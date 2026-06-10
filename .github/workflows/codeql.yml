@@ -28,6 +28,10 @@ jobs:
     permissions:
       contents: read
       security-events: write
+      # codeql-action's finalize step GETs the workflow run (telemetry/status)
+      # via the Actions API; on a PRIVATE repo the default token 403s without
+      # this, failing the job even though analysis ran clean + upload:never.
+      actions: read
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
