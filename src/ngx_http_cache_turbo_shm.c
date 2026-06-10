@@ -302,3 +302,27 @@ ngx_http_cache_turbo_shm_store(ngx_http_cache_turbo_zone_t *z,
     ngx_shmtx_unlock(&z->shpool->mutex);
     return NGX_OK;
 }
+
+
+void
+ngx_http_cache_turbo_shm_stats(ngx_http_cache_turbo_zone_t *z,
+    ngx_http_cache_turbo_stats_t *out)
+{
+    out->hits         = z->sh->hits;
+    out->misses       = z->sh->misses;
+    out->stale_serves = z->sh->stale_serves;
+    out->refreshes    = z->sh->refreshes;
+    out->evictions    = z->sh->evictions;
+}
+
+
+/* L1 backend instance (v4-1). Stateless dispatch table over the shm functions
+ * above; the zone is always passed in as an argument. */
+ngx_cache_turbo_l1_backend_t  ngx_http_cache_turbo_shm_backend = {
+    ngx_string("shm"),
+    ngx_http_cache_turbo_shm_lookup,
+    ngx_http_cache_turbo_shm_store,
+    ngx_http_cache_turbo_shm_purge_key,
+    ngx_http_cache_turbo_shm_purge_all,
+    ngx_http_cache_turbo_shm_stats,
+};

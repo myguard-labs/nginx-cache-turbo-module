@@ -120,6 +120,31 @@ typedef struct {
 } ngx_http_cache_turbo_zone_t;
 
 
+/* Snapshot of the L1 zone's atomic counters. Filled by the l1 backend's stats
+ * op and rendered by the admin GET handler, so the JSON formatting never touches
+ * the live shctx directly. */
+typedef struct {
+    ngx_atomic_uint_t   hits;
+    ngx_atomic_uint_t   misses;
+    ngx_atomic_uint_t   stale_serves;
+    ngx_atomic_uint_t   refreshes;
+    ngx_atomic_uint_t   evictions;
+} ngx_http_cache_turbo_stats_t;
+
+
+/*
+ * Backend vtables (v4-1, #6). Two tiers, two interfaces: the local L1 store
+ * (synchronous, in-process shm) and the remote L2 driver (asynchronous, parks
+ * the request). They are deliberately NOT fused behind one get() — the SWR dice
+ * / serve-stale branching lives between the L1 lookup and the L2 consult in the
+ * access handler (see history.md v4-1). Forward-declared here so loc_conf can
+ * hold pointers; the full definitions are at the foot of this header (after the
+ * request ctx + members callback typedef they reference).
+ */
+typedef struct ngx_cache_turbo_l1_backend_s  ngx_cache_turbo_l1_backend_t;
+typedef struct ngx_cache_turbo_backend_s     ngx_cache_turbo_backend_t;
+
+
 /* location-level configuration */
 typedef struct {
     ngx_flag_t               enable;
@@ -181,6 +206,14 @@ typedef struct {
      * (mobile/desktop) get separate cache slots. NGX_CONF_UNSET / 0 = off, so
      * v3-1 keys are unchanged unless cache_turbo_normalize_vary opts in. */
     ngx_int_t                normalize_vary;
+
+    /* Backend vtables (v4-1). l1 = the local store (shm); it is a stateless
+     * dispatch table (the zone is passed as an argument), so it is set
+     * unconditionally and is never NULL. backend = the remote L2 driver (redis),
+     * set when cache_turbo_redis is configured, else NULL — call sites guard on
+     * it. Both are resolved in merge_loc_conf. */
+    ngx_cache_turbo_l1_backend_t  *l1;
+    ngx_cache_turbo_backend_t     *backend;
 } ngx_http_cache_turbo_loc_conf_t;
 
 
@@ -245,6 +278,10 @@ ngx_int_t ngx_http_cache_turbo_shm_purge_key(ngx_http_cache_turbo_zone_t *z,
 
 /* Purge every entry in the zone. Returns the number removed. */
 ngx_uint_t ngx_http_cache_turbo_shm_purge_all(ngx_http_cache_turbo_zone_t *z);
+
+/* Snapshot the zone's atomic stat counters into out (admin stats endpoint). */
+void ngx_http_cache_turbo_shm_stats(ngx_http_cache_turbo_zone_t *z,
+    ngx_http_cache_turbo_stats_t *out);
 
 
 /* ---- swr.c ---- */
@@ -321,6 +358,74 @@ ngx_int_t ngx_http_cache_turbo_redis_smembers(ngx_http_request_t *r,
  * On re-entry after the reply, the caller inspects ctx->l2_result. */
 ngx_int_t ngx_http_cache_turbo_redis_get(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx);
+
+
+/* ---- backend vtables (v4-1, #6) ---- */
+
+/*
+ * L1 local-store backend. Synchronous in-process tier. `lookup` returns the live
+ * node so the caller (holding the zone mutex) can read its fields and run the SWR
+ * dice itself — that is why the stale/serve-stale control flow stays in the
+ * access handler rather than being hidden inside a fused get(). Today's only
+ * driver is shm; a future disk/mmap local tier would slot in behind this struct.
+ */
+struct ngx_cache_turbo_l1_backend_s {
+    ngx_str_t   name;
+
+    ngx_http_cache_turbo_node_t *(*lookup)(ngx_http_cache_turbo_zone_t *z,
+        u_char *key_hash, uint32_t hash);
+    ngx_int_t  (*store)(ngx_http_cache_turbo_zone_t *z, u_char *key_hash,
+        uint32_t hash, u_char *data, size_t len, ngx_uint_t status,
+        time_t fresh_ttl, ngx_int_t stale_mult);
+    ngx_int_t  (*purge_key)(ngx_http_cache_turbo_zone_t *z, u_char *key_hash,
+        uint32_t hash);
+    ngx_uint_t (*purge_all)(ngx_http_cache_turbo_zone_t *z);
+    void       (*stats)(ngx_http_cache_turbo_zone_t *z,
+        ngx_http_cache_turbo_stats_t *out);
+};
+
+extern ngx_cache_turbo_l1_backend_t  ngx_http_cache_turbo_shm_backend;
+
+
+/*
+ * L2 remote-driver backend. Asynchronous — `get` and `purge_tag` park the
+ * request (count++, NGX_AGAIN) and resume it when the reply lands. redis is the
+ * only driver today; memcached / disk slot in behind the same struct later. A
+ * driver that cannot perform an op leaves that member NULL (e.g. memcached has
+ * no atomic tag set, so its `purge_tag`/`tag_add` would be NULL). `lock`/
+ * `unlock` are the v4-2 multi-node single-flight slots (SET NX PX); NULL until
+ * then so v4-2 only fills the functions, never re-touches this struct.
+ */
+struct ngx_cache_turbo_backend_s {
+    ngx_str_t   name;
+
+    size_t     (*key)(ngx_str_t *prefix, u_char *key_hash, u_char *buf);
+    ngx_int_t  (*get)(ngx_http_request_t *r,
+        ngx_http_cache_turbo_loc_conf_t *clcf,
+        ngx_http_cache_turbo_ctx_t *ctx);
+    void       (*set)(ngx_http_request_t *r,
+        ngx_http_cache_turbo_loc_conf_t *clcf, u_char *key_hash,
+        u_char *blob, size_t blob_len, time_t fresh_ttl);
+    void       (*del)(ngx_http_cache_turbo_loc_conf_t *clcf, u_char *key_hash);
+    void       (*del_raw)(ngx_http_cache_turbo_loc_conf_t *clcf, u_char *key,
+        size_t key_len);
+    size_t     (*tagkey)(ngx_str_t *prefix, u_char *name, size_t name_len,
+        u_char *buf);
+    void       (*tag_add)(ngx_http_cache_turbo_loc_conf_t *clcf,
+        u_char *key_hash, u_char *name, size_t name_len, time_t ttl);
+    ngx_int_t  (*purge_tag)(ngx_http_request_t *r,
+        ngx_http_cache_turbo_loc_conf_t *clcf, u_char *name, size_t name_len,
+        ngx_http_cache_turbo_redis_members_pt cb, void *data);
+
+    /* v4-2 cross-node dogpile (SET NX PX). NULL until v4-2. */
+    ngx_int_t  (*lock)(ngx_http_request_t *r,
+        ngx_http_cache_turbo_loc_conf_t *clcf, u_char *key_hash,
+        ngx_str_t *owner, time_t ttl);
+    ngx_int_t  (*unlock)(ngx_http_cache_turbo_loc_conf_t *clcf, u_char *key_hash,
+        ngx_str_t *owner);
+};
+
+extern ngx_cache_turbo_backend_t  ngx_http_cache_turbo_redis_backend;
 
 
 #endif /* NGX_HTTP_CACHE_TURBO_MODULE_H_INCLUDED_ */

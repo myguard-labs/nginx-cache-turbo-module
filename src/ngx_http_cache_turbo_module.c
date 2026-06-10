@@ -288,7 +288,7 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
 
     ngx_shmtx_lock(&z->shpool->mutex);
 
-    ctn = ngx_http_cache_turbo_shm_lookup(z, ctx->key_hash, hash);
+    ctn = clcf->l1->lookup(z, ctx->key_hash, hash);
 
     if (ctn != NULL) {
         time_t     now = ngx_time();
@@ -375,8 +375,8 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
      * when the reply lands (see ngx_http_cache_turbo_redis_get). */
     ngx_shmtx_unlock(&z->shpool->mutex);
 
-    if (clcf->redis_enable && !ctx->l2_done) {
-        ngx_int_t  rc = ngx_http_cache_turbo_redis_get(r, clcf, ctx);
+    if (clcf->backend && !ctx->l2_done) {
+        ngx_int_t  rc = clcf->backend->get(r, clcf, ctx);
         if (rc == NGX_AGAIN) {
             return NGX_AGAIN;           /* parked; redis read handler resumes */
         }
@@ -391,7 +391,7 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
         if (ctx->l2_blob_len >= sizeof(bh)) {
             ngx_memcpy(&bh, ctx->l2_blob, sizeof(bh));
             if (bh.magic == NGX_HTTP_CACHE_TURBO_BLOB_MAGIC) {
-                (void) ngx_http_cache_turbo_shm_store(z, ctx->key_hash, hash,
+                (void) clcf->l1->store(z, ctx->key_hash, hash,
                            ctx->l2_blob, ctx->l2_blob_len, bh.status,
                            clcf->valid, clcf->stale_mult);
                 (void) ngx_atomic_fetch_add(&z->sh->hits, 1);
@@ -755,19 +755,21 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
             z = clcf->shm_zone->data;
             hash = ngx_crc32_short(ctx->key_hash, 32);
 
-            (void) ngx_http_cache_turbo_shm_store(z, ctx->key_hash, hash,
+            (void) clcf->l1->store(z, ctx->key_hash, hash,
                        blob, blob_len, r->headers_out.status, clcf->valid,
                        clcf->stale_mult);
 
             /* L2 write-through (async, fire-and-forget). Copies the blob into
              * its own pool, so it is safe even though `blob` lives in r->pool. */
-            ngx_http_cache_turbo_redis_set(r, clcf, ctx->key_hash,
-                                           blob, blob_len, clcf->valid);
+            if (clcf->backend) {
+                clcf->backend->set(r, clcf, ctx->key_hash,
+                                   blob, blob_len, clcf->valid);
+            }
 
             /* Tag index (v2c): for each tag in the cache_turbo_tag expression,
              * SADD this object's L2 key to the tag set so it can be purged by
              * tag later. Tags live only in L2; skip when Redis is off. */
-            if (clcf->redis_enable && clcf->tag) {
+            if (clcf->backend && clcf->tag) {
                 ngx_str_t  tagval;
 
                 if (ngx_http_complex_value(r, clcf->tag, &tagval) == NGX_OK
@@ -794,7 +796,7 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
                             s++;
                         }
                         if (s > tok) {
-                            ngx_http_cache_turbo_redis_tag_add(clcf,
+                            clcf->backend->tag_add(clcf,
                                 ctx->key_hash, tok, (size_t) (s - tok),
                                 stale_ttl);
                         }
@@ -1184,8 +1186,8 @@ ngx_http_cache_turbo_tag_purge_complete(ngx_http_request_t *r, void *data,
         }
 
         /* The member IS the object's L2 key: drop it from Redis. */
-        ngx_http_cache_turbo_redis_del_raw(tp->clcf, members[i].data,
-                                           members[i].len);
+        tp->clcf->backend->del_raw(tp->clcf, members[i].data,
+                                   members[i].len);
 
         /* member = <prefix><64 hex of the 32-byte key hash>: drop from L1. */
         if (members[i].len == plen + 64) {
@@ -1196,8 +1198,7 @@ ngx_http_cache_turbo_tag_purge_complete(ngx_http_request_t *r, void *data,
                                                key_hash) == NGX_OK)
             {
                 hash = ngx_crc32_short(key_hash, 32);
-                (void) ngx_http_cache_turbo_shm_purge_key(tp->zone, key_hash,
-                                                          hash);
+                (void) tp->clcf->l1->purge_key(tp->zone, key_hash, hash);
             }
         }
 
@@ -1207,9 +1208,9 @@ ngx_http_cache_turbo_tag_purge_complete(ngx_http_request_t *r, void *data,
     /* Remove the (now-emptied) tag set itself. */
     tagkey = ngx_pnalloc(r->pool, plen + sizeof("tag:") - 1 + tp->tag.len);
     if (tagkey != NULL) {
-        n = ngx_http_cache_turbo_redis_tagkey(&tp->clcf->redis_prefix,
+        n = tp->clcf->backend->tagkey(&tp->clcf->redis_prefix,
                  tp->tag.data, tp->tag.len, tagkey);
-        ngx_http_cache_turbo_redis_del_raw(tp->clcf, tagkey, n);
+        tp->clcf->backend->del_raw(tp->clcf, tagkey, n);
     }
 
     p = ngx_pnalloc(r->pool, sizeof("{\"purged\":4294967295}\n"));
@@ -1251,7 +1252,7 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
         if (r->args.len
             && ngx_http_arg(r, (u_char *) "all", 3, &arg) == NGX_OK)
         {
-            purged = ngx_http_cache_turbo_shm_purge_all(z);
+            purged = clcf->l1->purge_all(z);
 
         } else if (r->args.len
                    && ngx_http_arg(r, (u_char *) "key", 3, &arg) == NGX_OK)
@@ -1266,14 +1267,16 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
             ngx_md5_final(key_hash, &md5);
             hash = ngx_crc32_short(key_hash, 32);
 
-            purged = ngx_http_cache_turbo_shm_purge_key(z, key_hash, hash);
+            purged = clcf->l1->purge_key(z, key_hash, hash);
 
             /* L2-aware purge (issue P6): also drop the entry from Redis, so a
              * purge that cleared L1 cannot be silently refilled from L2 on the
              * next miss. Fire-and-forget; needs cache_turbo_redis on this admin
              * location (inherit it from server/http level). Reported "purged"
              * still reflects the L1 removal only. */
-            ngx_http_cache_turbo_redis_del(clcf, key_hash);
+            if (clcf->backend) {
+                clcf->backend->del(clcf, key_hash);
+            }
 
         } else if (r->args.len
                    && ngx_http_arg(r, (u_char *) "tag", 3, &arg) == NGX_OK)
@@ -1285,7 +1288,7 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
             ngx_http_cache_turbo_tagpurge_t  *tp;
             ngx_int_t                         rc;
 
-            if (!clcf->redis_enable) {
+            if (clcf->backend == NULL) {
                 ngx_str_set(&body,
                     "{\"error\":\"tag purge requires cache_turbo_redis\"}\n");
                 return ngx_http_cache_turbo_send_json(r,
@@ -1305,7 +1308,7 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
             }
             ngx_memcpy(tp->tag.data, arg.data, arg.len);
 
-            rc = ngx_http_cache_turbo_redis_smembers(r, clcf,
+            rc = clcf->backend->purge_tag(r, clcf,
                      tp->tag.data, tp->tag.len,
                      ngx_http_cache_turbo_tag_purge_complete, tp);
             if (rc == NGX_DONE) {
@@ -1344,19 +1347,26 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
         return ngx_http_cache_turbo_send_json(r, NGX_HTTP_OK, &body);
     }
 
-    /* GET / HEAD -> stats */
-    len = sizeof("{\"hits\":,\"misses\":,\"stale_serves\":,\"refreshes\":,"
-                 "\"evictions\":}\n") + 6 * NGX_ATOMIC_T_LEN;
-    p = ngx_pnalloc(r->pool, len);
-    if (p == NULL) {
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    /* GET / HEAD -> stats. Snapshot the counters through the L1 backend rather
+     * than reading the live shctx here. */
+    {
+        ngx_http_cache_turbo_stats_t  st;
+
+        clcf->l1->stats(z, &st);
+
+        len = sizeof("{\"hits\":,\"misses\":,\"stale_serves\":,\"refreshes\":,"
+                     "\"evictions\":}\n") + 6 * NGX_ATOMIC_T_LEN;
+        p = ngx_pnalloc(r->pool, len);
+        if (p == NULL) {
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+        body.data = p;
+        body.len = ngx_sprintf(p,
+            "{\"hits\":%uA,\"misses\":%uA,\"stale_serves\":%uA,"
+            "\"refreshes\":%uA,\"evictions\":%uA}\n",
+            st.hits, st.misses, st.stale_serves,
+            st.refreshes, st.evictions) - p;
     }
-    body.data = p;
-    body.len = ngx_sprintf(p,
-        "{\"hits\":%uA,\"misses\":%uA,\"stale_serves\":%uA,"
-        "\"refreshes\":%uA,\"evictions\":%uA}\n",
-        z->sh->hits, z->sh->misses, z->sh->stale_serves,
-        z->sh->refreshes, z->sh->evictions) - p;
     return ngx_http_cache_turbo_send_json(r, NGX_HTTP_OK, &body);
 }
 
@@ -1985,6 +1995,14 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
                         NGX_HTTP_CACHE_TURBO_REDIS_PREFIX);
         }
     }
+
+    /* Resolve the backend vtables (v4-1). l1 is a stateless dispatch table, so
+     * it is always wired (the zone is an argument, not driver state). backend is
+     * the remote L2 driver, present only when cache_turbo_redis was configured;
+     * call sites guard on it being non-NULL. */
+    conf->l1 = &ngx_http_cache_turbo_shm_backend;
+    conf->backend = conf->redis_enable
+                        ? &ngx_http_cache_turbo_redis_backend : NULL;
 
     /* Key normalize: inherit strip_all + the extra-pattern list. */
     ngx_conf_merge_value(conf->normalize_strip_all, prev->normalize_strip_all,

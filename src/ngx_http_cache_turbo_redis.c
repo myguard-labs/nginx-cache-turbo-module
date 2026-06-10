@@ -1019,3 +1019,21 @@ ngx_http_cache_turbo_redis_op_fail(ngx_http_cache_turbo_redis_op_t *op)
         ngx_http_cache_turbo_redis_op_done(op);
     }
 }
+
+
+/* L2 backend instance (v4-1). The remote-driver vtable memc/disk will mirror.
+ * lock/unlock are the v4-2 multi-node single-flight slots (SET NX PX), NULL for
+ * now. purge_tag is the SMEMBERS-based tag walk. */
+ngx_cache_turbo_backend_t  ngx_http_cache_turbo_redis_backend = {
+    ngx_string("redis"),
+    ngx_http_cache_turbo_redis_key,
+    ngx_http_cache_turbo_redis_get,
+    ngx_http_cache_turbo_redis_set,
+    ngx_http_cache_turbo_redis_del,
+    ngx_http_cache_turbo_redis_del_raw,
+    ngx_http_cache_turbo_redis_tagkey,
+    ngx_http_cache_turbo_redis_tag_add,
+    ngx_http_cache_turbo_redis_smembers,
+    NULL,   /* lock   — v4-2 SET NX PX */
+    NULL,   /* unlock — v4-2           */
+};
