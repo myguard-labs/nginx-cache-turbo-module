@@ -44,6 +44,10 @@ static char *ngx_http_cache_turbo_tag(ngx_conf_t *cf, ngx_command_t *cmd,
 static char *ngx_http_cache_turbo_preset(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static ngx_int_t ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r);
+static ngx_int_t ngx_http_cache_turbo_warm(ngx_http_request_t *r,
+    ngx_str_t *urls);
+static ngx_int_t ngx_http_cache_turbo_warm_one(ngx_http_request_t *r,
+    ngx_str_t *uri, ngx_str_t *args);
 static ngx_int_t ngx_http_cache_turbo_tag_purge_complete(ngx_http_request_t *r,
     void *data, ngx_str_t *members, ngx_uint_t nmembers);
 static ngx_int_t ngx_http_cache_turbo_add_variables(ngx_conf_t *cf);
@@ -248,7 +252,12 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
 
     if (r != r->main) {
         /* subrequest (e.g. our own background refresh) — never serve from
-         * cache, let it hit the origin and repopulate. */
+         * cache, let it hit the origin and repopulate. NB: nginx's access-phase
+         * checker skips subrequests entirely (ngx_http_core_access_phase:
+         * r != r->main -> phase_handler = next), so in practice this handler
+         * only ever runs for the main request. A warm subrequest (v3-3) builds
+         * its key + captures in the header/body filters, which DO run for
+         * subrequests. */
         return NGX_DECLINED;
     }
 
@@ -547,10 +556,21 @@ ngx_http_cache_turbo_header_filter(ngx_http_request_t *r)
 
     clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
 
-    /* Only capture cacheable success responses for v1. */
-    if (clcf->enable && r == r->main
+    /* Only capture cacheable success responses. Normally the main request only;
+     * a warm subrequest (ctx->warm) is the deliberate exception — we want its
+     * origin response captured and stored even though r != r->main. */
+    if (clcf->enable && (r == r->main || ctx->warm)
         && r->headers_out.status == NGX_HTTP_OK)
     {
+        /* A warm subrequest never ran the access phase (nginx skips it for
+         * subrequests), so its key was never built. Build it here from the
+         * subrequest URI before flagging capture, so the body filter stores
+         * under the same key a later real request will look up. */
+        if (ctx->warm
+            && ngx_http_cache_turbo_build_key(r, clcf, ctx) != NGX_OK)
+        {
+            return ngx_http_next_header_filter(r);
+        }
         ctx->captured = 1;
     }
 
@@ -1288,9 +1308,20 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
             return ngx_http_cache_turbo_send_json(r, NGX_HTTP_BAD_GATEWAY,
                        &body);
 
+        } else if (r->args.len
+                   && ngx_http_arg(r, (u_char *) "url", 3, &arg) == NGX_OK)
+        {
+            /* Warm (v3-3): pre-populate the cache for one or more comma-
+             * separated site URLs by firing background subrequests that hit the
+             * origin and store the result. Best-effort/async — the reply reports
+             * how many warm subrequests were fired, not how many actually
+             * stored. Sends its own JSON, so return its rc directly. */
+            return ngx_http_cache_turbo_warm(r, &arg);
+
         } else {
             ngx_str_set(&body,
-                "{\"error\":\"specify ?all=1, ?key=<string> or ?tag=<name>\"}\n");
+                "{\"error\":\"specify ?all=1, ?key=<string>, ?tag=<name> "
+                "or ?url=<path[,path...]>\"}\n");
             return ngx_http_cache_turbo_send_json(r, NGX_HTTP_BAD_REQUEST,
                        &body);
         }
@@ -1317,6 +1348,131 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
         "\"refreshes\":%uA,\"evictions\":%uA}\n",
         z->sh->hits, z->sh->misses, z->sh->stale_serves,
         z->sh->refreshes, z->sh->evictions) - p;
+    return ngx_http_cache_turbo_send_json(r, NGX_HTTP_OK, &body);
+}
+
+
+/* ----- warm (v3-3) --------------------------------------------------------- */
+
+/* Cap on URLs warmed per request. Keeps a single call well under nginx's
+ * subrequest-depth limit and bounds the work one admin POST can schedule. */
+#define NGX_HTTP_CACHE_TURBO_WARM_MAX  32
+
+
+/*
+ * Fire one background subrequest for `uri` (+ optional `args`) so the origin is
+ * hit and the response stored. BACKGROUND (not IN_MEMORY): IN_MEMORY would make
+ * the upstream accumulate into u->buffer via its input filter and bypass the
+ * output body-filter chain, so our body filter would never see the bytes and
+ * nothing would be cached. BACKGROUND alone lets the proxied response traverse
+ * the output filters (our filter captures + stores) while the postpone/write
+ * filter discards the client-facing output. See history.md (v3-3).
+ *
+ * The subrequest is pre-seeded with a ctx whose ->warm bit tells the access /
+ * header / body filters to force a miss and capture-store despite r != r->main.
+ */
+static ngx_int_t
+ngx_http_cache_turbo_warm_one(ngx_http_request_t *r, ngx_str_t *uri,
+    ngx_str_t *args)
+{
+    ngx_http_request_t          *sr;
+    ngx_http_cache_turbo_ctx_t  *wctx;
+
+    if (ngx_http_subrequest(r, uri, args->len ? args : NULL, &sr, NULL,
+                            NGX_HTTP_SUBREQUEST_BACKGROUND)
+        != NGX_OK)
+    {
+        return NGX_ERROR;
+    }
+
+    /* Force a clean GET to the origin regardless of the admin request's method
+     * (the admin POST is what triggered the warm). */
+    sr->method = NGX_HTTP_GET;
+    ngx_str_set(&sr->method_name, "GET");
+    sr->header_only = 0;
+
+    wctx = ngx_pcalloc(sr->pool, sizeof(ngx_http_cache_turbo_ctx_t));
+    if (wctx == NULL) {
+        return NGX_ERROR;
+    }
+    wctx->warm = 1;
+    ngx_http_set_ctx(sr, wctx, ngx_http_cache_turbo_module);
+
+    return NGX_OK;
+}
+
+
+/*
+ * POST /_cache?url=<path[,path,...]> — warm each comma-separated path. Each path
+ * is percent-decoded (so an encoded URL still resolves) and an optional "?query"
+ * suffix is passed through as the subrequest args. Only absolute paths ('/'...)
+ * are accepted; anything else is skipped. Replies {"warmed":N} with N = number
+ * of warm subrequests actually fired. The bg subrequests outlive this reply:
+ * each bumped r->main->count, so the connection survives admin finalize until
+ * they complete.
+ */
+static ngx_int_t
+ngx_http_cache_turbo_warm(ngx_http_request_t *r, ngx_str_t *urls)
+{
+    u_char     *p, *last, *comma, *q, *dst, *s;
+    ngx_uint_t  warmed = 0;
+    ngx_str_t   uri, args, body;
+    u_char     *out;
+
+    p = urls->data;
+    last = p + urls->len;
+
+    while (p < last && warmed < NGX_HTTP_CACHE_TURBO_WARM_MAX) {
+        comma = ngx_strlchr(p, last, ',');
+        if (comma == NULL) {
+            comma = last;
+        }
+
+        if (comma > p) {
+            uri.data = p;
+            uri.len = comma - p;
+            ngx_str_null(&args);
+
+            /* split off a "?query" suffix; keep it as the subrequest args */
+            q = ngx_strlchr(uri.data, uri.data + uri.len, '?');
+            if (q != NULL) {
+                args.data = q + 1;
+                args.len = uri.data + uri.len - (q + 1);
+                uri.len = q - uri.data;
+            }
+
+            /* percent-decode the path into a fresh buffer (subrequest expects an
+             * unescaped uri); decoding never grows the string. */
+            if (uri.len > 0 && uri.data[0] == '/') {
+                dst = ngx_pnalloc(r->pool, uri.len);
+                if (dst == NULL) {
+                    return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                }
+                s = uri.data;
+                {
+                    u_char  *d = dst;
+                    ngx_unescape_uri(&d, &s, uri.len, 0);
+                    uri.data = dst;
+                    uri.len = d - dst;
+                }
+
+                if (uri.len > 0 && uri.data[0] == '/'
+                    && ngx_http_cache_turbo_warm_one(r, &uri, &args) == NGX_OK)
+                {
+                    warmed++;
+                }
+            }
+        }
+
+        p = comma + 1;
+    }
+
+    out = ngx_pnalloc(r->pool, sizeof("{\"warmed\":4294967295}\n"));
+    if (out == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+    body.data = out;
+    body.len = ngx_sprintf(out, "{\"warmed\":%ui}\n", warmed) - out;
     return ngx_http_cache_turbo_send_json(r, NGX_HTTP_OK, &body);
 }
 

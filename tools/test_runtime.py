@@ -632,6 +632,57 @@ def test_admin_gating(ng: Nginx) -> None:
     assert s == 403, f"deny-all admin returned {s}, expected 403"
 
 
+def test_warm_populates(ng: Nginx, origin: Origin) -> None:
+    """v3-3: POST /_cache?url=<u> fires a background subrequest that hits origin
+    once and stores the result, so a never-before-fetched URL is a HIT on its
+    first real visit — without that visit touching the origin again."""
+    import json
+    uri = "/c/warm-pop"
+    base = origin.hits
+    s, b, _ = fetch(ng.port, f"/_cache?url={uri}", method="POST")
+    assert s == 200, f"warm status {s}"
+    assert json.loads(b)["warmed"] == 1, f"warmed count: {b}"
+    # the bg subrequest reaching origin is our completion signal
+    assert wait_for(lambda: origin.hits == base + 1), \
+        "warm subrequest never hit the origin"
+    time.sleep(0.2)                     # let the store settle after the response
+    after = origin.hits
+    # first real visit must be served from the warm-populated entry
+    s2, _, h2 = fetch(ng.port, uri)
+    assert s2 == 200
+    assert h2.get("x-cache") == "HIT", \
+        f"warm did not populate the cache (X-Cache={h2.get('x-cache')})"
+    assert origin.hits == after, \
+        f"GET after warm hit the origin ({origin.hits} vs {after})"
+
+
+def test_warm_multi(ng: Nginx, origin: Origin) -> None:
+    """v3-3: a comma-separated ?url=a,b warms both; both HIT afterwards."""
+    import json
+    a, b_uri = "/c/warm-m1", "/c/warm-m2"
+    base = origin.hits
+    s, body, _ = fetch(ng.port, f"/_cache?url={a},{b_uri}", method="POST")
+    assert s == 200, f"warm-multi status {s}"
+    assert json.loads(body)["warmed"] == 2, f"warmed count: {body}"
+    assert wait_for(lambda: origin.hits == base + 2), \
+        "both warm subrequests never reached origin"
+    time.sleep(0.2)
+    after = origin.hits
+    for u in (a, b_uri):
+        _, _, h = fetch(ng.port, u)
+        assert h.get("x-cache") == "HIT", f"{u} not warmed (X-Cache={h.get('x-cache')})"
+    assert origin.hits == after, "a warmed GET still hit origin"
+
+
+def test_warm_no_url(ng: Nginx) -> None:
+    """v3-3: POST /_cache with no recognised arg is a 400 with a JSON error."""
+    import json
+    s, b, h = fetch(ng.port, "/_cache", method="POST")
+    assert s == 400, f"no-arg admin POST returned {s}, expected 400"
+    assert "application/json" in h.get("content-type", ""), h.get("content-type")
+    assert "error" in json.loads(b), f"expected an error body, got {b!r}"
+
+
 def test_l2_write_through(ng: Nginx, origin: Origin, redis: RedisServer) -> None:
     """P4: a store writes through to L2. After caching /l2/<k>, the blob is
     present in Redis under the expected key, carries a PX TTL, and contains the
@@ -970,6 +1021,9 @@ def run_all(ng: Nginx, origin: Origin,
     test_admin_stats(ng)
     test_admin_purge_key(ng)
     test_admin_gating(ng)
+    test_warm_populates(ng, origin)
+    test_warm_multi(ng, origin)
+    test_warm_no_url(ng)
     test_stale_serves_stale(ng, origin)
     test_single_flight(ng, origin)
     test_normalize_arg_order(ng, origin)
@@ -1028,7 +1082,8 @@ def main() -> int:
 
     print("OK: miss/hit, header fidelity, max_size, concurrency (R1), "
           "LRU eviction (R6), stale serve (R3), single-flight (R4), "
-          "admin stats/purge/gating, key normalize (v3-1: order/tracking/"
+          "admin stats/purge/gating, warm (v3-3: populates/multi/no-url), "
+          "key normalize (v3-1: order/tracking/"
           "custom-strip/strip-all/distinct), "
           "presets (v3-2: conservative/aggressive stale-window differ, "
           "invalid-name rejected)"

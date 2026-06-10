@@ -76,7 +76,7 @@ is a `HIT` served from RAM in microseconds. Let it go stale and you'll see
 | `cache_turbo_max_size SIZE` | `server`, `location` | `1m` | Largest single response to cache. |
 | `cache_turbo_redis HOST:PORT [prefix=STR] [timeout=TIME]` | `http`, `server`, `location` | — | Add a shared **L2 Redis** tier behind the L1 shm cache. Stores write through asynchronously; an L1 miss does one synchronous Redis `GET` (off the hot path — L1 hits never touch Redis) and fills L1 on a hit. `prefix` defaults to `ct:`, `timeout` to `250ms`. Native client, no hiredis. |
 | `cache_turbo_tag EXPR` | `server`, `location` | — | Tag stored objects so they can be purged as a group. `EXPR` (any nginx variables) yields a whitespace/comma list of tags — e.g. `cache_turbo_tag $upstream_http_x_cache_tags`. Each tag set is kept in L2, so this needs `cache_turbo_redis`. Purge with `POST ?tag=<name>`. |
-| `cache_turbo_admin NAME` | `location` | — | Turn this location into a control endpoint for zone `NAME`. `GET` returns JSON stats; `POST ?all=1` purges the zone, `POST ?key=<string>` purges one key, `POST ?tag=<name>` purges every object carrying that tag. With `cache_turbo_redis` on the admin location, `?key`/`?tag` drop the entry from **both** L1 and L2. Gate it with `allow`/`deny`. |
+| `cache_turbo_admin NAME` | `location` | — | Turn this location into a control endpoint for zone `NAME`. `GET` returns JSON stats; `POST ?all=1` purges the zone, `POST ?key=<string>` purges one key, `POST ?tag=<name>` purges every object carrying that tag, `POST ?url=<path[,path...]>` **warms** the cache for those paths (background prefetch). With `cache_turbo_redis` on the admin location, `?key`/`?tag` drop the entry from **both** L1 and L2. Gate it with `allow`/`deny`. |
 | `cache_turbo_normalize_strip NAME...` | `server`, `location` | — | Extra query-arg names to drop from `$cache_turbo_normalized_args`, **added** to the built-in denylist. A trailing `*` is a prefix match (e.g. `tmp_*`). |
 | `cache_turbo_normalize_strip_all on` | `server`, `location` | `off` | Drop **every** query arg from `$cache_turbo_normalized_args` (the variable becomes the empty string). |
 
@@ -107,6 +107,28 @@ $ curl -X POST 'localhost/_cache?all=1'
 Add `cache_turbo_redis` to the admin location (inherited from `server`/`http`
 is fine) so `?key` and `?tag` purges clear the **L2** tier too — otherwise a
 purged entry just refills from Redis on the next miss.
+
+### Cache warming
+
+`POST ?url=<path[,path,...]>` pre-populates the cache for one or more site
+paths, so a cold URL is a **HIT** on its first real visitor instead of a miss:
+
+```console
+$ curl -X POST 'localhost/_cache?url=/blog/post-42'
+{"warmed":1}
+
+$ curl -X POST 'localhost/_cache?url=/,/blog/,/about'
+{"warmed":3}
+```
+
+Each path is fetched through a **background subrequest** that re-matches the
+site's locations (so it must resolve to a `cache_turbo`-enabled location with a
+`proxy_pass`), hits the origin once, and stores the result. The admin POST
+returns immediately with `{"warmed":N}` (N = subrequests fired); the fetches
+finish asynchronously, so a HIT may lag the reply by the origin round-trip. A
+warm always re-fetches from origin, even for a URL that is already cached. Up
+to 32 paths per call; paths are comma-separated and may be percent-encoded, and
+a `?query` suffix on a path is forwarded to the subrequest.
 
 The **stale window** is `cache_turbo_valid × (stale_mult − 1)` (the entry lives
 `× stale_mult` total), where `stale_mult` comes from the preset (`4` for the
@@ -267,7 +289,7 @@ The resulting `objs/ngx_http_cache_turbo_module.so` is loaded with
 - [x] Tag-based purge (purge by tag, L1 + L2) + L2-aware key/expired purge
 - [x] Smart cache-key normalisation — strip tracking params + sort args (`$cache_turbo_normalized_args`); Vary-aware suffix still to come
 - [x] `conservative` / `balanced` / `aggressive` tuning presets (`cache_turbo_preset`)
-- [ ] Cache (re)warming — sitemap walk + TTL-extension
+- [x] Cache warming — background prefetch of cold URLs (`POST ?url=`); sitemap walk + TTL-extension rewarmer still to come
 - [ ] Live autotune within preset bands (presets are the static version of this)
 - [ ] Slashdot protection (widen stale + harden single-flight under load spikes)
 
