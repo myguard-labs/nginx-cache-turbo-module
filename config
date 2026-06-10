@@ -4,6 +4,7 @@ CACHE_TURBO_SRCS="                                                       \
                   $ngx_addon_dir/src/ngx_http_cache_turbo_module.c      \
                   $ngx_addon_dir/src/ngx_http_cache_turbo_shm.c         \
                   $ngx_addon_dir/src/ngx_http_cache_turbo_swr.c         \
+                  $ngx_addon_dir/src/ngx_http_cache_turbo_redis.c       \
                   "
 
 CACHE_TURBO_DEPS="                                                      \

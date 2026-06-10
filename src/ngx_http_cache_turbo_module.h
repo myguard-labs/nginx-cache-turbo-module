@@ -88,6 +88,14 @@ typedef struct {
     size_t                   max_size;    /* max single response to cache   */
     ngx_flag_t               admin;       /* this location is an admin endpoint */
     ngx_shm_zone_t          *admin_zone;  /* zone the admin endpoint manages */
+
+    /* L2 Redis (v2b). Native async client, no hiredis. The L2 store is touched
+     * only on an L1 miss (sync GET) and on store (async write-through); it is
+     * never on the L1-hit hot path. */
+    ngx_flag_t               redis_enable; /* cache_turbo_redis configured     */
+    ngx_addr_t               redis_addr;   /* resolved host:port               */
+    ngx_str_t                redis_prefix; /* key prefix, default "ct:"        */
+    ngx_msec_t               redis_timeout;/* connect/read timeout             */
 } ngx_http_cache_turbo_loc_conf_t;
 
 
@@ -151,6 +159,25 @@ ngx_uint_t ngx_http_cache_turbo_shm_purge_all(ngx_http_cache_turbo_zone_t *z);
 time_t    ngx_http_cache_turbo_stale_ttl(time_t fresh_ttl);
 ngx_int_t ngx_http_cache_turbo_should_refresh(u_char *key_hash,
     time_t fresh_until, time_t stale_window, ngx_int_t beta_milli);
+
+
+/* ---- redis.c (L2, v2b) ---- */
+
+/* Default key prefix for L2 entries (overridable with prefix=). */
+#define NGX_HTTP_CACHE_TURBO_REDIS_PREFIX  "ct:"
+
+/* Build the L2 redis key for a cache entry into buf (must hold prefix.len +
+ * 64). Returns the byte length written. Key = prefix + lowercase hex of the
+ * 32-byte key hash, so it is stable and shareable across nodes. */
+size_t ngx_http_cache_turbo_redis_key(ngx_str_t *prefix, u_char *key_hash,
+    u_char *buf);
+
+/* Async write-through: fire-and-forget SET <key> <blob> PX <ms>. Copies
+ * everything it needs into its own pool, never blocks the worker, and survives
+ * the request being finalised. Best-effort: failures are logged, not fatal. */
+void ngx_http_cache_turbo_redis_set(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf, u_char *key_hash,
+    u_char *blob, size_t blob_len, time_t fresh_ttl);
 
 
 #endif /* NGX_HTTP_CACHE_TURBO_MODULE_H_INCLUDED_ */

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import hashlib
 import http.server
 import pathlib
 import shlex
@@ -141,8 +142,29 @@ class Origin:
 
 
 def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
-                 origin_port: int, workers: int) -> str:
+                 origin_port: int, workers: int,
+                 redis_port: int | None = None) -> str:
     load = f"load_module {module};\n" if module else ""
+
+    # L2 (v2b): wire a Redis backend + a location that uses it. Only emitted
+    # when a RedisServer is running, so the no-redis path still config-tests.
+    redis_http = ""
+    redis_loc = ""
+    if redis_port is not None:
+        redis_http = (
+            f"    cache_turbo_redis 127.0.0.1:{redis_port} "
+            f"prefix=ct: timeout=250ms;\n"
+        )
+        redis_loc = f"""
+        # L2 write-through: stores land in Redis as well as L1
+        location /l2/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+"""
+
     return f"""{load}worker_processes {workers};
 pid {root}/nginx.pid;
 error_log {root}/logs/error.log notice;
@@ -151,12 +173,13 @@ events {{ worker_connections 512; }}
 
 http {{
     access_log off;
-
+{redis_http}
     cache_turbo_zone name=main 16m;
     cache_turbo_zone name=tiny 8m;   # small zone for eviction test (R6)
 
     server {{
         listen 127.0.0.1:{port};
+{redis_loc}
 
         # standard 30s-fresh cache
         location /c/ {{
@@ -217,7 +240,7 @@ http {{
 
 class Nginx:
     def __init__(self, binary, module, root, port, origin_port, runner,
-                 single_process) -> None:
+                 single_process, redis_port=None) -> None:
         self.binary = binary
         self.module = module
         self.root = root
@@ -225,6 +248,7 @@ class Nginx:
         self.origin_port = origin_port
         self.runner = shlex.split(runner)
         self.single_process = single_process
+        self.redis_port = redis_port
         self.process: subprocess.Popen | None = None
         self.output_path = root / "nginx-output.log"
 
@@ -234,7 +258,7 @@ class Nginx:
         (self.root / "logs").mkdir(parents=True, exist_ok=True)
         (self.root / "conf" / "nginx.conf").write_text(
             nginx_config(self.root, self.port, self.module,
-                         self.origin_port, workers),
+                         self.origin_port, workers, self.redis_port),
             encoding="ascii")
 
     def command(self, test: bool = False) -> list[str]:
@@ -298,6 +322,69 @@ class Nginx:
                  if "[alert]" in ln or "[emerg]" in ln]
         if fatal:
             raise AssertionError("nginx logged fatal:\n" + "\n".join(fatal))
+
+
+# --------------------------------------------------------------------------- #
+# Ephemeral Redis for the L2 (v2b) tests.
+# --------------------------------------------------------------------------- #
+
+class RedisServer:
+    def __init__(self, binary: pathlib.Path, root: pathlib.Path,
+                 port: int) -> None:
+        self.binary = binary
+        self.root = root
+        self.port = port
+        self.process: subprocess.Popen[str] | None = None
+
+    def start(self) -> None:
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.process = subprocess.Popen(
+            [
+                str(self.binary),
+                "--bind", "127.0.0.1",
+                "--port", str(self.port),
+                "--save", "",
+                "--appendonly", "no",
+                "--dir", str(self.root),
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        wait_port(self.port)
+        self.cli("FLUSHALL")
+
+    def cli(self, *args: str) -> str:
+        """Run a redis-cli command against this server; return stdout."""
+        r = subprocess.run(
+            ["redis-cli", "-h", "127.0.0.1", "-p", str(self.port), *args],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            timeout=10)
+        return r.stdout.strip()
+
+    def stop(self) -> None:
+        if self.process is None:
+            return
+        if self.process.poll() is None:
+            self.process.terminate()
+            self.process.wait(timeout=10)
+        self.process = None
+
+
+def l2_key(uri: str, prefix: str = "ct:") -> str:
+    """Mirror the module's L2 key: prefix + hex of the 32-byte key hash. The
+    key hash is md5(cache_key) widened into 32 bytes (upper 16 stay zero), and
+    cache_turbo_key is $uri in the test config."""
+    return prefix + hashlib.md5(uri.encode()).hexdigest() + "0" * 32
+
+
+def wait_for(predicate, timeout: float = 3.0, interval: float = 0.05) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return False
 
 
 # --------------------------------------------------------------------------- #
@@ -448,7 +535,38 @@ def test_admin_gating(ng: Nginx) -> None:
     assert s == 403, f"deny-all admin returned {s}, expected 403"
 
 
-def run_all(ng: Nginx, origin: Origin) -> None:
+def test_l2_write_through(ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    """P4: a store writes through to L2. After caching /l2/<k>, the blob is
+    present in Redis under the expected key, carries a PX TTL, and contains the
+    actual response body bytes."""
+    uri = "/l2/store"
+    redis.cli("DEL", l2_key(uri))
+    s, body, h = fetch(ng.port, uri)               # miss -> origin -> store
+    assert s == 200, f"l2 store status {s}"
+    assert "x-cache" not in h, "first request should be a miss"
+
+    key = l2_key(uri)
+    # write-through is async/fire-and-forget; give it a moment to land
+    assert wait_for(lambda: redis.cli("EXISTS", key) == "1"), \
+        f"L2 key {key} never appeared in Redis"
+
+    pttl = int(redis.cli("PTTL", key))
+    # PX applied: a positive TTL no larger than the stale window (valid*4 = 120s)
+    assert 0 < pttl <= 120_000, f"unexpected PTTL {pttl}"
+
+    strlen = int(redis.cli("STRLEN", key))
+    assert strlen > len(body), f"stored blob ({strlen}B) smaller than body"
+
+    raw = redis.cli("--no-raw", "GET", key)
+    assert "gen-" in raw, f"stored blob missing response body: {raw[:80]!r}"
+
+    # L1 still serves the hit (L2 write-through must not disturb the hot path)
+    _, b2, h2 = fetch(ng.port, uri)
+    assert h2.get("x-cache") == "HIT" and b2 == body, "L1 hit broken after L2 set"
+
+
+def run_all(ng: Nginx, origin: Origin,
+            redis: RedisServer | None = None) -> None:
     test_miss_then_hit(ng)
     test_header_fidelity(ng)
     test_max_size_not_cached(ng)
@@ -459,6 +577,8 @@ def run_all(ng: Nginx, origin: Origin) -> None:
     test_admin_gating(ng)
     test_stale_serves_stale(ng, origin)
     test_single_flight(ng, origin)
+    if redis is not None:
+        test_l2_write_through(ng, origin, redis)
     test_admin_purge_all(ng)   # last: it empties the zone
 
 
@@ -472,27 +592,37 @@ def main() -> int:
         raise FileNotFoundError(module)
 
     origin_port = args.port + 11
+    redis_port = args.port + 21 if args.redis_server else None
     with tempfile.TemporaryDirectory(prefix="cache-turbo-ci-") as tmp:
         root = pathlib.Path(tmp)
         origin = Origin(origin_port, delay=0.05)
+        redis = None
+        if args.redis_server:
+            redis = RedisServer(pathlib.Path(args.redis_server),
+                                root / "redis", redis_port)
         ng = Nginx(binary, module, root / "server", args.port, origin_port,
-                   args.runner, args.single_process)
+                   args.runner, args.single_process, redis_port)
         ng.write_config()
         ng.config_test()
         try:
             origin.start()
+            if redis is not None:
+                redis.start()
             ng.start()
-            run_all(ng, origin)
+            run_all(ng, origin, redis)
             time.sleep(0.2)
             ng.stop()
             ng.assert_clean_logs()
         finally:
             ng.stop()
+            if redis is not None:
+                redis.stop()
             origin.stop()
 
     print("OK: miss/hit, header fidelity, max_size, concurrency (R1), "
           "LRU eviction (R6), stale serve (R3), single-flight (R4), "
-          "admin stats/purge/gating")
+          "admin stats/purge/gating"
+          + (", L2 write-through (P4)" if redis_port else ""))
     return 0
 
 

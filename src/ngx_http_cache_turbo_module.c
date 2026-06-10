@@ -37,6 +37,8 @@ static char *ngx_http_cache_turbo_key(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static char *ngx_http_cache_turbo_admin(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
+static char *ngx_http_cache_turbo_redis_conf(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
 static ngx_int_t ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r);
 static ngx_int_t ngx_http_cache_turbo_init(ngx_conf_t *cf);
 
@@ -99,6 +101,13 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
     { ngx_string("cache_turbo_admin"),
       NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
       ngx_http_cache_turbo_admin,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+
+    { ngx_string("cache_turbo_redis"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE123,
+      ngx_http_cache_turbo_redis_conf,
       NGX_HTTP_LOC_CONF_OFFSET,
       0,
       NULL },
@@ -635,6 +644,11 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 
             (void) ngx_http_cache_turbo_shm_store(z, ctx->key_hash, hash,
                        blob, blob_len, r->headers_out.status, clcf->valid);
+
+            /* L2 write-through (async, fire-and-forget). Copies the blob into
+             * its own pool, so it is safe even though `blob` lives in r->pool. */
+            ngx_http_cache_turbo_redis_set(r, clcf, ctx->key_hash,
+                                           blob, blob_len, clcf->valid);
         }
     }
 
@@ -787,6 +801,74 @@ ngx_http_cache_turbo_admin(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 }
 
 
+/* "cache_turbo_redis <host:port> [prefix=<str>] [timeout=<time>];" wires the
+ * L2 backend. The address is resolved at config time. Settable at http/server/
+ * location level and merged down, so a whole http{} block can share one L2. */
+static char *
+ngx_http_cache_turbo_redis_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_cache_turbo_loc_conf_t  *clcf = conf;
+
+    ngx_str_t   *value, s;
+    ngx_url_t    u;
+    ngx_uint_t   i;
+    ngx_int_t    t;
+
+    value = cf->args->elts;
+
+    ngx_memzero(&u, sizeof(ngx_url_t));
+    u.url = value[1];
+    u.default_port = 6379;
+
+    if (ngx_parse_url(cf->pool, &u) != NGX_OK) {
+        if (u.err) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "cache_turbo_redis: %s in \"%V\"", u.err, &u.url);
+        }
+        return NGX_CONF_ERROR;
+    }
+
+    if (u.naddrs == 0) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "cache_turbo_redis: no addresses for \"%V\"", &u.url);
+        return NGX_CONF_ERROR;
+    }
+
+    clcf->redis_addr = u.addrs[0];
+
+    for (i = 2; i < cf->args->nelts; i++) {
+
+        if (ngx_strncmp(value[i].data, "prefix=", 7) == 0) {
+            clcf->redis_prefix.data = value[i].data + 7;
+            clcf->redis_prefix.len = value[i].len - 7;
+            continue;
+        }
+
+        if (ngx_strncmp(value[i].data, "timeout=", 8) == 0) {
+            s.data = value[i].data + 8;
+            s.len = value[i].len - 8;
+            t = ngx_parse_time(&s, 0);   /* milliseconds */
+            if (t == NGX_ERROR) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "cache_turbo_redis: bad timeout \"%V\"", &s);
+                return NGX_CONF_ERROR;
+            }
+            clcf->redis_timeout = (ngx_msec_t) t;
+            continue;
+        }
+
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "cache_turbo_redis: invalid parameter \"%V\"",
+                           &value[i]);
+        return NGX_CONF_ERROR;
+    }
+
+    clcf->redis_enable = 1;
+
+    return NGX_CONF_OK;
+}
+
+
 /* GET  -> JSON stats for the zone.
  * POST -> purge: ?all=1 purges the whole zone; ?key=<string> purges one key
  *         (hashed the same way the cache hashes its key).
@@ -915,7 +997,9 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->beta = NGX_CONF_UNSET;
     conf->lock_ttl = NGX_CONF_UNSET;
     conf->max_size = NGX_CONF_UNSET_SIZE;
-    /* shm_zone, key default NULL via pcalloc */
+    conf->redis_enable = NGX_CONF_UNSET;
+    conf->redis_timeout = NGX_CONF_UNSET_MSEC;
+    /* shm_zone, key, redis_addr, redis_prefix default NULL via pcalloc */
 
     return conf;
 }
@@ -939,6 +1023,22 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     }
     if (conf->key == NULL) {
         conf->key = prev->key;
+    }
+
+    /* L2 Redis: inherit address/prefix/timeout, default prefix "ct:". */
+    ngx_conf_merge_value(conf->redis_enable, prev->redis_enable, 0);
+    ngx_conf_merge_msec_value(conf->redis_timeout, prev->redis_timeout, 250);
+
+    if (conf->redis_addr.sockaddr == NULL) {
+        conf->redis_addr = prev->redis_addr;
+    }
+    if (conf->redis_prefix.data == NULL) {
+        if (prev->redis_prefix.data) {
+            conf->redis_prefix = prev->redis_prefix;
+        } else {
+            ngx_str_set(&conf->redis_prefix,
+                        NGX_HTTP_CACHE_TURBO_REDIS_PREFIX);
+        }
     }
 
     return NGX_CONF_OK;
