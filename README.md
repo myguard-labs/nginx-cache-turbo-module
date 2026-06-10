@@ -72,7 +72,8 @@ is a `HIT` served from RAM in microseconds. Let it go stale and you'll see
 | `cache_turbo_beta N` | `server`, `location` | `1000` | SWR refresh aggressiveness, fixed-point ×1000 (1000 = 1.0). Higher → refresh earlier/more often. |
 | `cache_turbo_lock_ttl TIME` | `server`, `location` | `5s` | Hard single-flight window: once a refresh is claimed, all readers serve stale (skip the dice) until this expires or the refresh completes. Caps origin regens to ~one per stale cycle. |
 | `cache_turbo_max_size SIZE` | `server`, `location` | `1m` | Largest single response to cache. |
-| `cache_turbo_admin NAME` | `location` | — | Turn this location into a control endpoint for zone `NAME`. `GET` returns JSON stats; `POST ?all=1` purges the zone, `POST ?key=<string>` purges one key. Gate it with `allow`/`deny`. |
+| `cache_turbo_redis HOST:PORT [prefix=STR] [timeout=TIME]` | `http`, `server`, `location` | — | Add a shared **L2 Redis** tier behind the L1 shm cache. Stores write through asynchronously; an L1 miss does one synchronous Redis `GET` (off the hot path — L1 hits never touch Redis) and fills L1 on a hit. `prefix` defaults to `ct:`, `timeout` to `250ms`. Native client, no hiredis. |
+| `cache_turbo_admin NAME` | `location` | — | Turn this location into a control endpoint for zone `NAME`. `GET` returns JSON stats; `POST ?all=1` purges the zone, `POST ?key=<string>` purges one key (L1 only for now). Gate it with `allow`/`deny`. |
 
 ### Admin endpoint
 
@@ -97,6 +98,24 @@ $ curl -X POST 'localhost/_cache?all=1'
 
 The **stale window** is `cache_turbo_valid × 3` (the entry lives `× 4` total),
 so a `10s` fresh TTL keeps serving stale for another `30s` while it refreshes.
+
+### L2 Redis (shared tier)
+
+```nginx
+location / {
+    cache_turbo       main;
+    cache_turbo_valid 10s;
+    cache_turbo_redis 127.0.0.1:6379 prefix=ct: timeout=250ms;
+    proxy_pass http://backend;
+}
+```
+
+L1 (per-node shm) stays the hot path and serves every hit. Redis is touched
+only on an L1 **miss** (one synchronous `GET`, then L1 is filled) and on
+**store** (asynchronous write-through). So a second node with a cold L1 serves
+what the first node cached, without re-hitting the origin. The entry lives in
+Redis for the full stale window (`cache_turbo_valid × 4`). The client never
+blocks on Redis for a hit.
 
 ## How it works
 
