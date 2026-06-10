@@ -76,6 +76,8 @@ is a `HIT` served from RAM in microseconds. Let it go stale and you'll see
 | `cache_turbo_redis HOST:PORT [prefix=STR] [timeout=TIME]` | `http`, `server`, `location` | — | Add a shared **L2 Redis** tier behind the L1 shm cache. Stores write through asynchronously; an L1 miss does one synchronous Redis `GET` (off the hot path — L1 hits never touch Redis) and fills L1 on a hit. `prefix` defaults to `ct:`, `timeout` to `250ms`. Native client, no hiredis. |
 | `cache_turbo_tag EXPR` | `server`, `location` | — | Tag stored objects so they can be purged as a group. `EXPR` (any nginx variables) yields a whitespace/comma list of tags — e.g. `cache_turbo_tag $upstream_http_x_cache_tags`. Each tag set is kept in L2, so this needs `cache_turbo_redis`. Purge with `POST ?tag=<name>`. |
 | `cache_turbo_admin NAME` | `location` | — | Turn this location into a control endpoint for zone `NAME`. `GET` returns JSON stats; `POST ?all=1` purges the zone, `POST ?key=<string>` purges one key, `POST ?tag=<name>` purges every object carrying that tag. With `cache_turbo_redis` on the admin location, `?key`/`?tag` drop the entry from **both** L1 and L2. Gate it with `allow`/`deny`. |
+| `cache_turbo_normalize_strip NAME...` | `server`, `location` | — | Extra query-arg names to drop from `$cache_turbo_normalized_args`, **added** to the built-in denylist. A trailing `*` is a prefix match (e.g. `tmp_*`). |
+| `cache_turbo_normalize_strip_all on` | `server`, `location` | `off` | Drop **every** query arg from `$cache_turbo_normalized_args` (the variable becomes the empty string). |
 
 ### Admin endpoint
 
@@ -160,6 +162,36 @@ $ curl -X POST 'localhost/_cache?tag=post-42'
 Tags live only in Redis, so `cache_turbo_tag` requires `cache_turbo_redis`
 (without it a tag purge returns `400`).
 
+### Key normalization
+
+The `$cache_turbo_normalized_args` variable rebuilds the query string so that
+requests differing only in argument **order** or carrying tracking junk hash to
+one cache slot. It (1) drops denylisted params, (2) sorts the rest, and (3)
+re-emits them with a leading `?` (empty string when nothing remains). Compose
+your key from it instead of `$is_args$args`:
+
+```nginx
+location / {
+    cache_turbo      main;
+    cache_turbo_key  $scheme$host$uri$cache_turbo_normalized_args;
+    proxy_pass       http://backend;
+}
+```
+
+With this key, `?b=2&a=1` and `?a=1&b=2` are one entry, and `?p=1&utm_source=x`
+collapses onto `?p=1`. The variable is orthogonal to keying — it does not touch
+`$args`, so application logic still sees the original query string.
+
+Built-in denylist: `utm_*` (prefix), `fbclid`, `gclid`, `msclkid`, `mc_eid`,
+`_ga`, `ref`. Add more with `cache_turbo_normalize_strip` (a trailing `*` is a
+prefix match); these are *added* to the defaults, never replace them. Drop every
+arg with `cache_turbo_normalize_strip_all on`:
+
+```nginx
+# strip everything except a curated allow-set you keep via the key itself
+cache_turbo_normalize_strip  sid sessionid "tmp_*";   # + the built-in defaults
+```
+
 ## How it works
 
 ```
@@ -202,7 +234,7 @@ The resulting `objs/ngx_http_cache_turbo_module.so` is loaded with
 - [x] REST admin endpoint: JSON stats + purge by key / purge all (`cache_turbo_admin`)
 - [x] Redis L2 backend (shared/persistent, multi-node) — **native nginx client, no hiredis**
 - [x] Tag-based purge (purge by tag, L1 + L2) + L2-aware key/expired purge
-- [ ] Smart cache-key normalisation (strip tracking params, sort args, Vary-aware)
+- [x] Smart cache-key normalisation — strip tracking params + sort args (`$cache_turbo_normalized_args`); Vary-aware suffix still to come
 - [ ] Cache (re)warming — sitemap walk + TTL-extension
 - [ ] `conservative` / `balanced` / `aggressive` autotune presets
 - [ ] Slashdot protection (widen stale + harden single-flight under load spikes)

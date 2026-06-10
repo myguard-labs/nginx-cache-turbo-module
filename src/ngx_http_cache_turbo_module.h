@@ -102,6 +102,17 @@ typedef struct {
      * SADD'ed (+EXPIRE), so a purge-by-tag can drop every keyed object across
      * both tiers. Tags live only in L2, so this needs cache_turbo_redis. */
     ngx_http_complex_value_t *tag;        /* tag list expression, or NULL     */
+
+    /* Key normalize (v3-1). The $cache_turbo_normalized_args variable rebuilds
+     * r->args dropping tracking params and sorting the rest, so requests that
+     * differ only in arg order or carry junk (utm_*, fbclid, ...) hash to one
+     * cache slot. Orthogonal to keying: the user composes the key from the
+     * variable, e.g. cache_turbo_key $uri$cache_turbo_normalized_args. */
+    ngx_flag_t               normalize_strip_all; /* drop EVERY arg            */
+    ngx_array_t             *normalize_strip;     /* extra ngx_str_t patterns to
+                                                   * deny, added to the built-in
+                                                   * defaults; trailing '*' is a
+                                                   * prefix match. NULL = none. */
 } ngx_http_cache_turbo_loc_conf_t;
 
 

@@ -44,6 +44,11 @@ static char *ngx_http_cache_turbo_tag(ngx_conf_t *cf, ngx_command_t *cmd,
 static ngx_int_t ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r);
 static ngx_int_t ngx_http_cache_turbo_tag_purge_complete(ngx_http_request_t *r,
     void *data, ngx_str_t *members, ngx_uint_t nmembers);
+static ngx_int_t ngx_http_cache_turbo_add_variables(ngx_conf_t *cf);
+static ngx_int_t ngx_http_cache_turbo_normalized_args_variable(
+    ngx_http_request_t *r, ngx_http_variable_value_t *v, uintptr_t data);
+static char *ngx_http_cache_turbo_normalize_strip(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
 static ngx_int_t ngx_http_cache_turbo_init(ngx_conf_t *cf);
 
 
@@ -123,12 +128,26 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       0,
       NULL },
 
+    { ngx_string("cache_turbo_normalize_strip"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_1MORE,
+      ngx_http_cache_turbo_normalize_strip,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+
+    { ngx_string("cache_turbo_normalize_strip_all"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_turbo_loc_conf_t, normalize_strip_all),
+      NULL },
+
       ngx_null_command
 };
 
 
 static ngx_http_module_t  ngx_http_cache_turbo_module_ctx = {
-    NULL,                                  /* preconfiguration */
+    ngx_http_cache_turbo_add_variables,    /* preconfiguration */
     ngx_http_cache_turbo_init,             /* postconfiguration */
 
     NULL,                                  /* create main configuration */
@@ -1242,6 +1261,238 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
 }
 
 
+/* ----- key normalize (v3-1) ------------------------------------------------ */
+
+/* Built-in denylist: query params dropped from $cache_turbo_normalized_args by
+ * default. A trailing '*' is a prefix match (so utm_* covers utm_source etc.).
+ * cache_turbo_normalize_strip adds to this; it never removes a default. */
+static ngx_str_t  ngx_http_cache_turbo_default_strip[] = {
+    ngx_string("utm_*"),
+    ngx_string("fbclid"),
+    ngx_string("gclid"),
+    ngx_string("msclkid"),
+    ngx_string("mc_eid"),
+    ngx_string("_ga"),
+    ngx_string("ref"),
+};
+
+
+/* Does an arg name match a denylist pattern? Trailing '*' => prefix match. */
+static ngx_int_t
+ngx_http_cache_turbo_pat_match(ngx_str_t *pat, u_char *name, size_t nlen)
+{
+    if (pat->len > 0 && pat->data[pat->len - 1] == '*') {
+        size_t  plen = pat->len - 1;
+        return nlen >= plen && ngx_strncmp(name, pat->data, plen) == 0;
+    }
+    return nlen == pat->len && ngx_strncmp(name, pat->data, nlen) == 0;
+}
+
+
+/* Is this arg name on the denylist (built-in defaults + configured extras)? */
+static ngx_int_t
+ngx_http_cache_turbo_name_denied(ngx_http_cache_turbo_loc_conf_t *clcf,
+    u_char *name, size_t nlen)
+{
+    ngx_str_t   *pat;
+    ngx_uint_t   i;
+
+    for (i = 0;
+         i < sizeof(ngx_http_cache_turbo_default_strip) / sizeof(ngx_str_t);
+         i++)
+    {
+        if (ngx_http_cache_turbo_pat_match(
+                &ngx_http_cache_turbo_default_strip[i], name, nlen))
+        {
+            return 1;
+        }
+    }
+
+    if (clcf->normalize_strip != NULL
+        && clcf->normalize_strip != NGX_CONF_UNSET_PTR)
+    {
+        pat = clcf->normalize_strip->elts;
+        for (i = 0; i < clcf->normalize_strip->nelts; i++) {
+            if (ngx_http_cache_turbo_pat_match(&pat[i], name, nlen)) {
+                return 1;
+            }
+        }
+    }
+
+    return 0;
+}
+
+
+/* Stable byte-wise compare of two "name=value" tokens for the sort. */
+static ngx_int_t
+ngx_http_cache_turbo_tok_cmp(const void *one, const void *two)
+{
+    const ngx_str_t  *a = one;
+    const ngx_str_t  *b = two;
+    size_t            n = ngx_min(a->len, b->len);
+    ngx_int_t         rc = ngx_memcmp(a->data, b->data, n);
+
+    if (rc != 0) {
+        return rc;
+    }
+    return (ngx_int_t) a->len - (ngx_int_t) b->len;
+}
+
+
+/*
+ * $cache_turbo_normalized_args: rebuild r->args dropping denylisted params and
+ * sorting what remains, prefixed with '?'. Empty string when there is nothing
+ * to keep (no args, strip_all, or everything denied), so the variable can be
+ * concatenated straight into a cache key. Computed in r->pool; r->args is left
+ * untouched so application logic still sees the original query string.
+ */
+static ngx_int_t
+ngx_http_cache_turbo_normalized_args_variable(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data)
+{
+    ngx_http_cache_turbo_loc_conf_t  *clcf;
+    ngx_str_t                        *toks;
+    u_char                           *p, *last, *amp, *eq, *out, *w;
+    size_t                            nlen, total;
+    ngx_uint_t                        n, i, kept;
+
+    clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
+
+    v->valid = 1;
+    v->no_cacheable = 0;
+    v->not_found = 0;
+
+    /* strip_all, or no args at all: the normalized form is the empty string. */
+    if (clcf->normalize_strip_all || r->args.len == 0) {
+        v->len = 0;
+        v->data = (u_char *) "";
+        return NGX_OK;
+    }
+
+    /* Upper bound on token count = number of '&' + 1. */
+    n = 1;
+    for (p = r->args.data, last = p + r->args.len; p < last; p++) {
+        if (*p == '&') {
+            n++;
+        }
+    }
+
+    /* ngx_str_t array needs pointer alignment -> ngx_palloc, NEVER ngx_pnalloc
+     * (byte-aligned -> UBSan misalign trap; same class as issues C3 / v2c). */
+    toks = ngx_palloc(r->pool, n * sizeof(ngx_str_t));
+    if (toks == NULL) {
+        return NGX_ERROR;
+    }
+
+    /* Split on '&', keep the full "name=value" of each non-denied param. */
+    kept = 0;
+    total = 0;
+    p = r->args.data;
+    last = p + r->args.len;
+    while (p < last) {
+        amp = ngx_strlchr(p, last, '&');
+        if (amp == NULL) {
+            amp = last;
+        }
+
+        if (amp > p) {                       /* skip empty tokens ("&&", "&") */
+            eq = ngx_strlchr(p, amp, '=');
+            nlen = eq ? (size_t) (eq - p) : (size_t) (amp - p);
+
+            if (!ngx_http_cache_turbo_name_denied(clcf, p, nlen)) {
+                toks[kept].data = p;
+                toks[kept].len = amp - p;
+                total += toks[kept].len;
+                kept++;
+            }
+        }
+
+        p = amp + 1;
+    }
+
+    if (kept == 0) {
+        v->len = 0;
+        v->data = (u_char *) "";
+        return NGX_OK;
+    }
+
+    /* Stable alpha sort so ?b=2&a=1 and ?a=1&b=2 normalize identically. */
+    ngx_sort(toks, kept, sizeof(ngx_str_t), ngx_http_cache_turbo_tok_cmp);
+
+    total += 1 + (kept - 1);                  /* leading '?' + '&' separators  */
+
+    out = ngx_pnalloc(r->pool, total);        /* raw bytes -> pnalloc is fine  */
+    if (out == NULL) {
+        return NGX_ERROR;
+    }
+
+    w = out;
+    *w++ = '?';
+    for (i = 0; i < kept; i++) {
+        if (i) {
+            *w++ = '&';
+        }
+        w = ngx_cpymem(w, toks[i].data, toks[i].len);
+    }
+
+    v->len = w - out;
+    v->data = out;
+
+    return NGX_OK;
+}
+
+
+static ngx_str_t  ngx_http_cache_turbo_normalized_args_name =
+    ngx_string("cache_turbo_normalized_args");
+
+
+static ngx_int_t
+ngx_http_cache_turbo_add_variables(ngx_conf_t *cf)
+{
+    ngx_http_variable_t  *var;
+
+    var = ngx_http_add_variable(cf, &ngx_http_cache_turbo_normalized_args_name,
+                                0);
+    if (var == NULL) {
+        return NGX_ERROR;
+    }
+
+    var->get_handler = ngx_http_cache_turbo_normalized_args_variable;
+
+    return NGX_OK;
+}
+
+
+/* cache_turbo_normalize_strip name...  — append extra denylist patterns. */
+static char *
+ngx_http_cache_turbo_normalize_strip(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf)
+{
+    ngx_http_cache_turbo_loc_conf_t  *clcf = conf;
+    ngx_str_t                        *value, *s;
+    ngx_uint_t                        i;
+
+    if (clcf->normalize_strip == NGX_CONF_UNSET_PTR) {
+        clcf->normalize_strip = ngx_array_create(cf->pool, 8,
+                                                 sizeof(ngx_str_t));
+        if (clcf->normalize_strip == NULL) {
+            return NGX_CONF_ERROR;
+        }
+    }
+
+    value = cf->args->elts;
+    for (i = 1; i < cf->args->nelts; i++) {
+        s = ngx_array_push(clcf->normalize_strip);
+        if (s == NULL) {
+            return NGX_CONF_ERROR;
+        }
+        *s = value[i];
+    }
+
+    return NGX_CONF_OK;
+}
+
+
 static void *
 ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
 {
@@ -1259,6 +1510,8 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->max_size = NGX_CONF_UNSET_SIZE;
     conf->redis_enable = NGX_CONF_UNSET;
     conf->redis_timeout = NGX_CONF_UNSET_MSEC;
+    conf->normalize_strip_all = NGX_CONF_UNSET;
+    conf->normalize_strip = NGX_CONF_UNSET_PTR;
     /* shm_zone, key, redis_addr, redis_prefix default NULL via pcalloc */
 
     return conf;
@@ -1302,6 +1555,13 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
             ngx_str_set(&conf->redis_prefix,
                         NGX_HTTP_CACHE_TURBO_REDIS_PREFIX);
         }
+    }
+
+    /* Key normalize: inherit strip_all + the extra-pattern list. */
+    ngx_conf_merge_value(conf->normalize_strip_all, prev->normalize_strip_all,
+                         0);
+    if (conf->normalize_strip == NGX_CONF_UNSET_PTR) {
+        conf->normalize_strip = prev->normalize_strip;
     }
 
     return NGX_CONF_OK;

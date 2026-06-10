@@ -245,6 +245,34 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # key normalize (v3-1): key is built from $cache_turbo_normalized_args
+        # so reordered / tracking-laden query strings collapse to one slot
+        location /n/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri$cache_turbo_normalized_args;
+            cache_turbo_valid    30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # extra denylist patterns: exact "sid" + prefix "tmp_*", on top of the
+        # built-in defaults (utm_*, fbclid, ...)
+        location /ns/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri$cache_turbo_normalized_args;
+            cache_turbo_valid    30s;
+            cache_turbo_normalize_strip sid "tmp_*";
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # strip_all: every arg dropped, so all query strings share one slot
+        location /na/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri$cache_turbo_normalized_args;
+            cache_turbo_valid    30s;
+            cache_turbo_normalize_strip_all on;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # uncached passthrough, lets us read the raw origin
         location /raw/ {{
             proxy_pass http://127.0.0.1:{origin_port}/;
@@ -788,6 +816,72 @@ def test_l2_tag_purge(ng: Nginx, origin: Origin, redis: RedisServer) -> None:
         "post-purge bodies should be fresh generations"
 
 
+def test_normalize_arg_order(ng: Nginx, origin: Origin) -> None:
+    """v3-1: ?b=2&a=1 and ?a=1&b=2 normalize to one cache slot — the reordered
+    second request is a HIT serving the first body, origin hit exactly once."""
+    base = origin.hits
+    s1, b1, h1 = fetch(ng.port, "/n/order?b=2&a=1")
+    assert s1 == 200 and "x-cache" not in h1, "first request should miss to origin"
+    s2, b2, h2 = fetch(ng.port, "/n/order?a=1&b=2")
+    assert h2.get("x-cache") == "HIT", \
+        f"reordered args should HIT, got X-Cache={h2.get('x-cache')}"
+    assert b2 == b1, "reordered request served a different body"
+    assert origin.hits == base + 1, \
+        f"origin hit {origin.hits - base} times (args not normalized to one key)"
+
+
+def test_normalize_strips_tracking(ng: Nginx, origin: Origin) -> None:
+    """Built-in denylist: utm_* and fbclid are dropped, so ?p=1&utm_source=x&
+    fbclid=y collapses onto the same slot as a bare ?p=1."""
+    base = origin.hits
+    _, b1, h1 = fetch(ng.port, "/n/track?p=1")
+    assert "x-cache" not in h1, "prime should miss to origin"
+    _, b2, h2 = fetch(ng.port, "/n/track?p=1&utm_source=news&utm_medium=cpc&fbclid=z")
+    assert h2.get("x-cache") == "HIT", \
+        f"tracking-only diff should HIT, got X-Cache={h2.get('x-cache')}"
+    assert b2 == b1, "tracking-laden request served a different body"
+    assert origin.hits == base + 1, "tracking params were not stripped from the key"
+
+
+def test_normalize_strip_custom(ng: Nginx, origin: Origin) -> None:
+    """cache_turbo_normalize_strip adds exact ("sid") and prefix ("tmp_*")
+    patterns on top of the defaults; a request differing only in those HITs."""
+    base = origin.hits
+    _, b1, h1 = fetch(ng.port, "/ns/page?keep=1")
+    assert "x-cache" not in h1, "prime should miss to origin"
+    _, b2, h2 = fetch(ng.port, "/ns/page?sid=abc&keep=1&tmp_foo=9&utm_source=x")
+    assert h2.get("x-cache") == "HIT", \
+        f"custom-stripped diff should HIT, got X-Cache={h2.get('x-cache')}"
+    assert b2 == b1, "custom-stripped request served a different body"
+    assert origin.hits == base + 1, "custom strip patterns not applied"
+
+
+def test_normalize_strip_all(ng: Nginx, origin: Origin) -> None:
+    """cache_turbo_normalize_strip_all drops EVERY arg, so wholly different query
+    strings on the same path share one cache slot."""
+    base = origin.hits
+    _, b1, h1 = fetch(ng.port, "/na/x?anything=1&here=2")
+    assert "x-cache" not in h1, "prime should miss to origin"
+    _, b2, h2 = fetch(ng.port, "/na/x?totally=different&set=ofargs")
+    assert h2.get("x-cache") == "HIT", \
+        f"strip_all should collapse all args to one slot, got {h2.get('x-cache')}"
+    assert b2 == b1, "strip_all served a different body"
+    assert origin.hits == base + 1, "strip_all did not drop all args"
+
+
+def test_normalize_distinct_args_differ(ng: Nginx, origin: Origin) -> None:
+    """Guard against over-normalizing: a meaningful arg difference (a=1 vs a=2)
+    must remain two distinct cache slots, not collapse to one."""
+    base = origin.hits
+    _, b1, h1 = fetch(ng.port, "/n/distinct?a=1")
+    assert "x-cache" not in h1, "first should miss"
+    _, b2, h2 = fetch(ng.port, "/n/distinct?a=2")
+    assert "x-cache" not in h2, \
+        f"a different value must MISS, got X-Cache={h2.get('x-cache')}"
+    assert b2 != b1, "distinct args wrongly served the same cached body"
+    assert origin.hits == base + 2, "both distinct args should reach origin"
+
+
 def run_all(ng: Nginx, origin: Origin,
             redis: RedisServer | None = None) -> None:
     test_miss_then_hit(ng)
@@ -800,6 +894,11 @@ def run_all(ng: Nginx, origin: Origin,
     test_admin_gating(ng)
     test_stale_serves_stale(ng, origin)
     test_single_flight(ng, origin)
+    test_normalize_arg_order(ng, origin)
+    test_normalize_strips_tracking(ng, origin)
+    test_normalize_strip_custom(ng, origin)
+    test_normalize_strip_all(ng, origin)
+    test_normalize_distinct_args_differ(ng, origin)
     if redis is not None:
         test_l2_write_through(ng, origin, redis)
         test_l2_cross_instance_fill(ng, origin, redis)
@@ -849,7 +948,8 @@ def main() -> int:
 
     print("OK: miss/hit, header fidelity, max_size, concurrency (R1), "
           "LRU eviction (R6), stale serve (R3), single-flight (R4), "
-          "admin stats/purge/gating"
+          "admin stats/purge/gating, key normalize (v3-1: order/tracking/"
+          "custom-strip/strip-all/distinct)"
           + (", L2 write-through (P4), L2 cross-instance fill (P2), "
              "L2-aware key purge (P6), expired-L1 consults L2 (P6), "
              "tag index add (v2c), tag purge both tiers (P4)"
