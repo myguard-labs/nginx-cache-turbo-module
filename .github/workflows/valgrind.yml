@@ -5,12 +5,10 @@ env:
   NGINX_VERSION: "1.31.1"
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+  # Heavy job: monthly on a schedule + manual only. NOT on every push/PR
+  # (build-test.yml already runs ASan+UBSan on each change for fast feedback).
   schedule:
-    - cron: "30 3 1 * *"
+    - cron: "30 3 1 * *"   # 03:30 on the 1st of each month
   workflow_dispatch: {}
 
 concurrency:

@@ -5,12 +5,10 @@ env:
   NGINX_VERSION: "1.31.1"
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+  # Heavy job: monthly on a schedule + manual only. NOT on every push/PR
+  # (build-test.yml carries the per-change static checks: cppcheck, -Werror).
   schedule:
-    - cron: "47 4 * * 1"
+    - cron: "47 4 1 * *"   # 04:47 on the 1st of each month
   workflow_dispatch: {}
 
 concurrency:
