@@ -173,6 +173,17 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # tagged objects: every response under /l2t/ joins the "blog" and
+        # "news" tag sets, so a purge-by-tag can drop them across both tiers.
+        location /l2t/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    30s;
+            cache_turbo_redis    127.0.0.1:{redis_port} prefix=ct: timeout=250ms;
+            cache_turbo_tag      "blog news";
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # admin endpoint that is itself L2-aware: a single-key purge here must
         # also DEL the entry from Redis (P6), not just drop L1.
         location = /_cache_l2 {{
@@ -716,6 +727,67 @@ def test_l2_expired_consults_l2(ng: Nginx, origin: Origin,
         "origin was hit even though L2 held a fresh copy (P6 regression)"
 
 
+def tag_key(name: str, prefix: str = "ct:") -> str:
+    """Mirror the module's tag-set key: <prefix>tag:<name>."""
+    return f"{prefix}tag:{name}"
+
+
+def test_l2_tag_add_on_store(ng: Nginx, origin: Origin,
+                             redis: RedisServer) -> None:
+    """v2c: a tagged store SADDs the object's L2 key into every tag set named by
+    cache_turbo_tag, and bounds the set's lifetime with an EXPIRE."""
+    redis.cli("DEL", tag_key("blog"), tag_key("news"))
+    uri = "/l2t/article"
+    s, _, h = fetch(ng.port, uri)                  # miss -> origin -> store+tag
+    assert s == 200 and "x-cache" not in h, "tagged prime should miss to origin"
+
+    okey = l2_key(uri)
+    # SADD is fire-and-forget; let it land
+    assert wait_for(lambda: redis.cli("SISMEMBER", tag_key("blog"), okey) == "1"), \
+        "object key never joined tag set 'blog'"
+    assert redis.cli("SISMEMBER", tag_key("news"), okey) == "1", \
+        "object key missing from second tag set 'news'"
+    # EXPIRE applied to the tag set (bounded lifetime)
+    pttl = int(redis.cli("PTTL", tag_key("blog")))
+    assert pttl > 0, f"tag set has no TTL (PTTL={pttl})"
+
+
+def test_l2_tag_purge(ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    """P4: purge-by-tag drops every tagged object from BOTH tiers and removes
+    the tag set. Two objects share tag 'news'; one POST clears them all."""
+    redis.cli("DEL", tag_key("blog"), tag_key("news"))
+    u1, u2 = "/l2t/p1", "/l2t/p2"
+    body1, body2 = {}, {}
+    for u, store in ((u1, body1), (u2, body2)):
+        _, b, _ = fetch(ng.port, u)                # miss -> origin -> store+tag
+        store["body"] = b
+        _, _, h = fetch(ng.port, u)
+        assert h.get("x-cache") == "HIT", f"{u} should be cached (L1) before purge"
+    assert wait_for(lambda: redis.cli("SCARD", tag_key("news")) == "2"), \
+        "both objects should be in tag set 'news'"
+
+    s, b, _ = fetch(ng.port, f"/_cache_l2?tag=news", method="POST")
+    assert s == 200, f"tag purge status {s}"
+    assert json.loads(b)["purged"] == 2, f"expected 2 purged, got {b}"
+
+    # both objects gone from L2, and the tag set itself deleted
+    assert wait_for(lambda: redis.cli("EXISTS", l2_key(u1)) == "0"
+                    and redis.cli("EXISTS", l2_key(u2)) == "0"), \
+        "tagged objects not removed from L2"
+    assert wait_for(lambda: redis.cli("EXISTS", tag_key("news")) == "0"), \
+        "emptied tag set was not deleted"
+
+    # both gone from L1: next reads miss to a fresh origin generation
+    origin_before = origin.hits
+    _, nb1, h1 = fetch(ng.port, u1)
+    _, nb2, h2 = fetch(ng.port, u2)
+    assert "x-cache" not in h1 and "x-cache" not in h2, \
+        "tagged objects should be a MISS in L1 after purge"
+    assert origin.hits == origin_before + 2, "both reads should reach origin"
+    assert nb1 != body1["body"] and nb2 != body2["body"], \
+        "post-purge bodies should be fresh generations"
+
+
 def run_all(ng: Nginx, origin: Origin,
             redis: RedisServer | None = None) -> None:
     test_miss_then_hit(ng)
@@ -733,6 +805,8 @@ def run_all(ng: Nginx, origin: Origin,
         test_l2_cross_instance_fill(ng, origin, redis)
         test_l2_purge_key_drops_l2(ng, origin, redis)
         test_l2_expired_consults_l2(ng, origin, redis)
+        test_l2_tag_add_on_store(ng, origin, redis)
+        test_l2_tag_purge(ng, origin, redis)
     test_admin_purge_all(ng)   # last: it empties the zone
 
 
@@ -777,7 +851,8 @@ def main() -> int:
           "LRU eviction (R6), stale serve (R3), single-flight (R4), "
           "admin stats/purge/gating"
           + (", L2 write-through (P4), L2 cross-instance fill (P2), "
-             "L2-aware key purge (P6), expired-L1 consults L2 (P6)"
+             "L2-aware key purge (P6), expired-L1 consults L2 (P6), "
+             "tag index add (v2c), tag purge both tiers (P4)"
              if redis_port else ""))
     return 0
 

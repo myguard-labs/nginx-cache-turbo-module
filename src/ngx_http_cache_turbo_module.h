@@ -96,6 +96,12 @@ typedef struct {
     ngx_addr_t               redis_addr;   /* resolved host:port               */
     ngx_str_t                redis_prefix; /* key prefix, default "ct:"        */
     ngx_msec_t               redis_timeout;/* connect/read timeout             */
+
+    /* Tag index (v2c). cache_turbo_tag evaluates to a whitespace/comma list of
+     * tags; on store each tag set "<prefix>tag:<name>" gets the object's L2 key
+     * SADD'ed (+EXPIRE), so a purge-by-tag can drop every keyed object across
+     * both tiers. Tags live only in L2, so this needs cache_turbo_redis. */
+    ngx_http_complex_value_t *tag;        /* tag list expression, or NULL     */
 } ngx_http_cache_turbo_loc_conf_t;
 
 
@@ -189,6 +195,42 @@ void ngx_http_cache_turbo_redis_set(ngx_http_request_t *r,
  * survives the request. No-op when L2 is disabled. */
 void ngx_http_cache_turbo_redis_del(ngx_http_cache_turbo_loc_conf_t *clcf,
     u_char *key_hash);
+
+/* Fire-and-forget DEL of an arbitrary raw key (e.g. an emptied tag set). The
+ * key bytes are copied immediately, so the caller's buffer need not outlive the
+ * call. No-op when L2 is disabled. */
+void ngx_http_cache_turbo_redis_del_raw(ngx_http_cache_turbo_loc_conf_t *clcf,
+    u_char *key, size_t key_len);
+
+/* Build the tag-set key "<prefix>tag:<name>" into buf (must hold
+ * prefix.len + sizeof("tag:")-1 + name_len). Returns bytes written. */
+size_t ngx_http_cache_turbo_redis_tagkey(ngx_str_t *prefix, u_char *name,
+    size_t name_len, u_char *buf);
+
+/* Tag index store: SADD "<prefix>tag:<name>" "<object L2 key>" + EXPIRE the tag
+ * set to ttl seconds (refreshed each store). Async fire-and-forget. No-op when
+ * L2 is disabled. */
+void ngx_http_cache_turbo_redis_tag_add(ngx_http_cache_turbo_loc_conf_t *clcf,
+    u_char *key_hash, u_char *name, size_t name_len, time_t ttl);
+
+/* Completion callback for a SMEMBERS fetch: invoked once with the set members
+ * (pointing into transient buffers — copy what must outlive the call) BEFORE
+ * the request is finalized. Must produce the HTTP response and return the rc to
+ * finalize with. Called with nmembers==0 on an empty/missing set or any error,
+ * so the response path is uniform. */
+typedef ngx_int_t (*ngx_http_cache_turbo_redis_members_pt)(
+    ngx_http_request_t *r, void *data, ngx_str_t *members,
+    ngx_uint_t nmembers);
+
+/* Sync-park SMEMBERS "<prefix>tag:<name>": parks the request (count++) and,
+ * when the array reply lands, invokes cb(r, data, members, n) then finalizes
+ * with the rc cb returned. Returns:
+ *   NGX_DONE  - parked; caller must return NGX_DONE
+ *   NGX_ERROR - could not start (L2 disabled or connect failed); caller
+ *               produces its own response. */
+ngx_int_t ngx_http_cache_turbo_redis_smembers(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf, u_char *name, size_t name_len,
+    ngx_http_cache_turbo_redis_members_pt cb, void *data);
 
 /* Sync-on-L1-miss GET. Issues GET <key> and parks the request (count++,
  * NGX_AGAIN) until the reply arrives; the read handler stores the result in

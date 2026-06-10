@@ -37,10 +37,14 @@ typedef struct {
     ngx_buf_t                   *send;     /* RESP command to write           */
     ngx_msec_t                   timeout;
 
-    ngx_http_request_t          *request;  /* GET: parked request; SET: NULL  */
+    ngx_http_request_t          *request;  /* GET/SMEMBERS: parked req; else NULL */
     ngx_http_cache_turbo_ctx_t  *ctx;      /* GET: request ctx to fill        */
 
-    u_char                      *rbuf;     /* GET: growable reply buffer      */
+    /* SMEMBERS: completion callback + opaque data (tag-purge policy) */
+    ngx_http_cache_turbo_redis_members_pt  members_cb;
+    void                        *members_data;
+
+    u_char                      *rbuf;     /* GET/SMEMBERS: growable reply buf */
     size_t                       rcap;
     size_t                       rlen;
 
@@ -51,11 +55,15 @@ typedef struct {
 static void ngx_http_cache_turbo_redis_write(ngx_event_t *wev);
 static void ngx_http_cache_turbo_redis_read_drain(ngx_event_t *rev);
 static void ngx_http_cache_turbo_redis_read_get(ngx_event_t *rev);
+static void ngx_http_cache_turbo_redis_read_smembers(ngx_event_t *rev);
 static void ngx_http_cache_turbo_redis_op_done(
     ngx_http_cache_turbo_redis_op_t *op);
 static void ngx_http_cache_turbo_redis_get_finish(
     ngx_http_cache_turbo_redis_op_t *op, ngx_int_t result,
     u_char *blob, size_t blob_len);
+static void ngx_http_cache_turbo_redis_smembers_finish(
+    ngx_http_cache_turbo_redis_op_t *op, ngx_str_t *members,
+    ngx_uint_t nmembers);
 static void ngx_http_cache_turbo_redis_op_fail(
     ngx_http_cache_turbo_redis_op_t *op);
 
@@ -246,16 +254,108 @@ ngx_http_cache_turbo_redis_set(ngx_http_request_t *r,
 }
 
 
+/* Fire-and-forget a single RESP command (drains the reply, ignores it). The
+ * argv bytes are copied into the op pool by encode, so they need only be valid
+ * for the duration of this call. */
+static void
+ngx_http_cache_turbo_redis_fire_argv(ngx_http_cache_turbo_loc_conf_t *clcf,
+    ngx_str_t *argv, ngx_uint_t argc)
+{
+    ngx_http_cache_turbo_redis_op_t  *op;
+
+    op = ngx_http_cache_turbo_redis_op_create(clcf);
+    if (op == NULL) {
+        return;
+    }
+
+    op->send = ngx_http_cache_turbo_redis_encode(op->pool, argv, argc);
+    if (op->send == NULL) {
+        ngx_destroy_pool(op->pool);
+        return;
+    }
+
+    if (ngx_http_cache_turbo_redis_connect(op, &clcf->redis_addr,
+            ngx_http_cache_turbo_redis_read_drain) != NGX_OK)
+    {
+        ngx_destroy_pool(op->pool);
+    }
+}
+
+
+void
+ngx_http_cache_turbo_redis_del_raw(ngx_http_cache_turbo_loc_conf_t *clcf,
+    u_char *key, size_t key_len)
+{
+    ngx_str_t  argv[2];
+
+    if (!clcf->redis_enable) {
+        return;
+    }
+
+    argv[0].data = (u_char *) "DEL";
+    argv[0].len = sizeof("DEL") - 1;
+    argv[1].data = key;
+    argv[1].len = key_len;
+
+    ngx_http_cache_turbo_redis_fire_argv(clcf, argv, 2);
+}
+
+
 void
 ngx_http_cache_turbo_redis_del(ngx_http_cache_turbo_loc_conf_t *clcf,
     u_char *key_hash)
 {
-    ngx_pool_t                       *pool;
-    ngx_str_t                         argv[2];
-    ngx_http_cache_turbo_redis_op_t  *op;
-    u_char                           *keybuf;
+    ngx_pool_t  *tmp;
+    u_char      *keybuf;
+    size_t       keylen;
 
     if (!clcf->redis_enable) {
+        return;
+    }
+
+    /* Build the hex L2 key in a short-lived pool; del_raw copies it before this
+     * returns, so the pool can be torn down immediately afterwards. */
+    tmp = ngx_create_pool(ngx_pagesize, ngx_cycle->log);
+    if (tmp == NULL) {
+        return;
+    }
+
+    keybuf = ngx_pnalloc(tmp, clcf->redis_prefix.len + 64);
+    if (keybuf != NULL) {
+        keylen = ngx_http_cache_turbo_redis_key(&clcf->redis_prefix, key_hash,
+                                                keybuf);
+        ngx_http_cache_turbo_redis_del_raw(clcf, keybuf, keylen);
+    }
+
+    ngx_destroy_pool(tmp);
+}
+
+
+size_t
+ngx_http_cache_turbo_redis_tagkey(ngx_str_t *prefix, u_char *name,
+    size_t name_len, u_char *buf)
+{
+    u_char  *p;
+
+    p = ngx_cpymem(buf, prefix->data, prefix->len);
+    p = ngx_cpymem(p, "tag:", sizeof("tag:") - 1);
+    p = ngx_cpymem(p, name, name_len);
+
+    return (size_t) (p - buf);
+}
+
+
+void
+ngx_http_cache_turbo_redis_tag_add(ngx_http_cache_turbo_loc_conf_t *clcf,
+    u_char *key_hash, u_char *name, size_t name_len, time_t ttl)
+{
+    ngx_str_t                         argv[3];
+    ngx_buf_t                        *sadd, *expire;
+    size_t                            n1, n2;
+    ngx_http_cache_turbo_redis_op_t  *op;
+    u_char                           *tagkey, *member, *ttlbuf;
+
+    if (!clcf->redis_enable || ttl <= 0 || name_len == 0) {
         return;
     }
 
@@ -263,30 +363,56 @@ ngx_http_cache_turbo_redis_del(ngx_http_cache_turbo_loc_conf_t *clcf,
     if (op == NULL) {
         return;
     }
-    pool = op->pool;
 
-    keybuf = ngx_pnalloc(pool, clcf->redis_prefix.len + 64);
-    if (keybuf == NULL) {
-        ngx_destroy_pool(pool);
+    tagkey = ngx_pnalloc(op->pool,
+                         clcf->redis_prefix.len + sizeof("tag:") - 1 + name_len);
+    member = ngx_pnalloc(op->pool, clcf->redis_prefix.len + 64);
+    ttlbuf = ngx_pnalloc(op->pool, NGX_INT64_LEN);
+    if (tagkey == NULL || member == NULL || ttlbuf == NULL) {
+        ngx_destroy_pool(op->pool);
         return;
     }
 
-    argv[0].data = (u_char *) "DEL";
-    argv[0].len = sizeof("DEL") - 1;
-    argv[1].data = keybuf;
-    argv[1].len = ngx_http_cache_turbo_redis_key(&clcf->redis_prefix,
-                                                 key_hash, keybuf);
+    /* SADD <prefix>tag:<name> <object L2 key> */
+    argv[0].data = (u_char *) "SADD";
+    argv[0].len = sizeof("SADD") - 1;
+    argv[1].data = tagkey;
+    argv[1].len = ngx_http_cache_turbo_redis_tagkey(&clcf->redis_prefix, name,
+                                                    name_len, tagkey);
+    argv[2].data = member;
+    argv[2].len = ngx_http_cache_turbo_redis_key(&clcf->redis_prefix, key_hash,
+                                                 member);
+    sadd = ngx_http_cache_turbo_redis_encode(op->pool, argv, 3);
 
-    op->send = ngx_http_cache_turbo_redis_encode(pool, argv, 2);
+    /* EXPIRE <prefix>tag:<name> <ttl> — bound the tag set's lifetime so dead
+     * members can't accumulate forever; refreshed on every store. */
+    argv[0].data = (u_char *) "EXPIRE";
+    argv[0].len = sizeof("EXPIRE") - 1;
+    /* argv[1] (tagkey) unchanged */
+    argv[2].data = ttlbuf;
+    argv[2].len = (size_t) (ngx_sprintf(ttlbuf, "%T", ttl) - ttlbuf);
+    expire = ngx_http_cache_turbo_redis_encode(op->pool, argv, 3);
+
+    if (sadd == NULL || expire == NULL) {
+        ngx_destroy_pool(op->pool);
+        return;
+    }
+
+    /* Pipeline both commands into one buffer (one round trip). */
+    n1 = sadd->last - sadd->pos;
+    n2 = expire->last - expire->pos;
+    op->send = ngx_create_temp_buf(op->pool, n1 + n2);
     if (op->send == NULL) {
-        ngx_destroy_pool(pool);
+        ngx_destroy_pool(op->pool);
         return;
     }
+    op->send->last = ngx_cpymem(op->send->last, sadd->pos, n1);
+    op->send->last = ngx_cpymem(op->send->last, expire->pos, n2);
 
     if (ngx_http_cache_turbo_redis_connect(op, &clcf->redis_addr,
             ngx_http_cache_turbo_redis_read_drain) != NGX_OK)
     {
-        ngx_destroy_pool(pool);
+        ngx_destroy_pool(op->pool);
     }
 }
 
@@ -345,6 +471,63 @@ ngx_http_cache_turbo_redis_get(ngx_http_request_t *r,
     r->main->count++;
 
     return NGX_AGAIN;
+}
+
+
+ngx_int_t
+ngx_http_cache_turbo_redis_smembers(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf, u_char *name, size_t name_len,
+    ngx_http_cache_turbo_redis_members_pt cb, void *data)
+{
+    ngx_str_t                         argv[2];
+    ngx_http_cache_turbo_redis_op_t  *op;
+    u_char                           *tagkey;
+
+    if (!clcf->redis_enable) {
+        return NGX_ERROR;
+    }
+
+    op = ngx_http_cache_turbo_redis_op_create(clcf);
+    if (op == NULL) {
+        return NGX_ERROR;
+    }
+    op->request = r;
+    op->members_cb = cb;
+    op->members_data = data;
+
+    op->rcap = ngx_pagesize * 4;          /* grows on demand up to MAX_REPLY */
+    op->rbuf = ngx_pnalloc(op->pool, op->rcap);
+    tagkey = ngx_pnalloc(op->pool,
+                         clcf->redis_prefix.len + sizeof("tag:") - 1 + name_len);
+    if (op->rbuf == NULL || tagkey == NULL) {
+        ngx_destroy_pool(op->pool);
+        return NGX_ERROR;
+    }
+
+    argv[0].data = (u_char *) "SMEMBERS";
+    argv[0].len = sizeof("SMEMBERS") - 1;
+    argv[1].data = tagkey;
+    argv[1].len = ngx_http_cache_turbo_redis_tagkey(&clcf->redis_prefix, name,
+                                                    name_len, tagkey);
+
+    op->send = ngx_http_cache_turbo_redis_encode(op->pool, argv, 2);
+    if (op->send == NULL) {
+        ngx_destroy_pool(op->pool);
+        return NGX_ERROR;
+    }
+
+    if (ngx_http_cache_turbo_redis_connect(op, &clcf->redis_addr,
+            ngx_http_cache_turbo_redis_read_smembers) != NGX_OK)
+    {
+        ngx_destroy_pool(op->pool);
+        return NGX_ERROR;
+    }
+
+    /* Parked: hold a reference until the reply resumes the request (released by
+     * ngx_http_finalize_request in smembers_finish). */
+    r->main->count++;
+
+    return NGX_DONE;
 }
 
 
@@ -563,6 +746,214 @@ ngx_http_cache_turbo_redis_read_get(ngx_event_t *rev)
 }
 
 
+/* Upper bound on a SMEMBERS reply element count, so a bogus "*<huge>" header
+ * can't make us allocate an enormous members array before any data arrives. */
+#define NGX_HTTP_CACHE_TURBO_REDIS_MAX_MEMBERS  (1024 * 1024)
+
+
+/*
+ * Parse an accumulated SMEMBERS array reply in op->rbuf[0..op->rlen]:
+ *   *<count>\r\n  then count bulk strings  $<len>\r\n<bytes>\r\n
+ * On NGX_OK, *members (allocated from op->pool) points at ngx_str_t entries that
+ * reference into rbuf; nil array (*-1) and empty (*0) yield NGX_OK with 0.
+ * Returns NGX_AGAIN (need more bytes) or NGX_DECLINED (malformed/non-array).
+ */
+static ngx_int_t
+ngx_http_cache_turbo_redis_parse_array(ngx_http_cache_turbo_redis_op_t *op,
+    ngx_str_t **members, ngx_uint_t *nmembers)
+{
+    u_char     *p, *crlf, *end;
+    ngx_int_t   count, len;
+    ngx_uint_t  i;
+    ngx_str_t  *list;
+
+    p = op->rbuf;
+    end = op->rbuf + op->rlen;
+
+    if (p == end) {
+        return NGX_AGAIN;
+    }
+
+    if (*p != '*') {
+        return NGX_DECLINED;               /* not an array reply */
+    }
+
+    crlf = ngx_strlchr(p + 1, end, CR);
+    if (crlf == NULL || crlf + 1 >= end || crlf[1] != LF) {
+        return NGX_AGAIN;
+    }
+
+    count = ngx_atoi(p + 1, crlf - (p + 1));
+    if (count == NGX_ERROR) {
+        return NGX_DECLINED;
+    }
+    if (count < 0) {                       /* *-1 nil array */
+        *members = NULL;
+        *nmembers = 0;
+        return NGX_OK;
+    }
+    if (count > NGX_HTTP_CACHE_TURBO_REDIS_MAX_MEMBERS) {
+        return NGX_DECLINED;
+    }
+    if (count == 0) {
+        *members = NULL;
+        *nmembers = 0;
+        return NGX_OK;
+    }
+
+    /* ngx_palloc (not ngx_pnalloc): the ngx_str_t array needs pointer
+     * alignment; an unaligned base is UB (trapped by UBSan). */
+    list = ngx_palloc(op->pool, count * sizeof(ngx_str_t));
+    if (list == NULL) {
+        return NGX_DECLINED;
+    }
+
+    p = crlf + 2;
+
+    for (i = 0; i < (ngx_uint_t) count; i++) {
+        if (p >= end) {
+            return NGX_AGAIN;
+        }
+        if (*p != '$') {
+            return NGX_DECLINED;
+        }
+
+        crlf = ngx_strlchr(p + 1, end, CR);
+        if (crlf == NULL || crlf + 1 >= end || crlf[1] != LF) {
+            return NGX_AGAIN;
+        }
+
+        len = ngx_atoi(p + 1, crlf - (p + 1));
+        if (len == NGX_ERROR) {
+            return NGX_DECLINED;
+        }
+
+        if (len < 0) {                     /* nil element: empty member */
+            list[i].data = NULL;
+            list[i].len = 0;
+            p = crlf + 2;
+            continue;
+        }
+
+        if (len > NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY) {
+            return NGX_DECLINED;
+        }
+
+        p = crlf + 2;
+        if (end - p < len + 2) {           /* payload + trailing CRLF */
+            return NGX_AGAIN;
+        }
+
+        list[i].data = p;
+        list[i].len = (size_t) len;
+        p += len + 2;
+    }
+
+    *members = list;
+    *nmembers = (ngx_uint_t) count;
+    return NGX_OK;
+}
+
+
+static void
+ngx_http_cache_turbo_redis_read_smembers(ngx_event_t *rev)
+{
+    ssize_t                           n;
+    ngx_str_t                        *members;
+    u_char                           *nbuf;
+    size_t                            ncap;
+    ngx_uint_t                        nmembers;
+    ngx_int_t                         rc;
+    ngx_connection_t                 *c;
+    ngx_http_cache_turbo_redis_op_t  *op;
+
+    c = rev->data;
+    op = c->data;
+
+    if (rev->timedout) {
+        ngx_log_error(NGX_LOG_INFO, c->log, NGX_ETIMEDOUT,
+                      "cache_turbo: redis SMEMBERS timed out");
+        ngx_http_cache_turbo_redis_smembers_finish(op, NULL, 0);
+        return;
+    }
+
+    for ( ;; ) {
+        if (op->rlen == op->rcap) {
+            if (op->rcap >= NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY) {
+                ngx_http_cache_turbo_redis_smembers_finish(op, NULL, 0);
+                return;
+            }
+            ncap = op->rcap * 2;
+            if (ncap > NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY) {
+                ncap = NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY;
+            }
+            nbuf = ngx_pnalloc(op->pool, ncap);
+            if (nbuf == NULL) {
+                ngx_http_cache_turbo_redis_smembers_finish(op, NULL, 0);
+                return;
+            }
+            ngx_memcpy(nbuf, op->rbuf, op->rlen);
+            op->rbuf = nbuf;
+            op->rcap = ncap;
+        }
+
+        n = c->recv(c, op->rbuf + op->rlen, op->rcap - op->rlen);
+
+        if (n == NGX_AGAIN) {
+            if (ngx_handle_read_event(rev, 0) != NGX_OK) {
+                ngx_http_cache_turbo_redis_smembers_finish(op, NULL, 0);
+            }
+            return;
+        }
+        if (n == NGX_ERROR || n == 0) {
+            ngx_http_cache_turbo_redis_smembers_finish(op, NULL, 0);
+            return;
+        }
+
+        op->rlen += n;
+
+        rc = ngx_http_cache_turbo_redis_parse_array(op, &members, &nmembers);
+        if (rc == NGX_AGAIN) {
+            continue;
+        }
+        if (rc == NGX_OK) {
+            ngx_http_cache_turbo_redis_smembers_finish(op, members, nmembers);
+        } else {
+            ngx_http_cache_turbo_redis_smembers_finish(op, NULL, 0);
+        }
+        return;
+    }
+}
+
+
+/*
+ * SMEMBERS teardown + resume. Hands the parsed members to the policy callback
+ * (which must purge + produce the HTTP response while the members are still
+ * valid), tears down the op pool, then finalizes the parked request with the
+ * rc the callback returned. On any failure the callback runs with 0 members so
+ * the caller always gets a well-formed response.
+ */
+static void
+ngx_http_cache_turbo_redis_smembers_finish(
+    ngx_http_cache_turbo_redis_op_t *op, ngx_str_t *members,
+    ngx_uint_t nmembers)
+{
+    ngx_http_request_t                     *r = op->request;
+    ngx_http_cache_turbo_redis_members_pt   cb = op->members_cb;
+    void                                   *data = op->members_data;
+    ngx_int_t                               rc;
+
+    /* Callback consumes members (pointing into op->rbuf) synchronously. */
+    rc = cb(r, data, members, nmembers);
+
+    /* Now safe to drop our connection + pool (members no longer referenced). */
+    ngx_http_cache_turbo_redis_op_done(op);
+
+    ngx_http_run_posted_requests(r->connection);
+    ngx_http_finalize_request(r, rc);
+}
+
+
 /* SET path teardown: close the connection and free the op pool. */
 static void
 ngx_http_cache_turbo_redis_op_done(ngx_http_cache_turbo_redis_op_t *op)
@@ -616,11 +1007,13 @@ ngx_http_cache_turbo_redis_get_finish(ngx_http_cache_turbo_redis_op_t *op,
 }
 
 
-/* Terminal failure on the shared paths: dispatch by op kind. */
+/* Terminal failure on the shared write path: dispatch by op kind. */
 static void
 ngx_http_cache_turbo_redis_op_fail(ngx_http_cache_turbo_redis_op_t *op)
 {
-    if (op->request) {
+    if (op->members_cb) {
+        ngx_http_cache_turbo_redis_smembers_finish(op, NULL, 0);
+    } else if (op->request) {
         ngx_http_cache_turbo_redis_get_finish(op, NGX_DECLINED, NULL, 0);
     } else {
         ngx_http_cache_turbo_redis_op_done(op);

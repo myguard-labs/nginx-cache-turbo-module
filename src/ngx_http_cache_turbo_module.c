@@ -39,7 +39,11 @@ static char *ngx_http_cache_turbo_admin(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static char *ngx_http_cache_turbo_redis_conf(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
+static char *ngx_http_cache_turbo_tag(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
 static ngx_int_t ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r);
+static ngx_int_t ngx_http_cache_turbo_tag_purge_complete(ngx_http_request_t *r,
+    void *data, ngx_str_t *members, ngx_uint_t nmembers);
 static ngx_int_t ngx_http_cache_turbo_init(ngx_conf_t *cf);
 
 
@@ -108,6 +112,13 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
     { ngx_string("cache_turbo_redis"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE123,
       ngx_http_cache_turbo_redis_conf,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+
+    { ngx_string("cache_turbo_tag"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
+      ngx_http_cache_turbo_tag,
       NGX_HTTP_LOC_CONF_OFFSET,
       0,
       NULL },
@@ -678,6 +689,43 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
              * its own pool, so it is safe even though `blob` lives in r->pool. */
             ngx_http_cache_turbo_redis_set(r, clcf, ctx->key_hash,
                                            blob, blob_len, clcf->valid);
+
+            /* Tag index (v2c): for each tag in the cache_turbo_tag expression,
+             * SADD this object's L2 key to the tag set so it can be purged by
+             * tag later. Tags live only in L2; skip when Redis is off. */
+            if (clcf->redis_enable && clcf->tag) {
+                ngx_str_t  tagval;
+
+                if (ngx_http_complex_value(r, clcf->tag, &tagval) == NGX_OK
+                    && tagval.len)
+                {
+                    time_t   stale_ttl;
+                    u_char  *s, *e, *tok;
+
+                    stale_ttl = ngx_http_cache_turbo_stale_ttl(clcf->valid);
+                    s = tagval.data;
+                    e = tagval.data + tagval.len;
+
+                    while (s < e) {
+                        while (s < e && (*s == ' ' || *s == '\t' || *s == ','
+                                         || *s == '\r' || *s == '\n'))
+                        {
+                            s++;
+                        }
+                        tok = s;
+                        while (s < e && *s != ' ' && *s != '\t' && *s != ','
+                               && *s != '\r' && *s != '\n')
+                        {
+                            s++;
+                        }
+                        if (s > tok) {
+                            ngx_http_cache_turbo_redis_tag_add(clcf,
+                                ctx->key_hash, tok, (size_t) (s - tok),
+                                stale_ttl);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -803,6 +851,36 @@ ngx_http_cache_turbo_key(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 }
 
 
+/* "cache_turbo_tag <expr>;" sets the tag-list expression. On store the result
+ * is split on whitespace/commas and each tag set gets the object's L2 key. */
+static char *
+ngx_http_cache_turbo_tag(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_cache_turbo_loc_conf_t  *clcf = conf;
+
+    ngx_str_t                         *value;
+    ngx_http_compile_complex_value_t   ccv;
+
+    value = cf->args->elts;
+
+    clcf->tag = ngx_palloc(cf->pool, sizeof(ngx_http_complex_value_t));
+    if (clcf->tag == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    ngx_memzero(&ccv, sizeof(ngx_http_compile_complex_value_t));
+    ccv.cf = cf;
+    ccv.value = &value[1];
+    ccv.complex_value = clcf->tag;
+
+    if (ngx_http_compile_complex_value(&ccv) != NGX_OK) {
+        return NGX_CONF_ERROR;
+    }
+
+    return NGX_CONF_OK;
+}
+
+
 /* "cache_turbo_admin <zone>;" turns this location into a control endpoint for
  * the named zone. Gate it with the usual allow/deny. */
 static char *
@@ -898,20 +976,157 @@ ngx_http_cache_turbo_redis_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 }
 
 
+/* Send a small JSON body with the given status. Shared by the admin handler and
+ * the async tag-purge completion. Returns the rc to propagate/finalize with. */
+static ngx_int_t
+ngx_http_cache_turbo_send_json(ngx_http_request_t *r, ngx_uint_t status,
+    ngx_str_t *body)
+{
+    ngx_int_t     rc;
+    ngx_buf_t    *b;
+    ngx_chain_t   out;
+
+    r->headers_out.status = status;
+    ngx_str_set(&r->headers_out.content_type, "application/json");
+    r->headers_out.content_type_len = r->headers_out.content_type.len;
+    r->headers_out.content_length_n = body->len;
+
+    rc = ngx_http_send_header(r);
+    if (rc == NGX_ERROR || rc > NGX_OK || r->header_only) {
+        return rc;
+    }
+
+    b = ngx_create_temp_buf(r->pool, body->len);
+    if (b == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+    ngx_memcpy(b->pos, body->data, body->len);
+    b->last = b->pos + body->len;
+    b->last_buf = 1;
+    b->last_in_chain = 1;
+
+    out.buf = b;
+    out.next = NULL;
+    return ngx_http_output_filter(r, &out);
+}
+
+
+/* One hex nibble -> 0..15, or -1 on a non-hex char. */
+static ngx_int_t
+ngx_http_cache_turbo_hexval(u_char c)
+{
+    if (c >= '0' && c <= '9') { return c - '0'; }
+    if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
+    if (c >= 'A' && c <= 'F') { return c - 'A' + 10; }
+    return -1;
+}
+
+
+/* Decode len hex chars at src into len/2 bytes at dst. NGX_ERROR on odd length
+ * or any non-hex char. */
+static ngx_int_t
+ngx_http_cache_turbo_hexdecode(u_char *src, size_t len, u_char *dst)
+{
+    size_t     i;
+    ngx_int_t  hi, lo;
+
+    if (len & 1) {
+        return NGX_ERROR;
+    }
+    for (i = 0; i < len; i += 2) {
+        hi = ngx_http_cache_turbo_hexval(src[i]);
+        lo = ngx_http_cache_turbo_hexval(src[i + 1]);
+        if (hi < 0 || lo < 0) {
+            return NGX_ERROR;
+        }
+        dst[i / 2] = (u_char) ((hi << 4) | lo);
+    }
+    return NGX_OK;
+}
+
+
+/* State carried through an async tag purge from the admin handler to the
+ * SMEMBERS completion callback. */
+typedef struct {
+    ngx_http_cache_turbo_loc_conf_t  *clcf;
+    ngx_http_cache_turbo_zone_t      *zone;
+    ngx_str_t                         tag;    /* copied into r->pool */
+} ngx_http_cache_turbo_tagpurge_t;
+
+
+/* SMEMBERS completion: drop every member object from L1 + L2, delete the now-
+ * empty tag set, and answer {"purged":N}. Runs while `members` (which point
+ * into the redis op buffer) are still valid; everything it keeps is copied or
+ * acted on synchronously here. */
+static ngx_int_t
+ngx_http_cache_turbo_tag_purge_complete(ngx_http_request_t *r, void *data,
+    ngx_str_t *members, ngx_uint_t nmembers)
+{
+    ngx_http_cache_turbo_tagpurge_t  *tp = data;
+    ngx_uint_t                        i, purged = 0;
+    size_t                            plen, n;
+    u_char                           *tagkey, *p;
+    ngx_str_t                         body;
+
+    plen = tp->clcf->redis_prefix.len;
+
+    for (i = 0; i < nmembers; i++) {
+        if (members[i].len == 0) {
+            continue;
+        }
+
+        /* The member IS the object's L2 key: drop it from Redis. */
+        ngx_http_cache_turbo_redis_del_raw(tp->clcf, members[i].data,
+                                           members[i].len);
+
+        /* member = <prefix><64 hex of the 32-byte key hash>: drop from L1. */
+        if (members[i].len == plen + 64) {
+            u_char    key_hash[32];
+            uint32_t  hash;
+
+            if (ngx_http_cache_turbo_hexdecode(members[i].data + plen, 64,
+                                               key_hash) == NGX_OK)
+            {
+                hash = ngx_crc32_short(key_hash, 32);
+                (void) ngx_http_cache_turbo_shm_purge_key(tp->zone, key_hash,
+                                                          hash);
+            }
+        }
+
+        purged++;
+    }
+
+    /* Remove the (now-emptied) tag set itself. */
+    tagkey = ngx_pnalloc(r->pool, plen + sizeof("tag:") - 1 + tp->tag.len);
+    if (tagkey != NULL) {
+        n = ngx_http_cache_turbo_redis_tagkey(&tp->clcf->redis_prefix,
+                 tp->tag.data, tp->tag.len, tagkey);
+        ngx_http_cache_turbo_redis_del_raw(tp->clcf, tagkey, n);
+    }
+
+    p = ngx_pnalloc(r->pool, sizeof("{\"purged\":4294967295}\n"));
+    if (p == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+    body.data = p;
+    body.len = ngx_sprintf(p, "{\"purged\":%ui}\n", purged) - p;
+
+    return ngx_http_cache_turbo_send_json(r, NGX_HTTP_OK, &body);
+}
+
+
 /* GET  -> JSON stats for the zone.
  * POST -> purge: ?all=1 purges the whole zone; ?key=<string> purges one key
- *         (hashed the same way the cache hashes its key).
+ *         (hashed the same way the cache hashes its key); ?tag=<name> purges
+ *         every object tagged <name> across L1 + L2 (needs cache_turbo_redis).
  * Gating is the caller's responsibility (allow/deny in the location). */
 static ngx_int_t
 ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
 {
     ngx_http_cache_turbo_loc_conf_t  *clcf;
     ngx_http_cache_turbo_zone_t      *z;
-    ngx_buf_t                        *b;
-    ngx_chain_t                       out;
-    ngx_str_t                         body, type;
+    ngx_str_t                         body;
     u_char                           *p;
-    ngx_int_t                         rc;
     size_t                            len;
 
     clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
@@ -924,15 +1139,10 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
     if (r->method & (NGX_HTTP_POST|NGX_HTTP_PUT|NGX_HTTP_DELETE)) {
         ngx_str_t  arg;
         ngx_uint_t purged = 0;
-        ngx_uint_t all = 0;
 
         if (r->args.len
             && ngx_http_arg(r, (u_char *) "all", 3, &arg) == NGX_OK)
         {
-            all = 1;
-        }
-
-        if (all) {
             purged = ngx_http_cache_turbo_shm_purge_all(z);
 
         } else if (r->args.len
@@ -957,12 +1167,53 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
              * still reflects the L1 removal only. */
             ngx_http_cache_turbo_redis_del(clcf, key_hash);
 
-        } else {
-            ngx_str_set(&type, "application/json");
+        } else if (r->args.len
+                   && ngx_http_arg(r, (u_char *) "tag", 3, &arg) == NGX_OK)
+        {
+            /* Purge by tag. The tag index lives only in L2, so this needs
+             * cache_turbo_redis. SMEMBERS parks the request; the completion
+             * callback drops each object from L1 + L2, deletes the tag set, and
+             * sends {"purged":N}. */
+            ngx_http_cache_turbo_tagpurge_t  *tp;
+            ngx_int_t                         rc;
+
+            if (!clcf->redis_enable) {
+                ngx_str_set(&body,
+                    "{\"error\":\"tag purge requires cache_turbo_redis\"}\n");
+                return ngx_http_cache_turbo_send_json(r,
+                           NGX_HTTP_BAD_REQUEST, &body);
+            }
+
+            tp = ngx_palloc(r->pool, sizeof(ngx_http_cache_turbo_tagpurge_t));
+            if (tp == NULL) {
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }
+            tp->clcf = clcf;
+            tp->zone = z;
+            tp->tag.len = arg.len;
+            tp->tag.data = ngx_pnalloc(r->pool, arg.len);
+            if (tp->tag.data == NULL) {
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }
+            ngx_memcpy(tp->tag.data, arg.data, arg.len);
+
+            rc = ngx_http_cache_turbo_redis_smembers(r, clcf,
+                     tp->tag.data, tp->tag.len,
+                     ngx_http_cache_turbo_tag_purge_complete, tp);
+            if (rc == NGX_DONE) {
+                return NGX_DONE;            /* parked; completion sends reply */
+            }
+
             ngx_str_set(&body,
-                "{\"error\":\"specify ?all=1 or ?key=<string>\"}\n");
-            r->headers_out.status = NGX_HTTP_BAD_REQUEST;
-            goto send;
+                "{\"error\":\"tag purge backend unavailable\"}\n");
+            return ngx_http_cache_turbo_send_json(r, NGX_HTTP_BAD_GATEWAY,
+                       &body);
+
+        } else {
+            ngx_str_set(&body,
+                "{\"error\":\"specify ?all=1, ?key=<string> or ?tag=<name>\"}\n");
+            return ngx_http_cache_turbo_send_json(r, NGX_HTTP_BAD_REQUEST,
+                       &body);
         }
 
         p = ngx_pnalloc(r->pool, sizeof("{\"purged\":4294967295}\n"));
@@ -971,9 +1222,7 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
         }
         body.data = p;
         body.len = ngx_sprintf(p, "{\"purged\":%ui}\n", purged) - p;
-        ngx_str_set(&type, "application/json");
-        r->headers_out.status = NGX_HTTP_OK;
-        goto send;
+        return ngx_http_cache_turbo_send_json(r, NGX_HTTP_OK, &body);
     }
 
     /* GET / HEAD -> stats */
@@ -989,32 +1238,7 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
         "\"refreshes\":%uA,\"evictions\":%uA}\n",
         z->sh->hits, z->sh->misses, z->sh->stale_serves,
         z->sh->refreshes, z->sh->evictions) - p;
-    ngx_str_set(&type, "application/json");
-    r->headers_out.status = NGX_HTTP_OK;
-
-send:
-
-    r->headers_out.content_type = type;
-    r->headers_out.content_type_len = type.len;
-    r->headers_out.content_length_n = body.len;
-
-    rc = ngx_http_send_header(r);
-    if (rc == NGX_ERROR || rc > NGX_OK || r->header_only) {
-        return rc;
-    }
-
-    b = ngx_create_temp_buf(r->pool, body.len);
-    if (b == NULL) {
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
-    }
-    ngx_memcpy(b->pos, body.data, body.len);
-    b->last = b->pos + body.len;
-    b->last_buf = 1;
-    b->last_in_chain = 1;
-
-    out.buf = b;
-    out.next = NULL;
-    return ngx_http_output_filter(r, &out);
+    return ngx_http_cache_turbo_send_json(r, NGX_HTTP_OK, &body);
 }
 
 
@@ -1059,6 +1283,9 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     }
     if (conf->key == NULL) {
         conf->key = prev->key;
+    }
+    if (conf->tag == NULL) {
+        conf->tag = prev->tag;
     }
 
     /* L2 Redis: inherit address/prefix/timeout, default prefix "ct:". */
