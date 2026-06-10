@@ -218,46 +218,7 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
 
     ctn = ngx_http_cache_turbo_shm_lookup(z, ctx->key_hash, hash);
 
-    if (ctn == NULL) {
-        /* L1 miss. Consult L2 (Redis) before falling through to the origin:
-         * another node may already hold this object. The L2 GET is async but
-         * logically synchronous — it parks the request and resumes it when the
-         * reply lands (see ngx_http_cache_turbo_redis_get). */
-        ngx_shmtx_unlock(&z->shpool->mutex);
-
-        if (clcf->redis_enable && !ctx->l2_done) {
-            ngx_int_t  rc = ngx_http_cache_turbo_redis_get(r, clcf, ctx);
-            if (rc == NGX_AGAIN) {
-                return NGX_AGAIN;       /* parked; redis read handler resumes */
-            }
-            /* NGX_DECLINED: L2 disabled or could not start; go to origin */
-        }
-
-        if (ctx->l2_done && ctx->l2_result == NGX_OK && ctx->l2_blob) {
-            /* L2 hit: validate the blob, populate L1 so later reads hit shm,
-             * then serve it as a normal HIT. */
-            ngx_http_cache_turbo_blob_hdr_t  bh;
-
-            if (ctx->l2_blob_len >= sizeof(bh)) {
-                ngx_memcpy(&bh, ctx->l2_blob, sizeof(bh));
-                if (bh.magic == NGX_HTTP_CACHE_TURBO_BLOB_MAGIC) {
-                    (void) ngx_http_cache_turbo_shm_store(z, ctx->key_hash, hash,
-                               ctx->l2_blob, ctx->l2_blob_len, bh.status,
-                               clcf->valid);
-                    (void) ngx_atomic_fetch_add(&z->sh->hits, 1);
-                    return ngx_http_cache_turbo_serve(r, ctx->l2_blob,
-                               ctx->l2_blob_len, 0);
-                }
-            }
-            /* corrupt/short blob: treat as a miss, fall through to origin */
-        }
-
-        /* true miss: mark for capture, let the request run to the origin */
-        (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
-        return NGX_DECLINED;
-    }
-
-    {
+    if (ctn != NULL) {
         time_t     now = ngx_time();
         time_t     fresh_until = ctn->fresh_until;
         time_t     stale_until = ctn->stale_until;
@@ -330,11 +291,47 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
             }
         }
 
-        /* expired: treat as miss */
-        ngx_shmtx_unlock(&z->shpool->mutex);
-        (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
-        return NGX_DECLINED;
+        /* expired: the L1 copy is past its stale window. Fall through to the
+         * shared L2-consult/miss path below — another node may hold a fresher
+         * copy in Redis, so we must check L2 before the origin (issue P6). */
     }
+
+    /* L1 absent (miss) or expired. Consult L2 (Redis) before falling through to
+     * the origin: another node may already hold this object. The L2 GET is
+     * async but logically synchronous — it parks the request and resumes it
+     * when the reply lands (see ngx_http_cache_turbo_redis_get). */
+    ngx_shmtx_unlock(&z->shpool->mutex);
+
+    if (clcf->redis_enable && !ctx->l2_done) {
+        ngx_int_t  rc = ngx_http_cache_turbo_redis_get(r, clcf, ctx);
+        if (rc == NGX_AGAIN) {
+            return NGX_AGAIN;           /* parked; redis read handler resumes */
+        }
+        /* NGX_DECLINED: L2 disabled or could not start; go to origin */
+    }
+
+    if (ctx->l2_done && ctx->l2_result == NGX_OK && ctx->l2_blob) {
+        /* L2 hit: validate the blob, populate L1 so later reads hit shm,
+         * then serve it as a normal HIT. */
+        ngx_http_cache_turbo_blob_hdr_t  bh;
+
+        if (ctx->l2_blob_len >= sizeof(bh)) {
+            ngx_memcpy(&bh, ctx->l2_blob, sizeof(bh));
+            if (bh.magic == NGX_HTTP_CACHE_TURBO_BLOB_MAGIC) {
+                (void) ngx_http_cache_turbo_shm_store(z, ctx->key_hash, hash,
+                           ctx->l2_blob, ctx->l2_blob_len, bh.status,
+                           clcf->valid);
+                (void) ngx_atomic_fetch_add(&z->sh->hits, 1);
+                return ngx_http_cache_turbo_serve(r, ctx->l2_blob,
+                           ctx->l2_blob_len, 0);
+            }
+        }
+        /* corrupt/short blob: treat as a miss, fall through to origin */
+    }
+
+    /* true miss: mark for capture, let the request run to the origin */
+    (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
+    return NGX_DECLINED;
 }
 
 
@@ -952,6 +949,13 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
             hash = ngx_crc32_short(key_hash, 32);
 
             purged = ngx_http_cache_turbo_shm_purge_key(z, key_hash, hash);
+
+            /* L2-aware purge (issue P6): also drop the entry from Redis, so a
+             * purge that cleared L1 cannot be silently refilled from L2 on the
+             * next miss. Fire-and-forget; needs cache_turbo_redis on this admin
+             * location (inherit it from server/http level). Reported "purged"
+             * still reflects the L1 removal only. */
+            ngx_http_cache_turbo_redis_del(clcf, key_hash);
 
         } else {
             ngx_str_set(&type, "application/json");

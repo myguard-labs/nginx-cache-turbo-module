@@ -184,6 +184,12 @@ void ngx_http_cache_turbo_redis_set(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, u_char *key_hash,
     u_char *blob, size_t blob_len, time_t fresh_ttl);
 
+/* Async fire-and-forget DEL <key>: drop an entry from L2 so a purge that
+ * cleared L1 cannot be refilled from Redis (issue P6). Own pool, never blocks,
+ * survives the request. No-op when L2 is disabled. */
+void ngx_http_cache_turbo_redis_del(ngx_http_cache_turbo_loc_conf_t *clcf,
+    u_char *key_hash);
+
 /* Sync-on-L1-miss GET. Issues GET <key> and parks the request (count++,
  * NGX_AGAIN) until the reply arrives; the read handler stores the result in
  * ctx (l2_done + l2_result + l2_blob) and resumes the phase engine. Returns:

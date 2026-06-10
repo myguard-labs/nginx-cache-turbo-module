@@ -22,10 +22,12 @@ import argparse
 import concurrent.futures
 import hashlib
 import http.server
+import json
 import pathlib
 import shlex
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -159,6 +161,25 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             cache_turbo_valid    30s;
             cache_turbo_redis    127.0.0.1:{redis_port} prefix=ct: timeout=250ms;
             proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # L2 with a short fresh TTL so the L1 copy expires in-test (stale window
+        # = valid*4 = 4s), exercising the expired-L1 -> consult-L2 path (P6).
+        location /l2e/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    1s;
+            cache_turbo_redis    127.0.0.1:{redis_port} prefix=ct: timeout=250ms;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # admin endpoint that is itself L2-aware: a single-key purge here must
+        # also DEL the entry from Redis (P6), not just drop L1.
+        location = /_cache_l2 {{
+            cache_turbo_admin    main;
+            cache_turbo_redis    127.0.0.1:{redis_port} prefix=ct: timeout=250ms;
+            allow 127.0.0.1;
+            deny all;
         }}
 """
 
@@ -359,6 +380,18 @@ class RedisServer:
             text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             timeout=10)
         return r.stdout.strip()
+
+    def set_raw(self, key: str, value: bytes, px_ms: int) -> None:
+        """SET key value PX px_ms over raw RESP — binary-safe, so a blob with
+        embedded NULs/CRLF (which redis-cli argv cannot carry) lands intact."""
+        args = [b"SET", key.encode(), value, b"PX", str(px_ms).encode()]
+        cmd = b"*%d\r\n" % len(args)
+        for a in args:
+            cmd += b"$%d\r\n%s\r\n" % (len(a), a)
+        with socket.create_connection(("127.0.0.1", self.port), 5) as s:
+            s.sendall(cmd)
+            if s.recv(64)[:1] != b"+":
+                raise RuntimeError("raw SET not acknowledged")
 
     def stop(self) -> None:
         if self.process is None:
@@ -606,6 +639,83 @@ def test_l2_cross_instance_fill(ng: Nginx, origin: Origin,
         b.stop()
 
 
+def make_ctb1_blob(body: bytes, status: int = 200,
+                   headers: dict[str, str] | None = None) -> bytes:
+    """Hand-build a CTB1 cache blob exactly as the module serialises it
+    (ngx_http_cache_turbo_blob_hdr_t + name/value pairs + body, all native
+    little-endian uint32). Lets a test seed L2 directly with a valid object."""
+    headers = headers or {"Content-Type": "text/plain"}
+    hdr_block = b""
+    nheaders = 0
+    for name, value in headers.items():
+        nb = name.encode()
+        vb = value.encode()
+        hdr_block += struct.pack("<I", len(nb)) + nb
+        hdr_block += struct.pack("<I", len(vb)) + vb
+        nheaders += 1
+    magic = 0x43544231
+    head = struct.pack("<IIIII", magic, nheaders, len(hdr_block),
+                       len(body), status)
+    return head + hdr_block + body
+
+
+def test_l2_purge_key_drops_l2(ng: Nginx, origin: Origin,
+                               redis: RedisServer) -> None:
+    """P6: a single-key admin purge on an L2-aware endpoint removes the entry
+    from BOTH tiers, so it cannot be silently refilled from Redis."""
+    uri = "/l2/purgekey"
+    redis.cli("DEL", l2_key(uri))
+
+    s, body_a, h = fetch(ng.port, uri)             # miss -> origin -> L1 + L2
+    assert s == 200 and "x-cache" not in h, "prime should miss to origin"
+    assert wait_for(lambda: redis.cli("EXISTS", l2_key(uri)) == "1"), \
+        "write-through never reached L2"
+    _, _, h2 = fetch(ng.port, uri)
+    assert h2.get("x-cache") == "HIT", "should be an L1 hit before purge"
+
+    # purge via the L2-aware admin endpoint
+    s, b, _ = fetch(ng.port, f"/_cache_l2?key={uri}", method="POST")
+    assert s == 200 and json.loads(b)["purged"] == 1, f"purge result: {s} {b}"
+
+    # L2 entry must be gone (DEL fired); fire-and-forget, so allow a beat
+    assert wait_for(lambda: redis.cli("EXISTS", l2_key(uri)) == "0"), \
+        "admin purge did not DEL the entry from L2 (P6 regression)"
+
+    # next read is a true miss to the origin (a NEW gen), not an L2 refill
+    origin_before = origin.hits
+    s, body_b, h3 = fetch(ng.port, uri)
+    assert s == 200 and "x-cache" not in h3, \
+        f"post-purge read should miss to origin, got {h3.get('x-cache')}"
+    assert origin.hits == origin_before + 1, "origin was not consulted after purge"
+    assert body_b != body_a, "post-purge body should be a fresh generation"
+
+
+def test_l2_expired_consults_l2(ng: Nginx, origin: Origin,
+                                redis: RedisServer) -> None:
+    """P6: once the L1 copy is fully expired (past its stale window), a read
+    consults L2 before the origin. Seed L2 with a fresh blob after L1 expires
+    and prove the request serves it as a HIT without hitting the origin."""
+    uri = "/l2e/expired"
+    redis.cli("DEL", l2_key(uri))
+
+    fetch(ng.port, uri)                            # prime: L1 (valid=1s) + L2
+    time.sleep(4.3)                                # past stale_until (valid*4=4s)
+    # both L1 and L2 are expired now; reseed ONLY L2 with a fresh, valid blob
+    seeded = b"l2-seeded\n"
+    blob = make_ctb1_blob(seeded, headers={"Content-Type": "text/plain"})
+    redis.set_raw(l2_key(uri), blob, 60_000)       # binary-safe raw RESP SET
+    assert redis.cli("EXISTS", l2_key(uri)) == "1", "failed to seed L2"
+
+    origin_before = origin.hits
+    s, body, h = fetch(ng.port, uri)
+    assert s == 200, f"expired+L2 read status {s}"
+    assert h.get("x-cache") == "HIT", \
+        f"expired L1 should serve from L2 as HIT, got {h.get('x-cache')}"
+    assert body == seeded.decode(), f"served body {body!r} != seeded L2 blob"
+    assert origin.hits == origin_before, \
+        "origin was hit even though L2 held a fresh copy (P6 regression)"
+
+
 def run_all(ng: Nginx, origin: Origin,
             redis: RedisServer | None = None) -> None:
     test_miss_then_hit(ng)
@@ -621,6 +731,8 @@ def run_all(ng: Nginx, origin: Origin,
     if redis is not None:
         test_l2_write_through(ng, origin, redis)
         test_l2_cross_instance_fill(ng, origin, redis)
+        test_l2_purge_key_drops_l2(ng, origin, redis)
+        test_l2_expired_consults_l2(ng, origin, redis)
     test_admin_purge_all(ng)   # last: it empties the zone
 
 
@@ -664,7 +776,8 @@ def main() -> int:
     print("OK: miss/hit, header fidelity, max_size, concurrency (R1), "
           "LRU eviction (R6), stale serve (R3), single-flight (R4), "
           "admin stats/purge/gating"
-          + (", L2 write-through (P4), L2 cross-instance fill (P2)"
+          + (", L2 write-through (P4), L2 cross-instance fill (P2), "
+             "L2-aware key purge (P6), expired-L1 consults L2 (P6)"
              if redis_port else ""))
     return 0
 

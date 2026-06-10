@@ -157,6 +157,32 @@ ngx_http_cache_turbo_redis_connect(ngx_http_cache_turbo_redis_op_t *op,
 }
 
 
+/* Allocate an op with its own pool (so it can outlive the spawning request)
+ * preloaded with the configured timeout. NULL on failure (pool destroyed). */
+static ngx_http_cache_turbo_redis_op_t *
+ngx_http_cache_turbo_redis_op_create(ngx_http_cache_turbo_loc_conf_t *clcf)
+{
+    ngx_pool_t                       *pool;
+    ngx_http_cache_turbo_redis_op_t  *op;
+
+    pool = ngx_create_pool(ngx_pagesize, ngx_cycle->log);
+    if (pool == NULL) {
+        return NULL;
+    }
+
+    op = ngx_pcalloc(pool, sizeof(ngx_http_cache_turbo_redis_op_t));
+    if (op == NULL) {
+        ngx_destroy_pool(pool);
+        return NULL;
+    }
+
+    op->pool = pool;
+    op->timeout = clcf->redis_timeout;
+
+    return op;
+}
+
+
 void
 ngx_http_cache_turbo_redis_set(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, u_char *key_hash,
@@ -178,18 +204,11 @@ ngx_http_cache_turbo_redis_set(ngx_http_request_t *r,
         return;
     }
 
-    pool = ngx_create_pool(ngx_pagesize, ngx_cycle->log);
-    if (pool == NULL) {
-        return;
-    }
-
-    op = ngx_pcalloc(pool, sizeof(ngx_http_cache_turbo_redis_op_t));
+    op = ngx_http_cache_turbo_redis_op_create(clcf);
     if (op == NULL) {
-        ngx_destroy_pool(pool);
         return;
     }
-    op->pool = pool;
-    op->timeout = clcf->redis_timeout;
+    pool = op->pool;
 
     /* Copy the blob out of the request pool: this op may outlive the request. */
     blobcopy = ngx_pnalloc(pool, blob_len);
@@ -227,6 +246,51 @@ ngx_http_cache_turbo_redis_set(ngx_http_request_t *r,
 }
 
 
+void
+ngx_http_cache_turbo_redis_del(ngx_http_cache_turbo_loc_conf_t *clcf,
+    u_char *key_hash)
+{
+    ngx_pool_t                       *pool;
+    ngx_str_t                         argv[2];
+    ngx_http_cache_turbo_redis_op_t  *op;
+    u_char                           *keybuf;
+
+    if (!clcf->redis_enable) {
+        return;
+    }
+
+    op = ngx_http_cache_turbo_redis_op_create(clcf);
+    if (op == NULL) {
+        return;
+    }
+    pool = op->pool;
+
+    keybuf = ngx_pnalloc(pool, clcf->redis_prefix.len + 64);
+    if (keybuf == NULL) {
+        ngx_destroy_pool(pool);
+        return;
+    }
+
+    argv[0].data = (u_char *) "DEL";
+    argv[0].len = sizeof("DEL") - 1;
+    argv[1].data = keybuf;
+    argv[1].len = ngx_http_cache_turbo_redis_key(&clcf->redis_prefix,
+                                                 key_hash, keybuf);
+
+    op->send = ngx_http_cache_turbo_redis_encode(pool, argv, 2);
+    if (op->send == NULL) {
+        ngx_destroy_pool(pool);
+        return;
+    }
+
+    if (ngx_http_cache_turbo_redis_connect(op, &clcf->redis_addr,
+            ngx_http_cache_turbo_redis_read_drain) != NGX_OK)
+    {
+        ngx_destroy_pool(pool);
+    }
+}
+
+
 ngx_int_t
 ngx_http_cache_turbo_redis_get(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx)
@@ -240,18 +304,11 @@ ngx_http_cache_turbo_redis_get(ngx_http_request_t *r,
         return NGX_DECLINED;
     }
 
-    pool = ngx_create_pool(ngx_pagesize, ngx_cycle->log);
-    if (pool == NULL) {
-        return NGX_DECLINED;
-    }
-
-    op = ngx_pcalloc(pool, sizeof(ngx_http_cache_turbo_redis_op_t));
+    op = ngx_http_cache_turbo_redis_op_create(clcf);
     if (op == NULL) {
-        ngx_destroy_pool(pool);
         return NGX_DECLINED;
     }
-    op->pool = pool;
-    op->timeout = clcf->redis_timeout;
+    pool = op->pool;
     op->request = r;
     op->ctx = ctx;
 
