@@ -37,10 +37,12 @@ typedef struct {
     ngx_buf_t                   *send;     /* RESP command to write           */
     ngx_msec_t                   timeout;
 
-    ngx_http_request_t          *request;  /* GET/SMEMBERS: parked req; else NULL */
-    ngx_http_cache_turbo_ctx_t  *ctx;      /* GET: request ctx to fill        */
+    ngx_http_request_t          *request;  /* GET/SMEMBERS/SCAN/lock: parked req */
+    ngx_http_cache_turbo_ctx_t  *ctx;      /* GET/lock: request ctx to fill   */
+    ngx_http_cache_turbo_loc_conf_t *clcf; /* SCAN: rebuild next SCAN + del_raw */
+    unsigned                     is_lock:1;/* lock op (deposits ctx->lock_*)  */
 
-    /* SMEMBERS: completion callback + opaque data (tag-purge policy) */
+    /* SMEMBERS / SCAN: completion callback + opaque data (purge policy) */
     ngx_http_cache_turbo_redis_members_pt  members_cb;
     void                        *members_data;
 
@@ -56,6 +58,10 @@ static void ngx_http_cache_turbo_redis_write(ngx_event_t *wev);
 static void ngx_http_cache_turbo_redis_read_drain(ngx_event_t *rev);
 static void ngx_http_cache_turbo_redis_read_get(ngx_event_t *rev);
 static void ngx_http_cache_turbo_redis_read_smembers(ngx_event_t *rev);
+static void ngx_http_cache_turbo_redis_read_lock(ngx_event_t *rev);
+static void ngx_http_cache_turbo_redis_read_scan(ngx_event_t *rev);
+static void ngx_http_cache_turbo_redis_lock_finish(
+    ngx_http_cache_turbo_redis_op_t *op, ngx_int_t result);
 static void ngx_http_cache_turbo_redis_op_done(
     ngx_http_cache_turbo_redis_op_t *op);
 static void ngx_http_cache_turbo_redis_get_finish(
@@ -74,6 +80,20 @@ ngx_http_cache_turbo_redis_key(ngx_str_t *prefix, u_char *key_hash, u_char *buf)
     u_char  *p;
 
     p = ngx_cpymem(buf, prefix->data, prefix->len);
+    p = ngx_hex_dump(p, key_hash, 32);     /* 32 bytes -> 64 lowercase hex */
+
+    return (size_t) (p - buf);
+}
+
+
+size_t
+ngx_http_cache_turbo_redis_lockkey(ngx_str_t *prefix, u_char *key_hash,
+    u_char *buf)
+{
+    u_char  *p;
+
+    p = ngx_cpymem(buf, prefix->data, prefix->len);
+    p = ngx_cpymem(p, "lock:", sizeof("lock:") - 1);
     p = ngx_hex_dump(p, key_hash, 32);     /* 32 bytes -> 64 lowercase hex */
 
     return (size_t) (p - buf);
@@ -475,6 +495,80 @@ ngx_http_cache_turbo_redis_get(ngx_http_request_t *r,
 
 
 ngx_int_t
+ngx_http_cache_turbo_redis_lock(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx,
+    time_t ttl)
+{
+    ngx_pool_t                       *pool;
+    ngx_str_t                         argv[6];
+    ngx_http_cache_turbo_redis_op_t  *op;
+    u_char                           *lockbuf, *ownerbuf, *msbuf;
+
+    if (!clcf->redis_enable) {
+        return NGX_DECLINED;
+    }
+    if (ttl <= 0) {
+        ttl = 5;
+    }
+
+    op = ngx_http_cache_turbo_redis_op_create(clcf);
+    if (op == NULL) {
+        return NGX_DECLINED;
+    }
+    pool = op->pool;
+    op->request = r;
+    op->ctx = ctx;
+    op->is_lock = 1;
+
+    lockbuf = ngx_pnalloc(pool,
+                  clcf->redis_prefix.len + sizeof("lock:") - 1 + 64);
+    ownerbuf = ngx_pnalloc(pool, NGX_INT_T_LEN + 1 + NGX_INT64_LEN);
+    msbuf = ngx_pnalloc(pool, NGX_INT64_LEN);
+    if (lockbuf == NULL || ownerbuf == NULL || msbuf == NULL) {
+        ngx_destroy_pool(pool);
+        return NGX_DECLINED;
+    }
+
+    /* SET <prefix>lock:<hex> <owner> NX PX <ttl_ms>. The owner is unique per
+     * attempt (pid + random) for debuggability; it is never used to release the
+     * lock (no CAS unlock in v4-2 — the PX TTL is the only release), so its
+     * exact value does not affect correctness. */
+    argv[0].data = (u_char *) "SET";
+    argv[0].len = sizeof("SET") - 1;
+    argv[1].data = lockbuf;
+    argv[1].len = ngx_http_cache_turbo_redis_lockkey(&clcf->redis_prefix,
+                                                     ctx->key_hash, lockbuf);
+    argv[2].data = ownerbuf;
+    argv[2].len = (size_t) (ngx_sprintf(ownerbuf, "%P:%xL",
+                      ngx_pid, (int64_t) ngx_random()) - ownerbuf);
+    argv[3].data = (u_char *) "NX";
+    argv[3].len = sizeof("NX") - 1;
+    argv[4].data = (u_char *) "PX";
+    argv[4].len = sizeof("PX") - 1;
+    argv[5].data = msbuf;
+    argv[5].len = (size_t) (ngx_sprintf(msbuf, "%T", ttl * 1000) - msbuf);
+
+    op->send = ngx_http_cache_turbo_redis_encode(pool, argv, 6);
+    if (op->send == NULL) {
+        ngx_destroy_pool(pool);
+        return NGX_DECLINED;
+    }
+
+    if (ngx_http_cache_turbo_redis_connect(op, &clcf->redis_addr,
+            ngx_http_cache_turbo_redis_read_lock) != NGX_OK)
+    {
+        ngx_destroy_pool(pool);
+        return NGX_DECLINED;
+    }
+
+    ctx->lock_pending = 1;
+    r->main->count++;
+
+    return NGX_AGAIN;
+}
+
+
+ngx_int_t
 ngx_http_cache_turbo_redis_smembers(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, u_char *name, size_t name_len,
     ngx_http_cache_turbo_redis_members_pt cb, void *data)
@@ -525,6 +619,91 @@ ngx_http_cache_turbo_redis_smembers(ngx_http_request_t *r,
 
     /* Parked: hold a reference until the reply resumes the request (released by
      * ngx_http_finalize_request in smembers_finish). */
+    r->main->count++;
+
+    return NGX_DONE;
+}
+
+
+/* How many keys SCAN returns per round trip. A hint, not a hard limit; the
+ * cursor loop iterates until the cursor returns to "0". */
+#define NGX_HTTP_CACHE_TURBO_REDIS_SCAN_COUNT  "256"
+
+
+/* Encode one SCAN <cursor> MATCH <prefix>* COUNT <n> command into pool. */
+static ngx_buf_t *
+ngx_http_cache_turbo_redis_scan_cmd(ngx_pool_t *pool,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_str_t *cursor)
+{
+    ngx_str_t  argv[6];
+    u_char    *match;
+
+    match = ngx_pnalloc(pool, clcf->redis_prefix.len + 1);
+    if (match == NULL) {
+        return NULL;
+    }
+    ngx_memcpy(match, clcf->redis_prefix.data, clcf->redis_prefix.len);
+    match[clcf->redis_prefix.len] = '*';
+
+    argv[0].data = (u_char *) "SCAN";
+    argv[0].len = sizeof("SCAN") - 1;
+    argv[1] = *cursor;
+    argv[2].data = (u_char *) "MATCH";
+    argv[2].len = sizeof("MATCH") - 1;
+    argv[3].data = match;
+    argv[3].len = clcf->redis_prefix.len + 1;
+    argv[4].data = (u_char *) "COUNT";
+    argv[4].len = sizeof("COUNT") - 1;
+    argv[5].data = (u_char *) NGX_HTTP_CACHE_TURBO_REDIS_SCAN_COUNT;
+    argv[5].len = sizeof(NGX_HTTP_CACHE_TURBO_REDIS_SCAN_COUNT) - 1;
+
+    return ngx_http_cache_turbo_redis_encode(pool, argv, 6);
+}
+
+
+ngx_int_t
+ngx_http_cache_turbo_redis_scan_del(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf,
+    ngx_http_cache_turbo_redis_members_pt cb, void *data)
+{
+    ngx_str_t                         cursor0 = ngx_string("0");
+    ngx_http_cache_turbo_redis_op_t  *op;
+
+    if (!clcf->redis_enable) {
+        return NGX_ERROR;
+    }
+
+    op = ngx_http_cache_turbo_redis_op_create(clcf);
+    if (op == NULL) {
+        return NGX_ERROR;
+    }
+    op->request = r;
+    op->clcf = clcf;
+    op->members_cb = cb;
+    op->members_data = data;
+
+    op->rcap = ngx_pagesize * 4;          /* grows on demand up to MAX_REPLY */
+    op->rbuf = ngx_pnalloc(op->pool, op->rcap);
+    if (op->rbuf == NULL) {
+        ngx_destroy_pool(op->pool);
+        return NGX_ERROR;
+    }
+
+    op->send = ngx_http_cache_turbo_redis_scan_cmd(op->pool, clcf, &cursor0);
+    if (op->send == NULL) {
+        ngx_destroy_pool(op->pool);
+        return NGX_ERROR;
+    }
+
+    if (ngx_http_cache_turbo_redis_connect(op, &clcf->redis_addr,
+            ngx_http_cache_turbo_redis_read_scan) != NGX_OK)
+    {
+        ngx_destroy_pool(op->pool);
+        return NGX_ERROR;
+    }
+
+    /* Parked: released by ngx_http_finalize_request in smembers_finish (reused
+     * as the scan completion: cb(r, data, NULL, 0)). */
     r->main->count++;
 
     return NGX_DONE;
@@ -927,6 +1106,238 @@ ngx_http_cache_turbo_redis_read_smembers(ngx_event_t *rev)
 
 
 /*
+ * Parse an accumulated SCAN reply in op->rbuf[0..op->rlen]. SCAN returns a
+ * 2-element array: [ next-cursor (bulk string), [ matched keys (bulk strings) ] ]
+ * On NGX_OK *cursor + the keys array (allocated from op->pool, pointing into
+ * rbuf) are filled. Returns NGX_AGAIN (need more bytes) or NGX_DECLINED
+ * (malformed / not the expected shape).
+ */
+static ngx_int_t
+ngx_http_cache_turbo_redis_parse_scan(ngx_http_cache_turbo_redis_op_t *op,
+    ngx_str_t *cursor, ngx_str_t **keys, ngx_uint_t *nkeys)
+{
+    u_char     *p, *crlf, *end;
+    ngx_int_t   count, len;
+    ngx_uint_t  i;
+    ngx_str_t  *list;
+
+    p = op->rbuf;
+    end = op->rbuf + op->rlen;
+
+    if (p == end) {
+        return NGX_AGAIN;
+    }
+    if (*p != '*') {
+        return NGX_DECLINED;               /* not an array reply */
+    }
+
+    crlf = ngx_strlchr(p + 1, end, CR);
+    if (crlf == NULL || crlf + 1 >= end || crlf[1] != LF) {
+        return NGX_AGAIN;
+    }
+    count = ngx_atoi(p + 1, crlf - (p + 1));
+    if (count != 2) {
+        return NGX_DECLINED;               /* SCAN always replies a 2-tuple */
+    }
+    p = crlf + 2;
+
+    /* element 0: the next cursor, a bulk string */
+    if (p >= end) {
+        return NGX_AGAIN;
+    }
+    if (*p != '$') {
+        return NGX_DECLINED;
+    }
+    crlf = ngx_strlchr(p + 1, end, CR);
+    if (crlf == NULL || crlf + 1 >= end || crlf[1] != LF) {
+        return NGX_AGAIN;
+    }
+    len = ngx_atoi(p + 1, crlf - (p + 1));
+    if (len == NGX_ERROR || len < 0) {
+        return NGX_DECLINED;
+    }
+    p = crlf + 2;
+    if (end - p < len + 2) {
+        return NGX_AGAIN;
+    }
+    cursor->data = p;
+    cursor->len = (size_t) len;
+    p += len + 2;
+
+    /* element 1: the array of matched keys */
+    if (p >= end) {
+        return NGX_AGAIN;
+    }
+    if (*p != '*') {
+        return NGX_DECLINED;
+    }
+    crlf = ngx_strlchr(p + 1, end, CR);
+    if (crlf == NULL || crlf + 1 >= end || crlf[1] != LF) {
+        return NGX_AGAIN;
+    }
+    count = ngx_atoi(p + 1, crlf - (p + 1));
+    if (count == NGX_ERROR) {
+        return NGX_DECLINED;
+    }
+    if (count < 0) {                       /* nil array: treat as no keys */
+        count = 0;
+    }
+    if (count > NGX_HTTP_CACHE_TURBO_REDIS_MAX_MEMBERS) {
+        return NGX_DECLINED;
+    }
+    p = crlf + 2;
+
+    list = NULL;
+    if (count > 0) {
+        /* ngx_palloc (not ngx_pnalloc): ngx_str_t needs pointer alignment. */
+        list = ngx_palloc(op->pool, count * sizeof(ngx_str_t));
+        if (list == NULL) {
+            return NGX_DECLINED;
+        }
+    }
+
+    for (i = 0; i < (ngx_uint_t) count; i++) {
+        if (p >= end) {
+            return NGX_AGAIN;
+        }
+        if (*p != '$') {
+            return NGX_DECLINED;
+        }
+        crlf = ngx_strlchr(p + 1, end, CR);
+        if (crlf == NULL || crlf + 1 >= end || crlf[1] != LF) {
+            return NGX_AGAIN;
+        }
+        len = ngx_atoi(p + 1, crlf - (p + 1));
+        if (len == NGX_ERROR) {
+            return NGX_DECLINED;
+        }
+        if (len < 0) {                     /* nil element */
+            list[i].data = NULL;
+            list[i].len = 0;
+            p = crlf + 2;
+            continue;
+        }
+        if (len > NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY) {
+            return NGX_DECLINED;
+        }
+        p = crlf + 2;
+        if (end - p < len + 2) {
+            return NGX_AGAIN;
+        }
+        list[i].data = p;
+        list[i].len = (size_t) len;
+        p += len + 2;
+    }
+
+    *keys = list;
+    *nkeys = (ngx_uint_t) count;
+    return NGX_OK;
+}
+
+
+/*
+ * SCAN reply reader: accumulate, parse one [cursor, keys] page, DEL every key,
+ * then either finish (cursor back to "0") or post the write event to issue the
+ * next SCAN with the returned cursor. Posting (not recursing) keeps the stack
+ * bounded for an arbitrarily large keyspace.
+ */
+static void
+ngx_http_cache_turbo_redis_read_scan(ngx_event_t *rev)
+{
+    ssize_t                           n;
+    u_char                           *nbuf;
+    size_t                            ncap;
+    ngx_str_t                         cursor, *keys;
+    ngx_uint_t                        i, nkeys;
+    ngx_int_t                         rc;
+    ngx_connection_t                 *c;
+    ngx_http_cache_turbo_redis_op_t  *op;
+
+    c = rev->data;
+    op = c->data;
+
+    if (rev->timedout) {
+        ngx_log_error(NGX_LOG_INFO, c->log, NGX_ETIMEDOUT,
+                      "cache_turbo: redis SCAN timed out");
+        ngx_http_cache_turbo_redis_smembers_finish(op, NULL, 0);
+        return;
+    }
+
+    for ( ;; ) {
+        if (op->rlen == op->rcap) {
+            if (op->rcap >= NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY) {
+                ngx_http_cache_turbo_redis_smembers_finish(op, NULL, 0);
+                return;
+            }
+            ncap = op->rcap * 2;
+            if (ncap > NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY) {
+                ncap = NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY;
+            }
+            nbuf = ngx_pnalloc(op->pool, ncap);
+            if (nbuf == NULL) {
+                ngx_http_cache_turbo_redis_smembers_finish(op, NULL, 0);
+                return;
+            }
+            ngx_memcpy(nbuf, op->rbuf, op->rlen);
+            op->rbuf = nbuf;
+            op->rcap = ncap;
+        }
+
+        n = c->recv(c, op->rbuf + op->rlen, op->rcap - op->rlen);
+
+        if (n == NGX_AGAIN) {
+            if (ngx_handle_read_event(rev, 0) != NGX_OK) {
+                ngx_http_cache_turbo_redis_smembers_finish(op, NULL, 0);
+            }
+            return;
+        }
+        if (n == NGX_ERROR || n == 0) {
+            ngx_http_cache_turbo_redis_smembers_finish(op, NULL, 0);
+            return;
+        }
+
+        op->rlen += n;
+
+        rc = ngx_http_cache_turbo_redis_parse_scan(op, &cursor, &keys, &nkeys);
+        if (rc == NGX_AGAIN) {
+            continue;
+        }
+        if (rc != NGX_OK) {
+            ngx_http_cache_turbo_redis_smembers_finish(op, NULL, 0);
+            return;
+        }
+
+        /* DEL each matched key (keys point into rbuf; del_raw copies them). */
+        for (i = 0; i < nkeys; i++) {
+            if (keys[i].len) {
+                ngx_http_cache_turbo_redis_del_raw(op->clcf, keys[i].data,
+                                                   keys[i].len);
+            }
+        }
+
+        if (cursor.len == 1 && cursor.data[0] == '0') {
+            /* whole keyspace walked: emit the response via the callback */
+            ngx_http_cache_turbo_redis_smembers_finish(op, NULL, 0);
+            return;
+        }
+
+        /* Issue the next SCAN with the returned cursor. encode copies the
+         * cursor bytes (which point into rbuf) into a fresh send buffer, so it
+         * is safe to reset rbuf afterwards. */
+        op->send = ngx_http_cache_turbo_redis_scan_cmd(op->pool, op->clcf,
+                                                       &cursor);
+        if (op->send == NULL) {
+            ngx_http_cache_turbo_redis_smembers_finish(op, NULL, 0);
+            return;
+        }
+        op->rlen = 0;
+        ngx_post_event(c->write, &ngx_posted_events);
+        return;
+    }
+}
+
+
+/*
  * SMEMBERS teardown + resume. Hands the parsed members to the policy callback
  * (which must purge + produce the HTTP response while the members are still
  * valid), tears down the op pool, then finalizes the parked request with the
@@ -1007,12 +1418,83 @@ ngx_http_cache_turbo_redis_get_finish(ngx_http_cache_turbo_redis_op_t *op,
 }
 
 
-/* Terminal failure on the shared write path: dispatch by op kind. */
+/*
+ * Lock (SET NX PX) reply reader. The reply is tiny (+OK / $-1 / -ERR), so a
+ * single recv into the scratch buffer suffices; the first byte decides:
+ * '+' (+OK) = lock acquired; anything else ($-1 nil = key already held, -ERR,
+ * EOF, error) = not acquired. Treating every non-'+' as "lost" is conservative:
+ * the caller serves stale, never stampedes the origin on a Redis hiccup.
+ */
+static void
+ngx_http_cache_turbo_redis_read_lock(ngx_event_t *rev)
+{
+    ssize_t                           n;
+    ngx_connection_t                 *c;
+    ngx_http_cache_turbo_redis_op_t  *op;
+
+    c = rev->data;
+    op = c->data;
+
+    if (rev->timedout) {
+        ngx_log_error(NGX_LOG_INFO, c->log, NGX_ETIMEDOUT,
+                      "cache_turbo: redis lock timed out");
+        ngx_http_cache_turbo_redis_lock_finish(op, NGX_DECLINED);
+        return;
+    }
+
+    n = c->recv(c, op->recv, sizeof(op->recv));
+
+    if (n == NGX_AGAIN) {
+        if (ngx_handle_read_event(rev, 0) != NGX_OK) {
+            ngx_http_cache_turbo_redis_lock_finish(op, NGX_DECLINED);
+        }
+        return;
+    }
+    if (n <= 0) {
+        ngx_http_cache_turbo_redis_lock_finish(op, NGX_DECLINED);
+        return;
+    }
+
+    ngx_http_cache_turbo_redis_lock_finish(op,
+        op->recv[0] == '+' ? NGX_OK : NGX_DECLINED);
+}
+
+
+/*
+ * Lock teardown + resume. Records the outcome in ctx (lock_done + lock_result),
+ * tears down the op, and resumes the parked request through the phase engine —
+ * the access handler re-runs and acts on ctx->lock_* (win -> origin, lose ->
+ * serve stale). Same park/resume dance as get_finish, minus the blob copy.
+ */
+static void
+ngx_http_cache_turbo_redis_lock_finish(ngx_http_cache_turbo_redis_op_t *op,
+    ngx_int_t result)
+{
+    ngx_http_request_t          *r = op->request;
+    ngx_http_cache_turbo_ctx_t  *ctx = op->ctx;
+
+    ctx->lock_result = result;
+    ctx->lock_pending = 0;
+    ctx->lock_done = 1;
+
+    ngx_http_cache_turbo_redis_op_done(op);
+
+    ngx_http_core_run_phases(r);
+    ngx_http_run_posted_requests(r->connection);
+    ngx_http_finalize_request(r, NGX_DONE);
+}
+
+
+/* Terminal failure on the shared write path: dispatch by op kind. members_cb is
+ * set for both SMEMBERS and SCAN (both finish through smembers_finish); is_lock
+ * distinguishes a lock from a GET (both pin op->request + op->ctx). */
 static void
 ngx_http_cache_turbo_redis_op_fail(ngx_http_cache_turbo_redis_op_t *op)
 {
     if (op->members_cb) {
         ngx_http_cache_turbo_redis_smembers_finish(op, NULL, 0);
+    } else if (op->is_lock) {
+        ngx_http_cache_turbo_redis_lock_finish(op, NGX_DECLINED);
     } else if (op->request) {
         ngx_http_cache_turbo_redis_get_finish(op, NGX_DECLINED, NULL, 0);
     } else {
@@ -1021,9 +1503,11 @@ ngx_http_cache_turbo_redis_op_fail(ngx_http_cache_turbo_redis_op_t *op)
 }
 
 
-/* L2 backend instance (v4-1). The remote-driver vtable memc/disk will mirror.
- * lock/unlock are the v4-2 multi-node single-flight slots (SET NX PX), NULL for
- * now. purge_tag is the SMEMBERS-based tag walk. */
+/* L2 backend instance. purge_tag is the SMEMBERS-based tag walk; scan_del is the
+ * v4-2 SCAN MATCH-based whole-keyspace purge; lock is the v4-2 cross-node SET NX
+ * PX single-flight. unlock stays NULL: the lock is released only by PX expiry,
+ * never by owner (see history.md v4-2 — early unlock would re-open the
+ * single-flight window and cause cross-node double-regen). */
 ngx_cache_turbo_backend_t  ngx_http_cache_turbo_redis_backend = {
     ngx_string("redis"),
     ngx_http_cache_turbo_redis_key,
@@ -1034,6 +1518,7 @@ ngx_cache_turbo_backend_t  ngx_http_cache_turbo_redis_backend = {
     ngx_http_cache_turbo_redis_tagkey,
     ngx_http_cache_turbo_redis_tag_add,
     ngx_http_cache_turbo_redis_smembers,
-    NULL,   /* lock   — v4-2 SET NX PX */
-    NULL,   /* unlock — v4-2           */
+    ngx_http_cache_turbo_redis_scan_del,
+    ngx_http_cache_turbo_redis_lock,
+    NULL,   /* unlock — PX expiry only */
 };

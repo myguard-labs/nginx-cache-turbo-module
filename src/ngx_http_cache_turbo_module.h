@@ -229,6 +229,13 @@ typedef struct {
     ngx_int_t                l2_result;   /* NGX_OK = L2 hit; else miss      */
     u_char                  *l2_blob;     /* L2-hit blob, copied to r->pool  */
     size_t                   l2_blob_len;
+    /* Cross-node dogpile (v4-2). On a stale L1 dice win the request parks for a
+     * Redis SET NX PX reply: lock_result == NGX_OK means this node holds the
+     * cluster-wide regen lock (go to origin); anything else means another node
+     * owns it (serve stale, skip origin). Mirrors the l2_* park/resume trio. */
+    unsigned                 lock_pending:1;/* NX parked, awaiting reply      */
+    unsigned                 lock_done:1; /* NX reply landed                 */
+    ngx_int_t                lock_result; /* NGX_OK = we hold the lock        */
     ngx_chain_t             *body;        /* buffered response chain        */
     size_t                   body_len;
     ngx_str_t                cache_key;
@@ -359,6 +366,27 @@ ngx_int_t ngx_http_cache_turbo_redis_smembers(ngx_http_request_t *r,
 ngx_int_t ngx_http_cache_turbo_redis_get(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx);
 
+/* Build the cross-node lock key "<prefix>lock:<64 hex of key hash>" into buf
+ * (must hold prefix.len + sizeof("lock:")-1 + 64). Returns bytes written. */
+size_t ngx_http_cache_turbo_redis_lockkey(ngx_str_t *prefix, u_char *key_hash,
+    u_char *buf);
+
+/* Cross-node single-flight (v4-2): async SET <lockkey> <owner> NX PX <ttl*1000>.
+ * Parks the request (count++, NGX_AGAIN) until the reply lands, then sets
+ * ctx->lock_done + ctx->lock_result (NGX_OK = acquired) and resumes the phase
+ * engine. Returns NGX_AGAIN (parked) or NGX_DECLINED (L2 off / could not start;
+ * caller proceeds as single-box). */
+ngx_int_t ngx_http_cache_turbo_redis_lock(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx,
+    time_t ttl);
+
+/* Clear the whole L2 keyspace for this prefix (v4-2): parked SCAN MATCH
+ * <prefix>* cursor loop, DEL each match, then cb(r, data, NULL, 0) emits the
+ * response. Returns NGX_DONE (parked) or NGX_ERROR (L2 off / could not start). */
+ngx_int_t ngx_http_cache_turbo_redis_scan_del(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf,
+    ngx_http_cache_turbo_redis_members_pt cb, void *data);
+
 
 /* ---- backend vtables (v4-1, #6) ---- */
 
@@ -417,10 +445,21 @@ struct ngx_cache_turbo_backend_s {
         ngx_http_cache_turbo_loc_conf_t *clcf, u_char *name, size_t name_len,
         ngx_http_cache_turbo_redis_members_pt cb, void *data);
 
-    /* v4-2 cross-node dogpile (SET NX PX). NULL until v4-2. */
+    /* Purge the whole L2 keyspace (v4-2): SCAN MATCH <prefix>* + DEL each, then
+     * invoke cb(r, data, NULL, 0) to emit the response. Parks the request. */
+    ngx_int_t  (*scan_del)(ngx_http_request_t *r,
+        ngx_http_cache_turbo_loc_conf_t *clcf,
+        ngx_http_cache_turbo_redis_members_pt cb, void *data);
+
+    /* Cross-node dogpile (v4-2): async SET <prefix>lock:<hex> <owner> NX PX
+     * <ttl*1000>. Parks the request (count++, NGX_AGAIN); on reply ctx->lock_*
+     * is set (NGX_OK = acquired). NGX_DECLINED synchronously if it could not
+     * start (L2 down) — caller falls back to single-box regen. `unlock` stays
+     * NULL: the lock is released by PX expiry, never by owner (see history.md
+     * v4-2 — early unlock would re-open the single-flight window). */
     ngx_int_t  (*lock)(ngx_http_request_t *r,
-        ngx_http_cache_turbo_loc_conf_t *clcf, u_char *key_hash,
-        ngx_str_t *owner, time_t ttl);
+        ngx_http_cache_turbo_loc_conf_t *clcf,
+        ngx_http_cache_turbo_ctx_t *ctx, time_t ttl);
     ngx_int_t  (*unlock)(ngx_http_cache_turbo_loc_conf_t *clcf, u_char *key_hash,
         ngx_str_t *owner);
 };

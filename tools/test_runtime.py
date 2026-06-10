@@ -184,6 +184,35 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # cross-node dogpile (v4-2): fresh TTL 2s -> stale_until = valid*4 = 8s,
+        # a wide window so both lock tests have timing slack; aggressive beta so
+        # a stale read reliably rolls a refresh; lock_ttl 5s = the Redis SET NX
+        # PX hold (long enough to cap a multinode burst, short enough to model a
+        # crashed peer's lock self-healing by PX expiry).
+        location /lock/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    2s;     # stale window: serveable until t+8s
+            cache_turbo_beta     5000;   # aggressive: refresh likely while stale
+            cache_turbo_lock_ttl 5s;     # cross-node NX PX = 5000ms
+            cache_turbo_redis    127.0.0.1:{redis_port} prefix=ct: timeout=250ms;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # self-heal variant: SHORT lock_ttl (2s) so BOTH the per-box L1 refresh
+        # lock and the cross-node NX PX clear quickly once the 'crashed' peer's
+        # lock expires; wide stale window (valid*4 = 8s) leaves room to observe
+        # the post-expiry regen.
+        location /lockh/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    2s;     # stale window: serveable until t+8s
+            cache_turbo_beta     5000;
+            cache_turbo_lock_ttl 2s;     # local + NX hold = 2000ms
+            cache_turbo_redis    127.0.0.1:{redis_port} prefix=ct: timeout=250ms;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # admin endpoint that is itself L2-aware: a single-key purge here must
         # also DEL the entry from Redis (P6), not just drop L1.
         location = /_cache_l2 {{
@@ -501,6 +530,11 @@ def l2_key(uri: str, prefix: str = "ct:") -> str:
     key hash is md5(cache_key) widened into 32 bytes (upper 16 stay zero), and
     cache_turbo_key is $uri in the test config."""
     return prefix + hashlib.md5(uri.encode()).hexdigest() + "0" * 32
+
+
+def lock_key(uri: str, prefix: str = "ct:") -> str:
+    """Mirror the module's cross-node lock key: <prefix>lock:<hex key hash>."""
+    return prefix + "lock:" + hashlib.md5(uri.encode()).hexdigest() + "0" * 32
 
 
 def wait_for(predicate, timeout: float = 3.0, interval: float = 0.05) -> bool:
@@ -922,6 +956,149 @@ def test_l2_tag_purge(ng: Nginx, origin: Origin, redis: RedisServer) -> None:
         "post-purge bodies should be fresh generations"
 
 
+def _spawn_node(ng: Nginx, name: str, port_offset: int) -> Nginx:
+    """Start a second, independent nginx (own root, same Redis + origin) so a
+    cross-node test can observe two cache instances sharing one L2."""
+    b = Nginx(ng.binary, ng.module, ng.root.parent / name,
+              ng.port + port_offset, ng.origin_port, ng.runner_raw,
+              ng.single_process, ng.redis_port)
+    b.write_config()
+    b.config_test()
+    b.start()
+    return b
+
+
+def test_multinode_lock(ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    """v4-2: two nginx nodes sharing one Redis collapse a stale-key refresh to a
+    SINGLE origin regen via the cross-node SET NX PX lock. Without the lock both
+    nodes' dice would each reach origin (== 2)."""
+    uri = "/lock/mn"
+    redis.cli("DEL", l2_key(uri), lock_key(uri))
+
+    # Node A primes the key: origin -> L1_A + L2 fresh.
+    sa, body_a, ha = fetch(ng.port, uri)
+    assert sa == 200 and "x-cache" not in ha, "A should miss to origin first"
+    assert wait_for(lambda: redis.cli("EXISTS", l2_key(uri)) == "1"), \
+        "A never wrote the object to L2"
+
+    b = _spawn_node(ng, "server-mn", 6)
+    try:
+        # Node B fills its L1 from the shared L2 (HIT, no origin) -> both hold it.
+        sb, body_b, hb = fetch(b.port, uri)
+        assert sb == 200 and body_b == body_a, "B should L2-fill A's body"
+        assert hb.get("x-cache") == "HIT", \
+            f"B fill X-Cache={hb.get('x-cache')} (expected an L2-fill HIT)"
+
+        # Wait until the entry is stale on BOTH nodes. Each node's L1 is fresh
+        # for valid=2s from its own store; B stored its copy last (~now), so a
+        # 2.5s sleep puts both past fresh yet well inside the 8s stale window.
+        time.sleep(2.5)                            # stale on both, still < 8s
+        base = origin.hits
+
+        # Hammer both nodes through the stale window. The dice fires a refresh on
+        # at least one; the NX lock lets exactly one node reach origin.
+        deadline = time.time() + 1.5
+        while time.time() < deadline:
+            fetch(ng.port, uri)
+            fetch(b.port, uri)
+            time.sleep(0.05)
+        time.sleep(0.4)                            # let any in-flight regen land
+
+        regens = origin.hits - base
+        assert regens == 1, \
+            f"cross-node single-flight failed: {regens} origin regens (want 1)"
+
+        time.sleep(0.2)
+        b.stop()
+        b.assert_clean_logs()
+    finally:
+        b.stop()
+
+
+def test_lock_self_heal(ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    """v4-2: a held cross-node lock (a peer mid-regen) makes other nodes serve
+    stale without piling on origin; once the lock PX-expires (the peer 'died'
+    before storing) a node re-acquires it and regenerates EXACTLY once. Uses the
+    short-lock_ttl /lockh/ location so the node's own per-box L1 refresh lock
+    (also lock_ttl) clears in step with the cross-node lock.
+
+    NB: losing the NX still arms this node's local refresh_lock_until for
+    lock_ttl, so the self-heal cannot fire until BOTH the peer's PX and this
+    node's local lock have expired — the foreign PX is set a touch longer than
+    lock_ttl so it is the gating one."""
+    uri = "/lockh/heal"
+    redis.cli("DEL", l2_key(uri), lock_key(uri))
+
+    s, body_a, h = fetch(ng.port, uri)             # prime -> origin -> L1 + L2
+    assert s == 200 and "x-cache" not in h, "prime should miss to origin"
+    assert wait_for(lambda: redis.cli("EXISTS", l2_key(uri)) == "1"), \
+        "prime never wrote L2"
+
+    time.sleep(2.4)                                # now stale (fresh=2s)
+
+    # A peer node 'holds' the regen lock (set now that the key is stale, PX 2500
+    # > lock_ttl 2000), then crashes — the lock is freed only by PX expiry.
+    redis.cli("SET", lock_key(uri), "peer-node", "PX", "2500")
+    base = origin.hits
+
+    # Phase 1 — lock held by the peer: refresh attempts lose the NX, so reads
+    # serve stale and origin is NOT hit. Short, well inside the 2.5s PX.
+    for _ in range(6):
+        s, _, _ = fetch(ng.port, uri)
+        assert s == 200, f"stale read status {s}"
+        time.sleep(0.05)
+    assert origin.hits == base, \
+        f"origin was hit while the lock was held by a peer ({origin.hits - base})"
+
+    # Phase 2 — let the peer's lock PX-expire (and with it, past this node's own
+    # 2s local lock), then read: a node self-heals by acquiring the freed NX and
+    # regenerating exactly once. Still inside the 8s stale window.
+    assert wait_for(lambda: redis.cli("EXISTS", lock_key(uri)) == "0",
+                    timeout=4.0), "foreign lock never PX-expired"
+    deadline = time.time() + 1.5
+    while time.time() < deadline and origin.hits == base:
+        fetch(ng.port, uri)
+        time.sleep(0.05)
+    time.sleep(0.4)
+
+    regens = origin.hits - base
+    assert regens == 1, \
+        f"self-heal: want exactly 1 regen after lock expiry, got {regens}"
+
+
+def test_purge_all_clears_l2(ng: Nginx, origin: Origin,
+                             redis: RedisServer) -> None:
+    """v4-2: POST ?all=1 on an L2-aware admin endpoint clears the whole L2
+    keyspace (SCAN MATCH <prefix>* + DEL), so a purged object cannot be refilled
+    from Redis on the next miss. Pre-v4-2 ?all=1 emptied L1 only."""
+    uri = "/l2/purgeall"
+    redis.cli("DEL", l2_key(uri))
+
+    s, body_a, h = fetch(ng.port, uri)             # miss -> origin -> L1 + L2
+    assert s == 200 and "x-cache" not in h, "prime should miss to origin"
+    assert wait_for(lambda: redis.cli("EXISTS", l2_key(uri)) == "1"), \
+        "write-through never reached L2"
+    _, _, h2 = fetch(ng.port, uri)
+    assert h2.get("x-cache") == "HIT", "should be an L1 hit before purge"
+
+    # all-purge via the L2-aware admin endpoint
+    s, b, _ = fetch(ng.port, "/_cache_l2?all=1", method="POST")
+    assert s == 200 and "purged" in json.loads(b), f"all-purge result: {s} {b}"
+
+    # the L2 entry must actually be gone (SCAN+DEL fired, fire-and-forget)
+    assert wait_for(lambda: redis.cli("EXISTS", l2_key(uri)) == "0"), \
+        "?all=1 did not clear the entry from L2 (v4-2 regression)"
+
+    # next read is a true miss to a NEW origin generation, not an L2 refill
+    origin_before = origin.hits
+    s, body_b, h3 = fetch(ng.port, uri)
+    assert s == 200 and "x-cache" not in h3, \
+        f"post-all-purge read should miss to origin, got {h3.get('x-cache')}"
+    assert origin.hits == origin_before + 1, \
+        "origin was not consulted after all-purge (L2 still served)"
+    assert body_b != body_a, "post-purge body should be a fresh generation"
+
+
 def test_normalize_arg_order(ng: Nginx, origin: Origin) -> None:
     """v3-1: ?b=2&a=1 and ?a=1&b=2 normalize to one cache slot — the reordered
     second request is a HIT serving the first body, origin hit exactly once."""
@@ -1178,6 +1355,9 @@ def run_all(ng: Nginx, origin: Origin,
         test_l2_expired_consults_l2(ng, origin, redis)
         test_l2_tag_add_on_store(ng, origin, redis)
         test_l2_tag_purge(ng, origin, redis)
+        test_multinode_lock(ng, origin, redis)
+        test_lock_self_heal(ng, origin, redis)
+        test_purge_all_clears_l2(ng, origin, redis)  # last L2: empties L2
     test_admin_purge_all(ng)   # last: it empties the zone
 
 
@@ -1229,7 +1409,9 @@ def main() -> int:
           "invalid-name rejected)"
           + (", L2 write-through (P4), L2 cross-instance fill (P2), "
              "L2-aware key purge (P6), expired-L1 consults L2 (P6), "
-             "tag index add (v2c), tag purge both tiers (P4)"
+             "tag index add (v2c), tag purge both tiers (P4), "
+             "multi-node dogpile lock (v4-2 SET NX PX), lock self-heal (v4-2), "
+             "?all=1 clears L2 (v4-2 SCAN+DEL)"
              if redis_port else ""))
     return 0
 

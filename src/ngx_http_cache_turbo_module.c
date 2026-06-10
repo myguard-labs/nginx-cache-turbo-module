@@ -313,6 +313,18 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
 
         if (stale_until == 0 || now < stale_until) {
             /* stale-but-serveable */
+
+            /* Cross-node single-flight resolved (v4-2): we parked for the Redis
+             * NX and the phase engine re-entered. If we won, we own the
+             * cluster-wide regen → go to origin. If we lost, fall through:
+             * `refreshing` is already claimed (set before we parked) so the dice
+             * is skipped and we serve stale via the tail below — no extra state
+             * needed. */
+            if (ctx->lock_done && ctx->lock_result == NGX_OK) {
+                ngx_shmtx_unlock(&z->shpool->mutex);
+                return NGX_DECLINED;
+            }
+
             stale_window = ngx_http_cache_turbo_stale_ttl(clcf->valid,
                                clcf->stale_mult)
                            - clcf->valid;
@@ -327,15 +339,17 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
              * regenerator. This caps origin regens at ~one per stale cycle even
              * with many workers and aggressive beta. */
             refresh = NGX_DECLINED;
-            if (!ctn->refreshing || now >= ctn->refresh_lock_until) {
+            if (!ctx->lock_done
+                && (!ctn->refreshing || now >= ctn->refresh_lock_until))
+            {
                 refresh = ngx_http_cache_turbo_should_refresh(ctx->key_hash,
                               fresh_until, stale_window, clcf->beta);
             }
 
             if (refresh == NGX_OK) {
-                /* we win the dice: claim the refresh under lock (atomic with
-                 * the check above), serve stale, and fall through to origin so
-                 * the filters restore a fresh copy. The lock self-heals after
+                /* we win the per-box dice: claim the refresh under lock (atomic
+                 * with the check above), serve stale, and fall through to origin
+                 * so the filters restore a fresh copy. The lock self-heals after
                  * lock_ttl if this refresh never completes. */
                 time_t lock_ttl = clcf->lock_ttl;
                 if (lock_ttl <= 0) {
@@ -346,6 +360,19 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                 ngx_shmtx_unlock(&z->shpool->mutex);
                 (void) ngx_atomic_fetch_add(&z->sh->stale_serves, 1);
                 (void) ngx_atomic_fetch_add(&z->sh->refreshes, 1);
+
+                /* Cross-node gate (v4-2): the per-box L1 dice win is necessary
+                 * but not sufficient — only the node that ALSO wins the Redis
+                 * SET NX PX regenerates; the rest serve stale. lock() parks for
+                 * the NX reply and re-enters this handler (ctx->lock_done set,
+                 * handled at the top of this block). NGX_DECLINED = L2 off /
+                 * could not start → single-box fallback (regenerate locally). */
+                if (clcf->backend && clcf->backend->lock) {
+                    ngx_int_t  lrc = clcf->backend->lock(r, clcf, ctx, lock_ttl);
+                    if (lrc == NGX_AGAIN) {
+                        return NGX_AGAIN;       /* parked; resume re-enters */
+                    }
+                }
                 return NGX_DECLINED;
             }
 
@@ -1224,6 +1251,39 @@ ngx_http_cache_turbo_tag_purge_complete(ngx_http_request_t *r, void *data,
 }
 
 
+/* State carried through an async all-purge (?all=1) from the admin handler to
+ * the SCAN-del completion callback. Holds the L1 count purged synchronously so
+ * the reply can report it after the parked L2 SCAN finishes. */
+typedef struct {
+    ngx_uint_t  purged;        /* L1 entries dropped (reported as "purged") */
+} ngx_http_cache_turbo_allpurge_t;
+
+
+/* SCAN-del completion (?all=1): the L2 keyspace has been walked + DEL'd; emit
+ * {"purged":N} where N is the L1 count (L2 deletions are fire-and-forget and not
+ * separately counted). members/nmembers are unused (always 0 here). */
+static ngx_int_t
+ngx_http_cache_turbo_all_purge_complete(ngx_http_request_t *r, void *data,
+    ngx_str_t *members, ngx_uint_t nmembers)
+{
+    ngx_http_cache_turbo_allpurge_t  *ap = data;
+    u_char                           *p;
+    ngx_str_t                         body;
+
+    (void) members;
+    (void) nmembers;
+
+    p = ngx_pnalloc(r->pool, sizeof("{\"purged\":4294967295}\n"));
+    if (p == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+    body.data = p;
+    body.len = ngx_sprintf(p, "{\"purged\":%ui}\n", ap->purged) - p;
+
+    return ngx_http_cache_turbo_send_json(r, NGX_HTTP_OK, &body);
+}
+
+
 /* GET  -> JSON stats for the zone.
  * POST -> purge: ?all=1 purges the whole zone; ?key=<string> purges one key
  *         (hashed the same way the cache hashes its key); ?tag=<name> purges
@@ -1253,6 +1313,31 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
             && ngx_http_arg(r, (u_char *) "all", 3, &arg) == NGX_OK)
         {
             purged = clcf->l1->purge_all(z);
+
+            /* L2-aware all-purge (v4-2): also clear the whole L2 keyspace for
+             * this prefix via a parked SCAN MATCH <prefix>* + DEL loop, so an
+             * object cleared from L1 cannot be silently refilled from Redis on
+             * the next miss. Needs cache_turbo_redis on this admin location.
+             * The completion callback emits {"purged":<L1 count>}. */
+            if (clcf->backend && clcf->backend->scan_del) {
+                ngx_http_cache_turbo_allpurge_t  *ap;
+                ngx_int_t                         rc;
+
+                ap = ngx_palloc(r->pool,
+                                sizeof(ngx_http_cache_turbo_allpurge_t));
+                if (ap == NULL) {
+                    return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                }
+                ap->purged = purged;
+
+                rc = clcf->backend->scan_del(r, clcf,
+                         ngx_http_cache_turbo_all_purge_complete, ap);
+                if (rc == NGX_DONE) {
+                    return NGX_DONE;        /* parked; completion sends reply */
+                }
+                /* NGX_ERROR: L2 unavailable — fall through to the sync reply
+                 * below with the L1 count (L2 left as-is). */
+            }
 
         } else if (r->args.len
                    && ngx_http_arg(r, (u_char *) "key", 3, &arg) == NGX_OK)
