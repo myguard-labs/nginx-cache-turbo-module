@@ -112,6 +112,7 @@ class Origin:
         self.delay = delay
         self.fail = False          # when True, every GET answers 503 (v8 SIE)
         self._n = 0
+        self._paths: list[tuple[float, str]] = []   # DEBUG: (time, path) log
         self._lock = threading.Lock()
         self._server: http.server.ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
@@ -141,6 +142,9 @@ class Origin:
                 with origin._lock:
                     origin._n += 1
                     n = origin._n
+                    origin._paths.append((time.time(), self.path))
+                    if len(origin._paths) > 64:        # ring: diagnostics only
+                        del origin._paths[:-64]
                 # Origin failure injection (v8 stale-if-error): the hit is still
                 # counted (so a test can prove the refresh reached the origin),
                 # but the response is a 5xx the module must NOT cache or surface.
@@ -584,6 +588,7 @@ http {{
             cache_turbo_key      $uri;
             cache_turbo_autotune on;
             cache_turbo_autotune_interval 3600s;
+            cache_turbo_background_update off;   # autotune test: inline regen (see /atch/)
             add_header           X-CT-Beta $cache_turbo_beta always;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
@@ -593,6 +598,7 @@ http {{
             cache_turbo_preset   conservative;
             cache_turbo_autotune on;
             cache_turbo_autotune_interval 3600s;
+            cache_turbo_background_update off;   # autotune test: inline regen (see /atch/)
             add_header           X-CT-Beta $cache_turbo_beta always;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
@@ -611,6 +617,7 @@ http {{
             cache_turbo_key      $uri;
             cache_turbo_autotune on;
             cache_turbo_autotune_interval 3600s;
+            cache_turbo_background_update off;   # autotune test: inline regen (see /atch/)
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
@@ -628,6 +635,13 @@ http {{
             cache_turbo_lock_ttl 1s;
             cache_turbo_autotune on;
             cache_turbo_autotune_interval 3600s;
+            # bg-update OFF: this test drives a *flood* of stale re-reads (110 keys
+            # x 4 cycles) purely to exercise the autotune churn gate; with SWR on
+            # each would fire an async background-refresh subrequest, swamping a
+            # single-process worker and leaking late origin hits into later tests'
+            # exact-count assertions. Inline regen records cost/refreshes identically
+            # for autotune, so this changes nothing the test measures.
+            cache_turbo_background_update off;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
@@ -1451,6 +1465,7 @@ def test_l2_cross_instance_fill(ng: Nginx, origin: Origin,
     assert s == 200 and "x-cache" not in ha, "A should miss to origin first"
     assert wait_for(lambda: redis.cli("EXISTS", l2_key(uri)) == "1"), \
         "A never wrote the object to L2"
+    drain_origin(origin)           # absorb any stray async bg before counting
     origin_after_a = origin.hits
 
     # Instance B: separate nginx, cold L1, same Redis + same origin
@@ -1466,8 +1481,11 @@ def test_l2_cross_instance_fill(ng: Nginx, origin: Origin,
         assert body_b == body_a, f"B body {body_b!r} != A body {body_a!r}"
         assert hb.get("x-cache") == "HIT", \
             f"B X-Cache={hb.get('x-cache')} (expected an L2-fill HIT)"
-        assert origin.hits == origin_after_a, \
-            f"origin was hit on the L2 fill ({origin.hits} vs {origin_after_a})"
+        if origin.hits != origin_after_a:
+            recent = [(round(t, 2), p) for t, p in origin._paths[-15:]]
+            raise AssertionError(
+                f"origin was hit on the L2 fill ({origin.hits} vs "
+                f"{origin_after_a}); recent origin paths: {recent}")
 
         # B now has it in L1 too: second read is a plain L1 HIT
         _, body_b2, hb2 = fetch(b.port, uri)
@@ -1692,6 +1710,7 @@ def test_multinode_lock(ng: Nginx, origin: Origin, redis: RedisServer) -> None:
         # for valid=2s from its own store; B stored its copy last (~now), so a
         # 2.5s sleep puts both past fresh yet well inside the 8s stale window.
         time.sleep(2.5)                            # stale on both, still < 8s
+        drain_origin(origin)       # absorb any stray async bg before counting
         base = origin.hits
 
         # Hammer both nodes through the stale window. The dice fires a refresh on
@@ -1739,6 +1758,7 @@ def test_lock_self_heal(ng: Nginx, origin: Origin, redis: RedisServer) -> None:
     # A peer node 'holds' the regen lock (set now that the key is stale, PX 2500
     # > lock_ttl 2000), then crashes — the lock is freed only by PX expiry.
     redis.cli("SET", lock_key(uri), "peer-node", "PX", "2500")
+    drain_origin(origin)           # absorb any stray async bg before counting
     base = origin.hits
 
     # Phase 1 — lock held by the peer: refresh attempts lose the NX, so reads
@@ -1762,8 +1782,11 @@ def test_lock_self_heal(ng: Nginx, origin: Origin, redis: RedisServer) -> None:
     time.sleep(0.4)
 
     regens = origin.hits - base
-    assert regens == 1, \
-        f"self-heal: want exactly 1 regen after lock expiry, got {regens}"
+    if regens != 1:
+        recent = [(round(t, 2), p) for t, p in origin._paths[-15:]]
+        raise AssertionError(
+            f"self-heal: want exactly 1 regen after lock expiry, got {regens}; "
+            f"recent origin paths: {recent}")
     drain_origin(origin)       # v8: settle async bg refreshes before the next test
 
 
