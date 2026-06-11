@@ -180,6 +180,13 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       offsetof(ngx_http_cache_turbo_loc_conf_t, purge),
       NULL },
 
+    { ngx_string("cache_turbo_background_update"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_turbo_loc_conf_t, background_update),
+      NULL },
+
     { ngx_string("cache_turbo_admin"),
       NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
       ngx_http_cache_turbo_admin,
@@ -652,6 +659,26 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
              * is skipped and we serve stale via the tail below — no extra state
              * needed. */
             if (ctx->lock_done && ctx->lock_result == NGX_OK) {
+                /* We own the cluster-wide regen. With background_update (v8,
+                 * default) refresh in the background and serve stale now; else
+                 * fall through to the origin and regenerate inline. */
+                if (clcf->background_update) {
+                    u_char *snap = ngx_pnalloc(r->pool, ctn->len);
+                    size_t  snap_len = ctn->len;
+                    if (snap == NULL) {
+                        ngx_shmtx_unlock(&z->shpool->mutex);
+                        return NGX_ERROR;
+                    }
+                    ngx_memcpy(snap, ctn->data, snap_len);
+                    ngx_shmtx_unlock(&z->shpool->mutex);
+                    (void) ngx_http_cache_turbo_warm_one(r, &r->uri, &r->args);
+                    (void) ngx_atomic_fetch_add(&z->sh->stale_serves, 1);
+                    ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                                   "cache_turbo: cross-node WON bg-refresh + STALE "
+                                   "serve \"%V\" key=%ui len=%uz",
+                                   &r->uri, (ngx_uint_t) hash, snap_len);
+                    return ngx_http_cache_turbo_serve(r, snap, snap_len, 1);
+                }
                 ngx_shmtx_unlock(&z->shpool->mutex);
                 ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                                "cache_turbo: cross-node lock WON \"%V\" key=%ui "
@@ -683,16 +710,34 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
 
             if (refresh == NGX_OK) {
                 /* We win the per-box dice: claim the refresh under lock (atomic
-                 * with the check above) and fall through to the origin so the
-                 * filters restore a fresh copy. NB this request regenerates
-                 * SYNCHRONOUSLY — it serves the fresh origin response, not stale;
-                 * the OTHER concurrent readers are the ones serving stale. So we
-                 * count a `refresh` here but NOT a `stale_serve`. The lock
-                 * self-heals after lock_ttl if this refresh never completes. */
-                time_t lock_ttl = clcf->lock_ttl;
+                 * with the check above). With background_update on (v8, default)
+                 * this request serves STALE and refreshes in the background — it
+                 * never blocks on origin; the bg subrequest restores a fresh copy
+                 * and a failed origin (5xx/timeout) leaves the stale entry intact
+                 * (stale-if-error). With background_update off it falls through to
+                 * the origin and regenerates SYNCHRONOUSLY (serving fresh). Either
+                 * way the OTHER concurrent readers serve stale. We count a
+                 * `refresh` here (the regen we triggered) plus a `stale_serve` on
+                 * the bg path (the stale response we hand back). The lock
+                 * self-heals after lock_ttl if the refresh never completes. */
+                time_t  lock_ttl = clcf->lock_ttl;
+                u_char *snap;
+                size_t  snap_len;
+
                 if (lock_ttl <= 0) {
                     lock_ttl = 5;
                 }
+
+                /* snapshot the stale copy under the lock — used to serve stale on
+                 * the single-box background-update path below. */
+                snap_len = ctn->len;
+                snap = ngx_pnalloc(r->pool, snap_len);
+                if (snap == NULL) {
+                    ngx_shmtx_unlock(&z->shpool->mutex);
+                    return NGX_ERROR;
+                }
+                ngx_memcpy(snap, ctn->data, snap_len);
+
                 ctn->refreshing = 1;
                 ctn->refresh_lock_until = now + lock_ttl;
                 ngx_shmtx_unlock(&z->shpool->mutex);
@@ -705,8 +750,8 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                  * but not sufficient — only the node that ALSO wins the Redis
                  * SET NX PX regenerates; the rest serve stale. lock() parks for
                  * the NX reply and re-enters this handler (ctx->lock_done set,
-                 * handled at the top of this block). NGX_DECLINED = L2 off /
-                 * could not start → single-box fallback (regenerate locally). */
+                 * resolved at the top of this block — bg or inline). NGX_DECLINED
+                 * = L2 off / could not start → single-box fallback below. */
                 if (clcf->backend && clcf->backend->lock) {
                     ngx_int_t  lrc = clcf->backend->lock(r, clcf, ctx, lock_ttl);
                     if (lrc == NGX_AGAIN) {
@@ -716,7 +761,20 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                         return NGX_AGAIN;       /* parked; resume re-enters */
                     }
                 }
-                return NGX_DECLINED;
+
+                /* single-box winner (no L2 lock, or it could not start). */
+                if (clcf->background_update) {
+                    /* v8: fire a background refresh of this URI, serve stale. */
+                    (void) ngx_http_cache_turbo_warm_one(r, &r->uri, &r->args);
+                    (void) ngx_atomic_fetch_add(&z->sh->stale_serves, 1);
+                    ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                                   "cache_turbo: bg-refresh + STALE serve \"%V\" "
+                                   "key=%ui len=%uz", &r->uri, (ngx_uint_t) hash,
+                                   snap_len);
+                    return ngx_http_cache_turbo_serve(r, snap, snap_len, 1);
+                }
+
+                return NGX_DECLINED;       /* inline regen (serves fresh) */
             }
 
             /* serve stale, no regeneration on this request */
@@ -2943,6 +3001,7 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->autotune_interval = NGX_CONF_UNSET;
     conf->honor_cc = NGX_CONF_UNSET;
     conf->purge = NGX_CONF_UNSET;
+    conf->background_update = NGX_CONF_UNSET;
     conf->max_size = NGX_CONF_UNSET_SIZE;
     conf->redis_enable = NGX_CONF_UNSET;
     conf->redis_timeout = NGX_CONF_UNSET_MSEC;
@@ -3030,6 +3089,10 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 
     /* PURGE method (v14): off by default. */
     ngx_conf_merge_value(conf->purge, prev->purge, 0);
+
+    /* v8: background update / SWR defaults ON — the dice-winner serves stale and
+     * refreshes in the background rather than blocking on origin. */
+    ngx_conf_merge_value(conf->background_update, prev->background_update, 1);
 
     /* Live autotune (v4-3): off by default; default recompute cadence when on. */
     ngx_conf_merge_value(conf->autotune, prev->autotune, 0);

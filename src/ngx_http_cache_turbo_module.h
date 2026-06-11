@@ -287,6 +287,15 @@ typedef struct {
      * allow/deny. Off by default. */
     ngx_flag_t               purge;
 
+    /* Background update / stale-while-revalidate (v8). When on (default), the
+     * SWR dice-winner does NOT regenerate inline: it fires a background refresh
+     * subrequest for its own URI and serves the stale copy immediately, so no
+     * foreground request ever blocks on the origin. A failed bg refresh (origin
+     * 5xx/timeout) never overwrites the entry, so the stale copy persists =
+     * stale-if-error for free. Off restores the old block-and-serve-fresh
+     * winner. Mirrors proxy_cache_background_update (but default on here). */
+    ngx_flag_t               background_update;
+
     /* L2 Redis (v2b). Native async client, no hiredis. The L2 store is touched
      * only on an L1 miss (sync GET) and on store (async write-through); it is
      * never on the L1-hit hot path. */

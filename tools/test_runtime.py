@@ -110,6 +110,7 @@ class Origin:
     def __init__(self, port: int, delay: float = 0.0) -> None:
         self.port = port
         self.delay = delay
+        self.fail = False          # when True, every GET answers 503 (v8 SIE)
         self._n = 0
         self._lock = threading.Lock()
         self._server: http.server.ThreadingHTTPServer | None = None
@@ -140,6 +141,14 @@ class Origin:
                 with origin._lock:
                     origin._n += 1
                     n = origin._n
+                # Origin failure injection (v8 stale-if-error): the hit is still
+                # counted (so a test can prove the refresh reached the origin),
+                # but the response is a 5xx the module must NOT cache or surface.
+                if origin.fail:
+                    self.send_response(503)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
                 # Per-status caching markers (v6): redirects + negative responses.
                 if "redir" in self.path:
                     self.send_response(301)
@@ -438,6 +447,28 @@ http {{
             cache_turbo_key      $uri;
             cache_turbo_valid    1s;     # stale window = 3s, expires at 4s
             cache_turbo_beta     5000;   # aggressive: refresh likely while stale
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # stale-if-error (v8): background_update is ON by default, so a stale
+        # dice-winner serves stale + refreshes in the background. A failing
+        # origin never overwrites the entry -> the stale copy persists.
+        location /sie/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    2s;     # fresh 2s, stale window x4 -> 8s
+            cache_turbo_beta     5000;   # aggressive: a stale read fires a refresh
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # background_update OFF (v8): the stale dice-winner regenerates INLINE
+        # and serves the fresh body on that request (pre-v8 behaviour).
+        location /noswr/ {{
+            cache_turbo                   main;
+            cache_turbo_key               $uri;
+            cache_turbo_valid             2s;
+            cache_turbo_beta              5000;
+            cache_turbo_background_update off;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
@@ -861,6 +892,26 @@ def wait_for(predicate, timeout: float = 3.0, interval: float = 0.05) -> bool:
     return False
 
 
+def drain_origin(origin: Origin, settle: float = 0.6,
+                 timeout: float = 10.0) -> None:
+    """Wait until the origin stops receiving hits for `settle` seconds. v8's
+    background_update fires async refresh subrequests that hit the origin AFTER
+    the triggering request has returned; a bg-firing test must call this before
+    returning so its async origin traffic does not pollute a later test's exact
+    origin.hits assertion."""
+    deadline = time.time() + timeout
+    last = origin.hits
+    stable_since = time.time()
+    while time.time() < deadline:
+        time.sleep(0.05)
+        now = origin.hits
+        if now != last:
+            last = now
+            stable_since = time.time()
+        elif time.time() - stable_since >= settle:
+            return
+
+
 # --------------------------------------------------------------------------- #
 # Tests
 # --------------------------------------------------------------------------- #
@@ -1099,6 +1150,7 @@ def test_stale_serves_stale(ng: Nginx, origin: Origin) -> None:
             break
         time.sleep(0.1)
     assert advanced, "stale entry never refreshed to a new generation"
+    drain_origin(origin)       # v8: settle async bg refreshes before the next test
 
 
 def test_single_flight(ng: Nginx, origin: Origin) -> None:
@@ -1120,6 +1172,57 @@ def test_single_flight(ng: Nginx, origin: Origin) -> None:
     # let a few through before the lock is visible across event-loop turns).
     assert regens <= 8, \
         f"single-flight failed: {regens} origin regens for 40 readers"
+    drain_origin(origin)       # v8: settle async bg refreshes before the next test
+
+
+def test_stale_if_error(ng: Nginx, origin: Origin) -> None:
+    """v8: when an entry is stale and the background refresh hits a 5xx origin,
+    the client keeps getting the stale copy — the error is never surfaced and
+    the stale entry is not overwritten (stale-if-error)."""
+    s0, b0, _ = fetch(ng.port, "/sie/x")           # prime: 200, cached fresh
+    assert s0 == 200 and b0, f"prime failed: {s0} {b0!r}"
+    base = origin.hits
+    time.sleep(2.3)                                # past fresh (2s), inside the
+                                                   # stale window (×4 = 8s)
+    origin.fail = True
+    try:
+        for _ in range(8):
+            s, b, h = fetch(ng.port, "/sie/x")
+            assert s == 200, f"stale-if-error served {s}, expected stale 200"
+            assert b == b0, f"served {b!r}, expected stale {b0!r}"
+            assert h.get("x-cache") == "STALE", \
+                f"expected STALE serve, got x-cache={h.get('x-cache')}"
+            time.sleep(0.1)
+        # the background refresh did reach the (failing) origin at least once
+        assert origin.hits > base, \
+            "no background refresh reached the origin during the stale window"
+    finally:
+        origin.fail = False
+        drain_origin(origin)   # settle the failing bg refreshes before next test
+
+
+def test_background_update_off_regenerates_inline(ng: Nginx,
+                                                  origin: Origin) -> None:
+    """v8: cache_turbo_background_update off restores the pre-v8 winner — the
+    stale dice-winner regenerates INLINE and serves the freshly regenerated body
+    on that same request (live origin response, no X-Cache header), rather than
+    serving stale and refreshing in the background."""
+    s0, b0, _ = fetch(ng.port, "/noswr/x")         # prime
+    assert s0 == 200 and b0
+    time.sleep(2.3)                                # stale
+    # aggressive beta -> a stale read wins the dice; bg-off -> it regenerates
+    # inline and the response is the live origin body (no X-Cache), a NEW gen.
+    deadline = time.time() + 3.0
+    got_fresh_inline = False
+    while time.time() < deadline:
+        s, b, h = fetch(ng.port, "/noswr/x")
+        assert s == 200
+        if b != b0 and "x-cache" not in h:
+            got_fresh_inline = True
+            break
+        time.sleep(0.1)
+    assert got_fresh_inline, \
+        "bg-off winner should serve a freshly regenerated body inline"
 
 
 def test_lru_eviction(ng: Nginx) -> None:
@@ -1609,6 +1712,7 @@ def test_multinode_lock(ng: Nginx, origin: Origin, redis: RedisServer) -> None:
         b.assert_clean_logs()
     finally:
         b.stop()
+        drain_origin(origin)   # v8: settle async bg refreshes before next test
 
 
 def test_lock_self_heal(ng: Nginx, origin: Origin, redis: RedisServer) -> None:
@@ -1660,6 +1764,7 @@ def test_lock_self_heal(ng: Nginx, origin: Origin, redis: RedisServer) -> None:
     regens = origin.hits - base
     assert regens == 1, \
         f"self-heal: want exactly 1 regen after lock expiry, got {regens}"
+    drain_origin(origin)       # v8: settle async bg refreshes before the next test
 
 
 def test_purge_all_clears_l2(ng: Nginx, origin: Origin,
@@ -1926,6 +2031,7 @@ def test_preset_window_differs(ng: Nginx, origin: Origin) -> None:
     assert any(h.get("x-cache") == "STALE" for _, _, h in results), \
         ("aggressive (stale_mult=8) should still serve STALE at t=3s; "
          "got " + repr(sorted({h.get('x-cache') for _, _, h in results})))
+    drain_origin(origin)       # v8: settle async bg refreshes before the next test
 
 
 def test_invalid_preset_name(ng: Nginx) -> None:
@@ -1999,6 +2105,7 @@ def test_autotune_raises_beta_within_band(ng: Nginx, origin: Origin) -> None:
         assert con < bal, f"conservative ({con}) should be below balanced ({bal})"
     finally:
         origin.delay = 0.0
+        drain_origin(origin)   # v8: settle async bg refreshes before next test
 
 
 def test_autotune_off_by_default(ng: Nginx) -> None:
@@ -2021,6 +2128,7 @@ def test_autotune_insufficient_data(ng: Nginx, origin: Origin) -> None:
         assert st["autotuned_beta"] == 0, f"thin data wrongly tuned: {st}"
     finally:
         origin.delay = 0.0
+        drain_origin(origin)   # v8: settle async bg refreshes before next test
 
 
 def test_autotune_churn_disqualifies(ng: Nginx, origin: Origin) -> None:
@@ -2046,6 +2154,7 @@ def test_autotune_churn_disqualifies(ng: Nginx, origin: Origin) -> None:
             f"churn-heavy window should be vetoed, got {st}"
     finally:
         origin.delay = 0.0
+        drain_origin(origin)   # v8: settle async bg refreshes before next test
 
 
 def run_all(ng: Nginx, origin: Origin,
@@ -2081,6 +2190,8 @@ def run_all(ng: Nginx, origin: Origin,
     test_warm_no_url(ng)
     test_stale_serves_stale(ng, origin)
     test_single_flight(ng, origin)
+    test_stale_if_error(ng, origin)
+    test_background_update_off_regenerates_inline(ng, origin)
     test_normalize_arg_order(ng, origin)
     test_normalize_strips_tracking(ng, origin)
     test_normalize_strip_custom(ng, origin)
@@ -2196,6 +2307,7 @@ def main() -> int:
           "concurrency (R1), prometheus metrics (incl L2 hit/miss), "
           "default-key normalization, "
           "LRU eviction (R6), stale serve (R3), single-flight (R4), "
+          "stale-if-error (v8), background_update off (v8 inline regen), "
           "admin stats/purge/gating, warm (v3-3: populates/multi/no-url), "
           "key normalize (v3-1: order/tracking/"
           "custom-strip/strip-all/distinct), "
