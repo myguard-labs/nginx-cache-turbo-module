@@ -265,6 +265,16 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # L2 keepalive pool (v15): up to 4 idle Redis connections cached per
+        # worker and reused across ops, instead of connect()+close per op.
+        location /l2ka/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    30s;
+            cache_turbo_redis    127.0.0.1:{redis_port} prefix=ct: timeout=250ms keepalive=4 keepalive_timeout=30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # L2 with a short fresh TTL so the L1 copy expires in-test (stale window
         # = valid*4 = 4s), exercising the expired-L1 -> consult-L2 path (P6).
         location /l2e/ {{
@@ -1284,6 +1294,47 @@ def test_l2_write_through(ng: Nginx, origin: Origin, redis: RedisServer) -> None
     assert h2.get("x-cache") == "HIT" and b2 == body, "L1 hit broken after L2 set"
 
 
+def _redis_conns_received(redis: RedisServer) -> int:
+    """Redis' monotonic count of accepted client connections (INFO stats)."""
+    for line in redis.cli("INFO", "stats").splitlines():
+        if line.startswith("total_connections_received:"):
+            return int(line.split(":", 1)[1])
+    raise RuntimeError("total_connections_received absent from INFO stats")
+
+
+def test_l2_keepalive_reuse(ng: Nginx, origin: Origin,
+                            redis: RedisServer) -> None:
+    """v15: the keepalive pool reuses Redis connections across L2 ops. A burst
+    of distinct-URI misses opens one L2 GET + one L2 SET each. Under /l2ka/
+    (keepalive=4) the pool reuses connections, so Redis accepts far fewer new
+    connections than the same burst under /l2/ (no keepalive), where every op
+    dials a fresh socket and closes it."""
+    n = 60
+    stamp = time.time()
+
+    def burst(prefix: str) -> int:
+        before = _redis_conns_received(redis)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+            # 4 concurrent (== pool size) so reuse can dominate; unique keys so
+            # every request is an L1+L2 miss (GET then write-through SET).
+            list(ex.map(lambda i: fetch(ng.port, f"{prefix}ka-{stamp}-{i}"),
+                        range(n)))
+        # let the fire-and-forget SETs complete + pooled conns settle
+        time.sleep(0.6)
+        return _redis_conns_received(redis) - before
+
+    off = burst("/l2/")      # no keepalive: ~2N fresh connections
+    on = burst("/l2ka/")     # keepalive=4: a small bounded number, then reuse
+
+    assert off > n, f"no-keepalive baseline too low ({off}); expected > {n}"
+    assert on * 2 < off, \
+        f"keepalive did not cut Redis connection churn (on={on}, off={off})"
+
+    # the pool keeps connections live: a subsequent op still hits + serves
+    _, _, h = fetch(ng.port, f"/l2ka/ka-{stamp}-0")   # now an L1 HIT
+    assert h.get("x-cache") == "HIT", "keepalive location broke the hot path"
+
+
 def test_l2_cross_instance_fill(ng: Nginx, origin: Origin,
                                 redis: RedisServer) -> None:
     """P2: an L1 miss fills from L2. A second, independent nginx with a cold L1
@@ -2049,6 +2100,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_autotune_churn_disqualifies(ng, origin)
     if redis is not None:
         test_l2_write_through(ng, origin, redis)
+        test_l2_keepalive_reuse(ng, origin, redis)
         test_l2_cross_instance_fill(ng, origin, redis)
         test_l2_purge_key_drops_l2(ng, origin, redis)
         test_l2_expired_consults_l2(ng, origin, redis)
@@ -2153,7 +2205,8 @@ def main() -> int:
           "invalid-name rejected), "
           "autotune (v4-3: raises beta within band/off-by-default/"
           "insufficient-data/churn-disqualify)"
-          + (", L2 write-through (P4), L2 cross-instance fill (P2), "
+          + (", L2 write-through (P4), keepalive pool reuse (v15), "
+             "L2 cross-instance fill (P2), "
              "L2-aware key purge (P6), expired-L1 consults L2 (P6), "
              "tag index add (v2c), tag purge both tiers (P4), "
              "multi-node dogpile lock (v4-2 SET NX PX), lock self-heal (v4-2), "

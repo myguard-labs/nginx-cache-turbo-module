@@ -295,6 +295,15 @@ typedef struct {
     ngx_str_t                redis_prefix; /* key prefix, default "ct:"        */
     ngx_msec_t               redis_timeout;/* connect/read timeout             */
 
+    /* Keepalive pool (v15). cache_turbo_redis keepalive=N caches up to N idle
+     * L2 connections per worker, keyed by peer addr, so an L2 op reuses a live
+     * TCP connection instead of connect()+close per op. 0 = off (default).
+     * keepalive_timeout= closes an idle pooled connection after this long.
+     * Plain TCP only: TLS connections are never pooled (c->ssl borrows the op
+     * pool, which is torn down per op — see redis op_done). */
+    ngx_int_t                redis_keepalive;        /* max idle conns, 0=off  */
+    ngx_msec_t               redis_keepalive_timeout;/* idle close timeout     */
+
     /* Full DSN (v5): cache_turbo_redis accepts redis://[user:pass@]host:port/db
      * (rediss:// = TLS), with prefix=/timeout=/password=/user=/db=/tls=/
      * tls_verify=/tls_ca=/tls_name= overrides. On each connection the driver

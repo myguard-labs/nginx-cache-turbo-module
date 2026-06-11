@@ -1812,6 +1812,28 @@ ngx_http_cache_turbo_redis_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             }
             clcf->redis_timeout = (ngx_msec_t) t;
 
+        } else if (ngx_strncmp(value[i].data, "keepalive=", 10) == 0) {
+            clcf->redis_keepalive = ngx_atoi(value[i].data + 10,
+                                             value[i].len - 10);
+            if (clcf->redis_keepalive == NGX_ERROR
+                || clcf->redis_keepalive < 0)
+            {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                    "cache_turbo_redis: bad keepalive \"%V\"", &value[i]);
+                return NGX_CONF_ERROR;
+            }
+
+        } else if (ngx_strncmp(value[i].data, "keepalive_timeout=", 18) == 0) {
+            s.data = value[i].data + 18;
+            s.len = value[i].len - 18;
+            t = ngx_parse_time(&s, 0);   /* milliseconds */
+            if (t == NGX_ERROR) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                    "cache_turbo_redis: bad keepalive_timeout \"%V\"", &s);
+                return NGX_CONF_ERROR;
+            }
+            clcf->redis_keepalive_timeout = (ngx_msec_t) t;
+
         } else if (ngx_strncmp(value[i].data, "password=", 9) == 0) {
             clcf->redis_password.data = value[i].data + 9;
             clcf->redis_password.len = value[i].len - 9;
@@ -2924,6 +2946,8 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->max_size = NGX_CONF_UNSET_SIZE;
     conf->redis_enable = NGX_CONF_UNSET;
     conf->redis_timeout = NGX_CONF_UNSET_MSEC;
+    conf->redis_keepalive = NGX_CONF_UNSET;
+    conf->redis_keepalive_timeout = NGX_CONF_UNSET_MSEC;
     conf->redis_db = NGX_CONF_UNSET;
     conf->redis_tls = NGX_CONF_UNSET;
     conf->redis_tls_verify = NGX_CONF_UNSET;
@@ -3049,6 +3073,9 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     /* L2 Redis: inherit address/prefix/timeout, default prefix "ct:". */
     ngx_conf_merge_value(conf->redis_enable, prev->redis_enable, 0);
     ngx_conf_merge_msec_value(conf->redis_timeout, prev->redis_timeout, 250);
+    ngx_conf_merge_value(conf->redis_keepalive, prev->redis_keepalive, 0);
+    ngx_conf_merge_msec_value(conf->redis_keepalive_timeout,
+                              prev->redis_keepalive_timeout, 60000);
 
     if (conf->redis_addr.sockaddr == NULL) {
         conf->redis_addr = prev->redis_addr;

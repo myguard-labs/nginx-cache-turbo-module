@@ -45,6 +45,9 @@ typedef struct {
     ngx_http_cache_turbo_ctx_t  *ctx;      /* GET/lock: request ctx to fill   */
     ngx_http_cache_turbo_loc_conf_t *clcf; /* DSN/TLS + SCAN rebuild + del_raw */
     unsigned                     is_lock:1;/* lock op (deposits ctx->lock_*)  */
+    unsigned                     reused:1; /* conn came from keepalive pool   */
+    unsigned                     clean:1;  /* reply fully consumed at boundary:
+                                            * connection is reusable (v15)     */
 
     /* AUTH/SELECT preamble (v5 DSN). When the backend needs auth or a non-zero
      * db, `preamble` holds the pipelined AUTH (+SELECT) RESP; it is written
@@ -96,6 +99,253 @@ static void ngx_http_cache_turbo_redis_tls_handshake(ngx_event_t *ev);
 static void ngx_http_cache_turbo_redis_tls_handshake_done(
     ngx_connection_t *c);
 #endif
+
+
+/* ------------------------------------------------------------------------- *
+ * Keepalive pool (v15)
+ *
+ * A per-worker (process-global) cache of idle L2 connections, keyed by peer
+ * addr, so an op reuses a live TCP connection instead of connect()+close per
+ * op. Modelled on ngx_http_upstream_keepalive: a fixed array of items split
+ * between a `cache` queue (holding a live idle connection) and a `free` queue
+ * (empty slots). An idle pooled connection carries a close-on-readable handler
+ * (peer hung up / sent unsolicited data -> drop) plus an idle timer.
+ *
+ * Plain TCP only. A TLS connection's c->ssl is allocated from the op pool
+ * (which op_done destroys), so a pooled TLS conn would dangle — TLS ops are
+ * never pooled (guarded in save/get). A reused dead connection (redis closed it
+ * between park and reuse) just fails the op, which degrades to an L2 miss /
+ * lost fire-and-forget write / serve-stale — all safe, since L2 is advisory.
+ * ------------------------------------------------------------------------- */
+
+typedef struct {
+    ngx_queue_t        queue;
+    ngx_connection_t  *connection;
+    socklen_t          socklen;
+    ngx_sockaddr_t     sockaddr;       /* copy of peer addr, for match */
+} ngx_http_cache_turbo_redis_ka_item_t;
+
+typedef struct {
+    ngx_uint_t   inited;
+    ngx_uint_t   max;                  /* cap (cache_turbo_redis keepalive=N) */
+    ngx_uint_t   count;                /* live idle connections held */
+    ngx_msec_t   timeout;              /* idle close timeout */
+    ngx_queue_t  cache;                /* items holding a live connection */
+    ngx_queue_t  free;                 /* empty item slots */
+    ngx_http_cache_turbo_redis_ka_item_t *items;
+} ngx_http_cache_turbo_redis_ka_t;
+
+/* Process-global: each worker gets its own copy after fork. */
+static ngx_http_cache_turbo_redis_ka_t  ngx_http_cache_turbo_redis_ka;
+
+static void ngx_http_cache_turbo_redis_ka_close_handler(ngx_event_t *ev);
+static void ngx_http_cache_turbo_redis_ka_dummy_handler(ngx_event_t *ev);
+
+
+/* Lazily build the per-worker item array sized to the first-seen keepalive cap.
+ * Items live in ngx_cycle->pool (worker lifetime). Returns 0 if keepalive is
+ * off or the array cannot be allocated. */
+static ngx_uint_t
+ngx_http_cache_turbo_redis_ka_init(ngx_http_cache_turbo_loc_conf_t *clcf)
+{
+    ngx_uint_t                              i, max;
+    ngx_http_cache_turbo_redis_ka_t        *ka = &ngx_http_cache_turbo_redis_ka;
+
+    if (clcf->redis_keepalive <= 0) {
+        return 0;
+    }
+
+    if (ka->inited) {
+        return ka->max > 0;
+    }
+
+    ka->inited = 1;
+    max = (ngx_uint_t) clcf->redis_keepalive;
+
+    ka->items = ngx_palloc(ngx_cycle->pool,
+                           max * sizeof(ngx_http_cache_turbo_redis_ka_item_t));
+    if (ka->items == NULL) {
+        ka->max = 0;
+        return 0;
+    }
+
+    ngx_queue_init(&ka->cache);
+    ngx_queue_init(&ka->free);
+    for (i = 0; i < max; i++) {
+        ngx_queue_insert_head(&ka->free, &ka->items[i].queue);
+    }
+
+    ka->max = max;
+    ka->count = 0;
+    ka->timeout = clcf->redis_keepalive_timeout
+                      ? clcf->redis_keepalive_timeout : 60000;
+
+    return 1;
+}
+
+
+/* Close a pooled connection and return its slot to the free queue. */
+static void
+ngx_http_cache_turbo_redis_ka_drop(ngx_http_cache_turbo_redis_ka_item_t *item)
+{
+    ngx_connection_t                 *c = item->connection;
+    ngx_http_cache_turbo_redis_ka_t  *ka = &ngx_http_cache_turbo_redis_ka;
+
+    ngx_queue_remove(&item->queue);
+    ngx_queue_insert_head(&ka->free, &item->queue);
+    ka->count--;
+
+    item->connection = NULL;
+    if (c) {
+        ngx_close_connection(c);       /* plain conn: c->pool is NULL */
+    }
+}
+
+
+/* Pop a live pooled connection matching `addr` for reuse, or NULL. On success
+ * the caller owns the connection: it must install its own read/write handlers
+ * and either reuse or close it. */
+static ngx_connection_t *
+ngx_http_cache_turbo_redis_ka_get(ngx_http_cache_turbo_loc_conf_t *clcf,
+    ngx_addr_t *addr)
+{
+    ngx_queue_t                            *q;
+    ngx_connection_t                       *c;
+    ngx_http_cache_turbo_redis_ka_item_t   *item;
+    ngx_http_cache_turbo_redis_ka_t        *ka = &ngx_http_cache_turbo_redis_ka;
+
+    if (clcf->redis_tls || !ngx_http_cache_turbo_redis_ka_init(clcf)) {
+        return NULL;
+    }
+
+    for (q = ngx_queue_head(&ka->cache);
+         q != ngx_queue_sentinel(&ka->cache);
+         q = ngx_queue_next(q))
+    {
+        item = ngx_queue_data(q, ngx_http_cache_turbo_redis_ka_item_t, queue);
+
+        if (item->socklen == addr->socklen
+            && ngx_memcmp(&item->sockaddr, addr->sockaddr, addr->socklen) == 0)
+        {
+            c = item->connection;
+
+            ngx_queue_remove(q);
+            ngx_queue_insert_head(&ka->free, q);
+            ka->count--;
+            item->connection = NULL;
+
+            if (c->read->timer_set) {
+                ngx_del_timer(c->read);
+            }
+            c->idle = 0;
+            c->read->handler = NULL;
+            c->write->handler = NULL;
+
+            ngx_log_debug2(NGX_LOG_DEBUG_HTTP, c->log, 0,
+                           "cache_turbo: redis reuse pooled conn fd:%d (%ui left)",
+                           c->fd, ka->count);
+            return c;
+        }
+    }
+
+    return NULL;
+}
+
+
+/* Park op's connection on the idle pool if it is reusable. Returns 1 if parked
+ * (caller must NOT close it), 0 if the caller should close it as usual. */
+static ngx_uint_t
+ngx_http_cache_turbo_redis_ka_save(ngx_http_cache_turbo_redis_op_t *op)
+{
+    u_char                                  scratch[1];
+    ssize_t                                 n;
+    ngx_queue_t                            *q;
+    ngx_connection_t                       *c = op->peer.connection;
+    ngx_http_cache_turbo_redis_ka_item_t   *item;
+    ngx_http_cache_turbo_redis_ka_t        *ka = &ngx_http_cache_turbo_redis_ka;
+
+    if (!op->clean || c == NULL || op->clcf == NULL) {
+        return 0;
+    }
+    if (op->clcf->redis_tls || c->ssl) {
+        return 0;                          /* TLS conns are never pooled */
+    }
+    if (c->read->error || c->write->error || c->read->eof
+        || c->read->timedout || c->write->timedout || c->error)
+    {
+        return 0;
+    }
+    if (!ngx_http_cache_turbo_redis_ka_init(op->clcf)) {
+        return 0;
+    }
+    if (ka->count >= ka->max || ngx_queue_empty(&ka->free)) {
+        return 0;                          /* pool full: close it */
+    }
+
+    /* The stream must be exactly at a reply boundary: redis should have nothing
+     * more to send. A readable byte here means leftover/unsolicited data (or a
+     * close) — don't pool a connection we can't trust. */
+    n = c->recv(c, scratch, sizeof(scratch));
+    if (n != NGX_AGAIN) {
+        return 0;
+    }
+
+    q = ngx_queue_head(&ka->free);
+    ngx_queue_remove(q);
+    item = ngx_queue_data(q, ngx_http_cache_turbo_redis_ka_item_t, queue);
+    ngx_queue_insert_head(&ka->cache, q);
+    ka->count++;
+
+    item->connection = c;
+    item->socklen = op->peer.socklen;
+    ngx_memcpy(&item->sockaddr, op->peer.sockaddr, op->peer.socklen);
+
+    if (c->write->timer_set) {
+        ngx_del_timer(c->write);
+    }
+    if (c->read->timer_set) {
+        ngx_del_timer(c->read);
+    }
+
+    c->data = item;
+    c->read->handler = ngx_http_cache_turbo_redis_ka_close_handler;
+    c->write->handler = ngx_http_cache_turbo_redis_ka_dummy_handler;
+    c->idle = 1;                           /* core closes on worker shutdown */
+
+    if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
+        ngx_http_cache_turbo_redis_ka_drop(item);
+        return 1;                          /* drop closed it; do not double-close */
+    }
+
+    ngx_add_timer(c->read, ka->timeout);
+
+    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, c->log, 0,
+                   "cache_turbo: redis pool conn fd:%d (%ui idle)",
+                   c->fd, ka->count);
+    return 1;
+}
+
+
+/* Idle pooled connection became readable (peer closed or sent unsolicited
+ * data) or the idle timer fired: drop it. */
+static void
+ngx_http_cache_turbo_redis_ka_close_handler(ngx_event_t *ev)
+{
+    ngx_connection_t                       *c = ev->data;
+    ngx_http_cache_turbo_redis_ka_item_t   *item = c->data;
+
+    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, c->log, 0,
+                   "cache_turbo: redis pooled conn fd:%d dropped (%s)",
+                   c->fd, ev->timedout ? "idle timeout" : "peer event");
+    ngx_http_cache_turbo_redis_ka_drop(item);
+}
+
+
+static void
+ngx_http_cache_turbo_redis_ka_dummy_handler(ngx_event_t *ev)
+{
+    /* An idle pooled connection should never get a write event; ignore it. */
+}
 
 
 size_t
@@ -318,9 +568,37 @@ static ngx_int_t
 ngx_http_cache_turbo_redis_launch(ngx_http_cache_turbo_redis_op_t *op,
     ngx_http_cache_turbo_loc_conf_t *clcf, void (*read_handler)(ngx_event_t *))
 {
+    ngx_connection_t  *c;
+
     op->clcf = clcf;
     op->command = op->send;
     op->read_handler = read_handler;
+
+    /* Keepalive (v15): reuse a pooled idle connection if one is live. A pooled
+     * connection is already AUTH'd + SELECT'd, so it skips the preamble and
+     * sends the command straight away. */
+    if (clcf->redis_keepalive > 0 && !clcf->redis_tls) {
+        c = ngx_http_cache_turbo_redis_ka_get(clcf, &clcf->redis_addr);
+        if (c != NULL) {
+            op->reused = 1;
+            op->peer.connection = c;
+            op->peer.sockaddr = clcf->redis_addr.sockaddr;
+            op->peer.socklen = clcf->redis_addr.socklen;
+            op->peer.name = &clcf->redis_addr.name;
+            op->peer.log = ngx_cycle->log;
+            c->data = op;
+            c->write->handler = ngx_http_cache_turbo_redis_write;
+            c->read->handler = read_handler;
+
+            if (op->timeout) {
+                ngx_add_timer(c->write, op->timeout);
+            }
+            /* Post (don't run inline): a GET parks with count++ only after this
+             * returns, so an inline failure must not resume the request yet. */
+            ngx_post_event(c->write, &ngx_posted_events);
+            return NGX_OK;
+        }
+    }
 
     op->preamble = ngx_http_cache_turbo_redis_preamble(op->pool, clcf,
                        &op->preamble_replies);
@@ -1136,6 +1414,9 @@ ngx_http_cache_turbo_redis_read_drain(ngx_event_t *rev)
                       "cache_turbo: redis SET error: %*s",
                       (size_t) (n > 64 ? 64 : n), op->recv);
     }
+    if (n > 0) {
+        op->clean = 1;                     /* ack consumed: connection poolable */
+    }
     ngx_http_cache_turbo_redis_op_done(op);
 }
 
@@ -1280,6 +1561,10 @@ ngx_http_cache_turbo_redis_read_get(ngx_event_t *rev)
         if (rc == NGX_AGAIN) {
             continue;                      /* read more */
         }
+        /* A definitive parse result (hit or nil/miss) means a complete, well-
+         * formed reply was consumed: the connection is at a clean boundary and
+         * may be pooled (v15). */
+        op->clean = 1;
         if (rc == NGX_OK) {
             ngx_http_cache_turbo_redis_get_finish(op, NGX_OK, blob, blob_len);
         } else {
@@ -1681,6 +1966,12 @@ ngx_http_cache_turbo_redis_op_done(ngx_http_cache_turbo_redis_op_t *op)
     ngx_pool_t        *pool = op->pool;
     ngx_connection_t  *c = op->peer.connection;
 
+    if (c && ngx_http_cache_turbo_redis_ka_save(op)) {
+        /* parked on the idle pool; the connection outlives this op */
+        ngx_destroy_pool(pool);
+        return;
+    }
+
     if (c) {
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,
                        "cache_turbo: redis conn close fd:%d", c->fd);
@@ -1777,6 +2068,7 @@ ngx_http_cache_turbo_redis_read_lock(ngx_event_t *rev)
         return;
     }
 
+    op->clean = 1;                         /* reply consumed: connection poolable */
     ngx_http_cache_turbo_redis_lock_finish(op,
         op->recv[0] == '+' ? NGX_OK : NGX_DECLINED);
 }
