@@ -800,6 +800,58 @@ ngx_http_cache_turbo_redis_read_drain(ngx_event_t *rev)
 
 
 /*
+ * Append one recv() of reply bytes into op->rbuf, growing it (bounded by
+ * MAX_REPLY) when full. Shared by the GET / SMEMBERS / SCAN readers so the
+ * grow + recv + event-rearm boilerplate lives in one place. Returns:
+ *   NGX_OK    - op->rlen advanced by the bytes read; caller should re-parse
+ *   NGX_AGAIN - nothing readable yet, read event re-armed; caller must return
+ *   NGX_ERROR - cap exceeded, alloc failed, or the peer closed/errored; caller
+ *               must run its op-specific finish(fail)
+ */
+static ngx_int_t
+ngx_http_cache_turbo_redis_fill(ngx_http_cache_turbo_redis_op_t *op,
+    ngx_event_t *rev)
+{
+    ssize_t            n;
+    u_char            *nbuf;
+    size_t             ncap;
+    ngx_connection_t  *c = rev->data;
+
+    if (op->rlen == op->rcap) {
+        if (op->rcap >= NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY) {
+            return NGX_ERROR;
+        }
+        ncap = op->rcap * 2;
+        if (ncap > NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY) {
+            ncap = NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY;
+        }
+        nbuf = ngx_pnalloc(op->pool, ncap);
+        if (nbuf == NULL) {
+            return NGX_ERROR;
+        }
+        ngx_memcpy(nbuf, op->rbuf, op->rlen);
+        op->rbuf = nbuf;
+        op->rcap = ncap;
+    }
+
+    n = c->recv(c, op->rbuf + op->rlen, op->rcap - op->rlen);
+
+    if (n == NGX_AGAIN) {
+        if (ngx_handle_read_event(rev, 0) != NGX_OK) {
+            return NGX_ERROR;
+        }
+        return NGX_AGAIN;
+    }
+    if (n == NGX_ERROR || n == 0) {
+        return NGX_ERROR;
+    }
+
+    op->rlen += (size_t) n;
+    return NGX_OK;
+}
+
+
+/*
  * Parse an accumulated GET reply in op->rbuf[0..op->rlen]. Returns:
  *   NGX_OK       - bulk string complete; blob/blob_len point into rbuf
  *   NGX_AGAIN    - need more bytes
@@ -856,9 +908,8 @@ ngx_http_cache_turbo_redis_parse(ngx_http_cache_turbo_redis_op_t *op,
 static void
 ngx_http_cache_turbo_redis_read_get(ngx_event_t *rev)
 {
-    ssize_t                           n;
-    u_char                           *blob, *nbuf;
-    size_t                            blob_len, ncap;
+    u_char                           *blob;
+    size_t                            blob_len;
     ngx_int_t                         rc;
     ngx_connection_t                 *c;
     ngx_http_cache_turbo_redis_op_t  *op;
@@ -874,42 +925,15 @@ ngx_http_cache_turbo_redis_read_get(ngx_event_t *rev)
     }
 
     for ( ;; ) {
-        if (op->rlen == op->rcap) {
-            /* buffer full but reply incomplete: grow (bounded) */
-            if (op->rcap >= NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY) {
-                ngx_http_cache_turbo_redis_get_finish(op, NGX_DECLINED, NULL, 0);
-                return;
-            }
-            ncap = op->rcap * 2;
-            if (ncap > NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY) {
-                ncap = NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY;
-            }
-            nbuf = ngx_pnalloc(op->pool, ncap);
-            if (nbuf == NULL) {
-                ngx_http_cache_turbo_redis_get_finish(op, NGX_DECLINED, NULL, 0);
-                return;
-            }
-            ngx_memcpy(nbuf, op->rbuf, op->rlen);
-            op->rbuf = nbuf;
-            op->rcap = ncap;
+        rc = ngx_http_cache_turbo_redis_fill(op, rev);
+        if (rc == NGX_AGAIN) {
+            return;                        /* wait for more, or re-arm failed */
         }
-
-        n = c->recv(c, op->rbuf + op->rlen, op->rcap - op->rlen);
-
-        if (n == NGX_AGAIN) {
-            if (ngx_handle_read_event(rev, 0) != NGX_OK) {
-                ngx_http_cache_turbo_redis_get_finish(op, NGX_DECLINED,
-                                                      NULL, 0);
-            }
-            return;
-        }
-        if (n == NGX_ERROR || n == 0) {
-            /* connection closed/error before a full reply: treat as miss */
+        if (rc == NGX_ERROR) {
+            /* cap/alloc/closed: treat as an L2 miss */
             ngx_http_cache_turbo_redis_get_finish(op, NGX_DECLINED, NULL, 0);
             return;
         }
-
-        op->rlen += n;
 
         rc = ngx_http_cache_turbo_redis_parse(op, &blob, &blob_len);
         if (rc == NGX_AGAIN) {
@@ -1037,10 +1061,7 @@ ngx_http_cache_turbo_redis_parse_array(ngx_http_cache_turbo_redis_op_t *op,
 static void
 ngx_http_cache_turbo_redis_read_smembers(ngx_event_t *rev)
 {
-    ssize_t                           n;
     ngx_str_t                        *members;
-    u_char                           *nbuf;
-    size_t                            ncap;
     ngx_uint_t                        nmembers;
     ngx_int_t                         rc;
     ngx_connection_t                 *c;
@@ -1057,39 +1078,14 @@ ngx_http_cache_turbo_redis_read_smembers(ngx_event_t *rev)
     }
 
     for ( ;; ) {
-        if (op->rlen == op->rcap) {
-            if (op->rcap >= NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY) {
-                ngx_http_cache_turbo_redis_smembers_finish(op, NULL, 0);
-                return;
-            }
-            ncap = op->rcap * 2;
-            if (ncap > NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY) {
-                ncap = NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY;
-            }
-            nbuf = ngx_pnalloc(op->pool, ncap);
-            if (nbuf == NULL) {
-                ngx_http_cache_turbo_redis_smembers_finish(op, NULL, 0);
-                return;
-            }
-            ngx_memcpy(nbuf, op->rbuf, op->rlen);
-            op->rbuf = nbuf;
-            op->rcap = ncap;
-        }
-
-        n = c->recv(c, op->rbuf + op->rlen, op->rcap - op->rlen);
-
-        if (n == NGX_AGAIN) {
-            if (ngx_handle_read_event(rev, 0) != NGX_OK) {
-                ngx_http_cache_turbo_redis_smembers_finish(op, NULL, 0);
-            }
+        rc = ngx_http_cache_turbo_redis_fill(op, rev);
+        if (rc == NGX_AGAIN) {
             return;
         }
-        if (n == NGX_ERROR || n == 0) {
+        if (rc == NGX_ERROR) {
             ngx_http_cache_turbo_redis_smembers_finish(op, NULL, 0);
             return;
         }
-
-        op->rlen += n;
 
         rc = ngx_http_cache_turbo_redis_parse_array(op, &members, &nmembers);
         if (rc == NGX_AGAIN) {
@@ -1244,9 +1240,6 @@ ngx_http_cache_turbo_redis_parse_scan(ngx_http_cache_turbo_redis_op_t *op,
 static void
 ngx_http_cache_turbo_redis_read_scan(ngx_event_t *rev)
 {
-    ssize_t                           n;
-    u_char                           *nbuf;
-    size_t                            ncap;
     ngx_str_t                         cursor, *keys;
     ngx_uint_t                        i, nkeys;
     ngx_int_t                         rc;
@@ -1264,39 +1257,14 @@ ngx_http_cache_turbo_redis_read_scan(ngx_event_t *rev)
     }
 
     for ( ;; ) {
-        if (op->rlen == op->rcap) {
-            if (op->rcap >= NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY) {
-                ngx_http_cache_turbo_redis_smembers_finish(op, NULL, 0);
-                return;
-            }
-            ncap = op->rcap * 2;
-            if (ncap > NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY) {
-                ncap = NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY;
-            }
-            nbuf = ngx_pnalloc(op->pool, ncap);
-            if (nbuf == NULL) {
-                ngx_http_cache_turbo_redis_smembers_finish(op, NULL, 0);
-                return;
-            }
-            ngx_memcpy(nbuf, op->rbuf, op->rlen);
-            op->rbuf = nbuf;
-            op->rcap = ncap;
-        }
-
-        n = c->recv(c, op->rbuf + op->rlen, op->rcap - op->rlen);
-
-        if (n == NGX_AGAIN) {
-            if (ngx_handle_read_event(rev, 0) != NGX_OK) {
-                ngx_http_cache_turbo_redis_smembers_finish(op, NULL, 0);
-            }
+        rc = ngx_http_cache_turbo_redis_fill(op, rev);
+        if (rc == NGX_AGAIN) {
             return;
         }
-        if (n == NGX_ERROR || n == 0) {
+        if (rc == NGX_ERROR) {
             ngx_http_cache_turbo_redis_smembers_finish(op, NULL, 0);
             return;
         }
-
-        op->rlen += n;
 
         rc = ngx_http_cache_turbo_redis_parse_scan(op, &cursor, &keys, &nkeys);
         if (rc == NGX_AGAIN) {
@@ -1510,7 +1478,6 @@ ngx_http_cache_turbo_redis_op_fail(ngx_http_cache_turbo_redis_op_t *op)
  * single-flight window and cause cross-node double-regen). */
 ngx_cache_turbo_backend_t  ngx_http_cache_turbo_redis_backend = {
     ngx_string("redis"),
-    ngx_http_cache_turbo_redis_key,
     ngx_http_cache_turbo_redis_get,
     ngx_http_cache_turbo_redis_set,
     ngx_http_cache_turbo_redis_del,

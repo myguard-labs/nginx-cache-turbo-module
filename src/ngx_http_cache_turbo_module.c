@@ -6,7 +6,9 @@
  *
  *   - ACCESS phase: hash the cache key, look it up in the L1 shm zone.
  *       * fresh hit          -> serve from shm, skip upstream
- *       * stale hit + dice   -> serve stale now; this request regenerates
+ *       * stale hit + dice   -> THIS request regenerates synchronously (goes to
+ *                               origin, serves the fresh copy); concurrent
+ *                               readers serve stale meanwhile
  *       * stale hit, no dice -> serve stale now; someone else regenerates
  *       * miss               -> let the request run, capture + store
  *   - header/body filters: capture the upstream response and store it.
@@ -233,7 +235,7 @@ ngx_module_t  ngx_http_cache_turbo_module = {
 };
 
 
-/* Build the cache key string and its 32-byte hash into the request ctx. */
+/* Build the cache key string and its hash into the request ctx. */
 static ngx_int_t
 ngx_http_cache_turbo_build_key(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx)
@@ -245,15 +247,36 @@ ngx_http_cache_turbo_build_key(ngx_http_request_t *r,
             return NGX_ERROR;
         }
     } else {
-        /* default key: scheme + host + request_uri */
-        ctx->cache_key = r->unparsed_uri;
+        /*
+         * Default key: Host + request URI. The Host MUST be in the key — without
+         * it, two server blocks that share one zone collide (cross-vhost cache
+         * poisoning). r->headers_in.server is the validated Host (or matched
+         * server_name); r->unparsed_uri carries the path + raw query string.
+         */
+        u_char     *k, *p;
+        ngx_str_t   host = r->headers_in.server;
+        size_t      klen = host.len + r->unparsed_uri.len;
+
+        k = ngx_pnalloc(r->pool, klen ? klen : 1);
+        if (k == NULL) {
+            return NGX_ERROR;
+        }
+        p = ngx_cpymem(k, host.data, host.len);
+        ngx_memcpy(p, r->unparsed_uri.data, r->unparsed_uri.len);
+        ctx->cache_key.data = k;
+        ctx->cache_key.len = klen;
     }
 
+    /*
+     * key_hash is a 32-byte slot; MD5 fills the low 16 and the high 16 stay
+     * zero (ctx is pcalloc'd). The collision guard is therefore effectively
+     * 128-bit — ample for cache keying, and the redis hex key/lockkey encode
+     * the full 32-byte slot so the on-wire layout is stable.
+     */
     ngx_md5_init(&md5);
     ngx_md5_update(&md5, ctx->cache_key.data, ctx->cache_key.len);
     ngx_md5_final(ctx->key_hash, &md5);
 
-    /* md5 is 16 bytes; widen into the 32-byte slot (rest stays zero). */
     return NGX_OK;
 }
 
@@ -414,10 +437,13 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
             }
 
             if (refresh == NGX_OK) {
-                /* we win the per-box dice: claim the refresh under lock (atomic
-                 * with the check above), serve stale, and fall through to origin
-                 * so the filters restore a fresh copy. The lock self-heals after
-                 * lock_ttl if this refresh never completes. */
+                /* We win the per-box dice: claim the refresh under lock (atomic
+                 * with the check above) and fall through to the origin so the
+                 * filters restore a fresh copy. NB this request regenerates
+                 * SYNCHRONOUSLY — it serves the fresh origin response, not stale;
+                 * the OTHER concurrent readers are the ones serving stale. So we
+                 * count a `refresh` here but NOT a `stale_serve`. The lock
+                 * self-heals after lock_ttl if this refresh never completes. */
                 time_t lock_ttl = clcf->lock_ttl;
                 if (lock_ttl <= 0) {
                     lock_ttl = 5;
@@ -425,7 +451,6 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                 ctn->refreshing = 1;
                 ctn->refresh_lock_until = now + lock_ttl;
                 ngx_shmtx_unlock(&z->shpool->mutex);
-                (void) ngx_atomic_fetch_add(&z->sh->stale_serves, 1);
                 (void) ngx_atomic_fetch_add(&z->sh->refreshes, 1);
 
                 /* Cross-node gate (v4-2): the per-box L1 dice win is necessary
@@ -645,6 +670,106 @@ ngx_http_cache_turbo_serve(ngx_http_request_t *r, u_char *copy, size_t len,
 }
 
 
+/*
+ * RFC 9111 shared-cache safety floor: decide whether THIS response may be stored
+ * and replayed to other clients. Refuses when
+ *   - the request carried Authorization (the response is per-user), or
+ *   - the response sets a cookie (Set-Cookie => per-client state), or
+ *   - Cache-Control forbids shared/any caching
+ *     (private / no-store / no-cache / max-age=0 / s-maxage=0).
+ * Without this the module would store an authenticated 200 under its URL key and
+ * serve it to everyone — a cache-poisoning / data-leak hole. Cheap: one walk of
+ * the (small) response header list, only on the store path.
+ */
+static ngx_int_t
+ngx_http_cache_turbo_response_cacheable(ngx_http_request_t *r)
+{
+    ngx_list_part_t  *part;
+    ngx_table_elt_t  *h;
+    ngx_uint_t        i;
+
+    if (r->headers_in.authorization != NULL) {
+        return 0;
+    }
+
+    part = &r->headers_out.headers.part;
+    h = part->elts;
+    for (i = 0; /* void */ ; i++) {
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            h = part->elts;
+            i = 0;
+        }
+        if (h[i].hash == 0 || h[i].key.len == 0) {
+            continue;
+        }
+
+        if (h[i].key.len == sizeof("Set-Cookie") - 1
+            && ngx_strncasecmp(h[i].key.data, (u_char *) "Set-Cookie",
+                               sizeof("Set-Cookie") - 1) == 0)
+        {
+            return 0;
+        }
+
+        if (h[i].key.len == sizeof("Cache-Control") - 1
+            && ngx_strncasecmp(h[i].key.data, (u_char *) "Cache-Control",
+                               sizeof("Cache-Control") - 1) == 0)
+        {
+            u_char  *v = h[i].value.data;
+            u_char  *e = v + h[i].value.len;
+
+            if (ngx_strlcasestrn(v, e, (u_char *) "no-store", 8 - 1) != NULL
+                || ngx_strlcasestrn(v, e, (u_char *) "no-cache", 8 - 1) != NULL
+                || ngx_strlcasestrn(v, e, (u_char *) "private", 7 - 1) != NULL
+                || ngx_strlcasestrn(v, e, (u_char *) "max-age=0", 9 - 1) != NULL
+                || ngx_strlcasestrn(v, e, (u_char *) "s-maxage=0", 10 - 1)
+                       != NULL)
+            {
+                return 0;
+            }
+        }
+    }
+
+    return 1;
+}
+
+
+/*
+ * Headers that must NOT be captured into the cache blob. Hop-by-hop (RFC 9110
+ * §7.6.1) plus headers serve() / nginx's own header filter regenerate:
+ * Content-Length is re-derived from the stored body, Date/Server are re-emitted
+ * by the header filter, so replaying any of these would duplicate or conflict
+ * (e.g. two Content-Length lines, or chunked framing against a fixed length).
+ * Set-Cookie is dropped defensively too, though response_cacheable already
+ * refuses to store a Set-Cookie response at all.
+ */
+static ngx_int_t
+ngx_http_cache_turbo_header_skip(u_char *name, size_t nlen)
+{
+    static const char  *skip[] = {
+        "Connection", "Keep-Alive", "Proxy-Authenticate",
+        "Proxy-Authorization", "TE", "Trailer", "Transfer-Encoding",
+        "Upgrade", "Content-Length", "Set-Cookie", "Date", "Server", NULL
+    };
+    ngx_uint_t  i;
+    size_t      sl;
+
+    for (i = 0; skip[i] != NULL; i++) {
+        sl = ngx_strlen(skip[i]);
+        if (nlen == sl
+            && ngx_strncasecmp(name, (u_char *) skip[i], sl) == 0)
+        {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+
 static ngx_int_t
 ngx_http_cache_turbo_header_filter(ngx_http_request_t *r)
 {
@@ -663,7 +788,8 @@ ngx_http_cache_turbo_header_filter(ngx_http_request_t *r)
      * a warm subrequest (ctx->warm) is the deliberate exception — we want its
      * origin response captured and stored even though r != r->main. */
     if (clcf->enable && (r == r->main || ctx->warm)
-        && r->headers_out.status == NGX_HTTP_OK)
+        && r->headers_out.status == NGX_HTTP_OK
+        && ngx_http_cache_turbo_response_cacheable(r))
     {
         /* A warm subrequest never ran the access phase (nginx skips it for
          * subrequests), so its key was never built. Build it here from the
@@ -710,6 +836,9 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
     }
 
     for (cl = in; cl; cl = cl->next) {
+        ngx_buf_t    *nb;
+        ngx_chain_t  *ncl;
+
         b = cl->buf;
         n = ngx_buf_size(b);
 
@@ -720,7 +849,7 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
             }
             ngx_memcpy(p, b->pos, n);
 
-            ngx_buf_t *nb = ngx_calloc_buf(r->pool);
+            nb = ngx_calloc_buf(r->pool);
             if (nb == NULL) {
                 return NGX_ERROR;
             }
@@ -728,7 +857,7 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
             nb->last = p + n;
             nb->memory = 1;
 
-            ngx_chain_t *ncl = ngx_alloc_chain_link(r->pool);
+            ncl = ngx_alloc_chain_link(r->pool);
             if (ncl == NULL) {
                 return NGX_ERROR;
             }
@@ -779,7 +908,10 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
                 h = part->elts;
                 i = 0;
             }
-            if (h[i].hash == 0 || h[i].key.len == 0) {
+            if (h[i].hash == 0 || h[i].key.len == 0
+                || ngx_http_cache_turbo_header_skip(h[i].key.data,
+                                                    h[i].key.len))
+            {
                 continue;
             }
             hdr_bytes += sizeof(uint32_t) + h[i].key.len
@@ -831,7 +963,10 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
                     h = part->elts;
                     i = 0;
                 }
-                if (h[i].hash == 0 || h[i].key.len == 0) {
+                if (h[i].hash == 0 || h[i].key.len == 0
+                    || ngx_http_cache_turbo_header_skip(h[i].key.data,
+                                                        h[i].key.len))
+                {
                     continue;
                 }
                 CT_PUT(h[i].key.data, h[i].key.len,
@@ -1380,10 +1515,18 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
     ngx_str_t                         body;
     u_char                           *p;
     size_t                            len;
+    ngx_int_t                         rc;
 
     clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
     if (!clcf->admin || clcf->admin_zone == NULL) {
         return NGX_HTTP_NOT_FOUND;
+    }
+
+    /* Content handler must consume any request body (a purge/warm POST may carry
+     * one) or the bytes desync a keepalive connection. */
+    rc = ngx_http_discard_request_body(r);
+    if (rc != NGX_OK) {
+        return rc;
     }
 
     z = clcf->admin_zone->data;

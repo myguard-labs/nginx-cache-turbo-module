@@ -259,7 +259,6 @@ ngx_http_cache_turbo_shm_store(ngx_http_cache_turbo_zone_t *z,
         ctn->data = body;
         ctn->len = len;
         ctn->status = status;
-        ctn->generated_at = now;
         ctn->fresh_until = now + fresh_ttl;
         ctn->stale_until = stale_ttl ? now + stale_ttl : 0;
         ctn->refreshing = 0;
@@ -303,7 +302,6 @@ ngx_http_cache_turbo_shm_store(ngx_http_cache_turbo_zone_t *z,
     ctn->data = body;
     ctn->len = len;
     ctn->status = status;
-    ctn->generated_at = now;
     ctn->fresh_until = now + fresh_ttl;
     ctn->stale_until = stale_ttl ? now + stale_ttl : 0;
     ctn->refreshing = 0;

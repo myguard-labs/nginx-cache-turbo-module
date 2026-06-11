@@ -119,6 +119,16 @@ class Origin:
                 self.send_header("Content-Type",
                                  "application/json; charset=utf-8")
                 self.send_header("X-Backend", "origin-42")
+                # Path-marker-driven response headers, so a test can drive the
+                # RFC 9111 shared-cache floor (these responses must NOT be
+                # stored). The marker is matched in the path so $uri keying still
+                # collapses repeated requests onto one slot.
+                if "setcookie" in self.path:
+                    self.send_header("Set-Cookie", "sess=abc; Path=/")
+                if "ccprivate" in self.path:
+                    self.send_header("Cache-Control", "private, max-age=60")
+                if "ccnostore" in self.path:
+                    self.send_header("Cache-Control", "no-store")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 try:
@@ -248,6 +258,25 @@ http {{
             cache_turbo_key      $uri;
             cache_turbo_valid    30s;
             cache_turbo_max_size 1m;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # cacheability floor (RFC 9111): origin emits Set-Cookie / Cache-Control
+        # based on the path marker; such responses must never be stored. key=$uri
+        # so repeated requests share a slot (proving the refusal, not just a key
+        # split).
+        location /cc/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # default cache key (no cache_turbo_key) = $host$request_uri, so two
+        # Host headers on the same path must NOT collide.
+        location /dk/ {{
+            cache_turbo          main;
+            cache_turbo_valid    30s;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
@@ -656,6 +685,75 @@ def test_max_size_not_cached(ng: Nginx) -> None:
     fetch(ng.port, "/big/x")
     _, _, h = fetch(ng.port, "/big/x")
     assert "x-cache" not in h, "oversized response should not be cached"
+
+
+def test_no_cache_set_cookie(ng: Nginx) -> None:
+    """RFC 9111 floor: a Set-Cookie response is never stored (it carries
+    per-client state) — repeated reads keep hitting the origin."""
+    s1, b1, h1 = fetch(ng.port, "/cc/setcookie")
+    assert s1 == 200 and "x-cache" not in h1, "first read should be a miss"
+    s2, b2, h2 = fetch(ng.port, "/cc/setcookie")
+    assert "x-cache" not in h2, "Set-Cookie response must not be cached"
+    assert b1 != b2, "both reads should have gone to the origin"
+
+
+def test_no_cache_cc_private(ng: Nginx) -> None:
+    """RFC 9111 floor: Cache-Control: private is not stored in a shared cache."""
+    _, b1, h1 = fetch(ng.port, "/cc/ccprivate")
+    assert "x-cache" not in h1
+    _, b2, h2 = fetch(ng.port, "/cc/ccprivate")
+    assert "x-cache" not in h2, "Cache-Control: private must not be cached"
+    assert b1 != b2
+
+
+def test_no_cache_cc_nostore(ng: Nginx) -> None:
+    """RFC 9111 floor: Cache-Control: no-store is never stored."""
+    _, b1, h1 = fetch(ng.port, "/cc/ccnostore")
+    assert "x-cache" not in h1
+    _, b2, h2 = fetch(ng.port, "/cc/ccnostore")
+    assert "x-cache" not in h2, "Cache-Control: no-store must not be cached"
+    assert b1 != b2
+
+
+def test_no_cache_authorization(ng: Nginx) -> None:
+    """RFC 9111 floor: a request carrying Authorization yields a per-user
+    response that must not be stored in (or served from) the shared cache."""
+    hdr = {"Authorization": "Bearer secrettoken"}
+    _, b1, h1 = fetch(ng.port, "/c/authreq", headers=hdr)
+    assert "x-cache" not in h1
+    _, b2, h2 = fetch(ng.port, "/c/authreq", headers=hdr)
+    assert "x-cache" not in h2, "Authorization request must not be cached"
+    assert b1 != b2
+
+
+def test_default_key_varies_by_host(ng: Nginx) -> None:
+    """Default key (no cache_turbo_key) is $host$request_uri: the same path
+    under two Host headers must NOT collide (cross-vhost poisoning guard)."""
+    s1, b1, h1 = fetch(ng.port, "/dk/hostvary", headers={"Host": "a.example"})
+    assert s1 == 200 and "x-cache" not in h1, "first read should be a miss"
+    _, b2, h2 = fetch(ng.port, "/dk/hostvary", headers={"Host": "a.example"})
+    assert h2.get("x-cache") == "HIT" and b2 == b1, "same Host should HIT"
+    _, b3, h3 = fetch(ng.port, "/dk/hostvary", headers={"Host": "b.example"})
+    assert "x-cache" not in h3, "different Host must not collide"
+    assert b3 != b1, "second Host served the first Host's cached body"
+
+
+def test_admin_purge_post_with_body(ng: Nginx) -> None:
+    """A purge POST carrying a request body must succeed (the handler discards
+    the body) — otherwise the unread bytes would desync a keepalive socket."""
+    import json
+    fetch(ng.port, "/c/bodypurge")                     # miss -> cached
+    _, _, h = fetch(ng.port, "/c/bodypurge")
+    assert h.get("x-cache") == "HIT", "should be cached before purge"
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{ng.port}/_cache?key=/c/bodypurge",
+        data=b"x" * 256, method="POST",
+        headers={"Connection": "close"})
+    with urllib.request.urlopen(req, timeout=5) as r:
+        assert r.status == 200, f"purge-with-body status {r.status}"
+        assert json.loads(r.read())["purged"] == 1
+    _, _, h2 = fetch(ng.port, "/c/bodypurge")
+    assert "x-cache" not in h2, "entry should be gone after purge (a MISS)"
 
 
 def test_stale_serves_stale(ng: Nginx, origin: Origin) -> None:
@@ -1535,6 +1633,12 @@ def run_all(ng: Nginx, origin: Origin,
     test_miss_then_hit(ng)
     test_header_fidelity(ng)
     test_max_size_not_cached(ng)
+    test_no_cache_set_cookie(ng)
+    test_no_cache_cc_private(ng)
+    test_no_cache_cc_nostore(ng)
+    test_no_cache_authorization(ng)
+    test_default_key_varies_by_host(ng)
+    test_admin_purge_post_with_body(ng)
     test_concurrent_hits_no_deadlock(ng)
     test_lru_eviction(ng)
     test_admin_stats(ng)
@@ -1612,7 +1716,10 @@ def main() -> int:
                 redis.stop()
             origin.stop()
 
-    print("OK: miss/hit, header fidelity, max_size, concurrency (R1), "
+    print("OK: miss/hit, header fidelity, max_size, "
+          "cacheability floor (Set-Cookie/CC-private/CC-no-store/Authorization "
+          "not cached), default-key Host split, admin purge w/ body, "
+          "concurrency (R1), "
           "LRU eviction (R6), stale serve (R3), single-flight (R4), "
           "admin stats/purge/gating, warm (v3-3: populates/multi/no-url), "
           "key normalize (v3-1: order/tracking/"

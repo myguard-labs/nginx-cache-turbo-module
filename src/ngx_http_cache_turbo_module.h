@@ -122,7 +122,6 @@ typedef struct {
 
     time_t                   fresh_until;   /* < now  => stale              */
     time_t                   stale_until;   /* < now  => expired/evict      */
-    time_t                   generated_at;
 
     ngx_uint_t               refreshing;    /* a single-flight regen in air */
     time_t                   refresh_lock_until; /* hard single-flight guard:
@@ -524,7 +523,6 @@ extern ngx_cache_turbo_l1_backend_t  ngx_http_cache_turbo_shm_backend;
 struct ngx_cache_turbo_backend_s {
     ngx_str_t   name;
 
-    size_t     (*key)(ngx_str_t *prefix, u_char *key_hash, u_char *buf);
     ngx_int_t  (*get)(ngx_http_request_t *r,
         ngx_http_cache_turbo_loc_conf_t *clcf,
         ngx_http_cache_turbo_ctx_t *ctx);
