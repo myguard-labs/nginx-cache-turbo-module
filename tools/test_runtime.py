@@ -442,6 +442,17 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # min_uses (v15): only cache after the key has cold-missed 3 times, so a
+        # one-hit-wonder URL never occupies the cache. The first two misses go to
+        # the origin without storing; the third stores; the fourth is a HIT.
+        location /minuses/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    30s;
+            cache_turbo_min_uses 3;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # cacheability floor (RFC 9111): origin emits Set-Cookie / Cache-Control
         # based on the path marker; such responses must never be stored. key=$uri
         # so repeated requests share a slot (proving the refusal, not just a key
@@ -1447,6 +1458,58 @@ def test_cold_lock_off_stampedes(ng: Nginx, origin: Origin) -> None:
     drain_origin(origin)
 
 
+def _admin_min_uses_skips(ng: Nginx) -> int:
+    import json
+    _, b, _ = fetch(ng.port, "/_cache")
+    return int(json.loads(b).get("min_uses_skips", 0))
+
+
+def test_min_uses(ng: Nginx, origin: Origin) -> None:
+    """v15 cache_turbo_min_uses N: a response is cached only after its key has
+    cold-missed N times. /minuses/ sets N=3 — the first two misses run to the
+    origin without storing, the third stores, the fourth is a HIT served from
+    cache. The min_uses_skips counter rises by exactly the two skipped misses."""
+    uri = "/minuses/page1"                       # never fetched before
+    base = origin.hits
+    skips0 = _admin_min_uses_skips(ng)
+
+    # Below threshold: misses 1 and 2 both reach the origin, neither is cached.
+    for i in (1, 2):
+        s, _, h = fetch(ng.port, uri)
+        assert s == 200, f"sub-threshold req{i} status {s}"
+        assert "x-cache" not in h, \
+            f"req{i} must NOT be a HIT (below min_uses): {h.get('x-cache')}"
+    assert origin.hits == base + 2, \
+        f"both sub-threshold reqs must hit origin: {origin.hits - base}"
+
+    # The third miss reaches the threshold: THIS request stores (still served
+    # from the origin, no X-Cache), so its body is what later HITs return.
+    s, b3, h3 = fetch(ng.port, uri)
+    assert s == 200 and "x-cache" not in h3, \
+        "the threshold-reaching miss is served from origin, then stored"
+    assert origin.hits == base + 3, "the storing miss must reach the origin"
+
+    # The fourth request is now a cache HIT — no further origin traffic.
+    s, b4, h4 = fetch(ng.port, uri)
+    assert h4.get("x-cache") == "HIT", f"req4 X-Cache={h4.get('x-cache')}"
+    assert origin.hits == base + 3, "req4 must be served from cache, not origin"
+    assert b4 == b3, "the HIT body must match the response that was stored"
+
+    # Exactly the two sub-threshold misses were skipped (origin, no store).
+    assert _admin_min_uses_skips(ng) - skips0 == 2, \
+        f"min_uses_skips delta {_admin_min_uses_skips(ng) - skips0} != 2"
+
+
+def test_min_uses_off_by_default(ng: Nginx) -> None:
+    """A location with no cache_turbo_min_uses stores on the first miss (the
+    feature is off by default) — proving min_uses doesn't change the baseline."""
+    s, _, h1 = fetch(ng.port, "/c/minuses-default")    # /c/ has no min_uses
+    assert s == 200 and "x-cache" not in h1, "first miss must reach origin"
+    s, _, h2 = fetch(ng.port, "/c/minuses-default")
+    assert h2.get("x-cache") == "HIT", \
+        f"second req must HIT (min_uses default 1): {h2.get('x-cache')}"
+
+
 def test_lru_eviction(ng: Nginx) -> None:
     """R6: with a tiny zone, old entries are evicted, not 500s."""
     # hammer many distinct keys through the tiny zone; must all 200, no errors
@@ -1498,6 +1561,7 @@ def test_admin_prometheus(ng: Nginx) -> None:
                  "# TYPE cache_turbo_misses_total counter",
                  "# TYPE cache_turbo_l2_hits_total counter",
                  "# TYPE cache_turbo_l2_misses_total counter",
+                 "# TYPE cache_turbo_min_uses_skips_total counter",
                  "# TYPE cache_turbo_regen_cost_ms gauge",
                  "# TYPE cache_turbo_autotuned_beta gauge"):
         assert line in b, f"metrics missing line: {line!r}"
@@ -2587,6 +2651,8 @@ def run_all(ng: Nginx, origin: Origin,
     test_single_flight(ng, origin)
     test_cold_single_flight(ng, origin)
     test_cold_lock_off_stampedes(ng, origin)
+    test_min_uses(ng, origin)
+    test_min_uses_off_by_default(ng)
     test_stale_if_error(ng, origin)
     test_background_update_off_regenerates_inline(ng, origin)
     test_normalize_arg_order(ng, origin)
@@ -2718,6 +2784,7 @@ def main() -> int:
           "default-key normalization, "
           "LRU eviction (R6), stale serve (R3), single-flight (R4), "
           "cold-miss single-flight (v10: per-box collapse + lock-off stampede), "
+          "min_uses (v15: cache after N misses + off-by-default), "
           "stale-if-error (v8), background_update off (v8 inline regen), "
           "admin stats/purge/gating, warm (v3-3: populates/multi/no-url), "
           "key normalize (v3-1: order/tracking/"

@@ -227,6 +227,13 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       offsetof(ngx_http_cache_turbo_loc_conf_t, lock_timeout),
       NULL },
 
+    { ngx_string("cache_turbo_min_uses"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_num_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_turbo_loc_conf_t, min_uses),
+      NULL },
+
     { ngx_string("cache_turbo_admin"),
       NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
       ngx_http_cache_turbo_admin,
@@ -898,6 +905,31 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
         (void) ngx_atomic_fetch_add(&z->sh->l2_misses, 1);
     }
 
+    /* min_uses (v15): defer caching until the key has cold-missed min_uses times,
+     * so one-hit-wonder URLs never occupy the cache. The gate sits AFTER the L2
+     * consult (a popular key already held in L2 was served above, never blocked
+     * by min_uses) and BEFORE the v10 lock path (no point single-flighting a key
+     * we are not going to store yet). Run once per request — min_uses_passed
+     * guards the park/resume re-entries (the L2 GET / NX lock / cold-wait wakes
+     * all re-enter this handler from the top). */
+    if (clcf->min_uses > 1 && !ctx->min_uses_passed && !ctx->lock_done) {
+        if (clcf->l1->count_miss(z, ctx->key_hash, hash, clcf->min_uses)
+            == NGX_DECLINED)
+        {
+            /* Still below the threshold: run to the origin but do NOT store (the
+             * header filter checks min_uses_skip before capturing). */
+            ctx->min_uses_skip = 1;
+            (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
+            (void) ngx_atomic_fetch_add(&z->sh->min_uses_skips, 1);
+            ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                           "cache_turbo: below min_uses \"%V\" key=%ui -> origin "
+                           "(no store)", &r->uri, (ngx_uint_t) hash);
+            return NGX_DECLINED;
+        }
+        /* Threshold reached: this request stores via the normal cold path below. */
+        ctx->min_uses_passed = 1;
+    }
+
     /* Cold-miss single-flight (v10). L1 absent/expired and L2 missed: rather than
      * let every concurrent first-hit stampede the origin, the first request
      * becomes the single regenerator (per box via a stub shm node, cross-node via
@@ -1545,6 +1577,7 @@ ngx_http_cache_turbo_header_filter(ngx_http_request_t *r)
     if (clcf->enable && (r == r->main || ctx->warm)
         && !(r->method & NGX_HTTP_HEAD)
         && !ctx->vary_nocache
+        && !ctx->min_uses_skip
         && ngx_http_cache_turbo_status_ttl(clcf, r->headers_out.status) >= 0
         && ngx_http_cache_turbo_response_cacheable(r)
         && (clcf->no_store == NULL
@@ -2841,6 +2874,9 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
                 "# HELP cache_turbo_lock_waits_total Cold-miss requests that waited for a single-flight fill (v10).\n"
                 "# TYPE cache_turbo_lock_waits_total counter\n"
                 "cache_turbo_lock_waits_total{zone=\"%V\"} %uA\n"
+                "# HELP cache_turbo_min_uses_skips_total Cold misses sent to origin without storing because the key is below cache_turbo_min_uses (v15).\n"
+                "# TYPE cache_turbo_min_uses_skips_total counter\n"
+                "cache_turbo_min_uses_skips_total{zone=\"%V\"} %uA\n"
                 "# HELP cache_turbo_regen_cost_ms Average origin regeneration cost in milliseconds.\n"
                 "# TYPE cache_turbo_regen_cost_ms gauge\n"
                 "cache_turbo_regen_cost_ms{zone=\"%V\"} %uA\n"
@@ -2850,6 +2886,7 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
                 &zname, st.hits, &zname, st.misses, &zname, st.stale_serves,
                 &zname, st.refreshes, &zname, st.evictions,
                 &zname, st.l2_hits, &zname, st.l2_misses, &zname, st.lock_waits,
+                &zname, st.min_uses_skips,
                 &zname, st.cost_ms, &zname, st.autotuned_beta) - p;
 
             return ngx_http_cache_turbo_send_body(r, NGX_HTTP_OK, &body,
@@ -2859,8 +2896,8 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
 
         len = sizeof("{\"hits\":,\"misses\":,\"stale_serves\":,\"refreshes\":,"
                      "\"evictions\":,\"l2_hits\":,\"l2_misses\":,\"lock_waits\":,"
-                     "\"cost_ms\":,\"autotuned_beta\":}\n")
-              + 10 * NGX_ATOMIC_T_LEN;
+                     "\"min_uses_skips\":,\"cost_ms\":,\"autotuned_beta\":}\n")
+              + 11 * NGX_ATOMIC_T_LEN;
         p = ngx_pnalloc(r->pool, len);
         if (p == NULL) {
             return NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -2869,11 +2906,12 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
         body.len = ngx_sprintf(p,
             "{\"hits\":%uA,\"misses\":%uA,\"stale_serves\":%uA,"
             "\"refreshes\":%uA,\"evictions\":%uA,\"l2_hits\":%uA,"
-            "\"l2_misses\":%uA,\"lock_waits\":%uA,\"cost_ms\":%uA,"
-            "\"autotuned_beta\":%uA}\n",
+            "\"l2_misses\":%uA,\"lock_waits\":%uA,\"min_uses_skips\":%uA,"
+            "\"cost_ms\":%uA,\"autotuned_beta\":%uA}\n",
             st.hits, st.misses, st.stale_serves,
             st.refreshes, st.evictions, st.l2_hits, st.l2_misses,
-            st.lock_waits, st.cost_ms, st.autotuned_beta) - p;
+            st.lock_waits, st.min_uses_skips, st.cost_ms,
+            st.autotuned_beta) - p;
     }
     return ngx_http_cache_turbo_send_json(r, NGX_HTTP_OK, &body);
 }
@@ -3746,6 +3784,7 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->background_update = NGX_CONF_UNSET;
     conf->lock = NGX_CONF_UNSET;
     conf->lock_timeout = NGX_CONF_UNSET_MSEC;
+    conf->min_uses = NGX_CONF_UNSET;
     conf->max_size = NGX_CONF_UNSET_SIZE;
     conf->redis_enable = NGX_CONF_UNSET;
     conf->redis_timeout = NGX_CONF_UNSET_MSEC;
@@ -3844,6 +3883,14 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
      * lock_timeout (default 5s) and serve the filled entry. */
     ngx_conf_merge_value(conf->lock, prev->lock, 1);
     ngx_conf_merge_msec_value(conf->lock_timeout, prev->lock_timeout, 5000);
+
+    /* min_uses (v15): default 1 = store on the first miss (feature off). A value
+     * below 1 is meaningless — clamp it so the gate's `> 1` test is the only
+     * switch and a stray 0/negative never disables caching outright. */
+    ngx_conf_merge_value(conf->min_uses, prev->min_uses, 1);
+    if (conf->min_uses < 1) {
+        conf->min_uses = 1;
+    }
 
     /* Live autotune (v4-3): off by default; default recompute cadence when on. */
     ngx_conf_merge_value(conf->autotune, prev->autotune, 0);

@@ -89,6 +89,8 @@ ngx_http_cache_turbo_shm_init_zone(ngx_shm_zone_t *shm_zone, void *data)
     ctx->sh->evictions = 0;
     ctx->sh->l2_hits = 0;
     ctx->sh->l2_misses = 0;
+    ctx->sh->lock_waits = 0;
+    ctx->sh->min_uses_skips = 0;
 
     /* Autotune state (v4-3): everything zeroed. autotune_next = 0 makes the first
      * recompute fire immediately; the snapshots being 0 means the first window is
@@ -308,6 +310,7 @@ ngx_http_cache_turbo_shm_store(ngx_http_cache_turbo_zone_t *z,
     ctn->stale_until = stale_ttl ? now + stale_ttl : 0;
     ctn->refreshing = 0;
     ctn->refresh_lock_until = 0;
+    ctn->miss_count = 0;
 
     ngx_rbtree_insert(&z->sh->rbtree, &ctn->node);
     ngx_queue_insert_head(&z->sh->lru, &ctn->lru);
@@ -331,6 +334,7 @@ ngx_http_cache_turbo_shm_stats(ngx_http_cache_turbo_zone_t *z,
     out->l2_hits      = z->sh->l2_hits;
     out->l2_misses    = z->sh->l2_misses;
     out->lock_waits   = z->sh->lock_waits;
+    out->min_uses_skips = z->sh->min_uses_skips;
 
     /* Autotune introspection (v4-3): average origin-regen cost and the live beta
      * verdict, so the admin GET can render the tuning without an internal probe. */
@@ -408,6 +412,7 @@ ngx_http_cache_turbo_shm_claim(ngx_http_cache_turbo_zone_t *z,
     ctn->stale_until = 0;
     ctn->refreshing = 1;
     ctn->refresh_lock_until = now + lock_ttl;
+    ctn->miss_count = 0;
 
     ngx_rbtree_insert(&z->sh->rbtree, &ctn->node);
     ngx_queue_insert_head(&z->sh->lru, &ctn->lru);
@@ -440,6 +445,89 @@ ngx_http_cache_turbo_shm_unstub(ngx_http_cache_turbo_zone_t *z,
 }
 
 
+/* min_uses miss counter (v15). Count one cold miss for the key and decide
+ * whether it has been requested enough times to be worth caching. See the L1
+ * vtable `count_miss` comment in the header. Only called when min_uses > 1. */
+ngx_int_t
+ngx_http_cache_turbo_shm_count_miss(ngx_http_cache_turbo_zone_t *z,
+    u_char *key_hash, uint32_t hash, ngx_int_t min_uses)
+{
+    time_t                        now;
+    ngx_http_cache_turbo_node_t  *ctn;
+
+    now = ngx_time();
+
+    ngx_shmtx_lock(&z->shpool->mutex);
+
+    ctn = ngx_http_cache_turbo_shm_lookup(z, key_hash, hash);
+
+    if (ctn != NULL) {
+        /* A real entry (even expired/stale being refreshed) is already proven
+         * cacheable — never re-gate it, and do not touch its counter. */
+        if (ctn->len > 0) {
+            ngx_shmtx_unlock(&z->shpool->mutex);
+            return NGX_OK;
+        }
+
+        /* A live single-flight stub: another request already crossed the
+         * threshold and is regenerating. Proceed so the caller's claim() makes
+         * this request a waiter; don't count (this is not an un-coalesced miss). */
+        if (ctn->refreshing && now < ctn->refresh_lock_until) {
+            ngx_shmtx_unlock(&z->shpool->mutex);
+            return NGX_OK;
+        }
+
+        /* A counter node (or a dead stub): this is a genuine cold miss for a key
+         * not yet cached. Count it; cross the threshold => store-eligible. */
+        ctn->miss_count++;
+        if ((ngx_int_t) ctn->miss_count >= min_uses) {
+            ngx_shmtx_unlock(&z->shpool->mutex);
+            return NGX_OK;
+        }
+        ngx_shmtx_unlock(&z->shpool->mutex);
+        return NGX_DECLINED;
+    }
+
+    /* No node yet: create a counter node (data == NULL / len == 0 /
+     * refreshing == 0) recording this first miss. It is invisible to the serve
+     * branches (their len > 0 guards skip it) and converts into the cold-miss
+     * winner's stub via claim() once the threshold is reached. LRU eviction may
+     * reclaim a cold counter node — harmless, it just resets the count. */
+    ctn = ngx_slab_alloc_locked(z->shpool,
+                                sizeof(ngx_http_cache_turbo_node_t));
+    if (ctn == NULL) {
+        ngx_http_cache_turbo_shm_evict_one(z);
+        ctn = ngx_slab_alloc_locked(z->shpool,
+                                    sizeof(ngx_http_cache_turbo_node_t));
+    }
+    if (ctn == NULL) {
+        /* Out of slab: cannot track the count, so just let it cache now
+         * (correct, only less selective than min_uses would like). */
+        ngx_shmtx_unlock(&z->shpool->mutex);
+        return NGX_OK;
+    }
+
+    ctn->node.key = hash;
+    ngx_memcpy(ctn->key, key_hash, 32);
+    ctn->data = NULL;
+    ctn->len = 0;
+    ctn->status = 0;
+    ctn->fresh_until = 0;
+    ctn->stale_until = 0;
+    ctn->refreshing = 0;
+    ctn->refresh_lock_until = 0;
+    ctn->miss_count = 1;
+
+    ngx_rbtree_insert(&z->sh->rbtree, &ctn->node);
+    ngx_queue_insert_head(&z->sh->lru, &ctn->lru);
+
+    ngx_shmtx_unlock(&z->shpool->mutex);
+
+    /* First miss: below threshold unless min_uses == 1 (caller guards that). */
+    return (min_uses <= 1) ? NGX_OK : NGX_DECLINED;
+}
+
+
 /* L1 backend instance (v4-1). Stateless dispatch table over the shm functions
  * above; the zone is always passed in as an argument. */
 ngx_cache_turbo_l1_backend_t  ngx_http_cache_turbo_shm_backend = {
@@ -450,4 +538,5 @@ ngx_cache_turbo_l1_backend_t  ngx_http_cache_turbo_shm_backend = {
     ngx_http_cache_turbo_shm_purge_all,
     ngx_http_cache_turbo_shm_stats,
     ngx_http_cache_turbo_shm_claim,
+    ngx_http_cache_turbo_shm_count_miss,
 };

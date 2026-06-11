@@ -138,6 +138,14 @@ typedef struct {
                                               * Self-heals if a refresh dies. */
     ngx_uint_t               status;        /* cached HTTP status           */
 
+    /* min_uses (v15) miss counter. A "counter node" (data == NULL / len == 0,
+     * refreshing == 0) tracks how many times a key has cold-missed without yet
+     * being cached, so cache_turbo_min_uses N can defer the first store until the
+     * key has been requested N times (don't cache one-hit-wonders). Distinct from
+     * a v10 single-flight STUB, which is also len == 0 but has refreshing == 1.
+     * Irrelevant once the node holds a real body (len > 0); left untouched then. */
+    ngx_uint_t               miss_count;
+
     ngx_queue_t              lru;           /* LRU list linkage             */
 } ngx_http_cache_turbo_node_t;
 
@@ -164,6 +172,12 @@ typedef struct {
      * wait loop (a coalesced cold-miss that did NOT go to origin). Zero when
      * cache_turbo_lock is off. Observability for the single-flight working. */
     ngx_atomic_t             lock_waits;
+
+    /* min_uses (v15): bumped once per cold miss that was sent to the origin
+     * WITHOUT storing because the key is still below cache_turbo_min_uses. Zero
+     * when min_uses is 1 (the default — feature off). Observability for the
+     * "don't cache one-hit-wonders" gate. */
+    ngx_atomic_t             min_uses_skips;
 
     /*
      * Live autotune state (v4-3). cost_sum_ms / cost_count accumulate the
@@ -206,6 +220,7 @@ typedef struct {
     ngx_atomic_uint_t   l2_hits;
     ngx_atomic_uint_t   l2_misses;
     ngx_atomic_uint_t   lock_waits;   /* v10 coalesced cold-misses (waited)   */
+    ngx_atomic_uint_t   min_uses_skips; /* v15 cold misses below min_uses     */
     /* Autotune introspection (v4-3): cost_ms = the measured average origin-regen
      * cost (cost_sum_ms / cost_count, 0 when nothing measured); autotuned_beta =
      * the live verdict ×1000 (0 = none). Rendered by the admin GET so a test (or
@@ -320,6 +335,17 @@ typedef struct {
      * winner's hold (self-heal). */
     ngx_flag_t               lock;          /* cache_turbo_lock on|off          */
     ngx_msec_t               lock_timeout;  /* max a loser waits, then origin   */
+
+    /* Minimum uses before caching (v15). cache_turbo_min_uses N stores a
+     * response only after its key has cold-missed N times, so one-hit-wonder
+     * URLs never occupy the cache. A per-key miss counter lives in a lightweight
+     * L1 "counter node" (see ngx_http_cache_turbo_node_t.miss_count); the Nth
+     * miss converts that node into the normal cold-miss winner that stores.
+     * Default 1 = store on the first miss (feature off, zero behaviour change).
+     * Below the threshold a request goes to the origin but is not captured, and
+     * a popular key already present in L2 is served from L2 regardless (the gate
+     * sits after the L2 consult). */
+    ngx_int_t                min_uses;
 
     /* L2 Redis (v2b). Native async client, no hiredis. The L2 store is touched
      * only on an L1 miss (sync GET) and on store (async write-through); it is
@@ -452,6 +478,13 @@ typedef struct {
     unsigned                 varied:1;
     unsigned                 vary_nocache:1;
     ngx_int_t                vary_bits;
+    /* min_uses (v15). min_uses_skip = this request is below the threshold, so the
+     * header filter must NOT capture it (no store) and it runs to the origin.
+     * min_uses_passed = the gate already counted this request and let it through
+     * (it reached the threshold); it guards against re-counting on a park/resume
+     * re-entry of the access handler (L2/NX-lock/cold-wait wake). */
+    unsigned                 min_uses_skip:1;
+    unsigned                 min_uses_passed:1;
 } ngx_http_cache_turbo_ctx_t;
 
 
@@ -512,6 +545,14 @@ ngx_int_t ngx_http_cache_turbo_shm_claim(ngx_http_cache_turbo_zone_t *z,
  * Used when a cold-miss winner's response turned out non-cacheable. */
 void ngx_http_cache_turbo_shm_unstub(ngx_http_cache_turbo_zone_t *z,
     u_char *key_hash, uint32_t hash);
+
+/* min_uses miss counter (v15). See the L1 vtable `count_miss` comment. Returns
+ * NGX_OK when the key has reached min_uses (store-eligible — proceed to the
+ * normal cold path) or NGX_DECLINED when it is still below the threshold (go to
+ * the origin without storing). A real entry (len > 0) or an in-flight stub
+ * always returns NGX_OK without counting — refreshes are never re-gated. */
+ngx_int_t ngx_http_cache_turbo_shm_count_miss(ngx_http_cache_turbo_zone_t *z,
+    u_char *key_hash, uint32_t hash, ngx_int_t min_uses);
 
 
 /* ---- swr.c ---- */
@@ -667,6 +708,16 @@ struct ngx_cache_turbo_l1_backend_s {
      * fresh entry raced in — re-serve via lookup). lock_ttl bounds the stub. */
     ngx_int_t  (*claim)(ngx_http_cache_turbo_zone_t *z, u_char *key_hash,
         uint32_t hash, time_t lock_ttl);
+
+    /* min_uses miss counter (v15). Atomically (under the zone mutex) count one
+     * cold miss for the key and decide whether it has now been requested enough
+     * times to be worth caching. Returns NGX_OK (>= min_uses — proceed to the
+     * cold-miss/store path) or NGX_DECLINED (still below — go to origin, do not
+     * store). A node holding a real body (len > 0) or an in-flight stub returns
+     * NGX_OK without counting (a refresh of an already-cached key is never
+     * re-gated). Only called when min_uses > 1. */
+    ngx_int_t  (*count_miss)(ngx_http_cache_turbo_zone_t *z, u_char *key_hash,
+        uint32_t hash, ngx_int_t min_uses);
 };
 
 #define NGX_HTTP_CACHE_TURBO_CLAIM_WINNER  0
