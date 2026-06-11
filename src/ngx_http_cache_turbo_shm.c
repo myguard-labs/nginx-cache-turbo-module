@@ -330,12 +330,113 @@ ngx_http_cache_turbo_shm_stats(ngx_http_cache_turbo_zone_t *z,
     out->evictions    = z->sh->evictions;
     out->l2_hits      = z->sh->l2_hits;
     out->l2_misses    = z->sh->l2_misses;
+    out->lock_waits   = z->sh->lock_waits;
 
     /* Autotune introspection (v4-3): average origin-regen cost and the live beta
      * verdict, so the admin GET can render the tuning without an internal probe. */
     cnt = z->sh->cost_count;
     out->cost_ms        = cnt ? (z->sh->cost_sum_ms / cnt) : 0;
     out->autotuned_beta = z->sh->autotuned_beta;
+}
+
+
+/* Cold-miss single-flight claim (v10). Atomically decide, under the zone mutex,
+ * whether this request becomes the single regenerator for a cold key or waits.
+ * See the L1 vtable `claim` comment in the header. */
+ngx_int_t
+ngx_http_cache_turbo_shm_claim(ngx_http_cache_turbo_zone_t *z,
+    u_char *key_hash, uint32_t hash, time_t lock_ttl)
+{
+    time_t                        now;
+    ngx_http_cache_turbo_node_t  *ctn;
+
+    now = ngx_time();
+
+    ngx_shmtx_lock(&z->shpool->mutex);
+
+    ctn = ngx_http_cache_turbo_shm_lookup(z, key_hash, hash);
+
+    if (ctn != NULL) {
+        /* A real fresh entry raced in while we were on the cold path: re-serve
+         * it, do NOT regenerate. */
+        if (ctn->len > 0 && now < ctn->fresh_until) {
+            ngx_shmtx_unlock(&z->shpool->mutex);
+            return NGX_HTTP_CACHE_TURBO_CLAIM_FRESH;
+        }
+
+        /* Someone is already regenerating and the lock has not expired: wait. */
+        if (ctn->refreshing && now < ctn->refresh_lock_until) {
+            ngx_shmtx_unlock(&z->shpool->mutex);
+            return NGX_HTTP_CACHE_TURBO_CLAIM_LOSER;
+        }
+
+        /* Expired entry or a dead in-flight stub (the previous winner died):
+         * take it over as the new single regenerator. Any stale data left in
+         * place is past its stale window so no one serves it; the winner
+         * overwrites it on store(). */
+        ctn->refreshing = 1;
+        ctn->refresh_lock_until = now + lock_ttl;
+        ngx_shmtx_unlock(&z->shpool->mutex);
+        return NGX_HTTP_CACHE_TURBO_CLAIM_WINNER;
+    }
+
+    /* No node at all: create a stub (data == NULL, len == 0) marking the key as
+     * in flight so concurrent first-hits wait instead of stampeding the origin.
+     * The winner's store() finds it via lookup and overwrites it into a real
+     * node (clearing refreshing). LRU eviction may reclaim a stub under memory
+     * pressure — harmless, it just costs an extra origin hit. */
+    ctn = ngx_slab_alloc_locked(z->shpool,
+                                sizeof(ngx_http_cache_turbo_node_t));
+    if (ctn == NULL) {
+        ngx_http_cache_turbo_shm_evict_one(z);
+        ctn = ngx_slab_alloc_locked(z->shpool,
+                                    sizeof(ngx_http_cache_turbo_node_t));
+    }
+    if (ctn == NULL) {
+        /* Out of slab: cannot mark the key in flight, so just regenerate
+         * (winner, no single-flight this time — correct, only less efficient). */
+        ngx_shmtx_unlock(&z->shpool->mutex);
+        return NGX_HTTP_CACHE_TURBO_CLAIM_WINNER;
+    }
+
+    ctn->node.key = hash;
+    ngx_memcpy(ctn->key, key_hash, 32);
+    ctn->data = NULL;
+    ctn->len = 0;
+    ctn->status = 0;
+    ctn->fresh_until = 0;
+    ctn->stale_until = 0;
+    ctn->refreshing = 1;
+    ctn->refresh_lock_until = now + lock_ttl;
+
+    ngx_rbtree_insert(&z->sh->rbtree, &ctn->node);
+    ngx_queue_insert_head(&z->sh->lru, &ctn->lru);
+
+    ngx_shmtx_unlock(&z->shpool->mutex);
+    return NGX_HTTP_CACHE_TURBO_CLAIM_WINNER;
+}
+
+
+/* Remove a leftover cold-miss stub (v10). Only acts if the node is still a stub
+ * (data == NULL / len == 0) — a real entry stored in the meantime is left
+ * intact. Called when a cold-miss winner's response was non-cacheable so the
+ * in-flight marker would otherwise block waiters until refresh_lock_until. */
+void
+ngx_http_cache_turbo_shm_unstub(ngx_http_cache_turbo_zone_t *z,
+    u_char *key_hash, uint32_t hash)
+{
+    ngx_http_cache_turbo_node_t  *ctn;
+
+    ngx_shmtx_lock(&z->shpool->mutex);
+
+    ctn = ngx_http_cache_turbo_shm_lookup(z, key_hash, hash);
+    if (ctn != NULL && ctn->len == 0 && ctn->data == NULL) {
+        ngx_queue_remove(&ctn->lru);
+        ngx_rbtree_delete(&z->sh->rbtree, &ctn->node);
+        ngx_slab_free_locked(z->shpool, ctn);
+    }
+
+    ngx_shmtx_unlock(&z->shpool->mutex);
 }
 
 
@@ -348,4 +449,5 @@ ngx_cache_turbo_l1_backend_t  ngx_http_cache_turbo_shm_backend = {
     ngx_http_cache_turbo_shm_purge_key,
     ngx_http_cache_turbo_shm_purge_all,
     ngx_http_cache_turbo_shm_stats,
+    ngx_http_cache_turbo_shm_claim,
 };

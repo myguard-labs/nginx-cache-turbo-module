@@ -31,6 +31,13 @@ static ngx_int_t ngx_http_cache_turbo_body_filter(ngx_http_request_t *r,
 
 static ngx_int_t ngx_http_cache_turbo_serve(ngx_http_request_t *r,
     u_char *copy, size_t len, ngx_uint_t stale);
+static ngx_int_t ngx_http_cache_turbo_cold_wait(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_zone_t *z,
+    ngx_http_cache_turbo_ctx_t *ctx);
+static void ngx_http_cache_turbo_cold_wait_timeout(ngx_event_t *ev);
+static void ngx_http_cache_turbo_cold_mark_winner(ngx_http_request_t *r,
+    ngx_http_cache_turbo_ctx_t *ctx, ngx_http_cache_turbo_zone_t *z);
+static void ngx_http_cache_turbo_cold_cleanup(void *data);
 static ngx_int_t ngx_http_cache_turbo_send_json(ngx_http_request_t *r,
     ngx_uint_t status, ngx_str_t *body);
 
@@ -185,6 +192,20 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       ngx_conf_set_flag_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_cache_turbo_loc_conf_t, background_update),
+      NULL },
+
+    { ngx_string("cache_turbo_lock"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_turbo_loc_conf_t, lock),
+      NULL },
+
+    { ngx_string("cache_turbo_lock_timeout"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_msec_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_turbo_loc_conf_t, lock_timeout),
       NULL },
 
     { ngx_string("cache_turbo_admin"),
@@ -649,8 +670,11 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
             return ngx_http_cache_turbo_serve(r, snap, snap_len, 0);
         }
 
-        if (stale_until == 0 || now < stale_until) {
-            /* stale-but-serveable */
+        if ((stale_until == 0 || now < stale_until) && ctn->len > 0) {
+            /* stale-but-serveable. The `len > 0` guard skips a cold-miss
+             * single-flight STUB (v10: data == NULL, len == 0, stale_until == 0)
+             * — a stub is an in-flight marker, never serveable; it falls through
+             * to the cold path below where the waiter/claim logic handles it. */
 
             /* Cross-node single-flight resolved (v4-2): we parked for the Redis
              * NX and the phase engine re-entered. If we won, we own the
@@ -846,12 +870,228 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
         (void) ngx_atomic_fetch_add(&z->sh->l2_misses, 1);
     }
 
-    /* true miss: mark for capture, let the request run to the origin */
+    /* Cold-miss single-flight (v10). L1 absent/expired and L2 missed: rather than
+     * let every concurrent first-hit stampede the origin, the first request
+     * becomes the single regenerator (per box via a stub shm node, cross-node via
+     * the v4-2 Redis NX lock) and the rest WAIT for it to fill the cache, then
+     * serve it. cache_turbo_lock off restores the old straight-to-origin path. */
+    if (clcf->lock) {
+        time_t     lock_ttl = clcf->lock_ttl;
+        ngx_int_t  cl;
+
+        if (lock_ttl <= 0) {
+            lock_ttl = 5;
+        }
+
+        /* Resume after the cross-node NX park (we are the per-box claim winner
+         * that fired the lock): won -> we own the fleet-wide regen, go to origin;
+         * lost -> another node is filling, wait for its L2 write-through. */
+        if (ctx->lock_done) {
+            if (ctx->lock_result == NGX_OK) {
+                (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
+                ngx_http_cache_turbo_cold_mark_winner(r, ctx, z);
+                ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                               "cache_turbo: cold-miss cross-node WON \"%V\" "
+                               "key=%ui -> origin", &r->uri, (ngx_uint_t) hash);
+                return NGX_DECLINED;
+            }
+            ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                           "cache_turbo: cold-miss cross-node LOST \"%V\" key=%ui "
+                           "-> wait for L2 fill", &r->uri, (ngx_uint_t) hash);
+            return ngx_http_cache_turbo_cold_wait(r, clcf, z, ctx);
+        }
+
+        cl = clcf->l1->claim(z, ctx->key_hash, hash, lock_ttl);
+
+        if (cl == NGX_HTTP_CACHE_TURBO_CLAIM_FRESH) {
+            /* A real fresh entry raced in while we were on the cold path
+             * (another local winner finished): re-serve it from L1. */
+            ngx_http_cache_turbo_node_t  *fresh;
+            u_char                       *snap;
+            size_t                        snap_len;
+
+            ngx_shmtx_lock(&z->shpool->mutex);
+            fresh = clcf->l1->lookup(z, ctx->key_hash, hash);
+            if (fresh != NULL && fresh->len > 0
+                && ngx_time() < fresh->fresh_until)
+            {
+                snap_len = fresh->len;
+                snap = ngx_pnalloc(r->pool, snap_len);
+                if (snap == NULL) {
+                    ngx_shmtx_unlock(&z->shpool->mutex);
+                    return NGX_ERROR;
+                }
+                ngx_memcpy(snap, fresh->data, snap_len);
+                ngx_shmtx_unlock(&z->shpool->mutex);
+                (void) ngx_atomic_fetch_add(&z->sh->hits, 1);
+                ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                               "cache_turbo: cold-miss raced to FRESH \"%V\" "
+                               "key=%ui -> serve", &r->uri, (ngx_uint_t) hash);
+                return ngx_http_cache_turbo_serve(r, snap, snap_len, 0);
+            }
+            ngx_shmtx_unlock(&z->shpool->mutex);
+            /* vanished again (evicted/expired in the race): go to origin */
+            (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
+            return NGX_DECLINED;
+        }
+
+        if (cl == NGX_HTTP_CACHE_TURBO_CLAIM_LOSER) {
+            return ngx_http_cache_turbo_cold_wait(r, clcf, z, ctx);
+        }
+
+        /* CLAIM_WINNER: we created/took over the in-flight stub. Fire the
+         * cross-node NX lock (v4-2) so the whole fleet single-flights too; park
+         * for the reply (resolved at the top of this block on resume).
+         * NGX_DECLINED = no L2 / could not start -> single-box winner now. */
+        if (clcf->backend && clcf->backend->lock) {
+            ngx_int_t  lrc = clcf->backend->lock(r, clcf, ctx, lock_ttl);
+            if (lrc == NGX_AGAIN) {
+                ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                               "cache_turbo: cold-miss parked on L2 lock NX \"%V\" "
+                               "key=%ui", &r->uri, (ngx_uint_t) hash);
+                return NGX_AGAIN;
+            }
+        }
+
+        (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
+        ngx_http_cache_turbo_cold_mark_winner(r, ctx, z);
+        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "cache_turbo: cold-miss single-box WON \"%V\" key=%ui "
+                       "-> origin", &r->uri, (ngx_uint_t) hash);
+        return NGX_DECLINED;
+    }
+
+    /* true miss (cache_turbo_lock off): mark for capture, run to the origin */
     (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
     ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "cache_turbo: MISS \"%V\" key=%ui -> origin",
                    &r->uri, (ngx_uint_t) hash);
     return NGX_DECLINED;
+}
+
+
+/* Cold-miss single-flight waiter (v10). A request that lost the cold-miss claim
+ * (or the cross-node NX) parks on a short timer and re-checks L1/L2 until the
+ * winner fills the entry (a later re-entry then serves it) or lock_timeout
+ * elapses, at which point it falls through to the origin itself. Mirrors the
+ * redis park/resume dance: count++ here, finalize(NGX_DONE) in the timer handler. */
+static ngx_int_t
+ngx_http_cache_turbo_cold_wait(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_zone_t *z,
+    ngx_http_cache_turbo_ctx_t *ctx)
+{
+    ngx_msec_t       now = ngx_current_msec;
+    ngx_msec_int_t   remaining;
+    ngx_msec_t       delay;
+
+    if (!ctx->waiting) {
+        ctx->waiting = 1;
+        ctx->wait_deadline = now + clcf->lock_timeout;
+        (void) ngx_atomic_fetch_add(&z->sh->lock_waits, 1);
+    }
+
+    remaining = (ngx_msec_int_t) (ctx->wait_deadline - now);
+    if (remaining <= 0) {
+        /* Waited long enough: give up and regenerate ourselves. Our store ends
+         * the wait for any remaining readers. Bounded by lock_timeout. */
+        ctx->waiting = 0;
+        (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "cache_turbo: cold-miss wait timeout \"%V\" -> origin",
+                       &r->uri);
+        return NGX_DECLINED;
+    }
+
+    /* Re-consult L2 on the next re-entry so a cross-node winner's write-through
+     * is picked up (per-box fills are caught by the L1 lookup itself). */
+    ctx->l2_done = 0;
+    ctx->l2_result = NGX_DECLINED;
+    ctx->l2_blob = NULL;
+    ctx->l2_blob_len = 0;
+
+    delay = NGX_HTTP_CACHE_TURBO_LOCK_POLL_MS;
+    if (delay > (ngx_msec_t) remaining) {
+        delay = (ngx_msec_t) remaining;
+    }
+
+    if (ctx->cold_wait_ev.handler == NULL) {
+        ctx->cold_wait_ev.handler = ngx_http_cache_turbo_cold_wait_timeout;
+        ctx->cold_wait_ev.data = r;
+        ctx->cold_wait_ev.log = r->connection->log;
+    }
+
+    ngx_add_timer(&ctx->cold_wait_ev, delay);
+    r->main->count++;
+
+    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "cache_turbo: cold-miss WAIT \"%V\" poll=%M ms",
+                   &r->uri, delay);
+    return NGX_AGAIN;
+}
+
+
+/* Timer fired: re-drive the parked waiter through the phase engine (re-enters the
+ * access handler, which re-checks L1/L2). Same teardown as the redis get_finish
+ * resume — run_phases, run_posted_requests, then release the parked reference. */
+static void
+ngx_http_cache_turbo_cold_wait_timeout(ngx_event_t *ev)
+{
+    ngx_http_request_t  *r = ev->data;
+    ngx_connection_t    *c = r->connection;
+
+    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,
+                   "cache_turbo: cold-miss wait wake \"%V\"", &r->uri);
+
+    ngx_http_core_run_phases(r);
+    ngx_http_run_posted_requests(c);
+    ngx_http_finalize_request(r, NGX_DONE);
+}
+
+
+/* Mark this request as the cold-miss winner that owns the in-flight stub, and
+ * register a pool cleanup so the stub is removed at request teardown if the
+ * winner never stored a real entry (non-cacheable response, oversized body,
+ * upstream error, client abort). The header filter clears it earlier for the
+ * common non-cacheable case; this is the backstop for every other non-store
+ * exit. Registered once per request (the winner-DECLINED sites are reached at
+ * most once). */
+static void
+ngx_http_cache_turbo_cold_mark_winner(ngx_http_request_t *r,
+    ngx_http_cache_turbo_ctx_t *ctx, ngx_http_cache_turbo_zone_t *z)
+{
+    ngx_pool_cleanup_t  *cln;
+
+    if (ctx->cold_winner) {
+        return;
+    }
+
+    ctx->cold_winner = 1;
+    ctx->cold_zone = z;
+
+    cln = ngx_pool_cleanup_add(r->pool, 0);
+    if (cln == NULL) {
+        return;
+    }
+    cln->handler = ngx_http_cache_turbo_cold_cleanup;
+    cln->data = ctx;
+}
+
+
+/* Pool cleanup: if the cold-miss winner never resolved its stub (no real entry
+ * stored, stub not already cleared), remove the leftover stub so waiters for
+ * this key stop blocking. unstub only drops a node that is still a stub. */
+static void
+ngx_http_cache_turbo_cold_cleanup(void *data)
+{
+    ngx_http_cache_turbo_ctx_t  *ctx = data;
+    uint32_t                     hash;
+
+    if (!ctx->cold_winner || ctx->cold_stored || ctx->cold_zone == NULL) {
+        return;
+    }
+
+    hash = ngx_crc32_short(ctx->key_hash, 32);
+    ngx_http_cache_turbo_shm_unstub(ctx->cold_zone, ctx->key_hash, hash);
 }
 
 
@@ -1152,6 +1392,18 @@ ngx_http_cache_turbo_header_filter(ngx_http_request_t *r)
         ctx->captured = 1;
     }
 
+    /* Cold-miss single-flight (v10): if we are the winner but this response is
+     * NOT cacheable, the body filter will never store, so clear our in-flight
+     * stub now rather than make waiters block on it until lock_ttl. The pool
+     * cleanup is the backstop for the remaining non-store paths. */
+    if (ctx->cold_winner && !ctx->cold_stored && !ctx->captured
+        && ctx->cold_zone != NULL)
+    {
+        uint32_t  hash = ngx_crc32_short(ctx->key_hash, 32);
+        ngx_http_cache_turbo_shm_unstub(ctx->cold_zone, ctx->key_hash, hash);
+        ctx->cold_stored = 1;
+    }
+
     return ngx_http_next_header_filter(r);
 }
 
@@ -1357,6 +1609,10 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
             (void) clcf->l1->store(z, ctx->key_hash, hash,
                        blob, blob_len, r->headers_out.status, ttl,
                        clcf->stale_mult);
+
+            /* v10: store overwrote any cold-miss stub into a real entry, so the
+             * cleanup must not remove it. */
+            ctx->cold_stored = 1;
 
             ngx_log_debug4(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                            "cache_turbo: STORE \"%V\" key=%ui len=%uz ttl=%T",
@@ -2336,7 +2592,7 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
 
             /* Seven counters (*_total) + two gauges, each labelled by zone so one
              * Prometheus job can scrape many zones. Exposition format 0.0.4. */
-            len = 2600 + 9 * zname.len + 9 * NGX_ATOMIC_T_LEN;
+            len = 2800 + 10 * zname.len + 10 * NGX_ATOMIC_T_LEN;
             p = ngx_pnalloc(r->pool, len);
             if (p == NULL) {
                 return NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -2364,6 +2620,9 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
                 "# HELP cache_turbo_l2_misses_total L1 misses that L2 could not satisfy (went to origin).\n"
                 "# TYPE cache_turbo_l2_misses_total counter\n"
                 "cache_turbo_l2_misses_total{zone=\"%V\"} %uA\n"
+                "# HELP cache_turbo_lock_waits_total Cold-miss requests that waited for a single-flight fill (v10).\n"
+                "# TYPE cache_turbo_lock_waits_total counter\n"
+                "cache_turbo_lock_waits_total{zone=\"%V\"} %uA\n"
                 "# HELP cache_turbo_regen_cost_ms Average origin regeneration cost in milliseconds.\n"
                 "# TYPE cache_turbo_regen_cost_ms gauge\n"
                 "cache_turbo_regen_cost_ms{zone=\"%V\"} %uA\n"
@@ -2372,7 +2631,7 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
                 "cache_turbo_autotuned_beta{zone=\"%V\"} %uA\n",
                 &zname, st.hits, &zname, st.misses, &zname, st.stale_serves,
                 &zname, st.refreshes, &zname, st.evictions,
-                &zname, st.l2_hits, &zname, st.l2_misses,
+                &zname, st.l2_hits, &zname, st.l2_misses, &zname, st.lock_waits,
                 &zname, st.cost_ms, &zname, st.autotuned_beta) - p;
 
             return ngx_http_cache_turbo_send_body(r, NGX_HTTP_OK, &body,
@@ -2381,9 +2640,9 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
         }
 
         len = sizeof("{\"hits\":,\"misses\":,\"stale_serves\":,\"refreshes\":,"
-                     "\"evictions\":,\"l2_hits\":,\"l2_misses\":,\"cost_ms\":,"
-                     "\"autotuned_beta\":}\n")
-              + 9 * NGX_ATOMIC_T_LEN;
+                     "\"evictions\":,\"l2_hits\":,\"l2_misses\":,\"lock_waits\":,"
+                     "\"cost_ms\":,\"autotuned_beta\":}\n")
+              + 10 * NGX_ATOMIC_T_LEN;
         p = ngx_pnalloc(r->pool, len);
         if (p == NULL) {
             return NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -2392,10 +2651,11 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
         body.len = ngx_sprintf(p,
             "{\"hits\":%uA,\"misses\":%uA,\"stale_serves\":%uA,"
             "\"refreshes\":%uA,\"evictions\":%uA,\"l2_hits\":%uA,"
-            "\"l2_misses\":%uA,\"cost_ms\":%uA,\"autotuned_beta\":%uA}\n",
+            "\"l2_misses\":%uA,\"lock_waits\":%uA,\"cost_ms\":%uA,"
+            "\"autotuned_beta\":%uA}\n",
             st.hits, st.misses, st.stale_serves,
             st.refreshes, st.evictions, st.l2_hits, st.l2_misses,
-            st.cost_ms, st.autotuned_beta) - p;
+            st.lock_waits, st.cost_ms, st.autotuned_beta) - p;
     }
     return ngx_http_cache_turbo_send_json(r, NGX_HTTP_OK, &body);
 }
@@ -3002,6 +3262,8 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->honor_cc = NGX_CONF_UNSET;
     conf->purge = NGX_CONF_UNSET;
     conf->background_update = NGX_CONF_UNSET;
+    conf->lock = NGX_CONF_UNSET;
+    conf->lock_timeout = NGX_CONF_UNSET_MSEC;
     conf->max_size = NGX_CONF_UNSET_SIZE;
     conf->redis_enable = NGX_CONF_UNSET;
     conf->redis_timeout = NGX_CONF_UNSET_MSEC;
@@ -3093,6 +3355,12 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     /* v8: background update / SWR defaults ON — the dice-winner serves stale and
      * refreshes in the background rather than blocking on origin. */
     ngx_conf_merge_value(conf->background_update, prev->background_update, 1);
+
+    /* v10: cold-miss single-flight defaults ON — concurrent first-hits for one
+     * cold key collapse to a single origin fetch; the rest wait up to
+     * lock_timeout (default 5s) and serve the filled entry. */
+    ngx_conf_merge_value(conf->lock, prev->lock, 1);
+    ngx_conf_merge_msec_value(conf->lock_timeout, prev->lock_timeout, 5000);
 
     /* Live autotune (v4-3): off by default; default recompute cadence when on. */
     ngx_conf_merge_value(conf->autotune, prev->autotune, 0);

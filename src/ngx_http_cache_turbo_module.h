@@ -153,6 +153,11 @@ typedef struct {
     ngx_atomic_t             l2_hits;
     ngx_atomic_t             l2_misses;
 
+    /* Cold-miss single-flight (v10): bumped once when a request first enters the
+     * wait loop (a coalesced cold-miss that did NOT go to origin). Zero when
+     * cache_turbo_lock is off. Observability for the single-flight working. */
+    ngx_atomic_t             lock_waits;
+
     /*
      * Live autotune state (v4-3). cost_sum_ms / cost_count accumulate the
      * wall-clock cost of every origin regeneration (request_time at the
@@ -193,6 +198,7 @@ typedef struct {
     ngx_atomic_uint_t   evictions;
     ngx_atomic_uint_t   l2_hits;
     ngx_atomic_uint_t   l2_misses;
+    ngx_atomic_uint_t   lock_waits;   /* v10 coalesced cold-misses (waited)   */
     /* Autotune introspection (v4-3): cost_ms = the measured average origin-regen
      * cost (cost_sum_ms / cost_count, 0 when nothing measured); autotuned_beta =
      * the live verdict ×1000 (0 = none). Rendered by the admin GET so a test (or
@@ -296,6 +302,18 @@ typedef struct {
      * winner. Mirrors proxy_cache_background_update (but default on here). */
     ngx_flag_t               background_update;
 
+    /* Cold-miss single-flight (v10). When on (default), the FIRST request to
+     * cold-miss a key (no L1 node, L2 also misses) becomes the single
+     * regenerator (per box via a stub shm node, cross-node via the v4-2 Redis
+     * NX lock); concurrent first-hits for the same key WAIT (park + re-check)
+     * up to lock_timeout for the winner to fill the cache, then serve it,
+     * instead of all stampeding the origin. off restores the old behaviour
+     * (every cold-miss goes straight to origin). Mirrors proxy_cache_lock /
+     * proxy_cache_lock_timeout (but default on here). lock_ttl bounds the
+     * winner's hold (self-heal). */
+    ngx_flag_t               lock;          /* cache_turbo_lock on|off          */
+    ngx_msec_t               lock_timeout;  /* max a loser waits, then origin   */
+
     /* L2 Redis (v2b). Native async client, no hiredis. The L2 store is touched
      * only on an L1 miss (sync GET) and on store (async write-through); it is
      * never on the L1-hit hot path. */
@@ -384,6 +402,23 @@ typedef struct {
     unsigned                 lock_pending:1;/* NX parked, awaiting reply      */
     unsigned                 lock_done:1; /* NX reply landed                 */
     ngx_int_t                lock_result; /* NGX_OK = we hold the lock        */
+    /* Cold-miss single-flight (v10). A cold-miss LOSER parks on a short timer
+     * and re-checks L1/L2 until the winner fills the entry or lock_timeout
+     * elapses. waiting marks this request as already in the wait loop (re-entry
+     * must not re-claim); wait_deadline is the give-up time (ngx_current_msec
+     * clock); cold_wait_ev is the per-request poll timer (data = r). */
+    unsigned                 waiting:1;   /* in the cold-miss wait loop       */
+    ngx_msec_t               wait_deadline;/* give up + go to origin at this   */
+    ngx_event_t              cold_wait_ev; /* poll timer for the wait loop     */
+    /* This request is the cold-miss WINNER that owns the in-flight stub: it
+     * went to origin and must leave a real entry OR clear the stub so waiters
+     * don't block on a key that turned out non-cacheable. cold_stored = the
+     * stub was resolved (a real blob was stored, or the stub was cleared); when
+     * it is still 0 at request teardown the pool cleanup removes the leftover
+     * stub. cold_zone is the zone to clear it in (cleanup has only the ctx). */
+    unsigned                 cold_winner:1;
+    unsigned                 cold_stored:1;
+    ngx_http_cache_turbo_zone_t *cold_zone;
     ngx_chain_t             *body;        /* buffered response chain        */
     size_t                   body_len;
     ngx_str_t                cache_key;
@@ -437,6 +472,17 @@ ngx_uint_t ngx_http_cache_turbo_shm_purge_all(ngx_http_cache_turbo_zone_t *z);
 /* Snapshot the zone's atomic stat counters into out (admin stats endpoint). */
 void ngx_http_cache_turbo_shm_stats(ngx_http_cache_turbo_zone_t *z,
     ngx_http_cache_turbo_stats_t *out);
+
+/* Cold-miss single-flight claim (v10). See the L1 vtable `claim` comment.
+ * Returns NGX_HTTP_CACHE_TURBO_CLAIM_{WINNER,LOSER,FRESH}. */
+ngx_int_t ngx_http_cache_turbo_shm_claim(ngx_http_cache_turbo_zone_t *z,
+    u_char *key_hash, uint32_t hash, time_t lock_ttl);
+
+/* Remove a leftover cold-miss STUB (v10): drops the node ONLY if it is still a
+ * stub (len == 0), so a real entry stored by someone else is never touched.
+ * Used when a cold-miss winner's response turned out non-cacheable. */
+void ngx_http_cache_turbo_shm_unstub(ngx_http_cache_turbo_zone_t *z,
+    u_char *key_hash, uint32_t hash);
 
 
 /* ---- swr.c ---- */
@@ -584,7 +630,23 @@ struct ngx_cache_turbo_l1_backend_s {
     ngx_uint_t (*purge_all)(ngx_http_cache_turbo_zone_t *z);
     void       (*stats)(ngx_http_cache_turbo_zone_t *z,
         ngx_http_cache_turbo_stats_t *out);
+
+    /* Cold-miss single-flight claim (v10). Atomically (under the zone mutex)
+     * decide whether this request regenerates the key or waits for someone else.
+     * Returns CLAIM_WINNER (took/created the in-flight stub — go to origin),
+     * CLAIM_LOSER (someone else is in flight — wait), or CLAIM_FRESH (a real
+     * fresh entry raced in — re-serve via lookup). lock_ttl bounds the stub. */
+    ngx_int_t  (*claim)(ngx_http_cache_turbo_zone_t *z, u_char *key_hash,
+        uint32_t hash, time_t lock_ttl);
 };
+
+#define NGX_HTTP_CACHE_TURBO_CLAIM_WINNER  0
+#define NGX_HTTP_CACHE_TURBO_CLAIM_LOSER   1
+#define NGX_HTTP_CACHE_TURBO_CLAIM_FRESH   2
+
+/* Cold-miss wait-loop poll interval (ms): a loser re-checks L1/L2 this often
+ * until the winner fills the entry or cache_turbo_lock_timeout elapses (v10). */
+#define NGX_HTTP_CACHE_TURBO_LOCK_POLL_MS  100
 
 extern ngx_cache_turbo_l1_backend_t  ngx_http_cache_turbo_shm_backend;
 

@@ -314,12 +314,17 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
         # a stale read reliably rolls a refresh; lock_ttl 5s = the Redis SET NX
         # PX hold (long enough to cap a multinode burst, short enough to model a
         # crashed peer's lock self-healing by PX expiry).
+        # cache_turbo_lock off isolates the STALE-path NX under test from the v10
+        # cold-path NX (otherwise the cold prime's NX would linger for lock_ttl
+        # into the stale burst). Cold-path cross-node single-flight is covered by
+        # /coldl2/ below.
         location /lock/ {{
             cache_turbo          main;
             cache_turbo_key      $uri;
             cache_turbo_valid    2s;     # stale window: serveable until t+8s
             cache_turbo_beta     5000;   # aggressive: refresh likely while stale
             cache_turbo_lock_ttl 5s;     # cross-node NX PX = 5000ms
+            cache_turbo_lock     off;    # isolate stale-path NX (see comment)
             cache_turbo_redis    127.0.0.1:{redis_port} prefix=ct: timeout=250ms;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
@@ -334,6 +339,20 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             cache_turbo_valid    2s;     # stale window: serveable until t+8s
             cache_turbo_beta     5000;
             cache_turbo_lock_ttl 2s;     # local + NX hold = 2000ms
+            cache_turbo_lock     off;    # isolate stale-path NX (see /lock/)
+            cache_turbo_redis    127.0.0.1:{redis_port} prefix=ct: timeout=250ms;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # cold-miss single-flight (v10), cross-node: two nginx nodes share this
+        # Redis. A concurrent cold burst across both collapses to ~1 origin fetch
+        # -- the node that wins the SET NX PX regenerates + writes L2; the other
+        # node's local winner loses the NX and waits for the L2 write-through.
+        location /coldl2/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    30s;
+            cache_turbo_lock_ttl 5s;
             cache_turbo_redis    127.0.0.1:{redis_port} prefix=ct: timeout=250ms;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
@@ -374,6 +393,27 @@ http {{
             cache_turbo_key      $uri;
             cache_turbo_valid    30s;
             cache_turbo_max_size 1m;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # cold-miss single-flight (v10), per-box: cache_turbo_lock is ON by
+        # default, so a burst of first-hits on one cold key collapses to a
+        # single origin fetch; the rest wait then serve the filled entry.
+        location /cold/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    30s;
+            cache_turbo_lock_ttl 5s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # cold-miss single-flight DISABLED: the gate-off control. The same burst
+        # stampedes the origin (one hit per reader).
+        location /coldoff/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    30s;
+            cache_turbo_lock     off;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
@@ -1239,6 +1279,51 @@ def test_background_update_off_regenerates_inline(ng: Nginx,
         "bg-off winner should serve a freshly regenerated body inline"
 
 
+def _admin_lock_waits(ng: Nginx) -> int:
+    import json
+    _, b, _ = fetch(ng.port, "/_cache")
+    return int(json.loads(b).get("lock_waits", 0))
+
+
+def test_cold_single_flight(ng: Nginx, origin: Origin) -> None:
+    """v10: a burst of first-hits on ONE virgin (never-cached) key collapses to a
+    single origin fetch — the first request regenerates, the rest WAIT for the
+    fill and then serve it, instead of every reader stampeding the origin."""
+    uri = "/cold/sf"                               # never fetched before
+    base = origin.hits
+    waits0 = _admin_lock_waits(ng)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=40) as pool:
+        results = list(pool.map(lambda _: fetch(ng.port, uri), range(40)))
+    assert {r[0] for r in results} == {200}, \
+        f"cold burst returned {set(r[0] for r in results)}"
+    # All readers must agree on one body (the single regenerated copy).
+    bodies = {r[1] for r in results}
+    assert len(bodies) == 1, f"cold burst served {len(bodies)} distinct bodies"
+    regens = origin.hits - base
+    assert regens <= 3, \
+        f"cold single-flight failed: {regens} origin fetches for 40 readers"
+    # The collapse must have happened via the wait path (not just lucky timing).
+    assert _admin_lock_waits(ng) - waits0 > 0, \
+        "no requests waited — single-flight did not engage"
+    drain_origin(origin)
+
+
+def test_cold_lock_off_stampedes(ng: Nginx, origin: Origin) -> None:
+    """v10 gate: with cache_turbo_lock off, the same cold burst is NOT collapsed —
+    far more than one reader reaches the origin (proves the lock is what coalesces,
+    not some other serialisation)."""
+    uri = "/coldoff/sf"
+    base = origin.hits
+    with concurrent.futures.ThreadPoolExecutor(max_workers=40) as pool:
+        results = list(pool.map(lambda _: fetch(ng.port, uri), range(40)))
+    assert {r[0] for r in results} == {200}, \
+        f"cold(off) burst returned {set(r[0] for r in results)}"
+    regens = origin.hits - base
+    assert regens > 3, \
+        f"lock-off should stampede; only {regens} origin fetches for 40 readers"
+    drain_origin(origin)
+
+
 def test_lru_eviction(ng: Nginx) -> None:
     """R6: with a tiny zone, old entries are evicted, not 500s."""
     # hammer many distinct keys through the tiny zone; must all 200, no errors
@@ -1790,6 +1875,42 @@ def test_lock_self_heal(ng: Nginx, origin: Origin, redis: RedisServer) -> None:
     drain_origin(origin)       # v8: settle async bg refreshes before the next test
 
 
+def test_cold_single_flight_cross_node(ng: Nginx, origin: Origin,
+                                       redis: RedisServer) -> None:
+    """v10 cross-node: two nodes sharing one Redis collapse a CONCURRENT cold
+    burst to ~1 origin fetch. The node that wins the SET NX PX regenerates and
+    write-throughs to L2; the other node's local winner loses the NX and waits
+    for that L2 fill instead of going to origin too."""
+    uri = "/coldl2/sf"
+    redis.cli("DEL", l2_key(uri), lock_key(uri))
+
+    b = _spawn_node(ng, "server-cold", 7)
+    try:
+        base = origin.hits
+        ports = [ng.port, b.port]
+        # 40 concurrent first-hits split across both cold nodes.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=40) as pool:
+            results = list(pool.map(
+                lambda i: fetch(ports[i % 2], uri), range(40)))
+        assert {r[0] for r in results} == {200}, \
+            f"cross-node cold burst returned {set(r[0] for r in results)}"
+        bodies = {r[1] for r in results}
+        assert len(bodies) == 1, \
+            f"cross-node cold burst served {len(bodies)} distinct bodies"
+        time.sleep(0.4)                            # let any in-flight regen land
+        regens = origin.hits - base
+        # One node regenerates; the other L2-fills. Allow a little slack for the
+        # NX-resolution window across two event loops.
+        assert regens <= 3, \
+            f"cross-node cold single-flight failed: {regens} origin fetches"
+        time.sleep(0.2)
+        b.stop()
+        b.assert_clean_logs()
+    finally:
+        b.stop()
+        drain_origin(origin)
+
+
 def test_purge_all_clears_l2(ng: Nginx, origin: Origin,
                              redis: RedisServer) -> None:
     """v4-2: POST ?all=1 on an L2-aware admin endpoint clears the whole L2
@@ -2213,6 +2334,8 @@ def run_all(ng: Nginx, origin: Origin,
     test_warm_no_url(ng)
     test_stale_serves_stale(ng, origin)
     test_single_flight(ng, origin)
+    test_cold_single_flight(ng, origin)
+    test_cold_lock_off_stampedes(ng, origin)
     test_stale_if_error(ng, origin)
     test_background_update_off_regenerates_inline(ng, origin)
     test_normalize_arg_order(ng, origin)
@@ -2242,6 +2365,7 @@ def run_all(ng: Nginx, origin: Origin,
         test_l2_tag_purge(ng, origin, redis)
         test_multinode_lock(ng, origin, redis)
         test_lock_self_heal(ng, origin, redis)
+        test_cold_single_flight_cross_node(ng, origin, redis)
         test_l2_db_select(ng, origin, redis)         # SELECT-only preamble
         test_purge_all_clears_l2(ng, origin, redis)  # last L2: empties L2
     if redis_auth is not None:
@@ -2330,6 +2454,7 @@ def main() -> int:
           "concurrency (R1), prometheus metrics (incl L2 hit/miss), "
           "default-key normalization, "
           "LRU eviction (R6), stale serve (R3), single-flight (R4), "
+          "cold-miss single-flight (v10: per-box collapse + lock-off stampede), "
           "stale-if-error (v8), background_update off (v8 inline regen), "
           "admin stats/purge/gating, warm (v3-3: populates/multi/no-url), "
           "key normalize (v3-1: order/tracking/"
@@ -2345,6 +2470,7 @@ def main() -> int:
              "L2-aware key purge (P6), expired-L1 consults L2 (P6), "
              "tag index add (v2c), tag purge both tiers (P4), "
              "multi-node dogpile lock (v4-2 SET NX PX), lock self-heal (v4-2), "
+             "cold-miss cross-node single-flight (v10), "
              "?all=1 clears L2 (v4-2 SCAN+DEL), "
              "DSN SELECT-db preamble (v5)"
              if redis_port else "")
