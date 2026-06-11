@@ -1746,11 +1746,18 @@ def test_l2_purge_key_drops_l2(ng: Nginx, origin: Origin,
     assert wait_for(lambda: redis.cli("EXISTS", l2_key(uri)) == "0"), \
         "admin purge did not DEL the entry from L2 (P6 regression)"
 
-    # next read is a true miss to the origin (a NEW gen), not an L2 refill
+    # next read is a true miss to the origin (a NEW gen), not an L2 refill — and
+    # it must NOT stall: purge clears the cross-node single-flight lock too, so the
+    # cold-miss winner re-acquires the NX and goes straight to origin. Before the
+    # fix a stale lock made it wait the full lock_timeout (~5s) = the V-HANG.
     origin_before = origin.hits
+    t0 = time.monotonic()
     s, body_b, h3 = fetch(ng.port, uri)
+    elapsed = time.monotonic() - t0
     assert s == 200 and "x-cache" not in h3, \
         f"post-purge read should miss to origin, got {h3.get('x-cache')}"
+    assert elapsed < 2.0, \
+        f"post-purge cold miss stalled {elapsed:.1f}s (stale single-flight lock?)"
     assert origin.hits == origin_before + 1, "origin was not consulted after purge"
     assert body_b != body_a, "post-purge body should be a fresh generation"
 
@@ -1831,12 +1838,17 @@ def test_l2_tag_purge(ng: Nginx, origin: Origin, redis: RedisServer) -> None:
     assert wait_for(lambda: redis.cli("EXISTS", tag_key("news")) == "0"), \
         "emptied tag set was not deleted"
 
-    # both gone from L1: next reads miss to a fresh origin generation
+    # both gone from L1: next reads miss to a fresh origin generation, and must
+    # not stall — tag purge clears each member's single-flight lock too (V-HANG).
     origin_before = origin.hits
+    t0 = time.monotonic()
     _, nb1, h1 = fetch(ng.port, u1)
     _, nb2, h2 = fetch(ng.port, u2)
+    elapsed = time.monotonic() - t0
     assert "x-cache" not in h1 and "x-cache" not in h2, \
         "tagged objects should be a MISS in L1 after purge"
+    assert elapsed < 2.0, \
+        f"post-tag-purge cold misses stalled {elapsed:.1f}s (stale lock?)"
     assert origin.hits == origin_before + 2, "both reads should reach origin"
     assert nb1 != body1["body"] and nb2 != body2["body"], \
         "post-purge bodies should be fresh generations"

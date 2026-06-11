@@ -2471,7 +2471,10 @@ ngx_http_cache_turbo_tag_purge_complete(ngx_http_request_t *r, void *data,
         tp->clcf->backend->del_raw(tp->clcf, members[i].data,
                                    members[i].len);
 
-        /* member = <prefix><64 hex of the 32-byte key hash>: drop from L1. */
+        /* member = <prefix><64 hex of the 32-byte key hash>: drop from L1, and
+         * also drop the object's cross-node single-flight lock (v4-2 SET NX PX)
+         * — otherwise a stale lock outlives the purged object and stalls the
+         * next cold-miss winner for lock_timeout (the V-HANG; see redis_del). */
         if (members[i].len == plen + 64) {
             u_char    key_hash[32];
             uint32_t  hash;
@@ -2479,8 +2482,19 @@ ngx_http_cache_turbo_tag_purge_complete(ngx_http_request_t *r, void *data,
             if (ngx_http_cache_turbo_hexdecode(members[i].data + plen, 64,
                                                key_hash) == NGX_OK)
             {
+                u_char  *lockbuf;
+
                 hash = ngx_crc32_short(key_hash, 32);
                 (void) tp->clcf->l1->purge_key(tp->zone, key_hash, hash);
+
+                lockbuf = ngx_pnalloc(r->pool,
+                              plen + sizeof("lock:") - 1 + 64);
+                if (lockbuf != NULL) {
+                    size_t  locklen;
+                    locklen = ngx_http_cache_turbo_redis_lockkey(
+                                  &tp->clcf->redis_prefix, key_hash, lockbuf);
+                    tp->clcf->backend->del_raw(tp->clcf, lockbuf, locklen);
+                }
             }
         }
 

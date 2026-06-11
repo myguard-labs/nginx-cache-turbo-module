@@ -851,7 +851,7 @@ ngx_http_cache_turbo_redis_del(ngx_http_cache_turbo_loc_conf_t *clcf,
     u_char *key_hash)
 {
     ngx_pool_t  *tmp;
-    u_char      *keybuf;
+    u_char      *keybuf, *lockbuf;
     size_t       keylen;
 
     if (!clcf->redis_enable) {
@@ -870,6 +870,20 @@ ngx_http_cache_turbo_redis_del(ngx_http_cache_turbo_loc_conf_t *clcf,
         keylen = ngx_http_cache_turbo_redis_key(&clcf->redis_prefix, key_hash,
                                                 keybuf);
         ngx_http_cache_turbo_redis_del_raw(clcf, keybuf, keylen);
+    }
+
+    /* Also drop the cross-node single-flight lock (v4-2 SET NX PX). It is held
+     * for lock_ttl and self-heals only by PX expiry; a purge that removes the
+     * object but leaves the lock would make the NEXT cold-miss winner lose the
+     * NX to this now-stale lock and then wait the full lock_timeout for an L2
+     * fill that was just purged (a ~5s stall, the V-HANG). Clearing it here lets
+     * the post-purge cold miss re-acquire the lock and go to origin at once. */
+    lockbuf = ngx_pnalloc(tmp, clcf->redis_prefix.len + sizeof("lock:") - 1 + 64);
+    if (lockbuf != NULL) {
+        size_t  locklen;
+        locklen = ngx_http_cache_turbo_redis_lockkey(&clcf->redis_prefix,
+                                                     key_hash, lockbuf);
+        ngx_http_cache_turbo_redis_del_raw(clcf, lockbuf, locklen);
     }
 
     ngx_destroy_pool(tmp);
