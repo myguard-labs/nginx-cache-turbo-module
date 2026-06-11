@@ -190,6 +190,10 @@ ngx_http_cache_turbo_redis_connect(ngx_http_cache_turbo_redis_op_t *op,
     c = op->peer.connection;
     c->data = op;
 
+    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, c->log, 0,
+                   "cache_turbo: redis connect fd:%d -> %V",
+                   c->fd, op->peer.name);
+
 #if (NGX_SSL)
     if (op->clcf != NULL && op->clcf->redis_tls) {
         /* A peer connection has no pool of its own; ngx_ssl_create_connection
@@ -412,6 +416,9 @@ ngx_http_cache_turbo_redis_tls_handshake_done(ngx_connection_t *c)
             return;
         }
     }
+
+    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,
+                   "cache_turbo: redis TLS handshake ok fd:%d", c->fd);
 
     /* handshake good: now run the redis write path (preamble then command) */
     c->write->handler = ngx_http_cache_turbo_redis_write;
@@ -1675,6 +1682,8 @@ ngx_http_cache_turbo_redis_op_done(ngx_http_cache_turbo_redis_op_t *op)
     ngx_connection_t  *c = op->peer.connection;
 
     if (c) {
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,
+                       "cache_turbo: redis conn close fd:%d", c->fd);
 #if (NGX_SSL)
         if (c->ssl) {
             /* best-effort: don't block teardown waiting on close_notify */

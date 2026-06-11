@@ -510,6 +510,10 @@ ngx_http_cache_turbo_purge_request(ngx_http_request_t *r,
 
     purged = (ngx_uint_t) clcf->l1->purge_key(z, ctx->key_hash, hash);
 
+    ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "cache_turbo: PURGE \"%V\" key=%ui purged=%ui",
+                   &r->uri, (ngx_uint_t) hash, purged);
+
     /* Drop from L2 too, so a purge can't be silently refilled from Redis. */
     if (clcf->backend) {
         clcf->backend->del(clcf, ctx->key_hash);
@@ -595,6 +599,9 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
         && !ctx->l2_done && !ctx->lock_done
         && ngx_http_test_predicates(r, clcf->bypass) != NGX_OK)
     {
+        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "cache_turbo: bypass \"%V\" key=%ui -> origin",
+                       &r->uri, (ngx_uint_t) hash);
         (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
         return NGX_DECLINED;
     }
@@ -629,6 +636,9 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
             ngx_memcpy(snap, ctn->data, snap_len);
             ngx_shmtx_unlock(&z->shpool->mutex);
             (void) ngx_atomic_fetch_add(&z->sh->hits, 1);
+            ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                           "cache_turbo: L1 HIT (fresh) \"%V\" key=%ui len=%uz",
+                           &r->uri, (ngx_uint_t) hash, snap_len);
             return ngx_http_cache_turbo_serve(r, snap, snap_len, 0);
         }
 
@@ -643,6 +653,9 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
              * needed. */
             if (ctx->lock_done && ctx->lock_result == NGX_OK) {
                 ngx_shmtx_unlock(&z->shpool->mutex);
+                ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                               "cache_turbo: cross-node lock WON \"%V\" key=%ui "
+                               "-> regenerate", &r->uri, (ngx_uint_t) hash);
                 return NGX_DECLINED;
             }
 
@@ -684,6 +697,9 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                 ctn->refresh_lock_until = now + lock_ttl;
                 ngx_shmtx_unlock(&z->shpool->mutex);
                 (void) ngx_atomic_fetch_add(&z->sh->refreshes, 1);
+                ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                               "cache_turbo: stale, refresh dice WON \"%V\" "
+                               "key=%ui", &r->uri, (ngx_uint_t) hash);
 
                 /* Cross-node gate (v4-2): the per-box L1 dice win is necessary
                  * but not sufficient — only the node that ALSO wins the Redis
@@ -694,6 +710,9 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                 if (clcf->backend && clcf->backend->lock) {
                     ngx_int_t  lrc = clcf->backend->lock(r, clcf, ctx, lock_ttl);
                     if (lrc == NGX_AGAIN) {
+                        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                                       "cache_turbo: parked on L2 lock NX \"%V\" "
+                                       "key=%ui", &r->uri, (ngx_uint_t) hash);
                         return NGX_AGAIN;       /* parked; resume re-enters */
                     }
                 }
@@ -711,6 +730,9 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                 ngx_memcpy(snap, ctn->data, snap_len);
                 ngx_shmtx_unlock(&z->shpool->mutex);
                 (void) ngx_atomic_fetch_add(&z->sh->stale_serves, 1);
+                ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                               "cache_turbo: STALE serve \"%V\" key=%ui len=%uz",
+                               &r->uri, (ngx_uint_t) hash, snap_len);
                 return ngx_http_cache_turbo_serve(r, snap, snap_len, 1);
             }
         }
@@ -729,6 +751,9 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
     if (clcf->backend && !ctx->l2_done) {
         ngx_int_t  rc = clcf->backend->get(r, clcf, ctx);
         if (rc == NGX_AGAIN) {
+            ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                           "cache_turbo: parked on L2 GET \"%V\" key=%ui",
+                           &r->uri, (ngx_uint_t) hash);
             return NGX_AGAIN;           /* parked; redis read handler resumes */
         }
         /* NGX_DECLINED: L2 disabled or could not start; go to origin */
@@ -747,6 +772,10 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                            clcf->valid, clcf->stale_mult);
                 (void) ngx_atomic_fetch_add(&z->sh->hits, 1);
                 (void) ngx_atomic_fetch_add(&z->sh->l2_hits, 1);
+                ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                               "cache_turbo: L2 HIT \"%V\" key=%ui len=%uz "
+                               "(filled L1)", &r->uri, (ngx_uint_t) hash,
+                               ctx->l2_blob_len);
                 return ngx_http_cache_turbo_serve(r, ctx->l2_blob,
                            ctx->l2_blob_len, 0);
             }
@@ -761,6 +790,9 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
 
     /* true miss: mark for capture, let the request run to the origin */
     (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
+    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "cache_turbo: MISS \"%V\" key=%ui -> origin",
+                   &r->uri, (ngx_uint_t) hash);
     return NGX_DECLINED;
 }
 
@@ -828,6 +860,10 @@ ngx_http_cache_turbo_serve(ngx_http_request_t *r, u_char *copy, size_t len,
     end = p + bh->headers_len;
     body = end;
     body_len = bh->body_len;
+
+    ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "cache_turbo: serve status=%ui body=%uz stale=%ui",
+                   (ngx_uint_t) bh->status, body_len, stale);
 
     /* guard: header block must fit inside the blob */
     if (bh->headers_len > len - sizeof(hdr)
@@ -1147,6 +1183,9 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 
         ttl = ngx_http_cache_turbo_status_ttl(clcf, r->headers_out.status);
         if (ttl < 0) {
+            ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                           "cache_turbo: not cacheable \"%V\" status=%ui",
+                           &r->uri, r->headers_out.status);
             return ngx_http_next_body_filter(r, in);   /* not cacheable */
         }
 
@@ -1260,6 +1299,10 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
             (void) clcf->l1->store(z, ctx->key_hash, hash,
                        blob, blob_len, r->headers_out.status, ttl,
                        clcf->stale_mult);
+
+            ngx_log_debug4(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                           "cache_turbo: STORE \"%V\" key=%ui len=%uz ttl=%T",
+                           &r->uri, (ngx_uint_t) hash, blob_len, ttl);
 
             /* Record this origin regeneration's cost for the autotune (v4-3).
              * This store site is the origin→cache path only (the L2→L1 fill in
