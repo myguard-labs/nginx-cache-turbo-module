@@ -234,6 +234,9 @@ http {{
 
     cache_turbo_zone name=main 16m;
     cache_turbo_zone name=tiny 8m;   # small zone for eviction test (R6)
+    cache_turbo_zone name=at 16m;    # autotune raise/clamp/off (v4-3)
+    cache_turbo_zone name=ati 16m;   # autotune insufficient-data (v4-3)
+    cache_turbo_zone name=atch 16m;  # autotune churn-disqualify (v4-3)
 
     server {{
         listen 127.0.0.1:{port};
@@ -355,6 +358,81 @@ http {{
             cache_turbo_preset   aggressive;
             cache_turbo_valid    1s;     # stale_mult=8 -> expires at 8s
             proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # live autotune (v4-3). /at/ + /atc/ share zone "at": a window of slow
+        # misses drives the zone's beta verdict up; /at/ is balanced (band
+        # [500,2000]) so it shows the verdict, /atc/ is conservative (band
+        # [500,1000]) so it shows the SAME verdict re-clamped -- proving the
+        # per-location band clamp. X-CT-Beta exposes the effective beta. /ato/ has
+        # autotune OFF so it always shows the static preset beta regardless of the
+        # zone verdict (off-by-default). short interval so a window resolves fast.
+        location /at/ {{
+            cache_turbo          at;
+            cache_turbo_key      $uri;
+            cache_turbo_autotune on;
+            cache_turbo_autotune_interval 3600s;
+            add_header           X-CT-Beta $cache_turbo_beta always;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        location /atc/ {{
+            cache_turbo          at;
+            cache_turbo_key      $uri;
+            cache_turbo_preset   conservative;
+            cache_turbo_autotune on;
+            cache_turbo_autotune_interval 3600s;
+            add_header           X-CT-Beta $cache_turbo_beta always;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        location /ato/ {{
+            cache_turbo          at;
+            cache_turbo_key      $uri;
+            cache_turbo_preset   balanced;
+            add_header           X-CT-Beta $cache_turbo_beta always;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # autotune insufficient-data: a fresh zone with < MISSES_FLOOR traffic in
+        # the window must NOT publish a verdict (autotuned_beta stays 0).
+        location /ati/ {{
+            cache_turbo          ati;
+            cache_turbo_key      $uri;
+            cache_turbo_autotune on;
+            cache_turbo_autotune_interval 3600s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # autotune churn-disqualify: short TTL + short lock + aggressive beta so a
+        # stale read reliably refreshes; the test drives refreshes >> misses so the
+        # churn gate (refreshes/misses > 2) vetoes the otherwise-qualifying verdict.
+        location /atch/ {{
+            cache_turbo          atch;
+            cache_turbo_key      $uri;
+            cache_turbo_preset   aggressive;  # stale_mult 8 -> entry lives 8s, so a
+                                              # skipped refresh cycle never expires
+                                              # to a MISS (keeps churn ratio stable)
+            cache_turbo_valid    1s;
+            cache_turbo_beta     5000;        # static dice beta: refresh is certain
+            cache_turbo_lock_ttl 1s;
+            cache_turbo_autotune on;
+            cache_turbo_autotune_interval 3600s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        location = /_cache_at {{
+            cache_turbo_admin at;
+            allow 127.0.0.1;
+            deny all;
+        }}
+        location = /_cache_ati {{
+            cache_turbo_admin ati;
+            allow 127.0.0.1;
+            deny all;
+        }}
+        location = /_cache_atch {{
+            cache_turbo_admin atch;
+            allow 127.0.0.1;
+            deny all;
         }}
 
         # uncached passthrough, lets us read the raw origin
@@ -1321,6 +1399,106 @@ def test_invalid_preset_name(ng: Nginx) -> None:
         f"missing/odd diagnostic for bad preset:\n{r.stdout}"
 
 
+# --------------------------------------------------------------------------- #
+# Live autotune within preset bands (v4-3)
+# --------------------------------------------------------------------------- #
+
+def _fire_misses(ng: Nginx, prefix: str, n: int) -> None:
+    """Fire n distinct-key GETs concurrently so a window fills fast. Re-calling
+    with the same prefix re-reads the same keys (refreshes, not misses)."""
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=16) as ex:
+        list(ex.map(lambda i: fetch(ng.port, f"{prefix}{i}"), range(n)))
+
+
+# A forced recompute (admin ?autotune=1) windows over everything since the last
+# recompute and returns the stats incl. the fresh verdict. The autotune locations
+# use a huge interval so the throttled per-request recompute fires only on the
+# seed (snapshotting ~0) and never splits the measured window — the force does the
+# real measurement, making these tests independent of wall-clock timing.
+
+def _autotune_force(ng: Nginx, admin: str) -> dict:
+    import json
+    s, b, _ = fetch(ng.port, f"{admin}?autotune=1")
+    assert s == 200, f"{admin}?autotune=1 status {s}"
+    return json.loads(b)
+
+
+def test_autotune_raises_beta_within_band(ng: Nginx, origin: Origin) -> None:
+    """A window of slow misses makes the zone autotune its beta UP from the live
+    miss-cost (beta = cost_ms/20, ×1000). The verdict is published per-zone (admin
+    autotuned_beta) and re-clamped to each location's preset band ($cache_turbo_beta):
+    balanced /at/ [500,2000] shows the verdict, conservative /atc/ [500,1000] shows
+    it capped at its band max and strictly lower."""
+    origin.delay = 0.04          # ~40ms regen -> target beta ~ 40*1000/20 = 2000
+    try:
+        fetch(ng.port, "/at/seed")               # first request snapshots ~0
+        _fire_misses(ng, "/at/k", 110)           # 110 distinct slow misses
+        st = _autotune_force(ng, "/_cache_at")   # recompute over the whole window
+
+        assert 25 <= st["cost_ms"] <= 200, f"cost not measured sanely: {st}"
+        beta = st["autotuned_beta"]
+        assert 1500 <= beta <= 3000, f"autotuned beta not raised: {st}"
+
+        _, _, hb = fetch(ng.port, "/at/probe")
+        _, _, hc = fetch(ng.port, "/atc/probe")
+        bal = int(hb["x-ct-beta"]); con = int(hc["x-ct-beta"])
+        assert bal == max(500, min(beta, 2000)), \
+            f"balanced effective beta {bal} not clamped to its band from {beta}"
+        assert con == max(500, min(beta, 1000)), \
+            f"conservative effective beta {con} not clamped to its band from {beta}"
+        assert con < bal, f"conservative ({con}) should be below balanced ({bal})"
+    finally:
+        origin.delay = 0.0
+
+
+def test_autotune_off_by_default(ng: Nginx) -> None:
+    """A location WITHOUT cache_turbo_autotune ignores the zone's live verdict and
+    always reports its static preset beta (balanced = 1000), even though /ato/
+    shares the zone /at/ just autotuned up."""
+    _, _, h = fetch(ng.port, "/ato/x")
+    assert int(h["x-ct-beta"]) == 1000, \
+        f"autotune-off location should show static beta 1000, got {h.get('x-ct-beta')}"
+
+
+def test_autotune_insufficient_data(ng: Nginx, origin: Origin) -> None:
+    """Below MISSES_FLOOR (100) traffic in a window, no verdict is published — the
+    fresh zone's autotuned_beta stays 0 (fall back to preset)."""
+    origin.delay = 0.04
+    try:
+        fetch(ng.port, "/ati/seed")              # first request snapshots ~0
+        _fire_misses(ng, "/ati/k", 10)           # only 10 < floor
+        st = _autotune_force(ng, "/_cache_ati")  # recompute: thin window -> no verdict
+        assert st["autotuned_beta"] == 0, f"thin data wrongly tuned: {st}"
+    finally:
+        origin.delay = 0.0
+
+
+def test_autotune_churn_disqualifies(ng: Nginx, origin: Origin) -> None:
+    """A refresh-dominated window (refreshes/misses > 2) is vetoed by the churn gate
+    even though cost+hit-rate would otherwise qualify (cf. test_autotune_raises_*),
+    so no verdict is published (autotuned_beta stays 0). The /atch/ location uses an
+    aggressive preset (8s entry life), 1s TTL + 1s lock + beta 5.0 so a stale read
+    deep in the window certainly refreshes; re-reading the 110 keys for 4 cycles
+    drives well over 220 refreshes (> 2x the 110 cold misses) with margin even when
+    valgrind slows a cycle. One forced recompute windows the whole run."""
+    origin.delay = 0.012         # ~12ms >= COST_MOD (10ms): cost would qualify
+    try:
+        fetch(ng.port, "/atch/seed")             # first request snapshots ~0
+        _fire_misses(ng, "/atch/k", 110)         # 110 cold misses (floor + low hit-rate)
+        for _ in range(4):                        # 4 stale refresh cycles
+            time.sleep(2.7)                       # past fresh + lock, deep in stale
+            _fire_misses(ng, "/atch/k", 110)      # same keys -> refreshes, not misses
+
+        st = _autotune_force(ng, "/_cache_atch")  # recompute over the whole window
+        assert st["refreshes"] > 2 * max(1, st["misses"]), \
+            f"setup failed to drive churn ratio > 2: {st}"
+        assert st["autotuned_beta"] == 0, \
+            f"churn-heavy window should be vetoed, got {st}"
+    finally:
+        origin.delay = 0.0
+
+
 def run_all(ng: Nginx, origin: Origin,
             redis: RedisServer | None = None) -> None:
     test_miss_then_hit(ng)
@@ -1348,6 +1526,10 @@ def run_all(ng: Nginx, origin: Origin,
     test_invalid_normalize_vary_token(ng)
     test_preset_window_differs(ng, origin)
     test_invalid_preset_name(ng)
+    test_autotune_raises_beta_within_band(ng, origin)
+    test_autotune_off_by_default(ng)
+    test_autotune_insufficient_data(ng, origin)
+    test_autotune_churn_disqualifies(ng, origin)
     if redis is not None:
         test_l2_write_through(ng, origin, redis)
         test_l2_cross_instance_fill(ng, origin, redis)
@@ -1406,7 +1588,9 @@ def main() -> int:
           "vary suffix (v3-4: encoding/device/both/off-by-default, "
           "invalid-token rejected), "
           "presets (v3-2: conservative/aggressive stale-window differ, "
-          "invalid-name rejected)"
+          "invalid-name rejected), "
+          "autotune (v4-3: raises beta within band/off-by-default/"
+          "insufficient-data/churn-disqualify)"
           + (", L2 write-through (P4), L2 cross-instance fill (P2), "
              "L2-aware key purge (P6), expired-L1 consults L2 (P6), "
              "tag index add (v2c), tag purge both tiers (P4), "

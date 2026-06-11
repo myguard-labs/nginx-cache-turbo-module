@@ -88,6 +88,19 @@ ngx_http_cache_turbo_shm_init_zone(ngx_shm_zone_t *shm_zone, void *data)
     ctx->sh->refreshes = 0;
     ctx->sh->evictions = 0;
 
+    /* Autotune state (v4-3): everything zeroed. autotune_next = 0 makes the first
+     * recompute fire immediately; the snapshots being 0 means the first window is
+     * "since worker start". autotuned_beta = 0 means "no verdict → use preset". */
+    ctx->sh->cost_sum_ms = 0;
+    ctx->sh->cost_count = 0;
+    ctx->sh->autotuned_beta = 0;
+    ctx->sh->autotune_next = 0;
+    ctx->sh->snap_hits = 0;
+    ctx->sh->snap_misses = 0;
+    ctx->sh->snap_refreshes = 0;
+    ctx->sh->snap_cost_sum = 0;
+    ctx->sh->snap_cost_count = 0;
+
     ctx->shpool->log_nomem = 0;
 
     return NGX_OK;
@@ -308,11 +321,19 @@ void
 ngx_http_cache_turbo_shm_stats(ngx_http_cache_turbo_zone_t *z,
     ngx_http_cache_turbo_stats_t *out)
 {
+    ngx_atomic_uint_t  cnt;
+
     out->hits         = z->sh->hits;
     out->misses       = z->sh->misses;
     out->stale_serves = z->sh->stale_serves;
     out->refreshes    = z->sh->refreshes;
     out->evictions    = z->sh->evictions;
+
+    /* Autotune introspection (v4-3): average origin-regen cost and the live beta
+     * verdict, so the admin GET can render the tuning without an internal probe. */
+    cnt = z->sh->cost_count;
+    out->cost_ms        = cnt ? (z->sh->cost_sum_ms / cnt) : 0;
+    out->autotuned_beta = z->sh->autotuned_beta;
 }
 
 

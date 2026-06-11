@@ -71,11 +71,16 @@ static ngx_http_output_body_filter_pt    ngx_http_next_body_filter;
  * feel; the chosen values are documented in
  * memory/eilandert/nginx-cache-turbo-module/history.md.
  */
+/* Fields: valid, beta, lock_ttl, stale_mult, beta_min, beta_max. The last two are
+ * the v4-3 autotune clamp window for the preset (×1000); the autotune verdict is
+ * re-clamped to them so a conservative location never tunes as hot as aggressive
+ * (see history.md v4-3). Centres match the static beta; bands subset global
+ * [500,3000] with overlapping edges. */
 static const ngx_http_cache_turbo_band_t  ngx_http_cache_turbo_bands[] = {
-    /* [0] unused placeholder           */ {   0,    0,  0, 0 },
-    /* [1] CONSERVATIVE: correctness     */ {  30,  500, 10, 2 },
-    /* [2] BALANCED: current defaults    */ {  60, 1000,  5, 4 },
-    /* [3] AGGRESSIVE: max hit-rate      */ { 300, 3000,  3, 8 },
+    /* [0] unused placeholder        */ {   0,    0,  0, 0,    0,    0 },
+    /* [1] CONSERVATIVE: correctness */ {  30,  500, 10, 2,  500, 1000 },
+    /* [2] BALANCED: current defaults*/ {  60, 1000,  5, 4,  500, 2000 },
+    /* [3] AGGRESSIVE: max hit-rate  */ { 300, 3000,  3, 8, 1000, 3000 },
 };
 
 
@@ -135,6 +140,20 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       ngx_http_cache_turbo_preset,
       NGX_HTTP_LOC_CONF_OFFSET,
       0,
+      NULL },
+
+    { ngx_string("cache_turbo_autotune"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_turbo_loc_conf_t, autotune),
+      NULL },
+
+    { ngx_string("cache_turbo_autotune_interval"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_sec_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_turbo_loc_conf_t, autotune_interval),
       NULL },
 
     { ngx_string("cache_turbo_admin"),
@@ -239,6 +258,45 @@ ngx_http_cache_turbo_build_key(ngx_http_request_t *r,
 }
 
 
+/*
+ * Resolve the beta the SWR dice should use for this request. With autotune off
+ * (default) it is the static preset/explicit effective beta. With autotune on and
+ * a live verdict published (z->sh->autotuned_beta > 0), it is that verdict
+ * re-clamped to THIS location's preset band — so a conservative location can't be
+ * autotuned as hot as an aggressive one even though they may share a zone and
+ * thus a single global verdict. No verdict yet → fall back to the static beta.
+ */
+static ngx_int_t
+ngx_http_cache_turbo_effective_beta(ngx_http_cache_turbo_loc_conf_t *clcf,
+    ngx_http_cache_turbo_zone_t *z)
+{
+    ngx_int_t                           ab, p;
+    const ngx_http_cache_turbo_band_t  *band;
+
+    if (!clcf->autotune) {
+        return clcf->beta;
+    }
+
+    ab = (ngx_int_t) z->sh->autotuned_beta;
+    if (ab <= 0) {
+        return clcf->beta;
+    }
+
+    p = (clcf->preset == NGX_CONF_UNSET)
+            ? NGX_HTTP_CACHE_TURBO_PRESET_DEFAULT : clcf->preset;
+    band = &ngx_http_cache_turbo_bands[p];
+
+    if (ab < band->beta_min) {
+        ab = band->beta_min;
+
+    } else if (ab > band->beta_max) {
+        ab = band->beta_max;
+    }
+
+    return ab;
+}
+
+
 static ngx_int_t
 ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
 {
@@ -285,6 +343,14 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
 
     z = clcf->shm_zone->data;
     hash = ngx_crc32_short(ctx->key_hash, 32);
+
+    /* Live autotune (v4-3): throttled per-zone recompute of the beta verdict from
+     * the window's stats. Cheap to call every request (one time compare on the
+     * fast path); the heavy recompute runs at most once per interval per worker.
+     * Takes the zone mutex itself, so call it before we lock below. */
+    if (clcf->autotune) {
+        ngx_http_cache_turbo_autotune_maybe(z, clcf->autotune_interval);
+    }
 
     ngx_shmtx_lock(&z->shpool->mutex);
 
@@ -343,7 +409,8 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                 && (!ctn->refreshing || now >= ctn->refresh_lock_until))
             {
                 refresh = ngx_http_cache_turbo_should_refresh(ctx->key_hash,
-                              fresh_until, stale_window, clcf->beta);
+                              fresh_until, stale_window,
+                              ngx_http_cache_turbo_effective_beta(clcf, z));
             }
 
             if (refresh == NGX_OK) {
@@ -785,6 +852,22 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
             (void) clcf->l1->store(z, ctx->key_hash, hash,
                        blob, blob_len, r->headers_out.status, clcf->valid,
                        clcf->stale_mult);
+
+            /* Record this origin regeneration's cost for the autotune (v4-3).
+             * This store site is the origin→cache path only (the L2→L1 fill in
+             * the access handler is a separate store call), so request_time here
+             * is real origin latency — exactly the miss-cost the autotune feeds
+             * on. Recorded unconditionally so the admin cost_ms is meaningful and
+             * autotune has history the moment it is enabled; just two atomics. */
+            {
+                ngx_time_t      *tp = ngx_timeofday();
+                ngx_msec_int_t   ms;
+
+                ms = (ngx_msec_int_t)
+                     ((tp->sec - r->start_sec) * 1000
+                      + (tp->msec - r->start_msec));
+                ngx_http_cache_turbo_autotune_record_cost(z, ms);
+            }
 
             /* L2 write-through (async, fire-and-forget). Copies the blob into
              * its own pool, so it is safe even though `blob` lives in r->pool. */
@@ -1432,15 +1515,26 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
         return ngx_http_cache_turbo_send_json(r, NGX_HTTP_OK, &body);
     }
 
-    /* GET / HEAD -> stats. Snapshot the counters through the L1 backend rather
-     * than reading the live shctx here. */
+    /* GET / HEAD -> stats. `?autotune=1` first forces an immediate autotune
+     * recompute over the window since the last tick (operator "recompute now"),
+     * so the returned autotuned_beta reflects current stats without waiting on the
+     * interval. Snapshot the counters through the L1 backend rather than reading
+     * the live shctx here. */
     {
         ngx_http_cache_turbo_stats_t  st;
+        ngx_str_t                     arg;
+
+        if (r->args.len
+            && ngx_http_arg(r, (u_char *) "autotune", 8, &arg) == NGX_OK)
+        {
+            ngx_http_cache_turbo_autotune_force(z);
+        }
 
         clcf->l1->stats(z, &st);
 
         len = sizeof("{\"hits\":,\"misses\":,\"stale_serves\":,\"refreshes\":,"
-                     "\"evictions\":}\n") + 6 * NGX_ATOMIC_T_LEN;
+                     "\"evictions\":,\"cost_ms\":,\"autotuned_beta\":}\n")
+              + 7 * NGX_ATOMIC_T_LEN;
         p = ngx_pnalloc(r->pool, len);
         if (p == NULL) {
             return NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -1448,9 +1542,10 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
         body.data = p;
         body.len = ngx_sprintf(p,
             "{\"hits\":%uA,\"misses\":%uA,\"stale_serves\":%uA,"
-            "\"refreshes\":%uA,\"evictions\":%uA}\n",
+            "\"refreshes\":%uA,\"evictions\":%uA,\"cost_ms\":%uA,"
+            "\"autotuned_beta\":%uA}\n",
             st.hits, st.misses, st.stale_serves,
-            st.refreshes, st.evictions) - p;
+            st.refreshes, st.evictions, st.cost_ms, st.autotuned_beta) - p;
     }
     return ngx_http_cache_turbo_send_json(r, NGX_HTTP_OK, &body);
 }
@@ -1893,6 +1988,52 @@ static ngx_str_t  ngx_http_cache_turbo_normalized_args_name =
     ngx_string("cache_turbo_normalized_args");
 
 
+/*
+ * $cache_turbo_beta — the beta the SWR dice would use for a request in this
+ * location right now (×1000), i.e. the static preset/explicit beta, or, when
+ * cache_turbo_autotune is on and a live verdict is published, that verdict
+ * re-clamped to this location's preset band. Read-only introspection (v4-3): lets
+ * an operator log the live tuning, and lets the test suite observe the per-location
+ * band clamp (the zone-level verdict in the admin stats is pre-clamp). Not
+ * cacheable — it tracks live autotune state. */
+static ngx_str_t  ngx_http_cache_turbo_beta_name =
+    ngx_string("cache_turbo_beta");
+
+
+static ngx_int_t
+ngx_http_cache_turbo_beta_variable(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data)
+{
+    ngx_http_cache_turbo_loc_conf_t  *clcf;
+    ngx_http_cache_turbo_zone_t      *z;
+    ngx_int_t                         beta;
+    u_char                           *p;
+
+    clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
+
+    if (clcf->shm_zone == NULL) {
+        beta = clcf->beta;            /* not a caching location: static beta */
+
+    } else {
+        z = clcf->shm_zone->data;
+        beta = ngx_http_cache_turbo_effective_beta(clcf, z);
+    }
+
+    p = ngx_pnalloc(r->pool, NGX_INT_T_LEN);
+    if (p == NULL) {
+        return NGX_ERROR;
+    }
+
+    v->len = ngx_sprintf(p, "%i", beta) - p;
+    v->data = p;
+    v->valid = 1;
+    v->no_cacheable = 1;
+    v->not_found = 0;
+
+    return NGX_OK;
+}
+
+
 static ngx_int_t
 ngx_http_cache_turbo_add_variables(ngx_conf_t *cf)
 {
@@ -1905,6 +2046,13 @@ ngx_http_cache_turbo_add_variables(ngx_conf_t *cf)
     }
 
     var->get_handler = ngx_http_cache_turbo_normalized_args_variable;
+
+    var = ngx_http_add_variable(cf, &ngx_http_cache_turbo_beta_name, 0);
+    if (var == NULL) {
+        return NGX_ERROR;
+    }
+
+    var->get_handler = ngx_http_cache_turbo_beta_variable;
 
     return NGX_OK;
 }
@@ -1989,6 +2137,8 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->valid_raw = NGX_CONF_UNSET;
     conf->beta_raw = NGX_CONF_UNSET;
     conf->lock_ttl_raw = NGX_CONF_UNSET;
+    conf->autotune = NGX_CONF_UNSET;
+    conf->autotune_interval = NGX_CONF_UNSET;
     conf->max_size = NGX_CONF_UNSET_SIZE;
     conf->redis_enable = NGX_CONF_UNSET;
     conf->redis_timeout = NGX_CONF_UNSET_MSEC;
@@ -2054,6 +2204,11 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
                           ? band->lock_ttl : conf->lock_ttl_raw;
         conf->stale_mult = band->stale_mult;
     }
+
+    /* Live autotune (v4-3): off by default; default recompute cadence when on. */
+    ngx_conf_merge_value(conf->autotune, prev->autotune, 0);
+    ngx_conf_merge_sec_value(conf->autotune_interval, prev->autotune_interval,
+                             NGX_HTTP_CACHE_TURBO_AT_INTERVAL);
 
     if (conf->shm_zone == NULL) {
         conf->shm_zone = prev->shm_zone;

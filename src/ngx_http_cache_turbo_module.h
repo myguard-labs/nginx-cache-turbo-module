@@ -49,6 +49,36 @@
 
 
 /*
+ * Live autotune within preset bands (#10, v4-3). Ported from the wp-redis PHP
+ * implementation (eilandert/wp-redis/includes/class-swr-autotune.php) so the edge
+ * cache and the object cache tune the same way with the same constants. When
+ * cache_turbo_autotune is on, a throttled per-zone recompute reads the L1 shm
+ * stats over the last window (delta-snapshot), derives a target beta from the
+ * average origin-regen cost, and writes it to the zone (z->sh->autotuned_beta).
+ * The request path then uses that beta clamped to the location's preset band
+ * instead of the static preset/explicit beta. See history.md v4-3.
+ *
+ * All values are integer fixed-point to keep floats off the request path, exactly
+ * like swr.c: beta is ×1000, hit-rate is a percentage, the cost divisor and churn
+ * cap are plain integers. The PHP source uses 0.5/3.0/20/30ms/10ms/100/0.95/2.0.
+ */
+#define NGX_HTTP_CACHE_TURBO_BETA_MIN          500    /* 0.5 ×1000 (global floor) */
+#define NGX_HTTP_CACHE_TURBO_BETA_MAX          3000   /* 3.0 ×1000 (global ceil)  */
+#define NGX_HTTP_CACHE_TURBO_BETA_COST_DIVISOR 20     /* beta = cost_ms / 20      */
+
+#define NGX_HTTP_CACHE_TURBO_AT_COST_STRONG_MS 30     /* expensive-regen gate     */
+#define NGX_HTTP_CACHE_TURBO_AT_COST_MOD_MS    10     /* moderate-regen gate      */
+#define NGX_HTTP_CACHE_TURBO_AT_MISSES_FLOOR   100    /* min misses/window + the
+                                                       * min hits+misses to decide */
+#define NGX_HTTP_CACHE_TURBO_AT_HIT_RATE_CAP   95     /* hit-rate < 95% (percent) */
+#define NGX_HTTP_CACHE_TURBO_AT_CHURN_CAP      2      /* refreshes/misses > 2 → no */
+
+/* Default recompute cadence (seconds) when cache_turbo_autotune is on but no
+ * cache_turbo_autotune_interval is given. */
+#define NGX_HTTP_CACHE_TURBO_AT_INTERVAL       30
+
+
+/*
  * Vary-aware normalize suffix (v3-4). Bitmask in loc_conf.normalize_vary chosen
  * by `cache_turbo_normalize_vary encoding device`. ENCODING appends an
  * Accept-Encoding class (br/gzip/identity); DEVICE appends a User-Agent device
@@ -63,12 +93,18 @@
  * real arg value. */
 #define NGX_HTTP_CACHE_TURBO_VARY_SUFFIX_MAX  32
 
-/* A preset band: the default value for each preset-controlled knob. */
+/* A preset band: the default value for each preset-controlled knob, plus the
+ * [beta_min, beta_max] window the live autotune (v4-3) may move beta within for
+ * this preset. The autotune computes a cost-derived target clamped to the global
+ * [BETA_MIN, BETA_MAX]; the request path then re-clamps it to this band so e.g. a
+ * conservative location never autotunes as hot as an aggressive one. */
 typedef struct {
     time_t      valid;       /* fresh TTL (seconds)        */
     ngx_int_t   beta;        /* SWR aggressiveness, /1000  */
     time_t      lock_ttl;    /* single-flight lock window  */
     ngx_int_t   stale_mult;  /* stale window multiplier    */
+    ngx_int_t   beta_min;    /* autotune lower clamp /1000 */
+    ngx_int_t   beta_max;    /* autotune upper clamp /1000 */
 } ngx_http_cache_turbo_band_t;
 
 
@@ -111,6 +147,27 @@ typedef struct {
     ngx_atomic_t             stale_serves;
     ngx_atomic_t             refreshes;
     ngx_atomic_t             evictions;
+
+    /*
+     * Live autotune state (v4-3). cost_sum_ms / cost_count accumulate the
+     * wall-clock cost of every origin regeneration (request_time at the
+     * origin→cache store), so their ratio is the average miss-cost the autotune
+     * feeds on. autotuned_beta is the verdict the request path reads (×1000;
+     * 0 = no verdict yet → fall back to the preset/explicit beta). autotune_next
+     * throttles the recompute to once per interval per worker. The snap_* fields
+     * are the counter values at the previous recompute so each tick works on the
+     * delta over the last window (windowed, not lifetime-cumulative → it adapts
+     * down as well as up). All mutated under shpool->mutex in the recompute.
+     */
+    ngx_atomic_t             cost_sum_ms;   /* Σ origin-regen request_time (ms) */
+    ngx_atomic_t             cost_count;    /* number of origin regens measured */
+    ngx_atomic_t             autotuned_beta;/* live verdict ×1000, 0 = none     */
+    ngx_atomic_t             autotune_next; /* next recompute (epoch seconds)   */
+    ngx_atomic_uint_t        snap_hits;
+    ngx_atomic_uint_t        snap_misses;
+    ngx_atomic_uint_t        snap_refreshes;
+    ngx_atomic_uint_t        snap_cost_sum;
+    ngx_atomic_uint_t        snap_cost_count;
 } ngx_http_cache_turbo_shctx_t;
 
 
@@ -129,6 +186,12 @@ typedef struct {
     ngx_atomic_uint_t   stale_serves;
     ngx_atomic_uint_t   refreshes;
     ngx_atomic_uint_t   evictions;
+    /* Autotune introspection (v4-3): cost_ms = the measured average origin-regen
+     * cost (cost_sum_ms / cost_count, 0 when nothing measured); autotuned_beta =
+     * the live verdict ×1000 (0 = none). Rendered by the admin GET so a test (or
+     * an operator) can see the live tuning without an internal probe. */
+    ngx_atomic_uint_t   cost_ms;
+    ngx_atomic_uint_t   autotuned_beta;
 } ngx_http_cache_turbo_stats_t;
 
 
@@ -171,6 +234,14 @@ typedef struct {
     ngx_int_t                beta;        /* SWR aggressiveness /1000, eff  */
     time_t                   lock_ttl;    /* single-flight lock window, eff */
     ngx_int_t                stale_mult;  /* stale window multiplier, eff   */
+
+    /* Live autotune (v4-3). When on, the request path uses the zone's live
+     * autotuned beta (clamped to this location's preset band) in place of the
+     * static effective beta above; autotune_interval throttles the per-zone
+     * recompute. Off by default — beta then resolves purely from preset/explicit
+     * as before. The clamp band is ngx_http_cache_turbo_bands[preset]. */
+    ngx_flag_t               autotune;       /* cache_turbo_autotune on|off    */
+    time_t                   autotune_interval; /* recompute cadence (seconds) */
     size_t                   max_size;    /* max single response to cache   */
     ngx_flag_t               admin;       /* this location is an admin endpoint */
     ngx_shm_zone_t          *admin_zone;  /* zone the admin endpoint manages */
@@ -295,6 +366,32 @@ void ngx_http_cache_turbo_shm_stats(ngx_http_cache_turbo_zone_t *z,
 time_t    ngx_http_cache_turbo_stale_ttl(time_t fresh_ttl, ngx_int_t stale_mult);
 ngx_int_t ngx_http_cache_turbo_should_refresh(u_char *key_hash,
     time_t fresh_until, time_t stale_window, ngx_int_t beta_milli);
+
+
+/* ---- autotune.c (live autotune within preset bands, v4-3) ---- */
+
+/* Record one origin-regeneration cost sample (request_time in ms) into the zone's
+ * running cost accumulator. Called on the origin→cache store path only (never the
+ * cheap L2→L1 fill), so the average reflects real origin latency. Lock-free
+ * (two atomic adds); ms < 0 is clamped to 0. */
+void ngx_http_cache_turbo_autotune_record_cost(ngx_http_cache_turbo_zone_t *z,
+    ngx_msec_int_t ms);
+
+/* Throttled per-zone recompute. At most once per `interval` seconds per worker
+ * (guarded by z->sh->autotune_next): reads the L1 stats delta since the last
+ * tick, derives a target beta from the average miss-cost, applies the qualify /
+ * churn gates, and publishes the global-clamped verdict to z->sh->autotuned_beta
+ * (0 when the zone doesn't qualify or there is too little data). The request path
+ * re-clamps that verdict to the location's preset band. Cheap to call every
+ * request — the heavy path runs at most once per interval. */
+void ngx_http_cache_turbo_autotune_maybe(ngx_http_cache_turbo_zone_t *z,
+    time_t interval);
+
+/* Force an immediate recompute over the window since the last snapshot, ignoring
+ * the interval throttle (does not disturb the throttle schedule). Backs the admin
+ * "recompute now" command (`?autotune=1`) — an operator escape hatch, and what
+ * makes the autotune tests deterministic without waiting on the interval. */
+void ngx_http_cache_turbo_autotune_force(ngx_http_cache_turbo_zone_t *z);
 
 
 /* ---- redis.c (L2, v2b) ---- */
