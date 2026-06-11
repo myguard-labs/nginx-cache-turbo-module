@@ -1717,7 +1717,7 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
     ngx_str_t                         body;
     u_char                           *p;
     size_t                            len;
-    ngx_int_t                         rc;
+    ngx_int_t                         drc;
 
     clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
     if (!clcf->admin || clcf->admin_zone == NULL) {
@@ -1726,9 +1726,9 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
 
     /* Content handler must consume any request body (a purge/warm POST may carry
      * one) or the bytes desync a keepalive connection. */
-    rc = ngx_http_discard_request_body(r);
-    if (rc != NGX_OK) {
-        return rc;
+    drc = ngx_http_discard_request_body(r);
+    if (drc != NGX_OK) {
+        return drc;
     }
 
     z = clcf->admin_zone->data;

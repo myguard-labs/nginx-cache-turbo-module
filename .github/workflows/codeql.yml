@@ -37,7 +37,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential curl libpcre2-dev zlib1g-dev
+          sudo apt-get install -y build-essential curl libpcre2-dev libssl-dev zlib1g-dev
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4
