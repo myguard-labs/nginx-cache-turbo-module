@@ -159,6 +159,13 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       offsetof(ngx_http_cache_turbo_loc_conf_t, max_size),
       NULL },
 
+    { ngx_string("cache_turbo_suppress_native"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_turbo_loc_conf_t, suppress_native),
+      NULL },
+
     { ngx_string("cache_turbo_lock_ttl"),
       NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
       ngx_conf_set_sec_slot,
@@ -650,6 +657,13 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
     if (ngx_http_cache_turbo_build_key(r, clcf, ctx) != NGX_OK) {
         return NGX_ERROR;
     }
+
+    /* Q1: cache-turbo is engaged for this request (enabled, cacheable method,
+     * main request). The $cache_turbo_active variable reads this (gated by
+     * cache_turbo_suppress_native) so a stacked native proxy_cache can defer.
+     * Set before the bypass check on purpose: a bypassing request still stores
+     * the fresh response, so native should defer to us on that path too. */
+    ctx->ct_active = 1;
 
     z = clcf->shm_zone->data;
     hash = ngx_crc32_short(ctx->key_hash, 32);
@@ -3760,6 +3774,18 @@ static ngx_str_t  ngx_http_cache_turbo_beta_name =
     ngx_string("cache_turbo_beta");
 
 
+/*
+ * $cache_turbo_active (Q1) — "1" when cache-turbo is engaged for this request
+ * (enabled, cacheable method, main request) AND cache_turbo_suppress_native is
+ * on for the location; "0" otherwise. Wire it into a stacked native cache as
+ * `proxy_no_cache $cache_turbo_active; proxy_cache_bypass $cache_turbo_active;`
+ * so proxy_cache/fastcgi_cache defers to cache-turbo instead of double-caching.
+ * With suppress_native off (default) it is always "0", so the wiring is a safe
+ * no-op until the operator opts in. Not cacheable — it is per-request state. */
+static ngx_str_t  ngx_http_cache_turbo_active_name =
+    ngx_string("cache_turbo_active");
+
+
 static ngx_int_t
 ngx_http_cache_turbo_beta_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data)
@@ -3795,6 +3821,31 @@ ngx_http_cache_turbo_beta_variable(ngx_http_request_t *r,
 
 
 static ngx_int_t
+ngx_http_cache_turbo_active_variable(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data)
+{
+    ngx_http_cache_turbo_loc_conf_t  *clcf;
+    ngx_http_cache_turbo_ctx_t       *ctx;
+    ngx_uint_t                        active = 0;
+
+    clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
+    ctx = ngx_http_get_module_ctx(r, ngx_http_cache_turbo_module);
+
+    if (clcf->enable && clcf->suppress_native && ctx && ctx->ct_active) {
+        active = 1;
+    }
+
+    v->len = 1;
+    v->data = (u_char *) (active ? "1" : "0");
+    v->valid = 1;
+    v->no_cacheable = 1;
+    v->not_found = 0;
+
+    return NGX_OK;
+}
+
+
+static ngx_int_t
 ngx_http_cache_turbo_add_variables(ngx_conf_t *cf)
 {
     ngx_http_variable_t  *var;
@@ -3813,6 +3864,13 @@ ngx_http_cache_turbo_add_variables(ngx_conf_t *cf)
     }
 
     var->get_handler = ngx_http_cache_turbo_beta_variable;
+
+    var = ngx_http_add_variable(cf, &ngx_http_cache_turbo_active_name, 0);
+    if (var == NULL) {
+        return NGX_ERROR;
+    }
+
+    var->get_handler = ngx_http_cache_turbo_active_variable;
 
     return NGX_OK;
 }
@@ -3907,6 +3965,7 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->lock_timeout = NGX_CONF_UNSET_MSEC;
     conf->min_uses = NGX_CONF_UNSET;
     conf->max_size = NGX_CONF_UNSET_SIZE;
+    conf->suppress_native = NGX_CONF_UNSET;
     conf->redis_enable = NGX_CONF_UNSET;
     conf->memcached = NGX_CONF_UNSET;
     conf->redis_timeout = NGX_CONF_UNSET_MSEC;
@@ -3934,6 +3993,7 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 
     ngx_conf_merge_value(conf->enable, prev->enable, 0);
     ngx_conf_merge_size_value(conf->max_size, prev->max_size, 1024 * 1024);
+    ngx_conf_merge_value(conf->suppress_native, prev->suppress_native, 0);
 
     /*
      * Presets (v3-2). Two-stage so a location's preset can still set the band

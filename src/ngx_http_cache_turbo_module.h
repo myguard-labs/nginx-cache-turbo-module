@@ -307,6 +307,15 @@ typedef struct {
      * default so existing fixed-TTL configs are unchanged. */
     ngx_flag_t               honor_cc;
     size_t                   max_size;    /* max single response to cache   */
+
+    /* Suppress native cache when stacked (Q1). When on, the $cache_turbo_active
+     * variable reads "1" for a request cache-turbo is handling (enabled,
+     * cacheable method, not bypassed/no_store), else "0". The operator wires
+     * `proxy_no_cache $cache_turbo_active; proxy_cache_bypass $cache_turbo_active;`
+     * so a stacked native proxy_cache/fastcgi_cache defers to us instead of
+     * double-caching. Off by default => the variable is always "0", so the
+     * wiring can stay in place permanently and be toggled by this one knob. */
+    ngx_flag_t               suppress_native;
     ngx_flag_t               admin;       /* this location is an admin endpoint */
     ngx_shm_zone_t          *admin_zone;  /* zone the admin endpoint manages */
 
@@ -440,6 +449,10 @@ typedef struct {
 
 /* per-request context */
 typedef struct {
+    unsigned                 ct_active:1; /* Q1: cache-turbo engaged for this
+                                           * request (enabled, cacheable method,
+                                           * not bypassed/no_store) -> the
+                                           * $cache_turbo_active var reads 1     */
     unsigned                 captured:1;  /* response captured for store    */
     unsigned                 served:1;    /* we served from cache           */
     unsigned                 stale_hit:1; /* served stale (for X-Cache)      */

@@ -628,6 +628,28 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # Q1 suppress-native: $cache_turbo_active reads 1 when engaged AND
+        # cache_turbo_suppress_native is on. Echo it into a header so a test can
+        # observe the value an operator would wire into proxy_no_cache.
+        location /sup/ {{
+            cache_turbo                 main;
+            cache_turbo_key             $uri;
+            cache_turbo_valid           30s;
+            cache_turbo_suppress_native on;
+            add_header X-CT-Active      $cache_turbo_active always;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # suppress off (default): the variable is always 0, so the wiring is a
+        # safe no-op until opted in.
+        location /nosup/ {{
+            cache_turbo            main;
+            cache_turbo_key        $uri;
+            cache_turbo_valid      30s;
+            add_header X-CT-Active $cache_turbo_active always;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # tiny zone to force LRU eviction (R6)
         location /e/ {{
             cache_turbo          tiny;
@@ -1173,6 +1195,28 @@ def test_header_fidelity(ng: Nginx) -> None:
         f"content-type lost: {h.get('content-type')}"
     assert h.get("x-backend") == "origin-42", \
         f"custom header lost: {h.get('x-backend')}"
+
+
+def test_suppress_native_variable(ng: Nginx) -> None:
+    """Q1: $cache_turbo_active reads 1 on an engaged request when
+    cache_turbo_suppress_native is on (so a stacked native cache can defer via
+    proxy_no_cache), and 0 when the directive is off (default), even though
+    cache-turbo is still caching the request."""
+    # suppress on -> engaged request reports active=1 (miss and subsequent hit)
+    _, _, h1 = fetch(ng.port, "/sup/x")
+    assert h1.get("x-ct-active") == "1", \
+        f"suppress on: expected X-CT-Active=1, got {h1.get('x-ct-active')}"
+    _, _, h1b = fetch(ng.port, "/sup/x")
+    assert h1b.get("x-cache") == "HIT", "second /sup/ read should HIT"
+    assert h1b.get("x-ct-active") == "1", \
+        f"suppress on (hit): expected 1, got {h1b.get('x-ct-active')}"
+    # suppress off (default) -> variable is 0 although the entry is still cached
+    _, _, h2 = fetch(ng.port, "/nosup/x")
+    assert h2.get("x-ct-active") == "0", \
+        f"suppress off: expected X-CT-Active=0, got {h2.get('x-ct-active')}"
+    _, _, h2b = fetch(ng.port, "/nosup/x")
+    assert h2b.get("x-cache") == "HIT", \
+        "second /nosup/ read should HIT (still caching, var just reads 0)"
 
 
 def test_max_size_not_cached(ng: Nginx) -> None:
@@ -2940,6 +2984,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_miss_then_hit(ng)
     test_header_fidelity(ng)
     test_max_size_not_cached(ng)
+    test_suppress_native_variable(ng)
     test_no_cache_set_cookie(ng)
     test_no_cache_cc_private(ng)
     test_no_cache_cc_nostore(ng)
