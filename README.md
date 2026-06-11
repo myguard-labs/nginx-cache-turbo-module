@@ -198,10 +198,29 @@ when the client's copy is still current; `If-None-Match` wins when both are
 present (RFC 7232). Anything else serves the full cached body. This is automatic
 — there is no directive to set.
 
-> ⚠️ The cache keys on the **request**, not on the response's `Vary`. If your
-> page differs by gzip-vs-brotli or mobile-vs-desktop, split the key yourself
-> with `cache_turbo_normalize_vary` (below) — otherwise the first variant stored
-> wins for everyone.
+### Auto-Vary (read the response `Vary`)
+
+Turn on `cache_turbo_auto_vary on` and the module reads the response's own
+`Vary` header and splits the cache by the named **request** header automatically
+— no need to pre-declare the axes. It honours a safe whitelist:
+`Accept-Encoding` (bucketed br/gzip/identity/zstd), `User-Agent` (mobile/desktop
+class), `Accept-Language` and `Origin` (raw value). A response with `Vary: *`, or
+one that varies on `Cookie` or `Authorization`, is treated as **uncacheable**
+(those vary per-user — caching them would poison or leak across users); any other
+named header is ignored (still cached, just not split on it).
+
+Keying is two-level and node-local: the first time a URL's response is seen to
+vary, the module records a tiny *vary marker* in L1 and stores the body under a
+secondary *variant* key; later requests read the marker and resolve straight to
+their variant. The base slot stays empty for varied URLs, so a node that hasn't
+learned the `Vary` yet simply misses to origin — it never serves the wrong
+variant. Off by default.
+
+> ⚠️ With auto-Vary **off**, the cache keys on the **request**, not on the
+> response's `Vary`. If your page differs by gzip-vs-brotli or
+> mobile-vs-desktop, either turn on `cache_turbo_auto_vary` or split the key
+> yourself with `cache_turbo_normalize_vary` (below) — otherwise the first
+> variant stored wins for everyone.
 
 ## The cache key
 
@@ -334,6 +353,7 @@ $ curl -X POST 'localhost/_cache?url=/,/blog/,/about' # pre-warm cold pages
 | `cache_turbo_normalize_strip NAME...` | `server`, `location` | — | Extra query args to drop from `$cache_turbo_normalized_args` (trailing `*` = prefix), on top of the built-ins. |
 | `cache_turbo_normalize_strip_all on` | `server`, `location` | `off` | Drop **every** query arg from `$cache_turbo_normalized_args`. |
 | `cache_turbo_normalize_vary TOKEN...` | `server`, `location` | off | Append a variant bucket to `$cache_turbo_normalized_args`: `encoding` (br/gzip/identity) and/or `device` (mobile/desktop). |
+| `cache_turbo_auto_vary on` | `server`, `location` | `off` | Read the response's own `Vary` header and split the cache by the named request header automatically. Safe whitelist: `Accept-Encoding`, `User-Agent` (device class), `Accept-Language`, `Origin`. `Vary: *`/`Cookie`/`Authorization` ⇒ uncacheable; other names ignored. Two-level, node-local keying. See [Auto-Vary](#auto-vary-read-the-response-vary). |
 
 ### Admin endpoint verbs
 

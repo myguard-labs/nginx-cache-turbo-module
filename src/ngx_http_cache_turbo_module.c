@@ -74,6 +74,18 @@ static char *ngx_http_cache_turbo_normalize_strip(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 static char *ngx_http_cache_turbo_normalize_vary(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
+/* auto-Vary (v11 other half) — defined near the v3-4 vary helpers but called
+ * from the access/header/body paths above them, so forward-declared here. */
+static void ngx_http_cache_turbo_vary_resolve(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_zone_t *z,
+    ngx_http_cache_turbo_ctx_t *ctx, uint32_t *hash);
+static void ngx_http_cache_turbo_variant_hash(ngx_http_request_t *r,
+    ngx_str_t *base, ngx_int_t bits, u_char out[32]);
+static void ngx_http_cache_turbo_marker_hash(ngx_str_t *base, u_char out[32]);
+static void ngx_http_cache_turbo_marker_store(ngx_http_cache_turbo_loc_conf_t *clcf,
+    ngx_http_cache_turbo_zone_t *z, ngx_str_t *base, ngx_int_t bits, time_t ttl);
+static void ngx_http_cache_turbo_classify_vary(ngx_http_request_t *r,
+    ngx_int_t *bits_out, ngx_uint_t *nocache_out);
 static ngx_int_t ngx_http_cache_turbo_init(ngx_conf_t *cf);
 
 
@@ -178,6 +190,13 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       ngx_conf_set_flag_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_cache_turbo_loc_conf_t, honor_cc),
+      NULL },
+
+    { ngx_string("cache_turbo_auto_vary"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_turbo_loc_conf_t, auto_vary),
       NULL },
 
     { ngx_string("cache_turbo_purge"),
@@ -618,6 +637,15 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
 
     z = clcf->shm_zone->data;
     hash = ngx_crc32_short(ctx->key_hash, 32);
+
+    /* auto-Vary (v11 other half): probe the L1 vary marker for this base key and,
+     * if a previous store told us this URL varies, recompute key_hash to the
+     * variant (folding the named request headers) BEFORE the lookup below, so the
+     * whole single-flight/serve flow runs unchanged on the variant key. No marker
+     * (or auto_vary off) => key_hash stays the base key. */
+    if (clcf->auto_vary) {
+        ngx_http_cache_turbo_vary_resolve(r, clcf, z, ctx, &hash);
+    }
 
     /* Bypass (v9): when a cache_turbo_bypass predicate trips, skip the cache
      * lookup entirely and go to the origin — but still let the filters store the
@@ -1499,12 +1527,24 @@ ngx_http_cache_turbo_header_filter(ngx_http_request_t *r)
 
     clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
 
+    /* auto-Vary (v11 other half): classify the response Vary header once. bits =
+     * the safe-axis bitmask the body filter folds into the variant key + marker;
+     * vary_nocache vetoes caching when the response varies on something the
+     * whitelist refuses (*, Cookie, Authorization). Done before the capture gate
+     * so vary_nocache can suppress capture (and the cold-stub clear below fires). */
+    if (clcf->auto_vary) {
+        ngx_uint_t  nocache = 0;
+        ngx_http_cache_turbo_classify_vary(r, &ctx->vary_bits, &nocache);
+        ctx->vary_nocache = nocache ? 1 : 0;
+    }
+
     /* Only capture cacheable responses. 200 always, plus any status named by a
      * cache_turbo_valid <code> rule (redirects / negative caching, v6). Never a
      * HEAD — its empty body must not overwrite the GET entry. Normally the main
      * request only; a warm subrequest (ctx->warm) is the deliberate exception. */
     if (clcf->enable && (r == r->main || ctx->warm)
         && !(r->method & NGX_HTTP_HEAD)
+        && !ctx->vary_nocache
         && ngx_http_cache_turbo_status_ttl(clcf, r->headers_out.status) >= 0
         && ngx_http_cache_turbo_response_cacheable(r)
         && (clcf->no_store == NULL
@@ -1677,6 +1717,7 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
         blob = ngx_pnalloc(r->pool, blob_len);
         if (blob != NULL) {
             ngx_http_cache_turbo_blob_hdr_t  bhw;
+            u_char                           store_key[32];
 
             /* blob is byte-aligned; build the header in an aligned local and
              * memcpy it in rather than writing through a misaligned cast. */
@@ -1734,15 +1775,48 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
             }
 
             z = clcf->shm_zone->data;
-            hash = ngx_crc32_short(ctx->key_hash, 32);
 
-            (void) clcf->l1->store(z, ctx->key_hash, hash,
+            /* auto-Vary (v11 other half): when the response varies on a safe
+             * axis, store the object under the SECONDARY variant key (folding the
+             * named request headers) instead of the base key, so distinct
+             * representations never collide. store_key == key_hash otherwise (no
+             * auto_vary, no/whitelist-only Vary, or key_hash was already the
+             * variant via the request-time marker). */
+            ngx_memcpy(store_key, ctx->key_hash, 32);
+            if (clcf->auto_vary && ctx->vary_bits > 0) {
+                ngx_http_cache_turbo_variant_hash(r, &ctx->cache_key,
+                                                  ctx->vary_bits, store_key);
+            }
+            hash = ngx_crc32_short(store_key, 32);
+
+            /* If we relocated the key away from the base (cold-miss winner that
+             * only learned the Vary now), the cold-miss stub the access handler
+             * left under the base key would never be overwritten by this store →
+             * clear it so waiters on the base key stop blocking. unstub only drops
+             * a still-stub node, so a real base entry (if any) is untouched. */
+            if (ctx->cold_winner && !ctx->cold_stored
+                && ngx_memcmp(store_key, ctx->key_hash, 32) != 0)
+            {
+                ngx_http_cache_turbo_shm_unstub(z, ctx->key_hash,
+                                   ngx_crc32_short(ctx->key_hash, 32));
+            }
+
+            (void) clcf->l1->store(z, store_key, hash,
                        blob, blob_len, r->headers_out.status, ttl,
                        clcf->stale_mult);
 
-            /* v10: store overwrote any cold-miss stub into a real entry, so the
-             * cleanup must not remove it. */
+            /* v10: store overwrote any cold-miss stub into a real entry (or we
+             * cleared the relocated base stub above), so the cleanup must not
+             * remove it. */
             ctx->cold_stored = 1;
+
+            /* auto-Vary: persist the active-axis bitmask as an L1 marker under
+             * the base key so the next request resolves straight to this variant
+             * (node-local; self-heals if evicted). */
+            if (clcf->auto_vary && ctx->vary_bits > 0) {
+                ngx_http_cache_turbo_marker_store(clcf, z, &ctx->cache_key,
+                                                  ctx->vary_bits, ttl);
+            }
 
             ngx_log_debug4(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                            "cache_turbo: STORE \"%V\" key=%ui len=%uz ttl=%T",
@@ -1767,7 +1841,7 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
             /* L2 write-through (async, fire-and-forget). Copies the blob into
              * its own pool, so it is safe even though `blob` lives in r->pool. */
             if (clcf->backend) {
-                clcf->backend->set(r, clcf, ctx->key_hash,
+                clcf->backend->set(r, clcf, store_key,
                                    blob, blob_len, ttl);
             }
 
@@ -1802,7 +1876,7 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
                         }
                         if (s > tok) {
                             clcf->backend->tag_add(clcf,
-                                ctx->key_hash, tok, (size_t) (s - tok),
+                                store_key, tok, (size_t) (s - tok),
                                 stale_ttl);
                         }
                     }
@@ -3138,6 +3212,269 @@ ngx_http_cache_turbo_var_set(ngx_http_request_t *r,
 }
 
 
+/* --- auto-Vary (v11 other half) helpers --- */
+
+/* Find a request header by (case-insensitive) name; returns its value or an
+ * empty string when absent. Used for the raw-valued auto-Vary axes (Accept-
+ * Language, Origin) that core does not expose as a typed field. */
+static ngx_str_t
+ngx_http_cache_turbo_req_header(ngx_http_request_t *r, const char *name,
+    size_t nlen)
+{
+    ngx_list_part_t  *part = &r->headers_in.headers.part;
+    ngx_table_elt_t  *h = part->elts;
+    ngx_str_t         out = ngx_null_string;
+    ngx_uint_t        i;
+
+    for (i = 0; /* void */ ; i++) {
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            h = part->elts;
+            i = 0;
+        }
+        if (h[i].hash == 0 || h[i].key.len != nlen) {
+            continue;
+        }
+        if (ngx_strncasecmp(h[i].key.data, (u_char *) name, nlen) == 0) {
+            return h[i].value;
+        }
+    }
+
+    return out;
+}
+
+
+/* Derive the secondary VARIANT key from the base key material plus the request
+ * values of the named (whitelisted) Vary axes. Axes are folded in a FIXED order
+ * (ae, dev, lang, origin) regardless of the response Vary token order, so two
+ * nodes / two requests with the same axis values compute the same key. Encoding
+ * and device are bucketed to a class (reusing the v3-4 helpers); language and
+ * origin fold their raw values. The 0x1F (US) delimiter can never appear in a
+ * URI or these header values, so the suffix cannot collide with the base
+ * material. md5 fills the low 16 bytes; the high 16 are zeroed first (the slot
+ * layout matches build_key, so a base and a variant only ever differ by the
+ * folded bytes). */
+static void
+ngx_http_cache_turbo_variant_hash(ngx_http_request_t *r, ngx_str_t *base,
+    ngx_int_t bits, u_char out[32])
+{
+    ngx_md5_t          md5;
+    const char        *cls;
+    ngx_str_t          v;
+    static const u_char us = 0x1F;
+
+    ngx_memzero(out, 32);
+    ngx_md5_init(&md5);
+    ngx_md5_update(&md5, base->data, base->len);
+
+    if (bits & NGX_HTTP_CACHE_TURBO_VARY_ENCODING) {
+        cls = ngx_http_cache_turbo_ae_class(r);
+        ngx_md5_update(&md5, &us, 1);
+        ngx_md5_update(&md5, "ae=", 3);
+        ngx_md5_update(&md5, cls, ngx_strlen(cls));
+    }
+    if (bits & NGX_HTTP_CACHE_TURBO_VARY_DEVICE) {
+        cls = ngx_http_cache_turbo_device_class(r);
+        ngx_md5_update(&md5, &us, 1);
+        ngx_md5_update(&md5, "dev=", 4);
+        ngx_md5_update(&md5, cls, ngx_strlen(cls));
+    }
+    if (bits & NGX_HTTP_CACHE_TURBO_VARY_LANG) {
+        v = ngx_http_cache_turbo_req_header(r, "Accept-Language",
+                                            sizeof("Accept-Language") - 1);
+        ngx_md5_update(&md5, &us, 1);
+        ngx_md5_update(&md5, "lang=", 5);
+        ngx_md5_update(&md5, v.data, v.len);
+    }
+    if (bits & NGX_HTTP_CACHE_TURBO_VARY_ORIGIN) {
+        v = ngx_http_cache_turbo_req_header(r, "Origin", sizeof("Origin") - 1);
+        ngx_md5_update(&md5, &us, 1);
+        ngx_md5_update(&md5, "org=", 4);
+        ngx_md5_update(&md5, v.data, v.len);
+    }
+
+    ngx_md5_final(out, &md5);
+}
+
+
+/* The dedicated L1 slot key for the vary marker of a base key. Distinct from the
+ * object key (it folds a "varymark" tag) so the marker never collides with an
+ * object slot or a cold-miss stub. */
+static void
+ngx_http_cache_turbo_marker_hash(ngx_str_t *base, u_char out[32])
+{
+    ngx_md5_t          md5;
+    static const u_char us = 0x1F;
+
+    ngx_memzero(out, 32);
+    ngx_md5_init(&md5);
+    ngx_md5_update(&md5, base->data, base->len);
+    ngx_md5_update(&md5, &us, 1);
+    ngx_md5_update(&md5, "varymark", sizeof("varymark") - 1);
+    ngx_md5_final(out, &md5);
+}
+
+
+/* Store/refresh the L1 vary marker for a base key: a one-byte body carrying the
+ * active-axis bitmask, wrapped in the standard blob header so a later read can
+ * validate the magic before trusting the byte. L1-only and node-local by design
+ * (see the loc_conf auto_vary comment); shm store copies the stack blob in. */
+static void
+ngx_http_cache_turbo_marker_store(ngx_http_cache_turbo_loc_conf_t *clcf,
+    ngx_http_cache_turbo_zone_t *z, ngx_str_t *base, ngx_int_t bits, time_t ttl)
+{
+    u_char                           mk[32];
+    u_char                           blob[sizeof(ngx_http_cache_turbo_blob_hdr_t)
+                                          + 1];
+    ngx_http_cache_turbo_blob_hdr_t  bh;
+
+    bh.magic = NGX_HTTP_CACHE_TURBO_BLOB_MAGIC;
+    bh.nheaders = 0;
+    bh.headers_len = 0;
+    bh.body_len = 1;
+    bh.status = 0;
+    ngx_memcpy(blob, &bh, sizeof(bh));
+    blob[sizeof(bh)] = (u_char) (bits & 0xFF);
+
+    ngx_http_cache_turbo_marker_hash(base, mk);
+
+    (void) clcf->l1->store(z, mk, ngx_crc32_short(mk, 32),
+               blob, sizeof(blob), 0, ttl, clcf->stale_mult);
+}
+
+
+/* Probe the L1 vary marker for the request's base key. If a fresh marker exists,
+ * recompute ctx->key_hash to the variant key (and the caller's crc32) so the
+ * whole lookup/single-flight/serve flow below runs on the variant. No marker =>
+ * key_hash unchanged (base key) => a miss to origin, never a wrong-variant
+ * serve. L1-only: cross-node first-hit re-fetches once per node until its marker
+ * warms (the safe, non-invasive trade documented on loc_conf.auto_vary). */
+static void
+ngx_http_cache_turbo_vary_resolve(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_zone_t *z,
+    ngx_http_cache_turbo_ctx_t *ctx, uint32_t *hash)
+{
+    u_char                        mk[32];
+    ngx_int_t                     bits = 0;
+    ngx_http_cache_turbo_node_t  *m;
+
+    ngx_http_cache_turbo_marker_hash(&ctx->cache_key, mk);
+
+    ngx_shmtx_lock(&z->shpool->mutex);
+    m = clcf->l1->lookup(z, mk, ngx_crc32_short(mk, 32));
+    if (m != NULL && m->data != NULL
+        && m->len >= sizeof(ngx_http_cache_turbo_blob_hdr_t) + 1
+        && ngx_time() < m->fresh_until)
+    {
+        bits = m->data[sizeof(ngx_http_cache_turbo_blob_hdr_t)];
+    }
+    ngx_shmtx_unlock(&z->shpool->mutex);
+
+    if (bits > 0) {
+        ngx_http_cache_turbo_variant_hash(r, &ctx->cache_key, bits,
+                                          ctx->key_hash);
+        *hash = ngx_crc32_short(ctx->key_hash, 32);
+        ctx->varied = 1;
+        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "cache_turbo: auto-Vary marker hit \"%V\" bits=0x%xi "
+                       "-> variant key", &r->uri, bits);
+    }
+}
+
+
+/* Classify the response Vary header into a safe-axis bitmask (what we may key
+ * on) and a nocache veto. Only the whitelist (Accept-Encoding, User-Agent,
+ * Accept-Language, Origin) contributes to the key; Vary: * or a Vary naming
+ * Cookie / Authorization forces the response uncacheable (cross-user
+ * poisoning/leak guard); any other named header is ignored (the response is
+ * still cached, just not split on that header). Walks every Vary header instance
+ * and tokenises on comma/whitespace. */
+static void
+ngx_http_cache_turbo_classify_vary(ngx_http_request_t *r,
+    ngx_int_t *bits_out, ngx_uint_t *nocache_out)
+{
+    ngx_list_part_t  *part = &r->headers_out.headers.part;
+    ngx_table_elt_t  *h = part->elts;
+    ngx_int_t         bits = 0;
+    ngx_uint_t        nocache = 0;
+    ngx_uint_t        i;
+
+    for (i = 0; /* void */ ; i++) {
+        u_char  *s, *e, *tok;
+
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            h = part->elts;
+            i = 0;
+        }
+        if (h[i].hash == 0
+            || h[i].key.len != sizeof("Vary") - 1
+            || ngx_strncasecmp(h[i].key.data, (u_char *) "Vary",
+                               sizeof("Vary") - 1) != 0)
+        {
+            continue;
+        }
+
+        s = h[i].value.data;
+        e = s + h[i].value.len;
+
+        while (s < e) {
+            size_t  tl;
+
+            while (s < e && (*s == ' ' || *s == '\t' || *s == ',')) {
+                s++;
+            }
+            tok = s;
+            while (s < e && *s != ' ' && *s != '\t' && *s != ',') {
+                s++;
+            }
+            tl = (size_t) (s - tok);
+            if (tl == 0) {
+                continue;
+            }
+
+            if (tl == 1 && tok[0] == '*') {
+                nocache = 1;
+            } else if (tl == sizeof("Cookie") - 1
+                && ngx_strncasecmp(tok, (u_char *) "Cookie", tl) == 0) {
+                nocache = 1;
+            } else if (tl == sizeof("Authorization") - 1
+                && ngx_strncasecmp(tok, (u_char *) "Authorization", tl) == 0) {
+                nocache = 1;
+            } else if (tl == sizeof("Accept-Encoding") - 1
+                && ngx_strncasecmp(tok, (u_char *) "Accept-Encoding", tl) == 0) {
+                bits |= NGX_HTTP_CACHE_TURBO_VARY_ENCODING;
+            } else if (tl == sizeof("User-Agent") - 1
+                && ngx_strncasecmp(tok, (u_char *) "User-Agent", tl) == 0) {
+                bits |= NGX_HTTP_CACHE_TURBO_VARY_DEVICE;
+            } else if (tl == sizeof("Accept-Language") - 1
+                && ngx_strncasecmp(tok, (u_char *) "Accept-Language", tl) == 0) {
+                bits |= NGX_HTTP_CACHE_TURBO_VARY_LANG;
+            } else if (tl == sizeof("Origin") - 1
+                && ngx_strncasecmp(tok, (u_char *) "Origin", tl) == 0) {
+                bits |= NGX_HTTP_CACHE_TURBO_VARY_ORIGIN;
+            }
+            /* any other token: ignored (still cacheable, not split on it) */
+        }
+    }
+
+    /* A refused axis wins over any safe axis: don't cache a response that also
+     * varies on Cookie, Authorization or "*", even if it also names a safe one. */
+    if (nocache) {
+        bits = 0;
+    }
+
+    *bits_out = bits;
+    *nocache_out = nocache;
+}
+
+
 /*
  * $cache_turbo_normalized_args: rebuild r->args dropping denylisted params and
  * sorting what remains, prefixed with '?', then append the Vary-aware suffix
@@ -3404,6 +3741,7 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->autotune = NGX_CONF_UNSET;
     conf->autotune_interval = NGX_CONF_UNSET;
     conf->honor_cc = NGX_CONF_UNSET;
+    conf->auto_vary = NGX_CONF_UNSET;
     conf->purge = NGX_CONF_UNSET;
     conf->background_update = NGX_CONF_UNSET;
     conf->lock = NGX_CONF_UNSET;
@@ -3492,6 +3830,7 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 
     /* Honor upstream Cache-Control/Expires (v7): off by default. */
     ngx_conf_merge_value(conf->honor_cc, prev->honor_cc, 0);
+    ngx_conf_merge_value(conf->auto_vary, prev->auto_vary, 0);
 
     /* PURGE method (v14): off by default. */
     ngx_conf_merge_value(conf->purge, prev->purge, 0);

@@ -86,6 +86,13 @@
  */
 #define NGX_HTTP_CACHE_TURBO_VARY_ENCODING  0x1
 #define NGX_HTTP_CACHE_TURBO_VARY_DEVICE    0x2
+/* auto-Vary (v11 other half): the same bits also drive the automatic variant
+ * key derived from a response `Vary:` header (cache_turbo_auto_vary). LANG keys
+ * on the raw Accept-Language value; ORIGIN on the raw Origin value. Only this
+ * safe whitelist is honoured — Vary: * / Cookie / Authorization make the
+ * response uncacheable instead (cross-user poisoning/leak guard). */
+#define NGX_HTTP_CACHE_TURBO_VARY_LANG      0x4
+#define NGX_HTTP_CACHE_TURBO_VARY_ORIGIN    0x8
 
 /* Worst-case suffix bytes: "\x1Fae=identity" (12) + "\x1Fdev=desktop" (12). The
  * delimiter is the raw 0x1F (US) byte, which a query string can never contain
@@ -373,6 +380,19 @@ typedef struct {
      * v3-1 keys are unchanged unless cache_turbo_normalize_vary opts in. */
     ngx_int_t                normalize_vary;
 
+    /* auto-Vary (v11 other half). When on, the response `Vary:` header is read
+     * at store time and the named request headers (safe whitelist only:
+     * Accept-Encoding, User-Agent->device, Accept-Language, Origin) are folded
+     * into a SECONDARY variant key so distinct representations get distinct
+     * slots automatically — no operator config of the axes. Two-level keying is
+     * node-local: a tiny "vary marker" (the active axis bitmask) is stored in L1
+     * under a dedicated marker key; a request probes the marker (L1 only) and,
+     * if present, recomputes its key to the variant before the normal lookup.
+     * The base slot stays empty for varied URLs, so a missing marker just misses
+     * to origin (never serves the wrong variant). Vary: * / Cookie /
+     * Authorization make the response uncacheable. Off by default. */
+    ngx_flag_t               auto_vary;
+
     /* Backend vtables (v4-1). l1 = the local store (shm); it is a stateless
      * dispatch table (the zone is passed as an argument), so it is set
      * unconditionally and is never NULL. backend = the remote L2 driver (redis),
@@ -423,6 +443,15 @@ typedef struct {
     size_t                   body_len;
     ngx_str_t                cache_key;
     u_char                   key_hash[32];
+    /* auto-Vary (v11 other half). varied = the request was re-keyed to a variant
+     * via an L1 vary marker (key_hash already holds the variant). vary_bits = the
+     * safe-axis bitmask classified from the response Vary header in the header
+     * filter (>0 => store under a variant key + write/refresh the marker; the
+     * body filter reads it). vary_nocache = the response carried a Vary the
+     * whitelist refuses (*, Cookie, Authorization) => do not capture/store. */
+    unsigned                 varied:1;
+    unsigned                 vary_nocache:1;
+    ngx_int_t                vary_bits;
 } ngx_http_cache_turbo_ctx_t;
 
 

@@ -199,6 +199,25 @@ class Origin:
                     self.send_header("ETag", '"v11etag"')
                     self.send_header("Last-Modified",
                                      "Wed, 21 Oct 2015 07:28:00 GMT")
+                # auto-Vary (v11 other half): emit a response Vary driven by a
+                # query marker so a test can prove the module splits (or refuses)
+                # by the named request header. The body is the global gen-N, so a
+                # new origin hit == a distinct body == a distinct variant slot.
+                if "v=ae" in self.path:
+                    self.send_header("Vary", "Accept-Encoding")
+                if "v=ua" in self.path:
+                    self.send_header("Vary", "User-Agent")
+                if "v=al" in self.path:
+                    self.send_header("Vary", "Accept-Language")
+                if "v=or" in self.path:
+                    self.send_header("Vary", "Origin")
+                if "v=star" in self.path:
+                    self.send_header("Vary", "*")
+                if "v=ck" in self.path:
+                    self.send_header("Vary", "Cookie")
+                if "v=mix" in self.path:
+                    # safe axis + refused axis: the refused one must win (no cache)
+                    self.send_header("Vary", "Accept-Encoding, Cookie")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 try:
@@ -602,6 +621,26 @@ http {{
             cache_turbo_key      $uri$cache_turbo_normalized_args;
             cache_turbo_valid    30s;
             cache_turbo_normalize_vary encoding device;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # auto-Vary (v11 other half): the module reads the response Vary header
+        # itself and splits on the named request header (safe whitelist only).
+        # cache_turbo_key includes the query so each test's marker isolates.
+        location /av/ {{
+            cache_turbo          main;
+            cache_turbo_key      $request_uri;
+            cache_turbo_valid    30s;
+            cache_turbo_auto_vary on;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # auto-Vary OFF (default): the same response Vary header is ignored, so
+        # two encodings collapse onto one slot (back-compat proof).
+        location /avoff/ {{
+            cache_turbo          main;
+            cache_turbo_key      $request_uri;
+            cache_turbo_valid    30s;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
@@ -2242,6 +2281,116 @@ def test_invalid_normalize_vary_token(ng: Nginx) -> None:
         f"missing/odd diagnostic for bad vary token:\n{r.stdout}"
 
 
+def test_auto_vary_encoding(ng: Nginx, origin: Origin) -> None:
+    """v11 auto-Vary: a response `Vary: Accept-Encoding` makes the module split
+    by the Accept-Encoding class automatically (no operator config). Same class
+    collapses onto one slot; a different class is a distinct slot."""
+    base = origin.hits
+    p = "/av/enc?v=ae"
+    _, b1, _ = fetch(ng.port, p, {"Accept-Encoding": "gzip"})  # cold -> origin
+    _, b2, _ = fetch(ng.port, p, {"Accept-Encoding": "gzip"})  # marker -> HIT
+    assert b1 == b2, (b1, b2)
+    _, b3, _ = fetch(ng.port, p, {"Accept-Encoding": "br"})    # new variant
+    _, b4, _ = fetch(ng.port, p, {"Accept-Encoding": "br"})    # HIT
+    assert b3 == b4, (b3, b4)
+    assert b1 != b3, ("gzip and br shared a slot", b1, b3)
+    _, b5, _ = fetch(ng.port, p, {"Accept-Encoding": "gzip"})  # still its slot
+    assert b5 == b1, (b5, b1)
+    assert origin.hits - base == 2, origin.hits - base
+
+
+def test_auto_vary_encoding_same_class_shares(ng: Nginx, origin: Origin) -> None:
+    """v11 auto-Vary: two Accept-Encoding headers in the same bucket (gzip and
+    'gzip, deflate' both classify gzip) share one slot -> one origin hit."""
+    base = origin.hits
+    p = "/av/encsame?v=ae"
+    _, b1, _ = fetch(ng.port, p, {"Accept-Encoding": "gzip"})
+    _, b2, _ = fetch(ng.port, p, {"Accept-Encoding": "gzip, deflate"})
+    assert b1 == b2, (b1, b2)
+    assert origin.hits - base == 1, origin.hits - base
+
+
+def test_auto_vary_device(ng: Nginx, origin: Origin) -> None:
+    """v11 auto-Vary: `Vary: User-Agent` splits by the coarse device class."""
+    base = origin.hits
+    p = "/av/dev?v=ua"
+    mob = {"User-Agent": "Mozilla/5.0 (iPhone; CPU) Mobile"}
+    dsk = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64)"}
+    _, m1, _ = fetch(ng.port, p, mob)
+    _, m2, _ = fetch(ng.port, p, mob)
+    _, d1, _ = fetch(ng.port, p, dsk)
+    _, d2, _ = fetch(ng.port, p, dsk)
+    assert m1 == m2 and d1 == d2, (m1, m2, d1, d2)
+    assert m1 != d1, ("mobile and desktop shared a slot", m1, d1)
+    assert origin.hits - base == 2, origin.hits - base
+
+
+def test_auto_vary_language(ng: Nginx, origin: Origin) -> None:
+    """v11 auto-Vary: `Vary: Accept-Language` splits by the raw header value."""
+    base = origin.hits
+    p = "/av/lang?v=al"
+    _, e1, _ = fetch(ng.port, p, {"Accept-Language": "en"})
+    _, e2, _ = fetch(ng.port, p, {"Accept-Language": "en"})
+    _, f1, _ = fetch(ng.port, p, {"Accept-Language": "fr"})
+    assert e1 == e2, (e1, e2)
+    assert e1 != f1, ("en and fr shared a slot", e1, f1)
+    assert origin.hits - base == 2, origin.hits - base
+
+
+def test_auto_vary_origin(ng: Nginx, origin: Origin) -> None:
+    """v11 auto-Vary: `Vary: Origin` splits by the raw Origin header value."""
+    base = origin.hits
+    p = "/av/org?v=or"
+    _, a1, _ = fetch(ng.port, p, {"Origin": "https://a.example"})
+    _, a2, _ = fetch(ng.port, p, {"Origin": "https://a.example"})
+    _, c1, _ = fetch(ng.port, p, {"Origin": "https://b.example"})
+    assert a1 == a2, (a1, a2)
+    assert a1 != c1, ("two Origins shared a slot", a1, c1)
+    assert origin.hits - base == 2, origin.hits - base
+
+
+def test_auto_vary_star_uncacheable(ng: Nginx, origin: Origin) -> None:
+    """v11 auto-Vary: `Vary: *` is uncacheable -> every request hits origin."""
+    base = origin.hits
+    p = "/av/star?v=star"
+    _, b1, _ = fetch(ng.port, p)
+    _, b2, _ = fetch(ng.port, p)
+    assert b1 != b2, ("Vary: * was cached", b1, b2)
+    assert origin.hits - base == 2, origin.hits - base
+
+
+def test_auto_vary_cookie_uncacheable(ng: Nginx, origin: Origin) -> None:
+    """v11 auto-Vary: `Vary: Cookie` is refused (per-user) -> not cached."""
+    base = origin.hits
+    p = "/av/ck?v=ck"
+    _, b1, _ = fetch(ng.port, p)
+    _, b2, _ = fetch(ng.port, p)
+    assert b1 != b2, ("Vary: Cookie was cached", b1, b2)
+    assert origin.hits - base == 2, origin.hits - base
+
+
+def test_auto_vary_mixed_refused_wins(ng: Nginx, origin: Origin) -> None:
+    """v11 auto-Vary: `Vary: Accept-Encoding, Cookie` -> the refused Cookie axis
+    wins over the safe encoding axis, so the response is not cached at all."""
+    base = origin.hits
+    p = "/av/mix?v=mix"
+    _, b1, _ = fetch(ng.port, p, {"Accept-Encoding": "gzip"})
+    _, b2, _ = fetch(ng.port, p, {"Accept-Encoding": "gzip"})
+    assert b1 != b2, ("mixed safe+refused Vary was cached", b1, b2)
+    assert origin.hits - base == 2, origin.hits - base
+
+
+def test_auto_vary_off_ignores_vary(ng: Nginx, origin: Origin) -> None:
+    """v11 auto-Vary off by default: the response Vary header is ignored, so two
+    different Accept-Encodings collapse onto one slot (back-compat)."""
+    base = origin.hits
+    p = "/avoff/enc?v=ae"
+    _, b1, _ = fetch(ng.port, p, {"Accept-Encoding": "gzip"})
+    _, b2, _ = fetch(ng.port, p, {"Accept-Encoding": "br"})
+    assert b1 == b2, ("auto_vary off still split by Vary", b1, b2)
+    assert origin.hits - base == 1, origin.hits - base
+
+
 def test_preset_window_differs(ng: Nginx, origin: Origin) -> None:
     """v3-2: a preset sets the stale-window multiplier. With cache_turbo_valid
     pinned to 1s on both locations, the only difference is the preset: the
@@ -2451,6 +2600,15 @@ def run_all(ng: Nginx, origin: Origin,
     test_normalize_vary_off_by_default(ng, origin)
     test_normalize_vary_encoding_zstd(ng, origin)
     test_invalid_normalize_vary_token(ng)
+    test_auto_vary_encoding(ng, origin)
+    test_auto_vary_encoding_same_class_shares(ng, origin)
+    test_auto_vary_device(ng, origin)
+    test_auto_vary_language(ng, origin)
+    test_auto_vary_origin(ng, origin)
+    test_auto_vary_star_uncacheable(ng, origin)
+    test_auto_vary_cookie_uncacheable(ng, origin)
+    test_auto_vary_mixed_refused_wins(ng, origin)
+    test_auto_vary_off_ignores_vary(ng, origin)
     test_preset_window_differs(ng, origin)
     test_invalid_preset_name(ng)
     test_autotune_raises_beta_within_band(ng, origin)
@@ -2566,6 +2724,8 @@ def main() -> int:
           "custom-strip/strip-all/distinct), "
           "vary suffix (v3-4: encoding/device/both/off-by-default, "
           "zstd>br bucket (V6), invalid-token rejected), "
+          "auto-Vary (v11: encoding/same-class/device/language/origin split, "
+          "Vary:*/Cookie/mixed-refused uncacheable, off-by-default ignores Vary), "
           "presets (v3-2: conservative/aggressive stale-window differ, "
           "invalid-name rejected), "
           "autotune (v4-3: raises beta within band/off-by-default/"
