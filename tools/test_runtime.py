@@ -480,6 +480,14 @@ http {{
     cache_turbo_zone name=ati 16m;   # autotune insufficient-data (v4-3)
     cache_turbo_zone name=atch 16m;  # autotune churn-disqualify (v4-3)
 
+    # Q1 end-to-end: stacked native proxy_cache, one zone per suppress mode, so
+    # a test can prove cache_turbo_suppress_native actually keeps the native
+    # cache empty (vs the inert default where proxy_cache stores normally).
+    proxy_cache_path {root}/pcache_on  keys_zone=ctpcon:1m  levels=1:2
+                     inactive=10m max_size=64m;
+    proxy_cache_path {root}/pcache_off keys_zone=ctpcoff:1m levels=1:2
+                     inactive=10m max_size=64m;
+
     server {{
         listen 127.0.0.1:{port};
 {redis_loc}
@@ -722,6 +730,35 @@ http {{
         # (no ctx / disabled), proving the variable's defensive default.
         location /plain/ {{
             add_header X-CT-Active $cache_turbo_active always;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # Q1 E2E: cache_turbo_suppress_native on + the documented wiring ->
+        # proxy_cache (ctpcon) must stay empty (cache-turbo owns caching).
+        location /supcache/ {{
+            cache_turbo                 main;
+            cache_turbo_suppress_native on;
+            cache_turbo_key             $uri;
+            cache_turbo_valid           30s;
+            proxy_cache                 ctpcon;
+            proxy_cache_valid           200 5m;
+            proxy_cache_key             $uri;
+            proxy_no_cache              $cache_turbo_active;
+            proxy_cache_bypass          $cache_turbo_active;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # Q1 E2E control: suppress OFF -> $cache_turbo_active=0 -> the SAME
+        # wiring is inert and proxy_cache (ctpcoff) stores normally.
+        location /nosupcache/ {{
+            cache_turbo                 main;
+            cache_turbo_key             $uri;
+            cache_turbo_valid           30s;
+            proxy_cache                 ctpcoff;
+            proxy_cache_valid           200 5m;
+            proxy_cache_key             $uri;
+            proxy_no_cache              $cache_turbo_active;
+            proxy_cache_bypass          $cache_turbo_active;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
@@ -1410,6 +1447,37 @@ def test_suppress_native_inert_on_plain_location(ng: Nginx) -> None:
     _, _, h = fetch(ng.port, "/plain/x")
     assert h.get("x-ct-active") == "0", \
         f"plain location: expected X-CT-Active=0, got {h.get('x-ct-active')}"
+
+
+def test_suppress_native_e2e_proxy_cache(ng: Nginx) -> None:
+    """Q1 end-to-end: with cache_turbo_suppress_native on plus the documented
+    proxy_no_cache/proxy_cache_bypass wiring, a stacked proxy_cache never writes
+    (its on-disk cache dir stays empty). With suppress off the identical wiring
+    is inert ($cache_turbo_active=0) and proxy_cache stores as usual. Proves the
+    variable gates native caching for real, not just as a header value."""
+    import os
+
+    def file_count(d: pathlib.Path) -> int:
+        return sum(len(files) for _, _, files in os.walk(d))
+
+    on_dir = ng.root / "pcache_on"
+    off_dir = ng.root / "pcache_off"
+
+    # suppress ON: cache-turbo owns it; proxy_cache must stay empty.
+    fetch(ng.port, "/supcache/a")
+    fetch(ng.port, "/supcache/b")
+    time.sleep(0.4)                       # let the cache manager settle
+    n_on = file_count(on_dir)
+    assert n_on == 0, \
+        f"suppress on: proxy_cache wrote {n_on} files, expected 0 (native not suppressed)"
+
+    # suppress OFF (control): the same wiring is inert, proxy_cache stores.
+    fetch(ng.port, "/nosupcache/a")
+    fetch(ng.port, "/nosupcache/b")
+    time.sleep(0.4)
+    n_off = file_count(off_dir)
+    assert n_off > 0, \
+        "suppress off: proxy_cache should have stored (wiring inert), but dir is empty"
 
 
 def test_invalid_backend_name(ng: Nginx) -> None:
@@ -3221,6 +3289,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_auto_classify_more(ng, origin)
     test_q2_multibuffer_oversize(ng, origin)
     test_suppress_native_inert_on_plain_location(ng)
+    test_suppress_native_e2e_proxy_cache(ng)
     test_invalid_backend_name(ng)
     test_invalid_auto_mode(ng)
     test_no_cache_set_cookie(ng)

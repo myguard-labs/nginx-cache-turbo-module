@@ -616,6 +616,7 @@ ngx_http_cache_turbo_purge_request(ngx_http_request_t *r,
 }
 
 
+/* >>> FUZZ-EXTRACT auto-classify BEGIN (fuzz/extract_auto_classify.sh) <<< */
 /*
  * Auto-classify preset registry. Each row is one CMS backend: NULL-terminated
  * lists of request-Cookie name substrings, r->uri prefixes, and query-arg keys
@@ -747,6 +748,7 @@ ngx_http_cache_turbo_auto_skip(ngx_http_request_t *r,
 
     return 0;
 }
+/* >>> FUZZ-EXTRACT auto-classify END <<< */
 
 
 static ngx_int_t

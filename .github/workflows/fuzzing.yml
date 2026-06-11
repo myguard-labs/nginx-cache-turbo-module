@@ -1,11 +1,14 @@
 name: Fuzzing
 
-# Coverage-guided fuzzing of two attacker-controlled parsers:
+# Coverage-guided fuzzing of the attacker-controlled parsers/scanners:
 #   - the RESP reply parsers (redis_parse / _parse_array / _parse_scan),
 #     reading attacker-influenceable bytes from a shared L2;
 #   - the query-string normaliser (normalized_args_variable), splitting and
-#     re-buffering the fully attacker-controlled request query string.
-# Both built from the SHIPPED code via fuzz/extract_*.sh (no copy to drift).
+#     re-buffering the fully attacker-controlled request query string;
+#   - the memcached GET reply parser (mc_parse);
+#   - the auto-classify gate (auto_skip / cookie_has), scanning the request URI
+#     and Cookie header values for CMS dynamic-surface rules.
+# All built from the SHIPPED code via fuzz/extract_*.sh (no copy to drift).
 # Heavy job: monthly on a
 # schedule + manual only, matching valgrind.yml / codeql.yml — NOT on every
 # push/PR (build-test.yml already runs ASan+UBSan on each change for fast
@@ -64,7 +67,7 @@ jobs:
         run: |
           cd fuzz
           # target:corpus-dir pairs — each gets the full per-target budget.
-          targets="fuzz_resp_parser:corpus fuzz_norm_args:corpus_norm_args fuzz_mc_parser:corpus_mc"
+          targets="fuzz_resp_parser:corpus fuzz_norm_args:corpus_norm_args fuzz_mc_parser:corpus_mc fuzz_auto_classify:corpus_auto"
           for t in $targets; do
             bin="${t%%:*}"; corp="${t##*:}"
             echo "=== $bin over $corp ($FUZZ_SECS s) ==="
@@ -87,7 +90,7 @@ jobs:
         if: success() && github.event_name == 'schedule'
         run: |
           cd fuzz
-          for t in fuzz_resp_parser:corpus fuzz_norm_args:corpus_norm_args fuzz_mc_parser:corpus_mc; do
+          for t in fuzz_resp_parser:corpus fuzz_norm_args:corpus_norm_args fuzz_mc_parser:corpus_mc fuzz_auto_classify:corpus_auto; do
             bin="${t%%:*}"; corp="${t##*:}"
             mkdir -p "${corp}-min"
             "./$bin" -merge=1 "${corp}-min/" "$corp/"
