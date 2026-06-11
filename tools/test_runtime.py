@@ -54,6 +54,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--single-process", action="store_true")
     parser.add_argument("--port", type=int, default=18880)
     parser.add_argument("--redis-server")  # accepted; used by v2 L2 tests
+    parser.add_argument("--memcached-server")  # v13: memcached L2 backend tests
     return parser.parse_args()
 
 
@@ -248,7 +249,8 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
                  redis_auth_port: int | None = None,
                  redis_password: str | None = None,
                  redis_tls_port: int | None = None,
-                 redis_tls_ca: str | None = None) -> str:
+                 redis_tls_ca: str | None = None,
+                 memcached_port: int | None = None) -> str:
     load = f"load_module {module};\n" if module else ""
 
     # DSN auth+db (v5): a backend reached via a full redis://user:pass@host/db
@@ -407,6 +409,32 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
         }}
 """
 
+    # L2 memcached (v13): a location wired to the memcached backend instead of
+    # Redis. Emitted only when a MemcachedServer is running; scoped to /mc/ so it
+    # never disturbs the Redis or L1-only locations. Distinct prefix (mc:) so its
+    # keys can't collide with the Redis suite's ct: namespace.
+    mc_loc = ""
+    if memcached_port is not None:
+        mc_loc = f"""
+        # L2 memcached: write-through on store + sync fill on L1 miss
+        location /mc/ {{
+            cache_turbo            main;
+            cache_turbo_key        $uri;
+            cache_turbo_valid      30s;
+            cache_turbo_memcached  127.0.0.1:{memcached_port} prefix=mc: timeout=250ms;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # memcached-backed admin: a single-key purge here must also delete the
+        # entry from memcached (not just drop L1).
+        location = /_cache_mc {{
+            cache_turbo_admin      main;
+            cache_turbo_memcached  127.0.0.1:{memcached_port} prefix=mc: timeout=250ms;
+            allow 127.0.0.1;
+            deny all;
+        }}
+"""
+
     return f"""{load}worker_processes {workers};
 pid {root}/nginx.pid;
 error_log {root}/logs/error.log notice;
@@ -425,6 +453,7 @@ http {{
     server {{
         listen 127.0.0.1:{port};
 {redis_loc}
+{mc_loc}
 {dsn_loc}
 
         # standard 30s-fresh cache
@@ -808,7 +837,7 @@ class Nginx:
     def __init__(self, binary, module, root, port, origin_port, runner,
                  single_process, redis_port=None, redis_auth_port=None,
                  redis_password=None, redis_tls_port=None,
-                 redis_tls_ca=None) -> None:
+                 redis_tls_ca=None, memcached_port=None) -> None:
         self.binary = binary
         self.module = module
         self.root = root
@@ -822,6 +851,7 @@ class Nginx:
         self.redis_password = redis_password
         self.redis_tls_port = redis_tls_port
         self.redis_tls_ca = redis_tls_ca
+        self.memcached_port = memcached_port
         self.process: subprocess.Popen | None = None
         self.output_path = root / "nginx-output.log"
 
@@ -833,7 +863,8 @@ class Nginx:
             nginx_config(self.root, self.port, self.module,
                          self.origin_port, workers, self.redis_port,
                          self.redis_auth_port, self.redis_password,
-                         self.redis_tls_port, self.redis_tls_ca),
+                         self.redis_tls_port, self.redis_tls_ca,
+                         self.memcached_port),
             encoding="ascii")
 
     def command(self, test: bool = False) -> list[str]:
@@ -996,6 +1027,63 @@ class RedisServer:
             s.sendall(cmd)
             if s.recv(64)[:1] != b"+":
                 raise RuntimeError("raw SET not acknowledged")
+
+    def stop(self) -> None:
+        if self.process is None:
+            return
+        if self.process.poll() is None:
+            self.process.terminate()
+            self.process.wait(timeout=10)
+        self.process = None
+
+
+class MemcachedServer:
+    """A throwaway memcached instance for the v13 L2 tests. Talks the text
+    protocol over a raw socket (no client library dependency), mirroring how the
+    module's driver speaks to it."""
+
+    def __init__(self, binary: pathlib.Path, port: int) -> None:
+        self.binary = binary
+        self.port = port
+        self.process: subprocess.Popen[str] | None = None
+
+    def start(self) -> None:
+        self.process = subprocess.Popen(
+            [str(self.binary), "-l", "127.0.0.1", "-p", str(self.port),
+             "-U", "0", "-m", "64"],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        wait_port(self.port)
+        self.command(b"flush_all\r\n")
+
+    def command(self, payload: bytes, recv: int = 65536) -> bytes:
+        """Send a raw text-protocol command, return the (single recv) reply."""
+        with socket.create_connection(("127.0.0.1", self.port), 5) as s:
+            s.sendall(payload)
+            s.settimeout(5)
+            return s.recv(recv)
+
+    def get(self, key: str) -> bytes | None:
+        """Return the stored value bytes for key, or None on miss. Reads until
+        the trailing END\\r\\n so a value spanning multiple TCP segments is whole."""
+        with socket.create_connection(("127.0.0.1", self.port), 5) as s:
+            s.sendall(b"get " + key.encode() + b"\r\n")
+            s.settimeout(5)
+            buf = b""
+            while b"END\r\n" not in buf:
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+        if buf.startswith(b"END\r\n"):
+            return None
+        # VALUE <key> <flags> <bytes>\r\n<data>\r\nEND\r\n
+        hdr_end = buf.index(b"\r\n")
+        nbytes = int(buf[:hdr_end].split()[3])
+        data_start = hdr_end + 2
+        return buf[data_start:data_start + nbytes]
+
+    def exists(self, key: str) -> bool:
+        return self.get(key) is not None
 
     def stop(self) -> None:
         if self.process is None:
@@ -2684,10 +2772,116 @@ def test_autotune_churn_disqualifies(ng: Nginx, origin: Origin) -> None:
         drain_origin(origin)   # v8: settle async bg refreshes before next test
 
 
+# --------------------------------------------------------------------------- #
+# v13 memcached L2 backend
+# --------------------------------------------------------------------------- #
+
+def test_l2_memcached_write_through(ng: Nginx, origin: Origin,
+                                    mc: MemcachedServer) -> None:
+    """v13: a store under /mc/ writes through to memcached. After caching, the
+    blob is present under the mc: key and contains the response body bytes, and
+    the L1 hot path still serves the HIT byte-identically."""
+    uri = "/mc/store"
+    key = l2_key(uri, prefix="mc:")
+    mc.command(b"delete " + key.encode() + b"\r\n")
+
+    s, body, h = fetch(ng.port, uri)               # miss -> origin -> store
+    assert s == 200, f"mc store status {s}"
+    assert "x-cache" not in h, "first request should be a miss"
+
+    # write-through is async/fire-and-forget; give it a moment to land
+    assert wait_for(lambda: mc.exists(key)), \
+        f"L2 key {key} never appeared in memcached"
+    stored = mc.get(key)
+    assert stored is not None and len(stored) > len(body), \
+        f"stored blob ({len(stored or b'')}B) smaller than body"
+    assert b"gen-" in stored, "stored blob missing response body"
+
+    # L1 still serves the hit (write-through must not disturb the hot path)
+    _, b2, h2 = fetch(ng.port, uri)
+    assert h2.get("x-cache") == "HIT" and b2 == body, "L1 hit broken after L2 set"
+
+
+def test_l2_memcached_cross_instance_fill(ng: Nginx, origin: Origin,
+                                          mc: MemcachedServer) -> None:
+    """v13: an L1 miss fills from memcached. A second, independent nginx with a
+    cold L1 but the same memcached serves the object the first node cached,
+    without hitting the origin again."""
+    uri = "/mc/p2"
+    key = l2_key(uri, prefix="mc:")
+    mc.command(b"delete " + key.encode() + b"\r\n")
+
+    # Instance A: cold -> origin -> writes L1 + L2
+    s, body_a, ha = fetch(ng.port, uri)
+    assert s == 200 and "x-cache" not in ha, "A should miss to origin first"
+    assert wait_for(lambda: mc.exists(key)), "A never wrote the object to L2"
+    drain_origin(origin)
+    origin_after_a = origin.hits
+
+    # Instance B: separate nginx, cold L1, same memcached + same origin
+    b = Nginx(ng.binary, ng.module, ng.root.parent / "server-b-mc",
+              ng.port + 6, ng.origin_port, ng.runner_raw,
+              ng.single_process, memcached_port=ng.memcached_port)
+    b.write_config()
+    b.config_test()
+    b.start()
+    try:
+        s2, body_b, hb = fetch(b.port, uri)
+        assert s2 == 200, f"B status {s2}"
+        assert body_b == body_a, f"B body {body_b!r} != A body {body_a!r}"
+        assert hb.get("x-cache") == "HIT", \
+            f"B X-Cache={hb.get('x-cache')} (expected an L2-fill HIT)"
+        assert origin.hits == origin_after_a, \
+            f"origin was hit on the L2 fill ({origin.hits} vs {origin_after_a})"
+
+        # B now has it in L1 too: second read is a plain L1 HIT
+        _, body_b2, hb2 = fetch(b.port, uri)
+        assert hb2.get("x-cache") == "HIT" and body_b2 == body_a
+        assert origin.hits == origin_after_a, "origin hit on B's L1 hit"
+
+        time.sleep(0.2)
+        b.stop()
+        b.assert_clean_logs()
+    finally:
+        b.stop()
+
+
+def test_l2_memcached_purge_key_drops_l2(ng: Nginx, origin: Origin,
+                                         mc: MemcachedServer) -> None:
+    """v13: a single-key purge on the memcached-aware admin endpoint also deletes
+    the entry from memcached (not just L1), so the next miss cannot be silently
+    refilled from L2."""
+    uri = "/mc/purgekey"
+    key = l2_key(uri, prefix="mc:")
+    mc.command(b"delete " + key.encode() + b"\r\n")
+
+    s, body_a, h = fetch(ng.port, uri)             # miss -> origin -> L1 + L2
+    assert s == 200 and "x-cache" not in h, "prime should miss to origin"
+    assert wait_for(lambda: mc.exists(key)), "write-through never reached L2"
+
+    # purge the key via the memcached-aware admin endpoint
+    s, _, _ = fetch(ng.port, f"/_cache_mc?key={uri}", method="POST")
+    assert s == 200, f"purge status {s}"
+
+    # the L2 entry must actually be gone (fire-and-forget delete)
+    assert wait_for(lambda: not mc.exists(key)), \
+        "single-key purge did not drop the entry from memcached"
+
+    # next read misses to a fresh origin generation, not an L2 refill
+    origin_before = origin.hits
+    s, body_b, h3 = fetch(ng.port, uri)
+    assert s == 200 and "x-cache" not in h3, \
+        f"post-purge read should miss to origin, got {h3.get('x-cache')}"
+    assert origin.hits == origin_before + 1, \
+        "origin not consulted after purge (L2 still served)"
+    assert body_b != body_a, "post-purge body should be a fresh generation"
+
+
 def run_all(ng: Nginx, origin: Origin,
             redis: RedisServer | None = None,
             redis_auth: RedisServer | None = None,
-            redis_tls: RedisServer | None = None) -> None:
+            redis_tls: RedisServer | None = None,
+            mc: MemcachedServer | None = None) -> None:
     test_miss_then_hit(ng)
     test_header_fidelity(ng)
     test_max_size_not_cached(ng)
@@ -2774,6 +2968,10 @@ def run_all(ng: Nginx, origin: Origin,
     if redis_tls is not None:
         test_l2_tls(ng, origin, redis_tls)           # rediss:// + verify
         test_l2_tls_keepalive_reuse(ng, origin, redis_tls)  # v15-2 TLS pool
+    if mc is not None:
+        test_l2_memcached_write_through(ng, origin, mc)        # v13
+        test_l2_memcached_cross_instance_fill(ng, origin, mc)  # v13
+        test_l2_memcached_purge_key_drops_l2(ng, origin, mc)   # v13
     test_admin_purge_all(ng)   # last: it empties the zone
 
 
@@ -2790,12 +2988,16 @@ def main() -> int:
     redis_port = args.port + 21 if args.redis_server else None
     redis_auth_port = args.port + 22 if args.redis_server else None
     redis_tls_port = args.port + 23 if args.redis_server else None
+    memcached_port = args.port + 24 if args.memcached_server else None
     redis_password = "ctsecret"
     with tempfile.TemporaryDirectory(prefix="cache-turbo-ci-") as tmp:
         root = pathlib.Path(tmp)
         origin = Origin(origin_port, delay=0.05)
-        redis = redis_auth = redis_tls = None
+        redis = redis_auth = redis_tls = mc = None
         tls_certs = None
+        if args.memcached_server:
+            mc = MemcachedServer(pathlib.Path(args.memcached_server),
+                                 memcached_port)
         if args.redis_server:
             rbin = pathlib.Path(args.redis_server)
             redis = RedisServer(rbin, root / "redis", redis_port)
@@ -2816,7 +3018,8 @@ def main() -> int:
                    redis_auth_port=redis_auth_port if redis_auth else None,
                    redis_password=redis_password,
                    redis_tls_port=redis_tls_port if redis_tls else None,
-                   redis_tls_ca=(tls_certs or {}).get("ca"))
+                   redis_tls_ca=(tls_certs or {}).get("ca"),
+                   memcached_port=memcached_port if mc else None)
 
         try:
             origin.start()
@@ -2829,10 +3032,12 @@ def main() -> int:
                     redis_tls.start()
                 except Exception:
                     redis_tls = None        # TLS redis refused to start: skip
+            if mc is not None:
+                mc.start()
             ng.write_config()
             ng.config_test()
             ng.start()
-            run_all(ng, origin, redis, redis_auth, redis_tls)
+            run_all(ng, origin, redis, redis_auth, redis_tls, mc)
             time.sleep(0.2)
             ng.stop()
             ng.assert_clean_logs()
@@ -2844,6 +3049,8 @@ def main() -> int:
                 redis_auth.stop()
             if redis_tls is not None:
                 redis_tls.stop()
+            if mc is not None:
+                mc.stop()
             origin.stop()
 
     print("OK: miss/hit, header fidelity, max_size, "
@@ -2884,7 +3091,9 @@ def main() -> int:
              if redis_port else "")
           + (", DSN AUTH+SELECT preamble (v5)" if redis_auth else "")
           + (", rediss:// TLS + verify (v5), TLS keepalive reuse (v15-2)"
-             if redis_tls else ""))
+             if redis_tls else "")
+          + (", memcached L2 (v13: write-through, cross-instance fill, "
+             "key purge)" if memcached_port else ""))
     return 0
 
 

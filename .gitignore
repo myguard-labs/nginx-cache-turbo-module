@@ -9,8 +9,10 @@ valgrind-*.log
 # Fuzzing build artifacts (seed corpus IS tracked; everything else is not)
 fuzz/fuzz_resp_parser
 fuzz/fuzz_norm_args
+fuzz/fuzz_mc_parser
 fuzz/generated_parser.inc
 fuzz/generated_norm_args.inc
+fuzz/generated_mc_parser.inc
 fuzz/crash-*
 fuzz/*-min/
 fuzz/*.profraw

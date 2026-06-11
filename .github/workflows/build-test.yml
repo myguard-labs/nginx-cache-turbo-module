@@ -96,7 +96,7 @@ jobs:
           incs=$(awk '/^ALL_INCS[[:space:]]*=/{found=1} found{line=$0; sub(/^ALL_INCS[[:space:]]*=[[:space:]]*/,"",line); continued=(line ~ /\\$/); gsub(/\\$/, "", line); printf "%s ", line; if (!continued) exit}' "$build/objs/Makefile")
           # cflags and incs are compiler flag lists and must word-split.
           # shellcheck disable=SC2086
-          for src in ngx_http_cache_turbo_module ngx_http_cache_turbo_shm ngx_http_cache_turbo_swr ngx_http_cache_turbo_autotune ngx_http_cache_turbo_redis; do
+          for src in ngx_http_cache_turbo_module ngx_http_cache_turbo_shm ngx_http_cache_turbo_swr ngx_http_cache_turbo_autotune ngx_http_cache_turbo_redis ngx_http_cache_turbo_memcached; do
             ( cd "$build" && gcc -c -fPIC $cflags \
                 -Wall -Wextra -Wshadow -Wstrict-prototypes \
                 -Wstrict-aliasing -Wunreachable-code -Werror \
@@ -135,7 +135,7 @@ jobs:
       - name: Install runtime dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y redis-server
+          sudo apt-get install -y redis-server memcached
 
       - name: Run runtime suite
         run: |
@@ -143,7 +143,8 @@ jobs:
           python3 tools/test_runtime.py \
             --nginx-binary "$GITHUB_WORKSPACE/nginx-bin/nginx" \
             --module "$GITHUB_WORKSPACE/nginx-bin/ngx_http_cache_turbo_module.so" \
-            --redis-server /usr/bin/redis-server
+            --redis-server /usr/bin/redis-server \
+            --memcached-server /usr/bin/memcached
 
   asan:
     name: ASan and UBSan
@@ -156,7 +157,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential curl libpcre2-dev libssl-dev redis-server zlib1g-dev
+          sudo apt-get install -y build-essential curl libpcre2-dev libssl-dev redis-server memcached zlib1g-dev
 
       - name: Build with sanitizers
         run: bash tools/ci-build.sh nginx "$NGINX_VERSION" asan
@@ -169,4 +170,5 @@ jobs:
           python3 tools/test_runtime.py \
             --single-process \
             --redis-server /usr/bin/redis-server \
+            --memcached-server /usr/bin/memcached \
             --nginx-binary "$GITHUB_WORKSPACE/.build/nginx-${NGINX_VERSION}/objs/nginx"

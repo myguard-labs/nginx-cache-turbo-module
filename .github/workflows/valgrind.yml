@@ -31,7 +31,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            build-essential curl libpcre2-dev libssl-dev redis-server valgrind zlib1g-dev
+            build-essential curl libpcre2-dev libssl-dev redis-server memcached valgrind zlib1g-dev
 
       - name: Build debug server and module
         run: bash tools/ci-build.sh nginx "$NGINX_VERSION" debug
@@ -46,6 +46,7 @@ jobs:
             --single-process \
             --runner "$runner" \
             --redis-server /usr/bin/redis-server \
+            --memcached-server /usr/bin/memcached \
             --nginx-binary "$GITHUB_WORKSPACE/.build/nginx-${NGINX_VERSION}/objs/nginx" \
             --module "$GITHUB_WORKSPACE/.build/nginx-${NGINX_VERSION}/objs/ngx_http_cache_turbo_module.so"
 

@@ -355,6 +355,15 @@ typedef struct {
     ngx_str_t                redis_prefix; /* key prefix, default "ct:"        */
     ngx_msec_t               redis_timeout;/* connect/read timeout             */
 
+    /* L2 memcached (v13). A second, simpler L2 backend selected by
+     * cache_turbo_memcached HOST:PORT (mutually exclusive with cache_turbo_redis
+     * — both reuse redis_addr/redis_prefix/redis_timeout/redis_enable; the flag
+     * below picks the vtable). Text protocol, plain TCP, get/set/del/del_raw
+     * only: tag/scan/lock vtable slots stay NULL (no SADD/SCAN/atomic-lock), so
+     * tag-purge / purge?all / cross-node single-flight are unavailable on it.
+     * 1 MB value cap (memcached's default item ceiling): oversized SET skipped. */
+    ngx_flag_t               memcached;    /* cache_turbo_memcached configured  */
+
     /* Keepalive pool (v15). cache_turbo_redis keepalive=N caches up to N idle
      * L2 connections per worker, keyed by peer addr, so an L2 op reuses a live
      * TCP connection instead of connect()+close per op. 0 = off (default).
@@ -781,6 +790,7 @@ struct ngx_cache_turbo_backend_s {
 };
 
 extern ngx_cache_turbo_backend_t  ngx_http_cache_turbo_redis_backend;
+extern ngx_cache_turbo_backend_t  ngx_http_cache_turbo_memcached_backend;
 
 
 #endif /* NGX_HTTP_CACHE_TURBO_MODULE_H_INCLUDED_ */

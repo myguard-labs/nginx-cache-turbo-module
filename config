@@ -6,6 +6,7 @@ CACHE_TURBO_SRCS="                                                       \
                   $ngx_addon_dir/src/ngx_http_cache_turbo_swr.c         \
                   $ngx_addon_dir/src/ngx_http_cache_turbo_autotune.c    \
                   $ngx_addon_dir/src/ngx_http_cache_turbo_redis.c       \
+                  $ngx_addon_dir/src/ngx_http_cache_turbo_memcached.c   \
                   "
 
 CACHE_TURBO_DEPS="                                                      \

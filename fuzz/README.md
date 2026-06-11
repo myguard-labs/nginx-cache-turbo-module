@@ -1,10 +1,17 @@
 # Fuzzing
 
 Coverage-guided (libFuzzer) fuzzing of the module's attacker-controlled
-parsers. Two targets, each built from the SHIPPED source by its own
+parsers. Three targets, each built from the SHIPPED source by its own
 `extract_*.sh` slicer (no hand-maintained copy):
 
 - **`fuzz_resp_parser`** → the three Redis (RESP) reply parsers (below).
+- **`fuzz_mc_parser`** → `ngx_http_cache_turbo_mc_parse()` (v13), the memcached
+  TEXT-protocol GET reply parser. Reads a memcached reply from a shared,
+  possibly-compromised L2 — `VALUE <key> <flags> <bytes>[ <cas>]\r\n<data>` —
+  scanning the header line for spaces/CRLF and doing `<bytes>`-length pointer
+  arithmetic against `op->rbuf .. op->rbuf + op->rlen`. Same OOB-read / length-
+  check bug class as the RESP target. Sliced by `extract_mc_parser.sh` into
+  `generated_mc_parser.inc`; shim is `ngx_shim_mc.h`; corpus is `corpus_mc/`.
 - **`fuzz_norm_args`** → `ngx_http_cache_turbo_normalized_args_variable()`,
   which builds `$cache_turbo_normalized_args` from the **fully attacker-
   controlled** request query string: it splits on `&`/`=` with pointer

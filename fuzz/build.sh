@@ -39,4 +39,6 @@ else
     build_one fuzz_resp_parser.c "$DIR/fuzz_resp_parser"
     bash "$FUZZ_DIR/extract_norm_args.sh"
     build_one fuzz_norm_args.c "$DIR/fuzz_norm_args"
+    bash "$FUZZ_DIR/extract_mc_parser.sh"
+    build_one fuzz_mc_parser.c "$DIR/fuzz_mc_parser"
 fi

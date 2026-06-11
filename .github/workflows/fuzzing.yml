@@ -64,7 +64,7 @@ jobs:
         run: |
           cd fuzz
           # target:corpus-dir pairs — each gets the full per-target budget.
-          targets="fuzz_resp_parser:corpus fuzz_norm_args:corpus_norm_args"
+          targets="fuzz_resp_parser:corpus fuzz_norm_args:corpus_norm_args fuzz_mc_parser:corpus_mc"
           for t in $targets; do
             bin="${t%%:*}"; corp="${t##*:}"
             echo "=== $bin over $corp ($FUZZ_SECS s) ==="
@@ -87,7 +87,7 @@ jobs:
         if: success() && github.event_name == 'schedule'
         run: |
           cd fuzz
-          for t in fuzz_resp_parser:corpus fuzz_norm_args:corpus_norm_args; do
+          for t in fuzz_resp_parser:corpus fuzz_norm_args:corpus_norm_args fuzz_mc_parser:corpus_mc; do
             bin="${t%%:*}"; corp="${t##*:}"
             mkdir -p "${corp}-min"
             "./$bin" -merge=1 "${corp}-min/" "$corp/"

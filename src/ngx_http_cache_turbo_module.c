@@ -56,6 +56,8 @@ static char *ngx_http_cache_turbo_admin(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static char *ngx_http_cache_turbo_redis_conf(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
+static char *ngx_http_cache_turbo_memcached_conf(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
 static char *ngx_http_cache_turbo_tag(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static char *ngx_http_cache_turbo_preset(ngx_conf_t *cf, ngx_command_t *cmd,
@@ -244,6 +246,13 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
     { ngx_string("cache_turbo_redis"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_1MORE,
       ngx_http_cache_turbo_redis_conf,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+
+    { ngx_string("cache_turbo_memcached"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_1MORE,
+      ngx_http_cache_turbo_memcached_conf,
       NGX_HTTP_LOC_CONF_OFFSET,
       0,
       NULL },
@@ -1884,8 +1893,9 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 
             /* Tag index (v2c): for each tag in the cache_turbo_tag expression,
              * SADD this object's L2 key to the tag set so it can be purged by
-             * tag later. Tags live only in L2; skip when Redis is off. */
-            if (clcf->backend && clcf->tag) {
+             * tag later. Tags live only in L2; skip when Redis is off. The
+             * memcached backend has no tag support (tag_add == NULL, v13). */
+            if (clcf->backend && clcf->backend->tag_add && clcf->tag) {
                 ngx_str_t  tagval;
 
                 if (ngx_http_complex_value(r, clcf->tag, &tagval) == NGX_OK
@@ -2271,6 +2281,13 @@ ngx_http_cache_turbo_redis_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     value = cf->args->elts;
     arg1 = value[1];
 
+    if (clcf->memcached == 1) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "cache_turbo_redis: an L2 backend (cache_turbo_memcached) is already "
+            "configured in this block; the two are mutually exclusive");
+        return NGX_CONF_ERROR;
+    }
+
     /* --- 1. split the DSN (scheme / userinfo / host:port / db) ------------- */
     hostport = arg1;
 
@@ -2462,6 +2479,85 @@ ngx_http_cache_turbo_redis_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     }
 
     clcf->redis_enable = 1;
+
+    return NGX_CONF_OK;
+}
+
+
+/*
+ * "cache_turbo_memcached <host:port> [prefix=] [timeout=];"  (v13)
+ *
+ * Selects the memcached L2 backend instead of Redis. Reuses the redis_addr/
+ * redis_prefix/redis_timeout/redis_enable fields (the two backends are mutually
+ * exclusive — one L2 per location) and sets clcf->memcached so the merge step
+ * wires the memcached vtable. No DSN/auth/db/TLS: memcached's text protocol has
+ * no AUTH/SELECT and we keep the driver plain-TCP.
+ */
+static char *
+ngx_http_cache_turbo_memcached_conf(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf)
+{
+    ngx_http_cache_turbo_loc_conf_t  *clcf = conf;
+
+    ngx_str_t   *value, s;
+    ngx_url_t    u;
+    ngx_uint_t   i;
+    ngx_int_t    t;
+
+    value = cf->args->elts;
+
+    if (clcf->redis_enable == 1 && clcf->memcached != 1) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "cache_turbo_memcached: an L2 backend (cache_turbo_redis) is already "
+            "configured in this block; the two are mutually exclusive");
+        return NGX_CONF_ERROR;
+    }
+
+    ngx_memzero(&u, sizeof(ngx_url_t));
+    u.url = value[1];
+    u.default_port = 11211;
+
+    if (ngx_parse_url(cf->pool, &u) != NGX_OK) {
+        if (u.err) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                "cache_turbo_memcached: %s in \"%V\"", u.err, &u.url);
+        }
+        return NGX_CONF_ERROR;
+    }
+    if (u.naddrs == 0) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "cache_turbo_memcached: no addresses for \"%V\"", &u.url);
+        return NGX_CONF_ERROR;
+    }
+
+    clcf->redis_addr = u.addrs[0];
+
+    for (i = 2; i < cf->args->nelts; i++) {
+
+        if (ngx_strncmp(value[i].data, "prefix=", 7) == 0) {
+            clcf->redis_prefix.data = value[i].data + 7;
+            clcf->redis_prefix.len = value[i].len - 7;
+
+        } else if (ngx_strncmp(value[i].data, "timeout=", 8) == 0) {
+            s.data = value[i].data + 8;
+            s.len = value[i].len - 8;
+            t = ngx_parse_time(&s, 0);   /* milliseconds */
+            if (t == NGX_ERROR) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                    "cache_turbo_memcached: bad timeout \"%V\"", &s);
+                return NGX_CONF_ERROR;
+            }
+            clcf->redis_timeout = (ngx_msec_t) t;
+
+        } else {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                "cache_turbo_memcached: invalid parameter \"%V\"", &value[i]);
+            return NGX_CONF_ERROR;
+        }
+    }
+
+    clcf->redis_enable = 1;
+    clcf->memcached = 1;
 
     return NGX_CONF_OK;
 }
@@ -2761,7 +2857,7 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
             ngx_http_cache_turbo_tagpurge_t  *tp;
             ngx_int_t                         rc;
 
-            if (clcf->backend == NULL) {
+            if (clcf->backend == NULL || clcf->backend->purge_tag == NULL) {
                 ngx_str_set(&body,
                     "{\"error\":\"tag purge requires cache_turbo_redis\"}\n");
                 return ngx_http_cache_turbo_send_json(r,
@@ -3791,6 +3887,7 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->min_uses = NGX_CONF_UNSET;
     conf->max_size = NGX_CONF_UNSET_SIZE;
     conf->redis_enable = NGX_CONF_UNSET;
+    conf->memcached = NGX_CONF_UNSET;
     conf->redis_timeout = NGX_CONF_UNSET_MSEC;
     conf->redis_keepalive = NGX_CONF_UNSET;
     conf->redis_keepalive_timeout = NGX_CONF_UNSET_MSEC;
@@ -3937,6 +4034,7 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 
     /* L2 Redis: inherit address/prefix/timeout, default prefix "ct:". */
     ngx_conf_merge_value(conf->redis_enable, prev->redis_enable, 0);
+    ngx_conf_merge_value(conf->memcached, prev->memcached, 0);
     ngx_conf_merge_msec_value(conf->redis_timeout, prev->redis_timeout, 250);
     ngx_conf_merge_value(conf->redis_keepalive, prev->redis_keepalive, 0);
     ngx_conf_merge_msec_value(conf->redis_keepalive_timeout,
@@ -3975,7 +4073,10 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
      * call sites guard on it being non-NULL. */
     conf->l1 = &ngx_http_cache_turbo_shm_backend;
     conf->backend = conf->redis_enable
-                        ? &ngx_http_cache_turbo_redis_backend : NULL;
+                        ? (conf->memcached
+                               ? &ngx_http_cache_turbo_memcached_backend
+                               : &ngx_http_cache_turbo_redis_backend)
+                        : NULL;
 
     /* Key normalize: inherit strip_all + the extra-pattern list. */
     ngx_conf_merge_value(conf->normalize_strip_all, prev->normalize_strip_all,

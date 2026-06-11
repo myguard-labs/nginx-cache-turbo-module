@@ -357,6 +357,7 @@ $ curl -X POST 'localhost/_cache?url=/,/blog/,/about' # pre-warm cold pages
 | `cache_turbo_autotune on` | `server`, `location` | `off` | Auto-pick `beta` from the measured backend latency, clamped to the preset's band. |
 | `cache_turbo_autotune_interval TIME` | `server`, `location` | `30s` | How often autotune recomputes. |
 | `cache_turbo_redis DSN [opts...]` | `http`, `server`, `location` | — | Add a shared **L2 Redis** tier. `DSN` is `redis://[user:pass@]host:port/db` (or bare `host:port`); `rediss://` = TLS. Write-through on store; one sync `GET` on an L1 miss (never on an L1 hit). Opts: `prefix=` (`ct:`), `timeout=` (`250ms`), `password=`, `user=`, `db=`, `tls=on\|off`, `tls_verify=on\|off` (default on), `tls_ca=<file>`, `tls_name=<host>`. Native client, no hiredis. |
+| `cache_turbo_memcached HOST:PORT [opts...]` | `http`, `server`, `location` | — | Add a shared **L2 memcached** tier (alternative to `cache_turbo_redis`, mutually exclusive with it). Write-through on store; one sync `get` on an L1 miss. Opts: `prefix=` (`ct:`), `timeout=` (`250ms`). No tags / `?all` / cross-node lock (memcached lacks sorted sets, `SCAN`, atomic `SET-NX`); 1 MiB value cap. Native client, no libmemcached. |
 | `cache_turbo_tag EXPR` | `server`, `location` | — | Tag stored pages (whitespace/comma list) so they can be purged as a group. Needs `cache_turbo_redis`. |
 | `cache_turbo_admin NAME` | `location` | — | Make this location a control endpoint for zone `NAME` (stats/purge/warm). Gate with `allow`/`deny`. |
 | `cache_turbo_normalize_strip NAME...` | `server`, `location` | — | Extra query args to drop from `$cache_turbo_normalized_args` (trailing `*` = prefix), on top of the built-ins. |
@@ -481,6 +482,28 @@ trailing option, which **overrides** the DSN:
 > TLS needs nginx built with `--with-http_ssl_module` (the stock `nginx`
 > package is). Without it, a `rediss://` / `tls=on` config is rejected at start.
 > Passwords sit in your nginx config — keep it `chmod 600` / out of git.
+
+### memcached L2 (alternative backend)
+
+If you already run **memcached** as your shared cache, point the L2 tier at it
+instead of Redis with `cache_turbo_memcached` — same write-through-on-store /
+sync-`GET`-on-L1-miss model, native client (no `libmemcached`):
+
+```nginx
+cache_turbo_memcached 127.0.0.1:11211 prefix=mc: timeout=250ms;
+```
+
+memcached is deliberately the *lean* L2: it has no sorted sets, no `SCAN`, and
+no atomic `SET-NX`, so the features that need those are **unavailable** on it —
+**tag purge** (`cache_turbo_tag`, `POST /_cache?tag=`), **whole-keyspace
+purge** (`POST /_cache?all=1` clears L1 only), and the **cross-node
+single-flight lock** (per-box single-flight still works). Single-key purge,
+write-through, cross-instance fill and stale-while-revalidate all work as with
+Redis. Values at/above memcached's 1 MiB item ceiling are skipped (the page
+stays L1-only). Use Redis if you need tags or cluster-wide dogpile protection;
+use memcached if you already run one and want a simple shared object tier.
+`cache_turbo_redis` and `cache_turbo_memcached` are mutually exclusive in the
+same block.
 
 ## Cache-key normalization
 
