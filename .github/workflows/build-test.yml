@@ -43,17 +43,15 @@ jobs:
       - name: Static analysis (R7 shm-lock invariant + cppcheck + whitespace)
         run: |
           bash tools/lint-shm-lock.sh
+          # Scan every source (CI-4): the explicit list previously omitted
+          # src/ngx_http_cache_turbo_autotune.c. A glob keeps new sources covered.
           cppcheck \
             --enable=warning,performance,portability \
             --error-exitcode=1 \
             --suppress=missingIncludeSystem \
             --suppress=normalCheckLevelMaxBranches \
             --suppress=unusedFunction \
-            src/ngx_http_cache_turbo_module.c \
-            src/ngx_http_cache_turbo_shm.c \
-            src/ngx_http_cache_turbo_swr.c \
-            src/ngx_http_cache_turbo_redis.c \
-            src/ngx_http_cache_turbo_memcached.c
+            src/*.c
           git diff --check
 
       - name: Lint workflows

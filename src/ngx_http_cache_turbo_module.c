@@ -1161,9 +1161,19 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                 return NGX_DECLINED;
             }
 
-            stale_window = ngx_http_cache_turbo_stale_ttl(clcf->valid,
-                               clcf->stale_mult)
-                           - clcf->valid;
+            /* Refresh-dice window from the OBJECT's own deadlines, not the
+             * location default (COR-3): a per-status TTL or an honor_cc upstream
+             * max-age gives this node a different fresh/stale span than
+             * clcf->valid, so using clcf->valid here mis-scaled the dice and such
+             * objects could expire cold. stale_until == 0 (no stale deadline)
+             * falls back to the location-derived window. */
+            if (ctn->stale_until != 0) {
+                stale_window = ctn->stale_until - fresh_until;
+            } else {
+                stale_window = ngx_http_cache_turbo_stale_ttl(clcf->valid,
+                                   clcf->stale_mult)
+                               - clcf->valid;
+            }
             if (stale_window <= 0) {
                 stale_window = 1;
             }
@@ -2692,6 +2702,20 @@ ngx_http_cache_turbo_valid_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                 "cache_turbo_valid: bad status code \"%V\"", &value[i]);
             return NGX_CONF_ERROR;
         }
+        /* Reject statuses that must not stand alone as a cached representation
+         * (COR-12): 1xx informational are not final responses; 206 has no Range
+         * in the key (a stored partial would be replayed for another range); 304
+         * is a conditional answer that must never be served to an unconditional
+         * request. The body filter also refuses 206 at store time, but rejecting
+         * here turns a meaningless config into a clear error. */
+        if (code < 200 || code == NGX_HTTP_PARTIAL_CONTENT
+            || code == NGX_HTTP_NOT_MODIFIED)
+        {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                "cache_turbo_valid: status %V cannot be cached standalone "
+                "(1xx/206/304 refused)", &value[i]);
+            return NGX_CONF_ERROR;
+        }
         v = ngx_array_push(clcf->valid_status);
         if (v == NULL) {
             return NGX_CONF_ERROR;
@@ -3398,8 +3422,12 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
         ngx_str_t  arg;
         ngx_uint_t purged = 0;
 
+        /* Require all=1 explicitly (COR-10): mere presence of the arg used to
+         * purge, so a typo like ?all=0 destroyed the whole zone. Only the exact
+         * value "1" triggers the all-purge now. */
         if (r->args.len
-            && ngx_http_arg(r, (u_char *) "all", 3, &arg) == NGX_OK)
+            && ngx_http_arg(r, (u_char *) "all", 3, &arg) == NGX_OK
+            && arg.len == 1 && arg.data[0] == '1')
         {
             purged = clcf->l1->purge_all(z);
 

@@ -1638,6 +1638,27 @@ def test_invalid_auto_mode(ng: Nginx) -> None:
         f"missing/odd diagnostic for bad mode:\n{r.stdout}"
 
 
+def test_valid_status_rejects_304(ng: Nginx) -> None:
+    """COR-12: a per-status cache_turbo_valid naming 304 (or 206 / 1xx) is a
+    meaningless standalone cache entry and must be rejected at config time."""
+    bad = ng.root.parent / "bad-status"
+    (bad / "conf").mkdir(parents=True, exist_ok=True)
+    (bad / "logs").mkdir(parents=True, exist_ok=True)
+    cfg = nginx_config(bad, ng.port, ng.module, ng.origin_port, 1)
+    cfg = cfg.replace("cache_turbo_valid    0;",
+                      "cache_turbo_valid    0;\n"
+                      "            cache_turbo_valid 304 1m;")
+    (bad / "conf" / "nginx.conf").write_text(cfg, encoding="ascii")
+    cmd = ng.runner + [str(ng.binary), "-p", str(bad),
+                       "-c", str(bad / "conf" / "nginx.conf"), "-t"]
+    r = subprocess.run(cmd, text=True, stdout=subprocess.PIPE,
+                       stderr=subprocess.STDOUT, timeout=20)
+    assert r.returncode != 0, \
+        f"standalone 304 was accepted by nginx -t:\n{r.stdout}"
+    assert "cannot be cached standalone" in r.stdout, \
+        f"missing/odd diagnostic for 304 status:\n{r.stdout}"
+
+
 def test_empty_l2_prefix_rejected(ng: Nginx) -> None:
     """An empty L2 prefix must fail nginx -t: Redis all-purge would otherwise
     become SCAN MATCH * and delete the selected database."""
@@ -1987,6 +2008,21 @@ def test_conditional_inm_304(ng: Nginx, origin: Origin) -> None:
     assert b1 == "", f"304 must have no body, got {b1!r}"
     assert h1.get("x-cache") == "HIT", f"304 should be a cache HIT: {h1}"
     assert origin.hits == before, "304 must be served from cache, not origin"
+
+
+def test_conditional_inm_list_short_first(ng: Nginx, origin: Origin) -> None:
+    """COR-11: an If-None-Match LIST whose FIRST tag is shorter than the cached
+    ETag must still match a later equal tag — the parser skips to the next comma
+    instead of bailing on the whole header."""
+    s0, _, h0 = fetch_raw(ng.port, "/cond/cond-list")
+    assert s0 == 200 and h0.get("etag") == '"v11etag"', f"prime: {s0} {h0}"
+    before = origin.hits
+    s1, b1, h1 = fetch_raw(ng.port, "/cond/cond-list",
+                           headers={"If-None-Match": '"x", "v11etag"'})
+    assert s1 == 304, f"a later matching tag must 304, got {s1}"
+    assert b1 == "", f"304 must have no body, got {b1!r}"
+    assert h1.get("x-cache") == "HIT" and origin.hits == before, \
+        "304 from the list must be served from cache"
 
 
 def test_conditional_inm_star(ng: Nginx) -> None:
@@ -2453,6 +2489,17 @@ def test_admin_purge_key(ng: Nginx) -> None:
     assert json.loads(b)["purged"] == 1, f"purge count: {b}"
     _, _, h2 = fetch(ng.port, "/c/purgeme")
     assert "x-cache" not in h2, "entry should be gone after purge (a MISS)"
+
+
+def test_admin_all_zero_does_not_purge(ng: Nginx) -> None:
+    """COR-10: only the exact ?all=1 purges; ?all=0 (a typo) must NOT destroy the
+    zone — the entry stays cached."""
+    fetch(ng.port, "/c/azkeep")                        # miss -> cached
+    _, _, h = fetch(ng.port, "/c/azkeep")
+    assert h.get("x-cache") == "HIT", "should be cached before the ?all=0 attempt"
+    fetch(ng.port, "/_cache?all=0", method="POST")     # must purge nothing
+    _, _, h2 = fetch(ng.port, "/c/azkeep")
+    assert h2.get("x-cache") == "HIT", "?all=0 wrongly purged the entry"
 
 
 def test_admin_purge_all(ng: Nginx) -> None:
@@ -3716,6 +3763,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_suppress_native_e2e_proxy_cache(ng)
     test_invalid_backend_name(ng)
     test_invalid_auto_mode(ng)
+    test_valid_status_rejects_304(ng)
     test_empty_l2_prefix_rejected(ng)
     test_no_cache_set_cookie(ng)
     test_no_cache_cc_private(ng)
@@ -3737,6 +3785,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_auto_vary_stale_marker_reachable(ng, origin)
     test_206_never_cached(ng, origin)
     test_conditional_inm_304(ng, origin)
+    test_conditional_inm_list_short_first(ng, origin)
     test_conditional_inm_star(ng)
     test_conditional_inm_mismatch_full(ng)
     test_conditional_ims_304(ng)
@@ -3818,6 +3867,7 @@ def run_all(ng: Nginx, origin: Origin,
         test_l2_memcached_write_through(ng, origin, mc)        # v13
         test_l2_memcached_cross_instance_fill(ng, origin, mc)  # v13
         test_l2_memcached_purge_key_drops_l2(ng, origin, mc)   # v13
+    test_admin_all_zero_does_not_purge(ng)
     test_admin_purge_all(ng)   # last: it empties the zone
 
 

@@ -150,15 +150,16 @@ ngx_http_cache_turbo_shm_lookup(ngx_http_cache_turbo_zone_t *z,
 }
 
 
-/* Evict the least-recently-used entry. Caller holds the shpool mutex. */
-static void
+/* Evict the least-recently-used entry. Caller holds the shpool mutex. Returns 1
+ * if an entry was evicted, 0 if the LRU was already empty (no candidate). */
+static ngx_int_t
 ngx_http_cache_turbo_shm_evict_one(ngx_http_cache_turbo_zone_t *z)
 {
     ngx_queue_t                  *q;
     ngx_http_cache_turbo_node_t  *ctn;
 
     if (ngx_queue_empty(&z->sh->lru)) {
-        return;
+        return 0;
     }
 
     q = ngx_queue_last(&z->sh->lru);
@@ -173,6 +174,25 @@ ngx_http_cache_turbo_shm_evict_one(ngx_http_cache_turbo_zone_t *z)
     ngx_slab_free_locked(z->shpool, ctn);
 
     (void) ngx_atomic_fetch_add(&z->sh->evictions, 1);
+    return 1;
+}
+
+
+/* Slab-alloc `size` bytes, evicting LRU entries one at a time until the
+ * allocation succeeds or no candidate remains (PERF-6). A single fragmented
+ * allocation could previously fail even when several reclaimable entries would
+ * together free enough space; this drains as many as needed. Caller holds the
+ * shpool mutex; any node that must NOT be evicted (e.g. the one being refreshed)
+ * must be detached from the LRU before calling. */
+static void *
+ngx_http_cache_turbo_shm_alloc_evict(ngx_http_cache_turbo_zone_t *z, size_t size)
+{
+    void  *p = ngx_slab_alloc_locked(z->shpool, size);
+
+    while (p == NULL && ngx_http_cache_turbo_shm_evict_one(z)) {
+        p = ngx_slab_alloc_locked(z->shpool, size);
+    }
+    return p;
 }
 
 
@@ -256,11 +276,7 @@ ngx_http_cache_turbo_shm_store(ngx_http_cache_turbo_zone_t *z,
          * Re-inserted at the LRU head on success, restored on alloc fail. */
         ngx_queue_remove(&ctn->lru);
 
-        body = ngx_slab_alloc_locked(z->shpool, len);
-        if (body == NULL) {
-            ngx_http_cache_turbo_shm_evict_one(z);
-            body = ngx_slab_alloc_locked(z->shpool, len);
-        }
+        body = ngx_http_cache_turbo_shm_alloc_evict(z, len);
         if (body == NULL) {
             /* Refresh failed: keep the existing (stale) entry reachable. */
             ngx_queue_insert_head(&z->sh->lru, &ctn->lru);
@@ -286,23 +302,14 @@ ngx_http_cache_turbo_shm_store(ngx_http_cache_turbo_zone_t *z,
     }
 
     /* New entry. */
-    ctn = ngx_slab_alloc_locked(z->shpool,
-                                sizeof(ngx_http_cache_turbo_node_t));
-    if (ctn == NULL) {
-        ngx_http_cache_turbo_shm_evict_one(z);
-        ctn = ngx_slab_alloc_locked(z->shpool,
-                                    sizeof(ngx_http_cache_turbo_node_t));
-    }
+    ctn = ngx_http_cache_turbo_shm_alloc_evict(z,
+              sizeof(ngx_http_cache_turbo_node_t));
     if (ctn == NULL) {
         ngx_shmtx_unlock(&z->shpool->mutex);
         return NGX_ERROR;
     }
 
-    body = ngx_slab_alloc_locked(z->shpool, len);
-    if (body == NULL) {
-        ngx_http_cache_turbo_shm_evict_one(z);
-        body = ngx_slab_alloc_locked(z->shpool, len);
-    }
+    body = ngx_http_cache_turbo_shm_alloc_evict(z, len);
     if (body == NULL) {
         ngx_slab_free_locked(z->shpool, ctn);
         ngx_shmtx_unlock(&z->shpool->mutex);
@@ -398,13 +405,8 @@ ngx_http_cache_turbo_shm_claim(ngx_http_cache_turbo_zone_t *z,
      * The winner's store() finds it via lookup and overwrites it into a real
      * node (clearing refreshing). LRU eviction may reclaim a stub under memory
      * pressure — harmless, it just costs an extra origin hit. */
-    ctn = ngx_slab_alloc_locked(z->shpool,
-                                sizeof(ngx_http_cache_turbo_node_t));
-    if (ctn == NULL) {
-        ngx_http_cache_turbo_shm_evict_one(z);
-        ctn = ngx_slab_alloc_locked(z->shpool,
-                                    sizeof(ngx_http_cache_turbo_node_t));
-    }
+    ctn = ngx_http_cache_turbo_shm_alloc_evict(z,
+              sizeof(ngx_http_cache_turbo_node_t));
     if (ctn == NULL) {
         /* Out of slab: cannot mark the key in flight, so just regenerate
          * (winner, no single-flight this time — correct, only less efficient). */
@@ -501,13 +503,8 @@ ngx_http_cache_turbo_shm_count_miss(ngx_http_cache_turbo_zone_t *z,
      * branches (their len > 0 guards skip it) and converts into the cold-miss
      * winner's stub via claim() once the threshold is reached. LRU eviction may
      * reclaim a cold counter node — harmless, it just resets the count. */
-    ctn = ngx_slab_alloc_locked(z->shpool,
-                                sizeof(ngx_http_cache_turbo_node_t));
-    if (ctn == NULL) {
-        ngx_http_cache_turbo_shm_evict_one(z);
-        ctn = ngx_slab_alloc_locked(z->shpool,
-                                    sizeof(ngx_http_cache_turbo_node_t));
-    }
+    ctn = ngx_http_cache_turbo_shm_alloc_evict(z,
+              sizeof(ngx_http_cache_turbo_node_t));
     if (ctn == NULL) {
         /* Out of slab: cannot track the count, so just let it cache now
          * (correct, only less selective than min_uses would like). */
