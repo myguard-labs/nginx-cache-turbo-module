@@ -187,6 +187,12 @@ is never served stale and never re-fetched on its own — purge it explicitly to
 update). Internally this is a long finite TTL, so it still works across the L2
 (Redis/memcached) tier like any other entry.
 
+> ⚠️ `cache_turbo_valid` **replaces, it does not merge.** If a nested `location`
+> sets any `cache_turbo_valid` of its own, it discards the *entire* set inherited
+> from the parent (all status-code TTLs included) — standard nginx array-merge
+> semantics. Re-state every status line you still want in the nested block; don't
+> assume the parent's `301`/`404` TTLs carry through once you add a child rule.
+
 And it **refuses** to cache anything that looks per-user, so you don't
 accidentally serve Alice's logged-in page to Bob:
 
@@ -225,6 +231,14 @@ one that varies on `Cookie` or `Authorization`, is treated as **uncacheable**
 other named header is also treated as uncacheable** — the module can't key on it,
 and caching a single representation for every value of that header would serve the
 wrong one (RFC 9110 §12.5.5).
+
+> ⚠️ Don't double-partition the same axis. If you both turn on
+> `cache_turbo_auto_vary` *and* add the matching `cache_turbo_normalize_vary`
+> bucket (e.g. `encoding`) for an axis the origin already lists in `Vary`, the
+> cache splits on it **twice** — once via the normalized-args key, once via the
+> variant key — multiplying the slot count for no benefit. Pick one mechanism per
+> axis: `normalize_vary` when you know the axis up front, `auto_vary` to learn it
+> from the response.
 
 Keying is two-level and node-local: the first time a URL's response is seen to
 vary, the module records a tiny *vary marker* in L1 and stores the body under a
@@ -503,6 +517,8 @@ trailing option, which **overrides** the DSN:
 | `tls_name=<host>` | DSN host | Name used for SNI + cert verification. |
 | `prefix=` | `ct:` | Key prefix in Redis. |
 | `timeout=` | `250ms` | Connect/read timeout. |
+| `keepalive=N` | `0` (off) | Idle connections pooled per worker for reuse. A pooled conn is reused only within the same db/credentials/TLS context. `0` opens a fresh connection per op. |
+| `keepalive_timeout=` | `60s` | How long an idle pooled connection is kept before it is closed. |
 
 > TLS needs nginx built with `--with-http_ssl_module` (the stock `nginx`
 > package is). Without it, a `rediss://` / `tls=on` config is rejected at start.
