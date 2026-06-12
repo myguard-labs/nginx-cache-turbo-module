@@ -371,6 +371,109 @@ $ curl -X POST 'localhost/_cache?url=/,/blog/,/about' # pre-warm cold pages
 > ⚠️ The admin location purges the cache and `?url=` fires server-side fetches
 > to local paths. Always gate it with `allow`/`deny` (or auth). Never public.
 
+## Every directive in one place (full syntax)
+
+A single annotated config that names **every** directive with valid syntax and
+its **default** value, so you can copy a line out and change it. The values
+shown *are* the defaults — a block with all of them deleted behaves identically
+to one with all of them present.
+
+> ⚠️ This block is a **reference, not a paste-me**. A few directives are
+> mutually exclusive or context-restricted (Redis vs memcached, the `http`-only
+> zone, the `location`-only admin endpoint) — see the comments and the
+> [interaction matrix](#mutually-exclusive--interacting-directives) below. Lift
+> the lines you need into the right context.
+
+```nginx
+load_module modules/ngx_http_cache_turbo_module.so;
+
+http {
+    # ── http context only ───────────────────────────────────────────────
+    cache_turbo_zone name=ct 256m;          # declare the shm zone (min 8 pages)
+
+    # L2 tier — pick AT MOST ONE of the next two (mutually exclusive per block).
+    # Both also valid at server/location scope; declared here they're inherited.
+    cache_turbo_redis     redis://127.0.0.1:6379/0 prefix=ct: timeout=250ms
+                          tls=off tls_verify=on keepalive=0 keepalive_timeout=60s;
+  # cache_turbo_memcached 127.0.0.1:11211 prefix=ct: timeout=250ms;
+
+    server {
+        listen 80;
+        server_name example.com;
+
+        location / {
+            # ── turn it on ──────────────────────────────────────────────
+            cache_turbo                   ct;        # bind zone "ct" (or: off)
+          # cache_turbo                   ct auto;   # = also cache_turbo_backend generic
+            cache_turbo_backend           generic;   # generic|wordpress|woocommerce|joomla (stackable); implies honor_cache_control on
+
+            # ── what is "the same page" ─────────────────────────────────
+            cache_turbo_key               $host$uri$cache_turbo_normalized_args;  # the default
+            cache_turbo_safe_key          off;       # on = raw $scheme$host$request_uri default key (no strip/sort); no effect once key is set
+            cache_turbo_normalize_strip   sid sessionid "tmp_*";   # extra args to drop (trailing * = prefix)
+            cache_turbo_normalize_strip_all off;     # on = drop ALL args (overrides the strip list)
+            cache_turbo_normalize_vary    encoding device;        # add variant buckets to the key
+
+            # ── freshness / staleness ───────────────────────────────────
+            cache_turbo_preset            balanced;  # conservative|balanced|aggressive — sets the 4 knobs below
+            cache_turbo_valid             60s;       # 200 TTL; 0 = cache forever
+            cache_turbo_valid             301 302 308 1h;   # repeatable: cache redirects
+            cache_turbo_valid             404 410 1m;       #            negative caching
+            cache_turbo_beta              1000;      # refresh eagerness ×1000
+            cache_turbo_lock_ttl          5s;        # single-flight refresh window
+            cache_turbo_honor_cache_control off;     # on = take TTL from response Cache-Control/Expires
+            cache_turbo_background_update on;        # SWR + stale-if-error (off = inline regen)
+            cache_turbo_max_size          1m;        # don't cache bodies bigger than this
+
+            # ── dogpile / admission control ─────────────────────────────
+            cache_turbo_lock              on;        # cold-miss single-flight (others wait for the fill)
+            cache_turbo_lock_timeout      5s;        # how long a waiter waits before going to origin itself
+            cache_turbo_min_uses          1;         # cache only after the key is seen N times (1 = first miss)
+
+            # ── per-request opt-outs ────────────────────────────────────
+            cache_turbo_bypass            $cookie_session $arg_nocache;  # skip lookup, still store
+            cache_turbo_no_store          $cookie_session;              # don't store the response
+
+            # ── Vary handling ───────────────────────────────────────────
+            cache_turbo_auto_vary         off;       # on = read response Vary, split automatically
+            cache_turbo_vary_safe         off;       # on = refuse to cache an un-keyed Vary response
+
+            # ── L2 grouping / tuning ────────────────────────────────────
+            cache_turbo_tag               $upstream_http_x_cache_tags;  # needs cache_turbo_redis
+            cache_turbo_autotune          off;       # on = derive beta from measured backend latency
+            cache_turbo_autotune_interval 30s;       # how often autotune recomputes
+
+            # ── stacking with native proxy_cache ────────────────────────
+            cache_turbo_suppress_native   off;       # on = drive $cache_turbo_active for proxy_no_cache
+
+            proxy_pass http://127.0.0.1:8080;
+        }
+
+        # ── location context only ───────────────────────────────────────
+        location = /_cache {
+            cache_turbo_admin ct;        # stats / purge / warm endpoint
+            cache_turbo_purge on;        # also accept PURGE <uri>
+            allow 127.0.0.1;
+            deny  all;                   # NEVER public
+        }
+    }
+}
+```
+
+### Mutually exclusive / interacting directives
+
+| Pair | Relationship | What happens |
+|---|---|---|
+| `cache_turbo_redis` ↔ `cache_turbo_memcached` | **hard error** | One L2 per block. Declaring both in the same block fails the config at start ("the two are mutually exclusive"). |
+| `cache_turbo_tag` → `cache_turbo_redis` | **requires** | Tags need Redis sorted-sets. With memcached or no L2 the tag is rejected at config time (memcached has no tag/`?all`/cross-node lock). |
+| `cache_turbo_normalize_strip_all` ↔ `cache_turbo_normalize_strip` | **overrides** | `strip_all on` drops every arg, so the explicit strip list becomes a no-op. Use one or the other. |
+| `cache_turbo_safe_key` ↔ `cache_turbo_key` | **inert when set** | `safe_key` only chooses the *default* key. An explicit `cache_turbo_key` wins and `safe_key` has no effect. |
+| `cache_turbo_auto_vary` ↔ `cache_turbo_normalize_vary` | **don't double-cover an axis** | Not an error, but keying the same axis (e.g. `encoding`) via both multiplies the slot count for no benefit. Pick one per axis. |
+| `cache_turbo_vary_safe` ↔ `cache_turbo_auto_vary` | **mostly redundant together** | With `auto_vary on` the un-keyable axes are already refused; `vary_safe` only tightens the `auto_vary off` case. |
+| `cache_turbo_preset` ↔ `cache_turbo_valid`/`_beta`/`_lock_ttl` | **explicit wins** | The preset sets a band of defaults; any explicit knob overrides just that knob (the rest stay at the preset). Not exclusive. |
+| `cache_turbo_backend` / `cache_turbo … auto` → `cache_turbo_honor_cache_control` | **implies** | Enabling any CMS auto-classify preset flips `honor_cache_control` on unless you set it explicitly. |
+| `cache_turbo_background_update off` → stale-if-error / SWR | **disables** | Inline regeneration replaces serve-stale-while-revalidate; a stale entry is no longer served during refresh, and stale-if-error no longer applies. |
+
 ## Directive synopsis
 
 | Directive | Context | Default | What it does |
