@@ -31,7 +31,8 @@ static ngx_int_t ngx_http_cache_turbo_body_filter(ngx_http_request_t *r,
     ngx_chain_t *in);
 
 static ngx_int_t ngx_http_cache_turbo_serve(ngx_http_request_t *r,
-    u_char *copy, size_t len, ngx_uint_t stale);
+    u_char *copy, size_t len, ngx_uint_t stale,
+    ngx_http_cache_turbo_zone_t *z, u_char *ref_data);
 static ngx_int_t ngx_http_cache_turbo_restore_response(ngx_http_request_t *r,
     u_char *copy, size_t len, ngx_uint_t stale, const char *xcache,
     u_char **bodyp, size_t *body_lenp);
@@ -1672,14 +1673,13 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
         }
 
         if (now < fresh_until && fresh_ok) {
-            /* fresh hit: copy out of shm under lock, send after unlocking */
-            u_char *snap = ngx_pnalloc(r->pool, ctn->len);
-            size_t  snap_len = ctn->len;
-            if (snap == NULL) {
-                ngx_shmtx_unlock(&z->shpool->mutex);
-                return NGX_ERROR;
-            }
-            ngx_memcpy(snap, ctn->data, snap_len);
+            /* PERF-7 fresh hit: serve the blob DIRECTLY out of shm (zero-copy).
+             * Pin it with a reference under the mutex we already hold; the serve
+             * path registers a pool cleanup that drops the ref once the response
+             * has drained, so eviction/refresh by any worker is safe meanwhile. */
+            u_char *body = ctn->data;
+            size_t  body_len = ctn->len;
+            ngx_http_cache_turbo_blob_acquire(body);
             /* True LRU: promote this node to the head on access, so eviction
              * targets the genuinely least-recently-used entry (not the oldest by
              * insertion/refresh). Cheap queue splice under the mutex we hold. */
@@ -1689,8 +1689,8 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
             (void) ngx_atomic_fetch_add(&z->sh->hits, 1);
             ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                            "cache_turbo: L1 HIT (fresh) \"%V\" key=%ui len=%uz",
-                           &r->uri, (ngx_uint_t) hash, snap_len);
-            return ngx_http_cache_turbo_serve(r, snap, snap_len, 0);
+                           &r->uri, (ngx_uint_t) hash, body_len);
+            return ngx_http_cache_turbo_serve(r, body, body_len, 0, z, body);
         }
 
         if ((stale_until == 0 || now < stale_until) && ctn->len > 0 && stale_ok) {
@@ -1735,7 +1735,8 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                                    "cache_turbo: cross-node WON bg-refresh + STALE "
                                    "serve \"%V\" key=%ui len=%uz",
                                    &r->uri, (ngx_uint_t) hash, snap_len);
-                    return ngx_http_cache_turbo_serve(r, snap, snap_len, 1);
+                    return ngx_http_cache_turbo_serve(r, snap, snap_len, 1,
+                                                      z, NULL);
                 }
                 ngx_shmtx_unlock(&z->shpool->mutex);
                 ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
@@ -1839,7 +1840,8 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                                    "cache_turbo: bg-refresh + STALE serve \"%V\" "
                                    "key=%ui len=%uz", &r->uri, (ngx_uint_t) hash,
                                    snap_len);
-                    return ngx_http_cache_turbo_serve(r, snap, snap_len, 1);
+                    return ngx_http_cache_turbo_serve(r, snap, snap_len, 1,
+                                                      z, NULL);
                 }
 
                 return NGX_DECLINED;       /* inline regen (serves fresh) */
@@ -1847,19 +1849,16 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
 
             /* serve stale, no regeneration on this request */
             {
-                u_char *snap = ngx_pnalloc(r->pool, ctn->len);
-                size_t  snap_len = ctn->len;
-                if (snap == NULL) {
-                    ngx_shmtx_unlock(&z->shpool->mutex);
-                    return NGX_ERROR;
-                }
-                ngx_memcpy(snap, ctn->data, snap_len);
+                /* PERF-7: zero-copy stale serve (see the fresh-hit path). */
+                u_char *body = ctn->data;
+                size_t  body_len = ctn->len;
+                ngx_http_cache_turbo_blob_acquire(body);
                 ngx_shmtx_unlock(&z->shpool->mutex);
                 (void) ngx_atomic_fetch_add(&z->sh->stale_serves, 1);
                 ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                                "cache_turbo: STALE serve \"%V\" key=%ui len=%uz",
-                               &r->uri, (ngx_uint_t) hash, snap_len);
-                return ngx_http_cache_turbo_serve(r, snap, snap_len, 1);
+                               &r->uri, (ngx_uint_t) hash, body_len);
+                return ngx_http_cache_turbo_serve(r, body, body_len, 1, z, body);
             }
         }
 
@@ -1990,7 +1989,8 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                                    "(filled L1)", &r->uri, (ngx_uint_t) hash,
                                    ctx->l2_blob_len);
                     return ngx_http_cache_turbo_serve(r, ctx->l2_blob,
-                               ctx->l2_blob_len, rem_fresh <= 0 ? 1 : 0);
+                               ctx->l2_blob_len, rem_fresh <= 0 ? 1 : 0,
+                               z, NULL);   /* L2 blob lives in r->pool, no ref */
                 }
             }
         }
@@ -2087,7 +2087,6 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
             /* A real fresh entry raced in while we were on the cold path
              * (another local winner finished): re-serve it from L1. */
             ngx_http_cache_turbo_node_t  *fresh;
-            u_char                       *snap;
             size_t                        snap_len;
 
             ngx_shmtx_lock(&z->shpool->mutex);
@@ -2100,19 +2099,16 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                 && ngx_time() < fresh->fresh_until
                 && !ctx->req_reval)
             {
+                /* PERF-7: zero-copy serve of the raced-in fresh entry. */
+                u_char *body = fresh->data;
                 snap_len = fresh->len;
-                snap = ngx_pnalloc(r->pool, snap_len);
-                if (snap == NULL) {
-                    ngx_shmtx_unlock(&z->shpool->mutex);
-                    return NGX_ERROR;
-                }
-                ngx_memcpy(snap, fresh->data, snap_len);
+                ngx_http_cache_turbo_blob_acquire(body);
                 ngx_shmtx_unlock(&z->shpool->mutex);
                 (void) ngx_atomic_fetch_add(&z->sh->hits, 1);
                 ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                                "cache_turbo: cold-miss raced to FRESH \"%V\" "
                                "key=%ui -> serve", &r->uri, (ngx_uint_t) hash);
-                return ngx_http_cache_turbo_serve(r, snap, snap_len, 0);
+                return ngx_http_cache_turbo_serve(r, body, snap_len, 0, z, body);
             }
             ngx_shmtx_unlock(&z->shpool->mutex);
             /* vanished again (evicted/expired in the race): go to origin */
@@ -2581,6 +2577,24 @@ ngx_http_cache_turbo_restore_response(ngx_http_request_t *r, u_char *copy,
 }
 
 
+/* PERF-7: request-pool cleanup that drops a zero-copy serve's blob reference once
+ * the response has been fully sent (pool destroy happens after the output chain
+ * drains). `z` + `data` identify the blob; the slab is freed here only if the
+ * owning node already detached it (evict/refresh/purge raced the serve). */
+typedef struct {
+    ngx_http_cache_turbo_zone_t  *z;
+    u_char                       *data;
+} ngx_http_cache_turbo_blob_cln_t;
+
+static void
+ngx_http_cache_turbo_blob_cleanup(void *data)
+{
+    ngx_http_cache_turbo_blob_cln_t  *c = data;
+
+    ngx_http_cache_turbo_blob_release(c->z, c->data);
+}
+
+
 /*
  * Send a fully validated cache blob as the response: rebuild r->headers_out
  * from it (ngx_http_cache_turbo_restore_response), then send the header and the
@@ -2588,17 +2602,43 @@ ngx_http_cache_turbo_restore_response(ngx_http_request_t *r, u_char *copy,
  * handler. The RFC-2 serve-on-error path does NOT use this — it reuses only the
  * restore step from the header filter (a send_header + finalize here would
  * double-finalize the in-flight upstream-error request); see the header filter.
+ *
+ * PERF-7: when ref_data is non-NULL, `copy` is the blob still living in the shm
+ * slab (zero-copy serve); the caller has already taken a reference under the zone
+ * mutex (ngx_http_cache_turbo_blob_acquire) and we register a pool cleanup to
+ * drop it after the response drains. When ref_data is NULL, `copy` is a private
+ * r->pool buffer (an L2 blob or a copied snapshot) and no reference is held.
  */
 static ngx_int_t
 ngx_http_cache_turbo_serve(ngx_http_request_t *r, u_char *copy, size_t len,
-    ngx_uint_t stale)
+    ngx_uint_t stale, ngx_http_cache_turbo_zone_t *z, u_char *ref_data)
 {
-    u_char                       *body;
-    size_t                        body_len;
-    ngx_int_t                     rc;
-    ngx_buf_t                    *b;
-    ngx_chain_t                   out;
-    ngx_http_cache_turbo_ctx_t   *ctx;
+    u_char                           *body;
+    size_t                            body_len;
+    ngx_int_t                         rc;
+    ngx_buf_t                        *b;
+    ngx_chain_t                       out;
+    ngx_http_cache_turbo_ctx_t       *ctx;
+    ngx_pool_cleanup_t               *cln;
+    ngx_http_cache_turbo_blob_cln_t  *cc;
+
+    /* PERF-7: arm the reference drop FIRST, before any early return below, so the
+     * acquired ref is released exactly once on every exit path (the cleanup fires
+     * at request-pool destroy, after the output chain has drained). If the
+     * cleanup cannot be registered we must drop the ref now or the detached blob
+     * would leak forever. */
+    if (ref_data != NULL) {
+        cln = ngx_pool_cleanup_add(r->pool,
+                  sizeof(ngx_http_cache_turbo_blob_cln_t));
+        if (cln == NULL) {
+            ngx_http_cache_turbo_blob_release(z, ref_data);
+            return NGX_ERROR;
+        }
+        cln->handler = ngx_http_cache_turbo_blob_cleanup;
+        cc = cln->data;
+        cc->z = z;
+        cc->data = ref_data;
+    }
 
     ctx = ngx_http_get_module_ctx(r, ngx_http_cache_turbo_module);
     if (ctx) {
@@ -3066,7 +3106,7 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
         ngx_list_part_t                  *part;
         ngx_table_elt_t                  *h;
         ngx_str_t                         ct;
-        size_t                            hdr_bytes = 0, blob_len;
+        size_t                            hdr_bytes = 0, blob_len = 0;
         uint32_t                          nheaders = 0;
         u_char                           *blob, *w;
         ngx_uint_t                        i;

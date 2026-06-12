@@ -162,6 +162,29 @@ typedef struct {
 } ngx_http_cache_turbo_band_t;
 
 
+/* PERF-7: reference header prefixed to every slab-allocated response body so a
+ * cache HIT can serve the blob DIRECTLY out of shm (zero-copy) instead of
+ * memcpy'ing it into r->pool under the zone mutex. `data` (below) points at the
+ * blob bytes that follow this header; the header is recovered with CT_BLOBREF().
+ *
+ * Lifetime: while a request serves a blob its output buffer points into the
+ * slab, so the buffer must outlive eviction/refresh by another worker. `refs`
+ * counts the in-flight zero-copy servers; `detached` is set when the owning node
+ * has dropped this buffer (evict / refresh / purge). The slab is freed only when
+ * refs == 0 AND detached — i.e. by whichever side is last (the evicting worker if
+ * no serve is in flight, otherwise the last server's request-pool cleanup).
+ * ALL fields are mutated only under shpool->mutex, so plain ints suffice (the
+ * mutex is the barrier); no atomics. */
+typedef struct {
+    ngx_uint_t               refs;       /* in-flight zero-copy servers      */
+    ngx_uint_t               detached;   /* owning node dropped this buffer  */
+} ngx_http_cache_turbo_blobref_t;
+
+#define CT_BLOBREF(data)                                                       \
+    ((ngx_http_cache_turbo_blobref_t *)                                        \
+        ((u_char *) (data) - sizeof(ngx_http_cache_turbo_blobref_t)))
+
+
 /*
  * One cached object living in the shared-memory slab. The node key is the
  * 32-byte hash of the cache key; the variable-length body (headers + payload,
@@ -171,7 +194,8 @@ typedef struct {
     ngx_rbtree_node_t        node;       /* node.key = crc32 of cache key  */
     u_char                   key[32];    /* full key hash, collision guard */
 
-    u_char                  *data;       /* serialised response, slab alloc */
+    u_char                  *data;       /* blob bytes; CT_BLOBREF() header
+                                          * sits immediately before, slab alloc */
     size_t                   len;
 
     time_t                   fresh_until;   /* < now  => stale              */
@@ -698,6 +722,16 @@ extern ngx_module_t  ngx_http_cache_turbo_module;
 
 /* ---- shm.c ---- */
 ngx_int_t ngx_http_cache_turbo_shm_init_zone(ngx_shm_zone_t *zone, void *data);
+
+/* PERF-7 zero-copy serve refcount. acquire() pins a blob for an in-flight serve
+ * and MUST be called with shpool->mutex held (same critical section as the
+ * lookup that produced `data`). release() is the request-pool cleanup: it takes
+ * the mutex itself, drops the ref, and frees the slab if the owning node has
+ * already detached it. `data` is ngx_http_cache_turbo_node_t.data (the blob ptr,
+ * never NULL). */
+void ngx_http_cache_turbo_blob_acquire(u_char *data);
+void ngx_http_cache_turbo_blob_release(ngx_http_cache_turbo_zone_t *z,
+    u_char *data);
 
 ngx_http_cache_turbo_node_t *
     ngx_http_cache_turbo_shm_lookup(ngx_http_cache_turbo_zone_t *z,

@@ -150,6 +150,77 @@ ngx_http_cache_turbo_shm_lookup(ngx_http_cache_turbo_zone_t *z,
 }
 
 
+static void *ngx_http_cache_turbo_shm_alloc_evict(
+    ngx_http_cache_turbo_zone_t *z, size_t size);
+
+
+/* PERF-7: allocate a response blob with an ngx_http_cache_turbo_blobref_t header
+ * prefixed, so a HIT can be served zero-copy out of shm under refcount. Returns
+ * the BLOB pointer (== node->data; the header sits immediately before it), or
+ * NULL on slab exhaustion. Caller holds the shpool mutex. The header starts at
+ * refs == 0 / detached == 0 (only the owning node references it). */
+static u_char *
+ngx_http_cache_turbo_blob_alloc(ngx_http_cache_turbo_zone_t *z, size_t len)
+{
+    u_char                          *base;
+    ngx_http_cache_turbo_blobref_t  *ref;
+
+    base = ngx_http_cache_turbo_shm_alloc_evict(z,
+               sizeof(ngx_http_cache_turbo_blobref_t) + len);
+    if (base == NULL) {
+        return NULL;
+    }
+
+    ref = (ngx_http_cache_turbo_blobref_t *) base;
+    ref->refs = 0;
+    ref->detached = 0;
+
+    return base + sizeof(ngx_http_cache_turbo_blobref_t);
+}
+
+
+/* PERF-7: the owning node drops its reference to a blob (evict / refresh / purge).
+ * Caller holds the shpool mutex and `data` is non-NULL (node->data of a real
+ * entry). If no serve is in flight (refs == 0) the slab is freed now; otherwise
+ * it is marked detached and the last in-flight server frees it in its request-
+ * pool cleanup (ngx_http_cache_turbo_blob_release). */
+static void
+ngx_http_cache_turbo_blob_node_release(ngx_http_cache_turbo_zone_t *z,
+    u_char *data)
+{
+    ngx_http_cache_turbo_blobref_t  *ref = CT_BLOBREF(data);
+
+    if (ref->refs == 0) {
+        ngx_slab_free_locked(z->shpool, ref);
+        return;
+    }
+    ref->detached = 1;
+}
+
+
+/* PERF-7 exported helpers (see header). acquire under the caller's held mutex;
+ * release takes the mutex itself from a request-pool cleanup. */
+void
+ngx_http_cache_turbo_blob_acquire(u_char *data)
+{
+    CT_BLOBREF(data)->refs++;
+}
+
+
+void
+ngx_http_cache_turbo_blob_release(ngx_http_cache_turbo_zone_t *z, u_char *data)
+{
+    ngx_http_cache_turbo_blobref_t  *ref = CT_BLOBREF(data);
+
+    ngx_shmtx_lock(&z->shpool->mutex);
+    ref->refs--;
+    if (ref->refs == 0 && ref->detached) {
+        ngx_slab_free_locked(z->shpool, ref);
+    }
+    ngx_shmtx_unlock(&z->shpool->mutex);
+}
+
+
 /* Evict the least-recently-used entry. Caller holds the shpool mutex. Returns 1
  * if an entry was evicted, 0 if the LRU was already empty (no candidate). */
 static ngx_int_t
@@ -169,7 +240,7 @@ ngx_http_cache_turbo_shm_evict_one(ngx_http_cache_turbo_zone_t *z)
     ngx_rbtree_delete(&z->sh->rbtree, &ctn->node);
 
     if (ctn->data) {
-        ngx_slab_free_locked(z->shpool, ctn->data);
+        ngx_http_cache_turbo_blob_node_release(z, ctn->data);
     }
     ngx_slab_free_locked(z->shpool, ctn);
 
@@ -205,7 +276,7 @@ ngx_http_cache_turbo_shm_drop_locked(ngx_http_cache_turbo_zone_t *z,
     ngx_queue_remove(&ctn->lru);
     ngx_rbtree_delete(&z->sh->rbtree, &ctn->node);
     if (ctn->data) {
-        ngx_slab_free_locked(z->shpool, ctn->data);
+        ngx_http_cache_turbo_blob_node_release(z, ctn->data);
     }
     ngx_slab_free_locked(z->shpool, ctn);
 }
@@ -299,7 +370,7 @@ ngx_http_cache_turbo_shm_store(ngx_http_cache_turbo_zone_t *z,
          * Re-inserted at the LRU head on success, restored on alloc fail. */
         ngx_queue_remove(&ctn->lru);
 
-        body = ngx_http_cache_turbo_shm_alloc_evict(z, len);
+        body = ngx_http_cache_turbo_blob_alloc(z, len);
         if (body == NULL) {
             /* Refresh failed: keep the existing (stale) entry reachable. */
             ngx_queue_insert_head(&z->sh->lru, &ctn->lru);
@@ -309,7 +380,11 @@ ngx_http_cache_turbo_shm_store(ngx_http_cache_turbo_zone_t *z,
 
         ngx_memcpy(body, data, len);
         if (ctn->data) {
-            ngx_slab_free_locked(z->shpool, ctn->data);
+            /* PERF-7: the old blob may have an in-flight zero-copy server; this
+             * detaches it and frees only if no serve holds it (else the server's
+             * cleanup frees it). The new blob is independent, so a concurrent
+             * serve of the old one is unaffected. */
+            ngx_http_cache_turbo_blob_node_release(z, ctn->data);
         }
         ctn->data = body;
         ctn->len = len;
@@ -332,7 +407,7 @@ ngx_http_cache_turbo_shm_store(ngx_http_cache_turbo_zone_t *z,
         return NGX_ERROR;
     }
 
-    body = ngx_http_cache_turbo_shm_alloc_evict(z, len);
+    body = ngx_http_cache_turbo_blob_alloc(z, len);
     if (body == NULL) {
         ngx_slab_free_locked(z->shpool, ctn);
         ngx_shmtx_unlock(&z->shpool->mutex);

@@ -2974,6 +2974,30 @@ def test_lru_eviction(ng: Nginx) -> None:
         assert s == 200, f"/e/{i} returned {s}"
 
 
+def test_perf7_zero_copy_serve_under_eviction(ng: Nginx) -> None:
+    """PERF-7: a HIT serves the blob zero-copy DIRECTLY out of the shm slab
+    (no per-hit copy into r->pool), holding a refcount on the buffer until the
+    response drains. Hammer a working set far larger than the tiny zone in
+    parallel so blobs are evicted/refreshed by one worker while other in-flight
+    requests are still serving them. If the refcount is wrong (frees a buffer a
+    serve still points into, or double-frees), the multi-worker ASan run trips a
+    use-after-free / double-free here; the plain run still asserts no 5xx. Every
+    request must succeed."""
+    import random
+    keys = 300                       # > what the 8m tiny zone holds (see R6)
+    reqs = 4000
+    for i in range(keys):            # prime, forcing continuous eviction
+        fetch(ng.port, f"/e/p7-{i}")
+
+    def hit(_: int) -> int:
+        return fetch(ng.port, f"/e/p7-{random.randint(0, keys - 1)}")[0]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=48) as pool:
+        codes = list(pool.map(hit, range(reqs)))
+    bad = sorted({c for c in codes if c != 200})
+    assert not bad, f"non-200 under serve/eviction churn: {bad}"
+
+
 def test_concurrent_hits_no_deadlock(ng: Nginx) -> None:
     """R1: many parallel HITs on one key do not serialise/deadlock."""
     fetch(ng.port, "/c/conc")                      # prime
@@ -4593,6 +4617,11 @@ def run_all(ng: Nginx, origin: Origin,
         test_l2_memcached_write_through(ng, origin, mc)        # v13
         test_l2_memcached_cross_instance_fill(ng, origin, mc)  # v13
         test_l2_memcached_purge_key_drops_l2(ng, origin, mc)   # v13
+    # PERF-7 zero-copy serve stress: run LAST among L1 tests — its 48-thread /
+    # 4000-request eviction churn keeps the workers busy, so placing it before a
+    # timing-sensitive test (e.g. stale-if-error's ~0.8s bg-refresh window) can
+    # starve that window under the slow ASan build. Here it can't perturb others.
+    test_perf7_zero_copy_serve_under_eviction(ng)
     test_admin_all_zero_does_not_purge(ng)
     test_admin_purge_all(ng)   # last: it empties the zone
 
