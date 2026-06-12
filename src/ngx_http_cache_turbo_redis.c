@@ -29,6 +29,10 @@
  * buffer without bound. Comfortably above any sane cached page. */
 #define NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY  (64 * 1024 * 1024)
 
+/* Upper bound on an array reply element count, so a bogus "*<huge>" header
+ * can't make us allocate an enormous members array before any data arrives. */
+#define NGX_HTTP_CACHE_TURBO_REDIS_MAX_MEMBERS  (1024 * 1024)
+
 
 /*
  * One in-flight async redis operation. It owns its own pool so a fire-and-
@@ -63,6 +67,11 @@ typedef struct {
     ngx_http_cache_turbo_redis_members_pt  members_cb;
     void                        *members_data;
 
+    /* read_drain (fire-and-forget) only: how many top-level RESP replies the
+     * pipelined command produces. The connection is poolable (clean=1) only
+     * once ALL of them are fully framed (STAB-1). DEL = 1, tag_add = 3. */
+    ngx_uint_t                   expected_replies;
+
     u_char                      *rbuf;     /* GET/SMEMBERS: growable reply buf */
     size_t                       rcap;
     size_t                       rlen;
@@ -94,6 +103,8 @@ static void ngx_http_cache_turbo_redis_op_fail(
 static ngx_int_t ngx_http_cache_turbo_redis_launch(
     ngx_http_cache_turbo_redis_op_t *op,
     ngx_http_cache_turbo_loc_conf_t *clcf, void (*read_handler)(ngx_event_t *));
+static ngx_int_t ngx_http_cache_turbo_redis_frame(u_char *p, u_char *end,
+    ngx_uint_t depth, u_char **next);
 #if (NGX_SSL)
 static void ngx_http_cache_turbo_redis_tls_handshake(ngx_event_t *ev);
 static void ngx_http_cache_turbo_redis_tls_handshake_done(
@@ -943,6 +954,8 @@ ngx_http_cache_turbo_redis_fire_argv(ngx_http_cache_turbo_loc_conf_t *clcf,
         return;
     }
 
+    op->expected_replies = 1;              /* one command -> one RESP reply */
+
     op->send = ngx_http_cache_turbo_redis_encode(op->pool, argv, argc);
     if (op->send == NULL) {
         ngx_destroy_pool(op->pool);
@@ -1118,6 +1131,8 @@ ngx_http_cache_turbo_redis_tag_add(ngx_http_cache_turbo_loc_conf_t *clcf,
     op->send->last = ngx_cpymem(op->send->last, sadd->pos, n1);
     op->send->last = ngx_cpymem(op->send->last, exp_nx->pos, n2);
     op->send->last = ngx_cpymem(op->send->last, exp_gt->pos, n3);
+
+    op->expected_replies = 3;              /* SADD + EXPIRE NX + EXPIRE GT */
 
     if (ngx_http_cache_turbo_redis_launch(op, clcf,
             ngx_http_cache_turbo_redis_read_drain) != NGX_OK)
@@ -1565,44 +1580,99 @@ ngx_http_cache_turbo_redis_read_preamble(ngx_event_t *rev)
 }
 
 
-/* SET reply: we only need redis to have acknowledged; drain one read and stop. */
+/*
+ * Fire-and-forget reply drain (SET / DEL / pipelined SADD+EXPIRE). The command
+ * is durable the moment redis acknowledges, so the RESULT is ignored — but the
+ * connection may only be POOLED once every expected reply is fully framed.
+ *
+ * STAB-1: the old code set clean=1 on any single recv() that returned >0 bytes.
+ * That pooled a connection (a) when a reply arrived TCP-split (`+OK` now, `\r\n`
+ * later) and (b) for tag_add, which pipelines THREE replies (SADD + EXPIRE NX +
+ * EXPIRE GT) — draining one and pooling left two replies in flight, so the next
+ * reuse read them as its own reply and desynced. Now we accumulate into the
+ * scratch buffer and frame op->expected_replies complete RESP replies before
+ * marking the connection clean.
+ */
 static void
 ngx_http_cache_turbo_redis_read_drain(ngx_event_t *rev)
 {
     ssize_t                           n;
+    ngx_int_t                         rc;
+    ngx_uint_t                        seen, expected;
+    u_char                           *p, *last, *next;
     ngx_connection_t                 *c;
     ngx_http_cache_turbo_redis_op_t  *op;
 
     c = rev->data;
     op = c->data;
 
+    expected = op->expected_replies ? op->expected_replies : 1;
+
     if (rev->timedout) {
         ngx_log_error(NGX_LOG_INFO, c->log, NGX_ETIMEDOUT,
                       "cache_turbo: redis read timed out");
+        ngx_http_cache_turbo_redis_op_done(op);   /* clean stays 0: not pooled */
+        return;
+    }
+
+    for ( ;; ) {
+        if (op->recv_len >= sizeof(op->recv)) {
+            /* Replies to our fire-and-forget commands (integers, +OK, a short
+             * -ERR) never fill the scratch buffer; if one somehow does, just
+             * don't pool the connection rather than grow it unbounded. */
+            ngx_http_cache_turbo_redis_op_done(op);
+            return;
+        }
+
+        n = c->recv(c, op->recv + op->recv_len,
+                    sizeof(op->recv) - op->recv_len);
+
+        if (n == NGX_AGAIN) {
+            if (ngx_handle_read_event(rev, 0) != NGX_OK) {
+                ngx_http_cache_turbo_redis_op_done(op);
+            }
+            return;
+        }
+        if (n == NGX_ERROR || n == 0) {
+            /* Peer closed/errored before all replies framed: don't pool. */
+            ngx_http_cache_turbo_redis_op_done(op);
+            return;
+        }
+
+        op->recv_len += (size_t) n;
+
+        /* Frame every expected reply; only when ALL are fully buffered is the
+         * stream at a clean boundary and the connection poolable. */
+        seen = 0;
+        p = op->recv;
+        last = op->recv + op->recv_len;
+        while (seen < expected) {
+            rc = ngx_http_cache_turbo_redis_frame(p, last, 0, &next);
+            if (rc == NGX_AGAIN) {
+                break;                     /* partial: read more bytes */
+            }
+            if (rc == NGX_DECLINED) {
+                /* Malformed reply: drain is best-effort, don't pool. */
+                ngx_http_cache_turbo_redis_op_done(op);
+                return;
+            }
+            if (*p == '-') {
+                ngx_log_error(NGX_LOG_INFO, c->log, 0,
+                              "cache_turbo: redis command error: %*s",
+                              (size_t) (next - p > 64 ? 64 : next - p), p);
+            }
+            seen++;
+            p = next;
+        }
+
+        if (seen < expected) {
+            continue;                      /* need more reply bytes */
+        }
+
+        op->clean = 1;                     /* all replies consumed: poolable */
         ngx_http_cache_turbo_redis_op_done(op);
         return;
     }
-
-    n = c->recv(c, op->recv, sizeof(op->recv));
-
-    if (n == NGX_AGAIN) {
-        if (ngx_handle_read_event(rev, 0) != NGX_OK) {
-            ngx_http_cache_turbo_redis_op_done(op);
-        }
-        return;
-    }
-
-    /* Any reply (+OK / -ERR), EOF, or error: the SET is durable the moment
-     * redis acknowledges; fire-and-forget cares no more. */
-    if (n > 0 && op->recv[0] == '-') {
-        ngx_log_error(NGX_LOG_INFO, c->log, 0,
-                      "cache_turbo: redis SET error: %*s",
-                      (size_t) (n > 64 ? 64 : n), op->recv);
-    }
-    if (n > 0) {
-        op->clean = 1;                     /* ack consumed: connection poolable */
-    }
-    ngx_http_cache_turbo_redis_op_done(op);
 }
 
 
@@ -1760,9 +1830,102 @@ ngx_http_cache_turbo_redis_read_get(ngx_event_t *rev)
 }
 
 
-/* Upper bound on a SMEMBERS reply element count, so a bogus "*<huge>" header
- * can't make us allocate an enormous members array before any data arrives. */
-#define NGX_HTTP_CACHE_TURBO_REDIS_MAX_MEMBERS  (1024 * 1024)
+/* Cap recursion so a buggy/hostile server can't blow the stack with deeply
+ * nested arrays. Replies to the commands we issue nest at most 2 deep (SCAN). */
+#define NGX_HTTP_CACHE_TURBO_REDIS_FRAME_MAX_DEPTH  8
+
+
+/*
+ * Scan exactly ONE complete RESP reply in [p, end) WITHOUT allocating or
+ * interpreting the payload, recursing into arrays. On NGX_OK *next points one
+ * byte past the reply. Lets callers know a reply boundary is fully buffered:
+ *   - read_drain pools a keepalive conn only after ALL pipelined replies are in
+ *     (STAB-1: a TCP-split +OK or a 3-reply tag_add no longer pools early);
+ *   - read_smembers/read_scan confirm the whole array arrived before the single
+ *     parse+alloc pass (STAB-3: no per-recv re-alloc/re-walk of the members
+ *     array).
+ * Returns NGX_AGAIN (need more bytes) or NGX_DECLINED (malformed/too deep).
+ */
+static ngx_int_t
+ngx_http_cache_turbo_redis_frame(u_char *p, u_char *end, ngx_uint_t depth,
+    u_char **next)
+{
+    u_char     *crlf;
+    ngx_int_t   v, rc;
+    ngx_uint_t  i;
+
+    if (depth > NGX_HTTP_CACHE_TURBO_REDIS_FRAME_MAX_DEPTH) {
+        return NGX_DECLINED;
+    }
+    if (p >= end) {
+        return NGX_AGAIN;
+    }
+
+    switch (*p) {
+
+    case '+':                              /* simple string */
+    case '-':                              /* error */
+    case ':':                              /* integer */
+        crlf = ngx_strlchr(p + 1, end, CR);
+        if (crlf == NULL || crlf + 1 >= end || crlf[1] != LF) {
+            return NGX_AGAIN;
+        }
+        *next = crlf + 2;
+        return NGX_OK;
+
+    case '$':                              /* bulk string */
+        crlf = ngx_strlchr(p + 1, end, CR);
+        if (crlf == NULL || crlf + 1 >= end || crlf[1] != LF) {
+            return NGX_AGAIN;
+        }
+        v = ngx_atoi(p + 1, crlf - (p + 1));
+        if (v == NGX_ERROR) {
+            return NGX_DECLINED;
+        }
+        if (v < 0) {                       /* $-1 nil: no payload */
+            *next = crlf + 2;
+            return NGX_OK;
+        }
+        if (v > NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY) {
+            return NGX_DECLINED;
+        }
+        p = crlf + 2;
+        if (end - p < v + 2) {             /* payload + trailing CRLF */
+            return NGX_AGAIN;
+        }
+        *next = p + v + 2;
+        return NGX_OK;
+
+    case '*':                              /* array */
+        crlf = ngx_strlchr(p + 1, end, CR);
+        if (crlf == NULL || crlf + 1 >= end || crlf[1] != LF) {
+            return NGX_AGAIN;
+        }
+        v = ngx_atoi(p + 1, crlf - (p + 1));
+        if (v == NGX_ERROR) {
+            return NGX_DECLINED;
+        }
+        p = crlf + 2;
+        if (v < 0) {                       /* *-1 nil array: no elements */
+            *next = p;
+            return NGX_OK;
+        }
+        if (v > NGX_HTTP_CACHE_TURBO_REDIS_MAX_MEMBERS) {
+            return NGX_DECLINED;
+        }
+        for (i = 0; i < (ngx_uint_t) v; i++) {
+            rc = ngx_http_cache_turbo_redis_frame(p, end, depth + 1, &p);
+            if (rc != NGX_OK) {
+                return rc;                 /* AGAIN or DECLINED bubbles up */
+            }
+        }
+        *next = p;
+        return NGX_OK;
+
+    default:
+        return NGX_DECLINED;
+    }
+}
 
 
 /*
@@ -1889,6 +2052,8 @@ ngx_http_cache_turbo_redis_read_smembers(ngx_event_t *rev)
     }
 
     for ( ;; ) {
+        u_char  *next;
+
         rc = ngx_http_cache_turbo_redis_fill(op, rev);
         if (rc == NGX_AGAIN) {
             return;
@@ -1898,10 +2063,17 @@ ngx_http_cache_turbo_redis_read_smembers(ngx_event_t *rev)
             return;
         }
 
-        rc = ngx_http_cache_turbo_redis_parse_array(op, &members, &nmembers);
+        /* STAB-3: confirm the ENTIRE array reply is buffered before the single
+         * alloc+parse pass, so a reply split across recvs no longer re-allocs
+         * the members array (and re-walks it) on every partial fill. */
+        rc = ngx_http_cache_turbo_redis_frame(op->rbuf, op->rbuf + op->rlen,
+                                              0, &next);
         if (rc == NGX_AGAIN) {
-            continue;
+            continue;                      /* read more before parsing */
         }
+        /* NGX_DECLINED falls through: parse_array reports the same miss. */
+
+        rc = ngx_http_cache_turbo_redis_parse_array(op, &members, &nmembers);
         if (rc == NGX_OK) {
             ngx_http_cache_turbo_redis_smembers_finish(op, members, nmembers);
         } else {
@@ -2071,6 +2243,8 @@ ngx_http_cache_turbo_redis_read_scan(ngx_event_t *rev)
     }
 
     for ( ;; ) {
+        u_char  *next;
+
         rc = ngx_http_cache_turbo_redis_fill(op, rev);
         if (rc == NGX_AGAIN) {
             return;
@@ -2080,10 +2254,17 @@ ngx_http_cache_turbo_redis_read_scan(ngx_event_t *rev)
             return;
         }
 
-        rc = ngx_http_cache_turbo_redis_parse_scan(op, &cursor, &keys, &nkeys);
+        /* STAB-3: frame the whole [cursor, keys] page before parsing, so a
+         * SCAN reply split across recvs doesn't re-alloc the keys array each
+         * partial fill. */
+        rc = ngx_http_cache_turbo_redis_frame(op->rbuf, op->rbuf + op->rlen,
+                                              0, &next);
         if (rc == NGX_AGAIN) {
-            continue;
+            continue;                      /* read more before parsing */
         }
+        /* NGX_DECLINED falls through: parse_scan reports the same failure. */
+
+        rc = ngx_http_cache_turbo_redis_parse_scan(op, &cursor, &keys, &nkeys);
         if (rc != NGX_OK) {
             ngx_http_cache_turbo_redis_smembers_finish(op, NULL, 0);
             return;
