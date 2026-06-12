@@ -167,6 +167,21 @@ class Origin:
                     self.send_header("Content-Length", "0")
                     self.end_headers()
                     return
+                # 206 Partial Content must NEVER be cached (the key has no Range,
+                # so a stored partial could be replayed for a different/whole
+                # range). The module refuses it even with a per-status TTL.
+                if "partial" in self.path:
+                    body = f"part-{n}\n".encode()
+                    self.send_response(206)
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("Content-Range", f"bytes 0-{len(body)-1}/999")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    try:
+                        self.wfile.write(body)
+                    except BrokenPipeError:
+                        pass
+                    return
                 # Per-status caching markers (v6): redirects + negative responses.
                 if "redir" in self.path:
                     self.send_response(301)
@@ -224,6 +239,17 @@ class Origin:
                 if "ttl1" in self.path:
                     # upstream-declared 1s freshness (v7 honor_cache_control)
                     self.send_header("Cache-Control", "public, max-age=1")
+                if "mustrev" in self.path:
+                    # RFC 9111 must-revalidate: 1s fresh, then NO stale serving.
+                    self.send_header("Cache-Control",
+                                     "max-age=1, must-revalidate")
+                if "ccpad" in self.path:
+                    # leading-zero max-age: precise token parse must read this as
+                    # 1000s fresh (cacheable), NOT trip the substring "max-age=0".
+                    self.send_header("Cache-Control", "max-age=01000")
+                if "ccmaxage0" in self.path:
+                    # max-age=0 = already stale: a shared cache must not store it.
+                    self.send_header("Cache-Control", "max-age=0")
                 if "cond" in self.path:
                     # v11 conditional-304: stable validators so a stored entry
                     # can answer If-None-Match / If-Modified-Since from cache.
@@ -244,6 +270,11 @@ class Origin:
                     self.send_header("Vary", "Origin")
                 if "v=star" in self.path:
                     self.send_header("Vary", "*")
+                if "v=cs" in self.path:
+                    # a Vary on an axis the whitelist cannot key on (not *,
+                    # Cookie, or Authorization, but still unsupported): the
+                    # response must be refused, not silently mis-served.
+                    self.send_header("Vary", "Accept-Charset")
                 if "v=ck" in self.path:
                     self.send_header("Vary", "Cookie")
                 if "v=mix" in self.path:
@@ -615,6 +646,19 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # must-revalidate (RFC 9111): honor_cc reads max-age=1 (fresh 1s); the
+        # must-revalidate token collapses the stale window, so at ~2s the entry
+        # is NOT stale-served (as /cc7/ would be) but re-fetched. beta 1 ~ never
+        # rolls a refresh, isolating the must-revalidate behaviour.
+        location /mrev/ {{
+            cache_turbo                    main;
+            cache_turbo_key                $uri;
+            cache_turbo_valid              60s;
+            cache_turbo_beta               1;
+            cache_turbo_honor_cache_control on;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # PURGE method (v14): `PURGE /pg/x` drops that entry from L1 (+L2)
         location /pg/ {{
             cache_turbo       main;
@@ -881,6 +925,29 @@ http {{
             cache_turbo_key      $request_uri;
             cache_turbo_valid    30s;
             cache_turbo_auto_vary on;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # auto-Vary with a SHORT fresh TTL so the variant (and its L1 vary marker)
+        # go stale fast: a request after the fresh deadline but inside the stale
+        # window must still resolve to the variant via the now-stale marker
+        # (codex follow-up) and serve it stale, instead of falling back to the
+        # base key and missing to origin.
+        location /avs/ {{
+            cache_turbo          main;
+            cache_turbo_key      $request_uri;
+            cache_turbo_valid    2s;
+            cache_turbo_auto_vary on;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # cache_turbo_valid 0 == "cache forever" (resolved to a long finite TTL):
+        # the entry stays FRESH (a HIT, not instantly STALE) and survives the L2
+        # round-trip, reconciling the documented "forever" contract.
+        location /forever/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    0;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
@@ -1756,6 +1823,157 @@ def test_honor_cache_control(ng: Nginx) -> None:
          f"got {h2.get('x-cache')}")
 
 
+def test_age_header(ng: Nginx) -> None:
+    """RFC 9111 5.1: a cache HIT carries an Age header counting seconds since the
+    representation was stored. It must grow with wall-clock age."""
+    _, _, h0 = fetch(ng.port, "/c/age-test")
+    assert "x-cache" not in h0, "first should miss"
+    time.sleep(1.2)
+    _, _, h1 = fetch(ng.port, "/c/age-test")
+    assert h1.get("x-cache") == "HIT", f"second should be a HIT, got {h1}"
+    assert "age" in h1, "cache HIT must carry an Age header"
+    age = int(h1["age"])
+    assert age >= 1, f"Age should be >=1s after a 1.2s wait, got {age}"
+
+
+def test_request_no_cache(ng: Nginx, origin: Origin) -> None:
+    """RFC 9111 5.2.1.4: a request Cache-Control: no-cache skips the stored copy
+    and revalidates at the origin (the fresh response still refreshes the entry).
+    Pragma: no-cache behaves the same."""
+    _, b0, _ = fetch(ng.port, "/c/nocache-req")            # miss -> origin
+    _, _, h1 = fetch(ng.port, "/c/nocache-req")
+    assert h1.get("x-cache") == "HIT", "entry should be primed"
+    before = origin.hits
+    _, b2, h2 = fetch(ng.port, "/c/nocache-req",
+                      headers={"Cache-Control": "no-cache"})
+    assert "x-cache" not in h2, \
+        f"request no-cache must reach origin, got X-Cache={h2.get('x-cache')}"
+    assert origin.hits == before + 1, "request no-cache must consult the origin"
+    assert b2 != b0, "no-cache response should be a fresh origin generation"
+    _, _, h3 = fetch(ng.port, "/c/nocache-req",
+                     headers={"Pragma": "no-cache"})
+    assert "x-cache" not in h3, "Pragma: no-cache must also reach the origin"
+
+
+def test_must_revalidate(ng: Nginx) -> None:
+    """RFC 9111: a must-revalidate response is served fresh until its deadline
+    then re-fetched — never stale-served. Same setup as /cc7/ (which DOES stale-
+    serve), proving the must-revalidate token collapses the stale window."""
+    _, _, h0 = fetch(ng.port, "/mrev/mustrev")
+    assert "x-cache" not in h0, "first should miss"
+    _, _, h1 = fetch(ng.port, "/mrev/mustrev")
+    assert h1.get("x-cache") == "HIT", f"second should be a fresh HIT, got {h1}"
+    time.sleep(2.0)                               # past max-age=1
+    _, _, h2 = fetch(ng.port, "/mrev/mustrev")
+    assert h2.get("x-cache") != "STALE", \
+        f"must-revalidate must NOT stale-serve past freshness, got {h2.get('x-cache')}"
+    assert "x-cache" not in h2, \
+        "must-revalidate should re-fetch from origin once stale"
+
+
+def test_precise_maxage_token_parse(ng: Nginx) -> None:
+    """Full-token Cache-Control parse: max-age=01000 is 1000s (cacheable), it must
+    NOT trip the old substring 'max-age=0' uncacheable check; max-age=0 is still
+    refused."""
+    _, _, h0 = fetch(ng.port, "/cc/ccpad")
+    assert "x-cache" not in h0, "first should miss"
+    _, _, h1 = fetch(ng.port, "/cc/ccpad")
+    assert h1.get("x-cache") == "HIT", \
+        f"max-age=01000 must be cacheable (1000s), got X-Cache={h1.get('x-cache')}"
+
+    fetch(ng.port, "/cc/ccmaxage0")                        # prime attempt
+    _, _, h2 = fetch(ng.port, "/cc/ccmaxage0")
+    assert "x-cache" not in h2, "max-age=0 must not be stored in a shared cache"
+
+
+def test_valid_zero_is_forever(ng: Nginx, origin: Origin) -> None:
+    """cache_turbo_valid 0 == "cache forever": the stored entry must stay FRESH
+    (a HIT), not become instantly stale. Pre-fix a literal 0 fresh TTL made the
+    very next request a STALE serve and broke L2; now it resolves to a long
+    finite TTL and behaves as a normal long-lived HIT."""
+    base = origin.hits
+    _, b0, h0 = fetch(ng.port, "/forever/f")
+    assert "x-cache" not in h0, "first should miss to origin"
+    _, b1, h1 = fetch(ng.port, "/forever/f")
+    assert h1.get("x-cache") == "HIT", \
+        f"valid 0 must serve a FRESH HIT, got X-Cache={h1.get('x-cache')}"
+    assert b1 == b0, "HIT served a different body"
+    time.sleep(2.0)
+    _, b2, h2 = fetch(ng.port, "/forever/f")
+    assert h2.get("x-cache") == "HIT", \
+        f"valid 0 must still be fresh after a delay, got X-Cache={h2.get('x-cache')}"
+    assert origin.hits == base + 1, \
+        "a 'forever' entry must not re-hit the origin while fresh"
+
+
+def test_vary_encoding_qvalue(ng: Nginx, origin: Origin) -> None:
+    """Accept-Encoding is tokenised, not substring-matched: `gzip;q=0` (the client
+    REFUSES gzip) must NOT bucket as gzip, while `gzip;q=0.001` still does. Pre-fix
+    the substring scan re-keyed a never-gzip client onto a gzip body."""
+    base = origin.hits
+    _, bg, hg = fetch(ng.port, "/ve/q", headers={"Accept-Encoding": "gzip"})
+    assert "x-cache" not in hg, "first (gzip) request should miss"
+    # gzip;q=0 => client refuses gzip => identity bucket => SEPARATE slot (miss)
+    _, bz, hz = fetch(ng.port, "/ve/q",
+                      headers={"Accept-Encoding": "gzip;q=0"})
+    assert "x-cache" not in hz, \
+        f"gzip;q=0 must NOT hit the gzip slot, got X-Cache={hz.get('x-cache')}"
+    assert bz != bg, "gzip;q=0 was served the gzip body"
+    assert origin.hits == base + 2, "gzip and gzip;q=0 should be distinct slots"
+    # a positive q (even tiny) is still gzip => HIT the original gzip slot
+    _, bq, hq = fetch(ng.port, "/ve/q",
+                      headers={"Accept-Encoding": "gzip;q=0.001"})
+    assert hq.get("x-cache") == "HIT", \
+        f"gzip;q=0.001 must HIT the gzip slot, got X-Cache={hq.get('x-cache')}"
+    assert bq == bg, "gzip;q=0.001 should share the gzip slot"
+    assert origin.hits == base + 2, "gzip;q=0.001 wrongly hit origin"
+
+
+def test_auto_vary_unknown_axis_uncacheable(ng: Nginx, origin: Origin) -> None:
+    """auto-Vary: a response `Vary: Accept-Charset` names an axis the whitelist
+    cannot key on (and is not *, Cookie, or Authorization). It must force the
+    response uncacheable rather than serve one representation for every value
+    (RFC 9110 12.5.5)."""
+    base = origin.hits
+    _, _, h0 = fetch(ng.port, "/av/u?v=cs")
+    assert "x-cache" not in h0, "first should miss"
+    _, _, h1 = fetch(ng.port, "/av/u?v=cs")
+    assert "x-cache" not in h1, \
+        f"Vary on an un-keyable axis must stay uncacheable, got {h1.get('x-cache')}"
+    assert origin.hits == base + 2, "un-keyable Vary axis was wrongly cached"
+
+
+def test_auto_vary_stale_marker_reachable(ng: Nginx, origin: Origin) -> None:
+    """auto-Vary: once the variant and its L1 vary marker go stale (but are still
+    inside the stale window), a request must still resolve to the variant via the
+    stale marker and serve it from cache — not fall back to the base key and miss
+    to origin (codex follow-up)."""
+    ae = {"Accept-Encoding": "gzip"}
+    _, _, h0 = fetch(ng.port, "/avs/m?v=ae", headers=ae)
+    assert "x-cache" not in h0, "first should miss"
+    _, _, h1 = fetch(ng.port, "/avs/m?v=ae", headers=ae)
+    assert h1.get("x-cache") == "HIT", f"second should HIT, got {h1.get('x-cache')}"
+    time.sleep(2.5)                          # past the 2s fresh TTL, inside stale
+    _, _, h2 = fetch(ng.port, "/avs/m?v=ae", headers=ae)
+    assert "x-cache" in h2, \
+        ("a stale-but-serveable variant must stay reachable via its stale marker, "
+         f"got X-Cache={h2.get('x-cache')} (base-key fallback missed to origin)")
+
+
+def test_206_never_cached(ng: Nginx, origin: Origin) -> None:
+    """206 Partial Content must never be cached: the key carries no Range, so a
+    stored partial could be replayed for a different/whole range. Every request
+    reaches the origin."""
+    base = origin.hits
+    s0, _, h0 = fetch(ng.port, "/c/partial")
+    assert s0 == 206, f"origin should answer 206, got {s0}"
+    assert "x-cache" not in h0, "first 206 should miss"
+    s1, _, h1 = fetch(ng.port, "/c/partial")
+    assert s1 == 206 and "x-cache" not in h1, \
+        f"206 must never be cached, got X-Cache={h1.get('x-cache')}"
+    assert origin.hits == base + 2, "206 was wrongly served from cache"
+
+
 def test_conditional_inm_304(ng: Nginx, origin: Origin) -> None:
     """v11: a HIT whose stored ETag matches If-None-Match is answered 304 with no
     body, served from cache (the origin is not hit again)."""
@@ -1899,7 +2117,11 @@ def test_native_cache_headers_stripped(ng: Nginx) -> None:
     fetch(ng.port, "/c/nativecache")                   # prime (origin Age=123)
     _, _, h = fetch(ng.port, "/c/nativecache")         # HIT from shm
     assert h.get("x-cache") == "HIT", "should be an L1 hit"
-    assert "age" not in h, f"upstream Age leaked into the HIT: {h.get('age')}"
+    # The upstream's frozen Age:123 must not be replayed; we emit our OWN Age
+    # (seconds since WE stored it, so small) computed in serve().
+    assert "age" in h, "our own Age header should be present on a HIT"
+    assert int(h["age"]) < 100, \
+        f"upstream Age=123 leaked instead of our computed Age: {h.get('age')}"
     assert "x-cache-status" not in h, \
         f"upstream X-Cache-Status leaked: {h.get('x-cache-status')}"
 
@@ -3505,6 +3727,15 @@ def run_all(ng: Nginx, origin: Origin,
     test_cache_negative_404(ng)
     test_head_not_stored(ng)
     test_honor_cache_control(ng)
+    test_age_header(ng)
+    test_request_no_cache(ng, origin)
+    test_must_revalidate(ng)
+    test_precise_maxage_token_parse(ng)
+    test_valid_zero_is_forever(ng, origin)
+    test_vary_encoding_qvalue(ng, origin)
+    test_auto_vary_unknown_axis_uncacheable(ng, origin)
+    test_auto_vary_stale_marker_reachable(ng, origin)
+    test_206_never_cached(ng, origin)
     test_conditional_inm_304(ng, origin)
     test_conditional_inm_star(ng)
     test_conditional_inm_mismatch_full(ng)
@@ -3673,6 +3904,10 @@ def main() -> int:
           "not cached), default-key Host split, "
           "per-status caching (301/404 cached, HEAD not stored), "
           "honor upstream Cache-Control, "
+          "valid 0 = forever (fresh HIT, not instant-stale), "
+          "Accept-Encoding q-value (gzip;q=0 != gzip bucket), "
+          "auto-Vary unknown-axis uncacheable, "
+          "auto-Vary stale-marker still reachable, 206 never cached, "
           "conditional 304 (v11: If-None-Match/*/mismatch, "
           "If-Modified-Since fresh/stale, INM-beats-IMS precedence), "
           "PURGE method, bypass + no_store, "

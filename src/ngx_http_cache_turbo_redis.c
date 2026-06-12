@@ -1095,7 +1095,6 @@ ngx_http_cache_turbo_redis_get(ngx_http_request_t *r,
 
     /* Parked: hold a reference so the request survives until the reply resumes
      * it (released by ngx_http_finalize_request(NGX_DONE) in get_finish). */
-    ctx->l2_pending = 1;
     r->main->count++;
 
     return NGX_AGAIN;
@@ -1169,7 +1168,6 @@ ngx_http_cache_turbo_redis_lock(ngx_http_request_t *r,
         return NGX_DECLINED;
     }
 
-    ctx->lock_pending = 1;
     r->main->count++;
 
     return NGX_AGAIN;
@@ -2134,7 +2132,6 @@ ngx_http_cache_turbo_redis_get_finish(ngx_http_cache_turbo_redis_op_t *op,
     }
 
     ctx->l2_result = result;
-    ctx->l2_pending = 0;
     ctx->l2_done = 1;
 
     /* tear down our own connection + pool (blob is now copied into r->pool) */
@@ -2149,10 +2146,16 @@ ngx_http_cache_turbo_redis_get_finish(ngx_http_cache_turbo_redis_op_t *op,
 
 /*
  * Lock (SET NX PX) reply reader. The reply is tiny (+OK / $-1 / -ERR), so a
- * single recv into the scratch buffer suffices; the first byte decides:
- * '+' (+OK) = lock acquired; anything else ($-1 nil = key already held, -ERR,
- * EOF, error) = not acquired. Treating every non-'+' as "lost" is conservative:
- * the caller serves stale, never stampedes the origin on a Redis hiccup.
+ * single recv into the scratch buffer suffices. THREE outcomes (codex
+ * follow-up — a Redis outage must not look like "peer holds the lock"):
+ *   '+' (+OK)         -> NGX_OK       lock acquired, we own the regen
+ *   '$' ($-1 nil)     -> NGX_DECLINED key already held by a peer: wait/serve stale
+ *   timeout/EOF/-ERR  -> NGX_ERROR    lock channel unusable: degrade to per-box
+ *                                     single-flight (regenerate locally), never
+ *                                     suppress the refresh on a dead Redis.
+ * Only a real nil reply ($-1) means a peer genuinely holds the lock; every
+ * transport/protocol failure now maps to NGX_ERROR so the caller falls back
+ * instead of freezing the whole fleet on stale during an outage.
  */
 static void
 ngx_http_cache_turbo_redis_read_lock(ngx_event_t *rev)
@@ -2167,7 +2170,7 @@ ngx_http_cache_turbo_redis_read_lock(ngx_event_t *rev)
     if (rev->timedout) {
         ngx_log_error(NGX_LOG_INFO, c->log, NGX_ETIMEDOUT,
                       "cache_turbo: redis lock timed out");
-        ngx_http_cache_turbo_redis_lock_finish(op, NGX_DECLINED);
+        ngx_http_cache_turbo_redis_lock_finish(op, NGX_ERROR);
         return;
     }
 
@@ -2175,18 +2178,20 @@ ngx_http_cache_turbo_redis_read_lock(ngx_event_t *rev)
 
     if (n == NGX_AGAIN) {
         if (ngx_handle_read_event(rev, 0) != NGX_OK) {
-            ngx_http_cache_turbo_redis_lock_finish(op, NGX_DECLINED);
+            ngx_http_cache_turbo_redis_lock_finish(op, NGX_ERROR);
         }
         return;
     }
     if (n <= 0) {
-        ngx_http_cache_turbo_redis_lock_finish(op, NGX_DECLINED);
+        ngx_http_cache_turbo_redis_lock_finish(op, NGX_ERROR);
         return;
     }
 
     op->clean = 1;                         /* reply consumed: connection poolable */
     ngx_http_cache_turbo_redis_lock_finish(op,
-        op->recv[0] == '+' ? NGX_OK : NGX_DECLINED);
+        op->recv[0] == '+' ? NGX_OK :
+        op->recv[0] == '$' ? NGX_DECLINED : /* nil: a peer holds the lock */
+        NGX_ERROR);                         /* -ERR / garbage: channel unusable */
 }
 
 
@@ -2204,7 +2209,6 @@ ngx_http_cache_turbo_redis_lock_finish(ngx_http_cache_turbo_redis_op_t *op,
     ngx_http_cache_turbo_ctx_t  *ctx = op->ctx;
 
     ctx->lock_result = result;
-    ctx->lock_pending = 0;
     ctx->lock_done = 1;
 
     ngx_http_cache_turbo_redis_op_done(op);
@@ -2224,7 +2228,10 @@ ngx_http_cache_turbo_redis_op_fail(ngx_http_cache_turbo_redis_op_t *op)
     if (op->members_cb) {
         ngx_http_cache_turbo_redis_smembers_finish(op, NULL, 0);
     } else if (op->is_lock) {
-        ngx_http_cache_turbo_redis_lock_finish(op, NGX_DECLINED);
+        /* Write-path failure (connect/send/protocol error) is a transport
+         * failure, not a peer holding the lock: NGX_ERROR so the caller degrades
+         * to per-box single-flight rather than suppressing the refresh. */
+        ngx_http_cache_turbo_redis_lock_finish(op, NGX_ERROR);
     } else if (op->request) {
         ngx_http_cache_turbo_redis_get_finish(op, NGX_DECLINED, NULL, 0);
     } else {

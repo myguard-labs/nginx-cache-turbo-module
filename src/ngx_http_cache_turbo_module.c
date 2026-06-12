@@ -441,8 +441,9 @@ ngx_http_cache_turbo_effective_beta(ngx_http_cache_turbo_loc_conf_t *clcf,
 /*
  * Fresh TTL (seconds) to cache a response with this status, or -1 if the status
  * is not cacheable here (v6). 200 always caches at clcf->valid; any other status
- * caches only if a `cache_turbo_valid <code> <time>` rule named it. A 0 TTL
- * ("forever") is a valid return, so the not-cacheable sentinel is -1.
+ * caches only if a `cache_turbo_valid <code> <time>` rule named it. A configured
+ * "forever" (`cache_turbo_valid 0`) is already resolved to FOREVER_TTL at parse
+ * time, so a literal 0 never reaches here; the not-cacheable sentinel is -1.
  */
 static time_t
 ngx_http_cache_turbo_status_ttl(ngx_http_cache_turbo_loc_conf_t *clcf,
@@ -475,20 +476,80 @@ ngx_http_cache_turbo_status_ttl(ngx_http_cache_turbo_loc_conf_t *clcf,
 }
 
 
-/* Parse the integer delta-seconds after a Cache-Control "<dir>=" token in
- * [p,last). Returns -1 if the token is absent or has no numeric value. */
-static time_t
-ngx_http_cache_turbo_cc_delta(u_char *p, u_char *last, const char *dir,
-    size_t dirlen)
+/*
+ * Locate a Cache-Control directive by FULL-TOKEN match in a comma-separated
+ * value [v,last). Each token is "<name>" or "<name>=<value>" with optional
+ * surrounding LWS. Returns a pointer to the value (after '=') with *vlen set
+ * when the directive is present with a value, the token start with *vlen == 0
+ * when present bare, or NULL when absent. A full-token match (not a substring)
+ * is what keeps `s-maxage` from matching inside `max-age` parsing and
+ * `max-age=0` from matching inside `max-age=01000` (see the codex follow-ups).
+ */
+static u_char *
+ngx_http_cache_turbo_cc_token(u_char *v, u_char *last, const char *name,
+    size_t nlen, size_t *vlen)
 {
-    u_char  *q, *e;
+    u_char  *s = v, *tok, *e, *eq;
+    size_t   tn;
 
-    q = ngx_strlcasestrn(p, last, (u_char *) dir, dirlen - 1);
-    if (q == NULL) {
+    while (s < last) {
+        while (s < last && (*s == ' ' || *s == '\t' || *s == ',')) {
+            s++;
+        }
+        tok = s;
+        while (s < last && *s != ',') {
+            s++;
+        }
+        e = s;                                  /* [tok, e) is one token */
+        while (e > tok && (e[-1] == ' ' || e[-1] == '\t')) {
+            e--;                                /* right-trim LWS */
+        }
+
+        eq = ngx_strlchr(tok, e, '=');
+        tn = eq ? (size_t) (eq - tok) : (size_t) (e - tok);
+
+        if (tn == nlen && ngx_strncasecmp(tok, (u_char *) name, nlen) == 0) {
+            if (eq) {
+                *vlen = (size_t) (e - (eq + 1));
+                return eq + 1;
+            }
+            *vlen = 0;
+            return tok;
+        }
+    }
+
+    return NULL;
+}
+
+
+/* True if the named Cache-Control directive is present (bare or with a value),
+ * full-token match. */
+static ngx_int_t
+ngx_http_cache_turbo_cc_has(u_char *v, u_char *last, const char *name,
+    size_t nlen)
+{
+    size_t  vlen;
+
+    return ngx_http_cache_turbo_cc_token(v, last, name, nlen, &vlen) != NULL;
+}
+
+
+/* Parse the integer delta-seconds of a Cache-Control "<name>=N" directive in
+ * [p,last). Returns -1 if the directive is absent or carries no numeric value.
+ * `name` is the bare directive (e.g. "max-age"), NOT including the '='. */
+static time_t
+ngx_http_cache_turbo_cc_delta(u_char *p, u_char *last, const char *name,
+    size_t nlen)
+{
+    u_char  *q, *e, *vend;
+    size_t   vlen;
+
+    q = ngx_http_cache_turbo_cc_token(p, last, name, nlen, &vlen);
+    if (q == NULL || vlen == 0) {
         return -1;
     }
-    q += dirlen;                       /* past "<dir>=" */
-    for (e = q; e < last && *e >= '0' && *e <= '9'; e++) { /* void */ }
+    vend = q + vlen;
+    for (e = q; e < vend && *e >= '0' && *e <= '9'; e++) { /* void */ }
     if (e == q) {
         return -1;
     }
@@ -542,11 +603,11 @@ ngx_http_cache_turbo_upstream_ttl(ngx_http_request_t *r)
     }
 
     if (cc != NULL) {
-        t = ngx_http_cache_turbo_cc_delta(cc, cc_last, "s-maxage=",
-                                          sizeof("s-maxage=") - 1);
+        t = ngx_http_cache_turbo_cc_delta(cc, cc_last, "s-maxage",
+                                          sizeof("s-maxage") - 1);
         if (t < 0) {
-            t = ngx_http_cache_turbo_cc_delta(cc, cc_last, "max-age=",
-                                              sizeof("max-age=") - 1);
+            t = ngx_http_cache_turbo_cc_delta(cc, cc_last, "max-age",
+                                              sizeof("max-age") - 1);
         }
         if (t >= 0) {
             return t;
@@ -562,6 +623,111 @@ ngx_http_cache_turbo_upstream_ttl(ngx_http_request_t *r)
     }
 
     return -1;
+}
+
+
+/*
+ * True when the response forbids serving stale once expired (RFC 9111 §5.2.2.2 /
+ * §5.2.2.8): Cache-Control: must-revalidate or proxy-revalidate. We honour it by
+ * collapsing the stale window to zero at store, so the object is served fresh
+ * until its deadline and then re-fetched rather than stale-served. Walks the
+ * (small) response header list once on the store path only.
+ */
+static ngx_int_t
+ngx_http_cache_turbo_response_must_revalidate(ngx_http_request_t *r)
+{
+    ngx_list_part_t  *part = &r->headers_out.headers.part;
+    ngx_table_elt_t  *h = part->elts;
+    ngx_uint_t        i;
+
+    for (i = 0; /* void */ ; i++) {
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            h = part->elts;
+            i = 0;
+        }
+        if (h[i].hash == 0
+            || h[i].key.len != sizeof("Cache-Control") - 1
+            || ngx_strncasecmp(h[i].key.data, (u_char *) "Cache-Control",
+                               sizeof("Cache-Control") - 1) != 0)
+        {
+            continue;
+        }
+
+        {
+            u_char  *v = h[i].value.data;
+            u_char  *e = v + h[i].value.len;
+
+            if (ngx_http_cache_turbo_cc_has(v, e, "must-revalidate",
+                    sizeof("must-revalidate") - 1)
+                || ngx_http_cache_turbo_cc_has(v, e, "proxy-revalidate",
+                    sizeof("proxy-revalidate") - 1))
+            {
+                return 1;
+            }
+        }
+    }
+
+    return 0;
+}
+
+
+/*
+ * RFC 9111 §5.2.1.4: a request Cache-Control: no-cache (or the legacy
+ * Pragma: no-cache) means "do not reuse a stored response without successful
+ * validation". We have no upstream validation channel for a cache hit, so the
+ * conservative-correct behaviour is to skip the cache lookup and go to the
+ * origin (the fresh response is still stored, refreshing the entry). Walks the
+ * request header list once; both headers are rare so first-match is fine.
+ */
+static ngx_int_t
+ngx_http_cache_turbo_request_no_cache(ngx_http_request_t *r)
+{
+    ngx_list_part_t  *part = &r->headers_in.headers.part;
+    ngx_table_elt_t  *h = part->elts;
+    ngx_uint_t        i;
+
+    for (i = 0; /* void */ ; i++) {
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            h = part->elts;
+            i = 0;
+        }
+        if (h[i].hash == 0) {
+            continue;
+        }
+
+        if (h[i].key.len == sizeof("Cache-Control") - 1
+            && ngx_strncasecmp(h[i].key.data, (u_char *) "Cache-Control",
+                               sizeof("Cache-Control") - 1) == 0)
+        {
+            if (ngx_http_cache_turbo_cc_has(h[i].value.data,
+                    h[i].value.data + h[i].value.len, "no-cache",
+                    sizeof("no-cache") - 1))
+            {
+                return 1;
+            }
+
+        } else if (h[i].key.len == sizeof("Pragma") - 1
+                   && ngx_strncasecmp(h[i].key.data, (u_char *) "Pragma",
+                                      sizeof("Pragma") - 1) == 0)
+        {
+            if (ngx_http_cache_turbo_cc_has(h[i].value.data,
+                    h[i].value.data + h[i].value.len, "no-cache",
+                    sizeof("no-cache") - 1))
+            {
+                return 1;
+            }
+        }
+    }
+
+    return 0;
 }
 
 
@@ -856,9 +1022,25 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
      * no-cache on an anon page self-excludes at store time. */
     if (clcf->backend_presets && ngx_http_cache_turbo_auto_skip(r, clcf)) {
         ctx->auto_skip = 1;
+        /* cache-turbo neither serves nor stores an auto-classified dynamic
+         * request, so it is NOT "engaged": leave $cache_turbo_active = 0 so a
+         * stacked native cache is free to handle the URL itself. */
+        ctx->ct_active = 0;
         (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "cache_turbo: auto-classify dynamic \"%V\" -> origin",
+                       &r->uri);
+        return NGX_DECLINED;
+    }
+
+    /* Request Cache-Control: no-cache / Pragma: no-cache (RFC 9111 §5.2.1.4):
+     * do not reuse a stored response without validation. With no validation
+     * channel for a hit, skip the lookup and go to the origin — the fresh
+     * response still stores (refreshing the entry), like a bypass. */
+    if (ngx_http_cache_turbo_request_no_cache(r)) {
+        (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "cache_turbo: request no-cache \"%V\" -> origin (revalidate)",
                        &r->uri);
         return NGX_DECLINED;
     }
@@ -915,6 +1097,11 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                 return NGX_ERROR;
             }
             ngx_memcpy(snap, ctn->data, snap_len);
+            /* True LRU: promote this node to the head on access, so eviction
+             * targets the genuinely least-recently-used entry (not the oldest by
+             * insertion/refresh). Cheap queue splice under the mutex we hold. */
+            ngx_queue_remove(&ctn->lru);
+            ngx_queue_insert_head(&z->sh->lru, &ctn->lru);
             ngx_shmtx_unlock(&z->shpool->mutex);
             (void) ngx_atomic_fetch_add(&z->sh->hits, 1);
             ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
@@ -929,14 +1116,25 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
              * — a stub is an in-flight marker, never serveable; it falls through
              * to the cold path below where the waiter/claim logic handles it. */
 
+            /* True LRU: promote on access (still a live, serveable entry). */
+            ngx_queue_remove(&ctn->lru);
+            ngx_queue_insert_head(&z->sh->lru, &ctn->lru);
+
             /* Cross-node single-flight resolved (v4-2): we parked for the Redis
-             * NX and the phase engine re-entered. If we won, we own the
-             * cluster-wide regen → go to origin. If we lost, fall through:
-             * `refreshing` is already claimed (set before we parked) so the dice
-             * is skipped and we serve stale via the tail below — no extra state
-             * needed. */
-            if (ctx->lock_done && ctx->lock_result == NGX_OK) {
-                /* We own the cluster-wide regen. With background_update (v8,
+             * NX and the phase engine re-entered. If we won (NGX_OK), we own the
+             * cluster-wide regen → go to origin. If the lock channel FAILED
+             * (NGX_ERROR: Redis timeout/outage), there is no cross-node
+             * coordination to honour, so degrade to per-box single-flight and
+             * regenerate locally — `refreshing` is already claimed, so this box
+             * still single-flights while a peer with a live Redis can win the NX.
+             * Only a genuine peer-holds (NGX_DECLINED) falls through to serve
+             * stale: the dice is skipped (refreshing claimed) and the tail below
+             * serves stale — no extra state needed. */
+            if (ctx->lock_done
+                && (ctx->lock_result == NGX_OK || ctx->lock_result == NGX_ERROR))
+            {
+                /* We own the (cluster-wide, or per-box on L2 failure) regen. With
+                 * background_update (v8,
                  * default) refresh in the background and serve stale now; else
                  * fall through to the origin and regenerate inline. */
                 if (clcf->background_update) {
@@ -1123,7 +1321,7 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                                    "-> origin", &r->uri, (ngx_uint_t) hash);
                 } else {
                     (void) clcf->l1->store(z, ctx->key_hash, hash,
-                               ctx->l2_blob, ctx->l2_blob_len, bh.status,
+                               ctx->l2_blob, ctx->l2_blob_len,
                                rem_fresh, rem_stale);
                     (void) ngx_atomic_fetch_add(&z->sh->hits, 1);
                     (void) ngx_atomic_fetch_add(&z->sh->l2_hits, 1);
@@ -1188,14 +1386,21 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
 
         /* Resume after the cross-node NX park (we are the per-box claim winner
          * that fired the lock): won -> we own the fleet-wide regen, go to origin;
-         * lost -> another node is filling, wait for its L2 write-through. */
+         * lost -> another node is filling, wait for its L2 write-through. An
+         * NGX_ERROR (Redis outage: lock channel failed) is NOT a peer holding the
+         * lock — going to origin would stampede, but cold-waiting would add a full
+         * lock_timeout of dead latency for a fill that will never arrive. Treat it
+         * as a win: the per-box stub we already hold still single-flights this box,
+         * so degrade to per-box single-flight and regenerate now (codex). */
         if (ctx->lock_done) {
-            if (ctx->lock_result == NGX_OK) {
+            if (ctx->lock_result == NGX_OK || ctx->lock_result == NGX_ERROR) {
                 (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
                 ngx_http_cache_turbo_cold_mark_winner(r, ctx, z);
-                ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                               "cache_turbo: cold-miss cross-node WON \"%V\" "
-                               "key=%ui -> origin", &r->uri, (ngx_uint_t) hash);
+                ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                               "cache_turbo: cold-miss cross-node WON%s \"%V\" "
+                               "key=%ui -> origin",
+                               ctx->lock_result == NGX_ERROR ? " (L2 down)" : "",
+                               &r->uri, (ngx_uint_t) hash);
                 return NGX_DECLINED;
             }
             ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
@@ -1633,6 +1838,26 @@ ngx_http_cache_turbo_serve(ngx_http_request_t *r, u_char *copy, size_t len,
         body_len = 0;
     }
 
+    /* Age header (RFC 9111 §5.1): seconds since this representation was stored
+     * at the origin. created is the blob's own timestamp (survives the L2
+     * round-trip), so Age is correct whether served from L1 or after an L2
+     * fill. Clamp negative (writer/reader clock skew) to 0. */
+    {
+        time_t   age = ngx_time() - (time_t) bh->created;
+        u_char  *ab;
+
+        if (age < 0) {
+            age = 0;
+        }
+        ab = ngx_pnalloc(r->pool, NGX_TIME_T_LEN);
+        if (ab != NULL) {
+            static u_char  age_name[] = "Age";
+            size_t         al = (size_t) (ngx_sprintf(ab, "%T", age) - ab);
+            (void) ngx_http_cache_turbo_add_header(r, age_name,
+                       sizeof("Age") - 1, ab, al);
+        }
+    }
+
     /* X-Cache debug header */
     {
         static u_char  xc_name[] = "X-Cache";
@@ -1735,12 +1960,20 @@ ngx_http_cache_turbo_response_cacheable(ngx_http_request_t *r)
             u_char  *v = h[i].value.data;
             u_char  *e = v + h[i].value.len;
 
-            if (ngx_strlcasestrn(v, e, (u_char *) "no-store", 8 - 1) != NULL
-                || ngx_strlcasestrn(v, e, (u_char *) "no-cache", 8 - 1) != NULL
-                || ngx_strlcasestrn(v, e, (u_char *) "private", 7 - 1) != NULL
-                || ngx_strlcasestrn(v, e, (u_char *) "max-age=0", 9 - 1) != NULL
-                || ngx_strlcasestrn(v, e, (u_char *) "s-maxage=0", 10 - 1)
-                       != NULL)
+            /* Full-token match (not substring): no-store / no-cache / private
+             * forbid shared storage; max-age=0 / s-maxage=0 mean already-stale,
+             * not cacheable. cc_delta returns 0 only for an exact "=0" value, so
+             * "max-age=01000" no longer trips this (it is a 1000s freshness). */
+            if (ngx_http_cache_turbo_cc_has(v, e, "no-store",
+                    sizeof("no-store") - 1)
+                || ngx_http_cache_turbo_cc_has(v, e, "no-cache",
+                    sizeof("no-cache") - 1)
+                || ngx_http_cache_turbo_cc_has(v, e, "private",
+                    sizeof("private") - 1)
+                || ngx_http_cache_turbo_cc_delta(v, e, "max-age",
+                    sizeof("max-age") - 1) == 0
+                || ngx_http_cache_turbo_cc_delta(v, e, "s-maxage",
+                    sizeof("s-maxage") - 1) == 0)
             {
                 return 0;
             }
@@ -1877,11 +2110,10 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
     clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
 
     /* Append the incoming buffers to our captured chain (copying the bytes
-     * into the request pool so they survive past this filter call). */
-    ll = &ctx->body;
-    while (*ll) {
-        ll = &(*ll)->next;
-    }
+     * into the request pool so they survive past this filter call). Seed the
+     * append cursor from the cached tail so a multi-call streamed body does not
+     * re-walk the whole chain every filter invocation (was O(n²)). */
+    ll = ctx->body_last ? &ctx->body_last->next : &ctx->body;
 
     for (cl = in; cl; cl = cl->next) {
         ngx_buf_t    *nb;
@@ -1898,6 +2130,7 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
         {
             ctx->captured = 0;
             ctx->body = NULL;
+            ctx->body_last = NULL;
             ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                            "cache_turbo: file-backed body \"%V\" -> delegate to "
                            "native (cannot capture from memory)", &r->uri);
@@ -1919,6 +2152,7 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
             if (clcf->max_size > 0 && ctx->body_len + n > clcf->max_size) {
                 ctx->captured = 0;
                 ctx->body = NULL;
+                ctx->body_last = NULL;
                 ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                                "cache_turbo: oversize capture aborted \"%V\" "
                                "body>%uz -> delegate to native",
@@ -1949,6 +2183,7 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 
             *ll = ncl;
             ll = &ncl->next;
+            ctx->body_last = ncl;
 
             ctx->body_len += n;
         }
@@ -1993,6 +2228,18 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
         /* Absolute serveable window (fresh + stale) from now, reused by the blob
          * metadata, the L1 store, and the L2 EXPIRE so all three agree. */
         stale_window = ngx_http_cache_turbo_stale_ttl(ttl, clcf->stale_mult);
+
+        /* RFC 9111 must-revalidate / proxy-revalidate: once stale, the response
+         * must NOT be served without revalidation. We have no validation channel
+         * for a hit, so collapse the stale window to the fresh TTL — the object
+         * is served fresh until its deadline, then re-fetched (no stale serve,
+         * no stale-if-error). Only meaningful for a finite TTL. */
+        if (ttl > 0 && ngx_http_cache_turbo_response_must_revalidate(r)) {
+            stale_window = ttl;
+            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                           "cache_turbo: must-revalidate \"%V\" -> no stale window",
+                           &r->uri);
+        }
 
         /* Synthesise a Content-Type entry from the typed field (it is not in
          * the headers list). Everything else comes from headers_out.headers. */
@@ -2124,7 +2371,7 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
             }
 
             (void) clcf->l1->store(z, store_key, hash,
-                       blob, blob_len, r->headers_out.status, ttl,
+                       blob, blob_len, ttl,
                        stale_window);
 
             /* v10: store overwrote any cold-miss stub into a real entry (or we
@@ -2414,6 +2661,15 @@ ngx_http_cache_turbo_valid_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                            "cache_turbo_valid: bad time \"%V\"",
                            &value[cf->args->nelts - 1]);
         return NGX_CONF_ERROR;
+    }
+
+    /* "0" means "cache forever" (the documented contract). Resolve it to a long
+     * finite TTL so the object stays FRESH (not instantly-stale) and L2 works —
+     * a literal 0 fresh TTL produced an L2 blob with stale_ttl 0, which every L2
+     * hit re-read as already-expired. Covers both the bare default TTL and any
+     * per-status `cache_turbo_valid <code> 0` rule (same parsed `valid`). */
+    if (valid == 0) {
+        valid = NGX_HTTP_CACHE_TURBO_FOREVER_TTL;
     }
 
     if (cf->args->nelts == 2) {
@@ -3574,6 +3830,40 @@ ngx_http_cache_turbo_tok_cmp(const void *one, const void *two)
 
 /* ----- Vary-aware suffix (v3-4) --------------------------------------------- */
 
+/* Per-coding q-value check for the Accept-Encoding parser. `p` points at the
+ * first ';' of a coding token's parameters, `last` is the token end. Returns 0
+ * iff an explicit `q=0` (0, 0.0, 0.000, …) is present — i.e. the client REFUSES
+ * this coding — else 1 (a missing q, or any q>0, is acceptable). A bare substring
+ * match would treat `gzip;q=0` as gzip-capable and re-key a never-gzip client
+ * onto a gzip body (codex follow-up). RFC 9110 §12.5.3. */
+static ngx_uint_t
+ngx_http_cache_turbo_ae_q_ok(u_char *p, u_char *last)
+{
+    while (p < last) {
+        if (*p != ';') {
+            p++;
+            continue;
+        }
+        p++;                                   /* past ';' */
+        while (p < last && (*p == ' ' || *p == '\t')) {
+            p++;
+        }
+        if (p + 1 < last && (p[0] == 'q' || p[0] == 'Q') && p[1] == '=') {
+            ngx_uint_t  nonzero = 0;
+            p += 2;
+            while (p < last && *p != ';' && *p != ' ' && *p != '\t') {
+                if (*p >= '1' && *p <= '9') {
+                    nonzero = 1;
+                }
+                p++;
+            }
+            return nonzero ? 1 : 0;            /* q=0(.0…) => refused */
+        }
+    }
+    return 1;                                  /* no q parameter => acceptable */
+}
+
+
 /* Accept-Encoding collapsed to a small, stable enum so the cache shards by what
  * the response actually IS (zstd/br/gzip/identity), not by the per-browser raw
  * header. Priority zstd > br > gzip mirrors what our stack serves when the client
@@ -3581,27 +3871,71 @@ ngx_http_cache_turbo_tok_cmp(const void *one, const void *two)
  * zstd (ngx_http_zstd_ok), winning over brotli/gzip, and brotli wins over gzip.
  * We ship http-zstd, so zstd MUST be bucketed or a zstd-only client could read an
  * identity entry and a zstd+br client could collide a zstd body under ae=br
- * (issues V6). Absent/empty header => identity. Case-insensitive substring. */
+ * (issues V6). Absent/empty header => identity.
+ *
+ * The header is tokenised on commas into full codings (each `coding[;params]`)
+ * rather than substring-scanned, so `br` no longer matches inside `Calibre`,
+ * `x-gzip` no longer aliases `gzip`, and a `;q=0` parameter de-selects the coding
+ * (codex follow-up: token boundaries + q-values). Coding names are matched
+ * case-insensitively at exact length. */
 static const char *
 ngx_http_cache_turbo_ae_class(ngx_http_request_t *r)
 {
     ngx_table_elt_t  *ae = r->headers_in.accept_encoding;
-    u_char           *s, *last;
+    u_char           *p, *last, *end, *tok, *semi, *ce;
+    size_t            clen;
+    ngx_uint_t        zstd = 0, br = 0, gzip = 0;
 
     if (ae == NULL || ae->value.len == 0) {
         return "identity";
     }
 
-    s = ae->value.data;
-    last = s + ae->value.len;
+    p = ae->value.data;
+    last = p + ae->value.len;
 
-    if (ngx_strlcasestrn(s, last, (u_char *) "zstd", 4 - 1) != NULL) {
+    while (p < last) {
+        end = p;                               /* split on the next comma */
+        while (end < last && *end != ',') {
+            end++;
+        }
+
+        semi = p;                              /* coding name = [tok, semi) */
+        while (semi < end && *semi != ';') {
+            semi++;
+        }
+
+        tok = p;
+        while (tok < semi && (*tok == ' ' || *tok == '\t')) {
+            tok++;
+        }
+        ce = semi;
+        while (ce > tok && (ce[-1] == ' ' || ce[-1] == '\t')) {
+            ce--;
+        }
+        clen = (size_t) (ce - tok);
+
+        if (clen > 0 && ngx_http_cache_turbo_ae_q_ok(semi, end)) {
+            if (clen == 4 && ngx_strncasecmp(tok, (u_char *) "zstd", 4) == 0) {
+                zstd = 1;
+            } else if (clen == 2
+                       && ngx_strncasecmp(tok, (u_char *) "br", 2) == 0) {
+                br = 1;
+            } else if (clen == 4
+                       && ngx_strncasecmp(tok, (u_char *) "gzip", 4) == 0) {
+                gzip = 1;
+            }
+        }
+
+        p = (end < last) ? end + 1 : end;
+    }
+
+    if (zstd) {
         return "zstd";
     }
-    if (ngx_strlcasestrn(s, last, (u_char *) "br", 2 - 1) != NULL) {
+    if (br) {
         return "br";
     }
-    if (ngx_strlcasestrn(s, last, (u_char *) "gzip", 4 - 1) != NULL) {
+    if (gzip) {
         return "gzip";
     }
     return "identity";
@@ -3831,7 +4165,7 @@ ngx_http_cache_turbo_marker_store(ngx_http_cache_turbo_loc_conf_t *clcf,
     ngx_http_cache_turbo_marker_hash(base, mk);
 
     (void) clcf->l1->store(z, mk, ngx_crc32_short(mk, 32),
-               blob, sizeof(blob), 0, ttl,
+               blob, sizeof(blob), ttl,
                ngx_http_cache_turbo_stale_ttl(ttl, clcf->stale_mult));
 }
 
@@ -3855,11 +4189,25 @@ ngx_http_cache_turbo_vary_resolve(ngx_http_request_t *r,
 
     ngx_shmtx_lock(&z->shpool->mutex);
     m = clcf->l1->lookup(z, mk, ngx_crc32_short(mk, 32));
+    /* Accept a stale-but-serveable marker, not only a fresh one (codex
+     * follow-up): the object variants it points at are themselves served stale
+     * within their stale window, so gating the marker on fresh_until alone made
+     * those stale variants unreachable (the request fell back to the base key
+     * and re-fetched). The marker is refreshed on every variant store, so it
+     * only goes stale alongside its objects. stale_until == 0 => forever. */
     if (m != NULL && m->data != NULL
         && m->len >= sizeof(ngx_http_cache_turbo_blob_hdr_t) + 1
-        && ngx_time() < m->fresh_until)
+        && (m->stale_until == 0 || ngx_time() < m->stale_until))
     {
-        bits = m->data[sizeof(ngx_http_cache_turbo_blob_hdr_t)];
+        /* Validate the marker's blob magic before trusting the bits byte (the
+         * marker key folds "varymark" so a real object can't normally land here,
+         * but a hash collision must not be read as an axis bitmask). The slot is
+         * slab-aligned; copy the header into an aligned local rather than casting. */
+        ngx_http_cache_turbo_blob_hdr_t  mh;
+        ngx_memcpy(&mh, m->data, sizeof(mh));
+        if (mh.magic == NGX_HTTP_CACHE_TURBO_BLOB_MAGIC) {
+            bits = m->data[sizeof(ngx_http_cache_turbo_blob_hdr_t)];
+        }
     }
     ngx_shmtx_unlock(&z->shpool->mutex);
 
@@ -3867,7 +4215,6 @@ ngx_http_cache_turbo_vary_resolve(ngx_http_request_t *r,
         ngx_http_cache_turbo_variant_hash(r, &ctx->cache_key, bits,
                                           ctx->key_hash);
         *hash = ngx_crc32_short(ctx->key_hash, 32);
-        ctx->varied = 1;
         ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "cache_turbo: auto-Vary marker hit \"%V\" bits=0x%xi "
                        "-> variant key", &r->uri, bits);

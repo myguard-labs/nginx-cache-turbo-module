@@ -231,7 +231,7 @@ ngx_http_cache_turbo_shm_purge_all(ngx_http_cache_turbo_zone_t *z)
 ngx_int_t
 ngx_http_cache_turbo_shm_store(ngx_http_cache_turbo_zone_t *z,
     u_char *key_hash, uint32_t hash, u_char *data, size_t len,
-    ngx_uint_t status, time_t fresh_ttl, time_t stale_ttl)
+    time_t fresh_ttl, time_t stale_ttl)
 {
     u_char                       *body;
     time_t                        now;
@@ -274,7 +274,6 @@ ngx_http_cache_turbo_shm_store(ngx_http_cache_turbo_zone_t *z,
         }
         ctn->data = body;
         ctn->len = len;
-        ctn->status = status;
         ctn->fresh_until = now + fresh_ttl;
         ctn->stale_until = stale_ttl ? now + stale_ttl : 0;
         ctn->refreshing = 0;
@@ -316,7 +315,6 @@ ngx_http_cache_turbo_shm_store(ngx_http_cache_turbo_zone_t *z,
     ngx_memcpy(ctn->key, key_hash, 32);
     ctn->data = body;
     ctn->len = len;
-    ctn->status = status;
     ctn->fresh_until = now + fresh_ttl;
     ctn->stale_until = stale_ttl ? now + stale_ttl : 0;
     ctn->refreshing = 0;
@@ -418,7 +416,6 @@ ngx_http_cache_turbo_shm_claim(ngx_http_cache_turbo_zone_t *z,
     ngx_memcpy(ctn->key, key_hash, 32);
     ctn->data = NULL;
     ctn->len = 0;
-    ctn->status = 0;
     ctn->fresh_until = 0;
     ctn->stale_until = 0;
     ctn->refreshing = 1;
@@ -522,7 +519,6 @@ ngx_http_cache_turbo_shm_count_miss(ngx_http_cache_turbo_zone_t *z,
     ngx_memcpy(ctn->key, key_hash, 32);
     ctn->data = NULL;
     ctn->len = 0;
-    ctn->status = 0;
     ctn->fresh_until = 0;
     ctn->stale_until = 0;
     ctn->refreshing = 0;

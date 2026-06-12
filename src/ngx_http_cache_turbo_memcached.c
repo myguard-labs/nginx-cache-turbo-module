@@ -352,7 +352,6 @@ ngx_http_cache_turbo_memcached_get(ngx_http_request_t *r,
 
     /* Parked: hold a reference so the request survives until the reply resumes
      * it (released by ngx_http_finalize_request(NGX_DONE) in get_finish). */
-    ctx->l2_pending = 1;
     r->main->count++;
 
     return NGX_AGAIN;
@@ -677,7 +676,6 @@ ngx_http_cache_turbo_mc_get_finish(ngx_http_cache_turbo_mc_op_t *op,
     }
 
     ctx->l2_result = result;
-    ctx->l2_pending = 0;
     ctx->l2_done = 1;
 
     /* tear down our own connection + pool (blob is now copied into r->pool) */

@@ -179,7 +179,13 @@ their status codes a TTL:
 cache_turbo_valid 30s;              # the default / 200 TTL
 cache_turbo_valid 301 302 308 1h;   # cache redirects
 cache_turbo_valid 404 410 1m;       # negative caching
+cache_turbo_valid 0;                # "cache forever" (stays fresh, never expires)
 ```
+
+A `TIME` of `0` means **cache forever**: the copy stays *fresh* indefinitely (it
+is never served stale and never re-fetched on its own — purge it explicitly to
+update). Internally this is a long finite TTL, so it still works across the L2
+(Redis/memcached) tier like any other entry.
 
 And it **refuses** to cache anything that looks per-user, so you don't
 accidentally serve Alice's logged-in page to Bob:
@@ -349,7 +355,7 @@ $ curl -X POST 'localhost/_cache?url=/,/blog/,/about' # pre-warm cold pages
 | `cache_turbo_suppress_native on` | `server`, `location` | `off` | Make `$cache_turbo_active` read `1` while cache-turbo owns a request, so a stacked native `proxy_cache` can defer via `proxy_no_cache $cache_turbo_active; proxy_cache_bypass $cache_turbo_active;`. Off (default) keeps the variable always `0` (the wiring stays inert). |
 | `cache_turbo_key STRING` | `server`, `location` | `$host$uri$cache_turbo_normalized_args` | What makes two requests "the same page". The default already includes the Host and the **normalized args** (tracking params stripped, args sorted). |
 | `cache_turbo_preset NAME` | `server`, `location` | `balanced` | `conservative` / `balanced` / `aggressive` — sets the four knobs below at once. |
-| `cache_turbo_valid [CODE...] TIME` | `server`, `location` | preset (`60s`) | How long a copy stays *fresh* (then *stale*, still served). Bare `TIME` = the default/200 TTL. With leading status codes (`cache_turbo_valid 301 404 1m;`) it makes those statuses cacheable too — redirects + negative caching. Repeatable. |
+| `cache_turbo_valid [CODE...] TIME` | `server`, `location` | preset (`60s`) | How long a copy stays *fresh* (then *stale*, still served). Bare `TIME` = the default/200 TTL. `TIME` of `0` = cache forever (stays fresh, never expires). With leading status codes (`cache_turbo_valid 301 404 1m;`) it makes those statuses cacheable too — redirects + negative caching. Repeatable. |
 | `cache_turbo_beta N` | `server`, `location` | preset (`1000`) | Refresh eagerness, ×1000 (1000 = 1.0). Higher = refresh sooner/more often. |
 | `cache_turbo_lock_ttl TIME` | `server`, `location` | preset (`5s`) | Single-flight window: once one refresh is claimed, others serve stale until it finishes. Caps backend regens to ~one per cycle. |
 | `cache_turbo_lock on` / `off` | `server`, `location` | `on` | Cold-miss single-flight: when an *uncached* key is hit by many requests at once, the first goes to the origin and the rest **wait** for it to fill the cache (per box via a stub, cluster-wide via the Redis lock) rather than all stampeding the origin. **Off** = every cold miss goes straight to the origin. |

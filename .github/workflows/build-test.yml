@@ -122,6 +122,81 @@ jobs:
           path: artifact/
           retention-days: 1
 
+  legacy-build:
+    name: Legacy nginx compile (pre-1.23 header API)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential curl libpcre2-dev libssl-dev zlib1g-dev
+
+      - name: Build module against nginx 1.22.x
+        # 1.22.1 has nginx_version < 1023000, so it exercises the #else cookie /
+        # header-list code paths (r->headers_in.cookies array, etc.) that the
+        # mainline 1.31.x build never compiles. Guards against bitrot there.
+        env:
+          LEGACY_VERSION: "1.22.1"
+        run: |
+          bash tools/ci-build.sh nginx "$LEGACY_VERSION"
+          build=".build/nginx-${LEGACY_VERSION}"
+          cflags=$(awk '/^CFLAGS[[:space:]]*=/{sub(/^CFLAGS[[:space:]]*=[[:space:]]*/,""); print; exit}' "$build/objs/Makefile")
+          incs=$(awk '/^ALL_INCS[[:space:]]*=/{found=1} found{line=$0; sub(/^ALL_INCS[[:space:]]*=[[:space:]]*/,"",line); continued=(line ~ /\\$/); gsub(/\\$/, "", line); printf "%s ", line; if (!continued) exit}' "$build/objs/Makefile")
+          # cflags and incs are compiler flag lists and must word-split.
+          # shellcheck disable=SC2086
+          for src in ngx_http_cache_turbo_module ngx_http_cache_turbo_shm ngx_http_cache_turbo_swr ngx_http_cache_turbo_autotune ngx_http_cache_turbo_redis ngx_http_cache_turbo_memcached; do
+            ( cd "$build" && gcc -c -fPIC $cflags \
+                -Wall -Wextra -Wshadow -Wstrict-prototypes \
+                -Wstrict-aliasing -Wunreachable-code -Werror \
+                -Wno-unused-parameter \
+                $incs "$GITHUB_WORKSPACE/src/${src}.c" -o "/tmp/legacy-${src}.o" )
+          done
+
+  analyze:
+    name: Clang static analyzer (per-PR deep analysis)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang curl libpcre2-dev libssl-dev zlib1g-dev
+
+      - name: Clang --analyze every source
+        # The deep static-analysis suite (security-scanners.yml) only runs monthly;
+        # this is a fast clang static-analyzer pass on every PR so a regression
+        # cannot merge and sit un-analysed for ~a month. Uses the path-flow
+        # analyzer (null-deref, leaks, uninit reads, dead stores) over all six
+        # sources with the configured nginx include set. Any report fails the job.
+        env:
+          NGINX_VERSION: "1.31.1"
+        run: |
+          bash tools/ci-build.sh nginx "$NGINX_VERSION" module
+          build=".build/nginx-${NGINX_VERSION}"
+          incs=$(awk '/^ALL_INCS[[:space:]]*=/{found=1} found{line=$0; sub(/^ALL_INCS[[:space:]]*=[[:space:]]*/,"",line); continued=(line ~ /\\$/); gsub(/\\$/, "", line); printf "%s ", line; if (!continued) exit}' "$build/objs/Makefile")
+          rc=0
+          for src in ngx_http_cache_turbo_module ngx_http_cache_turbo_shm ngx_http_cache_turbo_swr ngx_http_cache_turbo_autotune ngx_http_cache_turbo_redis ngx_http_cache_turbo_memcached; do
+            # incs is a flag list and must word-split.
+            # shellcheck disable=SC2086
+            ( cd "$build" && clang --analyze -Xanalyzer -analyzer-output=text \
+                -DNGX_DEBUG_PALLOC=1 $incs \
+                "$GITHUB_WORKSPACE/src/${src}.c" 2>"/tmp/analyze-${src}.log" ) || rc=1
+            if [ -s "/tmp/analyze-${src}.log" ]; then
+              echo "::error file=src/${src}.c::clang analyzer reported issues"
+              cat "/tmp/analyze-${src}.log"
+              rc=1
+            fi
+          done
+          rm -f "$build"/*.plist
+          exit "$rc"
+
   runtime:
     name: Runtime
     runs-on: ubuntu-latest

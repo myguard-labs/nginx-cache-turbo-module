@@ -26,6 +26,16 @@
  * the runtime ngx_http_cache_turbo_loc_conf_t.stale_mult field. */
 #define NGX_HTTP_CACHE_TURBO_STALE_MULTIPLIER  4
 
+/* "Forever" fresh TTL. `cache_turbo_valid 0` ("cache forever", per the code's
+ * long-standing contract) resolves to this long-but-finite TTL rather than a
+ * literal 0 — a literal 0 made the object instantly+permanently STALE and
+ * skipped L2 (the L2 blob's stale_ttl was 0 => every L2 hit read as expired).
+ * 10 years keeps all the freshness arithmetic (fresh_until, stale window, L2
+ * EXPIRE, blob created+age) on the normal path while behaving as "never
+ * expires". Bounded so FOREVER * max-preset-stale_mult (8) still fits the uint32
+ * blob stale_ttl field (2.5e9 < 4.29e9). */
+#define NGX_HTTP_CACHE_TURBO_FOREVER_TTL  ((time_t) 315360000)   /* 10 years */
+
 /* Default SWR aggressiveness (beta). 1.0 = refresh probability tracks the
  * elapsed fraction of the stale window directly. */
 #define NGX_HTTP_CACHE_TURBO_DEFAULT_BETA      1000   /* fixed-point /1000 */
@@ -151,7 +161,6 @@ typedef struct {
                                               * serve stale and skip the dice;
                                               * only the claimer regenerates.
                                               * Self-heals if a refresh dies. */
-    ngx_uint_t               status;        /* cached HTTP status           */
 
     /* min_uses (v15) miss counter. A "counter node" (data == NULL / len == 0,
      * refreshing == 0) tracks how many times a key has cold-missed without yet
@@ -485,7 +494,6 @@ typedef struct {
     unsigned                 stale_hit:1; /* served stale (for X-Cache)      */
     unsigned                 warm:1;      /* warm subrequest: force a miss,  */
                                           /* capture + store though !r->main */
-    unsigned                 l2_pending:1;/* L2 GET parked, awaiting reply   */
     unsigned                 l2_done:1;   /* L2 GET finished (hit or miss)   */
     ngx_int_t                l2_result;   /* NGX_OK = L2 hit; else miss      */
     u_char                  *l2_blob;     /* L2-hit blob, copied to r->pool  */
@@ -494,10 +502,14 @@ typedef struct {
     /* Cross-node dogpile (v4-2). On a stale L1 dice win the request parks for a
      * Redis SET NX PX reply: lock_result == NGX_OK means this node holds the
      * cluster-wide regen lock (go to origin); anything else means another node
-     * owns it (serve stale, skip origin). Mirrors the l2_* park/resume trio. */
-    unsigned                 lock_pending:1;/* NX parked, awaiting reply      */
+     * owns it (serve stale, skip origin). Mirrors the l2_* park/resume trio.
+     * lock_result == NGX_ERROR is a THIRD outcome (v16): the L2 lock channel
+     * itself failed (timeout / connect error / EOF), distinct from a genuine
+     * peer-holds-lock decline — the caller degrades to per-box single-flight
+     * (regenerate locally) instead of suppressing the refresh, so a Redis
+     * outage cannot freeze every node on serve-stale / cold-wait. */
     unsigned                 lock_done:1; /* NX reply landed                 */
-    ngx_int_t                lock_result; /* NGX_OK = we hold the lock        */
+    ngx_int_t                lock_result; /* NGX_OK=hold; NGX_ERROR=L2 down   */
     /* Cold-miss single-flight (v10). A cold-miss LOSER parks on a short timer
      * and re-checks L1/L2 until the winner fills the entry or lock_timeout
      * elapses. waiting marks this request as already in the wait loop (re-entry
@@ -516,16 +528,16 @@ typedef struct {
     unsigned                 cold_stored:1;
     ngx_http_cache_turbo_zone_t *cold_zone;
     ngx_chain_t             *body;        /* buffered response chain        */
+    ngx_chain_t             *body_last;   /* tail of body, O(1) append      */
     size_t                   body_len;
     ngx_str_t                cache_key;
     u_char                   key_hash[32];
-    /* auto-Vary (v11 other half). varied = the request was re-keyed to a variant
-     * via an L1 vary marker (key_hash already holds the variant). vary_bits = the
-     * safe-axis bitmask classified from the response Vary header in the header
-     * filter (>0 => store under a variant key + write/refresh the marker; the
-     * body filter reads it). vary_nocache = the response carried a Vary the
-     * whitelist refuses (*, Cookie, Authorization) => do not capture/store. */
-    unsigned                 varied:1;
+    /* auto-Vary (v11 other half). vary_bits = the safe-axis bitmask classified
+     * from the response Vary header in the header filter (>0 => store under a
+     * variant key + write/refresh the marker; the body filter reads it). When a
+     * request resolves to a variant via an L1 vary marker, key_hash already holds
+     * the variant key. vary_nocache = the response carried a Vary the whitelist
+     * refuses (*, Cookie, Authorization) => do not capture/store. */
     unsigned                 vary_nocache:1;
     ngx_int_t                vary_bits;
     /* min_uses (v15). min_uses_skip = this request is below the threshold, so the
@@ -583,7 +595,7 @@ ngx_http_cache_turbo_node_t *
 
 ngx_int_t ngx_http_cache_turbo_shm_store(ngx_http_cache_turbo_zone_t *z,
     u_char *key_hash, uint32_t hash, u_char *data, size_t len,
-    ngx_uint_t status, time_t fresh_ttl, time_t stale_ttl);
+    time_t fresh_ttl, time_t stale_ttl);
 
 /* Purge a single entry by key hash. Returns 1 if an entry was removed, 0 if
  * not present. */
@@ -755,7 +767,7 @@ struct ngx_cache_turbo_l1_backend_s {
     ngx_http_cache_turbo_node_t *(*lookup)(ngx_http_cache_turbo_zone_t *z,
         u_char *key_hash, uint32_t hash);
     ngx_int_t  (*store)(ngx_http_cache_turbo_zone_t *z, u_char *key_hash,
-        uint32_t hash, u_char *data, size_t len, ngx_uint_t status,
+        uint32_t hash, u_char *data, size_t len,
         time_t fresh_ttl, time_t stale_ttl);
     ngx_int_t  (*purge_key)(ngx_http_cache_turbo_zone_t *z, u_char *key_hash,
         uint32_t hash);
