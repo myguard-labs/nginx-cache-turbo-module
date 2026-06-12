@@ -574,6 +574,15 @@ typedef struct {
      * refuses (*, Cookie, Authorization) => do not capture/store. */
     unsigned                 vary_nocache:1;
     ngx_int_t                vary_bits;
+    /* auto-Vary PURGE generation (COR-5). Resolved from the L1 marker by
+     * vary_resolve and reused at store so the variant key + marker agree. Stays
+     * 0 for the backend-backed purge path (variants are physically removed +
+     * the marker deleted, so the keyspace resets cleanly to gen 0); only the
+     * L1-only / memcached purge path bumps it (no enumerable L2 index, so an
+     * old generation's variants are orphaned and age out while new requests
+     * key on gen+1). variant_hash folds it ONLY when >0, so gen 0 keeps the
+     * pre-COR-5 variant keys (no keyspace turnover on upgrade). */
+    ngx_uint_t               vary_gen;
     /* min_uses (v15). min_uses_skip = this request is below the threshold, so the
      * header filter must NOT capture it (no store) and it runs to the origin.
      * min_uses_passed = the gate already counted this request and let it through

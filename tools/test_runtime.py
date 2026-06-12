@@ -430,6 +430,21 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # COR-5 (Redis-backed): auto-Vary + PURGE with an L2 backend. Each variant
+        # store SADDs its L2 key into a per-base variant-index set; a PURGE of the
+        # base URI SMEMBERS that set and drops every variant from L1 + L2 + the
+        # index set, then deletes the node-local marker. The next request for each
+        # axis value misses to origin (proves cross-tier variant invalidation).
+        location /cor5/ {{
+            cache_turbo          main;
+            cache_turbo_key      $request_uri;
+            cache_turbo_valid    30s;
+            cache_turbo_auto_vary on;
+            cache_turbo_purge    on;
+            cache_turbo_redis    127.0.0.1:{redis_port} prefix=ct: timeout=250ms;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # cross-node dogpile (v4-2): fresh TTL 2s -> stale_until = valid*4 = 8s,
         # a wide window so both lock tests have timing slack; aggressive beta so
         # a stale read reliably rolls a refresh; lock_ttl 5s = the Redis SET NX
@@ -969,6 +984,19 @@ http {{
             cache_turbo_key      $request_uri;
             cache_turbo_valid    30s;
             cache_turbo_vary_safe on;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # COR-5 (L1-only): auto-Vary + PURGE with NO L2 backend. A PURGE of the
+        # base URI must invalidate EVERY variant; with no enumerable L2 index the
+        # module bumps the marker generation so old-generation variants are
+        # orphaned and the next request for each axis value misses to origin.
+        location /cor5l1/ {{
+            cache_turbo          main;
+            cache_turbo_key      $request_uri;
+            cache_turbo_valid    30s;
+            cache_turbo_auto_vary on;
+            cache_turbo_purge    on;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
@@ -2210,6 +2238,63 @@ def test_purge_method(ng: Nginx) -> None:
     assert json.loads(b)["purged"] == 1, f"purge count: {b}"
     _, _, h2 = fetch(ng.port, "/pg/x")
     assert "x-cache" not in h2, "entry should be gone after PURGE (a MISS)"
+
+
+def test_cor5_l1only_variant_purge(ng: Nginx, origin: Origin) -> None:
+    """COR-5 (L1-only): a PURGE of an auto-Vary base URI must invalidate EVERY
+    variant, not just the base key. With no L2 backend the module bumps the
+    marker generation, orphaning every old-generation variant. Two language
+    variants are primed (HIT), then one PURGE of the base must make BOTH miss."""
+    import json
+    en = {"Accept-Language": "en"}
+    fr = {"Accept-Language": "fr"}
+    # prime + confirm two distinct, independently-cached variants
+    _, en0, _ = fetch(ng.port, "/cor5l1/p?v=al", headers=en)
+    _, en1, he1 = fetch(ng.port, "/cor5l1/p?v=al", headers=en)
+    assert he1.get("x-cache") == "HIT" and en1 == en0, "en variant should cache"
+    _, fr0, _ = fetch(ng.port, "/cor5l1/p?v=al", headers=fr)
+    _, fr1, hf1 = fetch(ng.port, "/cor5l1/p?v=al", headers=fr)
+    assert hf1.get("x-cache") == "HIT" and fr1 == fr0, "fr variant should cache"
+    assert fr0 != en0, "en and fr must be distinct variant slots"
+    # one PURGE of the base URI (no Accept-Language => base key)
+    s, b, _ = fetch_raw(ng.port, "/cor5l1/p?v=al", method="PURGE")
+    assert s == 200, f"PURGE status {s}"
+    assert json.loads(b)["purged"] >= 1, f"purge should report >=1: {b}"
+    # BOTH variants must now miss to origin (new bodies)
+    _, en2, he2 = fetch(ng.port, "/cor5l1/p?v=al", headers=en)
+    assert "x-cache" not in he2 and en2 != en0, \
+        f"en variant survived PURGE: X-Cache={he2.get('x-cache')} body={en2!r}"
+    _, fr2, hf2 = fetch(ng.port, "/cor5l1/p?v=al", headers=fr)
+    assert "x-cache" not in hf2 and fr2 != fr0, \
+        f"fr variant survived PURGE: X-Cache={hf2.get('x-cache')} body={fr2!r}"
+
+
+def test_cor5_redis_variant_purge(ng: Nginx, origin: Origin,
+                                  redis: RedisServer) -> None:
+    """COR-5 (Redis-backed): a PURGE of an auto-Vary base URI must drop every
+    variant from BOTH tiers via the per-base variant-index set (SADD at store,
+    SMEMBERS+DEL at purge). Two language variants are primed (HIT), then one
+    PURGE of the base must make both miss to origin."""
+    import json
+    en = {"Accept-Language": "en"}
+    fr = {"Accept-Language": "fr"}
+    _, en0, _ = fetch(ng.port, "/cor5/p?v=al", headers=en)
+    _, en1, he1 = fetch(ng.port, "/cor5/p?v=al", headers=en)
+    assert he1.get("x-cache") == "HIT" and en1 == en0, "en variant should cache"
+    _, fr0, _ = fetch(ng.port, "/cor5/p?v=al", headers=fr)
+    _, fr1, hf1 = fetch(ng.port, "/cor5/p?v=al", headers=fr)
+    assert hf1.get("x-cache") == "HIT" and fr1 == fr0, "fr variant should cache"
+    assert fr0 != en0, "en and fr must be distinct variant slots"
+    s, b, _ = fetch_raw(ng.port, "/cor5/p?v=al", method="PURGE")
+    assert s == 200, f"PURGE status {s}"
+    # the index held 2 variant members
+    assert json.loads(b)["purged"] >= 2, f"purge should report >=2 variants: {b}"
+    _, en2, he2 = fetch(ng.port, "/cor5/p?v=al", headers=en)
+    assert "x-cache" not in he2 and en2 != en0, \
+        f"en variant survived PURGE: X-Cache={he2.get('x-cache')} body={en2!r}"
+    _, fr2, hf2 = fetch(ng.port, "/cor5/p?v=al", headers=fr)
+    assert "x-cache" not in hf2 and fr2 != fr0, \
+        f"fr variant survived PURGE: X-Cache={hf2.get('x-cache')} body={fr2!r}"
 
 
 def test_cache_and_purge_respect_access_control(ng: Nginx) -> None:
@@ -3965,6 +4050,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_conditional_ims_old_full(ng)
     test_conditional_inm_beats_ims(ng)
     test_purge_method(ng)
+    test_cor5_l1only_variant_purge(ng, origin)
     test_cache_and_purge_respect_access_control(ng)
     test_bypass(ng)
     test_no_store(ng)
@@ -4025,6 +4111,7 @@ def run_all(ng: Nginx, origin: Origin,
         test_l2_malformed_blob_rejected(ng, origin, redis)  # STAB-4 validate
         test_l2_tag_add_on_store(ng, origin, redis)
         test_l2_tag_purge(ng, origin, redis)
+        test_cor5_redis_variant_purge(ng, origin, redis)  # COR-5 variant index
         test_multinode_lock(ng, origin, redis)
         test_lock_self_heal(ng, origin, redis)
         test_cold_single_flight_cross_node(ng, origin, redis)
@@ -4136,7 +4223,8 @@ def main() -> int:
           "vary_safe refuses varied response (SEC-4), "
           "conditional 304 (v11: If-None-Match/*/mismatch, "
           "If-Modified-Since fresh/stale, INM-beats-IMS precedence), "
-          "PURGE method, bypass + no_store, "
+          "PURGE method, COR-5 auto-Vary variant purge (L1-only gen-bump), "
+          "bypass + no_store, "
           "native-cache headers stripped, "
           "admin purge w/ body, "
           "concurrency (R1), prometheus metrics (incl L2 hit/miss), "
@@ -4163,6 +4251,7 @@ def main() -> int:
              "L2 cross-instance fill (P2), "
              "L2-aware key purge (P6), expired-L1 consults L2 (P6), "
              "tag index add (v2c), tag purge both tiers (P4), "
+             "COR-5 Redis variant-index purge (both tiers), "
              "multi-node dogpile lock (v4-2 SET NX PX), lock self-heal (v4-2), "
              "cold-miss cross-node single-flight (v10), "
              "?all=1 clears L2 (v4-2 SCAN+DEL), "

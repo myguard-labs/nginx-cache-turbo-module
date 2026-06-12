@@ -72,6 +72,15 @@ static ngx_int_t ngx_http_cache_turbo_warm(ngx_http_request_t *r,
     ngx_str_t *urls);
 static ngx_int_t ngx_http_cache_turbo_warm_one(ngx_http_request_t *r,
     ngx_str_t *uri, ngx_str_t *args);
+/* State carried through an async tag purge from the admin handler to the
+ * SMEMBERS completion callback. Also reused for the COR-5 variant-index purge
+ * (the index is a per-base tag set), so it is defined up here for
+ * purge_request near the top of the file. */
+typedef struct {
+    ngx_http_cache_turbo_loc_conf_t  *clcf;
+    ngx_http_cache_turbo_zone_t      *zone;
+    ngx_str_t                         tag;    /* copied into r->pool */
+} ngx_http_cache_turbo_tagpurge_t;
 static ngx_int_t ngx_http_cache_turbo_tag_purge_complete(ngx_http_request_t *r,
     void *data, ngx_str_t *members, ngx_uint_t nmembers);
 static ngx_int_t ngx_http_cache_turbo_add_variables(ngx_conf_t *cf);
@@ -87,10 +96,15 @@ static void ngx_http_cache_turbo_vary_resolve(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_zone_t *z,
     ngx_http_cache_turbo_ctx_t *ctx, uint32_t *hash);
 static void ngx_http_cache_turbo_variant_hash(ngx_http_request_t *r,
-    ngx_str_t *base, ngx_int_t bits, u_char out[32]);
+    ngx_str_t *base, ngx_int_t bits, ngx_uint_t gen, u_char out[32]);
 static void ngx_http_cache_turbo_marker_hash(ngx_str_t *base, u_char out[32]);
 static void ngx_http_cache_turbo_marker_store(ngx_http_cache_turbo_loc_conf_t *clcf,
-    ngx_http_cache_turbo_zone_t *z, ngx_str_t *base, ngx_int_t bits, time_t ttl);
+    ngx_http_cache_turbo_zone_t *z, ngx_str_t *base, ngx_int_t bits,
+    ngx_uint_t gen, time_t ttl);
+/* COR-5: the per-base variant-index set name (space-framed so no user tag token
+ * can collide) + the L1-only generation bump. */
+static size_t ngx_http_cache_turbo_variant_index_name(ngx_str_t *base,
+    u_char *buf);
 static void ngx_http_cache_turbo_classify_vary(ngx_http_request_t *r,
     ngx_int_t *bits_out, ngx_uint_t *nocache_out);
 static ngx_uint_t ngx_http_cache_turbo_response_has_vary(ngx_http_request_t *r);
@@ -1027,6 +1041,82 @@ ngx_http_cache_turbo_purge_request(ngx_http_request_t *r,
     /* Drop from L2 too, so a purge can't be silently refilled from Redis. */
     if (clcf->backend) {
         clcf->backend->del(clcf, ctx->key_hash);
+    }
+
+    /* COR-5: a PURGE of the base URI must also invalidate every auto-Vary
+     * variant. Variants are stored under variant keys (base material + the
+     * folded axis values), not the base key, so the base purge above never
+     * touches them. Two strategies by L2 capability:
+     *   - Redis (purge_tag): the variants were SADD'd into a per-base index set
+     *     at store time. SMEMBERS it and drop every variant from L1 + L2 + the
+     *     set (async). Delete the node-local marker so this node stops resolving
+     *     to the now-removed variants; the keyspace resets cleanly to gen 0.
+     *   - L1-only / memcached (no enumerable index): bump the marker generation
+     *     so old-generation variants are orphaned (new requests key on gen+1;
+     *     orphans age out via L1 LRU + TTL / memcached value TTL). */
+    if (clcf->auto_vary) {
+        u_char                        mk[32];
+        ngx_int_t                     bits = 0;
+        ngx_uint_t                    mgen = 0;
+        time_t                        mttl = 0;
+        ngx_uint_t                    have_marker = 0;
+        ngx_http_cache_turbo_node_t  *m;
+
+        ngx_http_cache_turbo_marker_hash(&ctx->cache_key, mk);
+        ngx_shmtx_lock(&z->shpool->mutex);
+        m = clcf->l1->lookup(z, mk, ngx_crc32_short(mk, 32));
+        if (m != NULL && m->data != NULL
+            && m->len >= NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE + 1)
+        {
+            ngx_http_cache_turbo_blob_hdr_t  mh;
+            if (ngx_http_cache_turbo_blob_validate(m->data, m->len, &mh,
+                    NULL, NULL) == NGX_OK)
+            {
+                have_marker = 1;
+                bits = m->data[NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE];
+                if (m->len >= NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE + 2) {
+                    mgen = m->data[NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE + 1];
+                }
+                mttl = (time_t) mh.fresh_ttl;
+            }
+        }
+        ngx_shmtx_unlock(&z->shpool->mutex);
+
+        if (clcf->backend && clcf->backend->purge_tag) {
+            u_char                            vname[1 + 64];
+            size_t                            vlen;
+            ngx_http_cache_turbo_tagpurge_t  *tp;
+            ngx_int_t                         prc;
+
+            (void) clcf->l1->purge_key(z, mk, ngx_crc32_short(mk, 32));
+
+            tp = ngx_pcalloc(r->pool, sizeof(*tp));
+            if (tp != NULL) {
+                vlen = ngx_http_cache_turbo_variant_index_name(&ctx->cache_key,
+                                                               vname);
+                tp->clcf = clcf;
+                tp->zone = z;
+                tp->tag.data = ngx_pnalloc(r->pool, vlen);
+                if (tp->tag.data != NULL) {
+                    ngx_memcpy(tp->tag.data, vname, vlen);
+                    tp->tag.len = vlen;
+                    prc = clcf->backend->purge_tag(r, clcf, vname, vlen,
+                              ngx_http_cache_turbo_tag_purge_complete, tp);
+                    if (prc == NGX_DONE) {
+                        /* parked; the completion drops every variant + the index
+                         * set and sends {"purged":N}. */
+                        return NGX_DONE;
+                    }
+                }
+            }
+            /* could not launch (alloc / L2 down): fall through to the sync
+             * base-only reply below. */
+
+        } else if (have_marker) {
+            ngx_http_cache_turbo_marker_store(clcf, z, &ctx->cache_key, bits,
+                                              mgen + 1, mttl);
+            purged++;
+        }
     }
 
     p = ngx_pnalloc(r->pool, sizeof("{\"purged\":4294967295}\n"));
@@ -2639,7 +2729,8 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
             ngx_memcpy(store_key, ctx->key_hash, 32);
             if (clcf->auto_vary && ctx->vary_bits > 0) {
                 ngx_http_cache_turbo_variant_hash(r, &ctx->cache_key,
-                                                  ctx->vary_bits, store_key);
+                                                  ctx->vary_bits, ctx->vary_gen,
+                                                  store_key);
             }
             hash = ngx_crc32_short(store_key, 32);
 
@@ -2669,7 +2760,23 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
              * (node-local; self-heals if evicted). */
             if (clcf->auto_vary && ctx->vary_bits > 0) {
                 ngx_http_cache_turbo_marker_store(clcf, z, &ctx->cache_key,
-                                                  ctx->vary_bits, ttl);
+                                                  ctx->vary_bits, ctx->vary_gen,
+                                                  ttl);
+
+                /* COR-5 variant index: SADD this variant's L2 key into the
+                 * per-base index set so a later PURGE of the base URI can
+                 * enumerate + drop every variant from L1+L2. Redis only
+                 * (memcached has no sets => tag_add NULL; its variants are
+                 * invalidated by the L1-only generation bump + TTL instead). */
+                if (clcf->backend && clcf->backend->tag_add) {
+                    u_char  vname[1 + 64];
+                    size_t  vlen;
+
+                    vlen = ngx_http_cache_turbo_variant_index_name(
+                               &ctx->cache_key, vname);
+                    clcf->backend->tag_add(clcf, store_key, vname, vlen,
+                        ngx_http_cache_turbo_stale_ttl(ttl, clcf->stale_mult));
+                }
             }
 
             ngx_log_debug4(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
@@ -3561,13 +3668,8 @@ ngx_http_cache_turbo_hexdecode(u_char *src, size_t len, u_char *dst)
 }
 
 
-/* State carried through an async tag purge from the admin handler to the
- * SMEMBERS completion callback. */
-typedef struct {
-    ngx_http_cache_turbo_loc_conf_t  *clcf;
-    ngx_http_cache_turbo_zone_t      *zone;
-    ngx_str_t                         tag;    /* copied into r->pool */
-} ngx_http_cache_turbo_tagpurge_t;
+/* ngx_http_cache_turbo_tagpurge_t is defined near the top of the file (shared
+ * with the COR-5 variant-index purge launched from purge_request). */
 
 
 /* SMEMBERS completion: drop every member object from L1 + L2, delete the now-
@@ -4394,7 +4496,7 @@ ngx_http_cache_turbo_req_header(ngx_http_request_t *r, const char *name,
  * folded bytes). */
 static void
 ngx_http_cache_turbo_variant_hash(ngx_http_request_t *r, ngx_str_t *base,
-    ngx_int_t bits, u_char out[32])
+    ngx_int_t bits, ngx_uint_t gen, u_char out[32])
 {
     ngx_http_cache_turbo_digest_t  d;
     const char                    *cls;
@@ -4403,6 +4505,20 @@ ngx_http_cache_turbo_variant_hash(ngx_http_request_t *r, ngx_str_t *base,
 
     ngx_http_cache_turbo_digest_init(&d);
     ngx_http_cache_turbo_digest_update(&d, base->data, base->len);
+
+    /* PURGE generation (COR-5): folded ONLY when bumped (>0) so an unpurged
+     * base keeps the pre-COR-5 variant key (no keyspace turnover on upgrade).
+     * The L1-only / memcached purge path bumps it to orphan an old generation's
+     * variants; the backend-backed purge deletes them outright and leaves gen 0. */
+    if (gen > 0) {
+        u_char  gbuf[NGX_INT_T_LEN];
+        size_t  glen;
+
+        glen = (size_t) (ngx_sprintf(gbuf, "%ui", gen) - gbuf);
+        ngx_http_cache_turbo_digest_update(&d, &us, 1);
+        ngx_http_cache_turbo_digest_update(&d, "gen=", 4);
+        ngx_http_cache_turbo_digest_update(&d, gbuf, glen);
+    }
 
     if (bits & NGX_HTTP_CACHE_TURBO_VARY_ENCODING) {
         cls = ngx_http_cache_turbo_ae_class(r);
@@ -4451,27 +4567,58 @@ ngx_http_cache_turbo_marker_hash(ngx_str_t *base, u_char out[32])
 }
 
 
+/* COR-5: build the per-base variant-index "tag name" into buf (>= 1 + 64). The
+ * index reuses the L2 tag set machinery (SADD member + EXPIRE NX/GT, purge via
+ * SMEMBERS); this name lands the set under <prefix>tag:<name>. A LEADING SPACE
+ * frames it so no user `cache_turbo_tag` token can ever equal it: tag tokens are
+ * split on whitespace, so a token can never contain a space. The body is the
+ * 64-hex of a "varidx"-tagged digest of the base key material (deterministic
+ * across nodes, like the variant/marker hashes). Returns the byte length. */
+static size_t
+ngx_http_cache_turbo_variant_index_name(ngx_str_t *base, u_char *buf)
+{
+    ngx_http_cache_turbo_digest_t  d;
+    u_char                         h[32];
+    u_char                        *p;
+    static const u_char            us = 0x1F;
+
+    ngx_http_cache_turbo_digest_init(&d);
+    ngx_http_cache_turbo_digest_update(&d, base->data, base->len);
+    ngx_http_cache_turbo_digest_update(&d, &us, 1);
+    ngx_http_cache_turbo_digest_update(&d, "varidx", sizeof("varidx") - 1);
+    ngx_http_cache_turbo_digest_final(&d, h);
+
+    buf[0] = ' ';
+    p = ngx_hex_dump(buf + 1, h, 32);
+    return (size_t) (p - buf);
+}
+
+
 /* Store/refresh the L1 vary marker for a base key: a one-byte body carrying the
  * active-axis bitmask, wrapped in the standard blob header so a later read can
  * validate the magic before trusting the byte. L1-only and node-local by design
  * (see the loc_conf auto_vary comment); shm store copies the stack blob in. */
 static void
 ngx_http_cache_turbo_marker_store(ngx_http_cache_turbo_loc_conf_t *clcf,
-    ngx_http_cache_turbo_zone_t *z, ngx_str_t *base, ngx_int_t bits, time_t ttl)
+    ngx_http_cache_turbo_zone_t *z, ngx_str_t *base, ngx_int_t bits,
+    ngx_uint_t gen, time_t ttl)
 {
     u_char                           mk[32];
     u_char                           blob[NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE
-                                          + 1];
+                                          + 2];
     ngx_http_cache_turbo_blob_hdr_t  bh;
 
     ngx_memzero(&bh, sizeof(bh));
-    bh.body_len = 1;
+    bh.body_len = 2;
     bh.created = (int64_t) ngx_time();
     bh.fresh_ttl = (uint32_t) (ttl > 0 ? ttl : 0);
     bh.stale_ttl = (uint32_t) ngx_http_cache_turbo_stale_ttl(ttl,
                        clcf->stale_mult);
     ngx_http_cache_turbo_blob_hdr_write(blob, &bh);
-    blob[NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE] = (u_char) (bits & 0xFF);
+    /* body = [axis bitmask][purge generation] (COR-5). The generation lets the
+     * L1-only purge path orphan an old generation's variants by bumping it. */
+    blob[NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE]     = (u_char) (bits & 0xFF);
+    blob[NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE + 1] = (u_char) (gen & 0xFF);
 
     ngx_http_cache_turbo_marker_hash(base, mk);
 
@@ -4494,6 +4641,7 @@ ngx_http_cache_turbo_vary_resolve(ngx_http_request_t *r,
 {
     u_char                        mk[32];
     ngx_int_t                     bits = 0;
+    ngx_uint_t                    gen = 0;
     ngx_http_cache_turbo_node_t  *m;
 
     ngx_http_cache_turbo_marker_hash(&ctx->cache_key, mk);
@@ -4519,12 +4667,22 @@ ngx_http_cache_turbo_vary_resolve(ngx_http_request_t *r,
             == NGX_OK)
         {
             bits = m->data[NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE];
+            /* COR-5: the purge generation lives in the 2nd body byte. Older
+             * 1-byte markers (pre-COR-5, still warm in L1 after upgrade) lack
+             * it => treat as gen 0. */
+            if (m->len >= NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE + 2) {
+                gen = m->data[NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE + 1];
+            }
         }
     }
     ngx_shmtx_unlock(&z->shpool->mutex);
 
+    /* Carry the generation to the store path so the variant key + the refreshed
+     * marker agree on it (store reuses ctx->vary_gen). */
+    ctx->vary_gen = gen;
+
     if (bits > 0) {
-        ngx_http_cache_turbo_variant_hash(r, &ctx->cache_key, bits,
+        ngx_http_cache_turbo_variant_hash(r, &ctx->cache_key, bits, gen,
                                           ctx->key_hash);
         *hash = ngx_crc32_short(ctx->key_hash, 32);
         ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
