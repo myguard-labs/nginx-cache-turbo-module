@@ -32,6 +32,9 @@ static ngx_int_t ngx_http_cache_turbo_body_filter(ngx_http_request_t *r,
 
 static ngx_int_t ngx_http_cache_turbo_serve(ngx_http_request_t *r,
     u_char *copy, size_t len, ngx_uint_t stale);
+static ngx_int_t ngx_http_cache_turbo_restore_response(ngx_http_request_t *r,
+    u_char *copy, size_t len, ngx_uint_t stale, const char *xcache,
+    u_char **bodyp, size_t *body_lenp);
 static ngx_int_t ngx_http_cache_turbo_cold_wait(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_zone_t *z,
     ngx_http_cache_turbo_ctx_t *ctx);
@@ -1862,7 +1865,33 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
 
         /* expired: the L1 copy is past its stale window. Fall through to the
          * shared L2-consult/miss path below — another node may hold a fresher
-         * copy in Redis, so we must check L2 before the origin (issue P6). */
+         * copy in Redis, so we must check L2 before the origin (issue P6).
+         *
+         * RFC 5861 §4 / RFC-2 stale-if-error (CTB4): before going to origin,
+         * arm a serve-on-error snapshot if this blob still carries a window
+         * (created + sie_ttl) that covers now. If the origin revalidation then
+         * fails (5xx/timeout), the header/body filters replay this snapshot
+         * instead of surfacing the error. Arming only STASHES — the L2 consult
+         * below still runs first (a peer may hold a fresh copy). len > 0 skips a
+         * stub; the !sie_armed guard makes the park/resume re-entries idempotent. */
+        if (ctn->len > 0 && !ctx->sie_armed) {
+            time_t    created = (time_t)
+                ngx_http_cache_turbo_get_u64(ctn->data + 24);
+            uint32_t  sie_ttl = ngx_http_cache_turbo_get_u32(ctn->data + 40);
+
+            if (sie_ttl > 0 && now < created + (time_t) sie_ttl) {
+                u_char *snap = ngx_pnalloc(r->pool, ctn->len);
+                if (snap != NULL) {
+                    ngx_memcpy(snap, ctn->data, ctn->len);
+                    ctx->sie_snap = snap;
+                    ctx->sie_snap_len = ctn->len;
+                    ctx->sie_armed = 1;
+                    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                                   "cache_turbo: SIE armed from L1 \"%V\" key=%ui",
+                                   &r->uri, (ngx_uint_t) hash);
+                }
+            }
+        }
     }
 
     /* L1 absent (miss) or expired. Consult L2 (Redis) before falling through to
@@ -1905,7 +1934,27 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
 
             if (rem_stale <= 0) {
                 /* Object outlived its serveable window in L2 (Redis TTL
-                 * slack): treat as a miss and go to origin. */
+                 * slack): treat as a miss and go to origin.
+                 *
+                 * RFC-2 stale-if-error (CTB4): if the L1 path did not already arm
+                 * a snapshot (L1 evicted, or this is a peer's fresher-but-expired
+                 * copy) and this L2 blob still carries a serve-on-error window
+                 * (created + sie_ttl) covering now, arm from it so a failing
+                 * origin below replays it instead of erroring. */
+                if (!ctx->sie_armed && bh.sie_ttl > 0
+                    && ngx_time() < (time_t) bh.created + (time_t) bh.sie_ttl)
+                {
+                    u_char *snap = ngx_pnalloc(r->pool, ctx->l2_blob_len);
+                    if (snap != NULL) {
+                        ngx_memcpy(snap, ctx->l2_blob, ctx->l2_blob_len);
+                        ctx->sie_snap = snap;
+                        ctx->sie_snap_len = ctx->l2_blob_len;
+                        ctx->sie_armed = 1;
+                        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                                       "cache_turbo: SIE armed from L2 \"%V\" "
+                                       "key=%ui", &r->uri, (ngx_uint_t) hash);
+                    }
+                }
                 ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                                "cache_turbo: L2 blob expired \"%V\" key=%ui "
                                "-> origin", &r->uri, (ngx_uint_t) hash);
@@ -2346,28 +2395,25 @@ ngx_http_cache_turbo_not_modified(ngx_http_request_t *r,
 }
 
 
-/* Serve a cached object from a pool-owned snapshot (caller already copied it
- * out of shm and released the zone lock). */
+/* Rebuild r->headers_out from a validated, pool-owned cache blob (caller already
+ * copied it out of shm and released the zone lock): set status / Content-Type /
+ * Content-Length, replay the stored headers, answer a conditional 200 with 304
+ * (live serves only), and stamp Date / Age / X-Cache. Returns the body slice via
+ * *bodyp / *body_lenp. Does NOT send the header or body — ngx_http_cache_turbo_
+ * serve() does that for a live HIT, while the RFC-2 serve-on-error path calls
+ * this from the header filter and lets the filter chain carry the response. */
 static ngx_int_t
-ngx_http_cache_turbo_serve(ngx_http_request_t *r, u_char *copy, size_t len,
-    ngx_uint_t stale)
+ngx_http_cache_turbo_restore_response(ngx_http_request_t *r, u_char *copy,
+    size_t len, ngx_uint_t stale, const char *xcache,
+    u_char **bodyp, size_t *body_lenp)
 {
     u_char                           *p, *end, *body;
     size_t                            body_len;
-    ngx_int_t                         rc;
-    ngx_buf_t                        *b;
-    ngx_chain_t                       out;
     ngx_http_cache_turbo_blob_hdr_t   hdr;
     ngx_http_cache_turbo_blob_hdr_t  *bh;
-    ngx_http_cache_turbo_ctx_t       *ctx;
     uint32_t                          i;
     u_char                           *etag = NULL, *lastmod = NULL;
     size_t                            etag_len = 0, lastmod_len = 0;
-
-    ctx = ngx_http_get_module_ctx(r, ngx_http_cache_turbo_module);
-    if (ctx) {
-        ctx->served = 1;           /* stop our filters re-capturing */
-    }
 
     /* STAB-4: one validated parse. blob_validate checks magic+version, that the
      * header block and body fit, AND walks every TLV header entry — so the
@@ -2520,19 +2566,56 @@ ngx_http_cache_turbo_serve(ngx_http_request_t *r, u_char *copy, size_t len,
         }
     }
 
-    /* X-Cache debug header */
+    /* X-Cache debug header. The caller chooses the value (HIT / STALE for a live
+     * serve, STALE-IF-ERROR for the RFC-2 serve-on-error replacement). */
     {
         static u_char  xc_name[] = "X-Cache";
-        u_char        *state = stale ? (u_char *) "STALE" : (u_char *) "HIT";
         (void) ngx_http_cache_turbo_add_header(r, xc_name,
-                   sizeof("X-Cache") - 1, state, ngx_strlen(state));
+                   sizeof("X-Cache") - 1, (u_char *) xcache,
+                   ngx_strlen(xcache));
+    }
+
+    *bodyp = body;
+    *body_lenp = body_len;
+    return NGX_OK;
+}
+
+
+/*
+ * Send a fully validated cache blob as the response: rebuild r->headers_out
+ * from it (ngx_http_cache_turbo_restore_response), then send the header and the
+ * body and finalize. Used for every live HIT / STALE serve from the access
+ * handler. The RFC-2 serve-on-error path does NOT use this — it reuses only the
+ * restore step from the header filter (a send_header + finalize here would
+ * double-finalize the in-flight upstream-error request); see the header filter.
+ */
+static ngx_int_t
+ngx_http_cache_turbo_serve(ngx_http_request_t *r, u_char *copy, size_t len,
+    ngx_uint_t stale)
+{
+    u_char                       *body;
+    size_t                        body_len;
+    ngx_int_t                     rc;
+    ngx_buf_t                    *b;
+    ngx_chain_t                   out;
+    ngx_http_cache_turbo_ctx_t   *ctx;
+
+    ctx = ngx_http_get_module_ctx(r, ngx_http_cache_turbo_module);
+    if (ctx) {
+        ctx->served = 1;           /* stop our filters re-capturing */
+    }
+
+    if (ngx_http_cache_turbo_restore_response(r, copy, len, stale,
+            stale ? "STALE" : "HIT", &body, &body_len) != NGX_OK)
+    {
+        return NGX_ERROR;
     }
 
     if (ngx_http_send_header(r) != NGX_OK) {
         return NGX_ERROR;
     }
 
-    /* HEAD: header already sent, no body expected — done. */
+    /* HEAD / conditional-304: header already sent, no body expected — done. */
     if (r->header_only) {
         ngx_http_finalize_request(r, NGX_OK);
         return NGX_DONE;
@@ -2683,6 +2766,58 @@ ngx_http_cache_turbo_header_skip(u_char *name, size_t nlen)
 }
 
 
+/*
+ * RFC-2 stale-if-error serve-on-error, header half. The origin revalidation of an
+ * EXPIRED entry returned a 5xx (or nginx synthesised a 502/504 for a transport
+ * failure) and a within-SIE snapshot is armed: REPLACE the error response with
+ * the stale snapshot. We cannot call ngx_http_cache_turbo_serve() here — it runs
+ * ngx_http_send_header + ngx_http_finalize_request, and on the upstream-error
+ * path we are already inside ngx_http_special_response_handler; a second
+ * finalize is a double-finalize / use-after-free. Instead we rewrite
+ * r->headers_out in place and let the filter chain carry the response: drop the
+ * error's header list + typed Content-Type/Length, then replay the snapshot via
+ * the shared restore step (X-Cache: STALE-IF-ERROR), stashing the body slice for
+ * the body filter. Returns NGX_OK on a successful rewrite, NGX_DECLINED to leave
+ * the original error untouched.
+ */
+static ngx_int_t
+ngx_http_cache_turbo_sie_rewrite(ngx_http_request_t *r,
+    ngx_http_cache_turbo_ctx_t *ctx)
+{
+    u_char  *body;
+    size_t   body_len;
+
+    /* Drop the error response's headers and the typed fields it set (Content-Type
+     * / Content-Length) so the snapshot's own headers are authoritative. The
+     * special-response path has already cleared ETag/Last-Modified/Accept-Ranges,
+     * so a fresh list + these two typed fields is a clean slate; restore_response
+     * sets status / Content-Type / Content-Length / status_line from the blob. */
+    if (ngx_list_init(&r->headers_out.headers, r->pool, 8,
+                      sizeof(ngx_table_elt_t)) != NGX_OK)
+    {
+        return NGX_DECLINED;
+    }
+    r->headers_out.content_type.len = 0;
+    r->headers_out.content_type.data = NULL;
+    r->headers_out.content_type_len = 0;
+    r->headers_out.content_length_n = -1;
+    r->headers_out.content_length = NULL;
+    r->headers_out.status_line.len = 0;
+
+    /* stale = 1: never answer 304 from a serve-on-error copy (it has not been
+     * revalidated), and the X-Cache value flags the replacement. */
+    if (ngx_http_cache_turbo_restore_response(r, ctx->sie_snap,
+            ctx->sie_snap_len, 1, "STALE-IF-ERROR", &body, &body_len) != NGX_OK)
+    {
+        return NGX_DECLINED;
+    }
+
+    ctx->sie_body = body;
+    ctx->sie_body_len = body_len;
+    return NGX_OK;
+}
+
+
 static ngx_int_t
 ngx_http_cache_turbo_header_filter(ngx_http_request_t *r)
 {
@@ -2692,6 +2827,30 @@ ngx_http_cache_turbo_header_filter(ngx_http_request_t *r)
     ctx = ngx_http_get_module_ctx(r, ngx_http_cache_turbo_module);
 
     if (ctx == NULL || ctx->served) {
+        return ngx_http_next_header_filter(r);
+    }
+
+    /* RFC-2 stale-if-error: an armed serve-on-error snapshot + an origin 5xx means
+     * replace the error with the stale copy. Do this BEFORE the capture gate so
+     * the (replaced) error is never captured, and clear any cold-miss stub we own
+     * so waiters do not block on a key we will not store. */
+    if (ctx->sie_armed && !ctx->sie_serving
+        && r->headers_out.status >= NGX_HTTP_INTERNAL_SERVER_ERROR
+        && r->headers_out.status <= 599
+        && ngx_http_cache_turbo_sie_rewrite(r, ctx) == NGX_OK)
+    {
+        ctx->served = 1;          /* block capture of the replaced error */
+        ctx->sie_serving = 1;     /* body filter emits the snapshot body */
+
+        if (ctx->cold_winner && !ctx->cold_stored && ctx->cold_zone != NULL) {
+            uint32_t  h = ngx_crc32_short(ctx->key_hash, 32);
+            ngx_http_cache_turbo_shm_unstub(ctx->cold_zone, ctx->key_hash, h);
+            ctx->cold_stored = 1;
+        }
+
+        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "cache_turbo: STALE-IF-ERROR serve \"%V\" len=%uz",
+                       &r->uri, ctx->sie_body_len);
         return ngx_http_next_header_filter(r);
     }
 
@@ -2775,6 +2934,38 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
     ngx_uint_t                        last = 0;
 
     ctx = ngx_http_get_module_ctx(r, ngx_http_cache_turbo_module);
+
+    /* RFC-2 stale-if-error, body half. The header filter replaced an origin error
+     * with the stale snapshot; discard the upstream error body and emit the
+     * snapshot body ONCE with last_buf. Checked before the served/captured gate
+     * (the header filter set ctx->served to stop capture). sie_body_sent swallows
+     * any trailing error buffers the upstream still streams after the last_buf. */
+    if (ctx != NULL && ctx->sie_serving) {
+        ngx_buf_t    *eb;
+        ngx_chain_t   eout;
+
+        if (ctx->sie_body_sent) {
+            return NGX_OK;
+        }
+        ctx->sie_body_sent = 1;
+
+        eb = ngx_calloc_buf(r->pool);
+        if (eb == NULL) {
+            return NGX_ERROR;
+        }
+        eb->pos = ctx->sie_body;
+        eb->last = ctx->sie_body + ctx->sie_body_len;
+        eb->memory = (ctx->sie_body_len > 0) ? 1 : 0;
+        eb->last_buf = (r == r->main) ? 1 : 0;
+        eb->last_in_chain = 1;
+        if (ctx->sie_body_len == 0) {
+            eb->sync = 1;
+        }
+
+        eout.buf = eb;
+        eout.next = NULL;
+        return ngx_http_next_body_filter(r, &eout);
+    }
 
     if (ctx == NULL || !ctx->captured || ctx->served) {
         return ngx_http_next_body_filter(r, in);

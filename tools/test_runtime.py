@@ -268,6 +268,13 @@ class Origin:
                     # serve-on-error window (fresh + 30) in the blob's sie_ttl.
                     self.send_header("Cache-Control",
                                      "max-age=60, stale-if-error=30")
+                if "sieserve" in self.path:
+                    # RFC-2 serve-on-error: short fresh window + a long
+                    # stale-if-error so the entry can FULLY expire (past its stale
+                    # window) yet stay inside the serve-on-error window. No max-age
+                    # here -> the location's cache_turbo_valid (1s) sets the fresh
+                    # TTL; sie_ttl = 1 + 30 = 31s. Drives test_sie_serve_on_error.
+                    self.send_header("Cache-Control", "stale-if-error=30")
                 if "cond" in self.path:
                     # v11 conditional-304: stable validators so a stored entry
                     # can answer If-None-Match / If-Modified-Since from cache.
@@ -800,6 +807,20 @@ http {{
             cache_turbo_key      $uri;
             cache_turbo_valid    2s;     # fresh 2s, stale window x4 -> 8s
             cache_turbo_beta     5000;   # aggressive: a stale read fires a refresh
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # RFC-2 stale-if-error serve-on-error (CTB4). Short fresh (1s -> stale
+        # window x4 = 4s, fully expired by ~5s). The origin emits
+        # stale-if-error=30 ONLY when the request suffix carries the "sieserve"
+        # marker (proxy_pass strips the /sieserve/ prefix), so a /sieserve/sieserve-*
+        # key gets a serve-on-error window and a /sieserve/plain-* key does NOT.
+        # The plain-* key is the negative control: an expired entry with no SIE
+        # window must surface the origin error. Drives test_sie_serve_on_error.
+        location /sieserve/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    1s;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
@@ -2701,11 +2722,13 @@ def test_stale_serves_stale_origin_hard_dead(ng: Nginx, origin: Origin) -> None:
     test_stale_if_error's clean-5xx case, and exercises the bg-refresh path
     against an origin that resets the connection.
 
-    Boundary (intentional, RFC-5861 extension out of v8 scope): this holds for
-    the SWR window with background_update on (the default). A key already past
-    its stale_until, a cold key, or background_update=off all surface the live
-    origin error by design — the module does not serve expired/never-cached
-    content on error."""
+    Boundary (intentional): this v8 path holds for the SWR window with
+    background_update on (the default). A cold key, or background_update=off,
+    surface the live origin error by design. A key already PAST its stale_until
+    is no longer surfaced unconditionally — RFC-2 stale-if-error (CTB4) replays it
+    when the response carried stale-if-error=N and now < created + sie_ttl (see
+    test_sie_serve_on_error); without that window the expired entry still surfaces
+    the error."""
     s0, b0, _ = fetch(ng.port, "/sie/x2")          # prime: 200, cached fresh
     assert s0 == 200 and b0, f"prime failed: {s0} {b0!r}"
     base = origin.hits
@@ -2726,6 +2749,61 @@ def test_stale_serves_stale_origin_hard_dead(ng: Nginx, origin: Origin) -> None:
     finally:
         origin.drop = False
         drain_origin(origin)   # settle the failing bg refreshes before next test
+
+
+def test_sie_serve_on_error(ng: Nginx, origin: Origin) -> None:
+    """RFC-2 (CTB4) stale-if-error serve-on-error: a FULLY EXPIRED entry (past its
+    stale window) whose blob carries a serve-on-error window (created + sie_ttl) is
+    replayed when the origin revalidation returns 5xx — the error is replaced by
+    the stale body with X-Cache: STALE-IF-ERROR. This is the past-stale_until case
+    the v8 SWR path deliberately did NOT cover (see
+    test_stale_serves_stale_origin_hard_dead).
+
+    Negative control in the same test: a sibling key whose response carries NO
+    stale-if-error has sie_ttl == 0, so the same expired-origin-5xx surfaces the
+    error instead of serving stale."""
+    # Positive: origin emits stale-if-error=30 (request suffix marker "sieserve").
+    s0, b0, _ = fetch(ng.port, "/sieserve/sieserve-k1")
+    assert s0 == 200 and b0, f"prime failed: {s0} {b0!r}"
+    # Negative control: no stale-if-error in the response (sie_ttl == 0).
+    sn, bn, _ = fetch(ng.port, "/sieserve/plain-k1")
+    assert sn == 200 and bn, f"control prime failed: {sn} {bn!r}"
+
+    time.sleep(4.6)     # past fresh (1s) AND the stale window (x4 = 4s): expired
+    origin.fail = True
+    try:
+        s, b, h = fetch(ng.port, "/sieserve/sieserve-k1")
+        assert s == 200, f"SIE serve-on-error returned {s}, expected stale 200"
+        assert b == b0, f"served {b!r}, expected stale {b0!r}"
+        assert h.get("x-cache") == "STALE-IF-ERROR", \
+            f"expected STALE-IF-ERROR, got x-cache={h.get('x-cache')}"
+
+        # Negative control: no SIE window -> the 5xx is surfaced, not replaced.
+        sc, _, hc = fetch(ng.port, "/sieserve/plain-k1")
+        assert sc == 503, f"no-SIE expired entry served {sc}, expected origin 503"
+        assert hc.get("x-cache") != "STALE-IF-ERROR", \
+            "a no-SIE expired entry must not serve-on-error"
+    finally:
+        origin.fail = False
+        drain_origin(origin)
+
+
+def test_sie_origin_recovers_serves_fresh(ng: Nginx, origin: Origin) -> None:
+    """RFC-2 serve-on-error must NOT hijack a SUCCESSFUL revalidation: when the
+    expired entry's origin comes back 200, the client gets the FRESH new body and
+    the entry is re-stored (the normal store path stays intact), not the stale
+    snapshot."""
+    s0, b0, _ = fetch(ng.port, "/sieserve/sieserve-k2")
+    assert s0 == 200 and b0, f"prime failed: {s0} {b0!r}"
+    time.sleep(4.6)                                # fully expired
+    s, b, h = fetch(ng.port, "/sieserve/sieserve-k2")
+    assert s == 200, f"recovered origin served {s}, expected fresh 200"
+    assert b != b0, f"served stale {b!r}, expected a fresh new gen"
+    assert h.get("x-cache") != "STALE-IF-ERROR", \
+        "a successful revalidation must not be a serve-on-error"
+    # Re-stored fresh: an immediate re-read returns the same NEW body from cache.
+    s2, b2, _ = fetch(ng.port, "/sieserve/sieserve-k2")
+    assert s2 == 200 and b2 == b, "expected the fresh re-store to be re-served"
 
 
 def test_background_update_off_regenerates_inline(ng: Nginx,
@@ -4442,6 +4520,8 @@ def run_all(ng: Nginx, origin: Origin,
     test_min_uses_off_by_default(ng)
     test_stale_if_error(ng, origin)
     test_stale_serves_stale_origin_hard_dead(ng, origin)
+    test_sie_serve_on_error(ng, origin)                     # RFC-2 CTB4 serve-on-error
+    test_sie_origin_recovers_serves_fresh(ng, origin)       # RFC-2 success not hijacked
     test_background_update_off_regenerates_inline(ng, origin)
     test_normalize_arg_order(ng, origin)
     test_normalize_strips_tracking(ng, origin)

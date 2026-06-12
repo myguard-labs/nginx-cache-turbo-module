@@ -617,6 +617,21 @@ typedef struct {
     unsigned                 req_max_stale_set:1;
     unsigned                 req_max_stale_any:1;
     unsigned                 req_reval:1;
+    /* RFC 5861 §4 / RFC-2 stale-if-error serve-on-error (CTB4). On a lookup that
+     * finds the entry EXPIRED (past its stale window) but still inside the blob's
+     * serve-on-error window (created + sie_ttl), we DECLINE to origin yet stash a
+     * snapshot of the stale blob here (sie_snap, r->pool). If the origin
+     * revalidation then returns 5xx, the header+body filters REPLACE the error
+     * response with this snapshot (X-Cache: STALE-IF-ERROR) instead of surfacing
+     * the failure. No node field is needed: eviction is pure-LRU (no TTL reaper),
+     * so the expired node survives on its own; arming at access time is enough. */
+    unsigned                 sie_armed:1;     /* a within-SIE snapshot is stashed */
+    unsigned                 sie_serving:1;   /* filters replacing error w/ snap  */
+    unsigned                 sie_body_sent:1; /* snapshot last_buf already emitted */
+    u_char                  *sie_snap;        /* stale blob copy (r->pool)         */
+    size_t                   sie_snap_len;
+    u_char                  *sie_body;        /* body slice inside sie_snap        */
+    size_t                   sie_body_len;
 } ngx_http_cache_turbo_ctx_t;
 
 
