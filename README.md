@@ -299,6 +299,86 @@ Any explicit knob (`cache_turbo_valid 120s;`) still beats the preset.
 The **stale window** is `valid × (multiplier − 1)`. So balanced + `valid 60s`
 = fresh for 60s, then served stale for another 180s, then expired.
 
+## Microcaching (1-second TTL for APIs and PHP-FPM)
+
+**Microcaching** = a deliberately tiny TTL (≈1s) on otherwise-dynamic endpoints.
+The page is "fresh" for only a second, so the data is near-real-time, but during
+that second a burst of N requests is served from RAM and the backend is hit
+**once** — and with the single-flight lock on, even the *cold* miss at the start
+of each second collapses to one origin request instead of a stampede. Net effect
+on a hammered `/api` or PHP app: backend load drops from "every request" to
+"~one per endpoint per second", content at most ~1–2s stale.
+
+cache-turbo runs in the ACCESS phase and captures the response in a body filter,
+so it is **upstream-agnostic** — the exact same directives microcache a
+`proxy_pass` API and a `fastcgi_pass` PHP-FPM app. Because only `GET` is cached,
+mutations (`POST`/`PUT`/`DELETE`) always pass straight through.
+
+```nginx
+# A) JSON API behind proxy_pass — 1s microcache
+location /api/ {
+    cache_turbo               ct;
+    cache_turbo_preset        conservative;   # ×2 stale mult = tight window
+    cache_turbo_valid         1s;             # fresh 1s (then ≤1s stale while one bg refresh runs)
+    cache_turbo_lock          on;             # collapse a per-second burst to ONE origin hit
+    cache_turbo_lock_timeout  1s;
+    cache_turbo_min_uses      2;              # don't cache one-shot endpoints (optional)
+
+    # never serve a cached body to an authenticated caller (Authorization is
+    # already refused both ways; this also covers cookie sessions)
+    cache_turbo_bypass        $http_authorization $cookie_session;
+    cache_turbo_no_store      $http_authorization $cookie_session;
+
+    proxy_pass http://api_upstream;
+}
+```
+
+```nginx
+# B) PHP-FPM (WordPress/Laravel/…) — 1s microcache
+location ~ \.php$ {
+    cache_turbo               ct;
+    cache_turbo_valid         1s;
+    cache_turbo_preset        conservative;
+    cache_turbo_lock          on;
+
+    # WP/Woo: auto-skip wp-admin, login + logged-in cookies. (Implies
+    # honor_cache_control on — see the gotcha below.)
+    cache_turbo_backend       wordpress;
+
+    # force the fixed 1s TTL instead of letting the app's Cache-Control win
+    cache_turbo_honor_cache_control off;
+
+    # belt-and-braces: never store a session response
+    cache_turbo_no_store      $cookie_PHPSESSID;
+
+    include      fastcgi_params;
+    fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+    fastcgi_pass unix:/run/php/php-fpm.sock;
+}
+```
+
+**Microcaching gotchas:**
+
+- **`conservative` keeps the stale window tight.** With `valid 1s` it is ×2 →
+  served stale for ≤1s more (so ≤2s old). `balanced`/`aggressive` widen that
+  (×4/×8 = up to 4s/8s stale) — usually *not* what you want for "near-real-time".
+- **`honor_cache_control` vs a fixed TTL.** A CMS preset (`cache_turbo_backend`)
+  or `cache_turbo … auto` turns `honor_cache_control` **on**, so an app that
+  emits `Cache-Control: max-age=600` would override your `1s`. Set
+  `cache_turbo_honor_cache_control off;` to pin the microcache TTL regardless of
+  app headers (example B). For an API that you *want* to honour its own
+  `Cache-Control`, leave it on and drop the static `valid`.
+- **Per-user safety.** Anything with an `Authorization` request header, or a
+  response with `Set-Cookie` / `Cache-Control: private`, is never cached or
+  served from cache. For cookie-session apps add an explicit
+  `cache_turbo_bypass`/`cache_turbo_no_store` on the session cookie so a logged-in
+  GET is never collapsed onto the anonymous slot (example A).
+- **Background refresh stays on.** With `cache_turbo_background_update on` (the
+  default) the once-per-second refresh is non-blocking — clients always get an
+  instant answer and a 5xx during refresh leaves the last good copy in place
+  (stale-if-error). Turn it off only if you need every served body strictly ≤1s
+  old at the cost of one client per second waiting on the backend.
+
 ## Full example (the works)
 
 ```nginx
