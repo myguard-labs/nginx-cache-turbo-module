@@ -29,6 +29,12 @@ ngx_http_cache_turbo_stale_ttl(time_t fresh_ttl, ngx_int_t stale_mult)
         stale_mult = NGX_HTTP_CACHE_TURBO_STALE_MULTIPLIER;
     }
 
+    /* STAB-5: clamp before multiplying so the product can never overflow time_t
+     * or exceed the uint32 blob stale_ttl field. Check on the input (no UB). */
+    if (fresh_ttl > NGX_HTTP_CACHE_TURBO_TTL_MAX / stale_mult) {
+        return NGX_HTTP_CACHE_TURBO_TTL_MAX;
+    }
+
     return fresh_ttl * stale_mult;
 }
 

@@ -1710,6 +1710,69 @@ def test_empty_l2_prefix_rejected(ng: Nginx) -> None:
             f"missing empty-prefix diagnostic for {name}:\n{r.stdout}"
 
 
+def _config_test_result(ng: Nginx, mutate) -> "subprocess.CompletedProcess[str]":
+    """Render the full config, apply `mutate(cfg) -> cfg`, write it, and run
+    nginx -t. Returns the CompletedProcess (returncode + combined stdout)."""
+    bad = ng.root.parent / "cfgcheck"
+    (bad / "conf").mkdir(parents=True, exist_ok=True)
+    (bad / "logs").mkdir(parents=True, exist_ok=True)
+    cfg = nginx_config(
+        bad, ng.port, ng.module, ng.origin_port, 1, ng.redis_port,
+        ng.redis_auth_port, ng.redis_password, ng.redis_tls_port,
+        ng.redis_tls_ca, ng.memcached_port)
+    cfg = mutate(cfg)
+    (bad / "conf" / "nginx.conf").write_text(cfg, encoding="ascii")
+    cmd = ng.runner + [str(ng.binary), "-p", str(bad),
+                       "-c", str(bad / "conf" / "nginx.conf"), "-t"]
+    return subprocess.run(cmd, text=True, stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT, timeout=20)
+
+
+def test_keepalive_cap_rejected(ng: Nginx) -> None:
+    """STAB-5: an absurd cache_turbo_redis keepalive=N (the per-worker pool is
+    N*sizeof(item)) is rejected at config time so the size_t multiply can't
+    overflow into a short allocation the init loop then overruns."""
+    if ng.redis_port is None:
+        return
+    anchor = "keepalive=8 keepalive_timeout=30s"
+    r = _config_test_result(
+        ng, lambda c: c.replace(anchor,
+                                "keepalive=99999999 keepalive_timeout=30s", 1))
+    assert r.returncode != 0, \
+        f"oversized keepalive was accepted by nginx -t:\n{r.stdout}"
+    assert "exceeds the maximum" in r.stdout, \
+        f"missing keepalive-cap diagnostic:\n{r.stdout}"
+
+
+def test_valid_dup_status_warns(ng: Nginx) -> None:
+    """COR-9: a second cache_turbo_valid rule for a status code is dead
+    (status_ttl returns the first match). nginx -t loads but must warn."""
+    r = _config_test_result(
+        ng, lambda c: c.replace(
+            "cache_turbo_valid    0;",
+            "cache_turbo_valid    0;\n"
+            "            cache_turbo_valid 404 1m;\n"
+            "            cache_turbo_valid 404 2m;", 1))
+    assert r.returncode == 0, \
+        f"duplicate-status config unexpectedly failed nginx -t:\n{r.stdout}"
+    assert "duplicate rule for status" in r.stdout, \
+        f"missing duplicate-status warning:\n{r.stdout}"
+
+
+def test_tag_without_l2_warns(ng: Nginx) -> None:
+    """COR-0: cache_turbo_tag in a location with no Redis L2 is inert (tags live
+    only in Redis). nginx -t loads but must warn it has no effect."""
+    r = _config_test_result(
+        ng, lambda c: c.replace(
+            "cache_turbo_valid    0;",
+            "cache_turbo_valid    0;\n"
+            "            cache_turbo_tag      $arg_t;", 1))
+    assert r.returncode == 0, \
+        f"tag-without-L2 config unexpectedly failed nginx -t:\n{r.stdout}"
+    assert "no effect here" in r.stdout, \
+        f"missing tag-without-L2 warning:\n{r.stdout}"
+
+
 def test_max_size_not_cached(ng: Nginx) -> None:
     """Responses larger than cache_turbo_max_size are never cached (Q2: the
     body filter early-aborts capture the moment body_len crosses max_size, so
@@ -3822,6 +3885,9 @@ def run_all(ng: Nginx, origin: Origin,
     test_invalid_auto_mode(ng)
     test_valid_status_rejects_304(ng)
     test_empty_l2_prefix_rejected(ng)
+    test_keepalive_cap_rejected(ng)
+    test_valid_dup_status_warns(ng)
+    test_tag_without_l2_warns(ng)
     test_no_cache_set_cookie(ng)
     test_no_cache_cc_private(ng)
     test_no_cache_cc_nostore(ng)
@@ -4039,6 +4105,8 @@ def main() -> int:
           "Vary:*/Cookie/mixed-refused uncacheable, off-by-default ignores Vary), "
           "presets (v3-2: conservative/aggressive stale-window differ, "
           "invalid-name rejected), "
+          "config maxima/warns (STAB-5 keepalive cap rejected, COR-9 dup-status "
+          "warn, COR-0 tag-without-L2 warn), "
           "autotune (v4-3: raises beta within band/off-by-default/"
           "insufficient-data/churn-disqualify)"
           + (", L2 write-through (P4), keepalive pool reuse (v15), "

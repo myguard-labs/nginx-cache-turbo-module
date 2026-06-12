@@ -36,6 +36,21 @@
  * blob stale_ttl field (2.5e9 < 4.29e9). */
 #define NGX_HTTP_CACHE_TURBO_FOREVER_TTL  ((time_t) 315360000)   /* 10 years */
 
+/* Hard ceiling for any fresh/stale TTL that reaches the wire (STAB-5). The blob
+ * fresh_ttl/stale_ttl are uint32 and the redis PX is `<ttl> * 1000`; an
+ * unbounded honor_cc max-age or `cache_turbo_valid <huge>` could overflow the
+ * uint32 cast or the *1000. Clamp every TTL to UINT32_MAX seconds (~136 yr,
+ * itself well past FOREVER): the cast is lossless and `<= 4.29e9 * 1000` (4.29e12)
+ * stays inside int64 %T. ngx_http_cache_turbo_stale_ttl clamps its product here;
+ * the store path clamps the fresh TTL before the uint32 cast. */
+#define NGX_HTTP_CACHE_TURBO_TTL_MAX  ((time_t) 0xFFFFFFFF)
+
+/* Upper bound on cache_turbo_redis keepalive=N (STAB-5). The per-worker pool is
+ * `ngx_palloc(N * sizeof(item))`; an unbounded N overflows the size_t multiply
+ * into a short allocation that the init loop then writes N items past. 65535
+ * idle L2 conns/worker is already absurd; reject anything larger at parse. */
+#define NGX_HTTP_CACHE_TURBO_KEEPALIVE_MAX  65535
+
 /* Default SWR aggressiveness (beta). 1.0 = refresh probability tracks the
  * elapsed fraction of the stale window directly. */
 #define NGX_HTTP_CACHE_TURBO_DEFAULT_BETA      1000   /* fixed-point /1000 */

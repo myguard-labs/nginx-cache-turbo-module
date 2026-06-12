@@ -2260,6 +2260,13 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
             }
         }
 
+        /* STAB-5: clamp the fresh TTL to the uint32 ceiling before it feeds the
+         * blob fresh_ttl cast, the stale-window multiply, and the L2 PX. An
+         * unbounded upstream max-age (honor_cc) is the realistic source. */
+        if (ttl > NGX_HTTP_CACHE_TURBO_TTL_MAX) {
+            ttl = NGX_HTTP_CACHE_TURBO_TTL_MAX;
+        }
+
         /* Absolute serveable window (fresh + stale) from now, reused by the blob
          * metadata, the L1 store, and the L2 EXPIRE so all three agree. */
         stale_window = ngx_http_cache_turbo_stale_ttl(ttl, clcf->stale_mult);
@@ -2309,10 +2316,23 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
             nheaders++;
         }
 
-        blob_len = sizeof(ngx_http_cache_turbo_blob_hdr_t)
-                   + hdr_bytes + ctx->body_len;
+        /* STAB-5: headers_len and body_len are uint32 in the blob header. Refuse
+         * to store (rather than write a header that lies about the layout) if a
+         * pathological response would truncate either. body_len is already
+         * bounded by max_size on the capture path; this also covers a max_size
+         * configured above 4 GiB and an unbounded header block. Reuse the
+         * blob==NULL skip below (same as an alloc failure: silently don't cache). */
+        if (hdr_bytes > 0xFFFFFFFFUL || ctx->body_len > 0xFFFFFFFFUL) {
+            ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                          "cache_turbo: \"%V\" not cached: header/body block "
+                          "exceeds the 4 GiB blob field limit", &r->uri);
+            blob = NULL;
+        } else {
+            blob_len = sizeof(ngx_http_cache_turbo_blob_hdr_t)
+                       + hdr_bytes + ctx->body_len;
+            blob = ngx_pnalloc(r->pool, blob_len);
+        }
 
-        blob = ngx_pnalloc(r->pool, blob_len);
         if (blob != NULL) {
             ngx_http_cache_turbo_blob_hdr_t  bhw;
             u_char                           store_key[32];
@@ -2741,6 +2761,22 @@ ngx_http_cache_turbo_valid_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                 "(1xx/206/304 refused)", &value[i]);
             return NGX_CONF_ERROR;
         }
+        /* COR-9: status_ttl() returns the FIRST matching rule, so a second rule
+         * for the same code is dead. Warn rather than silently ignore it. */
+        {
+            ngx_http_cache_turbo_valid_t  *ev = clcf->valid_status->elts;
+            ngx_uint_t                     j;
+
+            for (j = 0; j < clcf->valid_status->nelts; j++) {
+                if (ev[j].status == (ngx_uint_t) code) {
+                    ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+                        "cache_turbo_valid: duplicate rule for status %V "
+                        "ignored (the first rule for a code wins)", &value[i]);
+                    break;
+                }
+            }
+        }
+
         v = ngx_array_push(clcf->valid_status);
         if (v == NULL) {
             return NGX_CONF_ERROR;
@@ -3036,6 +3072,13 @@ ngx_http_cache_turbo_redis_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             {
                 ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                     "cache_turbo_redis: bad keepalive \"%V\"", &value[i]);
+                return NGX_CONF_ERROR;
+            }
+            /* STAB-5: bound N so the pool's N*sizeof(item) alloc can't overflow. */
+            if (clcf->redis_keepalive > NGX_HTTP_CACHE_TURBO_KEEPALIVE_MAX) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                    "cache_turbo_redis: keepalive %V exceeds the maximum %d",
+                    &value[i], NGX_HTTP_CACHE_TURBO_KEEPALIVE_MAX);
                 return NGX_CONF_ERROR;
             }
 
@@ -4972,6 +5015,19 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
                                ? &ngx_http_cache_turbo_memcached_backend
                                : &ngx_http_cache_turbo_redis_backend)
                         : NULL;
+
+    /* COR-0: tags live only in a Redis L2 (the memcached backend has no atomic
+     * tag set: tag_add == NULL). A cache_turbo_tag with no L2, or with the
+     * memcached backend, is silently inert — warn at config time rather than let
+     * the operator believe purge-by-tag will work. */
+    if (conf->tag != NULL
+        && (conf->backend == NULL || conf->backend->tag_add == NULL))
+    {
+        ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+            "cache_turbo_tag has no effect here: tag indexing requires a Redis "
+            "L2 (cache_turbo_redis); it is unavailable with %s",
+            conf->backend == NULL ? "no L2 backend" : "the memcached backend");
+    }
 
     /* Key normalize: inherit strip_all + the extra-pattern list. */
     ngx_conf_merge_value(conf->normalize_strip_all, prev->normalize_strip_all,
