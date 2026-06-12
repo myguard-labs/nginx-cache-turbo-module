@@ -2873,8 +2873,8 @@ ngx_http_cache_turbo_redis_build_ssl(ngx_conf_t *cf,
     cln->handler = ngx_ssl_cleanup_ctx;
     cln->data = ssl;
 
-    /* redis_tls_verify is still NGX_CONF_UNSET (-1) here unless tls_verify=off
-     * set it to 0; -1 and 1 both mean "verify on" (merge resolves -1 -> 1). */
+    /* Called post-merge (COR-6): redis_tls_verify is resolved to 0 or 1 here.
+     * 0 = verify off (tls_verify=off); 1 = verify on (the default). */
     if (clcf->redis_tls_verify != 0) {
         if (clcf->redis_tls_ca.len) {
             if (ngx_ssl_trusted_certificate(cf, ssl, &clcf->redis_tls_ca, 2)
@@ -3108,19 +3108,9 @@ ngx_http_cache_turbo_redis_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         }
     }
 
-    /* --- 4. build the SSL context if this is a TLS backend ---------------- */
-    if (clcf->redis_tls == 1) {
-#if (NGX_SSL)
-        if (ngx_http_cache_turbo_redis_build_ssl(cf, clcf) != NGX_CONF_OK) {
-            return NGX_CONF_ERROR;
-        }
-#else
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-            "cache_turbo_redis: TLS (rediss:// / tls=on) requires nginx built "
-            "with --with-http_ssl_module");
-        return NGX_CONF_ERROR;
-#endif
-    }
+    /* The client TLS context is built in merge_loc_conf (COR-6), once
+     * redis_tls / tls_verify / tls_ca are resolved — not here, where an
+     * inherited verify flag or CA would not yet be visible. */
 
     clcf->redis_enable = 1;
     /* Pin the backend choice for this block to Redis. Without this the flag
@@ -4894,7 +4884,8 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
         conf->tag = prev->tag;
     }
 
-    /* L2 Redis: inherit address/prefix/timeout, default prefix "ct:". */
+    /* L2 backend selection + connection knobs. These are behavioural tunables,
+     * not backend identity, so they inherit independently as before. */
     ngx_conf_merge_value(conf->redis_enable, prev->redis_enable, 0);
     ngx_conf_merge_value(conf->memcached, prev->memcached, 0);
     ngx_conf_merge_msec_value(conf->redis_timeout, prev->redis_timeout, 250);
@@ -4902,30 +4893,72 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_msec_value(conf->redis_keepalive_timeout,
                               prev->redis_keepalive_timeout, 60000);
 
-    if (conf->redis_addr.sockaddr == NULL) {
-        conf->redis_addr = prev->redis_addr;
-    }
-    if (conf->redis_prefix.data == NULL) {
-        if (prev->redis_prefix.data) {
-            conf->redis_prefix = prev->redis_prefix;
-        } else {
+    if (conf->redis_addr.sockaddr != NULL) {
+        /* COR-6: this block ran its own cache_turbo_redis — a complete backend
+         * in its own right (address set at parse). Treat its identity /
+         * credential / db / TLS fields as a FULL REPLACEMENT of the parent's:
+         * never inherit them field-by-field, or a child pointed at a different
+         * server would silently reuse the parent's password, database, and CA.
+         * Anything this directive left unset takes the built-in default. */
+        if (conf->redis_prefix.data == NULL) {
             ngx_str_set(&conf->redis_prefix,
                         NGX_HTTP_CACHE_TURBO_REDIS_PREFIX);
         }
+        /* nginx has no ngx_conf_init_str_value; self-merge applies the default
+         * when unset without consulting the parent. */
+        ngx_conf_merge_str_value(conf->redis_user, conf->redis_user, "");
+        ngx_conf_merge_str_value(conf->redis_password, conf->redis_password, "");
+        ngx_conf_init_value(conf->redis_db, 0);
+        ngx_conf_init_value(conf->redis_tls, 0);
+        ngx_conf_init_value(conf->redis_tls_verify, 1);
+        ngx_conf_merge_str_value(conf->redis_tls_ca, conf->redis_tls_ca, "");
+        ngx_conf_merge_str_value(conf->redis_tls_name, conf->redis_tls_name, "");
+        /* redis_host was set from the DSN at parse; redis_ssl is built below,
+         * post-merge, so it can never carry the parent's TLS context. */
+
+    } else {
+        /* No own backend: inherit the parent's entire profile (address + all
+         * identity/credential/TLS fields + the already-built TLS context) so an
+         * http/server-level backend applies to every nested location. */
+        conf->redis_addr = prev->redis_addr;
+        if (conf->redis_prefix.data == NULL) {
+            if (prev->redis_prefix.data) {
+                conf->redis_prefix = prev->redis_prefix;
+            } else {
+                ngx_str_set(&conf->redis_prefix,
+                            NGX_HTTP_CACHE_TURBO_REDIS_PREFIX);
+            }
+        }
+        ngx_conf_merge_str_value(conf->redis_user, prev->redis_user, "");
+        ngx_conf_merge_str_value(conf->redis_password, prev->redis_password, "");
+        ngx_conf_merge_value(conf->redis_db, prev->redis_db, 0);
+        ngx_conf_merge_value(conf->redis_tls, prev->redis_tls, 0);
+        ngx_conf_merge_value(conf->redis_tls_verify, prev->redis_tls_verify, 1);
+        ngx_conf_merge_str_value(conf->redis_tls_ca, prev->redis_tls_ca, "");
+        ngx_conf_merge_str_value(conf->redis_tls_name, prev->redis_tls_name, "");
+        ngx_conf_merge_str_value(conf->redis_host, prev->redis_host, "");
+#if (NGX_SSL)
+        conf->redis_ssl = prev->redis_ssl;   /* reuse parent's built context */
+#endif
     }
 
-    /* L2 auth/db/tls (v5 DSN). Inherit alongside the address. */
-    ngx_conf_merge_str_value(conf->redis_user, prev->redis_user, "");
-    ngx_conf_merge_str_value(conf->redis_password, prev->redis_password, "");
-    ngx_conf_merge_value(conf->redis_db, prev->redis_db, 0);
-    ngx_conf_merge_value(conf->redis_tls, prev->redis_tls, 0);
-    ngx_conf_merge_value(conf->redis_tls_verify, prev->redis_tls_verify, 1);
-    ngx_conf_merge_str_value(conf->redis_tls_ca, prev->redis_tls_ca, "");
-    ngx_conf_merge_str_value(conf->redis_tls_name, prev->redis_tls_name, "");
-    ngx_conf_merge_str_value(conf->redis_host, prev->redis_host, "");
 #if (NGX_SSL)
-    if (conf->redis_ssl == NULL) {
-        conf->redis_ssl = prev->redis_ssl;
+    /* COR-6: build the client TLS context HERE, after redis_tls / tls_verify /
+     * tls_ca are fully resolved — not at directive-parse time, when a tls=on
+     * backend that inherits its verify flag or CA would build the context from
+     * unmerged (default) values. Own backends build a fresh context; inherited
+     * backends already copied prev->redis_ssl above (guard skips the rebuild). */
+    if (conf->redis_enable && conf->redis_tls == 1 && conf->redis_ssl == NULL) {
+        if (ngx_http_cache_turbo_redis_build_ssl(cf, conf) != NGX_CONF_OK) {
+            return NGX_CONF_ERROR;
+        }
+    }
+#else
+    if (conf->redis_enable && conf->redis_tls == 1) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "cache_turbo_redis: TLS (rediss:// / tls=on) requires nginx built "
+            "with --with-http_ssl_module");
+        return NGX_CONF_ERROR;
     }
 #endif
 

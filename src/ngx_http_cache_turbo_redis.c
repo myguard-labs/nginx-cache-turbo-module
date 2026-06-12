@@ -557,19 +557,26 @@ ngx_http_cache_turbo_redis_connect(ngx_http_cache_turbo_redis_op_t *op,
 
 /* Build the AUTH (+ optional ACL user) and SELECT <db> preamble pipeline for a
  * DSN backend, into one buffer allocated from pool. Sets *nreplies to the number
- * of simple replies to consume (0, 1, or 2). Returns NULL when no preamble is
- * needed (no password and db 0) OR on allocation failure (caller treats NULL as
- * "no preamble"; an alloc failure there merely means the op runs unauthenticated
- * and redis rejects it — surfaced as a normal op failure, never a crash). */
-static ngx_buf_t *
+ * of simple replies to consume (0, 1, or 2) and *out to the buffer.
+ *
+ * Tri-state (STAB-2): NULL alone cannot distinguish "no preamble is needed"
+ * from "the preamble could not be built", and conflating them is unsafe — a
+ * SELECT-only backend (no password, db > 0) has no AUTH to make redis reject a
+ * missing preamble, so a swallowed alloc failure would run the op silently
+ * against db 0, the WRONG database. So:
+ *   NGX_OK       — preamble built, *out set, send it then consume *nreplies.
+ *   NGX_DECLINED — none needed (no password, db 0); *out = NULL.
+ *   NGX_ERROR    — allocation failed; caller MUST fail closed, never connect. */
+static ngx_int_t
 ngx_http_cache_turbo_redis_preamble(ngx_pool_t *pool,
-    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_uint_t *nreplies)
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_buf_t **out, ngx_uint_t *nreplies)
 {
     ngx_str_t   argv[3];
-    ngx_buf_t  *au = NULL, *sel = NULL, *out;
+    ngx_buf_t  *au = NULL, *sel = NULL, *res;
     u_char     *dbbuf;
-    size_t      n1 = 0, n2 = 0;
+    size_t      n1, n2;
 
+    *out = NULL;
     *nreplies = 0;
 
     if (clcf->redis_password.len) {
@@ -584,7 +591,7 @@ ngx_http_cache_turbo_redis_preamble(ngx_pool_t *pool,
             au = ngx_http_cache_turbo_redis_encode(pool, argv, 2);
         }
         if (au == NULL) {
-            return NULL;
+            return NGX_ERROR;
         }
         (*nreplies)++;
     }
@@ -592,7 +599,7 @@ ngx_http_cache_turbo_redis_preamble(ngx_pool_t *pool,
     if (clcf->redis_db > 0) {
         dbbuf = ngx_pnalloc(pool, NGX_INT_T_LEN);
         if (dbbuf == NULL) {
-            return NULL;
+            return NGX_ERROR;
         }
         argv[0].data = (u_char *) "SELECT";
         argv[0].len = sizeof("SELECT") - 1;
@@ -601,31 +608,34 @@ ngx_http_cache_turbo_redis_preamble(ngx_pool_t *pool,
                                 - dbbuf);
         sel = ngx_http_cache_turbo_redis_encode(pool, argv, 2);
         if (sel == NULL) {
-            return NULL;
+            return NGX_ERROR;
         }
         (*nreplies)++;
     }
 
     if (au == NULL && sel == NULL) {
-        return NULL;
+        return NGX_DECLINED;
     }
-    if (au != NULL && sel == NULL) {
-        return au;
+    if (sel == NULL) {
+        *out = au;
+        return NGX_OK;
     }
     if (au == NULL) {
-        return sel;
+        *out = sel;
+        return NGX_OK;
     }
 
     /* pipeline AUTH + SELECT into one buffer */
     n1 = au->last - au->pos;
     n2 = sel->last - sel->pos;
-    out = ngx_create_temp_buf(pool, n1 + n2);
-    if (out == NULL) {
-        return NULL;
+    res = ngx_create_temp_buf(pool, n1 + n2);
+    if (res == NULL) {
+        return NGX_ERROR;
     }
-    out->last = ngx_cpymem(out->last, au->pos, n1);
-    out->last = ngx_cpymem(out->last, sel->pos, n2);
-    return out;
+    res->last = ngx_cpymem(res->last, au->pos, n1);
+    res->last = ngx_cpymem(res->last, sel->pos, n2);
+    *out = res;
+    return NGX_OK;
 }
 
 
@@ -637,6 +647,7 @@ ngx_http_cache_turbo_redis_launch(ngx_http_cache_turbo_redis_op_t *op,
     ngx_http_cache_turbo_loc_conf_t *clcf, void (*read_handler)(ngx_event_t *))
 {
     ngx_connection_t  *c;
+    ngx_int_t          rc;
 
     op->clcf = clcf;
     op->command = op->send;
@@ -669,9 +680,14 @@ ngx_http_cache_turbo_redis_launch(ngx_http_cache_turbo_redis_op_t *op,
         }
     }
 
-    op->preamble = ngx_http_cache_turbo_redis_preamble(op->pool, clcf,
-                       &op->preamble_replies);
-    if (op->preamble != NULL) {
+    rc = ngx_http_cache_turbo_redis_preamble(op->pool, clcf, &op->preamble,
+                                             &op->preamble_replies);
+    if (rc == NGX_ERROR) {
+        /* STAB-2: fail closed. Connecting without the AUTH/SELECT preamble
+         * would authenticate nothing and, for db > 0, silently target db 0. */
+        return NGX_ERROR;
+    }
+    if (rc == NGX_OK) {
         op->send = op->preamble;
         op->in_preamble = 1;
     }
@@ -977,9 +993,9 @@ void
 ngx_http_cache_turbo_redis_tag_add(ngx_http_cache_turbo_loc_conf_t *clcf,
     u_char *key_hash, u_char *name, size_t name_len, time_t ttl)
 {
-    ngx_str_t                         argv[3];
-    ngx_buf_t                        *sadd, *expire;
-    size_t                            n1, n2;
+    ngx_str_t                         argv[4];
+    ngx_buf_t                        *sadd, *exp_nx, *exp_gt;
+    size_t                            n1, n2, n3;
     ngx_http_cache_turbo_redis_op_t  *op;
     u_char                           *tagkey, *member, *ttlbuf;
 
@@ -1012,30 +1028,51 @@ ngx_http_cache_turbo_redis_tag_add(ngx_http_cache_turbo_loc_conf_t *clcf,
                                                  member);
     sadd = ngx_http_cache_turbo_redis_encode(op->pool, argv, 3);
 
-    /* EXPIRE <prefix>tag:<name> <ttl> — bound the tag set's lifetime so dead
-     * members can't accumulate forever; refreshed on every store. */
+    /* Bound the tag set's lifetime so dead members can't accumulate forever,
+     * but NEVER below the longest-lived member's TTL (COR-8). A tag set holds
+     * members from many objects, each with its own TTL; a plain
+     * `EXPIRE tag <this-ttl>` on every store lets a later short-TTL object
+     * shorten the whole set, expiring it while longer-lived members are still
+     * cached — a tag purge then misses them and a stale variant survives.
+     *
+     * Take the max of the current and incoming expiry with two pipelined
+     * EXPIRE flags (both Redis >= 7.0):
+     *   NX — set TTL only if the key currently has none (freshly SADD'd set);
+     *        GT alone can't do this because redis treats a no-TTL key as
+     *        infinite, so GT would never bound a brand-new set (leak forever).
+     *   GT — set TTL only if it is greater than the current one (extend, never
+     *        reduce) for a set that already carries an expiry.
+     * Exactly one of the two takes effect on a set with an expiry; NX seeds a
+     * set without one. Either way the set TTL only ever grows. */
     argv[0].data = (u_char *) "EXPIRE";
     argv[0].len = sizeof("EXPIRE") - 1;
     /* argv[1] (tagkey) unchanged */
     argv[2].data = ttlbuf;
     argv[2].len = (size_t) (ngx_sprintf(ttlbuf, "%T", ttl) - ttlbuf);
-    expire = ngx_http_cache_turbo_redis_encode(op->pool, argv, 3);
+    argv[3].data = (u_char *) "NX";
+    argv[3].len = sizeof("NX") - 1;
+    exp_nx = ngx_http_cache_turbo_redis_encode(op->pool, argv, 4);
+    argv[3].data = (u_char *) "GT";
+    argv[3].len = sizeof("GT") - 1;
+    exp_gt = ngx_http_cache_turbo_redis_encode(op->pool, argv, 4);
 
-    if (sadd == NULL || expire == NULL) {
+    if (sadd == NULL || exp_nx == NULL || exp_gt == NULL) {
         ngx_destroy_pool(op->pool);
         return;
     }
 
-    /* Pipeline both commands into one buffer (one round trip). */
+    /* Pipeline all three commands into one buffer (one round trip). */
     n1 = sadd->last - sadd->pos;
-    n2 = expire->last - expire->pos;
-    op->send = ngx_create_temp_buf(op->pool, n1 + n2);
+    n2 = exp_nx->last - exp_nx->pos;
+    n3 = exp_gt->last - exp_gt->pos;
+    op->send = ngx_create_temp_buf(op->pool, n1 + n2 + n3);
     if (op->send == NULL) {
         ngx_destroy_pool(op->pool);
         return;
     }
     op->send->last = ngx_cpymem(op->send->last, sadd->pos, n1);
-    op->send->last = ngx_cpymem(op->send->last, expire->pos, n2);
+    op->send->last = ngx_cpymem(op->send->last, exp_nx->pos, n2);
+    op->send->last = ngx_cpymem(op->send->last, exp_gt->pos, n3);
 
     if (ngx_http_cache_turbo_redis_launch(op, clcf,
             ngx_http_cache_turbo_redis_read_drain) != NGX_OK)
