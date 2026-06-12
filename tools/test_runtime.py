@@ -128,6 +128,14 @@ class Origin:
         with self._lock:
             return self._n
 
+    def hits_for(self, needle: str) -> int:
+        """Count origin GETs whose path contains `needle`. Path-scoped, so a
+        test using a unique URL is immune to other tests' async bg-refresh
+        traffic bumping the global `hits` counter between its base capture and
+        its assertion (the test_206_never_cached deflake)."""
+        with self._lock:
+            return sum(1 for _, p in self._paths if needle in p)
+
     def start(self) -> None:
         origin = self
 
@@ -2136,15 +2144,22 @@ def test_auto_vary_stale_marker_reachable(ng: Nginx, origin: Origin) -> None:
 def test_206_never_cached(ng: Nginx, origin: Origin) -> None:
     """206 Partial Content must never be cached: the key carries no Range, so a
     stored partial could be replayed for a different/whole range. Every request
-    reaches the origin."""
-    base = origin.hits
-    s0, _, h0 = fetch(ng.port, "/c/partial")
+    reaches the origin.
+
+    Uses a unique URL ("partial" substring still triggers the 206 branch) and a
+    path-scoped hit count so a prior test's async background_update refresh can
+    bump the global origin counter without polluting this exact-count assert
+    (the historical CI flake)."""
+    url = "/c/partial-206flake"
+    base = origin.hits_for("partial-206flake")
+    s0, _, h0 = fetch(ng.port, url)
     assert s0 == 206, f"origin should answer 206, got {s0}"
     assert "x-cache" not in h0, "first 206 should miss"
-    s1, _, h1 = fetch(ng.port, "/c/partial")
+    s1, _, h1 = fetch(ng.port, url)
     assert s1 == 206 and "x-cache" not in h1, \
         f"206 must never be cached, got X-Cache={h1.get('x-cache')}"
-    assert origin.hits == base + 2, "206 was wrongly served from cache"
+    assert origin.hits_for("partial-206flake") == base + 2, \
+        "206 was wrongly served from cache"
 
 
 def test_safe_key_distinct_sessionids(ng: Nginx, origin: Origin) -> None:
