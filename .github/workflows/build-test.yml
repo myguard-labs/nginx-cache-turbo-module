@@ -73,7 +73,16 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential curl libpcre2-dev libssl-dev zlib1g-dev
+          sudo apt-get install -y build-essential clang curl libpcre2-dev libssl-dev zlib1g-dev
+
+      # CI-6: cache the upstream nginx source tarball so a re-run (or fresh
+      # commit) skips the nginx.org download. ci-build.sh fetches only when the
+      # tarball is absent, so a cache hit goes straight to extract + configure.
+      - name: Cache nginx source tarball
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4
+        with:
+          path: .build/nginx-${{ env.NGINX_VERSION }}.tar.gz
+          key: nginx-src-${{ env.NGINX_VERSION }}
 
       - name: Build server and dynamic module
         run: |
@@ -93,18 +102,25 @@ jobs:
           fi
 
       - name: Strict module compile
+        # CI-1 (compiler axis): the same -Werror wall under BOTH gcc and clang.
+        # The two diverge on warnings (clang flags shadow/unreachable/format cases
+        # gcc misses and vice-versa), so a clean compile under both is a stronger
+        # gate than gcc alone.
         run: |
           build=".build/nginx-${NGINX_VERSION}"
           cflags=$(awk '/^CFLAGS[[:space:]]*=/{sub(/^CFLAGS[[:space:]]*=[[:space:]]*/,""); print; exit}' "$build/objs/Makefile")
           incs=$(awk '/^ALL_INCS[[:space:]]*=/{found=1} found{line=$0; sub(/^ALL_INCS[[:space:]]*=[[:space:]]*/,"",line); continued=(line ~ /\\$/); gsub(/\\$/, "", line); printf "%s ", line; if (!continued) exit}' "$build/objs/Makefile")
-          # cflags and incs are compiler flag lists and must word-split.
-          # shellcheck disable=SC2086
-          for src in ngx_http_cache_turbo_module ngx_http_cache_turbo_shm ngx_http_cache_turbo_swr ngx_http_cache_turbo_autotune ngx_http_cache_turbo_redis ngx_http_cache_turbo_memcached; do
-            ( cd "$build" && gcc -c -fPIC $cflags \
-                -Wall -Wextra -Wshadow -Wstrict-prototypes \
-                -Wstrict-aliasing -Wunreachable-code -Werror \
-                -Wno-unused-parameter \
-                $incs "$GITHUB_WORKSPACE/src/${src}.c" -o "/tmp/${src}.o" )
+          for cc in gcc clang; do
+            echo "== strict compile: $cc =="
+            for src in ngx_http_cache_turbo_module ngx_http_cache_turbo_shm ngx_http_cache_turbo_swr ngx_http_cache_turbo_autotune ngx_http_cache_turbo_redis ngx_http_cache_turbo_memcached; do
+              # cflags and incs are compiler flag lists and must word-split.
+              # shellcheck disable=SC2086
+              ( cd "$build" && "$cc" -c -fPIC $cflags \
+                  -Wall -Wextra -Wshadow -Wstrict-prototypes \
+                  -Wstrict-aliasing -Wunreachable-code -Werror \
+                  -Wno-unused-parameter \
+                  $incs "$GITHUB_WORKSPACE/src/${src}.c" -o "/tmp/${cc}-${src}.o" )
+            done
           done
 
       - name: Stage artifact
@@ -152,6 +168,41 @@ jobs:
                 -Wstrict-aliasing -Wunreachable-code -Werror \
                 -Wno-unused-parameter \
                 $incs "$GITHUB_WORKSPACE/src/${src}.c" -o "/tmp/legacy-${src}.o" )
+          done
+
+  build-arm64:
+    name: Build (arm64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential curl libpcre2-dev libssl-dev zlib1g-dev
+
+      # CI-1 (arch axis): the deb pipeline ships an arm64 package but CI only
+      # built amd64. The blob wire format is fixed little-endian (STAB-4), so the
+      # two arches must agree; a native arm64 build + strict compile guards
+      # against an arch-specific regression (alignment, type width, endianness).
+      - name: Build server, module, and strict compile on arm64
+        run: |
+          bash tools/ci-build.sh nginx "$NGINX_VERSION"
+          build=".build/nginx-${NGINX_VERSION}"
+          test -x "$build/objs/nginx"
+          test -f "$build/objs/ngx_http_cache_turbo_module.so"
+          cflags=$(awk '/^CFLAGS[[:space:]]*=/{sub(/^CFLAGS[[:space:]]*=[[:space:]]*/,""); print; exit}' "$build/objs/Makefile")
+          incs=$(awk '/^ALL_INCS[[:space:]]*=/{found=1} found{line=$0; sub(/^ALL_INCS[[:space:]]*=[[:space:]]*/,"",line); continued=(line ~ /\\$/); gsub(/\\$/, "", line); printf "%s ", line; if (!continued) exit}' "$build/objs/Makefile")
+          for src in ngx_http_cache_turbo_module ngx_http_cache_turbo_shm ngx_http_cache_turbo_swr ngx_http_cache_turbo_autotune ngx_http_cache_turbo_redis ngx_http_cache_turbo_memcached; do
+            # cflags and incs are compiler flag lists and must word-split.
+            # shellcheck disable=SC2086
+            ( cd "$build" && gcc -c -fPIC $cflags \
+                -Wall -Wextra -Wshadow -Wstrict-prototypes \
+                -Wstrict-aliasing -Wunreachable-code -Werror \
+                -Wno-unused-parameter \
+                $incs "$GITHUB_WORKSPACE/src/${src}.c" -o "/tmp/arm64-${src}.o" )
           done
 
   analyze:
