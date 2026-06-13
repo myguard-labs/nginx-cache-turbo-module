@@ -32,9 +32,29 @@ if [ -n "$ngx_module_link" ]; then
     ngx_module_name=$ngx_addon_name
     ngx_module_srcs="$CACHE_TURBO_SRCS"
     ngx_module_deps="$CACHE_TURBO_DEPS"
-    # Run our body filter before the copy filter (so we see the buffers) and
-    # after the standard content filters, matching srcache's ordering.
+    # Filter ordering. ngx_module_order lists the modules our filter must run
+    # ABOVE (earlier on the output path / higher in the chain) — the same
+    # convention the gzip/zstd/brotli filters use to sit above copy.
+    #
+    # We MUST run above the compression filters (gzip/zstd/brotli) so our body
+    # filter captures the IDENTITY response body, not the already-compressed
+    # bytes. Capturing below them stores a coding-specific body plus a
+    # Content-Encoding header and replays e.g. a zstd body to a gzip/identity
+    # client on a HIT (browser "Content Encoding Error" — 2026-06-13 incident).
+    # Capturing identity instead lets the downstream compression filter
+    # re-encode per client on both MISS and HIT, so Vary: Accept-Encoding is a
+    # non-issue (one identity copy, correct coding for everyone) — exactly how
+    # nginx proxy_cache behaves. headers_filter / copy_filter stay so our body
+    # filter still sees the buffers before the copy filter, as before.
+    #
+    # gzip is static (always present); zstd/brotli are dynamic and named here so
+    # the dynamic loader gets an explicit "cache_turbo above them" edge instead
+    # of leaving the relative order to load_module sequence. A named module that
+    # is not built/loaded is simply ignored.
     ngx_module_order="$ngx_module_name \
+                      ngx_http_zstd_filter_module \
+                      ngx_http_brotli_filter_module \
+                      ngx_http_gzip_filter_module \
                       ngx_http_headers_filter_module \
                       ngx_http_copy_filter_module"
     . auto/module

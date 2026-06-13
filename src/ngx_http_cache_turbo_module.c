@@ -112,6 +112,7 @@ static size_t ngx_http_cache_turbo_variant_index_name(ngx_str_t *base,
 static void ngx_http_cache_turbo_classify_vary(ngx_http_request_t *r,
     ngx_int_t *bits_out, ngx_uint_t *nocache_out);
 static ngx_uint_t ngx_http_cache_turbo_response_has_vary(ngx_http_request_t *r);
+static ngx_uint_t ngx_http_cache_turbo_response_encoded(ngx_http_request_t *r);
 static ngx_int_t ngx_http_cache_turbo_init(ngx_conf_t *cf);
 
 
@@ -3030,6 +3031,7 @@ ngx_http_cache_turbo_header_filter(ngx_http_request_t *r)
         && !ctx->req_no_store
         && ngx_http_cache_turbo_status_ttl(clcf, r->headers_out.status) >= 0
         && ngx_http_cache_turbo_response_cacheable(r)
+        && !ngx_http_cache_turbo_response_encoded(r)
         && (clcf->no_store == NULL
             || ngx_http_test_predicates(r, clcf->no_store) == NGX_OK))
     {
@@ -5464,6 +5466,42 @@ ngx_http_cache_turbo_response_has_vary(ngx_http_request_t *r)
     }
 
     return 0;
+}
+
+
+/* True if the response already carries a non-identity Content-Encoding.
+ *
+ * SEC: a coding-specific body must never be cached under our encoding-blind
+ * key. The load-order fix (dh_nginx prio 80) puts our body filter ABOVE the
+ * gzip/zstd/brotli filters, so a normal compressed page reaches this filter as
+ * IDENTITY (no Content-Encoding yet) and is captured uncompressed — the
+ * compression filter then re-encodes it per client on both MISS and HIT. A
+ * Content-Encoding still present here therefore means either the ORIGIN
+ * pre-compressed the response (we hold no identity copy to re-encode) or we
+ * were mis-ordered below a compressor. In both cases the stored bytes are
+ * specific to one coding; replaying them to a client that negotiated a
+ * different Accept-Encoding yields a browser "Content Encoding Error". Refuse
+ * to capture rather than corrupt — this is the defense-in-depth guard that
+ * holds even if the filter order is ever wrong. (Walks the typed field, which
+ * upstream/proxy and the compression filters both populate.) */
+static ngx_uint_t
+ngx_http_cache_turbo_response_encoded(ngx_http_request_t *r)
+{
+    ngx_table_elt_t  *ce = r->headers_out.content_encoding;
+
+    if (ce == NULL || ce->hash == 0 || ce->value.len == 0) {
+        return 0;
+    }
+
+    /* "identity" is the no-op coding — safe to cache as-is. */
+    if (ce->value.len == sizeof("identity") - 1
+        && ngx_strncasecmp(ce->value.data, (u_char *) "identity",
+                           sizeof("identity") - 1) == 0)
+    {
+        return 0;
+    }
+
+    return 1;
 }
 
 

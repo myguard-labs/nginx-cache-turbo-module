@@ -631,6 +631,23 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # compressed-edge regression (2026-06-13 incident): a real nginx gzip
+        # filter sits in front of cache_turbo. gzip_proxied any + gzip_min_length
+        # 1 force compression even on the tiny origin body. With the dh_nginx
+        # prio-80 load-order fix cache_turbo's body filter runs ABOVE gzip, so it
+        # captures the IDENTITY body (no Content-Encoding) and gzip re-encodes per
+        # client on MISS and HIT alike. Drives test_compressed_edge_identity_capture.
+        location /gz/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    30s;
+            gzip                 on;
+            gzip_types           application/json;
+            gzip_min_length      1;
+            gzip_proxied         any;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # cold-miss single-flight (v10), per-box: cache_turbo_lock is ON by
         # default, so a burst of first-hits on one cold key collapses to a
         # single origin fetch; the rest wait then serve the filled entry.
@@ -1617,6 +1634,70 @@ def drain_origin(origin: Origin, settle: float = 0.6,
 # --------------------------------------------------------------------------- #
 # Tests
 # --------------------------------------------------------------------------- #
+
+def test_compressed_edge_identity_capture(ng: Nginx) -> None:
+    """REGRESSION (2026-06-13 incident): cache_turbo behind a real compression
+    filter must cache the IDENTITY body and let the downstream gzip filter
+    re-encode per client, so a HIT never replays a coding the client did not
+    accept (browser "Content Encoding Error").
+
+    The /gz/ location runs the actual nginx gzip filter in front of the origin
+    (gzip_proxied any + gzip_min_length 1 so even the tiny origin body is
+    compressed). With the ngx_module_order load-order fix cache_turbo sits ABOVE
+    gzip: it captures the uncompressed body, the entry is a single identity
+    copy, and gzip compresses it for each client on MISS and HIT alike.
+
+    Fails on the pre-fix build (cache_turbo below gzip -> stores gzip bytes +
+    Content-Encoding: gzip -> replays gzip to the identity client). The Fix-B
+    guard alone would make the entry a perpetual MISS, which the X-Cache=HIT
+    assertion below would also catch — so this proves the real identity-capture
+    path, not merely the refusal."""
+    import gzip as _gzip
+
+    def raw(ae: str):
+        conn = http.client.HTTPConnection("127.0.0.1", ng.port, timeout=5)
+        try:
+            conn.request("GET", "/gz/page",
+                         headers={"Accept-Encoding": ae, "Connection": "close"})
+            r = conn.getresponse()
+            data = r.read()
+            return (r.status, data,
+                    {k.lower(): v for k, v in r.getheaders()})
+        finally:
+            conn.close()
+
+    def decode(data, ce):
+        if ce == "gzip":
+            return _gzip.decompress(data)
+        assert ce in (None, "", "identity"), \
+            f"unexpected Content-Encoding {ce!r}"
+        return data
+
+    # prime: gzip-capable client. MISS -> origin identity captured -> gzip
+    # compresses on the way out.
+    s0, d0, h0 = raw("gzip")
+    assert s0 == 200, f"prime status {s0}"
+    plain0 = decode(d0, h0.get("content-encoding"))
+
+    # cross-encoding HIT: an identity-only client must get an UNencoded body from
+    # the same cached entry, decoding to the same bytes.
+    s1, d1, h1 = raw("identity")
+    assert s1 == 200
+    ce1 = h1.get("content-encoding")
+    assert ce1 in (None, "", "identity"), \
+        f"identity client got Content-Encoding={ce1!r} on HIT (encoding bug)"
+    assert h1.get("x-cache") == "HIT", \
+        f"identity request should HIT the identity entry, x-cache={h1.get('x-cache')}"
+    assert decode(d1, ce1) == plain0, "HIT body (identity) differs from origin"
+
+    # gzip client on a HIT: re-encoded gzip, decodes to the same bytes.
+    s2, d2, h2 = raw("gzip")
+    assert s2 == 200
+    ce2 = h2.get("content-encoding")
+    assert h2.get("x-cache") == "HIT", \
+        f"second gzip request should HIT, x-cache={h2.get('x-cache')}"
+    assert decode(d2, ce2) == plain0, "HIT body (gzip) differs from origin"
+
 
 def test_miss_then_hit(ng: Nginx) -> None:
     """Basic: first request MISS (origin), second HIT (cached, same body)."""
@@ -4647,6 +4728,7 @@ def run_all(ng: Nginx, origin: Origin,
             redis_tls: RedisServer | None = None,
             mc: MemcachedServer | None = None) -> None:
     test_miss_then_hit(ng)
+    test_compressed_edge_identity_capture(ng)
     test_header_fidelity(ng)
     test_max_size_not_cached(ng)
     test_suppress_native_variable(ng)
