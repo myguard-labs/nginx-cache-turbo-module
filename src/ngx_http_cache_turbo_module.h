@@ -746,7 +746,13 @@ typedef struct {
 /* CTB4 (RFC-2 stale-if-error): fixed-endian versioned wire format. CTB4 adds the
  * sie_ttl u32 after stale_ttl (44-byte header). Old CTB1/CTB2/CTB3 blobs in L2
  * fail the magic/version check and are treated as a miss (cache self-heals), so
- * no migration is needed — the keyspace turns over once on upgrade. */
+ * no migration is needed — the keyspace turns over once on upgrade.
+ *
+ * NOTE: the magic/version are bumped ONLY for an actual wire-LAYOUT change. A
+ * purely semantic shift in already-laid-out bytes (e.g. the 2bcb914 switch from
+ * storing a compressed body to an identity one) does NOT bump it — a reload
+ * clears L1 shm and short TTLs age out any L2 copy, so a global keyspace
+ * turnover would be unwarranted churn for a not-yet-in-production module. */
 #define NGX_HTTP_CACHE_TURBO_BLOB_MAGIC    0x43544234
 #define NGX_HTTP_CACHE_TURBO_BLOB_VERSION  4
 /* Fixed wire size of the blob header (NOT sizeof the struct — that carries

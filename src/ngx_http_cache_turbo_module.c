@@ -2013,6 +2013,16 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                 /* Object outlived its serveable window in L2 (Redis TTL
                  * slack): treat as a miss and go to origin.
                  *
+                 * NOTE (v4-4 asymmetry, intentional): the load-adaptive stale
+                 * widening is applied to the L1 serve decision only (it widens
+                 * the local stale_until without rewriting the stored window).
+                 * It is deliberately NOT applied here: this branch both SERVES
+                 * and STORES the L2 blob into L1 (rem_stale below feeds
+                 * l1->store), so widening rem_stale would PERSIST a stretched
+                 * window into L1 and diverge from the serve-only L1 semantics.
+                 * An L2-restored entry past its stored window is conservatively
+                 * a miss; the origin single-flight bounds the refetch.
+                 *
                  * RFC-2 stale-if-error (CTB4): if the L1 path did not already arm
                  * a snapshot (L1 evicted, or this is a peer's fresher-but-expired
                  * copy) and this L2 blob still carries a serve-on-error window
@@ -3261,8 +3271,16 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
          * window explicitly (fresh + N), overriding the cache_turbo_stale_mult
          * default. The existing SWR machinery (background_update) then serves
          * stale + refreshes within it. must-revalidate below still wins (it
-         * collapses the window). Only meaningful for a finite TTL. */
-        if (ttl > 0) {
+         * collapses the window). Only meaningful for a finite TTL.
+         *
+         * ignore_cc skips ALL three response-Cache-Control window adjustments
+         * (swr here, must-revalidate + stale-if-error below): the operator told
+         * us to ignore the upstream Cache-Control, so an upstream max-age=0 /
+         * must-revalidate / stale-while|if-* must NOT reshape the window built
+         * from cache_turbo_valid + cache_turbo_stale_mult. Matches the
+         * proxy_ignore_headers Cache-Control contract (the whole header is
+         * inert), not just the cacheability floor. */
+        if (ttl > 0 && !clcf->ignore_cc) {
             time_t  swr = ngx_http_cache_turbo_response_swr(r);
             if (swr >= 0) {
                 stale_window = ttl + swr;
@@ -3279,14 +3297,19 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
          * must NOT be served without revalidation. We have no validation channel
          * for a hit, so collapse the stale window to the fresh TTL — the object
          * is served fresh until its deadline, then re-fetched (no stale serve,
-         * no stale-if-error). Only meaningful for a finite TTL. */
-        if (ttl > 0 && ngx_http_cache_turbo_response_must_revalidate(r)) {
+         * no stale-if-error). Only meaningful for a finite TTL. Skipped under
+         * ignore_cc (see the swr block above — the whole upstream Cache-Control
+         * is inert, so an upstream must-revalidate must not collapse the
+         * operator-configured stale window). */
+        if (ttl > 0 && !clcf->ignore_cc
+            && ngx_http_cache_turbo_response_must_revalidate(r))
+        {
             stale_window = ttl;
             ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                            "cache_turbo: must-revalidate \"%V\" -> no stale window",
                            &r->uri);
 
-        } else if (ttl > 0) {
+        } else if (ttl > 0 && !clcf->ignore_cc) {
             /* RFC 5861 §4 / RFC-2: a response stale-if-error=N records an absolute
              * serve-on-error window (fresh + N) in the blob's sie_ttl (CTB4), so a
              * later origin failure may serve this copy PAST the normal stale
@@ -5484,9 +5507,12 @@ ngx_http_cache_turbo_response_has_vary(ngx_http_request_t *r)
 /* True if the response already carries a non-identity Content-Encoding.
  *
  * SEC: a coding-specific body must never be cached under our encoding-blind
- * key. The load-order fix (dh_nginx prio 80) puts our body filter ABOVE the
- * gzip/zstd/brotli filters, so a normal compressed page reaches this filter as
- * IDENTITY (no Content-Encoding yet) and is captured uncompressed — the
+ * key. The filter-order fix (no ngx_module_order in `config`, so a lone
+ * --add-dynamic-module registers LAST = TOP-most output filter; cache_turbo is
+ * also kept the last --add-dynamic-module in the angie/nginx package build)
+ * puts our body filter ABOVE the gzip/zstd/brotli filters, so a normal
+ * compressed page reaches this filter as IDENTITY (no Content-Encoding yet)
+ * and is captured uncompressed — the
  * compression filter then re-encodes it per client on both MISS and HIT. A
  * Content-Encoding still present here therefore means either the ORIGIN
  * pre-compressed the response (we hold no identity copy to re-encode) or we

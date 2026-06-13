@@ -789,6 +789,23 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # ignore_cc vs must-revalidate: cache_turbo_ignore_cache_control on must
+        # make the ENTIRE response Cache-Control inert, not just the cacheability
+        # floor. The origin emits "max-age=1, must-revalidate"; without ignore_cc
+        # the must-revalidate token collapses the stale window (like /mrev/), but
+        # with ignore_cc on the window stays valid*stale_mult (1s*4), so at ~2s
+        # the entry is still STALE-served, not a hard miss. fresh = valid 1s
+        # (ignore_cc forces honor_cc off). beta 1 ~never rolls a refresh, so the
+        # stale read is a clean STALE serve (no dice regen polluting origin).
+        location /ccignmr/ {{
+            cache_turbo                       main;
+            cache_turbo_key                   $uri;
+            cache_turbo_valid                 1s;
+            cache_turbo_beta                  1;
+            cache_turbo_ignore_cache_control  on;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # PURGE method (v14): `PURGE /pg/x` drops that entry from L1 (+L2)
         location /pg/ {{
             cache_turbo       main;
@@ -2290,6 +2307,31 @@ def test_ignore_cache_control_overrides_floor(ng: Nginx, origin: Origin) -> None
          f"X-Cache={h.get('x-cache')}")
 
 
+def test_ignore_cc_must_revalidate_keeps_stale_window(ng: Nginx,
+                                                      origin: Origin) -> None:
+    """cache_turbo_ignore_cache_control on must neutralise the WHOLE response
+    Cache-Control, including the must-revalidate token that would otherwise
+    collapse the stale window at store. The origin emits
+    "max-age=1, must-revalidate"; under /ccignmr/ (ignore_cc on, valid 1s, default
+    stale_mult 4 => 4s stale window) the entry must still be STALE-served at ~2s.
+    Without the fix (must-revalidate parsed despite ignore_cc) the window collapses
+    to 1s and the 2s read is a hard miss to origin. Inverse of
+    test_must_revalidate_collapses_stale (the /mrev/ honor_cc case)."""
+    uri = "/ccignmr/mustrev"
+    fetch(ng.port, uri)                                    # prime (miss, stores)
+    _, _, h1 = fetch(ng.port, uri)
+    assert h1.get("x-cache") == "HIT", \
+        f"ignore_cc must store the must-revalidate response; got {h1.get('x-cache')}"
+    time.sleep(2.0)                                        # past 1s fresh, < 4s stale
+    before = origin.hits
+    _, _, h2 = fetch(ng.port, uri)
+    assert h2.get("x-cache") == "STALE", \
+        ("ignore_cc must keep the stale window (must-revalidate ignored): expected "
+         f"STALE at 2s, got X-Cache={h2.get('x-cache')} — window was collapsed")
+    assert origin.hits == before, \
+        "stale serve under ignore_cc unexpectedly hit origin (window collapsed?)"
+
+
 def test_x_cache_off_suppresses_header(ng: Nginx, origin: Origin) -> None:
     """cache_turbo_x_cache off suppresses the X-Cache header while still serving
     from cache. The second read carries NO X-Cache but DOES carry Age (Age is
@@ -3654,7 +3696,7 @@ def test_l2_malformed_blob_rejected(ng: Nginx, origin: Origin,
         # CTB3 (prior wire format): a stale on-disk blob from the pre-RFC-2 build
         # must miss-to-origin once (self-heal), not be parsed at a shifted layout.
         "old-ctb3":      make_ctb4_blob(b"x", magic=0x43544233, version=3),
-        # valid header+version but headers_len lies past the buffer end
+        # valid magic+version but headers_len lies past the buffer end
         "hdrlen-overflow": (
             struct.pack("<IHHIIIIqIII", 0x43544234, 4, 0, 200, 1,
                         0xFFFF, 1, int(time.time()), 60, 240, 0) + b"\x01"),
@@ -4760,6 +4802,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_must_revalidate(ng)
     test_precise_maxage_token_parse(ng)
     test_ignore_cache_control_overrides_floor(ng, origin)
+    test_ignore_cc_must_revalidate_keeps_stale_window(ng, origin)
     test_x_cache_off_suppresses_header(ng, origin)
     test_valid_zero_is_forever(ng, origin)
     test_vary_encoding_qvalue(ng, origin)
