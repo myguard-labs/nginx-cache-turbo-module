@@ -298,6 +298,62 @@ variant. Off by default.
 > yourself with `cache_turbo_normalize_vary` (below) — otherwise the first
 > variant stored wins for everyone.
 
+## CMS backends (`cache_turbo_backend`)
+
+A page cache in front of a CMS has one classic footgun: cache a *logged-in* page,
+the admin dashboard, or a cart, and serve it to the world. `cache_turbo_backend`
+is the built-in guard — name your CMS and the module **auto-skips** the dynamic
+surfaces (login/session traffic, admin URIs, search/preview) straight to the
+origin, **never capturing them**, so only anonymous, shareable pages land in the
+cache.
+
+```nginx
+cache_turbo            ct;
+cache_turbo_backend    wordpress;          # one or more: wordpress woocommerce joomla generic
+# cache_turbo          ct auto;            # shorthand for `cache_turbo_backend generic`
+```
+
+Names **stack** (`cache_turbo_backend wordpress woocommerce;`), and `generic`
+(a.k.a. `auto`) is simply the **union of all three** presets — use it when you
+don't want to think about it, name the specific backend(s) when you want the
+tightest rule set.
+
+### What each preset skips
+
+A request is sent to the origin uncached if it matches **any** of three checks
+for an active preset: a **URI prefix**, the **presence of a query arg**, or a
+**substring of the `Cookie` header** (the login/session cookies carry
+per-session suffixes, so it matches as a substring).
+
+| Preset | URI prefixes | Query args | Cookie substrings |
+|---|---|---|---|
+| `wordpress`   | `/wp-admin/`, `/wp-login.php`, `/wp-cron.php`, `/xmlrpc.php`, `/wp-json/` | `preview`, `s` | `wordpress_logged_in_`, `wp-postpass_`, `comment_author_` |
+| `woocommerce` | `/cart`, `/checkout`, `/my-account` | — | `woocommerce_items_in_cart`, `woocommerce_cart_hash`, `wp_woocommerce_session_` |
+| `joomla`      | `/administrator/` | — | — |
+| `generic`/`auto` | union of all of the above | union | union |
+
+So a WordPress admin (`wordpress_logged_in_…` cookie), a `?preview=true` draft, a
+`/wp-json/` API call, a WooCommerce cart cookie, or a `/checkout` page all bypass
+the cache automatically — no hand-written `cache_turbo_bypass`/`no_store` rules.
+
+### Interactions and safety
+
+- **Implies `cache_turbo_honor_cache_control on`** (unless you set it
+  explicitly). So if your CMS plugin already emits `Cache-Control: no-cache` on a
+  page it knows is dynamic, that page self-excludes at store time too — belt and
+  braces. Pin a fixed TTL instead with an explicit
+  `cache_turbo_honor_cache_control off;` (e.g. for microcaching — see below).
+- **It is a floor, not the only one.** Auto-skip sits *under* the manual
+  `cache_turbo_bypass` / `cache_turbo_no_store` overrides, and the universal
+  safety rules still apply on top of it regardless of preset: a response with
+  `Set-Cookie`, or a request carrying `Authorization`, is never cached. The
+  preset widens the net for CMS-specific surfaces those generic rules miss (an
+  admin URL with no cookie yet, a search query), it doesn't replace them.
+- **Not a security boundary for your own private routes.** The presets cover the
+  well-known CMS surfaces above; a custom `/members/`-style area still needs its
+  own `cache_turbo_bypass $cookie_yoursession;` (or `cache_turbo_safe_key on` for
+  origins that don't reliably mark per-user responses `private`).
+
 ## The cache key
 
 A "key" is just the string that decides whether two requests are *the same
@@ -747,39 +803,6 @@ rate(cache_turbo_misses_total[5m]))`, **backend regen rate**
 `rate(cache_turbo_refreshes_total[5m])`, plus `cache_turbo_regen_cost_ms` and
 `cache_turbo_autotuned_beta` as plain gauges.
 
-### Benchmarking
-
-[`tools/bench.sh`](tools/bench.sh) measures throughput/latency and compares
-cache-turbo against the alternatives. It stands up an origin plus four edges on
-separate ports — **A** origin direct (the floor), **B** nginx `proxy_cache`,
-**C** cache_turbo L1 shm, **D** cache_turbo + L2 Redis — primes each so the run
-hits the cache (not the origin), then drives `wrk --latency` and prints an
-rps / p50 / p99 / hit-ratio table. The hit-ratio column comes from the module's
-own Prometheus counters, so a "fast" run that secretly missed shows up as
-<100 % instead of as a bogus number.
-
-```console
-$ tools/bench.sh /path/to/nginx 15 8           # 15s/run, 8 conns
-$ SIZES="tiny medium large" tools/bench.sh nginx 15 8
-$ REDIS="redis://127.0.0.1:6379/0" tools/bench.sh nginx 15 8   # adds run D
-```
-
-> Build the nginx binary as a **release** build (stock `-O`, **no** `-fsanitize`,
-> no valgrind) — sanitizers slow serving 10–50× and measure nothing real. That is
-> [`tools/soak.sh`](tools/soak.sh)'s job: it proves the module *survives* heavy
-> churn under ASAN/valgrind; bench.sh proves how *fast* it serves.
-
-Full method, a reference result set (cache-turbo **+23–37 %** over nginx's own
-`proxy_cache` on small/medium bodies), and caveats are in
-**[BENCHMARK.md](BENCHMARK.md)**.
-
-### Variables
-
-| Variable | Meaning |
-|---|---|
-| `$cache_turbo_normalized_args` | The query string with tracking junk dropped, args sorted, plus any `normalize_vary` buckets — drop it in your `cache_turbo_key`. |
-| `$cache_turbo_beta` | The `beta` this request would actually use right now (handy to `add_header X-CT-Beta $cache_turbo_beta;` and watch autotune work). |
-
 ## Redis L2 (shared cache)
 
 By default the cache lives in each box's RAM (L1). Add Redis as a shared **L2**
@@ -888,6 +911,33 @@ $ apt install angie-module-http-cache-turbo
   · [Angie modules (optimized & extended)](https://deb.myguard.nl/angie-modules-optimized-extended/)
 - **Directive synopsis:** [modules-synopsis #http-cache-turbo](https://deb.myguard.nl/nginx/modules-synopsis/#http-cache-turbo)
 - **Writeup:** [nginx-cache-turbo — a built-in page cache](https://deb.myguard.nl/2026/06/nginx-cache-turbo-built-in-page-cache/)
+
+## Benchmarking
+
+[`tools/bench.sh`](tools/bench.sh) measures throughput/latency and compares
+cache-turbo against the alternatives. It stands up an origin plus four edges on
+separate ports — **A** origin direct (the floor), **B** nginx `proxy_cache`,
+**C** cache_turbo L1 shm, **D** cache_turbo + L2 Redis — primes each so the run
+hits the cache (not the origin), then drives `wrk --latency` and prints an
+rps / p50 / p99 / hit-ratio table. The hit-ratio column comes from the module's
+own Prometheus counters, so a "fast" run that secretly missed shows up as
+< 100 % instead of as a bogus number.
+
+```console
+$ eval "$(tools/ci-build.sh nginx 1.31.1 nginx)"      # stock-O release: exports binary= module=
+$ MODULE="$module" tools/bench.sh "$binary" 15 8       # 15s/run, 8 conns
+$ SIZES="tiny medium large" REDIS="redis://127.0.0.1:6379/0" \
+      MODULE="$module" tools/bench.sh "$binary" 15 8   # all sizes + the L2-Redis run
+```
+
+> Build the nginx binary as a **release** build (stock `-O`, **no** `-fsanitize`,
+> no valgrind) — sanitizers slow serving 10–50× and measure nothing real. That is
+> [`tools/soak.sh`](tools/soak.sh)'s job: it proves the module *survives* heavy
+> churn under ASAN/valgrind; bench.sh proves how *fast* it serves.
+
+Full method, the reference environment, a result set (cache-turbo **+23–37 %**
+over nginx's own `proxy_cache` on small/medium bodies, ~10 % on multi-megabyte
+bodies), and the caveats are in **[BENCHMARK.md](BENCHMARK.md)**.
 
 ## License
 
