@@ -91,6 +91,7 @@ ngx_http_cache_turbo_shm_init_zone(ngx_shm_zone_t *shm_zone, void *data)
     ctx->sh->l2_misses = 0;
     ctx->sh->lock_waits = 0;
     ctx->sh->min_uses_skips = 0;
+    ctx->sh->bypasses = 0;
 
     /* Autotune state (v4-3): everything zeroed. autotune_next = 0 makes the first
      * recompute fire immediately; the snapshots being 0 means the first window is
@@ -450,6 +451,7 @@ ngx_http_cache_turbo_shm_stats(ngx_http_cache_turbo_zone_t *z,
     out->l2_misses    = z->sh->l2_misses;
     out->lock_waits   = z->sh->lock_waits;
     out->min_uses_skips = z->sh->min_uses_skips;
+    out->bypasses     = z->sh->bypasses;
 
     /* Autotune introspection (v4-3): average origin-regen cost and the live beta
      * verdict, so the admin GET can render the tuning without an internal probe. */

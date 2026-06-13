@@ -100,6 +100,15 @@
 #define NGX_HTTP_CACHE_TURBO_CC_HONOR    1
 #define NGX_HTTP_CACHE_TURBO_CC_IGNORE   2
 
+/* Per-request serve outcome (ctx.status), surfaced by $cache_turbo_status.
+ * MISS is 0 so a pcalloc'd ctx defaults to it; the serve/bypass paths override.
+ * Keep ngx_http_cache_turbo_status_str() in the .c in sync with these. */
+#define NGX_HTTP_CACHE_TURBO_ST_MISS     0
+#define NGX_HTTP_CACHE_TURBO_ST_HIT      1
+#define NGX_HTTP_CACHE_TURBO_ST_STALE    2
+#define NGX_HTTP_CACHE_TURBO_ST_BYPASS   3
+#define NGX_HTTP_CACHE_TURBO_ST_EXPIRED  4
+
 
 /*
  * Live autotune within preset bands (#10, v4-3). Ported from the wp-redis PHP
@@ -268,6 +277,12 @@ typedef struct {
      * "don't cache one-hit-wonders" gate. */
     ngx_atomic_t             min_uses_skips;
 
+    /* Requests sent to origin because a cache_turbo_bypass predicate tripped or
+     * a CMS backend preset auto-classified them as dynamic. Also counted in
+     * misses (they reached origin); bypasses isolates the "skipped on purpose"
+     * subset for $cache_turbo_status / Prometheus. */
+    ngx_atomic_t             bypasses;
+
     /*
      * Live autotune state (v4-3). cost_sum_ms / cost_count accumulate the
      * wall-clock cost of every origin regeneration (request_time at the
@@ -312,6 +327,7 @@ typedef struct {
     ngx_atomic_uint_t   l2_misses;
     ngx_atomic_uint_t   lock_waits;   /* v10 coalesced cold-misses (waited)   */
     ngx_atomic_uint_t   min_uses_skips; /* v15 cold misses below min_uses     */
+    ngx_atomic_uint_t   bypasses;     /* bypass / auto-classify skips to origin */
     /* Autotune introspection (v4-3): cost_ms = the measured average origin-regen
      * cost (cost_sum_ms / cost_count, 0 when nothing measured); autotuned_beta =
      * the live verdict ×1000 (0 = none). Rendered by the admin GET so a test (or
@@ -672,6 +688,11 @@ typedef struct {
     size_t                   sie_snap_len;
     u_char                  *sie_body;        /* body slice inside sie_snap        */
     size_t                   sie_body_len;
+    /* Per-request serve outcome for $cache_turbo_status / access logging. One of
+     * NGX_HTTP_CACHE_TURBO_ST_*; defaults to ST_MISS (0) via pcalloc and is
+     * overridden to HIT/STALE at the X-Cache emit site, BYPASS on the
+     * auto-classify / cache_turbo_bypass paths, EXPIRED on an only-if-cached 504. */
+    ngx_uint_t               status;
 } ngx_http_cache_turbo_ctx_t;
 
 

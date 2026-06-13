@@ -601,7 +601,7 @@ http {
 ```console
 # stats (JSON)
 $ curl localhost/_cache
-{"hits":1240,"misses":83,"stale_serves":12,"refreshes":11,"evictions":0,"l2_hits":61,"l2_misses":22,"cost_ms":34,"autotuned_beta":1700,"autotuned_load":1000}
+{"hits":1240,"misses":83,"stale_serves":12,"refreshes":11,"evictions":0,"l2_hits":61,"l2_misses":22,"bypasses":5,"cost_ms":34,"autotuned_beta":1700,"autotuned_load":1000}
 
 $ curl -X POST 'localhost/_cache?key=/blog/post-42'   # drop one page
 {"purged":1}
@@ -753,6 +753,7 @@ http {
 | `$cache_turbo_normalized_args` | The request's query string with tracking params stripped and the rest sorted, plus the optional Vary bucket (`cache_turbo_normalize_vary`). The default cache key's args component. |
 | `$cache_turbo_active` | `1` when cache-turbo is engaged for this request (enabled, cacheable method, main request) **and** `cache_turbo_suppress_native on`; else `0`. Wire it into a stacked `proxy_cache` via `proxy_no_cache`/`proxy_cache_bypass` so the native cache defers. |
 | `$cache_turbo_beta` | The effective refresh `beta` ×1000 in force for this request (preset/explicit/autotuned). Handy for debugging/logging. |
+| `$cache_turbo_status` | The per-request serve outcome, for access logging: `HIT`, `STALE` (incl. stale-if-error), `MISS`, `BYPASS` (`cache_turbo_bypass` or a CMS backend preset), or `EXPIRED` (only-if-cached with nothing serveable → 504). `-` when cache-turbo never engaged. E.g. `log_format ct '$request "$cache_turbo_status" rt=$request_time';`. |
 
 ### Admin endpoint verbs
 
@@ -781,6 +782,7 @@ cache_turbo_refreshes_total{zone="ct"} 11
 cache_turbo_evictions_total{zone="ct"} 0
 cache_turbo_l2_hits_total{zone="ct"} 61
 cache_turbo_l2_misses_total{zone="ct"} 22
+cache_turbo_bypasses_total{zone="ct"} 5
 cache_turbo_regen_cost_ms{zone="ct"} 34
 cache_turbo_autotuned_beta{zone="ct"} 1700
 cache_turbo_autotuned_load{zone="ct"} 1000
@@ -799,6 +801,7 @@ Every sample is labelled by `zone`, so one job can scrape many zones. Metrics:
 | `cache_turbo_l2_misses_total` | counter | L1 misses L2 couldn't satisfy (went to origin). |
 | `cache_turbo_lock_waits_total` | counter | Cold-miss requests that waited on a single-flight winner's fill. |
 | `cache_turbo_min_uses_skips_total` | counter | Requests sent to origin (not stored) for being below `cache_turbo_min_uses`. |
+| `cache_turbo_bypasses_total` | counter | Requests skipped to origin by a `cache_turbo_bypass` predicate or a CMS backend preset (a subset of misses). |
 | `cache_turbo_regen_cost_ms` | gauge | Average backend regeneration time (ms). |
 | `cache_turbo_autotuned_beta` | gauge | Live autotuned `beta` ×1000 (0 = none). |
 | `cache_turbo_autotuned_load` | gauge | Live load factor ×1000 widening the stale window + `lock_ttl` under load (1000 = baseline / not under load, up to 4000). |

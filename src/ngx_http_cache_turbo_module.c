@@ -1542,7 +1542,9 @@ ngx_http_cache_turbo_access_prologue(ngx_http_request_t *r,
          * request, so it is NOT "engaged": leave $cache_turbo_active = 0 so a
          * stacked native cache is free to handle the URL itself. */
         ctx->ct_active = 0;
+        ctx->status = NGX_HTTP_CACHE_TURBO_ST_BYPASS;
         (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
+        (void) ngx_atomic_fetch_add(&z->sh->bypasses, 1);
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "cache_turbo: auto-classify dynamic \"%V\" -> origin",
                        &r->uri);
@@ -1565,6 +1567,7 @@ ngx_http_cache_turbo_access_prologue(ngx_http_request_t *r,
     if (ngx_http_cache_turbo_request_revalidate(r)) {
         (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
         if (ctx->req_only_if_cached) {
+            ctx->status = NGX_HTTP_CACHE_TURBO_ST_EXPIRED;
             ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                            "cache_turbo: request revalidate + only-if-cached "
                            "\"%V\" -> 504", &r->uri);
@@ -1597,6 +1600,8 @@ ngx_http_cache_turbo_access_prologue(ngx_http_request_t *r,
                        "cache_turbo: bypass \"%V\" key=%ui -> origin",
                        &r->uri, (ngx_uint_t) hash);
         (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
+        (void) ngx_atomic_fetch_add(&z->sh->bypasses, 1);
+        ctx->status = NGX_HTTP_CACHE_TURBO_ST_BYPASS;
         return NGX_DECLINED;
     }
 
@@ -2629,10 +2634,20 @@ ngx_http_cache_turbo_restore_response(ngx_http_request_t *r, u_char *copy,
      * emitted; the Age above is too (RFC 9111). To suppress it on the wire,
      * clear it downstream with the standard nginx header tooling. */
     {
+        ngx_http_cache_turbo_ctx_t  *sctx;
         static u_char  xc_name[] = "X-Cache";
         (void) ngx_http_cache_turbo_add_header(r, xc_name,
                    sizeof("X-Cache") - 1, (u_char *) xcache,
                    ngx_strlen(xcache));
+
+        /* Record the served outcome for $cache_turbo_status: "HIT" -> HIT,
+         * "STALE"/"STALE-IF-ERROR" -> STALE. */
+        sctx = ngx_http_get_module_ctx(r, ngx_http_cache_turbo_module);
+        if (sctx != NULL) {
+            sctx->status = (xcache[0] == 'H')
+                ? NGX_HTTP_CACHE_TURBO_ST_HIT
+                : NGX_HTTP_CACHE_TURBO_ST_STALE;
+        }
     }
 
     *bodyp = body;
@@ -3420,6 +3435,10 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
             (void) clcf->l1->store(z, store_key, hash,
                        blob, blob_len, ttl,
                        stale_window);
+
+            ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                           "cache_turbo: stored \"%V\" len=%uz ttl=%T",
+                           &r->uri, blob_len, ttl);
 
             /* v10: store overwrote any cold-miss stub into a real entry (or we
              * cleared the relocated base stub above), so the cleanup must not
@@ -4746,6 +4765,9 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
                 "# HELP cache_turbo_min_uses_skips_total Cold misses sent to origin without storing because the key is below cache_turbo_min_uses (v15).\n"
                 "# TYPE cache_turbo_min_uses_skips_total counter\n"
                 "cache_turbo_min_uses_skips_total{zone=\"%V\"} %uA\n"
+                "# HELP cache_turbo_bypasses_total Requests skipped straight to origin by a cache_turbo_bypass predicate or a CMS backend preset (subset of misses).\n"
+                "# TYPE cache_turbo_bypasses_total counter\n"
+                "cache_turbo_bypasses_total{zone=\"%V\"} %uA\n"
                 "# HELP cache_turbo_regen_cost_ms Average origin regeneration cost in milliseconds.\n"
                 "# TYPE cache_turbo_regen_cost_ms gauge\n"
                 "cache_turbo_regen_cost_ms{zone=\"%V\"} %uA\n"
@@ -4758,7 +4780,7 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
                 &zname, st.hits, &zname, st.misses, &zname, st.stale_serves,
                 &zname, st.refreshes, &zname, st.evictions,
                 &zname, st.l2_hits, &zname, st.l2_misses, &zname, st.lock_waits,
-                &zname, st.min_uses_skips,
+                &zname, st.min_uses_skips, &zname, st.bypasses,
                 &zname, st.cost_ms, &zname, st.autotuned_beta,
                 &zname, st.autotuned_load) - p;
 
@@ -4769,9 +4791,9 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
 
         len = sizeof("{\"hits\":,\"misses\":,\"stale_serves\":,\"refreshes\":,"
                      "\"evictions\":,\"l2_hits\":,\"l2_misses\":,\"lock_waits\":,"
-                     "\"min_uses_skips\":,\"cost_ms\":,\"autotuned_beta\":,"
-                     "\"autotuned_load\":}\n")
-              + 12 * NGX_ATOMIC_T_LEN;
+                     "\"min_uses_skips\":,\"bypasses\":,\"cost_ms\":,"
+                     "\"autotuned_beta\":,\"autotuned_load\":}\n")
+              + 13 * NGX_ATOMIC_T_LEN;
         p = ngx_pnalloc(r->pool, len);
         if (p == NULL) {
             return NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -4781,10 +4803,11 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
             "{\"hits\":%uA,\"misses\":%uA,\"stale_serves\":%uA,"
             "\"refreshes\":%uA,\"evictions\":%uA,\"l2_hits\":%uA,"
             "\"l2_misses\":%uA,\"lock_waits\":%uA,\"min_uses_skips\":%uA,"
-            "\"cost_ms\":%uA,\"autotuned_beta\":%uA,\"autotuned_load\":%uA}\n",
+            "\"bypasses\":%uA,\"cost_ms\":%uA,\"autotuned_beta\":%uA,"
+            "\"autotuned_load\":%uA}\n",
             st.hits, st.misses, st.stale_serves,
             st.refreshes, st.evictions, st.l2_hits, st.l2_misses,
-            st.lock_waits, st.min_uses_skips, st.cost_ms,
+            st.lock_waits, st.min_uses_skips, st.bypasses, st.cost_ms,
             st.autotuned_beta, st.autotuned_load) - p;
     }
     return ngx_http_cache_turbo_send_json(r, NGX_HTTP_OK, &body);
@@ -5719,6 +5742,21 @@ static ngx_str_t  ngx_http_cache_turbo_active_name =
     ngx_string("cache_turbo_active");
 
 
+/*
+ * $cache_turbo_status — the per-request serve outcome, for access logging:
+ *   HIT     served fresh from L1/L2
+ *   STALE   served stale while a refresh runs (incl. stale-if-error)
+ *   MISS    went to origin (cold miss, store path, only-if-cached-absent)
+ *   BYPASS  skipped to origin by cache_turbo_bypass or a CMS backend preset
+ *   EXPIRED only-if-cached with nothing serveable -> 504
+ * A request cache-turbo never engaged (cache off / not a main GET) resolves to
+ * "-" (not_found). Drop it in a log_format, e.g.
+ *   log_format ct '$request "$cache_turbo_status" $upstream_response_time';
+ */
+static ngx_str_t  ngx_http_cache_turbo_status_name =
+    ngx_string("cache_turbo_status");
+
+
 static ngx_int_t
 ngx_http_cache_turbo_beta_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data)
@@ -5778,6 +5816,45 @@ ngx_http_cache_turbo_active_variable(ngx_http_request_t *r,
 }
 
 
+/* Keep in sync with the NGX_HTTP_CACHE_TURBO_ST_* macros in the .h. */
+static const char *
+ngx_http_cache_turbo_status_str(ngx_uint_t st)
+{
+    switch (st) {
+    case NGX_HTTP_CACHE_TURBO_ST_HIT:     return "HIT";
+    case NGX_HTTP_CACHE_TURBO_ST_STALE:   return "STALE";
+    case NGX_HTTP_CACHE_TURBO_ST_BYPASS:  return "BYPASS";
+    case NGX_HTTP_CACHE_TURBO_ST_EXPIRED: return "EXPIRED";
+    default:                              return "MISS";
+    }
+}
+
+
+static ngx_int_t
+ngx_http_cache_turbo_status_variable(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data)
+{
+    ngx_http_cache_turbo_ctx_t  *ctx;
+    const char                  *s;
+
+    ctx = ngx_http_get_module_ctx(r, ngx_http_cache_turbo_module);
+    if (ctx == NULL) {
+        /* cache-turbo never engaged for this request -> "-" in the access log. */
+        v->not_found = 1;
+        return NGX_OK;
+    }
+
+    s = ngx_http_cache_turbo_status_str(ctx->status);
+    v->data = (u_char *) s;
+    v->len = ngx_strlen(s);
+    v->valid = 1;
+    v->no_cacheable = 1;
+    v->not_found = 0;
+
+    return NGX_OK;
+}
+
+
 static ngx_int_t
 ngx_http_cache_turbo_add_variables(ngx_conf_t *cf)
 {
@@ -5804,6 +5881,13 @@ ngx_http_cache_turbo_add_variables(ngx_conf_t *cf)
     }
 
     var->get_handler = ngx_http_cache_turbo_active_variable;
+
+    var = ngx_http_add_variable(cf, &ngx_http_cache_turbo_status_name, 0);
+    if (var == NULL) {
+        return NGX_ERROR;
+    }
+
+    var->get_handler = ngx_http_cache_turbo_status_variable;
 
     return NGX_OK;
 }

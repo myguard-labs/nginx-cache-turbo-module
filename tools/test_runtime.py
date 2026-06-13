@@ -832,6 +832,17 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # $cache_turbo_status access-log variable: echoed into a header so the
+        # test can read MISS -> HIT, and BYPASS when ?nocache=1 trips bypass.
+        location /ctstatus/ {{
+            cache_turbo        main;
+            cache_turbo_key    $uri;
+            cache_turbo_valid  30s;
+            cache_turbo_bypass $arg_nocache;
+            add_header         X-CT-Status $cache_turbo_status always;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # no_store (v9): ?private=1 means the response is never stored
         location /nost/ {{
             cache_turbo          main;
@@ -2773,6 +2784,34 @@ def test_bypass(ng: Nginx) -> None:
         "bypass should have refreshed the cached entry"
 
 
+def test_status_variable(ng: Nginx) -> None:
+    """$cache_turbo_status (echoed as X-CT-Status): MISS on the cold fetch,
+    HIT on the second, BYPASS when a cache_turbo_bypass predicate trips. Also
+    confirms the bypass bumped the cache_turbo_bypasses_total counter."""
+    import re
+    _, _, h0 = fetch(ng.port, "/ctstatus/s")
+    assert h0.get("x-ct-status") == "MISS", \
+        f"cold fetch should be MISS, got {h0.get('x-ct-status')}"
+    _, _, h1 = fetch(ng.port, "/ctstatus/s")
+    assert h1.get("x-ct-status") == "HIT", \
+        f"second fetch should be HIT, got {h1.get('x-ct-status')}"
+
+    _, b, _ = fetch(ng.port, "/_cache?format=prometheus")
+    m = re.search(r'cache_turbo_bypasses_total\{zone="main"\} (\d+)', b)
+    assert m, f"no bypasses_total sample:\n{b[:300]}"
+    before = int(m.group(1))
+
+    _, _, h2 = fetch(ng.port, "/ctstatus/s?nocache=1")
+    assert h2.get("x-ct-status") == "BYPASS", \
+        f"bypass fetch should be BYPASS, got {h2.get('x-ct-status')}"
+
+    _, b2, _ = fetch(ng.port, "/_cache?format=prometheus")
+    after = int(re.search(r'cache_turbo_bypasses_total\{zone="main"\} (\d+)',
+                          b2).group(1))
+    assert after == before + 1, \
+        f"bypasses_total should increment on a bypass: {before} -> {after}"
+
+
 def test_no_store(ng: Nginx) -> None:
     """v9: cache_turbo_no_store keeps a flagged response out of the cache."""
     _, _, h1 = fetch(ng.port, "/nost/y?private=1")
@@ -3190,6 +3229,7 @@ def test_admin_prometheus(ng: Nginx) -> None:
                  "# TYPE cache_turbo_l2_hits_total counter",
                  "# TYPE cache_turbo_l2_misses_total counter",
                  "# TYPE cache_turbo_min_uses_skips_total counter",
+                 "# TYPE cache_turbo_bypasses_total counter",
                  "# TYPE cache_turbo_regen_cost_ms gauge",
                  "# TYPE cache_turbo_autotuned_beta gauge"):
         assert line in b, f"metrics missing line: {line!r}"
@@ -4777,6 +4817,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_cor5_l1only_variant_purge(ng, origin)
     test_cache_and_purge_respect_access_control(ng)
     test_bypass(ng)
+    test_status_variable(ng)
     test_no_store(ng)
     test_native_cache_headers_stripped(ng)
     test_admin_purge_post_with_body(ng)
@@ -4961,7 +5002,7 @@ def main() -> int:
           "conditional 304 (v11: If-None-Match/*/mismatch, "
           "If-Modified-Since fresh/stale, INM-beats-IMS precedence), "
           "PURGE method, COR-5 auto-Vary variant purge (L1-only gen-bump), "
-          "bypass + no_store, "
+          "bypass + no_store, $cache_turbo_status (MISS/HIT/BYPASS + bypasses counter), "
           "native-cache headers stripped, "
           "admin purge w/ body, "
           "concurrency (R1), prometheus metrics (incl L2 hit/miss), "
