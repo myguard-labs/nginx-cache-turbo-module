@@ -19,6 +19,7 @@ A built-in page cache for nginx. Think of it as a tiny Varnish that lives
 - [The idea in 30 seconds](#the-idea-in-30-seconds)
 - [The tiers: L0 → L1 → L2](#the-tiers-l0--l1--l2)
 - [Mixing with nginx's native cache (`proxy_cache`)](#mixing-with-nginxs-native-cache-proxy_cache)
+  - [When to pick which](#when-to-pick-which)
 - [Quick start](#quick-start)
 - [What it will and won't cache](#what-it-will-and-wont-cache)
   - [Conditional requests (`304 Not Modified`)](#conditional-requests-304-not-modified)
@@ -62,6 +63,13 @@ The clever part is what happens when a copy gets **old**:
 
 That "serve old now, quietly refresh one copy" trick is called
 **stale-while-revalidate (SWR)**. It's the whole point.
+
+And when that background refresh **fails** — the origin returns a 5xx or times
+out — cache-turbo keeps the good copy and serves it instead of surfacing the
+error (**stale-if-error**), automatically, no config. An origin
+`Cache-Control: stale-if-error=N` extends that grace past the normal stale
+window (served as `X-Cache: STALE-IF-ERROR`). The one thing it can't do is
+shield a page it never cached, so warm critical URLs ahead of an outage.
 
 Optional extras: a shared **Redis** tier so a cluster of nginx boxes share one
 cache, tag-based purging, cache warming, and live auto-tuning.
@@ -157,6 +165,28 @@ location / {
 - **Rule of thumb:** don't double-cache the *same* content. Use cache-turbo for
   what benefits from shm speed + SWR + Redis L2 + tag purge; use `proxy_cache`
   for a huge on-disk corpus that won't fit in RAM.
+
+### When to pick which
+
+`proxy_cache` is a fine, battle-tested cache. The honest split:
+
+**cache-turbo wins on:** raw speed (RAM, access-phase — see
+[BENCHMARK.md](BENCHMARK.md), +23–37 % over `proxy_cache` on small/medium
+bodies); SWR + stale-if-error on by default (vs wrestling
+`proxy_cache_use_stale`); dogpile protection that spans a fleet via the Redis
+lock (not just per-box `proxy_cache_lock`); a **shared L2** so one box's fill
+warms the whole fleet; and tag purge, auto-Vary, CMS auto-classify + a
+JSON/Prometheus admin endpoint.
+
+**`proxy_cache` wins on:** being built into nginx (nothing to build/install);
+an **on-disk** store that survives a reload and holds far more than RAM
+(cache-turbo's L1 is shm, cleared on reload — the Redis L2 softens this);
+soaking a huge cold/long-tail corpus that shouldn't live in memory; and a
+decade more battle-testing.
+
+Short version: hot HTML + dynamic apps → cache-turbo; giant on-disk archive →
+`proxy_cache`; in doubt, **stack them** (cache-turbo L0 in RAM over a
+`proxy_cache` disk tier, as above).
 
 ## Quick start
 
