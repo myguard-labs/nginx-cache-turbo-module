@@ -173,16 +173,16 @@ location / {
 | | **cache-turbo** | **nginx `proxy_cache`** |
 |---|:---:|:---:|
 | **Store / phase** | shared memory, ACCESS phase | disk, content phase |
-| **Throughput** | ✅ **+23–37 %** small/medium ([bench](BENCHMARK.md)) | baseline |
-| **Stale-while-revalidate + stale-if-error** | ✅ on by default | ⚠️ manual (`proxy_cache_use_stale`) |
-| **Dogpile / single-flight** | ✅ per-box **and** cross-fleet (Redis lock) | per-box (`proxy_cache_lock`) |
-| **Shared / distributed cache** | ✅ Redis/memcached L2 across the fleet | ➖ per-box disk, every node cold alone |
-| **One config for php-fpm *and* APIs** | ✅ same directives (`fastcgi_pass` + `proxy_pass`) | ➖ separate `fastcgi_cache` / `proxy_cache` |
-| **Tag purge · auto-Vary · CMS auto-classify · Prometheus** | ✅ built in | ➖ — |
-| **Survives reload / restart** | ➖ shm cleared (Redis L2 softens) | ✅ persists on disk |
-| **Capacity** | bounded by RAM | ✅ huge on-disk corpus |
-| **Built into nginx** | ➖ dynamic module | ✅ yes, nothing to install |
-| **Maturity** | newer | ✅ a decade of edge cases |
+| **Throughput** | **+23–37 %** small/medium ([bench](BENCHMARK.md)) | baseline |
+| **Stale-while-revalidate + stale-if-error** | on by default | manual (`proxy_cache_use_stale`) |
+| **Dogpile / single-flight** | per-box **and** cross-fleet (Redis lock) | per-box (`proxy_cache_lock`) |
+| **Shared / distributed cache** | Redis/memcached L2 across the fleet | per-box disk, every node cold alone |
+| **One config for php-fpm *and* APIs** | same directives (`fastcgi_pass` + `proxy_pass`) | separate `fastcgi_cache` / `proxy_cache` |
+| **Tag purge · auto-Vary · CMS auto-classify · Prometheus** | built in | none |
+| **Survives reload / restart** | no — shm cleared (Redis L2 softens) | yes, persists on disk |
+| **Capacity** | bounded by RAM | huge on-disk corpus |
+| **Built into nginx** | no — dynamic module | yes, nothing to install |
+| **Maturity** | newer | a decade of edge cases |
 
 > **Pick:** hot HTML and dynamic apps → **cache-turbo**. A giant cold / long-tail
 > on-disk archive → **`proxy_cache`**. In doubt, **stack them** — cache-turbo as
