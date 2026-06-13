@@ -252,14 +252,6 @@ Hop-by-hop / framing headers (`Connection`, `Transfer-Encoding`,
 stripped before storing and rebuilt on the way out, so a cached response is
 still well-formed.
 
-> **Upgrading from a build older than the identity-capture fix:** those builds
-> stored the *compressed* body, which would replay encoding-blind on a HIT. L1
-> lives in shared memory and is cleared by any `nginx -s reload` / restart (which
-> a module upgrade requires anyway), so L1 self-clears. If you run the Redis/
-> memcached L2 tier, its copies persist across a reload and age out on their TTL
-> — flush it (`cache_turbo_admin` `?all=1`, or `FLUSHDB`) once after the upgrade
-> if you cache with long TTLs and want the change to take effect immediately.
-
 The `Date` is re-emitted as a **stable** timestamp for the cached
 representation (it does not advance on every hit), and an `Age` header reports
 how long the copy has been cached — the two stay mutually consistent (RFC 9111).
