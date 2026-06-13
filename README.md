@@ -14,6 +14,37 @@ A built-in page cache for nginx. Think of it as a tiny Varnish that lives
 > `libnginx-mod-http-cache-turbo` (nginx) / `angie-module-http-cache-turbo`
 > (Angie) — see [Building & the stack](#building--the-stack).
 
+## Contents
+
+- [The idea in 30 seconds](#the-idea-in-30-seconds)
+- [The tiers: L0 → L1 → L2](#the-tiers-l0--l1--l2)
+- [Mixing with nginx's native cache (`proxy_cache`)](#mixing-with-nginxs-native-cache-proxy_cache)
+- [Quick start](#quick-start)
+- [What it will and won't cache](#what-it-will-and-wont-cache)
+  - [Conditional requests (`304 Not Modified`)](#conditional-requests-304-not-modified)
+  - [Auto-Vary (read the response `Vary`)](#auto-vary-read-the-response-vary)
+- [CMS backends (`cache_turbo_backend`)](#cms-backends-cache_turbo_backend)
+  - [What each preset skips](#what-each-preset-skips)
+  - [Interactions and safety](#interactions-and-safety)
+- [The cache key](#the-cache-key)
+  - [Cache-key normalization](#cache-key-normalization)
+- [Presets (pick a vibe, skip the knobs)](#presets-pick-a-vibe-skip-the-knobs)
+- [Microcaching (1-second TTL for APIs and PHP-FPM)](#microcaching-1-second-ttl-for-apis-and-php-fpm)
+- [What autotune actually tunes](#what-autotune-actually-tunes)
+- [Full example (the works)](#full-example-the-works)
+  - [Using the control panel](#using-the-control-panel)
+- [Every directive in one place (full syntax)](#every-directive-in-one-place-full-syntax)
+  - [Mutually exclusive / interacting directives](#mutually-exclusive--interacting-directives)
+- [Directive synopsis](#directive-synopsis)
+  - [Variables](#variables)
+  - [Admin endpoint verbs](#admin-endpoint-verbs)
+- [Monitoring (Prometheus + Grafana)](#monitoring-prometheus--grafana)
+- [Redis L2 (shared cache)](#redis-l2-shared-cache)
+  - [memcached L2 (alternative backend)](#memcached-l2-alternative-backend)
+- [Building & the stack](#building--the-stack)
+- [Benchmarking](#benchmarking)
+- [License](#license)
+
 ## The idea in 30 seconds
 
 Your backend (PHP, Node, whatever) is slow. The same pages get requested over
@@ -228,6 +259,7 @@ still well-formed.
 > memcached L2 tier, its copies persist across a reload and age out on their TTL
 > — flush it (`cache_turbo_admin` `?all=1`, or `FLUSHDB`) once after the upgrade
 > if you cache with long TTLs and want the change to take effect immediately.
+
 The `Date` is re-emitted as a **stable** timestamp for the cached
 representation (it does not advance on every hit), and an `Age` header reports
 how long the copy has been cached — the two stay mutually consistent (RFC 9111).
@@ -365,6 +397,21 @@ Set your own with `cache_turbo_key` using any nginx variables:
 
 ```nginx
 cache_turbo_key $scheme$host$uri$is_args$args;
+```
+
+### Cache-key normalization
+
+`$cache_turbo_normalized_args` rebuilds the query string so equivalent requests
+share one slot: it sorts args (`?b=2&a=1` == `?a=1&b=2`) and drops tracking
+params (built-in denylist: `utm_*`, `fbclid`, `gclid`, `msclkid`, `mc_eid`,
+`_ga`, `ref`, `sid`, `sessionid`, `tmp_*`). Add more with
+`cache_turbo_normalize_strip`, or nuke them all
+with `cache_turbo_normalize_strip_all on`.
+
+```nginx
+cache_turbo_key             $host$uri$cache_turbo_normalized_args;
+cache_turbo_normalize_strip sid sessionid "tmp_*";
+cache_turbo_normalize_vary  encoding device;   # keep gzip≠brotli, mobile≠desktop
 ```
 
 ## Presets (pick a vibe, skip the knobs)
@@ -866,21 +913,6 @@ stays L1-only). Use Redis if you need tags or cluster-wide dogpile protection;
 use memcached if you already run one and want a simple shared object tier.
 `cache_turbo_redis` and `cache_turbo_memcached` are mutually exclusive in the
 same block.
-
-## Cache-key normalization
-
-`$cache_turbo_normalized_args` rebuilds the query string so equivalent requests
-share one slot: it sorts args (`?b=2&a=1` == `?a=1&b=2`) and drops tracking
-params (built-in denylist: `utm_*`, `fbclid`, `gclid`, `msclkid`, `mc_eid`,
-`_ga`, `ref`, `sid`, `sessionid`, `tmp_*`). Add more with
-`cache_turbo_normalize_strip`, or nuke them all
-with `cache_turbo_normalize_strip_all on`.
-
-```nginx
-cache_turbo_key             $host$uri$cache_turbo_normalized_args;
-cache_turbo_normalize_strip sid sessionid "tmp_*";
-cache_turbo_normalize_vary  encoding device;   # keep gzip≠brotli, mobile≠desktop
-```
 
 ## Building & the stack
 
