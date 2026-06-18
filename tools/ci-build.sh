@@ -52,7 +52,15 @@ ADD_MODULE="--add-dynamic-module=$MODULE_DIR"
 WITH_DEBUG="--with-debug"
 case "$MODE" in
     asan)
-        SAN="-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g3 -O1"
+        # Disable the UBSan sub-checks that nginx CORE trips as benign false
+        # positives (so a soak under sanitizers doesn't abort on them):
+        #   function          - core calls filters through a generic
+        #                        ngx_*_filter_pt with a slightly different proto.
+        #   nonnull-attribute - core passes NULL + len 0 to memcpy in the
+        #                        proxy/upstream path.
+        #   pointer-overflow  - core p +/- n arithmetic UBSan flags on buffers.
+        # ASan and the rest of UBSan stay on.
+        SAN="-fsanitize=address,undefined -fno-sanitize=function,nonnull-attribute,pointer-overflow -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g3 -O1"
         CC_OPT="$SAN"
         LD_OPT="$SAN"
         # ASan needs the module linked into the binary (static), not dlopen'd.

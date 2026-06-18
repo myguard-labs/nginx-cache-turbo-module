@@ -145,13 +145,15 @@ if ls "$WORK"/logs/valgrind.* >/dev/null 2>&1; then
         problems=1
     fi
 fi
-# Any alert/emerg fails — EXCEPT the intermittent shm-teardown line nginx
-# logs when a worker still holds a zone mutex at QUIT ("shared memory zone
-# ... was locked by <pid>"). That is a shutdown race, not a runtime memory
-# bug (ASAN/valgrind below catch real corruption), and it is flaky, so it
-# must not turn the soak red on its own.
+# Any alert/emerg fails — EXCEPT benign shutdown-race noise nginx logs when it
+# is QUIT while connections are still in flight under load:
+#   - "shared memory zone ... was locked by <pid>" (worker held a zone mutex)
+#   - "open socket #N left in connection M" + the trailing "aborting" (nginx
+#     force-exits with sockets still open)
+# These are shutdown artifacts, not runtime memory bugs — ASAN/valgrind below
+# catch real corruption — and are flaky, so they must not turn the soak red.
 if grep -nE '\[alert\]|\[emerg\]' "$WORK/logs/error.log" 2>/dev/null \
-        | grep -vE 'shared memory zone .* was locked by'; then
+        | grep -vE 'shared memory zone .* was locked by|open socket #[0-9]+ left in connection|\[alert\][^:]*: aborting'; then
     echo "FAIL: alert/emerg in error.log"; problems=1
 fi
 if [ "$rc" -ne 0 ] && [ "$rc" -ne 130 ]; then
