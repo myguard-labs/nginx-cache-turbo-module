@@ -59,8 +59,14 @@ case "$MODE" in
         #   nonnull-attribute - core passes NULL + len 0 to memcpy in the
         #                        proxy/upstream path.
         #   pointer-overflow  - core p +/- n arithmetic UBSan flags on buffers.
-        # ASan and the rest of UBSan stay on.
-        SAN="-fsanitize=address,undefined -fno-sanitize=function,nonnull-attribute,pointer-overflow -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g3 -O1"
+        # ASan and the rest of UBSan stay on. These -fno-sanitize sub-check
+        # names are clang-specific; gcc's configure rejects nonnull-attribute/
+        # pointer-overflow. Only add them under clang (the local soak path);
+        # gcc keeps plain -fsanitize (CI was green, gcc doesn't trip these FPs).
+        SAN="-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g3 -O1"
+        if "${CC:-cc}" --version 2>/dev/null | grep -qi clang; then
+            SAN="-fsanitize=address,undefined -fno-sanitize=function,nonnull-attribute,pointer-overflow -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g3 -O1"
+        fi
         CC_OPT="$SAN"
         LD_OPT="$SAN"
         # ASan needs the module linked into the binary (static), not dlopen'd.
