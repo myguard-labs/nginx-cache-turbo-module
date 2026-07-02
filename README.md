@@ -1,10 +1,10 @@
 # nginx-cache-turbo-module
 
-[![Build & Test](https://github.com/eilandert/nginx-cache-turbo-module/actions/workflows/build-test.yml/badge.svg)](https://github.com/eilandert/nginx-cache-turbo-module/actions/workflows/build-test.yml)
-[![CodeQL](https://github.com/eilandert/nginx-cache-turbo-module/actions/workflows/codeql.yml/badge.svg)](https://github.com/eilandert/nginx-cache-turbo-module/actions/workflows/codeql.yml)
-[![Security Scanners](https://github.com/eilandert/nginx-cache-turbo-module/actions/workflows/security-scanners.yml/badge.svg)](https://github.com/eilandert/nginx-cache-turbo-module/actions/workflows/security-scanners.yml)
-[![Fuzzing](https://github.com/eilandert/nginx-cache-turbo-module/actions/workflows/fuzzing.yml/badge.svg)](https://github.com/eilandert/nginx-cache-turbo-module/actions/workflows/fuzzing.yml)
-[![Valgrind](https://github.com/eilandert/nginx-cache-turbo-module/actions/workflows/valgrind.yml/badge.svg)](https://github.com/eilandert/nginx-cache-turbo-module/actions/workflows/valgrind.yml)
+[![Build & Test](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/build-test.yml/badge.svg)](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/build-test.yml)
+[![CodeQL](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/codeql.yml/badge.svg)](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/codeql.yml)
+[![Security Scanners](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/security-scanners.yml/badge.svg)](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/security-scanners.yml)
+[![Fuzzing](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/fuzzing.yml/badge.svg)](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/fuzzing.yml)
+[![Valgrind](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/valgrind.yml/badge.svg)](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/valgrind.yml)
 
 A built-in page cache for nginx. Think of it as a tiny Varnish that lives
 **inside** nginx — no extra daemon, no second port, no Lua.
