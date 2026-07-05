@@ -1,0 +1,15 @@
+# libFuzzer dictionary for the memcached GET reply parser (fuzz_mc_parser).
+# memcached text-protocol reply verbs + framing. Whitespace HEX-escaped
+# (\x20 space, \x0d\x0a CRLF) — libFuzzer rejects literal \t/\n/\r.
+value="VALUE"
+end="END\x0d\x0a"
+stored="STORED\x0d\x0a"
+error="ERROR\x0d\x0a"
+crlf="\x0d\x0a"
+sp="\x20"
+value_line="VALUE\x20k\x20"
+flags0="\x200\x20"
+bytes="\x203\x0d\x0a"
+cas="\x20123\x0d\x0a"
+zero="0"
+big="9999999999"
