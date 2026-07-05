@@ -255,6 +255,29 @@ class Origin:
                     # RFC 9111 must-revalidate: 1s fresh, then NO stale serving.
                     self.send_header("Cache-Control",
                                      "max-age=1, must-revalidate")
+                if "cdnttl" in self.path:
+                    # RFC 9213: CDN-Cache-Control (edge TTL) must OUTRANK the
+                    # browser-facing Cache-Control. CC says 60s fresh, CDN-CC says
+                    # 1s — the shared cache must honour the 1s.
+                    self.send_header("Cache-Control", "public, max-age=60")
+                    self.send_header("CDN-Cache-Control", "max-age=1")
+                if "scttl" in self.path:
+                    # RFC 9213: Surgrogate-Control outranks BOTH CDN-CC and CC.
+                    # SC=1s wins over CDN-CC=60s and CC=60s.
+                    self.send_header("Cache-Control", "public, max-age=60")
+                    self.send_header("CDN-Cache-Control", "max-age=60")
+                    self.send_header("Surrogate-Control", "max-age=1")
+                if "cdnnostore" in self.path:
+                    # RFC 9213: a targeted no-store must veto the shared store even
+                    # when plain Cache-Control would permit it (max-age=60).
+                    self.send_header("Cache-Control", "public, max-age=60")
+                    self.send_header("CDN-Cache-Control", "no-store")
+                if "cdnstrip" in self.path:
+                    # cacheable, carries both targeted headers: the served HIT must
+                    # NOT replay them downstream (we are their intended consumer).
+                    self.send_header("Cache-Control", "public, max-age=60")
+                    self.send_header("CDN-Cache-Control", "max-age=30")
+                    self.send_header("Surrogate-Control", "max-age=30")
                 if "ccpad" in self.path:
                     # leading-zero max-age: precise token parse must read this as
                     # 1000s fresh (cacheable), NOT trip the substring "max-age=0".
@@ -2276,6 +2299,64 @@ def test_honor_cache_control(ng: Nginx) -> None:
     assert h2.get("x-cache") == "STALE", \
         ("honor_cache_control: entry should be STALE at 2s (max-age=1 < 60s), "
          f"got {h2.get('x-cache')}")
+
+
+def test_cdn_cache_control_ttl_outranks_cache_control(ng: Nginx) -> None:
+    """RFC 9213: CDN-Cache-Control sets the shared-cache TTL and must OUTRANK the
+    browser-facing Cache-Control. Origin: CC max-age=60, CDN-CC max-age=1 (via the
+    /cc7/ honor location). The entry must be STALE at ~2s (the 1s CDN TTL won),
+    not fresh (which the 60s CC would give)."""
+    _, _, h0 = fetch(ng.port, "/cc7/cdnttl")
+    assert "x-cache" not in h0, "first should miss"
+    _, _, h1 = fetch(ng.port, "/cc7/cdnttl")
+    assert h1.get("x-cache") == "HIT", "second should be a fresh HIT (<1s)"
+    time.sleep(2.0)                               # past CDN max-age=1, within stale
+    _, _, h2 = fetch(ng.port, "/cc7/cdnttl")
+    assert h2.get("x-cache") == "STALE", \
+        ("CDN-Cache-Control max-age=1 must outrank Cache-Control max-age=60: "
+         f"entry should be STALE at 2s, got {h2.get('x-cache')}")
+
+
+def test_surrogate_control_ttl_outranks_cdn_and_cache_control(ng: Nginx) -> None:
+    """RFC 9213: Surrogate-Control (Fastly/Akamai) is the highest-priority TTL
+    source, above CDN-Cache-Control and Cache-Control. Origin: SC max-age=1,
+    CDN-CC max-age=60, CC max-age=60. STALE at ~2s proves SC's 1s won."""
+    _, _, h0 = fetch(ng.port, "/cc7/scttl")
+    assert "x-cache" not in h0, "first should miss"
+    _, _, h1 = fetch(ng.port, "/cc7/scttl")
+    assert h1.get("x-cache") == "HIT", "second should be a fresh HIT (<1s)"
+    time.sleep(2.0)
+    _, _, h2 = fetch(ng.port, "/cc7/scttl")
+    assert h2.get("x-cache") == "STALE", \
+        ("Surrogate-Control max-age=1 must outrank CDN-CC=60 and CC=60: entry "
+         f"should be STALE at 2s, got {h2.get('x-cache')}")
+
+
+def test_cdn_cache_control_no_store_refuses(ng: Nginx) -> None:
+    """RFC 9213: a targeted CDN-Cache-Control: no-store must veto the shared store
+    even though plain Cache-Control (max-age=60) would permit it. The /cc7/ honor
+    location reads both; the response must never become a HIT."""
+    _, _, h0 = fetch(ng.port, "/cc7/cdnnostore")
+    assert "x-cache" not in h0, "first should miss"
+    _, _, h1 = fetch(ng.port, "/cc7/cdnnostore")
+    assert "x-cache" not in h1, \
+        ("CDN-Cache-Control: no-store must refuse the shared store despite "
+         f"Cache-Control max-age=60, got X-Cache={h1.get('x-cache')}")
+
+
+def test_targeted_cache_control_stripped_from_serve(ng: Nginx) -> None:
+    """RFC 9213: the shared cache is the intended consumer of CDN-Cache-Control /
+    Surrogate-Control, so they must be stripped before store and never replayed to
+    a downstream client on a HIT (same as the Age strip). Origin sends both on a
+    cacheable response; the cached HIT must carry neither."""
+    _, _, h0 = fetch(ng.port, "/cc7/cdnstrip")
+    assert "x-cache" not in h0, "first should miss"
+    _, _, h1 = fetch(ng.port, "/cc7/cdnstrip")
+    assert h1.get("x-cache") == "HIT", f"second should be a HIT, got {h1}"
+    assert "cdn-cache-control" not in h1, \
+        "CDN-Cache-Control must be stripped from the served HIT"
+    assert "surrogate-control" not in h1, \
+        "Surrogate-Control must be stripped from the served HIT"
 
 
 def test_age_header(ng: Nginx) -> None:
@@ -4946,6 +5027,10 @@ def run_all(ng: Nginx, origin: Origin,
     test_cache_negative_404(ng)
     test_head_not_stored(ng)
     test_honor_cache_control(ng)
+    test_cdn_cache_control_ttl_outranks_cache_control(ng)   # RFC 9213
+    test_surrogate_control_ttl_outranks_cdn_and_cache_control(ng)  # RFC 9213
+    test_cdn_cache_control_no_store_refuses(ng)             # RFC 9213
+    test_targeted_cache_control_stripped_from_serve(ng)     # RFC 9213
     test_age_header(ng)
     test_request_no_cache(ng, origin)
     test_must_revalidate(ng)
@@ -5163,6 +5248,8 @@ def main() -> int:
           "not cached), default-key Host split, "
           "per-status caching (301/404 cached, HEAD not stored), "
           "honor upstream Cache-Control, "
+          "RFC 9213 targeted cache-control (CDN-CC/Surrogate-Control TTL "
+          "precedence + no-store veto + stripped from serve), "
           "valid 0 = forever (fresh HIT, not instant-stale), "
           "Accept-Encoding q-value (gzip;q=0 != gzip bucket), "
           "auto-Vary unknown-axis uncacheable, "

@@ -194,6 +194,52 @@ location / {
 > genuinely safe (the backend sees ~one request per second per key, not a
 > stampede).
 
+## Behind a CDN / multi-tier caching
+
+When cache-turbo runs as a **shared cache behind a CDN** (Cloudflare, Fastly,
+Akamai …), the origin often needs *three* different TTLs: one for the browser,
+one for the CDN edge, and one for this shared cache. Plain `Cache-Control` can
+only carry two (`max-age` for private caches, `s-maxage` for shared). RFC 9213
+adds **targeted** cache-control headers for exactly this, and with
+`cache_turbo_cache_control honor` cache-turbo reads them at a **higher priority
+than `Cache-Control`**:
+
+| Priority | Header | Emitted by | TTL token |
+|:---:|---|---|---|
+| 1 (highest) | `Surrogate-Control` | Fastly, Akamai | `max-age` |
+| 2 | `CDN-Cache-Control` | Cloudflare (RFC 9213) | `s-maxage` > `max-age` |
+| 3 | `Cache-Control` | everyone | `s-maxage` > `max-age` |
+| 4 (lowest) | `Expires` | legacy | absolute date |
+
+So an origin can say:
+
+```http
+Cache-Control: max-age=60          # browser: 60s
+CDN-Cache-Control: max-age=600     # this shared cache (and the CDN): 10 min
+Surrogate-Control: max-age=3600    # Fastly edge specifically: 1 h
+```
+
+and cache-turbo stores it for **1 hour** (the `Surrogate-Control` value),
+ignoring the 60s browser TTL. Semantics:
+
+- **TTL precedence** — the highest-priority present header wins (table above).
+  Only active under `cache_turbo_cache_control honor`.
+- **`no-store` veto** — a targeted `no-store`/`private`/`max-age=0` refuses the
+  shared store the same way a plain `Cache-Control: no-store` does. An origin can
+  therefore keep a page out of *this* cache while still letting the browser cache
+  it.
+- **Stripped before store** — both targeted headers are removed before the entry
+  is stored (like `Age`), so a cached **HIT never replays them downstream** to
+  the browser or a next cache tier — you (the shared cache) are their intended
+  consumer.
+- **`ignore` mode** — `cache_turbo_cache_control ignore` discards the targeted
+  variants too, alongside `Cache-Control`.
+
+> **See also:** [`cache_turbo_cache_control`](#directives) for the full honor/
+> respect/ignore semantics, and [Mixing with nginx's native
+> cache](#mixing-with-nginxs-native-cache-proxy_cache) for stacking with
+> `proxy_cache`.
+
 ## Quick start
 
 ```nginx
@@ -784,7 +830,7 @@ http {
 | `cache_turbo_bypass VAR...` | `server`, `location` | — | If any variable is non-empty and not `0`, skip the cache lookup (go to origin) — but still store the fresh response. E.g. `cache_turbo_bypass $cookie_session $arg_nocache;` to always revalidate logged-in users. |
 | `cache_turbo_no_store VAR...` | `server`, `location` | — | If any variable is non-empty and not `0`, do **not** store the response. E.g. `cache_turbo_no_store $cookie_session;`. |
 | `cache_turbo_purge on` | `server`, `location` | `off` | Allow a `PURGE <uri>` request to drop that URI's entry from L1 (+L2). Gate the location with `allow`/`deny`. E.g. `curl -X PURGE http://host/blog/post-42`. |
-| `cache_turbo_cache_control respect\|honor\|ignore` | `server`, `location` | `respect` | How the response `Cache-Control` is treated. **respect** (default): it gates storage and reshapes the stale window as written; the fresh TTL comes from `cache_turbo_valid`. **honor**: also take the fresh TTL from the response's own `s-maxage`/`max-age` (s-maxage wins) or `Expires`, falling back to `cache_turbo_valid` when absent. **ignore**: discard the response `Cache-Control` **entirely** (mirror of nginx's `proxy_ignore_headers Cache-Control`) — `no-store`/`no-cache`/`private`/`max-age=0`/`s-maxage=0` no longer forbid storage, `must-revalidate`/`proxy-revalidate`/`stale-while-revalidate=N`/`stale-if-error=N` no longer reshape the window (it stays `cache_turbo_valid` × `cache_turbo_stale_mult`), and the TTL comes from `cache_turbo_valid`; use it for an origin that blankets shareable pages with `max-age=0, must-revalidate`. The `Set-Cookie` and request-`Authorization` safety floors are **not** affected by any mode — a per-user response is still never cached. A CMS preset (`cache_turbo_backend`) defaults this to `honor`. |
+| `cache_turbo_cache_control respect\|honor\|ignore` | `server`, `location` | `respect` | How the response `Cache-Control` is treated. **respect** (default): it gates storage and reshapes the stale window as written; the fresh TTL comes from `cache_turbo_valid`. **honor**: also take the fresh TTL from the response's own freshness headers, in RFC 9213 precedence order — `Surrogate-Control: max-age` (Fastly/Akamai) > `CDN-Cache-Control: s-maxage`/`max-age` (Cloudflare) > `Cache-Control: s-maxage`/`max-age` > `Expires` — falling back to `cache_turbo_valid` when none is present. The two **targeted** headers let an origin hand this shared cache a different TTL than the browser's `Cache-Control`; a targeted `no-store`/`private`/`max-age=0` also vetoes storage, and both targeted headers are stripped before store so they never replay downstream (see [Behind a CDN / multi-tier caching](#behind-a-cdn--multi-tier-caching)). **ignore**: discard the response `Cache-Control` **entirely** (mirror of nginx's `proxy_ignore_headers Cache-Control`) — `no-store`/`no-cache`/`private`/`max-age=0`/`s-maxage=0` no longer forbid storage, `must-revalidate`/`proxy-revalidate`/`stale-while-revalidate=N`/`stale-if-error=N` no longer reshape the window (it stays `cache_turbo_valid` × `cache_turbo_stale_mult`), and the TTL comes from `cache_turbo_valid`; use it for an origin that blankets shareable pages with `max-age=0, must-revalidate`. The `Set-Cookie` and request-`Authorization` safety floors are **not** affected by any mode — a per-user response is still never cached. A CMS preset (`cache_turbo_backend`) defaults this to `honor`. |
 | `cache_turbo_background_update on` / `off` | `server`, `location` | `on` | The stale-while-revalidate behaviour. **On** (default): a stale page is served *immediately* while one request quietly refreshes it in the background — **nobody waits on the backend**, and if that refresh hits a 5xx/timeout the old copy is left untouched and keeps being served (**stale-if-error**). **Off**: the chosen refresher regenerates inline (it waits for the backend and serves the fresh body), the pre-SWR behaviour. |
 | `cache_turbo_autotune on` | `server`, `location` | `off` | Adapt to live backend load. Auto-picks `beta` from the measured regen latency (clamped to the preset's band) **and**, under sustained load, widens two knobs by a load factor (≤4×): the **serveable stale window** (serve stale longer before a hard miss) and the **single-flight `lock_ttl`** (collapse more requests onto one regen). The **fresh** TTL is never touched — the freshness contract you set is unchanged; only the best-effort stale grace and dogpile window stretch, and they snap back the first quiet window. Recomputes on a fixed 30s cadence. See [What autotune does](#what-autotune-actually-tunes). |
 | `cache_turbo_redis DSN [opts...]` | `http`, `server`, `location` | — | Add a shared **L2 Redis** tier. `DSN` is `redis://[user:pass@]host:port/db` (or bare `host:port`); `rediss://` = TLS. Write-through on store; one sync `GET` on an L1 miss (never on an L1 hit). Opts: `prefix=` (`ct:`, must be non-empty), `timeout=` (`250ms`), `password=`, `user=`, `db=`, `tls=on\|off`, `tls_verify=on\|off` (default on), `tls_ca=<file>`, `tls_name=<host>`, `keepalive=N` (idle conns to pool per worker, `0`=off), `keepalive_timeout=` (`60s`). Pooled conns are reused only within the same db/credentials/TLS context. Native client, no hiredis. |
