@@ -39,8 +39,17 @@ head -c 4000000 /dev/urandom | base64 > "$WORK/html/large"
 
 # Small zone + short valid + background_update so eviction and the
 # stale-while-revalidate cycle both fire many times over the soak.
+# When the module was built as a dynamic .so (ci-build.sh debug/nginx modes),
+# point MODULE=<path/to/ngx_http_cache_turbo_module.so> and it is load_module'd.
+# A statically linked build (asan mode) leaves MODULE empty — nothing to load.
+LOAD_MODULE=""
+if [ -n "${MODULE:-}" ]; then
+    LOAD_MODULE="load_module ${MODULE};"
+fi
+
 cat > "$WORK/conf/nginx.conf" <<EOF
 daemon off;
+${LOAD_MODULE}
 master_process on;
 worker_processes 2;
 error_log $WORK/logs/error.log info;

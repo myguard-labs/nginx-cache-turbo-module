@@ -145,8 +145,9 @@ jobs:
         env:
           USE_VALGRIND: "1"
         run: |
-          bash tools/soak.sh \
-            "$GITHUB_WORKSPACE/.build/nginx-${NGINX_VERSION}/objs/nginx" 600 4
+          B="$GITHUB_WORKSPACE/.build/nginx-${NGINX_VERSION}/objs"
+          MODULE="$B/ngx_http_cache_turbo_module.so" \
+            bash tools/soak.sh "$B/nginx" 600 4
       - name: Notify Discord on failure
         if: failure() && github.event_name == 'schedule'
         env:
@@ -185,8 +186,9 @@ jobs:
         env:
           USE_HELGRIND: "1"
         run: |
-          bash tools/soak.sh \
-            "$GITHUB_WORKSPACE/.build/nginx-${NGINX_VERSION}/objs/nginx" 600 4
+          B="$GITHUB_WORKSPACE/.build/nginx-${NGINX_VERSION}/objs"
+          MODULE="$B/ngx_http_cache_turbo_module.so" \
+            bash tools/soak.sh "$B/nginx" 600 4
       - name: Notify Discord on failure
         if: failure() && github.event_name == 'schedule'
         env:
