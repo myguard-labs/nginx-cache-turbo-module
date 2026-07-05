@@ -590,6 +590,30 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
         }}
 """
 
+    # Backend-inheritance regression (precedence bug FIXED 2026-06-12): a parent
+    # location naming cache_turbo_memcached (memcached=1) enclosing a child that
+    # names cache_turbo_redis. The child MUST drive its own address with the Redis
+    # backend, not inherit the parent's memcached=1 (the merge would otherwise
+    # select the memcached driver for a redis:// address). Needs BOTH L2 servers.
+    mcinh_loc = ""
+    if memcached_port is not None and redis_port is not None:
+        mcinh_loc = f"""
+        location /mcinh/ {{
+            cache_turbo            main;
+            cache_turbo_key        $uri;
+            cache_turbo_valid      30s;
+            cache_turbo_memcached  127.0.0.1:{memcached_port} prefix=mc: timeout=250ms;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+
+            # child overrides the parent's memcached backend with Redis
+            location /mcinh/child/ {{
+                cache_turbo_redis  127.0.0.1:{redis_port} prefix=ct: timeout=250ms;
+                proxy_pass http://127.0.0.1:{origin_port}/;
+            }}
+        }}
+"""
+    mc_loc += mcinh_loc
+
     return f"""{load}worker_processes {workers};
 pid {root}/nginx.pid;
 error_log {root}/logs/error.log notice;
@@ -4844,6 +4868,51 @@ def test_l2_memcached_purge_key_drops_l2(ng: Nginx, origin: Origin,
     assert body_b != body_a, "post-purge body should be a fresh generation"
 
 
+def test_l2_backend_inheritance_child_redis_over_parent_memcached(
+        ng: Nginx, origin: Origin, redis: RedisServer,
+        mc: MemcachedServer) -> None:
+    """Precedence regression (bug FIXED 2026-06-12): a child location naming
+    cache_turbo_redis, enclosed by a parent naming cache_turbo_memcached, must
+    drive its OWN address with the Redis backend — not inherit the parent's
+    memcached=1 at merge (which would select the memcached driver for a redis://
+    address). The redis directive pins memcached=0 for this reason; this locks it.
+
+    Assertion: a store under the child writes through to REDIS (ct: key) and NOT
+    to memcached (mc: key). If the fix regressed, the blob would land in memcached
+    (parent's inherited backend) and the Redis key would never appear."""
+    uri = "/mcinh/child/store"
+    r_key = l2_key(uri, prefix="ct:")   # where it must land (child = Redis)
+    m_key = l2_key(uri, prefix="mc:")   # where it must NOT land (parent memcached)
+    redis.cli("DEL", r_key)
+    mc.command(b"delete " + m_key.encode() + b"\r\n")
+
+    s, body, h = fetch(ng.port, uri)               # miss -> origin -> store
+    assert s == 200, f"child store status {s}"
+    assert "x-cache" not in h, "first request should be a miss"
+
+    # write-through is async; the child's own (Redis) backend must receive it
+    assert wait_for(lambda: redis.cli("EXISTS", r_key) == "1"), \
+        f"child cache_turbo_redis store never reached Redis ({r_key}) — the child " \
+        "likely inherited the parent's memcached backend (precedence regression)"
+    # and the parent's memcached backend must stay untouched by the child
+    assert not mc.exists(m_key), \
+        f"child store leaked into the parent's memcached backend ({m_key})"
+
+    # sanity: the parent location itself still uses memcached (not poisoned by
+    # the child's redis override the other way around)
+    puri = "/mcinh/parent-x"
+    pm_key = l2_key(puri, prefix="mc:")
+    pr_key = l2_key(puri, prefix="ct:")
+    redis.cli("DEL", pr_key)
+    mc.command(b"delete " + pm_key.encode() + b"\r\n")
+    ps, _, ph = fetch(ng.port, puri)
+    assert ps == 200 and "x-cache" not in ph, "parent prime should miss"
+    assert wait_for(lambda: mc.exists(pm_key)), \
+        "parent cache_turbo_memcached store never reached memcached"
+    assert redis.cli("EXISTS", pr_key) == "0", \
+        "parent store leaked into Redis (backend identity crossed)"
+
+
 def run_all(ng: Nginx, origin: Origin,
             redis: RedisServer | None = None,
             redis_auth: RedisServer | None = None,
@@ -4997,6 +5066,10 @@ def run_all(ng: Nginx, origin: Origin,
         test_l2_memcached_write_through(ng, origin, mc)        # v13
         test_l2_memcached_cross_instance_fill(ng, origin, mc)  # v13
         test_l2_memcached_purge_key_drops_l2(ng, origin, mc)   # v13
+        if redis is not None:
+            # child redis over parent memcached — precedence regression lock
+            test_l2_backend_inheritance_child_redis_over_parent_memcached(
+                ng, origin, redis, mc)
     # PERF-7 zero-copy serve stress: run LAST among L1 tests — its 48-thread /
     # 4000-request eviction churn keeps the workers busy, so placing it before a
     # timing-sensitive test (e.g. stale-if-error's ~0.8s bg-refresh window) can
@@ -5137,7 +5210,9 @@ def main() -> int:
           + (", rediss:// TLS + verify (v5), TLS keepalive reuse (v15-2)"
              if redis_tls else "")
           + (", memcached L2 (v13: write-through, cross-instance fill, "
-             "key purge)" if memcached_port else ""))
+             "key purge)" if memcached_port else "")
+          + (", backend-inheritance (child redis over parent memcached)"
+             if (memcached_port and redis_port) else ""))
     return 0
 
 
