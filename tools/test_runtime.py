@@ -2988,7 +2988,13 @@ def test_stale_if_error(ng: Nginx, origin: Origin) -> None:
             assert h.get("x-cache") == "STALE", \
                 f"expected STALE serve, got x-cache={h.get('x-cache')}"
             time.sleep(0.1)
-        # the background refresh did reach the (failing) origin at least once
+        # the background refresh did reach the (failing) origin at least once.
+        # bg-refresh is async; under a loaded (valgrind ×2) runner it can lag the
+        # 0.8s serve loop, so poll to a generous deadline instead of asserting once.
+        deadline = time.monotonic() + 5.0
+        while origin.hits <= base and time.monotonic() < deadline:
+            fetch(ng.port, "/sie/x")   # keep prodding the stale entry
+            time.sleep(0.1)
         assert origin.hits > base, \
             "no background refresh reached the origin during the stale window"
     finally:
@@ -3025,7 +3031,12 @@ def test_stale_serves_stale_origin_hard_dead(ng: Nginx, origin: Origin) -> None:
             assert h.get("x-cache") == "STALE", \
                 f"expected STALE serve, got x-cache={h.get('x-cache')}"
             time.sleep(0.1)
-        # the background refresh did reach the dropped-connection origin
+        # the background refresh did reach the dropped-connection origin. async +
+        # loaded runner can lag the serve loop → poll to a deadline, not once.
+        deadline = time.monotonic() + 5.0
+        while origin.hits <= base and time.monotonic() < deadline:
+            fetch(ng.port, "/sie/x2")
+            time.sleep(0.1)
         assert origin.hits > base, \
             "no background refresh reached the origin during the stale window"
     finally:
