@@ -1,0 +1,17 @@
+# libFuzzer dictionary for the RESP reply parser (fuzz_resp_parser).
+# RESP type prefixes, CRLF, and bulk/array framing tokens. Whitespace is
+# HEX-escaped (\x0d \x0a) — libFuzzer's ParseDictionaryFile rejects \r/\n.
+crlf="\x0d\x0a"
+bulk="$"
+array="*"
+integer=":"
+simple="+"
+error="-"
+nil="$-1\x0d\x0a"
+empty_array="*0\x0d\x0a"
+neg_array="*-1\x0d\x0a"
+bulk3="$3\x0d\x0a"
+str_ok="+OK\x0d\x0a"
+zero="0"
+big="9999999999"
+scan_cursor="*2\x0d\x0a$1\x0d\x0a0\x0d\x0a"

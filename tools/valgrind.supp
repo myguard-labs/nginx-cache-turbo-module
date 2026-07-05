@@ -1,0 +1,23 @@
+# Valgrind leak suppressions for nginx CORE allocations that are intentionally
+# never freed when nginx runs to exit (especially in --single-process mode used
+# by the CI soak jobs). These are nginx's own arenas, not this module — each
+# suppression is pinned to the specific nginx core frame so a real leak in the
+# module (which always carries an ngx_http_cache_turbo_* frame) is never hidden.
+
+{
+   nginx-set-environment-not-freed-at-exit
+   Memcheck:Leak
+   match-leak-kinds: definite,indirect
+   fun:malloc
+   fun:ngx_alloc
+   fun:ngx_set_environment
+}
+
+{
+   nginx-event-process-init-arena-not-freed-at-exit
+   Memcheck:Leak
+   match-leak-kinds: definite,indirect
+   fun:malloc
+   fun:ngx_alloc
+   fun:ngx_event_process_init
+}
