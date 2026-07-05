@@ -876,21 +876,58 @@ ngx_http_cache_turbo_header_find(ngx_list_t *headers, const char *name,
 
 /*
  * Fresh TTL derived from the response's own freshness headers (v7), or -1 if it
- * carries none. Cache-Control s-maxage wins over max-age; otherwise Expires
- * (absolute) minus now. A past Expires / a parse miss clamps to 0 (store but
- * immediately stale). no-store/private/max-age=0 are already refused upstream by
- * response_cacheable, so they never reach here.
+ * carries none. Priority ladder (highest first):
+ *   1. Surrogate-Control: max-age    (Fastly/Akamai, RFC 9213)
+ *   2. CDN-Cache-Control: s-maxage/max-age   (Cloudflare, RFC 9213 §2)
+ *   3. Cache-Control: s-maxage > max-age
+ *   4. Expires (absolute) minus now.
+ * The targeted headers (1,2) exist precisely so an origin can hand the edge /
+ * shared cache a DIFFERENT TTL than the browser's Cache-Control — we are that
+ * shared cache, so they outrank plain Cache-Control here. They share the same
+ * "<token>=<delta>" grammar as Cache-Control, so cc_delta parses them directly.
+ * A past Expires / a parse miss clamps to 0 (store but immediately stale).
+ * no-store/private/max-age=0 (incl. the targeted variants) are already refused
+ * upstream by response_cacheable, so they never reach here. Only called under
+ * honor_cc && !ignore_cc, so honouring the targeted variants needs no new knob.
  */
 static time_t
 ngx_http_cache_turbo_upstream_ttl(ngx_http_request_t *r)
 {
-    ngx_str_t  cc, expires;
+    ngx_str_t  cc, expires, sc, cdn;
     time_t     t;
 
+    sc = ngx_http_cache_turbo_header_find(&r->headers_out.headers,
+             "Surrogate-Control", sizeof("Surrogate-Control") - 1);
+    cdn = ngx_http_cache_turbo_header_find(&r->headers_out.headers,
+             "CDN-Cache-Control", sizeof("CDN-Cache-Control") - 1);
     cc = ngx_http_cache_turbo_header_find(&r->headers_out.headers,
              "Cache-Control", sizeof("Cache-Control") - 1);
     expires = ngx_http_cache_turbo_header_find(&r->headers_out.headers,
              "Expires", sizeof("Expires") - 1);
+
+    /* 1. Surrogate-Control: only max-age is defined for freshness (no s-maxage). */
+    if (sc.data != NULL) {
+        t = ngx_http_cache_turbo_cc_delta(sc.data, sc.data + sc.len, "max-age",
+                                          sizeof("max-age") - 1);
+        if (t >= 0) {
+            return t;
+        }
+    }
+
+    /* 2. CDN-Cache-Control: s-maxage wins over max-age, same as Cache-Control. */
+    if (cdn.data != NULL) {
+        u_char  *cdn_last = cdn.data + cdn.len;
+
+        t = ngx_http_cache_turbo_cc_delta(cdn.data, cdn_last, "s-maxage",
+                                          sizeof("s-maxage") - 1);
+        if (t < 0) {
+            t = ngx_http_cache_turbo_cc_delta(cdn.data, cdn_last, "max-age",
+                                              sizeof("max-age") - 1);
+        }
+        if (t >= 0) {
+            return t;
+        }
+    }
 
     if (cc.data != NULL) {
         u_char  *cc_last = cc.data + cc.len;
@@ -2835,10 +2872,27 @@ ngx_http_cache_turbo_response_cacheable(ngx_http_request_t *r)
             return 0;
         }
 
+        /* Cache-Control plus the RFC 9213 targeted variants (CDN-Cache-Control,
+         * Surrogate-Control): all three carry the same no-store/private/max-age=0
+         * grammar, so a targeted directive must veto the shared store the same way
+         * plain Cache-Control does — otherwise an origin that says
+         * "CDN-Cache-Control: no-store" (edge must not cache) would still be
+         * stored by us. Gated by honor_cc (via ignore_cc): if the operator ignores
+         * Cache-Control, we ignore the targeted variants too. Surrogate-Control
+         * has no "private" token (Fastly uses "no-store"/"private" loosely, so we
+         * still honour both). */
         if (!clcf->ignore_cc
-            && h[i].key.len == sizeof("Cache-Control") - 1
-            && ngx_strncasecmp(h[i].key.data, (u_char *) "Cache-Control",
-                               sizeof("Cache-Control") - 1) == 0)
+            && ((h[i].key.len == sizeof("Cache-Control") - 1
+                 && ngx_strncasecmp(h[i].key.data, (u_char *) "Cache-Control",
+                                    sizeof("Cache-Control") - 1) == 0)
+                || (h[i].key.len == sizeof("CDN-Cache-Control") - 1
+                    && ngx_strncasecmp(h[i].key.data,
+                                       (u_char *) "CDN-Cache-Control",
+                                       sizeof("CDN-Cache-Control") - 1) == 0)
+                || (h[i].key.len == sizeof("Surrogate-Control") - 1
+                    && ngx_strncasecmp(h[i].key.data,
+                                       (u_char *) "Surrogate-Control",
+                                       sizeof("Surrogate-Control") - 1) == 0)))
         {
             u_char  *v = h[i].value.data;
             u_char  *e = v + h[i].value.len;
@@ -2898,7 +2952,12 @@ ngx_http_cache_turbo_header_skip(u_char *name, size_t nlen)
         "Connection", "Keep-Alive", "Proxy-Authenticate",
         "Proxy-Authorization", "TE", "Trailer", "Transfer-Encoding",
         "Upgrade", "Content-Length", "Content-Encoding", "Set-Cookie",
-        "Date", "Server", "Age", "X-Cache", "X-Cache-Status", NULL
+        "Date", "Server", "Age", "X-Cache", "X-Cache-Status",
+        /* RFC 9213 targeted cache directives: we (the shared cache / edge) are
+         * their intended consumer, so strip them before store — replaying them
+         * downstream would wrongly steer the browser or a next cache tier with a
+         * TTL meant for us. Same rationale as the Age strip above. */
+        "CDN-Cache-Control", "Surrogate-Control", NULL
     };
     ngx_uint_t  i;
     size_t      sl;
