@@ -54,7 +54,12 @@ master_process on;
 worker_processes 2;
 error_log $WORK/logs/error.log info;
 pid $WORK/logs/nginx.pid;
-events { worker_connections 256; }
+# Valgrind slows the worker ~30x, so request arrival outpaces service rate
+# and SWR background-refresh upstream connections pile up far beyond what a
+# native run needs. 256 worker_connections trips "not enough" alerts (which
+# the log gate treats as failure); give the soak generous headroom.
+worker_rlimit_nofile 16384;
+events { worker_connections 8192; }
 http {
     access_log off;
 
