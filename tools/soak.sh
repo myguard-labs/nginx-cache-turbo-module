@@ -47,6 +47,17 @@ if [ -n "${MODULE:-}" ]; then
     LOAD_MODULE="load_module ${MODULE};"
 fi
 
+# Valgrind slows the worker ~30x, so request arrival outpaces service rate
+# and SWR background-refresh upstream connections pile up far beyond what a
+# native run needs. 256 worker_connections trips "not enough" alerts (which
+# the log gate treats as failure). Raise the soft fd limit to the hard cap
+# (worker_rlimit_nofile needs privileges the runner lacks) and give nginx
+# most of it, capped at 8192.
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
+NOFILE=$(ulimit -n)
+WORKER_CONNS=$(( NOFILE > 17000 ? 8192 : NOFILE / 2 - 64 ))
+[ "$WORKER_CONNS" -ge 256 ] || WORKER_CONNS=256
+
 cat > "$WORK/conf/nginx.conf" <<EOF
 daemon off;
 ${LOAD_MODULE}
@@ -54,7 +65,7 @@ master_process on;
 worker_processes 2;
 error_log $WORK/logs/error.log info;
 pid $WORK/logs/nginx.pid;
-events { worker_connections 256; }
+events { worker_connections $WORKER_CONNS; }
 http {
     access_log off;
 
