@@ -19,6 +19,7 @@ how many times it was actually hit, which is how we assert single-flight.
 from __future__ import annotations
 
 import argparse
+import atexit
 import concurrent.futures
 import hashlib
 import http.client
@@ -36,6 +37,34 @@ import threading
 import time
 import urllib.error
 import urllib.request
+
+
+# A test that raises before stop() would orphan every child we spawned:
+# an nginx master (or redis/memcached) keeps listening on its test port,
+# which collides with later runs of any repo sharing the runner. Track
+# every Popen and reap survivors at interpreter exit.
+_SPAWNED: list[subprocess.Popen] = []
+
+
+def _track(proc: subprocess.Popen) -> subprocess.Popen:
+    _SPAWNED.append(proc)
+    return proc
+
+
+def _reap_spawned() -> None:
+    for proc in _SPAWNED:
+        if proc.poll() is None:
+            proc.terminate()
+    deadline = time.monotonic() + 5
+    for proc in _SPAWNED:
+        if proc.poll() is None:
+            try:
+                proc.wait(timeout=max(0.1, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+
+atexit.register(_reap_spawned)
 
 
 SANITIZER_MARKERS = (
@@ -1444,8 +1473,9 @@ class Nginx:
     def start(self) -> None:
         self.write_config()
         out = self.output_path.open("a", encoding="utf-8")
-        self.process = subprocess.Popen(self.command(), text=True,
-                                        stdout=out, stderr=subprocess.STDOUT)
+        self.process = _track(subprocess.Popen(self.command(), text=True,
+                                        stdout=out,
+                                        stderr=subprocess.STDOUT))
         out.close()
         try:
             wait_port(self.port)
@@ -1554,8 +1584,9 @@ class RedisServer:
         if self.password:
             args += ["--requirepass", self.password]
 
-        self.process = subprocess.Popen(
-            args, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        self.process = _track(subprocess.Popen(
+            args, text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT))
         wait_port(self.port)
         self.cli("FLUSHALL")
 
@@ -1630,10 +1661,10 @@ class MemcachedServer:
         self.process: subprocess.Popen[str] | None = None
 
     def start(self) -> None:
-        self.process = subprocess.Popen(
+        self.process = _track(subprocess.Popen(
             [str(self.binary), "-l", "127.0.0.1", "-p", str(self.port),
              "-U", "0", "-m", "64"],
-            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT))
         wait_port(self.port)
         self.command(b"flush_all\r\n")
 

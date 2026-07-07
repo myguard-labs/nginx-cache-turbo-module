@@ -195,6 +195,16 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y redis-server memcached
 
+      - name: Sweep stale test listeners
+        run: |
+          # Kill leftovers from earlier crashed runs still holding test
+          # ports (cross-repo collisions on shared runners).
+          command -v fuser >/dev/null || sudo apt-get install -y psmisc
+          for p in $(seq 18870 18999); do
+            fuser -k -TERM "${p}/tcp" 2>/dev/null || true
+          done
+          sleep 1
+
       - name: Run runtime suite
         run: |
           chmod +x nginx-bin/nginx
@@ -219,6 +229,16 @@ jobs:
 
       - name: Build with sanitizers
         run: bash tools/ci-build.sh nginx "$NGINX_VERSION" asan
+
+      - name: Sweep stale test listeners
+        run: |
+          # Kill leftovers from earlier crashed runs still holding test
+          # ports (cross-repo collisions on shared runners).
+          command -v fuser >/dev/null || sudo apt-get install -y psmisc
+          for p in $(seq 18870 18999); do
+            fuser -k -TERM "${p}/tcp" 2>/dev/null || true
+          done
+          sleep 1
 
       - name: Run runtime suite under ASan and UBSan
         env:
