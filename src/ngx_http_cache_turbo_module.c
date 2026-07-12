@@ -4803,9 +4803,12 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
         {
             ngx_str_t  zname = clcf->admin_zone->shm.name;
 
-            /* Seven counters (*_total) + two gauges, each labelled by zone so one
-             * Prometheus job can scrape many zones. Exposition format 0.0.4. */
-            len = 2800 + 10 * zname.len + 10 * NGX_ATOMIC_T_LEN;
+            /* Ten counters (*_total) + three gauges, each labelled by zone so one
+             * Prometheus job can scrape many zones. Exposition format 0.0.4.
+             * The per-metric budget must track the emitted count (13): every
+             * metric line renders one %V (zone) + one %uA (value), so a short
+             * multiplier could truncate the last line under a long zone name. */
+            len = 2800 + 13 * zname.len + 13 * NGX_ATOMIC_T_LEN;
             p = ngx_pnalloc(r->pool, len);
             if (p == NULL) {
                 return NGX_HTTP_INTERNAL_SERVER_ERROR;
