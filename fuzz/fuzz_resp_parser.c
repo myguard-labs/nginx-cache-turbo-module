@@ -44,14 +44,22 @@ static void
 check_in_bounds(const u_char *blob, size_t blob_len,
     const u_char *buf, size_t size)
 {
+    uintptr_t  blob_addr, buf_addr, offset;
+
     if (blob == NULL) {
         if (blob_len != 0) {
             __builtin_trap();              /* NULL data with nonzero len */
         }
         return;
     }
-    if (blob < buf || blob + blob_len < blob /* overflow */
-        || blob + blob_len > buf + size)
+    blob_addr = (uintptr_t) blob;
+    buf_addr = (uintptr_t) buf;
+    if (blob_addr < buf_addr) {
+        __builtin_trap();
+    }
+    offset = blob_addr - buf_addr;
+    if (offset > (uintptr_t) size
+        || blob_len > size - (size_t) offset)
     {
         __builtin_trap();                  /* points outside the input buffer */
     }

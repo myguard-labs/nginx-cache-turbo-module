@@ -81,6 +81,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--module")
     parser.add_argument("--runner", default="")
     parser.add_argument("--single-process", action="store_true")
+    parser.add_argument("--fault-injection", action="store_true",
+                        help="enable CI-only cached-header allocation failures")
     # CI-3: set when the binary is ASan/UBSan-instrumented. Lets a test opt out of
     # the run when it stresses nginx CORE code (not our module) that trips a known
     # core sanitizer false positive — e.g. the stacked proxy_cache file-write path.
@@ -262,7 +264,8 @@ class Origin:
                 self.send_response(200)
                 self.send_header("Content-Type",
                                  "application/json; charset=utf-8")
-                self.send_header("X-Backend", "origin-42")
+                if "bare" not in self.path:
+                    self.send_header("X-Backend", "origin-42")
                 # Path-marker-driven response headers, so a test can drive the
                 # RFC 9111 shared-cache floor (these responses must NOT be
                 # stored). The marker is matched in the path so $uri keying still
@@ -392,7 +395,8 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
                  redis_password: str | None = None,
                  redis_tls_port: int | None = None,
                  redis_tls_ca: str | None = None,
-                 memcached_port: int | None = None) -> str:
+                 memcached_port: int | None = None,
+                 fault_injection: bool = False) -> str:
     load = f"load_module {module};\n" if module else ""
 
     # DSN auth+db (v5): a backend reached via a full redis://user:pass@host/db
@@ -666,6 +670,36 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
 """
     mc_loc += mcinh_loc
 
+    fault_loc = ""
+    if fault_injection:
+        fault_loc = f"""
+        # CI-only allocation fault injection. These directives are compiled only
+        # by tools/ci-build.sh and are absent from production/package builds.
+        location /allocfail/ {{
+            cache_turbo                         main;
+            cache_turbo_key                     $uri;
+            cache_turbo_valid                   30s;
+            cache_turbo_test_restore_alloc_fail on;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        location /allocfailst/ {{
+            cache_turbo                         main;
+            cache_turbo_key                     $uri;
+            cache_turbo_valid                   301 30s;
+            cache_turbo_test_restore_alloc_fail on;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        location /allocfailsie/ {{
+            cache_turbo                         main;
+            cache_turbo_key                     $uri;
+            cache_turbo_valid                   1s;
+            cache_turbo_test_restore_alloc_fail on;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+"""
+
     return f"""{load}worker_processes {workers};
 pid {root}/nginx.pid;
 error_log {root}/logs/error.log notice;
@@ -697,6 +731,7 @@ http {{
 {redis_loc}
 {mc_loc}
 {dsn_loc}
+{fault_loc}
 
         # standard 30s-fresh cache
         location /c/ {{
@@ -1421,7 +1456,8 @@ class Nginx:
     def __init__(self, binary, module, root, port, origin_port, runner,
                  single_process, redis_port=None, redis_auth_port=None,
                  redis_password=None, redis_tls_port=None,
-                 redis_tls_ca=None, memcached_port=None) -> None:
+                 redis_tls_ca=None, memcached_port=None,
+                 fault_injection=False) -> None:
         self.binary = binary
         self.module = module
         self.root = root
@@ -1437,6 +1473,7 @@ class Nginx:
         self.redis_tls_port = redis_tls_port
         self.redis_tls_ca = redis_tls_ca
         self.memcached_port = memcached_port
+        self.fault_injection = fault_injection
         self.process: subprocess.Popen | None = None
         self.output_path = root / "nginx-output.log"
 
@@ -1449,7 +1486,7 @@ class Nginx:
                          self.origin_port, workers, self.redis_port,
                          self.redis_auth_port, self.redis_password,
                          self.redis_tls_port, self.redis_tls_ca,
-                         self.memcached_port),
+                         self.memcached_port, self.fault_injection),
             encoding="ascii")
 
     def command(self, test: bool = False) -> list[str]:
@@ -1819,7 +1856,6 @@ def test_compressed_edge_identity_capture(ng: Nginx) -> None:
 
 def test_miss_then_hit(ng: Nginx) -> None:
     """Basic: first request MISS (origin), second HIT (cached, same body)."""
-    before = None
     s1, b1, h1 = fetch(ng.port, "/c/hit")
     assert s1 == 200, f"miss status {s1}"
     assert "x-cache" not in h1, f"first req should be a miss, got {h1.get('x-cache')}"
@@ -1838,6 +1874,44 @@ def test_header_fidelity(ng: Nginx) -> None:
         f"content-type lost: {h.get('content-type')}"
     assert h.get("x-backend") == "origin-42", \
         f"custom header lost: {h.get('x-backend')}"
+
+
+def test_restore_allocation_failure_fails_closed(ng: Nginx,
+                                                 origin: Origin) -> None:
+    """Allocation failure while rebuilding a cached response must never emit a
+    partial cached 200/3xx or fall through from a destructively reset SIE header
+    list. The hidden directive exists only in tools/ci-build.sh builds."""
+    def assert_failed_closed(path: str, forbidden_status: int,
+                             forbidden_header: str | None = None) -> None:
+        try:
+            status, _, headers = fetch_raw(ng.port, path)
+        except http.client.RemoteDisconnected:
+            return  # nginx aborted before sending any partial header block
+        assert status == 500 and status != forbidden_status, \
+            f"allocation failure returned unsafe status {status}: {headers}"
+        if forbidden_header is not None:
+            assert headers.get(forbidden_header) is None, \
+                f"allocation failure leaked {forbidden_header}: {headers}"
+
+    s0, _, _ = fetch_raw(ng.port, "/allocfail/bare-normal")
+    assert s0 == 200, f"normal allocation-fault prime failed: {s0}"
+    assert_failed_closed("/allocfail/bare-normal", 200, "x-cache")
+
+    sr0, _, hr0 = fetch_raw(ng.port, "/allocfailst/redir")
+    assert sr0 == 301 and hr0.get("location"), \
+        f"redirect allocation-fault prime failed: {sr0} {hr0}"
+    assert_failed_closed("/allocfailst/redir", 301, "location")
+
+    ss0, bs0, _ = fetch_raw(ng.port, "/allocfailsie/sieserve-alloc")
+    assert ss0 == 200 and bs0, f"SIE allocation-fault prime failed: {ss0}"
+    time.sleep(4.6)  # fully expired, but inside stale-if-error=30
+    origin.fail = True
+    try:
+        assert_failed_closed("/allocfailsie/sieserve-alloc", 503,
+                             "x-cache")
+    finally:
+        origin.fail = False
+        drain_origin(origin)
 
 
 def test_suppress_native_variable(ng: Nginx) -> None:
@@ -3495,7 +3569,9 @@ def test_admin_all_zero_does_not_purge(ng: Nginx) -> None:
 def test_admin_purge_all(ng: Nginx) -> None:
     """POST /_cache?all=1 empties the zone."""
     import json
-    fetch(ng.port, "/c/a1"); fetch(ng.port, "/c/a2"); fetch(ng.port, "/c/a3")
+    fetch(ng.port, "/c/a1")
+    fetch(ng.port, "/c/a2")
+    fetch(ng.port, "/c/a3")
     s, b, _ = fetch(ng.port, "/_cache?all=1", method="POST")
     assert s == 200, f"purge-all status {s}"
     assert json.loads(b)["purged"] >= 1, f"purge-all count: {b}"
@@ -4027,7 +4103,7 @@ def test_l2_tag_purge(ng: Nginx, origin: Origin, redis: RedisServer) -> None:
     assert wait_for(lambda: redis.cli("SCARD", tag_key("news")) == "2"), \
         "both objects should be in tag set 'news'"
 
-    s, b, _ = fetch(ng.port, f"/_cache_l2?tag=news", method="POST")
+    s, b, _ = fetch(ng.port, "/_cache_l2?tag=news", method="POST")
     assert s == 200, f"tag purge status {s}"
     assert json.loads(b)["purged"] == 2, f"expected 2 purged, got {b}"
 
@@ -4644,7 +4720,7 @@ def test_preset_window_differs(ng: Nginx, origin: Origin) -> None:
     time.sleep(3.0)                                     # cons expired, aggr stale
 
     # conservative: past stale_until -> a true MISS (no X-Cache, hits origin)
-    sc, bc, hc = fetch(ng.port, "/pc/win")
+    sc, _, hc = fetch(ng.port, "/pc/win")
     assert sc == 200, f"conservative re-read status {sc}"
     assert "x-cache" not in hc, \
         ("conservative (stale_mult=2) should hard-expire by t=3s and MISS, "
@@ -4751,7 +4827,8 @@ def test_autotune_raises_beta_within_band(ng: Nginx, origin: Origin) -> None:
 
         _, _, hb = fetch(ng.port, "/at/probe")
         _, _, hc = fetch(ng.port, "/atc/probe")
-        bal = int(hb["x-ct-beta"]); con = int(hc["x-ct-beta"])
+        bal = int(hb["x-ct-beta"])
+        con = int(hc["x-ct-beta"])
         assert bal == max(500, min(beta, 2000)), \
             f"balanced effective beta {bal} not clamped to its band from {beta}"
         assert con == max(500, min(beta, 1000)), \
@@ -5033,6 +5110,8 @@ def run_all(ng: Nginx, origin: Origin,
     test_miss_then_hit(ng)
     test_compressed_edge_identity_capture(ng)
     test_header_fidelity(ng)
+    if ng.fault_injection:
+        test_restore_allocation_failure_fails_closed(ng, origin)
     test_max_size_not_cached(ng)
     test_suppress_native_variable(ng)
     test_auto_classify(ng, origin)
@@ -5239,7 +5318,8 @@ def main() -> int:
                    redis_password=redis_password,
                    redis_tls_port=redis_tls_port if redis_tls else None,
                    redis_tls_ca=(tls_certs or {}).get("ca"),
-                   memcached_port=memcached_port if mc else None)
+                   memcached_port=memcached_port if mc else None,
+                   fault_injection=args.fault_injection)
         ng.sanitizer = args.sanitizer
 
         try:

@@ -570,6 +570,13 @@ typedef struct {
      * Authorization make the response uncacheable. Off by default. */
     ngx_flag_t               auto_vary;
 
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+    /* CI-only fault injection; production/package builds do not define the
+     * feature macro and therefore expose neither this field nor its directive. */
+    ngx_flag_t               test_restore_alloc_fail;
+#endif
+
 
     /* Backend vtables (v4-1). l1 = the local store (shm); it is a stateless
      * dispatch table (the zone is passed as an argument), so it is set

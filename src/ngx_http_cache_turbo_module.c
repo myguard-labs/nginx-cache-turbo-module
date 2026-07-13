@@ -36,6 +36,8 @@ static ngx_int_t ngx_http_cache_turbo_serve(ngx_http_request_t *r,
 static ngx_int_t ngx_http_cache_turbo_restore_response(ngx_http_request_t *r,
     u_char *copy, size_t len, ngx_uint_t stale, const char *xcache,
     u_char **bodyp, size_t *body_lenp);
+static ngx_uint_t ngx_http_cache_turbo_restore_alloc_fails(
+    ngx_http_request_t *r);
 static ngx_int_t ngx_http_cache_turbo_cold_wait(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_zone_t *z,
     ngx_http_cache_turbo_ctx_t *ctx);
@@ -325,6 +327,16 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       NGX_HTTP_LOC_CONF_OFFSET,
       0,
       NULL },
+
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+    { ngx_string("cache_turbo_test_restore_alloc_fail"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_turbo_loc_conf_t, test_restore_alloc_fail),
+      NULL },
+#endif
 
       ngx_null_command
 };
@@ -2395,7 +2407,8 @@ ngx_http_cache_turbo_add_header(ngx_http_request_t *r,
 {
     ngx_table_elt_t  *h;
 
-    h = ngx_list_push(&r->headers_out.headers);
+    h = ngx_http_cache_turbo_restore_alloc_fails(r)
+            ? NULL : ngx_list_push(&r->headers_out.headers);
     if (h == NULL) {
         return NGX_ERROR;
     }
@@ -2410,6 +2423,26 @@ ngx_http_cache_turbo_add_header(ngx_http_request_t *r,
 #endif
 
     return NGX_OK;
+}
+
+
+/* CI builds can fail every allocation in cached-response reconstruction. The
+ * directive and field do not exist in production/package builds; keeping the
+ * hook at the allocation sink lets runtime tests exercise both live HIT and
+ * stale-if-error fail-closed behaviour without weakening ngx_alloc globally. */
+static ngx_uint_t
+ngx_http_cache_turbo_restore_alloc_fails(ngx_http_request_t *r)
+{
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+    ngx_http_cache_turbo_loc_conf_t  *clcf;
+
+    clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
+    return clcf->test_restore_alloc_fail ? 1 : 0;
+#else
+    (void) r;
+    return 0;
+#endif
 }
 
 
@@ -2593,7 +2626,9 @@ ngx_http_cache_turbo_restore_response(ngx_http_request_t *r, u_char *copy,
             lastmod_len = vl;
         }
 
-        (void) ngx_http_cache_turbo_add_header(r, nm, nl, vv, vl);
+        if (ngx_http_cache_turbo_add_header(r, nm, nl, vv, vl) != NGX_OK) {
+            return NGX_ERROR;
+        }
     }
 
     /* Conditional request (v11): a 200 HIT whose stored ETag / Last-Modified
@@ -2641,23 +2676,33 @@ ngx_http_cache_turbo_restore_response(ngx_http_request_t *r, u_char *copy,
      * is stripped at store and has no blob field yet); true origin-Date
      * preservation rides the deferred RFC-2 blob-format bump. */
     {
-        u_char  *db = ngx_pnalloc(r->pool,
-                          sizeof("Mon, 28 Sep 1970 06:00:00 GMT") - 1);
-        if (db != NULL) {
-            ngx_table_elt_t  *dh = ngx_list_push(&r->headers_out.headers);
-            if (dh != NULL) {
-                static u_char  date_name[] = "Date";
-                dh->hash = 1;
-                dh->key.len = sizeof("Date") - 1;
-                dh->key.data = date_name;
-                dh->value.len = (size_t) (ngx_http_time(db,
-                                    (time_t) bh->created) - db);
-                dh->value.data = db;
+        u_char           *db;
+        ngx_table_elt_t  *dh;
+
+        db = ngx_http_cache_turbo_restore_alloc_fails(r) ? NULL
+             : ngx_pnalloc(r->pool,
+                           sizeof("Mon, 28 Sep 1970 06:00:00 GMT") - 1);
+        if (db == NULL) {
+            return NGX_ERROR;
+        }
+        dh = ngx_http_cache_turbo_restore_alloc_fails(r)
+                 ? NULL : ngx_list_push(&r->headers_out.headers);
+        if (dh == NULL) {
+            return NGX_ERROR;
+        }
+
+        {
+            static u_char  date_name[] = "Date";
+            dh->hash = 1;
+            dh->key.len = sizeof("Date") - 1;
+            dh->key.data = date_name;
+            dh->value.len = (size_t) (ngx_http_time(db,
+                                (time_t) bh->created) - db);
+            dh->value.data = db;
 #if (nginx_version >= 1023000)
-                dh->next = NULL;
+            dh->next = NULL;
 #endif
-                r->headers_out.date = dh;
-            }
+            r->headers_out.date = dh;
         }
     }
 
@@ -2672,12 +2717,20 @@ ngx_http_cache_turbo_restore_response(ngx_http_request_t *r, u_char *copy,
         if (age < 0) {
             age = 0;
         }
-        ab = ngx_pnalloc(r->pool, NGX_TIME_T_LEN);
-        if (ab != NULL) {
+        ab = ngx_http_cache_turbo_restore_alloc_fails(r)
+                 ? NULL : ngx_pnalloc(r->pool, NGX_TIME_T_LEN);
+        if (ab == NULL) {
+            return NGX_ERROR;
+        }
+        {
             static u_char  age_name[] = "Age";
             size_t         al = (size_t) (ngx_sprintf(ab, "%T", age) - ab);
-            (void) ngx_http_cache_turbo_add_header(r, age_name,
-                       sizeof("Age") - 1, ab, al);
+
+            if (ngx_http_cache_turbo_add_header(r, age_name,
+                    sizeof("Age") - 1, ab, al) != NGX_OK)
+            {
+                return NGX_ERROR;
+            }
         }
     }
 
@@ -2688,9 +2741,12 @@ ngx_http_cache_turbo_restore_response(ngx_http_request_t *r, u_char *copy,
     {
         ngx_http_cache_turbo_ctx_t  *sctx;
         static u_char  xc_name[] = "X-Cache";
-        (void) ngx_http_cache_turbo_add_header(r, xc_name,
-                   sizeof("X-Cache") - 1, (u_char *) xcache,
-                   ngx_strlen(xcache));
+        if (ngx_http_cache_turbo_add_header(r, xc_name,
+                sizeof("X-Cache") - 1, (u_char *) xcache,
+                ngx_strlen(xcache)) != NGX_OK)
+        {
+            return NGX_ERROR;
+        }
 
         /* Record the served outcome for $cache_turbo_status: "HIT" -> HIT,
          * "STALE"/"STALE-IF-ERROR" -> STALE. */
@@ -2986,8 +3042,9 @@ ngx_http_cache_turbo_header_skip(u_char *name, size_t nlen)
  * r->headers_out in place and let the filter chain carry the response: drop the
  * error's header list + typed Content-Type/Length, then replay the snapshot via
  * the shared restore step (X-Cache: STALE-IF-ERROR), stashing the body slice for
- * the body filter. Returns NGX_OK on a successful rewrite, NGX_DECLINED to leave
- * the original error untouched.
+ * the body filter. Returns NGX_OK on a successful rewrite and NGX_ERROR on any
+ * allocation failure: once list reconstruction starts, falling through would
+ * emit a partially rebuilt response.
  */
 static ngx_int_t
 ngx_http_cache_turbo_sie_rewrite(ngx_http_request_t *r,
@@ -3004,7 +3061,7 @@ ngx_http_cache_turbo_sie_rewrite(ngx_http_request_t *r,
     if (ngx_list_init(&r->headers_out.headers, r->pool, 8,
                       sizeof(ngx_table_elt_t)) != NGX_OK)
     {
-        return NGX_DECLINED;
+        return NGX_ERROR;
     }
     r->headers_out.content_type.len = 0;
     r->headers_out.content_type.data = NULL;
@@ -3018,7 +3075,7 @@ ngx_http_cache_turbo_sie_rewrite(ngx_http_request_t *r,
     if (ngx_http_cache_turbo_restore_response(r, ctx->sie_snap,
             ctx->sie_snap_len, 1, "STALE-IF-ERROR", &body, &body_len) != NGX_OK)
     {
-        return NGX_DECLINED;
+        return NGX_ERROR;
     }
 
     ctx->sie_body = body;
@@ -3032,6 +3089,7 @@ ngx_http_cache_turbo_header_filter(ngx_http_request_t *r)
 {
     ngx_http_cache_turbo_ctx_t       *ctx;
     ngx_http_cache_turbo_loc_conf_t  *clcf;
+    ngx_int_t                         rc;
 
     ctx = ngx_http_get_module_ctx(r, ngx_http_cache_turbo_module);
 
@@ -3045,22 +3103,30 @@ ngx_http_cache_turbo_header_filter(ngx_http_request_t *r)
      * so waiters do not block on a key we will not store. */
     if (ctx->sie_armed && !ctx->sie_serving
         && r->headers_out.status >= NGX_HTTP_INTERNAL_SERVER_ERROR
-        && r->headers_out.status <= 599
-        && ngx_http_cache_turbo_sie_rewrite(r, ctx) == NGX_OK)
+        && r->headers_out.status <= 599)
     {
-        ctx->served = 1;          /* block capture of the replaced error */
-        ctx->sie_serving = 1;     /* body filter emits the snapshot body */
-
-        if (ctx->cold_winner && !ctx->cold_stored && ctx->cold_zone != NULL) {
-            uint32_t  h = ngx_crc32_short(ctx->key_hash, 32);
-            ngx_http_cache_turbo_shm_unstub(ctx->cold_zone, ctx->key_hash, h);
-            ctx->cold_stored = 1;
+        rc = ngx_http_cache_turbo_sie_rewrite(r, ctx);
+        if (rc == NGX_ERROR) {
+            return NGX_ERROR;
         }
+        if (rc == NGX_OK) {
+            ctx->served = 1;      /* block capture of the replaced error */
+            ctx->sie_serving = 1; /* body filter emits the snapshot body */
 
-        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                       "cache_turbo: STALE-IF-ERROR serve \"%V\" len=%uz",
-                       &r->uri, ctx->sie_body_len);
-        return ngx_http_next_header_filter(r);
+            if (ctx->cold_winner && !ctx->cold_stored
+                && ctx->cold_zone != NULL)
+            {
+                uint32_t  h = ngx_crc32_short(ctx->key_hash, 32);
+                ngx_http_cache_turbo_shm_unstub(ctx->cold_zone,
+                                                ctx->key_hash, h);
+                ctx->cold_stored = 1;
+            }
+
+            ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                           "cache_turbo: STALE-IF-ERROR serve \"%V\" len=%uz",
+                           &r->uri, ctx->sie_body_len);
+            return ngx_http_next_header_filter(r);
+        }
     }
 
     clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
@@ -6075,6 +6141,10 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->normalize_vary = NGX_CONF_UNSET;
     conf->bypass = NGX_CONF_UNSET_PTR;
     conf->no_store = NGX_CONF_UNSET_PTR;
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+    conf->test_restore_alloc_fail = NGX_CONF_UNSET;
+#endif
     /* shm_zone, key, redis_addr, redis_prefix default NULL via pcalloc */
 
     return conf;
@@ -6167,6 +6237,11 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     conf->honor_cc  = (conf->cc_mode == NGX_HTTP_CACHE_TURBO_CC_HONOR);
     conf->ignore_cc = (conf->cc_mode == NGX_HTTP_CACHE_TURBO_CC_IGNORE);
     ngx_conf_merge_value(conf->auto_vary, prev->auto_vary, 0);
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+    ngx_conf_merge_value(conf->test_restore_alloc_fail,
+                         prev->test_restore_alloc_fail, 0);
+#endif
 
     /* PURGE method (v14): off by default. */
     ngx_conf_merge_value(conf->purge, prev->purge, 0);

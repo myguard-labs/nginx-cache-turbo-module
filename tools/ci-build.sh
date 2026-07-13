@@ -20,6 +20,7 @@ VERSION="${2:-1.31.1}"
 MODE="${3:-debug}"
 ROOT="${BUILD_ROOT:-$PWD/.build}"
 MODULE_DIR="$PWD"
+TEST_OPT="-DNGX_HTTP_CACHE_TURBO_TEST_FAULTS=1"
 
 case "$FLAVOR" in
     nginx)
@@ -42,11 +43,12 @@ mkdir -p "$ROOT"
 if [ ! -f "$ROOT/${DIR}.tar.gz" ]; then
     curl -fsSL "$URL" -o "$ROOT/${DIR}.tar.gz"
 fi
+bash "$MODULE_DIR/tools/verify-download.sh" "$ROOT/${DIR}.tar.gz"
 if [ ! -d "$ROOT/$DIR" ]; then
     tar -xzf "$ROOT/${DIR}.tar.gz" -C "$ROOT"
 fi
 
-CC_OPT="-DNGX_DEBUG_PALLOC=1 -g3 -O0 -fno-omit-frame-pointer -funwind-tables"
+CC_OPT="$TEST_OPT -DNGX_DEBUG_PALLOC=1 -g3 -O0 -fno-omit-frame-pointer -funwind-tables"
 LD_OPT=""
 ADD_MODULE="--add-dynamic-module=$MODULE_DIR"
 WITH_DEBUG="--with-debug"
@@ -63,9 +65,9 @@ case "$MODE" in
         # names are clang-specific; gcc's configure rejects nonnull-attribute/
         # pointer-overflow. Only add them under clang (the local soak path);
         # gcc keeps plain -fsanitize (CI was green, gcc doesn't trip these FPs).
-        SAN="-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g3 -O1"
+        SAN="$TEST_OPT -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g3 -O1"
         if "${CC:-cc}" --version 2>/dev/null | grep -qi clang; then
-            SAN="-fsanitize=address,undefined -fno-sanitize=function,nonnull-attribute,pointer-overflow -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g3 -O1"
+            SAN="$TEST_OPT -fsanitize=address,undefined -fno-sanitize=function,nonnull-attribute,pointer-overflow -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g3 -O1"
         fi
         CC_OPT="$SAN"
         LD_OPT="$SAN"
@@ -73,13 +75,13 @@ case "$MODE" in
         ADD_MODULE="--add-module=$MODULE_DIR"
         ;;
     nginx)
-        # Stock nginx defaults for benchmarking (tools/bench.sh): empty
-        # --with-cc-opt => nginx's own default flags (-O, i.e. -O1), no
-        # NGX_DEBUG_PALLOC poisoning, no --with-debug logging. Not the
-        # distro's hardened -O2 set — a neutral upstream baseline. Module
-        # stays a dynamic .so (the shipped artifact); bench it with
-        # MODULE=<.so> tools/bench.sh.
-        CC_OPT=""
+        # Stock nginx defaults for benchmarking (tools/bench.sh): the only
+        # --with-cc-opt is the inert CI fault-test hook, so nginx keeps its own
+        # optimization defaults (-O, i.e. -O1), with no NGX_DEBUG_PALLOC
+        # poisoning and no --with-debug logging. This is not the distro's
+        # hardened -O2 set — it is a neutral upstream baseline. The module stays
+        # a dynamic .so; bench it with MODULE=<.so> tools/bench.sh.
+        CC_OPT="$TEST_OPT"
         WITH_DEBUG=""
         ;;
 esac

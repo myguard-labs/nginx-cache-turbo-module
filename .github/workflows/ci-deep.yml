@@ -3,12 +3,10 @@ name: CI Deep
 # Exhaustive dynamic analysis — monthly cron + on-demand only, NEVER on PR.
 # The fast PR/push gates live in the standalone fuzzing.yml (fuzz regression),
 # valgrind.yml (memcheck lite) and security-scanners.yml (scanners) workflows;
-# THIS file keeps the long/exhaustive runs. codeql.yml is dropped entirely:
-# CodeQL / the GitHub Security tab is GitHub-Advanced-Security only and does
-# nothing on a private repo, so the SARIF-upload path is removed too — the
-# scanners still run and GATE on findings, they just don't upload.
+# THIS file keeps the long/exhaustive runs. CodeQL remains in codeql.yml; this
+# workflow complements it with long dynamic-analysis and scanner jobs.
 #
-# Jobs: fuzz (14400s/target × 4) · memcheck soak · helgrind soak · scanners.
+# Jobs: fuzz (up to 14400s/target × 4) · memcheck soak · helgrind soak · scanners.
 #   * memcheck AND helgrind run under tools/soak.sh, which passes
 #     --suppressions=tools/valgrind.supp for BOTH, and --error-exitcode=99 for
 #     helgrind — the drift-fix baseline for every module.
@@ -21,7 +19,7 @@ name: CI Deep
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  NGINX_VERSION: ""
+  NGINX_VERSION: "1.31.1"
 
 on:
   schedule:
@@ -33,7 +31,8 @@ on:
       fuzz_seconds:
         description: "Per-target fuzz duration (seconds)"
         required: false
-        default: "3600"
+        type: number
+        default: 3600
 
 concurrency:
   group: ci-deep-${{ github.workflow }}-${{ github.ref }}
@@ -50,6 +49,8 @@ jobs:
     steps:
       - name: Checkout module
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
 
       - name: Install clang + libFuzzer
         run: |
@@ -57,12 +58,21 @@ jobs:
           sudo apt-get install -y clang
 
       - name: Select fuzz duration
+        env:
+          FUZZ_SECONDS_INPUT: ${{ inputs.fuzz_seconds || '3600' }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "FUZZ_SECS=${{ github.event.inputs.fuzz_seconds }}" >> "$GITHUB_ENV"
-          else
-            echo "FUZZ_SECS=3600" >> "$GITHUB_ENV"
+          case "$FUZZ_SECONDS_INPUT" in
+            ''|*[!0-9]*)
+              echo "::error::fuzz_seconds must contain decimal digits only"
+              exit 2
+              ;;
+          esac
+          if [ "$FUZZ_SECONDS_INPUT" -lt 1 ] \
+              || [ "$FUZZ_SECONDS_INPUT" -gt 14400 ]; then
+            echo "::error::fuzz_seconds must be between 1 and 14400"
+            exit 2
           fi
+          printf 'FUZZ_SECS=%s\n' "$FUZZ_SECONDS_INPUT" >> "$GITHUB_ENV"
 
       - name: Build fuzz targets
         run: bash fuzz/build.sh "$GITHUB_WORKSPACE/fuzz"
@@ -128,19 +138,14 @@ jobs:
     steps:
       - name: Checkout module
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      - name: Resolve latest mainline nginx
-        run: |
-          set -euo pipefail
-          ver=$(curl -fsSL https://nginx.org/en/download.html \
-            | grep -oP 'nginx-\K[0-9]+\.[0-9]+\.[0-9]+(?=\.tar\.gz)' | sort -V | tail -1)
-          [ -n "$ver" ] || { echo "::error::cannot resolve nginx version"; exit 1; }
-          echo "NGINX_VERSION=$ver" >> "$GITHUB_ENV"
+        with:
+          persist-credentials: false
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             build-essential curl libpcre2-dev libssl-dev pkg-config \
-            valgrind wget zlib1g-dev
+            valgrind zlib1g-dev
       - name: Build debug nginx + cache-turbo module
         run: bash tools/ci-build.sh nginx "$NGINX_VERSION" debug
       - name: Memcheck soak (600s @ 4 conc, WITH suppressions)
@@ -169,19 +174,14 @@ jobs:
     steps:
       - name: Checkout module
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      - name: Resolve latest mainline nginx
-        run: |
-          set -euo pipefail
-          ver=$(curl -fsSL https://nginx.org/en/download.html \
-            | grep -oP 'nginx-\K[0-9]+\.[0-9]+\.[0-9]+(?=\.tar\.gz)' | sort -V | tail -1)
-          [ -n "$ver" ] || { echo "::error::cannot resolve nginx version"; exit 1; }
-          echo "NGINX_VERSION=$ver" >> "$GITHUB_ENV"
+        with:
+          persist-credentials: false
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             build-essential curl libpcre2-dev libssl-dev pkg-config \
-            valgrind wget zlib1g-dev
+            valgrind zlib1g-dev
       - name: Build debug nginx + cache-turbo module
         run: bash tools/ci-build.sh nginx "$NGINX_VERSION" debug
       - name: Helgrind soak (600s @ 4 conc, --error-exitcode=99, WITH suppressions)
@@ -210,10 +210,13 @@ jobs:
     steps:
       - name: Checkout module
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y flawfinder clang-tidy python3 python3-pip pipx nginx-dev
+          sudo apt-get install -y build-essential curl flawfinder clang-tidy \
+            libpcre2-dev libssl-dev python3 python3-pip pipx zlib1g-dev
           # semgrep: isolate via pipx (PEP 668 blocks a bare pip3 install into the
           # system Python on the Ubuntu 24.04 self-hosted runner). Fall back to a
           # user pip install with --break-system-packages if pipx is unavailable.
@@ -227,12 +230,9 @@ jobs:
       - name: Configure nginx src tree (clang-tidy headers)
         run: |
           set -euo pipefail
-          ver=$(curl -fsSL https://nginx.org/en/download.html \
-            | grep -oP 'nginx-\K[0-9]+\.[0-9]+\.[0-9]+(?=\.tar\.gz)' | sort -V | tail -1)
-          wget -q "https://nginx.org/download/nginx-${ver}.tar.gz"
-          tar -xzf "nginx-${ver}.tar.gz"; cd "nginx-${ver}"
-          CC=gcc ./configure --with-compat --add-dynamic-module="$GITHUB_WORKSPACE" >/dev/null
-          echo "NGINX_SRC_TREE=$PWD" >> "$GITHUB_ENV"
+          bash tools/ci-build.sh nginx "$NGINX_VERSION" module
+          echo "NGINX_SRC_TREE=$GITHUB_WORKSPACE/.build/nginx-${NGINX_VERSION}" \
+            >> "$GITHUB_ENV"
       - name: flawfinder
         run: |
           flawfinder --minlevel=1 "$GITHUB_WORKSPACE"/src/*.c 2>&1 | tee flawfinder.log

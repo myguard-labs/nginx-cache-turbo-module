@@ -24,5 +24,7 @@ fuzz/corpus/*
 !fuzz/corpus/[0-9][0-9]_*
 fuzz/corpus_norm_args/*
 !fuzz/corpus_norm_args/[0-9][0-9]_*
+fuzz/corpus_mc/*
+!fuzz/corpus_mc/[0-9][0-9]_*
 fuzz/corpus_auto/*
 !fuzz/corpus_auto/[0-9][0-9]_*

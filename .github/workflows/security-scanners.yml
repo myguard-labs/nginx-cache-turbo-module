@@ -9,6 +9,7 @@ name: Security scanners
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  NGINX_VERSION: "1.31.1"
 
 on:
   push:
@@ -27,15 +28,18 @@ permissions:
 jobs:
   scanners:
     name: Security scanners
-    runs-on: [self-hosted, builder02, lxc]
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-24.04' || fromJSON('["self-hosted","builder02","lxc"]') }}
     timeout-minutes: 20
     steps:
       - name: Checkout module
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y flawfinder clang-tidy python3 python3-pip pipx nginx-dev
+          sudo apt-get install -y build-essential curl flawfinder clang-tidy \
+            libpcre2-dev libssl-dev python3 python3-pip pipx zlib1g-dev
           # semgrep: isolate via pipx (PEP 668 blocks a bare pip3 install into the
           # system Python on the Ubuntu 24.04 self-hosted runner). Fall back to a
           # user pip install with --break-system-packages if pipx is unavailable.
@@ -49,12 +53,9 @@ jobs:
       - name: Configure nginx src tree (clang-tidy headers)
         run: |
           set -euo pipefail
-          ver=$(curl -fsSL https://nginx.org/en/download.html \
-            | grep -oP 'nginx-\K[0-9]+\.[0-9]+\.[0-9]+(?=\.tar\.gz)' | sort -V | tail -1)
-          wget -q "https://nginx.org/download/nginx-${ver}.tar.gz"
-          tar -xzf "nginx-${ver}.tar.gz"; cd "nginx-${ver}"
-          CC=gcc ./configure --with-compat --add-dynamic-module="$GITHUB_WORKSPACE" >/dev/null
-          echo "NGINX_SRC_TREE=$PWD" >> "$GITHUB_ENV"
+          bash tools/ci-build.sh nginx "$NGINX_VERSION" module
+          echo "NGINX_SRC_TREE=$GITHUB_WORKSPACE/.build/nginx-${NGINX_VERSION}" \
+            >> "$GITHUB_ENV"
       - name: flawfinder
         run: |
           flawfinder --minlevel=1 "$GITHUB_WORKSPACE"/src/*.c 2>&1 | tee flawfinder.log

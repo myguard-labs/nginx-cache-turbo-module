@@ -21,11 +21,13 @@ permissions:
 jobs:
   validation:
     name: Validation
-    runs-on: [self-hosted, builder02, lxc]
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-24.04' || fromJSON('["self-hosted","builder02","lxc"]') }}
     timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
 
       - name: Install validation tools
         run: |
@@ -37,6 +39,17 @@ jobs:
           bash -n tools/*.sh fuzz/*.sh
           shellcheck tools/*.sh fuzz/*.sh
           python3 -m py_compile tools/test_runtime.py
+          python3 tools/lint-ci-runners.py
+
+      - name: Reject corrupt downloaded inputs
+        run: |
+          tmp=$(mktemp -d)
+          trap 'rm -rf "$tmp"' EXIT
+          printf corrupt > "$tmp/nginx-1.31.1.tar.gz"
+          if bash tools/verify-download.sh "$tmp/nginx-1.31.1.tar.gz"; then
+            echo "corrupt nginx archive passed checksum verification" >&2
+            exit 1
+          fi
 
       - name: Static analysis (R7 shm-lock invariant + cppcheck + whitespace)
         run: |
@@ -55,18 +68,22 @@ jobs:
       - name: Lint workflows
         run: |
           version=1.7.7
-          curl -fsSL -o /tmp/actionlint.tgz \
+          archive="/tmp/actionlint_${version}_linux_amd64.tar.gz"
+          curl -fsSL -o "$archive" \
             "https://github.com/rhysd/actionlint/releases/download/v${version}/actionlint_${version}_linux_amd64.tar.gz"
-          tar -xzf /tmp/actionlint.tgz -C /tmp actionlint
+          bash tools/verify-download.sh "$archive"
+          tar -xzf "$archive" -C /tmp actionlint
           /tmp/actionlint -color .github/workflows/*.yml
 
   build:
     name: Build
-    runs-on: [self-hosted, builder02, lxc]
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-24.04' || fromJSON('["self-hosted","builder02","lxc"]') }}
     timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
 
       - name: Install build dependencies
         run: |
@@ -136,11 +153,13 @@ jobs:
 
   analyze:
     name: Clang static analyzer (per-PR deep analysis)
-    runs-on: [self-hosted, builder02, lxc]
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-24.04' || fromJSON('["self-hosted","builder02","lxc"]') }}
     timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
 
       - name: Install build dependencies
         run: |
@@ -177,12 +196,14 @@ jobs:
 
   runtime:
     name: Runtime
-    runs-on: [self-hosted, builder02, lxc]
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-24.04' || fromJSON('["self-hosted","builder02","lxc"]') }}
     timeout-minutes: 15
     needs: build
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
 
       - name: Download nginx artifact
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
@@ -209,6 +230,7 @@ jobs:
         run: |
           chmod +x nginx-bin/nginx
           python3 tools/test_runtime.py \
+            --fault-injection \
             --nginx-binary "$GITHUB_WORKSPACE/nginx-bin/nginx" \
             --module "$GITHUB_WORKSPACE/nginx-bin/ngx_http_cache_turbo_module.so" \
             --redis-server /usr/bin/redis-server \
@@ -216,11 +238,13 @@ jobs:
 
   asan:
     name: ASan and UBSan
-    runs-on: [self-hosted, builder02, lxc]
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-24.04' || fromJSON('["self-hosted","builder02","lxc"]') }}
     timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
 
       - name: Install build dependencies
         run: |
@@ -246,6 +270,7 @@ jobs:
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: |
           python3 tools/test_runtime.py \
+            --fault-injection \
             --single-process \
             --redis-server /usr/bin/redis-server \
             --memcached-server /usr/bin/memcached \
@@ -265,6 +290,7 @@ jobs:
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: |
           python3 tools/test_runtime.py \
+            --fault-injection \
             --sanitizer \
             --redis-server /usr/bin/redis-server \
             --memcached-server /usr/bin/memcached \
