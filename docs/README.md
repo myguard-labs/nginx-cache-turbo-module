@@ -20,6 +20,8 @@ One page per `cache_turbo_backend` preset:
 | `mediawiki` | [mediawiki.md](mediawiki.md) | ✅ yes (`*UserID`, `*UserName`) |
 | `magento` | [magento.md](magento.md) | ✅ yes (`X-Magento-Vary`) — and the origin sends `no-store` on cart/checkout |
 | `ghost` | [ghost.md](ghost.md) | ✅ yes (`ghost-members-ssr`) — **plus `?uuid=`/`?key=`, which auth a member with no cookie** |
+| `wagtail` | [wagtail.md](wagtail.md) | ⚠️ yes (`sessionid`) — **but only while nothing writes the session for guests**; fails safe |
+| `kirby` | [kirby.md](kirby.md) | ⚠️ yes (`kirby_session`) — **but a `csrf()` form page cookies guests**; fails safe |
 
 ## Not an app — a framework? (Django, Laravel, Rails, …)
 
@@ -94,6 +96,15 @@ Four rows above are load-bearing:
   member purely from `?uuid=&key=` with **no cookie at all**, so a cookie-only rule
   set is not safe — a member's page would be stored under a URL anyone can request.
   See [ghost.md](ghost.md).
+- **`wagtail` and `kirby` are the two *conditional* presets — and the condition
+  fails SAFE.** Both ride a cookie that is issued only when a session actually
+  exists (Django's `sessionid` via lazy save; Kirby's `kirby_session`), which is
+  what makes them shippable at all. But both stop being logged-in signals if the
+  app starts writing sessions for guests — a Django anonymous cart, a Kirby
+  template calling `csrf()`. When that happens the guest gets **bypassed**: the hit
+  rate drops, nothing leaks. **That direction is the whole ballgame** — compare
+  `flarum` below, whose equivalent condition fails the *other* way and is therefore
+  rejected outright. See [wagtail.md](wagtail.md), [kirby.md](kirby.md).
 - **`mediawiki`'s dynamic surface is in the query args, not the path.** It
   bypasses `veaction=` but deliberately **not** a blanket `action=` — `action=raw`,
   `action=history`, `diff=` and `oldid=` are deterministic, shared and hot, and
@@ -170,6 +181,40 @@ lives in a query-arg **value**. This registry matches arg-**key** presence, and 
 `route` rule would match *every* page including the entire catalog — hit rate zero.
 Every cookie OpenCart sets (`OCSESSID`, `currency`) is set for anonymous visitors,
 so none can be a bypass. The preset simply cannot express the app.
+
+**Flarum.** The instructive rejection, because it *looks* shippable and is not.
+Flarum has a stable, non-`APP_NAME`-derived cookie prefix (`CookieFactory`, default
+`flarum`) and a cookie that means "logged in": `flarum_remember`. The trap is what
+happens when a user **doesn't tick "remember me"** — which is the checkbox's
+*default* state. `CreateTokenController` branches:
+
+```php
+if (Arr::get($body, 'remember')) { $token = RememberAccessToken::generate($user->id); }
+else                             { $token = SessionAccessToken::generate($user->id); }
+```
+
+and `Rememberer::remember()` — the **only** writer of `flarum_remember` — is called
+only for the `RememberAccessToken` branch. So an ordinary logged-in user carries
+**only `flarum_session`**, which Flarum starts for every anonymous visitor too.
+Both doors are locked:
+
+- bypass `flarum_session` → bypasses **100%** of traffic (hit rate 0)
+- bypass only `flarum_remember` → a logged-in user is served a **cached anonymous
+  page**
+
+The second is a **leak, not a lost hit**, and it is the *common* path rather than an
+edge case. That is the exact inverse of the [`kirby`](kirby.md) / [`wagtail`](wagtail.md)
+condition, which fails toward a needless bypass. **When a preset's failure mode
+serves one user's page to another, there is no preset.**
+
+**Grav, Craft, October, Statamic.** All four die on the cookie, in the two ways this
+page keeps repeating. *Guest-issued*: Craft's `CraftSessionId` and October's
+`october_session` are perfectly stable literals handed to **every** anonymous
+visitor (Craft's own issue tracker: *"the cookie is being set for any user visiting
+the site, even if they're not logged in"*). *Per-install*: Grav's session cookie is
+`grav-site-<hash>`. Statamic manages **both at once** — `<APP_NAME>_session`, which
+is per-install *and* set for every guest. Grav is the painful one: flat-file traffic
+is the ideal shape for a page cache, and it still cannot be expressed.
 
 **The test to apply before asking for a new preset:** *what fraction of this app's
 requests are pages a logged-out stranger can see, that look the same for every
