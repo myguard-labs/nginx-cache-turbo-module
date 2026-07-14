@@ -85,11 +85,18 @@
  * Auto-classify CMS backend presets (distinct from the stale-window PRESET_*
  * above). A bitmask in loc_conf->backend_presets; each bit pulls in one row of
  * the preset registry (cookie/URI/arg dynamic-surface rules). GENERIC is the
- * union of all known backends — what bare `cache_turbo <zone> auto` applies.
+ * union of the backends whose URI namespaces are disjoint enough to stack
+ * blindly — what bare `cache_turbo <zone> auto` applies.
+ *
+ * XENFORO is deliberately NOT in GENERIC: its dynamic surfaces are generic
+ * English paths (/login, /register, /contact, /misc) that a non-forum site can
+ * legitimately serve as cacheable pages, so folding it into `auto` would punch
+ * holes in unrelated sites' caches. Name it explicitly to opt in.
  */
 #define NGX_HTTP_CACHE_TURBO_BACKEND_WORDPRESS    0x0001
 #define NGX_HTTP_CACHE_TURBO_BACKEND_WOOCOMMERCE  0x0002
 #define NGX_HTTP_CACHE_TURBO_BACKEND_JOOMLA       0x0004
+#define NGX_HTTP_CACHE_TURBO_BACKEND_XENFORO      0x0008
 #define NGX_HTTP_CACHE_TURBO_BACKEND_GENERIC                                   \
     (NGX_HTTP_CACHE_TURBO_BACKEND_WORDPRESS                                    \
      | NGX_HTTP_CACHE_TURBO_BACKEND_WOOCOMMERCE                                \

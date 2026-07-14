@@ -1352,10 +1352,12 @@ ngx_http_cache_turbo_purge_request(ngx_http_request_t *r,
  * Auto-classify preset registry. Each row is one CMS backend: NULL-terminated
  * lists of request-Cookie name substrings, r->uri prefixes, and query-arg keys
  * that mark a request as a dynamic surface that must NOT be cached. Adding a
- * backend is one row here — no new code path. `generic` (bare `auto`) is the
- * union: a row is active when (clcf->backend_presets & row->bit). These mirror
- * the disjoint cookie/URI namespaces WP/Woo/Joomla use, so the union does not
- * collide. Curated heuristic, not a CMS fingerprint.
+ * backend is one row here — no new code path. A row is active when
+ * (clcf->backend_presets & row->bit). `generic` (bare `auto`) is the union of
+ * WP/Woo/Joomla, whose cookie/URI namespaces are disjoint, so stacking them
+ * cannot collide. A backend with generic-English URIs (xenforo) stays out of
+ * that union and must be named explicitly. Curated heuristic, not a CMS
+ * fingerprint.
  */
 typedef struct {
     ngx_uint_t           bit;
@@ -1382,6 +1384,31 @@ static const char *const  ct_joomla_cookies[] = { NULL };
 static const char *const  ct_joomla_uris[] = { "/administrator/", NULL };
 static const char *const  ct_joomla_args[] = { NULL };
 
+/*
+ * XenForo (XF2). Cookies: only the two that mark an *authenticated* visitor.
+ * `xf_session` is deliberately absent — XF issues it to guests as well, so
+ * bypassing on it would drop every visitor who ever touched a form out of the
+ * cache. `xf_user` is the persistent login cookie, `xf_session_admin` the
+ * admin-CP session. `xf_style_variation` / `xf_language_id` are presentation
+ * variants, NOT auth: they belong in cache_turbo_key, not here (bypassing on
+ * them would zero out caching for anyone who picked a dark theme). This mirrors
+ * what LiteSpeed's XF plugin does — bypass on xf_user/xf_session_admin, vary on
+ * style/language.
+ *
+ * Both cookie names honour $config['cookie']['prefix'] (default "xf_"); a forum
+ * that changed the prefix needs its own cache_turbo_bypass instead of (or on top
+ * of) this preset. URIs are the XF2 dynamic surfaces: auth flows, the admin and
+ * installer entry scripts, and /misc (the style/language picker + inline dispatch
+ * endpoints).
+ */
+static const char *const  ct_xf_cookies[] = {
+    "xf_user", "xf_session_admin", NULL };
+static const char *const  ct_xf_uris[] = {
+    "/admin.php", "/install/", "/login", "/logout", "/lost-password",
+    "/register", "/account", "/conversations", "/direct-messages",
+    "/contact", "/misc", NULL };
+static const char *const  ct_xf_args[] = { NULL };
+
 static const ngx_http_cache_turbo_preset_t  ngx_http_cache_turbo_presets[] = {
     { NGX_HTTP_CACHE_TURBO_BACKEND_WORDPRESS,
       ct_wp_cookies, ct_wp_uris, ct_wp_args },
@@ -1389,6 +1416,8 @@ static const ngx_http_cache_turbo_preset_t  ngx_http_cache_turbo_presets[] = {
       ct_woo_cookies, ct_woo_uris, ct_woo_args },
     { NGX_HTTP_CACHE_TURBO_BACKEND_JOOMLA,
       ct_joomla_cookies, ct_joomla_uris, ct_joomla_args },
+    { NGX_HTTP_CACHE_TURBO_BACKEND_XENFORO,
+      ct_xf_cookies, ct_xf_uris, ct_xf_args },
     { 0, NULL, NULL, NULL }
 };
 
@@ -3818,7 +3847,9 @@ ngx_http_cache_turbo(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
 /* cache_turbo_backend <name>... — compose one or more CMS auto-classify presets
  * (NGX_CONF_1MORE; listed names stack, e.g. `wordpress woocommerce`). "generic"
- * (or "auto") is the union of all backends; naming specific backends is tighter.
+ * (or "auto") is the union of the blindly-stackable backends (wordpress +
+ * woocommerce + joomla); naming specific backends is tighter. "xenforo" is
+ * opt-in only and NOT part of generic — see the BACKEND_* comment in the header.
  * Sets bits in clcf->backend_presets consumed by ngx_http_cache_turbo_auto_skip. */
 static char *
 ngx_http_cache_turbo_backend(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
@@ -3844,10 +3875,13 @@ ngx_http_cache_turbo_backend(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         } else if (ngx_strcmp(value[i].data, "joomla") == 0) {
             clcf->backend_presets |= NGX_HTTP_CACHE_TURBO_BACKEND_JOOMLA;
 
+        } else if (ngx_strcmp(value[i].data, "xenforo") == 0) {
+            clcf->backend_presets |= NGX_HTTP_CACHE_TURBO_BACKEND_XENFORO;
+
         } else {
             ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                 "unknown cache_turbo_backend \"%V\" (want "
-                "generic|wordpress|woocommerce|joomla)", &value[i]);
+                "generic|wordpress|woocommerce|joomla|xenforo)", &value[i]);
             return NGX_CONF_ERROR;
         }
     }
