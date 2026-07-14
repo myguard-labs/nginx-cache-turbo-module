@@ -1217,6 +1217,78 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # ---- wagtail -------------------------------------------------------
+        # URI prefixes anchor at position 0 -> ROOT locations. Every "must
+        # bypass" URI needs a REAL location: without one, nginx's implicit 404
+        # also carries no x-cache header and the assertion would pass for free.
+        location /admin/ {{
+            cache_turbo         main;
+            cache_turbo_backend wagtail;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        location /django-admin/ {{
+            cache_turbo         main;
+            cache_turbo_backend wagtail;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        # Permission-checked (serve_view enforces per-collection privacy).
+        location /documents/ {{
+            cache_turbo         main;
+            cache_turbo_backend wagtail;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        # The public site + /search/. Both MUST stay cacheable for anonymous
+        # readers -- including a guest carrying csrftoken, which Django hands to
+        # anyone who renders a form. /search/ is dynamic but anonymous-identical,
+        # so bypassing it would be a pure hit-rate loss.
+        location /wt/ {{
+            cache_turbo         main;
+            cache_turbo_backend wagtail;
+            cache_turbo_key     $uri$is_args$args;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        location /search/ {{
+            cache_turbo         main;
+            cache_turbo_backend wagtail;
+            cache_turbo_key     $uri$is_args$args;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # ---- kirby ---------------------------------------------------------
+        location /panel {{
+            cache_turbo         main;
+            cache_turbo_backend kirby;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        # The flat-file public site: the whole point of the preset. Must cache.
+        # /media/ is NOT a preset URI (static assets, no permission view) so it
+        # must cache too -- asserting that guards against someone "helpfully"
+        # adding it later.
+        location /kb/ {{
+            cache_turbo         main;
+            cache_turbo_backend kirby;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        location /media/ {{
+            cache_turbo         main;
+            cache_turbo_backend kirby;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # `none` overrides an inherited preset. The server-level directive below
         # arms wordpress for every location that does not say otherwise; this one
         # says otherwise, so /wp-admin/-style rules must NOT fire here.
@@ -2475,6 +2547,116 @@ def test_ghost_preset(ng: Nginx, origin: Origin) -> None:
     drain_origin(origin)
 
 
+def test_wagtail_preset(ng: Nginx, origin: Origin) -> None:
+    """Wagtail preset (docs/wagtail.md).
+
+    The first preset whose auth cookie belongs to the FRAMEWORK, not the app:
+    Wagtail ships no cookie of its own and rides Django's `sessionid`. That is only
+    safe because Django's SessionMiddleware saves the cookie ONLY when the session
+    is non-empty AND modified -- so a logged-out reader of a public page gets no
+    cookie at all. (Laravel has no such check and cookies every guest, which is why
+    there is no statamic/october/laravel preset. See docs/frameworks.md.)
+
+    The two assertions that matter pull in opposite directions:
+      - `sessionid` must bypass          (or a logged-in editor is served from cache)
+      - `csrftoken` must NOT bypass      (or the hit rate goes to zero)
+    Django hands csrftoken to any anonymous visitor who renders a form, so treating
+    it as a login signal is the classic way to build a cache that caches nothing."""
+    # Admin surfaces bypass. Each has a real location -- an implicit 404 carries no
+    # x-cache header either, and would pass this assertion for free.
+    for uri in ("/admin/pages/", "/django-admin/auth/user/"):
+        _, _, h = fetch(ng.port, uri)
+        assert "x-cache" not in h, f"wagtail: {uri} must bypass"
+
+    # /documents/ is permission-checked: WAGTAILDOCS_SERVE_METHOD defaults to
+    # serve_view, a Django view enforcing per-collection privacy. A private
+    # document fetched by an authorised user must never be stored and replayed.
+    _, _, hd = fetch(ng.port, "/documents/3/private-contract.pdf")
+    assert "x-cache" not in hd, \
+        ("wagtail: /documents/ is permission-checked (serve_view) -- it must bypass "
+         "or a private document is served to strangers")
+
+    # The logged-in editor: sessionid must bypass, on a URL a guest can also fetch.
+    for ck in ("sessionid=abc123", "sessionid=abc123; csrftoken=xyz"):
+        _, _, h1 = fetch(ng.port, "/wt/about", headers={"Cookie": ck})
+        _, _, h2 = fetch(ng.port, "/wt/about", headers={"Cookie": ck})
+        assert "x-cache" not in h1 and "x-cache" not in h2, \
+            f"wagtail: sessionid must bypass (Cookie: {ck})"
+
+    # THE INVERTED ONE. csrftoken is issued to ANONYMOUS visitors by Django, so it
+    # must NOT bypass. If a future edit adds it to the cookie list, the preset still
+    # "looks" correct -- it just silently stops caching. Fail loudly instead.
+    fetch(ng.port, "/wt/pricing", headers={"Cookie": "csrftoken=xyz"})
+    _, _, hc = fetch(ng.port, "/wt/pricing", headers={"Cookie": "csrftoken=xyz"})
+    assert hc.get("x-cache") == "HIT", \
+        ("wagtail: csrftoken is set for ANONYMOUS visitors and must keep caching -- "
+         f"bypassing it would zero the hit rate, got {hc.get('x-cache')}")
+
+    # Anonymous reader of the public site caches. This is the whole point.
+    fetch(ng.port, "/wt/home")
+    _, _, ha = fetch(ng.port, "/wt/home")
+    assert ha.get("x-cache") == "HIT", \
+        f"wagtail: an anonymous reader must cache, got {ha.get('x-cache')}"
+
+    # /search/ is deliberately NOT a preset URI: dynamic, but anonymous-IDENTICAL,
+    # so it is shared and hot. Bypassing it would be a pure hit-rate loss with no
+    # safety gain (same reasoning that keeps a blanket action= out of mediawiki).
+    fetch(ng.port, "/search/?q=nginx")
+    _, _, hs = fetch(ng.port, "/search/?q=nginx")
+    assert hs.get("x-cache") == "HIT", \
+        ("wagtail: /search/ is anonymous-identical and must stay cacheable, got "
+         f"{hs.get('x-cache')}")
+    drain_origin(origin)
+
+
+def test_kirby_preset(ng: Nginx, origin: Origin) -> None:
+    """Kirby preset (docs/kirby.md).
+
+    The best-shaped traffic of any preset here -- a flat-file site is almost
+    entirely public pages identical for every logged-out visitor.
+
+    kirby_session is a stable literal (session.cookieName) AND is not issued to
+    anonymous visitors: Kirby creates a session only when something is stored in
+    it. Stable + not-guest-issued is the pair every rejected candidate failed
+    (Grav's grav-site-<hash> is guest-issued AND per-install; Craft's
+    CraftSessionId is stable but handed to everyone).
+
+    THE ONE CONDITION FAILS SAFE: Kirby's csrf() helper creates a session cookie,
+    so a page with a contact/search form issues kirby_session to guests and stops
+    caching. That costs HITS; it never leaks -- the error direction is
+    bypass-a-guest, not serve-a-member's-page. Precisely inverted from Flarum,
+    whose no-remember-me logins carry only the guest-issued flarum_session, which
+    is why Flarum is rejected outright."""
+    # Panel (admin) bypasses.
+    _, _, h = fetch(ng.port, "/panel/pages")
+    assert "x-cache" not in h, "kirby: /panel must bypass"
+
+    # The logged-in Panel user / frontend member: kirby_session must bypass.
+    for ck in ("kirby_session=abc123",):
+        _, _, h1 = fetch(ng.port, "/kb/about", headers={"Cookie": ck})
+        _, _, h2 = fetch(ng.port, "/kb/about", headers={"Cookie": ck})
+        assert "x-cache" not in h1 and "x-cache" not in h2, \
+            f"kirby: kirby_session must bypass (Cookie: {ck})"
+
+    # Anonymous reader of the flat-file site caches -- Kirby issues no cookie to
+    # one, which is the property that makes this preset shippable.
+    fetch(ng.port, "/kb/home")
+    _, _, ha = fetch(ng.port, "/kb/home")
+    assert ha.get("x-cache") == "HIT", \
+        f"kirby: an anonymous reader must cache, got {ha.get('x-cache')}"
+
+    # /media/ is deliberately NOT a preset URI. Kirby serves assets from
+    # /media/<hash>/ with no per-request permission view, so it is static content
+    # that SHOULD cache -- bypassing it would be a self-inflicted wound. Assert it
+    # caches so nobody "helpfully" adds the prefix later.
+    fetch(ng.port, "/media/pages/home/logo.svg")
+    _, _, hm = fetch(ng.port, "/media/pages/home/logo.svg")
+    assert hm.get("x-cache") == "HIT", \
+        ("kirby: /media/ is static with no permission view and must stay cacheable, "
+         f"got {hm.get('x-cache')}")
+    drain_origin(origin)
+
+
 def test_new_presets_not_in_generic(ng: Nginx, origin: Origin) -> None:
     """None of the opt-in presets may be folded into generic/auto. Their URIs are
     generic English words (/login, /user, /admin, /session, /posts) that an
@@ -2719,8 +2901,10 @@ def test_backend_separators(ng: Nginx) -> None:
         "wordpress|woocommerce joomla",
         "mediawiki|drupal",
         "none",
-        "wordpress|woocommerce|joomla|xenforo|discourse|phpbb|drupal|mediawiki|magento|ghost",
+        "wordpress|woocommerce|joomla|xenforo|discourse|phpbb|drupal|mediawiki"
+        "|magento|ghost|wagtail|kirby",
         "magento|ghost",
+        "wagtail|kirby",
     ]):
         _config_accepts(ng, f"sep-ok-{i}", _BACKEND_LINE,
                         f"cache_turbo_backend {spec};")
@@ -5774,6 +5958,8 @@ def run_all(ng: Nginx, origin: Origin,
     test_mediawiki_preset(ng, origin)
     test_magento_preset(ng, origin)
     test_ghost_preset(ng, origin)
+    test_wagtail_preset(ng, origin)
+    test_kirby_preset(ng, origin)
     test_new_presets_not_in_generic(ng, origin)
     test_auto_classify_more(ng, origin)
     test_q2_multibuffer_oversize(ng, origin)
