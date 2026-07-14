@@ -30,12 +30,20 @@ Joomla user's page can be stored and served to the public.
 |---|---|
 | URI prefixes | `/administrator/` |
 | Query args | — |
-| Cookie substrings | — |
+| Cookie substrings | `joomla_remember_me_` |
 
-Compare that to the WordPress row (three cookies) and the reason is not
-laziness — it's that **Joomla's session cookie has no fixed name.** Joomla derives
-it from the site's secret, roughly `md5(md5($secret . 'site'))`, giving a bare
-32-hex cookie name with **no stable prefix**:
+## The cookie rule is a PARTIAL guard. Read this before you rely on it.
+
+`joomla_remember_me_` is the one Joomla cookie that is both **matchable** and
+**auth-only**. It is built as `'joomla_remember_me_' . getShortHashedUserAgent()`
+— the per-install part is the *suffix*, so the prefix is a stable literal — and it
+is set only for an authenticated user and cleared on logout.
+
+**But it only exists for users who ticked "Remember Me."** A member who simply logs
+in and does not tick the box carries **no such cookie**. What they carry is the
+session cookie — and **that** has no fixed name. Joomla derives it from the site's
+secret, roughly `md5(md5($secret . 'site'))`, giving a bare 32-hex cookie name with
+**no stable prefix**:
 
 ```
 1a79a4d60de6718e8e5b326e338ae533=abc123...      # a real Joomla session cookie
@@ -44,11 +52,30 @@ it from the site's secret, roughly `md5(md5($secret . 'site'))`, giving a bare
 (The front end and the administrator get *different* hashes — the `'site'` vs
 `'administrator'` component.)
 
-That name is different on every install, so there is no substring the module
-could ship that would match your site and not somebody else's. WordPress can ship
-`wordpress_logged_in_` because WordPress *prefixes* its hash; Joomla does not —
-the whole name is the hash. The preset therefore covers the one thing that *is*
-stable — the `/administrator/` path — and leaves the cookie to you.
+That name is different on every install, so there is no substring the module could
+ship that would match your site and not somebody else's. WordPress can ship
+`wordpress_logged_in_` because WordPress *prefixes* its hash; Joomla does not — the
+whole name **is** the hash.
+
+**So a normally-logged-in frontend user is invisible to this preset.** Do not read
+the presence of a cookie row as "Joomla is handled."
+
+## If your site has frontend logins, you MUST add a bypass
+
+Find your install's session-cookie name (log in, then look at the `Cookie` header —
+it is the bare 32-hex one), and bypass on it:
+
+```nginx
+# 1a79a4d6... is YOUR site's hash. It will not be the same as anyone else's.
+cache_turbo_bypass $cookie_1a79a4d60de6718e8e5b326e338ae533;
+```
+
+Without that, the only things standing between a logged-in Joomla user and a
+cached page are the `/administrator/` URI rule (which does not cover the front
+end) and Joomla's own `Cache-Control` — and Joomla core's page-cache plugin gates
+on `!$app->getIdentity()->guest`, which tells you upstream considers login state
+the thing that matters. `joomla_remember_me_` raises the floor. It does not make
+the preset safe on its own.
 
 **Consequence:** `cache_turbo_backend joomla;` on its own gives you an admin-URI
 guard and nothing more. A front-end user who logs in gets a session cookie the

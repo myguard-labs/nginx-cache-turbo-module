@@ -1401,33 +1401,84 @@ static const char *const  ct_woo_uris[] = {
  */
 static const char *const  ct_woo_args[] = { "wc-ajax", NULL };
 
-static const char *const  ct_joomla_cookies[] = { NULL };
+/*
+ * Joomla. One cookie, and it is a PARTIAL guard — read the caveat.
+ *
+ * `joomla_remember_me_` is a real fixed prefix ('joomla_remember_me_' .
+ * UserHelper::getShortHashedUserAgent()), set only for an authenticated user and
+ * cleared on logout. The per-install part is the SUFFIX, so the prefix is
+ * matchable — this is the one Joomla cookie that passes both tests.
+ *
+ * WHAT IT DOES NOT COVER, and this is the important half: it is only present for
+ * users who ticked "Remember Me". A normally-logged-in frontend user carries only
+ * the SESSION cookie, whose NAME is md5($secret . $session_name) — a per-install
+ * hash with no fixed substring anywhere in it. That user is invisible to this
+ * matcher. So joomla_remember_me_ raises the floor; it does not make the preset
+ * safe on its own.
+ *
+ * The real guard for a logged-in Joomla user therefore remains Joomla's own
+ * Cache-Control (core's page cache plugin itself gates on
+ * !$app->getIdentity()->guest), plus the /administrator/ URI rule. An operator
+ * running a site with frontend logins MUST add their own cache_turbo_bypass on
+ * their install's session-cookie name — docs/joomla.md shows how to find it.
+ * Do not read the presence of a cookie rule here as "joomla is now handled".
+ */
+static const char *const  ct_joomla_cookies[] = { "joomla_remember_me_", NULL };
 static const char *const  ct_joomla_uris[] = { "/administrator/", NULL };
 static const char *const  ct_joomla_args[] = { NULL };
 
 /*
- * XenForo (XF2). Cookies: only the two that mark an *authenticated* visitor.
- * `xf_session` is deliberately absent — XF issues it to guests as well, so
- * bypassing on it would drop every visitor who ever touched a form out of the
- * cache. `xf_user` is the persistent login cookie, `xf_session_admin` the
- * admin-CP session. `xf_style_variation` / `xf_language_id` are presentation
- * variants, NOT auth: they belong in cache_turbo_key, not here (bypassing on
- * them would zero out caching for anyone who picked a dark theme). This mirrors
- * what LiteSpeed's XF plugin does — bypass on xf_user/xf_session_admin, vary on
- * style/language.
+ * XenForo (XF2). READ THIS BEFORE TOUCHING THE COOKIE LIST.
  *
- * Both cookie names honour $config['cookie']['prefix'] (default "xf_"); a forum
- * that changed the prefix needs its own cache_turbo_bypass instead of (or on top
- * of) this preset. URIs are the XF2 dynamic surfaces: auth flows, the admin and
- * installer entry scripts, and /misc (the style/language picker + inline dispatch
- * endpoints).
+ * STOCK XF2 HAS NO LOGIN-ONLY COOKIE. This is the central, awkward fact about
+ * this preset, and an earlier version of it got this wrong and LEAKED.
+ *
+ * The trap: `xf_user` looks like the login cookie. It is not — it is the
+ * REMEMBER-ME cookie. ControllerPlugin/Login.php calls completeLogin($user,
+ * $remember) and only mints `xf_user` inside `if ($remember)`. "Stay logged in"
+ * is UNTICKED BY DEFAULT, so an ordinary member who just types their password
+ * carries NO xf_user at all. Matching only xf_user + xf_session_admin therefore
+ * misses the common login entirely: that member's authenticated page matched no
+ * bypass rule, got stored, and was served to strangers.
+ *
+ * So `xf_session` is in the list, and it has to be, even though XF issues it to
+ * guests. That is the whole trade:
+ *
+ *   - XF2's session IS lazy (Pub/App.php only saves when hasData() is true), so
+ *     a clean first-time guest who stores nothing gets NO cookie and still
+ *     caches. This is why the rule is not an instant hit-rate zero.
+ *   - BUT guests acquire a session routinely: LOGGING OUT writes userId=0 into
+ *     the session, a pending 2FA login writes tfaLoginUserId, captcha and spam
+ *     state write too. Any of those, and that guest is uncacheable from then on.
+ *
+ * Net: correct, with an unpredictable and possibly poor hit rate. That is the
+ * only cookie-only option that is not a leak. Do not "optimise" xf_session back
+ * out of this list — that is the leak, and it is how this preset shipped before.
+ *
+ * `xf_lscxf_logged_in` is the LiteSpeed XF2 plugin's cookie (its Login.php
+ * override sets it IGNORING $remember, with the verbatim comment "Set custom
+ * cookie to better track logged in state when 'Stay logged in' is unchecked").
+ * A vendor writing PHP to create this cookie is the proof that stock XF has
+ * none. On a forum running that plugin it is the precise login signal, and the
+ * operator can then narrow the preset by dropping xf_session with their own
+ * config. Harmless when the plugin is absent (the cookie simply never appears).
+ *
+ * `xf_style_variation` / `xf_language_id` are presentation variants, NOT auth:
+ * they belong in cache_turbo_key, not here (bypassing on them would zero out
+ * caching for anyone who picked a dark theme).
+ *
+ * All names honour $config['cookie']['prefix'] (default "xf_"); a forum that
+ * changed the prefix needs its own cache_turbo_bypass. URIs are the XF2 dynamic
+ * surfaces: auth flows, the admin and installer entry scripts, and /misc (the
+ * style/language picker + inline dispatch endpoints). /contact is NOT a stock
+ * XF2 route — the real one is misc/contact, already covered by /misc.
  */
 static const char *const  ct_xf_cookies[] = {
-    "xf_user", "xf_session_admin", NULL };
+    "xf_session", "xf_user", "xf_session_admin", "xf_lscxf_logged_in", NULL };
 static const char *const  ct_xf_uris[] = {
     "/admin.php", "/install/", "/login", "/logout", "/lost-password",
     "/register", "/account", "/conversations", "/direct-messages",
-    "/contact", "/misc", NULL };
+    "/misc", NULL };
 static const char *const  ct_xf_args[] = { NULL };
 
 /*
@@ -1485,28 +1536,44 @@ static const char *const  ct_phpbb_uris[] = {
 static const char *const  ct_phpbb_args[] = { "sid", NULL };
 
 /*
- * Drupal 9/10/11. NO COOKIE RULE, for a different reason than phpBB.
+ * Drupal 9/10/11. Cookie rule: the "SESS" substring, which covers BOTH
+ * SESS<hash> and SSESS<hash> (the TLS variant) in one entry.
  *
- * Drupal's session cookie is SESS<32-hex> (SSESS<32-hex> over TLS), where the
- * hash is derived per-install from the hostname (Core/Session/
- * SessionConfiguration.php). The only shippable literal is "SESS" — and a
- * substring match on "SESS" also hits PHPSESSID and JSESSIONID, i.e. the stock
- * session cookie of every other PHP and Java app on the box. That is a safe
- * failure (over-bypass, never a leak) but it would silently zero the hit rate
- * for any co-hosted app, so it is not worth shipping.
+ * THIS USED TO SHIP NO COOKIE RULE. That was a LEAK, and the reasoning behind it
+ * was factually wrong. The old comment claimed "anonymous readers get no session
+ * cookie at all", so the Cache-Control floor alone was enough. Drupal does not
+ * work that way: it opens a session for an ANONYMOUS user as soon as anything
+ * writes to $_SESSION, and core's own NoSessionOpen docblock names the everyday
+ * cases — a status message queued by a form submission, and cart contents. Once
+ * that happens the visitor holds SESS<hash>, and a logged-IN user holds the same
+ * cookie shape. With no cookie rule, an authenticated response could be stored
+ * and served to a stranger the moment the Cache-Control floor was not there to
+ * catch it (`cache_turbo_cache_control ignore` removes it, and the README
+ * recommends that mode for some origins). Correctness cannot rest on that floor.
  *
- * It costs little, because Drupal defends itself: it sends `private,
- * must-revalidate` on every authenticated response (EventSubscriber/
- * FinishResponseSubscriber.php), and cache_turbo_backend implies
- * cache_control honor, whose store path refuses `private`. The URI rules below
- * add the surfaces that are dynamic before any cookie exists. An operator who
- * wants belt-and-braces adds cache_turbo_bypass $cookie_SESS<their-hash>.
+ * THE KNOWN COST, accepted deliberately: "SESS" is a substring of PHPSESSID and
+ * JSESSIONID, so on a box that co-hosts another PHP or Java app under the same
+ * server block, this rule also bypasses on THAT app's session cookie. That is a
+ * hit-rate loss, never a leak — and a hit-rate loss on a co-hosted app is not a
+ * reason to keep leaking on the Drupal one. An operator who cares can narrow it
+ * with their own cache_turbo_bypass $cookie_SESS<their-hash>; see docs/drupal.md.
  *
- * (Anonymous readers get no session cookie at all — Drupal destroys an obsolete
- * session rather than persisting one — so a SESS rule would at least not be the
- * xf_session trap. The PHPSESSID collision is what rules it out.)
+ * The hash is per-install (derived from the hostname — Core/Session/
+ * SessionConfiguration.php), so "SESS" is the ONLY shippable literal; matching
+ * the full name is impossible.
+ *
+ * NOT NO_CACHE. It looks like the obvious addition — it is a fixed literal and it
+ * appears in every canonical Drupal VCL — but it is CONTRIB, not core (zero hits
+ * in the Drupal 11 core tree; it is Pressflow/Varnish heritage carried by modules
+ * like cookie_cache_bypass_adv), and it is set FOR LOGGED-OUT visitors by design
+ * (that is its whole purpose: force a cache bypass for a guest who must see fresh
+ * content). Matching it costs hits and buys no safety.
+ *
+ * Drupal still defends itself — `private, must-revalidate` on every authenticated
+ * response (EventSubscriber/FinishResponseSubscriber.php) — but that is now
+ * defence-in-depth behind the cookie rule, which is the correct ordering.
  */
-static const char *const  ct_drupal_cookies[] = { NULL };
+static const char *const  ct_drupal_cookies[] = { "SESS", NULL };
 static const char *const  ct_drupal_uris[] = {
     "/user", "/admin", "/node/add", "/system/", "/core/install.php", NULL };
 static const char *const  ct_drupal_args[] = { NULL };
@@ -1515,15 +1582,30 @@ static const char *const  ct_drupal_args[] = { NULL };
  * MediaWiki. Cookie prefix is $wgCookiePrefix, which DEFAULTS TO THE DATABASE
  * NAME — so, as with joomla, there is no shippable prefix. What is shippable is
  * the SUFFIX: the identity cookies are <prefix>UserID / <prefix>UserName /
- * <prefix>Token, and those CamelCase tails are distinctive enough to match on
- * (Session/CookieSessionProvider.php sets them only for a logged-in user, and
- * explicitly clears UserID when the user is anonymous). "Token" alone is NOT
- * shipped: this matcher searches the whole Cookie header, so a bare "Token"
- * would also hit any cookie whose VALUE happened to contain it.
+ * <prefix>Token / <prefix>_session, and those tails are distinctive enough to
+ * match on.
  *
- * <prefix>_session is not matched either — it is issued to an anonymous visitor
- * who merely interacts (an edit preview, a CSRF token), so it is closer to
- * xf_session than to an auth cookie.
+ * MATCH WHAT UPSTREAM MATCHES. MediaWiki's own getVaryCookies() says it plainly:
+ *
+ *     "Vary on token and session because those are the real authn determiners.
+ *      UserID and UserName don't matter without those."
+ *
+ * So `Token=` and `_session=` are the load-bearing pair, and they are what is
+ * shipped. `UserID=` is kept as a cheap belt-and-braces (it is cleared for an
+ * anonymous user, so it costs nothing).
+ *
+ * `UserName=` IS DELIBERATELY NOT MATCHED, and this is not an oversight —
+ * unpersistSession() deliberately does NOT clear it on logout, because it
+ * pre-fills the login form. So EVERY visitor who has ever logged in keeps
+ * sending <prefix>UserName forever, long after they are anonymous again.
+ * Bypassing on it is a permanent hit-rate loss for that visitor with zero safety
+ * gain — they are, by then, exactly the shared anonymous reader the cache exists
+ * for. It used to be in this list; removing it is a pure win.
+ *
+ * `_session=` is matched even though an anonymous visitor who merely interacts
+ * (edit preview, CSRF token) can acquire one. That is the xf_session trade in
+ * miniature and it is the right side of it: upstream names it a real authn
+ * determiner, and a bypassed guest costs hits while a cached member leaks.
  *
  * MediaWiki's dynamic surface is in the QUERY ARGS, not the path: /wiki/<Title>
  * is the cacheable read path and /index.php?action=... is the dynamic one. Only
@@ -1560,7 +1642,7 @@ static const char *const  ct_drupal_args[] = { NULL };
  * re-add a path rule without a source that says MediaWiki cannot cache it.
  */
 static const char *const  ct_mw_cookies[] = {
-    "UserID=", "UserName=", NULL };
+    "Token=", "_session=", "UserID=", NULL };
 static const char *const  ct_mw_uris[] = { NULL };
 static const char *const  ct_mw_args[] = { "veaction", "returnto", NULL };
 

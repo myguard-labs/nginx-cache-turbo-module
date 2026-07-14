@@ -32,33 +32,75 @@ cookie exists.
 |---|---|
 | URI prefixes | `/user`, `/admin`, `/node/add`, `/system/`, `/core/install.php` |
 | Query args | — |
-| Cookie substrings | **— (none)** |
+| Cookie substrings | `SESS` |
 
 Drupal's session cookie is `SESS<32-hex>` — or `SSESS<32-hex>` over TLS — where
 the hash is derived per-install from the site's hostname
 (`Core/Session/SessionConfiguration.php`). There is no stable suffix, so the only
-literal the module could ship is the leading `SESS`.
+literal the module can ship is the leading `SESS` — which, as a substring, covers
+both the plain and the TLS form in one rule.
 
-**And `SESS` is a bad substring to ship.** The preset registry matches substrings
-of the whole `Cookie` header, and `SESS` appears inside:
+## This preset used to ship no cookie rule. That was a leak.
+
+The old reasoning went: `SESS` is a substring of `PHPSESSID` and `JSESSIONID`, so
+shipping it would bypass on any co-hosted PHP or Java app's session cookie and
+zero *their* hit rate — and anyway Drupal defends itself with `Cache-Control:
+private`, so the cookie rule is unnecessary. **Both halves of that were wrong in a
+way that mattered.**
+
+**Anonymous Drupal users DO get a session cookie.** The old comment assumed they
+never do. Drupal opens a session for an anonymous visitor as soon as *anything*
+writes to `$_SESSION`, and core's own `NoSessionOpen` docblock names the everyday
+cases: a **status message queued by a form submission**, and **cart contents**. So
+`SESS<hash>` is not a logged-in-only marker in one direction — but a **logged-in
+user carries exactly the same cookie shape**. With no cookie rule at all, nothing
+in the request identifies that member, and their authenticated page is a candidate
+for storage.
+
+**And the Cache-Control floor is not something correctness may rest on.** Yes,
+`FinishResponseSubscriber` sets `private, must-revalidate` on authenticated
+responses, and `honor` mode (which `cache_turbo_backend` implies) refuses to store
+`private`. But `cache_turbo_cache_control ignore` **switches that floor off**, and
+this project's own README recommends that mode for origins that blanket everything
+with `max-age=0`. An operator who follows that advice on a Drupal site was, under
+the old preset, one config line away from serving a logged-in user's page to a
+stranger. A bypass rule must hold on its own.
+
+## The collision is real, and it is the accepted price
+
+`SESS` genuinely does match inside `PHPSESSID` and `JSESSIONID`:
 
 ```
-PHPSESSID=...      <- every stock PHP app
-JSESSIONID=...     <- every stock Java app
+PHPSESSID=...      <- every stock PHP app     -> also bypasses
+JSESSIONID=...     <- every stock Java app    -> also bypasses
 ```
 
-Shipping it would make cache-turbo bypass on any co-hosted PHP or Java app's
-session cookie. That fails *safe* — an unnecessary bypass never leaks anything —
-but it would silently zero the hit rate on sites that aren't even Drupal. Not
-worth it, so the row is empty.
+If you co-host another PHP or Java app under the same `server` block, its session
+cookie will bypass cache-turbo too. **That is a hit-rate loss on that app. It is
+never a leak.** And a hit-rate loss on a neighbouring app is not a reason to keep
+leaking on the Drupal one — so the rule ships.
 
-**What protects logged-in users instead** is the origin. Drupal's
-`FinishResponseSubscriber` sets `Cache-Control: private, must-revalidate` on
-authenticated responses (and `no-cache, private` when there are no validators),
-and cache-turbo's `honor` mode refuses to store a response carrying `private`,
-`no-cache` or `no-store`. `cache_turbo_backend` turns `honor` on for you. So the
-authenticated page is never stored — not because a cookie rule caught the
-request, but because the origin said not to.
+If the collision costs you, narrow it to your install:
+
+```nginx
+# Replace <hash> with the value from your own Set-Cookie (see the 3-curl check).
+cache_turbo_bypass $cookie_SESS<hash>;
+```
+
+## Not `NO_CACHE`
+
+`NO_CACHE` looks like the obvious addition — it is a fixed literal, and it appears
+in every canonical Drupal VCL. Do not add it:
+
+- It is **contrib, not core** (zero hits in the Drupal 11 `core/` tree). It is
+  Pressflow/Varnish heritage, carried by modules like `cookie_cache_bypass_adv`.
+- It is set **for logged-out visitors by design** — that is its entire purpose:
+  force a cache bypass for a guest who must see fresh content.
+
+Matching it would cost hits and buy no safety.
+
+**The origin's `Cache-Control` is still there**, and still useful — it is now
+defence-in-depth *behind* the cookie rule, which is the correct ordering.
 
 There is a second reason the missing cookie rule costs little: **anonymous
 readers get no session cookie at all.** Drupal destroys an obsolete session

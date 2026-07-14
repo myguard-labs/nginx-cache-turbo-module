@@ -24,14 +24,73 @@ cache_turbo_key     $host$uri$cookie_xf_style_variation$cache_turbo_normalized_a
 
 `cache_turbo_backend xenforo` auto-skips the dynamic surfaces — the auth flows,
 the admin CP, the installer, `/account`, DMs, `/misc` — and bypasses any request
-carrying `xf_user` (a logged-in member) or `xf_session_admin`. Guests get cached
-pages; members always hit the origin and their HTML is **never stored**.
+carrying `xf_session`, `xf_user`, `xf_session_admin` or `xf_lscxf_logged_in`.
 
 `xenforo` is opt-in and must be named, like the WordPress, WooCommerce
 and Joomla presets. Its URI prefixes are generic English words (`/login`,
-`/register`, `/contact`, `/misc`) that a non-forum site can legitimately serve as
-cacheable pages, so folding it into the union would punch holes in unrelated
-sites' caches. Name it explicitly.
+`/register`, `/misc`) that a non-forum site can legitimately serve as cacheable
+pages, so folding it into the union would punch holes in unrelated sites' caches.
+Name it explicitly.
+
+## Read this first: stock XenForo has NO login-only cookie
+
+This is the awkward, load-bearing fact about caching XenForo, and an earlier
+version of this preset got it wrong and **leaked**.
+
+**`xf_user` is not the login cookie. It is the *remember-me* cookie.**
+`ControllerPlugin/Login.php` calls `completeLogin($user, $remember)` and only mints
+`xf_user` inside `if ($remember)`. **"Stay logged in" is unticked by default.** So
+an ordinary member — types password, clicks Log in, does not tick the box — carries
+**no `xf_user` at all**. They carry only `xf_session`.
+
+The old preset matched `xf_user` and `xf_session_admin`, and deliberately excluded
+`xf_session` on the grounds that guests get one too. The result: that ordinary
+member matched **no bypass rule**, their authenticated page was stored, and it was
+served to strangers. A real cross-user leak, on the *common* login path.
+
+**So `xf_session` is now in the cookie list, and it has to be.** That is the whole
+trade, and it is not free:
+
+- XF2's session is **lazy** — `Pub/App.php` only saves a session that `hasData()`.
+  A clean first-time guest who stores nothing gets **no cookie** and still caches.
+  This is why the rule is not an instant hit-rate zero.
+- **But guests acquire sessions routinely.** *Logging out* writes `userId=0` into
+  the session. A pending 2FA login writes `tfaLoginUserId`. Captcha and spam state
+  write too. Any of those, and that guest is uncacheable from then on.
+
+Net: **correct, with an unpredictable and possibly poor hit rate.** That is the
+only cookie-only option that is not a leak.
+
+> **Do not "optimise" `xf_session` back out of the cookie list.** That is the leak,
+> and it is exactly how this preset shipped before. If your hit rate is
+> disappointing, the fix is the plugin below — not deleting the rule.
+
+## The fast path: a real login-only cookie
+
+If you run **LiteSpeed's XF2 plugin** (`lscache-xf2`), you get `xf_lscxf_logged_in`
+— a cookie set on **every** login regardless of "Stay logged in", and cleared on
+logout. The plugin's own source carries the comment:
+
+> *"Set custom cookie to better track logged in state when 'Stay logged in' is
+> unchecked."*
+
+A vendor writing PHP to create this cookie **is the proof** that stock XF has none.
+The preset already matches it (harmlessly absent if you don't run the plugin). With
+it installed you have a precise login signal, and you can then narrow the preset by
+dropping the broad `xf_session` rule:
+
+```nginx
+# ONLY do this if you actually run lscache-xf2 (or an add-on that sets an
+# equivalent login-only cookie). Without one, dropping xf_session re-opens the
+# leak described above.
+cache_turbo_backend none;
+cache_turbo_bypass  $cookie_xf_lscxf_logged_in $cookie_xf_user
+                    $cookie_xf_session_admin;
+```
+
+The same applies to any add-on of your own that sets a login-only cookie: XF gives
+you no way to tell a member from a guest by cookie name, so if you want both safety
+and a good hit rate, **something has to mint that cookie.**
 
 ## Why not just key on the session cookie?
 
