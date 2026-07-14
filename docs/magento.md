@@ -3,14 +3,14 @@
 Caching a Magento 2 (2.4.x) store. Magento is the **best-behaved application in
 this set** — it is *architecturally designed* to sit behind a shared cache, it
 ships its own reference Varnish VCL, and it tells you what is cacheable in-band
-via `Cache-Control`. This preset is that VCL, translated — with **one deliberate
-deviation you must understand**, because copying upstream naively here would leak
-one customer's cart to another.
+via `Cache-Control`. This preset **is** that VCL, translated, with no deviation:
+it value-keys the one cookie Magento's own VCL keys on, exactly the way upstream
+does.
 
 - [The short version](#the-short-version)
 - [Why this can replace Varnish](#why-this-can-replace-varnish)
-- [`X-Magento-Vary`: the one cookie, and the trap](#x-magento-vary-the-one-cookie-and-the-trap)
-- [Recovering the logged-in hit rate](#recovering-the-logged-in-hit-rate)
+- [`X-Magento-Vary`: value-keyed, not bypassed](#x-magento-vary-value-keyed-not-bypassed)
+- [The transition race](#the-transition-race)
 - [Cookies that must NOT bypass](#cookies-that-must-not-bypass)
 - [Vhost](#vhost)
 - [Checking it works](#checking-it-works)
@@ -24,7 +24,8 @@ cache_turbo_backend magento;      # implies cache_turbo_cache_control honor
 ```
 
 Set Magento's cache application to **Built-in**, not Varnish (see
-[Gotchas](#gotchas)). That's it for a correct, safe config.
+[Gotchas](#gotchas)). That's it for a correct, safe config — the vary cookie is
+handled natively, no `map` required.
 
 ## Why this can replace Varnish
 
@@ -53,13 +54,13 @@ What makes it safe is that Magento does the hard part itself:
   are protected *before a single preset rule runs*. The URI list below is
   defence-in-depth, not the primary control.
 
-## `X-Magento-Vary`: the one cookie, and the trap
+## `X-Magento-Vary`: value-keyed, not bypassed
 
 | Check | Values |
 |---|---|
 | URI prefixes | `/checkout`, `/customer`, `/graphql`, `/sales`, `/newsletter`, `/wishlist`, `/paypal`, `/review`, `/page_cache/block/esi`, `/health_check.php` |
 | Query args | — |
-| Cookie substrings | `X-Magento-Vary` |
+| Key cookies (value folded into cache key) | `X-Magento-Vary` |
 
 `X-Magento-Vary` is Magento's *"this visitor is not the shared anonymous case"*
 signal. It is a salted hash of the **vary context** — customer group, auth flag,
@@ -73,7 +74,7 @@ their defaults**:
 - A logged-in customer, a non-default customer group, or a switched
   currency/store ⇒ the cookie **is** set.
 
-**Here is the trap.** Magento's own VCL puts this cookie in the **cache key**:
+Magento's own VCL puts this cookie's **value** in the cache key:
 
 ```vcl
 sub vcl_hash {
@@ -83,49 +84,79 @@ sub vcl_hash {
 }
 ```
 
-That hashes the cookie's **value**, giving each context its own cache bucket. The
-preset **cannot** do that: its cookie matcher tests *presence*, never value. If it
-keyed on presence, then customer A, customer B, and a EUR guest would all hash to
-**one shared bucket** — and you would serve one customer's cart to another.
+`vcl_recv` has **no `return(pass)` on this cookie at all** — Magento's proxy
+passes only on URL (checkout, customer, media/static) and non-GET/HEAD methods.
+The built-in PHP Full Page Cache agrees:
+`Framework/App/PageCache/Identifier.php` folds `COOKIE_VARY_STRING` into the
+sha1 cache id. Two independent upstream implementations, one answer — the vary
+value is a cache-key component, not a bypass trigger.
 
-So the preset **bypasses** on it instead. That is correct-but-conservative:
-anonymous default-context traffic (the catalog — the bulk, and the entire point)
-still caches and is shared; everyone else goes to origin. Nothing leaks.
+**This preset does the same thing**, via a third tier of preset rule —
+`key_cookies` — alongside the URI list above: the raw `Cookie:` header is parsed
+for `X-Magento-Vary`, and its value is folded into the cache key automatically.
+Each vary context (anonymous, logged-in group A, EUR guest, …) gets its own
+cache entry, exactly like Varnish's `hash_data`. You do not configure a `map` or
+add anything to `cache_turbo_key` — this is intrinsic to the preset.
 
-## Recovering the logged-in hit rate
+**Why the old bypass was wrong.** The cookie is a *segment fingerprint*, not an
+identity: `Context::getVaryString()` runs `sha256` over the **sorted tuple**
+`{customer_group, customer_logged_in, store, currency}`, and `getData()` drops
+any field equal to its default. A default anonymous visitor gets **no cookie**.
+A guest who merely switched currency or store view gets one — while holding
+**zero** private data. Bypassing sent every one of those non-default anonymous
+visitors to origin for nothing. The "it stops a cart leak" justification was
+also false: the cart is never in the cached HTML. Magento's private-content/
+sections JS fetches it client-side after load — that is the entire point of the
+architecture. Two logged-in shoppers in the same group/store/currency are
+*designed* to receive byte-identical cached HTML; refusing to cache that page
+bought no safety and cost real hit rate.
 
-If you want upstream's behaviour back — non-default visitors cached, correctly
-segmented — put the cookie's **value** in the cache key. It must be done with a
-`map`:
+**Why not presence-key either.** Presence-keying (cache once you see the cookie
+at all, ignore its value) would collapse a EUR guest, a wholesale customer and a
+logged-in retail customer into **one shared bucket** — that genuinely is a
+cross-user leak. Value-keying and presence-keying are different mechanisms;
+rejecting the second is not an argument for bypass. Value-keying is what
+upstream does, and it is safe.
 
-```nginx
-# http context
-map $http_cookie $magento_vary {
-    default                        "";
-    "~X-Magento-Vary=(?<v>[^;]+)"  "$v";
-}
-```
+## The transition race
 
-```nginx
-# location context
-cache_turbo_backend magento;
-cache_turbo_key     $scheme$host$uri$is_args$args$magento_vary;
-```
+There is one real hazard, and it is invisible from the request side alone: a
+request carrying **no** vary cookie hashes to the shared anonymous bucket, but
+the *response* can be the one that sets `X-Magento-Vary` (a guest's first
+non-default action). Storing that segmented body under the anonymous key would
+poison it for every anonymous visitor afterwards.
 
-Now each vary context gets its own cache entry, exactly like Varnish's
-`hash_data`, and a logged-in customer's pages are cached *per context* instead of
-bypassed. The bypass rule still fires too, so if you want the hit rate you must
-also drop the cookie from the preset's reach — in practice: keep the preset for
-its URI rules and add your own key, and accept that the shipped cookie rule makes
-this a belt-and-braces config rather than a hit-rate win. (A future
-cookie-value-aware preset rule would make this unnecessary.)
+Magento's own VCL refuses this explicitly, in `vcl_backend_response`:
+`beresp.uncacheable = true` when the backend request had no vary cookie but the
+backend response sets one.
+
+cache-turbo gets the identical refusal for free, with no magento-specific code:
+`ngx_http_cache_turbo_response_cacheable()` has an **unconditional** floor that
+never stores any response carrying `Set-Cookie` — and the response that
+establishes a new vary segment necessarily carries one. This preset **depends**
+on that floor; there is nothing else guarding the transition.
 
 > **⚠️ Do not write `$cookie_X_Magento_Vary`.** It looks right and it **silently
 > never matches**. nginx does *not* translate `-` to `_` for cookie names (unlike
 > request headers, where `$http_x_forwarded_for` works). `$cookie_x_magento_vary`
 > is empty for every request, and `$cookie_x-magento-vary` parses as `$cookie_x`
-> followed by the literal text `-magento-vary`. Use the `map` above — it is the
-> only form that works.
+> followed by the literal text `-magento-vary`. This is exactly why the preset
+> parses the raw `Cookie:` header itself instead of relying on nginx's `$cookie_`
+> variables — no `map` workaround is needed, or possible to get right by hand.
+
+**Key-cookie name matching is exact**, unlike the tier-2 cookie *predicates*
+used by presets like `phpbb` (which match by name suffix). The value goes
+straight into the cache key, so a loose match would let an attacker choose which
+bucket their request lands in by sending a cookie like `NOT-X-Magento-Vary`. The
+predicate engine can afford suffix matching because its failure mode is a
+needless bypass; a key cookie cannot, because its failure mode is bucket
+selection.
+
+**All `Cookie:` request headers are scanned**, not just the first — a client can
+legally split cookies across multiple `Cookie:` headers, and Varnish's own
+`std.collect()` exists for the same reason. Scanning only the first header would
+let an attacker hide the real vary cookie in a second header and pick their
+bucket.
 
 ## Cookies that must NOT bypass
 
@@ -146,7 +177,8 @@ preset, on purpose — and this is the single most valuable thing on this page.
 
 Magento's own VCL inspects **no cookie at all** for its pass/hash decision — it
 leans entirely on `Cache-Control` plus the `X-Magento-Vary` key. That is a strong
-hint about which cookies matter, and the answer is: only that one.
+hint about which cookies matter, and the answer is: only that one, and only by
+value.
 
 ## Vhost
 
@@ -155,13 +187,6 @@ load_module modules/ngx_http_cache_turbo_module.so;
 
 http {
     cache_turbo_zone name=ct 512m;
-
-    # Optional: recover the logged-in hit rate by keying on the vary context.
-    # See "Recovering the logged-in hit rate" -- note this MUST be a map.
-    map $http_cookie $magento_vary {
-        default                       "";
-        "~X-Magento-Vary=(?<v>[^;]+)" "$v";
-    }
 
     upstream fastcgi_backend { server unix:/run/php/php-fpm.sock; }
 
@@ -178,6 +203,7 @@ http {
         location ~ ^/(index|get|static|errors/report|errors/404|errors/503)\.php$ {
             cache_turbo               ct;
             cache_turbo_backend       magento;   # implies cache_control honor
+                                                  # and value-keys X-Magento-Vary
 
             cache_turbo_key           $scheme$host$uri$is_args$args;
             cache_turbo_valid         300s;      # catalog tolerates a long TTL
@@ -216,31 +242,40 @@ add_header X-Cache-Turbo $cache_turbo_status always;
 
 ```bash
 # anonymous catalog page: MISS then HIT. This is the money path.
-curl -sI https://shop.example.com/some-category | grep -i x-cache-turbo
-curl -sI https://shop.example.com/some-category | grep -i x-cache-turbo   # HIT
+curl -s -o /dev/null -D- https://shop.example.com/some-category | grep -i x-cache-turbo
+curl -s -o /dev/null -D- https://shop.example.com/some-category | grep -i x-cache-turbo   # HIT
 
 # cart / checkout / account: BYPASS
-curl -sI https://shop.example.com/checkout/cart     | grep -i x-cache-turbo
-curl -sI https://shop.example.com/customer/account  | grep -i x-cache-turbo
+curl -s -o /dev/null -D- https://shop.example.com/checkout/cart     | grep -i x-cache-turbo
+curl -s -o /dev/null -D- https://shop.example.com/customer/account  | grep -i x-cache-turbo
 
 # THE HIT-RATE CHECK. A GUEST carrying the cookies Magento gives every visitor
 # must still be a HIT. If any of these say BYPASS, someone added an anon cookie
 # to a bypass list and your catalog cache is now doing nothing.
-curl -sI -H 'Cookie: PHPSESSID=abc; form_key=def; private_content_version=1a2b' \
+curl -s -o /dev/null -D- -H 'Cookie: PHPSESSID=abc; form_key=def; private_content_version=1a2b' \
      https://shop.example.com/some-category | grep -i x-cache-turbo        # HIT
 
-# THE SAFETY CHECK. A non-default context (logged in / group / currency) must
-# never be served from a shared entry.
-curl -sI -H 'Cookie: X-Magento-Vary=9f2a4c1e' \
-     https://shop.example.com/some-category | grep -i x-cache-turbo        # BYPASS
+# THE SEGMENTATION CHECK. Two different vary values must land in two different
+# entries -- neither one a HIT off the other's warm-up.
+curl -s -o /dev/null -D- -H 'Cookie: X-Magento-Vary=9f2a4c1e' \
+     https://shop.example.com/some-category | grep -i x-cache-turbo        # MISS (first time)
+curl -s -o /dev/null -D- -H 'Cookie: X-Magento-Vary=9f2a4c1e' \
+     https://shop.example.com/some-category | grep -i x-cache-turbo        # HIT (own segment)
+curl -s -o /dev/null -D- -H 'Cookie: X-Magento-Vary=deadbeef' \
+     https://shop.example.com/some-category | grep -i x-cache-turbo        # MISS (different segment, not the other customer's HIT)
 
 # And confirm the origin is doing its half.
-curl -sI https://shop.example.com/checkout/cart | grep -i cache-control
+curl -s -o /dev/null -D- https://shop.example.com/checkout/cart | grep -i cache-control
 # Cache-Control: no-store, no-cache, must-revalidate, max-age=0
 ```
 
-Run the hit-rate check **and** the safety check before you go live. The first
-protects your performance; the second protects your customers.
+Run the hit-rate check **and** the segmentation check before you go live. The
+first protects your performance; the second protects your customers — two
+different `X-Magento-Vary` values must never share a cache entry.
+
+Note the module never stores `HEAD` responses, so a `curl -sI` HEAD request can
+**never** show a `HIT` here — the recipes above are deliberately GET
+(`-s -o /dev/null -D-`), not `-sI`.
 
 ## Gotchas
 
@@ -278,8 +313,13 @@ protects your performance; the second protects your customers.
   `/checkout/cart` and `/checkout/onepage/*`, both covered by `/checkout`. A
   `/cart` prefix would match nothing on a stock install — and could false-positive
   on a catalog URL key like `/cartridge-refill`.
+- **A wide vary key range can grow the cache.** Every distinct vary value is its
+  own full set of cache entries. On a store with many customer groups or store
+  views this is the correct tradeoff (it is what upstream does), but size your
+  zone and TTLs with that multiplication in mind.
 - **`Set-Cookie` responses are never stored** and `Authorization` requests are
-  never cached, regardless of preset.
+  never cached, regardless of preset. This is also what protects the
+  vary-transition race above — see [The transition race](#the-transition-race).
 
 ## See also
 

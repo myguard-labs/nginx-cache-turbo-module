@@ -473,7 +473,7 @@ per-session suffixes, so it matches as a substring).
 | `phpbb` †     | `/ucp.php`, `/mcp.php`, `/adm/`, `/posting.php`, `/memberlist.php`, `/search.php`, `/report.php` | `sid` | *(value)* `…_u != 1` ∆ |
 | `drupal` †    | `/user`, `/admin`, `/node/add`, `/system/`, `/core/install.php` | — | `SESS` ¥ |
 | `mediawiki` † | — ¶ | `veaction`, `returnto` | `Token=`, `_session=`, `UserID=` |
-| `magento` †   | `/checkout`, `/customer`, `/graphql`, `/sales`, `/newsletter`, `/wishlist`, `/paypal`, `/review`, `/page_cache/block/esi`, `/health_check.php` | — | `X-Magento-Vary` |
+| `magento` † ✦ | `/checkout`, `/customer`, `/graphql`, `/sales`, `/newsletter`, `/wishlist`, `/paypal`, `/review`, `/page_cache/block/esi`, `/health_check.php` | — | *(key)* `X-Magento-Vary` ✦ |
 | `ghost` †     | `/ghost/`, `/members/`, `/p/`, `/r/` | `uuid`, `key`, `token`, `gift` | `ghost-members-ssr`, `ghost-admin-api-session` |
 | `wagtail` † § | `/admin/`, `/django-admin/`, `/documents/` | — | `sessionid` |
 | `kirby` † §   | `/panel` | — | `kirby_session` |
@@ -547,6 +547,34 @@ opens a session for **anonymous** users whenever anything writes to `$_SESSION`
 it with your own `cache_turbo_bypass $cookie_SESS<your-hash>` if the collision
 costs you. Note `NO_CACHE` is **not** matched: it is contrib (not core) and is set
 for *logged-out* visitors by design, so it would cost hits and buy no safety.
+
+✦ **A cookie VALUE folded into the cache KEY, not a bypass.** `magento` is the one
+preset that neither bypasses nor merely tests a cookie's value as a pass/fail
+predicate (∆, above) — it puts the cookie's **value** into the cache key itself,
+via a distinct `key_cookies` tier. `X-Magento-Vary` is Magento's
+`Context::getVaryString()` — a salted hash of the sorted tuple
+`{customer_group, customer_logged_in, store, currency}`, present only when a
+field differs from its default (`Framework/App/Http/Context.php`). Magento's own
+Varnish VCL hashes this value into the cache key (`vcl_hash`) and never passes on
+it; the built-in PHP Full Page Cache folds the same value into its cache id
+(`Framework/App/PageCache/Identifier.php`). Two independent upstream
+implementations agree it is a key component, not a gate.
+
+Bypassing on it — what this preset did before — was wrong: a plain anonymous
+visitor never gets the cookie at all, so bypass caught only *non-default*
+contexts (a EUR guest, a switched store view) that hold zero private data, for
+no safety benefit (the cart is fetched client-side, never in the cached HTML).
+Presence-keying would be a real leak (it collapses every non-default context —
+customer A, customer B, a EUR guest — into one shared bucket). Value-keying is
+neither: each vary context gets its own entry, exactly like upstream.
+
+Key-cookie name matching is **exact**, not by suffix like ∆ — the value goes
+straight into the cache key, so a loose match would let an attacker pick their
+own bucket with a cookie like `NOT-X-Magento-Vary`. The module parses the raw
+`Cookie:` header itself (scanning **every** `Cookie:` header a client sends, not
+just the first) because nginx's `$cookie_` variables cannot represent a
+hyphenated name (`$cookie_X_Magento_Vary` silently never matches — no `-`→`_`
+translation for cookie names, unlike `$http_*`). See [magento.md](docs/magento.md).
 
 § **Cookie rule is *conditional* — and fails safe.** Both of these ride a cookie the
 app issues only once a session actually exists, which is exactly what makes them
@@ -1015,7 +1043,7 @@ http {
 |---|---|---|---|
 | `cache_turbo_zone name=NAME SIZE` | `http` | — | Declare a shared-memory cache zone (min 8 pages). |
 | `cache_turbo NAME` / `off` | `server`, `location` | `off` | Turn caching on (bind a zone) or off. Takes a zone name and nothing else — the old `auto` shorthand is gone (see `cache_turbo_backend`). |
-| `cache_turbo_backend NAME...` | `server`, `location` | — | Auto-classify dynamic (uncacheable) request surfaces for one or more CMS presets: `wordpress`, `woocommerce`, `joomla`, `xenforo`, `discourse`, `phpbb`, `drupal`, `mediawiki`, `magento`, `ghost`, `wagtail`, `kirby` — or `none`. A matching request (login/session cookie, admin URI, dynamic arg) skips the cache and goes straight to origin. **Every preset is opt-in**; names **stack**, separated by spaces or `|` (`wordpress|woocommerce` == `wordpress woocommerce`). Implies `cache_turbo_cache_control honor`. **`none`** means no preset here and exists to override one inherited from the `server` block; it is exclusive and does not imply `honor`. **`generic`/`auto` were removed** and are now a config error — the union was never a safe default ([why](#cms-backends-cache_turbo_backend)). **`joomla` and `phpbb` ship no cookie rule**; both need your own `cache_turbo_bypass` to protect logged-in users ([phpbb](docs/phpbb.md) needs a *value* test). **`wagtail`/`kirby` ship a *conditional* cookie rule** that fails safe — it stops matching if the app writes sessions for guests ([wagtail](docs/wagtail.md), [kirby](docs/kirby.md)). There is **no `django`/`laravel` preset** and never will be ([why](docs/frameworks.md)). |
+| `cache_turbo_backend NAME...` | `server`, `location` | — | Auto-classify dynamic (uncacheable) request surfaces for one or more CMS presets: `wordpress`, `woocommerce`, `joomla`, `xenforo`, `discourse`, `phpbb`, `drupal`, `mediawiki`, `magento`, `ghost`, `wagtail`, `kirby` — or `none`. A matching request (login/session cookie, admin URI, dynamic arg) skips the cache and goes straight to origin. **Every preset is opt-in**; names **stack**, separated by spaces or `|` (`wordpress|woocommerce` == `wordpress woocommerce`). Implies `cache_turbo_cache_control honor`. **`none`** means no preset here and exists to override one inherited from the `server` block; it is exclusive and does not imply `honor`. **`generic`/`auto` were removed** and are now a config error — the union was never a safe default ([why](#cms-backends-cache_turbo_backend)). **`joomla` and `phpbb` ship no cookie rule**; both need your own `cache_turbo_bypass` to protect logged-in users ([phpbb](docs/phpbb.md) needs a *value* test). **`wagtail`/`kirby` ship a *conditional* cookie rule** that fails safe — it stops matching if the app writes sessions for guests ([wagtail](docs/wagtail.md), [kirby](docs/kirby.md)). **`magento` value-keys `X-Magento-Vary`** rather than bypassing on it — the cookie's value is folded into the cache key so each vary context gets its own entry, matching upstream's own Varnish VCL and built-in FPC ([magento](docs/magento.md)). There is **no `django`/`laravel` preset** and never will be ([why](docs/frameworks.md)). |
 | `cache_turbo_suppress_native on` | `server`, `location` | `off` | Make `$cache_turbo_active` read `1` while cache-turbo owns a request, so a stacked native `proxy_cache` can defer via `proxy_no_cache $cache_turbo_active; proxy_cache_bypass $cache_turbo_active;`. Off (default) keeps the variable always `0` (the wiring stays inert). |
 | `cache_turbo_key STRING` | `server`, `location` | normalized | What makes two requests "the same page". The default is `$host$uri$cache_turbo_normalized_args` — Host + **normalized args** (tracking params stripped, args sorted). |
 | `cache_turbo_preset NAME` | `server`, `location` | `balanced` | `micro` / `conservative` / `balanced` / `aggressive` — sets the four knobs below at once. `micro` = 1s microcaching (valid 1s, lock_ttl 1s, ×2 stale). |

@@ -61,6 +61,8 @@ static char *ngx_http_cache_turbo_cache_control(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 static ngx_int_t ngx_http_cache_turbo_auto_skip(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf);
+static ngx_int_t ngx_http_cache_turbo_key_cookie(ngx_http_request_t *r,
+    ngx_uint_t backend_presets, ngx_str_t *name_out, ngx_str_t *val_out);
 static char *ngx_http_cache_turbo_key(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static char *ngx_http_cache_turbo_valid_conf(ngx_conf_t *cf, ngx_command_t *cmd,
@@ -645,6 +647,57 @@ ngx_http_cache_turbo_build_key(ngx_http_request_t *r,
         ngx_memcpy(p, r->unparsed_uri.data, r->unparsed_uri.len);
         ctx->cache_key.data = k;
         ctx->cache_key.len = klen;
+    }
+
+    /*
+     * Preset key cookies (tier 3): fold the VALUE of a preset's key cookie into
+     * the key, so segment variants (Magento's customer group / currency / store
+     * view) get their own entries instead of bypassing. Absent cookie => key
+     * unchanged, i.e. the plain anonymous entry, which is what the application
+     * itself assumes (Magento emits no cookie for an all-default context).
+     *
+     * The framing is LENGTH-PREFIXED, not delimited: a 0x1f tag byte, then the
+     * name length and value length as fixed 4-byte fields, then the name and
+     * value bytes. Length-prefixing makes the fold UNAMBIGUOUS regardless of the
+     * bytes involved — no separator exists that a cookie value or the base key
+     * could contain to splice into a neighbouring field, so no (base, name,
+     * value) triple can serialize to another triple's bytes. This matters
+     * because the base key can be an operator-configured complex value
+     * (cache_turbo_key) that folds in a raw request header, and nginx permits
+     * 0x1f inside header field values (only SP/CR/LF/NUL are special in
+     * ngx_http_parse_header_line) — so a plain delimiter WOULD be forgeable from
+     * the request. The 4-byte lengths are memcpy'd, not text, so they are not
+     * confusable with content either. Including the name keeps two presets'
+     * key cookies from ever producing the same fold from different cookies.
+     */
+    if (NGX_HTTP_CACHE_TURBO_HAS_BACKEND(clcf->backend_presets)) {
+        ngx_str_t  kcname, kcval;
+
+        if (ngx_http_cache_turbo_key_cookie(r, clcf->backend_presets,
+                                            &kcname, &kcval))
+        {
+            u_char  *k, *p;
+            size_t   klen;
+
+            klen = ctx->cache_key.len + 1 + 4 + 4 + kcname.len + kcval.len;
+
+            k = ngx_pnalloc(r->pool, klen);
+            if (k == NULL) {
+                return NGX_ERROR;
+            }
+
+            p = ngx_cpymem(k, ctx->cache_key.data, ctx->cache_key.len);
+            *p++ = '\x1f';
+            ngx_http_cache_turbo_put_u32(p, (uint32_t) kcname.len);
+            p += 4;
+            ngx_http_cache_turbo_put_u32(p, (uint32_t) kcval.len);
+            p += 4;
+            p = ngx_cpymem(p, kcname.data, kcname.len);
+            ngx_memcpy(p, kcval.data, kcval.len);
+
+            ctx->cache_key.data = k;
+            ctx->cache_key.len = klen;
+        }
     }
 
     /*
@@ -1394,6 +1447,35 @@ typedef struct {
      * engine below for why the name is matched by SUFFIX and why an unparseable
      * cookie fails closed to bypass. */
     const ngx_http_cache_turbo_cookie_pred_t  *cookie_preds;
+
+    /*
+     * Cookie VALUE KEYING (tier 3). NULL-terminated list of cookie names whose
+     * VALUE is folded into the cache key, so visitors carrying different values
+     * get different cache entries instead of bypassing the cache altogether.
+     *
+     * This is for a cookie that is a SEGMENT FINGERPRINT, not an identity: it
+     * marks which shared variant of a page the visitor should see (customer
+     * group / currency / store view), and many visitors legitimately share one
+     * value. Magento's X-Magento-Vary is the type case, and Magento's own
+     * reference Varnish VCL keys on exactly this value (vcl_hash: hash_data of
+     * the regsub'd cookie) rather than passing.
+     *
+     * KEY, never BYPASS, and never PRESENCE. Keying on PRESENCE would collapse
+     * every non-default visitor into one bucket and is a cross-user leak; that
+     * is a different mistake from keying on the VALUE, and the two must not be
+     * confused. Bypassing on presence is safe but throws away the hit rate for
+     * every non-default ANONYMOUS visitor (guest in a second currency, second
+     * store view), who has no private data at all.
+     *
+     * A preset that lists a key cookie DEPENDS on the Set-Cookie floor in
+     * ngx_http_cache_turbo_response_cacheable(): a request with no key cookie
+     * hashes to the ANONYMOUS entry, and if the response ESTABLISHES the segment
+     * (Set-Cookie: <keycookie>=...) then storing that body under the anonymous
+     * key poisons it for every anonymous visitor. The floor refuses to store ANY
+     * Set-Cookie response, unconditionally, which covers that case exactly.
+     * DO NOT relax that floor without adding a preset-level veto here first.
+     */
+    const char *const  *key_cookies;
 } ngx_http_cache_turbo_preset_t;
 
 static const char *const  ct_wp_cookies[] = {
@@ -1727,19 +1809,45 @@ static const char *const  ct_mw_args[] = { "veaction", "returnto", NULL };
  * logged-in customer, a non-default customer group, or a switched
  * currency/store gets the cookie.
  *
- * THE DEVIATION, AND WHY. Magento's VCL puts this cookie in the cache KEY
- * (vcl_hash: hash_data(regsub(...X-Magento-Vary...))). We must NOT copy that
- * here: this registry matches cookie PRESENCE, never value. Keying on presence
- * would collapse EVERY non-default visitor — customer A, customer B, a EUR guest
- * — into ONE shared cache bucket and serve one customer's cart to another. So
- * the preset BYPASSES on it instead: correct-but-conservative. Anonymous
- * default-context traffic (the catalog, i.e. the bulk, i.e. the entire point)
- * still caches and is shared; everyone else goes to origin.
+ * WE KEY ON THE VALUE, exactly as Magento's VCL does (vcl_hash: hash_data of the
+ * regsub'd cookie), via the preset `key_cookies` list. vcl_recv never passes on
+ * this cookie; it passes on URL and method only. Magento's OWN built-in PHP full-
+ * page cache agrees — Framework/App/PageCache/Identifier.php folds
+ * COOKIE_VARY_STRING into the sha1 cache id. Two independent upstream
+ * implementations, one call: the vary value is a cache-key component.
  *
- * An operator who wants the logged-in hit rate back can restore true value-keying
- * with a `map` — see docs/magento.md. It must be a `map`: nginx does NOT expose a
+ * WHY NOT BYPASS (what this preset used to do). The cookie is a SEGMENT
+ * FINGERPRINT, not an identity: sha256 over the SORTED tuple {customer_group,
+ * customer_logged_in, store, currency} (App/Http/Context.php::getVaryString), and
+ * getData() drops every value equal to its default. So a plain anonymous visitor
+ * has NO cookie, and a guest who merely switched currency or store view has one
+ * while holding zero private data. Bypassing sent all of them to the origin. The
+ * "it prevents a cart leak" premise was false besides: the cart is NOT in the
+ * cached HTML — Magento's private-content/sections JS fetches it client-side, and
+ * two logged-in shoppers in the same group/store/currency are DESIGNED to receive
+ * byte-identical cached HTML.
+ *
+ * WHY NOT PRESENCE-KEY. Keying on mere presence would collapse a EUR guest, a
+ * wholesale customer and a logged-in retail customer into ONE bucket — that IS
+ * the cross-user leak. Presence-keying and value-keying are different things;
+ * rejecting the first does not justify bypassing.
+ *
+ * THE TRANSITION RACE (the one genuine leak, invisible from the request side):
+ * a request with NO vary cookie hashes to the anonymous bucket, and the RESPONSE
+ * sets X-Magento-Vary. Storing that segmented body under the anonymous key
+ * poisons it for everyone. Upstream refuses to cache exactly this
+ * (vcl_backend_response: beresp.uncacheable when the request had no vary cookie
+ * and the response sets one). We inherit the identical refusal from the
+ * UNCONDITIONAL Set-Cookie floor in ngx_http_cache_turbo_response_cacheable():
+ * the response that establishes the segment carries a Set-Cookie, so it is never
+ * stored, under any key. A dedicated preset veto would be dead code today — but
+ * this preset DEPENDS on that floor, and the floor says so.
+ *
+ * The raw Cookie header is parsed directly because nginx does NOT expose a
  * hyphenated cookie via $cookie_ (there is no '-' -> '_' translation for cookie
- * names, unlike headers), so `$cookie_x_magento_vary` silently never matches.
+ * names, unlike headers), so `$cookie_X_Magento_Vary` silently never matches — a
+ * `map` on $http_cookie is the only variable-level workaround, and the module's
+ * own parser makes it unnecessary.
  *
  * COOKIES DELIBERATELY NOT LISTED — every one of these is set for ANONYMOUS
  * visitors, and bypassing on any of them takes the hit rate to ~0:
@@ -1768,11 +1876,13 @@ static const char *const  ct_mw_args[] = { "veaction", "returnto", NULL };
  * they would match nothing, while /cart could false-positive on a catalog URL key
  * like /cartridge-refill.
  */
-static const char *const  ct_magento_cookies[] = { "X-Magento-Vary", NULL };
+static const char *const  ct_magento_cookies[] = { NULL };
 static const char *const  ct_magento_uris[] = {
     "/checkout", "/customer", "/graphql", "/sales", "/newsletter", "/wishlist",
     "/paypal", "/review", "/page_cache/block/esi", "/health_check.php", NULL };
 static const char *const  ct_magento_args[] = { NULL };
+/* Value-keyed, never bypassed. Exact name — see ngx_http_cache_turbo_cookie_value. */
+static const char *const  ct_magento_key_cookies[] = { "X-Magento-Vary", NULL };
 
 /*
  * Ghost (5.x/6.x). The public blog is a large, genuinely shared anonymous surface,
@@ -1897,30 +2007,31 @@ static const char *const  ct_kirby_args[] = { NULL };
 
 static const ngx_http_cache_turbo_preset_t  ngx_http_cache_turbo_presets[] = {
     { NGX_HTTP_CACHE_TURBO_BACKEND_WORDPRESS,
-      ct_wp_cookies, ct_wp_uris, ct_wp_args, NULL },
+      ct_wp_cookies, ct_wp_uris, ct_wp_args, NULL, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_WOOCOMMERCE,
-      ct_woo_cookies, ct_woo_uris, ct_woo_args, NULL },
+      ct_woo_cookies, ct_woo_uris, ct_woo_args, NULL, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_JOOMLA,
-      ct_joomla_cookies, ct_joomla_uris, ct_joomla_args, NULL },
+      ct_joomla_cookies, ct_joomla_uris, ct_joomla_args, NULL, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_XENFORO,
-      ct_xf_cookies, ct_xf_uris, ct_xf_args, NULL },
+      ct_xf_cookies, ct_xf_uris, ct_xf_args, NULL, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_DISCOURSE,
-      ct_discourse_cookies, ct_discourse_uris, ct_discourse_args, NULL },
+      ct_discourse_cookies, ct_discourse_uris, ct_discourse_args, NULL, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_PHPBB,
-      ct_phpbb_cookies, ct_phpbb_uris, ct_phpbb_args, ct_phpbb_preds },
+      ct_phpbb_cookies, ct_phpbb_uris, ct_phpbb_args, ct_phpbb_preds, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_DRUPAL,
-      ct_drupal_cookies, ct_drupal_uris, ct_drupal_args, NULL },
+      ct_drupal_cookies, ct_drupal_uris, ct_drupal_args, NULL, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_MEDIAWIKI,
-      ct_mw_cookies, ct_mw_uris, ct_mw_args, NULL },
+      ct_mw_cookies, ct_mw_uris, ct_mw_args, NULL, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_MAGENTO,
-      ct_magento_cookies, ct_magento_uris, ct_magento_args, NULL },
+      ct_magento_cookies, ct_magento_uris, ct_magento_args, NULL,
+      ct_magento_key_cookies },
     { NGX_HTTP_CACHE_TURBO_BACKEND_GHOST,
-      ct_ghost_cookies, ct_ghost_uris, ct_ghost_args, NULL },
+      ct_ghost_cookies, ct_ghost_uris, ct_ghost_args, NULL, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_WAGTAIL,
-      ct_wagtail_cookies, ct_wagtail_uris, ct_wagtail_args, NULL },
+      ct_wagtail_cookies, ct_wagtail_uris, ct_wagtail_args, NULL, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_KIRBY,
-      ct_kirby_cookies, ct_kirby_uris, ct_kirby_args, NULL },
-    { 0, NULL, NULL, NULL, NULL }
+      ct_kirby_cookies, ct_kirby_uris, ct_kirby_args, NULL, NULL },
+    { 0, NULL, NULL, NULL, NULL, NULL }
 };
 
 
@@ -2181,6 +2292,95 @@ ngx_http_cache_turbo_cookie_pred(ngx_http_request_t *r,
 
 
 /*
+ * Extract the VALUE of one cookie from one Cookie header value, by EXACT name.
+ * Returns 1 and fills *val when the cookie is present, 0 otherwise. A present
+ * cookie with an empty or absent value yields a zero-length *val and still
+ * returns 1 — "present but empty" is a distinct key from "absent", and both are
+ * distinct from any real value.
+ *
+ * EXACT name, not the suffix rule the predicate engine uses. A key cookie is
+ * shipped by the application under a fixed name (X-Magento-Vary), and the name
+ * bounds a value that goes into the CACHE KEY: a loose match would let an
+ * attacker-chosen cookie ("NOT-X-Magento-Vary") select which bucket a victim's
+ * request lands in. The predicate engine can afford suffix matching because its
+ * failure direction is a needless bypass; keying cannot.
+ */
+static ngx_int_t
+ngx_http_cache_turbo_cookie_value(u_char *data, size_t len, const char *name,
+    size_t nmlen, ngx_str_t *val)
+{
+    u_char  *p, *end, *pair, *eq, *v;
+    size_t   plen, nlen;
+
+    /* NULL data with len == 0: `data + len` is UB even at zero offset. */
+    if (data == NULL || len == 0) {
+        return 0;
+    }
+
+    p = data;
+    end = data + len;
+
+    while (p < end) {
+
+        while (p < end && (*p == ' ' || *p == '\t' || *p == ';')) {
+            p++;
+        }
+        if (p >= end) {
+            break;
+        }
+
+        pair = p;
+        while (p < end && *p != ';') {
+            p++;
+        }
+        plen = (size_t) (p - pair);
+
+        while (plen > 0 && (pair[plen - 1] == ' ' || pair[plen - 1] == '\t')) {
+            plen--;
+        }
+        if (plen == 0) {
+            continue;
+        }
+
+        eq = ngx_strlchr(pair, pair + plen, '=');
+
+        if (eq == NULL) {
+            /* Bare cookie, no '='. If it is ours, it is present with no value. */
+            nlen = plen;
+            while (nlen > 0 && (pair[nlen - 1] == ' ' || pair[nlen - 1] == '\t')) {
+                nlen--;
+            }
+            if (nlen == nmlen && ngx_strncmp(pair, name, nmlen) == 0) {
+                val->data = pair;
+                val->len = 0;
+                return 1;
+            }
+            continue;
+        }
+
+        nlen = (size_t) (eq - pair);
+        while (nlen > 0 && (pair[nlen - 1] == ' ' || pair[nlen - 1] == '\t')) {
+            nlen--;
+        }
+
+        if (nlen != nmlen || ngx_strncmp(pair, name, nmlen) != 0) {
+            continue;
+        }
+
+        v = eq + 1;
+        while (v < pair + plen && (*v == ' ' || *v == '\t')) {
+            v++;
+        }
+        val->data = v;
+        val->len = (size_t) ((pair + plen) - v);
+        return 1;
+    }
+
+    return 0;
+}
+
+
+/*
  * URI prefix match with a PATH-SEGMENT BOUNDARY. A preset URI rule like "/user"
  * must bypass "/user" and "/user/settings" but NOT "/users-guide" — a bare
  * ngx_strncmp prefix test matches all three and silently over-bypasses (a
@@ -2274,6 +2474,72 @@ ngx_http_cache_turbo_auto_skip(ngx_http_request_t *r,
             && ngx_http_cache_turbo_cookie_pred(r, ps->cookie_preds))
         {
             return 1;
+        }
+    }
+
+    return 0;
+}
+
+
+/*
+ * Look the request's key cookie up across EVERY Cookie header. A client may
+ * legally split its cookies over several Cookie headers, and Magento's own VCL
+ * runs std.collect(req.http.Cookie) before it looks — without that, a request
+ * that carries a decoy in the first header and the real cookie in the second
+ * would key on the decoy, i.e. an attacker could CHOOSE which cache bucket to
+ * read from or write to. Every header is scanned; the FIRST occurrence of the
+ * name wins, which is the same rule a browser's own single header would give.
+ *
+ * *name_out is set to the matched preset name so the key can record WHICH cookie
+ * produced the value (two presets with key cookies must not produce the same key
+ * suffix from different cookies). Returns 1 when a key cookie was found.
+ */
+static ngx_int_t
+ngx_http_cache_turbo_key_cookie(ngx_http_request_t *r,
+    ngx_uint_t backend_presets, ngx_str_t *name_out, ngx_str_t *val_out)
+{
+    const ngx_http_cache_turbo_preset_t  *ps;
+    const char *const                    *pp;
+    size_t                                nmlen;
+#if (nginx_version >= 1023000)
+    ngx_table_elt_t                      *ck;
+#else
+    ngx_table_elt_t                     **ckp;
+    ngx_uint_t                            i;
+#endif
+
+    for (ps = ngx_http_cache_turbo_presets; ps->bit; ps++) {
+        if (!(backend_presets & ps->bit) || ps->key_cookies == NULL) {
+            continue;
+        }
+
+        for (pp = ps->key_cookies; *pp; pp++) {
+            nmlen = ngx_strlen(*pp);
+
+#if (nginx_version >= 1023000)
+            for (ck = r->headers_in.cookie; ck; ck = ck->next) {
+                if (ngx_http_cache_turbo_cookie_value(ck->value.data,
+                                                      ck->value.len,
+                                                      *pp, nmlen, val_out))
+                {
+                    name_out->data = (u_char *) *pp;
+                    name_out->len = nmlen;
+                    return 1;
+                }
+            }
+#else
+            ckp = r->headers_in.cookies.elts;
+            for (i = 0; i < r->headers_in.cookies.nelts; i++) {
+                if (ngx_http_cache_turbo_cookie_value(ckp[i]->value.data,
+                                                      ckp[i]->value.len,
+                                                      *pp, nmlen, val_out))
+                {
+                    name_out->data = (u_char *) *pp;
+                    name_out->len = nmlen;
+                    return 1;
+                }
+            }
+#endif
         }
     }
 
@@ -3723,6 +3989,22 @@ ngx_http_cache_turbo_response_cacheable(ngx_http_request_t *r)
             continue;
         }
 
+        /*
+         * The Set-Cookie floor. Unconditional on purpose — NOT gated by
+         * ignore_cc, because relaxing it does more than staple one visitor's
+         * session cookie into a shared body.
+         *
+         * PRESET KEY COOKIES DEPEND ON THIS. A request that carries no key
+         * cookie (Magento's X-Magento-Vary) hashes to the ANONYMOUS entry, and
+         * the response that FIRST establishes the segment arrives with exactly
+         * one distinguishing mark: a Set-Cookie. Store it and the anonymous
+         * entry now serves segmented content to every anonymous visitor —
+         * upstream Magento's own VCL refuses the identical case
+         * (vcl_backend_response: beresp.uncacheable). Anyone adding a knob that
+         * caches Set-Cookie responses must add a preset-level veto in the header
+         * filter FIRST (request had no key cookie && response sets one => do not
+         * capture), or reintroduce a cross-user leak.
+         */
         if (h[i].key.len == sizeof("Set-Cookie") - 1
             && ngx_strncasecmp(h[i].key.data, (u_char *) "Set-Cookie",
                                sizeof("Set-Cookie") - 1) == 0)
