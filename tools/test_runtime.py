@@ -2430,14 +2430,21 @@ def test_discourse_preset(ng: Nginx, origin: Origin) -> None:
 
 
 def test_phpbb_preset(ng: Nginx, origin: Origin) -> None:
-    """phpBB preset (docs/phpbb.md). URI + ?sid= rules only — the preset ships NO
-    cookie rule on purpose, because phpBB sets _u / _k / _sid for every non-bot
-    visitor INCLUDING guests (an anon gets _u=1, the ANONYMOUS id) and this
-    matcher tests cookie presence, not value. So the guest cookies must keep
-    caching, and — this is the documented sharp edge — a LOGGED-IN phpBB user is
-    NOT protected by the preset alone. That is asserted here so the docs and the
-    code cannot drift apart: if someone later adds a _u/_sid cookie rule, this
-    test fails and they must revisit docs/phpbb.md."""
+    """phpBB preset (docs/phpbb.md). URI + ?sid= rules, PLUS the cookie VALUE
+    predicate <prefix>_u != 1.
+
+    phpBB sets _u/_k/_sid for every non-bot visitor INCLUDING guests, so a
+    presence matcher identifies nobody: an anon gets _u=1 (ANONYMOUS), a member
+    gets _u=<user_id> (never 1 — ANONYMOUS is a reserved row). Only a VALUE test
+    separates them. Until that existed the preset shipped no cookie rule and a
+    logged-in member's page was cached and served to strangers unless the
+    operator hand-wrote a bypass; this test now asserts that leak is closed.
+
+    The name is matched by SUFFIX because the prefix is config('cookie_name'),
+    an ACP setting (default "phpbb") that installers randomise — a literal-name
+    rule stops firing on a renamed board, and a bypass that stops firing leaks.
+    Verified against phpbb/phpbb: includes/constants.php (ANONYMOUS=1),
+    phpbb/session.php session_create()/set_cookie()."""
     for uri in ("/ucp.php", "/ucp.php?mode=login"):
         _, _, h = fetch(ng.port, uri)
         assert "x-cache" not in h, f"{uri} must bypass on the phpbb preset"
@@ -2453,16 +2460,61 @@ def test_phpbb_preset(ng: Nginx, origin: Origin) -> None:
     assert hg.get("x-cache") == "HIT", \
         f"guest phpbb cookies must stay cacheable, got {hg.get('x-cache')}"
 
-    # And the documented gap: an authenticated user's cookie looks identical to
-    # the matcher (presence-only), so the preset does NOT bypass them. This is
-    # why docs/phpbb.md makes cache_turbo_bypass mandatory.
+    # THE FIX (was the documented gap): a logged-in user carries <prefix>_u with
+    # their user_id, never ANONYMOUS(=1). The value predicate reads it and
+    # bypasses. Before this rule the member's page was cached and served to
+    # strangers — a cross-user leak the docs told the operator to patch by hand.
     authed = {"Cookie": "phpbb3_sid=abc; phpbb3_u=42; phpbb3_k=beef"}
     fetch(ng.port, "/phpbb/viewtopic-b", headers=authed)
     _, _, ha = fetch(ng.port, "/phpbb/viewtopic-b", headers=authed)
-    assert ha.get("x-cache") == "HIT", \
-        ("phpbb preset must NOT claim to bypass logged-in users (presence-only "
-         f"matcher cannot tell _u=42 from _u=1), got {ha.get('x-cache')} — if "
-         "this now bypasses, a cookie rule was added: update docs/phpbb.md")
+    assert "x-cache" not in ha, \
+        (f"logged-in phpbb user (_u=42 != ANONYMOUS 1) MUST bypass, got "
+         f"{ha.get('x-cache')} — this is the cross-user leak the value "
+         "predicate exists to close")
+
+    # The cookie NAME PREFIX is an ACP setting (config 'cookie_name', default
+    # "phpbb"), and installers randomise it. The predicate matches the name by
+    # SUFFIX for exactly this reason: a literal-name rule silently stops firing
+    # on a renamed board, and a bypass rule that stops firing LEAKS. Prove the
+    # suffix match holds under an arbitrary prefix.
+    for prefix in ("phpbb", "phpbb3", "myboard_xyz", "zz"):
+        m = {"Cookie": f"{prefix}_sid=abc; {prefix}_u=7"}
+        fetch(ng.port, f"/phpbb/vt-{prefix}", headers=m)
+        _, _, hm = fetch(ng.port, f"/phpbb/vt-{prefix}", headers=m)
+        assert "x-cache" not in hm, \
+            (f"member with cookie prefix '{prefix}' must bypass — the name is "
+             "matched by SUFFIX because the prefix is admin-configurable")
+
+        g = {"Cookie": f"{prefix}_sid=abc; {prefix}_u=1"}
+        fetch(ng.port, f"/phpbb/vg-{prefix}", headers=g)
+        _, _, hgp = fetch(ng.port, f"/phpbb/vg-{prefix}", headers=g)
+        assert hgp.get("x-cache") == "HIT", \
+            f"guest (_u=1) with prefix '{prefix}' must stay cacheable"
+
+    # Absent _u => no session => guest => cacheable (the predicate must have no
+    # opinion when its cookie is missing, not bypass everything).
+    none = {"Cookie": "other=1; unrelated=x"}
+    fetch(ng.port, "/phpbb/viewtopic-c", headers=none)
+    _, _, hn = fetch(ng.port, "/phpbb/viewtopic-c", headers=none)
+    assert hn.get("x-cache") == "HIT", \
+        f"no _u cookie at all must stay cacheable, got {hn.get('x-cache')}"
+
+    # Unparseable => fail CLOSED to bypass. A bare "_u" with no '=' gives us no
+    # value to test; guessing "guest" there would cache a possible member.
+    bare = {"Cookie": "phpbb3_sid=abc; phpbb3_u"}
+    fetch(ng.port, "/phpbb/viewtopic-d", headers=bare)
+    _, _, hb = fetch(ng.port, "/phpbb/viewtopic-d", headers=bare)
+    assert "x-cache" not in hb, \
+        (f"valueless '_u' must fail closed (bypass), got {hb.get('x-cache')} — "
+         "an unreadable cookie must never be assumed to be a guest")
+
+    # "_u=10" must not satisfy "_u == 1": the compare is exact + length-checked,
+    # not a prefix. A member with user_id 10 is a member.
+    ten = {"Cookie": "phpbb3_u=10"}
+    fetch(ng.port, "/phpbb/viewtopic-e", headers=ten)
+    _, _, ht = fetch(ng.port, "/phpbb/viewtopic-e", headers=ten)
+    assert "x-cache" not in ht, \
+        f"_u=10 is user 10, not ANONYMOUS(1) — must bypass, got {ht.get('x-cache')}"
     drain_origin(origin)
 
 
