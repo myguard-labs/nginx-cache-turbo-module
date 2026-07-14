@@ -2005,6 +2005,96 @@ static const char *const  ct_kirby_cookies[] = { "kirby_session", NULL };
 static const char *const  ct_kirby_uris[] = { "/panel", NULL };
 static const char *const  ct_kirby_args[] = { NULL };
 
+/*
+ * Shopware 6. VALUE-KEYED, NOT BYPASSED — the same shape as magento, and for the
+ * same reason. Read that comment first; this one only records what differs.
+ *
+ * sw-cache-hash is a purpose-built cache-variant cookie, not an identity.
+ * CacheHeadersService::buildCacheHash() folds a SET of fields into it —
+ * {rule_ids, version_id, currency_id, tax_state, logged_in_state} — where
+ * logged_in_state is literally 'logged-in' | 'not-logged-in' (CacheHeadersService
+ * .php:104). The logged-in bit is INSIDE the value, alongside currency and price
+ * rules. Shopware's own reverse proxy treats it exactly as a key and never as a
+ * bypass (shopware/varnish-shopware default.vcl: hash_data("+context=" +
+ * cookie.get("sw-cache-hash"))), which is the behaviour we are matching.
+ *
+ * WHY A BYPASS WOULD BE WRONG, precisely: isCacheHashRequired() (:125) returns
+ * true for a logged-in customer OR a guest with a filled cart OR a guest on a
+ * non-default currency. So bypass-on-presence would send cart-holding GUESTS and
+ * non-default-currency GUESTS to the origin — anonymous visitors whose private
+ * data is not in the cached HTML at all (the cart is fetched client-side, as in
+ * magento). That is the exact bypass #28 removed from magento; do not reintroduce
+ * it here. Presence is not identity; the value is a segment fingerprint.
+ *
+ * LAZY, and actively so — this is the (b) half of the screening question, and
+ * Shopware enforces it harder than any other preset here. When the hash is NOT
+ * required, applyCacheHash() (:62) does not merely omit the cookie, it DELETES a
+ * stale one (removeCookie + clearCookie). A default anonymous visitor is
+ * guaranteed cookieless, so the anonymous bucket is the common case.
+ *
+ * sw-states IS DELIBERATELY NOT MATCHED, and matching it would be a LEAK on a
+ * current shop. It was REMOVED in 6.8 (UPGRADE-6.8.md: "Removed `sw-states` and
+ * `sw-currency` cache cookie handling ... The complete caching behaviour is now
+ * controlled by the `sw-cache-hash` cookie"); HttpCacheKeyGenerator::
+ * SYSTEM_STATE_COOKIE is @deprecated tag:v6.8.0 and CacheResponseSubscriber gates
+ * the whole path off under Feature::isActive('v6.8.0.0'), so 6.8 never sets it. A
+ * preset keyed on sw-states alone would silently stop firing on an upgraded shop
+ * — the classic "matcher stops matching => logged-in pages get cached" failure.
+ * sw-cache-hash spans 6.4..6.8, so one exact literal covers every supported line.
+ *
+ * The name is a stable literal (HttpCacheKeyGenerator::CONTEXT_CACHE_COOKIE =
+ * 'sw-cache-hash', :27) — no per-install hash, no APP_NAME, not admin-settable.
+ * It is hyphenated, so $cookie_sw_cache_hash would never match; the module's raw
+ * Cookie parser is what makes it usable (see the magento note).
+ *
+ * /account and /checkout are stock Storefront routes and stay bypassed as
+ * defence-in-depth (Shopware sends no-store on them anyway). /admin is the API +
+ * Administration SPA. /store-api is the headless JSON API: it is context-sensitive
+ * per sw-context-token and must never be shared.
+ */
+static const char *const  ct_shopware6_cookies[] = { NULL };
+static const char *const  ct_shopware6_uris[] = {
+    "/account", "/checkout", "/admin", "/api", "/store-api", NULL };
+static const char *const  ct_shopware6_args[] = { NULL };
+/* Value-keyed, never bypassed. Exact name — see ngx_http_cache_turbo_cookie_value. */
+static const char *const  ct_shopware6_key_cookies[] = { "sw-cache-hash", NULL };
+
+/*
+ * TYPO3 (v11..v13). Lazy sessions, confirmed at the strongest possible place: the
+ * frontend authentication object opts OUT of cookies by default.
+ * FrontendUserAuthentication::$dontSetCookie = true (:155) OVERRIDES the base
+ * class default of false (AbstractUserAuthentication:199), and it is flipped back
+ * to false in exactly two places, both on the login path — createUserSession()
+ * (:242) and regenerateSessionId() (:407). shallSetSessionCookie() (:344) is the
+ * gate. So an anonymous visitor reading public pages is issued NO cookie: this is
+ * a deliberate upstream design decision in favour of caching, not an accident we
+ * are relying on.
+ *
+ * THE ONE CAVEAT, and it is a real one: the name is admin-overridable, NOT a hard
+ * literal. FrontendUserAuthentication::getCookieName() (:167) reads
+ * $GLOBALS['TYPO3_CONF_VARS']['FE']['cookieName'] and falls back to 'fe_typo_user'.
+ * It is a plain default rather than a per-install hash (unlike Drupal's SESS<hash>
+ * or Grav's grav-site-<hash>), and overriding it is rare — but a site that DOES
+ * override it silently loses the match, and a lost match on a bypass rule means
+ * logged-in pages get cached. docs/typo3.md says: if you set FE/cookieName, add
+ * your name with cache_turbo_bypass_cookie. We match the default exactly; we
+ * cannot match a name we cannot know.
+ *
+ * be_typo_user is matched too, and is a genuine stable literal. It is not
+ * redundant with the FE cookie: an editor previewing the frontend, or any backend
+ * user hitting a FE page, carries only the BE cookie, and TYPO3 renders
+ * hidden/scheduled records and preview versions for them. Caching that response
+ * would publish unpublished content to strangers. Same class as xenforo's
+ * xf_session_admin — a second cookie, a second table, an independent lifetime.
+ *
+ * /typo3 is the backend entry point (stable; TYPO3 does not randomise it the way
+ * magento randomises /admin).
+ */
+static const char *const  ct_typo3_cookies[] = {
+    "fe_typo_user", "be_typo_user", NULL };
+static const char *const  ct_typo3_uris[] = { "/typo3", NULL };
+static const char *const  ct_typo3_args[] = { NULL };
+
 static const ngx_http_cache_turbo_preset_t  ngx_http_cache_turbo_presets[] = {
     { NGX_HTTP_CACHE_TURBO_BACKEND_WORDPRESS,
       ct_wp_cookies, ct_wp_uris, ct_wp_args, NULL, NULL },
@@ -2031,6 +2121,11 @@ static const ngx_http_cache_turbo_preset_t  ngx_http_cache_turbo_presets[] = {
       ct_wagtail_cookies, ct_wagtail_uris, ct_wagtail_args, NULL, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_KIRBY,
       ct_kirby_cookies, ct_kirby_uris, ct_kirby_args, NULL, NULL },
+    { NGX_HTTP_CACHE_TURBO_BACKEND_SHOPWARE6,
+      ct_shopware6_cookies, ct_shopware6_uris, ct_shopware6_args, NULL,
+      ct_shopware6_key_cookies },
+    { NGX_HTTP_CACHE_TURBO_BACKEND_TYPO3,
+      ct_typo3_cookies, ct_typo3_uris, ct_typo3_args, NULL, NULL },
     { 0, NULL, NULL, NULL, NULL, NULL }
 };
 
@@ -4970,6 +5065,8 @@ static const struct {
     { "ghost",       NGX_HTTP_CACHE_TURBO_BACKEND_GHOST       },
     { "wagtail",     NGX_HTTP_CACHE_TURBO_BACKEND_WAGTAIL     },
     { "kirby",       NGX_HTTP_CACHE_TURBO_BACKEND_KIRBY       },
+    { "shopware6",   NGX_HTTP_CACHE_TURBO_BACKEND_SHOPWARE6   },
+    { "typo3",       NGX_HTTP_CACHE_TURBO_BACKEND_TYPO3       },
     { "none",        NGX_HTTP_CACHE_TURBO_BACKEND_NONE        },
     { NULL,          0                                        }
 };
@@ -5082,8 +5179,8 @@ ngx_http_cache_turbo_backend(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                 ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                     "unknown cache_turbo_backend \"%V\" (want wordpress, "
                     "woocommerce, joomla, xenforo, discourse, phpbb, drupal, "
-                    "mediawiki, magento, ghost, wagtail, kirby, or none — "
-                    "separated by spaces or '|')", &bad);
+                    "mediawiki, magento, ghost, wagtail, kirby, shopware6, "
+                    "typo3, or none — separated by spaces or '|')", &bad);
                 return NGX_CONF_ERROR;
             }
 
@@ -5116,7 +5213,7 @@ ngx_http_cache_turbo_backend(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
             "cache_turbo_backend names no backend (want wordpress, woocommerce, "
             "joomla, xenforo, discourse, phpbb, drupal, mediawiki, magento, "
-            "ghost, wagtail, kirby, or none)");
+            "ghost, wagtail, kirby, shopware6, typo3, or none)");
         return NGX_CONF_ERROR;
     }
 
