@@ -118,6 +118,8 @@
 #define NGX_HTTP_CACHE_TURBO_BACKEND_GHOST        0x0200
 #define NGX_HTTP_CACHE_TURBO_BACKEND_WAGTAIL      0x0400
 #define NGX_HTTP_CACHE_TURBO_BACKEND_KIRBY        0x0800
+#define NGX_HTTP_CACHE_TURBO_BACKEND_SHOPWARE6    0x1000
+#define NGX_HTTP_CACHE_TURBO_BACKEND_TYPO3        0x2000
 
 /*
  * "cache_turbo_backend none;" — explicitly NO preset here.

@@ -19,9 +19,11 @@ One page per `cache_turbo_backend` preset:
 | `drupal` | [drupal.md](drupal.md) | ✅ yes (`SESS`) — anon users DO get sessions, so the cookie rule is required; it over-matches `PHPSESSID` by design |
 | `mediawiki` | [mediawiki.md](mediawiki.md) | ✅ yes (`*Token`, `*_session`) — **no URI rules: `/index.php` is the article path on a stock wiki** |
 | `magento` | [magento.md](magento.md) | ✅ yes (`X-Magento-Vary`, value-keyed) — and the origin sends `no-store` on cart/checkout |
+| `shopware6` | [shopware6.md](shopware6.md) | ✅ yes (`sw-cache-hash`, value-keyed) — same engine as `magento` |
 | `ghost` | [ghost.md](ghost.md) | ✅ yes (`ghost-members-ssr`) — **plus `?uuid=`/`?key=`/`?gift=`, which auth a member or unlock paid content with no cookie** |
 | `wagtail` | [wagtail.md](wagtail.md) | ⚠️ yes (`sessionid`) — **but only while nothing writes the session for guests**; fails safe |
 | `kirby` | [kirby.md](kirby.md) | ⚠️ yes (`kirby_session`) — **but a `csrf()` form page cookies guests**; fails safe |
+| `typo3` | [typo3.md](typo3.md) | ⚠️ yes (`fe_typo_user`, `be_typo_user`) — **but the cookie name is admin-overridable via `FE/cookieName`**; fails **UNSAFE** |
 
 ## Not an app — a framework? (Django, Laravel, Rails, …)
 
@@ -104,6 +106,17 @@ Four rows above are load-bearing:
   parses the raw `Cookie:` header itself for this, which is also why
   `$cookie_X_Magento_Vary` (nginx does not translate `-` to `_` for cookie names)
   is no longer something you need to work around. See [magento.md](magento.md).
+- **`shopware6` value-keys `sw-cache-hash`, the same engine as `magento`.**
+  `CacheHeadersService::buildCacheHash()` folds `{rule_ids, version_id,
+  currency_id, tax_state, logged_in_state}` into the cookie's value, and
+  Shopware's own Varnish config hashes that same value into the cache key
+  (`hash_data("+context=" + cookie.get("sw-cache-hash"))`). Bypassing on
+  presence would send cart-holding guests and non-default-currency guests to
+  origin for nothing — `isCacheHashRequired()` returns true for them too, and
+  their data is never in the cached HTML. `sw-states`/`sw-currency` were
+  **removed in 6.8** in favour of this one cookie, so a preset keyed on the old
+  cookies would silently stop firing on an upgraded shop. See
+  [shopware6.md](shopware6.md).
 - **`ghost`'s query args are load-bearing.** `authMemberByUuid()` authenticates a
   member purely from `?uuid=&key=` with **no cookie at all**, so a cookie-only rule
   set is not safe — a member's page would be stored under a URL anyone can request.
@@ -117,6 +130,18 @@ Four rows above are load-bearing:
   rate drops, nothing leaks. **That direction is the whole ballgame** — compare
   `flarum` below, whose equivalent condition fails the *other* way and is therefore
   rejected outright. See [wagtail.md](wagtail.md), [kirby.md](kirby.md).
+- **`typo3` is a conditional cookie rule too — but it is the one that fails
+  UNSAFE, not safe.** `FrontendUserAuthentication` sets `$dontSetCookie = true`
+  by default, so an anonymous visitor gets no `fe_typo_user` cookie — good hit
+  rate, same shape as `wagtail`/`kirby`. But the cookie **name** is read from
+  `$GLOBALS['TYPO3_CONF_VARS']['FE']['cookieName']` and is admin-overridable,
+  not a per-install hash. A site that sets it loses the match silently, and
+  because this is a *bypass* rule, a lost match means a logged-in page gets
+  **cached and served to strangers** — the opposite failure direction from
+  `wagtail`/`kirby`. If you rename the cookie you must add your own
+  `cache_turbo_bypass` for it. `be_typo_user` (backend session) is matched too,
+  independently — it catches an editor previewing the frontend, who carries no
+  `fe_typo_user` at all. See [typo3.md](typo3.md).
 - **`mediawiki`'s dynamic surface is in the query args, not the path.** It
   bypasses `veaction=` but deliberately **not** a blanket `action=` — `action=raw`,
   `action=history`, `diff=` and `oldid=` are deterministic, shared and hot, and
