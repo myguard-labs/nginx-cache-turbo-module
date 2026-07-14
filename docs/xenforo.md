@@ -270,7 +270,7 @@ with, in `http`:
 ```nginx
 map $uri $subdir_dynamic {
     default                                  "";
-    "~^/forums/(admin\.php|install/|login|logout|lost-password|register|account|conversations|direct-messages|contact|misc)"  "1";
+    "~^/forums/(admin\.php|install/|login|logout|lost-password|register|account|conversations|direct-messages|misc)"  "1";
 }
 ```
 

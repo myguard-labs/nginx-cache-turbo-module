@@ -6,7 +6,7 @@ then hands you the thing a preset would have been: a procedure for deriving the
 correct rule for *your* app, and a vhost that is safe before you derive anything.
 
 If you are here because you run a specific *application* that happens to be built
-on a framework — Discourse is Rails, Magento is Symfony — **use that app's
+on a framework — Discourse is Rails, Magento is Laminas/Zend — **use that app's
 preset**, not this page. See [README.md](README.md).
 
 - [Why there is no framework preset](#why-there-is-no-framework-preset)

@@ -188,9 +188,12 @@ about to be wrong for somebody.
 - **Never name `woocommerce` alone.** It doesn't include the WordPress rules, so
   `/wp-admin/` and `wordpress_logged_in_*` would be cacheable. Stack:
   `cache_turbo_backend wordpress woocommerce;`.
-- **The URI prefixes are matched from the site root** and are *prefixes*, so
-  `/cart` also covers `/cart/`, and — watch out — a product literally named
-  `/cart-accessories/` would be bypassed too. Rename the product or accept it.
+- **The URI prefixes are matched from the site root on a path-segment boundary.**
+  `/cart` covers `/cart`, `/cart/`, and `/cart.html` — but NOT a different segment
+  that merely shares the letters, such as `/cart-accessories/` (which caches
+  normally). The rule is: after the prefix the URL must end or continue with `/` or
+  `.`. So a product whose slug starts with `cart` is safe unless the next character
+  is a boundary.
 - **A store on a subdirectory or a translated store** shifts these URIs
   (`/fr/panier`), and the preset will not match them. Add a `map`-driven
   `cache_turbo_bypass` for the translated paths; the *cookie* half of the preset

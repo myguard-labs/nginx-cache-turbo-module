@@ -34,7 +34,7 @@ derive the correct rule for **your** app, and the `cache_turbo_cache_control hon
 default that is safe before you do.
 
 If you run an *application* that is built on a framework — Discourse is Rails,
-Magento is Symfony — use that app's preset above, not that page.
+Magento is Laminas/Zend — use that app's preset above, not that page.
 
 ## Every preset is opt-in
 
@@ -77,12 +77,14 @@ Four rows above are load-bearing:
   guide gives you the `map` that does it properly. phpBB also sends no reliable
   `Cache-Control: private`, so the bypass is the *whole* safety story there.
   See [phpbb.md](phpbb.md).
-- **`drupal` ships no cookie rule but is still safe.** The only shippable literal
-  (`SESS`) substring-matches `PHPSESSID` and `JSESSIONID` — every other PHP and
-  Java app's session cookie — so shipping it would silently zero the hit rate on
-  co-hosted apps. Drupal instead defends itself: it sends `Cache-Control: private,
-  must-revalidate` on authenticated pages, and `cache_turbo_backend` implies
-  `cache_control honor`, which refuses to store that. See [drupal.md](drupal.md).
+- **`drupal` ships the `SESS` cookie rule.** Drupal names its session cookie
+  `SESS<hash>` (and `SSESS<hash>` over HTTPS), so the `SESS` substring matches every
+  install without a per-site literal. It over-matches `PHPSESSID` and `JSESSIONID`
+  by design — a co-hosted PHP/Java app's session cookie will also trip it, trading a
+  little hit rate on those apps for never serving an authenticated Drupal page. As a
+  second floor, Drupal sends `Cache-Control: private, must-revalidate` on
+  authenticated pages, and `cache_turbo_backend` implies `cache_control honor`, which
+  refuses to store that. See [drupal.md](drupal.md).
 - **`magento` bypasses `X-Magento-Vary` where upstream *keys* on it — deliberately.**
   Magento's own Varnish VCL hashes that cookie's **value** into the cache key. This
   registry matches cookie **presence**, never value, so keying on it would collapse
@@ -122,11 +124,13 @@ measure. **Check whether a cookie is set for a logged-out visitor before you
 bypass on it.**
 
 **A cookie name that isn't stable across installs cannot be a preset rule.**
-Joomla hashes it from the site secret; phpBB lets the admin set the prefix;
-MediaWiki derives it from the database name; Drupal hashes it from the hostname.
-Where no substring can match, these presets ship *no* cookie rule and say so —
-rather than shipping one that quietly does nothing. The guide then hands you the
-`map` that works on your install.
+Joomla hashes it from the site secret; phpBB lets the admin set the prefix. Where
+no substring can match, these two presets ship *no* cookie rule and say so — rather
+than shipping one that quietly does nothing. The guide then hands you the `map` that
+works on your install. Where a stable substring *does* exist, the preset ships it:
+MediaWiki's cookie prefix varies (it's the database name), but every install shares
+the `Token=` / `_session=` / `UserID=` suffixes, so the preset matches those;
+Drupal's `SESS` prefix is fixed, so the preset matches that.
 
 ## Apps we deliberately do *not* ship a preset for
 

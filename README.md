@@ -10,7 +10,7 @@
 A built-in page cache for nginx. Think of it as a tiny Varnish that lives
 **inside** nginx — no extra daemon, no second port, no Lua.
 
-> **Writeup:** [nginx-cache-turbo — a built-in page cache](https://deb.myguard.nl/2026/06/nginx-cache-turbo-built-in-page-cache/).
+> **Writeup:** [nginx-cache-turbo — a built-in page cache](https://deb.myguard.nl/articles/nginx-cache-turbo/).
 > Ships in the **deb.myguard.nl nginx/angie stack** as
 > `libnginx-mod-http-cache-turbo` (nginx) / `angie-module-http-cache-turbo`
 > (Angie) — see [Building & the stack](#building--the-stack).
@@ -995,7 +995,7 @@ http {
 |---|---|---|---|
 | `cache_turbo_zone name=NAME SIZE` | `http` | — | Declare a shared-memory cache zone (min 8 pages). |
 | `cache_turbo NAME` / `off` | `server`, `location` | `off` | Turn caching on (bind a zone) or off. Takes a zone name and nothing else — the old `auto` shorthand is gone (see `cache_turbo_backend`). |
-| `cache_turbo_backend NAME...` | `server`, `location` | — | Auto-classify dynamic (uncacheable) request surfaces for one or more CMS presets: `wordpress`, `woocommerce`, `joomla`, `xenforo`, `discourse`, `phpbb`, `drupal`, `mediawiki`, `magento`, `ghost`, `wagtail`, `kirby` — or `none`. A matching request (login/session cookie, admin URI, dynamic arg) skips the cache and goes straight to origin. **Every preset is opt-in**; names **stack**, separated by spaces or `|` (`wordpress|woocommerce` == `wordpress woocommerce`). Implies `cache_turbo_cache_control honor`. **`none`** means no preset here and exists to override one inherited from the `server` block; it is exclusive and does not imply `honor`. **`generic`/`auto` were removed** and are now a config error — the union was never a safe default ([why](#cms-backends-cache_turbo_backend)). **`joomla`, `phpbb` and `drupal` ship no cookie rule**; `joomla`/`phpbb` need your own `cache_turbo_bypass` to protect logged-in users ([phpbb](docs/phpbb.md) needs a *value* test), `drupal` leans on the origin's `Cache-Control: private`. **`wagtail`/`kirby` ship a *conditional* cookie rule** that fails safe — it stops matching if the app writes sessions for guests ([wagtail](docs/wagtail.md), [kirby](docs/kirby.md)). There is **no `django`/`laravel` preset** and never will be ([why](docs/frameworks.md)). |
+| `cache_turbo_backend NAME...` | `server`, `location` | — | Auto-classify dynamic (uncacheable) request surfaces for one or more CMS presets: `wordpress`, `woocommerce`, `joomla`, `xenforo`, `discourse`, `phpbb`, `drupal`, `mediawiki`, `magento`, `ghost`, `wagtail`, `kirby` — or `none`. A matching request (login/session cookie, admin URI, dynamic arg) skips the cache and goes straight to origin. **Every preset is opt-in**; names **stack**, separated by spaces or `|` (`wordpress|woocommerce` == `wordpress woocommerce`). Implies `cache_turbo_cache_control honor`. **`none`** means no preset here and exists to override one inherited from the `server` block; it is exclusive and does not imply `honor`. **`generic`/`auto` were removed** and are now a config error — the union was never a safe default ([why](#cms-backends-cache_turbo_backend)). **`joomla` and `phpbb` ship no cookie rule**; both need your own `cache_turbo_bypass` to protect logged-in users ([phpbb](docs/phpbb.md) needs a *value* test). **`wagtail`/`kirby` ship a *conditional* cookie rule** that fails safe — it stops matching if the app writes sessions for guests ([wagtail](docs/wagtail.md), [kirby](docs/kirby.md)). There is **no `django`/`laravel` preset** and never will be ([why](docs/frameworks.md)). |
 | `cache_turbo_suppress_native on` | `server`, `location` | `off` | Make `$cache_turbo_active` read `1` while cache-turbo owns a request, so a stacked native `proxy_cache` can defer via `proxy_no_cache $cache_turbo_active; proxy_cache_bypass $cache_turbo_active;`. Off (default) keeps the variable always `0` (the wiring stays inert). |
 | `cache_turbo_key STRING` | `server`, `location` | normalized | What makes two requests "the same page". The default is `$host$uri$cache_turbo_normalized_args` — Host + **normalized args** (tracking params stripped, args sorted). |
 | `cache_turbo_preset NAME` | `server`, `location` | `balanced` | `micro` / `conservative` / `balanced` / `aggressive` — sets the four knobs below at once. `micro` = 1s microcaching (valid 1s, lock_ttl 1s, ×2 stale). |
@@ -1198,7 +1198,7 @@ $ apt install angie-module-http-cache-turbo
 - **Module catalogues:** [nginx modules](https://deb.myguard.nl/nginx-modules/)
   · [Angie modules (optimized & extended)](https://deb.myguard.nl/angie-modules-optimized-extended/)
 - **Directive synopsis:** [modules-synopsis #http-cache-turbo](https://deb.myguard.nl/nginx/modules-synopsis/#http-cache-turbo)
-- **Writeup:** [nginx-cache-turbo — a built-in page cache](https://deb.myguard.nl/2026/06/nginx-cache-turbo-built-in-page-cache/)
+- **Writeup:** [nginx-cache-turbo — a built-in page cache](https://deb.myguard.nl/articles/nginx-cache-turbo/)
 
 ## Benchmarking
 

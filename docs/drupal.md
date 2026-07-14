@@ -1,12 +1,12 @@
 # Drupal + cache-turbo
 
-Caching a Drupal 9/10/11 site. The Drupal preset ships **no cookie rule** — but
-unlike [phpBB](phpbb.md) and [Joomla](joomla.md), that is mostly fine, because
-Drupal defends itself. Read [why](#the-preset-ships-no-cookie-rule--and-thats-ok)
-so you know what you are relying on.
+Caching a Drupal 9/10/11 site. The Drupal preset ships the **`SESS` cookie rule**
+— it bypasses the cache for any request carrying a Drupal session cookie. Read
+[why](#the-preset-ships-the-sess-cookie-rule) so you know what it protects and
+what it costs.
 
 - [The short version](#the-short-version)
-- [The preset ships no cookie rule — and that's ok](#the-preset-ships-no-cookie-rule--and-thats-ok)
+- [The preset ships the `SESS` cookie rule](#the-preset-ships-the-sess-cookie-rule)
 - [Belt and braces](#belt-and-braces)
 - [Vhost](#vhost)
 - [Vhost + Redis L2](#vhost--redis-l2)
@@ -20,13 +20,14 @@ cache_turbo         ct;
 cache_turbo_backend drupal;      # implies cache_turbo_cache_control honor
 ```
 
-That is genuinely all most sites need. `cache_turbo_backend` implies
-`cache_turbo_cache_control honor`, and Drupal sends `Cache-Control: private,
-must-revalidate` on every authenticated response — which `honor` refuses to
-store. The preset's URI rules cover the surfaces that are dynamic *before* any
-cookie exists.
+That is genuinely all most sites need. The preset bypasses the cache for any
+request carrying Drupal's `SESS` session cookie, and its URI rules cover the
+surfaces that are dynamic *before* any cookie exists. As defence-in-depth,
+`cache_turbo_backend` implies `cache_turbo_cache_control honor`, and Drupal sends
+`Cache-Control: private, must-revalidate` on every authenticated response — which
+`honor` refuses to store.
 
-## The preset ships no cookie rule — and that's ok
+## The preset ships the `SESS` cookie rule
 
 | Check | Values |
 |---|---|
@@ -102,18 +103,13 @@ Matching it would cost hits and buy no safety.
 **The origin's `Cache-Control` is still there**, and still useful — it is now
 defence-in-depth *behind* the cookie rule, which is the correct ordering.
 
-There is a second reason the missing cookie rule costs little: **anonymous
-readers get no session cookie at all.** Drupal destroys an obsolete session
-rather than persisting one, so a plain anonymous visitor is never issued a
-`SESS*`. (Which means, unlike phpBB's `_sid`, a `SESS` rule would at least not
-have been the "bypasses every guest" trap — the `PHPSESSID` collision is what
-rules it out.)
-
 ## Belt and braces
 
-If you want the request-side bypass anyway — defence in depth, or because you run
-a contrib module that writes to `$_SESSION` and emits pages Drupal marks
-cacheable — add your own. Find the cookie name:
+The preset already bypasses on the `SESS` substring. If you want a **more
+precise** request-side rule — one that matches Drupal's cookie shape without also
+catching a co-hosted app's `PHPSESSID`, or because you run a contrib module that
+writes to `$_SESSION` and emits pages Drupal marks cacheable — add your own. Find
+the cookie name:
 
 ```bash
 curl -sI -c - https://example.com/user/login | grep -i set-cookie
@@ -238,9 +234,9 @@ curl -sI https://example.com/user       | grep -i x-cache-turbo
 curl -sI https://example.com/admin/config | grep -i x-cache-turbo
 
 # THE ONE THAT MATTERS: a logged-in user must never be served from cache.
-# Expect BYPASS if you added the map; if you did not, expect MISS every time
-# (Drupal sends Cache-Control: private, so honor mode refuses to STORE it) --
-# and crucially, never a HIT.
+# Expect BYPASS -- the preset's SESS cookie rule catches the session cookie.
+# (Even without it, Drupal sends Cache-Control: private, so honor mode refuses
+# to STORE the response -- but the cookie rule is what you rely on.) Never a HIT.
 curl -sI -H 'Cookie: SSESS9f2a...=abc' https://example.com/node/1 \
      | grep -i x-cache-turbo
 
@@ -250,26 +246,28 @@ curl -sI -H 'Cookie: SSESS9f2a...=abc' https://example.com/node/1 \
 # Cache-Control: private, must-revalidate     <- if this is missing, ADD THE MAP
 ```
 
-That last check is the one to actually run. The no-cookie-rule design leans
-entirely on Drupal sending `private`. If a contrib module or an aggressive
-"performance" setting has stripped it, add the `map` bypass and don't rely on the
-origin.
+That last check is your defence-in-depth safety net. The `SESS` cookie rule is the
+primary defence; Drupal sending `private` is the belt behind it. If a contrib
+module or an aggressive "performance" setting has stripped `private`, the cookie
+rule still holds — but add the `map` bypass too and don't lean on the origin.
 
 ## Gotchas
 
-- **Don't set `cache_turbo_cache_control ignore` on a Drupal site.** It would
-  override the `honor` that `cache_turbo_backend` implies, and `honor` is the
-  entire reason the preset can get away with no cookie rule. `ignore` + no cookie
-  rule = authenticated pages in the cache.
+- **Think twice before `cache_turbo_cache_control ignore` on a Drupal site.** The
+  `SESS` cookie rule still bypasses authenticated requests, but `ignore` switches
+  off the `Cache-Control: private` floor that the `honor` implied by
+  `cache_turbo_backend` gives you — you lose the belt behind the cookie rule.
 - **`/user` and `/admin` are not reserved words.** They're ordinary Drupal routes,
   which is exactly why no preset is ever enabled implicitly — a non-Drupal site
   may serve `/user` as a perfectly cacheable page. Name the preset explicitly.
 - **Contrib modules add their own private surfaces.** Commerce carts, Group,
   Private Message — the preset knows nothing about them. Add a
   `cache_turbo_bypass` for each.
-- **`SESS` is not shipped on purpose.** If you're tempted to add
-  `cache_turbo_bypass $cookie_SESS...`, use the `map` form above instead — a bare
-  `SESS` match will also catch `PHPSESSID` from any other app on the host.
+- **`SESS` is shipped, and it is a substring.** Because the preset matches the
+  bare literal `SESS`, it also catches `PHPSESSID` and `JSESSIONID` from any other
+  PHP or Java app under the same `server` block — a hit-rate loss on that app,
+  never a leak. If it costs you, narrow it with the `map` form above or a
+  `cache_turbo_bypass $cookie_SESS<your-hash>;` scoped to your install.
 - **`/core/install.php` and `/update.php`** are dynamic; the preset covers the
   former, and the vhost above routes the latter through the same PHP block.
 - **`Set-Cookie` responses are never stored** and `Authorization` requests are
@@ -278,6 +276,6 @@ origin.
 ## See also
 
 - [README — CMS backends](../README.md#cms-backends-cache_turbo_backend)
-- [`docs/mediawiki.md`](mediawiki.md) — the other preset that leans on origin `Cache-Control`
+- [`docs/mediawiki.md`](mediawiki.md) — a preset that leans on origin `Cache-Control`
 - [`docs/phpbb.md`](phpbb.md) — a preset with no cookie rule and *no* origin safety net
 - [`docs/README.md`](README.md) — all presets
