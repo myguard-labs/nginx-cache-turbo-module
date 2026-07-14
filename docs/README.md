@@ -18,6 +18,8 @@ One page per `cache_turbo_backend` preset:
 | `phpbb` | [phpbb.md](phpbb.md) | ❌ **no** — you must add a `cache_turbo_bypass`, and it needs a *value* test |
 | `drupal` | [drupal.md](drupal.md) | ⚠️ via the origin — Drupal sends `Cache-Control: private`; no cookie rule shipped |
 | `mediawiki` | [mediawiki.md](mediawiki.md) | ✅ yes (`*UserID`, `*UserName`) |
+| `magento` | [magento.md](magento.md) | ✅ yes (`X-Magento-Vary`) — and the origin sends `no-store` on cart/checkout |
+| `ghost` | [ghost.md](ghost.md) | ✅ yes (`ghost-members-ssr`) — **plus `?uuid=`/`?key=`, which auth a member with no cookie** |
 
 ## Every preset is opt-in
 
@@ -66,6 +68,19 @@ Four rows above are load-bearing:
   co-hosted apps. Drupal instead defends itself: it sends `Cache-Control: private,
   must-revalidate` on authenticated pages, and `cache_turbo_backend` implies
   `cache_control honor`, which refuses to store that. See [drupal.md](drupal.md).
+- **`magento` bypasses `X-Magento-Vary` where upstream *keys* on it — deliberately.**
+  Magento's own Varnish VCL hashes that cookie's **value** into the cache key. This
+  registry matches cookie **presence**, never value, so keying on it would collapse
+  every non-default visitor — customer A, customer B, a EUR guest — into **one shared
+  bucket** and serve one customer's cart to another. Bypassing instead is
+  correct-but-conservative: the anonymous catalog (the bulk) still caches.
+  [magento.md](magento.md) shows the `map` that restores true value-keying — and
+  warns that `$cookie_X_Magento_Vary` **silently never matches**, because nginx does
+  not translate `-` to `_` for cookie names.
+- **`ghost`'s query args are load-bearing.** `authMemberByUuid()` authenticates a
+  member purely from `?uuid=&key=` with **no cookie at all**, so a cookie-only rule
+  set is not safe — a member's page would be stored under a URL anyone can request.
+  See [ghost.md](ghost.md).
 - **`mediawiki`'s dynamic surface is in the query args, not the path.** It
   bypasses `veaction=` but deliberately **not** a blanket `action=` — `action=raw`,
   `action=history`, `diff=` and `oldid=` are deterministic, shared and hot, and
@@ -119,6 +134,29 @@ fix is APCu/Redis, opcache, and `php-fpm` pool sizing — not an HTTP page cache
 anonymous surface is a login page, so a preset would be a list that says "bypass
 everything". Vaultwarden especially — a preset there is an invitation to
 misconfigure a password vault.
+
+**Moodle.** The Nextcloud case twice over. It starts a session and sets
+`MoodleSession` for *every* visitor including anonymous ones (`lib/setup.php`), so
+a bypass on it would bypass **100%** of requests. Independently, `send_headers()`
+(`lib/weblib.php`) emits `Cache-Control: private, max-age=0` at *best* and
+`no-store, no-cache` otherwise — so a cache that honours the origin stores nothing
+anyway. It is also commonly installed in a subdirectory, which breaks position-0
+prefix matching. Three independent failures.
+
+**PrestaShop.** The cookie name is `PrestaShop-<md5(version + name + domain)>` —
+per-install *and* it changes on every minor upgrade — and auth state lives **inside
+that cookie's encrypted value**, invisible to a presence matcher. Its cart/account
+paths are operator- and language-editable via a database `meta` table (`/panier`,
+`/mein-konto`), so no prefix is shippable either. And decisively: **PrestaShop 8
+sends no `Cache-Control` on cart or checkout at all**, so the origin backstop that
+saves Drupal and MediaWiki does not fire. All three legs are broken — a URI-only
+preset here would not degrade gracefully, it would **leak carts**.
+
+**OpenCart.** Everything is `index.php?route=checkout/cart`, so the dynamic surface
+lives in a query-arg **value**. This registry matches arg-**key** presence, and a
+`route` rule would match *every* page including the entire catalog — hit rate zero.
+Every cookie OpenCart sets (`OCSESSID`, `currency`) is set for anonymous visitors,
+so none can be a bypass. The preset simply cannot express the app.
 
 **The test to apply before asking for a new preset:** *what fraction of this app's
 requests are pages a logged-out stranger can see, that look the same for every

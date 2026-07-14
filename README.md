@@ -423,6 +423,7 @@ cache.
 cache_turbo            ct;
 cache_turbo_backend    wordpress;          # one or more: wordpress woocommerce joomla
                                            # xenforo discourse phpbb drupal mediawiki
+                                           # magento ghost
 ```
 
 **Every preset is opt-in — name the backends you actually run.** They **stack**,
@@ -473,6 +474,8 @@ per-session suffixes, so it matches as a substring).
 | `phpbb` †     | `/ucp.php`, `/mcp.php`, `/adm/`, `/posting.php`, `/memberlist.php`, `/search.php`, `/report.php` | `sid` | — ‡ |
 | `drupal` †    | `/user`, `/admin`, `/node/add`, `/system/`, `/core/install.php` | — | — ‡ |
 | `mediawiki` † | `/index.php`, `/load.php`, `/api.php` | `veaction`, `returnto` | `UserID=`, `UserName=` |
+| `magento` †   | `/checkout`, `/customer`, `/graphql`, `/sales`, `/newsletter`, `/wishlist`, `/paypal`, `/review`, `/page_cache/block/esi`, `/health_check.php` | — | `X-Magento-Vary` |
+| `ghost` †     | `/ghost/`, `/members/`, `/p/`, `/r/` | `uuid`, `key`, `token` | `ghost-members-ssr`, `ghost-admin-api-session` |
 
 † **Opt-in, like every preset.** These backends' dynamic surfaces are generic
 English paths (`/login`, `/register`, `/user`, `/admin`, `/session`,
@@ -502,7 +505,8 @@ XenForo member (`xf_user`), a Discourse user (`_t`) or a MediaWiki editor
 > [**WordPress**](docs/wordpress.md) · [**WooCommerce**](docs/woocommerce.md) ·
 > [**Joomla**](docs/joomla.md) · [**XenForo**](docs/xenforo.md) ·
 > [**Discourse**](docs/discourse.md) · [**phpBB**](docs/phpbb.md) ·
-> [**Drupal**](docs/drupal.md) · [**MediaWiki**](docs/mediawiki.md) —
+> [**Drupal**](docs/drupal.md) · [**MediaWiki**](docs/mediawiki.md) ·
+> [**Magento**](docs/magento.md) · [**Ghost**](docs/ghost.md) —
 > index at [`docs/`](docs/README.md).
 >
 > Caveats you should not skip: **`joomla` and `phpbb` ship no cookie rule** and do
@@ -868,7 +872,7 @@ http {
         location / {
             # ── turn it on ──────────────────────────────────────────────
             cache_turbo                   ct;        # bind zone "ct" (or: off)
-            cache_turbo_backend           wordpress; # wordpress|woocommerce|joomla|xenforo|discourse|phpbb|drupal|mediawiki (stackable, '|' or spaces); 'none' = off; implies cache_control honor
+            cache_turbo_backend           wordpress; # wordpress|woocommerce|joomla|xenforo|discourse|phpbb|drupal|mediawiki|magento|ghost (stackable, '|' or spaces); 'none' = off; implies cache_control honor
 
             # ── what is "the same page" ─────────────────────────────────
             cache_turbo_key               $host$uri$cache_turbo_normalized_args;  # the default
@@ -936,7 +940,7 @@ http {
 |---|---|---|---|
 | `cache_turbo_zone name=NAME SIZE` | `http` | — | Declare a shared-memory cache zone (min 8 pages). |
 | `cache_turbo NAME` / `off` | `server`, `location` | `off` | Turn caching on (bind a zone) or off. Takes a zone name and nothing else — the old `auto` shorthand is gone (see `cache_turbo_backend`). |
-| `cache_turbo_backend NAME...` | `server`, `location` | — | Auto-classify dynamic (uncacheable) request surfaces for one or more CMS presets: `wordpress`, `woocommerce`, `joomla`, `xenforo`, `discourse`, `phpbb`, `drupal`, `mediawiki` — or `none`. A matching request (login/session cookie, admin URI, dynamic arg) skips the cache and goes straight to origin. **Every preset is opt-in**; names **stack**, separated by spaces or `|` (`wordpress|woocommerce` == `wordpress woocommerce`). Implies `cache_turbo_cache_control honor`. **`none`** means no preset here and exists to override one inherited from the `server` block; it is exclusive and does not imply `honor`. **`generic`/`auto` were removed** and are now a config error — the union was never a safe default ([why](#cms-backends-cache_turbo_backend)). **`joomla`, `phpbb` and `drupal` ship no cookie rule**; `joomla`/`phpbb` need your own `cache_turbo_bypass` to protect logged-in users ([phpbb](docs/phpbb.md) needs a *value* test), `drupal` leans on the origin's `Cache-Control: private`. |
+| `cache_turbo_backend NAME...` | `server`, `location` | — | Auto-classify dynamic (uncacheable) request surfaces for one or more CMS presets: `wordpress`, `woocommerce`, `joomla`, `xenforo`, `discourse`, `phpbb`, `drupal`, `mediawiki`, `magento`, `ghost` — or `none`. A matching request (login/session cookie, admin URI, dynamic arg) skips the cache and goes straight to origin. **Every preset is opt-in**; names **stack**, separated by spaces or `|` (`wordpress|woocommerce` == `wordpress woocommerce`). Implies `cache_turbo_cache_control honor`. **`none`** means no preset here and exists to override one inherited from the `server` block; it is exclusive and does not imply `honor`. **`generic`/`auto` were removed** and are now a config error — the union was never a safe default ([why](#cms-backends-cache_turbo_backend)). **`joomla`, `phpbb` and `drupal` ship no cookie rule**; `joomla`/`phpbb` need your own `cache_turbo_bypass` to protect logged-in users ([phpbb](docs/phpbb.md) needs a *value* test), `drupal` leans on the origin's `Cache-Control: private`. |
 | `cache_turbo_suppress_native on` | `server`, `location` | `off` | Make `$cache_turbo_active` read `1` while cache-turbo owns a request, so a stacked native `proxy_cache` can defer via `proxy_no_cache $cache_turbo_active; proxy_cache_bypass $cache_turbo_active;`. Off (default) keeps the variable always `0` (the wiring stays inert). |
 | `cache_turbo_key STRING` | `server`, `location` | normalized | What makes two requests "the same page". The default is `$host$uri$cache_turbo_normalized_args` — Host + **normalized args** (tracking params stripped, args sorted). |
 | `cache_turbo_preset NAME` | `server`, `location` | `balanced` | `micro` / `conservative` / `balanced` / `aggressive` — sets the four knobs below at once. `micro` = 1s microcaching (valid 1s, lock_ttl 1s, ×2 stale). |

@@ -97,6 +97,8 @@ typedef struct {
 #define NGX_HTTP_CACHE_TURBO_BACKEND_PHPBB        0x0020
 #define NGX_HTTP_CACHE_TURBO_BACKEND_DRUPAL       0x0040
 #define NGX_HTTP_CACHE_TURBO_BACKEND_MEDIAWIKI    0x0080
+#define NGX_HTTP_CACHE_TURBO_BACKEND_MAGENTO      0x0100
+#define NGX_HTTP_CACHE_TURBO_BACKEND_GHOST        0x0200
 
 /*
  * Every preset bit, armed together by the driver. There is no GENERIC union any
@@ -117,7 +119,9 @@ typedef struct {
      | NGX_HTTP_CACHE_TURBO_BACKEND_DISCOURSE                                  \
      | NGX_HTTP_CACHE_TURBO_BACKEND_PHPBB                                      \
      | NGX_HTTP_CACHE_TURBO_BACKEND_DRUPAL                                     \
-     | NGX_HTTP_CACHE_TURBO_BACKEND_MEDIAWIKI)
+     | NGX_HTTP_CACHE_TURBO_BACKEND_MEDIAWIKI                                  \
+     | NGX_HTTP_CACHE_TURBO_BACKEND_MAGENTO                                    \
+     | NGX_HTTP_CACHE_TURBO_BACKEND_GHOST)
 
 /* ALL must be a gapless run of bits starting at 0x0001 — i.e. ALL+1 is a power
  * of two. A preset bit defined above but left out of ALL breaks this and fails

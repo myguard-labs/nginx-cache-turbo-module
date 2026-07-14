@@ -114,6 +114,8 @@
 #define NGX_HTTP_CACHE_TURBO_BACKEND_PHPBB        0x0020
 #define NGX_HTTP_CACHE_TURBO_BACKEND_DRUPAL       0x0040
 #define NGX_HTTP_CACHE_TURBO_BACKEND_MEDIAWIKI    0x0080
+#define NGX_HTTP_CACHE_TURBO_BACKEND_MAGENTO      0x0100
+#define NGX_HTTP_CACHE_TURBO_BACKEND_GHOST        0x0200
 
 /*
  * "cache_turbo_backend none;" — explicitly NO preset here.

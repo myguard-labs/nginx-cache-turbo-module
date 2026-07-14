@@ -1172,6 +1172,51 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # ---- magento -------------------------------------------------------
+        # URI prefixes anchor at position 0 -> ROOT locations.
+        location /checkout {{
+            cache_turbo         main;
+            cache_turbo_backend magento;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        location /customer {{
+            cache_turbo         main;
+            cache_turbo_backend magento;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        # Cookie rules are path-independent. The catalog is the surface that MUST
+        # stay cacheable -- including for guests carrying PHPSESSID / form_key /
+        # private_content_version, every one of which Magento sets for anons.
+        location /mg/ {{
+            cache_turbo         main;
+            cache_turbo_backend magento;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # ---- ghost ---------------------------------------------------------
+        location /ghost/ {{
+            cache_turbo         main;
+            cache_turbo_backend ghost;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        # The public blog: must cache for anonymous readers. Also where the
+        # ?uuid=/?key= cookieless member auth is exercised.
+        location /blog/ {{
+            cache_turbo         main;
+            cache_turbo_backend ghost;
+            cache_turbo_key     $uri$is_args$args;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # `none` overrides an inherited preset. The server-level directive below
         # arms wordpress for every location that does not say otherwise; this one
         # says otherwise, so /wp-admin/-style rules must NOT fire here.
@@ -2342,6 +2387,94 @@ def test_mediawiki_preset(ng: Nginx, origin: Origin) -> None:
     drain_origin(origin)
 
 
+def test_magento_preset(ng: Nginx, origin: Origin) -> None:
+    """Magento 2 preset (docs/magento.md).
+
+    ONE bypass cookie: X-Magento-Vary. It is the "not the shared anonymous case"
+    signal -- Magento computes it only from context values that DIFFER from their
+    defaults, so a plain anonymous visitor on the default store never gets it.
+
+    The negative half is the entire hit rate. Magento hands PHPSESSID, form_key,
+    private_content_version, mage-cache-sessid and section_data_ids to ANONYMOUS
+    visitors -- private_content_version on any POST, then for ten years. Bypassing
+    on any of them takes the catalog cache to ~0%. If someone adds one of these to
+    the cookie list, this test fails."""
+    for uri in ("/checkout", "/checkout/cart", "/customer/account"):
+        _, _, h = fetch(ng.port, uri)
+        assert "x-cache" not in h, f"{uri} must bypass on the magento preset"
+
+    # The one real bypass: a non-default context (logged in / group / currency).
+    vary = {"Cookie": "X-Magento-Vary=9f2a4c1e8b7d6f5a4c3b2a1908070605"}
+    _, _, h1 = fetch(ng.port, "/mg/product-a", headers=vary)
+    _, _, h2 = fetch(ng.port, "/mg/product-a", headers=vary)
+    assert "x-cache" not in h1 and "x-cache" not in h2, \
+        "X-Magento-Vary must bypass (non-default context: logged in, group, currency)"
+
+    # THE HIT RATE: every one of these is set for ANONYMOUS visitors. All must
+    # keep caching. A regression here is a silent 0%-hit-rate catalog.
+    for name, ck in (
+        ("PHPSESSID",               "PHPSESSID=abc123"),
+        ("form_key",                "form_key=deadbeef"),
+        ("private_content_version", "private_content_version=1a2b3c"),
+        ("mage-cache-sessid",       "mage-cache-sessid=true"),
+        ("section_data_ids",        "section_data_ids=%7B%22cart%22%3A1%7D"),
+        ("all of them together",    "PHPSESSID=abc; form_key=def; "
+                                    "private_content_version=1a2b; "
+                                    "mage-cache-sessid=true; mage-messages=hi"),
+    ):
+        uri = f"/mg/cat-{name.split()[0]}"
+        fetch(ng.port, uri, headers={"Cookie": ck})
+        _, _, hg = fetch(ng.port, uri, headers={"Cookie": ck})
+        assert hg.get("x-cache") == "HIT", \
+            (f"magento: {name} is set for ANONYMOUS visitors and must stay "
+             f"cacheable -- bypassing on it zeroes the catalog hit rate; "
+             f"got {hg.get('x-cache')}")
+    drain_origin(origin)
+
+
+def test_ghost_preset(ng: Nginx, origin: Origin) -> None:
+    """Ghost preset (docs/ghost.md).
+
+    The public blog is a genuinely shared anonymous surface: a member session does
+    not change the HTML of a fully public post (checkPostAccess() returns early on
+    visibility === 'public'), so a bypass cookie is sufficient and no cache-key
+    variant is needed.
+
+    The query-arg rules are LOAD-BEARING, not decoration: authMemberByUuid()
+    authenticates a member purely from ?uuid=&key= with NO cookie. Without those
+    rules a member-authenticated response could be stored and served to strangers.
+    That is the one non-obvious correctness item in this preset."""
+    # Admin SPA / API bypasses.
+    _, _, h = fetch(ng.port, "/ghost/api/admin/site")
+    assert "x-cache" not in h, "/ghost/ must bypass"
+
+    # Members session cookie bypasses (covers the .sig cookie via substring too).
+    for ck in ("ghost-members-ssr=abc123", "ghost-members-ssr.sig=deadbeef",
+               "ghost-admin-api-session=cafe"):
+        _, _, h1 = fetch(ng.port, "/blog/post-a", headers={"Cookie": ck})
+        _, _, h2 = fetch(ng.port, "/blog/post-a", headers={"Cookie": ck})
+        assert "x-cache" not in h1 and "x-cache" not in h2, \
+            f"ghost: {ck.split('=')[0]} must bypass"
+
+    # COOKIELESS MEMBER AUTH: ?uuid=&key= authenticates a member with no cookie at
+    # all. If these do not bypass, a member's page gets stored and served to the
+    # public. This is the sharp edge of the Ghost preset.
+    for uri in ("/blog/post-b?uuid=abc-123&key=deadbeef",
+                "/blog/post-b?token=magiclink123"):
+        _, _, hu = fetch(ng.port, uri)
+        assert "x-cache" not in hu, \
+            (f"ghost: {uri} authenticates a member via the QUERY STRING with no "
+             "cookie -- it must bypass or a member response is served to strangers")
+
+    # An anonymous reader must cache -- Ghost sets no cookie for one, which is the
+    # property that makes this preset worth shipping at all.
+    fetch(ng.port, "/blog/post-c")
+    _, _, ha = fetch(ng.port, "/blog/post-c")
+    assert ha.get("x-cache") == "HIT", \
+        f"ghost: an anonymous blog reader must cache, got {ha.get('x-cache')}"
+    drain_origin(origin)
+
+
 def test_new_presets_not_in_generic(ng: Nginx, origin: Origin) -> None:
     """None of the opt-in presets may be folded into generic/auto. Their URIs are
     generic English words (/login, /user, /admin, /session, /posts) that an
@@ -2586,7 +2719,8 @@ def test_backend_separators(ng: Nginx) -> None:
         "wordpress|woocommerce joomla",
         "mediawiki|drupal",
         "none",
-        "wordpress|woocommerce|joomla|xenforo|discourse|phpbb|drupal|mediawiki",
+        "wordpress|woocommerce|joomla|xenforo|discourse|phpbb|drupal|mediawiki|magento|ghost",
+        "magento|ghost",
     ]):
         _config_accepts(ng, f"sep-ok-{i}", _BACKEND_LINE,
                         f"cache_turbo_backend {spec};")
@@ -5638,6 +5772,8 @@ def run_all(ng: Nginx, origin: Origin,
     test_phpbb_preset(ng, origin)
     test_drupal_preset(ng, origin)
     test_mediawiki_preset(ng, origin)
+    test_magento_preset(ng, origin)
+    test_ghost_preset(ng, origin)
     test_new_presets_not_in_generic(ng, origin)
     test_auto_classify_more(ng, origin)
     test_q2_multibuffer_oversize(ng, origin)
