@@ -63,6 +63,10 @@ static ngx_int_t ngx_http_cache_turbo_auto_skip(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf);
 static ngx_int_t ngx_http_cache_turbo_key_cookie(ngx_http_request_t *r,
     ngx_uint_t backend_presets, ngx_str_t *name_out, ngx_str_t *val_out);
+static ngx_int_t ngx_http_cache_turbo_cookie_lookup(ngx_http_request_t *r,
+    ngx_str_t *name, ngx_str_t *val_out);
+static ngx_int_t ngx_http_cache_turbo_bypass_uri_match(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf);
 static char *ngx_http_cache_turbo_key(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static char *ngx_http_cache_turbo_valid_conf(ngx_conf_t *cf, ngx_command_t *cmd,
@@ -99,6 +103,10 @@ static ngx_int_t ngx_http_cache_turbo_normalized_args_variable(
 static char *ngx_http_cache_turbo_normalize_strip(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 static char *ngx_http_cache_turbo_normalize_vary(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
+static char *ngx_http_cache_turbo_bypass_uri(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
+static char *ngx_http_cache_turbo_key_cookie_conf(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 /* auto-Vary (v11 other half) — defined near the v3-4 vary helpers but called
  * from the access/header/body paths above them, so forward-declared here. */
@@ -326,6 +334,20 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
     { ngx_string("cache_turbo_normalize_vary"),
       NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_1MORE,
       ngx_http_cache_turbo_normalize_vary,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+
+    { ngx_string("cache_turbo_bypass_uri"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_1MORE,
+      ngx_http_cache_turbo_bypass_uri,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+
+    { ngx_string("cache_turbo_key_cookie"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_1MORE,
+      ngx_http_cache_turbo_key_cookie_conf,
       NGX_HTTP_LOC_CONF_OFFSET,
       0,
       NULL },
@@ -697,6 +719,63 @@ ngx_http_cache_turbo_build_key(ngx_http_request_t *r,
 
             ctx->cache_key.data = k;
             ctx->cache_key.len = klen;
+        }
+    }
+
+    /*
+     * DIY key cookies (cache_turbo_key_cookie): the same tier-3 value-keying as
+     * a preset key cookie, for an app we ship no preset for. Each configured
+     * cookie's VALUE is folded into the key with the IDENTICAL unforgeable
+     * length-prefixed framing (0x1f tag + 4B namelen + 4B vallen + name +
+     * value) — see the preset block above for why length-prefixing (not a
+     * delimiter) is required. Cookies are folded in config order, which is
+     * stable, so the key is deterministic. EXACT name match, ALL Cookie headers
+     * scanned (an attacker must not be able to hide the real cookie in a second
+     * header and pick the bucket). An absent cookie leaves the key unchanged
+     * (the anonymous entry), matching the preset semantics.
+     *
+     * SAFETY: like the presets, this DEPENDS on the unconditional Set-Cookie
+     * store floor in ngx_http_cache_turbo_response_cacheable() to refuse the
+     * transition race (request without the cookie keys to the anon entry, the
+     * response then SETS the cookie -> storing under the anon key would poison
+     * it). Do not relax that floor.
+     */
+    if (clcf->key_cookies != NULL
+        && clcf->key_cookies != NGX_CONF_UNSET_PTR)
+    {
+        ngx_str_t   *nm = clcf->key_cookies->elts;
+        ngx_uint_t   i;
+
+        for (i = 0; i < clcf->key_cookies->nelts; i++) {
+            ngx_str_t  kcval;
+
+            if (!ngx_http_cache_turbo_cookie_lookup(r, &nm[i], &kcval)) {
+                continue;
+            }
+
+            {
+                u_char  *k, *p;
+                size_t   klen;
+
+                klen = ctx->cache_key.len + 1 + 4 + 4 + nm[i].len + kcval.len;
+
+                k = ngx_pnalloc(r->pool, klen);
+                if (k == NULL) {
+                    return NGX_ERROR;
+                }
+
+                p = ngx_cpymem(k, ctx->cache_key.data, ctx->cache_key.len);
+                *p++ = '\x1f';
+                ngx_http_cache_turbo_put_u32(p, (uint32_t) nm[i].len);
+                p += 4;
+                ngx_http_cache_turbo_put_u32(p, (uint32_t) kcval.len);
+                p += 4;
+                p = ngx_cpymem(p, nm[i].data, nm[i].len);
+                ngx_memcpy(p, kcval.data, kcval.len);
+
+                ctx->cache_key.data = k;
+                ctx->cache_key.len = klen;
+            }
         }
     }
 
@@ -2643,6 +2722,86 @@ ngx_http_cache_turbo_key_cookie(ngx_http_request_t *r,
 /* >>> FUZZ-EXTRACT auto-classify END <<< */
 
 
+/*
+ * DIY manual URI bypass (cache_turbo_bypass_uri). Returns 1 when r->uri matches
+ * any configured prefix on a path-segment boundary, using the SAME matcher the
+ * presets use (ngx_http_cache_turbo_uri_prefix) — so an app we ship no preset
+ * for gets the identical subdirectory-safe bypass a preset URI rule would give,
+ * with the same origin-and-never-capture treatment (the caller sets
+ * ctx->auto_skip). Runs independently of backend_presets, so it works in pure
+ * manual mode. Config-driven, so it lives OUTSIDE the fuzz-extracted preset
+ * classifier. NULL / empty list => 0 (no cost when unused).
+ */
+static ngx_int_t
+ngx_http_cache_turbo_bypass_uri_match(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf)
+{
+    ngx_str_t   *pfx;
+    ngx_uint_t   i;
+
+    if (clcf->bypass_uri == NULL
+        || clcf->bypass_uri == NGX_CONF_UNSET_PTR)
+    {
+        return 0;
+    }
+
+    pfx = clcf->bypass_uri->elts;
+    for (i = 0; i < clcf->bypass_uri->nelts; i++) {
+        if (ngx_http_cache_turbo_uri_prefix(&r->uri, (char *) pfx[i].data,
+                                            pfx[i].len))
+        {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+
+/*
+ * Config-driven cookie lookup for cache_turbo_key_cookie: find NAME's value
+ * across EVERY Cookie header (same all-headers scan and first-occurrence-wins
+ * rule as ngx_http_cache_turbo_key_cookie for the presets, and the same reason
+ * — an attacker must not hide the real cookie in a second header to pick a
+ * bucket). NAME comes from config (an ngx_str_t) rather than the preset's
+ * NUL-terminated C string, so it is matched by explicit length. Returns 1 and
+ * fills *val_out when found.
+ */
+static ngx_int_t
+ngx_http_cache_turbo_cookie_lookup(ngx_http_request_t *r, ngx_str_t *name,
+    ngx_str_t *val_out)
+{
+#if (nginx_version >= 1023000)
+    ngx_table_elt_t  *ck;
+
+    for (ck = r->headers_in.cookie; ck; ck = ck->next) {
+        if (ngx_http_cache_turbo_cookie_value(ck->value.data, ck->value.len,
+                                              (char *) name->data, name->len,
+                                              val_out))
+        {
+            return 1;
+        }
+    }
+#else
+    ngx_table_elt_t  **ckp;
+    ngx_uint_t          i;
+
+    ckp = r->headers_in.cookies.elts;
+    for (i = 0; i < r->headers_in.cookies.nelts; i++) {
+        if (ngx_http_cache_turbo_cookie_value(ckp[i]->value.data,
+                                              ckp[i]->value.len,
+                                              (char *) name->data, name->len,
+                                              val_out))
+        {
+            return 1;
+        }
+    }
+#endif
+
+    return 0;
+}
+
+
 /* PURGE (v14) runs in the PRECONTENT phase, NOT the ACCESS phase. The ACCESS
  * phase (allow/deny, auth_basic, …) must complete first: handling PURGE in
  * ACCESS and returning NGX_DONE would short-circuit the phase engine and let an
@@ -2746,8 +2905,9 @@ ngx_http_cache_turbo_access_prologue(ngx_http_request_t *r,
      * the body filter). Sits under the manual bypass/no_store overrides below.
      * honor_cc is auto-enabled with a preset so a plugin's own Cache-Control:
      * no-cache on an anon page self-excludes at store time. */
-    if (NGX_HTTP_CACHE_TURBO_HAS_BACKEND(clcf->backend_presets)
-        && ngx_http_cache_turbo_auto_skip(r, clcf))
+    if ((NGX_HTTP_CACHE_TURBO_HAS_BACKEND(clcf->backend_presets)
+         && ngx_http_cache_turbo_auto_skip(r, clcf))
+        || ngx_http_cache_turbo_bypass_uri_match(r, clcf))
     {
         ctx->auto_skip = 1;
         /* cache-turbo neither serves nor stores an auto-classified dynamic
@@ -7514,6 +7674,82 @@ ngx_http_cache_turbo_normalize_vary(ngx_conf_t *cf, ngx_command_t *cmd,
 }
 
 
+/* cache_turbo_bypass_uri prefix...  — DIY equivalent of a preset URI rule. Each
+ * prefix is stored verbatim; the request path matches it with the same
+ * segment-boundary matcher the presets use. Appends across levels (a location
+ * adds to the server-level set) rather than replacing. */
+static char *
+ngx_http_cache_turbo_bypass_uri(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_cache_turbo_loc_conf_t  *clcf = conf;
+    ngx_str_t                        *value, *s;
+    ngx_uint_t                        i;
+
+    if (clcf->bypass_uri == NGX_CONF_UNSET_PTR) {
+        clcf->bypass_uri = ngx_array_create(cf->pool, 4, sizeof(ngx_str_t));
+        if (clcf->bypass_uri == NULL) {
+            return NGX_CONF_ERROR;
+        }
+    }
+
+    value = cf->args->elts;
+    for (i = 1; i < cf->args->nelts; i++) {
+        if (value[i].len == 0 || value[i].data[0] != '/') {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                "cache_turbo_bypass_uri prefix \"%V\" must begin with \"/\"",
+                &value[i]);
+            return NGX_CONF_ERROR;
+        }
+        s = ngx_array_push(clcf->bypass_uri);
+        if (s == NULL) {
+            return NGX_CONF_ERROR;
+        }
+        *s = value[i];
+    }
+
+    return NGX_CONF_OK;
+}
+
+
+/* cache_turbo_key_cookie name...  — DIY equivalent of a preset key cookie. The
+ * VALUE of each named cookie is folded into the cache key (tier-3 value-keying)
+ * so segment variants get their own entries instead of bypassing. EXACT name
+ * match. See ngx_http_cache_turbo_build_key for the fold and its security
+ * rationale (unforgeable length-prefixed framing, all Cookie headers scanned).
+ * Appends across levels. */
+static char *
+ngx_http_cache_turbo_key_cookie_conf(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf)
+{
+    ngx_http_cache_turbo_loc_conf_t  *clcf = conf;
+    ngx_str_t                        *value, *s;
+    ngx_uint_t                        i;
+
+    if (clcf->key_cookies == NGX_CONF_UNSET_PTR) {
+        clcf->key_cookies = ngx_array_create(cf->pool, 4, sizeof(ngx_str_t));
+        if (clcf->key_cookies == NULL) {
+            return NGX_CONF_ERROR;
+        }
+    }
+
+    value = cf->args->elts;
+    for (i = 1; i < cf->args->nelts; i++) {
+        if (value[i].len == 0) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                "cache_turbo_key_cookie name must not be empty");
+            return NGX_CONF_ERROR;
+        }
+        s = ngx_array_push(clcf->key_cookies);
+        if (s == NULL) {
+            return NGX_CONF_ERROR;
+        }
+        *s = value[i];
+    }
+
+    return NGX_CONF_OK;
+}
+
+
 static void *
 ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
 {
@@ -7551,6 +7787,8 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->normalize_vary = NGX_CONF_UNSET;
     conf->bypass = NGX_CONF_UNSET_PTR;
     conf->no_store = NGX_CONF_UNSET_PTR;
+    conf->bypass_uri = NGX_CONF_UNSET_PTR;
+    conf->key_cookies = NGX_CONF_UNSET_PTR;
 #if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
     && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
     conf->test_restore_alloc_fail = NGX_CONF_UNSET;
@@ -7824,6 +8062,15 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     /* Key normalize: inherit the extra-pattern list. */
     if (conf->normalize_strip == NGX_CONF_UNSET_PTR) {
         conf->normalize_strip = prev->normalize_strip;
+    }
+    /* DIY bypass-URI and key-cookie lists: inherit UNSET-only, same as
+     * normalize_strip (a location that sets its own fully replaces the parent's
+     * — matching how the append happens within a level, not across). */
+    if (conf->bypass_uri == NGX_CONF_UNSET_PTR) {
+        conf->bypass_uri = prev->bypass_uri;
+    }
+    if (conf->key_cookies == NGX_CONF_UNSET_PTR) {
+        conf->key_cookies = prev->key_cookies;
     }
     /* Vary suffix bitmask: inherit UNSET-only; the variable handler reads UNSET
      * as 0 (off), so v3-1 keys are unchanged unless a directive opts in. */

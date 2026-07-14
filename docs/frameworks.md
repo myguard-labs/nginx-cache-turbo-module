@@ -328,6 +328,70 @@ bypassed on may be issued to everyone. Put it in your monitoring — a cache tha
 silently stopped caching looks exactly like a cache that is working, until the
 origin falls over.
 
+## Two engines the presets have that you can now use directly
+
+A preset is three literal lists (bypass cookies, bypass URIs, dynamic query
+args) plus, for a few, two engines that plain nginx config could not express.
+Since v15 both engines are available as directives, so a hand-configured site
+gets exactly what a preset gets — no preset required.
+
+### `cache_turbo_bypass_uri` — segment-boundary URI bypass
+
+```nginx
+cache_turbo_bypass_uri  /admin  /account/;
+```
+
+Skips the cache entirely (origin, never captured) for any request whose URI
+matches a listed prefix **on a path-segment boundary** — the byte after the
+prefix must be `/`, `.`, or end-of-string. So `/admin` bypasses `/admin`,
+`/admin/users`, and `/admin.php`, but **not** `/administrator` (the letters
+continue past the needle — a different resource). A needle ending in `/`
+(`/account/`) carries its own boundary and bypasses the whole subtree.
+
+This is the one thing a plain nginx `location` prefix cannot do: `location`
+prefixes anchor at position 0 and have no boundary semantics, so a `location`
+that bypasses `/admin` also swallows `/administrator`, and mounting the app in a
+subdirectory silently mis-matches. Use `cache_turbo_bypass_uri` and mount-depth
+stops mattering.
+
+Prefixes must start with `/`. It works with or without a `cache_turbo_backend`
+preset — in pure manual mode it is your whole URI-bypass surface.
+
+### `cache_turbo_key_cookie` — fold a cookie's VALUE into the key
+
+```nginx
+cache_turbo_key_cookie  X-Segment;
+```
+
+Value-keys the named cookie: visitors carrying **different values** get
+**different cache entries**, visitors sharing a value share one entry, and a
+visitor with **no cookie** gets the plain anonymous entry. This is the
+[magento](magento.md)/[shopware6](shopware6.md) tier-3 engine as a directive.
+
+Use it **only** for a cookie that is a *segment fingerprint* — a marker of which
+shared variant of a page to serve (customer group, currency, store view, A/B
+bucket) that many visitors legitimately share — **never** for an identity cookie
+(a session id, a login token). Keying on an identity cookie gives one entry per
+visitor (hit rate ≈ 0) and puts authenticated HTML in a shared cache. For an
+identity cookie you want `cache_turbo_bypass`, not this.
+
+Why a directive and not just `cache_turbo_key $cookie_x`:
+
+- The name is matched **EXACTLY** and **every** `Cookie:` header is scanned, so
+  a client cannot hide the real cookie in a second header (or use a name that
+  merely ends with yours) to choose which cache bucket it reads or writes.
+- The value is folded with an **unforgeable length-prefixed framing**, so no
+  cookie value can splice itself into a neighbouring key field — a plain
+  delimiter in `cache_turbo_key` *is* forgeable (nginx permits the `0x1f`
+  separator byte inside header values).
+- It also reads **hyphenated cookie names** (`X-Magento-Vary`, `sw-cache-hash`)
+  that `$cookie_<name>` silently cannot — see the `$cookie_` trap below.
+
+The Set-Cookie store floor covers the transition race for free: a request with
+no key cookie keys to the anonymous entry, and if the response *establishes* the
+segment (`Set-Cookie: X-Segment=...`) that response is never stored, so it can
+never poison the anonymous entry.
+
 ## Gotchas
 
 - **`$cookie_<name>` does not translate `-` to `_`.** Unlike headers. So
@@ -335,7 +399,9 @@ origin falls over.
   permanently empty variable, and a bypass that never fires. Any hyphenated cookie
   (`XSRF-TOKEN`, `next-auth.session-token`) can only be read with a `map` on
   `$http_cookie`. Dots are just as bad. This has bitten us before; see
-  [magento.md](magento.md).
+  [magento.md](magento.md). If you need to value-KEY such a cookie (a segment
+  fingerprint, not an identity), [`cache_turbo_key_cookie`](#cache_turbo_key_cookie--fold-a-cookies-value-into-the-key)
+  reads hyphenated/dotted names natively and skips the `map` entirely.
 - **`HEAD` responses are never stored, so `curl -sI` can never show a `HIT`.** It
   will report `MISS` on a perfectly working cache, forever. Debug with `curl -s -D-`
   (GET). This one costs people an afternoon. (`curl -sI` is still the right tool for
@@ -356,9 +422,13 @@ origin falls over.
   for "framework, no preset". There is no union preset. The correct spelling for
   *"cache this, no preset applies"* is simply to omit `cache_turbo_backend` and set
   `cache_turbo_cache_control honor;` yourself.
-- **A framework in a subdirectory breaks prefix rules.** URI prefixes anchor at
-  position 0. If the app is mounted at `/shop/`, `/admin/` is `/shop/admin/` and
-  your `location ^~ /admin/` never fires.
+- **A framework in a subdirectory breaks `location` prefix rules.** A `location`
+  prefix anchors at position 0. If the app is mounted at `/shop/`, `/admin/` is
+  `/shop/admin/` and your `location ^~ /admin/` never fires — and a `location`
+  matching `/admin` also swallows `/administrator`.
+  [`cache_turbo_bypass_uri`](#cache_turbo_bypass_uri--segment-boundary-uri-bypass)
+  fixes both: give it the real mounted paths and it matches on a segment
+  boundary, so `/administrator` is left cacheable.
 - **Re-derive after deploys.** The Django conditions above are code-dependent, not
   config-dependent — a developer adding an anonymous cart changes your cache's
   correctness without touching nginx. Nobody will tell you.

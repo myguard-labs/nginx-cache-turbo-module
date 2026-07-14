@@ -989,6 +989,37 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # DIY manual URI bypass (cache_turbo_bypass_uri, v15): the preset
+        # segment-boundary matcher exposed as a directive, for an app we ship no
+        # preset for. "/bu/panel" bypasses on a segment boundary; "/bu/panel-x"
+        # (letters continue past the needle) must NOT -- that boundary check is
+        # exactly what a plain nginx location prefix cannot express. Mounted at a
+        # subdir to prove the matcher is subdirectory-safe. X-CT-Status makes
+        # BYPASS a POSITIVE signal (a plain MISS also lacks x-cache).
+        location /bu/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    30s;
+            cache_turbo_bypass_uri /bu/panel /bu/admin/;
+            add_header           X-CT-Status $cache_turbo_status always;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # DIY cookie value-keying (cache_turbo_key_cookie, v15): the tier-3
+        # magento engine exposed as a directive. "seg" is value-keyed into the
+        # cache key -- different values get different entries, the SAME value
+        # shares one, and an absent cookie is its own anonymous bucket. Same
+        # unforgeable length-prefixed fold, EXACT-name match, all Cookie headers
+        # scanned -- but with NO preset.
+        location /kc/ {{
+            cache_turbo            main;
+            cache_turbo_key        $uri;
+            cache_turbo_valid      30s;
+            cache_turbo_key_cookie seg;
+            add_header             X-CT-Status $cache_turbo_status always;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # $cache_turbo_status access-log variable: echoed into a header so the
         # test can read MISS -> HIT, and BYPASS when ?nocache=1 trips bypass.
         location /ctstatus/ {{
@@ -4446,6 +4477,92 @@ def test_bypass(ng: Nginx) -> None:
         "bypass should have refreshed the cached entry"
 
 
+def test_bypass_uri(ng: Nginx) -> None:
+    """v15: cache_turbo_bypass_uri gives a DIY user the preset segment-boundary
+    URI matcher without a preset. A matching prefix bypasses (origin, never
+    captured, X-CT-Status=BYPASS); a non-boundary continuation ("/bu/panel-x")
+    does NOT match and caches normally; an unlisted URI caches. This is the gap
+    a plain nginx `location` prefix cannot close (it anchors at position 0 and
+    has no '/'-or-'.' boundary check)."""
+    # exact segment match -> bypass
+    _, _, h = fetch(ng.port, "/bu/panel")
+    assert h.get("x-ct-status") == "BYPASS", \
+        f"/bu/panel must bypass (exact segment), got {h.get('x-ct-status')}"
+    # boundary continuation -> still bypass ("/bu/panel/sub", "/bu/panel.json")
+    _, _, h = fetch(ng.port, "/bu/panel/sub")
+    assert h.get("x-ct-status") == "BYPASS", \
+        f"/bu/panel/sub must bypass (segment boundary '/'), got {h.get('x-ct-status')}"
+    _, _, h = fetch(ng.port, "/bu/panel.json")
+    assert h.get("x-ct-status") == "BYPASS", \
+        f"/bu/panel.json must bypass (segment boundary '.'), got {h.get('x-ct-status')}"
+    # trailing-slash needle: any continuation is inside the subtree
+    _, _, h = fetch(ng.port, "/bu/admin/users")
+    assert h.get("x-ct-status") == "BYPASS", \
+        f"/bu/admin/users must bypass, got {h.get('x-ct-status')}"
+
+    # NON-boundary continuation -> NOT a match -> caches. This is the whole point
+    # of the segment matcher: "/bu/panel-x" is a different resource from "/bu/panel".
+    _, _, h0 = fetch(ng.port, "/bu/panel-x")
+    assert h0.get("x-ct-status") == "MISS", \
+        f"/bu/panel-x must NOT match /bu/panel (letters continue), got {h0.get('x-ct-status')}"
+    _, _, h1 = fetch(ng.port, "/bu/panel-x")
+    assert h1.get("x-ct-status") == "HIT", \
+        f"/bu/panel-x must cache (not bypassed), got {h1.get('x-ct-status')}"
+
+    # an entirely unlisted URI caches normally
+    _, _, h0 = fetch(ng.port, "/bu/public")
+    assert h0.get("x-ct-status") == "MISS", "unlisted URI first fetch MISS"
+    _, _, h1 = fetch(ng.port, "/bu/public")
+    assert h1.get("x-ct-status") == "HIT", \
+        f"unlisted /bu/public must cache, got {h1.get('x-ct-status')}"
+
+
+def test_key_cookie(ng: Nginx) -> None:
+    """v15: cache_turbo_key_cookie value-keys a cookie into the cache key for a
+    DIY user, the same tier-3 engine the magento preset uses. Different values
+    are different entries; the same value shares one; an absent cookie is its
+    own anonymous bucket. EXACT-name match and all-Cookie-headers scan are the
+    same anti-bucket-selection guarantees the preset carries."""
+    seg_a = {"Cookie": "seg=aaaa1111bbbb2222"}
+    _, ba1, _ = fetch(ng.port, "/kc/page", headers=seg_a)
+    _, ba2, ha2 = fetch(ng.port, "/kc/page", headers=seg_a)
+    assert ha2.get("x-ct-status") == "HIT" and ba1 == ba2, \
+        "same seg value must key to its own entry and HIT"
+
+    # a DIFFERENT value must not see A's body -- the value is in the KEY
+    seg_b = {"Cookie": "seg=cccc3333dddd4444"}
+    _, bb1, _ = fetch(ng.port, "/kc/page", headers=seg_b)
+    assert bb1 != ba1, \
+        "a different seg value was served another segment's body -- cross-user leak"
+    _, bb2, hb2 = fetch(ng.port, "/kc/page", headers=seg_b)
+    assert hb2.get("x-ct-status") == "HIT" and bb2 == bb1, \
+        "each seg value must warm and HIT its own entry"
+
+    # the cookie-less anonymous entry is a third, separate bucket
+    _, ban, _ = fetch(ng.port, "/kc/page")
+    _, ban2, han2 = fetch(ng.port, "/kc/page")
+    assert han2.get("x-ct-status") == "HIT" and ban2 == ban, "anonymous entry caches"
+    assert ban != ba1 and ban != bb1, "anonymous is its own bucket, not a segment's"
+
+    # EXACT-name: a cookie whose name merely ends with "seg" is a different
+    # cookie and must not select seg's bucket.
+    _, bd, _ = fetch(ng.port, "/kc/decoy",
+                     headers={"Cookie": "notseg=aaaa1111bbbb2222"})
+    _, bda, _ = fetch(ng.port, "/kc/decoy")
+    assert bd == bda, \
+        "notseg must not be read as seg -- exact-name keeps the bucket out of client hands"
+
+    # ALL Cookie headers scanned: the real cookie hidden in a SECOND header must
+    # key identically to the same cookie in one header (else attacker-chosen).
+    _, bs, _ = fetch_dup(ng.port, "/kc/split",
+                         [("Cookie", "other=x"),
+                          ("Cookie", "seg=eeee5555ffff6666")])
+    _, bs2, hs2 = fetch(ng.port, "/kc/split",
+                        headers={"Cookie": "other=x; seg=eeee5555ffff6666"})
+    assert hs2.get("x-ct-status") == "HIT" and bs2 == bs, \
+        "a seg cookie in a second Cookie header must key identically"
+
+
 def test_status_variable(ng: Nginx) -> None:
     """$cache_turbo_status (echoed as X-CT-Status): MISS on the cold fetch,
     HIT on the second, BYPASS when a cache_turbo_bypass predicate trips. Also
@@ -6664,6 +6781,8 @@ def run_all(ng: Nginx, origin: Origin,
     test_cor5_l1only_variant_purge(ng, origin)
     test_cache_and_purge_respect_access_control(ng)
     test_bypass(ng)
+    test_bypass_uri(ng)
+    test_key_cookie(ng)
     test_status_variable(ng)
     test_status_stale(ng, origin)
     test_status_expired(ng, origin)
@@ -6860,7 +6979,9 @@ def main() -> int:
           "conditional 304 (v11: If-None-Match/*/mismatch, "
           "If-Modified-Since fresh/stale, INM-beats-IMS precedence), "
           "PURGE method, COR-5 auto-Vary variant purge (L1-only gen-bump), "
-          "bypass + no_store, $cache_turbo_status (MISS/HIT/BYPASS + bypasses counter, "
+          "bypass + no_store, DIY bypass_uri (v15: segment-boundary + subdir + "
+          "non-boundary caches), DIY key_cookie (v15: value-keyed entries + anon "
+          "bucket + exact-name + split-header), $cache_turbo_status (MISS/HIT/BYPASS + bypasses counter, "
           "STALE serve, EXPIRED refetch), cc_mode inheritance (child preset honor "
           "overrides parent ignore), "
           "native-cache headers stripped, "
