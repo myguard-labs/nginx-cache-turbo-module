@@ -1355,9 +1355,18 @@ ngx_http_cache_turbo_purge_request(ngx_http_request_t *r,
  * backend is one row here — no new code path. A row is active when
  * (clcf->backend_presets & row->bit). `generic` (bare `auto`) is the union of
  * WP/Woo/Joomla, whose cookie/URI namespaces are disjoint, so stacking them
- * cannot collide. A backend with generic-English URIs (xenforo) stays out of
- * that union and must be named explicitly. Curated heuristic, not a CMS
- * fingerprint.
+ * cannot collide. A backend with generic-English URIs (xenforo, discourse,
+ * drupal, ...) stays out of that union and must be named explicitly. Curated
+ * heuristic, not a CMS fingerprint.
+ *
+ * `cookies` is matched as a SUBSTRING of the request Cookie header — presence
+ * only, no value predicate. Two consequences the rows below turn on: a cookie
+ * an application also issues to GUESTS can never be a bypass rule (it would
+ * match most traffic and take the hit rate to zero), and an application whose
+ * cookie NAME is per-install (a hash, or an operator-set prefix) cannot be
+ * matched at all. Where either applies the row ships no cookie rule and says
+ * so, rather than shipping one that does not work; docs/<app>.md then tells the
+ * operator to add their own cache_turbo_bypass.
  */
 typedef struct {
     ngx_uint_t           bit;
@@ -1409,6 +1418,120 @@ static const char *const  ct_xf_uris[] = {
     "/contact", "/misc", NULL };
 static const char *const  ct_xf_args[] = { NULL };
 
+/*
+ * Discourse. One cookie: `_t`, the auth token (lib/auth/default_current_user_
+ * provider.rb — TOKEN_COOKIE, deleted outright for anonymous requests, and the
+ * exact test Discourse's own anon cache uses). `_forum_session` is the Rails
+ * session cookie and is issued to EVERY visitor including guests, so it is the
+ * xf_session trap wearing a different hat: bypassing on it would drop all guest
+ * traffic out of the cache. `theme_ids` / `forced_color_mode` are presentation
+ * variants (Discourse folds them into its own cache KEY) — they belong in
+ * cache_turbo_key, not here. `_t` is renameable via DISCOURSE_TOKEN_COOKIE; a
+ * site that renamed it needs its own cache_turbo_bypass.
+ *
+ * Note Discourse ships its own anonymous page cache and already sends
+ * Cache-Control: no-store on authenticated responses, so this preset is mostly
+ * defence-in-depth. The api_key/api_username args mark API calls.
+ *
+ * The rule is "_t=", not "_t": a two-character substring would match inside
+ * unrelated names and values (_gat, utm_term=...). Keeping the "=" pins it to a
+ * name/value boundary. It can still over-match a cookie literally named
+ * "<something>_t" (e.g. "list_t"), which costs a needless bypass but never
+ * leaks; a substring matcher cannot do better, and "; _t=" would miss the case
+ * where _t is the first cookie in the header.
+ */
+static const char *const  ct_discourse_cookies[] = { "_t=", NULL };
+static const char *const  ct_discourse_uris[] = {
+    "/admin", "/session", "/auth/", "/login", "/logout", "/signup", "/u/",
+    "/my/", "/message-bus/", "/draft", "/presence/", "/notifications",
+    "/user_actions", NULL };
+static const char *const  ct_discourse_args[] = {
+    "api_key", "api_username", NULL };
+
+/*
+ * phpBB 3.x. NO COOKIE RULE — and that is deliberate, not an omission.
+ *
+ * phpBB's cookie names are <cookie_name>_u / _k / _sid where the prefix is set
+ * in the ACP and randomised by many installers, so no substring is shippable
+ * (the joomla problem). Worse, session_create() sets all three for every
+ * non-bot visitor INCLUDING guests (phpbb/session.php — the set_cookie() block
+ * is guarded on $bot, not on login state; an anonymous visitor gets _u=1, the
+ * ANONYMOUS user id, plus a real _sid). Telling a logged-in user apart from a
+ * guest therefore requires a VALUE test (_u != 1, or _k non-empty), and this
+ * registry matches cookie-name substrings only — presence, never value. A _u or
+ * _sid rule here would match every anonymous visitor and take the hit rate to
+ * zero while still not identifying an authenticated one.
+ *
+ * So: ship the URI rules (phpBB's dynamic surface is .php entry scripts, which
+ * are at least distinctive), ship no cookie rule, and document loudly that the
+ * operator MUST add their own cache_turbo_bypass. See docs/phpbb.md.
+ */
+static const char *const  ct_phpbb_cookies[] = { NULL };
+static const char *const  ct_phpbb_uris[] = {
+    "/ucp.php", "/mcp.php", "/adm/", "/posting.php", "/memberlist.php",
+    "/search.php", "/report.php", NULL };
+static const char *const  ct_phpbb_args[] = { "sid", NULL };
+
+/*
+ * Drupal 9/10/11. NO COOKIE RULE, for a different reason than phpBB.
+ *
+ * Drupal's session cookie is SESS<32-hex> (SSESS<32-hex> over TLS), where the
+ * hash is derived per-install from the hostname (Core/Session/
+ * SessionConfiguration.php). The only shippable literal is "SESS" — and a
+ * substring match on "SESS" also hits PHPSESSID and JSESSIONID, i.e. the stock
+ * session cookie of every other PHP and Java app on the box. That is a safe
+ * failure (over-bypass, never a leak) but it would silently zero the hit rate
+ * for any co-hosted app, so it is not worth shipping.
+ *
+ * It costs little, because Drupal defends itself: it sends `private,
+ * must-revalidate` on every authenticated response (EventSubscriber/
+ * FinishResponseSubscriber.php), and cache_turbo_backend implies
+ * cache_control honor, whose store path refuses `private`. The URI rules below
+ * add the surfaces that are dynamic before any cookie exists. An operator who
+ * wants belt-and-braces adds cache_turbo_bypass $cookie_SESS<their-hash>.
+ *
+ * (Anonymous readers get no session cookie at all — Drupal destroys an obsolete
+ * session rather than persisting one — so a SESS rule would at least not be the
+ * xf_session trap. The PHPSESSID collision is what rules it out.)
+ */
+static const char *const  ct_drupal_cookies[] = { NULL };
+static const char *const  ct_drupal_uris[] = {
+    "/user", "/admin", "/node/add", "/system/", "/core/install.php", NULL };
+static const char *const  ct_drupal_args[] = { NULL };
+
+/*
+ * MediaWiki. Cookie prefix is $wgCookiePrefix, which DEFAULTS TO THE DATABASE
+ * NAME — so, as with joomla, there is no shippable prefix. What is shippable is
+ * the SUFFIX: the identity cookies are <prefix>UserID / <prefix>UserName /
+ * <prefix>Token, and those CamelCase tails are distinctive enough to match on
+ * (Session/CookieSessionProvider.php sets them only for a logged-in user, and
+ * explicitly clears UserID when the user is anonymous). "Token" alone is NOT
+ * shipped: this matcher searches the whole Cookie header, so a bare "Token"
+ * would also hit any cookie whose VALUE happened to contain it.
+ *
+ * <prefix>_session is not matched either — it is issued to an anonymous visitor
+ * who merely interacts (an edit preview, a CSRF token), so it is closer to
+ * xf_session than to an auth cookie.
+ *
+ * MediaWiki's dynamic surface is in the QUERY ARGS, not the path: /wiki/<Title>
+ * is the cacheable read path and /index.php?action=... is the dynamic one. Only
+ * the MUTATING actions are listed. action=raw, action=history, diff=, oldid= are
+ * all deliberately absent — they are deterministic, shared, hot, and perfectly
+ * cacheable; bypassing them is a measurable hit-rate loss. veaction= is the
+ * VisualEditor entry point and is always dynamic. printable= is a presentation
+ * variant and belongs in cache_turbo_key.
+ *
+ * Like Drupal, MediaWiki sends `private, must-revalidate, max-age=0` to a
+ * logged-in user (Output/OutputPage.php), which the implied cache_control honor
+ * already refuses to store. Upstream's own recommended Varnish VCL leans on
+ * exactly this: cookies plus Cache-Control, no path rules.
+ */
+static const char *const  ct_mw_cookies[] = {
+    "UserID=", "UserName=", NULL };
+static const char *const  ct_mw_uris[] = {
+    "/index.php", "/load.php", "/api.php", NULL };
+static const char *const  ct_mw_args[] = { "veaction", "returnto", NULL };
+
 static const ngx_http_cache_turbo_preset_t  ngx_http_cache_turbo_presets[] = {
     { NGX_HTTP_CACHE_TURBO_BACKEND_WORDPRESS,
       ct_wp_cookies, ct_wp_uris, ct_wp_args },
@@ -1418,6 +1541,14 @@ static const ngx_http_cache_turbo_preset_t  ngx_http_cache_turbo_presets[] = {
       ct_joomla_cookies, ct_joomla_uris, ct_joomla_args },
     { NGX_HTTP_CACHE_TURBO_BACKEND_XENFORO,
       ct_xf_cookies, ct_xf_uris, ct_xf_args },
+    { NGX_HTTP_CACHE_TURBO_BACKEND_DISCOURSE,
+      ct_discourse_cookies, ct_discourse_uris, ct_discourse_args },
+    { NGX_HTTP_CACHE_TURBO_BACKEND_PHPBB,
+      ct_phpbb_cookies, ct_phpbb_uris, ct_phpbb_args },
+    { NGX_HTTP_CACHE_TURBO_BACKEND_DRUPAL,
+      ct_drupal_cookies, ct_drupal_uris, ct_drupal_args },
+    { NGX_HTTP_CACHE_TURBO_BACKEND_MEDIAWIKI,
+      ct_mw_cookies, ct_mw_uris, ct_mw_args },
     { 0, NULL, NULL, NULL }
 };
 
@@ -3848,9 +3979,11 @@ ngx_http_cache_turbo(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 /* cache_turbo_backend <name>... — compose one or more CMS auto-classify presets
  * (NGX_CONF_1MORE; listed names stack, e.g. `wordpress woocommerce`). "generic"
  * (or "auto") is the union of the blindly-stackable backends (wordpress +
- * woocommerce + joomla); naming specific backends is tighter. "xenforo" is
- * opt-in only and NOT part of generic — see the BACKEND_* comment in the header.
- * Sets bits in clcf->backend_presets consumed by ngx_http_cache_turbo_auto_skip. */
+ * woocommerce + joomla); naming specific backends is tighter. The rest —
+ * xenforo, discourse, phpbb, drupal, mediawiki — are opt-in only and NOT part of
+ * generic, because their URIs are generic English words that collide with
+ * unrelated sites; see the BACKEND_* comment in the header. Sets bits in
+ * clcf->backend_presets consumed by ngx_http_cache_turbo_auto_skip. */
 static char *
 ngx_http_cache_turbo_backend(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
@@ -3878,10 +4011,23 @@ ngx_http_cache_turbo_backend(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         } else if (ngx_strcmp(value[i].data, "xenforo") == 0) {
             clcf->backend_presets |= NGX_HTTP_CACHE_TURBO_BACKEND_XENFORO;
 
+        } else if (ngx_strcmp(value[i].data, "discourse") == 0) {
+            clcf->backend_presets |= NGX_HTTP_CACHE_TURBO_BACKEND_DISCOURSE;
+
+        } else if (ngx_strcmp(value[i].data, "phpbb") == 0) {
+            clcf->backend_presets |= NGX_HTTP_CACHE_TURBO_BACKEND_PHPBB;
+
+        } else if (ngx_strcmp(value[i].data, "drupal") == 0) {
+            clcf->backend_presets |= NGX_HTTP_CACHE_TURBO_BACKEND_DRUPAL;
+
+        } else if (ngx_strcmp(value[i].data, "mediawiki") == 0) {
+            clcf->backend_presets |= NGX_HTTP_CACHE_TURBO_BACKEND_MEDIAWIKI;
+
         } else {
             ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                "unknown cache_turbo_backend \"%V\" (want "
-                "generic|wordpress|woocommerce|joomla|xenforo)", &value[i]);
+                "unknown cache_turbo_backend \"%V\" (want generic|wordpress|"
+                "woocommerce|joomla|xenforo|discourse|phpbb|drupal|mediawiki)",
+                &value[i]);
             return NGX_CONF_ERROR;
         }
     }

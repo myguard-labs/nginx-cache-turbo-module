@@ -92,11 +92,20 @@
  * English paths (/login, /register, /contact, /misc) that a non-forum site can
  * legitimately serve as cacheable pages, so folding it into `auto` would punch
  * holes in unrelated sites' caches. Name it explicitly to opt in.
+ *
+ * The same reasoning keeps DISCOURSE (/login, /signup, /posts), PHPBB
+ * (/search.php, /posting.php), DRUPAL (/user, /admin, /node) and MEDIAWIKI
+ * (/index.php) out of GENERIC. GENERIC stays exactly the three original
+ * blindly-stackable backends; every preset added since is opt-in by name.
  */
 #define NGX_HTTP_CACHE_TURBO_BACKEND_WORDPRESS    0x0001
 #define NGX_HTTP_CACHE_TURBO_BACKEND_WOOCOMMERCE  0x0002
 #define NGX_HTTP_CACHE_TURBO_BACKEND_JOOMLA       0x0004
 #define NGX_HTTP_CACHE_TURBO_BACKEND_XENFORO      0x0008
+#define NGX_HTTP_CACHE_TURBO_BACKEND_DISCOURSE    0x0010
+#define NGX_HTTP_CACHE_TURBO_BACKEND_PHPBB        0x0020
+#define NGX_HTTP_CACHE_TURBO_BACKEND_DRUPAL       0x0040
+#define NGX_HTTP_CACHE_TURBO_BACKEND_MEDIAWIKI    0x0080
 #define NGX_HTTP_CACHE_TURBO_BACKEND_GENERIC                                   \
     (NGX_HTTP_CACHE_TURBO_BACKEND_WORDPRESS                                    \
      | NGX_HTTP_CACHE_TURBO_BACKEND_WOOCOMMERCE                                \
