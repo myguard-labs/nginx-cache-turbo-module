@@ -27,7 +27,7 @@ the admin CP, the installer, `/account`, DMs, `/misc` — and bypasses any reque
 carrying `xf_user` (a logged-in member) or `xf_session_admin`. Guests get cached
 pages; members always hit the origin and their HTML is **never stored**.
 
-`xenforo` is **not** part of `generic`/`auto`, unlike the WordPress, WooCommerce
+`xenforo` is opt-in and must be named, like the WordPress, WooCommerce
 and Joomla presets. Its URI prefixes are generic English words (`/login`,
 `/register`, `/contact`, `/misc`) that a non-forum site can legitimately serve as
 cacheable pages, so folding it into the union would punch holes in unrelated

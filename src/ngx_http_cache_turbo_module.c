@@ -1745,7 +1745,9 @@ ngx_http_cache_turbo_access_prologue(ngx_http_request_t *r,
      * the body filter). Sits under the manual bypass/no_store overrides below.
      * honor_cc is auto-enabled with a preset so a plugin's own Cache-Control:
      * no-cache on an anon page self-excludes at store time. */
-    if (clcf->backend_presets && ngx_http_cache_turbo_auto_skip(r, clcf)) {
+    if (NGX_HTTP_CACHE_TURBO_HAS_BACKEND(clcf->backend_presets)
+        && ngx_http_cache_turbo_auto_skip(r, clcf))
+    {
         ctx->auto_skip = 1;
         /* cache-turbo neither serves nor stores an auto-classified dynamic
          * request, so it is NOT "engaged": leave $cache_turbo_active = 0 so a
@@ -3959,78 +3961,252 @@ ngx_http_cache_turbo(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     clcf->enable = 1;
     clcf->shm_zone = shm_zone;
 
-    /* "cache_turbo <zone> auto;" — shorthand for the generic auto-classify
-     * preset (the union of all CMS backends). Equivalent to also writing
-     * `cache_turbo_backend generic;`. Any other 2nd token is rejected. */
+    /*
+     * "cache_turbo <zone> auto;" used to be shorthand for the `generic` preset.
+     * Both are GONE — see the cache_turbo_backend comment for why. The directive
+     * now takes the zone and nothing else.
+     *
+     * The command is deliberately still NGX_CONF_TAKE12 rather than TAKE1: that
+     * lets us catch the dead token here and name its replacement, instead of
+     * letting nginx emit a bare "invalid number of arguments" at someone whose
+     * config worked yesterday. It is a hard config error either way — nginx will
+     * not start — which is the point. Silently ignoring `auto` would leave a
+     * WordPress site with NO preset active and quietly start caching /wp-admin/.
+     */
     if (cf->args->nelts == 3) {
-        if (ngx_strcmp(value[2].data, "auto") != 0) {
+        if (ngx_strcmp(value[2].data, "auto") == 0) {
             ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                "invalid cache_turbo mode \"%V\" (expected \"auto\")",
-                &value[2]);
+                "\"cache_turbo %V auto\" is no longer supported: the `auto` / "
+                "`generic` preset union has been removed because it was not a "
+                "safe default (it never covered every backend, and `joomla` in "
+                "it ships no cookie rule at all). Name the backends you actually "
+                "run, e.g. \"cache_turbo %V; cache_turbo_backend wordpress;\"",
+                &value[1], &value[1]);
             return NGX_CONF_ERROR;
         }
-        clcf->backend_presets |= NGX_HTTP_CACHE_TURBO_BACKEND_GENERIC;
+
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "invalid cache_turbo mode \"%V\" (cache_turbo takes a zone name "
+            "only; use cache_turbo_backend to enable a CMS preset)",
+            &value[2]);
+        return NGX_CONF_ERROR;
     }
 
     return NGX_CONF_OK;
 }
 
 
-/* cache_turbo_backend <name>... — compose one or more CMS auto-classify presets
- * (NGX_CONF_1MORE; listed names stack, e.g. `wordpress woocommerce`). "generic"
- * (or "auto") is the union of the blindly-stackable backends (wordpress +
- * woocommerce + joomla); naming specific backends is tighter. The rest —
- * xenforo, discourse, phpbb, drupal, mediawiki — are opt-in only and NOT part of
- * generic, because their URIs are generic English words that collide with
- * unrelated sites; see the BACKEND_* comment in the header. Sets bits in
- * clcf->backend_presets consumed by ngx_http_cache_turbo_auto_skip. */
+/*
+ * cache_turbo_backend <name>... — compose one or more CMS auto-classify presets.
+ * EVERY preset is opt-in: you name the backends you actually run. All backends
+ * stack, and spaces and '|' are interchangeable separators:
+ *
+ *     cache_turbo_backend wordpress woocommerce;
+ *     cache_turbo_backend wordpress|woocommerce;
+ *     cache_turbo_backend wordpress | woocommerce;
+ *
+ * `none` is the odd one out: it means "no preset in this location" and overrides
+ * a preset inherited from the server block (see BACKEND_NONE in the header). It
+ * is exclusive — combining it with a real backend is a config error.
+ *
+ * Sets bits in clcf->backend_presets consumed by ngx_http_cache_turbo_auto_skip.
+ *
+ * There is deliberately no `generic` / `auto` union any more. It used to mean
+ * wordpress+woocommerce+joomla, and it was never a safe default:
+ *
+ *   - it never covered every backend (after xenforo/discourse/phpbb/drupal/
+ *     mediawiki it named 3 of 9), so `auto` on a Drupal site silently enabled
+ *     no Drupal rules at all;
+ *   - `woocommerce` inside it leaves /wp-admin/ cacheable unless it is stacked
+ *     with `wordpress` — a union whose members you must know how to combine is
+ *     not a default;
+ *   - `joomla` inside it ships NO cookie rule, so `auto` on a Joomla site LOOKED
+ *     like it protected logged-in users and did not.
+ *
+ * A default that is only correct if you already know which parts of it are wrong
+ * is a footgun with a friendly name. Both spellings are now rejected at config
+ * parse with a message naming the replacement — a hard error, never a silent
+ * no-op, because silently enabling nothing would start caching /wp-admin/ on an
+ * existing WordPress config.
+ */
+/* Backend name -> preset bit. One row per preset; adding a backend is a row here
+ * and a row in the registry, nothing else. Order is the order shown in the
+ * "unknown backend" diagnostic. */
+static const struct {
+    const char  *name;
+    ngx_uint_t   bit;
+} ngx_http_cache_turbo_backend_names[] = {
+    { "wordpress",   NGX_HTTP_CACHE_TURBO_BACKEND_WORDPRESS   },
+    { "woocommerce", NGX_HTTP_CACHE_TURBO_BACKEND_WOOCOMMERCE },
+    { "joomla",      NGX_HTTP_CACHE_TURBO_BACKEND_JOOMLA      },
+    { "xenforo",     NGX_HTTP_CACHE_TURBO_BACKEND_XENFORO     },
+    { "discourse",   NGX_HTTP_CACHE_TURBO_BACKEND_DISCOURSE   },
+    { "phpbb",       NGX_HTTP_CACHE_TURBO_BACKEND_PHPBB       },
+    { "drupal",      NGX_HTTP_CACHE_TURBO_BACKEND_DRUPAL      },
+    { "mediawiki",   NGX_HTTP_CACHE_TURBO_BACKEND_MEDIAWIKI   },
+    { "none",        NGX_HTTP_CACHE_TURBO_BACKEND_NONE        },
+    { NULL,          0                                        }
+};
+
+
+/* Resolve one backend name (already split off a token) to its bit. Returns 0 for
+ * an unknown name — 0 is not a valid bit, so the caller uses it as "not found".
+ * `len` is explicit because names arrive as slices of a `a|b|c` token and are
+ * NOT NUL-terminated at the boundary. */
+static ngx_uint_t
+ngx_http_cache_turbo_backend_bit(u_char *name, size_t len)
+{
+    ngx_uint_t  i;
+    size_t      nlen;
+
+    for (i = 0; ngx_http_cache_turbo_backend_names[i].name; i++) {
+        nlen = ngx_strlen(ngx_http_cache_turbo_backend_names[i].name);
+
+        if (nlen == len
+            && ngx_strncmp(name, ngx_http_cache_turbo_backend_names[i].name,
+                           len) == 0)
+        {
+            return ngx_http_cache_turbo_backend_names[i].bit;
+        }
+    }
+
+    return 0;
+}
+
+
 static char *
 ngx_http_cache_turbo_backend(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
     ngx_http_cache_turbo_loc_conf_t  *clcf = conf;
     ngx_str_t                        *value;
-    ngx_uint_t                        i;
+    ngx_uint_t                        i, bit, mask;
+    u_char                           *p, *end, *tok;
+    ngx_str_t                         bad;
 
     value = cf->args->elts;
+    mask = 0;
 
+    /*
+     * Backends stack, and both separators mean the same thing:
+     *
+     *     cache_turbo_backend wordpress woocommerce;      (spaces)
+     *     cache_turbo_backend wordpress|woocommerce;      (pipe)
+     *     cache_turbo_backend wordpress | woocommerce;    (both)
+     *
+     * nginx's config lexer splits on whitespace, so `a|b` reaches us as ONE
+     * token containing a '|', while `a | b` reaches us as THREE tokens (the
+     * middle one a bare "|"). Hence two levels: walk the argv tokens, and split
+     * each one on '|'. A bare "|" token contributes no names and is skipped.
+     * Empty slices (`a||b`, a trailing `a|`) are rejected rather than ignored —
+     * they are a typo, and silently accepting them hides it.
+     */
     for (i = 1; i < cf->args->nelts; i++) {
-        if (ngx_strcmp(value[i].data, "generic") == 0
-            || ngx_strcmp(value[i].data, "auto") == 0)
-        {
-            clcf->backend_presets |= NGX_HTTP_CACHE_TURBO_BACKEND_GENERIC;
+        p = value[i].data;
+        end = p + value[i].len;
 
-        } else if (ngx_strcmp(value[i].data, "wordpress") == 0) {
-            clcf->backend_presets |= NGX_HTTP_CACHE_TURBO_BACKEND_WORDPRESS;
+        /* a bare "|" used as a standalone separator token */
+        if (value[i].len == 1 && *p == '|') {
+            continue;
+        }
 
-        } else if (ngx_strcmp(value[i].data, "woocommerce") == 0) {
-            clcf->backend_presets |= NGX_HTTP_CACHE_TURBO_BACKEND_WOOCOMMERCE;
+        while (p < end) {
+            tok = p;
+            while (p < end && *p != '|') {
+                p++;
+            }
 
-        } else if (ngx_strcmp(value[i].data, "joomla") == 0) {
-            clcf->backend_presets |= NGX_HTTP_CACHE_TURBO_BACKEND_JOOMLA;
+            if (p == tok) {          /* empty slice: "||", leading/trailing "|" */
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                    "empty backend name in cache_turbo_backend \"%V\" "
+                    "(stray '|')", &value[i]);
+                return NGX_CONF_ERROR;
+            }
 
-        } else if (ngx_strcmp(value[i].data, "xenforo") == 0) {
-            clcf->backend_presets |= NGX_HTTP_CACHE_TURBO_BACKEND_XENFORO;
+            bit = ngx_http_cache_turbo_backend_bit(tok, (size_t) (p - tok));
 
-        } else if (ngx_strcmp(value[i].data, "discourse") == 0) {
-            clcf->backend_presets |= NGX_HTTP_CACHE_TURBO_BACKEND_DISCOURSE;
+            if (bit == 0) {
+                bad.data = tok;
+                bad.len  = (size_t) (p - tok);
 
-        } else if (ngx_strcmp(value[i].data, "phpbb") == 0) {
-            clcf->backend_presets |= NGX_HTTP_CACHE_TURBO_BACKEND_PHPBB;
+                /* The two removed spellings get their own diagnostic — a bare
+                 * "unknown backend" would leave an operator whose config worked
+                 * yesterday with no idea what to do. This is a HARD error, not a
+                 * silent no-op: accepting the name and enabling nothing would
+                 * leave an existing WordPress config with no preset active and
+                 * quietly start caching /wp-admin/, which is the exact failure
+                 * the removal exists to prevent. Refusing to start makes the
+                 * operator look. */
+                if ((bad.len == sizeof("generic") - 1
+                     && ngx_strncmp(bad.data, "generic", bad.len) == 0)
+                    || (bad.len == sizeof("auto") - 1
+                        && ngx_strncmp(bad.data, "auto", bad.len) == 0))
+                {
+                    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                        "cache_turbo_backend \"%V\" has been removed: it was a "
+                        "union of wordpress+woocommerce+joomla, which was never "
+                        "a safe default — it did not cover every backend, "
+                        "`woocommerce` in it left /wp-admin/ cacheable unless "
+                        "stacked with `wordpress`, and `joomla` in it ships no "
+                        "cookie rule at all. Name the backends you actually run, "
+                        "e.g. \"cache_turbo_backend wordpress|woocommerce;\"",
+                        &bad);
+                    return NGX_CONF_ERROR;
+                }
 
-        } else if (ngx_strcmp(value[i].data, "drupal") == 0) {
-            clcf->backend_presets |= NGX_HTTP_CACHE_TURBO_BACKEND_DRUPAL;
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                    "unknown cache_turbo_backend \"%V\" (want wordpress, "
+                    "woocommerce, joomla, xenforo, discourse, phpbb, drupal, "
+                    "mediawiki, or none — separated by spaces or '|')", &bad);
+                return NGX_CONF_ERROR;
+            }
 
-        } else if (ngx_strcmp(value[i].data, "mediawiki") == 0) {
-            clcf->backend_presets |= NGX_HTTP_CACHE_TURBO_BACKEND_MEDIAWIKI;
+            mask |= bit;
 
-        } else {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                "unknown cache_turbo_backend \"%V\" (want generic|wordpress|"
-                "woocommerce|joomla|xenforo|discourse|phpbb|drupal|mediawiki)",
-                &value[i]);
-            return NGX_CONF_ERROR;
+            if (p < end) {
+                p++;                 /* step over the '|' */
+
+                /* A '|' promises another name. If it was the last character of
+                 * the token ("wordpress|"), there is none — and the outer
+                 * `while (p < end)` would simply exit, silently accepting the
+                 * typo. Catch it here; the empty-slice check above only fires
+                 * for a leading or doubled pipe. */
+                if (p == end) {
+                    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                        "empty backend name in cache_turbo_backend \"%V\" "
+                        "(trailing '|')", &value[i]);
+                    return NGX_CONF_ERROR;
+                }
+            }
         }
     }
+
+    /* Every argument was a bare '|' separator, so no backend was actually named
+     * ("cache_turbo_backend |;"). Leaving the mask at 0 would mean "unset", which
+     * the loc-conf merge reads as "inherit the parent's" — a directive that looks
+     * like it says something and silently does nothing. NGX_CONF_1MORE already
+     * guarantees at least one argument; this catches the degenerate one. */
+    if (mask == 0) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "cache_turbo_backend names no backend (want wordpress, woocommerce, "
+            "joomla, xenforo, discourse, phpbb, drupal, mediawiki, or none)");
+        return NGX_CONF_ERROR;
+    }
+
+    /* "none" is exclusive: `none|wordpress` is a contradiction, not a merge, and
+     * silently letting one win would be the quiet surprise this directive exists
+     * to avoid. Checked on the resolved mask so it catches the combination
+     * however it was spelled (spaces, pipes, or across several directives). */
+    if ((mask & NGX_HTTP_CACHE_TURBO_BACKEND_NONE)
+        && NGX_HTTP_CACHE_TURBO_HAS_BACKEND(mask))
+    {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "cache_turbo_backend \"none\" cannot be combined with other backends "
+            "— it means \"no preset in this location\" (and overrides one "
+            "inherited from the server block). Use it alone.");
+        return NGX_CONF_ERROR;
+    }
+
+    clcf->backend_presets |= mask;
 
     return NGX_CONF_OK;
 }
@@ -6344,7 +6520,13 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     /* backend_presets is an accumulated bitmask (0 = unset), so the standard
      * UNSET-sentinel merge can't be used; inherit the parent's set when this
      * location named no backend of its own (an explicit backend fully
-     * overrides, it does not OR with the parent's). */
+     * overrides, it does not OR with the parent's).
+     *
+     * `cache_turbo_backend none;` is what makes that overridable downward: it
+     * sets the NONE sentinel bit, so the mask is non-zero, so we do NOT inherit
+     * — and since NONE matches no registry row, the location ends up with no
+     * preset at all. Without it, a server-level preset could never be switched
+     * off for a single location. */
     if (conf->backend_presets == 0) {
         conf->backend_presets = prev->backend_presets;
     }
@@ -6409,7 +6591,9 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
      * self-excludes at store time. Done before the merge so an explicit
      * `cache_turbo_cache_control respect;` still wins. honor_cc/ignore_cc are
      * derived from the resolved mode and are what the request path reads. */
-    if (conf->backend_presets != 0 && conf->cc_mode == NGX_CONF_UNSET_UINT) {
+    if (NGX_HTTP_CACHE_TURBO_HAS_BACKEND(conf->backend_presets)
+        && conf->cc_mode == NGX_CONF_UNSET_UINT)
+    {
         conf->cc_mode = NGX_HTTP_CACHE_TURBO_CC_HONOR;
     }
     ngx_conf_merge_uint_value(conf->cc_mode, prev->cc_mode,

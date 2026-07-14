@@ -85,14 +85,13 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     cookie.next = NULL;
     r.headers_in.cookie = &cookie;
 
-    /* Arm EVERY preset row, not just GENERIC — the opt-in presets (xenforo,
-     * discourse, phpbb, drupal, mediawiki) are deliberately outside the GENERIC
-     * union, so arming GENERIC alone would leave their cookie/URI lists
-     * unfuzzed. The bug class here is an OOB read while walking those lists, so
-     * every row must be walked. OPTIN is defined in ngx_shim_auto.h next to the
-     * bits, with a static assert that it does not overlap GENERIC. */
-    clcf.backend_presets = NGX_HTTP_CACHE_TURBO_BACKEND_GENERIC
-                           | NGX_HTTP_CACHE_TURBO_BACKEND_OPTIN;
+    /* Arm EVERY preset row. There is no GENERIC union any more — every preset is
+     * opt-in — so the fuzzer must name them all or a row's cookie/URI/arg lists
+     * are walked by nobody. The bug class here is an OOB read while walking those
+     * lists, so every row must be walked. BACKEND_ALL is defined in
+     * ngx_shim_auto.h next to the bits, with a static assert that catches a bit
+     * left out of it. */
+    clcf.backend_presets = NGX_HTTP_CACHE_TURBO_BACKEND_ALL;
 
     /* Return is 0/1; the bug class is an OOB read inside, which ASAN catches. */
     (void) ngx_http_cache_turbo_auto_skip(&r, &clcf);

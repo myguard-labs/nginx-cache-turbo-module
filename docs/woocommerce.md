@@ -23,7 +23,12 @@ cache_turbo_backend wordpress woocommerce;
 
 Naming `woocommerce` alone would cache `/wp-admin/` — the WooCommerce preset only
 adds the shop surfaces, it does not repeat the WordPress ones. **Always stack.**
-(`generic`/`auto` includes both, so `cache_turbo ct auto;` is also safe.)
+
+(This is one of the reasons the old `generic`/`auto` union was removed: it
+contained `woocommerce`, so it *looked* like a safe one-word default for a shop
+while quietly depending on you knowing it also had to contain `wordpress`. A
+default that is only correct if you already know which parts of it are wrong is
+not a default. Both spellings are now a config error that names the replacement.)
 
 ## What the preset skips
 

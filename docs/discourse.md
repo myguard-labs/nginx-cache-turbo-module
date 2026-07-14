@@ -185,9 +185,9 @@ curl -sI -H 'Cookie: _forum_session=guestsess' \
 - **`_t` can be renamed.** It honours the `DISCOURSE_TOKEN_COOKIE` env var. Stock
   and official-Docker installs use `_t`; if yours was renamed, the preset's cookie
   rule will not match and you must add your own `cache_turbo_bypass`.
-- **`discourse` is not in `generic`/`auto`.** `/login`, `/signup`, `/posts` are
-  generic English paths a non-forum site legitimately serves as cacheable pages.
-  Name the preset explicitly.
+- **Every preset is opt-in.** `/login`, `/signup`, `/posts` are generic English
+  paths a non-forum site legitimately serves as cacheable pages, so no preset is
+  ever enabled implicitly. Name it.
 - **Don't set `cache_turbo_cache_control ignore`.** Discourse's `no-store` on
   authenticated responses is a real part of your safety here.
 - **Discourse's own anon cache is still running.** That's fine — it makes your
