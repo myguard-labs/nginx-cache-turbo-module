@@ -733,6 +733,12 @@ http {{
 {dsn_loc}
 {fault_loc}
 
+        # SERVER-level preset: inherited by every location that does not name a
+        # backend of its own. /nonepreset/ overrides it with `none` -- that is
+        # the whole point of `none`, and without an inherited preset here that
+        # test would pass vacuously.
+        cache_turbo_backend wordpress;
+
         # standard 30s-fresh cache
         location /c/ {{
             cache_turbo          main;
@@ -1075,19 +1081,23 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
-        # auto-classify (generic union): anon pages cache, dynamic surfaces skip
+        # auto-classify: anon pages cache, dynamic surfaces skip. This used to
+        # be `cache_turbo main auto;` (the generic union); `auto`/`generic` are
+        # gone, so the backends are named explicitly -- which is the point.
         location /auto/ {{
-            cache_turbo       main auto;
-            cache_turbo_key   $uri;
-            cache_turbo_valid 30s;
+            cache_turbo         main;
+            cache_turbo_backend wordpress woocommerce joomla;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
         # auto-classify URI-prefix rule: r->uri starts with /wp-admin/ -> skip
         location /wp-admin/ {{
-            cache_turbo       main auto;
-            cache_turbo_key   $uri;
-            cache_turbo_valid 30s;
+            cache_turbo         main;
+            cache_turbo_backend wordpress;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
@@ -1111,9 +1121,10 @@ http {{
 
         # joomla URI-prefix rule: r->uri starts with /administrator/ -> skip
         location /administrator/ {{
-            cache_turbo       main auto;
-            cache_turbo_key   $uri;
-            cache_turbo_valid 30s;
+            cache_turbo         main;
+            cache_turbo_backend joomla;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
@@ -1147,11 +1158,26 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
-        # generic/auto: used to prove the opt-in presets are NOT folded into the
-        # union. /gen/login, /gen/user, ... must all still cache.
+        # A NAMED preset must pull in ONLY its own rules. `wordpress` here must
+        # not react to /login, /user, /session, /index.php or another preset's
+        # cookies -- those are other backends' surfaces and are perfectly
+        # cacheable pages on a WordPress site. (This location used to be
+        # `cache_turbo_backend generic;` and proved the same thing about the
+        # union; the union is gone, the invariant is not.)
         location /gen/ {{
             cache_turbo         main;
-            cache_turbo_backend generic;
+            cache_turbo_backend wordpress;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # `none` overrides an inherited preset. The server-level directive below
+        # arms wordpress for every location that does not say otherwise; this one
+        # says otherwise, so /wp-admin/-style rules must NOT fire here.
+        location /nonepreset/ {{
+            cache_turbo         main;
+            cache_turbo_backend none;
             cache_turbo_key     $uri;
             cache_turbo_valid   30s;
             proxy_pass http://127.0.0.1:{origin_port}/;
@@ -2465,23 +2491,166 @@ def test_invalid_backend_name(ng: Nginx) -> None:
         f"missing/odd diagnostic for bad backend:\n{r.stdout}"
 
 
-def test_invalid_auto_mode(ng: Nginx) -> None:
-    """cache_turbo <zone> <mode> rejects any 2nd token other than 'auto'."""
-    bad = ng.root.parent / "bad-mode"
+def _config_rejects(ng: Nginx, tag: str, old: str, new: str, want: str) -> None:
+    """Swap `old`->`new` in the generated config and assert nginx -t FAILS with
+    `want` in the diagnostic. Used for the removal tests below, where a silent
+    accept is the failure mode we actually fear."""
+    bad = ng.root.parent / tag
     (bad / "conf").mkdir(parents=True, exist_ok=True)
     (bad / "logs").mkdir(parents=True, exist_ok=True)
     cfg = nginx_config(bad, ng.port, ng.module, ng.origin_port, 1)
-    cfg = cfg.replace("cache_turbo       main auto;",
-                      "cache_turbo       main bogusmode;")
+    assert old in cfg, f"{tag}: pattern to replace not found in config: {old!r}"
+    cfg = cfg.replace(old, new, 1)
     (bad / "conf" / "nginx.conf").write_text(cfg, encoding="ascii")
     cmd = ng.runner + [str(ng.binary), "-p", str(bad),
                        "-c", str(bad / "conf" / "nginx.conf"), "-t"]
     r = subprocess.run(cmd, text=True, stdout=subprocess.PIPE,
                        stderr=subprocess.STDOUT, timeout=20)
     assert r.returncode != 0, \
-        f"invalid cache_turbo mode was accepted by nginx -t:\n{r.stdout}"
-    assert "invalid cache_turbo mode" in r.stdout, \
-        f"missing/odd diagnostic for bad mode:\n{r.stdout}"
+        f"{tag}: config was ACCEPTED by nginx -t but must be rejected:\n{r.stdout}"
+    assert want in r.stdout, \
+        f"{tag}: missing/odd diagnostic (want {want!r}):\n{r.stdout}"
+
+
+def test_invalid_cache_turbo_mode(ng: Nginx) -> None:
+    """cache_turbo takes a zone name and nothing else. Any 2nd token is rejected
+    (the `auto` shorthand is gone -- see test_auto_and_generic_are_removed)."""
+    _config_rejects(ng, "bad-mode",
+                    "cache_turbo         main;\n            cache_turbo_backend wordpress;",
+                    "cache_turbo         main bogusmode;",
+                    "invalid cache_turbo mode")
+
+
+def test_auto_and_generic_are_removed(ng: Nginx) -> None:
+    """The `generic`/`auto` preset union was removed because it was never a safe
+    default: it never covered every backend, `woocommerce` in it left /wp-admin/
+    cacheable unless stacked with `wordpress`, and `joomla` in it shipped no
+    cookie rule at all.
+
+    All three dead spellings must be a HARD CONFIG ERROR, not a silent no-op.
+    That distinction is the entire point: accepting the name and enabling nothing
+    would leave an existing WordPress config with no preset active and quietly
+    start caching /wp-admin/. nginx must refuse to start so the operator looks."""
+    # cache_turbo_backend generic;
+    _config_rejects(ng, "dead-generic", _BACKEND_LINE,
+                    "cache_turbo_backend generic;", "has been removed")
+    # cache_turbo_backend auto;
+    _config_rejects(ng, "dead-backend-auto", _BACKEND_LINE,
+                    "cache_turbo_backend auto;", "has been removed")
+    # cache_turbo <zone> auto;  -- the old shorthand
+    _config_rejects(ng, "dead-shorthand-auto",
+                    "cache_turbo         main;\n            cache_turbo_backend wordpress;",
+                    "cache_turbo         main auto;",
+                    "no longer supported")
+
+
+def _config_accepts(ng: Nginx, tag: str, old: str, new: str) -> None:
+    """Swap `old`->`new` and assert nginx -t ACCEPTS the result."""
+    good = ng.root.parent / tag
+    (good / "conf").mkdir(parents=True, exist_ok=True)
+    (good / "logs").mkdir(parents=True, exist_ok=True)
+    cfg = nginx_config(good, ng.port, ng.module, ng.origin_port, 1)
+    assert old in cfg, f"{tag}: pattern to replace not found: {old!r}"
+    cfg = cfg.replace(old, new, 1)
+    (good / "conf" / "nginx.conf").write_text(cfg, encoding="ascii")
+    cmd = ng.runner + [str(ng.binary), "-p", str(good),
+                       "-c", str(good / "conf" / "nginx.conf"), "-t"]
+    r = subprocess.run(cmd, text=True, stdout=subprocess.PIPE,
+                       stderr=subprocess.STDOUT, timeout=20)
+    assert r.returncode == 0, \
+        f"{tag}: config was REJECTED by nginx -t but must be accepted:\n{r.stdout}"
+
+
+# The directive line the separator tests rewrite. Kept as one constant so a
+# config reshuffle breaks these loudly (via the `old in cfg` assert) instead of
+# silently skipping them.
+_BACKEND_LINE = "cache_turbo_backend wordpress woocommerce joomla;"
+
+
+def test_backend_separators(ng: Nginx) -> None:
+    """Backends stack, and spaces and '|' are interchangeable separators. All of
+    these must mean the same thing:
+
+        cache_turbo_backend wordpress woocommerce;
+        cache_turbo_backend wordpress|woocommerce;
+        cache_turbo_backend wordpress | woocommerce;
+
+    nginx's config lexer splits on whitespace, so `a|b` arrives as ONE token with
+    a '|' inside while `a | b` arrives as THREE tokens -- the parser has to
+    handle both, which is what this pins down."""
+    for i, spec in enumerate([
+        "wordpress",
+        "wordpress woocommerce",
+        "wordpress|woocommerce",
+        "wordpress | woocommerce",
+        "wordpress|woocommerce joomla",
+        "mediawiki|drupal",
+        "none",
+        "wordpress|woocommerce|joomla|xenforo|discourse|phpbb|drupal|mediawiki",
+    ]):
+        _config_accepts(ng, f"sep-ok-{i}", _BACKEND_LINE,
+                        f"cache_turbo_backend {spec};")
+
+
+def test_backend_malformed_pipes(ng: Nginx) -> None:
+    """A stray '|' is a typo, and every form of it must be a config error.
+
+    Both of these were silent-accept bugs during development, which is the
+    dangerous direction: `wordpress|` parsed as just `wordpress` (the trailing
+    empty slice was never examined), and a lone `|` resolved to ZERO backends --
+    which leaves the mask at 0, which the loc-conf merge reads as "unset" and so
+    quietly INHERITS the parent's preset. A directive that looks like it names a
+    backend and silently does something else is exactly what must not ship."""
+    for i, (spec, want) in enumerate([
+        ("wordpress||woocommerce", "empty backend name"),
+        ("|wordpress",             "empty backend name"),
+        ("wordpress|",             "empty backend name"),   # trailing pipe
+        ("|",                      "names no backend"),     # lone pipe
+        ("| |",                    "names no backend"),
+        ("bogus",                  "unknown cache_turbo_backend"),
+        ("wordpress|bogus",        "unknown cache_turbo_backend"),
+    ]):
+        _config_rejects(ng, f"sep-bad-{i}", _BACKEND_LINE,
+                        f"cache_turbo_backend {spec};", want)
+
+
+def test_backend_none_is_exclusive(ng: Nginx) -> None:
+    """`none` means "no preset here" and cannot be combined with a real backend --
+    `none wordpress` is a contradiction, and silently letting one win is exactly
+    the quiet surprise this directive exists to avoid."""
+    for i, spec in enumerate(["none wordpress", "none|wordpress",
+                              "wordpress|none", "none | mediawiki"]):
+        _config_rejects(ng, f"none-plus-{i}", _BACKEND_LINE,
+                        f"cache_turbo_backend {spec};", "cannot be combined")
+
+
+def test_backend_none_overrides_inherited(ng: Nginx, origin: Origin) -> None:
+    """`cache_turbo_backend none;` switches OFF a preset inherited from the
+    server level.
+
+    This is the gap `none` exists to fill. backend_presets uses 0 to mean "this
+    location named no backend", which the loc-conf merge reads as "inherit the
+    parent's" -- so before `none` there was no way to opt a single location out
+    of a server-level preset. `none` sets a sentinel bit: non-zero (so nothing is
+    inherited) but matching no registry row (so no rule fires).
+
+    The server block arms `wordpress`, so /wp-admin/-shaped paths would normally
+    bypass. Under `none` they must cache like any other page."""
+    # A WordPress dynamic surface, in a location that said `none`: must CACHE.
+    fetch(ng.port, "/nonepreset/wp-login.php")
+    _, _, h = fetch(ng.port, "/nonepreset/wp-login.php")
+    assert h.get("x-cache") == "HIT", \
+        ("`none` must override the inherited wordpress preset, so this caches; "
+         f"got {h.get('x-cache')} -- the preset is still firing")
+
+    # And a WordPress auth cookie must not bypass either.
+    wp = {"Cookie": "wordpress_logged_in_abc=deadbeef"}
+    fetch(ng.port, "/nonepreset/page", headers=wp)
+    _, _, hw = fetch(ng.port, "/nonepreset/page", headers=wp)
+    assert hw.get("x-cache") == "HIT", \
+        ("`none` must override the inherited wordpress cookie rule too; "
+         f"got {hw.get('x-cache')}")
+    drain_origin(origin)
 
 
 def test_valid_status_rejects_304(ng: Nginx) -> None:
@@ -5475,7 +5644,12 @@ def run_all(ng: Nginx, origin: Origin,
     test_suppress_native_inert_on_plain_location(ng)
     test_suppress_native_e2e_proxy_cache(ng)
     test_invalid_backend_name(ng)
-    test_invalid_auto_mode(ng)
+    test_invalid_cache_turbo_mode(ng)
+    test_auto_and_generic_are_removed(ng)
+    test_backend_separators(ng)
+    test_backend_malformed_pipes(ng)
+    test_backend_none_is_exclusive(ng)
+    test_backend_none_overrides_inherited(ng, origin)
     test_valid_status_rejects_304(ng)
     test_empty_l2_prefix_rejected(ng)
     test_keepalive_cap_rejected(ng)

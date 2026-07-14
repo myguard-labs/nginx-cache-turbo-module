@@ -8,24 +8,45 @@ cookie/key decisions, and the specific ways each application can bite you.
 
 One page per `cache_turbo_backend` preset:
 
-| Preset | Guide | In `generic`/`auto`? | Protects logged-in users out of the box? |
-|---|---|---|---|
-| `wordpress` | [wordpress.md](wordpress.md) | ✅ yes | ✅ yes (`wordpress_logged_in_*`) |
-| `woocommerce` | [woocommerce.md](woocommerce.md) | ✅ yes | ✅ yes — **but must be stacked with `wordpress`** |
-| `joomla` | [joomla.md](joomla.md) | ✅ yes | ❌ **no** — you must add a `cache_turbo_bypass` for the session cookie |
-| `xenforo` | [xenforo.md](xenforo.md) | ❌ **no** — opt-in only | ✅ yes (`xf_user`, `xf_session_admin`) |
-| `discourse` | [discourse.md](discourse.md) | ❌ **no** — opt-in only | ✅ yes (`_t`) — and the origin sends `no-store` anyway |
-| `phpbb` | [phpbb.md](phpbb.md) | ❌ **no** — opt-in only | ❌ **no** — you must add a `cache_turbo_bypass`, and it needs a *value* test |
-| `drupal` | [drupal.md](drupal.md) | ❌ **no** — opt-in only | ⚠️ via the origin — Drupal sends `Cache-Control: private`; no cookie rule shipped |
-| `mediawiki` | [mediawiki.md](mediawiki.md) | ❌ **no** — opt-in only | ✅ yes (`*UserID`, `*UserName`) |
+| Preset | Guide | Protects logged-in users out of the box? |
+|---|---|---|
+| `wordpress` | [wordpress.md](wordpress.md) | ✅ yes (`wordpress_logged_in_*`) |
+| `woocommerce` | [woocommerce.md](woocommerce.md) | ✅ yes — **but must be stacked with `wordpress`** |
+| `joomla` | [joomla.md](joomla.md) | ❌ **no** — you must add a `cache_turbo_bypass` for the session cookie |
+| `xenforo` | [xenforo.md](xenforo.md) | ✅ yes (`xf_user`, `xf_session_admin`) |
+| `discourse` | [discourse.md](discourse.md) | ✅ yes (`_t`) — and the origin sends `no-store` anyway |
+| `phpbb` | [phpbb.md](phpbb.md) | ❌ **no** — you must add a `cache_turbo_bypass`, and it needs a *value* test |
+| `drupal` | [drupal.md](drupal.md) | ⚠️ via the origin — Drupal sends `Cache-Control: private`; no cookie rule shipped |
+| `mediawiki` | [mediawiki.md](mediawiki.md) | ✅ yes (`*UserID`, `*UserName`) |
 
-Only `wordpress`, `woocommerce` and `joomla` are in `generic`/`auto`. **Every
-preset added since is opt-in and must be named explicitly** — their dynamic URIs
-are generic English words (`/login`, `/register`, `/user`, `/admin`, `/node`,
-`/session`, `/index.php`) that an unrelated site legitimately serves as cacheable
-pages, so folding them into `auto` would punch holes in other sites' caches.
+## Every preset is opt-in
 
-Four rows are load-bearing:
+Name the backends you actually run. They stack, and spaces and `|` are
+interchangeable:
+
+```nginx
+cache_turbo_backend wordpress woocommerce;      # the same thing,
+cache_turbo_backend wordpress|woocommerce;      # spelled three ways
+cache_turbo_backend wordpress | woocommerce;
+```
+
+`cache_turbo_backend none;` means *no preset here* — it exists to switch off a
+preset inherited from the `server` block for one `location`.
+
+> **There is no `generic` / `auto` union any more, and both spellings are now a
+> config error.** It used to mean `wordpress` + `woocommerce` + `joomla`, and it
+> was never a safe default: it never covered every backend (`auto` on a Drupal or
+> XenForo site enabled *nothing* for it), the `woocommerce` in it left
+> `/wp-admin/` cacheable unless you also knew to stack `wordpress`, and the
+> `joomla` in it ships no cookie rule at all — so `auto` on a Joomla site *looked*
+> like it protected logged-in users and did not. A default that is only correct if
+> you already know which parts of it are wrong is a footgun with a friendly name.
+>
+> The error names its replacement, and nginx refuses to start rather than
+> silently enabling nothing — which on an existing WordPress config would mean
+> quietly caching `/wp-admin/`.
+
+Four rows above are load-bearing:
 
 - **`joomla` does not ship a cookie rule.** Joomla's session cookie is named from
   a hash of the site secret, so no shippable substring matches it. The preset
@@ -67,6 +88,43 @@ MediaWiki derives it from the database name; Drupal hashes it from the hostname.
 Where no substring can match, these presets ship *no* cookie rule and say so —
 rather than shipping one that quietly does nothing. The guide then hands you the
 `map` that works on your install.
+
+## Apps we deliberately do *not* ship a preset for
+
+A preset is only worth shipping when a meaningful share of an app's traffic is
+**anonymous, shared HTML** — pages that are byte-identical for every logged-out
+visitor. That is the whole business case for a page cache. For some applications
+it is simply not true, and a preset there would be an **attractive nuisance**: it
+implies caching the app is a good idea, and someone arriving from the WordPress
+preset would reasonably assume it does the same job. It cannot.
+
+The answer for these is `cache_turbo off;` — which is already the default.
+
+**Nextcloud.** No anonymous shared surface exists. `/` redirects to `/login`;
+`/login` is unique per visitor (it embeds a fresh CSRF token and bootstraps
+`oc_sessionPassphrase`) and must never be cached; `/s/<token>` public shares are
+random per-token URLs whose audience is a handful of people, so their hit ratio is
+≈ 0 while caching them risks serving a **revoked, expired, or password-protected**
+share. The bulk of a real instance's requests are WebDAV sync clients and
+`/ocs/*` polling — authenticated and per-user. Nextcloud correctly marks its app
+responses `Cache-Control: no-cache, no-store, must-revalidate`
+(`lib/public/AppFramework/Http/Response.php`), so a cache that honours the origin
+(which `cache_turbo_backend` implies) would store *nothing* anyway — a preset could
+only "work" by overriding that, which is the dangerous direction. Nextcloud's own
+reverse-proxy docs endorse caching **static assets only**, which its stock config
+already handles with `immutable` far-future headers. If Nextcloud feels slow the
+fix is APCu/Redis, opcache, and `php-fpm` pool sizing — not an HTTP page cache.
+
+**Vaultwarden, vimbadmin, Roundcube** and friends. Same shape: the entire
+anonymous surface is a login page, so a preset would be a list that says "bypass
+everything". Vaultwarden especially — a preset there is an invitation to
+misconfigure a password vault.
+
+**The test to apply before asking for a new preset:** *what fraction of this app's
+requests are pages a logged-out stranger can see, that look the same for every
+logged-out stranger?* If the answer is "basically none", the app does not want a
+page cache, and no preset will change that. Note this is **not** about whether the
+app is proxied or PHP or Rails — it is only about the anonymous-shared fraction.
 
 ## The rule the presets encode
 

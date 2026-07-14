@@ -97,31 +97,35 @@ typedef struct {
 #define NGX_HTTP_CACHE_TURBO_BACKEND_PHPBB        0x0020
 #define NGX_HTTP_CACHE_TURBO_BACKEND_DRUPAL       0x0040
 #define NGX_HTTP_CACHE_TURBO_BACKEND_MEDIAWIKI    0x0080
-/* GENERIC is the union of the blindly-stackable backends only. The opt-in
- * presets are deliberately excluded: their URIs (/login, /register, /contact,
- * /misc, /user, /admin, /node, /posts) are generic English paths that collide
- * with unrelated sites. */
-#define NGX_HTTP_CACHE_TURBO_BACKEND_GENERIC                                   \
+
+/*
+ * Every preset bit, armed together by the driver. There is no GENERIC union any
+ * more (it was never a safe default — see the module header); every preset is
+ * opt-in, so the fuzzer must arm them all explicitly or a row's cookie/URI/arg
+ * lists are walked by nobody.
+ *
+ * ADDING A PRESET MEANS ADDING IT HERE TOO. The assert below is the guard: it
+ * pins the mask to the contiguous run of bits [0x0001 .. highest], so a new bit
+ * that is not folded into ALL fails the fuzz build rather than silently going
+ * unfuzzed.
+ */
+#define NGX_HTTP_CACHE_TURBO_BACKEND_ALL                                       \
     (NGX_HTTP_CACHE_TURBO_BACKEND_WORDPRESS                                    \
      | NGX_HTTP_CACHE_TURBO_BACKEND_WOOCOMMERCE                                \
-     | NGX_HTTP_CACHE_TURBO_BACKEND_JOOMLA)
-
-/* Every opt-in preset the driver arms explicitly. Keeping this one name in
- * sync with the driver means a new preset is armed by editing a single list. */
-#define NGX_HTTP_CACHE_TURBO_BACKEND_OPTIN                                     \
-    (NGX_HTTP_CACHE_TURBO_BACKEND_XENFORO                                      \
+     | NGX_HTTP_CACHE_TURBO_BACKEND_JOOMLA                                     \
+     | NGX_HTTP_CACHE_TURBO_BACKEND_XENFORO                                    \
      | NGX_HTTP_CACHE_TURBO_BACKEND_DISCOURSE                                  \
      | NGX_HTTP_CACHE_TURBO_BACKEND_PHPBB                                      \
      | NGX_HTTP_CACHE_TURBO_BACKEND_DRUPAL                                     \
      | NGX_HTTP_CACHE_TURBO_BACKEND_MEDIAWIKI)
 
-/* Guard the invariant the fuzz driver depends on: the opt-in presets must not
- * be in GENERIC (the driver arms GENERIC | OPTIN, so folding one into GENERIC
- * would silently change what is fuzzed), and OPTIN must cover every non-GENERIC
- * bit in the registry — a preset in neither set is fuzzed by nobody. */
-_Static_assert((NGX_HTTP_CACHE_TURBO_BACKEND_GENERIC
-                & NGX_HTTP_CACHE_TURBO_BACKEND_OPTIN) == 0,
-               "opt-in presets must stay out of GENERIC (see module header)");
+/* ALL must be a gapless run of bits starting at 0x0001 — i.e. ALL+1 is a power
+ * of two. A preset bit defined above but left out of ALL breaks this and fails
+ * the fuzz build, which is exactly when we want to hear about it. */
+_Static_assert((NGX_HTTP_CACHE_TURBO_BACKEND_ALL
+                & (NGX_HTTP_CACHE_TURBO_BACKEND_ALL + 1)) == 0,
+               "a BACKEND_* bit is missing from BACKEND_ALL — the fuzzer would "
+               "not walk its preset row (see module header)");
 
 /* Linker stub: never called (driver keeps r->args.len == 0). */
 static ngx_int_t

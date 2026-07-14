@@ -25,7 +25,7 @@ auto-skips `/wp-admin/`, `/wp-login.php`, `/wp-cron.php`, `/xmlrpc.php` and
 `/wp-json/`, plus any request carrying a logged-in / password-protected-post /
 comment-author cookie, and any `?preview=` or `?s=` (search) request.
 
-`wordpress` **is** part of `generic`/`auto`, so `cache_turbo ct auto;` gets you
+`wordpress` must be named explicitly — `cache_turbo_backend wordpress;` gets you
 this plus the WooCommerce and Joomla rules.
 
 ## What the preset skips

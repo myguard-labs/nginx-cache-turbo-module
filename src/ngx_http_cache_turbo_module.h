@@ -84,19 +84,27 @@
 /*
  * Auto-classify CMS backend presets (distinct from the stale-window PRESET_*
  * above). A bitmask in loc_conf->backend_presets; each bit pulls in one row of
- * the preset registry (cookie/URI/arg dynamic-surface rules). GENERIC is the
- * union of the backends whose URI namespaces are disjoint enough to stack
- * blindly — what bare `cache_turbo <zone> auto` applies.
+ * the preset registry (cookie/URI/arg dynamic-surface rules).
  *
- * XENFORO is deliberately NOT in GENERIC: its dynamic surfaces are generic
- * English paths (/login, /register, /contact, /misc) that a non-forum site can
- * legitimately serve as cacheable pages, so folding it into `auto` would punch
- * holes in unrelated sites' caches. Name it explicitly to opt in.
+ * EVERY preset is opt-in — you name the backends you actually run. There is no
+ * `generic` / `auto` union, and deliberately so. It used to mean
+ * WORDPRESS|WOOCOMMERCE|JOOMLA, and it was never a safe default:
  *
- * The same reasoning keeps DISCOURSE (/login, /signup, /posts), PHPBB
- * (/search.php, /posting.php), DRUPAL (/user, /admin, /node) and MEDIAWIKI
- * (/index.php) out of GENERIC. GENERIC stays exactly the three original
- * blindly-stackable backends; every preset added since is opt-in by name.
+ *   - it never covered every backend, so `auto` on a Drupal or XenForo site
+ *     silently enabled no rules for it at all;
+ *   - WOOCOMMERCE inside it leaves /wp-admin/ cacheable unless stacked with
+ *     WORDPRESS — a union whose members you must know how to combine is not a
+ *     default;
+ *   - JOOMLA inside it ships no cookie rule, so `auto` on a Joomla site LOOKED
+ *     like it protected logged-in users and did not.
+ *
+ * Both spellings are now rejected at config parse (see cache_turbo_backend).
+ *
+ * The other reason no union is safe: most of these presets have generic-English
+ * dynamic URIs — /login, /register, /contact, /misc (xenforo), /login, /signup,
+ * /posts (discourse), /user, /admin, /node (drupal), /index.php (mediawiki) —
+ * which an unrelated site may legitimately serve as perfectly cacheable pages.
+ * Enabling one you do not run punches holes in your own cache.
  */
 #define NGX_HTTP_CACHE_TURBO_BACKEND_WORDPRESS    0x0001
 #define NGX_HTTP_CACHE_TURBO_BACKEND_WOOCOMMERCE  0x0002
@@ -106,10 +114,34 @@
 #define NGX_HTTP_CACHE_TURBO_BACKEND_PHPBB        0x0020
 #define NGX_HTTP_CACHE_TURBO_BACKEND_DRUPAL       0x0040
 #define NGX_HTTP_CACHE_TURBO_BACKEND_MEDIAWIKI    0x0080
-#define NGX_HTTP_CACHE_TURBO_BACKEND_GENERIC                                   \
-    (NGX_HTTP_CACHE_TURBO_BACKEND_WORDPRESS                                    \
-     | NGX_HTTP_CACHE_TURBO_BACKEND_WOOCOMMERCE                                \
-     | NGX_HTTP_CACHE_TURBO_BACKEND_JOOMLA)
+
+/*
+ * "cache_turbo_backend none;" — explicitly NO preset here.
+ *
+ * This is a sentinel, not a registry row: it matches no backend and pulls in no
+ * cookie/URI/arg rules. It exists because backend_presets uses 0 to mean "this
+ * location named no backend", which the loc-conf merge treats as "inherit the
+ * parent's". So a server-level `cache_turbo_backend wordpress;` is inherited by
+ * every location under it, and before `none` there was no way to switch that off
+ * for one location — leaving the mask at 0 is indistinguishable from silence.
+ *
+ * NONE occupies a bit so that backend_presets != 0 and inheritance is defeated,
+ * while matching nothing in the registry (whose rows all have a real backend
+ * bit). It is deliberately OUTSIDE the contiguous preset run so BACKEND_ALL —
+ * and the fuzzer's gapless-bits assert — is unaffected.
+ *
+ * It also does NOT imply cache_turbo_cache_control honor, unlike a real preset:
+ * asking for no CMS classification should not quietly change how the response's
+ * Cache-Control is treated.
+ */
+#define NGX_HTTP_CACHE_TURBO_BACKEND_NONE         0x8000
+
+/* True when a REAL preset is active — i.e. at least one registry row is armed.
+ * Use this, never a bare `backend_presets != 0`: the NONE sentinel is non-zero
+ * (deliberately, to defeat loc-conf inheritance) but must not count as a preset,
+ * or it would imply cache_control honor and enter the auto-classify walk. */
+#define NGX_HTTP_CACHE_TURBO_HAS_BACKEND(m)                                    \
+    (((m) & ~NGX_HTTP_CACHE_TURBO_BACKEND_NONE) != 0)
 
 /* cache_turbo_cache_control modes (loc_conf.cc_mode). */
 #define NGX_HTTP_CACHE_TURBO_CC_RESPECT  0

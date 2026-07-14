@@ -421,15 +421,40 @@ cache.
 
 ```nginx
 cache_turbo            ct;
-cache_turbo_backend    wordpress;          # one or more: wordpress woocommerce joomla xenforo
-                                           #             discourse phpbb drupal mediawiki generic
-# cache_turbo          ct auto;            # shorthand for `cache_turbo_backend generic`
+cache_turbo_backend    wordpress;          # one or more: wordpress woocommerce joomla
+                                           # xenforo discourse phpbb drupal mediawiki
 ```
 
-Names **stack** (`cache_turbo_backend wordpress woocommerce;`), and `generic`
-(a.k.a. `auto`) is the **union of `wordpress` + `woocommerce` + `joomla`** — use
-it when you don't want to think about it, name the specific backend(s) when you
-want the tightest rule set.
+**Every preset is opt-in — name the backends you actually run.** They **stack**,
+and spaces and `|` are interchangeable separators:
+
+```nginx
+cache_turbo_backend wordpress woocommerce;      # the same thing,
+cache_turbo_backend wordpress|woocommerce;      # spelled three ways
+cache_turbo_backend wordpress | woocommerce;
+```
+
+`cache_turbo_backend none;` means **no preset here**. Its job is to switch off a
+preset inherited from the `server` block for one `location` — without it, a
+server-level `cache_turbo_backend wordpress;` applies everywhere below it and
+there is no way to opt a single location out.
+
+> **There is no `generic` / `auto` union, and both spellings are a config error.**
+> They used to mean `wordpress` + `woocommerce` + `joomla`. That was never a safe
+> default:
+>
+> - it **never covered every backend** — after xenforo/discourse/phpbb/drupal/
+>   mediawiki it named 3 of 9, so `auto` on a Drupal site silently enabled *no*
+>   Drupal rules;
+> - the **`woocommerce` in it leaves `/wp-admin/` cacheable** unless you also knew
+>   to stack `wordpress` (see [woocommerce.md](docs/woocommerce.md));
+> - the **`joomla` in it ships no cookie rule at all**, so `auto` on a Joomla site
+>   *looked* like it protected logged-in users and did not.
+>
+> A default that is only correct if you already know which parts of it are wrong
+> is a footgun with a friendly name. nginx now **refuses to start** and names the
+> replacement — rather than accepting the word and enabling nothing, which on an
+> existing WordPress config would quietly start caching `/wp-admin/`.
 
 ### What each preset skips
 
@@ -448,14 +473,13 @@ per-session suffixes, so it matches as a substring).
 | `phpbb` †     | `/ucp.php`, `/mcp.php`, `/adm/`, `/posting.php`, `/memberlist.php`, `/search.php`, `/report.php` | `sid` | — ‡ |
 | `drupal` †    | `/user`, `/admin`, `/node/add`, `/system/`, `/core/install.php` | — | — ‡ |
 | `mediawiki` † | `/index.php`, `/load.php`, `/api.php` | `veaction`, `returnto` | `UserID=`, `UserName=` |
-| `generic`/`auto` | union of `wordpress` + `woocommerce` + `joomla` | union | union |
 
-† **Opt-in — deliberately *not* part of `generic`.** Only `wordpress`,
-`woocommerce` and `joomla` are in the `auto` union. Every other preset's dynamic
-surfaces are generic English paths (`/login`, `/register`, `/user`, `/admin`,
-`/session`, `/index.php`) that an unrelated site may legitimately serve as
-perfectly cacheable pages, so folding them into `auto` would punch holes in other
-sites' caches. Name them explicitly: `cache_turbo_backend xenforo;`.
+† **Opt-in, like every preset.** These backends' dynamic surfaces are generic
+English paths (`/login`, `/register`, `/user`, `/admin`, `/session`,
+`/index.php`) that an unrelated site may legitimately serve as perfectly
+cacheable pages. Enabling one you do not run punches holes in your own cache —
+which is why none of them is ever enabled implicitly, and why the old `generic`
+union is gone. Name them: `cache_turbo_backend xenforo;`.
 
 ‡ **Ships no cookie rule — read the guide before relying on it.** Three presets
 cannot match a session cookie at all, for two different reasons, and the
@@ -693,7 +717,7 @@ location ~ \.php$ {
   TTL, keep `cache_turbo_preset micro` and add an explicit `cache_turbo_valid 2s;`
   (the explicit knob wins; the ×2 stale window scales with it).
 - **`cache_control` mode vs a fixed TTL.** A CMS preset (`cache_turbo_backend`)
-  or `cache_turbo … auto` defaults `cache_turbo_cache_control` to **honor**, so
+  defaults `cache_turbo_cache_control` to **honor**, so
   an app that emits `Cache-Control: max-age=600` would override your `1s`. Set
   `cache_turbo_cache_control respect;` to pin the microcache TTL regardless of
   app headers (example B). For an API that you *want* to honour its own
@@ -844,8 +868,7 @@ http {
         location / {
             # ── turn it on ──────────────────────────────────────────────
             cache_turbo                   ct;        # bind zone "ct" (or: off)
-          # cache_turbo                   ct auto;   # = also cache_turbo_backend generic
-            cache_turbo_backend           generic;   # generic|wordpress|woocommerce|joomla|xenforo|discourse|phpbb|drupal|mediawiki (stackable); implies cache_control honor
+            cache_turbo_backend           wordpress; # wordpress|woocommerce|joomla|xenforo|discourse|phpbb|drupal|mediawiki (stackable, '|' or spaces); 'none' = off; implies cache_control honor
 
             # ── what is "the same page" ─────────────────────────────────
             cache_turbo_key               $host$uri$cache_turbo_normalized_args;  # the default
@@ -904,7 +927,7 @@ http {
 | `cache_turbo_tag` → `cache_turbo_redis` | **requires** | Tags need Redis sorted-sets. With memcached or no L2 the tag is rejected at config time (memcached has no tag/`?all`/cross-node lock). |
 | `cache_turbo_auto_vary` ↔ `cache_turbo_normalize_vary` | **don't double-cover an axis** | Not an error, but keying the same axis (e.g. `encoding`) via both multiplies the slot count for no benefit. Pick one per axis. |
 | `cache_turbo_preset` ↔ `cache_turbo_valid`/`_beta`/`_lock_ttl` | **explicit wins** | The preset sets a band of defaults; any explicit knob overrides just that knob (the rest stay at the preset). Not exclusive. |
-| `cache_turbo_backend` / `cache_turbo … auto` → `cache_turbo_cache_control` | **implies** | Enabling any CMS auto-classify preset defaults `cache_turbo_cache_control` to `honor` unless you set it explicitly. |
+| `cache_turbo_backend` → `cache_turbo_cache_control` | **implies** | Enabling any CMS auto-classify preset defaults `cache_turbo_cache_control` to `honor` unless you set it explicitly. `none` does not — asking for no classification should not quietly change how Cache-Control is treated. |
 | `cache_turbo_background_update off` → stale-if-error / SWR | **disables** | Inline regeneration replaces serve-stale-while-revalidate; a stale entry is no longer served during refresh, and stale-if-error no longer applies. |
 
 ## Directive synopsis
@@ -912,8 +935,8 @@ http {
 | Directive | Context | Default | What it does |
 |---|---|---|---|
 | `cache_turbo_zone name=NAME SIZE` | `http` | — | Declare a shared-memory cache zone (min 8 pages). |
-| `cache_turbo NAME [auto]` / `off` | `server`, `location` | `off` | Turn caching on (bind a zone) or off. The optional `auto` is shorthand for `cache_turbo_backend generic` (auto-classify dynamic CMS surfaces — see below). |
-| `cache_turbo_backend NAME...` | `server`, `location` | — | Auto-classify dynamic (uncacheable) request surfaces for one or more CMS presets: `generic` (a.k.a. `auto` — the union of `wordpress` + `woocommerce` + `joomla`), `wordpress`, `woocommerce`, `joomla`, `xenforo`, `discourse`, `phpbb`, `drupal`, `mediawiki`. A matching request (login/session cookie, admin URI, dynamic arg) skips the cache and goes straight to origin. Implies `cache_turbo_cache_control honor`. **Only `wordpress`/`woocommerce`/`joomla` are in `generic`** — every other preset has generic-English URIs (`/login`, `/user`, `/admin`, `/index.php`) that collide with unrelated sites, so it must be named explicitly ([why](#cms-backends-cache_turbo_backend)). **`joomla`, `phpbb` and `drupal` ship no cookie rule**; `joomla`/`phpbb` need your own `cache_turbo_bypass` to protect logged-in users ([phpbb](docs/phpbb.md) needs a *value* test), `drupal` leans on the origin's `Cache-Control: private`. |
+| `cache_turbo NAME` / `off` | `server`, `location` | `off` | Turn caching on (bind a zone) or off. Takes a zone name and nothing else — the old `auto` shorthand is gone (see `cache_turbo_backend`). |
+| `cache_turbo_backend NAME...` | `server`, `location` | — | Auto-classify dynamic (uncacheable) request surfaces for one or more CMS presets: `wordpress`, `woocommerce`, `joomla`, `xenforo`, `discourse`, `phpbb`, `drupal`, `mediawiki` — or `none`. A matching request (login/session cookie, admin URI, dynamic arg) skips the cache and goes straight to origin. **Every preset is opt-in**; names **stack**, separated by spaces or `|` (`wordpress|woocommerce` == `wordpress woocommerce`). Implies `cache_turbo_cache_control honor`. **`none`** means no preset here and exists to override one inherited from the `server` block; it is exclusive and does not imply `honor`. **`generic`/`auto` were removed** and are now a config error — the union was never a safe default ([why](#cms-backends-cache_turbo_backend)). **`joomla`, `phpbb` and `drupal` ship no cookie rule**; `joomla`/`phpbb` need your own `cache_turbo_bypass` to protect logged-in users ([phpbb](docs/phpbb.md) needs a *value* test), `drupal` leans on the origin's `Cache-Control: private`. |
 | `cache_turbo_suppress_native on` | `server`, `location` | `off` | Make `$cache_turbo_active` read `1` while cache-turbo owns a request, so a stacked native `proxy_cache` can defer via `proxy_no_cache $cache_turbo_active; proxy_cache_bypass $cache_turbo_active;`. Off (default) keeps the variable always `0` (the wiring stays inert). |
 | `cache_turbo_key STRING` | `server`, `location` | normalized | What makes two requests "the same page". The default is `$host$uri$cache_turbo_normalized_args` — Host + **normalized args** (tracking params stripped, args sorted). |
 | `cache_turbo_preset NAME` | `server`, `location` | `balanced` | `micro` / `conservative` / `balanced` / `aggressive` — sets the four knobs below at once. `micro` = 1s microcaching (valid 1s, lock_ttl 1s, ×2 stale). |

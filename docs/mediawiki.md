@@ -237,8 +237,9 @@ curl -sI -H 'Cookie: mywikiUserID=42' https://wiki.example.com/wiki/Main_Page \
   an edit gets one. Same trap as XenForo's `xf_session`.
 - **Don't set `cache_turbo_cache_control ignore`.** MediaWiki's `private` header is
   a load-bearing part of the safety story here, exactly as with Drupal.
-- **`mediawiki` is not in `generic`/`auto`.** `/index.php` is about as generic as a
-  path gets. Name the preset explicitly.
+- **Every preset is opt-in.** There is no `generic`/`auto` union — name the
+  backends you run. `/index.php` is about as generic as a path gets, so a
+  mediawiki rule must never be enabled implicitly.
 - **`Special:` pages are not path-matchable.** They share the `/wiki/` prefix with
   articles, and the namespace is localised on non-English wikis. Most are
   uncacheable anyway via `Cache-Control`; if you have a specific one to protect,

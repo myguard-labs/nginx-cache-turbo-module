@@ -220,7 +220,7 @@ origin.
   entire reason the preset can get away with no cookie rule. `ignore` + no cookie
   rule = authenticated pages in the cache.
 - **`/user` and `/admin` are not reserved words.** They're ordinary Drupal routes,
-  which is exactly why `drupal` is **not** in `generic`/`auto` — a non-Drupal site
+  which is exactly why no preset is ever enabled implicitly — a non-Drupal site
   may serve `/user` as a perfectly cacheable page. Name the preset explicitly.
 - **Contrib modules add their own private surfaces.** Commerce carts, Group,
   Private Message — the preset knows nothing about them. Add a
