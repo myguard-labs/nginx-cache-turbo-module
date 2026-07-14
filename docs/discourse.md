@@ -48,7 +48,7 @@ cache_turbo_backend discourse;      # implies cache_turbo_cache_control honor
 
 | Check | Values |
 |---|---|
-| URI prefixes | `/admin`, `/session`, `/auth/`, `/login`, `/logout`, `/signup`, `/u/`, `/my/`, `/message-bus/`, `/draft`, `/presence/`, `/notifications`, `/user_actions` |
+| URI prefixes | `/admin`, `/session`, `/auth/`, `/login`, `/logout`, `/signup`, `/my/`, `/message-bus/`, `/drafts`, `/presence/`, `/notifications`, `/user_actions` |
 | Query args | `api_key`, `api_username` |
 | Cookie substrings | `_t=` |
 
@@ -165,7 +165,9 @@ curl -sI https://forum.example.com/t/some-topic/123 | grep -i x-cache-turbo  # H
 
 # preset URI surfaces: BYPASS
 curl -sI https://forum.example.com/admin   | grep -i x-cache-turbo
-curl -sI https://forum.example.com/u/someone | grep -i x-cache-turbo
+
+# public profiles /u/ are NOT bypassed: they are anonymous-identical and cache
+curl -s -D- -o /dev/null https://forum.example.com/u/someone | grep -i x-cache-turbo  # MISS then HIT
 
 # THE ONE THAT MATTERS: a logged-in user must be BYPASS.
 curl -sI -H 'Cookie: _t=abc123' https://forum.example.com/t/some-topic/123 \

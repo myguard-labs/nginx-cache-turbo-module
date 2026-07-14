@@ -174,10 +174,13 @@ curl -s -D- -o /dev/null https://example.com/media/pages/home/logo.svg \
 - **Kirby's own page cache is a different layer.** It lives in PHP and makes the
   origin fast, which is what your cache-turbo *misses* hit. Leave it on; the two
   compose.
-- **`/panel` has no trailing slash in the preset.** The prefix matches `/panel`,
-  `/panel/`, and `/panel/pages` alike. If you relocate it via `panel.slug`, add a
-  `cache_turbo_bypass` — though `kirby_session` still guards every authenticated
-  request, so you lose an optimisation, not a guarantee.
+- **`/panel` has no trailing slash in the preset, but matches on a path-segment
+  boundary.** The prefix matches `/panel`, `/panel/`, and `/panel/pages` — but
+  NOT a different segment that merely shares the letters, such as
+  `/panels-and-doors` (which caches normally). The rule is: after the prefix the
+  URL must end or continue with `/` or `.`. If you relocate the panel via
+  `panel.slug`, add a `cache_turbo_bypass` — though `kirby_session` still guards
+  every authenticated request, so you lose an optimisation, not a guarantee.
 - **Don't set `cache_turbo_cache_control ignore`.** It overrides the `honor` that
   `cache_turbo_backend` implies.
 - **`Set-Cookie` responses are never stored** and `Authorization` requests are never

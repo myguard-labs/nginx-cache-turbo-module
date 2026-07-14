@@ -469,7 +469,7 @@ per-session suffixes, so it matches as a substring).
 | `woocommerce` | `/cart`, `/checkout`, `/my-account` | `wc-ajax` | `woocommerce_items_in_cart`, `woocommerce_cart_hash`, `wp_woocommerce_session_` |
 | `joomla`      | `/administrator/` | — | `joomla_remember_me_` ‡ |
 | `xenforo` † ¤ | `/admin.php`, `/install/`, `/login`, `/logout`, `/lost-password`, `/register`, `/account`, `/conversations`, `/direct-messages`, `/misc` | — | `xf_session`, `xf_user`, `xf_session_admin`, `xf_lscxf_logged_in` |
-| `discourse` † | `/admin`, `/session`, `/auth/`, `/login`, `/logout`, `/signup`, `/u/`, `/my/`, `/message-bus/`, `/draft`, `/presence/`, `/notifications`, `/user_actions` | `api_key`, `api_username` | `_t=` |
+| `discourse` † | `/admin`, `/session`, `/auth/`, `/login`, `/logout`, `/signup`, `/my/`, `/message-bus/`, `/drafts`, `/presence/`, `/notifications`, `/user_actions` | `api_key`, `api_username` | `_t=` |
 | `phpbb` †     | `/ucp.php`, `/mcp.php`, `/adm/`, `/posting.php`, `/memberlist.php`, `/search.php`, `/report.php` | `sid` | — ‡ |
 | `drupal` †    | `/user`, `/admin`, `/node/add`, `/system/`, `/core/install.php` | — | `SESS` ¥ |
 | `mediawiki` † | — ¶ | `veaction`, `returnto` | `Token=`, `_session=`, `UserID=` |

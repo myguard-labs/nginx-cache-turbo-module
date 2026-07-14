@@ -1283,6 +1283,17 @@ http {{
             cache_turbo_valid   30s;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
+        # Segment-boundary matcher proof: "/panel" must NOT swallow an unrelated
+        # public path that merely shares the prefix. "/panels-and-doors" is a
+        # different path segment (next byte is 's', not '/' or '.') so it must
+        # CACHE. Without the boundary check the bare prefix test bypassed it.
+        location /panels-and-doors {{
+            cache_turbo         main;
+            cache_turbo_backend kirby;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
         # The flat-file public site: the whole point of the preset. Must cache.
         # /media/ is NOT a preset URI (static assets, no permission view) so it
         # must cache too -- asserting that guards against someone "helpfully"
@@ -2382,9 +2393,15 @@ def test_discourse_preset(ng: Nginx, origin: Origin) -> None:
     variants — all three must keep caching. Bypassing on _forum_session would be
     the xf_session mistake again: it would drop all guest traffic out of the
     cache, which is a performance bug, not a safety one."""
-    for uri in ("/session", "/u/someone"):
-        _, _, h = fetch(ng.port, uri)
-        assert "x-cache" not in h, f"{uri} must bypass on the discourse preset"
+    _, _, h = fetch(ng.port, "/session")
+    assert "x-cache" not in h, "/session must bypass on the discourse preset"
+
+    # /u/ (public profiles) is NO LONGER a bypass rule: profiles are anon-
+    # identical and Discourse's own anon cache caches them, so they must cache.
+    fetch(ng.port, "/u/someone")
+    _, _, hu = fetch(ng.port, "/u/someone")
+    assert hu.get("x-cache") == "HIT", \
+        f"/u/ public profile must cache now, got {hu.get('x-cache')}"
 
     # Auth token bypasses on an otherwise cacheable page.
     tok = {"Cookie": "_t=abc123deadbeef"}
@@ -2778,9 +2795,19 @@ def test_kirby_preset(ng: Nginx, origin: Origin) -> None:
     bypass-a-guest, not serve-a-member's-page. Precisely inverted from Flarum,
     whose no-remember-me logins carry only the guest-issued flarum_session, which
     is why Flarum is rejected outright."""
-    # Panel (admin) bypasses.
+    # Panel (admin) bypasses -- both the exact prefix and a sub-path.
     _, _, h = fetch(ng.port, "/panel/pages")
-    assert "x-cache" not in h, "kirby: /panel must bypass"
+    assert "x-cache" not in h, "kirby: /panel/... must bypass"
+    _, _, hp = fetch(ng.port, "/panel")
+    assert "x-cache" not in hp, "kirby: exact /panel must bypass"
+
+    # SEGMENT BOUNDARY: /panels-and-doors shares the /panel prefix but is a
+    # different path segment, so it must CACHE, not bypass. Guards the boundary
+    # matcher against regressing to a bare prefix test.
+    fetch(ng.port, "/panels-and-doors")
+    _, _, hb = fetch(ng.port, "/panels-and-doors")
+    assert hb.get("x-cache") == "HIT", \
+        f"kirby: /panels-and-doors must cache (not swallowed by /panel), got {hb.get('x-cache')}"
 
     # The logged-in Panel user / frontend member: kirby_session must bypass.
     for ck in ("kirby_session=abc123",):

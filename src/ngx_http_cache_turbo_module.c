@@ -1502,11 +1502,18 @@ static const char *const  ct_xf_args[] = { NULL };
  * "<something>_t" (e.g. "list_t"), which costs a needless bypass but never
  * leaks; a substring matcher cannot do better, and "; _t=" would miss the case
  * where _t is the first cookie in the header.
+ *
+ * `/u/` (public user profiles) is deliberately ABSENT: profiles are anonymous-
+ * identical and Discourse's own anon cache caches them, so bypassing was a pure
+ * hit-rate loss. The route is `/drafts` (plural — resources :drafts in
+ * config/routes.rb); the singular `/draft` shipped earlier matched only via the
+ * old boundary-less prefix test and stops matching `/drafts.json` under the
+ * segment-boundary matcher, so it is corrected to the real name here.
  */
 static const char *const  ct_discourse_cookies[] = { "_t=", NULL };
 static const char *const  ct_discourse_uris[] = {
-    "/admin", "/session", "/auth/", "/login", "/logout", "/signup", "/u/",
-    "/my/", "/message-bus/", "/draft", "/presence/", "/notifications",
+    "/admin", "/session", "/auth/", "/login", "/logout", "/signup",
+    "/my/", "/message-bus/", "/drafts", "/presence/", "/notifications",
     "/user_actions", NULL };
 static const char *const  ct_discourse_args[] = {
     "api_key", "api_username", NULL };
@@ -1898,6 +1905,52 @@ ngx_http_cache_turbo_cookie_has(ngx_http_request_t *r,
 
 
 /*
+ * URI prefix match with a PATH-SEGMENT BOUNDARY. A preset URI rule like "/user"
+ * must bypass "/user" and "/user/settings" but NOT "/users-guide" — a bare
+ * ngx_strncmp prefix test matches all three and silently over-bypasses (a
+ * hit-rate loss) or, worse for a slash-less rule that is a genuine prefix of an
+ * unrelated public path, un-caches real content.
+ *
+ * A match requires the prefix, and then the URI must either END or continue with
+ * a boundary byte. Boundary bytes are '/' AND '.': '.' matters because Rails-
+ * style backends serve the same controller action with a format suffix appended
+ * directly to the path ("/notifications" -> "/notifications.json"), and those
+ * suffixed variants are the DYNAMIC endpoint we must keep bypassing. Requiring
+ * only '/' would un-bypass "/notifications.json" and leak it. Note r->uri never
+ * contains the query string (nginx splits it into r->args), so '/' and '.' are
+ * the only boundaries that occur.
+ *
+ * Rules that already carry their own boundary (a trailing '/' like "/wp-admin/",
+ * or a file suffix like "/xmlrpc.php") are unaffected: the byte after the prefix
+ * is fixed by the needle itself, so the extra check is always satisfied.
+ */
+static ngx_int_t
+ngx_http_cache_turbo_uri_prefix(ngx_str_t *uri, const char *pfx, size_t l)
+{
+    u_char  next;
+
+    if (uri->len < l || ngx_strncmp(uri->data, pfx, l) != 0) {
+        return 0;
+    }
+
+    if (uri->len == l) {
+        return 1;                       /* exact match: "/panel" == "/panel" */
+    }
+
+    /* A needle that already ends in a boundary ("/wp-admin/") carries its own
+     * segment terminator: any continuation is inside the matched subtree, so a
+     * plain prefix is the whole test. Only slash-less needles ("/panel") need
+     * the trailing byte checked. */
+    if (pfx[l - 1] == '/') {
+        return 1;
+    }
+
+    next = uri->data[l];
+    return (next == '/' || next == '.');
+}
+
+
+/*
  * Auto-classify gate. Returns 1 when the request matches a dynamic surface of
  * any active preset (login/session cookie, backend URI prefix, dynamic query
  * arg) and must therefore skip the cache entirely (origin, never capture). 0 =
@@ -1920,9 +1973,7 @@ ngx_http_cache_turbo_auto_skip(ngx_http_request_t *r,
 
         for (pp = ps->uris; *pp; pp++) {
             l = ngx_strlen(*pp);
-            if (r->uri.len >= l
-                && ngx_strncmp(r->uri.data, *pp, l) == 0)
-            {
+            if (ngx_http_cache_turbo_uri_prefix(&r->uri, *pp, l)) {
                 return 1;
             }
         }
