@@ -1,13 +1,12 @@
 # phpBB + cache-turbo
 
-Caching a phpBB 3.x board. **Read [the warning](#the-preset-ships-no-cookie-rule--read-this)
-first** — like the Joomla preset, the phpBB preset does **not** protect logged-in
-users on its own, and for a more interesting reason.
+Caching a phpBB 3.x board. **The preset now protects logged-in members on its
+own** — it carries a cookie **value** predicate. Earlier releases did not, and
+required the hand-written `map` below; if you are upgrading, you can delete it.
 
 - [The short version](#the-short-version)
-- [The preset ships no cookie rule — read this](#the-preset-ships-no-cookie-rule--read-this)
-- [Finding your cookie prefix](#finding-your-cookie-prefix)
-- [Writing the bypass](#writing-the-bypass)
+- [Why a value predicate (and why the name is matched by suffix)](#why-a-value-predicate-and-why-the-name-is-matched-by-suffix)
+- [Upgrading from the hand-written map](#upgrading-from-the-hand-written-map)
 - [Vhost](#vhost)
 - [Checking it works](#checking-it-works)
 - [Gotchas](#gotchas)
@@ -17,130 +16,66 @@ users on its own, and for a more interesting reason.
 ```nginx
 cache_turbo         ct;
 cache_turbo_backend phpbb;
+```
 
-# REQUIRED. The preset ships no cookie rule -- see below. Replace phpbb3_ with
-# your board's actual cookie name (ACP -> Server Configuration -> Cookie Settings).
+That is the whole config. No `map`, no `cache_turbo_bypass`. The preset bypasses
+the cache for any visitor whose `<cookie_name>_u` cookie holds anything other
+than `1` — i.e. any logged-in member — and keeps caching for guests, who carry
+`_u=1` (`ANONYMOUS`).
+
+It works whatever your board's cookie prefix is: the cookie **name is matched by
+suffix** (`_u`), so `phpbb_u`, `phpbb3_u`, and `myboard_xyz_u` all match. You do
+not need to look your prefix up.
+
+## Why a value predicate (and why the name is matched by suffix)
+
+phpBB sets `_u` / `_k` / `_sid` for **every non-bot visitor, guests included** —
+`session_create()` guards the `set_cookie()` block on `$bot`, not on login state.
+So cookie *presence* tells you nothing: an anonymous visitor has all three. What
+differs is the **value**:
+
+| Visitor | `<prefix>_u` |
+|---|---|
+| Guest | `1` — the `ANONYMOUS` constant (`includes/constants.php`: `define('ANONYMOUS', 1)`) |
+| Logged-in member | their `user_id` — **never** `1`, since `ANONYMOUS` is a reserved user row |
+
+(`phpbb/session.php`, `session_create()`: `cookie_data['u'] = ($bot) ? $bot : ANONYMOUS;`
+for the no-user path, `cookie_data['u'] = $this->data['user_id'];` for a real login.)
+
+Hence `_u != 1`. A presence rule would match every guest — taking the hit rate to
+zero while still failing to identify a member.
+
+**The name is matched by suffix on purpose.** phpBB composes the cookie as
+`config('cookie_name') . '_u'` (`set_cookie()`), and `cookie_name` is an ACP
+setting — it defaults to `phpbb`, installers randomise it, and anyone running two
+boards on one domain changes it. A rule keyed on a *literal* name silently stops
+firing on such a board, and **a bypass rule that stops firing caches the member's
+page and serves it to strangers.** Suffix matching is prefix-agnostic. It can
+over-match an unrelated cookie ending in `_u` — a needless bypass, never a leak.
+
+An unreadable `_u` (no `=`, malformed) **fails closed to bypass**: a false bypass
+costs one cache miss; a false hit costs somebody else's session.
+
+## Upgrading from the hand-written map
+
+If you followed an earlier version of this guide, you have something like:
+
+```nginx
 map $http_cookie $phpbb_user {
     default                    "";
-    "~phpbb3_u=(?!1(;|$))"     "1";   # _u present and NOT the ANONYMOUS id (1)
-    "~phpbb3_k=[^;\s]+"        "1";   # persistent-login key, non-empty
+    "~phpbb3_u=(?!1(;|$))"     "1";
+    "~phpbb3_k=[^;\s]+"        "1";
 }
-
 cache_turbo_bypass   $phpbb_user;
 cache_turbo_no_store $phpbb_user;
 ```
 
-Without that `map`, the preset skips phpBB's `.php` entry scripts and nothing
-else — a logged-in member's page is a cache candidate like any other.
+**You can delete all of it.** The preset now does this itself, and does it
+prefix-agnostically — which the `map` above did not: it hardcodes `phpbb3_`, so
+it silently stopped protecting you if the ACP cookie name ever changed.
 
-## The preset ships no cookie rule — read this
-
-| Check | Values |
-|---|---|
-| URI prefixes | `/ucp.php`, `/mcp.php`, `/adm/`, `/posting.php`, `/memberlist.php`, `/search.php`, `/report.php` |
-| Query args | `sid` |
-| Cookie substrings | **— (none)** |
-
-phpBB sets three cookies: `<prefix>_u` (user id), `<prefix>_k` (persistent-login
-key) and `<prefix>_sid` (session id). Two separate things make them unshippable
-as preset rules, and you need both to see why the row is empty.
-
-**1. The prefix is not stable.** The cookie name is `$config['cookie_name']`,
-set in the ACP and *randomised by many installers* — `phpbb3_`, `phpbb3_a1b2c`,
-or whatever the admin typed. There is no substring the module could ship that
-matches your board and not somebody else's. (Same problem as Joomla, different
-cause.)
-
-**2. Even with a known prefix, presence is the wrong test.** This is the part
-that surprises people. From `phpbb/session.php`, inside `session_create()`:
-
-```php
-if (!$bot)
-{
-    $this->set_cookie('u',   $this->cookie_data['u'], $cookie_expire);
-    $this->set_cookie('k',   $this->cookie_data['k'], $cookie_expire);
-    $this->set_cookie('sid', $this->session_id,       $cookie_expire);
-}
-```
-
-That block is guarded on `$bot` — **not on whether anyone is logged in.** Every
-non-bot visitor, including a first-time anonymous reader, walks away with all
-three cookies. The guest's `_u` is `1` (phpBB's `ANONYMOUS` user id) and their
-`_k` is empty, but the *cookies are there*.
-
-So telling a member from a guest needs a **value** test — `_u != 1`, or `_k`
-non-empty. The preset registry matches cookie-name **substrings**: it can ask
-"is this cookie present?", never "what is it set to?". A `_sid` or `_u` rule in
-the preset would therefore match **every anonymous visitor**, take your hit rate
-to approximately zero, *and still* not identify a logged-in one. It would be
-worse than useless.
-
-The honest answer is to ship no cookie rule and hand you the value test, which
-nginx's `map` can express and the preset cannot.
-
-> **Why not just fix the preset to support values?** Because a per-cookie value
-> predicate is a real feature with real syntax, and `map` already does it well.
-> If you think the module should grow one, that's a reasonable feature request —
-> but a broken rule shipped today is not a down payment on it.
-
-phpBB also does **not** reliably send `Cache-Control: private` on authenticated
-views, so unlike Drupal or MediaWiki you cannot fall back on the origin
-defending itself. On phpBB the bypass is the whole safety story.
-
-## Finding your cookie prefix
-
-ACP → Server Configuration → Cookie Settings → **Cookie name**. Or straight from
-the database:
-
-```sql
-SELECT config_value FROM phpbb_config WHERE config_name = 'cookie_name';
-```
-
-Or just log in and look:
-
-```bash
-curl -sI https://forum.example.com/ucp.php?mode=login | grep -i set-cookie
-# Set-Cookie: phpbb3_a1b2c_sid=...; Set-Cookie: phpbb3_a1b2c_u=1; ...
-#             ^^^^^^^^^^^^^ your prefix
-```
-
-Note the guest response already carries `_u=1` and a `_sid`. That is the whole
-point of this page.
-
-## Writing the bypass
-
-Substitute your prefix into both patterns:
-
-```nginx
-map $http_cookie $phpbb_user {
-    default                "";
-
-    # _u is present and is NOT "1" (ANONYMOUS). The negative lookahead is what
-    # separates a member from a guest; a plain "_u=" match would hit both.
-    "~phpbb3_u=(?!1(;|$))" "1";
-
-    # persistent "remember me" key, set only for a registered user who ticked it
-    "~phpbb3_k=[^;\s]+"    "1";
-}
-```
-
-`_sid` is deliberately absent from the map too — every guest has one, so matching
-it would bypass everybody.
-
-Check the map does what you think before you trust it:
-
-```bash
-# guest -> "" (cacheable)
-curl -s -o /dev/null -w '%{http_code}\n' -H 'Cookie: phpbb3_sid=x; phpbb3_u=1; phpbb3_k=' \
-     https://forum.example.com/viewtopic.php?t=1
-
-# member -> "1" (bypass)
-curl -s -o /dev/null -w '%{http_code}\n' -H 'Cookie: phpbb3_sid=x; phpbb3_u=42; phpbb3_k=beef' \
-     https://forum.example.com/viewtopic.php?t=1
-```
-
-(Add `add_header X-Cache-Turbo $cache_turbo_status always;` and read that header
-rather than the status code — see [Checking it works](#checking-it-works).)
+Keeping the `map` is harmless (the two rules agree), but it is dead weight and it
+will drift. Note it also needs PCRE, which the module's own matcher does not.
 
 ## Vhost
 
@@ -149,12 +84,6 @@ load_module modules/ngx_http_cache_turbo_module.so;
 
 http {
     cache_turbo_zone name=ct 256m;
-
-    map $http_cookie $phpbb_user {
-        default                "";
-        "~phpbb3_u=(?!1(;|$))" "1";
-        "~phpbb3_k=[^;\s]+"    "1";
-    }
 
     server {
         listen 443 ssl http2;
@@ -169,10 +98,8 @@ http {
         location ~ \.php$ {
             cache_turbo               ct;
             cache_turbo_backend       phpbb;
-
-            # NOT OPTIONAL. The preset ships no cookie rule (see docs).
-            cache_turbo_bypass        $phpbb_user;
-            cache_turbo_no_store      $phpbb_user;
+            # The preset carries the _u != 1 value predicate: logged-in members
+            # bypass automatically. No map, no cache_turbo_bypass needed.
 
             cache_turbo_valid         60s;
             cache_turbo_valid         404 410 1m;
@@ -212,35 +139,41 @@ add_header X-Cache-Turbo $cache_turbo_status always;
 
 ```bash
 # anonymous topic: MISS then HIT
-curl -sI https://forum.example.com/viewtopic.php?t=1 | grep -i x-cache-turbo
-curl -sI https://forum.example.com/viewtopic.php?t=1 | grep -i x-cache-turbo  # HIT
+curl -s -o /dev/null -D- https://forum.example.com/viewtopic.php?t=1 | grep -i x-cache-turbo
+curl -s -o /dev/null -D- https://forum.example.com/viewtopic.php?t=1 | grep -i x-cache-turbo  # HIT
 
 # UCP / posting / admin: BYPASS (this is what the preset gives you)
-curl -sI https://forum.example.com/ucp.php | grep -i x-cache-turbo
+curl -s -o /dev/null -D- https://forum.example.com/ucp.php | grep -i x-cache-turbo
 
 # A GUEST carrying the full cookie set must still be a HIT. If this says BYPASS,
 # your map is matching _sid or a bare _u= and you have destroyed your hit rate.
-curl -sI -H 'Cookie: phpbb3_sid=x; phpbb3_u=1; phpbb3_k=' \
+curl -s -o /dev/null -D- -H 'Cookie: phpbb3_sid=x; phpbb3_u=1; phpbb3_k=' \
      https://forum.example.com/viewtopic.php?t=1 | grep -i x-cache-turbo   # HIT
 
 # THE ONE THAT MATTERS: a logged-in member must be BYPASS. If this says HIT/MISS,
-# your cache_turbo_bypass is wrong and you are one request away from serving a
-# member's page -- with their username and unread PM count -- to the public.
-curl -sI -H 'Cookie: phpbb3_sid=x; phpbb3_u=42; phpbb3_k=beef' \
+# the preset is not active on this location -- you are one request away from
+# serving a member's page, with their username and unread PM count, to the public.
+curl -s -o /dev/null -D- -H 'Cookie: phpbb3_sid=x; phpbb3_u=42; phpbb3_k=beef' \
      https://forum.example.com/viewtopic.php?t=1 | grep -i x-cache-turbo   # BYPASS
 ```
 
-Run **both** of those last two against your real prefix before you go live. The
-guest check protects your hit rate; the member check protects your users.
+Run **both** of those last two before you go live. The guest check protects your
+hit rate; the member check protects your users. Use your board's real prefix if
+you like — but the member check should pass with *any* prefix, because the name is
+matched by suffix. That is worth confirming on your own board.
+
+> These probes use `GET` (`-s -o /dev/null -D-`), not `curl -sI`. A `HEAD` request
+> is **never stored** by the module, so `curl -sI` can never show you a `HIT` — it
+> will make a working cache look broken.
 
 ## Gotchas
 
-- **The preset does not cover logged-in users.** `cache_turbo_backend phpbb;`
-  without the `map` + `cache_turbo_bypass` is not a safe config. This is the one
-  real footgun.
 - **`_sid` is not an auth cookie.** Neither is a bare `_u=`. Guests have both.
   Bypassing on either is the classic mistake and it costs you the entire cache.
-- **Changing the cookie name in the ACP silently breaks your map.** Re-check
+  (This is why the preset tests the `_u` **value** and ignores `_sid` entirely.)
+- **Renaming the cookie in the ACP is safe** for the preset — the name is matched
+  by suffix (`_u`), so any prefix works. It is **not** safe for a hand-written
+  `map` that hardcodes `phpbb3_`; if you still have one, delete it.
   after any ACP cookie change.
 - **`?sid=` in URLs.** With `session.force_sid` on, phpBB appends the session id
   to links. The preset bypasses on the `sid` arg — it is both a dynamic marker

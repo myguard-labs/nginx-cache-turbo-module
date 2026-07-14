@@ -470,7 +470,7 @@ per-session suffixes, so it matches as a substring).
 | `joomla`      | `/administrator/` | — | `joomla_remember_me_` ‡ |
 | `xenforo` † ¤ | `/admin.php`, `/install/`, `/login`, `/logout`, `/lost-password`, `/register`, `/account`, `/conversations`, `/direct-messages`, `/misc` | — | `xf_session`, `xf_user`, `xf_session_admin`, `xf_lscxf_logged_in` |
 | `discourse` † | `/admin`, `/session`, `/auth/`, `/login`, `/logout`, `/signup`, `/my/`, `/message-bus/`, `/drafts`, `/presence/`, `/notifications`, `/user_actions` | `api_key`, `api_username` | `_t=` |
-| `phpbb` †     | `/ucp.php`, `/mcp.php`, `/adm/`, `/posting.php`, `/memberlist.php`, `/search.php`, `/report.php` | `sid` | — ‡ |
+| `phpbb` †     | `/ucp.php`, `/mcp.php`, `/adm/`, `/posting.php`, `/memberlist.php`, `/search.php`, `/report.php` | `sid` | *(value)* `…_u != 1` ∆ |
 | `drupal` †    | `/user`, `/admin`, `/node/add`, `/system/`, `/core/install.php` | — | `SESS` ¥ |
 | `mediawiki` † | — ¶ | `veaction`, `returnto` | `Token=`, `_session=`, `UserID=` |
 | `magento` †   | `/checkout`, `/customer`, `/graphql`, `/sales`, `/newsletter`, `/wishlist`, `/paypal`, `/review`, `/page_cache/block/esi`, `/health_check.php` | — | `X-Magento-Vary` |
@@ -497,13 +497,33 @@ path-based pass rule at all. The cookie rules plus the Cache-Control floor are
 the whole mechanism. Do not re-add a path rule here without a source that says
 MediaWiki cannot cache it.
 
-‡ **The cookie rule is a PARTIAL guard — you must still add your own.** Two
-presets cannot fully identify a logged-in user, for different reasons:
+∆ **A cookie VALUE predicate, not a name match.** Most presets classify on cookie
+*name* presence. That is useless for an app that issues the **same** cookie to
+guests and members and puts the distinction in the **value** — a presence rule
+there matches everyone and identifies nobody. phpBB is the case: every non-bot
+visitor gets `<cookie_name>_u`, holding `1` (`ANONYMOUS`) for a guest and the
+real `user_id` for a member ([`session.php`](https://github.com/phpbb/phpbb/blob/master/phpBB/phpbb/session.php),
+[`constants.php`](https://github.com/phpbb/phpbb/blob/master/phpBB/includes/constants.php)).
+So the preset tests `…_u != 1`.
+
+The cookie **name is matched by suffix**, deliberately: the prefix is
+`config('cookie_name')` (default `phpbb`, so the wire name is `phpbb_u`), an ACP
+setting that installers randomise and that any admin running two boards on one
+domain changes. A literal-name rule silently **stops firing** on such a board —
+and a bypass rule that stops firing caches the member's page and serves it to
+strangers. Suffix matching is prefix-agnostic; it can over-match an unrelated
+cookie ending in `_u`, which costs a needless bypass and never leaks.
+
+An **unreadable** cookie (no `=`, malformed) **fails closed to bypass**: a false
+bypass costs one cache miss, a false hit costs somebody else's session.
+
+‡ **The cookie rule is a PARTIAL guard — you must still add your own.** One
+preset cannot fully identify a logged-in user:
 
 | Preset | What it can and cannot see | What you must do |
 |---|---|---|
 | `joomla` | `joomla_remember_me_` is a real fixed prefix and is auth-only — but it exists **only** for users who ticked "Remember Me". A normally-logged-in frontend user carries only the session cookie, whose name is `md5($secret . $session_name)` — a per-install hash with **no** stable substring. That user is invisible to the matcher. | **Add your own `cache_turbo_bypass`** on your install's session-cookie name if your site has frontend logins ([guide](docs/joomla.md)). Do not read the cookie rule as "handled". |
-| `phpbb` | Ships **no** cookie rule. The prefix is admin-configurable, *and* `_u`/`_k`/`_sid` are set for **guests too** (an anonymous visitor gets `_u=1`) — separating a member from a guest needs a **value** test, which a substring matcher cannot do. | **Nothing protects you by default** — add a `map`-based `cache_turbo_bypass` ([guide](docs/phpbb.md)). |
+| `phpbb` | **Handled by a cookie VALUE predicate** (∆). `_u`/`_k`/`_sid` are set for **guests too** (an anonymous visitor gets `_u=1` — `ANONYMOUS`), so presence identifies nobody; a logged-in member carries `_u=<user_id>`, never `1`. The preset now tests the **value**, matching the cookie **name by suffix** because the prefix is `config('cookie_name')` (default `phpbb`, often renamed). | **Nothing extra.** A stock `cache_turbo_backend phpbb;` now bypasses logged-in members. (Before this, it did **not** — see [guide](docs/phpbb.md).) |
 
 ¤ **`xenforo` cannot be made both safe and fast on stock XenForo.** Stock XF2 has
 **no login-only cookie**. `xf_user` is the *remember-me* cookie — `completeLogin()`
