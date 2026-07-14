@@ -5485,6 +5485,60 @@ def tag_key(name: str, prefix: str = "ct:") -> str:
     return f"{prefix}tag:{name}"
 
 
+def test_l2_tag_truncation_warns(ng: Nginx, origin: Origin,
+                                 redis: RedisServer) -> None:
+    """MAX_TAGS (16) is a deliberate DoS bound -- the tag value is
+    upstream-controlled, and each tag costs its own Redis op, so an unbounded list
+    would let one response fire a connection storm (PERF-2). The bound stays.
+
+    But hitting it SILENTLY is a correctness trap, and a real one: a Magento
+    category page emits one cat_p_<id> tag PER PRODUCT, so a 40-product page
+    overflows 16 and the tags past the cap are never indexed. A later purge of one
+    of those tags then does NOT invalidate the page -- the operator gets stale
+    content with no signal anywhere. This pins the WARNING that makes the
+    truncation diagnosable.
+
+    Asserted positively (see lessons.md): we require the warning TEXT to appear,
+    and we require it NOT to appear for an exactly-at-the-cap value -- a warning
+    that always fires is as useless as one that never does."""
+    logf = ng.root / "logs" / "error.log"
+
+    def log_text() -> str:
+        return (logf.read_text(encoding="utf-8", errors="replace")
+                if logf.exists() else "")
+
+    # Exactly 16 tags -- at the cap, nothing dropped, must NOT warn.
+    before = len(log_text())
+    at_cap = ",".join(f"t{i}" for i in range(16))
+    fetch(ng.port, f"/l2tcap/at-cap?t={at_cap}")
+    time.sleep(0.3)
+    new = log_text()[before:]
+    assert "tag list truncated" not in new, \
+        ("a value with exactly MAX_TAGS tags drops nothing and must NOT warn -- "
+         "a warning that always fires teaches the operator to ignore it")
+
+    # 17 tags -- one over. The 17th is silently unindexed, so it MUST warn.
+    before = len(log_text())
+    over = ",".join(f"x{i}" for i in range(17))
+    fetch(ng.port, f"/l2tcap/over-cap?t={over}")
+    time.sleep(0.3)
+    new = log_text()[before:]
+    assert "tag list truncated" in new, \
+        ("17 tags overflow the 16-tag cap: the 17th is NOT indexed and a purge of "
+         "it will NOT invalidate the entry. That must be logged, or the operator "
+         "sees stale content with no signal. Missing warning in:\n" + new[-800:])
+    assert "/l2tcap/over-cap" in new, \
+        "the truncation warning must name the URI it dropped tags for"
+
+    # And the dropped tag really is absent from the index -- the warning is not
+    # cosmetic, it is reporting a real loss of purgeability.
+    assert redis.cli("EXISTS", tag_key("x16")) == "0", \
+        "the 17th tag must not be indexed (it is past the cap)"
+    assert redis.cli("EXISTS", tag_key("x0")) == "1", \
+        "tags within the cap must still be indexed"
+    drain_origin(origin)
+
+
 def test_l2_tag_add_on_store(ng: Nginx, origin: Origin,
                              redis: RedisServer) -> None:
     """v2c: a tagged store SADDs the object's L2 key into every tag set named by
@@ -6677,6 +6731,7 @@ def run_all(ng: Nginx, origin: Origin,
         test_l2_malformed_blob_rejected(ng, origin, redis)  # STAB-4 validate
         test_sie_ttl_stored_in_blob(ng, origin, redis)      # RFC-2 CTB4 sie_ttl
         test_l2_tag_add_on_store(ng, origin, redis)
+        test_l2_tag_truncation_warns(ng, origin, redis)
         test_l2_tag_purge(ng, origin, redis)
         test_l2_tag_purge_large(ng, origin, redis)  # STAB-3 + PERF-1/2 pipeline
         test_l2_tag_cap_and_dedup(ng, origin, redis)  # PERF-2 tag cap/dedup
