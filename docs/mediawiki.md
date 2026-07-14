@@ -29,7 +29,7 @@ of the same job.
 
 | Check | Values |
 |---|---|
-| URI prefixes | `/index.php`, `/load.php`, `/api.php` |
+| URI prefixes | **none** — see below |
 | Query args | `veaction`, `returnto` |
 | Cookie substrings | `UserID=`, `UserName=` |
 
@@ -66,6 +66,41 @@ With the default configuration, `/wiki/<Title>` is the **cacheable read path** a
 cacheable article from an uncacheable `Special:` page — they share the `/wiki/`
 prefix, and `Special:` is *localised* (`Spezial:`, `Spécial:`) so it isn't
 reliably matchable either. The work happens in the args.
+
+## Why this preset has NO URI rules
+
+It used to have three — `/index.php`, `/load.php`, `/api.php` — and every one of
+them was a mistake. They are gone. Do not re-add them.
+
+**`/index.php` is the article read path.** The paragraph above describes a wiki
+with short URLs configured. A **stock** MediaWiki has `$wgArticlePath` set to
+`/index.php?title=$1` (or `/index.php/$1`) — i.e. on a default install
+`/index.php` *is* how every article is read. Bypassing that prefix disabled
+caching for essentially the entire wiki, silently, with a healthy-looking config.
+
+**`/load.php` and `/api.php` are among the hottest cacheable objects you have.**
+ResourceLoader bundles are versioned by a hash in the query string and are
+immutable per hash. Wikimedia's production VCL does not merely cache them, it
+*protects* them: the one rule that forces `Cache-Control: private` is scoped to
+page URLs only, with an explicit comment and two ticket numbers —
+
+```vcl
+// Only apply to pages. Don't steal cachability of api.php, load.php, etc.
+// (T102898, T113007)
+if (req.url ~ "^/wiki/" || req.url ~ "^/w/index\.php" || req.url ~ "^/\?title=") {
+    ...
+}
+```
+
+Their text frontend has **no path-based pass rule at all**. Identity is handled
+entirely by folding the session/`Token` cookies into the cache key. That is
+exactly the shape of this preset: **cookies + args + the Cache-Control floor, no
+paths.** MediaWiki already sends `private, must-revalidate, max-age=0` to a
+logged-in user, and `cache_turbo_backend` implies `cache_turbo_cache_control
+honor`, whose store path refuses `private`.
+
+If you think you have found a path MediaWiki cannot cache, find a source that
+says so before adding it here.
 
 The preset bypasses on **`veaction`** (VisualEditor — always dynamic) and
 **`returnto`** (login redirect flow). It deliberately does **not** bypass on a
@@ -165,11 +200,12 @@ http {
 }
 ```
 
-Note `/load.php` gets its own block that **overrides** the preset's bypass: the
-preset lists `/load.php` as dynamic (it is an entry script), but ResourceLoader
-URLs carry a version hash in the query string and are extremely cacheable. A
-dedicated `location` with a long TTL is the right call on a busy wiki. Drop that
-block if you'd rather keep it simple — you lose a hot cache, not correctness.
+`/load.php` gets its own block with a long TTL because ResourceLoader URLs carry
+a version hash in the query string and are immutable for that hash — they are the
+hottest cacheable objects on a wiki, and worth a dedicated `location`. It is a
+tuning win, **not** a workaround: the preset does not bypass `/load.php` (it has
+no URI rules at all), so you can drop this block and still cache it — you just
+inherit the shorter default TTL.
 
 ## Vhost + Redis L2
 

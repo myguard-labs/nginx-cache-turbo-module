@@ -11,15 +11,15 @@ One page per `cache_turbo_backend` preset:
 | Preset | Guide | Protects logged-in users out of the box? |
 |---|---|---|
 | `wordpress` | [wordpress.md](wordpress.md) | ✅ yes (`wordpress_logged_in_*`) |
-| `woocommerce` | [woocommerce.md](woocommerce.md) | ✅ yes — **but must be stacked with `wordpress`** |
+| `woocommerce` | [woocommerce.md](woocommerce.md) | ✅ yes — **but must be stacked with `wordpress`** — plus `?wc-ajax=`, a cart fragment on *any* page URL |
 | `joomla` | [joomla.md](joomla.md) | ❌ **no** — you must add a `cache_turbo_bypass` for the session cookie |
 | `xenforo` | [xenforo.md](xenforo.md) | ✅ yes (`xf_user`, `xf_session_admin`) |
 | `discourse` | [discourse.md](discourse.md) | ✅ yes (`_t`) — and the origin sends `no-store` anyway |
 | `phpbb` | [phpbb.md](phpbb.md) | ❌ **no** — you must add a `cache_turbo_bypass`, and it needs a *value* test |
 | `drupal` | [drupal.md](drupal.md) | ⚠️ via the origin — Drupal sends `Cache-Control: private`; no cookie rule shipped |
-| `mediawiki` | [mediawiki.md](mediawiki.md) | ✅ yes (`*UserID`, `*UserName`) |
+| `mediawiki` | [mediawiki.md](mediawiki.md) | ✅ yes (`*UserID`, `*UserName`) — **no URI rules: `/index.php` is the article path on a stock wiki** |
 | `magento` | [magento.md](magento.md) | ✅ yes (`X-Magento-Vary`) — and the origin sends `no-store` on cart/checkout |
-| `ghost` | [ghost.md](ghost.md) | ✅ yes (`ghost-members-ssr`) — **plus `?uuid=`/`?key=`, which auth a member with no cookie** |
+| `ghost` | [ghost.md](ghost.md) | ✅ yes (`ghost-members-ssr`) — **plus `?uuid=`/`?key=`/`?gift=`, which auth a member or unlock paid content with no cookie** |
 | `wagtail` | [wagtail.md](wagtail.md) | ⚠️ yes (`sessionid`) — **but only while nothing writes the session for guests**; fails safe |
 | `kirby` | [kirby.md](kirby.md) | ⚠️ yes (`kirby_session`) — **but a `csrf()` form page cookies guests**; fails safe |
 

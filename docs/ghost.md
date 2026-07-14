@@ -27,25 +27,32 @@ cache_turbo_backend ghost;      # implies cache_turbo_cache_control honor
 | Check | Values |
 |---|---|
 | URI prefixes | `/ghost/`, `/members/`, `/p/`, `/r/` |
-| Query args | `uuid`, `key`, `token` |
+| Query args | `uuid`, `key`, `token`, `gift` |
 | Cookie substrings | `ghost-members-ssr`, `ghost-admin-api-session` |
 
 The question that decides any preset is: *does a logged-in user change the HTML
-that a logged-out user would have seen?* For Ghost, on a **public** post, the
-answer is **no** — and that is verifiable in upstream:
+that a logged-out user would have seen?* For Ghost the answer is **yes, even on a
+fully public post** — so the bypass rules below are **load-bearing**, not
+defence-in-depth. Do not talk yourself out of them.
 
-- `checkPostAccess()` (`services/members/content-gating.js`) returns `true`
-  **immediately** when `post.visibility === 'public'`. The member is never
-  consulted; the post's `html` is untouched.
-- Content is only stripped when the visitor *lacks* access — i.e. for
-  `members`/`paid`/`tiers` posts, which are *supposed* to differ.
-- The two things that *do* vary by login state on a public post — Koenig gated
-  blocks and the Transistor embed's member-uuid substitution — only fire **when a
-  member session exists**. A logged-out stranger always renders the identical
-  non-member variant.
+It is tempting to reason that a public post is member-invariant, because
+`checkPostAccess()` (`services/members/content-gating.js`) *does* return early when
+`post.visibility === 'public'` — the post body is never gated for a public post.
+**That reasoning is wrong**, and an earlier version of this page made exactly that
+mistake:
 
-So: bypass the members, cache everyone else, and every anonymous reader shares one
-HTML. No cache-key variant is needed.
+- `@member` is injected into the template context **unconditionally** whenever a
+  member session exists (`update-local-template-options.js`) — it is not gated on
+  post visibility. A stock `{{#if @member}}` in the theme (sign-up CTA, "you're
+  subscribed" banner, member-only nav) therefore renders **different markup on a
+  fully public post**.
+- Ghost itself agrees. `frontend-caching.js` sets `Cache-Control: private` for
+  **any** request carrying a member session, without ever consulting the post's
+  visibility.
+
+So: **bypass on the member cookie, always.** Anonymous readers and crawlers — the
+bulk of a blog's traffic — still share one cached entry, which is the entire win.
+Members go to origin. That is the trade, and it is a good one.
 
 **`ghost-members-ssr`** is the members session cookie
 (`services/members/service.js`), set **only on login**. An anonymous reader gets
@@ -65,11 +72,25 @@ under a URL that anyone can request, and served to strangers.
 
 ```
 /my-post?uuid=abc-123&key=deadbeef     <- authenticated. NEVER cache.
+/my-post?gift=abc123                   <- UNLOCKED PAID CONTENT. NEVER cache.
 ```
 
-`token` is the magic-link signin. All three are in the preset. **Do not remove
-them**, and if you write your own rules for a Ghost site, do not forget them —
-this is the one non-obvious correctness item on the page.
+`token` is the magic-link signin. **`gift` is the one that bites hardest**: a
+`?gift=` render serves **unlocked gated content** — a paid post, in full — to a
+caller with *no member cookie at all*. Ghost's own cache middleware refuses to
+store it (`isGiftRequest()`) for precisely this reason. Cache it and you are
+publishing your paid archive.
+
+All four are in the preset. **Do not remove them**, and if you write your own
+rules for a Ghost site, do not forget them — this is the one non-obvious
+correctness item on the page.
+
+Do not lean on the Cache-Control floor to save you here, either. It normally
+would (Ghost sends `private`/`no-store`, and the module refuses to store those,
+and never stores a `Set-Cookie` response) — but an operator running
+`cache_turbo_cache_control ignore`, which this project's README recommends for
+origins that blanket everything with `max-age=0`, has switched that floor **off**.
+The arg rules are what hold in that configuration.
 
 ## Vhost
 
@@ -161,13 +182,16 @@ query string is the one people miss.
 
 ## Gotchas
 
-- **`?uuid=` / `?key=` authenticate a member without a cookie.** Repeated because
-  it is the only genuinely surprising thing about Ghost. A rule set that bypasses
-  only on the cookie is **not** safe.
-- **A public post is identical for members and strangers**, so bypassing the
-  members cookie costs you only the members' own page views — not the shared
-  cache. Members are a small fraction of a typical blog's traffic; anonymous
-  readers and crawlers are the bulk, and they all share one entry.
+- **`?uuid=` / `?key=` / `?gift=` authenticate or unlock without a cookie.**
+  Repeated because it is the only genuinely surprising thing about Ghost. A rule
+  set that bypasses only on the cookie is **not** safe — `?gift=` in particular
+  hands out full paid content to a caller with no session.
+- **A public post is NOT identical for members and strangers.** `@member` is in
+  the template context whenever a session exists, regardless of the post's
+  visibility, so `{{#if @member}}` changes public-post markup. Bypass on the
+  member cookie unconditionally. The cost is only the members' own page views;
+  anonymous readers and crawlers are the bulk of the traffic and they all still
+  share one cache entry.
 - **Gated posts are protected by the origin too.** A `members`/`paid` post served
   to a non-member is a *different, smaller* HTML — but Ghost also marks
   member/admin routes `no-store`, and `cache_turbo_backend` implies

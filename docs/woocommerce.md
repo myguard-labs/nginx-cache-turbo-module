@@ -35,7 +35,7 @@ not a default. Both spellings are now a config error that names the replacement.
 | Check | Values |
 |---|---|
 | URI prefixes | `/cart`, `/checkout`, `/my-account` |
-| Query args | — |
+| Query args | `wc-ajax` |
 | Cookie substrings | `woocommerce_items_in_cart`, `woocommerce_cart_hash`, `wp_woocommerce_session_` |
 
 Plus everything the `wordpress` preset skips, when stacked.
@@ -195,9 +195,15 @@ about to be wrong for somebody.
   (`/fr/panier`), and the preset will not match them. Add a `map`-driven
   `cache_turbo_bypass` for the translated paths; the *cookie* half of the preset
   is path-independent and keeps protecting you regardless.
-- **Cart fragments.** WooCommerce refreshes the cart widget over AJAX
-  (`?wc-ajax=get_refreshed_fragments`). Make sure that request is never cached
-  (see the `location` above) — a cached fragment response is a leaked basket.
+- **Cart fragments — the preset now covers this, and it is the reason the arg rule
+  exists.** WooCommerce refreshes the cart widget over AJAX, and its endpoints have
+  **no path of their own**: `get_endpoint()` builds `currentpageurl?wc-ajax=name`,
+  so a fragment call is a request to an *ordinary, cacheable page URL* —
+  `/?wc-ajax=get_refreshed_fragments` is a request to your **home page**. None of
+  `/cart`, `/checkout` or `/my-account` match it. The response body is that
+  shopper's basket, and a cached fragment is a leaked basket served to every
+  subsequent visitor. The `wc-ajax` arg rule is what closes this; it is the one
+  WooCommerce leak path that no URI rule can reach.
 - **Prices per customer role** (wholesale plugins, tax by geography) make product
   pages *not* shared even for anonymous visitors. If you run one of those, the
   page cache needs the role/region in the key, or it needs to be off. This preset
