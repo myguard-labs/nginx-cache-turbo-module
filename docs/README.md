@@ -21,6 +21,19 @@ One page per `cache_turbo_backend` preset:
 | `magento` | [magento.md](magento.md) | ✅ yes (`X-Magento-Vary`) — and the origin sends `no-store` on cart/checkout |
 | `ghost` | [ghost.md](ghost.md) | ✅ yes (`ghost-members-ssr`) — **plus `?uuid=`/`?key=`, which auth a member with no cookie** |
 
+## Not an app — a framework? (Django, Laravel, Rails, …)
+
+[frameworks.md](frameworks.md). There is **no `django` or `laravel` preset**, and
+there will not be one: a framework supplies none of the three literals a preset is
+made of. Laravel's session cookie is `<APP_NAME>_session` (per-install) *and* is
+handed to every guest unconditionally; Django's `sessionid` is only guest-free
+until someone adds an anonymous cart. The guide gives you the three `curl`s that
+derive the correct rule for **your** app, and the `cache_turbo_cache_control honor;`
+default that is safe before you do.
+
+If you run an *application* that is built on a framework — Discourse is Rails,
+Magento is Symfony — use that app's preset above, not that page.
+
 ## Every preset is opt-in
 
 Name the backends you actually run. They stack, and spaces and `|` are
@@ -163,6 +176,12 @@ requests are pages a logged-out stranger can see, that look the same for every
 logged-out stranger?* If the answer is "basically none", the app does not want a
 page cache, and no preset will change that. Note this is **not** about whether the
 app is proxied or PHP or Rails — it is only about the anonymous-shared fraction.
+
+**Frameworks fail this test differently: they cannot be *asked* it.** Django,
+Laravel, Rails and friends do not have an anonymous-shared fraction — the code
+written on top of them does. A framework preset would be guessing about an app we
+have never seen, so instead there is [frameworks.md](frameworks.md), which teaches
+the derivation rather than shipping a guess.
 
 ## The rule the presets encode
 
