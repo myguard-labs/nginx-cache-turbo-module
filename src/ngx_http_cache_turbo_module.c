@@ -1387,7 +1387,19 @@ static const char *const  ct_woo_cookies[] = {
     "wp_woocommerce_session_", NULL };
 static const char *const  ct_woo_uris[] = {
     "/cart", "/checkout", "/my-account", NULL };
-static const char *const  ct_woo_args[] = { NULL };
+/*
+ * wc-ajax is LOAD-BEARING, not decoration — it is the one WooCommerce rule that
+ * no URI prefix can substitute for. WC's AJAX endpoints do not live under a path
+ * of their own: they ride on WHATEVER page the shopper is on, as a query arg
+ * (includes/class-wc-ajax.php::get_endpoint() -> "currentpageurl?wc-ajax=name").
+ * So `/?wc-ajax=get_refreshed_fragments` is a request to the CACHED HOME PAGE,
+ * and none of /cart, /checkout, /my-account match it.
+ *
+ * The response is that shopper's cart-fragment HTML. Store it and the next
+ * visitor is served someone else's cart. This is the only cross-customer leak
+ * path the URI rules cannot close, which is why it is an ARG rule.
+ */
+static const char *const  ct_woo_args[] = { "wc-ajax", NULL };
 
 static const char *const  ct_joomla_cookies[] = { NULL };
 static const char *const  ct_joomla_uris[] = { "/administrator/", NULL };
@@ -1525,11 +1537,31 @@ static const char *const  ct_drupal_args[] = { NULL };
  * logged-in user (Output/OutputPage.php), which the implied cache_control honor
  * already refuses to store. Upstream's own recommended Varnish VCL leans on
  * exactly this: cookies plus Cache-Control, no path rules.
+ *
+ * THERE ARE NO URI RULES, and that is the whole point — it is what "no path
+ * rules" above actually means. Three used to be here; all three were wrong:
+ *
+ *   /index.php  On a STOCK wiki $wgArticlePath is /index.php?title=Foo (or
+ *               /index.php/Foo) — i.e. /index.php IS the article read path. This
+ *               rule bypassed 100% of article reads on any wiki without short-URL
+ *               rewrites. It was the single worst rule in the registry.
+ *   /load.php   ResourceLoader: versioned, long-TTL JS/CSS bundles — the hottest
+ *               cacheable objects on the site.
+ *   /api.php    Same class.
+ *
+ * Wikimedia's production VCL does not merely cache the latter two, it RING-FENCES
+ * them, by ticket number, against a rule that would have made them private:
+ *   // Only apply to pages. Don't steal cachability of api.php, load.php, etc.
+ *   // (T102898, T113007)
+ *   if (req.url ~ "^/wiki/" || req.url ~ "^/w/index\.php" || ...)
+ * Their frontend has NO path-based pass rule at all — identity is handled purely
+ * by folding the session/Token cookies into the hash. The cookies below plus the
+ * Cache-Control floor are the entire mechanism, upstream and here. Do not
+ * re-add a path rule without a source that says MediaWiki cannot cache it.
  */
 static const char *const  ct_mw_cookies[] = {
     "UserID=", "UserName=", NULL };
-static const char *const  ct_mw_uris[] = {
-    "/index.php", "/load.php", "/api.php", NULL };
+static const char *const  ct_mw_uris[] = { NULL };
 static const char *const  ct_mw_args[] = { "veaction", "returnto", NULL };
 
 /*
@@ -1595,25 +1627,37 @@ static const char *const  ct_magento_uris[] = {
 static const char *const  ct_magento_args[] = { NULL };
 
 /*
- * Ghost (5.x/6.x). The public blog is a large, genuinely shared anonymous surface
- * — and, decisively, a member session does NOT change the HTML of a fully public
- * post: checkPostAccess() (services/members/content-gating.js) returns early when
- * visibility === 'public' without consulting the member. Gated blocks and member
- * substitutions only fire when a member session EXISTS, so a logged-out reader
- * always renders the identical non-member variant. That is exactly why a bypass
- * cookie suffices and no cache-key variant is needed.
+ * Ghost (5.x/6.x). The public blog is a large, genuinely shared anonymous surface,
+ * which is what makes it worth caching at all.
+ *
+ * DO NOT reason "a member sees the same HTML as a guest on a public post." It is
+ * FALSE, and an earlier version of this comment said it. checkPostAccess()
+ * (services/members/content-gating.js) does early-return on visibility ===
+ * 'public' — but `@member` is injected into the template context UNCONDITIONALLY
+ * whenever req.member exists (update-local-template-options.js), so a stock
+ * {{#if @member}} in the theme changes the markup of a FULLY PUBLIC post. Ghost
+ * itself agrees: frontend-caching.js sets `Cache-Control: private` for ANY member
+ * request without ever consulting visibility. The cookie bypass below is what
+ * keeps this correct — it is load-bearing, not defence-in-depth.
  *
  * ghost-members-ssr is the members session cookie (services/members/service.js),
  * set ONLY on login — an anonymous reader gets no cookie at all, which is the
  * property Moodle and the PHP shops lack. The substring also covers the
  * ghost-members-ssr.sig signature cookie, so one entry does both.
  *
- * THE ARGS ARE LOAD-BEARING, not decoration. authMemberByUuid()
- * (services/members/middleware.js) authenticates a member purely from the QUERY
- * STRING — ?uuid=&key= — with NO cookie involved. Without bypassing those, a
- * response authenticated by uuid could be stored and served to strangers. `token`
- * is the magic-link signin. This is the one non-obvious correctness item in the
- * preset; do not drop it.
+ * THE ARGS ARE LOAD-BEARING, not decoration — each one authenticates or unlocks
+ * WITHOUT A COOKIE, so the cookie rule above cannot catch them:
+ *   uuid + key  authMemberByUuid() (services/members/middleware.js) authenticates
+ *               a member purely from the QUERY STRING, HMAC-verifying key against
+ *               uuid. No cookie is involved at any point.
+ *   token       the magic-link signin.
+ *   gift        a ?gift render serves UNLOCKED GATED CONTENT with no member
+ *               cookie present. Ghost's own cache middleware refuses to store it
+ *               for exactly this reason (isGiftRequest()).
+ * Store any of these and the paid/gated body is replayed to strangers. Do not
+ * drop them, and do not assume the Cache-Control floor covers you: an operator
+ * running `cache_turbo_cache_control ignore` (which the README recommends for
+ * some origins) has switched that floor off.
  *
  * /p/ is unpublished post previews (must never be cached) and /r/ is the
  * link-redirect tracker.
@@ -1623,7 +1667,7 @@ static const char *const  ct_ghost_cookies[] = {
 static const char *const  ct_ghost_uris[] = {
     "/ghost/", "/members/", "/p/", "/r/", NULL };
 static const char *const  ct_ghost_args[] = {
-    "uuid", "key", "token", NULL };
+    "uuid", "key", "token", "gift", NULL };
 
 /*
  * Wagtail (Django CMS). The first preset for an app whose auth cookie belongs to

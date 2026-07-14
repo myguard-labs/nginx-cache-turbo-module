@@ -466,24 +466,36 @@ per-session suffixes, so it matches as a substring).
 | Preset | URI prefixes | Query args | Cookie substrings |
 |---|---|---|---|
 | `wordpress`   | `/wp-admin/`, `/wp-login.php`, `/wp-cron.php`, `/xmlrpc.php`, `/wp-json/` | `preview`, `s` | `wordpress_logged_in_`, `wp-postpass_`, `comment_author_` |
-| `woocommerce` | `/cart`, `/checkout`, `/my-account` | — | `woocommerce_items_in_cart`, `woocommerce_cart_hash`, `wp_woocommerce_session_` |
+| `woocommerce` | `/cart`, `/checkout`, `/my-account` | `wc-ajax` | `woocommerce_items_in_cart`, `woocommerce_cart_hash`, `wp_woocommerce_session_` |
 | `joomla`      | `/administrator/` | — | — ‡ |
 | `xenforo` †   | `/admin.php`, `/install/`, `/login`, `/logout`, `/lost-password`, `/register`, `/account`, `/conversations`, `/direct-messages`, `/contact`, `/misc` | — | `xf_user`, `xf_session_admin` |
 | `discourse` † | `/admin`, `/session`, `/auth/`, `/login`, `/logout`, `/signup`, `/u/`, `/my/`, `/message-bus/`, `/draft`, `/presence/`, `/notifications`, `/user_actions` | `api_key`, `api_username` | `_t=` |
 | `phpbb` †     | `/ucp.php`, `/mcp.php`, `/adm/`, `/posting.php`, `/memberlist.php`, `/search.php`, `/report.php` | `sid` | — ‡ |
 | `drupal` †    | `/user`, `/admin`, `/node/add`, `/system/`, `/core/install.php` | — | — ‡ |
-| `mediawiki` † | `/index.php`, `/load.php`, `/api.php` | `veaction`, `returnto` | `UserID=`, `UserName=` |
+| `mediawiki` † | — ¶ | `veaction`, `returnto` | `UserID=`, `UserName=` |
 | `magento` †   | `/checkout`, `/customer`, `/graphql`, `/sales`, `/newsletter`, `/wishlist`, `/paypal`, `/review`, `/page_cache/block/esi`, `/health_check.php` | — | `X-Magento-Vary` |
-| `ghost` †     | `/ghost/`, `/members/`, `/p/`, `/r/` | `uuid`, `key`, `token` | `ghost-members-ssr`, `ghost-admin-api-session` |
+| `ghost` †     | `/ghost/`, `/members/`, `/p/`, `/r/` | `uuid`, `key`, `token`, `gift` | `ghost-members-ssr`, `ghost-admin-api-session` |
 | `wagtail` † § | `/admin/`, `/django-admin/`, `/documents/` | — | `sessionid` |
 | `kirby` † §   | `/panel` | — | `kirby_session` |
 
 † **Opt-in, like every preset.** These backends' dynamic surfaces are generic
-English paths (`/login`, `/register`, `/user`, `/admin`, `/session`,
-`/index.php`) that an unrelated site may legitimately serve as perfectly
-cacheable pages. Enabling one you do not run punches holes in your own cache —
-which is why none of them is ever enabled implicitly, and why the old `generic`
-union is gone. Name them: `cache_turbo_backend xenforo;`.
+English paths (`/login`, `/register`, `/user`, `/admin`, `/session`) that an
+unrelated site may legitimately serve as perfectly cacheable pages. Enabling one
+you do not run punches holes in your own cache — which is why none of them is
+ever enabled implicitly, and why the old `generic` union is gone. Name them:
+`cache_turbo_backend xenforo;`.
+
+¶ **`mediawiki` deliberately ships NO URI rule**, and that is the correct shape —
+it is what upstream does. It used to bypass `/index.php`, `/load.php` and
+`/api.php`; all three were wrong. On a stock wiki `$wgArticlePath` is
+`/index.php?title=Foo`, so **`/index.php` is the article read path** — that rule
+bypassed essentially every article read. `/load.php` (ResourceLoader) and
+`/api.php` are among the hottest *cacheable* objects on a wiki; Wikimedia's
+production VCL explicitly ring-fences them, by ticket number (T102898, T113007),
+against a rule that would have made them private. Their frontend has no
+path-based pass rule at all. The cookie rules plus the Cache-Control floor are
+the whole mechanism. Do not re-add a path rule here without a source that says
+MediaWiki cannot cache it.
 
 ‡ **Ships no cookie rule — read the guide before relying on it.** Three presets
 cannot match a session cookie at all, for two different reasons, and the

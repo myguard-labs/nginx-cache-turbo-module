@@ -1101,11 +1101,14 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
-        # cache_turbo_backend woocommerce only: composes just that preset
+        # cache_turbo_backend woocommerce only: composes just that preset.
+        # NOTE the key includes the query string: ?wc-ajax= rides on an ORDINARY
+        # page URL, so this location is exactly the "cacheable page that an AJAX
+        # call is layered onto" shape the wc-ajax arg rule has to catch.
         location /woo/ {{
             cache_turbo         main;
             cache_turbo_backend woocommerce;
-            cache_turbo_key     $uri;
+            cache_turbo_key     $uri$is_args$args;
             cache_turbo_valid   30s;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
@@ -2265,6 +2268,36 @@ def test_auto_backend_composition(ng: Nginx, origin: Origin) -> None:
     drain_origin(origin)
 
 
+def test_woocommerce_wc_ajax(ng: Nginx, origin: Origin) -> None:
+    """?wc-ajax= is the one WooCommerce leak path that NO URI rule can close.
+
+    WC's AJAX endpoints have no path of their own — get_endpoint() builds
+    "currentpageurl?wc-ajax=name", so a cart-fragment call is a request to an
+    ORDINARY, CACHEABLE page URL carrying a query arg. /cart, /checkout and
+    /my-account all fail to match it. The response body is that shopper's cart
+    HTML; store it and the next visitor is served someone else's cart.
+
+    So: the same page URL must CACHE when plain, and BYPASS the moment wc-ajax
+    appears. Both halves are asserted — a bypass-everything bug would pass the
+    second assertion alone."""
+    # The bare page is a normal cacheable page.
+    fetch(ng.port, "/woo/shop-front")
+    _, _, hp = fetch(ng.port, "/woo/shop-front")
+    assert hp.get("x-cache") == "HIT", \
+        f"woo: a plain shop page must cache, got {hp.get('x-cache')}"
+
+    # The SAME page with ?wc-ajax= is a per-shopper cart fragment -> must bypass.
+    for uri in ("/woo/shop-front?wc-ajax=get_refreshed_fragments",
+                "/woo/shop-front?wc-ajax=update_order_review",
+                "/woo/?wc-ajax=checkout"):
+        _, _, h1 = fetch(ng.port, uri)
+        _, _, h2 = fetch(ng.port, uri)
+        assert "x-cache" not in h1 and "x-cache" not in h2, \
+            (f"woo: {uri} is a per-shopper cart fragment on an ordinary page URL "
+             "-- it must bypass or one shopper's cart is served to everyone")
+    drain_origin(origin)
+
+
 def test_xenforo_preset(ng: Nginx, origin: Origin) -> None:
     """XenForo preset (docs/xenforo.md). Two auth cookies bypass; the two
     NON-auth cookies must keep caching. That second half is the whole point:
@@ -2421,10 +2454,22 @@ def test_mediawiki_preset(ng: Nginx, origin: Origin) -> None:
     The negative half matters as much as the positive one: action=raw,
     action=history, diff= and oldid= are deterministic, shared and hot — they
     must stay CACHEABLE. Bypassing them is a measurable hit-rate loss, which is
-    why a blanket "presence of action= => bypass" rule was rejected."""
-    # Entry scripts are dynamic.
-    _, _, h = fetch(ng.port, "/index.php?title=Foo&action=edit")
-    assert "x-cache" not in h, "/index.php must bypass on the mediawiki preset"
+    why a blanket "presence of action= => bypass" rule was rejected.
+
+    THE PRESET HAS NO URI RULES. It used to bypass /index.php, /load.php and
+    /api.php; all three were wrong. On a stock wiki $wgArticlePath is
+    /index.php?title=Foo, so /index.php IS the article read path — that rule
+    bypassed 100% of article reads. /load.php (ResourceLoader) and /api.php are
+    the hottest cacheable objects on the site; Wikimedia's VCL ring-fences them
+    against being made private, by ticket number (T102898, T113007)."""
+    # /index.php IS the article path on a stock wiki -- it must CACHE, not bypass.
+    # This assertion is inverted from the original preset on purpose: it is the
+    # regression guard for the worst rule the registry ever shipped.
+    fetch(ng.port, "/index.php?title=Foo")
+    _, _, h = fetch(ng.port, "/index.php?title=Foo")
+    assert h.get("x-cache") == "HIT", \
+        ("/index.php?title= is the ARTICLE READ PATH on a stock wiki "
+         f"($wgArticlePath) -- it must cache, got {h.get('x-cache')}")
 
     # VisualEditor is always dynamic.
     _, _, hv = fetch(ng.port, "/wiki/Foo?veaction=edit")
@@ -2507,15 +2552,18 @@ def test_magento_preset(ng: Nginx, origin: Origin) -> None:
 def test_ghost_preset(ng: Nginx, origin: Origin) -> None:
     """Ghost preset (docs/ghost.md).
 
-    The public blog is a genuinely shared anonymous surface: a member session does
-    not change the HTML of a fully public post (checkPostAccess() returns early on
-    visibility === 'public'), so a bypass cookie is sufficient and no cache-key
-    variant is needed.
+    The public blog is a genuinely shared anonymous surface, which is what makes
+    it worth caching. Note it is NOT true that a member sees the same HTML as a
+    guest on a public post -- `@member` is injected into the template context
+    unconditionally, so {{#if @member}} changes the markup of a fully public post.
+    The cookie bypass is what keeps this correct; it is load-bearing.
 
-    The query-arg rules are LOAD-BEARING, not decoration: authMemberByUuid()
-    authenticates a member purely from ?uuid=&key= with NO cookie. Without those
-    rules a member-authenticated response could be stored and served to strangers.
-    That is the one non-obvious correctness item in this preset."""
+    The query-arg rules are LOAD-BEARING too: each one authenticates or unlocks
+    with NO cookie, so the cookie rule cannot catch them. authMemberByUuid()
+    authenticates a member purely from ?uuid=&key=; ?gift= serves UNLOCKED GATED
+    content to a caller with no member cookie at all. Without these rules a
+    member-authenticated (or paid) response could be stored and served to
+    strangers. That is the sharp edge of this preset."""
     # Admin SPA / API bypasses.
     _, _, h = fetch(ng.port, "/ghost/api/admin/site")
     assert "x-cache" not in h, "/ghost/ must bypass"
@@ -2532,11 +2580,13 @@ def test_ghost_preset(ng: Nginx, origin: Origin) -> None:
     # all. If these do not bypass, a member's page gets stored and served to the
     # public. This is the sharp edge of the Ghost preset.
     for uri in ("/blog/post-b?uuid=abc-123&key=deadbeef",
-                "/blog/post-b?token=magiclink123"):
+                "/blog/post-b?token=magiclink123",
+                "/blog/post-b?gift=abc123"):
         _, _, hu = fetch(ng.port, uri)
         assert "x-cache" not in hu, \
-            (f"ghost: {uri} authenticates a member via the QUERY STRING with no "
-             "cookie -- it must bypass or a member response is served to strangers")
+            (f"ghost: {uri} authenticates a member (or unlocks gated content) via "
+             "the QUERY STRING with no cookie -- it must bypass or a member/paid "
+             "response is served to strangers")
 
     # An anonymous reader must cache -- Ghost sets no cookie for one, which is the
     # property that makes this preset worth shipping at all.
@@ -5950,6 +6000,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_suppress_native_variable(ng)
     test_auto_classify(ng, origin)
     test_auto_backend_composition(ng, origin)
+    test_woocommerce_wc_ajax(ng, origin)
     test_xenforo_preset(ng, origin)
     test_xenforo_not_in_generic(ng, origin)
     test_discourse_preset(ng, origin)
