@@ -82,14 +82,31 @@ typedef struct {
     ngx_uint_t  backend_presets;
 } ngx_http_cache_turbo_loc_conf_t;
 
-/* CMS preset bits (kept in sync with src/ngx_http_cache_turbo_module.h). */
+/*
+ * CMS preset bits — MUST mirror src/ngx_http_cache_turbo_module.h. The fuzz
+ * target compiles the sliced registry WITHOUT the real header, so a bit added
+ * there and not here fails the fuzz build with "use of undeclared identifier"
+ * (and only in CI, since extract_auto_classify.sh does not compile). Adding a
+ * preset means editing BOTH. The static assert below catches the common case.
+ */
 #define NGX_HTTP_CACHE_TURBO_BACKEND_WORDPRESS    0x0001
 #define NGX_HTTP_CACHE_TURBO_BACKEND_WOOCOMMERCE  0x0002
 #define NGX_HTTP_CACHE_TURBO_BACKEND_JOOMLA       0x0004
+#define NGX_HTTP_CACHE_TURBO_BACKEND_XENFORO      0x0008
+/* GENERIC is the union of the blindly-stackable backends only. XENFORO is
+ * deliberately excluded: its URIs (/login, /register, /contact, /misc) are
+ * generic English paths that collide with non-forum sites. */
 #define NGX_HTTP_CACHE_TURBO_BACKEND_GENERIC                                   \
     (NGX_HTTP_CACHE_TURBO_BACKEND_WORDPRESS                                    \
      | NGX_HTTP_CACHE_TURBO_BACKEND_WOOCOMMERCE                                \
      | NGX_HTTP_CACHE_TURBO_BACKEND_JOOMLA)
+
+/* Guard the invariant the fuzz driver depends on: XENFORO must not be in
+ * GENERIC (the driver arms every preset via GENERIC, so folding xenforo in
+ * would silently change what is fuzzed). */
+_Static_assert((NGX_HTTP_CACHE_TURBO_BACKEND_GENERIC
+                & NGX_HTTP_CACHE_TURBO_BACKEND_XENFORO) == 0,
+               "xenforo must stay out of GENERIC (see module header)");
 
 /* Linker stub: never called (driver keeps r->args.len == 0). */
 static ngx_int_t
