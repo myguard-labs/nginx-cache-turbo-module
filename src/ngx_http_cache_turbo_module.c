@@ -4883,6 +4883,35 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
                         clcf->backend->tag_add(clcf, store_key, tok, toklen,
                                                stale_ttl);
                     }
+
+                    /* The MAX_TAGS cap is a DoS bound (above), not a hint -- but
+                     * hitting it SILENTLY is a correctness trap: the tags past the
+                     * cap are never indexed, so a later purge of one of them does
+                     * NOT invalidate this page and the operator sees stale content
+                     * with no signal anywhere. Real origins hit this: a Magento
+                     * category page emits one cat_p_<id> tag PER PRODUCT, so a
+                     * 40-product page overflows a 16-tag cap and quietly stops
+                     * being purgeable on the dropped tags.
+                     *
+                     * Warn, once per affected response, only when tags were
+                     * actually dropped -- s < e means the tokeniser stopped early
+                     * because the cap was reached, not because the value ran out.
+                     * Skip trailing separators first so a value ending in ", "
+                     * does not report a phantom drop. */
+                    while (s < e && (*s == ' ' || *s == '\t' || *s == ','
+                                     || *s == '\r' || *s == '\n'))
+                    {
+                        s++;
+                    }
+                    if (s < e) {
+                        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                            "cache_turbo: tag list truncated at %ui tags for "
+                            "\"%V\" -- the remaining tags are NOT indexed and a "
+                            "purge of them will NOT invalidate this entry "
+                            "(raise NGX_HTTP_CACHE_TURBO_MAX_TAGS or emit fewer "
+                            "tags)", (ngx_uint_t) NGX_HTTP_CACHE_TURBO_MAX_TAGS,
+                            &r->uri);
+                    }
                 }
             }
         }

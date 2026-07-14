@@ -288,11 +288,26 @@ Note the module never stores `HEAD` responses, so a `curl -sI` HEAD request can
   ```bash
   bin/magento config:set system/full_page_cache/caching_application 1   # 1 = Built-in
   ```
-- **No tag-based purging.** Varnish invalidates by banning on Magento's
-  `X-Magento-Tags` header, so a price change appears immediately. cache-turbo has
-  no equivalent, so **content changes appear when the TTL expires**. Size
-  `cache_turbo_valid` accordingly — this is the one real capability gap versus
-  Varnish, and it is worth knowing before you drop Varnish.
+- **Tag-based purging works — wire it to `X-Magento-Tags`.** Magento already emits
+  the header Varnish bans on; point `cache_turbo_tag` at it and a price change can
+  be purged immediately instead of waiting for the TTL. Needs `cache_turbo_redis`
+  (tags live in Redis).
+
+  ```nginx
+  cache_turbo_tag $upstream_http_x_magento_tags;   # comma-separated; needs redis
+  ```
+  Then invalidate a group with `POST /_cache?tag=cat_p_42`.
+
+  **Mind the 16-tag cap.** `NGX_HTTP_CACHE_TURBO_MAX_TAGS` is 16, and Magento emits
+  **one `cat_p_<id>` tag per product on the page** — so a category page listing more
+  than ~16 products overflows it. Tags past the cap are **not indexed**, which means
+  a purge of one of them will **not** invalidate that page and you will serve stale
+  content. The module logs `tag list truncated at 16 tags` (level `warn`) naming the
+  URI whenever this happens — **watch for it**. If your catalog pages trip it, either
+  raise `NGX_HTTP_CACHE_TURBO_MAX_TAGS` and rebuild, or fall back to TTL expiry for
+  those pages. The cap is a deliberate DoS bound: the tag list is upstream-controlled
+  and each tag costs its own Redis round trip, so an unbounded list would let one
+  response fire a connection storm.
 - **`/admin` is deliberately not in the preset.** Magento randomises the admin path
   at install (`admin_` + 7 random base36 characters —
   `Framework/Setup/BackendFrontnameGenerator`), so no shippable prefix could match
