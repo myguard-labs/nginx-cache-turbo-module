@@ -85,7 +85,12 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     cookie.next = NULL;
     r.headers_in.cookie = &cookie;
 
-    clcf.backend_presets = NGX_HTTP_CACHE_TURBO_BACKEND_GENERIC;
+    /* Arm EVERY preset row, not just GENERIC — xenforo is deliberately outside
+     * the GENERIC union, so arming GENERIC alone would leave its cookie/URI
+     * lists unfuzzed. The bug class here is an OOB read while walking those
+     * lists, so every row must be walked. */
+    clcf.backend_presets = NGX_HTTP_CACHE_TURBO_BACKEND_GENERIC
+                           | NGX_HTTP_CACHE_TURBO_BACKEND_XENFORO;
 
     /* Return is 0/1; the bug class is an OOB read inside, which ASAN catches. */
     (void) ngx_http_cache_turbo_auto_skip(&r, &clcf);

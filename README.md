@@ -421,14 +421,14 @@ cache.
 
 ```nginx
 cache_turbo            ct;
-cache_turbo_backend    wordpress;          # one or more: wordpress woocommerce joomla generic
+cache_turbo_backend    wordpress;          # one or more: wordpress woocommerce joomla xenforo generic
 # cache_turbo          ct auto;            # shorthand for `cache_turbo_backend generic`
 ```
 
 Names **stack** (`cache_turbo_backend wordpress woocommerce;`), and `generic`
-(a.k.a. `auto`) is simply the **union of all three** presets — use it when you
-don't want to think about it, name the specific backend(s) when you want the
-tightest rule set.
+(a.k.a. `auto`) is the **union of `wordpress` + `woocommerce` + `joomla`** — use
+it when you don't want to think about it, name the specific backend(s) when you
+want the tightest rule set.
 
 ### What each preset skips
 
@@ -442,11 +442,74 @@ per-session suffixes, so it matches as a substring).
 | `wordpress`   | `/wp-admin/`, `/wp-login.php`, `/wp-cron.php`, `/xmlrpc.php`, `/wp-json/` | `preview`, `s` | `wordpress_logged_in_`, `wp-postpass_`, `comment_author_` |
 | `woocommerce` | `/cart`, `/checkout`, `/my-account` | — | `woocommerce_items_in_cart`, `woocommerce_cart_hash`, `wp_woocommerce_session_` |
 | `joomla`      | `/administrator/` | — | — |
-| `generic`/`auto` | union of all of the above | union | union |
+| `xenforo` †   | `/admin.php`, `/install/`, `/login`, `/logout`, `/lost-password`, `/register`, `/account`, `/conversations`, `/direct-messages`, `/contact`, `/misc` | — | `xf_user`, `xf_session_admin` |
+| `generic`/`auto` | union of `wordpress` + `woocommerce` + `joomla` | union | union |
+
+† **`xenforo` is opt-in and deliberately *not* part of `generic`.** Its dynamic
+surfaces are generic English paths (`/login`, `/register`, `/contact`, `/misc`)
+that a non-forum site may legitimately serve as perfectly cacheable pages, so
+folding it into `auto` would punch holes in unrelated sites' caches. Name it
+explicitly: `cache_turbo_backend xenforo;`.
 
 So a WordPress admin (`wordpress_logged_in_…` cookie), a `?preview=true` draft, a
-`/wp-json/` API call, a WooCommerce cart cookie, or a `/checkout` page all bypass
-the cache automatically — no hand-written `cache_turbo_bypass`/`no_store` rules.
+`/wp-json/` API call, a WooCommerce cart cookie, a `/checkout` page, or a
+logged-in XenForo member (`xf_user` cookie) all bypass the cache automatically —
+no hand-written `cache_turbo_bypass`/`no_store` rules.
+
+> **Per-application guides**, each with a copy-paste vhost (page cache + Redis
+> L2), the cookie/key decisions and the application-specific footguns:
+> [**WordPress**](docs/wordpress.md) · [**WooCommerce**](docs/woocommerce.md) ·
+> [**Joomla**](docs/joomla.md) · [**XenForo**](docs/xenforo.md) —
+> index at [`docs/`](docs/README.md).
+>
+> Two of them carry a caveat you should not skip: **`joomla` ships no cookie rule
+> at all** (Joomla's session cookie is named from a hash of the site secret, so
+> nothing generic can match it — you *must* add your own bypass or logged-in pages
+> are cacheable), and **`woocommerce` must be stacked with `wordpress`** (alone, it
+> leaves `/wp-admin/` cacheable).
+
+#### XenForo: which cookies bypass, and which belong in the key
+
+The XenForo preset bypasses on exactly two cookies, and it is worth knowing why
+the obvious third one is absent:
+
+| Cookie | Treatment | Why |
+|---|---|---|
+| `xf_user` | **bypass** | the persistent login cookie — an authenticated member |
+| `xf_session_admin` | **bypass** | the admin-CP session |
+| `xf_session` | *ignored* | XenForo issues this to **guests too**. Bypassing on it would drop every visitor who so much as touched a form out of the cache — i.e. it would silently disable caching for most of your traffic. |
+| `xf_style_variation`, `xf_language_id` | **put in the cache key** | presentation variants, not auth. They change the rendered page but the page is still *shared*. Bypassing on them means anyone who picked a dark theme never gets a cached page again. |
+
+So do **not** do this:
+
+```nginx
+# WRONG — a per-session key gives every visitor their own private copy.
+# Hit rate collapses to ~0, and logged-in pages still get *stored*.
+cache_turbo_key $host$uri$cookie_xf_session$cache_turbo_normalized_args;
+```
+
+Keying on the session cookie does not make the logged-in page safely shareable —
+it just mints one cache entry per visitor (so nothing is ever reused), while
+still **storing** authenticated HTML, which is exactly the response you least
+want on disk if the origin ever forgets a `private`. Bypassing sends it to the
+origin and never captures it. Key on the *variant*, bypass the *identity*:
+
+```nginx
+cache_turbo_backend xenforo;                       # bypasses xf_user / xf_session_admin
+cache_turbo_key     $host$uri$cookie_xf_style_variation$cache_turbo_normalized_args;
+```
+
+This is the same split LiteSpeed's own XenForo cache plugin makes (bypass on
+`xf_user`/`xf_session_admin`, *vary* on style + language).
+
+Two caveats worth checking against your install:
+
+- **Custom cookie prefix.** Both names assume XenForo's default
+  `$config['cookie']['prefix'] = 'xf_'`. If you changed it, the preset won't
+  match — add your own `cache_turbo_bypass $cookie_<prefix>user;`.
+- **A board in a subdirectory** (`/forums/…`) shifts every URI prefix above. The
+  preset matches on `r->uri` from the site root, so scope it to the board's
+  `location` (see the vhost example in [`docs/xenforo.md`](docs/xenforo.md)).
 
 ### Interactions and safety
 
@@ -749,7 +812,7 @@ http {
             # ── turn it on ──────────────────────────────────────────────
             cache_turbo                   ct;        # bind zone "ct" (or: off)
           # cache_turbo                   ct auto;   # = also cache_turbo_backend generic
-            cache_turbo_backend           generic;   # generic|wordpress|woocommerce|joomla (stackable); implies cache_control honor
+            cache_turbo_backend           generic;   # generic|wordpress|woocommerce|joomla|xenforo (stackable); implies cache_control honor
 
             # ── what is "the same page" ─────────────────────────────────
             cache_turbo_key               $host$uri$cache_turbo_normalized_args;  # the default
@@ -817,7 +880,7 @@ http {
 |---|---|---|---|
 | `cache_turbo_zone name=NAME SIZE` | `http` | — | Declare a shared-memory cache zone (min 8 pages). |
 | `cache_turbo NAME [auto]` / `off` | `server`, `location` | `off` | Turn caching on (bind a zone) or off. The optional `auto` is shorthand for `cache_turbo_backend generic` (auto-classify dynamic CMS surfaces — see below). |
-| `cache_turbo_backend NAME...` | `server`, `location` | — | Auto-classify dynamic (uncacheable) request surfaces for one or more CMS presets: `generic` (a.k.a. `auto`, the union), `wordpress`, `woocommerce`, `joomla`. A matching request (login/session cookie, admin URI, dynamic arg) skips the cache and goes straight to origin. Implies `cache_turbo_cache_control honor`. |
+| `cache_turbo_backend NAME...` | `server`, `location` | — | Auto-classify dynamic (uncacheable) request surfaces for one or more CMS presets: `generic` (a.k.a. `auto` — the union of `wordpress` + `woocommerce` + `joomla`), `wordpress`, `woocommerce`, `joomla`, `xenforo`. A matching request (login/session cookie, admin URI, dynamic arg) skips the cache and goes straight to origin. Implies `cache_turbo_cache_control honor`. **`xenforo` is not in `generic`** — its URIs (`/login`, `/register`, `/contact`, `/misc`) are generic enough to collide with non-forum sites, so it must be named explicitly ([why](#xenforo-which-cookies-bypass-and-which-belong-in-the-key)). |
 | `cache_turbo_suppress_native on` | `server`, `location` | `off` | Make `$cache_turbo_active` read `1` while cache-turbo owns a request, so a stacked native `proxy_cache` can defer via `proxy_no_cache $cache_turbo_active; proxy_cache_bypass $cache_turbo_active;`. Off (default) keeps the variable always `0` (the wiring stays inert). |
 | `cache_turbo_key STRING` | `server`, `location` | normalized | What makes two requests "the same page". The default is `$host$uri$cache_turbo_normalized_args` — Host + **normalized args** (tracking params stripped, args sorted). |
 | `cache_turbo_preset NAME` | `server`, `location` | `balanced` | `micro` / `conservative` / `balanced` / `aggressive` — sets the four knobs below at once. `micro` = 1s microcaching (valid 1s, lock_ttl 1s, ×2 stale). |

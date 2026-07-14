@@ -1117,6 +1117,45 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # xenforo preset (opt-in; deliberately NOT part of generic/auto).
+        # The preset's URI prefixes anchor at position 0 of r->uri, so /login
+        # and /misc must be real ROOT locations to be exercised at all: a
+        # /xf/login path would (correctly) never match. See docs/xenforo.md.
+        location /login {{
+            cache_turbo         main;
+            cache_turbo_backend xenforo;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        location /misc {{
+            cache_turbo         main;
+            cache_turbo_backend xenforo;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # xenforo cookie rules are path-independent, so a prefixed location is
+        # fine for those: xf_user / xf_session_admin bypass, but the guest
+        # xf_session and the xf_style_variation theme cookie must NOT.
+        location /xf/ {{
+            cache_turbo         main;
+            cache_turbo_backend xenforo;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # generic/auto: used to prove xenforo is NOT folded into the union.
+        location /gen/ {{
+            cache_turbo         main;
+            cache_turbo_backend generic;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # Q2 multi-buffer oversize: ~200 KB body, 1k cap -> mid-stream abort
         location /qbig/ {{
             cache_turbo          main;
@@ -1988,6 +2027,58 @@ def test_auto_backend_composition(ng: Nginx, origin: Origin) -> None:
     _, _, hp2 = fetch(ng.port, "/woo/wppage", headers=wp)
     assert hp2.get("x-cache") == "HIT", \
         f"woo backend should ignore a WP cookie and cache, got {hp2.get('x-cache')}"
+    drain_origin(origin)
+
+
+def test_xenforo_preset(ng: Nginx, origin: Origin) -> None:
+    """XenForo preset (docs/xenforo.md). Two auth cookies bypass; the two
+    NON-auth cookies must keep caching. That second half is the whole point:
+    xf_session is issued to GUESTS too, and xf_style_variation is just a theme
+    variant — bypassing on either would silently disable caching for most real
+    traffic, so a regression there is a performance bug, not a safety one."""
+    # URI prefixes (root locations — the prefixes anchor at position 0).
+    for uri in ("/login", "/misc/style"):
+        _, _, h = fetch(ng.port, uri)
+        assert "x-cache" not in h, f"{uri} must bypass on the xenforo preset"
+
+    # Auth cookies bypass, on an otherwise perfectly cacheable page.
+    for ck in ("xf_user=1234%2Cabcdef", "xf_session_admin=deadbeef"):
+        _, _, h1 = fetch(ng.port, "/xf/thread-a", headers={"Cookie": ck})
+        _, _, h2 = fetch(ng.port, "/xf/thread-a", headers={"Cookie": ck})
+        assert "x-cache" not in h1 and "x-cache" not in h2, \
+            f"cookie {ck.split('=')[0]} must bypass"
+
+    # Guest session cookie must NOT bypass — XF gives one to anonymous visitors.
+    guest = {"Cookie": "xf_session=guestsess123"}
+    fetch(ng.port, "/xf/thread-b", headers=guest)
+    _, _, hg = fetch(ng.port, "/xf/thread-b", headers=guest)
+    assert hg.get("x-cache") == "HIT", \
+        f"guest xf_session must stay cacheable, got {hg.get('x-cache')}"
+
+    # Theme variant cookie must NOT bypass either (it belongs in the key).
+    style = {"Cookie": "xf_style_variation=dark"}
+    fetch(ng.port, "/xf/thread-c", headers=style)
+    _, _, hs = fetch(ng.port, "/xf/thread-c", headers=style)
+    assert hs.get("x-cache") == "HIT", \
+        f"xf_style_variation must stay cacheable, got {hs.get('x-cache')}"
+    drain_origin(origin)
+
+
+def test_xenforo_not_in_generic(ng: Nginx, origin: Origin) -> None:
+    """xenforo is opt-in and must NOT be folded into generic/auto: its URIs
+    (/login, /register, /contact, /misc) are generic English words that a
+    non-forum site can legitimately serve as cacheable pages. A `generic`
+    location must therefore still cache them, and must ignore xf_ cookies."""
+    fetch(ng.port, "/gen/login")
+    _, _, h = fetch(ng.port, "/gen/login")
+    assert h.get("x-cache") == "HIT", \
+        f"generic must NOT pull in the xenforo URI rules, got {h.get('x-cache')}"
+
+    xf = {"Cookie": "xf_user=1234%2Cabcdef"}
+    fetch(ng.port, "/gen/page", headers=xf)
+    _, _, hx = fetch(ng.port, "/gen/page", headers=xf)
+    assert hx.get("x-cache") == "HIT", \
+        f"generic must NOT pull in the xenforo cookie rules, got {hx.get('x-cache')}"
     drain_origin(origin)
 
 
@@ -5116,6 +5207,8 @@ def run_all(ng: Nginx, origin: Origin,
     test_suppress_native_variable(ng)
     test_auto_classify(ng, origin)
     test_auto_backend_composition(ng, origin)
+    test_xenforo_preset(ng, origin)
+    test_xenforo_not_in_generic(ng, origin)
     test_auto_classify_more(ng, origin)
     test_q2_multibuffer_oversize(ng, origin)
     test_suppress_native_inert_on_plain_location(ng)
