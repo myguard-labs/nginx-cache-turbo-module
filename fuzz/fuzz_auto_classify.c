@@ -96,6 +96,26 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     /* Return is 0/1; the bug class is an OOB read inside, which ASAN catches. */
     (void) ngx_http_cache_turbo_auto_skip(&r, &clcf);
 
+    /* Key cookies (tier 3) have their own raw-Cookie parser, and it is the one
+     * whose output reaches the CACHE KEY — an OOB read here is worse than in
+     * auto_skip, so drive it over the same arbitrary cookie bytes. The returned
+     * ngx_str_t points INTO the cookie buffer, so touch it: an off-by-one in the
+     * value bounds only shows up when the bytes are read. */
+    {
+        ngx_str_t   kcname, kcval;
+        volatile u_char  sink = 0;
+        size_t      j;
+
+        if (ngx_http_cache_turbo_key_cookie(&r, clcf.backend_presets,
+                                            &kcname, &kcval))
+        {
+            for (j = 0; j < kcval.len; j++) {
+                sink = (u_char) (sink ^ kcval.data[j]);
+            }
+            (void) sink;
+        }
+    }
+
     free(uri_buf);
     free(ck_buf);
     return 0;

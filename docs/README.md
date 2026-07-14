@@ -18,7 +18,7 @@ One page per `cache_turbo_backend` preset:
 | `phpbb` | [phpbb.md](phpbb.md) | ❌ **no** — you must add a `cache_turbo_bypass`, and it needs a *value* test |
 | `drupal` | [drupal.md](drupal.md) | ✅ yes (`SESS`) — anon users DO get sessions, so the cookie rule is required; it over-matches `PHPSESSID` by design |
 | `mediawiki` | [mediawiki.md](mediawiki.md) | ✅ yes (`*Token`, `*_session`) — **no URI rules: `/index.php` is the article path on a stock wiki** |
-| `magento` | [magento.md](magento.md) | ✅ yes (`X-Magento-Vary`) — and the origin sends `no-store` on cart/checkout |
+| `magento` | [magento.md](magento.md) | ✅ yes (`X-Magento-Vary`, value-keyed) — and the origin sends `no-store` on cart/checkout |
 | `ghost` | [ghost.md](ghost.md) | ✅ yes (`ghost-members-ssr`) — **plus `?uuid=`/`?key=`/`?gift=`, which auth a member or unlock paid content with no cookie** |
 | `wagtail` | [wagtail.md](wagtail.md) | ⚠️ yes (`sessionid`) — **but only while nothing writes the session for guests**; fails safe |
 | `kirby` | [kirby.md](kirby.md) | ⚠️ yes (`kirby_session`) — **but a `csrf()` form page cookies guests**; fails safe |
@@ -85,15 +85,25 @@ Four rows above are load-bearing:
   second floor, Drupal sends `Cache-Control: private, must-revalidate` on
   authenticated pages, and `cache_turbo_backend` implies `cache_control honor`, which
   refuses to store that. See [drupal.md](drupal.md).
-- **`magento` bypasses `X-Magento-Vary` where upstream *keys* on it — deliberately.**
-  Magento's own Varnish VCL hashes that cookie's **value** into the cache key. This
-  registry matches cookie **presence**, never value, so keying on it would collapse
-  every non-default visitor — customer A, customer B, a EUR guest — into **one shared
-  bucket** and serve one customer's cart to another. Bypassing instead is
-  correct-but-conservative: the anonymous catalog (the bulk) still caches.
-  [magento.md](magento.md) shows the `map` that restores true value-keying — and
-  warns that `$cookie_X_Magento_Vary` **silently never matches**, because nginx does
-  not translate `-` to `_` for cookie names.
+- **`magento` value-keys `X-Magento-Vary`, exactly like upstream.** Magento's own
+  Varnish VCL hashes that cookie's **value** into the cache key
+  (`vcl_hash: hash_data(regsub(...))`) and never passes on it in `vcl_recv`. There
+  are three distinct things a preset could do with a cookie, and they are not
+  interchangeable: **bypass** (skip the cache whenever the cookie is present) is
+  what this preset used to do, and it was wrong — the cookie is a segment
+  fingerprint set on *any* non-default context (a EUR guest, a switched store
+  view), not an auth flag, and a plain anonymous visitor never gets it at all, so
+  bypassing sent every non-default anonymous visitor to origin for nothing while
+  buying no real safety (the cart is never in the cached HTML — it's fetched
+  client-side). **Presence-keying** (one cache bucket for "cookie present", no
+  matter the value) would be a genuine leak — it collapses customer A, customer B,
+  and a EUR guest into one shared entry. **Value-keying** (this preset's `key_cookies`
+  tier) folds the cookie's actual value into the cache key, giving every vary
+  context its own entry — safe, and what both of Magento's own cache
+  implementations (Varnish VCL and the built-in PHP FPC) already do. The module
+  parses the raw `Cookie:` header itself for this, which is also why
+  `$cookie_X_Magento_Vary` (nginx does not translate `-` to `_` for cookie names)
+  is no longer something you need to work around. See [magento.md](magento.md).
 - **`ghost`'s query args are load-bearing.** `authMemberByUuid()` authenticates a
   member purely from `?uuid=&key=` with **no cookie at all**, so a cookie-only rule
   set is not safe — a member's page would be stored under a URL anyone can request.
