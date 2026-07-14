@@ -1368,11 +1368,32 @@ ngx_http_cache_turbo_purge_request(ngx_http_request_t *r,
  * so, rather than shipping one that does not work; docs/<app>.md then tells the
  * operator to add their own cache_turbo_bypass.
  */
+typedef struct ngx_http_cache_turbo_cookie_pred_s
+               ngx_http_cache_turbo_cookie_pred_t;
+
+#define NGX_HTTP_CACHE_TURBO_CVOP_NE        0   /* bypass when value != literal */
+#define NGX_HTTP_CACHE_TURBO_CVOP_EQ        1   /* bypass when value == literal */
+#define NGX_HTTP_CACHE_TURBO_CVOP_NONEMPTY  2   /* bypass when value is non-empty */
+
+struct ngx_http_cache_turbo_cookie_pred_s {
+    const char  *name_suffix;  /* cookie NAME must END with this (prefix-agnostic) */
+    ngx_uint_t   op;           /* NGX_HTTP_CACHE_TURBO_CVOP_*                       */
+    const char  *value;        /* literal compared against, NULL for NONEMPTY       */
+};
+
 typedef struct {
     ngx_uint_t           bit;
     const char *const   *cookies;  /* substrings in the request Cookie header */
     const char *const   *uris;     /* r->uri prefixes                         */
     const char *const   *args;     /* query-arg keys (presence => dynamic)    */
+
+    /* Cookie VALUE predicates (tier 2). NULL for presets that classify on name
+     * presence alone. An application that issues the SAME cookie to guests and
+     * members, and encodes the difference in the value, is unclassifiable by the
+     * `cookies` list above and needs a row here instead. See the predicate
+     * engine below for why the name is matched by SUFFIX and why an unparseable
+     * cookie fails closed to bypass. */
+    const ngx_http_cache_turbo_cookie_pred_t  *cookie_preds;
 } ngx_http_cache_turbo_preset_t;
 
 static const char *const  ct_wp_cookies[] = {
@@ -1541,6 +1562,44 @@ static const char *const  ct_phpbb_uris[] = {
     "/ucp.php", "/mcp.php", "/adm/", "/posting.php", "/memberlist.php",
     "/search.php", "/report.php", NULL };
 static const char *const  ct_phpbb_args[] = { "sid", NULL };
+
+/*
+ * phpBB VALUE predicate — the cookie rule the comment above says cannot exist as
+ * a NAME rule. Verified against phpbb/phpbb source, not inferred:
+ *
+ *   includes/constants.php            define('ANONYMOUS', 1);
+ *   phpbb/session.php  session_create()
+ *       guest:  $this->cookie_data['u'] = ($bot) ? $bot : ANONYMOUS;   // => 1
+ *       member: $this->cookie_data['u'] = $this->data['user_id'];      // never 1
+ *   phpbb/session.php  set_cookie()
+ *       $name_data = rawurlencode($config['cookie_name'] . '_' . $name) . '=' ...
+ *
+ * So EVERY non-bot visitor carries <cookie_name>_u; a guest's holds the literal
+ * 1 (ANONYMOUS is a reserved user row, so a real account never has user_id 1),
+ * and a member's holds their id. NE against "1" separates them exactly, which a
+ * presence rule cannot do — that is why this preset shipped with no cookie rule
+ * and told the operator to hand-write a bypass.
+ *
+ * THE NAME IS MATCHED BY SUFFIX because the prefix is an ACP setting
+ * (config 'cookie_name', default "phpbb", so the wire name is "phpbb_u").
+ * Installers randomise it and any admin hosting two boards on one domain changes
+ * it. A literal-name rule silently stops matching on such a board — and a bypass
+ * rule that stops matching caches the member's page and serves it to strangers.
+ * Suffix "_u" is prefix-agnostic. It can over-match an unrelated cookie ending
+ * in _u (a needless bypass, never a leak): the safe direction.
+ *
+ * Absent _u => no opinion => cacheable. Correct: a visitor with no phpBB cookie
+ * has no session and is a guest.
+ *
+ * Known, accepted: _u is attacker-supplied, so anyone can send <x>_u=999 and
+ * force their own request to bypass. That is a self-inflicted cache miss, not a
+ * leak. It is also a cache-flooding lever, but bounded — bypassed requests are
+ * never stored, so it costs origin traffic, not cache keyspace.
+ */
+static const ngx_http_cache_turbo_cookie_pred_t  ct_phpbb_preds[] = {
+    { "_u", NGX_HTTP_CACHE_TURBO_CVOP_NE, "1" },
+    { NULL, 0, NULL }
+};
 
 /*
  * Drupal 9/10/11. Cookie rule: the "SESS" substring, which covers BOTH
@@ -1838,30 +1897,30 @@ static const char *const  ct_kirby_args[] = { NULL };
 
 static const ngx_http_cache_turbo_preset_t  ngx_http_cache_turbo_presets[] = {
     { NGX_HTTP_CACHE_TURBO_BACKEND_WORDPRESS,
-      ct_wp_cookies, ct_wp_uris, ct_wp_args },
+      ct_wp_cookies, ct_wp_uris, ct_wp_args, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_WOOCOMMERCE,
-      ct_woo_cookies, ct_woo_uris, ct_woo_args },
+      ct_woo_cookies, ct_woo_uris, ct_woo_args, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_JOOMLA,
-      ct_joomla_cookies, ct_joomla_uris, ct_joomla_args },
+      ct_joomla_cookies, ct_joomla_uris, ct_joomla_args, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_XENFORO,
-      ct_xf_cookies, ct_xf_uris, ct_xf_args },
+      ct_xf_cookies, ct_xf_uris, ct_xf_args, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_DISCOURSE,
-      ct_discourse_cookies, ct_discourse_uris, ct_discourse_args },
+      ct_discourse_cookies, ct_discourse_uris, ct_discourse_args, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_PHPBB,
-      ct_phpbb_cookies, ct_phpbb_uris, ct_phpbb_args },
+      ct_phpbb_cookies, ct_phpbb_uris, ct_phpbb_args, ct_phpbb_preds },
     { NGX_HTTP_CACHE_TURBO_BACKEND_DRUPAL,
-      ct_drupal_cookies, ct_drupal_uris, ct_drupal_args },
+      ct_drupal_cookies, ct_drupal_uris, ct_drupal_args, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_MEDIAWIKI,
-      ct_mw_cookies, ct_mw_uris, ct_mw_args },
+      ct_mw_cookies, ct_mw_uris, ct_mw_args, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_MAGENTO,
-      ct_magento_cookies, ct_magento_uris, ct_magento_args },
+      ct_magento_cookies, ct_magento_uris, ct_magento_args, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_GHOST,
-      ct_ghost_cookies, ct_ghost_uris, ct_ghost_args },
+      ct_ghost_cookies, ct_ghost_uris, ct_ghost_args, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_WAGTAIL,
-      ct_wagtail_cookies, ct_wagtail_uris, ct_wagtail_args },
+      ct_wagtail_cookies, ct_wagtail_uris, ct_wagtail_args, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_KIRBY,
-      ct_kirby_cookies, ct_kirby_uris, ct_kirby_args },
-    { 0, NULL, NULL, NULL }
+      ct_kirby_cookies, ct_kirby_uris, ct_kirby_args, NULL },
+    { 0, NULL, NULL, NULL, NULL }
 };
 
 
@@ -1894,6 +1953,223 @@ ngx_http_cache_turbo_cookie_has(ngx_http_request_t *r,
         for (pp = subs; *pp; pp++) {
             if (ngx_strnstr(ckp[i]->value.data, (char *) *pp,
                             ckp[i]->value.len) != NULL)
+            {
+                return 1;
+            }
+        }
+    }
+#endif
+    return 0;
+}
+
+
+/*
+ * Cookie VALUE predicates (tier 2). The substring matcher above tests only that
+ * a cookie NAME appears somewhere in the header. Some applications cannot be
+ * classified that way at all: they issue the same cookie to guests and members
+ * and encode the distinction in its VALUE. phpBB is the type case — every
+ * non-bot visitor gets <prefix>_u, a guest's holds ANONYMOUS (the literal 1) and
+ * a member's holds their user_id (never 1, ANONYMOUS is a reserved row). A
+ * presence rule there matches all traffic and identifies nobody; a value rule
+ * separates them exactly.
+ *
+ * TWO PROPERTIES OF THIS PARSER ARE LOAD-BEARING. Both were derived from the
+ * upstream source, not assumed:
+ *
+ * 1. NAME-SUFFIX MATCHING, not exact names. phpBB's cookie is
+ *    $config['cookie_name'] . '_u' (phpbb/session.php, set_cookie()), and
+ *    cookie_name is an ACP setting — it defaults to "phpbb" (so the wire name is
+ *    "phpbb_u") but installers randomise it and any admin running two boards on
+ *    one domain changes it. A rule keyed on a literal name silently STOPS
+ *    MATCHING on such a board, and a bypass rule that stops matching means the
+ *    member's page is cached and served to strangers. Matching the name SUFFIX
+ *    ("_u") is prefix-agnostic and therefore safe. It can over-match an
+ *    unrelated cookie that happens to end in _u, which costs a needless bypass
+ *    and never leaks — the correct direction to err.
+ *
+ * 2. UNPARSEABLE => BYPASS (fail closed to the cache, open to the origin). If
+ *    the header is malformed, truncated, or the name matches with no '=' , we
+ *    return "dynamic" rather than "cacheable". A false bypass costs one cache
+ *    miss; a false hit costs somebody else's authenticated page. Every ambiguous
+ *    path below returns 1.
+ *
+ * The value is compared against a literal (op EQ/NE) or merely required to be
+ * non-empty (op NONEMPTY). Comparison is exact and length-checked: a cookie
+ * "_u=10" must NOT satisfy "_u == 1".
+ *
+ * Cookie header grammar (RFC 6265 §4.2.1): cookie-pair *( ";" SP cookie-pair ).
+ * We tolerate the sloppiness real clients emit — arbitrary OWS around ';' and
+ * '=', missing SP, empty pairs — because a parser that only accepts well-formed
+ * input would treat a malformed header as "no match" and, under a presence-only
+ * reading, silently cache it. r->headers_in cookie values are NOT
+ * NUL-terminated: every scan below is bounded by ck->value.len. (The fuzz
+ * harness drives this function with arbitrary non-NUL-terminated bytes under
+ * ASan for exactly this reason — fuzz/ngx_shim_auto.h.)
+ */
+
+
+/* True if the cookie name [n, n+nlen) ends with the NUL-terminated suffix. */
+static ngx_int_t
+ngx_http_cache_turbo_name_has_suffix(u_char *n, size_t nlen, const char *suffix)
+{
+    size_t  slen;
+
+    slen = ngx_strlen(suffix);
+
+    if (slen == 0 || nlen < slen) {
+        return 0;
+    }
+
+    return ngx_strncmp(n + (nlen - slen), suffix, slen) == 0;
+}
+
+
+/*
+ * Evaluate one predicate against one Cookie header value (which may itself hold
+ * several ';'-separated pairs). Returns 1 = request is dynamic (bypass), 0 = no
+ * opinion. "No opinion" is NOT "cacheable": the caller ORs the results of every
+ * predicate of every active preset, and a request nothing objects to is cached.
+ * A predicate whose cookie is ABSENT must therefore return 0 — for phpBB that is
+ * correct, since a visitor with no _u at all has no session and is a guest.
+ */
+static ngx_int_t
+ngx_http_cache_turbo_cookie_pred_one(u_char *data, size_t len,
+    const ngx_http_cache_turbo_cookie_pred_t *pr)
+{
+    u_char  *p, *end, *name, *eq, *val;
+    size_t   nlen, vlen, plen;
+
+    /* An empty (or absent) Cookie value: nothing to match, and no opinion. The
+     * explicit guard is required, not cosmetic — a header can carry data == NULL
+     * with len == 0, and computing `data + len` on a NULL pointer is undefined
+     * behaviour even when the offset is zero (UBSan: "applying zero offset to
+     * null pointer"). The fuzzer hit this on its first empty input. */
+    if (data == NULL || len == 0) {
+        return 0;
+    }
+
+    p = data;
+    end = data + len;
+
+    while (p < end) {
+
+        /* Skip leading OWS and stray ';' before this pair. */
+        while (p < end && (*p == ' ' || *p == '\t' || *p == ';')) {
+            p++;
+        }
+        if (p >= end) {
+            break;
+        }
+
+        /* The pair runs to the next ';' or to the end of the header value. */
+        name = p;
+        while (p < end && *p != ';') {
+            p++;
+        }
+        plen = (size_t) (p - name);
+
+        /* Trim trailing OWS off the pair. */
+        while (plen > 0
+               && (name[plen - 1] == ' ' || name[plen - 1] == '\t'))
+        {
+            plen--;
+        }
+        if (plen == 0) {
+            continue;                       /* empty pair ("; ;") — ignore */
+        }
+
+        /* Split name '=' value, bounded by plen (no NUL to lean on). */
+        eq = ngx_strlchr(name, name + plen, '=');
+
+        if (eq == NULL) {
+            /* A bare cookie with no '='. If its NAME is the one we key on, we
+             * cannot read a value and must not guess: fail closed to bypass. */
+            nlen = plen;
+            while (nlen > 0 && (name[nlen - 1] == ' ' || name[nlen - 1] == '\t')) {
+                nlen--;
+            }
+            if (ngx_http_cache_turbo_name_has_suffix(name, nlen,
+                                                     pr->name_suffix))
+            {
+                return 1;                   /* unparseable => bypass */
+            }
+            continue;
+        }
+
+        nlen = (size_t) (eq - name);
+        while (nlen > 0 && (name[nlen - 1] == ' ' || name[nlen - 1] == '\t')) {
+            nlen--;                          /* OWS before '=' */
+        }
+
+        if (!ngx_http_cache_turbo_name_has_suffix(name, nlen,
+                                                  pr->name_suffix))
+        {
+            continue;                        /* different cookie */
+        }
+
+        /* Value = everything after '=' to the end of the pair, OWS-trimmed. */
+        val = eq + 1;
+        while (val < name + plen && (*val == ' ' || *val == '\t')) {
+            val++;
+        }
+        vlen = (size_t) ((name + plen) - val);
+
+        switch (pr->op) {
+
+        case NGX_HTTP_CACHE_TURBO_CVOP_NONEMPTY:
+            return vlen > 0 ? 1 : 0;
+
+        case NGX_HTTP_CACHE_TURBO_CVOP_EQ:
+            plen = ngx_strlen(pr->value);
+            return (vlen == plen
+                    && ngx_strncmp(val, pr->value, plen) == 0) ? 1 : 0;
+
+        case NGX_HTTP_CACHE_TURBO_CVOP_NE:
+        default:
+            /* The phpBB case. An EMPTY value ("_u=") is not the guest literal
+             * "1", so by the letter of != it is a member — but it is really a
+             * malformed/cleared cookie. Bypass either way: both readings agree,
+             * and bypass is the safe direction. */
+            plen = ngx_strlen(pr->value);
+            if (vlen == plen && ngx_strncmp(val, pr->value, plen) == 0) {
+                return 0;                    /* == the guest literal: cacheable */
+            }
+            return 1;                        /* anything else: bypass */
+        }
+    }
+
+    return 0;                                /* cookie absent: no opinion */
+}
+
+
+/* True if any predicate in the NULL-terminated list fires against any Cookie
+ * header on the request. */
+static ngx_int_t
+ngx_http_cache_turbo_cookie_pred(ngx_http_request_t *r,
+    const ngx_http_cache_turbo_cookie_pred_t *preds)
+{
+    const ngx_http_cache_turbo_cookie_pred_t  *pr;
+#if (nginx_version >= 1023000)
+    ngx_table_elt_t                           *ck;
+
+    for (pr = preds; pr->name_suffix; pr++) {
+        for (ck = r->headers_in.cookie; ck; ck = ck->next) {
+            if (ngx_http_cache_turbo_cookie_pred_one(ck->value.data,
+                                                     ck->value.len, pr))
+            {
+                return 1;
+            }
+        }
+    }
+#else
+    ngx_table_elt_t                          **ckp;
+    ngx_uint_t                                 i;
+
+    ckp = r->headers_in.cookies.elts;
+    for (pr = preds; pr->name_suffix; pr++) {
+        for (i = 0; i < r->headers_in.cookies.nelts; i++) {
+            if (ngx_http_cache_turbo_cookie_pred_one(ckp[i]->value.data,
+                                                     ckp[i]->value.len, pr))
             {
                 return 1;
             }
@@ -1989,6 +2265,14 @@ ngx_http_cache_turbo_auto_skip(ngx_http_request_t *r,
         }
 
         if (ngx_http_cache_turbo_cookie_has(r, ps->cookies)) {
+            return 1;
+        }
+
+        /* Tier-2 value predicates. Only presets that cannot be classified by
+         * cookie-name presence carry these (phpbb: <prefix>_u != ANONYMOUS). */
+        if (ps->cookie_preds != NULL
+            && ngx_http_cache_turbo_cookie_pred(r, ps->cookie_preds))
+        {
             return 1;
         }
     }

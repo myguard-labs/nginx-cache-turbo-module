@@ -211,6 +211,28 @@ edge case. That is the exact inverse of the [`kirby`](kirby.md) / [`wagtail`](wa
 condition, which fails toward a needless bypass. **When a preset's failure mode
 serves one user's page to another, there is no preset.**
 
+> **"But we have cookie VALUE predicates now — doesn't that fix Flarum?" No.**
+> Asked and answered against the source; do not re-open it. `StartSession`
+> (`src/Http/Middleware/StartSession.php`) sets `flarum_session` on **every**
+> response with no actor check, and its value is an opaque Laravel session id —
+> byte-shape-identical for a guest and a member. Login state is the `access_token`
+> key **inside the server-side session payload** (`AuthenticateWithSession.php`),
+> and it never reaches a cookie. There is nothing in any cookie, *name or value*,
+> that differs between the two. The value predicate that rescues [phpBB](phpbb.md)
+> works because phpBB puts the user id in the cookie; Flarum does not put anything
+> there. **Flarum stays rejected.**
+>
+> **Joomla is the same shape, and its md5 cookie name is a red herring.** Joomla's
+> session name is `md5(md5($secret . $session_name))` — per-install, so a fixed-name
+> matcher genuinely cannot match it. But solving the *naming* problem would not
+> solve the *safety* problem: the session is started **eagerly for every anonymous
+> visitor** (`JoomlaStorage::get()` auto-calls `start()`; `WebApplication::
+> afterSessionStart()` then writes a **guest** `User` into it), and the guest/member
+> bit lives in a **database column** (`#__session.guest`), not in the cookie. So
+> even a perfect name match would only find you a cookie that guests also have.
+> Being able to *match* a cookie is not the same as being able to *tell users
+> apart*. That is why [`joomla`](joomla.md) still carries the ‡ warning.
+
 **Grav, Craft, October, Statamic.** All four die on the cookie, in the two ways this
 page keeps repeating. *Guest-issued*: Craft's `CraftSessionId` and October's
 `october_session` are perfectly stable literals handed to **every** anonymous
