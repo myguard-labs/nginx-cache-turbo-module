@@ -126,7 +126,7 @@ shared with anyone, ever.
 | Cookie | Treatment | Why |
 |---|---|---|
 | `xf_user` | **bypass** | persistent login cookie — an authenticated member |
-| `xf_session_admin` | **bypass** | admin-CP session |
+| `xf_session_admin` | **bypass** | admin-CP session — a **separate** cookie from `xf_session` (separate table, fixed 1h lifetime, path `/`). It is **not** redundant with `xf_session`: the two sessions expire independently, so an admin whose public session lapsed while the ACP session is live sends `xf_session_admin` **alone** on a public URL. Drop it and that admin's page gets cached and served to everyone. |
 | `xf_session` | **ignore** | XF issues this to **guests too**. Bypassing on it drops every visitor who touched a form out of the cache — that's most of your traffic. Not an auth marker. |
 | `xf_style_variation` | **cache key** | light/dark variant. Shared, not private. Bypassing on it means a visitor who picked dark theme never gets a cached page again. |
 | `xf_language_id` | **cache key** (multi-language boards) | same reasoning |
