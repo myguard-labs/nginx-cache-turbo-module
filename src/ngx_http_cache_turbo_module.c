@@ -1625,6 +1625,84 @@ static const char *const  ct_ghost_uris[] = {
 static const char *const  ct_ghost_args[] = {
     "uuid", "key", "token", NULL };
 
+/*
+ * Wagtail (Django CMS). The first preset for an app whose auth cookie belongs to
+ * its FRAMEWORK, not to itself — Wagtail ships no cookie of its own, it rides
+ * Django's `sessionid`. That is only shippable because of a specific Django
+ * property: SessionMiddleware saves the session cookie ONLY when the session is
+ * non-empty AND modified, so a logged-out reader of a public page is issued no
+ * cookie at all. Contrast Laravel, whose StartSession has no such check and
+ * cookies every guest — which is why there is no statamic/october preset, and no
+ * `laravel` preset, and never will be. See docs/frameworks.md.
+ *
+ * THE CONDITION IS REAL AND IT IS THE APP'S TO BREAK. `sessionid` stops being a
+ * logged-in signal the moment the site writes to the session for anonymous
+ * visitors: an anonymous cart (request.session['cart']=…), a large guest flash
+ * message (contrib.messages overflows cookie storage and falls back to the
+ * SESSION), or CSRF_USE_SESSIONS=True. Each turns the bypass into a 100% bypass —
+ * hit rate 0, no error, nothing in the log. This FAILS SAFE (lost hits, never a
+ * leak), which is the only reason it is shippable at all; docs/wagtail.md tells
+ * the operator to re-check with curl after any deploy that touches sessions.
+ *
+ * NOT csrftoken. Django hands it to every anonymous visitor that renders a form
+ * (a search box in the header is enough), so bypassing it would bypass everything
+ * and find no logged-in user. Same class as WooCommerce's guest cookies.
+ *
+ * URIs come from Wagtail's own project template (project_template/project_name/
+ * urls.py), so all three are what a stock install actually serves:
+ *   /admin/         wagtailadmin_urls — relocatable (the docs suggest /cms/ when
+ *                   it clashes with Django admin). An install that moves it loses
+ *                   the URI shortcut but stays CORRECT, because `sessionid` is the
+ *                   real guard. Cookie guards, URI optimises — that ordering is
+ *                   deliberate.
+ *   /django-admin/  admin.site.urls — also in the stock template.
+ *   /documents/     LOAD-BEARING, not decoration. WAGTAILDOCS_SERVE_METHOD
+ *                   defaults to serve_view under FileSystemStorage: a Django view
+ *                   that enforces per-collection PRIVACY checks. A private
+ *                   document fetched by an authorised user must never be stored
+ *                   and replayed to a stranger. Bypass on the prefix rather than
+ *                   trusting a no-store header we have not verified.
+ *
+ * /search/ is deliberately ABSENT. It is dynamic but ANONYMOUS-IDENTICAL — every
+ * logged-out visitor searching "foo" gets the same page — so it is shared, hot,
+ * and exactly what a cache is for. Bypassing it would be a pure hit-rate loss with
+ * no safety gain. Same reasoning that keeps a blanket `action=` out of mediawiki.
+ */
+static const char *const  ct_wagtail_cookies[] = { "sessionid", NULL };
+static const char *const  ct_wagtail_uris[] = {
+    "/admin/", "/django-admin/", "/documents/", NULL };
+static const char *const  ct_wagtail_args[] = { NULL };
+
+/*
+ * Kirby (flat-file PHP CMS). The best-shaped traffic of any preset here: a
+ * flat-file site is almost entirely public pages that are byte-identical for every
+ * logged-out visitor, which is the whole business case for a page cache.
+ *
+ * kirby_session is a STABLE literal (session.cookieName default) — no hash, no
+ * APP_NAME, no admin-settable prefix — and Kirby creates a session only when
+ * something is actually stored in it, so a plain anonymous GET of a public page is
+ * issued NO cookie. Stable + not-guest-issued is the pair every rejected candidate
+ * failed: Grav's grav-site-<hash> is both guest-issued AND per-install, Craft's
+ * CraftSessionId is stable but handed to every visitor, Statamic's is APP_NAME-
+ * derived AND guest-issued.
+ *
+ * THE ONE CONDITION, and it fails SAFE: Kirby's csrf() helper creates a session
+ * cookie ("When you use the csrf() helper, Kirby will create a session cookie" —
+ * the privacy guide). So a template with a contact/search/comment form issues
+ * kirby_session TO GUESTS on that page, and those pages stop caching. That costs
+ * HITS on form pages; it never leaks, because the direction of the error is
+ * bypass-a-guest, not serve-a-member's-page. Precisely inverted from Flarum, which
+ * is why Flarum is rejected and this ships. docs/kirby.md says which pages to
+ * expect it on.
+ *
+ * /panel is the admin (panel.slug, rarely moved). /media is NOT listed: Kirby
+ * serves assets from /media/<hash>/ with no per-request permission view, so it is
+ * static content that SHOULD cache — bypassing it would be a self-inflicted wound.
+ */
+static const char *const  ct_kirby_cookies[] = { "kirby_session", NULL };
+static const char *const  ct_kirby_uris[] = { "/panel", NULL };
+static const char *const  ct_kirby_args[] = { NULL };
+
 static const ngx_http_cache_turbo_preset_t  ngx_http_cache_turbo_presets[] = {
     { NGX_HTTP_CACHE_TURBO_BACKEND_WORDPRESS,
       ct_wp_cookies, ct_wp_uris, ct_wp_args },
@@ -1646,6 +1724,10 @@ static const ngx_http_cache_turbo_preset_t  ngx_http_cache_turbo_presets[] = {
       ct_magento_cookies, ct_magento_uris, ct_magento_args },
     { NGX_HTTP_CACHE_TURBO_BACKEND_GHOST,
       ct_ghost_cookies, ct_ghost_uris, ct_ghost_args },
+    { NGX_HTTP_CACHE_TURBO_BACKEND_WAGTAIL,
+      ct_wagtail_cookies, ct_wagtail_uris, ct_wagtail_args },
+    { NGX_HTTP_CACHE_TURBO_BACKEND_KIRBY,
+      ct_kirby_cookies, ct_kirby_uris, ct_kirby_args },
     { 0, NULL, NULL, NULL }
 };
 
@@ -4143,6 +4225,8 @@ static const struct {
     { "mediawiki",   NGX_HTTP_CACHE_TURBO_BACKEND_MEDIAWIKI   },
     { "magento",     NGX_HTTP_CACHE_TURBO_BACKEND_MAGENTO     },
     { "ghost",       NGX_HTTP_CACHE_TURBO_BACKEND_GHOST       },
+    { "wagtail",     NGX_HTTP_CACHE_TURBO_BACKEND_WAGTAIL     },
+    { "kirby",       NGX_HTTP_CACHE_TURBO_BACKEND_KIRBY       },
     { "none",        NGX_HTTP_CACHE_TURBO_BACKEND_NONE        },
     { NULL,          0                                        }
 };
@@ -4255,8 +4339,8 @@ ngx_http_cache_turbo_backend(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                 ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                     "unknown cache_turbo_backend \"%V\" (want wordpress, "
                     "woocommerce, joomla, xenforo, discourse, phpbb, drupal, "
-                    "mediawiki, magento, ghost, or none — separated by spaces "
-                    "or '|')", &bad);
+                    "mediawiki, magento, ghost, wagtail, kirby, or none — "
+                    "separated by spaces or '|')", &bad);
                 return NGX_CONF_ERROR;
             }
 
@@ -4289,7 +4373,7 @@ ngx_http_cache_turbo_backend(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
             "cache_turbo_backend names no backend (want wordpress, woocommerce, "
             "joomla, xenforo, discourse, phpbb, drupal, mediawiki, magento, "
-            "ghost, or none)");
+            "ghost, wagtail, kirby, or none)");
         return NGX_CONF_ERROR;
     }
 
