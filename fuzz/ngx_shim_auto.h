@@ -93,20 +93,35 @@ typedef struct {
 #define NGX_HTTP_CACHE_TURBO_BACKEND_WOOCOMMERCE  0x0002
 #define NGX_HTTP_CACHE_TURBO_BACKEND_JOOMLA       0x0004
 #define NGX_HTTP_CACHE_TURBO_BACKEND_XENFORO      0x0008
-/* GENERIC is the union of the blindly-stackable backends only. XENFORO is
- * deliberately excluded: its URIs (/login, /register, /contact, /misc) are
- * generic English paths that collide with non-forum sites. */
+#define NGX_HTTP_CACHE_TURBO_BACKEND_DISCOURSE    0x0010
+#define NGX_HTTP_CACHE_TURBO_BACKEND_PHPBB        0x0020
+#define NGX_HTTP_CACHE_TURBO_BACKEND_DRUPAL       0x0040
+#define NGX_HTTP_CACHE_TURBO_BACKEND_MEDIAWIKI    0x0080
+/* GENERIC is the union of the blindly-stackable backends only. The opt-in
+ * presets are deliberately excluded: their URIs (/login, /register, /contact,
+ * /misc, /user, /admin, /node, /posts) are generic English paths that collide
+ * with unrelated sites. */
 #define NGX_HTTP_CACHE_TURBO_BACKEND_GENERIC                                   \
     (NGX_HTTP_CACHE_TURBO_BACKEND_WORDPRESS                                    \
      | NGX_HTTP_CACHE_TURBO_BACKEND_WOOCOMMERCE                                \
      | NGX_HTTP_CACHE_TURBO_BACKEND_JOOMLA)
 
-/* Guard the invariant the fuzz driver depends on: XENFORO must not be in
- * GENERIC (the driver arms every preset via GENERIC, so folding xenforo in
- * would silently change what is fuzzed). */
+/* Every opt-in preset the driver arms explicitly. Keeping this one name in
+ * sync with the driver means a new preset is armed by editing a single list. */
+#define NGX_HTTP_CACHE_TURBO_BACKEND_OPTIN                                     \
+    (NGX_HTTP_CACHE_TURBO_BACKEND_XENFORO                                      \
+     | NGX_HTTP_CACHE_TURBO_BACKEND_DISCOURSE                                  \
+     | NGX_HTTP_CACHE_TURBO_BACKEND_PHPBB                                      \
+     | NGX_HTTP_CACHE_TURBO_BACKEND_DRUPAL                                     \
+     | NGX_HTTP_CACHE_TURBO_BACKEND_MEDIAWIKI)
+
+/* Guard the invariant the fuzz driver depends on: the opt-in presets must not
+ * be in GENERIC (the driver arms GENERIC | OPTIN, so folding one into GENERIC
+ * would silently change what is fuzzed), and OPTIN must cover every non-GENERIC
+ * bit in the registry — a preset in neither set is fuzzed by nobody. */
 _Static_assert((NGX_HTTP_CACHE_TURBO_BACKEND_GENERIC
-                & NGX_HTTP_CACHE_TURBO_BACKEND_XENFORO) == 0,
-               "xenforo must stay out of GENERIC (see module header)");
+                & NGX_HTTP_CACHE_TURBO_BACKEND_OPTIN) == 0,
+               "opt-in presets must stay out of GENERIC (see module header)");
 
 /* Linker stub: never called (driver keeps r->args.len == 0). */
 static ngx_int_t

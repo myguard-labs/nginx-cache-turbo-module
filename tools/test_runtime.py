@@ -1147,11 +1147,103 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
-        # generic/auto: used to prove xenforo is NOT folded into the union.
+        # generic/auto: used to prove the opt-in presets are NOT folded into the
+        # union. /gen/login, /gen/user, ... must all still cache.
         location /gen/ {{
             cache_turbo         main;
             cache_turbo_backend generic;
             cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # ---- discourse ----------------------------------------------------
+        # URI prefixes anchor at position 0, so these must be ROOT locations.
+        location /session {{
+            cache_turbo         main;
+            cache_turbo_backend discourse;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        location /u/ {{
+            cache_turbo         main;
+            cache_turbo_backend discourse;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        # Cookie/arg rules are path-independent, so a prefixed location is fine:
+        # _t bypasses, but the guest _forum_session and the theme_ids /
+        # forced_color_mode variant cookies must NOT.
+        location /dc/ {{
+            cache_turbo         main;
+            cache_turbo_backend discourse;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # ---- phpbb --------------------------------------------------------
+        # Ships NO cookie rule (all three phpBB cookies are set for guests and
+        # the matcher has no value predicate). URI + ?sid= only.
+        location /ucp.php {{
+            cache_turbo         main;
+            cache_turbo_backend phpbb;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        location /phpbb/ {{
+            cache_turbo         main;
+            cache_turbo_backend phpbb;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # ---- drupal -------------------------------------------------------
+        # Ships NO cookie rule (SESS would substring-match PHPSESSID/JSESSIONID).
+        location /user {{
+            cache_turbo         main;
+            cache_turbo_backend drupal;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        # /admin is a preset URI rule too and needs its own ROOT location, or a
+        # fetch of /admin/config falls through to nginx's implicit 404 -- which
+        # carries no x-cache header either, so a "must bypass" assertion would
+        # pass without the preset ever running.
+        location /admin {{
+            cache_turbo         main;
+            cache_turbo_backend drupal;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        location /dr/ {{
+            cache_turbo         main;
+            cache_turbo_backend drupal;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # ---- mediawiki ----------------------------------------------------
+        location /index.php {{
+            cache_turbo         main;
+            cache_turbo_backend mediawiki;
+            cache_turbo_key     $uri$is_args$args;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        # /wiki/ is the CACHEABLE read path -- proves the preset does not just
+        # bypass the whole wiki. Cookie + arg rules exercised from here.
+        location /wiki/ {{
+            cache_turbo         main;
+            cache_turbo_backend mediawiki;
+            cache_turbo_key     $uri$is_args$args;
             cache_turbo_valid   30s;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
@@ -2079,6 +2171,170 @@ def test_xenforo_not_in_generic(ng: Nginx, origin: Origin) -> None:
     _, _, hx = fetch(ng.port, "/gen/page", headers=xf)
     assert hx.get("x-cache") == "HIT", \
         f"generic must NOT pull in the xenforo cookie rules, got {hx.get('x-cache')}"
+    drain_origin(origin)
+
+
+def test_discourse_preset(ng: Nginx, origin: Origin) -> None:
+    """Discourse preset (docs/discourse.md). `_t` is the auth token and bypasses.
+    `_forum_session` is the Rails session cookie that Discourse hands to EVERY
+    visitor including guests, and theme_ids/forced_color_mode are presentation
+    variants — all three must keep caching. Bypassing on _forum_session would be
+    the xf_session mistake again: it would drop all guest traffic out of the
+    cache, which is a performance bug, not a safety one."""
+    for uri in ("/session", "/u/someone"):
+        _, _, h = fetch(ng.port, uri)
+        assert "x-cache" not in h, f"{uri} must bypass on the discourse preset"
+
+    # Auth token bypasses on an otherwise cacheable page.
+    tok = {"Cookie": "_t=abc123deadbeef"}
+    _, _, h1 = fetch(ng.port, "/dc/topic-a", headers=tok)
+    _, _, h2 = fetch(ng.port, "/dc/topic-a", headers=tok)
+    assert "x-cache" not in h1 and "x-cache" not in h2, "_t must bypass"
+
+    # Guest Rails session must NOT bypass.
+    guest = {"Cookie": "_forum_session=guestsess123"}
+    fetch(ng.port, "/dc/topic-b", headers=guest)
+    _, _, hg = fetch(ng.port, "/dc/topic-b", headers=guest)
+    assert hg.get("x-cache") == "HIT", \
+        f"guest _forum_session must stay cacheable, got {hg.get('x-cache')}"
+
+    # Theme / colour-mode variants must NOT bypass (they belong in the key).
+    var = {"Cookie": "theme_ids=2; forced_color_mode=dark"}
+    fetch(ng.port, "/dc/topic-c", headers=var)
+    _, _, hv = fetch(ng.port, "/dc/topic-c", headers=var)
+    assert hv.get("x-cache") == "HIT", \
+        f"theme_ids/forced_color_mode must stay cacheable, got {hv.get('x-cache')}"
+
+    # API args bypass.
+    _, _, ha = fetch(ng.port, "/dc/topic-d?api_key=deadbeef")
+    assert "x-cache" not in ha, "?api_key= must bypass"
+    drain_origin(origin)
+
+
+def test_phpbb_preset(ng: Nginx, origin: Origin) -> None:
+    """phpBB preset (docs/phpbb.md). URI + ?sid= rules only — the preset ships NO
+    cookie rule on purpose, because phpBB sets _u / _k / _sid for every non-bot
+    visitor INCLUDING guests (an anon gets _u=1, the ANONYMOUS id) and this
+    matcher tests cookie presence, not value. So the guest cookies must keep
+    caching, and — this is the documented sharp edge — a LOGGED-IN phpBB user is
+    NOT protected by the preset alone. That is asserted here so the docs and the
+    code cannot drift apart: if someone later adds a _u/_sid cookie rule, this
+    test fails and they must revisit docs/phpbb.md."""
+    for uri in ("/ucp.php", "/ucp.php?mode=login"):
+        _, _, h = fetch(ng.port, uri)
+        assert "x-cache" not in h, f"{uri} must bypass on the phpbb preset"
+
+    # ?sid= marks a session-propagated URL: bypass (also a key-poisoning vector).
+    _, _, hs = fetch(ng.port, "/phpbb/viewtopic?sid=deadbeef")
+    assert "x-cache" not in hs, "?sid= must bypass"
+
+    # Guest cookies must NOT bypass — every anonymous phpBB visitor carries them.
+    guest = {"Cookie": "phpbb3_sid=abc; phpbb3_u=1; phpbb3_k="}
+    fetch(ng.port, "/phpbb/viewtopic-a", headers=guest)
+    _, _, hg = fetch(ng.port, "/phpbb/viewtopic-a", headers=guest)
+    assert hg.get("x-cache") == "HIT", \
+        f"guest phpbb cookies must stay cacheable, got {hg.get('x-cache')}"
+
+    # And the documented gap: an authenticated user's cookie looks identical to
+    # the matcher (presence-only), so the preset does NOT bypass them. This is
+    # why docs/phpbb.md makes cache_turbo_bypass mandatory.
+    authed = {"Cookie": "phpbb3_sid=abc; phpbb3_u=42; phpbb3_k=beef"}
+    fetch(ng.port, "/phpbb/viewtopic-b", headers=authed)
+    _, _, ha = fetch(ng.port, "/phpbb/viewtopic-b", headers=authed)
+    assert ha.get("x-cache") == "HIT", \
+        ("phpbb preset must NOT claim to bypass logged-in users (presence-only "
+         f"matcher cannot tell _u=42 from _u=1), got {ha.get('x-cache')} — if "
+         "this now bypasses, a cookie rule was added: update docs/phpbb.md")
+    drain_origin(origin)
+
+
+def test_drupal_preset(ng: Nginx, origin: Origin) -> None:
+    """Drupal preset (docs/drupal.md). URI rules only — no cookie rule, because
+    the only shippable literal ("SESS") substring-matches PHPSESSID and
+    JSESSIONID, i.e. every other PHP/Java app's session cookie. Drupal defends
+    itself with `Cache-Control: private` on authenticated pages, which the
+    implied `cache_control honor` already refuses to store."""
+    for uri in ("/user", "/user/1/edit", "/admin/config"):
+        _, _, h = fetch(ng.port, uri)
+        assert "x-cache" not in h, f"{uri} must bypass on the drupal preset"
+
+    # A stock PHP session cookie must NOT bypass — that is the collision the
+    # missing SESS rule avoids. If someone adds "SESS", this fails.
+    php = {"Cookie": "PHPSESSID=abc123"}
+    fetch(ng.port, "/dr/node/1", headers=php)
+    _, _, hp = fetch(ng.port, "/dr/node/1", headers=php)
+    assert hp.get("x-cache") == "HIT", \
+        ("PHPSESSID must stay cacheable under the drupal preset (a bare SESS "
+         f"cookie rule would collide with it), got {hp.get('x-cache')}")
+    drain_origin(origin)
+
+
+def test_mediawiki_preset(ng: Nginx, origin: Origin) -> None:
+    """MediaWiki preset (docs/mediawiki.md). The identity cookies have no stable
+    prefix ($wgCookiePrefix defaults to the DB NAME), so the preset matches the
+    CamelCase suffixes UserID= / UserName=. The dynamic surface is in query args,
+    not paths: /wiki/<Title> is the cacheable read path.
+
+    The negative half matters as much as the positive one: action=raw,
+    action=history, diff= and oldid= are deterministic, shared and hot — they
+    must stay CACHEABLE. Bypassing them is a measurable hit-rate loss, which is
+    why a blanket "presence of action= => bypass" rule was rejected."""
+    # Entry scripts are dynamic.
+    _, _, h = fetch(ng.port, "/index.php?title=Foo&action=edit")
+    assert "x-cache" not in h, "/index.php must bypass on the mediawiki preset"
+
+    # VisualEditor is always dynamic.
+    _, _, hv = fetch(ng.port, "/wiki/Foo?veaction=edit")
+    assert "x-cache" not in hv, "?veaction= must bypass"
+
+    # Identity cookies bypass, whatever the site's $wgCookiePrefix happens to be.
+    for ck in ("mywikiUserID=42", "some_other_dbUserName=Bob"):
+        _, _, h1 = fetch(ng.port, "/wiki/Article-a", headers={"Cookie": ck})
+        _, _, h2 = fetch(ng.port, "/wiki/Article-a", headers={"Cookie": ck})
+        assert "x-cache" not in h1 and "x-cache" not in h2, \
+            f"cookie {ck.split('=')[0]} must bypass"
+
+    # The anon-interactive session cookie must NOT bypass: MediaWiki hands one to
+    # a logged-out visitor who merely previews an edit or picks up a CSRF token.
+    anon = {"Cookie": "mywiki_session=abc123"}
+    fetch(ng.port, "/wiki/Article-b", headers=anon)
+    _, _, hn = fetch(ng.port, "/wiki/Article-b", headers=anon)
+    assert hn.get("x-cache") == "HIT", \
+        f"anon mywiki_session must stay cacheable, got {hn.get('x-cache')}"
+
+    # The read path and the deliberately-cacheable args must all still cache.
+    for uri in ("/wiki/Article-c",
+                "/wiki/Article-c?action=raw",
+                "/wiki/Article-c?action=history",
+                "/wiki/Article-c?oldid=12345",
+                "/wiki/Article-c?diff=12345"):
+        fetch(ng.port, uri)
+        _, _, hc = fetch(ng.port, uri)
+        assert hc.get("x-cache") == "HIT", \
+            (f"{uri} must stay cacheable (deterministic + shared); bypassing it "
+             f"is a hit-rate loss, got {hc.get('x-cache')}")
+    drain_origin(origin)
+
+
+def test_new_presets_not_in_generic(ng: Nginx, origin: Origin) -> None:
+    """None of the opt-in presets may be folded into generic/auto. Their URIs are
+    generic English words (/login, /user, /admin, /session, /posts) that an
+    unrelated site legitimately serves as cacheable pages, so a `generic`
+    location must still cache them and must ignore their cookies."""
+    for uri in ("/gen/user", "/gen/admin", "/gen/session", "/gen/index.php"):
+        fetch(ng.port, uri)
+        _, _, h = fetch(ng.port, uri)
+        assert h.get("x-cache") == "HIT", \
+            f"generic must NOT pull in the opt-in URI rules ({uri}), got {h.get('x-cache')}"
+
+    # Distinct URIs per cookie: the key is $uri, so reusing one path would let
+    # the second cookie HIT on the first one's entry and pass for free.
+    for i, ck in enumerate(("_t=abc123", "mywikiUserID=42")):
+        uri = f"/gen/page-{i}"
+        fetch(ng.port, uri, headers={"Cookie": ck})
+        _, _, hx = fetch(ng.port, uri, headers={"Cookie": ck})
+        assert hx.get("x-cache") == "HIT", \
+            f"generic must NOT pull in the opt-in cookie rule {ck}, got {hx.get('x-cache')}"
     drain_origin(origin)
 
 
@@ -5209,6 +5465,11 @@ def run_all(ng: Nginx, origin: Origin,
     test_auto_backend_composition(ng, origin)
     test_xenforo_preset(ng, origin)
     test_xenforo_not_in_generic(ng, origin)
+    test_discourse_preset(ng, origin)
+    test_phpbb_preset(ng, origin)
+    test_drupal_preset(ng, origin)
+    test_mediawiki_preset(ng, origin)
+    test_new_presets_not_in_generic(ng, origin)
     test_auto_classify_more(ng, origin)
     test_q2_multibuffer_oversize(ng, origin)
     test_suppress_native_inert_on_plain_location(ng)
