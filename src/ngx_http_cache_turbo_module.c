@@ -1532,6 +1532,99 @@ static const char *const  ct_mw_uris[] = {
     "/index.php", "/load.php", "/api.php", NULL };
 static const char *const  ct_mw_args[] = { "veaction", "returnto", NULL };
 
+/*
+ * Magento 2 (2.4.x). ONE cookie: X-Magento-Vary. Magento is built to sit behind a
+ * shared cache and ships its own reference Varnish VCL
+ * (app/code/Magento/PageCache/etc/varnish7.vcl) — this preset is that VCL,
+ * translated, with one deliberate and important deviation.
+ *
+ * X-Magento-Vary is the "this visitor is not the shared anonymous case" signal
+ * (Framework/App/Http/Context.php::getVaryString): it is a salted hash of the
+ * vary context — customer group, auth flag, currency, store view — and it is
+ * computed ONLY from values that differ from their defaults. A plain anonymous
+ * visitor on the default store has an all-default context, so getVaryString()
+ * returns null and the cookie is not set (it is actively deleted if stale). A
+ * logged-in customer, a non-default customer group, or a switched
+ * currency/store gets the cookie.
+ *
+ * THE DEVIATION, AND WHY. Magento's VCL puts this cookie in the cache KEY
+ * (vcl_hash: hash_data(regsub(...X-Magento-Vary...))). We must NOT copy that
+ * here: this registry matches cookie PRESENCE, never value. Keying on presence
+ * would collapse EVERY non-default visitor — customer A, customer B, a EUR guest
+ * — into ONE shared cache bucket and serve one customer's cart to another. So
+ * the preset BYPASSES on it instead: correct-but-conservative. Anonymous
+ * default-context traffic (the catalog, i.e. the bulk, i.e. the entire point)
+ * still caches and is shared; everyone else goes to origin.
+ *
+ * An operator who wants the logged-in hit rate back can restore true value-keying
+ * with a `map` — see docs/magento.md. It must be a `map`: nginx does NOT expose a
+ * hyphenated cookie via $cookie_ (there is no '-' -> '_' translation for cookie
+ * names, unlike headers), so `$cookie_x_magento_vary` silently never matches.
+ *
+ * COOKIES DELIBERATELY NOT LISTED — every one of these is set for ANONYMOUS
+ * visitors, and bypassing on any of them takes the hit rate to ~0:
+ *   PHPSESSID              sessions are site-wide; everyone gets one
+ *   form_key               CSRF token, set client-side for everyone
+ *   private_content_version set on ANY POST by anyone (guest add-to-cart,
+ *                          newsletter) and then persists for TEN YEARS —
+ *                          a slow-motion hit-rate collapse
+ *   mage-cache-sessid      set by JS for everyone
+ *   section_data_ids       set by JS for everyone
+ *   mage-messages          flash queue; anons get these too
+ *   mage-cache-storage     not a cookie at all — a localStorage namespace
+ *   mage-customer-login    presence != logged-in (it stores a true/false VALUE)
+ *
+ * Most of the safety here is NOT these rules: cart, checkout, checkout success
+ * and the customer-account layouts are all cacheable="false", so Magento emits
+ * `no-store, no-cache, must-revalidate` (Framework/App/Response/Http.php
+ * ::setNoCacheHeaders) and the implied cache_control honor already refuses to
+ * store them. The URI list is defence-in-depth.
+ *
+ * /admin is deliberately ABSENT: the admin path is randomised per install
+ * ("admin_" + 7 random base36 chars — Framework/Setup/BackendFrontnameGenerator),
+ * so no shippable prefix matches it. It does not need one: admin always sends
+ * no-store. /cart and /onepage are absent because they are not stock routes (the
+ * real paths are /checkout/cart and /checkout/onepage) — as position-0 prefixes
+ * they would match nothing, while /cart could false-positive on a catalog URL key
+ * like /cartridge-refill.
+ */
+static const char *const  ct_magento_cookies[] = { "X-Magento-Vary", NULL };
+static const char *const  ct_magento_uris[] = {
+    "/checkout", "/customer", "/graphql", "/sales", "/newsletter", "/wishlist",
+    "/paypal", "/review", "/page_cache/block/esi", "/health_check.php", NULL };
+static const char *const  ct_magento_args[] = { NULL };
+
+/*
+ * Ghost (5.x/6.x). The public blog is a large, genuinely shared anonymous surface
+ * — and, decisively, a member session does NOT change the HTML of a fully public
+ * post: checkPostAccess() (services/members/content-gating.js) returns early when
+ * visibility === 'public' without consulting the member. Gated blocks and member
+ * substitutions only fire when a member session EXISTS, so a logged-out reader
+ * always renders the identical non-member variant. That is exactly why a bypass
+ * cookie suffices and no cache-key variant is needed.
+ *
+ * ghost-members-ssr is the members session cookie (services/members/service.js),
+ * set ONLY on login — an anonymous reader gets no cookie at all, which is the
+ * property Moodle and the PHP shops lack. The substring also covers the
+ * ghost-members-ssr.sig signature cookie, so one entry does both.
+ *
+ * THE ARGS ARE LOAD-BEARING, not decoration. authMemberByUuid()
+ * (services/members/middleware.js) authenticates a member purely from the QUERY
+ * STRING — ?uuid=&key= — with NO cookie involved. Without bypassing those, a
+ * response authenticated by uuid could be stored and served to strangers. `token`
+ * is the magic-link signin. This is the one non-obvious correctness item in the
+ * preset; do not drop it.
+ *
+ * /p/ is unpublished post previews (must never be cached) and /r/ is the
+ * link-redirect tracker.
+ */
+static const char *const  ct_ghost_cookies[] = {
+    "ghost-members-ssr", "ghost-admin-api-session", NULL };
+static const char *const  ct_ghost_uris[] = {
+    "/ghost/", "/members/", "/p/", "/r/", NULL };
+static const char *const  ct_ghost_args[] = {
+    "uuid", "key", "token", NULL };
+
 static const ngx_http_cache_turbo_preset_t  ngx_http_cache_turbo_presets[] = {
     { NGX_HTTP_CACHE_TURBO_BACKEND_WORDPRESS,
       ct_wp_cookies, ct_wp_uris, ct_wp_args },
@@ -1549,6 +1642,10 @@ static const ngx_http_cache_turbo_preset_t  ngx_http_cache_turbo_presets[] = {
       ct_drupal_cookies, ct_drupal_uris, ct_drupal_args },
     { NGX_HTTP_CACHE_TURBO_BACKEND_MEDIAWIKI,
       ct_mw_cookies, ct_mw_uris, ct_mw_args },
+    { NGX_HTTP_CACHE_TURBO_BACKEND_MAGENTO,
+      ct_magento_cookies, ct_magento_uris, ct_magento_args },
+    { NGX_HTTP_CACHE_TURBO_BACKEND_GHOST,
+      ct_ghost_cookies, ct_ghost_uris, ct_ghost_args },
     { 0, NULL, NULL, NULL }
 };
 
@@ -4044,6 +4141,8 @@ static const struct {
     { "phpbb",       NGX_HTTP_CACHE_TURBO_BACKEND_PHPBB       },
     { "drupal",      NGX_HTTP_CACHE_TURBO_BACKEND_DRUPAL      },
     { "mediawiki",   NGX_HTTP_CACHE_TURBO_BACKEND_MEDIAWIKI   },
+    { "magento",     NGX_HTTP_CACHE_TURBO_BACKEND_MAGENTO     },
+    { "ghost",       NGX_HTTP_CACHE_TURBO_BACKEND_GHOST       },
     { "none",        NGX_HTTP_CACHE_TURBO_BACKEND_NONE        },
     { NULL,          0                                        }
 };
@@ -4156,7 +4255,8 @@ ngx_http_cache_turbo_backend(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                 ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                     "unknown cache_turbo_backend \"%V\" (want wordpress, "
                     "woocommerce, joomla, xenforo, discourse, phpbb, drupal, "
-                    "mediawiki, or none — separated by spaces or '|')", &bad);
+                    "mediawiki, magento, ghost, or none — separated by spaces "
+                    "or '|')", &bad);
                 return NGX_CONF_ERROR;
             }
 
@@ -4188,7 +4288,8 @@ ngx_http_cache_turbo_backend(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     if (mask == 0) {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
             "cache_turbo_backend names no backend (want wordpress, woocommerce, "
-            "joomla, xenforo, discourse, phpbb, drupal, mediawiki, or none)");
+            "joomla, xenforo, discourse, phpbb, drupal, mediawiki, magento, "
+            "ghost, or none)");
         return NGX_CONF_ERROR;
     }
 
