@@ -1122,6 +1122,16 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # joomla public content: where the joomla_remember_me_ cookie rule and the
+        # unmatchable md5 session cookie are exercised.
+        location /jm/ {{
+            cache_turbo         main;
+            cache_turbo_backend joomla;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # joomla URI-prefix rule: r->uri starts with /administrator/ -> skip
         location /administrator/ {{
             cache_turbo         main;
@@ -2299,31 +2309,46 @@ def test_woocommerce_wc_ajax(ng: Nginx, origin: Origin) -> None:
 
 
 def test_xenforo_preset(ng: Nginx, origin: Origin) -> None:
-    """XenForo preset (docs/xenforo.md). Two auth cookies bypass; the two
-    NON-auth cookies must keep caching. That second half is the whole point:
-    xf_session is issued to GUESTS too, and xf_style_variation is just a theme
-    variant — bypassing on either would silently disable caching for most real
-    traffic, so a regression there is a performance bug, not a safety one."""
+    """XenForo preset (docs/xenforo.md).
+
+    xf_session MUST BYPASS, and that assertion is INVERTED from the original
+    preset on purpose. It is the regression guard for a real cross-user leak.
+
+    STOCK XF2 HAS NO LOGIN-ONLY COOKIE. xf_user is the REMEMBER-ME cookie only
+    (completeLogin() mints it inside `if ($remember)`, and "Stay logged in" is
+    unticked by default), so an ordinary member who just types their password
+    carries ONLY xf_session. This test used to assert that xf_session "must stay
+    cacheable" -- which meant that member's authenticated page was stored and
+    served to strangers. Bypassing on xf_session is the only cookie-only fix; it
+    costs hit rate (XF's session is lazy, so clean guests still cache, but a guest
+    who logs out / trips 2FA / hits a captcha acquires one) and that is the trade.
+
+    Do not "optimise" xf_session back out. That is the leak."""
     # URI prefixes (root locations — the prefixes anchor at position 0).
     for uri in ("/login", "/misc/style"):
         _, _, h = fetch(ng.port, uri)
         assert "x-cache" not in h, f"{uri} must bypass on the xenforo preset"
 
-    # Auth cookies bypass, on an otherwise perfectly cacheable page.
-    for ck in ("xf_user=1234%2Cabcdef", "xf_session_admin=deadbeef"):
+    # Every auth signal bypasses. xf_session is here because it is the ONLY cookie
+    # an ordinary (non-remember-me) login carries; xf_lscxf_logged_in is the
+    # LiteSpeed plugin's true login-only cookie, present only if that plugin runs.
+    for ck in ("xf_user=1234%2Cabcdef", "xf_session_admin=deadbeef",
+               "xf_session=membersess123", "xf_lscxf_logged_in=1"):
         _, _, h1 = fetch(ng.port, "/xf/thread-a", headers={"Cookie": ck})
         _, _, h2 = fetch(ng.port, "/xf/thread-a", headers={"Cookie": ck})
         assert "x-cache" not in h1 and "x-cache" not in h2, \
-            f"cookie {ck.split('=')[0]} must bypass"
+            (f"cookie {ck.split('=')[0]} must bypass -- a session-only login "
+             "carries xf_session and NOTHING else, so caching it leaks")
 
-    # Guest session cookie must NOT bypass — XF gives one to anonymous visitors.
-    guest = {"Cookie": "xf_session=guestsess123"}
-    fetch(ng.port, "/xf/thread-b", headers=guest)
-    _, _, hg = fetch(ng.port, "/xf/thread-b", headers=guest)
+    # A cookieless guest still caches. This is what stops the xf_session rule from
+    # being a blanket hit-rate zero: XF's session is LAZY, so a clean first-time
+    # visitor who stores nothing in it is issued no cookie at all.
+    fetch(ng.port, "/xf/thread-b")
+    _, _, hg = fetch(ng.port, "/xf/thread-b")
     assert hg.get("x-cache") == "HIT", \
-        f"guest xf_session must stay cacheable, got {hg.get('x-cache')}"
+        f"a cookieless XF guest must still cache, got {hg.get('x-cache')}"
 
-    # Theme variant cookie must NOT bypass either (it belongs in the key).
+    # Theme variant cookie must NOT bypass (it belongs in the key, not here).
     style = {"Cookie": "xf_style_variation=dark"}
     fetch(ng.port, "/xf/thread-c", headers=style)
     _, _, hs = fetch(ng.port, "/xf/thread-c", headers=style)
@@ -2424,24 +2449,91 @@ def test_phpbb_preset(ng: Nginx, origin: Origin) -> None:
     drain_origin(origin)
 
 
+def test_joomla_preset(ng: Nginx, origin: Origin) -> None:
+    """Joomla preset (docs/joomla.md). joomla_remember_me_ is the ONE Joomla
+    cookie that passes both tests: it is a fixed PREFIX ('joomla_remember_me_' .
+    getShortHashedUserAgent() -- the per-install part is the suffix) and it is set
+    only for an authenticated user.
+
+    THE PARTIAL-GUARD HALF IS ASSERTED TOO, and it matters more than the positive
+    one: a normally-logged-in frontend user (who did NOT tick "Remember Me")
+    carries only the session cookie, whose NAME is md5($secret . $session_name) --
+    a per-install hash with no fixed substring. That user is INVISIBLE to this
+    matcher, by construction. The test pins that reality so nobody reads the
+    presence of a cookie rule as "joomla is handled" -- it is not, and the docs
+    tell the operator to add their own cache_turbo_bypass."""
+    # The remember-me cookie is auth-only -> bypass.
+    rm = {"Cookie": "joomla_remember_me_9f8e7d6c=abc123"}
+    _, _, h1 = fetch(ng.port, "/jm/article-a", headers=rm)
+    _, _, h2 = fetch(ng.port, "/jm/article-a", headers=rm)
+    assert "x-cache" not in h1 and "x-cache" not in h2, \
+        "joomla_remember_me_ is auth-only and must bypass"
+
+    # THE GAP, asserted on purpose: the md5-named session cookie is unmatchable,
+    # so a normally-logged-in user still caches. This is a KNOWN limitation, not a
+    # regression -- if a future change makes this bypass, the preset got better and
+    # this assertion should be revisited deliberately, not deleted in passing.
+    sess = {"Cookie": "b1946ac92492d2347c6235b4d2611184=sessvalue"}
+    fetch(ng.port, "/jm/article-b", headers=sess)
+    _, _, hs = fetch(ng.port, "/jm/article-b", headers=sess)
+    assert hs.get("x-cache") == "HIT", \
+        ("joomla's md5-named session cookie is unmatchable by a substring rule, so "
+         "it still caches -- the operator MUST add their own cache_turbo_bypass. "
+         f"got {hs.get('x-cache')}")
+
+    # /administrator/ still bypasses.
+    _, _, ha = fetch(ng.port, "/administrator/index.php")
+    assert "x-cache" not in ha, "/administrator/ must bypass"
+    drain_origin(origin)
+
+
 def test_drupal_preset(ng: Nginx, origin: Origin) -> None:
-    """Drupal preset (docs/drupal.md). URI rules only — no cookie rule, because
-    the only shippable literal ("SESS") substring-matches PHPSESSID and
-    JSESSIONID, i.e. every other PHP/Java app's session cookie. Drupal defends
-    itself with `Cache-Control: private` on authenticated pages, which the
-    implied `cache_control honor` already refuses to store."""
+    """Drupal preset (docs/drupal.md).
+
+    The SESS cookie rule is a LEAK FIX and its assertions are INVERTED from the
+    original preset. This test used to assert that PHPSESSID must stay cacheable,
+    with a comment reading "If someone adds SESS, this fails" -- i.e. it encoded
+    the bug as a guarantee.
+
+    The bug: the preset shipped NO cookie rule, on the belief that anonymous
+    Drupal users never get a session cookie. False. Drupal opens a session for an
+    ANONYMOUS user as soon as anything writes to $_SESSION -- core's own
+    NoSessionOpen docblock names the cases (a status message from a form submit,
+    cart contents). A logged-in user carries the same SESS<hash> shape, so with
+    no cookie rule an authenticated response could be stored and served on.
+
+    The accepted cost: "SESS" is a substring of PHPSESSID and JSESSIONID, so a
+    co-hosted PHP/Java app's session cookie also bypasses. That is a HIT-RATE
+    loss on the other app, never a leak -- and it does not justify leaking here."""
     for uri in ("/user", "/user/1/edit", "/admin/config"):
         _, _, h = fetch(ng.port, uri)
         assert "x-cache" not in h, f"{uri} must bypass on the drupal preset"
 
-    # A stock PHP session cookie must NOT bypass — that is the collision the
-    # missing SESS rule avoids. If someone adds "SESS", this fails.
+    # The session cookie must bypass -- both the plain and the TLS (SSESS) form.
+    # The hash is per-install, so "SESS" as a substring is the only shippable rule.
+    for ck in ("SESS1a2b3c4d5e6f=authsession", "SSESSdeadbeefcafe=authsession"):
+        _, _, h1 = fetch(ng.port, "/dr/node-a", headers={"Cookie": ck})
+        _, _, h2 = fetch(ng.port, "/dr/node-a", headers={"Cookie": ck})
+        assert "x-cache" not in h1 and "x-cache" not in h2, \
+            (f"drupal: {ck.split('=')[0]} must bypass -- a logged-in user carries "
+             "this shape and caching it serves their page to strangers")
+
+    # The known, accepted collision: PHPSESSID contains "SESS", so it bypasses too.
+    # Asserted explicitly so the trade-off is visible and cannot regress silently.
     php = {"Cookie": "PHPSESSID=abc123"}
-    fetch(ng.port, "/dr/node/1", headers=php)
-    _, _, hp = fetch(ng.port, "/dr/node/1", headers=php)
-    assert hp.get("x-cache") == "HIT", \
-        ("PHPSESSID must stay cacheable under the drupal preset (a bare SESS "
-         f"cookie rule would collide with it), got {hp.get('x-cache')}")
+    _, _, hp1 = fetch(ng.port, "/dr/node-b", headers=php)
+    _, _, hp2 = fetch(ng.port, "/dr/node-b", headers=php)
+    assert "x-cache" not in hp1 and "x-cache" not in hp2, \
+        ("drupal: PHPSESSID collides with the SESS substring and bypasses. This is "
+         "the ACCEPTED cost of closing the anon-session leak -- a hit-rate loss on "
+         f"a co-hosted PHP app, never a leak. got {hp2.get('x-cache')}")
+
+    # A cookieless anonymous reader still caches -- the preset is not a blanket
+    # bypass, which is the whole point of it existing.
+    fetch(ng.port, "/dr/node-c")
+    _, _, hc = fetch(ng.port, "/dr/node-c")
+    assert hc.get("x-cache") == "HIT", \
+        f"drupal: a cookieless anonymous reader must cache, got {hc.get('x-cache')}"
     drain_origin(origin)
 
 
@@ -2476,19 +2568,28 @@ def test_mediawiki_preset(ng: Nginx, origin: Origin) -> None:
     assert "x-cache" not in hv, "?veaction= must bypass"
 
     # Identity cookies bypass, whatever the site's $wgCookiePrefix happens to be.
-    for ck in ("mywikiUserID=42", "some_other_dbUserName=Bob"):
+    # Token and _session are what UPSTREAM keys on -- getVaryCookies() verbatim:
+    # "Vary on token and session because those are the real authn determiners.
+    #  UserID and UserName don't matter without those."
+    # The _session assertion is INVERTED from the original preset, which asserted
+    # it must stay cacheable. Bypassing a session-carrying guest costs hits; NOT
+    # bypassing a session-carrying member leaks.
+    for ck in ("mywikiToken=deadbeef", "mywiki_session=abc123", "mywikiUserID=42"):
         _, _, h1 = fetch(ng.port, "/wiki/Article-a", headers={"Cookie": ck})
         _, _, h2 = fetch(ng.port, "/wiki/Article-a", headers={"Cookie": ck})
         assert "x-cache" not in h1 and "x-cache" not in h2, \
-            f"cookie {ck.split('=')[0]} must bypass"
+            f"cookie {ck.split('=')[0]} must bypass -- upstream calls it an authn determiner"
 
-    # The anon-interactive session cookie must NOT bypass: MediaWiki hands one to
-    # a logged-out visitor who merely previews an edit or picks up a CSRF token.
-    anon = {"Cookie": "mywiki_session=abc123"}
-    fetch(ng.port, "/wiki/Article-b", headers=anon)
-    _, _, hn = fetch(ng.port, "/wiki/Article-b", headers=anon)
+    # UserName must NOT bypass. unpersistSession() deliberately does NOT clear it
+    # on logout (it pre-fills the login form), so EVERY visitor who has ever logged
+    # in keeps sending it forever -- long after they are an ordinary anonymous
+    # reader. Bypassing on it is a permanent hit-rate loss with zero safety gain.
+    exlogin = {"Cookie": "mywikiUserName=Bob"}
+    fetch(ng.port, "/wiki/Article-b", headers=exlogin)
+    _, _, hn = fetch(ng.port, "/wiki/Article-b", headers=exlogin)
     assert hn.get("x-cache") == "HIT", \
-        f"anon mywiki_session must stay cacheable, got {hn.get('x-cache')}"
+        ("mywikiUserName survives logout (login-form pre-fill), so an ex-member "
+         f"reading anonymously must still cache, got {hn.get('x-cache')}")
 
     # The read path and the deliberately-cacheable args must all still cache.
     for uri in ("/wiki/Article-c",
@@ -6005,6 +6106,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_xenforo_not_in_generic(ng, origin)
     test_discourse_preset(ng, origin)
     test_phpbb_preset(ng, origin)
+    test_joomla_preset(ng, origin)
     test_drupal_preset(ng, origin)
     test_mediawiki_preset(ng, origin)
     test_magento_preset(ng, origin)

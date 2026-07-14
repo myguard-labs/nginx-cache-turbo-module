@@ -31,7 +31,7 @@ of the same job.
 |---|---|
 | URI prefixes | **none** — see below |
 | Query args | `veaction`, `returnto` |
-| Cookie substrings | `UserID=`, `UserName=` |
+| Cookie substrings | `Token=`, `_session=`, `UserID=` |
 
 MediaWiki's cookies are `<prefix>UserID`, `<prefix>UserName`, `<prefix>Token` and
 `<prefix>_session`, where `<prefix>` is `$wgCookiePrefix` — which **defaults to
@@ -39,25 +39,37 @@ MediaWiki's cookies are `<prefix>UserID`, `<prefix>UserName`, `<prefix>Token` an
 cookies are `mywikiUserID`, `mywikiUserName`, and so on.
 
 That means there is no shippable *prefix* — but unlike Joomla and phpBB, there is
-a shippable **suffix**. `UserID=` and `UserName=` are distinctive CamelCase tails,
-and `CookieSessionProvider.php` sets them only for a logged-in user (it explicitly
-*clears* `UserID` when the user is anonymous). So the preset matches on those, and
-it works whatever your `$wgCookiePrefix` is. No configuration needed.
+a shippable **suffix**. The tails are distinctive enough to match on, whatever your
+`$wgCookiePrefix` is. No configuration needed.
 
-Two cookies are deliberately **not** matched:
+**Match what upstream matches.** MediaWiki's own `getVaryCookies()` says it in one
+line:
 
-- **`Token`** — too generic. The matcher searches the whole `Cookie` header, so a
-  bare `Token` substring would also fire on any unrelated cookie whose *value*
-  happened to contain the word.
-- **`<prefix>_session`** — MediaWiki issues one to an *anonymous* visitor who
-  merely interacts with the wiki (previews an edit, picks up a CSRF token). It is
-  closer to XenForo's `xf_session` than to an auth cookie, and bypassing on it
-  would cost hit rate for no safety gain.
+> *"Vary on token and session because those are the real authn determiners. UserID
+> and UserName don't matter without those."*
 
-This mirrors what upstream does. MediaWiki's own recommended Varnish VCL bypasses
-on a cookie regex of `(session|Token)=` precisely *because* the prefix is
-unpredictable — and its `getVaryCookies()` notes that `UserID`/`UserName` are the
-ones that matter.
+So **`Token=` and `_session=` are the load-bearing pair**, and they are what the
+preset ships. `UserID=` is kept as cheap belt-and-braces — `CookieSessionProvider`
+clears it for an anonymous user, so it costs nothing.
+
+**`UserName=` is deliberately NOT matched**, and this is the non-obvious one.
+`unpersistSession()` **does not clear it on logout** — by design, because it
+pre-fills the login form for the next visit. So **every visitor who has ever logged
+in keeps sending `<prefix>UserName` forever**, long after they are an ordinary
+anonymous reader. Bypassing on it is a permanent hit-rate loss against exactly the
+shared, cacheable reader the cache exists for — with **zero** safety gain, because
+without a token or a session that cookie authenticates nobody. It used to be in
+this preset; removing it is a pure win.
+
+**`_session=` is matched even though anonymous visitors can acquire one** (preview
+an edit, pick up a CSRF token). That is the XenForo `xf_session` trade in
+miniature, and here it lands on the right side of it: upstream names it a real
+authn determiner, and the asymmetry is decisive — a bypassed guest costs you
+*hits*, a cached member *leaks*.
+
+This mirrors upstream exactly. MediaWiki's own recommended Varnish VCL bypasses on
+a cookie regex of `([sS]ession|Token)=` — precisely *because* the prefix is
+unpredictable, and precisely on the two names above.
 
 ## What is dynamic is the query arg, not the path
 

@@ -467,12 +467,12 @@ per-session suffixes, so it matches as a substring).
 |---|---|---|---|
 | `wordpress`   | `/wp-admin/`, `/wp-login.php`, `/wp-cron.php`, `/xmlrpc.php`, `/wp-json/` | `preview`, `s` | `wordpress_logged_in_`, `wp-postpass_`, `comment_author_` |
 | `woocommerce` | `/cart`, `/checkout`, `/my-account` | `wc-ajax` | `woocommerce_items_in_cart`, `woocommerce_cart_hash`, `wp_woocommerce_session_` |
-| `joomla`      | `/administrator/` | — | — ‡ |
-| `xenforo` †   | `/admin.php`, `/install/`, `/login`, `/logout`, `/lost-password`, `/register`, `/account`, `/conversations`, `/direct-messages`, `/contact`, `/misc` | — | `xf_user`, `xf_session_admin` |
+| `joomla`      | `/administrator/` | — | `joomla_remember_me_` ‡ |
+| `xenforo` † ¤ | `/admin.php`, `/install/`, `/login`, `/logout`, `/lost-password`, `/register`, `/account`, `/conversations`, `/direct-messages`, `/misc` | — | `xf_session`, `xf_user`, `xf_session_admin`, `xf_lscxf_logged_in` |
 | `discourse` † | `/admin`, `/session`, `/auth/`, `/login`, `/logout`, `/signup`, `/u/`, `/my/`, `/message-bus/`, `/draft`, `/presence/`, `/notifications`, `/user_actions` | `api_key`, `api_username` | `_t=` |
 | `phpbb` †     | `/ucp.php`, `/mcp.php`, `/adm/`, `/posting.php`, `/memberlist.php`, `/search.php`, `/report.php` | `sid` | — ‡ |
-| `drupal` †    | `/user`, `/admin`, `/node/add`, `/system/`, `/core/install.php` | — | — ‡ |
-| `mediawiki` † | — ¶ | `veaction`, `returnto` | `UserID=`, `UserName=` |
+| `drupal` †    | `/user`, `/admin`, `/node/add`, `/system/`, `/core/install.php` | — | `SESS` ¥ |
+| `mediawiki` † | — ¶ | `veaction`, `returnto` | `Token=`, `_session=`, `UserID=` |
 | `magento` †   | `/checkout`, `/customer`, `/graphql`, `/sales`, `/newsletter`, `/wishlist`, `/paypal`, `/review`, `/page_cache/block/esi`, `/health_check.php` | — | `X-Magento-Vary` |
 | `ghost` †     | `/ghost/`, `/members/`, `/p/`, `/r/` | `uuid`, `key`, `token`, `gift` | `ghost-members-ssr`, `ghost-admin-api-session` |
 | `wagtail` † § | `/admin/`, `/django-admin/`, `/documents/` | — | `sessionid` |
@@ -497,15 +497,36 @@ path-based pass rule at all. The cookie rules plus the Cache-Control floor are
 the whole mechanism. Do not re-add a path rule here without a source that says
 MediaWiki cannot cache it.
 
-‡ **Ships no cookie rule — read the guide before relying on it.** Three presets
-cannot match a session cookie at all, for two different reasons, and the
-consequences differ:
+‡ **The cookie rule is a PARTIAL guard — you must still add your own.** Two
+presets cannot fully identify a logged-in user, for different reasons:
 
-| Preset | Why no cookie rule | What protects logged-in users |
+| Preset | What it can and cannot see | What you must do |
 |---|---|---|
-| `joomla` | cookie is named from a hash of the site secret — no stable substring | **nothing** — you *must* add your own `cache_turbo_bypass` |
-| `phpbb` | prefix is admin-configurable, *and* `_u`/`_k`/`_sid` are set for **guests too** — separating a member from a guest needs a **value** test, which a substring matcher cannot do | **nothing** — you *must* add a `map`-based `cache_turbo_bypass` ([guide](docs/phpbb.md)) |
-| `drupal` | the only shippable literal (`SESS`) also matches `PHPSESSID` and `JSESSIONID` — it would zero the hit rate of any co-hosted PHP/Java app | **the origin**: Drupal sends `Cache-Control: private`, which the implied `honor` refuses to store |
+| `joomla` | `joomla_remember_me_` is a real fixed prefix and is auth-only — but it exists **only** for users who ticked "Remember Me". A normally-logged-in frontend user carries only the session cookie, whose name is `md5($secret . $session_name)` — a per-install hash with **no** stable substring. That user is invisible to the matcher. | **Add your own `cache_turbo_bypass`** on your install's session-cookie name if your site has frontend logins ([guide](docs/joomla.md)). Do not read the cookie rule as "handled". |
+| `phpbb` | Ships **no** cookie rule. The prefix is admin-configurable, *and* `_u`/`_k`/`_sid` are set for **guests too** (an anonymous visitor gets `_u=1`) — separating a member from a guest needs a **value** test, which a substring matcher cannot do. | **Nothing protects you by default** — add a `map`-based `cache_turbo_bypass` ([guide](docs/phpbb.md)). |
+
+¤ **`xenforo` cannot be made both safe and fast on stock XenForo.** Stock XF2 has
+**no login-only cookie**. `xf_user` is the *remember-me* cookie — `completeLogin()`
+only mints it inside `if ($remember)`, and "Stay logged in" is **unticked by
+default** — so an ordinary member who just types their password carries **only**
+`xf_session`. The preset therefore bypasses on `xf_session` as well, which is the
+only correct cookie-only option, and it costs hit rate: XF's session is *lazy*, so
+a clean first-time guest still caches, but a guest who logs out, trips 2FA, or
+hits a captcha acquires a session and is uncacheable from then on. If you run
+LiteSpeed's XF2 plugin you get `xf_lscxf_logged_in`, a true login-only cookie (the
+plugin exists to create the cookie XF lacks) — that is the fast path, and you can
+then drop `xf_session` with your own config. See [docs/xenforo.md](docs/xenforo.md).
+
+¥ **`drupal`'s `SESS` rule over-matches, deliberately.** `SESS` is a substring of
+`PHPSESSID` and `JSESSIONID`, so a co-hosted PHP or Java app under the same server
+block also bypasses. That is a **hit-rate loss on the other app, never a leak** —
+and it is the accepted price of closing a real leak on the Drupal side: Drupal
+opens a session for **anonymous** users whenever anything writes to `$_SESSION`
+(a status message after a form submit, cart contents), so a logged-in user's
+`SESS<hash>` cookie must bypass or their page can be stored and served on. Narrow
+it with your own `cache_turbo_bypass $cookie_SESS<your-hash>` if the collision
+costs you. Note `NO_CACHE` is **not** matched: it is contrib (not core) and is set
+for *logged-out* visitors by design, so it would cost hits and buy no safety.
 
 § **Cookie rule is *conditional* — and fails safe.** Both of these ride a cookie the
 app issues only once a session actually exists, which is exactly what makes them
