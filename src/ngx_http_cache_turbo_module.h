@@ -457,6 +457,29 @@ typedef struct {
     ngx_array_t             *bypass;
     ngx_array_t             *no_store;
 
+    /* Manual DIY equivalents of the preset URI-bypass and key-cookie engines
+     * (v15), for an app we ship no preset for.
+     *
+     * bypass_uri: array of ngx_str_t URI prefixes. A request whose r->uri
+     * matches any prefix on a path-segment boundary ('/' or '.') skips the
+     * cache entirely — the same origin-and-never-capture semantics as a preset
+     * URI rule (ngx_http_cache_turbo_auto_skip), evaluated by the SAME
+     * ngx_http_cache_turbo_uri_prefix() matcher, but WITHOUT needing a preset.
+     * This is what nginx `location` prefixes cannot express: they anchor at
+     * position 0 and have no segment-boundary semantics, so mounting the app in
+     * a subdirectory silently mis-matches.
+     *
+     * key_cookies: array of ngx_str_t cookie names whose VALUE is folded into
+     * the cache key (tier-3 value-keying) via the same unforgeable
+     * length-prefixed framing the presets use in build_key. EXACT name match,
+     * ALL Cookie headers scanned. KEY, never bypass, never presence — see the
+     * key_cookies field on ngx_http_cache_turbo_preset_t and the fold in
+     * ngx_http_cache_turbo_build_key for the full rationale (a value-key is for
+     * a SEGMENT FINGERPRINT the app shares across many visitors, not an
+     * identity; presence-keying leaks). Both NGX_CONF_UNSET_PTR until set. */
+    ngx_array_t             *bypass_uri;
+    ngx_array_t             *key_cookies;
+
     /* Auto-classify (cache_turbo <zone> auto / cache_turbo_backend <name>...).
      * A bitmask of CMS cacheability presets; 0 = manual mode (off). Each set
      * bit applies a curated set of "this request is dynamic, never cache it"
