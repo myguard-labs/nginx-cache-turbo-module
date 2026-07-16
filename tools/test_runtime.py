@@ -2386,16 +2386,25 @@ def test_post_passthrough_uncached(ng: Nginx, origin: Origin) -> None:
     assert s1 == 200 and s2 == 200, f"POST status {s1}/{s2}"
     assert b1.startswith("post-") and b2.startswith("post-"), \
         f"origin do_POST body shape: {b1!r} / {b2!r}"
-    assert b1.split(":")[1].strip() == want, \
-        f"request body mangled in transit: {b1!r} want digest {want}"
+    # Both POSTs must carry the body intact -- checking only the first would
+    # leave a second-request body corruption (buffering/park bug) invisible.
+    for tag, b in (("first", b1), ("second", b2)):
+        assert b.split(":")[1].strip() == want, \
+            f"{tag} POST body mangled in transit: {b!r} want digest {want}"
     assert b1 != b2, f"identical POST bodies -> a POST was served from cache: {b1!r}"
     assert "x-cache" not in h1 and "x-cache" not in h2
     assert origin.hits_for("post-passthru") == base + 2, \
         "every POST must reach the origin"
 
-    # The GET slot for the same URI is independent: first GET is a fresh MISS
-    # (distinct gen body, not a replayed POST body), second GET is a HIT.
+    # The GET slot for the same URI is independent: the first GET must reach the
+    # origin (positive proof, via the path-scoped hit counter -- NOT an
+    # "x-cache absent" assert, which a plain MISS and a never-consulted cache
+    # produce alike; see lessons.md) and return a fresh gen body rather than a
+    # replayed POST body. The second GET is then a HIT.
+    gbase = origin.hits_for("post-passthru")
     sg1, bg1, _ = fetch(ng.port, path)
+    assert origin.hits_for("post-passthru") == gbase + 1, \
+        "the first GET must reach the origin (no POST-primed entry to serve)"
     sg2, bg2, hg2 = fetch(ng.port, path)
     assert sg1 == 200 and sg2 == 200
     assert bg1.startswith("gen-"), \
