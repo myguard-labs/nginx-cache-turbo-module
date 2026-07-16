@@ -1644,24 +1644,63 @@ static const char *const  ct_joomla_args[] = { NULL };
  * none. On a forum running that plugin it is the precise login signal, and the
  * operator can then narrow the preset by dropping xf_session with their own
  * config. Harmless when the plugin is absent (the cookie simply never appears).
+ * The DigitalPoint Cloudflare app sets an equivalent <prefix>logged_in cookie
+ * (xf_logged_in on the stock prefix) for the same purpose; an operator running
+ * that instead can add it to their own bypass the same way.
  *
- * `xf_style_variation` / `xf_language_id` are presentation variants, NOT auth:
- * they belong in cache_turbo_key, not here (bypassing on them would zero out
- * caching for anyone who picked a dark theme).
+ * PRESENTATION VARIANTS ARE KEY COOKIES, NOT BYPASS (tier 3). These are shared
+ * across everyone who picked the same value, so folding the VALUE into the key
+ * gives one cache entry per variant instead of dropping the visitor from cache
+ * (bypassing on them would zero caching for anyone on a dark theme):
+ *   - xf_style_id       — selected style on a MULTI-STYLE board. This is the one
+ *                         LiteSpeed's own addon varies on (E=...,xf_style_id,...).
+ *   - xf_style_variation — light/dark/system VARIATION within a style. NEW in XF
+ *                         2.3's dark mode; set client-side by JS when the visitor
+ *                         picks a scheme. Distinct cookie from xf_style_id — a 2.3
+ *                         board with dark mode needs BOTH keyed.
+ *   - xf_language_id    — selected language on a multi-language board.
+ * A single-style, single-language, no-dark-mode board shares one value for each
+ * and loses nothing by keying on them (one bucket). xf_consent (guest-set, and
+ * it DOES change embed HTML: XF renders a consent placeholder in place of a
+ * third-party embed until accepted) is deliberately NOT keyed here — it would
+ * fragment the cache two ways on every embed-bearing page. docs/xenforo.md tells
+ * an operator who needs it to add xf_consent with their own cache_turbo_key_cookie.
+ *
+ * `/api/` is the XF REST API (docs.xenforo.com/manual/reference/rest-api). It
+ * authenticates on the XF-Api-Key REQUEST HEADER, never a cookie or the standard
+ * Authorization header — so an API client's private response carries NONE of the
+ * bypass cookies above, and a shared cache keyed on URL alone would store one
+ * client's data and serve it to the next. The header is invisible to the cookie
+ * rules, so /api/ must bypass on the URI. (This is the same class of bug as the
+ * xf_session leak: a real cross-CLIENT leak, closed here on the URI.)
+ *
+ * `_xfToken` is XF's CSRF token as a QUERY ARG (stock XF hangs it off GET links
+ * such as the logout link and the style-variation switcher). Its value is
+ * per-session, so any GET carrying it is per-user and must never be cached or
+ * served across visitors. The bare `t` alias XF also accepts is NOT matched: it
+ * is too generic (tracking params, timestamps) to bypass safely on a preset, and
+ * the surfaces that use it (logout, misc/style-variation) are already covered by
+ * the /logout and /misc URI rules. An operator with a custom GET route that
+ * takes `t` adds it with their own cache_turbo_bypass.
  *
  * All names honour $config['cookie']['prefix'] (default "xf_"); a forum that
  * changed the prefix needs its own cache_turbo_bypass. URIs are the XF2 dynamic
- * surfaces: auth flows, the admin and installer entry scripts, and /misc (the
- * style/language picker + inline dispatch endpoints). /contact is NOT a stock
- * XF2 route — the real one is misc/contact, already covered by /misc.
+ * surfaces: auth flows, the admin and installer entry scripts, /api/ (REST), and
+ * /misc (the style/language picker + inline dispatch endpoints). /contact is NOT
+ * a stock XF2 route — the real one is misc/contact, already covered by /misc.
+ * /conversations is the pre-2.3 DM route; XF 2.3 renamed it to /direct-messages
+ * and permanently redirects the old path, so BOTH are listed (the redirect is a
+ * cacheable object we do not want captured under a member's session either).
  */
 static const char *const  ct_xf_cookies[] = {
     "xf_session", "xf_user", "xf_session_admin", "xf_lscxf_logged_in", NULL };
 static const char *const  ct_xf_uris[] = {
-    "/admin.php", "/install/", "/login", "/logout", "/lost-password",
+    "/admin.php", "/install/", "/api/", "/login", "/logout", "/lost-password",
     "/register", "/account", "/conversations", "/direct-messages",
     "/misc", NULL };
-static const char *const  ct_xf_args[] = { NULL };
+static const char *const  ct_xf_args[] = { "_xfToken", NULL };
+static const char *const  ct_xf_key_cookies[] = {
+    "xf_style_id", "xf_style_variation", "xf_language_id", NULL };
 
 /*
  * Discourse. One cookie: `_t`, the auth token (lib/auth/default_current_user_
@@ -2182,7 +2221,7 @@ static const ngx_http_cache_turbo_preset_t  ngx_http_cache_turbo_presets[] = {
     { NGX_HTTP_CACHE_TURBO_BACKEND_JOOMLA,
       ct_joomla_cookies, ct_joomla_uris, ct_joomla_args, NULL, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_XENFORO,
-      ct_xf_cookies, ct_xf_uris, ct_xf_args, NULL, NULL },
+      ct_xf_cookies, ct_xf_uris, ct_xf_args, NULL, ct_xf_key_cookies },
     { NGX_HTTP_CACHE_TURBO_BACKEND_DISCOURSE,
       ct_discourse_cookies, ct_discourse_uris, ct_discourse_args, NULL, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_PHPBB,
