@@ -471,7 +471,7 @@ per-session suffixes, so it matches as a substring).
 | `wordpress`   | `/wp-admin/`, `/wp-login.php`, `/wp-cron.php`, `/xmlrpc.php`, `/wp-json/` | `preview`, `s` | `wordpress_logged_in_`, `wp-postpass_`, `comment_author_` |
 | `woocommerce` | `/cart`, `/checkout`, `/my-account` | `wc-ajax` | `woocommerce_items_in_cart`, `woocommerce_cart_hash`, `wp_woocommerce_session_` |
 | `joomla`      | `/administrator/` | — | `joomla_remember_me_` ‡ |
-| `xenforo` † ¤ | `/admin.php`, `/install/`, `/login`, `/logout`, `/lost-password`, `/register`, `/account`, `/conversations`, `/direct-messages`, `/misc` | — | `xf_session`, `xf_user`, `xf_session_admin`, `xf_lscxf_logged_in` |
+| `xenforo` † ¤ ✦ | `/admin.php`, `/install/`, `/api/`, `/login`, `/logout`, `/lost-password`, `/register`, `/account`, `/conversations`, `/direct-messages`, `/misc` | `_xfToken` | `xf_session`, `xf_user`, `xf_session_admin`, `xf_lscxf_logged_in`; *(key)* `xf_style_id`, `xf_style_variation`, `xf_language_id` |
 | `discourse` † | `/admin`, `/session`, `/auth/`, `/login`, `/logout`, `/signup`, `/my/`, `/message-bus/`, `/drafts`, `/presence/`, `/notifications`, `/user_actions` | `api_key`, `api_username` | `_t=` |
 | `phpbb` †     | `/ucp.php`, `/mcp.php`, `/adm/`, `/posting.php`, `/memberlist.php`, `/search.php`, `/report.php` | `sid` | *(value)* `…_u != 1` ∆ |
 | `drupal` †    | `/user`, `/admin`, `/node/add`, `/system/`, `/core/install.php` | — | `SESS` ¥ |
@@ -581,6 +581,14 @@ just the first) because nginx's `$cookie_` variables cannot represent a
 hyphenated name (`$cookie_X_Magento_Vary` silently never matches — no `-`→`_`
 translation for cookie names, unlike `$http_*`). See [magento.md](docs/magento.md).
 
+`shopware6` uses the same tier on `sw-cache-hash`, and `xenforo` uses it on the
+presentation cookies `xf_style_id` / `xf_style_variation` (XF 2.3 light/dark) /
+`xf_language_id` — the visitor's chosen style, dark-mode variation and language
+each get their own *shared* cache entry rather than being dropped from the cache.
+Unlike Magento's identity-derived vary string these are pure preference values,
+so there is no private data at stake; the point is purely to stop a dark-theme or
+second-language visitor from missing the cache. See [xenforo.md](docs/xenforo.md).
+
 § **Cookie rule is *conditional* — and fails safe.** Both of these ride a cookie the
 app issues only once a session actually exists, which is exactly what makes them
 shippable. That property is the *application's* to break:
@@ -660,17 +668,24 @@ it.** `curl -sI` your site with no cookies and look at what comes back in
 
 #### XenForo: which cookies bypass, and which belong in the key
 
-The XenForo preset bypasses on exactly two cookies, and it is worth knowing why
-the obvious third one is absent:
+Stock XenForo has **no login-only cookie** (`xf_user` is only the *remember-me*
+cookie, and "Stay logged in" is off by default), so the ordinary member carries
+only `xf_session`. That forces `xf_session` into the bypass list even though
+guests get it too — the full reasoning is in
+[docs/xenforo.md](docs/xenforo.md#read-this-first-stock-xenforo-has-no-login-only-cookie).
+The preset:
 
-| Cookie | Treatment | Why |
+| Cookie / arg | Treatment | Why |
 |---|---|---|
-| `xf_user` | **bypass** | the persistent login cookie — an authenticated member |
-| `xf_session_admin` | **bypass** | the admin-CP session |
-| `xf_session` | *ignored* | XenForo issues this to **guests too**. Bypassing on it would drop every visitor who so much as touched a form out of the cache — i.e. it would silently disable caching for most of your traffic. |
-| `xf_style_variation`, `xf_language_id` | **put in the cache key** | presentation variants, not auth. They change the rendered page but the page is still *shared*. Bypassing on them means anyone who picked a dark theme never gets a cached page again. |
+| `xf_user`, `xf_session_admin`, `xf_session` | **bypass** | the three identity signals. `xf_session` is guest-issued but is the only cookie a non-remember-me login carries — omitting it is a real cross-user leak. |
+| `xf_lscxf_logged_in` | **bypass** | LiteSpeed addon's true login-only cookie (present only if you run it). |
+| `_xfToken` (query arg) | **bypass** | XF's per-session CSRF token on some GET links (logout, style switcher). |
+| `xf_style_id`, `xf_style_variation`, `xf_language_id` | **value-keyed** | presentation variants — style, XF 2.3 light/dark, language. Folded into the cache key by the preset, so each value gets its own *shared* entry. |
+| `xf_consent` | *ignored* | changes embed HTML but fragments the cache heavily; key it yourself only if you need it. |
 
-So do **not** do this:
+The style/language cookies are **value-keyed by the preset itself** now (tier-3
+key-cookies, same engine as `magento`/`shopware6`) — you do not add them to
+`cache_turbo_key` by hand. So do **not** do this:
 
 ```nginx
 # WRONG — a per-session key gives every visitor their own private copy.
@@ -678,25 +693,29 @@ So do **not** do this:
 cache_turbo_key $host$uri$cookie_xf_session$cache_turbo_normalized_args;
 ```
 
-Keying on the session cookie does not make the logged-in page safely shareable —
-it just mints one cache entry per visitor (so nothing is ever reused), while
-still **storing** authenticated HTML, which is exactly the response you least
-want on disk if the origin ever forgets a `private`. Bypassing sends it to the
-origin and never captures it. Key on the *variant*, bypass the *identity*:
+Keying on the *session* cookie does not make a logged-in page safely shareable —
+it mints one entry per visitor (nothing is ever reused) while still **storing**
+authenticated HTML. Bypassing sends it to the origin and never captures it. Key
+on the *variant*, bypass the *identity* — and the preset does both for you:
 
 ```nginx
-cache_turbo_backend xenforo;                       # bypasses xf_user / xf_session_admin
-cache_turbo_key     $host$uri$cookie_xf_style_variation$cache_turbo_normalized_args;
+cache_turbo_backend xenforo;   # bypasses identity, value-keys style/language
+cache_turbo_key     $host$uri$cache_turbo_normalized_args;   # plain key is enough
 ```
 
-This is the same split LiteSpeed's own XenForo cache plugin makes (bypass on
-`xf_user`/`xf_session_admin`, *vary* on style + language).
+This is the same split LiteSpeed's own XenForo plugin makes (bypass on
+`xf_lscxf_logged_in`/`xf_user`/`xf_session_admin`, *vary* on `xf_style_id` +
+`xf_language_id`); we add `xf_style_variation`, the 2.3 dark-mode cookie that
+post-dates that addon's rules.
 
-Two caveats worth checking against your install:
+Three caveats worth checking against your install:
 
-- **Custom cookie prefix.** Both names assume XenForo's default
+- **Custom cookie prefix.** The names assume XenForo's default
   `$config['cookie']['prefix'] = 'xf_'`. If you changed it, the preset won't
   match — add your own `cache_turbo_bypass $cookie_<prefix>user;`.
+- **The REST API (`/api/`)** authenticates on the `XF-Api-Key` header, not a
+  cookie — the preset bypasses it on the URI so one client's private response is
+  never served to another. Bypass any non-standard API path too.
 - **A board in a subdirectory** (`/forums/…`) shifts every URI prefix above. The
   preset matches on `r->uri` from the site root, so scope it to the board's
   `location` (see the vhost example in [`docs/xenforo.md`](docs/xenforo.md)).

@@ -1230,10 +1230,21 @@ http {{
             cache_turbo_valid   30s;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
+        # /api/ is the REST API: it authenticates on the XF-Api-Key HEADER, which
+        # no cookie rule can see, so the preset bypasses it on the URI. Root
+        # location for the same anchor-at-0 reason as /login and /misc above.
+        location /api/ {{
+            cache_turbo         main;
+            cache_turbo_backend xenforo;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
 
-        # xenforo cookie rules are path-independent, so a prefixed location is
-        # fine for those: xf_user / xf_session_admin bypass, but the guest
-        # xf_session and the xf_style_variation theme cookie must NOT.
+        # xenforo cookie/arg rules are path-independent, so a prefixed location
+        # exercises them: xf_user / xf_session_admin / xf_session bypass and the
+        # _xfToken query arg bypasses, while the xf_style_* / xf_language_id
+        # variant cookies must KEY (value-folded), not bypass and not collide.
         location /xf/ {{
             cache_turbo         main;
             cache_turbo_backend xenforo;
@@ -2474,10 +2485,22 @@ def test_xenforo_preset(ng: Nginx, origin: Origin) -> None:
     who logs out / trips 2FA / hits a captcha acquires one) and that is the trade.
 
     Do not "optimise" xf_session back out. That is the leak."""
-    # URI prefixes (root locations — the prefixes anchor at position 0).
-    for uri in ("/login", "/misc/style"):
+    # URI prefixes (root locations — the prefixes anchor at position 0). /api/ is
+    # the REST API: it auths on the XF-Api-Key HEADER, invisible to every cookie
+    # rule, so a shared cache keyed on URL alone would serve one API client's
+    # private response to the next. It MUST bypass on the URI.
+    for uri in ("/login", "/misc/style", "/api/threads/1/"):
         _, _, h = fetch(ng.port, uri)
         assert "x-cache" not in h, f"{uri} must bypass on the xenforo preset"
+
+    # _xfToken is XF's CSRF token as a query arg (logout link, style-variation
+    # switcher). Its value is per-session, so any GET carrying it is per-user and
+    # must never be cached or served across visitors. (arg rules are
+    # path-independent, so the /xf/ prefix exercises them.)
+    _, _, ht1 = fetch(ng.port, "/xf/thread-tok?_xfToken=1650000000,abcdef")
+    _, _, ht2 = fetch(ng.port, "/xf/thread-tok?_xfToken=1650000000,abcdef")
+    assert "x-cache" not in ht1 and "x-cache" not in ht2, \
+        "a GET carrying _xfToken must bypass -- the CSRF token is per-session"
 
     # Every auth signal bypasses. xf_session is here because it is the ONLY cookie
     # an ordinary (non-remember-me) login carries; xf_lscxf_logged_in is the
@@ -2498,12 +2521,25 @@ def test_xenforo_preset(ng: Nginx, origin: Origin) -> None:
     assert hg.get("x-cache") == "HIT", \
         f"a cookieless XF guest must still cache, got {hg.get('x-cache')}"
 
-    # Theme variant cookie must NOT bypass (it belongs in the key, not here).
-    style = {"Cookie": "xf_style_variation=dark"}
-    fetch(ng.port, "/xf/thread-c", headers=style)
-    _, _, hs = fetch(ng.port, "/xf/thread-c", headers=style)
-    assert hs.get("x-cache") == "HIT", \
-        f"xf_style_variation must stay cacheable, got {hs.get('x-cache')}"
+    # Presentation variants are VALUE-KEYED (tier-3 key_cookies), not bypassed and
+    # not presence-keyed: xf_style_id (multi-style board), xf_style_variation
+    # (XF 2.3 light/dark within a style) and xf_language_id. Each is a SHARED
+    # variant -- everyone on dark theme sees the same page -- so it must cache,
+    # repeat-hit its OWN entry, and NOT collide with a different value.
+    for name in ("xf_style_variation", "xf_style_id", "xf_language_id"):
+        va = {"Cookie": f"{name}=aaaa"}
+        _, ba1, _ = fetch(ng.port, f"/xf/variant-{name}", headers=va)
+        _, ba2, hs = fetch(ng.port, f"/xf/variant-{name}", headers=va)
+        assert hs.get("x-cache") == "HIT" and ba1 == ba2, \
+            f"{name} must be KEYED and repeat-hit its own entry, got {hs.get('x-cache')}"
+        # A different value must not be served the first value's cached body.
+        vb = {"Cookie": f"{name}=bbbb"}
+        _, bb1, _ = fetch(ng.port, f"/xf/variant-{name}", headers=vb)
+        assert bb1 != ba1, \
+            f"{name}: a different value was served another variant's cached body"
+        _, bb2, hb = fetch(ng.port, f"/xf/variant-{name}", headers=vb)
+        assert hb.get("x-cache") == "HIT" and bb2 == bb1, \
+            f"{name}: each value must warm and hit its OWN entry"
     drain_origin(origin)
 
 
