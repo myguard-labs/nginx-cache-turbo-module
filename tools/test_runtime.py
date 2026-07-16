@@ -105,14 +105,20 @@ def wait_port(port: int, timeout: float = 15.0) -> None:
 
 
 def fetch(port: int, path: str, headers: dict | None = None,
-          method: str | None = None):
-    """Return (status, body_str, response_headers_dict)."""
+          method: str | None = None, data: bytes | None = None):
+    """Return (status, body_str, response_headers_dict). `data` sends a request
+    body (method must be given explicitly; urllib would otherwise silently flip
+    a GET into a POST the moment data is set)."""
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}{path}",
         headers={"Connection": "close", **(headers or {})},
         method=method,
     )
-    if method in ("POST", "PUT", "DELETE"):
+    if data is not None:
+        assert method in ("POST", "PUT", "PATCH"), \
+            f"fetch(data=...) needs an explicit body-carrying method, got {method}"
+        req.data = data
+    elif method in ("POST", "PUT", "DELETE"):
         req.data = b""
     try:
         with urllib.request.urlopen(req, timeout=5) as r:
@@ -206,6 +212,55 @@ class Origin:
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", "0")
                 self.end_headers()
+
+            def do_POST(self):  # noqa: N802
+                # GraphQL-shaped upstream: reads the request body and answers
+                # with a body that is BOTH unique per origin hit (gen counter,
+                # so a cached serve is detectable as a repeated body) AND
+                # body-identifying (a digest of the received bytes, so a test
+                # can prove the body actually transited nginx intact).
+                #
+                # Response headers are ECHO-driven: a test sets X-Want-Cacheable /
+                # X-Want-Deps on the REQUEST (nginx forwards request headers to
+                # the upstream) and the origin reflects them as the
+                # X-GraphQL-Cacheable / X-GraphQL-Cache-Dependencies RESPONSE
+                # headers the module reads. This keeps per-test control without
+                # a path-marker per dependency list.
+                if origin.delay:
+                    time.sleep(origin.delay)
+                clen = int(self.headers.get("Content-Length") or 0)
+                req_body = self.rfile.read(clen) if clen else b""
+                with origin._lock:
+                    origin._n += 1
+                    n = origin._n
+                    origin._paths.append((time.time(), self.path))
+                    if len(origin._paths) > 64:        # ring: diagnostics only
+                        del origin._paths[:-64]
+                if origin.drop:
+                    self.close_connection = True
+                    return
+                if origin.fail:
+                    self.send_response(503)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                digest = hashlib.sha256(req_body).hexdigest()[:16]
+                body = f"post-{n}:{digest}\n".encode()
+                self.send_response(200)
+                self.send_header("Content-Type",
+                                 "application/json; charset=utf-8")
+                want_c = self.headers.get("X-Want-Cacheable")
+                if want_c is not None:
+                    self.send_header("X-GraphQL-Cacheable", want_c)
+                want_d = self.headers.get("X-Want-Deps")
+                if want_d is not None:
+                    self.send_header("X-GraphQL-Cache-Dependencies", want_d)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                try:
+                    self.wfile.write(body)
+                except BrokenPipeError:
+                    pass
 
             def do_GET(self):  # noqa: N802
                 if origin.delay:
@@ -2311,6 +2366,51 @@ def test_miss_then_hit(ng: Nginx) -> None:
     assert s2 == 200
     assert h2.get("x-cache") == "HIT", f"second req X-Cache={h2.get('x-cache')}"
     assert b1 == b2, f"HIT body differs: {b1!r} vs {b2!r}"
+
+
+def test_post_passthrough_uncached(ng: Nginx, origin: Origin) -> None:
+    """A POST through a cache_turbo location is a pure passthrough today (the
+    method gate declines non-GET/HEAD before any cache work): every POST must
+    reach the origin, the body must transit nginx intact (origin echoes its
+    digest), and the GET entry for the same URI must be neither served to the
+    POST nor polluted by it."""
+    path = "/c/post-passthru"
+    payload = b'{"query":"query P($id:ID!){product(id:$id){name}}"}'
+    want = hashlib.sha256(payload).hexdigest()[:16]
+    base = origin.hits_for("post-passthru")
+
+    s1, b1, h1 = fetch(ng.port, path, method="POST", data=payload,
+                       headers={"Content-Type": "application/json"})
+    s2, b2, h2 = fetch(ng.port, path, method="POST", data=payload,
+                       headers={"Content-Type": "application/json"})
+    assert s1 == 200 and s2 == 200, f"POST status {s1}/{s2}"
+    assert b1.startswith("post-") and b2.startswith("post-"), \
+        f"origin do_POST body shape: {b1!r} / {b2!r}"
+    # Both POSTs must carry the body intact -- checking only the first would
+    # leave a second-request body corruption (buffering/park bug) invisible.
+    for tag, b in (("first", b1), ("second", b2)):
+        assert b.split(":")[1].strip() == want, \
+            f"{tag} POST body mangled in transit: {b!r} want digest {want}"
+    assert b1 != b2, f"identical POST bodies -> a POST was served from cache: {b1!r}"
+    assert "x-cache" not in h1 and "x-cache" not in h2
+    assert origin.hits_for("post-passthru") == base + 2, \
+        "every POST must reach the origin"
+
+    # The GET slot for the same URI is independent: the first GET must reach the
+    # origin (positive proof, via the path-scoped hit counter -- NOT an
+    # "x-cache absent" assert, which a plain MISS and a never-consulted cache
+    # produce alike; see lessons.md) and return a fresh gen body rather than a
+    # replayed POST body. The second GET is then a HIT.
+    gbase = origin.hits_for("post-passthru")
+    sg1, bg1, _ = fetch(ng.port, path)
+    assert origin.hits_for("post-passthru") == gbase + 1, \
+        "the first GET must reach the origin (no POST-primed entry to serve)"
+    sg2, bg2, hg2 = fetch(ng.port, path)
+    assert sg1 == 200 and sg2 == 200
+    assert bg1.startswith("gen-"), \
+        f"GET served a POST-shaped body -> POST polluted the GET entry: {bg1!r}"
+    assert hg2.get("x-cache") == "HIT" and bg1 == bg2, \
+        f"GET caching broken next to POSTs: {hg2.get('x-cache')} {bg1!r}/{bg2!r}"
 
 
 def test_header_fidelity(ng: Nginx) -> None:
@@ -6731,6 +6831,7 @@ def run_all(ng: Nginx, origin: Origin,
             redis_tls: RedisServer | None = None,
             mc: MemcachedServer | None = None) -> None:
     test_miss_then_hit(ng)
+    test_post_passthrough_uncached(ng, origin)
     test_compressed_edge_identity_capture(ng)
     test_header_fidelity(ng)
     if ng.fault_injection:
@@ -7000,7 +7101,8 @@ def main() -> int:
                 mc.stop()
             origin.stop()
 
-    print("OK: miss/hit, header fidelity, max_size, "
+    print("OK: miss/hit, POST passthrough uncached (origin do_POST harness), "
+          "header fidelity, max_size, "
           "cacheability floor (Set-Cookie/CC-private/CC-no-store/Authorization "
           "not cached), default-key Host split, "
           "per-status caching (301/404 cached, HEAD not stored), "
