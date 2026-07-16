@@ -1,6 +1,6 @@
 /*
- * Copyright (c) 2026 Eilander
- * SPDX-License-Identifier: MIT
+ * Copyright (C) 2026 Thijs Eilander
+ * SPDX-License-Identifier: BSD-2-Clause
  *
  * L1 shared-memory page cache: rbtree of cached objects keyed by the 32-byte
  * hash of the cache key, an LRU queue for eviction, and atomic stat counters.
