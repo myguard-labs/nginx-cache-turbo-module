@@ -8,6 +8,7 @@ put in the key, and a copy-paste vhost with the Redis L2 tier wired up.
 - [Cookies: bypass vs key](#cookies-bypass-vs-key)
 - [Vhost: page cache only](#vhost-page-cache-only)
 - [Vhost: page cache + Redis L2 (shared across a fleet)](#vhost-page-cache--redis-l2-shared-across-a-fleet)
+- [Vhost: full hit rate with the LiteSpeed plugin (lscache-xf2)](#vhost-full-hit-rate-with-the-litespeed-plugin-lscache-xf2)
 - [Board in a subdirectory](#board-in-a-subdirectory)
 - [XenForo's own object cache (Redis) — a different thing](#xenforos-own-object-cache-redis--a-different-thing)
 - [Purging on new posts](#purging-on-new-posts)
@@ -262,6 +263,119 @@ Nothing in the `location` block changes — the L2 is transparent. Use a distinc
 > `cache_turbo_redis` at the same DB XenForo uses for its own object cache (see
 > below) — a `?all=1` purge here would blow away XF's internal cache too. Use a
 > different DB number (`/0` vs `/1`), or a different `prefix=`, or both.
+
+## Vhost: full hit rate with the LiteSpeed plugin (`lscache-xf2`)
+
+If you run **LiteSpeed's XF2 plugin**, `xf_lscxf_logged_in` is set on **every**
+login (not just remember-me) and cleared on logout — a real login-only signal.
+That lets you **drop the broad `xf_session` bypass**, so a guest who merely
+touched a form (logged out, tripped 2FA, hit a captcha) still caches. Big
+hit-rate win over the stock-XF preset, and still leak-free — *as long as the
+plugin is actually running*.
+
+The `xenforo` preset can't do this: it always bypasses `xf_session` (the
+stock-XF safe floor, and there is no stock login cookie to replace it with). So
+set `cache_turbo_backend none` and hand-build the rules, **omitting**
+`xf_session`:
+
+```nginx
+load_module modules/ngx_http_cache_turbo_module.so;
+
+http {
+    cache_turbo_zone     name=ct 256m;
+
+    server_tokens        off;
+    fastcgi_buffers      16 16k;
+    fastcgi_buffer_size  32k;
+    fastcgi_read_timeout 60s;
+
+    server {
+        listen 443 ssl http2;
+        server_name forum.example.com;
+        root /var/www/xenforo;
+        index index.php;
+
+        add_header X-CT-Status $cache_turbo_status always;
+
+        location / {
+            try_files $uri $uri/ /index.php?$uri&$args;
+        }
+        location ~ ^/(internal_data|library|src)/ { internal; }
+
+        location ~ \.php$ {
+            cache_turbo               ct;
+
+            # NOT `cache_turbo_backend xenforo` — that bypasses xf_session. With
+            # lscache-xf2 we have a real login cookie, so we build the rules by
+            # hand and OMIT xf_session for the hit rate.
+            cache_turbo_backend       none;
+            cache_turbo_cache_control honor;   # preset would imply this; keep it
+
+            cache_turbo_preset        balanced;
+            cache_turbo_valid         60s;
+            cache_turbo_valid         301 302 308 1h;
+            cache_turbo_valid         404 410 1m;
+
+            # bypass on the TRUE login signals only (no xf_session):
+            #   xf_lscxf_logged_in — set on every login by lscache-xf2
+            #   xf_user            — remember-me
+            #   xf_session_admin   — admin CP session (independent lifetime)
+            #   _xfToken           — per-session CSRF token on GET links
+            cache_turbo_bypass        $cookie_xf_lscxf_logged_in
+                                      $cookie_xf_user
+                                      $cookie_xf_session_admin
+                                      $arg__xfToken
+                                      $http_authorization;
+
+            # the dynamic surfaces the preset's URI list would have covered:
+            cache_turbo_bypass_uri    /admin.php /install/ /api/ /login /logout
+                                      /lost-password /register /account
+                                      /conversations /direct-messages /misc;
+
+            # value-key the presentation variants (the preset does this itself):
+            cache_turbo_key_cookie    xf_style_id xf_style_variation
+                                      xf_language_id;
+
+            # never STORE a response that still carries a login cookie:
+            cache_turbo_no_store      $cookie_xf_lscxf_logged_in
+                                      $cookie_xf_user
+                                      $cookie_xf_session_admin
+                                      $http_authorization;
+
+            cache_turbo_lock          on;
+            cache_turbo_lock_timeout  5s;
+            cache_turbo_lock_ttl      5s;
+            cache_turbo_background_update on;
+            cache_turbo_max_size      2m;
+
+            include                   fastcgi_params;
+            fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+            fastcgi_param HTTPS on;
+            fastcgi_pass  unix:/run/php/php-fpm.sock;
+        }
+
+        location ~* \.(css|js|png|jpe?g|gif|webp|svg|woff2?)$ {
+            cache_turbo off;
+            expires 30d;
+            access_log off;
+        }
+
+        location = /_cache {
+            cache_turbo_admin ct;
+            cache_turbo_purge on;
+            allow 127.0.0.1;
+            deny  all;
+        }
+    }
+}
+```
+
+> **This is safe ONLY while lscache-xf2 runs.** Disable or remove the plugin and
+> an ordinary (non-remember-me) login carries only `xf_session` — which this
+> config no longer bypasses — so an authenticated page gets cached and served to
+> strangers. If you can't guarantee the plugin stays enabled, use
+> `cache_turbo_backend xenforo;` (it keeps the `xf_session` floor at a lower hit
+> rate). Add the Redis L2 block from the previous section if you run a fleet.
 
 ## Board in a subdirectory
 
