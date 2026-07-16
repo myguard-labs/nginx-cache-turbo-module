@@ -401,8 +401,12 @@ traffic, and the hit ratio should be dominated by guest thread/forum views.
 - **Custom cookie prefix.** The preset assumes XenForo's default
   `$config['cookie']['prefix'] = 'xf_'`. If you changed it, `xf_user` never
   matches and **logged-in pages become cacheable** — the one failure mode that
-  actually leaks. Add `cache_turbo_bypass $cookie_<yourprefix>user;` to be safe,
-  or leave the prefix at its default.
+  actually leaks. Add `cache_turbo_bypass $cookie_<yourprefix>session
+  $cookie_<yourprefix>session_admin $cookie_<yourprefix>user;` to be safe, or
+  leave the prefix at its default. All three matter: `session` is the only
+  cookie an ordinary (non-remember-me) login carries, `session_admin` the admin
+  session, and `user` remember-me. Bypassing `<yourprefix>user` alone leaves an
+  ordinary or admin login cacheable — exactly the leak the preset prevents.
 - **`/misc` is load-bearing.** It's XF's style/language picker and inline
   dispatch endpoint (`/misc/style`, `/misc/language`) — a `POST` that sets a
   cookie. Cached, it breaks the theme switcher. The preset bypasses it.

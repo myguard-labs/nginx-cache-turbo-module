@@ -712,7 +712,11 @@ Three caveats worth checking against your install:
 
 - **Custom cookie prefix.** The names assume XenForo's default
   `$config['cookie']['prefix'] = 'xf_'`. If you changed it, the preset won't
-  match — add your own `cache_turbo_bypass $cookie_<prefix>user;`.
+  match — add your own `cache_turbo_bypass $cookie_<prefix>session
+  $cookie_<prefix>session_admin $cookie_<prefix>user;`. All three: `session` is
+  the only cookie an ordinary (non-remember-me) login carries, `session_admin`
+  the admin session, `user` remember-me. Bypassing `user` alone leaves ordinary
+  and admin logins cacheable — the leak this preset exists to prevent.
 - **The REST API (`/api/`)** authenticates on the `XF-Api-Key` header, not a
   cookie — the preset bypasses it on the URI so one client's private response is
   never served to another. Bypass any non-standard API path too.
