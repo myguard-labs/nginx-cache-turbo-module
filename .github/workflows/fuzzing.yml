@@ -14,9 +14,9 @@ env:
 
 on:
   push:
-    branches: [master, main, dev]
+    branches: [main]
   pull_request:
-    branches: [master, main]
+    branches: [main]
   workflow_dispatch: {}
 
 concurrency:
