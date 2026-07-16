@@ -371,10 +371,12 @@ location /graphql {
 
 The response is stored only if it carries that header with an **affirmative**
 value — `yes`, `1`, or `on`, case-insensitive, matched whole. Everything else
-refuses the store: header absent, `no`, empty, a value like `note`, or the same
-header sent twice with conflicting values (ambiguous, so the only safe reading
-is "don't"). It **fails closed** by construction — any doubt is a cache miss,
-never a wrong serve.
+refuses the store: header absent, `no`, a value like `note`, or the same header
+sent twice with conflicting values (ambiguous, so the only safe reading is
+"don't"). It **fails closed** by construction — any doubt is a cache miss,
+never a wrong serve. (An *empty* value reads as absent: nginx does not forward
+an empty-valued header from the upstream, so it never reaches the gate — either
+way, no store.)
 
 Two details worth knowing:
 

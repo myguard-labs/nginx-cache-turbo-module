@@ -4750,21 +4750,38 @@ def test_require_header(ng: Nginx) -> None:
         _, b2, h2 = fetch(ng.port, p, headers={"X-Want-Cacheable": val})
         assert h2.get("x-ct-status") == "HIT" and b2 == b1, \
             f"{val!r} is affirmative -> must store and HIT, got {h2.get('x-ct-status')}"
-
-    # the affirmative header is STRIPPED before store: this cache is its
-    # intended consumer, a HIT must not replay the origin's internal signal.
-    assert "x-graphql-cacheable" not in {k.lower() for k in h2}, \
-        "the store opt-in header must be stripped, not replayed on a HIT"
+        # STRIPPED before store, asserted per value rather than once after the
+        # loop: this cache is the header's intended consumer, and a HIT must not
+        # replay the origin's internal store signal downstream. Checked inside
+        # the loop so every affirmative proves its own strip -- a single assert
+        # after the loop would silently only ever test the last value.
+        assert "x-graphql-cacheable" not in {k.lower() for k in h2}, \
+            f"{val!r}: the store opt-in header must be stripped, not replayed"
 
     # every non-affirmative value refuses the store -> the second fetch is a
     # fresh origin body, never a HIT. "note"/"1x"/"onward" specifically catch a
     # prefix compare that would read them as affirmative.
-    for i, val in enumerate(("no", "", "0", "note", "1x", "onward", "yes-but")):
+    # No "" case here: nginx drops an empty-valued response header in the proxy
+    # layer, so it never reaches the gate at all -- an "" row would silently be
+    # a second copy of the /gql/absent case below, not an empty-value test. The
+    # gate's own len-based checks still refuse an empty value if one ever does
+    # arrive (a non-proxy content phase, say); it just isn't reachable here.
+    for i, val in enumerate(("no", "0", "note", "1x", "onward", "yes-but")):
         p = f"/gql/no{i}"
         _, b1, _ = fetch(ng.port, p, headers={"X-Want-Cacheable": val})
         _, b2, h2 = fetch(ng.port, p, headers={"X-Want-Cacheable": val})
         assert h2.get("x-ct-status") == "MISS" and b2 != b1, \
             f"{val!r} is not affirmative -> must never store, got {h2.get('x-ct-status')}"
+
+    # Pins WHY there is no "" row above, on the ungated control location so the
+    # proxy layer's own behaviour is what's observed: nginx does not forward an
+    # empty-valued response header (the origin demonstrably sends
+    # "X-GraphQL-Cacheable: "). If a future nginx starts forwarding it, this
+    # fails and the "" case becomes worth testing on the gate directly.
+    _, _, he = fetch(ng.port, "/nogql/empty", headers={"X-Want-Cacheable": ""})
+    assert he.get("X-GraphQL-Cacheable") is None, \
+        "nginx now forwards an empty-valued header -- add an empty-value case " \
+        "to the refusal loop above, it is no longer just /gql/absent"
 
     # header ABSENT entirely -> refuse (the fail-closed default of the gate)
     _, ba1, _ = fetch(ng.port, "/gql/absent")
