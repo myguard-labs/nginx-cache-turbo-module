@@ -1326,4 +1326,5 @@ bodies), and the caveats are in **[BENCHMARK.md](BENCHMARK.md)**.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+BSD-2-Clause — the same license as nginx and Angie, the servers this module is
+built to load into. See [LICENSE](LICENSE).

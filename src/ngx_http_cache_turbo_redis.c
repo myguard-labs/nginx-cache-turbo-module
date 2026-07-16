@@ -1,6 +1,6 @@
 /*
- * Copyright (c) 2026 Eilander
- * SPDX-License-Identifier: MIT
+ * Copyright (C) 2026 Thijs Eilander
+ * SPDX-License-Identifier: BSD-2-Clause
  *
  * http-cache-turbo — L2 Redis driver (v2b).
  *

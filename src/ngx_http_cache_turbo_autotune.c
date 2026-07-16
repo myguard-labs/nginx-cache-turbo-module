@@ -1,6 +1,6 @@
 /*
- * Copyright (c) 2026 Eilander
- * SPDX-License-Identifier: MIT
+ * Copyright (C) 2026 Thijs Eilander
+ * SPDX-License-Identifier: BSD-2-Clause
  *
  * Live autotune within preset bands (v4-3). Ported from the wp-redis PHP
  * implementation (eilandert/wp-redis/includes/class-swr-autotune.php): the same
