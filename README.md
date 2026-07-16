@@ -23,6 +23,7 @@ A built-in page cache for nginx. Think of it as a tiny Varnish that lives
   - [When to pick which](#when-to-pick-which)
 - [Quick start](#quick-start)
 - [What it will and won't cache](#what-it-will-and-wont-cache)
+  - [Letting the origin decide (`cache_turbo_require_header`)](#letting-the-origin-decide-cache_turbo_require_header)
   - [Conditional requests (`304 Not Modified`)](#conditional-requests-304-not-modified)
   - [Auto-Vary (read the response `Vary`)](#auto-vary-read-the-response-vary)
 - [CMS backends (`cache_turbo_backend`)](#cms-backends-cache_turbo_backend)
@@ -347,6 +348,45 @@ It also honours a few **request** `Cache-Control` directives: `no-cache` /
 (a force-refresh); `no-store` runs the request to the origin and does **not**
 store the response; and `only-if-cached` answers `504 Gateway Timeout` when the
 page is in neither L1 nor L2, instead of contacting the origin.
+
+### Letting the origin decide (`cache_turbo_require_header`)
+
+Everything above is the module deciding from the HTTP it can see. Some origins
+answer things HTTP cannot separate: a **GraphQL** endpoint serves a read query
+and a write mutation on the *same* URI and method, and reports errors as
+`200 OK` with an `errors` member in the body. Nothing at the HTTP level tells
+those apart, and the module deliberately never parses the body (it stays an
+opaque blob), so only the application can say.
+
+`cache_turbo_require_header` inverts the default on a location — from *cacheable
+unless something vetoes it* to **uncacheable unless the origin affirms it**:
+
+```nginx
+location /graphql {
+    cache_turbo                main;
+    cache_turbo_require_header X-GraphQL-Cacheable;   # a header NAME
+    proxy_pass http://app;
+}
+```
+
+The response is stored only if it carries that header with an **affirmative**
+value — `yes`, `1`, or `on`, case-insensitive, matched whole. Everything else
+refuses the store: header absent, `no`, empty, a value like `note`, or the same
+header sent twice with conflicting values (ambiguous, so the only safe reading
+is "don't"). It **fails closed** by construction — any doubt is a cache miss,
+never a wrong serve.
+
+Two details worth knowing:
+
+- The argument is a plain header **name**, not a `$variable`. The value is read
+  from the *response*; a variable here would be evaluated against the *request*
+  and quietly gate on the wrong thing, so the name is validated at config time.
+- The header is **stripped before storing** (like `Age` and the RFC 9213
+  targeted directives): this cache is its intended consumer, and a hit must not
+  replay the origin's internal signal downstream.
+
+Unset — the default, and every location that doesn't name it — leaves the normal
+rules above completely untouched.
 
 ### Conditional requests (`304 Not Modified`)
 
@@ -1051,6 +1091,9 @@ http {
             cache_turbo_bypass            $cookie_session $arg_nocache;  # skip lookup, still store
             cache_turbo_no_store          $cookie_session;              # don't store the response
 
+            # ── let the origin decide (inverts the store default here) ──
+            cache_turbo_require_header    X-GraphQL-Cacheable;          # store ONLY if origin affirms
+
             # ── Vary handling ───────────────────────────────────────────
             cache_turbo_auto_vary         off;       # on = read response Vary, split automatically
 
@@ -1105,6 +1148,7 @@ http {
 | `cache_turbo_max_size SIZE` | `server`, `location` | `1m` | Don't cache responses bigger than this. |
 | `cache_turbo_bypass VAR...` | `server`, `location` | — | If any variable is non-empty and not `0`, skip the cache lookup (go to origin) — but still store the fresh response. E.g. `cache_turbo_bypass $cookie_session $arg_nocache;` to always revalidate logged-in users. |
 | `cache_turbo_no_store VAR...` | `server`, `location` | — | If any variable is non-empty and not `0`, do **not** store the response. E.g. `cache_turbo_no_store $cookie_session;`. |
+| `cache_turbo_require_header NAME` | `server`, `location` | — | **Inverts the store default** on this location: nothing is stored unless the *response* carries `NAME` with an affirmative value (`yes`/`1`/`on`, case-insensitive, matched whole). Header absent, `no`, empty, or sent twice with conflicting values ⇒ no store — it **fails closed**. For origins HTTP cannot judge: a GraphQL endpoint answers queries and mutations on one URI+method and returns errors as `200` ([details](#letting-the-origin-decide-cache_turbo_require_header)). Takes a header **name**, not a `$variable` (the value is read from the response; a variable would evaluate against the request), validated at config time. Stripped before storing, so a hit never replays it. Unset ⇒ inert. |
 | `cache_turbo_purge on` | `server`, `location` | `off` | Allow a `PURGE <uri>` request to drop that URI's entry from L1 (+L2). Gate the location with `allow`/`deny`. E.g. `curl -X PURGE http://host/blog/post-42`. |
 | `cache_turbo_cache_control respect\|honor\|ignore` | `server`, `location` | `respect` | How the response `Cache-Control` is treated. **respect** (default): it gates storage and reshapes the stale window as written; the fresh TTL comes from `cache_turbo_valid`. **honor**: also take the fresh TTL from the response's own freshness headers, in RFC 9213 precedence order — `Surrogate-Control: max-age` (Fastly/Akamai) > `CDN-Cache-Control: s-maxage`/`max-age` (Cloudflare) > `Cache-Control: s-maxage`/`max-age` > `Expires` — falling back to `cache_turbo_valid` when none is present. The two **targeted** headers let an origin hand this shared cache a different TTL than the browser's `Cache-Control`; a targeted `no-store`/`private`/`max-age=0` also vetoes storage, and both targeted headers are stripped before store so they never replay downstream (see [Behind a CDN / multi-tier caching](#behind-a-cdn--multi-tier-caching)). **ignore**: discard the response `Cache-Control` **entirely** (mirror of nginx's `proxy_ignore_headers Cache-Control`) — `no-store`/`no-cache`/`private`/`max-age=0`/`s-maxage=0` no longer forbid storage, `must-revalidate`/`proxy-revalidate`/`stale-while-revalidate=N`/`stale-if-error=N` no longer reshape the window (it stays `cache_turbo_valid` × `cache_turbo_stale_mult`), and the TTL comes from `cache_turbo_valid`; use it for an origin that blankets shareable pages with `max-age=0, must-revalidate`. The `Set-Cookie` and request-`Authorization` safety floors are **not** affected by any mode — a per-user response is still never cached. A CMS preset (`cache_turbo_backend`) defaults this to `honor`. |
 | `cache_turbo_background_update on` / `off` | `server`, `location` | `on` | The stale-while-revalidate behaviour. **On** (default): a stale page is served *immediately* while one request quietly refreshes it in the background — **nobody waits on the backend**, and if that refresh hits a 5xx/timeout the old copy is left untouched and keeps being served (**stale-if-error**). **Off**: the chosen refresher regenerates inline (it waits for the backend and serves the fresh body), the pre-SWR behaviour. |

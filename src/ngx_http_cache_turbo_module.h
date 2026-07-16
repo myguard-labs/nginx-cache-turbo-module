@@ -617,6 +617,25 @@ typedef struct {
      * both tiers. Tags live only in L2, so this needs cache_turbo_redis. */
     ngx_http_complex_value_t *tag;        /* tag list expression, or NULL     */
 
+    /* Explicit upstream store opt-in (cache_turbo_require_header <name>).
+     * When set, a response is captured ONLY if it carries <name> with an
+     * affirmative value ("yes"/"1"/"on", case-insensitive). Everything else --
+     * header absent, "no", empty, unparseable -- refuses the store.
+     *
+     * This inverts the module's usual "cacheable unless something vetoes it"
+     * default into "uncacheable unless the origin says otherwise", for origins
+     * where only the application can decide: a GraphQL endpoint answers a query
+     * and a mutation on the same URI+method, and returns errors as HTTP 200
+     * with an `errors` member in the body. No amount of HTTP-level inspection
+     * separates those, and the module deliberately does not parse the body
+     * (it stays an opaque blob), so the decision has to come from upstream.
+     *
+     * Fails CLOSED by construction: any doubt = no store = a cache miss, never
+     * a wrong serve. The name is stripped before store (like Age / the RFC 9213
+     * targeted directives) -- this cache is its intended consumer, and a HIT
+     * must not replay it downstream. len == 0 = unset (default). */
+    ngx_str_t                require_header;
+
     /* Key normalize (v3-1). The $cache_turbo_normalized_args variable rebuilds
      * r->args dropping tracking params and sorting the rest, so requests that
      * differ only in arg order or carry junk (utm_*, fbclid, ...) hash to one

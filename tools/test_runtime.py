@@ -343,6 +343,14 @@ class Origin:
                                  "application/json; charset=utf-8")
                 if "bare" not in self.path:
                     self.send_header("X-Backend", "origin-42")
+                # Same request-echo contract as do_POST: a test drives the
+                # cache_turbo_require_header gate by asking for an exact
+                # response-header value, including a deliberately duplicated or
+                # non-affirmative one, without a path marker per case.
+                want_c = self.headers.get("X-Want-Cacheable")
+                if want_c is not None:
+                    for v in want_c.split("|"):
+                        self.send_header("X-GraphQL-Cacheable", v)
                 # Path-marker-driven response headers, so a test can drive the
                 # RFC 9111 shared-cache floor (these responses must NOT be
                 # stored). The marker is matched in the path so $uri keying still
@@ -1447,6 +1455,31 @@ http {{
             cache_turbo_backend kirby;
             cache_turbo_key     $uri;
             cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # ---- require_header (explicit upstream store opt-in) ----------------
+        # The gate INVERTS the store default here: nothing is captured unless the
+        # origin affirms it. X-CT-Status is mandatory to test this at all -- every
+        # refusal case (header absent / "no" / duplicated / empty) produces a
+        # plain MISS, and a MISS has no x-cache, so "x-cache not in headers"
+        # cannot tell a working gate from a gate that never runs.
+        location /gql/ {{
+            cache_turbo              main;
+            cache_turbo_key          $uri;
+            cache_turbo_valid        30s;
+            cache_turbo_require_header X-GraphQL-Cacheable;
+            add_header               X-CT-Status $cache_turbo_status always;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        # Same origin, NO gate: proves the refusals above come from the directive
+        # and not from something else in the response (an unset gate must leave
+        # the module's normal "cacheable unless vetoed" path untouched).
+        location /nogql/ {{
+            cache_turbo         main;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            add_header          X-CT-Status $cache_turbo_status always;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
@@ -4699,6 +4732,65 @@ def test_key_cookie(ng: Nginx) -> None:
         "a seg cookie in a second Cookie header must key identically"
 
 
+def test_require_header(ng: Nginx) -> None:
+    """PR-A: cache_turbo_require_header inverts the store default on a location
+    from "cacheable unless vetoed" to "uncacheable unless the origin affirms
+    it". Only the application can decide for an origin like GraphQL, which
+    answers queries and mutations on the same URI+method and returns errors as
+    HTTP 200. Every assert is on a POSITIVE X-CT-Status: each refusal case is a
+    plain MISS, and a MISS carries no x-cache, so an absence assert here would
+    pass even if the gate never ran."""
+    # affirmative -> stored and served. "yes"/"1"/"on" each on their own URI so
+    # one value's entry can never satisfy another's assert.
+    for i, val in enumerate(("yes", "1", "on", "YES", "On")):
+        p = f"/gql/ok{i}"
+        _, b1, h1 = fetch(ng.port, p, headers={"X-Want-Cacheable": val})
+        assert h1.get("x-ct-status") == "MISS", \
+            f"cold fetch of {p} should be MISS, got {h1.get('x-ct-status')}"
+        _, b2, h2 = fetch(ng.port, p, headers={"X-Want-Cacheable": val})
+        assert h2.get("x-ct-status") == "HIT" and b2 == b1, \
+            f"{val!r} is affirmative -> must store and HIT, got {h2.get('x-ct-status')}"
+
+    # the affirmative header is STRIPPED before store: this cache is its
+    # intended consumer, a HIT must not replay the origin's internal signal.
+    assert "x-graphql-cacheable" not in {k.lower() for k in h2}, \
+        "the store opt-in header must be stripped, not replayed on a HIT"
+
+    # every non-affirmative value refuses the store -> the second fetch is a
+    # fresh origin body, never a HIT. "note"/"1x"/"onward" specifically catch a
+    # prefix compare that would read them as affirmative.
+    for i, val in enumerate(("no", "", "0", "note", "1x", "onward", "yes-but")):
+        p = f"/gql/no{i}"
+        _, b1, _ = fetch(ng.port, p, headers={"X-Want-Cacheable": val})
+        _, b2, h2 = fetch(ng.port, p, headers={"X-Want-Cacheable": val})
+        assert h2.get("x-ct-status") == "MISS" and b2 != b1, \
+            f"{val!r} is not affirmative -> must never store, got {h2.get('x-ct-status')}"
+
+    # header ABSENT entirely -> refuse (the fail-closed default of the gate)
+    _, ba1, _ = fetch(ng.port, "/gql/absent")
+    _, ba2, ha2 = fetch(ng.port, "/gql/absent")
+    assert ha2.get("x-ct-status") == "MISS" and ba2 != ba1, \
+        "no opt-in header at all must refuse the store"
+
+    # DUPLICATED + conflicting ("yes" and "no") -> ambiguous -> refuse, in BOTH
+    # orders: the gate scans the whole headers_out list, so a first-match-wins
+    # implementation would store the yes-first case and leak an uncacheable body.
+    for order in ("yes|no", "no|yes"):
+        p = f"/gql/dup{order.split('|')[0]}"
+        _, bd1, _ = fetch(ng.port, p, headers={"X-Want-Cacheable": order})
+        _, bd2, hd2 = fetch(ng.port, p, headers={"X-Want-Cacheable": order})
+        assert hd2.get("x-ct-status") == "MISS" and bd2 != bd1, \
+            f"conflicting duplicate opt-in ({order}) is ambiguous -> must refuse"
+
+    # UNSET on a location => gate inert => the module's normal path is untouched.
+    # Without this, a gate that refused everything everywhere would still pass
+    # every refusal assert above.
+    _, bn1, _ = fetch(ng.port, "/nogql/page")
+    _, bn2, hn2 = fetch(ng.port, "/nogql/page")
+    assert hn2.get("x-ct-status") == "HIT" and bn2 == bn1, \
+        "an unset require_header must leave normal caching alone"
+
+
 def test_status_variable(ng: Nginx) -> None:
     """$cache_turbo_status (echoed as X-CT-Status): MISS on the cold fetch,
     HIT on the second, BYPASS when a cache_turbo_bypass predicate trips. Also
@@ -6919,6 +7011,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_cache_and_purge_respect_access_control(ng)
     test_bypass(ng)
     test_bypass_uri(ng)
+    test_require_header(ng)
     test_key_cookie(ng)
     test_status_variable(ng)
     test_status_stale(ng, origin)

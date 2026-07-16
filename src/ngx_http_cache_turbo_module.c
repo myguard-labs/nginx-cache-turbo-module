@@ -79,6 +79,10 @@ static char *ngx_http_cache_turbo_memcached_conf(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 static char *ngx_http_cache_turbo_tag(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
+static char *ngx_http_cache_turbo_require_header(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
+static ngx_int_t ngx_http_cache_turbo_require_hdr_ok(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf);
 static char *ngx_http_cache_turbo_preset(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static ngx_int_t ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r);
@@ -306,6 +310,13 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
     { ngx_string("cache_turbo_tag"),
       NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
       ngx_http_cache_turbo_tag,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+
+    { ngx_string("cache_turbo_require_header"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
+      ngx_http_cache_turbo_require_header,
       NGX_HTTP_LOC_CONF_OFFSET,
       0,
       NULL },
@@ -4380,7 +4391,8 @@ ngx_http_cache_turbo_response_cacheable(ngx_http_request_t *r)
  * filter runs), so it never reaches this serialiser.
  */
 static ngx_int_t
-ngx_http_cache_turbo_header_skip(u_char *name, size_t nlen)
+ngx_http_cache_turbo_header_skip(ngx_http_cache_turbo_loc_conf_t *clcf,
+    u_char *name, size_t nlen)
 {
     static const char  *skip[] = {
         "Connection", "Keep-Alive", "Proxy-Authenticate",
@@ -4403,6 +4415,16 @@ ngx_http_cache_turbo_header_skip(u_char *name, size_t nlen)
         {
             return 1;
         }
+    }
+
+    /* The configured store opt-in header (cache_turbo_require_header) is for
+     * this cache to read, exactly like the RFC 9213 targeted directives above:
+     * strip it so a HIT never replays the origin's internal store signal. */
+    if (clcf->require_header.len == nlen
+        && nlen != 0
+        && ngx_strncasecmp(name, clcf->require_header.data, nlen) == 0)
+    {
+        return 1;
     }
 
     return 0;
@@ -4532,6 +4554,7 @@ ngx_http_cache_turbo_header_filter(ngx_http_request_t *r)
         && !ctx->req_no_store
         && ngx_http_cache_turbo_status_ttl(clcf, r->headers_out.status) >= 0
         && ngx_http_cache_turbo_response_cacheable(r)
+        && ngx_http_cache_turbo_require_hdr_ok(r, clcf)
         && !ngx_http_cache_turbo_response_encoded(r)
         && (clcf->no_store == NULL
             || ngx_http_test_predicates(r, clcf->no_store) == NGX_OK))
@@ -4832,7 +4855,7 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
                 i = 0;
             }
             if (h[i].hash == 0 || h[i].key.len == 0
-                || ngx_http_cache_turbo_header_skip(h[i].key.data,
+                || ngx_http_cache_turbo_header_skip(clcf, h[i].key.data,
                                                     h[i].key.len))
             {
                 continue;
@@ -4905,7 +4928,7 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
                     i = 0;
                 }
                 if (h[i].hash == 0 || h[i].key.len == 0
-                    || ngx_http_cache_turbo_header_skip(h[i].key.data,
+                    || ngx_http_cache_turbo_header_skip(clcf, h[i].key.data,
                                                         h[i].key.len))
                 {
                     continue;
@@ -5652,6 +5675,125 @@ ngx_http_cache_turbo_tag(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     }
 
     return NGX_CONF_OK;
+}
+
+
+/*
+ * cache_turbo_require_header <name>: the explicit upstream store opt-in.
+ * A plain header NAME, not a complex value -- the module reads the RESPONSE
+ * header of that name, and a $variable here would be evaluated against the
+ * request, quietly gating on the wrong thing.
+ */
+static char *
+ngx_http_cache_turbo_require_header(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf)
+{
+    ngx_http_cache_turbo_loc_conf_t  *clcf = conf;
+
+    ngx_str_t  *value = cf->args->elts;
+    ngx_uint_t  i;
+
+    if (clcf->require_header.len) {
+        return "is duplicate";
+    }
+
+    if (value[1].len == 0) {
+        return "requires a header name";
+    }
+
+    /* A header name is a token (RFC 9110 5.6.2). Reject anything else at config
+     * time rather than compare a name that can never match at runtime -- a
+     * store gate that silently never passes reads as "the cache is broken",
+     * and one that silently never fires would be worse. */
+    for (i = 0; i < value[1].len; i++) {
+        u_char  c = value[1].data[i];
+
+        if (c <= 0x20 || c >= 0x7f || c == ':' || c == ',' || c == ';'
+            || c == '(' || c == ')' || c == '<' || c == '>' || c == '@'
+            || c == '\\' || c == '"' || c == '/' || c == '[' || c == ']'
+            || c == '?' || c == '=' || c == '{' || c == '}')
+        {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "invalid header name \"%V\" in "
+                               "\"cache_turbo_require_header\"", &value[1]);
+            return NGX_CONF_ERROR;
+        }
+    }
+
+    clcf->require_header = value[1];
+
+    return NGX_CONF_OK;
+}
+
+
+/*
+ * The store gate itself. Unset (len == 0) => 1, so every existing config keeps
+ * the module's normal "cacheable unless vetoed" behaviour untouched.
+ *
+ * Set => the named response header must be present AND affirmative. Scans the
+ * whole headers_out list rather than stopping at the first match: an upstream
+ * that emits the header twice ("yes" and "no") is ambiguous, and the only safe
+ * reading of an ambiguous store signal is "do not store" -- so ANY
+ * non-affirmative occurrence vetoes, whatever order they arrive in.
+ */
+static ngx_int_t
+ngx_http_cache_turbo_require_hdr_ok(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf)
+{
+    ngx_list_part_t  *part;
+    ngx_table_elt_t  *h;
+    ngx_uint_t        i, found = 0;
+
+    if (clcf->require_header.len == 0) {
+        return 1;
+    }
+
+    part = &r->headers_out.headers.part;
+    h = part->elts;
+
+    for (i = 0; /* void */ ; i++) {
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            h = part->elts;
+            i = 0;
+        }
+        if (h[i].hash == 0 || h[i].key.len != clcf->require_header.len) {
+            continue;
+        }
+        if (ngx_strncasecmp(h[i].key.data, clcf->require_header.data,
+                            clcf->require_header.len) != 0)
+        {
+            continue;
+        }
+
+        /* Affirmative values only, matched whole: "yes" / "1" / "on". A prefix
+         * compare would read "note" as "no"-negative and, worse, "yes-but-not-
+         * really" as affirmative. */
+        if (!((h[i].value.len == 3
+               && ngx_strncasecmp(h[i].value.data, (u_char *) "yes", 3) == 0)
+              || (h[i].value.len == 2
+                  && ngx_strncasecmp(h[i].value.data, (u_char *) "on", 2) == 0)
+              || (h[i].value.len == 1 && h[i].value.data[0] == '1')))
+        {
+            ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                           "cache_turbo: \"%V\" not cached: %V is not "
+                           "affirmative", &r->uri, &clcf->require_header);
+            return 0;
+        }
+
+        found = 1;
+    }
+
+    if (!found) {
+        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "cache_turbo: \"%V\" not cached: no %V header",
+                       &r->uri, &clcf->require_header);
+    }
+
+    return found ? 1 : 0;
 }
 
 
@@ -7995,6 +8137,9 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     if (conf->tag == NULL) {
         conf->tag = prev->tag;
     }
+
+    ngx_conf_merge_str_value(conf->require_header, prev->require_header,
+                             "");
 
     /* L2 backend selection + connection knobs. These are behavioural tunables,
      * not backend identity, so they inherit independently as before. */
