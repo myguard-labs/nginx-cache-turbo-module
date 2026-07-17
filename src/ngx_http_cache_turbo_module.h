@@ -675,6 +675,12 @@ typedef struct {
     /* CI-only fault injection; production/package builds do not define the
      * feature macro and therefore expose neither this field nor its directive. */
     ngx_flag_t               test_restore_alloc_fail;
+    /* Force the body filter onto the file-backed delegate path even when the
+     * incoming buffers are in memory, so the sendfile-abort branch (which is
+     * fs/directio-alignment dependent and non-deterministic in the harness) is
+     * exercised deterministically. Delegates the UNMODIFIED in-memory chain
+     * downstream and abandons capture; it does NOT forge b->in_file. */
+    ngx_flag_t               test_force_file_buf;
 #endif
 
 
