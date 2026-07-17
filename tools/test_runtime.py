@@ -26,6 +26,7 @@ import http.client
 import http.server
 import json
 import pathlib
+import re
 import shlex
 import signal
 import socket
@@ -513,6 +514,18 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             cache_turbo_key   $uri;
             cache_turbo_valid 30s;
             cache_turbo_redis redis://:{redis_password}@127.0.0.1:{redis_auth_port}/2;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # AUTH+SELECT DSN with a keepalive pool (v15 + v5 combined): a pooled
+        # reused connection must skip the AUTH/SELECT preamble entirely (it was
+        # already authenticated + SELECTed when first opened). See
+        # test_l2_keepalive_no_auth_replay.
+        location /l2authka/ {{
+            cache_turbo       main;
+            cache_turbo_key   $uri;
+            cache_turbo_valid 30s;
+            cache_turbo_redis redis://:{redis_password}@127.0.0.1:{redis_auth_port}/2 keepalive=4 keepalive_timeout=30s;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 """
@@ -2221,6 +2234,106 @@ class RedisServer:
             self.process.terminate()
             self.process.wait(timeout=10)
         self.process = None
+
+    def start_monitor(self) -> "RedisMonitor":
+        """Open a raw MONITOR connection: Redis echoes every command any client
+        executes against this instance, timestamped, as it runs. Used to prove a
+        wire-level negative (e.g. AUTH/SELECT NOT resent on a reused connection)
+        that a state-inspection query (EXISTS/PTTL/...) cannot show — those only
+        prove the end state, not what was said on the wire to reach it."""
+        return RedisMonitor(self)
+
+
+class RedisMonitor:
+    """Background reader of `MONITOR` output for one RedisServer. Requires its
+    own raw socket (redis-cli MONITOR blocks the process), authenticating first
+    if the server has a password. Collects the command name (first RESP token
+    after the timestamp/db/addr preamble) of every command seen, so a caller can
+    assert exact counts of e.g. AUTH / SELECT / GET / SET without parsing full
+    MONITOR line syntax."""
+
+    _CMD_RE = re.compile(r'"([^"\\]*(?:\\.[^"\\]*)*)"')
+
+    def __init__(self, redis: "RedisServer") -> None:
+        self.redis = redis
+        self._sock: socket.socket | None = None
+        self._thread: threading.Thread | None = None
+        self._lines: list[str] = []
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+
+    def __enter__(self) -> "RedisMonitor":
+        self._sock = socket.create_connection(("127.0.0.1", self.redis.port), 5)
+        self._sock.settimeout(0.2)
+        if self.redis.password:
+            self._send(b"AUTH", self.redis.password.encode())
+        self._send(b"MONITOR")
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        time.sleep(0.1)  # let MONITOR register before the caller issues traffic
+        return self
+
+    def _send(self, *args: bytes) -> None:
+        cmd = b"*%d\r\n" % len(args)
+        for a in args:
+            cmd += b"$%d\r\n%s\r\n" % (len(a), a)
+        assert self._sock is not None
+        self._sock.sendall(cmd)
+        # drain the one-line reply (+OK or the MONITOR banner)
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            try:
+                if self._sock.recv(4096):
+                    return
+            except socket.timeout:
+                continue
+
+    def _run(self) -> None:
+        buf = b""
+        assert self._sock is not None
+        while not self._stop.is_set():
+            try:
+                chunk = self._sock.recv(65536)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf += chunk
+            while b"\r\n" in buf:
+                line, buf = buf.split(b"\r\n", 1)
+                with self._lock:
+                    self._lines.append(line.decode(errors="replace"))
+
+    def commands_seen(self) -> list[str]:
+        """Uppercased first-token command name of each MONITOR line captured so
+        far (e.g. ['AUTH', 'SELECT', 'GET', ...]); the MONITOR connection's own
+        AUTH is included by Redis too, so callers should checkpoint (clear) after
+        __enter__ if the server has a password and that AUTH must not be counted."""
+        with self._lock:
+            lines = list(self._lines)
+        out = []
+        for ln in lines:
+            m = self._CMD_RE.findall(ln)
+            if m:
+                out.append(m[0].upper())
+        return out
+
+    def checkpoint(self) -> None:
+        """Discard everything captured so far (e.g. the monitor's own AUTH)."""
+        with self._lock:
+            self._lines.clear()
+
+    def __exit__(self, *exc) -> None:
+        self._stop.set()
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+        if self._thread is not None:
+            self._thread.join(timeout=2)
 
 
 class MemcachedServer:
@@ -5603,6 +5716,55 @@ def test_l2_dsn_auth_db(ng: Nginx, origin: Origin,
     assert h.get("x-cache") == "HIT", "second read should be an L1 hit"
 
 
+def test_l2_keepalive_no_auth_replay(ng: Nginx, origin: Origin,
+                                     redis_auth: RedisServer) -> None:
+    """Deferred enhancement: prove a pooled Redis connection does NOT replay the
+    AUTH/SELECT preamble on reuse (ngx_http_cache_turbo_redis.c: op->reused skips
+    ngx_http_cache_turbo_redis_preamble() entirely — see redis_launch()). A
+    state-inspection assertion (EXISTS/PTTL) cannot show this: the object lands
+    in the right db either way, whether or not the preamble ran on every op. Only
+    a wire-level trace (Redis MONITOR) tells the difference between "no replay"
+    and "replayed harmlessly by hitting the same already-authed session".
+
+    /l2authka/ pairs the v5 AUTH+SELECT DSN with a keepalive=4 pool. A burst of
+    DISTINCT-URI misses each open one L2 GET + one L2 SET; with keepalive the
+    same handful of pooled connections serve the whole burst. Exactly one AUTH
+    and one SELECT should appear on the wire per connection actually opened
+    (bounded by the pool cap), never once per op."""
+    stamp = time.time_ns()
+    n = 20
+
+    with redis_auth.start_monitor() as mon:
+        mon.checkpoint()          # drop the monitor connection's own AUTH
+        for i in range(n):
+            fetch(ng.port, f"/l2authka/auth-{stamp}-{i}")
+        time.sleep(0.6)           # let fire-and-forget L2 SETs land
+        cmds = mon.commands_seen()
+
+    auths = cmds.count("AUTH")
+    selects = cmds.count("SELECT")
+    gets = cmds.count("GET")
+    sets = cmds.count("SET")
+
+    assert gets + sets >= n, \
+        f"burst did not reach redis as expected (GET={gets} SET={sets}, n={n})"
+    # Bounded by the keepalive pool cap (4), not by request count (20): if the
+    # preamble were replayed per-op this would read AUTH=n, SELECT=n instead.
+    assert 0 < auths <= 4, \
+        f"AUTH replayed on reuse: saw {auths} AUTH commands for {n} ops " \
+        f"over a keepalive=4 pool (want <= pool cap, not one per op)"
+    assert 0 < selects <= 4, \
+        f"SELECT replayed on reuse: saw {selects} SELECT commands for {n} ops " \
+        f"over a keepalive=4 pool (want <= pool cap, not one per op)"
+    assert auths < n and selects < n, \
+        f"preamble command count ({auths} AUTH, {selects} SELECT) scaled with " \
+        f"op count ({n}) -- looks replayed on every op, not just on new conns"
+
+    # the pooled channel still serves correctly after the burst
+    _, _, h = fetch(ng.port, f"/l2authka/auth-{stamp}-0")
+    assert h.get("x-cache") == "HIT", "keepalive+auth location broke the hot path"
+
+
 def test_l2_db_select(ng: Nginx, origin: Origin,
                       redis: RedisServer) -> None:
     """SELECT-only preamble (db=1, no auth): the object lands in db 1, not 0."""
@@ -6136,6 +6298,70 @@ def test_lock_self_heal(ng: Nginx, origin: Origin, redis: RedisServer) -> None:
             f"self-heal: want exactly 1 regen after lock expiry, got {regens}; "
             f"recent origin paths: {recent}")
     drain_origin(origin)       # v8: settle async bg refreshes before the next test
+
+
+def test_lock_redis_outage_fallback(ng: Nginx, origin: Origin,
+                                    redis: RedisServer) -> None:
+    """Deferred enhancement: deterministic mid-flight Redis outage coverage for
+    the lock NGX_ERROR fallback (ngx_http_cache_turbo_module.c ~3166-3206). When
+    the cross-node SET NX PX lock channel itself fails (Redis down, not merely
+    "peer holds the lock" == NGX_DECLINED), the module must NOT treat that the
+    same as a peer holding the lock (which would serve stale forever with no
+    regen) — it degrades to per-box single-flight and regenerates locally, since
+    `ctx->lock_result == NGX_OK || ctx->lock_result == NGX_ERROR` both fall into
+    the "we own the regen" branch, only NGX_DECLINED (genuine peer-holds) serves
+    stale without regenerating.
+
+    This is a REAL, distinct branch from test_lock_self_heal (which exercises a
+    PEER holding a live lock that later PX-expires — NGX_DECLINED then NGX_OK).
+    Here the lock channel never even completes: Redis is stopped between the
+    prime and the stale read, so the NX attempt itself gets ECONNREFUSED
+    (immediate, deterministic — no timeout hang, since this is a plain TCP
+    connect failure, not a slow-loris). Uses /lock/ (cache_turbo_lock off
+    isolates the stale-path NX under test, same as test_multinode_lock)."""
+    uri = "/lock/redis-outage"
+    redis.cli("DEL", l2_key(uri), lock_key(uri))
+
+    s, body_a, h = fetch(ng.port, uri)             # prime -> origin -> L1 + L2
+    assert s == 200 and "x-cache" not in h, "prime should miss to origin"
+    assert wait_for(lambda: redis.cli("EXISTS", l2_key(uri)) == "1"), \
+        "prime never wrote L2"
+
+    time.sleep(2.4)                                # now stale (fresh=2s)
+
+    # Simulate the outage: Redis goes away mid-flight, AFTER the prime succeeded
+    # and BEFORE any refresh's lock NX is attempted. Every subsequent lock
+    # attempt on this key fails at connect(), i.e. NGX_ERROR, never NGX_DECLINED.
+    redis.stop()
+    try:
+        drain_origin(origin)           # absorb any stray async bg before counting
+        base = origin.hits
+
+        # Hammer the stale key while Redis is down. The dice fires a refresh;
+        # losing Redis for the lock must not (a) hang the request, (b) serve
+        # stale forever with zero regen, or (c) regen on every single reader
+        # (that would mean single-flight collapsed entirely, not "degraded to
+        # per-box"). Expect exactly one origin regen, completing promptly.
+        t0 = time.monotonic()
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            s, _, _ = fetch(ng.port, uri)
+            assert s == 200, f"stale read during redis outage returned {s}"
+            time.sleep(0.05)
+        elapsed = time.monotonic() - t0
+        assert elapsed < 5.0, \
+            f"reads during redis outage stalled ({elapsed:.1f}s) -- NGX_ERROR " \
+            f"path did not fail fast"
+        time.sleep(0.3)                # let any in-flight regen land
+
+        regens = origin.hits - base
+        assert regens == 1, \
+            f"lock NGX_ERROR fallback failed: {regens} origin regens during a " \
+            f"redis outage (want exactly 1 -- per-box single-flight degrade, " \
+            f"not 0 [stuck stale] and not >1 [single-flight collapsed])"
+    finally:
+        redis.start()                  # restore for cleanup / assert_clean_logs
+        drain_origin(origin)
 
 
 def test_cold_single_flight_cross_node(ng: Nginx, origin: Origin,
@@ -7109,8 +7335,10 @@ def run_all(ng: Nginx, origin: Origin,
         test_l2_db_select(ng, origin, redis)         # SELECT-only preamble
         test_purge_all_escapes_redis_prefix_glob(ng, redis)
         test_purge_all_clears_l2(ng, origin, redis)  # last L2: empties L2
+        test_lock_redis_outage_fallback(ng, origin, redis)  # NGX_ERROR lock fallback (stops/restarts redis)
     if redis_auth is not None:
         test_l2_dsn_auth_db(ng, origin, redis_auth)  # AUTH+SELECT preamble
+        test_l2_keepalive_no_auth_replay(ng, origin, redis_auth)  # no replay on reuse
     if redis_tls is not None:
         test_l2_tls(ng, origin, redis_tls)           # rediss:// + verify
         test_l2_tls_keepalive_reuse(ng, origin, redis_tls)  # v15-2 TLS pool
