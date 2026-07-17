@@ -6,6 +6,15 @@ build/
 objs/
 valgrind-*.log
 
+# Coverage artifacts (tools/coverage.sh output + gcov intermediates)
+coverage-report/
+*.gcda
+*.gcno
+*.gcov
+
+# Unit-test build binary (source under tests/unit/ IS tracked)
+tests/unit/test_math
+
 # Fuzzing build artifacts (seed corpus IS tracked; everything else is not)
 fuzz/fuzz_resp_parser
 fuzz/fuzz_norm_args

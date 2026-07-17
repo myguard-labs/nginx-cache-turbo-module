@@ -4,11 +4,16 @@
 #   ci-build.sh <flavor> <version> <mode>
 #     flavor : nginx | angie         (default nginx)
 #     version: upstream version      (default 1.31.1)
-#     mode   : debug | nginx | asan | module
-#              debug  - debug build + module (default)
-#              nginx  - release-ish build + module
-#              asan   - static --add-module build with ASan+UBSan (no .so)
-#              module - build only the .so, skip the binary
+#     mode   : debug | nginx | asan | module | coverage
+#              debug    - debug build + module (default)
+#              nginx    - release-ish build + module
+#              asan     - static --add-module build with ASan+UBSan (no .so)
+#              module   - build only the .so, skip the binary
+#              coverage - gcov-instrumented .so + binary; run the runtime suite
+#                         against it, then gcov/lcov the module objects.
+#                         .gcno files land under objs/addon/src/; the matching
+#                         .gcda are written when the instrumented nginx exits.
+#                         tools/coverage.sh drives build -> run -> report.
 #
 # No hiredis: cache-turbo's L2 Redis driver is native nginx, so the build has
 # no -lhiredis dependency (see memory/.../cache-turbo-module-design.md).
@@ -73,6 +78,23 @@ case "$MODE" in
         LD_OPT="$SAN"
         # ASan needs the module linked into the binary (static), not dlopen'd.
         ADD_MODULE="--add-module=$MODULE_DIR"
+        ;;
+    coverage)
+        # gcov instrumentation on the MODULE only. --coverage =
+        # -fprofile-arcs -ftest-coverage; -O0 keeps arcs mapped 1:1 to source
+        # lines (optimization folds branches and makes gcov lie). No
+        # NGX_DEBUG_PALLOC / --with-debug: the pool poisoner and debug logging
+        # are irrelevant to coverage and only slow the suite. TEST_FAULTS stays
+        # on so the fault-injection tests (and their code paths) are counted.
+        #
+        # --coverage must reach BOTH the compile and link of the module's
+        # objects: -ftest-coverage emits .gcno at compile, -fprofile-arcs needs
+        # libgcov linked into the .so. nginx applies --with-cc-opt to every
+        # object including addon/src, and --with-ld-opt to the final link, so
+        # both land where they must. WITH_DEBUG cleared so the run is faster.
+        CC_OPT="$TEST_OPT --coverage -g -O0 -fno-omit-frame-pointer"
+        LD_OPT="--coverage"
+        WITH_DEBUG=""
         ;;
     nginx)
         # Stock nginx defaults for benchmarking (tools/bench.sh): the only
