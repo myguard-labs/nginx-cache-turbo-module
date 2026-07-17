@@ -578,12 +578,16 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
         }}
 
         # L2 keepalive pool (v15): idle Redis connections cached per worker and
-        # reused across ops, instead of connect()+close per op. The pool is
-        # process-global with a single cap set by the first keepalive location to
-        # init; keep it at 8 so the plain working set (<=4) AND the TLS keepalive
-        # test's working set (<=4, v15-2 /l2tlska/) both fit -- otherwise the
-        # leftover idle plain conns saturate the cap and shut TLS out (see
-        # test_l2_tls_keepalive_reuse + lessons.md).
+        # reused across ops, instead of connect()+close per op. The pool is one
+        # per-worker struct whose cap is latched by the first KEEPALIVE-ENABLED
+        # location to init it (a keepalive=0 location never latches). Plain and
+        # TLS conns are mutually unreusable (different profile) but still share
+        # that one undivided cap, so keep it at 8: the plain working set (<=4)
+        # AND the TLS keepalive test's working set (<=4, v15-2 /l2tlska/) must
+        # BOTH fit, or leftover idle plain conns saturate the cap and shut TLS
+        # out (see test_l2_tls_keepalive_reuse + lessons.md). This sizing is a
+        # harness workaround for the per-worker-latch defect documented in
+        # README + issues.md -- a per-fingerprint pool would retire it.
         location /l2ka/ {{
             cache_turbo          main;
             cache_turbo_key      $uri;
@@ -5588,7 +5592,7 @@ def test_l2_keepalive_reuse(ng: Nginx, origin: Origin,
         return _redis_conns_received(redis) - before
 
     off = burst("/l2/")      # no keepalive: ~2N fresh connections
-    on = burst("/l2ka/")     # keepalive=4: a small bounded number, then reuse
+    on = burst("/l2ka/")     # keepalive on: a small bounded number, then reuse
 
     assert off > n, f"no-keepalive baseline too low ({off}); expected > {n}"
     assert on * 2 < off, \
