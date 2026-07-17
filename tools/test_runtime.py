@@ -1242,6 +1242,22 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # auto-classify + suppress_native: an anon page engages cache-turbo
+        # ($cache_turbo_active=1, native defers), but a request the preset
+        # classifies as dynamic (login cookie / backend URI) is skipped -> NOT
+        # engaged -> $cache_turbo_active=0 so a stacked native cache is free to
+        # own that URL. Proves auto-skip forces the variable to 0 even with
+        # suppress_native on.
+        location /autosup/ {{
+            cache_turbo                 main;
+            cache_turbo_backend         wordpress;
+            cache_turbo_key             $uri;
+            cache_turbo_valid           30s;
+            cache_turbo_suppress_native on;
+            add_header X-CT-Active      $cache_turbo_active always;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # auto-classify URI-prefix rule: r->uri starts with /wp-admin/ -> skip
         location /wp-admin/ {{
             cache_turbo         main;
@@ -2666,6 +2682,37 @@ def test_auto_classify(ng: Nginx, origin: Origin) -> None:
     _, _, ha2 = fetch(ng.port, "/wp-admin/index")
     assert "x-cache" not in ha1 and "x-cache" not in ha2, \
         "/wp-admin/ must skip the cache"
+    drain_origin(origin)
+
+
+def test_auto_classify_suppress_native_interaction(ng: Nginx, origin: Origin) -> None:
+    """Q1 x auto-classify: on a suppress_native location, an anon page engages
+    cache-turbo so $cache_turbo_active=1 (native cache defers), but an
+    auto-classified dynamic request (login cookie) is skipped -> NOT engaged ->
+    $cache_turbo_active=0, freeing a stacked native cache to own that URL.
+
+    Guards the src comment at ngx_http_cache_turbo_module.c:2964 (auto-skip sets
+    ct_active=0). A regression that left ct_active=1 on the skip path would make
+    the variable report "1" and wrongly keep native suppressed on a page
+    cache-turbo refuses to store -> that URL caches nowhere."""
+    # anon page: engaged, native suppressed -> active=1, and it caches
+    fetch(ng.port, "/autosup/normal")
+    _, _, h = fetch(ng.port, "/autosup/normal")
+    assert h.get("x-cache") == "HIT", \
+        f"anon page should cache, got x-cache={h.get('x-cache')}"
+    assert h.get("x-ct-active") == "1", \
+        f"engaged anon page must report $cache_turbo_active=1, got {h.get('x-ct-active')}"
+
+    # logged-in cookie: auto-classified dynamic -> skipped -> NOT engaged
+    ck = {"Cookie": "wordpress_logged_in_abc=deadbeef"}
+    _, d1, hd1 = fetch(ng.port, "/autosup/private", headers=ck)
+    _, d2, hd2 = fetch(ng.port, "/autosup/private", headers=ck)
+    assert "x-cache" not in hd1 and "x-cache" not in hd2, \
+        "logged-in cookie must skip the cache even with suppress_native on"
+    assert d1 != d2, "logged-in requests must each reach the origin"
+    assert hd1.get("x-ct-active") == "0", \
+        (f"auto-skipped dynamic request must report $cache_turbo_active=0 so a "
+         f"stacked native cache is free, got {hd1.get('x-ct-active')}")
     drain_origin(origin)
 
 
@@ -7322,6 +7369,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_max_size_not_cached(ng)
     test_suppress_native_variable(ng)
     test_auto_classify(ng, origin)
+    test_auto_classify_suppress_native_interaction(ng, origin)
     test_auto_backend_composition(ng, origin)
     test_woocommerce_wc_ajax(ng, origin)
     test_xenforo_preset(ng, origin)
