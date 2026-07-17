@@ -1191,6 +1191,68 @@ ngx_http_cache_turbo_response_sie(ngx_http_request_t *r)
 
 
 /*
+ * P4: resolve the request Cache-Control and Pragma header values ONCE with a
+ * single walk of the request header list, caching them in the ctx. nginx does
+ * NOT pre-parse request Cache-Control into a discrete headers_in field (it does
+ * for cookies, not for CC), so the four RFC-1 predicates below used to each call
+ * header_find and re-walk the whole list — five full scans per hit. This folds
+ * them to one. ctx->req_cc / ctx->req_pragma carry data == NULL when the header
+ * is absent. Idempotent via req_cc_resolved.
+ */
+static void
+ngx_http_cache_turbo_resolve_req_cc(ngx_http_request_t *r,
+    ngx_http_cache_turbo_ctx_t *ctx)
+{
+    ngx_list_part_t  *part;
+    ngx_table_elt_t  *h;
+    ngx_uint_t        i;
+
+    if (ctx->req_cc_resolved) {
+        return;
+    }
+    ngx_str_null(&ctx->req_cc);
+    ngx_str_null(&ctx->req_pragma);
+    ctx->req_cc_resolved = 1;
+
+    /* One traversal of the request header list, capturing the first Cache-Control
+     * and first Pragma (first-occurrence-wins, matching the old per-predicate
+     * header_find). Stop early once both are found. */
+    part = &r->headers_in.headers.part;
+    h = part->elts;
+
+    for (i = 0; /* void */ ; i++) {
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            h = part->elts;
+            i = 0;
+        }
+        if (h[i].hash == 0) {
+            continue;
+        }
+        if (ctx->req_cc.data == NULL
+            && h[i].key.len == sizeof("Cache-Control") - 1
+            && ngx_strncasecmp(h[i].key.data, (u_char *) "Cache-Control",
+                               sizeof("Cache-Control") - 1) == 0)
+        {
+            ctx->req_cc = h[i].value;
+        } else if (ctx->req_pragma.data == NULL
+            && h[i].key.len == sizeof("Pragma") - 1
+            && ngx_strncasecmp(h[i].key.data, (u_char *) "Pragma",
+                               sizeof("Pragma") - 1) == 0)
+        {
+            ctx->req_pragma = h[i].value;
+        }
+        if (ctx->req_cc.data != NULL && ctx->req_pragma.data != NULL) {
+            break;
+        }
+    }
+}
+
+
+/*
  * RFC 9111 §5.2.1.4 / §5.2.1.1: a request Cache-Control: no-cache (or the
  * legacy Pragma: no-cache), or a request max-age=0, means "do not reuse a
  * stored response without successful validation". max-age=0 is what browsers
@@ -1199,18 +1261,18 @@ ngx_http_cache_turbo_response_sie(ngx_http_request_t *r)
  * correct behaviour is to skip the cache lookup and go to the origin (the fresh
  * response is still stored, refreshing the entry). max-age=N>0 / min-fresh /
  * max-stale are NOT honoured here — they need an entry-serve restructure that
- * collides with the cold-miss claim race (see audit RFC-1). Walks the request
- * header list once; the headers are rare so first-match is fine.
+ * collides with the cold-miss claim race (see audit RFC-1). Reads the CC/Pragma
+ * values resolved once by resolve_req_cc(); the headers are rare so first-match
+ * is fine.
  */
 static ngx_int_t
-ngx_http_cache_turbo_request_revalidate(ngx_http_request_t *r)
+ngx_http_cache_turbo_request_revalidate(ngx_http_request_t *r,
+    ngx_http_cache_turbo_ctx_t *ctx)
 {
-    ngx_str_t  cc, pragma;
+    ngx_http_cache_turbo_resolve_req_cc(r, ctx);
 
-    cc = ngx_http_cache_turbo_header_find(&r->headers_in.headers,
-             "Cache-Control", sizeof("Cache-Control") - 1);
-    if (cc.data != NULL) {
-        u_char  *v = cc.data, *e = cc.data + cc.len;
+    if (ctx->req_cc.data != NULL) {
+        u_char  *v = ctx->req_cc.data, *e = ctx->req_cc.data + ctx->req_cc.len;
 
         if (ngx_http_cache_turbo_cc_has(v, e, "no-cache",
                 sizeof("no-cache") - 1)
@@ -1221,10 +1283,9 @@ ngx_http_cache_turbo_request_revalidate(ngx_http_request_t *r)
         }
     }
 
-    pragma = ngx_http_cache_turbo_header_find(&r->headers_in.headers,
-             "Pragma", sizeof("Pragma") - 1);
-    if (pragma.data != NULL
-        && ngx_http_cache_turbo_cc_has(pragma.data, pragma.data + pragma.len,
+    if (ctx->req_pragma.data != NULL
+        && ngx_http_cache_turbo_cc_has(ctx->req_pragma.data,
+               ctx->req_pragma.data + ctx->req_pragma.len,
                "no-cache", sizeof("no-cache") - 1))
     {
         return 1;
@@ -1239,14 +1300,13 @@ ngx_http_cache_turbo_request_revalidate(ngx_http_request_t *r)
  * holds a serveable response the request gets 504 Gateway Timeout instead of
  * reaching the origin. */
 static ngx_int_t
-ngx_http_cache_turbo_request_only_if_cached(ngx_http_request_t *r)
+ngx_http_cache_turbo_request_only_if_cached(ngx_http_request_t *r,
+    ngx_http_cache_turbo_ctx_t *ctx)
 {
-    ngx_str_t  cc;
-
-    cc = ngx_http_cache_turbo_header_find(&r->headers_in.headers,
-             "Cache-Control", sizeof("Cache-Control") - 1);
-    return (cc.data != NULL
-            && ngx_http_cache_turbo_cc_has(cc.data, cc.data + cc.len,
+    ngx_http_cache_turbo_resolve_req_cc(r, ctx);
+    return (ctx->req_cc.data != NULL
+            && ngx_http_cache_turbo_cc_has(ctx->req_cc.data,
+                   ctx->req_cc.data + ctx->req_cc.len,
                    "only-if-cached", sizeof("only-if-cached") - 1)) ? 1 : 0;
 }
 
@@ -1254,14 +1314,13 @@ ngx_http_cache_turbo_request_only_if_cached(ngx_http_request_t *r)
 /* RFC 9111 §5.2.1.5: request Cache-Control: no-store — do not store this
  * request's response (the header-filter capture gate checks the flag). */
 static ngx_int_t
-ngx_http_cache_turbo_request_no_store(ngx_http_request_t *r)
+ngx_http_cache_turbo_request_no_store(ngx_http_request_t *r,
+    ngx_http_cache_turbo_ctx_t *ctx)
 {
-    ngx_str_t  cc;
-
-    cc = ngx_http_cache_turbo_header_find(&r->headers_in.headers,
-             "Cache-Control", sizeof("Cache-Control") - 1);
-    return (cc.data != NULL
-            && ngx_http_cache_turbo_cc_has(cc.data, cc.data + cc.len,
+    ngx_http_cache_turbo_resolve_req_cc(r, ctx);
+    return (ctx->req_cc.data != NULL
+            && ngx_http_cache_turbo_cc_has(ctx->req_cc.data,
+                   ctx->req_cc.data + ctx->req_cc.len,
                    "no-store", sizeof("no-store") - 1)) ? 1 : 0;
 }
 
@@ -1278,7 +1337,6 @@ static void
 ngx_http_cache_turbo_request_freshness_bounds(ngx_http_request_t *r,
     ngx_http_cache_turbo_ctx_t *ctx)
 {
-    ngx_str_t  cc;
     u_char    *v, *e, *q;
     size_t     vlen;
 
@@ -1286,13 +1344,12 @@ ngx_http_cache_turbo_request_freshness_bounds(ngx_http_request_t *r,
     ctx->req_min_fresh = -1;
     ctx->req_max_stale = -1;
 
-    cc = ngx_http_cache_turbo_header_find(&r->headers_in.headers,
-             "Cache-Control", sizeof("Cache-Control") - 1);
-    if (cc.data == NULL) {
+    ngx_http_cache_turbo_resolve_req_cc(r, ctx);
+    if (ctx->req_cc.data == NULL) {
         return;
     }
-    v = cc.data;
-    e = cc.data + cc.len;
+    v = ctx->req_cc.data;
+    e = ctx->req_cc.data + ctx->req_cc.len;
 
     ctx->req_max_age = ngx_http_cache_turbo_cc_delta(v, e, "max-age",
                            sizeof("max-age") - 1);
@@ -2987,8 +3044,8 @@ ngx_http_cache_turbo_access_prologue(ngx_http_request_t *r,
     /* RFC-1 request Cache-Control, parsed once here for the whole request:
      * only-if-cached gates the origin-bound miss paths below (-> 504), no-store
      * vetoes capture in the header filter. */
-    ctx->req_only_if_cached = ngx_http_cache_turbo_request_only_if_cached(r);
-    ctx->req_no_store = ngx_http_cache_turbo_request_no_store(r);
+    ctx->req_only_if_cached = ngx_http_cache_turbo_request_only_if_cached(r, ctx);
+    ctx->req_no_store = ngx_http_cache_turbo_request_no_store(r, ctx);
     ngx_http_cache_turbo_request_freshness_bounds(r, ctx);
 
     /* Request Cache-Control: no-cache / Pragma: no-cache / max-age=0 (RFC 9111
@@ -2997,7 +3054,7 @@ ngx_http_cache_turbo_access_prologue(ngx_http_request_t *r,
      * origin — the fresh response still stores (refreshing the entry), like a
      * bypass. With only-if-cached the client refuses origin contact and we
      * cannot validate, so the answer is 504 (RFC 9111 §5.2.1.7). */
-    if (ngx_http_cache_turbo_request_revalidate(r)) {
+    if (ngx_http_cache_turbo_request_revalidate(r, ctx)) {
         (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
         if (ctx->req_only_if_cached) {
             /* Nothing serveable without origin contact the client forbids:
