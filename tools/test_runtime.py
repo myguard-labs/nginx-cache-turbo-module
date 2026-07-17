@@ -578,16 +578,15 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
         }}
 
         # L2 keepalive pool (v15): idle Redis connections cached per worker and
-        # reused across ops, instead of connect()+close per op. The pool is one
-        # per-worker struct whose cap is latched by the first KEEPALIVE-ENABLED
-        # location to init it (a keepalive=0 location never latches). Plain and
-        # TLS conns are mutually unreusable (different profile) but still share
-        # that one undivided cap, so keep it at 8: the plain working set (<=4)
-        # AND the TLS keepalive test's working set (<=4, v15-2 /l2tlska/) must
-        # BOTH fit, or leftover idle plain conns saturate the cap and shut TLS
-        # out (see test_l2_tls_keepalive_reuse + lessons.md). This sizing is a
-        # harness workaround for the per-worker-latch defect documented in
-        # README + issues.md -- a per-fingerprint pool would retire it.
+        # reused across ops, instead of connect()+close per op. As of the
+        # per-fingerprint pool (v16), each distinct connection profile gets its
+        # OWN bucket, cap and timeout -- so this plain location's keepalive value
+        # is honoured for the plain profile regardless of what any TLS location
+        # (/l2tlska/) or auth location (/l2authka/) configures, and no profile can
+        # starve another out of a shared cap. (Before v16 the cap was latched
+        # once per worker by the first keepalive-enabled location and the plain
+        # and TLS working sets had to be summed into one value here -- that
+        # workaround is retired.)
         location /l2ka/ {{
             cache_turbo          main;
             cache_turbo_key      $uri;
@@ -5735,22 +5734,17 @@ def test_l2_keepalive_no_auth_replay(ng: Nginx, origin: Origin,
     same handful of pooled connections serve the whole burst, so the preamble
     runs once per connection ACTUALLY OPENED, never once per op.
 
-    NOTE on what is (and is not) asserted. The pool cap is NOT a usable bound
-    here: `ngx_http_cache_turbo_redis_ka` is a single PROCESS-GLOBAL struct
-    (redis.c:229) whose cap is latched exactly once, by whichever keepalive
-    location initialises it FIRST at runtime --
-    `if (ka->inited) { return ka->max > 0; }` then `ka->inited = 1;
-    max = clcf->redis_keepalive;` (redis.c:248,252-253). Every later location's
-    `keepalive=` value is silently ignored. So this location's configured cap of
-    4 holds only if /l2authka/ happens to run before /l2ka/ (keepalive=8) --
-    i.e. it depends on test EXECUTION order, which nothing guarantees. Asserting
-    `auths <= 4` would be asserting a number the module does not promise.
-
-    What IS guaranteed regardless of pool cap, execution order, or worker count:
-    the preamble count does not SCALE with the op count. A pool of any size >= 1
-    that skips the preamble on reuse yields auths << n; a preamble replayed on
-    every op yields auths == n exactly. That gap is the property under test, and
-    `auths < n` discriminates it soundly for any cap the pool may have latched."""
+    NOTE on what is (and is not) asserted. As of the per-fingerprint pool (v16)
+    this location gets its OWN keepalive bucket, sized from its OWN keepalive=4,
+    independent of any other location's cap and of test execution order (each
+    distinct connection profile is bucketed separately -- ka_bucket() in
+    ngx_http_cache_turbo_redis.c). So the configured cap IS now honoured. We
+    still assert the ORDER-INDEPENDENT property rather than a magic number,
+    because it is the stronger claim and is robust to worker count: the preamble
+    count does not SCALE with the op count. A pool of any size >= 1 that skips
+    the preamble on reuse yields auths << n; a preamble replayed on every op
+    yields auths == n exactly. That gap is the property under test, and
+    `auths < n` discriminates it soundly for any cap the bucket holds."""
     stamp = time.time_ns()
     n = 20
 
@@ -5850,6 +5844,65 @@ def test_l2_tls_keepalive_reuse(ng: Nginx, origin: Origin,
     # the pool keeps the TLS channel live: a subsequent op still hits + serves
     _, _, h = fetch(ng.port, f"/l2tlska/tka-{stamp}-0")   # now an L1 HIT
     assert h.get("x-cache") == "HIT", "TLS keepalive location broke the hot path"
+
+
+def test_l2_keepalive_per_profile_no_starvation(
+        ng: Nginx, origin: Origin,
+        redis: RedisServer, redis_tls: RedisServer) -> None:
+    """v16 per-fingerprint pool: two mutually-unreusable connection profiles
+    (plain /l2ka/ and TLS /l2tlska/, distinct sockaddr + tls bit) each keep their
+    OWN keepalive bucket and reuse connections, neither starving the other.
+
+    Before v16 the pool was one process-global struct with a single cap latched
+    by whichever profile inited first; the loser's conns could saturate that one
+    cap and shut the other profile out (documented in lessons.md: /l2tlska/ was
+    deterministically starved under single-process ASan, worked around by summing
+    both working sets into /l2ka/'s cap). With per-profile buckets that coupling
+    is gone: each server sees its own bounded new-connection churn.
+
+    We hammer BOTH profiles concurrently (interleaved so both are hot at once)
+    and measure each Redis instance's total_connections_received independently
+    (plain and TLS are separate servers on separate ports, so their counters do
+    not mix). Each profile opening its working set once and then reusing means
+    each counter stays well below the per-op ceiling. A starved profile would
+    instead dial a fresh conn per op -> ~2N new connections on that server."""
+    n = 40
+    stamp = time.time_ns()
+
+    plain_before = _redis_conns_received(redis)
+    tls_before = _redis_conns_received(redis_tls)
+
+    def hit(i: int) -> None:
+        # interleave the two profiles so both pools are under load simultaneously
+        if i % 2 == 0:
+            fetch(ng.port, f"/l2ka/pp-{stamp}-{i}")
+        else:
+            fetch(ng.port, f"/l2tlska/pp-{stamp}-{i}")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        list(ex.map(hit, range(n)))
+    time.sleep(0.6)   # let fire-and-forget L2 SETs + pool settle
+
+    plain_new = _redis_conns_received(redis) - plain_before
+    tls_new = _redis_conns_received(redis_tls) - tls_before
+
+    ops_per_profile = n // 2                 # ~20 requests each -> ~2 L2 ops each
+
+    # Each profile reuses: new conns stay a small bounded number (its own cap +
+    # slack), far below one-per-op. If either were starved of pool slots it would
+    # dial per op and land near ops_per_profile.
+    assert 0 < plain_new < ops_per_profile, \
+        f"plain profile did not keep its own pool (new conns={plain_new}, " \
+        f"ops~={ops_per_profile}) -- starved by the TLS profile?"
+    assert 0 < tls_new < ops_per_profile, \
+        f"TLS profile did not keep its own pool (new conns={tls_new}, " \
+        f"ops~={ops_per_profile}) -- starved by the plain profile?"
+
+    # both channels still serve correctly after the concurrent load
+    _, _, hp = fetch(ng.port, f"/l2ka/pp-{stamp}-0")
+    assert hp.get("x-cache") == "HIT", "plain keepalive broke after mixed load"
+    _, _, ht = fetch(ng.port, f"/l2tlska/pp-{stamp}-1")
+    assert ht.get("x-cache") == "HIT", "TLS keepalive broke after mixed load"
 
 
 def test_l2_purge_key_drops_l2(ng: Nginx, origin: Origin,
@@ -7437,6 +7490,10 @@ def run_all(ng: Nginx, origin: Origin,
     if redis_tls is not None:
         test_l2_tls(ng, origin, redis_tls)           # rediss:// + verify
         test_l2_tls_keepalive_reuse(ng, origin, redis_tls)  # v15-2 TLS pool
+        if redis is not None:
+            # v16: plain + TLS profiles each keep their own keepalive bucket
+            test_l2_keepalive_per_profile_no_starvation(
+                ng, origin, redis, redis_tls)
     if mc is not None:
         test_l2_memcached_write_through(ng, origin, mc)        # v13
         test_l2_memcached_cross_instance_fill(ng, origin, mc)  # v13
@@ -7589,6 +7646,7 @@ def main() -> int:
              if redis_port else "")
           + (", DSN AUTH+SELECT preamble (v5)" if redis_auth else "")
           + (", rediss:// TLS + verify (v5), TLS keepalive reuse (v15-2)"
+             + (", per-profile keepalive no-starvation (v16)" if redis_port else "")
              if redis_tls else "")
           + (", memcached L2 (v13: write-through, cross-instance fill, "
              "key purge)" if memcached_port else "")

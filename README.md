@@ -1155,7 +1155,7 @@ http {
 | `cache_turbo_cache_control respect\|honor\|ignore` | `server`, `location` | `respect` | How the response `Cache-Control` is treated. **respect** (default): it gates storage and reshapes the stale window as written; the fresh TTL comes from `cache_turbo_valid`. **honor**: also take the fresh TTL from the response's own freshness headers, in RFC 9213 precedence order — `Surrogate-Control: max-age` (Fastly/Akamai) > `CDN-Cache-Control: s-maxage`/`max-age` (Cloudflare) > `Cache-Control: s-maxage`/`max-age` > `Expires` — falling back to `cache_turbo_valid` when none is present. The two **targeted** headers let an origin hand this shared cache a different TTL than the browser's `Cache-Control`; a targeted `no-store`/`private`/`max-age=0` also vetoes storage, and both targeted headers are stripped before store so they never replay downstream (see [Behind a CDN / multi-tier caching](#behind-a-cdn--multi-tier-caching)). **ignore**: discard the response `Cache-Control` **entirely** (mirror of nginx's `proxy_ignore_headers Cache-Control`) — `no-store`/`no-cache`/`private`/`max-age=0`/`s-maxage=0` no longer forbid storage, `must-revalidate`/`proxy-revalidate`/`stale-while-revalidate=N`/`stale-if-error=N` no longer reshape the window (it stays `cache_turbo_valid` × `cache_turbo_stale_mult`), and the TTL comes from `cache_turbo_valid`; use it for an origin that blankets shareable pages with `max-age=0, must-revalidate`. The `Set-Cookie` and request-`Authorization` safety floors are **not** affected by any mode — a per-user response is still never cached. A CMS preset (`cache_turbo_backend`) defaults this to `honor`. |
 | `cache_turbo_background_update on` / `off` | `server`, `location` | `on` | The stale-while-revalidate behaviour. **On** (default): a stale page is served *immediately* while one request quietly refreshes it in the background — **nobody waits on the backend**, and if that refresh hits a 5xx/timeout the old copy is left untouched and keeps being served (**stale-if-error**). **Off**: the chosen refresher regenerates inline (it waits for the backend and serves the fresh body), the pre-SWR behaviour. |
 | `cache_turbo_autotune on` | `server`, `location` | `off` | Adapt to live backend load. Auto-picks `beta` from the measured regen latency (clamped to the preset's band) **and**, under sustained load, widens two knobs by a load factor (≤4×): the **serveable stale window** (serve stale longer before a hard miss) and the **single-flight `lock_ttl`** (collapse more requests onto one regen). The **fresh** TTL is never touched — the freshness contract you set is unchanged; only the best-effort stale grace and dogpile window stretch, and they snap back the first quiet window. Recomputes on a fixed 30s cadence. See [What autotune does](#what-autotune-actually-tunes). |
-| `cache_turbo_redis DSN [opts...]` | `http`, `server`, `location` | — | Add a shared **L2 Redis** tier. `DSN` is `redis://[user:pass@]host:port/db` (or bare `host:port`); `rediss://` = TLS. Write-through on store; one sync `GET` on an L1 miss (never on an L1 hit). Opts: `prefix=` (`ct:`, must be non-empty), `timeout=` (`250ms`), `password=`, `user=`, `db=`, `tls=on\|off`, `tls_verify=on\|off` (default on), `tls_ca=<file>`, `tls_name=<host>`, `keepalive=N` (idle conns to pool per worker, `0`=off), `keepalive_timeout=` (`60s`). Pooled conns are reused only within the same db/credentials/TLS context. **`keepalive=`/`keepalive_timeout=` are per-worker, latched by the first keepalive-enabled location to initialize the pool — keep them identical across locations.** Native client, no hiredis. |
+| `cache_turbo_redis DSN [opts...]` | `http`, `server`, `location` | — | Add a shared **L2 Redis** tier. `DSN` is `redis://[user:pass@]host:port/db` (or bare `host:port`); `rediss://` = TLS. Write-through on store; one sync `GET` on an L1 miss (never on an L1 hit). Opts: `prefix=` (`ct:`, must be non-empty), `timeout=` (`250ms`), `password=`, `user=`, `db=`, `tls=on\|off`, `tls_verify=on\|off` (default on), `tls_ca=<file>`, `tls_name=<host>`, `keepalive=N` (idle conns to pool per worker, `0`=off), `keepalive_timeout=` (`60s`). Pooled conns are reused only within the same db/credentials/TLS context. **`keepalive=`/`keepalive_timeout=` are honoured per connection profile — each distinct backend gets its own per-worker pool sized from its own location (soft cap 16 profiles/worker).** Native client, no hiredis. |
 | `cache_turbo_memcached HOST:PORT [opts...]` | `http`, `server`, `location` | — | Add a shared **L2 memcached** tier (alternative to `cache_turbo_redis`, mutually exclusive with it). Write-through on store; one sync `get` on an L1 miss. Opts: `prefix=` (`ct:`), `timeout=` (`250ms`). No tags / `?all` / cross-node lock (memcached lacks sorted sets, `SCAN`, atomic `SET-NX`); 1 MiB value cap. Native client, no libmemcached. |
 | `cache_turbo_tag EXPR` | `server`, `location` | — | Tag stored pages (whitespace/comma list) so they can be purged as a group. Needs `cache_turbo_redis`. |
 | `cache_turbo_admin NAME` | `location` | — | Make this location a control endpoint for zone `NAME` (stats/purge/warm). Gate with `allow`/`deny`. |
@@ -1284,35 +1284,23 @@ trailing option, which **overrides** the DSN:
 | `tls_name=<host>` | DSN host | Name used for SNI + cert verification. |
 | `prefix=` | `ct:` | Key prefix in Redis. |
 | `timeout=` | `250ms` | Connect/read timeout. |
-| `keepalive=N` | `0` (off) | Idle connections pooled per worker for reuse. A pooled conn is reused only within the same db/credentials/TLS context. `0` opens a fresh connection per op. **Per-worker, not per-location — see the warning below.** |
-| `keepalive_timeout=` | `60s` | How long an idle pooled connection is kept before it is closed. **Per-worker, not per-location — see the warning below.** |
+| `keepalive=N` | `0` (off) | Idle connections pooled per worker for reuse. A pooled conn is reused only within the same db/credentials/TLS context. `0` opens a fresh connection per op. **Sized per connection profile — see the note below.** |
+| `keepalive_timeout=` | `60s` | How long an idle pooled connection is kept before it is closed. **Per connection profile — see the note below.** |
 
-> **⚠ `keepalive=` and `keepalive_timeout=` are per-worker-process, not
-> per-location.** The idle-connection pool is a single per-worker structure, and
-> its size and idle timeout are latched **once**, by the first
-> **keepalive-enabled** location to initialize the pool in that worker. Every
-> other location's `keepalive=` / `keepalive_timeout=` is then **silently
-> ignored** — even though `cache_turbo_redis` is otherwise a normal per-location
-> directive. (A location with `keepalive=0` never latches anything; it opens a
-> fresh connection per op and leaves the pool untouched.)
+> **`keepalive=` and `keepalive_timeout=` are honoured per connection
+> profile.** Each distinct backend profile — host/port, db, credentials, and TLS
+> context — gets its **own** idle-connection pool in each worker, with its own
+> `keepalive=` size and `keepalive_timeout=`, taken from the location that opens
+> that profile. Locations that share a profile share (and reuse) its pool, which
+> is normal and desirable; incompatible profiles are fully isolated, each with
+> its own budget, so distinct backends **cannot starve each other** and no
+> connection can leak between them. A location with `keepalive=0` simply opens a
+> fresh connection per op.
 >
-> Pooled connections are matched by **connection profile** — host/port, db,
-> credentials, and TLS context — not by location. Locations that share a profile
-> **do** reuse each other's connections, which is normal and desirable; only
-> **incompatible** profiles are isolated from one another, so no connection can
-> leak from one backend to another. The trouble is that profiles which *cannot*
-> reuse each other's connections still share **one undivided pool budget**:
-> slots are first-come, with no per-profile reservation. Distinct backends
-> therefore starve each other, and a location can silently run under another's
-> idle timeout.
->
-> Which location wins the latch is **request-order dependent**, decided per
-> worker, and reshuffles on every reload. If you configure `cache_turbo_redis` in
-> more than one location, **give them all the same `keepalive=` and
-> `keepalive_timeout=`**, and size that value for the sum of the working sets of
-> every distinct backend profile in play. Symptoms otherwise are quiet: extra
-> connection churn, or idle conns reaped by the server (L2 failures are advisory
-> and degrade to a miss, so nothing shouts).
+> There is a soft cap of **16 distinct pooled profiles per worker**; realistic
+> deployments use one to three. A configuration that exceeds it runs the extra
+> profiles unpooled (a fresh connection per op) rather than failing — safe, since
+> L2 is advisory.
 
 > TLS needs nginx built with `--with-http_ssl_module` (the stock `nginx`
 > package is). Without it, a `rediss://` / `tls=on` config is rejected at start.
