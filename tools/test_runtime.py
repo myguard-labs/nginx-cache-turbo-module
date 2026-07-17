@@ -817,6 +817,17 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             cache_turbo_test_restore_alloc_fail on;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
+
+        # CI-only: force the body filter onto the file-backed delegate path
+        # (the sendfile-abort branch) deterministically, without depending on
+        # directio/O_DIRECT fs alignment. Nothing must ever store here.
+        location /forcefile/ {{
+            cache_turbo                    main;
+            cache_turbo_key                $uri;
+            cache_turbo_valid              30s;
+            cache_turbo_test_force_file_buf on;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
 """
 
     return f"""{load}worker_processes {workers};
@@ -2651,6 +2662,35 @@ def test_restore_allocation_failure_fails_closed(ng: Nginx,
     finally:
         origin.fail = False
         drain_origin(origin)
+
+
+def test_file_backed_delegate_never_stores(ng: Nginx,
+                                            origin: Origin) -> None:
+    """A file-backed (sendfile) response body cannot be captured from memory,
+    so the body filter must abort capture and delegate the UNMODIFIED chain
+    downstream -- the object is served correctly but never cached. The hidden
+    cache_turbo_test_force_file_buf directive drives that branch
+    deterministically (the real in_file trigger is directio/fs dependent). The
+    directive exists only in tools/ci-build.sh builds."""
+    n0 = origin.hits
+    s1, b1, h1 = fetch(ng.port, "/forcefile/asset")
+    assert s1 == 200 and b1, f"forcefile prime failed: {s1}"
+    assert h1.get("x-cache") != "HIT", \
+        f"file-backed body must not HIT on first read: {h1.get('x-cache')}"
+
+    s2, b2, h2 = fetch(ng.port, "/forcefile/asset")
+    assert s2 == 200 and b2, f"file-backed second read failed: {s2}"
+    assert h2.get("x-cache") != "HIT", \
+        f"file-backed body must never store (delegate path): {h2.get('x-cache')}"
+    # The counting origin returns a unique body per hit, so a HIT would replay
+    # b1 byte-for-byte. Two distinct bodies prove both reads were served fresh
+    # from the origin -- i.e. the delegate path stored nothing.
+    assert b2 != b1, \
+        "file-backed body identical across reads -> a stale copy was served"
+
+    # Both reads reached the origin -> nothing was served from cache-turbo.
+    assert origin.hits - n0 >= 2, \
+        f"expected >=2 origin hits (no caching), got {origin.hits - n0}"
 
 
 def test_suppress_native_variable(ng: Nginx) -> None:
@@ -7476,6 +7516,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_header_fidelity(ng)
     if ng.fault_injection:
         test_restore_allocation_failure_fails_closed(ng, origin)
+        test_file_backed_delegate_never_stores(ng, origin)
     test_max_size_not_cached(ng)
     test_suppress_native_variable(ng)
     test_auto_classify(ng, origin)
@@ -7811,7 +7852,9 @@ def main() -> int:
           + (", memcached L2 (v13: write-through, cross-instance fill, "
              "key purge)" if memcached_port else "")
           + (", backend-inheritance (child redis over parent memcached)"
-             if (memcached_port and redis_port) else ""))
+             if (memcached_port and redis_port) else "")
+          + (", alloc-fault fails-closed, file-backed sendfile delegate "
+             "never stores" if ng.fault_injection else ""))
     return 0
 
 

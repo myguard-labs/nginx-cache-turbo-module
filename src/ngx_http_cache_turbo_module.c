@@ -371,6 +371,13 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_cache_turbo_loc_conf_t, test_restore_alloc_fail),
       NULL },
+
+    { ngx_string("cache_turbo_test_force_file_buf"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_turbo_loc_conf_t, test_force_file_buf),
+      NULL },
 #endif
 
       ngx_null_command
@@ -4640,6 +4647,24 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 
     clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
 
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+    /* CI-only: deterministically drive the file-backed delegate path. The real
+     * trigger (an in_file && !in_memory buffer) is fs/directio dependent and
+     * cannot be produced reliably in the harness. Take the SAME abort-capture +
+     * delegate-unmodified-chain action here, without forging b->in_file (which
+     * would make downstream sendfile garbage). */
+    if (clcf->test_force_file_buf) {
+        ctx->captured = 0;
+        ctx->body = NULL;
+        ctx->body_last = NULL;
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "cache_turbo: test_force_file_buf \"%V\" -> delegate to "
+                       "native (capture abandoned)", &r->uri);
+        return ngx_http_next_body_filter(r, in);
+    }
+#endif
+
     /* Append the incoming buffers to our captured chain (copying the bytes
      * into the request pool so they survive past this filter call). Seed the
      * append cursor from the cached tail so a multi-call streamed body does not
@@ -7973,6 +7998,7 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
 #if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
     && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
     conf->test_restore_alloc_fail = NGX_CONF_UNSET;
+    conf->test_force_file_buf = NGX_CONF_UNSET;
 #endif
     /* shm_zone, key, redis_addr, redis_prefix default NULL via pcalloc */
 
@@ -8078,6 +8104,8 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
     ngx_conf_merge_value(conf->test_restore_alloc_fail,
                          prev->test_restore_alloc_fail, 0);
+    ngx_conf_merge_value(conf->test_force_file_buf,
+                         prev->test_force_file_buf, 0);
 #endif
 
     /* PURGE method (v14): off by default. */
