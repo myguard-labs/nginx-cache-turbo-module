@@ -391,6 +391,12 @@ class Origin:
                     # RFC 9111 must-revalidate: 1s fresh, then NO stale serving.
                     self.send_header("Cache-Control",
                                      "max-age=1, must-revalidate")
+                if "proxyrev" in self.path:
+                    # RFC 9111 proxy-revalidate: the shared-cache synonym of
+                    # must-revalidate. Same window collapse (response_must_revalidate
+                    # OR-arm), 1s fresh then NO stale serving.
+                    self.send_header("Cache-Control",
+                                     "max-age=1, proxy-revalidate")
                 if "cdnttl" in self.path:
                     # RFC 9213: CDN-Cache-Control (edge TTL) must OUTRANK the
                     # browser-facing Cache-Control. CC says 60s fresh, CDN-CC says
@@ -4391,6 +4397,24 @@ def test_must_revalidate(ng: Nginx) -> None:
         "must-revalidate should re-fetch from origin once stale"
 
 
+def test_proxy_revalidate(ng: Nginx) -> None:
+    """RFC 9111: proxy-revalidate is the shared-cache synonym of must-revalidate
+    and MUST collapse the stale window identically. Exercises the OR-arm of
+    response_must_revalidate (module.c:1142) that must-revalidate alone leaves
+    uncovered. Same /mrev/ location, "proxyrev" origin arm emits
+    "max-age=1, proxy-revalidate"."""
+    _, _, h0 = fetch(ng.port, "/mrev/proxyrev")
+    assert "x-cache" not in h0, "first should miss"
+    _, _, h1 = fetch(ng.port, "/mrev/proxyrev")
+    assert h1.get("x-cache") == "HIT", f"second should be a fresh HIT, got {h1}"
+    time.sleep(2.0)                               # past max-age=1
+    _, _, h2 = fetch(ng.port, "/mrev/proxyrev")
+    assert h2.get("x-cache") != "STALE", \
+        f"proxy-revalidate must NOT stale-serve past freshness, got {h2.get('x-cache')}"
+    assert "x-cache" not in h2, \
+        "proxy-revalidate should re-fetch from origin once stale"
+
+
 def test_precise_maxage_token_parse(ng: Nginx) -> None:
     """Full-token Cache-Control parse: max-age=01000 is 1000s (cacheable), it must
     NOT trip the old substring 'max-age=0' uncacheable check; max-age=0 is still
@@ -7779,6 +7803,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_age_header(ng)
     test_request_no_cache(ng, origin)
     test_must_revalidate(ng)
+    test_proxy_revalidate(ng)
     test_precise_maxage_token_parse(ng)
     test_ignore_cache_control_overrides_floor(ng, origin)
     test_ignore_cc_must_revalidate_keeps_stale_window(ng, origin)
