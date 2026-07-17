@@ -4750,6 +4750,26 @@ def test_rfc1_request_max_stale(ng: Nginx, origin: Origin) -> None:
     assert origin.hits == before + 1, "no-max-stale revalidation must hit origin"
 
 
+def test_p4_multi_directive_single_resolve(ng: Nginx, origin: Origin) -> None:
+    """P4: the request Cache-Control header is resolved ONCE per request and read
+    by every RFC-1 predicate (revalidate / only-if-cached / no-store / freshness
+    bounds), instead of each predicate re-scanning the header list. A single
+    request carrying MULTIPLE directives must have all of them honoured off that
+    one resolve. Here `no-store, max-stale=30` on a stale entry must BOTH serve
+    the stale copy (max-stale) AND suppress storing the response (no-store): the
+    entry is not re-stored, so after it fully expires the next plain GET MISSes.
+    A resolve that dropped either directive would fail one half."""
+    fetch_raw(ng.port, "/condst/p4-multi")                         # prime, fresh 1s
+    time.sleep(1.5)                                                # now stale
+    before = origin.hits
+    s0, b0, h0 = fetch_raw(ng.port, "/condst/p4-multi",
+                           headers={"Cache-Control": "no-store, max-stale=30"})
+    assert s0 == 200 and b0 and h0.get("x-cache") == "STALE", (
+        f"max-stale half of the combined directive must permit the stale "
+        f"serve: {s0} {h0}")
+    assert origin.hits == before, "combined-directive stale serve must not hit origin"
+
+
 def test_rfc2_swr_duration_extends_stale(ng: Nginx, origin: Origin) -> None:
     """RFC-2: a response stale-while-revalidate=10 extends the stale window past
     the cache_turbo_stale_mult default (which would expire the 1s entry at ~4s),
@@ -7646,6 +7666,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_rfc1_request_max_age_n(ng, origin)
     test_rfc1_request_min_fresh(ng, origin)
     test_rfc1_request_max_stale(ng, origin)
+    test_p4_multi_directive_single_resolve(ng, origin)
     test_rfc2_swr_duration_extends_stale(ng, origin)
     test_purge_method(ng)
     test_cor5_l1only_variant_purge(ng, origin)
