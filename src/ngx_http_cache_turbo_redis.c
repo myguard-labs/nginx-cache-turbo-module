@@ -137,20 +137,16 @@ static void ngx_http_cache_turbo_redis_tls_handshake_done(
  * stale — all safe, since L2 is advisory.
  * ------------------------------------------------------------------------- */
 
+typedef struct ngx_http_cache_turbo_redis_ka_bucket_s
+    ngx_http_cache_turbo_redis_ka_bucket_t;
+
+/* A pooled connection slot. Profile identity (fp/tls/creds/db/addr) lives on the
+ * owning bucket, not here — every item in a bucket shares that one profile — so
+ * an item only needs the connection and a back-pointer to its bucket. */
 typedef struct {
     ngx_queue_t        queue;
     ngx_connection_t  *connection;
-    socklen_t          socklen;
-    unsigned           tls:1;          /* pooled conn is TLS (match on reuse) */
-    unsigned           tls_verify:1;   /* exact-match field (SEC-3)           */
-    uint32_t           ctx_fp;         /* security-context fingerprint (fast pre-filter) */
-    ngx_int_t          db;             /* SEC-3 exact-match profile fields...  */
-    ngx_str_t          user;           /* (data points into the config pool,  */
-    ngx_str_t          password;       /*  which outlives this worker, so no   */
-    ngx_str_t          tls_ca;         /*  copy is needed)                     */
-    ngx_str_t          tls_name;
-    ngx_str_t          host;
-    ngx_sockaddr_t     sockaddr;       /* copy of peer addr, for match */
+    ngx_http_cache_turbo_redis_ka_bucket_t  *bucket;  /* owning bucket (for drop) */
 } ngx_http_cache_turbo_redis_ka_item_t;
 
 
@@ -202,29 +198,54 @@ ngx_http_cache_turbo_str_eq(ngx_str_t *a, ngx_str_t *b)
  * (which skips the AUTH/SELECT/cert-verify preamble) to a location with a
  * DIFFERENT db/credential/TLS-trust profile. This compares the profile fields
  * byte-for-byte, so reuse is exact. The item's ngx_str_t values reference the
- * config pool (process/worker lifetime), so no copy is needed. */
-static ngx_int_t
-ngx_http_cache_turbo_redis_ka_profile_eq(
-    ngx_http_cache_turbo_redis_ka_item_t *item,
-    ngx_http_cache_turbo_loc_conf_t *clcf)
-{
-    return item->db == clcf->redis_db
-        && item->tls_verify == (unsigned) (clcf->redis_tls_verify ? 1 : 0)
-        && ngx_http_cache_turbo_str_eq(&item->user, &clcf->redis_user)
-        && ngx_http_cache_turbo_str_eq(&item->password, &clcf->redis_password)
-        && ngx_http_cache_turbo_str_eq(&item->tls_ca, &clcf->redis_tls_ca)
-        && ngx_http_cache_turbo_str_eq(&item->tls_name, &clcf->redis_tls_name)
-        && ngx_http_cache_turbo_str_eq(&item->host, &clcf->redis_host);
-}
+ * config pool (process/worker lifetime), so no copy is needed. The byte-exact
+ * profile compare lives in ka_bucket_eq: a keepalive bucket owns exactly one
+ * profile, so any item inside a bucket is already an exact match. */
 
-typedef struct {
-    ngx_uint_t   inited;
-    ngx_uint_t   max;                  /* cap (cache_turbo_redis keepalive=N) */
+/* Per-profile keepalive sub-pool. Each distinct redis connection profile
+ * (fingerprint + exact SEC-3 fields + peer addr + tls bit) gets its OWN bucket
+ * with its OWN cap and timeout, taken from the first location that opens that
+ * profile. This is the real fix for the old single-pool defect where cap and
+ * timeout were latched once per worker by whichever keepalive-enabled location
+ * inited first, silently discarding every other location's redis_keepalive[_timeout]
+ * and letting mutually-unreusable profiles starve each other on one undivided
+ * budget. Now each profile's budget is isolated and sized by the config that
+ * owns it. */
+struct ngx_http_cache_turbo_redis_ka_bucket_s {
+    ngx_uint_t   inited;               /* slot allocated + queues initialized */
+    ngx_uint_t   max;                  /* cap (this profile's cache_turbo_redis keepalive=N) */
     ngx_uint_t   count;                /* live idle connections held */
     ngx_msec_t   timeout;              /* idle close timeout */
     ngx_queue_t  cache;                /* items holding a live connection */
     ngx_queue_t  free;                 /* empty item slots */
     ngx_http_cache_turbo_redis_ka_item_t *items;
+
+    /* Profile identity this bucket serves (config-pool-backed, no copy). */
+    uint32_t         ctx_fp;
+    unsigned         tls:1;
+    unsigned         tls_verify:1;
+    ngx_int_t        db;
+    ngx_str_t        user;
+    ngx_str_t        password;
+    ngx_str_t        tls_ca;
+    ngx_str_t        tls_name;
+    ngx_str_t        host;
+    socklen_t        socklen;
+    ngx_sockaddr_t   sockaddr;
+};
+
+/* Max distinct redis profiles pooled per worker. A profile is a backend +
+ * credential + db + TLS-trust combination; realistic deployments use 1-3.
+ * The cap only bounds pathological configs; overflow (a rare 17th distinct
+ * profile) simply runs unpooled — every op opens+closes a fresh conn, which is
+ * fully functional since L2 is advisory. No eviction: a filled array never
+ * realistically occurs and overflow degrades gracefully. */
+#define NGX_HTTP_CACHE_TURBO_REDIS_KA_MAX_BUCKETS  16
+
+typedef struct {
+    ngx_uint_t  nbuckets;              /* buckets in use */
+    ngx_http_cache_turbo_redis_ka_bucket_t
+                buckets[NGX_HTTP_CACHE_TURBO_REDIS_KA_MAX_BUCKETS];
 } ngx_http_cache_turbo_redis_ka_t;
 
 /* Process-global: each worker gets its own copy after fork. */
@@ -234,55 +255,100 @@ static void ngx_http_cache_turbo_redis_ka_close_handler(ngx_event_t *ev);
 static void ngx_http_cache_turbo_redis_ka_dummy_handler(ngx_event_t *ev);
 
 
-/* Lazily build the per-worker item array sized to the first-seen keepalive cap.
- * Items live in ngx_cycle->pool (worker lifetime). Returns 0 if keepalive is
- * off or the array cannot be allocated.
- *
- * NOTE: cap and timeout are latched here ONCE per worker, by the first
- * keepalive-enabled location to get this far (keepalive<=0 returns above without
- * latching); later locations' redis_keepalive[_timeout] are silently discarded
- * even though cache_turbo_redis merges per-location. Reuse is matched by profile,
- * not by location, so same-profile locations correctly share conns and no conn
- * crosses profiles (ka_fp/ka_profile_eq). But mutually-unreusable profiles still
- * share this one undivided budget -- ka_save's cap check is fingerprint-blind --
- * so they starve each other. Documented as a constraint in README; a
- * per-fingerprint pool would be the real fix. */
-static ngx_uint_t
-ngx_http_cache_turbo_redis_ka_init(ngx_http_cache_turbo_loc_conf_t *clcf)
+/* Does bucket b serve the profile described by clcf/addr/fp? Same exact match
+ * as ka_get uses on individual items: fp pre-filter, tls bit, peer addr, then
+ * the byte-exact SEC-3 profile compare. */
+static ngx_int_t
+ngx_http_cache_turbo_redis_ka_bucket_eq(
+    ngx_http_cache_turbo_redis_ka_bucket_t *b,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_addr_t *addr,
+    uint32_t fp, ngx_uint_t want_tls)
 {
-    ngx_uint_t                              i, max;
-    ngx_http_cache_turbo_redis_ka_t        *ka = &ngx_http_cache_turbo_redis_ka;
+    return b->ctx_fp == fp
+        && b->tls == want_tls
+        && b->socklen == addr->socklen
+        && ngx_memcmp(&b->sockaddr, addr->sockaddr, addr->socklen) == 0
+        && b->db == clcf->redis_db
+        && b->tls_verify == (unsigned) (clcf->redis_tls_verify ? 1 : 0)
+        && ngx_http_cache_turbo_str_eq(&b->user, &clcf->redis_user)
+        && ngx_http_cache_turbo_str_eq(&b->password, &clcf->redis_password)
+        && ngx_http_cache_turbo_str_eq(&b->tls_ca, &clcf->redis_tls_ca)
+        && ngx_http_cache_turbo_str_eq(&b->tls_name, &clcf->redis_tls_name)
+        && ngx_http_cache_turbo_str_eq(&b->host, &clcf->redis_host);
+}
+
+
+/* Locate the keepalive bucket for clcf/addr's profile, or NULL. When create is
+ * set and no bucket exists yet, lazily allocate one sized from THIS location's
+ * redis_keepalive[_timeout] (so per-location caps are honoured). Returns NULL if
+ * keepalive is off, the bucket array is full, or allocation fails — all of which
+ * make the caller run unpooled, which is safe. Items live in ngx_cycle->pool
+ * (worker lifetime). */
+static ngx_http_cache_turbo_redis_ka_bucket_t *
+ngx_http_cache_turbo_redis_ka_bucket(ngx_http_cache_turbo_loc_conf_t *clcf,
+    ngx_addr_t *addr, uint32_t fp, ngx_uint_t want_tls, ngx_uint_t create)
+{
+    ngx_uint_t                               i, max;
+    ngx_http_cache_turbo_redis_ka_t         *ka = &ngx_http_cache_turbo_redis_ka;
+    ngx_http_cache_turbo_redis_ka_bucket_t  *b;
 
     if (clcf->redis_keepalive <= 0) {
-        return 0;
+        return NULL;
     }
 
-    if (ka->inited) {
-        return ka->max > 0;
+    for (i = 0; i < ka->nbuckets; i++) {
+        b = &ka->buckets[i];
+        if (ngx_http_cache_turbo_redis_ka_bucket_eq(b, clcf, addr, fp, want_tls)) {
+            return b;
+        }
     }
 
-    ka->inited = 1;
+    if (!create) {
+        return NULL;
+    }
+
+    if (ka->nbuckets >= NGX_HTTP_CACHE_TURBO_REDIS_KA_MAX_BUCKETS) {
+        return NULL;                       /* array full: run unpooled */
+    }
+
+    b = &ka->buckets[ka->nbuckets];
     max = (ngx_uint_t) clcf->redis_keepalive;
 
-    ka->items = ngx_palloc(ngx_cycle->pool,
-                           max * sizeof(ngx_http_cache_turbo_redis_ka_item_t));
-    if (ka->items == NULL) {
-        ka->max = 0;
-        return 0;
+    b->items = ngx_palloc(ngx_cycle->pool,
+                          max * sizeof(ngx_http_cache_turbo_redis_ka_item_t));
+    if (b->items == NULL) {
+        return NULL;
     }
 
-    ngx_queue_init(&ka->cache);
-    ngx_queue_init(&ka->free);
+    ngx_queue_init(&b->cache);
+    ngx_queue_init(&b->free);
     for (i = 0; i < max; i++) {
-        ngx_queue_insert_head(&ka->free, &ka->items[i].queue);
+        b->items[i].bucket = b;
+        ngx_queue_insert_head(&b->free, &b->items[i].queue);
     }
 
-    ka->max = max;
-    ka->count = 0;
-    ka->timeout = clcf->redis_keepalive_timeout
-                      ? clcf->redis_keepalive_timeout : 60000;
+    b->max = max;
+    b->count = 0;
+    b->timeout = clcf->redis_keepalive_timeout
+                     ? clcf->redis_keepalive_timeout : 60000;
 
-    return 1;
+    /* Snapshot the profile identity (config-pool-backed, no copy). */
+    b->ctx_fp = fp;
+    b->tls = want_tls;
+    b->tls_verify = clcf->redis_tls_verify ? 1 : 0;
+    b->db = clcf->redis_db;
+    b->user = clcf->redis_user;
+    b->password = clcf->redis_password;
+    b->tls_ca = clcf->redis_tls_ca;
+    b->tls_name = clcf->redis_tls_name;
+    b->host = clcf->redis_host;
+    b->socklen = addr->socklen;
+    ngx_memcpy(&b->sockaddr, addr->sockaddr, addr->socklen);
+
+    b->inited = 1;
+    ka->nbuckets++;
+
+    return b;
 }
 
 
@@ -290,12 +356,12 @@ ngx_http_cache_turbo_redis_ka_init(ngx_http_cache_turbo_loc_conf_t *clcf)
 static void
 ngx_http_cache_turbo_redis_ka_drop(ngx_http_cache_turbo_redis_ka_item_t *item)
 {
-    ngx_connection_t                 *c = item->connection;
-    ngx_http_cache_turbo_redis_ka_t  *ka = &ngx_http_cache_turbo_redis_ka;
+    ngx_connection_t                        *c = item->connection;
+    ngx_http_cache_turbo_redis_ka_bucket_t  *b = item->bucket;
 
     ngx_queue_remove(&item->queue);
-    ngx_queue_insert_head(&ka->free, &item->queue);
-    ka->count--;
+    ngx_queue_insert_head(&b->free, &item->queue);
+    b->count--;
 
     item->connection = NULL;
     if (c) {
@@ -328,48 +394,43 @@ ngx_http_cache_turbo_redis_ka_get(ngx_http_cache_turbo_loc_conf_t *clcf,
     ngx_queue_t                            *q;
     ngx_connection_t                       *c;
     ngx_http_cache_turbo_redis_ka_item_t   *item;
-    ngx_http_cache_turbo_redis_ka_t        *ka = &ngx_http_cache_turbo_redis_ka;
+    ngx_http_cache_turbo_redis_ka_bucket_t *b;
     ngx_uint_t                              want_tls = clcf->redis_tls ? 1 : 0;
     uint32_t                                want_fp = ngx_http_cache_turbo_redis_ka_fp(clcf);
 
-    if (!ngx_http_cache_turbo_redis_ka_init(clcf)) {
+    /* A live connection can only exist in an already-created bucket, so don't
+     * create one here (create=0). */
+    b = ngx_http_cache_turbo_redis_ka_bucket(clcf, addr, want_fp, want_tls, 0);
+    if (b == NULL) {
         return NULL;
     }
 
-    for (q = ngx_queue_head(&ka->cache);
-         q != ngx_queue_sentinel(&ka->cache);
-         q = ngx_queue_next(q))
-    {
-        item = ngx_queue_data(q, ngx_http_cache_turbo_redis_ka_item_t, queue);
-
-        if (item->tls == want_tls
-            && item->ctx_fp == want_fp
-            && item->socklen == addr->socklen
-            && ngx_memcmp(&item->sockaddr, addr->sockaddr, addr->socklen) == 0
-            && ngx_http_cache_turbo_redis_ka_profile_eq(item, clcf))
-        {
-            c = item->connection;
-
-            ngx_queue_remove(q);
-            ngx_queue_insert_head(&ka->free, q);
-            ka->count--;
-            item->connection = NULL;
-
-            if (c->read->timer_set) {
-                ngx_del_timer(c->read);
-            }
-            c->idle = 0;
-            c->read->handler = NULL;
-            c->write->handler = NULL;
-
-            ngx_log_debug2(NGX_LOG_DEBUG_HTTP, c->log, 0,
-                           "cache_turbo: redis reuse pooled conn fd:%d (%ui left)",
-                           c->fd, ka->count);
-            return c;
-        }
+    /* Bucket identity already guarantees the full profile match; any parked
+     * conn in it is reusable. Take the head. */
+    if (ngx_queue_empty(&b->cache)) {
+        return NULL;
     }
 
-    return NULL;
+    q = ngx_queue_head(&b->cache);
+    item = ngx_queue_data(q, ngx_http_cache_turbo_redis_ka_item_t, queue);
+    c = item->connection;
+
+    ngx_queue_remove(q);
+    ngx_queue_insert_head(&b->free, q);
+    b->count--;
+    item->connection = NULL;
+
+    if (c->read->timer_set) {
+        ngx_del_timer(c->read);
+    }
+    c->idle = 0;
+    c->read->handler = NULL;
+    c->write->handler = NULL;
+
+    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, c->log, 0,
+                   "cache_turbo: redis reuse pooled conn fd:%d (%ui left)",
+                   c->fd, b->count);
+    return c;
 }
 
 
@@ -380,10 +441,13 @@ ngx_http_cache_turbo_redis_ka_save(ngx_http_cache_turbo_redis_op_t *op)
 {
     u_char                                  scratch[1];
     ssize_t                                 n;
+    ngx_addr_t                              addr;
+    uint32_t                                fp;
+    ngx_uint_t                              tls;
     ngx_queue_t                            *q;
     ngx_connection_t                       *c = op->peer.connection;
     ngx_http_cache_turbo_redis_ka_item_t   *item;
-    ngx_http_cache_turbo_redis_ka_t        *ka = &ngx_http_cache_turbo_redis_ka;
+    ngx_http_cache_turbo_redis_ka_bucket_t *b;
 
     if (!op->clean || c == NULL || op->clcf == NULL) {
         return 0;
@@ -393,11 +457,18 @@ ngx_http_cache_turbo_redis_ka_save(ngx_http_cache_turbo_redis_op_t *op)
     {
         return 0;
     }
-    if (!ngx_http_cache_turbo_redis_ka_init(op->clcf)) {
-        return 0;
+
+    addr.sockaddr = op->peer.sockaddr;
+    addr.socklen = op->peer.socklen;
+    fp = ngx_http_cache_turbo_redis_ka_fp(op->clcf);
+    tls = c->ssl ? 1 : 0;
+
+    b = ngx_http_cache_turbo_redis_ka_bucket(op->clcf, &addr, fp, tls, 1);
+    if (b == NULL) {
+        return 0;                          /* keepalive off / array full: close it */
     }
-    if (ka->count >= ka->max || ngx_queue_empty(&ka->free)) {
-        return 0;                          /* pool full: close it */
+    if (b->count >= b->max || ngx_queue_empty(&b->free)) {
+        return 0;                          /* this profile's pool full: close it */
     }
 
     /* The stream must be exactly at a reply boundary: redis should have nothing
@@ -408,25 +479,15 @@ ngx_http_cache_turbo_redis_ka_save(ngx_http_cache_turbo_redis_op_t *op)
         return 0;
     }
 
-    q = ngx_queue_head(&ka->free);
+    q = ngx_queue_head(&b->free);
     ngx_queue_remove(q);
     item = ngx_queue_data(q, ngx_http_cache_turbo_redis_ka_item_t, queue);
-    ngx_queue_insert_head(&ka->cache, q);
-    ka->count++;
+    ngx_queue_insert_head(&b->cache, q);
+    b->count++;
 
     item->connection = c;
-    item->socklen = op->peer.socklen;
-    item->tls = c->ssl ? 1 : 0;
-    item->ctx_fp = ngx_http_cache_turbo_redis_ka_fp(op->clcf);
-    /* SEC-3 exact-match profile snapshot (config-pool-backed, no copy). */
-    item->tls_verify = op->clcf->redis_tls_verify ? 1 : 0;
-    item->db = op->clcf->redis_db;
-    item->user = op->clcf->redis_user;
-    item->password = op->clcf->redis_password;
-    item->tls_ca = op->clcf->redis_tls_ca;
-    item->tls_name = op->clcf->redis_tls_name;
-    item->host = op->clcf->redis_host;
-    ngx_memcpy(&item->sockaddr, op->peer.sockaddr, op->peer.socklen);
+    /* item->bucket was set at bucket-init and is stable. The connection's
+     * profile identity is the bucket's; no per-item snapshot is needed. */
 
     if (c->write->timer_set) {
         ngx_del_timer(c->write);
@@ -445,11 +506,11 @@ ngx_http_cache_turbo_redis_ka_save(ngx_http_cache_turbo_redis_op_t *op)
         return 1;                          /* drop closed it; do not double-close */
     }
 
-    ngx_add_timer(c->read, ka->timeout);
+    ngx_add_timer(c->read, b->timeout);
 
     ngx_log_debug2(NGX_LOG_DEBUG_HTTP, c->log, 0,
                    "cache_turbo: redis pool conn fd:%d (%ui idle)",
-                   c->fd, ka->count);
+                   c->fd, b->count);
     return 1;
 }
 

@@ -584,12 +584,16 @@ typedef struct {
      * 1 MB value cap (memcached's default item ceiling): oversized SET skipped. */
     ngx_flag_t               memcached;    /* cache_turbo_memcached configured  */
 
-    /* Keepalive pool (v15). cache_turbo_redis keepalive=N caches up to N idle
-     * L2 connections per worker, keyed by peer addr, so an L2 op reuses a live
-     * TCP connection instead of connect()+close per op. 0 = off (default).
-     * keepalive_timeout= closes an idle pooled connection after this long.
-     * Plain TCP only: TLS connections are never pooled (c->ssl borrows the op
-     * pool, which is torn down per op — see redis op_done). */
+    /* Keepalive pool (v15; per-profile buckets v16). cache_turbo_redis
+     * keepalive=N caches up to N idle L2 connections per worker, so an L2 op
+     * reuses a live connection instead of connect()+close per op. 0 = off
+     * (default). keepalive_timeout= closes an idle pooled connection after this
+     * long. Each distinct connection profile (peer addr + db + credentials + TLS
+     * context) gets its OWN bucket with its OWN N and timeout, taken from the
+     * location that opens it — so per-location values are honoured and profiles
+     * cannot starve each other (see ka_bucket() in the redis driver). TLS conns
+     * are pooled too (v15-2): the persistent channel is reused, handshake +
+     * preamble skipped on reuse. */
     ngx_int_t                redis_keepalive;        /* max idle conns, 0=off  */
     ngx_msec_t               redis_keepalive_timeout;/* idle close timeout     */
 
