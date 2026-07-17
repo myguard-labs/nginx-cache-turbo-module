@@ -5484,28 +5484,41 @@ def test_p1_coarse_lru_splice_keeps_hot_key_resident(ng: Nginx) -> None:
     vanished status header would read as a pass otherwise. Sabotage check: if
     the coarse gate wrongly skipped ALL splices, the hot key would age to the
     LRU tail and the post-churn fetch would MISS."""
+    import time
     hot = "/e/p1-hot"
 
-    # Prime the hot key, then hammer it fast so almost every hit lands inside
-    # the same 1s window and exercises the coarse-splice skip path.
-    s, _, h = fetch(ng.port, hot)
+    # Prime the hot key, then hammer it fast so almost every hit lands inside the
+    # same 1s window and exercises the coarse-splice SKIP path (the whole point
+    # of P1 -- these hits must NOT re-splice the LRU list).
+    s, _, _ = fetch(ng.port, hot)
     assert s == 200, f"prime {hot} -> {s}"
     for _ in range(300):
         s, _, _ = fetch(ng.port, hot)
         assert s == 200, f"hot hammer {hot} -> {s}"
 
-    # Cold-key churn: /e/ is a tiny zone (R6 shows eviction at ~200 keys). Drive
-    # well past that so the LRU tail is continuously evicted. Re-touch the hot
-    # key every wave so a correct coarse splice keeps promoting it to the head.
-    for i in range(300):
-        fetch(ng.port, f"/e/p1-cold-{i}")
-        if i % 20 == 0:
-            fetch(ng.port, hot)          # keep it MRU (>=1s apart across waves)
+    # Cold-key churn in waves, each wave preceded by a real >1s gap then a hot
+    # touch. The sleep is load-bearing: the coarse gate splices only when
+    # now - last_access >= 1, and a new node starts at last_access = now, so
+    # WITHOUT the gap fast-loopback re-touches would fall in the same time_t
+    # second, skip every promotion, and the test could pass without ever
+    # exercising the splice. With the gap each hot touch genuinely re-promotes.
+    # /e/ is a tiny zone (R6: eviction at ~200 keys); each wave overflows it.
+    for wave in range(3):
+        time.sleep(1.2)                  # cross a 1s boundary -> splice fires
+        s, _, _ = fetch(ng.port, hot)    # re-promote to LRU head
+        assert s == 200, f"hot re-touch {hot} -> {s}"
+        for i in range(250):
+            fetch(ng.port, f"/e/p1-cold-{wave}-{i}")
 
-    # The hot key must have stayed resident through the eviction churn.
+    # The hot key was re-promoted before each eviction wave, so a correct coarse
+    # splice kept it RESIDENT. The property under test is non-eviction, so both
+    # HIT (still fresh) and STALE (present-but-expired; the many cold fetches +
+    # 1.2s sleeps can push total runtime past /e/'s 30s valid window) prove the
+    # node survived. A broken gate that skipped ALL splices would have aged it to
+    # the LRU tail and evicted it -> the re-fetch would MISS (cold origin fill).
     s, _, h = fetch(ng.port, hot)
     assert s == 200, f"post-churn {hot} -> {s}"
-    assert h.get("x-ct-status") == "HIT", (
+    assert h.get("x-ct-status") in ("HIT", "STALE"), (
         f"hot key evicted despite promotion: X-CT-Status={h.get('x-ct-status')}")
 
 

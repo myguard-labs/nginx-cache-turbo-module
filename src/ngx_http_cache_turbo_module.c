@@ -3481,9 +3481,17 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                  * the rejected copy (req_reval blocks the cold-claim re-serve). */
                 ngx_int_t  l2_fresh_ok = 1, l2_stale_ok = 1;
 
-                ngx_http_cache_turbo_req_serve_verdict(ctx, (time_t) bh.created,
-                    ngx_time(), (time_t) bh.created + (time_t) bh.fresh_ttl,
-                    &l2_fresh_ok, &l2_stale_ok);
+                /* P2: same gate as the L1 verdict above — only run the bounds
+                 * check when the client actually sent one. With none set the
+                 * verdict leaves l2_fresh_ok/l2_stale_ok at 1 and the block below
+                 * can never set req_reval, so it is pure dead work on the L2 hot
+                 * path. The defaults are the no-bounds answer. */
+                if (ctx->has_req_bounds) {
+                    ngx_http_cache_turbo_req_serve_verdict(ctx,
+                        (time_t) bh.created, ngx_time(),
+                        (time_t) bh.created + (time_t) bh.fresh_ttl,
+                        &l2_fresh_ok, &l2_stale_ok);
+                }
 
                 if ((rem_fresh > 0 && !l2_fresh_ok)
                     || (rem_fresh <= 0 && !l2_stale_ok))

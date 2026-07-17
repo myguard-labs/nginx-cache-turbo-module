@@ -37,6 +37,9 @@
 #           splices is invisible. Run e.g. KEYS=1000 with a high CONC and
 #           `worker_processes auto` and watch rps scale (or not) with cores.
 #           HIT% stays ~100 because all N keys are primed before measuring.
+#           NOTE: the rotor formats a request per iteration (some client CPU);
+#           if wrk saturates a core the server-side win can be masked -- watch
+#           client CPU or raise THREADS when reading results.
 #
 # Release binary + dynamic module, the shipped artifact:
 #   eval "$(tools/ci-build.sh nginx 1.31.1 nginx)"   # sets binary= module=
@@ -51,6 +54,7 @@ SIZES="${SIZES:-tiny medium}"
 REDIS="${REDIS:-}"
 KEYS="${KEYS:-1}"      # distinct hot keys per size (P1 contention bench)
 case "$KEYS" in ''|*[!0-9]*) echo "FATAL: KEYS must be a positive integer" >&2; exit 2;; esac
+KEYS=$((10#$KEYS))     # force base-10 so "08"/"09" don't trip octal arithmetic
 [ "$KEYS" -ge 1 ] || { echo "FATAL: KEYS must be >= 1" >&2; exit 2; }
 MODULE="${MODULE:-}"   # path to ngx_http_cache_turbo_module.so for a dynamic build
 NPROC="$(nproc 2>/dev/null || echo 4)"
