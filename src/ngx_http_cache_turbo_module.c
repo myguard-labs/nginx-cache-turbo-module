@@ -1298,11 +1298,15 @@ ngx_http_cache_turbo_request_freshness_bounds(ngx_http_request_t *r,
                            sizeof("max-age") - 1);
     ctx->req_min_fresh = ngx_http_cache_turbo_cc_delta(v, e, "min-fresh",
                              sizeof("min-fresh") - 1);
+    if (ctx->req_max_age >= 0 || ctx->req_min_fresh >= 0) {
+        ctx->has_req_bounds = 1;    /* P2: a bound that can change the verdict */
+    }
 
     q = ngx_http_cache_turbo_cc_token(v, e, "max-stale",
             sizeof("max-stale") - 1, &vlen);
     if (q != NULL) {
         ctx->req_max_stale_set = 1;
+        ctx->has_req_bounds = 1;    /* P2 */
         if (vlen == 0) {
             ctx->req_max_stale_any = 1;          /* bare: accept any staleness */
         } else {
@@ -3116,8 +3120,14 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
          * entry is blocked by the bounds, req_reval makes this a revalidation:
          * the cold-miss CLAIM_FRESH path must not re-serve the raced-in fresh
          * entry, and only-if-cached still 504s at the post-L2 chokepoint. */
-        if (ctn->len > 0) {
-            /* len > 0 implies data != NULL (a real entry always has both; a
+        if (ctx->has_req_bounds && ctn->len > 0) {
+            /* P2: only run the request-freshness-bounds verdict when the client
+             * actually sent max-age/min-fresh/max-stale. With none set,
+             * req_serve_verdict returns fresh_ok=stale_ok=1 unconditionally, so
+             * the block below can never set req_reval — pure dead work on the
+             * common (no request CC) hot path. only-if-cached is unaffected: it
+             * is gated at :2998/:3511, not here.
+             * len > 0 implies data != NULL (a real entry always has both; a
              * stub/counter node is len == 0) — the serve blocks below already
              * rely on this when they memcpy ctn->data. */
             time_t  created = (time_t)
@@ -3149,9 +3159,14 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
             ngx_http_cache_turbo_blob_acquire(body);
             /* True LRU: promote this node to the head on access, so eviction
              * targets the genuinely least-recently-used entry (not the oldest by
-             * insertion/refresh). Cheap queue splice under the mutex we hold. */
-            ngx_queue_remove(&ctn->lru);
-            ngx_queue_insert_head(&z->sh->lru, &ctn->lru);
+             * insertion/refresh). P1: coarse-gate the splice — skip the LRU WRITE
+             * when this node was already spliced within the last second, so a
+             * hot key serializes readers on the mutex at most once/second. */
+            if (now - ctn->last_access >= 1) {
+                ctn->last_access = now;
+                ngx_queue_remove(&ctn->lru);
+                ngx_queue_insert_head(&z->sh->lru, &ctn->lru);
+            }
             ngx_shmtx_unlock(&z->shpool->mutex);
             (void) ngx_atomic_fetch_add(&z->sh->hits, 1);
             ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
@@ -3166,9 +3181,13 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
              * — a stub is an in-flight marker, never serveable; it falls through
              * to the cold path below where the waiter/claim logic handles it. */
 
-            /* True LRU: promote on access (still a live, serveable entry). */
-            ngx_queue_remove(&ctn->lru);
-            ngx_queue_insert_head(&z->sh->lru, &ctn->lru);
+            /* True LRU: promote on access (still a live, serveable entry).
+             * P1: coarse-gate the splice (see the fresh-HIT site above). */
+            if (now - ctn->last_access >= 1) {
+                ctn->last_access = now;
+                ngx_queue_remove(&ctn->lru);
+                ngx_queue_insert_head(&z->sh->lru, &ctn->lru);
+            }
 
             /* Cross-node single-flight resolved (v4-2): we parked for the Redis
              * NX and the phase engine re-entered. If we won (NGX_OK), we own the

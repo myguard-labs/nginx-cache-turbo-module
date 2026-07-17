@@ -394,6 +394,7 @@ ngx_http_cache_turbo_shm_store(ngx_http_cache_turbo_zone_t *z,
         ctn->stale_until = stale_ttl ? now + stale_ttl : 0;
         ctn->refreshing = 0;
         ctn->refresh_lock_until = 0;
+        ctn->last_access = now;      /* P1: store re-heads the LRU, sync stamp */
 
         ngx_queue_insert_head(&z->sh->lru, &ctn->lru);
 
@@ -427,6 +428,7 @@ ngx_http_cache_turbo_shm_store(ngx_http_cache_turbo_zone_t *z,
     ctn->refreshing = 0;
     ctn->refresh_lock_until = 0;
     ctn->miss_count = 0;
+    ctn->last_access = now;      /* P1: fresh at LRU head */
 
     ngx_rbtree_insert(&z->sh->rbtree, &ctn->node);
     ngx_queue_insert_head(&z->sh->lru, &ctn->lru);
@@ -525,6 +527,7 @@ ngx_http_cache_turbo_shm_claim(ngx_http_cache_turbo_zone_t *z,
     ctn->refreshing = 1;
     ctn->refresh_lock_until = now + lock_ttl;
     ctn->miss_count = 0;
+    ctn->last_access = now;      /* P1: init the coarse LRU stamp */
 
     ngx_rbtree_insert(&z->sh->rbtree, &ctn->node);
     ngx_queue_insert_head(&z->sh->lru, &ctn->lru);
@@ -623,6 +626,7 @@ ngx_http_cache_turbo_shm_count_miss(ngx_http_cache_turbo_zone_t *z,
     ctn->refreshing = 0;
     ctn->refresh_lock_until = 0;
     ctn->miss_count = 1;
+    ctn->last_access = now;      /* P1: init the coarse LRU stamp */
 
     ngx_rbtree_insert(&z->sh->rbtree, &ctn->node);
     ngx_queue_insert_head(&z->sh->lru, &ctn->lru);
