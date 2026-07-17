@@ -41,6 +41,7 @@ typedef struct {
 #define NGX_OK            0
 #define NGX_ERROR        -1
 #define NGX_AGAIN        -2
+#define NGX_DONE         -4
 #define NGX_DECLINED     -5
 
 #if (UINTPTR_MAX > 0xffffffffUL)

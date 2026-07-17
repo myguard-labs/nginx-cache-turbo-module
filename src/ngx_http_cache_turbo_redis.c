@@ -105,6 +105,8 @@ static ngx_int_t ngx_http_cache_turbo_redis_launch(
     ngx_http_cache_turbo_loc_conf_t *clcf, void (*read_handler)(ngx_event_t *));
 static ngx_int_t ngx_http_cache_turbo_redis_frame(u_char *p, u_char *end,
     ngx_uint_t depth, u_char **next);
+static ngx_int_t ngx_http_cache_turbo_redis_resp_len(u_char *p, size_t n,
+    ngx_int_t *len);
 #if (NGX_SSL)
 static void ngx_http_cache_turbo_redis_tls_handshake(ngx_event_t *ev);
 static void ngx_http_cache_turbo_redis_tls_handshake_done(
@@ -1826,6 +1828,45 @@ ngx_http_cache_turbo_redis_fill(ngx_http_cache_turbo_redis_op_t *op,
 
 
 /*
+ * Parse a RESP length field (the digits between the type byte and CRLF) into a
+ * non-negative byte/element count.
+ *
+ * RESP encodes nil as exactly "-1" ($-1 bulk, *-1 array); ngx_atoi rejects any
+ * leading '-' as NGX_ERROR, so it cannot represent that sentinel — a caller that
+ * only tests `ngx_atoi(...) == NGX_ERROR` collapses "nil" into "malformed" and a
+ * dead `< 0` branch below it can never fire. Split the three cases here:
+ *   NGX_OK       - real length; *len >= 0
+ *   NGX_DONE     - nil ("-1"); *len untouched
+ *   NGX_ERROR    - malformed (non-"-1", non-numeric, or overflow)
+ */
+static ngx_int_t
+ngx_http_cache_turbo_redis_resp_len(u_char *p, size_t n, ngx_int_t *len)
+{
+    ngx_int_t  v;
+
+    *len = 0;                              /* always defined: keeps callers'
+                                            * count/len provably >= 0 for the
+                                            * static analyzer on every path */
+
+    if (n == 2 && p[0] == '-' && p[1] == '1') {
+        return NGX_DONE;                   /* nil sentinel */
+    }
+
+    v = ngx_atoi(p, n);
+    if (v < 0) {                           /* NGX_ERROR (== -1): non-numeric,
+                                            * empty, or overflow. The explicit
+                                            * `< 0` (not `== NGX_ERROR`) also
+                                            * makes *len >= 0 provable to the
+                                            * static analyzer on the OK path. */
+        return NGX_ERROR;
+    }
+
+    *len = v;
+    return NGX_OK;
+}
+
+
+/*
  * Parse an accumulated GET reply in op->rbuf[0..op->rlen]. Returns:
  *   NGX_OK       - bulk string complete; blob/blob_len point into rbuf
  *   NGX_AGAIN    - need more bytes
@@ -1856,9 +1897,11 @@ ngx_http_cache_turbo_redis_parse(ngx_http_cache_turbo_redis_op_t *op,
         return NGX_AGAIN;                  /* length line not complete yet */
     }
 
-    len = ngx_atoi(p + 1, crlf - (p + 1));
-    if (len == NGX_ERROR || len < 0) {
-        return NGX_DECLINED;               /* $-1 nil, or malformed length */
+    /* $-1 nil and malformed both mean "no usable L2 value" -> miss. */
+    if (ngx_http_cache_turbo_redis_resp_len(p + 1, crlf - (p + 1), &len)
+        != NGX_OK)
+    {
+        return NGX_DECLINED;
     }
 
     if (len > NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY) {
@@ -1975,11 +2018,11 @@ ngx_http_cache_turbo_redis_frame(u_char *p, u_char *end, ngx_uint_t depth,
         if (crlf == NULL || crlf + 1 >= end || crlf[1] != LF) {
             return NGX_AGAIN;
         }
-        v = ngx_atoi(p + 1, crlf - (p + 1));
-        if (v == NGX_ERROR) {
+        rc = ngx_http_cache_turbo_redis_resp_len(p + 1, crlf - (p + 1), &v);
+        if (rc == NGX_ERROR) {
             return NGX_DECLINED;
         }
-        if (v < 0) {                       /* $-1 nil: no payload */
+        if (rc == NGX_DONE) {              /* $-1 nil: no payload, one CRLF */
             *next = crlf + 2;
             return NGX_OK;
         }
@@ -1998,12 +2041,12 @@ ngx_http_cache_turbo_redis_frame(u_char *p, u_char *end, ngx_uint_t depth,
         if (crlf == NULL || crlf + 1 >= end || crlf[1] != LF) {
             return NGX_AGAIN;
         }
-        v = ngx_atoi(p + 1, crlf - (p + 1));
-        if (v == NGX_ERROR) {
+        rc = ngx_http_cache_turbo_redis_resp_len(p + 1, crlf - (p + 1), &v);
+        if (rc == NGX_ERROR) {
             return NGX_DECLINED;
         }
         p = crlf + 2;
-        if (v < 0) {                       /* *-1 nil array: no elements */
+        if (rc == NGX_DONE) {              /* *-1 nil array: no elements */
             *next = p;
             return NGX_OK;
         }
@@ -2037,7 +2080,7 @@ ngx_http_cache_turbo_redis_parse_array(ngx_http_cache_turbo_redis_op_t *op,
     ngx_str_t **members, ngx_uint_t *nmembers)
 {
     u_char     *p, *crlf, *end;
-    ngx_int_t   count, len;
+    ngx_int_t   count, len, rc;
     ngx_uint_t  i;
     ngx_str_t  *list;
 
@@ -2057,11 +2100,11 @@ ngx_http_cache_turbo_redis_parse_array(ngx_http_cache_turbo_redis_op_t *op,
         return NGX_AGAIN;
     }
 
-    count = ngx_atoi(p + 1, crlf - (p + 1));
-    if (count == NGX_ERROR) {
+    rc = ngx_http_cache_turbo_redis_resp_len(p + 1, crlf - (p + 1), &count);
+    if (rc == NGX_ERROR) {
         return NGX_DECLINED;
     }
-    if (count < 0) {                       /* *-1 nil array */
+    if (rc == NGX_DONE) {                  /* *-1 nil array */
         *members = NULL;
         *nmembers = 0;
         return NGX_OK;
@@ -2097,12 +2140,12 @@ ngx_http_cache_turbo_redis_parse_array(ngx_http_cache_turbo_redis_op_t *op,
             return NGX_AGAIN;
         }
 
-        len = ngx_atoi(p + 1, crlf - (p + 1));
-        if (len == NGX_ERROR) {
+        rc = ngx_http_cache_turbo_redis_resp_len(p + 1, crlf - (p + 1), &len);
+        if (rc == NGX_ERROR) {
             return NGX_DECLINED;
         }
 
-        if (len < 0) {                     /* nil element: empty member */
+        if (rc == NGX_DONE) {              /* $-1 nil element: empty member */
             list[i].data = NULL;
             list[i].len = 0;
             p = crlf + 2;
@@ -2193,7 +2236,7 @@ ngx_http_cache_turbo_redis_parse_scan(ngx_http_cache_turbo_redis_op_t *op,
     ngx_str_t *cursor, ngx_str_t **keys, ngx_uint_t *nkeys)
 {
     u_char     *p, *crlf, *end;
-    ngx_int_t   count, len;
+    ngx_int_t   count, len, rc;
     ngx_uint_t  i;
     ngx_str_t  *list;
 
@@ -2228,8 +2271,10 @@ ngx_http_cache_turbo_redis_parse_scan(ngx_http_cache_turbo_redis_op_t *op,
     if (crlf == NULL || crlf + 1 >= end || crlf[1] != LF) {
         return NGX_AGAIN;
     }
-    len = ngx_atoi(p + 1, crlf - (p + 1));
-    if (len == NGX_ERROR || len < 0) {
+    /* The SCAN cursor is always a real bulk string; nil ($-1) here is malformed. */
+    if (ngx_http_cache_turbo_redis_resp_len(p + 1, crlf - (p + 1), &len)
+        != NGX_OK)
+    {
         return NGX_DECLINED;
     }
     if (len > NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY) {
@@ -2254,11 +2299,11 @@ ngx_http_cache_turbo_redis_parse_scan(ngx_http_cache_turbo_redis_op_t *op,
     if (crlf == NULL || crlf + 1 >= end || crlf[1] != LF) {
         return NGX_AGAIN;
     }
-    count = ngx_atoi(p + 1, crlf - (p + 1));
-    if (count == NGX_ERROR) {
+    rc = ngx_http_cache_turbo_redis_resp_len(p + 1, crlf - (p + 1), &count);
+    if (rc == NGX_ERROR) {
         return NGX_DECLINED;
     }
-    if (count < 0) {                       /* nil array: treat as no keys */
+    if (rc == NGX_DONE) {                  /* *-1 nil array: treat as no keys */
         count = 0;
     }
     if (count > NGX_HTTP_CACHE_TURBO_REDIS_MAX_MEMBERS) {
@@ -2286,11 +2331,11 @@ ngx_http_cache_turbo_redis_parse_scan(ngx_http_cache_turbo_redis_op_t *op,
         if (crlf == NULL || crlf + 1 >= end || crlf[1] != LF) {
             return NGX_AGAIN;
         }
-        len = ngx_atoi(p + 1, crlf - (p + 1));
-        if (len == NGX_ERROR) {
+        rc = ngx_http_cache_turbo_redis_resp_len(p + 1, crlf - (p + 1), &len);
+        if (rc == NGX_ERROR) {
             return NGX_DECLINED;
         }
-        if (len < 0) {                     /* nil element */
+        if (rc == NGX_DONE) {              /* $-1 nil element */
             list[i].data = NULL;
             list[i].len = 0;
             p = crlf + 2;
