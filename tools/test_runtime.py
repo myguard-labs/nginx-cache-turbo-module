@@ -3074,6 +3074,18 @@ def test_phpbb_preset(ng: Nginx, origin: Origin) -> None:
     _, _, ht = fetch(ng.port, "/phpbb/viewtopic-e", headers=ten)
     assert "x-cache" not in ht, \
         f"_u=10 is user 10, not ANONYMOUS(1) — must bypass, got {ht.get('x-cache')}"
+
+    # Empty value "_u=" (a cleared/reset cookie, distinct from the bare "_u" with
+    # no '=' above): it reaches the value compare with a zero-length value. By the
+    # letter of "!= 1" an empty string is a non-member => bypass; that is also the
+    # safe reading for a malformed/cleared cookie (module.c:2532-2540). Exercises
+    # the empty-value arm of the NE predicate the non-empty members above skip.
+    empty = {"Cookie": "phpbb3_sid=abc; phpbb3_u="}
+    fetch(ng.port, "/phpbb/viewtopic-f", headers=empty)
+    _, _, he = fetch(ng.port, "/phpbb/viewtopic-f", headers=empty)
+    assert "x-cache" not in he, \
+        (f"empty '_u=' is not the guest literal '1' — must bypass (cleared/"
+         f"malformed cookie, safe direction), got {he.get('x-cache')}")
     drain_origin(origin)
 
 
