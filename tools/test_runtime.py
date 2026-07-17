@@ -1135,6 +1135,27 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # RFC-1 request Cache-Control serve verdict (req_serve_verdict): a
+        # client's own max-age/min-fresh/max-stale bound the entry it will
+        # accept. Long fresh window (30s) so the entry is unambiguously FRESH
+        # for the max-age/min-fresh cases; a separate 1s+beta1 sibling (/reqccst/)
+        # lets an entry go STALE so max-stale tolerance can be exercised.
+        location /reqcc/ {{
+            cache_turbo        main;
+            cache_turbo_key    $uri;
+            cache_turbo_valid  30s;
+            add_header         X-CT-Status $cache_turbo_status always;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        location /reqccst/ {{
+            cache_turbo        main;
+            cache_turbo_key    $uri;
+            cache_turbo_valid  1s;
+            cache_turbo_beta   1;
+            add_header         X-CT-Status $cache_turbo_status always;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # cc_mode (cache_turbo_cache_control) merge precedence: a child location
         # with a CMS backend preset (cc_mode defaults to honor) under a parent
         # that set `ignore` must resolve to HONOR, NOT inherit the parent ignore
@@ -5126,6 +5147,96 @@ def test_status_expired(ng: Nginx, origin: Origin) -> None:
     drain_origin(origin)
 
 
+def test_request_cc_serve_verdict_fresh(ng: Nginx, origin: Origin) -> None:
+    """RFC-1 request Cache-Control against a FRESH entry (req_serve_verdict,
+    module.c:1403-1409). A client's own max-age/min-fresh can refuse an entry
+    the cache considers fresh: fresh_ok clears, no max-stale means stale_ok is
+    also 0, so both serve paths are refused and the entry is revalidated
+    (refetched from origin) instead of served HIT.
+
+    The counting origin returns a unique body per hit, so a refetch yields a
+    body distinct from the primed one — that difference is the proof the cache
+    did NOT serve the stored copy."""
+    # prime a fresh 30s entry, confirm the plain second read HITs
+    _, base, _ = fetch(ng.port, "/reqcc/f")
+    _, b2, h2 = fetch(ng.port, "/reqcc/f")
+    assert h2.get("x-ct-status") == "HIT", \
+        f"plain second read should HIT, got {h2.get('x-ct-status')}"
+    assert b2 == base, "fresh HIT must replay the stored body"
+
+    # max-age=0: client demands an entry no older than 0s. The 30s entry has
+    # age>0 -> fresh_ok=0; no max-stale -> stale_ok=0 -> refused -> refetch.
+    _, bm, hm = fetch(ng.port, "/reqcc/f",
+                      headers={"Cache-Control": "max-age=0"})
+    assert hm.get("x-ct-status") != "HIT", \
+        f"max-age=0 must refuse the fresh HIT, got {hm.get('x-ct-status')}"
+    assert bm != base, "max-age=0 must be revalidated from origin (new body)"
+
+    # min-fresh=999: client wants >=999s of remaining freshness; the entry has
+    # at most 30s left -> fresh_ok=0 -> refused -> refetch.
+    fetch(ng.port, "/reqcc/g")
+    fetch(ng.port, "/reqcc/g")   # ensure a fresh stored entry
+    _, bg, hg = fetch(ng.port, "/reqcc/g",
+                      headers={"Cache-Control": "min-fresh=999"})
+    assert hg.get("x-ct-status") != "HIT", \
+        f"min-fresh=999 must refuse the 30s entry, got {hg.get('x-ct-status')}"
+
+    # max-stale (bare) on a fresh entry still serves the fresh HIT (fresh_ok=1),
+    # while exercising the bare-max-stale parse (req_max_stale_any). module.c:1367
+    _, _, hs = fetch(ng.port, "/reqcc/f",
+                     headers={"Cache-Control": "max-stale"})
+    assert hs.get("x-ct-status") == "HIT", \
+        f"bare max-stale must still serve the fresh HIT, got {hs.get('x-ct-status')}"
+    drain_origin(origin)
+
+
+def test_request_cc_serve_verdict_stale(ng: Nginx, origin: Origin) -> None:
+    """RFC-1 request Cache-Control against a STALE entry (req_serve_verdict
+    stale_ok arm, module.c:1411-1421). /reqccst/ has a 1s fresh window + the
+    default 4x stale window and beta 1 (dice ~never), so after ~1.3s the entry
+    is stale-but-serveable. The client's max-stale decides whether the cache may
+    serve that stale copy."""
+    # default (no request CC): a stale entry is served per cache policy (stale_ok
+    # default arm, module.c:1421).
+    fetch(ng.port, "/reqccst/a")
+    time.sleep(1.3)
+    _, _, hd = fetch(ng.port, "/reqccst/a")
+    assert hd.get("x-ct-status") == "STALE", \
+        f"default request must serve STALE, got {hd.get('x-ct-status')}"
+
+    # max-stale=0: no staleness tolerated. staleness>0 -> stale_ok=0; no max-age
+    # so fresh_ok stays 1 but the entry is not fresh -> refused -> refetch.
+    # Sleep 2.3s (not 1.3s) so staleness = now-fresh_until is unambiguously >=1s:
+    # ngx_time() has 1s granularity, and at ~0.3s past a 1s window the rounded
+    # staleness can land on 0, making `staleness <= max_stale(0)` true and the
+    # copy STALE-served (the 1s-granularity SWR flake class). 2.3s clears it.
+    fetch(ng.port, "/reqccst/b")
+    time.sleep(2.3)
+    _, _, hz = fetch(ng.port, "/reqccst/b",
+                     headers={"Cache-Control": "max-stale=0"})
+    assert hz.get("x-ct-status") != "STALE", \
+        f"max-stale=0 must refuse the stale copy, got {hz.get('x-ct-status')}"
+
+    # max-stale=100: 100s of staleness tolerated; the ~0.3s-stale entry is well
+    # within it -> stale_ok=1 -> STALE served (module.c:1416, valued branch).
+    fetch(ng.port, "/reqccst/c")
+    time.sleep(1.3)
+    _, _, hp = fetch(ng.port, "/reqccst/c",
+                     headers={"Cache-Control": "max-stale=100"})
+    assert hp.get("x-ct-status") == "STALE", \
+        f"max-stale=100 must permit the stale copy, got {hp.get('x-ct-status')}"
+
+    # max-stale=abc: unparseable value falls back to "accept any staleness"
+    # (req_max_stale_any, module.c:1375) -> STALE served.
+    fetch(ng.port, "/reqccst/d")
+    time.sleep(1.3)
+    _, _, hu = fetch(ng.port, "/reqccst/d",
+                     headers={"Cache-Control": "max-stale=abc"})
+    assert hu.get("x-ct-status") == "STALE", \
+        f"unparseable max-stale must be lenient (STALE), got {hu.get('x-ct-status')}"
+    drain_origin(origin)
+
+
 def test_cc_mode_inheritance_child_preset_overrides_parent_ignore(
         ng: Nginx, origin: Origin) -> None:
     """cc_mode (cache_turbo_cache_control) merge precedence: a child with a CMS
@@ -7693,6 +7804,8 @@ def run_all(ng: Nginx, origin: Origin,
     test_status_variable(ng)
     test_status_stale(ng, origin)
     test_status_expired(ng, origin)
+    test_request_cc_serve_verdict_fresh(ng, origin)
+    test_request_cc_serve_verdict_stale(ng, origin)
     test_cc_mode_inheritance_child_preset_overrides_parent_ignore(ng, origin)
     test_no_store(ng)
     test_native_cache_headers_stripped(ng)
@@ -7898,7 +8011,12 @@ def main() -> int:
           "bypass + no_store, DIY bypass_uri (v15: segment-boundary + subdir + "
           "non-boundary caches), DIY key_cookie (v15: value-keyed entries + anon "
           "bucket + exact-name + split-header), $cache_turbo_status (MISS/HIT/BYPASS + bypasses counter, "
-          "STALE serve, EXPIRED refetch), cc_mode inheritance (child preset honor "
+          "STALE serve, EXPIRED refetch), "
+          "RFC-1 request Cache-Control serve verdict (fresh: max-age=0/min-fresh "
+          "refuse fresh HIT + revalidate, bare max-stale still serves fresh; "
+          "stale: default serves STALE, max-stale=0 refuses, max-stale=N/"
+          "unparseable permit stale), "
+          "cc_mode inheritance (child preset honor "
           "overrides parent ignore), "
           "native-cache headers stripped, "
           "admin purge w/ body, "

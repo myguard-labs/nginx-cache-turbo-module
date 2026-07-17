@@ -65,6 +65,13 @@ jobs:
             src/*.c
           git diff --check
 
+      - name: Pure-math unit tests (SWR + autotune boundary branches)
+        run: |
+          # Fast, hermetic, no nginx: compiles the shipped src units verbatim
+          # against a shim and drives the fixed-point boundary branches the HTTP
+          # runtime suite cannot reach. check_constants.sh guards shim drift.
+          bash tests/unit/run.sh
+
       - name: Lint workflows
         run: |
           version=1.7.7

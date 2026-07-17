@@ -1,0 +1,69 @@
+name: Coverage
+
+# gcov/gcovr line+branch coverage of the cache-turbo MODULE sources, measured by
+# running the full runtime suite (L2 redis+memcached + fault injection) plus the
+# pure-math unit tests against a --coverage-instrumented build.
+#
+# Out-of-band by design: this is a ~5-minute instrumented run and a REPORT, not a
+# merge gate (repo policy is meaningful tests over a % threshold — see
+# feedback-coverage-badge-vs-test-integrity). It never fails on a number; it
+# surfaces where coverage is thin so gaps get real tests. Runs weekly + on
+# demand, never on the PR path.
+#
+# Action pins (keep in sync with build-test.yml header):
+# actions/checkout@v5        -> 93cb6efe18208431cddfb8368fd83d5badbf9bfd
+# actions/upload-artifact@v5 -> 330a01c490aca151604b8cf639adc76d48f6c5d4
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  NGINX_VERSION: "1.31.1"
+
+on:
+  schedule:
+    - cron: "17 4 * * 1"      # Mondays 04:17 UTC
+  workflow_dispatch: {}
+
+concurrency:
+  group: coverage-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  coverage:
+    name: gcov/gcovr module coverage
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && 'ubuntu-24.04' || fromJSON('["self-hosted","builder02","lxc"]') }}
+    timeout-minutes: 45
+    steps:
+      - name: Checkout module
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential curl libpcre2-dev libssl-dev pkg-config \
+            zlib1g-dev gcovr redis-server memcached
+
+      - name: Measure coverage (instrumented suite + unit tests)
+        run: |
+          # coverage.sh: builds the --coverage module, runs the full runtime
+          # suite + the pure-math unit tests against it, then gcovr-reports the
+          # six module sources. redis/memcached binaries live at the standard
+          # apt paths on both runner types.
+          REDIS_SERVER=/usr/bin/redis-server \
+          MEMCACHED_SERVER=/usr/bin/memcached \
+          TEST_NGINX_TIMEOUT=30 \
+            bash tools/coverage.sh nginx "$NGINX_VERSION"
+
+      - name: Upload HTML + XML coverage report
+        if: always()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: coverage-report
+          path: coverage-report/
+          if-no-files-found: warn
+          retention-days: 30
