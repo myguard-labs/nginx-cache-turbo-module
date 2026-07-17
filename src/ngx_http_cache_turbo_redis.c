@@ -234,7 +234,17 @@ static void ngx_http_cache_turbo_redis_ka_dummy_handler(ngx_event_t *ev);
 
 /* Lazily build the per-worker item array sized to the first-seen keepalive cap.
  * Items live in ngx_cycle->pool (worker lifetime). Returns 0 if keepalive is
- * off or the array cannot be allocated. */
+ * off or the array cannot be allocated.
+ *
+ * NOTE: cap and timeout are latched here ONCE per worker, by the first
+ * keepalive-enabled location to get this far (keepalive<=0 returns above without
+ * latching); later locations' redis_keepalive[_timeout] are silently discarded
+ * even though cache_turbo_redis merges per-location. Reuse is matched by profile,
+ * not by location, so same-profile locations correctly share conns and no conn
+ * crosses profiles (ka_fp/ka_profile_eq). But mutually-unreusable profiles still
+ * share this one undivided budget -- ka_save's cap check is fingerprint-blind --
+ * so they starve each other. Documented as a constraint in README; a
+ * per-fingerprint pool would be the real fix. */
 static ngx_uint_t
 ngx_http_cache_turbo_redis_ka_init(ngx_http_cache_turbo_loc_conf_t *clcf)
 {
