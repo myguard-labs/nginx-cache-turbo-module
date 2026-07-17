@@ -29,6 +29,17 @@
 #   MODULE  path to ngx_http_cache_turbo_module.so (dynamic builds — adds
 #           a load_module line; omit if the module is statically linked)
 #   THREADS wrk worker threads                     (default min(conc,nproc))
+#   KEYS    N distinct hot keys per size           (default 1 = single hot key)
+#           >1 spreads load across N cached keys via a wrk Lua rotor. The
+#           single-key default cannot show LRU-splice / per-key lock
+#           contention wins (P1): every request hammers ONE node's LRU
+#           linkage under the zone mutex, so a fix that skips redundant
+#           splices is invisible. Run e.g. KEYS=1000 with a high CONC and
+#           `worker_processes auto` and watch rps scale (or not) with cores.
+#           HIT% stays ~100 because all N keys are primed before measuring.
+#           NOTE: the rotor formats a request per iteration (some client CPU);
+#           if wrk saturates a core the server-side win can be masked -- watch
+#           client CPU or raise THREADS when reading results.
 #
 # Release binary + dynamic module, the shipped artifact:
 #   eval "$(tools/ci-build.sh nginx 1.31.1 nginx)"   # sets binary= module=
@@ -41,6 +52,10 @@ DURATION="${2:-15}"
 CONC="${3:-8}"
 SIZES="${SIZES:-tiny medium}"
 REDIS="${REDIS:-}"
+KEYS="${KEYS:-1}"      # distinct hot keys per size (P1 contention bench)
+case "$KEYS" in ''|*[!0-9]*) echo "FATAL: KEYS must be a positive integer" >&2; exit 2;; esac
+KEYS=$((10#$KEYS))     # force base-10 so "08"/"09" don't trip octal arithmetic
+[ "$KEYS" -ge 1 ] || { echo "FATAL: KEYS must be >= 1" >&2; exit 2; }
 MODULE="${MODULE:-}"   # path to ngx_http_cache_turbo_module.so for a dynamic build
 NPROC="$(nproc 2>/dev/null || echo 4)"
 THREADS="${THREADS:-$(( CONC < NPROC ? CONC : NPROC ))}"
@@ -145,6 +160,23 @@ $REDIS_EDGE
 }
 EOF
 
+# Multi-key rotor (KEYS>1): each wrk connection walks the N-key range with a
+# per-connection offset, so requests spread over N distinct cache nodes instead
+# of hammering one node's LRU linkage under the zone mutex. The path template is
+# passed in via WRK_PATH (e.g. "/tiny?k="); wrk appends the key index.
+if [ "$KEYS" -gt 1 ]; then
+    cat > "$WORK/conf/rotor.lua" <<'LUA'
+local keys = tonumber(os.getenv("WRK_KEYS")) or 1
+local base = os.getenv("WRK_PATH") or "/"
+local i = 0
+function init(args) i = math.random(0, keys - 1) end
+function request()
+    i = (i + 1) % keys
+    return wrk.format(nil, base .. i)
+end
+LUA
+fi
+
 "$NGINX" -p "$WORK" -c "$WORK/conf/nginx.conf" &
 NGINX_PID=$!
 trap 'kill -QUIT "$NGINX_PID" 2>/dev/null || true; rm -rf "$WORK"' EXIT
@@ -188,10 +220,27 @@ prime() {
     exit 3
 }
 
-# Run one wrk pass and emit "rps p50_ms p99_ms".
+# Prime N distinct keys under one base URL (KEYS>1). $1=port $2=baseurl $3=mode.
+# baseurl carries the "?k=" template; each key i is baseurl.i.
+prime_keys() {
+    local port="$1" base="$2" mode="$3" i
+    for (( i=0; i<KEYS; i++ )); do
+        prime "$port" "${base}${i}" "$mode"
+    done
+}
+
+# Run one wrk pass and emit "rps p50_ms p99_ms". With KEYS>1 pass $2=path
+# template (e.g. "/tiny?k=") + $3=one full seed URL; the Lua rotor spreads
+# requests over the key range from that connection base.
 runwrk() {
-    local url="$1" out
-    out=$(wrk -t"$THREADS" -c"$CONC" -d"${DURATION}s" --latency "$url" 2>/dev/null)
+    local url="$1" path="${2:-}" out
+    if [ "$KEYS" -gt 1 ] && [ -n "$path" ]; then
+        out=$(WRK_KEYS="$KEYS" WRK_PATH="$path" \
+              wrk -t"$THREADS" -c"$CONC" -d"${DURATION}s" --latency \
+                  -s "$WORK/conf/rotor.lua" "$url" 2>/dev/null)
+    else
+        out=$(wrk -t"$THREADS" -c"$CONC" -d"${DURATION}s" --latency "$url" 2>/dev/null)
+    fi
     local rps p50 p99
     rps=$(awk '/Requests\/sec:/ {print $2}' <<<"$out")
     # "Latency Distribution" block prints e.g. "     50%    1.23ms"
@@ -211,7 +260,7 @@ for kv in "${admin[@]}"; do ADMIN[${kv%%:*}]=${kv#*:}; done
 
 declare -A names=( [A]="origin-direct" [B]="proxy_cache" [C]="cache_turbo-shm" [D]="cache_turbo-redis" )
 
-echo "bench: ${DURATION}s/run, ${CONC} conns, ${THREADS} threads, sizes: $SIZES"
+echo "bench: ${DURATION}s/run, ${CONC} conns, ${THREADS} threads, sizes: $SIZES, keys: $KEYS"
 echo "       warmup run discarded; report is the second measured pass."
 printf '\n%-10s %-18s %12s %10s %10s %9s\n' SIZE MODE REQ/S P50 P99 HIT%
 printf '%s\n' "------------------------------------------------------------------------"
@@ -219,12 +268,19 @@ printf '%s\n' "-----------------------------------------------------------------
 for size in $SIZES; do
     for m in "${modes[@]}"; do
         port="${PORT[$m]}"; ap="${ADMIN[$m]}"
-        url="http://127.0.0.1:$port/$size"
         sleep 1                       # let the previous pass's sockets drain
-        prime "$port" "$url" "$m"
+        if [ "$KEYS" -gt 1 ]; then
+            path="/$size?k="                     # rotor appends the key index
+            url="http://127.0.0.1:$port${path}0" # seed URL for the wrk connection
+            prime_keys "$port" "http://127.0.0.1:$port$path" "$m"
+        else
+            path=""
+            url="http://127.0.0.1:$port/$size"
+            prime "$port" "$url" "$m"
+        fi
 
         # Discard one warmup pass (JIT TCP windows / shm fault-in).
-        runwrk "$url" >/dev/null
+        runwrk "$url" "$path" >/dev/null
 
         # hit-ratio over the measured pass, from the module's own counters.
         local_hit="n/a"
@@ -234,7 +290,7 @@ for size in $SIZES; do
             st0=$(scrape "$port" "$ap" cache_turbo_stale_serves_total)
         fi
 
-        read -r rps p50 p99 < <(runwrk "$url")
+        read -r rps p50 p99 < <(runwrk "$url" "$path")
 
         if [ -n "$ap" ]; then
             h1=$(scrape "$port" "$ap" cache_turbo_hits_total)

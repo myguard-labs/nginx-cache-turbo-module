@@ -301,6 +301,15 @@ typedef struct {
      * Irrelevant once the node holds a real body (len > 0); left untouched then. */
     ngx_uint_t               miss_count;
 
+    /* PERF (P1): coarse last-access stamp (1s granularity, ngx_time). The true-LRU
+     * head-splice on every HIT is a WRITE to the shared LRU list under
+     * shpool->mutex — on a hot key that serializes all readers on the same cache
+     * lines. We re-splice only when now - last_access >= 1, so a key hammered many
+     * times per second splices at most once/second. Eviction is best-effort/
+     * approximate anyway (shm.c), so an LRU that is at most ~1s stale is harmless.
+     * 0 = never spliced (fresh node); the first HIT always splices. */
+    time_t                   last_access;
+
     ngx_queue_t              lru;           /* LRU list linkage             */
 } ngx_http_cache_turbo_node_t;
 
@@ -789,6 +798,12 @@ typedef struct {
     unsigned                 req_max_stale_set:1;
     unsigned                 req_max_stale_any:1;
     unsigned                 req_reval:1;
+    /* PERF (P2): set iff the client sent ANY of max-age/min-fresh/max-stale, i.e.
+     * the freshness bounds can actually change the serve verdict. When unset the
+     * per-hit req_serve_verdict/bounds block on the lookup fast path is dead work
+     * (all three bounds are -1/absent => fresh serves, stale serves) and is
+     * skipped. only-if-cached is NOT folded here: it is handled at :2998/:3511. */
+    unsigned                 has_req_bounds:1;
     /* RFC 5861 §4 / RFC-2 stale-if-error serve-on-error (CTB4). On a lookup that
      * finds the entry EXPIRED (past its stale window) but still inside the blob's
      * serve-on-error window (created + sie_ttl), we DECLINE to origin yet stash a

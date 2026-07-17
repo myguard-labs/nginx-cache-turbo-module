@@ -1747,6 +1747,7 @@ http {{
             cache_turbo          tiny;
             cache_turbo_key      $uri;
             cache_turbo_valid    30s;
+            add_header           X-CT-Status $cache_turbo_status always;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
@@ -5471,6 +5472,56 @@ def test_lru_eviction(ng: Nginx) -> None:
         assert s == 200, f"/e/{i} returned {s}"
 
 
+def test_p1_coarse_lru_splice_keeps_hot_key_resident(ng: Nginx) -> None:
+    """P1: the LRU head-splice on a HIT is coarse-gated (re-splice only when
+    now - last_access >= 1s) so a key hammered many times per second does not
+    re-write the shared LRU list every hit. The gate must NOT let a genuinely
+    hot key drift toward the eviction tail: after being hammered fast and then
+    surviving a burst of cold-key eviction churn, the hot key must still be
+    resident (X-CT-Status HIT), proving the coarse splice still promotes it.
+
+    Positive assertion on $cache_turbo_status (HIT), never header-absence -- a
+    vanished status header would read as a pass otherwise. Sabotage check: if
+    the coarse gate wrongly skipped ALL splices, the hot key would age to the
+    LRU tail and the post-churn fetch would MISS."""
+    import time
+    hot = "/e/p1-hot"
+
+    # Prime the hot key, then hammer it fast so almost every hit lands inside the
+    # same 1s window and exercises the coarse-splice SKIP path (the whole point
+    # of P1 -- these hits must NOT re-splice the LRU list).
+    s, _, _ = fetch(ng.port, hot)
+    assert s == 200, f"prime {hot} -> {s}"
+    for _ in range(300):
+        s, _, _ = fetch(ng.port, hot)
+        assert s == 200, f"hot hammer {hot} -> {s}"
+
+    # Cold-key churn in waves, each wave preceded by a real >1s gap then a hot
+    # touch. The sleep is load-bearing: the coarse gate splices only when
+    # now - last_access >= 1, and a new node starts at last_access = now, so
+    # WITHOUT the gap fast-loopback re-touches would fall in the same time_t
+    # second, skip every promotion, and the test could pass without ever
+    # exercising the splice. With the gap each hot touch genuinely re-promotes.
+    # /e/ is a tiny zone (R6: eviction at ~200 keys); each wave overflows it.
+    for wave in range(3):
+        time.sleep(1.2)                  # cross a 1s boundary -> splice fires
+        s, _, _ = fetch(ng.port, hot)    # re-promote to LRU head
+        assert s == 200, f"hot re-touch {hot} -> {s}"
+        for i in range(250):
+            fetch(ng.port, f"/e/p1-cold-{wave}-{i}")
+
+    # The hot key was re-promoted before each eviction wave, so a correct coarse
+    # splice kept it RESIDENT. The property under test is non-eviction, so both
+    # HIT (still fresh) and STALE (present-but-expired; the many cold fetches +
+    # 1.2s sleeps can push total runtime past /e/'s 30s valid window) prove the
+    # node survived. A broken gate that skipped ALL splices would have aged it to
+    # the LRU tail and evicted it -> the re-fetch would MISS (cold origin fill).
+    s, _, h = fetch(ng.port, hot)
+    assert s == 200, f"post-churn {hot} -> {s}"
+    assert h.get("x-ct-status") in ("HIT", "STALE"), (
+        f"hot key evicted despite promotion: X-CT-Status={h.get('x-ct-status')}")
+
+
 def test_perf7_zero_copy_serve_under_eviction(ng: Nginx) -> None:
     """PERF-7: a HIT serves the blob zero-copy DIRECTLY out of the shm slab
     (no per-hit copy into r->pool), holding a refcount on the buffer until the
@@ -7612,6 +7663,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_admin_purge_post_with_body(ng)
     test_concurrent_hits_no_deadlock(ng)
     test_lru_eviction(ng)
+    test_p1_coarse_lru_splice_keeps_hot_key_resident(ng)
     test_admin_stats(ng)
     test_admin_prometheus(ng)
     test_admin_purge_key(ng)
