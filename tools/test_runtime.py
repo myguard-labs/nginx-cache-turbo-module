@@ -830,6 +830,7 @@ http {{
 
     cache_turbo_zone name=main 16m;
     cache_turbo_zone name=tiny 8m;   # small zone for eviction test (R6)
+    cache_turbo_zone name=shmref 16m; # refresh-under-pressure (R6b)
     cache_turbo_zone name=at 16m;    # autotune raise/clamp/off (v4-3)
     cache_turbo_zone name=atl 16m;   # autotune load-adaptive stale widen (v4-4)
     cache_turbo_zone name=ati 16m;   # autotune insufficient-data (v4-3)
@@ -1738,6 +1739,26 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # R6b: refresh-under-pressure. A tiny zone (so eviction churns) with a
+        # short fresh window + aggressive beta + background_update, so a working
+        # set larger than the zone is CONTINUOUSLY going stale and refreshing
+        # (SWR store back into shm) at the same time other entries are being
+        # evicted to make room. This overlaps the shm slab alloc/free/evict path
+        # with the refresh-store path under concurrency -- the combination the
+        # eviction-only (/e/, valid 30s never stale) and serve-under-eviction
+        # (PERF-7) tests do not exercise. The value is under the sanitizer CI run
+        # (asan job runs the full suite): a shm UAF / double-free / overflow in
+        # store-under-eviction surfaces there. beta 5000 = refresh fires early in
+        # the stale window; valid 1s keeps entries turning over fast.
+        location /shmref/ {{
+            cache_turbo               shmref;
+            cache_turbo_key           $uri;
+            cache_turbo_valid         2s;     # stale window opens at t+2s
+            cache_turbo_beta          5000;   # aggressive: refresh fires early in stale
+            cache_turbo_background_update on;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # key normalize (v3-1): key is built from $cache_turbo_normalized_args
         # so reordered / tracking-laden query strings collapse to one slot
         location /n/ {{
@@ -1994,6 +2015,11 @@ http {{
         }}
         location = /_cache_atch {{
             cache_turbo_admin atch;
+            allow 127.0.0.1;
+            deny all;
+        }}
+        location = /_cache_shmref {{
+            cache_turbo_admin shmref;
             allow 127.0.0.1;
             deny all;
         }}
@@ -5429,6 +5455,90 @@ def test_perf7_zero_copy_serve_under_eviction(ng: Nginx) -> None:
     assert not bad, f"non-200 under serve/eviction churn: {bad}"
 
 
+def test_shm_refresh_under_pressure(ng: Nginx) -> None:
+    """R6b: refresh-store races with eviction under concurrency. The /shmref/
+    location uses a tiny zone (8m) with a 1s fresh window + aggressive beta +
+    background_update, so a working set far larger than the zone is
+    CONTINUOUSLY going stale and refreshing (SWR store back into the shm slab)
+    while OTHER entries are being evicted to make room. This overlaps the
+    slab alloc/free/evict path with the refresh-store path -- the combination
+    that neither the eviction-only test (/e/, valid 30s, never stale) nor the
+    serve-under-eviction test (PERF-7, valid 30s, never refreshes) exercises.
+
+    The high-value assertion is delivered by the sanitizer CI run (the asan job
+    runs the full suite): a UAF / double-free / heap-overflow in store-under-
+    eviction trips ASan/UBSan and aborts the worker, which this test observes as
+    a 5xx or a dead server. The plain run asserts liveness + no corruption.
+
+    NOT timing-fragile: it does not assert an exact regeneration count (the
+    dice is ngx_time()-driven at 1s granularity and per-worker, so an exact
+    count would flake under slow/sanitized runs). It asserts (a) every request
+    succeeds, (b) the server is still alive and serving afterwards, and (c) the
+    refresh machinery actually engaged at least once (refreshes counter > 0),
+    so a run where nothing ever went stale -- which would silently cover
+    nothing -- fails loudly instead of passing vacuously."""
+    import json
+    import random
+
+    # A small HOT set stays resident in the zone across the 1s fresh window, so a
+    # re-request after expiry lands on a stale-but-present entry and drives the
+    # refresh-store path (which increments `refreshes` only for a stale HIT that
+    # wins the dice -- an entry EVICTED before re-hit never refreshes, so a large
+    # working set alone covers nothing). Interleaved COLD keys create the
+    # concurrent slab eviction pressure, so refresh-store races with eviction --
+    # the combination /e/ (never stale) and PERF-7 (never refreshes) miss.
+    # Hot set is re-touched every wave so it stays MRU and survives eviction (it
+    # must persist to go stale and drive refresh). The larger cold set overflows
+    # the zone's ~key capacity and is evicted continuously, so slab evict runs
+    # concurrently with the hot set's refresh-store. (A 16m zone holds a few
+    # hundred of these small entries; R6 shows 8m evicting at ~200 keys, so cold
+    # is sized well past that to guarantee churn without touching the MRU hot set.)
+    hot = 40
+    cold = 800                       # >> zone capacity -> continuous eviction
+    reqs = 4000
+
+    # refreshes counter baseline. Read the shmref zone's OWN admin endpoint --
+    # /_cache is bound to zone "main" (cache_turbo_admin main), so it would
+    # report main's counters, never shmref's, and the refresh assertion below
+    # would read 0 forever regardless of what the module did.
+    base = json.loads(fetch(ng.port, "/_cache_shmref")[1]).get("refreshes", 0)
+
+    for i in range(hot):             # prime the hot set (must survive to go stale)
+        s, _, _ = fetch(ng.port, f"/shmref/hot-{i}")
+        assert s == 200, f"/shmref/hot-{i} prime returned {s}"
+
+    # Sleep past fresh_until AND past the ngx_time() one-second-granularity dead
+    # zone. The refresh dice threshold is elapsed/window * beta with elapsed in
+    # whole seconds; at elapsed == 0 (the first ~1s after fresh_until) it is 0 and
+    # the dice CANNOT fire whatever beta is (documented on test_lock_redis_outage
+    # and the /atch/ churn test, which sleeps 2.7). fresh window is 2s; sleeping
+    # 3.2s puts the hot set >= ~1.2s into the stale window, so elapsed >= 1s for
+    # the entire hammer below and the dice fires from its first request.
+    time.sleep(3.2)
+
+    def hit(n: int) -> int:
+        # ~70% hot (stale -> refresh), ~30% cold (fresh miss -> eviction churn),
+        # so the refresh-store path and the slab evict path run concurrently.
+        if n % 10 < 7:
+            uri = f"/shmref/hot-{random.randint(0, hot - 1)}"
+        else:
+            uri = f"/shmref/cold-{random.randint(0, cold - 1)}"
+        return fetch(ng.port, uri)[0]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=48) as pool:
+        codes = list(pool.map(hit, range(reqs)))
+    bad = sorted({c for c in codes if c != 200})
+    assert not bad, f"non-200 under refresh/eviction churn: {bad}"
+
+    # Server still alive and serving (an ASan abort in a worker would show here).
+    s, body, _ = fetch(ng.port, "/_cache_shmref")
+    assert s == 200, f"admin stats unreachable after churn: {s}"
+    refreshes = json.loads(body).get("refreshes", 0)
+    assert refreshes > base, \
+        f"refresh path never engaged (refreshes {base} -> {refreshes}); " \
+        "test covered no refresh-under-pressure"
+
+
 def test_concurrent_hits_no_deadlock(ng: Nginx) -> None:
     """R1: many parallel HITs on one key do not serialise/deadlock."""
     fetch(ng.port, "/c/conc")                      # prime
@@ -7555,6 +7665,7 @@ def run_all(ng: Nginx, origin: Origin,
     # timing-sensitive test (e.g. stale-if-error's ~0.8s bg-refresh window) can
     # starve that window under the slow ASan build. Here it can't perturb others.
     test_perf7_zero_copy_serve_under_eviction(ng)
+    test_shm_refresh_under_pressure(ng)
     test_admin_all_zero_does_not_purge(ng)
     test_admin_purge_all(ng)   # last: it empties the zone
 
@@ -7664,7 +7775,8 @@ def main() -> int:
           "admin purge w/ body, "
           "concurrency (R1), prometheus metrics (incl L2 hit/miss), "
           "default-key normalization, "
-          "LRU eviction (R6), stale serve (R3), single-flight (R4), "
+          "LRU eviction (R6), refresh-under-pressure (R6b), "
+          "stale serve (R3), single-flight (R4), "
           "cold-miss single-flight (v10: per-box collapse + lock-off stampede), "
           "min_uses (v15: cache after N misses + off-by-default), "
           "stale-if-error (v8), background_update off (v8 inline regen), "
