@@ -4753,20 +4753,35 @@ def test_rfc1_request_max_stale(ng: Nginx, origin: Origin) -> None:
 def test_p4_multi_directive_single_resolve(ng: Nginx, origin: Origin) -> None:
     """P4: the request Cache-Control header is resolved ONCE per request and read
     by every RFC-1 predicate (revalidate / only-if-cached / no-store / freshness
-    bounds), instead of each predicate re-scanning the header list. A single
-    request carrying MULTIPLE directives must have all of them honoured off that
-    one resolve. Here `no-store, max-stale=30` on a stale entry must BOTH serve
-    the stale copy (max-stale) AND suppress storing the response (no-store): the
-    entry is not re-stored, so after it fully expires the next plain GET MISSes.
-    A resolve that dropped either directive would fail one half."""
+    bounds), instead of each predicate re-scanning the header list. Prove the one
+    resolve feeds MULTIPLE predicates by exercising two different ones:
+
+    (a) no-store predicate: a cold request with `Cache-Control: no-store, max-age=99`
+        must reach origin AND not store the response, so the next plain GET is a
+        MISS (origin hit again). This drives req_no_store off the same resolve
+        that also parsed the max-age bound.
+    (b) max-stale predicate: `Cache-Control: no-store, max-stale=30` on a stale
+        entry serves the stale copy (max-stale honoured off the same resolve)."""
+    # (a) no-store on a fresh cold key: not stored -> second GET re-hits origin.
+    before = origin.hits
+    s0, _, h0 = fetch_raw(ng.port, "/condst/p4-nostore",
+                          headers={"Cache-Control": "no-store, max-age=99"})
+    assert s0 == 200 and origin.hits == before + 1, \
+        f"no-store request must reach origin: {s0} hits={origin.hits}"
+    s1, _, h1 = fetch_raw(ng.port, "/condst/p4-nostore")           # plain GET
+    assert s1 == 200 and h1.get("x-cache") != "HIT" \
+        and origin.hits == before + 2, \
+        f"no-store must have suppressed storage -> second GET MISSes: {h1}"
+
+    # (b) max-stale half of a combined directive on a stale entry.
     fetch_raw(ng.port, "/condst/p4-multi")                         # prime, fresh 1s
     time.sleep(1.5)                                                # now stale
     before = origin.hits
-    s0, b0, h0 = fetch_raw(ng.port, "/condst/p4-multi",
+    s2, b2, h2 = fetch_raw(ng.port, "/condst/p4-multi",
                            headers={"Cache-Control": "no-store, max-stale=30"})
-    assert s0 == 200 and b0 and h0.get("x-cache") == "STALE", (
+    assert s2 == 200 and b2 and h2.get("x-cache") == "STALE", (
         f"max-stale half of the combined directive must permit the stale "
-        f"serve: {s0} {h0}")
+        f"serve: {s2} {h2}")
     assert origin.hits == before, "combined-directive stale serve must not hit origin"
 
 

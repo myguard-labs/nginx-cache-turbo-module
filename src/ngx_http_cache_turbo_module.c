@@ -1203,14 +1203,52 @@ static void
 ngx_http_cache_turbo_resolve_req_cc(ngx_http_request_t *r,
     ngx_http_cache_turbo_ctx_t *ctx)
 {
+    ngx_list_part_t  *part;
+    ngx_table_elt_t  *h;
+    ngx_uint_t        i;
+
     if (ctx->req_cc_resolved) {
         return;
     }
-    ctx->req_cc = ngx_http_cache_turbo_header_find(&r->headers_in.headers,
-                      "Cache-Control", sizeof("Cache-Control") - 1);
-    ctx->req_pragma = ngx_http_cache_turbo_header_find(&r->headers_in.headers,
-                          "Pragma", sizeof("Pragma") - 1);
+    ngx_str_null(&ctx->req_cc);
+    ngx_str_null(&ctx->req_pragma);
     ctx->req_cc_resolved = 1;
+
+    /* One traversal of the request header list, capturing the first Cache-Control
+     * and first Pragma (first-occurrence-wins, matching the old per-predicate
+     * header_find). Stop early once both are found. */
+    part = &r->headers_in.headers.part;
+    h = part->elts;
+
+    for (i = 0; /* void */ ; i++) {
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            h = part->elts;
+            i = 0;
+        }
+        if (h[i].hash == 0) {
+            continue;
+        }
+        if (ctx->req_cc.data == NULL
+            && h[i].key.len == sizeof("Cache-Control") - 1
+            && ngx_strncasecmp(h[i].key.data, (u_char *) "Cache-Control",
+                               sizeof("Cache-Control") - 1) == 0)
+        {
+            ctx->req_cc = h[i].value;
+        } else if (ctx->req_pragma.data == NULL
+            && h[i].key.len == sizeof("Pragma") - 1
+            && ngx_strncasecmp(h[i].key.data, (u_char *) "Pragma",
+                               sizeof("Pragma") - 1) == 0)
+        {
+            ctx->req_pragma = h[i].value;
+        }
+        if (ctx->req_cc.data != NULL && ctx->req_pragma.data != NULL) {
+            break;
+        }
+    }
 }
 
 
