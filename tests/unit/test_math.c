@@ -103,12 +103,22 @@ test_should_refresh(void)
 
     /* inside window, dice below threshold -> OK; dice above -> DECLINED.
      * elapsed=50/100, beta=1000 -> threshold = 0.5<<20. Force the dice each
-     * way via the RNG stub (the now-mix is deterministic under a fixed clock).*/
+     * way via the RNG stub: dice = (rand ^ now*k) & mask, so rand=now*k folds
+     * the mix to 0 (below threshold -> OK), and rand=(now*k ^ mask) drives the
+     * dice to all-ones (>= threshold -> DECLINED). Deterministic under the
+     * fixed clock, and both dice branches are now exercised. */
     ngx_shim_now = 2050;
-    ngx_shim_rand = 0;   /* dice = (0 ^ now*k) & mask -> compute both ways */
-    ngx_int_t lo = ngx_http_cache_turbo_should_refresh(key, 2000, 100, 1000);
-    CHECK(lo == NGX_OK || lo == NGX_DECLINED,
-          "should_refresh dice returns a valid verdict");
+    uint64_t mix = (uint64_t) ngx_shim_now * 2654435761ULL;
+    ngx_shim_rand = (long) mix;                 /* mixed dice becomes 0 */
+    CHECK_EQ(ngx_http_cache_turbo_should_refresh(key, 2000, 100, 1000),
+             NGX_OK, "should_refresh dice below threshold -> OK");
+    ngx_shim_rand = (long) (mix ^ ((1ULL << 20) - 1));
+    CHECK_EQ(ngx_http_cache_turbo_should_refresh(key, 2000, 100, 1000),
+             NGX_DECLINED, "should_refresh dice above threshold -> DECLINED");
+    /* beta_milli < 10 hits the 0.01 floor (swr.c:85); dice still 0 -> OK */
+    ngx_shim_rand = (long) mix;
+    CHECK_EQ(ngx_http_cache_turbo_should_refresh(key, 2000, 100, 0),
+             NGX_OK, "should_refresh floors beta to 0.01 -> OK");
 
     /* window <= 0 is coerced to 1, so any elapsed>=1 is past-window -> OK
      * (swr.c:72). now-fresh_until = 1 >= window(1). */

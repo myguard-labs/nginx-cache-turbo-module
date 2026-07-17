@@ -5176,7 +5176,7 @@ def test_request_cc_serve_verdict_fresh(ng: Nginx, origin: Origin) -> None:
     # at most 30s left -> fresh_ok=0 -> refused -> refetch.
     fetch(ng.port, "/reqcc/g")
     fetch(ng.port, "/reqcc/g")   # ensure a fresh stored entry
-    _, bg, hg = fetch(ng.port, "/reqcc/g",
+    _, _, hg = fetch(ng.port, "/reqcc/g",
                       headers={"Cache-Control": "min-fresh=999"})
     assert hg.get("x-ct-status") != "HIT", \
         f"min-fresh=999 must refuse the 30s entry, got {hg.get('x-ct-status')}"

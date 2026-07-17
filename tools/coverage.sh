@@ -63,11 +63,17 @@ python3 "$MODULE_DIR/tools/test_runtime.py" \
 
 # 2b. pure-math unit tests. They cover the SWR/autotune boundary branches the
 # HTTP suite structurally cannot reach (TTL overflow clamp, forever-TTL, band
-# fallback, beta/load clamps, data-sufficiency floor). Separate compilation
-# (its own instrumented objects under tests/unit), so it is a coverage GATE
-# here, not merged into the suite's gcovr run below; run.sh COVERAGE=1 leaves
-# .gcda beside ../../src for anyone who wants the swr/autotune combined number.
-COVERAGE=1 bash "$MODULE_DIR/tests/unit/run.sh"
+# fallback, beta/load clamps, data-sufficiency floor, refresh-dice both ways).
+# The driver #includes swr.c + autotune.c verbatim, compiles as a single TU
+# under tests/unit, and (COVERAGE=1) emits its own instrumented objects there —
+# so its arcs are NOT in the addon/src datafiles the main report scans below.
+# We therefore publish a SEPARATE unit report for those two sources (2c) so the
+# swr/autotune gains show up in the uploaded artifact, not just in the gate.
+UNIT_DIR="$MODULE_DIR/tests/unit"
+# Fresh unit counters: drop any .gcda from a previous run so the unit report
+# reflects THIS run only.
+find "$UNIT_DIR" -name '*.gcda' -delete 2>/dev/null || true
+COVERAGE=1 bash "$UNIT_DIR/run.sh"
 
 # 3. report. Filter to the module's own sources; branch coverage included.
 #
@@ -102,4 +108,27 @@ if [ -n "${COVERAGE_FAIL_UNDER:-}" ]; then
 fi
 
 gcovr "${GCOVR_ARGS[@]}"
-echo "coverage: report written to $OUT (index.html, coverage.xml, coverage.txt)"
+echo "coverage: suite report written to $OUT (index.html, coverage.xml, coverage.txt)"
+
+# 2c. unit-test report for the swr/autotune math. The unit driver's .gcda live
+# under tests/unit (single-TU #include build), covering the boundary branches
+# the HTTP suite cannot reach. Publish it as a separate report under $OUT/unit
+# so the artifact carries the full swr/autotune numbers, not only the gate pass.
+# Filter to just those two sources; the datafile also holds test_math.c arcs we
+# do not report on. gcov-ignore-errors=all for the same header-resolution reason
+# as the suite report above.
+UNIT_OUT="$OUT/unit"
+mkdir -p "$UNIT_OUT"
+gcovr \
+    --root "$MODULE_DIR" \
+    --filter "$MODULE_DIR/src/ngx_http_cache_turbo_swr.c" \
+    --filter "$MODULE_DIR/src/ngx_http_cache_turbo_autotune.c" \
+    --gcov-object-directory "$UNIT_DIR" \
+    --gcov-ignore-errors=all \
+    --branches \
+    --decisions \
+    --print-summary \
+    --html-details "$UNIT_OUT/index.html" \
+    --xml "$UNIT_OUT/coverage.xml" \
+    --txt "$UNIT_OUT/coverage.txt"
+echo "coverage: unit (swr/autotune) report written to $UNIT_OUT"
