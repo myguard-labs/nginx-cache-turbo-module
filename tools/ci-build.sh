@@ -108,6 +108,15 @@ case "$MODE" in
         ;;
 esac
 
+# TEST_HARNESS=1 compiles the CI-only cache_turbo_probe introspection endpoint
+# (t/harness, zero-hook mode) into the module. Never set for a packaged build:
+# the probe scans /proc and exposes internal state unauthenticated. Appended
+# AFTER the mode case so the asan leg (which replaces CC_OPT wholesale) keeps
+# the define too.
+if [ "${TEST_HARNESS:-0}" = "1" ]; then
+    CC_OPT="$CC_OPT -DNGX_TEST_HARNESS"
+fi
+
 cd "$ROOT/$DIR"
 ./configure \
     --with-compat \

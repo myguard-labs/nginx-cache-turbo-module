@@ -703,6 +703,14 @@ typedef struct {
 #endif
 
 
+#ifdef NGX_TEST_HARNESS
+    /* CI-only: zone the cache_turbo_probe endpoint reports on. The probe
+     * itself lives in t/harness (nginx-test-harness) and is used in ZERO-HOOK
+     * mode: no zone_render / fault_set hooks, only the harness's generic
+     * document (flavor, pid, connections, fds, cycle-pool, slab pages). */
+    ngx_shm_zone_t          *probe_zone;
+#endif
+
     /* Backend vtables (v4-1). l1 = the local store (shm); it is a stateless
      * dispatch table (the zone is passed as an argument), so it is set
      * unconditionally and is never NULL. backend = the remote L2 driver (redis),

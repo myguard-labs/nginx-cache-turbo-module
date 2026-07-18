@@ -19,6 +19,10 @@
 
 #include "ngx_http_cache_turbo_module.h"
 
+#ifdef NGX_TEST_HARNESS
+#include "ngx_test_probe.h"
+#endif
+
 #if (NGX_SSL)
 #include <ngx_event_openssl.h>
 #endif
@@ -132,6 +136,12 @@ static void ngx_http_cache_turbo_classify_vary(ngx_http_request_t *r,
     ngx_int_t *bits_out, ngx_uint_t *nocache_out);
 static ngx_uint_t ngx_http_cache_turbo_response_encoded(ngx_http_request_t *r);
 static ngx_int_t ngx_http_cache_turbo_init(ngx_conf_t *cf);
+
+#ifdef NGX_TEST_HARNESS
+static char *ngx_http_cache_turbo_probe(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
+static ngx_int_t ngx_http_cache_turbo_probe_handler(ngx_http_request_t *r);
+#endif
 
 
 static ngx_http_output_header_filter_pt  ngx_http_next_header_filter;
@@ -378,6 +388,17 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       ngx_conf_set_flag_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_cache_turbo_loc_conf_t, test_force_file_buf),
+      NULL },
+#endif
+
+#ifdef NGX_TEST_HARNESS
+    /* CI-only introspection endpoint (t/harness). Packaged builds never
+     * define NGX_TEST_HARNESS, so a config using it fails to load there. */
+    { ngx_string("cache_turbo_probe"),
+      NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_http_cache_turbo_probe,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
       NULL },
 #endif
 
@@ -9219,6 +9240,130 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 
     return NGX_CONF_OK;
 }
+
+
+#ifdef NGX_TEST_HARNESS
+
+/* ---- cache_turbo_probe: CI-only introspection endpoint ----------------- */
+
+/*
+ * cache_turbo_probe <zone>;
+ *
+ * Installs a content handler in this location that renders worker + shm state
+ * as JSON. The renderer lives in t/harness (nginx-test-harness); this module
+ * supplies only the HTTP surface. Cache-turbo uses the harness in ZERO-HOOK
+ * mode: no zone_render hook, no fault_set hook, no ngx_test_probe_register()
+ * call anywhere — the generic document (flavor, pid, connections, fds,
+ * cycle-pool stats, zone name/size/slab pages) is what the prober rules
+ * assert on. Compiled out entirely unless NGX_TEST_HARNESS is defined.
+ *
+ * The zone is resolved with a size of 0 — nginx's documented "attach to an
+ * already-declared zone" form. Declaring the zone remains cache_turbo_zone's
+ * job: a probe must observe state, never create it.
+ */
+static char *
+ngx_http_cache_turbo_probe(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_cache_turbo_loc_conf_t  *clcf = conf;
+
+    ngx_str_t                 *value;
+    ngx_http_core_loc_conf_t  *core_lcf;
+
+    value = cf->args->elts;
+
+    if (clcf->probe_zone != NULL) {
+        return "is duplicate";
+    }
+
+    clcf->probe_zone = ngx_shared_memory_add(cf, &value[1], 0,
+                                             &ngx_http_cache_turbo_module);
+    if (clcf->probe_zone == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    core_lcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
+    core_lcf->handler = ngx_http_cache_turbo_probe_handler;
+
+    return NGX_CONF_OK;
+}
+
+
+static ngx_int_t
+ngx_http_cache_turbo_probe_handler(ngx_http_request_t *r)
+{
+    size_t                            size;
+    u_char                           *buf, *last;
+    ngx_int_t                         rc;
+    ngx_buf_t                        *b;
+    ngx_chain_t                       out;
+    ngx_http_cache_turbo_loc_conf_t  *clcf;
+
+    if (!(r->method & (NGX_HTTP_GET|NGX_HTTP_HEAD))) {
+        return NGX_HTTP_NOT_ALLOWED;
+    }
+
+    rc = ngx_http_discard_request_body(r);
+    if (rc != NGX_OK) {
+        return rc;
+    }
+
+    clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
+
+    /* Applied before rendering so the response reports the state the caller
+     * just asked for. With no fault_set hook registered (zero-hook mode) any
+     * fault_* query argument is refused with NGX_DECLINED, which is the
+     * correct answer, not an error. */
+    (void) ngx_test_probe_arm(clcf->probe_zone, &r->args);
+
+    /*
+     * NGX_TEST_PROBE_JSON_MAX bounds the harness's GENERIC document; a
+     * consumer adds its own hook's bound on top. Zero-hook mode appends
+     * nothing, so the harness constant plus the zone name is the whole
+     * budget. Undersizing does not overflow (rendering is ngx_slprintf-based
+     * and truncates at `last`), but a truncated document fails to parse in
+     * the prober — "broken probe" on every case, not a wrong answer on one.
+     */
+    size = NGX_TEST_PROBE_JSON_MAX;
+    if (clcf->probe_zone != NULL) {
+        size += clcf->probe_zone->shm.name.len;
+    }
+
+    buf = ngx_pnalloc(r->pool, size);
+    if (buf == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    last = ngx_test_probe_json(buf, buf + size, clcf->probe_zone);
+
+    r->headers_out.status = NGX_HTTP_OK;
+    r->headers_out.content_length_n = last - buf;
+    ngx_str_set(&r->headers_out.content_type, "application/json");
+    r->headers_out.content_type_len = r->headers_out.content_type.len;
+    r->headers_out.content_type_lowcase = NULL;
+
+    rc = ngx_http_send_header(r);
+    if (rc == NGX_ERROR || rc > NGX_OK || r->header_only) {
+        return rc;
+    }
+
+    b = ngx_calloc_buf(r->pool);
+    if (b == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    b->pos = buf;
+    b->last = last;
+    b->memory = 1;
+    b->last_buf = (r == r->main) ? 1 : 0;
+    b->last_in_chain = 1;
+
+    out.buf = b;
+    out.next = NULL;
+
+    return ngx_http_output_filter(r, &out);
+}
+
+#endif /* NGX_TEST_HARNESS */
 
 
 static ngx_int_t

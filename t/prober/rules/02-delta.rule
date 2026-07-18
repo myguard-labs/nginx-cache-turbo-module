@@ -1,0 +1,72 @@
+# Delta assertions -- the leak detection neither ASan nor valgrind can give:
+#
+#   - a leaked fd is not a memory error, so no sanitizer sees it;
+#   - a request-pool allocation frees wholesale at request end, so the CYCLE
+#     pool is measured instead -- nothing in normal request handling may
+#     allocate there, and any nonzero delta is unbounded worker-lifetime
+#     growth;
+#   - slab pages live in shared memory that outlives every request, so a 502
+#     the module must not store has to leave the accounting exactly where it
+#     was.
+#
+# Every path here is the harness's generic document (zero-hook mode). The pid
+# oracle -- worker pid stable across consecutive probes -- runs implicitly on
+# every case. fds=-1 sentinel: guarded by the direct `probe fds >= 0` in
+# 01-probe.rule, and the prober itself refuses to difference the sentinel.
+
+name    a request the module ignores leaks no fd and no cycle-pool memory
+from    127.0.0.20
+send    GET /uncached HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=502
+delta   fds == 0
+delta   pool.cycle_used == 0
+delta   pool.cycle_large == 0
+delta   connections.free == 0
+delta   zone.slab_pages_free == 0
+
+# The module's own miss path: key derivation, zone lookup under the slab
+# mutex, the upstream 502, the do-not-store decision. All of it must be
+# allocation-neutral outside the request pool.
+name    a cache miss leaks no fd, no cycle-pool memory and no slab page
+from    127.0.0.21
+send    GET /cached HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=502
+delta   fds == 0
+delta   pool.cycle_used == 0
+delta   pool.cycle_large == 0
+delta   connections.free == 0
+delta   zone.slab_pages_free == 0
+
+# Same peer, same URI, second time: whatever lookup-side state the first miss
+# touched must be reused, not re-allocated.
+name    a repeated miss is slab-neutral too
+from    127.0.0.21
+send    GET /cached HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=502
+delta   fds == 0
+delta   pool.cycle_used == 0
+delta   zone.slab_pages_free == 0
+
+# Malformed input is the classic place for an early return to skip a cleanup
+# path: assert the same accounting on a request the parser rejects outright.
+name    a request rejected by the parser leaks nothing
+from    127.0.0.22
+send    GET /cached?x=\x00broken HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=400
+delta   fds == 0
+delta   pool.cycle_used == 0
+delta   zone.slab_pages_free == 0
+
+# The probe endpoint itself must be self-neutral, or every other delta in
+# this file is polluted by its own measuring instrument.
+name    probing is free -- the probe request itself leaks nothing
+send    GET /__probe HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+delta   fds == 0
+delta   pool.cycle_used == 0
+delta   zone.slab_pages_free == 0

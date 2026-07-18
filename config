@@ -1,5 +1,13 @@
 ngx_addon_name=ngx_http_cache_turbo_module
 
+# The test probe comes from t/harness (nginx-test-harness) and only becomes
+# real code when NGX_TEST_HARNESS is defined -- tools/ci-build.sh sets that
+# under TEST_HARNESS=1 and never for a packaged build. Its sources are listed
+# unconditionally because each compiles to an empty translation unit without
+# the define; keeping the list unconditional avoids a second build-mode switch
+# here that could drift out of sync with the one in ci-build.sh. This does
+# mean EVERY build (and every CI checkout) needs the t/harness submodule
+# populated, or ./configure fails on the missing files.
 CACHE_TURBO_SRCS="                                                       \
                   $ngx_addon_dir/src/ngx_http_cache_turbo_module.c      \
                   $ngx_addon_dir/src/ngx_http_cache_turbo_shm.c         \
@@ -7,11 +15,16 @@ CACHE_TURBO_SRCS="                                                       \
                   $ngx_addon_dir/src/ngx_http_cache_turbo_autotune.c    \
                   $ngx_addon_dir/src/ngx_http_cache_turbo_redis.c       \
                   $ngx_addon_dir/src/ngx_http_cache_turbo_memcached.c   \
+                  $ngx_addon_dir/t/harness/src/ngx_test_probe.c         \
+                  $ngx_addon_dir/t/harness/src/ngx_test_probe_arm.c     \
                   "
 
 CACHE_TURBO_DEPS="                                                      \
                   $ngx_addon_dir/src/ngx_http_cache_turbo_module.h      \
+                  $ngx_addon_dir/t/harness/src/ngx_test_probe.h         \
                   "
+
+CACHE_TURBO_INCS="$ngx_addon_dir/t/harness/src"
 
 # This module captures the upstream response body, so it depends on the
 # postpone filter being activated (same requirement as srcache).
@@ -32,6 +45,7 @@ if [ -n "$ngx_module_link" ]; then
     ngx_module_name=$ngx_addon_name
     ngx_module_srcs="$CACHE_TURBO_SRCS"
     ngx_module_deps="$CACHE_TURBO_DEPS"
+    ngx_module_incs="$CACHE_TURBO_INCS"
     # NO ngx_module_order: a lone --add-dynamic-module filter is appended last
     # at ./configure and registers at the TOP of the output chain, so our body
     # filter captures the IDENTITY response body BEFORE gzip/zstd/brotli compress
@@ -47,4 +61,5 @@ else
     HTTP_AUX_FILTER_MODULES="$HTTP_AUX_FILTER_MODULES $ngx_addon_name"
     NGX_ADDON_SRCS="$NGX_ADDON_SRCS $CACHE_TURBO_SRCS"
     NGX_ADDON_DEPS="$NGX_ADDON_DEPS $CACHE_TURBO_DEPS"
+    CORE_INCS="$CORE_INCS $CACHE_TURBO_INCS"
 fi

@@ -51,6 +51,7 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
+          submodules: true
 
       - name: Install clang + libFuzzer
         run: |
@@ -140,6 +141,7 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
+          submodules: true
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -176,6 +178,7 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
+          submodules: true
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -212,6 +215,7 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
+          submodules: true
       - name: Install dependencies
         run: |
           sudo apt-get update

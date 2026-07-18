@@ -3,6 +3,7 @@ name: Build and Test
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   NGINX_VERSION: "1.31.1"
+  ANGIE_VERSION: "1.12.0"
 
 on:
   push:
@@ -28,6 +29,7 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
+          submodules: true
 
       - name: Install validation tools
         run: |
@@ -91,6 +93,7 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
+          submodules: true
 
       - name: Install build dependencies
         run: |
@@ -167,6 +170,7 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
+          submodules: true
 
       - name: Install build dependencies
         run: |
@@ -211,6 +215,7 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
+          submodules: true
 
       - name: Download nginx artifact
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
@@ -264,6 +269,7 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
+          submodules: true
 
       - name: Install build and runtime dependencies
         run: |
@@ -300,6 +306,7 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
+          submodules: true
 
       - name: Install build dependencies
         run: |
@@ -350,3 +357,68 @@ jobs:
             --redis-server /usr/bin/redis-server \
             --memcached-server /usr/bin/memcached \
             --nginx-binary "$GITHUB_WORKSPACE/.build/nginx-${NGINX_VERSION}/objs/nginx"
+
+  prober:
+    name: Prober rules (${{ matrix.flavor }}, ${{ matrix.mode }})
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-24.04' || fromJSON('["self-hosted","builder02","lxc"]') }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: nginx
+            version_key: NGINX_VERSION
+            mode: debug
+          - flavor: angie
+            version_key: ANGIE_VERSION
+            mode: debug
+          # One leg runs the whole rule set against an ASan/UBSan build.
+          # t/harness/prober/run.sh disables leak detection only (nginx never
+          # frees its config pool); everything else ASan reports still fails
+          # the job.
+          - flavor: nginx
+            version_key: NGINX_VERSION
+            mode: asan
+    steps:
+      # submodules: the prober engine lives in t/harness (nginx-test-harness).
+      # Without it t/prober/run.sh bails, so this is not optional for this job.
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+          submodules: true
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential curl libpcre2-dev libssl-dev zlib1g-dev
+
+      # The expansion goes through a step env var rather than straight into the
+      # run block: an inline ${{ }} is substituted into the script text before
+      # the shell ever sees it, which is the template-injection shape zizmor
+      # fails the Validation job on.
+      - name: Resolve version
+        env:
+          RESOLVED_VERSION: ${{ env[matrix.version_key] }}
+        run: echo "VER=$RESOLVED_VERSION" >> "$GITHUB_ENV"
+
+      # angie's whole point: Test::Nginx-style banner sniffing bails on angie,
+      # but the prober reads no banner, so angie gets the same functional
+      # coverage nginx does -- with the SAME rule files.
+      - name: Build server with the test harness
+        run: TEST_HARNESS=1 bash tools/ci-build.sh "${{ matrix.flavor }}" "$VER" "${{ matrix.mode }}"
+
+      # SAN=1 puts the prober itself under ASan/UBSan on the sanitized leg: it
+      # parses rule files and raw socket bytes, so it gets the same treatment
+      # as the module it is testing.
+      - name: Build the prober
+        run: SAN=$([ "${{ matrix.mode }}" = asan ] && echo 1 || echo 0) bash t/harness/prober/build.sh
+
+      - name: Sweep stale test listeners
+        run: |
+          command -v fuser >/dev/null || sudo apt-get install -y psmisc
+          fuser -k -TERM 18119/tcp 2>/dev/null || true
+          sleep 1
+
+      - name: Run prober rules
+        run: bash t/prober/run.sh "${{ matrix.flavor }}" "$VER"
