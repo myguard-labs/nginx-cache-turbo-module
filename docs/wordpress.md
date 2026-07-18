@@ -47,7 +47,7 @@ i.e. one customer's basket served to the next visitor. See
 | Check | Values |
 |---|---|
 | URI prefixes | `/wp-admin/`, `/wp-login.php`, `/wp-cron.php`, `/xmlrpc.php`, `/wp-json/` |
-| Query args (presence) | `preview` |
+| Query args (presence) | `preview`, `rest_route` |
 | Cookie header substrings | `wordpress_logged_in_`, `wp-postpass_`, `comment_author_` |
 
 These literals are matched as **substrings of the whole `Cookie` header** —
@@ -228,6 +228,12 @@ a shared cache.
 
 ## Gotchas
 
+- **`?rest_route=` is bypassed too, and it is not a corner case.** `/wp-json/`
+  is a *rewrite* to `index.php?rest_route=/...` — `wp-includes/rest-api.php`
+  registers the rule, and `rest_api_loaded()` dispatches only when that query
+  var is set. With plain permalinks the request never carries a `/wp-json/`
+  path at all, so guarding only the path left `GET /?rest_route=/wp/v2/users/me`
+  cacheable. Same API, two addressings, both now covered.
 - **`/wp-json/` is bypassed wholesale.** That includes *public, cacheable* REST
   endpoints. If you serve a public API from `/wp-json/` and want it cached, give
   it its own `location` with `cache_turbo_backend` unset (and think hard about

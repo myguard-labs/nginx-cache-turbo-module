@@ -34,7 +34,7 @@ surfaces that are dynamic *before* any cookie exists. As defence-in-depth,
 
 | Check | Values |
 |---|---|
-| URI prefixes | `/user`, `/admin`, `/node/add`, `/system/`, `/core/install.php` |
+| URI prefixes | `/user`, `/admin`, `/node/add`, `/system/`, `/core/install.php`, `/jsonapi`, `/oauth` |
 | Query args | — |
 | Cookie header substrings | `SESS` |
 
@@ -260,6 +260,30 @@ That last check is your defence-in-depth safety net. The `SESS` cookie rule is t
 primary defence; Drupal sending `private` is the belt behind it. If a contrib
 module or an aggressive "performance" setting has stripped `private`, the cookie
 rule still holds — but add the `map` bypass too and don't lean on the origin.
+
+## The header-authenticated surface (`/jsonapi`, `/oauth`)
+
+An API client sends `Authorization: Bearer <token>` and **no `SESS` cookie**,
+so the cookie rule cannot see it. Two prefixes cover the shippable cases:
+
+- **`/jsonapi`** — core's JSON:API module. The prefix is the container
+  parameter `jsonapi.base_path: /jsonapi`
+  (`core/modules/jsonapi/jsonapi.services.yml`). It exposes every entity type
+  on the site, filtered by the requesting account's permissions.
+- **`/oauth`** — `simple_oauth` (contrib, but the de-facto OAuth2/OIDC
+  provider). Routes: `/oauth/token`, `/oauth/authorize`, `/oauth/userinfo`,
+  `/oauth/debug`, `/oauth/jwks`.
+
+**`/oauth/userinfo` is what makes this a leak rather than a nicety** — a GET,
+authenticated purely by the bearer token, returning the token holder's
+profile. Cache it and the next caller is handed someone else's identity.
+The token endpoint itself is a POST and RFC 6749 §5.1 mandates `no-store`, so
+it was never the interesting one.
+
+**Core REST is not coverable by a prefix.** `?_format=json` rides on ordinary
+node URLs. The cookie tier catches a session-authenticated client; a
+*bearer*-authenticated core-REST client is not catchable here. If you serve
+one, give it its own `location` with `cache_turbo` off.
 
 ## Gotchas
 

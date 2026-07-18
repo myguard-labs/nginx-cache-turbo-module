@@ -61,7 +61,7 @@ What makes it safe is that Magento does the hard part itself:
 
 | Check | Values |
 |---|---|
-| URI prefixes | `/checkout`, `/customer`, `/graphql`, `/sales`, `/newsletter`, `/wishlist`, `/paypal`, `/review`, `/page_cache/block/esi`, `/health_check.php` |
+| URI prefixes | `/checkout`, `/customer`, `/graphql`, `/rest`, `/soap`, `/sales`, `/newsletter`, `/wishlist`, `/paypal`, `/review`, `/page_cache/block/esi`, `/health_check.php` |
 | Query args | — |
 | Key cookies (value folded into cache key) | `X-Magento-Vary` |
 
@@ -305,6 +305,20 @@ different `X-Magento-Vary` values must never share a cache entry.
 Note the module never stores `HEAD` responses, so a `curl -sI` HEAD request can
 **never** show a `HIT` here — the recipes above are deliberately GET
 (`-s -o /dev/null -D-`), not `-sI`.
+
+## The Web API surface (`/rest`, `/soap`, `/graphql`)
+
+These three are **header-authenticated**: a client sends
+`Authorization: Bearer <token>` and no cookie at all, so every cookie rule in
+the preset is structurally blind to them. `GET /rest/V1/customers/me` returns
+that customer's name, e-mail and address book.
+
+The front names come from `app/code/Magento/Webapi/etc/di.xml` (`webapi_rest`
+→ `rest`, `webapi_soap` → `soap`). `/graphql` was covered from the start;
+`/rest` and `/soap` were its missing twins.
+
+The prefix needs a `/` or `.` boundary after it, so a catalog URL like
+`/restaurant-supplies` is **not** matched and still caches normally.
 
 ## Gotchas
 

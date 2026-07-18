@@ -1661,8 +1661,32 @@ typedef struct {
  * `$cookie_wordpress_logged_in_` form seen in a lot of third-party configs is a
  * permanent no-op: nginx's $cookie_NAME is an EXACT lookup.
  *
- * `preview` is the only arg rule. ?preview=true renders an UNPUBLISHED revision
- * for an author who holds a valid nonce, so it must never be stored.
+ * `preview` renders an UNPUBLISHED revision for an author who holds a valid
+ * nonce, so it must never be stored.
+ *
+ * `rest_route` IS THE REST API, and listing /wp-json/ without it covered only
+ * half the surface. The two are not a path and a fallback — the path is sugar
+ * over the argument. wp-includes/rest-api.php registers
+ *
+ *     add_rewrite_rule( '^' . rest_get_url_prefix() . '/(.*)?',
+ *                       'index.php?rest_route=/$matches[1]', 'top' );
+ *
+ * so /wp-json/wp/v2/users/me is REWRITTEN to index.php?rest_route=/wp/v2/users/me,
+ * and rest_api_loaded() dispatches only when that query var is set:
+ *
+ *     if ( empty( $GLOBALS['wp']->query_vars['rest_route'] ) ) { return; }
+ *
+ * With plain permalinks — or from any client that calls get_rest_url() while
+ * they are off, which emits the add_query_arg( 'rest_route', ... ) form — the
+ * request never has a /wp-json/ path at all. The URI rule saw nothing and
+ * `GET /?rest_route=/wp/v2/users/me` was cacheable. This is the same surface
+ * addressed two ways with only one way guarded: a parser differential, not a
+ * missing corner case.
+ *
+ * Matched as a bare NAME, so the whole REST API bypasses, public endpoints
+ * included. That is deliberate and matches how /wp-json/ is already treated
+ * (docs/wordpress.md calls the wholesale bypass out as a known hit-rate cost).
+ * An operator who wants a public endpoint cached gives it its own location.
  *
  * `s` — SITE SEARCH — IS DELIBERATELY ABSENT, and it used to be here. Every
  * logged-out visitor searching "foo" gets the same page: search results are
@@ -1699,7 +1723,7 @@ static const char *const  ct_wp_cookies[] = {
 static const char *const  ct_wp_uris[] = {
     "/wp-admin/", "/wp-login.php", "/wp-cron.php", "/xmlrpc.php",
     "/wp-json/", NULL };
-static const char *const  ct_wp_args[] = { "preview", NULL };
+static const char *const  ct_wp_args[] = { "preview", "rest_route", NULL };
 
 static const char *const  ct_woo_cookies[] = {
     "woocommerce_items_in_cart", "woocommerce_cart_hash",
@@ -2006,8 +2030,35 @@ static const ngx_http_cache_turbo_cookie_pred_t  ct_phpbb_preds[] = {
  * defence-in-depth behind the cookie rule, which is the correct ordering.
  */
 static const char *const  ct_drupal_cookies[] = { "SESS", NULL };
+/*
+ * /jsonapi and /oauth are the HEADER-AUTHENTICATED surfaces. The cookie tier
+ * cannot see them at all: an API client sends `Authorization: Bearer ...` and
+ * no SESS cookie, so every cookie rule above is structurally blind to it.
+ *
+ *   /jsonapi  core's JSON:API module. The prefix is a container parameter,
+ *             `jsonapi.base_path: /jsonapi` (core/modules/jsonapi/
+ *             jsonapi.services.yml). It exposes every entity type the site has,
+ *             filtered by the requesting account's permissions.
+ *   /oauth    simple_oauth, which is contrib rather than core but is the
+ *             de-facto OAuth2/OIDC provider for Drupal. Its routes are
+ *             /oauth/token, /oauth/authorize, /oauth/userinfo, /oauth/debug,
+ *             /oauth/jwks (simple_oauth.routing.yml).
+ *
+ * /oauth/userinfo is the one that makes this a leak rather than a nicety: it is
+ * a GET, authenticated purely by the bearer token, and it returns the token
+ * holder's profile. Store that response and the next caller is handed someone
+ * else's identity. /oauth/debug has the same shape for token metadata. The
+ * token endpoint itself is a POST and RFC 6749 §5.1 requires `no-store` on it,
+ * so it was never the interesting one.
+ *
+ * Core REST (?_format=json on an arbitrary entity path) is NOT coverable by a
+ * prefix — it rides on ordinary node URLs. The cookie tier catches the
+ * session-authenticated case; a bearer-authenticated core-REST client is not
+ * catchable here and is called out in docs/drupal.md.
+ */
 static const char *const  ct_drupal_uris[] = {
-    "/user", "/admin", "/node/add", "/system/", "/core/install.php", NULL };
+    "/user", "/admin", "/node/add", "/system/", "/core/install.php",
+    "/jsonapi", "/oauth", NULL };
 static const char *const  ct_drupal_args[] = { NULL };
 
 /*
@@ -2198,9 +2249,28 @@ static const char *const  ct_mw_args[] = {
  * like /cartridge-refill.
  */
 static const char *const  ct_magento_cookies[] = { NULL };
+/*
+ * /rest and /soap are the Web API front names, and they are the HEADER-
+ * AUTHENTICATED surface the cookie tier is structurally blind to. Magento
+ * declares all three in app/code/Magento/Webapi/etc/di.xml:
+ *
+ *     <item name="webapi_rest" ...><item name="frontName">rest</item>
+ *     <item name="webapi_soap" ...><item name="frontName">soap</item>
+ *
+ * `GET /rest/V1/customers/me` with `Authorization: Bearer <customer token>`
+ * returns that customer's name, e-mail and address book. No cookie is involved,
+ * so no cookie rule can see it; the request carries its identity in a header.
+ * /graphql was already listed and is the same class — /rest and /soap were the
+ * missing twins, not a new idea.
+ *
+ * The Authorization storage floor does refuse to store these, but that floor is
+ * the same defence-in-depth argument the comment above makes for the rest of
+ * this list, and the URI rule is what stops the LOOKUP as well as the store.
+ */
 static const char *const  ct_magento_uris[] = {
-    "/checkout", "/customer", "/graphql", "/sales", "/newsletter", "/wishlist",
-    "/paypal", "/review", "/page_cache/block/esi", "/health_check.php", NULL };
+    "/checkout", "/customer", "/graphql", "/rest", "/soap", "/sales",
+    "/newsletter", "/wishlist", "/paypal", "/review",
+    "/page_cache/block/esi", "/health_check.php", NULL };
 static const char *const  ct_magento_args[] = { NULL };
 /* Value-keyed, never bypassed. Exact name — see ngx_http_cache_turbo_cookie_value. */
 static const char *const  ct_magento_key_cookies[] = { "X-Magento-Vary", NULL };
@@ -2524,6 +2594,21 @@ static const char *const  ct_smf_args[] = {
  *
  * Renaming `Garden.Cookie.Name` therefore defeats this rule; docs/vanilla.md
  * tells the operator to add their own cache_turbo_bypass in that case.
+ */
+/*
+ * NO /api ROW, DELIBERATELY, and this is an unresolved gap rather than a
+ * decision. Vanilla's API v2 is Bearer-authenticated, so it is exactly the
+ * header-auth surface the cookie tier cannot see — the same class as magento
+ * /rest, drupal /jsonapi and xenforo /api/, all of which ARE listed.
+ *
+ * It is not listed here because it cannot be verified: github.com/vanilla/vanilla
+ * now 404s (repo, raw and API alike; the org survives), so there is no upstream
+ * tree left to check the prefix against, and every surviving reference is a
+ * Garden-era fork last pushed in 2013. Adding a row from recollection is exactly
+ * what produced the dead /admin.php and /message_send.php rows in punbb, so it
+ * is not being done. An operator running Vanilla's API adds their own:
+ *     cache_turbo_bypass_uri /api;
+ * See docs/vanilla.md.
  */
 static const char *const  ct_vanilla_cookies[] = { "Vanilla=", NULL };
 static const char *const  ct_vanilla_uris[] = {

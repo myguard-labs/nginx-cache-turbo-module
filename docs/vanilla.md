@@ -82,6 +82,27 @@ no guest response is captured under a shared key. You do not need
 anonymous traffic is the tell — and if it costs you too much, narrow the rule
 with a hand-verified `cache_turbo_bypass` on a cookie your guests do not get.
 
+## Known gap: the API (`/api`) has no rule
+
+Vanilla's API v2 is **Bearer-authenticated**, which makes it the same
+header-auth class as `magento /rest`, `drupal /jsonapi` and `xenforo /api/` —
+all of which *do* ship a URI rule. An API client sends no `Vanilla=` cookie, so
+the cookie rule above is structurally blind to it.
+
+**No `/api` row is shipped, deliberately.** `github.com/vanilla/vanilla` now
+404s (repo, raw and API alike; the org survives), so there is no upstream tree
+left to verify the prefix against, and every surviving reference is a
+Garden-era fork last pushed in 2013. Adding a row from recollection is what
+produced the dead `/admin.php` and `/message_send.php` rows in the PunBB
+preset, so it is not being repeated here.
+
+If you serve the API, add it yourself:
+
+```nginx
+cache_turbo_bypass_uri /api;
+cache_turbo_no_store;
+```
+
 ## Vhost
 
 ```nginx

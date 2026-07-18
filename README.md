@@ -514,15 +514,15 @@ plausibly appear as an arbitrary value.
 
 | Preset | URI prefixes | Query args | Cookie header substrings |
 |---|---|---|---|
-| `wordpress`   | `/wp-admin/`, `/wp-login.php`, `/wp-cron.php`, `/xmlrpc.php`, `/wp-json/` | `preview` | `wordpress_logged_in_`, `wp-postpass_`, `comment_author_` |
+| `wordpress`   | `/wp-admin/`, `/wp-login.php`, `/wp-cron.php`, `/xmlrpc.php`, `/wp-json/` | `preview`, `rest_route` | `wordpress_logged_in_`, `wp-postpass_`, `comment_author_` |
 | `woocommerce` | `/cart`, `/checkout`, `/my-account` | `wc-ajax` | `woocommerce_items_in_cart`, `woocommerce_cart_hash`, `wp_woocommerce_session_` |
 | `joomla`      | `/administrator/` | — | `joomla_remember_me_` ‡ |
 | `xenforo` † ¤ ✦ | `/admin.php`, `/install/`, `/api/`, `/login`, `/logout`, `/lost-password`, `/register`, `/account`, `/conversations`, `/direct-messages`, `/misc` | `_xfToken` | `xf_session`, `xf_user`, `xf_session_admin`, `xf_lscxf_logged_in`; *(key)* `xf_style_id`, `xf_style_variation`, `xf_language_id` |
 | `discourse` † | `/admin`, `/session`, `/auth/`, `/login`, `/logout`, `/signup`, `/my/`, `/message-bus/`, `/drafts`, `/presence/`, `/notifications`, `/user_actions` | `api_key`, `api_username` | `_t=` |
 | `phpbb` †     | `/ucp.php`, `/mcp.php`, `/adm/`, `/posting.php`, `/memberlist.php`, `/search.php`, `/report.php` | `sid` | *(value)* `…_u != 1` ∆ |
-| `drupal` †    | `/user`, `/admin`, `/node/add`, `/system/`, `/core/install.php` | — | `SESS` ¥ |
+| `drupal` †    | `/user`, `/admin`, `/node/add`, `/system/`, `/core/install.php`, `/jsonapi`, `/oauth` | — | `SESS` ¥ |
 | `mediawiki` † | — ¶ | `veaction`, `returnto`, mutating `action=` values ‡ | `Token=`, `_session=`, `UserID=` |
-| `magento` † ✦ | `/checkout`, `/customer`, `/graphql`, `/sales`, `/newsletter`, `/wishlist`, `/paypal`, `/review`, `/page_cache/block/esi`, `/health_check.php` | — | *(key)* `X-Magento-Vary` ✦ |
+| `magento` † ✦ | `/checkout`, `/customer`, `/graphql`, `/rest`, `/soap`, `/sales`, `/newsletter`, `/wishlist`, `/paypal`, `/review`, `/page_cache/block/esi`, `/health_check.php` | — | *(key)* `X-Magento-Vary` ✦ |
 | `shopware6` † ✦ | `/account`, `/checkout`, `/admin`, `/api`, `/store-api` | — | *(key)* `sw-cache-hash` ✦ |
 | `ghost` †     | `/ghost/`, `/members/`, `/p/`, `/r/` | `uuid`, `key`, `token`, `gift` | `ghost-members-ssr`, `ghost-admin-api-session` |
 | `wagtail` † § | `/admin/`, `/django-admin/`, `/documents/` | — | `sessionid` |
@@ -530,7 +530,7 @@ plausibly appear as an arbitrary value.
 | `typo3` † ※   | `/typo3` | — | `fe_typo_user`, `be_typo_user` |
 | `invision` †  | `/admin`, `/login`, `/register`, `/lostpassword`, `/messenger` | `do=compose`, `do=post`, `do=reply`, `do=report`, `module=messaging` | `_loggedIn` (suffix); *(key)* `ips4_hasJS`, `ips4_theme`, `ips4_language` |
 | `smf` †       | — | `action=admin`, `action=login`, `action=login2`, `action=logintfa`, `action=logout`, `action=profile`, `action=pm`, `action=post`, `action=post2`, `action=moderate`, `action=reporttm`, `action=xmlhttp` | `SMFCookie` (presence-only) |
-| `vanilla` †   | `/dashboard`, `/entry/`, `/messages/`, `/post/` | — | `Vanilla=` (presence-only) |
+| `vanilla` †   | `/dashboard`, `/entry/`, `/messages/`, `/post/` ⁂ | — | `Vanilla=` (presence-only) |
 | `punbb` †     | `/admin.php`, `/admin/`, `/login.php`, `/post.php`, `/message_send.php`, `/message_delete.php`, `/misc.php` | — | `forum_cookie`, `punbb_cookie` (presence-only) |
 | `phorum` †    | `admin.php`, `login.php`, `register.php`, `pm.php`, `posting.php`, `post.php`, `moderation.php`, `control.php`, `ajax.php`, `report.php`, `follow.php` | — | `phorum_session_v5`, `phorum_session_st`, `phorum_admin_session_v5`; *(key)* `list_style` |
 | `yabb` †      | — | `action=post`, `action=post2`, `action=login`, `action=login2`, `action=register`, `action=register2`, `action=admin`, `action=pm`, `action=imsend`, `action=imsend2` | `Y2User-`, `Y2Pass-`, `Y2Sess-` (prefix) |
@@ -543,6 +543,13 @@ unrelated site may legitimately serve as perfectly cacheable pages. Enabling one
 you do not run punches holes in your own cache — which is why none of them is
 ever enabled implicitly, and why the old `generic` union is gone. Name them:
 `cache_turbo_backend xenforo;`.
+
+⁂ **Vanilla ships no `/api` row**, and that is a known gap rather than a
+decision: Vanilla's API v2 is Bearer-authenticated, so it is the same
+header-auth class as `magento /rest` and `drupal /jsonapi`. It is absent
+because `github.com/vanilla/vanilla` now 404s and the prefix cannot be
+verified against any surviving upstream tree. Add `cache_turbo_bypass_uri
+/api;` if you serve it.
 
 ‡ `edit`, `submit`, `delete`, `protect`, `unprotect`, `purge`, `rollback`,
 `revert`, `watch`, `unwatch`, `markpatrolled`, `mcrundo`, `mcrrestore` — the
