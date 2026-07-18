@@ -3077,6 +3077,181 @@ ngx_http_cache_turbo_uri_prefix(ngx_str_t *uri, const char *pfx, size_t l)
 }
 
 
+/* One hex nibble -> 0..15, or -1 on a non-hex char. Lives inside the
+ * FUZZ-EXTRACT region because the query-string decoder below needs it; the
+ * hex-decode helpers further down share it. */
+static ngx_int_t
+ngx_http_cache_turbo_hexval(u_char c)
+{
+    if (c >= '0' && c <= '9') { return c - '0'; }
+    if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
+    if (c >= 'A' && c <= 'F') { return c - 'A' + 10; }
+    return -1;
+}
+
+
+/*
+ * Compare one raw query-string span against a plain needle, percent-DECODING
+ * the span as it goes.
+ *
+ * The backend routes on the decoded query string: PHP's $_GET turns "%61ction"
+ * into "action" and "log%69n" into "login", and every forum family in the
+ * preset table routes that way. Comparing the raw bytes therefore misses a
+ * request the backend treats as identical to one the classifier does catch, so
+ * an over-encoded (or deliberately encoded) login/logout/PM URL is classified
+ * cacheable and gets stored. Decoding as we compare needs no buffer and no
+ * length cap, so a megabyte-long value costs one walk and nothing else.
+ *
+ * Malformed escapes ("%", "%A", "%GG") compare as a literal '%' followed by
+ * whatever follows it, which is how PHP's parser leaves them.
+ *
+ * `name` selects PHP's key mangling, and only argument NAMES get it. PHP builds
+ * $_GET keys through php_register_variable_ex(), which rewrites '.' and ' ' to
+ * '_' — a habit inherited from register_globals, where a key had to be a legal
+ * variable name. So "%2ExfToken", "xf+Token" and "ips4.hasJS" all arrive at the
+ * application as "_xfToken" / "xf_Token" / "ips4_hasJS", and a matcher that
+ * only percent-decodes misses every one of them. Underscores are common in the
+ * needles (_xfToken, api_key, ips4_theme, woocommerce_cart_hash), so this is
+ * the same fail-open as the encoding case, one alphabet further out.
+ *
+ * A LITERAL '+' is a space here (form encoding), so it mangles to '_' too; a
+ * percent-escaped one ("%2B") decodes to a real '+' and PHP leaves it alone, so
+ * the two are tracked apart. PHP additionally strips leading spaces from a key,
+ * which this does not — a leading space folds to '_' instead. That direction
+ * over-matches (an unnecessary bypass, hit rate only) where the alternative
+ * would under-match, which is a cached private page.
+ *
+ * VALUES are never mangled by PHP and are not mangled here. A '+' in a value
+ * stays a '+': every needle value is a fixed route token with no space in it,
+ * so no treatment of '+' can create or destroy a match.
+ */
+static ngx_int_t
+ngx_http_cache_turbo_qs_eq(u_char *p, u_char *end, const char *needle,
+    size_t nlen, ngx_uint_t name)
+{
+    size_t     i;
+    u_char     c;
+    ngx_int_t  hi, lo, decoded;
+
+    for (i = 0; p < end; i++) {
+
+        c = *p++;
+        decoded = 0;
+
+        if (c == '%' && (size_t) (end - p) >= 2
+            && (hi = ngx_http_cache_turbo_hexval(p[0])) >= 0
+            && (lo = ngx_http_cache_turbo_hexval(p[1])) >= 0)
+        {
+            c = (u_char) ((hi << 4) | lo);
+            p += 2;
+            decoded = 1;
+        }
+
+        if (name) {
+            if (c == '+' && !decoded) {
+                c = '_';                /* literal '+' is a space, and mangles */
+
+            } else if (c == '.' || c == ' ') {
+                c = '_';
+            }
+        }
+
+        if (i >= nlen || c != (u_char) needle[i]) {
+            return 0;
+        }
+    }
+
+    return i == nlen;
+}
+
+
+/*
+ * Scan the query string for an argument, and keep scanning past a non-match.
+ *
+ * Replaces ngx_http_arg() for preset classification. ngx_http_arg has two
+ * properties that are wrong here:
+ *
+ *   1. It returns the FIRST occurrence of the name and stops. A query string
+ *      may legally repeat a name ("?action=profile&action=logout"), and the
+ *      backend decides which one wins — PHP's $_GET keeps the LAST. Stopping on
+ *      the first meant an attacker prefixed a harmless value and the real
+ *      dynamic route behind it was never seen, so the private page was cached.
+ *      Every occurrence is checked here; any match is a match.
+ *   2. It does not percent-decode, and it splits only on '&'. SMF and YaBB
+ *      build nearly every multi-argument URL with ';' as the separator
+ *      ("?action=profile;u=42"), a form PHP's arg_separator.input has accepted
+ *      for its whole life — so with '&'-only splitting, only the first argument
+ *      of such a URL was ever visible and the rest of those presets' arg rows
+ *      matched nothing at all.
+ *
+ * `value == NULL` means the rule is a bare NAME and presence alone is the
+ * signal (an empty "sid=" counts as present, matching ngx_http_arg). Otherwise
+ * the decoded value must equal `value` exactly.
+ *
+ * Splitting on ';' can also split a value that carries an unescaped ';'
+ * ("?next=/a;b"), which can only ever manufacture an EXTRA apparent argument.
+ * That direction fails safe: the worst case is an unnecessary bypass (hit-rate
+ * loss), never a cached private page.
+ */
+static ngx_int_t
+ngx_http_cache_turbo_arg_match(ngx_http_request_t *r, const char *name,
+    size_t nlen, const char *value, size_t vlen)
+{
+    u_char  *p, *end, *pair, *pend, *eq;
+
+    if (r->args.data == NULL || r->args.len == 0) {
+        return 0;
+    }
+
+    p = r->args.data;
+    end = p + r->args.len;
+
+    while (p < end) {
+
+        pair = p;
+        while (p < end && *p != '&' && *p != ';') {
+            p++;
+        }
+        pend = p;
+
+        if (p < end) {
+            p++;                        /* step over the separator */
+        }
+
+        if (pend == pair) {
+            continue;                   /* "&&", leading '&', trailing '&' */
+        }
+
+        eq = ngx_strlchr(pair, pend, '=');
+
+        if (eq == NULL) {
+            /* Valueless argument ("?...&sid&..."). Only a bare-NAME rule can
+             * match it; a NAME=VALUE rule has nothing to compare against. */
+            if (value == NULL
+                && ngx_http_cache_turbo_qs_eq(pair, pend, name, nlen, 1))
+            {
+                return 1;
+            }
+            continue;
+        }
+
+        if (!ngx_http_cache_turbo_qs_eq(pair, eq, name, nlen, 1)) {
+            continue;
+        }
+
+        if (value == NULL) {
+            return 1;
+        }
+
+        if (ngx_http_cache_turbo_qs_eq(eq + 1, pend, value, vlen, 0)) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+
 /*
  * Auto-classify gate. Returns 1 when the request matches a dynamic surface of
  * any active preset (login/session cookie, backend URI prefix, dynamic query
@@ -3091,7 +3266,6 @@ ngx_http_cache_turbo_auto_skip(ngx_http_request_t *r,
     const ngx_http_cache_turbo_preset_t  *ps;
     const char *const                    *pp;
     const char                           *eq;
-    ngx_str_t                             val;
     size_t                                l, nlen, vlen;
 
     for (ps = ngx_http_cache_turbo_presets; ps->bit; ps++) {
@@ -3113,8 +3287,8 @@ ngx_http_cache_turbo_auto_skip(ngx_http_request_t *r,
                 if (eq == NULL) {
                     /* Bare NAME: presence of the argument is the signal,
                      * whatever its value ("_xfToken", "sid"). */
-                    if (ngx_http_arg(r, (u_char *) *pp, ngx_strlen(*pp), &val)
-                        == NGX_OK)
+                    if (ngx_http_cache_turbo_arg_match(r, *pp,
+                                                       ngx_strlen(*pp), NULL, 0))
                     {
                         return 1;
                     }
@@ -3131,9 +3305,8 @@ ngx_http_cache_turbo_auto_skip(ngx_http_request_t *r,
                 nlen = (size_t) (eq - *pp);
                 vlen = ngx_strlen(eq + 1);
 
-                if (ngx_http_arg(r, (u_char *) *pp, nlen, &val) == NGX_OK
-                    && val.len == vlen
-                    && ngx_strncmp(val.data, eq + 1, vlen) == 0)
+                if (ngx_http_cache_turbo_arg_match(r, *pp, nlen,
+                                                   eq + 1, vlen))
                 {
                     return 1;
                 }
@@ -6801,17 +6974,6 @@ ngx_http_cache_turbo_send_json(ngx_http_request_t *r, ngx_uint_t status,
 {
     return ngx_http_cache_turbo_send_body(r, status, body,
                "application/json", sizeof("application/json") - 1);
-}
-
-
-/* One hex nibble -> 0..15, or -1 on a non-hex char. */
-static ngx_int_t
-ngx_http_cache_turbo_hexval(u_char c)
-{
-    if (c >= '0' && c <= '9') { return c - '0'; }
-    if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
-    if (c >= 'A' && c <= 'F') { return c - 'A' + 10; }
-    return -1;
 }
 
 

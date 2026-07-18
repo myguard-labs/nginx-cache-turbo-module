@@ -3529,6 +3529,82 @@ def test_preset_arg_value_predicate(ng: Nginx, origin: Origin) -> None:
              "entire board")
 
 
+def test_preset_arg_scanner(ng: Nginx, origin: Origin) -> None:
+    """The preset arg scanner must percent-decode, split on ';', and look past
+    the first occurrence of a name.
+
+    All three of these were fail-OPEN with core nginx's ngx_http_arg():
+
+      * ngx_http_arg splits only on '&'. SMF and YaBB build nearly every
+        multi-argument URL with ';' ("?u=42;action=login"), so everything after
+        the first argument was invisible and those presets' arg rows matched
+        nothing on a real board URL.
+      * ngx_http_arg does not percent-decode. PHP routes "%61ction=log%69n"
+        exactly like "action=login", so an encoded login URL was cached.
+      * ngx_http_arg returns the FIRST occurrence and stops. PHP's $_GET keeps
+        the LAST, so a harmless value prefixed onto the real one
+        ("?action=display&action=login") hid the dynamic route.
+
+    Each case is fetched TWICE for the same reason as the value-predicate test:
+    a bypass and a first-time MISS are indistinguishable on one request, so a
+    single fetch would pass with the scanner removed."""
+    bypass_cases = (
+        ("u=42;action=login", "';' is a query separator for SMF/YaBB"),
+        ("%61ction=login", "the argument NAME may be percent-encoded"),
+        ("action=log%69n", "the argument VALUE may be percent-encoded"),
+        ("action=display&action=login", "a later occurrence still counts"),
+        ("board=1;u=42;action=pm", "the match may be the LAST of several"),
+    )
+    for i, (q, why) in enumerate(bypass_cases):
+        uri = f"/smf/index.php?{q}&n={i}"
+        fetch(ng.port, uri)
+        _, _, h = fetch(ng.port, uri)
+        assert "x-cache" not in h, \
+            (f"?{q} must bypass on the smf preset ({why}), got "
+             f"{h.get('x-cache')}")
+
+    # The negative half. Decoding and ';'-splitting must not turn an ordinary
+    # read route into a bypass, or the scanner has simply un-cached the board.
+    for q in ("u=42;action=display", "action=%64isplay", "actionx=login"):
+        uri = f"/smf/index.php?{q}"
+        fetch(ng.port, uri)
+        _, _, h = fetch(ng.port, uri)
+        assert h.get("x-cache") == "HIT", \
+            (f"?{q} is an ordinary read route and must stay cacheable, got "
+             f"{h.get('x-cache')}")
+
+    # PHP's key mangling. php_register_variable_ex() rewrites '.' and ' ' to
+    # '_' when it builds a $_GET key, so "?.xfToken=" reaches XenForo as
+    # "_xfToken" -- the exact argument name the preset bypasses on, and a
+    # percent-decoding-only matcher misses every alias. A literal '+' is a
+    # space in form encoding and mangles the same way. The fold is applied to
+    # every preset, not only the PHP ones: on Discourse (Rack, which does not
+    # mangle) it can only ever cost an unnecessary bypass, which is the safe
+    # direction, so the discourse arms below pin the uniform behaviour.
+    for uri in ("/xf/thread-mangle?%2ExfToken=1650000000,abcdef",
+                "/xf/thread-mangle2?+xfToken=1650000000,abcdef",
+                "/dc/topic-mangle?api%2Ekey=deadbeef",
+                "/dc/topic-mangle2?api%20username=admin"):
+        fetch(ng.port, uri)
+        _, _, h = fetch(ng.port, uri)
+        assert "x-cache" not in h, \
+            (f"{uri} must bypass -- PHP folds '.', ' ' and a literal '+' in an "
+             f"argument NAME to '_', got {h.get('x-cache')}")
+
+    # ...but the mangling is a NAME rule only, and PHP leaves values alone.
+    # An unrelated name that merely contains the fold characters must not
+    # suddenly match, or every preset with an underscore in an arg row starts
+    # bypassing traffic it has no business seeing.
+    for uri in ("/xf/thread-nomangle?x.xfToken=1", "/dc/topic-nomangle?api.keyx=1"):
+        fetch(ng.port, uri)
+        _, _, h = fetch(ng.port, uri)
+        assert h.get("x-cache") == "HIT", \
+            (f"{uri} matches no preset argument and must stay cacheable, got "
+             f"{h.get('x-cache')}")
+
+    drain_origin(origin)
+
+
 def test_phorum_uri_rules_anchor_at_root(ng: Nginx, origin: Origin) -> None:
     """phorum URI rules must carry a leading slash.
 
@@ -8251,6 +8327,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_vanilla_guest_cookies_stay_cacheable(ng, origin)
     test_phorum_admin_session_cookie(ng, origin)
     test_preset_arg_value_predicate(ng, origin)
+    test_preset_arg_scanner(ng, origin)
     test_cookie_pred_multiple_matching_cookies(ng, origin)
     test_vbulletin_preset(ng, origin)
     test_invision_preset(ng, origin)
@@ -8574,6 +8651,9 @@ def main() -> int:
           "invalid-name rejected), "
           "cookie predicate multi-match (guest cookie must not mask a member "
           "in the same header, both orders, two-guests still cacheable), "
+          "preset arg scanner (';' separator, percent-decoded name and value, "
+          "later occurrence, PHP '.'/' '/'+' key mangling, read routes still "
+          "cached), "
           "vbulletin preset (NONEMPTY/EQ arms, empty value logged-out, "
           "bb_language keyed, bb_lastvisit NOT keyed), "
           "invision preset (_loggedIn suffix bypass, ips4_theme keyed, "

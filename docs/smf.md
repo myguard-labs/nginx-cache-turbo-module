@@ -190,6 +190,14 @@ SMF-specific knobs that interact with this preset:
   cache. `SMFCookie` presence covers logged-in members, but a logged-out visitor
   hitting `?action=login` (or `logout`, `post`, `pm`) must not be cached either —
   if you widen guest caching, exclude the mutating actions explicitly.
+- **SMF separates query arguments with `;`, not `&`.** A real board URL looks
+  like `index.php?topic=12.0;action=post`, and PHP's `arg_separator.input`
+  accepts it. The preset's argument scanner splits on both `;` and `&`, checks
+  every occurrence of a name (not only the first), and percent-decodes before
+  comparing, so `?%61ction=log%69n` and `?u=42;action=login` classify exactly
+  like the plain form. If you write your own `cache_turbo_bypass` rules against
+  `$arg_action`, note that nginx's own `$arg_` variables do NOT do any of
+  this — they split on `&` only and never decode.
 - **opcache.** Keep `opcache.enable=1` with a generous
   `opcache.memory_consumption` (128M+) and a high `opcache.max_accelerated_files`
   (SMF ships ~120 `Sources/*.php` plus themes/mods). cache-turbo removes the FPM

@@ -14,10 +14,13 @@
  * generated_auto_classify.inc at build time, so we fuzz the SHIPPED gate with
  * no copy drift. ngx_shim_auto.h supplies the tiny nginx surface.
  *
- * Input layout: bytes up to the first 0x00 are the URI; bytes after it are one
- * Cookie value (no NUL byte => empty cookie). Both buffers are sized EXACTLY,
- * with no trailing NUL, so ASAN flags any read at or past the end. All presets
- * are enabled (GENERIC) to exercise every cookie/URI rule each call.
+ * Input layout: bytes up to the first 0x00 are the URI; bytes between the first
+ * and second 0x00 are one Cookie value; bytes after the second 0x00 are the
+ * query string (a missing separator => that field is empty). The query string
+ * is last so every pre-existing one-NUL corpus entry keeps its exact old
+ * meaning. All three buffers are sized EXACTLY, with no trailing NUL, so ASAN
+ * flags any read at or past the end. All presets are enabled to exercise every
+ * cookie/URI/arg rule each call.
  *
  * Build (see fuzz/build.sh):
  *   clang -g -O1 -fsanitize=fuzzer,address,undefined \
@@ -40,19 +43,34 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     ngx_http_request_t               r;
     ngx_http_cache_turbo_loc_conf_t  clcf;
     ngx_table_elt_t                  cookie;
-    const uint8_t                   *sep;
-    size_t                           uri_len, ck_len;
+    const uint8_t                   *sep, *ck_src, *sep2, *arg_src;
+    size_t                           uri_len, ck_len, arg_len;
     u_char                          *uri_buf = NULL;
     u_char                          *ck_buf = NULL;
+    u_char                          *arg_buf = NULL;
 
-    /* Split input into URI (before the first NUL) and one cookie value (after). */
+    /* URI = before the first NUL, cookie = up to the second, args = the rest. */
     sep = (const uint8_t *) memchr(data, 0x00, size);
     if (sep != NULL) {
         uri_len = (size_t) (sep - data);
+        ck_src = sep + 1;
         ck_len = size - uri_len - 1;       /* drop the separator byte */
+
+        sep2 = (const uint8_t *) memchr(ck_src, 0x00, ck_len);
+        if (sep2 != NULL) {
+            arg_src = sep2 + 1;
+            arg_len = ck_len - (size_t) (sep2 - ck_src) - 1;
+            ck_len = (size_t) (sep2 - ck_src);
+        } else {
+            arg_src = NULL;
+            arg_len = 0;
+        }
     } else {
         uri_len = size;
+        ck_src = NULL;
         ck_len = 0;
+        arg_src = NULL;
+        arg_len = 0;
     }
 
     /* Exact-sized, non-NUL-terminated buffers: an over-read trips ASAN. */
@@ -69,7 +87,16 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
             free(uri_buf);
             return 0;
         }
-        memcpy(ck_buf, sep + 1, ck_len);
+        memcpy(ck_buf, ck_src, ck_len);
+    }
+    if (arg_len) {
+        arg_buf = (u_char *) malloc(arg_len);
+        if (arg_buf == NULL) {
+            free(uri_buf);
+            free(ck_buf);
+            return 0;
+        }
+        memcpy(arg_buf, arg_src, arg_len);
     }
 
     memset(&r, 0, sizeof(r));
@@ -77,8 +104,11 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 
     r.uri.data = uri_buf;
     r.uri.len = uri_len;
-    r.args.len = 0;                        /* skip the ngx_http_arg branch */
-    r.args.data = NULL;
+    /* The arg branch no longer calls core nginx's ngx_http_arg — the module
+     * carries its own percent-decoding, ';'-splitting, all-occurrences scanner,
+     * so those bytes are now OUR parser's problem and must be fuzzed. */
+    r.args.data = arg_buf;
+    r.args.len = arg_len;
 
     cookie.value.data = ck_buf;
     cookie.value.len = ck_len;
@@ -121,5 +151,6 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 
     free(uri_buf);
     free(ck_buf);
+    free(arg_buf);
     return 0;
 }
