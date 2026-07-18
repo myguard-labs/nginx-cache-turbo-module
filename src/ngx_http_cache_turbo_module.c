@@ -2539,19 +2539,43 @@ static const char *const  ct_yabb_args[] = {
     "action=pm", "action=imsend", "action=imsend2", NULL };
 
 /*
- * MyBB. The login cookie `{prefix}user` (COOKIE_PREFIX default "mybb_", so
- * the wire name is "mybbuser") is written ONLY inside the login success path
- * (inc/datahandlers/login.php via member.php do_login) — a guest structurally
- * cannot receive it, so presence alone is sufficient with no value predicate.
- * The prefix is an ACP setting, so the rule matches the SUFFIX "user", the
- * same prefix-agnostic technique phpBB's "_u" uses.
+ * MyBB. The login cookie is `mybbuser` — the whole of that is MyBB's own
+ * hardcoded base name (my_setcookie("mybbuser", ...)); the ACP `cookieprefix`
+ * setting is PREPENDED to it and defaults to EMPTY. An earlier version of this
+ * comment had it backwards ("COOKIE_PREFIX default mybb_"), which matters
+ * because it makes the prefix look like a fixed, known string when it is
+ * operator-chosen and undiscoverable from the request.
  *
- * `{prefix}sid` (session id) is issued to EVERY visitor including guests and
- * bots — deliberately NOT in this list; it is the same xf_session/SMFCookie
- * trap. The various `{prefix}[lastvisit]`, `[threadread]`, `[forumread]`,
- * `[readallforums]`, `[announcements]` array-cookies are guest read-tracking,
- * not auth — also excluded. `{prefix}theme` / `{prefix}lang` are presentation
- * cookies, folded into the key instead of bypassed.
+ * It is written ONLY inside the login success path (inc/datahandlers/login.php
+ * via member.php do_login) — a guest structurally cannot receive it, so
+ * presence alone is sufficient with no value predicate. Because the prefix is
+ * operator-set, the rule matches the SUFFIX "user", the same prefix-agnostic
+ * technique phpBB's "_u" uses; a predicate can afford that because its failure
+ * direction is a needless bypass (`coppauser`, a real MyBB cookie, also ends in
+ * "user" and costs a registrant's hit rate — nothing worse).
+ *
+ * `sid` (session id) is issued to EVERY visitor including guests and bots —
+ * deliberately NOT in this list; it is the same xf_session/SMFCookie trap. The
+ * various `mybb[lastvisit]`, `[threadread]`, `[forumread]`, `[readallforums]`,
+ * `[announcements]` array-cookies are guest read-tracking, not auth — also
+ * excluded. `mybbtheme` / `mybblang` are presentation cookies, folded into the
+ * key instead of bypassed.
+ *
+ * THE KEY COOKIES DO NOT GET THE SUFFIX TREATMENT, deliberately. On a board
+ * that sets a `cookieprefix` the wire names become `<prefix>mybbtheme` /
+ * `<prefix>mybblang`, the exact match below folds nothing, and every guest
+ * shares one bucket — whichever theme rendered first is served to all of them.
+ * That is a hit-QUALITY bug, and it is the better of the two failures: keying
+ * on a suffix would let any client fold a cookie of its own choosing
+ * (`evilmybbtheme=dark`) into the key, landing on the same bucket a real
+ * `mybbtheme=dark` reader uses while the origin — which ignores the unknown
+ * name — returns the DEFAULT theme to be stored there. See the threat model on
+ * ngx_http_cache_turbo_cookie_value(): a predicate's loose match costs a
+ * bypass, a key's loose match hands out bucket selection.
+ *
+ * The remedy is operator-side and already exists: a prefixed board declares
+ * `cache_turbo_key_cookie <prefix>mybbtheme <prefix>mybblang;`, which folds
+ * with the identical framing. docs/mybb.md carries this.
  */
 static const ngx_http_cache_turbo_cookie_pred_t  ct_mybb_preds[] = {
     { "user", NGX_HTTP_CACHE_TURBO_CVOP_NONEMPTY, NULL },
