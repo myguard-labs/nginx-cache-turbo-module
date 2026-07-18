@@ -1,5 +1,7 @@
 # WordPress + cache-turbo
 
+_Last researched: 2026-07-18_
+
 Full-page caching a WordPress site: what the preset skips, what to key on, and a
 copy-paste vhost with the Redis L2 tier.
 
@@ -198,6 +200,141 @@ a shared cache.
   back without a `cache_turbo_min_uses` guard.
 - **WooCommerce?** Stack the presets: `cache_turbo_backend wordpress woocommerce;`
   — see [`woocommerce.md`](woocommerce.md).
+
+## Forum / community plugins: bbPress, wpForo, Asgaros, BuddyPress, BuddyBoss
+
+These are all pure WordPress plugins — forum posts/topics/replies, activity
+feeds, private messages, all live as WP custom post types / DB tables, and
+none of them define their **own** session/auth cookie. Identity is decided
+entirely by WP core's `wordpress_logged_in_*` cookie, which the `wordpress`
+preset above already bypasses on. **There is no `bbpress` / `wpforo` /
+`asgaros` / `buddypress` / `buddyboss` preset, and there will not be one** —
+adding a redundant preset bit would either duplicate the existing bypass for
+no gain, or (if built around one of these plugins' own cosmetic cookies by
+mistake) silently bypass guests too for zero added safety, which is exactly
+the false-sense-of-safety trap this module's docs keep warning about.
+
+Each plugin's own cookies were checked and are cosmetic/UI-state, guest-issued,
+never an identity signal — fold them into the cache key if you care about
+their variants, never into a bypass rule:
+
+| Plugin | Its own cookies (all guest-issued, cosmetic) |
+|---|---|
+| bbPress | none of its own — rides `wordpress_logged_in_*` entirely |
+| wpForo | a read-tracking "visited forums/topics" cookie; guest-post name/email cookies (only when guest posting is enabled) |
+| Asgaros Forum | none confirmed beyond WP core |
+| BuddyPress | `bp-activity-oldestpage`, `bp-activity-filter`, `bp-activity-scope`, `bp-messages-last-check` |
+| BuddyBoss | `bp-activity-scope`, `bp-activity-filter`, `bp-activity-oldestpage`, `bp-better-messages-open-threads` |
+
+What these plugins **do** add is front-end URI surface the stock `wordpress`
+preset's admin/login-only URI list doesn't know about — regular front-end
+pages that are per-user dynamic content, not `/wp-admin/`. Bypass these
+explicitly:
+
+```nginx
+cache_turbo         ct;
+cache_turbo_backend wordpress;
+
+# Forum/community plugin surfaces the stock preset doesn't cover:
+cache_turbo_bypass_uri
+    /members/          # BuddyPress/BuddyBoss profiles
+    /groups/           # BuddyPress/BuddyBoss groups — see note below
+    /activity/         # BuddyPress/BuddyBoss activity feed
+    /notifications/    # BuddyPress/BuddyBoss
+    /messages/;         # BuddyPress/BuddyBoss private messages
+
+# All plugin AJAX rides admin-ajax.php, which the wordpress preset's
+# /wp-admin/ prefix already bypasses wholesale — no extra rule needed for
+# bbp-*, wpforo_*, bp-*/activity_*/messages_*/groups_* action names.
+```
+
+**Private BuddyPress/BuddyBoss groups are a special case worth calling out
+explicitly:** membership in a specific private group lives in the WP database
+(`bp_groups_members` table), not in any cookie. There is no cookie signal for
+"is this viewer a member of THIS group" — bypassing by cookie cannot express
+it. If you run private groups, either exclude `/groups/` from caching entirely
+(`cache_turbo off` in a nested `location`) or accept that a private group's
+activity feed must never be cached keyed on cookies alone.
+
+`/forums/` topic and reply **submission** is a normal WP `POST` to the
+topic/forum permalink (not a separate URI) — already excluded by the general
+"POST bypasses" behavior most cache-turbo installs rely on; the corresponding
+`GET` on the same URL is the common, safely-cacheable-for-guests case and
+needs no special handling.
+
+## PHP settings / gotchas
+
+cache-turbo keeps anonymous visitors away from PHP entirely, but every
+*bypass* — logged-in users, the cart, admin-ajax, a cache miss — still lands in
+PHP-FPM. A few WordPress-specific PHP settings decide whether those requests
+stay fast, and one of them can quietly wreck your hit rate.
+
+- **`session_start()` in a plugin is the classic hit-rate killer.** WordPress
+  core deliberately does **not** use PHP sessions — it keeps state in cookies and
+  the database. But some plugins (older forum, quiz, membership and "smart
+  coupon" plugins are repeat offenders) call `session_start()` on every request,
+  which makes PHP emit a `Set-Cookie: PHPSESSID=…` on the response. Per the
+  "plugins that set cookies on the fly" rule above, a response carrying
+  `Set-Cookie` is **never stored**, so a plugin that starts a session on every
+  front-end page turns your hit rate to zero without a single error in the log.
+  Worse, if you ever add `$cookie_PHPSESSID` to `cache_turbo_key` to "make it
+  work", you fragment the cache one entry per visitor — cache-busting, not
+  caching. The fix is upstream, not in nginx: find the `session_start()` call
+  (`grep -rn session_start wp-content/`) and remove it or replace the plugin; a
+  well-behaved WordPress plugin never needs one.
+
+- **`DONOTCACHEPAGE` is invisible to nginx.** The `DONOTCACHEPAGE` constant is
+  the de-facto standard PHP-side plugins use to opt a page out of caching, but
+  it is a runtime PHP constant — cache-turbo, sitting in front of PHP-FPM, never
+  sees it. It only reaches nginx if the plugin translates it into a real
+  response header (e.g. a `Cache-Control: no-cache`/`no-store`). Because the
+  `wordpress` preset defaults `cache_control` to `honor`, such a header will
+  already suppress storage; if you pin `cache_turbo_cache_control respect;` you
+  give that decision back to `cache_turbo_valid` and a `DONOTCACHEPAGE`-driven
+  header only gates storage rather than the TTL. Either way, do not expect the
+  bare constant to do anything at the nginx tier — verify the plugin actually
+  emits a header.
+
+- **opcache sizing scales with plugin count, not site size.** A stock WordPress
+  install is a few hundred PHP files; add WooCommerce, a page builder and a
+  couple of big plugins and you cross the `opcache.max_accelerated_files`
+  default of ~10 000 easily. Once opcache is full it evicts hot files and
+  re-compiles them on demand, so every bypass (the requests that *don't* hit
+  cache-turbo) pays a compile tax. Size it to the actual file count
+  (`find /var/www/wordpress -name '*.php' | wc -l`, round up to the next prime
+  opcache accepts) and give `opcache.memory_consumption` headroom (256 MB is
+  reasonable for a heavy plugin set). On a read-mostly production box,
+  `opcache.validate_timestamps=0` is the biggest single win — but remember to
+  reload PHP-FPM on every deploy, or new code silently won't take effect.
+
+- **WordPress layers its own memory limits on top of PHP's.** `memory_limit` in
+  the PHP-FPM pool is the hard ceiling, but WordPress applies its own softer
+  limits underneath it: `WP_MEMORY_LIMIT` (front end, default 40 MB — 64 MB on
+  multisite) and `WP_MAX_MEMORY_LIMIT` (admin only, default 256 MB). Heavy
+  themes and builders routinely exhaust the 40 MB front-end figure and fatal
+  *before* they reach the PHP ceiling, which looks like a random white screen on
+  a cache miss while the admin (running under the 256 MB limit) is fine. Raise
+  `WP_MEMORY_LIMIT` in `wp-config.php` and make sure the pool's `memory_limit`
+  sits above it — the lower of the two always wins.
+
+- **`max_execution_time` bites on the surfaces cache-turbo bypasses, not the
+  cached ones.** Cached pages are served without touching PHP, so their timeout
+  is irrelevant. The requests that *do* run PHP — `admin-ajax.php`, the REST API,
+  imports/exports, Action Scheduler and `wp-cron.php` — are exactly the
+  long-running ones, and they are all bypassed by the preset. Set a
+  `max_execution_time` (and matching `fastcgi_read_timeout`) that suits those
+  admin workloads; it will never slow a cache hit because a hit never reaches
+  the interpreter.
+
+- **The object-cache drop-in is a PHP-FPM concern, not an nginx one.** The
+  Redis/Memcached drop-in described under "WordPress's own object cache" lives at
+  `wp-content/object-cache.php` and depends on the matching PHP extension
+  (`php-redis` or `php-memcached`) being loaded in the **PHP-FPM** pool that
+  cache-turbo forwards to. If that extension is missing, WordPress silently falls
+  back to a non-persistent, per-request cache — no error, just a slow origin on
+  every cache-turbo miss and every logged-in request. Confirm the extension is
+  loaded (`php-fpm -m | grep -i redis`) rather than trusting that the drop-in
+  file exists.
 
 ## See also
 

@@ -1,5 +1,7 @@
 # Wagtail + cache-turbo
 
+_Last researched: 2026-07-18_
+
 Caching a Wagtail (Django CMS) site. This is the first preset whose auth cookie
 belongs to the **framework**, not the app — Wagtail ships no cookie of its own and
 rides Django's `sessionid`.
@@ -196,6 +198,73 @@ curl -sI https://example.com/ | grep -i set-cookie      # must NOT set sessionid
   ever enabled implicitly. Name it.
 - **`Set-Cookie` responses are never stored** and `Authorization` requests are never
   cached, regardless of preset. Those floors hold.
+
+## Runtime settings / gotchas
+
+Wagtail is Django on Python — it runs under a WSGI/ASGI server, not PHP-FPM — so the
+operational levers are different from the PHP presets. These are Wagtail/Django-specific.
+
+- **`Vary: Cookie` is emitted the moment the session is *touched*.** Django's
+  `SessionMiddleware` adds `Vary: Cookie` to any response whose session was merely
+  *accessed*, not just written — and `@login_required`, reading `request.user`, and
+  Wagtail's own middleware all read the session, so most non-trivial views carry it.
+  `CsrfViewMiddleware` adds the same header whenever the `{% csrf_token %}` tag
+  renders. It is a keying instruction, **not** a `Cache-Control: private`; it does
+  not stop a store. **With `cache_turbo_auto_vary off` (the default) the module
+  ignores the response `Vary` and keys on the request per the preset's `sessionid`
+  rule — which is exactly what you want here:** an anonymous page carries no
+  `sessionid`, so it caches correctly regardless of a stray `Vary: Cookie`. Do
+  **not** reflexively enable `cache_turbo_auto_vary` for a Wagtail origin — auto-Vary
+  treats `Vary: Cookie` as *uncacheable*, so turning it on would make every public
+  page that renders a form (a header search box is enough) stop caching entirely.
+  The cookie rule is the guard; leave Vary blind. (Verified: Django middleware +
+  CSRF docs.)
+- **`csrftoken` on GET pages is fine — keep it lazy, don't force it.** The preset
+  deliberately does not bypass on `csrftoken`, so a guest carrying it still HITs. The
+  risk is upstream: if the origin sets `csrftoken` (and the accompanying
+  `Vary: Cookie`) *unconditionally* on every GET, you forfeit the option to ever
+  enable auto-Vary and widen the cookie surface for no gain. Render the token only
+  where a form actually needs it rather than site-wide, and set
+  `CSRF_COOKIE_HTTPONLY = True` as defence-in-depth (it does not affect caching, but
+  keeps the cookie out of JavaScript). Avoid `CSRF_USE_SESSIONS = True`, which — per
+  the [condition table](#the-condition-and-how-to-check-it) — promotes every
+  form-viewing guest to a `sessionid` and zeroes the hit rate.
+- **`DEBUG = False` in production.** `DEBUG = True` changes response behaviour
+  (verbose error pages, different static handling) and is never what you want behind
+  a full-page cache. Confirm it before trusting any measurement.
+- **Tune the WSGI/ASGI worker pool, not FPM.** Wagtail serves through gunicorn (WSGI)
+  or uvicorn (ASGI), so concurrency is a gunicorn/uvicorn setting — roughly
+  `2 × cores + 1` sync workers as a starting point — and `--preload` lets workers
+  share the loaded application image, which trims memory and avoids each worker
+  cold-starting the ORM on a cache-stampede MISS. There is no `pm.max_children` here.
+- **`wagtail-cache` overlaps this module — pick one full-page cache.** The
+  third-party `wagtail-cache` package (CodeRed) is a *server-side* Django-cache page
+  cache: it refuses to cache logged-in responses or anything carrying
+  `Cache-Control: no-cache`/`private`, and emits its own `Cache-Control`. If you keep
+  it, cache-turbo's `honor` mode (which `cache_turbo_backend wagtail` already implies)
+  respects those headers — but running both is redundant double-caching. For an
+  nginx-fronted deployment, let cache-turbo own the full-page cache and drop
+  `wagtail-cache`; if you must keep it, do not set `cache_turbo_cache_control ignore`,
+  or you would override the very headers it relies on.
+- **Purge cache-turbo on publish with `wagtail.contrib.frontend_cache`.** Wagtail's
+  built-in front-end cache invalidator ships signal handlers that purge a reverse
+  proxy whenever a page is published or deleted. Its `HTTPBackend` sends an HTTP
+  `PURGE` request to the configured `LOCATION` — exactly the shape cache-turbo accepts
+  once you set `cache_turbo_purge on`. Point `LOCATION` at the nginx origin (a direct
+  connection, no intermediate proxy, per Wagtail's docs) and publishing a page drops
+  its entry from L1 (and L2):
+
+  ```python
+  WAGTAILFRONTENDCACHE = {
+      'default': {
+          'BACKEND':  'wagtail.contrib.frontend_cache.backends.HTTPBackend',
+          'LOCATION': 'http://127.0.0.1',
+      },
+  }
+  ```
+
+  The backend purges one URL per page by default; override `get_cached_paths()` on a
+  page model if a page resolves to several URLs.
 
 ## See also
 

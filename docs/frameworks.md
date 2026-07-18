@@ -1,5 +1,7 @@
 # Frameworks (Django, Laravel, Rails, …) + cache-turbo
 
+_Last researched: 2026-07-18_
+
 **There is no `django` preset, no `laravel` preset, and there never will be.** Not
 an oversight — a framework is not a cacheable thing. This page explains why, and
 then hands you the thing a preset would have been: a procedure for deriving the
@@ -42,11 +44,19 @@ And the one rule a framework preset *could* plausibly ship — "bypass on the se
 cookie" — is broken on both of the big two, for two different reasons:
 
 - **Laravel's session cookie is not called `laravel_session` on your site.** It is
-  `Str::slug(env('APP_NAME'), '_') . '_session'` — so a real install emits
-  `acme_shop_session`. `laravel_session` only appears if `APP_NAME` is unset, and
-  the skeleton `.env` ships `APP_NAME=Laravel`. A shipped `laravel_session`
-  substring would match **almost no production Laravel site**. Same failure class as
-  [Joomla](joomla.md) and [Drupal](drupal.md): a per-install name is not a shippable
+  derived from `APP_NAME` in `config/session.php`, and the exact derivation has also
+  *changed between framework versions*. Laravel 11 shipped
+  `Str::slug(env('APP_NAME', 'laravel'), '_') . '_session'` — underscores — so an
+  `APP_NAME=Acme Shop` install emitted `acme_shop_session`. Laravel 12 rewrote that
+  default (dropping the `'_'` separator so `Str::slug` falls back to its hyphen, and
+  suffixing `-session`; some 12.x point releases briefly used `Str::snake`, see
+  [laravel/framework#56449](https://github.com/laravel/framework/issues/56449)), so a
+  current install more typically emits the **hyphenated** `acme-shop-session`. Either
+  way `laravel_session` only appears when `APP_NAME` is unset. A shipped
+  `laravel_session` substring would match **almost no production Laravel site** — and
+  the modern hyphenated name additionally cannot be read with `$cookie_` at all (see
+  the [hyphen gotcha](#gotchas)). Same failure class as [Joomla](joomla.md) and
+  [Drupal](drupal.md): a per-install (now also per-version) name is not a shippable
   literal.
 - **…and even the right name would be useless, because Laravel cookies every
   guest.** `StartSession::addCookieToResponse()` gates only on *"is a session driver
@@ -163,7 +173,7 @@ the one that decides everything.**
 | Framework | Session cookie | Stable name? | Set for a **guest**? | Origin sends `private`? |
 |---|---|---|---|---|
 | **Django** | `sessionid` | ✅ | **⚠️ only if something writes the session** — see below | ❌ no (only `Vary: Cookie`) |
-| **Laravel** | `<APP_NAME>_session` | ❌ **env-derived** | ❌ **yes, always, unconditionally** | ❌ no |
+| **Laravel** | `<APP_NAME>_session` (11.x) / `<APP_NAME>-session` (12.x) | ❌ **env- & version-derived** | ❌ **yes, always, unconditionally** | ❌ no |
 | **Rails** | `_<appname>_session` | ❌ **per-app** | ⚠️ lazy, but flash + CSRF usually trip it | ❌ not guaranteed |
 | **Symfony** | `PHPSESSID` | ✅ (but collides — see below) | ⚠️ lazy in theory, leaky in practice | ✅ **yes, on session start** |
 | **Flask** | `session` | ✅ (but dangerously generic) | ⚠️ only if session written (`flash()` writes) | ❌ no (only `Vary: Cookie`) |
@@ -435,6 +445,72 @@ never poison the anonymous entry.
 - **`Set-Cookie` responses are never stored** and `Authorization` requests are never
   cached, regardless of any of this. Those floors hold even if every rule above is
   wrong.
+
+## Runtime settings / gotchas
+
+The [3 curls](#deriving-your-own-rule-the-3-curls) tell you *which cookie* to key on.
+This section is the layer under that: framework-specific origin behaviour that
+suppresses caching, competes with the module, or needs tuning on the MISS path. Only
+the gotchas that are particular to each framework are listed — the universal floors
+(`Set-Cookie` never stored, `Authorization` never cached) hold everywhere.
+
+**Laravel (PHP).** Both cookies it sets are guest cookies: the session cookie
+(`StartSession::addCookieToResponse()` gates only on *a session driver being
+configured*, so every `web`-middleware response cookies the visitor) and `XSRF-TOKEN`
+(written whenever the encrypt-cookies middleware runs — i.e. on GETs that render a
+form). There is no config knob to make the `web`-group session lazy, so you **cannot**
+key on presence — lean on `cache_turbo_cache_control honor;` (weak here: Laravel does
+not send `private`) plus a URI bypass of the authenticated area. Never fold either
+cookie into the key; `XSRF-TOKEN` is hyphenated, so `$cookie_XSRF_TOKEN` reads empty
+and `cache_turbo_key_cookie` is the only thing that could read it — which you must not
+do for a guest token anyway. Origin MISS latency is opcache-bound: enable OPcache with
+`opcache.validate_timestamps=0` in production (the module serves HITs itself, so
+opcache only pays on the MISS).
+
+**Symfony (PHP).** `PHPSESSID` (or the configured `framework.session.name`) is the
+stock PHP name shared by every co-hosted PHP app, so a substring bypass on it hits
+neighbours that are not even Symfony — do **not** bypass on it. Symfony's saving grace
+is `AbstractSessionListener`: it stamps the response `private` the moment the session
+is *started*, so `cache_turbo_cache_control honor;` genuinely covers authenticated
+pages (add a URI bypass for the admin path as belt-and-braces). Two traps: (1) an app
+that opts a session-bearing response back into caching via
+`AbstractSessionListener::NO_AUTO_CACHE_CONTROL_HEADER` drops that `private` — audit
+for it. (2) Symfony ships its *own* PHP reverse proxy (`framework.http_cache: true`,
+visible via the `X-Symfony-Cache` header); running it behind cache-turbo gives you two
+stacked gateway caches with two TTLs. Pick one edge — usually disable
+`framework.http_cache` and let cache-turbo be the cache. Opcache tuning as for Laravel.
+
+**Rails (Ruby).** The cookie is `_<app>_session`, per-app (from
+`config/session_store.rb`), and the session is lazy — but the CSRF `authenticity_token`
+lives *in the session* by default, so the first form render starts it and cookies the
+guest. Rails 7+ can move the CSRF token out of the session into its own encrypted
+cookie (`config.action_controller.urlsafe_csrf_tokens` / storing it outside the
+session): that stops session-thrash from anonymous CSRF but *adds a distinct guest
+cookie* — re-run curl #1, do not bypass on it. Rails does not reliably send `private`,
+so the derived cookie rule is load-bearing. `Rack::Cache` stopped being a default
+dependency in **Rails 4**; if the app re-enables it (the `rack-cache` gem +
+`config.action_dispatch.rack_cache = true`) you get a second HTTP cache — prefer
+cache-turbo at the edge and leave `Rack::Cache` off. MISS throughput scales with Puma
+workers (`WEB_CONCURRENCY`), not with the cache.
+
+**Django (Python).** `csrftoken` is a guest cookie by design (any form-rendering GET
+sets it) — never a bypass signal, never in the key. `sessionid` is set only on a
+non-empty *modified* session, which is exactly the conditional the field notes above
+warn about. Watch two settings that turn `sessionid` into a guest cookie:
+`CSRF_USE_SESSIONS = True` (moves the CSRF token into the session, so every form-GET
+now writes it) and `SESSION_SAVE_EVERY_REQUEST = True`. Session middleware also emits
+`Vary: Cookie` whenever the session is *accessed* — that is a keying instruction, not
+`private`, so `honor` will not fire on it and it is no evidence of safety. MISS
+throughput scales with gunicorn workers, not the cache.
+
+**Express (Node).** `connect.sid` is the express-session default, and
+`saveUninitialized` **defaults to `true`** — which saves and cookies *every* anonymous
+visitor, zeroing your hit rate. The single highest-value origin change is
+`saveUninitialized: false`, so a guest who never writes the session is never cookied
+and the response stays cacheable; presence of `connect.sid` then genuinely means
+"has state". Express sends no `private` of its own, so the cookie/URI bypass is the
+only defence. A CSRF layer (`csurf`, `csrf-csrf`) sets its own cookie on GET — keep it
+out of the key. MISS throughput scales with the Node cluster / PM2 worker count.
 
 ## See also
 

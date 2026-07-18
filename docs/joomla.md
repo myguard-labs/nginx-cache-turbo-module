@@ -1,5 +1,7 @@
 # Joomla + cache-turbo
 
+_Last researched: 2026-07-18_
+
 Caching a Joomla site. **Read [the warning](#the-preset-is-thin--read-this)
 first** — the Joomla preset is deliberately minimal and, unlike the other three,
 it does **not** protect logged-in users on its own.
@@ -42,15 +44,21 @@ is set only for an authenticated user and cleared on logout.
 **But it only exists for users who ticked "Remember Me."** A member who simply logs
 in and does not tick the box carries **no such cookie**. What they carry is the
 session cookie — and **that** has no fixed name. Joomla derives it from the site's
-secret, roughly `md5(md5($secret . 'site'))`, giving a bare 32-hex cookie name with
-**no stable prefix**:
+secret: on Joomla 4/5 the session name is `md5($secret . $seed)` where `$seed` is the
+configured `session_name` or, by default, the application class
+(`Joomla\CMS\Application\SiteApplication`) — see
+[`libraries/src/Service/Provider/Session.php`](https://github.com/joomla/joomla-cms/blob/5.4-dev/libraries/src/Service/Provider/Session.php)
+`generateSessionName()`. (Joomla 3.x used the older double hash `md5(md5($secret . 'site'))`;
+the seed changed, but the result is the same shape.) Either way it is a bare 32-hex
+cookie name with **no stable prefix**:
 
 ```
 1a79a4d60de6718e8e5b326e338ae533=abc123...      # a real Joomla session cookie
 ```
 
-(The front end and the administrator get *different* hashes — the `'site'` vs
-`'administrator'` component.)
+(The front end and the administrator get *different* hashes — the seed is the
+`SiteApplication` vs `AdministratorApplication` class, so the two areas never share a
+cookie name.)
 
 That name is different on every install, so there is no substring the module could
 ship that would match your site and not somebody else's. WordPress can ship
@@ -72,9 +80,12 @@ cache_turbo_bypass $cookie_1a79a4d60de6718e8e5b326e338ae533;
 
 Without that, the only things standing between a logged-in Joomla user and a
 cached page are the `/administrator/` URI rule (which does not cover the front
-end) and Joomla's own `Cache-Control` — and Joomla core's page-cache plugin gates
-on `!$app->getIdentity()->guest`, which tells you upstream considers login state
-the thing that matters. `joomla_remember_me_` raises the floor. It does not make
+end) and Joomla's own `Cache-Control` — and the core System - Page Cache plugin only
+stores a page when `$app->getIdentity()->guest` is true (its `appStateSupportsCaching()`
+also requires the site application, a `GET` request, and an empty message queue — see
+[`plugins/system/cache/src/Extension/Cache.php`](https://github.com/joomla/joomla-cms/blob/5.4-dev/plugins/system/cache/src/Extension/Cache.php)),
+which tells you upstream considers login state the thing that matters.
+`joomla_remember_me_` raises the floor. It does not make
 the preset safe on its own.
 
 **Consequence:** `cache_turbo_backend joomla;` on its own gives you an admin-URI
@@ -216,6 +227,33 @@ curl -sI -H 'Cookie: 1a79a4d60de6718e8e5b326e338ae533=abc' \
 Run that last check against your **actual** session cookie name before you go
 live. It is the whole safety story on Joomla.
 
+## Kunena (Joomla forum component): same unshippable shape, no separate preset
+
+Kunena is a Joomla **component**, not a standalone app — it has no auth/session
+subsystem of its own. It runs entirely inside Joomla core's identity/session
+layer (`JFactory::getApplication()->getIdentity()`, Joomla's `#__session` DB
+table), so every cookie a Kunena forum visitor carries is a Joomla-core
+cookie, exactly as described above. There is no Kunena-specific `setcookie()`
+call, session cookie name, or cookie helper anywhere in its source — **do not
+add a `kunena` preset bit**, it would be exactly as unshippable as a bare
+`joomla` identity guard and would add nothing this page doesn't already cover.
+
+Use the `joomla` preset plus your own per-install `cache_turbo_bypass` on your
+site's session cookie (see above), and add Kunena's own always-dynamic
+surfaces as extra URI-prefix bypasses — these are unauthenticated-cookie-
+invisible actions that must never be served from cache regardless of cookie
+state:
+
+```nginx
+cache_turbo_bypass_uri
+    /index.php?option=com_kunena&view=user&layout=messages   # private messages
+    /index.php?option=com_kunena&view=topic&layout=post;      # posting/reply
+```
+
+(Adjust for SEF URLs if enabled — match your site's actual routed paths for
+these views.) Moderation actions under `/administrator/` are already covered
+by the preset's admin-URI rule.
+
 ## Gotchas
 
 - **The preset does not cover logged-in users.** Said three times because it's the
@@ -231,6 +269,49 @@ live. It is the whole safety story on Joomla.
   own private surfaces and their own cookies. The preset knows nothing about them.
 - **`Set-Cookie` responses are never stored** and `Authorization` requests are
   never cached, regardless of preset. Those floors hold.
+- **Do not rely on `joomla_user_state` as a fixed-name login flag.** Third-party
+  cookie databases describe a `joomla_user_state` cookie "set when logged in, deleted
+  on logout" — but that string does not appear anywhere in Joomla 5 core source
+  (unverified / community-reported, likely an older-version or extension artifact). It
+  is not a stable, shippable auth cookie; the session cookie (32-hex) and
+  `joomla_remember_me_` remain the only login signals to key on.
+
+## PHP settings / gotchas
+
+Joomla-specific PHP notes. General PHP-FPM tuning lives with the other presets;
+these are the things that bite on Joomla in particular.
+
+- **The session cookie name is an MD5 hash and differs per site.** Joomla runs on
+  native PHP sessions, and its session/cookie name is `md5($secret . $seed)` (Joomla
+  4/5; see the cookie section above). There is no fixed string to ship, so the preset
+  and every example here key on cookie **presence** — the `~[0-9a-f]{32}=` `map` — not
+  on a known name. Rotating the site secret (or changing `session_name`) changes the
+  name; the `map` survives that, a hard-coded `$cookie_<hash>` does not.
+- **The System - Page Cache plugin is a second cache layer — mind double-caching.**
+  It caches whole rendered pages inside PHP for guests only (see above), so it and
+  cache-turbo can both hold a copy of the same URL. That is fine for hit-rate, but its
+  **`browsercache`** parameter (default `0`/off) makes Joomla emit `Cache-Control` /
+  `Expires` headers to the *client*; turning it on hands browsers and any downstream
+  proxy their own freshness window that you cannot purge when you flush cache-turbo.
+  Leave `browsercache` off and let the nginx layer own the full-page cache and its
+  invalidation. (Joomla core has a long history of emitting conservative
+  `Cache-Control: no-cache` / stale `Expires` headers otherwise.)
+- **Enable opcache.** A stock Joomla plus a normal extension set loads a large number
+  of PHP class files per request; opcache is the single biggest origin-speed win for
+  the misses cache-turbo passes through.
+- **`memory_limit` for large extension sets.** Component-heavy sites (page builders,
+  VirtueMart, multilingual) and the extension installer are memory-hungry — 128M is a
+  floor, 256M is realistic for a busy install.
+- **`max_execution_time` for `com_installer` and the cache-clean cron.** Installing or
+  updating extensions via `com_installer`, and Joomla's scheduled cache/expired-session
+  cleanup, can run well past the default 30s. Raise the limit for those paths (the CLI
+  scheduler in particular), not for normal page requests.
+- **Joomla keeps its own cache directories.** `cache/` (front end) and
+  `administrator/cache/` are Joomla's internal caches, entirely separate from
+  cache-turbo's store. Clearing Joomla cache (System → Clear Cache) does not touch
+  cache-turbo, and a cache-turbo purge does not clear these — flush both layers when
+  content changes. If the session handler is set to the filesystem, session GC lives
+  here too.
 
 ## See also
 

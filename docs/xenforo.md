@@ -1,5 +1,7 @@
 # XenForo + cache-turbo
 
+_Last researched: 2026-07-18_
+
 Full-page caching a XenForo (XF2) board: what to cache, what to bypass, what to
 put in the key, and a copy-paste vhost with the Redis L2 tier wired up.
 
@@ -14,6 +16,7 @@ put in the key, and a copy-paste vhost with the Redis L2 tier wired up.
 - [Purging on new posts](#purging-on-new-posts)
 - [Checking it works](#checking-it-works)
 - [Gotchas](#gotchas)
+- [PHP settings / gotchas](#php-settings--gotchas)
 
 ## The short version
 
@@ -140,6 +143,8 @@ shared with anyone, ever.
 | `xf_style_variation` | **cache key** (auto) | XF 2.3's light/dark **variation** within a style — a *different* cookie from `xf_style_id`, set client-side by JS when a visitor picks a scheme. A 2.3 board with dark mode enabled needs both keyed. |
 | `xf_language_id` | **cache key** (auto) | selected language on a multi-language board. |
 | `xf_consent` | **ignore** (see note) | cookie-consent choice; guest-set. It *does* change embed HTML (a consent placeholder replaces a third-party embed until accepted), so it is a real variant — but the preset does **not** key on it, because that fragments the cache on every embed-bearing page. Add it yourself only if you must — see below. |
+| `xf_csrf` | **ignore** | CSRF cookie, paired with the `_xfToken` request param — both are required for CSRF validation (XF kept the token even after adding SameSite=Lax cookies, as defence in depth). It is **guest-acquired**, like `xf_session`: any form-bearing page (login, register, captcha) mints it, so it is **not** a login signal and matching it as one would be wrong. The preset bypasses the `_xfToken` *query arg*, not this cookie. |
+| `xf_tfa_trust` | **ignore** | two-step-verification "trust this device" cookie (persists ~45 days). Set only *after* a 2FA member ticks "trust this device", and it **survives logout** — so it is neither a reliable login nor a guest signal, and is deliberately not matched. Do not add it to `cache_turbo_bypass` as a login proxy: it would bypass a trusted-device guest for weeks while missing the members who never trusted a device. |
 
 The three `xf_style_*` / `xf_language_id` rows are marked **(auto)** because the
 `xenforo` preset now folds their **value** into the cache key for you (tier-3
@@ -550,6 +555,69 @@ traffic, and the hit ratio should be dominated by guest thread/forum views.
   with an `Authorization` header is never cached. Those floors are unconditional.
 - **Two boards, one Redis.** Use distinct `prefix=` values, or `?all=1` on one
   purges the other.
+
+## PHP settings / gotchas
+
+XenForo-specific PHP/PHP-FPM knobs that interact with full-page caching. None of
+these are module directives — they live in `php.ini` / the FPM pool — but they
+change what the origin does behind the cache.
+
+- **XF runs its own cookie session, not PHP's.** XenForo does **not** use PHP
+  native sessions (`$_SESSION` / `PHPSESSID`); it stores session data in its own
+  table and hands the client the `xf_session` cookie. So `session.*` php.ini
+  tuning (`session.save_handler`, GC probability, `session.cookie_*`) is
+  irrelevant to what you cache — the cookie you key/bypass on is `xf_*`, never
+  `PHPSESSID`. It also means a guest can acquire an `xf_session` server-side
+  (logout, 2FA, captcha) without any PHP session ever existing; that is the
+  hit-rate trade documented above, not a PHP misconfiguration you can tune away.
+
+- **OPcache: on, and sized for XF's file count.** XenForo strongly recommends
+  the Zend OPcache (it is the single biggest origin win, and cache-turbo misses
+  plus every member request hit the origin). Two XF-specific traps:
+  - **File count.** A stock board plus a normal add-on set ships *thousands* of
+    PHP files. The default `opcache.max_accelerated_files` (~10 000, rounded up
+    to a prime like 16 229) can be exceeded, at which point OPcache starts
+    evicting and hit rate on the origin collapses. Raise it to a higher prime
+    (e.g. `opcache.max_accelerated_files=32531`) and give it room —
+    `opcache.memory_consumption=256` (MB) or more is a reasonable starting point
+    for XF with add-ons (community-reported; XF documents no exact figure, so
+    watch the ACP *Server environment* report / `opcache_get_status()` and size
+    to actual usage).
+  - **Timestamp validation.** XF calls `opcache_reset()` itself on add-on
+    install/upgrade — but that call is refused if `opcache.restrict_api` blocks
+    it, and if you run `opcache.validate_timestamps=0` (common for max
+    throughput) OPcache will **not** pick up changed XF/add-on files until you
+    reset it or reload FPM. After an upgrade or add-on change on such a box,
+    reload PHP-FPM as part of the deploy, then issue a cache-turbo `?all=1`
+    purge — stale opcode behind the cache otherwise gets frozen into cached HTML.
+
+- **`memory_limit` ≥ 128 MB, more with the image proxy / big add-on sets.**
+  XenForo's own floor is ~128 MB and it will refuse to run below it. Boards that
+  enable the **image proxy** or attachment thumbnailing (both decode images in
+  PHP), or carry large add-ons, routinely need 256 MB+. This only bites on
+  origin requests — i.e. cache-turbo misses and every member view — so a low
+  limit shows up as intermittent 500s on exactly the traffic the cache can't
+  absorb.
+
+- **Rebuild-caches jobs vs the FPM timeout.** The ACP *Rebuild caches* tools and
+  other long jobs call `set_time_limit(0)` in XF's `AbstractJob` to dodge
+  `max_execution_time` — but under PHP-FPM that does **not** override the pool's
+  `request_terminate_timeout`, so a big rebuild triggered from the ACP can still
+  be killed mid-run (and XF's `jobMaxRunTime` is not FPM-timeout aware). Run
+  large rebuilds from the CLI instead —
+  `php cmd.php xf:rebuild-caches` / `php cmd.php xf:run-jobs --max-execution-time 0`
+  — rather than raising the FPM timeout for the whole pool. Unrelated to the
+  page cache, but it is the XF admin task most likely to look like a caching
+  failure when it times out.
+
+- **XF has no built-in full-page cache — that is what this module is for.** XF's
+  own cache layer (registry / templates / phrases / permissions, and the
+  file-based `internal_data/code_cache/`) only makes the *origin* faster; it
+  never serves a whole rendered page to a guest without PHP running. cache-turbo
+  is the missing full-page tier. The two are complementary and separately
+  configured — see [XenForo's own object cache](#xenforos-own-object-cache-redis--a-different-thing)
+  above for the Redis DB/prefix separation that keeps a `?all=1` page-cache purge
+  from wiping XF's object cache.
 
 ## See also
 

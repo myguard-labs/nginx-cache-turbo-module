@@ -2292,6 +2292,261 @@ static const char *const  ct_typo3_cookies[] = {
 static const char *const  ct_typo3_uris[] = { "/typo3", NULL };
 static const char *const  ct_typo3_args[] = { NULL };
 
+/*
+ * Invision Community (IPS4). Closed-source, vendor-attested rather than
+ * source-verified — IPS's own developer docs document ips4_loggedIn as
+ * existing FOR THIS EXACT PURPOSE: "set after login, used by caching systems
+ * to identify if you are logged in" (Common Cookies Set By The Suite / the
+ * Caching developer guide, which tells a page-cache integrator to check it
+ * before initialising other classes). This is a stronger, purpose-built signal
+ * than most platforms in this registry ship — most forums leave you to reverse
+ * engineer a remember-me cookie; IPS names the caching cookie for you.
+ *
+ * `ips4_IPSSessionFront` is issued to EVERY visitor, guests included (ordinary
+ * session tracking) — the same xf_session/_forum_session shape, and it is
+ * deliberately NOT in this list.
+ *
+ * The `ips4_` prefix is admin-configurable (Overriding Default Cookie Options),
+ * so the rule matches the SUFFIX `_loggedIn`, not the literal `ips4_loggedIn`
+ * — the same prefix-agnostic technique phpBB's `_u` and Drupal's `SESS` use.
+ *
+ * IPS routes through app=core&module=...&do=... controller dispatch rather
+ * than one stable posting URI, so posting/messaging/moderation surfaces are
+ * matched as `do=` query args, not URI prefixes, alongside the fixed
+ * front-controller paths (/login, /register, /lostpassword, /messenger, and
+ * /admin — the ACP).
+ *
+ * key_cookies are cosmetic (theme/language/JS-detection/device fingerprint),
+ * shared by everyone who picked the same value — never an identity signal.
+ */
+static const ngx_http_cache_turbo_cookie_pred_t  ct_invision_preds[] = {
+    { "_loggedIn", NGX_HTTP_CACHE_TURBO_CVOP_NONEMPTY, NULL },
+    { NULL, 0, NULL }
+};
+static const char *const  ct_invision_cookies[] = { NULL };
+static const char *const  ct_invision_uris[] = {
+    "/admin", "/login", "/register", "/lostpassword", "/messenger", NULL };
+static const char *const  ct_invision_args[] = {
+    "do=compose", "do=post", "do=reply", "do=report", "module=messaging", NULL };
+static const char *const  ct_invision_key_cookies[] = {
+    "ips4_hasJS", "ips4_theme", "ips4_language", "ips4_deviceKey", NULL };
+
+/*
+ * Simple Machines Forum (SMF). SMFCookie (name is `$cookiename` from
+ * Settings.php, default "SMFCookie" + version suffix e.g. SMFCookie20/21, so
+ * the rule matches the SUBSTRING "SMFCookie" not a full literal) is issued to
+ * EVERY visitor, guests included — the phpBB shape exactly. loadUserSettings()
+ * in SMF's own core only treats it as authenticated when the embedded
+ * password-hash element is non-empty; a guest's value carries id_member=0 and
+ * an empty password field.
+ *
+ * A general-purpose nginx cookie matcher cannot safely JSON/PHP-serialize
+ * decode the structured value and validate hash shape, so the pragmatic proxy
+ * (same class of compromise as phpBB's presence-of-suffix rule) is: bypass
+ * whenever the cookie is present AT ALL. This is presence-only despite the
+ * cookie being guest-issued, and it is NOT free — it costs hit rate on guests
+ * who have merely started a session (viewed the login page, tripped 2FA).
+ * That is the accepted XenForo-style trade: correct, not maximally fast. Do
+ * not "optimise" this into a value predicate without actually parsing the
+ * cookie's array/JSON structure — an approximate string-prefix guess against
+ * a guest-canonical value is not a safe substitute for a real decode, and
+ * shipping one un-decoded risks the opposite failure (misclassifying an
+ * authenticated cookie as guest-shaped).
+ *
+ * The 2FA companion cookie `<cookiename>_tfa` only exists mid-login and is
+ * folded into the same presence rule for completeness.
+ */
+static const char *const  ct_smf_cookies[] = { "SMFCookie", NULL };
+static const char *const  ct_smf_uris[] = { NULL };
+static const char *const  ct_smf_args[] = {
+    "action=admin", "action=login", "action=login2", "action=logintfa",
+    "action=logout", "action=profile", "action=pm", "action=post",
+    "action=post2", "action=moderate", "action=reporttm", "action=xmlhttp",
+    NULL };
+
+/*
+ * Vanilla Forums. The `Vanilla` identity cookie (Gdn_CookieIdentity::
+ * SetIdentity()) is written ONLY at login/SSO time — a true guest never
+ * receives it at all, unlike the phpBB/SMF/XenForo shape. No value predicate
+ * is needed or available (the value is an HMAC-signed opaque payload).
+ *
+ * CAVEAT: this is corroborated via Vanilla's own KB article and community
+ * threads describing SetIdentity/GetIdentity, not a direct line-cited GitHub
+ * source read (the exact file could not be fetched at research time — it may
+ * have moved in the TypeScript/PHP8 rewrite of newer Vanilla). Ship it, but
+ * verify empirically against your own install (curl anonymously, confirm no
+ * `Set-Cookie: Vanilla=...` appears) before relying on it in production.
+ *
+ * The cookie name is config-renameable, so match the substring "Vanilla"
+ * rather than requiring the exact default.
+ */
+static const char *const  ct_vanilla_cookies[] = { "Vanilla", NULL };
+static const char *const  ct_vanilla_uris[] = {
+    "/dashboard", "/entry/", "/messages/", "/post/", NULL };
+static const char *const  ct_vanilla_args[] = { NULL };
+
+/*
+ * PunBB. `punbb_cookie` (config-default literal; admin-configurable) is
+ * issued EAGERLY to every guest too (set_default_user(), unless
+ * FORUM_QUIET_VISIT), so this needs the phpBB-shaped value predicate, not
+ * presence. Unlike phpBB's derived `_u` flag, PunBB's cookie value is a
+ * base64'd, pipe-delimited string whose FIRST field IS the numeric user_id
+ * directly — a guest's is the hardcoded literal "1" (login.php: logout path
+ * writes `base64_encode('1|'.random_key(...))`; a real login writes the
+ * actual user_id, which by the same ANONYMOUS-reserved-row convention as
+ * phpBB is never 1). The registry's cookie_preds engine tests the request
+ * Cookie header directly (not decoded base64), so the predicate here matches
+ * against the cookie's RAW value with the NE-vs-guest-literal test applied to
+ * the same base64'd guest string PunBB itself always writes for a logged-out
+ * visitor — see the predicate below.
+ *
+ * Fixed literal URI prefixes for admin/login/posting/private-messaging (a
+ * PunBB core feature, not a plugin) bypass unconditionally.
+ *
+ * IMPLEMENTATION NOTE: the ideal rule (base64-decode, split on '|', compare
+ * field[0] against the guest literal "1") is NOT expressible by this engine's
+ * cookie_preds — it compares the RAW cookie value against a fixed literal
+ * (EQ/NE) or tests non-emptiness, and PunBB's base64'd guest value carries a
+ * random per-request key suffix after the "1|" (`base64_encode('1|'.
+ * random_key(...))`), so it is never one fixed string an EQ/NE test can
+ * anchor on. A prefix-of-decoded-value predicate would require actually
+ * decoding base64 in the hot classify path, which this registry does not do
+ * anywhere else (all other value predicates compare the wire bytes directly).
+ * So this preset degrades to PRESENCE-only, same shape as SMF's SMFCookie —
+ * safe (bypass is the correct-direction failure), but costs hit rate on
+ * guests who merely touched a session-starting action. docs/punbb.md notes
+ * this rather than claiming the sharper rule the research suggested.
+ */
+static const char *const  ct_punbb_cookies[] = { "punbb_cookie", NULL };
+static const char *const  ct_punbb_uris[] = {
+    "/admin.php", "/admin/", "/login.php", "/post.php", "/message_send.php",
+    "/message_delete.php", "/misc.php", NULL };
+static const char *const  ct_punbb_args[] = { NULL };
+
+/*
+ * Phorum. Fixed, version-pinned literal session-cookie constants
+ * (phorum_session_v5, phorum_session_st, phorum_admin_session_v5 — PHP
+ * constants in include/api/user.php, not per-install hashes or
+ * admin-configurable prefixes) written ONLY by
+ * phorum_api_user_session_create(), which is called ONLY from a successful
+ * login — never for anonymous page rendering. This is the inverse of the
+ * XenForo/Discourse/phpBB/Flarum trap: presence alone is a safe, sufficient
+ * signal because guests never receive any of these three cookies. No value
+ * predicate needed.
+ *
+ * `phorum_tmp_cookie` is a guest-received cookie-support PROBE with no
+ * identity value (destroyed once logged in) — deliberately absent from the
+ * list; matching it would be a pure hit-rate loss for zero safety gain.
+ *
+ * Phorum is a flat top-level-script app (admin.php, login.php, ... — no path
+ * hierarchy), so the dynamic surface is expressed as URI prefixes against
+ * those script names directly.
+ */
+static const char *const  ct_phorum_cookies[] = {
+    "phorum_session_v5", "phorum_session_st", "phorum_admin_session_v5", NULL };
+static const char *const  ct_phorum_uris[] = {
+    "admin.php", "login.php", "register.php", "pm.php", "posting.php",
+    "post.php", "moderation.php", "control.php", "ajax.php", "report.php",
+    "follow.php", NULL };
+static const char *const  ct_phorum_args[] = { NULL };
+static const char *const  ct_phorum_key_cookies[] = { "list_style", NULL };
+
+/*
+ * YaBB (the Perl forum). The three session/login cookies (`Y2User-<rand>`,
+ * `Y2Pass-<rand>`, `Y2Sess-<rand>`) get a RANDOM per-install numeric suffix
+ * generated once by Setup.pl — the Joomla-shaped naming problem — but the
+ * FIXED PREFIXES (`Y2User-`, `Y2Pass-`, `Y2Sess-`) survive it, so the rule
+ * matches those substrings, not a full name.
+ *
+ * More importantly: presence alone is safe regardless of the prefix, because
+ * the single write path (UpdateCookie("write", ...)) is called ONLY from the
+ * post-login-form-POST success branch in LogInOut.pl. Every guest / logged-out
+ * / failed-login path calls UpdateCookie("delete") instead, which clears these
+ * three cookies (or, in guest-language-cookie mode, repurposes only the
+ * Y2Pass- slot to hold a plaintext "guestlanguage" string — cosmetic, not an
+ * auth artifact). YaBB also always cookies on login regardless of a
+ * remember-me checkbox (UpdateCookie("write") on LogInOut.pl:101 fires for
+ * ANY successful login; only the expiry varies) — so this has none of the
+ * XenForo/Flarum "ordinary login leaves no cookie" trap either.
+ *
+ * A site that hand-renames the three Y2*-prefixed cookie vars away from the
+ * convention breaks this preset silently — same caveat class as any other
+ * admin-configurable cookie name in this registry (document, don't code
+ * around what can't be discovered).
+ *
+ * YaBB is a single-script CGI app (YaBB.pl?action=X), so the dynamic surface
+ * lives in query args, not URI prefixes.
+ */
+static const char *const  ct_yabb_cookies[] = {
+    "Y2User-", "Y2Pass-", "Y2Sess-", NULL };
+static const char *const  ct_yabb_uris[] = { NULL };
+static const char *const  ct_yabb_args[] = {
+    "action=post", "action=post2", "action=login", "action=login2",
+    "action=register", "action=register2", "action=admin", "action=pm",
+    "action=imsend", "action=imsend2", NULL };
+
+/*
+ * MyBB. The login cookie `{prefix}user` (COOKIE_PREFIX default "mybb_", so
+ * the wire name is "mybbuser") is written ONLY inside the login success path
+ * (inc/datahandlers/login.php via member.php do_login) — a guest structurally
+ * cannot receive it, so presence alone is sufficient with no value predicate.
+ * The prefix is an ACP setting, so the rule matches the SUFFIX "user", the
+ * same prefix-agnostic technique phpBB's "_u" uses.
+ *
+ * `{prefix}sid` (session id) is issued to EVERY visitor including guests and
+ * bots — deliberately NOT in this list; it is the same xf_session/SMFCookie
+ * trap. The various `{prefix}[lastvisit]`, `[threadread]`, `[forumread]`,
+ * `[readallforums]`, `[announcements]` array-cookies are guest read-tracking,
+ * not auth — also excluded. `{prefix}theme` / `{prefix}lang` are presentation
+ * cookies, folded into the key instead of bypassed.
+ */
+static const ngx_http_cache_turbo_cookie_pred_t  ct_mybb_preds[] = {
+    { "user", NGX_HTTP_CACHE_TURBO_CVOP_NONEMPTY, NULL },
+    { NULL, 0, NULL }
+};
+static const char *const  ct_mybb_cookies[] = { NULL };
+static const char *const  ct_mybb_uris[] = {
+    "/member.php", "/usercp.php", "/private.php", "/modcp.php",
+    "/newthread.php", "/newreply.php", "/editpost.php", "/polls.php",
+    "/admin/", "/xmlhttp.php", NULL };
+static const char *const  ct_mybb_args[] = {
+    "action=login", "action=do_login", "action=logout", "action=do_logout",
+    "action=register", "action=do_register", "action=activate",
+    "action=lostpw", "action=do_lostpw", "action=resetpassword", NULL };
+static const char *const  ct_mybb_key_cookies[] = {
+    "mybbtheme", "mybblang", NULL };
+
+/*
+ * vBulletin (3.x/4.x "bb_" cookie-prefix era). `bb_userid` / `bb_password`
+ * (or `bbimloggedin=yes` on some builds, confirmed as the real signal ops use
+ * in production LiteSpeed vBulletin caching configs) are set ONLY on login
+ * and removed on logout — never issued to guests. Presence/non-empty-value
+ * alone is sufficient; no value-split trick needed.
+ *
+ * `bb_sessionhash` is issued to guests too (session tracking for everyone) —
+ * deliberately excluded, the xf_session shape again. The `bb_` prefix is
+ * admin-configurable (Cookie and HTTP Header Options), so this matches the
+ * SUFFIX "userid" / "password", not a hardcoded "bb_" literal — a rare manual
+ * full-rename still evades it (documented gap, same class as any other
+ * admin-configurable-name caveat in this registry).
+ *
+ * `bb_lastvisit` / `bb_lastactivity` / style-and-language-selection cookies
+ * are presentation, folded into the key rather than bypassed.
+ */
+static const ngx_http_cache_turbo_cookie_pred_t  ct_vbulletin_preds[] = {
+    { "userid", NGX_HTTP_CACHE_TURBO_CVOP_NONEMPTY, NULL },
+    { "password", NGX_HTTP_CACHE_TURBO_CVOP_NONEMPTY, NULL },
+    { "imloggedin", NGX_HTTP_CACHE_TURBO_CVOP_EQ, "yes" },
+    { NULL, 0, NULL }
+};
+static const char *const  ct_vbulletin_cookies[] = { NULL };
+static const char *const  ct_vbulletin_uris[] = {
+    "/login.php", "/register.php", "/usercp.php", "/private.php",
+    "/profile.php", "/cron.php", "/admincp/", NULL };
+static const char *const  ct_vbulletin_args[] = { NULL };
+static const char *const  ct_vbulletin_key_cookies[] = {
+    "bb_lastvisit", "bb_lastactivity", "bb_language", NULL };
+
 static const ngx_http_cache_turbo_preset_t  ngx_http_cache_turbo_presets[] = {
     { NGX_HTTP_CACHE_TURBO_BACKEND_WORDPRESS,
       ct_wp_cookies, ct_wp_uris, ct_wp_args, NULL, NULL },
@@ -2323,6 +2578,26 @@ static const ngx_http_cache_turbo_preset_t  ngx_http_cache_turbo_presets[] = {
       ct_shopware6_key_cookies },
     { NGX_HTTP_CACHE_TURBO_BACKEND_TYPO3,
       ct_typo3_cookies, ct_typo3_uris, ct_typo3_args, NULL, NULL },
+    { NGX_HTTP_CACHE_TURBO_BACKEND_INVISION,
+      ct_invision_cookies, ct_invision_uris, ct_invision_args,
+      ct_invision_preds, ct_invision_key_cookies },
+    { NGX_HTTP_CACHE_TURBO_BACKEND_SMF,
+      ct_smf_cookies, ct_smf_uris, ct_smf_args, NULL, NULL },
+    { NGX_HTTP_CACHE_TURBO_BACKEND_VANILLA,
+      ct_vanilla_cookies, ct_vanilla_uris, ct_vanilla_args, NULL, NULL },
+    { NGX_HTTP_CACHE_TURBO_BACKEND_PUNBB,
+      ct_punbb_cookies, ct_punbb_uris, ct_punbb_args, NULL, NULL },
+    { NGX_HTTP_CACHE_TURBO_BACKEND_PHORUM,
+      ct_phorum_cookies, ct_phorum_uris, ct_phorum_args, NULL,
+      ct_phorum_key_cookies },
+    { NGX_HTTP_CACHE_TURBO_BACKEND_YABB,
+      ct_yabb_cookies, ct_yabb_uris, ct_yabb_args, NULL, NULL },
+    { NGX_HTTP_CACHE_TURBO_BACKEND_MYBB,
+      ct_mybb_cookies, ct_mybb_uris, ct_mybb_args, ct_mybb_preds,
+      ct_mybb_key_cookies },
+    { NGX_HTTP_CACHE_TURBO_BACKEND_VBULLETIN,
+      ct_vbulletin_cookies, ct_vbulletin_uris, ct_vbulletin_args,
+      ct_vbulletin_preds, ct_vbulletin_key_cookies },
     { 0, NULL, NULL, NULL, NULL, NULL }
 };
 
@@ -5427,6 +5702,14 @@ static const struct {
     { "kirby",       NGX_HTTP_CACHE_TURBO_BACKEND_KIRBY       },
     { "shopware6",   NGX_HTTP_CACHE_TURBO_BACKEND_SHOPWARE6   },
     { "typo3",       NGX_HTTP_CACHE_TURBO_BACKEND_TYPO3       },
+    { "invision",    NGX_HTTP_CACHE_TURBO_BACKEND_INVISION    },
+    { "smf",         NGX_HTTP_CACHE_TURBO_BACKEND_SMF         },
+    { "vanilla",     NGX_HTTP_CACHE_TURBO_BACKEND_VANILLA     },
+    { "punbb",       NGX_HTTP_CACHE_TURBO_BACKEND_PUNBB       },
+    { "phorum",      NGX_HTTP_CACHE_TURBO_BACKEND_PHORUM      },
+    { "yabb",        NGX_HTTP_CACHE_TURBO_BACKEND_YABB        },
+    { "mybb",        NGX_HTTP_CACHE_TURBO_BACKEND_MYBB        },
+    { "vbulletin",   NGX_HTTP_CACHE_TURBO_BACKEND_VBULLETIN   },
     { "none",        NGX_HTTP_CACHE_TURBO_BACKEND_NONE        },
     { NULL,          0                                        }
 };

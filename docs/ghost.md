@@ -1,5 +1,7 @@
 # Ghost + cache-turbo
 
+_Last researched: 2026-07-18_
+
 Caching a Ghost (5.x/6.x) blog. Ghost is a clean fit: the public blog is a large,
 genuinely shared anonymous surface, and — this is the part that makes it work — a
 member session does **not** change the HTML of a fully public post. So one bypass
@@ -14,6 +16,7 @@ There is exactly one sharp edge, and it is not the cookie. It is
 - [Vhost](#vhost)
 - [Checking it works](#checking-it-works)
 - [Gotchas](#gotchas)
+- [Runtime settings / gotchas](#runtime-settings--gotchas)
 
 ## The short version
 
@@ -203,6 +206,73 @@ query string is the one people miss.
 - **`/r/` is the link-redirect tracker.** Caching it would break click analytics.
 - **`Set-Cookie` responses are never stored** and `Authorization` requests are
   never cached, regardless of preset.
+
+## Runtime settings / gotchas
+
+Ghost is a Node.js (Express) application, not PHP — there is no FPM pool, no
+`opcache`, no per-request worker to size. It runs as a single long-lived Node
+process, normally installed and supervised by `ghost-cli` as a systemd unit
+(`ghost_<instance>.service`) listening on `127.0.0.1:2368`. The tuning surface is
+therefore Ghost's own config, not a process manager.
+
+- **`NODE_ENV=production`.** Ghost reads `config.production.json` and enables its
+  production code paths (asset minification/fingerprinting, the built-in
+  in-memory caches for settings, routing and rendered `{{content}}`) only in the
+  production environment. `ghost-cli` sets this for you; a hand-rolled unit that
+  forgets it runs Ghost in development mode, which serves un-fingerprinted assets
+  and behaves differently under load. This is upstream in-process caching and is
+  orthogonal to cache-turbo — it speeds up the origin MISS, it does not make a
+  response cacheable at the edge.
+
+- **Ghost's own `Cache-Control` output.** On the public frontend Ghost emits
+  `Cache-Control: public, max-age=<caching.frontend.maxAge>`, and
+  `caching.frontend.maxAge` **defaults to `0`** — so out of the box every public
+  page carries `public, max-age=0`. Admin and members routes are marked
+  `private, no-cache, no-store, must-revalidate`. Raising `caching.frontend.maxAge`
+  (seconds, in `config.production.json` or via `caching__frontend__maxAge`) is the
+  supported way to make Ghost advertise a real freshness window; note that
+  `staleWhileRevalidate` / `staleIfError` under `caching.frontend` are
+  community-reported as **not fully wired into the emitted header** upstream
+  ([TryGhost/Ghost#21886](https://github.com/TryGhost/Ghost/issues/21886)), so do
+  not count on them. Because the default is `max-age=0`, this is exactly the
+  "origin blankets everything with `max-age=0`" case the README warns about — with
+  `cache_turbo_backend ghost` (which implies `cache_control honor`) an unraised
+  `maxAge` means the honor floor never lets a page store, and `cache_turbo_valid`
+  is what actually gives the blog a usable TTL. Either raise `caching.frontend.maxAge`
+  so the two agree, or accept that `cache_turbo_valid` is the source of truth.
+
+- **`X-Cache-Invalidate` is a purge *signal*, and cache-turbo does not act on it.**
+  When content changes (publish, edit, unpublish, delete, settings/theme change)
+  Ghost emits an `X-Cache-Invalidate` response header naming what became stale —
+  in practice `/*` for a site-wide flush, or a specific path list for a narrower
+  change. It is a custom, undocumented header that Ghost(Pro)'s own caching layer
+  consumes; it is stable but not part of the public API
+  ([forum: how is X-Cache-Invalidate used](https://forum.ghost.org/t/how-is-x-cache-invalidate-used/8117)).
+  **cache-turbo does not parse or honor it** — there is no directive that turns an
+  origin response header into a purge, and none is invented here. The practical
+  consequence: after you publish, the old page stays served until its
+  `cache_turbo_valid` TTL expires. Keep the blog TTL short enough that stale-after-
+  publish is tolerable (the sample uses `cache_turbo_valid 300s`), purge manually
+  through the `cache_turbo_admin` endpoint, or run a small sidecar proxy that
+  watches for `X-Cache-Invalidate` and calls the admin purge — that logic lives
+  outside this module.
+
+- **Members SSR cookie is the login-vary signal — there is nothing else to key
+  on.** Ghost does not vary a public post by tier in its HTML output by default
+  (member content caching is off unless explicitly enabled), so a member session
+  is a binary "bypass" signal, carried entirely by the `ghost-members-ssr` /
+  `ghost-members-ssr.sig` cookies (login) and the `?uuid=&key=` / `?token=` /
+  `?gift=` query args (cookieless auth). The preset already bypasses on all of
+  these; do not try to reproduce Ghost's `req.member` tiering in nginx — the
+  `X-Member-Cache-Tier` public-caching path is an advanced, off-by-default Ghost
+  feature and outside what this preset targets.
+
+- **`/ghost` admin and `/members` are always origin.** The Admin SPA and Admin API
+  (`ghost-admin-api-session` cookie) under `/ghost/` and the members endpoints
+  under `/members/` must never be cached; they are in the preset's bypass set and
+  the sample vhost also pins `/ghost/` with an explicit `cache_turbo off`. No
+  Node-side tuning changes this — these routes are `private, no-store` at the
+  origin regardless.
 
 ## See also
 

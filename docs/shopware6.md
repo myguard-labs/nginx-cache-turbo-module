@@ -1,5 +1,7 @@
 # Shopware 6 + cache-turbo
 
+_Last researched: 2026-07-18_
+
 Caching a Shopware 6 (6.4–6.8) storefront. **Same engine as [magento](magento.md)**
 — Shopware ships its own Varnish VCL and value-keys the one cookie that VCL keys
 on, exactly the way upstream does. This preset **is** that VCL, translated, with
@@ -194,6 +196,58 @@ recipes above are deliberately GET (`-s -o /dev/null -D-`), not `-sI`.
   `magento`.
 - **`Set-Cookie` responses are never stored** and `Authorization` requests are
   never cached, regardless of preset.
+
+## PHP settings / gotchas
+
+Shopware 6 is Symfony-based and runs on PHP-FPM; the items below are the ones
+that specifically bite a Shopware storefront sitting behind `cache-turbo`.
+Generic FPM pool tuning is out of scope.
+
+- **`sw-cache-hash` is the cache-vary key — bank this.** The whole preset rests
+  on folding that one cookie's *value* into the cache key (see above). Since 6.8
+  it is the **only** cache cookie: it carries logged-in state, tax state,
+  currency, and the matched cache-rule set, and `sw-states` / `sw-currency` are
+  gone. Do not bolt on a `$cookie_`-based `map` for login or currency state — it
+  already lives inside `sw-cache-hash`, and (on <6.8) `sw-states=logged-in` was
+  only ever a redundant tag for the same bit.
+
+- **Shopware — not cache-turbo — owns invalidation.** Shopware's built-in Symfony
+  reverse-proxy cache layer emits `BAN` invalidation requests (config key
+  `shopware.http_cache.reverse_proxy`, `ban_method: "BAN"`, optionally
+  `use_varnish_xkey`) to a Varnish/Fastly front when an entity changes, sharing
+  the same tags as its object cache. cache-turbo has no BAN endpoint, so it
+  relies on TTL expiry (`cache_turbo_valid`), not event-driven purge — keep TTLs
+  modest and leave Shopware's tag-based invalidation authoritative. If you need
+  event-driven storefront purges, that is Varnish/Fastly territory, run in front
+  of (or instead of) this preset, not a job this preset does.
+
+- **`SHOPWARE_HTTP_CACHE_ENABLED=1`** in `.env` is what turns on Shopware's HTTP
+  cache and the `Cache-Control` / `no-store` headers this preset honors. With it
+  off, Shopware stops emitting those headers and the URI rules
+  (`/account`, `/checkout`, …) become your only defence on private pages.
+
+- **opcache — size it for Symfony's class count.** Set
+  `opcache.memory_consumption` high (256–512 MB) and `opcache.max_accelerated_files`
+  to 20000+; Shopware blows past the 10000 default and silently thrashes opcache
+  otherwise. On persistent FPM, point `opcache.preload` at
+  `<project>/var/cache/opcache-preload.php` (the Symfony preload file Shopware
+  generates) with `opcache.preload_user` set to the FPM user, and in production
+  run `opcache.validate_timestamps=0` (flush opcache on deploy).
+
+- **`memory_limit` on the CLI is separate from the pool.** `bin/console`
+  commands — `theme:compile`, `dal:refresh:index`, `cache:warmup` — routinely
+  need 512 MB+ and read the CLI `php.ini`, not the FPM pool. An OOM there can
+  leave a half-compiled theme or a stale index that the cache then happily serves.
+
+- **`realpath_cache_size`.** Symfony/Shopware stat a very large file tree; raise
+  `realpath_cache_size` to 4096K+ and `realpath_cache_ttl` to ~600s, or the
+  filesystem lookups surface as latency on every MISS.
+
+- **`max_execution_time` for indexers and workers.** Message-queue workers
+  (`messenger:consume`) and the DAL indexers are long-running — run them from CLI
+  (no wall clock) or with an explicit `--time-limit`, never bounded by the web
+  pool's `max_execution_time`. A worker killed mid-run backs up the queue, so
+  Shopware's invalidations never reach the cache and stale pages linger to TTL.
 
 ## See also
 

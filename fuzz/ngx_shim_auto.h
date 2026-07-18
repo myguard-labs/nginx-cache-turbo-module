@@ -103,6 +103,14 @@ typedef struct {
 #define NGX_HTTP_CACHE_TURBO_BACKEND_KIRBY        0x0800
 #define NGX_HTTP_CACHE_TURBO_BACKEND_SHOPWARE6    0x1000
 #define NGX_HTTP_CACHE_TURBO_BACKEND_TYPO3        0x2000
+#define NGX_HTTP_CACHE_TURBO_BACKEND_INVISION     0x4000
+#define NGX_HTTP_CACHE_TURBO_BACKEND_SMF          0x8000
+#define NGX_HTTP_CACHE_TURBO_BACKEND_VANILLA      0x10000
+#define NGX_HTTP_CACHE_TURBO_BACKEND_PUNBB        0x20000
+#define NGX_HTTP_CACHE_TURBO_BACKEND_PHORUM       0x40000
+#define NGX_HTTP_CACHE_TURBO_BACKEND_YABB         0x80000
+#define NGX_HTTP_CACHE_TURBO_BACKEND_MYBB         0x100000
+#define NGX_HTTP_CACHE_TURBO_BACKEND_VBULLETIN    0x200000
 
 /*
  * Every preset bit, armed together by the driver. There is no GENERIC union any
@@ -129,7 +137,15 @@ typedef struct {
      | NGX_HTTP_CACHE_TURBO_BACKEND_WAGTAIL                                    \
      | NGX_HTTP_CACHE_TURBO_BACKEND_KIRBY                                      \
      | NGX_HTTP_CACHE_TURBO_BACKEND_SHOPWARE6                                  \
-     | NGX_HTTP_CACHE_TURBO_BACKEND_TYPO3)
+     | NGX_HTTP_CACHE_TURBO_BACKEND_TYPO3                                     \
+     | NGX_HTTP_CACHE_TURBO_BACKEND_INVISION                                  \
+     | NGX_HTTP_CACHE_TURBO_BACKEND_SMF                                       \
+     | NGX_HTTP_CACHE_TURBO_BACKEND_VANILLA                                   \
+     | NGX_HTTP_CACHE_TURBO_BACKEND_PUNBB                                     \
+     | NGX_HTTP_CACHE_TURBO_BACKEND_PHORUM                                    \
+     | NGX_HTTP_CACHE_TURBO_BACKEND_YABB                                      \
+     | NGX_HTTP_CACHE_TURBO_BACKEND_MYBB                                      \
+     | NGX_HTTP_CACHE_TURBO_BACKEND_VBULLETIN)
 
 /* ALL must be a gapless run of bits starting at 0x0001 — i.e. ALL+1 is a power
  * of two. A preset bit defined above but left out of ALL breaks this and fails

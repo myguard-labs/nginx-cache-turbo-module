@@ -1,5 +1,7 @@
 # Drupal + cache-turbo
 
+_Last researched: 2026-07-18_
+
 Caching a Drupal 9/10/11 site. The Drupal preset ships the **`SESS` cookie rule**
 — it bypasses the cache for any request carrying a Drupal session cookie. Read
 [why](#the-preset-ships-the-sess-cookie-rule) so you know what it protects and
@@ -36,8 +38,9 @@ surfaces that are dynamic *before* any cookie exists. As defence-in-depth,
 | Cookie substrings | `SESS` |
 
 Drupal's session cookie is `SESS<32-hex>` — or `SSESS<32-hex>` over TLS — where
-the hash is derived per-install from the site's hostname
-(`Core/Session/SessionConfiguration.php`). There is no stable suffix, so the only
+the hash is the first 32 chars of a SHA-256 derived per-install from the site's
+hostname and base path (`Core/Session/SessionConfiguration::getUnprefixedName()`,
+prefix chosen by `getName()` on `$request->isSecure()`). There is no stable suffix, so the only
 literal the module can ship is the leading `SESS` — which, as a substring, covers
 both the plain and the TLS form in one rule.
 
@@ -272,6 +275,56 @@ rule still holds — but add the `map` bypass too and don't lean on the origin.
   former, and the vhost above routes the latter through the same PHP block.
 - **`Set-Cookie` responses are never stored** and `Authorization` requests are
   never cached, regardless of preset. Those floors hold.
+
+## PHP settings / gotchas
+
+These are the Drupal-specific PHP/PHP-FPM knobs that change how the preset behaves.
+Generic tuning belongs in your PHP-FPM docs; only the Drupal interactions are here.
+
+- **The session cookie is the signal — don't defeat it.** Drupal uses PHP's native
+  session handler and *renames* the cookie itself via `SessionConfiguration`
+  (`SESS<hash>` / `SSESS<hash>` over TLS), so a stray `session.name` in `php.ini`
+  is overridden and does not change what the preset matches. What matters is that
+  the cookie is present exactly when a session exists — which is the logged-in (and
+  cart-carrying anonymous) signal the `SESS` rule bypasses on. Don't front Drupal
+  with anything that strips or rewrites the `Set-Cookie` / `Cookie` on PHP requests,
+  or the bypass loses its input.
+
+- **opcache is effectively mandatory, and Drupal is file-heavy.** Drupal's status
+  report warns when opcache is off, and the codebase is large (a stock Drupal 11
+  plus a few contrib modules runs well past 15,000 PHP files). Set
+  `opcache.max_accelerated_files` to ~`20000` so every file stays cached — the
+  common `10000` default silently evicts, and a half-cached opcode table is slow
+  origin, which is what every cache-turbo MISS pays for. In production also set
+  `opcache.validate_timestamps=0` (and reload PHP-FPM on deploy) for the fastest
+  path; `opcache.interned_strings_buffer=16` and `opcache.memory_consumption>=192`
+  suit a real Drupal build.
+
+- **`memory_limit` 256M or more.** Drupal recommends 256M+; the admin UI, batch
+  API, `update.php`, and Composer/media operations routinely exceed the PHP default.
+  An OOM here surfaces as a 500 that cache-turbo will not store (`honor` refuses a
+  non-2xx/`private` response), so it is never *served* stale — but it is still a bad
+  page. Size the pool for it.
+
+- **`max_execution_time` for `cron.php` and `update.php`.** Both can run long
+  (entity updates, index rebuilds). The vhost above routes `/update.php` through the
+  same PHP block, so the FPM `request_terminate_timeout` and PHP `max_execution_time`
+  bound it — raise them for those routes or, better, run cron and database updates
+  from the CLI (`drush cron`, `drush updatedb`) where no web timeout applies. These
+  routes are never cached regardless.
+
+- **Drupal's own `max-age` meets `honor` mode.** `cache_turbo_backend drupal`
+  implies `cache_turbo_cache_control honor`, so the module reads Drupal's
+  `Cache-Control` when deciding whether to store. Core's Internal Page Cache emits
+  `Cache-Control: max-age=<N>, public` on cacheable anonymous pages, where `<N>` is
+  the **Browser and proxy cache maximum age** setting
+  (`system.performance:cache.page.max_age`, `/admin/config/development/performance`).
+  On many installs that value is `0` — Drupal then emits `max-age=0`, and `honor`
+  will refuse to store the response. Either set that value above zero, or rely on
+  the explicit `cache_turbo_valid` in the vhost (which the example already does) so
+  storage TTL doesn't hinge on Drupal's default. Note that a bare `s-maxage` is
+  *contrib* (`http_cache_control` / `cache_control_override`), not core — don't
+  assume it's present.
 
 ## See also
 
