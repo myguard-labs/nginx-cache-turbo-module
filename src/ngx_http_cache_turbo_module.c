@@ -2553,8 +2553,10 @@ static const char *const  ct_mybb_key_cookies[] = {
  * full-rename still evades it (documented gap, same class as any other
  * admin-configurable-name caveat in this registry).
  *
- * `bb_lastvisit` / `bb_lastactivity` / style-and-language-selection cookies
- * are presentation, folded into the key rather than bypassed.
+ * The style-and-language-selection cookie is presentation, folded into the key
+ * rather than bypassed. `bb_lastvisit` / `bb_lastactivity` are presentation too
+ * but are NOT key cookies -- see ct_vbulletin_key_cookies below for why keying
+ * on a per-request timestamp is both useless and hostile.
  */
 static const ngx_http_cache_turbo_cookie_pred_t  ct_vbulletin_preds[] = {
     { "userid", NGX_HTTP_CACHE_TURBO_CVOP_NONEMPTY, NULL },
@@ -2567,8 +2569,14 @@ static const char *const  ct_vbulletin_uris[] = {
     "/login.php", "/register.php", "/usercp.php", "/private.php",
     "/profile.php", "/cron.php", "/admincp/", NULL };
 static const char *const  ct_vbulletin_args[] = { NULL };
+/* Only bb_language. bb_lastvisit and bb_lastactivity are per-visit timestamps
+ * that change on essentially every request, so keying on them gave each visitor
+ * a private bucket the next request already invalidated -- a hit rate near zero
+ * on a board that otherwise caches well. They were also a free remote memory
+ * attack: the values come straight from the client, so anyone could mint
+ * unlimited distinct keys and push the zone into eviction. */
 static const char *const  ct_vbulletin_key_cookies[] = {
-    "bb_lastvisit", "bb_lastactivity", "bb_language", NULL };
+    "bb_language", NULL };
 
 static const ngx_http_cache_turbo_preset_t  ngx_http_cache_turbo_presets[] = {
     { NGX_HTTP_CACHE_TURBO_BACKEND_WORDPRESS,
@@ -2738,7 +2746,7 @@ ngx_http_cache_turbo_cookie_pred_one(u_char *data, size_t len,
     const ngx_http_cache_turbo_cookie_pred_t *pr)
 {
     u_char  *p, *end, *name, *eq, *val;
-    size_t   nlen, vlen, plen;
+    size_t   nlen, vlen, plen, cmplen;
 
     /* An empty (or absent) Cookie value: nothing to match, and no opinion. The
      * explicit guard is required, not cosmetic — a header can carry data == NULL
@@ -2815,15 +2823,34 @@ ngx_http_cache_turbo_cookie_pred_one(u_char *data, size_t len,
         }
         vlen = (size_t) ((name + plen) - val);
 
+        /* A "this pair says cacheable" answer must NOT end the scan: the header
+         * can carry several cookies whose names all end in the suffix (phpBB
+         * keys on `_u`, and `phpbb3_<hash>_u` is per-board, so one browser
+         * visiting two boards on the same host sends two of them). Whichever
+         * one comes first would otherwise decide for the whole request, and a
+         * leading guest `_u=1` would mask a member `_u=42` behind it — serving
+         * and storing that member's page. So only `continue` here; bypass (1)
+         * still returns immediately, and "no pair objected" is the loop's exit
+         * value below.
+         *
+         * cmplen is deliberately NOT plen: plen is this pair's length and is
+         * still what bounds `val` above. Reusing it for the predicate value's
+         * length is safe only for as long as every arm returns. */
+        cmplen = (pr->value != NULL) ? ngx_strlen(pr->value) : 0;
+
         switch (pr->op) {
 
         case NGX_HTTP_CACHE_TURBO_CVOP_NONEMPTY:
-            return vlen > 0 ? 1 : 0;
+            if (vlen > 0) {
+                return 1;
+            }
+            continue;
 
         case NGX_HTTP_CACHE_TURBO_CVOP_EQ:
-            plen = ngx_strlen(pr->value);
-            return (vlen == plen
-                    && ngx_strncmp(val, pr->value, plen) == 0) ? 1 : 0;
+            if (vlen == cmplen && ngx_strncmp(val, pr->value, cmplen) == 0) {
+                return 1;
+            }
+            continue;
 
         case NGX_HTTP_CACHE_TURBO_CVOP_NE:
         default:
@@ -2831,9 +2858,8 @@ ngx_http_cache_turbo_cookie_pred_one(u_char *data, size_t len,
              * "1", so by the letter of != it is a member — but it is really a
              * malformed/cleared cookie. Bypass either way: both readings agree,
              * and bypass is the safe direction. */
-            plen = ngx_strlen(pr->value);
-            if (vlen == plen && ngx_strncmp(val, pr->value, plen) == 0) {
-                return 0;                    /* == the guest literal: cacheable */
+            if (vlen == cmplen && ngx_strncmp(val, pr->value, cmplen) == 0) {
+                continue;                    /* == the guest literal: cacheable */
             }
             return 1;                        /* anything else: bypass */
         }

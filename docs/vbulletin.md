@@ -39,7 +39,8 @@ docs — treat it as belt-and-braces, not the primary signal.)
 | `bbuserid` / `bbpassword` (suffix `userid`/`password`) | **bypass** (non-empty) | set only on login, removed on logout |
 | `bbimloggedin` == `yes` | **bypass** | community-reported extra login flag (LiteSpeed/nginx configs); not in official cookie docs |
 | `bbsessionhash` | **ignore** | session tracking for every visitor including guests |
-| `bblastvisit` / `bblastactivity` / language cookie | **cache key** (manual) | presentation, not identity |
+| language cookie | **cache key** | presentation, not identity |
+| `bblastvisit` / `bblastactivity` | **ignore** | presentation, but per-visit timestamps: keying on them would give every visitor a private entry their own next request invalidates, and let anyone mint unlimited keys to force eviction |
 
 ### The cookie prefix, and the underscore
 

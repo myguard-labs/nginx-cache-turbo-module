@@ -535,7 +535,7 @@ plausibly appear as an arbitrary value.
 | `phorum` †    | `admin.php`, `login.php`, `register.php`, `pm.php`, `posting.php`, `post.php`, `moderation.php`, `control.php`, `ajax.php`, `report.php`, `follow.php` | — | `phorum_session_v5`, `phorum_session_st`, `phorum_admin_session_v5`; *(key)* `list_style` |
 | `yabb` †      | — | `action=post`, `action=post2`, `action=login`, `action=login2`, `action=register`, `action=register2`, `action=admin`, `action=pm`, `action=imsend`, `action=imsend2` | `Y2User-`, `Y2Pass-`, `Y2Sess-` (prefix) |
 | `mybb` †      | `/member.php`, `/usercp.php`, `/private.php`, `/modcp.php`, `/newthread.php`, `/newreply.php`, `/editpost.php`, `/polls.php`, `/admin/`, `/xmlhttp.php` | `action=login`, `action=do_login`, `action=logout`, `action=do_logout`, `action=register`, `action=do_register`, `action=activate`, `action=lostpw`, `action=do_lostpw`, `action=resetpassword` | `user` (suffix, presence); *(key)* `mybbtheme`, `mybblang` |
-| `vbulletin` † | `/login.php`, `/register.php`, `/usercp.php`, `/private.php`, `/profile.php`, `/cron.php`, `/admincp/` | — | `userid`, `password` (suffix, non-empty), `imloggedin` == `yes`; *(key)* `bb_lastvisit`, `bb_lastactivity`, `bb_language` |
+| `vbulletin` † | `/login.php`, `/register.php`, `/usercp.php`, `/private.php`, `/profile.php`, `/cron.php`, `/admincp/` | — | `userid`, `password` (suffix, non-empty), `imloggedin` == `yes`; *(key)* `bb_language` |
 
 † **Opt-in, like every preset.** These backends' dynamic surfaces are generic
 English paths (`/login`, `/register`, `/user`, `/admin`, `/session`) that an
