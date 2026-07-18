@@ -125,6 +125,8 @@ typedef struct {
 } ngx_http_cache_turbo_redis_op_t;
 
 /* --- verbatim from nginx src/core/ngx_string.h --- */
+#define ngx_strchr(s1, c)   strchr((const char *) s1, (int) c)
+
 static inline u_char *
 ngx_strlchr(u_char *p, u_char *last, u_char c)
 {
