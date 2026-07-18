@@ -1,5 +1,7 @@
 # Discourse + cache-turbo
 
+_Last researched: 2026-07-18_
+
 Caching a Discourse forum. **Start with the honest question:
 [do you actually want this?](#do-you-want-this)** Discourse already ships its own
 anonymous page cache and already sends correct `Cache-Control` — so this preset
@@ -12,6 +14,7 @@ little.
 - [Vhost](#vhost)
 - [Checking it works](#checking-it-works)
 - [Gotchas](#gotchas)
+- [Runtime settings / gotchas](#runtime-settings--gotchas)
 
 ## Do you want this?
 
@@ -50,13 +53,26 @@ cache_turbo_backend discourse;      # implies cache_turbo_cache_control honor
 |---|---|
 | URI prefixes | `/admin`, `/session`, `/auth/`, `/login`, `/logout`, `/signup`, `/my/`, `/message-bus/`, `/drafts`, `/presence/`, `/notifications`, `/user_actions` |
 | Query args | `api_key`, `api_username` |
-| Cookie substrings | `_t=` |
+| Cookie header substrings | `_t=` |
 
 **One cookie bypasses: `_t`.** That is Discourse's auth token
 (`lib/auth/default_current_user_provider.rb` — `TOKEN_COOKIE`). It is written
 only for an authenticated user and *deleted* for an anonymous one, and it is the
 exact test Discourse's own anon cache uses to decide a request is cacheable. If
-`_t` is present, someone is logged in.
+`_t` is present, someone is logged in. The literal shipped is `_t=`, with the
+delimiter: this tier substring-searches the whole `Cookie` header across names
+*and* values, so the trailing `=` is what anchors the match to the end of a cookie
+name instead of firing on any value containing `_t`.
+
+> **⚠️ `_t` is the default, not a hard literal — it is env-overridable.**
+> `TOKEN_COOKIE = ENV["DISCOURSE_TOKEN_COOKIE"] || "_t"`
+> (`lib/auth/default_current_user_provider.rb:39`). A deployment that sets
+> `DISCOURSE_TOKEN_COOKIE` makes this rule stop matching, and a lost match on a
+> bypass rule means logged-in pages get cached. If your install sets it, add
+> `cache_turbo_bypass $cookie_<your_name>;` **and**
+> `cache_turbo_no_store $cookie_<your_name>;` yourself. (The `honor`-mode
+> `no-store` Discourse sends on authenticated responses still covers you on a
+> stock config — but not if you run `cache_turbo_cache_control ignore`.)
 
 **`_forum_session` must NOT bypass, and this is the important half.** It is the
 Rails session cookie, and Rails hands one to *everybody* — every anonymous
@@ -73,8 +89,14 @@ how the page renders, but everyone who picked dark mode gets the *same* dark pag
 They belong in the **key**, not the bypass:
 
 ```nginx
-cache_turbo_key $uri$cookie_theme_ids$cookie_forced_color_mode;
+cache_turbo_key_cookie theme_ids forced_color_mode;
 ```
+
+Use `cache_turbo_key_cookie`, **not** a hand-written
+`cache_turbo_key $uri$cookie_theme_ids$cookie_forced_color_mode`. The directive
+folds each value in with a length prefix; a plain `$cookie_*` splice has no
+delimiter between the fields, so a visitor can pick a `theme_ids` value that
+reproduces another page's key and store their content under that URL.
 
 Bypassing on them would disable caching for every user who ever touched the theme
 picker. Keying on them shares the cache among everyone with the same choice, which
@@ -105,7 +127,10 @@ http {
             cache_turbo_backend       discourse;   # implies cache_control honor
 
             # Theme and colour mode are VARIANTS -- key on them, never bypass.
-            cache_turbo_key           $scheme$host$uri$is_args$args$cookie_theme_ids$cookie_forced_color_mode;
+            # cache_turbo_key_cookie length-prefixes each value; splicing the
+            # same cookies into a cache_turbo_key by hand does not, and an
+            # unframed splice is key-poisonable. See the note above.
+            cache_turbo_key_cookie    theme_ids forced_color_mode;
 
             cache_turbo_valid         60s;
             cache_turbo_valid         404 410 1m;
@@ -186,7 +211,9 @@ curl -sI -H 'Cookie: _forum_session=guestsess' \
   is a performance bug that looks like a safety measure.
 - **`_t` can be renamed.** It honours the `DISCOURSE_TOKEN_COOKIE` env var. Stock
   and official-Docker installs use `_t`; if yours was renamed, the preset's cookie
-  rule will not match and you must add your own `cache_turbo_bypass`.
+  rule will not match and you must add your own `cache_turbo_bypass` **and**
+  `cache_turbo_no_store` on that cookie — the bypass skips only the lookup, so
+  on its own the logged-in response is still stored.
 - **Every preset is opt-in.** `/login`, `/signup`, `/posts` are generic English
   paths a non-forum site legitimately serves as cacheable pages, so no preset is
   ever enabled implicitly. Name it.
@@ -200,6 +227,57 @@ curl -sI -H 'Cookie: _forum_session=guestsess' \
   authenticated by query arg, not cookie; the preset bypasses on both.
 - **`Set-Cookie` responses are never stored** and `Authorization` requests are
   never cached, regardless of preset.
+
+## Runtime settings / gotchas
+
+Discourse is a Ruby on Rails application (Ember.js frontend), not PHP — there is
+no `php.ini`, no FPM pool, no opcache to tune. The runtime knobs that matter for
+caching live in the Rails app server and in Discourse's own dependencies.
+
+- **Discourse's own anonymous cache makes this preset largely redundant.**
+  `Middleware::AnonymousCache` caches anonymous GETs in Redis and is on by
+  default in production (`Auth::DefaultCurrentUserProvider` decides who is
+  anonymous via `has_auth_cookie?`, the `_t` check). The origin is therefore
+  already fast for guests. An nginx page cache in front is a latency/capacity
+  win, not a correctness one — see [Do you want this?](#do-you-want-this). You
+  can disable Discourse's layer with `DISCOURSE_DISABLE_ANON_CACHE=1` (a non-empty
+  value) or the `anon_cache_store_threshold` site setting (default 2; `0`
+  disables), but only to measure your true miss cost — not as a normal
+  configuration.
+
+- **Two anon caches means two poisoning surfaces.** Discourse's own anon cache
+  has had a run of cache-poisoning CVEs where a crafted request header served a
+  poisoned response to later anonymous visitors
+  (e.g. CVE-2025-23023 and the XHR/header-based advisories). Stacking a second
+  full-page cache with a broad key re-opens the same class of bug at the edge:
+  keep the key tight (scheme, host, URI, and the theme/colour variants — nothing
+  attacker-controlled) and keep Discourse patched. The `_t` bypass is what keeps
+  logged-in responses out of the shared cache; if it is ever misconfigured
+  (renamed cookie, missing bypass) you leak one user's authenticated page to
+  everyone. This is the one failure mode worth testing on every deploy.
+
+- **`/message-bus/` must never be cached, and must not be buffered.** MessageBus
+  is Discourse's realtime transport (long-poll with chunked transfer encoding
+  over HTTP/1.1). It requires `proxy_http_version 1.1` and `proxy_buffering off`
+  on that location only — buffering it globally stalls every stream. The vhost
+  above already carves it out; keep it out of any `cache_turbo` scope.
+
+- **Unicorn is the default app server; worker count is bounded by RAM.** Discourse
+  runs Unicorn (master + N forked workers) under `bin/unicorn`, with the count set
+  by `UNICORN_WORKERS` (the official Docker image derives a default from CPU/RAM).
+  Each worker is a full copy-on-write Rails process — budget roughly a few hundred
+  MB resident per worker — so oversubscribing `UNICORN_WORKERS` on a small box
+  swaps rather than scales. Puma is available but remains opt-in/experimental;
+  the same "one process per worker, memory-bound" reasoning applies. None of this
+  changes the nginx config, but it explains why edge caching helps under a spike:
+  it keeps the fixed, RAM-limited worker pool from being the bottleneck.
+
+- **Redis and PostgreSQL are hard dependencies of Discourse itself.** Discourse's
+  anon cache, MessageBus backlog, Sidekiq job queue, and rate limits all live in
+  *Discourse's* Redis — entirely separate from anything cache-turbo does. Don't
+  point Discourse at a shared/evicting Redis to "save memory": eviction there
+  corrupts sessions and job state, and it will look like a cache bug at the edge
+  when it is not one.
 
 ## See also
 

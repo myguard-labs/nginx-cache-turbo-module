@@ -120,6 +120,16 @@
 #define NGX_HTTP_CACHE_TURBO_BACKEND_KIRBY        0x0800
 #define NGX_HTTP_CACHE_TURBO_BACKEND_SHOPWARE6    0x1000
 #define NGX_HTTP_CACHE_TURBO_BACKEND_TYPO3        0x2000
+#define NGX_HTTP_CACHE_TURBO_BACKEND_INVISION     0x4000
+#define NGX_HTTP_CACHE_TURBO_BACKEND_SMF          0x8000
+#define NGX_HTTP_CACHE_TURBO_BACKEND_VANILLA      0x10000
+#define NGX_HTTP_CACHE_TURBO_BACKEND_PUNBB        0x20000
+#define NGX_HTTP_CACHE_TURBO_BACKEND_PHORUM       0x40000
+#define NGX_HTTP_CACHE_TURBO_BACKEND_YABB         0x80000
+#define NGX_HTTP_CACHE_TURBO_BACKEND_MYBB         0x100000
+#define NGX_HTTP_CACHE_TURBO_BACKEND_VBULLETIN    0x200000
+/* NOTE: BACKEND_NONE below was moved from 0x8000 to 0x400000 to make room for
+ * the bits above (SMF used to collide with it) — see BACKEND_NONE comment. */
 
 /*
  * "cache_turbo_backend none;" — explicitly NO preset here.
@@ -140,7 +150,7 @@
  * asking for no CMS classification should not quietly change how the response's
  * Cache-Control is treated.
  */
-#define NGX_HTTP_CACHE_TURBO_BACKEND_NONE         0x8000
+#define NGX_HTTP_CACHE_TURBO_BACKEND_NONE         0x400000
 
 /* True when a REAL preset is active — i.e. at least one registry row is armed.
  * Use this, never a bare `backend_presets != 0`: the NONE sentinel is non-zero

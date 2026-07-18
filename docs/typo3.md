@@ -1,5 +1,7 @@
 # TYPO3 + cache-turbo
 
+_Last researched: 2026-07-18_
+
 Caching a TYPO3 (v11–v13) frontend. A lazy-session bypass preset — same shape
 as [kirby](kirby.md) — but with a real, **fails-unsafe** caveat that the kirby
 and wagtail presets do not have. Read the [one condition](#the-one-condition--and-why-it-is-not-safe)
@@ -12,6 +14,7 @@ section before you ship this.
 - [Vhost](#vhost)
 - [Checking it works](#checking-it-works)
 - [Gotchas](#gotchas)
+- [PHP settings / gotchas](#php-settings--gotchas)
 
 ## The short version
 
@@ -27,7 +30,7 @@ not enough on its own** — see below, this is not optional reading.
 
 | Check | Values |
 |---|---|
-| Cookie substrings | `fe_typo_user`, `be_typo_user` |
+| Cookie header substrings | `fe_typo_user`, `be_typo_user` |
 | URI prefixes | `/typo3` |
 | Query args | — |
 
@@ -69,11 +72,19 @@ rare. But:
 > UNSAFE on that one condition. Every other conditional preset in this
 > registry fails safe. This is the exception — treat it as such.**
 
-If you set `FE/cookieName`, you **must** add your own bypass:
+If you set `FE/cookieName`, you **must** add your own bypass **and** a matching
+`cache_turbo_no_store`:
 
 ```nginx
-cache_turbo_bypass $cookie_<your_cookie_name>;
+cache_turbo_bypass   $cookie_<your_cookie_name>;
+cache_turbo_no_store $cookie_<your_cookie_name>;   # bypass alone still STORES
 ```
+
+**Both lines, not just the first.** `cache_turbo_bypass` only skips the cache
+*lookup* — the logged-in response still goes through the store path and can be
+written under the shared key, where the next anonymous visitor gets it.
+`cache_turbo_no_store` is the half that prevents storing. A bypass on its own is
+not the remediation for the unsafe case above; the pair is.
 
 Verify which name your install actually uses before going live:
 
@@ -126,9 +137,12 @@ http {
         }
 
         # Only if you override FE/cookieName -- see "The one condition" above.
-        # location ~ \.php$ {
-        #     cache_turbo_bypass $cookie_your_renamed_cookie;
-        # }
+        # Add these two lines INSIDE the `~ \.php$` location above; do not add a
+        # second `~ \.php$` block. nginx takes the first regex location that
+        # matches, so a second one never runs.
+        #
+        #     cache_turbo_bypass   $cookie_your_renamed_cookie;
+        #     cache_turbo_no_store $cookie_your_renamed_cookie;
 
         location = /_cache {
             cache_turbo_admin on;
@@ -174,13 +188,19 @@ grep -r "cookieName" typo3conf/ config/ 2>/dev/null
 - **The renamed-cookie case is the whole risk on this page.** See
   [above](#the-one-condition--and-why-it-is-not-safe) — this preset fails
   unsafe, not safe, if `FE/cookieName` is overridden and you do not add your own
-  `cache_turbo_bypass`.
+  `cache_turbo_bypass` **plus** `cache_turbo_no_store` on the same cookie. The
+  bypass alone does not stop the logged-in response from being stored.
 - **`be_typo_user` guards preview/editor traffic on frontend URLs** — do not
   remove it from the preset thinking it only matters on `/typo3`. See
   [above](#be_typo_user-is-a-separate-risk-not-a-duplicate).
 - **`/typo3` has no trailing slash in the preset but matches on a path-segment
   boundary** — it matches `/typo3`, `/typo3/`, `/typo3/module/...` but not an
-  unrelated segment merely sharing the letters.
+  unrelated segment merely sharing the letters, such as `/typo3-migration`
+  (which caches normally). The rule is: the prefix is anchored at byte 0 of the
+  URI, and after it the URL must end or continue with `/` **or `.`** (so
+  `/typo3.php` matches too). Anchoring at byte 0 also means a TYPO3 installed
+  under a subdirectory gets no URI-rule coverage at all — see the note on
+  subdirectory installs in [frameworks.md](frameworks.md).
 - **Don't set `cache_turbo_cache_control ignore`.** It overrides the `honor`
   that `cache_turbo_backend` implies.
 - **`Set-Cookie` responses are never stored** and `Authorization` requests are
@@ -188,6 +208,68 @@ grep -r "cookieName" typo3conf/ config/ 2>/dev/null
   cookie-name risk above — they still catch the response that *sets* a renamed
   cookie for the first time, they just cannot catch a *subsequent* request that
   already carries it under a name the preset does not know.
+
+## PHP settings / gotchas
+
+TYPO3-specific tuning that affects what this preset sees. None of it changes the
+directives above — it changes what TYPO3 emits and how well the `honor` mode the
+preset already implies can do its job.
+
+- **`config.sendCacheHeaders = 1` is the recommended integration point.** With it
+  set, TYPO3 emits real reverse-proxy-friendly response headers for a fully
+  cacheable anonymous page — `Expires`, `ETag`, `Cache-Control: max-age=…`,
+  `Pragma: public` — and, for a non-cacheable response, `Cache-Control: private,
+  no-store`. Because `cache_turbo_backend typo3` implies
+  `cache_turbo_cache_control honor`, the preset reads those headers and does the
+  right thing without a second source of truth: it caches what TYPO3 declares
+  cacheable and bypasses what TYPO3 declares private. This is TYPO3's own
+  supported path for front-proxy caching, so lean on it rather than fighting it.
+- **`config.sendCacheHeadersForSharedCaches` (TYPO3 13.3+) is the proxy-aware
+  variant.** In `auto` mode TYPO3 detects a reverse proxy and switches the cacheable
+  header to `Cache-Control: max-age=0, s-maxage=86400` — `s-maxage` for the shared
+  cache (this layer), `max-age=0` for the browser. `honor` mode reads `s-maxage`,
+  so a page marked shared-cacheable is still stored here while browsers are told
+  not to hold it. `force` skips proxy detection for a same-host cache. (Introduced
+  in [Changelog 13.3, Feature #104914](https://docs.typo3.org/c/typo3/cms-core/main/en-us/Changelog/13.3/Feature-104914-UpdatedHTTPHeadersForFrontendRenderingAndNewTypoScriptSettingForProxies.html).)
+- **`fe_typo_user` is only set once a frontend session actually starts** — see
+  [The one condition](#the-one-condition--and-why-it-is-not-safe). An anonymous
+  reader carries no cookie, so anon traffic stays cacheable; this is the whole
+  reason the preset is worth shipping. Nothing to configure, but it is the
+  invariant the whole page rests on.
+- **A page containing a `USER_INT`/`COA_INT` object is not cacheable and TYPO3
+  says so — respect it.** These are TYPO3's non-cacheable content objects (login
+  forms, per-user greetings): the page's cached shell carries HTML-comment
+  placeholders that TYPO3 re-renders on every request. With `sendCacheHeaders`
+  on, such a page emits `no-store`, and `honor` mode will not store it. Do not
+  try to force-cache a page that TYPO3 refused to cache — you would freeze the
+  dynamic hole.
+- **`no_cache` / `config.no_cache`.** A `?no_cache=1` request (or `config.no_cache
+  = 1`) tells TYPO3 to neither read from nor write to its own page cache, and it
+  renders everything per request — a DoS surface. It also suppresses the cacheable
+  headers, so `honor` mode bypasses it correctly, but the upstream cost is still
+  paid. Set `$GLOBALS['TYPO3_CONF_VARS']['FE']['disableNoCacheParameter'] = true`
+  in production so a hostile query arg cannot strip caching wholesale.
+- **opcache: TYPO3 strongly recommends it** — keep `opcache.enable=1` with a
+  generous `opcache.memory_consumption` (128–256M) and
+  `opcache.max_accelerated_files` high enough for TYPO3 plus extensions
+  (`opcache.max_accelerated_files=16000`+). This is the upstream floor speed on
+  every MISS the nginx layer can't serve; on cache MISS it is what you fall back to.
+- **`memory_limit` for the Install Tool / Extension Manager.** Composer-mode
+  installs, the Install Tool, and extension (de)activation are the memory-hungry
+  operations, not steady-state frontend rendering; TYPO3 recommends at least
+  `memory_limit = 256M` (512M is safer for the backend/install paths). The cached
+  frontend never touches this.
+- **`max_execution_time` for the Scheduler and cache warm-up.** Long-running CLI
+  tasks (Scheduler, `cache:warmup`, reference-index updates) run outside
+  PHP-FPM's request timeout, but if you warm the cache over HTTP or run
+  long backend jobs, raise `max_execution_time` (240s+) for those FPM pools or
+  they die mid-run. Frontend requests should stay on a short timeout.
+- **TYPO3's own caches sit under this layer, not beside it.** `cache_pages` (the
+  page-content cache, in the DB by default) and everything under `typo3temp/` are
+  TYPO3's *internal* caches — the fast MISS path, not a replacement for this
+  cache. Point the core caches at Redis/Memcached for a faster MISS; the nginx
+  layer still owns the anonymous full-page HIT that never reaches PHP at all. The
+  two are complementary — do not disable one expecting the other to cover it.
 
 ## See also
 

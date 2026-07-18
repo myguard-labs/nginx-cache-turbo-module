@@ -12,10 +12,10 @@ One page per `cache_turbo_backend` preset:
 |---|---|---|
 | `wordpress` | [wordpress.md](wordpress.md) | ✅ yes (`wordpress_logged_in_*`) |
 | `woocommerce` | [woocommerce.md](woocommerce.md) | ✅ yes — **but must be stacked with `wordpress`** — plus `?wc-ajax=`, a cart fragment on *any* page URL |
-| `joomla` | [joomla.md](joomla.md) | ⚠️ **partial** (`joomla_remember_me_`) — a non-remember-me login is INVISIBLE (md5 session cookie); you must still add a `cache_turbo_bypass` |
+| `joomla` | [joomla.md](joomla.md) | ⚠️ **partial** (`joomla_remember_me_`) — a non-remember-me login is INVISIBLE (md5 session cookie); you must still add a `cache_turbo_bypass` **+ `cache_turbo_no_store`** |
 | `xenforo` | [xenforo.md](xenforo.md) | ⚠️ yes (`xf_session` + `xf_user` + `xf_session_admin`) — **stock XF has NO login-only cookie**; `xf_session` is guest-issued, so safety costs hit rate. Also bypasses `/api/` (REST, `XF-Api-Key` header) + `_xfToken`, and **value-keys** `xf_style_id`/`xf_style_variation`/`xf_language_id` |
 | `discourse` | [discourse.md](discourse.md) | ✅ yes (`_t`) — and the origin sends `no-store` anyway |
-| `phpbb` | [phpbb.md](phpbb.md) | ❌ **no** — you must add a `cache_turbo_bypass`, and it needs a *value* test |
+| `phpbb` | [phpbb.md](phpbb.md) | ❌ **no** — you must add a `cache_turbo_bypass` **+ `cache_turbo_no_store`**, and it needs a *value* test |
 | `drupal` | [drupal.md](drupal.md) | ✅ yes (`SESS`) — anon users DO get sessions, so the cookie rule is required; it over-matches `PHPSESSID` by design |
 | `mediawiki` | [mediawiki.md](mediawiki.md) | ✅ yes (`*Token`, `*_session`) — **no URI rules: `/index.php` is the article path on a stock wiki** |
 | `magento` | [magento.md](magento.md) | ✅ yes (`X-Magento-Vary`, value-keyed) — and the origin sends `no-store` on cart/checkout |
@@ -24,6 +24,14 @@ One page per `cache_turbo_backend` preset:
 | `wagtail` | [wagtail.md](wagtail.md) | ⚠️ yes (`sessionid`) — **but only while nothing writes the session for guests**; fails safe |
 | `kirby` | [kirby.md](kirby.md) | ⚠️ yes (`kirby_session`) — **but a `csrf()` form page cookies guests**; fails safe |
 | `typo3` | [typo3.md](typo3.md) | ⚠️ yes (`fe_typo_user`, `be_typo_user`) — **but the cookie name is admin-overridable via `FE/cookieName`**; fails **UNSAFE** |
+| `invision` | [invision.md](invision.md) | ✅ yes (`ips4_loggedIn`, vendor-documented for this exact purpose) — closed-source, vendor-attested not code-verified |
+| `smf` | [smf.md](smf.md) | ✅ yes (`SMFCookie`, presence-only) — guest-issued too; the ideal value predicate needs JSON/array decoding this engine doesn't do, so it costs hit rate instead |
+| `vanilla` | [vanilla.md](vanilla.md) | ✅ yes (`Vanilla`, presence-only) — **verify empirically on your install**, source could not be directly cited |
+| `punbb` | [punbb.md](punbb.md) | ✅ yes (`forum_cookie`/`punbb_cookie`, presence-only) — `forum_cookie` covers stock 1.4.x (incl. the installer's randomised suffix), `punbb_cookie` the legacy 1.2-era name; same engine limitation as `smf`, guest-issued too |
+| `phorum` | [phorum.md](phorum.md) | ✅ yes (fixed session-cookie constants) — never guest-issued, the clean case |
+| `yabb` | [yabb.md](yabb.md) | ✅ yes (`Y2Sess-`/`Y2User-`/`Y2Pass-` prefix) — per-install random suffix, but never guest-issued |
+| `mybb` | [mybb.md](mybb.md) | ✅ yes (`{prefix}user` suffix) — never guest-issued |
+| `vbulletin` | [vbulletin.md](vbulletin.md) | ✅ yes (`bb_userid`/`bb_password`/`bbimloggedin`) — closed-source, community-corroborated |
 
 ## Not an app — a framework? (Django, Laravel, Rails, …)
 
@@ -37,6 +45,38 @@ default that is safe before you do.
 
 If you run an *application* that is built on a framework — Discourse is Rails,
 Magento is Laminas/Zend — use that app's preset above, not that page.
+
+## WordPress caching-plugin interop
+
+These are **not** `cache_turbo_backend` presets — there's no new backend keyword
+here. Every site below still runs `cache_turbo_backend wordpress;` (or
+`wordpress woocommerce`) unchanged. The question these pages answer is narrower:
+*"I already run cache-turbo at the nginx layer AND one of these plugins at the WP
+layer — how do I configure the plugin so the two don't double-cache, fight over
+a purge, or leave a stale race?"* Each page ends in the same shape: disable the
+plugin's own HTML page-cache module (cache-turbo is faster and already at the
+front), keep the plugin's *other* features (minify, image opt, CDN, object
+cache) since those speed up the PHP origin cache-turbo falls through to on a
+MISS — genuinely complementary, not redundant.
+
+| Plugin | Guide | Own page-cache engine on stock nginx |
+|---|---|---|
+| LiteSpeed Cache | [litespeed-cache.md](litespeed-cache.md) | **dormant** — LSCache needs the LiteSpeed web server or its own nginx module; on vanilla nginx only minify/image-opt/CDN/object-cache remain active |
+| WP Rocket | [wp-rocket.md](wp-rocket.md) | PHP-level fallback only (no official nginx helper) — disable it |
+| WP Super Cache | [wp-super-cache.md](wp-super-cache.md) | Expert/mod_rewrite mode is Apache-only and inert; Simple/PHP mode works but should be turned off |
+| WP Fastest Cache | [wp-fastest-cache.md](wp-fastest-cache.md) | `advanced-cache.php` PHP-level cache — disable "Cache System", keep minify/CDN |
+| W3 Total Cache | [w3-total-cache.md](w3-total-cache.md) | disable the **Page Cache** module only — Object/Database Cache, Minify, CDN are separate and worth keeping; Redis-DB-separation gotcha if both point at the same instance |
+| SG Optimizer | [sg-optimizer.md](sg-optimizer.md) | Dynamic Caching is SiteGround-proxy-only — **inert off SiteGround hosting**, nothing to disable |
+| Hummingbird | [hummingbird.md](hummingbird.md) | PHP-level disk cache — disable Page Caching, keep Asset Optimization/CDN |
+| NitroPack | [nitropack.md](nitropack.md) | **not a local plugin at all** — an edge/CDN reverse proxy in FRONT of your nginx; cache-turbo still helps on NitroPack's MISS/bypass traffic reaching origin. Real-IP/XFF and dual-purge gotchas |
+| Cache Enabler | [cache-enabler.md](cache-enabler.md) | `advanced-cache.php` PHP-level cache — disable it, WebP conversion is independent |
+| Breeze | [breeze.md](breeze.md) | disk-based PHP cache; its Varnish toggle is Cloudways-proxy-only and inert off Cloudways |
+
+Membership/paywall plugins (MemberPress, Restrict Content Pro) and WooCommerce
+extensions adding cart-like state outside `/cart` are a different, still-open
+class — they add genuinely new private surfaces the `wordpress`/`woocommerce`
+presets' URI list can't see, not a caching-layer interop question. Not yet
+covered here.
 
 ## Every preset is opt-in
 
@@ -139,7 +179,8 @@ Four rows above are load-bearing:
   because this is a *bypass* rule, a lost match means a logged-in page gets
   **cached and served to strangers** — the opposite failure direction from
   `wagtail`/`kirby`. If you rename the cookie you must add your own
-  `cache_turbo_bypass` for it. `be_typo_user` (backend session) is matched too,
+  `cache_turbo_bypass` **and** `cache_turbo_no_store` for it — the bypass skips
+  only the lookup and still stores the logged-in response. `be_typo_user` (backend session) is matched too,
   independently — it catches an editor previewing the frontend, who carries no
   `fe_typo_user` at all. See [typo3.md](typo3.md).
 - **`mediawiki`'s dynamic surface is in the query args, not the path.** It
@@ -157,6 +198,14 @@ are all handed to *anonymous* visitors. Putting one in a bypass list drops most 
 your traffic out of the cache — a performance bug wearing the costume of a safety
 measure. **Check whether a cookie is set for a logged-out visitor before you
 bypass on it.**
+
+**How the cookie tier actually matches.** A preset's cookie literals are searched
+as plain substrings of the entire `Cookie` request header — names *and* values,
+undelimited — not looked up as cookie names. So a literal has to be distinctive
+enough that it cannot turn up as an arbitrary cookie *value*, which a visitor may
+control; a too-generic literal costs hit rate (bypass is the safe direction, so it
+is never a leak). This is a different tier from the value predicates (cookie
+name-suffix plus a value operator) and from `cache_turbo_key_cookie` (exact name).
 
 **A cookie name that isn't stable across installs cannot be a preset rule.**
 Joomla hashes it from the site secret; phpBB lets the admin set the prefix. Where
@@ -277,6 +326,78 @@ the site, even if they're not logged in"*). *Per-install*: Grav's session cookie
 is per-install *and* set for every guest. Grav is the painful one: flat-file traffic
 is the ideal shape for a page cache, and it still cannot be expressed.
 
+**NodeBB.** Its only session cookie, `express.sid` (config-renameable via
+`sessionKey`), is issued to every visitor — guest and member alike — with an
+opaque, session-store-backed value carrying no guest/member marker (auth state
+lives server-side against Redis/Mongo, not in the cookie). NodeBB's own GitHub
+issue #5418, filed by a community member asking for exactly a "logged in"
+cookie for this exact reverse-proxy-caching use case, confirms none exists and
+none has shipped. The Joomla shape: guest/member bit lives server-side, not in
+anything the proxy can read.
+
+**FluxBB.** The value trick that would normally separate guest from member
+(phpBB-style: leading pipe-delimited `user_id` field == `1` for guest) works in
+principle — but the cookie **name** itself (`$cookie_name`, default
+`pun_cookie`) is admin/install-configurable free text with no guaranteed fixed
+suffix analogous to phpBB's `_u`. This stacks the Joomla naming-instability
+trap on top of an otherwise-workable value trick: a preset keyed to the
+default literal name would silently stop matching (fail toward full-bypass,
+never a leak, but with no way for an operator to know protection lapsed) on
+any install where the name was customized.
+
+**miniBB.** Its one cookie, `miniBBforums`, is also issued to guests via the
+anonymous-posting-name feature with an empty password subfield — a phpBB-shape
+value split exists in principle, but requires parsing a subfield this module's
+cookie-value engine cannot express (same class of limitation as SMF/PunBB,
+except those two at least clear the presence-only fallback bar; miniBB's admin
+path is also query-arg dispatched with no stable URI-prefix surface to lean on
+as compensation). Rejected rather than shipped as a false-confidence partial.
+
+**Forem.** The session cookie name is a fully admin/env-configurable literal
+(`ApplicationConfig["SESSION_KEY"]`) with no derivable pattern at all — worse
+than Joomla's md5 hash, which is at least a fixed *shape*. The one fixed-name
+identity cookie, `forem_user_signed_in`, is only set by the cross-subforem SSO
+flow, not by an ordinary Devise login — so it misses the common case entirely
+(useless as a sole defensive signal, and not a leak risk only because it's
+inert for most logins). Devise's `remember_user_token` is real but opt-in
+(remember-me checkbox), which is the Flarum trap: an ordinary login with the
+box unticked is indistinguishable from a guest by any cookie. Rejected.
+
+**HumHub.** Yii2's `_identity` (autologin) cookie is only issued when
+`duration>0` — i.e. only when "remember me" was ticked. A plain login sets
+`duration=0`, so Yii issues only the PHP session cookie, which guests also
+receive via any session-touching request (CSRF token issuance, guest search).
+No documented second signal distinguishes a plain-login member from a guest.
+The Flarum trap, in a new skin: bypassing on `_identity` alone leaks every
+non-remember-me session; bypassing on the session cookie zeroes the hit rate.
+
+**Mastodon.** `_mastodon_session` (Rails `ActionDispatch::Session::CookieStore`)
+is issued to **every** visitor on **every** request, opaque and rotating, no
+guest/member marker (confirmed by mastodon/mastodon#10468 and #23843). The
+only persistent-login signal, Devise's `remember_user_token`, is opt-in
+(remember-me) — the Flarum trap again. Mastodon's own community nginx configs
+that do cache guest traffic bypass on **any** cookie presence at all
+(`map $http_cookie $skip_cache_cookie { default 1; "" 0; }`) plus `Authorization`
+— i.e. they don't solve this with a named-cookie rule either, they just accept
+the same near-zero-hit-rate floor this project rejects a preset for shipping.
+
+**Codoforum.** Closed-source core (no public repo; only third-party SSO
+bridges are public). Official docs name an unspecified `rememberMe()` cookie
+with no documented name, value, or behavior on an ordinary (non-remember-me)
+login — the Flarum trap, unverifiable. Compounded by CodeIgniter's default
+session cookie being guest-issued with no accessible source to check for a
+value predicate. No public source exists to establish either half of a safe
+rule, so this is rejected on evidentiary grounds as much as structural ones.
+
+**WoltLab Suite.** Fails on two independent axes at once. The cookie name
+carries a per-installation random hex hash (`wsc_<hash>_user_session`), so no
+fixed substring/suffix generalizes across installs — the Joomla naming
+problem. And even granting a stable name, WoltLab's own WSC 5.4+ migration
+docs describe the session cookie as an opaque signed string set identically
+for guests and members, with no documented value split (no phpBB-style `_u=1`
+analog) — so a value predicate isn't available either, even per-install.
+Closed-source PHP prevents independent verification of either claim.
+
 **The test to apply before asking for a new preset:** *what fraction of this app's
 requests are pages a logged-out stranger can see, that look the same for every
 logged-out stranger?* If the answer is "basically none", the app does not want a
@@ -298,8 +419,13 @@ Every one of these guides is an application of the same split:
 A **variant** (theme, language, device) changes how a page renders but the page is
 still shared by everyone who picked that variant — so it belongs in
 `cache_turbo_key`. An **identity** (who you're logged in as, what's in your
-basket) is shared with nobody — so it belongs in `cache_turbo_bypass`, which means
-the response is *never captured*.
+basket) is shared with nobody — so it belongs in `cache_turbo_bypass` **paired
+with `cache_turbo_no_store` on the same variable**. Both halves: the bypass skips
+the cache *lookup*, and `cache_turbo_no_store` is what stops the response being
+*captured*. A bypass on its own still stores that user's page under the shared
+key, where the next anonymous visitor can be served it. (`cache_turbo_bypass_uri`
+and the `cache_turbo_backend` presets skip storing too; only `cache_turbo_bypass`
+needs the partner directive.)
 
 Putting a session cookie in the **key** instead of the bypass is the classic
 mistake: it doesn't share anything (one entry per visitor, hit rate ≈ 0) *and* it
@@ -316,7 +442,9 @@ These hold regardless of preset, and are not configurable away:
 A preset *widens* the net for application-specific surfaces those floors miss (an
 admin URL with no cookie yet, a search query, a cart page). It does not replace
 them — and it is **not a security boundary for your own private routes**. A custom
-`/members/` area still needs its own `cache_turbo_bypass`.
+`/members/` area still needs its own `cache_turbo_bypass` **plus**
+`cache_turbo_no_store` (or a `cache_turbo_bypass_uri`, which skips storing on its
+own).
 
 ## See also
 

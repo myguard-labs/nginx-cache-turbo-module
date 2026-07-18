@@ -1,5 +1,7 @@
 # Wagtail + cache-turbo
 
+_Last researched: 2026-07-18_
+
 Caching a Wagtail (Django CMS) site. This is the first preset whose auth cookie
 belongs to the **framework**, not the app — Wagtail ships no cookie of its own and
 rides Django's `sessionid`.
@@ -15,6 +17,7 @@ specifically, you want [frameworks.md](frameworks.md).
 - [Vhost](#vhost)
 - [Checking it works](#checking-it-works)
 - [Gotchas](#gotchas)
+- [Runtime settings / gotchas](#runtime-settings--gotchas)
 
 ## The short version
 
@@ -27,7 +30,7 @@ cache_turbo_backend wagtail;     # implies cache_turbo_cache_control honor
 
 | Check | Values |
 |---|---|
-| Cookie substrings | `sessionid` |
+| Cookie header substrings | `sessionid` |
 | URI prefixes | `/admin/`, `/django-admin/`, `/documents/` |
 | Query args | — |
 
@@ -81,6 +84,26 @@ working — until the origin falls over.
 is *bypass a guest* (lost hits), never *serve a member's page to a stranger* (a
 leak). Compare Flarum, whose failure direction is the leak — which is why there is
 [no flarum preset](README.md#apps-we-deliberately-do-not-ship-a-preset-for).
+
+> **⚠️ Renaming the cookie is a *different* failure, and it fails UNSAFE.** The
+> name is Django's `SESSION_COOKIE_NAME` setting (`django/conf/global_settings.py`
+> — it defaults to `"sessionid"`, and it is a plain overridable default, not a
+> per-install hash). A site that sets it to anything else makes the preset's rule
+> **stop matching a logged-in visitor** — and a lost match on a bypass rule means
+> the *cache keeps working* while the *safety check* silently stops: a logged-in
+> page gets stored and served to strangers. That is the opposite direction from
+> the guest-session condition above, and the same class of hazard as
+> [typo3's `FE/cookieName`](typo3.md#the-one-condition--and-why-it-is-not-safe).
+> If you set `SESSION_COOKIE_NAME`, add both lines yourself:
+>
+> ```nginx
+> cache_turbo_bypass   $cookie_<your_cookie_name>;
+> cache_turbo_no_store $cookie_<your_cookie_name>;   # bypass alone still STORES
+> ```
+>
+> Also watch `SESSION_COOKIE_NAME` if you run several Django sites on one domain —
+> renaming it per site is the standard fix for cookie collisions, and it is the
+> most likely way a Wagtail install ends up here.
 
 Check with one command, and **re-run it after any deploy that touches sessions**:
 
@@ -183,8 +206,10 @@ curl -sI https://example.com/ | grep -i set-cookie      # must NOT set sessionid
   rate without touching nginx, and nobody will tell you. Put the `set-cookie` check
   in monitoring.
 - **Moving the admin is fine.** If you relocate `/admin/` to `/cms/`, add a
-  `cache_turbo_bypass` (or just rely on `sessionid`, which still catches every
-  authenticated request). You lose an optimisation, not a guarantee.
+  `cache_turbo_bypass` plus a matching `cache_turbo_no_store` — the bypass alone
+  skips only the lookup and still stores (or just rely on `sessionid`, which
+  still catches every authenticated request). You lose an optimisation, not a
+  guarantee.
 - **`/documents/` must stay bypassed.** If you switch `WAGTAILDOCS_SERVE_METHOD` to
   `direct` or `redirect`, documents are served by the storage backend and the
   privacy check moves — but the preset's bypass costs you nothing, so leave it.
@@ -196,6 +221,74 @@ curl -sI https://example.com/ | grep -i set-cookie      # must NOT set sessionid
   ever enabled implicitly. Name it.
 - **`Set-Cookie` responses are never stored** and `Authorization` requests are never
   cached, regardless of preset. Those floors hold.
+
+## Runtime settings / gotchas
+
+Wagtail is Django on Python — it runs under a WSGI/ASGI server, not PHP-FPM — so the
+operational levers are different from the PHP presets. These are Wagtail/Django-specific.
+
+- **`Vary: Cookie` is emitted the moment the session is *touched*.** Django's
+  `SessionMiddleware` adds `Vary: Cookie` to any response whose session was merely
+  *accessed*, not just written — and `@login_required`, reading `request.user`, and
+  Wagtail's own middleware all read the session, so most non-trivial views carry it.
+  `CsrfViewMiddleware` adds the same header whenever the `{% csrf_token %}` tag
+  renders. It is a keying instruction, **not** a `Cache-Control: private`; it does
+  not stop a store. **With `cache_turbo_auto_vary off` (the default) the module
+  ignores the response `Vary` and classifies the request per the preset's
+  `sessionid` bypass rule — which is exactly what you want here:** an anonymous
+  page carries no `sessionid`, so it is not bypassed and caches correctly
+  regardless of a stray `Vary: Cookie`. Do
+  **not** reflexively enable `cache_turbo_auto_vary` for a Wagtail origin — auto-Vary
+  treats `Vary: Cookie` as *uncacheable*, so turning it on would make every public
+  page that renders a form (a header search box is enough) stop caching entirely.
+  The cookie rule is the guard; leave Vary blind. (Verified: Django middleware +
+  CSRF docs.)
+- **`csrftoken` on GET pages is fine — keep it lazy, don't force it.** The preset
+  deliberately does not bypass on `csrftoken`, so a guest carrying it still HITs. The
+  risk is upstream: if the origin sets `csrftoken` (and the accompanying
+  `Vary: Cookie`) *unconditionally* on every GET, you forfeit the option to ever
+  enable auto-Vary and widen the cookie surface for no gain. Render the token only
+  where a form actually needs it rather than site-wide, and set
+  `CSRF_COOKIE_HTTPONLY = True` as defence-in-depth (it does not affect caching, but
+  keeps the cookie out of JavaScript). Avoid `CSRF_USE_SESSIONS = True`, which — per
+  the [condition table](#the-condition-and-how-to-check-it) — promotes every
+  form-viewing guest to a `sessionid` and zeroes the hit rate.
+- **`DEBUG = False` in production.** `DEBUG = True` changes response behaviour
+  (verbose error pages, different static handling) and is never what you want behind
+  a full-page cache. Confirm it before trusting any measurement.
+- **Tune the WSGI/ASGI worker pool, not FPM.** Wagtail serves through gunicorn (WSGI)
+  or uvicorn (ASGI), so concurrency is a gunicorn/uvicorn setting — roughly
+  `2 × cores + 1` sync workers as a starting point — and `--preload` lets workers
+  share the loaded application image, which trims memory and avoids each worker
+  cold-starting the ORM on a cache-stampede MISS. There is no `pm.max_children` here.
+- **`wagtail-cache` overlaps this module — pick one full-page cache.** The
+  third-party `wagtail-cache` package (CodeRed) is a *server-side* Django-cache page
+  cache: it refuses to cache logged-in responses or anything carrying
+  `Cache-Control: no-cache`/`private`, and emits its own `Cache-Control`. If you keep
+  it, cache-turbo's `honor` mode (which `cache_turbo_backend wagtail` already implies)
+  respects those headers — but running both is redundant double-caching. For an
+  nginx-fronted deployment, let cache-turbo own the full-page cache and drop
+  `wagtail-cache`; if you must keep it, do not set `cache_turbo_cache_control ignore`,
+  or you would override the very headers it relies on.
+- **Purge cache-turbo on publish with `wagtail.contrib.frontend_cache`.** Wagtail's
+  built-in front-end cache invalidator ships signal handlers that purge a reverse
+  proxy whenever a page is published or deleted. Its `HTTPBackend` sends an HTTP
+  `PURGE` request to the configured `LOCATION` — exactly the shape cache-turbo accepts
+  once you set `cache_turbo_purge on`. Point `LOCATION` at the nginx origin (a direct
+  connection, no intermediate proxy, per Wagtail's docs) and publishing a page drops
+  its entry from L1 (and L2):
+
+  ```python
+  WAGTAILFRONTENDCACHE = {
+      'default': {
+          'BACKEND':  'wagtail.contrib.frontend_cache.backends.HTTPBackend',
+          'LOCATION': 'http://127.0.0.1',
+      },
+  }
+  ```
+
+  The backend purges one URL per page by default; override `get_cached_paths()` on a
+  page model if a page resolves to several URLs.
 
 ## See also
 

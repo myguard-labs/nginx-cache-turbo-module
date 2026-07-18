@@ -1,5 +1,7 @@
 # XenForo + cache-turbo
 
+_Last researched: 2026-07-18_
+
 Full-page caching a XenForo (XF2) board: what to cache, what to bypass, what to
 put in the key, and a copy-paste vhost with the Redis L2 tier wired up.
 
@@ -14,6 +16,7 @@ put in the key, and a copy-paste vhost with the Redis L2 tier wired up.
 - [Purging on new posts](#purging-on-new-posts)
 - [Checking it works](#checking-it-works)
 - [Gotchas](#gotchas)
+- [PHP settings / gotchas](#php-settings--gotchas)
 
 ## The short version
 
@@ -91,9 +94,12 @@ dropping the broad `xf_session` rule:
 # ONLY do this if you actually run lscache-xf2 (or an add-on that sets an
 # equivalent login-only cookie). Without one, dropping xf_session re-opens the
 # leak described above.
-cache_turbo_backend none;
-cache_turbo_bypass  $cookie_xf_lscxf_logged_in $cookie_xf_user
-                    $cookie_xf_session_admin;
+cache_turbo_backend  none;
+cache_turbo_bypass   $cookie_xf_lscxf_logged_in $cookie_xf_user
+                     $cookie_xf_session_admin;
+# bypass alone still STORES — the no_store is what keeps the member's page out:
+cache_turbo_no_store $cookie_xf_lscxf_logged_in $cookie_xf_user
+                     $cookie_xf_session_admin;
 ```
 
 The same applies to any add-on of your own that sets a login-only cookie: XF gives
@@ -137,15 +143,32 @@ shared with anyone, ever.
 | `xf_session_admin` | **bypass** | admin-CP session — a **separate** cookie from `xf_session` (separate table, fixed 1h lifetime, path `/`). It is **not** redundant with `xf_session`: the two sessions expire independently, so an admin whose public session lapsed while the ACP session is live sends `xf_session_admin` **alone** on a public URL. Drop it and that admin's page gets cached and served to everyone. |
 | `xf_session` | **bypass** | issued to **guests too**, but it is the ONLY cookie an ordinary (non-remember-me) member carries — see the section above. Bypassing costs hit rate; it is the leak-free floor. |
 | `xf_style_id` | **cache key** (auto) | selected style on a **multi-style** board. Shared, not private. |
-| `xf_style_variation` | **cache key** (auto) | XF 2.3's light/dark **variation** within a style — a *different* cookie from `xf_style_id`, set client-side by JS when a visitor picks a scheme. A 2.3 board with dark mode enabled needs both keyed. |
+| `xf_style_variation` | **cache key** (auto) | XF 2.3's light/dark **variation** within a style — a *different* cookie from `xf_style_id`. It is set **server-side**: the picker POSTs the choice to XF's `misc/style-variation` controller, which writes the cookie via the PHP `Response::setCookie()` path (JS only sends the request). A 2.3 board with dark mode enabled needs both keyed. |
 | `xf_language_id` | **cache key** (auto) | selected language on a multi-language board. |
 | `xf_consent` | **ignore** (see note) | cookie-consent choice; guest-set. It *does* change embed HTML (a consent placeholder replaces a third-party embed until accepted), so it is a real variant — but the preset does **not** key on it, because that fragments the cache on every embed-bearing page. Add it yourself only if you must — see below. |
+| `xf_csrf` | **ignore** | CSRF cookie, paired with the `_xfToken` request param — both are required for CSRF validation (XF kept the token even after adding SameSite=Lax cookies, as defence in depth). It is **guest-acquired**, like `xf_session`: any form-bearing page (login, register, captcha) mints it, so it is **not** a login signal and matching it as one would be wrong. The preset bypasses the `_xfToken` *query arg*, not this cookie. |
+| `xf_tfa_trust` | **ignore** | two-step-verification "trust this device" cookie (persists ~45 days). Set only *after* a 2FA member ticks "trust this device", and it **survives logout** — so it is neither a reliable login nor a guest signal, and is deliberately not matched. Do not add it to `cache_turbo_bypass` as a login proxy: it would bypass a trusted-device guest for weeks while missing the members who never trusted a device. |
 
 The three `xf_style_*` / `xf_language_id` rows are marked **(auto)** because the
 `xenforo` preset now folds their **value** into the cache key for you (tier-3
 key-cookies, the same engine `magento` and `shopware6` use for their vary
 cookies). You do **not** need to name them in `cache_turbo_key` — the plain
 default key already varies on them.
+
+### The `xf_` prefix is configurable — check yours
+
+Unlike the `phpbb`, `drupal` and `invision` presets, which match a suffix, the
+`xenforo` preset matches these cookie names **as literals**, `xf_` prefix
+included. That prefix is not fixed: it is `$config['cookie']['prefix']` in
+`config.php`, default `'xf_'`, and XF concatenates it onto bare base names
+(`session`, `user`, `csrf`, …) when the cookie is written. An operator who has
+set a different prefix gets `myprefix_session` on the wire, **no bypass rule
+fires, and authenticated pages are stored and served to strangers** — the exact
+leak the `xf_session` section above exists to prevent. Confirm with
+`grep -A5 "'cookie'" /path/to/xenforo/src/config.php` before trusting the
+preset; if it was changed, add your own
+`cache_turbo_bypass` **plus** `cache_turbo_no_store` on the real names (the
+bypass alone still stores the member's page).
 
 This is the same split [LiteSpeed's XenForo cache
 plugin](https://docs.litespeedtech.com/lscache/lscxf/installation/) makes: its
@@ -404,7 +427,8 @@ on its own; add explicit bypasses for the auth surfaces:
 location ~ ^/forums/ {
     cache_turbo         ct;
     cache_turbo_backend xenforo;                # still catches the xf_user cookie
-    cache_turbo_bypass  $subdir_dynamic;        # ...and the shifted URIs
+    cache_turbo_bypass   $subdir_dynamic;       # ...and the shifted URIs
+    cache_turbo_no_store $subdir_dynamic;       # bypass alone still STORES
 }
 ```
 
@@ -516,8 +540,9 @@ traffic, and the hit ratio should be dominated by guest thread/forum views.
   `$config['cookie']['prefix'] = 'xf_'`. If you changed it, `xf_user` never
   matches and **logged-in pages become cacheable** — the one failure mode that
   actually leaks. Add `cache_turbo_bypass $cookie_<yourprefix>session
-  $cookie_<yourprefix>session_admin $cookie_<yourprefix>user;` to be safe, or
-  leave the prefix at its default. All three matter: `session` is the only
+  $cookie_<yourprefix>session_admin $cookie_<yourprefix>user;` **and the same
+  list on `cache_turbo_no_store`** (a bypass skips only the lookup and still
+  stores) to be safe, or leave the prefix at its default. All three matter: `session` is the only
   cookie an ordinary (non-remember-me) login carries, `session_admin` the admin
   session, and `user` remember-me. Bypassing `<yourprefix>user` alone leaves an
   ordinary or admin login cacheable — exactly the leak the preset prevents.
@@ -537,7 +562,9 @@ traffic, and the hit ratio should be dominated by guest thread/forum views.
   are already covered by the `/logout` and `/misc` URI rules.
 - **DigitalPoint Cloudflare app** users: it sets `<prefix>logged_in` (i.e.
   `xf_logged_in`) as its login signal instead of LiteSpeed's `xf_lscxf_logged_in`.
-  If you run it, add `cache_turbo_bypass $cookie_xf_logged_in;` and you can then
+  If you run it, add `cache_turbo_bypass $cookie_xf_logged_in;` plus
+  `cache_turbo_no_store $cookie_xf_logged_in;` (the bypass alone still stores)
+  and you can then
   drop `xf_session` the same way the LiteSpeed section describes.
 - **`/direct-messages` vs `/conversations`.** XF 2.3 renamed the DM route to
   `/direct-messages` and permanently redirects the old `/conversations` path. The
@@ -545,11 +572,76 @@ traffic, and the hit ratio should be dominated by guest thread/forum views.
   captured under a member's session either. Keep both even on a 2.3-only board.
 - **Add-ons add surfaces.** The preset covers stock XF2 routes. An add-on that
   ships its own member-only route (`/my-shop/orders`) needs its own
-  `cache_turbo_bypass` — the preset is a floor, not a security boundary.
+  `cache_turbo_bypass` **and** `cache_turbo_no_store` (or a
+  `cache_turbo_bypass_uri`, which does skip storing) — the preset is a floor,
+  not a security boundary.
 - **`Set-Cookie` responses are never stored** regardless of preset, and a request
   with an `Authorization` header is never cached. Those floors are unconditional.
 - **Two boards, one Redis.** Use distinct `prefix=` values, or `?all=1` on one
   purges the other.
+
+## PHP settings / gotchas
+
+XenForo-specific PHP/PHP-FPM knobs that interact with full-page caching. None of
+these are module directives — they live in `php.ini` / the FPM pool — but they
+change what the origin does behind the cache.
+
+- **XF runs its own cookie session, not PHP's.** XenForo does **not** use PHP
+  native sessions (`$_SESSION` / `PHPSESSID`); it stores session data in its own
+  table and hands the client the `xf_session` cookie. So `session.*` php.ini
+  tuning (`session.save_handler`, GC probability, `session.cookie_*`) is
+  irrelevant to what you cache — the cookie you key/bypass on is `xf_*`, never
+  `PHPSESSID`. It also means a guest can acquire an `xf_session` server-side
+  (logout, 2FA, captcha) without any PHP session ever existing; that is the
+  hit-rate trade documented above, not a PHP misconfiguration you can tune away.
+
+- **OPcache: on, and sized for XF's file count.** XenForo strongly recommends
+  the Zend OPcache (it is the single biggest origin win, and cache-turbo misses
+  plus every member request hit the origin). Two XF-specific traps:
+  - **File count.** A stock board plus a normal add-on set ships *thousands* of
+    PHP files. The default `opcache.max_accelerated_files` (~10 000, rounded up
+    to a prime like 16 229) can be exceeded, at which point OPcache starts
+    evicting and hit rate on the origin collapses. Raise it to a higher prime
+    (e.g. `opcache.max_accelerated_files=32531`) and give it room —
+    `opcache.memory_consumption=256` (MB) or more is a reasonable starting point
+    for XF with add-ons (community-reported; XF documents no exact figure, so
+    watch the ACP *Server environment* report / `opcache_get_status()` and size
+    to actual usage).
+  - **Timestamp validation.** XF calls `opcache_reset()` itself on add-on
+    install/upgrade — but that call is refused if `opcache.restrict_api` blocks
+    it, and if you run `opcache.validate_timestamps=0` (common for max
+    throughput) OPcache will **not** pick up changed XF/add-on files until you
+    reset it or reload FPM. After an upgrade or add-on change on such a box,
+    reload PHP-FPM as part of the deploy, then issue a cache-turbo `?all=1`
+    purge — stale opcode behind the cache otherwise gets frozen into cached HTML.
+
+- **`memory_limit` ≥ 128 MB, more with the image proxy / big add-on sets.**
+  XenForo's own floor is ~128 MB and it will refuse to run below it. Boards that
+  enable the **image proxy** or attachment thumbnailing (both decode images in
+  PHP), or carry large add-ons, routinely need 256 MB+. This only bites on
+  origin requests — i.e. cache-turbo misses and every member view — so a low
+  limit shows up as intermittent 500s on exactly the traffic the cache can't
+  absorb.
+
+- **Rebuild-caches jobs vs the FPM timeout.** The ACP *Rebuild caches* tools and
+  other long jobs call `set_time_limit(0)` in XF's `AbstractJob` to dodge
+  `max_execution_time` — but under PHP-FPM that does **not** override the pool's
+  `request_terminate_timeout`, so a big rebuild triggered from the ACP can still
+  be killed mid-run (and XF's `jobMaxRunTime` is not FPM-timeout aware). Run
+  large rebuilds from the CLI instead —
+  `php cmd.php xf:rebuild-caches` / `php cmd.php xf:run-jobs --max-execution-time 0`
+  — rather than raising the FPM timeout for the whole pool. Unrelated to the
+  page cache, but it is the XF admin task most likely to look like a caching
+  failure when it times out.
+
+- **XF has no built-in full-page cache — that is what this module is for.** XF's
+  own cache layer (registry / templates / phrases / permissions, and the
+  file-based `internal_data/code_cache/`) only makes the *origin* faster; it
+  never serves a whole rendered page to a guest without PHP running. cache-turbo
+  is the missing full-page tier. The two are complementary and separately
+  configured — see [XenForo's own object cache](#xenforos-own-object-cache-redis--a-different-thing)
+  above for the Redis DB/prefix separation that keeps a `?all=1` page-cache purge
+  from wiping XF's object cache.
 
 ## See also
 

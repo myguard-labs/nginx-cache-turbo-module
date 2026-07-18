@@ -1,5 +1,7 @@
 # WooCommerce + cache-turbo
 
+_Last researched: 2026-07-18_
+
 Caching a WooCommerce store. This is the highest-stakes preset in the set — a
 mis-cached cart or checkout page leaks one customer's basket (or address) to the
 next visitor. Read the [gotchas](#gotchas) before going live.
@@ -11,6 +13,7 @@ next visitor. Read the [gotchas](#gotchas) before going live.
 - [Vhost + Redis L2](#vhost--redis-l2)
 - [Checking it works](#checking-it-works)
 - [Gotchas](#gotchas)
+- [PHP settings / gotchas](#php-settings--gotchas)
 
 ## The short version
 
@@ -36,7 +39,7 @@ not a default. Both spellings are now a config error that names the replacement.
 |---|---|
 | URI prefixes | `/cart`, `/checkout`, `/my-account` |
 | Query args | `wc-ajax` |
-| Cookie substrings | `woocommerce_items_in_cart`, `woocommerce_cart_hash`, `wp_woocommerce_session_` |
+| Cookie header substrings | `woocommerce_items_in_cart`, `woocommerce_cart_hash`, `wp_woocommerce_session_` |
 
 Plus everything the `wordpress` preset skips, when stacked.
 
@@ -70,8 +73,9 @@ URIs only:
 ```nginx
 # ONLY if your theme renders no per-user state into shared pages.
 # Verify with a diff of the anonymous vs. basket-holding HTML before doing this.
-cache_turbo_backend wordpress;              # skip the woocommerce cookie bypass
-cache_turbo_bypass  $woo_dynamic;           # keep the URI bypass
+cache_turbo_backend  wordpress;              # skip the woocommerce cookie bypass
+cache_turbo_bypass   $woo_dynamic;           # keep the URI bypass
+cache_turbo_no_store $woo_dynamic;           # bypass alone still STORES
 ```
 
 with, in `http`:
@@ -95,6 +99,20 @@ load_module modules/ngx_http_cache_turbo_module.so;
 http {
     cache_turbo_zone name=ct 256m;
 
+    # $cookie_NAME is an EXACT-name lookup, and WordPress suffixes its cookie
+    # names with an md5 of the site URL. $cookie_wordpress_logged_in_ is
+    # therefore ALWAYS empty -- match the prefix out of the raw Cookie header
+    # instead.
+    map $http_cookie $wp_logged_in {
+        default                                        0;
+        "~*(^|;\s*)wordpress_logged_in_[0-9a-f]{32}="   1;
+    }
+
+    map $http_cookie $wc_session {
+        default                                          0;
+        "~*(^|;\s*)wp_woocommerce_session_[0-9a-f]{32}=" 1;
+    }
+
     server {
         listen 443 ssl http2;
         server_name shop.example.com;
@@ -115,8 +133,8 @@ http {
 
             # Belt and braces on top of the preset: three independent floors.
             cache_turbo_no_store      $cookie_woocommerce_items_in_cart;
-            cache_turbo_no_store      $cookie_wp_woocommerce_session_;
-            cache_turbo_no_store      $cookie_wordpress_logged_in_;
+            cache_turbo_no_store      $wc_session;
+            cache_turbo_no_store      $wp_logged_in;
 
             include                   fastcgi_params;
             fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
@@ -196,7 +214,8 @@ about to be wrong for somebody.
   is a boundary.
 - **A store on a subdirectory or a translated store** shifts these URIs
   (`/fr/panier`), and the preset will not match them. Add a `map`-driven
-  `cache_turbo_bypass` for the translated paths; the *cookie* half of the preset
+  `cache_turbo_bypass` — plus a matching `cache_turbo_no_store`, since the
+  bypass only skips the lookup — for the translated paths; the *cookie* half of the preset
   is path-independent and keeps protecting you regardless.
 - **Cart fragments — the preset now covers this, and it is the reason the arg rule
   exists.** WooCommerce refreshes the cart widget over AJAX, and its endpoints have
@@ -213,6 +232,70 @@ about to be wrong for somebody.
   will not save you.
 - **`Set-Cookie` responses are never stored** regardless of preset — Woo sets
   cookies liberally, which is a large part of why store hit rates look low.
+
+## PHP settings / gotchas
+
+These are WooCommerce-specific PHP/PHP-FPM concerns that sit alongside the cache
+config — none of them change the directives above, but each one bites a store in
+a way it does not bite a plain WordPress blog.
+
+- **`wp_woocommerce_session_*` is not a PHP native session.** WooCommerce stores
+  its cart/customer session in the database (the `wp_woocommerce_sessions` table)
+  or in the object cache when one is present — it does *not* use `$_SESSION` or
+  the PHP `session.*` machinery. That means there is no `session.save_path` /
+  `session.gc` tuning to do here, and it is why the session survives across
+  PHP-FPM workers. What matters for the page cache is unchanged: the
+  `wp_woocommerce_session_*` cookie is a **per-user** cookie and must bypass the
+  page cache exactly like a login cookie — the preset already skips on the
+  `wp_woocommerce_session_` substring, and the `cache_turbo_no_store $wc_session`
+  floor in the vhost above is the belt to that braces. Note that floor has to go
+  through the `$wc_session` **map** — the cookie's wire name is
+  `wp_woocommerce_session_<md5>`, and nginx's `$cookie_NAME` is an exact-name
+  lookup, so a bare `$cookie_wp_woocommerce_session_` is always empty and buys
+  you nothing. Do not be tempted to treat it as "just a WordPress cookie".
+
+- **OPcache file-count ceiling.** WooCommerce core alone is thousands of PHP
+  files, and a real store stacks a dozen or more extensions on top; the total
+  easily exceeds the stock `opcache.max_accelerated_files` (default 10000). Once
+  the interned-file table fills, OPcache silently evicts and recompiles on almost
+  every request, and PHP-FPM CPU climbs for no visible reason. Raise
+  `opcache.max_accelerated_files` (a prime above your real file count — e.g.
+  `50021`) and give `opcache.memory_consumption` room (256M+) to match. This is
+  a WooCommerce problem specifically because of the extension file count, not a
+  generic PHP tweak.
+
+- **`memory_limit` for large catalogs.** A big product catalog, variable products
+  with many variations, and the WooCommerce admin's product/order list tables push
+  peak memory well past a blog's needs. WooCommerce's own baseline recommendation
+  is 256M (`WP_MEMORY_LIMIT`), and imports/exports want more. An under-set
+  `memory_limit` shows up as white-screen fatals on the shop/admin side, not as a
+  cache miss — the page cache will happily serve the last good copy while the
+  origin is broken, which can mask the problem.
+
+- **`max_execution_time` for bulk admin actions.** Bulk product edits, order-status
+  batch actions, and CSV product import/export can run long. These are `/wp-admin/`
+  and REST/CLI surfaces — never cached — so this does not touch the preset, but a
+  store that times out mid-bulk-action on the default 30s is a WooCommerce-specific
+  failure worth raising (or better, run imports over WP-CLI where the CLI SAPI has
+  no time limit).
+
+- **HPOS (High-Performance Order Storage) has no page-cache impact — note it
+  anyway.** HPOS moves orders out of `wp_posts`/`wp_postmeta` into dedicated
+  `wc_orders*` tables. It changes nothing about which URLs or cookies are
+  cacheable — orders live behind `/my-account` and `/checkout`, which are already
+  bypassed — so no directive changes when you enable it. It is called out here
+  only so nobody goes hunting for a cache implication that does not exist.
+
+- **Action Scheduler cron load.** WooCommerce schedules a large amount of
+  background work (emails, webhooks, subscription renewals, cleanup) through
+  Action Scheduler, which drains its queue via WP-Cron on front-end requests by
+  default. On a store with default WP-Cron, that queue runs inside a normal
+  page load and competes with PHP-FPM workers serving shoppers. Because the page
+  cache absorbs most anonymous front-end hits, WP-Cron can fire *less* often (fewer
+  uncached PHP hits to piggyback on), letting the queue back up. Move Action
+  Scheduler to a real system cron (`DISABLE_WP_CRON` + a `wp cron event run`
+  / `wp action-scheduler run` invocation) so queue drain does not depend on cache
+  misses — this is the standard WooCommerce-under-full-page-cache pairing.
 
 ## See also
 

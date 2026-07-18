@@ -1,5 +1,7 @@
 # MediaWiki + cache-turbo
 
+_Last researched: 2026-07-18_
+
 Caching a MediaWiki site. MediaWiki is the odd one out among these presets: its
 dynamic surface is in the **query args**, not the path, and its cookie names have
 no stable prefix. Both facts shape the preset, and one of them
@@ -12,6 +14,7 @@ no stable prefix. Both facts shape the preset, and one of them
 - [Vhost + Redis L2](#vhost--redis-l2)
 - [Checking it works](#checking-it-works)
 - [Gotchas](#gotchas)
+- [PHP settings / gotchas](#php-settings--gotchas)
 
 ## The short version
 
@@ -31,7 +34,7 @@ of the same job.
 |---|---|
 | URI prefixes | **none** — see below |
 | Query args | `veaction`, `returnto` |
-| Cookie substrings | `Token=`, `_session=`, `UserID=` |
+| Cookie header substrings | `Token=`, `_session=`, `UserID=` |
 
 MediaWiki's cookies are `<prefix>UserID`, `<prefix>UserName`, `<prefix>Token` and
 `<prefix>_session`, where `<prefix>` is `$wgCookiePrefix` — which **defaults to
@@ -40,7 +43,10 @@ cookies are `mywikiUserID`, `mywikiUserName`, and so on.
 
 That means there is no shippable *prefix* — but unlike Joomla and phpBB, there is
 a shippable **suffix**. The tails are distinctive enough to match on, whatever your
-`$wgCookiePrefix` is. No configuration needed.
+`$wgCookiePrefix` is. No configuration needed. The trailing `=` in each literal is
+load-bearing: this tier searches the whole `Cookie` header raw and undelimited
+across names *and* values, so the `=` is what keeps `Token=` anchored to the end of
+a cookie *name* rather than firing on any value that merely contains `Token`.
 
 **Match what upstream matches.** MediaWiki's own `getVaryCookies()` says it in one
 line:
@@ -133,12 +139,16 @@ are among the most cacheable and most requested URLs on a busy wiki. That's a
 measurable hit-rate loss in exchange for nothing, because the genuinely dynamic
 `action=` values are already covered by MediaWiki's own `Cache-Control: private`.
 
-If you want `printable=` to be a proper variant rather than a separate entry per
-URL, fold it into the key:
+`printable=` needs no special handling to become a proper variant: the module's
+**default** key is built from the validated `Host` plus `unparsed_uri` — the
+original request line, query string included — so `?printable=yes` already splits
+into its own entry.
 
-```nginx
-cache_turbo_key $uri$is_args$args;   # args already in the key -> printable= splits naturally
-```
+Do **not** hand-write `cache_turbo_key $uri$is_args$args` here. It is not just
+redundant, it is actively wrong on a pretty-URL wiki: the `/wiki/` location
+rewrites to `/index.php` before the module runs, so `$uri` is `/index.php` for
+every article and the whole wiki collapses onto a single cache entry. Leave the
+key alone unless you are adding something the default does not carry.
 
 ## Vhost
 
@@ -158,12 +168,24 @@ http {
         location /wiki/ {
             cache_turbo         ct;
             cache_turbo_backend mediawiki;   # implies cache_control honor
-            cache_turbo_key     $uri$is_args$args;
+            # No cache_turbo_key: the default (host + unparsed_uri) is the only
+            # correct one here. After the rewrite below $uri is /index.php for
+            # EVERY article, so a $uri-derived key collapses the whole wiki onto
+            # one entry.
             cache_turbo_valid   300s;        # wikis tolerate a longer TTL
             cache_turbo_valid   404 410 1m;
             cache_turbo_preset  balanced;
 
-            rewrite ^/wiki/(?<pagename>.*)$ /index.php;
+            # `break` keeps the request in THIS location. Without it the rewrite
+            # triggers a fresh location search and every directive above is
+            # silently discarded in favour of the `\.php$` block.
+            #
+            # The captured title MUST be forwarded as `title=`. A bare
+            # `rewrite ... /index.php break;` throws the page name away and
+            # MediaWiki renders the Main Page for every article -- which the
+            # cache then happily stores under each article's own URL, since the
+            # key is built from the original request line.
+            rewrite ^/wiki/(?<pagename>.*)$ /index.php?title=$pagename&$args break;
             include        fastcgi_params;
             fastcgi_param  SCRIPT_FILENAME $document_root/index.php;
             fastcgi_pass   unix:/run/php/php-fpm.sock;
@@ -172,7 +194,6 @@ http {
         location ~ \.php$ {
             cache_turbo         ct;
             cache_turbo_backend mediawiki;
-            cache_turbo_key     $uri$is_args$args;
             cache_turbo_valid   60s;
 
             include        fastcgi_params;
@@ -184,7 +205,6 @@ http {
         # string -- long-lived and safe to cache hard.
         location = /load.php {
             cache_turbo         ct;
-            cache_turbo_key     $uri$is_args$args;
             cache_turbo_valid   1h;
 
             include        fastcgi_params;
@@ -199,8 +219,15 @@ http {
         }
 
         # Deleted/private images are permission-checked -- never cache.
+        # `^~` outranks the `~ \.php$` regex, so this block must repeat the
+        # FastCGI wiring itself. Without it nginx falls back to the static
+        # handler and serves the raw PHP source.
         location ^~ /img_auth.php {
             cache_turbo off;
+
+            include        fastcgi_params;
+            fastcgi_param  SCRIPT_FILENAME $document_root/img_auth.php;
+            fastcgi_pass   unix:/run/php/php-fpm.sock;
         }
 
         location = /_cache {
@@ -277,6 +304,14 @@ curl -sI -H 'Cookie: mywikiUserID=42' https://wiki.example.com/wiki/Main_Page \
   `$wgCookiePrefix` to something that changes those *suffixes* (you can't, via
   that setting alone) or you run a wiki farm with a shared login domain, check the
   actual cookie names before trusting the preset.
+- **SUL / CentralAuth wikis are covered — but verify.** On a CentralAuth (Single
+  User Login) farm the shared cookies are `centralauth_User`, `centralauth_Token`
+  and `centralauth_Session`. `centralauth_Token` carries the substring `Token=`,
+  so the preset already bypasses a globally-logged-in reader on that alone.
+  `centralauth_Session` is capital-`S` and does **not** match the `_session=`
+  substring, which is fine — the token is the real authn determiner and is matched.
+  Still confirm your actual cookie names if you customise the CentralAuth cookie
+  prefix.
 - **Don't add a blanket `action=` bypass.** `action=raw`, `action=history`,
   `diff=` and `oldid=` are deterministic, shared, and hot. Bypassing them is a
   real hit-rate loss and buys nothing — the dynamic `action=` values are already
@@ -291,10 +326,63 @@ curl -sI -H 'Cookie: mywikiUserID=42' https://wiki.example.com/wiki/Main_Page \
 - **`Special:` pages are not path-matchable.** They share the `/wiki/` prefix with
   articles, and the namespace is localised on non-English wikis. Most are
   uncacheable anyway via `Cache-Control`; if you have a specific one to protect,
-  give it its own `cache_turbo_bypass`.
+  give it its own `cache_turbo_bypass` **and** `cache_turbo_no_store` — a bypass
+  skips only the lookup, so on its own the protected page is still stored.
 - **`img_auth.php`** serves permission-checked files. Never cache it.
 - **`Set-Cookie` responses are never stored** and `Authorization` requests are
   never cached, regardless of preset.
+
+## PHP settings / gotchas
+
+MediaWiki-specific only. The generic PHP-FPM tuning lives elsewhere; these are the
+knobs that change how the wiki interacts with cache-turbo.
+
+- **Built-in CDN support (`$wgUseCdn` + `$wgCdnServers`).** MediaWiki has its own
+  reverse-proxy mode. `$wgUseCdn` (default `false`; renamed from `$wgUseSquid` in
+  1.34, old name removed in 1.35) makes MediaWiki emit `Cache-Control: s-maxage=<n>`
+  on **anonymous** page views — with ESI configured it uses `Surrogate-Control`
+  instead. The value is capped by `$wgCdnMaxAge` (default `18000` = 5h) and is
+  *dynamic*: it shrinks as the page ages, so a freshly-edited page gets a short
+  s-maxage and an old one the full cap. Because `cache_turbo_backend mediawiki`
+  implies `cache_turbo_cache_control honor`, the module will **respect that
+  s-maxage** as the store TTL for anonymous responses — turning on `$wgUseCdn` is
+  the origin-side way to control cache-turbo's freshness per page instead of the
+  flat `cache_turbo_valid`. `$wgCdnServersNoPurge` lists proxy IP ranges MediaWiki
+  should trust for `X-Forwarded-For` but not purge.
+- **Sessions belong in the object cache, not files** (`$wgSessionCacheType`).
+  Since 1.27 MediaWiki keeps PHP sessions in its object cache; `$wgSessionCacheType`
+  inherits `$wgMainCacheType` unless set. Point it at Redis/Memcached (not the
+  default file handler) so a multi-worker or multi-host front end shares session
+  state — the cookie names cache-turbo matches (`_session=`, `Token=`) are the
+  same regardless, but a file-backed session store will not survive behind more
+  than one PHP host.
+- **Parser cache (`$wgParserCacheType`).** The rendered-HTML-of-wikitext cache is a
+  *distinct* layer that MediaWiki consults inside PHP before cache-turbo ever sees
+  the response; it falls back to `$wgMainCacheType`. Leave it on — it is what makes
+  a cache-turbo MISS cheap. It is not the same thing as the full-page cache and
+  purging one does not purge the other.
+- **opcache is not optional.** MediaWiki strongly recommends PHP opcache
+  (`opcache.enable=1`). The codebase is large — give it headroom
+  (`opcache.memory_consumption` 128–256M, `opcache.interned_strings_buffer` 16+,
+  a generous `opcache.max_accelerated_files`). Without it every MISS re-compiles
+  thousands of PHP files and the origin is slow enough that the cache masks a
+  problem rather than an optimisation.
+- **`memory_limit` for parsing and thumbnails.** Large articles, big templates, and
+  on-the-fly thumbnail generation (GD/ImageMagick) are memory-hungry; a stock 128M
+  is tight for a busy wiki — 256M+ is common. Shell-outs for image work are
+  separately bounded by `$wgMaxShellMemory`. A MISS that OOMs stores nothing useful.
+- **`max_execution_time` for maintenance/jobs.** CLI maintenance scripts
+  (`refreshLinks.php`, `runJobs.php`, `rebuildall`) run without a web time limit,
+  but web-triggered work — the job queue drained per request at `$wgJobRunRate`, or
+  a `?action=purge` — is bounded by `max_execution_time`. Keep heavy refreshes on
+  the CLI/cron path so they do not stall a request the front end is caching.
+- **MediaWiki, not cache-turbo, is the purger.** With `$wgUseCdn` on, MediaWiki
+  sends an HTTP `PURGE` to every host in `$wgCdnServers` when a page changes
+  (sending purges needs the PHP `sockets` extension). Point `$wgCdnServers` at this
+  nginx and cache-turbo's `PURGE` handler invalidates the article on edit instead
+  of waiting out the TTL — see [Vhost + Redis L2](#vhost--redis-l2). The only thing
+  cache-turbo has to provide is a reachable, locked-down `cache_turbo_admin`
+  location; MediaWiki drives the invalidation.
 
 ## See also
 

@@ -1,11 +1,14 @@
 # Magento 2 + cache-turbo
 
+_Last researched: 2026-07-18_
+
 Caching a Magento 2 (2.4.x) store. Magento is the **best-behaved application in
 this set** — it is *architecturally designed* to sit behind a shared cache, it
 ships its own reference Varnish VCL, and it tells you what is cacheable in-band
-via `Cache-Control`. This preset **is** that VCL, translated, with no deviation:
-it value-keys the one cookie Magento's own VCL keys on, exactly the way upstream
-does.
+via `Cache-Control`. This preset **is** that VCL, translated, with **one
+deliberate and important deviation** ([GraphQL](#gotchas)): it value-keys the one
+cookie Magento's own VCL keys on, exactly the way upstream does, but it *bypasses*
+`/graphql` where the VCL *caches* it.
 
 - [The short version](#the-short-version)
 - [Why this can replace Varnish](#why-this-can-replace-varnish)
@@ -190,6 +193,16 @@ http {
 
     upstream fastcgi_backend { server unix:/run/php/php-fpm.sock; }
 
+    # The preset's URI rules match $uri, which try_files has already rewritten
+    # to /index.php by the time the module runs, so the preset's uris[] can
+    # never fire on a Magento vhost. Gate the private surfaces on $request_uri
+    # instead -- the ORIGINAL request line, which an internal redirect does not
+    # touch -- and apply the result inside the .php location below.
+    map $request_uri $magento_private {
+        default                                          0;
+        "~^/(checkout|customer|sales|wishlist)([/?]|$)"   1;
+    }
+
     server {
         listen 443 ssl http2;
         server_name shop.example.com;
@@ -205,10 +218,26 @@ http {
             cache_turbo_backend       magento;   # implies cache_control honor
                                                   # and value-keys X-Magento-Vary
 
-            cache_turbo_key           $scheme$host$uri$is_args$args;
+            # NO cache_turbo_key here. try_files has rewritten $uri to
+            # /index.php, so any key built from $uri collapses the WHOLE
+            # storefront onto one entry. The module default keys on
+            # unparsed_uri (the original request line) and is correct.
             cache_turbo_valid         300s;      # catalog tolerates a long TTL
             cache_turbo_valid         404 410 1m;
             cache_turbo_preset        balanced;
+
+            # Cart / account / order / wishlist: never serve from cache, and
+            # never store either. Both directives are required -- bypass alone
+            # still stores, which would write a logged-in customer's page into
+            # the zone under the original URL.
+            #
+            # Do NOT try to do this with `location ^~ /checkout { cache_turbo
+            # off; }` instead. try_files internally redirects to /index.php,
+            # nginx then re-runs the location search, and THIS block's config is
+            # what governs the response -- the `cache_turbo off` set in the
+            # /checkout block is discarded before the module ever runs.
+            cache_turbo_bypass        $magento_private;
+            cache_turbo_no_store      $magento_private;
 
             fastcgi_pass   fastcgi_backend;
             fastcgi_param  PHP_FLAG "session.auto_start=off";
@@ -324,6 +353,20 @@ Note the module never stores `HEAD` responses, so a `curl -sI` HEAD request can
   traffic this is worth more hit rate than every bypass rule combined — use
   `cache_turbo_normalize_args` / `$cache_turbo_normalized_args` (see the
   [main README](../README.md#the-cache-key)).
+- **`/graphql` is bypassed here, and this is the one place the preset deviates
+  from Magento's VCL.** Upstream *caches* GraphQL: `varnish7.vcl` passes only an
+  authenticated request that carries no cache id (`req.url ~ "/graphql" &&
+  !req.http.X-Magento-Cache-Id && req.http.Authorization ~ "^Bearer"`), and
+  otherwise hashes the query on **request headers** —
+  `X-Magento-Cache-Id`, an `Authorized` marker, `Store` and `Content-Currency`
+  (`sub process_graphql_headers`). cache-turbo keys on the request line and on
+  cookie *values*, not on arbitrary request headers, so it cannot reproduce that
+  key; bypassing the whole endpoint is the correct-but-conservative equivalent.
+  If you serve heavy GraphQL read traffic and want it cached, do it explicitly
+  in its own `location /graphql` with `cache_turbo_key` plus
+  `cache_turbo_require_header` (see the
+  [main README](../README.md#letting-the-origin-decide-cache_turbo_require_header)) —
+  not by removing this rule.
 - **`/cart` and `/onepage` are not Magento routes.** The real paths are
   `/checkout/cart` and `/checkout/onepage/*`, both covered by `/checkout`. A
   `/cart` prefix would match nothing on a stock install — and could false-positive
@@ -335,6 +378,69 @@ Note the module never stores `HEAD` responses, so a `curl -sI` HEAD request can
 - **`Set-Cookie` responses are never stored** and `Authorization` requests are
   never cached, regardless of preset. This is also what protects the
   vary-transition race above — see [The transition race](#the-transition-race).
+
+## PHP settings / gotchas
+
+These are Magento-specific PHP-side facts that decide whether the preset in front
+of it is correct and fast. Everything below is verified against Adobe's own docs
+and `magento/magento2`; a couple of tuning numbers vary by source and are marked.
+
+- **`X-Magento-Vary` MUST be a cache-key component — this is the correctness
+  lynchpin.** Magento hands the same anonymous HTML to every default-context
+  visitor, and it segments everything else *only* through this cookie:
+  `Framework\App\Http\Context::getVaryString()` returns
+  `hash('sha256', $this->serializer->serialize($data) . '|' . $salt)` over the
+  `ksort()`ed context tuple — the serializer is Magento's
+  `Serialize\Serializer\Json` (the constructor default), **not** PHP's
+  `serialize()`, so the hashed bytes are JSON — over
+  (customer group, login flag, store, currency) with default-valued fields dropped
+  — so an all-default visitor gets `null` and no cookie, and any other segment gets
+  a distinct hash. If a cache does not fold that value into its key, a wholesale
+  customer, a EUR guest and a logged-in retail shopper collapse into one bucket and
+  cross-contaminate. The preset already value-keys it (see
+  [above](#x-magento-vary-value-keyed-not-bypassed)); do not defeat that.
+- **Magento's FPC is built for Varnish, and it ships the VCL.** Full Page Cache is
+  designed around a Varnish-style reverse proxy: Magento emits `X-Magento-Vary` plus
+  `Cache-Control`/`Surrogate-Control` and generates a store-specific `varnish6.vcl`
+  (`bin/magento varnish:vcl:generate`). The built-in PHP FPC exists as a fallback but
+  still pays a full PHP bootstrap per hit. cache-turbo replaces the Varnish tier by
+  replicating that VCL's key/pass logic — which is only safe because the *page* stays
+  cacheable while all per-user state loads out-of-band.
+- **Private content keeps the page cacheable.** Cart, customer name, messages and the
+  like are never in the cached HTML — they are fetched after load by the customer-data
+  JS from `/customer/section/load/` (driven by each module's `sections.xml`). That is
+  what lets an anonymous catalog page be genuinely shared. Never route
+  `/customer/section/load/` through the cache; it is covered by the `/customer` prefix
+  in the preset.
+- **OpCache is effectively required, and must be sized for Magento's file count.**
+  Adobe requires `opcache.save_comments=1` — Magento uses code comments/annotations
+  for DI code generation, and turning it off breaks compilation. Recommended
+  production values: `opcache.memory_consumption=512`,
+  `opcache.max_accelerated_files=60000` (Adobe's tested figure; large stores with many
+  extensions are commonly tuned higher — 100000–130000 is community-reported, and PHP
+  rounds the value up to the next prime), and `opcache.validate_timestamps=0` in
+  production (so you MUST flush OpCache on every deploy). Also
+  `opcache.interned_strings_buffer` in the tens of MB — it is carved out of
+  `memory_consumption`, so budget for it.
+- **`memory_limit` ≥ 2G for CLI / bin/magento.** `setup:di:compile`,
+  `setup:static-content:deploy` and other `bin/magento` commands need a large heap;
+  Adobe recommends 2G (up to ~4G for testing/heavy deploys), typically passed per
+  invocation with `php -d memory_limit=4G bin/magento …`. The PHP-FPM pool serving
+  page requests can stay lower (768M–2G).
+- **`realpath_cache_size=10M`, `realpath_cache_ttl=7200`.** Magento touches a huge
+  number of files per request; the default 4K realpath cache thrashes. Adobe calls
+  these out explicitly as a performance requirement.
+- **`max_execution_time` for indexers and cron.** Reindex (`bin/magento indexer:reindex`)
+  and `bin/magento cron:run` can run long; the CLI SAPI ignores `max_execution_time`
+  (`0`), but if you drive indexers or setup over an FPM/web path, raise it there or
+  they time out mid-run.
+- **2.4.8 vary-cookie regression (version-specific, community-reported).** A change in
+  Magento 2.4.8 marks a response uncacheable when the request's `X-Magento-Vary` cookie
+  does not match the freshly generated vary string — which is *always* true on a first
+  request (no cookie yet), reportedly breaking initial cache population
+  (`magento/magento2` issue #40272, S0, awaiting triage as of 2026-07). If you see
+  first-hit misses that never warm on 2.4.8, check for the upstream fix/patch before
+  blaming the preset — cache-turbo's key logic is unaffected.
 
 ## See also
 
