@@ -1561,8 +1561,12 @@ ngx_http_cache_turbo_purge_request(ngx_http_request_t *r,
 /* >>> FUZZ-EXTRACT auto-classify BEGIN (fuzz/extract_auto_classify.sh) <<< */
 /*
  * Auto-classify preset registry. Each row is one CMS backend: NULL-terminated
- * lists of request-Cookie name substrings, r->uri prefixes, and query-arg keys
- * that mark a request as a dynamic surface that must NOT be cached. Adding a
+ * lists of request-Cookie name substrings, r->uri prefixes, and query args
+ * that mark a request as a dynamic surface that must NOT be cached. A query-arg
+ * entry is either a bare "name" (presence alone is the signal) or "name=value"
+ * (the argument must carry exactly that value) — the single-entry-script forums
+ * route every page through one `action`/`do` argument, so for them only the
+ * VALUE separates a login from an ordinary read. Adding a
  * backend is one row here — no new code path. A row is active when
  * (clcf->backend_presets & row->bit). `generic` (bare `auto`) is the union of
  * WP/Woo/Joomla, whose cookie/URI namespaces are disjoint, so stacking them
@@ -1596,7 +1600,7 @@ typedef struct {
     ngx_uint_t           bit;
     const char *const   *cookies;  /* substrings in the request Cookie header */
     const char *const   *uris;     /* r->uri prefixes                         */
-    const char *const   *args;     /* query-arg keys (presence => dynamic)    */
+    const char *const   *args;     /* "name" (presence) or "name=value"       */
 
     /* Cookie VALUE predicates (tier 2). NULL for presets that classify on name
      * presence alone. An application that issues the SAME cookie to guests and
@@ -2464,9 +2468,9 @@ static const char *const  ct_punbb_args[] = { NULL };
 static const char *const  ct_phorum_cookies[] = {
     "phorum_session_v5", "phorum_session_st", "phorum_admin_session", NULL };
 static const char *const  ct_phorum_uris[] = {
-    "admin.php", "login.php", "register.php", "pm.php", "posting.php",
-    "post.php", "moderation.php", "control.php", "ajax.php", "report.php",
-    "follow.php", NULL };
+    "/admin.php", "/login.php", "/register.php", "/pm.php", "/posting.php",
+    "/post.php", "/moderation.php", "/control.php", "/ajax.php", "/report.php",
+    "/follow.php", NULL };
 static const char *const  ct_phorum_args[] = { NULL };
 static const char *const  ct_phorum_key_cookies[] = { "list_style", NULL };
 
@@ -3025,8 +3029,9 @@ ngx_http_cache_turbo_auto_skip(ngx_http_request_t *r,
 {
     const ngx_http_cache_turbo_preset_t  *ps;
     const char *const                    *pp;
+    const char                           *eq;
     ngx_str_t                             val;
-    size_t                                l;
+    size_t                                l, nlen, vlen;
 
     for (ps = ngx_http_cache_turbo_presets; ps->bit; ps++) {
         if (!(clcf->backend_presets & ps->bit)) {
@@ -3042,8 +3047,32 @@ ngx_http_cache_turbo_auto_skip(ngx_http_request_t *r,
 
         if (r->args.len) {
             for (pp = ps->args; *pp; pp++) {
-                if (ngx_http_arg(r, (u_char *) *pp, ngx_strlen(*pp), &val)
-                    == NGX_OK)
+                eq = ngx_strchr(*pp, '=');
+
+                if (eq == NULL) {
+                    /* Bare NAME: presence of the argument is the signal,
+                     * whatever its value ("_xfToken", "sid"). */
+                    if (ngx_http_arg(r, (u_char *) *pp, ngx_strlen(*pp), &val)
+                        == NGX_OK)
+                    {
+                        return 1;
+                    }
+                    continue;
+                }
+
+                /* NAME=VALUE: the forum families that route everything through
+                 * one script ("index.php?action=login", "?do=compose") cannot
+                 * be classified on the argument NAME — `action` and `do` also
+                 * carry the ordinary read routes, so matching the bare name
+                 * would bypass the whole board. Match the exact value instead.
+                 * Values are fixed route tokens, so an exact byte compare is
+                 * the whole test; no case folding, no prefix match. */
+                nlen = (size_t) (eq - *pp);
+                vlen = ngx_strlen(eq + 1);
+
+                if (ngx_http_arg(r, (u_char *) *pp, nlen, &val) == NGX_OK
+                    && val.len == vlen
+                    && ngx_strncmp(val.data, eq + 1, vlen) == 0)
                 {
                     return 1;
                 }
@@ -5842,7 +5871,8 @@ ngx_http_cache_turbo_backend(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                     "unknown cache_turbo_backend \"%V\" (want wordpress, "
                     "woocommerce, joomla, xenforo, discourse, phpbb, drupal, "
                     "mediawiki, magento, ghost, wagtail, kirby, shopware6, "
-                    "typo3, or none — separated by spaces or '|')", &bad);
+                    "typo3, invision, smf, vanilla, punbb, phorum, yabb, mybb, "
+                    "vbulletin, or none — separated by spaces or '|')", &bad);
                 return NGX_CONF_ERROR;
             }
 
@@ -5875,7 +5905,8 @@ ngx_http_cache_turbo_backend(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
             "cache_turbo_backend names no backend (want wordpress, woocommerce, "
             "joomla, xenforo, discourse, phpbb, drupal, mediawiki, magento, "
-            "ghost, wagtail, kirby, shopware6, typo3, or none)");
+            "ghost, wagtail, kirby, shopware6, typo3, invision, smf, vanilla, "
+            "punbb, phorum, yabb, mybb, vbulletin, or none)");
         return NGX_CONF_ERROR;
     }
 

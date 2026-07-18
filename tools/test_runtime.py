@@ -1405,6 +1405,26 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # smf routes every page through index.php?action=<route>, so its
+        # dynamic surface is expressed as query-arg VALUES, not URI prefixes.
+        # Arg rules are path-independent, so a prefixed location exercises them.
+        location /smf/ {{
+            cache_turbo         main;
+            cache_turbo_backend smf;
+            cache_turbo_key     $request_uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        # phorum is a flat top-level-script app: its URI rules are real root
+        # paths, so they must be root locations to be exercised at all.
+        location /admin.php {{
+            cache_turbo         main;
+            cache_turbo_backend phorum;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # Forum presets whose cookie rules were corrected after the docs
         # deep-research pass (punbb / vanilla / phorum). Their cookie rules are
         # path-independent, so a prefixed location exercises them; the URI rules
@@ -3220,6 +3240,51 @@ def test_phorum_admin_session_cookie(ng: Nginx, origin: Origin) -> None:
     assert hg.get("x-cache") == "HIT", \
         (f"phorum_tmp_cookie is guest-issued and must stay cacheable, got "
          f"{hg.get('x-cache')}")
+
+
+def test_preset_arg_value_predicate(ng: Nginx, origin: Origin) -> None:
+    """Preset query-arg rules written as `name=value` must match the VALUE.
+
+    The single-entry-script forums (SMF, MyBB, YaBB, Invision) route every page
+    through one `action` / `do` argument, so the argument NAME carries the
+    ordinary read routes too. The classifier originally looked every args entry
+    up as a bare argument name, which meant `action=login` was searched for as
+    an argument literally called "action=login" and never matched anything --
+    login, PM and moderation routes stayed cacheable. Matching on the name
+    alone is not the fix either: it would bypass the whole board.
+
+    So both halves are asserted. A listed value bypasses; an unlisted value on
+    the SAME argument name still caches."""
+    # A listed route value must bypass.
+    for i, q in enumerate(("action=login", "action=admin", "action=pm")):
+        uri = f"/smf/index.php?{q}&t={i}"
+        _, _, h = fetch(ng.port, uri)
+        assert "x-cache" not in h, \
+            f"?{q} must bypass on the smf preset, got {h.get('x-cache')}"
+
+    # An UNLISTED value on the same argument name is an ordinary read and must
+    # stay cacheable -- this is what a bare-name match would have broken.
+    for q in ("action=display", "action=recent"):
+        uri = f"/smf/index.php?{q}"
+        fetch(ng.port, uri)
+        _, _, h = fetch(ng.port, uri)
+        assert h.get("x-cache") == "HIT", \
+            (f"?{q} is an ordinary read route and must stay cacheable, got "
+             f"{h.get('x-cache')} -- matching the bare arg NAME bypasses the "
+             "entire board")
+
+
+def test_phorum_uri_rules_anchor_at_root(ng: Nginx, origin: Origin) -> None:
+    """phorum URI rules must carry a leading slash.
+
+    r->uri always begins with '/', and the preset's URI rules are prefixes
+    anchored at position 0, so a rule written as "admin.php" can never match
+    "/admin.php". The row shipped all eleven script names unslashed, which left
+    the admin, login, posting and moderation routes cacheable."""
+    _, _, h = fetch(ng.port, "/admin.php")
+    assert "x-cache" not in h, \
+        (f"/admin.php must bypass on the phorum preset, got {h.get('x-cache')} "
+         "-- the URI rules are anchored at position 0 and need a leading slash")
 
 
 def test_joomla_preset(ng: Nginx, origin: Origin) -> None:
@@ -7930,6 +7995,8 @@ def run_all(ng: Nginx, origin: Origin,
     test_punbb_cookie_name_default(ng, origin)
     test_vanilla_guest_cookies_stay_cacheable(ng, origin)
     test_phorum_admin_session_cookie(ng, origin)
+    test_preset_arg_value_predicate(ng, origin)
+    test_phorum_uri_rules_anchor_at_root(ng, origin)
     test_joomla_preset(ng, origin)
     test_drupal_preset(ng, origin)
     test_mediawiki_preset(ng, origin)
