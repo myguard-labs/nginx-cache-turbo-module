@@ -33,7 +33,7 @@ of the same job.
 | Check | Values |
 |---|---|
 | URI prefixes | **none** — see below |
-| Query args | `veaction`, `returnto` |
+| Query args | `veaction`, `returnto`, and the mutating `action=` values (`edit`, `submit`, `delete`, `protect`, `unprotect`, `purge`, `rollback`, `revert`, `watch`, `unwatch`, `markpatrolled`, `mcrundo`, `mcrrestore`) |
 | Cookie header substrings | `Token=`, `_session=`, `UserID=` |
 
 MediaWiki's cookies are `<prefix>UserID`, `<prefix>UserName`, `<prefix>Token` and
@@ -120,24 +120,39 @@ honor`, whose store path refuses `private`.
 If you think you have found a path MediaWiki cannot cache, find a source that
 says so before adding it here.
 
-The preset bypasses on **`veaction`** (VisualEditor — always dynamic) and
-**`returnto`** (login redirect flow). It deliberately does **not** bypass on a
-blanket `action=`, and that omission is a considered decision:
+The preset bypasses on **`veaction`** (VisualEditor — always dynamic),
+**`returnto`** (login redirect flow), and the **mutating half of
+`ActionFactory::CORE_ACTIONS`**, value by value. It deliberately does **not**
+bypass on a blanket `action=`, and that split is a considered decision:
 
 | Arg | Cached? | Why |
 |---|---|---|
-| `action=edit`, `submit`, `delete` | **not cached** | dynamic — but MediaWiki already sends `private` on these, and `honor` refuses to store them |
+| `action=edit`, `submit`, `delete`, `protect`, `unprotect`, `purge`, `rollback`, `revert`, `watch`, `unwatch`, `markpatrolled`, `mcrundo`, `mcrrestore` | **bypassed** | the mutating core actions, listed one value at a time |
 | `veaction=` | **bypassed** | VisualEditor, always dynamic |
 | `action=raw` | **cached** | deterministic wikitext; gadgets and JS fetch it constantly — a hot path |
 | `action=history` | **cached** | same for every anonymous reader; changes only on edit |
+| `action=view`, `render`, `info`, `credits` | **cached** | the read half of `CORE_ACTIONS` — deterministic and shared |
 | `diff=`, `oldid=` | **cached** | a revision diff is a pure function of the revision ids, and `oldid` content is *immutable* |
 | `printable=` | **cached** | a presentation variant — put it in the key, not a bypass |
 
 A blanket "presence of `action=` ⇒ bypass" rule is the obvious thing to write and
 it is **wrong**: it would throw away `raw`, `history`, `diff` and `oldid`, which
 are among the most cacheable and most requested URLs on a busy wiki. That's a
-measurable hit-rate loss in exchange for nothing, because the genuinely dynamic
-`action=` values are already covered by MediaWiki's own `Cache-Control: private`.
+measurable hit-rate loss in exchange for nothing. Listing the mutating values
+individually gets the safety without the loss.
+
+**Why the rows exist even though MediaWiki already sends `private`.** It does,
+and more reliably than "it marks mutating actions private" suggests:
+`OutputPage::$mCdnMaxage` starts at **0**, and core raises it in exactly one
+place — `ActionEntryPoint::performAction()`, for a `ViewAction` or an exact match
+against the page's purgeable canonical URLs. An `?action=edit` URL is neither, so
+it falls through to `sendCacheControl()`'s `no-maxage` branch and gets
+`private, must-revalidate, max-age=0`. None of those conditions depends on who is
+asking, so it holds for **anonymous** requesters too. But that floor is
+switched off by `cache_turbo_cache_control ignore`, and correctness here does not
+rest on a floor an operator can remove — the same reasoning the Drupal preset
+uses. The rows cost almost nothing: the read path is `/wiki/<Title>` with no
+`action` argument at all.
 
 `printable=` needs no special handling to become a proper variant: the module's
 **default** key is built from the validated `Host` plus `unparsed_uri` — the
@@ -313,9 +328,9 @@ curl -sI -H 'Cookie: mywikiUserID=42' https://wiki.example.com/wiki/Main_Page \
   Still confirm your actual cookie names if you customise the CentralAuth cookie
   prefix.
 - **Don't add a blanket `action=` bypass.** `action=raw`, `action=history`,
-  `diff=` and `oldid=` are deterministic, shared, and hot. Bypassing them is a
-  real hit-rate loss and buys nothing — the dynamic `action=` values are already
-  covered by MediaWiki's `Cache-Control: private`.
+  `action=render`, `action=info`, `diff=` and `oldid=` are deterministic, shared,
+  and hot. Bypassing them is a real hit-rate loss and buys nothing — the mutating
+  `action=` values are already listed individually.
 - **`<prefix>_session` is not an auth cookie.** An anonymous visitor who previews
   an edit gets one. Same trap as XenForo's `xf_session`.
 - **Don't set `cache_turbo_cache_control ignore`.** MediaWiki's `private` header is
