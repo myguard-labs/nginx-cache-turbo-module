@@ -4531,7 +4531,7 @@ def test_honor_ttl_clamped_to_max(ng: Nginx, origin: Origin) -> None:
     could overflow/wrap the fresh window to a small or instantly-stale value.
     Observable proof: the entry stays a FRESH HIT (no re-hit to origin) rather
     than going stale — a wrapped TTL would surface as a STALE serve here."""
-    base = origin.hits
+    base = origin.hits_for("ttlclamp")           # path-scoped: immune to bg-refresh noise
     _, b0, h0 = fetch(ng.port, "/cc7/ttlclamp")
     assert "x-cache" not in h0, "first should miss to origin"
     _, b1, h1 = fetch(ng.port, "/cc7/ttlclamp")
@@ -4542,7 +4542,7 @@ def test_honor_ttl_clamped_to_max(ng: Nginx, origin: Origin) -> None:
     assert h2.get("x-cache") == "HIT", \
         ("clamped max-age must still be fresh after a delay (no overflow-to-stale), "
          f"got {h2.get('x-cache')}")
-    assert origin.hits == base + 1, \
+    assert origin.hits_for("ttlclamp") == base + 1, \
         "a TTL_MAX-clamped entry must not re-hit the origin while fresh"
 
 
