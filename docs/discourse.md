@@ -108,7 +108,9 @@ http {
             cache_turbo_backend       discourse;   # implies cache_control honor
 
             # Theme and colour mode are VARIANTS -- key on them, never bypass.
-            cache_turbo_key           $scheme$host$uri$is_args$args$cookie_theme_ids$cookie_forced_color_mode;
+            # Normalized args (not raw $args) so the key stays tight -- see
+            # the poisoning note in Runtime settings / gotchas below.
+            cache_turbo_key           $scheme$host$uri$is_args$cache_turbo_normalized_args$cookie_theme_ids$cookie_forced_color_mode;
 
             cache_turbo_valid         60s;
             cache_turbo_valid         404 410 1m;

@@ -18,6 +18,7 @@ preset**, not this page. See [README.md](README.md).
 - [Vhost](#vhost)
 - [Checking it works](#checking-it-works)
 - [Gotchas](#gotchas)
+- [Runtime settings / gotchas](#runtime-settings--gotchas)
 
 ## Why there is no framework preset
 

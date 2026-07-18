@@ -171,7 +171,11 @@ add_action( 'transition_post_status', function ( $new_status, $old_status, $post
     if ( $new_status !== 'publish' ) {
         return;
     }
-    wp_remote_post( 'http://127.0.0.1/_cache?key=' . rawurlencode( get_permalink( $post ) ) );
+    // The admin endpoint hashes ?key= verbatim -- it must equal the full
+    // cache key (host + uri + normalized args), not the scheme+host+path
+    // that get_permalink() returns.
+    $key = preg_replace( '#^https?://#', '', get_permalink( $post ) );
+    wp_remote_post( 'http://127.0.0.1/_cache?key=' . rawurlencode( $key ) );
 }, 10, 3 );
 ```
 

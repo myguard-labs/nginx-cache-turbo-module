@@ -13,6 +13,7 @@ next visitor. Read the [gotchas](#gotchas) before going live.
 - [Vhost + Redis L2](#vhost--redis-l2)
 - [Checking it works](#checking-it-works)
 - [Gotchas](#gotchas)
+- [PHP settings / gotchas](#php-settings--gotchas)
 
 ## The short version
 

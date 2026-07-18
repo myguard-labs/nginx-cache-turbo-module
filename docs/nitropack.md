@@ -132,10 +132,14 @@ http {
         index index.php;
 
         # See "Real IP" below — traffic now arrives via NitroPack's proxy,
-        # not the visitor directly.
-        set_real_ip_from  0.0.0.0/0;   # replace with NitroPack's published ranges
-        real_ip_header    X-Forwarded-For;
-        real_ip_recursive on;
+        # not the visitor directly. NitroPack does not publish a fixed,
+        # citable IP-range list as of this writing -- get current ranges
+        # from NitroPack support/docs first, then uncomment with THOSE
+        # ranges. Never use 0.0.0.0/0: it trusts X-Forwarded-For from any
+        # client, letting a direct caller spoof the real IP.
+        # set_real_ip_from  <NitroPack-published-CIDR>;
+        # real_ip_header    X-Forwarded-For;
+        # real_ip_recursive on;
 
         location / {
             try_files $uri $uri/ /index.php?$args;
@@ -191,9 +195,9 @@ ranges** in the sources checked for this page — NitroPack's help center
 references an article titled "How to Allowlist NitroPack's IP Addresses" (seen
 only as a cross-reference, content not confirmed here). **Consult NitroPack's
 own published IP-range docs directly before writing `set_real_ip_from` — do not
-invent or guess ranges.** The `0.0.0.0/0` placeholder above is illustrative
-only and should never ship as-is (it would trust the `X-Forwarded-For` header
-from literally any client).
+invent or guess ranges.** That's why the `real_ip` block above ships commented
+out rather than with a wildcard: `set_real_ip_from 0.0.0.0/0` would trust the
+`X-Forwarded-For` header from literally any client and must never ship as-is.
 
 ## Gotchas
 

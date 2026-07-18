@@ -220,10 +220,14 @@ add_action( 'transition_post_status', function ( $new, $old, $post ) {
     if ( $new !== 'publish' && $old !== 'publish' ) {
         return;
     }
-    $url = wp_parse_url( get_permalink( $post ), PHP_URL_PATH );
-    wp_remote_post( 'http://127.0.0.1/_cache?key=' . rawurlencode( $url ) );
+    // The admin endpoint hashes ?key= verbatim -- it must equal the full
+    // cache key (host + uri + normalized args), not just the path.
+    $permalink = get_permalink( $post );
+    $key = wp_parse_url( $permalink, PHP_URL_HOST ) . wp_parse_url( $permalink, PHP_URL_PATH );
+    wp_remote_post( 'http://127.0.0.1/_cache?key=' . rawurlencode( $key ) );
     // Also purge the front page / relevant archive if this post appears there.
-    wp_remote_post( 'http://127.0.0.1/_cache?key=/' );
+    $front_key = wp_parse_url( home_url( '/' ), PHP_URL_HOST ) . '/';
+    wp_remote_post( 'http://127.0.0.1/_cache?key=' . rawurlencode( $front_key ) );
 }, 10, 3 );
 
 // Optional: piggyback on WP Rocket's own full-clear event so "Clear cache"

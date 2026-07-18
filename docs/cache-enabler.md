@@ -167,7 +167,7 @@ The `wordpress.md` mu-plugin pattern applies unchanged — hook
 endpoint:
 
 ```bash
-curl -X POST 'http://127.0.0.1/_cache?key=/blog/my-post/'
+curl -X POST 'http://127.0.0.1/_cache?key=example.com/blog/my-post/'
 curl -X POST 'http://127.0.0.1/_cache?all=1'   # after a theme change
 ```
 

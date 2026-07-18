@@ -214,7 +214,7 @@ admin endpoint is what needs triggering** on publish, same as a plain
 WordPress site:
 
 ```bash
-curl -X POST 'http://127.0.0.1/_cache?key=/blog/my-post/'
+curl -X POST 'http://127.0.0.1/_cache?key=example.com/blog/my-post/'
 curl -X POST 'http://127.0.0.1/_cache?all=1'   # after a theme/plugin-config change
 ```
 

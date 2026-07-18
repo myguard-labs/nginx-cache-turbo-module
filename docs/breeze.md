@@ -28,10 +28,12 @@ anything cache-turbo can detect automatically:
 1. **Self-hosted / any non-Cloudways nginx (the case this module targets):**
    disable Breeze's own page cache, keep its minify/gzip/CDN features, and let
    cache-turbo own the page cache with the stock `wordpress` preset:
+
    ```nginx
    cache_turbo         ct;
    cache_turbo_backend wordpress;
    ```
+
 2. **On Cloudways-managed infrastructure** (their own Varnish + a
    platform-managed nginx/Apache layer you don't configure yourself): this
    module's normal self-managed-vhost deployment model likely doesn't apply —
@@ -162,7 +164,7 @@ For the self-hosted scenario, wire cache-turbo's own admin endpoint from the
 same `save_post` / `transition_post_status` hook the WordPress doc describes:
 
 ```bash
-curl -X POST 'http://127.0.0.1/_cache?key=/blog/my-post/'
+curl -X POST 'http://127.0.0.1/_cache?key=example.com/blog/my-post/'
 curl -X POST 'http://127.0.0.1/_cache?all=1'          # after a theme change
 ```
 

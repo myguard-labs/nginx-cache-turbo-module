@@ -92,7 +92,7 @@ W3TC's Object/DB Cache Redis settings live in Performance → General
 Settings → Object Cache / Database Cache (or `wp-config.php` for some
 setups), independent of nginx:
 
-```
+```text
 Object Cache Method:   Redis
 Redis hostname:port:   10.0.0.5:6379
 Redis database:        1        <-- NOT the DB cache-turbo's L2 uses
@@ -185,7 +185,10 @@ add_action( 'save_post', function ( $post_id ) {
     if ( wp_is_post_revision( $post_id ) ) return;
     $url = get_permalink( $post_id );
     if ( ! $url ) return;
-    wp_remote_post( 'http://127.0.0.1/_cache?key=' . rawurlencode( wp_make_link_relative( $url ) ) );
+    // The admin endpoint hashes ?key= verbatim -- it must equal the full
+    // cache key (host + uri + normalized args), not a path-relative URL.
+    $key = preg_replace( '#^https?://#', '', $url );
+    wp_remote_post( 'http://127.0.0.1/_cache?key=' . rawurlencode( $key ) );
 }, 20 );
 ```
 

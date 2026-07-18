@@ -113,6 +113,11 @@ http {
             fastcgi_pass  unix:/run/php/php-fpm.sock;
         }
 
+        # phpBB internals -- never HTTP-reachable, never cache candidates.
+        location ~ ^/(cache|store|files)/ {
+            deny all;
+        }
+
         # Board styles / avatars / attachments: static, long-lived.
         location ~* ^/(styles|images|assets)/ {
             cache_turbo off;
@@ -203,9 +208,11 @@ PHP app and is out of scope here.
   in the `phpbb_sessions` table keyed by the `_sid` cookie; phpBB does not touch
   PHP's native `$_SESSION` / `session.save_handler`. So none of the `session.*`
   php.ini knobs (save path, GC, cookie params) affect who is "logged in" as far as
-  the cache is concerned. The only signal the edge can see is phpBB's own `_u`
-  cookie — which is exactly what the preset keys on. Do not reach for
-  `session.cookie_*` tuning to fix a cache-vs-login problem; it cannot help.
+  the cache is concerned. The edge also receives `_sid`, `_k`, and the `sid`
+  query argument, but phpBB's own `_u` cookie is the preset's auth signal — its
+  bypass predicate tests `_u` alone (classifying the request as bypass; it does
+  not fold the cookie into the cache key). Do not reach for `session.cookie_*`
+  tuning to fix a cache-vs-login problem; it cannot help.
 - **`_u == 1 == guest` is the load-bearing invariant — bank it.** The preset's
   entire correctness rests on `ANONYMOUS` being `1` (`includes/constants.php`:
   `define('ANONYMOUS', 1)`), still true in 3.3.x and on 4.0 `master`. Two ways it

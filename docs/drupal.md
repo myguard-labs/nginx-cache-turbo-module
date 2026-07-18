@@ -14,6 +14,7 @@ what it costs.
 - [Vhost + Redis L2](#vhost--redis-l2)
 - [Checking it works](#checking-it-works)
 - [Gotchas](#gotchas)
+- [PHP settings / gotchas](#php-settings--gotchas)
 
 ## The short version
 
@@ -320,9 +321,12 @@ Generic tuning belongs in your PHP-FPM docs; only the Drupal interactions are he
   the **Browser and proxy cache maximum age** setting
   (`system.performance:cache.page.max_age`, `/admin/config/development/performance`).
   On many installs that value is `0` — Drupal then emits `max-age=0`, and `honor`
-  will refuse to store the response. Either set that value above zero, or rely on
-  the explicit `cache_turbo_valid` in the vhost (which the example already does) so
-  storage TTL doesn't hinge on Drupal's default. Note that a bare `s-maxage` is
+  will refuse to **store** the response no matter what `cache_turbo_valid` says:
+  the storage veto runs first, and an explicit TTL only ever applies to a response
+  that already cleared it — `cache_turbo_valid` is the fallback TTL for a response
+  with no freshness header at all, not an override for `max-age=0`. Either set
+  that value above zero, or explicitly set `cache_turbo_cache_control` to
+  something other than `honor` for this location. Note that a bare `s-maxage` is
   *contrib* (`http_cache_control` / `cache_control_override`), not core — don't
   assume it's present.
 

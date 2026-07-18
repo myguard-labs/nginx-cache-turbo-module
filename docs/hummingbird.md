@@ -169,7 +169,10 @@ add_action( 'wphb_clear_page_cache', function () {
 } );
 
 add_action( 'wphb_clear_cache_url', function ( $url ) {
-    wp_remote_post( 'http://127.0.0.1/_cache?key=' . rawurlencode( wp_make_link_relative( $url ) ) );
+    // The admin endpoint hashes ?key= verbatim -- it must equal the full
+    // cache key (host + uri + normalized args), not a path-relative URL.
+    $key = preg_replace( '#^https?://#', '', $url );
+    wp_remote_post( 'http://127.0.0.1/_cache?key=' . rawurlencode( $key ) );
 } );
 ```
 

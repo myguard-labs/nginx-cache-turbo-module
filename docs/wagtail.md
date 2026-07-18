@@ -17,6 +17,7 @@ specifically, you want [frameworks.md](frameworks.md).
 - [Vhost](#vhost)
 - [Checking it works](#checking-it-works)
 - [Gotchas](#gotchas)
+- [Runtime settings / gotchas](#runtime-settings--gotchas)
 
 ## The short version
 
@@ -211,9 +212,10 @@ operational levers are different from the PHP presets. These are Wagtail/Django-
   `CsrfViewMiddleware` adds the same header whenever the `{% csrf_token %}` tag
   renders. It is a keying instruction, **not** a `Cache-Control: private`; it does
   not stop a store. **With `cache_turbo_auto_vary off` (the default) the module
-  ignores the response `Vary` and keys on the request per the preset's `sessionid`
-  rule — which is exactly what you want here:** an anonymous page carries no
-  `sessionid`, so it caches correctly regardless of a stray `Vary: Cookie`. Do
+  ignores the response `Vary` and classifies the request per the preset's
+  `sessionid` bypass rule — which is exactly what you want here:** an anonymous
+  page carries no `sessionid`, so it is not bypassed and caches correctly
+  regardless of a stray `Vary: Cookie`. Do
   **not** reflexively enable `cache_turbo_auto_vary` for a Wagtail origin — auto-Vary
   treats `Vary: Cookie` as *uncacheable*, so turning it on would make every public
   page that renders a form (a header search box is enough) stop caching entirely.

@@ -27,7 +27,7 @@ One page per `cache_turbo_backend` preset:
 | `invision` | [invision.md](invision.md) | ✅ yes (`ips4_loggedIn`, vendor-documented for this exact purpose) — closed-source, vendor-attested not code-verified |
 | `smf` | [smf.md](smf.md) | ✅ yes (`SMFCookie`, presence-only) — guest-issued too; the ideal value predicate needs JSON/array decoding this engine doesn't do, so it costs hit rate instead |
 | `vanilla` | [vanilla.md](vanilla.md) | ✅ yes (`Vanilla`, presence-only) — **verify empirically on your install**, source could not be directly cited |
-| `punbb` | [punbb.md](punbb.md) | ✅ yes (`punbb_cookie`, presence-only) — same engine limitation as `smf`, guest-issued too |
+| `punbb` | [punbb.md](punbb.md) | ✅ yes (`forum_cookie`/`punbb_cookie`, presence-only) — `forum_cookie` covers stock 1.4.x (incl. the installer's randomised suffix), `punbb_cookie` the legacy 1.2-era name; same engine limitation as `smf`, guest-issued too |
 | `phorum` | [phorum.md](phorum.md) | ✅ yes (fixed session-cookie constants) — never guest-issued, the clean case |
 | `yabb` | [yabb.md](yabb.md) | ✅ yes (`Y2Sess-`/`Y2User-`/`Y2Pass-` prefix) — per-install random suffix, but never guest-issued |
 | `mybb` | [mybb.md](mybb.md) | ✅ yes (`{prefix}user` suffix) — never guest-issued |

@@ -152,11 +152,14 @@ whether or not cache-turbo is in front.
   8.2 or above"). The revival is brand-new and its longevity is
   unverified/community-reported. Practical consequence for the whole
   deployment: legacy **Phorum 5.2.x will not run clean on PHP 8.x** (PHP 4-style
-  constructors, deprecated/removed functions), so either run 5.2.x on an
-  end-of-life PHP 7.x FPM pool or move to 6.0.x on PHP 8.2+. Pin the FPM version
-  to the Phorum version you actually run — a silent PHP upgrade is what breaks
-  an abandoned board. This affects the application, not the cache layer;
-  cache-turbo simply serves whatever the backend returns.
+  constructors, deprecated/removed functions). Running 5.2.x means an
+  end-of-life PHP 7.x FPM pool — **not a supported deployment target**, only a
+  migration-window stopgap: isolate that pool (no shared FPM with anything else
+  internet-facing, no known-unpatched CVEs left open) while you move to 6.0.x on
+  PHP 8.2+, the only currently-supported combination. Pin the FPM version to the
+  Phorum version you actually run — a silent PHP upgrade is what breaks an
+  abandoned board. This affects the application, not the cache layer; cache-turbo
+  simply serves whatever the backend returns.
 - **`opcache`** — enable it. Phorum's front controllers (`read.php`, `list.php`,
   `index.php`, …) are recompiled on every request otherwise; with cache-turbo
   absorbing guest hits, the opcache mainly benefits the uncached member and
