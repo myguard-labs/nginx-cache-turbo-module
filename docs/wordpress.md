@@ -25,7 +25,8 @@ cache_turbo_backend wordpress;
 That's it — the default key is right for a stock WordPress site. The preset
 auto-skips `/wp-admin/`, `/wp-login.php`, `/wp-cron.php`, `/xmlrpc.php` and
 `/wp-json/`, plus any request carrying a logged-in / password-protected-post /
-comment-author cookie, and any `?preview=` or `?s=` (search) request.
+comment-author cookie, and any `?preview=` request. Site search (`?s=`) is
+**cached**, not bypassed — see below.
 
 Each preset is its own independent bit — `cache_turbo_backend wordpress;`
 activates the WordPress rules and **nothing else**. It does not imply
@@ -46,7 +47,7 @@ i.e. one customer's basket served to the next visitor. See
 | Check | Values |
 |---|---|
 | URI prefixes | `/wp-admin/`, `/wp-login.php`, `/wp-cron.php`, `/xmlrpc.php`, `/wp-json/` |
-| Query args (presence) | `preview`, `s` |
+| Query args (presence) | `preview` |
 | Cookie header substrings | `wordpress_logged_in_`, `wp-postpass_`, `comment_author_` |
 
 These literals are matched as **substrings of the whole `Cookie` header** —
@@ -56,9 +57,24 @@ would never match. Note the match is not anchored to a cookie name, so a cookie
 *value* containing one of these literals bypasses too; all three are distinctive
 enough that this does not happen by accident.
 
-`?s=` is skipped because search results are effectively unbounded in cardinality:
-caching them lets any visitor fill your zone with junk keys and evict the pages
-people actually read.
+`?s=` (site search) is **cached**. It used to be bypassed, on the grounds that
+search results are unbounded in cardinality and let any visitor fill the zone
+with junk keys. The cardinality problem is real; bypassing was the wrong answer
+to it.
+
+- A logged-out visitor's results are **anonymous-identical** — everyone
+  searching "foo" gets the same page. That is shared, hot content.
+- A logged-in editor's results *do* include drafts and private posts, but that
+  visitor is already bypassed by `wordpress_logged_in_*` on the cookie tier. The
+  arg rule added no safety.
+- Bypassing made load *worse*. A bypass returns before the single-flight lock,
+  so bypassed requests get no miss-collapsing: a `?s=` flood put 100% of its
+  load on the origin, uncollapsed, on the most expensive query WordPress runs (a
+  full-text `LIKE` scan of `wp_posts`).
+
+Use **`cache_turbo_min_uses N`** for the cardinality half. It stores an entry
+only after N misses, so once-seen junk terms never mint one while terms real
+visitors repeat still cache — bounded keyspace, no origin flood.
 
 ## Cookies: bypass vs key
 
@@ -198,8 +214,12 @@ curl -sI https://example.com/blog/hello/ | grep -i x-cache-turbo   # HIT
 curl -sI -H 'Cookie: wordpress_logged_in_abc=user|123|hash' \
      https://example.com/blog/hello/ | grep -i x-cache-turbo       # BYPASS
 
-# admin + search + preview: BYPASS
+# admin + preview: BYPASS
 curl -sI https://example.com/wp-admin/            | grep -i x-cache-turbo
+curl -sI 'https://example.com/?preview=true'      | grep -i x-cache-turbo
+
+# search is CACHED, not bypassed -- a second identical search should HIT
+curl -sI 'https://example.com/?s=test'            | grep -i x-cache-turbo
 curl -sI 'https://example.com/?s=test'            | grep -i x-cache-turbo
 ```
 
@@ -219,8 +239,10 @@ a shared cache.
   produce `Set-Cookie` responses, which are **never stored** regardless of preset.
   That's a floor, not a bug — but it can silently tank your hit rate. Check the
   `bypasses` counter if the ratio looks wrong.
-- **`?s=` search is skipped by design** (unbounded key cardinality). Don't add it
-  back without a `cache_turbo_min_uses` guard.
+- **`?s=` search is CACHED by design.** It is anonymous-identical, and a
+  logged-in editor is covered by the cookie tier. If unbounded search-key
+  cardinality worries you, that is what `cache_turbo_min_uses N` is for — do not
+  reach for a bypass, which removes miss-collapsing and floods the origin.
 - **WooCommerce?** Stack the presets: `cache_turbo_backend wordpress woocommerce;`
   — see [`woocommerce.md`](woocommerce.md).
 

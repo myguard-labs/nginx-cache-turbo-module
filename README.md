@@ -514,14 +514,14 @@ plausibly appear as an arbitrary value.
 
 | Preset | URI prefixes | Query args | Cookie header substrings |
 |---|---|---|---|
-| `wordpress`   | `/wp-admin/`, `/wp-login.php`, `/wp-cron.php`, `/xmlrpc.php`, `/wp-json/` | `preview`, `s` | `wordpress_logged_in_`, `wp-postpass_`, `comment_author_` |
+| `wordpress`   | `/wp-admin/`, `/wp-login.php`, `/wp-cron.php`, `/xmlrpc.php`, `/wp-json/` | `preview` | `wordpress_logged_in_`, `wp-postpass_`, `comment_author_` |
 | `woocommerce` | `/cart`, `/checkout`, `/my-account` | `wc-ajax` | `woocommerce_items_in_cart`, `woocommerce_cart_hash`, `wp_woocommerce_session_` |
 | `joomla`      | `/administrator/` | — | `joomla_remember_me_` ‡ |
 | `xenforo` † ¤ ✦ | `/admin.php`, `/install/`, `/api/`, `/login`, `/logout`, `/lost-password`, `/register`, `/account`, `/conversations`, `/direct-messages`, `/misc` | `_xfToken` | `xf_session`, `xf_user`, `xf_session_admin`, `xf_lscxf_logged_in`; *(key)* `xf_style_id`, `xf_style_variation`, `xf_language_id` |
 | `discourse` † | `/admin`, `/session`, `/auth/`, `/login`, `/logout`, `/signup`, `/my/`, `/message-bus/`, `/drafts`, `/presence/`, `/notifications`, `/user_actions` | `api_key`, `api_username` | `_t=` |
 | `phpbb` †     | `/ucp.php`, `/mcp.php`, `/adm/`, `/posting.php`, `/memberlist.php`, `/search.php`, `/report.php` | `sid` | *(value)* `…_u != 1` ∆ |
 | `drupal` †    | `/user`, `/admin`, `/node/add`, `/system/`, `/core/install.php` | — | `SESS` ¥ |
-| `mediawiki` † | — ¶ | `veaction`, `returnto` | `Token=`, `_session=`, `UserID=` |
+| `mediawiki` † | — ¶ | `veaction`, `returnto`, mutating `action=` values ‡ | `Token=`, `_session=`, `UserID=` |
 | `magento` † ✦ | `/checkout`, `/customer`, `/graphql`, `/sales`, `/newsletter`, `/wishlist`, `/paypal`, `/review`, `/page_cache/block/esi`, `/health_check.php` | — | *(key)* `X-Magento-Vary` ✦ |
 | `shopware6` † ✦ | `/account`, `/checkout`, `/admin`, `/api`, `/store-api` | — | *(key)* `sw-cache-hash` ✦ |
 | `ghost` †     | `/ghost/`, `/members/`, `/p/`, `/r/` | `uuid`, `key`, `token`, `gift` | `ghost-members-ssr`, `ghost-admin-api-session` |
@@ -543,6 +543,11 @@ unrelated site may legitimately serve as perfectly cacheable pages. Enabling one
 you do not run punches holes in your own cache — which is why none of them is
 ever enabled implicitly, and why the old `generic` union is gone. Name them:
 `cache_turbo_backend xenforo;`.
+
+‡ `edit`, `submit`, `delete`, `protect`, `unprotect`, `purge`, `rollback`,
+`revert`, `watch`, `unwatch`, `markpatrolled`, `mcrundo`, `mcrrestore` — the
+mutating half of `ActionFactory::CORE_ACTIONS`. The read half (`view`,
+`history`, `raw`, `render`, `info`, `credits`) stays cacheable.
 
 ¶ **`mediawiki` deliberately ships NO URI rule**, and that is the correct shape —
 it is what upstream does. It used to bypass `/index.php`, `/load.php` and
@@ -706,7 +711,11 @@ XenForo member (`xf_user`), a Discourse user (`_t`) or a MediaWiki editor
 > (phpBB needs a *value* test — its cookies are handed to guests too); **`woocommerce` must be stacked
 > with `wordpress`** (alone, it leaves `/wp-admin/` cacheable); **`drupal` +
 > `mediawiki` lean on the origin's own `Cache-Control: private`**, so don't set
-> `cache_turbo_cache_control ignore` on those; and **`typo3`'s cookie name is
+> `cache_turbo_cache_control ignore` on those; **`woocommerce`'s `/cart`,
+> `/checkout`, `/my-account` prefixes are English defaults that match nothing on
+> a translated store** (WooCommerce creates the pages in the site locale), so add
+> your own `cache_turbo_bypass_uri` there and rely on the stacked `wordpress`
+> cookie rules; and **`typo3`'s cookie name is
 > admin-overridable (`FE/cookieName`) — if you change it, add your own
 > `cache_turbo_bypass` *and* `cache_turbo_no_store`, or logged-in pages get
 > cached** (this one fails unsafe,

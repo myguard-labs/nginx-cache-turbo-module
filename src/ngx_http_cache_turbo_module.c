@@ -1652,16 +1652,87 @@ typedef struct {
     const char *const  *key_cookies;
 } ngx_http_cache_turbo_preset_t;
 
+/*
+ * WordPress. The cookie tier is the load-bearing one: wordpress_logged_in_ is
+ * the login cookie, wp-postpass_ unlocks a password-protected post, and
+ * comment_author_ marks a commenter who must see their own pending comment.
+ * All three are matched as PREFIXES because the wire names carry a site-hash
+ * suffix (wordpress_logged_in_<sitehash>) — which is also why the
+ * `$cookie_wordpress_logged_in_` form seen in a lot of third-party configs is a
+ * permanent no-op: nginx's $cookie_NAME is an EXACT lookup.
+ *
+ * `preview` is the only arg rule. ?preview=true renders an UNPUBLISHED revision
+ * for an author who holds a valid nonce, so it must never be stored.
+ *
+ * `s` — SITE SEARCH — IS DELIBERATELY ABSENT, and it used to be here. Every
+ * logged-out visitor searching "foo" gets the same page: search results are
+ * dynamic but ANONYMOUS-IDENTICAL, which is shared, hot, and exactly what a
+ * cache is for. A logged-in editor whose results include drafts and private
+ * posts is already bypassed by wordpress_logged_in_ on the cookie tier, so the
+ * arg rule bought no safety at all — only hit-rate loss.
+ *
+ * It was also actively harmful. A bypass returns NGX_DECLINED BEFORE the
+ * single-flight lock, so miss-collapsing does not apply to a bypassed request:
+ * with `s` listed, a flood of `?s=<anything>` put 100% of its load on the
+ * origin, uncollapsed, on the single most expensive query WordPress runs (a
+ * full-text LIKE scan of wp_posts). Caching search at least collapses repeats.
+ *
+ * The objection to caching it is unbounded keyspace — `?s=<random>` mints a new
+ * entry each time and can LRU-evict the zone. That objection is real, and it
+ * has a directive: `cache_turbo_min_uses N` stores an entry only after N
+ * misses, so a flood of once-seen search terms never mints one while the terms
+ * real visitors repeat still cache. That is the control to reach for, and it is
+ * strictly better than the arg rule was — it bounds cardinality WITHOUT handing
+ * the origin an uncollapsed flood.
+ *
+ * It is also not specific to search: the default key includes unparsed_uri, so
+ * EVERY query-bearing URL has the same shape. Singling out search did not close
+ * that hole; it just moved the cost onto the database.
+ *
+ * This now matches ct_wagtail_* (/search/ deliberately absent, same reasoning)
+ * and the mediawiki registry's refusal of a blanket action= rule. Those two
+ * comments argue this case at length; the WordPress row was the outlier and it
+ * carried no comment explaining why.
+ */
 static const char *const  ct_wp_cookies[] = {
     "wordpress_logged_in_", "wp-postpass_", "comment_author_", NULL };
 static const char *const  ct_wp_uris[] = {
     "/wp-admin/", "/wp-login.php", "/wp-cron.php", "/xmlrpc.php",
     "/wp-json/", NULL };
-static const char *const  ct_wp_args[] = { "preview", "s", NULL };
+static const char *const  ct_wp_args[] = { "preview", NULL };
 
 static const char *const  ct_woo_cookies[] = {
     "woocommerce_items_in_cart", "woocommerce_cart_hash",
     "wp_woocommerce_session_", NULL };
+/*
+ * THESE THREE SLUGS ARE ENGLISH DEFAULTS, NOT CONSTANTS, and on a non-English
+ * store they match NOTHING. WC_Install::create_pages() declares them as
+ * TRANSLATABLE strings — _x( 'cart', 'Page slug', 'woocommerce' ) — and wraps
+ * the whole page-creation block in wc_switch_to_site_locale() precisely so that
+ * "pages are created in the correct language". So a German store gets
+ * /warenkorb, /kasse, /mein-konto AT INSTALL TIME, by design. This is not admin
+ * drift that a careful operator avoids; it is the shipped behaviour for every
+ * locale but one. An admin can also rename the pages afterwards, and the
+ * `woocommerce_create_pages` filter can replace the set outright.
+ *
+ * So DO NOT TREAT THE URI TIER AS THE GUARD HERE. It is a convenience for the
+ * default-locale majority. What actually holds on a translated store is the
+ * cookie tier above plus the STACKED wordpress preset — a logged-in customer
+ * carries wordpress_logged_in_, and a shopper with a cart carries
+ * woocommerce_items_in_cart / wp_woocommerce_session_.
+ *
+ * That stacking is not optional, and this is the case that proves it: a
+ * `cache_turbo_backend woocommerce;` used ALONE on a translated store serves a
+ * logged-in customer with an EMPTY cart — no woo cookie, no URI match, no
+ * wordpress preset — a CACHED /mein-konto. Every WooCommerce doc says to stack
+ * `wordpress woocommerce`; this is why.
+ *
+ * Locale slugs are deliberately NOT enumerated here. The set is unbounded (one
+ * per WooCommerce translation, plus whatever the operator typed), so an
+ * operator on a translated store adds their own:
+ *     cache_turbo_bypass_uri /warenkorb /kasse /mein-konto;
+ * See docs/woocommerce.md.
+ */
 static const char *const  ct_woo_uris[] = {
     "/cart", "/checkout", "/my-account", NULL };
 /*
