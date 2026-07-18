@@ -3007,6 +3007,34 @@ def test_xenforo_preset(ng: Nginx, origin: Origin) -> None:
         _, bb2, hb = fetch(ng.port, f"/xf/variant-{name}", headers=vb)
         assert hb.get("x-cache") == "HIT" and bb2 == bb1, \
             f"{name}: each value must warm and hit its OWN entry"
+
+    # EVERY declared key cookie is folded, not just the first one present.
+    # The preset declares xf_style_id, xf_style_variation and xf_language_id;
+    # if the key stopped at the first match, two requests that agree on
+    # xf_style_id and differ on xf_language_id would share ONE entry -- a
+    # German reader served the English page, and the same cookie the operator
+    # asked to vary on silently ignored. Hold the earlier cookie fixed and vary
+    # only the later one.
+    both_en = {"Cookie": "xf_style_id=7; xf_language_id=en"}
+    both_de = {"Cookie": "xf_style_id=7; xf_language_id=de"}
+    _, b_en, _ = fetch(ng.port, "/xf/multikey", headers=both_en)
+    _, _, h_en = fetch(ng.port, "/xf/multikey", headers=both_en)
+    assert h_en.get("x-cache") == "HIT", \
+        f"the multi-cookie combination must warm its own entry, got {h_en.get('x-cache')}"
+    _, b_de, h_de = fetch(ng.port, "/xf/multikey", headers=both_de)
+    assert h_de.get("x-cache") != "HIT" and b_de != b_en, \
+        ("a second key cookie behind the first one is not folded into the key: "
+         f"xf_language_id=de was served the =en entry ({h_de.get('x-cache')})")
+    _, b_de2, h_de2 = fetch(ng.port, "/xf/multikey", headers=both_de)
+    assert h_de2.get("x-cache") == "HIT" and b_de2 == b_de, \
+        "each key-cookie combination must warm and hit its OWN entry"
+
+    # Symmetrically, varying only the EARLIER cookie must still split, so the
+    # fold cannot be reduced to "the last cookie wins" either.
+    other_style = {"Cookie": "xf_style_id=9; xf_language_id=en"}
+    _, b_o, h_o = fetch(ng.port, "/xf/multikey", headers=other_style)
+    assert h_o.get("x-cache") != "HIT" and b_o != b_en, \
+        "a different xf_style_id at the same language must key to its own entry"
     drain_origin(origin)
 
 
