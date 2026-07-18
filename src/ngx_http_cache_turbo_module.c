@@ -2377,17 +2377,26 @@ static const char *const  ct_smf_args[] = {
  * verify empirically against your own install (curl anonymously, confirm no
  * `Set-Cookie: Vanilla=...` appears) before relying on it in production.
  *
- * The cookie name is config-renameable, so match the substring "Vanilla"
- * rather than requiring the exact default.
+ * The rule matches "Vanilla=" — the identity cookie's name followed by its
+ * delimiter — NOT the bare substring "Vanilla". Vanilla derives several
+ * GUEST-issued cookie names from the same `Garden.Cookie.Name` prefix
+ * (`Vanilla-tk`, the CSRF transient key, and `Vanilla-Vv`, the visit
+ * tracker), so a bare-prefix match would fire on ordinary anonymous traffic
+ * and collapse the hit rate to cookieless first hits and crawlers — the
+ * guest-issued-cookie trap this registry's header comment forbids. The
+ * trailing '=' is what separates the identity cookie from its siblings.
+ *
+ * Renaming `Garden.Cookie.Name` therefore defeats this rule; docs/vanilla.md
+ * tells the operator to add their own cache_turbo_bypass in that case.
  */
-static const char *const  ct_vanilla_cookies[] = { "Vanilla", NULL };
+static const char *const  ct_vanilla_cookies[] = { "Vanilla=", NULL };
 static const char *const  ct_vanilla_uris[] = {
     "/dashboard", "/entry/", "/messages/", "/post/", NULL };
 static const char *const  ct_vanilla_args[] = { NULL };
 
 /*
- * PunBB. `punbb_cookie` (config-default literal; admin-configurable) is
- * issued EAGERLY to every guest too (set_default_user(), unless
+ * PunBB. The session cookie is issued EAGERLY to every guest too
+ * (set_default_user(), unless
  * FORUM_QUIET_VISIT), so this needs the phpBB-shaped value predicate, not
  * presence. Unlike phpBB's derived `_u` flag, PunBB's cookie value is a
  * base64'd, pipe-delimited string whose FIRST field IS the numeric user_id
@@ -2416,8 +2425,18 @@ static const char *const  ct_vanilla_args[] = { NULL };
  * safe (bypass is the correct-direction failure), but costs hit rate on
  * guests who merely touched a session-starting action. docs/punbb.md notes
  * this rather than claiming the sharper rule the research suggested.
+ *
+ * COOKIE NAME: PunBB 1.4.x defaults to `forum_cookie`, and its installer
+ * offers a randomised `forum_cookie_<rand>`; `punbb_cookie` was the 1.2-era
+ * default and still appears on upgraded boards. Both are matched as
+ * substrings, so the randomised 1.4 variant is covered by the `forum_cookie`
+ * entry. Matching only `punbb_cookie` (as this row originally did) never
+ * fired on a stock 1.4 install, which served cached guest pages to logged-in
+ * members. An operator who renames `$cookie_name` to anything else must add
+ * their own cache_turbo_bypass — docs/punbb.md says so.
  */
-static const char *const  ct_punbb_cookies[] = { "punbb_cookie", NULL };
+static const char *const  ct_punbb_cookies[] = {
+    "forum_cookie", "punbb_cookie", NULL };
 static const char *const  ct_punbb_uris[] = {
     "/admin.php", "/admin/", "/login.php", "/post.php", "/message_send.php",
     "/message_delete.php", "/misc.php", NULL };
@@ -2425,7 +2444,7 @@ static const char *const  ct_punbb_args[] = { NULL };
 
 /*
  * Phorum. Fixed, version-pinned literal session-cookie constants
- * (phorum_session_v5, phorum_session_st, phorum_admin_session_v5 — PHP
+ * (phorum_session_v5, phorum_session_st, phorum_admin_session — PHP
  * constants in include/api/user.php, not per-install hashes or
  * admin-configurable prefixes) written ONLY by
  * phorum_api_user_session_create(), which is called ONLY from a successful
@@ -2443,7 +2462,7 @@ static const char *const  ct_punbb_args[] = { NULL };
  * those script names directly.
  */
 static const char *const  ct_phorum_cookies[] = {
-    "phorum_session_v5", "phorum_session_st", "phorum_admin_session_v5", NULL };
+    "phorum_session_v5", "phorum_session_st", "phorum_admin_session", NULL };
 static const char *const  ct_phorum_uris[] = {
     "admin.php", "login.php", "register.php", "pm.php", "posting.php",
     "post.php", "moderation.php", "control.php", "ajax.php", "report.php",

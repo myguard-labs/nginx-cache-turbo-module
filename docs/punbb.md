@@ -21,14 +21,15 @@ cache_turbo_backend punbb;
 
 ## Why presence-only (not the value predicate)
 
-The `punbb` preset keys on a cookie named `punbb_cookie`, but that is **not**
-the current PunBB default (verify: `include/common.php` in punbb/punbb, tag
-1.4.4). On PunBB 1.4.x the auth cookie is `$cookie_name` from `config.php`,
-which falls back to **`forum_cookie`** and is randomised to
-`forum_cookie_<random>` by the installer (`admin/install.php`); `punbb_cookie`
-is the older 1.2-era default the preset still anchors on. Line these up first
-(see PHP settings) or member requests are never bypassed — the preset's name
-simply won't be present in the `Cookie` header.
+The `punbb` preset matches two cookie-name substrings: **`forum_cookie`**, the
+PunBB 1.4.x default (verify: `include/common.php` in punbb/punbb, tag 1.4.4 —
+`$cookie_name` in `config.php` falls back to it, and the installer randomises
+it to `forum_cookie_<random>`, which the same substring still covers), and
+**`punbb_cookie`**, the older 1.2-era default that upgraded boards still carry.
+A stock 1.4.x install therefore works out of the box. Only an operator who has
+renamed `$cookie_name` to something matching neither needs to act — see PHP
+settings — otherwise member requests are never bypassed, because the preset's
+names are simply absent from the `Cookie` header.
 
 Unlike phpBB, PunBB does **not** write the auth cookie to every fresh guest.
 `cookie_login()` (`include/functions.php`) only (re)issues `$cookie_name` for a
@@ -52,7 +53,8 @@ to the hot classify path, which no preset here does.
 
 So this ships as **presence-only**: the preset substring-matches the cookie
 **name** in the request `Cookie` header, bypassing whenever anything containing
-`punbb_cookie` is present. Safe (bypass is the correct-direction failure), but
+`forum_cookie` or `punbb_cookie` is present. Safe (bypass is the
+correct-direction failure), but
 PunBB also sets a `<cookie_name>_track` topic-tracking cookie for guests who
 read topics (`set_tracked_topics()`) — it shares the prefix and trips the same
 substring match, so an actively-browsing guest stops being cached.
@@ -128,10 +130,10 @@ curl -sI https://forum.example.com/misc.php?action=markread | grep -i x-cache-tu
 - **Presence-only, not the ideal value predicate.** See above — accept the
   hit-rate cost, or run PunBB behind an app that can decode the cookie
   upstream and set a simpler signal cache-turbo can key on instead.
-- **The preset's `punbb_cookie` is not the 1.4.x default.** `$cookie_name`
-  defaults to `forum_cookie` (installer randomises it to
-  `forum_cookie_<random>`); set it to `punbb_cookie` in `config.php`, or add a
-  `cache_turbo_bypass $cookie_<your_name>;` for the real name — otherwise
+- **A renamed `$cookie_name` defeats the preset.** The defaults
+  (`forum_cookie`, the installer's `forum_cookie_<random>`, and the 1.2-era
+  `punbb_cookie`) are all matched; anything else is not. Add a
+  `cache_turbo_bypass $cookie_<your_name>;` for a custom name — otherwise
   logged-in members are served cached pages.
 - **`Set-Cookie` responses are never stored** and `Authorization` requests are
   never cached, regardless of preset.
@@ -141,13 +143,14 @@ curl -sI https://forum.example.com/misc.php?action=markread | grep -i x-cache-tu
 PunBB-specific only; generic PHP-FPM tuning lives in the other backend guides.
 
 - **`$cookie_name` must line up with the preset.** This is the load-bearing
-  signal. The `punbb` preset substring-matches the literal `punbb_cookie`, but a
-  stock 1.4.x install writes `forum_cookie` (or the installer's
-  `forum_cookie_<random>`). On such an install the preset sees nothing and
-  **every member is served cached pages**. Either set
-  `$cookie_name = 'punbb_cookie';` in `config.php`, or leave the default and add
-  your own `cache_turbo_bypass $cookie_<your_name>;`. The `<cookie_name>_track`
-  topic-tracking cookie shares the prefix and also trips the substring match.
+  signal. The `punbb` preset substring-matches `forum_cookie` (the 1.4.x
+  default, which also covers the installer's `forum_cookie_<random>`) and
+  `punbb_cookie` (the 1.2-era default kept for upgraded boards). A stock
+  install needs no change. If you have set `$cookie_name` in `config.php` to
+  anything else, the preset sees nothing and **every member is served cached
+  pages** — add your own `cache_turbo_bypass $cookie_<your_name>;`. The
+  `<cookie_name>_track` topic-tracking cookie shares the prefix and also trips
+  the substring match.
 - **Guest = user id 1.** PunBB's anonymous user is the row with `id = 1`
   (`set_default_user()` hard-requires it), and the auth cookie's first base64
   field is that id. The preset can't base64-decode on the hot path, so it keys

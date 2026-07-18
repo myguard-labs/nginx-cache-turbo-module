@@ -1405,6 +1405,32 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # Forum presets whose cookie rules were corrected after the docs
+        # deep-research pass (punbb / vanilla / phorum). Their cookie rules are
+        # path-independent, so a prefixed location exercises them; the URI rules
+        # anchor at position 0 and are not what these locations test.
+        location /punbb/ {{
+            cache_turbo         main;
+            cache_turbo_backend punbb;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        location /vanilla/ {{
+            cache_turbo         main;
+            cache_turbo_backend vanilla;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        location /phorum/ {{
+            cache_turbo         main;
+            cache_turbo_backend phorum;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # A NAMED preset must pull in ONLY its own rules. `wordpress` here must
         # not react to /login, /user, /session, /index.php or another preset's
         # cookies -- those are other backends' surfaces and are perfectly
@@ -3111,6 +3137,89 @@ def test_phpbb_preset(ng: Nginx, origin: Origin) -> None:
         (f"empty '_u=' is not the guest literal '1' — must bypass (cleared/"
          f"malformed cookie, safe direction), got {he.get('x-cache')}")
     drain_origin(origin)
+
+
+def test_punbb_cookie_name_default(ng: Nginx, origin: Origin) -> None:
+    """punbb preset must fire on the PunBB 1.4.x default cookie name.
+
+    The row originally matched only `punbb_cookie`, the 1.2-era default. PunBB
+    1.4.x names the auth cookie `$cookie_name` from config.php, which falls
+    back to `forum_cookie` and which the installer randomises to
+    `forum_cookie_<random>`. On a stock 1.4 board the preset therefore never
+    matched and logged-in members were served cached guest pages. Both names
+    are matched now; the substring also covers the randomised variant.
+    Verified against punbb/punbb tag 1.4.4 (include/common.php,
+    admin/install.php)."""
+    for i, cookie in enumerate(("forum_cookie=NDJ8YWJj",
+                                "forum_cookie_9f3a1c=NDJ8YWJj",
+                                "punbb_cookie=NDJ8YWJj")):
+        uri = f"/punbb/topic-{i}"
+        m = {"Cookie": cookie}
+        fetch(ng.port, uri, headers=m)
+        _, _, h = fetch(ng.port, uri, headers=m)
+        assert "x-cache" not in h, \
+            (f"a PunBB member carrying '{cookie}' MUST bypass, got "
+             f"{h.get('x-cache')} -- matching only the 1.2-era punbb_cookie "
+             "served cached guest pages to members on a stock 1.4 board")
+
+
+def test_vanilla_guest_cookies_stay_cacheable(ng: Nginx,
+                                              origin: Origin) -> None:
+    """vanilla preset must match `Vanilla=`, not the bare `Vanilla` prefix.
+
+    Vanilla derives several GUEST-issued cookie names from the same
+    Garden.Cookie.Name prefix: `Vanilla-tk` (CSRF transient key) and
+    `Vanilla-Vv` (visit tracker). A bare-prefix rule matched those and served
+    BYPASS to every returning anonymous visitor, leaving the cache to answer
+    only cookie-less first hits and crawlers -- the guest-issued-cookie trap
+    the preset registry's own header comment forbids. The `=` anchors on the
+    identity cookie's delimiter instead.
+
+    Both directions are asserted: the guest cookies must stay cacheable AND the
+    real identity cookie must still bypass. Do not drop the `=`."""
+    guest = {"Cookie": "Vanilla-Vv=1; Vanilla-tk=1650000000.abcdef"}
+    fetch(ng.port, "/vanilla/discussion-a", headers=guest)
+    _, _, hg = fetch(ng.port, "/vanilla/discussion-a", headers=guest)
+    assert hg.get("x-cache") == "HIT", \
+        (f"a returning GUEST carrying only Vanilla-tk / Vanilla-Vv must stay "
+         f"cacheable, got {hg.get('x-cache')} -- both are issued to everyone")
+
+    authed = {"Cookie": "Vanilla-Vv=1; Vanilla=abc.signed.payload"}
+    fetch(ng.port, "/vanilla/discussion-b", headers=authed)
+    _, _, ha = fetch(ng.port, "/vanilla/discussion-b", headers=authed)
+    assert "x-cache" not in ha, \
+        (f"a logged-in Vanilla member (identity cookie Vanilla=) MUST bypass, "
+         f"got {ha.get('x-cache')}")
+
+
+def test_phorum_admin_session_cookie(ng: Nginx, origin: Origin) -> None:
+    """phorum preset must match the real admin cookie `phorum_admin_session`.
+
+    The row shipped a stale `phorum_admin_session_v5` literal; the PHP constant
+    (PHORUM_SESSION_ADMIN, include/api/user.php) has no `_v5` suffix, so a pure
+    admin-session cookie never matched by name. Live impact was nil because
+    /admin.php bypasses by URI, but the literal was wrong. Verified against
+    Phorum Core v6.0.3. The member session cookies are asserted alongside it so
+    a future edit cannot quietly drop one."""
+    for i, cookie in enumerate(("phorum_admin_session=42:deadbeef",
+                                "phorum_session_v5=42:deadbeef",
+                                "phorum_session_st=42:cafebabe")):
+        uri = f"/phorum/read-{i}"
+        m = {"Cookie": cookie}
+        fetch(ng.port, uri, headers=m)
+        _, _, h = fetch(ng.port, uri, headers=m)
+        assert "x-cache" not in h, \
+            (f"a Phorum session cookie '{cookie}' MUST bypass, got "
+             f"{h.get('x-cache')}")
+
+    # phorum_tmp_cookie is a guest-issued cookie-support probe with no identity
+    # value -- matching it would be a pure hit-rate loss. It must NOT bypass.
+    guest = {"Cookie": "phorum_tmp_cookie=1"}
+    fetch(ng.port, "/phorum/read-guest", headers=guest)
+    _, _, hg = fetch(ng.port, "/phorum/read-guest", headers=guest)
+    assert hg.get("x-cache") == "HIT", \
+        (f"phorum_tmp_cookie is guest-issued and must stay cacheable, got "
+         f"{hg.get('x-cache')}")
 
 
 def test_joomla_preset(ng: Nginx, origin: Origin) -> None:
@@ -7818,6 +7927,9 @@ def run_all(ng: Nginx, origin: Origin,
     test_xenforo_not_in_generic(ng, origin)
     test_discourse_preset(ng, origin)
     test_phpbb_preset(ng, origin)
+    test_punbb_cookie_name_default(ng, origin)
+    test_vanilla_guest_cookies_stay_cacheable(ng, origin)
+    test_phorum_admin_session_cookie(ng, origin)
     test_joomla_preset(ng, origin)
     test_drupal_preset(ng, origin)
     test_mediawiki_preset(ng, origin)

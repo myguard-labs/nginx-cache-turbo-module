@@ -34,11 +34,7 @@ own. The long-term `phorum_session_v5` cookie (value `user_id:sessid`) is the
 load-bearing member signal.
 
 > Verified against Phorum `Core` at v6.0.3 (`include/api/user.php` lines 61–74,
-> `common.php:88`), 2026-07-18. Note: the shipped `phorum` preset matches the
-> admin cookie as `phorum_admin_session_v5` (a stale `_v5` suffix); current
-> Phorum 5/6 names it `phorum_admin_session`. This is harmless in practice —
-> the admin backend is bypassed by the `admin.php` URI rule regardless of the
-> cookie — but the cookie literal in the preset is out of date.
+> `common.php:88`), 2026-07-18.
 
 `phorum_tmp_cookie` **is** guest-issued — a one-shot cookie-support probe with
 no identity value, destroyed on login — and is deliberately absent from the
@@ -124,10 +120,10 @@ curl -sI https://forum.example.com/admin.php | grep -i x-cache-turbo
   rule — it carries no identity, matching it is a pure hit-rate loss.
 - **`Set-Cookie` responses are never stored** and `Authorization` requests are
   never cached, regardless of preset.
-- **The `phorum` preset's admin-cookie literal (`phorum_admin_session_v5`) is
-  stale** — Phorum 5/6 uses `phorum_admin_session`. Admin protection does not
-  depend on it: `/admin.php` is in the preset's URI-bypass list, so the backend
-  is BYPASS by path. Don't rely on the admin *cookie* alone to gate the cache.
+- **Admin protection is by URI, not by cookie.** `/admin.php` is in the
+  preset's URI-bypass list, so the backend is BYPASS by path even if the admin
+  cookie is renamed or absent. Don't rely on the admin *cookie* alone to gate
+  the cache.
 
 ## PHP settings / gotchas
 

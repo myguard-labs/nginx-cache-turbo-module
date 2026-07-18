@@ -26,8 +26,10 @@ site-specific cookie salt. Unlike phpBB/SMF/XenForo, a true guest never
 receives *that* cookie, so presence classifies a member with no value
 predicate needed. Its name is not fixed: it is `Garden.Cookie.Name`, whose
 stock default is `Vanilla` (`conf/config-defaults.php`), so the preset matches
-the **substring** `Vanilla` in the Cookie header rather than an exact name. A
-renamed cookie (`Garden.Cookie.Name` changed, or the SaaS `vf_[site]_<hash>`
+the substring **`Vanilla=`** — the default name plus its delimiter — in the
+Cookie header. The trailing `=` is deliberate: it excludes the guest-issued
+`Vanilla-tk` and `Vanilla-Vv` siblings that share the base prefix (see below).
+A renamed cookie (`Garden.Cookie.Name` changed, or the SaaS `vf_[site]_<hash>`
 naming) won't match and needs a hand-written `cache_turbo_bypass`.
 
 **Verification status:** the default name and the login-only identity cookie
@@ -44,17 +46,16 @@ curl -sI https://forum.example.com/ | grep -i set-cookie
 # a clean first-ever request must show NO "Vanilla=" identity cookie here
 ```
 
-**The prefix-collision caveat (the load-bearing one):** the same base name
-prefixes two cookies Vanilla issues to *everyone*, guests included —
-`Vanilla-tk` (the CSRF transient key) and `Vanilla-Vv` (a ~20-minute sliding
-visit tracker), both documented in the KB above. Each carries the substring
-`Vanilla`, so a returning visitor already holding either is matched and served
-**BYPASS** even though they never logged in. That is safe — a guest is never
-served a member's page and a logged-in view is never cached — but conservative:
-the cache effectively serves only cookie-less first hits and crawlers. If that
-hit rate is too low, front the board so `-tk`/`-Vv` are dropped from the request
-before it reaches the cached `location`, or replace the presence rule with a
-value-checked `cache_turbo_bypass` keyed on the exact identity cookie.
+**The prefix collision the `=` avoids:** the same base name prefixes two
+cookies Vanilla issues to *everyone*, guests included — `Vanilla-tk` (the CSRF
+transient key) and `Vanilla-Vv` (a ~20-minute sliding visit tracker), both
+documented in the KB above. A bare-prefix rule would match those and serve
+**BYPASS** to every returning guest, leaving the cache to answer only
+cookie-less first hits and crawlers. Matching `Vanilla=` instead anchors on the
+identity cookie's delimiter, so `Vanilla-tk` and `Vanilla-Vv` fall through and
+ordinary anonymous traffic still gets cached. If you rename
+`Garden.Cookie.Name`, the same reasoning applies to your prefix: match
+`<name>=`, not `<name>`.
 
 If your install (or a plugin/SSO integration) sets the identity cookie
 `Vanilla=` for anonymous visitors too, this preset is unsafe for you — fall
@@ -122,10 +123,10 @@ curl -sI https://forum.example.com/discussion/1/hello | grep -i x-cache-turbo  #
 curl -sI -H 'Cookie: Vanilla=abc.signed.payload' \
      https://forum.example.com/discussion/1/hello | grep -i x-cache-turbo     # BYPASS
 
-# prefix collision: a returning GUEST carrying -tk / -Vv is ALSO BYPASS
-# (both share the "Vanilla" substring — safe, but see the caveat above).
-curl -sI -H 'Cookie: Vanilla-Vv=1' \
-     https://forum.example.com/discussion/1/hello | grep -i x-cache-turbo     # BYPASS
+# a returning GUEST carrying only -tk / -Vv must still be cacheable:
+# the rule matches "Vanilla=", which neither of those contains.
+curl -sI -H 'Cookie: Vanilla-Vv=1; Vanilla-tk=2' \
+     https://forum.example.com/discussion/1/hello | grep -i x-cache-turbo     # HIT
 
 # dashboard / entry (login/register/SSO): BYPASS
 curl -sI https://forum.example.com/dashboard/ | grep -i x-cache-turbo
@@ -136,10 +137,10 @@ curl -sI https://forum.example.com/dashboard/ | grep -i x-cache-turbo
 - **Verified against the KB + legacy Garden source, not current master** —
   `github.com/vanilla/vanilla` is auth-gated, so confirm with a live anonymous
   `curl` before trusting this in production (see caveat above).
-- **The `-tk` / `-Vv` guest cookies share the `Vanilla` prefix** — returning
-  guests are served BYPASS, so real-world hit rate is limited to cookie-less
-  first hits and crawlers. Safe, but strip those cookies at the edge if you need
-  a higher hit rate.
+- **The `-tk` / `-Vv` guest cookies share the `Vanilla` prefix** — the preset
+  matches `Vanilla=` rather than `Vanilla` so those two do not trip it and
+  returning guests stay cacheable. Keep that `=` in mind if you write your own
+  `cache_turbo_bypass` for a renamed cookie.
 - **Query-string routing (`?p=/entry/signin`) dodges the URI bypasses.** The
   `/dashboard` and `/entry/` bypass rules match the request *path*; with
   `Garden.RewriteUrls` off the route lives in the `p=` query arg and `r->uri` is
@@ -158,8 +159,9 @@ Vanilla-specific PHP-FPM notes for the box behind this cache:
 - **`Garden.Cookie.Name` drives the whole cookie family.** The identity cookie,
   the `-tk` CSRF token and the `-Vv` visit tracker all take this prefix (default
   `Vanilla`). If an operator sets it in `conf/config.php`
-  (`$Configuration['Garden']['Cookie']['Name']`), the preset's `Vanilla`
-  substring stops matching — retune with `cache_turbo_bypass`. The SaaS naming
+  (`$Configuration['Garden']['Cookie']['Name']`), the preset's `Vanilla=`
+  substring stops matching — retune with `cache_turbo_bypass`, keyed on
+  `<your-name>=` so the `-tk` / `-Vv` siblings stay out of it. The SaaS naming
   `vf_[site]_<hash>` is a different prefix and never matches; this preset targets
   the self-hosted open-source build.
 - **`Gdn_Cache` is a *separate* layer.** Vanilla has its own object cache
