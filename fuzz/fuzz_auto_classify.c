@@ -104,10 +104,13 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     {
         ngx_str_t   kcname, kcval;
         volatile u_char  sink = 0;
+        ngx_uint_t  cursor = 0;
         size_t      j;
 
-        if (ngx_http_cache_turbo_key_cookie(&r, clcf.backend_presets,
-                                            &kcname, &kcval))
+        /* Drive the iterator to exhaustion: every declared key cookie is a
+         * separate raw-Cookie scan, so each one needs the fuzzed bytes. */
+        while (ngx_http_cache_turbo_key_cookie(&r, clcf.backend_presets,
+                                               &cursor, &kcname, &kcval))
         {
             for (j = 0; j < kcval.len; j++) {
                 sink = (u_char) (sink ^ kcval.data[j]);

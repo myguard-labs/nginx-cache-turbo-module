@@ -62,7 +62,8 @@ static char *ngx_http_cache_turbo_cache_control(ngx_conf_t *cf,
 static ngx_int_t ngx_http_cache_turbo_auto_skip(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf);
 static ngx_int_t ngx_http_cache_turbo_key_cookie(ngx_http_request_t *r,
-    ngx_uint_t backend_presets, ngx_str_t *name_out, ngx_str_t *val_out);
+    ngx_uint_t backend_presets, ngx_uint_t *cursor, ngx_str_t *name_out,
+    ngx_str_t *val_out);
 static ngx_int_t ngx_http_cache_turbo_cookie_lookup(ngx_http_request_t *r,
     ngx_str_t *name, ngx_str_t *val_out);
 static ngx_int_t ngx_http_cache_turbo_bypass_uri_match(ngx_http_request_t *r,
@@ -659,6 +660,47 @@ ngx_http_cache_turbo_blob_validate(const u_char *blob, size_t len,
 }
 
 
+/*
+ * Append ONE key cookie to the key under construction, with the unforgeable
+ * length-prefixed framing both the preset and the DIY path use: 0x1f tag, then
+ * the name length and the value length as fixed 4-byte fields, then the name
+ * and value bytes. See the call sites for why a length prefix and not a
+ * delimiter (a delimiter would be forgeable from a request header).
+ *
+ * Folding is append-only, so calling this once per present cookie yields a key
+ * that depends on every one of them. Order is the caller's iteration order,
+ * which is fixed by the preset table / the config, so the key is deterministic.
+ */
+static ngx_int_t
+ngx_http_cache_turbo_key_fold_cookie(ngx_http_request_t *r,
+    ngx_http_cache_turbo_ctx_t *ctx, ngx_str_t *name, ngx_str_t *val)
+{
+    u_char  *k, *p;
+    size_t   klen;
+
+    klen = ctx->cache_key.len + 1 + 4 + 4 + name->len + val->len;
+
+    k = ngx_pnalloc(r->pool, klen);
+    if (k == NULL) {
+        return NGX_ERROR;
+    }
+
+    p = ngx_cpymem(k, ctx->cache_key.data, ctx->cache_key.len);
+    *p++ = '\x1f';
+    ngx_http_cache_turbo_put_u32(p, (uint32_t) name->len);
+    p += 4;
+    ngx_http_cache_turbo_put_u32(p, (uint32_t) val->len);
+    p += 4;
+    p = ngx_cpymem(p, name->data, name->len);
+    ngx_memcpy(p, val->data, val->len);
+
+    ctx->cache_key.data = k;
+    ctx->cache_key.len = klen;
+
+    return NGX_OK;
+}
+
+
 /* Build the cache key string and its hash into the request ctx. */
 static ngx_int_t
 ngx_http_cache_turbo_build_key(ngx_http_request_t *r,
@@ -711,32 +753,20 @@ ngx_http_cache_turbo_build_key(ngx_http_request_t *r,
      * key cookies from ever producing the same fold from different cookies.
      */
     if (NGX_HTTP_CACHE_TURBO_HAS_BACKEND(clcf->backend_presets)) {
-        ngx_str_t  kcname, kcval;
+        ngx_str_t   kcname, kcval;
+        ngx_uint_t  cursor = 0;
 
-        if (ngx_http_cache_turbo_key_cookie(r, clcf->backend_presets,
-                                            &kcname, &kcval))
+        /* EVERY present key cookie is folded, not just the first: a preset may
+         * declare several, and a cookie the key ignores is one two different
+         * users can differ in while sharing an entry. */
+        while (ngx_http_cache_turbo_key_cookie(r, clcf->backend_presets,
+                                               &cursor, &kcname, &kcval))
         {
-            u_char  *k, *p;
-            size_t   klen;
-
-            klen = ctx->cache_key.len + 1 + 4 + 4 + kcname.len + kcval.len;
-
-            k = ngx_pnalloc(r->pool, klen);
-            if (k == NULL) {
+            if (ngx_http_cache_turbo_key_fold_cookie(r, ctx, &kcname, &kcval)
+                != NGX_OK)
+            {
                 return NGX_ERROR;
             }
-
-            p = ngx_cpymem(k, ctx->cache_key.data, ctx->cache_key.len);
-            *p++ = '\x1f';
-            ngx_http_cache_turbo_put_u32(p, (uint32_t) kcname.len);
-            p += 4;
-            ngx_http_cache_turbo_put_u32(p, (uint32_t) kcval.len);
-            p += 4;
-            p = ngx_cpymem(p, kcname.data, kcname.len);
-            ngx_memcpy(p, kcval.data, kcval.len);
-
-            ctx->cache_key.data = k;
-            ctx->cache_key.len = klen;
         }
     }
 
@@ -771,28 +801,10 @@ ngx_http_cache_turbo_build_key(ngx_http_request_t *r,
                 continue;
             }
 
+            if (ngx_http_cache_turbo_key_fold_cookie(r, ctx, &nm[i], &kcval)
+                != NGX_OK)
             {
-                u_char  *k, *p;
-                size_t   klen;
-
-                klen = ctx->cache_key.len + 1 + 4 + 4 + nm[i].len + kcval.len;
-
-                k = ngx_pnalloc(r->pool, klen);
-                if (k == NULL) {
-                    return NGX_ERROR;
-                }
-
-                p = ngx_cpymem(k, ctx->cache_key.data, ctx->cache_key.len);
-                *p++ = '\x1f';
-                ngx_http_cache_turbo_put_u32(p, (uint32_t) nm[i].len);
-                p += 4;
-                ngx_http_cache_turbo_put_u32(p, (uint32_t) kcval.len);
-                p += 4;
-                p = ngx_cpymem(p, nm[i].data, nm[i].len);
-                ngx_memcpy(p, kcval.data, kcval.len);
-
-                ctx->cache_key.data = k;
-                ctx->cache_key.len = klen;
+                return NGX_ERROR;
             }
         }
     }
@@ -3142,17 +3154,32 @@ ngx_http_cache_turbo_auto_skip(ngx_http_request_t *r,
  * read from or write to. Every header is scanned; the FIRST occurrence of the
  * name wins, which is the same rule a browser's own single header would give.
  *
+ * This is an ITERATOR, not a single lookup. A preset may declare several key
+ * cookies (and several presets may be enabled at once); returning only the
+ * first present one made every cookie behind it dead — the key ignored it, so
+ * two requests that differ only in that cookie shared an entry, which is the
+ * cache leak the key cookie exists to prevent. The caller drives it to
+ * exhaustion and folds EVERY present cookie into the key.
+ *
+ * *cursor must be 0 on the first call and is carried unchanged between calls;
+ * it is the index (over the flattened enabled-preset x key-cookie sequence) of
+ * the next candidate to examine. The sequence is walked from the start each
+ * call — it is at most a dozen entries, and this keeps the iterator a pure
+ * function of (request, presets, cursor).
+ *
  * *name_out is set to the matched preset name so the key can record WHICH cookie
  * produced the value (two presets with key cookies must not produce the same key
  * suffix from different cookies). Returns 1 when a key cookie was found.
  */
 static ngx_int_t
 ngx_http_cache_turbo_key_cookie(ngx_http_request_t *r,
-    ngx_uint_t backend_presets, ngx_str_t *name_out, ngx_str_t *val_out)
+    ngx_uint_t backend_presets, ngx_uint_t *cursor, ngx_str_t *name_out,
+    ngx_str_t *val_out)
 {
     const ngx_http_cache_turbo_preset_t  *ps;
     const char *const                    *pp;
     size_t                                nmlen;
+    ngx_uint_t                            idx = 0;
 #if (nginx_version >= 1023000)
     ngx_table_elt_t                      *ck;
 #else
@@ -3165,7 +3192,12 @@ ngx_http_cache_turbo_key_cookie(ngx_http_request_t *r,
             continue;
         }
 
-        for (pp = ps->key_cookies; *pp; pp++) {
+        for (pp = ps->key_cookies; *pp; pp++, idx++) {
+
+            if (idx < *cursor) {         /* already returned by an earlier call */
+                continue;
+            }
+
             nmlen = ngx_strlen(*pp);
 
 #if (nginx_version >= 1023000)
@@ -3176,6 +3208,7 @@ ngx_http_cache_turbo_key_cookie(ngx_http_request_t *r,
                 {
                     name_out->data = (u_char *) *pp;
                     name_out->len = nmlen;
+                    *cursor = idx + 1;
                     return 1;
                 }
             }
@@ -3188,6 +3221,7 @@ ngx_http_cache_turbo_key_cookie(ngx_http_request_t *r,
                 {
                     name_out->data = (u_char *) *pp;
                     name_out->len = nmlen;
+                    *cursor = idx + 1;
                     return 1;
                 }
             }
@@ -3195,6 +3229,7 @@ ngx_http_cache_turbo_key_cookie(ngx_http_request_t *r,
         }
     }
 
+    *cursor = idx;                       /* sequence exhausted */
     return 0;
 }
 /* >>> FUZZ-EXTRACT auto-classify END <<< */
