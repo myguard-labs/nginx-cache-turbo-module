@@ -3573,6 +3573,37 @@ def test_preset_arg_scanner(ng: Nginx, origin: Origin) -> None:
             (f"?{q} is an ordinary read route and must stay cacheable, got "
              f"{h.get('x-cache')}")
 
+    # PHP's key mangling. php_register_variable_ex() rewrites '.' and ' ' to
+    # '_' when it builds a $_GET key, so "?.xfToken=" reaches XenForo as
+    # "_xfToken" -- the exact argument name the preset bypasses on, and a
+    # percent-decoding-only matcher misses every alias. A literal '+' is a
+    # space in form encoding and mangles the same way. The fold is applied to
+    # every preset, not only the PHP ones: on Discourse (Rack, which does not
+    # mangle) it can only ever cost an unnecessary bypass, which is the safe
+    # direction, so the discourse arms below pin the uniform behaviour.
+    for uri in ("/xf/thread-mangle?%2ExfToken=1650000000,abcdef",
+                "/xf/thread-mangle2?+xfToken=1650000000,abcdef",
+                "/dc/topic-mangle?api%2Ekey=deadbeef",
+                "/dc/topic-mangle2?api%20username=admin"):
+        fetch(ng.port, uri)
+        _, _, h = fetch(ng.port, uri)
+        assert "x-cache" not in h, \
+            (f"{uri} must bypass -- PHP folds '.', ' ' and a literal '+' in an "
+             f"argument NAME to '_', got {h.get('x-cache')}")
+
+    # ...but the mangling is a NAME rule only, and PHP leaves values alone.
+    # An unrelated name that merely contains the fold characters must not
+    # suddenly match, or every preset with an underscore in an arg row starts
+    # bypassing traffic it has no business seeing.
+    for uri in ("/xf/thread-nomangle?x.xfToken=1", "/dc/topic-nomangle?api.keyx=1"):
+        fetch(ng.port, uri)
+        _, _, h = fetch(ng.port, uri)
+        assert h.get("x-cache") == "HIT", \
+            (f"{uri} matches no preset argument and must stay cacheable, got "
+             f"{h.get('x-cache')}")
+
+    drain_origin(origin)
+
 
 def test_phorum_uri_rules_anchor_at_root(ng: Nginx, origin: Origin) -> None:
     """phorum URI rules must carry a leading slash.
@@ -8621,7 +8652,8 @@ def main() -> int:
           "cookie predicate multi-match (guest cookie must not mask a member "
           "in the same header, both orders, two-guests still cacheable), "
           "preset arg scanner (';' separator, percent-decoded name and value, "
-          "later occurrence, read routes still cached), "
+          "later occurrence, PHP '.'/' '/'+' key mangling, read routes still "
+          "cached), "
           "vbulletin preset (NONEMPTY/EQ arms, empty value logged-out, "
           "bb_language keyed, bb_lastvisit NOT keyed), "
           "invision preset (_loggedIn suffix bypass, ips4_theme keyed, "

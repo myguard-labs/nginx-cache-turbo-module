@@ -224,7 +224,14 @@ curl -sI -H 'Cookie: _forum_session=guestsess' \
   `DISCOURSE_DISABLE_ANON_CACHE=1` and watch your origin latency, not because you
   should run it that way.
 - **The API is a bypass surface.** `?api_key=` / `?api_username=` requests are
-  authenticated by query arg, not cookie; the preset bypasses on both.
+  authenticated by query arg, not cookie; the preset bypasses on both. The
+  match is done by the preset's own scanner: it splits on `;` as well as `&`,
+  checks every occurrence of a name rather than the first, and percent-decodes
+  before comparing. A hand-written `$arg_api_key` rule does none of that — use
+  the preset. The scanner also folds `.`, space and `+` in an argument name to
+  `_`, which is PHP's `$_GET` key mangling; Rack does not do that, so on
+  Discourse the fold only ever costs an unnecessary bypass on a URL like
+  `?api.key=…` that Discourse would not have authenticated anyway.
 - **`Set-Cookie` responses are never stored** and `Authorization` requests are
   never cached, regardless of preset.
 

@@ -3105,21 +3105,38 @@ ngx_http_cache_turbo_hexval(u_char c)
  * Malformed escapes ("%", "%A", "%GG") compare as a literal '%' followed by
  * whatever follows it, which is how PHP's parser leaves them.
  *
- * '+' is deliberately NOT folded to a space. Every needle is a fixed route
- * token with no space in it, so neither treatment can create or destroy a
- * match, and leaving it alone keeps this a plain percent-decoder.
+ * `name` selects PHP's key mangling, and only argument NAMES get it. PHP builds
+ * $_GET keys through php_register_variable_ex(), which rewrites '.' and ' ' to
+ * '_' — a habit inherited from register_globals, where a key had to be a legal
+ * variable name. So "%2ExfToken", "xf+Token" and "ips4.hasJS" all arrive at the
+ * application as "_xfToken" / "xf_Token" / "ips4_hasJS", and a matcher that
+ * only percent-decodes misses every one of them. Underscores are common in the
+ * needles (_xfToken, api_key, ips4_theme, woocommerce_cart_hash), so this is
+ * the same fail-open as the encoding case, one alphabet further out.
+ *
+ * A LITERAL '+' is a space here (form encoding), so it mangles to '_' too; a
+ * percent-escaped one ("%2B") decodes to a real '+' and PHP leaves it alone, so
+ * the two are tracked apart. PHP additionally strips leading spaces from a key,
+ * which this does not — a leading space folds to '_' instead. That direction
+ * over-matches (an unnecessary bypass, hit rate only) where the alternative
+ * would under-match, which is a cached private page.
+ *
+ * VALUES are never mangled by PHP and are not mangled here. A '+' in a value
+ * stays a '+': every needle value is a fixed route token with no space in it,
+ * so no treatment of '+' can create or destroy a match.
  */
 static ngx_int_t
 ngx_http_cache_turbo_qs_eq(u_char *p, u_char *end, const char *needle,
-    size_t nlen)
+    size_t nlen, ngx_uint_t name)
 {
     size_t     i;
     u_char     c;
-    ngx_int_t  hi, lo;
+    ngx_int_t  hi, lo, decoded;
 
     for (i = 0; p < end; i++) {
 
         c = *p++;
+        decoded = 0;
 
         if (c == '%' && (size_t) (end - p) >= 2
             && (hi = ngx_http_cache_turbo_hexval(p[0])) >= 0
@@ -3127,6 +3144,16 @@ ngx_http_cache_turbo_qs_eq(u_char *p, u_char *end, const char *needle,
         {
             c = (u_char) ((hi << 4) | lo);
             p += 2;
+            decoded = 1;
+        }
+
+        if (name) {
+            if (c == '+' && !decoded) {
+                c = '_';                /* literal '+' is a space, and mangles */
+
+            } else if (c == '.' || c == ' ') {
+                c = '_';
+            }
         }
 
         if (i >= nlen || c != (u_char) needle[i]) {
@@ -3201,14 +3228,14 @@ ngx_http_cache_turbo_arg_match(ngx_http_request_t *r, const char *name,
             /* Valueless argument ("?...&sid&..."). Only a bare-NAME rule can
              * match it; a NAME=VALUE rule has nothing to compare against. */
             if (value == NULL
-                && ngx_http_cache_turbo_qs_eq(pair, pend, name, nlen))
+                && ngx_http_cache_turbo_qs_eq(pair, pend, name, nlen, 1))
             {
                 return 1;
             }
             continue;
         }
 
-        if (!ngx_http_cache_turbo_qs_eq(pair, eq, name, nlen)) {
+        if (!ngx_http_cache_turbo_qs_eq(pair, eq, name, nlen, 1)) {
             continue;
         }
 
@@ -3216,7 +3243,7 @@ ngx_http_cache_turbo_arg_match(ngx_http_request_t *r, const char *name,
             return 1;
         }
 
-        if (ngx_http_cache_turbo_qs_eq(eq + 1, pend, value, vlen)) {
+        if (ngx_http_cache_turbo_qs_eq(eq + 1, pend, value, vlen, 0)) {
             return 1;
         }
     }
