@@ -193,20 +193,21 @@ http {
 
     upstream fastcgi_backend { server unix:/run/php/php-fpm.sock; }
 
+    # The preset's URI rules match $uri, which try_files has already rewritten
+    # to /index.php by the time the module runs, so the preset's uris[] can
+    # never fire on a Magento vhost. Gate the private surfaces on $request_uri
+    # instead -- the ORIGINAL request line, which an internal redirect does not
+    # touch -- and apply the result inside the .php location below.
+    map $request_uri $magento_private {
+        default                                          0;
+        "~^/(checkout|customer|sales|wishlist)([/?]|$)"   1;
+    }
+
     server {
         listen 443 ssl http2;
         server_name shop.example.com;
         set $MAGE_ROOT /var/www/magento;
         root $MAGE_ROOT/pub;
-
-        # The preset's URI rules match $uri, which try_files has already
-        # rewritten to /index.php by the time the module runs. Gate the private
-        # surfaces here, BEFORE the rewrite, where the original path is still
-        # visible. Without these four blocks the preset's uris[] can never fire.
-        location ^~ /checkout { cache_turbo off; try_files $uri $uri/ /index.php$is_args$args; }
-        location ^~ /customer { cache_turbo off; try_files $uri $uri/ /index.php$is_args$args; }
-        location ^~ /sales    { cache_turbo off; try_files $uri $uri/ /index.php$is_args$args; }
-        location ^~ /wishlist { cache_turbo off; try_files $uri $uri/ /index.php$is_args$args; }
 
         location / {
             try_files $uri $uri/ /index.php$is_args$args;
@@ -224,6 +225,19 @@ http {
             cache_turbo_valid         300s;      # catalog tolerates a long TTL
             cache_turbo_valid         404 410 1m;
             cache_turbo_preset        balanced;
+
+            # Cart / account / order / wishlist: never serve from cache, and
+            # never store either. Both directives are required -- bypass alone
+            # still stores, which would write a logged-in customer's page into
+            # the zone under the original URL.
+            #
+            # Do NOT try to do this with `location ^~ /checkout { cache_turbo
+            # off; }` instead. try_files internally redirects to /index.php,
+            # nginx then re-runs the location search, and THIS block's config is
+            # what governs the response -- the `cache_turbo off` set in the
+            # /checkout block is discarded before the module ever runs.
+            cache_turbo_bypass        $magento_private;
+            cache_turbo_no_store      $magento_private;
 
             fastcgi_pass   fastcgi_backend;
             fastcgi_param  PHP_FLAG "session.auto_start=off";

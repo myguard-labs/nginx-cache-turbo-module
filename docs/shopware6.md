@@ -119,19 +119,20 @@ http {
 
     upstream fastcgi_backend { server unix:/run/php/php-fpm.sock; }
 
+    # The preset's URI rules match $uri, which try_files has already rewritten
+    # to /index.php by the time the module runs, so the preset's uris[] can
+    # never fire on a Shopware vhost. Gate the private surfaces on $request_uri
+    # instead -- the ORIGINAL request line, which an internal redirect does not
+    # touch -- and apply the result inside the .php location below.
+    map $request_uri $shopware_private {
+        default                                    0;
+        "~^/(account|checkout|admin|api)([/?]|$)"  1;
+    }
+
     server {
         listen 443 ssl http2;
         server_name shop.example.com;
         root /var/www/shopware/public;
-
-        # The preset's URI rules match $uri, which try_files has already
-        # rewritten to /index.php by the time the module runs. Gate the private
-        # surfaces here, BEFORE the rewrite, where the original path is still
-        # visible. Without these four blocks the preset's uris[] can never fire.
-        location ^~ /account  { cache_turbo off; try_files $uri /index.php$is_args$args; }
-        location ^~ /checkout { cache_turbo off; try_files $uri /index.php$is_args$args; }
-        location ^~ /admin    { cache_turbo off; try_files $uri /index.php$is_args$args; }
-        location ^~ /api      { cache_turbo off; try_files $uri /index.php$is_args$args; }
 
         location / {
             try_files $uri /index.php$is_args$args;
@@ -149,6 +150,19 @@ http {
             cache_turbo_valid         300s;
             cache_turbo_valid         404 410 1m;
             cache_turbo_preset        balanced;
+
+            # Account / cart / admin / Store-API: never serve from cache, and
+            # never store either. Both directives are required -- bypass alone
+            # still stores, which would write a logged-in customer's page into
+            # the zone under the original URL.
+            #
+            # Do NOT try to do this with `location ^~ /account { cache_turbo
+            # off; }` instead. try_files internally redirects to /index.php,
+            # nginx then re-runs the location search, and THIS block's config is
+            # what governs the response -- the `cache_turbo off` set in the
+            # /account block is discarded before the module ever runs.
+            cache_turbo_bypass        $shopware_private;
+            cache_turbo_no_store      $shopware_private;
 
             fastcgi_pass   fastcgi_backend;
             fastcgi_param  SCRIPT_FILENAME $realpath_root$fastcgi_script_name;
