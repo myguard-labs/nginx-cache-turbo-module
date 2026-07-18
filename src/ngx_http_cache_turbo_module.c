@@ -1970,16 +1970,46 @@ static const char *const  ct_drupal_args[] = { NULL };
  *
  * MediaWiki's dynamic surface is in the QUERY ARGS, not the path: /wiki/<Title>
  * is the cacheable read path and /index.php?action=... is the dynamic one. Only
- * the MUTATING actions are listed. action=raw, action=history, diff=, oldid= are
+ * the MUTATING actions are listed, enumerated from ActionFactory::CORE_ACTIONS.
+ * action=view, =history, =raw, =render, =info, =credits, diff= and oldid= are
  * all deliberately absent — they are deterministic, shared, hot, and perfectly
  * cacheable; bypassing them is a measurable hit-rate loss. veaction= is the
  * VisualEditor entry point and is always dynamic. printable= is a presentation
  * variant and belongs in cache_turbo_key.
  *
- * Like Drupal, MediaWiki sends `private, must-revalidate, max-age=0` to a
- * logged-in user (Output/OutputPage.php), which the implied cache_control honor
- * already refuses to store. Upstream's own recommended Varnish VCL leans on
- * exactly this: cookies plus Cache-Control, no path rules.
+ * THIS LIST USED TO BE EMPTY while the comment above claimed it was populated.
+ * The rows are new; what follows is why the floor that covered for them is not
+ * sufficient on its own.
+ *
+ * MediaWiki's non-view Cache-Control floor is DEFAULT-DENY, and much stronger
+ * than "mutating actions are marked private". OutputPage::$mCdnMaxage starts at
+ * 0 (Output/OutputPage.php), and core raises it in exactly one place —
+ * Actions/ActionEntryPoint.php::performAction():
+ *
+ *     if ( UseCdn ) {
+ *         if ( $request->matchURLForCDN( $htmlCacheUpdater->getUrls( $title ) ) )
+ *             $output->setCdnMaxage( CdnMaxAge );
+ *         elseif ( $action instanceof ViewAction )
+ *             $output->setCdnMaxage( 3600 );
+ *     }
+ *
+ * So a nonzero s-maxage requires a ViewAction or an exact match against the
+ * title's PURGEABLE canonical URLs — an ?action= URL is neither. Every other
+ * action falls to `$privateReason = 'no-maxage'` in sendCacheControl() and gets
+ * `private, must-revalidate, max-age=0`. None of those conditions is
+ * identity-dependent, so this holds for ANONYMOUS requesters too — that was the
+ * untested half of the claim, and it checks out. With UseCdn off, the same
+ * function takes `$privateReason = 'config'` and everything is private anyway.
+ *
+ * THE ROWS ARE STILL SHIPPED, for the drupal reason (see ct_drupal_cookies):
+ * `cache_turbo_cache_control ignore` switches that floor off, and correctness
+ * cannot rest on a floor an operator can remove. The cost of carrying them is
+ * ~zero — the read path is /wiki/<Title> with no action argument at all, and
+ * every hot ?action= value is deliberately NOT listed.
+ *
+ * Upstream's own recommended Varnish VCL does lean purely on cookies plus
+ * Cache-Control with no path rules — and that remains true of the PATH tier
+ * here, which is empty. These are argument rules, not path rules.
  *
  * THERE ARE NO URI RULES, and that is the whole point — it is what "no path
  * rules" above actually means. Three used to be here; all three were wrong:
@@ -2005,7 +2035,14 @@ static const char *const  ct_drupal_args[] = { NULL };
 static const char *const  ct_mw_cookies[] = {
     "Token=", "_session=", "UserID=", NULL };
 static const char *const  ct_mw_uris[] = { NULL };
-static const char *const  ct_mw_args[] = { "veaction", "returnto", NULL };
+static const char *const  ct_mw_args[] = {
+    "veaction", "returnto",
+    /* ActionFactory::CORE_ACTIONS, mutating half only. The read half
+     * (view/history/raw/render/info/credits) is deliberately absent. */
+    "action=edit", "action=submit", "action=delete", "action=protect",
+    "action=unprotect", "action=purge", "action=rollback", "action=revert",
+    "action=watch", "action=unwatch", "action=markpatrolled",
+    "action=mcrundo", "action=mcrrestore", NULL };
 
 /*
  * Magento 2 (2.4.x). ONE cookie: X-Magento-Vary. Magento is built to sit behind a

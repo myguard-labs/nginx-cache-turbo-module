@@ -3968,10 +3968,52 @@ def test_mediawiki_preset(ng: Nginx, origin: Origin) -> None:
         ("mywikiUserName survives logout (login-form pre-fill), so an ex-member "
          f"reading anonymously must still cache, got {hn.get('x-cache')}")
 
+    # Every MUTATING core action must bypass on the ARG alone, with no cookie
+    # present. ct_mw_args used to hold only veaction/returnto while the registry
+    # comment claimed "Only the MUTATING actions are listed" -- there was no
+    # action= row of any kind. Fetch twice: a bypass and a first-time MISS are
+    # indistinguishable on one fetch (both lack x-cache), and only the bypass
+    # still lacks it on the second.
+    #
+    # A logged-in actor is already covered by the cookie rule, and MediaWiki's
+    # own floor covers the anonymous case (mCdnMaxage stays 0 for anything that
+    # is not a ViewAction or a purgeable URL, so sendCacheControl() emits
+    # `private`). These arms are cookie-less and do not rely on that floor: the
+    # origin here sends no Cache-Control at all, which is precisely the
+    # `cache_turbo_cache_control ignore` shape the rows exist for.
+    for act in ("edit", "submit", "delete", "protect", "unprotect", "purge",
+                "rollback", "revert", "watch", "unwatch", "markpatrolled",
+                "mcrundo", "mcrrestore"):
+        uri = f"/wiki/Article-m?action={act}"
+        fetch(ng.port, uri)
+        _, _, hm = fetch(ng.port, uri)
+        assert "x-cache" not in hm, \
+            (f"?action={act} is a mutating MediaWiki core action and must "
+             f"bypass with no cookie present, got {hm.get('x-cache')}")
+
+    # MediaWiki writes ?title=Foo&action=edit -- the action is not the first
+    # argument. Percent-encoded too: PHP routes ?%61ction=edit identically.
+    for uri in ("/index.php?title=Foo&action=edit",
+                "/index.php?title=Foo&%61ction=delete"):
+        fetch(ng.port, uri)
+        _, _, hp = fetch(ng.port, uri)
+        assert "x-cache" not in hp, \
+            (f"{uri} must bypass -- the action is not the first argument and "
+             f"may be percent-encoded, got {hp.get('x-cache')}")
+
     # The read path and the deliberately-cacheable args must all still cache.
+    # action=render/info/credits are the rows a future editor is most likely to
+    # add by reflex when extending the mutating list -- they are core actions
+    # sitting right beside the ones above in CORE_ACTIONS, and they are hot,
+    # deterministic and shared. Pinning them here is what makes the list a
+    # decision rather than an accident.
     for uri in ("/wiki/Article-c",
                 "/wiki/Article-c?action=raw",
                 "/wiki/Article-c?action=history",
+                "/wiki/Article-c?action=render",
+                "/wiki/Article-c?action=info",
+                "/wiki/Article-c?action=credits",
+                "/wiki/Article-c?action=view",
                 "/wiki/Article-c?oldid=12345",
                 "/wiki/Article-c?diff=12345"):
         fetch(ng.port, uri)
@@ -8872,6 +8914,8 @@ def main() -> int:
           "mybb preset (user-suffix bypass survives cookieprefix, mybbtheme keyed exactly, look-alike cookie cannot steer buckets), "
           "yabb preset (Y2* triple bypass, action=logout/login/post/admin/pm "
           "bypass cookie-less, ';'-separated logout, plain reads cached), "
+          "mediawiki preset (13 mutating core actions bypass cookie-less, "
+          "encoded/non-first action, render/info/credits/view stay cached), "
           "punbb/phorum URI rows (edit/delete/moderate/profile/register bypass, "
           "phorum file.php attachment bypass, userlist.php/search.php stay "
           "cached), "
