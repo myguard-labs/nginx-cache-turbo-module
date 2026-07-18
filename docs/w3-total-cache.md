@@ -71,7 +71,7 @@ already bypasses on. **Nothing new to add for identity.**
 | `wp-postpass_*` | **bypass** (preset, auto) | password-protected post reader |
 | `comment_author_*` | **bypass** (preset, auto) | commenter personalization |
 | `w3tc_referrer` | **key (variant) — only if you use Referrer / User-Agent Groups** | Confirmed in source (W3TC 2.10.2, `Mobile_Referrer.php`, `W3TC_REFERRER_COOKIE_NAME`). Not an identity or session cookie: W3TC sets it only when a Referrer Group or User-Agent Group is enabled, to store the visitor's referrer so the cached *variant* stays consistent across page views. It carries no login signal. If you run those groups it's the cookie W3TC varies caching on — mirror it into `cache_turbo_key_cookie` so cache-turbo varies the same way; if you don't use the groups it is never set. |
-| `w3tc_logged_out` | **bypass — optional, transient** | Confirmed in source (`PgCache_Plugin.php` sets it in `on_logout()`, clears it in `on_login()`; `PgCache_Environment.php` adds it to `$reject_cookies` unconditionally). It is a deliberate, short-lived signal set for the one request right after logout, so W3TC's own page cache is bypassed during the transition (`wordpress_logged_in_*` is already gone by then). Not "safe to ignore" — it's a real bypass cookie in W3TC's logic. Low-stakes for cache-turbo (transient, and an anonymous cache hit is usually fine), but adding it to `cache_turbo_bypass` is correct belt-and-braces if you want the just-logged-out request to always render fresh. |
+| `w3tc_logged_out` | **bypass — optional, transient** | Confirmed in source (`PgCache_Plugin.php` sets it in `on_logout()`, clears it in `on_login()`; `PgCache_Environment.php` adds it to `$reject_cookies` unconditionally in the **Apache** generator, `rules_core_generate_apache()`; the **nginx** generator, `rules_core_generate_nginx()`, adds it only when the page-cache engine is `file_generic` (Disk: Enhanced) — so on an nginx box running any other engine W3TC never emits a `w3tc_logged_out` rule at all). It is a deliberate, short-lived signal set for the one request right after logout, so W3TC's own page cache is bypassed during the transition (`wordpress_logged_in_*` is already gone by then). Not "safe to ignore" — it's a real bypass cookie in W3TC's logic. Low-stakes for cache-turbo (transient, and an anonymous cache hit is usually fine), but adding it to `cache_turbo_bypass` is correct belt-and-braces if you want the just-logged-out request to always render fresh. |
 
 No new *key* cookies either — W3TC doesn't add a presentation/variant cookie
 of its own the way a multilingual plugin would. If you also run a W3TC Cookie
@@ -123,6 +123,15 @@ load_module modules/ngx_http_cache_turbo_module.so;
 http {
     cache_turbo_zone name=ct 256m;
 
+    # $cookie_NAME is an EXACT-name lookup, and WordPress suffixes its cookie
+    # names with an md5 of the site URL. $cookie_wordpress_logged_in_ is
+    # therefore ALWAYS empty -- match the prefix out of the raw Cookie header
+    # instead.
+    map $http_cookie $wp_logged_in {
+        default                                        0;
+        "~*(^|;\s*)wordpress_logged_in_[0-9a-f]{32}="   1;
+    }
+
     # Shared L2 — DB 0, distinct from W3TC's Object/DB Cache (DB 1 above).
     cache_turbo_redis redis://10.0.0.5:6379/0 prefix=w3tc-ct: timeout=250ms
                       keepalive=32 keepalive_timeout=60s;
@@ -145,7 +154,7 @@ http {
             cache_turbo_valid         404 410 1m;
             cache_turbo_preset        balanced;   # SWR: serve stale while one refresh runs
 
-            cache_turbo_no_store      $cookie_wordpress_logged_in_;
+            cache_turbo_no_store      $wp_logged_in;
 
             include                   fastcgi_params;
             fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;

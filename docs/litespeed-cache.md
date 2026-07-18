@@ -125,6 +125,15 @@ load_module modules/ngx_http_cache_turbo_module.so;
 http {
     cache_turbo_zone name=ct 256m;
 
+    # $cookie_NAME is an EXACT-name lookup, and WordPress suffixes its cookie
+    # names with an md5 of the site URL. $cookie_wordpress_logged_in_ is
+    # therefore ALWAYS empty -- match the prefix out of the raw Cookie header
+    # instead.
+    map $http_cookie $wp_logged_in {
+        default                                        0;
+        "~*(^|;\s*)wordpress_logged_in_[0-9a-f]{32}="   1;
+    }
+
     server {
         listen 443 ssl http2;
         server_name example.com;
@@ -145,13 +154,14 @@ http {
 
             # Belt and braces on top of the preset (same pattern as
             # wordpress.md's own cache_turbo_no_store line):
-            cache_turbo_no_store      $cookie_wordpress_logged_in_;
+            cache_turbo_no_store      $wp_logged_in;
 
             # LiteSpeed Cache plugin extra: bypass its own login-vary cookie
             # too. v7.8.1-confirmed the plugin sets _lscache_vary on login even
             # with the LSCache engine absent (belt-and-braces on top of the
             # wordpress_logged_in_ bypass; also covers Guest Mode if enabled).
             cache_turbo_bypass        $cookie__lscache_vary;
+            cache_turbo_no_store      $cookie__lscache_vary;   # bypass alone still STORES
 
             include                   fastcgi_params;
             fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
@@ -177,7 +187,9 @@ http {
 
 If you renamed the plugin's "Login Cookie" away from the `_lscache_vary`
 default (Cache > Advanced) or set a `LSCACHE_VARY_COOKIE` server var, match
-`cache_turbo_bypass` to whatever name you picked. Keep the line: v7.8.1 sets
+both `cache_turbo_bypass` and `cache_turbo_no_store` to whatever name you
+picked — the bypass only skips the lookup, so without the `no_store` half the
+logged-in response is still stored. Keep the lines: v7.8.1 sets
 this cookie on every login regardless of server, so it is not safe to assume
 your version omits it.
 

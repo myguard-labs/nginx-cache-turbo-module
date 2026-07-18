@@ -29,12 +29,17 @@ not a fixed literal: `other/install.php` derives it as
 followed by a number `0`–`999` fixed at install time (the shipped template
 default is `SMFCookie11`). The trailing number is **not** a version suffix; it
 is a per-install hash of the database name/prefix, and an admin can rename the
-cookie outright. So the rule matches the **substring** `SMFCookie`, not one
-fixed literal.
+cookie outright. So the rule matches the **substring** `SMFCookie` anywhere in
+the `Cookie` header, not one fixed cookie name. That search is raw and
+undelimited across names *and* values, so a cookie whose *value* contained
+`SMFCookie` would bypass too — the literal is distinctive enough that this is
+not a practical concern.
 
 Unlike phpBB — which hands `_u`/`_sid` to every visitor — SMF does **not** set
 this cookie for ordinary guests browsing the board. `setLoginCookie()` (in
-`Sources/Subs-Auth.php`) writes it for authenticated members, and *also* with a
+`Sources/Subs-Auth.php` on 2.1; in SMF 3.0 it is `SMF\Cookie::setLoginCookie()`
+in `Sources/Cookie.php`, with `Subs-Auth.php` reduced to a backward-compat
+shim) writes it for authenticated members, and *also* with a
 guest-empty value for a **cookieless** visitor who lands on the login /
 kick-guest / maintenance screens (the `if (empty($_COOKIE))` guard in
 `LogInOut.php` / `Subs-Auth.php`). A plain guest reading topics carries only
@@ -42,8 +47,9 @@ kick-guest / maintenance screens (the `if (empty($_COOKIE))` guard in
 which is why keying on `SMFCookie` presence, not `PHPSESSID`, is what keeps the
 cache useful.
 
-SMF's own `loadUserSettings()` (in `Sources/Load.php`) only treats the cookie as
-authenticated when the embedded password element is non-empty
+SMF's own `loadUserSettings()` (in `Sources/Load.php` on 2.1; that file is gone
+in SMF 3.0, where the logic lives in the `SMF\` namespace classes) only treats
+the cookie as authenticated when the embedded password element is non-empty
 (`$id_member = !empty($id_member) && strlen($password) > 0 ? (int) $id_member : 0`);
 a guest's value carries `id_member=0` and an empty password field. That is a
 real value split, in principle — but in SMF 2.1 the value is a JSON **object**
@@ -61,6 +67,13 @@ bounded: it lands only on a guest who hit the login / kick-guest / maintenance
 screen while cookieless, or who tripped 2FA. The 2FA companion cookie
 `<cookiename>_tfa` (written by `setTFACookie()` as `$cookiename . '_tfa'`) is
 folded into the same rule.
+
+**SMF 3.0 note.** The file layout above is 2.1's. SMF 3.0 (now the repo's
+default branch) moved the cookie code into the `SMF\Cookie` class in
+`Sources/Cookie.php`; `Sources/Load.php` no longer exists and
+`Sources/Subs-Auth.php` is a backward-compat shim. The cookie **names** and the
+JSON value format are unchanged from 2.1, so **no rule change is needed** — only
+the source citations differ.
 
 **Do not "optimise" this into a hand-decoded value check** without actually
 parsing the array — a string-prefix guess against the guest-canonical value is

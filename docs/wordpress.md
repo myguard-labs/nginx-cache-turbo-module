@@ -27,8 +27,19 @@ auto-skips `/wp-admin/`, `/wp-login.php`, `/wp-cron.php`, `/xmlrpc.php` and
 `/wp-json/`, plus any request carrying a logged-in / password-protected-post /
 comment-author cookie, and any `?preview=` or `?s=` (search) request.
 
-`wordpress` must be named explicitly — `cache_turbo_backend wordpress;` gets you
-this plus the WooCommerce and Joomla rules.
+Each preset is its own independent bit — `cache_turbo_backend wordpress;`
+activates the WordPress rules and **nothing else**. It does not imply
+WooCommerce and it does not imply Joomla. If the site runs WooCommerce you must
+stack the presets explicitly:
+
+```nginx
+cache_turbo_backend wordpress woocommerce;
+```
+
+Relying on `wordpress` alone on a shop leaves `/cart`, `/checkout`,
+`/my-account` and `?wc-ajax=` cacheable along with all three Woo cart cookies —
+i.e. one customer's basket served to the next visitor. See
+[woocommerce.md](woocommerce.md).
 
 ## What the preset skips
 
@@ -36,11 +47,14 @@ this plus the WooCommerce and Joomla rules.
 |---|---|
 | URI prefixes | `/wp-admin/`, `/wp-login.php`, `/wp-cron.php`, `/xmlrpc.php`, `/wp-json/` |
 | Query args (presence) | `preview`, `s` |
-| Cookie substrings | `wordpress_logged_in_`, `wp-postpass_`, `comment_author_` |
+| Cookie header substrings | `wordpress_logged_in_`, `wp-postpass_`, `comment_author_` |
 
-The cookie names are matched as **substrings**, because WordPress suffixes them
-with a hash of the site (`wordpress_logged_in_a1b2c3…`) — an exact-name lookup
-would never match.
+These literals are matched as **substrings of the whole `Cookie` header** —
+names *and* values, searched undelimited — because WordPress suffixes the names
+with a hash of the site (`wordpress_logged_in_a1b2c3…`) and an exact-name lookup
+would never match. Note the match is not anchored to a cookie name, so a cookie
+*value* containing one of these literals bypasses too; all three are distinctive
+enough that this does not happen by accident.
 
 `?s=` is skipped because search results are effectively unbounded in cardinality:
 caching them lets any visitor fill your zone with junk keys and evict the pages
@@ -72,6 +86,15 @@ load_module modules/ngx_http_cache_turbo_module.so;
 http {
     cache_turbo_zone name=ct 256m;
 
+    # $cookie_NAME is an EXACT-name lookup, and WordPress suffixes its cookie
+    # names with an md5 of the site URL. $cookie_wordpress_logged_in_ is
+    # therefore ALWAYS empty -- match the prefix out of the raw Cookie header
+    # instead.
+    map $http_cookie $wp_logged_in {
+        default                                        0;
+        "~*(^|;\s*)wordpress_logged_in_[0-9a-f]{32}="   1;
+    }
+
     server {
         listen 443 ssl http2;
         server_name example.com;
@@ -96,7 +119,7 @@ http {
           # cache_turbo_cache_control respect;
 
             # Belt and braces on top of the preset.
-            cache_turbo_no_store      $cookie_wordpress_logged_in_;
+            cache_turbo_no_store      $wp_logged_in;
 
             include                   fastcgi_params;
             fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;

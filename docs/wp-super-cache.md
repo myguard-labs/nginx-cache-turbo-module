@@ -107,6 +107,15 @@ load_module modules/ngx_http_cache_turbo_module.so;
 http {
     cache_turbo_zone name=ct 256m;
 
+    # $cookie_NAME is an EXACT-name lookup, and WordPress suffixes its cookie
+    # names with an md5 of the site URL. $cookie_wordpress_logged_in_ is
+    # therefore ALWAYS empty -- match the prefix out of the raw Cookie header
+    # instead.
+    map $http_cookie $wp_logged_in {
+        default                                        0;
+        "~*(^|;\s*)wordpress_logged_in_[0-9a-f]{32}="   1;
+    }
+
     server {
         listen 443 ssl http2;
         server_name example.com;
@@ -126,7 +135,7 @@ http {
             cache_turbo_preset        balanced;     # SWR: serve stale while one refresh runs
 
             # Belt and braces on top of the preset.
-            cache_turbo_no_store      $cookie_wordpress_logged_in_;
+            cache_turbo_no_store      $wp_logged_in;
 
             include                   fastcgi_params;
             fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;

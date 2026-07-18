@@ -33,13 +33,20 @@ the "remember me" path in `usercp.php`) — a guest structurally cannot receive
 it, and MyBB's own guest test is exactly `empty($mybb->cookies['mybbuser'])`
 (`inc/class_session.php:88`). Presence alone is therefore sufficient, no value
 predicate needed. Because `cookieprefix` is admin-configurable, the preset keys
-on the cookie-name **substring** `user` (non-empty) rather than a hardcoded
-literal — the same prefix-agnostic technique this module's `phpbb` preset uses
-for `_u`.
+on the **substring** `user` anywhere in the `Cookie` header rather than a
+hardcoded literal — the same prefix-agnostic technique this module's `phpbb`
+preset uses for `_u`. Be aware this tier searches the whole header undelimited,
+names *and* values: `user` is a short and undistinctive literal, so any cookie
+whose **value** happens to contain the four bytes `user` also bypasses. That is
+the correct-direction failure (a lost cache hit, never a leak), but it is a real
+hit-rate cost on a site that sets such cookies — pin an exact
+`cache_turbo_bypass $cookie_<prefix>mybbuser;` — plus the matching
+`cache_turbo_no_store`, since a bypass skips only the lookup and still stores —
+if it bites.
 
 | Cookie (stock wire name) | Treatment | Why |
 |---|---|---|
-| `mybbuser` (matched as substring `user`) | **bypass** (presence) | value `uid_loginkey`, written only on login success (`login.php`, `member.php`, `usercp.php`) |
+| `mybbuser` (matched as `Cookie`-header substring `user`) | **bypass** (presence) | value `uid_loginkey`, written only on login success (`login.php`, `member.php`, `usercp.php`) |
 | `sid` | **ignore** | session id issued to every visitor including guests and bots (`inc/class_session.php:123`) — note the base name is `sid`, **not** `mybbsid` |
 | `mybb[lastvisit]` / `[lastactive]` / `[threadread]` / `[threadsread]` / `[forumread]` / `[readallforums]` / `[announcements]` / `[referrer]` | **ignore** | guest read-tracking array, not auth (`inc/class_session.php`, `inc/functions_indicators.php`) |
 | `mybbtheme` / `mybblang` | **cache key** (manual) | presentation only; set for **guests** in `global.php` when they pick a theme/language |
@@ -68,9 +75,11 @@ http {
             cache_turbo               ct;
             cache_turbo_backend       mybb;
 
-            # theme/lang are presentation variants, not identity — key on them.
-            cache_turbo_key           $host$uri$cookie_mybbtheme$cookie_mybblang$cache_turbo_normalized_args;
-
+            # theme/lang are presentation variants, not identity — the `mybb`
+            # preset already folds both into the key with length-prefixed
+            # framing. Do NOT hand-write a cache_turbo_key that splices
+            # $cookie_* values together: unframed concatenation lets a visitor
+            # choose a cookie value that reproduces another page's key.
             cache_turbo_valid         60s;
             cache_turbo_valid         404 410 1m;
             cache_turbo_preset        balanced;
@@ -122,14 +131,17 @@ curl -sI https://forum.example.com/usercp.php | grep -i x-cache-turbo
 ## Gotchas
 
 - **Setting a `cookieprefix` is safe for this preset** — the substring `user`
-  is matched regardless of any prefix MyBB prepends. It is **not** safe for a
+  is matched anywhere in the `Cookie` header, so any prefix MyBB prepends is
+  irrelevant to it. It is **not** safe for a
   hand-written `map` that hardcodes `mybbuser`; there is no default `mybb_`
   prefix, so don't assume one.
 - **`sid` is not an auth cookie.** Guests have it too (base name `sid`, not
   `mybbsid`). Bypassing on it is the classic mistake and costs you the entire
   cache — the preset deliberately does not match it.
 - **The `user` substring match also catches `coppauser`** (set transiently to
-  `1`/`0` during COPPA registration, `member.php`). This only causes a harmless
+  `1`/`0` during COPPA registration, `member.php`) — and, because the search
+  covers the whole header, any cookie whose *value* contains `user` as well.
+  The `coppauser` case only causes a harmless
   extra bypass for a guest mid-registration — that flow lives under the already
   never-cached `/member.php` surface, so there is no correctness or cache-hit
   impact in practice.

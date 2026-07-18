@@ -26,7 +26,7 @@ That is genuinely all most Kirby sites need.
 
 | Check | Values |
 |---|---|
-| Cookie substrings | `kirby_session` |
+| Cookie header substrings | `kirby_session` |
 | URI prefixes | `/panel` |
 | Query args | — |
 
@@ -124,9 +124,12 @@ http {
 
         # Kirby's own storage must never be web-readable. This is a Kirby
         # hardening rule, not a caching one -- but it belongs in every vhost.
-        location ~ ^/(content|site|kirby)/ {
-            deny all;
-        }
+        # `^~` is load-bearing: regex locations are tested in DECLARATION order,
+        # so a plain `~ ^/(content|site|kirby)/` written after `~ \.php$` would
+        # never run and /content/... .php would execute in php-fpm.
+        location ^~ /content/ { deny all; }
+        location ^~ /site/    { deny all; }
+        location ^~ /kirby/   { deny all; }
 
         location = /_cache {
             cache_turbo_admin on;
@@ -172,7 +175,9 @@ curl -s -D- -o /dev/null https://example.com/media/pages/home/logo.svg \
   token is in someone else's session.
 - **Renaming the cookie breaks the preset.** If you set
   `session.cookieName` to something else, the shipped `kirby_session` substring
-  never matches — silently. Add your own `cache_turbo_bypass $cookie_<newname>;`.
+  never matches — silently. Add your own `cache_turbo_bypass $cookie_<newname>;`
+  **and** `cache_turbo_no_store $cookie_<newname>;` — the bypass only skips the
+  lookup, so on its own the authenticated response is still stored.
 - **Kirby's own page cache is a different layer.** It lives in PHP and makes the
   origin fast, which is what your cache-turbo *misses* hit. Leave it on; the two
   compose.
@@ -181,7 +186,8 @@ curl -s -D- -o /dev/null https://example.com/media/pages/home/logo.svg \
   NOT a different segment that merely shares the letters, such as
   `/panels-and-doors` (which caches normally). The rule is: after the prefix the
   URL must end or continue with `/` or `.`. If you relocate the panel via
-  `panel.slug`, add a `cache_turbo_bypass` — though `kirby_session` still guards
+  `panel.slug`, add a `cache_turbo_bypass` plus a matching `cache_turbo_no_store`
+  (the bypass alone still stores) — though `kirby_session` still guards
   every authenticated request, so you lose an optimisation, not a guarantee.
 - **Don't set `cache_turbo_cache_control ignore`.** It overrides the `honor` that
   `cache_turbo_backend` implies.
@@ -216,8 +222,9 @@ knobs that behave differently *because* the app is Kirby.
 - **Keep the Panel out of the cache path.** `/panel` (`panel.slug`) is authenticated
   and already in the preset's bypass list; never add a `cache_turbo` layer that would
   store Panel responses, and if you relocate the Panel via `panel.slug`, mirror it with
-  a `cache_turbo_bypass` (the `kirby_session` cookie still guards it, so you lose an
-  optimisation, not the guarantee).
+  a `cache_turbo_bypass` and a matching `cache_turbo_no_store` — the bypass alone
+  skips only the lookup and still stores (the `kirby_session` cookie still guards
+  it, so you lose an optimisation, not the guarantee).
 - **opcache pays off unusually well here.** Kirby is many small PHP files loaded per
   request (templates, snippets, models, the core), so a warm opcode cache removes a lot
   of per-request compile time on every origin miss. Enable `opcache.enable=1` and give

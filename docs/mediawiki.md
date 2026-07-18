@@ -34,7 +34,7 @@ of the same job.
 |---|---|
 | URI prefixes | **none** — see below |
 | Query args | `veaction`, `returnto` |
-| Cookie substrings | `Token=`, `_session=`, `UserID=` |
+| Cookie header substrings | `Token=`, `_session=`, `UserID=` |
 
 MediaWiki's cookies are `<prefix>UserID`, `<prefix>UserName`, `<prefix>Token` and
 `<prefix>_session`, where `<prefix>` is `$wgCookiePrefix` — which **defaults to
@@ -43,7 +43,10 @@ cookies are `mywikiUserID`, `mywikiUserName`, and so on.
 
 That means there is no shippable *prefix* — but unlike Joomla and phpBB, there is
 a shippable **suffix**. The tails are distinctive enough to match on, whatever your
-`$wgCookiePrefix` is. No configuration needed.
+`$wgCookiePrefix` is. No configuration needed. The trailing `=` in each literal is
+load-bearing: this tier searches the whole `Cookie` header raw and undelimited
+across names *and* values, so the `=` is what keeps `Token=` anchored to the end of
+a cookie *name* rather than firing on any value that merely contains `Token`.
 
 **Match what upstream matches.** MediaWiki's own `getVaryCookies()` says it in one
 line:
@@ -136,12 +139,16 @@ are among the most cacheable and most requested URLs on a busy wiki. That's a
 measurable hit-rate loss in exchange for nothing, because the genuinely dynamic
 `action=` values are already covered by MediaWiki's own `Cache-Control: private`.
 
-If you want `printable=` to be a proper variant rather than a separate entry per
-URL, fold it into the key:
+`printable=` needs no special handling to become a proper variant: the module's
+**default** key is built from the validated `Host` plus `unparsed_uri` — the
+original request line, query string included — so `?printable=yes` already splits
+into its own entry.
 
-```nginx
-cache_turbo_key $uri$is_args$args;   # args already in the key -> printable= splits naturally
-```
+Do **not** hand-write `cache_turbo_key $uri$is_args$args` here. It is not just
+redundant, it is actively wrong on a pretty-URL wiki: the `/wiki/` location
+rewrites to `/index.php` before the module runs, so `$uri` is `/index.php` for
+every article and the whole wiki collapses onto a single cache entry. Leave the
+key alone unless you are adding something the default does not carry.
 
 ## Vhost
 
@@ -161,12 +168,18 @@ http {
         location /wiki/ {
             cache_turbo         ct;
             cache_turbo_backend mediawiki;   # implies cache_control honor
-            cache_turbo_key     $uri$is_args$args;
+            # No cache_turbo_key: the default (host + unparsed_uri) is the only
+            # correct one here. After the rewrite below $uri is /index.php for
+            # EVERY article, so a $uri-derived key collapses the whole wiki onto
+            # one entry.
             cache_turbo_valid   300s;        # wikis tolerate a longer TTL
             cache_turbo_valid   404 410 1m;
             cache_turbo_preset  balanced;
 
-            rewrite ^/wiki/(?<pagename>.*)$ /index.php;
+            # `break` keeps the request in THIS location. Without it the rewrite
+            # triggers a fresh location search and every directive above is
+            # silently discarded in favour of the `\.php$` block.
+            rewrite ^/wiki/(?<pagename>.*)$ /index.php break;
             include        fastcgi_params;
             fastcgi_param  SCRIPT_FILENAME $document_root/index.php;
             fastcgi_pass   unix:/run/php/php-fpm.sock;
@@ -175,7 +188,6 @@ http {
         location ~ \.php$ {
             cache_turbo         ct;
             cache_turbo_backend mediawiki;
-            cache_turbo_key     $uri$is_args$args;
             cache_turbo_valid   60s;
 
             include        fastcgi_params;
@@ -187,7 +199,6 @@ http {
         # string -- long-lived and safe to cache hard.
         location = /load.php {
             cache_turbo         ct;
-            cache_turbo_key     $uri$is_args$args;
             cache_turbo_valid   1h;
 
             include        fastcgi_params;
@@ -202,8 +213,15 @@ http {
         }
 
         # Deleted/private images are permission-checked -- never cache.
+        # `^~` outranks the `~ \.php$` regex, so this block must repeat the
+        # FastCGI wiring itself. Without it nginx falls back to the static
+        # handler and serves the raw PHP source.
         location ^~ /img_auth.php {
             cache_turbo off;
+
+            include        fastcgi_params;
+            fastcgi_param  SCRIPT_FILENAME $document_root/img_auth.php;
+            fastcgi_pass   unix:/run/php/php-fpm.sock;
         }
 
         location = /_cache {
@@ -302,7 +320,8 @@ curl -sI -H 'Cookie: mywikiUserID=42' https://wiki.example.com/wiki/Main_Page \
 - **`Special:` pages are not path-matchable.** They share the `/wiki/` prefix with
   articles, and the namespace is localised on non-English wikis. Most are
   uncacheable anyway via `Cache-Control`; if you have a specific one to protect,
-  give it its own `cache_turbo_bypass`.
+  give it its own `cache_turbo_bypass` **and** `cache_turbo_no_store` — a bypass
+  skips only the lookup, so on its own the protected page is still stored.
 - **`img_auth.php`** serves permission-checked files. Never cache it.
 - **`Set-Cookie` responses are never stored** and `Authorization` requests are
   never cached, regardless of preset.

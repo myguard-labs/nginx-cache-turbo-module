@@ -21,7 +21,10 @@ cache_turbo_backend punbb;
 
 ## Why presence-only (not the value predicate)
 
-The `punbb` preset matches two cookie-name substrings: **`forum_cookie`**, the
+The `punbb` preset matches two substrings of the `Cookie` header — the search is
+raw and undelimited over names *and* values, not a cookie-name lookup, so a
+literal must be distinctive enough that it cannot appear as an arbitrary value.
+Both of these are: **`forum_cookie`**, the
 PunBB 1.4.x default (verify: `include/common.php` in punbb/punbb, tag 1.4.4 —
 `$cookie_name` in `config.php` falls back to it, and the installer randomises
 it to `forum_cookie_<random>`, which the same substring still covers), and
@@ -51,13 +54,15 @@ key suffix after `1|`, so it is never one fixed string an exact-match test can
 anchor on — the ideal rule is not expressible without adding a base64 decoder
 to the hot classify path, which no preset here does.
 
-So this ships as **presence-only**: the preset substring-matches the cookie
-**name** in the request `Cookie` header, bypassing whenever anything containing
+So this ships as **presence-only**: the preset substring-matches the request
+`Cookie` header, bypassing whenever anything containing
 `forum_cookie` or `punbb_cookie` is present. Safe (bypass is the
-correct-direction failure), but
-PunBB also sets a `<cookie_name>_track` topic-tracking cookie for guests who
-read topics (`set_tracked_topics()`) — it shares the prefix and trips the same
-substring match, so an actively-browsing guest stops being cached.
+correct-direction failure), and the hit-rate cost is smaller than it looks:
+PunBB's `<cookie_name>_track` topic-tracking cookie shares the prefix and trips
+the same substring match, but it is **members-only** — every
+`set_tracked_topics()` call site is guest-gated (`viewtopic.php` wraps it in
+`if (!$forum_user['is_guest'])`; `misc.php`'s mark-read actions reject guests
+outright), so a browsing guest never acquires it and stays cacheable.
 
 ## Vhost
 
@@ -133,8 +138,10 @@ curl -sI https://forum.example.com/misc.php?action=markread | grep -i x-cache-tu
 - **A renamed `$cookie_name` defeats the preset.** The defaults
   (`forum_cookie`, the installer's `forum_cookie_<random>`, and the 1.2-era
   `punbb_cookie`) are all matched; anything else is not. Add a
-  `cache_turbo_bypass $cookie_<your_name>;` for a custom name — otherwise
-  logged-in members are served cached pages.
+  `cache_turbo_bypass $cookie_<your_name>;` **plus**
+  `cache_turbo_no_store $cookie_<your_name>;` for a custom name — otherwise
+  logged-in members are served cached pages. The bypass alone only skips the
+  lookup; the `no_store` is the half that stops the member's page being stored.
 - **`Set-Cookie` responses are never stored** and `Authorization` requests are
   never cached, regardless of preset.
 
@@ -148,9 +155,12 @@ PunBB-specific only; generic PHP-FPM tuning lives in the other backend guides.
   `punbb_cookie` (the 1.2-era default kept for upgraded boards). A stock
   install needs no change. If you have set `$cookie_name` in `config.php` to
   anything else, the preset sees nothing and **every member is served cached
-  pages** — add your own `cache_turbo_bypass $cookie_<your_name>;`. The
+  pages** — add your own `cache_turbo_bypass $cookie_<your_name>;` and
+  `cache_turbo_no_store $cookie_<your_name>;` (the bypass alone still stores). The
   `<cookie_name>_track` topic-tracking cookie shares the prefix and also trips
-  the substring match.
+  the substring match — but it is written only for logged-in members
+  (`set_tracked_topics()` is guest-gated at every call site), so it costs no
+  guest hit rate.
 - **Guest = user id 1.** PunBB's anonymous user is the row with `id = 1`
   (`set_default_user()` hard-requires it), and the auth cookie's first base64
   field is that id. The preset can't base64-decode on the hot path, so it keys

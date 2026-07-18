@@ -2,16 +2,27 @@
 
 _Last researched: 2026-07-18_
 
-Caching a Ghost (5.x/6.x) blog. Ghost is a clean fit: the public blog is a large,
-genuinely shared anonymous surface, and — this is the part that makes it work — a
-member session does **not** change the HTML of a fully public post. So one bypass
-cookie is enough, and anonymous readers all share one cached page.
+Caching a Ghost (5.x/6.x) blog. Ghost is a clean fit for one reason only: an
+anonymous reader gets **no cookie at all**, so the whole public blog is a large,
+genuinely shared surface and every anonymous reader can be served the same
+cached page.
 
-There is exactly one sharp edge, and it is not the cookie. It is
-[the query string](#the-sharp-edge-cookieless-member-auth).
+**Do not reason "a member sees the same HTML as a guest on a public post."** It
+is false. `@member` is injected into the template context unconditionally
+whenever `req.member` exists (`update-local-template-options.js`), so a stock
+`{{#if @member}}` in the theme changes the markup of a *fully public* post.
+Ghost itself agrees — `frontend-caching.js` sets `Cache-Control: private` for
+any member request without ever consulting post visibility. The
+`ghost-members-ssr` bypass below is therefore **load-bearing, not
+defence-in-depth**.
+
+And a cookie rule alone is not enough anyway: Ghost authenticates members
+**from the query string, with no cookie present**. See
+[the sharp edge](#the-sharp-edge-cookieless-member-auth) — that section is not
+optional reading.
 
 - [The short version](#the-short-version)
-- [Why a bypass cookie is enough](#why-a-bypass-cookie-is-enough)
+- [Why the member-cookie bypass is load-bearing](#why-the-member-cookie-bypass-is-load-bearing)
 - [The sharp edge: cookieless member auth](#the-sharp-edge-cookieless-member-auth)
 - [Vhost](#vhost)
 - [Checking it works](#checking-it-works)
@@ -25,13 +36,13 @@ cache_turbo         ct;
 cache_turbo_backend ghost;      # implies cache_turbo_cache_control honor
 ```
 
-## Why a bypass cookie is enough
+## Why the member-cookie bypass is load-bearing
 
 | Check | Values |
 |---|---|
 | URI prefixes | `/ghost/`, `/members/`, `/p/`, `/r/` |
 | Query args | `uuid`, `key`, `token`, `gift` |
-| Cookie substrings | `ghost-members-ssr`, `ghost-admin-api-session` |
+| Cookie header substrings | `ghost-members-ssr`, `ghost-admin-api-session` |
 
 The question that decides any preset is: *does a logged-in user change the HTML
 that a logged-out user would have seen?* For Ghost the answer is **yes, even on a

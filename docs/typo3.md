@@ -30,7 +30,7 @@ not enough on its own** — see below, this is not optional reading.
 
 | Check | Values |
 |---|---|
-| Cookie substrings | `fe_typo_user`, `be_typo_user` |
+| Cookie header substrings | `fe_typo_user`, `be_typo_user` |
 | URI prefixes | `/typo3` |
 | Query args | — |
 
@@ -72,11 +72,19 @@ rare. But:
 > UNSAFE on that one condition. Every other conditional preset in this
 > registry fails safe. This is the exception — treat it as such.**
 
-If you set `FE/cookieName`, you **must** add your own bypass:
+If you set `FE/cookieName`, you **must** add your own bypass **and** a matching
+`cache_turbo_no_store`:
 
 ```nginx
-cache_turbo_bypass $cookie_<your_cookie_name>;
+cache_turbo_bypass   $cookie_<your_cookie_name>;
+cache_turbo_no_store $cookie_<your_cookie_name>;   # bypass alone still STORES
 ```
+
+**Both lines, not just the first.** `cache_turbo_bypass` only skips the cache
+*lookup* — the logged-in response still goes through the store path and can be
+written under the shared key, where the next anonymous visitor gets it.
+`cache_turbo_no_store` is the half that prevents storing. A bypass on its own is
+not the remediation for the unsafe case above; the pair is.
 
 Verify which name your install actually uses before going live:
 
@@ -130,7 +138,8 @@ http {
 
         # Only if you override FE/cookieName -- see "The one condition" above.
         # location ~ \.php$ {
-        #     cache_turbo_bypass $cookie_your_renamed_cookie;
+        #     cache_turbo_bypass   $cookie_your_renamed_cookie;
+        #     cache_turbo_no_store $cookie_your_renamed_cookie;
         # }
 
         location = /_cache {
@@ -177,13 +186,19 @@ grep -r "cookieName" typo3conf/ config/ 2>/dev/null
 - **The renamed-cookie case is the whole risk on this page.** See
   [above](#the-one-condition--and-why-it-is-not-safe) — this preset fails
   unsafe, not safe, if `FE/cookieName` is overridden and you do not add your own
-  `cache_turbo_bypass`.
+  `cache_turbo_bypass` **plus** `cache_turbo_no_store` on the same cookie. The
+  bypass alone does not stop the logged-in response from being stored.
 - **`be_typo_user` guards preview/editor traffic on frontend URLs** — do not
   remove it from the preset thinking it only matters on `/typo3`. See
   [above](#be_typo_user-is-a-separate-risk-not-a-duplicate).
 - **`/typo3` has no trailing slash in the preset but matches on a path-segment
   boundary** — it matches `/typo3`, `/typo3/`, `/typo3/module/...` but not an
-  unrelated segment merely sharing the letters.
+  unrelated segment merely sharing the letters, such as `/typo3-migration`
+  (which caches normally). The rule is: the prefix is anchored at byte 0 of the
+  URI, and after it the URL must end or continue with `/` **or `.`** (so
+  `/typo3.php` matches too). Anchoring at byte 0 also means a TYPO3 installed
+  under a subdirectory gets no URI-rule coverage at all — see the note on
+  subdirectory installs in [frameworks.md](frameworks.md).
 - **Don't set `cache_turbo_cache_control ignore`.** It overrides the `honor`
   that `cache_turbo_backend` implies.
 - **`Set-Cookie` responses are never stored** and `Authorization` requests are

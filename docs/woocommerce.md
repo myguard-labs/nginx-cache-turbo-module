@@ -39,7 +39,7 @@ not a default. Both spellings are now a config error that names the replacement.
 |---|---|
 | URI prefixes | `/cart`, `/checkout`, `/my-account` |
 | Query args | `wc-ajax` |
-| Cookie substrings | `woocommerce_items_in_cart`, `woocommerce_cart_hash`, `wp_woocommerce_session_` |
+| Cookie header substrings | `woocommerce_items_in_cart`, `woocommerce_cart_hash`, `wp_woocommerce_session_` |
 
 Plus everything the `wordpress` preset skips, when stacked.
 
@@ -73,8 +73,9 @@ URIs only:
 ```nginx
 # ONLY if your theme renders no per-user state into shared pages.
 # Verify with a diff of the anonymous vs. basket-holding HTML before doing this.
-cache_turbo_backend wordpress;              # skip the woocommerce cookie bypass
-cache_turbo_bypass  $woo_dynamic;           # keep the URI bypass
+cache_turbo_backend  wordpress;              # skip the woocommerce cookie bypass
+cache_turbo_bypass   $woo_dynamic;           # keep the URI bypass
+cache_turbo_no_store $woo_dynamic;           # bypass alone still STORES
 ```
 
 with, in `http`:
@@ -98,6 +99,20 @@ load_module modules/ngx_http_cache_turbo_module.so;
 http {
     cache_turbo_zone name=ct 256m;
 
+    # $cookie_NAME is an EXACT-name lookup, and WordPress suffixes its cookie
+    # names with an md5 of the site URL. $cookie_wordpress_logged_in_ is
+    # therefore ALWAYS empty -- match the prefix out of the raw Cookie header
+    # instead.
+    map $http_cookie $wp_logged_in {
+        default                                        0;
+        "~*(^|;\s*)wordpress_logged_in_[0-9a-f]{32}="   1;
+    }
+
+    map $http_cookie $wc_session {
+        default                                          0;
+        "~*(^|;\s*)wp_woocommerce_session_[0-9a-f]{32}=" 1;
+    }
+
     server {
         listen 443 ssl http2;
         server_name shop.example.com;
@@ -118,8 +133,8 @@ http {
 
             # Belt and braces on top of the preset: three independent floors.
             cache_turbo_no_store      $cookie_woocommerce_items_in_cart;
-            cache_turbo_no_store      $cookie_wp_woocommerce_session_;
-            cache_turbo_no_store      $cookie_wordpress_logged_in_;
+            cache_turbo_no_store      $wc_session;
+            cache_turbo_no_store      $wp_logged_in;
 
             include                   fastcgi_params;
             fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
@@ -199,7 +214,8 @@ about to be wrong for somebody.
   is a boundary.
 - **A store on a subdirectory or a translated store** shifts these URIs
   (`/fr/panier`), and the preset will not match them. Add a `map`-driven
-  `cache_turbo_bypass` for the translated paths; the *cookie* half of the preset
+  `cache_turbo_bypass` — plus a matching `cache_turbo_no_store`, since the
+  bypass only skips the lookup — for the translated paths; the *cookie* half of the preset
   is path-independent and keeps protecting you regardless.
 - **Cart fragments — the preset now covers this, and it is the reason the arg rule
   exists.** WooCommerce refreshes the cart widget over AJAX, and its endpoints have
@@ -231,9 +247,12 @@ a way it does not bite a plain WordPress blog.
   PHP-FPM workers. What matters for the page cache is unchanged: the
   `wp_woocommerce_session_*` cookie is a **per-user** cookie and must bypass the
   page cache exactly like a login cookie — the preset already skips on the
-  `wp_woocommerce_session_` substring, and the `cache_turbo_no_store
-  $cookie_wp_woocommerce_session_` floor in the vhost above is the belt to that
-  braces. Do not be tempted to treat it as "just a WordPress cookie".
+  `wp_woocommerce_session_` substring, and the `cache_turbo_no_store $wc_session`
+  floor in the vhost above is the belt to that braces. Note that floor has to go
+  through the `$wc_session` **map** — the cookie's wire name is
+  `wp_woocommerce_session_<md5>`, and nginx's `$cookie_NAME` is an exact-name
+  lookup, so a bare `$cookie_wp_woocommerce_session_` is always empty and buys
+  you nothing. Do not be tempted to treat it as "just a WordPress cookie".
 
 - **OPcache file-count ceiling.** WooCommerce core alone is thousands of PHP
   files, and a real store stacks a dozen or more extensions on top; the total

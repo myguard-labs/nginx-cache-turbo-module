@@ -5,9 +5,10 @@ _Last researched: 2026-07-18_
 Caching a Magento 2 (2.4.x) store. Magento is the **best-behaved application in
 this set** — it is *architecturally designed* to sit behind a shared cache, it
 ships its own reference Varnish VCL, and it tells you what is cacheable in-band
-via `Cache-Control`. This preset **is** that VCL, translated, with no deviation:
-it value-keys the one cookie Magento's own VCL keys on, exactly the way upstream
-does.
+via `Cache-Control`. This preset **is** that VCL, translated, with **one
+deliberate and important deviation** ([GraphQL](#gotchas)): it value-keys the one
+cookie Magento's own VCL keys on, exactly the way upstream does, but it *bypasses*
+`/graphql` where the VCL *caches* it.
 
 - [The short version](#the-short-version)
 - [Why this can replace Varnish](#why-this-can-replace-varnish)
@@ -198,6 +199,15 @@ http {
         set $MAGE_ROOT /var/www/magento;
         root $MAGE_ROOT/pub;
 
+        # The preset's URI rules match $uri, which try_files has already
+        # rewritten to /index.php by the time the module runs. Gate the private
+        # surfaces here, BEFORE the rewrite, where the original path is still
+        # visible. Without these four blocks the preset's uris[] can never fire.
+        location ^~ /checkout { cache_turbo off; try_files $uri $uri/ /index.php$is_args$args; }
+        location ^~ /customer { cache_turbo off; try_files $uri $uri/ /index.php$is_args$args; }
+        location ^~ /sales    { cache_turbo off; try_files $uri $uri/ /index.php$is_args$args; }
+        location ^~ /wishlist { cache_turbo off; try_files $uri $uri/ /index.php$is_args$args; }
+
         location / {
             try_files $uri $uri/ /index.php$is_args$args;
         }
@@ -207,7 +217,10 @@ http {
             cache_turbo_backend       magento;   # implies cache_control honor
                                                   # and value-keys X-Magento-Vary
 
-            cache_turbo_key           $scheme$host$uri$is_args$args;
+            # NO cache_turbo_key here. try_files has rewritten $uri to
+            # /index.php, so any key built from $uri collapses the WHOLE
+            # storefront onto one entry. The module default keys on
+            # unparsed_uri (the original request line) and is correct.
             cache_turbo_valid         300s;      # catalog tolerates a long TTL
             cache_turbo_valid         404 410 1m;
             cache_turbo_preset        balanced;
@@ -326,6 +339,20 @@ Note the module never stores `HEAD` responses, so a `curl -sI` HEAD request can
   traffic this is worth more hit rate than every bypass rule combined — use
   `cache_turbo_normalize_args` / `$cache_turbo_normalized_args` (see the
   [main README](../README.md#the-cache-key)).
+- **`/graphql` is bypassed here, and this is the one place the preset deviates
+  from Magento's VCL.** Upstream *caches* GraphQL: `varnish7.vcl` passes only an
+  authenticated request that carries no cache id (`req.url ~ "/graphql" &&
+  !req.http.X-Magento-Cache-Id && req.http.Authorization ~ "^Bearer"`), and
+  otherwise hashes the query on **request headers** —
+  `X-Magento-Cache-Id`, an `Authorized` marker, `Store` and `Content-Currency`
+  (`sub process_graphql_headers`). cache-turbo keys on the request line and on
+  cookie *values*, not on arbitrary request headers, so it cannot reproduce that
+  key; bypassing the whole endpoint is the correct-but-conservative equivalent.
+  If you serve heavy GraphQL read traffic and want it cached, do it explicitly
+  in its own `location /graphql` with `cache_turbo_key` plus
+  `cache_turbo_require_header` (see the
+  [main README](../README.md#letting-the-origin-decide-cache_turbo_require_header)) —
+  not by removing this rule.
 - **`/cart` and `/onepage` are not Magento routes.** The real paths are
   `/checkout/cart` and `/checkout/onepage/*`, both covered by `/checkout`. A
   `/cart` prefix would match nothing on a stock install — and could false-positive
@@ -348,7 +375,10 @@ and `magento/magento2`; a couple of tuning numbers vary by source and are marked
   lynchpin.** Magento hands the same anonymous HTML to every default-context
   visitor, and it segments everything else *only* through this cookie:
   `Framework\App\Http\Context::getVaryString()` returns
-  `hash('sha256', serialize(ksort($data)) . '|' . $salt)` over the context tuple
+  `hash('sha256', $this->serializer->serialize($data) . '|' . $salt)` over the
+  `ksort()`ed context tuple — the serializer is Magento's
+  `Serialize\Serializer\Json` (the constructor default), **not** PHP's
+  `serialize()`, so the hashed bytes are JSON — over
   (customer group, login flag, store, currency) with default-valued fields dropped
   — so an all-default visitor gets `null` and no cookie, and any other segment gets
   a distinct hash. If a cache does not fold that value into its key, a wholesale

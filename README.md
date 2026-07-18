@@ -237,7 +237,7 @@ ignoring the 60s browser TTL. Semantics:
 - **`ignore` mode** — `cache_turbo_cache_control ignore` discards the targeted
   variants too, alongside `Cache-Control`.
 
-> **See also:** [`cache_turbo_cache_control`](#directives) for the full honor/
+> **See also:** [`cache_turbo_cache_control`](#directive-synopsis) for the full honor/
 > respect/ignore semantics, and [Mixing with nginx's native
 > cache](#mixing-with-nginxs-native-cache-proxy_cache) for stacking with
 > `proxy_cache`.
@@ -505,10 +505,14 @@ there is no way to opt a single location out.
 
 A request is sent to the origin uncached if it matches **any** of three checks
 for an active preset: a **URI prefix**, the **presence of a query arg**, or a
-**substring of the `Cookie` header** (the login/session cookies carry
-per-session suffixes, so it matches as a substring).
+**substring of the whole `Cookie` header** — a raw, undelimited search across
+cookie names *and* values, not a lookup of a cookie name (the login/session
+cookies carry per-session suffixes, so it matches as a substring). Because the
+search is not anchored to a name, a cookie **value** can trip the rule as
+readily as a name: a rule's literal must be distinctive enough that it cannot
+plausibly appear as an arbitrary value.
 
-| Preset | URI prefixes | Query args | Cookie substrings |
+| Preset | URI prefixes | Query args | Cookie header substrings |
 |---|---|---|---|
 | `wordpress`   | `/wp-admin/`, `/wp-login.php`, `/wp-cron.php`, `/xmlrpc.php`, `/wp-json/` | `preview`, `s` | `wordpress_logged_in_`, `wp-postpass_`, `comment_author_` |
 | `woocommerce` | `/cart`, `/checkout`, `/my-account` | `wc-ajax` | `woocommerce_items_in_cart`, `woocommerce_cart_hash`, `wp_woocommerce_session_` |
@@ -577,7 +581,7 @@ preset cannot fully identify a logged-in user:
 
 | Preset | What it can and cannot see | What you must do |
 |---|---|---|
-| `joomla` | `joomla_remember_me_` is a real fixed prefix and is auth-only — but it exists **only** for users who ticked "Remember Me". A normally-logged-in frontend user carries only the session cookie, whose name is `md5($secret . $session_name)` — a per-install hash with **no** stable substring. That user is invisible to the matcher. | **Add your own `cache_turbo_bypass`** on your install's session-cookie name if your site has frontend logins ([guide](docs/joomla.md)). Do not read the cookie rule as "handled". |
+| `joomla` | `joomla_remember_me_` is a real fixed prefix and is auth-only — but it exists **only** for users who ticked "Remember Me". A normally-logged-in frontend user carries only the session cookie, whose name is `md5($secret . $session_name)` — a per-install hash with **no** stable substring. That user is invisible to the matcher. | **Add your own `cache_turbo_bypass` *and* `cache_turbo_no_store`** on your install's session-cookie name if your site has frontend logins ([guide](docs/joomla.md)) — the bypass skips only the lookup, so on its own the logged-in page is still stored. Do not read the cookie rule as "handled". |
 | `phpbb` | **Handled by a cookie VALUE predicate** (∆). `_u`/`_k`/`_sid` are set for **guests too** (an anonymous visitor gets `_u=1` — `ANONYMOUS`), so presence identifies nobody; a logged-in member carries `_u=<user_id>`, never `1`. The preset now tests the **value**, matching the cookie **name by suffix** because the prefix is `config('cookie_name')` (default `phpbb`, often renamed). | **Nothing extra.** A stock `cache_turbo_backend phpbb;` now bypasses logged-in members. (Before this, it did **not** — see [guide](docs/phpbb.md).) |
 
 ¤ **`xenforo` cannot be made both safe and fast on stock XenForo.** Stock XF2 has
@@ -598,9 +602,10 @@ block also bypasses. That is a **hit-rate loss on the other app, never a leak** 
 and it is the accepted price of closing a real leak on the Drupal side: Drupal
 opens a session for **anonymous** users whenever anything writes to `$_SESSION`
 (a status message after a form submit, cart contents), so a logged-in user's
-`SESS<hash>` cookie must bypass or their page can be stored and served on. Narrow
-it with your own `cache_turbo_bypass $cookie_SESS<your-hash>` if the collision
-costs you. Note `NO_CACHE` is **not** matched: it is contrib (not core) and is set
+`SESS<hash>` cookie must be excluded or their page can be stored and served on.
+Narrow it with your own `cache_turbo_bypass $cookie_SESS<your-hash>` — paired
+with a `cache_turbo_no_store` on the same cookie, since a bypass only skips the
+lookup and still stores — if the collision costs you. Note `NO_CACHE` is **not** matched: it is contrib (not core) and is set
 for *logged-out* visitors by design, so it would cost hits and buy no safety.
 
 ✦ **A cookie VALUE folded into the cache KEY, not a bypass.** `magento` is the one
@@ -668,7 +673,9 @@ default, not a per-install hash. If a site sets it, the preset's `fe_typo_user`
 substring **silently stops matching** — and because this is a *bypass* rule, a
 lost match means a **logged-in page gets cached and served to strangers**, the
 opposite of the wagtail/kirby failure direction. If you override
-`FE/cookieName`, add `cache_turbo_bypass $cookie_<your_name>;` yourself. The
+`FE/cookieName`, add `cache_turbo_bypass $cookie_<your_name>;` **and**
+`cache_turbo_no_store $cookie_<your_name>;` yourself — the bypass alone skips
+only the lookup and still stores the logged-in response. The
 preset also matches `be_typo_user` (the backend session) independently — it
 catches an editor previewing the frontend, who carries no `fe_typo_user` at
 all. See [typo3.md](docs/typo3.md).
@@ -694,13 +701,15 @@ XenForo member (`xf_user`), a Discourse user (`_t`) or a MediaWiki editor
 > why there is no preset for it and how to derive your own rule.
 >
 > Caveats you should not skip: **`joomla` and `phpbb` ship no cookie rule** and do
-> not protect logged-in users until you add your own bypass (phpBB needs a *value*
-> test — its cookies are handed to guests too); **`woocommerce` must be stacked
+> not protect logged-in users until you add your own bypass **plus a matching
+> `cache_turbo_no_store`** — a bypass skips only the lookup and still stores
+> (phpBB needs a *value* test — its cookies are handed to guests too); **`woocommerce` must be stacked
 > with `wordpress`** (alone, it leaves `/wp-admin/` cacheable); **`drupal` +
 > `mediawiki` lean on the origin's own `Cache-Control: private`**, so don't set
 > `cache_turbo_cache_control ignore` on those; and **`typo3`'s cookie name is
 > admin-overridable (`FE/cookieName`) — if you change it, add your own
-> `cache_turbo_bypass`, or logged-in pages get cached** (this one fails unsafe,
+> `cache_turbo_bypass` *and* `cache_turbo_no_store`, or logged-in pages get
+> cached** (this one fails unsafe,
 > not safe — see [typo3.md](docs/typo3.md)).
 
 #### "Session" in a cookie name does not mean "logged in"
@@ -763,7 +772,9 @@ Three caveats worth checking against your install:
 - **Custom cookie prefix.** The names assume XenForo's default
   `$config['cookie']['prefix'] = 'xf_'`. If you changed it, the preset won't
   match — add your own `cache_turbo_bypass $cookie_<prefix>session
-  $cookie_<prefix>session_admin $cookie_<prefix>user;`. All three: `session` is
+  $cookie_<prefix>session_admin $cookie_<prefix>user;` **and the same list on
+  `cache_turbo_no_store`** (the bypass skips only the lookup and still stores).
+  All three: `session` is
   the only cookie an ordinary (non-remember-me) login carries, `session_admin`
   the admin session, `user` remember-me. Bypassing `user` alone leaves ordinary
   and admin logins cacheable — the leak this preset exists to prevent.
@@ -789,7 +800,10 @@ Three caveats worth checking against your install:
   admin URL with no cookie yet, a search query), it doesn't replace them.
 - **Not a security boundary for your own private routes.** The presets cover the
   well-known CMS surfaces above; a custom `/members/`-style area still needs its
-  own `cache_turbo_bypass $cookie_yoursession;` (or a raw default key,
+  own `cache_turbo_bypass $cookie_yoursession;` **plus
+  `cache_turbo_no_store $cookie_yoursession;`** — a bypass skips only the lookup,
+  so without the `no_store` half the private page is still stored under the
+  shared key (or a raw default key,
   `cache_turbo_key $scheme$host$request_uri;`, for origins that don't reliably
   mark per-user responses `private`).
 
@@ -1098,7 +1112,9 @@ http {
             cache_turbo_min_uses          1;         # cache only after the key is seen N times (1 = first miss)
 
             # ── per-request opt-outs ────────────────────────────────────
-            cache_turbo_bypass            $cookie_session $arg_nocache;  # skip lookup, still store
+            cache_turbo_bypass            $cookie_session;  # skip lookup, still store
+            cache_turbo_no_store          $cookie_session;  # ...so pair it, see below
+            # NOT $arg_nocache -- a client-supplied bypass trigger is a DoS lever
             cache_turbo_no_store          $cookie_session;              # don't store the response
 
             # ── let the origin decide (inverts the store default here) ──
@@ -1156,8 +1172,10 @@ http {
 | `cache_turbo_lock_timeout TIME` | `server`, `location` | `5s` | How long a waiting cold-miss request waits for the winner's fill before giving up and going to the origin itself. |
 | `cache_turbo_min_uses N` | `server`, `location` | `1` | Cache a page only after its key has been requested `N` times — keep one-hit-wonder URLs out of the cache. Below the threshold each request goes to the origin and is **not** stored; the `N`-th miss stores it. A key already present in the L2 (Redis) tier is served from L2 regardless (it is already proven popular). `1` = store on the first miss (off). |
 | `cache_turbo_max_size SIZE` | `server`, `location` | `1m` | Don't cache responses bigger than this. |
-| `cache_turbo_bypass VAR...` | `server`, `location` | — | If any variable is non-empty and not `0`, skip the cache lookup (go to origin) — but still store the fresh response. E.g. `cache_turbo_bypass $cookie_session $arg_nocache;` to always revalidate logged-in users. |
+| `cache_turbo_bypass VAR...` | `server`, `location` | — | If any variable is non-empty and not `0`, skip the cache lookup (go to origin) — but still store the fresh response. E.g. `cache_turbo_bypass $cookie_session;` to always revalidate logged-in users. **Never put a client-controlled variable (`$arg_nocache`, `$http_x_no_cache`, …) in this list on a public endpoint** — the bypass returns before the single-flight lock is taken, so miss-collapsing does not apply and `ab -n 200000 'https://site/?nocache=1'` puts 100% of a flood on the origin. If you need a manual cache-buster, gate it on something only you can send (a shared secret in a header, or `$remote_addr` via a `map`). **On an identity predicate (session/login cookie, auth token, private-surface flag) always pair it with the same variables on `cache_turbo_no_store`** — on its own a bypass still writes that user's personalised response under the shared key, where the next anonymous visitor can be served it. Bypass controls the *lookup*; `cache_turbo_no_store` controls the *store*. (`cache_turbo_bypass_uri` and the `cache_turbo_backend` presets do skip storing as well; only `cache_turbo_bypass` does not.) |
 | `cache_turbo_no_store VAR...` | `server`, `location` | — | If any variable is non-empty and not `0`, do **not** store the response. E.g. `cache_turbo_no_store $cookie_session;`. |
+| `cache_turbo_bypass_uri PREFIX...` | `server`, `location` | — | Skip the cache entirely for requests whose URI starts with any of the listed prefixes — neither served from nor stored into the cache. Each prefix must start with `/` (a config error otherwise) and is matched against `r->uri` **with a `/` or `.` boundary**. `r->uri` is the decoded path *without* the query string, so a prefix containing `?` can never match — use `cache_turbo_bypass` with a `map $args` for query-string state. Prefixes are anchored at byte 0, so a subdirectory install (`/forum/…`) needs its own full prefixes. |
+| `cache_turbo_key_cookie NAME...` | `server`, `location` | — | Fold the value of each named cookie into the cache key, so each distinct value gets its own entry. Names are matched **exactly** (not as a substring). Each value is added **length-prefixed**, which is why this is the correct way to key on a cookie: splicing `$cookie_*` variables into `cache_turbo_key` by hand leaves the fields undelimited and lets a visitor choose a value that reproduces another page's key. Use for **variants** (theme, language, currency); never for identity — see `cache_turbo_bypass`. |
 | `cache_turbo_require_header NAME` | `server`, `location` | — | **Inverts the store default** on this location: nothing is stored unless the *response* carries `NAME` with an affirmative value (`yes`/`1`/`on`, case-insensitive, matched whole). Header absent, `no`, empty, or sent twice with conflicting values ⇒ no store — it **fails closed**. For origins HTTP cannot judge: a GraphQL endpoint answers queries and mutations on one URI+method and returns errors as `200` ([details](#letting-the-origin-decide-cache_turbo_require_header)). Takes a header **name**, not a `$variable` (the value is read from the response; a variable would evaluate against the request), validated at config time. Stripped before storing, so a hit never replays it. Unset ⇒ inert. |
 | `cache_turbo_purge on` | `server`, `location` | `off` | Allow a `PURGE <uri>` request to drop that URI's entry from L1 (+L2). Gate the location with `allow`/`deny`. E.g. `curl -X PURGE http://host/blog/post-42`. |
 | `cache_turbo_cache_control respect\|honor\|ignore` | `server`, `location` | `respect` | How the response `Cache-Control` is treated. **respect** (default): it gates storage and reshapes the stale window as written; the fresh TTL comes from `cache_turbo_valid`. **honor**: also take the fresh TTL from the response's own freshness headers, in RFC 9213 precedence order — `Surrogate-Control: max-age` (Fastly/Akamai) > `CDN-Cache-Control: s-maxage`/`max-age` (Cloudflare) > `Cache-Control: s-maxage`/`max-age` > `Expires` — falling back to `cache_turbo_valid` when none is present. The two **targeted** headers let an origin hand this shared cache a different TTL than the browser's `Cache-Control`; a targeted `no-store`/`private`/`max-age=0` also vetoes storage, and both targeted headers are stripped before store so they never replay downstream (see [Behind a CDN / multi-tier caching](#behind-a-cdn--multi-tier-caching)). **ignore**: discard the response `Cache-Control` **entirely** (mirror of nginx's `proxy_ignore_headers Cache-Control`) — `no-store`/`no-cache`/`private`/`max-age=0`/`s-maxage=0` no longer forbid storage, `must-revalidate`/`proxy-revalidate`/`stale-while-revalidate=N`/`stale-if-error=N` no longer reshape the window (it stays `cache_turbo_valid` × `cache_turbo_stale_mult`), and the TTL comes from `cache_turbo_valid`; use it for an origin that blankets shareable pages with `max-age=0, must-revalidate`. The `Set-Cookie` and request-`Authorization` safety floors are **not** affected by any mode — a per-user response is still never cached. A CMS preset (`cache_turbo_backend`) defaults this to `honor`. |

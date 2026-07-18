@@ -3,7 +3,9 @@
 _Last researched: 2026-07-18_
 
 Caching a vBulletin board — vBulletin 5 Connect (current as of 2026-07) and the
-vB4/vB3 legacy line, which share the same `bb_` login-cookie shape. Closed-source
+vB4/vB3 legacy line, which share the same login-cookie shape (see the
+[prefix note](#the-cookie-prefix-and-the-underscore) — the underscore in `bb_`
+is not universal). Closed-source
 commercial PHP, so no source read is possible; the cookie shape is documented in
 the vBulletin manual and community forum and matches production LiteSpeed/nginx
 guest-caching configs, so this ships with reasonable confidence.
@@ -24,9 +26,9 @@ cache_turbo_backend vbulletin;
 
 ## Why presence/non-empty is safe here
 
-`bb_userid` and `bb_password` are the load-bearing signal. The vBulletin
+`bbuserid` and `bbpassword` are the load-bearing signal. The vBulletin
 community documents them as set **on login and removed on logout** — a guest
-only ever carries `bb_lastactivity`, `bb_lastvisit`, and `bb_sessionhash`.
+only ever carries `bblastactivity`, `bblastvisit`, and `bbsessionhash`.
 Presence/non-empty-value alone is sufficient; no value-split trick needed.
 (`bbimloggedin=yes` also appears in some LiteSpeed/nginx guest-cache configs as
 an extra login flag, but it is community-reported and not in the official cookie
@@ -34,16 +36,28 @@ docs — treat it as belt-and-braces, not the primary signal.)
 
 | Cookie | Treatment | Why |
 |---|---|---|
-| `bb_userid` / `bb_password` (suffix `userid`/`password`) | **bypass** (non-empty) | set only on login, removed on logout |
+| `bbuserid` / `bbpassword` (suffix `userid`/`password`) | **bypass** (non-empty) | set only on login, removed on logout |
 | `bbimloggedin` == `yes` | **bypass** | community-reported extra login flag (LiteSpeed/nginx configs); not in official cookie docs |
-| `bb_sessionhash` | **ignore** | session tracking for every visitor including guests |
-| `bb_lastvisit` / `bb_lastactivity` / language cookie | **cache key** (manual) | presentation, not identity |
+| `bbsessionhash` | **ignore** | session tracking for every visitor including guests |
+| `bblastvisit` / `bblastactivity` / language cookie | **cache key** (manual) | presentation, not identity |
 
-The `bb_` prefix is admin-configurable (Cookie and HTTP Header Options), so the
-rule matches the **suffix** `userid`/`password`/`imloggedin`, not a hardcoded
-`bb_` literal. A rare full manual rename of the base cookie name itself (not
-just the prefix) still evades it — same caveat class as any other
-admin-configurable name in this registry.
+### The cookie prefix, and the underscore
+
+vBulletin builds each cookie name by concatenating the configured prefix onto a
+bare base name (`userid`, `password`, `sessionhash`, …) with **no separator**.
+The stock prefix is `bb`, so the names on the wire are `bbuserid`,
+`bbpassword`, `bbsessionhash` — *no underscore*. This is what vB3.8-era and
+vB5 Connect installs actually send, and what LiteSpeed's own vBulletin
+guest-cache recipe matches (`RewriteCond %{HTTP_COOKIE} !bbuserid=`). The
+`bb_userid` spelling seen on many vB4 boards comes from the prefix itself being
+set to `bb_`, not from a different naming scheme — either way the underscore is
+part of the *prefix*, not a fixed separator, so do not assume it is there.
+
+Because the prefix is operator-controlled, the rule matches the **suffix**
+`userid`/`password`/`imloggedin`, not a hardcoded `bb_` literal — so it covers
+`bbuserid`, `bb_userid` and any other prefix equally. A rare full manual rename
+of the base cookie name itself (not just the prefix) still evades it — same
+caveat class as any other admin-configurable name in this registry.
 
 ## Vhost
 
@@ -67,8 +81,11 @@ http {
             cache_turbo               ct;
             cache_turbo_backend       vbulletin;
 
-            cache_turbo_key           $host$uri$cookie_bb_language$cache_turbo_normalized_args;
-
+            # No cache_turbo_key: the `vbulletin` preset already folds the
+            # language cookie into the key with length-prefixed framing. Do NOT
+            # hand-write one that splices $cookie_* values together — unframed
+            # concatenation lets a visitor choose a cookie value that reproduces
+            # another page's key.
             cache_turbo_valid         60s;
             cache_turbo_valid         404 410 1m;
             cache_turbo_preset        balanced;
@@ -104,12 +121,13 @@ add_header X-Cache-Turbo $cache_turbo_status always;
 curl -sI https://forum.example.com/showthread.php?t=1 | grep -i x-cache-turbo
 curl -sI https://forum.example.com/showthread.php?t=1 | grep -i x-cache-turbo  # HIT
 
-# a GUEST carrying only bb_sessionhash must still be a HIT.
-curl -sI -H 'Cookie: bb_sessionhash=abc123' \
+# a GUEST carrying only bbsessionhash must still be a HIT.
+# (use bb_sessionhash instead if your install's prefix is "bb_")
+curl -sI -H 'Cookie: bbsessionhash=abc123' \
      https://forum.example.com/showthread.php?t=1 | grep -i x-cache-turbo     # HIT
 
 # THE ONE THAT MATTERS: a logged-in member must be BYPASS.
-curl -sI -H 'Cookie: bb_userid=42; bb_password=somehash' \
+curl -sI -H 'Cookie: bbuserid=42; bbpassword=somehash' \
      https://forum.example.com/showthread.php?t=1 | grep -i x-cache-turbo     # BYPASS
 
 # UCP / PM / admin: BYPASS
@@ -121,9 +139,9 @@ curl -sI https://forum.example.com/usercp.php | grep -i x-cache-turbo
 - **Closed-source, community-corroborated.** No source read is possible;
   confirmed against forum threads and a production LiteSpeed caching config,
   not vBulletin's own code.
-- **A full manual cookie rename (not just the `bb_` prefix)** evades the
-  suffix match. Rare, but possible via Admin CP.
-- **`bb_sessionhash` is not an auth cookie** — guests have it too. Bypassing
+- **A full manual cookie rename (not just the `bb` prefix)** evades the
+  suffix match. Rare, but possible.
+- **`bbsessionhash` is not an auth cookie** — guests have it too. Bypassing
   on it is the classic mistake and would zero the hit rate.
 - **`Set-Cookie` responses are never stored** and `Authorization` requests are
   never cached, regardless of preset.
@@ -132,19 +150,24 @@ curl -sI https://forum.example.com/usercp.php | grep -i x-cache-turbo
 
 vBulletin-specific things that bite around a full-page cache:
 
-- **The `bb_` cookie prefix is configurable.** Default is `bb` (cookies land as
-  `bb_userid`, `bb_password`, …), but it is set per-install under **AdminCP >
-  Settings > Options > Cookies and HTTP Header Options**. The preset matches on
-  the `userid`/`password` **suffix** rather than a hardcoded `bb_`, so a changed
-  prefix still works — but a full manual rename of the base cookie name would
-  need the key/bypass rules updated to match.
-- **`bb_userid` + `bb_password` are the member signal.** Their presence means a
-  logged-in user and must bypass; a guest carries only `bb_lastactivity`,
-  `bb_lastvisit`, `bb_sessionhash`. Never bypass on `bb_sessionhash` — guests
+- **The cookie prefix is configurable, in `config.php` — not the AdminCP.**
+  Default is `bb` (cookies land as `bbuserid`, `bbpassword`, …; the prefix is
+  concatenated with no separator). It is set per-install as
+  `$config['Misc']['cookieprefix']` in **`config.php`**. The AdminCP page
+  *Settings > Options > Cookies and HTTP Header Options* is a different thing —
+  it controls cookie **path, domain and session timeout**, not the prefix, so
+  don't go looking for it there. The preset matches on the `userid`/`password`
+  **suffix** rather than a hardcoded `bb_`, so a changed prefix still works —
+  but a full manual rename of the base cookie name would need the key/bypass
+  rules updated to match.
+- **`bbuserid` + `bbpassword` are the member signal.** Their presence means a
+  logged-in user and must bypass; a guest carries only `bblastactivity`,
+  `bblastvisit`, `bbsessionhash`. Never bypass on `bbsessionhash` — guests
   have it too, and doing so zeroes the hit rate.
 - **`/admincp` and `/modcp` must never be cached.** These are logged-in-only
-  admin/moderator surfaces (the admin session rides a separate `bb_cpsessionhash`
-  cookie); in vB5 the `modcp` directory name is fixed and cannot be renamed. Same
+  admin/moderator surfaces (the admin session rides a separate `bbcpsessionhash`
+  cookie — again prefix + base name, so `bb_cpsessionhash` on a `bb_`-prefixed
+  install); in vB5 the `modcp` directory name is fixed and cannot be renamed. Same
   for login/register and the private-message / UCP flows — all member-state pages.
 - **vBulletin's datastore is not the nginx layer.** vB caches its own settings,
   permissions, usergroups, and phrases in an internal *datastore* (DB rows or

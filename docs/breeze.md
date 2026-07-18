@@ -11,7 +11,7 @@ explicitly.
 
 - [The short version](#the-short-version)
 - [What Breeze actually is](#what-breeze-actually-is)
-- [Cookies: nothing extra](#cookies-nothing-extra)
+- [Cookies: one, and it is not an identity](#cookies-one-and-it-is-not-an-identity)
 - [Scenario 1: self-hosted / non-Cloudways nginx](#scenario-1-self-hosted--non-cloudways-nginx)
 - [Scenario 2: on Cloudways-managed infra](#scenario-2-on-cloudways-managed-infra)
 - [Vhost: page cache only](#vhost-page-cache-only)
@@ -64,21 +64,42 @@ and set the IP, and it becomes a live self-hosted purge integration. Either
 way it never touches cache-turbo's zone — Varnish would sit in front of nginx,
 cache-turbo lives inside it.
 
-## Cookies: nothing extra
+## Cookies: one, and it is not an identity
 
 Checked Breeze's settings surface and support docs for a plugin-specific
 identity cookie (the pattern XenForo's `xf_session` or a bespoke "logged in"
-cookie would represent). **Confirmed: none.** Breeze's "cache logged-in
-users" option is a coarse per-role toggle (Administrator/Editor/Author/
-Contributor) evaluated server-side against WordPress's own
+cookie would represent). **Confirmed: no identity cookie.** Breeze's "cache
+logged-in users" option is a coarse per-role toggle (Administrator/Editor/
+Author/Contributor) evaluated server-side against WordPress's own
 `wordpress_logged_in_*` cookie at cache-write time — it does not mint a
-cookie of its own for the browser to carry. That means the stock `wordpress`
-preset's bypass list is already complete for Breeze:
+login cookie of its own for the browser to carry.
+
+**It does mint one non-identity cookie, and it has a real edge case.** Breeze
+sets `breeze_commented_posts[<post-id>]` from its `set_comment_cookies` hook
+(`purge-cache.php`), **without the consent check WordPress core applies to its
+own `comment_author_*` cookies**. So a commenter who *declines* the cookie
+consent box carries the Breeze cookie **alone**: core skips `comment_author_*`,
+the `wordpress` preset has nothing to match on, and that commenter is served a
+cached page on which their own pending comment is missing. It is a confusing-UX
+bug, not a leak — the cookie carries no identity — but if your site takes
+comments, add it:
+
+```nginx
+map $http_cookie $breeze_commenter {
+    default                                  0;
+    "~*(^|;\s*)breeze_commented_posts%5B"    1;
+}
+
+cache_turbo_bypass   $breeze_commenter;
+cache_turbo_no_store $breeze_commenter;
+```
+
+Otherwise the stock `wordpress` preset's bypass list is complete for Breeze:
 
 | Check | Values |
 |---|---|
 | URI prefixes | `/wp-admin/`, `/wp-login.php`, `/wp-cron.php`, `/xmlrpc.php`, `/wp-json/` |
-| Cookie substrings | `wordpress_logged_in_`, `wp-postpass_`, `comment_author_` |
+| Cookie header substrings | `wordpress_logged_in_`, `wp-postpass_`, `comment_author_` |
 
 No Breeze-specific row to add. See [`wordpress.md`](wordpress.md) for the
 full table and the reasoning behind each entry.
@@ -118,6 +139,15 @@ load_module modules/ngx_http_cache_turbo_module.so;
 http {
     cache_turbo_zone name=ct 256m;
 
+    # $cookie_NAME is an EXACT-name lookup, and WordPress suffixes its cookie
+    # names with an md5 of the site URL. $cookie_wordpress_logged_in_ is
+    # therefore ALWAYS empty -- match the prefix out of the raw Cookie header
+    # instead.
+    map $http_cookie $wp_logged_in {
+        default                                        0;
+        "~*(^|;\s*)wordpress_logged_in_[0-9a-f]{32}="   1;
+    }
+
     server {
         listen 443 ssl http2;
         server_name example.com;
@@ -136,7 +166,7 @@ http {
             cache_turbo_valid         404 410 1m;   # negative caching
             cache_turbo_preset        balanced;     # SWR: serve stale while one refresh runs
 
-            cache_turbo_no_store      $cookie_wordpress_logged_in_;
+            cache_turbo_no_store      $wp_logged_in;
 
             include                   fastcgi_params;
             fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
@@ -197,11 +227,14 @@ of nginx rather than inside it.
 - **Minify/gzip/CDN features are unaffected either way** — they operate on
   the HTML/asset output regardless of which layer owns the page cache, so
   there's no need to disable them when disabling Breeze's page cache.
-- **No Breeze-specific cookie exists** (confirmed against plugin source v2.5.9
-  — its page cache keys off WordPress's own `wordpress_logged_in_` cookie and
-  mints none of its own). If a future release adds one (e.g. a dedicated
-  logged-in marker), it would need a `cache_turbo_bypass` addition the way
-  XenForo's `xf_lscxf_logged_in` needed one; nothing to add today.
+- **No Breeze-specific *identity* cookie exists** (confirmed against plugin
+  source v2.5.9 — its page cache keys off WordPress's own
+  `wordpress_logged_in_` cookie and mints no login cookie of its own). It does
+  mint `breeze_commented_posts[<id>]` with no consent gate, which is the one
+  real gap — see [Cookies](#cookies-one-and-it-is-not-an-identity) above. If a future release
+  adds a dedicated logged-in marker, it would need a `cache_turbo_bypass` +
+  `cache_turbo_no_store` addition (the bypass alone still stores) the way
+  XenForo's `xf_lscxf_logged_in` needed one.
 
 ## PHP settings / gotchas
 

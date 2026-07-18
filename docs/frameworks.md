@@ -22,7 +22,8 @@ preset**, not this page. See [README.md](README.md).
 
 ## Why there is no framework preset
 
-A preset is three literals: cookie substrings, URI prefixes, query-arg keys. An
+A preset is three literals: `Cookie`-header substrings (matched across cookie
+names *and* values, not as cookie names), URI prefixes, query-arg keys. An
 *application* can supply all three because it ships a fixed cookie name and a fixed
 URL layout. A *framework* supplies none of them.
 
@@ -184,8 +185,9 @@ the one that decides everything.**
 
 **Django — the conditional one.** `SessionMiddleware` sets `sessionid` only when the
 session is **non-empty AND modified**. So a brochure site with no cart, no guest
-flash messages and `CSRF_USE_SESSIONS=False` **never cookies a guest**, and
-`cache_turbo_bypass $cookie_sessionid;` is exactly right. But it silently stops
+flash messages and `CSRF_USE_SESSIONS=False` **never cookies a guest**, and the
+`cache_turbo_bypass`/`cache_turbo_no_store` pair on `$cookie_sessionid` above is
+exactly right. But it silently stops
 being right the moment the app grows:
 
 - an **anonymous cart** (`request.session['cart'] = …`) — cookies every guest;
@@ -384,7 +386,9 @@ shared variant of a page to serve (customer group, currency, store view, A/B
 bucket) that many visitors legitimately share — **never** for an identity cookie
 (a session id, a login token). Keying on an identity cookie gives one entry per
 visitor (hit rate ≈ 0) and puts authenticated HTML in a shared cache. For an
-identity cookie you want `cache_turbo_bypass`, not this.
+identity cookie you want `cache_turbo_bypass` **plus** `cache_turbo_no_store` on
+the same variable, not this — the bypass skips only the lookup, so on its own the
+authenticated response is still stored under the shared key.
 
 Why a directive and not just `cache_turbo_key $cookie_x`:
 

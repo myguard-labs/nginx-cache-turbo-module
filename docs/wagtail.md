@@ -30,7 +30,7 @@ cache_turbo_backend wagtail;     # implies cache_turbo_cache_control honor
 
 | Check | Values |
 |---|---|
-| Cookie substrings | `sessionid` |
+| Cookie header substrings | `sessionid` |
 | URI prefixes | `/admin/`, `/django-admin/`, `/documents/` |
 | Query args | — |
 
@@ -84,6 +84,26 @@ working — until the origin falls over.
 is *bypass a guest* (lost hits), never *serve a member's page to a stranger* (a
 leak). Compare Flarum, whose failure direction is the leak — which is why there is
 [no flarum preset](README.md#apps-we-deliberately-do-not-ship-a-preset-for).
+
+> **⚠️ Renaming the cookie is a *different* failure, and it fails UNSAFE.** The
+> name is Django's `SESSION_COOKIE_NAME` setting (`django/conf/global_settings.py`
+> — it defaults to `"sessionid"`, and it is a plain overridable default, not a
+> per-install hash). A site that sets it to anything else makes the preset's rule
+> **stop matching a logged-in visitor** — and a lost match on a bypass rule means
+> the *cache keeps working* while the *safety check* silently stops: a logged-in
+> page gets stored and served to strangers. That is the opposite direction from
+> the guest-session condition above, and the same class of hazard as
+> [typo3's `FE/cookieName`](typo3.md#the-one-condition--and-why-it-is-not-safe).
+> If you set `SESSION_COOKIE_NAME`, add both lines yourself:
+>
+> ```nginx
+> cache_turbo_bypass   $cookie_<your_cookie_name>;
+> cache_turbo_no_store $cookie_<your_cookie_name>;   # bypass alone still STORES
+> ```
+>
+> Also watch `SESSION_COOKIE_NAME` if you run several Django sites on one domain —
+> renaming it per site is the standard fix for cookie collisions, and it is the
+> most likely way a Wagtail install ends up here.
 
 Check with one command, and **re-run it after any deploy that touches sessions**:
 
@@ -186,8 +206,10 @@ curl -sI https://example.com/ | grep -i set-cookie      # must NOT set sessionid
   rate without touching nginx, and nobody will tell you. Put the `set-cookie` check
   in monitoring.
 - **Moving the admin is fine.** If you relocate `/admin/` to `/cms/`, add a
-  `cache_turbo_bypass` (or just rely on `sessionid`, which still catches every
-  authenticated request). You lose an optimisation, not a guarantee.
+  `cache_turbo_bypass` plus a matching `cache_turbo_no_store` — the bypass alone
+  skips only the lookup and still stores (or just rely on `sessionid`, which
+  still catches every authenticated request). You lose an optimisation, not a
+  guarantee.
 - **`/documents/` must stay bypassed.** If you switch `WAGTAILDOCS_SERVE_METHOD` to
   `direct` or `redirect`, documents are served by the storage backend and the
   privacy check moves — but the preset's bypass costs you nothing, so leave it.

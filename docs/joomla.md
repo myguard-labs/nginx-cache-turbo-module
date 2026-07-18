@@ -17,14 +17,17 @@ it does **not** protect logged-in users on its own.
 ## The short version
 
 ```nginx
-cache_turbo         ct;
-cache_turbo_backend joomla;
-cache_turbo_bypass  $cookie_<your_joomla_session_cookie>;   # ← REQUIRED, see below
+cache_turbo          ct;
+cache_turbo_backend  joomla;
+cache_turbo_bypass   $cookie_<your_joomla_session_cookie>;   # ← REQUIRED, see below
+cache_turbo_no_store $cookie_<your_joomla_session_cookie>;   # ← REQUIRED, bypass alone still STORES
 ```
 
-The preset alone skips `/administrator/` and nothing else. The
-`cache_turbo_bypass` line is not optional garnish — without it, a logged-in
-Joomla user's page can be stored and served to the public.
+The preset alone skips `/administrator/` and nothing else. Those two lines are
+not optional garnish — without them, a logged-in Joomla user's page can be
+stored and served to the public. **You need both:** `cache_turbo_bypass` only
+skips the cache *lookup*, so the logged-in response is still written under the
+shared key; `cache_turbo_no_store` is the half that prevents storing.
 
 ## The preset is thin — read this
 
@@ -32,7 +35,7 @@ Joomla user's page can be stored and served to the public.
 |---|---|
 | URI prefixes | `/administrator/` |
 | Query args | — |
-| Cookie substrings | `joomla_remember_me_` |
+| Cookie header substrings | `joomla_remember_me_` |
 
 ## The cookie rule is a PARTIAL guard. Read this before you rely on it.
 
@@ -75,10 +78,11 @@ it is the bare 32-hex one), and bypass on it:
 
 ```nginx
 # 1a79a4d6... is YOUR site's hash. It will not be the same as anyone else's.
-cache_turbo_bypass $cookie_1a79a4d60de6718e8e5b326e338ae533;
+cache_turbo_bypass   $cookie_1a79a4d60de6718e8e5b326e338ae533;
+cache_turbo_no_store $cookie_1a79a4d60de6718e8e5b326e338ae533;   # bypass alone still STORES
 ```
 
-Without that, the only things standing between a logged-in Joomla user and a
+Without those, the only things standing between a logged-in Joomla user and a
 cached page are the `/administrator/` URI rule (which does not cover the front
 end) and Joomla's own `Cache-Control` — and the core System - Page Cache plugin only
 stores a page when `$app->getIdentity()->guest` is true (its `appStateSupportsCaching()`
@@ -112,7 +116,8 @@ Or just read it out of your browser's dev-tools. You're looking for the
 32-hex-character cookie name. Then:
 
 ```nginx
-cache_turbo_bypass $cookie_1a79a4d60de6718e8e5b326e338ae533;
+cache_turbo_bypass   $cookie_1a79a4d60de6718e8e5b326e338ae533;
+cache_turbo_no_store $cookie_1a79a4d60de6718e8e5b326e338ae533;   # bypass alone still STORES
 ```
 
 If you'd rather not hard-code a hash that changes when the site secret is rotated,
@@ -126,7 +131,8 @@ map $http_cookie $joomla_session {
 ```
 
 ```nginx
-cache_turbo_bypass $joomla_session;
+cache_turbo_bypass   $joomla_session;
+cache_turbo_no_store $joomla_session;   # bypass alone still STORES
 ```
 
 That's blunter (it bypasses on *any* 32-hex cookie, including a guest session
@@ -238,27 +244,62 @@ call, session cookie name, or cookie helper anywhere in its source — **do not
 add a `kunena` preset bit**, it would be exactly as unshippable as a bare
 `joomla` identity guard and would add nothing this page doesn't already cover.
 
-Use the `joomla` preset plus your own per-install `cache_turbo_bypass` on your
-site's session cookie (see above), and add Kunena's own always-dynamic
+Use the `joomla` preset plus your own per-install `cache_turbo_bypass` **and
+`cache_turbo_no_store`** on your site's session cookie (see above), and add
+Kunena's own always-dynamic
 surfaces as extra URI-prefix bypasses — these are unauthenticated-cookie-
 invisible actions that must never be served from cache regardless of cookie
 state:
 
+**`cache_turbo_bypass_uri` cannot do this.** It matches a prefix of `r->uri`,
+which nginx has already stripped of the query string, so a needle containing
+`?option=…` is longer than the `/index.php` it is compared against and can never
+match. It passes the leading-slash config check, so a rule written that way
+loads clean and silently caches Kunena PMs. With SEF URLs **off**, every Kunena
+view lives at the same `/index.php` path and the distinguishing state is entirely
+in the query string — match on `$args`:
+
 ```nginx
-cache_turbo_bypass_uri
-    /index.php?option=com_kunena&view=user&layout=messages   # private messages
-    /index.php?option=com_kunena&view=topic&layout=post;      # posting/reply
+# Three maps rather than one regex: query-string argument order is arbitrary,
+# so "com_kunena AND view=user" cannot be expressed as a single left-to-right
+# pattern. Match each half independently, then AND the two flags.
+map $args $kunena_app {
+    default                        0;
+    "~(^|&)option=com_kunena(&|$)" 1;
+}
+
+map $args $kunena_private_view {
+    default                    0;
+    "~(^|&)view=user(&|$)"     1;   # private messages
+    "~(^|&)layout=post(&|$)"   1;   # posting/reply
+}
+
+map "$kunena_app$kunena_private_view" $kunena_private {
+    default 0;
+    "11"    1;
+}
+
+server {
+    location ~ \.php$ {
+        cache_turbo_bypass   $kunena_private;
+        cache_turbo_no_store $kunena_private;   # bypass alone still STORES
+        ...
+    }
+}
 ```
 
-(Adjust for SEF URLs if enabled — match your site's actual routed paths for
-these views.) Moderation actions under `/administrator/` are already covered
-by the preset's admin-URI rule.
+With SEF URLs **on** those views get real paths, and `cache_turbo_bypass_uri`
+becomes the right tool — point it at your site's actual routed prefixes (e.g.
+`/forum/user/messages`), not at the `index.php?option=` form. Moderation actions
+under `/administrator/` are already covered by the preset's admin-URI rule.
 
 ## Gotchas
 
 - **The preset does not cover logged-in users.** Said three times because it's the
   one real footgun here. `cache_turbo_backend joomla;` without a
-  `cache_turbo_bypass` for your session cookie is not a safe config.
+  `cache_turbo_bypass` **and** a `cache_turbo_no_store` for your session cookie
+  is not a safe config — the bypass skips only the lookup, so on its own it
+  still stores the logged-in response under the shared key.
 - **Rotating the site secret changes the cookie name** — and silently breaks a
   hard-coded `$cookie_<hash>` bypass. Use the `map` form, or re-check after any
   secret rotation.

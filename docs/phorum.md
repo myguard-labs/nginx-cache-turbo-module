@@ -66,9 +66,11 @@ http {
             cache_turbo               ct;
             cache_turbo_backend       phorum;
 
-            # Phorum's own thread-display style is presentation, not identity.
-            cache_turbo_key           $host$uri$cookie_list_style$cache_turbo_normalized_args;
-
+            # Phorum's own thread-display style is presentation, not identity —
+            # the `phorum` preset already folds `list_style` into the key with
+            # length-prefixed framing. Do NOT hand-write a cache_turbo_key that
+            # splices $cookie_* values together: unframed concatenation lets a
+            # visitor choose a cookie value that reproduces another page's key.
             cache_turbo_valid         60s;
             cache_turbo_valid         404 410 1m;
             cache_turbo_preset        balanced;

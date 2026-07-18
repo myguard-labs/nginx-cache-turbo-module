@@ -114,9 +114,12 @@ http {
         }
 
         # phpBB internals -- never HTTP-reachable, never cache candidates.
-        location ~ ^/(cache|store|files)/ {
-            deny all;
-        }
+        # `^~` is load-bearing: regex locations are tested in DECLARATION order,
+        # so a plain `~ ^/(cache|store|files)/` written after `~ \.php$` would
+        # never run and /cache/data_global.php would execute in php-fpm.
+        location ^~ /cache/ { deny all; }
+        location ^~ /store/ { deny all; }
+        location ^~ /files/ { deny all; }
 
         # Board styles / avatars / attachments: static, long-lived.
         location ~* ^/(styles|images|assets)/ {
@@ -126,8 +129,15 @@ http {
         }
 
         # Never cache attachment downloads -- they are permission-checked per user.
+        # An `=` location outranks the `~ \.php$` regex, so this block must
+        # repeat the FastCGI wiring itself. Without it nginx falls back to the
+        # static handler and serves the raw PHP source.
         location = /download/file.php {
             cache_turbo off;
+
+            include                   fastcgi_params;
+            fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+            fastcgi_pass  unix:/run/php/php-fpm.sock;
         }
 
         location = /_cache {

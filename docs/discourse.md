@@ -53,13 +53,26 @@ cache_turbo_backend discourse;      # implies cache_turbo_cache_control honor
 |---|---|
 | URI prefixes | `/admin`, `/session`, `/auth/`, `/login`, `/logout`, `/signup`, `/my/`, `/message-bus/`, `/drafts`, `/presence/`, `/notifications`, `/user_actions` |
 | Query args | `api_key`, `api_username` |
-| Cookie substrings | `_t=` |
+| Cookie header substrings | `_t=` |
 
 **One cookie bypasses: `_t`.** That is Discourse's auth token
 (`lib/auth/default_current_user_provider.rb` — `TOKEN_COOKIE`). It is written
 only for an authenticated user and *deleted* for an anonymous one, and it is the
 exact test Discourse's own anon cache uses to decide a request is cacheable. If
-`_t` is present, someone is logged in.
+`_t` is present, someone is logged in. The literal shipped is `_t=`, with the
+delimiter: this tier substring-searches the whole `Cookie` header across names
+*and* values, so the trailing `=` is what anchors the match to the end of a cookie
+name instead of firing on any value containing `_t`.
+
+> **⚠️ `_t` is the default, not a hard literal — it is env-overridable.**
+> `TOKEN_COOKIE = ENV["DISCOURSE_TOKEN_COOKIE"] || "_t"`
+> (`lib/auth/default_current_user_provider.rb:39`). A deployment that sets
+> `DISCOURSE_TOKEN_COOKIE` makes this rule stop matching, and a lost match on a
+> bypass rule means logged-in pages get cached. If your install sets it, add
+> `cache_turbo_bypass $cookie_<your_name>;` **and**
+> `cache_turbo_no_store $cookie_<your_name>;` yourself. (The `honor`-mode
+> `no-store` Discourse sends on authenticated responses still covers you on a
+> stock config — but not if you run `cache_turbo_cache_control ignore`.)
 
 **`_forum_session` must NOT bypass, and this is the important half.** It is the
 Rails session cookie, and Rails hands one to *everybody* — every anonymous
@@ -76,8 +89,14 @@ how the page renders, but everyone who picked dark mode gets the *same* dark pag
 They belong in the **key**, not the bypass:
 
 ```nginx
-cache_turbo_key $uri$cookie_theme_ids$cookie_forced_color_mode;
+cache_turbo_key_cookie theme_ids forced_color_mode;
 ```
+
+Use `cache_turbo_key_cookie`, **not** a hand-written
+`cache_turbo_key $uri$cookie_theme_ids$cookie_forced_color_mode`. The directive
+folds each value in with a length prefix; a plain `$cookie_*` splice has no
+delimiter between the fields, so a visitor can pick a `theme_ids` value that
+reproduces another page's key and store their content under that URL.
 
 Bypassing on them would disable caching for every user who ever touched the theme
 picker. Keying on them shares the cache among everyone with the same choice, which
@@ -108,9 +127,10 @@ http {
             cache_turbo_backend       discourse;   # implies cache_control honor
 
             # Theme and colour mode are VARIANTS -- key on them, never bypass.
-            # Normalized args (not raw $args) so the key stays tight -- see
-            # the poisoning note in Runtime settings / gotchas below.
-            cache_turbo_key           $scheme$host$uri$is_args$cache_turbo_normalized_args$cookie_theme_ids$cookie_forced_color_mode;
+            # cache_turbo_key_cookie length-prefixes each value; splicing the
+            # same cookies into a cache_turbo_key by hand does not, and an
+            # unframed splice is key-poisonable. See the note above.
+            cache_turbo_key_cookie    theme_ids forced_color_mode;
 
             cache_turbo_valid         60s;
             cache_turbo_valid         404 410 1m;
@@ -191,7 +211,9 @@ curl -sI -H 'Cookie: _forum_session=guestsess' \
   is a performance bug that looks like a safety measure.
 - **`_t` can be renamed.** It honours the `DISCOURSE_TOKEN_COOKIE` env var. Stock
   and official-Docker installs use `_t`; if yours was renamed, the preset's cookie
-  rule will not match and you must add your own `cache_turbo_bypass`.
+  rule will not match and you must add your own `cache_turbo_bypass` **and**
+  `cache_turbo_no_store` on that cookie — the bypass skips only the lookup, so
+  on its own the logged-in response is still stored.
 - **Every preset is opt-in.** `/login`, `/signup`, `/posts` are generic English
   paths a non-forum site legitimately serves as cacheable pages, so no preset is
   ever enabled implicitly. Name it.

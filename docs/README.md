@@ -12,10 +12,10 @@ One page per `cache_turbo_backend` preset:
 |---|---|---|
 | `wordpress` | [wordpress.md](wordpress.md) | ✅ yes (`wordpress_logged_in_*`) |
 | `woocommerce` | [woocommerce.md](woocommerce.md) | ✅ yes — **but must be stacked with `wordpress`** — plus `?wc-ajax=`, a cart fragment on *any* page URL |
-| `joomla` | [joomla.md](joomla.md) | ⚠️ **partial** (`joomla_remember_me_`) — a non-remember-me login is INVISIBLE (md5 session cookie); you must still add a `cache_turbo_bypass` |
+| `joomla` | [joomla.md](joomla.md) | ⚠️ **partial** (`joomla_remember_me_`) — a non-remember-me login is INVISIBLE (md5 session cookie); you must still add a `cache_turbo_bypass` **+ `cache_turbo_no_store`** |
 | `xenforo` | [xenforo.md](xenforo.md) | ⚠️ yes (`xf_session` + `xf_user` + `xf_session_admin`) — **stock XF has NO login-only cookie**; `xf_session` is guest-issued, so safety costs hit rate. Also bypasses `/api/` (REST, `XF-Api-Key` header) + `_xfToken`, and **value-keys** `xf_style_id`/`xf_style_variation`/`xf_language_id` |
 | `discourse` | [discourse.md](discourse.md) | ✅ yes (`_t`) — and the origin sends `no-store` anyway |
-| `phpbb` | [phpbb.md](phpbb.md) | ❌ **no** — you must add a `cache_turbo_bypass`, and it needs a *value* test |
+| `phpbb` | [phpbb.md](phpbb.md) | ❌ **no** — you must add a `cache_turbo_bypass` **+ `cache_turbo_no_store`**, and it needs a *value* test |
 | `drupal` | [drupal.md](drupal.md) | ✅ yes (`SESS`) — anon users DO get sessions, so the cookie rule is required; it over-matches `PHPSESSID` by design |
 | `mediawiki` | [mediawiki.md](mediawiki.md) | ✅ yes (`*Token`, `*_session`) — **no URI rules: `/index.php` is the article path on a stock wiki** |
 | `magento` | [magento.md](magento.md) | ✅ yes (`X-Magento-Vary`, value-keyed) — and the origin sends `no-store` on cart/checkout |
@@ -179,7 +179,8 @@ Four rows above are load-bearing:
   because this is a *bypass* rule, a lost match means a logged-in page gets
   **cached and served to strangers** — the opposite failure direction from
   `wagtail`/`kirby`. If you rename the cookie you must add your own
-  `cache_turbo_bypass` for it. `be_typo_user` (backend session) is matched too,
+  `cache_turbo_bypass` **and** `cache_turbo_no_store` for it — the bypass skips
+  only the lookup and still stores the logged-in response. `be_typo_user` (backend session) is matched too,
   independently — it catches an editor previewing the frontend, who carries no
   `fe_typo_user` at all. See [typo3.md](typo3.md).
 - **`mediawiki`'s dynamic surface is in the query args, not the path.** It
@@ -197,6 +198,14 @@ are all handed to *anonymous* visitors. Putting one in a bypass list drops most 
 your traffic out of the cache — a performance bug wearing the costume of a safety
 measure. **Check whether a cookie is set for a logged-out visitor before you
 bypass on it.**
+
+**How the cookie tier actually matches.** A preset's cookie literals are searched
+as plain substrings of the entire `Cookie` request header — names *and* values,
+undelimited — not looked up as cookie names. So a literal has to be distinctive
+enough that it cannot turn up as an arbitrary cookie *value*, which a visitor may
+control; a too-generic literal costs hit rate (bypass is the safe direction, so it
+is never a leak). This is a different tier from the value predicates (cookie
+name-suffix plus a value operator) and from `cache_turbo_key_cookie` (exact name).
 
 **A cookie name that isn't stable across installs cannot be a preset rule.**
 Joomla hashes it from the site secret; phpBB lets the admin set the prefix. Where
@@ -410,8 +419,13 @@ Every one of these guides is an application of the same split:
 A **variant** (theme, language, device) changes how a page renders but the page is
 still shared by everyone who picked that variant — so it belongs in
 `cache_turbo_key`. An **identity** (who you're logged in as, what's in your
-basket) is shared with nobody — so it belongs in `cache_turbo_bypass`, which means
-the response is *never captured*.
+basket) is shared with nobody — so it belongs in `cache_turbo_bypass` **paired
+with `cache_turbo_no_store` on the same variable**. Both halves: the bypass skips
+the cache *lookup*, and `cache_turbo_no_store` is what stops the response being
+*captured*. A bypass on its own still stores that user's page under the shared
+key, where the next anonymous visitor can be served it. (`cache_turbo_bypass_uri`
+and the `cache_turbo_backend` presets skip storing too; only `cache_turbo_bypass`
+needs the partner directive.)
 
 Putting a session cookie in the **key** instead of the bypass is the classic
 mistake: it doesn't share anything (one entry per visitor, hit rate ≈ 0) *and* it
@@ -428,7 +442,9 @@ These hold regardless of preset, and are not configurable away:
 A preset *widens* the net for application-specific surfaces those floors miss (an
 admin URL with no cookie yet, a search query, a cart page). It does not replace
 them — and it is **not a security boundary for your own private routes**. A custom
-`/members/` area still needs its own `cache_turbo_bypass`.
+`/members/` area still needs its own `cache_turbo_bypass` **plus**
+`cache_turbo_no_store` (or a `cache_turbo_bypass_uri`, which skips storing on its
+own).
 
 ## See also
 
