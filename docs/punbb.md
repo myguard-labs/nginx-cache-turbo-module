@@ -171,10 +171,23 @@ PunBB-specific only; generic PHP-FPM tuning lives in the other backend guides.
   writable by PHP. It is orthogonal to cache-turbo's full-page store — never
   point the nginx zone at it, and clearing one does not clear the other.
 - **Admin / posting / login stay dynamic.** The preset's never-cache URI list
-  covers `admin/`, `login.php`, `post.php`, `misc.php` and the PM scripts; PunBB
+  covers `admin/`, `login.php`, `post.php`, `edit.php`, `delete.php`,
+  `moderate.php`, `profile.php`, `register.php` and `misc.php`; PunBB
   guards these in PHP too (`admin/*` checks `$forum_user['g_id'] != FORUM_ADMIN`),
   so a cached admin page is never a risk even if a URI is missed — the member
   cookie already forces BYPASS.
+- **There is no PM row, because PunBB core has no PM.** Private messaging is a
+  third-party extension; core's user-to-user surfaces are the email-a-user and
+  report-a-post forms inside `misc.php`, which the list already covers. If your
+  board runs a PM extension, add its own path yourself:
+  `cache_turbo_bypass_uri /pm/;` (or whatever the extension routes on).
+- **1.2-era boards get no admin URI rule.** The list matches `admin/`, the
+  1.4.x layout. PunBB 1.2 put `admin_index.php`, `admin_users.php`, … at the
+  document root, and the URI matcher requires a `/` or `.` immediately after the
+  needle — so a shorthand like `/admin_` cannot be expressed. This is safe
+  rather than merely tolerated: reaching any admin page requires being logged
+  in, and the cookie rule bypasses every logged-in request already. Upgrade
+  regardless; 1.2 has been end-of-life since 2013.
 - **opcache on.** PunBB is a many-small-includes codebase (`include/` +
   per-page scripts); `opcache.enable=1` with a generous
   `opcache.max_accelerated_files` pays off. On cache-turbo HITs PHP is skipped
