@@ -2332,8 +2332,18 @@ static const char *const  ct_typo3_args[] = { NULL };
  * front-controller paths (/login, /register, /lostpassword, /messenger, and
  * /admin — the ACP).
  *
- * key_cookies are cosmetic (theme/language/JS-detection/device fingerprint),
- * shared by everyone who picked the same value — never an identity signal.
+ * key_cookies are cosmetic (theme, language, JS detection), shared by everyone
+ * who picked the same value — never an identity signal.
+ *
+ * `ips4_device_key` is deliberately NOT keyed, and it is the counter-example
+ * that defines the rule: it is a PER-DEVICE fingerprint, so it is neither
+ * cosmetic nor shared. Keying on it gives every visitor a private entry nobody
+ * else can ever hit, and because the value comes straight from the client it
+ * also lets one attacker mint unlimited distinct keys and push the zone into
+ * eviction. Same reasoning as ct_vbulletin_key_cookies. It is also invisible
+ * to the cache in the first place: IPS sets it httpOnly on the login POST for
+ * the remember-me device list, so its presence tracks a MEMBER, whose requests
+ * the _loggedIn predicate has already bypassed.
  */
 static const ngx_http_cache_turbo_cookie_pred_t  ct_invision_preds[] = {
     { "_loggedIn", NGX_HTTP_CACHE_TURBO_CVOP_NONEMPTY, NULL },
@@ -2345,7 +2355,7 @@ static const char *const  ct_invision_uris[] = {
 static const char *const  ct_invision_args[] = {
     "do=compose", "do=post", "do=reply", "do=report", "module=messaging", NULL };
 static const char *const  ct_invision_key_cookies[] = {
-    "ips4_hasJS", "ips4_theme", "ips4_language", "ips4_deviceKey", NULL };
+    "ips4_hasJS", "ips4_theme", "ips4_language", NULL };
 
 /*
  * Simple Machines Forum (SMF). SMFCookie (name is `$cookiename` from

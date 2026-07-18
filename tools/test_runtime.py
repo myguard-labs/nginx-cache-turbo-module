@@ -1755,6 +1755,17 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # ---- invision -----------------------------------------------------
+        # Cookie/arg rules are path-independent, so a prefixed location
+        # exercises them. $uri key for the same attribution reason as /vbull/.
+        location /ips/ {{
+            cache_turbo         main;
+            cache_turbo_backend invision;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # ---- drupal -------------------------------------------------------
         # Ships NO cookie rule (SESS would substring-match PHPSESSID/JSESSIONID).
         location /user {{
@@ -3418,6 +3429,54 @@ def test_vbulletin_preset(ng: Nginx, origin: Origin) -> None:
         (f"a different bb_lastvisit must reuse the SAME entry, got "
          f"{h_v2.get('x-cache')} -- per-visit timestamps must not be key "
          "cookies or every request mints its own entry")
+
+
+def test_invision_preset(ng: Nginx, origin: Origin) -> None:
+    """Invision: the _loggedIn bypass, the cosmetic key cookies, and the device
+    fingerprint that must NOT be one.
+
+    ips4_device_key is a per-device remember-me token. Keying on it would give
+    every visitor a private entry nobody else can hit and let any client mint
+    unlimited keys to force eviction -- the same failure bb_lastvisit had on the
+    vBulletin preset. The registry previously listed it under a camelCase name
+    (`ips4_deviceKey`) that key-cookie EXACT matching could never match, so the
+    row was dead; removing it is what makes the exclusion real, and this test is
+    what keeps it real now that every present key cookie is folded."""
+    # Guest with the ordinary session cookie: issued to everyone, must cache.
+    guest = {"Cookie": "ips4_IPSSessionFront=abc"}
+    fetch(ng.port, "/ips/topic", headers=guest)
+    _, _, hg = fetch(ng.port, "/ips/topic", headers=guest)
+    assert hg.get("x-cache") == "HIT", \
+        f"an IPS guest session must stay cacheable, got {hg.get('x-cache')}"
+
+    # _loggedIn is matched by SUFFIX (the ips4_ prefix is admin-configurable).
+    memb = {"Cookie": "ips4_IPSSessionFront=abc; ips4_loggedIn=1"}
+    fetch(ng.port, "/ips/member", headers=memb)
+    _, _, hm = fetch(ng.port, "/ips/member", headers=memb)
+    assert "x-cache" not in hm, \
+        f"a logged-in IPS member must bypass, got {hm.get('x-cache')}"
+
+    # Cosmetic key cookie: two themes, same URL, two entries.
+    ta = {"Cookie": "ips4_theme=1"}
+    tb = {"Cookie": "ips4_theme=2"}
+    _, ba, _ = fetch(ng.port, "/ips/keyed", headers=ta)
+    _, _, h_ta = fetch(ng.port, "/ips/keyed", headers=ta)
+    assert h_ta.get("x-cache") == "HIT", "the same ips4_theme must hit its bucket"
+    _, bb, h_tb = fetch(ng.port, "/ips/keyed", headers=tb)
+    assert h_tb.get("x-cache") != "HIT" and bb != ba, \
+        f"a different ips4_theme must key to its own entry, got {h_tb.get('x-cache')}"
+
+    # The device fingerprint must NOT be keyed: two devices, one entry.
+    d1 = {"Cookie": "ips4_device_key=aaaaaaaaaaaaaaaa"}
+    d2 = {"Cookie": "ips4_device_key=bbbbbbbbbbbbbbbb"}
+    fetch(ng.port, "/ips/unkeyed", headers=d1)
+    _, _, h_d1 = fetch(ng.port, "/ips/unkeyed", headers=d1)
+    assert h_d1.get("x-cache") == "HIT", "the device-key bucket must warm"
+    _, _, h_d2 = fetch(ng.port, "/ips/unkeyed", headers=d2)
+    assert h_d2.get("x-cache") == "HIT", \
+        (f"a different ips4_device_key must reuse the SAME entry, got "
+         f"{h_d2.get('x-cache')} -- a per-device fingerprint must not be a key "
+         "cookie or every device mints its own entry")
 
 
 def test_preset_arg_value_predicate(ng: Nginx, origin: Origin) -> None:
@@ -8182,6 +8241,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_preset_arg_value_predicate(ng, origin)
     test_cookie_pred_multiple_matching_cookies(ng, origin)
     test_vbulletin_preset(ng, origin)
+    test_invision_preset(ng, origin)
     test_phorum_uri_rules_anchor_at_root(ng, origin)
     test_joomla_preset(ng, origin)
     test_drupal_preset(ng, origin)
@@ -8504,6 +8564,8 @@ def main() -> int:
           "in the same header, both orders, two-guests still cacheable), "
           "vbulletin preset (NONEMPTY/EQ arms, empty value logged-out, "
           "bb_language keyed, bb_lastvisit NOT keyed), "
+          "invision preset (_loggedIn suffix bypass, ips4_theme keyed, "
+          "ips4_device_key NOT keyed), "
           "config maxima/warns (STAB-5 keepalive cap rejected, COR-9 dup-status "
           "warn, COR-0 tag-without-L2 warn), "
           "autotune (v4-3: raises beta within band/off-by-default/"
