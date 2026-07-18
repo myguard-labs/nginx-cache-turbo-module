@@ -2847,7 +2847,13 @@ ngx_http_cache_turbo_cookie_pred_one(u_char *data, size_t len,
             continue;
 
         case NGX_HTTP_CACHE_TURBO_CVOP_EQ:
-            if (vlen == cmplen && ngx_strncmp(val, pr->value, cmplen) == 0) {
+            /* A value-comparing op with no literal cannot match anything.
+             * Guard it: the registry never ships such a row, but the compare
+             * below passes pr->value to a nonnull parameter. */
+            if (pr->value != NULL
+                && vlen == cmplen
+                && ngx_strncmp(val, pr->value, cmplen) == 0)
+            {
                 return 1;
             }
             continue;
@@ -2858,10 +2864,15 @@ ngx_http_cache_turbo_cookie_pred_one(u_char *data, size_t len,
              * "1", so by the letter of != it is a member — but it is really a
              * malformed/cleared cookie. Bypass either way: both readings agree,
              * and bypass is the safe direction. */
-            if (vlen == cmplen && ngx_strncmp(val, pr->value, cmplen) == 0) {
+            if (pr->value != NULL
+                && vlen == cmplen
+                && ngx_strncmp(val, pr->value, cmplen) == 0)
+            {
                 continue;                    /* == the guest literal: cacheable */
             }
-            return 1;                        /* anything else: bypass */
+            return 1;                        /* anything else (incl. a row with
+                                              * no literal): bypass, the safe
+                                              * direction */
         }
     }
 

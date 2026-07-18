@@ -3354,6 +3354,16 @@ def test_vbulletin_preset(ng: Nginx, origin: Origin) -> None:
     assert hn.get("x-cache") == "HIT", \
         f"bb_imloggedin=no is not the EQ literal and must cache, got {hn.get('x-cache')}"
 
+    # EQ arm across TWO matching cookies, the non-matching one first: a value
+    # that is not the literal must not end the scan and hide the "yes" behind
+    # it. Guards the same regression as the NONEMPTY twin above, for the EQ arm.
+    eq_twin = {"Cookie": "bb_imloggedin=no; other_imloggedin=yes"}
+    fetch(ng.port, "/vbull/imlogged-twin", headers=eq_twin)
+    _, _, h_eq_twin = fetch(ng.port, "/vbull/imlogged-twin", headers=eq_twin)
+    assert "x-cache" not in h_eq_twin, \
+        (f"an `imloggedin=yes` behind a non-matching one must still bypass, "
+         f"got {h_eq_twin.get('x-cache')}")
+
     # Key cookie: bb_language splits the entry (two languages, same URL, two
     # buckets -- the second language must NOT read the first one's entry).
     en = {"Cookie": "bb_language=en"}
