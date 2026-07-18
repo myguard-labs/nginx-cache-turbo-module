@@ -2437,8 +2437,9 @@ static const char *const  ct_vanilla_args[] = { NULL };
  * the same base64'd guest string PunBB itself always writes for a logged-out
  * visitor — see the predicate below.
  *
- * Fixed literal URI prefixes for admin/login/posting/private-messaging (a
- * PunBB core feature, not a plugin) bypass unconditionally.
+ * Fixed literal URI prefixes for admin/login/posting/editing/moderation bypass
+ * unconditionally. There is no private-messaging row: PunBB core ships no PM
+ * (an earlier version of this comment claimed it did) -- see the URI list.
  *
  * IMPLEMENTATION NOTE: the ideal rule (base64-decode, split on '|', compare
  * field[0] against the guest literal "1") is NOT expressible by this engine's
@@ -2465,9 +2466,35 @@ static const char *const  ct_vanilla_args[] = { NULL };
  */
 static const char *const  ct_punbb_cookies[] = {
     "forum_cookie", "punbb_cookie", NULL };
+/*
+ * URI list, verified against the punbb/punbb tree at tag v1.4.4. Every entry
+ * below is a script that exists at the document root of a stock install.
+ *
+ * Three rows were removed because NO PunBB release ships them:
+ *   - "/admin.php": 1.4.x keeps the admin under the "/admin/" DIRECTORY
+ *     (admin/index.php, admin/users.php, admin/settings.php, ...), and the
+ *     1.2-era layout used admin_index.php / admin_users.php at the docroot.
+ *     Neither is "/admin.php". The 1.2 layout is also NOT expressible here:
+ *     uri_prefix() requires the byte after the needle to be '/' or '.', so a
+ *     partial-filename needle like "/admin_" can never match "/admin_index.php"
+ *     -- listing every 1.2 admin script individually would be the only way, and
+ *     1.2 has been EOL since 2013. Losing it costs nothing anyway: an admin is
+ *     by definition logged in, so the cookie tier bypasses them already, and
+ *     the admin scripts re-check g_id server-side.
+ *   - "/message_send.php", "/message_delete.php": private messaging is NOT a
+ *     PunBB core feature (the comment above previously claimed it was). Core
+ *     has no PM at all -- misc.php carries the email-a-user and report-a-post
+ *     forms instead -- and the third-party PM extensions route through their
+ *     own extension paths, not these two names.
+ *
+ * Five real member/mutating scripts were missing and are now listed: edit.php,
+ * delete.php, moderate.php, profile.php, register.php. search.php and
+ * userlist.php are deliberately absent -- both are guest-reachable read
+ * surfaces that cache correctly.
+ */
 static const char *const  ct_punbb_uris[] = {
-    "/admin.php", "/admin/", "/login.php", "/post.php", "/message_send.php",
-    "/message_delete.php", "/misc.php", NULL };
+    "/admin/", "/login.php", "/post.php", "/edit.php", "/delete.php",
+    "/moderate.php", "/profile.php", "/register.php", "/misc.php", NULL };
 static const char *const  ct_punbb_args[] = { NULL };
 
 /*
@@ -2491,10 +2518,24 @@ static const char *const  ct_punbb_args[] = { NULL };
  */
 static const char *const  ct_phorum_cookies[] = {
     "phorum_session_v5", "phorum_session_st", "phorum_admin_session", NULL };
+/*
+ * Verified against Phorum/Core master. "/file.php" is the row that matters
+ * most and was missing: it is the ATTACHMENT DOWNLOAD script, and it authorises
+ * per request through the file_storage API (a file attached to a private-forum
+ * message is refused to anyone without read access to that forum). Serving it
+ * from the cache hands the first requester's attachment body to every later
+ * requester of the same file id, permission check skipped -- the same shape as
+ * the phpBB download/file.php hazard.
+ *
+ * "/post.php" is kept even though Phorum 5 replaced it with posting.php: the
+ * file still ships, as a stub whose entire body is a die() that exists to
+ * overwrite the 5.0 script on upgrade so spammers cannot POST to it. Bypassing
+ * a die() page costs nothing and the row is one byte of table.
+ */
 static const char *const  ct_phorum_uris[] = {
     "/admin.php", "/login.php", "/register.php", "/pm.php", "/posting.php",
     "/post.php", "/moderation.php", "/control.php", "/ajax.php", "/report.php",
-    "/follow.php", NULL };
+    "/follow.php", "/file.php", NULL };
 static const char *const  ct_phorum_args[] = { NULL };
 static const char *const  ct_phorum_key_cookies[] = { "list_style", NULL };
 

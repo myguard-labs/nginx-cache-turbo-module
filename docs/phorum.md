@@ -126,6 +126,14 @@ curl -sI https://forum.example.com/admin.php | grep -i x-cache-turbo
   preset's URI-bypass list, so the backend is BYPASS by path even if the admin
   cookie is renamed or absent. Don't rely on the admin *cookie* alone to gate
   the cache.
+- **Attachments (`/file.php`) are bypassed by URI, and must be.** `file.php`
+  authorises every download through the file-storage API: a file attached to a
+  message in a read-restricted forum is refused to anyone without access. That
+  check lives behind the request, so a cached `file.php?file=<id>` response
+  would hand the first requester's attachment to every later requester of the
+  same id with the permission check skipped. The row is in the preset; if you
+  hand-write a URI list instead of using `cache_turbo_backend phorum`, do not
+  omit it.
 
 ## PHP settings / gotchas
 
