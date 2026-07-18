@@ -194,7 +194,11 @@ PunBB-specific only; generic PHP-FPM tuning lives in the other backend guides.
   entirely, so opcache matters most for the BYPASS (member/admin) traffic.
 - **memory_limit / max_execution_time.** PunBB is light — 32–64M is plenty.
   Default `max_execution_time = 30` is fine; the only slow endpoints are
-  `admin/reindex.php` and search, which are bypassed anyway.
+  `admin/reindex.php`, which the preset bypasses, and `search.php`, which it
+  does NOT — search is a guest-reachable read surface and caches normally, so
+  a raised limit there widens the cacheable surface rather than the bypassed
+  one. Vary the key on the query string (the default key already does) and let
+  repeated searches HIT.
 
 ## See also
 

@@ -864,7 +864,7 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             cache_turbo_valid   30s;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}""" for s in ("edit", "delete", "moderate", "profile", "register",
-                       "userlist"))
+                       "userlist", "search"))
 
     return f"""{load}worker_processes {workers};
 pid {root}/nginx.pid;
@@ -3353,10 +3353,14 @@ def test_punbb_phorum_uri_rules(ng: Nginx, origin: Origin) -> None:
     answer without an x-cache header, so a single fetch passes with the row
     still absent. Only a bypass is still header-less on the second request.
 
-    userlist.php is the negative control. It is a guest-reachable read surface
-    that the preset deliberately does NOT list, so it pins that these rows are
-    per-script and not a blanket "any root .php bypasses" -- an over-broad edit
-    that made them all bypass would still pass every arm above."""
+    userlist.php and search.php are the negative controls. Both are
+    guest-reachable read surfaces that the preset deliberately does NOT list, so
+    they pin that these rows are per-script and not a blanket "any root .php
+    bypasses" -- an over-broad edit that made them all bypass would still pass
+    every arm above. search.php is asserted separately from userlist.php because
+    it is the one a future editor is most likely to add: it is slow, and slow
+    reads as dynamic. It is not. It is the endpoint that benefits MOST from
+    being cached."""
     for uri in ("/edit.php?id=1", "/delete.php?id=1", "/moderate.php?fid=2",
                 "/profile.php?id=42", "/register.php"):
         fetch(ng.port, uri)
@@ -3372,11 +3376,12 @@ def test_punbb_phorum_uri_rules(ng: Nginx, origin: Origin) -> None:
          f"must bypass -- caching it replays one member's attachment to every "
          f"later requester of the same id, got {hf.get('x-cache')}")
 
-    fetch(ng.port, "/userlist.php")
-    _, _, hu = fetch(ng.port, "/userlist.php")
-    assert hu.get("x-cache") == "HIT", \
-        (f"/userlist.php is a public PunBB read surface that the preset does "
-         f"not list and must stay cacheable, got {hu.get('x-cache')}")
+    for uri in ("/userlist.php", "/search.php?action=search&keywords=nginx"):
+        fetch(ng.port, uri)
+        _, _, hu = fetch(ng.port, uri)
+        assert hu.get("x-cache") == "HIT", \
+            (f"{uri} is a public PunBB read surface that the preset does not "
+             f"list and must stay cacheable, got {hu.get('x-cache')}")
     drain_origin(origin)
 
 
@@ -8868,7 +8873,8 @@ def main() -> int:
           "yabb preset (Y2* triple bypass, action=logout/login/post/admin/pm "
           "bypass cookie-less, ';'-separated logout, plain reads cached), "
           "punbb/phorum URI rows (edit/delete/moderate/profile/register bypass, "
-          "phorum file.php attachment bypass, userlist.php stays cached), "
+          "phorum file.php attachment bypass, userlist.php/search.php stay "
+          "cached), "
           "config maxima/warns (STAB-5 keepalive cap rejected, COR-9 dup-status "
           "warn, COR-0 tag-without-L2 warn), "
           "autotune (v4-3: raises beta within band/off-by-default/"
