@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import concurrent.futures
+import email.utils
 import hashlib
 import http.client
 import http.server
@@ -397,6 +398,15 @@ class Origin:
                     # OR-arm), 1s fresh then NO stale serving.
                     self.send_header("Cache-Control",
                                      "max-age=1, proxy-revalidate")
+                if "expabs" in self.path:
+                    # Expires-only freshness (upstream_ttl ladder step 4): NO
+                    # Cache-Control/CDN-CC/Surrogate-Control, so the fresh TTL is
+                    # derived purely from absolute Expires minus now. Emit a 2s
+                    # future Expires; honor mode must cache with a ~2s window even
+                    # though cache_turbo_valid is 60s.
+                    self.send_header(
+                        "Expires",
+                        email.utils.formatdate(time.time() + 2, usegmt=True))
                 if "cdnttl" in self.path:
                     # RFC 9213: CDN-Cache-Control (edge TTL) must OUTRANK the
                     # browser-facing Cache-Control. CC says 60s fresh, CDN-CC says
@@ -4291,6 +4301,24 @@ def test_honor_cache_control(ng: Nginx) -> None:
          f"got {h2.get('x-cache')}")
 
 
+def test_honor_expires_absolute_ttl(ng: Nginx) -> None:
+    """upstream_ttl ladder step 4 (module.c Expires branch): a response with NO
+    Cache-Control/CDN-CC/Surrogate-Control, only an absolute Expires ~2s out,
+    must derive its fresh TTL from Expires-minus-now — NOT from the configured
+    cache_turbo_valid 60s (which would keep it fresh). STALE at ~3.5s (past the
+    2s Expires window, staleness >=1s so the 1s-granularity check is unambiguous)
+    proves the Expires arm set the window."""
+    _, _, h0 = fetch(ng.port, "/cc7/expabs")
+    assert "x-cache" not in h0, "first should miss"
+    _, _, h1 = fetch(ng.port, "/cc7/expabs")
+    assert h1.get("x-cache") == "HIT", "second should be a fresh HIT (<2s)"
+    time.sleep(3.5)                               # past the 2s Expires, staleness >=1s
+    _, _, h2 = fetch(ng.port, "/cc7/expabs")
+    assert h2.get("x-cache") == "STALE", \
+        ("Expires-derived TTL (~2s) must win over cache_turbo_valid 60s: "
+         f"entry should be STALE at ~3.5s, got {h2.get('x-cache')}")
+
+
 def test_cdn_cache_control_ttl_outranks_cache_control(ng: Nginx) -> None:
     """RFC 9213: CDN-Cache-Control sets the shared-cache TTL and must OUTRANK the
     browser-facing Cache-Control. Origin: CC max-age=60, CDN-CC max-age=1 (via the
@@ -7796,6 +7824,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_cache_negative_404(ng)
     test_head_not_stored(ng)
     test_honor_cache_control(ng)
+    test_honor_expires_absolute_ttl(ng)                    # upstream_ttl Expires arm
     test_cdn_cache_control_ttl_outranks_cache_control(ng)   # RFC 9213
     test_surrogate_control_ttl_outranks_cdn_and_cache_control(ng)  # RFC 9213
     test_cdn_cache_control_no_store_refuses(ng)             # RFC 9213
@@ -8035,6 +8064,7 @@ def main() -> int:
           "not cached), default-key Host split, "
           "per-status caching (301/404 cached, HEAD not stored), "
           "honor upstream Cache-Control, "
+          "Expires-only absolute TTL (upstream_ttl step 4), "
           "RFC 9213 targeted cache-control (CDN-CC/Surrogate-Control TTL "
           "precedence + no-store veto + stripped from serve), "
           "valid 0 = forever (fresh HIT, not instant-stale), "
