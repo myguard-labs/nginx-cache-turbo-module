@@ -260,7 +260,7 @@ a way it does not bite a plain WordPress blog.
   the interned-file table fills, OPcache silently evicts and recompiles on almost
   every request, and PHP-FPM CPU climbs for no visible reason. Raise
   `opcache.max_accelerated_files` (a prime above your real file count — e.g.
-  `50000`) and give `opcache.memory_consumption` room (256M+) to match. This is
+  `50021`) and give `opcache.memory_consumption` room (256M+) to match. This is
   a WooCommerce problem specifically because of the extension file count, not a
   generic PHP tweak.
 

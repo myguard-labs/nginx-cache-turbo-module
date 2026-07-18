@@ -3255,12 +3255,18 @@ def test_preset_arg_value_predicate(ng: Nginx, origin: Origin) -> None:
 
     So both halves are asserted. A listed value bypasses; an unlisted value on
     the SAME argument name still caches."""
-    # A listed route value must bypass.
+    # A listed route value must bypass. Fetch TWICE: a bypassed response and an
+    # ordinary first-time MISS both come back with no x-cache header, so a
+    # single fetch cannot tell them apart and would pass even with the rule
+    # removed. Only a bypass keeps the header absent on the SECOND request --
+    # a mere MISS would have been stored and would answer HIT.
     for i, q in enumerate(("action=login", "action=admin", "action=pm")):
         uri = f"/smf/index.php?{q}&t={i}"
+        fetch(ng.port, uri)
         _, _, h = fetch(ng.port, uri)
         assert "x-cache" not in h, \
-            f"?{q} must bypass on the smf preset, got {h.get('x-cache')}"
+            (f"?{q} must bypass on the smf preset (still no x-cache on the "
+             f"second request), got {h.get('x-cache')}")
 
     # An UNLISTED value on the same argument name is an ordinary read and must
     # stay cacheable -- this is what a bare-name match would have broken.

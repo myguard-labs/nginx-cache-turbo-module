@@ -137,10 +137,12 @@ http {
         }
 
         # Only if you override FE/cookieName -- see "The one condition" above.
-        # location ~ \.php$ {
+        # Add these two lines INSIDE the `~ \.php$` location above; do not add a
+        # second `~ \.php$` block. nginx takes the first regex location that
+        # matches, so a second one never runs.
+        #
         #     cache_turbo_bypass   $cookie_your_renamed_cookie;
         #     cache_turbo_no_store $cookie_your_renamed_cookie;
-        # }
 
         location = /_cache {
             cache_turbo_admin on;

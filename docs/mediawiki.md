@@ -179,7 +179,13 @@ http {
             # `break` keeps the request in THIS location. Without it the rewrite
             # triggers a fresh location search and every directive above is
             # silently discarded in favour of the `\.php$` block.
-            rewrite ^/wiki/(?<pagename>.*)$ /index.php break;
+            #
+            # The captured title MUST be forwarded as `title=`. A bare
+            # `rewrite ... /index.php break;` throws the page name away and
+            # MediaWiki renders the Main Page for every article -- which the
+            # cache then happily stores under each article's own URL, since the
+            # key is built from the original request line.
+            rewrite ^/wiki/(?<pagename>.*)$ /index.php?title=$pagename&$args break;
             include        fastcgi_params;
             fastcgi_param  SCRIPT_FILENAME $document_root/index.php;
             fastcgi_pass   unix:/run/php/php-fpm.sock;

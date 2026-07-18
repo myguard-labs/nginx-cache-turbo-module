@@ -73,10 +73,14 @@ ordinary anonymous traffic still gets cached. If you rename
 `<name>=`, not `<name>`.
 
 If your install (or a plugin/SSO integration) sets the identity cookie
-`Vanilla=` for anonymous visitors too, this preset is unsafe for you — fall
-back to `cache_turbo off` or a hand-verified `cache_turbo_bypass` +
-`cache_turbo_no_store` pair until that's
-fixed upstream or in your install.
+`Vanilla=` for anonymous visitors too, the failure is a **hit-rate** one, not a
+leak: the preset bypasses on the cookie's *presence*, so those guests simply
+bypass the cache and are served from the origin. Nothing private is stored, and
+no guest response is captured under a shared key. You do not need
+`cache_turbo off`. Confirm it with `$cache_turbo_status` (see
+[Checking it works](#checking-it-works)) — a board-wide `BYPASS` on
+anonymous traffic is the tell — and if it costs you too much, narrow the rule
+with a hand-verified `cache_turbo_bypass` on a cookie your guests do not get.
 
 ## Vhost
 
