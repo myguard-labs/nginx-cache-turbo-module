@@ -53,6 +53,25 @@ if it bites.
 
 (With a non-empty `cookieprefix`, prepend it to each of the names above.)
 
+> **If your board sets a `cookieprefix`, the two key cookies stop folding and
+> you must declare them yourself.** The bypass rule keeps working — it matches
+> the `user` suffix, so a prefix cannot hide it — but `mybbtheme` / `mybblang`
+> are matched by their **exact** wire name and a prefixed board sends
+> `<prefix>mybbtheme`. Nothing errors; the cache simply stops varying on theme
+> and language, and every guest shares one entry, so whichever theme rendered
+> first is served to all of them. Add:
+>
+> ```nginx
+> cache_turbo_key_cookie  <prefix>mybbtheme  <prefix>mybblang;
+> ```
+>
+> which folds with the identical length-prefixed framing the preset uses.
+> Key cookies are matched exactly **on purpose**: they select which cache entry
+> a request lands in, so a loose match would let any client fold a cookie of its
+> own naming into the key and pick another visitor's bucket. A bypass rule can
+> afford a loose match because its worst case is a needless bypass; a key rule
+> cannot. This is a deliberate trade, not an oversight.
+
 ## Vhost
 
 ```nginx

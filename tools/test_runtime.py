@@ -1415,6 +1415,13 @@ http {{
             cache_turbo_valid   30s;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
+        location /mybb/ {{
+            cache_turbo         main;
+            cache_turbo_backend mybb;
+            cache_turbo_key     $request_uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
         # yabb is the same shape as smf -- one YaBB.pl entry script dispatching
         # on ?action=<route> -- so it too is exercised from a prefixed location.
         location /yabb/ {{
@@ -3497,6 +3504,67 @@ def test_invision_preset(ng: Nginx, origin: Origin) -> None:
         (f"a different ips4_device_key must reuse the SAME entry, got "
          f"{h_d2.get('x-cache')} -- a per-device fingerprint must not be a key "
          "cookie or every device mints its own entry")
+    drain_origin(origin)
+
+
+def test_mybb_preset(ng: Nginx, origin: Origin) -> None:
+    """MyBB: the `user`-SUFFIX bypass, the EXACT-match key cookies, and the
+    asymmetry between the two that must not be 'fixed'.
+
+    MyBB prepends an ACP-settable `cookieprefix` (default empty) to every
+    hardcoded base name, so a reconfigured board sends `<prefix>mybbuser` and
+    `<prefix>mybbtheme`. The bypass rule survives that because it matches the
+    `user` suffix. The key cookies deliberately do NOT: they are matched by
+    exact wire name, so a prefixed board silently stops varying on theme.
+
+    That asymmetry is the point of this test. Making the key cookies suffix-
+    matched too is the obvious-looking repair and it is wrong: key cookies
+    select which entry a request lands in, so a loose match lets any client
+    fold a cookie of its own naming into the key and land on another visitor's
+    bucket -- while the origin, which ignores the unknown name, returns the
+    default variant to be stored there. A predicate's loose match costs a
+    bypass; a key's loose match hands out bucket selection."""
+    # sid is issued to every visitor including guests -- must stay cacheable.
+    guest = {"Cookie": "sid=abc123"}
+    fetch(ng.port, "/mybb/index.php", headers=guest)
+    _, _, hg = fetch(ng.port, "/mybb/index.php", headers=guest)
+    assert hg.get("x-cache") == "HIT", \
+        f"a MyBB guest session (sid) must stay cacheable, got {hg.get('x-cache')}"
+
+    # The login cookie bypasses, and keeps bypassing under a board prefix --
+    # that is what the suffix rule buys. The prefixed arm is the one that fails
+    # if anyone tightens the predicate to an exact name.
+    for i, ck in enumerate(("mybbuser=42_loginkey", "boardxmybbuser=42_loginkey")):
+        memb = {"Cookie": f"sid=abc123; {ck}"}
+        fetch(ng.port, f"/mybb/member-{i}.php", headers=memb)
+        _, _, hm = fetch(ng.port, f"/mybb/member-{i}.php", headers=memb)
+        assert "x-cache" not in hm, \
+            f"a logged-in MyBB member ({ck}) must bypass, got {hm.get('x-cache')}"
+
+    # The key cookie folds under its exact name: two themes, two entries.
+    ta, tb = {"Cookie": "mybbtheme=1"}, {"Cookie": "mybbtheme=2"}
+    _, ba, _ = fetch(ng.port, "/mybb/keyed.php", headers=ta)
+    _, _, h_ta = fetch(ng.port, "/mybb/keyed.php", headers=ta)
+    assert h_ta.get("x-cache") == "HIT", "the same mybbtheme must hit its bucket"
+    _, bb, h_tb = fetch(ng.port, "/mybb/keyed.php", headers=tb)
+    assert h_tb.get("x-cache") != "HIT", \
+        f"a different mybbtheme must not read the first theme's entry, got {h_tb.get('x-cache')}"
+    assert bb != ba, "a different mybbtheme was served the first theme's cached body"
+
+    # THE PIN. A cookie merely ENDING in the key-cookie name must not fold, so
+    # it cannot steer bucket selection: a request carrying only
+    # `evilmybbtheme` keys identically to one carrying no theme cookie at all,
+    # and therefore reads the entry the no-cookie request just warmed.
+    fetch(ng.port, "/mybb/unsteerable.php")
+    _, _, h_base = fetch(ng.port, "/mybb/unsteerable.php")
+    assert h_base.get("x-cache") == "HIT", "the no-cookie bucket must warm"
+    _, _, h_evil = fetch(ng.port, "/mybb/unsteerable.php",
+                         headers={"Cookie": "evilmybbtheme=1"})
+    assert h_evil.get("x-cache") == "HIT", \
+        (f"a cookie merely ending in 'mybbtheme' must NOT fold into the key, got "
+         f"{h_evil.get('x-cache')} -- suffix-matching a KEY cookie lets a client "
+         "pick which entry it lands on; the prefixed-board remedy is an operator "
+         "cache_turbo_key_cookie, not a loose match here")
     drain_origin(origin)
 
 
@@ -8396,6 +8464,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_cookie_pred_multiple_matching_cookies(ng, origin)
     test_vbulletin_preset(ng, origin)
     test_invision_preset(ng, origin)
+    test_mybb_preset(ng, origin)
     test_yabb_preset(ng, origin)
     test_phorum_uri_rules_anchor_at_root(ng, origin)
     test_joomla_preset(ng, origin)
@@ -8724,6 +8793,7 @@ def main() -> int:
           "bb_language keyed, bb_lastvisit NOT keyed), "
           "invision preset (_loggedIn suffix bypass, ips4_theme keyed, "
           "ips4_device_key NOT keyed), "
+          "mybb preset (user-suffix bypass survives cookieprefix, mybbtheme keyed exactly, look-alike cookie cannot steer buckets), "
           "yabb preset (Y2* triple bypass, action=logout/login/post/admin/pm "
           "bypass cookie-less, ';'-separated logout, plain reads cached), "
           "config maxima/warns (STAB-5 keepalive cap rejected, COR-9 dup-status "
