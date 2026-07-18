@@ -1742,6 +1742,19 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # ---- vbulletin ----------------------------------------------------
+        # The only preset wired to the NONEMPTY and EQ predicate ops (userid /
+        # password non-empty, imloggedin == "yes"), and the only one whose key
+        # cookie list is exercised here. $uri key so a key-cookie split is
+        # attributable to the cookie and not to the path.
+        location /vbull/ {{
+            cache_turbo         main;
+            cache_turbo_backend vbulletin;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # ---- drupal -------------------------------------------------------
         # Ships NO cookie rule (SESS would substring-match PHPSESSID/JSESSIONID).
         location /user {{
@@ -3240,6 +3253,143 @@ def test_phorum_admin_session_cookie(ng: Nginx, origin: Origin) -> None:
     assert hg.get("x-cache") == "HIT", \
         (f"phorum_tmp_cookie is guest-issued and must stay cacheable, got "
          f"{hg.get('x-cache')}")
+
+
+def test_cookie_pred_multiple_matching_cookies(ng: Nginx, origin: Origin) -> None:
+    """A Cookie header can carry SEVERAL cookies matching one predicate's name
+    suffix. Every one of them must be examined.
+
+    phpBB keys on the suffix `_u` and the prefix is per-board (config
+    'cookie_name'), so one browser visiting two boards on the same host sends
+    `phpbb3_<a>_u` AND `phpbb3_<b>_u` in a single header. The evaluator used to
+    return on the FIRST pair whose name matched, so a leading guest `_u=1`
+    decided the whole request and masked a member `_u=42` sitting behind it --
+    the member's page was cached and served to strangers. That is the same
+    cross-user leak the value predicate exists to close, reachable again through
+    a second cookie.
+
+    Both orders are asserted: the reverse order always worked, so testing only
+    that would pass with the bug still in place."""
+    # Guest cookie FIRST, member second. This is the regression.
+    masked = {"Cookie": "phpbb3_aaa_u=1; phpbb3_bbb_u=42"}
+    fetch(ng.port, "/phpbb/multi-a", headers=masked)
+    _, _, hm = fetch(ng.port, "/phpbb/multi-a", headers=masked)
+    assert "x-cache" not in hm, \
+        (f"a member `_u=42` behind a guest `_u=1` in the SAME Cookie header "
+         f"must still bypass, got {hm.get('x-cache')} -- the scan stopped at "
+         "the first name match and served a logged-in page from cache")
+
+    # Member first: worked before the fix too, kept so the pair is symmetric.
+    lead = {"Cookie": "phpbb3_bbb_u=42; phpbb3_aaa_u=1"}
+    fetch(ng.port, "/phpbb/multi-b", headers=lead)
+    _, _, hl = fetch(ng.port, "/phpbb/multi-b", headers=lead)
+    assert "x-cache" not in hl, \
+        f"member `_u=42` first must bypass, got {hl.get('x-cache')}"
+
+    # Two guests must NOT become a bypass: `continue` means "no opinion", it
+    # must not leak into "objection". Without this the fix would trade a leak
+    # for a board-wide hit-rate collapse and nothing would catch it.
+    guests = {"Cookie": "phpbb3_aaa_u=1; phpbb3_bbb_u=1"}
+    fetch(ng.port, "/phpbb/multi-c", headers=guests)
+    _, _, hg = fetch(ng.port, "/phpbb/multi-c", headers=guests)
+    assert hg.get("x-cache") == "HIT", \
+        (f"two guest `_u=1` cookies must stay cacheable, got "
+         f"{hg.get('x-cache')} -- 'no opinion' must not become a bypass")
+
+
+def test_vbulletin_preset(ng: Nginx, origin: Origin) -> None:
+    """vBulletin preset: the NONEMPTY and EQ predicate ops, and the key cookies.
+
+    This preset is the only one wired to NONEMPTY (`userid`, `password`) and EQ
+    (`imloggedin` == "yes"), so it is the only runtime coverage those two arms
+    get. Names are matched by SUFFIX because the `bb_` prefix is an admin
+    setting (Cookie and HTTP Header Options).
+
+    bb_lastvisit / bb_lastactivity are deliberately NOT key cookies: they are
+    per-visit timestamps, so keying on them gives every visitor a private entry
+    their own next request invalidates, and lets any client mint unlimited keys
+    to force eviction. Only bb_language is keyed."""
+    # Guest: session hash is issued to everyone, must not bypass.
+    guest = {"Cookie": "bb_sessionhash=abc; bb_lastvisit=1721300000"}
+    fetch(ng.port, "/vbull/forum", headers=guest)
+    _, _, hg = fetch(ng.port, "/vbull/forum", headers=guest)
+    assert hg.get("x-cache") == "HIT", \
+        f"vbulletin guest must stay cacheable, got {hg.get('x-cache')}"
+
+    # NONEMPTY arm: a non-empty userid/password is a logged-in member.
+    for i, ck in enumerate(("bb_userid=42", "bb_password=deadbeef")):
+        m = {"Cookie": f"bb_sessionhash=abc; {ck}"}
+        fetch(ng.port, f"/vbull/member-{i}", headers=m)
+        _, _, hm = fetch(ng.port, f"/vbull/member-{i}", headers=m)
+        assert "x-cache" not in hm, \
+            f"vbulletin member ({ck}) must bypass, got {hm.get('x-cache')}"
+
+    # NONEMPTY arm, EMPTY value: a cleared cookie is a logged-OUT visitor and
+    # must stay cacheable, or every logged-out member kills the hit rate.
+    empt = {"Cookie": "bb_sessionhash=abc; bb_userid=; bb_password="}
+    fetch(ng.port, "/vbull/emptied", headers=empt)
+    _, _, he = fetch(ng.port, "/vbull/emptied", headers=empt)
+    assert he.get("x-cache") == "HIT", \
+        f"empty bb_userid is logged-out and must cache, got {he.get('x-cache')}"
+
+    # NONEMPTY arm across TWO matching cookies, empty one first: the empty pair
+    # must not end the scan and hide the populated one behind it.
+    twin = {"Cookie": "bb_userid=; other_userid=42"}
+    fetch(ng.port, "/vbull/twin", headers=twin)
+    _, _, ht = fetch(ng.port, "/vbull/twin", headers=twin)
+    assert "x-cache" not in ht, \
+        (f"a populated `userid` behind an empty one must still bypass, got "
+         f"{ht.get('x-cache')}")
+
+    # EQ arm: imloggedin == "yes" bypasses; any other value does not.
+    yes = {"Cookie": "bb_sessionhash=abc; bb_imloggedin=yes"}
+    fetch(ng.port, "/vbull/imlogged", headers=yes)
+    _, _, hy = fetch(ng.port, "/vbull/imlogged", headers=yes)
+    assert "x-cache" not in hy, \
+        f"bb_imloggedin=yes must bypass, got {hy.get('x-cache')}"
+
+    no = {"Cookie": "bb_sessionhash=abc; bb_imloggedin=no"}
+    fetch(ng.port, "/vbull/imlogged-no", headers=no)
+    _, _, hn = fetch(ng.port, "/vbull/imlogged-no", headers=no)
+    assert hn.get("x-cache") == "HIT", \
+        f"bb_imloggedin=no is not the EQ literal and must cache, got {hn.get('x-cache')}"
+
+    # EQ arm across TWO matching cookies, the non-matching one first: a value
+    # that is not the literal must not end the scan and hide the "yes" behind
+    # it. Guards the same regression as the NONEMPTY twin above, for the EQ arm.
+    eq_twin = {"Cookie": "bb_imloggedin=no; other_imloggedin=yes"}
+    fetch(ng.port, "/vbull/imlogged-twin", headers=eq_twin)
+    _, _, h_eq_twin = fetch(ng.port, "/vbull/imlogged-twin", headers=eq_twin)
+    assert "x-cache" not in h_eq_twin, \
+        (f"an `imloggedin=yes` behind a non-matching one must still bypass, "
+         f"got {h_eq_twin.get('x-cache')}")
+
+    # Key cookie: bb_language splits the entry (two languages, same URL, two
+    # buckets -- the second language must NOT read the first one's entry).
+    en = {"Cookie": "bb_language=en"}
+    de = {"Cookie": "bb_language=de"}
+    fetch(ng.port, "/vbull/keyed", headers=en)
+    _, _, h_en = fetch(ng.port, "/vbull/keyed", headers=en)
+    assert h_en.get("x-cache") == "HIT", "same bb_language must hit its bucket"
+    _, _, h_de = fetch(ng.port, "/vbull/keyed", headers=de)
+    assert h_de.get("x-cache") != "HIT", \
+        (f"a different bb_language must key to its own entry, got "
+         f"{h_de.get('x-cache')} -- the language cookie is not folded into "
+         "the key")
+
+    # bb_lastvisit must NOT be keyed: two different timestamps on the same URL
+    # must share one entry. If this fails the preset is minting an entry per
+    # request and the zone is a free eviction target.
+    v1 = {"Cookie": "bb_lastvisit=1721300000"}
+    v2 = {"Cookie": "bb_lastvisit=1721399999"}
+    fetch(ng.port, "/vbull/unkeyed", headers=v1)
+    _, _, h_v1 = fetch(ng.port, "/vbull/unkeyed", headers=v1)
+    assert h_v1.get("x-cache") == "HIT", "bb_lastvisit bucket must warm"
+    _, _, h_v2 = fetch(ng.port, "/vbull/unkeyed", headers=v2)
+    assert h_v2.get("x-cache") == "HIT", \
+        (f"a different bb_lastvisit must reuse the SAME entry, got "
+         f"{h_v2.get('x-cache')} -- per-visit timestamps must not be key "
+         "cookies or every request mints its own entry")
 
 
 def test_preset_arg_value_predicate(ng: Nginx, origin: Origin) -> None:
@@ -8002,6 +8152,8 @@ def run_all(ng: Nginx, origin: Origin,
     test_vanilla_guest_cookies_stay_cacheable(ng, origin)
     test_phorum_admin_session_cookie(ng, origin)
     test_preset_arg_value_predicate(ng, origin)
+    test_cookie_pred_multiple_matching_cookies(ng, origin)
+    test_vbulletin_preset(ng, origin)
     test_phorum_uri_rules_anchor_at_root(ng, origin)
     test_joomla_preset(ng, origin)
     test_drupal_preset(ng, origin)
@@ -8320,6 +8472,10 @@ def main() -> int:
           "Vary:*/Cookie/mixed-refused uncacheable, off-by-default ignores Vary), "
           "presets (v3-2: conservative/aggressive stale-window differ, "
           "invalid-name rejected), "
+          "cookie predicate multi-match (guest cookie must not mask a member "
+          "in the same header, both orders, two-guests still cacheable), "
+          "vbulletin preset (NONEMPTY/EQ arms, empty value logged-out, "
+          "bb_language keyed, bb_lastvisit NOT keyed), "
           "config maxima/warns (STAB-5 keepalive cap rejected, COR-9 dup-status "
           "warn, COR-0 tag-without-L2 warn), "
           "autotune (v4-3: raises beta within band/off-by-default/"
