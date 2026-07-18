@@ -3438,10 +3438,15 @@ def test_invision_preset(ng: Nginx, origin: Origin) -> None:
     ips4_device_key is a per-device remember-me token. Keying on it would give
     every visitor a private entry nobody else can hit and let any client mint
     unlimited keys to force eviction -- the same failure bb_lastvisit had on the
-    vBulletin preset. The registry previously listed it under a camelCase name
-    (`ips4_deviceKey`) that key-cookie EXACT matching could never match, so the
-    row was dead; removing it is what makes the exclusion real, and this test is
-    what keeps it real now that every present key cookie is folded."""
+    vBulletin preset.
+
+    Note what the device-key case can and cannot prove. The registry listed the
+    cookie under a camelCase name (`ips4_deviceKey`) that EXACT key-cookie
+    matching never matched, so these requests were already unkeyed and this
+    assertion passes both before and after the row was dropped. It is not a
+    regression test for the removal; it is the guard against the tempting wrong
+    repair -- correcting the spelling to `ips4_device_key` -- which would key
+    every device separately and which this test would then fail."""
     # Guest with the ordinary session cookie: issued to everyone, must cache.
     guest = {"Cookie": "ips4_IPSSessionFront=abc"}
     fetch(ng.port, "/ips/topic", headers=guest)
@@ -3449,12 +3454,16 @@ def test_invision_preset(ng: Nginx, origin: Origin) -> None:
     assert hg.get("x-cache") == "HIT", \
         f"an IPS guest session must stay cacheable, got {hg.get('x-cache')}"
 
-    # _loggedIn is matched by SUFFIX (the ips4_ prefix is admin-configurable).
-    memb = {"Cookie": "ips4_IPSSessionFront=abc; ips4_loggedIn=1"}
-    fetch(ng.port, "/ips/member", headers=memb)
-    _, _, hm = fetch(ng.port, "/ips/member", headers=memb)
-    assert "x-cache" not in hm, \
-        f"a logged-in IPS member must bypass, got {hm.get('x-cache')}"
+    # _loggedIn is matched by SUFFIX, because the ips4_ prefix is admin-
+    # configurable (Overriding Default Cookie Options). The stock name alone
+    # would pass under an exact-name matcher too, so a renamed board is the
+    # case that actually pins the suffix rule.
+    for i, ck in enumerate(("ips4_loggedIn=1", "custom_loggedIn=1")):
+        memb = {"Cookie": f"ips4_IPSSessionFront=abc; {ck}"}
+        fetch(ng.port, f"/ips/member-{i}", headers=memb)
+        _, _, hm = fetch(ng.port, f"/ips/member-{i}", headers=memb)
+        assert "x-cache" not in hm, \
+            f"a logged-in IPS member ({ck}) must bypass, got {hm.get('x-cache')}"
 
     # Cosmetic key cookie: two themes, same URL, two entries.
     ta = {"Cookie": "ips4_theme=1"}
@@ -3463,8 +3472,10 @@ def test_invision_preset(ng: Nginx, origin: Origin) -> None:
     _, _, h_ta = fetch(ng.port, "/ips/keyed", headers=ta)
     assert h_ta.get("x-cache") == "HIT", "the same ips4_theme must hit its bucket"
     _, bb, h_tb = fetch(ng.port, "/ips/keyed", headers=tb)
-    assert h_tb.get("x-cache") != "HIT" and bb != ba, \
-        f"a different ips4_theme must key to its own entry, got {h_tb.get('x-cache')}"
+    assert h_tb.get("x-cache") != "HIT", \
+        f"a different ips4_theme must not read the first theme's entry, got {h_tb.get('x-cache')}"
+    assert bb != ba, \
+        "a different ips4_theme was served the first theme's cached body"
 
     # The device fingerprint must NOT be keyed: two devices, one entry.
     d1 = {"Cookie": "ips4_device_key=aaaaaaaaaaaaaaaa"}
@@ -3477,6 +3488,7 @@ def test_invision_preset(ng: Nginx, origin: Origin) -> None:
         (f"a different ips4_device_key must reuse the SAME entry, got "
          f"{h_d2.get('x-cache')} -- a per-device fingerprint must not be a key "
          "cookie or every device mints its own entry")
+    drain_origin(origin)
 
 
 def test_preset_arg_value_predicate(ng: Nginx, origin: Origin) -> None:

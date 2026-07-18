@@ -2340,10 +2340,12 @@ static const char *const  ct_typo3_args[] = { NULL };
  * cosmetic nor shared. Keying on it gives every visitor a private entry nobody
  * else can ever hit, and because the value comes straight from the client it
  * also lets one attacker mint unlimited distinct keys and push the zone into
- * eviction. Same reasoning as ct_vbulletin_key_cookies. It is also invisible
- * to the cache in the first place: IPS sets it httpOnly on the login POST for
- * the remember-me device list, so its presence tracks a MEMBER, whose requests
- * the _loggedIn predicate has already bypassed.
+ * eviction. Same reasoning as ct_vbulletin_key_cookies. It carries no variant
+ * information either: IPS sets it on the login POST for the remember-me device
+ * list, so its bearer is a MEMBER, and those requests the _loggedIn predicate
+ * has already bypassed. (It is httpOnly, but that is irrelevant here — httpOnly
+ * only hides a cookie from browser script; it is still sent in the Cookie
+ * header and this module sees it like any other.)
  */
 static const ngx_http_cache_turbo_cookie_pred_t  ct_invision_preds[] = {
     { "_loggedIn", NGX_HTTP_CACHE_TURBO_CVOP_NONEMPTY, NULL },
