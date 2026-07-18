@@ -121,7 +121,12 @@ how the preset keys pages.
   read is `YaBB.pl?num=<id>` with no `action` at all. There is no per-feature
   URI prefix to `location`-match, so the mutating/authenticated paths —
   `login`/`login2`/`logout`, posting, PMs, and the admin center — must be
-  excluded by their `action` value, not by path. The `yabb` preset already
+  excluded by their `action` value, not by path. YaBB also writes multi-argument
+  URLs with `;` as the separator (`YaBB.pl?num=17;action=post`); the preset's
+  argument scanner splits on both `;` and `&`, checks every occurrence of a
+  name, and percent-decodes before comparing, so those forms classify like the
+  plain one. nginx's own `$arg_action` variable does none of that — keep it in
+  mind if you hand-write bypass rules. The `yabb` preset already
   keys off this; it is the load-bearing signal for this backend and the reason
   a naïve `location`-prefix rule would wrongly cache POST/admin responses.
   (Confirmed against the `YaBB.pl` dispatch model and `LogInOut.pl`.)
