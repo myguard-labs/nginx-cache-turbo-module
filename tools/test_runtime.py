@@ -1415,6 +1415,15 @@ http {{
             cache_turbo_valid   30s;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
+        # yabb is the same shape as smf -- one YaBB.pl entry script dispatching
+        # on ?action=<route> -- so it too is exercised from a prefixed location.
+        location /yabb/ {{
+            cache_turbo         main;
+            cache_turbo_backend yabb;
+            cache_turbo_key     $request_uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
         # phorum is a flat top-level-script app: its URI rules are real root
         # paths, so they must be root locations to be exercised at all.
         location /admin.php {{
@@ -3488,6 +3497,62 @@ def test_invision_preset(ng: Nginx, origin: Origin) -> None:
         (f"a different ips4_device_key must reuse the SAME entry, got "
          f"{h_d2.get('x-cache')} -- a per-device fingerprint must not be a key "
          "cookie or every device mints its own entry")
+    drain_origin(origin)
+
+
+def test_yabb_preset(ng: Nginx, origin: Origin) -> None:
+    """YaBB: the Y2* cookie triple bypasses, and every mutating ?action= route
+    does too -- including logout.
+
+    Logout is the row this test exists for. A cached logout response is served
+    without the request ever reaching LogInOut.pl, so the
+    UpdateCookie("delete") that terminates the session never runs: the member
+    is shown a logged-out page while their Y2Sess-* cookie stays valid. The
+    registry listed login/login2 but not logout, so a logout arriving WITHOUT
+    the cookie triple (a stale tab, a link followed after the cookies expired,
+    or any client that drops them) was cacheable.
+
+    The cookie-triple arm is not a substitute for it: a request carrying
+    Y2User-* bypasses on the cookie rule alone and would pass with the args row
+    still missing, so the args arms are deliberately cookie-less."""
+    # The random per-install numeric suffix is what the substring rule exists
+    # for -- use a non-stock one so an exact-name matcher would fail here.
+    memb = {"Cookie": "Y2User-91827=alice; Y2Sess-91827=deadbeef"}
+    fetch(ng.port, "/yabb/YaBB.pl?num=17", headers=memb)
+    _, _, hm = fetch(ng.port, "/yabb/YaBB.pl?num=17", headers=memb)
+    assert "x-cache" not in hm, \
+        f"a YaBB member (Y2User-<rand>) must bypass, got {hm.get('x-cache')}"
+
+    # Mutating/authenticated routes must bypass on the ARG alone, with no
+    # cookie present. Fetch twice: a bypass and a first-time MISS are
+    # indistinguishable on one fetch (both lack x-cache), and only the bypass
+    # still lacks it on the second.
+    for q in ("action=logout", "action=login", "action=post", "action=admin",
+              "action=pm"):
+        uri = f"/yabb/YaBB.pl?{q}"
+        fetch(ng.port, uri)
+        _, _, h = fetch(ng.port, uri)
+        assert "x-cache" not in h, \
+            (f"?{q} must bypass on the yabb preset with no cookie present, got "
+             f"{h.get('x-cache')}")
+
+    # YaBB writes multi-argument URLs with ';', and the arg it dispatches on is
+    # rarely first -- the form the scanner was added for. Still a bypass.
+    uri = "/yabb/YaBB.pl?num=17;action=logout"
+    fetch(ng.port, uri)
+    _, _, h_semi = fetch(ng.port, uri)
+    assert "x-cache" not in h_semi, \
+        (f"?num=17;action=logout must bypass -- ';' is a YaBB query separator "
+         f"and the action is not the first argument, got {h_semi.get('x-cache')}")
+
+    # A plain thread read carries no action at all and must stay cacheable;
+    # this is what a bare-arg-NAME match would have broken.
+    for uri in ("/yabb/YaBB.pl?num=17;start=15", "/yabb/YaBB.pl?action=recent"):
+        fetch(ng.port, uri)
+        _, _, h_ok = fetch(ng.port, uri)
+        assert h_ok.get("x-cache") == "HIT", \
+            (f"{uri} is an ordinary read and must stay cacheable, got "
+             f"{h_ok.get('x-cache')}")
     drain_origin(origin)
 
 
@@ -8331,6 +8396,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_cookie_pred_multiple_matching_cookies(ng, origin)
     test_vbulletin_preset(ng, origin)
     test_invision_preset(ng, origin)
+    test_yabb_preset(ng, origin)
     test_phorum_uri_rules_anchor_at_root(ng, origin)
     test_joomla_preset(ng, origin)
     test_drupal_preset(ng, origin)
@@ -8658,6 +8724,8 @@ def main() -> int:
           "bb_language keyed, bb_lastvisit NOT keyed), "
           "invision preset (_loggedIn suffix bypass, ips4_theme keyed, "
           "ips4_device_key NOT keyed), "
+          "yabb preset (Y2* triple bypass, action=logout/login/post/admin/pm "
+          "bypass cookie-less, ';'-separated logout, plain reads cached), "
           "config maxima/warns (STAB-5 keepalive cap rejected, COR-9 dup-status "
           "warn, COR-0 tag-without-L2 warn), "
           "autotune (v4-3: raises beta within band/off-by-default/"

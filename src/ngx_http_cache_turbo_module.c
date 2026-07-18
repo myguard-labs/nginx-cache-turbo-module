@@ -2523,14 +2523,20 @@ static const char *const  ct_phorum_key_cookies[] = { "list_style", NULL };
  *
  * YaBB is a single-script CGI app (YaBB.pl?action=X), so the dynamic surface
  * lives in query args, not URI prefixes.
+ *
+ * `action=logout` is in the args list for the same reason `action=login` is,
+ * and it is the more dangerous of the pair to omit: a cached logout response
+ * is served without the request ever reaching LogInOut.pl, so the
+ * UpdateCookie("delete") that terminates the session never runs and the member
+ * stays logged in while being told they are not.
  */
 static const char *const  ct_yabb_cookies[] = {
     "Y2User-", "Y2Pass-", "Y2Sess-", NULL };
 static const char *const  ct_yabb_uris[] = { NULL };
 static const char *const  ct_yabb_args[] = {
     "action=post", "action=post2", "action=login", "action=login2",
-    "action=register", "action=register2", "action=admin", "action=pm",
-    "action=imsend", "action=imsend2", NULL };
+    "action=logout", "action=register", "action=register2", "action=admin",
+    "action=pm", "action=imsend", "action=imsend2", NULL };
 
 /*
  * MyBB. The login cookie `{prefix}user` (COOKIE_PREFIX default "mybb_", so
