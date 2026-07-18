@@ -37,7 +37,7 @@ not a default. Both spellings are now a config error that names the replacement.
 
 | Check | Values |
 |---|---|
-| URI prefixes | `/cart`, `/checkout`, `/my-account` |
+| URI prefixes | `/cart`, `/checkout`, `/my-account` — **English defaults only**, see below |
 | Query args | `wc-ajax` |
 | Cookie header substrings | `woocommerce_items_in_cart`, `woocommerce_cart_hash`, `wp_woocommerce_session_` |
 
@@ -212,8 +212,32 @@ about to be wrong for somebody.
   normally). The rule is: after the prefix the URL must end or continue with `/` or
   `.`. So a product whose slug starts with `cart` is safe unless the next character
   is a boundary.
-- **A store on a subdirectory or a translated store** shifts these URIs
-  (`/fr/panier`), and the preset will not match them. Add a `map`-driven
+- **On a non-English store these three prefixes match NOTHING, out of the box.**
+  This is not admin drift you can avoid by being careful — it is WooCommerce's
+  shipped behaviour. `WC_Install::create_pages()` declares the slugs as
+  *translatable* strings (`_x( 'cart', 'Page slug', 'woocommerce' )`) and wraps
+  page creation in `wc_switch_to_site_locale()` so that "pages are created in the
+  correct language". A German store gets `/warenkorb`, `/kasse`, `/mein-konto` at
+  install time. An admin can rename them afterwards, and the
+  `woocommerce_create_pages` filter can replace the set outright.
+
+  **Do not treat the URI tier as the guard here.** It is a convenience for the
+  default-locale majority. What holds on a translated store is the cookie tier
+  plus the stacked `wordpress` preset. That stacking is what makes this safe, and
+  this is the case that proves it is not optional: `cache_turbo_backend
+  woocommerce;` used **alone** on a translated store serves a logged-in customer
+  with an *empty* cart — no Woo cookie, no URI match, no `wordpress` preset — a
+  cached `/mein-konto`.
+
+  Locale slugs are deliberately not enumerated in the preset (the set is
+  unbounded). Add your own:
+
+  ```nginx
+  cache_turbo_bypass_uri /warenkorb /kasse /mein-konto;
+  ```
+
+- **A store on a subdirectory** shifts these URIs (`/fr/panier`), and the preset
+  will not match them. Add a `map`-driven
   `cache_turbo_bypass` — plus a matching `cache_turbo_no_store`, since the
   bypass only skips the lookup — for the translated paths; the *cookie* half of the preset
   is path-independent and keeps protecting you regardless.
