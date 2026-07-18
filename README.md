@@ -528,7 +528,7 @@ plausibly appear as an arbitrary value.
 | `wagtail` † § | `/admin/`, `/django-admin/`, `/documents/` | — | `sessionid` |
 | `kirby` † §   | `/panel` | — | `kirby_session` |
 | `typo3` † ※   | `/typo3` | — | `fe_typo_user`, `be_typo_user` |
-| `invision` †  | `/admin`, `/login`, `/register`, `/lostpassword`, `/messenger` | `do=compose`, `do=post`, `do=reply`, `do=report`, `module=messaging` | `_loggedIn` (suffix); *(key)* `ips4_hasJS`, `ips4_theme`, `ips4_language`, `ips4_deviceKey` |
+| `invision` †  | `/admin`, `/login`, `/register`, `/lostpassword`, `/messenger` | `do=compose`, `do=post`, `do=reply`, `do=report`, `module=messaging` | `_loggedIn` (suffix); *(key)* `ips4_hasJS`, `ips4_theme`, `ips4_language` |
 | `smf` †       | — | `action=admin`, `action=login`, `action=login2`, `action=logintfa`, `action=logout`, `action=profile`, `action=pm`, `action=post`, `action=post2`, `action=moderate`, `action=reporttm`, `action=xmlhttp` | `SMFCookie` (presence-only) |
 | `vanilla` †   | `/dashboard`, `/entry/`, `/messages/`, `/post/` | — | `Vanilla=` (presence-only) |
 | `punbb` †     | `/admin.php`, `/admin/`, `/login.php`, `/post.php`, `/message_send.php`, `/message_delete.php`, `/misc.php` | — | `forum_cookie`, `punbb_cookie` (presence-only) |
