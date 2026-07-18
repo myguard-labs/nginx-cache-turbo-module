@@ -407,6 +407,14 @@ class Origin:
                     self.send_header(
                         "Expires",
                         email.utils.formatdate(time.time() + 2, usegmt=True))
+                if "ttlclamp" in self.path:
+                    # STAB-5 TTL clamp (module.c:4873): an unbounded upstream
+                    # max-age (here ~3170 years, > TTL_MAX 0xFFFFFFFF) must be
+                    # clamped before it feeds the uint32 fresh_ttl cast, the
+                    # stale-window multiply and the L2 PX. Unclamped, the cast /
+                    # multiply overflow could wrap the fresh window to a small (or
+                    # instantly-stale) value; clamped, the entry stays fresh.
+                    self.send_header("Cache-Control", "public, max-age=99999999999")
                 if "cdnttl" in self.path:
                     # RFC 9213: CDN-Cache-Control (edge TTL) must OUTRANK the
                     # browser-facing Cache-Control. CC says 60s fresh, CDN-CC says
@@ -4516,6 +4524,28 @@ def test_valid_zero_is_forever(ng: Nginx, origin: Origin) -> None:
         "a 'forever' entry must not re-hit the origin while fresh"
 
 
+def test_honor_ttl_clamped_to_max(ng: Nginx, origin: Origin) -> None:
+    """STAB-5 TTL clamp (module.c:4873): honor mode reads an unbounded upstream
+    max-age (~3170 years, > TTL_MAX 0xFFFFFFFF). The clamp caps it before the
+    uint32 fresh_ttl cast and the stale-window multiply; without the clamp those
+    could overflow/wrap the fresh window to a small or instantly-stale value.
+    Observable proof: the entry stays a FRESH HIT (no re-hit to origin) rather
+    than going stale — a wrapped TTL would surface as a STALE serve here."""
+    base = origin.hits_for("ttlclamp")           # path-scoped: immune to bg-refresh noise
+    _, b0, h0 = fetch(ng.port, "/cc7/ttlclamp")
+    assert "x-cache" not in h0, "first should miss to origin"
+    _, b1, h1 = fetch(ng.port, "/cc7/ttlclamp")
+    assert h1.get("x-cache") == "HIT", \
+        f"clamped huge max-age must serve a FRESH HIT, got {h1.get('x-cache')}"
+    time.sleep(2.0)
+    _, b2, h2 = fetch(ng.port, "/cc7/ttlclamp")
+    assert h2.get("x-cache") == "HIT", \
+        ("clamped max-age must still be fresh after a delay (no overflow-to-stale), "
+         f"got {h2.get('x-cache')}")
+    assert origin.hits_for("ttlclamp") == base + 1, \
+        "a TTL_MAX-clamped entry must not re-hit the origin while fresh"
+
+
 def test_vary_encoding_qvalue(ng: Nginx, origin: Origin) -> None:
     """Accept-Encoding is tokenised, not substring-matched: `gzip;q=0` (the client
     REFUSES gzip) must NOT bucket as gzip, while `gzip;q=0.001` still does. Pre-fix
@@ -7837,6 +7867,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_ignore_cache_control_overrides_floor(ng, origin)
     test_ignore_cc_must_revalidate_keeps_stale_window(ng, origin)
     test_valid_zero_is_forever(ng, origin)
+    test_honor_ttl_clamped_to_max(ng, origin)              # STAB-5 TTL clamp
     test_vary_encoding_qvalue(ng, origin)
     test_auto_vary_unknown_axis_uncacheable(ng, origin)
     test_auto_vary_stale_marker_reachable(ng, origin)
@@ -8068,6 +8099,7 @@ def main() -> int:
           "RFC 9213 targeted cache-control (CDN-CC/Surrogate-Control TTL "
           "precedence + no-store veto + stripped from serve), "
           "valid 0 = forever (fresh HIT, not instant-stale), "
+          "TTL clamp to TTL_MAX (huge upstream max-age stays fresh, no overflow), "
           "Accept-Encoding q-value (gzip;q=0 != gzip bucket), "
           "auto-Vary unknown-axis uncacheable, "
           "auto-Vary stale-marker still reachable, 206 never cached, "
