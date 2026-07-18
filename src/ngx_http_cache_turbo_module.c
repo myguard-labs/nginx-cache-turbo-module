@@ -661,6 +661,22 @@ ngx_http_cache_turbo_blob_validate(const u_char *blob, size_t len,
 
 
 /*
+ * Longest key-cookie VALUE folded verbatim. Every legitimate segment
+ * fingerprint is far shorter: X-Magento-Vary is a base64'd hash, xf_style_id /
+ * xf_language_id are small integers, ips4_theme and mybbtheme are theme ids.
+ * A value past this length is not a fingerprint any application issued.
+ */
+#define NGX_HTTP_CACHE_TURBO_KEY_COOKIE_MAX       256
+
+/*
+ * Value-length field written for an over-long value. A real value can never
+ * reach this, since it is capped at _MAX above, so the marker is unforgeable
+ * from the request — the same property the length-prefixed framing relies on.
+ */
+#define NGX_HTTP_CACHE_TURBO_KEY_COOKIE_OVERSIZE  0xffffffffu
+
+
+/*
  * Append ONE key cookie to the key under construction, with the unforgeable
  * length-prefixed framing both the preset and the DIY path use: 0x1f tag, then
  * the name length and the value length as fixed 4-byte fields, then the name
@@ -670,15 +686,57 @@ ngx_http_cache_turbo_blob_validate(const u_char *blob, size_t len,
  * Folding is append-only, so calling this once per present cookie yields a key
  * that depends on every one of them. Order is the caller's iteration order,
  * which is fixed by the preset table / the config, so the key is deterministic.
+ *
+ * A value longer than _KEY_COOKIE_MAX is NOT folded verbatim. All such values
+ * collapse to ONE bucket, marked by the reserved _OVERSIZE length field and no
+ * value bytes. That bucket is distinct from the absent-cookie (anonymous) key
+ * and from every in-range value, so an over-long value can neither poison the
+ * anonymous entry nor land on a legitimate segment's entry — the only requests
+ * that share it are other over-long ones.
+ *
+ * WHAT THIS DOES AND DOES NOT FIX. It bounds the key size a single request can
+ * force, and it collapses the over-long case to one entry. It does NOT bound
+ * cardinality in general, and no length cap can: 256 bytes still spans 2^2048
+ * values, so an attacker sending short random values mints an entry per request
+ * exactly as before. That is a real exposure — it is finding 3's class (the
+ * vbulletin bb_lastvisit timestamp) — and the controls for it are
+ * cache_turbo_min_uses, which refuses to store a once-seen key at all, plus
+ * max_size and LRU. The remaining shipped key cookies are all low-cardinality
+ * by design, which is the property that makes them keyable in the first place;
+ * a high-cardinality one gets DROPPED from the list rather than capped, which
+ * is what happened to bb_lastvisit.
+ *
+ * The value is deliberately NOT hashed here and NOT charset-filtered. The whole
+ * key is SHA-256'd into ctx->key_hash before it reaches L1 or the L2 wire
+ * (SEC-2), so hashing a component adds nothing, and no raw byte of it is ever
+ * transmitted or used as a memcached/Redis key — which is what a charset filter
+ * would be protecting against. The framing above already makes arbitrary bytes
+ * unambiguous.
  */
 static ngx_int_t
 ngx_http_cache_turbo_key_fold_cookie(ngx_http_request_t *r,
     ngx_http_cache_turbo_ctx_t *ctx, ngx_str_t *name, ngx_str_t *val)
 {
-    u_char  *k, *p;
-    size_t   klen;
+    u_char    *k, *p;
+    size_t     klen, vlen;
+    uint32_t   vfield;
 
-    klen = ctx->cache_key.len + 1 + 4 + 4 + name->len + val->len;
+    if (val->len > NGX_HTTP_CACHE_TURBO_KEY_COOKIE_MAX) {
+        vlen = 0;
+        vfield = NGX_HTTP_CACHE_TURBO_KEY_COOKIE_OVERSIZE;
+
+        ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                      "cache_turbo: key cookie \"%V\" value of %uz bytes "
+                      "exceeds %d, folded as oversize",
+                      name, val->len,
+                      NGX_HTTP_CACHE_TURBO_KEY_COOKIE_MAX);
+
+    } else {
+        vlen = val->len;
+        vfield = (uint32_t) val->len;
+    }
+
+    klen = ctx->cache_key.len + 1 + 4 + 4 + name->len + vlen;
 
     k = ngx_pnalloc(r->pool, klen);
     if (k == NULL) {
@@ -689,10 +747,12 @@ ngx_http_cache_turbo_key_fold_cookie(ngx_http_request_t *r,
     *p++ = '\x1f';
     ngx_http_cache_turbo_put_u32(p, (uint32_t) name->len);
     p += 4;
-    ngx_http_cache_turbo_put_u32(p, (uint32_t) val->len);
+    ngx_http_cache_turbo_put_u32(p, vfield);
     p += 4;
     p = ngx_cpymem(p, name->data, name->len);
-    ngx_memcpy(p, val->data, val->len);
+    if (vlen) {
+        ngx_memcpy(p, val->data, vlen);
+    }
 
     ctx->cache_key.data = k;
     ctx->cache_key.len = klen;

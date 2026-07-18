@@ -6008,6 +6008,39 @@ def test_key_cookie(ng: Nginx) -> None:
     _, bb1, _ = fetch(ng.port, "/kc/page", headers=seg_b)
     assert bb1 != ba1, \
         "a different seg value was served another segment's body -- cross-user leak"
+
+    # OVER-LONG values (> 256 bytes) collapse to ONE bucket, marked by the
+    # reserved 0xffffffff length field and no value bytes. Two DIFFERENT
+    # over-long values must therefore share an entry -- that is the cap doing
+    # its job. The only requests in that bucket are other over-long ones.
+    big_x = {"Cookie": "seg=" + ("x" * 300)}
+    big_y = {"Cookie": "seg=" + ("y" * 400)}
+    _, bx1, _ = fetch(ng.port, "/kc/page", headers=big_x)
+    _, by1, hy1 = fetch(ng.port, "/kc/page", headers=big_y)
+    assert hy1.get("x-ct-status") == "HIT" and by1 == bx1, \
+        ("two distinct over-long key-cookie values must collapse to ONE bucket "
+         f"-- otherwise the cap does not bound anything, got {hy1.get('x-ct-status')}")
+
+    # ...but that bucket must be DISTINCT from the anonymous (absent-cookie)
+    # one, or an over-long value poisons the entry every cookie-less visitor
+    # reads. This is the assertion that fails if the cap is implemented by
+    # simply dropping the fold.
+    _, banon, _ = fetch(ng.port, "/kc/page")
+    assert banon != bx1, \
+        ("an over-long value must NOT land in the anonymous bucket -- dropping "
+         "the fold instead of marking it poisons every cookie-less visitor")
+
+    # ...and distinct from an in-range value's bucket.
+    assert bx1 != ba1 and bx1 != bb1, \
+        "the oversize bucket must not collide with an in-range segment's entry"
+
+    # A value at exactly the cap is still folded VERBATIM -- the boundary is
+    # inclusive, so a legitimate 256-byte fingerprint keeps its own entry.
+    at_cap = {"Cookie": "seg=" + ("z" * 256)}
+    _, bz1, _ = fetch(ng.port, "/kc/page", headers=at_cap)
+    assert bz1 != bx1, \
+        ("a value of exactly 256 bytes is at the cap, not over it -- it must "
+         "still key to its own entry, not the oversize bucket")
     _, bb2, hb2 = fetch(ng.port, "/kc/page", headers=seg_b)
     assert hb2.get("x-ct-status") == "HIT" and bb2 == bb1, \
         "each seg value must warm and HIT its own entry"
@@ -9048,7 +9081,9 @@ def main() -> int:
           "PURGE method, COR-5 auto-Vary variant purge (L1-only gen-bump), "
           "bypass + no_store, DIY bypass_uri (v15: segment-boundary + subdir + "
           "non-boundary caches), DIY key_cookie (v15: value-keyed entries + anon "
-          "bucket + exact-name + split-header), $cache_turbo_status (MISS/HIT/BYPASS + bypasses counter, "
+          "bucket + exact-name + split-header + oversize values collapse to one "
+          "bucket distinct from anon and from in-range, 256 still verbatim), "
+          "$cache_turbo_status (MISS/HIT/BYPASS + bypasses counter, "
           "STALE serve, EXPIRED refetch), "
           "RFC-1 request Cache-Control serve verdict (fresh: max-age=0/min-fresh "
           "refuse fresh HIT + revalidate, bare max-stale still serves fresh; "
