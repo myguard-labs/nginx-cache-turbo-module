@@ -353,8 +353,10 @@ http {
             # NOTE: $arg__xfToken is nginx's own lookup, and it is weaker than
             # the preset's. It splits on '&' only, takes the first occurrence,
             # and does no decoding, so "?%2ExfToken=…" (PHP folds '.' and ' '
-            # in a $_GET key to '_') and "?a=1&_xfToken=…&_xfToken=…" slip past
-            # it. `cache_turbo_backend xenforo;` handles all of those; prefer it
+            # in a $_GET key to '_') and "?_xfToken=&_xfToken=…" — where the
+            # empty first value leaves the bypass variable empty while PHP
+            # routes on the LAST one — both slip past it.
+            # `cache_turbo_backend xenforo;` handles all of those; prefer it
             # over hand-written $arg_ rules wherever you can.
 
             # the dynamic surfaces the preset's URI list would have covered:
