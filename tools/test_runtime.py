@@ -1536,6 +1536,34 @@ http {{
             cache_turbo_valid   30s;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
+        # Web API front names (app/code/Magento/Webapi/etc/di.xml). Header-
+        # authenticated -> invisible to the cookie tier, so they need URI rules.
+        # Root locations, or the fetch falls through to nginx's implicit 404 and
+        # a "must bypass" assertion passes without the preset ever running.
+        location /rest {{
+            cache_turbo         main;
+            cache_turbo_backend magento;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        location /soap {{
+            cache_turbo         main;
+            cache_turbo_backend magento;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        # A catalog URL that merely SHARES the letters must still cache: the
+        # prefix needs a '/' or '.' boundary after it, so /restaurant-supplies
+        # is not /rest.
+        location /restaurant-supplies {{
+            cache_turbo         main;
+            cache_turbo_backend magento;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
         # Cookie rules are path-independent. The catalog is the surface that MUST
         # stay cacheable -- including for guests carrying PHPSESSID / form_key /
         # private_content_version, every one of which Magento sets for anons.
@@ -1835,6 +1863,20 @@ http {{
         # carries no x-cache header either, so a "must bypass" assertion would
         # pass without the preset ever running.
         location /admin {{
+            cache_turbo         main;
+            cache_turbo_backend drupal;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        location /jsonapi {{
+            cache_turbo         main;
+            cache_turbo_backend drupal;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        location /oauth {{
             cache_turbo         main;
             cache_turbo_backend drupal;
             cache_turbo_key     $uri;
@@ -3051,6 +3093,64 @@ def test_wordpress_search_and_preview(ng: Nginx, origin: Origin) -> None:
         assert "x-cache" not in hp, \
             (f"{uri} renders an UNPUBLISHED revision and must bypass, got "
              f"{hp.get('x-cache')}")
+    drain_origin(origin)
+
+
+def test_header_auth_rest_surfaces(ng: Nginx, origin: Origin) -> None:
+    """Header-authenticated REST surfaces must bypass on the URI/arg tier.
+
+    These are structurally invisible to the cookie tier: an API client sends
+    `Authorization: Bearer ...` and NO session cookie, so every cookie rule in
+    every preset is blind to it. Only a URI or arg rule can see them, and only
+    xenforo's /api/ was covered.
+
+    The arms deliberately send NO Authorization header. The module has an
+    Authorization storage floor, so a request that carries one would bypass
+    storing for a reason that has nothing to do with the preset -- the
+    assertion would pass with the rule removed. A cookie-less, header-less
+    fetch is the only shape that actually tests the URI rule.
+
+    WordPress ?rest_route= is the sharpest of these: it is not a fallback for
+    /wp-json/, it is what /wp-json/ REWRITES TO. wp-includes/rest-api.php maps
+    ^wp-json/(.*) -> index.php?rest_route=/$1, and rest_api_loaded() dispatches
+    only when that query var is set. With plain permalinks the request never has
+    a /wp-json/ path at all, so the URI rule saw nothing."""
+    # Magento Web API front names: rest + soap.
+    for uri in ("/rest/V1/customers/me", "/rest/V1/orders", "/soap/default"):
+        fetch(ng.port, uri)
+        _, _, h = fetch(ng.port, uri)
+        assert "x-cache" not in h, \
+            (f"magento {uri} is header-authenticated and invisible to the cookie "
+             f"tier -- it must bypass on the URI rule, got {h.get('x-cache')}")
+
+    # ...but a catalog URL that merely shares the letters must still cache. The
+    # prefix requires a '/' or '.' boundary, so /restaurant-supplies is not /rest.
+    fetch(ng.port, "/restaurant-supplies")
+    _, _, hr = fetch(ng.port, "/restaurant-supplies")
+    assert hr.get("x-cache") == "HIT", \
+        ("/restaurant-supplies merely shares letters with /rest and must stay "
+         f"cacheable (prefix needs a '/' or '.' boundary), got {hr.get('x-cache')}")
+
+    # Drupal JSON:API (core, jsonapi.base_path) and simple_oauth.
+    # /oauth/userinfo is the leak that justifies the prefix: a GET, authenticated
+    # purely by bearer token, returning the token holder's profile.
+    for uri in ("/jsonapi/node/article", "/oauth/userinfo", "/oauth/debug"):
+        fetch(ng.port, uri)
+        _, _, h = fetch(ng.port, uri)
+        assert "x-cache" not in h, \
+            (f"drupal {uri} is header-authenticated -- it must bypass on the URI "
+             f"rule, got {h.get('x-cache')}")
+
+    # WordPress ?rest_route= -- the same API as /wp-json/, addressed the other
+    # way. This is the arm that fails if only the URI half is covered.
+    for uri in ("/wpq/?rest_route=/wp/v2/users/me",
+                "/wpq/index.php?rest_route=/wp/v2/posts",
+                "/wpq/?p=1&rest_route=/wp/v2/settings"):
+        fetch(ng.port, uri)
+        _, _, h = fetch(ng.port, uri)
+        assert "x-cache" not in h, \
+            (f"{uri} IS the REST API -- /wp-json/ is a rewrite to this form, so "
+             f"guarding only the path leaves it open, got {h.get('x-cache')}")
     drain_origin(origin)
 
 
@@ -8640,6 +8740,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_auto_backend_composition(ng, origin)
     test_woocommerce_wc_ajax(ng, origin)
     test_wordpress_search_and_preview(ng, origin)
+    test_header_auth_rest_surfaces(ng, origin)
     test_xenforo_preset(ng, origin)
     test_xenforo_not_in_generic(ng, origin)
     test_discourse_preset(ng, origin)
@@ -8985,6 +9086,8 @@ def main() -> int:
           "mybb preset (user-suffix bypass survives cookieprefix, mybbtheme keyed exactly, look-alike cookie cannot steer buckets), "
           "yabb preset (Y2* triple bypass, action=logout/login/post/admin/pm "
           "bypass cookie-less, ';'-separated logout, plain reads cached), "
+          "header-auth REST surfaces (magento /rest+/soap, drupal /jsonapi+"
+          "/oauth, wp ?rest_route=, /restaurant-supplies still cached), "
           "wordpress preset (?s= search CACHES incl. distinct terms, "
           "logged-in editor search bypasses on cookie, ?preview= bypasses), "
           "mediawiki preset (13 mutating core actions bypass cookie-less, "
