@@ -46,6 +46,19 @@
 #define NGX_HTTP_CACHE_TURBO_MIN_USES_MIN  1
 #define NGX_HTTP_CACHE_TURBO_MIN_USES_MAX  32
 
+/* Bounds on cache_turbo_l2_negative_ttl N (L13). 0 = OFF and is the default in
+ * every preset -- this is NOT a preset band column, precisely because the memo
+ * trades coherence for a round-trip and that trade must be opted into per
+ * location, not inherited from a preset name.
+ *
+ * The ceiling is deliberately small. The memo has no invalidation channel: a
+ * peer node storing the key does not clear it, so the window is exactly how
+ * long this node can stay blind to a fresh L2 object. Seconds are useful
+ * (a cold-key stampede is over in well under one); minutes are a footgun, so
+ * the cap keeps an operator's typo from turning L2 off for an hour. */
+#define NGX_HTTP_CACHE_TURBO_L2_NEG_TTL_MIN  1
+#define NGX_HTTP_CACHE_TURBO_L2_NEG_TTL_MAX  60
+
 /* "Forever" fresh TTL. `cache_turbo_valid 0` ("cache forever", per the code's
  * long-standing contract) resolves to this long-but-finite TTL rather than a
  * literal 0 — a literal 0 made the object instantly+permanently STALE and
@@ -340,6 +353,22 @@ typedef struct {
      * Irrelevant once the node holds a real body (len > 0); left untouched then. */
     ngx_uint_t               miss_count;
 
+    /* L2 negative memo (L13). When cache_turbo_l2_negative_ttl is set, an L2 GET
+     * that missed stamps `now + l2_negative_ttl` here, and subsequent cold
+     * requests for the same key skip the L2 round-trip until it expires. Rides
+     * on the same "counter node" (data == NULL / len == 0) as miss_count above,
+     * so a memo costs no extra allocation when min_uses already made one.
+     * 0 = no memo. Cleared on store (a node with a body never consults L2).
+     *
+     * COHERENCE: this is a bounded-staleness memo, NOT an invalidating one --
+     * nothing tells this node that a PEER stored the key during the window. The
+     * TTL is the entire coherence story, which is why it is off by default and
+     * capped at NGX_HTTP_CACHE_TURBO_L2_NEG_TTL_MAX. Worst case, a multi-node
+     * L2 hit is missed for up to l2_negative_ttl seconds and the request goes to
+     * origin instead -- a performance loss, never a correctness one (a stale
+     * body is never served from a memo; the memo holds no body at all). */
+    time_t                   l2_neg_until;
+
     /* PERF (P1): coarse last-access stamp (1s granularity, ngx_time). The true-LRU
      * head-splice on every HIT is a WRITE to the shared LRU list under
      * shpool->mutex — on a hot key that serializes all readers on the same cache
@@ -382,6 +411,13 @@ typedef struct {
      * when min_uses is 1 (the default — feature off). Observability for the
      * "don't cache one-hit-wonders" gate. */
     ngx_atomic_t             min_uses_skips;
+
+    /* L13: bumped once per L2 GET that a negative memo made unnecessary. Zero
+     * when cache_turbo_l2_negative_ttl is 0 (the default — feature off). This
+     * is the payoff metric: each unit is one L2 round-trip not taken. Compare
+     * against l2_hits to size the window — a memo that is suppressing hits
+     * (rising l2_neg_skips with falling l2_hits) is set too long. */
+    ngx_atomic_t             l2_neg_skips;
 
     /* Requests sent to origin because a cache_turbo_bypass predicate tripped or
      * a CMS backend preset auto-classified them as dynamic. Also counted in
@@ -433,6 +469,7 @@ typedef struct {
     ngx_atomic_uint_t   l2_misses;
     ngx_atomic_uint_t   lock_waits;   /* v10 coalesced cold-misses (waited)   */
     ngx_atomic_uint_t   min_uses_skips; /* v15 cold misses below min_uses     */
+    ngx_atomic_uint_t   l2_neg_skips;   /* L13 L2 GETs skipped by a memo      */
     ngx_atomic_uint_t   bypasses;     /* bypass / auto-classify skips to origin */
     /* Autotune introspection (v4-3): cost_ms = the measured average origin-regen
      * cost (cost_sum_ms / cost_count, 0 when nothing measured); autotuned_beta =
@@ -643,6 +680,19 @@ typedef struct {
      * regardless (the gate sits after the L2 consult). */
     ngx_int_t                min_uses;
 
+    /* cache_turbo_l2_negative_ttl N (L13). Seconds to remember that an L2 GET
+     * missed a key, so the next cold request for it skips the L2 round-trip
+     * instead of paying a full RTT to be told "absent" again. 0 = OFF (the
+     * default in every preset -- not a band column, see the MIN/MAX comment).
+     *
+     * Bounded staleness by construction: nothing invalidates the memo when a
+     * PEER node stores the key, so for up to N seconds this node may go to the
+     * origin for an object L2 actually holds. That is a hit-rate cost, never a
+     * correctness one -- the memo carries no body and can never cause a stale
+     * serve. Keep N at a few seconds (the stampede it collapses is shorter than
+     * that) and leave it off unless L2 misses dominate the miss path. */
+    time_t                   l2_negative_ttl;
+
     /* L2 Redis (v2b). Native async client, no hiredis. The L2 store is touched
      * only on an L1 miss (sync GET) and on store (async write-through); it is
      * never on the L1-hit hot path. */
@@ -794,6 +844,17 @@ typedef struct {
     u_char                  *l2_blob;     /* L2-hit blob, copied to r->pool  */
     size_t                   l2_blob_len;
     unsigned                 l2_miss_counted:1;/* l2_misses stat already bumped*/
+    unsigned                 l2_neg_force:1;   /* L13: consult L2 for real on
+                                                * this re-entry, ignoring any
+                                                * memo -- set by the cold-miss
+                                                * wait re-poll, whose whole
+                                                * purpose is to catch a peer's
+                                                * mid-wait write-through */
+    unsigned                 l2_neg_skipped:1; /* L13: the L2 GET was skipped by
+                                                * a negative memo rather than
+                                                * actually performed -- keeps
+                                                * the miss path from re-arming
+                                                * the memo it just consumed */
     /* Cross-node dogpile (v4-2). On a stale L1 dice win the request parks for a
      * Redis SET NX PX reply: lock_result == NGX_OK means this node holds the
      * cluster-wide regen lock (go to origin); anything else means another node
@@ -1030,6 +1091,14 @@ void ngx_http_cache_turbo_shm_unstub(ngx_http_cache_turbo_zone_t *z,
 ngx_int_t ngx_http_cache_turbo_shm_count_miss(ngx_http_cache_turbo_zone_t *z,
     u_char *key_hash, uint32_t hash, ngx_int_t min_uses);
 
+/* L2 negative memo (L13). See the L1 vtable `l2_neg_check` / `l2_neg_set`
+ * comments. check returns NGX_DECLINED to SKIP the L2 GET (a live memo), NGX_OK
+ * to consult L2 as usual; set records a memo and is best-effort. */
+ngx_int_t ngx_http_cache_turbo_shm_l2_neg_check(ngx_http_cache_turbo_zone_t *z,
+    u_char *key_hash, uint32_t hash);
+void ngx_http_cache_turbo_shm_l2_neg_set(ngx_http_cache_turbo_zone_t *z,
+    u_char *key_hash, uint32_t hash, time_t ttl);
+
 
 /* ---- swr.c ---- */
 time_t    ngx_http_cache_turbo_stale_ttl(time_t fresh_ttl, ngx_int_t stale_mult);
@@ -1211,6 +1280,24 @@ struct ngx_cache_turbo_l1_backend_s {
      * re-gated). Only called when min_uses > 1. */
     ngx_int_t  (*count_miss)(ngx_http_cache_turbo_zone_t *z, u_char *key_hash,
         uint32_t hash, ngx_int_t min_uses);
+
+    /* L2 negative memo (L13). Both halves take the zone mutex internally.
+     *
+     * l2_neg_check: NGX_DECLINED if a live memo says "L2 missed this key
+     * recently, skip the GET"; NGX_OK if the caller should consult L2 (no memo,
+     * memo expired, or a real body/stub exists -- those are never memoed).
+     *
+     * l2_neg_set: record a memo for `ttl` seconds after an L2 GET missed.
+     * Best-effort: allocates a counter node if none exists and silently does
+     * nothing when the slab is full (losing a memo costs a round-trip, never
+     * correctness). Never overwrites a node that holds a body (len > 0) or an
+     * in-flight stub -- neither ever consults L2 on the memo path.
+     *
+     * Only called when l2_negative_ttl > 0. */
+    ngx_int_t  (*l2_neg_check)(ngx_http_cache_turbo_zone_t *z, u_char *key_hash,
+        uint32_t hash);
+    void       (*l2_neg_set)(ngx_http_cache_turbo_zone_t *z, u_char *key_hash,
+        uint32_t hash, time_t ttl);
 };
 
 #define NGX_HTTP_CACHE_TURBO_CLAIM_WINNER  0

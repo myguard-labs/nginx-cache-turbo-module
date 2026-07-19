@@ -88,6 +88,8 @@ static char *ngx_http_cache_turbo_stale_mult(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 static char *ngx_http_cache_turbo_min_uses(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
+static char *ngx_http_cache_turbo_l2_negative_ttl(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
 static char *ngx_http_cache_turbo_preset(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static ngx_int_t ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r);
@@ -307,6 +309,13 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
     { ngx_string("cache_turbo_min_uses"),
       NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
       ngx_http_cache_turbo_min_uses,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+
+    { ngx_string("cache_turbo_l2_negative_ttl"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
+      ngx_http_cache_turbo_l2_negative_ttl,
       NGX_HTTP_LOC_CONF_OFFSET,
       0,
       NULL },
@@ -4457,6 +4466,24 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
      * when the reply lands (see ngx_http_cache_turbo_redis_get). */
     ngx_shmtx_unlock(&z->shpool->mutex);
 
+    /* L13: a live negative memo says an L2 GET for this key missed within the
+     * last cache_turbo_l2_negative_ttl seconds. Skip the round-trip and treat
+     * it as an L2 miss directly. Marking l2_done keeps the rest of the handler
+     * (and the l2_misses metric below) on exactly the path a real miss takes,
+     * so a memoed miss and a fetched miss are indistinguishable downstream. */
+    if (clcf->backend && !ctx->l2_done && !ctx->l2_neg_force
+        && clcf->l2_negative_ttl > 0
+        && clcf->l1->l2_neg_check(z, ctx->key_hash, hash) == NGX_DECLINED)
+    {
+        ctx->l2_done = 1;
+        ctx->l2_result = NGX_DECLINED;
+        ctx->l2_neg_skipped = 1;
+        (void) ngx_atomic_fetch_add(&z->sh->l2_neg_skips, 1);
+        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "cache_turbo: L2 GET skipped by negative memo \"%V\" "
+                       "key=%ui", &r->uri, (ngx_uint_t) hash);
+    }
+
     if (clcf->backend && !ctx->l2_done) {
         ngx_int_t  rc = clcf->backend->get(r, clcf, ctx);
         if (rc == NGX_AGAIN) {
@@ -4585,6 +4612,18 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
     if (clcf->backend && ctx->l2_done && !ctx->l2_miss_counted) {
         ctx->l2_miss_counted = 1;
         (void) ngx_atomic_fetch_add(&z->sh->l2_misses, 1);
+
+        /* L13: remember this miss so the next cold request skips the GET.
+         *
+         * ⚠ Guarded on !l2_neg_skipped: re-stamping a miss we only "knew about"
+         * BECAUSE of a memo would slide the window forward on every request and
+         * keep L2 switched off indefinitely for a hot-but-absent key. Only a
+         * miss learned from a REAL round-trip may arm the memo, so the window
+         * is bounded at l2_negative_ttl from the last actual L2 answer. */
+        if (clcf->l2_negative_ttl > 0 && !ctx->l2_neg_skipped) {
+            clcf->l1->l2_neg_set(z, ctx->key_hash, hash,
+                                 clcf->l2_negative_ttl);
+        }
     }
 
     /* only-if-cached (RFC 9111 §5.2.1.7): L1 missed/expired and L2 (if any) did
@@ -4772,8 +4811,17 @@ ngx_http_cache_turbo_cold_wait(ngx_http_request_t *r,
     }
 
     /* Re-consult L2 on the next re-entry so a cross-node winner's write-through
-     * is picked up (per-box fills are caught by the L1 lookup itself). */
+     * is picked up (per-box fills are caught by the L1 lookup itself).
+     *
+     * L13: that cross-node pickup is the ONE thing the negative memo would
+     * wrongly suppress -- we are here precisely because we expect a peer to
+     * publish the key mid-wait, which is the memo's blind spot. So force a real
+     * L2 GET on every cold-wait re-poll (l2_neg_force) and clear the
+     * skipped-flag, rather than letting a memo armed moments ago short-circuit
+     * the wait into a guaranteed origin fetch. */
     ctx->l2_done = 0;
+    ctx->l2_neg_skipped = 0;
+    ctx->l2_neg_force = 1;
     ctx->l2_result = NGX_DECLINED;
     ctx->l2_blob = NULL;
     ctx->l2_blob_len = 0;
@@ -7015,6 +7063,53 @@ ngx_http_cache_turbo_min_uses(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 }
 
 
+/* cache_turbo_l2_negative_ttl N (L13). Seconds to remember an L2 miss so the
+ * next cold request for the same key skips the L2 round-trip.
+ *
+ * Range-checked like stale_mult/min_uses above, but with one deliberate
+ * difference: 0 is ACCEPTED here and means OFF (the default). For those two
+ * directives a literal 0 was a config lie -- merge coerced it back up to 1 --
+ * so it had to be rejected. Here 0 is the honest, and default, way to say "no
+ * memo", and merge_loc_conf leaves it at 0. A NEGATIVE still fails as
+ * NGX_ERROR out of ngx_atoi (no sign handling) and surfaces as "bad value". */
+static char *
+ngx_http_cache_turbo_l2_negative_ttl(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf)
+{
+    ngx_http_cache_turbo_loc_conf_t  *clcf = conf;
+
+    ngx_str_t  *value = cf->args->elts;
+    ngx_int_t   n;
+
+    if (clcf->l2_negative_ttl != NGX_CONF_UNSET) {
+        return "is duplicate";
+    }
+
+    n = ngx_atoi(value[1].data, value[1].len);
+    if (n == NGX_ERROR) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "cache_turbo_l2_negative_ttl: bad value \"%V\"", &value[1]);
+        return NGX_CONF_ERROR;
+    }
+
+    if (n != 0
+        && (n < NGX_HTTP_CACHE_TURBO_L2_NEG_TTL_MIN
+            || n > NGX_HTTP_CACHE_TURBO_L2_NEG_TTL_MAX))
+    {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "cache_turbo_l2_negative_ttl \"%V\" is out of range: expected 0 "
+            "(off) or %d..%d",
+            &value[1], NGX_HTTP_CACHE_TURBO_L2_NEG_TTL_MIN,
+            NGX_HTTP_CACHE_TURBO_L2_NEG_TTL_MAX);
+        return NGX_CONF_ERROR;
+    }
+
+    clcf->l2_negative_ttl = (time_t) n;
+
+    return NGX_CONF_OK;
+}
+
+
 /* "cache_turbo_preset micro|conservative|balanced|aggressive;" stores the enum
  * (and validates the name here, at config time). The enum only selects the band
  * of default knob values used in merge_loc_conf; an explicit knob directive
@@ -7870,12 +7965,16 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
         {
             ngx_str_t  zname = clcf->admin_zone->shm.name;
 
-            /* Ten counters (*_total) + three gauges, each labelled by zone so one
-             * Prometheus job can scrape many zones. Exposition format 0.0.4.
-             * The per-metric budget must track the emitted count (13): every
+            /* Eleven counters (*_total) + three gauges, each labelled by zone so
+             * one Prometheus job can scrape many zones. Exposition format 0.0.4.
+             * The per-metric budget must track the emitted count (14): every
              * metric line renders one %V (zone) + one %uA (value), so a short
-             * multiplier could truncate the last line under a long zone name. */
-            len = 2800 + 13 * zname.len + 13 * NGX_ATOMIC_T_LEN;
+             * multiplier could truncate the last line under a long zone name.
+             * The fixed term covers the HELP/TYPE prose, which grows with every
+             * metric added -- bump BOTH when adding one (L13 added the 14th and
+             * needed ~180 bytes of prose; a stale 13 truncated the JSON arm's
+             * neighbour into invalid output). */
+            len = 3100 + 14 * zname.len + 14 * NGX_ATOMIC_T_LEN;
             p = ngx_pnalloc(r->pool, len);
             if (p == NULL) {
                 return NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -7909,6 +8008,9 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
                 "# HELP cache_turbo_min_uses_skips_total Cold misses sent to origin without storing because the key is below cache_turbo_min_uses (v15).\n"
                 "# TYPE cache_turbo_min_uses_skips_total counter\n"
                 "cache_turbo_min_uses_skips_total{zone=\"%V\"} %uA\n"
+                "# HELP cache_turbo_l2_neg_skips_total L2 GETs skipped because a negative memo already recorded a miss for the key (L13).\n"
+                "# TYPE cache_turbo_l2_neg_skips_total counter\n"
+                "cache_turbo_l2_neg_skips_total{zone=\"%V\"} %uA\n"
                 "# HELP cache_turbo_bypasses_total Requests skipped straight to origin by a cache_turbo_bypass predicate or a CMS backend preset (subset of misses).\n"
                 "# TYPE cache_turbo_bypasses_total counter\n"
                 "cache_turbo_bypasses_total{zone=\"%V\"} %uA\n"
@@ -7924,7 +8026,8 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
                 &zname, st.hits, &zname, st.misses, &zname, st.stale_serves,
                 &zname, st.refreshes, &zname, st.evictions,
                 &zname, st.l2_hits, &zname, st.l2_misses, &zname, st.lock_waits,
-                &zname, st.min_uses_skips, &zname, st.bypasses,
+                &zname, st.min_uses_skips, &zname, st.l2_neg_skips,
+                &zname, st.bypasses,
                 &zname, st.cost_ms, &zname, st.autotuned_beta,
                 &zname, st.autotuned_load) - p;
 
@@ -7935,9 +8038,10 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
 
         len = sizeof("{\"hits\":,\"misses\":,\"stale_serves\":,\"refreshes\":,"
                      "\"evictions\":,\"l2_hits\":,\"l2_misses\":,\"lock_waits\":,"
-                     "\"min_uses_skips\":,\"bypasses\":,\"cost_ms\":,"
+                     "\"min_uses_skips\":,\"l2_neg_skips\":,\"bypasses\":,"
+                     "\"cost_ms\":,"
                      "\"autotuned_beta\":,\"autotuned_load\":}\n")
-              + 13 * NGX_ATOMIC_T_LEN;
+              + 14 * NGX_ATOMIC_T_LEN;
         p = ngx_pnalloc(r->pool, len);
         if (p == NULL) {
             return NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -7947,11 +8051,13 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
             "{\"hits\":%uA,\"misses\":%uA,\"stale_serves\":%uA,"
             "\"refreshes\":%uA,\"evictions\":%uA,\"l2_hits\":%uA,"
             "\"l2_misses\":%uA,\"lock_waits\":%uA,\"min_uses_skips\":%uA,"
+            "\"l2_neg_skips\":%uA,"
             "\"bypasses\":%uA,\"cost_ms\":%uA,\"autotuned_beta\":%uA,"
             "\"autotuned_load\":%uA}\n",
             st.hits, st.misses, st.stale_serves,
             st.refreshes, st.evictions, st.l2_hits, st.l2_misses,
-            st.lock_waits, st.min_uses_skips, st.bypasses, st.cost_ms,
+            st.lock_waits, st.min_uses_skips, st.l2_neg_skips,
+            st.bypasses, st.cost_ms,
             st.autotuned_beta, st.autotuned_load) - p;
     }
     return ngx_http_cache_turbo_send_json(r, NGX_HTTP_OK, &body);
@@ -9255,6 +9361,7 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->lock_timeout = NGX_CONF_UNSET_MSEC;
     conf->min_uses_raw = NGX_CONF_UNSET;
     conf->min_uses = NGX_CONF_UNSET;
+    conf->l2_negative_ttl = NGX_CONF_UNSET;   /* L13; merges to 0 = off */
     conf->max_size = NGX_CONF_UNSET_SIZE;
     conf->suppress_native = NGX_CONF_UNSET;
     conf->redis_enable = NGX_CONF_UNSET;
@@ -9360,6 +9467,12 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
         conf->min_uses = (conf->min_uses_raw == NGX_CONF_UNSET)
                           ? band->min_uses : conf->min_uses_raw;
     }
+
+    /* L2 negative memo (L13). Deliberately NOT a preset band column: the memo
+     * trades L2 coherence for a saved round-trip, and that must be opted into
+     * per location rather than inherited from a preset name. Defaults to 0
+     * (off) at every preset, so this is inert unless explicitly configured. */
+    ngx_conf_merge_sec_value(conf->l2_negative_ttl, prev->l2_negative_ttl, 0);
 
     /* Per-status TTLs (v6): inherit the rule list if this level set none. */
     if (conf->valid_status == NULL) {

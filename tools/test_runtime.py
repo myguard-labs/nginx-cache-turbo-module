@@ -601,6 +601,43 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # L2 negative memo (L13). Same shape as /l2/ above (no keepalive, so
+        # every L2 op is exactly one countable Redis connection) plus a 3s memo,
+        # so a repeated cold miss on the same key skips the L2 GET entirely. The
+        # window is deliberately longer than the test's request burst and
+        # shorter than the suite, so expiry is observable within one test.
+        #
+        # min_uses 4 is load-bearing for the TEST, not for the feature: without
+        # it request 1 stores the (cacheable) origin response and request 2 is a
+        # plain L1 HIT that never reaches the L2 consult at all -- so the test
+        # would "pass" by measuring zero Redis traffic for the wrong reason.
+        # Keeping the key below the store threshold holds every request on the
+        # cold-miss path, which is the only path the memo is on.
+        location /l2neg/ {{
+            cache_turbo                  main;
+            cache_turbo_key              $uri;
+            cache_turbo_valid            30s;
+            cache_turbo_min_uses         4;
+            cache_turbo_l2_negative_ttl  3;
+            cache_turbo_redis            127.0.0.1:{redis_port} prefix=ct: timeout=250ms;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # L2 negative memo, min_uses interaction: the memo rides on the SAME
+        # counter node min_uses uses, so this location exercises both writing to
+        # one node. min_uses 3 exceeds the test's request count, so every request
+        # stays below the threshold and each one both counts a min_uses skip and
+        # consults the memo -- the overlapping state that would hide a clobber.
+        location /l2negmu/ {{
+            cache_turbo                  main;
+            cache_turbo_key              $uri;
+            cache_turbo_valid            30s;
+            cache_turbo_min_uses         3;
+            cache_turbo_l2_negative_ttl  3;
+            cache_turbo_redis            127.0.0.1:{redis_port} prefix=ct: timeout=250ms;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # L2 keepalive pool (v15): idle Redis connections cached per worker and
         # reused across ops, instead of connect()+close per op. As of the
         # per-fingerprint pool (v16), each distinct connection profile gets its
@@ -7199,6 +7236,200 @@ def test_min_uses_rejects_out_of_range(ng: Nginx) -> None:
             f"cache_turbo_min_uses {good} (a legal boundary) was rejected:\n{r.stdout}"
 
 
+def _admin_l2_neg_skips(ng: Nginx) -> int:
+    """L13: count of L2 GETs skipped by a live negative memo (admin stats)."""
+    import json
+    _, b, _ = fetch(ng.port, "/_cache")
+    return int(json.loads(b).get("l2_neg_skips", 0))
+
+
+def test_l2_negative_ttl_skips_repeat_get(ng: Nginx, origin: Origin,
+                                          redis: RedisServer) -> None:
+    """L13: after an L2 GET misses, a memo makes the next cold request for the
+    same key skip the round-trip entirely.
+
+    This measures the thing that actually changed -- the number of Redis
+    connections the module opens -- NOT merely that the response is still
+    correct. A test asserting only status/body would pass with or without the
+    memo (the L9 lesson: a perf change needs a test that observes the op count).
+
+    /l2neg/ has no keepalive, so each L2 op is exactly one accepted connection,
+    and its min_uses 4 keeps the key below the store threshold -- so both
+    requests stay on the cold-miss path that consults L2, rather than the second
+    becoming an L1 HIT that trivially avoids Redis for the wrong reason."""
+    uri = f"/l2neg/nomemo-{time.time()}"
+
+    # Request 1 primes the memo: a real L2 GET that misses. Measure it alone --
+    # redis.cli() shells out and opens its OWN connection, so any bookkeeping
+    # between two readings would be counted as module traffic.
+    before = _redis_conns_received(redis)
+    s1, _, _ = fetch(ng.port, uri)
+    assert s1 == 200, f"req1 status {s1}"
+    time.sleep(0.4)                       # let the write-through SET settle
+    first = _redis_conns_received(redis) - before
+    assert first >= 1, \
+        f"req1 must actually consult L2 (Redis conns delta {first} < 1)"
+
+    # Request 2 is inside the 3s window: the memo must suppress the GET. A
+    # write-through SET may still occur, so assert strictly fewer ops, not zero.
+    skips0 = _admin_l2_neg_skips(ng)
+    before = _redis_conns_received(redis)
+    s2, _, _ = fetch(ng.port, uri)
+    assert s2 == 200, f"req2 status {s2}"
+    time.sleep(0.4)
+    second = _redis_conns_received(redis) - before
+
+    assert second < first, \
+        (f"req2 opened {second} Redis connections vs req1's {first} -- the "
+         "negative memo did not suppress the repeat L2 GET")
+    assert _admin_l2_neg_skips(ng) - skips0 >= 1, \
+        ("l2_neg_skips did not rise: the request avoided Redis for some other "
+         "reason than the memo, so this test is not measuring the memo")
+
+
+def test_l2_negative_ttl_expires(ng: Nginx, origin: Origin,
+                                 redis: RedisServer) -> None:
+    """L13: the memo is a BOUNDED-staleness window, not a permanent off-switch.
+
+    The whole coherence story for this feature is "the memo expires", so the
+    expiry is the load-bearing assertion: once cache_turbo_l2_negative_ttl
+    seconds pass, the next request must consult L2 for real again and pick up
+    anything a peer stored meanwhile. Without expiry (or with the window sliding
+    forward on every memoed request) L2 would stay switched off for a hot-but-
+    absent key forever -- the exact failure the re-arm guard prevents."""
+    uri = f"/l2neg/expiry-{time.time()}"
+
+    fetch(ng.port, uri)                   # arm the memo with a real GET
+    time.sleep(0.4)
+
+    skips0 = _admin_l2_neg_skips(ng)
+    fetch(ng.port, uri)                   # inside the window: skipped
+    assert _admin_l2_neg_skips(ng) - skips0 >= 1, \
+        "the second request should have been memo-skipped (window is 3s)"
+
+    # Keep requesting ACROSS the whole window. Each of these is memo-skipped, and
+    # each is therefore a chance for a buggy build to re-stamp l2_neg_until from
+    # a miss it only "knew about" because of the memo -- which would slide the
+    # window forward indefinitely and never let the expiry below happen. A single
+    # mid-window request cannot detect that: the window would slide by only the
+    # sleep length and the final wait would still clear it.
+    # Hammer the key for LONGER than the 3s window, faster than the window, so
+    # every request lands while the memo is still live. In a correct build the
+    # memo is armed once and expires 3s after that first REAL miss -- mid-burst
+    # -- so the tail of this loop is already consulting L2 again. In a build
+    # that re-arms from memoed misses, l2_neg_until is pushed forward by every
+    # request and the memo never dies while traffic continues.
+    #
+    # The detection therefore has to happen DURING the burst, not after it:
+    # once requests stop, even a slid window lapses within one TTL, so any
+    # "sleep then check" ending would pass on both builds.
+    t_end = time.time() + 5.0
+    while time.time() < t_end:
+        fetch(ng.port, uri)
+        time.sleep(0.2)
+
+    # NOTE (L13, known gap): there is deliberately NO assertion that the memo is
+    # dead DURING this burst. A negative control with the re-arm guard removed
+    # still passes such an assertion today, because the memo does not currently
+    # survive long enough for re-arming to matter -- a node-destroying path on
+    # the cold-miss route drops the counter node within about one request, so
+    # the window is re-armed from a REAL miss each time either way. Asserting
+    # here would therefore pass for a reason unrelated to what it claims to
+    # measure. The re-arm guard in the module is still correct and still
+    # required once memo lifetime is fixed; see issues.md.
+    time.sleep(3.5)
+    skips1 = _admin_l2_neg_skips(ng)
+    before = _redis_conns_received(redis)
+    s, _, _ = fetch(ng.port, uri)
+    assert s == 200, f"post-expiry status {s}"
+    time.sleep(0.4)
+    after = _redis_conns_received(redis) - before
+
+    assert after >= 1, \
+        (f"after the memo expired the request opened {after} Redis connections "
+         "-- the memo is not expiring, so L2 is effectively disabled for this key")
+    assert _admin_l2_neg_skips(ng) - skips1 == 0, \
+        "an expired memo must not count as a skip"
+
+
+def test_l2_negative_ttl_with_min_uses(ng: Nginx, origin: Origin,
+                                       redis: RedisServer) -> None:
+    """L13: the memo and min_uses share ONE counter node, so they must not
+    clobber each other.
+
+    /l2negmu/ sets min_uses 3 plus a 3s memo. Both requests below stay BELOW the
+    threshold, so each one both counts a min_uses skip and (after the first)
+    consults the memo -- the two features writing to the same node on the same
+    request, which is the state that would break if l2_neg_set overwrote
+    miss_count or count_miss reset l2_neg_until.
+
+    The threshold must exceed the request count: with min_uses 2 the second
+    request PASSES the gate and stores, so it legitimately records no skip and
+    the interaction never gets exercised."""
+    uri = f"/l2negmu/shared-node-{time.time()}"
+
+    fetch(ng.port, uri)                   # miss 1: arms memo, counts 1
+    time.sleep(0.4)
+
+    skips0 = _admin_l2_neg_skips(ng)
+    mu0 = _admin_min_uses_skips(ng)
+
+    s, _, h = fetch(ng.port, uri)         # miss 2 within the window
+    assert s == 200, f"req2 status {s}"
+
+    assert _admin_l2_neg_skips(ng) - skips0 >= 1, \
+        "the memo stopped working once min_uses shared the node"
+    assert _admin_min_uses_skips(ng) - mu0 >= 1, \
+        "min_uses stopped counting once the memo shared the node"
+
+
+def test_l2_negative_ttl_rejects_out_of_range(ng: Nginx) -> None:
+    """L13: cache_turbo_l2_negative_ttl is range-checked at config time.
+
+    Unlike min_uses/stale_mult, `0` is LEGAL here and means off (it is the
+    default, and merge does not coerce it), so 0 is pinned as accepted -- if a
+    later edit copies the min_uses setter wholesale it would start rejecting the
+    documented way to disable the feature, and this test catches that. 61 is
+    rejected because the memo has no invalidation channel: the cap is what keeps
+    a typo from disabling L2 for a long window."""
+    anchor = "cache_turbo_l2_negative_ttl  3;"
+    assert anchor in nginx_config(
+        ng.root, ng.port, ng.module, ng.origin_port, 1, ng.redis_port,
+        ng.redis_auth_port, ng.redis_password, ng.redis_tls_port,
+        ng.redis_tls_ca, ng.memcached_port), \
+        f"test fixture missing anchor {anchor!r}"
+
+    # in-range-check arm: parses as a number, refused by the bounds
+    for bad in ("61", "3600"):
+        r = _config_test_result(
+            ng, lambda c, b=bad: c.replace(
+                anchor, f"cache_turbo_l2_negative_ttl {b};", 1))
+        assert r.returncode != 0, \
+            f"cache_turbo_l2_negative_ttl {bad} was accepted by nginx -t:\n{r.stdout}"
+        assert "out of range" in r.stdout, \
+            f"missing/odd range diagnostic for {bad}:\n{r.stdout}"
+
+    # parse arm: ngx_atoi has no sign handling, so a negative surfaces as a
+    # "bad value" rather than reaching the bounds check. Pinned separately so a
+    # later editor cannot collapse the two diagnostics into one.
+    for bad in ("-1", "abc"):
+        r = _config_test_result(
+            ng, lambda c, b=bad: c.replace(
+                anchor, f"cache_turbo_l2_negative_ttl {b};", 1))
+        assert r.returncode != 0, \
+            f"cache_turbo_l2_negative_ttl {bad} was accepted by nginx -t:\n{r.stdout}"
+        assert "bad value" in r.stdout, \
+            f"missing/odd bad-value diagnostic for {bad}:\n{r.stdout}"
+
+    # 0 (off, the default) and both real boundaries stay legal
+    for good in ("0", "1", "60"):
+        r = _config_test_result(
+            ng, lambda c, g=good: c.replace(
+                anchor, f"cache_turbo_l2_negative_ttl {g};", 1))
+        assert r.returncode == 0, \
+            (f"cache_turbo_l2_negative_ttl {good} (legal) was rejected:\n{r.stdout}")
+
+
 def test_lru_eviction(ng: Nginx) -> None:
     """R6: with a tiny zone, old entries are evicted, not 500s."""
     # hammer many distinct keys through the tiny zone; must all 200, no errors
@@ -9624,6 +9855,12 @@ def run_all(ng: Nginx, origin: Origin,
     test_autotune_churn_disqualifies(ng, origin)
     if redis is not None:
         test_l2_write_through(ng, origin, redis)
+        test_l2_negative_ttl_skips_repeat_get(ng, origin, redis)   # L13
+        test_l2_negative_ttl_expires(ng, origin, redis)            # L13
+        test_l2_negative_ttl_with_min_uses(ng, origin, redis)      # L13
+        # config-reject arm: no redis fixture needed, but its config anchor only
+        # exists when the redis locations are emitted, so it lives in here too
+        test_l2_negative_ttl_rejects_out_of_range(ng)              # L13
         test_l2_keepalive_reuse(ng, origin, redis)
         test_l2_keepalive_db_isolation(ng, origin, redis)
         test_l2_cross_instance_fill(ng, origin, redis)
@@ -9837,7 +10074,10 @@ def main() -> int:
           "redis DSN bad db, redis db out-of-range cap both arms), "
           "autotune (v4-3: raises beta within band/off-by-default/"
           "insufficient-data/churn-disqualify)"
-          + (", L2 write-through (P4), keepalive pool reuse (v15), "
+          + (", L2 write-through (P4), "
+             "L2 negative memo (L13: skips the repeat GET, expires, "
+             "coexists with min_uses, range-checked incl. 0=off), "
+             "keepalive pool reuse (v15), "
              "malformed L2 blob rejected pre-L1 (STAB-4), "
              "L2 cross-instance fill (P2), "
              "L2-aware key purge (P6), expired-L1 consults L2 (P6), "
