@@ -91,11 +91,21 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     op.rlen = size;
 
     rc = ngx_http_cache_turbo_mc_parse(&op, &blob, &blob_len);
-    if (rc != NGX_OK && rc != NGX_AGAIN && rc != NGX_DECLINED) {
+    /* L13-fix: tri-state on failure, mirroring the RESP parser. NGX_DECLINED is
+     * a bare "END" line (a DEFINITIVE miss, the only outcome allowed to arm the
+     * L13 negative memo); NGX_ERROR is an ERROR/CLIENT_ERROR/SERVER_ERROR reply,
+     * a malformed header line, or an unparseable field. Both are legal. */
+    if (rc != NGX_OK && rc != NGX_AGAIN && rc != NGX_DECLINED
+        && rc != NGX_ERROR)
+    {
         __builtin_trap();                  /* undocumented return */
     }
     if (rc == NGX_OK) {
         check_in_bounds(blob, blob_len, buf, size);
+    }
+    /* A failure return must never hand back a blob. */
+    if (rc != NGX_OK && (blob != NULL || blob_len != 0)) {
+        __builtin_trap();
     }
 
     free(buf);
