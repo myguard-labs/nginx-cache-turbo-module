@@ -436,8 +436,9 @@ location ~ ^/forums/.*\.php$ {
 
 With the mount declared, `/forums/login` is rebased to `/login` for the URI
 comparison and every preset prefix matches again. Without it the board gets
-**zero** URI-rule coverage — the admin CP included — so the directive is not
-optional for a subdirectory install.
+**zero** URI-rule coverage — the admin CP included. So on a subdirectory install
+the directive is required for *automatic* preset URI rebasing; the only supported
+way to skip it is to replace that coverage by hand, as below.
 
 If you would rather not declare the mount, the alternative is to spell the
 mounted paths out yourself:
