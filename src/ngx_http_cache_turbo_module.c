@@ -7053,6 +7053,13 @@ ngx_http_cache_turbo_redis_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                         "cache_turbo_redis: bad db in DSN \"%V\"", &arg1);
                     return NGX_CONF_ERROR;
                 }
+                if (clcf->redis_db > NGX_HTTP_CACHE_TURBO_REDIS_DB_MAX) {
+                    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                        "cache_turbo_redis: db in DSN \"%V\" exceeds the "
+                        "maximum %d", &arg1,
+                        NGX_HTTP_CACHE_TURBO_REDIS_DB_MAX);
+                    return NGX_CONF_ERROR;
+                }
             }
             hostport.data = rest;
             hostport.len = slash - rest;
@@ -7149,6 +7156,13 @@ ngx_http_cache_turbo_redis_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             if (clcf->redis_db == NGX_ERROR || clcf->redis_db < 0) {
                 ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                                    "cache_turbo_redis: bad db \"%V\"", &value[i]);
+                return NGX_CONF_ERROR;
+            }
+            if (clcf->redis_db > NGX_HTTP_CACHE_TURBO_REDIS_DB_MAX) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "cache_turbo_redis: db \"%V\" exceeds the "
+                                   "maximum %d", &value[i],
+                                   NGX_HTTP_CACHE_TURBO_REDIS_DB_MAX);
                 return NGX_CONF_ERROR;
             }
 

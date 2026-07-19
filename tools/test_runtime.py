@@ -5256,6 +5256,53 @@ def test_redis_bad_db_rejected(ng: Nginx) -> None:
         f"missing/odd bad-DSN-db diagnostic:\n{r.stdout}"
 
 
+def test_redis_db_cap_rejected(ng: Nginx) -> None:
+    """A syntactically valid but out-of-range db index is rejected at config
+    time, both as the `db=N` param and as the `/N` DSN suffix.
+
+    Distinct from test_redis_bad_db_rejected: that one refuses a value that is
+    not a number at all; this one refuses a well-formed number that no Redis
+    will accept. Redis ships `databases 16` (indices 0..15), so `db=99` used to
+    pass `nginx -t` clean and then fail every L2 op at runtime on SELECT --
+    silent until traffic. Both arms are pinned because they are separate parser
+    paths with separate diagnostics."""
+    if ng.redis_port is None:
+        return
+
+    param_anchor = f"127.0.0.1:{ng.redis_port} db=1"
+    assert param_anchor in nginx_config(
+        ng.root, ng.port, ng.module, ng.origin_port, 1, ng.redis_port,
+        ng.redis_auth_port, ng.redis_password, ng.redis_tls_port,
+        ng.redis_tls_ca, ng.memcached_port), \
+        f"test fixture missing anchor {param_anchor!r}"
+
+    # arm 1: db= trailing param
+    r = _config_test_result(
+        ng, lambda c: c.replace(param_anchor,
+                                f"127.0.0.1:{ng.redis_port} db=99", 1))
+    assert r.returncode != 0, \
+        f"out-of-range db= param was accepted by nginx -t:\n{r.stdout}"
+    assert "exceeds the maximum" in r.stdout, \
+        f"missing/odd db-cap diagnostic:\n{r.stdout}"
+
+    # arm 2: /N DSN suffix -- distinct code path, distinct message
+    r = _config_test_result(
+        ng, lambda c: c.replace(param_anchor,
+                                f"redis://127.0.0.1:{ng.redis_port}/99", 1))
+    assert r.returncode != 0, \
+        f"out-of-range DSN db was accepted by nginx -t:\n{r.stdout}"
+    assert "db in DSN" in r.stdout and "exceeds the maximum" in r.stdout, \
+        f"missing/odd DSN-db-cap diagnostic:\n{r.stdout}"
+
+    # the boundary itself must still be accepted -- a cap that rejects the
+    # highest legal index would be an off-by-one that no bad-value test catches
+    r = _config_test_result(
+        ng, lambda c: c.replace(param_anchor,
+                                f"127.0.0.1:{ng.redis_port} db=15", 1))
+    assert r.returncode == 0, \
+        f"db=15 (the highest legal index) was rejected:\n{r.stdout}"
+
+
 def test_max_size_not_cached(ng: Nginx) -> None:
     """Responses larger than cache_turbo_max_size are never cached (Q2: the
     body filter early-aborts capture the moment body_len crosses max_size, so
@@ -9003,6 +9050,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_require_header_rejects_invalid_name(ng)
     test_require_header_duplicate_rejected(ng)
     test_redis_bad_db_rejected(ng)
+    test_redis_db_cap_rejected(ng)
     test_no_cache_set_cookie(ng)
     test_no_cache_cc_private(ng)
     test_no_cache_cc_nostore(ng)
@@ -9321,7 +9369,7 @@ def main() -> int:
           "warn, COR-0 tag-without-L2 warn), "
           "config-time rejects (cache_control bad-mode/duplicate, valid "
           "out-of-range code/bad time, require_header non-token/duplicate, "
-          "redis DSN bad db), "
+          "redis DSN bad db, redis db out-of-range cap both arms), "
           "autotune (v4-3: raises beta within band/off-by-default/"
           "insufficient-data/churn-disqualify)"
           + (", L2 write-through (P4), keepalive pool reuse (v15), "

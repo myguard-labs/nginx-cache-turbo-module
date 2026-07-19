@@ -51,6 +51,14 @@
  * idle L2 conns/worker is already absurd; reject anything larger at parse. */
 #define NGX_HTTP_CACHE_TURBO_KEEPALIVE_MAX  65535
 
+/* Upper bound on the cache_turbo_redis database index, accepted both as the
+ * `db=N` param and as the `/N` DSN suffix. Redis ships `databases 16`, i.e.
+ * indices 0..15; a larger value passes parse but makes every L2 op fail at
+ * runtime on SELECT, silently, until traffic arrives. Not a memory-safety
+ * issue (the %i format target is NGX_INT_T_LEN and the value is a validated
+ * non-negative ngx_int_t) -- purely a fail-at-runtime config trap. */
+#define NGX_HTTP_CACHE_TURBO_REDIS_DB_MAX   15
+
 /* PERF-2: bounds on the upstream-controlled cache_turbo_tag value, so one
  * response cannot fan out into an unbounded number of SADD connections. At most
  * MAX_TAGS distinct tags are indexed per store; a token longer than MAX_TAG_LEN
