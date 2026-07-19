@@ -969,6 +969,44 @@ location ~ \.php$ {
   (stale-if-error). Turn it off only if you need every served body strictly ≤1s
   old at the cost of one client per second waiting on the backend.
 
+## Long-tail URLs: reach for `cache_turbo_min_uses` first
+
+If the cache is large but the hit rate is poor, the usual cause is not the TTL —
+it is **one-hit-wonder URLs**. Crawlers, tracking-parameter permutations, search
+queries and deep pagination each produce a key that is requested once and never
+again. Every one of them is stored, and each store evicts something that *was*
+being reused. Raising `cache_turbo_valid` does not help: the problem is what gets
+admitted, not how long it stays.
+
+```nginx
+cache_turbo_min_uses 2;   # store on the SECOND miss, not the first
+```
+
+A key is only stored once it has cold-missed `N` times, so a URL nobody asks for
+twice never occupies the cache at all. The counter is a lightweight node (no
+body), so the tail costs a slot but not memory. `2` is almost always the right
+value — it removes the entire never-repeated class, and higher values mostly
+delay caching for genuinely popular pages.
+
+Watch `cache_turbo_min_uses_skips_total`. It counts requests that went to the
+origin *because* they were below the threshold: a large and growing number is the
+long tail being kept out, which is the knob working — compare it against the hit
+rate rather than reading it as a problem on its own.
+
+Two interactions worth knowing:
+
+- **L2 wins over the gate.** A key already in Redis/memcached is served from L2
+  regardless of the local miss count — it is already proven popular, and a second
+  node should not have to re-learn that.
+- **It bounds attacker-chosen key cardinality.** When a visitor can steer the key
+  (a search term, a cookie value folded with `cache_turbo_key_cookie`), no cap on
+  the *value* bounds how many distinct keys they can mint. `min_uses` does, because
+  a key minted once is never stored.
+
+Use it with `cache_turbo_lock on`, not instead of it: `min_uses` decides what is
+worth storing, single-flight decides how many requests reach the origin while a
+key is being filled.
+
 ## What autotune actually tunes
 
 `cache_turbo_autotune on` makes the cache **load-adaptive**: every 30s it
