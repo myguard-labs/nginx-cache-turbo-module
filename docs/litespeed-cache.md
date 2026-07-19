@@ -265,6 +265,14 @@ LiteSpeed/`ngx_lscache` box with two competing HTML caches.
 
 ## Gotchas
 
+> **Subdirectory installs.** This preset's URI rules are root-relative literals
+> matched from byte 0 of `r->uri`, so an install mounted under a subdirectory
+> (`/shop/`, `/forum/`, …) matches **none** of them — the admin surface
+> included. Declare the mount with `cache_turbo_backend_prefix /forum/;` and the
+> preset URI tier is compared against the rebased path. Scoping the nginx
+> `location` does **not** substitute: it routes requests, it does not rewrite
+> `r->uri`. See [frameworks.md](frameworks.md).
+
 - **Don't chase "why is LSCache showing 0% hit rate."** It's supposed to be
   0% — the engine isn't there. That's cache-turbo's job on this stack, and
   its own stats (`GET /_cache`) are the ones that matter.

@@ -218,6 +218,14 @@ purge-and-revisit cycle. If it is, its "Cache System" toggle is still on.
 
 ## Gotchas
 
+> **Subdirectory installs.** This preset's URI rules are root-relative literals
+> matched from byte 0 of `r->uri`, so an install mounted under a subdirectory
+> (`/shop/`, `/forum/`, …) matches **none** of them — the admin surface
+> included. Declare the mount with `cache_turbo_backend_prefix /forum/;` and the
+> preset URI tier is compared against the rebased path. Scoping the nginx
+> `location` does **not** substitute: it routes requests, it does not rewrite
+> `r->uri`. See [frameworks.md](frameworks.md).
+
 - **Leaving "Cache System" on stacks both caches for no benefit.** WP Fastest
   Cache's output-buffer cache hook runs *inside* the PHP request path (there is
   no `advanced-cache.php` drop-in in the free plugin) — a cache-turbo HIT never

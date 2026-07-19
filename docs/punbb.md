@@ -132,6 +132,14 @@ curl -sI https://forum.example.com/misc.php?action=markread | grep -i x-cache-tu
 
 ## Gotchas
 
+> **Subdirectory installs.** This preset's URI rules are root-relative literals
+> matched from byte 0 of `r->uri`, so an install mounted under a subdirectory
+> (`/shop/`, `/forum/`, …) matches **none** of them — the admin surface
+> included. Declare the mount with `cache_turbo_backend_prefix /forum/;` and the
+> preset URI tier is compared against the rebased path. Scoping the nginx
+> `location` does **not** substitute: it routes requests, it does not rewrite
+> `r->uri`. See [frameworks.md](frameworks.md).
+
 - **Presence-only, not the ideal value predicate.** See above — accept the
   hit-rate cost, or run PunBB behind an app that can decode the cookie
   upstream and set a simpler signal cache-turbo can key on instead.

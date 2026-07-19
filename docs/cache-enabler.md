@@ -187,6 +187,14 @@ with the cache — see [WebP conversion](#webp-conversion--coupled-to-the-page-c
 
 ## Gotchas
 
+> **Subdirectory installs.** This preset's URI rules are root-relative literals
+> matched from byte 0 of `r->uri`, so an install mounted under a subdirectory
+> (`/shop/`, `/forum/`, …) matches **none** of them — the admin surface
+> included. Declare the mount with `cache_turbo_backend_prefix /forum/;` and the
+> preset URI tier is compared against the rebased path. Scoping the nginx
+> `location` does **not** substitute: it routes requests, it does not rewrite
+> `r->uri`. See [frameworks.md](frameworks.md).
+
 - **Double-cache trap.** If Cache Enabler's own page cache is still on
   *and* cache-turbo is in front of it, a purge on one layer doesn't touch
   the other — a stale page can serve from whichever layer didn't get

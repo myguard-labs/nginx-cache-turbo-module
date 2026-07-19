@@ -36,6 +36,14 @@ That's it for a correct, safe config — the vary cookie is handled natively, no
 | Query args | — |
 | Key cookies (value folded into cache key) | `sw-cache-hash` |
 
+> **Subdirectory installs.** The URI prefixes above are root-relative literals
+> matched from byte 0 of `r->uri`, so an install mounted under a subdirectory
+> (`/shop/`, `/forum/`, …) matches **none** of them — the admin surface
+> included. Declare the mount with `cache_turbo_backend_prefix /shop/;` and the
+> preset URI tier is compared against the rebased path. Scoping the nginx
+> `location` does **not** substitute: it routes requests, it does not rewrite
+> `r->uri`. See [frameworks.md](frameworks.md).
+
 **Matched cookie: exact name `sw-cache-hash`.** It is a **segment fingerprint**,
 not an identity, and it is folded into the cache key, not used as a bypass.
 `CacheHeadersService::buildCacheHash()` (`CacheHeadersService.php:104`; line

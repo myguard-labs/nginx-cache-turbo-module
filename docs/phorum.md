@@ -116,6 +116,14 @@ curl -sI https://forum.example.com/admin.php | grep -i x-cache-turbo
 
 ## Gotchas
 
+> **Subdirectory installs.** This preset's URI rules are root-relative literals
+> matched from byte 0 of `r->uri`, so an install mounted under a subdirectory
+> (`/shop/`, `/forum/`, …) matches **none** of them — the admin surface
+> included. Declare the mount with `cache_turbo_backend_prefix /forum/;` and the
+> preset URI tier is compared against the rebased path. Scoping the nginx
+> `location` does **not** substitute: it routes requests, it does not rewrite
+> `r->uri`. See [frameworks.md](frameworks.md).
+
 - **`list_style` (threaded/flat/hybrid) is presentation, not identity** — fold
   it into the key (as the vhost above does) rather than bypassing on it.
 - **`phorum_tmp_cookie` is guest-issued** and must never be added to a bypass

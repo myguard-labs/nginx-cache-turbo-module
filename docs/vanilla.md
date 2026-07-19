@@ -175,6 +175,14 @@ curl -sI https://forum.example.com/dashboard/ | grep -i x-cache-turbo
 
 ## Gotchas
 
+> **Subdirectory installs.** This preset's URI rules are root-relative literals
+> matched from byte 0 of `r->uri`, so an install mounted under a subdirectory
+> (`/shop/`, `/forum/`, …) matches **none** of them — the admin surface
+> included. Declare the mount with `cache_turbo_backend_prefix /forum/;` and the
+> preset URI tier is compared against the rebased path. Scoping the nginx
+> `location` does **not** substitute: it routes requests, it does not rewrite
+> `r->uri`. See [frameworks.md](frameworks.md).
+
 - **No live upstream source backs this page.** `github.com/vanilla/vanilla`
   404s and the vendor KB article no longer renders; the only surviving basis is
   the Garden-era tree (last pushed ~2013). Confirm with a live anonymous

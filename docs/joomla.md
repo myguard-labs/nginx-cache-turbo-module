@@ -37,6 +37,14 @@ shared key; `cache_turbo_no_store` is the half that prevents storing.
 | Query args | — |
 | Cookie header substrings | `joomla_remember_me_` |
 
+> **Subdirectory installs.** The URI prefixes above are root-relative literals
+> matched from byte 0 of `r->uri`, so an install mounted under a subdirectory
+> (`/shop/`, `/forum/`, …) matches **none** of them — the admin surface
+> included. Declare the mount with `cache_turbo_backend_prefix /shop/;` and the
+> preset URI tier is compared against the rebased path. Scoping the nginx
+> `location` does **not** substitute: it routes requests, it does not rewrite
+> `r->uri`. See [frameworks.md](frameworks.md).
+
 ## The cookie rule is a PARTIAL guard. Read this before you rely on it.
 
 `joomla_remember_me_` is the one Joomla cookie that is both **matchable** and

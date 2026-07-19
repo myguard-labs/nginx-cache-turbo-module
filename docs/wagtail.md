@@ -34,6 +34,14 @@ cache_turbo_backend wagtail;     # implies cache_turbo_cache_control honor
 | URI prefixes | `/admin/`, `/django-admin/`, `/documents/` |
 | Query args | — |
 
+> **Subdirectory installs.** The URI prefixes above are root-relative literals
+> matched from byte 0 of `r->uri`, so an install mounted under a subdirectory
+> (`/shop/`, `/forum/`, …) matches **none** of them — the admin surface
+> included. Declare the mount with `cache_turbo_backend_prefix /shop/;` and the
+> preset URI tier is compared against the rebased path. Scoping the nginx
+> `location` does **not** substitute: it routes requests, it does not rewrite
+> `r->uri`. See [frameworks.md](frameworks.md).
+
 **`sessionid`, and deliberately not `csrftoken`.** Django's `SessionMiddleware`
 writes the session cookie only when the session is **non-empty AND modified**, so a
 logged-out reader of a public page is issued **no cookie at all** — that is the
