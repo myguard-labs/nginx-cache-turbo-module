@@ -1207,18 +1207,38 @@ ngx_http_cache_turbo_redis_tagkey(ngx_str_t *prefix, u_char *name,
 }
 
 
+/* L9: index N tags for one object in a SINGLE pipelined op.
+ *
+ * Each tag costs three commands (SADD + EXPIRE NX + EXPIRE GT, see the COR-8
+ * rationale below), and the store path can present up to MAX_TAGS of them. One
+ * op per tag meant up to 16 separate pools, connections and round trips fired
+ * by a single response; batching collapses that to one of each. The per-tag
+ * wire encoding is unchanged -- only the number of ops is.
+ *
+ * Fire-and-forget (read_drain, no request parked on the reply), so a batched
+ * failure degrades exactly as a single-tag failure did: the tag index misses
+ * this object and a later purge of that tag does not invalidate it. */
 void
-ngx_http_cache_turbo_redis_tag_add(ngx_http_cache_turbo_loc_conf_t *clcf,
-    u_char *key_hash, u_char *name, size_t name_len, time_t ttl)
+ngx_http_cache_turbo_redis_tag_add_many(ngx_http_cache_turbo_loc_conf_t *clcf,
+    u_char *key_hash, ngx_str_t *names, ngx_uint_t nnames, time_t ttl)
 {
     ngx_str_t                         argv[4];
     ngx_buf_t                        *sadd, *exp_nx, *exp_gt;
-    size_t                            n1, n2, n3;
+    size_t                            total = 0;
+    ngx_uint_t                        i, nqueued = 0;
     ngx_http_cache_turbo_redis_op_t  *op;
-    u_char                           *tagkey, *member, *ttlbuf;
+    u_char                           *member, *ttlbuf;
+    ngx_buf_t                        *cmds[NGX_HTTP_CACHE_TURBO_MAX_TAGS * 3];
 
-    if (!clcf->redis_enable || ttl <= 0 || name_len == 0) {
+    if (!clcf->redis_enable || ttl <= 0 || nnames == 0) {
         return;
+    }
+
+    /* Defensive: the caller's dedup array is MAX_TAGS-bound, and cmds[] above
+     * is sized off the same constant. Refuse rather than overrun if a future
+     * caller presents more. */
+    if (nnames > NGX_HTTP_CACHE_TURBO_MAX_TAGS) {
+        nnames = NGX_HTTP_CACHE_TURBO_MAX_TAGS;
     }
 
     op = ngx_http_cache_turbo_redis_op_create(clcf);
@@ -1226,25 +1246,45 @@ ngx_http_cache_turbo_redis_tag_add(ngx_http_cache_turbo_loc_conf_t *clcf,
         return;
     }
 
-    tagkey = ngx_pnalloc(op->pool,
-                         clcf->redis_prefix.len + sizeof("tag:") - 1 + name_len);
+    /* The object's L2 key and the TTL text are identical for every tag in the
+     * batch, so encode them once. */
     member = ngx_pnalloc(op->pool, clcf->redis_prefix.len + 64);
     ttlbuf = ngx_pnalloc(op->pool, NGX_INT64_LEN);
-    if (tagkey == NULL || member == NULL || ttlbuf == NULL) {
+    if (member == NULL || ttlbuf == NULL) {
         ngx_destroy_pool(op->pool);
         return;
     }
 
-    /* SADD <prefix>tag:<name> <object L2 key> */
-    argv[0].data = (u_char *) "SADD";
-    argv[0].len = sizeof("SADD") - 1;
-    argv[1].data = tagkey;
-    argv[1].len = ngx_http_cache_turbo_redis_tagkey(&clcf->redis_prefix, name,
-                                                    name_len, tagkey);
     argv[2].data = member;
     argv[2].len = ngx_http_cache_turbo_redis_key(&clcf->redis_prefix, key_hash,
                                                  member);
-    sadd = ngx_http_cache_turbo_redis_encode(op->pool, argv, 3);
+
+    for (i = 0; i < nnames; i++) {
+        u_char  *tagkey;
+        size_t   klen;
+
+        if (names[i].len == 0) {
+            continue;
+        }
+
+        tagkey = ngx_pnalloc(op->pool, clcf->redis_prefix.len
+                             + sizeof("tag:") - 1 + names[i].len);
+        if (tagkey == NULL) {
+            ngx_destroy_pool(op->pool);
+            return;
+        }
+
+        klen = ngx_http_cache_turbo_redis_tagkey(&clcf->redis_prefix,
+                                                 names[i].data, names[i].len,
+                                                 tagkey);
+
+        /* SADD <prefix>tag:<name> <object L2 key> */
+        argv[0].data = (u_char *) "SADD";
+        argv[0].len = sizeof("SADD") - 1;
+        argv[1].data = tagkey;
+        argv[1].len = klen;
+        /* argv[2] (member) encoded once above */
+        sadd = ngx_http_cache_turbo_redis_encode(op->pool, argv, 3);
 
     /* Bound the tag set's lifetime so dead members can't accumulate forever,
      * but NEVER below the longest-lived member's TTL (COR-8). A tag set holds
@@ -1262,43 +1302,80 @@ ngx_http_cache_turbo_redis_tag_add(ngx_http_cache_turbo_loc_conf_t *clcf,
      *        reduce) for a set that already carries an expiry.
      * Exactly one of the two takes effect on a set with an expiry; NX seeds a
      * set without one. Either way the set TTL only ever grows. */
-    argv[0].data = (u_char *) "EXPIRE";
-    argv[0].len = sizeof("EXPIRE") - 1;
-    /* argv[1] (tagkey) unchanged */
-    argv[2].data = ttlbuf;
-    argv[2].len = (size_t) (ngx_sprintf(ttlbuf, "%T", ttl) - ttlbuf);
-    argv[3].data = (u_char *) "NX";
-    argv[3].len = sizeof("NX") - 1;
-    exp_nx = ngx_http_cache_turbo_redis_encode(op->pool, argv, 4);
-    argv[3].data = (u_char *) "GT";
-    argv[3].len = sizeof("GT") - 1;
-    exp_gt = ngx_http_cache_turbo_redis_encode(op->pool, argv, 4);
+        argv[0].data = (u_char *) "EXPIRE";
+        argv[0].len = sizeof("EXPIRE") - 1;
+        /* argv[1] (tagkey) unchanged */
+        argv[2].data = ttlbuf;
+        argv[2].len = (size_t) (ngx_sprintf(ttlbuf, "%T", ttl) - ttlbuf);
+        argv[3].data = (u_char *) "NX";
+        argv[3].len = sizeof("NX") - 1;
+        exp_nx = ngx_http_cache_turbo_redis_encode(op->pool, argv, 4);
+        argv[3].data = (u_char *) "GT";
+        argv[3].len = sizeof("GT") - 1;
+        exp_gt = ngx_http_cache_turbo_redis_encode(op->pool, argv, 4);
 
-    if (sadd == NULL || exp_nx == NULL || exp_gt == NULL) {
+        if (sadd == NULL || exp_nx == NULL || exp_gt == NULL) {
+            ngx_destroy_pool(op->pool);
+            return;
+        }
+
+        /* argv[2] is reused as the TTL text by the EXPIREs above, so restore
+         * the member for the next tag's SADD. */
+        argv[2].data = member;
+        argv[2].len = ngx_http_cache_turbo_redis_key(&clcf->redis_prefix,
+                                                     key_hash, member);
+
+        cmds[nqueued++] = sadd;
+        cmds[nqueued++] = exp_nx;
+        cmds[nqueued++] = exp_gt;
+        total += (size_t) (sadd->last - sadd->pos)
+                 + (size_t) (exp_nx->last - exp_nx->pos)
+                 + (size_t) (exp_gt->last - exp_gt->pos);
+    }
+
+    if (nqueued == 0) {                    /* every name was empty */
         ngx_destroy_pool(op->pool);
         return;
     }
 
-    /* Pipeline all three commands into one buffer (one round trip). */
-    n1 = sadd->last - sadd->pos;
-    n2 = exp_nx->last - exp_nx->pos;
-    n3 = exp_gt->last - exp_gt->pos;
-    op->send = ngx_create_temp_buf(op->pool, n1 + n2 + n3);
+    /* Pipeline every queued command into one buffer (one round trip). */
+    op->send = ngx_create_temp_buf(op->pool, total);
     if (op->send == NULL) {
         ngx_destroy_pool(op->pool);
         return;
     }
-    op->send->last = ngx_cpymem(op->send->last, sadd->pos, n1);
-    op->send->last = ngx_cpymem(op->send->last, exp_nx->pos, n2);
-    op->send->last = ngx_cpymem(op->send->last, exp_gt->pos, n3);
+    for (i = 0; i < nqueued; i++) {
+        size_t  n = (size_t) (cmds[i]->last - cmds[i]->pos);
+        op->send->last = ngx_cpymem(op->send->last, cmds[i]->pos, n);
+    }
 
-    op->expected_replies = 3;              /* SADD + EXPIRE NX + EXPIRE GT */
+    /* 3 replies per tag: SADD + EXPIRE NX + EXPIRE GT */
+    op->expected_replies = (ngx_uint_t) nqueued;
 
     if (ngx_http_cache_turbo_redis_launch(op, clcf,
             ngx_http_cache_turbo_redis_read_drain) != NGX_OK)
     {
         ngx_destroy_pool(op->pool);
     }
+}
+
+
+/* Single-tag entry point, preserved for the auto-vary variant-index store
+ * (one tag, nothing to batch) and any other one-shot caller. */
+void
+ngx_http_cache_turbo_redis_tag_add(ngx_http_cache_turbo_loc_conf_t *clcf,
+    u_char *key_hash, u_char *name, size_t name_len, time_t ttl)
+{
+    ngx_str_t  one;
+
+    if (name_len == 0) {
+        return;
+    }
+
+    one.data = name;
+    one.len = name_len;
+
+    ngx_http_cache_turbo_redis_tag_add_many(clcf, key_hash, &one, 1, ttl);
 }
 
 
@@ -2717,6 +2794,7 @@ ngx_cache_turbo_backend_t  ngx_http_cache_turbo_redis_backend = {
     ngx_http_cache_turbo_redis_del_raw,
     ngx_http_cache_turbo_redis_tagkey,
     ngx_http_cache_turbo_redis_tag_add,
+    ngx_http_cache_turbo_redis_tag_add_many,
     ngx_http_cache_turbo_redis_smembers,
     ngx_http_cache_turbo_redis_scan_del,
     ngx_http_cache_turbo_redis_lock,
