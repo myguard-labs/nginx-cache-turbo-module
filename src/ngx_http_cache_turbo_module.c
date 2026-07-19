@@ -84,6 +84,8 @@ static char *ngx_http_cache_turbo_require_header(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 static ngx_int_t ngx_http_cache_turbo_require_hdr_ok(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf);
+static char *ngx_http_cache_turbo_stale_mult(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
 static char *ngx_http_cache_turbo_preset(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static ngx_int_t ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r);
@@ -222,6 +224,13 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       ngx_conf_set_sec_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_cache_turbo_loc_conf_t, lock_ttl_raw),
+      NULL },
+
+    { ngx_string("cache_turbo_stale_mult"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
+      ngx_http_cache_turbo_stale_mult,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
       NULL },
 
     { ngx_string("cache_turbo_preset"),
@@ -6859,6 +6868,45 @@ ngx_http_cache_turbo_require_hdr_ok(ngx_http_request_t *r,
 }
 
 
+/* cache_turbo_stale_mult N (H5). Range-checked rather than a bare
+ * ngx_conf_set_num_slot: ngx_http_cache_turbo_stale_ttl() coerces <= 0 back to
+ * the BALANCED default, so an explicit `0` would silently behave as `4` instead
+ * of the "no stale window" the operator wrote. Reject it at parse instead. */
+static char *
+ngx_http_cache_turbo_stale_mult(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_cache_turbo_loc_conf_t  *clcf = conf;
+
+    ngx_str_t  *value = cf->args->elts;
+    ngx_int_t   n;
+
+    if (clcf->stale_mult_raw != NGX_CONF_UNSET) {
+        return "is duplicate";
+    }
+
+    n = ngx_atoi(value[1].data, value[1].len);
+    if (n == NGX_ERROR) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "cache_turbo_stale_mult: bad value \"%V\"", &value[1]);
+        return NGX_CONF_ERROR;
+    }
+
+    if (n < NGX_HTTP_CACHE_TURBO_STALE_MULT_MIN
+        || n > NGX_HTTP_CACHE_TURBO_STALE_MULT_MAX)
+    {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "cache_turbo_stale_mult \"%V\" is out of range: expected %d..%d",
+            &value[1], NGX_HTTP_CACHE_TURBO_STALE_MULT_MIN,
+            NGX_HTTP_CACHE_TURBO_STALE_MULT_MAX);
+        return NGX_CONF_ERROR;
+    }
+
+    clcf->stale_mult_raw = n;
+
+    return NGX_CONF_OK;
+}
+
+
 /* "cache_turbo_preset micro|conservative|balanced|aggressive;" stores the enum
  * (and validates the name here, at config time). The enum only selects the band
  * of default knob values used in merge_loc_conf; an explicit knob directive
@@ -9040,6 +9088,7 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->beta_raw = NGX_CONF_UNSET;
     conf->valid_raw = NGX_CONF_UNSET;
     conf->lock_ttl_raw = NGX_CONF_UNSET;
+    conf->stale_mult_raw = NGX_CONF_UNSET;
     conf->autotune = NGX_CONF_UNSET;
     conf->cc_mode = NGX_CONF_UNSET_UINT;
     conf->auto_vary = NGX_CONF_UNSET;
@@ -9113,8 +9162,8 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
      *     value would no longer look UNSET to a descendant, so the descendant's
      *     own preset could never override it (the classic merge-poisoning trap).
      *  3. Resolve the effective knob: explicit raw value if set, else this
-     *     level's resolved-preset band value. stale_mult is preset-only (no
-     *     directive yet), so it always takes the band value.
+     *     level's resolved-preset band value. All four knobs (valid, beta,
+     *     lock_ttl, stale_mult) follow this same raw/effective split.
      *
      * Net effect: an explicit directive beats a preset; a nearer preset beats a
      * farther one; nothing leaks a band default into the inheritance chain.
@@ -9136,6 +9185,8 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
         ngx_conf_merge_value(conf->beta_raw, prev->beta_raw, NGX_CONF_UNSET);
         ngx_conf_merge_sec_value(conf->lock_ttl_raw, prev->lock_ttl_raw,
                                  NGX_CONF_UNSET);
+        ngx_conf_merge_value(conf->stale_mult_raw, prev->stale_mult_raw,
+                             NGX_CONF_UNSET);
 
         conf->valid = (conf->valid_raw == NGX_CONF_UNSET)
                           ? band->valid : conf->valid_raw;
@@ -9143,7 +9194,8 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
                           ? band->beta : conf->beta_raw;
         conf->lock_ttl = (conf->lock_ttl_raw == NGX_CONF_UNSET)
                           ? band->lock_ttl : conf->lock_ttl_raw;
-        conf->stale_mult = band->stale_mult;
+        conf->stale_mult = (conf->stale_mult_raw == NGX_CONF_UNSET)
+                          ? band->stale_mult : conf->stale_mult_raw;
     }
 
     /* Per-status TTLs (v6): inherit the rule list if this level set none. */
