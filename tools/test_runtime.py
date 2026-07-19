@@ -3872,7 +3872,7 @@ def test_yabb_preset(ng: Nginx, origin: Origin) -> None:
     drain_origin(origin)
 
 
-def test_preset_arg_value_predicate(ng: Nginx, origin: Origin) -> None:
+def test_preset_arg_value_predicate(ng: Nginx) -> None:
     """Preset query-arg rules written as `name=value` must match the VALUE.
 
     The single-entry-script forums (SMF, MyBB, YaBB, Invision) route every page
@@ -9139,7 +9139,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_vanilla_guest_cookies_stay_cacheable(ng, origin)
     test_phorum_admin_session_cookie(ng, origin)
     test_punbb_phorum_uri_rules(ng, origin)
-    test_preset_arg_value_predicate(ng, origin)
+    test_preset_arg_value_predicate(ng)
     test_preset_arg_scanner(ng, origin)
     test_cookie_pred_multiple_matching_cookies(ng, origin)
     test_vbulletin_preset(ng, origin)
