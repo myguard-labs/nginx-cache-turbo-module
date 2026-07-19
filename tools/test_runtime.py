@@ -2142,6 +2142,38 @@ http {{
             cache_turbo_valid    1s;     # stale_mult=8 -> expires at 8s
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
+        # H3c band-column fixtures. Deliberately NOT reusing /pa/ and /pb/: those
+        # carry `cache_turbo_valid 1s` for the stale_mult tests, and the min_uses
+        # tests need several sequential requests to stay inside the fresh window.
+        # 30s TTL keeps the gate the only variable.
+        #
+        # /pab/: aggressive band, NO directive -> band min_uses=2 is the only
+        # thing that can arm the gate, so req1 skips and req2 stores.
+        location /pab/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_preset   aggressive;
+            cache_turbo_valid    30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        # /pbb/: balanced (the DEFAULT band) -> min_uses=1, stores on req1.
+        location /pbb/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_preset   balanced;
+            cache_turbo_valid    30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        # /pmu/: aggressive band (min_uses=2) + an explicit directive -> 1 wins,
+        # so req2 is already a HIT.
+        location /pmu/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_preset   aggressive;
+            cache_turbo_valid    30s;
+            cache_turbo_min_uses 1;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
         # micro preset: NO explicit cache_turbo_valid, so the band's own 1s fresh
         # TTL (stale_mult=2 -> serveable 2s) is what drives expiry. Distinguishes
         # micro (default valid 1s) from every other preset (default valid >= 30s).
@@ -2218,6 +2250,13 @@ http {{
             cache_turbo_preset   aggressive;  # stale_mult 8 -> entry lives 8s, so a
                                               # skipped refresh cycle never expires
                                               # to a MISS (keeps churn ratio stable)
+            cache_turbo_min_uses 1;           # H3c: the aggressive band is 2, but
+                                              # this test measures the refresh/miss
+                                              # churn ratio over 110 cold keys --
+                                              # gating each key's first store would
+                                              # double the miss count and change the
+                                              # very ratio under test. Pin the
+                                              # pre-H3c behaviour explicitly.
             cache_turbo_valid    1s;
             cache_turbo_beta     5000;        # static dice beta: refresh is certain
             cache_turbo_lock_ttl 1s;
@@ -6896,6 +6935,142 @@ def test_min_uses_off_by_default(ng: Nginx) -> None:
         f"second req must HIT (min_uses default 1): {h2.get('x-cache')}"
 
 
+def test_min_uses_band_aggressive(ng: Nginx, origin: Origin) -> None:
+    """H3c: the AGGRESSIVE band raises min_uses to 2, with NO directive present.
+
+    This is the band column doing the work: /pab/ carries only
+    `cache_turbo_preset aggressive`, so the gate can only be armed by the band's
+    min_uses=2. The first miss must therefore go to the origin WITHOUT storing,
+    and the second must also reach the origin (it is the one that stores), so
+    the third is the first HIT.
+
+    Contrast with min_uses=1, where request 2 would already be a HIT -- that
+    single difference is what distinguishes 'the band value reached the runtime'
+    from 'some caching happened'. Paired with test_min_uses_band_balanced_is_1,
+    which runs the identical sequence against the default preset and DOES get a
+    HIT on request 2; if the column were wired to every band, that test fails."""
+    uri = "/pab/band-minuses"                    # never fetched before
+    base = origin.hits
+    skips0 = _admin_min_uses_skips(ng)
+
+    # Request 1: below the band threshold -> origin, not stored.
+    s, _, h1 = fetch(ng.port, uri)
+    assert s == 200, f"req1 status {s}"
+    assert "x-cache" not in h1, \
+        f"req1 must not be a HIT: {h1.get('x-cache')}"
+
+    # Request 2: reaches min_uses=2 -> served from origin, and THIS one stores.
+    s, b2, h2 = fetch(ng.port, uri)
+    assert s == 200, f"req2 status {s}"
+    assert "x-cache" not in h2, \
+        ("req2 must still be served from the origin under the aggressive band "
+         f"(min_uses=2), got X-Cache={h2.get('x-cache')} -- the band's min_uses "
+         "did not reach the runtime, i.e. the H3c column is not wired")
+    assert origin.hits == base + 2, \
+        f"both sub-threshold reqs must reach the origin: {origin.hits - base}"
+
+    # Request 3: the entry stored on req2 is now serveable.
+    s, b3, h3 = fetch(ng.port, uri)
+    assert h3.get("x-cache") == "HIT", f"req3 X-Cache={h3.get('x-cache')}"
+    assert origin.hits == base + 2, "req3 must come from cache, not the origin"
+    assert b3 == b2, "the HIT body must match the response that was stored"
+
+    # Exactly one sub-threshold miss was skipped (req1); req2 stored.
+    assert _admin_min_uses_skips(ng) - skips0 == 1, \
+        f"min_uses_skips delta {_admin_min_uses_skips(ng) - skips0} != 1"
+
+
+def test_min_uses_band_balanced_is_1(ng: Nginx, origin: Origin) -> None:
+    """H3c: BALANCED -- the DEFAULT preset -- keeps min_uses=1, so adding the
+    band column changed no existing user's caching behaviour.
+
+    /pbb/ is `cache_turbo_preset balanced` with no min_uses directive. Request 2
+    must be a HIT, exactly as it was before H3c. This is the semver guard: if a
+    later edit flips the BALANCED row to 2 (the change that was explicitly NOT
+    signed off), this test fails rather than silently changing the first-request
+    store behaviour for every default-preset deployment."""
+    uri = "/pbb/band-minuses-default"            # never fetched before
+    base = origin.hits
+
+    s, _, h1 = fetch(ng.port, uri)
+    assert s == 200 and "x-cache" not in h1, "first miss must reach the origin"
+
+    s, _, h2 = fetch(ng.port, uri)
+    assert h2.get("x-cache") == "HIT", \
+        ("the balanced band must store on the FIRST miss (min_uses=1); got "
+         f"X-Cache={h2.get('x-cache')} -- a band row other than aggressive was "
+         "given min_uses > 1, which is a semver-visible default change")
+    assert origin.hits == base + 1, "req2 must be served from cache"
+
+
+def test_min_uses_directive_beats_band(ng: Nginx, origin: Origin) -> None:
+    """H3c: an explicit cache_turbo_min_uses overrides the resolved preset band,
+    the same raw/effective split as valid/beta/lock_ttl/stale_mult.
+
+    /pmu/ is `cache_turbo_preset aggressive` (band min_uses=2) plus an explicit
+    `cache_turbo_min_uses 1`. The directive must win, so request 2 is a HIT --
+    whereas /pab/ (same preset, no directive) needs three requests to get one.
+    Without the raw/effective wiring the band would win and req2 would miss."""
+    uri = "/pmu/beats-band"                      # never fetched before
+    base = origin.hits
+
+    s, _, h1 = fetch(ng.port, uri)
+    assert s == 200 and "x-cache" not in h1, "first miss must reach the origin"
+
+    s, _, h2 = fetch(ng.port, uri)
+    assert h2.get("x-cache") == "HIT", \
+        ("explicit cache_turbo_min_uses 1 must beat the aggressive band's 2, so "
+         f"req2 is a HIT; got X-Cache={h2.get('x-cache')} -- the directive lost "
+         "to the band, i.e. min_uses_raw is not resolving ahead of band->min_uses")
+    assert origin.hits == base + 1, "req2 must be served from cache"
+
+
+def test_min_uses_rejects_out_of_range(ng: Nginx) -> None:
+    """H3c: cache_turbo_min_uses is range-checked at config time.
+
+    `0` is the arm that matters: merge_loc_conf used to coerce a value < 1 up to
+    1, so accepting a literal 0 would silently mean "store on the first miss"
+    rather than whatever the operator intended by it. Rejecting at parse keeps
+    the directive honest -- the same lesson as stale_mult. Boundaries 1 and 32
+    must stay accepted so an off-by-one range check fails here."""
+    anchor = "cache_turbo_min_uses 3;"
+    assert anchor in nginx_config(
+        ng.root, ng.port, ng.module, ng.origin_port, 1, ng.redis_port,
+        ng.redis_auth_port, ng.redis_password, ng.redis_tls_port,
+        ng.redis_tls_ca, ng.memcached_port), \
+        f"test fixture missing anchor {anchor!r}"
+
+    # in-range-check arm: parses as a number, refused by the bounds
+    for bad in ("0", "33"):
+        r = _config_test_result(
+            ng, lambda c, b=bad: c.replace(
+                anchor, f"cache_turbo_min_uses {b};", 1))
+        assert r.returncode != 0, \
+            f"cache_turbo_min_uses {bad} was accepted by nginx -t:\n{r.stdout}"
+        assert "out of range" in r.stdout, \
+            f"missing/odd range diagnostic for {bad}:\n{r.stdout}"
+
+    # parse arm: ngx_atoi has no sign handling, so a negative never reaches the
+    # bounds check and surfaces as "bad value" -- rejected, different diagnostic.
+    # Pinned separately so a later editor cannot collapse the two paths.
+    for bad in ("-1", "abc"):
+        r = _config_test_result(
+            ng, lambda c, b=bad: c.replace(
+                anchor, f"cache_turbo_min_uses {b};", 1))
+        assert r.returncode != 0, \
+            f"cache_turbo_min_uses {bad} was accepted by nginx -t:\n{r.stdout}"
+        assert "bad value" in r.stdout, \
+            f"missing/odd bad-value diagnostic for {bad}:\n{r.stdout}"
+
+    # both boundaries stay legal
+    for good in ("1", "32"):
+        r = _config_test_result(
+            ng, lambda c, g=good: c.replace(
+                anchor, f"cache_turbo_min_uses {g};", 1))
+        assert r.returncode == 0, \
+            f"cache_turbo_min_uses {good} (a legal boundary) was rejected:\n{r.stdout}"
+
+
 def test_lru_eviction(ng: Nginx) -> None:
     """R6: with a tiny zone, old entries are evicted, not 500s."""
     # hammer many distinct keys through the tiny zone; must all 200, no errors
@@ -8643,7 +8818,14 @@ def test_preset_window_differs(ng: Nginx, origin: Origin) -> None:
     PRESET'S effect, not its stored value, and proves the band reaches the
     runtime stale math (stale_mult threaded through shm_store)."""
     fetch(ng.port, "/pc/win")                          # prime conservative
-    fetch(ng.port, "/pa/win")                          # prime aggressive
+    # H3c: the aggressive band is min_uses=2, so the FIRST request to a cold key
+    # under /pa/ is gated to the origin without storing. Prime twice -- the
+    # second request is the one that actually stores the entry whose stale
+    # window this test measures. (Conservative is min_uses=1, one prime is
+    # enough.) Without this the aggressive arm has nothing cached at t=3s and
+    # the STALE assertion below fails for a reason unrelated to stale_mult.
+    fetch(ng.port, "/pa/win")                          # aggressive: gated miss
+    fetch(ng.port, "/pa/win")                          # aggressive: stores
     time.sleep(3.0)                                     # cons expired, aggr stale
 
     # conservative: past stale_until -> a true MISS (no X-Cache, hits origin)
@@ -8662,7 +8844,7 @@ def test_preset_window_differs(ng: Nginx, origin: Origin) -> None:
         f"aggressive stale burst returned {set(r[0] for r in results)}"
     assert any(h.get("x-cache") == "STALE" for _, _, h in results), \
         ("aggressive (stale_mult=8) should still serve STALE at t=3s; "
-         "got " + repr(sorted({h.get('x-cache') for _, _, h in results})))
+         "got " + repr(sorted(str(h.get('x-cache')) for _, _, h in results)))
     drain_origin(origin)       # v8: settle async bg refreshes before the next test
 
 
@@ -8677,8 +8859,15 @@ def test_stale_mult_directive_beats_preset(ng: Nginx, origin: Origin) -> None:
     would behave identically. It must instead hard-expire and MISS -- proving
     the raw value reached the runtime stale math and beat the band, not merely
     that some window exists."""
-    fetch(ng.port, "/psm/win")                         # prime
-    fetch(ng.port, "/pa/win2")                         # control, same preset
+    # H3c: both locations resolve the aggressive band, whose min_uses is 2, so
+    # the first request to each cold key is gated to the origin without storing.
+    # Prime twice -- the second request is the one that stores the entry whose
+    # stale window this test measures. This is admission, orthogonal to the
+    # stale_mult precedence under test.
+    fetch(ng.port, "/psm/win")                         # gated miss
+    fetch(ng.port, "/psm/win")                         # prime (stores)
+    fetch(ng.port, "/pa/win2")                         # gated miss
+    fetch(ng.port, "/pa/win2")                         # control prime (stores)
     time.sleep(3.0)
 
     # directive wins: stale_mult=1 -> stale_until == fresh_until -> hard MISS
@@ -8697,7 +8886,7 @@ def test_stale_mult_directive_beats_preset(ng: Nginx, origin: Origin) -> None:
     assert any(h.get("x-cache") == "STALE" for _, _, h in results), \
         ("control /pa/ (aggressive band, no directive) should still serve "
          "STALE at t=3s; got "
-         + repr(sorted({h.get('x-cache') for _, _, h in results})))
+         + repr(sorted(str(h.get('x-cache')) for _, _, h in results)))
     drain_origin(origin)
 
 
@@ -9263,6 +9452,10 @@ def run_all(ng: Nginx, origin: Origin,
     test_cold_lock_off_stampedes(ng, origin)
     test_min_uses(ng, origin)
     test_min_uses_off_by_default(ng)
+    test_min_uses_band_aggressive(ng, origin)
+    test_min_uses_band_balanced_is_1(ng, origin)
+    test_min_uses_directive_beats_band(ng, origin)
+    test_min_uses_rejects_out_of_range(ng)
     test_stale_if_error(ng, origin)
     test_stale_serves_stale_origin_hard_dead(ng, origin)
     test_sie_serve_on_error(ng, origin)                     # RFC-2 CTB4 serve-on-error
@@ -9469,7 +9662,9 @@ def main() -> int:
           "LRU eviction (R6), refresh-under-pressure (R6b), "
           "stale serve (R3), single-flight (R4), "
           "cold-miss single-flight (v10: per-box collapse + lock-off stampede), "
-          "min_uses (v15: cache after N misses + off-by-default), "
+          "min_uses (v15: cache after N misses + off-by-default; "
+          "H3c: aggressive band=2, balanced band stays 1, directive beats band, "
+          "range-checked), "
           "stale-if-error (v8), background_update off (v8 inline regen), "
           "admin stats/purge/gating, warm (v3-3: populates/multi/no-url), "
           "key normalize (v3-1: order/tracking/"
