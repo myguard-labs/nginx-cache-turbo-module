@@ -56,6 +56,7 @@ typedef struct {
     ngx_pool_t                       *pool;
     ngx_buf_t                        *send;     /* buffer being written        */
     ngx_msec_t                        timeout;
+    ngx_http_cache_turbo_loc_conf_t  *clcf;     /* for keepalive pool config   */
 
     ngx_http_request_t               *request;  /* GET: parked request         */
     ngx_http_cache_turbo_ctx_t       *ctx;      /* GET: request ctx to fill    */
@@ -77,6 +78,155 @@ static void ngx_http_cache_turbo_mc_get_finish(
     ngx_http_cache_turbo_mc_op_t *op, ngx_int_t result,
     u_char *blob, size_t blob_len);
 static void ngx_http_cache_turbo_mc_op_fail(ngx_http_cache_turbo_mc_op_t *op);
+static ngx_http_cache_turbo_memcached_ka_bucket_t *
+    ngx_http_cache_turbo_mc_ka_bucket(ngx_addr_t *addr, ngx_uint_t create);
+static ngx_connection_t *
+    ngx_http_cache_turbo_mc_ka_get(ngx_addr_t *addr);
+static ngx_uint_t
+    ngx_http_cache_turbo_mc_ka_save(ngx_http_cache_turbo_mc_op_t *op);
+
+
+/* Global memcached keepalive pool. */
+ngx_http_cache_turbo_memcached_ka_t ngx_http_cache_turbo_memcached_ka;
+
+
+/* Locate or create the keepalive bucket for addr. Unlike redis, memcached has
+ * no auth/TLS/db, so identity is just peer addr. create=0 for lookup only. */
+static ngx_http_cache_turbo_memcached_ka_bucket_t *
+ngx_http_cache_turbo_mc_ka_bucket(ngx_addr_t *addr, ngx_uint_t create)
+{
+    ngx_uint_t                                 i, max;
+    ngx_http_cache_turbo_memcached_ka_t       *ka = &ngx_http_cache_turbo_memcached_ka;
+    ngx_http_cache_turbo_memcached_ka_bucket_t *b;
+
+    for (i = 0; i < ka->nbuckets; i++) {
+        b = &ka->buckets[i];
+        if (b->socklen == addr->socklen
+            && ngx_memcmp(&b->sockaddr, addr->sockaddr, addr->socklen) == 0) {
+            return b;
+        }
+    }
+
+    if (!create) {
+        return NULL;
+    }
+
+    if (ka->nbuckets >= NGX_HTTP_CACHE_TURBO_MEMCACHED_KA_MAX_BUCKETS) {
+        return NULL;
+    }
+
+    b = &ka->buckets[ka->nbuckets];
+    max = NGX_HTTP_CACHE_TURBO_KEEPALIVE_MAX; /* use redis cap; memcached uses per-loc override */
+
+    b->items = ngx_palloc(ngx_cycle->pool,
+                          max * sizeof(ngx_http_cache_turbo_memcached_ka_item_t));
+    if (b->items == NULL) {
+        return NULL;
+    }
+
+    ngx_queue_init(&b->cache);
+    ngx_queue_init(&b->free);
+    for (i = 0; i < max; i++) {
+        b->items[i].bucket = b;
+        ngx_queue_insert_head(&b->free, &b->items[i].queue);
+    }
+
+    b->max = max;
+    b->count = 0;
+    b->timeout = 60000; /* default, overridden at save time from loc_conf */
+    b->socklen = addr->socklen;
+    ngx_memcpy(&b->sockaddr, addr->sockaddr, addr->socklen);
+    b->inited = 1;
+    ka->nbuckets++;
+
+    return b;
+}
+
+
+static ngx_connection_t *
+ngx_http_cache_turbo_mc_ka_get(ngx_addr_t *addr)
+{
+    ngx_queue_t                                 *q;
+    ngx_connection_t                           *c;
+    ngx_http_cache_turbo_memcached_ka_item_t   *item;
+    ngx_http_cache_turbo_memcached_ka_bucket_t *b;
+
+    b = ngx_http_cache_turbo_mc_ka_bucket(addr, 0);
+    if (b == NULL || ngx_queue_empty(&b->cache)) {
+        return NULL;
+    }
+
+    q = ngx_queue_head(&b->cache);
+    item = ngx_queue_data(q, ngx_http_cache_turbo_memcached_ka_item_t, queue);
+    c = item->connection;
+
+    ngx_queue_remove(q);
+    ngx_queue_insert_head(&b->free, q);
+    b->count--;
+    item->connection = NULL;
+
+    if (c->read->timer_set) {
+        ngx_del_timer(c->read);
+    }
+    c->idle = 0;
+    c->read->handler = NULL;
+    c->write->handler = NULL;
+
+    return c;
+}
+
+
+static ngx_uint_t
+ngx_http_cache_turbo_mc_ka_save(ngx_http_cache_turbo_mc_op_t *op)
+{
+    ngx_addr_t                                  addr;
+    ngx_queue_t                                *q;
+    ngx_connection_t                           *c = op->peer.connection;
+    ngx_http_cache_turbo_memcached_ka_item_t   *item;
+    ngx_http_cache_turbo_memcached_ka_bucket_t *b;
+    ngx_http_cache_turbo_loc_conf_t            *clcf;
+    ngx_int_t                                   ka;
+
+    if (c == NULL || op->clcf == NULL) {
+        return 0;
+    }
+
+    clcf = op->clcf;
+    ka = clcf->memcached_keepalive;
+    if (ka <= 0) {
+        return 0;  /* keepalive disabled */
+    }
+
+    addr.sockaddr = op->peer.sockaddr;
+    addr.socklen = op->peer.socklen;
+    addr.name = *op->peer.name;
+
+    b = ngx_http_cache_turbo_mc_ka_bucket(&addr, 1);
+    if (b == NULL || b->count >= (ngx_uint_t) ka) {
+        return 0; /* pool full or no pool: close normally */
+    }
+
+    if (ngx_queue_empty(&b->free)) {
+        return 0;
+    }
+
+    q = ngx_queue_head(&b->free);
+    item = ngx_queue_data(q, ngx_http_cache_turbo_memcached_ka_item_t, queue);
+
+    ngx_queue_remove(q);
+    ngx_queue_insert_head(&b->cache, q);
+    b->count++;
+    item->connection = c;
+
+    c->idle = 1;
+    c->read->handler = NULL;
+    c->write->handler = NULL;
+    b->timeout = clcf->memcached_keepalive_timeout
+                     ? clcf->memcached_keepalive_timeout : 60000;
+    ngx_add_timer(c->read, b->timeout);
+
+    return 1;
+}
 
 
 /* Open a connection for op and arm the shared write handler. Returns NGX_OK on
@@ -88,6 +238,27 @@ ngx_http_cache_turbo_mc_connect(ngx_http_cache_turbo_mc_op_t *op,
 {
     ngx_int_t          rc;
     ngx_connection_t  *c;
+
+    /* Try keepalive pool first. */
+    c = ngx_http_cache_turbo_mc_ka_get(addr);
+    if (c != NULL) {
+        op->peer.connection = c;
+        c->data = op;
+        op->read_handler = read_handler;
+        c->write->handler = ngx_http_cache_turbo_mc_write;
+        c->read->handler = read_handler;
+
+        if (op->timeout) {
+            ngx_add_timer(c->write, op->timeout);
+        }
+
+        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, c->log, 0,
+                       "cache_turbo: memcached reuse pooled fd:%d -> %V",
+                       c->fd, addr->name);
+
+        ngx_post_event(c->write, &ngx_posted_events);
+        return NGX_OK;
+    }
 
     op->peer.sockaddr = addr->sockaddr;
     op->peer.socklen = addr->socklen;
@@ -152,6 +323,7 @@ ngx_http_cache_turbo_mc_op_create(ngx_http_cache_turbo_loc_conf_t *clcf)
     }
 
     op->pool = pool;
+    op->clcf = clcf;
     op->timeout = clcf->redis_timeout;
 
     return op;
@@ -642,9 +814,16 @@ ngx_http_cache_turbo_mc_op_done(ngx_http_cache_turbo_mc_op_t *op)
     ngx_connection_t  *c = op->peer.connection;
 
     if (c) {
-        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,
-                       "cache_turbo: memcached conn close fd:%d", c->fd);
-        ngx_close_connection(c);
+        if (ngx_http_cache_turbo_mc_ka_save(op)) {
+            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,
+                           "cache_turbo: memcached conn park fd:%d", c->fd);
+            /* conn is now in the pool, don't close */
+            op->peer.connection = NULL;
+        } else {
+            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,
+                           "cache_turbo: memcached conn close fd:%d", c->fd);
+            ngx_close_connection(c);
+        }
     }
     ngx_destroy_pool(pool);
 }

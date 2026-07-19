@@ -7279,6 +7279,35 @@ ngx_http_cache_turbo_memcached_conf(ngx_conf_t *cf, ngx_command_t *cmd,
             }
             clcf->redis_timeout = (ngx_msec_t) t;
 
+        } else if (ngx_strncmp(value[i].data, "keepalive=", 10) == 0) {
+            s.data = value[i].data + 10;
+            s.len = value[i].len - 10;
+            clcf->memcached_keepalive = ngx_atoi(s.data, s.len);
+            if (clcf->memcached_keepalive == NGX_ERROR
+                || clcf->memcached_keepalive < 0)
+            {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                    "cache_turbo_memcached: bad keepalive \"%V\"", &s);
+                return NGX_CONF_ERROR;
+            }
+            if (clcf->memcached_keepalive > NGX_HTTP_CACHE_TURBO_KEEPALIVE_MAX) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                    "cache_turbo_memcached: keepalive must be <= %d",
+                    NGX_HTTP_CACHE_TURBO_KEEPALIVE_MAX);
+                return NGX_CONF_ERROR;
+            }
+
+        } else if (ngx_strncmp(value[i].data, "keepalive_timeout=", 18) == 0) {
+            s.data = value[i].data + 18;
+            s.len = value[i].len - 18;
+            t = ngx_parse_time(&s, 0);
+            if (t == NGX_ERROR) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                    "cache_turbo_memcached: bad keepalive_timeout \"%V\"", &s);
+                return NGX_CONF_ERROR;
+            }
+            clcf->memcached_keepalive_timeout = (ngx_msec_t) t;
+
         } else {
             ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                 "cache_turbo_memcached: invalid parameter \"%V\"", &value[i]);
@@ -9012,6 +9041,8 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->redis_timeout = NGX_CONF_UNSET_MSEC;
     conf->redis_keepalive = NGX_CONF_UNSET;
     conf->redis_keepalive_timeout = NGX_CONF_UNSET_MSEC;
+    conf->memcached_keepalive = NGX_CONF_UNSET;
+    conf->memcached_keepalive_timeout = NGX_CONF_UNSET_MSEC;
     conf->redis_db = NGX_CONF_UNSET;
     conf->redis_tls = NGX_CONF_UNSET;
     conf->redis_tls_verify = NGX_CONF_UNSET;
@@ -9203,6 +9234,9 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_value(conf->redis_keepalive, prev->redis_keepalive, 0);
     ngx_conf_merge_msec_value(conf->redis_keepalive_timeout,
                               prev->redis_keepalive_timeout, 60000);
+    ngx_conf_merge_value(conf->memcached_keepalive, prev->memcached_keepalive, 0);
+    ngx_conf_merge_msec_value(conf->memcached_keepalive_timeout,
+                              prev->memcached_keepalive_timeout, 60000);
 
     if (conf->redis_addr.sockaddr != NULL) {
         /* COR-6: this block ran its own cache_turbo_redis — a complete backend
