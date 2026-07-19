@@ -135,6 +135,14 @@ cache-turbo — page cache and object cache sit in different layers.
 
 ## Gotchas
 
+> **Subdirectory installs.** This preset's URI rules are root-relative literals
+> matched from byte 0 of `r->uri`, so an install mounted under a subdirectory
+> (`/shop/`, `/forum/`, …) matches **none** of them — the admin surface
+> included. Declare the mount with `cache_turbo_backend_prefix /forum/;` and the
+> preset URI tier is compared against the rebased path. Scoping the nginx
+> `location` does **not** substitute: it routes requests, it does not rewrite
+> `r->uri`. See [frameworks.md](frameworks.md).
+
 - **Migrated sites keep the plugin out of inertia.** A WP install moved off
   SiteGround commonly still has SG Optimizer active. Its Dynamic Caching
   toggle may still show as available in the admin UI — it will do nothing on

@@ -78,8 +78,18 @@ typedef struct {
     ngx_str_t  args;
 } ngx_http_request_t;
 
+/* NGX_CONF_UNSET_PTR is nginx's "directive not set" sentinel. The sliced code
+ * tests pointer conf fields against it, so the shim must define it with the
+ * same value the real ngx_conf.h uses. */
+#define NGX_CONF_UNSET_PTR  ((void *) -1)
+
 typedef struct {
     ngx_uint_t  backend_presets;
+    /* Mirrors src/ngx_http_cache_turbo_module.h. The preset URI tier rebases
+     * r->uri onto this mount before comparing, so the sliced auto_skip reads
+     * it and the field must exist here too — see the bit-mirroring note below,
+     * which applies to conf FIELDS for the same reason. */
+    ngx_str_t  *backend_prefix;
 } ngx_http_cache_turbo_loc_conf_t;
 
 /*

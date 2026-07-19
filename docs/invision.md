@@ -121,6 +121,14 @@ curl -sI https://forum.example.com/admin/ | grep -i x-cache-turbo
 
 ## Gotchas
 
+> **Subdirectory installs.** This preset's URI rules are root-relative literals
+> matched from byte 0 of `r->uri`, so an install mounted under a subdirectory
+> (`/shop/`, `/forum/`, …) matches **none** of them — the admin surface
+> included. Declare the mount with `cache_turbo_backend_prefix /forum/;` and the
+> preset URI tier is compared against the rebased path. Scoping the nginx
+> `location` does **not** substitute: it routes requests, it does not rewrite
+> `r->uri`. See [frameworks.md](frameworks.md).
+
 - **Vendor-attested, not source-verified.** IPS4 is closed-source; this rests
   on IPS's own official docs, which happen to be unusually explicit about the
   cookie's purpose. Treat it as high-confidence, not code-proven.

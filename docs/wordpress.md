@@ -50,6 +50,14 @@ i.e. one customer's basket served to the next visitor. See
 | Query args (presence) | `preview`, `rest_route` |
 | Cookie header substrings | `wordpress_logged_in_`, `wp-postpass_`, `comment_author_` |
 
+> **Subdirectory installs.** The URI prefixes above are root-relative literals
+> matched from byte 0 of `r->uri`, so an install mounted under a subdirectory
+> (`/shop/`, `/forum/`, …) matches **none** of them — the admin surface
+> included. Declare the mount with `cache_turbo_backend_prefix /shop/;` and the
+> preset URI tier is compared against the rebased path. Scoping the nginx
+> `location` does **not** substitute: it routes requests, it does not rewrite
+> `r->uri`. See [frameworks.md](frameworks.md).
+
 These literals are matched as **substrings of the whole `Cookie` header** —
 names *and* values, searched undelimited — because WordPress suffixes the names
 with a hash of the site (`wordpress_logged_in_a1b2c3…`) and an exact-name lookup

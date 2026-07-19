@@ -412,8 +412,14 @@ http {
 ## Board in a subdirectory
 
 If the board lives at `/forums/` rather than the root, every URI prefix in the
-preset shifts. The preset matches on `r->uri` from the site root, so scope it to
-the board's location and the prefixes line up on their own:
+preset shifts. The preset's prefixes are matched against the **full** `r->uri`,
+anchored at byte 0: a board at `/forums/` serves `/forums/login`, which does
+*not* start with `/login`, so the preset's `/login` prefix never matches it.
+
+**Scoping the `location` does not fix this.** A `location` decides which
+requests reach the module; it does not rewrite `r->uri`, so the preset still
+sees `/forums/login` and still fails to match. Tell the module where the board
+is mounted instead:
 
 ```nginx
 location /forums/ {
@@ -421,16 +427,21 @@ location /forums/ {
 }
 
 location ~ ^/forums/.*\.php$ {
-    cache_turbo         ct;
-    cache_turbo_backend xenforo;   # matches /forums/login, /forums/admin.php, ...
+    cache_turbo                ct;
+    cache_turbo_backend        xenforo;
+    cache_turbo_backend_prefix /forums/;   # rebase before the preset URI tier
     ...
 }
 ```
 
-Careful: the preset's prefixes are matched against the **full** URI. A board at
-`/forums/` serves `/forums/login`, which does *not* start with `/login` — so the
-preset's `/login` prefix will not match it. Scoping the `location` is not enough
-on its own; add explicit bypasses for the auth surfaces:
+With the mount declared, `/forums/login` is rebased to `/login` for the URI
+comparison and every preset prefix matches again. Without it the board gets
+**zero** URI-rule coverage — the admin CP included. So on a subdirectory install
+the directive is required for *automatic* preset URI rebasing; the only supported
+way to skip it is to replace that coverage by hand, as below.
+
+If you would rather not declare the mount, the alternative is to spell the
+mounted paths out yourself:
 
 ```nginx
 location ~ ^/forums/ {

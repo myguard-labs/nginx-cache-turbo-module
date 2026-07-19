@@ -437,13 +437,22 @@ never poison the anonymous entry.
   for "framework, no preset". There is no union preset. The correct spelling for
   *"cache this, no preset applies"* is simply to omit `cache_turbo_backend` and set
   `cache_turbo_cache_control honor;` yourself.
-- **A framework in a subdirectory breaks `location` prefix rules.** A `location`
-  prefix anchors at position 0. If the app is mounted at `/shop/`, `/admin/` is
-  `/shop/admin/` and your `location ^~ /admin/` never fires — and a `location`
-  matching `/admin` also swallows `/administrator`.
-  [`cache_turbo_bypass_uri`](#cache_turbo_bypass_uri--segment-boundary-uri-bypass)
-  fixes both: give it the real mounted paths and it matches on a segment
-  boundary, so `/administrator` is left cacheable.
+- **A framework in a subdirectory breaks every byte-0 URI rule — including the
+  presets' own.** Anchoring at position 0 is not just an nginx `location` quirk;
+  the `cache_turbo_backend` presets ship their URI rules as root-relative
+  literals (`/wp-admin/`, `/administrator/`) and match them the same way. If the
+  app is mounted at `/shop/`, `/admin/` is `/shop/admin/`, so your
+  `location ^~ /admin/` never fires **and** the preset's `/admin/` rule never
+  matches either — the mounted app gets zero URI-rule coverage, admin surface
+  included. Two distinct fixes, for two distinct rule sets:
+  - **`cache_turbo_backend_prefix`** declares the mount so the **preset** rules
+    are rebased onto it (`cache_turbo_backend_prefix /shop/;` ⇒ `/shop/wp-admin/`
+    is tested as `/wp-admin/`). This is the one that restores preset coverage.
+  - [`cache_turbo_bypass_uri`](#cache_turbo_bypass_uri--segment-boundary-uri-bypass)
+    is for **your own** rules: give it the real mounted paths and it matches on a
+    segment boundary, so `/administrator` is left cacheable where `/admin` would
+    have swallowed it. Its prefixes are literals you author, so they are *not*
+    rebased.
 - **Re-derive after deploys.** The Django conditions above are code-dependent, not
   config-dependent — a developer adding an anonymous cart changes your cache's
   correctness without touching nginx. Nobody will tell you.

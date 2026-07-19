@@ -198,6 +198,14 @@ once the plugin stops serving them — safe to leave or clear at your convenienc
 
 ## Gotchas
 
+> **Subdirectory installs.** This preset's URI rules are root-relative literals
+> matched from byte 0 of `r->uri`, so an install mounted under a subdirectory
+> (`/shop/`, `/forum/`, …) matches **none** of them — the admin surface
+> included. Declare the mount with `cache_turbo_backend_prefix /forum/;` and the
+> preset URI tier is compared against the rebased path. Scoping the nginx
+> `location` does **not** substitute: it routes requests, it does not rewrite
+> `r->uri`. See [frameworks.md](frameworks.md).
+
 - **Expert/mod_rewrite mode is inert on nginx today — but don't ever turn it
   on.** Its `.htaccess` rewrite rules are Apache-only directive syntax; nginx
   never reads `.htaccess` and never evaluates them, so enabling Expert mode on

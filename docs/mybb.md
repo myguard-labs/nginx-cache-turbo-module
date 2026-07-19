@@ -149,6 +149,14 @@ curl -sI https://forum.example.com/usercp.php | grep -i x-cache-turbo
 
 ## Gotchas
 
+> **Subdirectory installs.** This preset's URI rules are root-relative literals
+> matched from byte 0 of `r->uri`, so an install mounted under a subdirectory
+> (`/shop/`, `/forum/`, …) matches **none** of them — the admin surface
+> included. Declare the mount with `cache_turbo_backend_prefix /forum/;` and the
+> preset URI tier is compared against the rebased path. Scoping the nginx
+> `location` does **not** substitute: it routes requests, it does not rewrite
+> `r->uri`. See [frameworks.md](frameworks.md).
+
 - **Setting a `cookieprefix` is safe for this preset** — the substring `user`
   is matched anywhere in the `Cookie` header, so any prefix MyBB prepends is
   irrelevant to it. It is **not** safe for a

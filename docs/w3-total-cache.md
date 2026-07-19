@@ -207,6 +207,14 @@ or accept the TTL on them.
 
 ## Gotchas
 
+> **Subdirectory installs.** This preset's URI rules are root-relative literals
+> matched from byte 0 of `r->uri`, so an install mounted under a subdirectory
+> (`/shop/`, `/forum/`, …) matches **none** of them — the admin surface
+> included. Declare the mount with `cache_turbo_backend_prefix /forum/;` and the
+> preset URI tier is compared against the rebased path. Scoping the nginx
+> `location` does **not** substitute: it routes requests, it does not rewrite
+> `r->uri`. See [frameworks.md](frameworks.md).
+
 - **Turn off Page Cache, not the whole plugin.** Deactivating W3TC entirely
   also kills Minify, Object Cache, Database Cache, Browser Cache and CDN
   rewriting — all genuinely useful and orthogonal to page caching. Disable

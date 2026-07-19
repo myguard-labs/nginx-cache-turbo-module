@@ -65,6 +65,21 @@ What makes it safe is that Magento does the hard part itself:
 | Query args | — |
 | Key cookies (value folded into cache key) | `X-Magento-Vary` |
 
+> **Subdirectory installs.** The URI prefixes above are root-relative literals
+> matched from byte 0 of `r->uri`, so an install mounted under a subdirectory
+> (`/shop/`, `/forum/`, …) matches **none** of them — the admin surface
+> included. Declare the mount with `cache_turbo_backend_prefix /shop/;` and the
+> preset URI tier is compared against the rebased path. Scoping the nginx
+> `location` does **not** substitute: it routes requests, it does not rewrite
+> `r->uri`. See [frameworks.md](frameworks.md).
+>
+> **On this vhost that is necessary but NOT sufficient.** The `try_files` flow
+> below internally redirects to `/index.php`, so by the time the module runs
+> `$uri` is *already* `/index.php` — there is no mounted path left to rebase and
+> the preset URI tier cannot fire, prefix or no prefix. The `$request_uri` map
+> and the `cache_turbo_bypass`/`cache_turbo_no_store` pair further down stay
+> **required** for the private Magento routes; see the comment at the `map`.
+
 `X-Magento-Vary` is Magento's *"this visitor is not the shared anonymous case"*
 signal. It is a salted hash of the **vary context** — customer group, auth flag,
 currency, store view — and `getVaryString()`

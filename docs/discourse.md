@@ -55,6 +55,14 @@ cache_turbo_backend discourse;      # implies cache_turbo_cache_control honor
 | Query args | `api_key`, `api_username` |
 | Cookie header substrings | `_t=` |
 
+> **Subdirectory installs.** The URI prefixes above are root-relative literals
+> matched from byte 0 of `r->uri`, so an install mounted under a subdirectory
+> (`/shop/`, `/forum/`, …) matches **none** of them — the admin surface
+> included. Declare the mount with `cache_turbo_backend_prefix /shop/;` and the
+> preset URI tier is compared against the rebased path. Scoping the nginx
+> `location` does **not** substitute: it routes requests, it does not rewrite
+> `r->uri`. See [frameworks.md](frameworks.md).
+
 **One cookie bypasses: `_t`.** That is Discourse's auth token
 (`lib/auth/default_current_user_provider.rb` — `TOKEN_COOKIE`). It is written
 only for an authenticated user and *deleted* for an anonymous one, and it is the

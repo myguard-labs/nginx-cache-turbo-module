@@ -1132,6 +1132,47 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # Subdirectory install (cache_turbo_backend_prefix, item 18): preset
+        # uris[] are literals anchored at byte 0 ("/wp-admin/"), so a WordPress
+        # mounted at /shop/ matches NO URI rule and its admin surface caches.
+        # The directive rebases r->uri onto the mount before the preset URI tier
+        # runs. /shop/ has it; /noshop/ is the SAME app WITHOUT it and exists to
+        # pin that the bug is real -- if /noshop/wp-admin/ ever stops caching,
+        # the /shop/ assertions below are passing for the wrong reason.
+        location /shop/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    30s;
+            cache_turbo_backend  wordpress;
+            cache_turbo_backend_prefix /shop/;
+            add_header           X-CT-Status $cache_turbo_status always;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # Directive value deliberately does NOT match this location's own path:
+        # requests here reach the module with backend_prefix set to /shop/ while
+        # r->uri starts with /elsewhere/, which is the ONLY way to exercise the
+        # no-rebase branch (a request routed to /shop/ always starts with it).
+        # A misconfigured mount must leave the URI alone, not force a match.
+        location /elsewhere/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    30s;
+            cache_turbo_backend  wordpress;
+            cache_turbo_backend_prefix /shop/;
+            add_header           X-CT-Status $cache_turbo_status always;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        location /noshop/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    30s;
+            cache_turbo_backend  wordpress;
+            add_header           X-CT-Status $cache_turbo_status always;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # DIY cookie value-keying (cache_turbo_key_cookie, v15): the tier-3
         # magento engine exposed as a directive. "seg" is value-keyed into the
         # cache key -- different values get different entries, the SAME value
@@ -5083,6 +5124,31 @@ def _config_test_result(ng: Nginx, mutate) -> "subprocess.CompletedProcess[str]"
                           stderr=subprocess.STDOUT, timeout=20)
 
 
+def test_backend_prefix_rejected(ng: Nginx) -> None:
+    """item 18: a malformed cache_turbo_backend_prefix must fail nginx -t. A
+    value that does not match the deployed mount yields ZERO URI-rule coverage
+    -- the exact silent failure the directive exists to end -- so it is rejected
+    loudly instead of coerced into something that merely looks configured.
+    Bare "/" is rejected too: it is a no-op that reads as configured."""
+    anchor = "cache_turbo_backend_prefix /shop/;"
+    for bad_value, why in (
+        ("shop/",  "no leading slash"),
+        ("/shop",  "no trailing slash"),
+        ("/",      "bare root mount is a no-op"),
+    ):
+        def mutate(cfg: str, _v: str = bad_value) -> str:
+            assert anchor in cfg, f"test fixture missing {anchor!r}"
+            return cfg.replace(anchor,
+                               f"cache_turbo_backend_prefix {_v};", 1)
+
+        r = _config_test_result(ng, mutate)
+        assert r.returncode != 0, \
+            (f"cache_turbo_backend_prefix {bad_value!r} ({why}) was accepted by "
+             f"nginx -t:\n{r.stdout}")
+        assert "must begin and end" in r.stdout.lower(), \
+            (f"missing backend_prefix diagnostic for {bad_value!r}:\n{r.stdout}")
+
+
 def test_keepalive_cap_rejected(ng: Nginx) -> None:
     """STAB-5: an absurd cache_turbo_redis keepalive=N (the per-worker pool is
     N*sizeof(item)) is rejected at config time so the size_t multiply can't
@@ -6262,6 +6328,68 @@ def test_bypass_uri(ng: Nginx) -> None:
     _, _, h1 = fetch(ng.port, "/bu/public")
     assert h1.get("x-ct-status") == "HIT", \
         f"unlisted /bu/public must cache, got {h1.get('x-ct-status')}"
+
+
+def test_backend_prefix_subdir(ng: Nginx) -> None:
+    """item 18: preset uris[] are anchored at byte 0, so a subdirectory install
+    matches no URI rule and its admin surface is cacheable.
+    cache_turbo_backend_prefix rebases r->uri onto the mount before the preset
+    URI tier runs. Asserts the fix, the bug it fixes (control location), that a
+    URI outside the mount does NOT inherit the app's rules, and that the
+    segment-boundary semantics survive the rebase."""
+    # THE BUG, still live on a location without the directive. If this ever
+    # reads BYPASS, the fix landed somewhere global and the /shop/ assertions
+    # below prove nothing.
+    _, _, h0 = fetch(ng.port, "/noshop/wp-admin/")
+    assert h0.get("x-ct-status") == "MISS", \
+        ("/noshop/wp-admin/ must still be cacheable without the directive -- "
+         f"otherwise this test cannot prove the fix, got {h0.get('x-ct-status')}")
+    _, _, h1 = fetch(ng.port, "/noshop/wp-admin/")
+    assert h1.get("x-ct-status") == "HIT", \
+        ("/noshop/wp-admin/ must CACHE without the directive (the item-18 bug) "
+         f"-- got {h1.get('x-ct-status')}")
+
+    # THE FIX: same path under the mount, with the directive -> preset URI rule
+    # matches after the rebase -> bypass.
+    _, _, h = fetch(ng.port, "/shop/wp-admin/")
+    assert h.get("x-ct-status") == "BYPASS", \
+        ("/shop/wp-admin/ must bypass: cache_turbo_backend_prefix rebases it to "
+         f"/wp-admin/ so the wordpress preset rule matches, got {h.get('x-ct-status')}")
+
+    # a second rebased needle, to prove the rebase is not special-cased to one rule
+    _, _, h = fetch(ng.port, "/shop/wp-login.php")
+    assert h.get("x-ct-status") == "BYPASS", \
+        f"/shop/wp-login.php must bypass after rebase, got {h.get('x-ct-status')}"
+
+    # OUTSIDE the mount: backend_prefix is /shop/ but the URI starts with
+    # /elsewhere/, so the rebase must not fire. A misconfigured mount leaves the
+    # URI alone rather than force-matching -- it degrades to today's behaviour.
+    _, _, h0 = fetch(ng.port, "/elsewhere/wp-admin/")
+    assert h0.get("x-ct-status") == "MISS", \
+        ("a URI outside the configured mount must not be rebased, got "
+         f"{h0.get('x-ct-status')}")
+    _, _, h1 = fetch(ng.port, "/elsewhere/wp-admin/")
+    assert h1.get("x-ct-status") == "HIT", \
+        ("an unrebased URI keeps today's (buggy-by-design) caching behaviour, "
+         f"got {h1.get('x-ct-status')}")
+
+    # BOUNDARY survives the rebase: "/shop/wp-adminfoo" rebases to
+    # "/wp-adminfoo", where the byte after the needle is a letter -> no match.
+    _, _, h0 = fetch(ng.port, "/shop/wp-adminfoo")
+    assert h0.get("x-ct-status") == "MISS", \
+        ("/shop/wp-adminfoo must NOT match /wp-admin/ after rebase (letters "
+         f"continue past the needle), got {h0.get('x-ct-status')}")
+    _, _, h1 = fetch(ng.port, "/shop/wp-adminfoo")
+    assert h1.get("x-ct-status") == "HIT", \
+        f"/shop/wp-adminfoo must cache (not bypassed), got {h1.get('x-ct-status')}"
+
+    # a normal page under the mount still caches -- the rebase must not turn the
+    # whole mounted subtree into a bypass.
+    _, _, h0 = fetch(ng.port, "/shop/about")
+    assert h0.get("x-ct-status") == "MISS", "mounted normal page first fetch MISS"
+    _, _, h1 = fetch(ng.port, "/shop/about")
+    assert h1.get("x-ct-status") == "HIT", \
+        f"/shop/about must cache, got {h1.get('x-ct-status')}"
 
 
 def test_key_cookie(ng: Nginx) -> None:
@@ -9359,6 +9487,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_backend_none_overrides_inherited(ng, origin)
     test_valid_status_rejects_304(ng)
     test_empty_l2_prefix_rejected(ng)
+    test_backend_prefix_rejected(ng)
     test_keepalive_cap_rejected(ng)
     test_memcached_keepalive_invalid_rejected(ng)
     test_memcached_keepalive_cap_rejected(ng)
@@ -9425,6 +9554,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_cache_and_purge_respect_access_control(ng)
     test_bypass(ng)
     test_bypass_uri(ng)
+    test_backend_prefix_subdir(ng)
     test_require_header(ng)
     test_key_cookie(ng)
     test_status_variable(ng)
@@ -9644,7 +9774,10 @@ def main() -> int:
           "If-Modified-Since fresh/stale, INM-beats-IMS precedence), "
           "PURGE method, COR-5 auto-Vary variant purge (L1-only gen-bump), "
           "bypass + no_store, DIY bypass_uri (v15: segment-boundary + subdir + "
-          "non-boundary caches), DIY key_cookie (v15: value-keyed entries + anon "
+          "non-boundary caches), backend_prefix subdir installs (item 18: "
+          "rebased preset URI rules + control location proves the bug + "
+          "unrebased outside mount + boundary survives rebase + malformed "
+          "rejected), DIY key_cookie (v15: value-keyed entries + anon "
           "bucket + exact-name + split-header + oversize values collapse to one "
           "bucket distinct from anon and from in-range, 256 still verbatim), "
           "$cache_turbo_status (MISS/HIT/BYPASS + bypasses counter, "

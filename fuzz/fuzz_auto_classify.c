@@ -123,6 +123,18 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
      * left out of it. */
     clcf.backend_presets = NGX_HTTP_CACHE_TURBO_BACKEND_ALL;
 
+    /* Subdirectory mount (cache_turbo_backend_prefix). clcf is NOT memset, so
+     * this field must be assigned on every path or auto_skip dereferences stack
+     * garbage. Alternate between unset and a fixed "/shop/" mount, keyed off a
+     * byte of the input, so BOTH the rebased and the un-rebased comparison get
+     * fuzzed: the rebase shortens the URI it hands to the prefix matcher, which
+     * is exactly where a length underflow would show up. A real mount is always
+     * well-formed ('/'-delimited, validated at config time), so fuzzing the
+     * mount VALUE itself would test a state the config parser cannot produce. */
+    static ngx_str_t  mount = { 6, (u_char *) "/shop/" };
+
+    clcf.backend_prefix = (uri_len && (uri_buf[0] & 1)) ? &mount : NULL;
+
     /* Return is 0/1; the bug class is an OOB read inside, which ASAN catches. */
     (void) ngx_http_cache_turbo_auto_skip(&r, &clcf);
 

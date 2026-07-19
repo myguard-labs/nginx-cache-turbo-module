@@ -38,6 +38,14 @@ surfaces that are dynamic *before* any cookie exists. As defence-in-depth,
 | Query args | — |
 | Cookie header substrings | `SESS` |
 
+> **Subdirectory installs.** The URI prefixes above are root-relative literals
+> matched from byte 0 of `r->uri`, so an install mounted under a subdirectory
+> (`/shop/`, `/forum/`, …) matches **none** of them — the admin surface
+> included. Declare the mount with `cache_turbo_backend_prefix /shop/;` and the
+> preset URI tier is compared against the rebased path. Scoping the nginx
+> `location` does **not** substitute: it routes requests, it does not rewrite
+> `r->uri`. See [frameworks.md](frameworks.md).
+
 Drupal's session cookie is `SESS<32-hex>` — or `SSESS<32-hex>` over TLS — where
 the hash is the first 32 chars of a SHA-256 derived per-install from the site's
 hostname and base path (`Core/Session/SessionConfiguration::getUnprefixedName()`,

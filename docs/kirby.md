@@ -30,6 +30,14 @@ That is genuinely all most Kirby sites need.
 | URI prefixes | `/panel` |
 | Query args | — |
 
+> **Subdirectory installs.** The URI prefixes above are root-relative literals
+> matched from byte 0 of `r->uri`, so an install mounted under a subdirectory
+> (`/shop/`, `/forum/`, …) matches **none** of them — the admin surface
+> included. Declare the mount with `cache_turbo_backend_prefix /shop/;` and the
+> preset URI tier is compared against the rebased path. Scoping the nginx
+> `location` does **not** substitute: it routes requests, it does not rewrite
+> `r->uri`. See [frameworks.md](frameworks.md).
+
 **`kirby_session` is the rare cookie that is both shippable and meaningful.** It is
 a **stable literal** (`session.cookieName`) — no per-install hash, no `APP_NAME`
 slug, no admin-settable prefix — *and* Kirby creates a session only when something

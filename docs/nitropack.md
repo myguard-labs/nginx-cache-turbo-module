@@ -210,6 +210,14 @@ out rather than with a wildcard: `set_real_ip_from 0.0.0.0/0` would trust the
 
 ## Gotchas
 
+> **Subdirectory installs.** This preset's URI rules are root-relative literals
+> matched from byte 0 of `r->uri`, so an install mounted under a subdirectory
+> (`/shop/`, `/forum/`, …) matches **none** of them — the admin surface
+> included. Declare the mount with `cache_turbo_backend_prefix /forum/;` and the
+> preset URI tier is compared against the rebased path. Scoping the nginx
+> `location` does **not** substitute: it routes requests, it does not rewrite
+> `r->uri`. See [frameworks.md](frameworks.md).
+
 - **Purging cache-turbo's origin cache is necessary but not sufficient.** With
   NitroPack's edge in front, a HIT at NitroPack never reaches your origin — so
   purging cache-turbo's zone (`curl -X POST '.../_cache?key=...'`) does nothing
