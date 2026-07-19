@@ -5079,6 +5079,138 @@ def test_tag_without_l2_warns(ng: Nginx) -> None:
         f"missing tag-without-L2 warning:\n{r.stdout}"
 
 
+def test_cache_control_invalid_mode_rejected(ng: Nginx) -> None:
+    """cache_turbo_cache_control takes respect|honor|ignore. Any other token is
+    rejected at config time: the mode decides whether an origin's `private` /
+    `no-store` is obeyed, so silently falling back to a default on a typo'd
+    value would turn a storage floor off without any signal."""
+    r = _config_test_result(
+        ng, lambda c: c.replace(
+            "cache_turbo_valid    0;",
+            "cache_turbo_valid    0;\n"
+            "            cache_turbo_cache_control respekt;", 1))
+    assert r.returncode != 0, \
+        f"invalid cache_control mode was accepted by nginx -t:\n{r.stdout}"
+    assert "want respect|honor|ignore" in r.stdout, \
+        f"missing/odd invalid-mode diagnostic:\n{r.stdout}"
+
+
+def test_cache_control_duplicate_rejected(ng: Nginx) -> None:
+    """Two cache_turbo_cache_control directives in one block is a config error,
+    not last-wins. The two modes disagree about the storage floor, so guessing
+    which the operator meant is worse than refusing to start."""
+    r = _config_test_result(
+        ng, lambda c: c.replace(
+            "cache_turbo_valid    0;",
+            "cache_turbo_valid    0;\n"
+            "            cache_turbo_cache_control honor;\n"
+            "            cache_turbo_cache_control ignore;", 1))
+    assert r.returncode != 0, \
+        f"duplicate cache_control was accepted by nginx -t:\n{r.stdout}"
+    assert "is duplicate" in r.stdout, \
+        f"missing duplicate-directive diagnostic:\n{r.stdout}"
+
+
+def test_valid_status_rejects_out_of_range_code(ng: Nginx) -> None:
+    """A cache_turbo_valid status code outside 100..599 is rejected. This is a
+    DIFFERENT arm from the 1xx/206/304 refusal (test_valid_status_rejects_304):
+    that one refuses valid-but-unstorable codes, this one refuses a value that
+    is not an HTTP status at all -- e.g. a time typo'd into the code slot."""
+    r = _config_test_result(
+        ng, lambda c: c.replace(
+            "cache_turbo_valid    0;",
+            "cache_turbo_valid    0;\n"
+            "            cache_turbo_valid 999 1m;", 1))
+    assert r.returncode != 0, \
+        f"out-of-range status code was accepted by nginx -t:\n{r.stdout}"
+    assert "bad status code" in r.stdout, \
+        f"missing/odd bad-status-code diagnostic:\n{r.stdout}"
+
+
+def test_valid_rejects_bad_time(ng: Nginx) -> None:
+    """The last cache_turbo_valid argument is always the time; an unparseable
+    one is rejected rather than silently resolving to 0 (which the parser then
+    promotes to cache-forever -- the worst possible reading of a typo)."""
+    r = _config_test_result(
+        ng, lambda c: c.replace(
+            "cache_turbo_valid    0;",
+            "cache_turbo_valid    0;\n"
+            "            cache_turbo_valid 404 5x;", 1))
+    assert r.returncode != 0, \
+        f"bad valid time was accepted by nginx -t:\n{r.stdout}"
+    assert "bad time" in r.stdout, \
+        f"missing/odd bad-time diagnostic:\n{r.stdout}"
+
+
+def test_require_header_rejects_invalid_name(ng: Nginx) -> None:
+    """cache_turbo_require_header takes an RFC 9110 token. A non-token name can
+    never match a real response header, so the store gate would silently never
+    pass -- a cache that stores nothing, with no diagnostic. Rejected instead."""
+    r = _config_test_result(
+        ng, lambda c: c.replace(
+            "cache_turbo_valid    0;",
+            "cache_turbo_valid    0;\n"
+            "            cache_turbo_require_header \"X-Bad:Name\";", 1))
+    assert r.returncode != 0, \
+        f"invalid require_header name was accepted by nginx -t:\n{r.stdout}"
+    assert "invalid header name" in r.stdout, \
+        f"missing/odd invalid-header-name diagnostic:\n{r.stdout}"
+
+
+def test_require_header_duplicate_rejected(ng: Nginx) -> None:
+    """Two cache_turbo_require_header directives in one block: the gate is a
+    single name, so the second would be silently dropped and the operator would
+    believe both headers were required."""
+    r = _config_test_result(
+        ng, lambda c: c.replace(
+            "cache_turbo_valid    0;",
+            "cache_turbo_valid    0;\n"
+            "            cache_turbo_require_header X-One;\n"
+            "            cache_turbo_require_header X-Two;", 1))
+    assert r.returncode != 0, \
+        f"duplicate require_header was accepted by nginx -t:\n{r.stdout}"
+    assert "is duplicate" in r.stdout, \
+        f"missing duplicate-directive diagnostic:\n{r.stdout}"
+
+
+def test_redis_bad_db_rejected(ng: Nginx) -> None:
+    """A non-numeric Redis db is rejected at config time rather than defaulting
+    to db 0 -- silently sharing db 0 with another application's keys is exactly
+    what an explicit db selector was written to prevent.
+
+    Both arms are pinned because they are SEPARATE parser paths with separate
+    diagnostics: the `db=N` trailing param and the `/N` DSN suffix. The rendered
+    test config uses the param form, so the DSN arm is reached by rewriting a
+    bare `host:port db=N` line into DSN form."""
+    if ng.redis_port is None:
+        return
+
+    param_anchor = f"127.0.0.1:{ng.redis_port} db=1"
+    assert param_anchor in nginx_config(
+        ng.root, ng.port, ng.module, ng.origin_port, 1, ng.redis_port,
+        ng.redis_auth_port, ng.redis_password, ng.redis_tls_port,
+        ng.redis_tls_ca, ng.memcached_port), \
+        f"test fixture missing anchor {param_anchor!r}"
+
+    # arm 1: db= trailing param
+    r = _config_test_result(
+        ng, lambda c: c.replace(param_anchor,
+                                f"127.0.0.1:{ng.redis_port} db=xy", 1))
+    assert r.returncode != 0, \
+        f"bad db= param was accepted by nginx -t:\n{r.stdout}"
+    assert "bad db" in r.stdout, \
+        f"missing/odd bad-db diagnostic:\n{r.stdout}"
+
+    # arm 2: /N DSN suffix -- distinct code path, distinct message
+    r = _config_test_result(
+        ng, lambda c: c.replace(param_anchor,
+                                f"redis://127.0.0.1:{ng.redis_port}/xy", 1))
+    assert r.returncode != 0, \
+        f"bad DSN db was accepted by nginx -t:\n{r.stdout}"
+    assert "bad db in DSN" in r.stdout, \
+        f"missing/odd bad-DSN-db diagnostic:\n{r.stdout}"
+
+
 def test_max_size_not_cached(ng: Nginx) -> None:
     """Responses larger than cache_turbo_max_size are never cached (Q2: the
     body filter early-aborts capture the moment body_len crosses max_size, so
@@ -8816,6 +8948,13 @@ def run_all(ng: Nginx, origin: Origin,
     test_keepalive_cap_rejected(ng)
     test_valid_dup_status_warns(ng)
     test_tag_without_l2_warns(ng)
+    test_cache_control_invalid_mode_rejected(ng)
+    test_cache_control_duplicate_rejected(ng)
+    test_valid_status_rejects_out_of_range_code(ng)
+    test_valid_rejects_bad_time(ng)
+    test_require_header_rejects_invalid_name(ng)
+    test_require_header_duplicate_rejected(ng)
+    test_redis_bad_db_rejected(ng)
     test_no_cache_set_cookie(ng)
     test_no_cache_cc_private(ng)
     test_no_cache_cc_nostore(ng)
@@ -9132,6 +9271,9 @@ def main() -> int:
           "cached), "
           "config maxima/warns (STAB-5 keepalive cap rejected, COR-9 dup-status "
           "warn, COR-0 tag-without-L2 warn), "
+          "config-time rejects (cache_control bad-mode/duplicate, valid "
+          "out-of-range code/bad time, require_header non-token/duplicate, "
+          "redis DSN bad db), "
           "autotune (v4-3: raises beta within band/off-by-default/"
           "insufficient-data/churn-disqualify)"
           + (", L2 write-through (P4), keepalive pool reuse (v15), "
