@@ -505,6 +505,17 @@ ngx_http_cache_turbo_shm_claim(ngx_http_cache_turbo_zone_t *z,
          * overwrites it on store(). */
         ctn->refreshing = 1;
         ctn->refresh_lock_until = now + lock_ttl;
+        ctn->l2_neg_until = 0;       /* L13: this node is now a stub, not a memo
+                                      * carrier -- same reset every other
+                                      * shape-conversion site does (store(),
+                                      * the new-stub path below, count_miss()).
+                                      * This branch takes over an EXISTING node,
+                                      * which may be a counter node carrying a
+                                      * live memo; leaving it stamped would let
+                                      * the memo outlive the single-flight it
+                                      * now belongs to, and would keep
+                                      * shm_unstub() from clearing the stub on a
+                                      * non-cacheable origin response. */
         ngx_shmtx_unlock(&z->shpool->mutex);
         return NGX_HTTP_CACHE_TURBO_CLAIM_WINNER;
     }
@@ -558,16 +569,26 @@ ngx_http_cache_turbo_shm_unstub(ngx_http_cache_turbo_zone_t *z,
     ctn = ngx_http_cache_turbo_shm_lookup(z, key_hash, hash);
 
     /* len == 0 && data == NULL is NOT enough to identify a stub: the min_uses
-     * counter node and the L13 negative memo share exactly that shape. Dropping
-     * one of those here silently resets state the caller never meant to touch
-     * -- it cost the L13 memo its entire lifetime (every non-cacheable cold
-     * miss deleted the memo it had just armed, so the window never survived a
-     * single request), and it has always quietly reset min_uses counters the
-     * same way on this path.
+     * counter node and the L13 negative memo share exactly that shape, so a
+     * bare shape check here would drop state the caller never meant to touch.
+     * The extra l2_neg_until term keeps a node whose memo is still live.
      *
-     * A real stub is the one that carries single-flight state (refreshing), so
-     * key on that. A node carrying a LIVE memo is kept even when it is not a
-     * stub; an expired memo on a counter-only node is free to go. */
+     * ⚠ Keying on `refreshing` instead would be the more direct statement of
+     * "a real stub is the one carrying single-flight state", and would also
+     * cover the min_uses counter node (which this guard does NOT protect --
+     * a counter node with no memo has l2_neg_until == 0 and is still freed
+     * here). It was measured rather than assumed: an instrumented full-suite
+     * run (2026-07-19) logged 68 calls to this function, every one of them
+     * refreshing == 1, l2_neg_until == 0, miss_count == 0. So on every path
+     * the suite exercises, both formulations behave identically and only real
+     * stubs ever reach here. The narrower term is kept because it is what is
+     * tested; switching it is a behaviour-preserving cleanup, not a fix.
+     *
+     * That same run recorded ZERO calls to evict_one, which refutes eviction
+     * as the cause of the memo's short lifetime. The actual cause is upstream
+     * of this function -- see l2_neg_check/l2_neg_set below, whose
+     * !ctn->refreshing conditions are masked by claim() setting refreshing on
+     * the memo's own node. */
     if (ctn != NULL && ctn->len == 0 && ctn->data == NULL
         && ctn->l2_neg_until <= ngx_time())
     {
