@@ -26,6 +26,15 @@
  * the runtime ngx_http_cache_turbo_loc_conf_t.stale_mult field. */
 #define NGX_HTTP_CACHE_TURBO_STALE_MULTIPLIER  4
 
+/* Bounds on an explicit cache_turbo_stale_mult N. The floor is 1 ("no stale
+ * window": stale_ttl == fresh_ttl, nothing is ever served stale) because
+ * ngx_http_cache_turbo_stale_ttl() coerces <= 0 back to the BALANCED default,
+ * so a literal 0 would silently mean 4 rather than what the operator wrote.
+ * The ceiling matches the largest band multiplier and keeps
+ * FOREVER_TTL * stale_mult inside the uint32 blob stale_ttl field. */
+#define NGX_HTTP_CACHE_TURBO_STALE_MULT_MIN  1
+#define NGX_HTTP_CACHE_TURBO_STALE_MULT_MAX  8
+
 /* "Forever" fresh TTL. `cache_turbo_valid 0` ("cache forever", per the code's
  * long-standing contract) resolves to this long-but-finite TTL rather than a
  * literal 0 — a literal 0 made the object instantly+permanently STALE and
@@ -454,6 +463,7 @@ typedef struct {
      * write and what merge inherits down the tree WITHOUT a literal default, so
      * a knob stays UNSET until a real directive sets it at some level. The
      * non-raw fields (valid/beta/lock_ttl/stale_mult) are the EFFECTIVE values
+     * (every one of the four now has a directive and therefore a *_raw twin)
      * the request path reads: in merge_loc_conf each resolves to its *_raw value
      * if set, else the resolved preset's band value. Keeping raw separate from
      * effective is what lets a location's preset still win when an ancestor only
@@ -463,6 +473,8 @@ typedef struct {
     time_t                   valid_raw;   /* explicit cache_turbo_valid      */
     ngx_int_t                beta_raw;    /* explicit cache_turbo_beta       */
     time_t                   lock_ttl_raw;/* explicit cache_turbo_lock_ttl   */
+    ngx_int_t                stale_mult_raw;
+                                          /* explicit cache_turbo_stale_mult */
 
     time_t                   valid;       /* fresh TTL (seconds), effective */
     ngx_int_t                beta;        /* SWR aggressiveness /1000, eff  */

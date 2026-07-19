@@ -2125,6 +2125,16 @@ http {{
             cache_turbo_valid    1s;     # stale_mult=4 -> expires at 4s
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
+        # H5: the aggressive band is stale_mult=8, but an explicit directive
+        # must beat it -> 1 = no stale window at all, hard-expires at 1s.
+        location /psm/ {{
+            cache_turbo             main;
+            cache_turbo_key         $uri;
+            cache_turbo_preset      aggressive;
+            cache_turbo_valid       1s;
+            cache_turbo_stale_mult  1;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
         location /pa/ {{
             cache_turbo          main;
             cache_turbo_key      $uri;
@@ -8615,6 +8625,88 @@ def test_preset_window_differs(ng: Nginx, origin: Origin) -> None:
     drain_origin(origin)       # v8: settle async bg refreshes before the next test
 
 
+def test_stale_mult_directive_beats_preset(ng: Nginx, origin: Origin) -> None:
+    """H5: an explicit cache_turbo_stale_mult overrides the resolved preset's
+    band multiplier, the same way cache_turbo_valid/_beta/_lock_ttl already do.
+
+    /psm/ carries `cache_turbo_preset aggressive` (band stale_mult=8) plus
+    `cache_turbo_stale_mult 1`. The paired assertion is what makes this
+    load-bearing: /pa/ is the SAME preset and the SAME 1s fresh TTL and is
+    still serveable as STALE at t=3s, so if the directive were ignored /psm/
+    would behave identically. It must instead hard-expire and MISS -- proving
+    the raw value reached the runtime stale math and beat the band, not merely
+    that some window exists."""
+    fetch(ng.port, "/psm/win")                         # prime
+    fetch(ng.port, "/pa/win2")                         # control, same preset
+    time.sleep(3.0)
+
+    # directive wins: stale_mult=1 -> stale_until == fresh_until -> hard MISS
+    s, _, h = fetch(ng.port, "/psm/win")
+    assert s == 200, f"stale_mult=1 re-read status {s}"
+    assert "x-cache" not in h, \
+        ("explicit cache_turbo_stale_mult 1 should hard-expire at 1s and MISS, "
+         f"got X-Cache={h.get('x-cache')} -- the directive lost to the "
+         "aggressive band (stale_mult=8), i.e. the raw/effective split is "
+         "not wired")
+
+    # control: same preset, no directive -> the band's 8s window still applies,
+    # so the difference above is attributable to the directive alone.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+        results = list(pool.map(lambda _: fetch(ng.port, "/pa/win2"), range(16)))
+    assert any(h.get("x-cache") == "STALE" for _, _, h in results), \
+        ("control /pa/ (aggressive band, no directive) should still serve "
+         "STALE at t=3s; got "
+         + repr(sorted({h.get('x-cache') for _, _, h in results})))
+    drain_origin(origin)
+
+
+def test_stale_mult_rejects_out_of_range(ng: Nginx) -> None:
+    """H5: cache_turbo_stale_mult is range-checked at config time.
+
+    `0` is the arm that matters: ngx_http_cache_turbo_stale_ttl() coerces a
+    non-positive multiplier back to the BALANCED default of 4, so accepting a
+    literal 0 would silently give the operator a 4x stale window instead of the
+    "no stale window" they asked for. Rejecting it at parse is what keeps the
+    directive honest. The boundaries 1 and 8 must still be accepted, so an
+    off-by-one range check fails here rather than passing unnoticed."""
+    anchor = "cache_turbo_stale_mult  1;"
+    assert anchor in nginx_config(
+        ng.root, ng.port, ng.module, ng.origin_port, 1, ng.redis_port,
+        ng.redis_auth_port, ng.redis_password, ng.redis_tls_port,
+        ng.redis_tls_ca, ng.memcached_port), \
+        f"test fixture missing anchor {anchor!r}"
+
+    # in-range-check arm: parses fine as a number, refused by the bounds
+    for bad in ("0", "9"):
+        r = _config_test_result(
+            ng, lambda c, b=bad: c.replace(
+                anchor, f"cache_turbo_stale_mult  {b};", 1))
+        assert r.returncode != 0, \
+            f"cache_turbo_stale_mult {bad} was accepted by nginx -t:\n{r.stdout}"
+        assert "out of range" in r.stdout, \
+            f"missing/odd range diagnostic for {bad}:\n{r.stdout}"
+
+    # parse arm: ngx_atoi has no sign handling, so a negative never reaches the
+    # bounds check and surfaces as "bad value" -- still rejected, different
+    # diagnostic. Pinned so the two paths can't be collapsed by a later editor.
+    for bad in ("-1", "abc"):
+        r = _config_test_result(
+            ng, lambda c, b=bad: c.replace(
+                anchor, f"cache_turbo_stale_mult  {b};", 1))
+        assert r.returncode != 0, \
+            f"cache_turbo_stale_mult {bad} was accepted by nginx -t:\n{r.stdout}"
+        assert "bad value" in r.stdout, \
+            f"missing/odd bad-value diagnostic for {bad}:\n{r.stdout}"
+
+    # both boundaries stay legal
+    for good in ("1", "8"):
+        r = _config_test_result(
+            ng, lambda c, g=good: c.replace(
+                anchor, f"cache_turbo_stale_mult  {g};", 1))
+        assert r.returncode == 0, \
+            f"cache_turbo_stale_mult {good} (a legal boundary) was rejected:\n{r.stdout}"
+
+
 def test_preset_micro_default_ttl(ng: Nginx, origin: Origin) -> None:
     """micro preset: with NO explicit cache_turbo_valid the band's own 1s fresh
     TTL takes effect (stale_mult=2 -> entry hard-expires at ~2s). An immediate
@@ -9156,6 +9248,8 @@ def run_all(ng: Nginx, origin: Origin,
     test_auto_vary_mixed_refused_wins(ng, origin)
     test_auto_vary_off_ignores_vary(ng, origin)
     test_preset_window_differs(ng, origin)
+    test_stale_mult_directive_beats_preset(ng, origin)
+    test_stale_mult_rejects_out_of_range(ng)
     test_preset_micro_default_ttl(ng, origin)
     test_invalid_preset_name(ng)
     test_autotune_raises_beta_within_band(ng, origin)
@@ -9343,6 +9437,7 @@ def main() -> int:
           "auto-Vary (v11: encoding/same-class/device/language/origin split, "
           "Vary:*/Cookie/mixed-refused uncacheable, off-by-default ignores Vary), "
           "presets (v3-2: conservative/aggressive stale-window differ, "
+          "explicit cache_turbo_stale_mult beats the band + range-rejects, "
           "invalid-name rejected), "
           "cookie predicate multi-match (guest cookie must not mask a member "
           "in the same header, both orders, two-guests still cacheable), "
