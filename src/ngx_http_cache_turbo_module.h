@@ -616,6 +616,12 @@ typedef struct {
     ngx_int_t                redis_keepalive;        /* max idle conns, 0=off  */
     ngx_msec_t               redis_keepalive_timeout;/* idle close timeout     */
 
+    /* Memcached keepalive pool (v14). cache_turbo_memcached keepalive=N caches
+     * up to N idle L2 connections per worker. 0 = off (default). Memcached has
+     * no auth/TLS/db, so identity = peer addr only (simpler than redis). */
+    ngx_int_t                memcached_keepalive;        /* max idle conns, 0=off  */
+    ngx_msec_t               memcached_keepalive_timeout;/* idle close timeout     */
+
     /* Full DSN (v5): cache_turbo_redis accepts redis://[user:pass@]host:port/db
      * (rediss:// = TLS), with prefix=/timeout=/password=/user=/db=/tls=/
      * tls_verify=/tls_ca=/tls_name= overrides. On each connection the driver
@@ -1200,6 +1206,40 @@ struct ngx_cache_turbo_backend_s {
     ngx_int_t  (*unlock)(ngx_http_cache_turbo_loc_conf_t *clcf, u_char *key_hash,
         ngx_str_t *owner);
 };
+
+
+/* Memcached keepalive pool per-profile bucket (v14). Peer addr is the only
+ * profile identity (no auth/TLS/db like redis). */
+typedef struct ngx_http_cache_turbo_memcached_ka_bucket_s
+    ngx_http_cache_turbo_memcached_ka_bucket_t;
+
+typedef struct {
+    ngx_queue_t                                     queue;
+    ngx_connection_t                               *connection;
+    ngx_http_cache_turbo_memcached_ka_bucket_t    *bucket;
+} ngx_http_cache_turbo_memcached_ka_item_t;
+
+struct ngx_http_cache_turbo_memcached_ka_bucket_s {
+    ngx_uint_t   inited;
+    ngx_uint_t   max;
+    ngx_uint_t   count;
+    ngx_msec_t   timeout;
+    ngx_queue_t  cache;
+    ngx_queue_t  free;
+    ngx_http_cache_turbo_memcached_ka_item_t *items;
+    socklen_t    socklen;
+    ngx_sockaddr_t sockaddr;
+};
+
+#define NGX_HTTP_CACHE_TURBO_MEMCACHED_KA_MAX_BUCKETS  16
+
+typedef struct {
+    ngx_uint_t  nbuckets;
+    ngx_http_cache_turbo_memcached_ka_bucket_t
+                buckets[NGX_HTTP_CACHE_TURBO_MEMCACHED_KA_MAX_BUCKETS];
+} ngx_http_cache_turbo_memcached_ka_t;
+
+extern ngx_http_cache_turbo_memcached_ka_t ngx_http_cache_turbo_memcached_ka;
 
 extern ngx_cache_turbo_backend_t  ngx_http_cache_turbo_redis_backend;
 extern ngx_cache_turbo_backend_t  ngx_http_cache_turbo_memcached_backend;

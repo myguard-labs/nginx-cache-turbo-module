@@ -5050,6 +5050,51 @@ def test_keepalive_cap_rejected(ng: Nginx) -> None:
         f"missing keepalive-cap diagnostic:\n{r.stdout}"
 
 
+def test_memcached_keepalive_invalid_rejected(ng: Nginx) -> None:
+    """L14: cache_turbo_memcached keepalive=<bad> is rejected."""
+    if ng.memcached_port is None:
+        return
+    def mutate(c):
+        return c.replace(
+            f"cache_turbo_memcached  127.0.0.1:{ng.memcached_port} prefix=mc: timeout=250ms;",
+            f"cache_turbo_memcached  127.0.0.1:{ng.memcached_port} prefix=mc: timeout=250ms keepalive=abc;", 1)
+    r = _config_test_result(ng, mutate)
+    assert r.returncode != 0, \
+        f"bad keepalive was accepted by nginx -t:\n{r.stdout}"
+    assert "bad keepalive" in r.stdout, \
+        f"missing bad-keepalive diagnostic:\n{r.stdout}"
+
+
+def test_memcached_keepalive_cap_rejected(ng: Nginx) -> None:
+    """L14: cache_turbo_memcached keepalive=N > max is rejected."""
+    if ng.memcached_port is None:
+        return
+    def mutate(c):
+        return c.replace(
+            f"cache_turbo_memcached  127.0.0.1:{ng.memcached_port} prefix=mc: timeout=250ms;",
+            f"cache_turbo_memcached  127.0.0.1:{ng.memcached_port} prefix=mc: timeout=250ms keepalive=99999999;", 1)
+    r = _config_test_result(ng, mutate)
+    assert r.returncode != 0, \
+        f"oversized keepalive was accepted by nginx -t:\n{r.stdout}"
+    assert "must be <=" in r.stdout, \
+        f"missing keepalive-cap diagnostic:\n{r.stdout}"
+
+
+def test_memcached_keepalive_timeout_invalid_rejected(ng: Nginx) -> None:
+    """L14: cache_turbo_memcached keepalive_timeout=<bad> is rejected."""
+    if ng.memcached_port is None:
+        return
+    def mutate(c):
+        return c.replace(
+            f"cache_turbo_memcached  127.0.0.1:{ng.memcached_port} prefix=mc: timeout=250ms;",
+            f"cache_turbo_memcached  127.0.0.1:{ng.memcached_port} prefix=mc: timeout=250ms keepalive=8 keepalive_timeout=notatime;", 1)
+    r = _config_test_result(ng, mutate)
+    assert r.returncode != 0, \
+        f"bad keepalive_timeout was accepted by nginx -t:\n{r.stdout}"
+    assert "bad keepalive_timeout" in r.stdout, \
+        f"missing bad-timeout diagnostic:\n{r.stdout}"
+
+
 def test_valid_dup_status_warns(ng: Nginx) -> None:
     """COR-9: a second cache_turbo_valid rule for a status code is dead
     (status_ttl returns the first match). nginx -t loads but must warn."""
@@ -8946,6 +8991,9 @@ def run_all(ng: Nginx, origin: Origin,
     test_valid_status_rejects_304(ng)
     test_empty_l2_prefix_rejected(ng)
     test_keepalive_cap_rejected(ng)
+    test_memcached_keepalive_invalid_rejected(ng)
+    test_memcached_keepalive_cap_rejected(ng)
+    test_memcached_keepalive_timeout_invalid_rejected(ng)
     test_valid_dup_status_warns(ng)
     test_tag_without_l2_warns(ng)
     test_cache_control_invalid_mode_rejected(ng)
