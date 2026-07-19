@@ -385,6 +385,9 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
 };
 
 
+static void ngx_http_cache_turbo_exit_process(ngx_cycle_t *cycle);
+
+
 static ngx_http_module_t  ngx_http_cache_turbo_module_ctx = {
     ngx_http_cache_turbo_add_variables,    /* preconfiguration */
     ngx_http_cache_turbo_init,             /* postconfiguration */
@@ -410,7 +413,7 @@ ngx_module_t  ngx_http_cache_turbo_module = {
     NULL,                                  /* init process */
     NULL,                                  /* init thread */
     NULL,                                  /* exit thread */
-    NULL,                                  /* exit process */
+    ngx_http_cache_turbo_exit_process,     /* exit process */
     NULL,                                  /* exit master */
     NGX_MODULE_V1_PADDING
 };
@@ -449,11 +452,33 @@ typedef struct {
 } ngx_http_cache_turbo_digest_t;
 
 
+#if (NGX_SSL)
+/* P6: one EVP_MD_CTX per worker, reused across every digest.
+ *
+ * nginx workers are single-threaded and a digest never spans an event-handler
+ * return (init/update/final all run within one call), so there is no window in
+ * which two digests are live at once and a single shared ctx is safe. Each
+ * digest_init() does EVP_DigestInit_ex() on it, which resets the hash state —
+ * so no residue carries between callers.
+ *
+ * Created lazily on first use rather than from an init_process hook, so a
+ * digest issued before worker fork (config-time key derivation) still works.
+ * Freed in exit_process; leaking it at shutdown would be harmless but shows up
+ * under valgrind/ASan and the suite treats that as a failure.
+ */
+static EVP_MD_CTX  *ngx_http_cache_turbo_worker_md;
+#endif
+
+
 static void
 ngx_http_cache_turbo_digest_init(ngx_http_cache_turbo_digest_t *d)
 {
 #if (NGX_SSL)
-    d->md = EVP_MD_CTX_new();
+    if (ngx_http_cache_turbo_worker_md == NULL) {
+        ngx_http_cache_turbo_worker_md = EVP_MD_CTX_new();
+    }
+
+    d->md = ngx_http_cache_turbo_worker_md;
     d->ok = (d->md != NULL
              && EVP_DigestInit_ex(d->md, EVP_sha256(), NULL) == 1) ? 1 : 0;
 #else
@@ -496,10 +521,9 @@ ngx_http_cache_turbo_digest_final(ngx_http_cache_turbo_digest_t *d,
          * rather than read uninitialised bytes. Practically unreachable. */
         ngx_memzero(out, 32);
     }
-    if (d->md != NULL) {
-        EVP_MD_CTX_free(d->md);
-        d->md = NULL;
-    }
+    /* P6: the ctx is worker-persistent — do NOT free it here. The next
+     * digest_init() re-keys it via EVP_DigestInit_ex(); exit_process frees it. */
+    d->md = NULL;
 #else
     ngx_md5_final(out, &d->lo);          /* low 16 */
     ngx_md5_final(out + 16, &d->hi);     /* high 16 */
@@ -516,6 +540,21 @@ ngx_http_cache_turbo_digest(const void *data, size_t len, u_char out[32])
     ngx_http_cache_turbo_digest_init(&d);
     ngx_http_cache_turbo_digest_update(&d, data, len);
     ngx_http_cache_turbo_digest_final(&d, out);
+}
+
+
+/* P6: release the worker-persistent digest ctx (see digest_init). */
+static void
+ngx_http_cache_turbo_exit_process(ngx_cycle_t *cycle)
+{
+    (void) cycle;
+
+#if (NGX_SSL)
+    if (ngx_http_cache_turbo_worker_md != NULL) {
+        EVP_MD_CTX_free(ngx_http_cache_turbo_worker_md);
+        ngx_http_cache_turbo_worker_md = NULL;
+    }
+#endif
 }
 
 
