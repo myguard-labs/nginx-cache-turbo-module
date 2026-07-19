@@ -4471,11 +4471,22 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
      * it as an L2 miss directly. Marking l2_done keeps the rest of the handler
      * (and the l2_misses metric below) on exactly the path a real miss takes,
      * so a memoed miss and a fetched miss are indistinguishable downstream. */
+    if (clcf->backend && clcf->l2_negative_ttl > 0) {
+        ngx_log_error(NGX_LOG_NOTICE, r->connection->log, 0,
+                      "PROBE3 \"%V\" done=%d force=%d chk=%d",
+                      &r->uri, (int) ctx->l2_done, (int) ctx->l2_neg_force,
+                      (int) clcf->l1->l2_neg_check(z, ctx->key_hash, hash));
+    }
+
     if (clcf->backend && !ctx->l2_done && !ctx->l2_neg_force
         && clcf->l2_negative_ttl > 0
         && clcf->l1->l2_neg_check(z, ctx->key_hash, hash) == NGX_DECLINED)
     {
         ctx->l2_done = 1;
+        /* NGX_DECLINED is right HERE (unlike the cold-wait re-poll seed, which
+         * uses NGX_ERROR): the memo asserts L2 definitively lacks the key, and
+         * downstream must not be able to tell a memoed miss from a fetched one.
+         * l2_neg_skipped on the next line is what stops this from re-arming. */
         ctx->l2_result = NGX_DECLINED;
         ctx->l2_neg_skipped = 1;
         (void) ngx_atomic_fetch_add(&z->sh->l2_neg_skips, 1);
@@ -4619,8 +4630,28 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
          * BECAUSE of a memo would slide the window forward on every request and
          * keep L2 switched off indefinitely for a hot-but-absent key. Only a
          * miss learned from a REAL round-trip may arm the memo, so the window
-         * is bounded at l2_negative_ttl from the last actual L2 answer. */
-        if (clcf->l2_negative_ttl > 0 && !ctx->l2_neg_skipped) {
+         * is bounded at l2_negative_ttl from the last actual L2 answer.
+         *
+         * ⚠ Guarded on l2_result == NGX_DECLINED: ONLY a definitive miss arms it.
+         * l2_result is tri-state (see the ctx field) and NGX_ERROR means L2's
+         * answer is unknown -- a timeout, a dropped connection, a malformed or
+         * error reply, or a local alloc failure on a real HIT. Arming on those
+         * turned an L2 OUTAGE into self-inflicted amplification: every failed GET
+         * armed a memo, the memos then suppressed the GETs that would have noticed
+         * L2 coming back, and the cache stayed switched off for up to
+         * l2_negative_ttl past recovery. The alloc-failure sub-case was worse
+         * still -- it armed "key is absent" immediately after L2 said it HAS the
+         * key. (Codex #5 on PR #77.) */
+        ngx_log_error(NGX_LOG_NOTICE, r->connection->log, 0,
+                      "PROBE arm \"%V\" ttl=%d skipped=%d result=%d WILLARM=%d",
+                      &r->uri, (int) clcf->l2_negative_ttl,
+                      (int) ctx->l2_neg_skipped, (int) ctx->l2_result,
+                      (int) (clcf->l2_negative_ttl > 0 && !ctx->l2_neg_skipped
+                             && ctx->l2_result == NGX_DECLINED));
+
+        if (clcf->l2_negative_ttl > 0 && !ctx->l2_neg_skipped
+            && ctx->l2_result == NGX_DECLINED)
+        {
             clcf->l1->l2_neg_set(z, ctx->key_hash, hash,
                                  clcf->l2_negative_ttl);
         }
@@ -4822,7 +4853,14 @@ ngx_http_cache_turbo_cold_wait(ngx_http_request_t *r,
     ctx->l2_done = 0;
     ctx->l2_neg_skipped = 0;
     ctx->l2_neg_force = 1;
-    ctx->l2_result = NGX_DECLINED;
+    /* ⚠ NGX_ERROR ("no L2 answer yet"), NOT NGX_DECLINED. Since L13-fix,
+     * NGX_DECLINED means "L2 definitively does not have this key" and is what
+     * licenses arming the negative memo. Seeding a pre-GET placeholder with it
+     * makes every cold-wait re-poll look like a fresh definitive miss: combined
+     * with the l2_neg_skipped reset above, that re-arms the memo on each poll and
+     * slides l2_neg_until forward indefinitely, so a hot-but-absent key never
+     * re-consults L2. The real result overwrites this when the GET completes. */
+    ctx->l2_result = NGX_ERROR;
     ctx->l2_blob = NULL;
     ctx->l2_blob_len = 0;
 

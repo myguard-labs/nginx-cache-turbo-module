@@ -327,9 +327,35 @@ typedef struct {
  * 32-byte hash of the cache key; the variable-length body (headers + payload,
  * serialised) is slab-allocated separately and pointed to by data/len.
  */
+/* L1 node kind (L13-fix). What the node HOLDS -- the single authority, replacing
+ * the old ad-hoc `len == 0 && data == NULL` shape sniffing. Every guard that used
+ * to infer a node's role from its shape now reads `kind` instead.
+ *
+ * ⚠ ORTHOGONAL TO `refreshing`. A node's kind says what it holds; `refreshing`
+ * says whether a single-flight regen is in the air for it. BOTH kinds can be
+ * refreshing: an ENTRY refreshes while still serving its stale body (the v8
+ * background-update dice, module.c), and a COUNTER refreshing is what the rest
+ * of the code calls a STUB. So "is this a stub?" is exactly
+ * `kind == COUNTER && refreshing`, never a shape test.
+ *
+ * History: stub / negative memo / min_uses counter were three meanings overloaded
+ * onto one body-less shape, disambiguated by a different field at each site. Five
+ * confirmed defects (Codex #1/#4/#5, CodeRabbit CR-A/CR-B on PR #77) were all
+ * sites that picked the wrong disambiguator. See memory issues.md 2026-07-19. */
+#define NGX_HTTP_CACHE_TURBO_NODE_ENTRY    0  /* holds a body (len > 0)        */
+#define NGX_HTTP_CACHE_TURBO_NODE_COUNTER  1  /* no body: min_uses counter
+                                               * and/or L13 negative memo, and
+                                               * (when refreshing) the v10
+                                               * cold-miss stub               */
+
 typedef struct {
     ngx_rbtree_node_t        node;       /* node.key = crc32 of cache key  */
     u_char                   key[32];    /* full key hash, collision guard */
+
+    /* What this node holds; see NGX_HTTP_CACHE_TURBO_NODE_* above. ENTRY is 0 so
+     * a node zeroed by accident reads as ENTRY -- which every serve branch then
+     * rejects on its own `len > 0` test, i.e. the safe direction. */
+    ngx_uint_t               kind;
 
     u_char                  *data;       /* blob bytes; CT_BLOBREF() header
                                           * sits immediately before, slab alloc */
@@ -345,20 +371,35 @@ typedef struct {
                                               * only the claimer regenerates.
                                               * Self-heals if a refresh dies. */
 
-    /* min_uses (v15) miss counter. A "counter node" (data == NULL / len == 0,
-     * refreshing == 0) tracks how many times a key has cold-missed without yet
-     * being cached, so cache_turbo_min_uses N can defer the first store until the
-     * key has been requested N times (don't cache one-hit-wonders). Distinct from
-     * a v10 single-flight STUB, which is also len == 0 but has refreshing == 1.
-     * Irrelevant once the node holds a real body (len > 0); left untouched then. */
+    /* min_uses (v15) miss counter. A COUNTER node tracks how many times a key has
+     * cold-missed without yet being cached, so cache_turbo_min_uses N can defer
+     * the first store until the key has been requested N times (don't cache
+     * one-hit-wonders). Irrelevant once the node becomes an ENTRY; left untouched
+     * then.
+     *
+     * ⚠ A COUNTER with miss_count > 0 carries state the owner never asked to
+     * discard: shm_unstub() must NOT free it (that would silently reset the
+     * min_uses threshold). See the predicate there. */
     ngx_uint_t               miss_count;
 
     /* L2 negative memo (L13). When cache_turbo_l2_negative_ttl is set, an L2 GET
-     * that missed stamps `now + l2_negative_ttl` here, and subsequent cold
-     * requests for the same key skip the L2 round-trip until it expires. Rides
-     * on the same "counter node" (data == NULL / len == 0) as miss_count above,
-     * so a memo costs no extra allocation when min_uses already made one.
-     * 0 = no memo. Cleared on store (a node with a body never consults L2).
+     * that DEFINITIVELY missed stamps `now + l2_negative_ttl` here, and subsequent
+     * cold requests for the same key skip the L2 round-trip until it expires.
+     * Rides on the same COUNTER node as miss_count above, so a memo costs no extra
+     * allocation when min_uses already made one. 0 = no memo. Cleared on store
+     * (an ENTRY never consults L2).
+     *
+     * ⚠ ONLY a definitive miss may arm this -- never a transport failure. An L2
+     * outage that armed memos would suppress the very GETs that notice recovery
+     * (fail-slow amplification for up to l2_negative_ttl past recovery), and an
+     * alloc failure on a real L2 HIT would arm a memo asserting the key is ABSENT.
+     * The adapters therefore distinguish the two: NGX_DECLINED = definitive miss
+     * (arms), NGX_ERROR = transport failure (must not arm). See l2_result.
+     *
+     * ⚠ The memo survives the single-flight that armed it. It is NOT cleared when
+     * a COUNTER becomes a stub (refreshing = 1) -- doing so destroyed the memo
+     * before any later request could read it, which is why the window used to
+     * collapse to ~1 request (CodeRabbit CR-A on PR #77).
      *
      * COHERENCE: this is a bounded-staleness memo, NOT an invalidating one --
      * nothing tells this node that a PEER stored the key during the window. The
@@ -840,7 +881,22 @@ typedef struct {
     unsigned                 warm:1;      /* warm subrequest: force a miss,  */
                                           /* capture + store though !r->main */
     unsigned                 l2_done:1;   /* L2 GET finished (hit or miss)   */
-    ngx_int_t                l2_result;   /* NGX_OK = L2 hit; else miss      */
+    /* L2 GET outcome. TRI-STATE (L13-fix) -- callers that only care "did L2
+     * satisfy this request" still test `== NGX_OK`, but anything that acts on a
+     * MISS must distinguish the two failure kinds:
+     *
+     *   NGX_OK       L2 hit, blob in l2_blob
+     *   NGX_DECLINED DEFINITIVE miss -- a well-formed reply said "not there".
+     *                The only value that may arm the L13 negative memo.
+     *   NGX_ERROR    TRANSPORT failure (timeout / closed conn / malformed reply /
+     *                connect+send error / local alloc failure on an otherwise
+     *                successful hit). L2's answer is UNKNOWN, not "absent".
+     *
+     * Mirrors the convention the cross-node lock path already uses (redis.c
+     * lock_finish: NGX_ERROR on transport failure "so the caller degrades ...
+     * rather than suppressing the refresh"). Same reasoning: an outage must never
+     * suppress the operation that would notice recovery. */
+    ngx_int_t                l2_result;
     u_char                  *l2_blob;     /* L2-hit blob, copied to r->pool  */
     size_t                   l2_blob_len;
     unsigned                 l2_miss_counted:1;/* l2_misses stat already bumped*/

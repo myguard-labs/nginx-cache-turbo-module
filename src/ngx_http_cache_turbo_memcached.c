@@ -682,12 +682,20 @@ ngx_http_cache_turbo_mc_fill(ngx_http_cache_turbo_mc_op_t *op, ngx_event_t *rev)
 /*
  * Parse an accumulated GET reply in op->rbuf[0..op->rlen]. memcached text:
  *   VALUE <key> <flags> <bytes>[ <cas>]\r\n<data>\r\nEND\r\n   (hit)
- *   END\r\n                                                    (miss)
- *   ERROR / CLIENT_ERROR / SERVER_ERROR ...\r\n                (treat as miss)
+ *   END\r\n                                                    (definitive miss)
+ *   ERROR / CLIENT_ERROR / SERVER_ERROR ...\r\n                (server failure)
  * Returns:
  *   NGX_OK       - data complete; blob/blob_len point into rbuf
  *   NGX_AGAIN    - need more bytes
- *   NGX_DECLINED - miss / error / unparseable
+ *   NGX_DECLINED - DEFINITIVE miss: a bare "END" line. The key is absent.
+ *   NGX_ERROR    - not a usable answer: an ERROR/CLIENT_ERROR/SERVER_ERROR reply,
+ *                  a malformed header line, or an unparseable field. The request
+ *                  still proceeds as a miss, but L2's answer is UNKNOWN.
+ *
+ * ⚠ The NGX_DECLINED / NGX_ERROR split is load-bearing: only NGX_DECLINED may arm
+ * the L13 negative memo. Collapsing them (as this function did before) lets a
+ * server error assert "this key is absent" -- see node_t.l2_neg_until. Mirrors
+ * ngx_http_cache_turbo_redis_parse().
  */
 static ngx_int_t
 ngx_http_cache_turbo_mc_parse(ngx_http_cache_turbo_mc_op_t *op,
@@ -709,10 +717,11 @@ ngx_http_cache_turbo_mc_parse(ngx_http_cache_turbo_mc_op_t *op,
         return NGX_AGAIN;                  /* header line not complete yet */
     }
     if (cr[1] != LF) {
-        return NGX_DECLINED;               /* malformed */
+        return NGX_ERROR;                  /* malformed */
     }
 
-    /* miss: a bare "END" line */
+    /* THE definitive miss: a bare "END" line. The only parse outcome that may
+     * arm the L13 negative memo. */
     if (cr - p == 3 && ngx_strncmp(p, "END", 3) == 0) {
         return NGX_DECLINED;
     }
@@ -721,31 +730,33 @@ ngx_http_cache_turbo_mc_parse(ngx_http_cache_turbo_mc_op_t *op,
     if (cr - p < (ssize_t) (sizeof("VALUE ") - 1)
         || ngx_strncmp(p, "VALUE ", sizeof("VALUE ") - 1) != 0)
     {
-        return NGX_DECLINED;               /* ERROR / unexpected line -> miss */
+        return NGX_ERROR;                  /* ERROR / CLIENT_ERROR / unexpected */
     }
 
     /* fields after "VALUE ": <key> <flags> <bytes>[ <cas>], up to cr */
     q = p + sizeof("VALUE ") - 1;
 
+    /* Every field failure below is a malformed VALUE header, not a miss: the
+     * server said it HAS the key and we failed to read its framing. */
     sp = ngx_strlchr(q, cr, ' ');          /* end of key */
     if (sp == NULL) {
-        return NGX_DECLINED;
+        return NGX_ERROR;
     }
     q = sp + 1;
 
     sp = ngx_strlchr(q, cr, ' ');          /* end of flags */
     if (sp == NULL) {
-        return NGX_DECLINED;
+        return NGX_ERROR;
     }
     q = sp + 1;                            /* start of <bytes> */
 
     sp = ngx_strlchr(q, cr, ' ');          /* optional <cas> separator */
     len = ngx_atoi(q, (sp ? sp : cr) - q);
     if (len == NGX_ERROR || len < 0) {
-        return NGX_DECLINED;
+        return NGX_ERROR;
     }
     if (len > NGX_HTTP_CACHE_TURBO_MC_MAX_VALUE) {
-        return NGX_DECLINED;               /* refuse absurd payloads */
+        return NGX_ERROR;                  /* refuse absurd payloads */
     }
 
     data = cr + 2;                         /* payload starts after header CRLF */
@@ -778,7 +789,8 @@ ngx_http_cache_turbo_mc_read_get(ngx_event_t *rev)
     if (rev->timedout) {
         ngx_log_error(NGX_LOG_INFO, c->log, NGX_ETIMEDOUT,
                       "cache_turbo: memcached GET timed out");
-        ngx_http_cache_turbo_mc_get_finish(op, NGX_DECLINED, NULL, 0);
+        /* L13: transport failure, NOT a definitive miss -- must not arm the memo */
+        ngx_http_cache_turbo_mc_get_finish(op, NGX_ERROR, NULL, 0);
         return;
     }
 
@@ -788,7 +800,8 @@ ngx_http_cache_turbo_mc_read_get(ngx_event_t *rev)
             return;                        /* wait for more, or re-arm failed */
         }
         if (rc == NGX_ERROR) {
-            ngx_http_cache_turbo_mc_get_finish(op, NGX_DECLINED, NULL, 0);
+            /* cap/alloc/closed connection: L2's answer is UNKNOWN */
+            ngx_http_cache_turbo_mc_get_finish(op, NGX_ERROR, NULL, 0);
             return;
         }
 
@@ -799,7 +812,10 @@ ngx_http_cache_turbo_mc_read_get(ngx_event_t *rev)
         if (rc == NGX_OK) {
             ngx_http_cache_turbo_mc_get_finish(op, NGX_OK, blob, blob_len);
         } else {
-            ngx_http_cache_turbo_mc_get_finish(op, NGX_DECLINED, NULL, 0);
+            /* NGX_DECLINED (bare END) = definitive miss, may arm the L13 memo;
+             * NGX_ERROR (server error / malformed) = unknown, must not. Passed
+             * straight through -- do NOT collapse. */
+            ngx_http_cache_turbo_mc_get_finish(op, rc, NULL, 0);
         }
         return;
     }
@@ -846,7 +862,9 @@ ngx_http_cache_turbo_mc_get_finish(ngx_http_cache_turbo_mc_op_t *op,
     if (result == NGX_OK && blob_len > 0) {
         copy = ngx_pnalloc(r->pool, blob_len);
         if (copy == NULL) {
-            result = NGX_DECLINED;
+            /* L13: L2 HAD the key -- we merely failed to copy it locally. A miss
+             * here would arm a memo asserting the key is ABSENT. NGX_ERROR. */
+            result = NGX_ERROR;
         } else {
             ngx_memcpy(copy, blob, blob_len);
             ctx->l2_blob = copy;
@@ -873,7 +891,9 @@ static void
 ngx_http_cache_turbo_mc_op_fail(ngx_http_cache_turbo_mc_op_t *op)
 {
     if (op->request) {
-        ngx_http_cache_turbo_mc_get_finish(op, NGX_DECLINED, NULL, 0);
+        /* Terminal transport failure: not an answer about the key, so NGX_ERROR
+         * keeps it from arming the L13 negative memo. */
+        ngx_http_cache_turbo_mc_get_finish(op, NGX_ERROR, NULL, 0);
     } else {
         ngx_http_cache_turbo_mc_op_done(op);
     }

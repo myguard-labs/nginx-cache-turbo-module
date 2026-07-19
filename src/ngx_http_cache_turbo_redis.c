@@ -2008,7 +2008,16 @@ ngx_http_cache_turbo_redis_resp_len(u_char *p, size_t n, ngx_int_t *len)
  * Parse an accumulated GET reply in op->rbuf[0..op->rlen]. Returns:
  *   NGX_OK       - bulk string complete; blob/blob_len point into rbuf
  *   NGX_AGAIN    - need more bytes
- *   NGX_DECLINED - nil / error / unparseable: treat as an L2 miss
+ *   NGX_DECLINED - DEFINITIVE miss: a well-formed `$-1` nil. The key is absent.
+ *   NGX_ERROR    - the reply was not a usable answer: a Redis error reply, an
+ *                  unexpected type byte, an unparseable length, or an oversized
+ *                  payload. The request still proceeds as a miss, but L2's answer
+ *                  is UNKNOWN.
+ *
+ * ⚠ The NGX_DECLINED / NGX_ERROR split is load-bearing, not cosmetic: only
+ * NGX_DECLINED may arm the L13 negative memo. Collapsing them (as this function
+ * did before) lets a malformed or error reply assert "this key is absent" -- see
+ * ngx_http_cache_turbo_node_t.l2_neg_until.
  */
 static ngx_int_t
 ngx_http_cache_turbo_redis_parse(ngx_http_cache_turbo_redis_op_t *op,
@@ -2024,10 +2033,11 @@ ngx_http_cache_turbo_redis_parse(ngx_http_cache_turbo_redis_op_t *op,
         return NGX_AGAIN;
     }
 
-    /* Only a bulk string carries a stored value. nil ($-1), errors (-...),
-     * and anything else mean "not a usable L2 value" -> miss. */
+    /* Only a bulk string carries a stored value. An error reply (`-ERR ...`) or
+     * any other type byte is a protocol-level failure, not an answer about this
+     * key: NGX_ERROR, so it cannot arm the memo. */
     if (*p != '$') {
-        return NGX_DECLINED;
+        return NGX_ERROR;
     }
 
     crlf = ngx_strlchr(p + 1, end, CR);
@@ -2035,15 +2045,24 @@ ngx_http_cache_turbo_redis_parse(ngx_http_cache_turbo_redis_op_t *op,
         return NGX_AGAIN;                  /* length line not complete yet */
     }
 
-    /* $-1 nil and malformed both mean "no usable L2 value" -> miss. */
-    if (ngx_http_cache_turbo_redis_resp_len(p + 1, crlf - (p + 1), &len)
-        != NGX_OK)
-    {
-        return NGX_DECLINED;
+    /* resp_len already separates the two cases this function must not conflate:
+     * NGX_DONE = a well-formed `$-1` nil (the key genuinely does not exist),
+     * NGX_ERROR = malformed/overflow. Map them straight through -- NGX_DONE is
+     * THE definitive miss and the only parse outcome that may arm the L13 memo. */
+    switch (ngx_http_cache_turbo_redis_resp_len(p + 1, crlf - (p + 1), &len)) {
+
+    case NGX_DONE:
+        return NGX_DECLINED;               /* $-1 nil: definitive miss */
+
+    case NGX_OK:
+        break;                             /* real length in `len` */
+
+    default:
+        return NGX_ERROR;                  /* malformed length line */
     }
 
     if (len > NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY) {
-        return NGX_DECLINED;               /* refuse absurd payloads */
+        return NGX_ERROR;                  /* refuse absurd payloads */
     }
 
     p = crlf + 2;                          /* start of payload */
@@ -2075,7 +2094,8 @@ ngx_http_cache_turbo_redis_read_get(ngx_event_t *rev)
     if (rev->timedout) {
         ngx_log_error(NGX_LOG_INFO, c->log, NGX_ETIMEDOUT,
                       "cache_turbo: redis GET timed out");
-        ngx_http_cache_turbo_redis_get_finish(op, NGX_DECLINED, NULL, 0);
+        /* L13: transport failure, NOT a definitive miss -- must not arm the memo */
+        ngx_http_cache_turbo_redis_get_finish(op, NGX_ERROR, NULL, 0);
         return;
     }
 
@@ -2085,8 +2105,9 @@ ngx_http_cache_turbo_redis_read_get(ngx_event_t *rev)
             return;                        /* wait for more, or re-arm failed */
         }
         if (rc == NGX_ERROR) {
-            /* cap/alloc/closed: treat as an L2 miss */
-            ngx_http_cache_turbo_redis_get_finish(op, NGX_DECLINED, NULL, 0);
+            /* cap/alloc/closed connection: L2's answer is UNKNOWN. Still resumes
+             * the request as a miss (origin serves it), but L13 must not memo it. */
+            ngx_http_cache_turbo_redis_get_finish(op, NGX_ERROR, NULL, 0);
             return;
         }
 
@@ -2094,13 +2115,20 @@ ngx_http_cache_turbo_redis_read_get(ngx_event_t *rev)
         if (rc == NGX_AGAIN) {
             continue;                      /* read more */
         }
-        /* A definitive parse result (hit or nil/miss) means a complete, well-
-         * formed reply was consumed: the connection is at a clean boundary and
-         * may be pooled (v15). */
+        /* A hit or a nil means a complete, well-formed reply was consumed: the
+         * connection is at a clean boundary and may be pooled (v15). NGX_ERROR
+         * (malformed / error reply) leaves the stream at an UNKNOWN offset, so
+         * the connection must NOT be pooled -- a later op would resync mid-reply. */
+        if (rc == NGX_ERROR) {
+            ngx_http_cache_turbo_redis_get_finish(op, NGX_ERROR, NULL, 0);
+            return;
+        }
+
         op->clean = 1;
         if (rc == NGX_OK) {
             ngx_http_cache_turbo_redis_get_finish(op, NGX_OK, blob, blob_len);
         } else {
+            /* NGX_DECLINED: definitive $-1 miss -- may arm the L13 memo */
             ngx_http_cache_turbo_redis_get_finish(op, NGX_DECLINED, NULL, 0);
         }
         return;
@@ -2664,7 +2692,10 @@ ngx_http_cache_turbo_redis_get_finish(ngx_http_cache_turbo_redis_op_t *op,
     if (result == NGX_OK && blob_len > 0) {
         copy = ngx_pnalloc(r->pool, blob_len);
         if (copy == NULL) {
-            result = NGX_DECLINED;
+            /* L13: L2 HAD the key -- we merely failed to copy it locally. Reporting
+             * a miss here would arm a memo asserting the key is ABSENT, which is
+             * the exact opposite of what L2 just told us. NGX_ERROR: unknown. */
+            result = NGX_ERROR;
         } else {
             ngx_memcpy(copy, blob, blob_len);
             ctx->l2_blob = copy;
@@ -2774,7 +2805,10 @@ ngx_http_cache_turbo_redis_op_fail(ngx_http_cache_turbo_redis_op_t *op)
          * to per-box single-flight rather than suppressing the refresh. */
         ngx_http_cache_turbo_redis_lock_finish(op, NGX_ERROR);
     } else if (op->request) {
-        ngx_http_cache_turbo_redis_get_finish(op, NGX_DECLINED, NULL, 0);
+        /* Connect/send/protocol failure on the GET path: same reasoning as the
+         * lock path above -- a transport failure is not an answer about the key,
+         * so NGX_ERROR keeps it from arming the L13 negative memo. */
+        ngx_http_cache_turbo_redis_get_finish(op, NGX_ERROR, NULL, 0);
     } else {
         ngx_http_cache_turbo_redis_op_done(op);
     }
