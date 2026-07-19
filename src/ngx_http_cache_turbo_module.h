@@ -534,6 +534,25 @@ typedef struct {
     ngx_array_t             *bypass_uri;
     ngx_array_t             *key_cookies;
 
+    /* cache_turbo_backend_prefix: mount point of a subdirectory install, e.g.
+     * "/shop/" for a WordPress served from https://example.com/shop/. Preset
+     * uris[] rules are literals anchored at byte 0 ("/wp-admin/"), so without
+     * this a subdirectory install matches NO URI rule at all and its admin
+     * surface is cacheable. When set and r->uri starts with it, the preset URI
+     * tier compares against the URI with this prefix removed.
+     *
+     * Scope is deliberately narrow — the PRESET uris[] tier only
+     * (ngx_http_cache_turbo_auto_skip). NOT bypass_uri: those prefixes are
+     * user-authored literals already written against the deployed path, so
+     * stripping would break a rule the operator spelled out in full. NOT the
+     * cookie or arg tiers: both are path-independent.
+     *
+     * Unrelated to the L2 "prefix=" param on cache_turbo_redis /
+     * cache_turbo_memcached, which namespaces CACHE KEYS, not URI paths.
+     *
+     * Must begin and end with '/'. NGX_CONF_UNSET_PTR until set. */
+    ngx_str_t               *backend_prefix;
+
     /* Auto-classify (cache_turbo <zone> auto / cache_turbo_backend <name>...).
      * A bitmask of CMS cacheability presets; 0 = manual mode (off). Each set
      * bit applies a curated set of "this request is dynamic, never cache it"

@@ -113,6 +113,8 @@ static char *ngx_http_cache_turbo_normalize_strip(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 static char *ngx_http_cache_turbo_normalize_vary(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
+static char *ngx_http_cache_turbo_backend_prefix(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
 static char *ngx_http_cache_turbo_bypass_uri(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 static char *ngx_http_cache_turbo_key_cookie_conf(ngx_conf_t *cf,
@@ -375,6 +377,13 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
     { ngx_string("cache_turbo_bypass_uri"),
       NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_1MORE,
       ngx_http_cache_turbo_bypass_uri,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+
+    { ngx_string("cache_turbo_backend_prefix"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
+      ngx_http_cache_turbo_backend_prefix,
       NGX_HTTP_LOC_CONF_OFFSET,
       0,
       NULL },
@@ -3652,6 +3661,31 @@ ngx_http_cache_turbo_auto_skip(ngx_http_request_t *r,
     const char *const                    *pp;
     const char                           *eq;
     size_t                                l, nlen, vlen;
+    ngx_str_t                             uri;
+
+    /* Preset uris[] are literals anchored at byte 0 ("/wp-admin/"), so a
+     * subdirectory install matches nothing unless we rebase the URI onto the
+     * configured mount point. Loop-invariant, so computed once.
+     *
+     * The mount's trailing '/' is RETAINED as the rebased URI's leading '/':
+     * "/shop/" over "/shop/wp-admin/" yields "/wp-admin/", which is the shape
+     * every needle is written in. A URI outside the mount is left alone rather
+     * than force-matched, so "/other/wp-admin/" on a "/shop/"-mounted site does
+     * not inherit the mounted app's rules. */
+    uri = r->uri;
+
+    if (clcf->backend_prefix != NULL
+        && clcf->backend_prefix != NGX_CONF_UNSET_PTR)
+    {
+        l = clcf->backend_prefix->len;
+
+        if (uri.len >= l
+            && ngx_strncmp(uri.data, clcf->backend_prefix->data, l) == 0)
+        {
+            uri.data += l - 1;          /* keep the mount's trailing '/' */
+            uri.len  -= l - 1;
+        }
+    }
 
     for (ps = ngx_http_cache_turbo_presets; ps->bit; ps++) {
         if (!(clcf->backend_presets & ps->bit)) {
@@ -3660,7 +3694,7 @@ ngx_http_cache_turbo_auto_skip(ngx_http_request_t *r,
 
         for (pp = ps->uris; *pp; pp++) {
             l = ngx_strlen(*pp);
-            if (ngx_http_cache_turbo_uri_prefix(&r->uri, *pp, l)) {
+            if (ngx_http_cache_turbo_uri_prefix(&uri, *pp, l)) {
                 return 1;
             }
         }
@@ -9071,6 +9105,55 @@ ngx_http_cache_turbo_normalize_vary(ngx_conf_t *cf, ngx_command_t *cmd,
 }
 
 
+/*
+ * "cache_turbo_backend_prefix /shop/;"
+ *
+ * Mount point of a subdirectory install. Rebases r->uri before the preset
+ * uris[] tier runs, so "/shop/wp-admin/" matches the "/wp-admin/" needle.
+ * See the backend_prefix field comment for why the scope stops there.
+ *
+ * Both slashes are REQUIRED rather than silently added. A value that does not
+ * match the deployed mount produces zero URI-rule coverage — the exact silent
+ * failure this directive exists to end — so a malformed one is rejected loudly
+ * at config time instead of being coerced into something that merely looks
+ * like it works.
+ */
+static char *
+ngx_http_cache_turbo_backend_prefix(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf)
+{
+    ngx_http_cache_turbo_loc_conf_t  *clcf = conf;
+    ngx_str_t                        *value;
+
+    if (clcf->backend_prefix != NGX_CONF_UNSET_PTR
+        && clcf->backend_prefix != NULL)
+    {
+        return "is duplicate";
+    }
+
+    value = cf->args->elts;
+
+    if (value[1].len < 2 || value[1].data[0] != '/'
+        || value[1].data[value[1].len - 1] != '/')
+    {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "cache_turbo_backend_prefix \"%V\" must begin and end with \"/\" "
+            "(e.g. \"/shop/\"); \"/\" alone is the root mount and is the "
+            "default behaviour, so it is not a valid value", &value[1]);
+        return NGX_CONF_ERROR;
+    }
+
+    clcf->backend_prefix = ngx_palloc(cf->pool, sizeof(ngx_str_t));
+    if (clcf->backend_prefix == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    *clcf->backend_prefix = value[1];
+
+    return NGX_CONF_OK;
+}
+
+
 /* cache_turbo_bypass_uri prefix...  — DIY equivalent of a preset URI rule. Each
  * prefix is stored verbatim; the request path matches it with the same
  * segment-boundary matcher the presets use. Appends across levels (a location
@@ -9190,6 +9273,7 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->no_store = NGX_CONF_UNSET_PTR;
     conf->bypass_uri = NGX_CONF_UNSET_PTR;
     conf->key_cookies = NGX_CONF_UNSET_PTR;
+    conf->backend_prefix = NGX_CONF_UNSET_PTR;
 #if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
     && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
     conf->test_restore_alloc_fail = NGX_CONF_UNSET;
@@ -9485,6 +9569,9 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
      * — matching how the append happens within a level, not across). */
     if (conf->bypass_uri == NGX_CONF_UNSET_PTR) {
         conf->bypass_uri = prev->bypass_uri;
+    }
+    if (conf->backend_prefix == NGX_CONF_UNSET_PTR) {
+        conf->backend_prefix = prev->backend_prefix;
     }
     if (conf->key_cookies == NGX_CONF_UNSET_PTR) {
         conf->key_cookies = prev->key_cookies;
