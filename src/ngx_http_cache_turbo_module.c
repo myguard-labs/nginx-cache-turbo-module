@@ -4416,8 +4416,9 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
         }
     }
 
-    /* L1 absent (miss) or expired. Consult L2 (Redis) before falling through to
-     * the origin: another node may already hold this object. The L2 GET is
+    /* L1 absent (miss) or expired. Consult L2 (Redis or memcached -- the
+     * backend is a vtable) before falling through to the origin: another node
+     * may already hold this object. The L2 GET is
      * async but logically synchronous — it parks the request and resumes it
      * when the reply lands (see ngx_http_cache_turbo_redis_get). */
     ngx_shmtx_unlock(&z->shpool->mutex);
@@ -7862,7 +7863,7 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
                 "# HELP cache_turbo_evictions_total Entries evicted under memory pressure (LRU).\n"
                 "# TYPE cache_turbo_evictions_total counter\n"
                 "cache_turbo_evictions_total{zone=\"%V\"} %uA\n"
-                "# HELP cache_turbo_l2_hits_total L1 misses satisfied by the L2 (Redis) tier.\n"
+                "# HELP cache_turbo_l2_hits_total L1 misses satisfied by the L2 tier (Redis or memcached).\n"
                 "# TYPE cache_turbo_l2_hits_total counter\n"
                 "cache_turbo_l2_hits_total{zone=\"%V\"} %uA\n"
                 "# HELP cache_turbo_l2_misses_total L1 misses that L2 could not satisfy (went to origin).\n"

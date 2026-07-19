@@ -365,9 +365,10 @@ typedef struct {
     ngx_atomic_t             refreshes;
     ngx_atomic_t             evictions;
 
-    /* L2 (Redis) outcome counters (v12): incremented on an L1 miss that
-     * consulted L2 — l2_hits when L2 held the object (filled L1), l2_misses when
-     * it did not (went to origin). Zero when no L2 is configured. */
+    /* L2 (Redis or memcached) outcome counters (v12): incremented on an L1
+     * miss that consulted L2 — l2_hits when L2 held the object (filled L1),
+     * l2_misses when it did not (went to origin). Zero when no L2 is
+     * configured. */
     ngx_atomic_t             l2_hits;
     ngx_atomic_t             l2_misses;
 
