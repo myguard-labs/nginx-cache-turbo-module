@@ -1319,7 +1319,7 @@ trailing option, which **overrides** the DSN:
 |---|---|---|
 | `password=` | — | `AUTH` password (or put it in the DSN userinfo). |
 | `user=` | — | ACL username (Redis 6+). |
-| `db=` | `0` | `SELECT` this db number. |
+| `db=` | `0` | `SELECT` this db number. Must be `0`–`15`, matching Redis's default `databases 16`; a larger index is rejected at config time rather than failing every L2 op at runtime. Same bound applies to the `/N` suffix of a DSN. |
 | `tls=on\|off` | from scheme | Force TLS on/off regardless of `redis://`/`rediss://`. |
 | `tls_verify=on\|off` | `on` | Verify the server cert + hostname. **Leave on** unless you know why. |
 | `tls_ca=<file>` | system CAs | CA bundle to trust (for a private CA). |
