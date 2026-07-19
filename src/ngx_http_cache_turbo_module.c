@@ -6162,9 +6162,26 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
                         seen[ntags].data = tok;
                         seen[ntags].len = toklen;
                         ntags++;
+                    }
 
-                        clcf->backend->tag_add(clcf, store_key, tok, toklen,
-                                               stale_ttl);
+                    /* L9: index the whole deduped set in ONE pipelined op
+                     * (one pool, one connection, one round trip) rather than
+                     * one op per tag -- a MAX_TAGS response fired up to 16.
+                     * seen[] is already deduped and cap-bound by the loop
+                     * above, which is exactly tag_add_many's contract. Fall
+                     * back to per-tag calls on a backend that predates the
+                     * batched slot. */
+                    if (ntags > 0) {
+                        if (clcf->backend->tag_add_many) {
+                            clcf->backend->tag_add_many(clcf, store_key, seen,
+                                                        ntags, stale_ttl);
+                        } else {
+                            for (k = 0; k < ntags; k++) {
+                                clcf->backend->tag_add(clcf, store_key,
+                                                       seen[k].data,
+                                                       seen[k].len, stale_ttl);
+                            }
+                        }
                     }
 
                     /* The MAX_TAGS cap is a DoS bound (above), not a hint -- but

@@ -892,6 +892,7 @@ ngx_cache_turbo_backend_t  ngx_http_cache_turbo_memcached_backend = {
     ngx_http_cache_turbo_memcached_del_raw,
     NULL,   /* tagkey    — no tag sets   */
     NULL,   /* tag_add   — no tag sets   */
+    NULL,   /* tag_add_many — no tag sets */
     NULL,   /* purge_tag — no SMEMBERS   */
     NULL,   /* scan_del  — no SCAN       */
     NULL,   /* lock      — no atomic NX  */

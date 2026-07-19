@@ -7947,6 +7947,47 @@ def test_l2_tag_cap_and_dedup(ng: Nginx, origin: Origin,
         "duplicate tag produced more than one membership"
 
 
+def test_l2_tag_add_batched_one_op(ng: Nginx, origin: Origin,
+                                   redis: RedisServer) -> None:
+    """L9: a store naming N tags indexes them in ONE pipelined Redis op, not N.
+
+    /l2tcap/ carries no keepalive=, so every op dials a fresh socket and Redis'
+    total_connections_received tracks the op count directly. A 12-tag store
+    costs 1 SET + 1 batched tag op; before L9 it cost 1 SET + 12 tag ops, so
+    the pre-L9 tree fails this by roughly an order of magnitude.
+
+    Membership is asserted too: batching must not lose a tag (the existing
+    cap/dedup tests would pass either way, since they only check membership)."""
+    ntags = 12
+    stamp = time.time()
+    uri = f"/l2tcap/batch-{stamp}"
+    obj = l2_key(uri)
+    tags = [f"b{stamp}-{i}" for i in range(ntags)]
+    for t in tags:
+        redis.cli("DEL", tag_key(t))
+
+    # NOTE: redis.cli() shells out to redis-cli and opens its OWN connection
+    # per call, so NOTHING may touch redis between the two _redis_conns_received
+    # readings -- a SISMEMBER poll inside the window counts as module traffic
+    # and inflates the result. Measure the fetch alone; verify membership after.
+    before = _redis_conns_received(redis)
+    s, _, _ = fetch(ng.port, f"{uri}?t={','.join(tags)}")
+    assert s == 200, f"batch prime status {s}"
+    time.sleep(0.6)          # let the fire-and-forget ops settle
+    conns = _redis_conns_received(redis) - before
+
+    # every tag must still be indexed -- batching must not drop one
+    assert wait_for(lambda: all(
+        redis.cli("SISMEMBER", tag_key(t), obj) == "1" for t in tags)), \
+        "batched tag_add did not index every tag"
+
+    # 1 GET (miss) + 1 SET (write-through) + 1 batched tag op = ~3. Allow slack
+    # for retries/probes but stay far below the pre-L9 1 + 1 + ntags.
+    assert conns < ntags, \
+        f"tag_add was not batched: {conns} connections for {ntags} tags " \
+        f"(pre-L9 cost ~{ntags + 2}; batched should be ~3)"
+
+
 def _spawn_node(ng: Nginx, name: str, port_offset: int) -> Nginx:
     """Start a second, independent nginx (own root, same Redis + origin) so a
     cross-node test can observe two cache instances sharing one L2."""
@@ -9273,6 +9314,7 @@ def run_all(ng: Nginx, origin: Origin,
         test_l2_tag_purge(ng, origin, redis)
         test_l2_tag_purge_large(ng, origin, redis)  # STAB-3 + PERF-1/2 pipeline
         test_l2_tag_cap_and_dedup(ng, origin, redis)  # PERF-2 tag cap/dedup
+        test_l2_tag_add_batched_one_op(ng, origin, redis)  # L9 one op for N tags
         test_cor5_redis_variant_purge(ng, origin, redis)  # COR-5 variant index
         test_multinode_lock(ng, origin, redis)
         test_lock_self_heal(ng, origin, redis)

@@ -1076,6 +1076,14 @@ size_t ngx_http_cache_turbo_redis_tagkey(ngx_str_t *prefix, u_char *name,
 void ngx_http_cache_turbo_redis_tag_add(ngx_http_cache_turbo_loc_conf_t *clcf,
     u_char *key_hash, u_char *name, size_t name_len, time_t ttl);
 
+/* L9: as tag_add, but indexes up to MAX_TAGS names for one object in a SINGLE
+ * pipelined op (one pool, one connection, one round trip) instead of one op per
+ * tag. names[] must already be deduped and MAX_TAGS-bound by the caller; empty
+ * entries are skipped. Same fire-and-forget semantics as tag_add. */
+void ngx_http_cache_turbo_redis_tag_add_many(
+    ngx_http_cache_turbo_loc_conf_t *clcf, u_char *key_hash, ngx_str_t *names,
+    ngx_uint_t nnames, time_t ttl);
+
 /* Completion callback for a SMEMBERS fetch: invoked once with the set members
  * (pointing into transient buffers — copy what must outlive the call) BEFORE
  * the request is finalized. Must produce the HTTP response and return the rc to
@@ -1204,6 +1212,10 @@ struct ngx_cache_turbo_backend_s {
         u_char *buf);
     void       (*tag_add)(ngx_http_cache_turbo_loc_conf_t *clcf,
         u_char *key_hash, u_char *name, size_t name_len, time_t ttl);
+    /* L9: batched tag_add (one op for N tags). NULL on a backend without tag
+     * support, exactly like tag_add -- callers must check it before use. */
+    void       (*tag_add_many)(ngx_http_cache_turbo_loc_conf_t *clcf,
+        u_char *key_hash, ngx_str_t *names, ngx_uint_t nnames, time_t ttl);
     ngx_int_t  (*purge_tag)(ngx_http_request_t *r,
         ngx_http_cache_turbo_loc_conf_t *clcf, u_char *name, size_t name_len,
         ngx_http_cache_turbo_redis_members_pt cb, void *data);
