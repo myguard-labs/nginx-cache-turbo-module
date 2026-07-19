@@ -86,6 +86,8 @@ static ngx_int_t ngx_http_cache_turbo_require_hdr_ok(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf);
 static char *ngx_http_cache_turbo_stale_mult(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
+static char *ngx_http_cache_turbo_min_uses(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
 static char *ngx_http_cache_turbo_preset(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static ngx_int_t ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r);
@@ -145,19 +147,30 @@ static ngx_http_output_body_filter_pt    ngx_http_next_body_filter;
  * is a never-used placeholder so an UNSET/zero preset can't silently index a
  * real band). BALANCED equals the historical hardcoded merge fallbacks. Tune by
  * feel; the chosen values are documented in
- * memory/eilandert/nginx-cache-turbo-module/history.md.
+ * memory/labs/nginx-cache-turbo-module/history.md.
  */
-/* Fields: valid, beta, lock_ttl, stale_mult, beta_min, beta_max. The last two are
- * the v4-3 autotune clamp window for the preset (×1000); the autotune verdict is
- * re-clamped to them so a conservative location never tunes as hot as aggressive
- * (see history.md v4-3). Centres match the static beta; bands subset global
- * [500,3000] with overlapping edges. */
+/* Fields: valid, beta, lock_ttl, stale_mult, beta_min, beta_max, min_uses.
+ * beta_min/beta_max are the v4-3 autotune clamp window for the preset (×1000);
+ * the autotune verdict is re-clamped to them so a conservative location never
+ * tunes as hot as aggressive (see history.md v4-3). Centres match the static
+ * beta; bands subset global [500,3000] with overlapping edges.
+ *
+ * min_uses (H3c): cold misses required before a key is stored. 1 = store on the
+ * first miss. ONLY AGGRESSIVE raises it to 2, deliberately: the gate trades one
+ * extra origin fetch per genuine repeat key for never spending a response blob
+ * on a one-hit-wonder URL, which is the bargain an operator asking for max
+ * hit-rate on a long-tail site wants. Every other band — including BALANCED,
+ * the default — stays 1, so the default preset's caching behaviour is unchanged
+ * (a key is stored on its first request, as it always has been). Note a counter
+ * node still costs a full node_t: min_uses 2 saves the BLOB on one-hit keys, not
+ * the node, so raising it on a normal-cardinality site is a pure origin-load
+ * increase with no offsetting saving. See history.md H3c. */
 static const ngx_http_cache_turbo_band_t  ngx_http_cache_turbo_bands[] = {
-    /* [0] unused placeholder        */ {   0,    0,  0, 0,    0,    0 },
-    /* [1] CONSERVATIVE: correctness */ {  30,  500, 10, 2,  500, 1000 },
-    /* [2] BALANCED: current defaults*/ {  60, 1000,  5, 4,  500, 2000 },
-    /* [3] AGGRESSIVE: max hit-rate  */ { 300, 3000,  3, 8, 1000, 3000 },
-    /* [4] MICRO: 1s microcaching    */ {   1, 1000,  1, 2,  500, 2000 },
+    /* [0] unused placeholder        */ {   0,    0,  0, 0,    0,    0, 0 },
+    /* [1] CONSERVATIVE: correctness */ {  30,  500, 10, 2,  500, 1000, 1 },
+    /* [2] BALANCED: current defaults*/ {  60, 1000,  5, 4,  500, 2000, 1 },
+    /* [3] AGGRESSIVE: max hit-rate  */ { 300, 3000,  3, 8, 1000, 3000, 2 },
+    /* [4] MICRO: 1s microcaching    */ {   1, 1000,  1, 2,  500, 2000, 1 },
 };
 
 
@@ -291,9 +304,9 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
 
     { ngx_string("cache_turbo_min_uses"),
       NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
-      ngx_conf_set_num_slot,
+      ngx_http_cache_turbo_min_uses,
       NGX_HTTP_LOC_CONF_OFFSET,
-      offsetof(ngx_http_cache_turbo_loc_conf_t, min_uses),
+      0,
       NULL },
 
     { ngx_string("cache_turbo_admin"),
@@ -6924,6 +6937,49 @@ ngx_http_cache_turbo_stale_mult(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 }
 
 
+/* cache_turbo_min_uses N (H3c). Range-checked rather than a bare
+ * ngx_conf_set_num_slot for the same reason as stale_mult above: merge_loc_conf
+ * coerces a value < 1 up to 1, so an explicit `0` or a negative would silently
+ * behave as `1` ("store on the first miss") instead of whatever the operator
+ * meant by it. Reject at parse so the config cannot lie. */
+static char *
+ngx_http_cache_turbo_min_uses(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_cache_turbo_loc_conf_t  *clcf = conf;
+
+    ngx_str_t  *value = cf->args->elts;
+    ngx_int_t   n;
+
+    if (clcf->min_uses_raw != NGX_CONF_UNSET) {
+        return "is duplicate";
+    }
+
+    /* ngx_atoi has no sign handling, so a negative fails here as NGX_ERROR and
+     * surfaces as "bad value" rather than reaching the range check below. The
+     * two diagnostics are deliberately distinct — see the H5 lesson. */
+    n = ngx_atoi(value[1].data, value[1].len);
+    if (n == NGX_ERROR) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "cache_turbo_min_uses: bad value \"%V\"", &value[1]);
+        return NGX_CONF_ERROR;
+    }
+
+    if (n < NGX_HTTP_CACHE_TURBO_MIN_USES_MIN
+        || n > NGX_HTTP_CACHE_TURBO_MIN_USES_MAX)
+    {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "cache_turbo_min_uses \"%V\" is out of range: expected %d..%d",
+            &value[1], NGX_HTTP_CACHE_TURBO_MIN_USES_MIN,
+            NGX_HTTP_CACHE_TURBO_MIN_USES_MAX);
+        return NGX_CONF_ERROR;
+    }
+
+    clcf->min_uses_raw = n;
+
+    return NGX_CONF_OK;
+}
+
+
 /* "cache_turbo_preset micro|conservative|balanced|aggressive;" stores the enum
  * (and validates the name here, at config time). The enum only selects the band
  * of default knob values used in merge_loc_conf; an explicit knob directive
@@ -9113,6 +9169,7 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->background_update = NGX_CONF_UNSET;
     conf->lock = NGX_CONF_UNSET;
     conf->lock_timeout = NGX_CONF_UNSET_MSEC;
+    conf->min_uses_raw = NGX_CONF_UNSET;
     conf->min_uses = NGX_CONF_UNSET;
     conf->max_size = NGX_CONF_UNSET_SIZE;
     conf->suppress_native = NGX_CONF_UNSET;
@@ -9204,6 +9261,8 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
                                  NGX_CONF_UNSET);
         ngx_conf_merge_value(conf->stale_mult_raw, prev->stale_mult_raw,
                              NGX_CONF_UNSET);
+        ngx_conf_merge_value(conf->min_uses_raw, prev->min_uses_raw,
+                             NGX_CONF_UNSET);
 
         conf->valid = (conf->valid_raw == NGX_CONF_UNSET)
                           ? band->valid : conf->valid_raw;
@@ -9213,6 +9272,8 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
                           ? band->lock_ttl : conf->lock_ttl_raw;
         conf->stale_mult = (conf->stale_mult_raw == NGX_CONF_UNSET)
                           ? band->stale_mult : conf->stale_mult_raw;
+        conf->min_uses = (conf->min_uses_raw == NGX_CONF_UNSET)
+                          ? band->min_uses : conf->min_uses_raw;
     }
 
     /* Per-status TTLs (v6): inherit the rule list if this level set none. */
@@ -9261,13 +9322,13 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_value(conf->lock, prev->lock, 1);
     ngx_conf_merge_msec_value(conf->lock_timeout, prev->lock_timeout, 5000);
 
-    /* min_uses (v15): default 1 = store on the first miss (feature off). A value
-     * below 1 is meaningless — clamp it so the gate's `> 1` test is the only
-     * switch and a stray 0/negative never disables caching outright. */
-    ngx_conf_merge_value(conf->min_uses, prev->min_uses, 1);
-    if (conf->min_uses < 1) {
-        conf->min_uses = 1;
-    }
+    /* min_uses (v15) is resolved in the preset block above (H3c): it inherits as
+     * min_uses_raw with an UNSET fallback and resolves against the band, exactly
+     * like valid/beta/lock_ttl/stale_mult. Do NOT merge it to a literal here —
+     * that would overwrite the band-resolved value and re-poison the inheritance
+     * chain the raw/effective split exists to keep clean. The old `< 1` clamp is
+     * gone too: ngx_http_cache_turbo_min_uses() range-checks at parse, and every
+     * band value is >= 1, so the gate's `> 1` test cannot see a stray 0. */
 
     /* Live autotune (v4-3): off by default; default recompute cadence when on. */
     ngx_conf_merge_value(conf->autotune, prev->autotune, 0);

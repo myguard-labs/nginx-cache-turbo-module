@@ -35,6 +35,17 @@
 #define NGX_HTTP_CACHE_TURBO_STALE_MULT_MIN  1
 #define NGX_HTTP_CACHE_TURBO_STALE_MULT_MAX  8
 
+/* Bounds on an explicit cache_turbo_min_uses N (H3c). The floor is 1 ("store on
+ * the first miss" = feature off) for the same reason stale_mult's floor is 1:
+ * merge_loc_conf coerces < 1 up to 1, so a literal 0 or a negative would
+ * silently mean 1 rather than what the operator wrote — range-check at parse
+ * instead of letting the config lie. The ceiling is a sanity bound: each cold
+ * miss below the threshold is an uncached origin fetch, so a large N is far more
+ * likely a typo than an intent, and every miss up to N also pins a counter node
+ * in the zone. */
+#define NGX_HTTP_CACHE_TURBO_MIN_USES_MIN  1
+#define NGX_HTTP_CACHE_TURBO_MIN_USES_MAX  32
+
 /* "Forever" fresh TTL. `cache_turbo_valid 0` ("cache forever", per the code's
  * long-standing contract) resolves to this long-but-finite TTL rather than a
  * literal 0 — a literal 0 made the object instantly+permanently STALE and
@@ -271,6 +282,7 @@ typedef struct {
     ngx_int_t   stale_mult;  /* stale window multiplier    */
     ngx_int_t   beta_min;    /* autotune lower clamp /1000 */
     ngx_int_t   beta_max;    /* autotune upper clamp /1000 */
+    ngx_int_t   min_uses;    /* cold misses before storing */
 } ngx_http_cache_turbo_band_t;
 
 
@@ -462,12 +474,12 @@ typedef struct {
      * directive value (or NGX_CONF_UNSET); they are what the directive slots
      * write and what merge inherits down the tree WITHOUT a literal default, so
      * a knob stays UNSET until a real directive sets it at some level. The
-     * non-raw fields (valid/beta/lock_ttl/stale_mult) are the EFFECTIVE values
-     * (every one of the four now has a directive and therefore a *_raw twin)
-     * the request path reads: in merge_loc_conf each resolves to its *_raw value
-     * if set, else the resolved preset's band value. Keeping raw separate from
-     * effective is what lets a location's preset still win when an ancestor only
-     * resolved the effective default — see the note in merge_loc_conf.
+     * non-raw fields (valid/beta/lock_ttl/stale_mult/min_uses) are the EFFECTIVE
+     * values (every one of the five now has a directive and therefore a *_raw
+     * twin) the request path reads: in merge_loc_conf each resolves to its *_raw
+     * value if set, else the resolved preset's band value. Keeping raw separate
+     * from effective is what lets a location's preset still win when an ancestor
+     * only resolved the effective default — see the note in merge_loc_conf.
      */
     ngx_int_t                preset;      /* one of PRESET_* or UNSET       */
     time_t                   valid_raw;   /* explicit cache_turbo_valid      */
@@ -475,6 +487,8 @@ typedef struct {
     time_t                   lock_ttl_raw;/* explicit cache_turbo_lock_ttl   */
     ngx_int_t                stale_mult_raw;
                                           /* explicit cache_turbo_stale_mult */
+    ngx_int_t                min_uses_raw;
+                                          /* explicit cache_turbo_min_uses   */
 
     time_t                   valid;       /* fresh TTL (seconds), effective */
     ngx_int_t                beta;        /* SWR aggressiveness /1000, eff  */
@@ -595,15 +609,18 @@ typedef struct {
     ngx_flag_t               lock;          /* cache_turbo_lock on|off          */
     ngx_msec_t               lock_timeout;  /* max a loser waits, then origin   */
 
-    /* Minimum uses before caching (v15). cache_turbo_min_uses N stores a
+    /* Minimum uses before caching (v15), EFFECTIVE value — the explicit
+     * directive lives in min_uses_raw above and this resolves to it if set, else
+     * to the preset band's min_uses (H3c). cache_turbo_min_uses N stores a
      * response only after its key has cold-missed N times, so one-hit-wonder
      * URLs never occupy the cache. A per-key miss counter lives in a lightweight
      * L1 "counter node" (see ngx_http_cache_turbo_node_t.miss_count); the Nth
      * miss converts that node into the normal cold-miss winner that stores.
-     * Default 1 = store on the first miss (feature off, zero behaviour change).
-     * Below the threshold a request goes to the origin but is not captured, and
-     * a popular key already present in L2 is served from L2 regardless (the gate
-     * sits after the L2 consult). */
+     * 1 = store on the first miss (feature off) and is the band value for every
+     * preset except AGGRESSIVE, which uses 2 — so the default (BALANCED) is
+     * unchanged from v15. Below the threshold a request goes to the origin but
+     * is not captured, and a popular key already present in L2 is served from L2
+     * regardless (the gate sits after the L2 consult). */
     ngx_int_t                min_uses;
 
     /* L2 Redis (v2b). Native async client, no hiredis. The L2 store is touched

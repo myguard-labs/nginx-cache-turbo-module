@@ -875,8 +875,17 @@ cache_turbo_preset aggressive;   # long TTLs, wide stale window, eager refresh
 | `beta` (refresh eagerness ×1000) | 1000 | 500 | 1000 | 3000 |
 | `lock_ttl` | 1s | 10s | 5s | 3s |
 | stale-window multiplier | ×2 | ×2 | ×4 | ×8 |
+| `min_uses` (misses before storing) | 1 | 1 | 1 | **2** |
 
 Any explicit knob (`cache_turbo_valid 120s;`) still beats the preset.
+
+`aggressive` is the only preset that raises **`min_uses`**, to `2`: a key is
+stored on its *second* cold miss, not its first, so a one-hit-wonder URL never
+spends a cache entry on itself. That is the trade an operator asking for maximum
+hit-rate on a long-tail site wants — but it costs one extra origin fetch for
+every genuinely repeated key, so it is deliberately **not** the default. If you
+want the aggressive TTLs without the admission gate, set `cache_turbo_min_uses 1`
+explicitly; an explicit directive beats the band like any other knob.
 
 The **stale window** is `valid × (multiplier − 1)`. So balanced + `valid 60s`
 = fresh for 60s, then served stale for another 180s, then expired.
@@ -987,6 +996,10 @@ twice never occupies the cache at all. The counter is a lightweight node (no
 body), so the tail costs a slot but not memory. `2` is almost always the right
 value — it removes the entire never-repeated class, and higher values mostly
 delay caching for genuinely popular pages.
+
+`cache_turbo_preset aggressive` already sets `min_uses 2` for you; every other
+preset leaves it at `1`. Setting the directive explicitly beats whichever band is
+in effect, in both directions.
 
 Watch `cache_turbo_min_uses_skips_total`. It counts requests that went to the
 origin *because* they were below the threshold: a large and growing number is the
@@ -1225,7 +1238,7 @@ http {
 | `cache_turbo_stale_mult N` | `server`, `location` | preset (`4` balanced) | Stale window as a multiple of the fresh TTL: an entry stays serveable as `STALE` until `cache_turbo_valid * N`. `1` = no stale window (hard-expire at the fresh TTL); the maximum is `8`. An explicit value overrides the preset's band, like `cache_turbo_valid`/`_beta`/`_lock_ttl`. `0` is rejected rather than silently meaning `4`. |
 | `cache_turbo_lock on` / `off` | `server`, `location` | `on` | Cold-miss single-flight: when an *uncached* key is hit by many requests at once, the first goes to the origin and the rest **wait** for it to fill the cache (per box via a stub, cluster-wide via the Redis lock) rather than all stampeding the origin. **Off** = every cold miss goes straight to the origin. |
 | `cache_turbo_lock_timeout TIME` | `server`, `location` | `5s` | How long a waiting cold-miss request waits for the winner's fill before giving up and going to the origin itself. |
-| `cache_turbo_min_uses N` | `server`, `location` | `1` | Cache a page only after its key has been requested `N` times — keep one-hit-wonder URLs out of the cache. Below the threshold each request goes to the origin and is **not** stored; the `N`-th miss stores it. A key already present in the L2 (Redis) tier is served from L2 regardless (it is already proven popular). `1` = store on the first miss (off). |
+| `cache_turbo_min_uses N` | `server`, `location` | preset (`1`, `2` aggressive) | Cache a page only after its key has been requested `N` times — keep one-hit-wonder URLs out of the cache. Below the threshold each request goes to the origin and is **not** stored; the `N`-th miss stores it. A key already present in the L2 (Redis) tier is served from L2 regardless (it is already proven popular). `1` = store on the first miss (off), which is the band value for every preset except `aggressive` (`2`). An explicit value overrides the preset's band, like `cache_turbo_valid`/`_beta`/`_lock_ttl`/`_stale_mult`. Range `1`..`32`; `0` and negatives are rejected at config time rather than silently meaning `1`. Note each sub-threshold miss still costs a lightweight counter node in the zone — `min_uses` saves the response *body*, not the key slot, so raising it on a site without a long tail is a pure origin-load increase. |
 | `cache_turbo_max_size SIZE` | `server`, `location` | `1m` | Don't cache responses bigger than this. |
 | `cache_turbo_bypass VAR...` | `server`, `location` | — | If any variable is non-empty and not `0`, skip the cache lookup (go to origin) — but still store the fresh response. E.g. `cache_turbo_bypass $cookie_session;` to always revalidate logged-in users. **Never put a client-controlled variable (`$arg_nocache`, `$http_x_no_cache`, …) in this list on a public endpoint** — the bypass returns before the single-flight lock is taken, so miss-collapsing does not apply and `ab -n 200000 'https://site/?nocache=1'` puts 100% of a flood on the origin. If you need a manual cache-buster, gate it on something only you can send (a shared secret in a header, or `$remote_addr` via a `map`). **On an identity predicate (session/login cookie, auth token, private-surface flag) always pair it with the same variables on `cache_turbo_no_store`** — on its own a bypass still writes that user's personalised response under the shared key, where the next anonymous visitor can be served it. Bypass controls the *lookup*; `cache_turbo_no_store` controls the *store*. (`cache_turbo_bypass_uri` and the `cache_turbo_backend` presets do skip storing as well; only `cache_turbo_bypass` does not.) |
 | `cache_turbo_no_store VAR...` | `server`, `location` | — | If any variable is non-empty and not `0`, do **not** store the response. E.g. `cache_turbo_no_store $cookie_session;`. |
