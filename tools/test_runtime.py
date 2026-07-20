@@ -9433,6 +9433,38 @@ def test_auto_vary_origin(ng: Nginx, origin: Origin) -> None:
     assert origin.hits - base == 2, origin.hits - base
 
 
+def test_auto_vary_origin_not_class_folded(ng: Nginx, origin: Origin) -> None:
+    """S7 regression guard: ORIGIN must stay RAW and is NEVER class-folded like
+    LANG. Two distinct origins that share the same first 8 bytes (the LANG fold
+    length, NGX_HTTP_CACHE_TURBO_LANG_CLASS_MAX) and the same "scheme + first
+    label up to a '-'" shape -- i.e. exactly what a primary-subtag-style fold
+    would collapse -- must still split into distinct slots and cause TWO
+    origin hits. If ORIGIN were ever folded the way LANG is (cut at a
+    delimiter, lowercase, cap at 8 bytes), these two would collide into one
+    slot: both start with the identical 8-byte prefix "https://" and share the
+    same leading label "a-one" / "a-two" up to a hyphen-cut point that overlaps
+    ("a"), so a class-fold bug reusing the lang-style cut would alias them.
+    Folding https://a-one.example with https://a-two.example would serve one
+    origin's CORS headers to the other -- a real security bug, not just a
+    cache-efficiency regression."""
+    base = origin.hits
+    p = "/av/orgnofold?v=or"
+    o1 = "https://a-one.example"
+    o2 = "https://a-two.example"
+    s1, b1, h1 = fetch(ng.port, p, {"Origin": o1})
+    s2, b2, h2 = fetch(ng.port, p, {"Origin": o1})
+    s3, b3, h3 = fetch(ng.port, p, {"Origin": o2})
+    assert s1 == 200 and s2 == 200 and s3 == 200, (s1, s2, s3)
+    assert b1 == b2, ("same Origin should share a slot", b1, b2)
+    assert b1 != b3, (
+        "ORIGIN got class-folded -- two distinct origins sharing an 8-byte "
+        "prefix collapsed onto one slot; this is a CORS cross-origin leak",
+        b1, b3)
+    assert origin.hits - base == 2, (
+        "ORIGIN must stay raw: two distinct origins => two origin hits, "
+        "not one folded class", origin.hits - base)
+
+
 def test_auto_vary_star_uncacheable(ng: Nginx, origin: Origin) -> None:
     """v11 auto-Vary: `Vary: *` is uncacheable -> every request hits origin."""
     base = origin.hits
@@ -10148,6 +10180,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_auto_vary_language_different_primary_splits(ng, origin)
     test_auto_vary_language_absent_splits_from_class(ng, origin)
     test_auto_vary_origin(ng, origin)
+    test_auto_vary_origin_not_class_folded(ng, origin)
     test_auto_vary_star_uncacheable(ng, origin)
     test_auto_vary_cookie_uncacheable(ng, origin)
     test_auto_vary_mixed_refused_wins(ng, origin)
