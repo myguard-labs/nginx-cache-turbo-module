@@ -9353,7 +9353,8 @@ def test_auto_vary_device(ng: Nginx, origin: Origin) -> None:
 
 
 def test_auto_vary_language(ng: Nginx, origin: Origin) -> None:
-    """v11 auto-Vary: `Vary: Accept-Language` splits by the raw header value."""
+    """v11 auto-Vary: `Vary: Accept-Language` splits by the LANG axis class
+    (S7: primary-subtag class, not the raw header)."""
     base = origin.hits
     p = "/av/lang?v=al"
     _, e1, _ = fetch(ng.port, p, {"Accept-Language": "en"})
@@ -9364,8 +9365,64 @@ def test_auto_vary_language(ng: Nginx, origin: Origin) -> None:
     assert origin.hits - base == 2, origin.hits - base
 
 
+def test_auto_vary_language_primary_subtag_shares(ng: Nginx,
+                                                    origin: Origin) -> None:
+    """S7: LANG folds to the primary-subtag CLASS, so `en-US,en;q=0.9` and
+    `en-GB,en;q=0.8` -- distinct raw headers, same primary subtag `en` -- now
+    SHARE one slot -> a single origin hit. This is the actual fix: before S7
+    the raw fold gave each browser locale string its own variant, blowing up
+    the keyspace on an i18n site for representations that are byte-identical.
+    Canary: $cache_turbo_status (echoed as X-CT-Status) is HIT on the second
+    request, not just "body matches"."""
+    base = origin.hits
+    p = "/av/langshare?v=al"
+    s1, b1, h1 = fetch(ng.port, p, {"Accept-Language": "en-US,en;q=0.9"})
+    s2, b2, h2 = fetch(ng.port, p, {"Accept-Language": "en-GB,en;q=0.8"})
+    assert s1 == 200 and s2 == 200, (s1, s2)
+    assert b1 == b2, ("en-US and en-GB did not share a slot", b1, b2)
+    assert origin.hits - base == 1, \
+        ("en-US and en-GB should fold to one 'en' class -> one origin hit",
+         origin.hits - base)
+
+
+def test_auto_vary_language_different_primary_splits(ng: Nginx,
+                                                       origin: Origin) -> None:
+    """S7 negative guard: `en` and `de` are DIFFERENT primary subtags and must
+    still SPLIT into distinct slots -- proves the fold isn't over-collapsing
+    everything to one class."""
+    base = origin.hits
+    p = "/av/langsplit?v=al"
+    _, en1, _ = fetch(ng.port, p, {"Accept-Language": "en-US,en;q=0.9"})
+    _, en2, _ = fetch(ng.port, p, {"Accept-Language": "en-GB,en;q=0.8"})
+    _, de1, _ = fetch(ng.port, p, {"Accept-Language": "de-DE,de;q=0.9"})
+    assert en1 == en2, ("en variants should still share", en1, en2)
+    assert en1 != de1, ("en and de shared a slot", en1, de1)
+    assert origin.hits - base == 2, origin.hits - base
+
+
+def test_auto_vary_language_absent_splits_from_class(ng: Nginx,
+                                                       origin: Origin) -> None:
+    """S7: an absent Accept-Language header folds to its OWN empty class "" --
+    it must still split from a present `en` header, not collide with it (the
+    empty class is skip-shaped but must NOT be skipped: skipping the axis
+    would collide a present-but-empty header with an absent one)."""
+    base = origin.hits
+    p = "/av/langabsent?v=al"
+    s1, absent1, h1 = fetch(ng.port, p)  # no Accept-Language header at all
+    s2, absent2, h2 = fetch(ng.port, p)
+    s3, en1, h3 = fetch(ng.port, p, {"Accept-Language": "en-US,en;q=0.9"})
+    assert s1 == 200 and s2 == 200 and s3 == 200, (s1, s2, s3)
+    assert absent1 == absent2, ("absent header should share its own slot",
+                                 absent1, absent2)
+    assert absent1 != en1, ("absent Accept-Language shared a slot with 'en'",
+                             absent1, en1)
+    assert origin.hits - base == 2, origin.hits - base
+
+
 def test_auto_vary_origin(ng: Nginx, origin: Origin) -> None:
-    """v11 auto-Vary: `Vary: Origin` splits by the raw Origin header value."""
+    """v11 auto-Vary: `Vary: Origin` splits by the raw Origin header value.
+    ORIGIN is a CORS security boundary and is NEVER class-folded (S7 touches
+    LANG only) -- two distinct Origins must still split into distinct slots."""
     base = origin.hits
     p = "/av/org?v=or"
     _, a1, _ = fetch(ng.port, p, {"Origin": "https://a.example"})
@@ -10087,6 +10144,9 @@ def run_all(ng: Nginx, origin: Origin,
     test_auto_vary_encoding_same_class_shares(ng, origin)
     test_auto_vary_device(ng, origin)
     test_auto_vary_language(ng, origin)
+    test_auto_vary_language_primary_subtag_shares(ng, origin)
+    test_auto_vary_language_different_primary_splits(ng, origin)
+    test_auto_vary_language_absent_splits_from_class(ng, origin)
     test_auto_vary_origin(ng, origin)
     test_auto_vary_star_uncacheable(ng, origin)
     test_auto_vary_cookie_uncacheable(ng, origin)

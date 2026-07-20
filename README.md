@@ -412,12 +412,27 @@ Turn on `cache_turbo_auto_vary on` and the module reads the response's own
 `Vary` header and splits the cache by the named **request** header automatically
 — no need to pre-declare the axes. It honours a safe whitelist:
 `Accept-Encoding` (bucketed br/gzip/identity/zstd), `User-Agent` (mobile/desktop
-class), `Accept-Language` and `Origin` (raw value). A response with `Vary: *`, or
-one that varies on `Cookie` or `Authorization`, is treated as **uncacheable**
-(those vary per-user — caching them would poison or leak across users). **Any
-other named header is also treated as uncacheable** — the module can't key on it,
-and caching a single representation for every value of that header would serve the
-wrong one (RFC 9110 §12.5.5).
+class), `Accept-Language` (primary-subtag class) and `Origin` (raw value,
+unfolded: it's a CORS security boundary, collapsing distinct origins into one
+class would let one origin's response serve another's CORS headers). A response
+with `Vary: *`, or one that varies on `Cookie` or `Authorization`, is treated as
+**uncacheable** (those vary per-user — caching them would poison or leak across
+users). **Any other named header is also treated as uncacheable** — the module
+can't key on it, and caching a single representation for every value of that
+header would serve the wrong one (RFC 9110 §12.5.5).
+
+`Accept-Language` is folded to its **primary subtag only**, lowercased: the
+first language-range of the header, cut at the first `-` (and any `;q=`
+parameter dropped), capped at 8 bytes. `en-US,en;q=0.9` and `en-GB,en;q=0.8`
+both fold to `en` and share a cache entry — the raw header would otherwise
+spawn a distinct variant per browser locale string, blowing up the keyspace on
+an i18n site with no benefit (nobody serves different bytes for `en-US` vs.
+`en-GB`). An absent, empty, or malformed header folds to its own empty class
+`""` rather than being skipped — skipping would collide the axis with a
+genuinely present-but-empty header. Accepted cost: `pt-BR`/`pt-PT` and
+`zh-Hans`/`zh-Hant` now share an entry; a site that truly serves different
+content per region/script should use an explicit `cache_turbo_vary` for that
+axis rather than relying on auto-Vary.
 
 > Don't double-partition the same axis. If you both turn on
 > `cache_turbo_auto_vary` *and* add the matching `cache_turbo_normalize_vary`
@@ -1318,7 +1333,7 @@ http {
 | `cache_turbo_admin NAME` | `location` | — | Make this location a control endpoint for zone `NAME` (stats/purge/warm). Gate with `allow`/`deny`. |
 | `cache_turbo_normalize_strip NAME...` | `server`, `location` | — | Extra query args to drop from `$cache_turbo_normalized_args` (trailing `*` = prefix; a bare `*` matches every name = drop all), on top of the built-ins. |
 | `cache_turbo_normalize_vary TOKEN...` | `server`, `location` | off | Append a variant bucket to `$cache_turbo_normalized_args`: `encoding` (br/gzip/identity) and/or `device` (mobile/desktop). |
-| `cache_turbo_auto_vary on` | `server`, `location` | `off` | Read the response's own `Vary` header and split the cache by the named request header automatically. Safe whitelist: `Accept-Encoding`, `User-Agent` (device class), `Accept-Language`, `Origin`. `Vary: *`/`Cookie`/`Authorization` — **or any other header not on the whitelist** — ⇒ uncacheable (so an un-split Vary axis can never serve the wrong representation). Two-level, node-local keying. See [Auto-Vary](#auto-vary-read-the-response-vary). |
+| `cache_turbo_auto_vary on` | `server`, `location` | `off` | Read the response's own `Vary` header and split the cache by the named request header automatically. Safe whitelist: `Accept-Encoding`, `User-Agent` (device class), `Accept-Language` (primary-subtag class), `Origin` (raw — CORS boundary, never folded). `Vary: *`/`Cookie`/`Authorization` — **or any other header not on the whitelist** — ⇒ uncacheable (so an un-split Vary axis can never serve the wrong representation). Two-level, node-local keying. See [Auto-Vary](#auto-vary-read-the-response-vary). |
 
 ### Variables
 

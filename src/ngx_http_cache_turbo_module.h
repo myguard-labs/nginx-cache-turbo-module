@@ -271,9 +271,13 @@
 #define NGX_HTTP_CACHE_TURBO_VARY_DEVICE    0x2
 /* auto-Vary (v11 other half): the same bits also drive the automatic variant
  * key derived from a response `Vary:` header (cache_turbo_auto_vary). LANG keys
- * on the raw Accept-Language value; ORIGIN on the raw Origin value. Only this
- * safe whitelist is honoured — Vary: * / Cookie / Authorization make the
- * response uncacheable instead (cross-user poisoning/leak guard). */
+ * on the Accept-Language PRIMARY SUBTAG CLASS (first language-range, cut at
+ * '-', lowercased, capped at 8 bytes — e.g. `en-US,en;q=0.9` -> "en"; absent/
+ * malformed folds to the empty class, it is not skipped); ORIGIN keys on the
+ * raw Origin value (a CORS security boundary — folding it would let one
+ * origin's response serve another's CORS headers, so it stays raw by design).
+ * Only this safe whitelist is honoured — Vary: * / Cookie / Authorization make
+ * the response uncacheable instead (cross-user poisoning/leak guard). */
 #define NGX_HTTP_CACHE_TURBO_VARY_LANG      0x4
 #define NGX_HTTP_CACHE_TURBO_VARY_ORIGIN    0x8
 
