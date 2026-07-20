@@ -50,14 +50,18 @@ version of this preset got it wrong and **leaked**.
 
 **`xf_user` is not the login cookie. It is the *remember-me* cookie.**
 `ControllerPlugin/Login.php` calls `completeLogin($user, $remember)` and only mints
-`xf_user` inside `if ($remember)`. **"Stay logged in" is unticked by default.** So
-an ordinary member — types password, clicks Log in, does not tick the box — carries
-**no `xf_user` at all**. They carry only `xf_session`.
+`xf_user` inside `if ($remember)`. So any member who does **not** tick "Stay logged
+in" — types password, clicks Log in, leaves the box alone — carries **no `xf_user`
+at all**. They carry only `xf_session`.
+
+Whether that box ships ticked or unticked varies by XenForo version, style, and
+admin configuration, so **do not build the rule on the default**: as long as *some*
+members log in without it, `xf_user` cannot be your login signal.
 
 The old preset matched `xf_user` and `xf_session_admin`, and deliberately excluded
 `xf_session` on the grounds that guests get one too. The result: that ordinary
 member matched **no bypass rule**, their authenticated page was stored, and it was
-served to strangers. A real cross-user leak, on the *common* login path.
+served to strangers. A real cross-user leak, on an entirely ordinary login path.
 
 **So `xf_session` is now in the cookie list, and it has to be.** That is the whole
 trade, and it is not free:
