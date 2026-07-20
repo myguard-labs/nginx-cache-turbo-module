@@ -88,6 +88,8 @@ static char *ngx_http_cache_turbo_stale_mult(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 static char *ngx_http_cache_turbo_min_uses(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
+static char *ngx_http_cache_turbo_scan_resistant(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
 static char *ngx_http_cache_turbo_l2_negative_ttl(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 static char *ngx_http_cache_turbo_preset(ngx_conf_t *cf, ngx_command_t *cmd,
@@ -309,6 +311,13 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
     { ngx_string("cache_turbo_min_uses"),
       NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
       ngx_http_cache_turbo_min_uses,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+
+    { ngx_string("cache_turbo_scan_resistant"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE12,
+      ngx_http_cache_turbo_scan_resistant,
       NGX_HTTP_LOC_CONF_OFFSET,
       0,
       NULL },
@@ -4227,11 +4236,11 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
              * insertion/refresh). P1: coarse-gate the splice — skip the LRU WRITE
              * when this node was already spliced within the last second, so a
              * hot key serializes readers on the mutex at most once/second. */
-            if (now - ctn->last_access >= 1) {
-                ctn->last_access = now;
-                ngx_queue_remove(&ctn->lru);
-                ngx_queue_insert_head(&z->sh->lru, &ctn->lru);
-            }
+            /* S8: shared promote-on-second-hit helper; also applies the P1
+             * 1s coarse gate internally. clcf->scan_resistant_pct == 0 (the
+             * default) makes this a plain probation re-head. */
+            ngx_http_cache_turbo_shm_touch_lru(z, ctn, now,
+                                               clcf->scan_resistant_pct);
             ngx_shmtx_unlock(&z->shpool->mutex);
             (void) ngx_atomic_fetch_add(&z->sh->hits, 1);
             ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
@@ -4248,11 +4257,11 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
 
             /* True LRU: promote on access (still a live, serveable entry).
              * P1: coarse-gate the splice (see the fresh-HIT site above). */
-            if (now - ctn->last_access >= 1) {
-                ctn->last_access = now;
-                ngx_queue_remove(&ctn->lru);
-                ngx_queue_insert_head(&z->sh->lru, &ctn->lru);
-            }
+            /* S8: shared promote-on-second-hit helper; also applies the P1
+             * 1s coarse gate internally. clcf->scan_resistant_pct == 0 (the
+             * default) makes this a plain probation re-head. */
+            ngx_http_cache_turbo_shm_touch_lru(z, ctn, now,
+                                               clcf->scan_resistant_pct);
 
             /* Cross-node single-flight resolved (v4-2): we parked for the Redis
              * NX and the phase engine re-entered. If we won (NGX_OK), we own the
@@ -7087,6 +7096,105 @@ ngx_http_cache_turbo_min_uses(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 }
 
 
+/* cache_turbo_scan_resistant on|off [protected_pct=N]   (S8)
+ *
+ * Segmented (probation/protected) LRU. OFF BY DEFAULT: when absent, or set to
+ * `off`, scan_resistant_pct is 0 and every LRU path behaves exactly as the flat
+ * single-queue LRU did before S8 -- no node is ever promoted, the protected
+ * queue stays empty, and eviction always finds its victim on probation.
+ *
+ * `on` stores the protected-segment cap (1..99, default 80) in the same field,
+ * so "on" and the tuning cannot disagree and there is no representable
+ * "on with pct 0" state.
+ *
+ * Range-checked by hand rather than via ngx_conf_set_num_slot for the reason
+ * H5/stale_mult and H3c/min_uses both re-learned the hard way: a bare num_slot
+ * would accept `protected_pct=0` and let it be silently coerced to the default,
+ * so the config would quietly mean something other than what it says. A value
+ * outside the band is a config ERROR here.
+ */
+static char *
+ngx_http_cache_turbo_scan_resistant(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf)
+{
+    ngx_http_cache_turbo_loc_conf_t  *clcf = conf;
+
+    ngx_str_t  *value = cf->args->elts;
+    ngx_int_t   pct;
+    ngx_uint_t  i;
+    ngx_uint_t  on;
+
+    if (clcf->scan_resistant_pct != (ngx_uint_t) NGX_CONF_UNSET) {
+        return "is duplicate";
+    }
+
+    if (value[1].len == 2 && ngx_strncmp(value[1].data, "on", 2) == 0) {
+        on = 1;
+
+    } else if (value[1].len == 3
+               && ngx_strncmp(value[1].data, "off", 3) == 0)
+    {
+        on = 0;
+
+    } else {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "cache_turbo_scan_resistant: bad value \"%V\": expected "
+            "\"on\" or \"off\"", &value[1]);
+        return NGX_CONF_ERROR;
+    }
+
+    pct = NGX_HTTP_CACHE_TURBO_PROTECTED_PCT_DEFAULT;
+
+    for (i = 2; i < cf->args->nelts; i++) {
+
+        if (ngx_strncmp(value[i].data, "protected_pct=", 14) == 0) {
+
+            /* ngx_atoi has no sign handling, so a negative fails as NGX_ERROR
+             * and surfaces as "bad protected_pct" rather than reaching the
+             * range check. The two diagnostics are deliberately distinct --
+             * same split as cache_turbo_stale_mult (the H5 lesson). */
+            pct = ngx_atoi(value[i].data + 14, value[i].len - 14);
+            if (pct == NGX_ERROR) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                    "cache_turbo_scan_resistant: bad protected_pct \"%V\"",
+                    &value[i]);
+                return NGX_CONF_ERROR;
+            }
+
+            if (pct < NGX_HTTP_CACHE_TURBO_PROTECTED_PCT_MIN
+                || pct > NGX_HTTP_CACHE_TURBO_PROTECTED_PCT_MAX)
+            {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                    "cache_turbo_scan_resistant: protected_pct \"%V\" is out "
+                    "of range: expected %d..%d", &value[i],
+                    NGX_HTTP_CACHE_TURBO_PROTECTED_PCT_MIN,
+                    NGX_HTTP_CACHE_TURBO_PROTECTED_PCT_MAX);
+                return NGX_CONF_ERROR;
+            }
+
+            continue;
+        }
+
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "cache_turbo_scan_resistant: unknown parameter \"%V\"", &value[i]);
+        return NGX_CONF_ERROR;
+    }
+
+    /* protected_pct on an `off` directive is accepted-but-inert config: reject
+     * it rather than store a value that will never be read. */
+    if (!on && cf->args->nelts > 2) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "cache_turbo_scan_resistant: protected_pct is meaningless with "
+            "\"off\"");
+        return NGX_CONF_ERROR;
+    }
+
+    clcf->scan_resistant_pct = on ? (ngx_uint_t) pct : 0;
+
+    return NGX_CONF_OK;
+}
+
+
 /* cache_turbo_l2_negative_ttl N (L13). Seconds to remember an L2 miss so the
  * next cold request for the same key skips the L2 round-trip.
  *
@@ -9384,6 +9492,10 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->lock = NGX_CONF_UNSET;
     conf->lock_timeout = NGX_CONF_UNSET_MSEC;
     conf->min_uses_raw = NGX_CONF_UNSET;
+    /* S8: NGX_CONF_UNSET (not 0) so merge can tell "never set here" from an
+     * explicit `off`, and an explicit off in a location still beats an
+     * inherited `on`. Resolved to 0 (off) or 1..99 in merge_loc_conf. */
+    conf->scan_resistant_pct = (ngx_uint_t) NGX_CONF_UNSET;
     conf->min_uses = NGX_CONF_UNSET;
     conf->l2_negative_ttl = NGX_CONF_UNSET;   /* L13; merges to 0 = off */
     conf->max_size = NGX_CONF_UNSET_SIZE;
@@ -9460,6 +9572,18 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
      */
     if (conf->preset == NGX_CONF_UNSET) {
         conf->preset = prev->preset;
+    }
+
+    /* S8: deliberately NOT band-resolved. No preset enables scan resistance --
+     * it is a behaviour change with a keyspace-shape trade-off, so it is opt-in
+     * per location and nothing else. Plain inherit, then default to 0 = OFF.
+     * An explicit `off` stores 0 (not UNSET), so it correctly overrides an
+     * inherited `on` rather than re-inheriting it here. */
+    if (conf->scan_resistant_pct == (ngx_uint_t) NGX_CONF_UNSET) {
+        conf->scan_resistant_pct = prev->scan_resistant_pct;
+    }
+    if (conf->scan_resistant_pct == (ngx_uint_t) NGX_CONF_UNSET) {
+        conf->scan_resistant_pct = 0;
     }
 
     {
