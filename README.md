@@ -1127,6 +1127,14 @@ Turning it on changes only eviction ORDER. It never changes what is served,
 what is cacheable, or any freshness decision, and `off` (or omitting the
 directive) is byte-for-byte the pre-existing flat LRU.
 
+**Turning it back off on a live zone.** A cache zone survives an `nginx -s
+reload`, so an `on` -> `off` change inherits entries that were already promoted.
+Those are **demoted back to probation as they are next accessed**, and any that
+are never accessed again are drained by eviction once probation empties, so the
+zone converges on the flat LRU rather than keeping a permanently privileged set.
+The convergence is gradual, not instantaneous; restart (rather than reload) if
+you need the flat LRU immediately.
+
 ## What autotune actually tunes
 
 `cache_turbo_autotune on` makes the cache **load-adaptive**: every 30s it

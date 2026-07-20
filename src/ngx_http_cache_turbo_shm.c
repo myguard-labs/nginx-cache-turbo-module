@@ -366,10 +366,25 @@ ngx_http_cache_turbo_shm_touch_lru(ngx_http_cache_turbo_zone_t *z,
      * touched has been accessed at least once since it was stored (the store
      * itself does not touch), so this touch is the promoting one. That reuses
      * the existing state instead of adding a hit counter to the node. */
-    if (protected_pct > 0
-        && ctn->kind == NGX_HTTP_CACHE_TURBO_NODE_ENTRY
-        && ctn->seg == NGX_HTTP_CACHE_TURBO_SEG_PROBATION
-        && ctn->promotable)
+    if (protected_pct == 0) {
+        /* Feature OFF: DEMOTE, do not merely decline to promote.
+         *
+         * ⚠ A zone survives a reload (init_zone inherits the live `sh` when
+         * `octx` is set, or `shm.exists`), so an `on` -> `off` config change
+         * hands us nodes that are already PROTECTED. Leaving `seg` alone here
+         * would relink them onto lru_protected forever -- `off` would stop
+         * future promotions but never restore the flat single-queue LRU, and
+         * the entries promoted while it was on would stay preferentially
+         * un-evictable for the life of the zone. Demoting on touch drains the
+         * protected queue back into probation as those nodes are used, so
+         * `off` genuinely converges on the pre-S8 behaviour. Untouched nodes
+         * are reached by eviction instead, which drains lru_protected once
+         * probation empties. (CodeRabbit, PR #81.) */
+        ctn->seg = NGX_HTTP_CACHE_TURBO_SEG_PROBATION;
+
+    } else if (ctn->kind == NGX_HTTP_CACHE_TURBO_NODE_ENTRY
+               && ctn->seg == NGX_HTTP_CACHE_TURBO_SEG_PROBATION
+               && ctn->promotable)
     {
         ctn->seg = NGX_HTTP_CACHE_TURBO_SEG_PROTECTED;
     }

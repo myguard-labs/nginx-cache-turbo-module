@@ -403,7 +403,10 @@ test_s8_promote_on_second_hit(void)
           "consistency broken -- a node must be on exactly one)");
 
     /* (4) The P1 coarse gate still governs: a touch inside the same second is
-     * a no-op, not a promotion. Demote by hand and re-touch immediately. */
+     * a no-op. The node is already PROTECTED here, so what this pins is that
+     * an immediate re-touch does not run the promote/cap machinery again --
+     * n_protected must not move. (No manual demote is involved; an earlier
+     * version of this comment claimed one. CodeRabbit, PR #81.) */
     ngx_http_cache_turbo_shm_touch_lru(&g_zone, ctn, ngx_test_now, PCT_ON);
     CHECK(g_sh.n_protected == 1,
           "a within-1s touch must be a no-op, not a second promotion");
@@ -437,6 +440,74 @@ test_s8_promote_on_second_hit(void)
           "fixture: memo should still be live");
     CHECK(find(1)->seg == NGX_HTTP_CACHE_TURBO_SEG_PROBATION,
           "S8: l2_neg_check promoted a memo COUNTER");
+
+    CHECK(ngx_test_lock_balanced(), "touch path left the zone mutex held");
+}
+
+/* =====================================================================
+ * S8: turning the feature OFF must DEMOTE, not merely stop promoting.
+ *
+ * A zone survives a reload -- init_zone() inherits the live `sh` -- so an
+ * `on` -> `off` config change is handed nodes that are already PROTECTED.
+ * If touch_lru() only declined to promote, unlink/link_head would keep
+ * relinking those nodes onto lru_protected forever: `off` would stop future
+ * promotions but never restore the flat single-queue LRU, and everything
+ * promoted while it was on would stay preferentially un-evictable for the
+ * life of the zone.
+ *
+ * Found by CodeRabbit on PR #81, not by CI -- the original tests only ever
+ * exercised a FRESH zone, where nothing is protected to begin with.
+ * ===================================================================== */
+static void
+test_s8_off_demotes_inherited_protected_nodes(void)
+{
+    ngx_http_cache_turbo_node_t  *ctn;
+
+    printf("S8: `off` demotes nodes a previous `on` had promoted\n");
+    zone_reset();
+
+    /* Build the post-reload state: an ENTRY promoted while the feature was on. */
+    ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(0), 1);
+    ctn = find(0);
+    ctn->kind = NGX_HTTP_CACHE_TURBO_NODE_ENTRY;
+    ctn->len  = 128;
+    ctn->last_access = ngx_test_now;
+
+    ngx_test_advance_time(2);
+    ngx_http_cache_turbo_shm_touch_lru(&g_zone, ctn, ngx_test_now, PCT_ON);
+    ngx_test_advance_time(2);
+    ngx_http_cache_turbo_shm_touch_lru(&g_zone, ctn, ngx_test_now, PCT_ON);
+    CHECK(ctn->seg == NGX_HTTP_CACHE_TURBO_SEG_PROTECTED,
+          "fixture: node should be PROTECTED before the reload");
+    CHECK(g_sh.n_protected == 1, "fixture: n_protected should be 1");
+
+    /* Config reloaded with the directive removed/off => pct 0 from here on. */
+    ngx_test_advance_time(2);
+    ngx_http_cache_turbo_shm_touch_lru(&g_zone, ctn, ngx_test_now, 0);
+
+    CHECK(ctn->seg == NGX_HTTP_CACHE_TURBO_SEG_PROBATION,
+          "S8: `off` left an inherited node PROTECTED -- the zone never "
+          "returns to the flat LRU after an on->off reload");
+    CHECK(g_sh.n_protected == 0,
+          "S8: n_protected not decremented when `off` demoted the node");
+    CHECK(ngx_queue_empty(&g_sh.lru_protected),
+          "S8: protected queue still non-empty after `off` touched its "
+          "only member");
+    CHECK(!ngx_queue_empty(&g_sh.lru),
+          "S8: demoted node did not land on the probation queue");
+
+    /* And it must not creep back: with the feature off, further touches keep
+     * it in probation however many times it is hit. */
+    ngx_test_advance_time(2);
+    ngx_http_cache_turbo_shm_touch_lru(&g_zone, ctn, ngx_test_now, 0);
+    ngx_test_advance_time(2);
+    ngx_http_cache_turbo_shm_touch_lru(&g_zone, ctn, ngx_test_now, 0);
+    CHECK(ctn->seg == NGX_HTTP_CACHE_TURBO_SEG_PROBATION,
+          "S8: a node re-promoted itself while the feature was off");
+    CHECK(g_sh.n_protected == 0, "S8: n_protected rose while off");
+
+    ctn->len = 0;   /* keep zone_reset()'s drain off the blob path */
+    ctn->kind = NGX_HTTP_CACHE_TURBO_NODE_COUNTER;
 
     CHECK(ngx_test_lock_balanced(), "touch path left the zone mutex held");
 }
@@ -752,6 +823,7 @@ main(void)
 
     test_s8_evict_terminates_on_empty_queues();
     test_s8_promote_on_second_hit();
+    test_s8_off_demotes_inherited_protected_nodes();
     test_cr_a_memo_survives_claim();
     test_cr_b_unstub_preserves_counter();
     test_claim_single_flight();
