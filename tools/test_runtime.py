@@ -34,7 +34,6 @@ import socket
 import struct
 import subprocess
 import sys
-import contextlib
 import tempfile
 import threading
 import time
@@ -526,6 +525,15 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
                  redis_tls_ca: str | None = None,
                  memcached_port: int | None = None,
                  fault_injection: bool = False) -> str:
+    """Build the generated nginx.conf for the test server.
+
+    !! ASCII ONLY -- everything returned here, INCLUDING COMMENTS, is written
+    with encoding="ascii" (see Nginx.write_config). A single non-ASCII byte
+    anywhere in this function (a stray arrow, dash, or warning sign pasted into
+    a location comment) raises UnicodeEncodeError before a single test runs, and
+    the traceback points at write_text, not at the comment you added. Use "!!",
+    "->" and plain hyphens.
+    """
     load = f"load_module {module};\n" if module else ""
 
     # DSN auth+db (v5): a backend reached via a full redis://user:pass@host/db
@@ -677,19 +685,31 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
         # one node. min_uses 3 exceeds the test's request count, so every request
         # stays below the threshold and each one both counts a min_uses skip and
         # consults the memo -- the overlapping state that would hide a clobber.
-        # lock_ttl 1s (not the 5s default): the CR-B test drives UNCACHEABLE
-        # responses through here, so a winner never stores and a follower would
-        # park until the single-flight self-heals. With a correct unstub() nothing
-        # parks -- the stub is cleared the moment the winner finishes -- but a
-        # regression in that teardown otherwise stalls each request for 5s and
-        # times the suite out non-deterministically (measured ~1 run in 3).
-        # Bounding the TTL turns that hang into a fast, legible failure.
+        # The CR-B test drives UNCACHEABLE responses through here, so a winner
+        # never stores and a follower can park on the single-flight. Two SEPARATE
+        # deadlines govern that, and they are easy to confuse:
+        #
+        #   lock_ttl 1s      -- how long a CLAIM stays valid (when a stub goes
+        #                       stale and may be taken over by a new winner).
+        #   lock_timeout 2s  -- how long a WAITER parks before giving up and
+        #                       going to origin itself (module.c: wait_deadline
+        #                       = now + lock_timeout).
+        #
+        # !! lock_timeout MUST stay well under fetch()'s 5s client timeout. Both
+        # defaulted to 5s, so a waiter that parked the full deadline released at
+        # ~5.000s while the client aborted at 5.000s -- a photo finish decided by
+        # scheduling jitter, which is exactly the 1-in-N red this test showed on
+        # slower CI runners (PR #77, run 29708006339 attempt 1). Pinning it to 2s
+        # makes the park end strictly before the client gives up, so a real
+        # teardown regression surfaces as a legible assertion rather than a
+        # timeout whose cause is ambiguous.
         location /l2negmu/ {{
             cache_turbo                  main;
             cache_turbo_key              $uri;
             cache_turbo_valid            30s;
             cache_turbo_min_uses         3;
             cache_turbo_lock_ttl         1s;
+            cache_turbo_lock_timeout     2s;
             cache_turbo_l2_negative_ttl  3;
             cache_turbo_redis            127.0.0.1:{redis_port} prefix=ct: timeout=250ms;
             proxy_pass http://127.0.0.1:{origin_port}/;
@@ -7587,6 +7607,18 @@ def test_min_uses_counter_survives_uncacheable(ng: Nginx, origin: Origin,
     # and the next request must not race the winner's unstub(). At 0.1s this test
     # intermittently hit a still-claimed stub and parked, timing the suite out on
     # roughly one run in three.
+    #
+    # !! The sleep is a NUISANCE REDUCER, not the thing that makes this safe, and
+    # it never was: lock_ttl on /l2negmu/ is 1s, so a 0.3s gap still lands well
+    # inside the previous request's claim window by construction. Parking here is
+    # REACHABLE and expected -- count_miss() returns NGX_OK (not NGX_DECLINED) when
+    # it finds a live stub, precisely so claim() can turn this request into a
+    # waiter (shm.c, "Proceed so the caller's claim() makes this request a
+    # waiter"). No concurrency is needed to get a waiter in this serial test.
+    # What keeps that park from failing the test is cache_turbo_lock_timeout 2s
+    # on the location, which bounds the park strictly under fetch()'s 5s client
+    # timeout. Both were 5s until 2026-07-20, which is the real source of the
+    # "1 in N" red on slow CI runners -- not the sleep, and not unstub().
     skips_seen = []
     for _ in range(5):
         mu0 = _admin_min_uses_skips(ng)
@@ -10150,7 +10182,7 @@ def main() -> int:
     redis_tls_port = args.port + 23 if args.redis_server else None
     memcached_port = args.port + 24 if args.memcached_server else None
     redis_password = "ctsecret"
-    with contextlib.nullcontext(tempfile.mkdtemp(prefix="cache-turbo-ci-")) as tmp:  # PROBE-KEEP
+    with tempfile.TemporaryDirectory(prefix="cache-turbo-ci-") as tmp:
         root = pathlib.Path(tmp)
         origin = Origin(origin_port, delay=0.05)
         redis = redis_auth = redis_tls = mc = None
