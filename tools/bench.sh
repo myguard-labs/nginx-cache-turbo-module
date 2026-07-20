@@ -82,7 +82,7 @@ command -v wrk >/dev/null 2>&1 || {
 }
 # median_of() below uses gawk's asort(); Debian/Ubuntu's default
 # /usr/bin/awk is mawk, which lacks it.
-command -v gawk >/dev/null 2>&1 && AWK_BIN=gawk || AWK_BIN=awk
+if command -v gawk >/dev/null 2>&1; then AWK_BIN="gawk"; else AWK_BIN="awk"; fi
 if ! "$AWK_BIN" 'BEGIN{a[1]=3;a[2]=1;n=asort(a);exit (n==2 && a[1]==1)?0:1}' 2>/dev/null; then
     echo "FATAL: gawk (with asort()) not found; required for pass median/min/max. apt-get install gawk." >&2
     exit 2
@@ -311,7 +311,7 @@ prime_keys() {
 # always warned wrk can saturate a client core and mask the effect we're
 # trying to measure, but nothing recorded it until now.
 runwrk() {
-    local url="$1" path="${2:-}" out timeout_out cpu_pct
+    local url="$1" path="${2:-}" out cpu_pct
     local time_bin="/usr/bin/time"
     [ -x "$time_bin" ] || time_bin=""
 
@@ -369,6 +369,7 @@ printf '%s\n' "-----------------------------------------------------------------
 
 # Median of a whitespace-separated list of numbers (awk, no external sort dep).
 median_of() {
+    # shellcheck disable=SC2016  # $i is awk's field ref, not a shell expansion
     "$AWK_BIN" 'BEGIN{n=0} {for(i=1;i<=NF;i++){a[n++]=$i}}
          END{
              asort(a)
