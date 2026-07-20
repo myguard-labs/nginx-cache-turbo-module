@@ -323,7 +323,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential curl libpcre2-dev libssl-dev redis-server memcached zlib1g-dev
+          sudo apt-get install -y build-essential curl libpcre2-dev libssl-dev redis-server memcached zlib1g-dev gdb
 
       - name: Build with sanitizers
         run: bash tools/ci-build.sh nginx "$NGINX_VERSION" asan
@@ -342,13 +342,29 @@ jobs:
         env:
           ASAN_OPTIONS: detect_leaks=0:halt_on_error=1:abort_on_error=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        # Wrapped in ci-hang-guard.sh: the single-process suite intermittently wedges
+        # the nginx event loop on CI (R6b, never reproduced locally — memory issues.md).
+        # If the suite runs past the soft timeout the guard captures a gdb all-thread
+        # backtrace + SIGQUIT debug dump into ci-hang-artifacts/ (uploaded below) so the
+        # next occurrence yields evidence instead of a mute job timeout. 1200s soft <
+        # the 30-min job timeout, well above the ~7-min healthy run.
         run: |
-          python3 tools/test_runtime.py \
-            --fault-injection \
-            --single-process \
-            --redis-server /usr/bin/redis-server \
-            --memcached-server /usr/bin/memcached \
-            --nginx-binary "$GITHUB_WORKSPACE/.build/nginx-${NGINX_VERSION}/objs/nginx"
+          bash tools/ci-hang-guard.sh 1200 "$GITHUB_WORKSPACE/ci-hang-artifacts" -- \
+            python3 tools/test_runtime.py \
+              --fault-injection \
+              --single-process \
+              --redis-server /usr/bin/redis-server \
+              --memcached-server /usr/bin/memcached \
+              --nginx-binary "$GITHUB_WORKSPACE/.build/nginx-${NGINX_VERSION}/objs/nginx"
+
+      - name: Upload hang-capture artifacts
+        if: always()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: asan-hang-capture
+          path: ci-hang-artifacts/
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: Run runtime suite multi-worker under ASan and UBSan (CI-3)
         # CI-3: the single-process run above covers our allocations; this run
