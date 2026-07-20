@@ -8534,16 +8534,79 @@ ngx_http_cache_turbo_req_header(ngx_http_request_t *r, const char *name,
 }
 
 
+/* Accept-Language collapsed to the PRIMARY SUBTAG only, lowercased, so
+ * `en-US,en;q=0.9` and `en-GB,en;q=0.8` fold to the same "en" class instead of
+ * spawning a distinct variant per raw header string (i18n keyspace blowup).
+ * Policy: take the first language-range of the header, cut at '-', drop any
+ * ';q=' parameter, lowercase. Absent/empty/malformed header folds to the empty
+ * class "" (NOT skipped — skipping the axis would collide with a genuinely
+ * empty-but-present header). Result is capped at LANG_CLASS_MAX bytes; a
+ * longer primary subtag is truncated, not rejected.
+ *
+ * Unlike ae_class/device_class this returns into a caller buffer rather than a
+ * static string: the class is a truncated, lowercased slice of the raw header,
+ * not a fixed enum member. len (out) is 0..LANG_CLASS_MAX.
+ *
+ * Unlike the COR-5 purge generation (folded ONLY when bumped, so an unpurged
+ * base keeps its pre-upgrade variant key), this fold applies unconditionally:
+ * every LANG-varying entry's variant key changes on upgrade (base keys are
+ * unaffected — only the auto-Vary variant suffix moves). That one-time
+ * keyspace turnover is the accepted, expected cost of collapsing the
+ * raw-header keyspace to primary-subtag classes. */
+#define NGX_HTTP_CACHE_TURBO_LANG_CLASS_MAX  8
+
+static size_t
+ngx_http_cache_turbo_lang_class(ngx_http_request_t *r, u_char *buf)
+{
+    ngx_str_t   v;
+    u_char     *s, *last;
+    size_t      len;
+
+    v = ngx_http_cache_turbo_req_header(r, "Accept-Language",
+                                        sizeof("Accept-Language") - 1);
+
+    if (v.len == 0) {
+        return 0;
+    }
+
+    s = v.data;
+    last = v.data + v.len;
+
+    /* first language-range = up to the first ',' */
+    while (s < last && *s != ',') {
+        s++;
+    }
+    last = s;
+    s = v.data;
+
+    /* primary subtag = up to the first '-' (also stops at ';q=' since ';'
+     * terminates the range the same way '-' does for subtags) */
+    while (s < last && *s != '-' && *s != ';') {
+        s++;
+    }
+
+    len = (size_t) (s - v.data);
+    if (len > NGX_HTTP_CACHE_TURBO_LANG_CLASS_MAX) {
+        len = NGX_HTTP_CACHE_TURBO_LANG_CLASS_MAX;
+    }
+
+    ngx_strlow(buf, v.data, len);
+
+    return len;
+}
+
+
 /* Derive the secondary VARIANT key from the base key material plus the request
  * values of the named (whitelisted) Vary axes. Axes are folded in a FIXED order
  * (ae, dev, lang, origin) regardless of the response Vary token order, so two
- * nodes / two requests with the same axis values compute the same key. Encoding
- * and device are bucketed to a class (reusing the v3-4 helpers); language and
- * origin fold their raw values. The 0x1F (US) delimiter can never appear in a
- * URI or these header values, so the suffix cannot collide with the base
- * material. md5 fills the low 16 bytes; the high 16 are zeroed first (the slot
- * layout matches build_key, so a base and a variant only ever differ by the
- * folded bytes). */
+ * nodes / two requests with the same axis values compute the same key. Encoding,
+ * device, and language (S7: primary-subtag class) are all bucketed to a class;
+ * origin alone folds its raw value (CORS security boundary — see lang_class's
+ * docstring for why LANG is classed but ORIGIN is not). The 0x1F (US) delimiter
+ * can never appear in a URI or these header values, so the suffix cannot
+ * collide with the base material. md5 fills the low 16 bytes; the high 16 are
+ * zeroed first (the slot layout matches build_key, so a base and a variant
+ * only ever differ by the folded bytes). */
 static void
 ngx_http_cache_turbo_variant_hash(ngx_http_request_t *r, ngx_str_t *base,
     ngx_int_t bits, ngx_uint_t gen, u_char out[32])
@@ -8583,11 +8646,13 @@ ngx_http_cache_turbo_variant_hash(ngx_http_request_t *r, ngx_str_t *base,
         ngx_http_cache_turbo_digest_update(&d, cls, ngx_strlen(cls));
     }
     if (bits & NGX_HTTP_CACHE_TURBO_VARY_LANG) {
-        v = ngx_http_cache_turbo_req_header(r, "Accept-Language",
-                                            sizeof("Accept-Language") - 1);
+        u_char  lbuf[NGX_HTTP_CACHE_TURBO_LANG_CLASS_MAX];
+        size_t  llen;
+
+        llen = ngx_http_cache_turbo_lang_class(r, lbuf);
         ngx_http_cache_turbo_digest_update(&d, &us, 1);
         ngx_http_cache_turbo_digest_update(&d, "lang=", 5);
-        ngx_http_cache_turbo_digest_update(&d, v.data, v.len);
+        ngx_http_cache_turbo_digest_update(&d, lbuf, llen);
     }
     if (bits & NGX_HTTP_CACHE_TURBO_VARY_ORIGIN) {
         v = ngx_http_cache_turbo_req_header(r, "Origin", sizeof("Origin") - 1);
