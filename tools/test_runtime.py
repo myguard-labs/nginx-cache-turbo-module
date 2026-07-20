@@ -524,7 +524,8 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
                  redis_tls_port: int | None = None,
                  redis_tls_ca: str | None = None,
                  memcached_port: int | None = None,
-                 fault_injection: bool = False) -> str:
+                 fault_injection: bool = False,
+                 sr_off: bool = False) -> str:
     """Build the generated nginx.conf for the test server.
 
     !! ASCII ONLY -- everything returned here, INCLUDING COMMENTS, is written
@@ -535,6 +536,14 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
     "->" and plain hyphens.
     """
     load = f"load_module {module};\n" if module else ""
+
+    # S8 reload arm: the SAME zone (srz) with the directive flipped to `off`.
+    # Written into the conf only for the post-reload pass, so a real
+    # `nginx -s reload` hands the already-PROTECTED nodes in the surviving zone
+    # to a worker whose effective protected_pct is now 0. See
+    # test_s8_reload_on_to_off_drains_protected.
+    sr_directive = ("cache_turbo_scan_resistant off;" if sr_off
+                    else "cache_turbo_scan_resistant on;")
 
     # DSN auth+db (v5): a backend reached via a full redis://user:pass@host/db
     # DSN, and a plain SELECT-db (no auth) backend on the main instance.
@@ -2129,7 +2138,7 @@ http {{
             cache_turbo               srz;
             cache_turbo_key           $uri;
             cache_turbo_valid         300s;
-            cache_turbo_scan_resistant on;
+            {sr_directive}
             add_header                X-CT-Status $cache_turbo_status always;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
@@ -2537,7 +2546,7 @@ class Nginx:
         self.process: subprocess.Popen | None = None
         self.output_path = root / "nginx-output.log"
 
-    def write_config(self) -> None:
+    def write_config(self, sr_off: bool = False) -> None:
         workers = 1 if self.single_process else 4
         (self.root / "conf").mkdir(parents=True, exist_ok=True)
         (self.root / "logs").mkdir(parents=True, exist_ok=True)
@@ -2546,7 +2555,8 @@ class Nginx:
                          self.origin_port, workers, self.redis_port,
                          self.redis_auth_port, self.redis_password,
                          self.redis_tls_port, self.redis_tls_ca,
-                         self.memcached_port, self.fault_injection),
+                         self.memcached_port, self.fault_injection,
+                         sr_off),
             encoding="ascii")
 
     def command(self, test: bool = False) -> list[str]:
@@ -2579,6 +2589,74 @@ class Nginx:
         except Exception:
             self.stop()
             raise
+
+    def worker_pids(self) -> set[int]:
+        """PIDs of the live worker processes (children of the master).
+
+        Read from /proc rather than `ps` so it stays dependency-free. Returns an
+        empty set in single-process mode, where there are no children at all.
+        """
+        if self.process is None:
+            return set()
+        try:
+            children = (pathlib.Path("/proc") / str(self.process.pid) /
+                        "task" / str(self.process.pid) / "children")
+            return {int(p) for p in children.read_text().split()}
+        except (OSError, ValueError):
+            return set()
+
+    def reload(self, sr_off: bool = False, timeout: float = 20.0) -> None:
+        """Rewrite the config and drive a REAL `nginx -s reload`, then block
+        until the new worker generation has actually taken over.
+
+        !! Waiting is the whole point. `-s reload` only delivers SIGHUP and
+        returns; the master then forks new workers and shuts the old ones down
+        gracefully. A test that asserts immediately after the signal is racing a
+        worker that may still be running the OLD configuration, which makes the
+        assertion nondeterministic in exactly the direction that hides a bug.
+        We therefore capture the worker PID set first and wait for a set that is
+        both non-empty and fully disjoint from it -- old workers gone, new
+        workers serving.
+
+        Requires a master process; single-process mode has none and must skip.
+        """
+        if self.process is None:
+            raise RuntimeError("reload() on a stopped nginx")
+        if self.single_process:
+            raise RuntimeError("reload() requires a master process "
+                               "(not single_process mode)")
+
+        before = self.worker_pids()
+        self.write_config(sr_off=sr_off)
+
+        # Fail on a bad config BEFORE signalling: a reload with a broken conf is
+        # logged and ignored by the master, which would otherwise surface here as
+        # a confusing "behaviour did not change" assertion failure instead of a
+        # config error.
+        self.config_test()
+
+        r = subprocess.run(
+            self.runner + [str(self.binary), "-p", str(self.root),
+                           "-c", str(self.root / "conf" / "nginx.conf"),
+                           "-s", "reload"],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            timeout=20)
+        if r.returncode != 0:
+            raise RuntimeError(f"nginx -s reload failed:\n{r.stdout}")
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            now = self.worker_pids()
+            if now and not (now & before):
+                # New generation is up. The listening socket is inherited, so the
+                # port never closes; confirm it still answers before returning.
+                wait_port(self.port)
+                return
+            time.sleep(0.1)
+
+        raise RuntimeError(
+            f"reload: workers did not turn over within {timeout}s "
+            f"(before={sorted(before)}, now={sorted(self.worker_pids())})")
 
     def stop(self) -> None:
         if self.process is None:
@@ -7938,6 +8016,95 @@ def test_s8_explicit_off_matches_absent(ng: Nginx) -> None:
         f"S8: explicit `off` did not match absent (X-CT-Status={st})")
 
 
+def test_s8_reload_on_to_off_drains_protected(ng: Nginx) -> None:
+    """S8 reload arm -- THE BUG CLASS THE SUITE COULD NOT REACH.
+
+    Every other S8 test starts from a fresh zone, so an entry can only ever be
+    PROTECTED under a config that is currently `on`. The interesting state is
+    the one that only a reload can produce: a zone whose shared memory SURVIVES
+    (init_zone inherits the live `sh`) being handed to a worker whose effective
+    protected_pct is now 0. That is how the `on` -> `off` inherited-PROTECTED
+    bug reached CI green -- it was unreachable by construction, not merely
+    untested. (Found by CodeRabbit on PR #81; see lessons.md.)
+
+    Sequence: promote a hot key to PROTECTED while `on`, reload the SAME zone to
+    `off`, then touch the hot key (which must DEMOTE it to probation) and run a
+    scan. With `off` genuinely restoring pre-S8 behaviour the scan walks the key
+    out of the zone exactly as in test_s8_default_off_is_unchanged -> MISS.
+
+    NEGATIVE CONTROL (required by TODO, verified by hand -- see the PR body):
+    delete the `ctn->seg = ...SEG_PROBATION;` demote in
+    ngx_http_cache_turbo_shm_touch_lru() (shm.c, the `protected_pct == 0` arm)
+    and this test FAILS by its own assertion with X-CT-Status=HIT: the node
+    stays on lru_protected across the reload and the scan cannot evict it.
+
+    Skipped in single-process mode (`master_process off`), which has no master
+    and therefore cannot reload at all -- the ASan run uses it.
+    """
+    if ng.single_process:
+        return
+
+    prefix, tag = "/sr/", "reload"
+    hot = f"{prefix}hot-{tag}"
+
+    # 1. Promote to PROTECTED while the directive is still `on`. Two touches,
+    #    each straddling a real 1s boundary so the P1 coarse gate lets the
+    #    splice through (the same priming _s8_hot_status does).
+    s, _, _ = fetch(ng.port, hot)
+    assert s == 200, f"prime {hot} -> {s}"
+    for n in (1, 2):
+        time.sleep(1.2)
+        s, _, h = fetch(ng.port, hot)
+        assert s == 200, f"touch{n} {hot} -> {s}"
+        assert h.get("x-ct-status") == "HIT", (
+            f"priming touch{n} should HIT: {h.get('x-ct-status')}")
+
+    # 2. Prove the promotion actually took, BEFORE the reload. Without this the
+    #    test could pass for the wrong reason: if priming silently failed the
+    #    key would never be PROTECTED, the post-reload MISS would be trivially
+    #    true, and the test would assert nothing about `off` at all.
+    _s8_scan(ng, prefix, f"{tag}-pre")
+    s, _, h = fetch(ng.port, hot)
+    assert s == 200, f"pre-reload {hot} -> {s}"
+    assert h.get("x-ct-status") == "HIT", (
+        f"S8 reload: hot key was not PROTECTED before the reload "
+        f"(X-CT-Status={h.get('x-ct-status')}); priming is broken, so the "
+        "post-reload assertion below would prove nothing")
+
+    try:
+        # 3. The real reload: same zone, directive flipped to `off`.
+        ng.reload(sr_off=True)
+
+        # 4. Touch the surviving node under the new config. This is the demote:
+        #    protected_pct is now 0, so touch_lru must move it back to
+        #    probation. Straddle the 1s gate or the splice never runs.
+        time.sleep(1.2)
+        s, _, h = fetch(ng.port, hot)
+        assert s == 200, f"post-reload touch {hot} -> {s}"
+        assert h.get("x-ct-status") in ("HIT", "STALE"), (
+            f"S8 reload: entry did not survive the reload at all "
+            f"(X-CT-Status={h.get('x-ct-status')}); the zone was re-created "
+            "rather than inherited, so this test is not measuring the "
+            "inherited-state path it exists to cover")
+
+        # 5. Now the scan must be able to evict it, exactly as it does in the
+        #    never-was-on case.
+        _s8_scan(ng, prefix, f"{tag}-post")
+        s, _, h = fetch(ng.port, hot)
+        assert s == 200, f"post-scan {hot} -> {s}"
+        st = h.get("x-ct-status", "")
+        assert st == "MISS", (
+            f"S8 reload: `off` did not drain the inherited PROTECTED node "
+            f"(X-CT-Status={st}, expected MISS). Turning scan resistance off "
+            "must ACTIVELY DEMOTE nodes promoted while it was on, not merely "
+            "decline to promote new ones -- the zone outlives the reload")
+    finally:
+        # Restore `on` for whatever runs next: the conf and the srz zone are
+        # shared, and leaving the directive off would silently invert
+        # test_s8_scan_resistant_keeps_hot_key if it ran after this one.
+        ng.reload(sr_off=False)
+
+
 def test_s8_scan_still_stores_and_evicts(ng: Nginx) -> None:
     """S8 test 4 -- the anti-hang / anti-wedge arm at the HTTP level.
 
@@ -10369,6 +10536,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_s8_scan_resistant_keeps_hot_key(ng)
     test_s8_default_off_is_unchanged(ng)
     test_s8_explicit_off_matches_absent(ng)
+    test_s8_reload_on_to_off_drains_protected(ng)
     test_s8_scan_still_stores_and_evicts(ng)
     test_admin_stats(ng)
     test_admin_prometheus(ng)
@@ -10605,7 +10773,7 @@ def main() -> int:
           "admin purge w/ body, "
           "concurrency (R1), prometheus metrics (incl L2 hit/miss), "
           "default-key normalization, "
-          "LRU eviction (R6), S8 scan-resistant segmented LRU (protected hot key survives a scan; default-off and explicit-off both still evict it; churn stores+evicts without wedging; config rejects), refresh-under-pressure (R6b), "
+          "LRU eviction (R6), S8 scan-resistant segmented LRU (protected hot key survives a scan; default-off and explicit-off both still evict it; churn stores+evicts without wedging; config rejects; on->off across a REAL reload drains inherited PROTECTED nodes), refresh-under-pressure (R6b), "
           "stale serve (R3), single-flight (R4), "
           "cold-miss single-flight (v10: per-box collapse + lock-off stampede), "
           "min_uses (v15: cache after N misses + off-by-default; "
