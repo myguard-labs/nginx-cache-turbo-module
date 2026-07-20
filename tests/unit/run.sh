@@ -39,15 +39,23 @@ fi
 NGINX_VERSION="${NGINX_VERSION:-1.31.1}"
 NGX_SRC="${NGX_SRC:-$DIR/../../.build/nginx-$NGINX_VERSION}"
 
-if [ -f "$NGX_SRC/objs/ngx_auto_config.h" ]; then
+# Honour the Makefile's own variable names if the caller set them. These are
+# passed to make as command-line args below, which override the environment --
+# so without reading them here a caller pointing this script at a custom tree
+# (following the Makefile, or the pattern in build-test.yml) would be silently
+# ignored in favour of the .build default.
+NGINX_SRC="${NGINX_SRC:-$NGX_SRC/src}"
+NGINX_OBJS="${NGINX_OBJS:-$NGX_SRC/objs}"
+
+if [ -f "$NGINX_OBJS/ngx_auto_config.h" ]; then
     echo "--- shm node state machine (ASan/UBSan) ---"
     make -C "$DIR" --no-print-directory check \
         NGINX_VERSION="$NGINX_VERSION" \
-        NGINX_SRC="$NGX_SRC/src" \
-        NGINX_OBJS="$NGX_SRC/objs"
+        NGINX_SRC="$NGINX_SRC" \
+        NGINX_OBJS="$NGINX_OBJS"
 else
     echo "--- shm node state machine: SKIPPED (no configured nginx tree at" \
-         "$NGX_SRC/objs) ---"
+         "$NGINX_OBJS) ---"
     echo "    build one with tools/ci-build.sh, or run tests/unit/make check" \
          "with NGINX_SRC/NGINX_OBJS set."
 fi

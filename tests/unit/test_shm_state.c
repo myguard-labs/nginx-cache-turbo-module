@@ -29,6 +29,15 @@
 
 #include "ngx_shim_shm.h"
 
+/* MIRROR side of the layout guard. layout_check.c asserts the REAL nginx
+ * headers against the same literals; the two views cannot meet in one TU, so
+ * agreeing with layout_expect.h separately is what proves they agree with each
+ * other. Without this half, a hand edit to the mirror in ngx_shim_shm.h would
+ * compile clean and corrupt memory at run time. */
+#include "layout_expect.h"
+
+NGX_CT_ASSERT_LAYOUTS("mirrored decl (ngx_shim_shm.h):");
+
 /* --- shim state ---------------------------------------------------------- */
 time_t      ngx_test_now        = 1000000;
 long        ngx_test_slab_budget = -1;
