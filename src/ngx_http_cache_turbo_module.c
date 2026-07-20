@@ -4471,13 +4471,6 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
      * it as an L2 miss directly. Marking l2_done keeps the rest of the handler
      * (and the l2_misses metric below) on exactly the path a real miss takes,
      * so a memoed miss and a fetched miss are indistinguishable downstream. */
-    if (clcf->backend && clcf->l2_negative_ttl > 0) {
-        ngx_log_error(NGX_LOG_NOTICE, r->connection->log, 0,
-                      "PROBE3 \"%V\" done=%d force=%d chk=%d",
-                      &r->uri, (int) ctx->l2_done, (int) ctx->l2_neg_force,
-                      (int) clcf->l1->l2_neg_check(z, ctx->key_hash, hash));
-    }
-
     if (clcf->backend && !ctx->l2_done && !ctx->l2_neg_force
         && clcf->l2_negative_ttl > 0
         && clcf->l1->l2_neg_check(z, ctx->key_hash, hash) == NGX_DECLINED)
@@ -4642,13 +4635,6 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
          * l2_negative_ttl past recovery. The alloc-failure sub-case was worse
          * still -- it armed "key is absent" immediately after L2 said it HAS the
          * key. (Codex #5 on PR #77.) */
-        ngx_log_error(NGX_LOG_NOTICE, r->connection->log, 0,
-                      "PROBE arm \"%V\" ttl=%d skipped=%d result=%d WILLARM=%d",
-                      &r->uri, (int) clcf->l2_negative_ttl,
-                      (int) ctx->l2_neg_skipped, (int) ctx->l2_result,
-                      (int) (clcf->l2_negative_ttl > 0 && !ctx->l2_neg_skipped
-                             && ctx->l2_result == NGX_DECLINED));
-
         if (clcf->l2_negative_ttl > 0 && !ctx->l2_neg_skipped
             && ctx->l2_result == NGX_DECLINED)
         {
