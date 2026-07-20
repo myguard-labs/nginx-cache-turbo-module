@@ -632,9 +632,6 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
-        # L2 negative memo, LIFETIME arm. Same shape as /l2neg/ but with a
-        # min_uses far above any test's request count.
-        #
         # L2 negative memo, LIFETIME arm. DEFAULT min_uses (1) on purpose.
         #
         # This location exists to measure the memo across its whole window in the
