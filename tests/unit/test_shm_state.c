@@ -26,6 +26,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <signal.h>
+#include <unistd.h>
 
 #include "ngx_shim_shm.h"
 
@@ -64,13 +66,25 @@ typedef struct {
     ngx_uint_t          miss_count;
     time_t              l2_neg_until;
     time_t              last_access;
+    ngx_uint_t          seg;
+    ngx_uint_t          promotable;
     ngx_queue_t         lru;
 } ngx_http_cache_turbo_node_t;
+
+/* S8 segment ids. PROBATION == 0 is load-bearing: a node zeroed by accident
+ * reads as probation, i.e. the EVICTABLE (safe) direction -- same rationale as
+ * NODE_ENTRY == 0. extract_shm.sh pins both values against the header. */
+#define NGX_HTTP_CACHE_TURBO_SEG_PROBATION  0
+#define NGX_HTTP_CACHE_TURBO_SEG_PROTECTED  1
+#define NGX_HTTP_CACHE_TURBO_PROTECTED_PCT_DEFAULT 80
 
 typedef struct {
     ngx_rbtree_t        rbtree;
     ngx_rbtree_node_t   sentinel;
     ngx_queue_t         lru;
+    ngx_queue_t         lru_protected;
+    ngx_uint_t          n_protected;
+    ngx_uint_t          n_entries;
     ngx_atomic_t        hits, misses, stale_serves, refreshes, evictions;
     ngx_atomic_t        l2_hits, l2_misses, lock_waits;
     ngx_atomic_t        min_uses_skips, l2_neg_skips, bypasses;
@@ -96,6 +110,23 @@ ngx_http_cache_turbo_blob_node_release(ngx_http_cache_turbo_zone_t *z, u_char *p
     fprintf(stderr, "blob_node_release called: fixture built an ENTRY, not a COUNTER\n");
     abort();
 }
+
+/* evict_one/alloc_evict are `static` in the sliced production source. Forward-
+ * declare them so the S8 hang test can drive the eviction path directly --
+ * that path is only reachable indirectly otherwise (through a slab failure),
+ * which is far too blunt to pin which queue was consulted. */
+static ngx_int_t ngx_http_cache_turbo_shm_evict_one(
+    ngx_http_cache_turbo_zone_t *z);
+static void *ngx_http_cache_turbo_shm_alloc_evict(
+    ngx_http_cache_turbo_zone_t *z, size_t size);
+static void ngx_http_cache_turbo_lru_link_head(
+    ngx_http_cache_turbo_zone_t *z, ngx_http_cache_turbo_node_t *ctn);
+static void ngx_http_cache_turbo_lru_unlink(
+    ngx_http_cache_turbo_zone_t *z, ngx_http_cache_turbo_node_t *ctn);
+static void ngx_http_cache_turbo_lru_insert_new(
+    ngx_http_cache_turbo_zone_t *z, ngx_http_cache_turbo_node_t *ctn);
+static void ngx_http_cache_turbo_lru_enforce_cap(
+    ngx_http_cache_turbo_zone_t *z, ngx_uint_t protected_pct);
 
 #include "generated_shm.inc"
 
@@ -136,9 +167,22 @@ zone_reset(void)
         ngx_slab_free_locked(&g_pool, ctn);
     }
 
+    /* S8: the protected queue must be drained too, or the leak check below
+     * misses every promoted node -- the same fan-out miss purge_all has to
+     * avoid in production. */
+    while (g_zone_live && !ngx_queue_empty(&g_sh.lru_protected)) {
+        ngx_queue_t                  *q   = ngx_queue_last(&g_sh.lru_protected);
+        ngx_http_cache_turbo_node_t  *ctn =
+            ngx_queue_data(q, ngx_http_cache_turbo_node_t, lru);
+        ngx_queue_remove(&ctn->lru);
+        ngx_rbtree_delete(&g_sh.rbtree, &ctn->node);
+        ngx_slab_free_locked(&g_pool, ctn);
+    }
+
     memset(&g_sh, 0, sizeof(g_sh));
     ngx_rbtree_init(&g_sh.rbtree, &g_sh.sentinel, ngx_rbtree_insert_value);
     ngx_queue_init(&g_sh.lru);
+    ngx_queue_init(&g_sh.lru_protected);
     g_zone_live = 1;
 
     g_zone.sh     = &g_sh;
@@ -165,6 +209,307 @@ static ngx_http_cache_turbo_node_t *
 find(int n)
 {
     return ngx_http_cache_turbo_shm_lookup(&g_zone, KEY(n));
+}
+
+/* =====================================================================
+ * S8 HANG HAZARD -- the single most dangerous line in the segmented LRU.
+ *
+ * evict_one() used to answer "is there anything to evict?" with
+ * ngx_queue_empty(&sh->lru). With TWO queues that test is no longer
+ * sufficient IN EITHER DIRECTION, and the two directions fail differently:
+ *
+ *   a) It must not return 0 while the OTHER queue still holds a victim, or
+ *      alloc_evict() gives up early and a store fails on a zone that still
+ *      had reclaimable entries. Merely wrong, and visible as a test failure.
+ *
+ *   b) It must return 0 when BOTH are empty. If it ever returns non-zero
+ *      without actually evicting, alloc_evict()'s
+ *          while (p == NULL && evict_one(z))
+ *      spins FOREVER -- while holding shpool->mutex. That is not a crash and
+ *      not a wrong number: it is a wedged worker plus every other worker
+ *      blocked behind the mutex it never releases. Nothing in a black-box
+ *      HTTP suite reports that as anything but a timeout.
+ *
+ * A spin cannot be caught by an assertion, because control never comes back
+ * to make one. So this test arms a real SIGALRM watchdog: if the call does
+ * not return within the budget, the handler reports the hazard by name and
+ * exits non-zero. A regression therefore FAILS the suite in bounded time
+ * instead of hanging CI until the job timeout kills it with no diagnosis.
+ * ===================================================================== */
+
+static const char *g_watchdog_what;
+
+static void
+watchdog_fired(int sig)
+{
+    (void) sig;
+    /* async-signal-safe only: write(2) + _exit(2). No printf, no abort. */
+    static const char msg[] =
+        "\n  x HANG: evict_one/alloc_evict did not return within the watchdog "
+        "budget.\n"
+        "    alloc_evict() spins while holding shpool->mutex when evict_one()\n"
+        "    reports progress it did not make. This wedges a worker.\n"
+        "    test: ";
+    ssize_t rc;
+    rc = write(2, msg, sizeof(msg) - 1);
+    if (g_watchdog_what != NULL) {
+        rc = write(2, g_watchdog_what, strlen(g_watchdog_what));
+    }
+    rc = write(2, "\n", 1);
+    (void) rc;
+    _exit(1);
+}
+
+/* Arm/disarm around any call that could spin. The budget is generous in
+ * wall-clock terms (a correct call returns in microseconds) but finite, which
+ * is the whole point: bounded failure beats an unbounded hang. */
+static void
+watchdog_arm(const char *what)
+{
+    g_watchdog_what = what;
+    signal(SIGALRM, watchdog_fired);
+    alarm(10);
+}
+
+static void
+watchdog_disarm(void)
+{
+    alarm(0);
+    g_watchdog_what = NULL;
+}
+
+static void
+test_s8_evict_terminates_on_empty_queues(void)
+{
+    void  *p;
+
+    printf("S8 hang hazard: eviction terminates when both queues are empty\n");
+    zone_reset();
+
+    /* (b) THE HANG. Both queues empty and the slab refuses every allocation:
+     * alloc_evict() must conclude there is nothing to reclaim and return NULL.
+     * If evict_one() ever claims progress on an empty pair, this never
+     * returns and the watchdog fires. */
+    ngx_test_slab_fail_after(0);
+
+    watchdog_arm("both queues empty must terminate, not spin");
+    p = ngx_http_cache_turbo_shm_alloc_evict(&g_zone, 128);
+    watchdog_disarm();
+
+    CHECK(p == NULL, "alloc_evict must fail (not spin) on an empty zone");
+    CHECK(ngx_http_cache_turbo_shm_evict_one(&g_zone) == 0,
+          "evict_one must report 0 when BOTH queues are empty");
+
+    ngx_test_slab_fail_after(-1);
+
+    /* (b') The same hazard with only the PROBATION queue empty. This is the
+     * state a scan-resistant zone actually reaches: everything hot has been
+     * promoted, probation has drained, and a new store still needs room. The
+     * flat `ngx_queue_empty(&lru)` test answers "empty, give up" here, so a
+     * naive port either wedges or refuses to evict a full-but-all-protected
+     * zone. Assert it evicts the protected tail instead. */
+    zone_reset();
+    ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(0), 4);
+    find(0)->seg = NGX_HTTP_CACHE_TURBO_SEG_PROTECTED;
+    ngx_queue_remove(&find(0)->lru);
+    ngx_queue_insert_head(&g_sh.lru_protected, &find(0)->lru);
+    g_sh.n_protected = 1;
+
+    CHECK(ngx_queue_empty(&g_sh.lru), "fixture: probation should be empty");
+
+    watchdog_arm("probation empty, protected non-empty must evict, not spin");
+    CHECK(ngx_http_cache_turbo_shm_evict_one(&g_zone) == 1,
+          "evict_one must fall through to the protected tail");
+    watchdog_disarm();
+
+    CHECK(find(0) == NULL, "the protected victim was not actually evicted");
+    CHECK(g_sh.evictions == 1, "eviction was not counted");
+
+    /* And now that it drained the protected queue too, the zone is genuinely
+     * empty again -- so the terminating answer must still be 0. */
+    watchdog_arm("post-drain empty must terminate");
+    CHECK(ngx_http_cache_turbo_shm_evict_one(&g_zone) == 0,
+          "evict_one must report 0 after draining the protected queue");
+    watchdog_disarm();
+
+    /* (a) The opposite direction: a victim in probation must be found even
+     * though a segmented implementation might consult the wrong head. */
+    zone_reset();
+    ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(1), 4);
+    CHECK(ngx_http_cache_turbo_shm_evict_one(&g_zone) == 1,
+          "evict_one must evict a probation victim");
+    CHECK(find(1) == NULL, "the probation victim was not evicted");
+
+    CHECK(ngx_test_lock_balanced(), "eviction path left the zone mutex held");
+}
+
+/* =====================================================================
+ * S8 promote-on-second-hit.
+ *
+ * The re-splice sites live in module.c (the request path), not in the sliced
+ * shm set, so the shared decision is factored into ONE production helper --
+ * ngx_http_cache_turbo_shm_touch_lru() in shm.c -- which all three sites call
+ * and which extract_shm.sh slices here. That is deliberate: a rule duplicated
+ * at three call sites is a rule that drifts at one of them, and this test
+ * would still pass while the drifted site quietly never promoted.
+ *
+ * The invariants:
+ *   1. first touch  -> stays in PROBATION (a one-hit crawler URL never gets
+ *      protection; that is the entire scan resistance)
+ *   2. second touch -> moves to PROTECTED head
+ *   3. a COUNTER never promotes, however often it is touched -- it holds no
+ *      body, and letting a miss-storm pin the protected segment with bodyless
+ *      bookkeeping nodes would invert the feature
+ *   4. the 1s coarse gate from P1 still applies; no second clock is added
+ * ===================================================================== */
+/* protected_pct as an ENABLED location would supply it. */
+#define PCT_ON  NGX_HTTP_CACHE_TURBO_PROTECTED_PCT_DEFAULT
+
+static void
+test_s8_promote_on_second_hit(void)
+{
+    ngx_http_cache_turbo_node_t  *ctn;
+
+    printf("S8: promote on second hit, and never promote a COUNTER\n");
+    zone_reset();
+
+    /* Build a real ENTRY the way store() would leave one: in probation. */
+    ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(0), 1);
+    ctn = find(0);
+    ctn->kind = NGX_HTTP_CACHE_TURBO_NODE_ENTRY;
+    ctn->len  = 128;
+    ctn->seg  = NGX_HTTP_CACHE_TURBO_SEG_PROBATION;
+    ctn->last_access = ngx_test_now;
+
+    /* (1) First hit. The P1 coarse gate must have elapsed for any splice to
+     * happen at all, so advance past it. A first touch re-heads within
+     * probation but must NOT promote. */
+    ngx_test_advance_time(2);
+    ngx_http_cache_turbo_shm_touch_lru(&g_zone, ctn, ngx_test_now, PCT_ON);
+    CHECK(ctn->seg == NGX_HTTP_CACHE_TURBO_SEG_PROBATION,
+          "S8: a FIRST hit must not promote (one-hit keys stay evictable)");
+    CHECK(g_sh.n_protected == 0, "protected count moved on a first hit");
+
+    /* (2) Second hit -> PROTECTED. This is the actual promotion rule. */
+    ngx_test_advance_time(2);
+    ngx_http_cache_turbo_shm_touch_lru(&g_zone, ctn, ngx_test_now, PCT_ON);
+    CHECK(ctn->seg == NGX_HTTP_CACHE_TURBO_SEG_PROTECTED,
+          "S8: a SECOND hit must promote the node to PROTECTED");
+    CHECK(g_sh.n_protected == 1, "protected count not maintained on promote");
+    CHECK(!ngx_queue_empty(&g_sh.lru_protected),
+          "promoted node is not on the protected queue");
+    CHECK(ngx_queue_empty(&g_sh.lru),
+          "promoted node was left on the probation queue too (both-queue "
+          "consistency broken -- a node must be on exactly one)");
+
+    /* (4) The P1 coarse gate still governs: a touch inside the same second is
+     * a no-op. The node is already PROTECTED here, so what this pins is that
+     * an immediate re-touch does not run the promote/cap machinery again --
+     * n_protected must not move. (No manual demote is involved; an earlier
+     * version of this comment claimed one. CodeRabbit, PR #81.) */
+    ngx_http_cache_turbo_shm_touch_lru(&g_zone, ctn, ngx_test_now, PCT_ON);
+    CHECK(g_sh.n_protected == 1,
+          "a within-1s touch must be a no-op, not a second promotion");
+
+    /* (3) A COUNTER must never promote, no matter how many times it is
+     * touched. l2_neg_check() touches memo nodes on every consult; if that
+     * promoted them, an L2 miss storm would evict real bodies to make room
+     * for nodes that hold none. */
+    zone_reset();
+    ngx_http_cache_turbo_shm_l2_neg_set(&g_zone, KEY(1), 600);
+    ctn = find(1);
+    CHECK(ctn->kind == NGX_HTTP_CACHE_TURBO_NODE_COUNTER, "fixture: COUNTER");
+
+    ngx_test_advance_time(2);
+    ngx_http_cache_turbo_shm_touch_lru(&g_zone, ctn, ngx_test_now, PCT_ON);
+    ngx_test_advance_time(2);
+    ngx_http_cache_turbo_shm_touch_lru(&g_zone, ctn, ngx_test_now, PCT_ON);
+    ngx_test_advance_time(2);
+    ngx_http_cache_turbo_shm_touch_lru(&g_zone, ctn, ngx_test_now, PCT_ON);
+
+    CHECK(ctn->seg == NGX_HTTP_CACHE_TURBO_SEG_PROBATION,
+          "S8: a COUNTER promoted -- a miss storm can now pin the protected "
+          "segment with bodyless nodes");
+    CHECK(g_sh.n_protected == 0, "a COUNTER was counted as protected");
+
+    /* Same via the real l2_neg_check path, which is how a memo is touched in
+     * production -- proves the gate is in the shared helper, not bolted onto
+     * one call site. */
+    ngx_test_advance_time(2);
+    CHECK(ngx_http_cache_turbo_shm_l2_neg_check(&g_zone, KEY(1)) == NGX_DECLINED,
+          "fixture: memo should still be live");
+    CHECK(find(1)->seg == NGX_HTTP_CACHE_TURBO_SEG_PROBATION,
+          "S8: l2_neg_check promoted a memo COUNTER");
+
+    CHECK(ngx_test_lock_balanced(), "touch path left the zone mutex held");
+}
+
+/* =====================================================================
+ * S8: turning the feature OFF must DEMOTE, not merely stop promoting.
+ *
+ * A zone survives a reload -- init_zone() inherits the live `sh` -- so an
+ * `on` -> `off` config change is handed nodes that are already PROTECTED.
+ * If touch_lru() only declined to promote, unlink/link_head would keep
+ * relinking those nodes onto lru_protected forever: `off` would stop future
+ * promotions but never restore the flat single-queue LRU, and everything
+ * promoted while it was on would stay preferentially un-evictable for the
+ * life of the zone.
+ *
+ * Found by CodeRabbit on PR #81, not by CI -- the original tests only ever
+ * exercised a FRESH zone, where nothing is protected to begin with.
+ * ===================================================================== */
+static void
+test_s8_off_demotes_inherited_protected_nodes(void)
+{
+    ngx_http_cache_turbo_node_t  *ctn;
+
+    printf("S8: `off` demotes nodes a previous `on` had promoted\n");
+    zone_reset();
+
+    /* Build the post-reload state: an ENTRY promoted while the feature was on. */
+    ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(0), 1);
+    ctn = find(0);
+    ctn->kind = NGX_HTTP_CACHE_TURBO_NODE_ENTRY;
+    ctn->len  = 128;
+    ctn->last_access = ngx_test_now;
+
+    ngx_test_advance_time(2);
+    ngx_http_cache_turbo_shm_touch_lru(&g_zone, ctn, ngx_test_now, PCT_ON);
+    ngx_test_advance_time(2);
+    ngx_http_cache_turbo_shm_touch_lru(&g_zone, ctn, ngx_test_now, PCT_ON);
+    CHECK(ctn->seg == NGX_HTTP_CACHE_TURBO_SEG_PROTECTED,
+          "fixture: node should be PROTECTED before the reload");
+    CHECK(g_sh.n_protected == 1, "fixture: n_protected should be 1");
+
+    /* Config reloaded with the directive removed/off => pct 0 from here on. */
+    ngx_test_advance_time(2);
+    ngx_http_cache_turbo_shm_touch_lru(&g_zone, ctn, ngx_test_now, 0);
+
+    CHECK(ctn->seg == NGX_HTTP_CACHE_TURBO_SEG_PROBATION,
+          "S8: `off` left an inherited node PROTECTED -- the zone never "
+          "returns to the flat LRU after an on->off reload");
+    CHECK(g_sh.n_protected == 0,
+          "S8: n_protected not decremented when `off` demoted the node");
+    CHECK(ngx_queue_empty(&g_sh.lru_protected),
+          "S8: protected queue still non-empty after `off` touched its "
+          "only member");
+    CHECK(!ngx_queue_empty(&g_sh.lru),
+          "S8: demoted node did not land on the probation queue");
+
+    /* And it must not creep back: with the feature off, further touches keep
+     * it in probation however many times it is hit. */
+    ngx_test_advance_time(2);
+    ngx_http_cache_turbo_shm_touch_lru(&g_zone, ctn, ngx_test_now, 0);
+    ngx_test_advance_time(2);
+    ngx_http_cache_turbo_shm_touch_lru(&g_zone, ctn, ngx_test_now, 0);
+    CHECK(ctn->seg == NGX_HTTP_CACHE_TURBO_SEG_PROBATION,
+          "S8: a node re-promoted itself while the feature was off");
+    CHECK(g_sh.n_protected == 0, "S8: n_protected rose while off");
+
+    ctn->len = 0;   /* keep zone_reset()'s drain off the blob path */
+    ctn->kind = NGX_HTTP_CACHE_TURBO_NODE_COUNTER;
+
+    CHECK(ngx_test_lock_balanced(), "touch path left the zone mutex held");
 }
 
 /* =====================================================================
@@ -476,6 +821,9 @@ main(void)
     memset(&g_sh, 0, sizeof(g_sh));
     zone_reset();
 
+    test_s8_evict_terminates_on_empty_queues();
+    test_s8_promote_on_second_hit();
+    test_s8_off_demotes_inherited_protected_nodes();
     test_cr_a_memo_survives_claim();
     test_cr_b_unstub_preserves_counter();
     test_claim_single_flight();

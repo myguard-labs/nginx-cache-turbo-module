@@ -3,6 +3,8 @@
 # Slice the verbatim bodies of the shared-memory node state machine out of the
 # shipped ../../src/ngx_http_cache_turbo_shm.c into generated_shm.inc:
 #
+#   ngx_http_cache_turbo_lru_*()             - S8 segment linkage helpers
+#   ngx_http_cache_turbo_shm_touch_lru()     - S8 promote-on-second-hit
 #   ngx_http_cache_turbo_shm_lookup()        - rbtree lookup by hash + key
 #   ngx_http_cache_turbo_shm_evict_one()     - LRU tail reclaim
 #   ngx_http_cache_turbo_shm_alloc_evict()   - alloc, evicting until it fits
@@ -55,6 +57,11 @@ check_define() {
 }
 check_define NGX_HTTP_CACHE_TURBO_NODE_ENTRY   0
 check_define NGX_HTTP_CACHE_TURBO_NODE_COUNTER 1
+# S8: PROBATION == 0 is load-bearing for the same reason ENTRY == 0 is -- a node
+# zeroed by accident must read as the EVICTABLE segment. A silent flip would
+# invert the promotion assertions while leaving them green.
+check_define NGX_HTTP_CACHE_TURBO_SEG_PROBATION 0
+check_define NGX_HTTP_CACHE_TURBO_SEG_PROTECTED 1
 
 # --- slice the function bodies in source order.
 # nginx style: a definition is a bare return-type line (`void`, `ngx_int_t`,
@@ -65,7 +72,7 @@ awk '
     /^(static )?(void|ngx_int_t|ngx_uint_t|time_t|u_char|ngx_http_cache_turbo_node_t)[[:space:]]*\**$/ {
         pending = 1; buf = $0 ORS; next
     }
-    pending && /^ngx_http_cache_turbo_shm_(lookup|evict_one|alloc_evict|claim|unstub|count_miss|l2_neg_check|l2_neg_set)\(/ {
+    pending && /^ngx_http_cache_turbo_(shm_(lookup|evict_one|alloc_evict|claim|unstub|count_miss|l2_neg_check|l2_neg_set|touch_lru)|lru_(link_head|unlink|insert_new|enforce_cap))\(/ {
         capture = 1; pending = 0; printf "%s", buf; print; next
     }
     pending { pending = 0; buf = "" }
@@ -79,6 +86,11 @@ awk '
 # closing brace (a truncated slice would otherwise fail to compile in a
 # confusing place, or worse, compile with a body silently cut short).
 for fn in \
+    'ngx_http_cache_turbo_lru_link_head(' \
+    'ngx_http_cache_turbo_lru_unlink(' \
+    'ngx_http_cache_turbo_lru_insert_new(' \
+    'ngx_http_cache_turbo_lru_enforce_cap(' \
+    'ngx_http_cache_turbo_shm_touch_lru(' \
     'ngx_http_cache_turbo_shm_lookup(' \
     'ngx_http_cache_turbo_shm_evict_one(' \
     'ngx_http_cache_turbo_shm_alloc_evict(' \
@@ -133,4 +145,4 @@ if ! sed -n '/^ngx_http_cache_turbo_shm_unstub(/,/^}/p' "$OUT" \
 fi
 
 LINES=$(wc -l < "$OUT")
-echo "✓ extracted 8 shm state functions — $LINES lines -> $OUT"
+echo "✓ extracted 13 shm state functions — $LINES lines -> $OUT"

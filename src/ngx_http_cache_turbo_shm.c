@@ -82,6 +82,14 @@ ngx_http_cache_turbo_shm_init_zone(ngx_shm_zone_t *shm_zone, void *data)
                     ngx_http_cache_turbo_rbtree_insert_value);
     ngx_queue_init(&ctx->sh->lru);
 
+    /* S8: the protected queue MUST be initialised even when scan resistance is
+     * off. ngx_queue_empty() on a zeroed head reads h == h->prev as false
+     * against NULL, so an uninitialised head would make evict_one() believe it
+     * had a protected victim and walk a null sentinel. */
+    ngx_queue_init(&ctx->sh->lru_protected);
+    ctx->sh->n_protected = 0;
+    ctx->sh->n_entries = 0;
+
     ctx->sh->hits = 0;
     ctx->sh->misses = 0;
     ctx->sh->stale_serves = 0;
@@ -224,22 +232,215 @@ ngx_http_cache_turbo_blob_release(ngx_http_cache_turbo_zone_t *z, u_char *data)
 }
 
 
+/* --- S8 segmented-LRU linkage helpers ------------------------------------
+ *
+ * EVERY insert/detach in this file goes through these three, so a node's `seg`
+ * field and the queue it is actually threaded on can never disagree. That
+ * invariant is what eviction depends on: evict_one() takes a node off the tail
+ * of one queue and must be certain the node believed it was there.
+ *
+ * Caller holds the shpool mutex throughout.
+ */
+
+/* Link a node onto the head of the queue its `seg` names. `seg` must already
+ * be set; this does not choose a segment. */
+static void
+ngx_http_cache_turbo_lru_link_head(ngx_http_cache_turbo_zone_t *z,
+    ngx_http_cache_turbo_node_t *ctn)
+{
+    if (ctn->seg == NGX_HTTP_CACHE_TURBO_SEG_PROTECTED) {
+        ngx_queue_insert_head(&z->sh->lru_protected, &ctn->lru);
+        z->sh->n_protected++;
+
+    } else {
+        ngx_queue_insert_head(&z->sh->lru, &ctn->lru);
+    }
+}
+
+
+/* Unlink a node from whichever queue it is on, keeping n_protected in step.
+ * Leaves `seg` alone: callers either free the node or re-link it. */
+static void
+ngx_http_cache_turbo_lru_unlink(ngx_http_cache_turbo_zone_t *z,
+    ngx_http_cache_turbo_node_t *ctn)
+{
+    ngx_queue_remove(&ctn->lru);
+
+    if (ctn->seg == NGX_HTTP_CACHE_TURBO_SEG_PROTECTED) {
+        z->sh->n_protected--;
+    }
+}
+
+
+/* A brand-new node always enters PROBATION, whatever the feature setting. A
+ * first store is an unproven key -- that is precisely what makes a scan
+ * unable to evict the hot set. */
+static void
+ngx_http_cache_turbo_lru_insert_new(ngx_http_cache_turbo_zone_t *z,
+    ngx_http_cache_turbo_node_t *ctn)
+{
+    ctn->seg = NGX_HTTP_CACHE_TURBO_SEG_PROBATION;
+    ngx_queue_insert_head(&z->sh->lru, &ctn->lru);
+    z->sh->n_entries++;
+}
+
+
+/* Enforce the protected-segment cap by demoting protected tails to the
+ * PROBATION HEAD (not tail -- a demoted-but-hot entry deserves a second
+ * chance before a cold probation entry). Caller holds the shpool mutex.
+ *
+ * A loop, not an `if`: protected_pct can shrink across a reload while entries
+ * are already resident, so more than one demotion may be owed. It is bounded
+ * by n_protected and each pass strictly decrements it, so it terminates. */
+static void
+ngx_http_cache_turbo_lru_enforce_cap(ngx_http_cache_turbo_zone_t *z,
+    ngx_uint_t protected_pct)
+{
+    ngx_uint_t                    cap;
+    ngx_queue_t                  *q;
+    ngx_http_cache_turbo_node_t  *victim;
+
+    /* Round UP, and floor the result at 1.
+     *
+     * Truncating division would make the cap 0 for any zone with fewer than
+     * 100/pct entries -- at the default 80 that is a zone of ONE entry, whose
+     * single node would be promoted and instantly demoted again on every hit,
+     * churning the queues forever and never actually protecting anything. The
+     * floor guarantees a non-empty zone can always protect at least one entry,
+     * which is what makes the segment meaningful on small zones. */
+    cap = (z->sh->n_entries * protected_pct + 99) / 100;
+
+    if (cap == 0) {
+        cap = 1;
+    }
+
+    while (z->sh->n_protected > cap
+           && !ngx_queue_empty(&z->sh->lru_protected))
+    {
+        q = ngx_queue_last(&z->sh->lru_protected);
+        victim = ngx_queue_data(q, ngx_http_cache_turbo_node_t, lru);
+
+        ngx_http_cache_turbo_lru_unlink(z, victim);
+        victim->seg = NGX_HTTP_CACHE_TURBO_SEG_PROBATION;
+        ngx_http_cache_turbo_lru_link_head(z, victim);
+    }
+}
+
+
+/* Re-splice a node on access, and promote it on its second touch (S8).
+ *
+ * Shared by all three re-splice sites (fresh HIT, stale HIT, memo consult) so
+ * the promotion rule cannot drift between them -- a rule duplicated three
+ * times is a rule that is wrong at one of them.
+ *
+ * `protected_pct` of 0 means the feature is OFF: the node then simply re-heads
+ * within probation, which is byte-for-byte the pre-S8 behaviour.
+ *
+ * Returns with the node re-headed on whichever queue it now belongs to.
+ * Caller holds the shpool mutex.
+ */
+void
+ngx_http_cache_turbo_shm_touch_lru(ngx_http_cache_turbo_zone_t *z,
+    ngx_http_cache_turbo_node_t *ctn, time_t now, ngx_uint_t protected_pct)
+{
+    /* P1 coarse gate: at most one LRU write per node per second. Deliberately
+     * the SAME gate that governed the flat re-splice -- S8 adds no second
+     * clock, so a hot key still serializes readers at most once/second. */
+    if (now - ctn->last_access < 1) {
+        return;
+    }
+
+    ctn->last_access = now;
+
+    ngx_http_cache_turbo_lru_unlink(z, ctn);
+
+    /* Promote on the SECOND touch, and only ever an ENTRY.
+     *
+     * ⚠ COUNTER nodes (min_uses counters, L13 negative memos, cold-miss stubs)
+     * must stay in probation permanently. They hold bookkeeping, not content;
+     * promoting one would let an L2 miss storm pin the protected segment with
+     * nodes that carry no body at all -- inverting the feature. The kind gate
+     * is load-bearing, not defensive.
+     *
+     * "Second touch" is read off `seg`: a node still in probation that is being
+     * touched has been accessed at least once since it was stored (the store
+     * itself does not touch), so this touch is the promoting one. That reuses
+     * the existing state instead of adding a hit counter to the node. */
+    if (protected_pct == 0) {
+        /* Feature OFF: DEMOTE, do not merely decline to promote.
+         *
+         * ⚠ A zone survives a reload (init_zone inherits the live `sh` when
+         * `octx` is set, or `shm.exists`), so an `on` -> `off` config change
+         * hands us nodes that are already PROTECTED. Leaving `seg` alone here
+         * would relink them onto lru_protected forever -- `off` would stop
+         * future promotions but never restore the flat single-queue LRU, and
+         * the entries promoted while it was on would stay preferentially
+         * un-evictable for the life of the zone. Demoting on touch drains the
+         * protected queue back into probation as those nodes are used, so
+         * `off` genuinely converges on the pre-S8 behaviour. Untouched nodes
+         * are reached by eviction instead, which drains lru_protected once
+         * probation empties. (CodeRabbit, PR #81.) */
+        ctn->seg = NGX_HTTP_CACHE_TURBO_SEG_PROBATION;
+
+    } else if (ctn->kind == NGX_HTTP_CACHE_TURBO_NODE_ENTRY
+               && ctn->seg == NGX_HTTP_CACHE_TURBO_SEG_PROBATION
+               && ctn->promotable)
+    {
+        ctn->seg = NGX_HTTP_CACHE_TURBO_SEG_PROTECTED;
+    }
+
+    ctn->promotable = 1;
+
+    ngx_http_cache_turbo_lru_link_head(z, ctn);
+
+    if (protected_pct > 0) {
+        ngx_http_cache_turbo_lru_enforce_cap(z, protected_pct);
+    }
+}
+
+
 /* Evict the least-recently-used entry. Caller holds the shpool mutex. Returns 1
- * if an entry was evicted, 0 if the LRU was already empty (no candidate). */
+ * if an entry was evicted, 0 if BOTH queues were already empty (no candidate).
+ *
+ * ⚠ THE HANG HAZARD. With two queues, `ngx_queue_empty(&z->sh->lru)` is no
+ * longer the "nothing to evict" test in either direction:
+ *
+ *   - Returning 0 while lru_protected still holds a victim makes alloc_evict()
+ *     give up on a zone that still had reclaimable entries (a store fails for
+ *     no reason).
+ *   - Returning non-zero WITHOUT evicting makes alloc_evict()'s
+ *     `while (p == NULL && evict_one(z))` spin forever -- while holding
+ *     shpool->mutex. That wedges the worker and every other worker behind it.
+ *     It is not a crash and not a wrong number; a black-box suite sees only a
+ *     timeout.
+ *
+ * So: probation tail first (that ordering IS the scan resistance), fall
+ * through to the protected tail, and return 0 only when BOTH are empty.
+ * Pinned by test_s8_evict_terminates_on_empty_queues() under a SIGALRM
+ * watchdog, so a regression fails in bounded time instead of hanging CI.
+ */
 static ngx_int_t
 ngx_http_cache_turbo_shm_evict_one(ngx_http_cache_turbo_zone_t *z)
 {
     ngx_queue_t                  *q;
     ngx_http_cache_turbo_node_t  *ctn;
 
-    if (ngx_queue_empty(&z->sh->lru)) {
-        return 0;
+    if (!ngx_queue_empty(&z->sh->lru)) {
+        q = ngx_queue_last(&z->sh->lru);
+
+    } else if (!ngx_queue_empty(&z->sh->lru_protected)) {
+        /* Probation drained: a full-but-all-protected zone must still be
+         * reclaimable, or the loop in alloc_evict() never terminates. */
+        q = ngx_queue_last(&z->sh->lru_protected);
+
+    } else {
+        return 0;                    /* genuinely nothing to evict */
     }
 
-    q = ngx_queue_last(&z->sh->lru);
     ctn = ngx_queue_data(q, ngx_http_cache_turbo_node_t, lru);
 
-    ngx_queue_remove(&ctn->lru);
+    ngx_http_cache_turbo_lru_unlink(z, ctn);
+    z->sh->n_entries--;
     ngx_rbtree_delete(&z->sh->rbtree, &ctn->node);
 
     if (ctn->data) {
@@ -276,7 +477,8 @@ static void
 ngx_http_cache_turbo_shm_drop_locked(ngx_http_cache_turbo_zone_t *z,
     ngx_http_cache_turbo_node_t *ctn)
 {
-    ngx_queue_remove(&ctn->lru);
+    ngx_http_cache_turbo_lru_unlink(z, ctn);
+    z->sh->n_entries--;
     ngx_rbtree_delete(&z->sh->rbtree, &ctn->node);
     if (ctn->data) {
         ngx_http_cache_turbo_blob_node_release(z, ctn->data);
@@ -322,10 +524,26 @@ ngx_http_cache_turbo_shm_purge_all(ngx_http_cache_turbo_zone_t *z)
         ngx_shmtx_lock(&z->shpool->mutex);
 
         batch = 0;
+
+        /* ⚠ S8: BOTH queues must drain. Walking only &z->sh->lru would leave
+         * the entire protected set resident and a purge would silently keep
+         * serving the objects it claimed to remove -- the classic fan-out
+         * miss. Probation first, then protected; the batch cap spans the two
+         * so the mutex is still released every PURGE_BATCH drops however the
+         * entries are distributed. */
         while (batch < NGX_HTTP_CACHE_TURBO_PURGE_BATCH
                && !ngx_queue_empty(&z->sh->lru))
         {
             q = ngx_queue_head(&z->sh->lru);
+            ctn = ngx_queue_data(q, ngx_http_cache_turbo_node_t, lru);
+            ngx_http_cache_turbo_shm_drop_locked(z, ctn);
+            batch++;
+        }
+
+        while (batch < NGX_HTTP_CACHE_TURBO_PURGE_BATCH
+               && !ngx_queue_empty(&z->sh->lru_protected))
+        {
+            q = ngx_queue_head(&z->sh->lru_protected);
             ctn = ngx_queue_data(q, ngx_http_cache_turbo_node_t, lru);
             ngx_http_cache_turbo_shm_drop_locked(z, ctn);
             batch++;
@@ -370,13 +588,20 @@ ngx_http_cache_turbo_shm_store(ngx_http_cache_turbo_zone_t *z,
          * evicting it here would free the very node we go on to write to
          * (use-after-free + double-free of ctn->data). Detaching guarantees the
          * retry-evict frees some OTHER node (or none, if ctn was the only one).
-         * Re-inserted at the LRU head on success, restored on alloc fail. */
-        ngx_queue_remove(&ctn->lru);
+         * Re-inserted at the LRU head on success, restored on alloc fail.
+         *
+         * ⚠ S8: unlink/relink both go through the helpers so n_protected stays
+         * in step with the linkage on BOTH exits. `seg` is left untouched
+         * across the detach, so the restore path below puts the node back on
+         * exactly the queue it came off -- a protected entry whose refresh
+         * fails must not silently demote itself. */
+        ngx_http_cache_turbo_lru_unlink(z, ctn);
 
         body = ngx_http_cache_turbo_blob_alloc(z, len);
         if (body == NULL) {
-            /* Refresh failed: keep the existing (stale) entry reachable. */
-            ngx_queue_insert_head(&z->sh->lru, &ctn->lru);
+            /* Refresh failed: keep the existing (stale) entry reachable, on
+             * its original segment. */
+            ngx_http_cache_turbo_lru_link_head(z, ctn);
             ngx_shmtx_unlock(&z->shpool->mutex);
             return NGX_ERROR;
         }
@@ -400,7 +625,15 @@ ngx_http_cache_turbo_shm_store(ngx_http_cache_turbo_zone_t *z,
                                       * carried as a COUNTER is moot */
         ctn->last_access = now;      /* P1: store re-heads the LRU, sync stamp */
 
-        ngx_queue_insert_head(&z->sh->lru, &ctn->lru);
+        /* S8: a refresh installs a NEW representation, so it re-earns
+         * protection rather than inheriting the old body's. The node is
+         * ALREADY unlinked (detached above, before the alloc), so this only
+         * re-labels it and links it back onto probation. Two further hits
+         * protect it again. This also stops the refresh path being a way to
+         * hold protected residency indefinitely without ever being read. */
+        ctn->seg = NGX_HTTP_CACHE_TURBO_SEG_PROBATION;
+        ctn->promotable = 0;
+        ngx_http_cache_turbo_lru_link_head(z, ctn);
 
         ngx_shmtx_unlock(&z->shpool->mutex);
         return NGX_OK;
@@ -435,9 +668,11 @@ ngx_http_cache_turbo_shm_store(ngx_http_cache_turbo_zone_t *z,
     ctn->miss_count = 0;
     ctn->l2_neg_until = 0;       /* L13: no memo on an ENTRY */
     ctn->last_access = now;      /* P1: fresh at LRU head */
+    ctn->promotable = 0;         /* S8: unproven; second touch promotes */
 
     ngx_rbtree_insert(&z->sh->rbtree, &ctn->node);
-    ngx_queue_insert_head(&z->sh->lru, &ctn->lru);
+    /* S8: every new node enters PROBATION (see lru_insert_new). */
+    ngx_http_cache_turbo_lru_insert_new(z, ctn);
 
     ngx_shmtx_unlock(&z->shpool->mutex);
     return NGX_OK;
@@ -551,9 +786,11 @@ ngx_http_cache_turbo_shm_claim(ngx_http_cache_turbo_zone_t *z,
     ctn->miss_count = 0;
     ctn->l2_neg_until = 0;       /* brand-new node: no memo to preserve */
     ctn->last_access = now;      /* P1: init the coarse LRU stamp */
+    ctn->promotable = 0;         /* S8: unproven; second touch promotes */
 
     ngx_rbtree_insert(&z->sh->rbtree, &ctn->node);
-    ngx_queue_insert_head(&z->sh->lru, &ctn->lru);
+    /* S8: every new node enters PROBATION (see lru_insert_new). */
+    ngx_http_cache_turbo_lru_insert_new(z, ctn);
 
     ngx_shmtx_unlock(&z->shpool->mutex);
     return NGX_HTTP_CACHE_TURBO_CLAIM_WINNER;
@@ -611,7 +848,8 @@ ngx_http_cache_turbo_shm_unstub(ngx_http_cache_turbo_zone_t *z,
          * carries state the caller never asked to discard, so it stays as a plain
          * COUNTER and expires on its own terms. */
         if (ctn->miss_count == 0 && ctn->l2_neg_until <= ngx_time()) {
-            ngx_queue_remove(&ctn->lru);
+            ngx_http_cache_turbo_lru_unlink(z, ctn);
+            z->sh->n_entries--;
             ngx_rbtree_delete(&z->sh->rbtree, &ctn->node);
             ngx_slab_free_locked(z->shpool, ctn);
         }
@@ -690,9 +928,11 @@ ngx_http_cache_turbo_shm_count_miss(ngx_http_cache_turbo_zone_t *z,
     ctn->miss_count = 1;
     ctn->l2_neg_until = 0;       /* L13: no memo yet; l2_neg_set stamps it */
     ctn->last_access = now;      /* P1: init the coarse LRU stamp */
+    ctn->promotable = 0;         /* S8: unproven; second touch promotes */
 
     ngx_rbtree_insert(&z->sh->rbtree, &ctn->node);
-    ngx_queue_insert_head(&z->sh->lru, &ctn->lru);
+    /* S8: every new node enters PROBATION (see lru_insert_new). */
+    ngx_http_cache_turbo_lru_insert_new(z, ctn);
 
     ngx_shmtx_unlock(&z->shpool->mutex);
 
@@ -747,11 +987,14 @@ ngx_http_cache_turbo_shm_l2_neg_check(ngx_http_cache_turbo_zone_t *z,
          * entries. Eviction of a memo is legitimate under real slab pressure (a
          * body is worth more than a memo, and losing one only costs an RTT), but
          * it should be evicted on its true recency. */
-        if (now - ctn->last_access >= 1) {
-            ctn->last_access = now;
-            ngx_queue_remove(&ctn->lru);
-            ngx_queue_insert_head(&z->sh->lru, &ctn->lru);
-        }
+        /* S8: routed through the shared helper so the memo re-splice cannot
+         * drift from the two HIT sites. The pct argument is 0 because a memo is
+         * a COUNTER and the helper's kind gate would refuse to promote it
+         * anyway -- passing 0 states that intent locally, and means this site
+         * needs no access to the location config. If the kind gate were ever
+         * dropped, the promote-on-second-hit test asserts BOTH this path and
+         * the gate, so the regression is caught either way. */
+        ngx_http_cache_turbo_shm_touch_lru(z, ctn, now, 0);
     }
 
     ngx_shmtx_unlock(&z->shpool->mutex);
@@ -822,9 +1065,11 @@ ngx_http_cache_turbo_shm_l2_neg_set(ngx_http_cache_turbo_zone_t *z,
     ctn->miss_count = 0;
     ctn->l2_neg_until = now + ttl;
     ctn->last_access = now;      /* P1: init the coarse LRU stamp */
+    ctn->promotable = 0;         /* S8: unproven; second touch promotes */
 
     ngx_rbtree_insert(&z->sh->rbtree, &ctn->node);
-    ngx_queue_insert_head(&z->sh->lru, &ctn->lru);
+    /* S8: every new node enters PROBATION (see lru_insert_new). */
+    ngx_http_cache_turbo_lru_insert_new(z, ctn);
 
     ngx_shmtx_unlock(&z->shpool->mutex);
 }

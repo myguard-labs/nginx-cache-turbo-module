@@ -352,6 +352,18 @@ typedef struct {
                                                * (when refreshing) the v10
                                                * cold-miss stub               */
 
+/* S8 segmented-LRU segment ids. See the `seg` field below for why PROBATION
+ * must stay 0. tests/unit/extract_shm.sh pins both values. */
+#define NGX_HTTP_CACHE_TURBO_SEG_PROBATION  0  /* on &sh->lru               */
+#define NGX_HTTP_CACHE_TURBO_SEG_PROTECTED  1  /* on &sh->lru_protected     */
+
+/* protected_pct bounds for cache_turbo_scan_resistant (range-checked setter,
+ * NOT ngx_conf_set_num_slot -- a literal 0 must be a config error, not a
+ * silently-coerced default. See H5/min_uses for the trap this avoids). */
+#define NGX_HTTP_CACHE_TURBO_PROTECTED_PCT_MIN      1
+#define NGX_HTTP_CACHE_TURBO_PROTECTED_PCT_MAX     99
+#define NGX_HTTP_CACHE_TURBO_PROTECTED_PCT_DEFAULT 80
+
 typedef struct {
     ngx_rbtree_node_t        node;       /* node.key = crc32 of cache key  */
     u_char                   key[32];    /* full key hash, collision guard */
@@ -423,6 +435,31 @@ typedef struct {
      * 0 = never spliced (fresh node); the first HIT always splices. */
     time_t                   last_access;
 
+    /* S8 (scan-resistant segmented LRU). Which LRU queue this node's `lru` link
+     * is currently threaded on: SEG_PROBATION => &sh->lru, SEG_PROTECTED =>
+     * &sh->lru_protected. Exactly one, always -- every detach/insert pair must
+     * keep this field and the actual linkage in agreement, or eviction walks a
+     * node that is not on the queue it is being taken from.
+     *
+     * ⚠ PROBATION is 0 for the same reason NODE_ENTRY is 0: a node zeroed by
+     * accident must read as probation, i.e. the EVICTABLE direction. Inverting
+     * this would make a corrupted node un-evictable and leak the zone. Do NOT
+     * invert it.
+     *
+     * When cache_turbo_scan_resistant is off (the default) nothing ever sets
+     * this to PROTECTED, sh->lru_protected stays empty, and every path degrades
+     * to exactly the flat single-queue LRU that shipped before S8. */
+    ngx_uint_t               seg;
+
+    /* S8: has this node been touched (accessed) at least once since it was
+     * stored? A store leaves it 0, the first HIT sets it, and the SECOND hit is
+     * therefore the one that promotes. Cheaper and less racy than a hit counter
+     * -- we only ever need "have we seen this before", not how many times.
+     *
+     * Reset to 0 on a refresh store: a refreshed body is a new representation,
+     * so it re-earns protection rather than inheriting it. */
+    ngx_uint_t               promotable;
+
     ngx_queue_t              lru;           /* LRU list linkage             */
 } ngx_http_cache_turbo_node_t;
 
@@ -431,7 +468,28 @@ typedef struct {
 typedef struct {
     ngx_rbtree_t             rbtree;
     ngx_rbtree_node_t        sentinel;
+
+    /* S8: the PROBATION queue. Named `lru` still because when
+     * cache_turbo_scan_resistant is off this is the ONLY populated queue and
+     * every node lives here, exactly as before S8. */
     ngx_queue_t              lru;
+
+    /* S8: the PROTECTED queue, and how many nodes are on it. Empty and 0
+     * respectively unless scan resistance is enabled.
+     *
+     * ⚠ evict_one() must consult BOTH: probation tail first (that ordering IS
+     * the scan resistance), falling through to the protected tail when
+     * probation is empty. Returning 0 while this queue is non-empty makes
+     * alloc_evict() give up on a zone that still has reclaimable entries;
+     * returning non-zero without evicting makes it spin forever holding the
+     * mutex. See the hang test in tests/unit/test_shm_state.c.
+     *
+     * n_protected is maintained under shpool->mutex alongside the linkage, so
+     * it is a plain ngx_uint_t rather than an atomic -- never read outside the
+     * lock. */
+    ngx_queue_t              lru_protected;
+    ngx_uint_t               n_protected;
+    ngx_uint_t               n_entries;     /* nodes on BOTH queues combined */
 
     ngx_atomic_t             hits;
     ngx_atomic_t             misses;
@@ -572,6 +630,13 @@ typedef struct {
                                           /* explicit cache_turbo_stale_mult */
     ngx_int_t                min_uses_raw;
                                           /* explicit cache_turbo_min_uses   */
+
+    /* S8 scan-resistant segmented LRU. `cache_turbo_scan_resistant off` (the
+     * default) stores 0 here, which every LRU path reads as "flat LRU, behave
+     * exactly as before S8". `on` stores the protected-segment cap as a
+     * percentage (1..99, default 80). One field carries both the on/off state
+     * and the tuning, so there is no way to be "on with pct 0". */
+    ngx_uint_t               scan_resistant_pct;
 
     time_t                   valid;       /* fresh TTL (seconds), effective */
     ngx_int_t                beta;        /* SWR aggressiveness /1000, eff  */
@@ -1115,6 +1180,20 @@ void ngx_http_cache_turbo_blob_release(ngx_http_cache_turbo_zone_t *z,
 ngx_http_cache_turbo_node_t *
     ngx_http_cache_turbo_shm_lookup(ngx_http_cache_turbo_zone_t *z,
         u_char *key_hash, uint32_t hash);
+
+/* S8: re-splice a node on access, promoting it to the PROTECTED segment on its
+ * second touch. THE single implementation of the promotion rule -- all three
+ * re-splice sites (fresh HIT, stale HIT, L13 memo consult) call this, so the
+ * rule cannot drift between them.
+ *
+ * `protected_pct` is the effective cache_turbo_scan_resistant setting: 0 means
+ * the feature is OFF and the node simply re-heads within probation, which is
+ * byte-for-byte the pre-S8 flat LRU. The P1 1-second coarse gate is applied
+ * INSIDE -- callers must not pre-filter on last_access, or the two gates drift.
+ *
+ * Caller holds shpool->mutex. */
+void ngx_http_cache_turbo_shm_touch_lru(ngx_http_cache_turbo_zone_t *z,
+    ngx_http_cache_turbo_node_t *ctn, time_t now, ngx_uint_t protected_pct);
 
 ngx_int_t ngx_http_cache_turbo_shm_store(ngx_http_cache_turbo_zone_t *z,
     u_char *key_hash, uint32_t hash, u_char *data, size_t len,

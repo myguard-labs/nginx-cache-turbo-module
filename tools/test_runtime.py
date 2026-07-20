@@ -988,6 +988,14 @@ http {{
 
     cache_turbo_zone name=main 16m;
     cache_turbo_zone name=tiny 8m;   # small zone for eviction test (R6)
+    # S8: 32k == the enforced minimum (8 * pagesize). Deliberately the SMALLEST
+    # legal zone so a few hundred unique keys genuinely overflow it and force
+    # real eviction -- an 8m zone holds tens of thousands of these tiny bodies,
+    # so the scan would evict nothing and every S8 assertion would pass for the
+    # wrong reason.
+    cache_turbo_zone name=srz 64k;    # S8 scan-resistant ON
+    cache_turbo_zone name=sroffz 64k; # S8 default-off control (absent)
+    cache_turbo_zone name=srexpz 64k; # S8 explicit `off` control
     cache_turbo_zone name=shmref 16m; # refresh-under-pressure (R6b)
     cache_turbo_zone name=at 16m;    # autotune raise/clamp/off (v4-3)
     cache_turbo_zone name=atl 16m;   # autotune load-adaptive stale widen (v4-4)
@@ -2112,6 +2120,39 @@ http {{
             cache_turbo_key      $uri;
             cache_turbo_valid    30s;
             add_header           X-CT-Status $cache_turbo_status always;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # S8: scan-resistant segmented LRU, ON. Own tiny zone so the scan below
+        # cannot be perturbed by other tests sharing /e/.
+        location /sr/ {{
+            cache_turbo               srz;
+            cache_turbo_key           $uri;
+            cache_turbo_valid         300s;
+            cache_turbo_scan_resistant on;
+            add_header                X-CT-Status $cache_turbo_status always;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # S8: the SAME shape with the directive ABSENT -- the default-off
+        # control. Any behavioural difference between /sr/ and /sroff/ is
+        # attributable to the directive and nothing else.
+        location /sroff/ {{
+            cache_turbo          sroffz;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    300s;
+            add_header           X-CT-Status $cache_turbo_status always;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # S8: explicit `off` must behave identically to absent (not merely
+        # parse). Separate zone again so it is independently measurable.
+        location /srexpoff/ {{
+            cache_turbo               srexpz;
+            cache_turbo_key           $uri;
+            cache_turbo_valid         300s;
+            cache_turbo_scan_resistant off;
+            add_header                X-CT-Status $cache_turbo_status always;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
@@ -5260,6 +5301,83 @@ def test_backend_prefix_rejected(ng: Nginx) -> None:
             (f"missing backend_prefix diagnostic for {bad_value!r}:\n{r.stdout}")
 
 
+def test_s8_scan_resistant_config_rejects(ng: Nginx) -> None:
+    """S8 config-time rejects. Each arm has its OWN diagnostic, because a
+    single "bad config" catch-all cannot tell an operator which mistake they
+    made -- and because a shared message would let one arm pass on the other's
+    error (the trap the H5/stale_mult tests recorded).
+
+    protected_pct is range-checked by hand rather than via
+    ngx_conf_set_num_slot precisely so `protected_pct=0` is an ERROR instead of
+    being silently coerced to the default 80. Both H5 and H3(c) were bitten by
+    that coerce-on-read trap; this test is what stops it recurring here."""
+    anchor = "cache_turbo_scan_resistant on;"
+
+    # 1. bad on/off token
+    r = _config_test_result(
+        ng, lambda c: c.replace(anchor, "cache_turbo_scan_resistant yes;", 1))
+    assert r.returncode != 0, f"bad on/off token accepted:\n{r.stdout}"
+    assert 'expected "on" or "off"' in r.stdout, \
+        f"missing on/off diagnostic:\n{r.stdout}"
+
+    # 2. protected_pct=0 -- must NOT be coerced to the default
+    r = _config_test_result(
+        ng, lambda c: c.replace(
+            anchor, "cache_turbo_scan_resistant on protected_pct=0;", 1))
+    assert r.returncode != 0, f"protected_pct=0 accepted:\n{r.stdout}"
+    assert "out of range" in r.stdout, \
+        f"missing protected_pct range diagnostic:\n{r.stdout}"
+
+    # 3. protected_pct=100 -- upper bound is 99 (100 would mean "nothing may
+    #    ever live in probation", i.e. no scan resistance at all)
+    r = _config_test_result(
+        ng, lambda c: c.replace(
+            anchor, "cache_turbo_scan_resistant on protected_pct=100;", 1))
+    assert r.returncode != 0, f"protected_pct=100 accepted:\n{r.stdout}"
+    assert "out of range" in r.stdout, \
+        f"missing protected_pct upper-bound diagnostic:\n{r.stdout}"
+
+    # 4. non-numeric protected_pct -- a DISTINCT diagnostic from out-of-range.
+    #    ngx_atoi has no sign handling, so a negative also lands here.
+    r = _config_test_result(
+        ng, lambda c: c.replace(
+            anchor, "cache_turbo_scan_resistant on protected_pct=abc;", 1))
+    assert r.returncode != 0, f"non-numeric protected_pct accepted:\n{r.stdout}"
+    assert "bad protected_pct" in r.stdout, \
+        f"missing bad-protected_pct diagnostic:\n{r.stdout}"
+
+    # 5. unknown parameter
+    r = _config_test_result(
+        ng, lambda c: c.replace(
+            anchor, "cache_turbo_scan_resistant on wat=1;", 1))
+    assert r.returncode != 0, f"unknown parameter accepted:\n{r.stdout}"
+    assert "unknown parameter" in r.stdout, \
+        f"missing unknown-parameter diagnostic:\n{r.stdout}"
+
+    # 6. protected_pct on `off` is inert config -- reject rather than store a
+    #    value that can never be read.
+    r = _config_test_result(
+        ng, lambda c: c.replace(
+            anchor, "cache_turbo_scan_resistant off protected_pct=50;", 1))
+    assert r.returncode != 0, f"protected_pct on `off` accepted:\n{r.stdout}"
+    assert "meaningless with" in r.stdout, \
+        f"missing off+protected_pct diagnostic:\n{r.stdout}"
+
+    # 7. duplicate directive
+    r = _config_test_result(
+        ng, lambda c: c.replace(
+            anchor, anchor + "\n            " + anchor, 1))
+    assert r.returncode != 0, f"duplicate directive accepted:\n{r.stdout}"
+    assert "is duplicate" in r.stdout, \
+        f"missing duplicate diagnostic:\n{r.stdout}"
+
+    # 8. the pristine config must still pass, or every arm above is vacuous
+    #    (a config broken for an unrelated reason fails all seven).
+    r = _config_test_result(ng, lambda c: c)
+    assert r.returncode == 0, \
+        f"baseline config does not pass nginx -t:\n{r.stdout}"
+
+
 def test_keepalive_cap_rejected(ng: Nginx) -> None:
     """STAB-5: an absurd cache_turbo_redis keepalive=N (the per-worker pool is
     N*sizeof(item)) is rejected at config time so the size_t multiply can't
@@ -7738,6 +7856,114 @@ def test_p1_coarse_lru_splice_keeps_hot_key_resident(ng: Nginx) -> None:
         f"hot key evicted despite promotion: X-CT-Status={h.get('x-ct-status')}")
 
 
+def _s8_scan(ng: Nginx, prefix: str, tag: str, n: int = 400) -> None:
+    """Walk n unique keys once each -- a crawler. Every one is a one-hit
+    wonder, so under a segmented LRU they all stay in probation and can only
+    evict each other."""
+    for i in range(n):
+        fetch(ng.port, f"{prefix}scan-{tag}-{i}")
+
+
+def _s8_hot_status(ng: Nginx, prefix: str, tag: str) -> str:
+    """Prime a hot key so it is PROTECTED-eligible, run a scan, then report the
+    hot key's status. Promotion needs a SECOND hit, and the P1 coarse gate only
+    splices when now - last_access >= 1s, so the two priming hits straddle a
+    real 1s boundary. Without that sleep the second hit is swallowed by the
+    gate, the node never promotes, and the test would measure nothing."""
+    import time
+    hot = f"{prefix}hot-{tag}"
+
+    s, _, _ = fetch(ng.port, hot)                 # store (probation)
+    assert s == 200, f"prime {hot} -> {s}"
+    time.sleep(1.2)
+    s, _, h = fetch(ng.port, hot)                 # 1st touch
+    assert s == 200, f"touch1 {hot} -> {s}"
+    assert h.get("x-ct-status") == "HIT", (
+        f"priming touch1 should HIT: {h.get('x-ct-status')}")
+    time.sleep(1.2)
+    s, _, h = fetch(ng.port, hot)                 # 2nd touch -> PROMOTES
+    assert s == 200, f"touch2 {hot} -> {s}"
+    assert h.get("x-ct-status") == "HIT", (
+        f"priming touch2 should HIT: {h.get('x-ct-status')}")
+
+    _s8_scan(ng, prefix, tag)
+
+    s, _, h = fetch(ng.port, hot)
+    assert s == 200, f"post-scan {hot} -> {s}"
+    return h.get("x-ct-status", "")
+
+
+def test_s8_scan_resistant_keeps_hot_key(ng: Nginx) -> None:
+    """S8 test 1 -- THE ACTUAL FIX. With cache_turbo_scan_resistant on, a key
+    that was hit twice is PROTECTED, so a crawler walking a large unique
+    keyspace through a small zone cannot evict it: every scan key is a one-hit
+    wonder that never leaves PROBATION, and evict_one() takes probation tails
+    first.
+
+    Positive assertion on $cache_turbo_status (HIT), never header-absence.
+
+    NEGATIVE CONTROL (verified by hand, see the PR body): with evict_one()
+    reverted to the flat `ngx_queue_last(&z->sh->lru)` this assertion fails --
+    the hot key is evicted by the scan and comes back MISS."""
+    st = _s8_hot_status(ng, "/sr/", "on")
+    assert st == "HIT", (
+        f"S8: scan evicted the protected hot key (X-CT-Status={st}); "
+        "promote-on-second-hit or the probation-first victim pick is broken")
+
+
+def test_s8_default_off_is_unchanged(ng: Nginx) -> None:
+    """S8 test 2 -- OFF BY DEFAULT, and off means genuinely unchanged.
+
+    Same location shape, same zone size, same traffic, directive ABSENT. The
+    flat LRU has no notion of protection, so the scan walks the hot key out of
+    the zone exactly as it did before S8 and the post-scan fetch MISSes.
+
+    This is the off-by-default regression guard: if a future edit ever makes
+    segmentation apply unconditionally, this test flips to HIT and fails. It is
+    also the inverse arm of test 1 -- the two together show the behavioural
+    difference is caused by the directive and by nothing else, since the only
+    difference between /sr/ and /sroff/ is that one line of config."""
+    st = _s8_hot_status(ng, "/sroff/", "off")
+    assert st == "MISS", (
+        f"S8: default-off behaviour CHANGED (X-CT-Status={st}, expected MISS). "
+        "Scan resistance must not apply unless cache_turbo_scan_resistant is on")
+
+
+def test_s8_explicit_off_matches_absent(ng: Nginx) -> None:
+    """S8: `cache_turbo_scan_resistant off` must be identical to omitting it --
+    not merely accepted by the parser. Pins that `off` stores 0 rather than
+    falling through to the default-on-when-present trap."""
+    st = _s8_hot_status(ng, "/srexpoff/", "expoff")
+    assert st == "MISS", (
+        f"S8: explicit `off` did not match absent (X-CT-Status={st})")
+
+
+def test_s8_scan_still_stores_and_evicts(ng: Nginx) -> None:
+    """S8 test 4 -- the anti-hang / anti-wedge arm at the HTTP level.
+
+    Drive far more unique keys through the scan-resistant zone than it can
+    hold, so the protected segment fills, the cap demotes, and eviction must
+    keep finding victims on BOTH queues. Every request must still complete with
+    a 200: a zone that could not evict would fail stores (or, with the
+    evict_one() hazard, wedge the worker holding the mutex and time this out).
+
+    The C-level test pins the spin deterministically with a watchdog; this arm
+    proves the same property through the real request path under real slab
+    pressure, which is where a both-queues-consistency bug would actually
+    surface."""
+    for i in range(1500):
+        s, _, _ = fetch(ng.port, f"/sr/churn-{i}")
+        assert s == 200, f"/sr/churn-{i} returned {s} (store or eviction wedged)"
+
+    # And the zone is still serving: a fresh key stores and then HITs, proving
+    # eviction left the structure usable rather than merely not crashing.
+    s, _, _ = fetch(ng.port, "/sr/after-churn")
+    assert s == 200
+    s, _, h = fetch(ng.port, "/sr/after-churn")
+    assert s == 200 and h.get("x-ct-status") == "HIT", (
+        f"zone unusable after churn: X-CT-Status={h.get('x-ct-status')}")
+
+
 def test_perf7_zero_copy_serve_under_eviction(ng: Nginx) -> None:
     """PERF-7: a HIT serves the blob zero-copy DIRECTLY out of the shm slab
     (no per-hit copy into r->pool), holding a refcount on the buffer until the
@@ -10059,6 +10285,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_empty_l2_prefix_rejected(ng)
     test_backend_prefix_rejected(ng)
     test_keepalive_cap_rejected(ng)
+    test_s8_scan_resistant_config_rejects(ng)
     test_memcached_keepalive_invalid_rejected(ng)
     test_memcached_keepalive_cap_rejected(ng)
     test_memcached_keepalive_timeout_invalid_rejected(ng)
@@ -10139,6 +10366,10 @@ def run_all(ng: Nginx, origin: Origin,
     test_concurrent_hits_no_deadlock(ng)
     test_lru_eviction(ng)
     test_p1_coarse_lru_splice_keeps_hot_key_resident(ng)
+    test_s8_scan_resistant_keeps_hot_key(ng)
+    test_s8_default_off_is_unchanged(ng)
+    test_s8_explicit_off_matches_absent(ng)
+    test_s8_scan_still_stores_and_evicts(ng)
     test_admin_stats(ng)
     test_admin_prometheus(ng)
     test_admin_purge_key(ng)
@@ -10374,7 +10605,7 @@ def main() -> int:
           "admin purge w/ body, "
           "concurrency (R1), prometheus metrics (incl L2 hit/miss), "
           "default-key normalization, "
-          "LRU eviction (R6), refresh-under-pressure (R6b), "
+          "LRU eviction (R6), S8 scan-resistant segmented LRU (protected hot key survives a scan; default-off and explicit-off both still evict it; churn stores+evicts without wedging; config rejects), refresh-under-pressure (R6b), "
           "stale serve (R3), single-flight (R4), "
           "cold-miss single-flight (v10: per-box collapse + lock-off stampede), "
           "min_uses (v15: cache after N misses + off-by-default; "
