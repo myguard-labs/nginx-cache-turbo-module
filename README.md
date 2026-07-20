@@ -1031,7 +1031,7 @@ key is being filled.
 The cache zone is a single shared-memory heap with a flat LRU (least-recently-used)
 eviction list. Four kinds of nodes live in this heap and compete for space:
 
-- **Entry nodes** — actual cached response bodies with metadata (~100–400 bytes overhead + response body)
+- **Entry nodes** — actual cached response bodies with metadata (one node + the response body)
 - **Single-flight stubs** — temporary markers during origin fetch (metadata only, no body)
 - **min_uses counters** — track cold-miss count before storing (metadata only, no body; one per unique key if `cache_turbo_min_uses > 1`)
 - **L2 negative memos** — "the origin didn't have this key" records (metadata only, if `cache_turbo_l2_negative_ttl` is set)
@@ -1052,11 +1052,13 @@ A large and rapidly growing count under a stable workload signals that `min_uses
 
 **Rough sizing:**
 
-A node structure costs roughly **200 bytes overhead** per key on most systems (rbtree metadata, LRU linkage, timestamps, flags). This is incurred once per unique key, regardless of whether it is a counter, stub, or full entry. Add the response body byte count for each cached entry. The rule of thumb:
+A node structure is **168 bytes** on a 64-bit build (`sizeof(ngx_http_cache_turbo_node_t)`: rbtree linkage, the 32-byte key, timestamps, flags, LRU linkage). Slab allocation rounds up and adds its own per-chunk overhead, so budget **~256 bytes per key** in practice rather than the bare struct size. This is incurred once per unique key, regardless of whether it is a counter, stub, or full entry. Add the response body byte count for each cached entry:
 
 ```
-Zone size ≥ (unique_keys × 200 bytes) + (cached_responses × avg_body_size)
+Zone size ≥ (unique_keys × ~256 bytes) + (cached_responses × avg_body_size)
 ```
+
+Treat that as an order-of-magnitude starting point, not a formula to size a zone to the megabyte — slab rounding depends on your allocation size distribution, which depends on your body sizes. Measure, then adjust.
 
 Example:
 
@@ -1065,20 +1067,15 @@ Example:
 - Average cached body: 50 KB
 
 ```
-Minimum zone = (10,000 × 200 bytes) + (2,000 × 50,000 bytes)
-             = 2 MB + 100 MB = 102 MB
+Minimum zone ≈ (10,000 × 256 bytes) + (2,000 × 50,000 bytes)
+             ≈ 2.5 MB + 100 MB ≈ 103 MB
 ```
 
-Set `cache_turbo_zone name=ct 256m;` (rounding up for slab overhead + margin). Monitor `evictions_total` for the first week. If it stays near zero, the zone is sized well. If it grows steadily, increment the zone size.
+Set `cache_turbo_zone name=ct 256m;` (rounding up for slab overhead + margin). Monitor `cache_turbo_evictions_total` for the first week. If it stays near zero, the zone is sized well. If it grows steadily, increase the zone size.
 
-**With `min_uses` enabled,** all 10,000 keys occupy a node in the zone (not just the 2,000 cached ones), so:
+**Note where the key-slot cost falls.** In the example above the 8,000 uncached keys cost a node slot *whether or not* `min_uses` is set — a cold miss allocates a node either way. What `min_uses 2` changes is that those 8,000 keys never get a response **body** attached, which is the expensive part. So `min_uses` reduces body storage on a long-tail workload; it does not reduce the key-slot count, and it is not a fix for a zone that is too small to hold your key cardinality.
 
-```
-Minimum zone = (10,000 × 200 bytes) + (2,000 × 50,000 bytes)
-             = Same formula — the 8,000 non-cached keys still cost slots
-```
-
-This is why `min_uses` is not a default: it trades storage space (8,000 counter nodes in this example) against avoiding the first request to the origin. On a massive keyspace, the trade can tip the wrong way. **You cannot predict the break-even point without measuring** — set `min_uses 2`, monitor `min_uses_skips_total` (requests rejected by the gate) and `evictions_total` (thrashing), and adjust zone size upward or `min_uses` back to 1.
+That is also why it is not a default: on a workload whose unique-key count alone exceeds the zone, the counter nodes are pure overhead. **You cannot predict the break-even point without measuring** — set `min_uses 2`, monitor `cache_turbo_min_uses_skips_total` (cold misses sent to origin without storing) and `cache_turbo_evictions_total` (thrashing), and adjust zone size upward or `min_uses` back to 1.
 
 The zone minimum is enforced at `8 × ngx_pagesize` (~32 KB on most systems); your `cache_turbo_zone` size directive must be at least that.
 
