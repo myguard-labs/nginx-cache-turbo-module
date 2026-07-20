@@ -33,6 +33,8 @@ A built-in page cache for nginx. Think of it as a tiny Varnish that lives
   - [Cache-key normalization](#cache-key-normalization)
 - [Presets (pick a vibe, skip the knobs)](#presets-pick-a-vibe-skip-the-knobs)
 - [Microcaching (1-second TTL for APIs and PHP-FPM)](#microcaching-1-second-ttl-for-apis-and-php-fpm)
+- [Long-tail URLs: reach for `cache_turbo_min_uses` first](#long-tail-urls-reach-for-cache_turbo_min_uses-first)
+- [Zone sizing under LRU pressure](#zone-sizing-under-lru-pressure)
 - [What autotune actually tunes](#what-autotune-actually-tunes)
 - [Full example (the works)](#full-example-the-works)
   - [Using the control panel](#using-the-control-panel)
@@ -1023,6 +1025,61 @@ Two interactions worth knowing:
 Use it with `cache_turbo_lock on`, not instead of it: `min_uses` decides what is
 worth storing, single-flight decides how many requests reach the origin while a
 key is being filled.
+
+## Zone sizing under LRU pressure
+
+The cache zone is a single shared-memory heap with a flat LRU (least-recently-used)
+eviction list. Four kinds of nodes live in this heap and compete for space:
+
+- **Entry nodes** — actual cached response bodies with metadata (one node + the response body)
+- **Single-flight stubs** — temporary markers during origin fetch (metadata only, no body)
+- **min_uses counters** — track cold-miss count before storing (metadata only, no body; one per unique key if `cache_turbo_min_uses > 1`)
+- **L2 negative memos** — "the origin didn't have this key" records (metadata only, if `cache_turbo_l2_negative_ttl` is set)
+- **Auto-Vary markers** — tiny records for two-level vary discovery (described in [Auto-Vary](#auto-vary-read-the-response-vary))
+
+The LRU is one flat queue; **eviction does not distinguish between them**. A counter node holds no response body (its `data` pointer is NULL) but still consumes a full node structure, so on a long-tail workload with `cache_turbo_min_uses 2` enabled, each unique URL costs a slot — the counter saves the response body, not the key slot itself. If your zone is undersized relative to unique key cardinality, the counters and memos can starve out your actual cached entries.
+
+**Watch for thrashing:**
+
+When evictions spike but your origin traffic hasn't changed, the zone is too small or the hit rate is genuinely collapsing. Check the `cache_turbo_evictions_total` counter, exposed at your admin endpoint:
+
+```console
+$ curl 'localhost/_cache?format=prometheus' | grep evictions
+cache_turbo_evictions_total{zone="ct"} 42000
+```
+
+A large and rapidly growing count under a stable workload signals that `min_uses` counters or young entries are being evicted faster than they can serve. The remedy is to **increase the zone size** (see sizing guidance below) or **lower `cache_turbo_min_uses`** (it is not useful on an undersized zone).
+
+**Rough sizing:**
+
+A node structure is **168 bytes** on a 64-bit build (`sizeof(ngx_http_cache_turbo_node_t)`: rbtree linkage, the 32-byte key, timestamps, flags, LRU linkage). Slab allocation rounds up and adds its own per-chunk overhead, so budget **~256 bytes per key** in practice rather than the bare struct size. This is incurred once per unique key, regardless of whether it is a counter, stub, or full entry. Add the response body byte count for each cached entry:
+
+```
+Zone size ≥ (unique_keys × ~256 bytes) + (cached_responses × avg_body_size)
+```
+
+Treat that as an order-of-magnitude starting point, not a formula to size a zone to the megabyte — slab rounding depends on your allocation size distribution, which depends on your body sizes. Measure, then adjust.
+
+Example:
+
+- 10,000 unique keys in your workload
+- 2,000 of them cached (the other 8,000 are one-hit-wonders, admin URLs, etc.)
+- Average cached body: 50 KB
+
+```
+Minimum zone ≈ (10,000 × 256 bytes) + (2,000 × 50,000 bytes)
+             ≈ 2.5 MB + 100 MB ≈ 103 MB
+```
+
+Set `cache_turbo_zone name=ct 256m;` (rounding up for slab overhead + margin). Monitor `cache_turbo_evictions_total` for the first week. If it stays near zero, the zone is sized well. If it grows steadily, increase the zone size.
+
+**Note where the key-slot cost falls.** In the example above the 8,000 uncached keys cost a node slot *whether or not* `min_uses` is set — a cold miss allocates a node either way. What `min_uses 2` changes is that those 8,000 keys never get a response **body** attached, which is the expensive part. So `min_uses` reduces body storage on a long-tail workload; it does not reduce the key-slot count, and it is not a fix for a zone that is too small to hold your key cardinality.
+
+That is also why it is not a default: on a workload whose unique-key count alone exceeds the zone, the counter nodes are pure overhead. **You cannot predict the break-even point without measuring** — set `min_uses 2`, monitor `cache_turbo_min_uses_skips_total` (cold misses sent to origin without storing) and `cache_turbo_evictions_total` (thrashing), and adjust zone size upward or `min_uses` back to 1.
+
+The zone minimum is enforced at `8 × ngx_pagesize` (~32 KB on most systems); your `cache_turbo_zone` size directive must be at least that.
+
+See also: [Auto-Vary marker/variant scheme](#auto-vary-read-the-response-vary) (two-level keying on a single zone).
 
 ## What autotune actually tunes
 
