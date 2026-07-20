@@ -91,6 +91,7 @@ ngx_http_cache_turbo_shm_init_zone(ngx_shm_zone_t *shm_zone, void *data)
     ctx->sh->l2_misses = 0;
     ctx->sh->lock_waits = 0;
     ctx->sh->min_uses_skips = 0;
+    ctx->sh->l2_neg_skips = 0;
     ctx->sh->bypasses = 0;
 
     /* Autotune state (v4-3): everything zeroed. autotune_next = 0 makes the first
@@ -388,12 +389,15 @@ ngx_http_cache_turbo_shm_store(ngx_http_cache_turbo_zone_t *z,
              * serve of the old one is unaffected. */
             ngx_http_cache_turbo_blob_node_release(z, ctn->data);
         }
+        ctn->kind = NGX_HTTP_CACHE_TURBO_NODE_ENTRY;  /* now holds a body */
         ctn->data = body;
         ctn->len = len;
         ctn->fresh_until = now + fresh_ttl;
         ctn->stale_until = stale_ttl ? now + stale_ttl : 0;
         ctn->refreshing = 0;
         ctn->refresh_lock_until = 0;
+        ctn->l2_neg_until = 0;       /* L13: node now holds a body; any memo it
+                                      * carried as a COUNTER is moot */
         ctn->last_access = now;      /* P1: store re-heads the LRU, sync stamp */
 
         ngx_queue_insert_head(&z->sh->lru, &ctn->lru);
@@ -421,6 +425,7 @@ ngx_http_cache_turbo_shm_store(ngx_http_cache_turbo_zone_t *z,
 
     ctn->node.key = hash;
     ngx_memcpy(ctn->key, key_hash, 32);
+    ctn->kind = NGX_HTTP_CACHE_TURBO_NODE_ENTRY;
     ctn->data = body;
     ctn->len = len;
     ctn->fresh_until = now + fresh_ttl;
@@ -428,6 +433,7 @@ ngx_http_cache_turbo_shm_store(ngx_http_cache_turbo_zone_t *z,
     ctn->refreshing = 0;
     ctn->refresh_lock_until = 0;
     ctn->miss_count = 0;
+    ctn->l2_neg_until = 0;       /* L13: no memo on an ENTRY */
     ctn->last_access = now;      /* P1: fresh at LRU head */
 
     ngx_rbtree_insert(&z->sh->rbtree, &ctn->node);
@@ -453,6 +459,7 @@ ngx_http_cache_turbo_shm_stats(ngx_http_cache_turbo_zone_t *z,
     out->l2_misses    = z->sh->l2_misses;
     out->lock_waits   = z->sh->lock_waits;
     out->min_uses_skips = z->sh->min_uses_skips;
+    out->l2_neg_skips = z->sh->l2_neg_skips;
     out->bypasses     = z->sh->bypasses;
 
     /* Autotune introspection (v4-3): average origin-regen cost and the live beta
@@ -497,7 +504,21 @@ ngx_http_cache_turbo_shm_claim(ngx_http_cache_turbo_zone_t *z,
         /* Expired entry or a dead in-flight stub (the previous winner died):
          * take it over as the new single regenerator. Any stale data left in
          * place is past its stale window so no one serves it; the winner
-         * overwrites it on store(). */
+         * overwrites it on store().
+         *
+         * ⚠ The node's KIND is deliberately left alone. An expired ENTRY keeps its
+         * (past-stale, unservable) blob until store() replaces it -- that is the
+         * pre-existing contract and the blob's lifetime is not this fix's business.
+         * `refreshing` alone marks the single-flight; for a COUNTER that is
+         * precisely what makes it a stub.
+         *
+         * ⚠ l2_neg_until is deliberately NOT cleared. A COUNTER may carry a live
+         * memo armed moments ago by l2_neg_set() on THIS request; clearing it here
+         * destroyed the memo before any later request could read it, collapsing
+         * the window to ~1 request (CodeRabbit CR-A on PR #77). The memo describes
+         * L2's contents, which a local single-flight does not change, so it
+         * legitimately outlives the regen. unstub() no longer depends on this
+         * reset -- it identifies a stub by kind + refreshing, not by shape. */
         ctn->refreshing = 1;
         ctn->refresh_lock_until = now + lock_ttl;
         ngx_shmtx_unlock(&z->shpool->mutex);
@@ -520,6 +541,7 @@ ngx_http_cache_turbo_shm_claim(ngx_http_cache_turbo_zone_t *z,
 
     ctn->node.key = hash;
     ngx_memcpy(ctn->key, key_hash, 32);
+    ctn->kind = NGX_HTTP_CACHE_TURBO_NODE_COUNTER;  /* + refreshing = a stub */
     ctn->data = NULL;
     ctn->len = 0;
     ctn->fresh_until = 0;
@@ -527,6 +549,7 @@ ngx_http_cache_turbo_shm_claim(ngx_http_cache_turbo_zone_t *z,
     ctn->refreshing = 1;
     ctn->refresh_lock_until = now + lock_ttl;
     ctn->miss_count = 0;
+    ctn->l2_neg_until = 0;       /* brand-new node: no memo to preserve */
     ctn->last_access = now;      /* P1: init the coarse LRU stamp */
 
     ngx_rbtree_insert(&z->sh->rbtree, &ctn->node);
@@ -550,10 +573,48 @@ ngx_http_cache_turbo_shm_unstub(ngx_http_cache_turbo_zone_t *z,
     ngx_shmtx_lock(&z->shpool->mutex);
 
     ctn = ngx_http_cache_turbo_shm_lookup(z, key_hash, hash);
-    if (ctn != NULL && ctn->len == 0 && ctn->data == NULL) {
-        ngx_queue_remove(&ctn->lru);
-        ngx_rbtree_delete(&z->sh->rbtree, &ctn->node);
-        ngx_slab_free_locked(z->shpool, ctn);
+
+    /* Two separate jobs, and conflating them is what made this function a bug
+     * factory:
+     *
+     *   1. ALWAYS clear the single-flight on a claimed COUNTER. That is what
+     *      unblocks waiters, and it must happen whatever else the node carries.
+     *   2. Free the node only if it then carries NOTHING worth keeping.
+     *
+     * ⚠ Do NOT gate step 1 on what the node carries. A previous version required
+     * `l2_neg_until <= now`, so a node holding a LIVE memo kept its `refreshing`
+     * flag after its winner's response turned out non-cacheable -- every later
+     * request for that key then parked on a stub nobody would ever fill, until
+     * refresh_lock_until expired. That is a hang, not a slowdown: measured
+     * 2026-07-19, it timed out the runtime suite outright.
+     *
+     * ⚠ Do NOT reduce the free test to a shape check (`len == 0 && data == NULL`).
+     * That shape is shared by the stub, the min_uses counter and the L13 memo --
+     * the overloading that produced this whole defect class. When only
+     * l2_neg_until guarded it, a counter node mid-count was freed outright and its
+     * min_uses progress silently reset (CR-B); the in-tree justification for that
+     * ("the suite logs miss_count == 0 on all 68 calls") was measured under
+     * min_uses 4, a config where counters never reach here at all. Evidence of
+     * absence, mistaken for absence of the path.
+     *
+     * An ENTRY is never touched: it holds a body someone may still serve. */
+    if (ctn != NULL
+        && ctn->kind == NGX_HTTP_CACHE_TURBO_NODE_COUNTER
+        && ctn->refreshing)
+    {
+        /* (1) release the single-flight -- unconditional */
+        ctn->refreshing = 0;
+        ctn->refresh_lock_until = 0;
+
+        /* (2) reclaim only if nothing else lives on this node: no min_uses
+         * progress and no live negative memo. Either one means the node still
+         * carries state the caller never asked to discard, so it stays as a plain
+         * COUNTER and expires on its own terms. */
+        if (ctn->miss_count == 0 && ctn->l2_neg_until <= ngx_time()) {
+            ngx_queue_remove(&ctn->lru);
+            ngx_rbtree_delete(&z->sh->rbtree, &ctn->node);
+            ngx_slab_free_locked(z->shpool, ctn);
+        }
     }
 
     ngx_shmtx_unlock(&z->shpool->mutex);
@@ -579,7 +640,7 @@ ngx_http_cache_turbo_shm_count_miss(ngx_http_cache_turbo_zone_t *z,
     if (ctn != NULL) {
         /* A real entry (even expired/stale being refreshed) is already proven
          * cacheable — never re-gate it, and do not touch its counter. */
-        if (ctn->len > 0) {
+        if (ctn->kind == NGX_HTTP_CACHE_TURBO_NODE_ENTRY && ctn->len > 0) {
             ngx_shmtx_unlock(&z->shpool->mutex);
             return NGX_OK;
         }
@@ -619,6 +680,7 @@ ngx_http_cache_turbo_shm_count_miss(ngx_http_cache_turbo_zone_t *z,
 
     ctn->node.key = hash;
     ngx_memcpy(ctn->key, key_hash, 32);
+    ctn->kind = NGX_HTTP_CACHE_TURBO_NODE_COUNTER;
     ctn->data = NULL;
     ctn->len = 0;
     ctn->fresh_until = 0;
@@ -626,6 +688,7 @@ ngx_http_cache_turbo_shm_count_miss(ngx_http_cache_turbo_zone_t *z,
     ctn->refreshing = 0;
     ctn->refresh_lock_until = 0;
     ctn->miss_count = 1;
+    ctn->l2_neg_until = 0;       /* L13: no memo yet; l2_neg_set stamps it */
     ctn->last_access = now;      /* P1: init the coarse LRU stamp */
 
     ngx_rbtree_insert(&z->sh->rbtree, &ctn->node);
@@ -638,8 +701,141 @@ ngx_http_cache_turbo_shm_count_miss(ngx_http_cache_turbo_zone_t *z,
 }
 
 
+/* L2 negative memo (L13). Is there a live "L2 missed this key recently" memo?
+ * Returns NGX_DECLINED to SKIP the L2 GET, NGX_OK to consult L2 as usual.
+ * See the L1 vtable `l2_neg_check` comment. Only called when
+ * l2_negative_ttl > 0. */
+ngx_int_t
+ngx_http_cache_turbo_shm_l2_neg_check(ngx_http_cache_turbo_zone_t *z,
+    u_char *key_hash, uint32_t hash)
+{
+    time_t                        now;
+    ngx_int_t                     rc;
+    ngx_http_cache_turbo_node_t  *ctn;
+
+    now = ngx_time();
+    rc = NGX_OK;
+
+    ngx_shmtx_lock(&z->shpool->mutex);
+
+    ctn = ngx_http_cache_turbo_shm_lookup(z, key_hash, hash);
+
+    /* Only a COUNTER can carry a memo, and only while it has not expired.
+     *
+     * ⚠ `refreshing` is deliberately NOT consulted. It used to be, and that is
+     * what limited the memo to ~1 request: l2_neg_check runs BEFORE claim() in the
+     * request path (module.c), so req1 armed the memo and req1's own claim() then
+     * marked the very same node refreshing, masking the memo from req2 onward. At
+     * the default min_uses 1 that made the whole feature a near no-op (Codex #4).
+     *
+     * Consulting it is also wrong on the merits: `refreshing` says a LOCAL regen
+     * is in the air, which tells us nothing about whether L2 holds the key. The
+     * memo is a statement about L2's contents; a local single-flight does not
+     * change them. Skipping the L2 GET while a regen is in flight is exactly as
+     * safe as skipping it otherwise -- the memo holds no body and can never cause
+     * a stale serve. */
+    if (ctn != NULL
+        && ctn->kind == NGX_HTTP_CACHE_TURBO_NODE_COUNTER
+        && ctn->l2_neg_until > now)
+    {
+        rc = NGX_DECLINED;
+
+        /* P1/Codex #2: a consulted memo is in USE -- re-head it on the same 1s
+         * granularity as a served ENTRY. Without this a memo node keeps the
+         * last_access it was created with and sinks to the LRU tail no matter how
+         * often it is read, making it a PREFERRED eviction victim ahead of colder
+         * entries. Eviction of a memo is legitimate under real slab pressure (a
+         * body is worth more than a memo, and losing one only costs an RTT), but
+         * it should be evicted on its true recency. */
+        if (now - ctn->last_access >= 1) {
+            ctn->last_access = now;
+            ngx_queue_remove(&ctn->lru);
+            ngx_queue_insert_head(&z->sh->lru, &ctn->lru);
+        }
+    }
+
+    ngx_shmtx_unlock(&z->shpool->mutex);
+
+    return rc;
+}
+
+
+/* L2 negative memo (L13). Record that an L2 GET just missed this key, so the
+ * next cold request skips the round-trip for `ttl` seconds. Best-effort: a full
+ * slab simply means no memo (one extra RTT, never a correctness problem).
+ * See the L1 vtable `l2_neg_set` comment. */
+void
+ngx_http_cache_turbo_shm_l2_neg_set(ngx_http_cache_turbo_zone_t *z,
+    u_char *key_hash, uint32_t hash, time_t ttl)
+{
+    time_t                        now;
+    ngx_http_cache_turbo_node_t  *ctn;
+
+    now = ngx_time();
+
+    ngx_shmtx_lock(&z->shpool->mutex);
+
+    ctn = ngx_http_cache_turbo_shm_lookup(z, key_hash, hash);
+
+    if (ctn != NULL) {
+        /* Never memo an ENTRY: it holds a body, so it does not consult L2 at all
+         * and a memo on it could never be read.
+         *
+         * ⚠ `refreshing` is deliberately NOT consulted here either. The old guard
+         * rejected a refreshing node because "stamping a stub would make the memo
+         * outlive the single-flight it belongs to" -- but outliving it is now the
+         * INTENDED behaviour (see l2_neg_check and the claim() takeover branch):
+         * the memo describes L2's contents and a local regen does not change them.
+         * Keeping the guard would also re-create the ~1-request window from the
+         * other side, since a cold request's own claim() marks the node before the
+         * miss is recorded on some paths. */
+        if (ctn->kind == NGX_HTTP_CACHE_TURBO_NODE_ENTRY) {
+            ngx_shmtx_unlock(&z->shpool->mutex);
+            return;
+        }
+
+        ctn->l2_neg_until = now + ttl;
+        ngx_shmtx_unlock(&z->shpool->mutex);
+        return;
+    }
+
+    /* No node yet: create a COUNTER carrying only the memo. Invisible to every
+     * serve branch (they require an ENTRY with a body). miss_count stays 0 --
+     * this path counts nothing; if min_uses is also on it will do its own
+     * counting through count_miss on the same node. */
+    ctn = ngx_http_cache_turbo_shm_alloc_evict(z,
+              sizeof(ngx_http_cache_turbo_node_t));
+    if (ctn == NULL) {
+        ngx_shmtx_unlock(&z->shpool->mutex);   /* out of slab: no memo */
+        return;
+    }
+
+    ctn->node.key = hash;
+    ngx_memcpy(ctn->key, key_hash, 32);
+    ctn->kind = NGX_HTTP_CACHE_TURBO_NODE_COUNTER;
+    ctn->data = NULL;
+    ctn->len = 0;
+    ctn->fresh_until = 0;
+    ctn->stale_until = 0;
+    ctn->refreshing = 0;
+    ctn->refresh_lock_until = 0;
+    ctn->miss_count = 0;
+    ctn->l2_neg_until = now + ttl;
+    ctn->last_access = now;      /* P1: init the coarse LRU stamp */
+
+    ngx_rbtree_insert(&z->sh->rbtree, &ctn->node);
+    ngx_queue_insert_head(&z->sh->lru, &ctn->lru);
+
+    ngx_shmtx_unlock(&z->shpool->mutex);
+}
+
+
 /* L1 backend instance (v4-1). Stateless dispatch table over the shm functions
- * above; the zone is always passed in as an argument. */
+ * above; the zone is always passed in as an argument.
+ *
+ * ⚠ POSITIONAL: fields are brace-initialised in declaration order. A new slot
+ * must be APPENDED here in the same order it was appended to
+ * ngx_cache_turbo_l1_backend_t, or every entry after it silently shifts. */
 ngx_cache_turbo_l1_backend_t  ngx_http_cache_turbo_shm_backend = {
     ngx_string("shm"),
     ngx_http_cache_turbo_shm_lookup,
@@ -649,4 +845,6 @@ ngx_cache_turbo_l1_backend_t  ngx_http_cache_turbo_shm_backend = {
     ngx_http_cache_turbo_shm_stats,
     ngx_http_cache_turbo_shm_claim,
     ngx_http_cache_turbo_shm_count_miss,
+    ngx_http_cache_turbo_shm_l2_neg_check,
+    ngx_http_cache_turbo_shm_l2_neg_set,
 };

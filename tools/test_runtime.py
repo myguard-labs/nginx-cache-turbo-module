@@ -525,6 +525,15 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
                  redis_tls_ca: str | None = None,
                  memcached_port: int | None = None,
                  fault_injection: bool = False) -> str:
+    """Build the generated nginx.conf for the test server.
+
+    !! ASCII ONLY -- everything returned here, INCLUDING COMMENTS, is written
+    with encoding="ascii" (see Nginx.write_config). A single non-ASCII byte
+    anywhere in this function (a stray arrow, dash, or warning sign pasted into
+    a location comment) raises UnicodeEncodeError before a single test runs, and
+    the traceback points at write_text, not at the comment you added. Use "!!",
+    "->" and plain hyphens.
+    """
     load = f"load_module {module};\n" if module else ""
 
     # DSN auth+db (v5): a backend reached via a full redis://user:pass@host/db
@@ -598,6 +607,108 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             cache_turbo_key      $uri;
             cache_turbo_valid    30s;
             cache_turbo_redis    127.0.0.1:{redis_port} prefix=ct: timeout=250ms;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # L2 negative memo (L13). Same shape as /l2/ above (no keepalive, so
+        # every L2 op is exactly one countable Redis connection) plus a 3s memo,
+        # so a repeated cold miss on the same key skips the L2 GET entirely. The
+        # window is deliberately longer than the test's request burst and
+        # shorter than the suite, so expiry is observable within one test.
+        #
+        # min_uses 4 is load-bearing for the TEST, not for the feature: without
+        # it request 1 stores the (cacheable) origin response and request 2 is a
+        # plain L1 HIT that never reaches the L2 consult at all -- so the test
+        # would "pass" by measuring zero Redis traffic for the wrong reason.
+        # Keeping the key below the store threshold holds every request on the
+        # cold-miss path, which is the only path the memo is on.
+        location /l2neg/ {{
+            cache_turbo                  main;
+            cache_turbo_key              $uri;
+            cache_turbo_valid            30s;
+            cache_turbo_min_uses         4;
+            cache_turbo_l2_negative_ttl  3;
+            cache_turbo_redis            127.0.0.1:{redis_port} prefix=ct: timeout=250ms;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # L2 negative memo, LIFETIME arm. DEFAULT min_uses (1) on purpose.
+        #
+        # This location exists to measure the memo across its whole window in the
+        # config the feature actually SHIPS in. Two traps had to be avoided at once,
+        # and both were hit for real while writing this (2026-07-19):
+        #
+        # 1. A high min_uses (4, or 32) keeps the key uncached, but it ALSO stops
+        #    the request before the v10 cold-miss claim(): count_miss returns
+        #    NGX_DECLINED and the handler returns early. claim() is what marks the
+        #    node `refreshing`, which is the mechanism that used to mask the memo --
+        #    so on such a location the masking bug CANNOT occur and a negative
+        #    control reintroducing it still passes. The test would assert nothing.
+        #
+        # 2. At min_uses 1 the cold path runs in full (claim() included), but a
+        #    cacheable response STORES on request 1 and every later request is a
+        #    plain L1 HIT that never reaches L2 -- zero GETs for the wrong reason.
+        #
+        # 3. min_uses 1 + an uncacheable response keeps every request cold, but with
+        #    the v10 cold-miss lock ON the winner never stores (the response is
+        #    uncacheable), so followers PARK on the stub and the cold-wait re-poll
+        #    sets l2_neg_force -- which bypasses the memo by design. Measured
+        #    2026-07-19: 2 requests in 5s, the second issuing 50 forced GETs.
+        #
+        # So: min_uses 1 (real cold path) + uncacheable origin (never stores) +
+        # cache_turbo_lock off (no parking, no forced re-polls). This location
+        # measures memo LIFETIME in the config the feature ships in.
+        #
+        # NOTE: there is deliberately NO test here for "the memo is consulted on a
+        # node another request marked `refreshing`" (CodeRabbit CR-A / Codex #4).
+        # That state is not reachable from outside the module: the memo is checked
+        # once per request BEFORE the cold-miss single-flight, and a request that
+        # arrives while a claim is held becomes a WAITER, whose re-poll sets
+        # l2_neg_force and bypasses the memo by design. Six formulations were tried
+        # (serial and 12-way concurrent, min_uses 1/4/32, lock on and off); every
+        # one passed with the coupling deliberately restored. See issues.md.
+        location /l2neglife/ {{
+            cache_turbo                  main;
+            cache_turbo_key              $uri;
+            cache_turbo_valid            30s;
+            cache_turbo_lock             off;
+            cache_turbo_l2_negative_ttl  3;
+            cache_turbo_redis            127.0.0.1:{redis_port} prefix=ct: timeout=250ms;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # L2 negative memo, min_uses interaction: the memo rides on the SAME
+        # counter node min_uses uses, so this location exercises both writing to
+        # one node. min_uses 3 exceeds the test's request count, so every request
+        # stays below the threshold and each one both counts a min_uses skip and
+        # consults the memo -- the overlapping state that would hide a clobber.
+        # The CR-B test drives UNCACHEABLE responses through here, so a winner
+        # never stores and a follower can park on the single-flight. Two SEPARATE
+        # deadlines govern that, and they are easy to confuse:
+        #
+        #   lock_ttl 1s      -- how long a CLAIM stays valid (when a stub goes
+        #                       stale and may be taken over by a new winner).
+        #   lock_timeout 2s  -- how long a WAITER parks before giving up and
+        #                       going to origin itself (module.c: wait_deadline
+        #                       = now + lock_timeout).
+        #
+        # !! lock_timeout MUST stay well under fetch()'s 5s client timeout. Both
+        # defaulted to 5s, so a waiter that parked the full deadline released at
+        # ~5.000s while the client aborted at 5.000s -- a photo finish decided by
+        # scheduling jitter, which is exactly the 1-in-N red this test showed on
+        # slower CI runners (PR #77, run 29708006339 attempt 1). Pinning it to 2s
+        # makes the park end strictly before the client gives up, so a real
+        # teardown regression surfaces as a legible assertion rather than a
+        # timeout whose cause is ambiguous.
+        location /l2negmu/ {{
+            cache_turbo                  main;
+            cache_turbo_key              $uri;
+            cache_turbo_valid            30s;
+            cache_turbo_min_uses         3;
+            cache_turbo_lock_ttl         1s;
+            cache_turbo_lock_timeout     2s;
+            cache_turbo_l2_negative_ttl  3;
+            cache_turbo_redis            127.0.0.1:{redis_port} prefix=ct: timeout=250ms;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
@@ -7199,6 +7310,376 @@ def test_min_uses_rejects_out_of_range(ng: Nginx) -> None:
             f"cache_turbo_min_uses {good} (a legal boundary) was rejected:\n{r.stdout}"
 
 
+def _admin_l2_neg_skips(ng: Nginx) -> int:
+    """L13: count of L2 GETs skipped by a live negative memo (admin stats)."""
+    import json
+    _, b, _ = fetch(ng.port, "/_cache")
+    return int(json.loads(b).get("l2_neg_skips", 0))
+
+
+def test_l2_negative_ttl_skips_repeat_get(ng: Nginx, origin: Origin,
+                                          redis: RedisServer) -> None:
+    """L13: after an L2 GET misses, a memo makes the next cold request for the
+    same key skip the round-trip entirely.
+
+    This measures the thing that actually changed -- the number of Redis
+    connections the module opens -- NOT merely that the response is still
+    correct. A test asserting only status/body would pass with or without the
+    memo (the L9 lesson: a perf change needs a test that observes the op count).
+
+    /l2neg/ has no keepalive, so each L2 op is exactly one accepted connection,
+    and its min_uses 4 keeps the key below the store threshold -- so both
+    requests stay on the cold-miss path that consults L2, rather than the second
+    becoming an L1 HIT that trivially avoids Redis for the wrong reason."""
+    uri = f"/l2neg/nomemo-{time.time()}"
+
+    # Request 1 primes the memo: a real L2 GET that misses. Measure it alone --
+    # redis.cli() shells out and opens its OWN connection, so any bookkeeping
+    # between two readings would be counted as module traffic.
+    before = _redis_conns_received(redis)
+    s1, _, _ = fetch(ng.port, uri)
+    assert s1 == 200, f"req1 status {s1}"
+    time.sleep(0.4)                       # let the write-through SET settle
+    first = _redis_conns_received(redis) - before
+    assert first >= 1, \
+        f"req1 must actually consult L2 (Redis conns delta {first} < 1)"
+
+    # Request 2 is inside the 3s window: the memo must suppress the GET. A
+    # write-through SET may still occur, so assert strictly fewer ops, not zero.
+    skips0 = _admin_l2_neg_skips(ng)
+    before = _redis_conns_received(redis)
+    s2, _, _ = fetch(ng.port, uri)
+    assert s2 == 200, f"req2 status {s2}"
+    time.sleep(0.4)
+    second = _redis_conns_received(redis) - before
+
+    assert second < first, \
+        (f"req2 opened {second} Redis connections vs req1's {first} -- the "
+         "negative memo did not suppress the repeat L2 GET")
+    assert _admin_l2_neg_skips(ng) - skips0 >= 1, \
+        ("l2_neg_skips did not rise: the request avoided Redis for some other "
+         "reason than the memo, so this test is not measuring the memo")
+
+
+def test_l2_negative_ttl_expires(ng: Nginx, origin: Origin,
+                                 redis: RedisServer) -> None:
+    """L13: the memo is a BOUNDED-staleness window, not a permanent off-switch.
+
+    The whole coherence story for this feature is "the memo expires", so the
+    expiry is the load-bearing assertion: once cache_turbo_l2_negative_ttl
+    seconds pass, the next request must consult L2 for real again and pick up
+    anything a peer stored meanwhile. Without expiry (or with the window sliding
+    forward on every memoed request) L2 would stay switched off for a hot-but-
+    absent key forever -- the exact failure the re-arm guard prevents."""
+    # /l2neglife/ + a "ccnostore" URI: DEFAULT min_uses (1) so the full cold path
+    # including claim() runs -- claim() is what marks the node `refreshing` and is
+    # the mechanism the memo-masking bug rode on, so a location with a raised
+    # min_uses cannot exercise it at all (see the location comment). The
+    # uncacheable origin response is what keeps the key off the store path so
+    # later requests do not turn into L1 HITs.
+    uri = f"/l2neglife/ccnostore-expiry-{time.time()}"
+
+    fetch(ng.port, uri)                   # arm the memo with a real GET
+    time.sleep(0.4)
+
+    skips0 = _admin_l2_neg_skips(ng)
+    fetch(ng.port, uri)                   # inside the window: skipped
+    assert _admin_l2_neg_skips(ng) - skips0 >= 1, \
+        "the second request should have been memo-skipped (window is 3s)"
+
+    # Keep requesting ACROSS the whole window. Each of these is memo-skipped, and
+    # each is therefore a chance for a buggy build to re-stamp l2_neg_until from
+    # a miss it only "knew about" because of the memo -- which would slide the
+    # window forward indefinitely and never let the expiry below happen. A single
+    # mid-window request cannot detect that: the window would slide by only the
+    # sleep length and the final wait would still clear it.
+    # Hammer the key for LONGER than the 3s window, faster than the window, so
+    # every request lands while the memo is still live. In a correct build the
+    # memo is armed once and expires 3s after that first REAL miss -- mid-burst
+    # -- so the tail of this loop is already consulting L2 again. In a build
+    # that re-arms from memoed misses, l2_neg_until is pushed forward by every
+    # request and the memo never dies while traffic continues.
+    #
+    # The detection therefore has to happen DURING the burst, not after it:
+    # once requests stop, even a slid window lapses within one TTL, so any
+    # "sleep then check" ending would pass on both builds.
+    # The memo was armed once, at the first real miss. It must therefore DIE
+    # mid-burst, ~3s in, and every later request in the burst must consult L2 for
+    # real. Record when skips stop rising: that is the memo's true death.
+    #
+    # This assertion is what makes the !l2_neg_skipped re-arm guard testable. It
+    # was impossible before the L13-fix (memo lifetime collapsed to ~1 request, so
+    # the window was re-armed from a REAL miss every time and a guard-removed
+    # Measure the memo's lifetime by counting GET COMMANDS ON THE WIRE.
+    #
+    # ⚠ Neither of the obvious signals works here, and both were tried:
+    #
+    # 1. l2_neg_skips is NOT a per-request counter. It is bumped on the skip
+    #    branch in the request handler, which only runs on a request's FIRST entry
+    #    with !l2_done. Measured directly (2026-07-19) it rises exactly ONCE for a
+    #    key and then stays flat for the whole window while the memo keeps
+    #    declining every GET -- so "skips stopped rising" means "the first skip
+    #    happened", not "the memo died". Existing assertions on it are all `>= 1`
+    #    liveness checks, which is why the flatness never surfaced before.
+    #
+    # 2. Redis CONNECTION count cannot see it either: with the memo working a
+    #    request does 0 GETs + 1 write-through SET, and with the memo dead it does
+    #    1 GET + 0 SETs. Both are exactly one connection on a keepalive-less
+    #    location, so the metric is blind to the thing under test.
+    #
+    # MONITOR is the instrument that distinguishes them -- the same reason the
+    # keepalive tests use it: a wire-level negative that a state query cannot show.
+    with redis.start_monitor() as mon:
+        t_start = time.time()
+        t_end = t_start + 5.0
+        samples = []      # (elapsed, GET commands issued for that request)
+        statuses = []
+        # 0.3s pacing: ~17 requests over 5s, enough samples to locate the memo's
+        # death inside a 3s window. The key never stores (uncacheable origin
+        # response), so request count is not bounded by min_uses here.
+        while time.time() < t_end:
+            mon.checkpoint()
+            _s, _b, hdrs = fetch(ng.port, uri)
+            time.sleep(0.3)   # let the request's L2 ops reach the wire
+            samples.append((time.time() - t_start,
+                            mon.commands_seen().count("GET")))
+            statuses.append((hdrs.get("x-cache") or hdrs.get("X-Cache") or "-"))
+
+    # ⚠ GUARD: prove the burst stayed on the path under test before reading
+    # anything into its L2 traffic. If the key gets STORED mid-burst, every later
+    # request is a plain L1 HIT that issues no L2 GET -- which is indistinguishable
+    # from "the memo is alive" by GET count alone, and would make this test pass
+    # for entirely the wrong reason. That is exactly what happened on the original
+    # /l2neg/ location (min_uses 4 < burst length); see the location comment.
+    assert "HIT" not in statuses, (
+        f"the key was CACHED during the burst (X-Cache sequence: {statuses}) -- "
+        "later requests never reached the L2 path, so the GET counts below say "
+        "nothing about the memo. Raise min_uses on this location above the "
+        "request count.")
+
+    # While the memo is live the module issues NO GET; once it expires, GETs
+    # resume. The last silent sample marks the memo's death.
+    quiet = [t for t, n in samples if n == 0]
+    talked = [t for t, n in samples if n > 0]
+    memo_lifetime = max(quiet) if quiet else 0.0
+
+    assert quiet, (
+        f"every request in the burst issued an L2 GET ({samples}) -- the memo "
+        "never suppressed a single GET, so it is not working at all")
+
+    # It must have lived a MEANINGFUL fraction of its 3s window, not ~1 request.
+    # This is the direct regression test for the memo-lifetime defect: before the
+    # L13-fix the memo covered about ONE request (~0.2s) instead of ~3s.
+    assert memo_lifetime > 1.5, (
+        f"the memo stopped suppressing L2 GETs after only {memo_lifetime:.1f}s of a "
+        f"3s window (per-request GET counts: {samples}) -- it is being destroyed "
+        "or masked early, so the feature is largely a no-op (CodeRabbit CR-A / "
+        "Codex #4 on PR #77)")
+
+    # ...and it must actually DIE inside the burst. A build that re-arms from
+    # memoed misses slides l2_neg_until forward on every request, so L2 stays
+    # switched off for a hot-but-absent key indefinitely. Detection has to happen
+    # DURING the burst: once traffic stops, even a slid window lapses within one
+    # TTL and a "sleep then check" ending would pass on both builds. This is the
+    # assertion that finally makes the !l2_neg_skipped re-arm guard testable -- it
+    # was impossible while the memo only survived ~1 request.
+    assert talked, (
+        f"no request in a 5s burst issued an L2 GET (per-request GET counts: "
+        f"{samples}) -- the 3s memo never expired, so l2_neg_until is sliding "
+        "forward on memoed misses and L2 is effectively disabled for this key "
+        "(the !l2_neg_skipped re-arm guard is not working)")
+
+    time.sleep(3.5)
+    skips1 = _admin_l2_neg_skips(ng)
+    before = _redis_conns_received(redis)
+    s, _, _ = fetch(ng.port, uri)
+    assert s == 200, f"post-expiry status {s}"
+    time.sleep(0.4)
+    after = _redis_conns_received(redis) - before
+
+    assert after >= 1, \
+        (f"after the memo expired the request opened {after} Redis connections "
+         "-- the memo is not expiring, so L2 is effectively disabled for this key")
+    assert _admin_l2_neg_skips(ng) - skips1 == 0, \
+        "an expired memo must not count as a skip"
+
+
+def test_l2_negative_ttl_with_min_uses(ng: Nginx, origin: Origin,
+                                       redis: RedisServer) -> None:
+    """L13: the memo and min_uses share ONE counter node, so they must not
+    clobber each other.
+
+    /l2negmu/ sets min_uses 3 plus a 3s memo. Both requests below stay BELOW the
+    threshold, so each one both counts a min_uses skip and (after the first)
+    consults the memo -- the two features writing to the same node on the same
+    request, which is the state that would break if l2_neg_set overwrote
+    miss_count or count_miss reset l2_neg_until.
+
+    The threshold must exceed the request count: with min_uses 2 the second
+    request PASSES the gate and stores, so it legitimately records no skip and
+    the interaction never gets exercised."""
+    uri = f"/l2negmu/shared-node-{time.time()}"
+
+    fetch(ng.port, uri)                   # miss 1: arms memo, counts 1
+    time.sleep(0.4)
+
+    skips0 = _admin_l2_neg_skips(ng)
+    mu0 = _admin_min_uses_skips(ng)
+
+    s, _, h = fetch(ng.port, uri)         # miss 2 within the window
+    assert s == 200, f"req2 status {s}"
+
+    assert _admin_l2_neg_skips(ng) - skips0 >= 1, \
+        "the memo stopped working once min_uses shared the node"
+    assert _admin_min_uses_skips(ng) - mu0 >= 1, \
+        "min_uses stopped counting once the memo shared the node"
+
+
+def test_l2_negative_ttl_not_armed_by_outage(ng: Nginx, origin: Origin,
+                                             redis: RedisServer) -> None:
+    """L13-fix (Codex #5): an L2 OUTAGE must not arm the negative memo.
+
+    The memo asserts "L2 does not have this key". A failed round-trip does not
+    establish that -- it establishes nothing. Arming on failure is fail-slow
+    amplification: every failed GET arms a memo, the memos then suppress the very
+    GETs that would notice L2 coming back, and the cache stays switched off for up
+    to l2_negative_ttl PAST recovery.
+
+    So: take Redis down, drive requests (each one a connect failure, formerly
+    indistinguishable from a miss), bring it back, and require that the next
+    request consults L2 for real. A build that memoes transport failures skips it
+    instead, and l2_neg_skips rises.
+
+    This is precisely the scenario 5/5 green CI could not see before: the suite
+    never induced an L2 outage, so the defect passed every existing assertion."""
+    uri = f"/l2neg/outage-{time.time()}"
+
+    redis.stop()
+    try:
+        # Each request now fails to reach L2. Formerly every one of these armed a
+        # memo asserting the key was absent.
+        for _ in range(3):
+            s, _, _ = fetch(ng.port, uri)
+            assert s == 200, \
+                f"request during L2 outage returned {s}; origin must still serve"
+    finally:
+        redis.start()
+
+    # Redis is back. The next request MUST consult it -- that is how recovery is
+    # noticed. Assert on the skip counter (did the memo suppress it?), not merely
+    # on the status, which is 200 either way.
+    skips0 = _admin_l2_neg_skips(ng)
+    s, _, _ = fetch(ng.port, uri)
+    assert s == 200, f"post-recovery status {s}"
+
+    assert _admin_l2_neg_skips(ng) - skips0 == 0, (
+        "an L2 outage armed the negative memo: the post-recovery request was "
+        "memo-skipped instead of re-consulting L2, so a transient outage keeps L2 "
+        "switched off for up to l2_negative_ttl afterwards (Codex #5)")
+
+
+def test_min_uses_counter_survives_uncacheable(ng: Nginx, origin: Origin,
+                                               redis: RedisServer) -> None:
+    """L13-fix (CodeRabbit CR-B): an uncacheable response must not reset the
+    min_uses counter.
+
+    unstub() frees the leftover cold-miss stub when a winner's response turns out
+    non-cacheable. A min_uses counter node has the same body-less shape as that
+    stub, so a shape-based predicate freed it too -- silently discarding the
+    accumulated miss_count and restarting the threshold from zero. A key that is
+    requested repeatedly would then never reach min_uses and never get cached.
+
+    /l2negmu/ sets min_uses 3. The URI contains "ccnostore", which makes the test
+    origin answer `Cache-Control: no-store` -- a genuinely uncacheable response,
+    so every request runs the non-cacheable winner teardown in unstub(). Then
+    assert the counter still climbs: the min_uses skips must stop once the
+    threshold is crossed. If the counter were being reset by that teardown, every
+    request would keep skipping forever."""
+    uri = f"/l2negmu/ccnostore-{time.time()}"
+
+    # Five requests against a min_uses 3 location. In a correct build the counter
+    # survives each uncacheable teardown, crosses 3, and the LAST requests record
+    # no further min_uses skip. In a resetting build every request skips.
+    # 0.3s between requests: each uncacheable response runs the cold-miss teardown,
+    # and the next request must not race the winner's unstub(). At 0.1s this test
+    # intermittently hit a still-claimed stub and parked, timing the suite out on
+    # roughly one run in three.
+    #
+    # !! The sleep is a NUISANCE REDUCER, not the thing that makes this safe, and
+    # it never was: lock_ttl on /l2negmu/ is 1s, so a 0.3s gap still lands well
+    # inside the previous request's claim window by construction. Parking here is
+    # REACHABLE and expected -- count_miss() returns NGX_OK (not NGX_DECLINED) when
+    # it finds a live stub, precisely so claim() can turn this request into a
+    # waiter (shm.c, "Proceed so the caller's claim() makes this request a
+    # waiter"). No concurrency is needed to get a waiter in this serial test.
+    # What keeps that park from failing the test is cache_turbo_lock_timeout 2s
+    # on the location, which bounds the park strictly under fetch()'s 5s client
+    # timeout. Both were 5s until 2026-07-20, which is the real source of the
+    # "1 in N" red on slow CI runners -- not the sleep, and not unstub().
+    skips_seen = []
+    for _ in range(5):
+        mu0 = _admin_min_uses_skips(ng)
+        s, _, _ = fetch(ng.port, uri)
+        assert s == 200, f"status {s}"
+        skips_seen.append(_admin_min_uses_skips(ng) - mu0)
+        time.sleep(0.3)
+
+    assert skips_seen[0] >= 1, (
+        f"first request recorded no min_uses skip ({skips_seen}) -- min_uses is "
+        "not gating this location, so this test is not measuring the counter")
+    assert skips_seen[-1] == 0, (
+        f"min_uses skips per request across 5 requests: {skips_seen}. The counter "
+        "never crossed its threshold of 3, i.e. it is being reset by the "
+        "uncacheable-response teardown in unstub() (CodeRabbit CR-B on PR #77)")
+
+
+def test_l2_negative_ttl_rejects_out_of_range(ng: Nginx) -> None:
+    """L13: cache_turbo_l2_negative_ttl is range-checked at config time.
+
+    Unlike min_uses/stale_mult, `0` is LEGAL here and means off (it is the
+    default, and merge does not coerce it), so 0 is pinned as accepted -- if a
+    later edit copies the min_uses setter wholesale it would start rejecting the
+    documented way to disable the feature, and this test catches that. 61 is
+    rejected because the memo has no invalidation channel: the cap is what keeps
+    a typo from disabling L2 for a long window."""
+    anchor = "cache_turbo_l2_negative_ttl  3;"
+    assert anchor in nginx_config(
+        ng.root, ng.port, ng.module, ng.origin_port, 1, ng.redis_port,
+        ng.redis_auth_port, ng.redis_password, ng.redis_tls_port,
+        ng.redis_tls_ca, ng.memcached_port), \
+        f"test fixture missing anchor {anchor!r}"
+
+    # in-range-check arm: parses as a number, refused by the bounds
+    for bad in ("61", "3600"):
+        r = _config_test_result(
+            ng, lambda c, b=bad: c.replace(
+                anchor, f"cache_turbo_l2_negative_ttl {b};", 1))
+        assert r.returncode != 0, \
+            f"cache_turbo_l2_negative_ttl {bad} was accepted by nginx -t:\n{r.stdout}"
+        assert "out of range" in r.stdout, \
+            f"missing/odd range diagnostic for {bad}:\n{r.stdout}"
+
+    # parse arm: ngx_atoi has no sign handling, so a negative surfaces as a
+    # "bad value" rather than reaching the bounds check. Pinned separately so a
+    # later editor cannot collapse the two diagnostics into one.
+    for bad in ("-1", "abc"):
+        r = _config_test_result(
+            ng, lambda c, b=bad: c.replace(
+                anchor, f"cache_turbo_l2_negative_ttl {b};", 1))
+        assert r.returncode != 0, \
+            f"cache_turbo_l2_negative_ttl {bad} was accepted by nginx -t:\n{r.stdout}"
+        assert "bad value" in r.stdout, \
+            f"missing/odd bad-value diagnostic for {bad}:\n{r.stdout}"
+
+    # 0 (off, the default) and both real boundaries stay legal
+    for good in ("0", "1", "60"):
+        r = _config_test_result(
+            ng, lambda c, g=good: c.replace(
+                anchor, f"cache_turbo_l2_negative_ttl {g};", 1))
+        assert r.returncode == 0, \
+            (f"cache_turbo_l2_negative_ttl {good} (legal) was rejected:\n{r.stdout}")
+
+
 def test_lru_eviction(ng: Nginx) -> None:
     """R6: with a tiny zone, old entries are evicted, not 500s."""
     # hammer many distinct keys through the tiny zone; must all 200, no errors
@@ -9624,6 +10105,14 @@ def run_all(ng: Nginx, origin: Origin,
     test_autotune_churn_disqualifies(ng, origin)
     if redis is not None:
         test_l2_write_through(ng, origin, redis)
+        test_l2_negative_ttl_skips_repeat_get(ng, origin, redis)   # L13
+        test_l2_negative_ttl_expires(ng, origin, redis)            # L13
+        test_l2_negative_ttl_with_min_uses(ng, origin, redis)      # L13
+        test_l2_negative_ttl_not_armed_by_outage(ng, origin, redis)  # L13-fix #5
+        test_min_uses_counter_survives_uncacheable(ng, origin, redis)  # L13-fix CR-B
+        # config-reject arm: no redis fixture needed, but its config anchor only
+        # exists when the redis locations are emitted, so it lives in here too
+        test_l2_negative_ttl_rejects_out_of_range(ng)              # L13
         test_l2_keepalive_reuse(ng, origin, redis)
         test_l2_keepalive_db_isolation(ng, origin, redis)
         test_l2_cross_instance_fill(ng, origin, redis)
@@ -9837,7 +10326,12 @@ def main() -> int:
           "redis DSN bad db, redis db out-of-range cap both arms), "
           "autotune (v4-3: raises beta within band/off-by-default/"
           "insufficient-data/churn-disqualify)"
-          + (", L2 write-through (P4), keepalive pool reuse (v15), "
+          + (", L2 write-through (P4), "
+             "L2 negative memo (L13: skips the repeat GET, expires, "
+             "coexists with min_uses, range-checked incl. 0=off, "
+             "survives its full window, NOT armed by an L2 outage, "
+             "min_uses counter survives uncacheable teardown), "
+             "keepalive pool reuse (v15), "
              "malformed L2 blob rejected pre-L1 (STAB-4), "
              "L2 cross-instance fill (P2), "
              "L2-aware key purge (P6), expired-L1 consults L2 (P6), "

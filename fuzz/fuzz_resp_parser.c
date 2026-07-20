@@ -100,11 +100,23 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         op.pool = &pool;
 
         rc = ngx_http_cache_turbo_redis_parse(&op, &blob, &blob_len);
-        if (rc != NGX_OK && rc != NGX_AGAIN && rc != NGX_DECLINED) {
+        /* L13-fix: this parser is TRI-state on failure. NGX_DECLINED is now
+         * reserved for a well-formed `$-1` nil (a DEFINITIVE miss, the only
+         * outcome allowed to arm the L13 negative memo) and NGX_ERROR covers
+         * every not-an-answer reply: a Redis error reply, an unexpected type
+         * byte, an unparseable length, an oversized payload. Both are legal
+         * returns; conflating them is the bug the split exists to prevent. */
+        if (rc != NGX_OK && rc != NGX_AGAIN && rc != NGX_DECLINED
+            && rc != NGX_ERROR)
+        {
             __builtin_trap();              /* undocumented return */
         }
         if (rc == NGX_OK) {
             check_in_bounds(blob, blob_len, buf, size);
+        }
+        /* A failure return must never hand back a blob. */
+        if (rc != NGX_OK && (blob != NULL || blob_len != 0)) {
+            __builtin_trap();
         }
         ngx_fuzz_pool_reset(&pool);
     }

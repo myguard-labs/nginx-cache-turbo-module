@@ -123,6 +123,25 @@ jobs:
             exit 1
           fi
 
+      - name: Unit tests — shm node state machine (ASan/UBSan)
+        # Runs HERE, not in Validation, because these link nginx's real
+        # ngx_rbtree.c and so need the configured tree the build job just made.
+        # tests/unit/run.sh SKIPS them when no such tree exists, so this step is
+        # what makes them actually execute -- do not remove it on the assumption
+        # the Validation job covers it. It does not.
+        #
+        # Guards CR-A (the L13 negative memo must survive the claim() that stubs
+        # its node) and CR-B (unstub() must not free a COUNTER carrying min_uses
+        # progress). Both are unreachable through the HTTP surface, so the
+        # runtime suite passes with either bug restored -- see tests/unit/
+        # ngx_shim_shm.h. Each assertion is control-verified by injecting the
+        # bug into the shipped source.
+        run: |
+          make -C tests/unit --no-print-directory check \
+            NGINX_VERSION="$NGINX_VERSION" \
+            NGINX_SRC=".build/nginx-${NGINX_VERSION}/src" \
+            NGINX_OBJS=".build/nginx-${NGINX_VERSION}/objs"
+
       - name: Strict module compile
         # CI-1 (compiler axis): the same -Werror wall under BOTH gcc and clang.
         # The two diverge on warnings (clang flags shadow/unreachable/format cases

@@ -14,6 +14,8 @@ coverage-report/
 
 # Unit-test build binary (source under tests/unit/ IS tracked)
 tests/unit/test_math
+tests/unit/test_shm_state
+tests/unit/test_shm_state.san
 
 # Fuzzing build artifacts (seed corpus IS tracked; everything else is not)
 fuzz/fuzz_resp_parser
@@ -24,6 +26,7 @@ fuzz/generated_parser.inc
 fuzz/generated_norm_args.inc
 fuzz/generated_mc_parser.inc
 fuzz/generated_auto_classify.inc
+tests/unit/generated_shm.inc
 fuzz/crash-*
 fuzz/*-min/
 fuzz/*.profraw
