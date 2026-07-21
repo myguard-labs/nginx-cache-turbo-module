@@ -6807,10 +6807,25 @@ ngx_http_cache_turbo_backend(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         return NGX_CONF_ERROR;
     }
 
+    /* Resolve add-on implications (woocommerce -> wordpress) to a fixpoint.
+     * Silent by design — an add-on that needed its base spelled out would be the
+     * same footgun cache_turbo_backend "auto" was removed for. "none" carries no
+     * implication (implies == 0 in the name table), so folding it through here is
+     * a no-op and safe to do before the exclusivity check below. */
+    mask = ngx_http_cache_turbo_expand_implies(mask);
+
+    /* Fold in any earlier cache_turbo_backend in the SAME context before the
+     * "none" exclusivity check. backend_presets accumulates per context (0 =
+     * unset), so this makes the check see the combined value rather than only this
+     * one invocation's args — otherwise `cache_turbo_backend none;` and
+     * `cache_turbo_backend wordpress;` on two lines each pass alone and silently
+     * leave NONE|WORDPRESS set. */
+    mask |= clcf->backend_presets;
+
     /* "none" is exclusive: `none|wordpress` is a contradiction, not a merge, and
      * silently letting one win would be the quiet surprise this directive exists
-     * to avoid. Checked on the resolved mask so it catches the combination
-     * however it was spelled (spaces, pipes, or across several directives). */
+     * to avoid. Checked on the combined mask so it catches the mix however it was
+     * spelled (spaces, pipes, or across several directives). */
     if ((mask & NGX_HTTP_CACHE_TURBO_BACKEND_NONE)
         && NGX_HTTP_CACHE_TURBO_HAS_BACKEND(mask))
     {
@@ -6821,14 +6836,7 @@ ngx_http_cache_turbo_backend(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         return NGX_CONF_ERROR;
     }
 
-    /* Resolve add-on implications (woocommerce -> wordpress) to a fixpoint. Done
-     * after the "none" exclusivity check so it operates on real backends only:
-     * "none" carries no implication and cannot appear alongside another backend
-     * here. Silent by design — an add-on that needed its base spelled out would
-     * be the same footgun cache_turbo_backend "auto" was removed for. */
-    mask = ngx_http_cache_turbo_expand_implies(mask);
-
-    clcf->backend_presets |= mask;
+    clcf->backend_presets = mask;
 
     return NGX_CONF_OK;
 }
