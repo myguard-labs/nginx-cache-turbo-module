@@ -53,7 +53,7 @@ permissions:
 jobs:
   build-asan:
     name: Build (ASan/UBSan)
-    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-24.04' || fromJSON('["self-hosted","builder02","lxc"]') }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","builder02","lxc"]') || 'ubuntu-24.04' }}
     timeout-minutes: 30
     steps:
       - name: Checkout
@@ -85,7 +85,7 @@ jobs:
 
   asan-single-process:
     name: ASan single-process
-    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-24.04' || fromJSON('["self-hosted","builder02","lxc"]') }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","builder02","lxc"]') || 'ubuntu-24.04' }}
     timeout-minutes: 30
     needs: build-asan
     steps:
@@ -146,7 +146,7 @@ jobs:
 
   asan-multi-worker:
     name: ASan multi-worker
-    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-24.04' || fromJSON('["self-hosted","builder02","lxc"]') }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","builder02","lxc"]') || 'ubuntu-24.04' }}
     timeout-minutes: 30
     needs: build-asan
     steps:

@@ -28,7 +28,7 @@ permissions:
 jobs:
   scanners:
     name: Security scanners
-    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-24.04' || fromJSON('["self-hosted","builder02","lxc"]') }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","builder02","lxc"]') || 'ubuntu-24.04' }}
     timeout-minutes: 20
     steps:
       - name: Checkout module

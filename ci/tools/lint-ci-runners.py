@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Reject pull-request workflows that can select persistent self-hosted runners."""
+"""Reject pull-request workflows that let UNTRUSTED (forked) PR code select the
+persistent self-hosted runners.
+
+Same-repo PRs (head.repo.full_name == github.repository) and pushes are trusted
+and run self-hosted; fork PRs fall back to GitHub-hosted. pull_request_target is
+forbidden outright (it would run with repo secrets against untrusted head)."""
 
 from __future__ import annotations
 
@@ -8,11 +13,13 @@ import re
 import sys
 
 
-ROOT = pathlib.Path(__file__).resolve().parents[1]
+# This script lives at ci/tools/; repo root is two levels up (ci/ -> root).
+ROOT = pathlib.Path(__file__).resolve().parents[2]
 WORKFLOWS = ROOT / ".github" / "workflows"
 TRUST_SPLIT = (
-    "${{ github.event_name == 'pull_request' && 'ubuntu-24.04' || "
-    "fromJSON('[\"self-hosted\",\"builder02\",\"lxc\"]') }}"
+    "${{ (github.event_name != 'pull_request' || "
+    "github.event.pull_request.head.repo.full_name == github.repository) && "
+    "fromJSON('[\"self-hosted\",\"builder02\",\"lxc\"]') || 'ubuntu-24.04' }}"
 )
 HOSTED = re.compile(r"ubuntu-(?:latest|[0-9]+\.[0-9]+)")
 
@@ -39,7 +46,7 @@ def main() -> int:
     if errors:
         print("\n".join(errors), file=sys.stderr)
         return 1
-    print("CI runner policy: public pull requests use GitHub-hosted runners")
+    print("CI runner policy: fork PRs run GitHub-hosted; same-repo PRs + pushes self-hosted")
     return 0
 
 

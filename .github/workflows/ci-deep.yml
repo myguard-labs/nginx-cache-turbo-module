@@ -110,7 +110,7 @@ jobs:
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: fuzz-deep-crashes
-          path: ${{ github.workspace }}/fuzz/crash-*
+          path: ${{ github.workspace }}/ci/fuzz/crash-*
           retention-days: 30
 
       - name: Upload minimized corpus
@@ -118,7 +118,7 @@ jobs:
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: fuzz-corpus
-          path: ${{ github.workspace }}/fuzz/*-min
+          path: ${{ github.workspace }}/ci/fuzz/*-min
           retention-days: 30
 
       - name: Notify Discord on failure
