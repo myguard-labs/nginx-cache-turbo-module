@@ -19,7 +19,7 @@
 set -euo pipefail
 
 FUZZ_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SRC="$FUZZ_DIR/../src/ngx_http_cache_turbo_redis.c"
+SRC="$FUZZ_DIR/../../src/ngx_http_cache_turbo_redis.c"
 SHIM="$FUZZ_DIR/ngx_shim.h"
 OUT="$FUZZ_DIR/generated_parser.inc"
 
@@ -43,7 +43,7 @@ check_define() {
     fi
     if [ "$got" != "$shim" ]; then
         echo "✗ $name drifted: source='$got' shim='$shim'" >&2
-        echo "  update fuzz/ngx_shim.h to match src/ngx_http_cache_turbo_redis.c" >&2
+        echo "  update ci/fuzz/ngx_shim.h to match src/ngx_http_cache_turbo_redis.c" >&2
         exit 1
     fi
 }

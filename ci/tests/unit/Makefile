@@ -10,14 +10,14 @@
 # report, not a silent read out of a still-mapped fake arena).
 
 # Resolve everything against THIS Makefile's directory, not the caller's cwd.
-# `make -C tests/unit` from the repo root would otherwise resolve a relative
-# NGINX_SRC against tests/unit/, and a caller passing a repo-root-relative path
+# `make -C ci/tests/unit` from the repo root would otherwise resolve a relative
+# NGINX_SRC against ci/tests/unit/, and a caller passing a repo-root-relative path
 # (as .github/workflows/build-test.yml does) would resolve it against the wrong
 # base -- which is exactly how the first CI run failed with
 # "layout_check.c:18: fatal error: ngx_config.h: No such file or directory"
-# while `make check` from inside tests/unit passed.
+# while `make check` from inside ci/tests/unit passed.
 HERE := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
-REPO := $(abspath $(HERE)/../..)
+REPO := $(abspath $(HERE)/../../..)
 
 NGINX_VERSION ?= 1.31.1
 NGINX_SRC     ?= $(REPO)/.build/nginx-$(NGINX_VERSION)/src

@@ -4,7 +4,7 @@ How fast does cache-turbo serve, and how does that compare to the alternatives?
 This page documents the method, a reproducible harness, and a reference result
 set. For what the module *is* and how to configure it, see
 [README.md](README.md); for the correctness/stability story (does it survive
-churn under ASAN/valgrind?) see [`tools/soak.sh`](tools/soak.sh) — a different
+churn under ASAN/valgrind?) see [`tools/soak.sh`](ci/tools/soak.sh) — a different
 question from the one here.
 
 > **TL;DR.** On a stock-defaults nginx build, cache-turbo serves cached pages
@@ -40,20 +40,20 @@ absolute number.**
 
 ## How to reproduce
 
-The harness is [`tools/bench.sh`](tools/bench.sh). It needs `wrk`
+The harness is [`tools/bench.sh`](ci/tools/bench.sh). It needs `wrk`
 (`apt-get install wrk`) and, for the Redis run, a local `redis-server`.
 
 ```console
 # 1. Build a stock-defaults nginx + the dynamic module.
 #    The "nginx" mode = empty --with-cc-opt (nginx's own -O), no
 #    NGX_DEBUG_PALLOC, no --with-debug. NOT a sanitizer build.
-$ eval "$(tools/ci-build.sh nginx 1.31.1 nginx)"     # exports binary= module=
+$ eval "$(ci/tools/ci-build.sh nginx 1.31.1 nginx)"     # exports binary= module=
 
 # 2. Run the matrix (tiny+medium by default; add large + the Redis tier).
 $ SIZES="tiny medium large" \
   REDIS="redis://127.0.0.1:6379/0" \
   MODULE="$module" \
-  tools/bench.sh "$binary" 10 50                      # 10 s/run, 50 connections
+  ci/tools/bench.sh "$binary" 10 50                      # 10 s/run, 50 connections
 ```
 
 `tools/bench.sh <nginx-binary> [duration_s] [concurrency]`, env knobs:
@@ -189,7 +189,7 @@ not this one.
 ## See also
 
 - [README.md](README.md) — what the module is, every directive, configuration.
-- [`tools/bench.sh`](tools/bench.sh) — this harness.
-- [`tools/soak.sh`](tools/soak.sh) — correctness/stability soak under ASAN/valgrind.
+- [`tools/bench.sh`](ci/tools/bench.sh) — this harness.
+- [`tools/soak.sh`](ci/tools/soak.sh) — correctness/stability soak under ASAN/valgrind.
 - [Monitoring (Prometheus + Grafana)](README.md#monitoring-prometheus--grafana)
   — the same counters bench.sh reads for its HIT % column.

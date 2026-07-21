@@ -13,7 +13,7 @@
 # at the wrapped command, so a NEIGHBOURING job on a shared self-hosted runner never
 # leaks its backtraces/logs into this artifact (CWE-200).
 #
-# Usage: tools/ci-hang-guard.sh <soft_timeout_s> <artifact_dir> -- <cmd...>
+# Usage: ci/tools/ci-hang-guard.sh <soft_timeout_s> <artifact_dir> -- <cmd...>
 set -eu
 
 SOFT="$1"; shift

@@ -1718,7 +1718,7 @@ ngx_http_cache_turbo_purge_request(ngx_http_request_t *r,
 }
 
 
-/* >>> FUZZ-EXTRACT auto-classify BEGIN (fuzz/extract_auto_classify.sh) <<< */
+/* >>> FUZZ-EXTRACT auto-classify BEGIN (ci/fuzz/extract_auto_classify.sh) <<< */
 /*
  * Auto-classify preset registry. Each row is one CMS backend: NULL-terminated
  * lists of request-Cookie name substrings, r->uri prefixes, and query args
@@ -3149,7 +3149,7 @@ ngx_http_cache_turbo_cookie_has(ngx_http_request_t *r,
  * reading, silently cache it. r->headers_in cookie values are NOT
  * NUL-terminated: every scan below is bounded by ck->value.len. (The fuzz
  * harness drives this function with arbitrary non-NUL-terminated bytes under
- * ASan for exactly this reason — fuzz/ngx_shim_auto.h.)
+ * ASan for exactly this reason — ci/fuzz/ngx_shim_auto.h.)
  */
 
 

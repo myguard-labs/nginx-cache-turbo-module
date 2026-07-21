@@ -1,0 +1,196 @@
+name: ASan and UBSan
+
+# Dedicated ASan+UBSan workflow, PATH-GATED: only runs when a PR/push touches
+# code that could carry a memory/UB bug (C sources, the build/runtime harness,
+# or this workflow). A docs/memory/other-workflow PR skips it entirely instead
+# of paying the ~16-minute sanitizer build+suite for zero possible signal.
+#
+# Structure — compile ONCE, run the two suite modes as PARALLEL jobs:
+#   build-asan            compile the static --add-module ASan binary, upload it
+#   asan-single-process   needs build-asan; --single-process suite (own allocs,
+#                         R6b event-loop hang, ci-hang-guard armed)
+#   asan-multi-worker     needs build-asan; master + 4-worker suite (cross-worker
+#                         shm-zone UAF / race the 1-worker run cannot reach)
+# Wall-clock ~= build + max(single, multi) instead of build + single + multi.
+# ASan links the module statically into the nginx binary (no .so), so only the
+# nginx binary is passed through the artifact and to --nginx-binary.
+#
+# Action pins (keep in sync with build-test.yml header):
+# actions/checkout@v5         -> 93cb6efe18208431cddfb8368fd83d5badbf9bfd
+# actions/upload-artifact@v5  -> 330a01c490aca151604b8cf639adc76d48f6c5d4
+# actions/download-artifact@v5-> 634f93cb2916e3fdff6788551b99b062d0335ce0
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  NGINX_VERSION: "1.31.1"
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "ci/tools/ci-build.sh"
+      - "ci/tools/test_runtime.py"
+      - "ci/tools/ci-hang-guard.sh"
+      - ".github/workflows/asan.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "ci/tools/ci-build.sh"
+      - "ci/tools/test_runtime.py"
+      - "ci/tools/ci-hang-guard.sh"
+      - ".github/workflows/asan.yml"
+  workflow_dispatch: {}
+
+concurrency:
+  group: asan-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-asan:
+    name: Build (ASan/UBSan)
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-24.04' || fromJSON('["self-hosted","builder02","lxc"]') }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential curl libpcre2-dev libssl-dev zlib1g-dev
+
+      - name: Build with sanitizers
+        run: bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" asan
+
+      - name: Stage artifact
+        run: |
+          # ASan build is static --add-module: the module is linked into the
+          # nginx binary, there is no separate .so to ship.
+          mkdir artifact
+          cp ".build/nginx-${NGINX_VERSION}/objs/nginx" artifact/
+
+      - name: Upload ASan nginx binary
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: nginx-asan
+          path: artifact/
+          retention-days: 1
+
+  asan-single-process:
+    name: ASan single-process
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-24.04' || fromJSON('["self-hosted","builder02","lxc"]') }}
+    timeout-minutes: 30
+    needs: build-asan
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - name: Download ASan nginx binary
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: nginx-asan
+          path: nginx-bin
+
+      - name: Install runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y redis-server memcached gdb
+
+      - name: Sweep stale test listeners
+        run: |
+          # Kill leftovers from earlier crashed runs still holding test
+          # ports (cross-repo collisions on shared runners).
+          command -v fuser >/dev/null || sudo apt-get install -y psmisc
+          for p in $(seq 18870 18999); do
+            fuser -k -TERM "${p}/tcp" 2>/dev/null || true
+          done
+          sleep 1
+
+      - name: Run runtime suite under ASan and UBSan (single-process)
+        env:
+          ASAN_OPTIONS: detect_leaks=0:halt_on_error=1:abort_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        # Wrapped in ci-hang-guard.sh: the single-process suite intermittently wedges
+        # the nginx event loop on CI (R6b, never reproduced locally — memory issues.md).
+        # If the suite runs past the soft timeout the guard captures a gdb all-thread
+        # backtrace + SIGQUIT debug dump into ci-hang-artifacts/ (uploaded below) so the
+        # next occurrence yields evidence instead of a mute job timeout. 1200s soft <
+        # the 30-min job timeout, well above the ~7-min healthy run.
+        run: |
+          chmod +x nginx-bin/nginx
+          bash ci/tools/ci-hang-guard.sh 1200 "$GITHUB_WORKSPACE/ci-hang-artifacts" -- \
+            python3 ci/tools/test_runtime.py \
+              --fault-injection \
+              --single-process \
+              --redis-server /usr/bin/redis-server \
+              --memcached-server /usr/bin/memcached \
+              --nginx-binary "$GITHUB_WORKSPACE/nginx-bin/nginx"
+
+      - name: Upload hang-capture artifacts
+        if: always()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: asan-hang-capture
+          path: ci-hang-artifacts/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  asan-multi-worker:
+    name: ASan multi-worker
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-24.04' || fromJSON('["self-hosted","builder02","lxc"]') }}
+    timeout-minutes: 30
+    needs: build-asan
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - name: Download ASan nginx binary
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: nginx-asan
+          path: nginx-bin
+
+      - name: Install runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y redis-server memcached
+
+      - name: Sweep stale test listeners
+        run: |
+          command -v fuser >/dev/null || sudo apt-get install -y psmisc
+          for p in $(seq 18870 18999); do
+            fuser -k -TERM "${p}/tcp" 2>/dev/null || true
+          done
+          sleep 1
+
+      - name: Run runtime suite multi-worker under ASan and UBSan (CI-3)
+        # CI-3: the single-process job covers our allocations; this run exercises
+        # the SAME sanitized binary under nginx's real master + 4-worker model (no
+        # --single-process), so a cross-worker shm-zone UAF / race / use of a slab
+        # freed by another worker surfaces here that the 1-worker run cannot.
+        # detect_leaks=0 deliberately keeps LSan OFF: nginx frees its pools at exit,
+        # not per-request, so LSan over the worker pool is false-positive-prone with
+        # no real signal — ASan's UAF/overflow checks are the high-value part and
+        # run fully multi-worker here.
+        env:
+          ASAN_OPTIONS: detect_leaks=0:halt_on_error=1:abort_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          chmod +x nginx-bin/nginx
+          python3 ci/tools/test_runtime.py \
+            --fault-injection \
+            --sanitizer \
+            --redis-server /usr/bin/redis-server \
+            --memcached-server /usr/bin/memcached \
+            --nginx-binary "$GITHUB_WORKSPACE/nginx-bin/nginx"

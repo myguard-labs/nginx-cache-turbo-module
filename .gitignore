@@ -6,37 +6,37 @@ build/
 objs/
 valgrind-*.log
 
-# Coverage artifacts (tools/coverage.sh output + gcov intermediates)
+# Coverage artifacts (ci/tools/coverage.sh output + gcov intermediates)
 coverage-report/
 *.gcda
 *.gcno
 *.gcov
 
-# Unit-test build binary (source under tests/unit/ IS tracked)
-tests/unit/test_math
-tests/unit/test_shm_state
-tests/unit/test_shm_state.san
+# Unit-test build binary (source under ci/tests/unit/ IS tracked)
+ci/tests/unit/test_math
+ci/tests/unit/test_shm_state
+ci/tests/unit/test_shm_state.san
 
 # Fuzzing build artifacts (seed corpus IS tracked; everything else is not)
-fuzz/fuzz_resp_parser
-fuzz/fuzz_norm_args
-fuzz/fuzz_mc_parser
-fuzz/fuzz_auto_classify
-fuzz/generated_parser.inc
-fuzz/generated_norm_args.inc
-fuzz/generated_mc_parser.inc
-fuzz/generated_auto_classify.inc
-tests/unit/generated_shm.inc
-fuzz/crash-*
-fuzz/*-min/
-fuzz/*.profraw
+ci/fuzz/fuzz_resp_parser
+ci/fuzz/fuzz_norm_args
+ci/fuzz/fuzz_mc_parser
+ci/fuzz/fuzz_auto_classify
+ci/fuzz/generated_parser.inc
+ci/fuzz/generated_norm_args.inc
+ci/fuzz/generated_mc_parser.inc
+ci/fuzz/generated_auto_classify.inc
+ci/tests/unit/generated_shm.inc
+ci/fuzz/crash-*
+ci/fuzz/*-min/
+ci/fuzz/*.profraw
 # Local fuzz runs dump discovered units into the corpus dirs; keep only the
 # hand-written NN_* seeds, ignore libFuzzer's hash-named discoveries.
-fuzz/corpus/*
-!fuzz/corpus/[0-9][0-9]_*
-fuzz/corpus_norm_args/*
-!fuzz/corpus_norm_args/[0-9][0-9]_*
-fuzz/corpus_mc/*
-!fuzz/corpus_mc/[0-9][0-9]_*
-fuzz/corpus_auto/*
-!fuzz/corpus_auto/[0-9][0-9]_*
+ci/fuzz/corpus/*
+!ci/fuzz/corpus/[0-9][0-9]_*
+ci/fuzz/corpus_norm_args/*
+!ci/fuzz/corpus_norm_args/[0-9][0-9]_*
+ci/fuzz/corpus_mc/*
+!ci/fuzz/corpus_mc/[0-9][0-9]_*
+ci/fuzz/corpus_auto/*
+!ci/fuzz/corpus_auto/[0-9][0-9]_*

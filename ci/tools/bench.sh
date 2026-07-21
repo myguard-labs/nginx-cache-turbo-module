@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Throughput/latency benchmark for cache-turbo. LOCAL ONLY — not wired into
-# CI. The sibling tools/soak.sh proves the module SURVIVES heavy churn; this
+# CI. The sibling ci/tools/soak.sh proves the module SURVIVES heavy churn; this
 # proves how FAST it serves, and how that compares to the alternatives.
 #
 # Stands up one nginx with an origin plus four edge servers on separate
@@ -19,9 +19,9 @@
 # nothing real — that is soak.sh's job, not this one.
 #
 # Usage:
-#   tools/bench.sh <nginx-binary> [duration_seconds] [concurrency]
-#   SIZES="tiny medium" tools/bench.sh <nginx-binary> 15 8
-#   REDIS="redis://127.0.0.1:6379/0" tools/bench.sh <nginx-binary> 15 8
+#   ci/tools/bench.sh <nginx-binary> [duration_seconds] [concurrency]
+#   SIZES="tiny medium" ci/tools/bench.sh <nginx-binary> 15 8
+#   REDIS="redis://127.0.0.1:6379/0" ci/tools/bench.sh <nginx-binary> 15 8
 #
 # Env:
 #   SIZES   space list from {tiny,medium,large}   (default "tiny medium")
@@ -53,8 +53,8 @@
 #           contention win isn't lost in the noise of a single sample.
 #
 # Release binary + dynamic module, the shipped artifact:
-#   eval "$(tools/ci-build.sh nginx 1.31.1 nginx)"   # sets binary= module=
-#   MODULE="$module" tools/bench.sh "$binary" 15 8
+#   eval "$(ci/tools/ci-build.sh nginx 1.31.1 nginx)"   # sets binary= module=
+#   MODULE="$module" ci/tools/bench.sh "$binary" 15 8
 
 set -euo pipefail
 

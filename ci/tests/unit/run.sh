@@ -2,8 +2,8 @@
 #
 # Build + run the cache-turbo pure-math unit tests. Fast, hermetic, no nginx.
 #
-#   tests/unit/run.sh            # build with warnings-as-errors + run
-#   COVERAGE=1 tests/unit/run.sh # also instrument (--coverage) so a caller can
+#   ci/tests/unit/run.sh            # build with warnings-as-errors + run
+#   COVERAGE=1 ci/tests/unit/run.sh # also instrument (--coverage) so a caller can
 #                                # gcov ../../src/ngx_http_cache_turbo_{swr,
 #                                # autotune}.c afterwards
 #
@@ -37,7 +37,7 @@ fi
 # which is the exact failure mode these tests exist to prevent. Keep the
 # build-test "Runtime" job (which has the configured tree) calling run.sh.
 NGINX_VERSION="${NGINX_VERSION:-1.31.1}"
-NGX_SRC="${NGX_SRC:-$DIR/../../.build/nginx-$NGINX_VERSION}"
+NGX_SRC="${NGX_SRC:-$DIR/../../../.build/nginx-$NGINX_VERSION}"
 
 # Honour the Makefile's own variable names if the caller set them. These are
 # passed to make as command-line args below, which override the environment --
@@ -56,6 +56,6 @@ if [ -f "$NGINX_OBJS/ngx_auto_config.h" ]; then
 else
     echo "--- shm node state machine: SKIPPED (no configured nginx tree at" \
          "$NGINX_OBJS) ---"
-    echo "    build one with tools/ci-build.sh, or run tests/unit/make check" \
+    echo "    build one with ci/tools/ci-build.sh, or run ci/tests/unit/make check" \
          "with NGINX_SRC/NGINX_OBJS set."
 fi

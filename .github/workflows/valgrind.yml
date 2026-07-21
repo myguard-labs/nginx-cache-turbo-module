@@ -44,7 +44,7 @@ jobs:
             valgrind zlib1g-dev
 
       - name: Build debug nginx + cache-turbo module
-        run: bash tools/ci-build.sh nginx "$NGINX_VERSION" debug
+        run: bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" debug
 
       - name: Memcheck soak (60s @ 4 conc, WITH suppressions)
         env:
@@ -52,4 +52,4 @@ jobs:
         run: |
           B="$GITHUB_WORKSPACE/.build/nginx-${NGINX_VERSION}/objs"
           MODULE="$B/ngx_http_cache_turbo_module.so" \
-            bash tools/soak.sh "$B/nginx" 60 4
+            bash ci/tools/soak.sh "$B/nginx" 60 4

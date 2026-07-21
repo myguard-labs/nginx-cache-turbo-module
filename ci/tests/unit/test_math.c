@@ -4,7 +4,7 @@
  *
  * Unit tests for the cache-turbo pure-math units (SWR TTL/dice + autotune
  * verdict). Compiles the SHIPPED src units verbatim against
- * tests/unit/ngx_shim_math.h so the assertions run against production code,
+ * ci/tests/unit/ngx_shim_math.h so the assertions run against production code,
  * not a copy.
  *
  * We suppress the real src/ngx_http_cache_turbo_module.h by pre-defining its
@@ -23,8 +23,8 @@ time_t  ngx_shim_now  = 1000000;
 long    ngx_shim_rand = 0;
 
 /* the units under test, verbatim */
-#include "../../src/ngx_http_cache_turbo_swr.c"
-#include "../../src/ngx_http_cache_turbo_autotune.c"
+#include "../../../src/ngx_http_cache_turbo_swr.c"
+#include "../../../src/ngx_http_cache_turbo_autotune.c"
 
 #include <stdio.h>
 #include <string.h>

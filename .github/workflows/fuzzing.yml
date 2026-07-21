@@ -43,12 +43,12 @@ jobs:
           sudo apt-get install -y clang
 
       - name: Build fuzz targets
-        run: bash fuzz/build.sh "$GITHUB_WORKSPACE/fuzz"
+        run: bash ci/fuzz/build.sh "$GITHUB_WORKSPACE/ci/fuzz"
 
       - name: Run each target 120s
         run: |
           set -euo pipefail
-          cd fuzz
+          cd ci/fuzz
           # target:corpus:dict — dict empty where a token dictionary does not help.
           targets="fuzz_resp_parser:corpus:fuzz.dict \
                    fuzz_norm_args:corpus_norm_args: \

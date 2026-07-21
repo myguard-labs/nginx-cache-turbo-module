@@ -92,7 +92,7 @@ ngx_atomic_fetch_add(ngx_atomic_t *value, ngx_atomic_int_t add)
 
 /* ---- constants the units reference ------------------------------------ *
  * Kept byte-identical to src/ngx_http_cache_turbo_module.h. A drift here is
- * caught by tests/unit/check_constants.sh (grep-compares the two).         */
+ * caught by ci/tests/unit/check_constants.sh (grep-compares the two).         */
 #define NGX_HTTP_CACHE_TURBO_STALE_MULTIPLIER   4
 #define NGX_HTTP_CACHE_TURBO_TTL_MAX            ((time_t) 0xFFFFFFFF)
 

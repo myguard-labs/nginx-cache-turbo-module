@@ -53,7 +53,7 @@ jobs:
       - name: Configure nginx src tree (clang-tidy headers)
         run: |
           set -euo pipefail
-          bash tools/ci-build.sh nginx "$NGINX_VERSION" module
+          bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" module
           echo "NGINX_SRC_TREE=$GITHUB_WORKSPACE/.build/nginx-${NGINX_VERSION}" \
             >> "$GITHUB_ENV"
       - name: flawfinder

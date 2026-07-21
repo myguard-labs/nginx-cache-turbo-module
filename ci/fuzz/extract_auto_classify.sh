@@ -9,7 +9,7 @@
 set -euo pipefail
 
 FUZZ_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SRC="$FUZZ_DIR/../src/ngx_http_cache_turbo_module.c"
+SRC="$FUZZ_DIR/../../src/ngx_http_cache_turbo_module.c"
 OUT="$FUZZ_DIR/generated_auto_classify.inc"
 
 if [ ! -f "$SRC" ]; then

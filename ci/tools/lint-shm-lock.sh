@@ -17,7 +17,7 @@
 # ngx_shmtx_lock and its matching ngx_shmtx_unlock, and fails the build if it
 # finds one. Comment lines are ignored.
 #
-# Usage: tools/lint-shm-lock.sh [src-file ...]   (defaults to src/*.c)
+# Usage: ci/tools/lint-shm-lock.sh [src-file ...]   (defaults to src/*.c)
 
 set -euo pipefail
 
