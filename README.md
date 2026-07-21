@@ -510,8 +510,8 @@ there is no way to opt a single location out.
 >
 > - it **never covered every backend** — it named 3 of the 12 presets that now
 >   exist, so `auto` on a Drupal site silently enabled *no* Drupal rules;
-> - the **`woocommerce` in it leaves `/wp-admin/` cacheable** unless you also knew
->   to stack `wordpress` (see [woocommerce.md](docs/woocommerce.md));
+> - its **`woocommerce`** shipped without implying `wordpress`, leaving
+>   `/wp-admin/` cacheable (see [woocommerce.md](docs/woocommerce.md));
 > - the **`joomla` in it ships no cookie rule at all**, so `auto` on a Joomla site
 >   *looked* like it protected logged-in users and did not.
 >
@@ -734,8 +734,8 @@ XenForo member (`xf_user`), a Discourse user (`_t`) or a MediaWiki editor
 > Caveats you should not skip: **`joomla` and `phpbb` ship no cookie rule** and do
 > not protect logged-in users until you add your own bypass **plus a matching
 > `cache_turbo_no_store`** — a bypass skips only the lookup and still stores
-> (phpBB needs a *value* test — its cookies are handed to guests too); **`woocommerce` must be stacked
-> with `wordpress`** (alone, it leaves `/wp-admin/` cacheable); **`drupal` +
+> (phpBB needs a *value* test — its cookies are handed to guests too); **`woocommerce` implies
+> `wordpress`** automatically (so `/wp-admin/` is covered without stacking); **`drupal` +
 > `mediawiki` lean on the origin's own `Cache-Control: private`**, so don't set
 > `cache_turbo_cache_control ignore` on those; **`woocommerce`'s `/cart`,
 > `/checkout`, `/my-account` prefixes are English defaults that match nothing on
