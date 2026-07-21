@@ -46,14 +46,21 @@ And the one rule a framework preset *could* plausibly ship — "bypass on the se
 cookie" — is broken on both of the big two, for two different reasons:
 
 - **Laravel's session cookie is not called `laravel_session` on your site.** It is
-  derived from `APP_NAME` in `config/session.php`, and the exact derivation has also
-  *changed between framework versions*. Laravel 11 shipped
+  derived from `APP_NAME` in the shipped `config/session.php`, and the exact derivation
+  *changed between skeleton versions*. The operative default is the one in the
+  [`laravel/laravel`](https://github.com/laravel/laravel/blob/12.x/config/session.php)
+  **application skeleton** an operator actually deploys — **not** the
+  [`laravel/framework`](https://github.com/laravel/framework/blob/12.x/config/session.php)
+  library stub, which still passes the `'_'` separator on 12.x and so reads underscore;
+  that mismatch is why version tables disagree. In the skeleton, Laravel 11 shipped
   `Str::slug(env('APP_NAME', 'laravel'), '_') . '_session'` — underscores — so an
   `APP_NAME=Acme Shop` install emitted `acme_shop_session`. Laravel 12 rewrote that
   default (dropping the `'_'` separator so `Str::slug` falls back to its hyphen, and
-  suffixing `-session`; some 12.x point releases briefly used `Str::snake`, see
-  [laravel/framework#56449](https://github.com/laravel/framework/issues/56449)), so a
-  current install more typically emits the **hyphenated** `acme-shop-session`. Either
+  suffixing `-session` → `Str::slug(env('APP_NAME','laravel')) . '-session'`), so a
+  current 12.x install emits the **hyphenated** `acme-shop-session`. (12.21.0 briefly
+  swapped `Str::slug` for `Str::snake`, which broke `APP_NAME`s containing a period —
+  [laravel/framework#56449](https://github.com/laravel/framework/issues/56449) — and was
+  reverted; it never changed the underscore/hyphen boundary.) Either
   way `laravel_session` only appears when `APP_NAME` is unset. A shipped
   `laravel_session` substring would match **almost no production Laravel site** — and
   the modern hyphenated name additionally cannot be read with `$cookie_` at all (see
