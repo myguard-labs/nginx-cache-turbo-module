@@ -26,6 +26,7 @@ import hashlib
 import http.client
 import http.server
 import json
+import os
 import pathlib
 import re
 import shlex
@@ -95,11 +96,109 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+# --------------------------------------------------------------------------- #
+# DIAG: socket-flake attribution (see memory/labs/nginx-cache-turbo-module/
+# issues.md, "open socket left in connection" at shutdown). nginx tags that
+# alert with *NNNN = c->number, its cumulative connection counter, bumped once
+# per accepted client connection AND once per upstream connect
+# (ngx_event_accept.c / ngx_event_connect.c both fetch_add the SAME
+# ngx_connection_counter). The harness is the only client and runs the origin,
+# so it observes both increment sources: every client open we make bumps
+# _NGX_CLIENT_CONNS, and Origin.hits counts the upstream requests nginx proxies
+# (origin has no keepalive pool, so 1 request == 1 upstream connect). Their sum
+# tracks c->number, letting a per-test snapshot bracket a shutdown *NNNN into
+# the owning test. This is pure instrumentation: it never relaxes the guard.
+_NGX_CLIENT_CONNS = 0
+
+
+def _bump_conn() -> None:
+    """Count one client-side connection opened to the nginx port."""
+    global _NGX_CLIENT_CONNS
+    _NGX_CLIENT_CONNS += 1
+
+
+# (name, cum_before, cum_after) per instrumented test, where cum tracks
+# c->number = client accepts + upstream connects. Populated by _instrument().
+_SPANS: list[tuple[str, int, int]] = []
+_ORIGIN_REF: "Origin | None" = None
+
+# Breadcrumb file: the wrapper writes "<test> <cursor>" here on ENTER and
+# "DONE <test>" on exit. If the suite hangs (R6b), the file names the test that
+# never finished, so ci-hang-guard.sh can label the gdb backtrace with the
+# culprit instead of only a nginx PID. Path from env so the guard can find it.
+_BREADCRUMB = os.environ.get("CT_TEST_BREADCRUMB")
+
+
+def _write_breadcrumb(text: str) -> None:
+    if not _BREADCRUMB:
+        return
+    try:
+        with open(_BREADCRUMB, "w", encoding="utf-8") as fh:
+            fh.write(text + "\n")
+    except OSError:
+        pass
+
+
+def _conn_cursor() -> int:
+    """Best estimate of nginx's current c->number: every client connection we
+    opened plus every upstream request the origin served (no origin keepalive,
+    so one served request == one upstream connect)."""
+    origin_hits = _ORIGIN_REF.hits if _ORIGIN_REF is not None else 0
+    return _NGX_CLIENT_CONNS + origin_hits
+
+
+def _instrument(origin: "Origin") -> None:
+    """Wrap every module-level test_* function so each records the c->number
+    cursor before and after it runs. Nested test_* calls just produce nested
+    spans; the narrowest span that brackets an alert is the most specific
+    attribution. Idempotent-safe: called once from main() before run_all."""
+    global _ORIGIN_REF
+    _ORIGIN_REF = origin
+    import inspect
+    for _name, _fn in list(globals().items()):
+        if not (_name.startswith("test_") and inspect.isfunction(_fn)):
+            continue
+
+        def _wrap(name, fn):
+            def _runner(*a, **kw):
+                before = _conn_cursor()
+                _write_breadcrumb(f"{name} {before}")
+                try:
+                    return fn(*a, **kw)
+                finally:
+                    _SPANS.append((name, before, _conn_cursor()))
+                    _write_breadcrumb(f"DONE {name}")
+            return _runner
+        globals()[_name] = _wrap(_name, _fn)
+
+
+def _attribute_alert(conn_number: int) -> str:
+    """Given a shutdown alert's *NNNN, return a human string naming the test(s)
+    whose span brackets it, narrowest first. The cursor is an estimate, so also
+    report the two nearest spans on either side when nothing brackets exactly."""
+    exact = [(hi - lo, name, lo, hi) for (name, lo, hi) in _SPANS
+             if lo < conn_number <= hi]
+    exact.sort()   # narrowest span first
+    if exact:
+        lines = [f"    *{conn_number} falls in: {name} "
+                 f"(conn cursor {lo}..{hi})"
+                 for (_w, name, lo, hi) in exact[:3]]
+        return "\n".join(lines)
+    # No exact bracket (cursor drift / keepalive reuse): show nearest neighbours.
+    nearest = sorted(_SPANS, key=lambda s: min(abs(conn_number - s[1]),
+                                               abs(conn_number - s[2])))
+    lines = [f"    *{conn_number}: no exact span; nearest {name} "
+             f"(cursor {lo}..{hi})"
+             for (name, lo, hi) in nearest[:3]]
+    return "\n".join(lines)
+
+
 def wait_port(port: int, timeout: float = 15.0) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
             with socket.create_connection(("127.0.0.1", port), 0.25):
+                _bump_conn()   # a successful probe IS an accepted connection
                 return
         except OSError:
             time.sleep(0.05)
@@ -123,6 +222,7 @@ def fetch(port: int, path: str, headers: dict | None = None,
     elif method in ("POST", "PUT", "DELETE"):
         req.data = b""
     try:
+        _bump_conn()
         with urllib.request.urlopen(req, timeout=5) as r:
             body = r.read().decode("utf-8", "replace")
             return r.status, body, {k.lower(): v for k, v in r.headers.items()}
@@ -137,6 +237,7 @@ def fetch_dup(port: int, path: str, headers: list[tuple[str, str]]):
     several Cookie headers, and a cache that only looks at the first one lets the
     client choose which cache bucket it lands in. dict-based fetch() cannot
     express that request at all."""
+    _bump_conn()
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
     try:
         conn.putrequest("GET", path, skip_host=False,
@@ -157,6 +258,7 @@ def fetch_raw(port: int, path: str, method: str = "GET",
               headers: dict | None = None):
     """Like fetch(), but does NOT follow redirects and supports HEAD — returns
     (status, body_str, headers_dict). Uses http.client so a 3xx is observable."""
+    _bump_conn()
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
     try:
         conn.request(method, path, headers=headers or {})
@@ -2688,7 +2790,21 @@ class Nginx:
         fatal = [ln for ln in combined.splitlines()
                  if "[alert]" in ln or "[emerg]" in ln]
         if fatal:
-            raise AssertionError("nginx logged fatal:\n" + "\n".join(fatal))
+            # DIAG: attribute any "open socket ... left in connection" leak to
+            # the test that opened connection *NNNN. Purely informative — the
+            # assertion still fires, it just names the culprit instead of
+            # leaving a bare ordinal (see issues.md socket-flake entry).
+            attribution = []
+            for ln in fatal:
+                m = re.search(r"\*(\d+) open socket", ln)
+                if m:
+                    attribution.append(_attribute_alert(int(m.group(1))))
+            msg = "nginx logged fatal:\n" + "\n".join(fatal)
+            if attribution:
+                msg += ("\n\nsocket-leak attribution "
+                        "(c->number cursor estimate):\n"
+                        + "\n".join(attribution))
+            raise AssertionError(msg)
 
 
 # --------------------------------------------------------------------------- #
@@ -3048,6 +3164,7 @@ def test_compressed_edge_identity_capture(ng: Nginx) -> None:
     import gzip as _gzip
 
     def raw(ae: str):
+        _bump_conn()
         conn = http.client.HTTPConnection("127.0.0.1", ng.port, timeout=5)
         try:
             conn.request("GET", "/gz/page",
@@ -5815,6 +5932,7 @@ def test_admin_purge_post_with_body(ng: Nginx) -> None:
         f"http://127.0.0.1:{ng.port}/_cache?key=/c/bodypurge",
         data=b"x" * 256, method="POST",
         headers={"Connection": "close"})
+    _bump_conn()
     with urllib.request.urlopen(req, timeout=5) as r:
         assert r.status == 200, f"purge-with-body status {r.status}"
         assert json.loads(r.read())["purged"] == 1
@@ -10720,6 +10838,7 @@ def main() -> int:
             ng.write_config()
             ng.config_test()
             ng.start()
+            _instrument(origin)   # DIAG: socket-flake attribution
             run_all(ng, origin, redis, redis_auth, redis_tls, mc)
             time.sleep(0.2)
             ng.stop()
