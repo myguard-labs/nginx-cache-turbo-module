@@ -28,7 +28,7 @@ permissions:
 jobs:
   scanners:
     name: Security scanners
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","builder02","lxc"]') || 'ubuntu-24.04' }}
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02","lxc"]') }}
     timeout-minutes: 20
     steps:
       - name: Checkout module
@@ -50,6 +50,11 @@ jobs:
             pip3 install --quiet --user --break-system-packages semgrep
             echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           fi
+      - name: Restore build caches
+        uses: ./.github/actions/build-cache
+        with:
+          mode: module
+          nginx-version: ${{ env.NGINX_VERSION }}
       - name: Configure nginx src tree (clang-tidy headers)
         run: |
           set -euo pipefail

@@ -1,0 +1,98 @@
+name: Build cache
+description: >-
+  Restore the ccache + upstream-tarball caches for one build. Hybrid by design:
+  on a PERSISTENT self-hosted runner ~/.cache/ccache and the tarball are already
+  warm on disk and this is nearly a no-op; on an ephemeral or hosted runner
+  actions/cache repopulates them. Keep both paths -- see "Why hybrid" below.
+
+inputs:
+  mode:
+    description: "Build mode (debug | nginx | asan | module | coverage). Namespaces the ccache key."
+    required: true
+  nginx-version:
+    description: "upstream version, e.g. 1.31.1 (nginx) or 1.12.0 (angie)"
+    required: true
+  flavor:
+    description: "nginx (default) | angie -- MUST match the ci-build.sh arg."
+    required: false
+    default: "nginx"
+  ccache:
+    description: >-
+      "true" (default) caches + installs ccache. Set "false" for the CodeQL job:
+      its build tracer must see every real compiler invocation, and a ccache hit
+      serves an object without running cc -> "no source seen during build".
+    required: false
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    # Why hybrid:
+    #   The builder02 runners are persistent incus containers today, so
+    #   ~/.cache/ccache survives between jobs on disk -- the fastest possible
+    #   cache, no upload/download at all. But that is a property of the CURRENT
+    #   runner topology, not a guarantee: an ephemeral conversion is possible,
+    #   and hosted runners (codeql.yml, fork PRs) never had it. actions/cache is
+    #   therefore the FALLBACK, not the primary: on a warm persistent runner it
+    #   costs one cheap key lookup; on an ephemeral/hosted one it is the only
+    #   thing between you and a cold build every job.
+    #
+    # No build-tree cache here, on purpose. ci-build.sh writes EVERY mode into
+    # the SAME tree path (.build/<flavor>-<version>); debug/asan/module objects
+    # are not interchangeable, so caching that shared tree would risk handing a
+    # sanitizer job a debug (non-instrumented) core -> a green ASan job that
+    # checks nothing. ccache gives the compile win WITHOUT that hazard: it is
+    # keyed by CONTENT (CCACHE_COMPILERCHECK=content in ci-build.sh), so an asan
+    # object and a debug object have different hashes and never collide. A stale
+    # ccache can only ever MISS, never serve a wrong object.
+    #
+    # BEFORE YOU "FIX" A CACHE MISS ON A PR -- read this.
+    #   GitHub scopes caches BY REF. A PR run writes to refs/pull/N/merge, an
+    #   isolated scope; only caches on the DEFAULT branch are inherited by other
+    #   refs. So the FIRST run of a new PR always misses until main has populated
+    #   a scope. That is correct and expected, not a broken cache.
+
+    # github.sha is deliberately in the primary key even though it can never hit
+    # on the run that writes it: actions/cache only SAVES when the primary key
+    # missed, so a stable primary key would freeze the cache at its first
+    # contents. A per-commit primary + a restore-keys ladder is the documented
+    # way to get a rolling cache that folds in newly-compiled objects.
+    - name: Restore ccache
+      if: inputs.ccache == 'true'
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      with:
+        path: ~/.cache/ccache
+        key: ccache-${{ runner.os }}-${{ inputs.mode }}-${{ inputs.flavor }}-${{ inputs.nginx-version }}-${{ github.sha }}
+        restore-keys: |
+          ccache-${{ runner.os }}-${{ inputs.mode }}-${{ inputs.flavor }}-${{ inputs.nginx-version }}-
+          ccache-${{ runner.os }}-${{ inputs.mode }}-${{ inputs.flavor }}-
+
+    # The upstream tarball never changes for a given version -- key on version
+    # alone, no restore-keys ladder (a "close" tarball is the wrong tarball).
+    # ci-build.sh skips the download when this file is already present.
+    - name: Cache source tarball
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      with:
+        path: .build/${{ inputs.flavor }}-${{ inputs.nginx-version }}.tar.gz
+        key: src-${{ inputs.flavor }}-${{ inputs.nginx-version }}
+
+    - name: Ensure ccache, mold and eatmydata are present
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Present on the builder02 runners already; installed only on a hosted
+        # runner (codeql.yml, fork PRs). Cheap to check, and it keeps the
+        # workflows portable to a fresh runner image.
+        need=()
+        if [ "${{ inputs.ccache }}" = "true" ]; then
+          command -v ccache >/dev/null || need+=(ccache)
+        fi
+        command -v mold      >/dev/null || need+=(mold)
+        command -v eatmydata >/dev/null || need+=(eatmydata)
+        if [ ${#need[@]} -gt 0 ]; then
+          sudo apt-get update
+          sudo apt-get install -y "${need[@]}"
+        fi
+        if [ "${{ inputs.ccache }}" = "true" ]; then
+          ccache --version | head -1
+        fi

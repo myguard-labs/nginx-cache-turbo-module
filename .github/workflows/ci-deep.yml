@@ -52,7 +52,7 @@ permissions:
 jobs:
   fuzz:
     name: Fuzz (all targets, long)
-    runs-on: [self-hosted, builder02, lxc]
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02","lxc"]') }}
     timeout-minutes: 600
     steps:
       - name: Checkout module
@@ -81,6 +81,12 @@ jobs:
             exit 2
           fi
           printf 'FUZZ_SECS=%s\n' "$FUZZ_SECONDS_INPUT" >> "$GITHUB_ENV"
+
+      - name: Restore build caches
+        uses: ./.github/actions/build-cache
+        with:
+          mode: debug
+          nginx-version: ${{ env.NGINX_VERSION }}
 
       - name: Build fuzz targets
         run: bash ci/fuzz/build.sh "$GITHUB_WORKSPACE/ci/fuzz"
@@ -153,7 +159,7 @@ jobs:
     # 2026-07-21: the ABI branch changes rarely, so nightly coverage is enough
     # and it no longer sits on the per-PR critical path.
     name: Legacy nginx (pre-1.23) runtime
-    runs-on: [self-hosted, builder02, lxc]
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02","lxc"]') }}
     timeout-minutes: 20
     env:
       LEGACY_NGINX_VERSION: "1.22.1"
@@ -167,6 +173,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential ccache curl eatmydata libpcre2-dev libssl-dev mold redis-server memcached zlib1g-dev
+
+      - name: Restore build caches
+        uses: ./.github/actions/build-cache
+        with:
+          mode: debug
+          nginx-version: ${{ env.LEGACY_NGINX_VERSION }}
 
       - name: Build module against legacy nginx
         run: bash ci/tools/ci-build.sh nginx "$LEGACY_NGINX_VERSION" debug
@@ -209,7 +221,7 @@ jobs:
     # pass already covers per-PR clang static analysis — so this deeper full-source
     # pass runs nightly rather than duplicating clang work on every PR.
     name: Clang static analyzer
-    runs-on: [self-hosted, builder02, lxc]
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02","lxc"]') }}
     timeout-minutes: 30
     steps:
       - name: Checkout module
@@ -221,6 +233,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential ccache clang curl eatmydata libpcre2-dev libssl-dev mold zlib1g-dev
+
+      - name: Restore build caches
+        uses: ./.github/actions/build-cache
+        with:
+          mode: module
+          nginx-version: ${{ env.NGINX_VERSION }}
 
       - name: Clang --analyze every source
         run: |
@@ -257,7 +275,7 @@ jobs:
 
   memcheck:
     name: Valgrind Memcheck soak
-    runs-on: [self-hosted, builder02, lxc]
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02","lxc"]') }}
     timeout-minutes: 240
     steps:
       - name: Checkout module
@@ -270,6 +288,11 @@ jobs:
           sudo apt-get install -y \
             build-essential ccache curl eatmydata libpcre2-dev libssl-dev mold pkg-config \
             valgrind zlib1g-dev
+      - name: Restore build caches
+        uses: ./.github/actions/build-cache
+        with:
+          mode: debug
+          nginx-version: ${{ env.NGINX_VERSION }}
       - name: Build debug nginx + cache-turbo module
         run: bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" debug
       - name: Memcheck soak (600s @ 4 conc, WITH suppressions)
@@ -293,7 +316,7 @@ jobs:
 
   helgrind:
     name: Valgrind Helgrind soak
-    runs-on: [self-hosted, builder02, lxc]
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02","lxc"]') }}
     timeout-minutes: 240
     steps:
       - name: Checkout module
@@ -306,6 +329,11 @@ jobs:
           sudo apt-get install -y \
             build-essential ccache curl eatmydata libpcre2-dev libssl-dev mold pkg-config \
             valgrind zlib1g-dev
+      - name: Restore build caches
+        uses: ./.github/actions/build-cache
+        with:
+          mode: debug
+          nginx-version: ${{ env.NGINX_VERSION }}
       - name: Build debug nginx + cache-turbo module
         run: bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" debug
       - name: Helgrind soak (600s @ 4 conc, --error-exitcode=99, WITH suppressions)
@@ -338,7 +366,7 @@ jobs:
     # not a merge gate. Builds its own ASan binary (ci-deep jobs are
     # self-contained; no cross-workflow artifact reuse).
     name: ASan multi-worker soak (flake repetition)
-    runs-on: [self-hosted, builder02, lxc]
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02","lxc"]') }}
     timeout-minutes: 60
     steps:
       - name: Checkout module
@@ -350,6 +378,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential ccache curl eatmydata libpcre2-dev libssl-dev mold redis-server memcached zlib1g-dev
+
+      - name: Restore build caches
+        uses: ./.github/actions/build-cache
+        with:
+          mode: asan
+          nginx-version: ${{ env.NGINX_VERSION }}
 
       - name: Build with sanitizers
         run: bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" asan
@@ -400,7 +434,7 @@ jobs:
 
   scanners:
     name: Security scanners
-    runs-on: [self-hosted, builder02, lxc]
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02","lxc"]') }}
     timeout-minutes: 20
     steps:
       - name: Checkout module
@@ -422,6 +456,11 @@ jobs:
             pip3 install --quiet --user --break-system-packages semgrep
             echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           fi
+      - name: Restore build caches
+        uses: ./.github/actions/build-cache
+        with:
+          mode: module
+          nginx-version: ${{ env.NGINX_VERSION }}
       - name: Configure nginx src tree (clang-tidy headers)
         run: |
           set -euo pipefail

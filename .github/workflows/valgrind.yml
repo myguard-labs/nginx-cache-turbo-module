@@ -28,7 +28,7 @@ permissions:
 jobs:
   memcheck-lite:
     name: Memcheck lite (60s soak)
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","builder02","lxc"]') || 'ubuntu-24.04' }}
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02","lxc"]') }}
     timeout-minutes: 45
     steps:
       - name: Checkout module
@@ -42,6 +42,12 @@ jobs:
           sudo apt-get install -y \
             build-essential ccache curl eatmydata libpcre2-dev libssl-dev mold pkg-config \
             valgrind zlib1g-dev
+
+      - name: Restore build caches
+        uses: ./.github/actions/build-cache
+        with:
+          mode: debug
+          nginx-version: ${{ env.NGINX_VERSION }}
 
       - name: Build debug nginx + cache-turbo module
         run: bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" debug

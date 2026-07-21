@@ -62,6 +62,13 @@ fi
 CC="${CC:-cc}"
 if command -v ccache >/dev/null 2>&1; then
     WITH_CC="ccache $CC"
+    # Key ccache objects by compiler CONTENT, not mtime/size. Without this a
+    # cache restored onto a different runner (or after a toolchain reinstall
+    # that changed the compiler mtime) is treated as stale and wholesale-missed;
+    # content hashing makes the cross-run/cross-runner ~/.cache/ccache that the
+    # build-cache action persists actually reusable. Safe: a content mismatch
+    # only ever MISSES, never serves a wrong object.
+    export CCACHE_COMPILERCHECK=content
 else
     WITH_CC="$CC"
 fi
