@@ -84,6 +84,10 @@ static ngx_connection_t *
     ngx_http_cache_turbo_mc_ka_get(ngx_addr_t *addr);
 static ngx_uint_t
     ngx_http_cache_turbo_mc_ka_save(ngx_http_cache_turbo_mc_op_t *op);
+static void ngx_http_cache_turbo_mc_ka_drop(
+    ngx_http_cache_turbo_memcached_ka_item_t *item);
+static void ngx_http_cache_turbo_mc_ka_close_handler(ngx_event_t *ev);
+static void ngx_http_cache_turbo_mc_ka_dummy_handler(ngx_event_t *ev);
 
 
 /* Global memcached keepalive pool. */
@@ -218,14 +222,75 @@ ngx_http_cache_turbo_mc_ka_save(ngx_http_cache_turbo_mc_op_t *op)
     b->count++;
     item->connection = c;
 
-    c->idle = 1;
-    c->read->handler = NULL;
-    c->write->handler = NULL;
+    if (c->write->timer_set) {
+        ngx_del_timer(c->write);
+    }
+    if (c->read->timer_set) {
+        ngx_del_timer(c->read);
+    }
+
     b->timeout = clcf->memcached_keepalive_timeout
                      ? clcf->memcached_keepalive_timeout : 60000;
+
+    /* An idle pooled connection must carry a close-on-readable handler: when the
+     * memcached server drops the idle conn (FIN/RST) or sends unsolicited data,
+     * epoll wakes c->read and the handler drops the pooled slot. Leaving the
+     * handlers NULL (as this driver used to) meant that wakeup dereferenced a
+     * NULL c->read->handler -> worker SIGSEGV. Mirrors the Redis driver. */
+    c->data = item;
+    c->idle = 1;                           /* core closes on worker shutdown */
+    c->read->handler = ngx_http_cache_turbo_mc_ka_close_handler;
+    c->write->handler = ngx_http_cache_turbo_mc_ka_dummy_handler;
+
+    if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
+        ngx_http_cache_turbo_mc_ka_drop(item);
+        return 1;                          /* drop closed it; do not double-close */
+    }
+
     ngx_add_timer(c->read, b->timeout);
 
     return 1;
+}
+
+
+/* Remove a pooled connection from its bucket, close it, and return the item to
+ * the free list. Safe to call from the close handler or the read-event guard. */
+static void
+ngx_http_cache_turbo_mc_ka_drop(ngx_http_cache_turbo_memcached_ka_item_t *item)
+{
+    ngx_connection_t                           *c = item->connection;
+    ngx_http_cache_turbo_memcached_ka_bucket_t *b = item->bucket;
+
+    ngx_queue_remove(&item->queue);
+    ngx_queue_insert_head(&b->free, &item->queue);
+    b->count--;
+    item->connection = NULL;
+
+    if (c) {
+        ngx_close_connection(c);
+    }
+}
+
+
+/* Idle pooled connection became readable (peer closed or sent unsolicited data)
+ * or the idle timer fired: drop it. */
+static void
+ngx_http_cache_turbo_mc_ka_close_handler(ngx_event_t *ev)
+{
+    ngx_connection_t                           *c = ev->data;
+    ngx_http_cache_turbo_memcached_ka_item_t   *item = c->data;
+
+    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, c->log, 0,
+                   "cache_turbo: memcached pooled conn fd:%d dropped (%s)",
+                   c->fd, ev->timedout ? "idle timeout" : "peer event");
+    ngx_http_cache_turbo_mc_ka_drop(item);
+}
+
+
+static void
+ngx_http_cache_turbo_mc_ka_dummy_handler(ngx_event_t *ev)
+{
+    /* An idle pooled connection should never get a write event; ignore it. */
 }
 
 
@@ -243,6 +308,13 @@ ngx_http_cache_turbo_mc_connect(ngx_http_cache_turbo_mc_op_t *op,
     c = ngx_http_cache_turbo_mc_ka_get(addr);
     if (c != NULL) {
         op->peer.connection = c;
+        /* Populate the peer address on the reuse path too: op_done -> ka_save
+         * reads op->peer.name/sockaddr to re-pool this connection. On a pooled
+         * reuse these were never set (only the fresh-connect branch below did),
+         * so ka_save dereferenced a NULL op->peer.name -> worker SIGSEGV. */
+        op->peer.sockaddr = addr->sockaddr;
+        op->peer.socklen = addr->socklen;
+        op->peer.name = &addr->name;
         c->data = op;
         op->read_handler = read_handler;
         c->write->handler = ngx_http_cache_turbo_mc_write;

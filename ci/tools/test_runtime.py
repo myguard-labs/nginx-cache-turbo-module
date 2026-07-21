@@ -1016,6 +1016,18 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # L2 memcached with a keepalive pool (D-O1): idle pooled conns must carry
+        # a close-on-readable handler. When the memcached server drops an idle
+        # pooled conn, epoll wakes c->read; a NULL handler there SIGSEGVs the
+        # worker. Exercised by test_mc_keepalive_server_close_survives.
+        location /mcka/ {{
+            cache_turbo            main;
+            cache_turbo_key        $uri;
+            cache_turbo_valid      30s;
+            cache_turbo_memcached  127.0.0.1:{memcached_port} prefix=mck: timeout=250ms keepalive=4 keepalive_timeout=30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # memcached-backed admin: a single-key purge here must also delete the
         # entry from memcached (not just drop L1).
         location = /_cache_mc {{
@@ -10654,6 +10666,63 @@ def test_l2_backend_inheritance_child_redis_over_parent_memcached(
         "parent store leaked into Redis (backend identity crossed)"
 
 
+def test_mc_keepalive_server_close_survives(ng: Nginx, origin: Origin,
+                                            mc: MemcachedServer) -> None:
+    """D-O1: an idle memcached keepalive connection whose server drops it must
+    NOT crash the worker.
+
+    The /mcka/ location runs the memcached L2 backend with a keepalive pool.
+    After a write-through SET the driver parks the connection idle in the pool.
+    When the memcached server then closes that idle connection, epoll wakes
+    c->read; the pooled slot must carry a close-on-readable handler that drops
+    it. The driver used to leave c->read->handler == NULL there, so the wakeup
+    dereferenced NULL and SIGSEGV'd the worker. We detect a crash by watching
+    the worker PID set: a segfaulting worker is replaced by the master, so the
+    set changes; a healthy worker keeps its PID and keeps serving the L1 hit.
+
+    Multi-worker mode only (single_process has no worker to lose + no PID set).
+    """
+    if ng.single_process:
+        return
+
+    uri = "/mcka/keepme"
+    key = l2_key(uri, prefix="mck:")
+    mc.command(b"delete " + key.encode() + b"\r\n")
+
+    # Miss -> origin -> L1 + write-through SET. The SET op pools its connection
+    # idle when it finishes (op_done -> ka_save).
+    s, body, h = fetch(ng.port, uri)
+    assert s == 200 and "x-cache" not in h, "prime should miss to origin"
+    assert wait_for(lambda: mc.exists(key)), \
+        "write-through never reached memcached (no conn to pool)"
+
+    workers_before = ng.worker_pids()
+    assert workers_before, "expected at least one worker in multi-process mode"
+
+    # Server drops every connection, including the idle pooled one. This is what
+    # wakes the pooled conn's read event on the worker.
+    mc.stop()
+
+    # Give epoll a moment to deliver the readable/closed event to the worker and
+    # run its handler. On the unpatched (NULL-handler) driver the worker would
+    # SIGSEGV here and the master would fork a replacement with a new PID.
+    deadline = time.time() + 2.0
+    while time.time() < deadline:
+        if ng.worker_pids() != workers_before:
+            break
+        time.sleep(0.05)
+
+    assert ng.worker_pids() == workers_before, (
+        "worker PID set changed after the memcached server dropped an idle "
+        "pooled connection -- a worker crashed (D-O1 NULL close handler)")
+
+    # And the worker is still healthy: the already-cached object still serves
+    # from L1 without the (now dead) memcached backend.
+    s2, body2, h2 = fetch(ng.port, uri)
+    assert s2 == 200 and h2.get("x-cache") == "HIT" and body2 == body, \
+        "worker no longer serves the L1 hit after the pooled-conn close event"
+
+
 def run_all(ng: Nginx, origin: Origin,
             redis: RedisServer | None = None,
             redis_auth: RedisServer | None = None,
@@ -10911,6 +10980,8 @@ def run_all(ng: Nginx, origin: Origin,
             # child redis over parent memcached — precedence regression lock
             test_l2_backend_inheritance_child_redis_over_parent_memcached(
                 ng, origin, redis, mc)
+        # D-O1 idle-pool close: MUST be last mc test — it stops the mc server.
+        test_mc_keepalive_server_close_survives(ng, origin, mc)
     # PERF-7 zero-copy serve stress: run LAST among L1 tests — its 48-thread /
     # 4000-request eviction churn keeps the workers busy, so placing it before a
     # timing-sensitive test (e.g. stale-if-error's ~0.8s bg-refresh window) can
