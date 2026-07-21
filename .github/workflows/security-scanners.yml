@@ -38,8 +38,8 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential curl flawfinder clang-tidy \
-            libpcre2-dev libssl-dev python3 python3-pip pipx zlib1g-dev
+          sudo apt-get install -y build-essential ccache curl eatmydata flawfinder clang-tidy \
+            libpcre2-dev libssl-dev mold python3 python3-pip pipx zlib1g-dev
           # semgrep: isolate via pipx (PEP 668 blocks a bare pip3 install into the
           # system Python on the Ubuntu 24.04 self-hosted runner). Fall back to a
           # user pip install with --break-system-packages if pipx is unavailable.

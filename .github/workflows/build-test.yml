@@ -95,7 +95,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential clang curl libpcre2-dev libssl-dev zlib1g-dev
+          sudo apt-get install -y build-essential ccache clang curl eatmydata libpcre2-dev libssl-dev mold zlib1g-dev
 
       # CI-6: full-cache the .build tree (tarball + extracted + configured nginx
       # source). ci-build.sh skips download/extract/configure on a cache hit and
@@ -105,6 +105,12 @@ jobs:
         with:
           path: .build
           key: nginx-build-${{ env.NGINX_VERSION }}-${{ runner.os }}
+          # Fall back to any earlier .build tree for this OS when the exact
+          # version key misses (e.g. an NGINX_VERSION bump): ci-build.sh still
+          # re-downloads/extracts the new version but the partial tree seeds it.
+          restore-keys: |
+            nginx-build-${{ env.NGINX_VERSION }}-
+            nginx-build-
 
       - name: Build server and dynamic module
         run: |
