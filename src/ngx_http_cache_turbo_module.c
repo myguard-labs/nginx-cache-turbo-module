@@ -6581,36 +6581,83 @@ ngx_http_cache_turbo(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
  */
 /* Backend name -> preset bit. One row per preset; adding a backend is a row here
  * and a row in the registry, nothing else. Order is the order shown in the
- * "unknown backend" diagnostic. */
+ * "unknown backend" diagnostic.
+ *
+ * `implies` names other preset bits that this backend REQUIRES to be safe — an
+ * add-on that layers dynamic surfaces on top of another CMS without repeating
+ * that CMS's own login/admin rules. `woocommerce` is the type case: its rows add
+ * only cart/checkout/account cookies and URIs and ship NO /wp-admin/ rule and NO
+ * wordpress_logged_in_ cookie rule, because it IS WordPress and those belong to
+ * the wordpress preset. `cache_turbo_backend woocommerce;` used alone therefore
+ * leaves /wp-admin/ cacheable and — on a store whose account page is at a
+ * translated slug the woo uris[] cannot know — caches a logged-in customer's
+ * account page (no woo cookie on an empty cart, no wordpress preset to catch the
+ * login cookie). The implication is resolved to a fixpoint at parse time
+ * (ngx_http_cache_turbo_backend), so naming the add-on silently enables the base
+ * too; auto_skip then fires the base's rules unchanged. 0 = no implication. */
 static const struct {
     const char  *name;
     ngx_uint_t   bit;
+    ngx_uint_t   implies;
 } ngx_http_cache_turbo_backend_names[] = {
-    { "wordpress",   NGX_HTTP_CACHE_TURBO_BACKEND_WORDPRESS   },
-    { "woocommerce", NGX_HTTP_CACHE_TURBO_BACKEND_WOOCOMMERCE },
-    { "joomla",      NGX_HTTP_CACHE_TURBO_BACKEND_JOOMLA      },
-    { "xenforo",     NGX_HTTP_CACHE_TURBO_BACKEND_XENFORO     },
-    { "discourse",   NGX_HTTP_CACHE_TURBO_BACKEND_DISCOURSE   },
-    { "phpbb",       NGX_HTTP_CACHE_TURBO_BACKEND_PHPBB       },
-    { "drupal",      NGX_HTTP_CACHE_TURBO_BACKEND_DRUPAL      },
-    { "mediawiki",   NGX_HTTP_CACHE_TURBO_BACKEND_MEDIAWIKI   },
-    { "magento",     NGX_HTTP_CACHE_TURBO_BACKEND_MAGENTO     },
-    { "ghost",       NGX_HTTP_CACHE_TURBO_BACKEND_GHOST       },
-    { "wagtail",     NGX_HTTP_CACHE_TURBO_BACKEND_WAGTAIL     },
-    { "kirby",       NGX_HTTP_CACHE_TURBO_BACKEND_KIRBY       },
-    { "shopware6",   NGX_HTTP_CACHE_TURBO_BACKEND_SHOPWARE6   },
-    { "typo3",       NGX_HTTP_CACHE_TURBO_BACKEND_TYPO3       },
-    { "invision",    NGX_HTTP_CACHE_TURBO_BACKEND_INVISION    },
-    { "smf",         NGX_HTTP_CACHE_TURBO_BACKEND_SMF         },
-    { "vanilla",     NGX_HTTP_CACHE_TURBO_BACKEND_VANILLA     },
-    { "punbb",       NGX_HTTP_CACHE_TURBO_BACKEND_PUNBB       },
-    { "phorum",      NGX_HTTP_CACHE_TURBO_BACKEND_PHORUM      },
-    { "yabb",        NGX_HTTP_CACHE_TURBO_BACKEND_YABB        },
-    { "mybb",        NGX_HTTP_CACHE_TURBO_BACKEND_MYBB        },
-    { "vbulletin",   NGX_HTTP_CACHE_TURBO_BACKEND_VBULLETIN   },
-    { "none",        NGX_HTTP_CACHE_TURBO_BACKEND_NONE        },
-    { NULL,          0                                        }
+    { "wordpress",   NGX_HTTP_CACHE_TURBO_BACKEND_WORDPRESS,   0 },
+    { "woocommerce", NGX_HTTP_CACHE_TURBO_BACKEND_WOOCOMMERCE,
+      NGX_HTTP_CACHE_TURBO_BACKEND_WORDPRESS },
+    { "joomla",      NGX_HTTP_CACHE_TURBO_BACKEND_JOOMLA,      0 },
+    { "xenforo",     NGX_HTTP_CACHE_TURBO_BACKEND_XENFORO,     0 },
+    { "discourse",   NGX_HTTP_CACHE_TURBO_BACKEND_DISCOURSE,   0 },
+    { "phpbb",       NGX_HTTP_CACHE_TURBO_BACKEND_PHPBB,       0 },
+    { "drupal",      NGX_HTTP_CACHE_TURBO_BACKEND_DRUPAL,      0 },
+    { "mediawiki",   NGX_HTTP_CACHE_TURBO_BACKEND_MEDIAWIKI,   0 },
+    { "magento",     NGX_HTTP_CACHE_TURBO_BACKEND_MAGENTO,     0 },
+    { "ghost",       NGX_HTTP_CACHE_TURBO_BACKEND_GHOST,       0 },
+    { "wagtail",     NGX_HTTP_CACHE_TURBO_BACKEND_WAGTAIL,     0 },
+    { "kirby",       NGX_HTTP_CACHE_TURBO_BACKEND_KIRBY,       0 },
+    { "shopware6",   NGX_HTTP_CACHE_TURBO_BACKEND_SHOPWARE6,   0 },
+    { "typo3",       NGX_HTTP_CACHE_TURBO_BACKEND_TYPO3,       0 },
+    { "invision",    NGX_HTTP_CACHE_TURBO_BACKEND_INVISION,    0 },
+    { "smf",         NGX_HTTP_CACHE_TURBO_BACKEND_SMF,         0 },
+    { "vanilla",     NGX_HTTP_CACHE_TURBO_BACKEND_VANILLA,     0 },
+    { "punbb",       NGX_HTTP_CACHE_TURBO_BACKEND_PUNBB,       0 },
+    { "phorum",      NGX_HTTP_CACHE_TURBO_BACKEND_PHORUM,      0 },
+    { "yabb",        NGX_HTTP_CACHE_TURBO_BACKEND_YABB,        0 },
+    { "mybb",        NGX_HTTP_CACHE_TURBO_BACKEND_MYBB,        0 },
+    { "vbulletin",   NGX_HTTP_CACHE_TURBO_BACKEND_VBULLETIN,   0 },
+    { "none",        NGX_HTTP_CACHE_TURBO_BACKEND_NONE,        0 },
+    { NULL,          0,                                        0 }
 };
+
+
+/* Expand every implied backend bit into `mask` to a fixpoint. An add-on preset
+ * (woocommerce -> wordpress) is unsafe without its base, so naming it must
+ * enable the base too. The loop repeats until a pass adds nothing, so a chain
+ * (a -> b -> c) resolves fully however the table is ordered; the table is small
+ * and implications are shallow, so the cost is negligible. Returns the expanded
+ * mask. */
+static ngx_uint_t
+ngx_http_cache_turbo_expand_implies(ngx_uint_t mask)
+{
+    ngx_uint_t  i, added;
+
+    do {
+        added = 0;
+
+        for (i = 0; ngx_http_cache_turbo_backend_names[i].name; i++) {
+            if ((mask & ngx_http_cache_turbo_backend_names[i].bit)
+                && ngx_http_cache_turbo_backend_names[i].implies)
+            {
+                ngx_uint_t  imp = ngx_http_cache_turbo_backend_names[i].implies;
+
+                if ((mask & imp) != imp) {
+                    mask |= imp;
+                    added = 1;
+                }
+            }
+        }
+    } while (added);
+
+    return mask;
+}
 
 
 /* Resolve one backend name (already split off a token) to its bit. Returns 0 for
@@ -6773,6 +6820,13 @@ ngx_http_cache_turbo_backend(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             "inherited from the server block). Use it alone.");
         return NGX_CONF_ERROR;
     }
+
+    /* Resolve add-on implications (woocommerce -> wordpress) to a fixpoint. Done
+     * after the "none" exclusivity check so it operates on real backends only:
+     * "none" carries no implication and cannot appear alongside another backend
+     * here. Silent by design — an add-on that needed its base spelled out would
+     * be the same footgun cache_turbo_backend "auto" was removed for. */
+    mask = ngx_http_cache_turbo_expand_implies(mask);
 
     clcf->backend_presets |= mask;
 

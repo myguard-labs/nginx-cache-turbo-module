@@ -17,21 +17,27 @@ next visitor. Read the [gotchas](#gotchas) before going live.
 
 ## The short version
 
-WooCommerce is an **add-on** to WordPress, and so is its preset. Stack them:
+WooCommerce is an **add-on** to WordPress, and so is its preset. Naming it is
+enough — `woocommerce` **implies** `wordpress`:
 
 ```nginx
 cache_turbo         ct;
-cache_turbo_backend wordpress woocommerce;
+cache_turbo_backend woocommerce;
 ```
 
-Naming `woocommerce` alone would cache `/wp-admin/` — the WooCommerce preset only
-adds the shop surfaces, it does not repeat the WordPress ones. **Always stack.**
+The WooCommerce preset only adds the shop surfaces (`/cart`, `/checkout`, the
+cart cookies, `wc-ajax`); it does not repeat the WordPress ones. So naming it
+automatically enables the `wordpress` preset too, and `/wp-admin/` and
+`wordpress_logged_in_*` are skipped without you spelling `wordpress` out.
+Writing `cache_turbo_backend wordpress woocommerce;` is equivalent and still
+valid — the implication is idempotent — so existing stacked configs keep working.
 
-(This is one of the reasons the old `generic`/`auto` union was removed: it
-contained `woocommerce`, so it *looked* like a safe one-word default for a shop
-while quietly depending on you knowing it also had to contain `wordpress`. A
-default that is only correct if you already know which parts of it are wrong is
-not a default. Both spellings are now a config error that names the replacement.)
+(This implication is why the old `generic`/`auto` union was removed and not
+resurrected: `auto` *looked* like a safe one-word default but silently enabled
+NO rules on a Drupal or Joomla site. A per-preset implication is the honest
+version of the same convenience — it only adds the base an add-on genuinely
+depends on. Both `generic`/`auto` spellings remain a config error that names the
+replacement.)
 
 ## What the preset skips
 
@@ -41,7 +47,8 @@ not a default. Both spellings are now a config error that names the replacement.
 | Query args | `wc-ajax` |
 | Cookie header substrings | `woocommerce_items_in_cart`, `woocommerce_cart_hash`, `wp_woocommerce_session_` |
 
-Plus everything the `wordpress` preset skips, when stacked.
+Plus everything the `wordpress` preset skips — always, because `woocommerce`
+implies `wordpress`.
 
 ## The cart-cookie problem
 
@@ -203,9 +210,10 @@ about to be wrong for somebody.
 
 ## Gotchas
 
-- **Never name `woocommerce` alone.** It doesn't include the WordPress rules, so
-  `/wp-admin/` and `wordpress_logged_in_*` would be cacheable. Stack:
-  `cache_turbo_backend wordpress woocommerce;`.
+- **`woocommerce` implies `wordpress`.** Naming it alone enables the WordPress
+  rules too (resolved at config parse), so `/wp-admin/` and `wordpress_logged_in_*`
+  are skipped. `cache_turbo_backend woocommerce;` is safe; the explicit
+  `cache_turbo_backend wordpress woocommerce;` is equivalent.
 - **The URI prefixes are matched from the site root on a path-segment boundary.**
   `/cart` covers `/cart`, `/cart/`, and `/cart.html` — but NOT a different segment
   that merely shares the letters, such as `/cart-accessories/` (which caches
@@ -223,11 +231,12 @@ about to be wrong for somebody.
 
   **Do not treat the URI tier as the guard here.** It is a convenience for the
   default-locale majority. What holds on a translated store is the cookie tier
-  plus the stacked `wordpress` preset. That stacking is what makes this safe, and
-  this is the case that proves it is not optional: `cache_turbo_backend
-  woocommerce;` used **alone** on a translated store serves a logged-in customer
-  with an *empty* cart — no Woo cookie, no URI match, no `wordpress` preset — a
-  cached `/mein-konto`.
+  plus the implied `wordpress` preset. That implication is what makes this safe:
+  before it existed, `cache_turbo_backend woocommerce;` used **alone** on a
+  translated store served a logged-in customer with an *empty* cart — no Woo
+  cookie, no URI match, no `wordpress` preset — a cached `/mein-konto`. Naming
+  `woocommerce` now enables the WordPress login-cookie rule automatically, so that
+  request is caught by the login cookie even when the locale slug is not.
 
   Locale slugs are deliberately not enumerated in the preset (the set is
   unbounded). Add your own:

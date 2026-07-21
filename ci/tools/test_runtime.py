@@ -1611,10 +1611,28 @@ http {{
         # NOTE the key includes the query string: ?wc-ajax= rides on an ORDINARY
         # page URL, so this location is exactly the "cacheable page that an AJAX
         # call is layered onto" shape the wc-ajax arg rule has to catch.
+        #
+        # `woocommerce` alone here ALSO implies `wordpress` (resolved at parse):
+        # the woo-cookie/arg rules are woo's own; the WP login-cookie skip and the
+        # /wp-admin/ URI skip come from the implied wordpress preset. Drives
+        # test_auto_backend_composition and test_woo_implies_wordpress_wp_admin.
         location /woo/ {{
             cache_turbo         main;
             cache_turbo_backend woocommerce;
             cache_turbo_key     $uri$is_args$args;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # woo-only location mounted at /wooshop/: proves the IMPLIED wordpress
+        # /wp-admin/ URI rule fires without `wordpress` being named. The prefix
+        # rebases /wooshop/wp-admin/* onto /wp-admin/* for the preset matcher, so
+        # a hit here would be the exact leak (cacheable wp-admin under woo-only).
+        location /wooshop/ {{
+            cache_turbo         main;
+            cache_turbo_backend woocommerce;
+            cache_turbo_backend_prefix /wooshop/;
+            cache_turbo_key     $uri;
             cache_turbo_valid   30s;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
@@ -3433,21 +3451,59 @@ def test_auto_classify_suppress_native_interaction(ng: Nginx, origin: Origin) ->
 
 
 def test_auto_backend_composition(ng: Nginx, origin: Origin) -> None:
-    """cache_turbo_backend composes only the named presets: a woocommerce-only
-    location skips on a woo session cookie but NOT on a wordpress login cookie
-    (which that preset does not know about), so the WP-cookie page still caches
-    — proving the presets are selective, not a blanket union."""
+    """cache_turbo_backend woocommerce IMPLIES wordpress: WooCommerce is an add-on
+    to WordPress that ships no /wp-admin/ or wordpress_logged_in_ rule of its own,
+    so naming it alone must silently enable the wordpress preset too. A woo session
+    cookie still skips (woo's own rule), a WP login cookie ALSO skips (the implied
+    wordpress rule — the cross-user leak the implication closes), and a page with
+    neither cookie still caches (the implication adds bypass rules, it does not
+    disable caching wholesale)."""
     woo = {"Cookie": "woocommerce_cart_hash=abc123"}
     _, _, hw1 = fetch(ng.port, "/woo/cartpage", headers=woo)
     _, _, hw2 = fetch(ng.port, "/woo/cartpage", headers=woo)
-    assert "x-cache" not in hw1 and "x-cache" not in hw2, \
-        "woo session cookie must skip on the woocommerce backend"
+    assert "x-cache" not in hw1, \
+        "woo session cookie must skip on the woocommerce backend (1st req)"
+    assert "x-cache" not in hw2, \
+        "woo session cookie must skip on the woocommerce backend (2nd req)"
 
+    # woocommerce implies wordpress: a WP login cookie MUST now skip on a
+    # woo-only location. Before the implication this cached a logged-in customer's
+    # page for every visitor.
     wp = {"Cookie": "wordpress_logged_in_x=1"}
-    fetch(ng.port, "/woo/wppage", headers=wp)
+    _, _, hp1 = fetch(ng.port, "/woo/wppage", headers=wp)
     _, _, hp2 = fetch(ng.port, "/woo/wppage", headers=wp)
+    assert "x-cache" not in hp1, \
+        f"woo implies wordpress: a WP login cookie must skip (1st req), got {hp1.get('x-cache')}"
+    assert "x-cache" not in hp2, \
+        f"woo implies wordpress: a WP login cookie must skip (2nd req), got {hp2.get('x-cache')}"
+
+    # An anonymous page (no woo, no wp cookie) still caches: the implication only
+    # adds bypass rules, it must not turn the whole location into pass-through.
+    fetch(ng.port, "/woo/anonpage")
+    _, _, ha2 = fetch(ng.port, "/woo/anonpage")
+    assert ha2.get("x-cache") == "HIT", \
+        f"woo implies wordpress: an anonymous page must still cache, got {ha2.get('x-cache')}"
+    drain_origin(origin)
+
+
+def test_woo_implies_wordpress_wp_admin(ng: Nginx, origin: Origin) -> None:
+    """The headline leak the implication closes: `cache_turbo_backend woocommerce`
+    alone must skip /wp-admin/, which is a wordpress URI rule woo does not carry.
+    /wooshop/ is woo-only with backend_prefix /wooshop/, so /wooshop/wp-admin/*
+    rebases to /wp-admin/* for the matcher. A HIT here is the leak."""
+    _, _, ha1 = fetch(ng.port, "/wooshop/wp-admin/index")
+    _, _, ha2 = fetch(ng.port, "/wooshop/wp-admin/index")
+    assert "x-cache" not in ha1, \
+        "woo implies wordpress: /wp-admin/ must skip under a woo-only backend (1st req)"
+    assert "x-cache" not in ha2, \
+        "woo implies wordpress: /wp-admin/ must skip under a woo-only backend (2nd req)"
+
+    # Control: an ordinary page under the same woo-only mount still caches, so the
+    # skip above is the /wp-admin/ rule firing, not the whole location bypassing.
+    fetch(ng.port, "/wooshop/shop/product")
+    _, _, hp2 = fetch(ng.port, "/wooshop/shop/product")
     assert hp2.get("x-cache") == "HIT", \
-        f"woo backend should ignore a WP cookie and cache, got {hp2.get('x-cache')}"
+        f"woo implies wordpress: an ordinary page must still cache, got {hp2.get('x-cache')}"
     drain_origin(origin)
 
 
@@ -10526,6 +10582,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_auto_classify(ng, origin)
     test_auto_classify_suppress_native_interaction(ng, origin)
     test_auto_backend_composition(ng, origin)
+    test_woo_implies_wordpress_wp_admin(ng, origin)
     test_woocommerce_wc_ajax(ng, origin)
     test_wordpress_search_and_preview(ng, origin)
     test_header_auth_rest_surfaces(ng, origin)

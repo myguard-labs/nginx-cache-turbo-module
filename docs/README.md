@@ -11,7 +11,7 @@ One page per `cache_turbo_backend` preset:
 | Preset | Guide | Protects logged-in users out of the box? |
 |---|---|---|
 | `wordpress` | [wordpress.md](wordpress.md) | ✅ yes (`wordpress_logged_in_*`) |
-| `woocommerce` | [woocommerce.md](woocommerce.md) | ✅ yes — **but must be stacked with `wordpress`** — plus `?wc-ajax=`, a cart fragment on *any* page URL |
+| `woocommerce` | [woocommerce.md](woocommerce.md) | ✅ yes — **implies `wordpress`** (naming it alone is safe) — plus `?wc-ajax=`, a cart fragment on *any* page URL |
 | `joomla` | [joomla.md](joomla.md) | ⚠️ **partial** (`joomla_remember_me_`) — a non-remember-me login is INVISIBLE (md5 session cookie); you must still add a `cache_turbo_bypass` **+ `cache_turbo_no_store`** |
 | `xenforo` | [xenforo.md](xenforo.md) | ⚠️ yes (`xf_session` + `xf_user` + `xf_session_admin`) — **stock XF has NO login-only cookie**; `xf_session` is guest-issued, so safety costs hit rate. Also bypasses `/api/` (REST, `XF-Api-Key` header) + `_xfToken`, and **value-keys** `xf_style_id`/`xf_style_variation`/`xf_language_id` |
 | `discourse` | [discourse.md](discourse.md) | ✅ yes (`_t`) — and the origin sends `no-store` anyway |
@@ -96,7 +96,10 @@ preset inherited from the `server` block for one `location`.
 > config error.** It used to mean `wordpress` + `woocommerce` + `joomla`, and it
 > was never a safe default: it never covered every backend (`auto` on a Drupal or
 > XenForo site enabled *nothing* for it), the `woocommerce` in it left
-> `/wp-admin/` cacheable unless you also knew to stack `wordpress`, and the
+> `/wp-admin/` cacheable unless you also knew to stack `wordpress` (an add-on
+> preset now **implies** its base — `woocommerce` alone enables `wordpress` — so
+> that specific footgun is fixed the honest way, per-preset rather than via a
+> blanket union), and the
 > `joomla` in it ships no cookie rule at all — so `auto` on a Joomla site *looked*
 > like it protected logged-in users and did not. A default that is only correct if
 > you already know which parts of it are wrong is a footgun with a friendly name.
