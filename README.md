@@ -5,7 +5,7 @@
 [![Fuzzing](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/fuzzing.yml/badge.svg)](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/fuzzing.yml)
 [![Valgrind](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/valgrind.yml/badge.svg)](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/valgrind.yml)
 [![CodeQL](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/codeql.yml/badge.svg)](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/codeql.yml)
-[![ASan](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/asan.yml/badge.svg)](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/asan.yml)
+[![A/UBSan](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/asan.yml/badge.svg)](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/asan.yml)
 [![CI Deep](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/ci-deep.yml/badge.svg)](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/ci-deep.yml)
 
 A built-in page cache for nginx. Think of it as a tiny Varnish that lives
