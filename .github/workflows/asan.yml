@@ -119,6 +119,10 @@ jobs:
         env:
           ASAN_OPTIONS: detect_leaks=0:halt_on_error=1:abort_on_error=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+          # Breadcrumb: the harness writes the running test here (see
+          # test_runtime.py _write_breadcrumb). On an R6b hang the guard copies
+          # it to hanging-test.txt so the backtrace is labelled with the culprit.
+          CT_TEST_BREADCRUMB: ${{ github.workspace }}/ci-hang-artifacts/current-test.txt
         # Wrapped in ci-hang-guard.sh: the single-process suite intermittently wedges
         # the nginx event loop on CI (R6b, never reproduced locally — memory issues.md).
         # If the suite runs past the soft timeout the guard captures a gdb all-thread

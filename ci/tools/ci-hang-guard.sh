@@ -78,6 +78,13 @@ while kill -0 "$CMD_PID" 2>/dev/null; do
     if [ "$elapsed" -ge "$SOFT" ] && [ "$captured" -eq 0 ]; then
         captured=1
         echo "ci-hang-guard: soft timeout ${SOFT}s hit — capturing nginx state" >&2
+        # Name the test that never finished: the Python harness writes the
+        # current test to CT_TEST_BREADCRUMB on enter and "DONE <test>" on exit,
+        # so on a hang this file holds the culprit (see test_runtime.py).
+        if [ -n "${CT_TEST_BREADCRUMB:-}" ] && [ -r "$CT_TEST_BREADCRUMB" ]; then
+            cp "$CT_TEST_BREADCRUMB" "$ARTDIR/hanging-test.txt" 2>/dev/null || true
+            echo "ci-hang-guard: current test = $(cat "$CT_TEST_BREADCRUMB")" >&2
+        fi
         pids=$(nginx_pids_under "$CMD_PID")
         [ -z "$pids" ] && echo "ci-hang-guard: no nginx under pid $CMD_PID" >&2
         roots=""
