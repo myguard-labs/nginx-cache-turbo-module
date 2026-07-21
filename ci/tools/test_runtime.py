@@ -8495,9 +8495,14 @@ def test_admin_prometheus(ng: Nginx) -> None:
     assert "text/plain" in ct and "0.0.4" in ct, f"bad content-type: {ct}"
     for line in ("# TYPE cache_turbo_hits_total counter",
                  "# TYPE cache_turbo_misses_total counter",
+                 "# TYPE cache_turbo_stale_serves_total counter",
+                 "# TYPE cache_turbo_refreshes_total counter",
+                 "# TYPE cache_turbo_evictions_total counter",
                  "# TYPE cache_turbo_l2_hits_total counter",
                  "# TYPE cache_turbo_l2_misses_total counter",
+                 "# TYPE cache_turbo_lock_waits_total counter",
                  "# TYPE cache_turbo_min_uses_skips_total counter",
+                 "# TYPE cache_turbo_l2_neg_skips_total counter",
                  "# TYPE cache_turbo_bypasses_total counter",
                  "# TYPE cache_turbo_regen_cost_ms gauge",
                  "# TYPE cache_turbo_autotuned_beta gauge"):
