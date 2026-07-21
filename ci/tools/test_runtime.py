@@ -441,6 +441,21 @@ class Origin:
                     except BrokenPipeError:
                         pass
                     return
+                if "ckecho" in self.path:
+                    # B-S4: echo the received Cookie header so a test can prove a
+                    # warm subrequest reaches the origin ANONYMOUSLY (with none of
+                    # the admin POST's inherited segment/identity cookies).
+                    ck = self.headers.get("Cookie") or "none"
+                    body = f"gen-{n} cookie=[{ck}]\n".encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    try:
+                        self.wfile.write(body)
+                    except BrokenPipeError:
+                        pass
+                    return
                 body = f"gen-{n}\n".encode()
                 self.send_response(200)
                 self.send_header("Content-Type",
@@ -8588,6 +8603,48 @@ def test_warm_no_url(ng: Nginx) -> None:
     assert "error" in json.loads(b), f"expected an error body, got {b!r}"
 
 
+def test_warm_strips_key_cookie(ng: Nginx, origin: Origin) -> None:
+    """B-S4: a warm subrequest fetches ANONYMOUSLY even when the admin POST
+    carries a segment/key cookie.
+
+    ngx_http_subrequest copies headers_in shallowly, so the warm sr inherits the
+    admin request's Cookie header. On a preset location (magento here) that would
+    (a) fold X-Magento-Vary into the cache key -> the warmed body lands under a
+    SEGMENTED key no cookieless visitor reaches (wasted warm), and (b) forward the
+    cookie upstream -> the origin returns that segment's private body. warm_one
+    now strips every Cookie from the sr, so both the key and the upstream request
+    are the cookieless anonymous variant.
+
+    Negative control: without the strip, (a) makes the cookieless GET below a MISS
+    (asserted HIT), and (b) leaks the cookie into the served body (asserted absent).
+    """
+    import json
+    uri = "/mg/ckecho-warm"
+    seg = {"Cookie": "X-Magento-Vary=deadbeefdeadbeefdeadbeefdeadbeef"}
+    base = origin.hits
+    s, b, _ = fetch(ng.port, f"/_cache?url={uri}", method="POST", headers=seg)
+    assert s == 200 and json.loads(b)["warmed"] == 1, f"warm status/body: {s} {b!r}"
+    assert wait_for(lambda: origin.hits == base + 1), \
+        "warm subrequest never reached origin"
+    time.sleep(0.2)                     # let the store settle
+    after = origin.hits
+
+    # (a) the cookieless anonymous lookup HITs the warmed entry -> key went anon.
+    s2, body2, h2 = fetch(ng.port, uri)          # no cookie
+    assert s2 == 200
+    assert h2.get("x-cache") == "HIT", \
+        ("warm keyed to the X-Magento-Vary segment, not the anonymous bucket a "
+         f"cookieless visitor looks up (X-Cache={h2.get('x-cache')})")
+    assert origin.hits == after, \
+        f"the anonymous GET hit origin instead of the warm entry ({origin.hits} vs {after})"
+
+    # (b) the served (warm-stored) body proves the origin saw NO cookie -> no leak.
+    assert "cookie=[none]" in body2, \
+        f"warm forwarded the operator cookie to origin (leak): {body2!r}"
+    assert "X-Magento-Vary" not in body2, \
+        f"warm leaked the segment cookie into the anonymous entry: {body2!r}"
+
+
 def test_l2_write_through(ng: Nginx, origin: Origin, redis: RedisServer) -> None:
     """P4: a store writes through to L2. After caching /l2/<k>, the blob is
     present in Redis under the expected key, carries a PX TTL, and contains the
@@ -10746,6 +10803,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_warm_populates(ng, origin)
     test_warm_multi(ng, origin)
     test_warm_no_url(ng)
+    test_warm_strips_key_cookie(ng, origin)
     test_stale_serves_stale(ng, origin)
     test_single_flight(ng, origin)
     test_cold_single_flight(ng, origin)
