@@ -53,6 +53,19 @@ if [ ! -d "$ROOT/$DIR" ]; then
     tar -xzf "$ROOT/${DIR}.tar.gz" -C "$ROOT"
 fi
 
+# ccache: cache object compiles across CI runs (50-80% compile cut on a warm
+# cache). Auto-detected on PATH so a local build without ccache still works.
+# nginx honors --with-cc; the base build uses the default `cc`, the asan/coverage
+# branches below set a clang-specific CC, so wrap whichever compiler is in play.
+# ASan/coverage flags are already in the compile hash (they live in --with-cc-opt),
+# so those branches get their own cache namespace for free — no manual split.
+CC="${CC:-cc}"
+if command -v ccache >/dev/null 2>&1; then
+    WITH_CC="ccache $CC"
+else
+    WITH_CC="$CC"
+fi
+
 CC_OPT="$TEST_OPT -DNGX_DEBUG_PALLOC=1 -g3 -O0 -fno-omit-frame-pointer -funwind-tables"
 LD_OPT=""
 ADD_MODULE="--add-dynamic-module=$MODULE_DIR"
@@ -108,10 +121,26 @@ case "$MODE" in
         ;;
 esac
 
+# mold: faster linker, auto-detected on PATH. Appended (never clobbering) so the
+# asan/coverage LD_OPT flags set in the case above are preserved. -fuse-ld=mold
+# is understood by both gcc and clang.
+if command -v mold >/dev/null 2>&1; then
+    LD_OPT="${LD_OPT:+$LD_OPT }-fuse-ld=mold"
+fi
+
+# eatmydata: drop fsync/fdatasync on the many small object + intermediate writes
+# make performs. Marginal but free; auto-detected so a local build without it is
+# unaffected. Wraps only the build (make), not configure — configure is I/O-light.
+MAKE="make"
+if command -v eatmydata >/dev/null 2>&1; then
+    MAKE="eatmydata make"
+fi
+
 cd "$ROOT/$DIR"
 ./configure \
     --with-compat \
     $WITH_DEBUG \
+    --with-cc="$WITH_CC" \
     --with-http_realip_module \
     --with-http_ssl_module \
     --without-http_rewrite_module \
@@ -120,11 +149,14 @@ cd "$ROOT/$DIR"
     "$ADD_MODULE"
 
 if [ "$MODE" != "asan" ]; then
-    make -j"$(nproc)" modules
+    # MAKE may be "eatmydata make" — must word-split.
+    # shellcheck disable=SC2086
+    $MAKE -j"$(nproc)" modules
 fi
 
 if [ "$MODE" != "module" ]; then
-    make -j"$(nproc)"
+    # shellcheck disable=SC2086
+    $MAKE -j"$(nproc)"
     printf 'binary=%s\n' "$ROOT/$DIR/objs/$BINARY"
 fi
 
