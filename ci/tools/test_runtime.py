@@ -5428,6 +5428,25 @@ def test_backend_none_is_exclusive(ng: Nginx) -> None:
         _config_rejects(ng, f"none-plus-{i}", _BACKEND_LINE,
                         f"cache_turbo_backend {spec};", "cannot be combined")
 
+    # Across SEPARATE directive lines in the same context. Each line passes the
+    # per-invocation check on its own, but the COMBINED result is still
+    # NONE|<preset>, which must still be rejected. Regression guard for A3
+    # (audit 2026-07-21): the exclusivity check used to look at only this one
+    # invocation's args and silently left NONE|WORDPRESS set. Without the fix
+    # nginx -t accepts these two-line configs and _config_rejects fails on its
+    # `returncode != 0` assert -- i.e. this loop is its own negative control.
+    # `woocommerce` implies `wordpress`, so ("woocommerce","none") also exercises
+    # the implies path folding into the combined mask.
+    for i, (a, b) in enumerate([("none", "wordpress"),
+                                ("wordpress", "none"),
+                                ("none", "mediawiki|drupal"),
+                                ("woocommerce", "none")]):
+        _config_rejects(
+            ng, f"none-2line-{i}", _BACKEND_LINE,
+            f"cache_turbo_backend {a};\n"
+            f"            cache_turbo_backend {b};",
+            "cannot be combined")
+
 
 def test_backend_none_overrides_inherited(ng: Nginx, origin: Origin) -> None:
     """`cache_turbo_backend none;` switches OFF a preset inherited from the
