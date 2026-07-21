@@ -8269,20 +8269,6 @@ ngx_http_cache_turbo_warm_one(ngx_http_request_t *r, ngx_str_t *uri,
         return NGX_ERROR;
     }
 
-    /* Mark the subrequest as truly detached. NGX_HTTP_SUBREQUEST_BACKGROUND
-     * bumps r->main->count but does NOT set r->background; without it the
-     * subrequest finalizes down the normal active-request path
-     * (ngx_http_finalize_request -> r->main->count-- + c->data = pr) which
-     * assumes the parent is still driving the connection. Our parent already
-     * served the stale body and closed, so the warm subrequest is an orphan
-     * holding the client connection: at graceful worker exit its socket is
-     * left open -> "open socket #N left in connection M" (the P1-splice
-     * shutdown flake). Setting sr->background routes finalize through
-     * ngx_http_finalize_connection() (ngx_http_request.c:2775), the detached
-     * completion path, exactly as nginx core's own SWR background_update does
-     * (ngx_http_upstream.c). */
-    sr->background = 1;
-
     /* Force a clean GET to the origin regardless of the admin request's method
      * (the admin POST is what triggered the warm). */
     sr->method = NGX_HTTP_GET;
