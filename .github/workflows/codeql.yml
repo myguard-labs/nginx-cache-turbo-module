@@ -53,6 +53,17 @@ jobs:
             paths-ignore:
               - .build/**
 
+      # ccache: false -- CodeQL's build tracer must see every compiler
+      # invocation; a ccache hit skips the compile and hides code from the
+      # database. This still caches the upstream tarball and ensures mold/
+      # eatmydata (link/IO-only, safe for tracing).
+      - name: Restore build caches
+        uses: ./.github/actions/build-cache
+        with:
+          mode: module
+          nginx-version: ${{ env.NGINX_VERSION }}
+          ccache: "false"
+
       - name: Build traced source
         run: bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" module
 
