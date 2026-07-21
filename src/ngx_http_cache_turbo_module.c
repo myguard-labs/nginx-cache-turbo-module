@@ -4881,10 +4881,15 @@ ngx_http_cache_turbo_cold_wait(ngx_http_request_t *r,
          * ngx_del_timer implicitly via its finalize, so a normal wake leaves
          * timer_set == 0 and the cleanup is a no-op. */
         cln = ngx_pool_cleanup_add(r->pool, 0);
-        if (cln != NULL) {
-            cln->handler = ngx_http_cache_turbo_cold_wait_cleanup;
-            cln->data = ctx;
+        if (cln == NULL) {
+            /* Never arm the timer without its teardown cancellation: under the
+             * memory exhaustion that makes this fail, a subsequent teardown is
+             * exactly when the orphaned-timer socket leak would bite. Fail
+             * closed (the access handler finalizes 500) instead. */
+            return NGX_ERROR;
         }
+        cln->handler = ngx_http_cache_turbo_cold_wait_cleanup;
+        cln->data = ctx;
     }
 
     ngx_add_timer(&ctx->cold_wait_ev, delay);
