@@ -42,6 +42,7 @@ static ngx_int_t ngx_http_cache_turbo_cold_wait(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_zone_t *z,
     ngx_http_cache_turbo_ctx_t *ctx);
 static void ngx_http_cache_turbo_cold_wait_timeout(ngx_event_t *ev);
+static void ngx_http_cache_turbo_cold_wait_cleanup(void *data);
 static void ngx_http_cache_turbo_cold_mark_winner(ngx_http_request_t *r,
     ngx_http_cache_turbo_ctx_t *ctx, ngx_http_cache_turbo_zone_t *z);
 static void ngx_http_cache_turbo_cold_cleanup(void *data);
@@ -4865,9 +4866,25 @@ ngx_http_cache_turbo_cold_wait(ngx_http_request_t *r,
     }
 
     if (ctx->cold_wait_ev.handler == NULL) {
+        ngx_pool_cleanup_t  *cln;
+
         ctx->cold_wait_ev.handler = ngx_http_cache_turbo_cold_wait_timeout;
         ctx->cold_wait_ev.data = r;
         ctx->cold_wait_ev.log = r->connection->log;
+
+        /* Cancel a still-pending poll timer at request teardown. Without this,
+         * a request torn down while parked here (client abort, or worker exit
+         * under cold-key churn) leaves cold_wait_ev armed on a freed r and the
+         * count++ below unbalanced -- the connection cannot close, surfacing as
+         * "open socket left in connection" at shutdown. Registered once, on the
+         * same one-shot path that first arms the timer; the timeout handler runs
+         * ngx_del_timer implicitly via its finalize, so a normal wake leaves
+         * timer_set == 0 and the cleanup is a no-op. */
+        cln = ngx_pool_cleanup_add(r->pool, 0);
+        if (cln != NULL) {
+            cln->handler = ngx_http_cache_turbo_cold_wait_cleanup;
+            cln->data = ctx;
+        }
     }
 
     ngx_add_timer(&ctx->cold_wait_ev, delay);
@@ -4895,6 +4912,24 @@ ngx_http_cache_turbo_cold_wait_timeout(ngx_event_t *ev)
     ngx_http_core_run_phases(r);
     ngx_http_run_posted_requests(c);
     ngx_http_finalize_request(r, NGX_DONE);
+}
+
+
+/* Pool cleanup: delete a still-armed cold-wait poll timer at request teardown.
+ * The timer's ev.data points at r; once the request pool is being destroyed that
+ * pointer is dangling, so a timer left in the event tree would fire the handler
+ * on freed memory. Deleting it here makes teardown safe on every path that
+ * bypasses the normal timer wake (worker exit under cold-key churn, connection
+ * reset). A normal wake already ran ngx_del_timer, so timer_set is 0 and this
+ * is a no-op. */
+static void
+ngx_http_cache_turbo_cold_wait_cleanup(void *data)
+{
+    ngx_http_cache_turbo_ctx_t  *ctx = data;
+
+    if (ctx->cold_wait_ev.timer_set) {
+        ngx_del_timer(&ctx->cold_wait_ev);
+    }
 }
 
 
