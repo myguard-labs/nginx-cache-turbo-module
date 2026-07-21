@@ -16,11 +16,22 @@ import sys
 # This script lives at ci/tools/; repo root is two levels up (ci/ -> root).
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 WORKFLOWS = ROOT / ".github" / "workflows"
-TRUST_SPLIT = (
-    "${{ (github.event_name != 'pull_request' || "
-    "github.event.pull_request.head.repo.full_name == github.repository) && "
-    "fromJSON('[\"self-hosted\",\"builder02\",\"lxc\"]') || 'ubuntu-24.04' }}"
-)
+# Approved trust splits: both send fork PRs to a GitHub-hosted runner and keep
+# same-repo PRs + pushes/dispatch on the self-hosted pool. The .fork form is the
+# org skeleton's (fork is null on non-pull_request events -> self-hosted); the
+# full_name form is the older equivalent. Either is safe; add a new form here
+# only if it preserves that fork->hosted / trusted->self-hosted split.
+TRUST_SPLITS = frozenset({
+    (
+        "${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || "
+        "fromJSON('[\"self-hosted\",\"builder02\",\"lxc\"]') }}"
+    ),
+    (
+        "${{ (github.event_name != 'pull_request' || "
+        "github.event.pull_request.head.repo.full_name == github.repository) && "
+        "fromJSON('[\"self-hosted\",\"builder02\",\"lxc\"]') || 'ubuntu-24.04' }}"
+    ),
+})
 HOSTED = re.compile(r"ubuntu-(?:latest|[0-9]+\.[0-9]+)")
 
 
@@ -37,7 +48,7 @@ def main() -> int:
             errors.append(f"{path.name}: pull_request workflow has no jobs")
             continue
         for runner in runners:
-            if runner == TRUST_SPLIT or HOSTED.fullmatch(runner):
+            if runner in TRUST_SPLITS or HOSTED.fullmatch(runner):
                 continue
             errors.append(
                 f"{path.name}: PR job runner must be GitHub-hosted or the "
