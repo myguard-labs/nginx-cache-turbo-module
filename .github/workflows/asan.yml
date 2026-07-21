@@ -29,17 +29,17 @@ on:
     branches: [main]
     paths:
       - "src/**"
-      - "tools/ci-build.sh"
-      - "tools/test_runtime.py"
-      - "tools/ci-hang-guard.sh"
+      - "ci/tools/ci-build.sh"
+      - "ci/tools/test_runtime.py"
+      - "ci/tools/ci-hang-guard.sh"
       - ".github/workflows/asan.yml"
   pull_request:
     branches: [main]
     paths:
       - "src/**"
-      - "tools/ci-build.sh"
-      - "tools/test_runtime.py"
-      - "tools/ci-hang-guard.sh"
+      - "ci/tools/ci-build.sh"
+      - "ci/tools/test_runtime.py"
+      - "ci/tools/ci-hang-guard.sh"
       - ".github/workflows/asan.yml"
   workflow_dispatch: {}
 
@@ -67,7 +67,7 @@ jobs:
           sudo apt-get install -y build-essential curl libpcre2-dev libssl-dev zlib1g-dev
 
       - name: Build with sanitizers
-        run: bash tools/ci-build.sh nginx "$NGINX_VERSION" asan
+        run: bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" asan
 
       - name: Stage artifact
         run: |
@@ -127,8 +127,8 @@ jobs:
         # the 30-min job timeout, well above the ~7-min healthy run.
         run: |
           chmod +x nginx-bin/nginx
-          bash tools/ci-hang-guard.sh 1200 "$GITHUB_WORKSPACE/ci-hang-artifacts" -- \
-            python3 tools/test_runtime.py \
+          bash ci/tools/ci-hang-guard.sh 1200 "$GITHUB_WORKSPACE/ci-hang-artifacts" -- \
+            python3 ci/tools/test_runtime.py \
               --fault-injection \
               --single-process \
               --redis-server /usr/bin/redis-server \
@@ -188,7 +188,7 @@ jobs:
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: |
           chmod +x nginx-bin/nginx
-          python3 tools/test_runtime.py \
+          python3 ci/tools/test_runtime.py \
             --fault-injection \
             --sanitizer \
             --redis-server /usr/bin/redis-server \

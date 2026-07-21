@@ -36,24 +36,24 @@ jobs:
 
       - name: Validate scripts and source
         run: |
-          bash -n tools/*.sh fuzz/*.sh
-          shellcheck tools/*.sh fuzz/*.sh
-          python3 -m py_compile tools/test_runtime.py
-          python3 tools/lint-ci-runners.py
+          bash -n ci/tools/*.sh ci/fuzz/*.sh
+          shellcheck ci/tools/*.sh ci/fuzz/*.sh
+          python3 -m py_compile ci/tools/test_runtime.py
+          python3 ci/tools/lint-ci-runners.py
 
       - name: Reject corrupt downloaded inputs
         run: |
           tmp=$(mktemp -d)
           trap 'rm -rf "$tmp"' EXIT
           printf corrupt > "$tmp/nginx-1.31.1.tar.gz"
-          if bash tools/verify-download.sh "$tmp/nginx-1.31.1.tar.gz"; then
+          if bash ci/tools/verify-download.sh "$tmp/nginx-1.31.1.tar.gz"; then
             echo "corrupt nginx archive passed checksum verification" >&2
             exit 1
           fi
 
       - name: Static analysis (R7 shm-lock invariant + cppcheck + whitespace)
         run: |
-          bash tools/lint-shm-lock.sh
+          bash ci/tools/lint-shm-lock.sh
           # Scan every source (CI-4): the explicit list previously omitted
           # src/ngx_http_cache_turbo_autotune.c. A glob keeps new sources covered.
           cppcheck \
@@ -70,7 +70,7 @@ jobs:
           # Fast, hermetic, no nginx: compiles the shipped src units verbatim
           # against a shim and drives the fixed-point boundary branches the HTTP
           # runtime suite cannot reach. check_constants.sh guards shim drift.
-          bash tests/unit/run.sh
+          bash ci/tests/unit/run.sh
 
       - name: Lint workflows
         run: |
@@ -78,7 +78,7 @@ jobs:
           archive="/tmp/actionlint_${version}_linux_amd64.tar.gz"
           curl -fsSL -o "$archive" \
             "https://github.com/rhysd/actionlint/releases/download/v${version}/actionlint_${version}_linux_amd64.tar.gz"
-          bash tools/verify-download.sh "$archive"
+          bash ci/tools/verify-download.sh "$archive"
           tar -xzf "$archive" -C /tmp actionlint
           /tmp/actionlint -color .github/workflows/*.yml
 
@@ -108,7 +108,7 @@ jobs:
 
       - name: Build server and dynamic module
         run: |
-          bash tools/ci-build.sh nginx "$NGINX_VERSION"
+          bash ci/tools/ci-build.sh nginx "$NGINX_VERSION"
           build=".build/nginx-${NGINX_VERSION}/objs"
           test -x "$build/nginx"
           test -f "$build/ngx_http_cache_turbo_module.so"
@@ -126,18 +126,18 @@ jobs:
       - name: Unit tests — shm node state machine (ASan/UBSan)
         # Runs HERE, not in Validation, because these link nginx's real
         # ngx_rbtree.c and so need the configured tree the build job just made.
-        # tests/unit/run.sh SKIPS them when no such tree exists, so this step is
+        # ci/tests/unit/run.sh SKIPS them when no such tree exists, so this step is
         # what makes them actually execute -- do not remove it on the assumption
         # the Validation job covers it. It does not.
         #
         # Guards CR-A (the L13 negative memo must survive the claim() that stubs
         # its node) and CR-B (unstub() must not free a COUNTER carrying min_uses
         # progress). Both are unreachable through the HTTP surface, so the
-        # runtime suite passes with either bug restored -- see tests/unit/
+        # runtime suite passes with either bug restored -- see ci/tests/unit/
         # ngx_shim_shm.h. Each assertion is control-verified by injecting the
         # bug into the shipped source.
         run: |
-          make -C tests/unit --no-print-directory check \
+          make -C ci/tests/unit --no-print-directory check \
             NGINX_VERSION="$NGINX_VERSION" \
             NGINX_SRC=".build/nginx-${NGINX_VERSION}/src" \
             NGINX_OBJS=".build/nginx-${NGINX_VERSION}/objs"
@@ -217,7 +217,7 @@ jobs:
       - name: Run runtime suite
         run: |
           chmod +x nginx-bin/nginx
-          python3 tools/test_runtime.py \
+          python3 ci/tools/test_runtime.py \
             --fault-injection \
             --nginx-binary "$GITHUB_WORKSPACE/nginx-bin/nginx" \
             --module "$GITHUB_WORKSPACE/nginx-bin/ngx_http_cache_turbo_module.so" \

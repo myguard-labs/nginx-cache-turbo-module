@@ -9,8 +9,8 @@ name: CI Deep
 # Jobs: fuzz (up to 14400s/target × 4) · legacy-runtime (pre-1.23 ABI) ·
 #       clang-analyze (full-source path-flow) · memcheck soak · helgrind soak ·
 #       scanners.
-#   * memcheck AND helgrind run under tools/soak.sh, which passes
-#     --suppressions=tools/valgrind.supp for BOTH, and --error-exitcode=99 for
+#   * memcheck AND helgrind run under ci/tools/soak.sh, which passes
+#     --suppressions=ci/tools/valgrind.supp for BOTH, and --error-exitcode=99 for
 #     helgrind — the drift-fix baseline for every module.
 #   * cache-turbo is a memory-heavy module (shm slab + LRU + SWR + L2 clients),
 #     so both soaks run 600s (longer than the 300s baseline) to churn eviction.
@@ -77,12 +77,12 @@ jobs:
           printf 'FUZZ_SECS=%s\n' "$FUZZ_SECONDS_INPUT" >> "$GITHUB_ENV"
 
       - name: Build fuzz targets
-        run: bash fuzz/build.sh "$GITHUB_WORKSPACE/fuzz"
+        run: bash ci/fuzz/build.sh "$GITHUB_WORKSPACE/ci/fuzz"
 
       - name: Fuzz each target
         run: |
           set -euo pipefail
-          cd fuzz
+          cd ci/fuzz
           # target:corpus:dict — each target gets the full per-target budget.
           targets="fuzz_resp_parser:corpus:fuzz.dict \
                    fuzz_norm_args:corpus_norm_args: \
@@ -163,7 +163,7 @@ jobs:
           sudo apt-get install -y build-essential curl libpcre2-dev libssl-dev redis-server memcached zlib1g-dev
 
       - name: Build module against legacy nginx
-        run: bash tools/ci-build.sh nginx "$LEGACY_NGINX_VERSION" debug
+        run: bash ci/tools/ci-build.sh nginx "$LEGACY_NGINX_VERSION" debug
 
       - name: Sweep stale test listeners
         run: |
@@ -176,7 +176,7 @@ jobs:
       - name: Run runtime suite against legacy nginx
         run: |
           B="$GITHUB_WORKSPACE/.build/nginx-${LEGACY_NGINX_VERSION}/objs"
-          python3 tools/test_runtime.py \
+          python3 ci/tools/test_runtime.py \
             --fault-injection \
             --nginx-binary "$B/nginx" \
             --module "$B/ngx_http_cache_turbo_module.so" \
@@ -218,7 +218,7 @@ jobs:
 
       - name: Clang --analyze every source
         run: |
-          bash tools/ci-build.sh nginx "$NGINX_VERSION" module
+          bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" module
           build=".build/nginx-${NGINX_VERSION}"
           incs=$(awk '/^ALL_INCS[[:space:]]*=/{found=1} found{line=$0; sub(/^ALL_INCS[[:space:]]*=[[:space:]]*/,"",line); continued=(line ~ /\\$/); gsub(/\\$/, "", line); printf "%s ", line; if (!continued) exit}' "$build/objs/Makefile")
           rc=0
@@ -265,14 +265,14 @@ jobs:
             build-essential curl libpcre2-dev libssl-dev pkg-config \
             valgrind zlib1g-dev
       - name: Build debug nginx + cache-turbo module
-        run: bash tools/ci-build.sh nginx "$NGINX_VERSION" debug
+        run: bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" debug
       - name: Memcheck soak (600s @ 4 conc, WITH suppressions)
         env:
           USE_VALGRIND: "1"
         run: |
           B="$GITHUB_WORKSPACE/.build/nginx-${NGINX_VERSION}/objs"
           MODULE="$B/ngx_http_cache_turbo_module.so" \
-            bash tools/soak.sh "$B/nginx" 600 4
+            bash ci/tools/soak.sh "$B/nginx" 600 4
       - name: Notify Discord on failure
         if: failure() && github.event_name == 'schedule'
         env:
@@ -301,14 +301,14 @@ jobs:
             build-essential curl libpcre2-dev libssl-dev pkg-config \
             valgrind zlib1g-dev
       - name: Build debug nginx + cache-turbo module
-        run: bash tools/ci-build.sh nginx "$NGINX_VERSION" debug
+        run: bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" debug
       - name: Helgrind soak (600s @ 4 conc, --error-exitcode=99, WITH suppressions)
         env:
           USE_HELGRIND: "1"
         run: |
           B="$GITHUB_WORKSPACE/.build/nginx-${NGINX_VERSION}/objs"
           MODULE="$B/ngx_http_cache_turbo_module.so" \
-            bash tools/soak.sh "$B/nginx" 600 4
+            bash ci/tools/soak.sh "$B/nginx" 600 4
       - name: Notify Discord on failure
         if: failure() && github.event_name == 'schedule'
         env:
@@ -348,7 +348,7 @@ jobs:
       - name: Configure nginx src tree (clang-tidy headers)
         run: |
           set -euo pipefail
-          bash tools/ci-build.sh nginx "$NGINX_VERSION" module
+          bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" module
           echo "NGINX_SRC_TREE=$GITHUB_WORKSPACE/.build/nginx-${NGINX_VERSION}" \
             >> "$GITHUB_ENV"
       - name: flawfinder

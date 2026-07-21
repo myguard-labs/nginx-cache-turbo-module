@@ -6,6 +6,7 @@
 [![Valgrind](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/valgrind.yml/badge.svg)](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/valgrind.yml)
 [![CI Deep](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/ci-deep.yml/badge.svg)](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/ci-deep.yml)
 [![CodeQL](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/codeql.yml/badge.svg)](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/codeql.yml)
+[![ASan](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/asan.yml/badge.svg)](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/asan.yml)
 
 A built-in page cache for nginx. Think of it as a tiny Varnish that lives
 **inside** nginx — no extra daemon, no second port, no Lua.
@@ -1467,7 +1468,7 @@ scrape_configs:
 > public out.
 
 A ready-made **Grafana dashboard** is in
-[`tools/grafana-dashboard.json`](tools/grafana-dashboard.json) — import it and
+[`tools/grafana-dashboard.json`](ci/tools/grafana-dashboard.json) — import it and
 pick your Prometheus datasource (hit ratios, L1/L2 request rates, regen cost,
 autotuned beta, per-`zone` template variable).
 
@@ -1588,7 +1589,7 @@ $ apt install angie-module-http-cache-turbo
 
 ## Benchmarking
 
-[`tools/bench.sh`](tools/bench.sh) measures throughput/latency and compares
+[`tools/bench.sh`](ci/tools/bench.sh) measures throughput/latency and compares
 cache-turbo against the alternatives. It stands up an origin plus four edges on
 separate ports — **A** origin direct (the floor), **B** nginx `proxy_cache`,
 **C** cache_turbo L1 shm, **D** cache_turbo + L2 Redis — primes each so the run
@@ -1598,15 +1599,15 @@ own Prometheus counters, so a "fast" run that secretly missed shows up as
 < 100 % instead of as a bogus number.
 
 ```console
-$ eval "$(tools/ci-build.sh nginx 1.31.1 nginx)"      # stock-O release: exports binary= module=
-$ MODULE="$module" tools/bench.sh "$binary" 15 8       # 15s/run, 8 conns
+$ eval "$(ci/tools/ci-build.sh nginx 1.31.1 nginx)"      # stock-O release: exports binary= module=
+$ MODULE="$module" ci/tools/bench.sh "$binary" 15 8       # 15s/run, 8 conns
 $ SIZES="tiny medium large" REDIS="redis://127.0.0.1:6379/0" \
-      MODULE="$module" tools/bench.sh "$binary" 15 8   # all sizes + the L2-Redis run
+      MODULE="$module" ci/tools/bench.sh "$binary" 15 8   # all sizes + the L2-Redis run
 ```
 
 > Build the nginx binary as a **release** build (stock `-O`, **no** `-fsanitize`,
 > no valgrind) — sanitizers slow serving 10–50× and measure nothing real. That is
-> [`tools/soak.sh`](tools/soak.sh)'s job: it proves the module *survives* heavy
+> [`tools/soak.sh`](ci/tools/soak.sh)'s job: it proves the module *survives* heavy
 > churn under ASAN/valgrind; bench.sh proves how *fast* it serves.
 
 Full method, the reference environment, a result set (cache-turbo **+23–37 %**

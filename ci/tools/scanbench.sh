@@ -15,8 +15,8 @@
 # Reports median of PASSES per arm.
 #
 # Usage:
-#   tools/scanbench.sh <nginx-binary> <module.so>
-#   ZONE=512k HOT=50 SCAN=800 PASSES=5 tools/scanbench.sh ...
+#   ci/tools/scanbench.sh <nginx-binary> <module.so>
+#   ZONE=512k HOT=50 SCAN=800 PASSES=5 ci/tools/scanbench.sh ...
 #
 # MEASURED 2026-07-20 (nginx 1.31.1, ZONE=512k HOT=50 BODY=1024, median of 5,
 # SCAN in {200, 800, 2000} -- 15 runs, zero variance):
@@ -154,7 +154,7 @@ run_arm() {  # $1 = on|off  -> prints hot-set HIT%
     # touches land within milliseconds of each other, so the gate swallows every
     # one, NOTHING is promoted, and both arms degenerate to flat LRU -- which
     # reports a real-looking "0.0 vs 0.0, no difference" that proves nothing.
-    # (_s8_hot_status in tools/test_runtime.py sleeps for exactly this reason.)
+    # (_s8_hot_status in ci/tools/test_runtime.py sleeps for exactly this reason.)
     seqp "$HOT" "/hot?k=" | batch >/dev/null      # store -> probation
     sleep 1.2
     seqp "$HOT" "/hot?k=" | batch >/dev/null      # 1st touch

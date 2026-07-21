@@ -61,7 +61,7 @@ points back into the input buffer.
 
 ```bash
 # needs clang with libFuzzer (clang >= 6)
-bash fuzz/build.sh                 # -> fuzz/fuzz_resp_parser (ASan+UBSan+fuzzer)
+bash ci/fuzz/build.sh                 # -> ci/fuzz/fuzz_resp_parser (ASan+UBSan+fuzzer)
 cd fuzz
 ./fuzz_resp_parser -max_total_time=60 corpus/
 ```

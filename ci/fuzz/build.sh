@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
 # Build the cache-turbo libFuzzer targets.
-# Usage: fuzz/build.sh [output-dir-or-binary]
+# Usage: ci/fuzz/build.sh [output-dir-or-binary]
 #
-#   - no arg      : build both targets into fuzz/
+#   - no arg      : build both targets into ci/fuzz/
 #   - a directory : build both targets into that dir
 #   - a file path : build ONLY the RESP-reply target to that path
 #                   (back-compat for the CI step that passes an explicit

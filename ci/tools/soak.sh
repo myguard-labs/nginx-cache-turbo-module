@@ -14,8 +14,8 @@
 # the module ran, not that everything missed straight to origin.
 #
 # Usage:
-#   tools/soak.sh <nginx-binary> [duration_seconds] [concurrency]
-#   USE_VALGRIND=1 tools/soak.sh <nginx-binary> 600 8
+#   ci/tools/soak.sh <nginx-binary> [duration_seconds] [concurrency]
+#   USE_VALGRIND=1 ci/tools/soak.sh <nginx-binary> 600 8
 #
 # Build the nginx binary with the module + -fsanitize=address,undefined
 # for the ASAN path, or a plain debug build for the valgrind path.

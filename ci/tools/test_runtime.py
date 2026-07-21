@@ -937,7 +937,7 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
     if fault_injection:
         fault_loc = f"""
         # CI-only allocation fault injection. These directives are compiled only
-        # by tools/ci-build.sh and are absent from production/package builds.
+        # by ci/tools/ci-build.sh and are absent from production/package builds.
         location /allocfail/ {{
             cache_turbo                         main;
             cache_turbo_key                     $uri;
@@ -3163,7 +3163,7 @@ def test_restore_allocation_failure_fails_closed(ng: Nginx,
                                                  origin: Origin) -> None:
     """Allocation failure while rebuilding a cached response must never emit a
     partial cached 200/3xx or fall through from a destructively reset SIE header
-    list. The hidden directive exists only in tools/ci-build.sh builds."""
+    list. The hidden directive exists only in ci/tools/ci-build.sh builds."""
     def assert_failed_closed(path: str, forbidden_status: int,
                              forbidden_header: str | None = None) -> None:
         try:
@@ -3204,7 +3204,7 @@ def test_file_backed_delegate_never_stores(ng: Nginx,
     downstream -- the object is served correctly but never cached. The hidden
     cache_turbo_test_force_file_buf directive drives that branch
     deterministically (the real in_file trigger is directio/fs dependent). The
-    directive exists only in tools/ci-build.sh builds."""
+    directive exists only in ci/tools/ci-build.sh builds."""
     n0 = origin.hits
     s1, b1, h1 = fetch(ng.port, "/forcefile/asset")
     assert s1 == 200 and b1, f"forcefile prime failed: {s1}"

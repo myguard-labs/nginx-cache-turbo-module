@@ -8,7 +8,7 @@
 set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-HDR="$DIR/../../src/ngx_http_cache_turbo_module.h"
+HDR="$DIR/../../../src/ngx_http_cache_turbo_module.h"
 SHIM="$DIR/ngx_shim_math.h"
 
 CONSTS=(

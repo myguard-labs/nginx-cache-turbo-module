@@ -13,7 +13,7 @@
 #                         against it, then gcov/lcov the module objects.
 #                         .gcno files land under objs/addon/src/; the matching
 #                         .gcda are written when the instrumented nginx exits.
-#                         tools/coverage.sh drives build -> run -> report.
+#                         ci/tools/coverage.sh drives build -> run -> report.
 #
 # No hiredis: cache-turbo's L2 Redis driver is native nginx, so the build has
 # no -lhiredis dependency (see memory/.../cache-turbo-module-design.md).
@@ -48,7 +48,7 @@ mkdir -p "$ROOT"
 if [ ! -f "$ROOT/${DIR}.tar.gz" ]; then
     curl -fsSL "$URL" -o "$ROOT/${DIR}.tar.gz"
 fi
-bash "$MODULE_DIR/tools/verify-download.sh" "$ROOT/${DIR}.tar.gz"
+bash "$MODULE_DIR/ci/tools/verify-download.sh" "$ROOT/${DIR}.tar.gz"
 if [ ! -d "$ROOT/$DIR" ]; then
     tar -xzf "$ROOT/${DIR}.tar.gz" -C "$ROOT"
 fi
@@ -97,12 +97,12 @@ case "$MODE" in
         WITH_DEBUG=""
         ;;
     nginx)
-        # Stock nginx defaults for benchmarking (tools/bench.sh): the only
+        # Stock nginx defaults for benchmarking (ci/tools/bench.sh): the only
         # --with-cc-opt is the inert CI fault-test hook, so nginx keeps its own
         # optimization defaults (-O, i.e. -O1), with no NGX_DEBUG_PALLOC
         # poisoning and no --with-debug logging. This is not the distro's
         # hardened -O2 set — it is a neutral upstream baseline. The module stays
-        # a dynamic .so; bench it with MODULE=<.so> tools/bench.sh.
+        # a dynamic .so; bench it with MODULE=<.so> ci/tools/bench.sh.
         CC_OPT="$TEST_OPT"
         WITH_DEBUG=""
         ;;

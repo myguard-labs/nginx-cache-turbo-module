@@ -3,7 +3,7 @@
 # Measure gcov line+branch coverage of the cache-turbo MODULE sources by
 # running the full runtime suite against a gcov-instrumented nginx.
 #
-#   tools/coverage.sh [flavor] [version]
+#   ci/tools/coverage.sh [flavor] [version]
 #     flavor : nginx | angie   (default nginx)
 #     version: upstream version (default 1.31.1)
 #
@@ -39,7 +39,7 @@ REDIS_SERVER="${REDIS_SERVER:-/usr/bin/redis-server}"
 MEMCACHED_SERVER="${MEMCACHED_SERVER:-/usr/bin/memcached}"
 
 # 1. instrumented build
-bash "$MODULE_DIR/tools/ci-build.sh" "$FLAVOR" "$VERSION" coverage
+bash "$MODULE_DIR/ci/tools/ci-build.sh" "$FLAVOR" "$VERSION" coverage
 
 if [ ! -d "$ADDON" ]; then
     echo "coverage: no instrumented module objects at $ADDON" >&2
@@ -54,7 +54,7 @@ find "$ADDON" -name '*.gcda' -delete 2>/dev/null || true
 # the fault-injection paths are exercised and counted. TEST_NGINX_TIMEOUT must
 # be generous or clean tests "fail" on slow instrumented seeding.
 export TEST_NGINX_TIMEOUT="${TEST_NGINX_TIMEOUT:-30}"
-python3 "$MODULE_DIR/tools/test_runtime.py" \
+python3 "$MODULE_DIR/ci/tools/test_runtime.py" \
     --nginx-binary "$OBJDIR/$([ "$FLAVOR" = angie ] && echo angie || echo nginx)" \
     --module "$OBJDIR/ngx_http_cache_turbo_module.so" \
     --redis-server "$REDIS_SERVER" \
@@ -65,11 +65,11 @@ python3 "$MODULE_DIR/tools/test_runtime.py" \
 # HTTP suite structurally cannot reach (TTL overflow clamp, forever-TTL, band
 # fallback, beta/load clamps, data-sufficiency floor, refresh-dice both ways).
 # The driver #includes swr.c + autotune.c verbatim, compiles as a single TU
-# under tests/unit, and (COVERAGE=1) emits its own instrumented objects there —
+# under ci/tests/unit, and (COVERAGE=1) emits its own instrumented objects there —
 # so its arcs are NOT in the addon/src datafiles the main report scans below.
 # We therefore publish a SEPARATE unit report for those two sources (2c) so the
 # swr/autotune gains show up in the uploaded artifact, not just in the gate.
-UNIT_DIR="$MODULE_DIR/tests/unit"
+UNIT_DIR="$MODULE_DIR/ci/tests/unit"
 # Fresh unit counters: drop any .gcda from a previous run so the unit report
 # reflects THIS run only.
 find "$UNIT_DIR" -name '*.gcda' -delete 2>/dev/null || true
@@ -111,7 +111,7 @@ gcovr "${GCOVR_ARGS[@]}"
 echo "coverage: suite report written to $OUT (index.html, coverage.xml, coverage.txt)"
 
 # 2c. unit-test report for the swr/autotune math. The unit driver's .gcda live
-# under tests/unit (single-TU #include build), covering the boundary branches
+# under ci/tests/unit (single-TU #include build), covering the boundary branches
 # the HTTP suite cannot reach. Publish it as a separate report under $OUT/unit
 # so the artifact carries the full swr/autotune numbers, not only the gate pass.
 # Filter to just those two sources; the datafile also holds test_math.c arcs we

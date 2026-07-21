@@ -353,7 +353,7 @@ typedef struct {
                                                * cold-miss stub               */
 
 /* S8 segmented-LRU segment ids. See the `seg` field below for why PROBATION
- * must stay 0. tests/unit/extract_shm.sh pins both values. */
+ * must stay 0. ci/tests/unit/extract_shm.sh pins both values. */
 #define NGX_HTTP_CACHE_TURBO_SEG_PROBATION  0  /* on &sh->lru               */
 #define NGX_HTTP_CACHE_TURBO_SEG_PROTECTED  1  /* on &sh->lru_protected     */
 
@@ -482,7 +482,7 @@ typedef struct {
      * probation is empty. Returning 0 while this queue is non-empty makes
      * alloc_evict() give up on a zone that still has reclaimable entries;
      * returning non-zero without evicting makes it spin forever holding the
-     * mutex. See the hang test in tests/unit/test_shm_state.c.
+     * mutex. See the hang test in ci/tests/unit/test_shm_state.c.
      *
      * n_protected is maintained under shpool->mutex alongside the linkage, so
      * it is a plain ngx_uint_t rather than an atomic -- never read outside the

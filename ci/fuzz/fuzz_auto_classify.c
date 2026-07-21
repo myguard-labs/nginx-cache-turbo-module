@@ -10,7 +10,7 @@
  * well-formed cookies; this fuzzes arbitrary URI + cookie bytes.
  *
  * The real code lives in ../src/ngx_http_cache_turbo_module.c between the
- * FUZZ-EXTRACT markers; fuzz/extract_auto_classify.sh slices it into
+ * FUZZ-EXTRACT markers; ci/fuzz/extract_auto_classify.sh slices it into
  * generated_auto_classify.inc at build time, so we fuzz the SHIPPED gate with
  * no copy drift. ngx_shim_auto.h supplies the tiny nginx surface.
  *
@@ -22,7 +22,7 @@
  * flags any read at or past the end. All presets are enabled to exercise every
  * cookie/URI/arg rule each call.
  *
- * Build (see fuzz/build.sh):
+ * Build (see ci/fuzz/build.sh):
  *   clang -g -O1 -fsanitize=fuzzer,address,undefined \
  *       fuzz_auto_classify.c -o fuzz_auto_classify
  */

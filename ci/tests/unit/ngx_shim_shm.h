@@ -31,7 +31,7 @@
  * -----------------------------
  * The functions under test are NOT copied. extract_shm.sh slices them verbatim
  * out of the shipped ../../src/ngx_http_cache_turbo_shm.c at build time, the
- * same no-drift discipline fuzz/extract_parser.sh already uses. If a body
+ * same no-drift discipline ci/fuzz/extract_parser.sh already uses. If a body
  * changes upstream, the next build picks it up; if one cannot be found, the
  * build fails loudly rather than silently testing nothing.
  *

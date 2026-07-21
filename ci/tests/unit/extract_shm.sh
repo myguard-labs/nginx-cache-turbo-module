@@ -14,7 +14,7 @@
 #   ngx_http_cache_turbo_shm_l2_neg_check()  - read the L13 negative memo
 #   ngx_http_cache_turbo_shm_l2_neg_set()    - arm the L13 negative memo
 #
-# Same no-drift discipline as fuzz/extract_parser.sh: the test binary always
+# Same no-drift discipline as ci/fuzz/extract_parser.sh: the test binary always
 # exercises PRODUCTION code. Nothing here is hand-copied, so a body that
 # changes upstream is picked up on the next build, and a body that can no
 # longer be found fails the build loudly rather than silently testing nothing.
@@ -27,8 +27,8 @@
 set -euo pipefail
 
 UNIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SRC="$UNIT_DIR/../../src/ngx_http_cache_turbo_shm.c"
-HDR="$UNIT_DIR/../../src/ngx_http_cache_turbo_module.h"
+SRC="$UNIT_DIR/../../../src/ngx_http_cache_turbo_shm.c"
+HDR="$UNIT_DIR/../../../src/ngx_http_cache_turbo_module.h"
 OUT="$UNIT_DIR/generated_shm.inc"
 
 if [ ! -f "$SRC" ]; then
@@ -51,7 +51,7 @@ check_define() {
     fi
     if [ "$got" != "$want" ]; then
         echo "✗ $name drifted: source='$got' expected='$want'" >&2
-        echo "  tests/unit/test_shm_state.c asserts on these values" >&2
+        echo "  ci/tests/unit/test_shm_state.c asserts on these values" >&2
         exit 1
     fi
 }
