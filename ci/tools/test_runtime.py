@@ -3461,8 +3461,10 @@ def test_auto_backend_composition(ng: Nginx, origin: Origin) -> None:
     woo = {"Cookie": "woocommerce_cart_hash=abc123"}
     _, _, hw1 = fetch(ng.port, "/woo/cartpage", headers=woo)
     _, _, hw2 = fetch(ng.port, "/woo/cartpage", headers=woo)
-    assert "x-cache" not in hw1 and "x-cache" not in hw2, \
-        "woo session cookie must skip on the woocommerce backend"
+    assert "x-cache" not in hw1, \
+        "woo session cookie must skip on the woocommerce backend (1st req)"
+    assert "x-cache" not in hw2, \
+        "woo session cookie must skip on the woocommerce backend (2nd req)"
 
     # woocommerce implies wordpress: a WP login cookie MUST now skip on a
     # woo-only location. Before the implication this cached a logged-in customer's
@@ -3470,8 +3472,10 @@ def test_auto_backend_composition(ng: Nginx, origin: Origin) -> None:
     wp = {"Cookie": "wordpress_logged_in_x=1"}
     _, _, hp1 = fetch(ng.port, "/woo/wppage", headers=wp)
     _, _, hp2 = fetch(ng.port, "/woo/wppage", headers=wp)
-    assert "x-cache" not in hp1 and "x-cache" not in hp2, \
-        f"woo implies wordpress: a WP login cookie must skip, got {hp2.get('x-cache')}"
+    assert "x-cache" not in hp1, \
+        f"woo implies wordpress: a WP login cookie must skip (1st req), got {hp1.get('x-cache')}"
+    assert "x-cache" not in hp2, \
+        f"woo implies wordpress: a WP login cookie must skip (2nd req), got {hp2.get('x-cache')}"
 
     # An anonymous page (no woo, no wp cookie) still caches: the implication only
     # adds bypass rules, it must not turn the whole location into pass-through.
@@ -3489,8 +3493,10 @@ def test_woo_implies_wordpress_wp_admin(ng: Nginx, origin: Origin) -> None:
     rebases to /wp-admin/* for the matcher. A HIT here is the leak."""
     _, _, ha1 = fetch(ng.port, "/wooshop/wp-admin/index")
     _, _, ha2 = fetch(ng.port, "/wooshop/wp-admin/index")
-    assert "x-cache" not in ha1 and "x-cache" not in ha2, \
-        "woo implies wordpress: /wp-admin/ must skip under a woo-only backend"
+    assert "x-cache" not in ha1, \
+        "woo implies wordpress: /wp-admin/ must skip under a woo-only backend (1st req)"
+    assert "x-cache" not in ha2, \
+        "woo implies wordpress: /wp-admin/ must skip under a woo-only backend (2nd req)"
 
     # Control: an ordinary page under the same woo-only mount still caches, so the
     # skip above is the /wp-admin/ rule firing, not the whole location bypassing.
