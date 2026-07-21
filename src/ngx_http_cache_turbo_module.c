@@ -8352,6 +8352,85 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
  * The subrequest is pre-seeded with a ctx whose ->warm bit tells the access /
  * header / body filters to force a miss and capture-store despite r != r->main.
  */
+
+/*
+ * Make a warm subrequest fetch ANONYMOUSLY. ngx_http_subrequest sets
+ * sr->headers_in = r->headers_in (a SHALLOW copy), so the warm sr inherits the
+ * admin POST's Cookie header. If the operator's browser carried a segment/key
+ * cookie (Magento's X-Magento-Vary, Shopware's sw-cache-hash, a configured
+ * cache_turbo_key_cookie, ...), that inherited cookie would be wrong on BOTH
+ * axes: (a) build_key folds every present preset/configured key cookie into the
+ * key, so the warmed body lands under a SEGMENTED key no cookieless visitor ever
+ * looks up -- wasted warm; and (b) the proxy forwards the headers_in list to the
+ * origin verbatim, so the origin returns that segment's PRIVATE body -- which,
+ * once (a) is corrected to the anonymous key, would be stored under the anon key
+ * = a cross-visitor leak. Warm as a cookieless anonymous visitor: give the sr a
+ * PRIVATE headers list with every Cookie header dropped, and clear the derived
+ * cookie fields. The parent request's list and header elements are never mutated
+ * (its own key/upstream handling is unaffected).
+ */
+static ngx_int_t
+ngx_http_cache_turbo_warm_anonymize(ngx_http_request_t *sr)
+{
+    ngx_list_t        shared;
+    ngx_list_part_t  *part;
+    ngx_table_elt_t  *h, *nh;
+    ngx_uint_t        i;
+
+    /* Read from a COPY of the inherited (parent-shared) list header, then build
+     * a fresh private list IN PLACE in sr->headers_in.headers. Initialising in
+     * place (not into a local we assign out of) keeps the list's `last` pointer
+     * self-referential: a local ngx_list_t copied into the struct would leave
+     * `last` dangling at the out-of-scope local's embedded first part. The
+     * parent's list data is only read; its elements are never mutated. */
+    shared = sr->headers_in.headers;
+
+    if (ngx_list_init(&sr->headers_in.headers, sr->pool, 8,
+                      sizeof(ngx_table_elt_t)) != NGX_OK)
+    {
+        sr->headers_in.headers = shared;      /* restore on failure */
+        return NGX_ERROR;
+    }
+
+    part = &shared.part;
+    h = part->elts;
+
+    for (i = 0; /* void */; i++) {
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            h = part->elts;
+            i = 0;
+        }
+
+        /* Drop every Cookie header; copy every other elt BY VALUE into the
+         * private list (the parent's list/elts stay untouched). */
+        if (h[i].key.len == sizeof("Cookie") - 1
+            && ngx_strncasecmp(h[i].key.data, (u_char *) "Cookie",
+                               sizeof("Cookie") - 1) == 0)
+        {
+            continue;
+        }
+
+        nh = ngx_list_push(&sr->headers_in.headers);
+        if (nh == NULL) {
+            sr->headers_in.headers = shared;  /* restore on failure */
+            return NGX_ERROR;
+        }
+        *nh = h[i];
+    }
+
+#if (nginx_version >= 1023000)
+    sr->headers_in.cookie = NULL;
+#else
+    sr->headers_in.cookies.nelts = 0;
+#endif
+
+    return NGX_OK;
+}
+
 static ngx_int_t
 ngx_http_cache_turbo_warm_one(ngx_http_request_t *r, ngx_str_t *uri,
     ngx_str_t *args)
@@ -8363,6 +8442,12 @@ ngx_http_cache_turbo_warm_one(ngx_http_request_t *r, ngx_str_t *uri,
                             NGX_HTTP_SUBREQUEST_BACKGROUND)
         != NGX_OK)
     {
+        return NGX_ERROR;
+    }
+
+    /* Warm anonymously: strip inherited cookies so both the cache key and the
+     * upstream request are the cookieless anonymous variant a visitor gets. */
+    if (ngx_http_cache_turbo_warm_anonymize(sr) != NGX_OK) {
         return NGX_ERROR;
     }
 

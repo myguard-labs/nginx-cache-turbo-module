@@ -1411,7 +1411,7 @@ http {
 | `POST /_cache?all=1` | Purge the whole zone (and the L2 keyspace, if Redis is on). |
 | `POST /_cache?key=<string>` | Purge one entry. `<string>` is hashed **verbatim**, so it must equal the entry's full cache-key value — for the default key that is `<host><uri><normalized-args>` (e.g. `example.com/blog/post-42`), **not** just the path. Use a `PURGE` request to that URL (above) if you don't want to reconstruct the key. Drops L1 + L2. |
 | `POST /_cache?tag=<name>` | Purge every page tagged `<name>` across L1 + L2. |
-| `POST /_cache?url=<path[,path,...]>` | Warm those paths (background prefetch). |
+| `POST /_cache?url=<path[,path,...]>` | Warm those paths (background prefetch). Each warm subrequest fetches **anonymously** — the admin request's `Cookie` header is stripped, so the entry is stored under the cookieless anonymous key a visitor looks up (and no per-visitor/segment body is pulled from the origin), even if you trigger the warm from a logged-in browser. |
 
 ## Monitoring (Prometheus + Grafana)
 
