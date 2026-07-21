@@ -23,8 +23,8 @@ time_t  ngx_shim_now  = 1000000;
 long    ngx_shim_rand = 0;
 
 /* the units under test, verbatim */
-#include "../../src/ngx_http_cache_turbo_swr.c"
-#include "../../src/ngx_http_cache_turbo_autotune.c"
+#include "../../../src/ngx_http_cache_turbo_swr.c"
+#include "../../../src/ngx_http_cache_turbo_autotune.c"
 
 #include <stdio.h>
 #include <string.h>

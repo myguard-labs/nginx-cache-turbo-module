@@ -9,7 +9,7 @@
  * NUL-bounded scan would over-read a worker. The runtime suite only feeds
  * well-formed cookies; this fuzzes arbitrary URI + cookie bytes.
  *
- * The real code lives in ../src/ngx_http_cache_turbo_module.c between the
+ * The real code lives in ../../src/ngx_http_cache_turbo_module.c between the
  * FUZZ-EXTRACT markers; ci/fuzz/extract_auto_classify.sh slices it into
  * generated_auto_classify.inc at build time, so we fuzz the SHIPPED gate with
  * no copy drift. ngx_shim_auto.h supplies the tiny nginx surface.
