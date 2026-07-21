@@ -7884,11 +7884,18 @@ def test_l2_negative_ttl_expires(ng: Nginx, origin: Origin,
     s, _, _ = fetch(ng.port, uri)
     assert s == 200, f"post-expiry status {s}"
     time.sleep(0.4)
-    after = _redis_conns_received(redis) - before
+    # _redis_conns_received() opens its OWN redis-cli connection, counted in
+    # Redis' total_connections_received. The `before` probe's connection cancels
+    # (it is in both reads); THIS probe's does not, so it inflates the delta by
+    # exactly 1. Subtract it -- otherwise `>= 1` can never fail even when nginx
+    # opened ZERO L2 connections, i.e. the "memo never expires, L2 stays off"
+    # bug this is meant to catch ([[feedback-negative-control-or-it-isnt-a-test]]).
+    nginx_l2_conns = _redis_conns_received(redis) - before - 1
 
-    assert after >= 1, \
-        (f"after the memo expired the request opened {after} Redis connections "
-         "-- the memo is not expiring, so L2 is effectively disabled for this key")
+    assert nginx_l2_conns >= 1, \
+        (f"after the memo expired the request opened {nginx_l2_conns} Redis "
+         "connections -- the memo is not expiring, so L2 is effectively disabled "
+         "for this key")
     assert _admin_l2_neg_skips(ng) - skips1 == 0, \
         "an expired memo must not count as a skip"
 
