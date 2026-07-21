@@ -5799,6 +5799,41 @@ ngx_http_cache_turbo_header_filter(ngx_http_request_t *r)
 }
 
 
+/* Downstream forward for the body filter. For a normal (main or SIE) request
+ * this is the real next body filter. For a background WARM subrequest it
+ * SWALLOWS the chain instead: a warm sr has no client, and forwarding its body
+ * into the postpone/write chain accrues r->buffered on the shared main
+ * connection. ngx_http_finalize_request then parks the subrequest on
+ * ngx_http_writer (the `r != r->main && r->buffered` branch) instead of taking
+ * the r->background count-drop, so the warm sr's r->main->count++ is never
+ * balanced. If the worker enters graceful exit while parked, the parent
+ * stale-serve client connection can never close -> "open socket left in
+ * connection" at shutdown (proven via gdb core dump, s84). The body is already
+ * captured into ctx->body above; nothing downstream needs it. Consuming the
+ * buffers (pos=last, mark consumed) lets the upstream see the output as fully
+ * written so the sr finalizes with r->buffered == 0. */
+static ngx_int_t
+ngx_http_cache_turbo_forward_body(ngx_http_request_t *r, ngx_chain_t *in)
+{
+    ngx_chain_t                 *cl;
+    ngx_http_cache_turbo_ctx_t  *ctx;
+
+    ctx = ngx_http_get_module_ctx(r, ngx_http_cache_turbo_module);
+
+    if (ctx == NULL || !ctx->warm) {
+        return ngx_http_next_body_filter(r, in);
+    }
+
+    for (cl = in; cl; cl = cl->next) {
+        cl->buf->pos = cl->buf->last;
+        cl->buf->file_pos = cl->buf->file_last;
+        cl->buf->sync = 1;
+    }
+
+    return NGX_OK;
+}
+
+
 static ngx_int_t
 ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 {
@@ -5847,7 +5882,7 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
     }
 
     if (ctx == NULL || !ctx->captured || ctx->served) {
-        return ngx_http_next_body_filter(r, in);
+        return ngx_http_cache_turbo_forward_body(r, in);
     }
 
     clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
@@ -5866,7 +5901,7 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "cache_turbo: test_force_file_buf \"%V\" -> delegate to "
                        "native (capture abandoned)", &r->uri);
-        return ngx_http_next_body_filter(r, in);
+        return ngx_http_cache_turbo_forward_body(r, in);
     }
 #endif
 
@@ -5895,7 +5930,7 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
             ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                            "cache_turbo: file-backed body \"%V\" -> delegate to "
                            "native (cannot capture from memory)", &r->uri);
-            return ngx_http_next_body_filter(r, in);
+            return ngx_http_cache_turbo_forward_body(r, in);
         }
 
         n = ngx_buf_in_memory(b) ? (size_t) (b->last - b->pos) : 0;
@@ -5918,7 +5953,7 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
                                "cache_turbo: oversize capture aborted \"%V\" "
                                "body>%uz -> delegate to native",
                                &r->uri, clcf->max_size);
-                return ngx_http_next_body_filter(r, in);
+                return ngx_http_cache_turbo_forward_body(r, in);
             }
 
             p = ngx_pnalloc(r->pool, n);
@@ -5974,7 +6009,7 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
             ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                            "cache_turbo: not cacheable \"%V\" status=%ui",
                            &r->uri, r->headers_out.status);
-            return ngx_http_next_body_filter(r, in);   /* not cacheable */
+            return ngx_http_cache_turbo_forward_body(r, in);   /* not cacheable */
         }
 
         /* Honor upstream freshness (v7): let the response's own
@@ -6386,7 +6421,7 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
         }
     }
 
-    return ngx_http_next_body_filter(r, in);
+    return ngx_http_cache_turbo_forward_body(r, in);
 }
 
 
@@ -8270,9 +8305,12 @@ ngx_http_cache_turbo_warm_one(ngx_http_request_t *r, ngx_str_t *uri,
     }
 
     /* Force a clean GET to the origin regardless of the admin request's method
-     * (the admin POST is what triggered the warm). */
-    sr->method = NGX_HTTP_GET;
-    ngx_str_set(&sr->method_name, "GET");
+     * (the admin POST is what triggered the warm). header_only stays 0: unlike
+     * core SWR (which relies on the native file cache and can set header_only=1),
+     * cache-turbo captures the body in its OWN body filter, so the full origin
+     * body must stream through the filter chain to be stored. header_only=1
+     * suppresses that streaming and the warm entry is never populated
+     * (test_warm_populates). */
     sr->header_only = 0;
 
     wctx = ngx_pcalloc(sr->pool, sizeof(ngx_http_cache_turbo_ctx_t));
