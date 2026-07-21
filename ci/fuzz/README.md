@@ -1,7 +1,7 @@
 # Fuzzing
 
 Coverage-guided (libFuzzer) fuzzing of the module's attacker-controlled
-parsers. Three targets, each built from the SHIPPED source by its own
+parsers. Four targets, each built from the SHIPPED source by its own
 `extract_*.sh` slicer (no hand-maintained copy):
 
 - **`fuzz_resp_parser`** → the three Redis (RESP) reply parsers (below).
@@ -23,6 +23,11 @@ parsers. Three targets, each built from the SHIPPED source by its own
   (see `ngx_shim_args.h`): the write bound is computed from the same
   kept-token set it writes, so it is invariant to which tokens are dropped
   or whether a Vary suffix is appended.
+- **`fuzz_auto_classify`** → `ngx_http_cache_turbo_auto_skip()` (the backend
+  preset classifier: preset registry + `cookie_has`), fed an attacker-controlled
+  `Cookie` header / request URI / args. Bug classes: OOB reads in the cookie
+  substring / value-predicate scans and the URI/arg matchers. Sliced by
+  `extract_auto_classify.sh` into `generated_auto_classify.inc`.
 
 ## RESP reply parsers
 
@@ -61,8 +66,8 @@ points back into the input buffer.
 
 ```bash
 # needs clang with libFuzzer (clang >= 6)
-bash ci/fuzz/build.sh                 # -> ci/fuzz/fuzz_resp_parser (ASan+UBSan+fuzzer)
-cd fuzz
+bash ci/fuzz/build.sh                 # -> ci/fuzz/fuzz_* (ASan+UBSan+fuzzer, all four targets)
+cd ci/fuzz
 ./fuzz_resp_parser -max_total_time=60 corpus/
 ```
 
@@ -72,9 +77,10 @@ A crash drops a `crash-*` reproducer; re-run it with
 
 ## CI
 
-`.github/workflows/fuzzing.yml` runs this monthly (1st of the month) and on
-manual dispatch, mirroring the `valgrind` / `codeql` heavy-job cadence. The
-build-time ASan+UBSan suite in `build-test.yml` is the per-change gate.
+`.github/workflows/fuzzing.yml` is a **fast regression gate on every PR/push**
+(120s/target on all four parsers) plus manual dispatch. Long discovery fuzzing
+(hours/target) lives in `ci-deep.yml` (monthly cron + dispatch). The build-time
+ASan+UBSan suite in `build-test.yml` is the other per-change gate.
 
 ## Findings
 
