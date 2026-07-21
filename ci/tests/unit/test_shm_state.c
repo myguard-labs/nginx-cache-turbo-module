@@ -143,6 +143,24 @@ static int tests_run, tests_failed;
         }                                                                     \
     } while (0)
 
+/* Fatal variant of CHECK for fixture-setup invariants whose failure would make
+ * the FOLLOWING lines dereference a NULL/garbage pointer. It records the failure
+ * exactly like CHECK, then RETURNS from the (void) test -- so a broken fixture
+ * reports its own assertion instead of SIGSEGV-ing on the next deref and masking
+ * which assertion actually failed. Use it only for a guard the rest of the test
+ * body derefs (a find() result, a node pointer); keep CHECK for independent
+ * asserts a later line does not depend on. */
+#define REQUIRE(cond, msg)                                                    \
+    do {                                                                      \
+        tests_run++;                                                          \
+        if (!(cond)) {                                                        \
+            tests_failed++;                                                   \
+            fprintf(stderr, "  ✗ %s (fatal)\n    at %s:%d: %s\n",             \
+                    (msg), __FILE__, __LINE__, #cond);                        \
+            return;                                                           \
+        }                                                                     \
+    } while (0)
+
 static ngx_http_cache_turbo_shctx_t  g_sh;
 static ngx_slab_pool_t               g_pool;
 static ngx_http_cache_turbo_zone_t   g_zone;
@@ -530,7 +548,7 @@ test_cr_a_memo_survives_claim(void)
     CHECK(ngx_test_lock_balanced(), "l2_neg_set left the zone mutex held");
 
     ctn = find(0);
-    CHECK(ctn != NULL, "l2_neg_set did not create a node");
+    REQUIRE(ctn != NULL, "l2_neg_set did not create a node");
     CHECK(ctn->kind == NGX_HTTP_CACHE_TURBO_NODE_COUNTER,
           "memo node is not a COUNTER");
     CHECK(ctn->l2_neg_until == ngx_test_now + 60, "memo TTL not stamped");
@@ -543,7 +561,7 @@ test_cr_a_memo_survives_claim(void)
     CHECK(ngx_test_lock_balanced(), "claim left the zone mutex held");
 
     ctn = find(0);
-    CHECK(ctn != NULL, "claim destroyed the memo node");
+    REQUIRE(ctn != NULL, "claim destroyed the memo node");
     CHECK(ctn->refreshing == 1, "winner did not mark the node refreshing");
 
     /* THE INVARIANT. The node is now a stub, and the memo must still be on it. */
@@ -588,7 +606,8 @@ test_cr_b_unstub_preserves_counter(void)
     CHECK(ngx_test_lock_balanced(), "count_miss left the zone mutex held");
 
     ctn = find(0);
-    CHECK(ctn != NULL && ctn->miss_count == 3, "miss_count should be 3");
+    REQUIRE(ctn != NULL, "count_miss did not create a node");
+    CHECK(ctn->miss_count == 3, "miss_count should be 3");
 
     /* That node becomes a stub, then the winner's response turns out to be
      * non-cacheable, so unstub() runs. */
@@ -602,7 +621,7 @@ test_cr_b_unstub_preserves_counter(void)
      * variant that wedged every later request on a stub nobody would fill --
      * a hang, not a slowdown. */
     ctn = find(0);
-    CHECK(ctn != NULL, "CR-B: unstub() freed a COUNTER still holding miss_count");
+    REQUIRE(ctn != NULL, "CR-B: unstub() freed a COUNTER still holding miss_count");
     CHECK(ctn->refreshing == 0, "unstub did not release the single-flight");
     CHECK(ctn->refresh_lock_until == 0, "unstub did not clear the lock deadline");
 
@@ -617,13 +636,14 @@ test_cr_b_unstub_preserves_counter(void)
     zone_reset();
     ngx_http_cache_turbo_shm_l2_neg_set(&g_zone, KEY(1), 60);
     ctn = find(1);
-    CHECK(ctn != NULL && ctn->miss_count == 0, "memo node should have no misses");
+    REQUIRE(ctn != NULL, "l2_neg_set did not create the memo node");
+    CHECK(ctn->miss_count == 0, "memo node should have no misses");
     ctn->refreshing         = 1;
     ctn->refresh_lock_until = ngx_test_now + 5;
 
     ngx_http_cache_turbo_shm_unstub(&g_zone, KEY(1));
     ctn = find(1);
-    CHECK(ctn != NULL, "CR-B: unstub() freed a COUNTER holding a live memo");
+    REQUIRE(ctn != NULL, "CR-B: unstub() freed a COUNTER holding a live memo");
     CHECK(ctn->refreshing == 0, "unstub did not release the single-flight");
     CHECK(ngx_http_cache_turbo_shm_l2_neg_check(&g_zone, KEY(1)) == NGX_DECLINED,
           "memo lost across unstub");
@@ -640,6 +660,7 @@ test_cr_b_unstub_preserves_counter(void)
     zone_reset();
     ngx_http_cache_turbo_shm_l2_neg_set(&g_zone, KEY(3), 10);
     ctn = find(3);
+    REQUIRE(ctn != NULL, "l2_neg_set did not create the expiring memo node");
     ctn->refreshing         = 1;
     ctn->refresh_lock_until = ngx_test_now + 5;
     ngx_test_advance_time(11);                  /* memo now expired */
