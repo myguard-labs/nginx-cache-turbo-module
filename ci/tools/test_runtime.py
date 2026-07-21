@@ -8623,7 +8623,8 @@ def test_warm_strips_key_cookie(ng: Nginx, origin: Origin) -> None:
     seg = {"Cookie": "X-Magento-Vary=deadbeefdeadbeefdeadbeefdeadbeef"}
     base = origin.hits
     s, b, _ = fetch(ng.port, f"/_cache?url={uri}", method="POST", headers=seg)
-    assert s == 200 and json.loads(b)["warmed"] == 1, f"warm status/body: {s} {b!r}"
+    assert s == 200, f"warm status: {s} {b!r}"
+    assert json.loads(b)["warmed"] == 1, f"warm body: {b!r}"
     assert wait_for(lambda: origin.hits == base + 1), \
         "warm subrequest never reached origin"
     time.sleep(0.2)                     # let the store settle
