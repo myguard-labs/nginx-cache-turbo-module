@@ -1279,7 +1279,8 @@ http {
     # Both also valid at server/location scope; declared here they're inherited.
     cache_turbo_redis     redis://127.0.0.1:6379/0 prefix=ct: timeout=250ms
                           tls=off tls_verify=on keepalive=0 keepalive_timeout=60s;
-  # cache_turbo_memcached 127.0.0.1:11211 prefix=ct: timeout=250ms;
+  # cache_turbo_memcached 127.0.0.1:11211 prefix=ct: timeout=250ms
+  #                       keepalive=0 keepalive_timeout=60s;
 
     server {
         listen 80;
@@ -1386,7 +1387,7 @@ http {
 | `cache_turbo_background_update on` / `off` | `server`, `location` | `on` | The stale-while-revalidate behaviour. **On** (default): a stale page is served *immediately* while one request quietly refreshes it in the background — **nobody waits on the backend**, and if that refresh hits a 5xx/timeout the old copy is left untouched and keeps being served (**stale-if-error**). **Off**: the chosen refresher regenerates inline (it waits for the backend and serves the fresh body), the pre-SWR behaviour. |
 | `cache_turbo_autotune on` | `server`, `location` | `off` | Adapt to live backend load. Auto-picks `beta` from the measured regen latency (clamped to the preset's band) **and**, under sustained load, widens two knobs by a load factor (≤4×): the **serveable stale window** (serve stale longer before a hard miss) and the **single-flight `lock_ttl`** (collapse more requests onto one regen). The **fresh** TTL is never touched — the freshness contract you set is unchanged; only the best-effort stale grace and dogpile window stretch, and they snap back the first quiet window. Recomputes on a fixed 30s cadence. See [What autotune does](#what-autotune-actually-tunes). |
 | `cache_turbo_redis DSN [opts...]` | `http`, `server`, `location` | — | Add a shared **L2 Redis** tier. `DSN` is `redis://[user:pass@]host:port/db` (or bare `host:port`); `rediss://` = TLS. Write-through on store; one sync `GET` on an L1 miss (never on an L1 hit). Opts: `prefix=` (`ct:`, must be non-empty), `timeout=` (`250ms`), `password=`, `user=`, `db=`, `tls=on\|off`, `tls_verify=on\|off` (default on), `tls_ca=<file>`, `tls_name=<host>`, `keepalive=N` (idle conns to pool per worker, `0`=off), `keepalive_timeout=` (`60s`). Pooled conns are reused only within the same db/credentials/TLS context. **`keepalive=`/`keepalive_timeout=` are honoured per connection profile — each distinct backend gets its own per-worker pool sized from its own location (soft cap 16 profiles/worker).** Native client, no hiredis. |
-| `cache_turbo_memcached HOST:PORT [opts...]` | `http`, `server`, `location` | — | Add a shared **L2 memcached** tier (alternative to `cache_turbo_redis`, mutually exclusive with it). Write-through on store; one sync `get` on an L1 miss. Opts: `prefix=` (`ct:`), `timeout=` (`250ms`). No tags / `?all` / cross-node lock (memcached lacks sorted sets, `SCAN`, atomic `SET-NX`); 1 MiB value cap. Native client, no libmemcached. |
+| `cache_turbo_memcached HOST:PORT [opts...]` | `http`, `server`, `location` | — | Add a shared **L2 memcached** tier (alternative to `cache_turbo_redis`, mutually exclusive with it). Write-through on store; one sync `get` on an L1 miss. Opts: `prefix=` (`ct:`), `timeout=` (`250ms`), `keepalive=N` (idle conns to pool per worker, `0`=off), `keepalive_timeout=` (`60s`). Pooled conns are keyed by peer address (memcached has no db/credentials/TLS) and only re-pooled when the previous reply framed cleanly at a boundary. No tags / `?all` / cross-node lock (memcached lacks sorted sets, `SCAN`, atomic `SET-NX`); 1 MiB value cap. Native client, no libmemcached. |
 | `cache_turbo_tag EXPR` | `server`, `location` | — | Tag stored pages (whitespace/comma list) so they can be purged as a group. Needs `cache_turbo_redis`. |
 | `cache_turbo_admin NAME` | `location` | — | Make this location a control endpoint for zone `NAME` (stats/purge/warm). Gate with `allow`/`deny`. |
 | `cache_turbo_normalize_strip NAME...` | `server`, `location` | — | Extra query args to drop from `$cache_turbo_normalized_args` (trailing `*` = prefix; a bare `*` matches every name = drop all), on top of the built-ins. |
@@ -1544,8 +1545,20 @@ instead of Redis with `cache_turbo_memcached` — same write-through-on-store /
 sync-`GET`-on-L1-miss model, native client (no `libmemcached`):
 
 ```nginx
-cache_turbo_memcached 127.0.0.1:11211 prefix=mc: timeout=250ms;
+cache_turbo_memcached 127.0.0.1:11211 prefix=mc: timeout=250ms
+                      keepalive=16 keepalive_timeout=60s;
 ```
+
+`keepalive=N` pools up to **N** idle connections per worker and reuses them for
+later ops instead of opening a fresh TCP connection each time (`0`, the default,
+opens one per op). `keepalive_timeout=` (default `60s`) is how long an idle
+pooled connection is kept before it is closed. memcached has no db, credentials
+or TLS, so a pool is keyed only by **peer address** — every location pointing at
+the same `HOST:PORT` shares its worker's pool. A connection is returned to the
+pool only after its reply was read to a clean protocol boundary; a timeout, a
+short/fragmented reply, an EOF or a server error closes the connection instead
+of pooling it, so a reused connection is never mid-reply. The same soft cap of
+**16 pooled profiles per worker** as the Redis tier applies.
 
 memcached is deliberately the *lean* L2: it has no sorted sets, no `SCAN`, and
 no atomic `SET-NX`, so the features that need those are **unavailable** on it —

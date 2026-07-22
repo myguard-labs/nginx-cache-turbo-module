@@ -70,6 +70,7 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     u_char    *buf;
     u_char    *blob = NULL;
     size_t     blob_len = 0;
+    size_t     consumed = 0;
     size_t     alloc;
     ngx_int_t  rc;
 
@@ -90,7 +91,7 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     op.rbuf = buf;
     op.rlen = size;
 
-    rc = ngx_http_cache_turbo_mc_parse(&op, &blob, &blob_len);
+    rc = ngx_http_cache_turbo_mc_parse(&op, &blob, &blob_len, &consumed);
     /* L13-fix: tri-state on failure, mirroring the RESP parser. NGX_DECLINED is
      * a bare "END" line (a DEFINITIVE miss, the only outcome allowed to arm the
      * L13 negative memo); NGX_ERROR is an ERROR/CLIENT_ERROR/SERVER_ERROR reply,
@@ -102,6 +103,12 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     }
     if (rc == NGX_OK) {
         check_in_bounds(blob, blob_len, buf, size);
+    }
+    /* D-O2: `consumed` (bytes framed for this reply, used by the keepalive
+     * clean-gate to detect trailing garbage) is written only on a complete
+     * reply, and must never point past the buffer the parser was given. */
+    if ((rc == NGX_OK || rc == NGX_DECLINED) && consumed > size) {
+        __builtin_trap();                  /* consumed past end of reply buffer */
     }
     /* A failure return must never hand back a blob. */
     if (rc != NGX_OK && (blob != NULL || blob_len != 0)) {
