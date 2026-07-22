@@ -10227,16 +10227,22 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
                                : &ngx_http_cache_turbo_redis_backend)
                         : NULL;
 
-    /* COR-0: tags live only in a Redis L2 (the memcached backend has no atomic
-     * tag set: tag_add == NULL). A cache_turbo_tag with no L2, or with the
-     * memcached backend, is silently inert — warn at config time rather than let
-     * the operator believe purge-by-tag will work. */
+    /* COR-0: the tag INDEX (purge-by-tag) lives only in a Redis L2 (the memcached
+     * backend has no atomic tag set: tag_add == NULL). A cache_turbo_tag with no L2,
+     * or with the memcached backend, cannot be purged by tag — warn at config time
+     * rather than let the operator believe purge-by-tag will work. EXCEPTION:
+     * cache_turbo_surrogate_key gives the tag list a SECOND, Redis-free consumer
+     * (downstream Surrogate-Key emission for a fronting CDN), so the tag is NOT
+     * inert then; only the local purge-by-tag index is unavailable, and that is a
+     * deliberate, documented Redis-free mode — no warning. */
     if (conf->tag != NULL
+        && !conf->surrogate_key
         && (conf->backend == NULL || conf->backend->tag_add == NULL))
     {
         ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
             "cache_turbo_tag has no effect here: tag indexing requires a Redis "
-            "L2 (cache_turbo_redis); it is unavailable with %s",
+            "L2 (cache_turbo_redis); it is unavailable with %s "
+            "(cache_turbo_surrogate_key still emits the tags downstream)",
             conf->backend == NULL ? "no L2 backend" : "the memcached backend");
     }
 

@@ -1364,8 +1364,11 @@ http {
             # ── Vary handling ───────────────────────────────────────────
             cache_turbo_auto_vary         off;       # on = read response Vary, split automatically
 
+            # ── tags: local purge-by-tag (Redis) + downstream CDN sync ──
+            cache_turbo_tag               $upstream_http_x_cache_tags;  # purge-by-tag index needs cache_turbo_redis
+            cache_turbo_surrogate_key     off;       # on = re-emit the tags as a Surrogate-Key header for a fronting CDN (no Redis needed)
+
             # ── L2 grouping / tuning ────────────────────────────────────
-            cache_turbo_tag               $upstream_http_x_cache_tags;  # needs cache_turbo_redis
             cache_turbo_autotune          off;       # on = derive beta from measured backend latency (fixed 30s cadence)
 
             # ── stacking with native proxy_cache ────────────────────────
@@ -1390,7 +1393,7 @@ http {
 | Pair | Relationship | What happens |
 |---|---|---|
 | `cache_turbo_redis` ↔ `cache_turbo_memcached` | **hard error** | One L2 per block. Declaring both in the same block fails the config at start ("the two are mutually exclusive"). |
-| `cache_turbo_tag` → `cache_turbo_redis` | **requires** | Tags need Redis sorted-sets. With memcached or no L2 the tag is rejected at config time (memcached has no tag/`?all`/cross-node lock). |
+| `cache_turbo_tag` → `cache_turbo_redis` | **required for purge-by-tag only** | The local **purge-by-tag index** needs Redis sorted-sets; with memcached or no L2 it is unavailable and cache-turbo warns at config time (memcached has no tag/`?all`/cross-node lock). The tag is **not** wasted without Redis if `cache_turbo_surrogate_key on` is set — the tags are then emitted downstream as a `Surrogate-Key` header for a fronting CDN (no Redis needed, no warning). |
 | `cache_turbo_auto_vary` ↔ `cache_turbo_normalize_vary` | **don't double-cover an axis** | Not an error, but keying the same axis (e.g. `encoding`) via both multiplies the slot count for no benefit. Pick one per axis. |
 | `cache_turbo_preset` ↔ `cache_turbo_valid`/`_beta`/`_lock_ttl` | **explicit wins** | The preset sets a band of defaults; any explicit knob overrides just that knob (the rest stay at the preset). Not exclusive. |
 | `cache_turbo_backend` → `cache_turbo_cache_control` | **implies** | Enabling any CMS auto-classify preset defaults `cache_turbo_cache_control` to `honor` unless you set it explicitly. `none` does not — asking for no classification should not quietly change how Cache-Control is treated. |

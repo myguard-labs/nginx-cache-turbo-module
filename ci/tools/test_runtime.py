@@ -934,10 +934,13 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
 
         # surrogate_key OFF (default): tag set but no downstream header. Proves the
         # directive gates the emit -- a plain cache_turbo_tag user is unaffected.
+        # Redis is attached so the tag has its normal purge-by-tag consumer and
+        # the COR-0 "no effect" warning does not fire (an unconsumed tag would).
         location /skoff/ {{
             cache_turbo          main;
             cache_turbo_key      $uri;
             cache_turbo_valid    30s;
+            cache_turbo_redis    127.0.0.1:{redis_port} prefix=ct: timeout=250ms;
             cache_turbo_tag      "blog news";
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
@@ -6005,6 +6008,23 @@ def test_tag_without_l2_warns(ng: Nginx) -> None:
         f"tag-without-L2 config unexpectedly failed nginx -t:\n{r.stdout}"
     assert "no effect here" in r.stdout, \
         f"missing tag-without-L2 warning:\n{r.stdout}"
+
+
+def test_tag_without_l2_but_surrogate_key_no_warn(ng: Nginx) -> None:
+    """COR-0 exception: cache_turbo_surrogate_key gives cache_turbo_tag a
+    Redis-free consumer (downstream Surrogate-Key emission). The tag is then NOT
+    inert, so the "no effect here" warning must be SUPPRESSED even with no L2 --
+    otherwise a valid Redis-free CDN-sync config nags on every reload."""
+    r = _config_test_result(
+        ng, lambda c: c.replace(
+            "cache_turbo_valid    0;",
+            "cache_turbo_valid    0;\n"
+            "            cache_turbo_tag      $arg_t;\n"
+            "            cache_turbo_surrogate_key on;", 1))
+    assert r.returncode == 0, \
+        f"tag+surrogate_key config unexpectedly failed nginx -t:\n{r.stdout}"
+    assert "no effect here" not in r.stdout, \
+        f"tag-without-L2 warning must be suppressed when surrogate_key is on:\n{r.stdout}"
 
 
 def test_cache_control_invalid_mode_rejected(ng: Nginx) -> None:
@@ -11172,6 +11192,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_memcached_keepalive_timeout_invalid_rejected(ng)
     test_valid_dup_status_warns(ng)
     test_tag_without_l2_warns(ng)
+    test_tag_without_l2_but_surrogate_key_no_warn(ng)
     test_cache_control_invalid_mode_rejected(ng)
     test_cache_control_duplicate_rejected(ng)
     test_valid_status_rejects_out_of_range_code(ng)
