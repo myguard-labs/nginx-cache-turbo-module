@@ -365,6 +365,13 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       0,
       NULL },
 
+    { ngx_string("cache_turbo_surrogate_key"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_turbo_loc_conf_t, surrogate_key),
+      NULL },
+
     { ngx_string("cache_turbo_bypass"),
       NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_1MORE,
       ngx_http_set_predicate_slot,
@@ -5011,6 +5018,106 @@ ngx_http_cache_turbo_add_header(ngx_http_request_t *r,
 }
 
 
+/*
+ * cache_turbo_surrogate_key emit. Evaluate the cache_turbo_tag expression,
+ * tokenise it with the SAME whitespace/comma split, per-tag length cap
+ * (MAX_TAG_LEN) and count cap + dedup (MAX_TAGS) the L2 tag-index store uses,
+ * then join the surviving tags into ONE space-separated Surrogate-Key response
+ * header (Fastly / RFC edge-arch surrogate spec) so a CDN fronting this cache
+ * keys the edge object on the same tags. Space is the surrogate-key separator;
+ * the tokeniser splits on it, so a single tag never itself contains a space.
+ *
+ * Called from the HEADER filter on the capture (MISS/store) path only, BEFORE
+ * headers are sent -- the body-filter store runs after the header filter, far
+ * too late to add a response header. A HIT is served earlier (ctx->served) and
+ * never reaches the capture path, so a replayed hit does not re-emit it; the CDN
+ * already holds the mapping from the miss that populated its edge. Independent of
+ * cache_turbo_redis -- emitting the CDN header needs no turbo L2 tag index.
+ *
+ * Best-effort: empty tag value, zero surviving tags, or any allocation failure
+ * simply skips the header. A missing CDN purge-key is a degraded-but-correct
+ * edge (still cached, just not CDN-tag-purgeable), never a response failure. */
+static void
+ngx_http_cache_turbo_emit_surrogate_key(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf)
+{
+    ngx_str_t    tagval, seen[NGX_HTTP_CACHE_TURBO_MAX_TAGS];
+    u_char      *s, *e, *tok, *buf, *p;
+    size_t       toklen, len = 0;
+    ngx_uint_t   ntags = 0, i, k;
+
+    if (clcf->tag == NULL) {
+        return;
+    }
+    if (ngx_http_complex_value(r, clcf->tag, &tagval) != NGX_OK
+        || tagval.len == 0)
+    {
+        return;
+    }
+
+    s = tagval.data;
+    e = tagval.data + tagval.len;
+
+    while (s < e && ntags < NGX_HTTP_CACHE_TURBO_MAX_TAGS) {
+        while (s < e && (*s == ' ' || *s == '\t' || *s == ','
+                         || *s == '\r' || *s == '\n'))
+        {
+            s++;
+        }
+        tok = s;
+        while (s < e && *s != ' ' && *s != '\t' && *s != ','
+               && *s != '\r' && *s != '\n')
+        {
+            s++;
+        }
+        toklen = (size_t) (s - tok);
+        if (toklen == 0 || toklen > NGX_HTTP_CACHE_TURBO_MAX_TAG_LEN) {
+            continue;
+        }
+
+        for (k = 0; k < ntags; k++) {          /* dedup within value */
+            if (seen[k].len == toklen
+                && ngx_memcmp(seen[k].data, tok, toklen) == 0)
+            {
+                break;
+            }
+        }
+        if (k < ntags) {
+            continue;
+        }
+
+        seen[ntags].data = tok;
+        seen[ntags].len = toklen;
+        ntags++;
+    }
+
+    if (ntags == 0) {
+        return;
+    }
+
+    for (i = 0; i < ntags; i++) {
+        len += seen[i].len + 1;                /* +1 for a separating space */
+    }
+
+    buf = ngx_pnalloc(r->pool, len);
+    if (buf == NULL) {
+        return;                                /* degrade: no CDN key, still cached */
+    }
+
+    p = buf;
+    for (i = 0; i < ntags; i++) {
+        if (i != 0) {
+            *p++ = ' ';
+        }
+        p = ngx_cpymem(p, seen[i].data, seen[i].len);
+    }
+
+    (void) ngx_http_cache_turbo_add_header(r,
+               (u_char *) "Surrogate-Key", sizeof("Surrogate-Key") - 1,
+               buf, (size_t) (p - buf));
+}
+
+
 /* CI builds can fail every allocation in cached-response reconstruction. The
  * directive and field do not exist in production/package builds; keeping the
  * hook at the allocation sink lets runtime tests exercise both live HIT and
@@ -5615,7 +5722,13 @@ ngx_http_cache_turbo_header_skip(ngx_http_cache_turbo_loc_conf_t *clcf,
          * their intended consumer, so strip them before store — replaying them
          * downstream would wrongly steer the browser or a next cache tier with a
          * TTL meant for us. Same rationale as the Age strip above. */
-        "CDN-Cache-Control", "Surrogate-Control", NULL
+        "CDN-Cache-Control", "Surrogate-Control",
+        /* cache_turbo_surrogate_key stamps this on the MISS/capture response for a
+         * fronting CDN. It must NOT enter the blob: a later HIT replays the blob,
+         * and re-emitting the miss's Surrogate-Key on every hit is both redundant
+         * (the CDN keyed the object on the miss) and wrong (a hit's tags could
+         * differ). The header filter re-emits it live on each fresh capture. */
+        "Surrogate-Key", NULL
     };
     ngx_uint_t  i;
     size_t      sl;
@@ -5781,6 +5894,15 @@ ngx_http_cache_turbo_header_filter(ngx_http_request_t *r)
             return ngx_http_next_header_filter(r);
         }
         ctx->captured = 1;
+
+        /* cache_turbo_surrogate_key: this response is a MISS being stored, so
+         * emit the tag list downstream as a Surrogate-Key header for a fronting
+         * CDN NOW, while headers are still mutable (the body-filter store runs
+         * after headers are sent). Capture-path only -- a HIT returns earlier via
+         * ctx->served and never re-emits. */
+        if (clcf->surrogate_key) {
+            ngx_http_cache_turbo_emit_surrogate_key(r, clcf);
+        }
     }
 
     /* Cold-miss single-flight (v10): if we are the winner but this response is
@@ -6309,7 +6431,12 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
             /* Tag index (v2c): for each tag in the cache_turbo_tag expression,
              * SADD this object's L2 key to the tag set so it can be purged by
              * tag later. Tags live only in L2; skip when Redis is off. The
-             * memcached backend has no tag support (tag_add == NULL, v13). */
+             * memcached backend has no tag support (tag_add == NULL, v13).
+             *
+             * cache_turbo_surrogate_key (emit the same tags downstream for a
+             * fronting CDN) is handled separately in the HEADER filter -- headers
+             * are already sent by the time this body-filter store runs, so the
+             * emit MUST happen before next_header_filter, not here. */
             if (clcf->backend && clcf->backend->tag_add && clcf->tag) {
                 ngx_str_t  tagval;
 
@@ -9779,6 +9906,7 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->auto_vary = NGX_CONF_UNSET;
     conf->purge = NGX_CONF_UNSET;
     conf->background_update = NGX_CONF_UNSET;
+    conf->surrogate_key = NGX_CONF_UNSET;
     conf->lock = NGX_CONF_UNSET;
     conf->lock_timeout = NGX_CONF_UNSET_MSEC;
     conf->min_uses_raw = NGX_CONF_UNSET;
@@ -9947,6 +10075,7 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 
     /* PURGE method (v14): off by default. */
     ngx_conf_merge_value(conf->purge, prev->purge, 0);
+    ngx_conf_merge_value(conf->surrogate_key, prev->surrogate_key, 0);
 
     /* v8: background update / SWR defaults ON — the dice-winner serves stale and
      * refreshes in the background rather than blocking on origin. */

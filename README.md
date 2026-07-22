@@ -246,6 +246,46 @@ ignoring the 60s browser TTL. Semantics:
 > cache](#mixing-with-nginxs-native-cache-proxy_cache) for stacking with
 > `proxy_cache`.
 
+### Purge-syncing the CDN: `cache_turbo_surrogate_key`
+
+The headers above are about **freshness** flowing *down* to this cache. The
+other direction is **invalidation**: when the origin changes a page you want to
+drop it from *both* cache-turbo and the CDN edge in one go. Fastly (and any
+edge speaking the surrogate-key spec) purges by **tag** — you tell the edge which
+tags an object carries via a `Surrogate-Key` response header, then later issue a
+"purge everything tagged `X`".
+
+cache-turbo already indexes objects by tag for its own purge-by-tag
+([Redis L2](#redis-l2-shared-cache)). `cache_turbo_surrogate_key on` mirrors the
+**same** `cache_turbo_tag` list back **downstream** as a `Surrogate-Key` header,
+so the fronting CDN keys the edge copy on the identical tags and the two stay
+purge-synced:
+
+```nginx
+location / {
+    cache_turbo          main;
+    cache_turbo_valid    1h;
+    cache_turbo_tag      $upstream_http_x_cache_tags;  # origin names the tags
+    cache_turbo_surrogate_key on;                      # re-emit them to the CDN
+    proxy_pass http://backend;
+}
+```
+
+Semantics:
+
+- **MISS only.** The header is emitted on the response that *populates* the
+  cache (and the CDN edge). Subsequent HITs are served from the edge and do not
+  re-emit it — the CDN already holds the mapping.
+- **Same parsing as the tag index** — whitespace/comma split, deduped, and
+  bounded to the same per-tag length and count caps, so a hostile/buggy origin
+  can't blow up the emitted header.
+- **No Redis required.** Emitting the CDN header does *not* need cache-turbo's
+  own L2 tag index — you can front a pure-L1 cache with a tag-purging CDN. (If
+  you *also* want cache-turbo's own purge-by-tag, add `cache_turbo_redis`.)
+- **Not stored in the entry** — like the targeted freshness headers above, the
+  emitted `Surrogate-Key` is stripped before the entry is stored, so a HIT never
+  replays a stale tag set.
+
 ## Quick start
 
 ```nginx
@@ -1389,6 +1429,7 @@ http {
 | `cache_turbo_redis DSN [opts...]` | `http`, `server`, `location` | — | Add a shared **L2 Redis** tier. `DSN` is `redis://[user:pass@]host:port/db` (or bare `host:port`); `rediss://` = TLS. Write-through on store; one sync `GET` on an L1 miss (never on an L1 hit). Opts: `prefix=` (`ct:`, must be non-empty), `timeout=` (`250ms`), `password=`, `user=`, `db=`, `tls=on\|off`, `tls_verify=on\|off` (default on), `tls_ca=<file>`, `tls_name=<host>`, `keepalive=N` (idle conns to pool per worker, `0`=off), `keepalive_timeout=` (`60s`). Pooled conns are reused only within the same db/credentials/TLS context. **`keepalive=`/`keepalive_timeout=` are honoured per connection profile — each distinct backend gets its own per-worker pool sized from its own location (soft cap 16 profiles/worker).** Native client, no hiredis. |
 | `cache_turbo_memcached HOST:PORT [opts...]` | `http`, `server`, `location` | — | Add a shared **L2 memcached** tier (alternative to `cache_turbo_redis`, mutually exclusive with it). Write-through on store; one sync `get` on an L1 miss. Opts: `prefix=` (`ct:`), `timeout=` (`250ms`), `keepalive=N` (idle conns to pool per worker, `0`=off), `keepalive_timeout=` (`60s`). Pooled conns are keyed by peer address (memcached has no db/credentials/TLS) and only re-pooled when the previous reply framed cleanly at a boundary. No tags / `?all` / cross-node lock (memcached lacks sorted sets, `SCAN`, atomic `SET-NX`); 1 MiB value cap. Native client, no libmemcached. |
 | `cache_turbo_tag EXPR` | `server`, `location` | — | Tag stored pages (whitespace/comma list) so they can be purged as a group. Needs `cache_turbo_redis`. |
+| `cache_turbo_surrogate_key on\|off` | `server`, `location` | `off` | Emit the `cache_turbo_tag` list downstream as a `Surrogate-Key` header on the MISS/store response, so a fronting CDN (Fastly, …) can purge-by-tag in sync. No `cache_turbo_redis` required. See [Purge-syncing the CDN](#purge-syncing-the-cdn-cache_turbo_surrogate_key). |
 | `cache_turbo_admin NAME` | `location` | — | Make this location a control endpoint for zone `NAME` (stats/purge/warm). Gate with `allow`/`deny`. |
 | `cache_turbo_normalize_strip NAME...` | `server`, `location` | — | Extra query args to drop from `$cache_turbo_normalized_args` (trailing `*` = prefix; a bare `*` matches every name = drop all), on top of the built-ins. |
 | `cache_turbo_normalize_vary TOKEN...` | `server`, `location` | off | Append a variant bucket to `$cache_turbo_normalized_args`: `encoding` (br/gzip/identity) and/or `device` (mobile/desktop). |

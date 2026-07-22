@@ -863,6 +863,15 @@ typedef struct {
      * both tiers. Tags live only in L2, so this needs cache_turbo_redis. */
     ngx_http_complex_value_t *tag;        /* tag list expression, or NULL     */
 
+    /* cache_turbo_surrogate_key on|off. When on AND cache_turbo_tag is set, the
+     * store path emits the parsed tag list back downstream as a Surrogate-Key
+     * response header (RFC edge-arch / Fastly), so a CDN fronting this cache can
+     * key the edge object on the same tags and stay purge-synced. Independent of
+     * cache_turbo_redis: emitting the CDN header does not need a turbo L2 tag
+     * index. MISS/store path only -- the CDN reads Surrogate-Key on the fetch
+     * that populates its edge; subsequent hits are served from the edge. */
+    ngx_flag_t               surrogate_key; /* cache_turbo_surrogate_key on|off */
+
     /* Explicit upstream store opt-in (cache_turbo_require_header <name>).
      * When set, a response is captured ONLY if it carries <name> with an
      * affirmative value ("yes"/"1"/"on", case-insensitive). Everything else --

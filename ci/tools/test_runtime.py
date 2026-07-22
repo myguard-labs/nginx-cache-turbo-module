@@ -918,6 +918,41 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # cache_turbo_surrogate_key: emit the tag list downstream as a
+        # Surrogate-Key header for a fronting CDN. Deliberately NO cache_turbo_redis
+        # here -- the emit must work without an L2 tag index. First request is a
+        # MISS and carries Surrogate-Key; the second is a HIT and must NOT
+        # (the CDN keyed the object on the miss, a hit replays the stored blob).
+        location /sk/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    30s;
+            cache_turbo_tag      "blog news blog";
+            cache_turbo_surrogate_key on;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # surrogate_key OFF (default): tag set but no downstream header. Proves the
+        # directive gates the emit -- a plain cache_turbo_tag user is unaffected.
+        location /skoff/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    30s;
+            cache_turbo_tag      "blog news";
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # surrogate_key with the tag value from a query arg (upstream-controlled
+        # stand-in) so the cap/dedup carries into the emitted header.
+        location /skcap/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    30s;
+            cache_turbo_tag      $arg_t;
+            cache_turbo_surrogate_key on;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # COR-5 (Redis-backed): auto-Vary + PURGE with an L2 backend. Each variant
         # store SADDs its L2 key into a per-base variant-index set; a PURGE of the
         # base URI SMEMBERS that set and drops every variant from L1 + L2 + the
@@ -3417,6 +3452,59 @@ def test_miss_then_hit(ng: Nginx) -> None:
     assert s2 == 200
     assert h2.get("x-cache") == "HIT", f"second req X-Cache={h2.get('x-cache')}"
     assert b1 == b2, f"HIT body differs: {b1!r} vs {b2!r}"
+
+
+def test_surrogate_key_emit_on_miss_only(ng: Nginx) -> None:
+    """cache_turbo_surrogate_key on: the MISS (store) response carries a
+    Surrogate-Key header built from the deduped cache_turbo_tag list; the HIT
+    (blob replay) does NOT re-emit it. Works with NO cache_turbo_redis -- the
+    emit is independent of the L2 tag index."""
+    path = "/sk/page"
+
+    s1, _b1, h1 = fetch(ng.port, path)
+    assert s1 == 200, f"miss status {s1}"
+    assert "x-cache" not in h1, f"first req should MISS, got {h1.get('x-cache')}"
+    sk = h1.get("surrogate-key")
+    assert sk is not None, "MISS response is missing the Surrogate-Key header"
+    # tag list was "blog news blog" -> dedup -> two tags, order preserved.
+    assert sk.split() == ["blog", "news"], \
+        f"Surrogate-Key not the deduped tag set: {sk!r}"
+
+    s2, _b2, h2 = fetch(ng.port, path)
+    assert s2 == 200
+    assert h2.get("x-cache") == "HIT", f"second req X-Cache={h2.get('x-cache')}"
+    assert "surrogate-key" not in h2, \
+        f"HIT must NOT re-emit Surrogate-Key, got {h2.get('surrogate-key')!r}"
+
+
+def test_surrogate_key_off_by_default(ng: Nginx) -> None:
+    """A cache_turbo_tag location WITHOUT cache_turbo_surrogate_key emits no
+    Surrogate-Key header -- the directive gates the emit."""
+    s1, _b1, h1 = fetch(ng.port, "/skoff/page")
+    assert s1 == 200, f"miss status {s1}"
+    assert "x-cache" not in h1, f"first req should MISS, got {h1.get('x-cache')}"
+    assert "surrogate-key" not in h1, \
+        f"surrogate_key OFF but header present: {h1.get('surrogate-key')!r}"
+
+
+def test_surrogate_key_empty_tag_no_header(ng: Nginx) -> None:
+    """surrogate_key on but the tag expression evaluates empty (no ?t= arg):
+    no tags, so no Surrogate-Key header (and no empty-value header)."""
+    s1, _b1, h1 = fetch(ng.port, "/skcap/page")
+    assert s1 == 200, f"miss status {s1}"
+    assert "surrogate-key" not in h1, \
+        f"empty tag list should emit no header, got {h1.get('surrogate-key')!r}"
+
+
+def test_surrogate_key_dedup_from_arg(ng: Nginx) -> None:
+    """The emitted Surrogate-Key reflects the same dedup the tag tokeniser does:
+    a value with a repeated tag emits each tag once."""
+    s1, _b1, h1 = fetch(ng.port, "/skcap/page2?t=a,b,a,c,b")
+    assert s1 == 200, f"miss status {s1}"
+    sk = h1.get("surrogate-key")
+    assert sk is not None, "MISS response is missing the Surrogate-Key header"
+    assert sk.split() == ["a", "b", "c"], \
+        f"Surrogate-Key not deduped in emit order: {sk!r}"
 
 
 def test_post_passthrough_uncached(ng: Nginx, origin: Origin) -> None:
@@ -11018,6 +11106,10 @@ def run_all(ng: Nginx, origin: Origin,
             redis_tls: RedisServer | None = None,
             mc: MemcachedServer | None = None) -> None:
     test_miss_then_hit(ng)
+    test_surrogate_key_emit_on_miss_only(ng)
+    test_surrogate_key_off_by_default(ng)
+    test_surrogate_key_empty_tag_no_header(ng)
+    test_surrogate_key_dedup_from_arg(ng)
     test_post_passthrough_uncached(ng, origin)
     test_compressed_edge_identity_capture(ng)
     test_header_fidelity(ng)
