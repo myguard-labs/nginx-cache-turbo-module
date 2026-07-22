@@ -14,9 +14,12 @@
  *     stay NULL in the vtable: memcached has no SADD/SCAN/atomic SET-NX, so
  *     tag-purge, whole-keyspace purge (?all) and cross-node single-flight are
  *     simply unavailable on this backend (the call sites guard on NULL).
- *   - no AUTH/SELECT preamble, no TLS, no keepalive pool: each op opens a
- *     connection, runs one command, and closes. L2 is advisory, so a failed op
- *     just degrades to an L2 miss / lost write-through — never a request error.
+ *   - no AUTH/SELECT preamble, no TLS. An optional per-worker keepalive pool
+ *     (keepalive=/keepalive_timeout=, off by default) reuses idle connections
+ *     keyed by peer address, re-pooling only a boundary-clean reply; with
+ *     keepalive=0 each op opens a connection, runs one command, and closes. L2
+ *     is advisory, so a failed op just degrades to an L2 miss / lost
+ *     write-through — never a request error.
  *   - SET (write-through, fire-and-forget): op->request == NULL.
  *   - GET (sync-on-L1-miss): parks the request (count++, NGX_AGAIN) and resumes
  *     the phase engine when the reply lands. op->request == r.
