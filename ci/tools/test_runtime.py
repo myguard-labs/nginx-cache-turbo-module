@@ -1028,6 +1028,17 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # Short idle timeout (D-O1): a pooled conn left idle past 1s must be
+        # dropped by mc_ka_close_handler's ev->timedout branch, not leak/crash.
+        # Exercised by test_mc_keepalive_idle_timeout_drops.
+        location /mckashort/ {{
+            cache_turbo            main;
+            cache_turbo_key        $uri;
+            cache_turbo_valid      30s;
+            cache_turbo_memcached  127.0.0.1:{memcached_port} prefix=mcks: timeout=250ms keepalive=4 keepalive_timeout=1s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # memcached-backed admin: a single-key purge here must also delete the
         # entry from memcached (not just drop L1).
         location = /_cache_mc {{
@@ -3133,6 +3144,21 @@ class MemcachedServer:
 
     def exists(self, key: str) -> bool:
         return self.get(key) is not None
+
+    def total_connections(self) -> int:
+        """Value of memcached's `STAT total_connections` -- the running count of
+        connections it has accepted since start. A keepalive pool that reuses
+        connections drives far fewer new accepts than connect-per-op. Mirrors
+        _redis_conns_received(); like it, the probe's OWN connection is counted
+        (each caller opens one), so subtract a per-probe baseline, not compare
+        raw totals."""
+        reply = self.command(b"stats\r\n")
+        for line in reply.split(b"\r\n"):
+            parts = line.split()
+            if len(parts) == 3 and parts[0] == b"STAT" \
+                    and parts[1] == b"total_connections":
+                return int(parts[2])
+        raise RuntimeError("total_connections absent from memcached stats")
 
     def stop(self) -> None:
         if self.process is None:
@@ -10666,6 +10692,90 @@ def test_l2_backend_inheritance_child_redis_over_parent_memcached(
         "parent store leaked into Redis (backend identity crossed)"
 
 
+def test_mc_keepalive_reuse(ng: Nginx, origin: Origin,
+                            mc: MemcachedServer) -> None:
+    """D-O1 primary crash path: a memcached L2 op GET-pools its connection, and
+    the very next op (the write-through SET) REUSES it, then re-pools it. Before
+    the fix, mc_connect's reuse branch left op->peer.name NULL, so the SET's
+    re-pool (op_done -> ka_save, which dereferences op->peer.name) SIGSEGV'd the
+    worker on a plain L1 miss. This exercises that exact GET-pool -> SET-reuse
+    -> re-pool cycle across a burst and proves (a) the worker survives it and
+    (b) the pool actually reuses connections (few new accepts vs connect-per-op).
+
+    /mcka/ has keepalive=4; /mc/ connects per op. We measure memcached's accept
+    count across an identical burst on each and assert the pool cut the churn --
+    the same connect-per-op vs reuse contrast the Redis test_l2_keepalive_reuse
+    makes, but on the driver the fix touched.
+    """
+    n = 40
+    stamp = time.time()
+
+    def burst(prefix: str) -> int:
+        # each probe opens one stats connection; subtract it so we count only
+        # nginx's accepts, not our own measurement conns (mirrors the redis test)
+        before = mc.total_connections() - 1
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+            list(ex.map(lambda i: fetch(ng.port, f"{prefix}reuse-{stamp}-{i}"),
+                        range(n)))
+        time.sleep(0.6)   # let fire-and-forget SETs finish + conns settle
+        return mc.total_connections() - 1 - before
+
+    workers_before = ng.worker_pids()
+
+    off = burst("/mc/")      # connect-per-op memcached location: ~2N accepts
+    on = burst("/mcka/")     # keepalive on: a small bounded number, then reuse
+
+    # The worker must have survived the GET-pool -> SET-reuse -> re-pool cycle.
+    if not ng.single_process:
+        assert ng.worker_pids() == workers_before, (
+            "worker PID set changed during a keepalive reuse burst -- a worker "
+            "crashed (D-O1 NULL op->peer.name on the mc_connect reuse path)")
+
+    assert off > n, f"connect-per-op baseline too low ({off}); expected > {n}"
+    assert on * 2 < off, \
+        f"memcached keepalive did not cut connection churn (on={on}, off={off})"
+
+    # pool kept a live conn: a subsequent op still hits + serves
+    _, _, h = fetch(ng.port, f"/mcka/reuse-{stamp}-0")   # now an L1 HIT
+    assert h.get("x-cache") == "HIT", "keepalive location broke the hot path"
+
+
+def test_mc_keepalive_idle_timeout_drops(ng: Nginx, origin: Origin,
+                                         mc: MemcachedServer) -> None:
+    """D-O1 idle-timer branch of mc_ka_close_handler (ev->timedout): a pooled
+    memcached connection left idle past keepalive_timeout must be dropped by the
+    timer handler, not leak or crash the worker. /mckashort/ has a 1s idle
+    timeout. Prime a pooled conn, wait past it, and assert the worker survives
+    and the next op still serves (re-dialing a fresh conn transparently).
+
+    The peer-event branch is covered by test_mc_keepalive_server_close_survives;
+    this covers the timedout branch the server-close test never reaches."""
+    uri = "/mckashort/idle"
+    key = l2_key(uri, prefix="mcks:")
+    mc.command(b"delete " + key.encode() + b"\r\n")
+
+    s, body, _ = fetch(ng.port, uri)
+    assert s == 200, "prime should miss to origin"
+    assert wait_for(lambda: mc.exists(key)), \
+        "write-through never reached memcached (no conn to pool)"
+
+    workers_before = ng.worker_pids()
+
+    # Idle timeout is 1s; wait comfortably past it so the read timer fires and
+    # mc_ka_close_handler drops the pooled slot via the ev->timedout path.
+    time.sleep(2.0)
+
+    if not ng.single_process:
+        assert ng.worker_pids() == workers_before, (
+            "worker PID set changed while a pooled conn idle-timed-out -- the "
+            "idle-timer close handler crashed (D-O1 timedout branch)")
+
+    # A fresh op re-dials transparently and still serves from L1.
+    s2, body2, h2 = fetch(ng.port, uri)
+    assert s2 == 200 and h2.get("x-cache") == "HIT" and body2 == body, \
+        "worker no longer serves the L1 hit after the pooled conn idle-timeout"
+
+
 def test_mc_keepalive_server_close_survives(ng: Nginx, origin: Origin,
                                             mc: MemcachedServer) -> None:
     """D-O1: an idle memcached keepalive connection whose server drops it must
@@ -10980,6 +11090,8 @@ def run_all(ng: Nginx, origin: Origin,
             # child redis over parent memcached — precedence regression lock
             test_l2_backend_inheritance_child_redis_over_parent_memcached(
                 ng, origin, redis, mc)
+        test_mc_keepalive_reuse(ng, origin, mc)            # D-O1 reuse+re-pool
+        test_mc_keepalive_idle_timeout_drops(ng, origin, mc)  # D-O1 timedout br
         # D-O1 idle-pool close: MUST be last mc test — it stops the mc server.
         test_mc_keepalive_server_close_survives(ng, origin, mc)
     # PERF-7 zero-copy serve stress: run LAST among L1 tests — its 48-thread /
