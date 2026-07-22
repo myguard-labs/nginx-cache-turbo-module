@@ -936,12 +936,16 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
         # directive gates the emit -- a plain cache_turbo_tag user is unaffected.
         # Redis is attached so the tag has its normal purge-by-tag consumer and
         # the COR-0 "no effect" warning does not fire (an unconsumed tag would).
+        # A DISTINCT prefix (sk:) + unique tag names keep this location's SADDs out
+        # of the shared ct:tag:* sets other L2 tests assert exact counts on (the
+        # truncation test fills ct:tag:news to exactly 350 -- a stray SADD from
+        # here would race it to 351 under the multi-worker runner).
         location /skoff/ {{
             cache_turbo          main;
             cache_turbo_key      $uri;
             cache_turbo_valid    30s;
-            cache_turbo_redis    127.0.0.1:{redis_port} prefix=ct: timeout=250ms;
-            cache_turbo_tag      "blog news";
+            cache_turbo_redis    127.0.0.1:{redis_port} prefix=sk: timeout=250ms;
+            cache_turbo_tag      "skoff-a skoff-b";
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
