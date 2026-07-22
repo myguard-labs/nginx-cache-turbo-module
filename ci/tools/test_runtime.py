@@ -1039,6 +1039,20 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # D-O2: a keepalive location pointed at a DELIBERATELY MISBEHAVING fake
+        # memcached (on memcached_port+1, stood up only by
+        # test_mc_dirty_reply_not_pooled). A reply that does not frame cleanly at
+        # a boundary (trailing junk past END/STORED, a server error, a timeout)
+        # must NOT be returned to the pool -- the connection is closed instead, so
+        # a reuse never resumes mid-reply. Same keepalive size as /mcka/.
+        location /mcdirty/ {{
+            cache_turbo            main;
+            cache_turbo_key        $uri;
+            cache_turbo_valid      30s;
+            cache_turbo_memcached  127.0.0.1:{memcached_port + 1} prefix=mcd: timeout=250ms keepalive=4 keepalive_timeout=30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # memcached-backed admin: a single-key purge here must also delete the
         # entry from memcached (not just drop L1).
         location = /_cache_mc {{
@@ -3167,6 +3181,120 @@ class MemcachedServer:
             self.process.terminate()
             self.process.wait(timeout=10)
         self.process = None
+
+
+class DirtyMemcached:
+    """A DELIBERATELY MISBEHAVING fake memcached for the D-O2 clean-boundary test.
+
+    Speaks just enough of the text protocol to answer get/set/delete/flush_all,
+    but appends `trailer` bytes AFTER the framed reply (past END / STORED / the
+    delete ack). A correct driver frames the reply, sees the extra trailing
+    bytes, decides the stream is NOT at a clean boundary, and CLOSES the
+    connection rather than returning it to the keepalive pool -- so the next op
+    dials a fresh connection instead of resuming mid-reply. We count accepted
+    connections: no pooling => roughly one accept per op.
+
+    Threaded raw-socket server (no client library, mirrors MemcachedServer)."""
+
+    def __init__(self, port: int, trailer: bytes = b"JUNKJUNK\r\n") -> None:
+        self.port = port
+        self.trailer = trailer
+        self._sock: socket.socket | None = None
+        self._thread: threading.Thread | None = None
+        self._store: dict[bytes, bytes] = {}
+        self._lock = threading.Lock()
+        self._running = False
+        self.accepts = 0
+
+    def start(self) -> None:
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind(("127.0.0.1", self.port))
+        self._sock.listen(64)
+        self._running = True
+        self._thread = threading.Thread(target=self._accept_loop, daemon=True)
+        self._thread.start()
+        wait_port(self.port)
+
+    def _accept_loop(self) -> None:
+        while self._running:
+            try:
+                conn, _ = self._sock.accept()
+            except OSError:
+                return
+            with self._lock:
+                self.accepts += 1
+            threading.Thread(target=self._serve, args=(conn,),
+                             daemon=True).start()
+
+    def _serve(self, conn: socket.socket) -> None:
+        buf = b""
+        try:
+            conn.settimeout(10)
+            while self._running:
+                # A command is a CRLF-terminated line (plus a data block for set).
+                while b"\r\n" not in buf:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        return
+                    buf += chunk
+                line, _, rest = buf.partition(b"\r\n")
+                buf = rest
+                parts = line.split()
+                if not parts:
+                    continue
+                cmd = parts[0]
+                if cmd == b"set":
+                    nbytes = int(parts[4])
+                    while len(buf) < nbytes + 2:
+                        chunk = conn.recv(4096)
+                        if not chunk:
+                            return
+                        buf += chunk
+                    data = buf[:nbytes]
+                    buf = buf[nbytes + 2:]           # drop data + trailing CRLF
+                    with self._lock:
+                        self._store[parts[1]] = data
+                    conn.sendall(b"STORED\r\n" + self.trailer)
+                elif cmd == b"get":
+                    with self._lock:
+                        val = self._store.get(parts[1])
+                    if val is None:
+                        conn.sendall(b"END\r\n" + self.trailer)
+                    else:
+                        conn.sendall(b"VALUE " + parts[1] + b" 0 "
+                                     + str(len(val)).encode() + b"\r\n" + val
+                                     + b"\r\nEND\r\n" + self.trailer)
+                elif cmd == b"delete":
+                    with self._lock:
+                        hit = self._store.pop(parts[1], None) is not None
+                    conn.sendall((b"DELETED\r\n" if hit else b"NOT_FOUND\r\n")
+                                 + self.trailer)
+                elif cmd == b"flush_all":
+                    with self._lock:
+                        self._store.clear()
+                    conn.sendall(b"OK\r\n")
+                else:
+                    conn.sendall(b"ERROR\r\n")
+        except OSError:
+            return
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def stop(self) -> None:
+        self._running = False
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+            self._sock = None
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+            self._thread = None
 
 
 def l2_key(uri: str, prefix: str = "ct:") -> str:
@@ -10776,6 +10904,57 @@ def test_mc_keepalive_idle_timeout_drops(ng: Nginx, origin: Origin,
         "worker no longer serves the L1 hit after the pooled conn idle-timeout"
 
 
+def test_mc_dirty_reply_not_pooled(ng: Nginx, origin: Origin) -> None:
+    """D-O2: a memcached reply that does not end at a clean protocol boundary
+    (trailing junk past END / STORED) must NOT be returned to the keepalive pool.
+    The connection is closed instead, so a later reuse can never resume in the
+    middle of a stale reply and desync the stream.
+
+    /mcdirty/ (keepalive=4) points at a fake memcached that appends garbage after
+    every framed reply. We drive a burst of DISTINCT cold keys -- each is an L1
+    miss -> memcached GET (miss) -> origin -> L1 store + write-through memcached
+    SET, i.e. two memcached ops per key. With the clean gate, every one of those
+    connections is closed (the reply had trailing bytes), so the fake sees about
+    one accept per op. The pre-fix driver pooled those unclean connections and
+    reused them, collapsing the accept count far below the op count.
+
+    Negative control (PROVEN by reverting op->clean + its gate in the driver and
+    rebuilding the .so): dirty conns get pooled -> `accepts` drops ~10x -> the
+    assertion below fires. The worker-PID check also catches a crash on the
+    unclean path."""
+    dirty = DirtyMemcached(ng.memcached_port + 1)
+    dirty.start()
+    try:
+        n = 30
+        stamp = time.time()
+        workers_before = ng.worker_pids()
+
+        def one(i: int) -> int:
+            s, _, _ = fetch(ng.port, f"/mcdirty/d-{stamp}-{i}")
+            return s
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+            statuses = list(ex.map(one, range(n)))
+        time.sleep(0.6)   # let fire-and-forget SETs land + connections settle
+
+        assert all(s == 200 for s in statuses), \
+            f"a /mcdirty/ request failed (worker wedged on an unclean conn?): {statuses}"
+
+        if not ng.single_process:
+            assert ng.worker_pids() == workers_before, (
+                "worker PID set changed during the dirty-reply burst -- a worker "
+                "crashed handling an unclean memcached connection (D-O2)")
+
+        # ~2N ops, each on its own fresh connection when the clean gate closes the
+        # unclean ones. `>= n` sits ~2x under the pooled-none expectation (~2N) and
+        # well above the reuse case (~pool size). Generous slack for scheduling.
+        assert dirty.accepts >= n, (
+            f"dirty memcached connections were reused ({dirty.accepts} accepts for "
+            f"{n} cold keys / ~{2 * n} ops) -- an unclean reply was pooled (D-O2)")
+    finally:
+        dirty.stop()
+
+
 def test_mc_keepalive_server_close_survives(ng: Nginx, origin: Origin,
                                             mc: MemcachedServer) -> None:
     """D-O1: an idle memcached keepalive connection whose server drops it must
@@ -11092,6 +11271,7 @@ def run_all(ng: Nginx, origin: Origin,
                 ng, origin, redis, mc)
         test_mc_keepalive_reuse(ng, origin, mc)            # D-O1 reuse+re-pool
         test_mc_keepalive_idle_timeout_drops(ng, origin, mc)  # D-O1 timedout br
+        test_mc_dirty_reply_not_pooled(ng, origin)         # D-O2 clean-gate
         # D-O1 idle-pool close: MUST be last mc test — it stops the mc server.
         test_mc_keepalive_server_close_survives(ng, origin, mc)
     # PERF-7 zero-copy serve stress: run LAST among L1 tests — its 48-thread /

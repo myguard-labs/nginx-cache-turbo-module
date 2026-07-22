@@ -67,6 +67,9 @@ typedef struct {
     size_t                            rlen;
 
     u_char                            recv[128];/* SET/DELETE reply scratch    */
+    size_t                            recv_len; /* bytes accumulated in recv[] */
+    unsigned                          clean:1;  /* reply fully framed at a
+                                                 * boundary: conn is poolable  */
 } ngx_http_cache_turbo_mc_op_t;
 
 
@@ -191,7 +194,12 @@ ngx_http_cache_turbo_mc_ka_save(ngx_http_cache_turbo_mc_op_t *op)
     ngx_http_cache_turbo_loc_conf_t            *clcf;
     ngx_int_t                                   ka;
 
-    if (c == NULL || op->clcf == NULL) {
+    /* Only a connection left at a verified reply boundary may be pooled. A
+     * partial/fragmented reply, a timeout, an EOF, a write failure or a server
+     * error all leave clean=0 -> the stream offset is UNKNOWN, so re-pooling it
+     * would desync the next reuse (it would read the leftover bytes as its own
+     * reply). Mirrors the Redis driver's clean gate (STAB-1 / v15). */
+    if (!op->clean || c == NULL || op->clcf == NULL) {
         return 0;
     }
 
@@ -657,12 +665,18 @@ ngx_http_cache_turbo_mc_write(ngx_event_t *wev)
 }
 
 
-/* SET/DELETE reply: we only need memcached to have acknowledged; drain one read
- * and stop. Fire-and-forget: any reply / EOF / error ends the op. */
+/* SET/DELETE reply drain. The command is durable the moment memcached ACKs, so
+ * the RESULT is ignored — but the connection may only be POOLED once a COMPLETE
+ * single-line ack is framed with nothing trailing it. A TCP fragment ("STOR"
+ * now, "ED\r\n" later), a timeout, an EOF/error, an unrecognized/error reply, or
+ * extra bytes past the ack's CRLF all leave clean=0 so the connection is closed
+ * rather than re-pooled into a desynced reuse (mirrors redis_read_drain STAB-1). */
 static void
 ngx_http_cache_turbo_mc_read_drain(ngx_event_t *rev)
 {
     ssize_t                        n;
+    size_t                         line;
+    u_char                        *lf;
     ngx_connection_t              *c;
     ngx_http_cache_turbo_mc_op_t  *op;
 
@@ -672,33 +686,66 @@ ngx_http_cache_turbo_mc_read_drain(ngx_event_t *rev)
     if (rev->timedout) {
         ngx_log_error(NGX_LOG_INFO, c->log, NGX_ETIMEDOUT,
                       "cache_turbo: memcached read timed out");
+        ngx_http_cache_turbo_mc_op_done(op);   /* clean stays 0: not pooled */
+        return;
+    }
+
+    for ( ;; ) {
+        if (op->recv_len >= sizeof(op->recv)) {
+            /* A SET/DELETE ack ("STORED\r\n" etc.) never fills 128 bytes; if one
+             * somehow does, don't pool rather than grow unbounded. */
+            ngx_http_cache_turbo_mc_op_done(op);
+            return;
+        }
+
+        n = c->recv(c, op->recv + op->recv_len,
+                    sizeof(op->recv) - op->recv_len);
+
+        if (n == NGX_AGAIN) {
+            if (ngx_handle_read_event(rev, 0) != NGX_OK) {
+                ngx_http_cache_turbo_mc_op_done(op);
+            }
+            return;
+        }
+        if (n == NGX_ERROR || n == 0) {
+            /* Peer closed/errored before the ack framed: don't pool. */
+            ngx_http_cache_turbo_mc_op_done(op);
+            return;
+        }
+
+        op->recv_len += (size_t) n;
+
+        /* Need a complete CRLF-terminated reply line before deciding. */
+        lf = ngx_strlchr(op->recv, op->recv + op->recv_len, LF);
+        if (lf == NULL) {
+            continue;                          /* line not complete yet */
+        }
+        if (lf == op->recv || lf[-1] != CR) {
+            ngx_http_cache_turbo_mc_op_done(op);   /* malformed framing */
+            return;
+        }
+
+        line = (size_t) (lf + 1 - op->recv);   /* bytes through the CRLF */
+
+        /* Poolable only when the reply is a recognized single-line ack AND the
+         * server sent nothing past its CRLF (extra bytes => stream desync on the
+         * next reuse). Any error/unknown reply keeps clean=0 -> conn closed. */
+        if (line == op->recv_len
+            && (ngx_strncmp(op->recv, "STORED", 6) == 0
+                || ngx_strncmp(op->recv, "DELETED", 7) == 0
+                || ngx_strncmp(op->recv, "NOT_FOUND", 9) == 0))
+        {
+            op->clean = 1;
+        } else {
+            ngx_log_error(NGX_LOG_INFO, c->log, 0,
+                          "cache_turbo: memcached reply not poolable: %*s",
+                          (size_t) (op->recv_len > 64 ? 64 : op->recv_len),
+                          op->recv);
+        }
+
         ngx_http_cache_turbo_mc_op_done(op);
         return;
     }
-
-    n = c->recv(c, op->recv, sizeof(op->recv));
-
-    if (n == NGX_AGAIN) {
-        if (ngx_handle_read_event(rev, 0) != NGX_OK) {
-            ngx_http_cache_turbo_mc_op_done(op);
-        }
-        return;
-    }
-
-    /* A non-"STORED"/"DELETED"/"NOT_FOUND" reply (ERROR/CLIENT_ERROR/
-     * SERVER_ERROR) is worth a log line, but the op is fire-and-forget either
-     * way: L2 is advisory, so we never surface it to the request. */
-    if (n > 0
-        && ngx_strncmp(op->recv, "STORED", 6) != 0
-        && ngx_strncmp(op->recv, "DELETED", 7) != 0
-        && ngx_strncmp(op->recv, "NOT_FOUND", 9) != 0)
-    {
-        ngx_log_error(NGX_LOG_INFO, c->log, 0,
-                      "cache_turbo: memcached reply: %*s",
-                      (size_t) (n > 64 ? 64 : n), op->recv);
-    }
-
-    ngx_http_cache_turbo_mc_op_done(op);
 }
 
 
@@ -771,7 +818,7 @@ ngx_http_cache_turbo_mc_fill(ngx_http_cache_turbo_mc_op_t *op, ngx_event_t *rev)
  */
 static ngx_int_t
 ngx_http_cache_turbo_mc_parse(ngx_http_cache_turbo_mc_op_t *op,
-    u_char **blob, size_t *blob_len)
+    u_char **blob, size_t *blob_len, size_t *consumed)
 {
     u_char    *p, *end, *cr, *q, *sp, *data;
     ngx_int_t  len;
@@ -795,6 +842,7 @@ ngx_http_cache_turbo_mc_parse(ngx_http_cache_turbo_mc_op_t *op,
     /* THE definitive miss: a bare "END" line. The only parse outcome that may
      * arm the L13 negative memo. */
     if (cr - p == 3 && ngx_strncmp(p, "END", 3) == 0) {
+        *consumed = (size_t) (cr + 2 - op->rbuf);   /* through "END\r\n" */
         return NGX_DECLINED;
     }
 
@@ -838,8 +886,17 @@ ngx_http_cache_turbo_mc_parse(ngx_http_cache_turbo_mc_op_t *op,
         return NGX_AGAIN;
     }
 
+    /* Validate the EXACT trailer. A corrupt/short value whose declared <bytes>
+     * doesn't line up with a real "\r\nEND\r\n" is malformed, not a hit: treat
+     * it as NGX_ERROR so the stream offset is deemed unknown and the connection
+     * is not pooled (a later reuse would resync mid-reply). */
+    if (ngx_strncmp(data + len, "\r\nEND\r\n", sizeof("\r\nEND\r\n") - 1) != 0) {
+        return NGX_ERROR;
+    }
+
     *blob = data;
     *blob_len = (size_t) len;
+    *consumed = (size_t) (data + len + (sizeof("\r\nEND\r\n") - 1) - op->rbuf);
     return NGX_OK;
 }
 
@@ -850,7 +907,7 @@ static void
 ngx_http_cache_turbo_mc_read_get(ngx_event_t *rev)
 {
     u_char                        *blob;
-    size_t                         blob_len;
+    size_t                         blob_len, consumed;
     ngx_int_t                      rc;
     ngx_connection_t              *c;
     ngx_http_cache_turbo_mc_op_t  *op;
@@ -861,7 +918,8 @@ ngx_http_cache_turbo_mc_read_get(ngx_event_t *rev)
     if (rev->timedout) {
         ngx_log_error(NGX_LOG_INFO, c->log, NGX_ETIMEDOUT,
                       "cache_turbo: memcached GET timed out");
-        /* L13: transport failure, NOT a definitive miss -- must not arm the memo */
+        /* L13: transport failure, NOT a definitive miss -- must not arm the memo.
+         * clean stays 0: a half-read reply is on the wire, don't pool. */
         ngx_http_cache_turbo_mc_get_finish(op, NGX_ERROR, NULL, 0);
         return;
     }
@@ -872,22 +930,36 @@ ngx_http_cache_turbo_mc_read_get(ngx_event_t *rev)
             return;                        /* wait for more, or re-arm failed */
         }
         if (rc == NGX_ERROR) {
-            /* cap/alloc/closed connection: L2's answer is UNKNOWN */
+            /* cap/alloc/closed connection: L2's answer is UNKNOWN; not poolable */
             ngx_http_cache_turbo_mc_get_finish(op, NGX_ERROR, NULL, 0);
             return;
         }
 
-        rc = ngx_http_cache_turbo_mc_parse(op, &blob, &blob_len);
+        consumed = 0;
+        rc = ngx_http_cache_turbo_mc_parse(op, &blob, &blob_len, &consumed);
         if (rc == NGX_AGAIN) {
             continue;                      /* read more */
         }
+        if (rc == NGX_ERROR) {
+            /* server error / malformed: stream offset UNKNOWN, must not pool
+             * (clean stays 0) and must NOT arm the L13 memo. */
+            ngx_http_cache_turbo_mc_get_finish(op, NGX_ERROR, NULL, 0);
+            return;
+        }
+
+        /* rc is NGX_OK (hit) or NGX_DECLINED (bare END, definitive miss): a
+         * complete, well-framed reply was consumed. The connection is poolable
+         * ONLY if the server sent nothing past it -- trailing bytes mean an
+         * unexpected pipelined/garbage tail and a later reuse would desync. */
+        if (consumed == op->rlen) {
+            op->clean = 1;
+        }
+
         if (rc == NGX_OK) {
             ngx_http_cache_turbo_mc_get_finish(op, NGX_OK, blob, blob_len);
         } else {
-            /* NGX_DECLINED (bare END) = definitive miss, may arm the L13 memo;
-             * NGX_ERROR (server error / malformed) = unknown, must not. Passed
-             * straight through -- do NOT collapse. */
-            ngx_http_cache_turbo_mc_get_finish(op, rc, NULL, 0);
+            /* NGX_DECLINED = definitive miss, may arm the L13 memo. */
+            ngx_http_cache_turbo_mc_get_finish(op, NGX_DECLINED, NULL, 0);
         }
         return;
     }
