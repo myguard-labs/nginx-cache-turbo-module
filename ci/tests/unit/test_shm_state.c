@@ -328,6 +328,7 @@ test_s8_evict_terminates_on_empty_queues(void)
      * zone. Assert it evicts the protected tail instead. */
     zone_reset();
     ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(0), 4);
+    REQUIRE(find(0) != NULL, "fixture: count_miss did not create the node");
     find(0)->seg = NGX_HTTP_CACHE_TURBO_SEG_PROTECTED;
     ngx_queue_remove(&find(0)->lru);
     ngx_queue_insert_head(&g_sh.lru_protected, &find(0)->lru);
@@ -394,6 +395,7 @@ test_s8_promote_on_second_hit(void)
     /* Build a real ENTRY the way store() would leave one: in probation. */
     ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(0), 1);
     ctn = find(0);
+    REQUIRE(ctn != NULL, "S8 fixture: count_miss did not create the ENTRY");
     ctn->kind = NGX_HTTP_CACHE_TURBO_NODE_ENTRY;
     ctn->len  = 128;
     ctn->seg  = NGX_HTTP_CACHE_TURBO_SEG_PROBATION;
@@ -436,6 +438,7 @@ test_s8_promote_on_second_hit(void)
     zone_reset();
     ngx_http_cache_turbo_shm_l2_neg_set(&g_zone, KEY(1), 600);
     ctn = find(1);
+    REQUIRE(ctn != NULL, "S8 fixture: l2_neg_set did not create the COUNTER");
     CHECK(ctn->kind == NGX_HTTP_CACHE_TURBO_NODE_COUNTER, "fixture: COUNTER");
 
     ngx_test_advance_time(2);
@@ -456,7 +459,7 @@ test_s8_promote_on_second_hit(void)
     ngx_test_advance_time(2);
     CHECK(ngx_http_cache_turbo_shm_l2_neg_check(&g_zone, KEY(1)) == NGX_DECLINED,
           "fixture: memo should still be live");
-    CHECK(find(1)->seg == NGX_HTTP_CACHE_TURBO_SEG_PROBATION,
+    CHECK(ctn->seg == NGX_HTTP_CACHE_TURBO_SEG_PROBATION,
           "S8: l2_neg_check promoted a memo COUNTER");
 
     CHECK(ngx_test_lock_balanced(), "touch path left the zone mutex held");
@@ -487,6 +490,7 @@ test_s8_off_demotes_inherited_protected_nodes(void)
     /* Build the post-reload state: an ENTRY promoted while the feature was on. */
     ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(0), 1);
     ctn = find(0);
+    REQUIRE(ctn != NULL, "S8-off fixture: count_miss did not create the ENTRY");
     ctn->kind = NGX_HTTP_CACHE_TURBO_NODE_ENTRY;
     ctn->len  = 128;
     ctn->last_access = ngx_test_now;
@@ -716,21 +720,23 @@ test_count_miss_semantics(void)
     zone_reset();
     ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(1), 4);
     ctn = find(1);
+    REQUIRE(ctn != NULL, "count_miss fixture: live-stub node missing");
     ctn->refreshing         = 1;
     ctn->refresh_lock_until = ngx_test_now + 5;
     CHECK(ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(1), 4) == NGX_OK,
           "a live stub should pass through as NGX_OK");
-    CHECK(find(1)->miss_count == 1, "a live stub must not be counted");
+    CHECK(ctn->miss_count == 1, "a live stub must not be counted");
 
     /* A proven-cacheable ENTRY is never re-gated. */
     zone_reset();
     ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(2), 4);
     ctn = find(2);
+    REQUIRE(ctn != NULL, "count_miss fixture: ENTRY node missing");
     ctn->kind = NGX_HTTP_CACHE_TURBO_NODE_ENTRY;
     ctn->len  = 128;
     CHECK(ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(2), 4) == NGX_OK,
           "an ENTRY must never be re-gated by min_uses");
-    CHECK(find(2)->miss_count == 1, "an ENTRY's counter must not be touched");
+    CHECK(ctn->miss_count == 1, "an ENTRY's counter must not be touched");
     ctn->len = 0;   /* keep zone_reset()'s drain off the blob path */
     ctn->kind = NGX_HTTP_CACHE_TURBO_NODE_COUNTER;
 }
@@ -745,11 +751,12 @@ test_l2_neg_never_on_entry(void)
 
     ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(0), 4);
     ctn = find(0);
+    REQUIRE(ctn != NULL, "ENTRY-never-memoed fixture: node missing");
     ctn->kind = NGX_HTTP_CACHE_TURBO_NODE_ENTRY;
     ctn->len  = 64;
 
     ngx_http_cache_turbo_shm_l2_neg_set(&g_zone, KEY(0), 60);
-    CHECK(find(0)->l2_neg_until == 0, "an ENTRY must never be memoed");
+    CHECK(ctn->l2_neg_until == 0, "an ENTRY must never be memoed");
     CHECK(ngx_http_cache_turbo_shm_l2_neg_check(&g_zone, KEY(0)) == NGX_OK,
           "an ENTRY must never report a memo hit");
 
@@ -801,6 +808,7 @@ run_negative_controls(void)
     ngx_http_cache_turbo_shm_l2_neg_set(&g_zone, KEY(0), 60);
     ngx_http_cache_turbo_shm_claim(&g_zone, KEY(0), 5);
     ctn = find(0);
+    REQUIRE(ctn != NULL, "CR-A control fixture: memo node missing after claim");
     ctn->l2_neg_until = 0;                     /* <-- the bug */
 
     caught = (ngx_http_cache_turbo_shm_l2_neg_check(&g_zone, KEY(0)) != NGX_DECLINED);
@@ -818,6 +826,7 @@ run_negative_controls(void)
     ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(1), 4);
     ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(1), 4);
     ctn = find(1);
+    REQUIRE(ctn != NULL, "CR-B control fixture: COUNTER node missing");
     ctn->refreshing = 1;
     if (ctn->kind == NGX_HTTP_CACHE_TURBO_NODE_COUNTER
         && ctn->l2_neg_until <= ngx_time())     /* <-- the bug: no miss_count test */
