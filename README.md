@@ -1599,7 +1599,7 @@ $ apt install angie-module-http-cache-turbo
 
 - **Module catalogues:** [nginx modules](https://deb.myguard.nl/nginx-modules/)
   · [Angie modules (optimized & extended)](https://deb.myguard.nl/angie-modules-optimized-extended/)
-- **Directive synopsis:** [modules-synopsis #http-cache-turbo](https://deb.myguard.nl/nginx/modules-synopsis/#http-cache-turbo)
+- **Directive synopsis:** [modules-synopsis / http-cache-turbo](https://deb.myguard.nl/nginx/modules-synopsis/http-cache-turbo/)
 - **Writeup:** [nginx-cache-turbo — a built-in page cache](https://deb.myguard.nl/articles/nginx-cache-turbo/)
 
 ## Benchmarking
