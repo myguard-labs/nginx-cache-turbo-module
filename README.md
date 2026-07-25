@@ -273,18 +273,23 @@ location / {
 
 Semantics:
 
-- **MISS only.** The header is emitted on the response that *populates* the
-  cache (and the CDN edge). Subsequent HITs are served from the edge and do not
-  re-emit it — the CDN already holds the mapping.
+- **MISS *and* HIT.** The header rides every response for the representation,
+  not only the one that populated the cache. A CDN POP whose own copy expired or
+  was evicted refills from a cache-turbo **HIT**; if that hit carried no
+  `Surrogate-Key` the edge object would be untagged and would survive a later
+  tag purge, leaving stale content served.
 - **Same parsing as the tag index** — whitespace/comma split, deduped, and
   bounded to the same per-tag length and count caps, so a hostile/buggy origin
   can't blow up the emitted header.
 - **No Redis required.** Emitting the CDN header does *not* need cache-turbo's
   own L2 tag index — you can front a pure-L1 cache with a tag-purging CDN. (If
   you *also* want cache-turbo's own purge-by-tag, add `cache_turbo_redis`.)
-- **Not stored in the entry** — like the targeted freshness headers above, the
-  emitted `Surrogate-Key` is stripped before the entry is stored, so a HIT never
-  replays a stale tag set.
+- **Generated, not stored.** While the directive is `on` the emitted
+  `Surrogate-Key` is kept out of the stored blob and regenerated live from
+  `cache_turbo_tag` on each serve — so a HIT emits exactly one header line and
+  always the current tag set. With the directive `off`, an **origin-supplied**
+  `Surrogate-Key` is ordinary response metadata: it is stored with the entry and
+  replayed on every HIT.
 
 ## Quick start
 
@@ -1432,7 +1437,7 @@ http {
 | `cache_turbo_redis DSN [opts...]` | `http`, `server`, `location` | — | Add a shared **L2 Redis** tier. `DSN` is `redis://[user:pass@]host:port/db` (or bare `host:port`); `rediss://` = TLS. Write-through on store; one sync `GET` on an L1 miss (never on an L1 hit). Opts: `prefix=` (`ct:`, must be non-empty), `timeout=` (`250ms`), `password=`, `user=`, `db=`, `tls=on\|off`, `tls_verify=on\|off` (default on), `tls_ca=<file>`, `tls_name=<host>`, `keepalive=N` (idle conns to pool per worker, `0`=off), `keepalive_timeout=` (`60s`). Pooled conns are reused only within the same db/credentials/TLS context. **`keepalive=`/`keepalive_timeout=` are honoured per connection profile — each distinct backend gets its own per-worker pool sized from its own location (soft cap 16 profiles/worker).** Native client, no hiredis. |
 | `cache_turbo_memcached HOST:PORT [opts...]` | `http`, `server`, `location` | — | Add a shared **L2 memcached** tier (alternative to `cache_turbo_redis`, mutually exclusive with it). Write-through on store; one sync `get` on an L1 miss. Opts: `prefix=` (`ct:`), `timeout=` (`250ms`), `keepalive=N` (idle conns to pool per worker, `0`=off), `keepalive_timeout=` (`60s`). Pooled conns are keyed by peer address (memcached has no db/credentials/TLS) and only re-pooled when the previous reply framed cleanly at a boundary. No tags / `?all` / cross-node lock (memcached lacks sorted sets, `SCAN`, atomic `SET-NX`); 1 MiB value cap. Native client, no libmemcached. |
 | `cache_turbo_tag EXPR` | `server`, `location` | — | Tag stored pages (whitespace/comma list) so they can be purged as a group. Needs `cache_turbo_redis`. |
-| `cache_turbo_surrogate_key on\|off` | `server`, `location` | `off` | Emit the `cache_turbo_tag` list downstream as a `Surrogate-Key` header on the MISS/store response, so a fronting CDN (Fastly, …) can purge-by-tag in sync. No `cache_turbo_redis` required. See [Purge-syncing the CDN](#purge-syncing-the-cdn-cache_turbo_surrogate_key). |
+| `cache_turbo_surrogate_key on\|off` | `server`, `location` | `off` | Emit the `cache_turbo_tag` list downstream as a `Surrogate-Key` header on the MISS/store response **and on every HIT/STALE serve** (a CDN POP can refill from a hit), so a fronting CDN (Fastly, …) can purge-by-tag in sync. No `cache_turbo_redis` required. See [Purge-syncing the CDN](#purge-syncing-the-cdn-cache_turbo_surrogate_key). |
 | `cache_turbo_admin NAME` | `location` | — | Make this location a control endpoint for zone `NAME` (stats/purge/warm). Gate with `allow`/`deny`. |
 | `cache_turbo_normalize_strip NAME...` | `server`, `location` | — | Extra query args to drop from `$cache_turbo_normalized_args` (trailing `*` = prefix; a bare `*` matches every name = drop all), on top of the built-ins. |
 | `cache_turbo_normalize_vary TOKEN...` | `server`, `location` | off | Append a variant bucket to `$cache_turbo_normalized_args`: `encoding` (br/gzip/identity) and/or `device` (mobile/desktop). |
@@ -1598,7 +1603,11 @@ later ops instead of opening a fresh TCP connection each time (`0`, the default,
 opens one per op). `keepalive_timeout=` (default `60s`) is how long an idle
 pooled connection is kept before it is closed. memcached has no db, credentials
 or TLS, so a pool is keyed only by **peer address** — every location pointing at
-the same `HOST:PORT` shares its worker's pool. A connection is returned to the
+the same `HOST:PORT` shares its worker's pool, which is allocated at the size the
+location that first touched it configured. A location with `keepalive=0` neither
+borrows from nor re-pools into that shared pool: it always dials a fresh
+connection, exactly as documented, and cannot drain a neighbouring location's
+pool. A connection is returned to the
 pool only after its reply was read to a clean protocol boundary; a timeout, a
 short/fragmented reply, an EOF or a server error closes the connection instead
 of pooling it, so a reused connection is never mid-reply. The same soft cap of

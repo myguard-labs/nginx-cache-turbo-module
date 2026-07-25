@@ -494,6 +494,13 @@ class Origin:
                     self.send_header(
                         "Set-Cookie",
                         "sw-cache-hash=aaaabbbbccccdddd; Path=/; HttpOnly")
+                if "originsk" in self.path:
+                    # SK-A1: an origin-supplied Surrogate-Key. With
+                    # cache_turbo_surrogate_key OFF the module generates nothing,
+                    # so this header is ordinary representation metadata: it must
+                    # be stored and replayed on every HIT, or a CDN refilling
+                    # from our hit caches an object outside its tag purge.
+                    self.send_header("Surrogate-Key", "origin-a origin-b")
                 if "ccprivate" in self.path:
                     self.send_header("Cache-Control", "private, max-age=60")
                 if "ccnostore" in self.path:
@@ -721,6 +728,39 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
         }}
 """
 
+    # SK-A2: the surrogate-key locations that carry NO cache_turbo_redis are
+    # emitted unconditionally. They used to sit inside redis_loc, so a run
+    # without --redis-server dropped them while run_all() still called their
+    # tests -- the "works without an L2 tag index" claim was exactly the case
+    # that never ran. /skoff/ stays in redis_loc (it needs Redis to consume the
+    # tag and suppress the COR-0 "no effect" warning).
+    sk_loc = f"""
+        # cache_turbo_surrogate_key: emit the tag list downstream as a
+        # Surrogate-Key header for a fronting CDN. Deliberately NO cache_turbo_redis
+        # here -- the emit must work without an L2 tag index. SK-A1: BOTH the MISS
+        # and every later HIT carry the header, because a CDN POP that lost its own
+        # copy refills from our HIT and would otherwise cache an untagged object.
+        location /sk/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    30s;
+            cache_turbo_tag      "blog news blog";
+            cache_turbo_surrogate_key on;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # surrogate_key with the tag value from a query arg (upstream-controlled
+        # stand-in) so the cap/dedup carries into the emitted header.
+        location /skcap/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    30s;
+            cache_turbo_tag      $arg_t;
+            cache_turbo_surrogate_key on;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+"""
+
     # L2 (v2b): a location wired to a Redis backend. Scoped to /l2/ only so the
     # L1-only tests (purge, eviction, ...) are unaffected. Emitted only when a
     # RedisServer is running, so the no-redis path still config-tests.
@@ -918,20 +958,6 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
-        # cache_turbo_surrogate_key: emit the tag list downstream as a
-        # Surrogate-Key header for a fronting CDN. Deliberately NO cache_turbo_redis
-        # here -- the emit must work without an L2 tag index. First request is a
-        # MISS and carries Surrogate-Key; the second is a HIT and must NOT
-        # (the CDN keyed the object on the miss, a hit replays the stored blob).
-        location /sk/ {{
-            cache_turbo          main;
-            cache_turbo_key      $uri;
-            cache_turbo_valid    30s;
-            cache_turbo_tag      "blog news blog";
-            cache_turbo_surrogate_key on;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-
         # surrogate_key OFF (default): tag set but no downstream header. Proves the
         # directive gates the emit -- a plain cache_turbo_tag user is unaffected.
         # Redis is attached so the tag has its normal purge-by-tag consumer and
@@ -946,17 +972,6 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             cache_turbo_valid    30s;
             cache_turbo_redis    127.0.0.1:{redis_port} prefix=sk: timeout=250ms;
             cache_turbo_tag      "skoff-a skoff-b";
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-
-        # surrogate_key with the tag value from a query arg (upstream-controlled
-        # stand-in) so the cap/dedup carries into the emitted header.
-        location /skcap/ {{
-            cache_turbo          main;
-            cache_turbo_key      $uri;
-            cache_turbo_valid    30s;
-            cache_turbo_tag      $arg_t;
-            cache_turbo_surrogate_key on;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
@@ -1067,6 +1082,20 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             cache_turbo_key        $uri;
             cache_turbo_valid      30s;
             cache_turbo_memcached  127.0.0.1:{memcached_port} prefix=mck: timeout=250ms keepalive=4 keepalive_timeout=30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # MC-A2: SAME memcached peer as /mcka/ but keepalive explicitly 0. The
+        # documented contract is a fresh connection per op; before the fix
+        # mc_connect looked the pool up by peer address only, so this location
+        # borrowed (and, because ka_save does check zero, then CLOSED) sockets
+        # /mcka/ had pooled -- draining another location's pool. Exercised by
+        # test_mc_keepalive_zero_does_not_drain_pool.
+        location /mcka0/ {{
+            cache_turbo            main;
+            cache_turbo_key        $uri;
+            cache_turbo_valid      30s;
+            cache_turbo_memcached  127.0.0.1:{memcached_port} prefix=mck0: timeout=250ms keepalive=0;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
@@ -1219,6 +1248,7 @@ http {{
 
     server {{
         listen 127.0.0.1:{port};
+{sk_loc}
 {redis_loc}
 {mc_loc}
 {dsn_loc}
@@ -3461,11 +3491,13 @@ def test_miss_then_hit(ng: Nginx) -> None:
     assert b1 == b2, f"HIT body differs: {b1!r} vs {b2!r}"
 
 
-def test_surrogate_key_emit_on_miss_only(ng: Nginx) -> None:
-    """cache_turbo_surrogate_key on: the MISS (store) response carries a
-    Surrogate-Key header built from the deduped cache_turbo_tag list; the HIT
-    (blob replay) does NOT re-emit it. Works with NO cache_turbo_redis -- the
-    emit is independent of the L2 tag index."""
+def test_surrogate_key_emit_on_miss_and_hit(ng: Nginx) -> None:
+    """cache_turbo_surrogate_key on: BOTH the MISS (store) response and every
+    later HIT carry the same Surrogate-Key header built from the deduped
+    cache_turbo_tag list (SK-A1). A fronting CDN POP whose own copy expired
+    refills from our HIT; an untagged hit would leave that edge object outside
+    the tag purge. Works with NO cache_turbo_redis -- the emit is independent of
+    the L2 tag index."""
     path = "/sk/page"
 
     s1, _b1, h1 = fetch(ng.port, path)
@@ -3480,8 +3512,27 @@ def test_surrogate_key_emit_on_miss_only(ng: Nginx) -> None:
     s2, _b2, h2 = fetch(ng.port, path)
     assert s2 == 200
     assert h2.get("x-cache") == "HIT", f"second req X-Cache={h2.get('x-cache')}"
-    assert "surrogate-key" not in h2, \
-        f"HIT must NOT re-emit Surrogate-Key, got {h2.get('surrogate-key')!r}"
+    sk2 = h2.get("surrogate-key")
+    assert sk2 is not None, \
+        "HIT dropped Surrogate-Key -- a CDN refilling from this hit caches an " \
+        "untagged object that a tag purge cannot reach (SK-A1)"
+    assert sk2.split() == ["blog", "news"], \
+        f"HIT Surrogate-Key differs from the MISS's: {sk2!r} vs {sk!r}"
+    assert sk2.split() == sk.split(), "MISS and HIT keys must match exactly"
+
+    # Exactly one header line -- the store-path skip must keep the generated key
+    # out of the blob, or the hit would carry a duplicate.
+    conn = http.client.HTTPConnection("127.0.0.1", ng.port, timeout=5)
+    try:
+        conn.request("GET", path, headers={"Connection": "close"})
+        resp = conn.getresponse()
+        resp.read()
+        sk_lines = [v for k, v in resp.getheaders()
+                    if k.lower() == "surrogate-key"]
+    finally:
+        conn.close()
+    assert len(sk_lines) == 1, \
+        f"expected exactly one Surrogate-Key line on a HIT, got {sk_lines!r}"
 
 
 def test_surrogate_key_off_by_default(ng: Nginx) -> None:
@@ -3492,6 +3543,26 @@ def test_surrogate_key_off_by_default(ng: Nginx) -> None:
     assert "x-cache" not in h1, f"first req should MISS, got {h1.get('x-cache')}"
     assert "surrogate-key" not in h1, \
         f"surrogate_key OFF but header present: {h1.get('surrogate-key')!r}"
+
+
+def test_surrogate_key_origin_header_survives_hit(ng: Nginx) -> None:
+    """SK-A1, directive OFF: an origin-supplied Surrogate-Key is stored with the
+    representation and replayed on the HIT. The store-path skip only applies to
+    the key the module generates itself; dropping the origin's would hand a CDN
+    an untagged edge object on every refill from our cache."""
+    path = "/c/originsk-page"
+
+    s1, _b1, h1 = fetch(ng.port, path)
+    assert s1 == 200, f"miss status {s1}"
+    assert "x-cache" not in h1, f"first req should MISS, got {h1.get('x-cache')}"
+    assert h1.get("surrogate-key") == "origin-a origin-b", \
+        f"origin Surrogate-Key mangled on MISS: {h1.get('surrogate-key')!r}"
+
+    s2, _b2, h2 = fetch(ng.port, path)
+    assert s2 == 200
+    assert h2.get("x-cache") == "HIT", f"second req X-Cache={h2.get('x-cache')}"
+    assert h2.get("surrogate-key") == "origin-a origin-b", \
+        f"HIT dropped the origin Surrogate-Key: {h2.get('surrogate-key')!r}"
 
 
 def test_surrogate_key_empty_tag_no_header(ng: Nginx) -> None:
@@ -10980,6 +11051,49 @@ def test_mc_keepalive_reuse(ng: Nginx, origin: Origin,
     assert h.get("x-cache") == "HIT", "keepalive location broke the hot path"
 
 
+def test_mc_keepalive_zero_does_not_drain_pool(ng: Nginx, origin: Origin,
+                                               mc: MemcachedServer) -> None:
+    """MC-A2: a location with keepalive=0 must neither borrow from nor drain the
+    pool a DIFFERENT location filled for the SAME memcached peer. /mcka/ has
+    keepalive=4 and /mcka0/ points at the same address with keepalive=0.
+
+    Prime /mcka/ so idle sockets sit in the pool, run a burst through /mcka0/,
+    then run a burst through /mcka/ again. If the zero location borrowed pooled
+    sockets it would close each one after its op (ka_save refuses to re-pool at
+    keepalive=0), so the second /mcka/ burst would have to re-dial and its accept
+    count would jump to the connect-per-op level. With the fix the zero location
+    dials its own connections and /mcka/'s pool is untouched."""
+    n = 12
+    stamp = time.time()
+
+    def burst(prefix: str, tag: str) -> int:
+        before = mc.total_connections() - 1
+        for i in range(n):
+            fetch(ng.port, f"{prefix}drain-{tag}-{stamp}-{i}")
+        time.sleep(0.6)          # let fire-and-forget SETs settle
+        return mc.total_connections() - 1 - before
+
+    workers_before = ng.worker_pids()
+
+    burst("/mcka/", "prime")             # fill the pool
+    zero = burst("/mcka0/", "zero")      # keepalive=0: fresh conn per op
+    warm = burst("/mcka/", "warm")       # pool must still be warm
+
+    if not ng.single_process:
+        assert ng.worker_pids() == workers_before, \
+            "worker crashed during the mixed keepalive=0 / keepalive=4 burst"
+
+    assert zero > n, \
+        f"keepalive=0 location did not dial per op (accepts={zero}, ops={n})"
+    # The pool holds 4 idle sockets. If /mcka0/ borrowed them it closed each one
+    # after its op (ka_save refuses to re-pool at keepalive=0), so the warm burst
+    # must re-dial the whole pool. Untouched, the warm burst reuses what is
+    # already pooled and opens (almost) nothing.
+    assert warm <= 1, (
+        "the keepalive=0 location drained the shared peer's pool: the warm "
+        f"burst re-dialled {warm} connection(s) (zero={zero}, ops={n})")
+
+
 def test_mc_keepalive_idle_timeout_drops(ng: Nginx, origin: Origin,
                                          mc: MemcachedServer) -> None:
     """D-O1 idle-timer branch of mc_ka_close_handler (ev->timedout): a pooled
@@ -11130,8 +11244,12 @@ def run_all(ng: Nginx, origin: Origin,
             redis_tls: RedisServer | None = None,
             mc: MemcachedServer | None = None) -> None:
     test_miss_then_hit(ng)
-    test_surrogate_key_emit_on_miss_only(ng)
-    test_surrogate_key_off_by_default(ng)
+    test_surrogate_key_emit_on_miss_and_hit(ng)
+    if redis is not None:
+        # /skoff/ carries a cache_turbo_redis (its tag needs the L2 consumer to
+        # keep the COR-0 warning quiet), so it only exists in a Redis run.
+        test_surrogate_key_off_by_default(ng)
+    test_surrogate_key_origin_header_survives_hit(ng)
     test_surrogate_key_empty_tag_no_header(ng)
     test_surrogate_key_dedup_from_arg(ng)
     test_post_passthrough_uncached(ng, origin)
@@ -11387,6 +11505,7 @@ def run_all(ng: Nginx, origin: Origin,
             test_l2_backend_inheritance_child_redis_over_parent_memcached(
                 ng, origin, redis, mc)
         test_mc_keepalive_reuse(ng, origin, mc)            # D-O1 reuse+re-pool
+        test_mc_keepalive_zero_does_not_drain_pool(ng, origin, mc)  # MC-A2
         test_mc_keepalive_idle_timeout_drops(ng, origin, mc)  # D-O1 timedout br
         test_mc_dirty_reply_not_pooled(ng, origin)         # D-O2 clean-gate
         # D-O1 idle-pool close: MUST be last mc test — it stops the mc server.
