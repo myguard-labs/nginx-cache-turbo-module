@@ -5027,12 +5027,12 @@ ngx_http_cache_turbo_add_header(ngx_http_request_t *r,
  * keys the edge object on the same tags. Space is the surrogate-key separator;
  * the tokeniser splits on it, so a single tag never itself contains a space.
  *
- * Called from the HEADER filter on the capture (MISS/store) path only, BEFORE
- * headers are sent -- the body-filter store runs after the header filter, far
- * too late to add a response header. A HIT is served earlier (ctx->served) and
- * never reaches the capture path, so a replayed hit does not re-emit it; the CDN
- * already holds the mapping from the miss that populated its edge. Independent of
- * cache_turbo_redis -- emitting the CDN header needs no turbo L2 tag index.
+ * Called from the HEADER filter on the capture (MISS/store) path BEFORE headers
+ * are sent (the body-filter store runs after the header filter, far too late to
+ * add a response header), AND from restore_response() on every HIT/STALE serve
+ * (SK-A1): a CDN POP that lost its own copy refills from one of our hits, so a
+ * hit without the key produces an untagged, unpurgeable edge object. Independent
+ * of cache_turbo_redis -- emitting the CDN header needs no turbo L2 tag index.
  *
  * Best-effort: empty tag value, zero surviving tags, or any allocation failure
  * simply skips the header. A missing CDN purge-key is a degraded-but-correct
@@ -5320,6 +5320,22 @@ ngx_http_cache_turbo_restore_response(ngx_http_request_t *r, u_char *copy,
 
         if (ngx_http_cache_turbo_add_header(r, nm, nl, vv, vl) != NGX_OK) {
             return NGX_ERROR;
+        }
+    }
+
+    /* SK-A1: re-emit the CDN purge key on every HIT/STALE serve, not only on the
+     * MISS that stored the entry. A fronting surrogate-key CDN refills a POP from
+     * one of OUR hits whenever its own copy expired or was evicted; without the
+     * key that edge object is untagged and survives a later tag purge, leaving
+     * stale content publicly served. Generated live from the same cache_turbo_tag
+     * expression (the header is skipped at store while the directive is on, so
+     * there is no duplicate), and best-effort like the MISS-path emit. */
+    {
+        ngx_http_cache_turbo_loc_conf_t  *sk_clcf;
+
+        sk_clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
+        if (sk_clcf != NULL && sk_clcf->surrogate_key) {
+            ngx_http_cache_turbo_emit_surrogate_key(r, sk_clcf);
         }
     }
 
@@ -5723,15 +5739,26 @@ ngx_http_cache_turbo_header_skip(ngx_http_cache_turbo_loc_conf_t *clcf,
          * downstream would wrongly steer the browser or a next cache tier with a
          * TTL meant for us. Same rationale as the Age strip above. */
         "CDN-Cache-Control", "Surrogate-Control",
-        /* cache_turbo_surrogate_key stamps this on the MISS/capture response for a
-         * fronting CDN. It must NOT enter the blob: a later HIT replays the blob,
-         * and re-emitting the miss's Surrogate-Key on every hit is both redundant
-         * (the CDN keyed the object on the miss) and wrong (a hit's tags could
-         * differ). The header filter re-emits it live on each fresh capture. */
-        "Surrogate-Key", NULL
+        NULL
     };
     ngx_uint_t  i;
     size_t      sl;
+
+    /* SK-A1: Surrogate-Key describes the representation, so it must travel WITH
+     * it. A CDN POP whose copy expired refills from OUR hit; if that hit carries
+     * no key the edge object is untagged and a later tag purge misses it.
+     *
+     * When cache_turbo_surrogate_key is ON we generate the header live on both
+     * MISS and HIT from the same cache_turbo_tag expression, so storing the
+     * miss-time copy would only duplicate it -> skip at store.
+     * When the directive is OFF the header is purely origin-supplied metadata
+     * about this response: store and replay it like any other header. */
+    if (clcf->surrogate_key
+        && nlen == sizeof("Surrogate-Key") - 1
+        && ngx_strncasecmp(name, (u_char *) "Surrogate-Key", nlen) == 0)
+    {
+        return 1;
+    }
 
     for (i = 0; skip[i] != NULL; i++) {
         sl = ngx_strlen(skip[i]);

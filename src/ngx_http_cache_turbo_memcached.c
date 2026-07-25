@@ -85,9 +85,11 @@ static void ngx_http_cache_turbo_mc_get_finish(
     u_char *blob, size_t blob_len);
 static void ngx_http_cache_turbo_mc_op_fail(ngx_http_cache_turbo_mc_op_t *op);
 static ngx_http_cache_turbo_memcached_ka_bucket_t *
-    ngx_http_cache_turbo_mc_ka_bucket(ngx_addr_t *addr, ngx_uint_t create);
+    ngx_http_cache_turbo_mc_ka_bucket(ngx_http_cache_turbo_loc_conf_t *clcf,
+        ngx_addr_t *addr, ngx_uint_t create);
 static ngx_connection_t *
-    ngx_http_cache_turbo_mc_ka_get(ngx_addr_t *addr);
+    ngx_http_cache_turbo_mc_ka_get(ngx_http_cache_turbo_loc_conf_t *clcf,
+        ngx_addr_t *addr);
 static ngx_uint_t
     ngx_http_cache_turbo_mc_ka_save(ngx_http_cache_turbo_mc_op_t *op);
 static void ngx_http_cache_turbo_mc_ka_drop(
@@ -101,13 +103,28 @@ ngx_http_cache_turbo_memcached_ka_t ngx_http_cache_turbo_memcached_ka;
 
 
 /* Locate or create the keepalive bucket for addr. Unlike redis, memcached has
- * no auth/TLS/db, so identity is just peer addr. create=0 for lookup only. */
+ * no auth/TLS/db, so identity is just peer addr. create=0 for lookup only.
+ *
+ * MC-A1/MC-A2: keepalive is a per-location setting, so this takes clcf and
+ * (a) returns NULL when THIS location disabled keepalive -- a keepalive=0
+ * location must never borrow from or drain a peer pool another location
+ * filled -- and (b) sizes the item array from the configured
+ * memcached_keepalive, not from the parse-time ceiling
+ * NGX_HTTP_CACHE_TURBO_KEEPALIVE_MAX (65535 items = 2 MiB per peer per worker
+ * even for keepalive=1). Mirrors the redis driver. Locations sharing one peer
+ * with different N latch the first creator's capacity; the per-op
+ * `count >= ka` gate in ka_save still enforces each location's own cap. */
 static ngx_http_cache_turbo_memcached_ka_bucket_t *
-ngx_http_cache_turbo_mc_ka_bucket(ngx_addr_t *addr, ngx_uint_t create)
+ngx_http_cache_turbo_mc_ka_bucket(ngx_http_cache_turbo_loc_conf_t *clcf,
+    ngx_addr_t *addr, ngx_uint_t create)
 {
     ngx_uint_t                                 i, max;
     ngx_http_cache_turbo_memcached_ka_t       *ka = &ngx_http_cache_turbo_memcached_ka;
     ngx_http_cache_turbo_memcached_ka_bucket_t *b;
+
+    if (clcf == NULL || clcf->memcached_keepalive <= 0) {
+        return NULL;
+    }
 
     for (i = 0; i < ka->nbuckets; i++) {
         b = &ka->buckets[i];
@@ -126,7 +143,7 @@ ngx_http_cache_turbo_mc_ka_bucket(ngx_addr_t *addr, ngx_uint_t create)
     }
 
     b = &ka->buckets[ka->nbuckets];
-    max = NGX_HTTP_CACHE_TURBO_KEEPALIVE_MAX; /* use redis cap; memcached uses per-loc override */
+    max = (ngx_uint_t) clcf->memcached_keepalive;
 
     b->items = ngx_palloc(ngx_cycle->pool,
                           max * sizeof(ngx_http_cache_turbo_memcached_ka_item_t));
@@ -154,14 +171,15 @@ ngx_http_cache_turbo_mc_ka_bucket(ngx_addr_t *addr, ngx_uint_t create)
 
 
 static ngx_connection_t *
-ngx_http_cache_turbo_mc_ka_get(ngx_addr_t *addr)
+ngx_http_cache_turbo_mc_ka_get(ngx_http_cache_turbo_loc_conf_t *clcf,
+    ngx_addr_t *addr)
 {
     ngx_queue_t                                 *q;
     ngx_connection_t                           *c;
     ngx_http_cache_turbo_memcached_ka_item_t   *item;
     ngx_http_cache_turbo_memcached_ka_bucket_t *b;
 
-    b = ngx_http_cache_turbo_mc_ka_bucket(addr, 0);
+    b = ngx_http_cache_turbo_mc_ka_bucket(clcf, addr, 0);
     if (b == NULL || ngx_queue_empty(&b->cache)) {
         return NULL;
     }
@@ -216,7 +234,7 @@ ngx_http_cache_turbo_mc_ka_save(ngx_http_cache_turbo_mc_op_t *op)
     addr.socklen = op->peer.socklen;
     addr.name = *op->peer.name;
 
-    b = ngx_http_cache_turbo_mc_ka_bucket(&addr, 1);
+    b = ngx_http_cache_turbo_mc_ka_bucket(clcf, &addr, 1);
     if (b == NULL || b->count >= (ngx_uint_t) ka) {
         return 0; /* pool full or no pool: close normally */
     }
@@ -315,8 +333,11 @@ ngx_http_cache_turbo_mc_connect(ngx_http_cache_turbo_mc_op_t *op,
     ngx_int_t          rc;
     ngx_connection_t  *c;
 
-    /* Try keepalive pool first. */
-    c = ngx_http_cache_turbo_mc_ka_get(addr);
+    /* Try keepalive pool first. Gated on THIS location's keepalive setting
+     * (MC-A2): with keepalive=0 the documented contract is a fresh connection
+     * per op, so it must not borrow -- and thereby drain -- a pool another
+     * location filled for the same peer. */
+    c = ngx_http_cache_turbo_mc_ka_get(op->clcf, addr);
     if (c != NULL) {
         op->peer.connection = c;
         /* Populate the peer address on the reuse path too: op_done -> ka_save
