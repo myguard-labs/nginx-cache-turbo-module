@@ -53,7 +53,7 @@ permissions:
 jobs:
   build-asan:
     name: Build (ASan/UBSan)
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02","lxc"]') }}
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02","ctsuite"]') }}
     timeout-minutes: 30
     steps:
       - name: Checkout
@@ -91,7 +91,7 @@ jobs:
 
   asan-single-process:
     name: ASan single-process
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02","lxc"]') }}
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02","ctsuite"]') }}
     timeout-minutes: 30
     needs: build-asan
     steps:
@@ -161,7 +161,7 @@ jobs:
 
   asan-multi-worker:
     name: ASan multi-worker
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02","lxc"]') }}
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02","ctsuite"]') }}
     timeout-minutes: 30
     needs: build-asan
     steps:

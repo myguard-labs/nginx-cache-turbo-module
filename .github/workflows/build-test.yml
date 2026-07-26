@@ -1,5 +1,23 @@
 name: Build & Test
 
+# Runner selection: `ctsuite`, NOT `lxc`.
+#
+# `lxc` matched only builder02-runner-01..04 — 4 slots — while builder02-docker-01
+# and -02 sat idle because they carry `docker` instead. A 10-job wave therefore ran
+# 4-at-a-time and spent more time queueing than executing (measured 2026-07-26:
+# 24min wall for ~40min of job time). The two families are equivalent for this
+# suite: both have gcc/clang/make/ccache/mold/valgrind/python3/fuser, 8 CPU / 8G,
+# nginx+redis+memcached installed-but-inactive, nothing enabled, and the test port
+# range 18870-18999 free. The old docker-golden :80 collision is fixed on both.
+#
+# `ctsuite` is applied to exactly those 6 local slots. builder03-docker-01 is
+# deliberately EXCLUDED (it carries the `builder02` label, so plain
+# [self-hosted, builder02] would have pulled it in): it is an incus container on a
+# WSL2 workstation reached over the LAN, and builder03's own lxc slots are not
+# currently registered. Keep this suite on the local box.
+#
+# Adding a slot => give it the `ctsuite` label; no workflow edit needed.
+
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   NGINX_VERSION: "1.31.1"
@@ -21,7 +39,7 @@ permissions:
 jobs:
   validation:
     name: Validation
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02","lxc"]') }}
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02","ctsuite"]') }}
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -88,7 +106,7 @@ jobs:
 
   build:
     name: Build
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02","lxc"]') }}
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02","ctsuite"]') }}
     timeout-minutes: 30
     steps:
       - name: Checkout
@@ -189,7 +207,7 @@ jobs:
 
   runtime:
     name: Runtime
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02","lxc"]') }}
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02","ctsuite"]') }}
     timeout-minutes: 15
     needs: build
     steps:
