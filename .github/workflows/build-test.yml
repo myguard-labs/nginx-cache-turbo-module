@@ -1,22 +1,25 @@
 name: Build & Test
 
-# Runner selection: `ctsuite`, NOT `lxc`.
+# Runner selection: plain `[self-hosted, builder02]`, NOT `lxc`.
 #
-# `lxc` matched only builder02-runner-01..04 — 4 slots — while builder02-docker-01
-# and -02 sat idle because they carry `docker` instead. A 10-job wave therefore ran
-# 4-at-a-time and spent more time queueing than executing (measured 2026-07-26:
-# 24min wall for ~40min of job time). The two families are equivalent for this
-# suite: both have gcc/clang/make/ccache/mold/valgrind/python3/fuser, 8 CPU / 8G,
+# `lxc` matched only the builder02-runner-* slots while the *-docker-* slots sat
+# idle because they carry `docker` instead. A 10-job wave therefore ran a few at a
+# time and spent more time queueing than executing (measured 2026-07-26: 24min wall
+# for ~40min of job time). The families are equivalent for this suite: both have
+# gcc/clang/make/ccache/mold/valgrind/python3/fuser, 8 CPU / 8G,
 # nginx+redis+memcached installed-but-inactive, nothing enabled, and the test port
 # range 18870-18999 free. The old docker-golden :80 collision is fixed on both.
 #
-# `ctsuite` is applied to exactly those 6 local slots. builder03-docker-01 is
-# deliberately EXCLUDED (it carries the `builder02` label, so plain
-# [self-hosted, builder02] would have pulled it in): it is an incus container on a
-# WSL2 workstation reached over the LAN, and builder03's own lxc slots are not
-# currently registered. Keep this suite on the local box.
+# Every slot in the org group carries `builder02`, so the bare selector reaches all
+# of them: the local builder02 lxc + docker slots AND builder03-docker-01. Adding a
+# slot => register it with `builder02`; no workflow edit needed.
 #
-# Adding a slot => give it the `ctsuite` label; no workflow edit needed.
+# NOTE: builder03-docker-01 is an incus container on a WSL2 workstation reached over
+# the LAN, so a job landing there has a network hop the local slots do not. Its lxc
+# siblings (builder03-runner-01..06) are registered but usually offline. If this
+# suite starts showing host-correlated flakes — dropped connections mid-run, stalled
+# background jobs — check which runner the job took before suspecting the code;
+# WSL2 has a known habit of killing backgrounded children on a broken pipe.
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -39,7 +42,7 @@ permissions:
 jobs:
   validation:
     name: Validation
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02","ctsuite"]') }}
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02"]') }}
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -106,7 +109,7 @@ jobs:
 
   build:
     name: Build
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02","ctsuite"]') }}
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02"]') }}
     timeout-minutes: 30
     steps:
       - name: Checkout
@@ -207,7 +210,7 @@ jobs:
 
   runtime:
     name: Runtime
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02","ctsuite"]') }}
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02"]') }}
     timeout-minutes: 15
     needs: build
     steps:
