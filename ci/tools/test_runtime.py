@@ -193,6 +193,15 @@ def _attribute_alert(conn_number: int) -> str:
     return "\n".join(lines)
 
 
+# Per-request HTTP timeout, in seconds. Instrumented builds (ASan/UBSan,
+# Valgrind) slow the server far enough that a request which is comfortably
+# sub-second on a normal build can exceed a fixed 5s budget -- the suite then
+# hard-fails with TimeoutError on a commit that is perfectly green untouched.
+# Scale it from the environment instead of hardcoding; teardown waits
+# (process reap, thread join) deliberately do NOT use this.
+HTTP_TIMEOUT = float(os.environ.get("TEST_CT_TIMEOUT", "5"))
+
+
 def wait_port(port: int, timeout: float = 15.0) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -223,7 +232,7 @@ def fetch(port: int, path: str, headers: dict | None = None,
         req.data = b""
     try:
         _bump_conn()
-        with urllib.request.urlopen(req, timeout=5) as r:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
             body = r.read().decode("utf-8", "replace")
             return r.status, body, {k.lower(): v for k, v in r.headers.items()}
     except urllib.error.HTTPError as exc:
@@ -238,7 +247,7 @@ def fetch_dup(port: int, path: str, headers: list[tuple[str, str]]):
     client choose which cache bucket it lands in. dict-based fetch() cannot
     express that request at all."""
     _bump_conn()
-    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=HTTP_TIMEOUT)
     try:
         conn.putrequest("GET", path, skip_host=False,
                         skip_accept_encoding=True)
@@ -259,7 +268,7 @@ def fetch_raw(port: int, path: str, method: str = "GET",
     """Like fetch(), but does NOT follow redirects and supports HEAD — returns
     (status, body_str, headers_dict). Uses http.client so a 3xx is observable."""
     _bump_conn()
-    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=HTTP_TIMEOUT)
     try:
         conn.request(method, path, headers=headers or {})
         resp = conn.getresponse()
@@ -3575,7 +3584,7 @@ def test_compressed_edge_identity_capture(ng: Nginx) -> None:
 
     def raw(ae: str):
         _bump_conn()
-        conn = http.client.HTTPConnection("127.0.0.1", ng.port, timeout=5)
+        conn = http.client.HTTPConnection("127.0.0.1", ng.port, timeout=HTTP_TIMEOUT)
         try:
             conn.request("GET", "/gz/page",
                          headers={"Accept-Encoding": ae, "Connection": "close"})
@@ -3661,7 +3670,7 @@ def test_surrogate_key_emit_on_miss_and_hit(ng: Nginx) -> None:
 
     # Exactly one header line -- the store-path skip must keep the generated key
     # out of the blob, or the hit would carry a duplicate.
-    conn = http.client.HTTPConnection("127.0.0.1", ng.port, timeout=5)
+    conn = http.client.HTTPConnection("127.0.0.1", ng.port, timeout=HTTP_TIMEOUT)
     try:
         conn.request("GET", path, headers={"Connection": "close"})
         resp = conn.getresponse()
@@ -6756,7 +6765,7 @@ def test_admin_purge_post_with_body(ng: Nginx) -> None:
         data=b"x" * 256, method="POST",
         headers={"Connection": "close"})
     _bump_conn()
-    with urllib.request.urlopen(req, timeout=5) as r:
+    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
         assert r.status == 200, f"purge-with-body status {r.status}"
         assert json.loads(r.read())["purged"] == 1
     _, _, h2 = fetch(ng.port, "/c/bodypurge")
@@ -10383,7 +10392,7 @@ def test_lock_redis_outage_fallback(ng: Nginx, origin: Origin,
             f"(latencies: {sorted(round(d, 2) for _, d in results)})"
 
         assert wait_for(
-            lambda: origin.hits_for(slug) > base, timeout=5.0), \
+            lambda: origin.hits_for(slug) > base, timeout=HTTP_TIMEOUT), \
             "lock NGX_ERROR fallback failed: 0 origin regens during a redis " \
             "outage -- the NGX_ERROR lock channel was treated like a peer " \
             "holding the lock (NGX_DECLINED), so the key is stuck stale forever"

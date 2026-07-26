@@ -400,6 +400,9 @@ jobs:
         env:
           ASAN_OPTIONS: detect_leaks=0:halt_on_error=1:abort_on_error=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+          # Instrumented latency is not a signal -- see asan.yml. An 8-iteration
+          # soak multiplies the odds of a spurious per-request TimeoutError.
+          TEST_CT_TIMEOUT: "30"
           SOAK_ITERATIONS: ${{ github.event.inputs.soak_iterations || 8 }}
         run: |
           B="$GITHUB_WORKSPACE/.build/nginx-${NGINX_VERSION}/objs/nginx"

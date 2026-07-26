@@ -125,6 +125,11 @@ jobs:
         env:
           ASAN_OPTIONS: detect_leaks=0:halt_on_error=1:abort_on_error=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+          # An instrumented build is several times slower than a plain one; the
+          # default 5s per-request budget is not a real signal here, it just
+          # turns latency into a spurious TimeoutError (seen on main 2026-07-26,
+          # same commit green on its PR branch).
+          TEST_CT_TIMEOUT: "30"
           # Breadcrumb: the harness writes the running test here (see
           # test_runtime.py _write_breadcrumb). On an R6b hang the guard copies
           # it to hanging-test.txt so the backtrace is labelled with the culprit.
@@ -196,6 +201,8 @@ jobs:
         env:
           ASAN_OPTIONS: detect_leaks=0:halt_on_error=1:abort_on_error=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+          # See the single-process job: instrumented latency is not a signal.
+          TEST_CT_TIMEOUT: "30"
         run: |
           chmod +x nginx-bin/nginx
           python3 ci/tools/test_runtime.py \
