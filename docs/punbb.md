@@ -85,6 +85,8 @@ http {
         location ~ \.php$ {
             cache_turbo               ct;
             cache_turbo_backend       punbb;
+            # Preserve the original URL after try_files redirects to index.php.
+            cache_turbo_key           $host$request_uri;
 
             cache_turbo_valid         60s;
             cache_turbo_valid         404 410 1m;
@@ -118,16 +120,20 @@ add_header X-Cache-Turbo $cache_turbo_status always;
 
 ```bash
 # guest topic: MISS then HIT
-curl -sI https://forum.example.com/viewtopic.php?id=1 | grep -i x-cache-turbo
-curl -sI https://forum.example.com/viewtopic.php?id=1 | grep -i x-cache-turbo  # HIT
+curl -s -o /dev/null -D- https://forum.example.com/viewtopic.php?id=1 \
+    | grep -i x-cache-turbo
+curl -s -o /dev/null -D- https://forum.example.com/viewtopic.php?id=1 \
+    | grep -i x-cache-turbo  # HIT
 
 # THE ONE THAT MATTERS: a logged-in member must be BYPASS.
-curl -sI -H 'Cookie: punbb_cookie=NDJ8c29tZWhhc2h8MTIzNDU2fGFiYw==' \
+curl -s -o /dev/null -D- -H 'Cookie: punbb_cookie=NDJ8c29tZWhhc2h8MTIzNDU2fGFiYw==' \
      https://forum.example.com/viewtopic.php?id=1 | grep -i x-cache-turbo     # BYPASS
 
 # admin/posting: BYPASS (1.4.x admin lives under admin/, not admin.php)
-curl -sI https://forum.example.com/admin/index.php | grep -i x-cache-turbo
-curl -sI https://forum.example.com/misc.php?action=markread | grep -i x-cache-turbo
+curl -s -o /dev/null -D- https://forum.example.com/admin/index.php \
+    | grep -i x-cache-turbo
+curl -s -o /dev/null -D- https://forum.example.com/misc.php?action=markread \
+    | grep -i x-cache-turbo
 ```
 
 ## Gotchas
@@ -205,7 +211,8 @@ PunBB-specific only; generic PHP-FPM tuning lives in the other backend guides.
   `admin/reindex.php`, which the preset bypasses, and `search.php`, which it
   does NOT — search is a guest-reachable read surface and caches normally, so
   a raised limit there widens the cacheable surface rather than the bypassed
-  one. Vary the key on the query string (the default key already does) and let
+  one. Vary the key on the query string (the configured `$request_uri` key does)
+  and let
   repeated searches HIT.
 
 ## See also

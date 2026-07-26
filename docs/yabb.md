@@ -88,15 +88,18 @@ add_header X-Cache-Turbo $cache_turbo_status always;
 
 ```bash
 # guest thread: MISS then HIT
-curl -sI 'https://forum.example.com/cgi-bin/YaBB.pl?num=1' | grep -i x-cache-turbo
-curl -sI 'https://forum.example.com/cgi-bin/YaBB.pl?num=1' | grep -i x-cache-turbo  # HIT
+curl -s -o /dev/null -D- 'https://forum.example.com/cgi-bin/YaBB.pl?num=1' \
+    | grep -i x-cache-turbo
+curl -s -o /dev/null -D- 'https://forum.example.com/cgi-bin/YaBB.pl?num=1' \
+    | grep -i x-cache-turbo  # HIT
 
 # THE ONE THAT MATTERS: a logged-in member must be BYPASS.
-curl -sI -H 'Cookie: Y2Sess-42891=abcdef123456' \
+curl -s -o /dev/null -D- -H 'Cookie: Y2Sess-42891=abcdef123456' \
      'https://forum.example.com/cgi-bin/YaBB.pl?num=1' | grep -i x-cache-turbo      # BYPASS
 
 # posting/admin/pm actions: BYPASS
-curl -sI 'https://forum.example.com/cgi-bin/YaBB.pl?action=post' | grep -i x-cache-turbo
+curl -s -o /dev/null -D- 'https://forum.example.com/cgi-bin/YaBB.pl?action=post' \
+    | grep -i x-cache-turbo
 ```
 
 ## Gotchas

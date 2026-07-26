@@ -120,6 +120,13 @@ http {
         "~*(^|;\s*)wp_woocommerce_session_[0-9a-f]{32}=" 1;
     }
 
+    # The preset sees /index.php after try_files. Preserve its clean-route tier
+    # against the original request URL; replace these slugs on translated shops.
+    map $request_uri $wc_private_route {
+        default                                  0;
+        ~^/(?:cart|checkout|my-account)(?:[/?]|$) 1;
+    }
+
     server {
         listen 443 ssl http2;
         server_name shop.example.com;
@@ -132,7 +139,11 @@ http {
 
         location ~ \.php$ {
             cache_turbo               ct;
-            cache_turbo_backend       wordpress woocommerce;   # STACK both
+            cache_turbo_backend       woocommerce;  # implies wordpress
+            # Preserve the original URL after try_files redirects to index.php.
+            cache_turbo_key           $host$request_uri;
+            cache_turbo_bypass        $wc_private_route;
+            cache_turbo_no_store      $wc_private_route;
 
             cache_turbo_valid         60s;
             cache_turbo_valid         404 410 1m;
@@ -146,13 +157,6 @@ http {
             include                   fastcgi_params;
             fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
             fastcgi_pass  unix:/run/php/php-fpm.sock;
-        }
-
-        # WooCommerce's cart-fragments AJAX must never be cached.
-        location = /?wc-ajax=get_refreshed_fragments {
-            cache_turbo off;
-            include     fastcgi_params;
-            fastcgi_pass unix:/run/php/php-fpm.sock;
         }
 
         location ~* \.(css|js|png|jpe?g|gif|webp|svg|woff2?)$ {
@@ -191,16 +195,21 @@ add_header X-Cache-Turbo $cache_turbo_status always;
 
 ```bash
 # anonymous product page: MISS then HIT
-curl -sI https://shop.example.com/product/widget/ | grep -i x-cache-turbo
-curl -sI https://shop.example.com/product/widget/ | grep -i x-cache-turbo   # HIT
+curl -s -o /dev/null -D- https://shop.example.com/product/widget/ \
+    | grep -i x-cache-turbo
+curl -s -o /dev/null -D- https://shop.example.com/product/widget/ \
+    | grep -i x-cache-turbo   # HIT
 
 # these must ALWAYS be BYPASS — check every one before launch
-curl -sI https://shop.example.com/cart/       | grep -i x-cache-turbo
-curl -sI https://shop.example.com/checkout/   | grep -i x-cache-turbo
-curl -sI https://shop.example.com/my-account/ | grep -i x-cache-turbo
+curl -s -o /dev/null -D- https://shop.example.com/cart/ \
+    | grep -i x-cache-turbo
+curl -s -o /dev/null -D- https://shop.example.com/checkout/ \
+    | grep -i x-cache-turbo
+curl -s -o /dev/null -D- https://shop.example.com/my-account/ \
+    | grep -i x-cache-turbo
 
 # a shopper with a basket: BYPASS on *every* page, not just /cart
-curl -sI -H 'Cookie: woocommerce_items_in_cart=1' \
+curl -s -o /dev/null -D- -H 'Cookie: woocommerce_items_in_cart=1' \
      https://shop.example.com/product/widget/ | grep -i x-cache-turbo       # BYPASS
 ```
 
@@ -239,10 +248,17 @@ about to be wrong for somebody.
   request is caught by the login cookie even when the locale slug is not.
 
   Locale slugs are deliberately not enumerated in the preset (the set is
-  unbounded). Add your own:
+  unbounded). Put the actual slugs in the vhost's `$request_uri` map:
 
   ```nginx
-  cache_turbo_bypass_uri /warenkorb /kasse /mein-konto;
+  map $request_uri $wc_private_route {
+      default                                        0;
+      ~^/(?:warenkorb|kasse|mein-konto)(?:[/?]|$)    1;
+  }
+
+  # In the cache-enabled PHP location:
+  cache_turbo_bypass   $wc_private_route;
+  cache_turbo_no_store $wc_private_route;
   ```
 
 - **A store on a subdirectory** shifts these URIs (`/fr/panier`), and the preset
@@ -332,6 +348,6 @@ a way it does not bite a plain WordPress blog.
 
 ## See also
 
-- [`wordpress.md`](wordpress.md) — the base preset you must stack with
+- [`wordpress.md`](wordpress.md) — the base preset implied by `woocommerce`
 - [README — CMS backends](../README.md#cms-backends-cache_turbo_backend)
 - [`docs/README.md`](README.md) — all presets

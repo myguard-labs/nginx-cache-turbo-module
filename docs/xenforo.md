@@ -1,6 +1,6 @@
 # XenForo + cache-turbo
 
-_Last researched: 2026-07-18_
+_Last researched: 2026-07-26_
 
 Full-page caching a XenForo (XF2) board: what to cache, what to bypass, what to
 put in the key, and a copy-paste vhost with the Redis L2 tier wired up.
@@ -34,8 +34,10 @@ It also **value-keys the presentation cookies for you** — `xf_style_id`,
 `xf_style_variation` (XF 2.3 light/dark) and `xf_language_id` are folded into the
 cache key automatically, so a dark-theme visitor gets their own shared entry
 rather than being dropped from the cache. You no longer need to spell those out
-in `cache_turbo_key`; the plain default key is enough. (Tested against XenForo
-2.3.11, the current stable line; 2.4 was still unreleased at time of writing.)
+in `cache_turbo_key`; the preset appends them to the explicit base key. Tested
+against the official
+[XenForo 2.3.11 release](https://xenforo.com/community/threads/xenforo-2-3-11-add-ons-released.238509/),
+the current stable line; 2.4 was still unreleased at the time of writing.
 
 `xenforo` is opt-in and must be named, like the WordPress, WooCommerce
 and Joomla presets. Its URI prefixes are generic English words (`/login`,
@@ -156,8 +158,8 @@ shared with anyone, ever.
 The three `xf_style_*` / `xf_language_id` rows are marked **(auto)** because the
 `xenforo` preset now folds their **value** into the cache key for you (tier-3
 key-cookies, the same engine `magento` and `shopware6` use for their vary
-cookies). You do **not** need to name them in `cache_turbo_key` — the plain
-default key already varies on them.
+cookies). You do **not** need to name them in `cache_turbo_key` — the preset
+folds them into the key after the configured base expression is evaluated.
 
 ### The `xf_` prefix is configurable — check yours
 
@@ -202,6 +204,15 @@ load_module modules/ngx_http_cache_turbo_module.so;
 http {
     cache_turbo_zone name=ct 256m;
 
+    # try_files rewrites clean XF routes to /index.php before cache-turbo runs.
+    # Preserve the preset's private-route tier using the original request URI.
+    map $request_uri $xf_private_route {
+        default 0;
+        ~^/(?:admin\.php|install|api|login|logout)(?:[/?]|$) 1;
+        ~^/(?:lost-password|register|account|misc)(?:[/?]|$) 1;
+        ~^/(?:conversations|direct-messages)(?:[/?]|$) 1;
+    }
+
     server {
         listen 443 ssl http2;
         server_name forum.example.com;
@@ -221,11 +232,14 @@ http {
             cache_turbo_backend       xenforo;
 
             # The preset value-keys xf_style_id / xf_style_variation /
-            # xf_language_id for you, so the plain default key is enough — the
-            # theme/language variants still get their own entries. (Older docs
+            # xf_language_id for you, so the base key only needs the original
+            # request URL — the theme/language variants still get their own
+            # entries. (Older docs
             # spelled $cookie_xf_style_variation into the key by hand; you can
             # drop that now.)
-            cache_turbo_key           $host$uri$cache_turbo_normalized_args;
+            cache_turbo_key           $host$request_uri;
+            cache_turbo_bypass        $xf_private_route;
+            cache_turbo_no_store      $xf_private_route;
 
             cache_turbo_valid         60s;        # guests see a page at most 60s old
             cache_turbo_valid         404 410 1m; # negative caching
@@ -311,6 +325,13 @@ load_module modules/ngx_http_cache_turbo_module.so;
 http {
     cache_turbo_zone     name=ct 256m;
 
+    map $request_uri $xf_private_route {
+        default 0;
+        ~^/(?:admin\.php|install|api|login|logout)(?:[/?]|$) 1;
+        ~^/(?:lost-password|register|account|misc)(?:[/?]|$) 1;
+        ~^/(?:conversations|direct-messages)(?:[/?]|$) 1;
+    }
+
     server_tokens        off;
     fastcgi_buffers      16 16k;
     fastcgi_buffer_size  32k;
@@ -337,6 +358,9 @@ http {
             # hand and OMIT xf_session for the hit rate.
             cache_turbo_backend       none;
             cache_turbo_cache_control honor;   # preset would imply this; keep it
+            cache_turbo_key           $host$request_uri;
+            cache_turbo_bypass        $xf_private_route;
+            cache_turbo_no_store      $xf_private_route;
 
             cache_turbo_preset        balanced;
             cache_turbo_valid         60s;
@@ -363,10 +387,8 @@ http {
             # `cache_turbo_backend xenforo;` handles all of those; prefer it
             # over hand-written $arg_ rules wherever you can.
 
-            # the dynamic surfaces the preset's URI list would have covered:
-            cache_turbo_bypass_uri    /admin.php /install/ /api/ /login /logout
-                                      /lost-password /register /account
-                                      /conversations /direct-messages /misc;
+            # $xf_private_route above covers the preset's clean-path list using
+            # the original URL; a bypass_uri here would see /index.php.
 
             # value-key the presentation variants (the preset does this itself):
             cache_turbo_key_cookie    xf_style_id xf_style_variation
@@ -507,7 +529,7 @@ fine for a forum. If you want it immediate, purge the thread's key when a post
 lands — the admin endpoint takes a key or a tag:
 
 ```bash
-curl -X POST 'http://127.0.0.1/_cache?key=/threads/some-thread.1234/'
+curl -X POST 'http://127.0.0.1/_cache?key=forum.example.com/threads/some-thread.1234/'
 curl -X POST 'http://127.0.0.1/_cache?all=1'    # nuke the zone (e.g. after a style change)
 ```
 
@@ -527,26 +549,31 @@ The three that matter for XenForo:
 
 ```bash
 # guest thread page: MISS then HIT
-curl -sI https://forum.example.com/threads/hello.1/ | grep -i x-cache-turbo
-curl -sI https://forum.example.com/threads/hello.1/ | grep -i x-cache-turbo   # HIT
+curl -s -o /dev/null -D- https://forum.example.com/threads/hello.1/ \
+    | grep -i x-cache-turbo
+curl -s -o /dev/null -D- https://forum.example.com/threads/hello.1/ \
+    | grep -i x-cache-turbo   # HIT
 
 # logged-in member: must always be BYPASS
-curl -sI -H 'Cookie: xf_user=1234%2Cabcdef' \
-     https://forum.example.com/threads/hello.1/ | grep -i x-cache-turbo       # BYPASS
+curl -s -o /dev/null -D- -H 'Cookie: xf_user=1234%2Cabcdef' \
+     https://forum.example.com/threads/hello.1/ \
+    | grep -i x-cache-turbo       # BYPASS
 
 # auth surface: must always be BYPASS
-curl -sI https://forum.example.com/login | grep -i x-cache-turbo              # BYPASS
+curl -s -o /dev/null -D- https://forum.example.com/login \
+    | grep -i x-cache-turbo              # BYPASS
 
 # REST API: must always be BYPASS (auth is the XF-Api-Key header, no cookie)
-curl -sI -H 'XF-Api-Key: xxxx' \
-     https://forum.example.com/api/me/ | grep -i x-cache-turbo                # BYPASS
+curl -s -o /dev/null -D- -H 'XF-Api-Key: xxxx' \
+     https://forum.example.com/api/me/ \
+    | grep -i x-cache-turbo       # BYPASS
 
 # a GET carrying the CSRF token as _xfToken: must always be BYPASS
-curl -sI 'https://forum.example.com/whatever?_xfToken=1650000000,abc' \
+curl -s -o /dev/null -D- 'https://forum.example.com/whatever?_xfToken=1650000000,abc' \
      | grep -i x-cache-turbo                                                  # BYPASS
 
 # theme variant: caches, but its OWN entry (keyed on the value)
-curl -sI -H 'Cookie: xf_style_variation=alternate' \
+curl -s -o /dev/null -D- -H 'Cookie: xf_style_variation=alternate' \
      https://forum.example.com/threads/hello.1/ | grep -i x-cache-turbo       # MISS then HIT
 ```
 

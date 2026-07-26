@@ -53,7 +53,7 @@ plausible-but-unverified and **confirm it on your own install** before going
 live:
 
 ```bash
-curl -sI https://forum.example.com/ | grep -i set-cookie
+curl -s -o /dev/null -D- https://forum.example.com/ | grep -i set-cookie
 # a clean first-ever request must show NO "Vanilla=" identity cookie here
 ```
 
@@ -96,11 +96,19 @@ Garden-era fork last pushed in 2013. Adding a row from recollection is what
 produced the dead `/admin.php` and `/message_send.php` rows in the PunBB
 preset, so it is not being repeated here.
 
-If you serve the API, add it yourself:
+If you serve the API behind the PHP front controller, classify the original
+request URI. A `cache_turbo_bypass_uri /api;` placed in the PHP location sees
+the internally redirected `/index.php` and does not match:
 
 ```nginx
-cache_turbo_bypass_uri /api;
-cache_turbo_no_store;
+map $request_uri $vanilla_api {
+    default              0;
+    ~^/api(?:[/?]|$)     1;
+}
+
+# In the cache-enabled PHP location:
+cache_turbo_bypass   $vanilla_api;
+cache_turbo_no_store $vanilla_api;
 ```
 
 ## Vhost
@@ -110,6 +118,11 @@ load_module modules/ngx_http_cache_turbo_module.so;
 
 http {
     cache_turbo_zone name=ct 256m;
+
+    map $request_uri $vanilla_api {
+        default          0;
+        ~^/api(?:[/?]|$) 1;
+    }
 
     server {
         listen 443 ssl http2;
@@ -124,6 +137,10 @@ http {
         location ~ \.php$ {
             cache_turbo               ct;
             cache_turbo_backend       vanilla;
+            # Preserve the original URL after try_files redirects to index.php.
+            cache_turbo_key           $host$request_uri;
+            cache_turbo_bypass        $vanilla_api;
+            cache_turbo_no_store      $vanilla_api;
 
             cache_turbo_valid         60s;
             cache_turbo_valid         404 410 1m;
@@ -157,20 +174,23 @@ add_header X-Cache-Turbo $cache_turbo_status always;
 
 ```bash
 # guest discussion: MISS then HIT
-curl -sI https://forum.example.com/discussion/1/hello | grep -i x-cache-turbo
-curl -sI https://forum.example.com/discussion/1/hello | grep -i x-cache-turbo  # HIT
+curl -s -o /dev/null -D- https://forum.example.com/discussion/1/hello \
+    | grep -i x-cache-turbo
+curl -s -o /dev/null -D- https://forum.example.com/discussion/1/hello \
+    | grep -i x-cache-turbo  # HIT
 
 # THE ONE THAT MATTERS: a logged-in member must be BYPASS.
-curl -sI -H 'Cookie: Vanilla=abc.signed.payload' \
+curl -s -o /dev/null -D- -H 'Cookie: Vanilla=abc.signed.payload' \
      https://forum.example.com/discussion/1/hello | grep -i x-cache-turbo     # BYPASS
 
 # a returning GUEST carrying only -tk / -Vv must still be cacheable:
 # the rule matches "Vanilla=", which neither of those contains.
-curl -sI -H 'Cookie: Vanilla-Vv=1; Vanilla-tk=2' \
+curl -s -o /dev/null -D- -H 'Cookie: Vanilla-Vv=1; Vanilla-tk=2' \
      https://forum.example.com/discussion/1/hello | grep -i x-cache-turbo     # HIT
 
 # dashboard / entry (login/register/SSO): BYPASS
-curl -sI https://forum.example.com/dashboard/ | grep -i x-cache-turbo
+curl -s -o /dev/null -D- https://forum.example.com/dashboard/ \
+    | grep -i x-cache-turbo
 ```
 
 ## Gotchas

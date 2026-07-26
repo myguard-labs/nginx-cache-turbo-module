@@ -116,7 +116,7 @@ leak). Compare Flarum, whose failure direction is the leak — which is why ther
 Check with one command, and **re-run it after any deploy that touches sessions**:
 
 ```bash
-curl -sI https://example.com/ | grep -i set-cookie
+curl -s -o /dev/null -D- https://example.com/ | grep -i set-cookie
 # (no sessionid)          <- good, the preset works
 # Set-Cookie: sessionid=  <- STOP. Your hit rate is zero. See below.
 ```
@@ -192,7 +192,8 @@ curl -s -D- -o /dev/null https://example.com/            | grep -i x-cache-turbo
 
 # admin + documents: BYPASS
 curl -s -D- -o /dev/null https://example.com/admin/      | grep -i x-cache-turbo
-curl -s -D- -o /dev/null https://example.com/documents/3/x.pdf | grep -i x-cache-turbo
+curl -s -D- -o /dev/null https://example.com/documents/3/x.pdf \
+    | grep -i x-cache-turbo
 
 # logged-in editor must never be served from cache
 curl -s -D- -o /dev/null -H 'Cookie: sessionid=abc' https://example.com/ \
@@ -204,7 +205,8 @@ curl -s -D- -o /dev/null -H 'Cookie: csrftoken=xyz' https://example.com/ \
     | grep -i x-cache-turbo          # HIT
 
 # And the guest-cookie check from above -- the one that decides everything.
-curl -sI https://example.com/ | grep -i set-cookie      # must NOT set sessionid
+curl -s -o /dev/null -D- https://example.com/ \
+    | grep -i set-cookie      # must NOT set sessionid
 ```
 
 ## Gotchas

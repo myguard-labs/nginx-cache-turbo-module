@@ -147,6 +147,8 @@ http {
         location ~ \.php$ {
             cache_turbo               ct;
             cache_turbo_backend       wordpress;   # base preset — unchanged
+            # Preserve the original URL after try_files redirects to index.php.
+            cache_turbo_key           $host$request_uri;
 
             cache_turbo_valid         60s;
             cache_turbo_valid         404 410 1m;
@@ -247,15 +249,17 @@ add_header X-Cache-Turbo $cache_turbo_status always;
 
 ```bash
 # anonymous post: MISS then HIT — this is cache-turbo, not LSCache
-curl -sI https://example.com/blog/hello/ | grep -i x-cache-turbo
-curl -sI https://example.com/blog/hello/ | grep -i x-cache-turbo   # HIT
+curl -s -o /dev/null -D- https://example.com/blog/hello/ | grep -i x-cache-turbo
+curl -s -o /dev/null -D- https://example.com/blog/hello/ \
+    | grep -i x-cache-turbo   # HIT
 
 # confirm LSCache is NOT actually caching (expect no litespeed cache-hit signal)
-curl -sI https://example.com/blog/hello/ | grep -i x-litespeed-cache
+curl -s -o /dev/null -D- https://example.com/blog/hello/ \
+    | grep -i x-litespeed-cache
 #  -> absent, or present-but-"miss" every time: confirms the engine isn't there
 
 # logged-in: must always be BYPASS
-curl -sI -H 'Cookie: wordpress_logged_in_abc=user|123|hash' \
+curl -s -o /dev/null -D- -H 'Cookie: wordpress_logged_in_abc=user|123|hash' \
      https://example.com/blog/hello/ | grep -i x-cache-turbo       # BYPASS
 ```
 

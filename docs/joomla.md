@@ -1,6 +1,6 @@
 # Joomla + cache-turbo
 
-_Last researched: 2026-07-18_
+_Last researched: 2026-07-26_
 
 Caching a Joomla site. **Read [the warning](#the-preset-is-thin--read-this)
 first** — the Joomla preset is deliberately minimal and, unlike the other three,
@@ -54,11 +54,11 @@ is set only for an authenticated user and cleared on logout.
 
 **But it only exists for users who ticked "Remember Me."** A member who simply logs
 in and does not tick the box carries **no such cookie**. What they carry is the
-session cookie — and **that** has no fixed name. Joomla derives it from the site's
-secret: on Joomla 4/5 the session name is `md5($secret . $seed)` where `$seed` is the
-configured `session_name` or, by default, the application class
+session cookie — and **that** has no fixed name. Joomla derives it from the
+site's secret: on Joomla 4–6 the session name is `md5($secret . $seed)`, where
+`$seed` is the configured `session_name` or, by default, the application class
 (`Joomla\CMS\Application\SiteApplication`) — see
-[`libraries/src/Service/Provider/Session.php`](https://github.com/joomla/joomla-cms/blob/5.4-dev/libraries/src/Service/Provider/Session.php)
+[`libraries/src/Service/Provider/Session.php`](https://github.com/joomla/joomla-cms/blob/6.1-dev/libraries/src/Service/Provider/Session.php)
 `generateSessionName()`. (Joomla 3.x used the older double hash `md5(md5($secret . 'site'))`;
 the seed changed, but the result is the same shape.) Either way it is a bare 32-hex
 cookie name with **no stable prefix**:
@@ -95,7 +95,7 @@ cached page are the `/administrator/` URI rule (which does not cover the front
 end) and Joomla's own `Cache-Control` — and the core System - Page Cache plugin only
 stores a page when `$app->getIdentity()->guest` is true (its `appStateSupportsCaching()`
 also requires the site application, a `GET` request, and an empty message queue — see
-[`plugins/system/cache/src/Extension/Cache.php`](https://github.com/joomla/joomla-cms/blob/5.4-dev/plugins/system/cache/src/Extension/Cache.php)),
+[`plugins/system/cache/src/Extension/Cache.php`](https://github.com/joomla/joomla-cms/blob/6.1-dev/plugins/system/cache/src/Extension/Cache.php)),
 which tells you upstream considers login state the thing that matters.
 `joomla_remember_me_` raises the floor. It does not make
 the preset safe on its own.
@@ -116,7 +116,7 @@ cached unless you bypass it.
 Log in to the front end and look at what Joomla set:
 
 ```bash
-curl -sI -c - https://example.com/index.php?option=com_users \
+curl -s -o /dev/null -D- -c - https://example.com/index.php?option=com_users \
   | awk '/Set-Cookie/ {print $2}'
 ```
 
@@ -173,8 +173,10 @@ http {
         location ~ \.php$ {
             cache_turbo               ct;
             cache_turbo_backend       joomla;
+            # Preserve the original URL after try_files redirects to index.php.
+            cache_turbo_key           $host$request_uri;
 
-            # NOT OPTIONAL. The preset ships no cookie rule (see docs).
+            # NOT OPTIONAL. The preset's remember-me cookie rule is partial.
             cache_turbo_bypass        $joomla_session;
             cache_turbo_no_store      $joomla_session;
 
@@ -225,16 +227,19 @@ add_header X-Cache-Turbo $cache_turbo_status always;
 
 ```bash
 # anonymous article: MISS then HIT
-curl -sI https://example.com/index.php/blog/article | grep -i x-cache-turbo
-curl -sI https://example.com/index.php/blog/article | grep -i x-cache-turbo  # HIT
+curl -s -o /dev/null -D- https://example.com/index.php/blog/article \
+    | grep -i x-cache-turbo
+curl -s -o /dev/null -D- https://example.com/index.php/blog/article \
+    | grep -i x-cache-turbo  # HIT
 
 # admin: BYPASS (this is all the preset gives you)
-curl -sI https://example.com/administrator/ | grep -i x-cache-turbo
+curl -s -o /dev/null -D- https://example.com/administrator/ \
+    | grep -i x-cache-turbo
 
 # THE ONE THAT MATTERS: a logged-in front-end user must be BYPASS.
 # If this says HIT/MISS, your cache_turbo_bypass is wrong and you are one
 # request away from serving a member's page to the public.
-curl -sI -H 'Cookie: 1a79a4d60de6718e8e5b326e338ae533=abc' \
+curl -s -o /dev/null -D- -H 'Cookie: 1a79a4d60de6718e8e5b326e338ae533=abc' \
      https://example.com/index.php/blog/article | grep -i x-cache-turbo      # BYPASS
 ```
 
@@ -320,7 +325,7 @@ under `/administrator/` are already covered by the preset's admin-URI rule.
   never cached, regardless of preset. Those floors hold.
 - **Do not rely on `joomla_user_state` as a fixed-name login flag.** Third-party
   cookie databases describe a `joomla_user_state` cookie "set when logged in, deleted
-  on logout" — but that string does not appear anywhere in Joomla 5 core source
+  on logout" — but that string does not appear anywhere in Joomla 6.1 core source
   (unverified / community-reported, likely an older-version or extension artifact). It
   is not a stable, shippable auth cookie; the session cookie (32-hex) and
   `joomla_remember_me_` remain the only login signals to key on.
@@ -332,7 +337,7 @@ these are the things that bite on Joomla in particular.
 
 - **The session cookie name is an MD5 hash and differs per site.** Joomla runs on
   native PHP sessions, and its session/cookie name is `md5($secret . $seed)` (Joomla
-  4/5; see the cookie section above). There is no fixed string to ship, so the preset
+  4–6; see the cookie section above). There is no fixed string to ship, so the preset
   and every example here key on cookie **presence** — the `~[0-9a-f]{32}=` `map` — not
   on a known name. Rotating the site secret (or changing `session_name`) changes the
   name; the `map` survives that, a hard-coded `$cookie_<hash>` does not.

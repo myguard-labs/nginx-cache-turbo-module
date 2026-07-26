@@ -80,11 +80,11 @@ Check which of your pages are affected:
 
 ```bash
 # A page with no form -- must set NO cookie.
-curl -sI https://example.com/about | grep -i set-cookie
+curl -s -o /dev/null -D- https://example.com/about | grep -i set-cookie
 # (nothing)  <- caches
 
 # A page with a contact form calling csrf() -- will set one.
-curl -sI https://example.com/contact | grep -i set-cookie
+curl -s -o /dev/null -D- https://example.com/contact | grep -i set-cookie
 # Set-Cookie: kirby_session=...   <- this page will not cache. Expected.
 ```
 
@@ -113,6 +113,8 @@ http {
         location ~ \.php$ {
             cache_turbo         ct;
             cache_turbo_backend kirby;     # implies cache_control honor
+            # Preserve the original URL after try_files redirects to index.php.
+            cache_turbo_key           $host$request_uri;
 
             cache_turbo_valid   60s;
             cache_turbo_valid   404 410 1m;

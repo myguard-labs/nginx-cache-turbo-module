@@ -175,19 +175,21 @@ add_header X-Cache-Turbo $cache_turbo_status always;
 
 ```bash
 # anonymous reader on a public post: MISS then HIT
-curl -sI https://blog.example.com/my-post | grep -i x-cache-turbo
-curl -sI https://blog.example.com/my-post | grep -i x-cache-turbo   # HIT
+curl -s -o /dev/null -D- https://blog.example.com/my-post \
+    | grep -i x-cache-turbo
+curl -s -o /dev/null -D- https://blog.example.com/my-post \
+    | grep -i x-cache-turbo   # HIT
 
 # admin: BYPASS
-curl -sI https://blog.example.com/ghost/ | grep -i x-cache-turbo
+curl -s -o /dev/null -D- https://blog.example.com/ghost/ | grep -i x-cache-turbo
 
 # a logged-in member: BYPASS
-curl -sI -H 'Cookie: ghost-members-ssr=abc123' \
+curl -s -o /dev/null -D- -H 'Cookie: ghost-members-ssr=abc123' \
      https://blog.example.com/my-post | grep -i x-cache-turbo       # BYPASS
 
 # THE ONE THAT MATTERS: cookieless member auth via the query string. If this is
 # not BYPASS, a member's page can be stored and served to the public.
-curl -sI 'https://blog.example.com/my-post?uuid=abc-123&key=deadbeef' \
+curl -s -o /dev/null -D- 'https://blog.example.com/my-post?uuid=abc-123&key=deadbeef' \
      | grep -i x-cache-turbo                                        # BYPASS
 ```
 

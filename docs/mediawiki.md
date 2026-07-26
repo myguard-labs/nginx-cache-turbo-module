@@ -154,16 +154,15 @@ rest on a floor an operator can remove — the same reasoning the Drupal preset
 uses. The rows cost almost nothing: the read path is `/wiki/<Title>` with no
 `action` argument at all.
 
-`printable=` needs no special handling to become a proper variant: the module's
-**default** key is built from the validated `Host` plus `unparsed_uri` — the
-original request line, query string included — so `?printable=yes` already splits
-into its own entry.
+`printable=` needs no special handling to become a proper variant when the key
+uses the original request line: `?printable=yes` then splits into its own entry.
 
-Do **not** hand-write `cache_turbo_key $uri$is_args$args` here. It is not just
-redundant, it is actively wrong on a pretty-URL wiki: the `/wiki/` location
+Do **not** hand-write `cache_turbo_key $uri$is_args$args` here. It is actively
+wrong on a pretty-URL wiki: the `/wiki/` location
 rewrites to `/index.php` before the module runs, so `$uri` is `/index.php` for
-every article and the whole wiki collapses onto a single cache entry. Leave the
-key alone unless you are adding something the default does not carry.
+every article and the whole wiki collapses onto a single cache entry. The
+configured default also uses `$uri`, so this vhost explicitly keys on
+`$host$request_uri` instead.
 
 ## Vhost
 
@@ -183,10 +182,9 @@ http {
         location /wiki/ {
             cache_turbo         ct;
             cache_turbo_backend mediawiki;   # implies cache_control honor
-            # No cache_turbo_key: the default (host + unparsed_uri) is the only
-            # correct one here. After the rewrite below $uri is /index.php for
-            # EVERY article, so a $uri-derived key collapses the whole wiki onto
-            # one entry.
+            # The rewrite below makes $uri /index.php for EVERY article. Preserve
+            # the original request line or the whole wiki shares one entry.
+            cache_turbo_key     $host$request_uri;
             cache_turbo_valid   300s;        # wikis tolerate a longer TTL
             cache_turbo_valid   404 410 1m;
             cache_turbo_preset  balanced;
@@ -209,6 +207,7 @@ http {
         location ~ \.php$ {
             cache_turbo         ct;
             cache_turbo_backend mediawiki;
+            cache_turbo_key     $host$request_uri;
             cache_turbo_valid   60s;
 
             include        fastcgi_params;
@@ -288,26 +287,32 @@ add_header X-Cache-Turbo $cache_turbo_status always;
 
 ```bash
 # anonymous article: MISS then HIT
-curl -sI https://wiki.example.com/wiki/Main_Page | grep -i x-cache-turbo
-curl -sI https://wiki.example.com/wiki/Main_Page | grep -i x-cache-turbo  # HIT
+curl -s -o /dev/null -D- https://wiki.example.com/wiki/Main_Page \
+    | grep -i x-cache-turbo
+curl -s -o /dev/null -D- https://wiki.example.com/wiki/Main_Page \
+    | grep -i x-cache-turbo  # HIT
 
 # the cacheable args must STAY cacheable -- these are hot paths
-curl -sI 'https://wiki.example.com/wiki/Main_Page?action=raw'     | grep -i x-cache-turbo
-curl -sI 'https://wiki.example.com/wiki/Main_Page?action=history' | grep -i x-cache-turbo
-curl -sI 'https://wiki.example.com/wiki/Main_Page?oldid=12345'    | grep -i x-cache-turbo
+curl -s -o /dev/null -D- 'https://wiki.example.com/wiki/Main_Page?action=raw' \
+    | grep -i x-cache-turbo
+curl -s -o /dev/null -D- 'https://wiki.example.com/wiki/Main_Page?action=history' \
+    | grep -i x-cache-turbo
+curl -s -o /dev/null -D- 'https://wiki.example.com/wiki/Main_Page?oldid=12345' \
+    | grep -i x-cache-turbo
 # all of these should MISS then HIT. If they BYPASS, someone added a blanket
 # action= rule and you are leaving a lot of hit rate on the floor.
 
 # VisualEditor: BYPASS
-curl -sI 'https://wiki.example.com/wiki/Main_Page?veaction=edit' | grep -i x-cache-turbo
+curl -s -o /dev/null -D- 'https://wiki.example.com/wiki/Main_Page?veaction=edit' \
+    | grep -i x-cache-turbo
 
 # THE ONE THAT MATTERS: a logged-in user must be BYPASS. Substitute your own
 # $wgCookiePrefix (defaults to your DB name).
-curl -sI -H 'Cookie: mywikiUserID=42; mywikiUserName=Bob' \
+curl -s -o /dev/null -D- -H 'Cookie: mywikiUserID=42; mywikiUserName=Bob' \
      https://wiki.example.com/wiki/Main_Page | grep -i x-cache-turbo   # BYPASS
 
 # And confirm the origin's own defence is in place.
-curl -sI -H 'Cookie: mywikiUserID=42' https://wiki.example.com/wiki/Main_Page \
+curl -s -o /dev/null -D- -H 'Cookie: mywikiUserID=42' https://wiki.example.com/wiki/Main_Page \
      | grep -i cache-control
 # Cache-Control: private, must-revalidate, max-age=0
 ```

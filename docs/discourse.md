@@ -193,23 +193,27 @@ add_header X-Cache-Turbo $cache_turbo_status always;
 
 ```bash
 # anonymous topic: MISS then HIT
-curl -sI https://forum.example.com/t/some-topic/123 | grep -i x-cache-turbo
-curl -sI https://forum.example.com/t/some-topic/123 | grep -i x-cache-turbo  # HIT
+curl -s -o /dev/null -D- https://forum.example.com/t/some-topic/123 \
+    | grep -i x-cache-turbo
+curl -s -o /dev/null -D- https://forum.example.com/t/some-topic/123 \
+    | grep -i x-cache-turbo  # HIT
 
 # preset URI surfaces: BYPASS
-curl -sI https://forum.example.com/admin   | grep -i x-cache-turbo
+curl -s -o /dev/null -D- https://forum.example.com/admin \
+    | grep -i x-cache-turbo
 
 # public profiles /u/ are NOT bypassed: they are anonymous-identical and cache
-curl -s -D- -o /dev/null https://forum.example.com/u/someone | grep -i x-cache-turbo  # MISS then HIT
+curl -s -D- -o /dev/null https://forum.example.com/u/someone \
+    | grep -i x-cache-turbo  # MISS then HIT
 
 # THE ONE THAT MATTERS: a logged-in user must be BYPASS.
-curl -sI -H 'Cookie: _t=abc123' https://forum.example.com/t/some-topic/123 \
+curl -s -o /dev/null -D- -H 'Cookie: _t=abc123' https://forum.example.com/t/some-topic/123 \
      | grep -i x-cache-turbo    # BYPASS
 
 # THE OTHER ONE THAT MATTERS: a GUEST carrying _forum_session must still be a
 # HIT. If this says BYPASS, something added _forum_session to a bypass list and
 # your cache is now doing nothing for guest traffic.
-curl -sI -H 'Cookie: _forum_session=guestsess' \
+curl -s -o /dev/null -D- -H 'Cookie: _forum_session=guestsess' \
      https://forum.example.com/t/some-topic/123 | grep -i x-cache-turbo   # HIT
 ```
 

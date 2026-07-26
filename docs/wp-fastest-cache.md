@@ -127,6 +127,8 @@ http {
         location ~ \.php$ {
             cache_turbo               ct;
             cache_turbo_backend       wordpress;
+            # Preserve the original URL after try_files redirects to index.php.
+            cache_turbo_key           $host$request_uri;
 
             cache_turbo_valid         60s;
             cache_turbo_valid         404 410 1m;   # negative caching
@@ -181,7 +183,7 @@ add_action( 'transition_post_status', function ( $new_status, $old_status, $post
         return;
     }
     // The admin endpoint hashes ?key= verbatim -- it must equal the full
-    // cache key (host + uri + normalized args), not the scheme+host+path
+    // cache key (host + original request URI), not the scheme+host+path
     // that get_permalink() returns.
     $key = preg_replace( '#^https?://#', '', get_permalink( $post ) );
     wp_remote_post( 'http://127.0.0.1/_cache?key=' . rawurlencode( $key ) );
@@ -189,7 +191,7 @@ add_action( 'transition_post_status', function ( $new_status, $old_status, $post
 ```
 
 ```bash
-curl -X POST 'http://127.0.0.1/_cache?key=/blog/my-post/'
+curl -X POST 'http://127.0.0.1/_cache?key=example.com/blog/my-post/'
 curl -X POST 'http://127.0.0.1/_cache?all=1'          # after a theme/minify-settings change
 ```
 
@@ -205,10 +207,12 @@ add_header X-Cache-Turbo $cache_turbo_status always;
 ```
 
 ```bash
-curl -sI https://example.com/blog/hello/ | grep -i x-cache-turbo   # MISS
-curl -sI https://example.com/blog/hello/ | grep -i x-cache-turbo   # HIT
+curl -s -o /dev/null -D- https://example.com/blog/hello/ \
+    | grep -i x-cache-turbo   # MISS
+curl -s -o /dev/null -D- https://example.com/blog/hello/ \
+    | grep -i x-cache-turbo   # HIT
 
-curl -sI -H 'Cookie: wordpress_logged_in_abc=user|123|hash' \
+curl -s -o /dev/null -D- -H 'Cookie: wordpress_logged_in_abc=user|123|hash' \
      https://example.com/blog/hello/ | grep -i x-cache-turbo       # BYPASS
 ```
 

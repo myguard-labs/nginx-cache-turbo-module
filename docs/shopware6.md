@@ -1,6 +1,6 @@
 # Shopware 6 + cache-turbo
 
-_Last researched: 2026-07-18_
+_Last researched: 2026-07-26_
 
 Caching a Shopware 6 (6.4–6.7, and 6.8 on trunk) storefront. **Same engine as
 [magento](magento.md)** — Shopware ships its own Varnish VCL and value-keys the
@@ -25,8 +25,9 @@ cache_turbo         ct;
 cache_turbo_backend shopware6;    # implies cache_turbo_cache_control honor
 ```
 
-That's it for a correct, safe config — the vary cookie is handled natively, no
-`map` required.
+That is the preset portion. The PHP front-controller vhost still needs the
+original-URL key and private-route map shown below; the vary cookie itself is
+handled natively and needs no cookie `map`.
 
 ## `sw-cache-hash`: value-keyed, never bypassed
 
@@ -84,10 +85,11 @@ therefore guaranteed cookieless, so the anonymous bucket is the common case and
 hit rate is good.
 
 **`sw-states` is deliberately NOT matched — matching it would be a leak on a
-future shop.** It **is being removed in 6.8**, which is **not released yet**
-(latest shipping line is 6.7; 6.8 exists only on `trunk`, so everything in this
-paragraph is *forthcoming* behaviour, not something you can observe on a shop
-today). `UPGRADE-6.8.md` on `trunk` says, in full:
+future shop.** It **is being removed in 6.8**, which Shopware now
+[plans for 2027](https://www.shopware.com/en/news/next-major-version-6-8-planned-for-2027/).
+The latest shipping line is 6.7; 6.8 exists only on `trunk`, so everything
+in this paragraph is *forthcoming* behaviour, not something you can observe on
+a shop today. `UPGRADE-6.8.md` on `trunk` says:
 
 > *"Removed `sw-states` and `sw-currency` cache cookie handling, which means by
 > default the HTTP-Cache is also active for logged in customers or when the cart
@@ -120,7 +122,7 @@ classic "matcher stops matching ⇒ logged-in pages get cached" failure.
 
 | Cookie | Why it is not a bypass |
 |---|---|
-| `sw-states` | Being removed in 6.8 (unreleased, `trunk` — see above) — matching it stops firing silently on an upgraded shop. `sw-cache-hash` already carries everything it used to. |
+| `sw-states` | Being removed in 6.8 (planned for 2027; currently `trunk` — see above) — matching it stops firing silently on an upgraded shop. `sw-cache-hash` already carries everything it used to. |
 | `sw-currency` | Same forthcoming removal, same reason — already folded into `sw-cache-hash` (6.7's VCL still hashes it as a fallback; this preset does not — see [Gotchas](#gotchas)). |
 | `sw-context-token` | Set for **every** visitor, guest included — it identifies the sales-channel context, not a login. Bypassing on it zeroes your storefront hit rate. It is, however, why `/store-api` is bypassed by URI below (see [Gotchas](#gotchas)). |
 
@@ -158,10 +160,10 @@ http {
             cache_turbo_backend       shopware6;  # implies cache_control honor
                                                     # and value-keys sw-cache-hash
 
-            # NO cache_turbo_key here. try_files has rewritten $uri to
-            # /index.php, so any key built from $uri collapses the WHOLE
-            # storefront onto one entry. The module default keys on
-            # unparsed_uri (the original request line) and is correct.
+            # try_files has rewritten $uri to /index.php. The configured default
+            # key uses $uri, so it would collapse the WHOLE storefront onto one
+            # entry. $request_uri preserves the original request line.
+            cache_turbo_key           $host$request_uri;
             cache_turbo_valid         300s;
             cache_turbo_valid         404 410 1m;
             cache_turbo_preset        balanced;
@@ -209,16 +211,21 @@ add_header X-Cache-Turbo $cache_turbo_status always;
 
 ```bash
 # anonymous storefront page: MISS then HIT.
-curl -s -o /dev/null -D- https://shop.example.com/some-category | grep -i x-cache-turbo
-curl -s -o /dev/null -D- https://shop.example.com/some-category | grep -i x-cache-turbo   # HIT
+curl -s -o /dev/null -D- https://shop.example.com/some-category \
+    | grep -i x-cache-turbo
+curl -s -o /dev/null -D- https://shop.example.com/some-category \
+    | grep -i x-cache-turbo   # HIT
 
 # account / checkout / admin / api: BYPASS
-curl -s -o /dev/null -D- https://shop.example.com/account            | grep -i x-cache-turbo
-curl -s -o /dev/null -D- https://shop.example.com/checkout/confirm    | grep -i x-cache-turbo
+curl -s -o /dev/null -D- https://shop.example.com/account \
+    | grep -i x-cache-turbo
+curl -s -o /dev/null -D- https://shop.example.com/checkout/confirm \
+    | grep -i x-cache-turbo
 
 # THE HIT-RATE CHECK. A default anonymous visitor gets NO sw-cache-hash cookie
 # (it is actively deleted if stale) -- must still be a HIT.
-curl -s -o /dev/null -D- https://shop.example.com/some-category | grep -i x-cache-turbo   # HIT, no cookie needed
+curl -s -o /dev/null -D- https://shop.example.com/some-category \
+    | grep -i x-cache-turbo   # HIT, no cookie needed
 
 # THE SEGMENTATION CHECK. Two different hash values must land in two different
 # entries -- neither a HIT off the other's warm-up.

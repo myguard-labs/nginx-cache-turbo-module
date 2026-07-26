@@ -15,7 +15,7 @@ One page per `cache_turbo_backend` preset:
 | `joomla` | [joomla.md](joomla.md) | ⚠️ **partial** (`joomla_remember_me_`) — a non-remember-me login is INVISIBLE (md5 session cookie); you must still add a `cache_turbo_bypass` **+ `cache_turbo_no_store`** |
 | `xenforo` | [xenforo.md](xenforo.md) | ⚠️ yes (`xf_session` + `xf_user` + `xf_session_admin`) — **stock XF has NO login-only cookie**; `xf_session` is guest-issued, so safety costs hit rate. Also bypasses `/api/` (REST, `XF-Api-Key` header) + `_xfToken`, and **value-keys** `xf_style_id`/`xf_style_variation`/`xf_language_id` |
 | `discourse` | [discourse.md](discourse.md) | ✅ yes (`_t`) — and the origin sends `no-store` anyway |
-| `phpbb` | [phpbb.md](phpbb.md) | ❌ **no** — you must add a `cache_turbo_bypass` **+ `cache_turbo_no_store`**, and it needs a *value* test |
+| `phpbb` | [phpbb.md](phpbb.md) | ✅ yes (`*_u != 1`, matched by cookie-name suffix) — the value predicate is built into the preset |
 | `drupal` | [drupal.md](drupal.md) | ✅ yes (`SESS`) — anon users DO get sessions, so the cookie rule is required; it over-matches `PHPSESSID` by design |
 | `mediawiki` | [mediawiki.md](mediawiki.md) | ✅ yes (`*Token`, `*_session`) — **no URI rules: `/index.php` is the article path on a stock wiki** |
 | `magento` | [magento.md](magento.md) | ✅ yes (`X-Magento-Vary`, value-keyed) — and the origin sends `no-store` on cart/checkout |
@@ -31,14 +31,29 @@ One page per `cache_turbo_backend` preset:
 | `phorum` | [phorum.md](phorum.md) | ✅ yes (fixed session-cookie constants) — never guest-issued, the clean case |
 | `yabb` | [yabb.md](yabb.md) | ✅ yes (`Y2Sess-`/`Y2User-`/`Y2Pass-` prefix) — per-install random suffix, but never guest-issued |
 | `mybb` | [mybb.md](mybb.md) | ✅ yes (`{prefix}user` suffix) — never guest-issued |
-| `vbulletin` | [vbulletin.md](vbulletin.md) | ✅ yes (`bb_userid`/`bb_password`/`bbimloggedin`) — closed-source, community-corroborated |
+| `vbulletin` | [vbulletin.md](vbulletin.md) | ⚠️ yes (suffixes `userid`/`password`; optional `imloggedin=yes`) — closed-source; verify on current vBulletin 6 |
+| `textpattern` | [textpattern.md](textpattern.md) | ✅ yes (`txp_login_public`/`txp_login`) — default `/textpattern` admin folder; add a rule if renamed |
+| `bludit` | [bludit.md](bludit.md) | ✅ yes (`BLUDIT-KEY` plus remember-me cookies) — public bootstrap is session-free |
+| `spip` | [spip.md](spip.md) | ✅ yes (prefix-independent `_session`/`_admin` suffixes) — language/Ajax state bypasses conservatively |
+| `bugzilla` | [bugzilla.md](bugzilla.md) | ✅ yes (both login cookies plus cookieless API/login token args) — public bug/list/report pages remain cacheable |
+| `mantisbt` (`mantis`) | [mantisbt.md](mantisbt.md) | ✅ yes (prefix-independent login/state suffixes plus `PHPSESSID`) — custom PHP `session.name` needs a local rule |
+| `plone` | [plone.md](plone.md) | ✅ yes (`__ac`, Zope session/status/language state) — keep Plone's own cache headers enabled |
+| `umbraco` | [umbraco.md](umbraco.md) | ⚠️ yes for stock cookie names — member/back-office auth names are configurable; renamed schemes need local rules |
+| `dotclear` | [dotclear.md](dotclear.md) | ⚠️ yes with stock `dcxd` session name — custom `DC_SESSION_NAME` and same-host admin paths need local rules |
+| `wikijs` | [wikijs.md](wikijs.md) | ✅ yes for Wiki.js 2.x (`jwt`; untouched guests get no Express session) — re-audit for 3.x |
+
+`classicpress` is a source-verified alias for `wordpress`; `backdrop` is a
+source-verified alias for `drupal`. See the addenda in [wordpress.md](wordpress.md)
+and [drupal.md](drupal.md). They intentionally reuse the base preset rather than
+duplicating the same registry row.
 
 ## Not an app — a framework? (Django, Laravel, Rails, …)
 
 [frameworks.md](frameworks.md). There is **no `django` or `laravel` preset**, and
 there will not be one: a framework supplies none of the three literals a preset is
-made of. Laravel's session cookie is `<APP_NAME>_session` (per-install) *and* is
-handed to every guest unconditionally; Django's `sessionid` is only guest-free
+made of. Laravel's session cookie is derived from `APP_NAME` (and changed from
+underscore-separated in 11.x to hyphen-separated in 12/13.x) *and* is handed to
+every guest unconditionally; Django's `sessionid` is only guest-free
 until someone adds an anonymous cart. The guide gives you the three `curl`s that
 derive the correct rule for **your** app, and the `cache_turbo_cache_control honor;`
 default that is safe before you do.
@@ -100,28 +115,29 @@ preset inherited from the `server` block for one `location`.
 > preset now **implies** its base — `woocommerce` alone enables `wordpress` — so
 > that specific footgun is fixed the honest way, per-preset rather than via a
 > blanket union), and the
-> `joomla` in it ships no cookie rule at all — so `auto` on a Joomla site *looked*
-> like it protected logged-in users and did not. A default that is only correct if
-> you already know which parts of it are wrong is a footgun with a friendly name.
+> `joomla` in it had no usable session-cookie rule — so `auto` on a Joomla site
+> *looked* like it protected logged-in users and did not. A default that is only
+> correct if you already know which parts are wrong is a footgun with a friendly
+> name.
 >
 > The error names its replacement, and nginx refuses to start rather than
 > silently enabling nothing — which on an existing WordPress config would mean
 > quietly caching `/wp-admin/`.
 
-Four rows above are load-bearing:
+Several rows above are load-bearing:
 
-- **`joomla` does not ship a cookie rule.** Joomla's session cookie is named from
-  a hash of the site secret, so no shippable substring matches it. The preset
-  guards `/administrator/` and nothing else — a logged-in front-end user is *not*
-  protected until you add your own bypass. See [joomla.md](joomla.md).
-- **`phpbb` does not ship a cookie rule either, and for a sharper reason.** phpBB
-  hands `_u` / `_k` / `_sid` to *every* visitor including guests (an anonymous
-  reader gets `_u=1`), so telling a member from a guest needs a **value** test —
-  and the preset registry matches cookie *presence*, never value. A `_sid` rule
-  would match every guest, zero your hit rate, and still not find a member. The
-  guide gives you the `map` that does it properly. phpBB also sends no reliable
-  `Cache-Control: private`, so the bypass is the *whole* safety story there.
-  See [phpbb.md](phpbb.md).
+- **`joomla` ships only a partial cookie rule.** The stable
+  `joomla_remember_me_` prefix catches remembered logins, but Joomla's ordinary
+  session cookie is named from a hash of the site secret and has no shippable
+  substring. The preset also guards `/administrator/`; a non-remembered
+  logged-in front-end user is still unprotected until you add the install's
+  session-cookie bypass. See [joomla.md](joomla.md).
+- **`phpbb` needs a value predicate, and now ships one.** phpBB hands `_u` /
+  `_k` / `_sid` to every visitor including guests (an anonymous reader gets
+  `_u=1`), so presence cannot distinguish a member. The preset suffix-matches
+  the configurable `<cookie_name>_u` name and bypasses when its value is not
+  `1`. A `_sid` presence rule would instead zero the guest hit rate. See
+  [phpbb.md](phpbb.md).
 - **`drupal` ships the `SESS` cookie rule.** Drupal names its session cookie
   `SESS<hash>` (and `SSESS<hash>` over HTTPS), so the `SESS` substring matches every
   install without a per-site literal. It over-matches `PHPSESSID` and `JSESSIONID`
@@ -156,9 +172,10 @@ Four rows above are load-bearing:
   (`hash_data("+context=" + cookie.get("sw-cache-hash"))`). Bypassing on
   presence would send cart-holding guests and non-default-currency guests to
   origin for nothing — `isCacheHashRequired()` returns true for them too, and
-  their data is never in the cached HTML. `sw-states`/`sw-currency` were
-  **removed in 6.8** in favour of this one cookie, so a preset keyed on the old
-  cookies would silently stop firing on an upgraded shop. See
+  their data is never in the cached HTML. `sw-states`/`sw-currency` are slated
+  for **removal in 6.8** in favour of this one cookie; Shopware now plans 6.8
+  for 2027, so this remains forthcoming behaviour. A preset keyed on the old
+  cookies would silently stop firing after that upgrade. See
   [shopware6.md](shopware6.md).
 - **`ghost`'s query args are load-bearing.** `authMemberByUuid()` authenticates a
   member purely from `?uuid=&key=` with **no cookie at all**, so a cookie-only rule
@@ -195,6 +212,25 @@ Four rows above are load-bearing:
 
 ## Two traps these guides keep pointing at
 
+**A front-controller redirect changes `$uri`.** The module's configured default
+key is `$host$uri$cache_turbo_normalized_args`. In a typical PHP vhost,
+`try_files ... /index.php` performs an internal redirect before the module runs
+in the PHP location, so `$uri` is then `/index.php`. Without an explicit key,
+different clean URLs can collapse onto one cache entry. The PHP examples in
+these guides therefore use `cache_turbo_key $host$request_uri;`, which keeps the
+original path and query string. It trades the default tracking-argument
+normalization for correctness; an advanced configuration can split the original
+path from `$request_uri` with a `map` and append
+`$cache_turbo_normalized_args`.
+
+The preset URI tier also evaluates the post-redirect `$uri`. Cookies, dynamic
+query arguments, `Set-Cookie`, and honoured origin cache-control still apply,
+but a clean-path rule such as `/checkout` cannot fire after the redirect. When
+that route rule is load-bearing, classify `$request_uri` with a `map` and feed
+the result to both `cache_turbo_bypass` and `cache_turbo_no_store`; the
+[Magento](magento.md#vhost) and [Shopware](shopware6.md#vhost) guides show the
+pattern.
+
 **"Session" in a cookie name does not mean "logged in."** XenForo's `xf_session`,
 Discourse's `_forum_session`, phpBB's `_sid` and MediaWiki's `<prefix>_session`
 are all handed to *anonymous* visitors. Putting one in a bypass list drops most of
@@ -210,11 +246,12 @@ control; a too-generic literal costs hit rate (bypass is the safe direction, so 
 is never a leak). This is a different tier from the value predicates (cookie
 name-suffix plus a value operator) and from `cache_turbo_key_cookie` (exact name).
 
-**A cookie name that isn't stable across installs cannot be a preset rule.**
-Joomla hashes it from the site secret; phpBB lets the admin set the prefix. Where
-no substring can match, these two presets ship *no* cookie rule and say so — rather
-than shipping one that quietly does nothing. The guide then hands you the `map` that
-works on your install. Where a stable substring *does* exist, the preset ships it:
+**A cookie name that isn't stable across installs needs a stable fragment or a
+value predicate.** Joomla's ordinary session name is a whole-site hash, so its
+preset can ship only the separate `joomla_remember_me_` guard and requires the
+operator to add the actual session cookie. phpBB's prefix varies, but the `_u`
+suffix and guest value `1` are stable, so its preset can suffix-match the name
+and apply `_u != 1`. Where a stable fragment exists, the preset ships it:
 MediaWiki's cookie prefix varies (it's the database name), but every install shares
 the `Token=` / `_session=` / `UserID=` suffixes, so the preset matches those;
 Drupal's `SESS` prefix is fixed, so the preset matches that.
@@ -400,6 +437,174 @@ docs describe the session cookie as an opaque signed string set identically
 for guests and members, with no documented value split (no phpBB-style `_u=1`
 analog) — so a value predicate isn't available either, even per-install.
 Closed-source PHP prevents independent verification of either claim.
+
+### Issue trackers investigated in July 2026
+
+**Jira Server/Data Center.** Intentionally no preset. Atlassian documents
+[`JSESSIONID` as the authenticated cookie](https://developer.atlassian.com/server/jira/platform/cookie-based-authentication/),
+but its own [support trace](https://support.atlassian.com/jira/kb/jira-rate-limiting-is-not-working-due-to-cookies-headers-in-the-requests/)
+shows both `JSESSIONID` and `atlassian.xsrf.token` being issued while
+`x-ausername` is `anonymous`. Presence cannot separate a user from a guest.
+More decisively,
+Atlassian's [Data Center CDN
+guide](https://confluence.atlassian.com/adminjiraserver/use-a-cdn-with-atlassian-data-center-applications-974378840.html)
+says only static assets are cached; dynamic pages and issues are not. A Jira
+preset would either bypass everything useful or contradict the vendor's cache
+contract. Cache `/s/` and other fingerprinted assets with normal static rules,
+not this page cache.
+
+**Request Tracker (RT 6).** Intentionally no preset. RT's
+[`Web.pm`](https://github.com/bestpractical/rt/blob/stable/lib/RT/Interface/Web.pm)
+derives `RT_SID_<rtname>.<port>`, creates a session when none is supplied, and
+sends the session cookie from the web autohandler. Anonymous dynamic requests
+therefore receive the same opaque session shape as users. The universal
+`Set-Cookie` storage floor already refuses their first response; bypassing on
+`RT_SID_` then refuses every later request too. The result is a zero-hit preset.
+
+**Redmine and OpenProject.** Both are Rails applications that use session state
+on ordinary requests. Redmine's
+[`application.rb`](https://github.com/redmine/redmine/blob/master/config/application.rb)
+configures `_redmine_session`; OpenProject's
+[`session_store.rb`](https://github.com/opf/openproject/blob/dev/config/initializers/session_store.rb)
+defaults `_open_project_session` to an active-record session. In both cases the
+guest/member distinction is inside server-side session state, not a readable
+cookie value. Redmine also accepts the custom `X-Redmine-API-Key` header in
+[`ApplicationController`](https://github.com/redmine/redmine/blob/master/app/controllers/application_controller.rb),
+which a cookie/URI/query preset cannot inspect across every API route. A
+presence preset finds sessions, not users, and an HTML-only route list would
+leave a separate authentication channel invisible.
+
+**Flyspray.** Its core starts a `flyspray` PHP session and creates a per-session
+CSRF token, while
+[`header.php`](https://github.com/Flyspray/flyspray/blob/master/header.php)
+emits `Cache-Control: no-store, no-cache, must-revalidate`. Honoring the origin
+stores nothing; ignoring it would be knowingly unsafe.
+
+**Roundup.** The
+[`CGI client`](https://github.com/roundup-tracker/roundup/blob/master/roundup/cgi/client.py)
+defines a tracker-specific `roundup_session_<tracker>` cookie (or secure
+spelling) for visitor state, and rendered dynamic pages send `Cache-Control:
+no-cache` plus an already-expired `Expires`. The cookie is created lazily, not
+for literally every first-time visitor; the origin's dynamic-page cache policy
+is the decisive reason a preset adds no value.
+
+**Phorge.** [`PhabricatorController`](https://github.com/phorgeit/phorge/blob/master/src/applications/base/controller/PhabricatorController.php)
+creates an anonymous `phsid` session for CSRF before controller execution, and
+the base [`AphrontResponse`](https://github.com/phorgeit/phorge/blob/master/src/aphront/response/AphrontResponse.php)
+defaults dynamic output to `Cache-Control: no-store`. The first response cannot
+be stored and every later request carries guest-issued session state. No useful
+preset remains.
+
+**Trac.** `trac_auth` is a clean authenticated-user cookie, but Trac's current
+[`Request.send()` path](https://github.com/edgewall/trac/blob/master/trac/web/api.py)
+marks rendered dynamic pages `must-revalidate` with an expired `Expires` value.
+A preset implies `honor`, so there is no safe cacheable page surface to unlock.
+Static assets belong in ordinary nginx static caching.
+
+**GitLab.** Intentionally no preset. Current public issue and repository HTML
+responses create an anonymous `_gitlab_session` and send `Cache-Control:
+max-age=0, private, must-revalidate`. GitLab's own
+[`NoCacheHeaders`](https://gitlab.com/gitlab-org/gitlab/-/blob/master/lib/gitlab/no_cache_headers.rb)
+adds `no-store, no-cache` on still more sensitive responses. Honoring those
+headers stores no dynamic HTML; bypassing on `_gitlab_session` also rejects the
+anonymous return request. Cache fingerprinted assets and intentionally public
+raw objects using their own response policy, not with a GitLab page preset.
+
+**Gitea and Forgejo.** Gitea's common dynamic-web
+[`Contexter`](https://github.com/go-gitea/gitea/blob/main/services/context/context.go)
+sets `max-age=0, private, must-revalidate` before dispatch, while its static
+handler has a separate public policy. A preset that implies `honor` therefore
+does not unlock dynamic repository or issue pages. Forgejo also makes the
+[session cookie configurable and supports reverse-proxy authentication on web
+requests](https://forgejo.org/docs/latest/admin/config-cheat-sheet/); a fixed
+cookie rule could miss that header-based identity channel. Keep their static
+asset caching separate.
+
+**Zammad.** Every response using its application controller is changed to
+`Cache-Control: no-store` by
+[`SetsHeaders`](https://github.com/zammad/zammad/blob/develop/app/controllers/application_controller/sets_headers.rb).
+That deliberately includes the public knowledge-base controller hierarchy. A
+preset would either respect the contract and store nothing or override an
+explicit vendor safety boundary.
+
+**osTicket.** Its bootstrap selects PHP's
+[`nocache` session limiter](https://github.com/osTicket/osTicket/blob/develop/bootstrap.php),
+and the application constructor starts `OSTSESSID` plus session-backed CSRF for
+the client and knowledge-base surface in
+[`class.osticket.php`](https://github.com/osTicket/osTicket/blob/develop/include/class.osticket.php).
+The guest/member split is consequently inside an always-started session and the
+origin already forbids shared caching.
+
+**GLPI.** GLPI derives the PHP session name from a hash of the installation path,
+host and port in
+[`SystemConfigurator`](https://github.com/glpi-project/glpi/blob/11.0/bugfixes/src/Glpi/Application/SystemConfigurator.php),
+then [`Session::start()`](https://github.com/glpi-project/glpi/blob/11.0/bugfixes/src/Session.php)
+starts it and writes request-specific state. No fixed cookie literal is portable,
+and bypassing only the remember-me suffix would miss an ordinary authenticated
+session. Its explicitly public CSS/locale endpoints belong under normal static
+or response-header-aware caching.
+
+Bugzilla and MantisBT passed the same review and are the two tracker presets
+that did ship: both have meaningful anonymous issue pages and observable auth
+state. See [bugzilla.md](bugzilla.md) and [mantisbt.md](mantisbt.md).
+
+### Other CMS/publishing candidates checked in the same pass
+
+**WriteFreely.** Public home/collection rendering reads flash state and calls
+[`saveUserSession()`](https://github.com/writefreely/writefreely/blob/develop/session.go),
+which saves the `wfu` cookie even for an anonymous visitor. **Question2Answer**
+does have a login-only `qa_session` cookie, but public question/list rendering
+embeds form-security codes; its
+[`qa_set_form_security_key()`](https://github.com/q2a/question2answer/blob/bugfix/qa-include/app/users.php)
+sets or extends a visitor-specific `qa_key` cookie whenever those codes are
+rendered. The shared HTML surface is therefore session-bound despite the clean
+login signal, and a `qa_key` guard would bypass the pages worth caching.
+
+**Zenphoto.** Authentication/password cookies are classifiable, but the optional
+[`GALLERY_SESSION` branch](https://github.com/zenphoto/zenphoto/blob/master/zp-core/definitions-core.php)
+starts a configurable PHP session on public gallery traffic. A preset cannot
+know whether it is enabled or what `session.name` an installation selected.
+Missing that state can be unsafe; matching only the default would claim
+protection it does not have. Use installation-specific manual rules if you have
+verified public requests remain session-free.
+
+**Pagure.** The application writes `flask.session.permanent = True` in its
+global request setup in
+[`flask_app.py`](https://pagure.io/pagure/blob/master/f/pagure/flask_app.py),
+and public repository/issue templates include session-backed CSRF forms. The
+default cookie name `pagure` is observable, but bypassing it would remove the
+return visits that a page cache needs; omitting it would ignore guest-specific
+signed session state.
+
+**DokuWiki.** The common
+[`inc/init.php`](https://github.com/dokuwiki/dokuwiki/blob/master/inc/init.php)
+starts the `DokuWiki` PHP session for dynamic requests. Guest breadcrumbs,
+messages and authentication state share it, while the separate `DW<hash>` auth
+cookie is installation-derived. A session-presence rule fails safe but makes
+the public wiki a one-request cache at best.
+
+**Serendipity.** Its common
+[`serendipity_config.inc.php`](https://github.com/s9y/Serendipity/blob/master/serendipity_config.inc.php)
+starts a path-derived `s9y_<hash>` session, and the public
+[`index.php`](https://github.com/s9y/Serendipity/blob/master/index.php) emits
+`private` or `no-cache` while using that session for autologin. There is neither
+a portable cookie literal nor an origin-approved shared HTML surface.
+
+**PluXml and WonderCMS.** PluXml's public
+[`index.php`](https://github.com/pluxml/PluXml/blob/master/index.php) calls
+`plx_session_start()` before rendering and uses that same session for article
+preview; the helper in
+[`core/lib/config.php`](https://github.com/pluxml/PluXml/blob/master/core/lib/config.php)
+retains PHP's configurable session name. WonderCMS starts PHP's session at the
+top of its single public
+[`index.php`](https://github.com/robiso/wondercms/blob/main/index.php) and renders
+admin state on the same arbitrary page routes. Both reduce to a broad PHP
+session bypass with little shared-cache value.
+
+Dotclear and Wiki.js passed this publishing/wiki batch and ship as
+[`dotclear`](dotclear.md) and [`wikijs`](wikijs.md). Dotclear keeps ordinary
+frontend rendering session-free; Wiki.js sets `saveUninitialized: false` and
+uses a fixed `jwt` cookie for authenticated variants.
 
 **The test to apply before asking for a new preset:** *what fraction of this app's
 requests are pages a logged-out stranger can see, that look the same for every

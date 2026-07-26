@@ -27,8 +27,9 @@ cache_turbo_backend magento;      # implies cache_turbo_cache_control honor
 ```
 
 Set Magento's cache application to **Built-in**, not Varnish (see
-[Gotchas](#gotchas)). That's it for a correct, safe config — the vary cookie is
-handled natively, no `map` required.
+[Gotchas](#gotchas)). That is the preset portion. The PHP front-controller
+vhost still needs the original-URL key and private-route map shown below; the
+vary cookie itself is handled natively and needs no cookie `map`.
 
 ## Why this can replace Varnish
 
@@ -233,10 +234,10 @@ http {
             cache_turbo_backend       magento;   # implies cache_control honor
                                                   # and value-keys X-Magento-Vary
 
-            # NO cache_turbo_key here. try_files has rewritten $uri to
-            # /index.php, so any key built from $uri collapses the WHOLE
-            # storefront onto one entry. The module default keys on
-            # unparsed_uri (the original request line) and is correct.
+            # try_files has rewritten $uri to /index.php. The configured default
+            # key uses $uri, so it would collapse the WHOLE storefront onto one
+            # entry. $request_uri preserves the original request line.
+            cache_turbo_key           $host$request_uri;
             cache_turbo_valid         300s;      # catalog tolerates a long TTL
             cache_turbo_valid         404 410 1m;
             cache_turbo_preset        balanced;
@@ -286,12 +287,16 @@ add_header X-Cache-Turbo $cache_turbo_status always;
 
 ```bash
 # anonymous catalog page: MISS then HIT. This is the money path.
-curl -s -o /dev/null -D- https://shop.example.com/some-category | grep -i x-cache-turbo
-curl -s -o /dev/null -D- https://shop.example.com/some-category | grep -i x-cache-turbo   # HIT
+curl -s -o /dev/null -D- https://shop.example.com/some-category \
+    | grep -i x-cache-turbo
+curl -s -o /dev/null -D- https://shop.example.com/some-category \
+    | grep -i x-cache-turbo   # HIT
 
 # cart / checkout / account: BYPASS
-curl -s -o /dev/null -D- https://shop.example.com/checkout/cart     | grep -i x-cache-turbo
-curl -s -o /dev/null -D- https://shop.example.com/customer/account  | grep -i x-cache-turbo
+curl -s -o /dev/null -D- https://shop.example.com/checkout/cart \
+    | grep -i x-cache-turbo
+curl -s -o /dev/null -D- https://shop.example.com/customer/account \
+    | grep -i x-cache-turbo
 
 # THE HIT-RATE CHECK. A GUEST carrying the cookies Magento gives every visitor
 # must still be a HIT. If any of these say BYPASS, someone added an anon cookie
@@ -309,7 +314,8 @@ curl -s -o /dev/null -D- -H 'Cookie: X-Magento-Vary=deadbeef' \
      https://shop.example.com/some-category | grep -i x-cache-turbo        # MISS (different segment, not the other customer's HIT)
 
 # And confirm the origin is doing its half.
-curl -s -o /dev/null -D- https://shop.example.com/checkout/cart | grep -i cache-control
+curl -s -o /dev/null -D- https://shop.example.com/checkout/cart \
+    | grep -i cache-control
 # Cache-Control: no-store, no-cache, must-revalidate, max-age=0
 ```
 
@@ -380,7 +386,7 @@ The prefix needs a `/` or `.` boundary after it, so a catalog URL like
   `gbraid` and friends from the URL before hashing, so a hundred ad-tagged
   variants of one product page share **one** cache entry. On a store with paid
   traffic this is worth more hit rate than every bypass rule combined — use
-  `cache_turbo_normalize_args` / `$cache_turbo_normalized_args` (see the
+  `cache_turbo_normalize_strip` / `$cache_turbo_normalized_args` (see the
   [main README](../README.md#the-cache-key)).
 - **`/graphql` is bypassed here, and this is the one place the preset deviates
   from Magento's VCL.** Upstream *caches* GraphQL: `varnish7.vcl` passes only an

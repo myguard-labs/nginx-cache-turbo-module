@@ -101,6 +101,8 @@ http {
         location ~ \.php$ {
             cache_turbo               ct;
             cache_turbo_backend       smf;
+            # Preserve the original URL after try_files redirects to index.php.
+            cache_turbo_key           $host$request_uri;
 
             cache_turbo_valid         60s;
             cache_turbo_valid         404 410 1m;
@@ -134,18 +136,20 @@ add_header X-Cache-Turbo $cache_turbo_status always;
 
 ```bash
 # guest topic: MISS then HIT
-curl -sI https://forum.example.com/index.php?topic=1.0 | grep -i x-cache-turbo
-curl -sI https://forum.example.com/index.php?topic=1.0 | grep -i x-cache-turbo  # HIT
+curl -s -o /dev/null -D- https://forum.example.com/index.php?topic=1.0 \
+    | grep -i x-cache-turbo
+curl -s -o /dev/null -D- https://forum.example.com/index.php?topic=1.0 \
+    | grep -i x-cache-turbo  # HIT
 
 # a GUEST who hit the login page while cookieless (SMFCookie, empty password)
 # will now BYPASS — this is the expected, bounded hit-rate cost, not a bug.
 # (Value shape {"0":0,"1":"",...} is illustrative; the preset keys on presence,
 #  not the bytes. Use the site's real cookie name if it isn't SMFCookie11.)
-curl -sI -H 'Cookie: SMFCookie11=%7B%220%22%3A0%2C%221%22%3A%22%22%2C%222%22%3A0%7D' \
+curl -s -o /dev/null -D- -H 'Cookie: SMFCookie11=%7B%220%22%3A0%2C%221%22%3A%22%22%2C%222%22%3A0%7D' \
      https://forum.example.com/index.php?topic=1.0 | grep -i x-cache-turbo    # BYPASS
 
 # THE ONE THAT MATTERS: a logged-in member must be BYPASS.
-curl -sI -H 'Cookie: SMFCookie11=%7B%220%22%3A42%2C%221%22%3A%22somehash%22%2C%222%22%3A0%7D' \
+curl -s -o /dev/null -D- -H 'Cookie: SMFCookie11=%7B%220%22%3A42%2C%221%22%3A%22somehash%22%2C%222%22%3A0%7D' \
      https://forum.example.com/index.php?topic=1.0 | grep -i x-cache-turbo    # BYPASS
 ```
 

@@ -22,16 +22,16 @@ cache_turbo         ct;
 cache_turbo_backend wordpress;
 ```
 
-That's it — the default key is right for a stock WordPress site. The preset
+That is the preset portion. In the `try_files` vhost below, the explicit
+`$host$request_uri` key preserves the original permalink after nginx internally
+redirects to `/index.php`. The preset
 auto-skips `/wp-admin/`, `/wp-login.php`, `/wp-cron.php`, `/xmlrpc.php` and
 `/wp-json/`, plus any request carrying a logged-in / password-protected-post /
 comment-author cookie, and any `?preview=` request. Site search (`?s=`) is
 **cached**, not bypassed — see below.
 
-Each preset is its own independent bit — `cache_turbo_backend wordpress;`
-activates the WordPress rules and **nothing else**. It does not imply
-WooCommerce and it does not imply Joomla. If the site runs WooCommerce you must
-stack the presets explicitly:
+`cache_turbo_backend wordpress;` activates the WordPress rules and does not
+imply WooCommerce or Joomla. If the site runs WooCommerce, add its preset too:
 
 ```nginx
 cache_turbo_backend wordpress woocommerce;
@@ -132,6 +132,8 @@ http {
         location ~ \.php$ {
             cache_turbo               ct;
             cache_turbo_backend       wordpress;
+            # Preserve the original URL after try_files redirects to index.php.
+            cache_turbo_key           $host$request_uri;
 
             cache_turbo_valid         60s;
             cache_turbo_valid         404 410 1m;   # negative caching
@@ -199,7 +201,7 @@ don't reach PHP at all. Run both.
 A 60s TTL means a new post is live within a minute. For instant, purge on publish:
 
 ```bash
-curl -X POST 'http://127.0.0.1/_cache?key=/blog/my-post/'
+curl -X POST 'http://127.0.0.1/_cache?key=example.com/blog/my-post/'
 curl -X POST 'http://127.0.0.1/_cache?all=1'          # after a theme change
 ```
 
@@ -215,20 +217,25 @@ add_header X-Cache-Turbo $cache_turbo_status always;
 
 ```bash
 # anonymous post: MISS then HIT
-curl -sI https://example.com/blog/hello/ | grep -i x-cache-turbo
-curl -sI https://example.com/blog/hello/ | grep -i x-cache-turbo   # HIT
+curl -s -o /dev/null -D- https://example.com/blog/hello/ | grep -i x-cache-turbo
+curl -s -o /dev/null -D- https://example.com/blog/hello/ \
+    | grep -i x-cache-turbo   # HIT
 
 # logged-in: must always be BYPASS
-curl -sI -H 'Cookie: wordpress_logged_in_abc=user|123|hash' \
+curl -s -o /dev/null -D- -H 'Cookie: wordpress_logged_in_abc=user|123|hash' \
      https://example.com/blog/hello/ | grep -i x-cache-turbo       # BYPASS
 
 # admin + preview: BYPASS
-curl -sI https://example.com/wp-admin/            | grep -i x-cache-turbo
-curl -sI 'https://example.com/?preview=true'      | grep -i x-cache-turbo
+curl -s -o /dev/null -D- https://example.com/wp-admin/ \
+    | grep -i x-cache-turbo
+curl -s -o /dev/null -D- 'https://example.com/?preview=true' \
+    | grep -i x-cache-turbo
 
 # search is CACHED, not bypassed -- a second identical search should HIT
-curl -sI 'https://example.com/?s=test'            | grep -i x-cache-turbo
-curl -sI 'https://example.com/?s=test'            | grep -i x-cache-turbo
+curl -s -o /dev/null -D- 'https://example.com/?s=test' \
+    | grep -i x-cache-turbo
+curl -s -o /dev/null -D- 'https://example.com/?s=test' \
+    | grep -i x-cache-turbo
 ```
 
 If a logged-in request ever returns `HIT`, stop — that's an authenticated page in
@@ -241,7 +248,7 @@ a shared cache.
   registers the rule, and `rest_api_loaded()` dispatches only when that query
   var is set. With plain permalinks the request never carries a `/wp-json/`
   path at all, so guarding only the path left `GET /?rest_route=/wp/v2/users/me`
-  cacheable. Same API, two addressings, both now covered.
+  cacheable. Same API, two URL forms, both now covered.
 - **`/wp-json/` is bypassed wholesale.** That includes *public, cacheable* REST
   endpoints. If you serve a public API from `/wp-json/` and want it cached, give
   it its own `location` with `cache_turbo_backend` unset (and think hard about
@@ -257,8 +264,26 @@ a shared cache.
   logged-in editor is covered by the cookie tier. If unbounded search-key
   cardinality worries you, that is what `cache_turbo_min_uses N` is for — do not
   reach for a bypass, which removes miss-collapsing and floods the origin.
-- **WooCommerce?** Stack the presets: `cache_turbo_backend wordpress woocommerce;`
-  — see [`woocommerce.md`](woocommerce.md).
+- **WooCommerce?** Add its preset:
+  `cache_turbo_backend wordpress woocommerce;`. Naming only `woocommerce` is
+  also safe because it implies `wordpress`; see
+  [`woocommerce.md`](woocommerce.md).
+
+## ClassicPress: use the `classicpress` alias
+
+`cache_turbo_backend classicpress;` is an alias for the `wordpress` bit, not a
+second rule set. This is deliberate and source-verified against current
+ClassicPress: its
+[`default-constants.php`](https://github.com/ClassicPress/ClassicPress/blob/develop/src/wp-includes/default-constants.php)
+still defines `LOGGED_IN_COOKIE` as `wordpress_logged_in_` plus `COOKIEHASH`,
+and it retains `/wp-admin/`, `/wp-login.php`, `/wp-cron.php`, `/xmlrpc.php` and
+the WordPress REST routing model. A duplicate preset would drift while adding
+no coverage.
+
+ClassicPress plugins can add private front-end surfaces just as WordPress
+plugins do. The alias proves the core contract only; keep the plugin guidance
+below and add local bypass/no-store rules for custom membership, commerce or
+community routes.
 
 ## Forum / community plugins: bbPress, wpForo, Asgaros, BuddyPress, BuddyBoss
 

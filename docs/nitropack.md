@@ -1,6 +1,6 @@
 # NitroPack + cache-turbo
 
-_Last researched: 2026-07-18_
+_Last researched: 2026-07-26_
 
 NitroPack is architecturally different from every other plugin in this doc set —
 this page exists to explain that difference before it costs you a debugging
@@ -38,8 +38,9 @@ for the same requests.
 a *connector*, not the cache itself. Confirmed from NitroPack's own docs
 ([What does the NitroPack plugin do for WordPress sites?](https://nitropack.io/blog/what-does-nitropack-do-wordpress/),
 [server requirements](https://support.nitropack.io/en/articles/8390446-server-requirements))
-and cross-checked against the connector plugin source (wordpress.org slug
-`nitropack`, Stable tag **1.19.8**, source read 2026-07-18):
+and cross-checked against the
+[official connector plugin](https://wordpress.org/plugins/nitropack/) source
+(stable tag **1.19.9**, source read 2026-07-26):
 
 - The actual caching, image optimization, and minification happen on
   **NitroPack's own servers** — "on its own servers, which preserves your
@@ -157,6 +158,8 @@ http {
         location ~ \.php$ {
             cache_turbo               ct;
             cache_turbo_backend       wordpress;   # same preset as a bare WP site
+            # Preserve the original URL after try_files redirects to index.php.
+            cache_turbo_key           $host$request_uri;
 
             cache_turbo_valid         60s;
             cache_turbo_valid         404 410 1m;

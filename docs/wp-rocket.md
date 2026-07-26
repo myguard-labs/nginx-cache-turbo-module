@@ -115,13 +115,14 @@ value): `utm_*` (source/medium/campaign/etc.), `gclid`, `fbclid`,
 [Customize query string
 caching](https://docs.wp-rocket.me/article/1281-customize-query-string-caching)).
 
-cache-turbo's `$cache_turbo_normalized_args` already strips the standard
-tracking-param set independently at the nginx layer (see
-[README — The cache key](../README.md#the-cache-key)) — the two lists overlap
-in intent (drop marketing params from the key) but are enforced at different
-layers and don't need to be kept in lockstep; cache-turbo's normalization runs
-regardless of what WP Rocket's PHP filter says, since cache-turbo (once you've
-disabled WP Rocket's page cache per above) is the only layer actually deciding
+cache-turbo can strip the standard tracking-param set independently at the
+nginx layer with `$cache_turbo_normalized_args` (see
+[README — The cache key](../README.md#the-cache-key)). The safe front-controller
+vhost below instead uses raw `$request_uri`, because `$uri` has already become
+`/index.php`; that explicit key does **not** apply normalization. To keep both
+properties, map the original path out of `$request_uri` and append
+`$cache_turbo_normalized_args`, as described in [`docs/README.md`](README.md#two-traps-these-guides-keep-pointing-at).
+Either way, WP Rocket's PHP filter no longer decides
 cache keys for HTML.
 
 WP Rocket also ships a **`?nowprocket`** bypass query arg ([Bypass WP Rocket's
@@ -166,6 +167,8 @@ http {
         location ~ \.php$ {
             cache_turbo               ct;
             cache_turbo_backend       wordpress;
+            # Preserve the original URL after try_files redirects to index.php.
+            cache_turbo_key           $host$request_uri;
 
             cache_turbo_valid         60s;
             cache_turbo_valid         404 410 1m;   # negative caching
@@ -230,7 +233,7 @@ add_action( 'transition_post_status', function ( $new, $old, $post ) {
         return;
     }
     // The admin endpoint hashes ?key= verbatim -- it must equal the full
-    // cache key (host + uri + normalized args), not just the path.
+    // cache key (host + original request URI), not just the path.
     $permalink = get_permalink( $post );
     $key = wp_parse_url( $permalink, PHP_URL_HOST ) . wp_parse_url( $permalink, PHP_URL_PATH );
     wp_remote_post( 'http://127.0.0.1/_cache?key=' . rawurlencode( $key ) );

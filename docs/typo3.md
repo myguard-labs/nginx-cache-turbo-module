@@ -126,6 +126,8 @@ http {
         location ~ \.php$ {
             cache_turbo         ct;
             cache_turbo_backend typo3;    # implies cache_control honor
+            # Preserve the original URL after try_files redirects to index.php.
+            cache_turbo_key           $host$request_uri;
 
             cache_turbo_valid   60s;
             cache_turbo_valid   404 410 1m;

@@ -129,6 +129,8 @@ http {
         location ~ \.php$ {
             cache_turbo               ct;
             cache_turbo_backend       wordpress;
+            # Preserve the original URL after try_files redirects to index.php.
+            cache_turbo_key           $host$request_uri;
 
             cache_turbo_valid         60s;
             cache_turbo_valid         404 410 1m;   # negative caching
@@ -183,11 +185,12 @@ add_header X-Cache-Turbo $cache_turbo_status always;
 
 ```bash
 # anonymous post: MISS then HIT
-curl -sI https://example.com/blog/hello/ | grep -i x-cache-turbo
-curl -sI https://example.com/blog/hello/ | grep -i x-cache-turbo   # HIT
+curl -s -o /dev/null -D- https://example.com/blog/hello/ | grep -i x-cache-turbo
+curl -s -o /dev/null -D- https://example.com/blog/hello/ \
+    | grep -i x-cache-turbo   # HIT
 
 # logged-in: must always be BYPASS
-curl -sI -H 'Cookie: wordpress_logged_in_abc=user|123|hash' \
+curl -s -o /dev/null -D- -H 'Cookie: wordpress_logged_in_abc=user|123|hash' \
      https://example.com/blog/hello/ | grep -i x-cache-turbo       # BYPASS
 ```
 

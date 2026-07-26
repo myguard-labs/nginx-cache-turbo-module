@@ -74,6 +74,8 @@ http {
         location ~ \.php$ {
             cache_turbo               ct;
             cache_turbo_backend       invision;
+            # Preserve the original URL after try_files redirects to index.php.
+            cache_turbo_key           $host$request_uri;
 
             cache_turbo_valid         60s;
             cache_turbo_valid         404 410 1m;
@@ -108,15 +110,18 @@ add_header X-Cache-Turbo $cache_turbo_status always;
 
 ```bash
 # guest topic: MISS then HIT
-curl -sI https://forum.example.com/topic/1-hello/ | grep -i x-cache-turbo
-curl -sI https://forum.example.com/topic/1-hello/ | grep -i x-cache-turbo   # HIT
+curl -s -o /dev/null -D- https://forum.example.com/topic/1-hello/ \
+    | grep -i x-cache-turbo
+curl -s -o /dev/null -D- https://forum.example.com/topic/1-hello/ \
+    | grep -i x-cache-turbo   # HIT
 
 # THE ONE THAT MATTERS: a logged-in member must be BYPASS.
-curl -sI -H 'Cookie: ips4_loggedIn=1' \
+curl -s -o /dev/null -D- -H 'Cookie: ips4_loggedIn=1' \
      https://forum.example.com/topic/1-hello/ | grep -i x-cache-turbo       # BYPASS
 
 # admin: BYPASS
-curl -sI https://forum.example.com/admin/ | grep -i x-cache-turbo
+curl -s -o /dev/null -D- https://forum.example.com/admin/ \
+    | grep -i x-cache-turbo
 ```
 
 ## Gotchas

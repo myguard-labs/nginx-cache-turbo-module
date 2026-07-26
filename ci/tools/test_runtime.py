@@ -2221,8 +2221,8 @@ http {{
         }}
 
         # ---- phpbb --------------------------------------------------------
-        # Ships NO cookie rule (all three phpBB cookies are set for guests and
-        # the matcher has no value predicate). URI + ?sid= only.
+        # Every visitor gets phpBB's cookies; the preset therefore uses the
+        # `_u != 1` value predicate rather than a name-presence rule.
         location /ucp.php {{
             cache_turbo         main;
             cache_turbo_backend phpbb;
@@ -2251,6 +2251,100 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # ---- 2026 preset expansion --------------------------------------
+        # Each app is mounted below a unique prefix. backend_prefix rebases
+        # the preset's root-relative URI rules, so the same location exercises
+        # cookie, query-arg and URI tiers without colliding with older tests'
+        # /admin, /login and other root locations.
+        location /ct-textpattern/ {{
+            cache_turbo         main;
+            cache_turbo_backend textpattern;
+            cache_turbo_backend_prefix /ct-textpattern/;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        location /ct-bludit/ {{
+            cache_turbo         main;
+            cache_turbo_backend bludit;
+            cache_turbo_backend_prefix /ct-bludit/;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        location /ct-spip/ {{
+            cache_turbo         main;
+            cache_turbo_backend spip;
+            cache_turbo_backend_prefix /ct-spip/;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        location /ct-bugzilla/ {{
+            cache_turbo         main;
+            cache_turbo_backend bugzilla;
+            cache_turbo_backend_prefix /ct-bugzilla/;
+            cache_turbo_key     $uri$is_args$args;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        location /ct-mantis/ {{
+            cache_turbo         main;
+            cache_turbo_backend mantis;
+            cache_turbo_backend_prefix /ct-mantis/;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        location /ct-plone/ {{
+            cache_turbo         main;
+            cache_turbo_backend plone;
+            cache_turbo_backend_prefix /ct-plone/;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        location /ct-umbraco/ {{
+            cache_turbo         main;
+            cache_turbo_backend umbraco;
+            cache_turbo_backend_prefix /ct-umbraco/;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        location /ct-dotclear/ {{
+            cache_turbo         main;
+            cache_turbo_backend dotclear;
+            cache_turbo_backend_prefix /ct-dotclear/;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        location /ct-wikijs/ {{
+            cache_turbo         main;
+            cache_turbo_backend wikijs;
+            cache_turbo_backend_prefix /ct-wikijs/;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        location /ct-classicpress/ {{
+            cache_turbo         main;
+            cache_turbo_backend classicpress;
+            cache_turbo_backend_prefix /ct-classicpress/;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        location /ct-backdrop/ {{
+            cache_turbo         main;
+            cache_turbo_backend backdrop;
+            cache_turbo_backend_prefix /ct-backdrop/;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # ---- invision -----------------------------------------------------
         # Cookie/arg rules are path-independent, so a prefixed location
         # exercises them. $uri key for the same attribution reason as /vbull/.
@@ -2263,7 +2357,8 @@ http {{
         }}
 
         # ---- drupal -------------------------------------------------------
-        # Ships NO cookie rule (SESS would substring-match PHPSESSID/JSESSIONID).
+        # Drupal's SESS substring deliberately catches SESS*/SSESS* session
+        # names; false-positive names cost a bypass rather than risking a leak.
         location /user {{
             cache_turbo         main;
             cache_turbo_backend drupal;
@@ -4585,6 +4680,164 @@ def test_invision_preset(ng: Nginx, origin: Origin) -> None:
     drain_origin(origin)
 
 
+def _assert_new_preset_shape(
+    ng: Nginx,
+    root: str,
+    cookie: str,
+    dynamic_uri: str,
+) -> None:
+    """Pin the shared contract for a newly added preset.
+
+    A plain public URL must still cache; a representative state cookie and a
+    representative root-relative dynamic URI must bypass. The URI request is
+    made below the test mount so this also covers backend_prefix rebasing.
+    """
+    public = f"/{root}/public"
+    fetch(ng.port, public)
+    status, _, hp = fetch(ng.port, public)
+    assert status == 200, f"{root} public page returned {status}"
+    assert hp.get("x-cache") == "HIT", \
+        f"{root} anonymous public page must cache, got {hp.get('x-cache')}"
+
+    member = f"/{root}/state-cookie"
+    headers = {"Cookie": cookie}
+    fetch(ng.port, member, headers=headers)
+    status, _, hc = fetch(ng.port, member, headers=headers)
+    assert status == 200, f"{root} cookie request returned {status}"
+    assert "x-cache" not in hc, \
+        f"{root} state cookie {cookie!r} must bypass, got {hc.get('x-cache')}"
+
+    uri = f"/{root}/{dynamic_uri.lstrip('/')}"
+    fetch(ng.port, uri)
+    status, _, hu = fetch(ng.port, uri)
+    assert status == 200, f"{root} dynamic URI returned {status}"
+    assert "x-cache" not in hu, \
+        f"{root} dynamic URI {dynamic_uri!r} must bypass, got {hu.get('x-cache')}"
+
+
+def test_2026_preset_expansion(ng: Nginx, origin: Origin) -> None:
+    """Source-audited CMS and issue-tracker presets added in 2026.
+
+    Representative rules cover all nine registry rows and the three aliases.
+    Extra assertions pin the suffix predicates, cookieless token auth, and
+    current alternate cookie spellings that motivated the individual designs.
+    """
+    _assert_new_preset_shape(
+        ng, "ct-textpattern", "txp_login_public=member", "textpattern/index.php"
+    )
+    _assert_new_preset_shape(
+        ng, "ct-bludit", "__Secure-BLUDIT-KEY=session", "admin/dashboard"
+    )
+    _assert_new_preset_shape(
+        ng, "ct-spip", "CUSTOM_session=member", "ecrire/"
+    )
+    _assert_new_preset_shape(
+        ng, "ct-bugzilla", "Bugzilla_logincookie=member", "editusers.cgi"
+    )
+    _assert_new_preset_shape(
+        ng, "ct-mantis", "ACME_STRING_COOKIE=member", "bug_report_page.php"
+    )
+    _assert_new_preset_shape(
+        ng, "ct-plone", "__ac=member", "@@login"
+    )
+    _assert_new_preset_shape(
+        ng, "ct-umbraco", "__Host-umbAccessToken-siteA=member", "umbraco/"
+    )
+    _assert_new_preset_shape(
+        ng, "ct-dotclear", "dcxd_blog=session", "pagespreview/draft"
+    )
+    _assert_new_preset_shape(
+        ng, "ct-wikijs", "jwt=token", "graphql"
+    )
+    _assert_new_preset_shape(
+        ng, "ct-classicpress", "wordpress_logged_in_hash=member", "wp-admin/"
+    )
+    _assert_new_preset_shape(
+        ng, "ct-backdrop", "SSESSabc=member", "user/login"
+    )
+
+    # SPIP's cookie prefix is configurable. Every presentation/state suffix is
+    # intentionally prefix-agnostic and non-empty only.
+    for i, cookie in enumerate((
+        "site_admin=1",
+        "site_lang=fr",
+        "site_lang_ecrire=fr",
+        "site_accepte_ajax=1",
+    )):
+        uri = f"/ct-spip/predicate-{i}"
+        fetch(ng.port, uri, headers={"Cookie": cookie})
+        status, _, h = fetch(ng.port, uri, headers={"Cookie": cookie})
+        assert status == 200, f"SPIP predicate request returned {status}"
+        assert "x-cache" not in h, \
+            f"SPIP suffix cookie {cookie!r} must bypass, got {h.get('x-cache')}"
+
+    # Empty suffix cookies are cleared state, not active identity/preferences.
+    empty_spip = {"Cookie": "site_session=; site_lang="}
+    fetch(ng.port, "/ct-spip/empty", headers=empty_spip)
+    status, _, hs = fetch(ng.port, "/ct-spip/empty", headers=empty_spip)
+    assert status == 200, f"empty SPIP-cookie request returned {status}"
+    assert hs.get("x-cache") == "HIT", \
+        f"empty SPIP state cookies must stay cacheable, got {hs.get('x-cache')}"
+
+    # SPIP action/debug modes and Bugzilla query credential spellings can carry
+    # dynamic or authenticated state with no cookie at all.
+    for uri in (
+        "/ct-spip/public?action=logout",
+        "/ct-spip/public?var_mode=preview",
+        "/ct-bugzilla/show_bug.cgi?id=1&Bugzilla_api_key=secret",
+        "/ct-bugzilla/show_bug.cgi?id=1&api_key=secret",
+        "/ct-bugzilla/show_bug.cgi?id=1&Bugzilla_api_token=secret",
+        "/ct-bugzilla/show_bug.cgi?id=1&Bugzilla_token=secret",
+        "/ct-bugzilla/show_bug.cgi?id=1&Bugzilla_login=user",
+        "/ct-bugzilla/show_bug.cgi?id=1&token=secret",
+        "/ct-bugzilla/rest/bug/1",
+    ):
+        fetch(ng.port, uri)
+        status, _, h = fetch(ng.port, uri)
+        assert status == 200, f"cookieless dynamic request returned {status}"
+        assert "x-cache" not in h, \
+            f"cookieless dynamic request {uri!r} must bypass, got {h.get('x-cache')}"
+
+    # MantisBT's prefix is configurable and its anonymous form-token session is
+    # PHPSESSID by default. Project/list/collapse state changes public HTML.
+    for i, cookie in enumerate((
+        "PROJECTX_PROJECT_COOKIE=7",
+        "PROJECTX_VIEW_ALL_COOKIE=recent",
+        "PROJECTX_BUG_LIST_COOKIE=filter",
+        "PROJECTX_collapse_settings=1",
+        "PHPSESSID=anonymous-form-session",
+    )):
+        uri = f"/ct-mantis/predicate-{i}"
+        fetch(ng.port, uri, headers={"Cookie": cookie})
+        status, _, h = fetch(ng.port, uri, headers={"Cookie": cookie})
+        assert status == 200, f"MantisBT predicate request returned {status}"
+        assert "x-cache" not in h, \
+            f"MantisBT state cookie {cookie!r} must bypass, got {h.get('x-cache')}"
+
+    # Remaining alternate/default cookie channels.
+    for root, cookie in (
+        ("ct-textpattern", "txp_login=admin"),
+        ("ct-bludit", "BLUDITREMEMBERTOKEN=remembered"),
+        ("ct-plone", "I18N_LANGUAGE=nl"),
+        ("ct-plone", "_ZopeId=session"),
+        ("ct-umbraco", ".AspNetCore.Identity.Application=member"),
+        ("ct-umbraco", "UMB_PREVIEW=preview"),
+        ("ct-umbraco", "UMB_SESSION=custom-state"),
+        ("ct-dotclear", "dc_admin=remembered"),
+        ("ct-dotclear", "dc_passwd=protected-post"),
+        ("ct-wikijs", "connect.sid=oauth-session"),
+        ("ct-wikijs", "loginRedirect=/private-page"),
+    ):
+        uri = f"/{root}/alternate-{cookie.split('=', 1)[0].replace('.', 'dot')}"
+        fetch(ng.port, uri, headers={"Cookie": cookie})
+        status, _, h = fetch(ng.port, uri, headers={"Cookie": cookie})
+        assert status == 200, f"{root} alternate-cookie request returned {status}"
+        assert "x-cache" not in h, \
+            f"{root} alternate cookie {cookie!r} must bypass, got {h.get('x-cache')}"
+
+    drain_origin(origin)
+
+
 def test_mybb_preset(ng: Nginx, origin: Origin) -> None:
     """MyBB: the `user`-SUFFIX bypass, the EXACT-match key cookies, and the
     asymmetry between the two that must not be 'fixed'.
@@ -5672,8 +5925,8 @@ def test_invalid_cache_turbo_mode(ng: Nginx) -> None:
 def test_auto_and_generic_are_removed(ng: Nginx) -> None:
     """The `generic`/`auto` preset union was removed because it was never a safe
     default: it never covered every backend, `woocommerce` in it left /wp-admin/
-    cacheable unless stacked with `wordpress`, and `joomla` in it shipped no
-    cookie rule at all.
+    cacheable unless stacked with `wordpress`, and `joomla` in it then shipped
+    no cookie rule at all.
 
     All three dead spellings must be a HARD CONFIG ERROR, not a silent no-op.
     That distinction is the entire point: accepting the name and enabling nothing
@@ -5739,6 +5992,8 @@ def test_backend_separators(ng: Nginx) -> None:
         "magento|ghost",
         "wagtail|kirby",
         "shopware6|typo3",
+        "textpattern|bludit|spip|bugzilla|mantisbt|plone|umbraco|dotclear|wikijs",
+        "mantis|classicpress|backdrop",
     ]):
         _config_accepts(ng, f"sep-ok-{i}", _BACKEND_LINE,
                         f"cache_turbo_backend {spec};")
@@ -11280,6 +11535,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_cookie_pred_multiple_matching_cookies(ng, origin)
     test_vbulletin_preset(ng, origin)
     test_invision_preset(ng, origin)
+    test_2026_preset_expansion(ng, origin)
     test_mybb_preset(ng, origin)
     test_yabb_preset(ng, origin)
     test_phorum_uri_rules_anchor_at_root(ng, origin)
@@ -11662,6 +11918,11 @@ def main() -> int:
           "cached), "
           "vbulletin preset (NONEMPTY/EQ arms, empty value logged-out, "
           "bb_language keyed, bb_lastvisit NOT keyed), "
+          "2026 preset expansion (textpattern/bludit/spip/bugzilla/mantisbt/"
+          "plone/umbraco/dotclear/wikijs: public HIT + state-cookie/URI/arg "
+          "BYPASS, custom "
+          "cookie-prefix predicates, backend_prefix rebasing; mantis/"
+          "classicpress/backdrop aliases), "
           "invision preset (_loggedIn suffix bypass, ips4_theme keyed, "
           "ips4_device_key NOT keyed), "
           "mybb preset (user-suffix bypass survives cookieprefix, mybbtheme keyed exactly, look-alike cookie cannot steer buckets), "

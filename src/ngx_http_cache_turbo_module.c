@@ -3022,6 +3022,176 @@ static const char *const  ct_vbulletin_args[] = { NULL };
 static const char *const  ct_vbulletin_key_cookies[] = {
     "bb_language", NULL };
 
+/*
+ * Textpattern. Both login cookies are written after every successful login;
+ * `txp_login_public` is the frontend signal and `txp_login` protects the admin
+ * side. Anonymous public requests do not receive either one. The admin folder
+ * defaults to /textpattern but can be renamed, so the guide requires an
+ * operator rule when it is moved.
+ */
+static const char *const  ct_textpattern_cookies[] = {
+    "txp_login_public=", "txp_login=", NULL };
+static const char *const  ct_textpattern_uris[] = { "/textpattern", NULL };
+static const char *const  ct_textpattern_args[] = { NULL };
+
+/*
+ * Bludit. Only the admin bootstrap starts the BLUDIT-KEY session; the public
+ * bootstrap is session-free. The __Secure- spelling still contains BLUDIT-KEY,
+ * and the two remember-me names are stable literals. /install.php is dynamic
+ * setup state and must never be replayed from the page cache.
+ */
+static const char *const  ct_bludit_cookies[] = {
+    "BLUDIT-KEY", "BLUDITREMEMBERUSERNAME=", "BLUDITREMEMBERTOKEN=", NULL };
+static const char *const  ct_bludit_uris[] = {
+    "/admin", "/install.php", NULL };
+static const char *const  ct_bludit_args[] = { NULL };
+
+/*
+ * SPIP prefixes all of its spip_* cookies with an operator-selected cookie
+ * prefix. Suffix predicates preserve the meaningful half of each name and fail
+ * toward a bypass if another cookie happens to collide. Language and Ajax-mode
+ * cookies are presentation state; bypassing them avoids serving the wrong
+ * variant without allowing arbitrary client values into the cache key.
+ * `?action=` dispatches action handlers and `?var_mode=` forces preview/debug/
+ * recalculation modes, neither of which is a shared page render.
+ */
+static const ngx_http_cache_turbo_cookie_pred_t  ct_spip_preds[] = {
+    { "_session", NGX_HTTP_CACHE_TURBO_CVOP_NONEMPTY, NULL },
+    { "_admin", NGX_HTTP_CACHE_TURBO_CVOP_NONEMPTY, NULL },
+    { "_lang", NGX_HTTP_CACHE_TURBO_CVOP_NONEMPTY, NULL },
+    { "_lang_ecrire", NGX_HTTP_CACHE_TURBO_CVOP_NONEMPTY, NULL },
+    { "_accepte_ajax", NGX_HTTP_CACHE_TURBO_CVOP_NONEMPTY, NULL },
+    { NULL, 0, NULL }
+};
+static const char *const  ct_spip_cookies[] = { NULL };
+static const char *const  ct_spip_uris[] = { "/ecrire", NULL };
+static const char *const  ct_spip_args[] = { "action", "var_mode", NULL };
+
+/*
+ * Bugzilla. Bugzilla_login and Bugzilla_logincookie are both issued on every
+ * successful cookie login (remember-me changes only expiry), so they are clean
+ * member-only signals. API keys and tokens can authenticate entirely through
+ * the query string. The URI list keeps login/account/mutation/admin/API entry
+ * points out before a cookie exists while leaving show_bug.cgi, buglist.cgi
+ * and reports cacheable for anonymous readers.
+ */
+static const char *const  ct_bugzilla_cookies[] = {
+    "Bugzilla_login=", "Bugzilla_logincookie=", NULL };
+static const char *const  ct_bugzilla_uris[] = {
+    "/admin.cgi", "/createaccount.cgi", "/relogin.cgi", "/token.cgi",
+    "/userprefs.cgi", "/enter_bug.cgi", "/post_bug.cgi",
+    "/process_bug.cgi", "/request.cgi", "/quips.cgi", "/votes.cgi",
+    "/colchange.cgi", "/summarize_time.cgi", "/sanitycheck.cgi",
+    "/page.cgi", "/search_plugin.cgi", "/jsonrpc.cgi", "/xmlrpc.cgi",
+    "/rest", "/rest.cgi", "/editclassifications.cgi", "/editcomponents.cgi",
+    "/editfields.cgi", "/editflagtypes.cgi", "/editgroups.cgi",
+    "/editkeywords.cgi", "/editmilestones.cgi", "/editparams.cgi",
+    "/editproducts.cgi", "/editsettings.cgi", "/editusers.cgi",
+    "/editvalues.cgi", "/editversions.cgi", "/editwhines.cgi",
+    "/editworkflow.cgi", NULL };
+static const char *const  ct_bugzilla_args[] = {
+    "Bugzilla_api_key", "api_key", "Bugzilla_api_token", "Bugzilla_token",
+    "Bugzilla_login", "Bugzilla_password", "Bugzilla_login_token", "token",
+    NULL };
+
+/*
+ * MantisBT. The install-selected cookie prefix is prepended to every symbolic
+ * cookie name, so predicates match the invariant suffix. STRING_COOKIE is the
+ * login token; the project/list/collapse cookies change a public render and are
+ * conservatively bypassed instead of keyed. Mantis form tokens lazily start a
+ * native PHP session for anonymous form pages; PHPSESSID is therefore included
+ * too (session.name overrides need an operator rule, documented in the guide).
+ */
+static const ngx_http_cache_turbo_cookie_pred_t  ct_mantisbt_preds[] = {
+    { "_STRING_COOKIE", NGX_HTTP_CACHE_TURBO_CVOP_NONEMPTY, NULL },
+    { "_PROJECT_COOKIE", NGX_HTTP_CACHE_TURBO_CVOP_NONEMPTY, NULL },
+    { "_VIEW_ALL_COOKIE", NGX_HTTP_CACHE_TURBO_CVOP_NONEMPTY, NULL },
+    { "_BUG_LIST_COOKIE", NGX_HTTP_CACHE_TURBO_CVOP_NONEMPTY, NULL },
+    { "_collapse_settings", NGX_HTTP_CACHE_TURBO_CVOP_NONEMPTY, NULL },
+    { NULL, 0, NULL }
+};
+static const char *const  ct_mantisbt_cookies[] = { "PHPSESSID=", NULL };
+static const char *const  ct_mantisbt_uris[] = {
+    "/admin/", "/api/", "/login.php", "/login_page.php",
+    "/login_password_page.php", "/logout_page.php", "/signup.php",
+    "/signup_page.php", "/lost_pwd.php", "/lost_pwd_page.php",
+    "/verify.php", "/verify_email.php", "/my_view_page.php",
+    "/account_page.php", "/account_prefs_page.php",
+    "/account_prof_edit_page.php", "/account_manage_columns_page.php",
+    "/api_tokens_page.php", "/bug_report.php", "/bug_report_page.php",
+    "/bug_update.php", "/bug_update_page.php",
+    "/bug_change_status_page.php", "/bug_actiongroup_page.php",
+    "/bug_actiongroup_ext_page.php", "/bug_reminder_page.php",
+    "/bugnote_add.php", "/bugnote_edit_page.php", "/proj_doc_add_page.php",
+    "/proj_doc_edit_page.php", "/news_edit_page.php", "/query_store.php",
+    NULL };
+static const char *const  ct_mantisbt_args[] = { NULL };
+
+/*
+ * Plone. __ac is the stable frontend authentication cookie. Zope sessions,
+ * status messages and the language override are user-specific state too. Plone
+ * itself marks login/reset responses private; the URI tier is still valuable
+ * when an operator weakens origin Cache-Control. Traversal views below content
+ * (folder/@@edit) remain protected by the auth cookie.
+ */
+static const char *const  ct_plone_cookies[] = {
+    "__ac=", "_ZopeId=", "statusmessages=", "I18N_LANGUAGE=", NULL };
+static const char *const  ct_plone_uris[] = {
+    "/login", "/logout", "/register", "/passwordreset", "/mail_password",
+    "/manage", "/@@login", NULL };
+static const char *const  ct_plone_args[] = { NULL };
+
+/*
+ * Umbraco. Verified current identity channels include the configurable
+ * back-office cookie (default UMB_UCONTEXT), v17+ token cookies, preview/XSRF
+ * cookies, and ASP.NET Identity's member cookie. UMB_EXTLOGIN and UMB_SESSION
+ * remain conservative compatibility guards for legacy/optional integrations.
+ * /umbraco contains the back office and management API; ordinary content and
+ * the public Delivery API are left available for caching. Sites that rename
+ * the member/back-office cookies must add their configured names explicitly
+ * (see docs/umbraco.md).
+ */
+static const char *const  ct_umbraco_cookies[] = {
+    "UMB_UCONTEXT=", "UMB_EXTLOGIN=", "UMB_PREVIEW=",
+    "UMB-WEBSITE-PREVIEW-ACCEPT=", "UMB-XSRF-V=", "UMB_SESSION=",
+    "umbAccessToken", "umbRefreshToken", "umbPkceCode",
+    ".AspNetCore.Identity.Application=", NULL };
+static const char *const  ct_umbraco_uris[] = { "/umbraco", NULL };
+static const char *const  ct_umbraco_args[] = { NULL };
+
+/*
+ * Dotclear. The public frontend does not start the configured PHP session by
+ * default; the backend does. `dcxd` is DC_SESSION_NAME's stock value and also
+ * prefixes per-blog frontend sessions. dc_admin is the fixed remember-cookie,
+ * while dc_passwd grants access to password-protected posts/pages. Preview
+ * routes expose unpublished content on the public host. DC_SESSION_NAME and
+ * DC_ADMIN_URL are configurable, so non-default deployments need matching
+ * operator rules (see docs/dotclear.md).
+ */
+static const char *const  ct_dotclear_cookies[] = {
+    "dcxd", "dc_admin=", "dc_passwd=", NULL };
+static const char *const  ct_dotclear_uris[] = {
+    "/admin", "/preview", "/pagespreview", NULL };
+static const char *const  ct_dotclear_args[] = { NULL };
+
+/*
+ * Wiki.js 2.x. Authentication is a fixed `jwt` cookie. Express-session is
+ * installed globally but saveUninitialized=false leaves ordinary guests
+ * cookie-free; OAuth strategies can create the default connect.sid session.
+ * loginRedirect carries a private target across login. The URI tier keeps
+ * identity, editor/history/source, upload and GraphQL surfaces out even before
+ * a cookie exists. Published arbitrary-path pages remain available for shared
+ * guest caching; their ACL/navigation view is guest-group-specific, while all
+ * authenticated group variants carry jwt and bypass.
+ */
+static const char *const  ct_wikijs_cookies[] = {
+    "jwt=", "connect.sid=", "loginRedirect=", NULL };
+static const char *const  ct_wikijs_uris[] = {
+    "/a", "/d", "/e", "/h", "/p", "/s", "/u",
+    "/login", "/logout", "/register", "/verify", "/login-reset",
+    "/graphql", "/graphql-subscriptions", NULL };
+static const char *const  ct_wikijs_args[] = { NULL };
+
 static const ngx_http_cache_turbo_preset_t  ngx_http_cache_turbo_presets[] = {
     { NGX_HTTP_CACHE_TURBO_BACKEND_WORDPRESS,
       ct_wp_cookies, ct_wp_uris, ct_wp_args, NULL, NULL },
@@ -3073,6 +3243,26 @@ static const ngx_http_cache_turbo_preset_t  ngx_http_cache_turbo_presets[] = {
     { NGX_HTTP_CACHE_TURBO_BACKEND_VBULLETIN,
       ct_vbulletin_cookies, ct_vbulletin_uris, ct_vbulletin_args,
       ct_vbulletin_preds, ct_vbulletin_key_cookies },
+    { NGX_HTTP_CACHE_TURBO_BACKEND_TEXTPATTERN,
+      ct_textpattern_cookies, ct_textpattern_uris, ct_textpattern_args,
+      NULL, NULL },
+    { NGX_HTTP_CACHE_TURBO_BACKEND_BLUDIT,
+      ct_bludit_cookies, ct_bludit_uris, ct_bludit_args, NULL, NULL },
+    { NGX_HTTP_CACHE_TURBO_BACKEND_SPIP,
+      ct_spip_cookies, ct_spip_uris, ct_spip_args, ct_spip_preds, NULL },
+    { NGX_HTTP_CACHE_TURBO_BACKEND_BUGZILLA,
+      ct_bugzilla_cookies, ct_bugzilla_uris, ct_bugzilla_args, NULL, NULL },
+    { NGX_HTTP_CACHE_TURBO_BACKEND_MANTISBT,
+      ct_mantisbt_cookies, ct_mantisbt_uris, ct_mantisbt_args,
+      ct_mantisbt_preds, NULL },
+    { NGX_HTTP_CACHE_TURBO_BACKEND_PLONE,
+      ct_plone_cookies, ct_plone_uris, ct_plone_args, NULL, NULL },
+    { NGX_HTTP_CACHE_TURBO_BACKEND_UMBRACO,
+      ct_umbraco_cookies, ct_umbraco_uris, ct_umbraco_args, NULL, NULL },
+    { NGX_HTTP_CACHE_TURBO_BACKEND_DOTCLEAR,
+      ct_dotclear_cookies, ct_dotclear_uris, ct_dotclear_args, NULL, NULL },
+    { NGX_HTTP_CACHE_TURBO_BACKEND_WIKIJS,
+      ct_wikijs_cookies, ct_wikijs_uris, ct_wikijs_args, NULL, NULL },
     { 0, NULL, NULL, NULL, NULL, NULL }
 };
 
@@ -6777,6 +6967,18 @@ static const struct {
     { "yabb",        NGX_HTTP_CACHE_TURBO_BACKEND_YABB,        0 },
     { "mybb",        NGX_HTTP_CACHE_TURBO_BACKEND_MYBB,        0 },
     { "vbulletin",   NGX_HTTP_CACHE_TURBO_BACKEND_VBULLETIN,   0 },
+    { "textpattern", NGX_HTTP_CACHE_TURBO_BACKEND_TEXTPATTERN, 0 },
+    { "bludit",      NGX_HTTP_CACHE_TURBO_BACKEND_BLUDIT,      0 },
+    { "spip",        NGX_HTTP_CACHE_TURBO_BACKEND_SPIP,        0 },
+    { "bugzilla",    NGX_HTTP_CACHE_TURBO_BACKEND_BUGZILLA,    0 },
+    { "mantisbt",    NGX_HTTP_CACHE_TURBO_BACKEND_MANTISBT,    0 },
+    { "mantis",      NGX_HTTP_CACHE_TURBO_BACKEND_MANTISBT,    0 },
+    { "plone",       NGX_HTTP_CACHE_TURBO_BACKEND_PLONE,       0 },
+    { "umbraco",     NGX_HTTP_CACHE_TURBO_BACKEND_UMBRACO,     0 },
+    { "dotclear",    NGX_HTTP_CACHE_TURBO_BACKEND_DOTCLEAR,    0 },
+    { "wikijs",      NGX_HTTP_CACHE_TURBO_BACKEND_WIKIJS,      0 },
+    { "classicpress", NGX_HTTP_CACHE_TURBO_BACKEND_WORDPRESS,  0 },
+    { "backdrop",    NGX_HTTP_CACHE_TURBO_BACKEND_DRUPAL,      0 },
     { "none",        NGX_HTTP_CACHE_TURBO_BACKEND_NONE,        0 },
     { NULL,          0,                                        0 }
 };
@@ -6923,7 +7125,10 @@ ngx_http_cache_turbo_backend(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                     "woocommerce, joomla, xenforo, discourse, phpbb, drupal, "
                     "mediawiki, magento, ghost, wagtail, kirby, shopware6, "
                     "typo3, invision, smf, vanilla, punbb, phorum, yabb, mybb, "
-                    "vbulletin, or none — separated by spaces or '|')", &bad);
+                    "vbulletin, textpattern, bludit, spip, bugzilla, mantisbt, "
+                    "mantis, plone, umbraco, dotclear, wikijs, "
+                    "classicpress, backdrop, or none — "
+                    "separated by spaces or '|')", &bad);
                 return NGX_CONF_ERROR;
             }
 
@@ -6957,7 +7162,9 @@ ngx_http_cache_turbo_backend(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             "cache_turbo_backend names no backend (want wordpress, woocommerce, "
             "joomla, xenforo, discourse, phpbb, drupal, mediawiki, magento, "
             "ghost, wagtail, kirby, shopware6, typo3, invision, smf, vanilla, "
-            "punbb, phorum, yabb, mybb, vbulletin, or none)");
+            "punbb, phorum, yabb, mybb, vbulletin, textpattern, bludit, spip, "
+            "bugzilla, mantisbt, mantis, plone, umbraco, dotclear, wikijs, "
+            "classicpress, backdrop, or none)");
         return NGX_CONF_ERROR;
     }
 
