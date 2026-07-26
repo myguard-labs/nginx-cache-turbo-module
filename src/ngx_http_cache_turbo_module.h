@@ -146,38 +146,48 @@
  * /posts (discourse), /user, /admin, /node (drupal), /index.php (mediawiki) —
  * which an unrelated site may legitimately serve as perfectly cacheable pages.
  * Enabling one you do not run punches holes in your own cache.
+ *
+ * WIDTH: the bits are `ull` and the mask field is ngx_uint_t (64-bit on every
+ * platform this module targets; nginx defines it as uintptr_t). The run was
+ * 32-bit until it filled up at 31 presets + the NONE sentinel — a 32nd preset
+ * would have aliased NONE and been silently invisible, because HAS_BACKEND()
+ * masks NONE out. Keep every literal suffixed `ull`: an unsuffixed 0x80000000
+ * is `unsigned int`, and the promotion in `mask & ~BIT` would then clear the
+ * high half of a 64-bit mask on a plain-int operand. There is room for 63
+ * presets; NONE is pinned to bit 63, the far end, so the preset run can grow
+ * contiguously from bit 0 without ever colliding with it again.
  */
-#define NGX_HTTP_CACHE_TURBO_BACKEND_WORDPRESS    0x0001
-#define NGX_HTTP_CACHE_TURBO_BACKEND_WOOCOMMERCE  0x0002
-#define NGX_HTTP_CACHE_TURBO_BACKEND_JOOMLA       0x0004
-#define NGX_HTTP_CACHE_TURBO_BACKEND_XENFORO      0x0008
-#define NGX_HTTP_CACHE_TURBO_BACKEND_DISCOURSE    0x0010
-#define NGX_HTTP_CACHE_TURBO_BACKEND_PHPBB        0x0020
-#define NGX_HTTP_CACHE_TURBO_BACKEND_DRUPAL       0x0040
-#define NGX_HTTP_CACHE_TURBO_BACKEND_MEDIAWIKI    0x0080
-#define NGX_HTTP_CACHE_TURBO_BACKEND_MAGENTO      0x0100
-#define NGX_HTTP_CACHE_TURBO_BACKEND_GHOST        0x0200
-#define NGX_HTTP_CACHE_TURBO_BACKEND_WAGTAIL      0x0400
-#define NGX_HTTP_CACHE_TURBO_BACKEND_KIRBY        0x0800
-#define NGX_HTTP_CACHE_TURBO_BACKEND_SHOPWARE6    0x1000
-#define NGX_HTTP_CACHE_TURBO_BACKEND_TYPO3        0x2000
-#define NGX_HTTP_CACHE_TURBO_BACKEND_INVISION     0x4000
-#define NGX_HTTP_CACHE_TURBO_BACKEND_SMF          0x8000
-#define NGX_HTTP_CACHE_TURBO_BACKEND_VANILLA      0x10000
-#define NGX_HTTP_CACHE_TURBO_BACKEND_PUNBB        0x20000
-#define NGX_HTTP_CACHE_TURBO_BACKEND_PHORUM       0x40000
-#define NGX_HTTP_CACHE_TURBO_BACKEND_YABB         0x80000
-#define NGX_HTTP_CACHE_TURBO_BACKEND_MYBB         0x100000
-#define NGX_HTTP_CACHE_TURBO_BACKEND_VBULLETIN    0x200000
-#define NGX_HTTP_CACHE_TURBO_BACKEND_TEXTPATTERN  0x400000
-#define NGX_HTTP_CACHE_TURBO_BACKEND_BLUDIT       0x800000
-#define NGX_HTTP_CACHE_TURBO_BACKEND_SPIP         0x1000000
-#define NGX_HTTP_CACHE_TURBO_BACKEND_BUGZILLA     0x2000000
-#define NGX_HTTP_CACHE_TURBO_BACKEND_MANTISBT     0x4000000
-#define NGX_HTTP_CACHE_TURBO_BACKEND_PLONE        0x8000000
-#define NGX_HTTP_CACHE_TURBO_BACKEND_UMBRACO      0x10000000
-#define NGX_HTTP_CACHE_TURBO_BACKEND_DOTCLEAR     0x20000000u
-#define NGX_HTTP_CACHE_TURBO_BACKEND_WIKIJS       0x40000000u
+#define NGX_HTTP_CACHE_TURBO_BACKEND_WORDPRESS    0x0001ull
+#define NGX_HTTP_CACHE_TURBO_BACKEND_WOOCOMMERCE  0x0002ull
+#define NGX_HTTP_CACHE_TURBO_BACKEND_JOOMLA       0x0004ull
+#define NGX_HTTP_CACHE_TURBO_BACKEND_XENFORO      0x0008ull
+#define NGX_HTTP_CACHE_TURBO_BACKEND_DISCOURSE    0x0010ull
+#define NGX_HTTP_CACHE_TURBO_BACKEND_PHPBB        0x0020ull
+#define NGX_HTTP_CACHE_TURBO_BACKEND_DRUPAL       0x0040ull
+#define NGX_HTTP_CACHE_TURBO_BACKEND_MEDIAWIKI    0x0080ull
+#define NGX_HTTP_CACHE_TURBO_BACKEND_MAGENTO      0x0100ull
+#define NGX_HTTP_CACHE_TURBO_BACKEND_GHOST        0x0200ull
+#define NGX_HTTP_CACHE_TURBO_BACKEND_WAGTAIL      0x0400ull
+#define NGX_HTTP_CACHE_TURBO_BACKEND_KIRBY        0x0800ull
+#define NGX_HTTP_CACHE_TURBO_BACKEND_SHOPWARE6    0x1000ull
+#define NGX_HTTP_CACHE_TURBO_BACKEND_TYPO3        0x2000ull
+#define NGX_HTTP_CACHE_TURBO_BACKEND_INVISION     0x4000ull
+#define NGX_HTTP_CACHE_TURBO_BACKEND_SMF          0x8000ull
+#define NGX_HTTP_CACHE_TURBO_BACKEND_VANILLA      0x10000ull
+#define NGX_HTTP_CACHE_TURBO_BACKEND_PUNBB        0x20000ull
+#define NGX_HTTP_CACHE_TURBO_BACKEND_PHORUM       0x40000ull
+#define NGX_HTTP_CACHE_TURBO_BACKEND_YABB         0x80000ull
+#define NGX_HTTP_CACHE_TURBO_BACKEND_MYBB         0x100000ull
+#define NGX_HTTP_CACHE_TURBO_BACKEND_VBULLETIN    0x200000ull
+#define NGX_HTTP_CACHE_TURBO_BACKEND_TEXTPATTERN  0x400000ull
+#define NGX_HTTP_CACHE_TURBO_BACKEND_BLUDIT       0x800000ull
+#define NGX_HTTP_CACHE_TURBO_BACKEND_SPIP         0x1000000ull
+#define NGX_HTTP_CACHE_TURBO_BACKEND_BUGZILLA     0x2000000ull
+#define NGX_HTTP_CACHE_TURBO_BACKEND_MANTISBT     0x4000000ull
+#define NGX_HTTP_CACHE_TURBO_BACKEND_PLONE        0x8000000ull
+#define NGX_HTTP_CACHE_TURBO_BACKEND_UMBRACO      0x10000000ull
+#define NGX_HTTP_CACHE_TURBO_BACKEND_DOTCLEAR     0x20000000ull
+#define NGX_HTTP_CACHE_TURBO_BACKEND_WIKIJS       0x40000000ull
 
 /*
  * "cache_turbo_backend none;" — explicitly NO preset here.
@@ -194,11 +204,17 @@
  * bit). It is deliberately OUTSIDE the contiguous preset run so BACKEND_ALL —
  * and the fuzzer's gapless-bits assert — is unaffected.
  *
+ * It sits at bit 63, the far end of the widened mask, NOT immediately above the
+ * highest preset. It used to be bit 31 when the run was 32-bit, which made it
+ * the very next bit a new preset would claim; pinning it to the top instead
+ * means the run can grow to 63 presets without a second collision. Do not
+ * "tidy" it back down next to the run.
+ *
  * It also does NOT imply cache_turbo_cache_control honor, unlike a real preset:
  * asking for no CMS classification should not quietly change how the response's
  * Cache-Control is treated.
  */
-#define NGX_HTTP_CACHE_TURBO_BACKEND_NONE         0x80000000u
+#define NGX_HTTP_CACHE_TURBO_BACKEND_NONE         0x8000000000000000ull
 
 /* True when a REAL preset is active — i.e. at least one registry row is armed.
  * Use this, never a bare `backend_presets != 0`: the NONE sentinel is non-zero
