@@ -16,10 +16,24 @@ env:
   NGINX_VERSION: "1.31.1"
 
 on:
+  # Path-gated for the same reason asan.yml is: this is a ~8min job and, with only
+  # 4 matching runner slots, every long job on a PR that cannot possibly affect it
+  # pushes the whole wave's wall-clock out. The targets are built from ci/fuzz/*.c
+  # plus the shims, which mirror parser code lifted out of src/ -- so a docs, memory,
+  # or unrelated-workflow PR cannot change fuzz behaviour. Keep this list in sync
+  # with what ci/fuzz/build.sh actually compiles.
   push:
     branches: [main]
+    paths:
+      - "src/**"
+      - "ci/fuzz/**"
+      - ".github/workflows/fuzzing.yml"
   pull_request:
     branches: [main]
+    paths:
+      - "src/**"
+      - "ci/fuzz/**"
+      - ".github/workflows/fuzzing.yml"
   workflow_dispatch: {}
 
 concurrency:
