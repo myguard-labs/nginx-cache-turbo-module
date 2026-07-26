@@ -1907,8 +1907,12 @@ http {{
         # punbb's URI rules are root scripts too, so each needs its own root
         # location. userlist.php is here on purpose: the preset deliberately
         # does NOT list it, so it is the negative control. Written as prefix
-        # locations rather than one regex -- the CI nginx is built without PCRE
-        # and rejects a regex location outright.
+        # locations rather than one regex. (The "CI nginx has no PCRE" reason
+        # once given here is stale: ci-build.sh dropped
+        # --without-http_rewrite_module in s103 and the build now links
+        # -lpcre2-8, so a regex location would be accepted. Prefix locations are
+        # kept because they are what the preset URI tier itself does -- byte-0
+        # anchored prefix compares -- so the fixture mirrors the code under test.)
         {punbb_root_locs}
 
         # Forum presets whose cookie rules were corrected after the docs
@@ -1933,6 +1937,45 @@ http {{
             cache_turbo         main;
             cache_turbo_backend phorum;
             cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # redmine / flarum / opencart (2026-07-26 research pass). All three
+        # exist to prove a guest-issued session cookie is NOT treated as a
+        # login signal -- the trap that makes a preset bypass 100% of traffic
+        # and silently disable the cache. The key must include $is_args$args so
+        # the opencart arg-tier rows are reachable: with a bare $uri key every
+        # ?route= variant collapses onto one entry and the test would pass for
+        # the wrong reason.
+        # backend_prefix is REQUIRED here, not decoration: preset uris[] are
+        # anchored at byte 0 ("/admin", "/api"), so under a /flarum/ mount the
+        # module compares them against "/flarum/api/..." and the whole URI tier
+        # silently never fires. Without it test_flarum_admin_and_api_bypass
+        # fails with "MUST bypass ... got HIT" -- which is how this was caught.
+        location /redmine/ {{
+            cache_turbo         main;
+            cache_turbo_backend redmine;
+            cache_turbo_backend_prefix /redmine/;
+            cache_turbo_key     $uri$is_args$args;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        location /flarum/ {{
+            cache_turbo         main;
+            cache_turbo_backend flarum;
+            cache_turbo_backend_prefix /flarum/;
+            cache_turbo_key     $uri$is_args$args;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        # opencart needs no prefix: it ships NO uris[] row at all (everything is
+        # /index.php?route=), so the arg tier is what fires and it is
+        # path-independent.
+        location /opencart/ {{
+            cache_turbo         main;
+            cache_turbo_backend opencart;
+            cache_turbo_key     $uri$is_args$args;
             cache_turbo_valid   30s;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
@@ -4457,6 +4500,164 @@ def test_vanilla_guest_cookies_stay_cacheable(ng: Nginx,
     assert "x-cache" not in ha, \
         (f"a logged-in Vanilla member (identity cookie Vanilla=) MUST bypass, "
          f"got {ha.get('x-cache')}")
+
+
+def test_flarum_session_cookie_is_not_a_login_signal(ng: Nginx,
+                                                     origin: Origin) -> None:
+    """flarum preset must bypass on `flarum_remember`, NOT on `flarum_session`.
+
+    Http/Middleware/StartSession.php applies withSessionCookie()
+    unconditionally after $session->save(), on every response and before any
+    auth check, so `flarum_session` is issued to ANONYMOUS GUESTS. A cookie row
+    matching it would fire on essentially 100% of traffic and silently disable
+    the cache -- the failure returns correct bytes and is invisible to every
+    correctness assertion, so it is asserted here explicitly.
+
+    `flarum_remember` is written only by Http/Rememberer.php
+    (COOKIE_NAME = 'remember'), i.e. at login.
+
+    Both directions matter. The guest half is the one that breaks if someone
+    later "fixes" the preset by adding the obvious session cookie; the member
+    half is the one that breaks if the remember row is dropped. Verified
+    against flarum/framework main (2.0.0-rc.5)."""
+    guest = {"Cookie": "flarum_session=eyJpdiI6Ilg5.guest.session.id"}
+    fetch(ng.port, "/flarum/d/1-welcome", headers=guest)
+    _, _, hg = fetch(ng.port, "/flarum/d/1-welcome", headers=guest)
+    assert hg.get("x-cache") == "HIT", \
+        (f"a guest carrying only flarum_session must stay cacheable, got "
+         f"{hg.get('x-cache')} -- Flarum issues that cookie to every anonymous "
+         "visitor, so bypassing on it disables the cache entirely")
+
+    member = {"Cookie": "flarum_session=abc; flarum_remember=def.signed.token"}
+    fetch(ng.port, "/flarum/d/2-topic", headers=member)
+    _, _, hm = fetch(ng.port, "/flarum/d/2-topic", headers=member)
+    assert "x-cache" not in hm, \
+        (f"a logged-in Flarum user (flarum_remember) MUST bypass, got "
+         f"{hm.get('x-cache')}")
+
+
+def test_flarum_admin_and_api_bypass(ng: Nginx, origin: Origin) -> None:
+    """flarum URI tier must cover /admin and /api even with no cookie at all.
+
+    /api is load-bearing beyond the obvious: a user who logs in WITHOUT
+    "remember me" carries only `flarum_session`, which is indistinguishable
+    from a guest's on the wire, so the cookie tier cannot see them. The SPA
+    fetches their content through /api, which contains the exposure. Asserted
+    cookie-less so it cannot pass by accident via the cookie rule."""
+    for uri in ("/flarum/api/discussions", "/flarum/admin"):
+        fetch(ng.port, uri)
+        _, _, h = fetch(ng.port, uri)
+        assert "x-cache" not in h, \
+            (f"{uri} MUST bypass with no cookie, got {h.get('x-cache')}")
+
+
+def test_redmine_key_arg_bypasses_without_cookie(ng: Nginx,
+                                                 origin: Origin) -> None:
+    """redmine preset must bypass `?key=` with NO cookie present.
+
+    application_controller.rb authenticates `key` two ways, neither of which
+    starts a session: as an Atom key (params[:format] == 'atom' && params[:key]
+    -> User.find_by_atom_key) and as an API key (api_key_from_request when
+    Setting.rest_api_enabled?). So ?key=<atom key> returns a private issue list
+    with no cookie at all. A cookie-only preset would cache that under the
+    public cache key and serve one user's private tracker to everyone -- the
+    same hole ghost's ?uuid=/?key=/?gift= rows close.
+
+    The negative control is the same path WITHOUT the arg: it must still cache,
+    proving the bypass comes from the arg rule and not from the path being
+    uncacheable anyway."""
+    _, _, h1 = fetch(ng.port, "/redmine/issues?key=abc123deadbeef")
+    _, _, h2 = fetch(ng.port, "/redmine/issues?key=abc123deadbeef")
+    assert "x-cache" not in h2, \
+        (f"?key= MUST bypass with no cookie, got {h2.get('x-cache')} -- it "
+         "authenticates via Atom/API key and returns private content")
+
+    fetch(ng.port, "/redmine/issues")
+    _, _, h3 = fetch(ng.port, "/redmine/issues")
+    assert h3.get("x-cache") == "HIT", \
+        (f"a public issue list with no key must still cache, got "
+         f"{h3.get('x-cache')} -- if this is also a bypass the test above "
+         "proves nothing about the arg rule")
+
+
+def test_redmine_public_content_stays_cacheable(ng: Nginx,
+                                                origin: Origin) -> None:
+    """redmine must NOT bypass /projects, /issues, /news, /wiki.
+
+    On an open tracker those are the main public content and the entire reason
+    to put a cache in front of it. Public-vs-private there is a per-project
+    ACL nginx cannot see; the cookie rule is what protects a logged-in view.
+    A preset that bypassed them would be safe but pointless, so the rows are
+    deliberately absent and that absence is pinned here.
+
+    /admin and /my are asserted alongside as the positive half, so the test
+    cannot pass by the preset simply doing nothing."""
+    for uri in ("/redmine/projects/foo", "/redmine/issues",
+                "/redmine/news", "/redmine/wiki/Main"):
+        fetch(ng.port, uri)
+        _, _, h = fetch(ng.port, uri)
+        assert h.get("x-cache") == "HIT", \
+            (f"{uri} must stay cacheable, got {h.get('x-cache')} -- public "
+             "tracker content is why the cache is here")
+
+    for uri in ("/redmine/admin", "/redmine/my/account", "/redmine/login"):
+        fetch(ng.port, uri)
+        _, _, h = fetch(ng.port, uri)
+        assert "x-cache" not in h, \
+            (f"{uri} MUST bypass, got {h.get('x-cache')}")
+
+
+def test_opencart_route_args_bypass(ng: Nginx, origin: Origin) -> None:
+    """opencart is an ARG-tier preset: every private page is /index.php?route=.
+
+    OpenCart routes everything through one path, so the URI tier catches
+    NOTHING -- a URI-prefix rule would look correct, match nothing, and leave
+    carts and account pages cacheable. The rows are enumerated route VALUES
+    because the arg tier compares NAME=VALUE by exact bytes ("no case folding,
+    no prefix match"), so a `route=account/` row would match only the literal
+    ?route=account/ and never ?route=account/login.
+
+    The catalogue half is the negative control: an ordinary product page goes
+    through the SAME path with a different route value and must still cache. A
+    test asserting only the bypass would also pass if the preset bypassed
+    /index.php outright, which would disable the cache for the whole shop."""
+    for route in ("account/login", "account/order", "checkout/cart",
+                  "checkout/checkout"):
+        uri = f"/opencart/index.php?route={route}"
+        fetch(ng.port, uri)
+        _, _, h = fetch(ng.port, uri)
+        assert "x-cache" not in h, \
+            (f"?route={route} MUST bypass, got {h.get('x-cache')} -- private "
+             "cart/account content on the shared /index.php path")
+
+    for route in ("common/home", "product/category", "product/product"):
+        uri = f"/opencart/index.php?route={route}"
+        fetch(ng.port, uri)
+        _, _, h = fetch(ng.port, uri)
+        assert h.get("x-cache") == "HIT", \
+            (f"?route={route} must stay cacheable, got {h.get('x-cache')} -- "
+             "the catalogue shares /index.php with the private routes, so "
+             "bypassing the path instead of the route kills the whole cache")
+
+
+def test_opencart_session_cookie_is_not_a_login_signal(ng: Nginx,
+                                                       origin: Origin) -> None:
+    """opencart must ship NO cookie row -- OCSESSID is guest-issued.
+
+    A shop has to track an anonymous cart, so OCSESSID is handed to every
+    visitor; login state lives in $this->session->data['customer'],
+    SERVER-SIDE ONLY, and the cookie value is an opaque session id whose guest
+    and customer forms are identical on the wire. There is nothing for nginx to
+    test, so the preset deliberately carries no cookies[] row and a catalogue
+    page must cache even while OCSESSID is present."""
+    shopper = {"Cookie": "OCSESSID=b7d3f1a9c2e4550188aa"}
+    uri = "/opencart/index.php?route=product/category&path=20"
+    fetch(ng.port, uri, headers=shopper)
+    _, _, h = fetch(ng.port, uri, headers=shopper)
+    assert h.get("x-cache") == "HIT", \
+        (f"a browsing shopper carrying OCSESSID must stay cacheable, got "
+         f"{h.get('x-cache')} -- OpenCart issues it to every guest, so a "
+         "cookie row here would bypass the entire shop")
 
 
 def test_phorum_admin_session_cookie(ng: Nginx, origin: Origin) -> None:
@@ -11666,6 +11867,12 @@ def run_all(ng: Nginx, origin: Origin,
     test_phpbb_preset(ng, origin)
     test_punbb_cookie_name_default(ng, origin)
     test_vanilla_guest_cookies_stay_cacheable(ng, origin)
+    test_flarum_session_cookie_is_not_a_login_signal(ng, origin)
+    test_flarum_admin_and_api_bypass(ng, origin)
+    test_redmine_key_arg_bypasses_without_cookie(ng, origin)
+    test_redmine_public_content_stays_cacheable(ng, origin)
+    test_opencart_route_args_bypass(ng, origin)
+    test_opencart_session_cookie_is_not_a_login_signal(ng, origin)
     test_phorum_admin_session_cookie(ng, origin)
     test_punbb_phorum_uri_rules(ng, origin)
     test_preset_arg_value_predicate(ng)

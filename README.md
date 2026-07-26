@@ -609,6 +609,9 @@ plausibly appear as an arbitrary value.
 | `umbraco` † | `/umbraco` | — | `UMB_UCONTEXT`, back-office token/preview/XSRF cookies, `UMB_SESSION`, `.AspNetCore.Identity.Application` |
 | `dotclear` † | `/admin`, `/preview`, `/pagespreview` | — | `dcxd`, `dc_admin`, `dc_passwd` |
 | `wikijs` † | admin/editor/history/source/upload, login/identity and GraphQL routes | — | `jwt`, `connect.sid`, `loginRedirect` |
+| `redmine` † | `/admin`, `/my`, `/login`, `/logout`, `/account`, `/settings`, `/enumerations`, `/roles`, `/trackers`, `/custom_fields`, `/auth_sources`, `/mail_handler` | `key` | `_redmine_session`, `autologin` |
+| `flarum` † | `/admin`, `/api`, `/login`, `/logout`, `/global-logout`, `/register`, `/reset`, `/confirm`, `/settings`, `/notifications` | — | `flarum_remember` **only** — `flarum_session` is guest-issued and deliberately unmatched |
+| `opencart` † | — (all routing is `/index.php?route=`) | `route=account/…` and `route=checkout/…` (enumerated), `user_token`, `customer_token` | — (none: `OCSESSID` is guest-issued, login state is server-side only) |
 
 `classicpress` is an alias for `wordpress`, and `backdrop` is an alias for
 `drupal`; the upstream forks retain their base project's cookie and route
@@ -789,10 +792,20 @@ XenForo member (`xf_user`), a Discourse user (`_t`) or a MediaWiki editor
 > [**Bludit**](docs/bludit.md) · [**SPIP**](docs/spip.md) ·
 > [**Bugzilla**](docs/bugzilla.md) · [**MantisBT**](docs/mantisbt.md) ·
 > [**Plone**](docs/plone.md) · [**Umbraco**](docs/umbraco.md) ·
-> [**Dotclear**](docs/dotclear.md) · [**Wiki.js**](docs/wikijs.md) —
+> [**Dotclear**](docs/dotclear.md) · [**Wiki.js**](docs/wikijs.md) ·
+> [**Redmine**](docs/redmine.md) · [**Flarum**](docs/flarum.md) ·
+> [**OpenCart**](docs/opencart.md) —
 > index at [`docs/`](docs/README.md). Running a framework rather than one of these
 > apps (Django, Laravel, Rails)? [**frameworks.md**](docs/frameworks.md) explains
 > why there is no preset for it and how to derive your own rule.
+>
+> **PrestaShop, NodeBB, Grav or Craft CMS?** Those have guides too —
+> [**prestashop.md**](docs/prestashop.md) · [**nodebb.md**](docs/nodebb.md) ·
+> [**grav.md**](docs/grav.md) · [**craft.md**](docs/craft.md) — but **no preset
+> keyword**, because each one either hands its session cookie to anonymous
+> guests (so bypassing on it disables the cache rather than protecting anyone)
+> or derives its identity cookie name from an install-specific hash. Each page
+> ships a hand-rolled vhost instead.
 >
 > Caveats you should not skip: **`joomla` has only a remember-me cookie rule**
 > and does not protect an ordinary frontend login until you add your deployed
@@ -1430,7 +1443,7 @@ http {
 |---|---|---|---|
 | `cache_turbo_zone name=NAME SIZE` | `http` | — | Declare a shared-memory cache zone (min 8 pages). |
 | `cache_turbo NAME` / `off` | `server`, `location` | `off` | Turn caching on (bind a zone) or off. Takes a zone name and nothing else — the old `auto` shorthand is gone (see `cache_turbo_backend`). |
-| `cache_turbo_backend NAME...` | `server`, `location` | — | Auto-classify dynamic (uncacheable) request surfaces for one or more application presets: `wordpress`, `woocommerce`, `joomla`, `xenforo`, `discourse`, `phpbb`, `drupal`, `mediawiki`, `magento`, `shopware6`, `ghost`, `wagtail`, `kirby`, `typo3`, `invision`, `smf`, `vanilla`, `punbb`, `phorum`, `yabb`, `mybb`, `vbulletin`, `textpattern`, `bludit`, `spip`, `bugzilla`, `mantisbt` (`mantis`), `plone`, `umbraco`, `dotclear`, `wikijs`; aliases: `classicpress` → `wordpress`, `backdrop` → `drupal`; or `none`. A matching request (login/session cookie, admin URI, dynamic arg) skips lookup **and storage** and goes straight to origin. **Every preset is opt-in**; names **stack**, separated by spaces or `\|` (`wordpress\|woocommerce` == `wordpress woocommerce`). Implies `cache_turbo_cache_control honor`. **`none`** means no preset here and exists to override one inherited from the `server` block; it is exclusive and does not imply `honor`. **`generic`/`auto` were removed** and are now a config error — the union was never a safe default ([why](#cms-backends-cache_turbo_backend)). Cookie names that an app lets you rename still need an explicit local rule; see each [application guide](docs/README.md). There is **no `django`/`laravel` preset** and never will be ([why](docs/frameworks.md)); Jira, Request Tracker and several other session-eager trackers are intentional non-presets ([research](docs/README.md#apps-we-deliberately-do-not-ship-a-preset-for)). |
+| `cache_turbo_backend NAME...` | `server`, `location` | — | Auto-classify dynamic (uncacheable) request surfaces for one or more application presets: `wordpress`, `woocommerce`, `joomla`, `xenforo`, `discourse`, `phpbb`, `drupal`, `mediawiki`, `magento`, `shopware6`, `ghost`, `wagtail`, `kirby`, `typo3`, `invision`, `smf`, `vanilla`, `punbb`, `phorum`, `yabb`, `mybb`, `vbulletin`, `textpattern`, `bludit`, `spip`, `bugzilla`, `mantisbt` (`mantis`), `plone`, `umbraco`, `dotclear`, `wikijs`, `redmine`, `flarum`, `opencart`; aliases: `classicpress` → `wordpress`, `backdrop` → `drupal`; or `none`. A matching request (login/session cookie, admin URI, dynamic arg) skips lookup **and storage** and goes straight to origin. **Every preset is opt-in**; names **stack**, separated by spaces or `\|` (`wordpress\|woocommerce` == `wordpress woocommerce`). Implies `cache_turbo_cache_control honor`. **`none`** means no preset here and exists to override one inherited from the `server` block; it is exclusive and does not imply `honor`. **`generic`/`auto` were removed** and are now a config error — the union was never a safe default ([why](#cms-backends-cache_turbo_backend)). Cookie names that an app lets you rename still need an explicit local rule; see each [application guide](docs/README.md). There is **no `django`/`laravel` preset** and never will be ([why](docs/frameworks.md)); Jira, Request Tracker and several other session-eager trackers are intentional non-presets ([research](docs/README.md#apps-we-deliberately-do-not-ship-a-preset-for)). |
 | `cache_turbo_suppress_native on` | `server`, `location` | `off` | Make `$cache_turbo_active` read `1` while cache-turbo owns a request, so a stacked native `proxy_cache` can defer via `proxy_no_cache $cache_turbo_active; proxy_cache_bypass $cache_turbo_active;`. Off (default) keeps the variable always `0` (the wiring stays inert). |
 | `cache_turbo_key STRING` | `server`, `location` | normalized | What makes two requests "the same page". The default is `$host$uri$cache_turbo_normalized_args` — Host + **normalized args** (tracking params stripped, args sorted). |
 | `cache_turbo_preset NAME` | `server`, `location` | `balanced` | `micro` / `conservative` / `balanced` / `aggressive` — sets the four knobs below at once. `micro` = 1s microcaching (valid 1s, lock_ttl 1s, ×2 stale). |

@@ -3192,6 +3192,122 @@ static const char *const  ct_wikijs_uris[] = {
     "/graphql", "/graphql-subscriptions", NULL };
 static const char *const  ct_wikijs_args[] = { NULL };
 
+/*
+ * Redmine. `_redmine_session` is a hardcoded string literal in
+ * config/application.rb (config.session_store :cookie_store, :key =>
+ * '_redmine_session') — not derived from config, unlike most of the apps
+ * researched alongside it. `autologin` is the remember-me cookie; its name is
+ * config-settable (Redmine::Configuration['autologin_cookie_name']) but falls
+ * back to the literal, so the stock name is matched and a renamed one degrades
+ * to "session cookie still catches an active login" rather than to nothing.
+ *
+ * The ARG tier is load-bearing here and is NOT optional. `key` authenticates
+ * with NO cookie at all: application_controller.rb accepts it as an Atom key
+ * (params[:format] == 'atom' && params[:key] -> User.find_by_atom_key) and as
+ * an API key (api_key_from_request when Setting.rest_api_enabled?). A
+ * cookie-only rule would therefore cache a private issue list fetched via
+ * ?key=<atom key> under the public cache key and serve it to everyone. This is
+ * the same class of hole the ghost preset's ?uuid=/?key=/?gift= rows close.
+ *
+ * The URI tier deliberately does NOT list /projects, /issues, /news, /wiki or
+ * /repository. On an open tracker those are the main public content and the
+ * entire reason to cache it; public-vs-private there is a per-project ACL that
+ * nginx cannot see, and the cookie rule is what protects a logged-in view of
+ * them. Verified against redmine/redmine master (7.0.0 current 2026-07-26).
+ */
+static const char *const  ct_redmine_cookies[] = {
+    "_redmine_session=", "autologin=", NULL };
+static const char *const  ct_redmine_uris[] = {
+    "/admin", "/my", "/login", "/logout", "/account",
+    "/settings", "/enumerations", "/roles", "/trackers", "/custom_fields",
+    "/auth_sources", "/mail_handler", NULL };
+static const char *const  ct_redmine_args[] = { "key", NULL };
+
+/*
+ * Flarum. The cookie tier matches ONLY `flarum_remember`, never
+ * `flarum_session` — and that distinction is the whole preset.
+ * Http/Middleware/StartSession.php applies withSessionCookie() unconditionally
+ * after $session->save(), on every response, before any auth check, so
+ * `flarum_session` is issued to ANONYMOUS GUESTS. A rule matching it would fire
+ * on ~100% of traffic and silently disable the cache — the guest-issued-cookie
+ * trap this registry's header comment forbids. `flarum_remember` is written
+ * only by Http/Rememberer.php (COOKIE_NAME = 'remember'), i.e. at login.
+ *
+ * KNOWN GAP, documented rather than papered over: a user who logs in WITHOUT
+ * "remember me" carries only `flarum_session`, whose guest and member forms are
+ * distinguishable solely by the session id's server-side mapping. nginx cannot
+ * tell them apart, so such a login is invisible to the cookie tier. /api is in
+ * the URI tier partly to contain that — the SPA fetches its content through it —
+ * but a non-remembered login browsing plain discussion URLs is genuinely
+ * unprotected by this preset alone. docs/flarum.md prescribes the map-based
+ * rule for sites that need to close it.
+ *
+ * Both names carry the `cookie.name` prefix from config.php (CookieFactory.php:
+ * $prefix = $config['cookie.name'] ?? 'flarum', getName() returns
+ * "{$prefix}_{$name}"), and `paths.admin`/`paths.api` are renameable the same
+ * way; all three are matched at their stock values only. Verified against
+ * flarum/framework main (2.0.0-rc.5; identical mechanics in the 1.8.x stable
+ * line).
+ */
+static const char *const  ct_flarum_cookies[] = {
+    "flarum_remember=", NULL };
+static const char *const  ct_flarum_uris[] = {
+    "/admin", "/api", "/login", "/logout", "/global-logout", "/register",
+    "/reset", "/confirm", "/settings", "/notifications", NULL };
+static const char *const  ct_flarum_args[] = { NULL };
+
+/*
+ * OpenCart. This preset is ARG-tier, not URI-tier, and that is forced by the
+ * application: OpenCart routes everything through index.php?route=<controller>,
+ * so every private page shares the single path /index.php. A URI-prefix rule
+ * catches NOTHING here — it would look correct, match nothing, and leave carts
+ * and account pages cacheable. The `route=account/` and `route=checkout/`
+ * prefixes cover the whole private surface (verified against
+ * upload/catalog/controller/{account,checkout}/ on opencart/opencart master,
+ * 4.1.0.3 current 2026-07-26). `user_token` is the admin-panel auth arg and
+ * `customer_token` the login-validation token.
+ *
+ * NO COOKIE ROW, deliberately. `OCSESSID` (upload/system/config/default.php,
+ * $_['session_name']) is issued to guests — a shop has to track an anonymous
+ * cart — and login state lives in $this->session->data['customer'], SERVER-SIDE
+ * ONLY. The cookie value is an opaque session id whose guest and customer forms
+ * are identical on the wire, so there is nothing for nginx to test. Adding
+ * `OCSESSID` here would bypass every visitor and disable the cache. The
+ * /admin/ path is renameable at install and is therefore left to the operator.
+ *
+ * The route values are ENUMERATED, not prefix-matched. The arg tier compares
+ * NAME=VALUE by exact bytes (see the NAME=VALUE branch in auto_skip: "no case
+ * folding, no prefix match"), so a `route=account/` row would match only the
+ * literal ?route=account/ and never ?route=account/login — i.e. it would look
+ * right and protect nothing. Every private route is therefore listed in full.
+ * ADDING A ROUTE MEANS ADDING A ROW; a new private controller under
+ * account/ or checkout/ is NOT covered automatically.
+ *
+ * No key_cookies: OpenCart 4.x drives language and currency through the URL
+ * (catalog/controller/common/language.php only reads request/config and
+ * redirects with the arg — it sets no cookie), so there is no rendering cookie
+ * to vary on. The 3.x-era `language`/`currency` cookies were checked for and
+ * are NOT set by 4.x; do not add them back without re-verifying.
+ */
+static const char *const  ct_opencart_cookies[] = { NULL };
+static const char *const  ct_opencart_uris[] = { NULL };
+static const char *const  ct_opencart_args[] = {
+    "route=checkout/cart", "route=checkout/checkout", "route=checkout/confirm",
+    "route=checkout/success", "route=checkout/failure",
+    "route=checkout/payment_address", "route=checkout/payment_method",
+    "route=checkout/shipping_address", "route=checkout/shipping_method",
+    "route=checkout/register",
+    "route=account/account", "route=account/login", "route=account/logout",
+    "route=account/register", "route=account/forgotten", "route=account/edit",
+    "route=account/password", "route=account/address", "route=account/order",
+    "route=account/wishlist", "route=account/download", "route=account/returns",
+    "route=account/reward", "route=account/transaction",
+    "route=account/subscription", "route=account/newsletter",
+    "route=account/affiliate", "route=account/custom_field",
+    "route=account/tracking", "route=account/payment_method",
+    "route=account/authorize", "route=account/success",
+    "user_token", "customer_token", NULL };
+
 static const ngx_http_cache_turbo_preset_t  ngx_http_cache_turbo_presets[] = {
     { NGX_HTTP_CACHE_TURBO_BACKEND_WORDPRESS,
       ct_wp_cookies, ct_wp_uris, ct_wp_args, NULL, NULL },
@@ -3263,6 +3379,12 @@ static const ngx_http_cache_turbo_preset_t  ngx_http_cache_turbo_presets[] = {
       ct_dotclear_cookies, ct_dotclear_uris, ct_dotclear_args, NULL, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_WIKIJS,
       ct_wikijs_cookies, ct_wikijs_uris, ct_wikijs_args, NULL, NULL },
+    { NGX_HTTP_CACHE_TURBO_BACKEND_REDMINE,
+      ct_redmine_cookies, ct_redmine_uris, ct_redmine_args, NULL, NULL },
+    { NGX_HTTP_CACHE_TURBO_BACKEND_FLARUM,
+      ct_flarum_cookies, ct_flarum_uris, ct_flarum_args, NULL, NULL },
+    { NGX_HTTP_CACHE_TURBO_BACKEND_OPENCART,
+      ct_opencart_cookies, ct_opencart_uris, ct_opencart_args, NULL, NULL },
     { 0, NULL, NULL, NULL, NULL, NULL }
 };
 
@@ -6977,6 +7099,9 @@ static const struct {
     { "umbraco",     NGX_HTTP_CACHE_TURBO_BACKEND_UMBRACO,     0 },
     { "dotclear",    NGX_HTTP_CACHE_TURBO_BACKEND_DOTCLEAR,    0 },
     { "wikijs",      NGX_HTTP_CACHE_TURBO_BACKEND_WIKIJS,      0 },
+    { "redmine",     NGX_HTTP_CACHE_TURBO_BACKEND_REDMINE,     0 },
+    { "flarum",      NGX_HTTP_CACHE_TURBO_BACKEND_FLARUM,      0 },
+    { "opencart",    NGX_HTTP_CACHE_TURBO_BACKEND_OPENCART,    0 },
     { "classicpress", NGX_HTTP_CACHE_TURBO_BACKEND_WORDPRESS,  0 },
     { "backdrop",    NGX_HTTP_CACHE_TURBO_BACKEND_DRUPAL,      0 },
     { "none",        NGX_HTTP_CACHE_TURBO_BACKEND_NONE,        0 },
@@ -7126,7 +7251,8 @@ ngx_http_cache_turbo_backend(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                     "mediawiki, magento, ghost, wagtail, kirby, shopware6, "
                     "typo3, invision, smf, vanilla, punbb, phorum, yabb, mybb, "
                     "vbulletin, textpattern, bludit, spip, bugzilla, mantisbt, "
-                    "mantis, plone, umbraco, dotclear, wikijs, "
+                    "mantis, plone, umbraco, dotclear, wikijs, redmine, "
+                    "flarum, opencart, "
                     "classicpress, backdrop, or none — "
                     "separated by spaces or '|')", &bad);
                 return NGX_CONF_ERROR;
@@ -7164,6 +7290,7 @@ ngx_http_cache_turbo_backend(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             "ghost, wagtail, kirby, shopware6, typo3, invision, smf, vanilla, "
             "punbb, phorum, yabb, mybb, vbulletin, textpattern, bludit, spip, "
             "bugzilla, mantisbt, mantis, plone, umbraco, dotclear, wikijs, "
+            "redmine, flarum, opencart, "
             "classicpress, backdrop, or none)");
         return NGX_CONF_ERROR;
     }
