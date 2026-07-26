@@ -581,7 +581,8 @@ signed session state.
 starts the `DokuWiki` PHP session for dynamic requests. Guest breadcrumbs,
 messages and authentication state share it, while the separate `DW<hash>` auth
 cookie is installation-derived. A session-presence rule fails safe but makes
-the public wiki a one-request cache at best.
+the first response unstoreable and bypasses every later request, yielding no
+useful page-cache hits.
 
 **Serendipity.** Its common
 [`serendipity_config.inc.php`](https://github.com/s9y/Serendipity/blob/master/serendipity_config.inc.php)
