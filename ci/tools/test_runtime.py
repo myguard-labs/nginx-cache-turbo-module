@@ -1221,6 +1221,15 @@ http {{
     access_log off;
 
     cache_turbo_zone name=main 16m;
+
+    # DOC-A2: the front-controller redirect replaces r->uri, so preset URI rules
+    # and cache_turbo_bypass_uri (both compare r->uri) stop seeing the real
+    # route. $request_uri still carries it -- the pattern docs/xenforo.md now
+    # prescribes for private routes behind a front controller.
+    map $request_uri $ctir_private_route {{
+        default 0;
+        ~^/ctir-fixed/(?:api|login|account)(?:[/?]|$) 1;
+    }}
     cache_turbo_zone name=tiny 8m;   # small zone for eviction test (R6)
     # S8: 32k == the enforced minimum (8 * pagesize). Deliberately the SMALLEST
     # legal zone so a few hundred unique keys genuinely overflow it and force
@@ -2396,6 +2405,41 @@ http {{
             cache_turbo_backend drupal;
             cache_turbo_key     $uri;
             cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # ---- internal-redirect regression (DOC-A1 / DOC-A2) ---------------
+        # A PHP front controller: try_files sends every clean URL to
+        # /ctir/index.php. After that internal redirect nginx has REPLACED
+        # r->uri with /ctir/index.php, so both the default $uri-based key and
+        # the preset URI rules see the front controller, never the original
+        # route. /ctir/ reproduces the shape the published docs used to show.
+        location /ctir/ {{
+            try_files $uri /ctir/index.php;
+        }}
+        location = /ctir/index.php {{
+            cache_turbo         main;
+            cache_turbo_backend xenforo;
+            cache_turbo_key     $host$uri$cache_turbo_normalized_args;
+            cache_turbo_valid   30s;
+            add_header          X-CT-Status $cache_turbo_status always;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # Same front controller, keyed the way the fixed docs now prescribe:
+        # $request_uri survives the internal redirect, so distinct clean URLs
+        # stay distinct and the map-driven private-route veto still fires.
+        location /ctir-fixed/ {{
+            try_files $uri /ctir-fixed/index.php;
+        }}
+        location = /ctir-fixed/index.php {{
+            cache_turbo           main;
+            cache_turbo_backend   xenforo;
+            cache_turbo_key       $host$request_uri;
+            cache_turbo_bypass    $ctir_private_route;
+            cache_turbo_no_store  $ctir_private_route;
+            cache_turbo_valid     30s;
+            add_header            X-CT-Status $cache_turbo_status always;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
@@ -5168,6 +5212,91 @@ def test_drupal_preset(ng: Nginx, origin: Origin) -> None:
     assert hc.get("x-cache") == "HIT", \
         f"drupal: a cookieless anonymous reader must cache, got {hc.get('x-cache')}"
     drain_origin(origin)
+
+
+def test_internal_redirect_key_and_veto(ng: Nginx, origin: Origin) -> None:
+    """Internal redirects replace r->uri -- regression for the 2026-07-26 docs
+    audit (DOC-A1 BLOCKER, DOC-A2 MAJOR).
+
+    A PHP front controller runs `try_files $uri /index.php`. Once nginx takes
+    that internal redirect, r->uri IS /index.php: the original clean route is
+    only still visible in $request_uri. Two consequences, both proven here:
+
+    DOC-A1 -- with the module's DEFAULT $uri-based key, two unrelated clean
+    URLs collapse onto the single key /ctir/index.php, so the second request is
+    served the FIRST page's body. That is a cross-page hit inside one shared
+    cache. This test pins the defect deliberately: it is the reason the
+    published examples now say `cache_turbo_key $host$request_uri`. If the
+    module default ever becomes original-path-based, the first assertion flips
+    to MISS and this test must be revisited along with the docs guidance.
+
+    DOC-A2 -- preset URI rules and cache_turbo_bypass_uri BOTH compare r->uri
+    (ngx_http_cache_turbo_bypass_uri_match, module.c:4059), so a route-only
+    guard for a private path silently stops matching after the redirect.
+    cache_turbo_bypass_uri cannot be the fix -- it reads the same rewritten
+    r->uri. The working pattern, which docs/xenforo.md prescribes, is a
+    `map $request_uri` feeding cache_turbo_bypass + cache_turbo_no_store.
+    XenForo's /api/ is the sharpest case: it authenticates with XF-Api-Key,
+    not a preset cookie, so nothing else catches it.
+
+    NEGATIVE CONTROL: the /ctir-fixed/ assertions must FAIL if the key reverts
+    to $uri -- distinct routes would share one entry, so the second GET would
+    report HIT and replay alpha's body instead of MISSing with its own. The
+    origin answers every GET with a unique `gen-<n>` body, so body identity
+    across two different routes is positive proof of a shared entry; asserting
+    status alone would pass for free whenever both routes rendered alike."""
+    # -- DOC-A1: default $uri key collapses distinct routes onto index.php --
+    s1, b1, h1 = fetch(ng.port, "/ctir/alpha")
+    assert s1 == 200 and h1.get("x-ct-status") == "MISS", \
+        f"first clean URL should MISS, got {s1}/{h1.get('x-ct-status')}"
+
+    # A DIFFERENT clean URL, same front controller. Under the $uri key this
+    # hits the entry stored for /ctir/alpha.
+    _, b2, h2 = fetch(ng.port, "/ctir/beta")
+    assert h2.get("x-ct-status") == "HIT", \
+        ("DOC-A1 regression: with the default $uri key both clean URLs key on "
+         f"/ctir/index.php, so the 2nd route must HIT the 1st entry, got "
+         f"{h2.get('x-ct-status')} -- if this now MISSes the module default key "
+         "changed and the docs guidance must be revisited")
+    assert b2 == b1, \
+        ("DOC-A1 regression: /ctir/beta must be served ALPHA's cached body "
+         f"under the $uri key, got {b2!r} vs {b1!r}")
+
+    # -- DOC-A1 fixed: $request_uri keeps the routes distinct ---------------
+    _, bf1, hf1 = fetch(ng.port, "/ctir-fixed/alpha")
+    assert hf1.get("x-ct-status") == "MISS", \
+        f"first fixed route should MISS, got {hf1.get('x-ct-status')}"
+
+    _, bf2, hf2 = fetch(ng.port, "/ctir-fixed/beta")
+    # THE discriminating assertion: MISS, not HIT. A revert to $uri makes this
+    # a HIT replaying alpha's body -- exactly the defect being guarded.
+    assert hf2.get("x-ct-status") == "MISS", \
+        ("$host$request_uri must keep distinct clean URLs on distinct keys "
+         f"across the internal redirect, got {hf2.get('x-ct-status')}")
+    assert bf2 != bf1, \
+        ("/ctir-fixed/beta must get its OWN origin body, not alpha's cached "
+         f"one, got {bf2!r} == {bf1!r}")
+
+    # Each fixed route caches independently on its own second request.
+    _, ba, ha = fetch(ng.port, "/ctir-fixed/alpha")
+    assert ha.get("x-ct-status") == "HIT" and ba == bf1, \
+        f"fixed alpha should HIT its own entry, got {ha.get('x-ct-status')}/{ba!r}"
+
+    # -- DOC-A2: route veto must survive the internal redirect --------------
+    _, bp1, hp1 = fetch(ng.port, "/ctir-fixed/api/me")
+    assert hp1.get("x-ct-status") == "BYPASS", \
+        ("DOC-A2: the private /api/ route must BYPASS even though the internal "
+         f"redirect rewrote r->uri to the front controller, got "
+         f"{hp1.get('x-ct-status')}")
+
+    # ... and must never have been STORED, not merely skipped on lookup: a
+    # fresh origin body on every request is what proves nothing was cached.
+    _, bp2, hp2 = fetch(ng.port, "/ctir-fixed/api/me")
+    assert hp2.get("x-ct-status") == "BYPASS", \
+        f"private route must BYPASS on every request, got {hp2.get('x-ct-status')}"
+    assert bp2 != bp1, \
+        ("private route must come from origin each time -- an identical body "
+         f"means it was stored and replayed, got {bp2!r}")
 
 
 def test_mediawiki_preset(ng: Nginx, origin: Origin) -> None:
@@ -11541,6 +11670,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_phorum_uri_rules_anchor_at_root(ng, origin)
     test_joomla_preset(ng, origin)
     test_drupal_preset(ng, origin)
+    test_internal_redirect_key_and_veto(ng, origin)
     test_mediawiki_preset(ng, origin)
     test_magento_preset(ng, origin)
     test_ghost_preset(ng, origin)
