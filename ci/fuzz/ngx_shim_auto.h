@@ -131,6 +131,9 @@ typedef struct {
 #define NGX_HTTP_CACHE_TURBO_BACKEND_UMBRACO      0x10000000ull
 #define NGX_HTTP_CACHE_TURBO_BACKEND_DOTCLEAR     0x20000000ull
 #define NGX_HTTP_CACHE_TURBO_BACKEND_WIKIJS       0x40000000ull
+#define NGX_HTTP_CACHE_TURBO_BACKEND_REDMINE      0x80000000ull
+#define NGX_HTTP_CACHE_TURBO_BACKEND_FLARUM       0x100000000ull
+#define NGX_HTTP_CACHE_TURBO_BACKEND_OPENCART     0x200000000ull
 
 /*
  * Every preset bit, armed together by the driver. There is no GENERIC union any
@@ -174,7 +177,10 @@ typedef struct {
      | NGX_HTTP_CACHE_TURBO_BACKEND_PLONE                                     \
      | NGX_HTTP_CACHE_TURBO_BACKEND_UMBRACO                                   \
      | NGX_HTTP_CACHE_TURBO_BACKEND_DOTCLEAR                                  \
-     | NGX_HTTP_CACHE_TURBO_BACKEND_WIKIJS)
+     | NGX_HTTP_CACHE_TURBO_BACKEND_WIKIJS                                     \
+     | NGX_HTTP_CACHE_TURBO_BACKEND_REDMINE                                    \
+     | NGX_HTTP_CACHE_TURBO_BACKEND_FLARUM                                     \
+     | NGX_HTTP_CACHE_TURBO_BACKEND_OPENCART)
 
 /* ALL must be a gapless run of bits starting at 0x0001 — i.e. ALL+1 is a power
  * of two. An omitted bit inside the run breaks this and fails the fuzz build,

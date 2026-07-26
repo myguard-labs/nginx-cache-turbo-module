@@ -41,6 +41,9 @@ One page per `cache_turbo_backend` preset:
 | `umbraco` | [umbraco.md](umbraco.md) | ⚠️ yes for stock cookie names — member/back-office auth names are configurable; renamed schemes need local rules |
 | `dotclear` | [dotclear.md](dotclear.md) | ⚠️ yes with stock `dcxd` session name — custom `DC_SESSION_NAME` and same-host admin paths need local rules |
 | `wikijs` | [wikijs.md](wikijs.md) | ✅ yes for Wiki.js 2.x (`jwt`; untouched guests get no Express session) — re-audit for 3.x |
+| `redmine` | [redmine.md](redmine.md) | ✅ yes (`_redmine_session`, a hardcoded literal, + `autologin`) — **and `?key=` is a bypass ARG**: it authenticates an Atom/API request with no cookie at all |
+| `flarum` | [flarum.md](flarum.md) | ⚠️ **only with "remember me"** (`flarum_remember`) — `flarum_session` is issued to every guest and is deliberately NOT matched; a login without remember-me is invisible to the cookie tier, `/api` contains most of the exposure |
+| `opencart` | [opencart.md](opencart.md) | ⚠️ **by ARG, not cookie** (`route=account/…`, `route=checkout/…`) — `OCSESSID` is guest-issued and login state is server-side only, so there is NO cookie rule; routes are enumerated because the arg tier is an exact match |
 
 `classicpress` is a source-verified alias for `wordpress`; `backdrop` is a
 source-verified alias for `drupal`. See the addenda in [wordpress.md](wordpress.md)

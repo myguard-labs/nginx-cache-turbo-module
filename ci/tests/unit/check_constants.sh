@@ -148,3 +148,52 @@ print(f"✓ auto-classify preset bits match the fuzz shim "
       f"({len(hdr)} presets, gapless, NONE at bit {none_val.bit_length() - 1}, "
       f"{63 - len(hdr)} free)")
 PY
+
+# ---------------------------------------------------------------------------
+# The two "unknown cache_turbo_backend" diagnostics enumerate every accepted
+# name by hand. Nothing ties them to ngx_http_cache_turbo_backend_names[], so a
+# preset added to the table leaves them stale and the operator who typos a name
+# is told their new backend does not exist. This is the recurring-drift pattern
+# recorded in .claude/skills/audit-api-contract: a diagnostic that goes stale
+# when the thing it describes gains an entry.
+# ---------------------------------------------------------------------------
+python3 - "$DIR/../../../src/ngx_http_cache_turbo_module.c" <<'PY'
+import re, sys
+
+src = open(sys.argv[1]).read()
+
+m = re.search(r'ngx_http_cache_turbo_backend_names\[\]\s*=\s*\{(.*?)\n\};',
+              src, re.S)
+if not m:
+    print("✗ could not locate ngx_http_cache_turbo_backend_names[]",
+          file=sys.stderr); sys.exit(1)
+names = set(re.findall(r'\{\s*"([a-z0-9]+)"', m.group(1)))
+
+# Each diagnostic is a run of adjacent string literals; concatenate then split.
+diags = re.findall(r'"unknown cache_turbo_backend((?:[^;]|\n)*?);', src) + \
+        re.findall(r'"cache_turbo_backend names no backend((?:[^;]|\n)*?);', src)
+if len(diags) != 2:
+    print(f"✗ expected 2 backend-name diagnostics, found {len(diags)} — if one "
+          f"was added or reworded, update this guard", file=sys.stderr)
+    sys.exit(1)
+
+rc = 0
+for i, d in enumerate(diags):
+    # Scan the whole span for bare words. The literals are split across source
+    # lines ("... wikijs, "\n "redmine, ..."), so pairing quotes would capture
+    # the whitespace BETWEEN literals instead of the literals themselves and
+    # report every name as missing. The surrounding C tokens (%V, want, the
+    # separator prose) are harmless here: this only tests that each accepted
+    # name APPEARS, never that nothing else does.
+    listed = set(re.findall(r'\b([a-z0-9]+)\b', d))
+    missing = names - listed
+    if missing:
+        print(f"✗ diagnostic #{i + 1} does not list: {', '.join(sorted(missing))} "
+              f"— a name accepted by cache_turbo_backend but absent from the "
+              f"'want ...' message", file=sys.stderr)
+        rc = 1
+
+if rc:
+    sys.exit(1)
+print(f"✓ both cache_turbo_backend diagnostics list all {len(names)} accepted names")
+PY
