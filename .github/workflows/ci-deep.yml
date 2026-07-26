@@ -52,7 +52,7 @@ permissions:
 jobs:
   fuzz:
     name: Fuzz (all targets, long)
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02","lxc"]') }}
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02"]') }}
     timeout-minutes: 600
     steps:
       - name: Checkout module
@@ -159,7 +159,7 @@ jobs:
     # 2026-07-21: the ABI branch changes rarely, so nightly coverage is enough
     # and it no longer sits on the per-PR critical path.
     name: Legacy nginx (pre-1.23) runtime
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02","lxc"]') }}
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02"]') }}
     timeout-minutes: 20
     env:
       LEGACY_NGINX_VERSION: "1.22.1"
@@ -221,7 +221,7 @@ jobs:
     # pass already covers per-PR clang static analysis — so this deeper full-source
     # pass runs nightly rather than duplicating clang work on every PR.
     name: Clang static analyzer
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02","lxc"]') }}
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02"]') }}
     timeout-minutes: 30
     steps:
       - name: Checkout module
@@ -275,7 +275,7 @@ jobs:
 
   memcheck:
     name: Valgrind Memcheck soak
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02","lxc"]') }}
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02"]') }}
     timeout-minutes: 240
     steps:
       - name: Checkout module
@@ -316,7 +316,7 @@ jobs:
 
   helgrind:
     name: Valgrind Helgrind soak
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02","lxc"]') }}
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02"]') }}
     timeout-minutes: 240
     steps:
       - name: Checkout module
@@ -366,7 +366,7 @@ jobs:
     # not a merge gate. Builds its own ASan binary (ci-deep jobs are
     # self-contained; no cross-workflow artifact reuse).
     name: ASan multi-worker soak (flake repetition)
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02","lxc"]') }}
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02"]') }}
     timeout-minutes: 60
     steps:
       - name: Checkout module
@@ -437,7 +437,7 @@ jobs:
 
   scanners:
     name: Security scanners
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02","lxc"]') }}
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02"]') }}
     timeout-minutes: 20
     steps:
       - name: Checkout module

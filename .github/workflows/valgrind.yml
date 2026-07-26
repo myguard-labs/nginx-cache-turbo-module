@@ -28,7 +28,7 @@ permissions:
 jobs:
   memcheck-lite:
     name: Memcheck lite (60s soak)
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02","lxc"]') }}
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02"]') }}
     timeout-minutes: 45
     steps:
       - name: Checkout module

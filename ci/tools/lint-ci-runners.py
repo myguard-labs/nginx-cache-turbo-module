@@ -31,6 +31,22 @@ TRUST_SPLITS = frozenset({
         "github.event.pull_request.head.repo.full_name == github.repository) && "
         "fromJSON('[\"self-hosted\",\"builder02\",\"lxc\"]') || 'ubuntu-24.04' }}"
     ),
+    # The bare `[self-hosted, builder02]` form is the same pool widened to every
+    # slot in the org group: the `lxc`-only selector left the *-docker-* slots idle.
+    # Every slot carries `builder02`, so dropping the third label reaches all of
+    # them, builder03-docker-01 included. Only the label set inside the self-hosted
+    # arm changes; the fork -> 'ubuntu-latest' arm is untouched, so the trust split
+    # this script exists to enforce is preserved. `self-hosted` is still required,
+    # so this cannot degrade into an unpinned selector.
+    (
+        "${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || "
+        "fromJSON('[\"self-hosted\",\"builder02\"]') }}"
+    ),
+    (
+        "${{ (github.event_name != 'pull_request' || "
+        "github.event.pull_request.head.repo.full_name == github.repository) && "
+        "fromJSON('[\"self-hosted\",\"builder02\"]') || 'ubuntu-24.04' }}"
+    ),
 })
 HOSTED = re.compile(r"ubuntu-(?:latest|[0-9]+\.[0-9]+)")
 
