@@ -31,6 +31,21 @@ TRUST_SPLITS = frozenset({
         "github.event.pull_request.head.repo.full_name == github.repository) && "
         "fromJSON('[\"self-hosted\",\"builder02\",\"lxc\"]') || 'ubuntu-24.04' }}"
     ),
+    # `ctsuite` is the same pool widened from 4 slots to 6: it labels
+    # builder02-runner-01..04 PLUS builder02-docker-01/02, which were idle under
+    # the `lxc`-only selector. Only the label inside the self-hosted arm changes;
+    # the fork -> 'ubuntu-latest' arm is untouched, so the trust split this script
+    # exists to enforce is preserved. builder03-docker-01 is deliberately NOT
+    # labelled `ctsuite` (WSL2 workstation over the LAN).
+    (
+        "${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || "
+        "fromJSON('[\"self-hosted\",\"builder02\",\"ctsuite\"]') }}"
+    ),
+    (
+        "${{ (github.event_name != 'pull_request' || "
+        "github.event.pull_request.head.repo.full_name == github.repository) && "
+        "fromJSON('[\"self-hosted\",\"builder02\",\"ctsuite\"]') || 'ubuntu-24.04' }}"
+    ),
 })
 HOSTED = re.compile(r"ubuntu-(?:latest|[0-9]+\.[0-9]+)")
 
