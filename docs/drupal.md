@@ -129,7 +129,8 @@ writes to `$_SESSION` and emits pages Drupal marks cacheable — add your own. F
 the cookie name:
 
 ```bash
-curl -sI -c - https://example.com/user/login | grep -i set-cookie
+curl -s -o /dev/null -D- -c - https://example.com/user/login \
+    | grep -i set-cookie
 # Set-Cookie: SSESS9f2a4c1e...=abc123; path=/; secure; HttpOnly
 #             ^^^^^^^^^^^^^^^^ this
 ```
@@ -185,6 +186,8 @@ http {
         location ~ '\.php$|^/update.php' {
             cache_turbo               ct;
             cache_turbo_backend       drupal;   # implies cache_control honor
+            # Preserve the original URL after try_files redirects to index.php.
+            cache_turbo_key           $host$request_uri;
 
             # Optional -- Drupal's own Cache-Control already covers this.
             cache_turbo_bypass        $drupal_session;
@@ -244,22 +247,24 @@ add_header X-Cache-Turbo $cache_turbo_status always;
 
 ```bash
 # anonymous node: MISS then HIT
-curl -sI https://example.com/node/1 | grep -i x-cache-turbo
-curl -sI https://example.com/node/1 | grep -i x-cache-turbo   # HIT
+curl -s -o /dev/null -D- https://example.com/node/1 | grep -i x-cache-turbo
+curl -s -o /dev/null -D- https://example.com/node/1 \
+    | grep -i x-cache-turbo   # HIT
 
 # preset URI surfaces: BYPASS
-curl -sI https://example.com/user       | grep -i x-cache-turbo
-curl -sI https://example.com/admin/config | grep -i x-cache-turbo
+curl -s -o /dev/null -D- https://example.com/user       | grep -i x-cache-turbo
+curl -s -o /dev/null -D- https://example.com/admin/config \
+    | grep -i x-cache-turbo
 
 # THE ONE THAT MATTERS: a logged-in user must never be served from cache.
 # Expect BYPASS -- the preset's SESS cookie rule catches the session cookie.
 # (Even without it, Drupal sends Cache-Control: private, so honor mode refuses
 # to STORE the response -- but the cookie rule is what you rely on.) Never a HIT.
-curl -sI -H 'Cookie: SSESS9f2a...=abc' https://example.com/node/1 \
+curl -s -o /dev/null -D- -H 'Cookie: SSESS9f2a...=abc' https://example.com/node/1 \
      | grep -i x-cache-turbo
 
 # Prove the origin really is sending private -- this is your safety net.
-curl -sI -H 'Cookie: SSESS9f2a...=abc' https://example.com/node/1 \
+curl -s -o /dev/null -D- -H 'Cookie: SSESS9f2a...=abc' https://example.com/node/1 \
      | grep -i cache-control
 # Cache-Control: private, must-revalidate     <- if this is missing, ADD THE MAP
 ```
@@ -268,6 +273,20 @@ That last check is your defence-in-depth safety net. The `SESS` cookie rule is t
 primary defence; Drupal sending `private` is the belt behind it. If a contrib
 module or an aggressive "performance" setting has stripped `private`, the cookie
 rule still holds — but add the `map` bypass too and don't lean on the origin.
+
+## Backdrop CMS: use the `backdrop` alias
+
+`cache_turbo_backend backdrop;` resolves to the `drupal` preset. Backdrop's
+current session bootstrap still constructs the cookie with an `SESS`/`SSESS`
+prefix in
+[`core/includes/bootstrap.inc`](https://github.com/backdrop/backdrop/blob/1.x/core/includes/bootstrap.inc),
+and its core route families retain `/user`, `/admin` and `/node/add`. Its
+session handler also explicitly suppresses an empty anonymous session so HTTP
+proxies can cache anonymous page views. Those are the exact facts the Drupal
+preset encodes; a separate bit would only duplicate them.
+
+Backdrop contrib modules can introduce routes the Drupal list does not know.
+Treat the alias as core coverage, not a promise about every contrib module.
 
 ## The header-authenticated surface (`/jsonapi`, `/oauth`)
 
@@ -379,5 +398,5 @@ Generic tuning belongs in your PHP-FPM docs; only the Drupal interactions are he
 
 - [README — CMS backends](../README.md#cms-backends-cache_turbo_backend)
 - [`docs/mediawiki.md`](mediawiki.md) — a preset that leans on origin `Cache-Control`
-- [`docs/phpbb.md`](phpbb.md) — a preset with no cookie rule and *no* origin safety net
+- [`docs/phpbb.md`](phpbb.md) — another preset that needs a cookie value predicate
 - [`docs/README.md`](README.md) — all presets

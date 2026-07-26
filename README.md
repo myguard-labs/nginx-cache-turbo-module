@@ -553,11 +553,11 @@ there is no way to opt a single location out.
 > They used to mean `wordpress` + `woocommerce` + `joomla`. That was never a safe
 > default:
 >
-> - it **never covered every backend** — it named 3 of the 12 presets that now
+> - it **never covered every backend** — it named 3 of the 29 presets that now
 >   exist, so `auto` on a Drupal site silently enabled *no* Drupal rules;
 > - its **`woocommerce`** shipped without implying `wordpress`, leaving
 >   `/wp-admin/` cacheable (see [woocommerce.md](docs/woocommerce.md));
-> - the **`joomla` in it ships no cookie rule at all**, so `auto` on a Joomla site
+> - the **`joomla` in it shipped no cookie rule at all**, so `auto` on a Joomla site
 >   *looked* like it protected logged-in users and did not.
 >
 > A default that is only correct if you already know which parts of it are wrong
@@ -600,6 +600,20 @@ plausibly appear as an arbitrary value.
 | `yabb` †      | — | `action=post`, `action=post2`, `action=login`, `action=login2`, `action=register`, `action=register2`, `action=admin`, `action=pm`, `action=imsend`, `action=imsend2` | `Y2User-`, `Y2Pass-`, `Y2Sess-` (prefix) |
 | `mybb` †      | `/member.php`, `/usercp.php`, `/private.php`, `/modcp.php`, `/newthread.php`, `/newreply.php`, `/editpost.php`, `/polls.php`, `/admin/`, `/xmlhttp.php` | `action=login`, `action=do_login`, `action=logout`, `action=do_logout`, `action=register`, `action=do_register`, `action=activate`, `action=lostpw`, `action=do_lostpw`, `action=resetpassword` | `user` (suffix, presence); *(key)* `mybbtheme`, `mybblang` |
 | `vbulletin` † | `/login.php`, `/register.php`, `/usercp.php`, `/private.php`, `/profile.php`, `/cron.php`, `/admincp/` | — | `userid`, `password` (suffix, non-empty), `imloggedin` == `yes`; *(key)* `bb_language` |
+| `textpattern` † | `/textpattern` | — | `txp_login_public`, `txp_login` |
+| `bludit` † | `/admin`, `/install.php` | — | `BLUDIT-KEY` (also `__Secure-`), `BLUDITREMEMBERUSERNAME`, `BLUDITREMEMBERTOKEN` |
+| `spip` † | `/ecrire` | `action`, `var_mode` | `_session`, `_admin`, `_lang`, `_lang_ecrire`, `_accepte_ajax` (suffix, non-empty) |
+| `bugzilla` † | account/login, mutation, admin/edit and API CGI entry points | `Bugzilla_api_key`, `api_key`, `Bugzilla_api_token`, `Bugzilla_token`, `Bugzilla_login`, `Bugzilla_password`, `Bugzilla_login_token`, `token` | `Bugzilla_login`, `Bugzilla_logincookie` |
+| `mantisbt` † | login/signup/account/form, `/admin/`, `/api/` entry points | — | `_STRING_COOKIE`, `_PROJECT_COOKIE`, `_VIEW_ALL_COOKIE`, `_BUG_LIST_COOKIE`, `_collapse_settings` (suffix, non-empty); `PHPSESSID` |
+| `plone` † | `/login`, `/logout`, `/register`, `/passwordreset`, `/mail_password`, `/manage`, `/@@login` | — | `__ac`, `_ZopeId`, `statusmessages`, `I18N_LANGUAGE` |
+| `umbraco` † | `/umbraco` | — | `UMB_UCONTEXT`, back-office token/preview/XSRF cookies, `UMB_SESSION`, `.AspNetCore.Identity.Application` |
+| `dotclear` † | `/admin`, `/preview`, `/pagespreview` | — | `dcxd`, `dc_admin`, `dc_passwd` |
+| `wikijs` † | admin/editor/history/source/upload, login/identity and GraphQL routes | — | `jwt`, `connect.sid`, `loginRedirect` |
+
+`classicpress` is an alias for `wordpress`, and `backdrop` is an alias for
+`drupal`; the upstream forks retain their base project's cookie and route
+contract, so aliases reuse the audited rule set instead of consuming duplicate
+preset bits. `mantis` is accepted as a convenience alias for `mantisbt`.
 
 † **Opt-in, like every preset.** These backends' dynamic surfaces are generic
 English paths (`/login`, `/register`, `/user`, `/admin`, `/session`) that an
@@ -771,15 +785,21 @@ XenForo member (`xf_user`), a Discourse user (`_t`) or a MediaWiki editor
 > [**Magento**](docs/magento.md) · [**Shopware 6**](docs/shopware6.md) ·
 > [**Ghost**](docs/ghost.md) ·
 > [**Wagtail**](docs/wagtail.md) · [**Kirby**](docs/kirby.md) ·
-> [**TYPO3**](docs/typo3.md) —
+> [**TYPO3**](docs/typo3.md) · [**Textpattern**](docs/textpattern.md) ·
+> [**Bludit**](docs/bludit.md) · [**SPIP**](docs/spip.md) ·
+> [**Bugzilla**](docs/bugzilla.md) · [**MantisBT**](docs/mantisbt.md) ·
+> [**Plone**](docs/plone.md) · [**Umbraco**](docs/umbraco.md) ·
+> [**Dotclear**](docs/dotclear.md) · [**Wiki.js**](docs/wikijs.md) —
 > index at [`docs/`](docs/README.md). Running a framework rather than one of these
 > apps (Django, Laravel, Rails)? [**frameworks.md**](docs/frameworks.md) explains
 > why there is no preset for it and how to derive your own rule.
 >
-> Caveats you should not skip: **`joomla` and `phpbb` ship no cookie rule** and do
-> not protect logged-in users until you add your own bypass **plus a matching
-> `cache_turbo_no_store`** — a bypass skips only the lookup and still stores
-> (phpBB needs a *value* test — its cookies are handed to guests too); **`woocommerce` implies
+> Caveats you should not skip: **`joomla` has only a remember-me cookie rule**
+> and does not protect an ordinary frontend login until you add your deployed
+> session cookie as a bypass **plus matching `cache_turbo_no_store`**. phpBB's
+> built-in `_u != 1` value predicate does protect members even though all
+> visitors receive the cookie. A bypass alone skips only lookup and still
+> stores. **`woocommerce` implies
 > `wordpress`** automatically (so `/wp-admin/` is covered without stacking); **`drupal` +
 > `mediawiki` lean on the origin's own `Cache-Control: private`**, so don't set
 > `cache_turbo_cache_control ignore` on those; **`woocommerce`'s `/cart`,
@@ -1334,7 +1354,7 @@ http {
         location / {
             # ── turn it on ──────────────────────────────────────────────
             cache_turbo                   ct;        # bind zone "ct" (or: off)
-            cache_turbo_backend           wordpress; # wordpress|woocommerce|joomla|xenforo|discourse|phpbb|drupal|mediawiki|magento|shopware6|ghost|wagtail|kirby|typo3|invision|smf|vanilla|punbb|phorum|yabb|mybb|vbulletin (stackable, '|' or spaces); 'none' = off; implies cache_control honor
+            cache_turbo_backend           wordpress; # presets stack with '|' or spaces; see the directive table/docs for the full list; 'none' = off; implies cache_control honor
 
             # ── what is "the same page" ─────────────────────────────────
             cache_turbo_key               $host$uri$cache_turbo_normalized_args;  # the default
@@ -1410,7 +1430,7 @@ http {
 |---|---|---|---|
 | `cache_turbo_zone name=NAME SIZE` | `http` | — | Declare a shared-memory cache zone (min 8 pages). |
 | `cache_turbo NAME` / `off` | `server`, `location` | `off` | Turn caching on (bind a zone) or off. Takes a zone name and nothing else — the old `auto` shorthand is gone (see `cache_turbo_backend`). |
-| `cache_turbo_backend NAME...` | `server`, `location` | — | Auto-classify dynamic (uncacheable) request surfaces for one or more CMS presets: `wordpress`, `woocommerce`, `joomla`, `xenforo`, `discourse`, `phpbb`, `drupal`, `mediawiki`, `magento`, `shopware6`, `ghost`, `wagtail`, `kirby`, `typo3`, `invision`, `smf`, `vanilla`, `punbb`, `phorum`, `yabb`, `mybb`, `vbulletin` — or `none`. A matching request (login/session cookie, admin URI, dynamic arg) skips the cache and goes straight to origin. **Every preset is opt-in**; names **stack**, separated by spaces or `\|` (`wordpress\|woocommerce` == `wordpress woocommerce`). Implies `cache_turbo_cache_control honor`. **`none`** means no preset here and exists to override one inherited from the `server` block; it is exclusive and does not imply `honor`. **`generic`/`auto` were removed** and are now a config error — the union was never a safe default ([why](#cms-backends-cache_turbo_backend)). **`joomla` and `phpbb` ship no cookie rule**; both need your own `cache_turbo_bypass` to protect logged-in users ([phpbb](docs/phpbb.md) needs a *value* test). **`wagtail`/`kirby` ship a *conditional* cookie rule** that fails safe — it stops matching if the app writes sessions for guests ([wagtail](docs/wagtail.md), [kirby](docs/kirby.md)). **`typo3` ships the same kind of conditional cookie rule, but it fails UNSAFE** — the cookie name is admin-overridable (`FE/cookieName`), and a renamed cookie means a logged-in page gets cached rather than a guest getting bypassed; add your own `cache_turbo_bypass` if you rename it ([typo3](docs/typo3.md)). **`magento` and `shopware6` value-key their vary cookie** (`X-Magento-Vary`, `sw-cache-hash`) rather than bypassing on it — the cookie's value is folded into the cache key so each vary context gets its own entry, matching each app's own Varnish VCL and built-in FPC ([magento](docs/magento.md), [shopware6](docs/shopware6.md)). **`smf`, `vanilla` and `punbb` are presence-only despite (SMF/PunBB) or possibly (Vanilla) being guest-issued** — SMF/PunBB's ideal value predicate needs array/base64 decoding this engine doesn't do; Vanilla is presence-only because guests are believed (not source-verified) to never receive it ([smf](docs/smf.md), [vanilla](docs/vanilla.md), [punbb](docs/punbb.md)). There is **no `django`/`laravel` preset** and never will be ([why](docs/frameworks.md)); there is likewise **no `bbpress`/`wpforo`/`asgaros`/`buddypress`/`buddyboss`** (fully covered by `wordpress`, [addendum](docs/wordpress.md)) or **`kunena`** (same shape as bare `joomla`, [addendum](docs/joomla.md)) preset. |
+| `cache_turbo_backend NAME...` | `server`, `location` | — | Auto-classify dynamic (uncacheable) request surfaces for one or more application presets: `wordpress`, `woocommerce`, `joomla`, `xenforo`, `discourse`, `phpbb`, `drupal`, `mediawiki`, `magento`, `shopware6`, `ghost`, `wagtail`, `kirby`, `typo3`, `invision`, `smf`, `vanilla`, `punbb`, `phorum`, `yabb`, `mybb`, `vbulletin`, `textpattern`, `bludit`, `spip`, `bugzilla`, `mantisbt` (`mantis`), `plone`, `umbraco`, `dotclear`, `wikijs`; aliases: `classicpress` → `wordpress`, `backdrop` → `drupal`; or `none`. A matching request (login/session cookie, admin URI, dynamic arg) skips lookup **and storage** and goes straight to origin. **Every preset is opt-in**; names **stack**, separated by spaces or `\|` (`wordpress\|woocommerce` == `wordpress woocommerce`). Implies `cache_turbo_cache_control honor`. **`none`** means no preset here and exists to override one inherited from the `server` block; it is exclusive and does not imply `honor`. **`generic`/`auto` were removed** and are now a config error — the union was never a safe default ([why](#cms-backends-cache_turbo_backend)). Cookie names that an app lets you rename still need an explicit local rule; see each [application guide](docs/README.md). There is **no `django`/`laravel` preset** and never will be ([why](docs/frameworks.md)); Jira, Request Tracker and several other session-eager trackers are intentional non-presets ([research](docs/README.md#apps-we-deliberately-do-not-ship-a-preset-for)). |
 | `cache_turbo_suppress_native on` | `server`, `location` | `off` | Make `$cache_turbo_active` read `1` while cache-turbo owns a request, so a stacked native `proxy_cache` can defer via `proxy_no_cache $cache_turbo_active; proxy_cache_bypass $cache_turbo_active;`. Off (default) keeps the variable always `0` (the wiring stays inert). |
 | `cache_turbo_key STRING` | `server`, `location` | normalized | What makes two requests "the same page". The default is `$host$uri$cache_turbo_normalized_args` — Host + **normalized args** (tracking params stripped, args sorted). |
 | `cache_turbo_preset NAME` | `server`, `location` | `balanced` | `micro` / `conservative` / `balanced` / `aggressive` — sets the four knobs below at once. `micro` = 1s microcaching (valid 1s, lock_ttl 1s, ×2 stale). |

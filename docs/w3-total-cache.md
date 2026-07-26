@@ -149,6 +149,8 @@ http {
         location ~ \.php$ {
             cache_turbo               ct;
             cache_turbo_backend       wordpress;
+            # Preserve the original URL after try_files redirects to index.php.
+            cache_turbo_key           $host$request_uri;
 
             cache_turbo_valid         60s;
             cache_turbo_valid         404 410 1m;
@@ -195,7 +197,7 @@ add_action( 'save_post', function ( $post_id ) {
     $url = get_permalink( $post_id );
     if ( ! $url ) return;
     // The admin endpoint hashes ?key= verbatim -- it must equal the full
-    // cache key (host + uri + normalized args), not a path-relative URL.
+    // cache key (host + original request URI), not a path-relative URL.
     $key = preg_replace( '#^https?://#', '', $url );
     wp_remote_post( 'http://127.0.0.1/_cache?key=' . rawurlencode( $key ) );
 }, 20 );

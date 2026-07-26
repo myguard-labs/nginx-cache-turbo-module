@@ -93,6 +93,8 @@ http {
         location ~ \.php$ {
             cache_turbo               ct;
             cache_turbo_backend       mybb;
+            # Preserve the original URL after try_files redirects to index.php.
+            cache_turbo_key           $host$request_uri;
 
             # theme/lang are presentation variants, not identity — the `mybb`
             # preset already folds both into the key with length-prefixed
@@ -131,20 +133,23 @@ add_header X-Cache-Turbo $cache_turbo_status always;
 
 ```bash
 # guest thread: MISS then HIT
-curl -sI https://forum.example.com/showthread.php?tid=1 | grep -i x-cache-turbo
-curl -sI https://forum.example.com/showthread.php?tid=1 | grep -i x-cache-turbo  # HIT
+curl -s -o /dev/null -D- https://forum.example.com/showthread.php?tid=1 \
+    | grep -i x-cache-turbo
+curl -s -o /dev/null -D- https://forum.example.com/showthread.php?tid=1 \
+    | grep -i x-cache-turbo  # HIT
 
 # a GUEST carrying the full cookie set (sid + read-tracking) must still be a
 # HIT. If this says BYPASS, something is over-matching the sid cookie.
-curl -sI -H 'Cookie: sid=abc123; mybb[lastvisit]=1700000000' \
+curl -s -o /dev/null -D- -H 'Cookie: sid=abc123; mybb[lastvisit]=1700000000' \
      https://forum.example.com/showthread.php?tid=1 | grep -i x-cache-turbo     # HIT
 
 # THE ONE THAT MATTERS: a logged-in member must be BYPASS.
-curl -sI -H 'Cookie: mybbuser=42_somehash' \
+curl -s -o /dev/null -D- -H 'Cookie: mybbuser=42_somehash' \
      https://forum.example.com/showthread.php?tid=1 | grep -i x-cache-turbo     # BYPASS
 
 # UCP / PM / posting: BYPASS
-curl -sI https://forum.example.com/usercp.php | grep -i x-cache-turbo
+curl -s -o /dev/null -D- https://forum.example.com/usercp.php \
+    | grep -i x-cache-turbo
 ```
 
 ## Gotchas

@@ -1,6 +1,6 @@
 # Frameworks (Django, Laravel, Rails, …) + cache-turbo
 
-_Last researched: 2026-07-18_
+_Last researched: 2026-07-26_
 
 **There is no `django` preset, no `laravel` preset, and there never will be.** Not
 an oversight — a framework is not a cacheable thing. This page explains why, and
@@ -48,21 +48,23 @@ cookie" — is broken on both of the big two, for two different reasons:
 - **Laravel's session cookie is not called `laravel_session` on your site.** It is
   derived from `APP_NAME` in the shipped `config/session.php`, and the exact derivation
   *changed between skeleton versions*. The operative default is the one in the
-  [`laravel/laravel`](https://github.com/laravel/laravel/blob/12.x/config/session.php)
+  [`laravel/laravel`](https://github.com/laravel/laravel/blob/13.x/config/session.php)
   **application skeleton** an operator actually deploys — **not** the
-  [`laravel/framework`](https://github.com/laravel/framework/blob/12.x/config/session.php)
-  library stub, which still passes the `'_'` separator on 12.x and so reads underscore;
+  [`laravel/framework`](https://github.com/laravel/framework/blob/13.x/config/session.php)
+  library stub, which still uses `Str::snake(...) . '_session'` on 13.x;
   that mismatch is why version tables disagree. In the skeleton, Laravel 11 shipped
   `Str::slug(env('APP_NAME', 'laravel'), '_') . '_session'` — underscores — so an
-  `APP_NAME=Acme Shop` install emitted `acme_shop_session`. Laravel 12 rewrote that
-  default (dropping the `'_'` separator so `Str::slug` falls back to its hyphen, and
-  suffixing `-session` → `Str::slug(env('APP_NAME','laravel')) . '-session'`), so a
-  current 12.x install emits the **hyphenated** `acme-shop-session`. (12.21.0 briefly
+  `APP_NAME=Acme Shop` install emitted `acme_shop_session`. Laravel 12 and 13 use
+  the new default (dropping the `'_'` separator so `Str::slug` falls back to its
+  hyphen, and suffixing `-session` →
+  `Str::slug(env('APP_NAME','laravel')) . '-session'`), so a
+  current install emits the **hyphenated** `acme-shop-session`. (12.21.0 briefly
   swapped `Str::slug` for `Str::snake`, which broke `APP_NAME`s containing a period —
   [laravel/framework#56449](https://github.com/laravel/framework/issues/56449) — and was
-  reverted; it never changed the underscore/hyphen boundary.) Either
-  way `laravel_session` only appears when `APP_NAME` is unset. A shipped
-  `laravel_session` substring would match **almost no production Laravel site** — and
+  reverted; it never changed the underscore/hyphen boundary.) In 11.x,
+  `laravel_session` was the fallback when `APP_NAME` was unset; current skeletons
+  produce `laravel-session` instead. A shipped literal for either spelling would
+  match **almost no production Laravel site** — and
   the modern hyphenated name additionally cannot be read with `$cookie_` at all (see
   the [hyphen gotcha](#gotchas)). Same failure class as [Joomla](joomla.md) and
   [Drupal](drupal.md): a per-install (now also per-version) name is not a shippable
@@ -131,7 +133,7 @@ write a single `cache_turbo_bypass`.
 bypass signal — by definition, it does not mean "logged in".
 
 ```bash
-curl -sI https://example.com/ | grep -i set-cookie
+curl -s -o /dev/null -D- https://example.com/ | grep -i set-cookie
 # Django:  Set-Cookie: csrftoken=...            <- guest cookie, NOT a bypass
 # Laravel: Set-Cookie: acme_session=...         <- guest cookie, NOT a bypass
 #          Set-Cookie: XSRF-TOKEN=...           <- guest cookie, NOT a bypass
@@ -158,7 +160,7 @@ instead.
 guest can also see.
 
 ```bash
-curl -sI -b jar.txt https://example.com/ | grep -i cache-control
+curl -s -o /dev/null -D- -b jar.txt https://example.com/ | grep -i cache-control
 # Cache-Control: private, ...   <- honor mode refuses to store it. You have a net.
 # (nothing)                     <- YOU HAVE NO NET. The cookie rule is load-bearing.
 ```
@@ -181,13 +183,13 @@ the one that decides everything.**
 
 | Framework | Session cookie | Stable name? | Set for a **guest**? | Origin sends `private`? |
 |---|---|---|---|---|
-| **Django** | `sessionid` | ✅ | **⚠️ only if something writes the session** — see below | ❌ no (only `Vary: Cookie`) |
-| **Laravel** | `<APP_NAME>_session` (11.x) / `<APP_NAME>-session` (12.x) | ❌ **env- & version-derived** | ❌ **yes, always, unconditionally** | ❌ no |
-| **Rails** | `_<appname>_session` | ❌ **per-app** | ⚠️ lazy, but flash + CSRF usually trip it | ❌ not guaranteed |
-| **Symfony** | `PHPSESSID` | ✅ (but collides — see below) | ⚠️ lazy in theory, leaky in practice | ✅ **yes, on session start** |
-| **Flask** | `session` | ✅ (but dangerously generic) | ⚠️ only if session written (`flash()` writes) | ❌ no (only `Vary: Cookie`) |
-| **Express** | `connect.sid` | ✅ | ❌ **yes — `saveUninitialized: true` is the default** | ❌ no |
-| **ASP.NET Core** | `.AspNetCore.Identity.Application` (auth) | ✅ | ✅ **no — set only on sign-in** | ✅ **yes, `no-cache,no-store`** |
+| **Django** | `sessionid` | ✅ | **Conditional: only if something writes the session** — see below | No (only `Vary: Cookie`) |
+| **Laravel** | `<APP_NAME>_session` (11.x) / `<APP_NAME>-session` (12/13.x) | ❌ **env- & version-derived** | **Yes, always** | No |
+| **Rails** | `_<appname>_session` | ❌ **per-app** | Lazy, but flash + CSRF usually trip it | Not guaranteed |
+| **Symfony** | `PHPSESSID` | ✅ (but collides — see below) | Conditional: lazy in theory | **Yes, on session start** |
+| **Flask** | `session` | ✅ (but dangerously generic) | Only if session written (`flash()` writes) | No (only `Vary: Cookie`) |
+| **Express** | `connect.sid` | ✅ | **Yes: [`saveUninitialized: true`](https://expressjs.com/en/resources/middleware/session.html) is the default** | No |
+| **ASP.NET Core** | `.AspNetCore.Identity.Application` (auth) | ✅ | **No: set only on sign-in** | **Yes: `no-cache,no-store`** |
 | **Next.js** | *none* — library-defined | ❌ | library-dependent | ✅ on dynamic routes |
 
 **Django — the conditional one.** `SessionMiddleware` sets `sessionid` only when the
@@ -221,10 +223,11 @@ hits `laravel_session`, `_forum_session`, `xf_session`, `PHPSESSID`… everythin
 Rename it (`SESSION_COOKIE_NAME = 'myapp_sid'`) and bypass the distinctive name.
 
 **Rails / Next.js — the name is not knowable from here.** Rails derives it from the
-app name; Next.js has no session at all (Auth.js uses `next-auth.session-token`,
-which becomes `__Secure-next-auth.session-token` **over HTTPS** — the name changes
-between schemes, so a naive literal breaks in production but works in dev). Derive
-with the curls.
+app name; Next.js has no session at all. The authentication library supplies the
+cookie: Auth.js v5 defaults to `authjs.session-token` and prefixes it as
+`__Secure-authjs.session-token` over HTTPS; NextAuth.js v4 used the corresponding
+`next-auth.session-token` names. The name can also be configured, so derive it with
+the curls instead of copying a version-specific literal.
 
 ## Vhost
 
@@ -371,8 +374,9 @@ continue past the needle — a different resource). A needle ending in `/`
 This is the one thing a plain nginx `location` prefix cannot do: `location`
 prefixes anchor at position 0 and have no boundary semantics, so a `location`
 that bypasses `/admin` also swallows `/administrator`, and mounting the app in a
-subdirectory silently mis-matches. Use `cache_turbo_bypass_uri` and mount-depth
-stops mattering.
+subdirectory silently mis-matches. `cache_turbo_bypass_uri` gives the explicit
+boundary behaviour, but its literals are not rebased: supply the app's deployed
+path (for example, `/shop/admin` for an app mounted at `/shop/`).
 
 Prefixes must start with `/`. It works with or without a `cache_turbo_backend`
 preset — in pure manual mode it is your whole URI-bypass surface.
@@ -419,21 +423,21 @@ never poison the anonymous entry.
 - **`$cookie_<name>` does not translate `-` to `_`.** Unlike headers. So
   `$cookie_XSRF_TOKEN` **never matches** `XSRF-TOKEN` — no error, just a
   permanently empty variable, and a bypass that never fires. Any hyphenated cookie
-  (`XSRF-TOKEN`, `next-auth.session-token`) can only be read with a `map` on
+  (`XSRF-TOKEN`, `authjs.session-token`) can only be read with a `map` on
   `$http_cookie`. Dots are just as bad. This has bitten us before; see
   [magento.md](magento.md). If you need to value-KEY such a cookie (a segment
   fingerprint, not an identity), [`cache_turbo_key_cookie`](#cache_turbo_key_cookie--fold-a-cookies-value-into-the-key)
   reads hyphenated/dotted names natively and skips the `map` entirely.
 - **`HEAD` responses are never stored, so `curl -sI` can never show a `HIT`.** It
-  will report `MISS` on a perfectly working cache, forever. Debug with `curl -s -D-`
-  (GET). This one costs people an afternoon. (`curl -sI` is still the right tool for
-  the [3 curls](#deriving-your-own-rule-the-3-curls) above — those read `Set-Cookie`
-  and `Cache-Control`, which HEAD returns correctly. It is only the **cache-status**
-  checks that need a GET.)
-- **A `map` needs PCRE.** If you build nginx `--without-http_rewrite_module`, a
-  regex `map` **parses fine** — `nginx -t` says *successful* — and then never
-  matches anything, ever. Silent. Check `nginx -V` for `--with-pcre` before
-  debugging a `map` that "does nothing".
+  will report `MISS` on a perfectly working cache, forever. Debug with a GET while
+  discarding its body: `curl -s -o /dev/null -D- URL`. The 3-curl procedure above
+  uses that form as well, so application-specific HEAD handling cannot skew its
+  cookie or cache-control observations.
+- **A regex `map` needs PCRE.** On an nginx build configured `--without-pcre`, a
+  `~pattern` map key falls through as a literal string: `nginx -t` succeeds but
+  the intended regex never matches. `--without-http_rewrite_module` is a different
+  option and does not by itself prove that PCRE is absent. Check `nginx -V` for
+  `--without-pcre`, or exercise the map in a config test.
 - **Do not bypass on the CSRF cookie.** Bears repeating: `csrftoken` /
   `XSRF-TOKEN` are guest cookies. This is the most common way to get a 0% hit rate
   and think you have configured security.
@@ -502,13 +506,16 @@ stacked gateway caches with two TTLs. Pick one edge — usually disable
 `framework.http_cache` and let cache-turbo be the cache. Opcache tuning as for Laravel.
 
 **Rails (Ruby).** The cookie is `_<app>_session`, per-app (from
-`config/session_store.rb`), and the session is lazy — but the CSRF `authenticity_token`
-lives *in the session* by default, so the first form render starts it and cookies the
-guest. Rails 7+ can move the CSRF token out of the session into its own encrypted
-cookie (`config.action_controller.urlsafe_csrf_tokens` / storing it outside the
-session): that stops session-thrash from anonymous CSRF but *adds a distinct guest
-cookie* — re-run curl #1, do not bypass on it. Rails does not reliably send `private`,
-so the derived cookie rule is load-bearing. `Rack::Cache` stopped being a default
+`config/session_store.rb`), and the session is lazy — but the CSRF
+`authenticity_token` lives *in the session* by default, so the first form render
+starts it and cookies the guest. Rails 7.1+ can instead use
+[`protect_from_forgery store: :cookie`](https://api.rubyonrails.org/classes/ActionController/RequestForgeryProtection/ClassMethods.html)
+to put the CSRF token in its own encrypted cookie. The old
+`config.action_controller.urlsafe_csrf_tokens` setting controlled token encoding;
+it did not select storage. A cookie storage strategy stops this session write
+but adds a distinct guest cookie — re-run curl #1 and do not bypass on it. Rails
+does not reliably send `private`, so the derived cookie rule is load-bearing.
+`Rack::Cache` stopped being a default
 dependency in **Rails 4**; if the app re-enables it (the `rack-cache` gem +
 `config.action_dispatch.rack_cache = true`) you get a second HTTP cache — prefer
 cache-turbo at the edge and leave `Rack::Cache` off. MISS throughput scales with Puma
@@ -535,8 +542,11 @@ out of the key. MISS throughput scales with the Node cluster / PM2 worker count.
 
 ## See also
 
-- [README — CMS backends](../README.md#cms-backends-cache_turbo_backend) — the preset table
-- [`docs/README.md`](README.md) — all presets, and the apps we deliberately reject
-- [`docs/phpbb.md`](phpbb.md) — the other guide with **no** shippable cookie rule and no origin net; shows the value-testing `map`
-- [`docs/drupal.md`](drupal.md) — the `honor`-carries-it pattern, and the `SESS`/`PHPSESSID` collision
+- [README — CMS backends](../README.md#cms-backends-cache_turbo_backend) — the
+  preset table
+- [`docs/README.md`](README.md) — all presets and the apps deliberately rejected
+- [`docs/phpbb.md`](phpbb.md) — the built-in `_u != 1` predicate and legacy
+  `map` equivalent
+- [`docs/drupal.md`](drupal.md) — the `honor` pattern and the
+  `SESS`/`PHPSESSID` collision
 - [`docs/magento.md`](magento.md) — the `$cookie_` hyphen trap in full

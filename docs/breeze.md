@@ -1,9 +1,10 @@
 # Breeze + cache-turbo
 
-_Last researched: 2026-07-18_
+_Last researched: 2026-07-26_
 
 Interop notes for **Breeze**, Cloudways' free WordPress caching plugin
-(`wordpress.org/plugins/breeze`, ~70k+ installs). This is **not** a new
+([official listing](https://wordpress.org/plugins/breeze/), ~70k+ installs).
+This is **not** a new
 `cache_turbo_backend` preset — Breeze is a WordPress plugin, so the stock
 `wordpress` preset already covers it. This doc exists because Breeze has one
 platform-specific wrinkle (its Cloudways Varnish toggle) worth calling out
@@ -51,7 +52,7 @@ those parts are host-agnostic and worth keeping regardless of which layer
 owns the page cache.
 
 Separately, Breeze ships a "Varnish" toggle. On Cloudways it flushes their
-platform-managed Varnish, but — confirmed against plugin source (v2.5.9) — the
+platform-managed Varnish, but — confirmed against plugin source (v2.5.10) — the
 integration is **not** Cloudways-locked: the Varnish tab exposes a "Varnish
 Server IP" field (`breeze-varnish-server-ip`, default `127.0.0.1`), and "Auto
 Purge Varnish" sends `PURGE`/`URLPURGE` requests at whatever host you point it
@@ -169,6 +170,8 @@ http {
         location ~ \.php$ {
             cache_turbo               ct;
             cache_turbo_backend       wordpress;
+            # Preserve the original URL after try_files redirects to index.php.
+            cache_turbo_key           $host$request_uri;
 
             cache_turbo_valid         60s;
             cache_turbo_valid         404 410 1m;   # negative caching
@@ -236,7 +239,7 @@ of nginx rather than inside it.
   the HTML/asset output regardless of which layer owns the page cache, so
   there's no need to disable them when disabling Breeze's page cache.
 - **No Breeze-specific *identity* cookie exists** (confirmed against plugin
-  source v2.5.9 — its page cache keys off WordPress's own
+  source v2.5.10 — its page cache keys off WordPress's own
   `wordpress_logged_in_` cookie and mints no login cookie of its own). It does
   mint `breeze_commented_posts[<id>]` with no consent gate, which is the one
   real gap — see [Cookies](#cookies-one-and-it-is-not-an-identity) above. If a future release

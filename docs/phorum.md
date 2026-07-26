@@ -1,6 +1,6 @@
 # Phorum + cache-turbo
 
-_Last researched: 2026-07-18_
+_Last researched: 2026-07-26_
 
 Caching a Phorum board. The clean case: presence alone is a safe, sufficient
 signal, no value predicate, no per-install hash.
@@ -33,8 +33,9 @@ any of these cookies, so presence is a correct, sufficient bypass signal on its
 own. The long-term `phorum_session_v5` cookie (value `user_id:sessid`) is the
 load-bearing member signal.
 
-> Verified against Phorum `Core` at v6.0.3 (`include/api/user.php` lines 61–74,
-> `common.php:88`), 2026-07-18.
+> Verified against Phorum `Core` at the
+> [v6.0.4 release](https://github.com/Phorum/Core/releases/tag/v6.0.4)
+> (`include/api/user.php` lines 59–74, `common.php:88`), 2026-07-26.
 
 `phorum_tmp_cookie` **is** guest-issued — a one-shot cookie-support probe with
 no identity value, destroyed on login — and is deliberately absent from the
@@ -65,6 +66,8 @@ http {
         location ~ \.php$ {
             cache_turbo               ct;
             cache_turbo_backend       phorum;
+            # Preserve the original URL after try_files redirects to index.php.
+            cache_turbo_key           $host$request_uri;
 
             # Phorum's own thread-display style is presentation, not identity —
             # the `phorum` preset already folds `list_style` into the key with
@@ -103,15 +106,18 @@ add_header X-Cache-Turbo $cache_turbo_status always;
 
 ```bash
 # guest thread: MISS then HIT
-curl -sI https://forum.example.com/read.php?1,1 | grep -i x-cache-turbo
-curl -sI https://forum.example.com/read.php?1,1 | grep -i x-cache-turbo  # HIT
+curl -s -o /dev/null -D- https://forum.example.com/read.php?1,1 \
+    | grep -i x-cache-turbo
+curl -s -o /dev/null -D- https://forum.example.com/read.php?1,1 \
+    | grep -i x-cache-turbo  # HIT
 
 # THE ONE THAT MATTERS: a logged-in member must be BYPASS.
-curl -sI -H 'Cookie: phorum_session_v5=42:abcdef' \
+curl -s -o /dev/null -D- -H 'Cookie: phorum_session_v5=42:abcdef' \
      https://forum.example.com/read.php?1,1 | grep -i x-cache-turbo      # BYPASS
 
 # admin: BYPASS
-curl -sI https://forum.example.com/admin.php | grep -i x-cache-turbo
+curl -s -o /dev/null -D- https://forum.example.com/admin.php \
+    | grep -i x-cache-turbo
 ```
 
 ## Gotchas
@@ -165,7 +171,7 @@ whether or not cache-turbo is in front.
 - **UNMAINTAINED-project caveat — pin your PHP version.** Phorum sat dormant for
   roughly nine years: the 5.2.x line's last public release was 5.2.23 (2016),
   and the tree was quiet from January 2017. A 6.0.x line appeared in early July
-  2026 (tags `v6.0.0`–`v6.0.3`, commit "PHP 8.2 modernization and security
+  2026 (tags `v6.0.0`–`v6.0.4`, commit "PHP 8.2 modernization and security
   hardening") that **requires PHP 8.2 or higher** (`README.md`, "PHP, version
   8.2 or above"). The revival is brand-new and its longevity is
   unverified/community-reported. Practical consequence for the whole

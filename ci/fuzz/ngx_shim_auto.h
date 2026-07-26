@@ -93,11 +93,12 @@ typedef struct {
 } ngx_http_cache_turbo_loc_conf_t;
 
 /*
- * CMS preset bits — MUST mirror src/ngx_http_cache_turbo_module.h. The fuzz
- * target compiles the sliced registry WITHOUT the real header, so a bit added
- * there and not here fails the fuzz build with "use of undeclared identifier"
- * (and only in CI, since extract_auto_classify.sh does not compile). Adding a
- * preset means editing BOTH. The static assert below catches the common case.
+ * Application preset bits — MUST mirror src/ngx_http_cache_turbo_module.h.
+ * The fuzz target compiles the sliced registry WITHOUT the real header, so a
+ * bit added there and not here fails the fuzz build with an
+ * undeclared-identifier error (and only in CI, since
+ * extract_auto_classify.sh does not compile). Adding a preset means editing
+ * BOTH. The static assert below catches gaps in the mask.
  */
 #define NGX_HTTP_CACHE_TURBO_BACKEND_WORDPRESS    0x0001
 #define NGX_HTTP_CACHE_TURBO_BACKEND_WOOCOMMERCE  0x0002
@@ -121,6 +122,15 @@ typedef struct {
 #define NGX_HTTP_CACHE_TURBO_BACKEND_YABB         0x80000
 #define NGX_HTTP_CACHE_TURBO_BACKEND_MYBB         0x100000
 #define NGX_HTTP_CACHE_TURBO_BACKEND_VBULLETIN    0x200000
+#define NGX_HTTP_CACHE_TURBO_BACKEND_TEXTPATTERN  0x400000
+#define NGX_HTTP_CACHE_TURBO_BACKEND_BLUDIT       0x800000
+#define NGX_HTTP_CACHE_TURBO_BACKEND_SPIP         0x1000000
+#define NGX_HTTP_CACHE_TURBO_BACKEND_BUGZILLA     0x2000000
+#define NGX_HTTP_CACHE_TURBO_BACKEND_MANTISBT     0x4000000
+#define NGX_HTTP_CACHE_TURBO_BACKEND_PLONE        0x8000000
+#define NGX_HTTP_CACHE_TURBO_BACKEND_UMBRACO      0x10000000
+#define NGX_HTTP_CACHE_TURBO_BACKEND_DOTCLEAR     0x20000000u
+#define NGX_HTTP_CACHE_TURBO_BACKEND_WIKIJS       0x40000000u
 
 /*
  * Every preset bit, armed together by the driver. There is no GENERIC union any
@@ -128,10 +138,10 @@ typedef struct {
  * opt-in, so the fuzzer must arm them all explicitly or a row's cookie/URI/arg
  * lists are walked by nobody.
  *
- * ADDING A PRESET MEANS ADDING IT HERE TOO. The assert below is the guard: it
- * pins the mask to the contiguous run of bits [0x0001 .. highest], so a new bit
- * that is not folded into ALL fails the fuzz build rather than silently going
- * unfuzzed.
+ * ADDING A PRESET MEANS ADDING IT HERE TOO. The assert below pins the mask to a
+ * contiguous run of bits [0x0001 .. highest], so an omitted bit inside that run
+ * fails the fuzz build. Review still has to update the highest bit explicitly;
+ * C has no way to enumerate macro definitions.
  */
 #define NGX_HTTP_CACHE_TURBO_BACKEND_ALL                                       \
     (NGX_HTTP_CACHE_TURBO_BACKEND_WORDPRESS                                    \
@@ -155,17 +165,27 @@ typedef struct {
      | NGX_HTTP_CACHE_TURBO_BACKEND_PHORUM                                    \
      | NGX_HTTP_CACHE_TURBO_BACKEND_YABB                                      \
      | NGX_HTTP_CACHE_TURBO_BACKEND_MYBB                                      \
-     | NGX_HTTP_CACHE_TURBO_BACKEND_VBULLETIN)
+     | NGX_HTTP_CACHE_TURBO_BACKEND_VBULLETIN                                 \
+     | NGX_HTTP_CACHE_TURBO_BACKEND_TEXTPATTERN                               \
+     | NGX_HTTP_CACHE_TURBO_BACKEND_BLUDIT                                    \
+     | NGX_HTTP_CACHE_TURBO_BACKEND_SPIP                                      \
+     | NGX_HTTP_CACHE_TURBO_BACKEND_BUGZILLA                                  \
+     | NGX_HTTP_CACHE_TURBO_BACKEND_MANTISBT                                  \
+     | NGX_HTTP_CACHE_TURBO_BACKEND_PLONE                                     \
+     | NGX_HTTP_CACHE_TURBO_BACKEND_UMBRACO                                   \
+     | NGX_HTTP_CACHE_TURBO_BACKEND_DOTCLEAR                                  \
+     | NGX_HTTP_CACHE_TURBO_BACKEND_WIKIJS)
 
 /* ALL must be a gapless run of bits starting at 0x0001 — i.e. ALL+1 is a power
- * of two. A preset bit defined above but left out of ALL breaks this and fails
- * the fuzz build, which is exactly when we want to hear about it. */
+ * of two. An omitted bit inside the run breaks this and fails the fuzz build,
+ * which is exactly when we want to hear about it. */
 _Static_assert((NGX_HTTP_CACHE_TURBO_BACKEND_ALL
                 & (NGX_HTTP_CACHE_TURBO_BACKEND_ALL + 1)) == 0,
-               "a BACKEND_* bit is missing from BACKEND_ALL — the fuzzer would "
-               "not walk its preset row (see module header)");
+               "BACKEND_ALL has a bit gap — the fuzzer would not walk that "
+               "preset row (see module header)");
 
-/* Linker stub: never called (driver keeps r->args.len == 0). */
+/* Linker stub retained for compatibility with older extracted classifier code;
+ * the current in-module query scanner does not call ngx_http_arg(). */
 static ngx_int_t
 ngx_http_arg(ngx_http_request_t *r, u_char *name, size_t len, ngx_str_t *value)
 {

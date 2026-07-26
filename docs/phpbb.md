@@ -101,6 +101,8 @@ http {
         location ~ \.php$ {
             cache_turbo               ct;
             cache_turbo_backend       phpbb;
+            # Preserve the original URL after try_files redirects to index.php.
+            cache_turbo_key           $host$request_uri;
             # The preset carries the _u != 1 value predicate: logged-in members
             # bypass automatically. No map, no cache_turbo_bypass needed.
 
@@ -157,11 +159,14 @@ add_header X-Cache-Turbo $cache_turbo_status always;
 
 ```bash
 # anonymous topic: MISS then HIT
-curl -s -o /dev/null -D- https://forum.example.com/viewtopic.php?t=1 | grep -i x-cache-turbo
-curl -s -o /dev/null -D- https://forum.example.com/viewtopic.php?t=1 | grep -i x-cache-turbo  # HIT
+curl -s -o /dev/null -D- https://forum.example.com/viewtopic.php?t=1 \
+    | grep -i x-cache-turbo
+curl -s -o /dev/null -D- https://forum.example.com/viewtopic.php?t=1 \
+    | grep -i x-cache-turbo  # HIT
 
 # UCP / posting / admin: BYPASS (this is what the preset gives you)
-curl -s -o /dev/null -D- https://forum.example.com/ucp.php | grep -i x-cache-turbo
+curl -s -o /dev/null -D- https://forum.example.com/ucp.php \
+    | grep -i x-cache-turbo
 
 # A GUEST carrying the full cookie set must still be a HIT. If this says BYPASS,
 # your map is matching _sid or a bare _u= and you have destroyed your hit rate.
@@ -261,5 +266,5 @@ PHP app and is out of scope here.
 ## See also
 
 - [README — CMS backends](../README.md#cms-backends-cache_turbo_backend)
-- [`docs/joomla.md`](joomla.md) — the other preset with no cookie rule
+- [`docs/joomla.md`](joomla.md) — the preset whose remember-me rule is only partial
 - [`docs/README.md`](README.md) — all presets

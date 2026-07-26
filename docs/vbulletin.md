@@ -1,14 +1,19 @@
 # vBulletin + cache-turbo
 
-_Last researched: 2026-07-18_
+_Last researched: 2026-07-26_
 
-Caching a vBulletin board — vBulletin 5 Connect (current as of 2026-07) and the
-vB4/vB3 legacy line, which share the same login-cookie shape (see the
+Caching a vBulletin board — current
+[vBulletin 6](https://www.vbulletin.com/en/vbulletin-6.html), vBulletin 5
+Connect, and the vB4/vB3 legacy line. Vendor documentation identifies `userid`,
+`password`, and `sessionhash` as
+[logged-in user cookies](https://forum.vbulletin.com/articles/support-documents/reference/4463793-vbulletin-cookies),
+but vBulletin is
+closed-source and its current download is member-only. Before enabling caching
+on vBulletin 6, run the anonymous and authenticated checks below and confirm the
+same cookies are present. See the
 [prefix note](#the-cookie-prefix-and-the-underscore) — the underscore in `bb_`
-is not universal). Closed-source
-commercial PHP, so no source read is possible; the cookie shape is documented in
-the vBulletin manual and community forum and matches production LiteSpeed/nginx
-guest-caching configs, so this ships with reasonable confidence.
+is not universal. Closed-source commercial PHP means this cannot receive the same
+source-level verification as the open-source presets.
 
 - [The short version](#the-short-version)
 - [Why presence/non-empty is safe here](#why-presencenon-empty-is-safe-here)
@@ -27,19 +32,22 @@ cache_turbo_backend vbulletin;
 ## Why presence/non-empty is safe here
 
 `bbuserid` and `bbpassword` are the load-bearing signal. The vBulletin
-community documents them as set **on login and removed on logout** — a guest
-only ever carries `bblastactivity`, `bblastvisit`, and `bbsessionhash`.
+community documents them as set **on login and removed on logout**; guest
+session-cookie behaviour varies by product line and configuration.
 Presence/non-empty-value alone is sufficient; no value-split trick needed.
 (`bbimloggedin=yes` also appears in some LiteSpeed/nginx guest-cache configs as
-an extra login flag, but it is community-reported and not in the official cookie
-docs — treat it as belt-and-braces, not the primary signal.)
+an extra login flag. A
+[vBulletin staff response](https://forum.vbulletin.com/forum/vbulletin-5-connect/support-issues-questions/4027789-question-about-remember-me-cookies-and-having-to-log-in-over-and-over)
+identifies it as specific to vbulletin.com's own Varnish setup, not a stock
+product cookie — treat it as a
+harmless extra match, not the primary signal.)
 
 | Cookie | Treatment | Why |
 |---|---|---|
 | `bbuserid` / `bbpassword` (suffix `userid`/`password`) | **bypass** (non-empty) | set only on login, removed on logout |
-| `bbimloggedin` == `yes` | **bypass** | community-reported extra login flag (LiteSpeed/nginx configs); not in official cookie docs |
+| `bbimloggedin` == `yes` | **bypass** | site-specific extra flag used by vbulletin.com's cache; not a stock cookie |
 | `bbsessionhash` | **ignore** | session tracking for every visitor including guests |
-| language cookie | **cache key** | presentation, not identity |
+| `bb_language` (exact name) | **cache key** | presentation, not identity |
 | `bblastvisit` / `bblastactivity` | **ignore** | presentation, but per-visit timestamps: keying on them would give every visitor a private entry their own next request invalidates, and let anyone mint unlimited keys to force eviction |
 
 ### The cookie prefix, and the underscore
@@ -81,10 +89,13 @@ http {
         location ~ \.php$ {
             cache_turbo               ct;
             cache_turbo_backend       vbulletin;
+            # Preserve the original URL after try_files redirects to index.php.
+            cache_turbo_key           $host$request_uri;
 
-            # No cache_turbo_key: the `vbulletin` preset already folds the
-            # language cookie into the key with length-prefixed framing. Do NOT
-            # hand-write one that splices $cookie_* values together — unframed
+            # Keep cookie values out of the base key above: the `vbulletin`
+            # preset folds the exact `bb_language` cookie into it with
+            # length-prefixed framing. Do NOT hand-write a replacement that
+            # splices $cookie_* values together — unframed
             # concatenation lets a visitor choose a cookie value that reproduces
             # another page's key.
             cache_turbo_valid         60s;
@@ -119,20 +130,23 @@ add_header X-Cache-Turbo $cache_turbo_status always;
 
 ```bash
 # guest thread: MISS then HIT
-curl -sI https://forum.example.com/showthread.php?t=1 | grep -i x-cache-turbo
-curl -sI https://forum.example.com/showthread.php?t=1 | grep -i x-cache-turbo  # HIT
+curl -s -o /dev/null -D- https://forum.example.com/showthread.php?t=1 \
+    | grep -i x-cache-turbo
+curl -s -o /dev/null -D- https://forum.example.com/showthread.php?t=1 \
+    | grep -i x-cache-turbo  # HIT
 
 # a GUEST carrying only bbsessionhash must still be a HIT.
 # (use bb_sessionhash instead if your install's prefix is "bb_")
-curl -sI -H 'Cookie: bbsessionhash=abc123' \
+curl -s -o /dev/null -D- -H 'Cookie: bbsessionhash=abc123' \
      https://forum.example.com/showthread.php?t=1 | grep -i x-cache-turbo     # HIT
 
 # THE ONE THAT MATTERS: a logged-in member must be BYPASS.
-curl -sI -H 'Cookie: bbuserid=42; bbpassword=somehash' \
+curl -s -o /dev/null -D- -H 'Cookie: bbuserid=42; bbpassword=somehash' \
      https://forum.example.com/showthread.php?t=1 | grep -i x-cache-turbo     # BYPASS
 
 # UCP / PM / admin: BYPASS
-curl -sI https://forum.example.com/usercp.php | grep -i x-cache-turbo
+curl -s -o /dev/null -D- https://forum.example.com/usercp.php \
+    | grep -i x-cache-turbo
 ```
 
 ## Gotchas
@@ -150,8 +164,14 @@ curl -sI https://forum.example.com/usercp.php | grep -i x-cache-turbo
   not vBulletin's own code.
 - **A full manual cookie rename (not just the `bb` prefix)** evades the
   suffix match. Rare, but possible.
-- **`bbsessionhash` is not an auth cookie** — guests have it too. Bypassing
-  on it is the classic mistake and would zero the hit rate.
+- **The presentation-key cookie is exactly `bb_language`.** Unlike the auth
+  predicates, this key-cookie name does not follow the configured prefix. If
+  your board emits a differently named language/style cookie, add that exact
+  name with `cache_turbo_key_cookie` or disable the selector; otherwise two
+  presentation variants can share an entry.
+- **`bbsessionhash` is not a reliable auth cookie** — guest sessions on older
+  lines and some configurations carry it too. Bypassing on it is a safe failure
+  direction, but can zero the hit rate; verify it with the anonymous check.
 - **`Set-Cookie` responses are never stored** and `Authorization` requests are
   never cached, regardless of preset.
 
@@ -176,19 +196,24 @@ vBulletin-specific things that bite around a full-page cache:
 - **`/admincp` and `/modcp` must never be cached.** These are logged-in-only
   admin/moderator surfaces (the admin session rides a separate `bbcpsessionhash`
   cookie — again prefix + base name, so `bb_cpsessionhash` on a `bb_`-prefixed
-  install); in vB5 the `modcp` directory name is fixed and cannot be renamed. Same
-  for login/register and the private-message / UCP flows — all member-state pages.
+  install). The preset has an `/admincp/` URI row but no `/modcp/` row; the
+  ordinary member cookies should still bypass a logged-in moderator, but add a
+  `$request_uri`-based bypass/no-store map for the actual CP paths as a separate
+  route guard. The front-controller warning in [docs/README.md](README.md#two-traps-these-guides-keep-pointing-at)
+  explains why a PHP-location `cache_turbo_bypass_uri /modcp;` may see only
+  `/index.php`. Apply the same treatment to login/register and private-message /
+  UCP flows if your current vBulletin release routes them through clean URLs.
 - **vBulletin's datastore is not the nginx layer.** vB caches its own settings,
   permissions, usergroups, and phrases in an internal *datastore* (DB rows or
   memcached). That is unrelated to the nginx full-page cache and does **not**
   invalidate it — a datastore rebuild after a settings change won't purge stale
   guest pages, so keep `cache_turbo_valid` short or purge via `/_cache` on
   content updates.
-- **vB5 Connect is heavy**, so guest full-page caching at nginx is high value —
-  it is exactly the uncached guest `showthread.php`/`forumdisplay.php` renders
+- **Modern vBulletin is heavy**, so guest full-page caching at nginx is high
+  value — it is exactly the uncached guest `showthread.php`/`forumdisplay.php` renders
   (many DB queries + template assembly each) that the cache removes from PHP-FPM.
-- **opcache** — enable it; vB5 has a large PHP surface and opcache is a big win
-  on the requests that still reach PHP (members, POSTs).
+- **opcache** — enable it; vBulletin has a large PHP surface and opcache is a
+  big win on the requests that still reach PHP (members, POSTs).
 - **`memory_limit`** — vB5 is memory-hungry; 256M is a sane floor, and the
   AdminCP / upgrade scripts want more (upgrade guidance runs to 512M+).
 - **`max_execution_time`** — vBulletin's scheduled-task (cron) runner is

@@ -1,9 +1,10 @@
 # Hummingbird + cache-turbo
 
-_Last researched: 2026-07-18_
+_Last researched: 2026-07-26_
 
-Interop notes for **Hummingbird** (WPMU DEV's `hummingbird-performance`,
-v3.19.0, 100k+ installs) on a site fronted by cache-turbo. This is **not** a new
+Interop notes for **Hummingbird** (WPMU DEV's
+[`hummingbird-performance`](https://wordpress.org/plugins/hummingbird-performance/),
+v3.20.0, 100k+ installs) on a site fronted by cache-turbo. This is **not** a new
 backend preset — Hummingbird runs on stock WordPress with stock WP auth
 cookies, so the existing `wordpress` preset already covers it. This page is
 about which of Hummingbird's *own* modules to turn off.
@@ -123,6 +124,8 @@ http {
         location ~ \.php$ {
             cache_turbo               ct;
             cache_turbo_backend       wordpress;
+            # Preserve the original URL after try_files redirects to index.php.
+            cache_turbo_key           $host$request_uri;
 
             cache_turbo_valid         60s;
             cache_turbo_valid         404 410 1m;   # negative caching
@@ -157,11 +160,11 @@ http {
 ## Multisite note
 
 Hummingbird is a WPMU DEV product and commonly runs on WordPress
-Multisite. Cache-turbo's default key already includes `$host`, so
+Multisite. The vhost's explicit key includes `$host`, so
 subdomain-mapped multisite sites (`site2.example.com`) get naturally
 separate cache entries with zero extra config. Subdirectory multisite
-(`example.com/site2/`) is covered too, since `$uri` is also in the default
-key — no special-casing needed either way.
+(`example.com/site2/`) is covered too, since `$request_uri` preserves the site
+path — no special-casing needed either way.
 
 ## Purging on publish
 
@@ -179,7 +182,7 @@ add_action( 'wphb_clear_page_cache', function () {
 
 add_action( 'wphb_clear_cache_url', function ( $url ) {
     // The admin endpoint hashes ?key= verbatim -- it must equal the full
-    // cache key (host + uri + normalized args), not a path-relative URL.
+    // cache key (host + original request URI), not a path-relative URL.
     $key = preg_replace( '#^https?://#', '', $url );
     wp_remote_post( 'http://127.0.0.1/_cache?key=' . rawurlencode( $key ) );
 } );
@@ -262,4 +265,3 @@ the site:
 - [`wordpress.md`](wordpress.md) — the WordPress preset baseline this page builds on
 - [`woocommerce.md`](woocommerce.md) — the WooCommerce add-on preset
 - [`docs/README.md`](README.md) — all presets
-</content>

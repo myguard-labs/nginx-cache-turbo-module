@@ -98,6 +98,8 @@ http {
         location ~ \.php$ {
             cache_turbo         ct;
             cache_turbo_backend wordpress;
+            # Preserve the original URL after try_files redirects to index.php.
+            cache_turbo_key           $host$request_uri;
             cache_turbo_valid   60s;
             cache_turbo_preset  balanced;
 

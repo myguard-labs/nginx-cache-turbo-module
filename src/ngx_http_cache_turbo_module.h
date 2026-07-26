@@ -169,8 +169,15 @@
 #define NGX_HTTP_CACHE_TURBO_BACKEND_YABB         0x80000
 #define NGX_HTTP_CACHE_TURBO_BACKEND_MYBB         0x100000
 #define NGX_HTTP_CACHE_TURBO_BACKEND_VBULLETIN    0x200000
-/* NOTE: BACKEND_NONE below was moved from 0x8000 to 0x400000 to make room for
- * the bits above (SMF used to collide with it) — see BACKEND_NONE comment. */
+#define NGX_HTTP_CACHE_TURBO_BACKEND_TEXTPATTERN  0x400000
+#define NGX_HTTP_CACHE_TURBO_BACKEND_BLUDIT       0x800000
+#define NGX_HTTP_CACHE_TURBO_BACKEND_SPIP         0x1000000
+#define NGX_HTTP_CACHE_TURBO_BACKEND_BUGZILLA     0x2000000
+#define NGX_HTTP_CACHE_TURBO_BACKEND_MANTISBT     0x4000000
+#define NGX_HTTP_CACHE_TURBO_BACKEND_PLONE        0x8000000
+#define NGX_HTTP_CACHE_TURBO_BACKEND_UMBRACO      0x10000000
+#define NGX_HTTP_CACHE_TURBO_BACKEND_DOTCLEAR     0x20000000u
+#define NGX_HTTP_CACHE_TURBO_BACKEND_WIKIJS       0x40000000u
 
 /*
  * "cache_turbo_backend none;" — explicitly NO preset here.
@@ -191,7 +198,7 @@
  * asking for no CMS classification should not quietly change how the response's
  * Cache-Control is treated.
  */
-#define NGX_HTTP_CACHE_TURBO_BACKEND_NONE         0x400000
+#define NGX_HTTP_CACHE_TURBO_BACKEND_NONE         0x80000000u
 
 /* True when a REAL preset is active — i.e. at least one registry row is armed.
  * Use this, never a bare `backend_presets != 0`: the NONE sentinel is non-zero
