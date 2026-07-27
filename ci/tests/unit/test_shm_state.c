@@ -1064,6 +1064,32 @@ test_breaker_threshold_zero_never_trips(void)
 }
 
 
+/* window == 0 is INERT, not "accumulate forever". O4.4 feeds this from a
+ * directive, so an unset window is a plausible arrival and must fail towards
+ * "breaker does nothing" the same way threshold == 0 does. */
+static void
+test_breaker_zero_window_never_trips(void)
+{
+    ngx_uint_t  i;
+
+    printf("breaker: window 0 is inert, not cumulative\n");
+    zone_reset();
+    ngx_test_set_time(1000);
+
+    /* Fifty failures, days apart. A cumulative reading would have tripped at
+     * the third. */
+    for (i = 0; i < 50; i++) {
+        ngx_http_cache_turbo_shm_breaker_record(&g_zone, 0, 3, 0);
+        ngx_test_advance_time(86400);
+    }
+
+    CHECK(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+              == NGX_HTTP_CACHE_TURBO_BREAKER_CLOSED,
+          "window 0 accumulated failures and tripped the breaker");
+    CHECK(g_sh.breaker_opens == 0, "window 0 recorded an open");
+}
+
+
 /* The rendered state strings are what the admin JSON exposes; an unknown id
  * must render, not crash. */
 static void
@@ -1149,15 +1175,25 @@ run_negative_controls(void)
      * test_breaker_window_rolls must then accumulate and trip. */
     zone_reset();
     ngx_test_set_time(1000);
+    g_sh.breaker_window_start = 1000;
     {
-        ngx_uint_t  i, fails = 0;
+        ngx_uint_t  i;
 
+        /* The bug injected into REAL shared state: bump breaker_fails without
+         * ever re-anchoring the window, which is what dropping the re-anchor
+         * branch would do. Then ask the REAL function for its verdict. */
         for (i = 0; i < 10; i++) {
-            fails++;                            /* <-- the bug: no re-anchor */
+            g_sh.breaker_fails++;               /* <-- the bug: no re-anchor */
             ngx_test_advance_time(61);
         }
 
-        caught = (fails >= 3);
+        if (g_sh.breaker_fails >= 3) {
+            g_sh.breaker_opened_at = (ngx_atomic_t) ngx_test_now;
+            g_sh.breaker_state = NGX_HTTP_CACHE_TURBO_BREAKER_OPEN;
+        }
+
+        caught = (ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+                      == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN);
         tests_run++;
         if (!caught) {
             fprintf(stderr, "  ✗ CONTROL O4.1-a: a non-rolling window did not "
@@ -1206,14 +1242,24 @@ run_negative_controls(void)
     ngx_http_cache_turbo_shm_breaker_record(&g_zone, 0, 3, 60);
     ngx_http_cache_turbo_shm_breaker_record(&g_zone, 0, 3, 60);
     {
-        ngx_atomic_uint_t  kept = g_sh.breaker_fails;   /* <-- bug: not cleared */
+        ngx_atomic_uint_t  kept = g_sh.breaker_fails;
 
-        /* One more failure on top of a retained run of 2 reaches threshold 3. */
-        caught = (kept + 1 >= 3);
+        /* The bug: a success that does NOT clear the run. Restore the retained
+         * count by hand, then drive the REAL record()/state() pair with the
+         * same two post-success failures the test uses. With the run retained,
+         * 2 + 2 crosses threshold 3 and the breaker opens. */
+        ngx_http_cache_turbo_shm_breaker_record(&g_zone, 1, 3, 60);
+        g_sh.breaker_fails = kept;              /* <-- bug: not cleared */
+
+        ngx_http_cache_turbo_shm_breaker_record(&g_zone, 0, 3, 60);
+        ngx_http_cache_turbo_shm_breaker_record(&g_zone, 0, 3, 60);
+
+        caught = (ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+                      == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN);
         tests_run++;
         if (!caught) {
             fprintf(stderr, "  ✗ CONTROL O4.1-c: a retained failure run did not "
-                            "reach the threshold — the post-close assertion "
+                            "reach the threshold — the post-success assertion "
                             "guards nothing\n");
             tests_failed++;
         }
@@ -1243,6 +1289,7 @@ main(void)
     test_breaker_abandoned_probe_lease_recovers();
     test_breaker_stale_success_does_not_close();
     test_breaker_threshold_zero_never_trips();
+    test_breaker_zero_window_never_trips();
     test_breaker_state_strings();
     run_negative_controls();
 

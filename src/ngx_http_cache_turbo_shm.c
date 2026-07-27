@@ -1135,7 +1135,11 @@ ngx_http_cache_turbo_shm_breaker_state(ngx_http_cache_turbo_zone_t *z,
     time_t      now;
     ngx_uint_t  state;
 
-    state = (ngx_uint_t) ngx_atomic_fetch_add(&z->sh->breaker_state, 0);
+    /* Plain volatile read, NOT fetch_add(...,0): a lock-prefixed RMW would
+     * acquire the cache line exclusively on every call, and this is the
+     * pre-origin-connect read path -- the hottest site in the zone. Sampling is
+     * all that is needed here; the transitions below carry their own CAS. */
+    state = (ngx_uint_t) z->sh->breaker_state;
 
     now = ngx_time();
 
@@ -1167,7 +1171,17 @@ ngx_http_cache_turbo_shm_breaker_state(ngx_http_cache_turbo_zone_t *z,
              * promotion path below, which re-stamps opened_at and admits one
              * replacement probe. Two CASes rather than one, but each has a
              * genuine single winner -- a HALF_OPEN -> HALF_OPEN cas would
-             * succeed for every caller and guard nothing. */
+             * succeed for every caller and guard nothing.
+             *
+             * ⚠ This stamp lands AFTER its CAS, the opposite of the ordering
+             * _breaker_record() insists on, and it is safe ONLY because of the
+             * VALUE: now - open_for reads as already elapsed, so a worker that
+             * sees the intermediate OPEN with an even older opened_at just wins
+             * the promotion CAS instead of us -- still exactly one probe.
+             * Change this to `now`, or to anything meant to arm a FRESH window,
+             * and the ordering silently becomes the window-skip bug the
+             * failed-probe path warns about. Move the write above the CAS if
+             * you ever change the value. */
             z->sh->breaker_opened_at = (ngx_atomic_t) (now - open_for);
             state = NGX_HTTP_CACHE_TURBO_BREAKER_OPEN;
 
@@ -1208,7 +1222,8 @@ ngx_http_cache_turbo_shm_breaker_state(ngx_http_cache_turbo_zone_t *z,
  * `threshold` failures inside a `window` of seconds trip CLOSED -> OPEN. The
  * window is a rolling anchor, not a fixed bucket: the first failure after an
  * idle gap re-anchors it, so a slow trickle of unrelated failures spread over
- * hours never accumulates into an open. A threshold of 0 disables tripping.
+ * hours never accumulates into an open. A threshold of 0 disables tripping,
+ * and so does a window of 0 -- both are inert rather than degenerate.
  */
 void
 ngx_http_cache_turbo_shm_breaker_record(ngx_http_cache_turbo_zone_t *z,
@@ -1219,7 +1234,7 @@ ngx_http_cache_turbo_shm_breaker_record(ngx_http_cache_turbo_zone_t *z,
     ngx_uint_t        state;
 
     now   = ngx_time();
-    state = (ngx_uint_t) ngx_atomic_fetch_add(&z->sh->breaker_state, 0);
+    state = (ngx_uint_t) z->sh->breaker_state;   /* plain read, see above */
 
     if (success) {
         /* A success clears the failure run. */
@@ -1273,15 +1288,21 @@ ngx_http_cache_turbo_shm_breaker_record(ngx_http_cache_turbo_zone_t *z,
         return;
     }
 
-    if (state != NGX_HTTP_CACHE_TURBO_BREAKER_CLOSED || threshold == 0) {
+    /* ⚠ window <= 0 is INERT, not "count forever". Skipping the re-anchor
+     * instead would let breaker_fails accumulate for the life of the zone and
+     * trip on the Nth failure EVER recorded, days apart -- precisely the slow
+     * trickle the rolling window exists to ignore. O4.4 feeds these values from
+     * directives, so an unset or zero window is a plausible arrival, and it
+     * must fail towards "breaker does nothing" like threshold == 0 does. */
+    if (state != NGX_HTTP_CACHE_TURBO_BREAKER_CLOSED
+        || threshold == 0 || window <= 0)
+    {
         return;
     }
 
     /* Rolling window: re-anchor if the previous one has expired, so only a
      * BURST of failures trips the breaker. */
-    if (window > 0
-        && now >= (time_t) z->sh->breaker_window_start + window)
-    {
+    if (now >= (time_t) z->sh->breaker_window_start + window) {
         z->sh->breaker_window_start = (ngx_atomic_t) now;
         z->sh->breaker_fails        = 0;
     }

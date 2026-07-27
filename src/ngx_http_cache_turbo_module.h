@@ -710,7 +710,10 @@ typedef struct {
      * under concurrency, so nothing may read two of them and assume they
      * describe the same instant. Each transition is carried by a single CAS on
      * breaker_state, and every other field is either advisory (fails,
-     * window_start) or written by the CAS winner alone (opened_at, probe_at).
+     * window_start) or written by the CAS winner alone (probe_at). opened_at is
+     * deliberately PUBLISHED BEFORE the transition CAS by every racing writer,
+     * not just the winner, so a worker that can observe OPEN can always observe
+     * a deadline at least as new -- see the ordering notes in _breaker_record().
      *
      * A reload resets all of this to CLOSED -- the shm zone is re-created. That
      * is documented as an accepted limitation in the plan, not a bug: a reload
