@@ -111,21 +111,31 @@
  * backend_presets above -- an unsuffixed literal at/above bit 31 would be
  * `unsigned int` and get truncated by promotion into a 64-bit mask.
  *
- * `error` and `timeout` are nginx-shaped ALIASES, not independent bits: nginx
- * itself maps a failed/refused upstream connection onto a synthetic 502 and an
- * upstream read/connect timeout onto a synthetic 504 (see nginx's
- * ngx_http_upstream.c NGX_HTTP_UPSTREAM_FT_ERROR / FT_TIMEOUT -> the 502/504
- * status it assigns before the cache_use_stale check). This module has no
- * lower-level connection-failure signal of its own to key on -- the trigger
- * site at ngx_http_cache_turbo_header_filter only ever sees r->headers_out.status.
+ * ⚠ `error` and `timeout` are NOT nginx-equivalent here, and the difference is
+ * a known limitation rather than an oversight. In nginx these are
+ * communication-failure classes inherited from proxy_next_upstream: `error`
+ * means the connection failed/reset, `http_502` means the upstream really
+ * answered 502. They are distinct conditions.
  *
- * `error` and `timeout` therefore carry their OWN bits here rather than being
- * folded into HTTP_502 / HTTP_504 at parse time: the parser preserves what the
- * operator actually wrote, and S4.2 (the consume side) owns the mapping.
- * ⚠ S4.2 MUST treat ERROR as also matching a 502 and TIMEOUT as also matching a
- * 504, or `cache_turbo_use_stale error` will not serve stale on the very status
- * nginx synthesizes for a connection failure. Do NOT assume the parse-time mask
- * already folds them in -- it does not.
+ * This module cannot make that distinction. Its only observation point is
+ * ngx_http_cache_turbo_header_filter, which sees r->headers_out.status and
+ * nothing else -- there is no NGX_HTTP_UPSTREAM_FT_* state, no peer status, no
+ * upstream failure provenance reachable from a header filter. By the time this
+ * module runs, a refused connection and a genuine upstream 502 are the same
+ * 502, and a timeout and a genuine 504 are the same 504.
+ *
+ * Consequence, which S4.2 must NOT paper over: with a status-only consumer,
+ * `error` and `http_502` match the same set of responses, as do `timeout` and
+ * `http_504`. An operator asking for `error` alone will also get stale serves
+ * on a real upstream 502. The tokens exist for vocabulary compatibility with
+ * proxy_cache_use_stale, not for behavioural parity.
+ *
+ * They carry their own bits so the parser records what the operator wrote and a
+ * future consumer that DOES have provenance (e.g. one reading upstream state
+ * rather than the final status) can honour the distinction without a config
+ * break. Until such a consumer exists, treat ERROR as equivalent to HTTP_502
+ * and TIMEOUT as equivalent to HTTP_504, and document the collapse rather than
+ * claiming a fidelity this trigger site cannot deliver.
  *
  * `off` is exclusive: it is only accepted alone (any token alongside it is a
  * config error), and it means an EMPTY mask, not "keep default."

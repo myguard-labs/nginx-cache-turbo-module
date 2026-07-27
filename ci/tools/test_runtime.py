@@ -9442,11 +9442,40 @@ def test_use_stale_config_parse(ng: Nginx) -> None:
     assert "is duplicate" in r.stdout, \
         f"missing duplicate diagnostic:\n{r.stdout}"
 
+    # accept: server-level directive inherited by a location that does not
+    # override it, and a location-level override alongside it. This is the
+    # only part of the create/merge path observable from a config test.
+    r = _config_test_result(
+        ng, lambda c: with_directive(c, "cache_turbo_use_stale http_404;"))
+    assert r.returncode == 0, \
+        f"server-scope cache_turbo_use_stale was rejected:\n{r.stdout}"
+
+    # reject: tokens are matched by exact bytes, so a case variant is not a
+    # silently-accepted synonym.
+    for bad in ("HTTP_500", "Off", "Error"):
+        r = _config_test_result(
+            ng, lambda c, _b=bad: with_directive(
+                c, f"cache_turbo_use_stale {_b};"))
+        assert r.returncode != 0, \
+            f"cache_turbo_use_stale {bad} was accepted (case folding?):\n{r.stdout}"
+        assert "invalid value" in r.stdout, \
+            f"missing invalid-value diagnostic for {bad}:\n{r.stdout}"
+
     # negative control: the pristine (unmutated) config must still pass, or
     # every reject arm above is vacuous.
     r = _config_test_result(ng, lambda c: c)
     assert r.returncode == 0, \
         f"pristine config (no mutation) failed nginx -t:\n{r.stdout}"
+
+    # ⚠ KNOWN COVERAGE GAP -- do not read this test as validating the mask.
+    # Nothing reads clcf->use_stale yet (that is S4.2), so no config test can
+    # observe the VALUE any token produces. These arms prove only that the
+    # grammar accepts/rejects the right strings. Mutations that survive this
+    # test unchanged: mapping every token to the same bit, swapping two token
+    # bits, dropping ANY_5XX from USE_STALE_DEFAULT, or breaking the
+    # UNSET-vs-0 merge. Those invariants become observable only once S4.2
+    # gives the mask a behavioural effect, and the S4.2 tests -- not these --
+    # are what must pin them down. See the S4.1 entry in issues.md.
 
 
 def test_lru_eviction(ng: Nginx) -> None:
