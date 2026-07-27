@@ -6464,6 +6464,7 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
         u_char                           *blob, *w;
         ngx_uint_t                        i;
         time_t                            ttl, stale_window, sie_window = 0;
+        time_t                            retain_ttl;
 
         ttl = ngx_http_cache_turbo_status_ttl(clcf, r->headers_out.status);
         if (ttl < 0) {
@@ -6626,6 +6627,22 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
             bhw.sie_ttl = (uint32_t) sie_window;   /* CTB4 (RFC-2 SIE) */
             ngx_http_cache_turbo_blob_hdr_write(blob, &bhw);
 
+            /* The L2 retention window, used for the object key AND for every L2
+             * index that points at it (variant index, tag index). stale_window
+             * already carries any stale-while-revalidate widening; sie_window is
+             * the RFC-2 stale-if-error deadline and can extend past it entirely.
+             * Both are absolute windows off the same base ttl and are already
+             * clamped to TTL_MAX, so max() needs no further bounding.
+             *
+             * The indexes MUST NOT outlive-mismatch the object: if an index
+             * expired at the stale window while the object survived into the
+             * SIE-only interval, a tag or base purge in that interval could no
+             * longer find the object and would leave it undeletable in L2. */
+            retain_ttl = stale_window;
+            if (sie_window > retain_ttl) {
+                retain_ttl = sie_window;
+            }
+
             w = blob + NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE;
 
             /* write a single name/value pair (lengths fixed-endian, STAB-4) */
@@ -6732,7 +6749,7 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
                     vlen = ngx_http_cache_turbo_variant_index_name(
                                &ctx->cache_key, vname);
                     clcf->backend->tag_add(clcf, store_key, vname, vlen,
-                        ngx_http_cache_turbo_stale_ttl(ttl, clcf->stale_mult));
+                                           retain_ttl);
                 }
             }
 
@@ -6758,16 +6775,16 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 
             /* L2 write-through (async, fire-and-forget). Copies the blob into
              * its own pool, so it is safe even though `blob` lives in r->pool.
-             * The caller now owns the L2 key's retention window: retain_ttl is
-             * passed explicitly (today: the same fresh+stale window the
-             * backends used to derive themselves) so the object can still be
-             * stale-served from L2 after its fresh deadline; the blob's own
-             * freshness metadata then bounds how it is restored into L1. */
+             * The caller owns the L2 key's retention window: retain_ttl (computed
+             * above, shared with the L2 index writes) is max(stale_window,
+             * sie_window). Passing stale_window alone here would silently
+             * truncate the L2 key's PX/EXPIRE to the stale deadline, so an
+             * SIE-armed object's L2 copy is already gone by the time an origin
+             * failure needs it — the access handler's SIE-from-L2 path would
+             * then always miss. */
             if (clcf->backend) {
                 clcf->backend->set(r, clcf, store_key,
-                                   blob, blob_len, ttl,
-                                   ngx_http_cache_turbo_stale_ttl(ttl,
-                                       clcf->stale_mult));
+                                   blob, blob_len, ttl, retain_ttl);
             }
 
             /* Tag index (v2c): for each tag in the cache_turbo_tag expression,
@@ -6785,7 +6802,6 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
                 if (ngx_http_complex_value(r, clcf->tag, &tagval) == NGX_OK
                     && tagval.len)
                 {
-                    time_t     stale_ttl;
                     u_char    *s, *e, *tok;
                     size_t     toklen;
                     ngx_uint_t ntags = 0, k;
@@ -6797,8 +6813,6 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
                      * is SADD'd once. */
                     ngx_str_t  seen[NGX_HTTP_CACHE_TURBO_MAX_TAGS];
 
-                    stale_ttl = ngx_http_cache_turbo_stale_ttl(ttl,
-                                    clcf->stale_mult);
                     s = tagval.data;
                     e = tagval.data + tagval.len;
 
@@ -6847,12 +6861,12 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
                     if (ntags > 0) {
                         if (clcf->backend->tag_add_many) {
                             clcf->backend->tag_add_many(clcf, store_key, seen,
-                                                        ntags, stale_ttl);
+                                                        ntags, retain_ttl);
                         } else {
                             for (k = 0; k < ntags; k++) {
                                 clcf->backend->tag_add(clcf, store_key,
                                                        seen[k].data,
-                                                       seen[k].len, stale_ttl);
+                                                       seen[k].len, retain_ttl);
                             }
                         }
                     }
