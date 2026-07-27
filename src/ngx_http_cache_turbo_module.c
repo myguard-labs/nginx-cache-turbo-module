@@ -6758,13 +6758,16 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 
             /* L2 write-through (async, fire-and-forget). Copies the blob into
              * its own pool, so it is safe even though `blob` lives in r->pool.
-             * set() takes the FRESH ttl and derives its own EXPIRE spanning the
-             * full serveable window (fresh + stale), so the object can still be
+             * The caller now owns the L2 key's retention window: retain_ttl is
+             * passed explicitly (today: the same fresh+stale window the
+             * backends used to derive themselves) so the object can still be
              * stale-served from L2 after its fresh deadline; the blob's own
              * freshness metadata then bounds how it is restored into L1. */
             if (clcf->backend) {
                 clcf->backend->set(r, clcf, store_key,
-                                   blob, blob_len, ttl);
+                                   blob, blob_len, ttl,
+                                   ngx_http_cache_turbo_stale_ttl(ttl,
+                                       clcf->stale_mult));
             }
 
             /* Tag index (v2c): for each tag in the cache_turbo_tag expression,

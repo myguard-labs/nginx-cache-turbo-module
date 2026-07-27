@@ -953,9 +953,8 @@ ngx_http_cache_turbo_redis_op_create(ngx_http_cache_turbo_loc_conf_t *clcf)
 void
 ngx_http_cache_turbo_redis_set(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, u_char *key_hash,
-    u_char *blob, size_t blob_len, time_t fresh_ttl)
+    u_char *blob, size_t blob_len, time_t fresh_ttl, time_t retain_ttl)
 {
-    time_t                            stale_ttl;
     ngx_pool_t                       *pool;
     ngx_str_t                         argv[5];
     ngx_http_cache_turbo_redis_op_t  *op;
@@ -965,9 +964,9 @@ ngx_http_cache_turbo_redis_set(ngx_http_request_t *r,
         return;
     }
 
-    /* L2 entry lives as long as the L1 copy could be served stale. */
-    stale_ttl = ngx_http_cache_turbo_stale_ttl(fresh_ttl, clcf->stale_mult);
-    if (stale_ttl <= 0) {
+    /* L2 entry lives as long as the caller says it should (retain_ttl) --
+     * the backend no longer derives its own window from fresh_ttl. */
+    if (retain_ttl <= 0) {
         return;
     }
 
@@ -997,7 +996,7 @@ ngx_http_cache_turbo_redis_set(ngx_http_request_t *r,
     argv[3].data = (u_char *) "PX";
     argv[3].len = sizeof("PX") - 1;
     argv[4].data = msbuf;
-    argv[4].len = (size_t) (ngx_sprintf(msbuf, "%T", stale_ttl * 1000) - msbuf);
+    argv[4].len = (size_t) (ngx_sprintf(msbuf, "%T", retain_ttl * 1000) - msbuf);
 
     op->send = ngx_http_cache_turbo_redis_encode(pool, argv, 5);
     if (op->send == NULL) {
