@@ -6758,16 +6758,24 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 
             /* L2 write-through (async, fire-and-forget). Copies the blob into
              * its own pool, so it is safe even though `blob` lives in r->pool.
-             * The caller now owns the L2 key's retention window: retain_ttl is
-             * passed explicitly (today: the same fresh+stale window the
-             * backends used to derive themselves) so the object can still be
-             * stale-served from L2 after its fresh deadline; the blob's own
-             * freshness metadata then bounds how it is restored into L1. */
+             * The caller owns the L2 key's retention window: retain_ttl is
+             * max(stale_window, sie_window) — stale_window already carries any
+             * SWR widening (v7 above), and sie_window (RFC-2 stale-if-error)
+             * can extend PAST the stale window entirely (e.g. max-age=60,
+             * stale-if-error=86400). Passing stale_window alone here would
+             * silently truncate the L2 key's PX/EXPIRE to the stale deadline,
+             * so an SIE-armed object's L2 copy is already gone by the time an
+             * origin failure needs it — the access handler's SIE-from-L2 path
+             * would then always miss. */
             if (clcf->backend) {
+                time_t  retain_ttl = stale_window;
+
+                if (sie_window > retain_ttl) {
+                    retain_ttl = sie_window;
+                }
+
                 clcf->backend->set(r, clcf, store_key,
-                                   blob, blob_len, ttl,
-                                   ngx_http_cache_turbo_stale_ttl(ttl,
-                                       clcf->stale_mult));
+                                   blob, blob_len, ttl, retain_ttl);
             }
 
             /* Tag index (v2c): for each tag in the cache_turbo_tag expression,
