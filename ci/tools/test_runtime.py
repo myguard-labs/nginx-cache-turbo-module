@@ -10201,6 +10201,58 @@ def test_l2_retain_ttl_covers_sie(ng: Nginx, origin: Origin,
         f"stale-if-error window (expected >3,000,000ms, i.e. close to 3601s)"
 
 
+def test_l2_sie_serve_survives_l1_purge(ng: Nginx, origin: Origin,
+                                        redis: RedisServer) -> None:
+    """S1.2 (behavioural complement to test_l2_retain_ttl_covers_sie, which only
+    asserts the Redis PTTL): prove a user actually gets served during an origin
+    outage once L1 is gone. Reuses the /l2sie/ marker (max-age=1,
+    cache_turbo_stale_mult 1, origin stale-if-error=3600) -- a 3600s SIE window
+    is far past this test's runtime, so it also satisfies the plan's "sleep past
+    the stale window; ... within stale-if-error=30" shape without a fragile 30s
+    sleep budget.
+
+    Sequence: prime L1+L2 -> sleep past the 1s stale window (L1 now expired) ->
+    purge L1 ONLY via the non-L2-aware /_cache admin endpoint (zone "main" has
+    no cache_turbo_redis directive, so this purge cannot reach Redis) -> the L2
+    key must still exist -> origin.fail = True -> a read must still get a 200
+    with X-Cache: STALE-IF-ERROR, served out of L2.
+
+    Negative control: revert S1.2 (retain_ttl back to stale_ttl(ttl,
+    stale_mult) instead of max(stale_window, sie_window)) and the L2 key is
+    already gone by the time of the purge/origin-fail step -> 502."""
+    import json
+    uri = "/l2sie/l2sie-sie1"
+    key = l2_key(uri)
+    redis.cli("DEL", key)
+
+    s0, body0, h0 = fetch(ng.port, uri)            # miss -> store L1 + L2
+    assert s0 == 200 and "x-cache" not in h0, "prime should miss to origin"
+    assert wait_for(lambda: redis.cli("EXISTS", key) == "1"), \
+        "object never written to L2"
+
+    time.sleep(1.3)                                # past the 1s stale window
+
+    # L1-only purge: /_cache (zone "main") has no cache_turbo_redis directive,
+    # so it cannot touch the L2 key -- only the L1 slot is dropped.
+    s, b, _ = fetch(ng.port, f"/_cache?key={uri}", method="POST")
+    assert s == 200 and json.loads(b)["purged"] == 1, f"L1 purge result: {s} {b}"
+    assert redis.cli("EXISTS", key) == "1", \
+        "L1-only purge must not have deleted the L2 key (test setup broken)"
+
+    origin.fail = True
+    try:
+        s2, body2, h2 = fetch(ng.port, uri)
+        assert s2 == 200, \
+            f"origin down + L1 purged should still serve 200 from L2, got {s2}"
+        assert h2.get("x-cache") == "STALE-IF-ERROR", \
+            f"expected X-Cache: STALE-IF-ERROR from L2, got {h2.get('x-cache')}"
+        assert body2 == body0, \
+            f"served {body2!r}, expected the original primed body {body0!r}"
+    finally:
+        origin.fail = False
+        drain_origin(origin)
+
+
 def tag_key(name: str, prefix: str = "ct:") -> str:
     """Mirror the module's tag-set key: <prefix>tag:<name>."""
     return f"{prefix}tag:{name}"
@@ -12124,6 +12176,8 @@ def run_all(ng: Nginx, origin: Origin,
         test_l2_malformed_blob_rejected(ng, origin, redis)  # STAB-4 validate
         test_sie_ttl_stored_in_blob(ng, origin, redis)      # RFC-2 CTB4 sie_ttl
         test_l2_retain_ttl_covers_sie(ng, origin, redis)    # S1.2 retain_ttl
+        test_l2_sie_serve_survives_l1_purge(ng, origin, redis)  # S1.2 e2e serve
+        test_l2_sie_serve_survives_l1_purge(ng, origin, redis)  # S1.2 e2e serve
         test_l2_tag_add_on_store(ng, origin, redis)
         test_l2_tag_truncation_warns(ng, origin, redis)
         test_l2_tag_purge(ng, origin, redis)
