@@ -1101,6 +1101,43 @@ When the origin is unavailable and an entry has passed its `cache_turbo_valid` T
 
 An origin that sends its own `stale-if-error` wins outright — `cache_turbo_keep_stale` is the last resort for the common case where it sends none, not a floor that widens one the origin already scoped. Two interactions worth knowing: `cache_turbo_cache_control ignore` does **not** disable `cache_turbo_keep_stale` (it makes the *upstream* header inert; this is *operator* config), while a response `must-revalidate` **does** suppress it — that directive forbids serving stale at all. Full precedence in the [Directive synopsis](#directive-synopsis) entry.
 
+### Which failures count as "the origin is down"
+
+By default, "down" means any 5xx. That covers a dead origin, because nginx turns
+a refused connection into a 502 and a hung one into a 504 before this module ever
+sees the response. It does not cover a *half*-broken origin — a bad deploy that
+404s every page, an over-eager rate limiter answering 429 — because those are
+perfectly valid HTTP responses as far as the cache is concerned.
+
+`cache_turbo_use_stale` picks the trigger set:
+
+```nginx
+    cache_turbo_keep_stale    6h;
+    cache_turbo_use_stale     error timeout http_404 http_429;
+```
+
+Tokens: `off`, `error`, `timeout`, `http_403`, `http_404`, `http_429`, `http_500`,
+`http_502`, `http_503`, `http_504`. The default is every 5xx, so leaving the
+directive out keeps today's behaviour exactly. `off` disables serve-on-error
+entirely and may only appear on its own.
+
+⚠ **Naming tokens replaces the default — it does not extend it.** Writing
+`cache_turbo_use_stale http_500 http_502 http_503 http_504` looks like a spelled-out
+version of the default, but it is narrower: the default also covers the 5xx statuses
+that have no token of their own (501, 505, 507, 508, 510, 511), and those stop
+falling back to a stale copy the moment you name anything. If you want the default
+plus one more status, you still have to list the 5xx you care about explicitly, or
+leave the directive out and accept every 5xx.
+
+⚠ **`error` and `timeout` are vocabulary compatibility with
+`proxy_cache_use_stale`, not behavioural parity.** In nginx those are
+communication-failure classes: `error` means the connection failed, as distinct
+from an upstream that genuinely answered 502. This module decides at the response
+header filter, where the only thing it can see is the final status — by then a
+refused connection and a real 502 are the same number. So `error` behaves as
+`http_502` and `timeout` behaves as `http_504`. Write whichever reads better;
+they select the same responses.
+
 ## Long-tail URLs: reach for `cache_turbo_min_uses` first
 
 If the cache is large but the hit rate is poor, the usual cause is not the TTL —
@@ -1406,6 +1443,9 @@ http {
             cache_turbo_cache_control     respect;   # respect | honor (take TTL from response CC/Expires) | ignore (discard response CC)
             cache_turbo_background_update on;        # SWR + stale-if-error (off = inline regen)
             cache_turbo_keep_stale        off;       # off | <time> | forever — serve stale when origin is down
+          # cache_turbo_use_stale       http_404 http_429;  # which statuses count as "down". Omitted = the default, ANY 5xx.
+                                                           # ⚠ naming tokens REPLACES the default, it does not add to it:
+                                                           # listing the four 5xx tokens drops 501/505/507/... coverage.
             cache_turbo_max_size          1m;        # don't cache bodies bigger than this
 
             # ── dogpile / admission control ─────────────────────────────
@@ -1490,6 +1530,7 @@ http {
 | `cache_turbo_cache_control respect\|honor\|ignore` | `server`, `location` | `respect` | How the response `Cache-Control` is treated. **respect** (default): it gates storage and reshapes the stale window as written; the fresh TTL comes from `cache_turbo_valid`. **honor**: also take the fresh TTL from the response's own freshness headers, in RFC 9213 precedence order — `Surrogate-Control: max-age` (Fastly/Akamai) > `CDN-Cache-Control: s-maxage`/`max-age` (Cloudflare) > `Cache-Control: s-maxage`/`max-age` > `Expires` — falling back to `cache_turbo_valid` when none is present. The two **targeted** headers let an origin hand this shared cache a different TTL than the browser's `Cache-Control`; a targeted `no-store`/`private`/`max-age=0` also vetoes storage, and both targeted headers are stripped before store so they never replay downstream (see [Behind a CDN / multi-tier caching](#behind-a-cdn--multi-tier-caching)). **ignore**: discard the response `Cache-Control` **entirely** (mirror of nginx's `proxy_ignore_headers Cache-Control`) — `no-store`/`no-cache`/`private`/`max-age=0`/`s-maxage=0` no longer forbid storage, `must-revalidate`/`proxy-revalidate`/`stale-while-revalidate=N`/`stale-if-error=N` no longer reshape the window (it stays `cache_turbo_valid` × `cache_turbo_stale_mult`), and the TTL comes from `cache_turbo_valid`; use it for an origin that blankets shareable pages with `max-age=0, must-revalidate`. The `Set-Cookie` and request-`Authorization` safety floors are **not** affected by any mode — a per-user response is still never cached. A CMS preset (`cache_turbo_backend`) defaults this to `honor`. |
 | `cache_turbo_background_update on` / `off` | `server`, `location` | `on` | The stale-while-revalidate behaviour. **On** (default): a stale page is served *immediately* while one request quietly refreshes it in the background — **nobody waits on the backend**, and if that refresh hits a 5xx/timeout the old copy is left untouched and keeps being served (**stale-if-error**). **Off**: the chosen refresher regenerates inline (it waits for the backend and serves the fresh body), the pre-SWR behaviour. |
 | `cache_turbo_keep_stale off` \| `<time>` \| `forever` | `server`, `location` | `off` | Origin-independent last-resort retention. When a cached entry has fully expired and the origin is DOWN, serve the stale copy if the `cache_turbo_keep_stale` window covers the request. Default `off`: no grace window, errors surface normally. `<time>` (e.g. `6h`): serve stale for up to that long, clamped to the module's internal TTL ceiling. `forever`: never give up the stale copy. Argument forms: a bare `0` is also `off` (unlike `cache_turbo_valid 0`, which means cache forever — note this! A bare `0` here is deliberately the OPPOSITE.) **Precedence (decision D-1):** a honored response `stale-if-error` (RFC 5861) **wins outright** over `cache_turbo_keep_stale` — it is not a `max()` of the two. `cache_turbo_cache_control ignore` does **not** disable `cache_turbo_keep_stale`; it makes the *upstream* `Cache-Control` inert, but `keep_stale` is *operator* configuration. A honored `must-revalidate` from the response DOES suppress `keep_stale` — `must-revalidate` forbids any stale serve at all, `stale-if-error` included. |
+| `cache_turbo_use_stale off` \| `error` \| `timeout` \| `http_403` \| `http_404` \| `http_429` \| `http_500` \| `http_502` \| `http_503` \| `http_504` ... | `server`, `location` | every 5xx | Which upstream statuses count as "the origin is down" and so may be answered from a stale cached copy. Multiple tokens may be listed in one directive. The default is every 5xx (including ones no token names, e.g. 501, 505, 507, 508, 510, 511), so omitting the directive keeps the pre-existing behaviour byte-for-byte. ⚠ **Naming any token REPLACES that default rather than extending it** — `cache_turbo_use_stale http_500 http_502 http_503 http_504` reads like the default written out, but it is strictly narrower, because the unnamed 5xx statuses are covered by an internal `ANY_5XX` bit that no token can set. `off` disables serve-on-error entirely and is only accepted on its own — listing it alongside any other token is a config error. This selects the TRIGGER; the retention WINDOW still comes from a response `stale-if-error` or from `cache_turbo_keep_stale`, so a status named here is only served stale while such a window is open. ⚠ **`error` and `timeout` are not nginx-equivalent here.** In `proxy_cache_use_stale` they are communication-failure classes (`error` = the connection failed, as opposed to an upstream that really answered 502). This module triggers in the response header filter, which sees only the final status, so a refused connection and a genuine 502 are indistinguishable at that point: `error` behaves as `http_502` and `timeout` as `http_504`. The tokens exist so the configuration vocabulary matches nginx's, and they carry their own bits so a future trigger site with access to upstream state can honour the distinction without a config break. |
 | `cache_turbo_autotune on` | `server`, `location` | `off` | Adapt to live backend load. Auto-picks `beta` from the measured regen latency (clamped to the preset's band) **and**, under sustained load, widens two knobs by a load factor (≤4×): the **serveable stale window** (serve stale longer before a hard miss) and the **single-flight `lock_ttl`** (collapse more requests onto one regen). The **fresh** TTL is never touched — the freshness contract you set is unchanged; only the best-effort stale grace and dogpile window stretch, and they snap back the first quiet window. Recomputes on a fixed 30s cadence. See [What autotune does](#what-autotune-actually-tunes). |
 | `cache_turbo_redis DSN [opts...]` | `http`, `server`, `location` | — | Add a shared **L2 Redis** tier. `DSN` is `redis://[user:pass@]host:port/db` (or bare `host:port`); `rediss://` = TLS. Write-through on store; one sync `GET` on an L1 miss (never on an L1 hit). Opts: `prefix=` (`ct:`, must be non-empty), `timeout=` (`250ms`), `password=`, `user=`, `db=`, `tls=on\|off`, `tls_verify=on\|off` (default on), `tls_ca=<file>`, `tls_name=<host>`, `keepalive=N` (idle conns to pool per worker, `0`=off), `keepalive_timeout=` (`60s`). Pooled conns are reused only within the same db/credentials/TLS context. **`keepalive=`/`keepalive_timeout=` are honoured per connection profile — each distinct backend gets its own per-worker pool sized from its own location (soft cap 16 profiles/worker).** Native client, no hiredis. |
 | `cache_turbo_memcached HOST:PORT [opts...]` | `http`, `server`, `location` | — | Add a shared **L2 memcached** tier (alternative to `cache_turbo_redis`, mutually exclusive with it). Write-through on store; one sync `get` on an L1 miss. Opts: `prefix=` (`ct:`), `timeout=` (`250ms`), `keepalive=N` (idle conns to pool per worker, `0`=off), `keepalive_timeout=` (`60s`). Pooled conns are keyed by peer address (memcached has no db/credentials/TLS) and only re-pooled when the previous reply framed cleanly at a boundary. No tags / `?all` / cross-node lock (memcached lacks sorted sets, `SCAN`, atomic `SET-NX`); 1 MiB value cap. Native client, no libmemcached. |

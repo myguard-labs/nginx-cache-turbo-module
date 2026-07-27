@@ -6166,6 +6166,61 @@ ngx_http_cache_turbo_sie_rewrite(ngx_http_request_t *r,
 }
 
 
+/* S4.2: does `status` trigger a stale serve under the configured use_stale mask?
+ *
+ * The mask is the operator's `cache_turbo_use_stale` set (S4.1); the default
+ * (USE_STALE_DEFAULT) reproduces the pre-S4.2 hardcoded "every 5xx" condition
+ * byte-for-byte via the four named 5xx bits plus ANY_5XX.
+ *
+ * ERROR/TIMEOUT are folded onto 502/504 here, NOT honoured as distinct
+ * conditions: this site sees only r->headers_out.status, so a refused
+ * connection and a genuine upstream 502 are the same value by the time we run
+ * (see the USE_STALE_* comment block in the header for why the bits stay
+ * separate anyway). Do not "fix" this into a distinction without first giving
+ * the trigger access to upstream provenance.
+ */
+static ngx_uint_t
+ngx_http_cache_turbo_use_stale_triggers(ngx_uint_t mask, ngx_uint_t status)
+{
+    ngx_uint_t  bit;
+
+    switch (status) {
+    case NGX_HTTP_FORBIDDEN:
+        bit = NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_403;
+        break;
+    case NGX_HTTP_NOT_FOUND:
+        bit = NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_404;
+        break;
+    case 429:
+        bit = NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_429;
+        break;
+    case NGX_HTTP_INTERNAL_SERVER_ERROR:
+        bit = NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_500;
+        break;
+    case NGX_HTTP_BAD_GATEWAY:
+        bit = NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_502
+              | NGX_HTTP_CACHE_TURBO_USE_STALE_ERROR;
+        break;
+    case NGX_HTTP_SERVICE_UNAVAILABLE:
+        bit = NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_503;
+        break;
+    case NGX_HTTP_GATEWAY_TIME_OUT:
+        bit = NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_504
+              | NGX_HTTP_CACHE_TURBO_USE_STALE_TIMEOUT;
+        break;
+    default:
+        /* Every other 5xx (506, 507, 508, 510, 511, ...) is covered only by
+         * ANY_5XX, which the default sets and no config token can set alone. */
+        bit = (status >= NGX_HTTP_INTERNAL_SERVER_ERROR && status <= 599)
+              ? NGX_HTTP_CACHE_TURBO_USE_STALE_ANY_5XX
+              : 0;
+        break;
+    }
+
+    return (mask & bit) != 0;
+}
+
+
 static ngx_int_t
 ngx_http_cache_turbo_header_filter(ngx_http_request_t *r)
 {
@@ -6179,13 +6234,16 @@ ngx_http_cache_turbo_header_filter(ngx_http_request_t *r)
         return ngx_http_next_header_filter(r);
     }
 
-    /* RFC-2 stale-if-error: an armed serve-on-error snapshot + an origin 5xx means
-     * replace the error with the stale copy. Do this BEFORE the capture gate so
-     * the (replaced) error is never captured, and clear any cold-miss stub we own
-     * so waiters do not block on a key we will not store. */
+    clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
+
+    /* RFC-2 stale-if-error: an armed serve-on-error snapshot + a status the
+     * configured `cache_turbo_use_stale` set names means replace the error with
+     * the stale copy. Do this BEFORE the capture gate so the (replaced) error is
+     * never captured, and clear any cold-miss stub we own so waiters do not
+     * block on a key we will not store. */
     if (ctx->sie_armed && !ctx->sie_serving
-        && r->headers_out.status >= NGX_HTTP_INTERNAL_SERVER_ERROR
-        && r->headers_out.status <= 599)
+        && ngx_http_cache_turbo_use_stale_triggers(clcf->use_stale,
+                                                   r->headers_out.status))
     {
         rc = ngx_http_cache_turbo_sie_rewrite(r, ctx);
         if (rc == NGX_ERROR) {
@@ -6210,8 +6268,6 @@ ngx_http_cache_turbo_header_filter(ngx_http_request_t *r)
             return ngx_http_next_header_filter(r);
         }
     }
-
-    clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
 
     /* auto-Vary (v11 other half): classify the response Vary header once. bits =
      * the safe-axis bitmask the body filter folds into the variant key + marker;
