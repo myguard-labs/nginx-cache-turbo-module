@@ -9057,6 +9057,78 @@ def test_l2_negative_ttl_rejects_out_of_range(ng: Nginx) -> None:
             (f"cache_turbo_l2_negative_ttl {good} (legal) was rejected:\n{r.stdout}")
 
 
+def test_keep_stale_config_parse(ng: Nginx) -> None:
+    """S2.1: cache_turbo_keep_stale <off|time|forever> -- PARSER ONLY, no
+    runtime read yet (that is S2.2). Cover every accept/reject arm named in
+    the plan: off, a plain time, forever, an invalid token, and a duplicate
+    directive in one block. The negative control for each reject case is the
+    literal expected diagnostic string, not merely a nonzero exit -- nginx -t
+    failing for the WRONG reason would pass a bare-returncode assertion."""
+    anchor = "cache_turbo_valid 30s;"
+    assert anchor in nginx_config(
+        ng.root, ng.port, ng.module, ng.origin_port, 1), \
+        f"test fixture missing anchor {anchor!r}"
+
+    # accept: off (the default spelling)
+    r = _config_test_result(
+        ng, lambda c: c.replace(
+            anchor, anchor + "\n            cache_turbo_keep_stale off;", 1))
+    assert r.returncode == 0, \
+        f"cache_turbo_keep_stale off was rejected:\n{r.stdout}"
+
+    # accept: bare 0 as a synonym for off (NOT forever -- see handler comment)
+    r = _config_test_result(
+        ng, lambda c: c.replace(
+            anchor, anchor + "\n            cache_turbo_keep_stale 0;", 1))
+    assert r.returncode == 0, \
+        f"cache_turbo_keep_stale 0 was rejected:\n{r.stdout}"
+
+    # accept: a plain time value
+    r = _config_test_result(
+        ng, lambda c: c.replace(
+            anchor, anchor + "\n            cache_turbo_keep_stale 1h;", 1))
+    assert r.returncode == 0, \
+        f"cache_turbo_keep_stale 1h was rejected:\n{r.stdout}"
+
+    # accept: forever
+    r = _config_test_result(
+        ng, lambda c: c.replace(
+            anchor, anchor + "\n            cache_turbo_keep_stale forever;",
+            1))
+    assert r.returncode == 0, \
+        f"cache_turbo_keep_stale forever was rejected:\n{r.stdout}"
+
+    # reject: invalid token (neither off/forever nor a parseable time)
+    r = _config_test_result(
+        ng, lambda c: c.replace(
+            anchor, anchor + "\n            cache_turbo_keep_stale bogus;",
+            1))
+    assert r.returncode != 0, \
+        f"cache_turbo_keep_stale bogus was accepted by nginx -t:\n{r.stdout}"
+    assert "bad value" in r.stdout, \
+        f"missing/odd bad-value diagnostic:\n{r.stdout}"
+
+    # reject: duplicate directive in the same block
+    r = _config_test_result(
+        ng, lambda c: c.replace(
+            anchor,
+            anchor
+            + "\n            cache_turbo_keep_stale 1h;"
+              "\n            cache_turbo_keep_stale 2h;",
+            1))
+    assert r.returncode != 0, \
+        f"duplicate cache_turbo_keep_stale was accepted:\n{r.stdout}"
+    assert "is duplicate" in r.stdout, \
+        f"missing duplicate diagnostic:\n{r.stdout}"
+
+    # negative control: the pristine (unmutated) config must still pass, or
+    # every reject arm above is vacuous (a config broken for an unrelated
+    # reason fails all of them regardless of this directive).
+    r = _config_test_result(ng, lambda c: c)
+    assert r.returncode == 0, \
+        f"pristine config (no mutation) failed nginx -t:\n{r.stdout}"
+
+
 def test_lru_eviction(ng: Nginx) -> None:
     """R6: with a tiny zone, old entries are evicted, not 500s."""
     # hammer many distinct keys through the tiny zone; must all 200, no errors
@@ -12013,6 +12085,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_backend_prefix_rejected(ng)
     test_keepalive_cap_rejected(ng)
     test_s8_scan_resistant_config_rejects(ng)
+    test_keep_stale_config_parse(ng)                        # S2.1
     test_memcached_keepalive_invalid_rejected(ng)
     test_memcached_keepalive_cap_rejected(ng)
     test_memcached_keepalive_timeout_invalid_rejected(ng)
