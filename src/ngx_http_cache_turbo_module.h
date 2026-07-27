@@ -84,6 +84,21 @@
  * idle L2 conns/worker is already absurd; reject anything larger at parse. */
 #define NGX_HTTP_CACHE_TURBO_KEEPALIVE_MAX  65535
 
+/* cache_turbo_keep_stale <off|time|forever> (S2.1, parser only -- S2.2 wires
+ * the read side). Origin-independent last-resort stale retention: when a
+ * response carries no `stale-if-error` window of its own, S2.2 will use this
+ * as the effective stale-if-error window instead of leaving the object with
+ * no fallback at all. `off` (0) is the default and reproduces today's
+ * behaviour exactly -- nothing here is read yet.
+ *
+ * No separate MIN/MAX pair: this directive shares the module-wide
+ * NGX_HTTP_CACHE_TURBO_TTL_MAX ceiling above (the same uint32-wire-format
+ * bound that clamps every other TTL that can reach the L2 blob), because a
+ * kept-stale window is stored and clamped exactly like any other TTL once
+ * S2.2 starts reading it -- there is no reason for this one knob to carry a
+ * tighter, bespoke ceiling the way l2_negative_ttl does (that ceiling exists
+ * because THAT memo has no invalidation channel; this window does). */
+
 /* Upper bound on the cache_turbo_redis database index, accepted both as the
  * `db=N` param and as the `/N` DSN suffix. Redis ships `databases 16`, i.e.
  * indices 0..15; a larger value passes parse but makes every L2 op fail at
@@ -828,6 +843,15 @@ typedef struct {
      * serve. Keep N at a few seconds (the stampede it collapses is shorter than
      * that) and leave it off unless L2 misses dominate the miss path. */
     time_t                   l2_negative_ttl;
+
+    /* cache_turbo_keep_stale <off|time|forever> (S2.1). Parser-only for now --
+     * NOT read on any request path yet (that lands in S2.2). 0 = OFF (the
+     * default, today's behaviour unchanged); NGX_HTTP_CACHE_TURBO_FOREVER_TTL
+     * for the `forever` keyword; otherwise the parsed+clamped seconds value.
+     * Deliberately NOT a synonym for cache_turbo_valid's "0 = forever"
+     * convention -- see the doc comment on the handler for why a bare 0 here
+     * means off, not forever. */
+    time_t                   keep_stale;
 
     /* L2 Redis (v2b). Native async client, no hiredis. The L2 store is touched
      * only on an L1 miss (sync GET) and on store (async write-through); it is

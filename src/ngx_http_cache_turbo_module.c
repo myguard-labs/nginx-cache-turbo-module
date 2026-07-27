@@ -93,6 +93,8 @@ static char *ngx_http_cache_turbo_scan_resistant(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 static char *ngx_http_cache_turbo_l2_negative_ttl(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
+static char *ngx_http_cache_turbo_keep_stale(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
 static char *ngx_http_cache_turbo_preset(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static ngx_int_t ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r);
@@ -326,6 +328,13 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
     { ngx_string("cache_turbo_l2_negative_ttl"),
       NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
       ngx_http_cache_turbo_l2_negative_ttl,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+
+    { ngx_string("cache_turbo_keep_stale"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
+      ngx_http_cache_turbo_keep_stale,
       NGX_HTTP_LOC_CONF_OFFSET,
       0,
       NULL },
@@ -7884,6 +7893,78 @@ ngx_http_cache_turbo_l2_negative_ttl(ngx_conf_t *cf, ngx_command_t *cmd,
 }
 
 
+/* cache_turbo_keep_stale <off|time|forever> (S2.1). PARSER ONLY -- nothing
+ * reads clcf->keep_stale yet (that is S2.2). Origin-independent last-resort
+ * retention: when a response carries no `stale-if-error` window of its own,
+ * S2.2 will use this value as the effective stale-if-error window instead of
+ * leaving the object with no fallback.
+ *
+ * Argument forms:
+ *   off      -> 0 (the default; today's behaviour, unchanged)
+ *   forever  -> NGX_HTTP_CACHE_TURBO_FOREVER_TTL
+ *   <time>   -> ngx_parse_time(..., 1), clamped to NGX_HTTP_CACHE_TURBO_TTL_MAX
+ *
+ * A bare "0" is accepted as a synonym for `off`, NOT for "forever" --
+ * ngx_parse_time("0", 1) already returns 0 with no error, so this falls out
+ * naturally rather than needing a special case. This is a DELIBERATE
+ * departure from cache_turbo_valid's contract, where `cache_turbo_valid 0`
+ * means "cache forever" (see the FOREVER_TTL resolution above
+ * ngx_http_cache_turbo_valid_conf). The two directives read the same digit
+ * with opposite meaning: cache_turbo_valid's forever-TTL and this directive's
+ * off both had to spell as "reset the field to a value that switches the
+ * feature off"; but cache_turbo_valid's field can never mean "no TTL" (a
+ * cached object always has SOME fresh window), so 0 there was repurposed as
+ * an alias for forever. keep_stale, by contrast, has an honest OFF state (no
+ * last-resort retention at all), and OFF is what an operator who writes a
+ * bare 0 -- or omits the directive -- means. Do not "fix" this to match
+ * cache_turbo_valid; a future reader who reconciles the two will silently
+ * turn every un-configured location into permanent stale retention. */
+static char *
+ngx_http_cache_turbo_keep_stale(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf)
+{
+    ngx_http_cache_turbo_loc_conf_t  *clcf = conf;
+
+    ngx_str_t  *value = cf->args->elts;
+    time_t      t;
+
+    if (clcf->keep_stale != NGX_CONF_UNSET) {
+        return "is duplicate";
+    }
+
+    if (value[1].len == 3 && ngx_strncmp(value[1].data, "off", 3) == 0) {
+        clcf->keep_stale = 0;
+        return NGX_CONF_OK;
+    }
+
+    if (value[1].len == 7 && ngx_strncmp(value[1].data, "forever", 7) == 0) {
+        clcf->keep_stale = NGX_HTTP_CACHE_TURBO_FOREVER_TTL;
+        return NGX_CONF_OK;
+    }
+
+    t = ngx_parse_time(&value[1], 1);   /* seconds, matches cache_turbo_valid */
+    if (t == (time_t) NGX_ERROR) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "cache_turbo_keep_stale: bad value \"%V\"", &value[1]);
+        return NGX_CONF_ERROR;
+    }
+
+    /* Clamp rather than reject (matches the store path's own TTL_MAX clamp,
+     * see the header comment on NGX_HTTP_CACHE_TURBO_TTL_MAX): an operator
+     * writing an oversized-but-well-formed time is asking for "as long as
+     * possible", not making a typo the way an out-of-range l2_negative_ttl
+     * is -- there is no bounded-blindness cost here to make a large value a
+     * footgun, only a wire-format ceiling. */
+    if (t > NGX_HTTP_CACHE_TURBO_TTL_MAX) {
+        t = NGX_HTTP_CACHE_TURBO_TTL_MAX;
+    }
+
+    clcf->keep_stale = t;
+
+    return NGX_CONF_OK;
+}
+
+
 /* "cache_turbo_preset micro|conservative|balanced|aggressive;" stores the enum
  * (and validates the name here, at config time). The enum only selects the band
  * of default knob values used in merge_loc_conf; an explicit knob directive
@@ -10294,6 +10375,7 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->scan_resistant_pct = (ngx_uint_t) NGX_CONF_UNSET;
     conf->min_uses = NGX_CONF_UNSET;
     conf->l2_negative_ttl = NGX_CONF_UNSET;   /* L13; merges to 0 = off */
+    conf->keep_stale = NGX_CONF_UNSET;   /* S2.1; merges to 0 = off */
     conf->max_size = NGX_CONF_UNSET_SIZE;
     conf->suppress_native = NGX_CONF_UNSET;
     conf->redis_enable = NGX_CONF_UNSET;
@@ -10417,6 +10499,12 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
      * per location rather than inherited from a preset name. Defaults to 0
      * (off) at every preset, so this is inert unless explicitly configured. */
     ngx_conf_merge_sec_value(conf->l2_negative_ttl, prev->l2_negative_ttl, 0);
+
+    /* cache_turbo_keep_stale (S2.1). Plain inherit/default-0, same shape as
+     * l2_negative_ttl above -- not a preset band column, and off unless an
+     * operator opts in. Parser only: nothing consults conf->keep_stale on any
+     * request path yet (S2.2). */
+    ngx_conf_merge_sec_value(conf->keep_stale, prev->keep_stale, 0);
 
     /* Per-status TTLs (v6): inherit the rule list if this level set none. */
     if (conf->valid_status == NULL) {
