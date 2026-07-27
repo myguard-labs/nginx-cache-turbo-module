@@ -1739,6 +1739,23 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # S3.1: a negative-cached 5xx must never overwrite a still-serveable
+        # body (cache_turbo_valid 503 1m legitimately negative-caches errors,
+        # but that must not let an error blob clobber a good 200 -- the
+        # inverse of outage resilience). Short fresh/stale window (1s / x4=4s)
+        # like /keepstale/ so the entry goes stale quickly; the 503 negative
+        # cache rule is what a "cache negative responses too" config looks
+        # like. Drives test_5xx_never_overwrites_cached_body.
+        location /noclobber/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    1s;
+            cache_turbo_valid    503 1m;
+            cache_turbo_background_update off;
+            cache_turbo_beta     100000;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # S2.3: no-reaper contract. keep_stale is a generous 1h -- an entry
         # here is way inside its keep-stale window at every point this test
         # checks it, so if the entry ever disappears on its own that proves a
@@ -8560,6 +8577,70 @@ def test_keep_stale_loses_to_response_sie(ng: Nginx, origin: Origin) -> None:
         drain_origin(origin)
 
 
+def test_5xx_never_overwrites_cached_body(ng: Nginx, origin: Origin) -> None:
+    """O6/S3.1: a legitimate negative-cache rule (cache_turbo_valid 503 1m)
+    must never let an error blob overwrite a still-serveable good body -- the
+    exact inverse of outage resilience. /noclobber/ has a 1s fresh TTL (x4 =
+    4s stale window) plus `cache_turbo_valid 503 1m`, `background_update off`
+    (the dice-winning reader regenerates INLINE/synchronously instead of
+    firing a background subrequest -- deterministic, no async race to wait
+    out) and a cranked `cache_turbo_beta 100000` so the very first stale-path
+    request wins the refresh dice for certain (threshold saturates to
+    guaranteed almost immediately after fresh_until, see
+    ngx_http_cache_turbo_should_refresh's elapsed_frac*beta model).
+
+    Sequence: warm with a 200, sleep past fresh_until (1s) but well inside
+    the stale window (4s) -- entry is stale-but-serveable, exactly the case
+    the guard predicate's `now < stale_until` branch protects. The dice
+    winner goes straight to origin inline; origin answers a clean 503 (NOT
+    origin.drop -- that is a transport-level 502, a different code path).
+    That 503 is what `cache_turbo_valid 503 1m` would normally negative-cache
+    -- clobbering the good entry without the guard. A second request right
+    after must still see the ORIGINAL 200 body from cache. Once the origin
+    recovers a 200 must still be served, though NOT necessarily the original
+    body: the entry is past fresh_until, so a healthy refresh may legitimately
+    replace it (the guard blocks ERROR stores, it does not freeze good ones)."""
+    s0, b0, _ = fetch(ng.port, "/noclobber/x")
+    assert s0 == 200 and b0, f"prime failed: {s0} {b0!r}"
+
+    time.sleep(2.5)     # past fresh (1s), well inside stale window (fresh+4=5s)
+    origin.fail = True
+    try:
+        # The stale-but-serveable dice winner regenerates inline (background_
+        # update off) and gets the origin's 503 back. Without the guard this
+        # STORES the 503 into L1, clobbering the good body.
+        s1, _, _ = fetch(ng.port, "/noclobber/x")
+        assert s1 == 503, f"expected the origin's 503 to pass through, got {s1}"
+
+        # THE DISCRIMINATING ASSERTION: a second request right after must
+        # still see the ORIGINAL 200 body, not a cached 503. If the guard is
+        # missing/disabled, the first request's 503 got stored and this
+        # request is served straight from cache as a 503 with no body match.
+        s2, b2, _ = fetch(ng.port, "/noclobber/x")
+        assert s2 == 200, (
+            f"second stale-path request got {s2}, expected 200 -- the prior "
+            "503 was allowed to overwrite the cached body"
+        )
+        assert b2 == b0, f"served {b2!r}, expected original body {b0!r}"
+    finally:
+        origin.fail = False
+        drain_origin(origin)
+
+    # After the origin recovers, a 200 must be served -- either the retained
+    # original or a fresh regeneration.
+    #
+    # ⚠ Deliberately NOT `b3 == b0`. The entry is past fresh_until, so once the
+    # origin is healthy again a refresh legitimately stores a NEW body: that is
+    # the cache working, not the guard failing. Asserting the original body
+    # survives recovery would demand the entry never refresh again, and the
+    # assertion DID fail that way (`gen-5356` != `gen-5354`) while the guard
+    # itself was working correctly. The guard's contract is "an ERROR must not
+    # replace a good body", never "a good body is frozen".
+    s3, b3, _ = fetch(ng.port, "/noclobber/x")
+    assert s3 == 200, f"post-recovery request got {s3}, expected 200"
+    assert b3, "post-recovery served an empty body"
+
+
 def test_keep_stale_no_reaper_lru_only_reclaim(ng: Nginx, origin: Origin) -> None:
     """S2.3 CONTRACT: an L1 node past its stale deadline but still inside its
     cache_turbo_keep_stale window is reclaimed ONLY by LRU/max_size pressure --
@@ -12450,6 +12531,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_keep_stale_serves_dead_origin(ng, origin)          # S2.2 keep_stale fallback
     test_keep_stale_loses_to_response_sie(ng, origin)       # S2.2 / D-1 precedence
     test_keep_stale_no_reaper_lru_only_reclaim(ng, origin)  # S2.3 no-reaper contract
+    test_5xx_never_overwrites_cached_body(ng, origin)       # O6/S3.1 5xx-never-clobbers
     test_background_update_off_regenerates_inline(ng, origin)
     test_normalize_arg_order(ng, origin)
     test_normalize_strips_tracking(ng, origin)
