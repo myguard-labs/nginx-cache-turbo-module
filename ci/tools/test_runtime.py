@@ -8631,6 +8631,13 @@ def test_use_stale_http_404(ng: Nginx, origin: Origin) -> None:
         assert h.get("x-cache") == "STALE-IF-ERROR", \
             f"expected STALE-IF-ERROR, got x-cache={h.get('x-cache')}"
 
+        # A stale serve fires a background refresh subrequest, which hits the
+        # (still failing) origin asynchronously. Settle it before the next
+        # request: otherwise the following fetch races that in-flight refresh on
+        # the shared keepalive connection and can time out rather than fail an
+        # assertion. Same reason the keep_stale tests drain before returning.
+        drain_origin(origin)
+
         # 2. an unnamed status does NOT trigger, even though it is a 5xx and
         #    would have triggered under the pre-S4.2 hardcoded condition.
         origin.fail_status = 503
@@ -8690,6 +8697,10 @@ def test_use_stale_any_5xx_bit(ng: Nginx, origin: Origin) -> None:
         assert b == b0, f"served {b!r}, expected stale {b0!r}"
         assert h.get("x-cache") == "STALE-IF-ERROR", \
             f"expected STALE-IF-ERROR, got x-cache={h.get('x-cache')}"
+
+        # Stale serve -> background refresh against the failing origin; settle
+        # it before the next request (see test_use_stale_http_404).
+        drain_origin(origin)
 
         s2, _, h2 = fetch(ng.port, "/usestale500/y")
         assert s2 == 507, \
@@ -8760,6 +8771,9 @@ def test_use_stale_403_429(ng: Nginx, origin: Origin) -> None:
             assert b == b0, f"served {b!r} on a {status}, expected stale {b0!r}"
             assert h.get("x-cache") == "STALE-IF-ERROR", \
                 f"expected STALE-IF-ERROR on {status}, got x-cache={h.get('x-cache')}"
+            # Settle the background refresh this serve fired before the next
+            # iteration reuses the connection (see test_use_stale_http_404).
+            drain_origin(origin)
 
         # A 5xx is NOT in this mask, even though the default covers it.
         origin.fail_status = 503
