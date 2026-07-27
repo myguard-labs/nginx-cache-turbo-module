@@ -7938,7 +7938,8 @@ ngx_http_cache_turbo_l2_negative_ttl(ngx_conf_t *cf, ngx_command_t *cmd,
  * S2.2 will use this value as the effective stale-if-error window instead of
  * leaving the object with no fallback.
  *
- * cache_turbo_ignore_cc does NOT suppress this directive (decision D-1). Every
+ * cache_turbo_cache_control ignore does NOT suppress this directive (decision
+ * D-1; clcf->ignore_cc is the internal flag it sets). Every
  * !clcf->ignore_cc gate in the store path guards a RESPONSE-derived value --
  * upstream max-age, stale-while-revalidate, must-revalidate, stale-if-error --
  * because ignore_cc means "the upstream Cache-Control header is inert", not

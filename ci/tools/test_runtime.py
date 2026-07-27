@@ -8575,13 +8575,21 @@ def test_keep_stale_no_reaper_lru_only_reclaim(ng: Nginx, origin: Origin) -> Non
     and cache_turbo_keep_stale 1h, so an entry is fresh for ~1s and then sits
     deep inside a 3600s keep-stale window for the rest of this test.
 
-    Phase 1 (discriminates "no reaper"): prime one key, let it go stale, wait
-    past the stale deadline with NOTHING else touching the zone, then kill the
-    origin and confirm the key still serves a stale 200. If a time-based
-    reaper existed, this key -- sitting untouched, past stale_until, doing
-    nothing to keep itself warm -- is exactly what it would have swept, and
-    this fetch would MISS-refill against the dead origin and return an error
-    instead of a stale 200.
+    Phase 1 (retention across an idle gap): prime one key, let it go stale,
+    wait past the stale deadline with NOTHING else touching the zone, then
+    kill the origin and confirm the key still serves a stale 200.
+
+    ⚠ SCOPE OF THIS PHASE -- do not over-trust it. The idle gap is only ~2.3s,
+    so it does NOT rule out a time-based reaper in general: any plausible
+    sweep cadence (seconds to minutes) could hide inside this window and the
+    assertion would still pass. What phase 1 actually proves is narrower and
+    still worth having -- that an expired-but-inside-keep_stale node is
+    RETAINED and SERVEABLE rather than dropped at its stale deadline, which is
+    the behaviour keep_stale exists to provide. The real evidence for the
+    no-reaper contract is the source read recorded in the first paragraph
+    (there is no ngx_add_timer sweep to find), not this sleep. Lengthening the
+    wait would buy very little and cost the suite real wall-clock; if you ever
+    need the stronger claim, assert it against the source, not the clock.
 
     Phase 2 (discriminates "LRU is what DOES reclaim it"): with the same key
     still resident, flood the same tiny zone with enough distinct keys to
@@ -8604,7 +8612,7 @@ def test_keep_stale_no_reaper_lru_only_reclaim(ng: Nginx, origin: Origin) -> Non
 
     origin.fail = True
     try:
-        s1, b1, h1 = fetch(ng.port, key)
+        s1, b1, _ = fetch(ng.port, key)
         # A time-based reaper would have removed this node already, so the
         # request would MISS, hit the dead origin, and surface an error (503)
         # instead of serving the retained stale body.
