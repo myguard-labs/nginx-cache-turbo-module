@@ -6483,6 +6483,30 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
             return ngx_http_cache_turbo_forward_body(r, in);   /* not cacheable */
         }
 
+        /* O6/S3.1: a negative-cached error (e.g. "cache_turbo_valid 503 1m")
+         * must never overwrite a body that is still worth serving -- that is
+         * the exact inverse of outage resilience. There is no pre-existing
+         * node in scope at this point in the body filter (only ctx->sie_snap,
+         * populated only when SIE was already armed at ACCESS time), so this
+         * does its own lookup under the zone mutex. Modeled on
+         * ngx_http_cache_turbo_shm_claim()'s lock/unlock discipline --
+         * shm_lookup() does not lock itself.
+         *
+         * Predicate ("holds a body worth protecting"):
+         *   kind == ENTRY && ctn->len > 0 &&
+         *   ((stale_until == 0 || now < stale_until) || now < created + sie_ttl)
+         *
+         * stale_until == 0 means FOREVER, not expired (module.c special-cases
+         * this sentinel elsewhere; a naive `now < stale_until` would invert it
+         * and skip the guard on exactly the never-expiring entries).
+         *
+         * The stale_until node field alone is NOT enough: it is derived from
+         * stale_ttl only and does not include the SIE / cache_turbo_keep_stale
+         * window, which lives in the BLOB header as sie_ttl (0 = none),
+         * relative to the blob's `created`. A body alive only via keep_stale
+         * sits past stale_until and must still be protected (D-4, answered
+         * YES 2026-07-27) -- an outage is exactly when a 5xx is most likely to
+         * arrive and clobber the one thing keep_stale exists to retain. */
         /* Honor upstream freshness (v7): let the response's own
          * Cache-Control/Expires set the fresh TTL when enabled. ignore_cc wins:
          * if the operator told us to ignore Cache-Control, the TTL is the static
@@ -6751,6 +6775,78 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
                                                   store_key);
             }
             hash = ngx_crc32_short(store_key, 32);
+
+            /* O6/S3.1: a negative-cached error (e.g. "cache_turbo_valid 503 1m")
+             * must never overwrite a body that is still worth serving -- that is
+             * the exact inverse of outage resilience. There is no pre-existing
+             * node in scope in this body filter (only ctx->sie_snap, populated
+             * only when SIE was already armed at ACCESS time), so this does its
+             * own lookup under the zone mutex. Modeled on
+             * ngx_http_cache_turbo_shm_claim()'s lock/unlock discipline --
+             * shm_lookup() does not lock itself.
+             *
+             * Predicate ("holds a body worth protecting"):
+             *   kind == ENTRY && ctn->len > 0 && (stale_until == 0
+             *                                     || now < stale_until)
+             *
+             * stale_until == 0 means FOREVER, not expired (special-cased
+             * elsewhere in this file); a naive `now < stale_until` would invert
+             * the sentinel and skip the guard on exactly the never-expiring
+             * entries.
+             *
+             * ⚠ D-4 ("does this also cover a body alive ONLY via
+             * cache_turbo_keep_stale, i.e. past stale_until?") is YES, and it is
+             * ALREADY SATISFIED UPSTREAM -- deliberately NOT by a second branch
+             * on the blob's sie_ttl here. A keep-stale-only body arms an SIE
+             * snapshot at access time (see the `sie_ttl > 0 && now < created +
+             * sie_ttl` arming test in the access handler), and the header filter
+             * then rewrites the origin's 5xx into that snapshot and sets
+             * ctx->served = 1 BEFORE the capture gate -- so the 5xx never
+             * reaches this body filter at all and there is nothing here to
+             * guard. An earlier revision of this guard did test
+             * `now < created + sie_ttl` as a fallback arm; it was UNREACHABLE
+             * (identical predicate to the arming test, evaluated on the same
+             * fields) and was removed rather than shipped as dead weight. The
+             * only way past the arming test is its ngx_pnalloc() for the
+             * snapshot failing under memory pressure -- not worth a branch.
+             * Do not "restore" the sie_ttl arm without first writing a test
+             * that reaches it.
+             *
+             * ⚠ This MUST run here, not earlier: it has to probe the key this
+             * store will actually write, and `store_key` only diverges from
+             * ctx->key_hash above (auto-Vary variant relocation). Probing
+             * ctx->key_hash instead would check the BASE key while the store
+             * overwrites the VARIANT -- protecting on an unrelated body and
+             * still clobbering the variant this guard exists to save. */
+            if (r->headers_out.status >= NGX_HTTP_INTERNAL_SERVER_ERROR) {
+                ngx_http_cache_turbo_node_t      *gctn;
+                ngx_int_t                         protect = 0;
+
+                ngx_shmtx_lock(&z->shpool->mutex);
+
+                gctn = ngx_http_cache_turbo_shm_lookup(z, store_key, hash);
+
+                if (gctn != NULL
+                    && gctn->kind == NGX_HTTP_CACHE_TURBO_NODE_ENTRY
+                    && gctn->len > 0)
+                {
+                    time_t  gnow = ngx_time();
+
+                    if (gctn->stale_until == 0 || gnow < gctn->stale_until) {
+                        protect = 1;
+                    }
+                }
+
+                ngx_shmtx_unlock(&z->shpool->mutex);
+
+                if (protect) {
+                    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                                   "cache_turbo: refusing to overwrite cached "
+                                   "body \"%V\" with error status=%ui",
+                                   &r->uri, r->headers_out.status);
+                    return ngx_http_cache_turbo_forward_body(r, in);
+                }
+            }
 
             /* If we relocated the key away from the base (cold-miss winner that
              * only learned the Vary now), the cold-miss stub the access handler
