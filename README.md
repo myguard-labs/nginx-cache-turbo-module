@@ -99,6 +99,11 @@ answers:
   box*. Touched only on an L1 **miss** (one `GET`) and on store (async
   write-through) — never on an L1 hit. So one box warming a page warms the whole
   fleet, and a restarted box refills from Redis instead of stampeding the origin.
+  The L2 key — and every purge index that points at it (variant index, tag index)
+  — is kept for the **full retention window**, `max(stale window, stale-if-error
+  window)`, so an entry that is still serveable stays purgeable for exactly as
+  long. (An index that expired before its object would leave content that is
+  still served but that a purge can no longer find.)
 - **origin — your backend.** Reached only when both L1 and L2 miss. SWR + the
   single-flight lock (and the cross-node Redis lock) keep origin hits to roughly
   one per stale cycle even under a stampede.
