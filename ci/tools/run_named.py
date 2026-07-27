@@ -54,6 +54,8 @@ EXTEND
     nothing needs touching when tests are added. To support a new fixture
     argument, add it to FIXTURES below.
 """
+import argparse
+import io
 import inspect
 import pathlib
 import sys
@@ -66,10 +68,57 @@ sys.path.insert(0, str(HERE))
 import test_runtime as T  # noqa: E402
 
 
+def _valueless_flags() -> set:
+    """Option strings of test_runtime's flags that take NO value.
+
+    Read from test_runtime's own parser declarations instead of being
+    duplicated here, so adding a `store_true` flag there cannot silently
+    desynchronise this tool's argv splitting. test_runtime builds its parser
+    inside parse_args(), so we call it with add_argument() intercepted and
+    argv emptied; the required= flags would otherwise abort the process.
+    """
+    captured: set = set()
+    real_add = argparse.ArgumentParser.add_argument
+
+    def spy(self, *args, **kwargs):
+        action = real_add(self, *args, **kwargs)
+        if action.nargs == 0:
+            captured.update(action.option_strings)
+        return action
+
+    argparse.ArgumentParser.add_argument = spy
+    saved_argv, saved_stderr = sys.argv, sys.stderr
+    sys.argv = [saved_argv[0]]
+    try:
+        # argparse prints its usage block to stderr before raising; that is
+        # noise here, not a diagnostic the caller should see.
+        sys.stderr = io.StringIO()
+        T.parse_args()
+    except SystemExit:
+        # Expected: --nginx-binary is required and absent under the empty argv.
+        pass
+    finally:
+        argparse.ArgumentParser.add_argument = real_add
+        sys.argv, sys.stderr = saved_argv, saved_stderr
+
+    return captured
+
+
 def main() -> int:
     # Split our positional test names off argv before test_runtime's parser
     # (which accepts no positionals) ever sees them.
-    names = [a for a in sys.argv[1:] if not a.startswith("-")]
+    #
+    # Flag arity is read from test_runtime's OWN parser rather than guessed
+    # from the shape of the next token. Assuming every flag takes a value
+    # makes a boolean flag swallow the following test name -- e.g.
+    # `run_named.py --single-process test_foo` would forward "test_foo" as
+    # the value of --single-process, leave `names` empty, and print usage.
+    # That failure is quiet enough to be misread as a test result, which is
+    # exactly the wrong thing in the tool used to prove negative controls.
+    # Deriving arity here means a future store_true flag cannot reintroduce it.
+    nargs_zero = _valueless_flags()
+
+    names = []
     passthrough = []
     argv = sys.argv[1:]
     i = 0
@@ -77,10 +126,16 @@ def main() -> int:
         a = argv[i]
         if a.startswith("-"):
             passthrough.append(a)
-            if "=" not in a and i + 1 < len(argv) and not argv[i + 1].startswith("-"):
+            if (
+                "=" not in a
+                and a not in nargs_zero
+                and i + 1 < len(argv)
+                and not argv[i + 1].startswith("-")
+            ):
                 passthrough.append(argv[i + 1])
-                names = [n for n in names if n is not argv[i + 1]]
                 i += 1
+        else:
+            names.append(a)
         i += 1
 
     if not names:

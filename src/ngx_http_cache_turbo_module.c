@@ -6484,29 +6484,13 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
         }
 
         /* O6/S3.1: a negative-cached error (e.g. "cache_turbo_valid 503 1m")
-         * must never overwrite a body that is still worth serving -- that is
-         * the exact inverse of outage resilience. There is no pre-existing
-         * node in scope at this point in the body filter (only ctx->sie_snap,
-         * populated only when SIE was already armed at ACCESS time), so this
-         * does its own lookup under the zone mutex. Modeled on
-         * ngx_http_cache_turbo_shm_claim()'s lock/unlock discipline --
-         * shm_lookup() does not lock itself.
-         *
-         * Predicate ("holds a body worth protecting"):
-         *   kind == ENTRY && ctn->len > 0 &&
-         *   ((stale_until == 0 || now < stale_until) || now < created + sie_ttl)
-         *
-         * stale_until == 0 means FOREVER, not expired (module.c special-cases
-         * this sentinel elsewhere; a naive `now < stale_until` would invert it
-         * and skip the guard on exactly the never-expiring entries).
-         *
-         * The stale_until node field alone is NOT enough: it is derived from
-         * stale_ttl only and does not include the SIE / cache_turbo_keep_stale
-         * window, which lives in the BLOB header as sie_ttl (0 = none),
-         * relative to the blob's `created`. A body alive only via keep_stale
-         * sits past stale_until and must still be protected (D-4, answered
-         * YES 2026-07-27) -- an outage is exactly when a 5xx is most likely to
-         * arrive and clobber the one thing keep_stale exists to retain. */
+         * must never overwrite a body that is still worth serving. The guard
+         * itself lives at the store site below (search "refusing to overwrite
+         * cached body"), which is the single source of truth for the predicate
+         * and why it looks the way it does -- including why the blob's sie_ttl
+         * is deliberately NOT consulted. Do not restate the predicate here; an
+         * earlier copy of it in this comment went stale the moment the
+         * implementation changed. */
         /* Honor upstream freshness (v7): let the response's own
          * Cache-Control/Expires set the fresh TTL when enabled. ignore_cc wins:
          * if the operator told us to ignore Cache-Control, the TTL is the static
