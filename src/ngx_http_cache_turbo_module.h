@@ -477,6 +477,20 @@ typedef struct {
 #define NGX_HTTP_CACHE_TURBO_SEG_PROBATION  0  /* on &sh->lru               */
 #define NGX_HTTP_CACHE_TURBO_SEG_PROTECTED  1  /* on &sh->lru_protected     */
 
+/* P6 circuit-breaker states (D-5: scope is PER-ZONE -- the shm zone is already
+ * the accounting unit for autotune and stats, and a per-upstream breaker would
+ * need new keying for no proven gain).
+ *
+ * ⚠ CLOSED == 0 is load-bearing, for the same reason NODE_ENTRY == 0 and
+ * SEG_PROBATION == 0 are: a zone that is zeroed -- at init, or by accident --
+ * must read as "breaker not tripped", which is the SAFE direction (traffic
+ * flows to origin as if the feature were off). A silent flip of these values
+ * would make a fresh zone come up OPEN and serve nothing but stale bodies and
+ * 503s until the first probe. ci/tests/unit/extract_shm.sh pins all three. */
+#define NGX_HTTP_CACHE_TURBO_BREAKER_CLOSED     0  /* origin believed healthy  */
+#define NGX_HTTP_CACHE_TURBO_BREAKER_OPEN       1  /* origin dead: do not call */
+#define NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN  2  /* one probe in flight      */
+
 /* protected_pct bounds for cache_turbo_scan_resistant (range-checked setter,
  * NOT ngx_conf_set_num_slot -- a literal 0 must be a config error, not a
  * silently-coerced default. See H5/min_uses for the trap this avoids). */
@@ -670,6 +684,37 @@ typedef struct {
     ngx_atomic_uint_t        snap_refreshes;
     ngx_atomic_uint_t        snap_cost_sum;
     ngx_atomic_uint_t        snap_cost_count;
+
+    /*
+     * P6 circuit-breaker state (O4.1). Per-zone (D-5). Mutated ONLY by
+     * ngx_http_cache_turbo_shm_breaker_state() / _record(), and ONLY through
+     * ngx_atomic_cmp_set -- deliberately NO shpool->mutex. The breaker is
+     * consulted on the request path before the origin connect, which is the
+     * hottest possible read site; taking the zone mutex there would serialise
+     * every request in the zone behind a lock whose other holders do slab
+     * allocation and rbtree surgery. Lock-free also means the breaker adds no
+     * new mutex ordering to reason about (the module already has one deadlock
+     * class from nesting shpool->mutex under itself -- see the l1->store()
+     * warning in memory issues.md), and no way for a worker killed mid-update
+     * to leave the zone wedged.
+     *
+     * The cost of that choice is that the fields are NOT mutually consistent
+     * under concurrency, so nothing may read two of them and assume they
+     * describe the same instant. Each transition is carried by a single CAS on
+     * breaker_state, and every other field is either advisory (fails,
+     * window_start) or written by the CAS winner alone (opened_at, probe_at).
+     *
+     * A reload resets all of this to CLOSED -- the shm zone is re-created. That
+     * is documented as an accepted limitation in the plan, not a bug: a reload
+     * is an operator action and re-probing the origin once afterwards is
+     * cheaper than persisting breaker state across it.
+     */
+    ngx_atomic_t             breaker_state;        /* BREAKER_* above          */
+    ngx_atomic_t             breaker_fails;        /* failures this window     */
+    ngx_atomic_t             breaker_window_start; /* epoch s, window anchor   */
+    ngx_atomic_t             breaker_opened_at;    /* epoch s the OPEN began   */
+    ngx_atomic_t             breaker_probe_at;     /* epoch s next probe is due*/
+    ngx_atomic_t             breaker_opens;        /* lifetime CLOSED→OPEN     */
 } ngx_http_cache_turbo_shctx_t;
 
 
@@ -701,6 +746,11 @@ typedef struct {
     ngx_atomic_uint_t   cost_ms;
     ngx_atomic_uint_t   autotuned_beta;
     ngx_atomic_uint_t   autotuned_load;   /* v4-4 load factor ×1000 (1000 = none) */
+    /* P6/O4.1 breaker introspection: the raw state id (rendered as a string by
+     * _breaker_state_str) and the lifetime CLOSED→OPEN trip count. Snapshotted
+     * raw -- the stats op must never call _breaker_state(), which transitions. */
+    ngx_atomic_uint_t   breaker_state;
+    ngx_atomic_uint_t   breaker_opens;
 } ngx_http_cache_turbo_stats_t;
 
 
@@ -1383,6 +1433,13 @@ ngx_int_t ngx_http_cache_turbo_shm_l2_neg_check(ngx_http_cache_turbo_zone_t *z,
     u_char *key_hash, uint32_t hash);
 void ngx_http_cache_turbo_shm_l2_neg_set(ngx_http_cache_turbo_zone_t *z,
     u_char *key_hash, uint32_t hash, time_t ttl);
+
+/* P6/O4.1 circuit breaker (per-zone, lock-free -- see the shctx field block). */
+ngx_uint_t ngx_http_cache_turbo_shm_breaker_state(
+    ngx_http_cache_turbo_zone_t *z, time_t open_for);
+void ngx_http_cache_turbo_shm_breaker_record(ngx_http_cache_turbo_zone_t *z,
+    ngx_uint_t success, ngx_uint_t threshold, time_t window);
+const char *ngx_http_cache_turbo_shm_breaker_state_str(ngx_uint_t state);
 
 
 /* ---- swr.c ---- */

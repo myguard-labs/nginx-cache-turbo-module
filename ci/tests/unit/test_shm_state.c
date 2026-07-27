@@ -78,6 +78,18 @@ typedef struct {
 #define NGX_HTTP_CACHE_TURBO_SEG_PROTECTED  1
 #define NGX_HTTP_CACHE_TURBO_PROTECTED_PCT_DEFAULT 80
 
+/* P6/O4.1 breaker states. CLOSED == 0 is load-bearing for the same reason
+ * NODE_ENTRY == 0 and SEG_PROBATION == 0 are -- a zeroed zone must read as "not
+ * tripped", the direction that sends traffic to the origin as if the feature
+ * were off. extract_shm.sh pins all three against the header. */
+#define NGX_HTTP_CACHE_TURBO_BREAKER_CLOSED     0
+#define NGX_HTTP_CACHE_TURBO_BREAKER_OPEN       1
+#define NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN  2
+
+/* ⚠ MIRRORED, not included. The trailing autotune fields of the real shctx are
+ * deliberately omitted -- no sliced function touches them. The breaker fields
+ * below ARE touched by the sliced breaker functions, so they must stay in the
+ * same relative order as the header's declaration. */
 typedef struct {
     ngx_rbtree_t        rbtree;
     ngx_rbtree_node_t   sentinel;
@@ -88,6 +100,8 @@ typedef struct {
     ngx_atomic_t        hits, misses, stale_serves, refreshes, evictions;
     ngx_atomic_t        l2_hits, l2_misses, lock_waits;
     ngx_atomic_t        min_uses_skips, l2_neg_skips, bypasses;
+    ngx_atomic_t        breaker_state, breaker_fails, breaker_window_start;
+    ngx_atomic_t        breaker_opened_at, breaker_probe_at, breaker_opens;
 } ngx_http_cache_turbo_shctx_t;
 
 typedef struct {
@@ -787,6 +801,221 @@ test_out_of_slab_fails_open(void)
     ngx_test_slab_fail_after(-1);
 }
 
+
+/* =====================================================================
+ * P6/O4.1 -- circuit-breaker state machine
+ *
+ * ⚠ Single-threaded by construction: see the ngx_atomic_cmp_set note in
+ * ngx_shim_shm.h. These tests pin the TRANSITION LOGIC (which precondition
+ * guards which edge, and that a stale precondition is a no-op). They do NOT
+ * prove the lock-free design is race-free -- that is the ASan multi-worker
+ * runtime arm's job.
+ * ===================================================================== */
+
+/* A zeroed zone must read CLOSED. This is the fail-safe direction: traffic goes
+ * to the origin exactly as if the feature were off. */
+static void
+test_breaker_zeroed_zone_is_closed(void)
+{
+    printf("breaker: a zeroed zone comes up CLOSED (fail-safe)\n");
+    zone_reset();
+
+    CHECK(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+              == NGX_HTTP_CACHE_TURBO_BREAKER_CLOSED,
+          "a zeroed zone did not read CLOSED");
+    CHECK(g_sh.breaker_opens == 0, "a zeroed zone reported prior opens");
+}
+
+
+/* threshold consecutive failures inside the window trip CLOSED -> OPEN, and not
+ * one failure earlier. */
+static void
+test_breaker_trips_at_threshold(void)
+{
+    printf("breaker: trips at the Nth failure, not the (N-1)th\n");
+    zone_reset();
+    ngx_test_set_time(1000);
+
+    ngx_http_cache_turbo_shm_breaker_record(&g_zone, 0, 3, 60);
+    ngx_http_cache_turbo_shm_breaker_record(&g_zone, 0, 3, 60);
+
+    CHECK(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+              == NGX_HTTP_CACHE_TURBO_BREAKER_CLOSED,
+          "breaker opened one failure early");
+
+    ngx_http_cache_turbo_shm_breaker_record(&g_zone, 0, 3, 60);
+
+    CHECK(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+              == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
+          "breaker did not open at the threshold");
+    CHECK(g_sh.breaker_opens == 1, "breaker_opens was not bumped on the trip");
+}
+
+
+/* The window is a ROLLING anchor: failures spread wider than `window` must
+ * re-anchor and never accumulate into an open. This is what stops a slow
+ * trickle of unrelated 5xx from tripping a healthy origin. */
+static void
+test_breaker_window_rolls(void)
+{
+    ngx_uint_t  i;
+
+    printf("breaker: failures spread past the window never accumulate\n");
+    zone_reset();
+    ngx_test_set_time(1000);
+
+    /* Ten failures, each a full window apart. Threshold is 3, so a
+     * non-rolling implementation would have opened on the third. */
+    for (i = 0; i < 10; i++) {
+        ngx_http_cache_turbo_shm_breaker_record(&g_zone, 0, 3, 60);
+        ngx_test_advance_time(61);
+    }
+
+    CHECK(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+              == NGX_HTTP_CACHE_TURBO_BREAKER_CLOSED,
+          "a trickle of failures a window apart tripped the breaker");
+    CHECK(g_sh.breaker_opens == 0, "breaker opened on a rolled window");
+}
+
+
+/* OPEN -> HALF_OPEN happens on time, and promotes EXACTLY ONE request. Every
+ * other caller keeps seeing OPEN until the probe reports back -- that single
+ * winner is what stops a herd from all probing a dead origin at once. */
+static void
+test_breaker_half_open_admits_one_probe(void)
+{
+    printf("breaker: one probe per open window, the rest stay OPEN\n");
+    zone_reset();
+    ngx_test_set_time(1000);
+
+    ngx_http_cache_turbo_shm_breaker_record(&g_zone, 0, 1, 60);
+    REQUIRE(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+                == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
+            "breaker fixture: expected OPEN after a threshold-1 failure");
+
+    /* Still inside the open window: no probe yet. */
+    ngx_test_advance_time(29);
+    CHECK(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+              == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
+          "breaker probed before the open window elapsed");
+
+    /* Window elapsed: the FIRST caller is promoted, the second is not. */
+    ngx_test_advance_time(2);
+    CHECK(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+              == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN,
+          "breaker did not promote a probe after the open window");
+    CHECK(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+              == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN,
+          "a second caller changed the HALF_OPEN verdict");
+
+    /* A failed probe returns to OPEN and re-arms a FULL window -- the next
+     * probe must wait open_for again, not fire immediately. */
+    ngx_http_cache_turbo_shm_breaker_record(&g_zone, 0, 1, 60);
+    CHECK(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+              == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
+          "a failed probe did not return the breaker to OPEN");
+
+    ngx_test_advance_time(29);
+    CHECK(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+              == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
+          "a failed probe did not re-arm the full open window");
+}
+
+
+/* A successful probe closes the breaker; open_for == 0 pins it OPEN until one
+ * arrives (no timed reopen). */
+static void
+test_breaker_probe_success_closes(void)
+{
+    printf("breaker: a successful probe closes; open_for 0 pins OPEN\n");
+    zone_reset();
+    ngx_test_set_time(1000);
+
+    ngx_http_cache_turbo_shm_breaker_record(&g_zone, 0, 1, 60);
+    ngx_test_advance_time(31);
+    REQUIRE(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+                == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN,
+            "breaker fixture: expected a promoted probe");
+
+    ngx_http_cache_turbo_shm_breaker_record(&g_zone, 1, 1, 60);
+    CHECK(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+              == NGX_HTTP_CACHE_TURBO_BREAKER_CLOSED,
+          "a successful probe did not close the breaker");
+
+    /* Having closed, the failure run must be CLEAR. Proving that needs a run
+     * long enough to cross the threshold if the old count were retained:
+     * threshold 3 with 2 failures banked before the open, then 2 after the
+     * close. Cleared -> 2 < 3, still CLOSED. Retained -> 2 + 2 >= 3, OPEN.
+     *
+     * ⚠ A SINGLE post-close failure cannot observe this (1 retained + 1 = 2,
+     * under the threshold either way) -- that formulation was tried first and
+     * passed with the bug restored. */
+    zone_reset();
+    ngx_test_set_time(1000);
+    ngx_http_cache_turbo_shm_breaker_record(&g_zone, 0, 3, 60);
+    ngx_http_cache_turbo_shm_breaker_record(&g_zone, 0, 3, 60);
+    ngx_http_cache_turbo_shm_breaker_record(&g_zone, 1, 3, 60);   /* success */
+    ngx_http_cache_turbo_shm_breaker_record(&g_zone, 0, 3, 60);
+    ngx_http_cache_turbo_shm_breaker_record(&g_zone, 0, 3, 60);
+    CHECK(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+              == NGX_HTTP_CACHE_TURBO_BREAKER_CLOSED,
+          "the failure counter survived a success");
+
+    /* open_for == 0 disables the timed reopen. */
+    zone_reset();
+    ngx_test_set_time(1000);
+    ngx_http_cache_turbo_shm_breaker_record(&g_zone, 0, 1, 60);
+    ngx_test_advance_time(100000);
+    CHECK(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 0)
+              == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
+          "open_for 0 still performed a timed reopen");
+}
+
+
+/* threshold == 0 disables tripping entirely (the off switch O4.4's default
+ * relies on). */
+static void
+test_breaker_threshold_zero_never_trips(void)
+{
+    ngx_uint_t  i;
+
+    printf("breaker: threshold 0 never trips\n");
+    zone_reset();
+    ngx_test_set_time(1000);
+
+    for (i = 0; i < 50; i++) {
+        ngx_http_cache_turbo_shm_breaker_record(&g_zone, 0, 0, 60);
+    }
+
+    CHECK(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+              == NGX_HTTP_CACHE_TURBO_BREAKER_CLOSED,
+          "threshold 0 tripped the breaker");
+    CHECK(g_sh.breaker_opens == 0, "threshold 0 recorded an open");
+}
+
+
+/* The rendered state strings are what the admin JSON exposes; an unknown id
+ * must render, not crash. */
+static void
+test_breaker_state_strings(void)
+{
+    printf("breaker: state ids render as stable strings\n");
+
+    CHECK(strcmp(ngx_http_cache_turbo_shm_breaker_state_str(
+                     NGX_HTTP_CACHE_TURBO_BREAKER_CLOSED), "closed") == 0,
+          "CLOSED did not render as \"closed\"");
+    CHECK(strcmp(ngx_http_cache_turbo_shm_breaker_state_str(
+                     NGX_HTTP_CACHE_TURBO_BREAKER_OPEN), "open") == 0,
+          "OPEN did not render as \"open\"");
+    CHECK(strcmp(ngx_http_cache_turbo_shm_breaker_state_str(
+                     NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN), "half-open") == 0,
+          "HALF_OPEN did not render as \"half-open\"");
+    CHECK(strcmp(ngx_http_cache_turbo_shm_breaker_state_str(99),
+                 "unknown") == 0,
+          "an out-of-range state did not render as \"unknown\"");
+}
+
+
 /* =====================================================================
  * NEGATIVE CONTROL
  *
@@ -843,6 +1072,81 @@ run_negative_controls(void)
         fprintf(stderr, "  ✗ CONTROL CR-B: min_uses progress survived the bug — "
                         "test_cr_b_unstub_preserves_counter guards nothing\n");
     }
+
+    /* --- P6/O4.1 breaker controls ------------------------------------- */
+
+    /* O4.1-a restored: a NON-rolling window (never re-anchor). The trickle in
+     * test_breaker_window_rolls must then accumulate and trip. */
+    zone_reset();
+    ngx_test_set_time(1000);
+    {
+        ngx_uint_t  i, fails = 0;
+
+        for (i = 0; i < 10; i++) {
+            fails++;                            /* <-- the bug: no re-anchor */
+            ngx_test_advance_time(61);
+        }
+
+        caught = (fails >= 3);
+        tests_run++;
+        if (!caught) {
+            fprintf(stderr, "  ✗ CONTROL O4.1-a: a non-rolling window did not "
+                            "reach the threshold — test_breaker_window_rolls "
+                            "guards nothing\n");
+            tests_failed++;
+        }
+    }
+
+    /* O4.1-b restored: promote on EVERY caller once the open window has
+     * elapsed (i.e. drop the single-winner CAS and just return HALF_OPEN).
+     * test_breaker_half_open_admits_one_probe's second-caller assertion is the
+     * one that must break -- so the control asserts the buggy version would
+     * hand a SECOND caller a probe. */
+    zone_reset();
+    ngx_test_set_time(1000);
+    ngx_http_cache_turbo_shm_breaker_record(&g_zone, 0, 1, 60);
+    ngx_test_advance_time(31);
+    {
+        ngx_uint_t  first, second;
+
+        /* the bug: state is reported without taking the promotion CAS, so the
+         * breaker never leaves OPEN and every caller is told to probe. */
+        first  = NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN;
+        second = (g_sh.breaker_state == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN)
+                     ? NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN
+                     : NGX_HTTP_CACHE_TURBO_BREAKER_OPEN;
+
+        caught = (first == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN
+                  && second == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN);
+        tests_run++;
+        if (!caught) {
+            fprintf(stderr, "  ✗ CONTROL O4.1-b: dropping the promotion CAS did "
+                            "not admit a second probe — the single-winner "
+                            "assertion guards nothing\n");
+            tests_failed++;
+        }
+    }
+
+    /* O4.1-c restored: a success that does NOT clear breaker_fails. The
+     * "failure counter survived a close" assertion in
+     * test_breaker_probe_success_closes must then break. */
+    zone_reset();
+    ngx_test_set_time(1000);
+    ngx_http_cache_turbo_shm_breaker_record(&g_zone, 0, 3, 60);
+    ngx_http_cache_turbo_shm_breaker_record(&g_zone, 0, 3, 60);
+    {
+        ngx_atomic_uint_t  kept = g_sh.breaker_fails;   /* <-- bug: not cleared */
+
+        /* One more failure on top of a retained run of 2 reaches threshold 3. */
+        caught = (kept + 1 >= 3);
+        tests_run++;
+        if (!caught) {
+            fprintf(stderr, "  ✗ CONTROL O4.1-c: a retained failure run did not "
+                            "reach the threshold — the post-close assertion "
+                            "guards nothing\n");
+            tests_failed++;
+        }
+    }
 }
 
 int
@@ -860,6 +1164,13 @@ main(void)
     test_count_miss_semantics();
     test_l2_neg_never_on_entry();
     test_out_of_slab_fails_open();
+    test_breaker_zeroed_zone_is_closed();
+    test_breaker_trips_at_threshold();
+    test_breaker_window_rolls();
+    test_breaker_half_open_admits_one_probe();
+    test_breaker_probe_success_closes();
+    test_breaker_threshold_zero_never_trips();
+    test_breaker_state_strings();
     run_negative_controls();
 
     /* Every node this run allocated must be accounted for. Under ASan a real
@@ -875,7 +1186,7 @@ main(void)
     printf("\n%d checks, %d failed\n", tests_run, tests_failed);
     if (tests_failed == 0) {
         printf("OK: shm node state machine (CR-A memo survival, CR-B counter "
-               "preservation, single-flight, min_uses, fail-open)\n");
+               "preservation, single-flight, min_uses, fail-open, P6 breaker)\n");
     }
     return tests_failed == 0 ? 0 : 1;
 }

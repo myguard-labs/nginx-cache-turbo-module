@@ -9203,8 +9203,10 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
                      "\"evictions\":,\"l2_hits\":,\"l2_misses\":,\"lock_waits\":,"
                      "\"min_uses_skips\":,\"l2_neg_skips\":,\"bypasses\":,"
                      "\"cost_ms\":,"
-                     "\"autotuned_beta\":,\"autotuned_load\":}\n")
-              + 14 * NGX_ATOMIC_T_LEN;
+                     "\"autotuned_beta\":,\"autotuned_load\":,"
+                     "\"breaker_state\":\"\",\"breaker_opens\":}\n")
+              + 15 * NGX_ATOMIC_T_LEN
+              + sizeof("half-open") - 1;   /* longest _breaker_state_str value */
         p = ngx_pnalloc(r->pool, len);
         if (p == NULL) {
             return NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -9216,12 +9218,16 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
             "\"l2_misses\":%uA,\"lock_waits\":%uA,\"min_uses_skips\":%uA,"
             "\"l2_neg_skips\":%uA,"
             "\"bypasses\":%uA,\"cost_ms\":%uA,\"autotuned_beta\":%uA,"
-            "\"autotuned_load\":%uA}\n",
+            "\"autotuned_load\":%uA,"
+            "\"breaker_state\":\"%s\",\"breaker_opens\":%uA}\n",
             st.hits, st.misses, st.stale_serves,
             st.refreshes, st.evictions, st.l2_hits, st.l2_misses,
             st.lock_waits, st.min_uses_skips, st.l2_neg_skips,
             st.bypasses, st.cost_ms,
-            st.autotuned_beta, st.autotuned_load) - p;
+            st.autotuned_beta, st.autotuned_load,
+            ngx_http_cache_turbo_shm_breaker_state_str(
+                (ngx_uint_t) st.breaker_state),
+            st.breaker_opens) - p;
     }
     return ngx_http_cache_turbo_send_json(r, NGX_HTTP_OK, &body);
 }
