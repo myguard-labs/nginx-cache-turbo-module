@@ -12177,7 +12177,6 @@ def run_all(ng: Nginx, origin: Origin,
         test_sie_ttl_stored_in_blob(ng, origin, redis)      # RFC-2 CTB4 sie_ttl
         test_l2_retain_ttl_covers_sie(ng, origin, redis)    # S1.2 retain_ttl
         test_l2_sie_serve_survives_l1_purge(ng, origin, redis)  # S1.2 e2e serve
-        test_l2_sie_serve_survives_l1_purge(ng, origin, redis)  # S1.2 e2e serve
         test_l2_tag_add_on_store(ng, origin, redis)
         test_l2_tag_truncation_warns(ng, origin, redis)
         test_l2_tag_purge(ng, origin, redis)
