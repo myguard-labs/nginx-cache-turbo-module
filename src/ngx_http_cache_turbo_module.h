@@ -99,6 +99,84 @@
  * tighter, bespoke ceiling the way l2_negative_ttl does (that ceiling exists
  * because THAT memo has no invalidation channel; this window does). */
 
+/*
+ * cache_turbo_use_stale <off | error | timeout | http_403 | http_404 |
+ *                         http_429 | http_500 | http_502 | http_503 |
+ *                         http_504> ... (S4.1, parser only -- nothing on any
+ * request path reads loc_conf->use_stale yet, that lands in S4.2). Bitmask of
+ * which upstream response classes are allowed to fall back to a stale cached
+ * copy, mirroring nginx's own `proxy_cache_use_stale` vocabulary.
+ *
+ * Bits are `ull` and the carrier is ngx_uint_t, same convention as
+ * backend_presets above -- an unsuffixed literal at/above bit 31 would be
+ * `unsigned int` and get truncated by promotion into a 64-bit mask.
+ *
+ * ⚠ `error` and `timeout` are NOT nginx-equivalent here, and the difference is
+ * a known limitation rather than an oversight. In nginx these are
+ * communication-failure classes inherited from proxy_next_upstream: `error`
+ * means the connection failed/reset, `http_502` means the upstream really
+ * answered 502. They are distinct conditions.
+ *
+ * This module cannot make that distinction. Its only observation point is
+ * ngx_http_cache_turbo_header_filter, which sees r->headers_out.status and
+ * nothing else -- there is no NGX_HTTP_UPSTREAM_FT_* state, no peer status, no
+ * upstream failure provenance reachable from a header filter. By the time this
+ * module runs, a refused connection and a genuine upstream 502 are the same
+ * 502, and a timeout and a genuine 504 are the same 504.
+ *
+ * Consequence, which S4.2 must NOT paper over: with a status-only consumer,
+ * `error` and `http_502` match the same set of responses, as do `timeout` and
+ * `http_504`. An operator asking for `error` alone will also get stale serves
+ * on a real upstream 502. The tokens exist for vocabulary compatibility with
+ * proxy_cache_use_stale, not for behavioural parity.
+ *
+ * They carry their own bits so the parser records what the operator wrote and a
+ * future consumer that DOES have provenance (e.g. one reading upstream state
+ * rather than the final status) can honour the distinction without a config
+ * break. Until such a consumer exists, treat ERROR as equivalent to HTTP_502
+ * and TIMEOUT as equivalent to HTTP_504, and document the collapse rather than
+ * claiming a fidelity this trigger site cannot deliver.
+ *
+ * `off` is exclusive: it is only accepted alone (any token alongside it is a
+ * config error), and it means an EMPTY mask, not "keep default."
+ *
+ * DEFAULT (see ngx_http_cache_turbo_merge_loc_conf): HTTP_500 | HTTP_502 |
+ * HTTP_503 | HTTP_504 | ANY_5XX. Today's only trigger site
+ * (ngx_http_cache_turbo_header_filter) is unconditional on
+ * `status >= NGX_HTTP_INTERNAL_SERVER_ERROR && status <= 599` -- i.e. EVERY
+ * 5xx, not just the four named ones (506, 507, 508, 510, 511, ... are all
+ * covered today). The four HTTP_5xx bits alone would silently narrow that on
+ * the day S4.2 wires the read side, so ANY_5XX is a fifth bit carrying "every
+ * other 5xx not already named by one of the four explicit bits" -- the merge
+ * default sets all five bits, together reproducing "any 5xx" byte-for-byte.
+ * ANY_5XX is deliberately NOT settable directly from the config vocabulary
+ * (there is no `any_5xx` token): it exists solely so the default can be
+ * expressed as a sum of named bits without the parser having to special-case
+ * "no directive configured" as anything other than the ordinary UNSET/merge
+ * path every other directive in this file already uses.
+ */
+#define NGX_HTTP_CACHE_TURBO_USE_STALE_ERROR      0x01ull /* own bit; S4.2 maps -> 502 */
+#define NGX_HTTP_CACHE_TURBO_USE_STALE_TIMEOUT    0x02ull /* own bit; S4.2 maps -> 504 */
+#define NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_403   0x04ull
+#define NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_404   0x08ull
+#define NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_429   0x10ull
+#define NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_500   0x20ull
+#define NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_502   0x40ull
+#define NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_503   0x80ull
+#define NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_504   0x100ull
+/* "any other 5xx" -- see comment above. Kept well clear of the named bits and
+ * of any future sentinel (backend_presets' NONE sentinel lives at bit 63; this
+ * mask has no sentinel of its own, so there is no collision to avoid there,
+ * but the gap still documents that this bit is not a real HTTP status). */
+#define NGX_HTTP_CACHE_TURBO_USE_STALE_ANY_5XX    0x200ull
+
+#define NGX_HTTP_CACHE_TURBO_USE_STALE_DEFAULT \
+    (NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_500 \
+     | NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_502 \
+     | NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_503 \
+     | NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_504 \
+     | NGX_HTTP_CACHE_TURBO_USE_STALE_ANY_5XX)
+
 /* Upper bound on the cache_turbo_redis database index, accepted both as the
  * `db=N` param and as the `/N` DSN suffix. Redis ships `databases 16`, i.e.
  * indices 0..15; a larger value passes parse but makes every L2 op fail at
@@ -852,6 +930,14 @@ typedef struct {
      * convention -- see the doc comment on the handler for why a bare 0 here
      * means off, not forever. */
     time_t                   keep_stale;
+
+    /* cache_turbo_use_stale <off|error|timeout|http_NNN...> (S4.1). Bitmask,
+     * see the NGX_HTTP_CACHE_TURBO_USE_STALE_* comment block for the full
+     * contract. NGX_CONF_UNSET_UINT until merge; merges to
+     * NGX_HTTP_CACHE_TURBO_USE_STALE_DEFAULT (today's "any 5xx" behaviour,
+     * unchanged). Parser only: nothing reads this field on any request path
+     * yet (that is S4.2). */
+    ngx_uint_t               use_stale;
 
     /* L2 Redis (v2b). Native async client, no hiredis. The L2 store is touched
      * only on an L1 miss (sync GET) and on store (async write-through); it is

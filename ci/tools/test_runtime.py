@@ -9463,6 +9463,102 @@ def test_keep_stale_config_parse(ng: Nginx) -> None:
         f"pristine config (no mutation) failed nginx -t:\n{r.stdout}"
 
 
+def test_use_stale_config_parse(ng: Nginx) -> None:
+    """S4.1: cache_turbo_use_stale <off|error|timeout|http_NNN...> --
+    PARSER ONLY, no runtime read yet (that is S4.2). Cover every token
+    individually, a multi-token combination, off, an invalid token, and a
+    duplicate directive. Each reject case asserts the literal diagnostic
+    string, not just a nonzero exit, so a config broken for the wrong reason
+    cannot pass as "correctly rejected"."""
+    anchor = "cache_turbo_valid 30s;"
+    assert anchor in nginx_config(
+        ng.root, ng.port, ng.module, ng.origin_port, 1), \
+        f"test fixture missing anchor {anchor!r}"
+
+    def with_directive(cfg: str, directive: str) -> str:
+        assert anchor in cfg, f"test fixture missing {anchor!r}"
+        return cfg.replace(anchor, anchor + "\n            " + directive, 1)
+
+    # accept: each individual token
+    for token in ("off", "error", "timeout", "http_403", "http_404",
+                  "http_429", "http_500", "http_502", "http_503",
+                  "http_504"):
+        r = _config_test_result(
+            ng, lambda c, _t=token: with_directive(
+                c, f"cache_turbo_use_stale {_t};"))
+        assert r.returncode == 0, \
+            f"cache_turbo_use_stale {token} was rejected:\n{r.stdout}"
+
+    # accept: multi-token combination
+    r = _config_test_result(
+        ng, lambda c: with_directive(
+            c, "cache_turbo_use_stale error timeout http_404 http_500;"))
+    assert r.returncode == 0, \
+        f"multi-token cache_turbo_use_stale was rejected:\n{r.stdout}"
+
+    # reject: off combined with another token
+    r = _config_test_result(
+        ng, lambda c: with_directive(c, "cache_turbo_use_stale off http_500;"))
+    assert r.returncode != 0, \
+        f"cache_turbo_use_stale off + http_500 was accepted:\n{r.stdout}"
+    assert "cannot be combined" in r.stdout, \
+        f"missing off-combination diagnostic:\n{r.stdout}"
+
+    # reject: invalid token
+    r = _config_test_result(
+        ng, lambda c: with_directive(c, "cache_turbo_use_stale bogus;"))
+    assert r.returncode != 0, \
+        f"cache_turbo_use_stale bogus was accepted by nginx -t:\n{r.stdout}"
+    assert "invalid value" in r.stdout, \
+        f"missing invalid-value diagnostic:\n{r.stdout}"
+
+    # reject: duplicate directive in the same block
+    r = _config_test_result(
+        ng, lambda c: with_directive(
+            c,
+            "cache_turbo_use_stale http_500;"
+            "\n            cache_turbo_use_stale http_502;"))
+    assert r.returncode != 0, \
+        f"duplicate cache_turbo_use_stale was accepted:\n{r.stdout}"
+    assert "is duplicate" in r.stdout, \
+        f"missing duplicate diagnostic:\n{r.stdout}"
+
+    # accept: server-level directive inherited by a location that does not
+    # override it, and a location-level override alongside it. This is the
+    # only part of the create/merge path observable from a config test.
+    r = _config_test_result(
+        ng, lambda c: with_directive(c, "cache_turbo_use_stale http_404;"))
+    assert r.returncode == 0, \
+        f"server-scope cache_turbo_use_stale was rejected:\n{r.stdout}"
+
+    # reject: tokens are matched by exact bytes, so a case variant is not a
+    # silently-accepted synonym.
+    for bad in ("HTTP_500", "Off", "Error"):
+        r = _config_test_result(
+            ng, lambda c, _b=bad: with_directive(
+                c, f"cache_turbo_use_stale {_b};"))
+        assert r.returncode != 0, \
+            f"cache_turbo_use_stale {bad} was accepted (case folding?):\n{r.stdout}"
+        assert "invalid value" in r.stdout, \
+            f"missing invalid-value diagnostic for {bad}:\n{r.stdout}"
+
+    # negative control: the pristine (unmutated) config must still pass, or
+    # every reject arm above is vacuous.
+    r = _config_test_result(ng, lambda c: c)
+    assert r.returncode == 0, \
+        f"pristine config (no mutation) failed nginx -t:\n{r.stdout}"
+
+    # ⚠ KNOWN COVERAGE GAP -- do not read this test as validating the mask.
+    # Nothing reads clcf->use_stale yet (that is S4.2), so no config test can
+    # observe the VALUE any token produces. These arms prove only that the
+    # grammar accepts/rejects the right strings. Mutations that survive this
+    # test unchanged: mapping every token to the same bit, swapping two token
+    # bits, dropping ANY_5XX from USE_STALE_DEFAULT, or breaking the
+    # UNSET-vs-0 merge. Those invariants become observable only once S4.2
+    # gives the mask a behavioural effect, and the S4.2 tests -- not these --
+    # are what must pin them down. See the S4.1 entry in issues.md.
+
+
 def test_lru_eviction(ng: Nginx) -> None:
     """R6: with a tiny zone, old entries are evicted, not 500s."""
     # hammer many distinct keys through the tiny zone; must all 200, no errors
@@ -12420,6 +12516,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_keepalive_cap_rejected(ng)
     test_s8_scan_resistant_config_rejects(ng)
     test_keep_stale_config_parse(ng)                        # S2.1
+    test_use_stale_config_parse(ng)                         # S4.1
     test_memcached_keepalive_invalid_rejected(ng)
     test_memcached_keepalive_cap_rejected(ng)
     test_memcached_keepalive_timeout_invalid_rejected(ng)

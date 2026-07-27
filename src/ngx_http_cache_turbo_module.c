@@ -95,6 +95,8 @@ static char *ngx_http_cache_turbo_l2_negative_ttl(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 static char *ngx_http_cache_turbo_keep_stale(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
+static char *ngx_http_cache_turbo_use_stale(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
 static char *ngx_http_cache_turbo_preset(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static ngx_int_t ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r);
@@ -335,6 +337,13 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
     { ngx_string("cache_turbo_keep_stale"),
       NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
       ngx_http_cache_turbo_keep_stale,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+
+    { ngx_string("cache_turbo_use_stale"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_1MORE,
+      ngx_http_cache_turbo_use_stale,
       NGX_HTTP_LOC_CONF_OFFSET,
       0,
       NULL },
@@ -8098,6 +8107,116 @@ ngx_http_cache_turbo_keep_stale(ngx_conf_t *cf, ngx_command_t *cmd,
 }
 
 
+/* cache_turbo_use_stale <off | error | timeout | http_403 | http_404 |
+ *                         http_429 | http_500 | http_502 | http_503 |
+ *                         http_504> ... (S4.1). PARSER ONLY -- nothing reads
+ * clcf->use_stale on any request path yet (that is S4.2). See the
+ * NGX_HTTP_CACHE_TURBO_USE_STALE_* block in the header for the full mask
+ * contract, the error/timeout aliasing rationale, and why the merge default
+ * includes the ANY_5XX bit.
+ *
+ * `off` must appear alone: mixing it with any other token is rejected, same
+ * shape as nginx's own proxy_cache_use_stale (`off` there is likewise not
+ * combinable). Any unrecognised token is rejected by name. Hand-written
+ * NGX_CONF_1MORE parser -- this module has zero uses of
+ * ngx_conf_set_bitmask_slot anywhere, by established convention (see
+ * cache_turbo_scan_resistant, cache_turbo_normalize_strip, and the directive
+ * this one is modelled on, cache_turbo_keep_stale, immediately above). */
+static char *
+ngx_http_cache_turbo_use_stale(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_cache_turbo_loc_conf_t  *clcf = conf;
+
+    ngx_str_t   *value;
+    ngx_uint_t   i, mask, saw_off;
+
+    if (clcf->use_stale != NGX_CONF_UNSET_UINT) {
+        return "is duplicate";
+    }
+
+    value = cf->args->elts;
+    mask = 0;
+    saw_off = 0;
+
+    for (i = 1; i < cf->args->nelts; i++) {
+
+        if (value[i].len == 3
+            && ngx_strncmp(value[i].data, "off", 3) == 0)
+        {
+            saw_off = 1;
+            continue;
+        }
+
+        if (value[i].len == 5
+            && ngx_strncmp(value[i].data, "error", 5) == 0)
+        {
+            mask |= NGX_HTTP_CACHE_TURBO_USE_STALE_ERROR;
+
+        } else if (value[i].len == 7
+            && ngx_strncmp(value[i].data, "timeout", 7) == 0)
+        {
+            mask |= NGX_HTTP_CACHE_TURBO_USE_STALE_TIMEOUT;
+
+        } else if (value[i].len == 8
+            && ngx_strncmp(value[i].data, "http_403", 8) == 0)
+        {
+            mask |= NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_403;
+
+        } else if (value[i].len == 8
+            && ngx_strncmp(value[i].data, "http_404", 8) == 0)
+        {
+            mask |= NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_404;
+
+        } else if (value[i].len == 8
+            && ngx_strncmp(value[i].data, "http_429", 8) == 0)
+        {
+            mask |= NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_429;
+
+        } else if (value[i].len == 8
+            && ngx_strncmp(value[i].data, "http_500", 8) == 0)
+        {
+            mask |= NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_500;
+
+        } else if (value[i].len == 8
+            && ngx_strncmp(value[i].data, "http_502", 8) == 0)
+        {
+            mask |= NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_502;
+
+        } else if (value[i].len == 8
+            && ngx_strncmp(value[i].data, "http_503", 8) == 0)
+        {
+            mask |= NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_503;
+
+        } else if (value[i].len == 8
+            && ngx_strncmp(value[i].data, "http_504", 8) == 0)
+        {
+            mask |= NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_504;
+
+        } else {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                "invalid value \"%V\" in \"%V\" directive",
+                &value[i], &cmd->name);
+            return NGX_CONF_ERROR;
+        }
+    }
+
+    if (saw_off && mask != 0) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "invalid value \"off\" in \"%V\" directive: "
+            "\"off\" cannot be combined with other tokens", &cmd->name);
+        return NGX_CONF_ERROR;
+    }
+
+    /* saw_off with mask == 0 -> empty mask (off). Any other combination of
+     * real tokens -> their OR. Note this never sets ANY_5XX: that bit is a
+     * merge-default-only construct (see header comment), not reachable from
+     * the config vocabulary. */
+    clcf->use_stale = mask;
+
+    return NGX_CONF_OK;
+}
+
+
 /* "cache_turbo_preset micro|conservative|balanced|aggressive;" stores the enum
  * (and validates the name here, at config time). The enum only selects the band
  * of default knob values used in merge_loc_conf; an explicit knob directive
@@ -10509,6 +10628,7 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->min_uses = NGX_CONF_UNSET;
     conf->l2_negative_ttl = NGX_CONF_UNSET;   /* L13; merges to 0 = off */
     conf->keep_stale = NGX_CONF_UNSET;   /* S2.1; merges to 0 = off */
+    conf->use_stale = NGX_CONF_UNSET_UINT;   /* S4.1; merges to USE_STALE_DEFAULT */
     conf->max_size = NGX_CONF_UNSET_SIZE;
     conf->suppress_native = NGX_CONF_UNSET;
     conf->redis_enable = NGX_CONF_UNSET;
@@ -10638,6 +10758,16 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
      * operator opts in. Parser only: nothing consults conf->keep_stale on any
      * request path yet (S2.2). */
     ngx_conf_merge_sec_value(conf->keep_stale, prev->keep_stale, 0);
+
+    /* cache_turbo_use_stale (S4.1). Plain inherit/default, same shape as
+     * keep_stale above. Default is USE_STALE_DEFAULT (HTTP_500|502|503|504 +
+     * ANY_5XX), which reproduces today's unconditional "any 5xx" trigger at
+     * ngx_http_cache_turbo_header_filter byte-for-byte -- see the header
+     * comment on NGX_HTTP_CACHE_TURBO_USE_STALE_DEFAULT for why the ANY_5XX
+     * bit is required to make that true. Parser only: nothing consults
+     * conf->use_stale on any request path yet (S4.2). */
+    ngx_conf_merge_uint_value(conf->use_stale, prev->use_stale,
+                              NGX_HTTP_CACHE_TURBO_USE_STALE_DEFAULT);
 
     /* Per-status TTLs (v6): inherit the rule list if this level set none. */
     if (conf->valid_status == NULL) {
