@@ -102,10 +102,11 @@
 /*
  * cache_turbo_use_stale <off | error | timeout | http_403 | http_404 |
  *                         http_429 | http_500 | http_502 | http_503 |
- *                         http_504> ... (S4.1, parser only -- nothing on any
- * request path reads loc_conf->use_stale yet, that lands in S4.2). Bitmask of
- * which upstream response classes are allowed to fall back to a stale cached
- * copy, mirroring nginx's own `proxy_cache_use_stale` vocabulary.
+ *                         http_504> ... Bitmask of which upstream response
+ * classes are allowed to fall back to a stale cached copy, mirroring nginx's
+ * own `proxy_cache_use_stale` vocabulary. Read on the request path by
+ * ngx_http_cache_turbo_use_stale_triggers(), which gates the stale-if-error
+ * rewrite in ngx_http_cache_turbo_header_filter() (S4.2).
  *
  * Bits are `ull` and the carrier is ngx_uint_t, same convention as
  * backend_presets above -- an unsuffixed literal at/above bit 31 would be
@@ -155,8 +156,8 @@
  * "no directive configured" as anything other than the ordinary UNSET/merge
  * path every other directive in this file already uses.
  */
-#define NGX_HTTP_CACHE_TURBO_USE_STALE_ERROR      0x01ull /* own bit; S4.2 maps -> 502 */
-#define NGX_HTTP_CACHE_TURBO_USE_STALE_TIMEOUT    0x02ull /* own bit; S4.2 maps -> 504 */
+#define NGX_HTTP_CACHE_TURBO_USE_STALE_ERROR      0x01ull /* own bit; folded onto 502 at the trigger */
+#define NGX_HTTP_CACHE_TURBO_USE_STALE_TIMEOUT    0x02ull /* own bit; folded onto 504 at the trigger */
 #define NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_403   0x04ull
 #define NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_404   0x08ull
 #define NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_429   0x10ull
