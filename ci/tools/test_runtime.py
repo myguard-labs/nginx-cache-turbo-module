@@ -1278,6 +1278,11 @@ http {{
     cache_turbo_zone name=atch 16m;  # autotune churn-disqualify (v4-3)
     cache_turbo_zone name=ka0 8m;    # Redis keepalive DB-isolation test
     cache_turbo_zone name=ka1 8m;    # Redis keepalive DB-isolation test
+    # S2.3: 64k == enforced minimum, same reasoning as S8's srz -- a handful of
+    # unique keys genuinely overflow this zone and force real LRU eviction,
+    # unlike an 8m/16m zone where the contract test would pass for the wrong
+    # reason (nothing ever gets evicted). Drives the no-reaper contract test.
+    cache_turbo_zone name=ksevz 64k; # keep_stale no-reaper / LRU-only-reclaim (S2.3)
 
     # Q1 end-to-end: stacked native proxy_cache, one zone per suppress mode, so
     # a test can prove cache_turbo_suppress_native actually keeps the native
@@ -1691,6 +1696,64 @@ http {{
             cache_turbo          main;
             cache_turbo_key      $uri;
             cache_turbo_valid    1s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # S2.2: cache_turbo_keep_stale feeds sie_window when the response
+        # carries NO stale-if-error of its own (D-1 precedence table). Origin
+        # for this location sends no Cache-Control at all -> keep_stale is the
+        # only thing standing between an expired entry and a surfaced error.
+        # Short fresh (1s) / stale (x4 = 4s) window like /sieserve/ so the
+        # entry is fully expired quickly. Drives test_keep_stale_serves_dead_origin.
+        location /keepstale/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    1s;
+            cache_turbo_keep_stale 1h;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # Negative control for /keepstale/: identical location, keep_stale off
+        # (the default) -> an expired entry with a dead origin must surface the
+        # error (502), not serve stale. Proves the positive result above is
+        # actually caused by keep_stale, not some other widening.
+        location /keepstaleoff/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    1s;
+            cache_turbo_keep_stale off;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # Precedence test: both a response stale-if-error AND cache_turbo_keep_stale
+        # are in play here. keep_stale is a generous 1h baseline; the response's
+        # own stale-if-error=30 (via the "sieserve" request-suffix marker, same
+        # origin convention as /sieserve/) must WIN -- sie_window = ttl + 30, not
+        # ttl + 3600 and not max() of the two. Drives
+        # test_keep_stale_loses_to_response_sie.
+        location /keepstalewins/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    1s;
+            cache_turbo_keep_stale 1h;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # S2.3: no-reaper contract. keep_stale is a generous 1h -- an entry
+        # here is way inside its keep-stale window at every point this test
+        # checks it, so if the entry ever disappears on its own that proves a
+        # time-based reaper exists (contract violation). The zone (ksevz,
+        # 64k, the enforced minimum) is what actually reclaims memory: it only
+        # holds a couple of these bodies, so flooding it with distinct keys
+        # forces genuine LRU eviction and gives the test a second location to
+        # observe the SAME key vanish for the CORRECT reason (max_size
+        # pressure, not time).
+        location /ksev/ {{
+            cache_turbo             ksevz;
+            cache_turbo_key         $uri;
+            cache_turbo_valid       1s;
+            cache_turbo_keep_stale  1h;
+            add_header X-CT-Status  $cache_turbo_status always;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
@@ -8397,6 +8460,196 @@ def test_sie_origin_recovers_serves_fresh(ng: Nginx, origin: Origin) -> None:
     assert s2 == 200 and b2 == b, "expected the fresh re-store to be re-served"
 
 
+def test_keep_stale_serves_dead_origin(ng: Nginx, origin: Origin) -> None:
+    """S2.2: cache_turbo_keep_stale is the origin-independent serve-on-error
+    fallback (D-1 precedence table) when the response carries no
+    stale-if-error of its own. /keepstale/ origin emits no Cache-Control at
+    all, so without keep_stale a fully-expired entry would have sie_window==0
+    and surface the dead origin's error. With keep_stale 1h, sie_window =
+    ttl (1s) + 3600, comfortably covering the test's expiry window -> a hard
+    connection-drop on a fully expired entry still serves the cached body with
+    X-Cache: STALE-IF-ERROR.
+
+    Negative control (MANDATORY, same origin behaviour, sibling location with
+    cache_turbo_keep_stale off): the identical dead-origin request against
+    /keepstaleoff/ must surface a 502 -- proving the 200 above is caused by
+    keep_stale, not some other widening (SWR/stale_mult) leaking into the
+    expired path."""
+    s0, b0, _ = fetch(ng.port, "/keepstale/x")
+    assert s0 == 200 and b0, f"prime failed: {s0} {b0!r}"
+    sn0, bn0, _ = fetch(ng.port, "/keepstaleoff/x")
+    assert sn0 == 200 and bn0, f"control prime failed: {sn0} {bn0!r}"
+
+    time.sleep(4.6)     # past fresh (1s) AND the stale window (x4 = 4s): expired
+    origin.drop = True
+    try:
+        # Positive: keep_stale covers the outage -> stale body served.
+        s, b, h = fetch(ng.port, "/keepstale/x")
+        assert s == 200, f"keep_stale dead-origin served {s}, expected stale 200"
+        assert b == b0, f"served {b!r}, expected stale {b0!r}"
+        assert h.get("x-cache") == "STALE-IF-ERROR", \
+            f"expected STALE-IF-ERROR, got x-cache={h.get('x-cache')}"
+
+        # Negative control: keep_stale off -> no fallback window -> the dead
+        # origin's connection-drop surfaces as 502, proven BY THIS ASSERTION.
+        sc, _, hc = fetch(ng.port, "/keepstaleoff/x")
+        assert sc == 502, \
+            f"keep_stale off served {sc}, expected 502 (no serve-on-error window)"
+        assert hc.get("x-cache") != "STALE-IF-ERROR", \
+            "keep_stale off must not serve-on-error"
+    finally:
+        origin.drop = False
+        drain_origin(origin)
+
+
+def test_keep_stale_loses_to_response_sie(ng: Nginx, origin: Origin) -> None:
+    """S2.2 / D-1: a HONORED response stale-if-error wins over
+    cache_turbo_keep_stale when both are available -- NOT max(). /keepstalewins/
+    has keep_stale 1h (3600s) configured; the "sieserve" request-suffix marker
+    makes the origin emit stale-if-error=30 for this request, same convention as
+    /sieserve/. If the precedence were max(), sie_window would be ttl+3600 and a
+    request timed at ttl+~35s (well past the response SIE window but nowhere near
+    the keep_stale window) would still serve stale. The correct precedence
+    (response SIE wins outright, keep_stale is not consulted at all) makes that
+    same request surface the dead origin's error instead."""
+    s0, b0, _ = fetch(ng.port, "/keepstalewins/sieserve-p1")
+    assert s0 == 200 and b0, f"prime failed: {s0} {b0!r}"
+
+    # Phase 1 -- inside the response's own SIE window (~31s). Serves stale.
+    # NB this assertion is NOT the discriminating one: it passes identically
+    # whether the precedence is "response SIE wins" (window ~31s) or a max()
+    # bug (window ~3601s). It only establishes that a window exists at all.
+    time.sleep(4.6)     # past fresh (1s) and stale_mult x4 (4s): fully expired
+    origin.fail = True
+    try:
+        s, b, h = fetch(ng.port, "/keepstalewins/sieserve-p1")
+        assert s == 200, f"within response-SIE window served {s}, expected 200"
+        assert b == b0, f"served {b!r}, expected stale {b0!r}"
+        assert h.get("x-cache") == "STALE-IF-ERROR", \
+            f"expected STALE-IF-ERROR, got x-cache={h.get('x-cache')}"
+    finally:
+        origin.fail = False
+        drain_origin(origin)
+
+    # Phase 2 -- THE DISCRIMINATING ASSERTION. Past the response's own SIE
+    # window (fresh 1s + sie 30s = ~31s) but far short of keep_stale's 3600s.
+    # Correct precedence: sie_window ended at ~31s, keep_stale was never
+    # consulted -> the dead origin surfaces as 502. Under a max() bug the
+    # window would run to ~3601s and this would still serve a stale 200, so
+    # this assertion is what fails if anyone "reconciles" the precedence into
+    # a max(). Re-prime first: phase 1 left the entry untouched (a stale serve
+    # does not re-store), so its absolute sie deadline is still ~31s from the
+    # ORIGINAL store -- sleeping the remainder is what crosses it.
+    time.sleep(27.0)    # ~31.6s total since the store: response SIE expired
+    origin.fail = True
+    try:
+        s2, _, h2 = fetch(ng.port, "/keepstalewins/sieserve-p1")
+        # 503 (not 502): origin.fail returns an upstream 503, which passes
+        # through once no serve-on-error window covers the request.
+        # origin.drop is the transport-level failure that yields 502.
+        assert s2 == 503, (
+            f"past the response stale-if-error window served {s2}, expected 503. "
+            "A 200 here means keep_stale (3600s) widened the window the response "
+            "had already scoped to 30s -- i.e. the precedence became max(), which "
+            "D-1 explicitly rejects."
+        )
+        assert h2.get("x-cache") != "STALE-IF-ERROR", \
+            "keep_stale must not extend a response-scoped stale-if-error window"
+    finally:
+        origin.fail = False
+        drain_origin(origin)
+
+
+def test_keep_stale_no_reaper_lru_only_reclaim(ng: Nginx, origin: Origin) -> None:
+    """S2.3 CONTRACT: an L1 node past its stale deadline but still inside its
+    cache_turbo_keep_stale window is reclaimed ONLY by LRU/max_size pressure --
+    there is no time-based reaper proactively evicting it. Verified against
+    src/ngx_http_cache_turbo_shm.c: the only eviction path is
+    ngx_http_cache_turbo_shm_evict_one(), called exclusively from
+    ngx_http_cache_turbo_shm_alloc_evict() on an allocation failure inside
+    store()/claim()/count_miss()/l2_neg_set(). No ngx_add_timer/event-driven
+    sweep touches the LRU queues anywhere in the module. This is deliberate,
+    not a gap -- do not "fix" it with a reaper.
+
+    /ksev/ (zone ksevz, 8m->64k, the enforced minimum) has cache_turbo_valid 1s
+    and cache_turbo_keep_stale 1h, so an entry is fresh for ~1s and then sits
+    deep inside a 3600s keep-stale window for the rest of this test.
+
+    Phase 1 (retention across an idle gap): prime one key, let it go stale,
+    wait past the stale deadline with NOTHING else touching the zone, then
+    kill the origin and confirm the key still serves a stale 200.
+
+    ⚠ SCOPE OF THIS PHASE -- do not over-trust it. The idle gap is only ~2.3s,
+    so it does NOT rule out a time-based reaper in general: any plausible
+    sweep cadence (seconds to minutes) could hide inside this window and the
+    assertion would still pass. What phase 1 actually proves is narrower and
+    still worth having -- that an expired-but-inside-keep_stale node is
+    RETAINED and SERVEABLE rather than dropped at its stale deadline, which is
+    the behaviour keep_stale exists to provide. The real evidence for the
+    no-reaper contract is the source read recorded in the first paragraph
+    (there is no ngx_add_timer sweep to find), not this sleep. Lengthening the
+    wait would buy very little and cost the suite real wall-clock; if you ever
+    need the stronger claim, assert it against the source, not the clock.
+
+    Phase 2 (discriminates "LRU is what DOES reclaim it"): with the same key
+    still resident, flood the same tiny zone with enough distinct keys to
+    force real max_size eviction. The original key must now be gone (a fresh
+    MISS body, not the stale one) -- proving reclaim genuinely happens, just
+    triggered by capacity pressure rather than a clock. Without this phase,
+    phase 1 alone can't distinguish "no reaper" from "eviction is broken
+    entirely"."""
+    key = "/ksev/no-reaper"
+
+    # Prime, then let TTL (1s) elapse so the entry is genuinely stale.
+    s0, b0, h0 = fetch(ng.port, key)
+    assert s0 == 200, f"prime {key} -> {s0}"
+    assert h0.get("x-ct-status") == "MISS", f"prime not a MISS: {h0.get('x-ct-status')}"
+    time.sleep(1.3)   # cross the 1s valid window -> now stale, deep in keep_stale
+
+    # Nothing touches ksevz here. If a reaper swept expired-but-keep-stale
+    # nodes on a timer, this idle gap is exactly where it would fire.
+    time.sleep(1.0)
+
+    origin.fail = True
+    try:
+        s1, b1, _ = fetch(ng.port, key)
+        # A time-based reaper would have removed this node already, so the
+        # request would MISS, hit the dead origin, and surface an error (503)
+        # instead of serving the retained stale body.
+        assert s1 == 200, (
+            f"{key} returned {s1} with origin down after an idle wait -- "
+            "expected a stale 200. A non-200 here means the entry was reaped "
+            "by something other than LRU/max_size pressure, violating the "
+            "no-reaper contract."
+        )
+        assert b1 == b0, (
+            f"{key} body changed ({b0!r} -> {b1!r}) with origin down -- "
+            "expected the SAME retained stale node, not a refill"
+        )
+    finally:
+        origin.fail = False
+        drain_origin(origin)
+
+    # Phase 2: force real LRU/max_size eviction in the SAME tiny zone by
+    # flooding it with enough distinct keys to overflow 64k. The original key
+    # must be gone afterward -- reclaim happens, just via capacity, not time.
+    for i in range(120):
+        fetch(ng.port, f"/ksev/flood-{i}")
+
+    s2, b2, h2 = fetch(ng.port, key)
+    assert s2 == 200, f"post-flood {key} -> {s2}"
+    assert h2.get("x-ct-status") == "MISS", (
+        f"{key} still resident after flooding ksevz to capacity "
+        f"(status={h2.get('x-ct-status')}) -- LRU/max_size pressure is "
+        "supposed to be the actual reclaim mechanism; if it never evicts "
+        "either, entries would accumulate in a keep_stale zone forever."
+    )
+    assert b2 != b0, (
+        f"{key} served the SAME stale body ({b0!r}) after eviction pressure -- "
+        "the old node should have been reclaimed and this should be a fresh refill"
+    )
+
+
 def test_background_update_off_regenerates_inline(ng: Nginx,
                                                   origin: Origin) -> None:
     """v8: cache_turbo_background_update off restores the pre-v8 winner — the
@@ -12194,6 +12447,9 @@ def run_all(ng: Nginx, origin: Origin,
     test_stale_serves_stale_origin_hard_dead(ng, origin)
     test_sie_serve_on_error(ng, origin)                     # RFC-2 CTB4 serve-on-error
     test_sie_origin_recovers_serves_fresh(ng, origin)       # RFC-2 success not hijacked
+    test_keep_stale_serves_dead_origin(ng, origin)          # S2.2 keep_stale fallback
+    test_keep_stale_loses_to_response_sie(ng, origin)       # S2.2 / D-1 precedence
+    test_keep_stale_no_reaper_lru_only_reclaim(ng, origin)  # S2.3 no-reaper contract
     test_background_update_off_regenerates_inline(ng, origin)
     test_normalize_arg_order(ng, origin)
     test_normalize_strips_tracking(ng, origin)
@@ -12423,7 +12679,12 @@ def main() -> int:
           "min_uses (v15: cache after N misses + off-by-default; "
           "H3c: aggressive band=2, balanced band stays 1, directive beats band, "
           "range-checked), "
-          "stale-if-error (v8), background_update off (v8 inline regen), "
+          "stale-if-error (v8), "
+          "keep_stale (S2.2: serves a dead origin with no response "
+          "stale-if-error, off surfaces the error; response stale-if-error "
+          "wins over keep_stale, not max(); S2.3: no time-based reaper, "
+          "LRU/max_size is the only reclaim), "
+          "background_update off (v8 inline regen), "
           "admin stats/purge/gating, warm (v3-3: populates/multi/no-url), "
           "key normalize (v3-1: order/tracking/"
           "custom-strip/strip-all/distinct), "

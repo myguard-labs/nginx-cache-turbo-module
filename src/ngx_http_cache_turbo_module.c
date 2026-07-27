@@ -6565,7 +6565,46 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
                 ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                                "cache_turbo: stale-if-error=%T \"%V\"",
                                sie, &r->uri);
+
+            } else if (ttl > 0 && clcf->keep_stale > 0) {
+                /* S2.2 / D-1: no response stale-if-error to honor here, so fall
+                 * back to the operator's cache_turbo_keep_stale baseline (fresh +
+                 * keep_stale). This branch only runs when a response SIE was
+                 * absent -- a HONORED response stale-if-error above already took
+                 * this window and we must NOT also apply keep_stale on top of it
+                 * (that would be max(), which the plan explicitly rejects: an
+                 * origin that states its own error window is making a statement,
+                 * not setting a floor). Still gated behind the outer
+                 * !must-revalidate branch above, so a honored must-revalidate
+                 * still collapses the window to `ttl` and suppresses keep_stale
+                 * too -- must-revalidate forbids ANY stale serve. */
+                sie_window = ttl + clcf->keep_stale;
+                if (sie_window > NGX_HTTP_CACHE_TURBO_TTL_MAX) {
+                    sie_window = NGX_HTTP_CACHE_TURBO_TTL_MAX;
+                }
+                ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                               "cache_turbo: keep_stale=%T \"%V\"",
+                               clcf->keep_stale, &r->uri);
             }
+
+        } else if (ttl > 0 && clcf->ignore_cc && clcf->keep_stale > 0) {
+            /* D-1: under ignore_cc the response-derived swr/must-revalidate/sie
+             * branches above never run (the whole upstream Cache-Control is
+             * inert), so this location's stale window is untouched by the
+             * response and sie_window is still 0 here. keep_stale is OPERATOR
+             * config, not upstream config -- ignore_cc only makes the upstream
+             * header inert, it does not disable operator-configured retention.
+             * Apply the keep_stale baseline unconditionally in this case (no
+             * response SIE to compare against, and no honored must-revalidate
+             * to suppress it -- must-revalidate is itself response-derived and
+             * therefore inert under ignore_cc). */
+            sie_window = ttl + clcf->keep_stale;
+            if (sie_window > NGX_HTTP_CACHE_TURBO_TTL_MAX) {
+                sie_window = NGX_HTTP_CACHE_TURBO_TTL_MAX;
+            }
+            ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                           "cache_turbo: keep_stale=%T (ignore_cc) \"%V\"",
+                           clcf->keep_stale, &r->uri);
         }
 
         /* Synthesise a Content-Type entry from the typed field (it is not in
@@ -7898,6 +7937,20 @@ ngx_http_cache_turbo_l2_negative_ttl(ngx_conf_t *cf, ngx_command_t *cmd,
  * retention: when a response carries no `stale-if-error` window of its own,
  * S2.2 will use this value as the effective stale-if-error window instead of
  * leaving the object with no fallback.
+ *
+ * cache_turbo_cache_control ignore does NOT suppress this directive (decision
+ * D-1; clcf->ignore_cc is the internal flag it sets). Every
+ * !clcf->ignore_cc gate in the store path guards a RESPONSE-derived value --
+ * upstream max-age, stale-while-revalidate, must-revalidate, stale-if-error --
+ * because ignore_cc means "the upstream Cache-Control header is inert", not
+ * "operator retention config is inert". stale_window is likewise built from
+ * cache_turbo_valid + cache_turbo_stale_mult regardless of ignore_cc; keep_stale
+ * is the sie_window analogue of stale_mult. Under ignore_cc the response
+ * stale-if-error branch never runs, so keep_stale simply applies unconditionally.
+ * Precedence when both are available: a HONORED response stale-if-error WINS over
+ * keep_stale (same shape as response swr beating stale_mult) -- deliberately not
+ * max(), which would make keep_stale a silent floor overriding an origin that
+ * explicitly stated its own error window.
  *
  * Argument forms:
  *   off      -> 0 (the default; today's behaviour, unchanged)
