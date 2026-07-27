@@ -899,14 +899,24 @@ test_breaker_half_open_admits_one_probe(void)
               == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
           "breaker probed before the open window elapsed");
 
-    /* Window elapsed: the FIRST caller is promoted, the second is not. */
+    /* Window elapsed: the FIRST caller is promoted, the second is NOT.
+     *
+     * ⚠ The second assertion is the whole anti-herd property. An earlier
+     * revision asserted the second caller ALSO received HALF_OPEN, which is
+     * what the code did at the time -- the promotion CAS controlled who
+     * TRANSITIONED, not who was ADMITTED, so every request after the winner
+     * was handed the probe's verdict and walked into the dead origin. The
+     * test certified the bug. Do not "restore" it. */
     ngx_test_advance_time(2);
     CHECK(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
               == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN,
           "breaker did not promote a probe after the open window");
     CHECK(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
-              == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN,
-          "a second caller changed the HALF_OPEN verdict");
+              == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
+          "a second caller was also admitted as a probe (herd)");
+    CHECK(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+              == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
+          "a third caller was also admitted as a probe (herd)");
 
     /* A failed probe returns to OPEN and re-arms a FULL window -- the next
      * probe must wait open_for again, not fire immediately. */
@@ -919,6 +929,66 @@ test_breaker_half_open_admits_one_probe(void)
     CHECK(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
               == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
           "a failed probe did not re-arm the full open window");
+}
+
+
+/* A promoted probe that never reports back must not wedge the breaker in
+ * HALF_OPEN forever. Its request can be aborted, or its worker killed, between
+ * promotion and _record() -- ordinary lifecycle events, not exotic ones. The
+ * promotion is therefore a time-bounded LEASE: once stale, one replacement
+ * probe is admitted. */
+static void
+test_breaker_abandoned_probe_lease_recovers(void)
+{
+    printf("breaker: an abandoned probe lease is reclaimed, once\n");
+    zone_reset();
+    ngx_test_set_time(1000);
+
+    ngx_http_cache_turbo_shm_breaker_record(&g_zone, 0, 1, 60);
+    ngx_test_advance_time(31);
+    REQUIRE(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+                == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN,
+            "breaker fixture: expected a promoted probe");
+
+    /* The probe vanishes -- no _record() ever arrives. Inside the lease the
+     * breaker must keep refusing everyone. */
+    ngx_test_advance_time(29);
+    CHECK(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+              == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
+          "the probe lease was reclaimed before it went stale");
+
+    /* Lease stale: exactly one replacement probe, and no more. */
+    ngx_test_advance_time(2);
+    CHECK(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+              == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN,
+          "an abandoned probe lease was never reclaimed (wedged HALF_OPEN)");
+    CHECK(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+              == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
+          "the reclaimed lease admitted a second probe");
+}
+
+
+/* A success that predates the trip must not close a breaker it knows nothing
+ * about. While OPEN nobody is talking to the origin, so the only success
+ * carrying current information is the probe's. */
+static void
+test_breaker_stale_success_does_not_close(void)
+{
+    printf("breaker: a pre-trip success cannot close the breaker\n");
+    zone_reset();
+    ngx_test_set_time(1000);
+
+    ngx_http_cache_turbo_shm_breaker_record(&g_zone, 0, 1, 60);
+    REQUIRE(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+                == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
+            "breaker fixture: expected OPEN");
+
+    /* A request that started while the breaker was still CLOSED finally
+     * completes and reports success. It must be ignored. */
+    ngx_http_cache_turbo_shm_breaker_record(&g_zone, 1, 1, 60);
+    CHECK(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+              == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
+          "a stale pre-trip success closed the breaker");
 }
 
 
@@ -1097,11 +1167,14 @@ run_negative_controls(void)
         }
     }
 
-    /* O4.1-b restored: promote on EVERY caller once the open window has
-     * elapsed (i.e. drop the single-winner CAS and just return HALF_OPEN).
+    /* O4.1-b restored: return the STORED state instead of reserving HALF_OPEN
+     * for the CAS winner. That is what the first revision of this code did, and
+     * it is the herd bug: once one caller is promoted, every subsequent caller
+     * loads HALF_OPEN and is handed the probe's verdict.
+     *
      * test_breaker_half_open_admits_one_probe's second-caller assertion is the
-     * one that must break -- so the control asserts the buggy version would
-     * hand a SECOND caller a probe. */
+     * one that must break, so the control asks what a stored-state read would
+     * return to the second caller. */
     zone_reset();
     ngx_test_set_time(1000);
     ngx_http_cache_turbo_shm_breaker_record(&g_zone, 0, 1, 60);
@@ -1109,18 +1182,16 @@ run_negative_controls(void)
     {
         ngx_uint_t  first, second;
 
-        /* the bug: state is reported without taking the promotion CAS, so the
-         * breaker never leaves OPEN and every caller is told to probe. */
-        first  = NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN;
-        second = (g_sh.breaker_state == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN)
-                     ? NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN
-                     : NGX_HTTP_CACHE_TURBO_BREAKER_OPEN;
+        first = ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30);
+
+        /* the bug: hand back whatever is stored, with no winner check. */
+        second = (ngx_uint_t) g_sh.breaker_state;
 
         caught = (first == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN
                   && second == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN);
         tests_run++;
         if (!caught) {
-            fprintf(stderr, "  ✗ CONTROL O4.1-b: dropping the promotion CAS did "
+            fprintf(stderr, "  ✗ CONTROL O4.1-b: reading the stored state did "
                             "not admit a second probe — the single-winner "
                             "assertion guards nothing\n");
             tests_failed++;
@@ -1169,6 +1240,8 @@ main(void)
     test_breaker_window_rolls();
     test_breaker_half_open_admits_one_probe();
     test_breaker_probe_success_closes();
+    test_breaker_abandoned_probe_lease_recovers();
+    test_breaker_stale_success_does_not_close();
     test_breaker_threshold_zero_never_trips();
     test_breaker_state_strings();
     run_negative_controls();

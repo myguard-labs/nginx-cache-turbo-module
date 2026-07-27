@@ -687,8 +687,10 @@ typedef struct {
 
     /*
      * P6 circuit-breaker state (O4.1). Per-zone (D-5). Mutated ONLY by
-     * ngx_http_cache_turbo_shm_breaker_state() / _record(), and ONLY through
-     * ngx_atomic_cmp_set -- deliberately NO shpool->mutex. The breaker is
+     * ngx_http_cache_turbo_shm_breaker_state() / _record(). Every STATE
+     * transition goes through ngx_atomic_cmp_set; the counters and timestamps
+     * beside it are plain stores and fetch_adds (they are advisory -- see
+     * below). Deliberately NO shpool->mutex anywhere. The breaker is
      * consulted on the request path before the origin connect, which is the
      * hottest possible read site; taking the zone mutex there would serialise
      * every request in the zone behind a lock whose other holders do slab
@@ -696,7 +698,13 @@ typedef struct {
      * new mutex ordering to reason about (the module already has one deadlock
      * class from nesting shpool->mutex under itself -- see the l1->store()
      * warning in memory issues.md), and no way for a worker killed mid-update
-     * to leave the zone wedged.
+     * to leave the zone holding a lock nobody will release.
+     *
+     * ⚠ Lock-freedom does NOT by itself make the state machine liveness-safe.
+     * A worker killed after being promoted to the probe leaves the breaker in
+     * HALF_OPEN with nothing left to report the outcome, which would wedge it
+     * permanently. breaker_probe_at exists to bound exactly that: the promotion
+     * is a LEASE, and a stale one is reclaimed. See _breaker_state().
      *
      * The cost of that choice is that the fields are NOT mutually consistent
      * under concurrency, so nothing may read two of them and assume they
@@ -713,7 +721,9 @@ typedef struct {
     ngx_atomic_t             breaker_fails;        /* failures this window     */
     ngx_atomic_t             breaker_window_start; /* epoch s, window anchor   */
     ngx_atomic_t             breaker_opened_at;    /* epoch s the OPEN began   */
-    ngx_atomic_t             breaker_probe_at;     /* epoch s next probe is due*/
+    ngx_atomic_t             breaker_probe_at;     /* epoch s probe admitted;
+                                                    * its LEASE deadline is
+                                                    * this + open_for         */
     ngx_atomic_t             breaker_opens;        /* lifetime CLOSED→OPEN     */
 } ngx_http_cache_turbo_shctx_t;
 
