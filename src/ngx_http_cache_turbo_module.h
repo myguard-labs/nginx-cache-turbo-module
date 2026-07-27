@@ -1319,10 +1319,13 @@ size_t ngx_http_cache_turbo_redis_key(ngx_str_t *prefix, u_char *key_hash,
 
 /* Async write-through: fire-and-forget SET <key> <blob> PX <ms>. Copies
  * everything it needs into its own pool, never blocks the worker, and survives
- * the request being finalised. Best-effort: failures are logged, not fatal. */
+ * the request being finalised. Best-effort: failures are logged, not fatal.
+ * retain_ttl is the caller-computed L2 key lifetime (see the `set` slot doc
+ * comment on ngx_cache_turbo_backend_s) -- this function no longer derives
+ * it from fresh_ttl. */
 void ngx_http_cache_turbo_redis_set(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, u_char *key_hash,
-    u_char *blob, size_t blob_len, time_t fresh_ttl);
+    u_char *blob, size_t blob_len, time_t fresh_ttl, time_t retain_ttl);
 
 /* Async fire-and-forget DEL <key>: drop an entry from L2 so a purge that
  * cleared L1 cannot be refilled from Redis (issue P6). Own pool, never blocks,
@@ -1500,9 +1503,15 @@ struct ngx_cache_turbo_backend_s {
     ngx_int_t  (*get)(ngx_http_request_t *r,
         ngx_http_cache_turbo_loc_conf_t *clcf,
         ngx_http_cache_turbo_ctx_t *ctx);
+    /* fresh_ttl is the object's fresh lifetime (metadata/logging only --
+     * NOT the L2 key's expiry). retain_ttl is how long the L2 key itself
+     * must survive: the full serveable window (fresh ∪ stale ∪ any wider
+     * retention the caller has decided on). The caller computes retain_ttl;
+     * the backend must use it as-is and must NOT re-derive it from
+     * fresh_ttl. */
     void       (*set)(ngx_http_request_t *r,
         ngx_http_cache_turbo_loc_conf_t *clcf, u_char *key_hash,
-        u_char *blob, size_t blob_len, time_t fresh_ttl);
+        u_char *blob, size_t blob_len, time_t fresh_ttl, time_t retain_ttl);
     void       (*del)(ngx_http_cache_turbo_loc_conf_t *clcf, u_char *key_hash);
     void       (*del_raw)(ngx_http_cache_turbo_loc_conf_t *clcf, u_char *key,
         size_t key_len);

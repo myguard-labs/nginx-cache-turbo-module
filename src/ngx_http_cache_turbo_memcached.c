@@ -437,9 +437,8 @@ ngx_http_cache_turbo_mc_op_create(ngx_http_cache_turbo_loc_conf_t *clcf)
 static void
 ngx_http_cache_turbo_memcached_set(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, u_char *key_hash,
-    u_char *blob, size_t blob_len, time_t fresh_ttl)
+    u_char *blob, size_t blob_len, time_t fresh_ttl, time_t retain_ttl)
 {
-    time_t                         stale_ttl;
     ngx_pool_t                    *pool;
     ngx_buf_t                     *b;
     ngx_http_cache_turbo_mc_op_t  *op;
@@ -456,17 +455,17 @@ ngx_http_cache_turbo_memcached_set(ngx_http_request_t *r,
         return;
     }
 
-    /* L2 entry lives as long as the L1 copy could be served stale. */
-    stale_ttl = ngx_http_cache_turbo_stale_ttl(fresh_ttl, clcf->stale_mult);
-    if (stale_ttl <= 0) {
+    /* L2 entry lives as long as the caller says it should (retain_ttl) --
+     * the backend no longer derives its own window from fresh_ttl. */
+    if (retain_ttl <= 0) {
         return;
     }
     /* memcached interprets an exptime > 30 days as an ABSOLUTE Unix timestamp,
      * not a relative duration. A large relative window would otherwise be read
      * as a timestamp near the epoch and expire instantly — convert it to a real
      * absolute deadline so long-lived objects persist as intended. */
-    if (stale_ttl > 60 * 60 * 24 * 30) {
-        stale_ttl = ngx_time() + stale_ttl;
+    if (retain_ttl > 60 * 60 * 24 * 30) {
+        retain_ttl = ngx_time() + retain_ttl;
     }
 
     op = ngx_http_cache_turbo_mc_op_create(clcf);
@@ -493,7 +492,7 @@ ngx_http_cache_turbo_memcached_set(ngx_http_request_t *r,
     }
 
     p = ngx_sprintf(b->last, "set %*s 0 %T %uz\r\n", keylen, keybuf,
-                    stale_ttl, blob_len);
+                    retain_ttl, blob_len);
     p = ngx_cpymem(p, blob, blob_len);
     *p++ = CR; *p++ = LF;
     b->last = p;
