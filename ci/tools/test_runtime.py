@@ -1761,6 +1761,31 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # S4.2: `off` is not "no directive" -- it is an EMPTY mask, so nothing
+        # triggers a stale serve, not even the 5xx the default covers. Same
+        # keep_stale 1h window as its siblings, so the window is not what
+        # differs. Drives test_use_stale_off.
+        location /usestaleoff/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    1s;
+            cache_turbo_keep_stale 1h;
+            cache_turbo_use_stale off;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # S4.2: the two non-5xx tokens that are not 404. Covers the remaining
+        # explicit bits so no status token ships on parse-test evidence alone.
+        # Drives test_use_stale_403_429.
+        location /usestale403429/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    1s;
+            cache_turbo_keep_stale 1h;
+            cache_turbo_use_stale http_403 http_429;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # Negative control for /keepstale/: identical location, keep_stale off
         # (the default) -> an expired entry with a dead origin must surface the
         # error (502), not serve stale. Proves the positive result above is
@@ -8677,6 +8702,78 @@ def test_use_stale_any_5xx_bit(ng: Nginx, origin: Origin) -> None:
         drain_origin(origin)
 
 
+def test_use_stale_off(ng: Nginx, origin: Origin) -> None:
+    """S4.2: `cache_turbo_use_stale off` means an EMPTY mask -- no status
+    triggers a stale serve, including the 5xx the default covers.
+
+    /usestaleoff/ carries keep_stale 1h exactly like /usestaledefault/, so the
+    serve-on-error window is armed and identical; only the mask differs. A 503
+    must therefore surface as 503 here while the same request against the
+    default location serves stale. Without this, an `off` that merged as UNSET
+    (i.e. silently fell back to the default) would look identical to a working
+    `off` in every other test."""
+    s0, b0, _ = fetch(ng.port, "/usestaleoff/z")
+    assert s0 == 200 and b0, f"prime failed: {s0} {b0!r}"
+    sd0, bd0, _ = fetch(ng.port, "/usestaledefault/z")
+    assert sd0 == 200 and bd0, f"default-location prime failed: {sd0} {bd0!r}"
+
+    time.sleep(4.6)     # fully expired
+    origin.fail = True
+    try:
+        s, _, h = fetch(ng.port, "/usestaleoff/z")
+        assert s == 503, \
+            f"use_stale off served {s} on a 503, expected the origin's 503"
+        assert h.get("x-cache") != "STALE-IF-ERROR", \
+            "use_stale off must never serve-on-error"
+
+        # Same request, same window, default mask -> stale. Proves the 503
+        # above is caused by `off` and not by a missing or short SIE window.
+        s2, b2, h2 = fetch(ng.port, "/usestaledefault/z")
+        assert s2 == 200, f"default use_stale served {s2}, expected stale 200"
+        assert b2 == bd0, f"served {b2!r}, expected stale {bd0!r}"
+        assert h2.get("x-cache") == "STALE-IF-ERROR", \
+            f"expected STALE-IF-ERROR, got x-cache={h2.get('x-cache')}"
+    finally:
+        origin.fail = False
+        drain_origin(origin)
+
+
+def test_use_stale_403_429(ng: Nginx, origin: Origin) -> None:
+    """S4.2: the remaining explicit non-5xx tokens. `cache_turbo_use_stale
+    http_403 http_429` must trigger on both statuses it names and on nothing
+    else -- in particular not on a 503, which the DEFAULT would have covered.
+
+    This is the multi-token arm: it also proves the parser's accumulation
+    across tokens reaches the trigger intact, which the S4.1 parse tests could
+    only prove as far as `nginx -t`."""
+    s0, b0, _ = fetch(ng.port, "/usestale403429/w")
+    assert s0 == 200 and b0, f"prime failed: {s0} {b0!r}"
+
+    time.sleep(4.6)     # fully expired
+    origin.fail = True
+    try:
+        for status in (403, 429):
+            origin.fail_status = status
+            s, b, h = fetch(ng.port, "/usestale403429/w")
+            assert s == 200, \
+                f"use_stale http_403 http_429 served {s} on a {status}, expected stale 200"
+            assert b == b0, f"served {b!r} on a {status}, expected stale {b0!r}"
+            assert h.get("x-cache") == "STALE-IF-ERROR", \
+                f"expected STALE-IF-ERROR on {status}, got x-cache={h.get('x-cache')}"
+
+        # A 5xx is NOT in this mask, even though the default covers it.
+        origin.fail_status = 503
+        s2, _, h2 = fetch(ng.port, "/usestale403429/w")
+        assert s2 == 503, \
+            f"use_stale http_403 http_429 served {s2} on a 503, expected the origin's 503"
+        assert h2.get("x-cache") != "STALE-IF-ERROR", \
+            "a status outside the mask must not serve-on-error"
+    finally:
+        origin.fail = False
+        origin.fail_status = 503
+        drain_origin(origin)
+
+
 def test_keep_stale_loses_to_response_sie(ng: Nginx, origin: Origin) -> None:
     """S2.2 / D-1: a HONORED response stale-if-error wins over
     cache_turbo_keep_stale when both are available -- NOT max(). /keepstalewins/
@@ -12787,6 +12884,8 @@ def run_all(ng: Nginx, origin: Origin,
     test_keep_stale_loses_to_response_sie(ng, origin)       # S2.2 / D-1 precedence
     test_use_stale_http_404(ng, origin)                     # S4.2 mask selects trigger
     test_use_stale_any_5xx_bit(ng, origin)                  # S4.2 ANY_5XX bit
+    test_use_stale_off(ng, origin)                          # S4.2 off = empty mask
+    test_use_stale_403_429(ng, origin)                      # S4.2 non-5xx tokens
     test_keep_stale_no_reaper_lru_only_reclaim(ng, origin)  # S2.3 no-reaper contract
     test_5xx_never_overwrites_cached_body(ng, origin)       # O6/S3.1 5xx-never-clobbers
     test_background_update_off_regenerates_inline(ng, origin)
