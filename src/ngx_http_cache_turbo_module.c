@@ -4905,6 +4905,12 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                  * MISS. Covers the L1-absent / L1-evicted case where the L1
                  * fall-through above never ran. */
                 ctx->status = NGX_HTTP_CACHE_TURBO_ST_EXPIRED;
+                /* V-HANG-2: L2 HAS the key, we just cannot serve it. If we are
+                 * a cold-miss waiter, the fill we are parked for has already
+                 * landed — every further poll re-fetches this same unserveable
+                 * blob, so waiting out lock_timeout adds pure latency. Record
+                 * it; the wait loop gives up on the next re-entry. */
+                ctx->l2_present_unserveable = 1;
                 ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                                "cache_turbo: L2 blob expired \"%V\" key=%ui "
                                "-> origin", &r->uri, (ngx_uint_t) hash);
@@ -5160,6 +5166,30 @@ ngx_http_cache_turbo_cold_wait(ngx_http_request_t *r,
         ctx->waiting = 1;
         ctx->wait_deadline = now + clcf->lock_timeout;
         (void) ngx_atomic_fetch_add(&z->sh->lock_waits, 1);
+    }
+
+    /* V-HANG-2: a previous re-poll already found the key PRESENT in L2 but past
+     * its stored stale window. The winner's fill has landed; it is simply not
+     * serveable to us. Polling again can only re-read the same blob, so stop
+     * waiting and regenerate now instead of burning the rest of lock_timeout.
+     *
+     * ⚠ This is NOT an early `unlock`. The cross-node NX lock is still held by
+     * its owner and still expires only by PX (module.h: unlock stays NULL, and
+     * releasing it here would re-open the dogpile window). We only stop THIS
+     * waiter from parking for a fill that has demonstrably already happened —
+     * the per-box stub still single-flights this box.
+     *
+     * Bites whenever the stored stale window is shorter than lock_ttl: e.g.
+     * cache_turbo_stale_mult 1 makes stale_window == fresh_ttl, so the entry is
+     * unserveable ~1s after it is written while the lock lives 5s. Every
+     * request in that gap stalled the full lock_timeout (~5s) before this. */
+    if (ctx->waiting && ctx->l2_present_unserveable) {
+        ctx->waiting = 0;
+        (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "cache_turbo: cold-wait sees L2 filled-but-unserveable "
+                       "\"%V\" -> origin", &r->uri);
+        return NGX_DECLINED;
     }
 
     remaining = (ngx_msec_int_t) (ctx->wait_deadline - now);

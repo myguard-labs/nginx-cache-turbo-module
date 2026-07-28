@@ -1227,6 +1227,12 @@ typedef struct {
      * must not re-claim); wait_deadline is the give-up time (ngx_current_msec
      * clock); cold_wait_ev is the per-request poll timer (data = r). */
     unsigned                 waiting:1;   /* in the cold-miss wait loop       */
+    /* V-HANG-2: a cold-wait re-poll saw L2 HOLD this key but reject it as
+     * unserveable (past its stored stale window). The fill we are waiting for
+     * has therefore already happened and no further poll can change the answer
+     * — keep waiting and we burn the rest of lock_timeout for nothing. Set on
+     * the L2-hit-but-expired branch, checked at the top of the wait loop. */
+    unsigned                 l2_present_unserveable:1;
     ngx_msec_t               wait_deadline;/* give up + go to origin at this   */
     ngx_event_t              cold_wait_ev; /* poll timer for the wait loop     */
     /* This request is the cold-miss WINNER that owns the in-flight stub: it

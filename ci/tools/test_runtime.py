@@ -11024,6 +11024,64 @@ def test_l2_sie_serve_survives_l1_purge(ng: Nginx, origin: Origin,
         drain_origin(origin)
 
 
+def test_l2_stale_refetch_does_not_stall_on_lock(ng: Nginx, origin: Origin,
+                                                 redis: RedisServer) -> None:
+    """V-HANG-2: a request that finds an entry past its stored stale window must
+    go to the origin PROMPTLY, not sit in the cold-miss wait loop until the
+    cross-node NX lock expires.
+
+    The trap: the winner takes `SET <prefix>lock:<hex> NX PX <lock_ttl*1000>`
+    (default 5s) and it is released ONLY by PX expiry -- `unlock` is
+    deliberately NULL (module.h), because an early unlock would re-open the
+    dogpile window. That is fine as long as waiters can serve the fill. But
+    /l2sie/ sets cache_turbo_stale_mult 1, so stale_window == fresh_ttl == 1s:
+    ~1s after the winner stores, the object is UNSERVEABLE while its lock is
+    still alive for ~4s more. Every request in that gap lost the NX, entered
+    ngx_http_cache_turbo_cold_wait(), re-polled L2 every 100ms
+    (LOCK_POLL_MS), got the same unserveable blob back each time, and only
+    reached the origin after the full lock_timeout (default 5000ms).
+
+    That is a ~5s user-visible stall on a healthy origin with a healthy cache.
+    It also made test_l2_sie_serve_survives_l1_purge look like a flaky timeout,
+    because HTTP_TIMEOUT is also 5s -- the client lost that dead heat.
+
+    ⚠ ASSERT ON WALL-CLOCK, not just status. With the bug present this request
+    still returns 200, just ~5.05s later, so a status-only assertion passes
+    with the bug fully restored.
+
+    Negative control: revert the `ctx->l2_present_unserveable` give-up in
+    cold_wait (module.c) -- e.g. `if (0 && ctx->waiting && ...)` -- and the
+    elapsed assertion below fails at ~5.0s while every other assertion here
+    still passes."""
+    uri = "/l2sie/l2sie-nostall"
+    key = l2_key(uri)
+    redis.cli("DEL", key)
+
+    s0, _, _ = fetch(ng.port, uri)              # miss -> store L1 + L2, takes NX
+    assert s0 == 200, f"prime should reach origin, got {s0}"
+    assert wait_for(lambda: redis.cli("EXISTS", key) == "1"), \
+        "object never written to L2"
+
+    # Past the 1s stale window but well inside the 5s lock PX: the exact gap
+    # where the winner's lock is still held and its object is unserveable.
+    time.sleep(1.3)
+
+    t0 = time.time()
+    s1, _, _ = fetch(ng.port, uri)
+    elapsed = time.time() - t0
+
+    assert s1 == 200, f"stale refetch should serve 200 from origin, got {s1}"
+    # lock_timeout defaults to 5000ms; the stall was the FULL window. A healthy
+    # refetch is ~50ms here, so 2s is far above real latency and far below the
+    # 5s bug -- it cannot pass with the give-up removed.
+    assert elapsed < 2.0, (
+        f"stale refetch took {elapsed:.2f}s -- it stalled in the cold-miss wait "
+        f"loop waiting out the cross-node NX lock (V-HANG-2). Expected <2s; "
+        f"the bug parks for the full lock_timeout (~5s).")
+
+    drain_origin(origin)
+
+
 def tag_key(name: str, prefix: str = "ct:") -> str:
     """Mirror the module's tag-set key: <prefix>tag:<name>."""
     return f"{prefix}tag:{name}"
@@ -12958,6 +13016,7 @@ def run_all(ng: Nginx, origin: Origin,
         test_sie_ttl_stored_in_blob(ng, origin, redis)      # RFC-2 CTB4 sie_ttl
         test_l2_retain_ttl_covers_sie(ng, origin, redis)    # S1.2 retain_ttl
         test_l2_sie_serve_survives_l1_purge(ng, origin, redis)  # S1.2 e2e serve
+        test_l2_stale_refetch_does_not_stall_on_lock(ng, origin, redis)  # V-HANG-2
         test_l2_tag_add_on_store(ng, origin, redis)
         test_l2_tag_truncation_warns(ng, origin, redis)
         test_l2_tag_purge(ng, origin, redis)
