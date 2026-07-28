@@ -663,6 +663,27 @@ class Origin:
             self._server = None
 
 
+def _errlog_level() -> str:
+    """error_log level for the harness nginx, overridable for diagnosis.
+
+    Defaults to `notice`, which is what CI and every normal run want. Set
+    TEST_CT_ERRLOG=debug to make the module's ngx_log_debug sites (memo skips,
+    cold-wait give-ups, L2 verdicts) land in logs/error.log -- the cheap way to
+    identify WHICH uri tripped a zone-global counter assertion in a long suite,
+    instead of bisecting a couple of hundred tests by hand.
+
+    The binary must be built --with-debug for `debug` to do anything; the
+    harness build is (see objs/ngx_auto_config.h). Debug on a full suite is a
+    large log, hence opt-in rather than the default.
+    """
+    lvl = os.environ.get("TEST_CT_ERRLOG", "notice").strip() or "notice"
+    allowed = {"debug", "info", "notice", "warn", "error", "crit", "alert", "emerg"}
+    if lvl not in allowed:
+        raise SystemExit(f"TEST_CT_ERRLOG={lvl!r} is not an nginx log level "
+                         f"(one of: {', '.join(sorted(allowed))})")
+    return lvl
+
+
 def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
                  origin_port: int, workers: int,
                  redis_port: int | None = None,
@@ -959,6 +980,31 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # V-HANG-2 single-flight guard rail. The give-up added for V-HANG-2 must
+        # fire only on a cold-wait RE-POLL, never on a first pass -- otherwise
+        # every cold-miss loser bypasses the wait loop and the burst stampedes.
+        #
+        # Reproducing that needs an L2 blob that is PRESENT but UNSERVEABLE while
+        # a burst arrives, WITHOUT the regens being explainable by ordinary
+        # re-expiry. /l2sie/ cannot do it: its cache_turbo_valid is 1s, so entries
+        # legitimately re-expire mid-burst and 40 regens is correct behaviour
+        # there (verified against stock -- identical counts).
+        #
+        # So: fresh_ttl 30s (a regen stays fresh for the whole burst, hence any
+        # stampede is real) but stale_mult 1, so the FIRST entry is unserveable
+        # 30s after it is stored. The test primes, expires the L2 object by hand,
+        # and bursts -- see test_l2_unserveable_giveup_still_single_flights.
+        location /sfgu/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    30s;
+            cache_turbo_stale_mult 1;
+            cache_turbo_lock_ttl 5s;
+            cache_turbo_purge    on;   # test drops L1 so the burst consults L2
+            cache_turbo_redis    127.0.0.1:{redis_port} prefix=ct: timeout=250ms;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # S1.2: stale_mult 1 collapses stale_window == fresh_ttl (1s), so a
         # stale-if-error=3600 response's sie window (3601s) is far wider than
         # the stale window. Proves the L2 key's retain_ttl covers sie, not
@@ -1249,7 +1295,7 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
 
     return f"""{load}worker_processes {workers};
 pid {root}/nginx.pid;
-error_log {root}/logs/error.log notice;
+error_log {root}/logs/error.log {_errlog_level()};
 
 events {{ worker_connections 512; }}
 
@@ -7407,18 +7453,33 @@ def test_valid_zero_is_forever(ng: Nginx, origin: Origin) -> None:
     (a HIT), not become instantly stale. Pre-fix a literal 0 fresh TTL made the
     very next request a STALE serve and broke L2; now it resolves to a long
     finite TTL and behaves as a normal long-lived HIT."""
-    base = origin.hits
-    _, b0, h0 = fetch(ng.port, "/forever/f")
+    # Path-scoped, NOT origin.hits: the global counter sees every other test's
+    # traffic (and async bg-refresh subrequests) landing between the base capture
+    # and the assertion below, which fails an equality bound that has nothing to
+    # do with this location. That is a real failure mode, not a hypothetical --
+    # it took down the ASan multi-worker arm on 28ae802 (SUITE-3), the slowest arm
+    # and so the one with the widest window. Same fix as test_206_never_cached and
+    # test_honor_ttl_clamped_to_max directly below.
+    #
+    # /!\ The needle is in the FILENAME, not the location prefix. /forever/ uses
+    # `proxy_pass http://.../;` WITH a trailing slash, so nginx strips the prefix
+    # and the origin only ever sees "/forever-f" -- hits_for("/forever/") matches
+    # nothing and the assertion fails with the entry behaving perfectly. Same trap
+    # as the /l2sie/ fixture (s121). This is why ttlclamp works: its needle is the
+    # filename too.
+    base = origin.hits_for("forever-f")
+    _, b0, h0 = fetch(ng.port, "/forever/forever-f")
     assert "x-cache" not in h0, "first should miss to origin"
-    _, b1, h1 = fetch(ng.port, "/forever/f")
+    _, b1, h1 = fetch(ng.port, "/forever/forever-f")
     assert h1.get("x-cache") == "HIT", \
         f"valid 0 must serve a FRESH HIT, got X-Cache={h1.get('x-cache')}"
     assert b1 == b0, "HIT served a different body"
     time.sleep(2.0)
-    _, b2, h2 = fetch(ng.port, "/forever/f")
+    _, b2, h2 = fetch(ng.port, "/forever/forever-f")
     assert h2.get("x-cache") == "HIT", \
         f"valid 0 must still be fresh after a delay, got X-Cache={h2.get('x-cache')}"
-    assert origin.hits == base + 1, \
+    assert b2 == b0, "the 'forever' entry served a different body after the delay"
+    assert origin.hits_for("forever-f") == base + 1, \
         "a 'forever' entry must not re-hit the origin while fresh"
 
 
@@ -9283,6 +9344,30 @@ def test_min_uses_rejects_out_of_range(ng: Nginx) -> None:
             f"cache_turbo_min_uses {good} (a legal boundary) was rejected:\n{r.stdout}"
 
 
+def _recent_memo_skips(ng: Nginx, limit: int = 8) -> str:
+    """Tail the URIs most recently skipped by a negative memo, for diagnostics.
+
+    Reads the module's own `L2 GET skipped by negative memo "<uri>"` debug line
+    out of logs/error.log. Only produces anything when the harness ran with
+    TEST_CT_ERRLOG=debug (see _errlog_level) -- otherwise those lines are below
+    the log level and this returns a hint saying so.
+
+    Diagnostic only: never assert on this. It exists so that a failure of a
+    ZONE-GLOBAL counter assertion names the uri that actually bumped the
+    counter, rather than leaving the reader to bisect the suite.
+    """
+    log = ng.root / "logs" / "error.log"
+    try:
+        text = log.read_text(errors="replace")
+    except OSError as exc:
+        return f"<error.log unreadable: {exc}>"
+    hits = re.findall(r'L2 GET skipped by negative memo "([^"]*)"', text)
+    if not hits:
+        return ("<none logged -- re-run with TEST_CT_ERRLOG=debug>"
+                if _errlog_level() != "debug" else "<none logged at debug>")
+    return ", ".join(hits[-limit:])
+
+
 def _admin_l2_neg_skips(ng: Nginx) -> int:
     """L13: count of L2 GETs skipped by a live negative memo (admin stats)."""
     import json
@@ -9552,10 +9637,17 @@ def test_l2_negative_ttl_not_armed_by_outage(ng: Nginx, origin: Origin,
     s, _, _ = fetch(ng.port, uri)
     assert s == 200, f"post-recovery status {s}"
 
-    assert _admin_l2_neg_skips(ng) - skips0 == 0, (
+    delta = _admin_l2_neg_skips(ng) - skips0
+    assert delta == 0, (
         "an L2 outage armed the negative memo: the post-recovery request was "
         "memo-skipped instead of re-consulting L2, so a transient outage keeps L2 "
-        "switched off for up to l2_negative_ttl afterwards (Codex #5)")
+        "switched off for up to l2_negative_ttl afterwards (Codex #5)"
+        f"\n  l2_neg_skips delta={delta} (expected 0), this test's uri={uri}"
+        f"\n  skipped keys in the window: {_recent_memo_skips(ng, limit=8)}"
+        "\n  NOTE l2_neg_skips is ZONE-GLOBAL: a skip logged against a DIFFERENT"
+        " uri means another request bled into this window, not that this uri's"
+        " memo was armed by the outage. Re-run with TEST_CT_ERRLOG=debug to"
+        " populate the key list above.")
 
 
 def test_min_uses_counter_survives_uncacheable(ng: Nginx, origin: Origin,
@@ -11022,6 +11114,171 @@ def test_l2_sie_serve_survives_l1_purge(ng: Nginx, origin: Origin,
     finally:
         origin.fail = False
         drain_origin(origin)
+
+
+def test_l2_stale_refetch_does_not_stall_on_lock(ng: Nginx, origin: Origin,
+                                                 redis: RedisServer) -> None:
+    """V-HANG-2: a request that finds an entry past its stored stale window must
+    go to the origin PROMPTLY, not sit in the cold-miss wait loop until the
+    cross-node NX lock expires.
+
+    The trap: the winner takes `SET <prefix>lock:<hex> NX PX <lock_ttl*1000>`
+    (default 5s) and it is released ONLY by PX expiry -- `unlock` is
+    deliberately NULL (module.h), because an early unlock would re-open the
+    dogpile window. That is fine as long as waiters can serve the fill. But
+    /l2sie/ sets cache_turbo_stale_mult 1, so stale_window == fresh_ttl == 1s:
+    ~1s after the winner stores, the object is UNSERVEABLE while its lock is
+    still alive for ~4s more. Every request in that gap lost the NX, entered
+    ngx_http_cache_turbo_cold_wait(), re-polled L2 every 100ms
+    (LOCK_POLL_MS), got the same unserveable blob back each time, and only
+    reached the origin after the full lock_timeout (default 5000ms).
+
+    That is a ~5s user-visible stall on a healthy origin with a healthy cache.
+    It also made test_l2_sie_serve_survives_l1_purge look like a flaky timeout,
+    because HTTP_TIMEOUT is also 5s -- the client lost that dead heat.
+
+    ⚠ ASSERT ON WALL-CLOCK, not just status. With the bug present this request
+    still returns 200, just ~5.05s later, so a status-only assertion passes
+    with the bug fully restored.
+
+    Negative control: revert the `ctx->l2_present_unserveable` give-up in
+    cold_wait (module.c) -- e.g. `if (0 && ctx->waiting && ...)` -- and the
+    elapsed assertion below fails at ~5.0s while every other assertion here
+    still passes."""
+    uri = "/l2sie/l2sie-nostall"
+    key = l2_key(uri)
+    redis.cli("DEL", key)
+
+    s0, _, _ = fetch(ng.port, uri)              # miss -> store L1 + L2, takes NX
+    assert s0 == 200, f"prime should reach origin, got {s0}"
+    assert wait_for(lambda: redis.cli("EXISTS", key) == "1"), \
+        "object never written to L2"
+
+    # Past the 1s stale window but well inside the 5s lock PX: the exact gap
+    # where the winner's lock is still held and its object is unserveable.
+    time.sleep(1.3)
+
+    # sleep() only guarantees a LOWER bound. If the box stalls long enough for
+    # the 5s lock PX to expire before the fetch below, the request no longer
+    # meets a held lock and the test passes without exercising the window it
+    # exists to cover. Assert the lock is still alive, with enough margin left
+    # that a stall could not be mistaken for a healthy sub-2s response.
+    lock_pttl = int(redis.cli("PTTL", lock_key(uri)))
+    assert lock_pttl > 2000, (
+        f"cross-node lock has only {lock_pttl}ms left (or is gone: -2). The "
+        f"unserveable-object/held-lock window has already closed, so this run "
+        f"would not exercise V-HANG-2 at all.")
+
+    t0 = time.time()
+    s1, _, _ = fetch(ng.port, uri)
+    elapsed = time.time() - t0
+
+    assert s1 == 200, f"stale refetch should serve 200 from origin, got {s1}"
+    # lock_timeout defaults to 5000ms; the stall was the FULL window. A healthy
+    # refetch is ~50ms here, so 2s is far above real latency and far below the
+    # 5s bug -- it cannot pass with the give-up removed.
+    assert elapsed < 2.0, (
+        f"stale refetch took {elapsed:.2f}s -- it stalled in the cold-miss wait "
+        f"loop waiting out the cross-node NX lock (V-HANG-2). Expected <2s; "
+        f"the bug parks for the full lock_timeout (~5s).")
+
+    drain_origin(origin)
+
+
+def test_l2_unserveable_giveup_still_single_flights(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    """V-HANG-2 guard rail: the give-up must not defeat cold-miss single-flight.
+
+    The V-HANG-2 fix lets a cold-miss waiter stop parking once it sees the key
+    PRESENT in L2 but past its stored stale window -- the fill it was waiting
+    for has already landed, so further polling only burns lock_timeout.
+
+    ⚠ That inference is valid ONLY on a cold-wait RE-POLL. The set site
+    (module.c, the L2-hit-but-expired branch) fires on ANY L2 lookup, including
+    the very first one. If the give-up is gated on `ctx->waiting`, it guards
+    nothing: cold_wait() sets `waiting = 1` a few lines ABOVE the check, so it
+    is unconditionally true on first entry too. A CLAIM_LOSER then reads the
+    same expired blob on its FIRST pass -- before the winner has written
+    anything -- gives up immediately, and goes straight to the origin. Every
+    loser in a burst does the same, so the whole burst stampedes.
+
+    Hence the real gate is `ctx->wait_polled`, set at the park site only after
+    the timer is armed.
+
+    ⚠ It deliberately does NOT reuse /l2sie/. That location sets
+    cache_turbo_valid 1s, so a regenerated entry is stale again within the
+    burst and 40 origin fetches is CORRECT behaviour there -- verified by
+    running this exact burst against stock: identical counts (40 regens, 40
+    lock_waits). A stampede assertion on /l2sie/ would fail on fixed and stock
+    alike and prove nothing.
+
+    /sfgu/ instead has fresh_ttl 30s with stale_mult 1, so once the primed entry
+    is unserveable, any regen stays fresh for the whole burst -- every extra
+    origin fetch is then a genuine single-flight failure. The entry is aged by
+    rewriting the blob's `created` field (i64 at offset 24) rather than by
+    sleeping 30s.
+
+    Negative control: relax the gate back to `ctx->waiting` in cold_wait
+    (module.c) and the `regens` assertion below fails, while
+    test_l2_stale_refetch_does_not_stall_on_lock above still passes -- the two
+    tests pin opposite edges of the same branch."""
+    uri = "/sfgu/sfgu-k1"
+    key = l2_key(uri)
+    redis.cli("DEL", key)
+
+    s0, _, _ = fetch(ng.port, uri)              # miss -> store L1 + L2, takes NX
+    assert s0 == 200, f"prime should reach origin, got {s0}"
+    assert wait_for(lambda: redis.cli("EXISTS", key) == "1"), \
+        "object never written to L2"
+
+    # Age the L2 blob past its stale window WITHOUT waiting for it: rewrite
+    # `created` (i64 @24) to 60s ago. fresh_ttl is 30 and stale_mult 1 makes
+    # stale_ttl 30, so the object is now PRESENT-but-UNSERVEABLE -- exactly the
+    # state that arms l2_present_unserveable on the very first L2 lookup.
+    blob = redis.get_raw(key)
+    assert blob is not None and len(blob) >= 44, f"short/absent blob: {blob!r}"
+    fresh_ttl, stale_ttl, _sie = struct.unpack("<III", blob[32:44])
+    assert fresh_ttl == 30 and stale_ttl == 30, (
+        f"/sfgu/ fixture drifted: fresh_ttl={fresh_ttl} stale_ttl={stale_ttl}, "
+        f"expected 30/30 (valid 30s + stale_mult 1). Without stale_ttl == "
+        f"fresh_ttl the aged blob is still serveable and this test is vacuous.")
+
+    # ⚠ ORDER MATTERS. PURGE is L2-aware -- it DELETEs the Redis key too -- so
+    # the L1 drop has to happen BEFORE the aged blob is written, or the setup
+    # deletes the very object under test and the burst sees a plain cold miss.
+    s_p, b_p, _ = fetch_raw(ng.port, uri, method="PURGE")
+    assert s_p == 200, f"PURGE status {s_p}: {b_p}"
+    aged = blob[:24] + struct.pack("<q", int(time.time()) - 60) + blob[32:]
+    redis.set_raw(key, aged, 3_600_000)
+    assert redis.get_raw(key) == aged, "aged blob did not land in L2"
+
+    base = origin.hits
+    waits0 = _admin_lock_waits(ng)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=40) as pool:
+        results = list(pool.map(lambda _: fetch(ng.port, uri), range(40)))
+
+    assert {r[0] for r in results} == {200}, \
+        f"expired-L2 burst returned {set(r[0] for r in results)}"
+
+    # A regen here stays fresh for 30s, so after the first one every other
+    # reader can be served: extra origin fetches are genuine single-flight
+    # failures, not re-expiry. The give-up may still legitimately cost a few
+    # (a waiter that re-polls and finds the blob unserveable regenerates), so
+    # the bound is loose -- but with the gate wrongly on ctx->waiting all 40
+    # bypass the wait loop and reach the origin.
+    regens = origin.hits - base
+    assert regens <= 5, (
+        f"expired-L2 burst stampeded: {regens} origin fetches for 40 readers. "
+        f"The V-HANG-2 give-up fired on the FIRST pass instead of on a re-poll, "
+        f"so every cold-miss loser bypassed the wait loop.")
+
+    # ...and it must collapse VIA the wait path, not by luck: at least one
+    # request has to have actually parked. Without this the assertion above
+    # could pass on a run where the requests merely serialised.
+    assert _admin_lock_waits(ng) - waits0 > 0, \
+        "no requests waited — single-flight did not engage on the expired-L2 burst"
+
+    drain_origin(origin)
 
 
 def tag_key(name: str, prefix: str = "ct:") -> str:
@@ -12958,6 +13215,8 @@ def run_all(ng: Nginx, origin: Origin,
         test_sie_ttl_stored_in_blob(ng, origin, redis)      # RFC-2 CTB4 sie_ttl
         test_l2_retain_ttl_covers_sie(ng, origin, redis)    # S1.2 retain_ttl
         test_l2_sie_serve_survives_l1_purge(ng, origin, redis)  # S1.2 e2e serve
+        test_l2_stale_refetch_does_not_stall_on_lock(ng, origin, redis)  # V-HANG-2
+        test_l2_unserveable_giveup_still_single_flights(ng, origin, redis)
         test_l2_tag_add_on_store(ng, origin, redis)
         test_l2_tag_truncation_warns(ng, origin, redis)
         test_l2_tag_purge(ng, origin, redis)
@@ -13215,3 +13474,4 @@ if __name__ == "__main__":
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         raise
+

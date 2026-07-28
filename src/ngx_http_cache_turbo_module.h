@@ -1003,6 +1003,27 @@ typedef struct {
      * yet (that is S4.2). */
     ngx_uint_t               use_stale;
 
+    /* P6/O4.2 circuit-breaker tuning. Fed to
+     * ngx_http_cache_turbo_shm_breaker_record() from the request path; the
+     * O4.3 serve-path read and the directives that set these are O4.4.
+     *
+     * ⚠ Both merge to 0, and 0 is INERT on purpose (see the contract in
+     * _breaker_record(): threshold == 0 disables tripping, window == 0
+     * likewise). Until O4.4 adds the parsers there is no config that can make
+     * either non-zero, so O4.2 records outcomes into a breaker that can never
+     * trip -- behaviour is byte-for-byte unchanged, which is what makes this
+     * step safe to merge on its own, exactly as O4.1 was.
+     *
+     * NOT derived from `use_stale`. "Should I serve stale?" and "is the origin
+     * down?" are different questions that merely overlap on 5xx: use_stale may
+     * legitimately name 403/404/429, all of which are a HEALTHY origin
+     * answering correctly. Counting those as origin failures would let a
+     * 404-heavy site trip its own breaker and 503 everything while the origin
+     * was fine. The breaker's failure test is 5xx-only -- see
+     * ngx_http_cache_turbo_breaker_is_origin_failure(). */
+    ngx_uint_t               breaker_threshold; /* failures to trip; 0 = off  */
+    time_t                   breaker_window;    /* rolling window s; 0 = off  */
+
     /* L2 Redis (v2b). Native async client, no hiredis. The L2 store is touched
      * only on an L1 miss (sync GET) and on store (async write-through); it is
      * never on the L1-hit hot path. */
@@ -1206,6 +1227,27 @@ typedef struct {
      * must not re-claim); wait_deadline is the give-up time (ngx_current_msec
      * clock); cold_wait_ev is the per-request poll timer (data = r). */
     unsigned                 waiting:1;   /* in the cold-miss wait loop       */
+    /* V-HANG-2: a cold-wait re-poll saw L2 HOLD this key but reject it as
+     * unserveable (past its stored stale window). The fill we are waiting for
+     * has therefore already happened and no further poll can change the answer
+     * — keep waiting and we burn the rest of lock_timeout for nothing. Set on
+     * the L2-hit-but-expired branch, checked at the top of the wait loop.
+     *
+     * ⚠ Only meaningful together with wait_polled below. The set site fires on
+     * ANY L2-hit-but-expired lookup, including the very first one, so on its own
+     * it cannot distinguish "the fill already landed" from "we have not waited
+     * for the fill yet" — see wait_polled. */
+    unsigned                 l2_present_unserveable:1;
+    /* This request has completed at least one cold-wait POLL (it parked on the
+     * timer and came back). Set at the park site, never cleared.
+     *
+     * The V-HANG-2 give-up above is only sound once this is set: it concludes
+     * "the winner's fill has already landed" from seeing the key present in L2,
+     * and that inference holds only for a re-poll. On the FIRST pass a
+     * CLAIM_LOSER can see the same expired blob before the winner has written
+     * anything — giving up there sends every loser straight to the origin and
+     * defeats the single-flight this loop exists to provide. */
+    unsigned                 wait_polled:1;
     ngx_msec_t               wait_deadline;/* give up + go to origin at this   */
     ngx_event_t              cold_wait_ev; /* poll timer for the wait loop     */
     /* This request is the cold-miss WINNER that owns the in-flight stub: it

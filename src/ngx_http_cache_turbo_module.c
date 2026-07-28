@@ -4905,6 +4905,12 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                  * MISS. Covers the L1-absent / L1-evicted case where the L1
                  * fall-through above never ran. */
                 ctx->status = NGX_HTTP_CACHE_TURBO_ST_EXPIRED;
+                /* V-HANG-2: L2 HAS the key, we just cannot serve it. If we are
+                 * a cold-miss waiter, the fill we are parked for has already
+                 * landed — every further poll re-fetches this same unserveable
+                 * blob, so waiting out lock_timeout adds pure latency. Record
+                 * it; the wait loop gives up on the next re-entry. */
+                ctx->l2_present_unserveable = 1;
                 ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                                "cache_turbo: L2 blob expired \"%V\" key=%ui "
                                "-> origin", &r->uri, (ngx_uint_t) hash);
@@ -5162,6 +5168,38 @@ ngx_http_cache_turbo_cold_wait(ngx_http_request_t *r,
         (void) ngx_atomic_fetch_add(&z->sh->lock_waits, 1);
     }
 
+    /* V-HANG-2: a previous re-poll already found the key PRESENT in L2 but past
+     * its stored stale window. The winner's fill has landed; it is simply not
+     * serveable to us. Polling again can only re-read the same blob, so stop
+     * waiting and regenerate now instead of burning the rest of lock_timeout.
+     *
+     * ⚠ This is NOT an early `unlock`. The cross-node NX lock is still held by
+     * its owner and still expires only by PX (module.h: unlock stays NULL, and
+     * releasing it here would re-open the dogpile window). We only stop THIS
+     * waiter from parking for a fill that has demonstrably already happened —
+     * the per-box stub still single-flights this box.
+     *
+     * Bites whenever the stored stale window is shorter than lock_ttl: e.g.
+     * cache_turbo_stale_mult 1 makes stale_window == fresh_ttl, so the entry is
+     * unserveable ~1s after it is written while the lock lives 5s. Every
+     * request in that gap stalled the full lock_timeout (~5s) before this.
+     *
+     * ⚠ Gated on wait_polled, NOT on ctx->waiting: waiting is set unconditionally
+     * a few lines above, so it is always 1 by the time we read it here and tests
+     * nothing. The inference "the fill has already landed" is only valid AFTER we
+     * have actually parked once — on the first pass a CLAIM_LOSER can reach this
+     * with the flag set by its own initial L2 lookup, before the winner has
+     * written anything, and giving up there stampedes the origin with every
+     * loser. Do not relax this back to ctx->waiting. */
+    if (ctx->wait_polled && ctx->l2_present_unserveable) {
+        ctx->waiting = 0;
+        (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "cache_turbo: cold-wait sees L2 filled-but-unserveable "
+                       "\"%V\" -> origin", &r->uri);
+        return NGX_DECLINED;
+    }
+
     remaining = (ngx_msec_int_t) (ctx->wait_deadline - now);
     if (remaining <= 0) {
         /* Waited long enough: give up and regenerate ourselves. Our store ends
@@ -5231,6 +5269,10 @@ ngx_http_cache_turbo_cold_wait(ngx_http_request_t *r,
 
     ngx_add_timer(&ctx->cold_wait_ev, delay);
     r->main->count++;
+    /* We are now genuinely parked: any subsequent re-entry is a re-poll, so the
+     * V-HANG-2 give-up at the top of this function may trust an
+     * l2_present_unserveable observed from here on. Never cleared. */
+    ctx->wait_polled = 1;
 
     ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "cache_turbo: cold-miss WAIT \"%V\" poll=%M ms",
@@ -6221,6 +6263,95 @@ ngx_http_cache_turbo_use_stale_triggers(ngx_uint_t mask, ngx_uint_t status)
 }
 
 
+/* P6/O4.2: does `status` mean "the origin is down" for circuit-breaker
+ * purposes?
+ *
+ * ⚠ Deliberately NOT ngx_http_cache_turbo_use_stale_triggers(). The two
+ * questions look alike and are not: use_stale answers "may I serve a stale
+ * copy instead of this response?", and its mask may legitimately name 403,
+ * 404 and 429 -- every one of which is a perfectly HEALTHY origin answering
+ * correctly. Feeding those into the breaker would let a 404-heavy site trip
+ * its own breaker and start 503-ing everything while the origin was fine: an
+ * outage caused by enabling an unrelated stale-serving option. So the breaker
+ * has its own, narrower test.
+ *
+ * 5xx-only, all of them, matching what "origin is down" means at this site.
+ * As at the use_stale trigger, a refused connection and a genuine upstream 502
+ * are indistinguishable here -- the header filter sees r->headers_out.status
+ * and nothing else -- so transport failures arrive as 502/504 and are counted
+ * by the same test. */
+/* UNIT-EXTRACT breaker-failure BEGIN */
+static ngx_uint_t
+ngx_http_cache_turbo_breaker_is_origin_failure(ngx_uint_t status)
+{
+    return status >= NGX_HTTP_INTERNAL_SERVER_ERROR && status <= 599;
+}
+
+
+/* P6/O4.2: may this response feed the breaker at all?
+ *
+ * Factored out of the header filter so the unit suite can drive the REAL
+ * admission rule instead of restating it -- a test that re-implements its
+ * subject passes whatever the subject does (that is how O4.1's herd bug got
+ * certified by its own test). The header filter passes the four facts it has;
+ * every argument here is a genuine reason to refuse.
+ *
+ *   served       -- OUR cache serve. Replaying our own body says nothing about
+ *                   the origin, and feeding it back would read a dead origin
+ *                   as healthy for as long as the cache kept serving.
+ *   from_origin  -- the response really came off the wire. TWO conditions, and
+ *                   both are needed:
+ *
+ *                   r->upstream != NULL, because !served does NOT mean the
+ *                   origin was contacted -- an only-if-cached miss is answered
+ *                   504 locally (module.c:4422, :5002) with no upstream at
+ *                   all, and counting those lets a client trip a healthy
+ *                   breaker with a request header.
+ *
+ *                   !r->cached, because r->upstream being non-NULL only means
+ *                   the upstream subsystem was initialised, NOT that it spoke
+ *                   to anyone. When cache-turbo is stacked in front of
+ *                   proxy_cache / fastcgi_cache (a documented setup, see the
+ *                   README), ngx_http_upstream_cache_send() sets r->cached = 1
+ *                   and serves from nginx's OWN disk cache with r->upstream
+ *                   already allocated. Those responses are somebody else's
+ *                   cache hits: counting them lets nginx's disk cache clear a
+ *                   real failure run, or close a HALF_OPEN breaker without any
+ *                   probe ever reaching the origin -- the breaker would go
+ *                   blind for exactly as long as the disk cache kept serving.
+ *   is_main      -- subrequests other than our own warm fetch have their own
+ *                   lifecycle and are not the origin conversation we track.
+ *   threshold    -- the breaker's off-switch. _breaker_record()'s success path
+ *                   returns before the threshold check and writes
+ *                   breaker_fails = 0 regardless, so "off" is only free if the
+ *                   call is skipped here.
+ */
+static ngx_uint_t
+ngx_http_cache_turbo_breaker_should_record(ngx_uint_t served,
+    ngx_uint_t from_origin, ngx_uint_t is_main, ngx_uint_t threshold)
+{
+    return !served && from_origin && is_main && threshold > 0;
+}
+
+
+/* Did this response actually come off the wire? Split out so the two
+ * conditions are testable together rather than assembled inline at the call
+ * site: an inline expression is invisible to the unit slice, so reversing or
+ * dropping half of it would leave every test green.
+ *
+ * `upstream` is r->upstream != NULL, `native_cached` is r->cached (always 0
+ * where NGX_HTTP_CACHE is off, hence no #if here -- the caller resolves that).
+ * See the argument notes on _breaker_should_record() for why both are needed.
+ */
+static ngx_uint_t
+ngx_http_cache_turbo_breaker_from_origin(ngx_uint_t upstream,
+    ngx_uint_t native_cached)
+{
+    return upstream && !native_cached;
+}
+/* UNIT-EXTRACT breaker-failure END */
+
+
 static ngx_int_t
 ngx_http_cache_turbo_header_filter(ngx_http_request_t *r)
 {
@@ -6235,6 +6366,78 @@ ngx_http_cache_turbo_header_filter(ngx_http_request_t *r)
     }
 
     clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
+
+    /* P6/O4.2: feed this origin outcome into the per-zone circuit breaker.
+     *
+     * Placement matters in three ways:
+     *
+     * 1. AFTER the ctx->served early-return above, so only responses that
+     *    really came from the origin are recorded. A cache serve never reaches
+     *    here, and must not -- a breaker fed by its own cache hits would read a
+     *    dead origin as healthy for as long as the cache kept serving.
+     * 2. BEFORE the stale-if-error rewrite below, which overwrites
+     *    r->headers_out.status with the snapshot's 200. Recorded after it, the
+     *    origin's 502 would be counted as a success and the breaker could never
+     *    trip on exactly the outage it exists to handle.
+     * 3. OUTSIDE the `ctx->sie_armed` guard the SIE trigger sits behind. A cold
+     *    URL with no armed snapshot is precisely the case where the breaker
+     *    matters most, and those failures must count even though nothing
+     *    stale-serves them.
+     *
+     * Recorded unconditionally rather than under a `breaker enabled` test: with
+     * threshold/window at their 0 defaults _breaker_record() is inert (it
+     * returns before touching any window state), so this costs one plain read
+     * and a branch until O4.4 makes the breaker configurable. Successes are
+     * recorded just as broadly as failures -- a breaker that only ever hears
+     * about failures can never close again.
+     *
+     * ⚠ NOT recorded at the autotune_record_cost() site the plan first named.
+     * That call lives inside the store block, behind ~10 cacheability gates
+     * (enable, not-HEAD, status_ttl >= 0, response_cacheable, require_hdr_ok,
+     * not-encoded, no_store predicates, ...). A healthy origin serving an
+     * uncacheable 200 would never record a success there, so a breaker tripped
+     * by a transient outage could never close. Success recording has to be at
+     * least as broad as failure recording, which is why both live here.
+     *
+     * ⚠ r->upstream is the load-bearing part of this condition, not decoration.
+     * !ctx->served proves we are not replaying a cached body; it does NOT prove
+     * the origin was ever contacted. This module generates 5xx locally: a
+     * request carrying `Cache-Control: only-if-cached` that finds nothing
+     * serveable is answered NGX_HTTP_GATEWAY_TIME_OUT straight from the access
+     * handler (module.c:4422 and :5002), with ctx allocated and ctx->served
+     * unset, having spoken to no upstream at all. Counting those would let a
+     * client trip a HEALTHY zone's breaker on demand simply by repeating a
+     * request header -- a remote denial of service against the origin's own
+     * traffic. Only a response with an upstream behind it carries information
+     * about whether the origin is up.
+     *
+     * ⚠ Also gated on breaker_threshold: _breaker_record() checks the
+     * threshold/window off-switch only on its FAILURE path (shm.c:1297), while
+     * the success path returns earlier at :1266 having already written
+     * breaker_fails = 0. Calling it unconditionally would therefore put a
+     * shared-memory write on every successful response even with the breaker
+     * disabled -- not the no-op this step is supposed to be. Skipping the call
+     * outright keeps "breaker off" genuinely free. */
+    if (clcf->enable && clcf->shm_zone != NULL
+        && ngx_http_cache_turbo_breaker_should_record(
+               0,                      /* ctx->served: excluded above already */
+               ngx_http_cache_turbo_breaker_from_origin(
+                   r->upstream != NULL,
+#if (NGX_HTTP_CACHE)
+                   r->cached),
+#else
+                   0),
+#endif
+               r == r->main || ctx->warm,
+               clcf->breaker_threshold))
+    {
+        ngx_http_cache_turbo_shm_breaker_record(
+            clcf->shm_zone->data,
+            !ngx_http_cache_turbo_breaker_is_origin_failure(
+                r->headers_out.status),
+            clcf->breaker_threshold,
+            clcf->breaker_window);
+    }
 
     /* RFC-2 stale-if-error: an armed serve-on-error snapshot + a status the
      * configured `cache_turbo_use_stale` set names means replace the error with
@@ -10691,6 +10894,8 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->l2_negative_ttl = NGX_CONF_UNSET;   /* L13; merges to 0 = off */
     conf->keep_stale = NGX_CONF_UNSET;   /* S2.1; merges to 0 = off */
     conf->use_stale = NGX_CONF_UNSET_UINT;   /* S4.1; merges to USE_STALE_DEFAULT */
+    conf->breaker_threshold = NGX_CONF_UNSET_UINT; /* O4.2; merges to 0 = off */
+    conf->breaker_window = NGX_CONF_UNSET;         /* O4.2; merges to 0 = off */
     conf->max_size = NGX_CONF_UNSET_SIZE;
     conf->suppress_native = NGX_CONF_UNSET;
     conf->redis_enable = NGX_CONF_UNSET;
@@ -10830,6 +11035,14 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
      * conf->use_stale on any request path yet (S4.2). */
     ngx_conf_merge_uint_value(conf->use_stale, prev->use_stale,
                               NGX_HTTP_CACHE_TURBO_USE_STALE_DEFAULT);
+
+    /* P6/O4.2 breaker tuning. Both default to 0, which _breaker_record()
+     * treats as INERT (no tripping, no window accounting) -- so recording is
+     * wired up here while the breaker itself stays unreachable until O4.4
+     * adds the directives that can set these non-zero. */
+    ngx_conf_merge_uint_value(conf->breaker_threshold,
+                              prev->breaker_threshold, 0);
+    ngx_conf_merge_sec_value(conf->breaker_window, prev->breaker_window, 0);
 
     /* Per-status TTLs (v6): inherit the rule list if this level set none. */
     if (conf->valid_status == NULL) {

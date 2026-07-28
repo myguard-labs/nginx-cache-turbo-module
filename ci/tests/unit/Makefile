@@ -67,7 +67,12 @@ layout-check:
 
 extract: $(GEN)
 
-$(GEN): $(REPO)/src/ngx_http_cache_turbo_shm.c $(REPO)/src/ngx_http_cache_turbo_module.h $(HERE)/extract_shm.sh
+# ⚠ module.c is a prerequisite too: O4.2 slices the breaker's origin-failure
+# predicate out of it by marker. Without it listed here, editing that predicate
+# leaves a STALE generated_shm.inc in place and the suite silently tests the
+# previous copy -- a mutation of the production predicate then "passes",
+# which is exactly how a negative control ends up guarding nothing.
+$(GEN): $(REPO)/src/ngx_http_cache_turbo_shm.c $(REPO)/src/ngx_http_cache_turbo_module.h $(REPO)/src/ngx_http_cache_turbo_module.c $(HERE)/extract_shm.sh
 	@$(HERE)/extract_shm.sh
 
 clean:

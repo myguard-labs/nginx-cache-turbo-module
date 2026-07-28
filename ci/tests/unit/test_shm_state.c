@@ -86,6 +86,11 @@ typedef struct {
 #define NGX_HTTP_CACHE_TURBO_BREAKER_OPEN       1
 #define NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN  2
 
+/* P6/O4.2: the only nginx status constant the sliced origin-failure predicate
+ * needs. Same value as nginx's own; check_constants.sh is not involved because
+ * this one is nginx's, not ours. */
+#define NGX_HTTP_INTERNAL_SERVER_ERROR      500
+
 /* ⚠ MIRRORED, not included. The trailing autotune fields of the real shctx are
  * deliberately omitted -- no sliced function touches them. The breaker fields
  * below ARE touched by the sliced breaker functions, so they must stay in the
@@ -1113,6 +1118,203 @@ test_breaker_state_strings(void)
 
 
 /* =====================================================================
+ * P6/O4.2 -- which origin outcomes feed the breaker
+ * ===================================================================== */
+
+/* Every 5xx means "the origin is down", including the ones no config token can
+ * name individually. 599 is the inclusive upper bound; 600 is not a 5xx. */
+static void
+test_breaker_failure_counts_every_5xx(void)
+{
+    printf("breaker/O4.2: every 5xx counts as an origin failure\n");
+
+    CHECK(ngx_http_cache_turbo_breaker_is_origin_failure(500),
+          "500 was not counted as an origin failure");
+    CHECK(ngx_http_cache_turbo_breaker_is_origin_failure(502),
+          "502 was not counted as an origin failure");
+    CHECK(ngx_http_cache_turbo_breaker_is_origin_failure(503),
+          "503 was not counted as an origin failure");
+    CHECK(ngx_http_cache_turbo_breaker_is_origin_failure(504),
+          "504 was not counted as an origin failure");
+
+    /* The statuses only ANY_5XX covers -- a breaker that missed these would
+     * ignore real outages from origins that answer 507/508/511. */
+    CHECK(ngx_http_cache_turbo_breaker_is_origin_failure(507),
+          "507 was not counted as an origin failure");
+    CHECK(ngx_http_cache_turbo_breaker_is_origin_failure(599),
+          "599 (inclusive upper bound) was not counted as a failure");
+}
+
+
+/* ⚠ The load-bearing test of O4.2. The breaker's failure predicate must NOT be
+ * the use_stale trigger: use_stale legitimately names 403/404/429, every one of
+ * which is a HEALTHY origin answering correctly. If those ever start counting,
+ * a 404-heavy site trips its own breaker and 503s everything while the backend
+ * is fine -- an outage caused by switching on an unrelated stale-serve option.
+ *
+ * 200 is here for the obvious reason; 3xx/4xx because they are what the
+ * use_stale mask can be configured to include. */
+static void
+test_breaker_failure_ignores_healthy_statuses(void)
+{
+    printf("breaker/O4.2: healthy statuses never count as origin failures\n");
+
+    CHECK(!ngx_http_cache_turbo_breaker_is_origin_failure(200),
+          "200 was counted as an origin failure");
+    CHECK(!ngx_http_cache_turbo_breaker_is_origin_failure(301),
+          "301 was counted as an origin failure");
+    CHECK(!ngx_http_cache_turbo_breaker_is_origin_failure(304),
+          "304 was counted as an origin failure");
+
+    /* The three use_stale can name. These are the regression that matters. */
+    CHECK(!ngx_http_cache_turbo_breaker_is_origin_failure(403),
+          "403 counted as an origin failure — use_stale leaked into the "
+          "breaker; a healthy origin can now trip it");
+    CHECK(!ngx_http_cache_turbo_breaker_is_origin_failure(404),
+          "404 counted as an origin failure — use_stale leaked into the "
+          "breaker; a 404-heavy site will trip its own breaker");
+    CHECK(!ngx_http_cache_turbo_breaker_is_origin_failure(429),
+          "429 counted as an origin failure — use_stale leaked into the "
+          "breaker");
+
+    /* Below the 5xx floor by one, and above the ceiling by one. */
+    CHECK(!ngx_http_cache_turbo_breaker_is_origin_failure(499),
+          "499 was counted as an origin failure");
+    CHECK(!ngx_http_cache_turbo_breaker_is_origin_failure(600),
+          "600 was counted as an origin failure");
+}
+
+
+/* The two conditions that together mean "this came off the wire". Tested as a
+ * pair because the dangerous case is the one where only half holds. */
+static void
+test_breaker_from_origin(void)
+{
+    printf("breaker/O4.2: upstream present AND not a native cache hit\n");
+
+    CHECK(ngx_http_cache_turbo_breaker_from_origin(1, 0),
+          "a real upstream response was not treated as coming from the origin");
+
+    /* No upstream at all: the only-if-cached 504 the module generates itself. */
+    CHECK(!ngx_http_cache_turbo_breaker_from_origin(0, 0),
+          "a response with no upstream was treated as coming from the origin");
+
+    /* ⚠ upstream allocated, but nginx served it from its OWN disk cache.
+     * ngx_http_upstream_cache_send() sets r->cached = 1 with r->upstream
+     * already in place, so the upstream check alone passes here. */
+    CHECK(!ngx_http_cache_turbo_breaker_from_origin(1, 1),
+          "a native proxy_cache HIT was treated as an origin response — the "
+          "disk cache could close a breaker no probe ever tested");
+
+    CHECK(!ngx_http_cache_turbo_breaker_from_origin(0, 1),
+          "a cached response with no upstream was treated as an origin "
+          "response");
+}
+
+
+/* The bug O4.2-a and O4.2-b model: the use_stale trigger reused as the
+ * breaker's failure test (what this step's original spec called for). Written
+ * out explicitly and kept local so the controls can assert that the REAL
+ * predicate DISAGREES with it — a control that hardcodes its verdict never
+ * touches the production function and would survive any mutation of it.
+ *
+ * Mirrors USE_STALE_DEFAULT plus the three healthy statuses an operator can
+ * add: 403, 404, 429. */
+static ngx_uint_t
+buggy_use_stale_is_failure(ngx_uint_t status)
+{
+    return status == 403 || status == 404 || status == 429
+           || (status >= 500 && status <= 504);
+}
+
+
+/* ⚠ The admission rule, driven directly rather than restated. Each argument is
+ * withheld in turn; every one of them must be able to veto on its own. */
+static void
+test_breaker_should_record_admission(void)
+{
+    printf("breaker/O4.2: only a real origin response feeds the breaker\n");
+
+    /* served=0, from_origin=1, main=1, threshold=3 -- the one admitted case. */
+    CHECK(ngx_http_cache_turbo_breaker_should_record(0, 1, 1, 3),
+          "a genuine origin response was not admitted");
+
+    /* Our own cache serve says nothing about the origin. */
+    CHECK(!ngx_http_cache_turbo_breaker_should_record(1, 1, 1, 3),
+          "a cache serve was fed to the breaker — it would read a dead origin "
+          "as healthy for as long as the cache kept serving");
+
+    /* ⚠ Not from the origin. Two distinct real cases collapse onto this arm,
+     * and the call site must exclude both:
+     *   - an only-if-cached miss, answered 504 locally with no upstream at
+     *     all. Client-triggerable: if it counts, a visitor trips a healthy
+     *     zone's breaker just by repeating a request header.
+     *   - a native proxy_cache/fastcgi_cache HIT, where r->upstream IS
+     *     allocated but ngx_http_upstream_cache_send() served from disk and
+     *     set r->cached. Somebody else's cache hit; counting it lets the disk
+     *     cache close a breaker no probe ever tested. */
+    CHECK(!ngx_http_cache_turbo_breaker_should_record(0, 0, 1, 3),
+          "a response that did not come from the origin was fed to the "
+          "breaker — either a client can trip a healthy origin's breaker, or "
+          "a native cache HIT can close one without probing");
+
+    /* Not the origin conversation we track. */
+    CHECK(!ngx_http_cache_turbo_breaker_should_record(0, 1, 0, 3),
+          "a foreign subrequest was fed to the breaker");
+
+    /* threshold 0 = breaker off: skip the call entirely, because
+     * _breaker_record()'s success path writes breaker_fails before it ever
+     * consults the threshold. */
+    CHECK(!ngx_http_cache_turbo_breaker_should_record(0, 1, 1, 0),
+          "the breaker was recorded into while disabled — 'off' must not put "
+          "a shared-memory write on every successful response");
+}
+
+
+/* The predicate is what the request path actually feeds to _record(), so drive
+ * the real pair end to end: a run of 5xx trips the breaker, and the same number
+ * of 404s does not. This is the assertion that would catch the two being wired
+ * up backwards -- the pure-predicate tests above cannot see the call site. */
+static void
+test_breaker_record_driven_by_predicate(void)
+{
+    ngx_uint_t  i;
+
+    printf("breaker/O4.2: 5xx runs trip the breaker, 404 runs do not\n");
+
+    /* Three 503s at threshold 3 -> OPEN. */
+    zone_reset();
+    ngx_test_set_time(1000);
+    for (i = 0; i < 3; i++) {
+        ngx_http_cache_turbo_shm_breaker_record(
+            &g_zone,
+            !ngx_http_cache_turbo_breaker_is_origin_failure(503),
+            3, 60);
+    }
+    CHECK(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+              == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
+          "three origin 503s did not trip the breaker");
+
+    /* The same run of 404s must leave it CLOSED, and record no failures. */
+    zone_reset();
+    ngx_test_set_time(1000);
+    for (i = 0; i < 3; i++) {
+        ngx_http_cache_turbo_shm_breaker_record(
+            &g_zone,
+            !ngx_http_cache_turbo_breaker_is_origin_failure(404),
+            3, 60);
+    }
+    CHECK(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+              == NGX_HTTP_CACHE_TURBO_BREAKER_CLOSED,
+          "a run of 404s tripped the breaker against a healthy origin");
+    CHECK(g_sh.breaker_opens == 0,
+          "a run of 404s recorded a breaker trip");
+    CHECK(g_sh.breaker_fails == 0,
+          "a run of 404s accumulated failures");
+}
+
+
+/* =====================================================================
  * NEGATIVE CONTROL
  *
  * Re-implements each bug against the same fixture and asserts the test's own
@@ -1264,6 +1466,146 @@ run_negative_controls(void)
             tests_failed++;
         }
     }
+
+    /* O4.2-a: the breaker's failure predicate reverted to the use_stale
+     * trigger, i.e. the plan's literal wording. Model a use_stale mask with
+     * `http_404` in it -- the exact configuration that makes the two predicates
+     * disagree -- and confirm test_breaker_failure_ignores_healthy_statuses's
+     * 404 assertion would then break.
+     *
+     * Asserted as a real state transition rather than on the boolean alone: a
+     * bare `is_failure(404) == 1` control would pass even if _record() ignored
+     * the value entirely, which is the vacuous shape the CodeRabbit round
+     * flagged on O4.1. Here the run of 404s must actually OPEN the breaker. */
+    zone_reset();
+    ngx_test_set_time(1000);
+    {
+        ngx_uint_t  i, buggy_is_failure;
+
+        /* Drive the buggy predicate for real, and REQUIRE that the production
+         * one disagrees with it here. Without this the control hardcodes its
+         * own verdict, never calls _breaker_is_origin_failure(), and stays
+         * green through any mutation of it — vacuous in exactly the way the
+         * comment above O4.1-a warns about. */
+        buggy_is_failure = buggy_use_stale_is_failure(404);
+        REQUIRE(buggy_is_failure
+                && !ngx_http_cache_turbo_breaker_is_origin_failure(404),
+                "O4.2-a fixture: the real predicate already agrees with the "
+                "buggy one on 404 — the control models nothing");
+
+        for (i = 0; i < 3; i++) {
+            ngx_http_cache_turbo_shm_breaker_record(&g_zone, !buggy_is_failure,
+                                                    3, 60);
+        }
+
+        caught = (ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+                      == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN
+                  && g_sh.breaker_opens == 1);
+        tests_run++;
+        if (!caught) {
+            fprintf(stderr, "  ✗ CONTROL O4.2-a: counting 404 as an origin "
+                            "failure did not trip the breaker — the "
+                            "healthy-status assertions guard nothing\n");
+            tests_failed++;
+        }
+    }
+
+    /* O4.2-b: the predicate narrowed to the four use_stale-nameable 5xx, losing
+     * the ANY_5XX-only statuses (507/508/511/...). Those origins would then
+     * never trip the breaker no matter how long they stayed down.
+     * test_breaker_failure_counts_every_5xx's 507 assertion must break. */
+    zone_reset();
+    ngx_test_set_time(1000);
+    {
+        ngx_uint_t  i, buggy_is_failure;
+
+        /* Same anchoring as O4.2-a, mirrored: the buggy predicate misses 507
+         * (only ANY_5XX covers it), the real one must catch it. */
+        buggy_is_failure = buggy_use_stale_is_failure(507);
+        REQUIRE(!buggy_is_failure
+                && ngx_http_cache_turbo_breaker_is_origin_failure(507),
+                "O4.2-b fixture: the real predicate already agrees with the "
+                "buggy one on 507 — the control models nothing");
+
+        for (i = 0; i < 3; i++) {
+            ngx_http_cache_turbo_shm_breaker_record(&g_zone, !buggy_is_failure,
+                                                    3, 60);
+        }
+
+        caught = (ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+                      == NGX_HTTP_CACHE_TURBO_BREAKER_CLOSED
+                  && g_sh.breaker_opens == 0);
+        tests_run++;
+        if (!caught) {
+            fprintf(stderr, "  ✗ CONTROL O4.2-b: ignoring 507 still tripped "
+                            "the breaker — the every-5xx assertions guard "
+                            "nothing\n");
+            tests_failed++;
+        }
+    }
+
+    /* O4.2-c: the admission rule loses its from_origin arm, so a response the
+     * origin never sent counts as an origin outcome. Model the only-if-cached
+     * miss exactly: no upstream was contacted, and the module answered 504
+     * itself. Drive the REAL admission rule with from_origin forced on (the
+     * bug's effect) and the REAL record()/state() pair with the 504.
+     *
+     * Three of those trip the breaker on threshold 3 -- against an origin
+     * nobody spoke to. test_breaker_should_record_admission's no-upstream
+     * assertion is the one that must break. */
+    zone_reset();
+    ngx_test_set_time(1000);
+    {
+        ngx_uint_t  i;
+
+        for (i = 0; i < 3; i++) {
+            /* the bug: from_origin forced to 1 for a response that wasn't */
+            if (ngx_http_cache_turbo_breaker_should_record(0, 1, 1, 3)) {
+                ngx_http_cache_turbo_shm_breaker_record(
+                    &g_zone,
+                    !ngx_http_cache_turbo_breaker_is_origin_failure(504),
+                    3, 60);
+            }
+        }
+
+        caught = (ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+                      == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN
+                  && g_sh.breaker_opens == 1);
+        tests_run++;
+        if (!caught) {
+            fprintf(stderr, "  ✗ CONTROL O4.2-c: admitting a response that "
+                            "did not come from the origin did not trip the "
+                            "breaker — the from_origin assertion guards "
+                            "nothing\n");
+            tests_failed++;
+        }
+    }
+
+    /* O4.2-d: the admission rule loses its threshold arm, so a disabled
+     * breaker is still recorded into. Prove that reaches shared memory: seed a
+     * failure run, then feed one success with the breaker OFF. With the arm
+     * present the call is skipped and the run survives; without it,
+     * _breaker_record()'s success path clears breaker_fails before it ever
+     * looks at the threshold (shm.c:1266 vs :1297). */
+    zone_reset();
+    ngx_test_set_time(1000);
+    ngx_http_cache_turbo_shm_breaker_record(&g_zone, 0, 3, 60);
+    ngx_http_cache_turbo_shm_breaker_record(&g_zone, 0, 3, 60);
+    {
+        ngx_atomic_uint_t  before = g_sh.breaker_fails;
+
+        /* the bug: threshold 0 no longer vetoes, so the call goes through */
+        ngx_http_cache_turbo_shm_breaker_record(&g_zone, 1, 0, 60);
+
+        caught = (before == 2 && g_sh.breaker_fails == 0);
+        tests_run++;
+        if (!caught) {
+            fprintf(stderr, "  ✗ CONTROL O4.2-d: recording into a DISABLED "
+                            "breaker did not touch shared state — the "
+                            "'off is free' assertion guards nothing\n");
+            tests_failed++;
+        }
+    }
 }
 
 int
@@ -1291,6 +1633,11 @@ main(void)
     test_breaker_threshold_zero_never_trips();
     test_breaker_zero_window_never_trips();
     test_breaker_state_strings();
+    test_breaker_failure_counts_every_5xx();
+    test_breaker_failure_ignores_healthy_statuses();
+    test_breaker_record_driven_by_predicate();
+    test_breaker_from_origin();
+    test_breaker_should_record_admission();
     run_negative_controls();
 
     /* Every node this run allocated must be accounted for. Under ASan a real
