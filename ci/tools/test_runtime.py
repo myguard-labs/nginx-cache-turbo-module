@@ -26,6 +26,7 @@ import hashlib
 import http.client
 import http.server
 import json
+import math
 import os
 import pathlib
 import re
@@ -213,6 +214,20 @@ HTTP_TIMEOUT = float(os.environ.get("TEST_CT_TIMEOUT", "5"))
 # would start passing. Keep the plain ceiling tight; widen only where the
 # contention is manufactured by the test itself.
 STRESS_TIMEOUT = float(os.environ.get("TEST_CT_STRESS_TIMEOUT", "30"))
+
+
+def _check_timeout(name: str, value: float) -> float:
+    """A timeout reaches urlopen() directly, where a bad value fails obscurely:
+    0 surfaces as `URLError: [Errno 115] Operation now in progress`, which reads
+    as a network fault rather than a typo in the environment. Reject it here so
+    the message names the variable."""
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{name} must be a finite number > 0, got {value!r}")
+    return value
+
+
+_check_timeout("TEST_CT_TIMEOUT", HTTP_TIMEOUT)
+_check_timeout("TEST_CT_STRESS_TIMEOUT", STRESS_TIMEOUT)
 
 
 def wait_port(port: int, timeout: float = 15.0) -> None:
@@ -10411,7 +10426,7 @@ def test_perf7_zero_copy_serve_under_eviction(ng: Nginx) -> None:
     def hit(_: int) -> int:
         # STRESS_TIMEOUT, not the default: 4000 requests across 48 threads means
         # a descheduled worker can exceed the plain ceiling on a loaded runner
-        # while the server is healthy. The assertion here is "no 5xx", not
+        # while the server is healthy. The assertion here is "HTTP 200", not
         # "answered within 5s".
         return fetch(ng.port, f"/e/p7-{random.randint(0, keys - 1)}",
                      timeout=STRESS_TIMEOUT)[0]
