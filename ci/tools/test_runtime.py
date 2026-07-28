@@ -1683,14 +1683,29 @@ http {{
         # make the ENTIRE response Cache-Control inert, not just the cacheability
         # floor. The origin emits "max-age=1, must-revalidate"; without ignore
         # the must-revalidate token collapses the stale window (like /mrev/), but
-        # with ignore the window stays valid*stale_mult (1s*4), so at ~2s
-        # the entry is still STALE-served, not a hard miss. fresh = valid 1s
+        # with ignore the window stays valid*stale_mult (4s*4 = 16s), so at ~8s
+        # the entry is still STALE-served, not a hard miss. fresh = valid 4s
         # (ignore forces honor off). beta 1 ~never rolls a refresh, so the
         # stale read is a clean STALE serve (no dice regen polluting origin).
+        #
+        # !! valid is 4s, NOT the 1s the origin declares, and the test's sleep
+        # is sized from it. At valid 1s the prime->HIT assert raced the 1s fresh
+        # edge: a loaded runner (ASan, busy CI box) taking >1s between the two
+        # fetches makes STALE the CORRECT answer and the test fails on box speed,
+        # not on module behaviour (SUITE-4). Both edges scale together -- widening
+        # valid alone would move the stale read back inside the FRESH window and
+        # break the STALE assert instead.
+        #
+        # Total serve life is valid*stale_mult ABSOLUTE, not fresh + stale on top:
+        # shm_store() sets stale_until = now + stale_ttl(valid, stale_mult), so
+        # 4s*4 = 16s total == 4s fresh + 12s stale. When retuning, the sleep must
+        # satisfy valid < sleep < valid*(stale_mult-1) -- the lower slack absorbs
+        # the prime, and the upper one the elapsed time before the sleep starts.
+        # Here that is 4 < 8 < 12.
         location /ccignmr/ {{
             cache_turbo               main;
             cache_turbo_key           $uri;
-            cache_turbo_valid         1s;
+            cache_turbo_valid         4s;
             cache_turbo_beta          1;
             cache_turbo_cache_control ignore;
             proxy_pass http://127.0.0.1:{origin_port}/;
@@ -7594,22 +7609,26 @@ def test_ignore_cc_must_revalidate_keeps_stale_window(ng: Nginx,
     """cache_turbo_cache_control ignore must neutralise the WHOLE response
     Cache-Control, including the must-revalidate token that would otherwise
     collapse the stale window at store. The origin emits
-    "max-age=1, must-revalidate"; under /ccignmr/ (ignore_cc on, valid 1s, default
-    stale_mult 4 => 4s stale window) the entry must still be STALE-served at ~2s.
-    Without the fix (must-revalidate parsed despite ignore_cc) the window collapses
-    to 1s and the 2s read is a hard miss to origin. Inverse of
-    test_must_revalidate_collapses_stale (the /mrev/ honor_cc case)."""
+    "max-age=1, must-revalidate"; under /ccignmr/ (ignore_cc on, valid 4s, default
+    stale_mult 4 => 16s total serve life = 4s fresh + 12s stale) the entry must
+    still be STALE-served at ~8s. Without the fix (must-revalidate parsed despite
+    ignore_cc) the serve deadline collapses to the 4s fresh deadline and the 8s
+    read is a hard miss to origin. Inverse of test_must_revalidate (the /mrev/
+    honor_cc case).
+
+    !! The 4s fresh TTL is deliberate and paired with the 8s sleep below; see
+    the /ccignmr/ fixture comment. Do not shrink either one independently."""
     uri = "/ccignmr/mustrev"
     fetch(ng.port, uri)                                    # prime (miss, stores)
     _, _, h1 = fetch(ng.port, uri)
     assert h1.get("x-cache") == "HIT", \
         f"ignore_cc must store the must-revalidate response; got {h1.get('x-cache')}"
-    time.sleep(2.0)                                        # past 1s fresh, < 4s stale
+    time.sleep(8.0)                                        # past 4s fresh, < 16s deadline
     before = origin.hits
     _, _, h2 = fetch(ng.port, uri)
     assert h2.get("x-cache") == "STALE", \
         ("ignore_cc must keep the stale window (must-revalidate ignored): expected "
-         f"STALE at 2s, got X-Cache={h2.get('x-cache')} — window was collapsed")
+         f"STALE at 8s, got X-Cache={h2.get('x-cache')} — window was collapsed")
     assert origin.hits == before, \
         "stale serve under ignore_cc unexpectedly hit origin (window collapsed?)"
 
