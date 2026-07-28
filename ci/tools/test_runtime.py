@@ -1389,8 +1389,9 @@ http {{
     # inside the window fails an assertion about a different URI.
     #
     # !! Scope of that risk, corrected: the increment at module.c:4832 is gated
-    # on `clcf->l2_negative_ttl > 0` (module.c:4822), and only THREE locations
-    # in this config set it -- /l2neg/, /l2neglife/, /l2negmu/. The ~40 other
+    # on `clcf->l2_negative_ttl > 0` (module.c:4822), and only FOUR locations
+    # in this config set it -- /l2neg/, /l2negout/, /l2neglife/, /l2negmu/,
+    # of which /l2neg/ and /l2negout/ now sit in private zones. The ~40 other
     # locations sharing `main` are NOT counter writers and never could be. So
     # the isolation below is defence against the two SIBLING memo tests, not
     # against the whole zone, and it is hardening rather than a proven root
@@ -9750,9 +9751,10 @@ def test_l2_negative_ttl_not_armed_by_outage(ng: Nginx, origin: Origin,
         f"\n  l2_neg_skips delta={delta} (expected 0), this test's uri={uri}"
         f"\n  recently skipped keys: {_recent_memo_skips(ng, limit=8)}"
         "\n  NOTE l2_neg_skips is per-zone and /l2negout/ has a PRIVATE zone"
-        " (l2negoutz) read here via /_cache_l2negout, and it is the ONLY"
-        " location bound to that zone -- so a non-zero delta is this uri's own"
-        " memo and cannot be another location bleeding into the window."
+        " (l2negoutz), read here via /_cache_l2negout. /l2negout/ is the only"
+        " location that can WRITE that counter (the admin location is bound to"
+        " the same zone but only reads it), so a non-zero delta is this uri's"
+        " own memo and cannot be another location bleeding into the window."
         "\n  ⚠ The key list above is tailed from the WHOLE error.log, not from"
         " this assertion's window, so an unrelated uri in it may predate the"
         " test entirely -- it is a hint, not evidence. Re-run with"
@@ -11945,19 +11947,23 @@ def test_purge_all_escapes_redis_prefix_glob(ng: Nginx,
     # Asserting EXISTS immediately is a race that only loses on a slow build --
     # which is why it went red under ASan (instrumented nginx is ~10-20x slower)
     # while passing every plain run. Poll for absence instead of sampling once.
-    deadline = time.monotonic() + 10.0
-    while time.monotonic() < deadline:
-        if redis.cli("-n", "0", "EXISTS", owned) == "0":
-            break
-        time.sleep(0.05)
-    assert redis.cli("-n", "0", "EXISTS", owned) == "0", \
+    assert wait_for(lambda: redis.cli("-n", "0", "EXISTS", owned) == "0",
+                    timeout=10.0), \
         "literal glob-prefix key was not purged (waited 10s after the 200)"
 
-    # NOT polled, deliberately: `foreign` must NEVER be deleted, so the only
-    # sound moment to check it is after the purge has demonstrably drained
-    # (the loop above just observed `owned` disappear). Polling for absence
-    # here would invert the property under test.
-    assert redis.cli("-n", "0", "EXISTS", foreign) == "1", \
+    # !! `owned` disappearing does NOT mean the purge has finished. del_many()
+    # runs ONCE PER SCAN PAGE (redis.c:2584), each opening its own connection,
+    # and there is no completion ordering between them. With the escaping defect
+    # restored, `ct*:*` can put `owned` and `foreign` on DIFFERENT pages -- so a
+    # single EXISTS sample here can observe foreign==1 simply because the page
+    # that would delete it has an UNLINK still in flight, and the cleanup DEL
+    # below then erases the evidence. That is a green run with the regression
+    # present, which is the exact failure mode this whole PR exists to remove.
+    #
+    # So assert the forbidden transition NEVER happens across a drain window
+    # wider than the 250ms redis op timeout, rather than sampling once.
+    assert not wait_for(lambda: redis.cli("-n", "0", "EXISTS", foreign) == "0",
+                        timeout=1.5), \
         "glob prefix widened SCAN and deleted an unrelated key"
     redis.cli("-n", "0", "DEL", foreign)
 
