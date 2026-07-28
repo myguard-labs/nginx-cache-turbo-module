@@ -5182,8 +5182,16 @@ ngx_http_cache_turbo_cold_wait(ngx_http_request_t *r,
      * Bites whenever the stored stale window is shorter than lock_ttl: e.g.
      * cache_turbo_stale_mult 1 makes stale_window == fresh_ttl, so the entry is
      * unserveable ~1s after it is written while the lock lives 5s. Every
-     * request in that gap stalled the full lock_timeout (~5s) before this. */
-    if (ctx->waiting && ctx->l2_present_unserveable) {
+     * request in that gap stalled the full lock_timeout (~5s) before this.
+     *
+     * ⚠ Gated on wait_polled, NOT on ctx->waiting: waiting is set unconditionally
+     * a few lines above, so it is always 1 by the time we read it here and tests
+     * nothing. The inference "the fill has already landed" is only valid AFTER we
+     * have actually parked once — on the first pass a CLAIM_LOSER can reach this
+     * with the flag set by its own initial L2 lookup, before the winner has
+     * written anything, and giving up there stampedes the origin with every
+     * loser. Do not relax this back to ctx->waiting. */
+    if (ctx->wait_polled && ctx->l2_present_unserveable) {
         ctx->waiting = 0;
         (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
@@ -5261,6 +5269,10 @@ ngx_http_cache_turbo_cold_wait(ngx_http_request_t *r,
 
     ngx_add_timer(&ctx->cold_wait_ev, delay);
     r->main->count++;
+    /* We are now genuinely parked: any subsequent re-entry is a re-poll, so the
+     * V-HANG-2 give-up at the top of this function may trust an
+     * l2_present_unserveable observed from here on. Never cleared. */
+    ctx->wait_polled = 1;
 
     ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "cache_turbo: cold-miss WAIT \"%V\" poll=%M ms",

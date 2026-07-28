@@ -1231,8 +1231,23 @@ typedef struct {
      * unserveable (past its stored stale window). The fill we are waiting for
      * has therefore already happened and no further poll can change the answer
      * — keep waiting and we burn the rest of lock_timeout for nothing. Set on
-     * the L2-hit-but-expired branch, checked at the top of the wait loop. */
+     * the L2-hit-but-expired branch, checked at the top of the wait loop.
+     *
+     * ⚠ Only meaningful together with wait_polled below. The set site fires on
+     * ANY L2-hit-but-expired lookup, including the very first one, so on its own
+     * it cannot distinguish "the fill already landed" from "we have not waited
+     * for the fill yet" — see wait_polled. */
     unsigned                 l2_present_unserveable:1;
+    /* This request has completed at least one cold-wait POLL (it parked on the
+     * timer and came back). Set at the park site, never cleared.
+     *
+     * The V-HANG-2 give-up above is only sound once this is set: it concludes
+     * "the winner's fill has already landed" from seeing the key present in L2,
+     * and that inference holds only for a re-poll. On the FIRST pass a
+     * CLAIM_LOSER can see the same expired blob before the winner has written
+     * anything — giving up there sends every loser straight to the origin and
+     * defeats the single-flight this loop exists to provide. */
+    unsigned                 wait_polled:1;
     ngx_msec_t               wait_deadline;/* give up + go to origin at this   */
     ngx_event_t              cold_wait_ev; /* poll timer for the wait loop     */
     /* This request is the cold-miss WINNER that owns the in-flight stub: it
