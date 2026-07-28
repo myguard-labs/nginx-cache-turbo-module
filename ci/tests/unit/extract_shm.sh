@@ -90,6 +90,69 @@ awk '
     }
 ' "$SRC" > "$OUT"
 
+# --- P6/O4.2: the breaker's origin-failure predicate lives in module.c, not
+# shm.c, because it is about the RESPONSE (a status code) rather than about the
+# zone. Sliced by marker like the fuzz targets do it, for the same no-drift
+# reason as everything above: the test must exercise production code, and a
+# marker that moves or vanishes has to fail the build loudly rather than
+# silently test a hand-copied stale duplicate.
+MODSRC="$UNIT_DIR/../../../src/ngx_http_cache_turbo_module.c"
+if [ ! -f "$MODSRC" ]; then
+    echo "✗ cannot find $MODSRC" >&2
+    rm -f "$OUT"
+    exit 1
+fi
+
+{
+    echo ""
+    awk '
+        /UNIT-EXTRACT breaker-failure BEGIN/ { cap = 1; next }
+        /UNIT-EXTRACT breaker-failure END/   { cap = 0 }
+        cap { print }
+    ' "$MODSRC"
+} >> "$OUT"
+
+for fn in 'ngx_http_cache_turbo_breaker_is_origin_failure(' \
+          'ngx_http_cache_turbo_breaker_should_record('; do
+    if ! grep -qF "$fn" "$OUT"; then
+        echo "✗ failed to extract ${fn%(} from $MODSRC" >&2
+        echo "  (UNIT-EXTRACT breaker-failure markers moved or vanished?)" >&2
+        rm -f "$OUT"
+        exit 1
+    fi
+done
+
+# ⚠ The admission rule must keep its r->upstream arm. Without it a locally
+# generated 5xx -- an only-if-cached miss is answered 504 by the module itself,
+# no upstream contacted -- counts as an origin failure, and a client can trip a
+# HEALTHY zone's breaker just by repeating a request header.
+if ! sed -n '/^ngx_http_cache_turbo_breaker_should_record(/,/^}/p' "$OUT" \
+   | sed -E 's;/\*.*;;; s;^[[:space:]]*\*.*;;' \
+   | grep -q 'has_upstream'; then
+    echo "✗ O4.2 regression: the breaker admission rule dropped has_upstream." >&2
+    echo "  Locally generated 5xx (only-if-cached 504) would then count as" >&2
+    echo "  origin failures — a client could trip a healthy breaker." >&2
+    rm -f "$OUT"
+    exit 1
+fi
+
+# ⚠ The whole point of this predicate is that it is NOT the use_stale trigger:
+# use_stale may name 403/404/429, which are a healthy origin answering
+# correctly, and feeding those to the breaker lets a 404-heavy site trip its own
+# breaker and 503 everything. If somebody "deduplicates" the two, catch it here
+# rather than in production. Comments are stripped first -- the prose above the
+# function names use_stale deliberately, and a grep that matched the COMMENT
+# would stay green exactly when the code had been broken.
+if sed -n '/^ngx_http_cache_turbo_breaker_is_origin_failure(/,/^}/p' "$OUT" \
+   | sed -E 's;/\*.*;;; s;^[[:space:]]*\*.*;;' \
+   | grep -q 'use_stale'; then
+    echo "✗ O4.2 regression: the breaker failure test now consults use_stale." >&2
+    echo "  403/404/429 are a HEALTHY origin; counting them trips the breaker" >&2
+    echo "  against a working backend. Keep the two predicates separate." >&2
+    rm -f "$OUT"
+    exit 1
+fi
+
 # --- sanity: every wanted function must be present, and the file must end on a
 # closing brace (a truncated slice would otherwise fail to compile in a
 # confusing place, or worse, compile with a body silently cut short).

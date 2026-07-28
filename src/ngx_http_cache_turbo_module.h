@@ -1003,6 +1003,27 @@ typedef struct {
      * yet (that is S4.2). */
     ngx_uint_t               use_stale;
 
+    /* P6/O4.2 circuit-breaker tuning. Fed to
+     * ngx_http_cache_turbo_shm_breaker_record() from the request path; the
+     * O4.3 serve-path read and the directives that set these are O4.4.
+     *
+     * ⚠ Both merge to 0, and 0 is INERT on purpose (see the contract in
+     * _breaker_record(): threshold == 0 disables tripping, window == 0
+     * likewise). Until O4.4 adds the parsers there is no config that can make
+     * either non-zero, so O4.2 records outcomes into a breaker that can never
+     * trip -- behaviour is byte-for-byte unchanged, which is what makes this
+     * step safe to merge on its own, exactly as O4.1 was.
+     *
+     * NOT derived from `use_stale`. "Should I serve stale?" and "is the origin
+     * down?" are different questions that merely overlap on 5xx: use_stale may
+     * legitimately name 403/404/429, all of which are a HEALTHY origin
+     * answering correctly. Counting those as origin failures would let a
+     * 404-heavy site trip its own breaker and 503 everything while the origin
+     * was fine. The breaker's failure test is 5xx-only -- see
+     * ngx_http_cache_turbo_breaker_is_origin_failure(). */
+    ngx_uint_t               breaker_threshold; /* failures to trip; 0 = off  */
+    time_t                   breaker_window;    /* rolling window s; 0 = off  */
+
     /* L2 Redis (v2b). Native async client, no hiredis. The L2 store is touched
      * only on an L1 miss (sync GET) and on store (async write-through); it is
      * never on the L1-hit hot path. */
