@@ -8280,11 +8280,12 @@ ngx_http_cache_turbo_l2_negative_ttl(ngx_conf_t *cf, ngx_command_t *cmd,
 }
 
 
-/* cache_turbo_keep_stale <off|time|forever> (S2.1). PARSER ONLY -- nothing
- * reads clcf->keep_stale yet (that is S2.2). Origin-independent last-resort
- * retention: when a response carries no `stale-if-error` window of its own,
- * S2.2 will use this value as the effective stale-if-error window instead of
- * leaving the object with no fallback.
+/* cache_turbo_keep_stale <off|time|forever> (S2.1). Origin-independent
+ * last-resort retention: when a response carries no `stale-if-error` window of
+ * its own, this value becomes the effective stale-if-error window instead of
+ * leaving the object with no fallback. The store path reads clcf->keep_stale
+ * into sie_window in the two branches at the `ttl > 0 && clcf->keep_stale > 0`
+ * and `ttl > 0 && clcf->ignore_cc && clcf->keep_stale > 0` gates (S2.2).
  *
  * cache_turbo_cache_control ignore does NOT suppress this directive (decision
  * D-1; clcf->ignore_cc is the internal flag it sets). Every
@@ -8368,8 +8369,8 @@ ngx_http_cache_turbo_keep_stale(ngx_conf_t *cf, ngx_command_t *cmd,
 
 /* cache_turbo_use_stale <off | error | timeout | http_403 | http_404 |
  *                         http_429 | http_500 | http_502 | http_503 |
- *                         http_504> ... (S4.1). PARSER ONLY -- nothing reads
- * clcf->use_stale on any request path yet (that is S4.2). See the
+ *                         http_504> ... (S4.1). Read on the request path by
+ * the stale-if-error gate in ngx_http_cache_turbo_header_filter (S4.2). See the
  * NGX_HTTP_CACHE_TURBO_USE_STALE_* block in the header for the full mask
  * contract, the error/timeout aliasing rationale, and why the merge default
  * includes the ANY_5XX bit.
@@ -11022,8 +11023,8 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 
     /* cache_turbo_keep_stale (S2.1). Plain inherit/default-0, same shape as
      * l2_negative_ttl above -- not a preset band column, and off unless an
-     * operator opts in. Parser only: nothing consults conf->keep_stale on any
-     * request path yet (S2.2). */
+     * operator opts in. Consulted on the store path, where a non-zero value
+     * widens sie_window (S2.2). */
     ngx_conf_merge_sec_value(conf->keep_stale, prev->keep_stale, 0);
 
     /* cache_turbo_use_stale (S4.1). Plain inherit/default, same shape as
@@ -11031,8 +11032,8 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
      * ANY_5XX), which reproduces today's unconditional "any 5xx" trigger at
      * ngx_http_cache_turbo_header_filter byte-for-byte -- see the header
      * comment on NGX_HTTP_CACHE_TURBO_USE_STALE_DEFAULT for why the ANY_5XX
-     * bit is required to make that true. Parser only: nothing consults
-     * conf->use_stale on any request path yet (S4.2). */
+     * bit is required to make that true. Consulted on the request path by the
+     * stale-if-error gate in ngx_http_cache_turbo_header_filter (S4.2). */
     ngx_conf_merge_uint_value(conf->use_stale, prev->use_stale,
                               NGX_HTTP_CACHE_TURBO_USE_STALE_DEFAULT);
 
