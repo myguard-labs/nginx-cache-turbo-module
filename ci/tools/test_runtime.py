@@ -11624,7 +11624,25 @@ def test_l2_tag_purge_large(ng: Nginx, origin: Origin,
     and exhausted worker_connections; now the purge collects all keys into ONE
     pipelined UNLINK connection, so the whole set is deleted cleanly. Asserts
     both the framed member count (STAB-3) and full cross-tier deletion (PERF)."""
-    redis.cli("DEL", tag_key("blog"), tag_key("news"))
+    # ⚠ The tag SADD is fire-and-forget, so the PRECEDING test's trailing
+    # /l2t/p1 + /l2t/p2 cold misses (test_l2_tag_purge) can still have their
+    # re-tagging SADDs in flight when we get here. DELeting once races them: a
+    # straggler lands after the DEL and this test counts 351 instead of 350.
+    # Drain to a stable empty state first -- DEL, then confirm it STAYS empty
+    # across a settle window -- so the count below is only our own members.
+    def _drained() -> bool:
+        # Re-DEL each poll so a straggler that lands between our DEL and our
+        # read is absorbed rather than merely detected, then require the set to
+        # STAY empty across a settle window before we trust it.
+        redis.cli("DEL", tag_key("blog"), tag_key("news"))
+        time.sleep(0.25)
+        return redis.cli("SCARD", tag_key("news")) == "0"
+
+    assert wait_for(_drained, timeout=10.0), \
+        (f"tag set 'news' never drained before priming; a previous test's "
+         f"fire-and-forget SADD is still landing after 10s "
+         f"(SCARD={redis.cli('SCARD', tag_key('news'))})")
+
     n = 350                                        # ~25 KiB SMEMBERS reply
     for i in range(n):
         s, _, _ = fetch(ng.port, f"/l2t/big-{i}")  # miss -> store + tag
