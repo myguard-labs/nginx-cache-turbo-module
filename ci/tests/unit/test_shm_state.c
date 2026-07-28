@@ -1185,6 +1185,33 @@ test_breaker_failure_ignores_healthy_statuses(void)
 }
 
 
+/* The two conditions that together mean "this came off the wire". Tested as a
+ * pair because the dangerous case is the one where only half holds. */
+static void
+test_breaker_from_origin(void)
+{
+    printf("breaker/O4.2: upstream present AND not a native cache hit\n");
+
+    CHECK(ngx_http_cache_turbo_breaker_from_origin(1, 0),
+          "a real upstream response was not treated as coming from the origin");
+
+    /* No upstream at all: the only-if-cached 504 the module generates itself. */
+    CHECK(!ngx_http_cache_turbo_breaker_from_origin(0, 0),
+          "a response with no upstream was treated as coming from the origin");
+
+    /* ⚠ upstream allocated, but nginx served it from its OWN disk cache.
+     * ngx_http_upstream_cache_send() sets r->cached = 1 with r->upstream
+     * already in place, so the upstream check alone passes here. */
+    CHECK(!ngx_http_cache_turbo_breaker_from_origin(1, 1),
+          "a native proxy_cache HIT was treated as an origin response — the "
+          "disk cache could close a breaker no probe ever tested");
+
+    CHECK(!ngx_http_cache_turbo_breaker_from_origin(0, 1),
+          "a cached response with no upstream was treated as an origin "
+          "response");
+}
+
+
 /* ⚠ The admission rule, driven directly rather than restated. Each argument is
  * withheld in turn; every one of them must be able to veto on its own. */
 static void
@@ -1192,21 +1219,28 @@ test_breaker_should_record_admission(void)
 {
     printf("breaker/O4.2: only a real origin response feeds the breaker\n");
 
-    /* served=0, upstream=1, main=1, threshold=3 -- the one admitted case. */
+    /* served=0, from_origin=1, main=1, threshold=3 -- the one admitted case. */
     CHECK(ngx_http_cache_turbo_breaker_should_record(0, 1, 1, 3),
           "a genuine origin response was not admitted");
 
-    /* A cache serve says nothing about the origin. */
+    /* Our own cache serve says nothing about the origin. */
     CHECK(!ngx_http_cache_turbo_breaker_should_record(1, 1, 1, 3),
           "a cache serve was fed to the breaker — it would read a dead origin "
           "as healthy for as long as the cache kept serving");
 
-    /* ⚠ The client-triggerable one. An only-if-cached miss is answered 504
-     * locally with no upstream; if that counts, a client trips a healthy
-     * zone's breaker just by repeating a request header. */
+    /* ⚠ Not from the origin. Two distinct real cases collapse onto this arm,
+     * and the call site must exclude both:
+     *   - an only-if-cached miss, answered 504 locally with no upstream at
+     *     all. Client-triggerable: if it counts, a visitor trips a healthy
+     *     zone's breaker just by repeating a request header.
+     *   - a native proxy_cache/fastcgi_cache HIT, where r->upstream IS
+     *     allocated but ngx_http_upstream_cache_send() served from disk and
+     *     set r->cached. Somebody else's cache hit; counting it lets the disk
+     *     cache close a breaker no probe ever tested. */
     CHECK(!ngx_http_cache_turbo_breaker_should_record(0, 0, 1, 3),
-          "a locally generated response with no upstream was fed to the "
-          "breaker — a client can now trip a healthy origin's breaker");
+          "a response that did not come from the origin was fed to the "
+          "breaker — either a client can trip a healthy origin's breaker, or "
+          "a native cache HIT can close one without probing");
 
     /* Not the origin conversation we track. */
     CHECK(!ngx_http_cache_turbo_breaker_should_record(0, 1, 0, 3),
@@ -1481,11 +1515,11 @@ run_negative_controls(void)
         }
     }
 
-    /* O4.2-c: the admission rule loses its r->upstream arm, so a locally
-     * generated response counts as an origin outcome. Model the only-if-cached
+    /* O4.2-c: the admission rule loses its from_origin arm, so a response the
+     * origin never sent counts as an origin outcome. Model the only-if-cached
      * miss exactly: no upstream was contacted, and the module answered 504
-     * itself. Drive the REAL admission rule with upstream present (the bug's
-     * effect) and the REAL record()/state() pair with the 504 the client sees.
+     * itself. Drive the REAL admission rule with from_origin forced on (the
+     * bug's effect) and the REAL record()/state() pair with the 504.
      *
      * Three of those trip the breaker on threshold 3 -- against an origin
      * nobody spoke to. test_breaker_should_record_admission's no-upstream
@@ -1496,7 +1530,7 @@ run_negative_controls(void)
         ngx_uint_t  i;
 
         for (i = 0; i < 3; i++) {
-            /* the bug: has_upstream forced to 1 for a response that had none */
+            /* the bug: from_origin forced to 1 for a response that wasn't */
             if (ngx_http_cache_turbo_breaker_should_record(0, 1, 1, 3)) {
                 ngx_http_cache_turbo_shm_breaker_record(
                     &g_zone,
@@ -1510,9 +1544,9 @@ run_negative_controls(void)
                   && g_sh.breaker_opens == 1);
         tests_run++;
         if (!caught) {
-            fprintf(stderr, "  ✗ CONTROL O4.2-c: admitting a response with no "
-                            "upstream did not trip the breaker — the "
-                            "client-triggerable-trip assertion guards "
+            fprintf(stderr, "  ✗ CONTROL O4.2-c: admitting a response that "
+                            "did not come from the origin did not trip the "
+                            "breaker — the from_origin assertion guards "
                             "nothing\n");
             tests_failed++;
         }
@@ -1573,6 +1607,7 @@ main(void)
     test_breaker_failure_counts_every_5xx();
     test_breaker_failure_ignores_healthy_statuses();
     test_breaker_record_driven_by_predicate();
+    test_breaker_from_origin();
     test_breaker_should_record_admission();
     run_negative_controls();
 

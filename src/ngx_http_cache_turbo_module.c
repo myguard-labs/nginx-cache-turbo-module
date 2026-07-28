@@ -6254,14 +6254,29 @@ ngx_http_cache_turbo_breaker_is_origin_failure(ngx_uint_t status)
  * certified by its own test). The header filter passes the four facts it has;
  * every argument here is a genuine reason to refuse.
  *
- *   served       -- a cache serve. Replaying our own body says nothing about
+ *   served       -- OUR cache serve. Replaying our own body says nothing about
  *                   the origin, and feeding it back would read a dead origin
  *                   as healthy for as long as the cache kept serving.
- *   has_upstream -- r->upstream != NULL. The decisive one: !served does NOT
- *                   mean the origin was contacted. An only-if-cached miss is
- *                   answered 504 locally (module.c:4422, :5002) with no
- *                   upstream at all, and counting those lets a client trip a
- *                   healthy breaker with a request header.
+ *   from_origin  -- the response really came off the wire. TWO conditions, and
+ *                   both are needed:
+ *
+ *                   r->upstream != NULL, because !served does NOT mean the
+ *                   origin was contacted -- an only-if-cached miss is answered
+ *                   504 locally (module.c:4422, :5002) with no upstream at
+ *                   all, and counting those lets a client trip a healthy
+ *                   breaker with a request header.
+ *
+ *                   !r->cached, because r->upstream being non-NULL only means
+ *                   the upstream subsystem was initialised, NOT that it spoke
+ *                   to anyone. When cache-turbo is stacked in front of
+ *                   proxy_cache / fastcgi_cache (a documented setup, see the
+ *                   README), ngx_http_upstream_cache_send() sets r->cached = 1
+ *                   and serves from nginx's OWN disk cache with r->upstream
+ *                   already allocated. Those responses are somebody else's
+ *                   cache hits: counting them lets nginx's disk cache clear a
+ *                   real failure run, or close a HALF_OPEN breaker without any
+ *                   probe ever reaching the origin -- the breaker would go
+ *                   blind for exactly as long as the disk cache kept serving.
  *   is_main      -- subrequests other than our own warm fetch have their own
  *                   lifecycle and are not the origin conversation we track.
  *   threshold    -- the breaker's off-switch. _breaker_record()'s success path
@@ -6271,9 +6286,26 @@ ngx_http_cache_turbo_breaker_is_origin_failure(ngx_uint_t status)
  */
 static ngx_uint_t
 ngx_http_cache_turbo_breaker_should_record(ngx_uint_t served,
-    ngx_uint_t has_upstream, ngx_uint_t is_main, ngx_uint_t threshold)
+    ngx_uint_t from_origin, ngx_uint_t is_main, ngx_uint_t threshold)
 {
-    return !served && has_upstream && is_main && threshold > 0;
+    return !served && from_origin && is_main && threshold > 0;
+}
+
+
+/* Did this response actually come off the wire? Split out so the two
+ * conditions are testable together rather than assembled inline at the call
+ * site: an inline expression is invisible to the unit slice, so reversing or
+ * dropping half of it would leave every test green.
+ *
+ * `upstream` is r->upstream != NULL, `native_cached` is r->cached (always 0
+ * where NGX_HTTP_CACHE is off, hence no #if here -- the caller resolves that).
+ * See the argument notes on _breaker_should_record() for why both are needed.
+ */
+static ngx_uint_t
+ngx_http_cache_turbo_breaker_from_origin(ngx_uint_t upstream,
+    ngx_uint_t native_cached)
+{
+    return upstream && !native_cached;
 }
 /* UNIT-EXTRACT breaker-failure END */
 
@@ -6347,7 +6379,13 @@ ngx_http_cache_turbo_header_filter(ngx_http_request_t *r)
     if (clcf->enable && clcf->shm_zone != NULL
         && ngx_http_cache_turbo_breaker_should_record(
                0,                      /* ctx->served: excluded above already */
-               r->upstream != NULL,
+               ngx_http_cache_turbo_breaker_from_origin(
+                   r->upstream != NULL,
+#if (NGX_HTTP_CACHE)
+                   r->cached),
+#else
+                   0),
+#endif
                r == r->main || ctx->warm,
                clcf->breaker_threshold))
     {

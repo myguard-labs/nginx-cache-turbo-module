@@ -113,7 +113,8 @@ fi
 } >> "$OUT"
 
 for fn in 'ngx_http_cache_turbo_breaker_is_origin_failure(' \
-          'ngx_http_cache_turbo_breaker_should_record('; do
+          'ngx_http_cache_turbo_breaker_should_record(' \
+          'ngx_http_cache_turbo_breaker_from_origin('; do
     if ! grep -qF "$fn" "$OUT"; then
         echo "✗ failed to extract ${fn%(} from $MODSRC" >&2
         echo "  (UNIT-EXTRACT breaker-failure markers moved or vanished?)" >&2
@@ -122,16 +123,35 @@ for fn in 'ngx_http_cache_turbo_breaker_is_origin_failure(' \
     fi
 done
 
-# ⚠ The admission rule must keep its r->upstream arm. Without it a locally
+# ⚠ The admission rule must keep its from_origin arm. Without it a locally
 # generated 5xx -- an only-if-cached miss is answered 504 by the module itself,
 # no upstream contacted -- counts as an origin failure, and a client can trip a
 # HEALTHY zone's breaker just by repeating a request header.
 if ! sed -n '/^ngx_http_cache_turbo_breaker_should_record(/,/^}/p' "$OUT" \
    | sed -E 's;/\*.*;;; s;^[[:space:]]*\*.*;;' \
-   | grep -q 'has_upstream'; then
-    echo "✗ O4.2 regression: the breaker admission rule dropped has_upstream." >&2
+   | grep -q 'from_origin'; then
+    echo "✗ O4.2 regression: the breaker admission rule dropped from_origin." >&2
     echo "  Locally generated 5xx (only-if-cached 504) would then count as" >&2
     echo "  origin failures — a client could trip a healthy breaker." >&2
+    rm -f "$OUT"
+    exit 1
+fi
+
+# ⚠ The CALL SITE must compute from_origin as "upstream exists AND this is not
+# somebody else's cache hit". r->upstream != NULL alone only proves the upstream
+# subsystem was initialised: with cache-turbo stacked in front of proxy_cache,
+# ngx_http_upstream_cache_send() sets r->cached = 1 and serves from nginx's disk
+# cache with r->upstream already allocated. Those hits would then clear a real
+# failure run, or close a HALF_OPEN breaker with no probe reaching the origin.
+#
+# Checked against module.c rather than the slice: the call site is in the header
+# filter, which is not extracted. Comments stripped first, as everywhere here.
+if ! sed -n '/ngx_http_cache_turbo_breaker_should_record($/,/^    {$/p' "$MODSRC" \
+   | sed -E 's;/\*.*;;; s;^[[:space:]]*\*.*;;' \
+   | grep -q 'r->cached'; then
+    echo "✗ O4.2 regression: the breaker call site no longer excludes" >&2
+    echo "  r->cached. Native proxy_cache/fastcgi_cache HITs would count as" >&2
+    echo "  origin outcomes and blind the breaker during an outage." >&2
     rm -f "$OUT"
     exit 1
 fi
