@@ -907,7 +907,7 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
         # (serial and 12-way concurrent, min_uses 1/4/32, lock on and off); every
         # one passed with the coupling deliberately restored. See issues.md.
         location /l2neglife/ {{
-            cache_turbo                  main;
+            cache_turbo                  l2neglifez;
             cache_turbo_key              $uri;
             cache_turbo_valid            30s;
             cache_turbo_lock             off;
@@ -940,7 +940,7 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
         # teardown regression surfaces as a legible assertion rather than a
         # timeout whose cause is ambiguous.
         location /l2negmu/ {{
-            cache_turbo                  main;
+            cache_turbo                  l2negmuz;
             cache_turbo_key              $uri;
             cache_turbo_valid            30s;
             cache_turbo_min_uses         3;
@@ -1179,6 +1179,26 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             deny all;
         }}
 
+        # SUITE-1 (s128): the other half of the l2neglifez/l2negmuz split. A
+        # private zone without its own admin endpoint cannot be measured at all
+        # -- the helper would keep reading `main`, a zone the location no longer
+        # writes, and every delta assertion would be trivially satisfied.
+        location = /_cache_l2neglife {{
+            cache_turbo_admin    l2neglifez;
+            cache_turbo_redis    127.0.0.1:{redis_port} prefix=ct: timeout=250ms;
+            allow 127.0.0.1;
+            deny all;
+        }}
+
+        # /l2negmu/ writes BOTH l2_neg_skips and min_uses_skips, so this endpoint
+        # is what _admin_min_uses_skips() must read for that location too.
+        location = /_cache_l2negmu {{
+            cache_turbo_admin    l2negmuz;
+            cache_turbo_redis    127.0.0.1:{redis_port} prefix=ct: timeout=250ms;
+            allow 127.0.0.1;
+            deny all;
+        }}
+
         # Literal Redis glob metacharacters in a prefix must stay literal during
         # SCAN-based all-purge; only the module-appended final '*' is a wildcard.
         location = /_cache_l2glob {{
@@ -1390,14 +1410,26 @@ http {{
     #
     # !! Scope of that risk, corrected: the increment at module.c:4832 is gated
     # on `clcf->l2_negative_ttl > 0` (module.c:4822), and only FOUR locations
-    # in this config set it -- /l2neg/, /l2negout/, /l2neglife/, /l2negmu/,
-    # of which /l2neg/ and /l2negout/ now sit in private zones. The ~40 other
-    # locations sharing `main` are NOT counter writers and never could be. So
-    # the isolation below is defence against the two SIBLING memo tests, not
-    # against the whole zone, and it is hardening rather than a proven root
-    # cause: the runner is serial, so no reachable foreign writer has actually
-    # been demonstrated. The original intermittency is NOT fully explained and
-    # may recur -- do not treat this zone split as having closed it.
+    # in this config set it -- /l2neg/, /l2negout/, /l2neglife/, /l2negmu/.
+    # The ~40 other locations sharing `main` are NOT counter writers and never
+    # could be, so the "zone bleed from ~40 locations" story is wrong; the real
+    # contention was always between these FOUR siblings.
+    #
+    # As of s128 all four sit in private zones, and the mechanism is PROVEN
+    # rather than argued: with /l2neglife/ still in `main`, injecting one
+    # memo-skipped /l2negmu/ request into the assertion window of
+    # test_l2_negative_ttl_expires moves its delta 0 -> 1; the identical
+    # injection against an already-isolated location leaves it at 0. Same
+    # binary, same timing, only the zone differs. The harness bounded the
+    # window by error.log byte offsets, so an in-window URI provably landed
+    # between the two admin reads (unlike _recent_memo_skips(), which tails the
+    # WHOLE log and can show a URI that predates the test -- that is most
+    # likely what made the discarded ~40-location story look confirmed).
+    #
+    # !! Still NOT established: that this was the cause of the ORIGINAL SUITE-1
+    # intermittency. No foreign write has been observed landing naturally in
+    # that window -- only an injected one. A recurrence is therefore possible
+    # and would NOT be a regression from this change.
     # NOTE Isolating the zone is only HALF the fix: /_cache is `cache_turbo_admin
     # main`, so a helper reading it after this move would read a counter this
     # location no longer writes and `delta == 0` would be trivially true forever.
@@ -1413,6 +1445,24 @@ http {{
     # separate from l2negz so the 60s memo cannot bleed into the short-window
     # repeat-GET test's counter, and vice versa.
     cache_turbo_zone name=l2negoutz 1m;
+    # SUITE-1 (s128): private zones for the last two memo locations. These were
+    # left in `main` by the first split, which kept the defect alive at
+    # test_l2_negative_ttl_expires' `delta == 0` -- /l2neglife/ and /l2negmu/ are
+    # BOTH l2_neg_skips writers, so a request to one failed an assertion about
+    # the other. PROVEN, not argued: same binary, same timing, inject a
+    # memo-skipped request mid-window and the delta moves 0 -> 1 when the
+    # injected location shares `main`, and stays 0 when it sits in a private
+    # zone (see issues.md / HANDOFF for the log-offset-bounded harness).
+    #
+    # /l2negmu/ also sets min_uses, so this move additionally takes it out of the
+    # min_uses_skips contention set that /minuses/ and /pmu/ still share in
+    # `main` -- those two keep `== N` equality asserts and are now the only
+    # remaining writers of that counter there.
+    #
+    # 1m for the same reason as l2negz: counter nodes only, and ASan redzones
+    # make an oversized zone expensive.
+    cache_turbo_zone name=l2neglifez 1m;
+    cache_turbo_zone name=l2negmuz 1m;
 
     # Q1 end-to-end: stacked native proxy_cache, one zone per suppress mode, so
     # a test can prove cache_turbo_suppress_native actually keeps the native
@@ -9236,9 +9286,21 @@ def test_l2_miss_counted_once_on_cold_park(ng: Nginx, origin: Origin) -> None:
     drain_origin(origin)
 
 
-def _admin_min_uses_skips(ng: Nginx) -> int:
+def _admin_min_uses_skips(ng: Nginx, endpoint: str = "/_cache") -> int:
+    """v15 count of stores skipped because the key was below min_uses.
+
+    ⚠ Zone-global, exactly like l2_neg_skips (see _admin_l2_neg_skips): the
+    admin handler emits ONE zone's stats, so `endpoint` must name the admin
+    location bound to the zone under test. /_cache is `cache_turbo_admin main`,
+    /_cache_l2negmu is `cache_turbo_admin l2negmuz`. Reading the wrong one
+    yields a counter the location never writes, which turns an equality
+    assertion permanently true -- the SUITE-1 defect, in its min_uses form.
+
+    /minuses/ and /pmu/ still share `main` and still use `== N` equality
+    asserts, so they remain mutually contending by construction: keep any new
+    min_uses location OUT of `main`, or give it a private zone + endpoint."""
     import json
-    _, b, _ = fetch(ng.port, "/_cache")
+    _, b, _ = fetch(ng.port, endpoint)
     return int(json.loads(b).get("min_uses_skips", 0))
 
 
@@ -9531,9 +9593,9 @@ def test_l2_negative_ttl_expires(ng: Nginx, origin: Origin,
     fetch(ng.port, uri)                   # arm the memo with a real GET
     time.sleep(0.4)
 
-    skips0 = _admin_l2_neg_skips(ng)
+    skips0 = _admin_l2_neg_skips(ng, "/_cache_l2neglife")
     fetch(ng.port, uri)                   # inside the window: skipped
-    assert _admin_l2_neg_skips(ng) - skips0 >= 1, \
+    assert _admin_l2_neg_skips(ng, "/_cache_l2neglife") - skips0 >= 1, \
         "the second request should have been memo-skipped (window is 3s)"
 
     # Keep requesting ACROSS the whole window. Each of these is memo-skipped, and
@@ -9639,7 +9701,7 @@ def test_l2_negative_ttl_expires(ng: Nginx, origin: Origin,
         "(the !l2_neg_skipped re-arm guard is not working)")
 
     time.sleep(3.5)
-    skips1 = _admin_l2_neg_skips(ng)
+    skips1 = _admin_l2_neg_skips(ng, "/_cache_l2neglife")
     before = _redis_conns_received(redis)
     s, _, _ = fetch(ng.port, uri)
     assert s == 200, f"post-expiry status {s}"
@@ -9656,8 +9718,18 @@ def test_l2_negative_ttl_expires(ng: Nginx, origin: Origin,
         (f"after the memo expired the request opened {nginx_l2_conns} Redis "
          "connections -- the memo is not expiring, so L2 is effectively disabled "
          "for this key")
-    assert _admin_l2_neg_skips(ng) - skips1 == 0, \
-        "an expired memo must not count as a skip"
+    assert _admin_l2_neg_skips(ng, "/_cache_l2neglife") - skips1 == 0, \
+        ("an expired memo must not count as a skip"
+         "\n  NOTE l2_neg_skips is per-zone and /l2neglife/ has a PRIVATE zone"
+         " (l2neglifez, s128), read here via /_cache_l2neglife. It is the only"
+         " location that can WRITE that counter, so a non-zero delta is this"
+         " uri's own memo -- it cannot be a sibling memo test bleeding into the"
+         " window, which is what this assertion used to fail on while"
+         " /l2neglife/ and /l2negmu/ both sat in `main`."
+         f"\n  recently skipped keys: {_recent_memo_skips(ng, limit=8)}"
+         "\n  ⚠ That key list is tailed from the WHOLE error.log, not this"
+         " assertion's window, so an unrelated uri in it may predate the test"
+         " entirely -- a hint, not evidence. Re-run with TEST_CT_ERRLOG=debug.")
 
 
 def test_l2_negative_ttl_with_min_uses(ng: Nginx, origin: Origin,
@@ -9679,15 +9751,15 @@ def test_l2_negative_ttl_with_min_uses(ng: Nginx, origin: Origin,
     fetch(ng.port, uri)                   # miss 1: arms memo, counts 1
     time.sleep(0.4)
 
-    skips0 = _admin_l2_neg_skips(ng)
-    mu0 = _admin_min_uses_skips(ng)
+    skips0 = _admin_l2_neg_skips(ng, "/_cache_l2negmu")
+    mu0 = _admin_min_uses_skips(ng, "/_cache_l2negmu")
 
     s, _, h = fetch(ng.port, uri)         # miss 2 within the window
     assert s == 200, f"req2 status {s}"
 
-    assert _admin_l2_neg_skips(ng) - skips0 >= 1, \
+    assert _admin_l2_neg_skips(ng, "/_cache_l2negmu") - skips0 >= 1, \
         "the memo stopped working once min_uses shared the node"
-    assert _admin_min_uses_skips(ng) - mu0 >= 1, \
+    assert _admin_min_uses_skips(ng, "/_cache_l2negmu") - mu0 >= 1, \
         "min_uses stopped counting once the memo shared the node"
 
 
@@ -9801,10 +9873,10 @@ def test_min_uses_counter_survives_uncacheable(ng: Nginx, origin: Origin,
     # "1 in N" red on slow CI runners -- not the sleep, and not unstub().
     skips_seen = []
     for _ in range(5):
-        mu0 = _admin_min_uses_skips(ng)
+        mu0 = _admin_min_uses_skips(ng, "/_cache_l2negmu")
         s, _, _ = fetch(ng.port, uri)
         assert s == 200, f"status {s}"
-        skips_seen.append(_admin_min_uses_skips(ng) - mu0)
+        skips_seen.append(_admin_min_uses_skips(ng, "/_cache_l2negmu") - mu0)
         time.sleep(0.3)
 
     assert skips_seen[0] >= 1, (
