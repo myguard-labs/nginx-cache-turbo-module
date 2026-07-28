@@ -1147,9 +1147,9 @@ can plan around them rather than discover them during an incident.
   client has a `200` and a partial body; there is no way to retract that and
   substitute a cached copy. Recovering would mean buffering every complete
   response before sending any of it, which costs more than the failure does.
-- **Nothing was ever cached for the URL.** Serving stale needs something stale to
-  serve. A cold URL during an outage has nothing, and no directive changes that —
-  see the `error_page` note below for making the failure look better.
+- **Nothing was ever cached for the URL.** Serving stale needs something stale
+  to serve. A cold URL during an outage has nothing, and no directive changes
+  that — see the `error_page` note below for making the failure look better.
 - **L1 lives in shared memory, so an nginx *restart* empties it.** A reload
   preserves it; a restart does not. Configure a Redis or memcached L2 if you need
   the cache to survive a restart during an outage — but note that Redis down *and*
