@@ -1138,6 +1138,38 @@ refused connection and a real 502 are the same number. So `error` behaves as
 `http_502` and `timeout` behaves as `http_504`. Write whichever reads better;
 they select the same responses.
 
+### What outage handling cannot do
+
+Some failure modes are outside what a cache can fix. They are listed here so you
+can plan around them rather than discover them during an incident.
+
+- **The origin dies after the response headers are already on the wire.** The
+  client has a `200` and a partial body; there is no way to retract that and
+  substitute a cached copy. Recovering would mean buffering every complete
+  response before sending any of it, which costs more than the failure does.
+- **Nothing was ever cached for the URL.** Serving stale needs something stale to
+  serve. A cold URL during an outage has nothing, and no directive changes that —
+  see the `error_page` note below for making the failure look better.
+- **L1 lives in shared memory, so an nginx *restart* empties it.** A reload
+  preserves it; a restart does not. Configure a Redis or memcached L2 if you need
+  the cache to survive a restart during an outage — but note that Redis down *and*
+  origin down leaves this module with nothing on either tier.
+- **Staleness past the `stale-if-error` window is by operator consent.** That is
+  why `cache_turbo_keep_stale` defaults to `off`: serving a six-hour-old page is
+  the right answer for a brochure site and the wrong one for a bank balance, and
+  only you can say which this is.
+
+For the cold-URL case, prefer nginx's own error handling over anything this module
+could add:
+
+```nginx
+    error_page 502 503 504 /maintenance.html;
+```
+
+That keeps one mechanism for "the origin is unreachable and we have nothing", works
+identically whether or not cache-turbo is in the location, and stays under your
+control rather than this module's.
+
 ## Long-tail URLs: reach for `cache_turbo_min_uses` first
 
 If the cache is large but the hit rate is poor, the usual cause is not the TTL —
