@@ -11158,6 +11158,17 @@ def test_l2_stale_refetch_does_not_stall_on_lock(ng: Nginx, origin: Origin,
     # where the winner's lock is still held and its object is unserveable.
     time.sleep(1.3)
 
+    # sleep() only guarantees a LOWER bound. If the box stalls long enough for
+    # the 5s lock PX to expire before the fetch below, the request no longer
+    # meets a held lock and the test passes without exercising the window it
+    # exists to cover. Assert the lock is still alive, with enough margin left
+    # that a stall could not be mistaken for a healthy sub-2s response.
+    lock_pttl = int(redis.cli("PTTL", lock_key(uri)))
+    assert lock_pttl > 2000, (
+        f"cross-node lock has only {lock_pttl}ms left (or is gone: -2). The "
+        f"unserveable-object/held-lock window has already closed, so this run "
+        f"would not exercise V-HANG-2 at all.")
+
     t0 = time.time()
     s1, _, _ = fetch(ng.port, uri)
     elapsed = time.time() - t0
