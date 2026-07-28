@@ -9768,7 +9768,7 @@ def test_l2_negative_ttl_with_min_uses(ng: Nginx, origin: Origin,
     skips0 = _admin_l2_neg_skips(ng, "/_cache_l2negmu")
     mu0 = _admin_min_uses_skips(ng, "/_cache_l2negmu")
 
-    s, _, h = fetch(ng.port, uri)         # miss 2 within the window
+    s, _, _ = fetch(ng.port, uri)         # miss 2 within the window
     assert s == 200, f"req2 status {s}"
 
     assert _admin_l2_neg_skips(ng, "/_cache_l2negmu") - skips0 >= 1, \
