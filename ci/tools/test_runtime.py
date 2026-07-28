@@ -1694,8 +1694,14 @@ http {{
         # fetches makes STALE the CORRECT answer and the test fails on box speed,
         # not on module behaviour (SUITE-4). Both edges scale together -- widening
         # valid alone would move the stale read back inside the FRESH window and
-        # break the STALE assert instead. Keep `valid` and the test's sleep
-        # proportional: sleep must land in (valid, valid*stale_mult).
+        # break the STALE assert instead.
+        #
+        # Total serve life is valid*stale_mult ABSOLUTE, not fresh + stale on top:
+        # shm_store() sets stale_until = now + stale_ttl(valid, stale_mult), so
+        # 4s*4 = 16s total == 4s fresh + 12s stale. When retuning, the sleep must
+        # satisfy valid < sleep < valid*(stale_mult-1) -- the lower slack absorbs
+        # the prime, and the upper one the elapsed time before the sleep starts.
+        # Here that is 4 < 8 < 12.
         location /ccignmr/ {{
             cache_turbo               main;
             cache_turbo_key           $uri;
@@ -7604,10 +7610,11 @@ def test_ignore_cc_must_revalidate_keeps_stale_window(ng: Nginx,
     Cache-Control, including the must-revalidate token that would otherwise
     collapse the stale window at store. The origin emits
     "max-age=1, must-revalidate"; under /ccignmr/ (ignore_cc on, valid 4s, default
-    stale_mult 4 => 16s stale window) the entry must still be STALE-served at ~8s.
-    Without the fix (must-revalidate parsed despite ignore_cc) the window collapses
-    to 4s and the 8s read is a hard miss to origin. Inverse of
-    test_must_revalidate_collapses_stale (the /mrev/ honor_cc case).
+    stale_mult 4 => 16s total serve life = 4s fresh + 12s stale) the entry must
+    still be STALE-served at ~8s. Without the fix (must-revalidate parsed despite
+    ignore_cc) the serve deadline collapses to the 4s fresh deadline and the 8s
+    read is a hard miss to origin. Inverse of test_must_revalidate (the /mrev/
+    honor_cc case).
 
     !! The 4s fresh TTL is deliberate and paired with the 8s sleep below; see
     the /ccignmr/ fixture comment. Do not shrink either one independently."""
@@ -7616,7 +7623,7 @@ def test_ignore_cc_must_revalidate_keeps_stale_window(ng: Nginx,
     _, _, h1 = fetch(ng.port, uri)
     assert h1.get("x-cache") == "HIT", \
         f"ignore_cc must store the must-revalidate response; got {h1.get('x-cache')}"
-    time.sleep(8.0)                                        # past 4s fresh, < 20s stale
+    time.sleep(8.0)                                        # past 4s fresh, < 16s deadline
     before = origin.hits
     _, _, h2 = fetch(ng.port, uri)
     assert h2.get("x-cache") == "STALE", \
