@@ -116,6 +116,17 @@ ngx_http_cache_turbo_shm_init_zone(ngx_shm_zone_t *shm_zone, void *data)
     ctx->sh->snap_cost_sum = 0;
     ctx->sh->snap_cost_count = 0;
 
+    /* P6/O4.1 breaker: a fresh zone starts CLOSED, i.e. NOT tripped, so traffic
+     * flows to the origin exactly as if the feature were off. Explicit rather
+     * than relying on CLOSED == 0, because this is the fail-safe direction and
+     * a reader should not have to know the constant's value to see that. */
+    ctx->sh->breaker_state = NGX_HTTP_CACHE_TURBO_BREAKER_CLOSED;
+    ctx->sh->breaker_fails = 0;
+    ctx->sh->breaker_window_start = 0;
+    ctx->sh->breaker_opened_at = 0;
+    ctx->sh->breaker_probe_at = 0;
+    ctx->sh->breaker_opens = 0;
+
     ctx->shpool->log_nomem = 0;
 
     return NGX_OK;
@@ -703,6 +714,12 @@ ngx_http_cache_turbo_shm_stats(ngx_http_cache_turbo_zone_t *z,
     out->cost_ms        = cnt ? (z->sh->cost_sum_ms / cnt) : 0;
     out->autotuned_beta = z->sh->autotuned_beta;
     out->autotuned_load = z->sh->autotuned_load;   /* v4-4 load factor ×1000 */
+
+    /* P6/O4.1 breaker introspection. Read raw -- do NOT call breaker_state()
+     * here: that function performs the OPEN -> HALF_OPEN transition, and an
+     * admin GET must observe the breaker, never drive it. */
+    out->breaker_state = z->sh->breaker_state;
+    out->breaker_opens = z->sh->breaker_opens;
 }
 
 
@@ -1072,6 +1089,257 @@ ngx_http_cache_turbo_shm_l2_neg_set(ngx_http_cache_turbo_zone_t *z,
     ngx_http_cache_turbo_lru_insert_new(z, ctn);
 
     ngx_shmtx_unlock(&z->shpool->mutex);
+}
+
+
+/*
+ * P6/O4.1 -- circuit-breaker state machine. Per-zone (D-5).
+ *
+ * CLOSED --(threshold failures inside window)--> OPEN
+ *   OPEN --(open_for elapsed)--------------->  HALF_OPEN   (one probe allowed)
+ * HALF_OPEN --(probe succeeded)------------->  CLOSED
+ * HALF_OPEN --(probe failed)---------------->  OPEN        (fresh open window)
+ *
+ * ⚠ NO LOCK IS TAKEN HERE, deliberately -- see the field block in module.h.
+ * Every transition is one ngx_atomic_cmp_set on sh->breaker_state; the losing
+ * worker of a concurrent CAS simply observes the winner's state on its next
+ * read. That makes the transitions correct under concurrency without making
+ * the FIELDS mutually consistent, so no caller may latch two of them and
+ * assume they describe one instant.
+ *
+ * This is state only. NOTHING on the serve path calls these yet: O4.3 wires
+ * the request path, O4.2 wires the outcome recording, O4.4 adds the directives
+ * that supply threshold/window/open_for. Until then the breaker is inert by
+ * construction -- there is no config that can reach it, which is why O4.1 is
+ * safe to merge on its own.
+ */
+
+/*
+ * Return the breaker's CURRENT state, performing any transition that has become
+ * due purely by the passage of time (OPEN -> HALF_OPEN). Callers treat the
+ * return value as the verdict for this request.
+ *
+ * `open_for` is how long an OPEN lasts before one probe is let through. A
+ * caller passing 0 disables the timed reopen (the breaker stays OPEN until a
+ * recorded success), which is why the guard below is `> 0` and not an assert.
+ *
+ * Exactly ONE request per open window is promoted to the probe: the CAS on
+ * OPEN -> HALF_OPEN has a single winner, and every other request keeps seeing
+ * OPEN until that probe reports back through _record(). That is the property
+ * that stops a thundering herd from all "probing" a still-dead origin at once.
+ */
+ngx_uint_t
+ngx_http_cache_turbo_shm_breaker_state(ngx_http_cache_turbo_zone_t *z,
+    time_t open_for)
+{
+    time_t      now;
+    ngx_uint_t  state;
+
+    /* Plain volatile read, NOT fetch_add(...,0): a lock-prefixed RMW would
+     * acquire the cache line exclusively on every call, and this is the
+     * pre-origin-connect read path -- the hottest site in the zone. Sampling is
+     * all that is needed here; the transitions below carry their own CAS. */
+    state = (ngx_uint_t) z->sh->breaker_state;
+
+    now = ngx_time();
+
+    /* ⚠ A caller that merely OBSERVES a HALF_OPEN installed by somebody else is
+     * NOT the probe and must be told OPEN. Returning the stored state here --
+     * which an earlier revision did -- hands every concurrent request the
+     * probe's verdict and destroys the entire anti-herd property: one worker
+     * wins the CAS, and then unbounded traffic walks past the breaker into the
+     * dead origin. HALF_OPEN is returned by exactly one path, the successful
+     * promotion CAS below, and nowhere else.
+     *
+     * The exception is a probe that never reported back (its request was
+     * aborted, or its worker was killed between promotion and _record()).
+     * Nothing would ever move the state again, so the breaker would wedge in
+     * HALF_OPEN forever. breaker_probe_at makes the promotion a time-bounded
+     * LEASE: once it has gone stale by open_for, the next caller reclaims the
+     * probe slot with a CAS -- again a single winner. */
+    if (state == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN) {
+
+        if (open_for > 0
+            && now >= (time_t) z->sh->breaker_probe_at + open_for
+            && ngx_atomic_cmp_set(&z->sh->breaker_state,
+                                  NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN,
+                                  NGX_HTTP_CACHE_TURBO_BREAKER_OPEN))
+        {
+            /* Reclaimed an abandoned lease by demoting it to OPEN. Exactly one
+             * caller can win THIS cas (the next one finds OPEN, not
+             * HALF_OPEN), and that winner then falls through to the ordinary
+             * promotion path below, which re-stamps opened_at and admits one
+             * replacement probe. Two CASes rather than one, but each has a
+             * genuine single winner -- a HALF_OPEN -> HALF_OPEN cas would
+             * succeed for every caller and guard nothing.
+             *
+             * ⚠ This stamp lands AFTER its CAS, the opposite of the ordering
+             * _breaker_record() insists on, and it is safe ONLY because of the
+             * VALUE: now - open_for reads as already elapsed, so a worker that
+             * sees the intermediate OPEN with an even older opened_at just wins
+             * the promotion CAS instead of us -- still exactly one probe.
+             * Change this to `now`, or to anything meant to arm a FRESH window,
+             * and the ordering silently becomes the window-skip bug the
+             * failed-probe path warns about. Move the write above the CAS if
+             * you ever change the value. */
+            z->sh->breaker_opened_at = (ngx_atomic_t) (now - open_for);
+            state = NGX_HTTP_CACHE_TURBO_BREAKER_OPEN;
+
+        } else {
+            return NGX_HTTP_CACHE_TURBO_BREAKER_OPEN;
+        }
+    }
+
+    if (state != NGX_HTTP_CACHE_TURBO_BREAKER_OPEN || open_for <= 0) {
+        return state;
+    }
+
+    if (now < (time_t) z->sh->breaker_opened_at + open_for) {
+        return NGX_HTTP_CACHE_TURBO_BREAKER_OPEN;
+    }
+
+    /* The open window has elapsed. Promote exactly one request to probe the
+     * origin. A loser of this CAS keeps its OPEN verdict -- it must NOT fall
+     * through to the origin, or the herd this breaker exists to stop walks
+     * straight past it. */
+    if (ngx_atomic_cmp_set(&z->sh->breaker_state,
+                           NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
+                           NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN))
+    {
+        z->sh->breaker_probe_at = (ngx_atomic_t) now;
+        return NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN;
+    }
+
+    return NGX_HTTP_CACHE_TURBO_BREAKER_OPEN;
+}
+
+
+/*
+ * Feed one origin outcome into the breaker. `success` is non-zero when the
+ * origin answered acceptably; zero when it failed (connect error, timeout, or
+ * a status the use_stale mask counts as down).
+ *
+ * `threshold` failures inside a `window` of seconds trip CLOSED -> OPEN. The
+ * window is a rolling anchor, not a fixed bucket: the first failure after an
+ * idle gap re-anchors it, so a slow trickle of unrelated failures spread over
+ * hours never accumulates into an open. A threshold of 0 disables tripping,
+ * and so does a window of 0 -- both are inert rather than degenerate.
+ */
+void
+ngx_http_cache_turbo_shm_breaker_record(ngx_http_cache_turbo_zone_t *z,
+    ngx_uint_t success, ngx_uint_t threshold, time_t window)
+{
+    time_t            now;
+    ngx_atomic_uint_t fails;
+    ngx_uint_t        state;
+
+    now   = ngx_time();
+    state = (ngx_uint_t) z->sh->breaker_state;   /* plain read, see above */
+
+    if (success) {
+        /* A success clears the failure run. */
+        z->sh->breaker_fails = 0;
+
+        /* ⚠ ONLY a HALF_OPEN -> CLOSED edge exists, matching the state diagram.
+         * An earlier revision closed from ANY non-CLOSED state, which let a
+         * success that had been in flight since before the trip close a breaker
+         * it knew nothing about: a slow request started while CLOSED completes
+         * after faster failures opened the breaker, and reports "origin fine".
+         * While OPEN nobody is talking to the origin by construction, so the
+         * only success that carries current information is the probe's. Any
+         * other success is stale by definition and must be ignored.
+         *
+         * This is deliberately NOT a full generation/token scheme. A stale
+         * probe success can still close a LATER HALF_OPEN (classic ABA: the
+         * state returned to HALF_OPEN while the old outcome was in flight).
+         * Closing early costs one round of origin traffic that immediately
+         * re-trips, whereas the pre-trip case above could hold the breaker
+         * closed against a dead origin indefinitely. O4.3 owns the probe
+         * token if the residual turns out to matter in practice; it needs a
+         * request-scoped handle this API does not have. */
+        if (state == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN) {
+            (void) ngx_atomic_cmp_set(&z->sh->breaker_state,
+                                      NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN,
+                                      NGX_HTTP_CACHE_TURBO_BREAKER_CLOSED);
+        }
+
+        return;
+    }
+
+    /* --- failure --- */
+
+    if (state == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN) {
+        /* The probe failed: back to OPEN for a fresh window. Re-stamping
+         * opened_at is what makes the next probe wait another open_for rather
+         * than firing again immediately.
+         *
+         * ⚠ The timestamp is published BEFORE the CAS. Written after, a worker
+         * could observe the new OPEN while opened_at still held the PREVIOUS
+         * open's value, compute that open_for had long since elapsed, and
+         * promote a probe immediately -- skipping the entire window. Writing
+         * first means any worker that can see OPEN can already see a deadline
+         * that is at least as new. */
+        z->sh->breaker_opened_at = (ngx_atomic_t) now;
+
+        (void) ngx_atomic_cmp_set(&z->sh->breaker_state,
+                                  NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN,
+                                  NGX_HTTP_CACHE_TURBO_BREAKER_OPEN);
+
+        return;
+    }
+
+    /* ⚠ window <= 0 is INERT, not "count forever". Skipping the re-anchor
+     * instead would let breaker_fails accumulate for the life of the zone and
+     * trip on the Nth failure EVER recorded, days apart -- precisely the slow
+     * trickle the rolling window exists to ignore. O4.4 feeds these values from
+     * directives, so an unset or zero window is a plausible arrival, and it
+     * must fail towards "breaker does nothing" like threshold == 0 does. */
+    if (state != NGX_HTTP_CACHE_TURBO_BREAKER_CLOSED
+        || threshold == 0 || window <= 0)
+    {
+        return;
+    }
+
+    /* Rolling window: re-anchor if the previous one has expired, so only a
+     * BURST of failures trips the breaker. */
+    if (now >= (time_t) z->sh->breaker_window_start + window) {
+        z->sh->breaker_window_start = (ngx_atomic_t) now;
+        z->sh->breaker_fails        = 0;
+    }
+
+    fails = (ngx_atomic_uint_t) ngx_atomic_fetch_add(&z->sh->breaker_fails, 1) + 1;
+
+    if (fails < threshold) {
+        return;
+    }
+
+    /* Same publish-before-CAS ordering as the failed-probe path above: a worker
+     * must never be able to see OPEN alongside a stale opened_at and conclude
+     * the open window has already expired. */
+    z->sh->breaker_opened_at = (ngx_atomic_t) now;
+
+    if (ngx_atomic_cmp_set(&z->sh->breaker_state,
+                           NGX_HTTP_CACHE_TURBO_BREAKER_CLOSED,
+                           NGX_HTTP_CACHE_TURBO_BREAKER_OPEN))
+    {
+        z->sh->breaker_fails = 0;
+        (void) ngx_atomic_fetch_add(&z->sh->breaker_opens, 1);
+    }
+}
+
+
+/* Map a breaker state to the string the admin JSON exposes. Returns a static
+ * literal; never NULL, so a corrupted state renders as "unknown" rather than
+ * crashing the admin endpoint. */
+const char *
+ngx_http_cache_turbo_shm_breaker_state_str(ngx_uint_t state)
+{
+    switch (state) {
+    case NGX_HTTP_CACHE_TURBO_BREAKER_CLOSED:    return "closed";
+    case NGX_HTTP_CACHE_TURBO_BREAKER_OPEN:      return "open";
+    case NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN: return "half-open";
+    default:                                     return "unknown";
+    }
 }
 
 

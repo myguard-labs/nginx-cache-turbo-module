@@ -62,6 +62,14 @@ check_define NGX_HTTP_CACHE_TURBO_NODE_COUNTER 1
 # invert the promotion assertions while leaving them green.
 check_define NGX_HTTP_CACHE_TURBO_SEG_PROBATION 0
 check_define NGX_HTTP_CACHE_TURBO_SEG_PROTECTED 1
+# P6/O4.1: CLOSED == 0 is load-bearing for the third time in this file -- a
+# zeroed zone must come up with the breaker NOT tripped (traffic flows to origin
+# as if the feature were off). A silent flip would bring every fresh worker up
+# OPEN, serving stale bodies and 503s until the first probe, and the state tests
+# below would stay green while doing it.
+check_define NGX_HTTP_CACHE_TURBO_BREAKER_CLOSED    0
+check_define NGX_HTTP_CACHE_TURBO_BREAKER_OPEN      1
+check_define NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN 2
 
 # --- slice the function bodies in source order.
 # nginx style: a definition is a bare return-type line (`void`, `ngx_int_t`,
@@ -69,10 +77,10 @@ check_define NGX_HTTP_CACHE_TURBO_SEG_PROTECTED 1
 # by the `name(` line, and the body closes on a bare `}` in column 0. Matching
 # the type line + the name regex picks out exactly the wanted set.
 awk '
-    /^(static )?(void|ngx_int_t|ngx_uint_t|time_t|u_char|ngx_http_cache_turbo_node_t)[[:space:]]*\**$/ {
+    /^(static )?(void|ngx_int_t|ngx_uint_t|time_t|u_char|const char|ngx_http_cache_turbo_node_t)[[:space:]]*\**$/ {
         pending = 1; buf = $0 ORS; next
     }
-    pending && /^ngx_http_cache_turbo_(shm_(lookup|evict_one|alloc_evict|claim|unstub|count_miss|l2_neg_check|l2_neg_set|touch_lru)|lru_(link_head|unlink|insert_new|enforce_cap))\(/ {
+    pending && /^ngx_http_cache_turbo_(shm_(lookup|evict_one|alloc_evict|claim|unstub|count_miss|l2_neg_check|l2_neg_set|touch_lru|breaker_state|breaker_record|breaker_state_str)|lru_(link_head|unlink|insert_new|enforce_cap))\(/ {
         capture = 1; pending = 0; printf "%s", buf; print; next
     }
     pending { pending = 0; buf = "" }
@@ -98,7 +106,10 @@ for fn in \
     'ngx_http_cache_turbo_shm_unstub(' \
     'ngx_http_cache_turbo_shm_count_miss(' \
     'ngx_http_cache_turbo_shm_l2_neg_check(' \
-    'ngx_http_cache_turbo_shm_l2_neg_set('
+    'ngx_http_cache_turbo_shm_l2_neg_set(' \
+    'ngx_http_cache_turbo_shm_breaker_state(' \
+    'ngx_http_cache_turbo_shm_breaker_record(' \
+    'ngx_http_cache_turbo_shm_breaker_state_str('
 do
     if ! grep -qF "$fn" "$OUT"; then
         echo "✗ failed to extract $fn from $SRC" >&2
@@ -145,4 +156,7 @@ if ! sed -n '/^ngx_http_cache_turbo_shm_unstub(/,/^}/p' "$OUT" \
 fi
 
 LINES=$(wc -l < "$OUT")
-echo "✓ extracted 13 shm state functions — $LINES lines -> $OUT"
+# Derive the count rather than hardcoding it: a literal here goes stale the
+# moment the slice list grows and then reports a number that is simply wrong.
+FNS=$(grep -cE '^ngx_http_cache_turbo_[a-z_]+\(' "$OUT")
+echo "✓ extracted $FNS shm state functions — $LINES lines -> $OUT"

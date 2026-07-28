@@ -86,6 +86,22 @@ typedef volatile ngx_atomic_uint_t ngx_atomic_t;
  * the counters observable. */
 #define ngx_atomic_fetch_add(p, n)  ((*(p)) += (n), (*(p)) - (n))
 
+/* Compare-and-set, matching nginx's contract: set *p to `set` and return 1 iff
+ * *p currently equals `old`, else return 0 and leave *p alone.
+ *
+ * ⚠ This harness is SINGLE-THREADED, so this models only the sequential
+ * semantics of the real CAS -- it cannot exercise the interleavings that make
+ * the breaker's lock-free design interesting (two workers racing the same
+ * OPEN -> HALF_OPEN promotion). What it DOES cover is that each transition is
+ * guarded by the right precondition, that a CAS whose precondition no longer
+ * holds is a no-op, and that no path leaves the state machine in an
+ * unreachable state. The multi-worker interleaving is covered by the ASan
+ * multi-worker runtime arm, not here -- do not read a green run of this file
+ * as proof the breaker is race-free. */
+#define ngx_atomic_cmp_set(p, old, set)                                       \
+    ((*(p)) == (ngx_atomic_uint_t) (old)                                      \
+     ? ((*(p)) = (ngx_atomic_uint_t) (set), 1) : 0)
+
 /* --- settable clock ------------------------------------------------------
  * The code under test stamps and compares TTL deadlines (refresh_lock_until,
  * l2_neg_until, last_access). Driving those from the real clock would force
