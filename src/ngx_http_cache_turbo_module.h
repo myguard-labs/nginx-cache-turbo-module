@@ -84,12 +84,12 @@
  * idle L2 conns/worker is already absurd; reject anything larger at parse. */
 #define NGX_HTTP_CACHE_TURBO_KEEPALIVE_MAX  65535
 
-/* cache_turbo_keep_stale <off|time|forever> (S2.1, parser only -- S2.2 wires
- * the read side). Origin-independent last-resort stale retention: when a
- * response carries no `stale-if-error` window of its own, S2.2 will use this
- * as the effective stale-if-error window instead of leaving the object with
- * no fallback at all. `off` (0) is the default and reproduces today's
- * behaviour exactly -- nothing here is read yet.
+/* cache_turbo_keep_stale <off|time|forever> (S2.1; read side wired in S2.2).
+ * Origin-independent last-resort stale retention: when a response carries no
+ * `stale-if-error` window of its own, this becomes the effective
+ * stale-if-error window instead of leaving the object with no fallback at
+ * all. `off` (0) is the default and reproduces the pre-S2.1 behaviour
+ * exactly -- the store path only widens sie_window when this is > 0.
  *
  * No separate MIN/MAX pair: this directive shares the module-wide
  * NGX_HTTP_CACHE_TURBO_TTL_MAX ceiling above (the same uint32-wire-format
@@ -999,8 +999,8 @@ typedef struct {
      * see the NGX_HTTP_CACHE_TURBO_USE_STALE_* comment block for the full
      * contract. NGX_CONF_UNSET_UINT until merge; merges to
      * NGX_HTTP_CACHE_TURBO_USE_STALE_DEFAULT (today's "any 5xx" behaviour,
-     * unchanged). Parser only: nothing reads this field on any request path
-     * yet (that is S4.2). */
+     * unchanged). Read on the request path by the stale-if-error gate in
+     * ngx_http_cache_turbo_header_filter (S4.2). */
     ngx_uint_t               use_stale;
 
     /* P6/O4.2 circuit-breaker tuning. Fed to
