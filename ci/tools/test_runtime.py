@@ -663,6 +663,27 @@ class Origin:
             self._server = None
 
 
+def _errlog_level() -> str:
+    """error_log level for the harness nginx, overridable for diagnosis.
+
+    Defaults to `notice`, which is what CI and every normal run want. Set
+    TEST_CT_ERRLOG=debug to make the module's ngx_log_debug sites (memo skips,
+    cold-wait give-ups, L2 verdicts) land in logs/error.log -- the cheap way to
+    identify WHICH uri tripped a zone-global counter assertion in a long suite,
+    instead of bisecting a couple of hundred tests by hand.
+
+    The binary must be built --with-debug for `debug` to do anything; the
+    harness build is (see objs/ngx_auto_config.h). Debug on a full suite is a
+    large log, hence opt-in rather than the default.
+    """
+    lvl = os.environ.get("TEST_CT_ERRLOG", "notice").strip() or "notice"
+    allowed = {"debug", "info", "notice", "warn", "error", "crit", "alert", "emerg"}
+    if lvl not in allowed:
+        raise SystemExit(f"TEST_CT_ERRLOG={lvl!r} is not an nginx log level "
+                         f"(one of: {', '.join(sorted(allowed))})")
+    return lvl
+
+
 def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
                  origin_port: int, workers: int,
                  redis_port: int | None = None,
@@ -1249,7 +1270,7 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
 
     return f"""{load}worker_processes {workers};
 pid {root}/nginx.pid;
-error_log {root}/logs/error.log notice;
+error_log {root}/logs/error.log {_errlog_level()};
 
 events {{ worker_connections 512; }}
 
@@ -7407,18 +7428,32 @@ def test_valid_zero_is_forever(ng: Nginx, origin: Origin) -> None:
     (a HIT), not become instantly stale. Pre-fix a literal 0 fresh TTL made the
     very next request a STALE serve and broke L2; now it resolves to a long
     finite TTL and behaves as a normal long-lived HIT."""
-    base = origin.hits
-    _, b0, h0 = fetch(ng.port, "/forever/f")
+    # Path-scoped, NOT origin.hits: the global counter sees every other test's
+    # traffic (and async bg-refresh subrequests) landing between the base capture
+    # and the assertion below, which fails an equality bound that has nothing to
+    # do with this location. That is a real failure mode, not a hypothetical --
+    # it took down the ASan multi-worker arm on 28ae802 (SUITE-3), the slowest arm
+    # and so the one with the widest window. Same fix as test_206_never_cached and
+    # test_honor_ttl_clamped_to_max directly below.
+    #
+    # /!\ The needle is in the FILENAME, not the location prefix. /forever/ uses
+    # `proxy_pass http://.../;` WITH a trailing slash, so nginx strips the prefix
+    # and the origin only ever sees "/forever-f" -- hits_for("/forever/") matches
+    # nothing and the assertion fails with the entry behaving perfectly. Same trap
+    # as the /l2sie/ fixture (s121). This is why ttlclamp works: its needle is the
+    # filename too.
+    base = origin.hits_for("forever-f")
+    _, b0, h0 = fetch(ng.port, "/forever/forever-f")
     assert "x-cache" not in h0, "first should miss to origin"
-    _, b1, h1 = fetch(ng.port, "/forever/f")
+    _, b1, h1 = fetch(ng.port, "/forever/forever-f")
     assert h1.get("x-cache") == "HIT", \
         f"valid 0 must serve a FRESH HIT, got X-Cache={h1.get('x-cache')}"
     assert b1 == b0, "HIT served a different body"
     time.sleep(2.0)
-    _, b2, h2 = fetch(ng.port, "/forever/f")
+    _, b2, h2 = fetch(ng.port, "/forever/forever-f")
     assert h2.get("x-cache") == "HIT", \
         f"valid 0 must still be fresh after a delay, got X-Cache={h2.get('x-cache')}"
-    assert origin.hits == base + 1, \
+    assert origin.hits_for("forever-f") == base + 1, \
         "a 'forever' entry must not re-hit the origin while fresh"
 
 
@@ -9283,6 +9318,30 @@ def test_min_uses_rejects_out_of_range(ng: Nginx) -> None:
             f"cache_turbo_min_uses {good} (a legal boundary) was rejected:\n{r.stdout}"
 
 
+def _recent_memo_skips(ng: Nginx, limit: int = 8) -> str:
+    """Tail the URIs most recently skipped by a negative memo, for diagnostics.
+
+    Reads the module's own `L2 GET skipped by negative memo "<uri>"` debug line
+    out of logs/error.log. Only produces anything when the harness ran with
+    TEST_CT_ERRLOG=debug (see _errlog_level) -- otherwise those lines are below
+    the log level and this returns a hint saying so.
+
+    Diagnostic only: never assert on this. It exists so that a failure of a
+    ZONE-GLOBAL counter assertion names the uri that actually bumped the
+    counter, rather than leaving the reader to bisect the suite.
+    """
+    log = ng.root / "logs" / "error.log"
+    try:
+        text = log.read_text(errors="replace")
+    except OSError as exc:
+        return f"<error.log unreadable: {exc}>"
+    hits = re.findall(r'L2 GET skipped by negative memo "([^"]*)"', text)
+    if not hits:
+        return ("<none logged -- re-run with TEST_CT_ERRLOG=debug>"
+                if _errlog_level() != "debug" else "<none logged at debug>")
+    return ", ".join(hits[-limit:])
+
+
 def _admin_l2_neg_skips(ng: Nginx) -> int:
     """L13: count of L2 GETs skipped by a live negative memo (admin stats)."""
     import json
@@ -9552,10 +9611,17 @@ def test_l2_negative_ttl_not_armed_by_outage(ng: Nginx, origin: Origin,
     s, _, _ = fetch(ng.port, uri)
     assert s == 200, f"post-recovery status {s}"
 
-    assert _admin_l2_neg_skips(ng) - skips0 == 0, (
+    delta = _admin_l2_neg_skips(ng) - skips0
+    assert delta == 0, (
         "an L2 outage armed the negative memo: the post-recovery request was "
         "memo-skipped instead of re-consulting L2, so a transient outage keeps L2 "
-        "switched off for up to l2_negative_ttl afterwards (Codex #5)")
+        "switched off for up to l2_negative_ttl afterwards (Codex #5)"
+        f"\n  l2_neg_skips delta={delta} (expected 0), this test's uri={uri}"
+        f"\n  skipped keys in the window: {_recent_memo_skips(ng, limit=8)}"
+        "\n  NOTE l2_neg_skips is ZONE-GLOBAL: a skip logged against a DIFFERENT"
+        " uri means another request bled into this window, not that this uri's"
+        " memo was armed by the outage. Re-run with TEST_CT_ERRLOG=debug to"
+        " populate the key list above.")
 
 
 def test_min_uses_counter_survives_uncacheable(ng: Nginx, origin: Origin,
