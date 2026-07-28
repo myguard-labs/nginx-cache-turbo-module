@@ -833,11 +833,40 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
         # Keeping the key below the store threshold holds every request on the
         # cold-miss path, which is the only path the memo is on.
         location /l2neg/ {{
-            cache_turbo                  main;
+            cache_turbo                  l2negz;
             cache_turbo_key              $uri;
             cache_turbo_valid            30s;
             cache_turbo_min_uses         4;
             cache_turbo_l2_negative_ttl  3;
+            cache_turbo_redis            127.0.0.1:{redis_port} prefix=ct: timeout=250ms;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # SUITE-1 / Codex MAJOR-1: the OUTAGE test gets its own location with a
+        # deliberately LONG memo, and it cannot share /l2neg/'s 3s one.
+        #
+        # The outage test asserts that a post-recovery request was NOT memo-
+        # skipped (delta == 0). That assertion only means anything while a memo
+        # would still be live if the bug were present: the memo is stamped on
+        # second-granularity ngx_time(), so `l2_negative_ttl 3` is 2-3s
+        # effective, while redis.start() is Popen + wait_port() + a FLUSHALL
+        # subprocess carrying a 10s timeout. If the restart outruns the memo,
+        # the post-recovery request does a REAL GET and delta == 0 passes even
+        # with the arm-on-failure bug restored -- the test goes green for the
+        # wrong reason. That is not hypothetical: it is why the negative control
+        # for this test passed in the first place.
+        #
+        # 60s is far longer than any plausible restart, so a delta of 0 is
+        # attributable to the fix rather than to the memo having expired. The
+        # sibling repeat-GET test still needs the SHORT window (it asserts
+        # expiry within one test), which is why this is a separate location and
+        # not a bump of /l2neg/.
+        location /l2negout/ {{
+            cache_turbo                  l2negoutz;
+            cache_turbo_key              $uri;
+            cache_turbo_valid            30s;
+            cache_turbo_min_uses         4;
+            cache_turbo_l2_negative_ttl  60;
             cache_turbo_redis            127.0.0.1:{redis_port} prefix=ct: timeout=250ms;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
@@ -1129,6 +1158,27 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             deny all;
         }}
 
+        # SUITE-1: stats endpoint for the /l2neg/ zone. l2_neg_skips is per-zone
+        # and the admin handler emits exactly ONE zone's stats, so a test that
+        # isolates /l2neg/ into `l2negz` must read the counter HERE -- reading
+        # /_cache (which is `cache_turbo_admin main`) would report a zone this
+        # location no longer writes, making `delta == 0` trivially true.
+        location = /_cache_l2neg {{
+            cache_turbo_admin    l2negz;
+            cache_turbo_redis    127.0.0.1:{redis_port} prefix=ct: timeout=250ms;
+            allow 127.0.0.1;
+            deny all;
+        }}
+
+        # SUITE-1: same pairing for the long-memo outage location. A zone
+        # without its own admin endpoint cannot be measured at all.
+        location = /_cache_l2negout {{
+            cache_turbo_admin    l2negoutz;
+            cache_turbo_redis    127.0.0.1:{redis_port} prefix=ct: timeout=250ms;
+            allow 127.0.0.1;
+            deny all;
+        }}
+
         # Literal Redis glob metacharacters in a prefix must stay literal during
         # SCAN-based all-purge; only the module-appended final '*' is a wildcard.
         location = /_cache_l2glob {{
@@ -1333,6 +1383,36 @@ http {{
     # unlike an 8m/16m zone where the contract test would pass for the wrong
     # reason (nothing ever gets evicted). Drives the no-reaper contract test.
     cache_turbo_zone name=ksevz 64k; # keep_stale no-reaper / LRU-only-reclaim (S2.3)
+    # SUITE-1: private zone for /l2neg/. l2_neg_skips is PER-ZONE
+    # (z->sh->l2_neg_skips, module.c:4832), and the outage test asserts a delta
+    # of exactly 0 over one request, so any other location writing that counter
+    # inside the window fails an assertion about a different URI.
+    #
+    # !! Scope of that risk, corrected: the increment at module.c:4832 is gated
+    # on `clcf->l2_negative_ttl > 0` (module.c:4822), and only FOUR locations
+    # in this config set it -- /l2neg/, /l2negout/, /l2neglife/, /l2negmu/,
+    # of which /l2neg/ and /l2negout/ now sit in private zones. The ~40 other
+    # locations sharing `main` are NOT counter writers and never could be. So
+    # the isolation below is defence against the two SIBLING memo tests, not
+    # against the whole zone, and it is hardening rather than a proven root
+    # cause: the runner is serial, so no reachable foreign writer has actually
+    # been demonstrated. The original intermittency is NOT fully explained and
+    # may recur -- do not treat this zone split as having closed it.
+    # NOTE Isolating the zone is only HALF the fix: /_cache is `cache_turbo_admin
+    # main`, so a helper reading it after this move would read a counter this
+    # location no longer writes and `delta == 0` would be trivially true forever.
+    # The paired admin endpoint /_cache_l2neg below is the other half; the two
+    # must be changed together or the test goes quiet instead of going correct.
+    #
+    # 1m, not 16m: these locations run min_uses 4 over a handful of unique keys
+    # and store essentially nothing, so the zone only ever holds counter nodes.
+    # Sizing them at 16m each cost 32m of shared memory for no coverage, which
+    # matters under ASan where the redzone overhead per allocation is large.
+    cache_turbo_zone name=l2negz 1m;
+    # SUITE-1: private zone for the long-memo outage location (/l2negout/), kept
+    # separate from l2negz so the 60s memo cannot bleed into the short-window
+    # repeat-GET test's counter, and vice versa.
+    cache_turbo_zone name=l2negoutz 1m;
 
     # Q1 end-to-end: stacked native proxy_cache, one zone per suppress mode, so
     # a test can prove cache_turbo_suppress_native actually keeps the native
@@ -9368,10 +9448,17 @@ def _recent_memo_skips(ng: Nginx, limit: int = 8) -> str:
     return ", ".join(hits[-limit:])
 
 
-def _admin_l2_neg_skips(ng: Nginx) -> int:
-    """L13: count of L2 GETs skipped by a live negative memo (admin stats)."""
+def _admin_l2_neg_skips(ng: Nginx, endpoint: str = "/_cache") -> int:
+    """L13: count of L2 GETs skipped by a live negative memo (admin stats).
+
+    ⚠ `l2_neg_skips` is PER-ZONE (z->sh->l2_neg_skips) and the admin handler
+    emits exactly ONE zone's stats, so `endpoint` must name the admin location
+    bound to the zone the location under test uses -- /_cache is
+    `cache_turbo_admin main`, /_cache_l2neg is `cache_turbo_admin l2negz`.
+    Reading the wrong one yields a counter the test never writes, which turns
+    an `== 0` assertion permanently true (SUITE-1)."""
     import json
-    _, b, _ = fetch(ng.port, "/_cache")
+    _, b, _ = fetch(ng.port, endpoint)
     return int(json.loads(b).get("l2_neg_skips", 0))
 
 
@@ -9404,7 +9491,11 @@ def test_l2_negative_ttl_skips_repeat_get(ng: Nginx, origin: Origin,
 
     # Request 2 is inside the 3s window: the memo must suppress the GET. A
     # write-through SET may still occur, so assert strictly fewer ops, not zero.
-    skips0 = _admin_l2_neg_skips(ng)
+    # /_cache_l2neg, not /_cache: /l2neg/ lives in the private `l2negz` zone and
+    # l2_neg_skips is per-zone, so /_cache (bound to `main`) would report a
+    # counter this location never touches -- making this `>= 1` permanently
+    # FALSE rather than trivially true (SUITE-1).
+    skips0 = _admin_l2_neg_skips(ng, "/_cache_l2neg")
     before = _redis_conns_received(redis)
     s2, _, _ = fetch(ng.port, uri)
     assert s2 == 200, f"req2 status {s2}"
@@ -9414,7 +9505,7 @@ def test_l2_negative_ttl_skips_repeat_get(ng: Nginx, origin: Origin,
     assert second < first, \
         (f"req2 opened {second} Redis connections vs req1's {first} -- the "
          "negative memo did not suppress the repeat L2 GET")
-    assert _admin_l2_neg_skips(ng) - skips0 >= 1, \
+    assert _admin_l2_neg_skips(ng, "/_cache_l2neg") - skips0 >= 1, \
         ("l2_neg_skips did not rise: the request avoided Redis for some other "
          "reason than the memo, so this test is not measuring the memo")
 
@@ -9617,9 +9708,10 @@ def test_l2_negative_ttl_not_armed_by_outage(ng: Nginx, origin: Origin,
 
     This is precisely the scenario 5/5 green CI could not see before: the suite
     never induced an L2 outage, so the defect passed every existing assertion."""
-    uri = f"/l2neg/outage-{time.time()}"
+    uri = f"/l2negout/outage-{time.time()}"
 
     redis.stop()
+    outage_start = time.monotonic()
     try:
         # Each request now fails to reach L2. Formerly every one of these armed a
         # memo asserting the key was absent.
@@ -9633,21 +9725,40 @@ def test_l2_negative_ttl_not_armed_by_outage(ng: Nginx, origin: Origin,
     # Redis is back. The next request MUST consult it -- that is how recovery is
     # noticed. Assert on the skip counter (did the memo suppress it?), not merely
     # on the status, which is 200 either way.
-    skips0 = _admin_l2_neg_skips(ng)
+    skips0 = _admin_l2_neg_skips(ng, "/_cache_l2negout")
     s, _, _ = fetch(ng.port, uri)
     assert s == 200, f"post-recovery status {s}"
+    elapsed = time.monotonic() - outage_start
 
-    delta = _admin_l2_neg_skips(ng) - skips0
+    # ⚠ Codex MAJOR-1: delta == 0 is only EVIDENCE while a memo armed by the
+    # outage would still be live. If the restart outran the memo, a build WITH
+    # the arm-on-failure bug also reports 0 -- the assertion below would pass
+    # for the wrong reason and this test would silently stop guarding anything.
+    # /l2negout/ uses a 60s memo precisely so this cannot happen; if it ever
+    # does, fail LOUDLY here rather than reporting a meaningless pass.
+    assert elapsed < 30, (
+        f"outage window + restart took {elapsed:.1f}s, which is close enough to "
+        "/l2negout/'s 60s l2_negative_ttl that a memo armed by the outage could "
+        "have expired on its own. The delta assertion below would then pass even "
+        "with the bug present, so this run proves nothing -- treat it as "
+        "INCONCLUSIVE and raise the memo, do not relax the check.")
+
+    delta = _admin_l2_neg_skips(ng, "/_cache_l2negout") - skips0
     assert delta == 0, (
         "an L2 outage armed the negative memo: the post-recovery request was "
         "memo-skipped instead of re-consulting L2, so a transient outage keeps L2 "
         "switched off for up to l2_negative_ttl afterwards (Codex #5)"
         f"\n  l2_neg_skips delta={delta} (expected 0), this test's uri={uri}"
-        f"\n  skipped keys in the window: {_recent_memo_skips(ng, limit=8)}"
-        "\n  NOTE l2_neg_skips is ZONE-GLOBAL: a skip logged against a DIFFERENT"
-        " uri means another request bled into this window, not that this uri's"
-        " memo was armed by the outage. Re-run with TEST_CT_ERRLOG=debug to"
-        " populate the key list above.")
+        f"\n  recently skipped keys: {_recent_memo_skips(ng, limit=8)}"
+        "\n  NOTE l2_neg_skips is per-zone and /l2negout/ has a PRIVATE zone"
+        " (l2negoutz), read here via /_cache_l2negout. /l2negout/ is the only"
+        " location that can WRITE that counter (the admin location is bound to"
+        " the same zone but only reads it), so a non-zero delta is this uri's"
+        " own memo and cannot be another location bleeding into the window."
+        "\n  ⚠ The key list above is tailed from the WHOLE error.log, not from"
+        " this assertion's window, so an unrelated uri in it may predate the"
+        " test entirely -- it is a hint, not evidence. Re-run with"
+        " TEST_CT_ERRLOG=debug to populate it.")
 
 
 def test_min_uses_counter_survives_uncacheable(ng: Nginx, origin: Origin,
@@ -11827,9 +11938,32 @@ def test_purge_all_escapes_redis_prefix_glob(ng: Nginx,
     s, b, _ = fetch(ng.port, "/_cache_l2glob?all=1", method="POST")
     assert s == 200 and "purged" in json.loads(b), \
         f"glob-prefix all-purge failed: {s} {b}"
-    assert redis.cli("-n", "0", "EXISTS", owned) == "0", \
-        "literal glob-prefix key was not purged"
-    assert redis.cli("-n", "0", "EXISTS", foreign) == "1", \
+
+    # !! The 200 does NOT mean the keys are gone yet. The SCAN loop hands each
+    # page to redis_del_many(), which opens its OWN connection and pipelines
+    # UNLINKs fire-and-forget (redis.c: launch(..., read_drain)); the SCAN loop
+    # never waits for those replies, and smembers_finish() emits this response
+    # as soon as the CURSOR completes. So an UNLINK can still be in flight here.
+    # Asserting EXISTS immediately is a race that only loses on a slow build --
+    # which is why it went red under ASan (instrumented nginx is ~10-20x slower)
+    # while passing every plain run. Poll for absence instead of sampling once.
+    assert wait_for(lambda: redis.cli("-n", "0", "EXISTS", owned) == "0",
+                    timeout=10.0), \
+        "literal glob-prefix key was not purged (waited 10s after the 200)"
+
+    # !! `owned` disappearing does NOT mean the purge has finished. del_many()
+    # runs ONCE PER SCAN PAGE (redis.c:2584), each opening its own connection,
+    # and there is no completion ordering between them. With the escaping defect
+    # restored, `ct*:*` can put `owned` and `foreign` on DIFFERENT pages -- so a
+    # single EXISTS sample here can observe foreign==1 simply because the page
+    # that would delete it has an UNLINK still in flight, and the cleanup DEL
+    # below then erases the evidence. That is a green run with the regression
+    # present, which is the exact failure mode this whole PR exists to remove.
+    #
+    # So assert the forbidden transition NEVER happens across a drain window
+    # wider than the 250ms redis op timeout, rather than sampling once.
+    assert not wait_for(lambda: redis.cli("-n", "0", "EXISTS", foreign) == "0",
+                        timeout=1.5), \
         "glob prefix widened SCAN and deleted an unrelated key"
     redis.cli("-n", "0", "DEL", foreign)
 
