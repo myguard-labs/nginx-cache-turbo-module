@@ -201,6 +201,19 @@ def _attribute_alert(conn_number: int) -> str:
 # (process reap, thread join) deliberately do NOT use this.
 HTTP_TIMEOUT = float(os.environ.get("TEST_CT_TIMEOUT", "5"))
 
+# Client read timeout for the CONCURRENCY-PRESSURE tests only (the 48-thread,
+# thousands-of-requests ones). Those spend their budget on runner scheduling,
+# not on the module: a single request crossing HTTP_TIMEOUT aborts the whole
+# suite with a bare TimeoutError, which is a harness property rather than a
+# defect. They need a ceiling well above scheduling noise.
+#
+# Deliberately SEPARATE from HTTP_TIMEOUT. Raising HTTP_TIMEOUT suite-wide would
+# also raise it for the ~800 ordinary status-only requests, whose 5s ceiling is
+# their only liveness guard -- a regression answering correctly but 10s late
+# would start passing. Keep the plain ceiling tight; widen only where the
+# contention is manufactured by the test itself.
+STRESS_TIMEOUT = float(os.environ.get("TEST_CT_STRESS_TIMEOUT", "30"))
+
 
 def wait_port(port: int, timeout: float = 15.0) -> None:
     deadline = time.time() + timeout
@@ -215,10 +228,17 @@ def wait_port(port: int, timeout: float = 15.0) -> None:
 
 
 def fetch(port: int, path: str, headers: dict | None = None,
-          method: str | None = None, data: bytes | None = None):
+          method: str | None = None, data: bytes | None = None,
+          timeout: float | None = None):
     """Return (status, body_str, response_headers_dict). `data` sends a request
     body (method must be given explicitly; urllib would otherwise silently flip
-    a GET into a POST the moment data is set)."""
+    a GET into a POST the moment data is set).
+
+    `timeout` overrides the default HTTP_TIMEOUT client read ceiling. Pass
+    STRESS_TIMEOUT from the concurrency-pressure tests, where a slow read is
+    runner scheduling rather than a defect. Do NOT widen it for ordinary
+    requests: for most tests here the default ceiling is the only thing
+    asserting the server answered promptly at all."""
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}{path}",
         headers={"Connection": "close", **(headers or {})},
@@ -232,7 +252,8 @@ def fetch(port: int, path: str, headers: dict | None = None,
         req.data = b""
     try:
         _bump_conn()
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
+        with urllib.request.urlopen(
+                req, timeout=HTTP_TIMEOUT if timeout is None else timeout) as r:
             body = r.read().decode("utf-8", "replace")
             return r.status, body, {k.lower(): v for k, v in r.headers.items()}
     except urllib.error.HTTPError as exc:
@@ -10388,7 +10409,12 @@ def test_perf7_zero_copy_serve_under_eviction(ng: Nginx) -> None:
         fetch(ng.port, f"/e/p7-{i}")
 
     def hit(_: int) -> int:
-        return fetch(ng.port, f"/e/p7-{random.randint(0, keys - 1)}")[0]
+        # STRESS_TIMEOUT, not the default: 4000 requests across 48 threads means
+        # a descheduled worker can exceed the plain ceiling on a loaded runner
+        # while the server is healthy. The assertion here is "no 5xx", not
+        # "answered within 5s".
+        return fetch(ng.port, f"/e/p7-{random.randint(0, keys - 1)}",
+                     timeout=STRESS_TIMEOUT)[0]
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=48) as pool:
         codes = list(pool.map(hit, range(reqs)))
@@ -10464,7 +10490,10 @@ def test_shm_refresh_under_pressure(ng: Nginx) -> None:
             uri = f"/shmref/hot-{random.randint(0, hot - 1)}"
         else:
             uri = f"/shmref/cold-{random.randint(0, cold - 1)}"
-        return fetch(ng.port, uri)[0]
+        # STRESS_TIMEOUT, not the default -- see test_perf7_zero_copy_serve_
+        # under_eviction. A slow read here is 48-thread scheduling contention,
+        # not the module; the assertions are liveness + refreshes > base.
+        return fetch(ng.port, uri, timeout=STRESS_TIMEOUT)[0]
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=48) as pool:
         codes = list(pool.map(hit, range(reqs)))
@@ -11955,8 +11984,13 @@ def test_lock_redis_outage_fallback(ng: Nginx, origin: Origin,
             f"NGX_ERROR lock path parked instead of failing fast " \
             f"(latencies: {sorted(round(d, 2) for _, d in results)})"
 
+        # 5s literal, NOT HTTP_TIMEOUT. This is a semantic deadline -- "the
+        # NGX_ERROR fallback regenerated at all" -- not a socket read ceiling,
+        # and the two only ever coincided numerically. Borrowing the client
+        # timeout meant any future widening of it would silently grant a broken
+        # fallback path more time to look correct.
         assert wait_for(
-            lambda: origin.hits_for(slug) > base, timeout=HTTP_TIMEOUT), \
+            lambda: origin.hits_for(slug) > base, timeout=5.0), \
             "lock NGX_ERROR fallback failed: 0 origin regens during a redis " \
             "outage -- the NGX_ERROR lock channel was treated like a peer " \
             "holding the lock (NGX_DECLINED), so the key is stuck stale forever"
