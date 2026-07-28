@@ -1212,6 +1212,22 @@ test_breaker_from_origin(void)
 }
 
 
+/* The bug O4.2-a and O4.2-b model: the use_stale trigger reused as the
+ * breaker's failure test (what this step's original spec called for). Written
+ * out explicitly and kept local so the controls can assert that the REAL
+ * predicate DISAGREES with it — a control that hardcodes its verdict never
+ * touches the production function and would survive any mutation of it.
+ *
+ * Mirrors USE_STALE_DEFAULT plus the three healthy statuses an operator can
+ * add: 403, 404, 429. */
+static ngx_uint_t
+buggy_use_stale_is_failure(ngx_uint_t status)
+{
+    return status == 403 || status == 404 || status == 429
+           || (status >= 500 && status <= 504);
+}
+
+
 /* ⚠ The admission rule, driven directly rather than restated. Each argument is
  * withheld in turn; every one of them must be able to veto on its own. */
 static void
@@ -1466,8 +1482,16 @@ run_negative_controls(void)
     {
         ngx_uint_t  i, buggy_is_failure;
 
-        /* The bug: 404 is in the use_stale set, so it reads as origin-down. */
-        buggy_is_failure = 1;
+        /* Drive the buggy predicate for real, and REQUIRE that the production
+         * one disagrees with it here. Without this the control hardcodes its
+         * own verdict, never calls _breaker_is_origin_failure(), and stays
+         * green through any mutation of it — vacuous in exactly the way the
+         * comment above O4.1-a warns about. */
+        buggy_is_failure = buggy_use_stale_is_failure(404);
+        REQUIRE(buggy_is_failure
+                && !ngx_http_cache_turbo_breaker_is_origin_failure(404),
+                "O4.2-a fixture: the real predicate already agrees with the "
+                "buggy one on 404 — the control models nothing");
 
         for (i = 0; i < 3; i++) {
             ngx_http_cache_turbo_shm_breaker_record(&g_zone, !buggy_is_failure,
@@ -1495,8 +1519,13 @@ run_negative_controls(void)
     {
         ngx_uint_t  i, buggy_is_failure;
 
-        /* The bug: only 500/502/503/504 count, so 507 reads as healthy. */
-        buggy_is_failure = 0;
+        /* Same anchoring as O4.2-a, mirrored: the buggy predicate misses 507
+         * (only ANY_5XX covers it), the real one must catch it. */
+        buggy_is_failure = buggy_use_stale_is_failure(507);
+        REQUIRE(!buggy_is_failure
+                && ngx_http_cache_turbo_breaker_is_origin_failure(507),
+                "O4.2-b fixture: the real predicate already agrees with the "
+                "buggy one on 507 — the control models nothing");
 
         for (i = 0; i < 3; i++) {
             ngx_http_cache_turbo_shm_breaker_record(&g_zone, !buggy_is_failure,
