@@ -9228,8 +9228,22 @@ def test_cold_single_flight(ng: Nginx, origin: Origin) -> None:
     uri = "/cold/sf"                               # never fetched before
     base = origin.hits
     waits0 = _admin_lock_waits(ng)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=40) as pool:
-        results = list(pool.map(lambda _: fetch(ng.port, uri), range(40)))
+
+    # Rendezvous before the burst for the same reason as
+    # test_l2_unserveable_giveup_still_single_flights: a reader that arrives
+    # after the winner's fill lands takes the CLAIM_FRESH path and serves from
+    # L1 without entering cold_wait(), so it never increments lock_waits. Left
+    # unsynchronised, a staggered thread start can drive the delta to 0 while
+    # the collapse itself was correct.
+    readers = 40
+    barrier = threading.Barrier(readers)
+
+    def _burst_reader(_i: int) -> tuple[int, bytes, dict]:
+        barrier.wait()
+        return fetch(ng.port, uri)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=readers) as pool:
+        results = list(pool.map(_burst_reader, range(readers)))
     assert {r[0] for r in results} == {200}, \
         f"cold burst returned {set(r[0] for r in results)}"
     # All readers must agree on one body (the single regenerated copy).
@@ -11437,8 +11451,26 @@ def test_l2_unserveable_giveup_still_single_flights(
 
     base = origin.hits
     waits0 = _admin_lock_waits(ng)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=40) as pool:
-        results = list(pool.map(lambda _: fetch(ng.port, uri), range(40)))
+
+    # All 40 readers rendezvous at the barrier before hitting the key, so they
+    # reach the cold-miss claim inside the same window. Without this the burst
+    # can legitimately produce ZERO waiters: a regen here stays fresh for 30s,
+    # so once the winner's fill lands in L1 every later reader takes the
+    # CLAIM_FRESH path (module.c) and serves from L1 *without entering
+    # cold_wait()* -- the only site that increments lock_waits. On a loaded
+    # runner, thread start-up is staggered enough for the winner to finish
+    # before any other thread reaches the claim, leaving regens == 1 (a correct
+    # collapse) but the lock_waits delta at 0 -- failing the liveness assert
+    # below for a race in the test rather than a defect in the module.
+    readers = 40
+    barrier = threading.Barrier(readers)
+
+    def _burst_reader(_i: int) -> tuple[int, bytes, dict]:
+        barrier.wait()
+        return fetch(ng.port, uri)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=readers) as pool:
+        results = list(pool.map(_burst_reader, range(readers)))
 
     assert {r[0] for r in results} == {200}, \
         f"expired-L2 burst returned {set(r[0] for r in results)}"
