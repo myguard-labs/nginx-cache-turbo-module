@@ -4982,26 +4982,25 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
              * to the origin with a CLOSED breaker and never call _serve(). The
              * ref must therefore be dropped when nobody consumes it, which is
              * what the explicit cleanup below is for -- see brk_ref. */
-            ngx_http_cache_turbo_blob_acquire(ctn->data);
-            ctx->brk_snap = ctn->data;
-            ctx->brk_snap_len = ctn->len;
-            ctx->brk_ref = ctn->data;
-            ctx->brk_armed = 1;
-
+            /* Register the drop BEFORE acquiring. ngx_pool_cleanup_add() is
+             * the only thing here that can fail, and it touches r->pool only
+             * -- no slab, no zone mutex -- so failing first costs nothing to
+             * undo. Acquiring first would force the failure arm to call
+             * blob_release(), which takes the zone mutex itself (shm.c) and so
+             * requires unlocking here; ngx_shmtx is not recursive. That unlock
+             * would invalidate `ctn` -- it was resolved at the lookup and is
+             * only valid while the mutex is held -- letting a concurrent
+             * evict/refresh/purge detach the blob and our own release then free
+             * it, leaving the SIE block below dereferencing freed slab. */
             if (ngx_http_cache_turbo_brk_ref_cleanup(r, z, ctn->data)
-                != NGX_OK)
+                == NGX_OK)
             {
-                /* Could not register the drop: release now and arm nothing
-                 * rather than leak a pinned slab for the zone's lifetime. */
-                ctx->brk_armed = 0;
-                ctx->brk_snap = NULL;
-                ctx->brk_snap_len = 0;
-                ctx->brk_ref = NULL;
-                ngx_shmtx_unlock(&z->shpool->mutex);
-                ngx_http_cache_turbo_blob_release(z, ctn->data);
-                ngx_shmtx_lock(&z->shpool->mutex);
+                ngx_http_cache_turbo_blob_acquire(ctn->data);
+                ctx->brk_snap = ctn->data;
+                ctx->brk_snap_len = ctn->len;
+                ctx->brk_ref = ctn->data;
+                ctx->brk_armed = 1;
 
-            } else {
                 ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                                "cache_turbo: breaker fallback armed from L1 "
                                "\"%V\" key=%ui", &r->uri, (ngx_uint_t) hash);
@@ -5111,12 +5110,7 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                 /* P6/O4.3: arm the breaker fallback from the L2 blob too. This
                  * is the L1-absent / L1-evicted case -- a peer's copy that is
                  * past its serveable window. Same any-age rule and same
-                 * threshold off-switch as the L1 site above.
-                 *
-                 * A copy is taken rather than pointing at ctx->l2_blob because
-                 * the two have different lifetimes on the resume paths; the
-                 * blob buffer is owned by the L2 read handler, and the breaker
-                 * gate runs after further parks are possible. */
+                 * threshold off-switch as the L1 site above. */
                 if (!ctx->brk_armed && clcf->breaker_threshold > 0) {
                     /* No copy: ctx->l2_blob already lives in r->pool with the
                      * same lifetime as this request, so pointing at it is both
