@@ -304,7 +304,44 @@ FNS=$(grep -cE '^ngx_http_cache_turbo_[a-z_]+\(' "$OUT")
 #
 # Checked against module.c rather than the slice: the gate lives in the access
 # handler, which is not extracted. Comments stripped first, as everywhere here.
-if ! sed -n '/^    if (ngx_http_cache_turbo_breaker_should_consult(clcf))$/,/^    }$/p' "$MODSRC" \
+#
+# ⚠ The block is delimited by BRACE DEPTH, not by a `^    }$` line. The previous
+# form anchored on exact 4-space indentation and an exactly-indented closing
+# brace, so a pure reformat -- moving the opening brace up onto the `if` line,
+# no semantic change at all, latch fully intact -- made this fire a false build
+# failure (#135). Depth counting cares about the code, not its layout, which is
+# the whole point of a canary: it must fail when the LATCH goes, and only then.
+#
+# The gate is located by the should_consult(clcf) call rather than by a function
+# definition (every sibling check here anchors on a definition) because it lives
+# mid-function in the access handler, which has no extractable boundary of its
+# own. If a second bare `should_consult(clcf)` gate block is ever added, this
+# picks the FIRST and the invariant would need re-scoping -- hence the count
+# guard below, which fails loudly instead of silently checking the wrong block.
+GATES=$(grep -cE '^[[:space:]]*if \(ngx_http_cache_turbo_breaker_should_consult\(clcf\)\)[[:space:]]*\{?$' "$MODSRC")
+if [ "$GATES" -ne 1 ]; then
+    echo "✗ O4.3 canary cannot scope itself: expected exactly 1 bare" >&2
+    echo "  'if (breaker_should_consult(clcf))' gate in $MODSRC, found $GATES." >&2
+    echo "  Re-scope this check (it verifies the FIRST such block only)." >&2
+    rm -f "$OUT"
+    exit 1
+fi
+
+if ! awk '
+    # Enter the gate block at the bare should_consult(clcf) if-statement.
+    !inblk && $0 ~ /^[[:space:]]*if \(ngx_http_cache_turbo_breaker_should_consult\(clcf\)\)[[:space:]]*\{?$/ {
+        inblk = 1
+        depth = 0
+        seen_open = 0
+    }
+    inblk {
+        print
+        # Count braces to find the real end of the block, whatever the layout.
+        n = gsub(/\{/, "{"); depth += n; if (n) seen_open = 1
+        depth -= gsub(/\}/, "}")
+        if (seen_open && depth <= 0) { exit }
+    }
+' "$MODSRC" \
    | sed -E 's;/\*.*;;; s;^[[:space:]]*\*.*;;' \
    | grep -q 'brk_consulted'; then
     echo "✗ O4.3 regression: the pre-origin breaker gate lost its" >&2
