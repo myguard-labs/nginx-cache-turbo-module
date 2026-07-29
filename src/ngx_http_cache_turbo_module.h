@@ -491,6 +491,77 @@ typedef struct {
 #define NGX_HTTP_CACHE_TURBO_BREAKER_OPEN       1  /* origin dead: do not call */
 #define NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN  2  /* one probe in flight      */
 
+/*
+ * P6/O4.3-c -- breaker_state is a PACKED word: [ generation | state ].
+ *
+ * The state alone is not enough to identify a LEASE. Publishing HALF_OPEN and
+ * stamping the lease were two separate stores, and resolving it was a CAS on
+ * the state enum only, which left two ABA holes (Codex review, PR #135):
+ *
+ *   - a worker could observe HALF_OPEN paired with the PREVIOUS lease's stamp
+ *     -- necessarily old, zero on the first lease -- read it as abandoned, and
+ *     reclaim a lease that was merely mid-publication; and
+ *   - a probe descheduled after validating its token could have its
+ *     HALF_OPEN -> CLOSED CAS land against a REPLACEMENT lease's generation,
+ *     closing a breaker only the stale probe ever tested.
+ *
+ * Folding a generation counter into the same atomic word closes both: every
+ * promotion bumps it, and every reclaim and resolution CASes the whole word, so
+ * a transition belonging to a superseded lease cannot succeed. The generation
+ * IS the lease token handed to the promoted request -- breaker_probe_at stays
+ * only as the lease DEADLINE, never as identity.
+ *
+ * ⚠ CLOSED == 0 and generation 0 make a zeroed word read CLOSED, preserving the
+ * fail-safe direction documented above. The generation is deliberately allowed
+ * to wrap: at one promotion per open window it cannot realistically reach 2^62,
+ * and a wrap is harmless anyway -- it would have to coincide exactly with an
+ * outcome in flight from 2^62 leases ago.
+ *
+ * Pinned by ci/tests/unit/extract_shm.sh and the ABA tests in test_shm_state.c.
+ */
+#define NGX_HTTP_CACHE_TURBO_BREAKER_STATE_BITS  2
+#define NGX_HTTP_CACHE_TURBO_BREAKER_STATE_MASK \
+    ((ngx_uint_t) ((1U << NGX_HTTP_CACHE_TURBO_BREAKER_STATE_BITS) - 1))
+
+#define ngx_http_cache_turbo_brk_state(w) \
+    ((ngx_uint_t) (w) & NGX_HTTP_CACHE_TURBO_BREAKER_STATE_MASK)
+#define ngx_http_cache_turbo_brk_gen(w) \
+    ((ngx_uint_t) (w) >> NGX_HTTP_CACHE_TURBO_BREAKER_STATE_BITS)
+#define ngx_http_cache_turbo_brk_pack(gen, st)                                \
+    (((ngx_uint_t) (gen) << NGX_HTTP_CACHE_TURBO_BREAKER_STATE_BITS)          \
+     | ((ngx_uint_t) (st) & NGX_HTTP_CACHE_TURBO_BREAKER_STATE_MASK))
+
+/* P6/O4.3 serve-path actions, the verdict of
+ * ngx_http_cache_turbo_breaker_action(). PASS is the only one that lets the
+ * request reach the origin.
+ *
+ * ⚠ PASS == 0 is load-bearing, exactly like BREAKER_CLOSED == 0 above: the safe
+ * direction for a zeroed or accidentally-defaulted value is "the breaker does
+ * not interfere". A silent flip would make the fall-through case start serving
+ * stale bodies or 503s. */
+/* P6/O4.3: "no probe lease held". 0 is safe as the sentinel because it is also
+ * breaker_probe_at's zeroed-zone value, so a token that was never stamped can
+ * never match a live lease. */
+#define NGX_HTTP_CACHE_TURBO_BREAKER_NO_PROBE  0
+
+#define NGX_HTTP_CACHE_TURBO_BRK_ACT_PASS   0  /* fall through, ordinary request */
+#define NGX_HTTP_CACHE_TURBO_BRK_ACT_SERVE  1  /* serve the fallback body        */
+#define NGX_HTTP_CACHE_TURBO_BRK_ACT_FAIL   2  /* 503 + Retry-After, no origin   */
+/*
+ * P6/O4.3-c: the promoted probe. DISTINCT from PASS because the probe must go
+ * to the origin DIRECTLY -- PASS merely falls through, and everything after the
+ * breaker gate (min_uses, claim(), the cross-node NX lock, cold_wait()) can
+ * park the request and resume it. On resume the L1 fresh/stale and L2-HIT
+ * returns sit BEFORE the gate, and brk_consulted keeps the gate from running a
+ * second time, so the lease holder could be answered from a peer's fill without
+ * ever contacting the origin -- burning the lease, recording no outcome
+ * (_serve() sets ctx->served, and the header filter skips _breaker_record()),
+ * and leaving the breaker HALF_OPEN until the lease expires.
+ *
+ * Collapsing this back into PASS reintroduces exactly that (Codex F2, PR #135).
+ */
+#define NGX_HTTP_CACHE_TURBO_BRK_ACT_PROBE  3  /* the probe: origin, directly    */
+
 /* protected_pct bounds for cache_turbo_scan_resistant (range-checked setter,
  * NOT ngx_conf_set_num_slot -- a literal 0 must be a config error, not a
  * silently-coerced default. See H5/min_uses for the trap this avoids). */
@@ -1024,6 +1095,29 @@ typedef struct {
     ngx_uint_t               breaker_threshold; /* failures to trip; 0 = off  */
     time_t                   breaker_window;    /* rolling window s; 0 = off  */
 
+    /* P6/O4.3 serve-path tuning. Read by the pre-origin breaker gate in
+     * ngx_http_cache_turbo_access_handler(); the directives that set them are
+     * O4.4, so both still merge to their inert defaults here.
+     *
+     * breaker_open is the `open_for` argument of
+     * ngx_http_cache_turbo_shm_breaker_state() -- how long an OPEN lasts before
+     * ONE request is promoted to probe the origin. time_t (seconds), NOT msec:
+     * that is the type the shm API takes.
+     *
+     * ⚠ 0 does NOT mean "no open window", it means NO TIMED REOPEN: the state
+     * machine's guard is `open_for > 0`, so with 0 an OPEN breaker never
+     * promotes a probe and stays open until a recorded success -- and while
+     * OPEN nobody talks to the origin, so no success can ever be recorded. The
+     * breaker would wedge permanently. It is inert today only because
+     * threshold == 0 means it can never trip in the first place; O4.4 MUST
+     * default this to a non-zero value (and reject 0) once the breaker can be
+     * switched on. Tracked as O4.3-a in memory issues.md. */
+    time_t                   breaker_open;      /* OPEN duration s before probe */
+
+    /* Retry-After seconds sent with the breaker's 503. Advisory to the client;
+     * has no effect on the breaker's own timing. */
+    time_t                   breaker_retry_after;
+
     /* L2 Redis (v2b). Native async client, no hiredis. The L2 store is touched
      * only on an L1 miss (sync GET) and on store (async write-through); it is
      * never on the L1-hit hot path. */
@@ -1339,6 +1433,96 @@ typedef struct {
     size_t                   sie_snap_len;
     u_char                  *sie_body;        /* body slice inside sie_snap        */
     size_t                   sie_body_len;
+
+    /* P6/O4.3 circuit-breaker fallback snapshot. Taken at the SAME two
+     * fall-through sites that arm SIE (L1 past its stale window, L2 blob past
+     * rem_stale), but under a DIFFERENT and much wider rule: SIE is armed only
+     * inside `created + sie_ttl`, whereas the breaker serves a body of ANY age
+     * once the origin is known to be down. Serving a week-old page beats
+     * serving 503, and the operator opted in by enabling the breaker.
+     *
+     * ⚠ Deliberately a SEPARATE snapshot rather than widening sie_armed. The
+     * SIE window is a response-driven RFC 5861 contract consumed by the header
+     * filter on an origin ERROR; this one is an operator-driven policy consumed
+     * by the access handler BEFORE any origin contact. Folding them would let a
+     * breaker config silently widen stale-if-error for responses that never
+     * asked for it.
+     *
+     * Both point into r->pool (a copy taken under the zone mutex), so no shm
+     * reference is held and ngx_http_cache_turbo_serve() is called with
+     * ref_data = NULL. Only taken when the breaker is actually enabled --
+     * threshold == 0 skips the memcpy entirely, so "breaker off" stays free. */
+    unsigned                 brk_armed:1;     /* a breaker fallback is stashed  */
+
+    /* P6/O4.3-c: arming was ATTEMPTED, independent of whether the fallback is
+     * still held. brk_armed cannot serve as the once-per-request guard on its
+     * own any more: the gate clears it when it drops a pin nothing can consume,
+     * and a PASS request does not stop there -- it falls through to claim() and
+     * cold_wait(), whose every re-poll re-enters this handler from the top.
+     * Guarding on brk_armed alone would then re-register a pool cleanup and
+     * re-acquire the blob on each poll, for the whole lock_timeout. This latch
+     * is set once and never cleared, which is what sie_armed relies on too. */
+    unsigned                 brk_arm_done:1;  /* arming already attempted       */
+    u_char                  *brk_snap;        /* blob bytes, any age            */
+    size_t                   brk_snap_len;
+    /* PERF: when non-NULL, brk_snap points into the shm slab and this holds the
+     * pinned blob for ngx_http_cache_turbo_serve()'s ref_data (the pool cleanup
+     * drops the reference once the response drains). NULL means brk_snap is an
+     * r->pool buffer owned by somebody else -- the L2 path -- and no reference
+     * is held. Mirrors the fresh/stale serve paths rather than copying: the L1
+     * arming used to memcpy the whole blob under the ZONE MUTEX on every
+     * enabled request that found an expired entry, which serialises concurrent
+     * workers on a 1 MiB-default (configurable) copy exactly during the outage
+     * this feature exists to smooth over. */
+    u_char                  *brk_ref;         /* pinned shm blob, or NULL       */
+
+    /* P6/O4.3-c: the cleanup record that owns brk_ref's reference, so the
+     * breaker gate can DROP that reference as soon as its verdict rules out a
+     * fallback serve, instead of holding it until the request pool is
+     * destroyed. Most armed requests fall through to the origin, and on a slow
+     * upstream those pins accumulate: an evictor can then unlink an entry's LRU
+     * metadata and still not reclaim its blob, so the zone drains without
+     * freeing space (Codex F3, PR #135). NULL once dropped or never armed.
+     *
+     * void * because ngx_http_cache_turbo_blob_cln_t is private to module.c,
+     * which is the only file that dereferences this. */
+    void                    *brk_cln;
+
+    /* P6/O4.3: the pre-origin gate's verdict, latched on first consult.
+     *
+     * ⚠ THE GATE MUST BE CONSULTED AT MOST ONCE PER REQUEST, and these two
+     * fields are what enforces it. The access handler is re-entered from the
+     * TOP on every park/resume (the L2 GET park, the v4-2 Redis NX lock park,
+     * and each cold_wait() re-poll), so an unguarded gate calls
+     * _breaker_state() several times for one request.
+     *
+     * That is not merely wasteful, it is the wedge the whole design exists to
+     * avoid. _breaker_state() is not a pure getter: it PROMOTES exactly one
+     * caller per open window to HALF_OPEN, and it returns HALF_OPEN only to
+     * that promoter -- every later call, including a later call by the SAME
+     * request, is told OPEN (shm.c:1188). So a request promoted to probe that
+     * then parks would, on its resume, be handed OPEN, get answered from cache
+     * or 503'd, and never reach the origin. Nothing would record an outcome,
+     * and the breaker would stay open until the lease expired -- burning one
+     * probe per window forever, which is exactly the failure the HALF_OPEN
+     * pass-through is designed to prevent.
+     *
+     * Latching also keeps the verdict COHERENT across a resume: a request must
+     * not be told PASS before parking and SERVE afterwards because a different
+     * worker tripped the breaker meanwhile. It committed to going to the
+     * origin; it goes.
+     *
+     * Same idempotence discipline as l2_miss_counted, min_uses_passed and
+     * sie_armed, all of which guard the identical re-entry hazard. */
+    unsigned                 brk_consulted:1; /* gate already ran this request  */
+    ngx_uint_t               brk_action;      /* latched BRK_ACT_* verdict      */
+    ngx_uint_t               brk_state;       /* latched BREAKER_* state        */
+
+    /* P6/O4.3: the probe lease token, non-zero ONLY on the request that won the
+     * OPEN -> HALF_OPEN promotion. Handed to _breaker_record() in the header
+     * filter so that exactly that request's origin outcome resolves the lease;
+     * every other request passes NO_PROBE and cannot. */
+    ngx_uint_t               brk_probe;       /* lease token, 0 = not the probe */
     /* Per-request serve outcome for $cache_turbo_status / access logging. One of
      * NGX_HTTP_CACHE_TURBO_ST_*; defaults to ST_MISS (0) via pcalloc and is
      * overridden to HIT/STALE at the X-Cache emit site, BYPASS on the
@@ -1489,11 +1673,27 @@ ngx_int_t ngx_http_cache_turbo_shm_l2_neg_check(ngx_http_cache_turbo_zone_t *z,
 void ngx_http_cache_turbo_shm_l2_neg_set(ngx_http_cache_turbo_zone_t *z,
     u_char *key_hash, uint32_t hash, time_t ttl);
 
-/* P6/O4.1 circuit breaker (per-zone, lock-free -- see the shctx field block). */
+/* P6/O4.1 circuit breaker (per-zone, lock-free -- see the shctx field block).
+ *
+ * O4.3 added the probe TOKEN to both calls. `*probe` is an out-parameter on
+ * _breaker_state() and an in-parameter on _breaker_record(); NGX_HTTP_CACHE_
+ * TURBO_BREAKER_NO_PROBE means "this caller does not own a probe lease".
+ *
+ * ⚠ Only the request that WON the OPEN -> HALF_OPEN promotion receives a
+ * non-zero token, and only that token may resolve HALF_OPEN. Without it any
+ * unrelated origin response completing during the open window could close (or
+ * re-open) a lease it knows nothing about: a request that started before the
+ * trip reports "origin fine" and releases the herd toward a still-dead origin,
+ * and a promoted probe that ends up served from a peer's L2 fill leaves the
+ * breaker with no outcome at all. Pass NO_PROBE from every non-probe site.
+ *
+ * The token is the promotion's breaker_probe_at stamp, which is already unique
+ * per lease -- no new shm field, and a stale token from a previous lease simply
+ * fails the comparison. */
 ngx_uint_t ngx_http_cache_turbo_shm_breaker_state(
-    ngx_http_cache_turbo_zone_t *z, time_t open_for);
+    ngx_http_cache_turbo_zone_t *z, time_t open_for, ngx_uint_t *probe);
 void ngx_http_cache_turbo_shm_breaker_record(ngx_http_cache_turbo_zone_t *z,
-    ngx_uint_t success, ngx_uint_t threshold, time_t window);
+    ngx_uint_t success, ngx_uint_t threshold, time_t window, ngx_uint_t probe);
 const char *ngx_http_cache_turbo_shm_breaker_state_str(ngx_uint_t state);
 
 

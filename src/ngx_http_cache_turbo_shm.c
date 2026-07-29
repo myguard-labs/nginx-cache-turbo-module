@@ -1130,16 +1130,28 @@ ngx_http_cache_turbo_shm_l2_neg_set(ngx_http_cache_turbo_zone_t *z,
  */
 ngx_uint_t
 ngx_http_cache_turbo_shm_breaker_state(ngx_http_cache_turbo_zone_t *z,
-    time_t open_for)
+    time_t open_for, ngx_uint_t *probe)
 {
     time_t      now;
-    ngx_uint_t  state;
+    ngx_uint_t  word, state;
+
+    /* O4.3: default to "no lease". Only the promotion CAS below overwrites
+     * this, so every caller that is merely OBSERVING the breaker -- including
+     * one that sees a HALF_OPEN installed by somebody else -- goes away without
+     * a token and therefore cannot resolve the lease in _breaker_record(). */
+    *probe = NGX_HTTP_CACHE_TURBO_BREAKER_NO_PROBE;
 
     /* Plain volatile read, NOT fetch_add(...,0): a lock-prefixed RMW would
      * acquire the cache line exclusively on every call, and this is the
      * pre-origin-connect read path -- the hottest site in the zone. Sampling is
-     * all that is needed here; the transitions below carry their own CAS. */
-    state = (ngx_uint_t) z->sh->breaker_state;
+     * all that is needed here; the transitions below carry their own CAS.
+     *
+     * O4.3-c: one read of the PACKED word. Both the state and the generation
+     * come from the same load, so every CAS below is tested against the exact
+     * word this caller decided on -- that is what makes the transitions
+     * generation-safe rather than merely state-safe. */
+    word  = (ngx_uint_t) z->sh->breaker_state;
+    state = ngx_http_cache_turbo_brk_state(word);
 
     now = ngx_time();
 
@@ -1159,11 +1171,28 @@ ngx_http_cache_turbo_shm_breaker_state(ngx_http_cache_turbo_zone_t *z,
      * probe slot with a CAS -- again a single winner. */
     if (state == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN) {
 
+        /* ⚠ O4.3-c: a lease whose stamp is not yet PUBLISHED is not stale, it
+         * is brand new. The promoting worker publishes HALF_OPEN and stamps
+         * breaker_probe_at as two stores, so a reader can land between them and
+         * see this HALF_OPEN paired with the previous lease's stamp -- which is
+         * necessarily older, and exactly 0 on the very first lease of a zeroed
+         * zone. Treating that as an abandoned lease reclaims a probe that is
+         * merely mid-publication and admits a SECOND concurrent probe, which is
+         * the herd this breaker exists to prevent.
+         *
+         * A zero stamp therefore means "published moments ago, deadline not
+         * written yet" and must never satisfy the staleness test. Every real
+         * lease carries a non-zero ngx_time(), so this costs nothing outside
+         * the window it closes. Pinned by
+         * test_breaker_unpublished_lease_is_not_reclaimable(). */
         if (open_for > 0
+            && z->sh->breaker_probe_at != 0
             && now >= (time_t) z->sh->breaker_probe_at + open_for
-            && ngx_atomic_cmp_set(&z->sh->breaker_state,
-                                  NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN,
-                                  NGX_HTTP_CACHE_TURBO_BREAKER_OPEN))
+            && ngx_atomic_cmp_set(&z->sh->breaker_state, (ngx_atomic_uint_t) word,
+                                  (ngx_atomic_uint_t)
+                                      ngx_http_cache_turbo_brk_pack(
+                                          ngx_http_cache_turbo_brk_gen(word),
+                                          NGX_HTTP_CACHE_TURBO_BREAKER_OPEN)))
         {
             /* Reclaimed an abandoned lease by demoting it to OPEN. Exactly one
              * caller can win THIS cas (the next one finds OPEN, not
@@ -1183,6 +1212,13 @@ ngx_http_cache_turbo_shm_breaker_state(ngx_http_cache_turbo_zone_t *z,
              * failed-probe path warns about. Move the write above the CAS if
              * you ever change the value. */
             z->sh->breaker_opened_at = (ngx_atomic_t) (now - open_for);
+
+            /* O4.3-c: we own the demotion, so we know the word we installed --
+             * same generation, state now OPEN. Fall through to the promotion
+             * below and CAS against THAT, not against the pre-reclaim word. */
+            word  = ngx_http_cache_turbo_brk_pack(
+                        ngx_http_cache_turbo_brk_gen(word),
+                        NGX_HTTP_CACHE_TURBO_BREAKER_OPEN);
             state = NGX_HTTP_CACHE_TURBO_BREAKER_OPEN;
 
         } else {
@@ -1202,12 +1238,47 @@ ngx_http_cache_turbo_shm_breaker_state(ngx_http_cache_turbo_zone_t *z,
      * origin. A loser of this CAS keeps its OPEN verdict -- it must NOT fall
      * through to the origin, or the herd this breaker exists to stop walks
      * straight past it. */
-    if (ngx_atomic_cmp_set(&z->sh->breaker_state,
-                           NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
-                           NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN))
     {
-        z->sh->breaker_probe_at = (ngx_atomic_t) now;
-        return NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN;
+        ngx_uint_t  gen, next;
+
+        /* O4.3-c: the promotion opens a NEW lease generation, and the CAS
+         * covers state and generation together. A loser sees the winner's whole
+         * word and retries nothing -- it simply keeps its OPEN verdict.
+         *
+         * ⚠ The generation starts at 1, never 0: 0 is the NO_PROBE sentinel, so
+         * a zeroed zone's first promotion must not hand out a token that reads
+         * as "no lease held". Wrapping past 2^62 lands back on 0 for the same
+         * reason, hence the explicit skip rather than a bare increment. */
+        gen = ngx_http_cache_turbo_brk_gen(word) + 1;
+        if (gen == NGX_HTTP_CACHE_TURBO_BREAKER_NO_PROBE) {
+            gen = 1;
+        }
+
+        next = ngx_http_cache_turbo_brk_pack(
+                   gen, NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN);
+
+        if (ngx_atomic_cmp_set(&z->sh->breaker_state, (ngx_atomic_uint_t) word,
+                               (ngx_atomic_uint_t) next))
+        {
+            /* ⚠ The stamp is published AFTER the CAS, so a concurrent reader
+             * can briefly see this HALF_OPEN while breaker_probe_at still holds
+             * the PREVIOUS lease's value, which may already look expired. That
+             * no longer admits a second probe: the reclaim path CASes the whole
+             * word, so a reader acting on the stale deadline is testing against
+             * generation N-1 and loses to the generation N we just installed.
+             * The generation is what makes the two-store publication safe --
+             * the zero-stamp guard above covers only the first lease of a
+             * zeroed zone, where there is no previous generation to lose to. */
+            z->sh->breaker_probe_at = (ngx_atomic_t) now;
+
+            /* The GENERATION is the lease token, not the stamp. Two leases
+             * promoted in the same wall-clock second are stamp-equal, which is
+             * precisely the collision that let a superseded probe resolve a
+             * replacement lease. Generations are unique by construction. */
+            *probe = gen;
+
+            return NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN;
+        }
     }
 
     return NGX_HTTP_CACHE_TURBO_BREAKER_OPEN;
@@ -1227,14 +1298,17 @@ ngx_http_cache_turbo_shm_breaker_state(ngx_http_cache_turbo_zone_t *z,
  */
 void
 ngx_http_cache_turbo_shm_breaker_record(ngx_http_cache_turbo_zone_t *z,
-    ngx_uint_t success, ngx_uint_t threshold, time_t window)
+    ngx_uint_t success, ngx_uint_t threshold, time_t window, ngx_uint_t probe)
 {
     time_t            now;
     ngx_atomic_uint_t fails;
-    ngx_uint_t        state;
+    ngx_uint_t        word, state;
 
     now   = ngx_time();
-    state = (ngx_uint_t) z->sh->breaker_state;   /* plain read, see above */
+    /* O4.3-c: one read of the packed word; state and generation are decided
+     * together, and every CAS below is tested against this exact value. */
+    word  = (ngx_uint_t) z->sh->breaker_state;   /* plain read, see above */
+    state = ngx_http_cache_turbo_brk_state(word);
 
     if (success) {
         /* A success clears the failure run. */
@@ -1257,10 +1331,32 @@ ngx_http_cache_turbo_shm_breaker_record(ngx_http_cache_turbo_zone_t *z,
          * closed against a dead origin indefinitely. O4.3 owns the probe
          * token if the residual turns out to matter in practice; it needs a
          * request-scoped handle this API does not have. */
-        if (state == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN) {
+        /* ⚠ O4.3: ONLY the request holding this lease's token may close it.
+         * Without the token check any success completing during HALF_OPEN
+         * closes the breaker -- including a request that began BEFORE the trip
+         * and whose "origin fine" verdict is stale by definition, and a
+         * concurrent request that was served from a peer's L2 fill and never
+         * touched the origin at all. Both release the herd toward an origin
+         * nothing actually probed. The token is the promotion's own stamp, so a
+         * leftover token from a previous lease fails this comparison too, which
+         * closes the ABA case the O4.1 comment flagged as residual. */
+        /* ⚠ O4.3-c: the token is the lease GENERATION, and the CAS carries it.
+         * Comparing against breaker_probe_at was not enough -- the stamp is a
+         * wall-clock second, so a superseded probe and its replacement are
+         * stamp-EQUAL whenever both promotions land in the same second, and the
+         * old probe's state-only CAS then closed a lease it did not own. Testing
+         * the whole word means a resolution can only land on the exact
+         * generation it was issued for. */
+        if (state == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN
+            && probe != NGX_HTTP_CACHE_TURBO_BREAKER_NO_PROBE
+            && probe == ngx_http_cache_turbo_brk_gen(word))
+        {
             (void) ngx_atomic_cmp_set(&z->sh->breaker_state,
-                                      NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN,
-                                      NGX_HTTP_CACHE_TURBO_BREAKER_CLOSED);
+                                      (ngx_atomic_uint_t) word,
+                                      (ngx_atomic_uint_t)
+                                          ngx_http_cache_turbo_brk_pack(
+                                              probe,
+                                              NGX_HTTP_CACHE_TURBO_BREAKER_CLOSED));
         }
 
         return;
@@ -1268,7 +1364,10 @@ ngx_http_cache_turbo_shm_breaker_record(ngx_http_cache_turbo_zone_t *z,
 
     /* --- failure --- */
 
-    if (state == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN) {
+    if (state == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN
+        && probe != NGX_HTTP_CACHE_TURBO_BREAKER_NO_PROBE
+        && probe == ngx_http_cache_turbo_brk_gen(word))
+    {
         /* The probe failed: back to OPEN for a fresh window. Re-stamping
          * opened_at is what makes the next probe wait another open_for rather
          * than firing again immediately.
@@ -1282,13 +1381,24 @@ ngx_http_cache_turbo_shm_breaker_record(ngx_http_cache_turbo_zone_t *z,
         z->sh->breaker_opened_at = (ngx_atomic_t) now;
 
         (void) ngx_atomic_cmp_set(&z->sh->breaker_state,
-                                  NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN,
-                                  NGX_HTTP_CACHE_TURBO_BREAKER_OPEN);
+                                  (ngx_atomic_uint_t) word,
+                                  (ngx_atomic_uint_t)
+                                      ngx_http_cache_turbo_brk_pack(
+                                          probe,
+                                          NGX_HTTP_CACHE_TURBO_BREAKER_OPEN));
 
         return;
     }
 
-    /* ⚠ window <= 0 is INERT, not "count forever". Skipping the re-anchor
+    /* O4.3: a failure during HALF_OPEN from someone who does NOT hold the lease
+     * lands here and is dropped by the state test below. That is deliberate and
+     * symmetric with the success side: while HALF_OPEN, the only outcome
+     * carrying current information about the origin is the probe's. A non-probe
+     * failure is either older than the trip or belongs to a request that never
+     * reached the origin, and letting it re-stamp opened_at would push the next
+     * probe out by a full open_for on evidence nobody gathered.
+     *
+     * ⚠ window <= 0 is INERT, not "count forever". Skipping the re-anchor
      * instead would let breaker_fails accumulate for the life of the zone and
      * trip on the Nth failure EVER recorded, days apart -- precisely the slow
      * trickle the rolling window exists to ignore. O4.4 feeds these values from
@@ -1318,9 +1428,22 @@ ngx_http_cache_turbo_shm_breaker_record(ngx_http_cache_turbo_zone_t *z,
      * the open window has already expired. */
     z->sh->breaker_opened_at = (ngx_atomic_t) now;
 
+    /* ⚠ O4.3-c: CAS the whole packed word, carrying the CURRENT generation
+     * forward. Expecting a bare CLOSED here would compare against generation 0
+     * and so fail on every zone that has ever run a probe -- the breaker would
+     * trip exactly once in the lifetime of the zone and then never again.
+     * The trip does not open a new LEASE (no probe is promoted yet), so the
+     * generation is preserved rather than bumped; the promotion that follows
+     * open_for seconds later is what opens the next one. */
     if (ngx_atomic_cmp_set(&z->sh->breaker_state,
-                           NGX_HTTP_CACHE_TURBO_BREAKER_CLOSED,
-                           NGX_HTTP_CACHE_TURBO_BREAKER_OPEN))
+                           (ngx_atomic_uint_t)
+                               ngx_http_cache_turbo_brk_pack(
+                                   ngx_http_cache_turbo_brk_gen(word),
+                                   NGX_HTTP_CACHE_TURBO_BREAKER_CLOSED),
+                           (ngx_atomic_uint_t)
+                               ngx_http_cache_turbo_brk_pack(
+                                   ngx_http_cache_turbo_brk_gen(word),
+                                   NGX_HTTP_CACHE_TURBO_BREAKER_OPEN)))
     {
         z->sh->breaker_fails = 0;
         (void) ngx_atomic_fetch_add(&z->sh->breaker_opens, 1);
@@ -1334,6 +1457,11 @@ ngx_http_cache_turbo_shm_breaker_record(ngx_http_cache_turbo_zone_t *z,
 const char *
 ngx_http_cache_turbo_shm_breaker_state_str(ngx_uint_t state)
 {
+    /* O4.3-c: accepts either a bare state or a packed [gen|state] word --
+     * masking a bare state is a no-op, so every caller is correct without
+     * having to know which it holds. The admin JSON passes the raw shm word. */
+    state = ngx_http_cache_turbo_brk_state(state);
+
     switch (state) {
     case NGX_HTTP_CACHE_TURBO_BREAKER_CLOSED:    return "closed";
     case NGX_HTTP_CACHE_TURBO_BREAKER_OPEN:      return "open";
