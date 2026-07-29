@@ -786,10 +786,19 @@ typedef struct {
      * not just the winner, so a worker that can observe OPEN can always observe
      * a deadline at least as new -- see the ordering notes in _breaker_record().
      *
-     * A reload resets all of this to CLOSED -- the shm zone is re-created. That
-     * is documented as an accepted limitation in the plan, not a bug: a reload
-     * is an operator action and re-probing the origin once afterwards is
-     * cheaper than persisting breaker state across it.
+     * ⚠ A reload does NOT reset any of this. _shm_init_zone() deliberately
+     * inherits the live shm from the old cycle (`ctx->sh = octx->sh`), so a zone
+     * that was OPEN before the reload is still OPEN after it, mid-window and
+     * mid-lease. An earlier version of this comment claimed the opposite; the
+     * zone is reused, not re-created.
+     *
+     * The consequence worth knowing (O4.4-d): breaker STATE is per-ZONE while
+     * the directives that drive it are per-LOCATION, and during a reload the old
+     * and new workers both run against this one machine with whatever policy
+     * each was configured with. Failures counted under one location's threshold
+     * satisfy another's, and a threshold change takes effect against a counter
+     * accumulated under the previous one. Treat the zone, not the location, as
+     * the failure domain.
      */
     ngx_atomic_t             breaker_state;        /* BREAKER_* above          */
     ngx_atomic_t             breaker_fails;        /* failures this window     */
