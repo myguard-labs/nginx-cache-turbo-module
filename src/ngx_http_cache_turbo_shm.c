@@ -1107,6 +1107,15 @@ ngx_http_cache_turbo_shm_l2_neg_set(ngx_http_cache_turbo_zone_t *z,
  * the FIELDS mutually consistent, so no caller may latch two of them and
  * assume they describe one instant.
  *
+ * ⚠ O4.4-b: every deadline test here is written as `now - stamp CMP duration`,
+ * never `now CMP stamp + duration`. ngx_parse_time() accepts durations up to
+ * NGX_MAX_INT_T_VALUE, so adding one to an epoch stamp overflows signed time_t
+ * and SILENTLY INVERTS the comparison -- a very large breaker_window would read
+ * as permanently elapsed rather than never. Subtracting an epoch stamp from
+ * another epoch stamp cannot overflow, so the elapsed form is safe for every
+ * duration the parser can produce, and no range check on the directives is
+ * needed. Keep new deadline tests in this form.
+ *
  * This is state only. NOTHING on the serve path calls these yet: O4.3 wires
  * the request path, O4.2 wires the outcome recording, O4.4 adds the directives
  * that supply threshold/window/open_for. Until then the breaker is inert by
@@ -1187,7 +1196,7 @@ ngx_http_cache_turbo_shm_breaker_state(ngx_http_cache_turbo_zone_t *z,
          * test_breaker_unpublished_lease_is_not_reclaimable(). */
         if (open_for > 0
             && z->sh->breaker_probe_at != 0
-            && now >= (time_t) z->sh->breaker_probe_at + open_for
+            && now - (time_t) z->sh->breaker_probe_at >= open_for
             && ngx_atomic_cmp_set(&z->sh->breaker_state, (ngx_atomic_uint_t) word,
                                   (ngx_atomic_uint_t)
                                       ngx_http_cache_turbo_brk_pack(
@@ -1230,7 +1239,7 @@ ngx_http_cache_turbo_shm_breaker_state(ngx_http_cache_turbo_zone_t *z,
         return state;
     }
 
-    if (now < (time_t) z->sh->breaker_opened_at + open_for) {
+    if (now - (time_t) z->sh->breaker_opened_at < open_for) {
         return NGX_HTTP_CACHE_TURBO_BREAKER_OPEN;
     }
 
@@ -1412,7 +1421,7 @@ ngx_http_cache_turbo_shm_breaker_record(ngx_http_cache_turbo_zone_t *z,
 
     /* Rolling window: re-anchor if the previous one has expired, so only a
      * BURST of failures trips the breaker. */
-    if (now >= (time_t) z->sh->breaker_window_start + window) {
+    if (now - (time_t) z->sh->breaker_window_start >= window) {
         z->sh->breaker_window_start = (ngx_atomic_t) now;
         z->sh->breaker_fails        = 0;
     }

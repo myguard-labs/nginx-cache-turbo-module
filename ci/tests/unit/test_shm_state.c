@@ -876,6 +876,94 @@ brk_record(ngx_uint_t success, ngx_uint_t threshold, time_t window)
 }
 
 
+/* O4.4-b: ngx_parse_time() accepts durations up to NGX_MAX_INT_T_VALUE, so a
+ * deadline written as `now >= stamp + duration` overflows signed time_t once an
+ * epoch stamp is added and the comparison INVERTS -- an effectively infinite
+ * window reads as already elapsed. The shipped form subtracts two epoch stamps
+ * instead, which cannot overflow for any duration the parser can produce.
+ *
+ * Both breaker deadlines are covered:
+ *
+ *  - the rolling failure window in _record(). With the overflowing form,
+ *    `now >= window_start + window` is true for every failure, so each failure
+ *    re-anchors the window and resets the counter to 1 -- the breaker can never
+ *    accumulate to a threshold above 1 and NEVER TRIPS. The elapsed form keeps
+ *    the anchor, so two failures inside a huge window trip it.
+ *
+ *  - the open duration in _breaker_state(). With the overflowing form,
+ *    `now < opened_at + open_for` is false immediately, so an effectively
+ *    infinite OPEN promotes a probe on the very next request -- the herd this
+ *    breaker exists to hold back is released a second after it trips.
+ *
+ * Negative control: restore either `+` form and the matching CHECK below fails.
+ */
+static void
+test_breaker_huge_durations_do_not_overflow(void)
+{
+    time_t  huge;
+
+    printf("breaker: a near-max duration does not overflow the deadline\n");
+
+    /* NGX_MAX_INT_T_VALUE, spelled out because the unit shim does not pull in
+     * nginx's core headers. Large enough that adding it to any plausible epoch
+     * overflows a signed 64-bit time_t, and still inside what ngx_parse_time()
+     * accepts. */
+    huge = (time_t) 0x7fffffffffffffffLL;
+
+    zone_reset();
+    ngx_test_set_time(1000);
+
+    /* Window arm: two failures a second apart, threshold 2, effectively
+     * infinite window. They are unquestionably inside it, so they must trip.
+     *
+     * The anchor is seeded explicitly rather than left at the zeroed-zone 0:
+     * `0 + huge` does not overflow, so a fresh zone would exercise the safe
+     * side of the comparison and the test would pass either way. A real epoch
+     * anchor is what makes `anchor + huge` wrap. */
+    g_sh.breaker_window_start = (ngx_atomic_t) 1000;
+    brk_record(0, 2, huge);
+    ngx_test_set_time(1001);
+    brk_record(0, 2, huge);
+
+    CHECK(brk_state(huge) == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
+          "a near-max breaker window overflowed: every failure re-anchored the "
+          "rolling window, so the breaker never reached its threshold");
+
+    /* Open arm: the breaker just opened, and open_for is effectively infinite.
+     * No probe may be promoted -- not now, and not a second later. */
+    ngx_test_set_time(1002);
+    CHECK(brk_state(huge) == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
+          "a near-max breaker_open overflowed: the open window read as already "
+          "elapsed and a probe was promoted immediately");
+    CHECK(ngx_http_cache_turbo_brk_state((ngx_uint_t) g_sh.breaker_state)
+              == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
+          "a near-max breaker_open promoted the state out of OPEN");
+
+    /* Reclaim arm: the probe LEASE deadline is the third site with the same
+     * arithmetic. A live lease stamped a second ago, with an effectively
+     * infinite open_for, is nowhere near abandoned -- the overflowing form
+     * reads it as long expired and hands a SECOND concurrent probe to the dead
+     * origin, which is the herd the lease exists to bound. */
+    zone_reset();
+    ngx_test_set_time(1000);
+    g_sh.breaker_state    = ngx_http_cache_turbo_brk_pack(
+                                1, NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN);
+    g_sh.breaker_probe_at = (ngx_atomic_t) 1000;
+
+    ngx_test_set_time(1001);
+    {
+        ngx_uint_t  probe_b;
+
+        CHECK(brk_probe_state(huge, &probe_b)
+                  == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
+              "a near-max breaker_open overflowed the probe lease deadline");
+        CHECK(probe_b == NGX_HTTP_CACHE_TURBO_BREAKER_NO_PROBE,
+              "a live lease was reclaimed under a near-max open_for and a "
+              "second probe was issued a token");
+    }
+}
+
+
 static void
 test_breaker_zeroed_zone_is_closed(void)
 {
@@ -2108,6 +2196,7 @@ main(void)
     test_breaker_stale_success_does_not_close();
     test_breaker_unpublished_lease_is_not_reclaimable();
     test_breaker_stale_probe_cannot_resolve_new_lease();
+    test_breaker_huge_durations_do_not_overflow();
     test_breaker_threshold_zero_never_trips();
     test_breaker_zero_window_never_trips();
     test_breaker_state_strings();
