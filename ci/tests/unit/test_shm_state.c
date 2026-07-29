@@ -945,26 +945,39 @@ test_breaker_huge_durations_do_not_overflow(void)
           "a near-max breaker_open promoted the state out of OPEN");
 
     /* Reclaim arm: the probe LEASE deadline is the third site with the same
-     * arithmetic. A live lease stamped a second ago, with an effectively
-     * infinite open_for, is nowhere near abandoned -- the overflowing form
-     * reads it as long expired and hands a SECOND concurrent probe to the dead
-     * origin, which is the herd the lease exists to bound. */
+     * arithmetic.
+     *
+     * ⚠ O4.4-a moved this site off open_for and onto the fixed
+     * BREAKER_PROBE_LEASE, which changes what it takes to overflow it. Seeding
+     * `probe_at = 1000` and passing a near-max open_for no longer reaches the
+     * addition form at all -- `1000 + 300` is not near TIME_MAX, so the arm
+     * would stay green with the forbidden `now >= probe_at + lease` restored.
+     * The stamp itself must sit STRICTLY INSIDE one lease of TIME_MAX instead;
+     * that is where `probe_at + lease` wraps and reads a lease stamped THIS
+     * INSTANT as long expired, handing a second concurrent probe to the origin.
+     *
+     * ⚠ `MAX - lease + 1` is NOT inside that band -- the sum lands exactly on
+     * MAX, does not wrap, and both forms agree, so the arm silently stops
+     * guarding anything. Verified by mutation, not by reading: the offset below
+     * is deliberately well inside the band rather than on its edge.
+     *
+     * open_for is now irrelevant to this arm and is passed as an ordinary 30 to
+     * make that explicit. */
     zone_reset();
-    ngx_test_set_time(1000);
+    ngx_test_set_time(NGX_TEST_TIME_T_MAX - 100);
     g_sh.breaker_state    = ngx_http_cache_turbo_brk_pack(
                                 1, NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN);
-    g_sh.breaker_probe_at = (ngx_atomic_t) 1000;
+    g_sh.breaker_probe_at = (ngx_atomic_t) ngx_time();
 
-    ngx_test_set_time(1001);
     {
         ngx_uint_t  probe_b;
-
-        CHECK(brk_probe_state(huge, &probe_b)
+        CHECK(brk_probe_state(30, &probe_b)
                   == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
-              "a near-max breaker_open overflowed the probe lease deadline");
+              "a lease stamped within one PROBE_LEASE of TIME_MAX overflowed "
+              "its deadline and was reclaimed while live");
         CHECK(probe_b == NGX_HTTP_CACHE_TURBO_BREAKER_NO_PROBE,
-              "a live lease was reclaimed under a near-max open_for and a "
-              "second probe was issued a token");
+              "a live lease near TIME_MAX was reclaimed and a second probe was "
+              "issued a token");
     }
 }
 
@@ -1271,7 +1284,9 @@ test_breaker_unpublished_lease_is_not_reclaimable(void)
  * must OUTLIVE open_for, and it must still EXPIRE -- a lease that never expires
  * re-introduces the wedge the reclaim path exists to prevent, just at the other
  * end. The elapsed times are expressed relative to the constant so the test
- * follows it if the value is ever retuned; only the ORDERING is asserted. */
+ * follows it if the value is ever re-tuned, with one deliberate exception: the
+ * upper bound is an ABSOLUTE ceiling, because a relative one scales with the
+ * constant and would accept any value at all. */
 static void
 test_breaker_probe_lease_is_independent_of_open(void)
 {
@@ -1320,13 +1335,14 @@ test_breaker_probe_lease_is_independent_of_open(void)
     /* ⚠ The lease must also be BOUNDED, and that cannot be asserted by stepping
      * `lease + 1` -- such a step scales with the constant, so an absurd lease
      * still passes and the arm certifies nothing. The bound is asserted here as
-     * an absolute ceiling instead: an abandoned probe blocks every request in
-     * the zone until it is reclaimed, so a lease measured in hours is an
-     * outage, not a backstop. 15 minutes is far above any real origin timeout
-     * and far below "operationally indistinguishable from wedged". */
+     * an absolute ceiling instead: an abandoned probe diverts every affected
+     * origin-bound MISS to a stale body or a 503 until it is reclaimed (fresh
+     * hits never reach the breaker), so a lease measured in hours is an outage,
+     * not a backstop. 15 minutes is far above any real origin timeout and far
+     * below "operationally indistinguishable from wedged". */
     CHECK(lease <= 900,
-          "the probe lease exceeds 15 minutes; an abandoned probe would block "
-          "the zone for that long before a replacement is admitted");
+          "the probe lease exceeds 15 minutes; an abandoned probe would divert "
+          "origin-bound misses for that long before a replacement is admitted");
 
     /* Arm 2 -- the lease still expires. Promote a fresh probe, abandon it, and
      * step just past the lease: the slot must be reclaimable, or an aborted

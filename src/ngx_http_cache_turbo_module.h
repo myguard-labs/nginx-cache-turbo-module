@@ -539,9 +539,11 @@ typedef struct {
  * direction for a zeroed or accidentally-defaulted value is "the breaker does
  * not interfere". A silent flip would make the fall-through case start serving
  * stale bodies or 503s. */
-/* P6/O4.3: "no probe lease held". 0 is safe as the sentinel because it is also
- * breaker_probe_at's zeroed-zone value, so a token that was never stamped can
- * never match a live lease. */
+/* P6/O4.3: "no probe lease held". 0 is safe as the sentinel because the token
+ * is a GENERATION and the promotion path skips generation 0 explicitly (see the
+ * packed-word block above), so no live lease is ever identified by 0. The
+ * earlier stamp-based token relied on breaker_probe_at's zeroed-zone value for
+ * the same guarantee; that rationale is obsolete, the sentinel is not. */
 #define NGX_HTTP_CACHE_TURBO_BREAKER_NO_PROBE  0
 
 /*
@@ -560,9 +562,21 @@ typedef struct {
  * nginx's proxy_connect_timeout and proxy_read_timeout both default to 60s, so
  * an origin that is merely SLOW -- not dead -- could never close the breaker.
  *
- * 300s is chosen to clear the ~120s that those two defaults bound an origin
- * attempt to, with margin for a hand-raised read timeout, while still bounding
- * a genuinely abandoned lease to something an operator would wait out. It is
+ * 300s is chosen to clear the ~120s that those two defaults imply for a normal
+ * origin attempt, with margin, while still bounding a genuinely abandoned lease
+ * to something an operator would wait out.
+ *
+ * ⚠ 300s is NOT a proof of safety, and no finite constant here could be.
+ * proxy_read_timeout is measured between successive READS, not across the whole
+ * response, and proxy_next_upstream_tries/_timeout default to unlimited -- so
+ * time-to-response-headers is genuinely unbounded. A probe slower than this
+ * lease still gets superseded and its healthy outcome still discarded; it is
+ * re-probed every lease rather than never, so the breaker recovers late instead
+ * of wedging. Closing that class needs an enforced total time-to-header
+ * deadline on the probe, below this lease. Tracked as O4.4-g in memory
+ * issues.md. This constant widens the safe band; it does not end the problem.
+ *
+ * It is
  * INTERNAL on purpose (decision, 2026-07-29): a directive would add a third
  * argument to _breaker_state() and a knob with no tuning signal behind it.
  * The lease is a liveness backstop, not a policy -- the ordinary path resolves

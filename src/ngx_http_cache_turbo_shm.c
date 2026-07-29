@@ -1192,8 +1192,10 @@ ngx_http_cache_turbo_shm_breaker_state(ngx_http_cache_turbo_zone_t *z,
      * NOT open_for. Reclaiming on open_for meant any probe slower than it was
      * reclaimed in flight, so a slow-but-healthy origin could never close the
      * breaker. See the constant's block in the header for why it is not a
-     * directive. open_for still gates this branch, but only as "is the breaker
-     * configured at all" -- the same test the promotion below makes. */
+     * directive. open_for still gates this branch, matching the promotion test
+     * below: with open_for == 0 there is no timed reopen, so no probe is ever
+     * promoted and there is no lease to reclaim. (The FEATURE switch is
+     * breaker_threshold, not this -- see the merge note on breaker_open.) */
     if (state == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN) {
 
         /* ⚠ O4.3-c: a lease whose stamp is not yet PUBLISHED is not stale, it
