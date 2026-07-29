@@ -855,6 +855,26 @@ typedef struct {
                                                     * lease elapses after
                                                     * BREAKER_PROBE_LEASE     */
     ngx_atomic_t             breaker_opens;        /* lifetime CLOSED→OPEN     */
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+    /* O4.4-i: lifetime count of breaker-fallback ARMINGS, bumped inside the
+     * breaker_should_consult() branch at each of the two arming sites (L1
+     * expired-entry, L2 fallback). Exists solely to give those two sites a
+     * negative control: the black-box runtime test cannot isolate them, because
+     * the pre-origin gate alone already blocks BRK_ACT_SERVE when the breaker
+     * is off, so a site reverted to a bare `threshold > 0` check keeps the
+     * end-to-end test green (verified in s138 by injecting exactly that).
+     *
+     * ⚠ The bump MUST stay INSIDE the should_consult() branch. Bumped outside
+     * it, this counts arming ATTEMPTS and goes vacuous in the same way the
+     * black-box test did.
+     *
+     * TEST_FAULTS-gated rather than a plain counter so no permanent public
+     * admin-JSON field exists only to serve a test. Production and package
+     * builds do not define the macro and so have neither the field nor the
+     * header that reports it. */
+    ngx_atomic_t             test_brk_armings;
+#endif
 } ngx_http_cache_turbo_shctx_t;
 
 

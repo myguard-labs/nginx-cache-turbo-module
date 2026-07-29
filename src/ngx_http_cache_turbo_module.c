@@ -5104,6 +5104,13 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                 ctx->brk_cln = bcc;
                 ctx->brk_armed = 1;
 
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+                /* O4.4-i negative control for THIS site. Inside the
+                 * should_consult() branch on purpose -- see the field comment. */
+                (void) ngx_atomic_fetch_add(&z->sh->test_brk_armings, 1);
+#endif
+
                 ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                                "cache_turbo: breaker fallback armed from L1 "
                                "\"%V\" key=%ui", &r->uri, (ngx_uint_t) hash);
@@ -5226,6 +5233,12 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                     ctx->brk_ref = NULL;
                     ctx->brk_arm_done = 1;
                     ctx->brk_armed = 1;
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+                    /* O4.4-i negative control for THIS site. Inside the
+                     * should_consult() branch on purpose -- see field comment. */
+                    (void) ngx_atomic_fetch_add(&z->sh->test_brk_armings, 1);
+#endif
                     ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                                    "cache_turbo: breaker fallback armed from "
                                    "L2 \"%V\" key=%ui", &r->uri,
@@ -5933,6 +5946,71 @@ ngx_http_cache_turbo_add_header(ngx_http_request_t *r,
 
     return NGX_OK;
 }
+
+
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+/*
+ * O4.4-i: emit the zone's lifetime breaker-arming count as
+ * X-Cache-Turbo-Test-Armings so a runtime test can assert that a `breaker off`
+ * location armed NOTHING, which is the negative control the black-box shape
+ * cannot provide (the pre-origin gate masks the two arming sites).
+ *
+ * TEST_FAULTS-only: production and package builds define neither the counter
+ * nor this function, so no public surface is added to serve a test.
+ *
+ * ⚠ Uses ngx_list_push() directly rather than the add_header() helper, because
+ * that helper is deliberately suppressed by cache_turbo_test_restore_alloc_fail.
+ * An oracle that vanishes under an unrelated fault flag would read as "armed 0"
+ * -- the exact vacuous pass this control exists to prevent.
+ */
+static ngx_int_t
+ngx_http_cache_turbo_test_armings_header(ngx_http_request_t *r)
+{
+    ngx_http_cache_turbo_loc_conf_t  *clcf;
+    ngx_http_cache_turbo_zone_t      *z;
+    ngx_table_elt_t                  *h;
+    u_char                           *v;
+    size_t                            vlen;
+
+    static u_char  name[] = "X-Cache-Turbo-Test-Armings";
+
+    clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
+
+    if (clcf->shm_zone == NULL) {
+        return NGX_DECLINED;
+    }
+
+    z = clcf->shm_zone->data;
+    if (z == NULL || z->sh == NULL) {
+        return NGX_DECLINED;
+    }
+
+    v = ngx_pnalloc(r->pool, NGX_ATOMIC_T_LEN);
+    if (v == NULL) {
+        return NGX_ERROR;
+    }
+
+    vlen = ngx_sprintf(v, "%uA",
+                       ngx_atomic_fetch_add(&z->sh->test_brk_armings, 0)) - v;
+
+    h = ngx_list_push(&r->headers_out.headers);
+    if (h == NULL) {
+        return NGX_ERROR;
+    }
+
+    h->hash = 1;
+    h->key.len = sizeof("X-Cache-Turbo-Test-Armings") - 1;
+    h->key.data = name;
+    h->value.len = vlen;
+    h->value.data = v;
+#if (nginx_version >= 1023000)
+    h->next = NULL;
+#endif
+
+    return NGX_OK;
+}
+#endif
 
 
 /*
@@ -6983,10 +7061,25 @@ ngx_http_cache_turbo_header_filter(ngx_http_request_t *r)
     ctx = ngx_http_get_module_ctx(r, ngx_http_cache_turbo_module);
 
     if (ctx == NULL || ctx->served) {
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+        /* O4.4-i: report the zone's arming count on cache-serve responses too.
+         * Stamped BEFORE this early-return because a request that armed from L1
+         * is frequently the one that then serves the snapshot, and the test must
+         * be able to read the counter off any response it makes. */
+        if (ctx != NULL) {
+            (void) ngx_http_cache_turbo_test_armings_header(r);
+        }
+#endif
         return ngx_http_next_header_filter(r);
     }
 
     clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
+
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+    (void) ngx_http_cache_turbo_test_armings_header(r);
+#endif
 
     /* P6/O4.2: feed this origin outcome into the per-zone circuit breaker.
      *

@@ -1458,6 +1458,11 @@ http {{
     # unlike an 8m/16m zone where the contract test would pass for the wrong
     # reason (nothing ever gets evicted). Drives the no-reaper contract test.
     cache_turbo_zone name=ksevz 64k; # keep_stale no-reaper / LRU-only-reclaim (S2.3)
+    # O4.4-i arming-site control. Its OWN zone, not `main`: the test trips the
+    # breaker and leaves it OPEN, which would make the older black-box
+    # test_breaker_arming_gated_on_breaker_enable() (also on `main`) serve its
+    # tripping request from the fallback instead of reaching the dead origin.
+    cache_turbo_zone name=brkiz 16m;
     # SUITE-1: private zone for /l2neg/. l2_neg_skips is PER-ZONE
     # (z->sh->l2_neg_skips, module.c:4832), and the outage test asserts a delta
     # of exactly 0 over one request, so any other location writing that counter
@@ -2067,6 +2072,35 @@ http {{
             cache_turbo_key                $uri;
             cache_turbo_valid               1s;
             cache_turbo_breaker             off;
+            cache_turbo_breaker_threshold   1;
+            cache_turbo_breaker_window     60s;
+            cache_turbo_breaker_open       30s;
+            cache_turbo_lock_timeout        2s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # O4.4-i white-box arming control. Mirrors /breakeron/ and /breakeroff/
+        # exactly, but on the dedicated `brkiz` zone so tripping the breaker here
+        # cannot perturb the black-box test that shares `main`. Drives
+        # test_breaker_arming_sites_gated_white_box, which reads the
+        # TEST_FAULTS-only arming counter off these responses.
+        location /brkion/ {{
+            cache_turbo                    brkiz;
+            cache_turbo_key                $uri;
+            cache_turbo_valid               1s;
+            cache_turbo_breaker             on;
+            cache_turbo_breaker_threshold   1;
+            cache_turbo_breaker_window     60s;
+            cache_turbo_breaker_open       30s;
+            cache_turbo_lock_timeout        2s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        location /brkioff/ {{
+            cache_turbo                    brkiz;
+            cache_turbo_key                $uri;
+            cache_turbo_valid               1s;
+            cache_turbo_breaker            off;
             cache_turbo_breaker_threshold   1;
             cache_turbo_breaker_window     60s;
             cache_turbo_breaker_open       30s;
@@ -6863,6 +6897,111 @@ def test_breaker_arming_gated_on_breaker_enable(ng: Nginx, origin: Origin) -> No
             ("breaker OFF: a dead origin was still answered 200 from a stale "
              "snapshot -- cache_turbo_breaker off did not disable arming at "
              "the L1-expired call site")
+    finally:
+        origin.fail = False
+        drain_origin(origin)
+
+
+
+# Response-header names arrive lower-cased from fetch()'s dict.
+_ARMINGS_HDR = "x-cache-turbo-test-armings"
+
+
+def _armings(hdrs: dict, where: str) -> int:
+    """Pull the zone's lifetime breaker-arming counter out of a response's
+    headers (O4.4-i, TEST_FAULTS-only).
+
+    Takes an ALREADY-FETCHED header dict on purpose: issuing an extra request
+    just to read the counter perturbs the very state under test (a probe fetch
+    re-primes the entry and resets the failure window, which made the tripping
+    request below return 200 instead of reaching the dead origin).
+
+    A missing header means the build lacks the counter, in which case every
+    delta would read 0 and the test would pass while proving nothing -- so its
+    absence is a hard failure, not a skip."""
+    raw = hdrs.get(_ARMINGS_HDR)
+    assert raw is not None, (
+        f"{_ARMINGS_HDR} missing on {where} -- this build has no arming "
+        f"counter, so the O4.4-i control cannot distinguish 'gated' from "
+        f"'broken'")
+    return int(raw)
+
+
+def test_breaker_arming_sites_gated_white_box(ng: Nginx, origin: Origin) -> None:
+    """O4.4-i: pin the L1 expired-entry ARMING call site specifically, which
+    test_breaker_arming_gated_on_breaker_enable() provably cannot.
+
+    ⚠ SCOPE: this pins the **L1** arming site only. Verified by mutation --
+    reverting the L1 gate (module.c:5069) to a bare `breaker_threshold > 0`
+    fails this test on the armed_off assertion (delta 2), while the black-box
+    test above still passes. The SAME mutation applied to the L2 arming site
+    (module.c:5225) does NOT fail this test, because no breaker location in this
+    suite has an L2 backend configured, so the L2 fallback path is never taken.
+    Pinning L2 needs a breaker location with a Redis/memcached L2 -- tracked as
+    the remaining half of O4.4-i. Do not read a pass here as covering both.
+
+    That test is black-box, and the pre-origin gate alone blocks BRK_ACT_SERVE
+    when the breaker is off -- so reverting an arming site to a bare
+    `breaker_threshold > 0` (dropping should_consult() there) keeps it green.
+    Verified in s138 by injecting exactly that mutation.
+
+    This test reads the TEST_FAULTS-only arming counter instead, which is bumped
+    INSIDE the should_consult() branch at each arming site. Two claims:
+
+      1. breaker ON  + expired entry + dead origin => the counter MOVES.
+         Without this the '0 armings' assertion below is vacuous: a counter that
+         never moves satisfies it no matter how the sites are gated.
+      2. breaker OFF + same conditions            => the counter does NOT move.
+         This is the O4.4-c regression a bare threshold check reintroduces:
+         `breaker off` would keep pinning blobs on the expired-entry path.
+
+    /brkion/ and /brkioff/ share the dedicated `brkiz` zone (NOT `main`): this
+    test leaves the breaker OPEN, which would make the black-box test's own
+    tripping request get served the fallback rather than reach the dead origin.
+    Since the two locations do share brkiz, the counter is zone-wide and every
+    assertion below is a DELTA around that location's fetches, never an
+    absolute."""
+    base = {}
+    for path in ("/brkion/dead", "/brkioff/dead"):
+        s0, b0, h0 = fetch(ng.port, path)
+        assert s0 == 200, f"prime failed for {path}: {s0}"
+        assert b0, f"prime returned an empty body for {path}"
+        base[path] = _armings(h0, f"prime {path}")
+
+    time.sleep(4.3)   # past fresh (1s) AND the x4 stale window (4s): L1-expired
+    origin.fail = True
+    try:
+        # --- claim 1: breaker ON arms, so the counter must move ---------------
+        s_trip, _, _ = fetch(ng.port, "/brkion/dead")
+        assert s_trip != 200, \
+            f"breaker ON: tripping request unexpectedly 200: {s_trip}"
+        s_on, _, h_on = fetch(ng.port, "/brkion/dead")
+        assert s_on == 200, \
+            f"breaker ON: expected the any-age fallback after tripping, got {s_on}"
+        armed_on = _armings(h_on, "breaker ON fallback") - base["/brkion/dead"]
+        assert armed_on > 0, (
+            "breaker ON armed NOTHING at either call site (counter delta 0) -- "
+            "either the arming sites no longer bump the counter or the fallback "
+            "was served without arming; the 'breaker OFF arms nothing' "
+            "assertion below would be vacuous, so fail here instead")
+
+        # --- claim 2: breaker OFF must arm nothing ---------------------------
+        # Baseline is the counter AFTER the breaker-ON phase, since both
+        # locations share the `main` zone.
+        before_off = _armings(h_on, "breaker ON fallback")
+        s_off_trip, _, _ = fetch(ng.port, "/brkioff/dead")
+        assert s_off_trip != 200, \
+            f"breaker OFF: tripping request unexpectedly 200: {s_off_trip}"
+        s_off, _, h_off = fetch(ng.port, "/brkioff/dead")
+        assert s_off != 200, \
+            f"breaker OFF: dead origin answered 200 from a stale snapshot: {s_off}"
+        armed_off = _armings(h_off, "breaker OFF error") - before_off
+        assert armed_off == 0, (
+            f"breaker OFF armed {armed_off} time(s) at the L1 expired-entry "
+            f"arming call site -- cache_turbo_breaker off must gate it through "
+            f"breaker_should_consult(), not a bare breaker_threshold > 0 check. "
+            f"With the breaker off this path keeps pinning blobs on every "
+            f"request to a cold-ish key (O4.4-c/O4.4-i)")
     finally:
         origin.fail = False
         drain_origin(origin)
@@ -13549,6 +13688,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_breaker_directives_accepted(ng)                     # O4.4
     test_breaker_open_zero_rejected(ng)                      # O4.4 / O4.3-a
     test_breaker_arming_gated_on_breaker_enable(ng, origin)  # O4.4
+    test_breaker_arming_sites_gated_white_box(ng, origin)    # O4.4-i
     test_backend_separators(ng)
     test_backend_malformed_pipes(ng)
     test_backend_none_is_exclusive(ng)
