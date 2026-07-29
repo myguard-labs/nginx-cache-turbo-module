@@ -109,6 +109,11 @@ typedef struct {
  * so a token that was never stamped can never match a live lease. */
 #define NGX_HTTP_CACHE_TURBO_BREAKER_NO_PROBE  0
 
+/* P6/O4.4-a: how long a promoted probe owns its lease, deliberately NOT
+ * breaker_open -- rationale on the header definition. Mirrored here because the
+ * sliced breaker_state() references it; extract_shm.sh pins the two copies. */
+#define NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_LEASE  300
+
 #define NGX_HTTP_CACHE_TURBO_BRK_ACT_PASS   0
 #define NGX_HTTP_CACHE_TURBO_BRK_ACT_SERVE  1
 #define NGX_HTTP_CACHE_TURBO_BRK_ACT_FAIL   2
@@ -940,26 +945,39 @@ test_breaker_huge_durations_do_not_overflow(void)
           "a near-max breaker_open promoted the state out of OPEN");
 
     /* Reclaim arm: the probe LEASE deadline is the third site with the same
-     * arithmetic. A live lease stamped a second ago, with an effectively
-     * infinite open_for, is nowhere near abandoned -- the overflowing form
-     * reads it as long expired and hands a SECOND concurrent probe to the dead
-     * origin, which is the herd the lease exists to bound. */
+     * arithmetic.
+     *
+     * ⚠ O4.4-a moved this site off open_for and onto the fixed
+     * BREAKER_PROBE_LEASE, which changes what it takes to overflow it. Seeding
+     * `probe_at = 1000` and passing a near-max open_for no longer reaches the
+     * addition form at all -- `1000 + 300` is not near TIME_MAX, so the arm
+     * would stay green with the forbidden `now >= probe_at + lease` restored.
+     * The stamp itself must sit STRICTLY INSIDE one lease of TIME_MAX instead;
+     * that is where `probe_at + lease` wraps and reads a lease stamped THIS
+     * INSTANT as long expired, handing a second concurrent probe to the origin.
+     *
+     * ⚠ `MAX - lease + 1` is NOT inside that band -- the sum lands exactly on
+     * MAX, does not wrap, and both forms agree, so the arm silently stops
+     * guarding anything. Verified by mutation, not by reading: the offset below
+     * is deliberately well inside the band rather than on its edge.
+     *
+     * open_for is now irrelevant to this arm and is passed as an ordinary 30 to
+     * make that explicit. */
     zone_reset();
-    ngx_test_set_time(1000);
+    ngx_test_set_time(NGX_TEST_TIME_T_MAX - 100);
     g_sh.breaker_state    = ngx_http_cache_turbo_brk_pack(
                                 1, NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN);
-    g_sh.breaker_probe_at = (ngx_atomic_t) 1000;
+    g_sh.breaker_probe_at = (ngx_atomic_t) ngx_time();
 
-    ngx_test_set_time(1001);
     {
         ngx_uint_t  probe_b;
-
-        CHECK(brk_probe_state(huge, &probe_b)
+        CHECK(brk_probe_state(30, &probe_b)
                   == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
-              "a near-max breaker_open overflowed the probe lease deadline");
+              "a lease stamped within one PROBE_LEASE of TIME_MAX overflowed "
+              "its deadline and was reclaimed while live");
         CHECK(probe_b == NGX_HTTP_CACHE_TURBO_BREAKER_NO_PROBE,
-              "a live lease was reclaimed under a near-max open_for and a "
-              "second probe was issued a token");
+              "a live lease near TIME_MAX was reclaimed and a second probe was "
+              "issued a token");
     }
 }
 
@@ -1101,8 +1119,15 @@ test_breaker_abandoned_probe_lease_recovers(void)
             "breaker fixture: expected a promoted probe");
 
     /* The probe vanishes -- no _record() ever arrives. Inside the lease the
-     * breaker must keep refusing everyone. */
-    ngx_test_advance_time(29);
+     * breaker must keep refusing everyone.
+     *
+     * ⚠ O4.4-a: these steps are sized from BREAKER_PROBE_LEASE, NOT from the
+     * open_for passed to brk_state(). An earlier revision reclaimed on open_for
+     * and this test walked the clock 29s then 2s across that 30s boundary; the
+     * arithmetic looked like it was testing the lease while actually pinning
+     * the coupling that made a slow-but-healthy probe unreclaimable in flight. */
+    ngx_test_advance_time(
+        (time_t) NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_LEASE - 1);
     CHECK(brk_state(30)
               == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
           "the probe lease was reclaimed before it went stale");
@@ -1244,6 +1269,100 @@ test_breaker_unpublished_lease_is_not_reclaimable(void)
     CHECK(probe_b == NGX_HTTP_CACHE_TURBO_BREAKER_NO_PROBE,
           "a second probe was issued a lease token while the first was still "
           "live");
+}
+
+
+/* O4.4-a: the probe lease is bounded by BREAKER_PROBE_LEASE, not by open_for.
+ *
+ * The defect this pins wedged the breaker permanently OPEN against an origin
+ * that was merely SLOW. With the lease reclaimed on open_for, a probe taking
+ * longer than open_for lost its lease in flight; its healthy response then
+ * arrived holding a superseded generation and was discarded (correctly), so
+ * nothing could ever record the success that closes the breaker.
+ *
+ * Two arms, because either alone is satisfiable by a wrong constant: the lease
+ * must OUTLIVE open_for, and it must still EXPIRE -- a lease that never expires
+ * re-introduces the wedge the reclaim path exists to prevent, just at the other
+ * end. The elapsed times are expressed relative to the constant so the test
+ * follows it if the value is ever re-tuned, with one deliberate exception: the
+ * upper bound is an ABSOLUTE ceiling, because a relative one scales with the
+ * constant and would accept any value at all. */
+static void
+test_breaker_probe_lease_is_independent_of_open(void)
+{
+    ngx_uint_t  probe_a, probe_b;
+    time_t      lease = (time_t) NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_LEASE;
+
+    printf("breaker: the probe lease is independent of breaker_open\n");
+
+    /* The hazard only exists when a probe can outlast open_for, which is what
+     * the shipped 30s default against a 60s proxy_read_timeout looks like. */
+    REQUIRE(lease > 30,
+            "breaker fixture: probe lease must exceed the open_for used here, "
+            "or this test cannot reach the coupling it pins");
+
+    zone_reset();
+    ngx_test_set_time(1000);
+
+    brk_record(0, 1, 60);
+    ngx_test_advance_time(31);
+    REQUIRE(brk_probe_state(30, &probe_a)
+                == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN,
+            "breaker fixture: expected probe A to be promoted");
+    REQUIRE(probe_a != NGX_HTTP_CACHE_TURBO_BREAKER_NO_PROBE,
+            "breaker fixture: probe A was issued no token");
+
+    /* Arm 1 -- A is slower than open_for but well inside its lease. This is the
+     * slow-but-healthy origin. A's lease must still be its own. */
+    ngx_test_advance_time(31);
+    CHECK(brk_probe_state(30, &probe_b) == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
+          "a probe slower than breaker_open had its lease reclaimed in flight; "
+          "its response will carry a superseded generation and the breaker can "
+          "never close");
+    CHECK(probe_b == NGX_HTTP_CACHE_TURBO_BREAKER_NO_PROBE,
+          "a second probe was promoted while the first was still inside its "
+          "lease");
+
+    /* A now reports success on the token it still holds -- the raw call, since
+     * brk_record() hardcodes NO_PROBE and could never resolve a lease. With the
+     * lease coupled to open_for this token is stale and the breaker stays OPEN
+     * forever; that is the user-visible consequence, asserted not inferred. */
+    ngx_http_cache_turbo_shm_breaker_record(&g_zone, 1, 1, 60, probe_a);
+    CHECK(brk_probe_state(30, &probe_b) == NGX_HTTP_CACHE_TURBO_BREAKER_CLOSED,
+          "a slow-but-healthy probe reported success and the breaker did not "
+          "close");
+
+    /* ⚠ The lease must also be BOUNDED, and that cannot be asserted by stepping
+     * `lease + 1` -- such a step scales with the constant, so an absurd lease
+     * still passes and the arm certifies nothing. The bound is asserted here as
+     * an absolute ceiling instead: an abandoned probe diverts every affected
+     * origin-bound MISS to a stale body or a 503 until it is reclaimed (fresh
+     * hits never reach the breaker), so a lease measured in hours is an outage,
+     * not a backstop. 15 minutes is far above any real origin timeout and far
+     * below "operationally indistinguishable from wedged". */
+    CHECK(lease <= 900,
+          "the probe lease exceeds 15 minutes; an abandoned probe would divert "
+          "origin-bound misses for that long before a replacement is admitted");
+
+    /* Arm 2 -- the lease still expires. Promote a fresh probe, abandon it, and
+     * step just past the lease: the slot must be reclaimable, or an aborted
+     * probe wedges the breaker in HALF_OPEN permanently. */
+    zone_reset();
+    ngx_test_set_time(1000);
+
+    brk_record(0, 1, 60);
+    ngx_test_advance_time(31);
+    REQUIRE(brk_probe_state(30, &probe_a)
+                == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN,
+            "breaker fixture: expected the second probe to be promoted");
+
+    ngx_test_advance_time((time_t) (lease + 1));
+    CHECK(brk_probe_state(30, &probe_b)
+              == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN,
+          "an abandoned lease was not reclaimed after the probe lease elapsed; "
+          "the breaker is wedged in HALF_OPEN");
+    CHECK(probe_b != NGX_HTTP_CACHE_TURBO_BREAKER_NO_PROBE,
+          "the reclaiming caller was not issued a replacement lease token");
 }
 
 
@@ -2195,6 +2314,7 @@ main(void)
     test_breaker_abandoned_probe_lease_recovers();
     test_breaker_stale_success_does_not_close();
     test_breaker_unpublished_lease_is_not_reclaimable();
+    test_breaker_probe_lease_is_independent_of_open();
     test_breaker_stale_probe_cannot_resolve_new_lease();
     test_breaker_huge_durations_do_not_overflow();
     test_breaker_threshold_zero_never_trips();

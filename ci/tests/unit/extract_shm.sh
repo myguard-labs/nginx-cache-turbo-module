@@ -74,6 +74,12 @@ check_define NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN 2
 # direction (a zeroed or defaulted verdict must not divert the request). The
 # test file redeclares these locally, so an unpinned drift would leave the
 # mapping tests asserting against the wrong numbers while staying green.
+# P6/O4.4-a: the probe lease. Mirrored into test_shm_state.c because the sliced
+# breaker_state() references it, so a drift between the two copies would move
+# the reclaim deadline in production while the test kept measuring the old one.
+# The test asserts only the ORDERING against open_for, but it cannot notice a
+# value that silently drops below it -- this pin is what does.
+check_define NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_LEASE 300
 check_define NGX_HTTP_CACHE_TURBO_BRK_ACT_PASS  0
 check_define NGX_HTTP_CACHE_TURBO_BRK_ACT_SERVE 1
 check_define NGX_HTTP_CACHE_TURBO_BRK_ACT_FAIL  2
