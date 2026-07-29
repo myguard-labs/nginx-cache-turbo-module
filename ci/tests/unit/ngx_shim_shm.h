@@ -65,6 +65,24 @@
 #include <string.h>
 #include <time.h>
 
+/* H-1: the real nginx build derives NGX_PTR_SIZE from objs/ngx_auto_config.h,
+ * which this harness never sees -- test_shm_state.c used to leave the macro
+ * entirely undefined, so `#if (NGX_PTR_SIZE >= 8)` at the packed-probe layout
+ * select silently evaluated to 0 and every unit build compiled the 32-bit
+ * (20/12-bit) layout regardless of host width, while shipped x86-64 uses the
+ * 64-bit (32/32-bit) layout. `-Wundef` catches this ("not defined, evaluates
+ * to 0") but -Wundef is not in -Wall/-Wextra, so plain -Werror never did.
+ *
+ * Fix: define it here from the portable predefined `__SIZEOF_POINTER__`
+ * (the actual host pointer width in BYTES -- NGX_PTR_SIZE is 8 or 4 in real
+ * nginx, matching sizeof(void *), not a bit count), never a hardcoded 8 --
+ * hardcoding 8 would just move the same silent-wrong-layout bug from
+ * "undefined" to "wrong on a 32-bit host". Both the real header and this
+ * mirror now also #error outright if NGX_PTR_SIZE is somehow still
+ * undefined at the layout-select site, so this can never again pick a
+ * layout silently. */
+#define NGX_PTR_SIZE  __SIZEOF_POINTER__
+
 /* --- core types (nginx ngx_config.h / ngx_core.h) --- */
 typedef intptr_t    ngx_int_t;
 typedef uintptr_t   ngx_uint_t;

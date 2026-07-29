@@ -1174,12 +1174,32 @@ ngx_http_cache_turbo_shm_l2_neg_set(ngx_http_cache_turbo_zone_t *z,
  * The age is therefore only meaningful for stamps younger than one field wrap,
  * which the lease constant guarantees for any lease this function is asked
  * about. Pinned by test_breaker_probe_age_is_modular().
+ *
+ * ⚠ H-3: `now` is nginx's cached wall clock (ngx_time()), which follows
+ * settimeofday()/NTP steps rather than a monotonic source. A BACKWARDS step
+ * to before sh->breaker_epoch makes `now - epoch` negative; cast to
+ * ngx_uint_t that wraps to near-UINT_MAX, which then masks to near-MASK --
+ * i.e. it reads as an almost-maximally-OLD lease and gets reclaimed while
+ * still live. This is the ORIGINAL O4.4-h failure mode, reintroduced by the
+ * very epoch anchor that fixed the other one.
+ *
+ * The fix clamps: when `now` precedes the epoch, the lease is reported as
+ * age 0 (brand new) rather than computing a meaningless negative-turned-huge
+ * age. That fails CLOSED -- a spuriously "young" reading only means one
+ * fewer reclaim opportunity until the clock catches back up, never an
+ * incorrect reclaim of a live lease. A monotonic clock source would remove
+ * the hazard at its root, but that is a module-wide change out of scope
+ * here. Pinned by test_breaker_backwards_clock_step_does_not_reclaim().
  */
 static time_t
 ngx_http_cache_turbo_shm_brk_probe_age(ngx_http_cache_turbo_zone_t *z,
     ngx_uint_t probe_word, time_t now)
 {
     ngx_uint_t  rel, stamp;
+
+    if (now < (time_t) z->sh->breaker_epoch) {
+        return (time_t) 0;
+    }
 
     rel   = ((ngx_uint_t) (now - (time_t) z->sh->breaker_epoch))
             & NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_STAMP_MASK;
@@ -1276,6 +1296,39 @@ ngx_http_cache_turbo_shm_breaker_state(ngx_http_cache_turbo_zone_t *z,
          * this line fails test_breaker_unpublished_lease_is_not_reclaimable().
          * The generation equality alone is therefore necessary but not
          * sufficient; NO_PROBE must be rejected on its own.
+         *
+         * ⚠⚠ H-2 (open, NOT fixed here -- see the module's ledger entry and
+         * the s141/grind decision packet): a generation MISMATCH (state gen
+         * N, probe gen != N, not NO_PROBE) is never reclaimed by this
+         * predicate at all, because the equality arm above requires an exact
+         * match before the age test even runs. If that mismatch is ever
+         * reached (an ABA on the probe word: a stale promoter's publication
+         * survives a HALF_OPEN later promoted by a DIFFERENT generation),
+         * every future call falls to the `else` below and returns OPEN
+         * forever -- a permanent wedge, no probe ever promoted again.
+         *
+         * Two fix directions were tried and REJECTED, both demonstrated by a
+         * failing existing test, not merely reasoned about:
+         *   - reclaim a mismatch unconditionally: breaks
+         *     test_breaker_fresh_lease_not_reclaimable_via_old_stamp() (a
+         *     provably FRESH generation N, momentarily paired with N-1's
+         *     stale stamp by an ordinary descheduling window, must NOT be
+         *     torn down the instant it is observed).
+         *   - reclaim a mismatch once breaker_opened_at (the CURRENT
+         *     generation's own promotion stamp, unlike the mismatched probe
+         *     stamp) ages past BREAKER_PROBE_LEASE: breaks the SAME test,
+         *     because that fixture never sets breaker_opened_at either, so
+         *     it is indistinguishable from a genuinely wedged generation by
+         *     any state this function can read within one deadline window.
+         * No third signal in the current shared-memory layout separates
+         * "briefly mismatched, about to self-heal when the promoter's second
+         * store lands" from "permanently mismatched, promoter never
+         * returns" -- both look identical to a reader. Resolving this needs
+         * either a new piece of state (e.g. a monotonic per-zone promotion
+         * sequence number distinct from the masked generation) or accepting
+         * the wedge as a bounded-probability, operator-visible failure mode
+         * (a metrics/log signal + manual/orchestration-level breaker reset).
+         * Left OPEN rather than shipping either rejected fix.
          *
          * Pinned by test_breaker_unpublished_lease_is_not_reclaimable() and
          * test_breaker_fresh_lease_not_reclaimable_via_old_stamp().

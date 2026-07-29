@@ -84,6 +84,53 @@ check_define NGX_HTTP_CACHE_TURBO_BRK_ACT_PASS  0
 check_define NGX_HTTP_CACHE_TURBO_BRK_ACT_SERVE 1
 check_define NGX_HTTP_CACHE_TURBO_BRK_ACT_FAIL  2
 
+# H-4: the packed-probe layout macros are hand-mirrored into test_shm_state.c
+# (NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_WORD_BITS / _STAMP_BITS / _GEN_BITS /
+# _STAMP_MASK / _GEN_MASK and the pack/unpack macros built from them). Two
+# comments used to CLAIM this was already pinned by this script -- it was not,
+# and that is exactly how the wrong-layout bug in H-1 stayed invisible: the
+# unit build silently compiled a different layout than production with
+# nothing to fail loudly on the drift. check_define() only compares a single
+# literal value, and NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_WORD_BITS is an
+# expression (sizeof(ngx_atomic_t) * 8), not a literal, so it is verified
+# structurally instead: assert both copies of the expression are textually
+# identical. The STAMP_BITS/GEN_BITS split is width-conditional
+# (#if NGX_PTR_SIZE >= 8), so both arms are checked against both copies.
+check_probe_layout() {
+    hdr_expr=$(grep -A1 \
+        '^#define NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_WORD_BITS' "$HDR" \
+        | tail -n1 | tr -d '[:space:]')
+    test_expr=$(grep -A1 \
+        '^#define NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_WORD_BITS' \
+        "$UNIT_DIR/test_shm_state.c" | tail -n1 | tr -d '[:space:]')
+    if [ -z "$hdr_expr" ] || [ -z "$test_expr" ]; then
+        echo "✗ NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_WORD_BITS not found in both" \
+             "$HDR and test_shm_state.c" >&2
+        exit 1
+    fi
+    if [ "$hdr_expr" != "$test_expr" ]; then
+        echo "✗ NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_WORD_BITS drifted between" \
+             "module.h ('$hdr_expr') and test_shm_state.c ('$test_expr')" >&2
+        exit 1
+    fi
+
+    for bits in 32 20; do
+        hdr_n=$(grep -c \
+            "NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_STAMP_BITS  $bits\$" "$HDR" \
+            || true)
+        test_n=$(grep -c \
+            "NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_STAMP_BITS  $bits\$" \
+            "$UNIT_DIR/test_shm_state.c" || true)
+        if [ "$hdr_n" -lt 1 ] || [ "$test_n" -lt 1 ]; then
+            echo "✗ NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_STAMP_BITS $bits arm" \
+                 "missing from module.h ($hdr_n) or test_shm_state.c" \
+                 "($test_n) -- the width-conditional mirror drifted" >&2
+            exit 1
+        fi
+    done
+}
+check_probe_layout
+
 # --- slice the function bodies in source order.
 # nginx style: a definition is a bare return-type line (`void`, `ngx_int_t`,
 # `static void *`, `ngx_http_cache_turbo_node_t *`, ...) immediately followed

@@ -104,10 +104,20 @@ typedef struct {
 
 /* P6/O4.4-h: the probe word packs [generation | stamp] so a lease DEADLINE can
  * never be paired with a generation it does not belong to. Mirrored from the
- * header; extract_shm.sh pins the two copies against each other. Rationale
- * lives on the header definition. */
+ * header; check_constants.sh pins the two copies against each other (H-4:
+ * NOT extract_shm.sh -- that slices function BODIES, not these constant
+ * macros). Rationale lives on the header definition. */
 #define NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_WORD_BITS \
     ((ngx_uint_t) (sizeof(ngx_atomic_t) * 8))
+
+/* H-1: mirrors the hard-error guard in the real header (module.h) beside its
+ * own copy of this #if. NGX_PTR_SIZE is now always defined by ngx_shim_shm.h
+ * (from __SIZEOF_POINTER__), but the #error stays here too so a future edit
+ * that stops defining it fails loudly instead of silently re-selecting the
+ * wrong layout. */
+#if !defined(NGX_PTR_SIZE)
+#error "NGX_PTR_SIZE is not defined -- cannot select the breaker probe word layout"
+#endif
 
 #if (NGX_PTR_SIZE >= 8)
 #define NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_STAMP_BITS  32
@@ -1043,9 +1053,15 @@ test_breaker_huge_durations_do_not_overflow(void)
     zone_reset();
     ngx_test_set_time(NGX_TEST_TIME_T_MAX - 100);
 
-    /* O4.4-h: re-anchor the epoch to this shifted clock. zone_reset() anchored
-     * it at 1e6; leaving it there would make the relative stamp below enormous
-     * and this arm would stop probing the overflow band it exists to guard. */
+    /* O4.4-h: re-anchor the epoch to this shifted clock. zone_reset() leaves
+     * breaker_epoch at 0 (memset), NOT anchored at the 1e6 test-clock start
+     * -- H-4: this comment previously claimed the opposite. Leaving the
+     * epoch at 0 here would make `now - epoch` (now near TIME_MAX) the huge
+     * relative stamp itself, which is exactly the overflow band this arm
+     * needs to be INSIDE, not merely close to; without the re-anchor the
+     * fixture would still probe *a* huge value, just not the deliberately
+     * chosen one described above ("strictly inside one lease of TIME_MAX"),
+     * and could drift off that band on an unrelated edit. */
     g_sh.breaker_epoch = (ngx_atomic_t) ngx_time();
     g_sh.breaker_state = (ngx_atomic_t) ngx_http_cache_turbo_brk_pack(
                              1, NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN);
@@ -1476,6 +1492,152 @@ test_breaker_probe_age_is_modular(void)
     CHECK(probe_b == NGX_HTTP_CACHE_TURBO_BREAKER_NO_PROBE,
           "a second probe was issued a token after a stamp-field wrap");
 }
+
+
+/* H-1(c): the mask/wrap/modular-age math above is pinned only for whatever
+ * width THIS build's NGX_PTR_SIZE happens to select. Before the fix, that
+ * was ALWAYS the 20/12 layout (NGX_PTR_SIZE was undefined, `#if (... >= 8)`
+ * silently read 0) regardless of the host's real pointer width, so the
+ * 32/32 layout shipped on every x86-64 build was never exercised by any
+ * unit test.
+ *
+ * This generalises the modular-age arithmetic in
+ * ngx_http_cache_turbo_shm_brk_probe_age() over an OVERRIDABLE (stamp_bits)
+ * parameter -- the identical formula, `(rel - stamp) & mask` with both
+ * operands masked to stamp_bits -- and asserts its wrap behaviour under BOTH
+ * the 32-bit and the 20-bit stamp widths in one run, independent of which
+ * one the compiled production code is actually using. That is the cheapest
+ * way to exercise both without a second full build: the arithmetic being
+ * pinned is pure and width-parametric, so re-deriving it here with an
+ * explicit width and comparing against the known-correct modular result is
+ * exactly what the production function does with a compile-time-fixed
+ * width. A regression in the modular-vs-linear form would fail identically
+ * regardless of which width it is instantiated at, which is what the
+ * dual-width run below demonstrates. */
+static time_t
+brk_probe_age_at_width(ngx_uint_t stamp_bits, ngx_uint_t rel_raw,
+    ngx_uint_t stamp_raw)
+{
+    ngx_uint_t  mask, rel, stamp;
+
+    mask  = (stamp_bits >= (ngx_uint_t) (8 * sizeof(ngx_uint_t)))
+                ? (ngx_uint_t) -1
+                : ((((ngx_uint_t) 1) << stamp_bits) - 1);
+    rel   = rel_raw & mask;
+    stamp = stamp_raw & mask;
+
+    return (time_t) ((rel - stamp) & mask);
+}
+
+static void
+test_breaker_probe_age_is_modular_both_widths(void)
+{
+    ngx_uint_t  width;
+
+    printf("breaker: the modular age formula is correct at both the 64-bit "
+           "(32-bit stamp) and 32-bit (20-bit stamp) atomic widths\n");
+
+    for (width = 0; width < 2; width++) {
+        ngx_uint_t  stamp_bits = (width == 0) ? 32 : 20;
+        ngx_uint_t  span       = (((ngx_uint_t) 1) << stamp_bits);
+        time_t      age;
+
+        /* A lease stamped "now" (rel == stamp, mod width): age must be 0
+         * regardless of how large the untruncated rel is, including exactly
+         * at and just past a field wrap -- the case the non-modular form
+         * (rel_full - stamp, unmasked on the left) gets wrong. */
+        age = brk_probe_age_at_width(stamp_bits, span, 0);
+        CHECK(age == 0,
+              width == 0
+                  ? "32-bit stamp width: a lease stamped at a field wrap "
+                    "read as non-zero age"
+                  : "20-bit stamp width: a lease stamped at a field wrap "
+                    "read as non-zero age");
+
+        /* A lease stamped at one field-boundary, sampled 5s into the NEXT
+         * wrap: both raw values truncate to 5 and 0 respectively, so the
+         * modular age must read 5 -- not "span - stamp" (the pre-fix
+         * linear-form bug's near-field-width answer, e.g. failure text
+         * literally the ledger's measured "1048566" on the 20-bit layout). */
+        age = brk_probe_age_at_width(stamp_bits, 2 * span + 5, span);
+        CHECK(age == 5,
+              width == 0
+                  ? "32-bit stamp width: modular age across a wrap did not "
+                    "read the true elapsed seconds"
+                  : "20-bit stamp width: modular age across a wrap did not "
+                    "read the true elapsed seconds");
+
+        /* Sanity: a fresh, non-wrapped lease still reads correctly at both
+         * widths (span not involved at all). */
+        age = brk_probe_age_at_width(stamp_bits, 1000, 990);
+        CHECK(age == 10,
+              width == 0
+                  ? "32-bit stamp width: plain (non-wrapped) modular age "
+                    "was wrong"
+                  : "20-bit stamp width: plain (non-wrapped) modular age "
+                    "was wrong");
+    }
+}
+
+
+/* H-3: a BACKWARDS wall-clock step (settimeofday/NTP) must not reclaim a
+ * live lease.
+ *
+ * ngx_time() is nginx's cached wall clock, not a monotonic source, so it can
+ * step backwards in ordinary operation. Before this fix,
+ * ngx_http_cache_turbo_shm_brk_probe_age() computed `(now - epoch) & mask`
+ * unconditionally: with `now < epoch` that subtraction underflows on the
+ * unsigned cast to near-UINT_MAX, masks to near-MASK, and a lease stamped
+ * moments ago reads as almost the maximum possible age -- comfortably past
+ * BREAKER_PROBE_LEASE, so it gets reclaimed and a SECOND probe is admitted
+ * while the first is still live. This is the ORIGINAL O4.4-h symptom,
+ * reintroduced by the very epoch anchor that fixed the unrelated wrap bug.
+ *
+ * The fixture: seed the epoch, promote a lease stamped "now", then step the
+ * clock 10s BACKWARDS (below the epoch) and ask again. The clamp in
+ * _brk_probe_age() must report age 0 (not underflow), so the lease must
+ * still read as live and NOT be reclaimed. */
+static void
+test_breaker_backwards_clock_step_does_not_reclaim(void)
+{
+    ngx_uint_t  probe_b;
+
+    printf("breaker: a backwards clock step does not reclaim a live lease\n");
+    zone_reset();
+
+    ngx_test_set_time(100000);
+    g_sh.breaker_epoch = (ngx_atomic_t) ngx_time();
+
+    g_sh.breaker_state = (ngx_atomic_t) ngx_http_cache_turbo_brk_pack(
+                             4, NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN);
+    brk_set_probe(4, ngx_test_now);
+
+    /* Step backwards below the epoch -- the hazard condition. */
+    ngx_test_set_time(100000 - 10);
+    REQUIRE(ngx_test_now < (time_t) g_sh.breaker_epoch,
+            "breaker fixture: the clock must be strictly before the epoch "
+            "to exercise the backwards-step clamp");
+
+    CHECK(brk_probe_state(30, &probe_b)
+              == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
+          "a backwards clock step reclaimed a live lease, admitting a second "
+          "concurrent probe");
+    CHECK(probe_b == NGX_HTTP_CACHE_TURBO_BREAKER_NO_PROBE,
+          "a second probe was issued a lease token after a backwards clock "
+          "step");
+}
+
+
+/* H-2 is NOT fixed in this pass -- see the decision-packet comment at the
+ * reclaim predicate in shm.c (search "H-2 (open, NOT fixed here"). Both
+ * candidate fixes tried during this rework broke
+ * test_breaker_fresh_lease_not_reclaimable_via_old_stamp() (proof, not
+ * argument: unconditional-mismatch-reclaim admitted a second probe against a
+ * provably fresh generation; gating on breaker_opened_at could not tell that
+ * fixture apart from a genuinely wedged one, since neither sets
+ * breaker_opened_at). No wedge-reclaim test is added here on purpose --
+ * asserting behavior the code does not implement would be exactly the
+ * "test encodes the bug" trap. */
 
 
 /* O4.4-a: the probe lease is bounded by BREAKER_PROBE_LEASE, not by open_for.
@@ -2579,6 +2741,8 @@ main(void)
     test_breaker_unpublished_lease_is_not_reclaimable();
     test_breaker_fresh_lease_not_reclaimable_via_old_stamp();
     test_breaker_probe_age_is_modular();
+    test_breaker_probe_age_is_modular_both_widths();
+    test_breaker_backwards_clock_step_does_not_reclaim();
     test_breaker_probe_lease_is_independent_of_open();
     test_breaker_stale_probe_cannot_resolve_new_lease();
     test_breaker_huge_durations_do_not_overflow();

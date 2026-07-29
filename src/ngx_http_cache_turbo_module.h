@@ -574,7 +574,9 @@ typedef struct {
  * lease window, which one-promotion-per-open-window cannot reach.
  *
  * Pinned by test_breaker_fresh_lease_not_reclaimable_via_old_stamp() and
- * ci/tests/unit/extract_shm.sh.
+ * ci/tests/unit/check_constants.sh (H-4: NOT extract_shm.sh, which slices
+ * function bodies, not these macros -- check_constants.sh is the one that
+ * diffs mirrored constant VALUES against this header).
  */
 #define NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_WORD_BITS \
     ((ngx_uint_t) (sizeof(ngx_atomic_t) * 8))
@@ -590,6 +592,18 @@ typedef struct {
  * instantly reclaimable. That is reached by uptime alone, not by an attacker.
  * Modular subtraction is correct because a real lease age is always far smaller
  * than the field. */
+/* H-1: an undefined NGX_PTR_SIZE must be a hard build error here, not a
+ * silent fallback to the narrow layout. NGX_PTR_SIZE normally comes from
+ * nginx's own objs/ngx_auto_config.h; any build that reaches this point
+ * without it (e.g. a unit-test harness that forgot to define it) would
+ * otherwise silently compile the WRONG packed-word layout -- exactly the
+ * defect this #error replaces. See the mirrored guard in
+ * ci/tests/unit/test_shm_state.c and the definition site in
+ * ci/tests/unit/ngx_shim_shm.h. */
+#if !defined(NGX_PTR_SIZE)
+#error "NGX_PTR_SIZE is not defined -- cannot select the breaker probe word layout"
+#endif
+
 #if (NGX_PTR_SIZE >= 8)
 #define NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_STAMP_BITS  32
 #else
