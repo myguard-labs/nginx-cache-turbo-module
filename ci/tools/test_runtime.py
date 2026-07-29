@@ -323,7 +323,8 @@ class Origin:
     def __init__(self, port: int, delay: float = 0.0) -> None:
         self.port = port
         self.delay = delay
-        # The suite-wide baseline (run_all builds the Origin with delay=0.05).
+        # The suite-wide baseline (main() and run_named.main() both construct
+        # the Origin with delay=0.05).
         # Tests that borrow `delay` for a slow-miss window MUST restore to this,
         # not to a hardcoded 0.0 -- several burst tests downstream depend on a
         # non-zero regeneration window to be non-vacuous. See reset_delay().
@@ -348,7 +349,7 @@ class Origin:
         """Restore `delay` to the suite baseline after a test borrowed it.
 
         ⚠ Restoring to a hardcoded 0.0 instead is a SILENT test-weakening bug,
-        and it shipped: run_all builds the Origin with delay=0.05, the autotune
+        and it shipped: the Origin is constructed with delay=0.05, the autotune
         tests set it to 0.04 and reset it to 0.0, and every burst test after
         them then ran against an INSTANT origin. With no regeneration window
         left, a single-flight winner fills L1 before the other threads issue, so
