@@ -1453,6 +1453,16 @@ typedef struct {
      * ref_data = NULL. Only taken when the breaker is actually enabled --
      * threshold == 0 skips the memcpy entirely, so "breaker off" stays free. */
     unsigned                 brk_armed:1;     /* a breaker fallback is stashed  */
+
+    /* P6/O4.3-c: arming was ATTEMPTED, independent of whether the fallback is
+     * still held. brk_armed cannot serve as the once-per-request guard on its
+     * own any more: the gate clears it when it drops a pin nothing can consume,
+     * and a PASS request does not stop there -- it falls through to claim() and
+     * cold_wait(), whose every re-poll re-enters this handler from the top.
+     * Guarding on brk_armed alone would then re-register a pool cleanup and
+     * re-acquire the blob on each poll, for the whole lock_timeout. This latch
+     * is set once and never cleared, which is what sie_armed relies on too. */
+    unsigned                 brk_arm_done:1;  /* arming already attempted       */
     u_char                  *brk_snap;        /* blob bytes, any age            */
     size_t                   brk_snap_len;
     /* PERF: when non-NULL, brk_snap points into the shm slab and this holds the

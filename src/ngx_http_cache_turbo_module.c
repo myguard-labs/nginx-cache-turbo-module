@@ -4570,14 +4570,16 @@ ngx_http_cache_turbo_brk_ref_drop(ngx_http_cache_turbo_ctx_t *ctx,
 {
     ngx_http_cache_turbo_blob_cln_t  *cc = ctx->brk_cln;
 
-    if (cc == NULL || cc->data == NULL) {
-        return;
+    /* Only an L1 arming holds a slab reference. An L2 arming points at
+     * ctx->l2_blob, which lives in r->pool and needs no release -- but it must
+     * still be disarmed below, or this function is idempotent for one arming
+     * source and not the other. */
+    if (cc != NULL && cc->data != NULL) {
+        ngx_http_cache_turbo_blob_release(z, cc->data);
+
+        /* Disarm: the cleanup still runs at pool destruction, as a no-op. */
+        cc->data = NULL;
     }
-
-    ngx_http_cache_turbo_blob_release(z, cc->data);
-
-    /* Disarm: the cleanup still runs at pool destruction, as a no-op. */
-    cc->data = NULL;
 
     ctx->brk_cln  = NULL;
     ctx->brk_ref  = NULL;
@@ -5016,7 +5018,7 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
          * The !brk_armed guard makes the park/resume re-entries idempotent (the
          * L2 GET and the cold-wait both re-enter this handler from the top),
          * exactly as !sie_armed does below. */
-        if (ctn->len > 0 && !ctx->brk_armed && clcf->breaker_threshold > 0) {
+        if (ctn->len > 0 && !ctx->brk_arm_done && clcf->breaker_threshold > 0) {
             /* PERF-7 style zero-copy arm: pin the blob in the slab under the
              * mutex we already hold instead of copying it. A full-blob memcpy
              * here would run on EVERY enabled request that finds an expired
@@ -5045,6 +5047,7 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
             if (ngx_http_cache_turbo_brk_ref_cleanup(r, z, ctn->data, &bcc)
                 == NGX_OK)
             {
+                ctx->brk_arm_done = 1;
                 ngx_http_cache_turbo_blob_acquire(ctn->data);
                 ctx->brk_snap = ctn->data;
                 ctx->brk_snap_len = ctn->len;
@@ -5162,7 +5165,7 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                  * is the L1-absent / L1-evicted case -- a peer's copy that is
                  * past its serveable window. Same any-age rule and same
                  * threshold off-switch as the L1 site above. */
-                if (!ctx->brk_armed && clcf->breaker_threshold > 0) {
+                if (!ctx->brk_arm_done && clcf->breaker_threshold > 0) {
                     /* No copy: ctx->l2_blob already lives in r->pool with the
                      * same lifetime as this request, so pointing at it is both
                      * correct and free. brk_ref stays NULL -- there is no shm
@@ -5170,6 +5173,7 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                     ctx->brk_snap = ctx->l2_blob;
                     ctx->brk_snap_len = ctx->l2_blob_len;
                     ctx->brk_ref = NULL;
+                    ctx->brk_arm_done = 1;
                     ctx->brk_armed = 1;
                     ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                                    "cache_turbo: breaker fallback armed from "
@@ -6394,9 +6398,10 @@ ngx_http_cache_turbo_serve(ngx_http_request_t *r, u_char *copy, size_t len,
      * STALE-BREAKER). NULL keeps the original HIT/STALE choice, which is what
      * every pre-O4.3 call site passes.
      *
-     * ⚠ Any override must still begin with a letter other than 'H': the
-     * $cache_turbo_status mapping in restore_response() folds on that first
-     * byte, so a value starting "H" would log a breaker serve as a fresh HIT. */
+     * The $cache_turbo_status mapping in restore_response() compares the
+     * reason EXACTLY against "HIT", so any override is safe -- including one
+     * that starts with 'H'. An earlier revision folded on the first byte, which
+     * would have logged such a value as a fresh HIT. */
     if (ngx_http_cache_turbo_restore_response(r, copy, len, stale,
             xcache != NULL ? xcache : (stale ? "STALE" : "HIT"),
             &body, &body_len) != NGX_OK)
