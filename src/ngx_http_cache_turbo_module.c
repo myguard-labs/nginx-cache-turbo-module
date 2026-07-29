@@ -4497,7 +4497,16 @@ ngx_http_cache_turbo_blob_cleanup(void *data)
 {
     ngx_http_cache_turbo_blob_cln_t  *c = data;
 
+    /* O4.3-c: c->data == NULL means the reference was already dropped early --
+     * see the breaker gate, which releases a fallback nothing can consume once
+     * its verdict is known. Pool cleanups cannot be unregistered, so disarming
+     * one is exactly this: clear the payload and let it run as a no-op. */
+    if (c->data == NULL) {
+        return;
+    }
+
     ngx_http_cache_turbo_blob_release(c->z, c->data);
+    c->data = NULL;
 }
 
 
@@ -4519,7 +4528,8 @@ ngx_http_cache_turbo_blob_cleanup(void *data)
  */
 static ngx_int_t
 ngx_http_cache_turbo_brk_ref_cleanup(ngx_http_request_t *r,
-    ngx_http_cache_turbo_zone_t *z, u_char *data)
+    ngx_http_cache_turbo_zone_t *z, u_char *data,
+    ngx_http_cache_turbo_blob_cln_t **out)
 {
     ngx_pool_cleanup_t               *cln;
     ngx_http_cache_turbo_blob_cln_t  *cc;
@@ -4535,7 +4545,45 @@ ngx_http_cache_turbo_brk_ref_cleanup(ngx_http_request_t *r,
     cc->z = z;
     cc->data = data;
 
+    /* O4.3-c: hand the record back so the caller can drop the reference early
+     * (see ngx_http_cache_turbo_brk_ref_drop). Optional -- pass NULL when the
+     * pool-lifetime drop is all that is wanted. */
+    if (out != NULL) {
+        *out = cc;
+    }
+
     return NGX_OK;
+}
+
+
+/*
+ * O4.3-c: drop a breaker fallback's slab reference NOW rather than at request
+ * teardown, and disarm the pool cleanup that would otherwise drop it again.
+ *
+ * Called once the gate's verdict rules out a fallback serve. Idempotent, and
+ * safe to call with nothing armed. See ctx->brk_cln for why holding the pin to
+ * pool destruction is a reclamation hazard.
+ */
+static void
+ngx_http_cache_turbo_brk_ref_drop(ngx_http_cache_turbo_ctx_t *ctx,
+    ngx_http_cache_turbo_zone_t *z)
+{
+    ngx_http_cache_turbo_blob_cln_t  *cc = ctx->brk_cln;
+
+    if (cc == NULL || cc->data == NULL) {
+        return;
+    }
+
+    ngx_http_cache_turbo_blob_release(z, cc->data);
+
+    /* Disarm: the cleanup still runs at pool destruction, as a no-op. */
+    cc->data = NULL;
+
+    ctx->brk_cln  = NULL;
+    ctx->brk_ref  = NULL;
+    ctx->brk_snap = NULL;
+    ctx->brk_snap_len = 0;
+    ctx->brk_armed = 0;
 }
 
 
@@ -4992,13 +5040,16 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
              * only valid while the mutex is held -- letting a concurrent
              * evict/refresh/purge detach the blob and our own release then free
              * it, leaving the SIE block below dereferencing freed slab. */
-            if (ngx_http_cache_turbo_brk_ref_cleanup(r, z, ctn->data)
+            ngx_http_cache_turbo_blob_cln_t  *bcc = NULL;
+
+            if (ngx_http_cache_turbo_brk_ref_cleanup(r, z, ctn->data, &bcc)
                 == NGX_OK)
             {
                 ngx_http_cache_turbo_blob_acquire(ctn->data);
                 ctx->brk_snap = ctn->data;
                 ctx->brk_snap_len = ctn->len;
                 ctx->brk_ref = ctn->data;
+                ctx->brk_cln = bcc;
                 ctx->brk_armed = 1;
 
                 ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
@@ -5259,7 +5310,7 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
         if (ngx_http_cache_turbo_breaker_should_consult(clcf->enable,
                 clcf->breaker_threshold)
             && ctx->brk_armed
-            && (ngx_uint_t) z->sh->breaker_state
+            && ngx_http_cache_turbo_brk_state(z->sh->breaker_state)
                    == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN)
         {
             (void) ngx_atomic_fetch_add(&z->sh->stale_serves, 1);
@@ -5358,6 +5409,40 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
         }
 
         bact = ctx->brk_action;
+
+        /* ⚠ O4.3-c (Codex F2): the probe leaves for the origin HERE, before
+         * min_uses, claim(), the cross-node NX lock and cold_wait() -- every
+         * one of which can park this request and resume it at the top of the
+         * handler, where the L1 and L2 serve paths return BEFORE this gate and
+         * brk_consulted stops the gate re-running. A parked probe answered from
+         * a peer's fill never touches the origin, records no outcome, and
+         * leaves the breaker HALF_OPEN until its lease expires -- the recovery
+         * window is spent on a request that learned nothing.
+         *
+         * NGX_DECLINED is the handler's ordinary "carry on to the upstream"
+         * return, the same one the fall-through below reaches; taking it early
+         * simply skips the machinery that could divert us. */
+        if (bact == NGX_HTTP_CACHE_TURBO_BRK_ACT_PROBE) {
+            /* O4.3-c (F3): this request is going to the origin and can never
+             * consume its armed fallback, so release the slab pin now instead
+             * of holding it for the whole upstream round trip. */
+            ngx_http_cache_turbo_brk_ref_drop(ctx, z);
+            ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                           "cache_turbo: breaker probe bypasses single-flight "
+                           "\"%V\" key=%ui -> origin",
+                           &r->uri, (ngx_uint_t) hash);
+            return NGX_DECLINED;
+        }
+
+        /* O4.3-c (F3): same for an ordinary CLOSED-breaker request -- it falls
+         * through to the origin below and will not serve the fallback either.
+         * Only ACT_SERVE consumes it, and ACT_FAIL has nothing armed by
+         * definition (it is the no-body verdict). Holding these pins across a
+         * slow upstream is what lets an evictor drain the zone's LRU without
+         * reclaiming any blob storage. */
+        if (bact == NGX_HTTP_CACHE_TURBO_BRK_ACT_PASS) {
+            ngx_http_cache_turbo_brk_ref_drop(ctx, z);
+        }
 
         if (bact != NGX_HTTP_CACHE_TURBO_BRK_ACT_PASS) {
 
@@ -6797,6 +6882,15 @@ ngx_http_cache_turbo_breaker_should_consult(ngx_uint_t enable,
 static ngx_uint_t
 ngx_http_cache_turbo_breaker_action(ngx_uint_t state, ngx_uint_t has_body)
 {
+    /* ⚠ O4.3-c: HALF_OPEN is returned ONLY to the request that won the
+     * promotion, and it is terminal -- that request owes the breaker an origin
+     * outcome, so it must reach the origin directly rather than falling through
+     * into the single-flight machinery, which can park it and answer it from
+     * cache on resume. See BRK_ACT_PROBE. */
+    if (state == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN) {
+        return NGX_HTTP_CACHE_TURBO_BRK_ACT_PROBE;
+    }
+
     if (state != NGX_HTTP_CACHE_TURBO_BREAKER_OPEN) {
         return NGX_HTTP_CACHE_TURBO_BRK_ACT_PASS;
     }

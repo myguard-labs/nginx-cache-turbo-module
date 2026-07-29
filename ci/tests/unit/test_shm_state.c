@@ -86,6 +86,22 @@ typedef struct {
 #define NGX_HTTP_CACHE_TURBO_BREAKER_OPEN       1
 #define NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN  2
 
+/* P6/O4.3-c: breaker_state is a packed [ generation | state ] word, so that a
+ * lease can be identified by a generation that every transition CASes as part
+ * of the same atomic value. Mirrored from the header; extract_shm.sh pins the
+ * two copies against each other. Rationale lives on the header definition. */
+#define NGX_HTTP_CACHE_TURBO_BREAKER_STATE_BITS  2
+#define NGX_HTTP_CACHE_TURBO_BREAKER_STATE_MASK \
+    ((ngx_uint_t) ((1U << NGX_HTTP_CACHE_TURBO_BREAKER_STATE_BITS) - 1))
+
+#define ngx_http_cache_turbo_brk_state(w) \
+    ((ngx_uint_t) (w) & NGX_HTTP_CACHE_TURBO_BREAKER_STATE_MASK)
+#define ngx_http_cache_turbo_brk_gen(w) \
+    ((ngx_uint_t) (w) >> NGX_HTTP_CACHE_TURBO_BREAKER_STATE_BITS)
+#define ngx_http_cache_turbo_brk_pack(gen, st)                                \
+    (((ngx_uint_t) (gen) << NGX_HTTP_CACHE_TURBO_BREAKER_STATE_BITS)          \
+     | ((ngx_uint_t) (st) & NGX_HTTP_CACHE_TURBO_BREAKER_STATE_MASK))
+
 /* P6/O4.3 serve-path actions. PASS == 0 is load-bearing for the same reason
  * CLOSED == 0 is: the safe direction for a zeroed value is "the breaker does
  * not interfere". extract_shm.sh pins these against the header too. */
@@ -96,6 +112,8 @@ typedef struct {
 #define NGX_HTTP_CACHE_TURBO_BRK_ACT_PASS   0
 #define NGX_HTTP_CACHE_TURBO_BRK_ACT_SERVE  1
 #define NGX_HTTP_CACHE_TURBO_BRK_ACT_FAIL   2
+/* O4.3-c: the promoted probe. Terminal and DISTINCT from PASS -- see header. */
+#define NGX_HTTP_CACHE_TURBO_BRK_ACT_PROBE  3
 
 /* P6/O4.2: the only nginx status constant the sliced origin-failure predicate
  * needs. Same value as nginx's own; check_constants.sh is not involved because
@@ -1089,6 +1107,145 @@ test_breaker_probe_success_closes(void)
 }
 
 
+/* O4.3-c/F1 -- the lease token must be bound to the GENERATION it was issued
+ * for, not merely to "some HALF_OPEN". Codex review of PR #135.
+ *
+ * ⚠ WHY THIS TEST CONSTRUCTS THE STATE INSTEAD OF DRIVING IT. Both F1 schedules
+ * are windows INSIDE one function -- the gap between the promotion CAS and the
+ * probe_at store, and a state-only CAS that carries no generation. A
+ * single-threaded harness calls those functions atomically and can never
+ * observe either window by ordinary driving. The first formulation of this test
+ * tried exactly that (promote A, let its lease go stale, promote B, then record
+ * A) and PASSED against the unfixed code: every promotion overwrites probe_at,
+ * so with the clock advanced between A and B the existing stamp comparison
+ * already rejects A. It certified a case the shipped token handles and said
+ * nothing about F1.
+ *
+ * So the fixture below writes the shm fields directly to construct the exact
+ * inconsistent state a concurrent worker WOULD observe, then asks the real
+ * function for its verdict -- the same technique the O4.1-a negative control
+ * already uses. The state is reachable in production; only the schedule that
+ * produces it is unreachable here.
+ *
+ * Schedule 1 (unsafe publication): worker A wins OPEN -> HALF_OPEN and is
+ * descheduled BEFORE `breaker_probe_at = now`. Worker B now observes HALF_OPEN
+ * paired with the PREVIOUS lease's stamp -- necessarily old, and zero on the
+ * very first lease. B computes that lease as long expired, reclaims it, and is
+ * promoted itself. Two live probes against a dead origin, which is the precise
+ * herd this breaker exists to prevent. */
+static void
+test_breaker_unpublished_lease_is_not_reclaimable(void)
+{
+    ngx_uint_t  probe_b;
+
+    printf("breaker: a lease whose stamp is not yet published is not stale\n");
+    zone_reset();
+    ngx_test_set_time(1000);
+
+    /* Construct A's half-published promotion: HALF_OPEN is visible, the stamp
+     * still holds the zeroed-zone value it had before the CAS. */
+    g_sh.breaker_state    = NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN;
+    g_sh.breaker_probe_at = 0;
+
+    /* B arrives. It must NOT read this as an abandoned lease: A holds a live
+     * probe and is simply between two stores. */
+    CHECK(brk_probe_state(30, &probe_b)
+              == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
+          "a half-published lease was reclaimed as stale, admitting a second "
+          "concurrent probe");
+    CHECK(probe_b == NGX_HTTP_CACHE_TURBO_BREAKER_NO_PROBE,
+          "a second probe was issued a lease token while the first was still "
+          "live");
+}
+
+
+/* O4.3-c/F1 schedule 2 (state-only CAS -> ABA): probe A validates its token and
+ * is descheduled. Its lease is reclaimed, a replacement probe B is promoted,
+ * and only then does A's CAS land. The CAS tests HALF_OPEN -> CLOSED and
+ * nothing else, so it succeeds against B's generation.
+ *
+ * A's success closes a breaker that only A -- whose evidence predates the
+ * replacement lease entirely -- ever tested, releasing the herd toward an
+ * origin the current probe has not answered for.
+ *
+ * Constructed the same way and for the same reason as the test above: the
+ * fixture rebuilds the state in which A's token is stale-but-equal, which is
+ * what a bare stamp comparison cannot distinguish. Both leases are stamped in
+ * the SAME second on purpose -- that is the collision the shipped comparison
+ * misses, and advancing the clock between them is what made the first version
+ * of this test vacuous. */
+static void
+test_breaker_stale_probe_cannot_resolve_new_lease(void)
+{
+    ngx_uint_t  probe_a;
+
+    printf("breaker: a stale probe cannot resolve a later lease (ABA)\n");
+    zone_reset();
+    ngx_test_set_time(1000);
+
+    brk_record(0, 1, 60);
+    ngx_test_advance_time(31);
+    REQUIRE(brk_probe_state(30, &probe_a)
+                == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN,
+            "breaker fixture: expected probe A to be promoted");
+    REQUIRE(probe_a != NGX_HTTP_CACHE_TURBO_BREAKER_NO_PROBE,
+            "breaker fixture: probe A was issued no token");
+
+    /* A's lease is reclaimed and a replacement probe is promoted while A is
+     * still in flight. Constructed directly: a NEW generation, stamped in the
+     * SAME wall-clock second A was. The stamp is therefore identical, so a
+     * comparison against breaker_probe_at cannot tell the two leases apart --
+     * only a generation carried by the resolving CAS can. */
+    g_sh.breaker_state    = (ngx_atomic_t) ngx_http_cache_turbo_brk_pack(
+                                ngx_http_cache_turbo_brk_gen(
+                                    g_sh.breaker_state) + 1,
+                                NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN);
+
+    /* ⚠ The two preconditions this test rests on. Without them it passes for
+     * the wrong reason: an unequal stamp would let the OLD stamp comparison
+     * reject A on its own, and an equal generation would mean no replacement
+     * lease was actually constructed. */
+    REQUIRE((ngx_uint_t) g_sh.breaker_probe_at == (ngx_uint_t) ngx_test_now,
+            "breaker fixture: the replacement lease is not stamp-equal to A's, "
+            "so this test cannot distinguish a generation from a stamp check");
+    REQUIRE(ngx_http_cache_turbo_brk_gen(g_sh.breaker_state) != probe_a,
+            "breaker fixture: the replacement lease reuses A's generation, so "
+            "there is no superseded lease to test");
+
+    /* A's success finally lands, naming a lease that has since been replaced. */
+    ngx_http_cache_turbo_shm_breaker_record(&g_zone, 1, 1, 60, probe_a);
+
+    CHECK(brk_state(30)
+              == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
+          "a stale probe's success closed a replacement lease it did not own");
+
+    /* Symmetric: a stale FAILURE must not cancel the replacement lease either,
+     * which would push recovery out by another full window on evidence that
+     * belongs to a lease nobody is waiting on. */
+    zone_reset();
+    ngx_test_set_time(1000);
+    brk_record(0, 1, 60);
+    ngx_test_advance_time(31);
+    REQUIRE(brk_probe_state(30, &probe_a)
+                == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN,
+            "breaker fixture: expected probe A to be promoted");
+
+    g_sh.breaker_state     = (ngx_atomic_t) ngx_http_cache_turbo_brk_pack(
+                                 ngx_http_cache_turbo_brk_gen(
+                                     g_sh.breaker_state) + 1,
+                                 NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN);
+    g_sh.breaker_probe_at  = (ngx_atomic_t) ngx_test_now;
+    g_sh.breaker_opened_at = (ngx_atomic_t) ngx_test_now;
+
+    ngx_http_cache_turbo_shm_breaker_record(&g_zone, 0, 1, 60, probe_a);
+
+    CHECK(ngx_http_cache_turbo_brk_state(g_sh.breaker_state)
+              == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN,
+          "a stale probe's failure re-opened a replacement lease it did not "
+          "own");
+}
+
+
 /* threshold == 0 disables tripping entirely (the off switch O4.4's default
  * relies on). */
 static void
@@ -1357,16 +1514,23 @@ test_breaker_action_mapping(void)
      * open window, and that promotion is a lease only _record() releases.
      * Answering it from cache means no origin contact, so no outcome is ever
      * recorded and the breaker cannot close -- it re-promotes one doomed probe
-     * per window forever. This must be PASS even though a body is available,
-     * which is what makes it a different rule from the OPEN arm below. */
+     * per window forever. A body being available must not change that, which is
+     * what makes this a different rule from the OPEN arm below.
+     *
+     * ⚠ O4.3-c: this must be PROBE, not PASS. PASS states only "the breaker did
+     * not interfere" and lets the request fall through into min_uses, claim(),
+     * the NX lock and cold_wait() -- all of which can park it and let it return
+     * from a pre-gate cache serve on resume, which is the very outcome the
+     * paragraph above forbids. PROBE is terminal: the gate returns to the
+     * origin immediately. Restoring PASS here reinstates Codex F2. */
     CHECK(ngx_http_cache_turbo_breaker_action(
               NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN, 1)
-              == NGX_HTTP_CACHE_TURBO_BRK_ACT_PASS,
+              == NGX_HTTP_CACHE_TURBO_BRK_ACT_PROBE,
           "the HALF_OPEN probe was served from cache — nothing would reach the "
           "origin, so no outcome is recorded and the breaker wedges OPEN");
     CHECK(ngx_http_cache_turbo_breaker_action(
               NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN, 0)
-              == NGX_HTTP_CACHE_TURBO_BRK_ACT_PASS,
+              == NGX_HTTP_CACHE_TURBO_BRK_ACT_PROBE,
           "the HALF_OPEN probe was 503'd instead of probing the origin");
 
     /* OPEN: a body of ANY age beats a 503, and only its presence decides. */
@@ -1420,7 +1584,7 @@ test_breaker_probe_passes_and_recovery_completes(void)
     CHECK(state == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN,
           "no probe was promoted after the open window elapsed");
     act = ngx_http_cache_turbo_breaker_action(state, 1);
-    CHECK(act == NGX_HTTP_CACHE_TURBO_BRK_ACT_PASS,
+    CHECK(act == NGX_HTTP_CACHE_TURBO_BRK_ACT_PROBE,
           "the promoted probe did not reach the origin — with a body cached "
           "the serve path would answer it locally and the breaker would wedge");
 
@@ -1473,7 +1637,7 @@ test_breaker_only_the_probe_token_closes(void)
     /* A non-probe success -- an older in-flight request, or one served from a
      * peer's fill -- must NOT close the breaker. */
     brk_record(1, 3, 60);
-    CHECK((ngx_uint_t) g_zone.sh->breaker_state
+    CHECK(ngx_http_cache_turbo_brk_state(g_zone.sh->breaker_state)
               == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN,
           "a success WITHOUT the lease token closed the breaker — an outcome "
           "from a request that never probed would release the herd onto a "
@@ -1481,20 +1645,20 @@ test_breaker_only_the_probe_token_closes(void)
 
     /* A non-probe FAILURE must not re-stamp the window either. */
     brk_record(0, 3, 60);
-    CHECK((ngx_uint_t) g_zone.sh->breaker_state
+    CHECK(ngx_http_cache_turbo_brk_state(g_zone.sh->breaker_state)
               == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN,
           "a failure WITHOUT the lease token resolved the lease");
 
     /* A stale token from no lease at all is still refused. */
     other = probe + 12345;
     ngx_http_cache_turbo_shm_breaker_record(&g_zone, 1, 3, 60, other);
-    CHECK((ngx_uint_t) g_zone.sh->breaker_state
+    CHECK(ngx_http_cache_turbo_brk_state(g_zone.sh->breaker_state)
               == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN,
           "a WRONG lease token closed the breaker");
 
     /* The real owner closes it. */
     ngx_http_cache_turbo_shm_breaker_record(&g_zone, 1, 3, 60, probe);
-    CHECK((ngx_uint_t) g_zone.sh->breaker_state
+    CHECK(ngx_http_cache_turbo_brk_state(g_zone.sh->breaker_state)
               == NGX_HTTP_CACHE_TURBO_BREAKER_CLOSED,
           "the lease owner's success did not close the breaker");
 }
@@ -1522,7 +1686,7 @@ test_breaker_probe_token_reopens(void)
     ngx_http_cache_turbo_shm_breaker_record(
         &g_zone, !ngx_http_cache_turbo_breaker_is_origin_failure(502), 3, 60,
         probe);
-    CHECK((ngx_uint_t) g_zone.sh->breaker_state
+    CHECK(ngx_http_cache_turbo_brk_state(g_zone.sh->breaker_state)
               == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
           "the probe's failure did not re-open the breaker");
 
@@ -1567,7 +1731,7 @@ test_breaker_second_consult_loses_the_probe(void)
     CHECK(first == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN,
           "the first consult was not promoted to probe");
     CHECK(ngx_http_cache_turbo_breaker_action(first, 1)
-              == NGX_HTTP_CACHE_TURBO_BRK_ACT_PASS,
+              == NGX_HTTP_CACHE_TURBO_BRK_ACT_PROBE,
           "the promoted probe was not sent to the origin");
 
     /* The SAME request consulting again -- what an unlatched gate does on a
@@ -1583,7 +1747,7 @@ test_breaker_second_consult_loses_the_probe(void)
           "ever recorded and the breaker cannot close");
 
     /* Nothing closed the breaker, because the probe never reported. */
-    CHECK((ngx_uint_t) g_zone.sh->breaker_state
+    CHECK(ngx_http_cache_turbo_brk_state(g_zone.sh->breaker_state)
               == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN,
           "the breaker left the half-open lease unexpectedly");
 }
@@ -1737,7 +1901,7 @@ run_negative_controls(void)
         first = brk_state(30);
 
         /* the bug: hand back whatever is stored, with no winner check. */
-        second = (ngx_uint_t) g_sh.breaker_state;
+        second = ngx_http_cache_turbo_brk_state(g_sh.breaker_state);
 
         caught = (first == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN
                   && second == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN);
@@ -1942,6 +2106,8 @@ main(void)
     test_breaker_probe_success_closes();
     test_breaker_abandoned_probe_lease_recovers();
     test_breaker_stale_success_does_not_close();
+    test_breaker_unpublished_lease_is_not_reclaimable();
+    test_breaker_stale_probe_cannot_resolve_new_lease();
     test_breaker_threshold_zero_never_trips();
     test_breaker_zero_window_never_trips();
     test_breaker_state_strings();

@@ -491,6 +491,46 @@ typedef struct {
 #define NGX_HTTP_CACHE_TURBO_BREAKER_OPEN       1  /* origin dead: do not call */
 #define NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN  2  /* one probe in flight      */
 
+/*
+ * P6/O4.3-c -- breaker_state is a PACKED word: [ generation | state ].
+ *
+ * The state alone is not enough to identify a LEASE. Publishing HALF_OPEN and
+ * stamping the lease were two separate stores, and resolving it was a CAS on
+ * the state enum only, which left two ABA holes (Codex review, PR #135):
+ *
+ *   - a worker could observe HALF_OPEN paired with the PREVIOUS lease's stamp
+ *     -- necessarily old, zero on the first lease -- read it as abandoned, and
+ *     reclaim a lease that was merely mid-publication; and
+ *   - a probe descheduled after validating its token could have its
+ *     HALF_OPEN -> CLOSED CAS land against a REPLACEMENT lease's generation,
+ *     closing a breaker only the stale probe ever tested.
+ *
+ * Folding a generation counter into the same atomic word closes both: every
+ * promotion bumps it, and every reclaim and resolution CASes the whole word, so
+ * a transition belonging to a superseded lease cannot succeed. The generation
+ * IS the lease token handed to the promoted request -- breaker_probe_at stays
+ * only as the lease DEADLINE, never as identity.
+ *
+ * ⚠ CLOSED == 0 and generation 0 make a zeroed word read CLOSED, preserving the
+ * fail-safe direction documented above. The generation is deliberately allowed
+ * to wrap: at one promotion per open window it cannot realistically reach 2^62,
+ * and a wrap is harmless anyway -- it would have to coincide exactly with an
+ * outcome in flight from 2^62 leases ago.
+ *
+ * Pinned by ci/tests/unit/extract_shm.sh and the ABA tests in test_shm_state.c.
+ */
+#define NGX_HTTP_CACHE_TURBO_BREAKER_STATE_BITS  2
+#define NGX_HTTP_CACHE_TURBO_BREAKER_STATE_MASK \
+    ((ngx_uint_t) ((1U << NGX_HTTP_CACHE_TURBO_BREAKER_STATE_BITS) - 1))
+
+#define ngx_http_cache_turbo_brk_state(w) \
+    ((ngx_uint_t) (w) & NGX_HTTP_CACHE_TURBO_BREAKER_STATE_MASK)
+#define ngx_http_cache_turbo_brk_gen(w) \
+    ((ngx_uint_t) (w) >> NGX_HTTP_CACHE_TURBO_BREAKER_STATE_BITS)
+#define ngx_http_cache_turbo_brk_pack(gen, st)                                \
+    (((ngx_uint_t) (gen) << NGX_HTTP_CACHE_TURBO_BREAKER_STATE_BITS)          \
+     | ((ngx_uint_t) (st) & NGX_HTTP_CACHE_TURBO_BREAKER_STATE_MASK))
+
 /* P6/O4.3 serve-path actions, the verdict of
  * ngx_http_cache_turbo_breaker_action(). PASS is the only one that lets the
  * request reach the origin.
@@ -504,9 +544,23 @@ typedef struct {
  * never match a live lease. */
 #define NGX_HTTP_CACHE_TURBO_BREAKER_NO_PROBE  0
 
-#define NGX_HTTP_CACHE_TURBO_BRK_ACT_PASS   0  /* go to origin (incl. the probe) */
+#define NGX_HTTP_CACHE_TURBO_BRK_ACT_PASS   0  /* fall through, ordinary request */
 #define NGX_HTTP_CACHE_TURBO_BRK_ACT_SERVE  1  /* serve the fallback body        */
 #define NGX_HTTP_CACHE_TURBO_BRK_ACT_FAIL   2  /* 503 + Retry-After, no origin   */
+/*
+ * P6/O4.3-c: the promoted probe. DISTINCT from PASS because the probe must go
+ * to the origin DIRECTLY -- PASS merely falls through, and everything after the
+ * breaker gate (min_uses, claim(), the cross-node NX lock, cold_wait()) can
+ * park the request and resume it. On resume the L1 fresh/stale and L2-HIT
+ * returns sit BEFORE the gate, and brk_consulted keeps the gate from running a
+ * second time, so the lease holder could be answered from a peer's fill without
+ * ever contacting the origin -- burning the lease, recording no outcome
+ * (_serve() sets ctx->served, and the header filter skips _breaker_record()),
+ * and leaving the breaker HALF_OPEN until the lease expires.
+ *
+ * Collapsing this back into PASS reintroduces exactly that (Codex F2, PR #135).
+ */
+#define NGX_HTTP_CACHE_TURBO_BRK_ACT_PROBE  3  /* the probe: origin, directly    */
 
 /* protected_pct bounds for cache_turbo_scan_resistant (range-checked setter,
  * NOT ngx_conf_set_num_slot -- a literal 0 must be a config error, not a
@@ -1411,6 +1465,18 @@ typedef struct {
      * workers on a 1 MiB-default (configurable) copy exactly during the outage
      * this feature exists to smooth over. */
     u_char                  *brk_ref;         /* pinned shm blob, or NULL       */
+
+    /* P6/O4.3-c: the cleanup record that owns brk_ref's reference, so the
+     * breaker gate can DROP that reference as soon as its verdict rules out a
+     * fallback serve, instead of holding it until the request pool is
+     * destroyed. Most armed requests fall through to the origin, and on a slow
+     * upstream those pins accumulate: an evictor can then unlink an entry's LRU
+     * metadata and still not reclaim its blob, so the zone drains without
+     * freeing space (Codex F3, PR #135). NULL once dropped or never armed.
+     *
+     * void * because ngx_http_cache_turbo_blob_cln_t is private to module.c,
+     * which is the only file that dereferences this. */
+    void                    *brk_cln;
 
     /* P6/O4.3: the pre-origin gate's verdict, latched on first consult.
      *
