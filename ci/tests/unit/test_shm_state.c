@@ -148,6 +148,22 @@ typedef struct {
     ngx_slab_pool_t               *shpool;
 } ngx_http_cache_turbo_zone_t;
 
+/* O4.4: minimal loc_conf shim for ngx_http_cache_turbo_breaker_should_consult().
+ * Only the four fields the predicate reads need to exist, and only by NAME --
+ * the sliced function is compiled against THIS struct, not the real one, so
+ * field ORDER/offsets don't need to match, just the names the predicate
+ * dereferences (clcf->enable, clcf->breaker_enable, clcf->breaker_threshold,
+ * clcf->breaker_window). Kept deliberately tiny rather than mirroring the full
+ * ~1300-line production loc_conf. */
+typedef struct {
+    ngx_int_t    enable;         /* ngx_flag_t in the real loc_conf; the shim
+                                   * doesn't pull in ngx_conf_file.h, and the
+                                   * predicate only tests truthiness. */
+    ngx_int_t    breaker_enable;
+    ngx_uint_t   breaker_threshold;
+    time_t       breaker_window;
+} ngx_http_cache_turbo_loc_conf_t;
+
 /* claim() verdicts -- values are not asserted on, only distinctness matters. */
 #define NGX_HTTP_CACHE_TURBO_CLAIM_FRESH    0
 #define NGX_HTTP_CACHE_TURBO_CLAIM_WINNER   1
@@ -1677,27 +1693,81 @@ test_breaker_should_record_admission(void)
 }
 
 
-/* P6/O4.3: the pre-origin gate's admission rule. Same shape and same reason as
- * the O4.2 recording admission above -- the serve path must drive the real
- * predicate, not a restatement of it. */
+/* P6/O4.3-O4.4: the pre-origin gate's admission rule. Same shape and same
+ * reason as the O4.2 recording admission above -- the serve path must drive
+ * the real predicate, not a restatement of it.
+ *
+ * O4.4 regression pin: this is the ONLY test that calls the real
+ * ngx_http_cache_turbo_breaker_should_consult() function directly rather than
+ * through a config-parse test. Config-parse tests can prove a directive is
+ * ACCEPTED; they cannot prove the predicate a config value feeds is correct,
+ * nor that a call site was wired to it at all -- see extract_shm.sh's
+ * brk_consulted latch guard for the complementary "was it wired" check on the
+ * pre-origin gate specifically. Each CHECK below independently zeroes exactly
+ * one of the four required conditions to prove the predicate is a genuine AND
+ * of all four, not e.g. an OR, or a predicate that silently ignores one
+ * input. */
 static void
 test_breaker_should_consult_admission(void)
 {
-    printf("breaker/O4.3: the serve path consults the breaker only when on\n");
+    ngx_http_cache_turbo_loc_conf_t  clcf;
 
-    CHECK(ngx_http_cache_turbo_breaker_should_consult(1, 3),
-          "an enabled breaker was not consulted on the pre-origin path");
+    printf("breaker/O4.3-O4.4: the serve path consults the breaker only "
+           "when ALL FOUR of enable/breaker_enable/threshold/window hold\n");
+
+    /* All four true -> consult. */
+    clcf.enable = 1;
+    clcf.breaker_enable = 1;
+    clcf.breaker_threshold = 3;
+    clcf.breaker_window = 60;
+    CHECK(ngx_http_cache_turbo_breaker_should_consult(&clcf),
+          "an enabled breaker (all four conditions true) was not consulted "
+          "on the pre-origin path");
+
+    /* clcf->enable off (module disabled here) -> never consult, even if every
+     * breaker-specific field says on. */
+    clcf.enable = 0;
+    clcf.breaker_enable = 1;
+    clcf.breaker_threshold = 3;
+    clcf.breaker_window = 60;
+    CHECK(!ngx_http_cache_turbo_breaker_should_consult(&clcf),
+          "the breaker was consulted in a location where cache_turbo itself "
+          "is off");
+
+    /* cache_turbo_breaker off -> never consult, even with a configured
+     * threshold/window (an operator who left the breaker off but set the
+     * tuning knobs must NOT get it silently switched on). */
+    clcf.enable = 1;
+    clcf.breaker_enable = 0;
+    clcf.breaker_threshold = 3;
+    clcf.breaker_window = 60;
+    CHECK(!ngx_http_cache_turbo_breaker_should_consult(&clcf),
+          "the breaker was consulted with cache_turbo_breaker off — "
+          "breaker_enable must be an independent off-switch");
 
     /* ⚠ Not merely an optimisation. _breaker_state() PERFORMS the due
-     * OPEN -> HALF_OPEN promotion, and the O4.2 recording site is gated on the
-     * same threshold, so consulting it while disabled would promote a probe
-     * that nothing can ever report an outcome for. */
-    CHECK(!ngx_http_cache_turbo_breaker_should_consult(1, 0),
-          "a disabled breaker (threshold 0) was consulted — the state call is "
-          "not a pure getter, so this drives a state machine nothing feeds");
+     * OPEN -> HALF_OPEN promotion, and the O4.2/O4.4 recording site is gated
+     * on this same predicate, so consulting it while disabled would promote a
+     * probe that nothing can ever report an outcome for. */
+    clcf.enable = 1;
+    clcf.breaker_enable = 1;
+    clcf.breaker_threshold = 0;
+    clcf.breaker_window = 60;
+    CHECK(!ngx_http_cache_turbo_breaker_should_consult(&clcf),
+          "a disabled breaker (threshold 0) was consulted — the state call "
+          "is not a pure getter, so this drives a state machine nothing "
+          "feeds");
 
-    CHECK(!ngx_http_cache_turbo_breaker_should_consult(0, 3),
-          "the breaker was consulted in a location where cache_turbo is off");
+    /* window 0 -> never consult, even with a real threshold: a trip count
+     * with no rolling window to count it over is a meaningless config, and
+     * must be as inert as threshold 0. */
+    clcf.enable = 1;
+    clcf.breaker_enable = 1;
+    clcf.breaker_threshold = 3;
+    clcf.breaker_window = 0;
+    CHECK(!ngx_http_cache_turbo_breaker_should_consult(&clcf),
+          "a disabled breaker (window 0) was consulted — window is one of "
+          "the three independent off-switches, not a pure tuning knob");
 }
 
 

@@ -304,7 +304,7 @@ FNS=$(grep -cE '^ngx_http_cache_turbo_[a-z_]+\(' "$OUT")
 #
 # Checked against module.c rather than the slice: the gate lives in the access
 # handler, which is not extracted. Comments stripped first, as everywhere here.
-if ! sed -n '/breaker_should_consult(clcf->enable/,/^    }$/p' "$MODSRC" \
+if ! sed -n '/^    if (ngx_http_cache_turbo_breaker_should_consult(clcf))$/,/^    }$/p' "$MODSRC" \
    | sed -E 's;/\*.*;;; s;^[[:space:]]*\*.*;;' \
    | grep -q 'brk_consulted'; then
     echo "✗ O4.3 regression: the pre-origin breaker gate lost its" >&2

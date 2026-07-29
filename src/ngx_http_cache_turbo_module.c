@@ -43,8 +43,10 @@ static ngx_int_t ngx_http_cache_turbo_send_body(ngx_http_request_t *r,
  * that calls them. */
 static ngx_int_t ngx_http_cache_turbo_add_header(ngx_http_request_t *r,
     u_char *name, size_t nlen, u_char *val, size_t vlen);
-static ngx_uint_t ngx_http_cache_turbo_breaker_should_consult(ngx_uint_t enable,
-    ngx_uint_t threshold);
+static ngx_uint_t ngx_http_cache_turbo_breaker_should_consult(
+    ngx_http_cache_turbo_loc_conf_t *clcf);
+static char *ngx_http_cache_turbo_breaker_open_conf(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
 static ngx_uint_t ngx_http_cache_turbo_breaker_action(ngx_uint_t state,
     ngx_uint_t has_body);
 static ngx_int_t ngx_http_cache_turbo_restore_response(ngx_http_request_t *r,
@@ -360,6 +362,51 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       ngx_http_cache_turbo_use_stale,
       NGX_HTTP_LOC_CONF_OFFSET,
       0,
+      NULL },
+
+    /* O4.4: the circuit-breaker directives. Three independent ways to turn
+     * the breaker off: this flag, `cache_turbo_breaker_threshold 0`, or
+     * `cache_turbo_breaker_window 0` -- see
+     * ngx_http_cache_turbo_breaker_should_consult(). Deliberately no
+     * cache_turbo_breaker_probe directive: the probe lease is the internal
+     * constant NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_LEASE, not operator-tunable
+     * (see its header comment for why). */
+    { ngx_string("cache_turbo_breaker"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_turbo_loc_conf_t, breaker_enable),
+      NULL },
+
+    { ngx_string("cache_turbo_breaker_threshold"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_num_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_turbo_loc_conf_t, breaker_threshold),
+      NULL },
+
+    { ngx_string("cache_turbo_breaker_window"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_sec_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_turbo_loc_conf_t, breaker_window),
+      NULL },
+
+    /* ⚠ NOT ngx_conf_set_sec_slot: 0 must be a hard config error here, not a
+     * silent disable. See ngx_http_cache_turbo_breaker_open_conf() and the
+     * O4.3-a note on the breaker_open field in the .h. */
+    { ngx_string("cache_turbo_breaker_open"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
+      ngx_http_cache_turbo_breaker_open_conf,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+
+    { ngx_string("cache_turbo_breaker_retry_after"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_sec_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_turbo_loc_conf_t, breaker_retry_after),
       NULL },
 
     { ngx_string("cache_turbo_admin"),
@@ -5010,15 +5057,17 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
          * NORMAL path will ever serve it -- only the pre-origin breaker gate
          * can, and only while the breaker is OPEN.
          *
-         * ⚠ Gated on breaker_threshold so this costs nothing when the breaker
-         * is off: it is a full-blob memcpy on the expired-entry path, which is
-         * every request to a cold-ish key. Same off-switch the O4.2 recording
-         * site uses.
+         * ⚠ Gated on breaker_should_consult() so this costs nothing when the
+         * breaker is off by ANY of its off-switches: it is a full-blob memcpy
+         * on the expired-entry path, which is every request to a cold-ish
+         * key. Same predicate the pre-origin gate below uses.
          *
          * The !brk_armed guard makes the park/resume re-entries idempotent (the
          * L2 GET and the cold-wait both re-enter this handler from the top),
          * exactly as !sie_armed does below. */
-        if (ctn->len > 0 && !ctx->brk_arm_done && clcf->breaker_threshold > 0) {
+        if (ctn->len > 0 && !ctx->brk_arm_done
+            && ngx_http_cache_turbo_breaker_should_consult(clcf))
+        {
             /* PERF-7 style zero-copy arm: pin the blob in the slab under the
              * mutex we already hold instead of copying it. A full-blob memcpy
              * here would run on EVERY enabled request that finds an expired
@@ -5164,8 +5213,10 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                 /* P6/O4.3: arm the breaker fallback from the L2 blob too. This
                  * is the L1-absent / L1-evicted case -- a peer's copy that is
                  * past its serveable window. Same any-age rule and same
-                 * threshold off-switch as the L1 site above. */
-                if (!ctx->brk_arm_done && clcf->breaker_threshold > 0) {
+                 * breaker_should_consult() off-switch as the L1 site above. */
+                if (!ctx->brk_arm_done
+                    && ngx_http_cache_turbo_breaker_should_consult(clcf))
+                {
                     /* No copy: ctx->l2_blob already lives in r->pool with the
                      * same lifetime as this request, so pointing at it is both
                      * correct and free. brk_ref stays NULL -- there is no shm
@@ -5311,8 +5362,7 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
          * A CLOSED or HALF_OPEN breaker falls through to the 504 below: with
          * the origin believed reachable, serving a body past every configured
          * window is the operator's outage policy, not this client's to invoke. */
-        if (ngx_http_cache_turbo_breaker_should_consult(clcf->enable,
-                clcf->breaker_threshold)
+        if (ngx_http_cache_turbo_breaker_should_consult(clcf)
             && ctx->brk_armed
             && ngx_http_cache_turbo_brk_state(z->sh->breaker_state)
                    == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN)
@@ -5377,13 +5427,13 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
      *   OPEN       -- serve the fallback body if one was armed, else 503 +
      *                 Retry-After. Either way: no origin contact.
      *
-     * ⚠ The state call is skipped entirely when threshold == 0. It is not a
-     * pure getter -- it performs the due OPEN -> HALF_OPEN transition -- so
-     * calling it with the breaker disabled would drive a state machine nothing
-     * can feed, and pay an shm read on every miss.
+     * ⚠ The state call is skipped entirely when breaker_should_consult() is
+     * false (any of: not enabled, breaker off, threshold == 0, window == 0).
+     * It is not a pure getter -- it performs the due OPEN -> HALF_OPEN
+     * transition -- so calling it with the breaker disabled would drive a
+     * state machine nothing can feed, and pay an shm read on every miss.
      */
-    if (ngx_http_cache_turbo_breaker_should_consult(clcf->enable,
-            clcf->breaker_threshold))
+    if (ngx_http_cache_turbo_breaker_should_consult(clcf))
     {
         ngx_uint_t  bact;
 
@@ -6840,25 +6890,42 @@ ngx_http_cache_turbo_breaker_from_origin(ngx_uint_t upstream,
 {
     return upstream && !native_cached;
 }
-/* P6/O4.3: may the pre-origin gate consult the breaker for this request?
+/* P6/O4.3-O4.4: may the pre-origin gate (or the outcome-recording site)
+ * consult/feed the breaker for this request?
  *
  * Factored out for the same reason _breaker_should_record() was: the unit suite
  * must drive the REAL admission rule rather than restate it. Restated rules
  * pass whatever the subject does, which is precisely how O4.1's herd bug got
  * certified green by its own test.
  *
- * ⚠ threshold is not a tuning knob here, it is the off-switch, and skipping the
- * call matters beyond saving an shm read: _breaker_state() is NOT a pure getter
- * -- it performs the due OPEN -> HALF_OPEN promotion. Consulting it while the
- * breaker is disabled would drive a state machine that nothing is feeding
- * outcomes into (the O4.2 recording site is gated on the same threshold), so a
- * zone could be promoted to probe with no probe ever reporting back.
- */
+ * Full predicate, O4.4: clcf->enable && clcf->breaker_enable &&
+ * breaker_threshold > 0 && breaker_window > 0. Three independent off-switches
+ * on top of the module's own enable flag -- cache_turbo_breaker off,
+ * cache_turbo_breaker_threshold 0, or cache_turbo_breaker_window 0 -- any one
+ * of which must make this false. breaker_window matters here even though the
+ * pre-origin gate itself never reads it: a threshold with no window is a
+ * meaningless "trip after N failures ever", and admitting that config to the
+ * state machine would let a handful of failures over the server's entire
+ * uptime eventually trip a breaker nobody configured a trip window for.
+ *
+ * ⚠ None of these fields are tuning knobs once false is reached here --
+ * together they are the off-switch, and skipping the call matters beyond
+ * saving an shm read: _breaker_state() is NOT a pure getter -- it performs
+ * the due OPEN -> HALF_OPEN promotion. Consulting it while the breaker is
+ * disabled would drive a state machine that nothing is feeding outcomes into
+ * (the O4.2 recording site is gated on this same predicate), so a zone could
+ * be promoted to probe with no probe ever reporting back.
+ *
+ * Takes clcf directly rather than individual fields: every call site already
+ * has clcf in scope, and a struct pointer can't drift out of sync with a
+ * field the way four positional scalar arguments could. */
 static ngx_uint_t
-ngx_http_cache_turbo_breaker_should_consult(ngx_uint_t enable,
-    ngx_uint_t threshold)
+ngx_http_cache_turbo_breaker_should_consult(
+    ngx_http_cache_turbo_loc_conf_t *clcf)
 {
-    return enable && threshold > 0;
+    return clcf->enable && clcf->breaker_enable
+           && clcf->breaker_threshold > 0
+           && clcf->breaker_window > 0;
 }
 
 
@@ -6938,12 +7005,15 @@ ngx_http_cache_turbo_header_filter(ngx_http_request_t *r)
      *    matters most, and those failures must count even though nothing
      *    stale-serves them.
      *
-     * Recorded unconditionally rather than under a `breaker enabled` test: with
-     * threshold/window at their 0 defaults _breaker_record() is inert (it
-     * returns before touching any window state), so this costs one plain read
-     * and a branch until O4.4 makes the breaker configurable. Successes are
-     * recorded just as broadly as failures -- a breaker that only ever hears
-     * about failures can never close again.
+     * O4.4: gated on breaker_should_consult() rather than the bare
+     * clcf->enable this used before the breaker had its own directives.
+     * threshold/window at their 0 defaults (or breaker_enable off, or the
+     * module itself disabled) make _breaker_record() inert (it returns before
+     * touching any window state), so this predicate simply makes that "no
+     * config can trip it" state explicit and skips the shm read entirely
+     * rather than paying it every response. Successes are recorded just as
+     * broadly as failures -- a breaker that only ever hears about failures
+     * can never close again.
      *
      * ⚠ NOT recorded at the autotune_record_cost() site the plan first named.
      * That call lives inside the store block, behind ~10 cacheability gates
@@ -6965,14 +7035,19 @@ ngx_http_cache_turbo_header_filter(ngx_http_request_t *r)
      * traffic. Only a response with an upstream behind it carries information
      * about whether the origin is up.
      *
-     * ⚠ Also gated on breaker_threshold: _breaker_record() checks the
-     * threshold/window off-switch only on its FAILURE path (shm.c:1297), while
-     * the success path returns earlier at :1266 having already written
-     * breaker_fails = 0. Calling it unconditionally would therefore put a
-     * shared-memory write on every successful response even with the breaker
-     * disabled -- not the no-op this step is supposed to be. Skipping the call
-     * outright keeps "breaker off" genuinely free. */
-    if (clcf->enable && clcf->shm_zone != NULL
+     * ⚠ The threshold/window off-switch is now enforced entirely by
+     * should_consult(clcf) above -- should_record()'s own `threshold` argument
+     * is a legacy positional parameter kept for the unit slice, not a second
+     * independent gate. The reason this call must still be SKIPPED outright
+     * (rather than trusting _breaker_record() to be inert when off) is that
+     * _breaker_record() only checks the off-switch on its FAILURE path
+     * (shm.c:1297); the success path returns earlier at :1266 having already
+     * written breaker_fails = 0. Calling it unconditionally would therefore
+     * put a shared-memory write on every successful response even with the
+     * breaker disabled -- not the no-op this step is supposed to be.
+     * Skipping the call outright keeps "breaker off" genuinely free. */
+    if (ngx_http_cache_turbo_breaker_should_consult(clcf)
+        && clcf->shm_zone != NULL
         && ngx_http_cache_turbo_breaker_should_record(
                0,                      /* ctx->served: excluded above already */
                ngx_http_cache_turbo_breaker_from_origin(
@@ -8691,6 +8766,57 @@ ngx_http_cache_turbo_min_uses(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     }
 
     clcf->min_uses_raw = n;
+
+    return NGX_CONF_OK;
+}
+
+
+/* cache_turbo_breaker_open T (O4.4). Hand-rolled rather than
+ * ngx_conf_set_sec_slot for the same class of reason as min_uses/stale_mult
+ * above, but inverted: those reject 0 because merge_loc_conf would silently
+ * COERCE it to a non-zero default, masking the operator's intent. This one
+ * rejects 0 because a literal 0 would NOT be inert here the way it is for
+ * every sibling breaker field -- _breaker_state()'s timed reopen is guarded
+ * on `open_for > 0` (see the field comment in the .h and O4.3-a in memory
+ * issues.md), so `cache_turbo_breaker_open 0` would WEDGE an OPEN breaker
+ * permanently: it would never promote a probe, and with nobody talking to
+ * the origin while OPEN, no success could ever be recorded to close it
+ * either. That is materially worse than the "off" the operator likely
+ * intended, so it is refused outright -- "off" for the breaker is expressed
+ * via cache_turbo_breaker, cache_turbo_breaker_threshold 0, or
+ * cache_turbo_breaker_window 0 instead. */
+static char *
+ngx_http_cache_turbo_breaker_open_conf(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf)
+{
+    ngx_http_cache_turbo_loc_conf_t  *clcf = conf;
+
+    ngx_str_t   *value = cf->args->elts;
+    ngx_int_t    n;
+
+    if (clcf->breaker_open != NGX_CONF_UNSET) {
+        return "is duplicate";
+    }
+
+    n = ngx_parse_time(&value[1], 1);
+    if (n == NGX_ERROR) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "cache_turbo_breaker_open: invalid value \"%V\"", &value[1]);
+        return NGX_CONF_ERROR;
+    }
+
+    if (n == 0) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "cache_turbo_breaker_open \"%V\" must be greater than 0 "
+            "(0 wedges the breaker OPEN forever: it never reopens and, with "
+            "no origin contact while OPEN, never closes either -- use "
+            "cache_turbo_breaker off, cache_turbo_breaker_threshold 0, or "
+            "cache_turbo_breaker_window 0 to disable the breaker instead)",
+            &value[1]);
+        return NGX_CONF_ERROR;
+    }
+
+    clcf->breaker_open = (time_t) n;
 
     return NGX_CONF_OK;
 }
@@ -11457,6 +11583,7 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->l2_negative_ttl = NGX_CONF_UNSET;   /* L13; merges to 0 = off */
     conf->keep_stale = NGX_CONF_UNSET;   /* S2.1; merges to 0 = off */
     conf->use_stale = NGX_CONF_UNSET_UINT;   /* S4.1; merges to USE_STALE_DEFAULT */
+    conf->breaker_enable = NGX_CONF_UNSET;         /* O4.4; merges to 0 = off */
     conf->breaker_threshold = NGX_CONF_UNSET_UINT; /* O4.2; merges to 0 = off */
     conf->breaker_window = NGX_CONF_UNSET;         /* O4.2; merges to 0 = off */
     conf->breaker_open = NGX_CONF_UNSET;           /* O4.3; see the merge note */
@@ -11601,10 +11728,15 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_uint_value(conf->use_stale, prev->use_stale,
                               NGX_HTTP_CACHE_TURBO_USE_STALE_DEFAULT);
 
+    /* O4.4: the breaker's own on/off switch, independent of clcf->enable and
+     * of the threshold/window off-switches below -- see
+     * ngx_http_cache_turbo_breaker_should_consult(). */
+    ngx_conf_merge_value(conf->breaker_enable, prev->breaker_enable, 0);
+
     /* P6/O4.2 breaker tuning. Both default to 0, which _breaker_record()
-     * treats as INERT (no tripping, no window accounting) -- so recording is
-     * wired up here while the breaker itself stays unreachable until O4.4
-     * adds the directives that can set these non-zero. */
+     * treats as INERT (no tripping, no window accounting) -- these are two
+     * more of the three independent off-switches alongside breaker_enable
+     * above. */
     ngx_conf_merge_uint_value(conf->breaker_threshold,
                               prev->breaker_threshold, 0);
     ngx_conf_merge_sec_value(conf->breaker_window, prev->breaker_window, 0);
@@ -11618,18 +11750,26 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
      *
      * The whole feature is still off by default via breaker_threshold == 0
      * (which skips the state call outright), so this default only takes effect
-     * once an operator switches the breaker on. O4.4's parser must REJECT an
-     * explicit 0 here rather than accept it as a disable -- tracked as O4.3-a.
+     * once an operator switches the breaker on. cache_turbo_breaker_open's
+     * custom handler REJECTS an explicit 0 at parse time rather than accept
+     * it as a disable -- tracked as O4.3-a -- so 0 can never reach this merge
+     * from an explicit directive; NGX_CONF_UNSET is the only way through.
      *
      * 30s is the usual circuit-breaker recovery probe interval: long enough
      * that a dead origin is not re-probed hard, short enough that a recovered
      * one is picked up quickly. */
     ngx_conf_merge_sec_value(conf->breaker_open, prev->breaker_open, 30);
 
-    /* Advisory only; 0 = send no Retry-After at all. Matching breaker_open
-     * means the hint expires about when the next probe is due. */
+    /* Advisory only; 0 = send no Retry-After at all. cache_turbo_breaker_open
+     * is rejected at 0 (see above) but the fully-merged breaker_open here can
+     * still legitimately be a small operator-chosen value, so this derives
+     * from the EFFECTIVE (post-merge) breaker_open rather than a hardcoded
+     * constant, keeping the hint in sync with the actual probe interval by
+     * default. A `cache_turbo_breaker_retry_after` directive, if given
+     * explicitly, always wins -- this fallback applies only when it was left
+     * unset. */
     ngx_conf_merge_sec_value(conf->breaker_retry_after,
-                             prev->breaker_retry_after, 30);
+                             prev->breaker_retry_after, conf->breaker_open);
 
     /* Per-status TTLs (v6): inherit the rule list if this level set none. */
     if (conf->valid_status == NULL) {
