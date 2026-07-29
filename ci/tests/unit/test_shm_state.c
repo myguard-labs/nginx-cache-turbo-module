@@ -904,11 +904,11 @@ test_breaker_huge_durations_do_not_overflow(void)
 
     printf("breaker: a near-max duration does not overflow the deadline\n");
 
-    /* NGX_MAX_INT_T_VALUE, spelled out because the unit shim does not pull in
-     * nginx's core headers. Large enough that adding it to any plausible epoch
-     * overflows a signed 64-bit time_t, and still inside what ngx_parse_time()
-     * accepts. */
-    huge = (time_t) 0x7fffffffffffffffLL;
+    /* The largest duration ngx_parse_time() can hand the state machine that is
+     * also representable in time_t (see ngx_shim_shm.h). Hardcoding a 64-bit
+     * literal instead would be an out-of-range conversion wherever time_t is
+     * narrower, and the test would quietly stop reaching the overflow. */
+    huge = NGX_TEST_MAX_DURATION;
 
     zone_reset();
     ngx_test_set_time(1000);

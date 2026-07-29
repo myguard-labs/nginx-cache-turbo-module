@@ -115,6 +115,32 @@ extern time_t ngx_test_now;
 static inline void ngx_test_set_time(time_t t)     { ngx_test_now = t; }
 static inline void ngx_test_advance_time(time_t d) { ngx_test_now += d; }
 
+/* The ceiling ngx_parse_time() accepts, gated exactly as ci/fuzz/ngx_shim.h
+ * gates it. Tests that drive the breaker's overflow guards (O4.4-b) need the
+ * largest duration the real parser can hand the state machine, and spelling it
+ * as a 64-bit literal would be an out-of-range conversion wherever ngx_int_t is
+ * 32 bits -- the test would stop exercising the path it exists for. */
+#if (UINTPTR_MAX > 0xffffffffUL)
+#define NGX_MAX_INT_T_VALUE  9223372036854775807LL
+#else
+#define NGX_MAX_INT_T_VALUE  2147483647
+#endif
+
+/* ...and the largest duration that also fits the local time_t, which is what
+ * the deadline arithmetic actually overflows. On the usual 64-bit build this is
+ * NGX_MAX_INT_T_VALUE itself; where time_t is narrower it is time_t's own
+ * maximum, which still makes `stamp + duration` wrap. TIME_T_MAX is derived
+ * from the unsigned counterpart rather than hardcoded, so it holds for any
+ * width without assuming one. */
+#define NGX_TEST_TIME_T_MAX                                                   \
+    ((time_t) (((uintmax_t) 1 << (8 * sizeof(time_t) - 1)) - 1))
+
+#define NGX_TEST_MAX_DURATION                                                 \
+    ((time_t) (((uintmax_t) NGX_MAX_INT_T_VALUE                               \
+                    <= (uintmax_t) NGX_TEST_TIME_T_MAX)                       \
+                   ? (time_t) NGX_MAX_INT_T_VALUE                             \
+                   : NGX_TEST_TIME_T_MAX))
+
 /* --- real nginx rbtree + queue -------------------------------------------
  * ngx_rbtree.h and ngx_queue.h cannot be included directly here: both open with
  * `#include <ngx_config.h> / <ngx_core.h>`, which drags in the entire nginx
