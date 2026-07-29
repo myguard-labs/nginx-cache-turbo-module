@@ -1578,6 +1578,39 @@ http {
 | `cache_turbo_normalize_vary TOKEN...` | `server`, `location` | off | Append a variant bucket to `$cache_turbo_normalized_args`: `encoding` (br/gzip/identity) and/or `device` (mobile/desktop). |
 | `cache_turbo_auto_vary on` | `server`, `location` | `off` | Read the response's own `Vary` header and split the cache by the named request header automatically. Safe whitelist: `Accept-Encoding`, `User-Agent` (device class), `Accept-Language` (primary-subtag class), `Origin` (raw — CORS boundary, never folded). `Vary: *`/`Cookie`/`Authorization` — **or any other header not on the whitelist** — ⇒ uncacheable (so an un-split Vary axis can never serve the wrong representation). Two-level, node-local keying. See [Auto-Vary](#auto-vary-read-the-response-vary). |
 
+> **The breaker is per-ZONE state driven by per-LOCATION policy — so its reopen
+> timing is "last reader decides".** The failure counter, the window anchor and
+> the OPEN/HALF_OPEN state all live in the shared zone
+> (`cache_turbo_zone name=…`), but every breaker directive is a `location` (or
+> `server`) setting. Two locations on one zone therefore accumulate into **one**
+> counter pair, while each contributes its own thresholds.
+>
+> `cache_turbo_breaker_open` is the one that surprises people. It is not stored
+> in the zone: it is passed per request from the requesting location's own
+> config into the state check, and tested there against the zone-shared
+> `breaker_opened_at`. So whether an OPEN breaker is ready to promote a probe is
+> judged using **whichever location's `breaker_open` the current request landed
+> on** — not a merge of the two, not the value in force when it tripped. Give
+> two locations on one zone `30s` and `5m` and the effective reopen delay flaps
+> with your traffic mix. `cache_turbo_breaker_retry_after` inherits the same
+> property, since it defaults to the effective `breaker_open`.
+>
+> Sharing a zone between locations that want different breaker policy is
+> therefore a configuration error the module cannot detect for you: it has no
+> way to tell "deliberately layered" from "accidentally inconsistent". One
+> effective breaker policy per zone — if two locations genuinely need different
+> thresholds or reopen timing, give them **separate zones**.
+>
+> **Enforcement scope is not observation scope.** `cache_turbo_breaker off` on a
+> location stops that location arming, consulting, tripping, or recording — it
+> does not hide the zone's breaker state from anything else. The admin endpoint
+> still reports `breaker_state` and `breaker_opens` for the zone, and a sibling
+> location with the breaker **on** still trips and still serves fallbacks from
+> shared counters this location's traffic never contributed to. A zone whose
+> breaker looks OPEN in the stats while one location behaves as if nothing is
+> wrong is both of these rules working as designed.
+
+
 ### Variables
 
 | Variable | Value |
