@@ -6838,7 +6838,8 @@ def test_breaker_arming_gated_on_breaker_enable(ng: Nginx, origin: Origin) -> No
     the dead origin, i.e. NOT 200), the second observes the tripped state."""
     for path in ("/breakeron/dead", "/breakeroff/dead"):
         s0, b0, _ = fetch(ng.port, path)
-        assert s0 == 200 and b0, f"prime failed for {path}: {s0} {b0!r}"
+        assert s0 == 200, f"prime failed for {path}: {s0}"
+        assert b0, f"prime returned an empty body for {path}"
 
     time.sleep(4.3)   # past fresh (1s) AND the x4 stale window (4s): L1-expired
     origin.fail = True
@@ -6848,7 +6849,7 @@ def test_breaker_arming_gated_on_breaker_enable(ng: Nginx, origin: Origin) -> No
             (f"breaker ON: the tripping request itself was answered 200 -- "
              f"expected it to reach the (dead) origin and fail, got {s_trip}")
 
-        s_on, b_on, _ = fetch(ng.port, "/breakeron/dead")
+        s_on, _b_on, _ = fetch(ng.port, "/breakeron/dead")
         assert s_on == 200, \
             (f"breaker ON: expired entry + dead origin did not fall back to "
              f"the breaker's any-age snapshot after tripping, got {s_on}")
