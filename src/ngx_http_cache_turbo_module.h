@@ -499,6 +499,11 @@ typedef struct {
  * direction for a zeroed or accidentally-defaulted value is "the breaker does
  * not interfere". A silent flip would make the fall-through case start serving
  * stale bodies or 503s. */
+/* P6/O4.3: "no probe lease held". 0 is safe as the sentinel because it is also
+ * breaker_probe_at's zeroed-zone value, so a token that was never stamped can
+ * never match a live lease. */
+#define NGX_HTTP_CACHE_TURBO_BREAKER_NO_PROBE  0
+
 #define NGX_HTTP_CACHE_TURBO_BRK_ACT_PASS   0  /* go to origin (incl. the probe) */
 #define NGX_HTTP_CACHE_TURBO_BRK_ACT_SERVE  1  /* serve the fallback body        */
 #define NGX_HTTP_CACHE_TURBO_BRK_ACT_FAIL   2  /* 503 + Retry-After, no origin   */
@@ -1052,7 +1057,7 @@ typedef struct {
      * breaker would wedge permanently. It is inert today only because
      * threshold == 0 means it can never trip in the first place; O4.4 MUST
      * default this to a non-zero value (and reject 0) once the breaker can be
-     * switched on. Tracked as O4.3-a in issues.md. */
+     * switched on. Tracked as O4.3-a in memory issues.md. */
     time_t                   breaker_open;      /* OPEN duration s before probe */
 
     /* Retry-After seconds sent with the breaker's 503. Advisory to the client;
@@ -1394,8 +1399,18 @@ typedef struct {
      * ref_data = NULL. Only taken when the breaker is actually enabled --
      * threshold == 0 skips the memcpy entirely, so "breaker off" stays free. */
     unsigned                 brk_armed:1;     /* a breaker fallback is stashed  */
-    u_char                  *brk_snap;        /* blob copy, any age (r->pool)   */
+    u_char                  *brk_snap;        /* blob bytes, any age            */
     size_t                   brk_snap_len;
+    /* PERF: when non-NULL, brk_snap points into the shm slab and this holds the
+     * pinned blob for ngx_http_cache_turbo_serve()'s ref_data (the pool cleanup
+     * drops the reference once the response drains). NULL means brk_snap is an
+     * r->pool buffer owned by somebody else -- the L2 path -- and no reference
+     * is held. Mirrors the fresh/stale serve paths rather than copying: the L1
+     * arming used to memcpy the whole blob under the ZONE MUTEX on every
+     * enabled request that found an expired entry, which serialises concurrent
+     * workers on a 1 MiB-default (configurable) copy exactly during the outage
+     * this feature exists to smooth over. */
+    u_char                  *brk_ref;         /* pinned shm blob, or NULL       */
 
     /* P6/O4.3: the pre-origin gate's verdict, latched on first consult.
      *
@@ -1426,6 +1441,12 @@ typedef struct {
     unsigned                 brk_consulted:1; /* gate already ran this request  */
     ngx_uint_t               brk_action;      /* latched BRK_ACT_* verdict      */
     ngx_uint_t               brk_state;       /* latched BREAKER_* state        */
+
+    /* P6/O4.3: the probe lease token, non-zero ONLY on the request that won the
+     * OPEN -> HALF_OPEN promotion. Handed to _breaker_record() in the header
+     * filter so that exactly that request's origin outcome resolves the lease;
+     * every other request passes NO_PROBE and cannot. */
+    ngx_uint_t               brk_probe;       /* lease token, 0 = not the probe */
     /* Per-request serve outcome for $cache_turbo_status / access logging. One of
      * NGX_HTTP_CACHE_TURBO_ST_*; defaults to ST_MISS (0) via pcalloc and is
      * overridden to HIT/STALE at the X-Cache emit site, BYPASS on the
@@ -1576,11 +1597,27 @@ ngx_int_t ngx_http_cache_turbo_shm_l2_neg_check(ngx_http_cache_turbo_zone_t *z,
 void ngx_http_cache_turbo_shm_l2_neg_set(ngx_http_cache_turbo_zone_t *z,
     u_char *key_hash, uint32_t hash, time_t ttl);
 
-/* P6/O4.1 circuit breaker (per-zone, lock-free -- see the shctx field block). */
+/* P6/O4.1 circuit breaker (per-zone, lock-free -- see the shctx field block).
+ *
+ * O4.3 added the probe TOKEN to both calls. `*probe` is an out-parameter on
+ * _breaker_state() and an in-parameter on _breaker_record(); NGX_HTTP_CACHE_
+ * TURBO_BREAKER_NO_PROBE means "this caller does not own a probe lease".
+ *
+ * ⚠ Only the request that WON the OPEN -> HALF_OPEN promotion receives a
+ * non-zero token, and only that token may resolve HALF_OPEN. Without it any
+ * unrelated origin response completing during the open window could close (or
+ * re-open) a lease it knows nothing about: a request that started before the
+ * trip reports "origin fine" and releases the herd toward a still-dead origin,
+ * and a promoted probe that ends up served from a peer's L2 fill leaves the
+ * breaker with no outcome at all. Pass NO_PROBE from every non-probe site.
+ *
+ * The token is the promotion's breaker_probe_at stamp, which is already unique
+ * per lease -- no new shm field, and a stale token from a previous lease simply
+ * fails the comparison. */
 ngx_uint_t ngx_http_cache_turbo_shm_breaker_state(
-    ngx_http_cache_turbo_zone_t *z, time_t open_for);
+    ngx_http_cache_turbo_zone_t *z, time_t open_for, ngx_uint_t *probe);
 void ngx_http_cache_turbo_shm_breaker_record(ngx_http_cache_turbo_zone_t *z,
-    ngx_uint_t success, ngx_uint_t threshold, time_t window);
+    ngx_uint_t success, ngx_uint_t threshold, time_t window, ngx_uint_t probe);
 const char *ngx_http_cache_turbo_shm_breaker_state_str(ngx_uint_t state);
 
 

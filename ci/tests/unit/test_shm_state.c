@@ -89,6 +89,10 @@ typedef struct {
 /* P6/O4.3 serve-path actions. PASS == 0 is load-bearing for the same reason
  * CLOSED == 0 is: the safe direction for a zeroed value is "the breaker does
  * not interfere". extract_shm.sh pins these against the header too. */
+/* P6/O4.3 probe lease sentinel. 0 doubles as breaker_probe_at's zeroed value,
+ * so a token that was never stamped can never match a live lease. */
+#define NGX_HTTP_CACHE_TURBO_BREAKER_NO_PROBE  0
+
 #define NGX_HTTP_CACHE_TURBO_BRK_ACT_PASS   0
 #define NGX_HTTP_CACHE_TURBO_BRK_ACT_SERVE  1
 #define NGX_HTTP_CACHE_TURBO_BRK_ACT_FAIL   2
@@ -826,13 +830,41 @@ test_out_of_slab_fails_open(void)
 
 /* A zeroed zone must read CLOSED. This is the fail-safe direction: traffic goes
  * to the origin exactly as if the feature were off. */
+/* P6/O4.3 shims. Most breaker tests do not care about the probe LEASE TOKEN --
+ * they assert state transitions -- so these keep those call sites readable while
+ * still driving the real production signatures. brk_state() discards the token;
+ * brk_probe_state() hands it back for the tests that DO care (only the promoted
+ * request may resolve HALF_OPEN); brk_record() reports without a token, which is
+ * what every non-probe request in the module passes. */
+static ngx_uint_t
+brk_state(time_t open_for)
+{
+    ngx_uint_t  probe;
+
+    return ngx_http_cache_turbo_shm_breaker_state(&g_zone, open_for, &probe);
+}
+
+static ngx_uint_t
+brk_probe_state(time_t open_for, ngx_uint_t *probe)
+{
+    return ngx_http_cache_turbo_shm_breaker_state(&g_zone, open_for, probe);
+}
+
+static void
+brk_record(ngx_uint_t success, ngx_uint_t threshold, time_t window)
+{
+    ngx_http_cache_turbo_shm_breaker_record(&g_zone, success, threshold, window,
+        NGX_HTTP_CACHE_TURBO_BREAKER_NO_PROBE);
+}
+
+
 static void
 test_breaker_zeroed_zone_is_closed(void)
 {
     printf("breaker: a zeroed zone comes up CLOSED (fail-safe)\n");
     zone_reset();
 
-    CHECK(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+    CHECK(brk_state(30)
               == NGX_HTTP_CACHE_TURBO_BREAKER_CLOSED,
           "a zeroed zone did not read CLOSED");
     CHECK(g_sh.breaker_opens == 0, "a zeroed zone reported prior opens");
@@ -848,16 +880,16 @@ test_breaker_trips_at_threshold(void)
     zone_reset();
     ngx_test_set_time(1000);
 
-    ngx_http_cache_turbo_shm_breaker_record(&g_zone, 0, 3, 60);
-    ngx_http_cache_turbo_shm_breaker_record(&g_zone, 0, 3, 60);
+    brk_record(0, 3, 60);
+    brk_record(0, 3, 60);
 
-    CHECK(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+    CHECK(brk_state(30)
               == NGX_HTTP_CACHE_TURBO_BREAKER_CLOSED,
           "breaker opened one failure early");
 
-    ngx_http_cache_turbo_shm_breaker_record(&g_zone, 0, 3, 60);
+    brk_record(0, 3, 60);
 
-    CHECK(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+    CHECK(brk_state(30)
               == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
           "breaker did not open at the threshold");
     CHECK(g_sh.breaker_opens == 1, "breaker_opens was not bumped on the trip");
@@ -879,11 +911,11 @@ test_breaker_window_rolls(void)
     /* Ten failures, each a full window apart. Threshold is 3, so a
      * non-rolling implementation would have opened on the third. */
     for (i = 0; i < 10; i++) {
-        ngx_http_cache_turbo_shm_breaker_record(&g_zone, 0, 3, 60);
+        brk_record(0, 3, 60);
         ngx_test_advance_time(61);
     }
 
-    CHECK(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+    CHECK(brk_state(30)
               == NGX_HTTP_CACHE_TURBO_BREAKER_CLOSED,
           "a trickle of failures a window apart tripped the breaker");
     CHECK(g_sh.breaker_opens == 0, "breaker opened on a rolled window");
@@ -900,14 +932,14 @@ test_breaker_half_open_admits_one_probe(void)
     zone_reset();
     ngx_test_set_time(1000);
 
-    ngx_http_cache_turbo_shm_breaker_record(&g_zone, 0, 1, 60);
-    REQUIRE(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+    brk_record(0, 1, 60);
+    REQUIRE(brk_state(30)
                 == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
             "breaker fixture: expected OPEN after a threshold-1 failure");
 
     /* Still inside the open window: no probe yet. */
     ngx_test_advance_time(29);
-    CHECK(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+    CHECK(brk_state(30)
               == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
           "breaker probed before the open window elapsed");
 
@@ -920,25 +952,25 @@ test_breaker_half_open_admits_one_probe(void)
      * was handed the probe's verdict and walked into the dead origin. The
      * test certified the bug. Do not "restore" it. */
     ngx_test_advance_time(2);
-    CHECK(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+    CHECK(brk_state(30)
               == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN,
           "breaker did not promote a probe after the open window");
-    CHECK(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+    CHECK(brk_state(30)
               == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
           "a second caller was also admitted as a probe (herd)");
-    CHECK(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+    CHECK(brk_state(30)
               == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
           "a third caller was also admitted as a probe (herd)");
 
     /* A failed probe returns to OPEN and re-arms a FULL window -- the next
      * probe must wait open_for again, not fire immediately. */
-    ngx_http_cache_turbo_shm_breaker_record(&g_zone, 0, 1, 60);
-    CHECK(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+    brk_record(0, 1, 60);
+    CHECK(brk_state(30)
               == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
           "a failed probe did not return the breaker to OPEN");
 
     ngx_test_advance_time(29);
-    CHECK(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+    CHECK(brk_state(30)
               == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
           "a failed probe did not re-arm the full open window");
 }
@@ -956,25 +988,25 @@ test_breaker_abandoned_probe_lease_recovers(void)
     zone_reset();
     ngx_test_set_time(1000);
 
-    ngx_http_cache_turbo_shm_breaker_record(&g_zone, 0, 1, 60);
+    brk_record(0, 1, 60);
     ngx_test_advance_time(31);
-    REQUIRE(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+    REQUIRE(brk_state(30)
                 == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN,
             "breaker fixture: expected a promoted probe");
 
     /* The probe vanishes -- no _record() ever arrives. Inside the lease the
      * breaker must keep refusing everyone. */
     ngx_test_advance_time(29);
-    CHECK(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+    CHECK(brk_state(30)
               == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
           "the probe lease was reclaimed before it went stale");
 
     /* Lease stale: exactly one replacement probe, and no more. */
     ngx_test_advance_time(2);
-    CHECK(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+    CHECK(brk_state(30)
               == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN,
           "an abandoned probe lease was never reclaimed (wedged HALF_OPEN)");
-    CHECK(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+    CHECK(brk_state(30)
               == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
           "the reclaimed lease admitted a second probe");
 }
@@ -990,15 +1022,15 @@ test_breaker_stale_success_does_not_close(void)
     zone_reset();
     ngx_test_set_time(1000);
 
-    ngx_http_cache_turbo_shm_breaker_record(&g_zone, 0, 1, 60);
-    REQUIRE(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+    brk_record(0, 1, 60);
+    REQUIRE(brk_state(30)
                 == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
             "breaker fixture: expected OPEN");
 
     /* A request that started while the breaker was still CLOSED finally
      * completes and reports success. It must be ignored. */
-    ngx_http_cache_turbo_shm_breaker_record(&g_zone, 1, 1, 60);
-    CHECK(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+    brk_record(1, 1, 60);
+    CHECK(brk_state(30)
               == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
           "a stale pre-trip success closed the breaker");
 }
@@ -1009,18 +1041,21 @@ test_breaker_stale_success_does_not_close(void)
 static void
 test_breaker_probe_success_closes(void)
 {
+    ngx_uint_t  probe;
+
     printf("breaker: a successful probe closes; open_for 0 pins OPEN\n");
     zone_reset();
     ngx_test_set_time(1000);
 
-    ngx_http_cache_turbo_shm_breaker_record(&g_zone, 0, 1, 60);
+    brk_record(0, 1, 60);
     ngx_test_advance_time(31);
-    REQUIRE(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+    /* O4.3: hold the lease token -- only its owner may close the breaker. */
+    REQUIRE(brk_probe_state(30, &probe)
                 == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN,
             "breaker fixture: expected a promoted probe");
 
-    ngx_http_cache_turbo_shm_breaker_record(&g_zone, 1, 1, 60);
-    CHECK(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+    ngx_http_cache_turbo_shm_breaker_record(&g_zone, 1, 1, 60, probe);
+    CHECK(brk_state(30)
               == NGX_HTTP_CACHE_TURBO_BREAKER_CLOSED,
           "a successful probe did not close the breaker");
 
@@ -1034,21 +1069,21 @@ test_breaker_probe_success_closes(void)
      * passed with the bug restored. */
     zone_reset();
     ngx_test_set_time(1000);
-    ngx_http_cache_turbo_shm_breaker_record(&g_zone, 0, 3, 60);
-    ngx_http_cache_turbo_shm_breaker_record(&g_zone, 0, 3, 60);
-    ngx_http_cache_turbo_shm_breaker_record(&g_zone, 1, 3, 60);   /* success */
-    ngx_http_cache_turbo_shm_breaker_record(&g_zone, 0, 3, 60);
-    ngx_http_cache_turbo_shm_breaker_record(&g_zone, 0, 3, 60);
-    CHECK(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+    brk_record(0, 3, 60);
+    brk_record(0, 3, 60);
+    brk_record(1, 3, 60);   /* success */
+    brk_record(0, 3, 60);
+    brk_record(0, 3, 60);
+    CHECK(brk_state(30)
               == NGX_HTTP_CACHE_TURBO_BREAKER_CLOSED,
           "the failure counter survived a success");
 
     /* open_for == 0 disables the timed reopen. */
     zone_reset();
     ngx_test_set_time(1000);
-    ngx_http_cache_turbo_shm_breaker_record(&g_zone, 0, 1, 60);
+    brk_record(0, 1, 60);
     ngx_test_advance_time(100000);
-    CHECK(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 0)
+    CHECK(brk_state(0)
               == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
           "open_for 0 still performed a timed reopen");
 }
@@ -1066,10 +1101,10 @@ test_breaker_threshold_zero_never_trips(void)
     ngx_test_set_time(1000);
 
     for (i = 0; i < 50; i++) {
-        ngx_http_cache_turbo_shm_breaker_record(&g_zone, 0, 0, 60);
+        brk_record(0, 0, 60);
     }
 
-    CHECK(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+    CHECK(brk_state(30)
               == NGX_HTTP_CACHE_TURBO_BREAKER_CLOSED,
           "threshold 0 tripped the breaker");
     CHECK(g_sh.breaker_opens == 0, "threshold 0 recorded an open");
@@ -1091,11 +1126,11 @@ test_breaker_zero_window_never_trips(void)
     /* Fifty failures, days apart. A cumulative reading would have tripped at
      * the third. */
     for (i = 0; i < 50; i++) {
-        ngx_http_cache_turbo_shm_breaker_record(&g_zone, 0, 3, 0);
+        brk_record(0, 3, 0);
         ngx_test_advance_time(86400);
     }
 
-    CHECK(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+    CHECK(brk_state(30)
               == NGX_HTTP_CACHE_TURBO_BREAKER_CLOSED,
           "window 0 accumulated failures and tripped the breaker");
     CHECK(g_sh.breaker_opens == 0, "window 0 recorded an open");
@@ -1357,7 +1392,7 @@ test_breaker_action_mapping(void)
 static void
 test_breaker_probe_passes_and_recovery_completes(void)
 {
-    ngx_uint_t  i, state, act;
+    ngx_uint_t  i, state, act, probe;
 
     printf("breaker/O4.3: the promoted probe reaches origin and closes it\n");
 
@@ -1365,14 +1400,12 @@ test_breaker_probe_passes_and_recovery_completes(void)
     ngx_test_set_time(1000);
 
     for (i = 0; i < 3; i++) {
-        ngx_http_cache_turbo_shm_breaker_record(
-            &g_zone,
-            !ngx_http_cache_turbo_breaker_is_origin_failure(503),
+        brk_record(!ngx_http_cache_turbo_breaker_is_origin_failure(503),
             3, 60);
     }
 
     /* While OPEN, a request holding a stale body serves it and never leaves. */
-    state = ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30);
+    state = brk_state(30);
     CHECK(state == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
           "three 503s did not open the breaker");
     CHECK(ngx_http_cache_turbo_breaker_action(state, 1)
@@ -1382,7 +1415,8 @@ test_breaker_probe_passes_and_recovery_completes(void)
     /* The open window elapses: exactly one request is promoted, and it must be
      * told to go to the origin. */
     ngx_test_set_time(1031);
-    state = ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30);
+    /* O4.3: keep the lease token; only its owner may close the breaker. */
+    state = brk_probe_state(30, &probe);
     CHECK(state == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN,
           "no probe was promoted after the open window elapsed");
     act = ngx_http_cache_turbo_breaker_action(state, 1);
@@ -1391,21 +1425,111 @@ test_breaker_probe_passes_and_recovery_completes(void)
           "the serve path would answer it locally and the breaker would wedge");
 
     /* Everyone else still sees OPEN while the probe is out (anti-herd). */
-    CHECK(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+    CHECK(brk_state(30)
               == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
           "a second request was also promoted — the herd walks into the origin");
 
-    /* The probe reports success through the header filter: breaker closes. */
-    ngx_http_cache_turbo_shm_breaker_record(
-        &g_zone,
-        !ngx_http_cache_turbo_breaker_is_origin_failure(200),
-        3, 60);
-    state = ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30);
+    /* The probe reports success through the header filter, under ITS lease
+     * token: breaker closes. */
+    ngx_http_cache_turbo_shm_breaker_record(&g_zone,
+        !ngx_http_cache_turbo_breaker_is_origin_failure(200), 3, 60, probe);
+    state = brk_state(30);
     CHECK(state == NGX_HTTP_CACHE_TURBO_BREAKER_CLOSED,
           "a successful probe did not close the breaker");
     CHECK(ngx_http_cache_turbo_breaker_action(state, 1)
               == NGX_HTTP_CACHE_TURBO_BRK_ACT_PASS,
           "the recovered breaker still refused to pass traffic");
+}
+
+
+/* P6/O4.3 (F1): only the request holding the lease token may resolve HALF_OPEN.
+ *
+ * Without the token, ANY origin outcome completing during the open window
+ * resolves the lease: a request that started before the trip reports "origin
+ * fine" and closes a breaker it never tested, releasing the herd onto a still
+ * dead origin. The promoted probe, meanwhile, may never reach the origin at all
+ * (it can lose the Redis NX and be served from a peer's L2 fill), leaving the
+ * lease with no outcome. Both halves are asserted here. */
+static void
+test_breaker_only_the_probe_token_closes(void)
+{
+    ngx_uint_t  i, state, probe, other;
+
+    printf("breaker/O4.3: only the lease owner's outcome resolves HALF_OPEN\n");
+
+    zone_reset();
+    ngx_test_set_time(1000);
+    for (i = 0; i < 3; i++) {
+        brk_record(!ngx_http_cache_turbo_breaker_is_origin_failure(503), 3, 60);
+    }
+
+    ngx_test_set_time(1031);
+    state = brk_probe_state(30, &probe);
+    CHECK(state == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN,
+          "no probe was promoted after the open window elapsed");
+    CHECK(probe != NGX_HTTP_CACHE_TURBO_BREAKER_NO_PROBE,
+          "the promoted probe was not given a lease token");
+
+    /* A non-probe success -- an older in-flight request, or one served from a
+     * peer's fill -- must NOT close the breaker. */
+    brk_record(1, 3, 60);
+    CHECK((ngx_uint_t) g_zone.sh->breaker_state
+              == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN,
+          "a success WITHOUT the lease token closed the breaker — an outcome "
+          "from a request that never probed would release the herd onto a "
+          "still-dead origin");
+
+    /* A non-probe FAILURE must not re-stamp the window either. */
+    brk_record(0, 3, 60);
+    CHECK((ngx_uint_t) g_zone.sh->breaker_state
+              == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN,
+          "a failure WITHOUT the lease token resolved the lease");
+
+    /* A stale token from no lease at all is still refused. */
+    other = probe + 12345;
+    ngx_http_cache_turbo_shm_breaker_record(&g_zone, 1, 3, 60, other);
+    CHECK((ngx_uint_t) g_zone.sh->breaker_state
+              == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN,
+          "a WRONG lease token closed the breaker");
+
+    /* The real owner closes it. */
+    ngx_http_cache_turbo_shm_breaker_record(&g_zone, 1, 3, 60, probe);
+    CHECK((ngx_uint_t) g_zone.sh->breaker_state
+              == NGX_HTTP_CACHE_TURBO_BREAKER_CLOSED,
+          "the lease owner's success did not close the breaker");
+}
+
+
+/* P6/O4.3 (F1): a failed probe re-opens only for its own lease owner. */
+static void
+test_breaker_probe_token_reopens(void)
+{
+    ngx_uint_t  i, state, probe;
+
+    printf("breaker/O4.3: the lease owner's failure re-opens a fresh window\n");
+
+    zone_reset();
+    ngx_test_set_time(1000);
+    for (i = 0; i < 3; i++) {
+        brk_record(!ngx_http_cache_turbo_breaker_is_origin_failure(503), 3, 60);
+    }
+
+    ngx_test_set_time(1031);
+    state = brk_probe_state(30, &probe);
+    CHECK(state == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN,
+          "no probe was promoted");
+
+    ngx_http_cache_turbo_shm_breaker_record(
+        &g_zone, !ngx_http_cache_turbo_breaker_is_origin_failure(502), 3, 60,
+        probe);
+    CHECK((ngx_uint_t) g_zone.sh->breaker_state
+              == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
+          "the probe's failure did not re-open the breaker");
+
+    /* And the fresh window really is fresh: no immediate re-promotion. */
+    CHECK(brk_state(30) == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
+          "a probe was promoted again immediately after a failed probe — the "
+          "open window was skipped");
 }
 
 
@@ -1433,15 +1557,13 @@ test_breaker_second_consult_loses_the_probe(void)
     ngx_test_set_time(1000);
 
     for (i = 0; i < 3; i++) {
-        ngx_http_cache_turbo_shm_breaker_record(
-            &g_zone,
-            !ngx_http_cache_turbo_breaker_is_origin_failure(503),
+        brk_record(!ngx_http_cache_turbo_breaker_is_origin_failure(503),
             3, 60);
     }
 
     ngx_test_set_time(1031);
 
-    first = ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30);
+    first = brk_state(30);
     CHECK(first == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN,
           "the first consult was not promoted to probe");
     CHECK(ngx_http_cache_turbo_breaker_action(first, 1)
@@ -1450,7 +1572,7 @@ test_breaker_second_consult_loses_the_probe(void)
 
     /* The SAME request consulting again -- what an unlatched gate does on a
      * park/resume. It is no longer the promoter, so it is told OPEN. */
-    second = ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30);
+    second = brk_state(30);
     CHECK(second == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
           "a second consult did not return OPEN — if this ever changes, the "
           "brk_consulted latch's rationale needs rechecking");
@@ -1482,12 +1604,10 @@ test_breaker_record_driven_by_predicate(void)
     zone_reset();
     ngx_test_set_time(1000);
     for (i = 0; i < 3; i++) {
-        ngx_http_cache_turbo_shm_breaker_record(
-            &g_zone,
-            !ngx_http_cache_turbo_breaker_is_origin_failure(503),
+        brk_record(!ngx_http_cache_turbo_breaker_is_origin_failure(503),
             3, 60);
     }
-    CHECK(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+    CHECK(brk_state(30)
               == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
           "three origin 503s did not trip the breaker");
 
@@ -1495,12 +1615,10 @@ test_breaker_record_driven_by_predicate(void)
     zone_reset();
     ngx_test_set_time(1000);
     for (i = 0; i < 3; i++) {
-        ngx_http_cache_turbo_shm_breaker_record(
-            &g_zone,
-            !ngx_http_cache_turbo_breaker_is_origin_failure(404),
+        brk_record(!ngx_http_cache_turbo_breaker_is_origin_failure(404),
             3, 60);
     }
-    CHECK(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+    CHECK(brk_state(30)
               == NGX_HTTP_CACHE_TURBO_BREAKER_CLOSED,
           "a run of 404s tripped the breaker against a healthy origin");
     CHECK(g_sh.breaker_opens == 0,
@@ -1590,7 +1708,7 @@ run_negative_controls(void)
             g_sh.breaker_state = NGX_HTTP_CACHE_TURBO_BREAKER_OPEN;
         }
 
-        caught = (ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+        caught = (brk_state(30)
                       == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN);
         tests_run++;
         if (!caught) {
@@ -1611,12 +1729,12 @@ run_negative_controls(void)
      * return to the second caller. */
     zone_reset();
     ngx_test_set_time(1000);
-    ngx_http_cache_turbo_shm_breaker_record(&g_zone, 0, 1, 60);
+    brk_record(0, 1, 60);
     ngx_test_advance_time(31);
     {
         ngx_uint_t  first, second;
 
-        first = ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30);
+        first = brk_state(30);
 
         /* the bug: hand back whatever is stored, with no winner check. */
         second = (ngx_uint_t) g_sh.breaker_state;
@@ -1637,8 +1755,8 @@ run_negative_controls(void)
      * test_breaker_probe_success_closes must then break. */
     zone_reset();
     ngx_test_set_time(1000);
-    ngx_http_cache_turbo_shm_breaker_record(&g_zone, 0, 3, 60);
-    ngx_http_cache_turbo_shm_breaker_record(&g_zone, 0, 3, 60);
+    brk_record(0, 3, 60);
+    brk_record(0, 3, 60);
     {
         ngx_atomic_uint_t  kept = g_sh.breaker_fails;
 
@@ -1646,13 +1764,13 @@ run_negative_controls(void)
          * count by hand, then drive the REAL record()/state() pair with the
          * same two post-success failures the test uses. With the run retained,
          * 2 + 2 crosses threshold 3 and the breaker opens. */
-        ngx_http_cache_turbo_shm_breaker_record(&g_zone, 1, 3, 60);
+        brk_record(1, 3, 60);
         g_sh.breaker_fails = kept;              /* <-- bug: not cleared */
 
-        ngx_http_cache_turbo_shm_breaker_record(&g_zone, 0, 3, 60);
-        ngx_http_cache_turbo_shm_breaker_record(&g_zone, 0, 3, 60);
+        brk_record(0, 3, 60);
+        brk_record(0, 3, 60);
 
-        caught = (ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+        caught = (brk_state(30)
                       == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN);
         tests_run++;
         if (!caught) {
@@ -1690,11 +1808,11 @@ run_negative_controls(void)
                 "buggy one on 404 — the control models nothing");
 
         for (i = 0; i < 3; i++) {
-            ngx_http_cache_turbo_shm_breaker_record(&g_zone, !buggy_is_failure,
+            brk_record(!buggy_is_failure,
                                                     3, 60);
         }
 
-        caught = (ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+        caught = (brk_state(30)
                       == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN
                   && g_sh.breaker_opens == 1);
         tests_run++;
@@ -1724,11 +1842,11 @@ run_negative_controls(void)
                 "buggy one on 507 — the control models nothing");
 
         for (i = 0; i < 3; i++) {
-            ngx_http_cache_turbo_shm_breaker_record(&g_zone, !buggy_is_failure,
+            brk_record(!buggy_is_failure,
                                                     3, 60);
         }
 
-        caught = (ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+        caught = (brk_state(30)
                       == NGX_HTTP_CACHE_TURBO_BREAKER_CLOSED
                   && g_sh.breaker_opens == 0);
         tests_run++;
@@ -1757,14 +1875,12 @@ run_negative_controls(void)
         for (i = 0; i < 3; i++) {
             /* the bug: from_origin forced to 1 for a response that wasn't */
             if (ngx_http_cache_turbo_breaker_should_record(0, 1, 1, 3)) {
-                ngx_http_cache_turbo_shm_breaker_record(
-                    &g_zone,
-                    !ngx_http_cache_turbo_breaker_is_origin_failure(504),
+                brk_record(!ngx_http_cache_turbo_breaker_is_origin_failure(504),
                     3, 60);
             }
         }
 
-        caught = (ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+        caught = (brk_state(30)
                       == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN
                   && g_sh.breaker_opens == 1);
         tests_run++;
@@ -1785,13 +1901,13 @@ run_negative_controls(void)
      * looks at the threshold (shm.c:1266 vs :1297). */
     zone_reset();
     ngx_test_set_time(1000);
-    ngx_http_cache_turbo_shm_breaker_record(&g_zone, 0, 3, 60);
-    ngx_http_cache_turbo_shm_breaker_record(&g_zone, 0, 3, 60);
+    brk_record(0, 3, 60);
+    brk_record(0, 3, 60);
     {
         ngx_atomic_uint_t  before = g_sh.breaker_fails;
 
         /* the bug: threshold 0 no longer vetoes, so the call goes through */
-        ngx_http_cache_turbo_shm_breaker_record(&g_zone, 1, 0, 60);
+        brk_record(1, 0, 60);
 
         caught = (before == 2 && g_sh.breaker_fails == 0);
         tests_run++;
@@ -1838,6 +1954,8 @@ main(void)
     test_breaker_action_mapping();
     test_breaker_probe_passes_and_recovery_completes();
     test_breaker_second_consult_loses_the_probe();
+    test_breaker_only_the_probe_token_closes();
+    test_breaker_probe_token_reopens();
     run_negative_controls();
 
     /* Every node this run allocated must be accounted for. Under ASan a real

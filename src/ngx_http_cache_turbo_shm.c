@@ -1130,10 +1130,16 @@ ngx_http_cache_turbo_shm_l2_neg_set(ngx_http_cache_turbo_zone_t *z,
  */
 ngx_uint_t
 ngx_http_cache_turbo_shm_breaker_state(ngx_http_cache_turbo_zone_t *z,
-    time_t open_for)
+    time_t open_for, ngx_uint_t *probe)
 {
     time_t      now;
     ngx_uint_t  state;
+
+    /* O4.3: default to "no lease". Only the promotion CAS below overwrites
+     * this, so every caller that is merely OBSERVING the breaker -- including
+     * one that sees a HALF_OPEN installed by somebody else -- goes away without
+     * a token and therefore cannot resolve the lease in _breaker_record(). */
+    *probe = NGX_HTTP_CACHE_TURBO_BREAKER_NO_PROBE;
 
     /* Plain volatile read, NOT fetch_add(...,0): a lock-prefixed RMW would
      * acquire the cache line exclusively on every call, and this is the
@@ -1207,6 +1213,21 @@ ngx_http_cache_turbo_shm_breaker_state(ngx_http_cache_turbo_zone_t *z,
                            NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN))
     {
         z->sh->breaker_probe_at = (ngx_atomic_t) now;
+
+        /* O4.3: hand THIS caller the lease token. The stamp doubles as the
+         * token -- it is already unique per lease, so no new shm field is
+         * needed and a token left over from an earlier lease simply fails the
+         * comparison in _breaker_record().
+         *
+         * ⚠ now == 0 would collide with the NO_PROBE sentinel. ngx_time() is
+         * seconds since the epoch, so that is unreachable outside a clock set
+         * to 1970; the fallback keeps the promotion honest rather than silently
+         * issuing an unusable token. */
+        *probe = (ngx_uint_t) now;
+        if (*probe == NGX_HTTP_CACHE_TURBO_BREAKER_NO_PROBE) {
+            *probe = 1;
+        }
+
         return NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN;
     }
 
@@ -1227,7 +1248,7 @@ ngx_http_cache_turbo_shm_breaker_state(ngx_http_cache_turbo_zone_t *z,
  */
 void
 ngx_http_cache_turbo_shm_breaker_record(ngx_http_cache_turbo_zone_t *z,
-    ngx_uint_t success, ngx_uint_t threshold, time_t window)
+    ngx_uint_t success, ngx_uint_t threshold, time_t window, ngx_uint_t probe)
 {
     time_t            now;
     ngx_atomic_uint_t fails;
@@ -1257,7 +1278,19 @@ ngx_http_cache_turbo_shm_breaker_record(ngx_http_cache_turbo_zone_t *z,
          * closed against a dead origin indefinitely. O4.3 owns the probe
          * token if the residual turns out to matter in practice; it needs a
          * request-scoped handle this API does not have. */
-        if (state == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN) {
+        /* ⚠ O4.3: ONLY the request holding this lease's token may close it.
+         * Without the token check any success completing during HALF_OPEN
+         * closes the breaker -- including a request that began BEFORE the trip
+         * and whose "origin fine" verdict is stale by definition, and a
+         * concurrent request that was served from a peer's L2 fill and never
+         * touched the origin at all. Both release the herd toward an origin
+         * nothing actually probed. The token is the promotion's own stamp, so a
+         * leftover token from a previous lease fails this comparison too, which
+         * closes the ABA case the O4.1 comment flagged as residual. */
+        if (state == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN
+            && probe != NGX_HTTP_CACHE_TURBO_BREAKER_NO_PROBE
+            && probe == (ngx_uint_t) z->sh->breaker_probe_at)
+        {
             (void) ngx_atomic_cmp_set(&z->sh->breaker_state,
                                       NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN,
                                       NGX_HTTP_CACHE_TURBO_BREAKER_CLOSED);
@@ -1268,7 +1301,10 @@ ngx_http_cache_turbo_shm_breaker_record(ngx_http_cache_turbo_zone_t *z,
 
     /* --- failure --- */
 
-    if (state == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN) {
+    if (state == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN
+        && probe != NGX_HTTP_CACHE_TURBO_BREAKER_NO_PROBE
+        && probe == (ngx_uint_t) z->sh->breaker_probe_at)
+    {
         /* The probe failed: back to OPEN for a fresh window. Re-stamping
          * opened_at is what makes the next probe wait another open_for rather
          * than firing again immediately.
@@ -1288,7 +1324,15 @@ ngx_http_cache_turbo_shm_breaker_record(ngx_http_cache_turbo_zone_t *z,
         return;
     }
 
-    /* ⚠ window <= 0 is INERT, not "count forever". Skipping the re-anchor
+    /* O4.3: a failure during HALF_OPEN from someone who does NOT hold the lease
+     * lands here and is dropped by the state test below. That is deliberate and
+     * symmetric with the success side: while HALF_OPEN, the only outcome
+     * carrying current information about the origin is the probe's. A non-probe
+     * failure is either older than the trip or belongs to a request that never
+     * reached the origin, and letting it re-stamp opened_at would push the next
+     * probe out by a full open_for on evidence nobody gathered.
+     *
+     * ⚠ window <= 0 is INERT, not "count forever". Skipping the re-anchor
      * instead would let breaker_fails accumulate for the life of the zone and
      * trip on the Nth failure EVER recorded, days apart -- precisely the slow
      * trickle the rolling window exists to ignore. O4.4 feeds these values from

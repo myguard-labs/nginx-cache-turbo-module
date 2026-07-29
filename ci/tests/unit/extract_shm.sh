@@ -288,8 +288,6 @@ LINES=$(wc -l < "$OUT")
 # Derive the count rather than hardcoding it: a literal here goes stale the
 # moment the slice list grows and then reports a number that is simply wrong.
 FNS=$(grep -cE '^ngx_http_cache_turbo_[a-z_]+\(' "$OUT")
-echo "✓ extracted $FNS shm state functions — $LINES lines -> $OUT"
-
 # ⚠ O4.3: the pre-origin gate must consult the breaker AT MOST ONCE per request.
 # The access handler is re-entered from the top on every park/resume (L2 GET,
 # the v4-2 NX lock, each cold_wait re-poll), and _breaker_state() promotes only
@@ -310,3 +308,6 @@ if ! sed -n '/breaker_should_consult(clcf->enable/,/^    }$/p' "$MODSRC" \
     rm -f "$OUT"
     exit 1
 fi
+
+echo "✓ extracted $FNS shm state functions — $LINES lines -> $OUT"
+

@@ -4483,6 +4483,62 @@ ngx_http_cache_turbo_access_prologue(ngx_http_request_t *r,
 }
 
 
+/* PERF-7: request-pool cleanup that drops a zero-copy serve's blob reference once
+ * the response has been fully sent (pool destroy happens after the output chain
+ * drains). `z` + `data` identify the blob; the slab is freed here only if the
+ * owning node already detached it (evict/refresh/purge raced the serve). */
+typedef struct {
+    ngx_http_cache_turbo_zone_t  *z;
+    u_char                       *data;
+} ngx_http_cache_turbo_blob_cln_t;
+
+static void
+ngx_http_cache_turbo_blob_cleanup(void *data)
+{
+    ngx_http_cache_turbo_blob_cln_t  *c = data;
+
+    ngx_http_cache_turbo_blob_release(c->z, c->data);
+}
+
+
+/* P6/O4.3: register the pool cleanup that drops a breaker-armed blob's slab
+ * reference.
+ *
+ * The arming site pins the blob under the zone mutex (PERF-7 style) instead of
+ * copying it, but UNLIKE the serve paths it does not yet know whether the blob
+ * will ever be sent: most armed requests find a CLOSED breaker and run to the
+ * origin. So the reference is dropped by a cleanup tied to the REQUEST POOL
+ * rather than to a serve call, which covers both outcomes with one drop.
+ *
+ * ⚠ That is also why the breaker's _serve() calls pass ref_data = NULL. A
+ * second cleanup for the same blob would double-drop the refcount and free a
+ * slab still in use elsewhere.
+ *
+ * Returns NGX_ERROR when the cleanup cannot be registered; the caller must then
+ * release the reference itself and arm nothing.
+ */
+static ngx_int_t
+ngx_http_cache_turbo_brk_ref_cleanup(ngx_http_request_t *r,
+    ngx_http_cache_turbo_zone_t *z, u_char *data)
+{
+    ngx_pool_cleanup_t               *cln;
+    ngx_http_cache_turbo_blob_cln_t  *cc;
+
+    cln = ngx_pool_cleanup_add(r->pool,
+              sizeof(ngx_http_cache_turbo_blob_cln_t));
+    if (cln == NULL) {
+        return NGX_ERROR;
+    }
+
+    cln->handler = ngx_http_cache_turbo_blob_cleanup;
+    cc = cln->data;
+    cc->z = z;
+    cc->data = data;
+
+    return NGX_OK;
+}
+
+
 /*
  * P6/O4.3: answer a request the OPEN breaker refuses to forward and for which
  * no cached body of any age exists. 503 + Retry-After, generated locally with
@@ -4494,9 +4550,11 @@ ngx_http_cache_turbo_access_prologue(ngx_http_request_t *r,
  * time on a request this function has already sent a body for. NGX_DONE is what
  * stops the engine here.
  *
- * ⚠ Sent WITHOUT a body on a HEAD, and header_only is honoured by the same
- * early return the shared sender uses -- a Content-Length with no body would
- * desync a keepalive connection.
+ * On a HEAD the shared sender returns after ngx_http_send_header() via
+ * r->header_only, so the headers -- Content-Length included -- are emitted with
+ * no body. That is the correct HEAD representation per RFC 9110 §9.3.2
+ * (identical fields to the GET, body omitted), not a framing bug; nginx knows
+ * the response is body-less and keeps the connection in sync.
  *
  * Retry-After is advisory to the client and deliberately does NOT feed back
  * into the breaker's own timing: the breaker reopens on ITS schedule
@@ -4911,13 +4969,39 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
          * L2 GET and the cold-wait both re-enter this handler from the top),
          * exactly as !sie_armed does below. */
         if (ctn->len > 0 && !ctx->brk_armed && clcf->breaker_threshold > 0) {
-            u_char *snap = ngx_pnalloc(r->pool, ctn->len);
+            /* PERF-7 style zero-copy arm: pin the blob in the slab under the
+             * mutex we already hold instead of copying it. A full-blob memcpy
+             * here would run on EVERY enabled request that finds an expired
+             * entry, inside the cross-worker zone lock, on objects up to
+             * cache_turbo_max_object (1 MiB by default, configurable higher) --
+             * a lock convoy on precisely the outage path this feature is meant
+             * to smooth. The reference is released by the pool cleanup that
+             * ngx_http_cache_turbo_serve() registers for ref_data.
+             *
+             * ⚠ Arming does not mean serving: most armed requests fall through
+             * to the origin with a CLOSED breaker and never call _serve(). The
+             * ref must therefore be dropped when nobody consumes it, which is
+             * what the explicit cleanup below is for -- see brk_ref. */
+            ngx_http_cache_turbo_blob_acquire(ctn->data);
+            ctx->brk_snap = ctn->data;
+            ctx->brk_snap_len = ctn->len;
+            ctx->brk_ref = ctn->data;
+            ctx->brk_armed = 1;
 
-            if (snap != NULL) {
-                ngx_memcpy(snap, ctn->data, ctn->len);
-                ctx->brk_snap = snap;
-                ctx->brk_snap_len = ctn->len;
-                ctx->brk_armed = 1;
+            if (ngx_http_cache_turbo_brk_ref_cleanup(r, z, ctn->data)
+                != NGX_OK)
+            {
+                /* Could not register the drop: release now and arm nothing
+                 * rather than leak a pinned slab for the zone's lifetime. */
+                ctx->brk_armed = 0;
+                ctx->brk_snap = NULL;
+                ctx->brk_snap_len = 0;
+                ctx->brk_ref = NULL;
+                ngx_shmtx_unlock(&z->shpool->mutex);
+                ngx_http_cache_turbo_blob_release(z, ctn->data);
+                ngx_shmtx_lock(&z->shpool->mutex);
+
+            } else {
                 ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                                "cache_turbo: breaker fallback armed from L1 "
                                "\"%V\" key=%ui", &r->uri, (ngx_uint_t) hash);
@@ -5034,18 +5118,18 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                  * blob buffer is owned by the L2 read handler, and the breaker
                  * gate runs after further parks are possible. */
                 if (!ctx->brk_armed && clcf->breaker_threshold > 0) {
-                    u_char *snap = ngx_pnalloc(r->pool, ctx->l2_blob_len);
-
-                    if (snap != NULL) {
-                        ngx_memcpy(snap, ctx->l2_blob, ctx->l2_blob_len);
-                        ctx->brk_snap = snap;
-                        ctx->brk_snap_len = ctx->l2_blob_len;
-                        ctx->brk_armed = 1;
-                        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                                       "cache_turbo: breaker fallback armed from "
-                                       "L2 \"%V\" key=%ui", &r->uri,
-                                       (ngx_uint_t) hash);
-                    }
+                    /* No copy: ctx->l2_blob already lives in r->pool with the
+                     * same lifetime as this request, so pointing at it is both
+                     * correct and free. brk_ref stays NULL -- there is no shm
+                     * slab reference to drop. */
+                    ctx->brk_snap = ctx->l2_blob;
+                    ctx->brk_snap_len = ctx->l2_blob_len;
+                    ctx->brk_ref = NULL;
+                    ctx->brk_armed = 1;
+                    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                                   "cache_turbo: breaker fallback armed from "
+                                   "L2 \"%V\" key=%ui", &r->uri,
+                                   (ngx_uint_t) hash);
                 }
 
                 if (!ctx->sie_armed && bh.sie_ttl > 0
@@ -5159,77 +5243,119 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
         }
     }
 
+    /* only-if-cached (RFC 9111 §5.2.1.7): L1 missed/expired and L2 (if any) did
+     * not satisfy it either — both caches are exhausted. The client refuses
+     * origin contact, so answer 504 rather than engaging the cold-miss
+     * single-flight / origin path below. A fresh or stale HIT above already
+     * returned (only-if-cached is satisfied by any cache serve). */
+    if (ctx->req_only_if_cached) {
+
+        /* P6/O4.3: the breaker's any-age snapshot is still a CACHE serve with
+         * zero origin contact, so it satisfies only-if-cached in full -- but
+         * only when the breaker is already OPEN. Read the state RAW rather than
+         * through _breaker_state(), which is not a pure getter: it would
+         * promote this request to probe, and an only-if-cached request can
+         * never be a probe (it will not contact the origin by definition), so
+         * the lease would be burnt and the recovery window lost. The admin
+         * stats path reads raw for the same reason.
+         *
+         * A CLOSED or HALF_OPEN breaker falls through to the 504 below: with
+         * the origin believed reachable, serving a body past every configured
+         * window is the operator's outage policy, not this client's to invoke. */
+        if (ngx_http_cache_turbo_breaker_should_consult(clcf->enable,
+                clcf->breaker_threshold)
+            && ctx->brk_armed
+            && (ngx_uint_t) z->sh->breaker_state
+                   == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN)
+        {
+            (void) ngx_atomic_fetch_add(&z->sh->stale_serves, 1);
+            ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                           "cache_turbo: only-if-cached + breaker OPEN -> "
+                           "STALE-BREAKER serve \"%V\" key=%ui len=%uz",
+                           &r->uri, (ngx_uint_t) hash, ctx->brk_snap_len);
+            /* ref_data = NULL: the arming site owns the reference drop. */
+            return ngx_http_cache_turbo_serve(r, ctx->brk_snap,
+                       ctx->brk_snap_len, 1, z, NULL, "STALE-BREAKER");
+        }
+
+        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "cache_turbo: only-if-cached miss \"%V\" key=%ui -> 504",
+                       &r->uri, (ngx_uint_t) hash);
+        return NGX_HTTP_GATEWAY_TIME_OUT;
+    }
+
     /* ------------------------------------------------------------------
      * P6/O4.3: the pre-origin circuit-breaker gate.
      *
-     * This is the ONE chokepoint every request that is about to contact the
-     * origin passes through, exactly once: L1 has missed or fallen past its
-     * stale window, L2 has been consulted and did not satisfy us, and
-     * everything below this line (only-if-cached, min_uses, the cold-miss
-     * single-flight, the plain miss) either answers locally or returns
-     * NGX_DECLINED into the upstream. Serving a fresh or stale HIT returned
-     * long before here, which is the point: while the origin is down the
-     * breaker changes only what happens to requests that would otherwise walk
-     * into it.
+     * The chokepoint every ORIGIN-BOUND request passes exactly once: L1 has
+     * missed or fallen past its stale window, L2 has been consulted and did not
+     * satisfy us, and only-if-cached has already had its say. Everything below
+     * this line (min_uses, the cold-miss single-flight, the plain miss) either
+     * answers locally or returns NGX_DECLINED into the upstream.
      *
-     * ⚠ Placed BEFORE the only-if-cached gate below on purpose. A breaker
-     * serve is a CACHE serve with zero origin contact, so it satisfies
-     * only-if-cached in full; ordering it after would answer 504 to a request
-     * we could have served a body for.
+     * ⚠ SCOPE. This gate governs the requests this module can actually serve
+     * from cache: anonymous, cacheable, main GET/HEAD. The prologue turns away
+     * non-GET/HEAD, subrequests, Authorization-bearing requests, request
+     * no-cache, auto-classified dynamic URIs and configured bypasses BEFORE the
+     * handler ever gets here, and those still reach the origin while the
+     * breaker is OPEN. That is not an oversight to be "fixed" by 503-ing them:
+     * the breaker's whole mechanism is answering from a cached representation,
+     * and for a request the module never caches there is nothing to answer
+     * with. Refusing them would mean 503-ing authenticated and non-idempotent
+     * traffic on the strength of a breaker that never observed it.
      *
-     * ⚠ Placed BEFORE the cold-miss single-flight for the same reason the
-     * feature exists. A stampede onto a dead origin must not first claim a
-     * stub, park every loser in cold_wait() for a fill that can never arrive,
-     * and only then discover there is nothing to serve -- that converts an
-     * origin outage into lock_timeout of latency on every request plus a
-     * worker parked for each.
+     * ⚠ Placed AFTER the only-if-cached 504. RFC 9111 §5.2.1.7 makes 504 the
+     * required answer when the cache cannot satisfy such a request, so the
+     * breaker must not pre-empt it with a 503 -- and, more importantly, an
+     * only-if-cached request must never become the origin PROBE, because by
+     * definition it will not contact the origin. It would win the promotion and
+     * then exit locally, burning one recovery lease per open window. A request
+     * that CAN be satisfied from the breaker's snapshot returned above.
+     *
+     * ⚠ Placed BEFORE the cold-miss single-flight. A stampede onto a dead
+     * origin must not first claim a stub and park every loser in cold_wait()
+     * for a fill that can never arrive -- that turns an outage into lock_timeout
+     * of latency on every request plus a parked worker for each.
      *
      * Three verdicts, from ngx_http_cache_turbo_shm_breaker_state():
      *
      *   CLOSED     -- normal service. Fall through untouched.
-     *   HALF_OPEN  -- ⚠ WE ARE THE PROBE. The state call promotes exactly one
-     *                 request per open window and the promotion is a lease that
-     *                 only _breaker_record() (or its expiry) releases, so this
-     *                 request MUST reach the origin and report an outcome
-     *                 through the header filter. Serving it from cache instead
-     *                 would leave the breaker with nobody to close it and it
-     *                 would wedge OPEN until the lease timed out -- once per
-     *                 open window, forever. Falling through is mandatory, not a
-     *                 default.
-     *   OPEN       -- serve the fallback body if we armed one at either
-     *                 fall-through site above, else 503 + Retry-After. Either
-     *                 way: no origin contact.
+     *   HALF_OPEN  -- ⚠ WE ARE THE PROBE, and we hold the lease token in
+     *                 ctx->brk_probe. This request MUST reach the origin so the
+     *                 header filter can report the outcome back under that
+     *                 token; serving it from cache would leave the breaker with
+     *                 nobody to close it. Falling through is mandatory.
+     *   OPEN       -- serve the fallback body if one was armed, else 503 +
+     *                 Retry-After. Either way: no origin contact.
      *
      * ⚠ The state call is skipped entirely when threshold == 0. It is not a
      * pure getter -- it performs the due OPEN -> HALF_OPEN transition -- so
      * calling it with the breaker disabled would drive a state machine nothing
-     * can feed, and pay an shm read on every miss. Same off-switch discipline
-     * as the O4.2 recording site.
+     * can feed, and pay an shm read on every miss.
      */
     if (ngx_http_cache_turbo_breaker_should_consult(clcf->enable,
             clcf->breaker_threshold))
     {
         ngx_uint_t  bact;
 
-        /* ⚠ Consult at most ONCE per request; latch the verdict. This handler
-         * is re-entered from the top on every park/resume (L2 GET, the v4-2 NX
-         * lock, each cold_wait re-poll), and _breaker_state() is not a pure
-         * getter -- it promotes exactly one caller per open window and returns
-         * HALF_OPEN only to that promoter. Consulting twice therefore hands a
-         * request that WAS the probe an OPEN verdict on its resume, answers it
-         * locally, and leaves nobody to close the breaker. See the brk_consulted
-         * field comment for the full failure mode. */
+        /* ⚠ Consult at most ONCE per request; latch the verdict AND the lease
+         * token. This handler is re-entered from the top on every park/resume
+         * (L2 GET, the v4-2 NX lock, each cold_wait re-poll), and
+         * _breaker_state() is not a pure getter -- it promotes exactly one
+         * caller per open window and returns HALF_OPEN only to that promoter.
+         * Consulting twice therefore hands a request that WAS the probe an OPEN
+         * verdict on its resume, answers it locally, and leaves nobody to close
+         * the breaker. See the brk_consulted field comment. */
         if (!ctx->brk_consulted) {
             ctx->brk_consulted = 1;
-            ctx->brk_state =
-                ngx_http_cache_turbo_shm_breaker_state(z, clcf->breaker_open);
+            ctx->brk_state = ngx_http_cache_turbo_shm_breaker_state(
+                z, clcf->breaker_open, &ctx->brk_probe);
             ctx->brk_action = ngx_http_cache_turbo_breaker_action(
                 ctx->brk_state, ctx->brk_armed);
 
             if (ctx->brk_state == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN) {
-                /* Logged only on the consult that actually won the promotion,
-                 * not on every re-entry -- this line is the one trace that says
-                 * "this request owes the breaker an outcome". */
+                /* Logged only on the consult that actually won the promotion.
+                 * This line means "this request owes the breaker an outcome". */
                 ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                                "cache_turbo: breaker HALF_OPEN, this request is "
                                "the probe \"%V\" key=%ui -> origin",
@@ -5242,27 +5368,32 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
         if (bact != NGX_HTTP_CACHE_TURBO_BRK_ACT_PASS) {
 
             if (bact == NGX_HTTP_CACHE_TURBO_BRK_ACT_SERVE) {
-                /* Serve the stale body. ngx_http_cache_turbo_serve() is the
-                 * correct call here and there is NO double-finalize hazard: we
-                 * are in the ACCESS phase with no upstream in flight, which is
-                 * the same position the five existing _serve() call sites are
-                 * in. The hazard documented on ngx_http_cache_turbo_sie_rewrite()
-                 * is specific to the HEADER FILTER, where a send_header +
-                 * finalize would land inside ngx_http_special_response_handler
-                 * on an already-finalizing request. Do not "unify" the two.
+                /* Serve the stale body. ngx_http_cache_turbo_serve() is correct
+                 * here and there is NO double-finalize hazard: we are in the
+                 * ACCESS phase with no upstream in flight, the same position as
+                 * every other _serve() call site. The hazard documented on
+                 * ngx_http_cache_turbo_sie_rewrite() is specific to the HEADER
+                 * FILTER, where a send_header + finalize would land inside
+                 * ngx_http_special_response_handler on an already-finalizing
+                 * request. Do not "unify" the two.
                  *
                  * stale = 1 suppresses the conditional-GET 304 shortcut: this
                  * copy is past its window and has NOT been revalidated, so a
                  * 304 would tell the client its cached copy is still good on
-                 * the authority of an origin we cannot reach.
-                 *
-                 * ref_data = NULL: brk_snap is an r->pool copy, not an shm
-                 * pointer, so no blob reference is held or released. */
+                 * the authority of an origin we cannot reach. */
                 (void) ngx_atomic_fetch_add(&z->sh->stale_serves, 1);
                 ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                                "cache_turbo: breaker OPEN -> STALE-BREAKER serve "
                                "\"%V\" key=%ui len=%uz",
                                &r->uri, (ngx_uint_t) hash, ctx->brk_snap_len);
+                /* ref_data = NULL on purpose: when brk_snap points into the
+                 * slab, the ARMING site already registered the pool cleanup
+                 * that drops that reference. Passing ctx->brk_ref here would
+                 * register a SECOND cleanup for the same blob and double-drop
+                 * the refcount, freeing a slab another worker may still be
+                 * serving. The single cleanup covers both outcomes -- served
+                 * and not served -- because it is tied to the request pool, not
+                 * to this call. */
                 return ngx_http_cache_turbo_serve(r, ctx->brk_snap,
                            ctx->brk_snap_len, 1, z, NULL, "STALE-BREAKER");
             }
@@ -5276,19 +5407,6 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                            "-> 503", &r->uri, (ngx_uint_t) hash);
             return ngx_http_cache_turbo_breaker_unavailable(r, clcf);
         }
-
-    }
-
-    /* only-if-cached (RFC 9111 §5.2.1.7): L1 missed/expired and L2 (if any) did
-     * not satisfy it either — both caches are exhausted. The client refuses
-     * origin contact, so answer 504 rather than engaging the cold-miss
-     * single-flight / origin path below. A fresh or stale HIT above already
-     * returned (only-if-cached is satisfied by any cache serve). */
-    if (ctx->req_only_if_cached) {
-        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                       "cache_turbo: only-if-cached miss \"%V\" key=%ui -> 504",
-                       &r->uri, (ngx_uint_t) hash);
-        return NGX_HTTP_GATEWAY_TIME_OUT;
     }
 
     /* min_uses (v15): defer caching until the key has cold-missed min_uses times,
@@ -6112,11 +6230,15 @@ ngx_http_cache_turbo_restore_response(ngx_http_request_t *r, u_char *copy,
             return NGX_ERROR;
         }
 
-        /* Record the served outcome for $cache_turbo_status: "HIT" -> HIT,
-         * "STALE"/"STALE-IF-ERROR" -> STALE. */
+        /* Record the served outcome for $cache_turbo_status. Match the reason
+         * EXACTLY rather than switching on xcache[0]: O4.3 made this parameter
+         * caller-supplied ("STALE-BREAKER"), so a first-byte test silently
+         * turns every future reason beginning with 'H' into a fresh HIT. Any
+         * non-HIT reason -- "STALE", "STALE-IF-ERROR", "STALE-BREAKER" -- folds
+         * to STALE, which is what $upstream_cache_status compatibility wants. */
         sctx = ngx_http_get_module_ctx(r, ngx_http_cache_turbo_module);
         if (sctx != NULL) {
-            sctx->status = (xcache[0] == 'H')
+            sctx->status = (ngx_strcmp(xcache, "HIT") == 0)
                 ? NGX_HTTP_CACHE_TURBO_ST_HIT
                 : NGX_HTTP_CACHE_TURBO_ST_STALE;
         }
@@ -6125,24 +6247,6 @@ ngx_http_cache_turbo_restore_response(ngx_http_request_t *r, u_char *copy,
     *bodyp = body;
     *body_lenp = body_len;
     return NGX_OK;
-}
-
-
-/* PERF-7: request-pool cleanup that drops a zero-copy serve's blob reference once
- * the response has been fully sent (pool destroy happens after the output chain
- * drains). `z` + `data` identify the blob; the slab is freed here only if the
- * owning node already detached it (evict/refresh/purge raced the serve). */
-typedef struct {
-    ngx_http_cache_turbo_zone_t  *z;
-    u_char                       *data;
-} ngx_http_cache_turbo_blob_cln_t;
-
-static void
-ngx_http_cache_turbo_blob_cleanup(void *data)
-{
-    ngx_http_cache_turbo_blob_cln_t  *c = data;
-
-    ngx_http_cache_turbo_blob_release(c->z, c->data);
 }
 
 
@@ -6778,12 +6882,20 @@ ngx_http_cache_turbo_header_filter(ngx_http_request_t *r)
                r == r->main || ctx->warm,
                clcf->breaker_threshold))
     {
+        /* ⚠ ctx->brk_probe is the lease token, non-zero only when THIS request
+         * won the promotion. Passing it is what stops an unrelated origin
+         * response -- one that started before the trip, or one this module
+         * served from a peer's L2 fill -- from closing a HALF_OPEN breaker no
+         * probe actually tested. Non-probe requests pass 0 (NO_PROBE) and can
+         * still count failures toward a CLOSED breaker's threshold, which is
+         * the one thing they legitimately observe. */
         ngx_http_cache_turbo_shm_breaker_record(
             clcf->shm_zone->data,
             !ngx_http_cache_turbo_breaker_is_origin_failure(
                 r->headers_out.status),
             clcf->breaker_threshold,
-            clcf->breaker_window);
+            clcf->breaker_window,
+            ctx->brk_probe);
     }
 
     /* RFC-2 stale-if-error: an armed serve-on-error snapshot + a status the
@@ -11245,7 +11357,7 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->breaker_threshold = NGX_CONF_UNSET_UINT; /* O4.2; merges to 0 = off */
     conf->breaker_window = NGX_CONF_UNSET;         /* O4.2; merges to 0 = off */
     conf->breaker_open = NGX_CONF_UNSET;           /* O4.3; see the merge note */
-    conf->breaker_retry_after = NGX_CONF_UNSET;    /* O4.3; merges to 0 = off */
+    conf->breaker_retry_after = NGX_CONF_UNSET;    /* O4.3; merges to 30s   */
     conf->max_size = NGX_CONF_UNSET_SIZE;
     conf->suppress_native = NGX_CONF_UNSET;
     conf->redis_enable = NGX_CONF_UNSET;
