@@ -5209,10 +5209,35 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
     if (ngx_http_cache_turbo_breaker_should_consult(clcf->enable,
             clcf->breaker_threshold))
     {
-        ngx_uint_t  bstate =
-            ngx_http_cache_turbo_shm_breaker_state(z, clcf->breaker_open);
-        ngx_uint_t  bact =
-            ngx_http_cache_turbo_breaker_action(bstate, ctx->brk_armed);
+        ngx_uint_t  bact;
+
+        /* ⚠ Consult at most ONCE per request; latch the verdict. This handler
+         * is re-entered from the top on every park/resume (L2 GET, the v4-2 NX
+         * lock, each cold_wait re-poll), and _breaker_state() is not a pure
+         * getter -- it promotes exactly one caller per open window and returns
+         * HALF_OPEN only to that promoter. Consulting twice therefore hands a
+         * request that WAS the probe an OPEN verdict on its resume, answers it
+         * locally, and leaves nobody to close the breaker. See the brk_consulted
+         * field comment for the full failure mode. */
+        if (!ctx->brk_consulted) {
+            ctx->brk_consulted = 1;
+            ctx->brk_state =
+                ngx_http_cache_turbo_shm_breaker_state(z, clcf->breaker_open);
+            ctx->brk_action = ngx_http_cache_turbo_breaker_action(
+                ctx->brk_state, ctx->brk_armed);
+
+            if (ctx->brk_state == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN) {
+                /* Logged only on the consult that actually won the promotion,
+                 * not on every re-entry -- this line is the one trace that says
+                 * "this request owes the breaker an outcome". */
+                ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                               "cache_turbo: breaker HALF_OPEN, this request is "
+                               "the probe \"%V\" key=%ui -> origin",
+                               &r->uri, (ngx_uint_t) hash);
+            }
+        }
+
+        bact = ctx->brk_action;
 
         if (bact != NGX_HTTP_CACHE_TURBO_BRK_ACT_PASS) {
 
@@ -5252,12 +5277,6 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
             return ngx_http_cache_turbo_breaker_unavailable(r, clcf);
         }
 
-        if (bstate == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN) {
-            ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                           "cache_turbo: breaker HALF_OPEN, this request is the "
-                           "probe \"%V\" key=%ui -> origin",
-                           &r->uri, (ngx_uint_t) hash);
-        }
     }
 
     /* only-if-cached (RFC 9111 §5.2.1.7): L1 missed/expired and L2 (if any) did

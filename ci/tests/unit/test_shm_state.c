@@ -1409,6 +1409,64 @@ test_breaker_probe_passes_and_recovery_completes(void)
 }
 
 
+/* P6/O4.3: consulting the breaker TWICE for one request wedges it.
+ *
+ * The access handler is re-entered from the top on every park/resume (L2 GET,
+ * the v4-2 NX lock, each cold_wait re-poll). _breaker_state() promotes exactly
+ * one caller per open window and returns HALF_OPEN only to that promoter, so a
+ * request that was promoted and then parked is handed OPEN on its resume --
+ * answered from cache, never reaching the origin, leaving nobody to report an
+ * outcome. The production fix is the ctx->brk_consulted latch; this pins the
+ * shm-level behaviour that makes the latch necessary, so a future "simplify"
+ * that drops it fails here rather than in an outage.
+ *
+ * ⚠ This test asserts the SECOND call returns OPEN. That is not the desired
+ * behaviour of the request path -- it is the trap the request path must avoid. */
+static void
+test_breaker_second_consult_loses_the_probe(void)
+{
+    ngx_uint_t  i, first, second;
+
+    printf("breaker/O4.3: a second consult in one request loses the probe\n");
+
+    zone_reset();
+    ngx_test_set_time(1000);
+
+    for (i = 0; i < 3; i++) {
+        ngx_http_cache_turbo_shm_breaker_record(
+            &g_zone,
+            !ngx_http_cache_turbo_breaker_is_origin_failure(503),
+            3, 60);
+    }
+
+    ngx_test_set_time(1031);
+
+    first = ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30);
+    CHECK(first == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN,
+          "the first consult was not promoted to probe");
+    CHECK(ngx_http_cache_turbo_breaker_action(first, 1)
+              == NGX_HTTP_CACHE_TURBO_BRK_ACT_PASS,
+          "the promoted probe was not sent to the origin");
+
+    /* The SAME request consulting again -- what an unlatched gate does on a
+     * park/resume. It is no longer the promoter, so it is told OPEN. */
+    second = ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30);
+    CHECK(second == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
+          "a second consult did not return OPEN — if this ever changes, the "
+          "brk_consulted latch's rationale needs rechecking");
+    CHECK(ngx_http_cache_turbo_breaker_action(second, 1)
+              == NGX_HTTP_CACHE_TURBO_BRK_ACT_SERVE,
+          "the re-consulted request was not diverted — this is the wedge: it "
+          "holds the probe lease but is answered from cache, so no outcome is "
+          "ever recorded and the breaker cannot close");
+
+    /* Nothing closed the breaker, because the probe never reported. */
+    CHECK((ngx_uint_t) g_zone.sh->breaker_state
+              == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN,
+          "the breaker left the half-open lease unexpectedly");
+}
+
+
 /* The predicate is what the request path actually feeds to _record(), so drive
  * the real pair end to end: a run of 5xx trips the breaker, and the same number
  * of 404s does not. This is the assertion that would catch the two being wired
@@ -1779,6 +1837,7 @@ main(void)
     test_breaker_should_consult_admission();
     test_breaker_action_mapping();
     test_breaker_probe_passes_and_recovery_completes();
+    test_breaker_second_consult_loses_the_probe();
     run_negative_controls();
 
     /* Every node this run allocated must be accounted for. Under ASan a real

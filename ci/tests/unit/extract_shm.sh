@@ -289,3 +289,24 @@ LINES=$(wc -l < "$OUT")
 # moment the slice list grows and then reports a number that is simply wrong.
 FNS=$(grep -cE '^ngx_http_cache_turbo_[a-z_]+\(' "$OUT")
 echo "✓ extracted $FNS shm state functions — $LINES lines -> $OUT"
+
+# ⚠ O4.3: the pre-origin gate must consult the breaker AT MOST ONCE per request.
+# The access handler is re-entered from the top on every park/resume (L2 GET,
+# the v4-2 NX lock, each cold_wait re-poll), and _breaker_state() promotes only
+# one caller per open window and returns HALF_OPEN only to that promoter. An
+# unlatched gate therefore hands a request that WAS the probe an OPEN verdict on
+# its resume, answers it locally, and leaves nobody to close the breaker -- one
+# burnt probe per window, indefinitely.
+#
+# Checked against module.c rather than the slice: the gate lives in the access
+# handler, which is not extracted. Comments stripped first, as everywhere here.
+if ! sed -n '/breaker_should_consult(clcf->enable/,/^    }$/p' "$MODSRC" \
+   | sed -E 's;/\*.*;;; s;^[[:space:]]*\*.*;;' \
+   | grep -q 'brk_consulted'; then
+    echo "✗ O4.3 regression: the pre-origin breaker gate lost its" >&2
+    echo "  ctx->brk_consulted latch. The handler is re-entered on every" >&2
+    echo "  park/resume, so the promoted probe would be re-consulted, told" >&2
+    echo "  OPEN, and answered from cache -- wedging the breaker." >&2
+    rm -f "$OUT"
+    exit 1
+fi

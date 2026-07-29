@@ -1396,6 +1396,36 @@ typedef struct {
     unsigned                 brk_armed:1;     /* a breaker fallback is stashed  */
     u_char                  *brk_snap;        /* blob copy, any age (r->pool)   */
     size_t                   brk_snap_len;
+
+    /* P6/O4.3: the pre-origin gate's verdict, latched on first consult.
+     *
+     * ⚠ THE GATE MUST BE CONSULTED AT MOST ONCE PER REQUEST, and these two
+     * fields are what enforces it. The access handler is re-entered from the
+     * TOP on every park/resume (the L2 GET park, the v4-2 Redis NX lock park,
+     * and each cold_wait() re-poll), so an unguarded gate calls
+     * _breaker_state() several times for one request.
+     *
+     * That is not merely wasteful, it is the wedge the whole design exists to
+     * avoid. _breaker_state() is not a pure getter: it PROMOTES exactly one
+     * caller per open window to HALF_OPEN, and it returns HALF_OPEN only to
+     * that promoter -- every later call, including a later call by the SAME
+     * request, is told OPEN (shm.c:1188). So a request promoted to probe that
+     * then parks would, on its resume, be handed OPEN, get answered from cache
+     * or 503'd, and never reach the origin. Nothing would record an outcome,
+     * and the breaker would stay open until the lease expired -- burning one
+     * probe per window forever, which is exactly the failure the HALF_OPEN
+     * pass-through is designed to prevent.
+     *
+     * Latching also keeps the verdict COHERENT across a resume: a request must
+     * not be told PASS before parking and SERVE afterwards because a different
+     * worker tripped the breaker meanwhile. It committed to going to the
+     * origin; it goes.
+     *
+     * Same idempotence discipline as l2_miss_counted, min_uses_passed and
+     * sie_armed, all of which guard the identical re-entry hazard. */
+    unsigned                 brk_consulted:1; /* gate already ran this request  */
+    ngx_uint_t               brk_action;      /* latched BRK_ACT_* verdict      */
+    ngx_uint_t               brk_state;       /* latched BREAKER_* state        */
     /* Per-request serve outcome for $cache_turbo_status / access logging. One of
      * NGX_HTTP_CACHE_TURBO_ST_*; defaults to ST_MISS (0) via pcalloc and is
      * overridden to HIT/STALE at the X-Cache emit site, BYPASS on the
