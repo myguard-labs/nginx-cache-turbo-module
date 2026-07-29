@@ -5401,7 +5401,17 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
             /* Nothing cached at any age: answer immediately rather than
              * spending a full connect/read timeout on a corpse. This is the
              * worker-exhaustion case the breaker exists for -- the 503 is the
-             * feature, not a failure. */
+             * feature, not a failure.
+             *
+             * Counted as a MISS so the zone totals stay reconcilable: every
+             * other terminal branch in this handler bumps one of hits /
+             * stale_serves / misses, and a branch that bumps nothing makes
+             * hits+stale_serves+misses silently undercount once O4.4 makes the
+             * breaker reachable. A miss is also what this is -- nothing was
+             * served from cache. A dedicated breaker_serves/breaker_opens pair
+             * belongs to S7.1, which owns the observability surface; do not
+             * invent one here. */
+            (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
             ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                            "cache_turbo: breaker OPEN, no body \"%V\" key=%ui "
                            "-> 503", &r->uri, (ngx_uint_t) hash);
