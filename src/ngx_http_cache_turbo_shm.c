@@ -1099,6 +1099,13 @@ ngx_http_cache_turbo_shm_l2_neg_set(ngx_http_cache_turbo_zone_t *z,
  *   OPEN --(open_for elapsed)--------------->  HALF_OPEN   (one probe allowed)
  * HALF_OPEN --(probe succeeded)------------->  CLOSED
  * HALF_OPEN --(probe failed)---------------->  OPEN        (fresh open window)
+ * HALF_OPEN --(lease expired, probe never reported)--> OPEN (reclaim)
+ *
+ * ⚠ O4.4-a: the two durations above are INDEPENDENT. open_for drives the
+ * OPEN -> HALF_OPEN edge; the reclaim edge is driven by the internal
+ * NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_LEASE. Driving both from open_for let a
+ * probe slower than open_for be reclaimed mid-flight, which wedged the breaker
+ * permanently OPEN against a slow-but-healthy origin.
  *
  * ⚠ NO LOCK IS TAKEN HERE, deliberately -- see the field block in module.h.
  * Every transition is one ngx_atomic_cmp_set on sh->breaker_state; the losing
@@ -1131,6 +1138,8 @@ ngx_http_cache_turbo_shm_l2_neg_set(ngx_http_cache_turbo_zone_t *z,
  * `open_for` is how long an OPEN lasts before one probe is let through. A
  * caller passing 0 disables the timed reopen (the breaker stays OPEN until a
  * recorded success), which is why the guard below is `> 0` and not an assert.
+ * It does NOT bound how long the promoted probe may take -- that is the
+ * internal NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_LEASE (O4.4-a).
  *
  * Exactly ONE request per open window is promoted to the probe: the CAS on
  * OPEN -> HALF_OPEN has a single winner, and every other request keeps seeing
@@ -1176,8 +1185,15 @@ ngx_http_cache_turbo_shm_breaker_state(ngx_http_cache_turbo_zone_t *z,
      * aborted, or its worker was killed between promotion and _record()).
      * Nothing would ever move the state again, so the breaker would wedge in
      * HALF_OPEN forever. breaker_probe_at makes the promotion a time-bounded
-     * LEASE: once it has gone stale by open_for, the next caller reclaims the
-     * probe slot with a CAS -- again a single winner. */
+     * LEASE: once it has gone stale by BREAKER_PROBE_LEASE, the next caller
+     * reclaims the probe slot with a CAS -- again a single winner.
+     *
+     * ⚠ O4.4-a: the lease duration is that INTERNAL constant and deliberately
+     * NOT open_for. Reclaiming on open_for meant any probe slower than it was
+     * reclaimed in flight, so a slow-but-healthy origin could never close the
+     * breaker. See the constant's block in the header for why it is not a
+     * directive. open_for still gates this branch, but only as "is the breaker
+     * configured at all" -- the same test the promotion below makes. */
     if (state == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN) {
 
         /* ⚠ O4.3-c: a lease whose stamp is not yet PUBLISHED is not stale, it
@@ -1196,7 +1212,8 @@ ngx_http_cache_turbo_shm_breaker_state(ngx_http_cache_turbo_zone_t *z,
          * test_breaker_unpublished_lease_is_not_reclaimable(). */
         if (open_for > 0
             && z->sh->breaker_probe_at != 0
-            && now - (time_t) z->sh->breaker_probe_at >= open_for
+            && now - (time_t) z->sh->breaker_probe_at
+                   >= (time_t) NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_LEASE
             && ngx_atomic_cmp_set(&z->sh->breaker_state, (ngx_atomic_uint_t) word,
                                   (ngx_atomic_uint_t)
                                       ngx_http_cache_turbo_brk_pack(

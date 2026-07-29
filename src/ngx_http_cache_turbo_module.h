@@ -544,6 +544,34 @@ typedef struct {
  * never match a live lease. */
 #define NGX_HTTP_CACHE_TURBO_BREAKER_NO_PROBE  0
 
+/*
+ * P6/O4.4-a -- how long a promoted probe OWNS its lease, deliberately NOT
+ * breaker_open.
+ *
+ * These are two unrelated durations that an earlier revision conflated.
+ * breaker_open answers "how long does OPEN wait before letting one probe
+ * through"; this answers "how long may that probe take before we assume its
+ * worker died and admit a replacement". Reclaiming on breaker_open makes any
+ * probe SLOWER than breaker_open get its lease reclaimed while still in flight
+ * -- its healthy response then arrives holding a superseded generation and is
+ * correctly discarded, so the breaker trips and can never close again.
+ *
+ * ⚠ The shipped `breaker_open 30s` default sat squarely inside that hazard:
+ * nginx's proxy_connect_timeout and proxy_read_timeout both default to 60s, so
+ * an origin that is merely SLOW -- not dead -- could never close the breaker.
+ *
+ * 300s is chosen to clear the ~120s that those two defaults bound an origin
+ * attempt to, with margin for a hand-raised read timeout, while still bounding
+ * a genuinely abandoned lease to something an operator would wait out. It is
+ * INTERNAL on purpose (decision, 2026-07-29): a directive would add a third
+ * argument to _breaker_state() and a knob with no tuning signal behind it.
+ * The lease is a liveness backstop, not a policy -- the ordinary path resolves
+ * it in _breaker_record() the moment the probe reports, whatever this value is.
+ *
+ * Pinned by test_breaker_probe_lease_is_independent_of_open().
+ */
+#define NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_LEASE  300
+
 #define NGX_HTTP_CACHE_TURBO_BRK_ACT_PASS   0  /* fall through, ordinary request */
 #define NGX_HTTP_CACHE_TURBO_BRK_ACT_SERVE  1  /* serve the fallback body        */
 #define NGX_HTTP_CACHE_TURBO_BRK_ACT_FAIL   2  /* 503 + Retry-After, no origin   */
@@ -777,6 +805,11 @@ typedef struct {
      * permanently. breaker_probe_at exists to bound exactly that: the promotion
      * is a LEASE, and a stale one is reclaimed. See _breaker_state().
      *
+     * ⚠ O4.4-a: that lease elapses after BREAKER_PROBE_LEASE, which is NOT
+     * breaker_open. Bounding it by breaker_open instead reclaimed any probe
+     * slower than breaker_open while it was still in flight, so a
+     * slow-but-healthy origin could never close the breaker.
+     *
      * The cost of that choice is that the fields are NOT mutually consistent
      * under concurrency, so nothing may read two of them and assume they
      * describe the same instant. Each transition is carried by a single CAS on
@@ -805,8 +838,8 @@ typedef struct {
     ngx_atomic_t             breaker_window_start; /* epoch s, window anchor   */
     ngx_atomic_t             breaker_opened_at;    /* epoch s the OPEN began   */
     ngx_atomic_t             breaker_probe_at;     /* epoch s probe admitted;
-                                                    * its LEASE deadline is
-                                                    * this + open_for         */
+                                                    * lease elapses after
+                                                    * BREAKER_PROBE_LEASE     */
     ngx_atomic_t             breaker_opens;        /* lifetime CLOSED→OPEN     */
 } ngx_http_cache_turbo_shctx_t;
 
@@ -1696,9 +1729,12 @@ void ngx_http_cache_turbo_shm_l2_neg_set(ngx_http_cache_turbo_zone_t *z,
  * and a promoted probe that ends up served from a peer's L2 fill leaves the
  * breaker with no outcome at all. Pass NO_PROBE from every non-probe site.
  *
- * The token is the promotion's breaker_probe_at stamp, which is already unique
- * per lease -- no new shm field, and a stale token from a previous lease simply
- * fails the comparison. */
+ * ⚠ The token is the promotion's GENERATION, unpacked out of breaker_state --
+ * NOT the breaker_probe_at stamp an earlier revision used. Two leases promoted
+ * in the same wall-clock second carry the same stamp, so a stamp token could
+ * not tell a superseded probe from the current one (O4.3-c/F1). The generation
+ * is bumped by every promotion and CASed as part of the same atomic word, so a
+ * stale token cannot resolve a lease that replaced it. */
 ngx_uint_t ngx_http_cache_turbo_shm_breaker_state(
     ngx_http_cache_turbo_zone_t *z, time_t open_for, ngx_uint_t *probe);
 void ngx_http_cache_turbo_shm_breaker_record(ngx_http_cache_turbo_zone_t *z,
