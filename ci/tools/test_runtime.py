@@ -323,6 +323,11 @@ class Origin:
     def __init__(self, port: int, delay: float = 0.0) -> None:
         self.port = port
         self.delay = delay
+        # The suite-wide baseline (run_all builds the Origin with delay=0.05).
+        # Tests that borrow `delay` for a slow-miss window MUST restore to this,
+        # not to a hardcoded 0.0 -- several burst tests downstream depend on a
+        # non-zero regeneration window to be non-vacuous. See reset_delay().
+        self.default_delay = delay
         self.fail = False          # when True, every GET answers 503 (v8 SIE)
         self.fail_status = 503     # status `fail` answers with. 503 keeps every
                                    # pre-S4.2 caller byte-identical; S4.2's
@@ -338,6 +343,19 @@ class Origin:
         self._lock = threading.Lock()
         self._server: http.server.ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
+
+    def reset_delay(self) -> None:
+        """Restore `delay` to the suite baseline after a test borrowed it.
+
+        ⚠ Restoring to a hardcoded 0.0 instead is a SILENT test-weakening bug,
+        and it shipped: run_all builds the Origin with delay=0.05, the autotune
+        tests set it to 0.04 and reset it to 0.0, and every burst test after
+        them then ran against an INSTANT origin. With no regeneration window
+        left, a single-flight winner fills L1 before the other threads issue, so
+        they take CLAIM_FRESH and never park -- collapsing the lock_waits
+        liveness assert to 0 (SUITE-8) and voiding the 50ms window
+        test_lock_redis_outage_fallback's docstring claims to rely on."""
+        self.delay = self.default_delay
 
     @property
     def hits(self) -> int:
@@ -11515,6 +11533,30 @@ def test_l2_unserveable_giveup_still_single_flights(
     base = origin.hits
     waits0 = _admin_lock_waits(ng)
 
+    # ⚠ PRECONDITION, not decoration. The lock_waits assert at the end of this
+    # test is a LIVENESS proxy ("someone actually parked"), and it is only
+    # meaningful while the winner's origin fetch is still in flight when the
+    # stragglers arrive. With an INSTANT origin the winner fills L1 first, the
+    # rest take CLAIM_FRESH without ever entering cold_wait(), and the delta
+    # decays toward 0 -- a test-harness artefact that looks exactly like a
+    # single-flight defect (SUITE-8).
+    #
+    # Measured on this burst, pinned to 2 cores: delay=0.05 gives a lock_waits
+    # delta of 39/39/39, delay=0.0 gives 39/23/8 -- same regens==1 (the module
+    # is correct either way), but the margin erodes to near-zero. CI's slower
+    # single-process ASan arm is where 8 becomes 0.
+    #
+    # This tripped because the autotune tests upstream in run_all() borrow
+    # origin.delay and used to restore it to a hardcoded 0.0 instead of the
+    # suite baseline. Origin.reset_delay() now restores the real default; this
+    # assert makes a regression of that fail HERE, loudly, instead of showing up
+    # as a rare unexplained flake in the assertion below.
+    assert origin.delay > 0, (
+        f"origin.delay is {origin.delay}: an instant origin leaves no "
+        f"regeneration window for the losers to park in, making the lock_waits "
+        f"liveness assert below vacuous. An upstream test borrowed origin.delay "
+        f"and did not restore it via origin.reset_delay().")
+
     # All 40 readers rendezvous at the barrier before hitting the key, so they
     # reach the cold-miss claim inside the same window. Without this the burst
     # can legitimately produce ZERO waiters: a regen here stays fresh for 30s,
@@ -12784,7 +12826,7 @@ def test_autotune_raises_beta_within_band(ng: Nginx, origin: Origin) -> None:
             f"conservative effective beta {con} not clamped to its band from {beta}"
         assert con < bal, f"conservative ({con}) should be below balanced ({bal})"
     finally:
-        origin.delay = 0.0
+        origin.reset_delay()
         drain_origin(origin)   # v8: settle async bg refreshes before next test
 
 
@@ -12805,7 +12847,7 @@ def test_autotune_load_factor_under_load(ng: Nginx, origin: Origin) -> None:
         assert load == 4000, \
             f"load factor should saturate at the 4000 cap for a ~40ms origin: {st}"
     finally:
-        origin.delay = 0.0
+        origin.reset_delay()
         drain_origin(origin)
 
     # Snap-back: a window dominated by HITS (few misses, hit-rate >= 95%) does not
@@ -12832,10 +12874,12 @@ def test_autotune_load_widens_stale_window(ng: Nginx, origin: Origin) -> None:
         _fire_misses(ng, "/atl/k", 110)          # pump the zone load factor
         st = _autotune_force(ng, "/_cache_atl")
         assert st["autotuned_load"] >= 2000, f"load not pumped: {st}"
-        origin.delay = 0.0
+        origin.delay = 0.0   # deliberate, NOT a restore: the probe prime must be
+                             # instant so it lands well inside the 1s fresh window.
+                             # The finally below does the real restore.
         fetch(ng.port, "/atl/probe")             # prime the probe (fresh 1s)
     finally:
-        origin.delay = 0.0
+        origin.reset_delay()
 
     time.sleep(3.0)                              # past static 2s, within widened ~5s
 
@@ -12871,7 +12915,7 @@ def test_autotune_insufficient_data(ng: Nginx, origin: Origin) -> None:
         st = _autotune_force(ng, "/_cache_ati")  # recompute: thin window -> no verdict
         assert st["autotuned_beta"] == 0, f"thin data wrongly tuned: {st}"
     finally:
-        origin.delay = 0.0
+        origin.reset_delay()
         drain_origin(origin)   # v8: settle async bg refreshes before next test
 
 
@@ -12897,7 +12941,7 @@ def test_autotune_churn_disqualifies(ng: Nginx, origin: Origin) -> None:
         assert st["autotuned_beta"] == 0, \
             f"churn-heavy window should be vetoed, got {st}"
     finally:
-        origin.delay = 0.0
+        origin.reset_delay()
         drain_origin(origin)   # v8: settle async bg refreshes before next test
 
 
