@@ -1130,16 +1130,27 @@ typedef struct {
      * ngx_http_cache_turbo_header_filter (S4.2). */
     ngx_uint_t               use_stale;
 
+    /* cache_turbo_breaker on|off (O4.4). Separate on/off switch from the
+     * module's own `enable`: a location can have cache_turbo on with the
+     * breaker left off (today's behaviour, and the default), or the breaker
+     * explicitly re-enabled/disabled per-location independently of caching
+     * itself. NGX_CONF_UNSET until merge; merges to off (0) — see
+     * ngx_http_cache_turbo_breaker_should_consult() for the full admission
+     * rule this feeds. This is one of THREE independent ways to express
+     * "breaker off": the flag itself, `breaker_threshold 0`, or
+     * `breaker_window 0`. */
+    ngx_flag_t               breaker_enable;
+
     /* P6/O4.2 circuit-breaker tuning. Fed to
      * ngx_http_cache_turbo_shm_breaker_record() from the request path; the
      * O4.3 serve-path read and the directives that set these are O4.4.
      *
      * ⚠ Both merge to 0, and 0 is INERT on purpose (see the contract in
      * _breaker_record(): threshold == 0 disables tripping, window == 0
-     * likewise). Until O4.4 adds the parsers there is no config that can make
-     * either non-zero, so O4.2 records outcomes into a breaker that can never
-     * trip -- behaviour is byte-for-byte unchanged, which is what makes this
-     * step safe to merge on its own, exactly as O4.1 was.
+     * likewise). O4.4 adds the parsers that can make either non-zero;
+     * whether the breaker is actually consulted is decided by
+     * ngx_http_cache_turbo_breaker_should_consult(), which additionally
+     * requires breaker_enable and clcf->enable.
      *
      * NOT derived from `use_stale`. "Should I serve stale?" and "is the origin
      * down?" are different questions that merely overlap on 5xx: use_stale may
@@ -1165,13 +1176,22 @@ typedef struct {
      * promotes a probe and stays open until a recorded success -- and while
      * OPEN nobody talks to the origin, so no success can ever be recorded. The
      * breaker would wedge permanently. It is inert today only because
-     * threshold == 0 means it can never trip in the first place; O4.4 MUST
-     * default this to a non-zero value (and reject 0) once the breaker can be
-     * switched on. Tracked as O4.3-a in memory issues.md. */
-    time_t                   breaker_open;      /* OPEN duration s before probe */
+     * threshold == 0 means it can never trip in the first place. O4.4's
+     * `cache_turbo_breaker_open` directive REJECTS a literal 0 as a hard
+     * config error rather than accept it as a disable — see
+     * ngx_http_cache_turbo_breaker_open_conf(). Tracked as O4.3-a in memory
+     * issues.md. Default merges to 30s (non-zero, unlike every sibling
+     * breaker field). */
+    time_t                   breaker_open;      /* OPEN duration s; never 0 */
 
     /* Retry-After seconds sent with the breaker's 503. Advisory to the client;
-     * has no effect on the breaker's own timing. */
+     * has no effect on the breaker's own timing.
+     *
+     * cache_turbo_breaker_retry_after is an explicit knob (NGX_CONF_UNSET
+     * until set). When left unset, merge derives it from the EFFECTIVE
+     * breaker_open rather than a hardcoded constant, so the two stay in sync
+     * by default — the Retry-After hint then always names about when the
+     * next probe is actually due. */
     time_t                   breaker_retry_after;
 
     /* L2 Redis (v2b). Native async client, no hiredis. The L2 store is touched

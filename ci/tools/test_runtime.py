@@ -2032,6 +2032,48 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # O4.4: the circuit breaker's own on/off switch (cache_turbo_breaker),
+        # independent of the threshold/window off-switches the config-parse
+        # tests already cover. NO keep_stale/use_stale window here on purpose:
+        # once the entry is past its stale window (1s fresh, x4=4s stale) the
+        # ONLY thing that can still answer a dead origin with a cached body is
+        # the breaker's own any-age fallback (call site 1 in
+        # ngx_http_cache_turbo_access_handler) -- so this isolates that call
+        # site's routing through breaker_should_consult() rather than
+        # overlapping RFC-2/keep_stale, which have their own coverage above.
+        # Drives test_breaker_arming_gated_on_breaker_enable.
+        location /breakeron/ {{
+            cache_turbo                    main;
+            cache_turbo_key                $uri;
+            cache_turbo_valid               1s;
+            cache_turbo_breaker             on;
+            cache_turbo_breaker_threshold   1;
+            cache_turbo_breaker_window     60s;
+            cache_turbo_breaker_open       30s;
+            cache_turbo_lock_timeout        2s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # Negative control for /breakeron/: identical apart from
+        # `cache_turbo_breaker off`. threshold/window/open are still set (an
+        # operator who left the breaker off but configured the tuning knobs)
+        # -- if breaker_enable were not an independent gate at the arming call
+        # site, this location would ALSO fall back to the stale snapshot on a
+        # dead origin, exactly like /breakeron/. It must instead surface the
+        # origin failure, because with the breaker off nothing may EVER be
+        # armed or consulted.
+        location /breakeroff/ {{
+            cache_turbo                    main;
+            cache_turbo_key                $uri;
+            cache_turbo_valid               1s;
+            cache_turbo_breaker             off;
+            cache_turbo_breaker_threshold   1;
+            cache_turbo_breaker_window     60s;
+            cache_turbo_breaker_open       30s;
+            cache_turbo_lock_timeout        2s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # Negative control for /keepstale/: identical location, keep_stale off
         # (the default) -> an expired entry with a dead origin must surface the
         # error (502), not serve stale. Proves the positive result above is
@@ -6721,6 +6763,109 @@ def _config_accepts(ng: Nginx, tag: str, old: str, new: str) -> None:
                        stderr=subprocess.STDOUT, timeout=20)
     assert r.returncode == 0, \
         f"{tag}: config was REJECTED by nginx -t but must be accepted:\n{r.stdout}"
+
+
+def test_breaker_directives_accepted(ng: Nginx) -> None:
+    """O4.4: the four breaker directives parse. Each is appended standalone
+    after the zone's cache_turbo_valid line (present verbatim in every
+    generated config) so the test does not depend on any one location block's
+    exact directive set."""
+    _config_accepts(ng, "breaker-flag-on",
+                    "cache_turbo_valid    0;",
+                    "cache_turbo_valid    0;\n"
+                    "            cache_turbo_breaker on;")
+    _config_accepts(ng, "breaker-flag-off",
+                    "cache_turbo_valid    0;",
+                    "cache_turbo_valid    0;\n"
+                    "            cache_turbo_breaker off;")
+    _config_accepts(ng, "breaker-threshold",
+                    "cache_turbo_valid    0;",
+                    "cache_turbo_valid    0;\n"
+                    "            cache_turbo_breaker_threshold 5;")
+    _config_accepts(ng, "breaker-window",
+                    "cache_turbo_valid    0;",
+                    "cache_turbo_valid    0;\n"
+                    "            cache_turbo_breaker_window 30s;")
+    _config_accepts(ng, "breaker-open-nonzero",
+                    "cache_turbo_valid    0;",
+                    "cache_turbo_valid    0;\n"
+                    "            cache_turbo_breaker_open 15s;")
+    _config_accepts(ng, "breaker-retry-after",
+                    "cache_turbo_valid    0;",
+                    "cache_turbo_valid    0;\n"
+                    "            cache_turbo_breaker_retry_after 20s;")
+
+
+def test_breaker_open_zero_rejected(ng: Nginx) -> None:
+    """O4.3-a / O4.4 regression pin: `cache_turbo_breaker_open 0` MUST be a
+    hard config error, not accepted as a disable. Every sibling breaker field
+    treats 0 as inert/off; this one is the exception because
+    ngx_http_cache_turbo_shm_breaker_state()'s timed reopen is guarded on
+    `open_for > 0` -- with 0 an OPEN breaker would never promote a probe, and
+    with no origin contact while OPEN, no success could ever close it either.
+    The breaker would wedge OPEN until reload. See memory issues.md O4.3-a."""
+    _config_rejects(ng, "breaker-open-zero",
+                    "cache_turbo_valid    0;",
+                    "cache_turbo_valid    0;\n"
+                    "            cache_turbo_breaker_open 0;",
+                    "must be greater than 0")
+
+
+def test_breaker_arming_gated_on_breaker_enable(ng: Nginx, origin: Origin) -> None:
+    """O4.4 wiring pin: cache_turbo_breaker off must be a genuine, independent
+    off-switch black-box-observable end to end (arming call site through the
+    pre-origin gate) -- a dead origin behind a disabled breaker must never be
+    answered from a stale snapshot.
+
+    ⚠ This end-to-end shape cannot isolate WHICH of the two should_consult()
+    call sites (arming vs. the pre-origin gate) is doing the gating: the
+    pre-origin gate alone already blocks BRK_ACT_SERVE when breaker_enable is
+    off, regardless of whether arming itself is correctly gated -- verified by
+    injecting a bare `breaker_threshold > 0` at the arming site alone (dropping
+    should_consult() there) and observing this test still passes. Isolating
+    the arming site specifically needs a white-box check (e.g. a debug counter
+    or log line asserting brk_armed stayed 0), not a black-box HTTP fetch
+    through both sites.
+
+    /breakeron/ and /breakeroff/ are identical apart from the flag itself.
+
+    threshold=1 means one failing response trips CLOSED -> OPEN, but that
+    trip is recorded by the header filter AFTER the response is already
+    built, so the failing request that does the tripping still gets the raw
+    origin error itself; only the NEXT request finds the breaker OPEN at the
+    pre-origin gate and can be served the fallback. Hence two dead-origin
+    fetches per location below: the first trips (and is asserted to reach
+    the dead origin, i.e. NOT 200), the second observes the tripped state."""
+    for path in ("/breakeron/dead", "/breakeroff/dead"):
+        s0, b0, _ = fetch(ng.port, path)
+        assert s0 == 200, f"prime failed for {path}: {s0}"
+        assert b0, f"prime returned an empty body for {path}"
+
+    time.sleep(4.3)   # past fresh (1s) AND the x4 stale window (4s): L1-expired
+    origin.fail = True
+    try:
+        s_trip, _, _ = fetch(ng.port, "/breakeron/dead")
+        assert s_trip != 200, \
+            (f"breaker ON: the tripping request itself was answered 200 -- "
+             f"expected it to reach the (dead) origin and fail, got {s_trip}")
+
+        s_on, _b_on, _ = fetch(ng.port, "/breakeron/dead")
+        assert s_on == 200, \
+            (f"breaker ON: expired entry + dead origin did not fall back to "
+             f"the breaker's any-age snapshot after tripping, got {s_on}")
+
+        s_off_trip, _, _ = fetch(ng.port, "/breakeroff/dead")
+        assert s_off_trip != 200, \
+            f"breaker OFF: tripping request unexpectedly 200: {s_off_trip}"
+
+        s_off, _, _ = fetch(ng.port, "/breakeroff/dead")
+        assert s_off != 200, \
+            ("breaker OFF: a dead origin was still answered 200 from a stale "
+             "snapshot -- cache_turbo_breaker off did not disable arming at "
+             "the L1-expired call site")
+    finally:
+        origin.fail = False
+        drain_origin(origin)
 
 
 # The directive line the separator tests rewrite. Kept as one constant so a
@@ -13401,6 +13546,9 @@ def run_all(ng: Nginx, origin: Origin,
     test_invalid_backend_name(ng)
     test_invalid_cache_turbo_mode(ng)
     test_auto_and_generic_are_removed(ng)
+    test_breaker_directives_accepted(ng)                     # O4.4
+    test_breaker_open_zero_rejected(ng)                      # O4.4 / O4.3-a
+    test_breaker_arming_gated_on_breaker_enable(ng, origin)  # O4.4
     test_backend_separators(ng)
     test_backend_malformed_pipes(ng)
     test_backend_none_is_exclusive(ng)
