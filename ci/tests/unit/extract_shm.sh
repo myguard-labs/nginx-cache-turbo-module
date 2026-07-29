@@ -93,7 +93,7 @@ awk '
     /^(static )?(void|ngx_int_t|ngx_uint_t|time_t|u_char|const char|ngx_http_cache_turbo_node_t)[[:space:]]*\**$/ {
         pending = 1; buf = $0 ORS; next
     }
-    pending && /^ngx_http_cache_turbo_(shm_(lookup|evict_one|alloc_evict|claim|unstub|count_miss|l2_neg_check|l2_neg_set|touch_lru|breaker_state|breaker_record|breaker_state_str)|lru_(link_head|unlink|insert_new|enforce_cap))\(/ {
+    pending && /^ngx_http_cache_turbo_(shm_(lookup|evict_one|alloc_evict|claim|unstub|count_miss|l2_neg_check|l2_neg_set|touch_lru|brk_probe_age|breaker_state|breaker_record|breaker_state_str)|lru_(link_head|unlink|insert_new|enforce_cap))\(/ {
         capture = 1; pending = 0; printf "%s", buf; print; next
     }
     pending { pending = 0; buf = "" }

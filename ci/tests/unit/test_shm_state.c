@@ -102,10 +102,44 @@ typedef struct {
     (((ngx_uint_t) (gen) << NGX_HTTP_CACHE_TURBO_BREAKER_STATE_BITS)          \
      | ((ngx_uint_t) (st) & NGX_HTTP_CACHE_TURBO_BREAKER_STATE_MASK))
 
+/* P6/O4.4-h: the probe word packs [generation | stamp] so a lease DEADLINE can
+ * never be paired with a generation it does not belong to. Mirrored from the
+ * header; extract_shm.sh pins the two copies against each other. Rationale
+ * lives on the header definition. */
+#define NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_WORD_BITS \
+    ((ngx_uint_t) (sizeof(ngx_atomic_t) * 8))
+
+#if (NGX_PTR_SIZE >= 8)
+#define NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_STAMP_BITS  32
+#else
+#define NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_STAMP_BITS  20
+#endif
+
+#define NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_STAMP_MASK                         \
+    ((ngx_uint_t) ((((ngx_uint_t) 1)                                          \
+                    << NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_STAMP_BITS) - 1))
+#define NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_GEN_BITS                           \
+    (NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_WORD_BITS                             \
+     - NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_STAMP_BITS)
+#define NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_GEN_MASK                           \
+    ((ngx_uint_t) ((((ngx_uint_t) 1)                                          \
+                    << NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_GEN_BITS) - 1))
+
+#define ngx_http_cache_turbo_brk_probe_stamp(w) \
+    ((ngx_uint_t) (w) & NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_STAMP_MASK)
+#define ngx_http_cache_turbo_brk_probe_gen(w)                                 \
+    (((ngx_uint_t) (w) >> NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_STAMP_BITS)      \
+     & NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_GEN_MASK)
+#define ngx_http_cache_turbo_brk_probe_pack(gen, stamp)                       \
+    ((((ngx_uint_t) (gen) & NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_GEN_MASK)      \
+      << NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_STAMP_BITS)                       \
+     | ((ngx_uint_t) (stamp)                                                  \
+        & NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_STAMP_MASK))
+
 /* P6/O4.3 serve-path actions. PASS == 0 is load-bearing for the same reason
  * CLOSED == 0 is: the safe direction for a zeroed value is "the breaker does
  * not interfere". extract_shm.sh pins these against the header too. */
-/* P6/O4.3 probe lease sentinel. 0 doubles as breaker_probe_at's zeroed value,
+/* P6/O4.3 probe lease sentinel. 0 doubles as the probe word's zeroed value,
  * so a token that was never stamped can never match a live lease. */
 #define NGX_HTTP_CACHE_TURBO_BREAKER_NO_PROBE  0
 
@@ -140,7 +174,8 @@ typedef struct {
     ngx_atomic_t        l2_hits, l2_misses, lock_waits;
     ngx_atomic_t        min_uses_skips, l2_neg_skips, bypasses;
     ngx_atomic_t        breaker_state, breaker_fails, breaker_window_start;
-    ngx_atomic_t        breaker_opened_at, breaker_probe_at, breaker_opens;
+    ngx_atomic_t        breaker_opened_at, breaker_probe, breaker_opens;
+    ngx_atomic_t        breaker_epoch;
 } ngx_http_cache_turbo_shctx_t;
 
 typedef struct {
@@ -276,6 +311,17 @@ zone_reset(void)
     g_zone.shpool = &g_pool;
 
     ngx_test_now         = 1000000;
+
+    /* O4.4-h: the probe word's stamp is RELATIVE to breaker_epoch. The memset
+     * above left the anchor at 0, which is deliberately KEPT here: these tests
+     * set absolute clocks freely (including winding BACKWARDS, e.g.
+     * ngx_test_set_time(1000) after this reset), and anchoring at the current
+     * test clock would make any earlier absolute time produce a negative --
+     * therefore wrapped -- relative stamp. With the anchor at 0 the relative
+     * stamp is simply the absolute test second, which every fixture here
+     * already reasons in. Production anchors at real zone-init time; only the
+     * ORIGIN differs, and nothing in the lease arithmetic depends on it. */
+
     ngx_test_slab_budget = -1;
     ngx_test_lock_depth  = 0;
     ngx_test_lock_count  = 0;
@@ -897,6 +943,21 @@ brk_record(ngx_uint_t success, ngx_uint_t threshold, time_t window)
 }
 
 
+/* O4.4-h fixture helper: stamp a lease for `gen` as of absolute time `at`.
+ *
+ * The probe word packs [generation | stamp] and the stamp is RELATIVE to
+ * sh->breaker_epoch, so a fixture cannot just assign an epoch second the way it
+ * could to the old bare breaker_probe_at. Going through the same packing the
+ * production path uses is also what keeps these fixtures honest: a change to the
+ * layout breaks the tests rather than silently reinterpreting their bits. */
+static void
+brk_set_probe(ngx_uint_t gen, time_t at)
+{
+    g_sh.breaker_probe = (ngx_atomic_t) ngx_http_cache_turbo_brk_probe_pack(
+        gen, (ngx_uint_t) (at - (time_t) g_sh.breaker_epoch));
+}
+
+
 /* O4.4-b: ngx_parse_time() accepts durations up to NGX_MAX_INT_T_VALUE, so a
  * deadline written as `now >= stamp + duration` overflows signed time_t once an
  * epoch stamp is added and the comparison INVERTS -- an effectively infinite
@@ -981,9 +1042,14 @@ test_breaker_huge_durations_do_not_overflow(void)
      * make that explicit. */
     zone_reset();
     ngx_test_set_time(NGX_TEST_TIME_T_MAX - 100);
-    g_sh.breaker_state    = ngx_http_cache_turbo_brk_pack(
-                                1, NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN);
-    g_sh.breaker_probe_at = (ngx_atomic_t) ngx_time();
+
+    /* O4.4-h: re-anchor the epoch to this shifted clock. zone_reset() anchored
+     * it at 1e6; leaving it there would make the relative stamp below enormous
+     * and this arm would stop probing the overflow band it exists to guard. */
+    g_sh.breaker_epoch = (ngx_atomic_t) ngx_time();
+    g_sh.breaker_state = (ngx_atomic_t) ngx_http_cache_turbo_brk_pack(
+                             1, NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN);
+    brk_set_probe(1, ngx_time());
 
     {
         ngx_uint_t  probe_b;
@@ -1257,7 +1323,7 @@ test_breaker_probe_success_closes(void)
  * produces it is unreachable here.
  *
  * Schedule 1 (unsafe publication): worker A wins OPEN -> HALF_OPEN and is
- * descheduled BEFORE `breaker_probe_at = now`. Worker B now observes HALF_OPEN
+ * descheduled BEFORE publishing its probe word. Worker B now observes HALF_OPEN
  * paired with the PREVIOUS lease's stamp -- necessarily old, and zero on the
  * very first lease. B computes that lease as long expired, reclaims it, and is
  * promoted itself. Two live probes against a dead origin, which is the precise
@@ -1274,7 +1340,7 @@ test_breaker_unpublished_lease_is_not_reclaimable(void)
     /* Construct A's half-published promotion: HALF_OPEN is visible, the stamp
      * still holds the zeroed-zone value it had before the CAS. */
     g_sh.breaker_state    = NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN;
-    g_sh.breaker_probe_at = 0;
+    g_sh.breaker_probe = 0;
 
     /* B arrives. It must NOT read this as an abandoned lease: A holds a live
      * probe and is simply between two stores. */
@@ -1285,6 +1351,130 @@ test_breaker_unpublished_lease_is_not_reclaimable(void)
     CHECK(probe_b == NGX_HTTP_CACHE_TURBO_BREAKER_NO_PROBE,
           "a second probe was issued a lease token while the first was still "
           "live");
+}
+
+
+/* O4.4-h: a FRESH generation must not be reclaimable using the PREVIOUS
+ * generation's stamp.
+ *
+ * ⚠ This is the case test_breaker_unpublished_lease_is_not_reclaimable() above
+ * does NOT cover, and the distinction is the whole bug. That test constructs a
+ * bare HALF_OPEN -- generation 0, stamp 0 -- so it is rejected by the `stamp
+ * != 0` guard, which only ever covered the very first lease of a zeroed zone.
+ * The reachable race has a NON-ZERO expired stamp:
+ *
+ *   generation N-1's lease ran its full course, so the probe word holds a
+ *   real, long-expired epoch stamp. A promoter then CASes the state word to
+ *   generation N and is descheduled BEFORE re-stamping. A reader now loads the
+ *   packed word (generation N, HALF_OPEN) and, separately, that expired
+ *   generation-N-1 stamp. Its reclaim CAS expects the word it just loaded --
+ *   generation N, which IS current -- so the CAS SUCCEEDS and it reclaims a
+ *   lease milliseconds old, admitting a second concurrent probe.
+ *
+ * The generation does not rescue this on its own: nothing compares the STAMP's
+ * generation to the state word's. That is what the fix binds together, and it
+ * is why the in-code comment claiming such a reader "is testing against
+ * generation N-1 and loses" was wrong -- it loaded N.
+ *
+ * Constructed directly, like the ABA fixtures above: the state is reachable in
+ * production, only the schedule that produces it is unreachable here. */
+static void
+test_breaker_fresh_lease_not_reclaimable_via_old_stamp(void)
+{
+    ngx_uint_t  probe_b;
+
+    printf("breaker: a fresh lease is not reclaimable via the previous "
+           "generation's stamp\n");
+    zone_reset();
+
+    /* ⚠ The clock is left where zone_reset() put it, which is also where the
+     * epoch anchor is. Winding it BACKWARDS here (an earlier revision called
+     * ngx_test_set_time(1000)) makes the relative stamp negative and the lease
+     * age nonsense, so the fixture would stop describing the race. */
+
+    /* Generation N-1 (7) held a real lease that has since fully expired: a
+     * NON-ZERO stamp, older than BREAKER_PROBE_LEASE. */
+    brk_set_probe(7, ngx_test_now);
+    ngx_test_advance_time((time_t) NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_LEASE + 1);
+
+    /* Generation N (8) has won its state CAS but its promoter was descheduled
+     * before publishing a probe word, so the fresh HALF_OPEN is paired with
+     * generation 7's stale, expired stamp. THIS is the O4.4-h state. */
+    g_sh.breaker_state = (ngx_atomic_t) ngx_http_cache_turbo_brk_pack(
+                             8, NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN);
+
+    /* ⚠ Preconditions, or the test passes for the wrong reason: a zero stamp
+     * would be rejected by the old guard alone (which is the case already
+     * covered above), and an unexpired stamp would not reach the reclaim test. */
+    REQUIRE(ngx_http_cache_turbo_brk_probe_gen(g_sh.breaker_probe)
+                != NGX_HTTP_CACHE_TURBO_BREAKER_NO_PROBE,
+            "breaker fixture: generation 0 is the already-covered zeroed-zone "
+            "case, not the O4.4-h race");
+    REQUIRE(ngx_http_cache_turbo_brk_probe_gen(g_sh.breaker_probe)
+                != (ngx_http_cache_turbo_brk_gen(g_sh.breaker_state)
+                    & NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_GEN_MASK),
+            "breaker fixture: the stale stamp must belong to a DIFFERENT "
+            "generation than the state word, or there is no mispairing to test");
+
+    /* B must be told OPEN and handed no token: generation N's probe is live. */
+    CHECK(brk_probe_state(30, &probe_b)
+              == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
+          "a fresh lease was reclaimed using the previous generation's expired "
+          "stamp, admitting a second concurrent probe");
+    CHECK(probe_b == NGX_HTTP_CACHE_TURBO_BREAKER_NO_PROBE,
+          "a second probe was issued a lease token while generation N's probe "
+          "was still live");
+}
+
+
+/* O4.4-h: the probe age must be computed MODULO the stamp field.
+ *
+ * The stamp is a relative second truncated to PROBE_STAMP_BITS. An earlier
+ * revision subtracted that masked stamp from a FULL-WIDTH `now - epoch`, which
+ * agrees with the modular form only until the relative clock passes the field's
+ * range. Past the first wrap, a lease stamped moments ago reads as an entire
+ * field-width old -- so it is reclaimed instantly, on every call, admitting the
+ * unbounded herd the lease exists to prevent. Reached by UPTIME alone: ~12 days
+ * on the 20-bit (32-bit atomic) layout.
+ *
+ * The fixture puts the clock exactly one field-width past the epoch, so the
+ * fresh lease's truncated stamp and the truncated elapsed value agree at 0 while
+ * the untruncated difference is a whole field. With the modular form the lease
+ * is brand new and must be refused; with the buggy form it looks ancient.
+ *
+ * ⚠ This runs against whatever width the build actually has, so it guards the
+ * 64-bit layout too: the arithmetic, not the constant, is what is pinned. */
+static void
+test_breaker_probe_age_is_modular(void)
+{
+    ngx_uint_t  probe_b;
+    time_t      span;
+
+    printf("breaker: the probe age is modular in the stamp field\n");
+    zone_reset();
+
+    span = (time_t) NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_STAMP_MASK + 1;
+
+    /* One full wrap of the stamp field after the epoch anchor. */
+    ngx_test_set_time((time_t) g_sh.breaker_epoch + span);
+
+    /* A live lease for generation 3, stamped right now. */
+    g_sh.breaker_state = (ngx_atomic_t) ngx_http_cache_turbo_brk_pack(
+                             3, NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN);
+    brk_set_probe(3, ngx_test_now);
+
+    /* ⚠ Precondition: the truncated stamp must have wrapped to 0, or the clock
+     * did not actually cross a field boundary and this test proves nothing. */
+    REQUIRE(ngx_http_cache_turbo_brk_probe_stamp(g_sh.breaker_probe) == 0,
+            "breaker fixture: the stamp did not wrap, so the modular and "
+            "non-modular forms still agree and nothing is being pinned");
+
+    CHECK(brk_probe_state(30, &probe_b)
+              == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
+          "a lease stamped just after a stamp-field wrap read as a full field "
+          "old and was reclaimed while live");
+    CHECK(probe_b == NGX_HTTP_CACHE_TURBO_BREAKER_NO_PROBE,
+          "a second probe was issued a token after a stamp-field wrap");
 }
 
 
@@ -1417,7 +1607,7 @@ test_breaker_stale_probe_cannot_resolve_new_lease(void)
     /* A's lease is reclaimed and a replacement probe is promoted while A is
      * still in flight. Constructed directly: a NEW generation, stamped in the
      * SAME wall-clock second A was. The stamp is therefore identical, so a
-     * comparison against breaker_probe_at cannot tell the two leases apart --
+     * comparison against the probe STAMP cannot tell the two leases apart --
      * only a generation carried by the resolving CAS can. */
     g_sh.breaker_state    = (ngx_atomic_t) ngx_http_cache_turbo_brk_pack(
                                 ngx_http_cache_turbo_brk_gen(
@@ -1428,7 +1618,9 @@ test_breaker_stale_probe_cannot_resolve_new_lease(void)
      * the wrong reason: an unequal stamp would let the OLD stamp comparison
      * reject A on its own, and an equal generation would mean no replacement
      * lease was actually constructed. */
-    REQUIRE((ngx_uint_t) g_sh.breaker_probe_at == (ngx_uint_t) ngx_test_now,
+    REQUIRE(ngx_http_cache_turbo_brk_probe_stamp(g_sh.breaker_probe)
+                == (ngx_uint_t) ((time_t) ngx_test_now
+                                 - (time_t) g_sh.breaker_epoch),
             "breaker fixture: the replacement lease is not stamp-equal to A's, "
             "so this test cannot distinguish a generation from a stamp check");
     REQUIRE(ngx_http_cache_turbo_brk_gen(g_sh.breaker_state) != probe_a,
@@ -1457,7 +1649,8 @@ test_breaker_stale_probe_cannot_resolve_new_lease(void)
                                  ngx_http_cache_turbo_brk_gen(
                                      g_sh.breaker_state) + 1,
                                  NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN);
-    g_sh.breaker_probe_at  = (ngx_atomic_t) ngx_test_now;
+    brk_set_probe(ngx_http_cache_turbo_brk_gen(g_sh.breaker_state),
+                  ngx_test_now);
     g_sh.breaker_opened_at = (ngx_atomic_t) ngx_test_now;
 
     ngx_http_cache_turbo_shm_breaker_record(&g_zone, 0, 1, 60, probe_a);
@@ -2384,6 +2577,8 @@ main(void)
     test_breaker_abandoned_probe_lease_recovers();
     test_breaker_stale_success_does_not_close();
     test_breaker_unpublished_lease_is_not_reclaimable();
+    test_breaker_fresh_lease_not_reclaimable_via_old_stamp();
+    test_breaker_probe_age_is_modular();
     test_breaker_probe_lease_is_independent_of_open();
     test_breaker_stale_probe_cannot_resolve_new_lease();
     test_breaker_huge_durations_do_not_overflow();

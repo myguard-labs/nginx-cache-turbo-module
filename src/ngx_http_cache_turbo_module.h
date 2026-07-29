@@ -508,7 +508,7 @@ typedef struct {
  * Folding a generation counter into the same atomic word closes both: every
  * promotion bumps it, and every reclaim and resolution CASes the whole word, so
  * a transition belonging to a superseded lease cannot succeed. The generation
- * IS the lease token handed to the promoted request -- breaker_probe_at stays
+ * IS the lease token handed to the promoted request -- breaker_probe stays
  * only as the lease DEADLINE, never as identity.
  *
  * ⚠ CLOSED == 0 and generation 0 make a zeroed word read CLOSED, preserving the
@@ -531,6 +531,92 @@ typedef struct {
     (((ngx_uint_t) (gen) << NGX_HTTP_CACHE_TURBO_BREAKER_STATE_BITS)          \
      | ((ngx_uint_t) (st) & NGX_HTTP_CACHE_TURBO_BREAKER_STATE_MASK))
 
+/*
+ * P6/O4.4-h -- breaker_probe is a PACKED word too: [ generation | stamp ].
+ *
+ * The generation in breaker_state made every TRANSITION generation-safe, but
+ * the lease DEADLINE stayed a bare stamp in its own field, and nothing tied the
+ * two together. The promotion CASes the state word to generation N and then
+ * stores the stamp, so a reader could load generation N (current, therefore its
+ * reclaim CAS succeeds) paired with generation N-1's long-expired stamp, and
+ * reclaim a lease milliseconds old -- admitting the second concurrent probe the
+ * breaker exists to prevent. The `stamp != 0` guard covered only the very first
+ * lease of a zeroed zone, where there is no previous stamp to mispair with.
+ *
+ * ⚠ The in-code comment that claimed such a reader "is testing against
+ * generation N-1 and loses" was WRONG: it loaded N. Do not restore that
+ * reasoning.
+ *
+ * ⚠ Reversing the two stores does NOT fix this, which is why the stamp is
+ * packed rather than merely re-ordered: with a bare stamp, two promoters racing
+ * the same word both write their own `now`, and a later reader cannot tell
+ * whose lease a stamp belongs to. The generation must travel WITH the stamp in
+ * one atomically-published word so the reclaim test can demand that the
+ * deadline it is about to act on belongs to the generation it observed.
+ *
+ * Publication order is deliberately probe-word FIRST, then the state CAS. A
+ * probe word whose generation runs AHEAD of the state word is inert by
+ * construction -- the reclaim branch runs only in HALF_OPEN and requires the
+ * generations to match -- so a promoter that publishes and then LOSES the state
+ * CAS leaves nothing visible behind. Publishing after the CAS would recreate
+ * the very window this closes.
+ *
+ * The stamp is seconds RELATIVE to breaker_epoch, not an absolute epoch stamp:
+ * an absolute stamp needs 31+ bits and cannot share a 32-bit ngx_atomic_t with
+ * a usable generation. ngx_atomic_t is 32-bit on several targets in nginx's own
+ * ngx_atomic.h, so the split is derived from its actual width rather than
+ * assumed to be 64.
+ *
+ * ⚠ Generation 0 stays the NO_PROBE sentinel in the MASKED field as well: the
+ * promotion skips a masked generation of 0 exactly as it skips a full one, so
+ * no live lease is ever identified by 0 on either width. Aliasing needs a full
+ * wrap of the masked field (2^PROBE_GEN_BITS promotions) to land inside one
+ * lease window, which one-promotion-per-open-window cannot reach.
+ *
+ * Pinned by test_breaker_fresh_lease_not_reclaimable_via_old_stamp() and
+ * ci/tests/unit/extract_shm.sh.
+ */
+#define NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_WORD_BITS \
+    ((ngx_uint_t) (sizeof(ngx_atomic_t) * 8))
+
+/* Stamp width: 32 bits of relative seconds on a 64-bit atomic (~136 years,
+ * i.e. never wraps in a process lifetime); 20 bits on a 32-bit atomic (~12
+ * days), which leaves 12 bits of generation.
+ *
+ * ⚠ The narrow layout DOES wrap in ordinary operation, so the age computation
+ * must be modular in this field -- see _brk_probe_age(). An earlier revision
+ * subtracted a masked stamp from a full-width elapsed value, which made a lease
+ * stamped moments after a wrap read as a whole field-width old and therefore
+ * instantly reclaimable. That is reached by uptime alone, not by an attacker.
+ * Modular subtraction is correct because a real lease age is always far smaller
+ * than the field. */
+#if (NGX_PTR_SIZE >= 8)
+#define NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_STAMP_BITS  32
+#else
+#define NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_STAMP_BITS  20
+#endif
+
+#define NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_STAMP_MASK                         \
+    ((ngx_uint_t) ((((ngx_uint_t) 1)                                          \
+                    << NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_STAMP_BITS) - 1))
+#define NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_GEN_BITS                           \
+    (NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_WORD_BITS                             \
+     - NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_STAMP_BITS)
+#define NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_GEN_MASK                           \
+    ((ngx_uint_t) ((((ngx_uint_t) 1)                                          \
+                    << NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_GEN_BITS) - 1))
+
+#define ngx_http_cache_turbo_brk_probe_stamp(w) \
+    ((ngx_uint_t) (w) & NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_STAMP_MASK)
+#define ngx_http_cache_turbo_brk_probe_gen(w)                                 \
+    (((ngx_uint_t) (w) >> NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_STAMP_BITS)      \
+     & NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_GEN_MASK)
+#define ngx_http_cache_turbo_brk_probe_pack(gen, stamp)                       \
+    ((((ngx_uint_t) (gen) & NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_GEN_MASK)      \
+      << NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_STAMP_BITS)                       \
+     | ((ngx_uint_t) (stamp)                                                  \
+        & NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_STAMP_MASK))
+
 /* P6/O4.3 serve-path actions, the verdict of
  * ngx_http_cache_turbo_breaker_action(). PASS is the only one that lets the
  * request reach the origin.
@@ -542,7 +628,7 @@ typedef struct {
 /* P6/O4.3: "no probe lease held". 0 is safe as the sentinel because the token
  * is a GENERATION and the promotion path skips generation 0 explicitly (see the
  * packed-word block above), so no live lease is ever identified by 0. The
- * earlier stamp-based token relied on breaker_probe_at's zeroed-zone value for
+ * earlier stamp-based token relied on the probe stamp's zeroed-zone value for
  * the same guarantee; that rationale is obsolete, the sentinel is not. */
 #define NGX_HTTP_CACHE_TURBO_BREAKER_NO_PROBE  0
 
@@ -816,7 +902,7 @@ typedef struct {
      * ⚠ Lock-freedom does NOT by itself make the state machine liveness-safe.
      * A worker killed after being promoted to the probe leaves the breaker in
      * HALF_OPEN with nothing left to report the outcome, which would wedge it
-     * permanently. breaker_probe_at exists to bound exactly that: the promotion
+     * permanently. breaker_probe exists to bound exactly that: the promotion
      * is a LEASE, and a stale one is reclaimed. See _breaker_state().
      *
      * ⚠ O4.4-a: that lease elapses after BREAKER_PROBE_LEASE, which is NOT
@@ -851,9 +937,19 @@ typedef struct {
     ngx_atomic_t             breaker_fails;        /* failures this window     */
     ngx_atomic_t             breaker_window_start; /* epoch s, window anchor   */
     ngx_atomic_t             breaker_opened_at;    /* epoch s the OPEN began   */
-    ngx_atomic_t             breaker_probe_at;     /* epoch s probe admitted;
-                                                    * lease elapses after
+    ngx_atomic_t             breaker_probe;        /* O4.4-h packed
+                                                    * [generation | stamp];
+                                                    * stamp is seconds since
+                                                    * breaker_epoch, lease
+                                                    * elapses after
                                                     * BREAKER_PROBE_LEASE     */
+    ngx_atomic_t             breaker_epoch;        /* O4.4-h epoch s the zone
+                                                    * was initialised; anchor
+                                                    * for the relative stamp
+                                                    * above. Written once at
+                                                    * init, never again -- a
+                                                    * reload INHERITS it with
+                                                    * the rest of the shm     */
     ngx_atomic_t             breaker_opens;        /* lifetime CLOSED→OPEN     */
 #if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
     && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
@@ -1784,7 +1880,7 @@ void ngx_http_cache_turbo_shm_l2_neg_set(ngx_http_cache_turbo_zone_t *z,
  * breaker with no outcome at all. Pass NO_PROBE from every non-probe site.
  *
  * ⚠ The token is the promotion's GENERATION, unpacked out of breaker_state --
- * NOT the breaker_probe_at stamp an earlier revision used. Two leases promoted
+ * NOT the probe stamp an earlier revision used. Two leases promoted
  * in the same wall-clock second carry the same stamp, so a stamp token could
  * not tell a superseded probe from the current one (O4.3-c/F1). The generation
  * is bumped by every promotion and CASed as part of the same atomic word, so a
