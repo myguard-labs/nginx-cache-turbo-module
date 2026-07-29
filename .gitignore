@@ -1,6 +1,10 @@
 *.o
 *.so
 .build/
+# Local dynamic-module build tree used to prove a change before pushing.
+# Ignored for the same reason .build/ is: it is an unpacked nginx source
+# tree, so a stray `git add -A` commits thousands of upstream files.
+.build-proof/
 __pycache__/
 build/
 objs/
