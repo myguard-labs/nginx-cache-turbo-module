@@ -2050,6 +2050,7 @@ http {{
             cache_turbo_breaker_threshold   1;
             cache_turbo_breaker_window     60s;
             cache_turbo_breaker_open       30s;
+            cache_turbo_lock_timeout        2s;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
@@ -2069,6 +2070,7 @@ http {{
             cache_turbo_breaker_threshold   1;
             cache_turbo_breaker_window     60s;
             cache_turbo_breaker_open       30s;
+            cache_turbo_lock_timeout        2s;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
@@ -6811,15 +6813,29 @@ def test_breaker_open_zero_rejected(ng: Nginx) -> None:
 
 def test_breaker_arming_gated_on_breaker_enable(ng: Nginx, origin: Origin) -> None:
     """O4.4 wiring pin: cache_turbo_breaker off must be a genuine, independent
-    off-switch at the arming call site (ngx_http_cache_turbo_access_handler,
-    the L1-expired-entry breaker fallback), not just at the pre-origin gate.
+    off-switch black-box-observable end to end (arming call site through the
+    pre-origin gate) -- a dead origin behind a disabled breaker must never be
+    answered from a stale snapshot.
 
-    /breakeron/ and /breakeroff/ are identical apart from the flag itself --
-    both set a real threshold/window/open, so a location that only checked
-    `breaker_threshold > 0` at the arming site (ignoring breaker_enable, the
-    O4.3-era bare check this replaced) would arm and stale-serve on BOTH
-    locations alike. Only a location whose arming is actually gated by
-    ngx_http_cache_turbo_breaker_should_consult() can tell them apart."""
+    ⚠ This end-to-end shape cannot isolate WHICH of the two should_consult()
+    call sites (arming vs. the pre-origin gate) is doing the gating: the
+    pre-origin gate alone already blocks BRK_ACT_SERVE when breaker_enable is
+    off, regardless of whether arming itself is correctly gated -- verified by
+    injecting a bare `breaker_threshold > 0` at the arming site alone (dropping
+    should_consult() there) and observing this test still passes. Isolating
+    the arming site specifically needs a white-box check (e.g. a debug counter
+    or log line asserting brk_armed stayed 0), not a black-box HTTP fetch
+    through both sites.
+
+    /breakeron/ and /breakeroff/ are identical apart from the flag itself.
+
+    threshold=1 means one failing response trips CLOSED -> OPEN, but that
+    trip is recorded by the header filter AFTER the response is already
+    built, so the failing request that does the tripping still gets the raw
+    origin error itself; only the NEXT request finds the breaker OPEN at the
+    pre-origin gate and can be served the fallback. Hence two dead-origin
+    fetches per location below: the first trips (and is asserted to reach
+    the dead origin, i.e. NOT 200), the second observes the tripped state."""
     for path in ("/breakeron/dead", "/breakeroff/dead"):
         s0, b0, _ = fetch(ng.port, path)
         assert s0 == 200 and b0, f"prime failed for {path}: {s0} {b0!r}"
@@ -6827,10 +6843,19 @@ def test_breaker_arming_gated_on_breaker_enable(ng: Nginx, origin: Origin) -> No
     time.sleep(4.3)   # past fresh (1s) AND the x4 stale window (4s): L1-expired
     origin.fail = True
     try:
+        s_trip, _, _ = fetch(ng.port, "/breakeron/dead")
+        assert s_trip != 200, \
+            (f"breaker ON: the tripping request itself was answered 200 -- "
+             f"expected it to reach the (dead) origin and fail, got {s_trip}")
+
         s_on, b_on, _ = fetch(ng.port, "/breakeron/dead")
         assert s_on == 200, \
             (f"breaker ON: expired entry + dead origin did not fall back to "
-             f"the breaker's any-age snapshot, got {s_on}")
+             f"the breaker's any-age snapshot after tripping, got {s_on}")
+
+        s_off_trip, _, _ = fetch(ng.port, "/breakeroff/dead")
+        assert s_off_trip != 200, \
+            f"breaker OFF: tripping request unexpectedly 200: {s_off_trip}"
 
         s_off, _, _ = fetch(ng.port, "/breakeroff/dead")
         assert s_off != 200, \
