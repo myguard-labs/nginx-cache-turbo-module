@@ -491,6 +491,18 @@ typedef struct {
 #define NGX_HTTP_CACHE_TURBO_BREAKER_OPEN       1  /* origin dead: do not call */
 #define NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN  2  /* one probe in flight      */
 
+/* P6/O4.3 serve-path actions, the verdict of
+ * ngx_http_cache_turbo_breaker_action(). PASS is the only one that lets the
+ * request reach the origin.
+ *
+ * ⚠ PASS == 0 is load-bearing, exactly like BREAKER_CLOSED == 0 above: the safe
+ * direction for a zeroed or accidentally-defaulted value is "the breaker does
+ * not interfere". A silent flip would make the fall-through case start serving
+ * stale bodies or 503s. */
+#define NGX_HTTP_CACHE_TURBO_BRK_ACT_PASS   0  /* go to origin (incl. the probe) */
+#define NGX_HTTP_CACHE_TURBO_BRK_ACT_SERVE  1  /* serve the fallback body        */
+#define NGX_HTTP_CACHE_TURBO_BRK_ACT_FAIL   2  /* 503 + Retry-After, no origin   */
+
 /* protected_pct bounds for cache_turbo_scan_resistant (range-checked setter,
  * NOT ngx_conf_set_num_slot -- a literal 0 must be a config error, not a
  * silently-coerced default. See H5/min_uses for the trap this avoids). */
@@ -1024,6 +1036,29 @@ typedef struct {
     ngx_uint_t               breaker_threshold; /* failures to trip; 0 = off  */
     time_t                   breaker_window;    /* rolling window s; 0 = off  */
 
+    /* P6/O4.3 serve-path tuning. Read by the pre-origin breaker gate in
+     * ngx_http_cache_turbo_access_handler(); the directives that set them are
+     * O4.4, so both still merge to their inert defaults here.
+     *
+     * breaker_open is the `open_for` argument of
+     * ngx_http_cache_turbo_shm_breaker_state() -- how long an OPEN lasts before
+     * ONE request is promoted to probe the origin. time_t (seconds), NOT msec:
+     * that is the type the shm API takes.
+     *
+     * ⚠ 0 does NOT mean "no open window", it means NO TIMED REOPEN: the state
+     * machine's guard is `open_for > 0`, so with 0 an OPEN breaker never
+     * promotes a probe and stays open until a recorded success -- and while
+     * OPEN nobody talks to the origin, so no success can ever be recorded. The
+     * breaker would wedge permanently. It is inert today only because
+     * threshold == 0 means it can never trip in the first place; O4.4 MUST
+     * default this to a non-zero value (and reject 0) once the breaker can be
+     * switched on. Tracked as O4.3-a in issues.md. */
+    time_t                   breaker_open;      /* OPEN duration s before probe */
+
+    /* Retry-After seconds sent with the breaker's 503. Advisory to the client;
+     * has no effect on the breaker's own timing. */
+    time_t                   breaker_retry_after;
+
     /* L2 Redis (v2b). Native async client, no hiredis. The L2 store is touched
      * only on an L1 miss (sync GET) and on store (async write-through); it is
      * never on the L1-hit hot path. */
@@ -1339,6 +1374,28 @@ typedef struct {
     size_t                   sie_snap_len;
     u_char                  *sie_body;        /* body slice inside sie_snap        */
     size_t                   sie_body_len;
+
+    /* P6/O4.3 circuit-breaker fallback snapshot. Taken at the SAME two
+     * fall-through sites that arm SIE (L1 past its stale window, L2 blob past
+     * rem_stale), but under a DIFFERENT and much wider rule: SIE is armed only
+     * inside `created + sie_ttl`, whereas the breaker serves a body of ANY age
+     * once the origin is known to be down. Serving a week-old page beats
+     * serving 503, and the operator opted in by enabling the breaker.
+     *
+     * ⚠ Deliberately a SEPARATE snapshot rather than widening sie_armed. The
+     * SIE window is a response-driven RFC 5861 contract consumed by the header
+     * filter on an origin ERROR; this one is an operator-driven policy consumed
+     * by the access handler BEFORE any origin contact. Folding them would let a
+     * breaker config silently widen stale-if-error for responses that never
+     * asked for it.
+     *
+     * Both point into r->pool (a copy taken under the zone mutex), so no shm
+     * reference is held and ngx_http_cache_turbo_serve() is called with
+     * ref_data = NULL. Only taken when the breaker is actually enabled --
+     * threshold == 0 skips the memcpy entirely, so "breaker off" stays free. */
+    unsigned                 brk_armed:1;     /* a breaker fallback is stashed  */
+    u_char                  *brk_snap;        /* blob copy, any age (r->pool)   */
+    size_t                   brk_snap_len;
     /* Per-request serve outcome for $cache_turbo_status / access logging. One of
      * NGX_HTTP_CACHE_TURBO_ST_*; defaults to ST_MISS (0) via pcalloc and is
      * overridden to HIT/STALE at the X-Cache emit site, BYPASS on the

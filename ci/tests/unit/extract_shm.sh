@@ -70,6 +70,13 @@ check_define NGX_HTTP_CACHE_TURBO_SEG_PROTECTED 1
 check_define NGX_HTTP_CACHE_TURBO_BREAKER_CLOSED    0
 check_define NGX_HTTP_CACHE_TURBO_BREAKER_OPEN      1
 check_define NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN 2
+# P6/O4.3: and a fourth time for the serve-path actions. PASS == 0 is the safe
+# direction (a zeroed or defaulted verdict must not divert the request). The
+# test file redeclares these locally, so an unpinned drift would leave the
+# mapping tests asserting against the wrong numbers while staying green.
+check_define NGX_HTTP_CACHE_TURBO_BRK_ACT_PASS  0
+check_define NGX_HTTP_CACHE_TURBO_BRK_ACT_SERVE 1
+check_define NGX_HTTP_CACHE_TURBO_BRK_ACT_FAIL  2
 
 # --- slice the function bodies in source order.
 # nginx style: a definition is a bare return-type line (`void`, `ngx_int_t`,
@@ -114,7 +121,9 @@ fi
 
 for fn in 'ngx_http_cache_turbo_breaker_is_origin_failure(' \
           'ngx_http_cache_turbo_breaker_should_record(' \
-          'ngx_http_cache_turbo_breaker_from_origin('; do
+          'ngx_http_cache_turbo_breaker_from_origin(' \
+          'ngx_http_cache_turbo_breaker_should_consult(' \
+          'ngx_http_cache_turbo_breaker_action('; do
     if ! grep -qF "$fn" "$OUT"; then
         echo "✗ failed to extract ${fn%(} from $MODSRC" >&2
         echo "  (UNIT-EXTRACT breaker-failure markers moved or vanished?)" >&2
@@ -169,6 +178,43 @@ if sed -n '/^ngx_http_cache_turbo_breaker_is_origin_failure(/,/^}/p' "$OUT" \
     echo "✗ O4.2 regression: the breaker failure test now consults use_stale." >&2
     echo "  403/404/429 are a HEALTHY origin; counting them trips the breaker" >&2
     echo "  against a working backend. Keep the two predicates separate." >&2
+    rm -f "$OUT"
+    exit 1
+fi
+
+# ⚠ O4.3: the HALF_OPEN probe must PASS to the origin. A HALF_OPEN verdict goes
+# to exactly one request per open window and that promotion is a lease which
+# only _breaker_record() releases, so if the serve path answers the probe from
+# cache (or 503s it) nothing ever reaches the origin, no outcome is recorded,
+# and the breaker re-promotes one doomed probe per window forever.
+#
+# The property is structural: only the OPEN state may divert a request, so the
+# mapping must key on OPEN and treat everything else as pass-through. A rewrite
+# to "if (state != CLOSED) divert" reads as a harmless tidy-up and silently
+# wedges the breaker, which is why this is pinned here and not left to review.
+# Comments stripped first, for the same reason as every check above.
+if ! sed -n '/^ngx_http_cache_turbo_breaker_action(/,/^}/p' "$OUT" \
+   | sed -E 's;/\*.*;;; s;^[[:space:]]*\*.*;;' \
+   | grep -q 'state != NGX_HTTP_CACHE_TURBO_BREAKER_OPEN'; then
+    echo "✗ O4.3 regression: the serve-path action no longer keys on OPEN." >&2
+    echo "  Only OPEN may divert a request. If HALF_OPEN stops passing to the" >&2
+    echo "  origin the probe is answered locally, no outcome is ever recorded," >&2
+    echo "  and the breaker wedges OPEN until reload." >&2
+    rm -f "$OUT"
+    exit 1
+fi
+
+# ⚠ O4.3: the OPEN arm must decide purely on whether a body exists, with NO age
+# test. Serving a body of any age is the entire premise -- past stale, past
+# stale-if-error, past keep_stale. Reintroducing a freshness condition here
+# silently downgrades the breaker back into stale-if-error, and every test above
+# would stay green because they only ever pass "has_body".
+if sed -n '/^ngx_http_cache_turbo_breaker_action(/,/^}/p' "$OUT" \
+   | sed -E 's;/\*.*;;; s;^[[:space:]]*\*.*;;' \
+   | grep -qE 'ngx_time|fresh|stale_until|sie_ttl|created'; then
+    echo "✗ O4.3 regression: the serve-path action grew an age/freshness test." >&2
+    echo "  The breaker serves a cached body of ANY age once the origin is" >&2
+    echo "  known down; an age condition turns it back into stale-if-error." >&2
     rm -f "$OUT"
     exit 1
 fi

@@ -86,6 +86,13 @@ typedef struct {
 #define NGX_HTTP_CACHE_TURBO_BREAKER_OPEN       1
 #define NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN  2
 
+/* P6/O4.3 serve-path actions. PASS == 0 is load-bearing for the same reason
+ * CLOSED == 0 is: the safe direction for a zeroed value is "the breaker does
+ * not interfere". extract_shm.sh pins these against the header too. */
+#define NGX_HTTP_CACHE_TURBO_BRK_ACT_PASS   0
+#define NGX_HTTP_CACHE_TURBO_BRK_ACT_SERVE  1
+#define NGX_HTTP_CACHE_TURBO_BRK_ACT_FAIL   2
+
 /* P6/O4.2: the only nginx status constant the sliced origin-failure predicate
  * needs. Same value as nginx's own; check_constants.sh is not involved because
  * this one is nginx's, not ours. */
@@ -1271,6 +1278,137 @@ test_breaker_should_record_admission(void)
 }
 
 
+/* P6/O4.3: the pre-origin gate's admission rule. Same shape and same reason as
+ * the O4.2 recording admission above -- the serve path must drive the real
+ * predicate, not a restatement of it. */
+static void
+test_breaker_should_consult_admission(void)
+{
+    printf("breaker/O4.3: the serve path consults the breaker only when on\n");
+
+    CHECK(ngx_http_cache_turbo_breaker_should_consult(1, 3),
+          "an enabled breaker was not consulted on the pre-origin path");
+
+    /* ⚠ Not merely an optimisation. _breaker_state() PERFORMS the due
+     * OPEN -> HALF_OPEN promotion, and the O4.2 recording site is gated on the
+     * same threshold, so consulting it while disabled would promote a probe
+     * that nothing can ever report an outcome for. */
+    CHECK(!ngx_http_cache_turbo_breaker_should_consult(1, 0),
+          "a disabled breaker (threshold 0) was consulted — the state call is "
+          "not a pure getter, so this drives a state machine nothing feeds");
+
+    CHECK(!ngx_http_cache_turbo_breaker_should_consult(0, 3),
+          "the breaker was consulted in a location where cache_turbo is off");
+}
+
+
+/* P6/O4.3: state + body availability -> serve-path action. */
+static void
+test_breaker_action_mapping(void)
+{
+    printf("breaker/O4.3: OPEN serves any-age body, else 503; probe passes\n");
+
+    /* CLOSED is normal service regardless of what is cached. */
+    CHECK(ngx_http_cache_turbo_breaker_action(
+              NGX_HTTP_CACHE_TURBO_BREAKER_CLOSED, 1)
+              == NGX_HTTP_CACHE_TURBO_BRK_ACT_PASS,
+          "a CLOSED breaker interfered with a normal request");
+    CHECK(ngx_http_cache_turbo_breaker_action(
+              NGX_HTTP_CACHE_TURBO_BREAKER_CLOSED, 0)
+              == NGX_HTTP_CACHE_TURBO_BRK_ACT_PASS,
+          "a CLOSED breaker interfered with a normal cold request");
+
+    /* ⚠ THE probe assertion. HALF_OPEN is returned to exactly one request per
+     * open window, and that promotion is a lease only _record() releases.
+     * Answering it from cache means no origin contact, so no outcome is ever
+     * recorded and the breaker cannot close -- it re-promotes one doomed probe
+     * per window forever. This must be PASS even though a body is available,
+     * which is what makes it a different rule from the OPEN arm below. */
+    CHECK(ngx_http_cache_turbo_breaker_action(
+              NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN, 1)
+              == NGX_HTTP_CACHE_TURBO_BRK_ACT_PASS,
+          "the HALF_OPEN probe was served from cache — nothing would reach the "
+          "origin, so no outcome is recorded and the breaker wedges OPEN");
+    CHECK(ngx_http_cache_turbo_breaker_action(
+              NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN, 0)
+              == NGX_HTTP_CACHE_TURBO_BRK_ACT_PASS,
+          "the HALF_OPEN probe was 503'd instead of probing the origin");
+
+    /* OPEN: a body of ANY age beats a 503, and only its presence decides. */
+    CHECK(ngx_http_cache_turbo_breaker_action(
+              NGX_HTTP_CACHE_TURBO_BREAKER_OPEN, 1)
+              == NGX_HTTP_CACHE_TURBO_BRK_ACT_SERVE,
+          "an OPEN breaker did not serve the cached body it had");
+    CHECK(ngx_http_cache_turbo_breaker_action(
+              NGX_HTTP_CACHE_TURBO_BREAKER_OPEN, 0)
+              == NGX_HTTP_CACHE_TURBO_BRK_ACT_FAIL,
+          "an OPEN breaker with nothing cached did not answer 503");
+}
+
+
+/* P6/O4.3: the probe mapping and the state machine, driven together.
+ *
+ * The pure mapping test above cannot see whether the value it maps is the one
+ * the state machine actually hands out. This drives the real pair: trip the
+ * breaker, let the open window elapse, and confirm the promoted request is told
+ * to PASS and that reporting its success then CLOSES the breaker -- i.e. that
+ * the O4.3 serve path can actually complete an O4.1 recovery cycle. A serve-path
+ * change that swallowed the probe would leave this breaker OPEN forever. */
+static void
+test_breaker_probe_passes_and_recovery_completes(void)
+{
+    ngx_uint_t  i, state, act;
+
+    printf("breaker/O4.3: the promoted probe reaches origin and closes it\n");
+
+    zone_reset();
+    ngx_test_set_time(1000);
+
+    for (i = 0; i < 3; i++) {
+        ngx_http_cache_turbo_shm_breaker_record(
+            &g_zone,
+            !ngx_http_cache_turbo_breaker_is_origin_failure(503),
+            3, 60);
+    }
+
+    /* While OPEN, a request holding a stale body serves it and never leaves. */
+    state = ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30);
+    CHECK(state == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
+          "three 503s did not open the breaker");
+    CHECK(ngx_http_cache_turbo_breaker_action(state, 1)
+              == NGX_HTTP_CACHE_TURBO_BRK_ACT_SERVE,
+          "an OPEN breaker sent a request to a dead origin");
+
+    /* The open window elapses: exactly one request is promoted, and it must be
+     * told to go to the origin. */
+    ngx_test_set_time(1031);
+    state = ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30);
+    CHECK(state == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN,
+          "no probe was promoted after the open window elapsed");
+    act = ngx_http_cache_turbo_breaker_action(state, 1);
+    CHECK(act == NGX_HTTP_CACHE_TURBO_BRK_ACT_PASS,
+          "the promoted probe did not reach the origin — with a body cached "
+          "the serve path would answer it locally and the breaker would wedge");
+
+    /* Everyone else still sees OPEN while the probe is out (anti-herd). */
+    CHECK(ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30)
+              == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
+          "a second request was also promoted — the herd walks into the origin");
+
+    /* The probe reports success through the header filter: breaker closes. */
+    ngx_http_cache_turbo_shm_breaker_record(
+        &g_zone,
+        !ngx_http_cache_turbo_breaker_is_origin_failure(200),
+        3, 60);
+    state = ngx_http_cache_turbo_shm_breaker_state(&g_zone, 30);
+    CHECK(state == NGX_HTTP_CACHE_TURBO_BREAKER_CLOSED,
+          "a successful probe did not close the breaker");
+    CHECK(ngx_http_cache_turbo_breaker_action(state, 1)
+              == NGX_HTTP_CACHE_TURBO_BRK_ACT_PASS,
+          "the recovered breaker still refused to pass traffic");
+}
+
+
 /* The predicate is what the request path actually feeds to _record(), so drive
  * the real pair end to end: a run of 5xx trips the breaker, and the same number
  * of 404s does not. This is the assertion that would catch the two being wired
@@ -1638,6 +1776,9 @@ main(void)
     test_breaker_record_driven_by_predicate();
     test_breaker_from_origin();
     test_breaker_should_record_admission();
+    test_breaker_should_consult_admission();
+    test_breaker_action_mapping();
+    test_breaker_probe_passes_and_recovery_completes();
     run_negative_controls();
 
     /* Every node this run allocated must be accounted for. Under ASan a real
