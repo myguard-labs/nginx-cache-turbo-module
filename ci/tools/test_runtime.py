@@ -1262,6 +1262,54 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             allow 127.0.0.1;
             deny all;
         }}
+
+        # O4.4-i L2 half. Mirrors /brkion/ and /brkioff/, but with a Redis L2
+        # configured so the breaker fallback is served from the L2 blob path --
+        # the arming call site the L1 pair above provably cannot reach. Their own
+        # `brkil2z` zone: the L1 pair leaves its breaker OPEN, and a shared zone
+        # would let that state decide these requests.
+        location /brkil2on/ {{
+            cache_turbo                    brkil2z;
+            cache_turbo_key                $uri;
+            # LONG valid on purpose. The L1 copy is removed by EVICTION (the
+            # tiny brkil2z zone), NOT by expiry, so the entry must still be
+            # inside its freshness window when the fallback runs -- otherwise
+            # the L2 blob has expired too and there is nothing left to arm
+            # from. Measured with valid 1s: the brkil2:* keys drop from 174
+            # to 13 across the wait, and the l2 delta then reads 0 for a
+            # reason that has nothing to do with gating.
+            # valid 1s + keep_stale 300s. The entry is past its x4 stale
+            # window within ~4s (so rem_stale <= 0, which is the L2 arming
+            # site's precondition -- module.c ~5203), while keep_stale
+            # pushes the REDIS retention window out to 300s via sie_ttl
+            # (retain_ttl = max(stale_window, sie_window), module.c ~7705)
+            # so the blob is still in L2 to be armed from. The tiny
+            # brkil2z zone evicts the L1 copy so the L1 site cannot claim
+            # the arming first.
+            cache_turbo_valid               1s;
+            cache_turbo_keep_stale        300s;
+            cache_turbo_breaker             on;
+            cache_turbo_breaker_threshold   1;
+            cache_turbo_breaker_window     60s;
+            cache_turbo_breaker_open       30s;
+            cache_turbo_lock_timeout        2s;
+            cache_turbo_redis              127.0.0.1:{redis_port} prefix=brkil2: timeout=250ms;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        location /brkil2off/ {{
+            cache_turbo                    brkil2z;
+            cache_turbo_key                $uri;
+            cache_turbo_valid               1s;   # see /brkil2on/
+            cache_turbo_keep_stale        300s;
+            cache_turbo_breaker            off;
+            cache_turbo_breaker_threshold   1;
+            cache_turbo_breaker_window     60s;
+            cache_turbo_breaker_open       30s;
+            cache_turbo_lock_timeout        2s;
+            cache_turbo_redis              127.0.0.1:{redis_port} prefix=brkil2: timeout=250ms;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
 """
 
     # L2 memcached (v13): a location wired to the memcached backend instead of
@@ -2113,54 +2161,6 @@ http {{
             cache_turbo_breaker_window     60s;
             cache_turbo_breaker_open       30s;
             cache_turbo_lock_timeout        2s;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-
-        # O4.4-i L2 half. Mirrors /brkion/ and /brkioff/, but with a Redis L2
-        # configured so the breaker fallback is served from the L2 blob path --
-        # the arming call site the L1 pair above provably cannot reach. Their own
-        # `brkil2z` zone: the L1 pair leaves its breaker OPEN, and a shared zone
-        # would let that state decide these requests.
-        location /brkil2on/ {{
-            cache_turbo                    brkil2z;
-            cache_turbo_key                $uri;
-            # LONG valid on purpose. The L1 copy is removed by EVICTION (the
-            # tiny brkil2z zone), NOT by expiry, so the entry must still be
-            # inside its freshness window when the fallback runs -- otherwise
-            # the L2 blob has expired too and there is nothing left to arm
-            # from. Measured with valid 1s: the brkil2:* keys drop from 174
-            # to 13 across the wait, and the l2 delta then reads 0 for a
-            # reason that has nothing to do with gating.
-            # valid 1s + keep_stale 300s. The entry is past its x4 stale
-            # window within ~4s (so rem_stale <= 0, which is the L2 arming
-            # site's precondition -- module.c ~5203), while keep_stale
-            # pushes the REDIS retention window out to 300s via sie_ttl
-            # (retain_ttl = max(stale_window, sie_window), module.c ~7705)
-            # so the blob is still in L2 to be armed from. The tiny
-            # brkil2z zone evicts the L1 copy so the L1 site cannot claim
-            # the arming first.
-            cache_turbo_valid               1s;
-            cache_turbo_keep_stale        300s;
-            cache_turbo_breaker             on;
-            cache_turbo_breaker_threshold   1;
-            cache_turbo_breaker_window     60s;
-            cache_turbo_breaker_open       30s;
-            cache_turbo_lock_timeout        2s;
-            cache_turbo_redis              127.0.0.1:{redis_port} prefix=brkil2: timeout=250ms;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-
-        location /brkil2off/ {{
-            cache_turbo                    brkil2z;
-            cache_turbo_key                $uri;
-            cache_turbo_valid               1s;   # see /brkil2on/
-            cache_turbo_keep_stale        300s;
-            cache_turbo_breaker            off;
-            cache_turbo_breaker_threshold   1;
-            cache_turbo_breaker_window     60s;
-            cache_turbo_breaker_open       30s;
-            cache_turbo_lock_timeout        2s;
-            cache_turbo_redis              127.0.0.1:{redis_port} prefix=brkil2: timeout=250ms;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
