@@ -1519,6 +1519,13 @@ http {{
     # fallback to come from L2 rather than from an L1 hit -- an L1 hit would
     # bump the l1 counter and prove nothing about the L2 site.
     cache_turbo_zone name=brkil2z 64k;
+    # O4.4-d: private zone for the breaker-policy-divergence config-time
+    # warning tests. Its OWN zone, not `main` or `brkiz`: both already carry
+    # a first-seen breaker policy from other locations, so reusing them would
+    # make the "identical tuple, no warning" negative control depend on
+    # matching an unrelated fixture's numbers instead of on the two injected
+    # locations agreeing with each other.
+    cache_turbo_zone name=brkpolz 16m;
     # SUITE-1: private zone for /l2neg/. l2_neg_skips is PER-ZONE
     # (z->sh->l2_neg_skips, module.c:4832), and the outage test asserts a delta
     # of exactly 0 over one request, so any other location writing that counter
@@ -6853,6 +6860,128 @@ def _config_accepts(ng: Nginx, tag: str, old: str, new: str) -> None:
                        stderr=subprocess.STDOUT, timeout=20)
     assert r.returncode == 0, \
         f"{tag}: config was REJECTED by nginx -t but must be accepted:\n{r.stdout}"
+
+
+def _config_warns(ng: Nginx, tag: str, old: str, new: str, want: str) -> None:
+    """Swap `old`->`new` and assert nginx -t both ACCEPTS the config (exit 0)
+    AND prints `want` on stdout. For warn-not-reject checks (O4.4-d): a config
+    that loads successfully today must keep loading, but the operator still
+    needs to see the diagnostic."""
+    warn = ng.root.parent / tag
+    (warn / "conf").mkdir(parents=True, exist_ok=True)
+    (warn / "logs").mkdir(parents=True, exist_ok=True)
+    cfg = nginx_config(warn, ng.port, ng.module, ng.origin_port, 1)
+    assert old in cfg, f"{tag}: pattern to replace not found: {old!r}"
+    cfg = cfg.replace(old, new, 1)
+    (warn / "conf" / "nginx.conf").write_text(cfg, encoding="ascii")
+    cmd = ng.runner + [str(ng.binary), "-p", str(warn),
+                       "-c", str(warn / "conf" / "nginx.conf"), "-t"]
+    r = subprocess.run(cmd, text=True, stdout=subprocess.PIPE,
+                       stderr=subprocess.STDOUT, timeout=20)
+    assert r.returncode == 0, \
+        f"{tag}: config was REJECTED by nginx -t but must still load:\n{r.stdout}"
+    assert want in r.stdout, \
+        f"{tag}: missing/odd diagnostic (want {want!r}):\n{r.stdout}"
+
+
+def test_breaker_policy_divergence_warns(ng: Nginx) -> None:
+    """O4.4-d: breaker STATE/counters are per-ZONE but the five breaker
+    directives are per-LOCATION. Two sibling locations sharing one zone
+    (`brkpolz`) with divergent EFFECTIVE breaker tuples (open=30s vs open=5m)
+    must load successfully (WARN, not reject -- a hard reject would break
+    configs that work today) and must print the divergence diagnostic added
+    at merge_loc_conf just after the shm_zone inheritance block."""
+    _config_warns(ng, "breaker-policy-diverge",
+        "        location /forever/ {\n"
+        "            cache_turbo          main;\n"
+        "            cache_turbo_key      $uri;\n"
+        "            cache_turbo_valid    0;\n"
+        "            proxy_pass http://127.0.0.1:{origin_port}/;\n"
+        "        }\n".replace("{origin_port}", str(ng.origin_port)),
+        "        location /forever/ {\n"
+        "            cache_turbo          main;\n"
+        "            cache_turbo_key      $uri;\n"
+        "            cache_turbo_valid    0;\n"
+        "            proxy_pass http://127.0.0.1:%d/;\n"
+        "        }\n"
+        "\n"
+        "        location /brkpolicy1/ {\n"
+        "            cache_turbo                   brkpolz;\n"
+        "            cache_turbo_key                $uri;\n"
+        "            cache_turbo_valid              30s;\n"
+        "            cache_turbo_breaker            on;\n"
+        "            cache_turbo_breaker_threshold  3;\n"
+        "            cache_turbo_breaker_window     10s;\n"
+        "            cache_turbo_breaker_open       30s;\n"
+        "            proxy_pass http://127.0.0.1:%d/;\n"
+        "        }\n"
+        "\n"
+        "        location /brkpolicy2/ {\n"
+        "            cache_turbo                   brkpolz;\n"
+        "            cache_turbo_key                $uri;\n"
+        "            cache_turbo_valid              30s;\n"
+        "            cache_turbo_breaker            on;\n"
+        "            cache_turbo_breaker_threshold  3;\n"
+        "            cache_turbo_breaker_window     10s;\n"
+        "            cache_turbo_breaker_open       5m;\n"
+        "            proxy_pass http://127.0.0.1:%d/;\n"
+        "        }\n"
+        % (ng.origin_port, ng.origin_port, ng.origin_port),
+        "circuit breaker")
+
+
+def test_breaker_policy_identical_no_warning(ng: Nginx) -> None:
+    """NEGATIVE CONTROL (a): two siblings on the same zone with an IDENTICAL
+    effective breaker tuple must produce NO warning -- the divergence check
+    must not fire unconditionally. See test_breaker_policy_divergence_warns
+    for the positive arm; the always-true-mutation falsification (b) is
+    manual (documented in the O4.4-d ledger), since it requires rebuilding
+    the module with a deliberately broken comparison."""
+    good = ng.root.parent / "breaker-policy-identical"
+    (good / "conf").mkdir(parents=True, exist_ok=True)
+    (good / "logs").mkdir(parents=True, exist_ok=True)
+    cfg = nginx_config(good, ng.port, ng.module, ng.origin_port, 1)
+    old = ("        location /forever/ {\n"
+           "            cache_turbo          main;\n"
+           "            cache_turbo_key      $uri;\n"
+           "            cache_turbo_valid    0;\n"
+           "            proxy_pass http://127.0.0.1:%d/;\n"
+           "        }\n") % ng.origin_port
+    assert old in cfg, "pattern to replace not found"
+    new = (old +
+        "\n"
+        "        location /brkpolicy1/ {\n"
+        "            cache_turbo                   brkpolz;\n"
+        "            cache_turbo_key                $uri;\n"
+        "            cache_turbo_valid              30s;\n"
+        "            cache_turbo_breaker            on;\n"
+        "            cache_turbo_breaker_threshold  3;\n"
+        "            cache_turbo_breaker_window     10s;\n"
+        "            cache_turbo_breaker_open       30s;\n"
+        "            proxy_pass http://127.0.0.1:%d/;\n"
+        "        }\n"
+        "\n"
+        "        location /brkpolicy2/ {\n"
+        "            cache_turbo                   brkpolz;\n"
+        "            cache_turbo_key                $uri;\n"
+        "            cache_turbo_valid              30s;\n"
+        "            cache_turbo_breaker            on;\n"
+        "            cache_turbo_breaker_threshold  3;\n"
+        "            cache_turbo_breaker_window     10s;\n"
+        "            cache_turbo_breaker_open       30s;\n"
+        "            proxy_pass http://127.0.0.1:%d/;\n"
+        "        }\n"
+        % (ng.origin_port, ng.origin_port))
+    cfg = cfg.replace(old, new, 1)
+    (good / "conf" / "nginx.conf").write_text(cfg, encoding="ascii")
+    cmd = ng.runner + [str(ng.binary), "-p", str(good),
+                       "-c", str(good / "conf" / "nginx.conf"), "-t"]
+    r = subprocess.run(cmd, text=True, stdout=subprocess.PIPE,
+                       stderr=subprocess.STDOUT, timeout=20)
+    assert r.returncode == 0, \
+        f"identical breaker tuples: config was REJECTED:\n{r.stdout}"
+    assert "circuit breaker" not in r.stdout, \
+        f"identical breaker tuples must NOT warn, but got:\n{r.stdout}"
 
 
 def test_breaker_directives_accepted(ng: Nginx) -> None:
@@ -13890,6 +14019,8 @@ def run_all(ng: Nginx, origin: Origin,
     test_invalid_cache_turbo_mode(ng)
     test_auto_and_generic_are_removed(ng)
     test_breaker_directives_accepted(ng)                     # O4.4
+    test_breaker_policy_divergence_warns(ng)                 # O4.4-d
+    test_breaker_policy_identical_no_warning(ng)              # O4.4-d
     test_breaker_open_zero_rejected(ng)                      # O4.4 / O4.3-a
     test_breaker_arming_gated_on_breaker_enable(ng, origin)  # O4.4
     test_breaker_arming_sites_gated_white_box(ng, origin)    # O4.4-i (L1)
