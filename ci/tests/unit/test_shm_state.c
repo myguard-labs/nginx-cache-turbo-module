@@ -1865,7 +1865,7 @@ test_breaker_probe_lease_is_independent_of_open(void)
 static void
 test_breaker_probe_slower_than_lease_recovers_late(void)
 {
-    ngx_uint_t  probe_a, probe_b, probe_c;
+    ngx_uint_t  probe_a, probe_b;
     time_t      lease = (time_t) NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_LEASE;
 
     printf("breaker/O4.4-g: a probe slower than the lease recovers late, "
@@ -1922,8 +1922,7 @@ test_breaker_probe_slower_than_lease_recovers_late(void)
      * of this test is the discard above -- dropping the generation check on
      * _breaker_record()'s success path fails it and nothing else here. */
     ngx_http_cache_turbo_shm_breaker_record(&g_zone, 1, 1, 60, probe_b);
-    CHECK(brk_probe_state(30, &probe_c)
-              == NGX_HTTP_CACHE_TURBO_BREAKER_CLOSED,
+    CHECK(brk_state(30) == NGX_HTTP_CACHE_TURBO_BREAKER_CLOSED,
           "the replacement probe promoted by the reclaim could not close the "
           "breaker either: a slow origin wedges it permanently, which is the "
           "O4.4-g hazard in its worse form");
