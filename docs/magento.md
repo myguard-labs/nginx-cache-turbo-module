@@ -341,6 +341,17 @@ The front names come from `app/code/Magento/Webapi/etc/di.xml` (`webapi_rest`
 The prefix needs a `/` or `.` boundary after it, so a catalog URL like
 `/restaurant-supplies` is **not** matched and still caches normally.
 
+## Origin failure: stale-if-error
+
+By default this module serves a stale cached copy when the origin returns 5xx; nginx turns a refused connection into a 502 and a hung one into a 504, so a dead origin is covered. Once the cached copy's TTL has expired there is no grace window unless one is configured — `cache_turbo_keep_stale <time>` supplies it, and it defaults to `off`. Most CMS/app stacks emit no `stale-if-error` of their own. `cache_turbo_use_stale` selects which statuses count as "down" (default: every 5xx); naming tokens replaces the default rather than extending it. Nothing was ever cached for a URL ⇒ nothing to serve; `error_page 502 503 504 /maintenance.html` is the nicer failure.
+
+```nginx
+cache_turbo_keep_stale    2h;
+cache_turbo_valid         300s;
+```
+
+The copy stays fresh for `300s`; if the origin starts failing after that, the expired copy keeps being served for up to `2h` (`cache_turbo_keep_stale`). Past that window, or with nothing cached at all, `error_page` is the fallback. See the README sections on [which failures count as "the origin is down"](../README.md#which-failures-count-as-the-origin-is-down) and [what outage handling cannot do](../README.md#what-outage-handling-cannot-do).
+
 ## Gotchas
 
 - **Set the cache application to "Built-in", not "Varnish".** In Varnish mode
