@@ -1463,6 +1463,14 @@ http {{
     # test_breaker_arming_gated_on_breaker_enable() (also on `main`) serve its
     # tripping request from the fallback instead of reaching the dead origin.
     cache_turbo_zone name=brkiz 16m;
+    # O4.4-i L2 half. A SECOND private zone for the L2-backed arming pair
+    # (/brkil2on/, /brkil2off/). Separate from brkiz because the L1 pair leaves
+    # its own breaker OPEN and the two must not share a breaker state; separate
+    # from `main` for the same reason brkiz is. Deliberately TINY (64k) so an
+    # entry stored here is evicted from L1 promptly, which is what forces the
+    # fallback to come from L2 rather than from an L1 hit -- an L1 hit would
+    # bump the l1 counter and prove nothing about the L2 site.
+    cache_turbo_zone name=brkil2z 64k;
     # SUITE-1: private zone for /l2neg/. l2_neg_skips is PER-ZONE
     # (z->sh->l2_neg_skips, module.c:4832), and the outage test asserts a delta
     # of exactly 0 over one request, so any other location writing that counter
@@ -2105,6 +2113,54 @@ http {{
             cache_turbo_breaker_window     60s;
             cache_turbo_breaker_open       30s;
             cache_turbo_lock_timeout        2s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # O4.4-i L2 half. Mirrors /brkion/ and /brkioff/, but with a Redis L2
+        # configured so the breaker fallback is served from the L2 blob path --
+        # the arming call site the L1 pair above provably cannot reach. Their own
+        # `brkil2z` zone: the L1 pair leaves its breaker OPEN, and a shared zone
+        # would let that state decide these requests.
+        location /brkil2on/ {{
+            cache_turbo                    brkil2z;
+            cache_turbo_key                $uri;
+            # LONG valid on purpose. The L1 copy is removed by EVICTION (the
+            # tiny brkil2z zone), NOT by expiry, so the entry must still be
+            # inside its freshness window when the fallback runs -- otherwise
+            # the L2 blob has expired too and there is nothing left to arm
+            # from. Measured with valid 1s: the brkil2:* keys drop from 174
+            # to 13 across the wait, and the l2 delta then reads 0 for a
+            # reason that has nothing to do with gating.
+            # valid 1s + keep_stale 300s. The entry is past its x4 stale
+            # window within ~4s (so rem_stale <= 0, which is the L2 arming
+            # site's precondition -- module.c ~5203), while keep_stale
+            # pushes the REDIS retention window out to 300s via sie_ttl
+            # (retain_ttl = max(stale_window, sie_window), module.c ~7705)
+            # so the blob is still in L2 to be armed from. The tiny
+            # brkil2z zone evicts the L1 copy so the L1 site cannot claim
+            # the arming first.
+            cache_turbo_valid               1s;
+            cache_turbo_keep_stale        300s;
+            cache_turbo_breaker             on;
+            cache_turbo_breaker_threshold   1;
+            cache_turbo_breaker_window     60s;
+            cache_turbo_breaker_open       30s;
+            cache_turbo_lock_timeout        2s;
+            cache_turbo_redis              127.0.0.1:{redis_port} prefix=brkil2: timeout=250ms;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        location /brkil2off/ {{
+            cache_turbo                    brkil2z;
+            cache_turbo_key                $uri;
+            cache_turbo_valid               1s;   # see /brkil2on/
+            cache_turbo_keep_stale        300s;
+            cache_turbo_breaker            off;
+            cache_turbo_breaker_threshold   1;
+            cache_turbo_breaker_window     60s;
+            cache_turbo_breaker_open       30s;
+            cache_turbo_lock_timeout        2s;
+            cache_turbo_redis              127.0.0.1:{redis_port} prefix=brkil2: timeout=250ms;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
@@ -6907,9 +6963,15 @@ def test_breaker_arming_gated_on_breaker_enable(ng: Nginx, origin: Origin) -> No
 _ARMINGS_HDR = "x-cache-turbo-test-armings"
 
 
-def _armings(hdrs: dict, where: str) -> int:
-    """Pull the zone's lifetime breaker-arming counter out of a response's
-    headers (O4.4-i, TEST_FAULTS-only).
+def _armings(hdrs: dict, where: str, site: str = "l1") -> int:
+    """Pull ONE arming site's lifetime breaker-arming counter out of a
+    response's headers (O4.4-i, TEST_FAULTS-only).
+
+    The header carries both sites: ``l1=<n>,l2=<n>``. `site` selects which.
+    They are separate counters on purpose -- a single total cannot pin either
+    site, because the L1 site runs first on every request, so an L2 assertion
+    against a shared counter passes on L1's bump and the L2 mutation stays
+    green. That was measured, not assumed.
 
     Takes an ALREADY-FETCHED header dict on purpose: issuing an extra request
     just to read the counter perturbs the very state under test (a probe fetch
@@ -6918,27 +6980,42 @@ def _armings(hdrs: dict, where: str) -> int:
 
     A missing header means the build lacks the counter, in which case every
     delta would read 0 and the test would pass while proving nothing -- so its
-    absence is a hard failure, not a skip."""
+    absence is a hard failure, not a skip. Same for a site key that is not in
+    the value: a format drift must fail loudly rather than silently read 0."""
+    assert site in ("l1", "l2"), f"unknown arming site {site!r}"
     raw = hdrs.get(_ARMINGS_HDR)
     assert raw is not None, (
         f"{_ARMINGS_HDR} missing on {where} -- this build has no arming "
         f"counter, so the O4.4-i control cannot distinguish 'gated' from "
         f"'broken'")
-    return int(raw)
+    parts = dict(
+        kv.split("=", 1) for kv in raw.split(",") if "=" in kv
+    )
+    assert site in parts, (
+        f"{_ARMINGS_HDR} on {where} is {raw!r}, which carries no {site!r} "
+        f"key -- the header format drifted and this assertion would silently "
+        f"measure nothing")
+    return int(parts[site])
 
 
 def test_breaker_arming_sites_gated_white_box(ng: Nginx, origin: Origin) -> None:
     """O4.4-i: pin the L1 expired-entry ARMING call site specifically, which
     test_breaker_arming_gated_on_breaker_enable() provably cannot.
 
-    ⚠ SCOPE: this pins the **L1** arming site only. Verified by mutation --
-    reverting the L1 gate (module.c:5069) to a bare `breaker_threshold > 0`
-    fails this test on the armed_off assertion (delta 2), while the black-box
-    test above still passes. The SAME mutation applied to the L2 arming site
-    (module.c:5225) does NOT fail this test, because no breaker location in this
-    suite has an L2 backend configured, so the L2 fallback path is never taken.
-    Pinning L2 needs a breaker location with a Redis/memcached L2 -- tracked as
-    the remaining half of O4.4-i. Do not read a pass here as covering both.
+    ⚠ SCOPE: this pins the **L1** arming site only, and now says so in the
+    counter it reads: the header carries `l1=<n>,l2=<n>` and this test asserts
+    on the l1 field. The L2 site is pinned separately by
+    test_breaker_l2_arming_site_gated_white_box() below.
+
+    The per-site split is load-bearing, not tidiness. Against a single shared
+    counter an L2 assertion passes on the L1 site's bump -- the L1 site runs
+    first on every request -- so the L2 mutation stayed green. That was measured
+    (mutation applied, rebuilt, test still PASSED), which is why the counter was
+    split rather than the L2 test simply being added.
+
+    Verified by mutation: reverting the L1 gate (module.c:5069) to a bare
+    `breaker_threshold > 0` fails this test on the armed_off assertion, while
+    the black-box test above still passes.
 
     That test is black-box, and the pre-origin gate alone blocks BRK_ACT_SERVE
     when the breaker is off -- so reverting an arming site to a bare
@@ -6966,7 +7043,7 @@ def test_breaker_arming_sites_gated_white_box(ng: Nginx, origin: Origin) -> None
         s0, b0, h0 = fetch(ng.port, path)
         assert s0 == 200, f"prime failed for {path}: {s0}"
         assert b0, f"prime returned an empty body for {path}"
-        base[path] = _armings(h0, f"prime {path}")
+        base[path] = _armings(h0, f"prime {path}", site="l1")
 
     time.sleep(4.3)   # past fresh (1s) AND the x4 stale window (4s): L1-expired
     origin.fail = True
@@ -6978,7 +7055,7 @@ def test_breaker_arming_sites_gated_white_box(ng: Nginx, origin: Origin) -> None
         s_on, _, h_on = fetch(ng.port, "/brkion/dead")
         assert s_on == 200, \
             f"breaker ON: expected the any-age fallback after tripping, got {s_on}"
-        armed_on = _armings(h_on, "breaker ON fallback") - base["/brkion/dead"]
+        armed_on = _armings(h_on, "breaker ON fallback", site="l1") - base["/brkion/dead"]
         assert armed_on > 0, (
             "breaker ON armed NOTHING at either call site (counter delta 0) -- "
             "either the arming sites no longer bump the counter or the fallback "
@@ -6988,20 +7065,147 @@ def test_breaker_arming_sites_gated_white_box(ng: Nginx, origin: Origin) -> None
         # --- claim 2: breaker OFF must arm nothing ---------------------------
         # Baseline is the counter AFTER the breaker-ON phase, since both
         # locations share the `main` zone.
-        before_off = _armings(h_on, "breaker ON fallback")
+        before_off = _armings(h_on, "breaker ON fallback", site="l1")
         s_off_trip, _, _ = fetch(ng.port, "/brkioff/dead")
         assert s_off_trip != 200, \
             f"breaker OFF: tripping request unexpectedly 200: {s_off_trip}"
         s_off, _, h_off = fetch(ng.port, "/brkioff/dead")
         assert s_off != 200, \
             f"breaker OFF: dead origin answered 200 from a stale snapshot: {s_off}"
-        armed_off = _armings(h_off, "breaker OFF error") - before_off
+        armed_off = _armings(h_off, "breaker OFF error", site="l1") - before_off
         assert armed_off == 0, (
             f"breaker OFF armed {armed_off} time(s) at the L1 expired-entry "
             f"arming call site -- cache_turbo_breaker off must gate it through "
             f"breaker_should_consult(), not a bare breaker_threshold > 0 check. "
             f"With the breaker off this path keeps pinning blobs on every "
             f"request to a cold-ish key (O4.4-c/O4.4-i)")
+    finally:
+        origin.fail = False
+        drain_origin(origin)
+
+
+def test_breaker_l2_arming_site_gated_white_box(ng: Nginx, origin: Origin,
+                                                redis: RedisServer) -> None:
+    """O4.4-i (L2 half): pin the **L2** breaker-fallback ARMING call site.
+
+    The sibling test above pins the L1 expired-entry site. This one pins the
+    other arming site -- the branch that arms from an L2 blob when L1 has no
+    copy (module.c ~5227, inside the `rem_stale <= 0` arm) -- and reaching it
+    needs three conditions at once, each of which was established by
+    measurement rather than assumed:
+
+      1. **A separate counter.** The header reports `l1=<n>,l2=<n>` and this
+         test asserts on `l2`. Against a single shared total the L1 site
+         supplies the bump and the assertion passes with the L2 gate broken --
+         measured: the L2 mutation was applied, rebuilt, and the test PASSED.
+      2. **`rem_stale <= 0` with the blob still in Redis.** `valid 1s` puts the
+         entry past its x4 stale window within ~4s (the site's precondition),
+         while `keep_stale 300s` pushes the L2 RETENTION window out via
+         `sie_ttl` -- retention is `max(stale_window, sie_window)` -- so the
+         object is still there to arm from. With `valid 300s` instead the entry
+         is a plain fresh HIT and the origin is never contacted; with no
+         `keep_stale` the Redis keys expire alongside the stale window and the
+         l2 delta reads 0 for a reason unrelated to gating.
+      3. **L1 evicted.** The 64k `brkil2z` zone plus the filler loop below
+         removes the L1 copy, so the L1 site cannot claim the arming first.
+
+    The fixture serves 200 STALE-IF-ERROR / STALE-BREAKER rather than an error,
+    so the STATUS is not the oracle here -- the per-site counter is. Both
+    claims are therefore deltas on `l2`:
+
+      1. breaker ON  => the l2 counter MOVES (measured: l1=0, l2=2)
+      2. breaker OFF => the l2 counter does NOT move
+
+    ⚠ SCOPE, stated plainly: only claim 1 is real today. Claim 2 currently
+    holds for the wrong reason -- the OFF request is served STALE-IF-ERROR from
+    L1 and never reaches the L2 branch at all, so its counter cannot move
+    whether the gate is right or wrong. Verified by mutation: with the L2 gate
+    reduced to a bare `breaker_threshold > 0`, this test still passes. The
+    assertion carries a full note at the call site; do not read a green run
+    here as "the L2 arming site is gated".
+    """
+    base = {}
+    for path in ("/brkil2on/dead", "/brkil2off/dead"):
+        s0, b0, h0 = fetch(ng.port, path)
+        assert s0 == 200, f"prime failed for {path}: {s0}"
+        assert b0, f"prime returned an empty body for {path}"
+        base[path] = _armings(h0, f"prime {path}", site="l2")
+
+    # Evict the L1 copies of BOTH primed keys. The zone is shared, but eviction
+    # is LRU -- a filler loop only pushes out entries OLDER than the filler, so
+    # priming /brkil2off/dead and then filling would leave it resident while
+    # /brkil2on/dead went. It would then be served STALE-IF-ERROR from its L1
+    # snapshot and never enter the L2 `rem_stale <= 0` branch at all, so the
+    # OFF half of this test would measure nothing and pass with the L2 gate
+    # broken. (That is not hypothetical: it is what the first version of this
+    # test did, and the L2 mutation passed it.) Both keys are primed above,
+    # before this loop, so both are older than every filler entry.
+    for i in range(400):
+        fetch(ng.port, f"/brkil2on/filler-{i}")
+        fetch(ng.port, f"/brkil2off/filler-{i}")
+
+    time.sleep(4.3)   # past fresh (1s) AND the x4 stale window: rem_stale <= 0
+    origin.fail = True
+    try:
+        # --- claim 1: breaker ON arms from L2, so the l2 counter must move ---
+        s_trip, _, _ = fetch(ng.port, "/brkil2on/dead")
+        assert s_trip == 200, (
+            f"breaker ON: expected the L2 stale-if-error serve on the tripping "
+            f"request, got {s_trip}")
+        s_on, _, h_on = fetch(ng.port, "/brkil2on/dead")
+        assert s_on == 200, \
+            f"breaker ON: expected the L2 fallback after tripping, got {s_on}"
+        armed_on = _armings(h_on, "breaker ON L2 fallback",
+                            site="l2") - base["/brkil2on/dead"]
+        assert armed_on > 0, (
+            "breaker ON armed nothing at the L2 call site (l2 counter delta 0). "
+            "Either the fallback came from L1 rather than L2 -- check that the "
+            "filler loop above still evicts from brkil2z -- or the L2 blob had "
+            "already left Redis, or the site no longer bumps its counter. The "
+            "'breaker OFF arms nothing' assertion below would be vacuous in "
+            "every one of those cases, so fail here instead")
+
+        # --- claim 2: breaker OFF must arm nothing at the L2 site ------------
+        # ⚠ The baseline is read from a /brkil2off/ RESPONSE, not carried over
+        # from h_on. brkil2z is deliberately tiny (64k) and the filler loop
+        # above runs it hard; a counter read on one request is not a safe
+        # baseline for a later one. Reading it off the first OFF response and
+        # differencing against the second keeps both samples inside the window
+        # being measured -- differencing across the ON phase produced a
+        # NEGATIVE delta, which is how this was found.
+        _, _, h_off0 = fetch(ng.port, "/brkil2off/dead")
+        before_off = _armings(h_off0, "breaker OFF baseline", site="l2")
+        _, _, h_off = fetch(ng.port, "/brkil2off/dead")
+        armed_off = _armings(h_off, "breaker OFF L2 error",
+                             site="l2") - before_off
+
+        # ⚠⚠ THIS HALF IS NOT YET A CONTROL -- do not read a pass as coverage.
+        #
+        # On the OFF location the request is served STALE-IF-ERROR from its L1
+        # snapshot: the L1 block (which arms SIE, module.c ~5122) runs BEFORE
+        # the L2 GET, so the request never enters the `rem_stale <= 0` branch
+        # where the L2 arming site lives, and l2 stays 0 whether the gate is
+        # correct or not. Measured directly: with the L2 gate mutated to a bare
+        # `breaker_threshold > 0`, this test still PASSED.
+        #
+        # Three fixture attempts did not move it -- longer valid (entry becomes
+        # a plain fresh HIT, origin never contacted), keep_stale (retains the L2
+        # blob but is exactly what enables the SIE serve that short-circuits
+        # this), and driving the filler loop through both locations. The ON half
+        # above IS real: it reaches the L2 site and its l2 delta is attributable
+        # (l1=0,l2=2 measured), which is what the per-site counter split bought.
+        #
+        # So this assertion is currently a placeholder that happens to hold. It
+        # is left in place, and loudly annotated, rather than deleted, because
+        # the ON half is worth having now and the remaining work is fixture
+        # shape, not counter plumbing. Closing it needs an OFF fixture whose
+        # request reaches the L2 branch -- i.e. no serveable L1 copy AND no SIE
+        # window -- while still retaining the L2 blob. See the O4.4-i row.
+        assert armed_off == 0, (
+            f"breaker OFF armed {armed_off} time(s) at the L2 arming call site "
+            f"-- cache_turbo_breaker off must gate it through "
+            f"breaker_should_consult(), not a bare breaker_threshold > 0 check "
+            f"(O4.4-c/O4.4-i, L2 half)")
     finally:
         origin.fail = False
         drain_origin(origin)
@@ -13688,7 +13892,13 @@ def run_all(ng: Nginx, origin: Origin,
     test_breaker_directives_accepted(ng)                     # O4.4
     test_breaker_open_zero_rejected(ng)                      # O4.4 / O4.3-a
     test_breaker_arming_gated_on_breaker_enable(ng, origin)  # O4.4
-    test_breaker_arming_sites_gated_white_box(ng, origin)    # O4.4-i
+    test_breaker_arming_sites_gated_white_box(ng, origin)    # O4.4-i (L1)
+    if redis is not None:
+        # O4.4-i (L2). Needs a real Redis: without an L2 backend the L2 arming
+        # path never executes and every delta reads 0, so the test would pass
+        # while proving nothing. Guarded rather than unconditional for that
+        # reason -- a no-Redis run must SKIP it, not fake it.
+        test_breaker_l2_arming_site_gated_white_box(ng, origin, redis)
     test_backend_separators(ng)
     test_backend_malformed_pipes(ng)
     test_backend_none_is_exclusive(ng)

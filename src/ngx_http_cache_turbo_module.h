@@ -1021,8 +1021,18 @@ typedef struct {
      * TEST_FAULTS-gated rather than a plain counter so no permanent public
      * admin-JSON field exists only to serve a test. Production and package
      * builds do not define the macro and so have neither the field nor the
-     * header that reports it. */
-    ngx_atomic_t             test_brk_armings;
+     * header that reports it.
+     *
+     * ⚠ PER SITE, not one shared counter. A single counter bumped at both
+     * arming sites cannot pin either of them: on a fixture that arms from L2,
+     * the L1 site runs first, the shared counter moves, and the assertion
+     * credits L2 for L1's bump -- so an L2 mutation stays green. That was
+     * measured, not theorised (a session applied the L2 mutation, rebuilt, and
+     * the test still PASSED), which is why the split exists. Each site bumps
+     * only its own field, so a delta on _l2 can only have come from the L2
+     * site. */
+    ngx_atomic_t             test_brk_armings_l1;
+    ngx_atomic_t             test_brk_armings_l2;
 
     /* H-2/O4.4-j: lifetime count of times the reclaim predicate's `else`
      * (ngx_http_cache_turbo_shm.c, ngx_http_cache_turbo_shm_breaker_state())

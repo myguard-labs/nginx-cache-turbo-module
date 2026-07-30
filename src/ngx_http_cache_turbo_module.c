@@ -5107,8 +5107,10 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
 #if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
     && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
                 /* O4.4-i negative control for THIS site. Inside the
-                 * should_consult() branch on purpose -- see the field comment. */
-                (void) ngx_atomic_fetch_add(&z->sh->test_brk_armings, 1);
+                 * should_consult() branch on purpose -- see the field comment.
+                 * Bumps the L1 field only: a shared counter would let an L2
+                 * assertion pass on this site's bump. */
+                (void) ngx_atomic_fetch_add(&z->sh->test_brk_armings_l1, 1);
 #endif
 
                 ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
@@ -5236,8 +5238,10 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
 #if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
     && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
                     /* O4.4-i negative control for THIS site. Inside the
-                     * should_consult() branch on purpose -- see field comment. */
-                    (void) ngx_atomic_fetch_add(&z->sh->test_brk_armings, 1);
+                     * should_consult() branch on purpose -- see field comment.
+                     * Bumps the L2 field only, so a delta here cannot have come
+                     * from the L1 site above. */
+                    (void) ngx_atomic_fetch_add(&z->sh->test_brk_armings_l2, 1);
 #endif
                     ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                                    "cache_turbo: breaker fallback armed from "
@@ -5986,13 +5990,19 @@ ngx_http_cache_turbo_test_armings_header(ngx_http_request_t *r)
         return NGX_DECLINED;
     }
 
-    v = ngx_pnalloc(r->pool, NGX_ATOMIC_T_LEN);
+    /* "l1=<n>,l2=<n>" -- the two arming sites are reported separately so a
+     * test can attribute a delta to ONE of them. A single total cannot: the L1
+     * site runs first on every request, so an L2 assertion against a shared
+     * counter passes on L1's bump and the L2 mutation stays green (measured).
+     * Room for both values plus the "l1=" / ",l2=" literals. */
+    v = ngx_pnalloc(r->pool, sizeof("l1=,l2=") - 1 + 2 * NGX_ATOMIC_T_LEN);
     if (v == NULL) {
         return NGX_ERROR;
     }
 
-    vlen = ngx_sprintf(v, "%uA",
-                       ngx_atomic_fetch_add(&z->sh->test_brk_armings, 0)) - v;
+    vlen = ngx_sprintf(v, "l1=%uA,l2=%uA",
+                       ngx_atomic_fetch_add(&z->sh->test_brk_armings_l1, 0),
+                       ngx_atomic_fetch_add(&z->sh->test_brk_armings_l2, 0)) - v;
 
     h = ngx_list_push(&r->headers_out.headers);
     if (h == NULL) {
