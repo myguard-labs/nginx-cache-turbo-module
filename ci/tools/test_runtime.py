@@ -1553,6 +1553,16 @@ http {{
     # "own zone" reasoning as brkiz/s71z above, just one more private zone
     # because s71z is already spent by the time H7.3a needs a CLOSED breaker.
     cache_turbo_zone name=h73z 16m;
+    # S7.2: private zone for $cache_turbo_serve_reason coverage. NOT s71z --
+    # s71z's breaker is already tripped OPEN by test_breaker_counters by the
+    # time this runs in run_all()'s ordering, which would make this test's
+    # own FRESH/STALE priming (expects a CLOSED breaker, 200s) collide with a
+    # leftover OPEN state. Also needs its own zone for the BREAKER-503 arm: a
+    # SECOND uri on the SAME zone, never primed, so it hits breaker_unavailable()
+    # once the first uri's dead-origin fetch trips the breaker OPEN -- reusing
+    # s71z would let /s71brk/'s trip leave it OPEN too early or too late
+    # relative to this test's own sequencing.
+    cache_turbo_zone name=sr72z 16m;
     # SUITE-1: private zone for /l2neg/. l2_neg_skips is PER-ZONE
     # (z->sh->l2_neg_skips, module.c:4832), and the outage test asserts a delta
     # of exactly 0 over one request, so any other location writing that counter
@@ -2195,6 +2205,51 @@ http {{
             cache_turbo_breaker_window     60s;
             cache_turbo_breaker_open       30s;
             cache_turbo_lock_timeout        2s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # S7.2: $cache_turbo_serve_reason coverage, FRESH/STALE arms. Same
+        # shape as /ctstale/ (1s fresh -> x4=4s stale, beta 1 so the refresh
+        # dice never fires) but on the private sr72z zone. Drives
+        # test_serve_reason_variable.
+        location /sr72/ {{
+            cache_turbo        sr72z;
+            cache_turbo_key    $uri;
+            cache_turbo_valid  1s;
+            cache_turbo_beta   1;
+            add_header         X-CT-Reason $cache_turbo_serve_reason always;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # S7.2: $cache_turbo_serve_reason coverage, STALE-IF-ERROR arm. Same
+        # shape as /sieserve/ (the "sieserve" request-suffix marker makes the
+        # origin emit stale-if-error=30) but on sr72z so the breaker arm below
+        # can trip that zone's breaker without disturbing this location's own
+        # fully-expired-entry setup. Drives test_serve_reason_variable.
+        location /sr72sie/ {{
+            cache_turbo        sr72z;
+            cache_turbo_key    $uri;
+            cache_turbo_valid  1s;
+            add_header         X-CT-Reason $cache_turbo_serve_reason always;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # S7.2: $cache_turbo_serve_reason coverage, STALE-BREAKER + BREAKER-503
+        # arms. Same shape as /s71brk/ (1s fresh, x4=4s stale, threshold=1) but
+        # on sr72z: the /dead key gets primed then trips the breaker OPEN, the
+        # /never key is NEVER primed so once the breaker is OPEN it has no
+        # armed copy at all and falls into breaker_unavailable() (BREAKER-503).
+        # Drives test_serve_reason_variable.
+        location /sr72brk/ {{
+            cache_turbo                    sr72z;
+            cache_turbo_key                $uri;
+            cache_turbo_valid               1s;
+            cache_turbo_breaker             on;
+            cache_turbo_breaker_threshold   1;
+            cache_turbo_breaker_window     60s;
+            cache_turbo_breaker_open       30s;
+            cache_turbo_lock_timeout        2s;
+            add_header         X-CT-Reason $cache_turbo_serve_reason always;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
@@ -9335,6 +9390,93 @@ def test_status_expired(ng: Nginx, origin: Origin) -> None:
     drain_origin(origin)
 
 
+def test_serve_reason_variable(ng: Nginx, origin: Origin) -> None:
+    """S7.2: $cache_turbo_serve_reason (echoed as X-CT-Reason) is the UNFOLDED
+    per-request serve outcome. Drives all five values on the private sr72z
+    zone, kept separate from s71z/brkiz/etc. so this test's own breaker
+    priming (expects CLOSED, then trips it itself) is not polluted by another
+    test's already-tripped breaker.
+
+    FRESH  : /sr72/ second fetch, within the 1s fresh window.
+    STALE  : /sr72/ third fetch, past fresh (1s) but within the x4=4s stale
+             window (beta 1 keeps the refresh dice from firing, same
+             discipline as test_status_stale).
+    STALE-IF-ERROR : /sr72sie/ fully expired (past the 4s stale window) with
+             the origin down; the "sieserve" request-suffix marker armed a
+             serve-on-error snapshot on priming (same convention as
+             test_sie_serve_on_error).
+    STALE-BREAKER  : /sr72brk/dead, primed then origin killed. threshold=1
+             means the FIRST dead-origin request trips CLOSED->OPEN and still
+             surfaces the raw origin error (not a serve at all, so it does
+             NOT report STALE-BREAKER); the SECOND request finds the breaker
+             OPEN and is served the armed fallback -- that is the one this
+             test asserts on (same two-fetch shape as test_breaker_counters).
+    BREAKER-503    : /sr72brk/never -- NEVER primed, so once the breaker above
+             is OPEN this key has no snapshot of any age and falls into
+             ngx_http_cache_turbo_breaker_unavailable(), the local 503 that
+             never touches the origin.
+    """
+    # FRESH
+    fetch(ng.port, "/sr72/k1")                    # prime: MISS (SR_NONE, no
+                                                    # unfolded reason for a cold
+                                                    # miss -- not asserted here)
+    _, _, h_fresh = fetch(ng.port, "/sr72/k1")
+    assert h_fresh.get("x-ct-reason") == "FRESH", \
+        f"fresh serve should report FRESH, got {h_fresh.get('x-ct-reason')}"
+
+    # STALE
+    time.sleep(1.3)                                # past fresh, within 4s stale
+    _, _, h_stale = fetch(ng.port, "/sr72/k1")
+    assert h_stale.get("x-ct-reason") == "STALE", \
+        f"stale serve should report STALE, got {h_stale.get('x-ct-reason')}"
+    drain_origin(origin)
+
+    # STALE-IF-ERROR
+    s0, b0, _ = fetch(ng.port, "/sr72sie/sieserve-k1")   # arms sie window
+    assert s0 == 200 and b0, f"sie prime failed: {s0} {b0!r}"
+    time.sleep(4.6)                                # past fresh (1s) + stale (4s)
+    origin.fail = True
+    try:
+        s_sie, b_sie, h_sie = fetch(ng.port, "/sr72sie/sieserve-k1")
+        assert s_sie == 200 and b_sie == b0, \
+            f"SIE serve-on-error returned {s_sie} {b_sie!r}, expected stale 200 {b0!r}"
+        assert h_sie.get("x-ct-reason") == "STALE-IF-ERROR", \
+            (f"SIE serve should report STALE-IF-ERROR, got "
+             f"{h_sie.get('x-ct-reason')}")
+    finally:
+        origin.fail = False
+        drain_origin(origin)
+
+    # STALE-BREAKER + BREAKER-503
+    s_prime, b_prime, _ = fetch(ng.port, "/sr72brk/dead")
+    assert s_prime == 200 and b_prime, f"breaker prime failed: {s_prime} {b_prime!r}"
+
+    time.sleep(4.3)   # past fresh (1s) AND the x4 stale window (4s): L1-expired
+    origin.fail = True
+    try:
+        s_trip, _, _ = fetch(ng.port, "/sr72brk/dead")
+        assert s_trip != 200, \
+            (f"tripping request was answered 200 -- expected it to reach "
+             f"the dead origin and fail, got {s_trip}")
+
+        s_brk, _, h_brk = fetch(ng.port, "/sr72brk/dead")
+        assert s_brk == 200, \
+            f"breaker OPEN did not fall back to the any-age snapshot, got {s_brk}"
+        assert h_brk.get("x-ct-reason") == "STALE-BREAKER", \
+            (f"breaker fallback serve should report STALE-BREAKER, got "
+             f"{h_brk.get('x-ct-reason')}")
+
+        s_503, _, h_503 = fetch(ng.port, "/sr72brk/never")
+        assert s_503 == 503, \
+            f"breaker OPEN + no cached copy should 503, got {s_503}"
+        assert h_503.get("x-ct-reason") == "BREAKER-503", \
+            (f"breaker refusal should report BREAKER-503, got "
+             f"{h_503.get('x-ct-reason')}")
+    finally:
+        origin.fail = False
+        drain_origin(origin)
+
+
 def test_request_cc_serve_verdict_fresh(ng: Nginx, origin: Origin) -> None:
     """RFC-1 request Cache-Control against a FRESH entry (req_serve_verdict,
     module.c:1403-1409). A client's own max-age/min-fresh can refuse an entry
@@ -14398,6 +14540,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_status_variable(ng)
     test_status_stale(ng, origin)
     test_status_expired(ng, origin)
+    test_serve_reason_variable(ng, origin)                   # S7.2 unfolded serve reason
     test_request_cc_serve_verdict_fresh(ng, origin)
     test_request_cc_serve_verdict_stale(ng, origin)
     test_cc_mode_inheritance_child_preset_overrides_parent_ignore(ng, origin)

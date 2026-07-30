@@ -4715,11 +4715,13 @@ ngx_http_cache_turbo_breaker_unavailable(ngx_http_request_t *r,
      *
      * $cache_turbo_status is deliberately left at its default (MISS): the
      * existing status ids have no value meaning "refused without contacting the
-     * origin", and inventing one belongs to S7.2's $cache_turbo_serve_reason,
-     * not here. The X-Cache: BREAKER-503 header above is the signal until then. */
+     * origin", so this path leaves it alone. $cache_turbo_serve_reason (S7.2)
+     * DOES record it, as SR_BREAKER_503 -- that variable exists precisely for
+     * outcomes status's HIT/STALE/BYPASS/EXPIRED/MISS enum has no slot for. */
     ctx = ngx_http_get_module_ctx(r, ngx_http_cache_turbo_module);
     if (ctx != NULL) {
         ctx->served = 1;
+        ctx->serve_reason = NGX_HTTP_CACHE_TURBO_SR_BREAKER_503;
     }
 
     rc = ngx_http_cache_turbo_send_body(r, NGX_HTTP_SERVICE_UNAVAILABLE, &body,
@@ -6481,6 +6483,23 @@ ngx_http_cache_turbo_restore_response(ngx_http_request_t *r, u_char *copy,
             sctx->status = (ngx_strcmp(xcache, "HIT") == 0)
                 ? NGX_HTTP_CACHE_TURBO_ST_HIT
                 : NGX_HTTP_CACHE_TURBO_ST_STALE;
+
+            /* S7.2: unfolded reason for $cache_turbo_serve_reason. Same
+             * exact-match discipline as the fold above -- never switch on
+             * xcache[0]. FRESH is the S7.2 spec's name for what `status`
+             * calls HIT; the other three values pass through as-is. */
+            if (ngx_strcmp(xcache, "HIT") == 0) {
+                sctx->serve_reason = NGX_HTTP_CACHE_TURBO_SR_FRESH;
+
+            } else if (ngx_strcmp(xcache, "STALE") == 0) {
+                sctx->serve_reason = NGX_HTTP_CACHE_TURBO_SR_STALE;
+
+            } else if (ngx_strcmp(xcache, "STALE-IF-ERROR") == 0) {
+                sctx->serve_reason = NGX_HTTP_CACHE_TURBO_SR_STALE_IF_ERROR;
+
+            } else if (ngx_strcmp(xcache, "STALE-BREAKER") == 0) {
+                sctx->serve_reason = NGX_HTTP_CACHE_TURBO_SR_STALE_BREAKER;
+            }
         }
     }
 
@@ -11413,6 +11432,25 @@ static ngx_str_t  ngx_http_cache_turbo_status_name =
     ngx_string("cache_turbo_status");
 
 
+/*
+ * $cache_turbo_serve_reason (S7.2) -- the UNFOLDED per-request serve outcome,
+ * for access logging. Unlike $cache_turbo_status (which folds every non-HIT
+ * reason to STALE for $upstream_cache_status compatibility and MUST keep
+ * doing so -- do not change that fold), this variable keeps the reason
+ * distinct:
+ *   FRESH            served fresh from L1/L2 ($cache_turbo_status: HIT)
+ *   STALE            served stale while a refresh runs
+ *   STALE-IF-ERROR   RFC 5861 serve-on-error replacement
+ *   STALE-BREAKER    served stale because the breaker is OPEN/HALF_OPEN
+ *   BREAKER-503      breaker OPEN, no serveable copy -> local 503, no origin
+ * A request cache-turbo never engaged, or one that has not yet reached a
+ * serve/503 decision, resolves to "-" (not_found) -- same convention as
+ * $cache_turbo_status.
+ */
+static ngx_str_t  ngx_http_cache_turbo_serve_reason_name =
+    ngx_string("cache_turbo_serve_reason");
+
+
 static ngx_int_t
 ngx_http_cache_turbo_beta_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data)
@@ -11511,6 +11549,54 @@ ngx_http_cache_turbo_status_variable(ngx_http_request_t *r,
 }
 
 
+/* Keep in sync with the NGX_HTTP_CACHE_TURBO_SR_* macros in the .h. */
+static const char *
+ngx_http_cache_turbo_serve_reason_str(ngx_uint_t sr)
+{
+    switch (sr) {
+    case NGX_HTTP_CACHE_TURBO_SR_FRESH:           return "FRESH";
+    case NGX_HTTP_CACHE_TURBO_SR_STALE:           return "STALE";
+    case NGX_HTTP_CACHE_TURBO_SR_STALE_IF_ERROR:  return "STALE-IF-ERROR";
+    case NGX_HTTP_CACHE_TURBO_SR_STALE_BREAKER:   return "STALE-BREAKER";
+    case NGX_HTTP_CACHE_TURBO_SR_BREAKER_503:     return "BREAKER-503";
+    default:                                      return NULL;
+    }
+}
+
+
+static ngx_int_t
+ngx_http_cache_turbo_serve_reason_variable(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data)
+{
+    ngx_http_cache_turbo_ctx_t  *ctx;
+    const char                  *s;
+
+    ctx = ngx_http_get_module_ctx(r, ngx_http_cache_turbo_module);
+    if (ctx == NULL) {
+        /* cache-turbo never engaged for this request -> "-" in the access log. */
+        v->not_found = 1;
+        return NGX_OK;
+    }
+
+    s = ngx_http_cache_turbo_serve_reason_str(ctx->serve_reason);
+    if (s == NULL) {
+        /* SR_NONE: engaged but no serve/503 decision recorded yet (e.g. a
+         * MISS/BYPASS/EXPIRED path that $cache_turbo_status covers but S7.2
+         * has no unfolded reason for) -> "-", same convention as above. */
+        v->not_found = 1;
+        return NGX_OK;
+    }
+
+    v->data = (u_char *) s;
+    v->len = ngx_strlen(s);
+    v->valid = 1;
+    v->no_cacheable = 1;
+    v->not_found = 0;
+
+    return NGX_OK;
+}
+
+
 static ngx_int_t
 ngx_http_cache_turbo_add_variables(ngx_conf_t *cf)
 {
@@ -11544,6 +11630,13 @@ ngx_http_cache_turbo_add_variables(ngx_conf_t *cf)
     }
 
     var->get_handler = ngx_http_cache_turbo_status_variable;
+
+    var = ngx_http_add_variable(cf, &ngx_http_cache_turbo_serve_reason_name, 0);
+    if (var == NULL) {
+        return NGX_ERROR;
+    }
+
+    var->get_handler = ngx_http_cache_turbo_serve_reason_variable;
 
     return NGX_OK;
 }

@@ -337,6 +337,20 @@
 #define NGX_HTTP_CACHE_TURBO_ST_BYPASS   3
 #define NGX_HTTP_CACHE_TURBO_ST_EXPIRED  4
 
+/* S7.2: unfolded per-request serve reason, surfaced by
+ * $cache_turbo_serve_reason. Unlike ctx.status/$cache_turbo_status (which
+ * folds every non-HIT reason to STALE for $upstream_cache_status
+ * compatibility and MUST keep doing so), this enum keeps the caller-supplied
+ * reason distinct. NONE is 0 so a pcalloc'd ctx defaults to it (never
+ * engaged / not yet decided -> "-" via not_found, same as status).
+ * Keep ngx_http_cache_turbo_serve_reason_str() in the .c in sync. */
+#define NGX_HTTP_CACHE_TURBO_SR_NONE            0
+#define NGX_HTTP_CACHE_TURBO_SR_FRESH           1
+#define NGX_HTTP_CACHE_TURBO_SR_STALE           2
+#define NGX_HTTP_CACHE_TURBO_SR_STALE_IF_ERROR  3
+#define NGX_HTTP_CACHE_TURBO_SR_STALE_BREAKER   4
+#define NGX_HTTP_CACHE_TURBO_SR_BREAKER_503     5
+
 
 /*
  * Live autotune within preset bands (#10, v4-3). Ported from the wp-redis PHP
@@ -1846,6 +1860,12 @@ typedef struct {
      * auto-classify / cache_turbo_bypass paths, EXPIRED when a cached entry is
      * found past its serveable window (L1 or L2) and refetched from origin. */
     ngx_uint_t               status;
+    /* S7.2: unfolded per-request serve reason for $cache_turbo_serve_reason.
+     * One of NGX_HTTP_CACHE_TURBO_SR_*; defaults to SR_NONE (0) via pcalloc.
+     * Set at the same capture points as `status` above but WITHOUT folding
+     * STALE/STALE-IF-ERROR/STALE-BREAKER together, plus the breaker's local
+     * 503 (which never touches `status` -- see breaker_unavailable()). */
+    ngx_uint_t               serve_reason;
 } ngx_http_cache_turbo_ctx_t;
 
 
