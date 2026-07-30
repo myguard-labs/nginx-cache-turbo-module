@@ -1158,7 +1158,9 @@ location / {
 }
 ```
 
-The breaker trips OPEN after three 5xx responses within 30 seconds, halting origin requests for the next 2 minutes while serving the cached copy (fresh if within 5 minutes, stale if older). During the OPEN window, one request per refresh cycle probes the origin; if it succeeds, the breaker closes. If the origin is still down after 2 minutes, the next refresh cycle attempts again. Once fully expired beyond the 24-hour `keep_stale` window, clients see a hard error — this is by design: serving months-old data requires an explicit choice, not a default.
+The breaker trips OPEN after three 5xx responses within 30 seconds. While it is OPEN it does not contact the origin at all — that is the point — and requests are answered from the cached copy, fresh if it is under 5 minutes old and stale if it is older. Once the 2-minute OPEN window elapses, exactly one request is promoted to probe the origin: if that probe succeeds the breaker closes and normal traffic resumes, and if it fails the breaker stays OPEN for another window.
+
+A URI with no cached copy at all has nothing to fall back on, so those requests get a `503` carrying a `Retry-After` hint that tracks `cache_turbo_breaker_open`. The same applies once a copy ages past the 24-hour `cache_turbo_keep_stale` window: serving indefinitely old data is an explicit choice, not a default.
 
 ### What outage handling cannot do
 
