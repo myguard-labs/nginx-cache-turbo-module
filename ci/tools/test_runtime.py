@@ -8097,9 +8097,12 @@ def test_breaker_record_native_proxy_cache_hit_no_record(ng: Nginx) -> None:
         if s1 == 200 and b1 == b0:
             break
         time.sleep(0.1)
-    assert s1 == 200 and b1 == b0, (
-        f"expected a native proxy_cache HIT (identical body) for {path} "
-        f"within 5s, got status={s1} body-changed={b1 != b0}")
+    if not (s1 == 200 and b1 == b0):
+        _, _, hdbg = fetch(ng.port, path)
+        raise AssertionError(
+            f"expected a native proxy_cache HIT (identical body) for {path} "
+            f"within 5s, got status={s1} body-changed={b1 != b0}; "
+            f"b0={b0[:80]!r} b1={(b1 or b'')[:80]!r} hdrs={dict(hdbg)!r}")
 
     of_after = _admin_stat(ng, "origin_failures", "/_cache_o45hit")
     assert of_after == of_before, (
