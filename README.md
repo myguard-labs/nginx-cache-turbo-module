@@ -1689,6 +1689,11 @@ Every sample is labelled by `zone`, so one job can scrape many zones. Metrics:
 | `cache_turbo_regen_cost_ms` | gauge | Average backend regeneration time (ms). |
 | `cache_turbo_autotuned_beta` | gauge | Live autotuned `beta` ×1000 (0 = none). |
 | `cache_turbo_autotuned_load` | gauge | Live load factor ×1000 widening the stale window + `lock_ttl` under load (1000 = baseline / not under load, up to 4000). |
+| `cache_turbo_sie_serves_total` | counter | Responses served from a stale-if-error snapshot. |
+| `cache_turbo_breaker_serves_total` | counter | Responses served from the circuit breaker's armed fallback while OPEN. |
+| `cache_turbo_origin_failures_total` | counter | Origin responses recorded as a failure by the circuit breaker. |
+| `cache_turbo_breaker_opens_total` | counter | Lifetime count of CLOSED->OPEN circuit breaker trips. |
+| `cache_turbo_breaker_state` | gauge | Circuit breaker state (0=closed, 1=open, 2=half-open). |
 
 `prometheus.yml`:
 

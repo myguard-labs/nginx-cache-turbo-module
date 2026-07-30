@@ -101,6 +101,56 @@
         { "expr": "sum(rate(cache_turbo_refreshes_total{zone=~\"$zone\"}[5m]))", "legendFormat": "refresh" },
         { "expr": "sum(rate(cache_turbo_evictions_total{zone=~\"$zone\"}[5m]))", "legendFormat": "eviction" }
       ]
+    },
+    {
+      "title": "SIE serves/s",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 14 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "reqps" } },
+      "targets": [
+        { "expr": "sum(rate(cache_turbo_sie_serves_total{zone=~\"$zone\"}[5m]))", "legendFormat": "SIE serves" }
+      ]
+    },
+    {
+      "title": "Breaker serves/s",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 6, "x": 6, "y": 14 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "reqps" } },
+      "targets": [
+        { "expr": "sum(rate(cache_turbo_breaker_serves_total{zone=~\"$zone\"}[5m]))", "legendFormat": "breaker serves" }
+      ]
+    },
+    {
+      "title": "Origin failures/s",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 14 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "reqps" } },
+      "targets": [
+        { "expr": "sum(rate(cache_turbo_origin_failures_total{zone=~\"$zone\"}[5m]))", "legendFormat": "failures" }
+      ]
+    },
+    {
+      "title": "Breaker opens/s",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 14 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "reqps" } },
+      "targets": [
+        { "expr": "sum(rate(cache_turbo_breaker_opens_total{zone=~\"$zone\"}[5m]))", "legendFormat": "opens" }
+      ]
+    },
+    {
+      "title": "Breaker state",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 22 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "mappings": [ { "type": "value", "options": { "0": { "text": "closed", "color": "green" }, "1": { "text": "open", "color": "red" }, "2": { "text": "half-open", "color": "yellow" } } } ] } },
+      "targets": [
+        { "expr": "max(cache_turbo_breaker_state{zone=~\"$zone\"})", "legendFormat": "state" }
+      ]
     }
   ]
 }
