@@ -1595,10 +1595,29 @@ http {
 > property, since it defaults to the effective `breaker_open`.
 >
 > Sharing a zone between locations that want different breaker policy is
-> therefore a configuration error the module cannot detect for you: it has no
-> way to tell "deliberately layered" from "accidentally inconsistent". One
-> effective breaker policy per zone — if two locations genuinely need different
-> thresholds or reopen timing, give them **separate zones**.
+> therefore a configuration mistake — but not a silent one. The module compares
+> each location's effective breaker tuple (`threshold`, `window`, `open`,
+> `retry_after`) against the first one it saw for that zone, and warns at config
+> time when they diverge:
+>
+> ```
+> nginx: [warn] cache_turbo circuit breaker: this location's effective policy
+> (threshold=3 window=10 open=300 retry_after=30) diverges from another location
+> sharing the same cache_turbo_zone (threshold=3 window=10 open=30
+> retry_after=30); breaker STATE is per-zone but policy is per-location, so
+> whichever location last calls the state machine decides effective reopen
+> timing for the whole zone
+> ```
+>
+> It is a **warning, not a rejection** — divergence is legal, and configs doing
+> it deliberately keep loading. The module still cannot tell "deliberately
+> layered" from "accidentally inconsistent"; it can only tell you the two
+> policies differ and let you decide. One effective breaker policy per zone — if
+> two locations genuinely need different thresholds or reopen timing, give them
+> **separate zones**.
+>
+> Only locations where the breaker is actually live are compared: a location
+> with `cache_turbo_breaker off` contributes no policy and triggers no warning.
 >
 > **Enforcement scope is not observation scope.** `cache_turbo_breaker off` on a
 > location stops that location arming, consulting, tripping, or recording — it
