@@ -6831,6 +6831,27 @@ ngx_http_cache_turbo_sie_rewrite(ngx_http_request_t *r,
         return NGX_ERROR;
     }
 
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+    /* O4.4-i: RE-STAMP the arming counter header.
+     *
+     * The ngx_list_init() above wipes headers_out.headers, and the header
+     * filter has ALREADY stamped X-Cache-Turbo-Test-Armings by the time this
+     * runs -- so without this the client sees the snapshot's stored value
+     * (whatever the counter read at store time, normally 0) on every
+     * STALE-IF-ERROR response, while the live zone counter has moved. That is
+     * not a cosmetic loss: it silently disarms the O4.4-i L2 control, whose
+     * `breaker off` fixture is served exactly this way. Measured: the header
+     * filter logged l2=3/l2=4 for the two /brkil2off/ requests while the
+     * client received l1=0,l2=0.
+     *
+     * Failure is deliberately ignored -- a test-only header must never turn a
+     * successful serve-on-error into a 500. A MISSING header is a hard failure
+     * in the test's own oracle (_armings), so a silent drop cannot read as
+     * "armed 0". */
+    (void) ngx_http_cache_turbo_test_armings_header(r);
+#endif
+
     ctx->sie_body = body;
     ctx->sie_body_len = body_len;
     return NGX_OK;
