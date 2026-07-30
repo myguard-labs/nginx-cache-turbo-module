@@ -1137,6 +1137,29 @@ refused connection and a real 502 are the same number. So `error` behaves as
 `http_502` and `timeout` behaves as `http_504`. Write whichever reads better;
 they select the same responses.
 
+### Circuit breaker + stale-on-error for origin protection
+
+When the origin becomes unreliable (degraded response times, rare failures), you can combine the circuit breaker with `cache_turbo_keep_stale` to shield downstream clients and give the origin time to recover:
+
+```nginx
+location / {
+    cache_turbo                       ct;
+    cache_turbo_valid                 5m;         # fresh TTL: 5 minutes
+    cache_turbo_keep_stale            24h;        # if origin is down, serve stale for up to 24 hours
+    cache_turbo_background_update     on;         # stale-while-revalidate during normal operation
+
+    # Circuit breaker: trip after 3 consecutive 5xx in a 30-second window
+    cache_turbo_breaker               on;
+    cache_turbo_breaker_threshold     3;          # fail count needed to open
+    cache_turbo_breaker_window        30s;        # rolling window for counting failures
+    cache_turbo_breaker_open          2m;         # stay open for 2 minutes, then probe once
+
+    proxy_pass http://backend;
+}
+```
+
+The breaker trips OPEN after three 5xx responses within 30 seconds, halting origin requests for the next 2 minutes while serving the cached copy (fresh if within 5 minutes, stale if older). During the OPEN window, one request per refresh cycle probes the origin; if it succeeds, the breaker closes. If the origin is still down after 2 minutes, the next refresh cycle attempts again. Once fully expired beyond the 24-hour `keep_stale` window, clients see a hard error — this is by design: serving months-old data requires an explicit choice, not a default.
+
 ### What outage handling cannot do
 
 Some failure modes are outside what a cache can fix. They are listed here so you
