@@ -53,7 +53,40 @@ jobs:
       - name: Install validation tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y cppcheck shellcheck
+          sudo apt-get install -y cppcheck shellcheck python3-pip pipx
+          # ruff is pinned so a new release cannot add a rule to the selected
+          # tiers and land this job red on an unrelated PR.
+          #
+          # Same pipx-with-pip-fallback shape as the semgrep install in
+          # security-scanners.yml: PEP 668 blocks a bare pip3 install into the
+          # system Python on the Ubuntu 24.04 self-hosted runner. Both paths
+          # land the binary in ~/.local/bin, which is NOT on the runner's
+          # default PATH -- without the GITHUB_PATH append the next step dies
+          # with "ruff: command not found", i.e. a gate that fails for a reason
+          # that has nothing to do with the code.
+          if command -v pipx >/dev/null; then
+            pipx install --quiet 'ruff==0.15.20'
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          else
+            pip3 install --quiet --user --break-system-packages 'ruff==0.15.20'
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          fi
+
+      - name: ruff (Python correctness tiers F,B,RUF059)
+        run: |
+          set -euo pipefail
+          # ci/tools/test_runtime.py IS the runtime suite (~15.6k lines) and
+          # went unlinted before this gate. RUF059 (unused-unpacked-variable)
+          # is the reason this gate exists: a captured-then-never-read variable
+          # is the tell for the vacuous-assertion class that produced a test
+          # whose only surviving assertion was satisfied by BOTH the pass and
+          # the fail state. Mirrors the ruff hook in .pre-commit-config.yaml --
+          # move both together.
+          #
+          # Style tiers (PT018, E501) are deliberately excluded: 257 findings
+          # would land this red on arrival and train --no-verify.
+          ruff --version          # records which ruff resolved off PATH
+          ruff check --select F,B,RUF059 ci/
 
       - name: Validate scripts and source
         run: |
