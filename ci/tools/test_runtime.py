@@ -2320,10 +2320,10 @@ http {{
             deny all;
         }}
 
-        # O4.5: breaker LIFECYCLE end-to-end. /o45/cached is primed then
+        # O4.5: breaker LIFECYCLE end-to-end. /o45/o45cache is primed then
         # tripped (same 1s-fresh/x4=4s-stale/threshold=1 shape as /s71brk/) so
         # a re-fetch while OPEN proves zero origin contact (origin.hits_for
-        # unchanged) by serving the armed any-age snapshot. /o45/cold shares
+        # unchanged) by serving the armed any-age snapshot. /o45/o45cold shares
         # the zone but is NEVER primed, so once OPEN it has no snapshot to
         # arm and falls into breaker_unavailable() (503 + Retry-After) --
         # same "second, never-primed uri on the same zone" shape as
@@ -2384,10 +2384,18 @@ http {{
         # own trip. threshold=1/window=60s/open=30s -- same shape as the
         # other breaker fixtures; claim 1's drop DOES trip this zone's
         # breaker, which is why it runs after claim 2's HIT check.
+        #
+        # valid is 30s, NOT the 1s the sibling breaker fixtures use: claim 2
+        # puts an _admin_stat round trip between the prime and the HIT fetch,
+        # so a 1s window can expire on a loaded or ASan runner and the HIT
+        # becomes a re-fetch -- failing on box speed rather than on module
+        # behaviour, the same SUITE-4 trap the /ccignmr/ comment records.
+        # Neither claim here needs a short TTL: /o45hit/dropme is never primed,
+        # and the staleness step runs on /o45hitpos/, a different zone.
         location /o45hit/ {{
             cache_turbo                    o45hitz;
             cache_turbo_key                $uri;
-            cache_turbo_valid               1s;
+            cache_turbo_valid              30s;
             cache_turbo_breaker              on;
             cache_turbo_breaker_threshold    1;
             cache_turbo_breaker_window      60s;
@@ -7798,11 +7806,11 @@ def test_breaker_lifecycle_open_zero_contact_close(ng: Nginx, origin: Origin) ->
     open=2s):
 
       1. N (=1) origin failures trips the breaker OPEN.
-      2. A CACHED key (/o45/cached, already armed by the priming fetch) still
-         answers 200 while OPEN, with origin.hits_for("/o45/cached")
+      2. A CACHED key (/o45/o45cache, already armed by the priming fetch) still
+         answers 200 while OPEN, with origin.hits_for("o45cache")
          UNCHANGED across the OPEN-window fetch -- proving zero origin
          contact, not just "some 200".
-      3. A COLD key sharing the same zone (/o45/cold, never primed, so it has
+      3. A COLD key sharing the same zone (/o45/o45cold, never primed, so it has
          no snapshot to arm) gets 503 + a Retry-After header while OPEN,
          matching this location's explicit cache_turbo_breaker_retry_after
          (2s -- set explicitly rather than left to track breaker_open, see
@@ -7813,7 +7821,7 @@ def test_breaker_lifecycle_open_zero_contact_close(ng: Nginx, origin: Origin) ->
          claim is testing).
       4. Origin restored + the probe promoted after breaker_open (2s) elapses
          CLOSES the breaker: the next fetch after the wait reaches the (now
-         healthy) origin and origin.hits_for("/o45/cached") MOVES.
+         healthy) origin and origin.hits_for("o45cache") MOVES.
     """
     # NOTE: proxy_pass strips the /o45/ location prefix before the request
     # reaches the origin, so origin.hits_for() must be given the ORIGIN-side
@@ -7828,7 +7836,7 @@ def test_breaker_lifecycle_open_zero_contact_close(ng: Nginx, origin: Origin) ->
     cached_needle = "o45cache"
     cold_needle = "o45cold"
 
-    # Prime /o45/cached only -- /o45/cold is deliberately NEVER primed (claim 3
+    # Prime /o45/o45cache only -- /o45/o45cold is deliberately NEVER primed (claim 3
     # needs a key with no armed snapshot at all once OPEN).
     s0, b0, _ = fetch(ng.port, cached_path)
     assert s0 == 200 and b0, f"prime failed for {cached_path}: {s0} {b0!r}"
@@ -7894,11 +7902,26 @@ def test_breaker_lifecycle_open_zero_contact_close(ng: Nginx, origin: Origin) ->
 
         # A second fetch right after must find the breaker CLOSED (normal
         # service resumed) rather than still routing through the fallback.
+        #
+        # The status alone cannot say that: a still-OPEN breaker serving the
+        # armed any-age snapshot answers 200 too. Nor can an origin-hit delta
+        # -- the probe above just re-stored this key and cache_turbo_valid is
+        # 1s, so a CLOSED breaker legitimately answers from cache with zero
+        # origin contact, and asserting a hit would fail on timing rather than
+        # behaviour. The zone's own breaker_state is the discriminating read:
+        # shm_stats() snapshots the word (shm.c:734) instead of going through
+        # _breaker_state(), so unlike the request path it promotes nothing and
+        # observing it cannot change what it reports.
         drain_origin(origin)
-        hits_before_confirm = origin.hits_for(cached_needle)
         s_confirm, _, _ = fetch(ng.port, cached_path)
         assert s_confirm == 200, (
             f"post-close confirm fetch: expected 200, got {s_confirm}")
+        brk_state = _admin_str(ng, "breaker_state", "/_cache_o45")
+        assert brk_state == "closed", (
+            f"the successful probe must CLOSE the breaker, but the zone still "
+            f"reports breaker_state={brk_state!r} -- a 200 here proves nothing "
+            f"on its own, since an OPEN breaker serving the armed snapshot "
+            f"answers 200 as well")
     finally:
         origin.fail = False
         drain_origin(origin)
@@ -8024,7 +8047,7 @@ def test_breaker_record_position_and_sense(ng: Nginx, origin: Origin) -> None:
     origin.drop = True
     try:
         of_before_stale = _admin_stat(ng, "origin_failures", "/_cache_o45hitpos")
-        s_stale, b_stale, h_stale = fetch(ng.port, stale_path)
+        s_stale, b_stale, _ = fetch(ng.port, stale_path)
         assert s_stale == 200 and b_stale == b2, (
             f"expected keep_stale to swap the dropped-connection 502 for "
             f"the stale body (unchanged from the prime), got status="
@@ -10851,6 +10874,16 @@ def _admin_stat(ng: Nginx, name: str, path: str = "/_cache") -> int:
     import json
     _, b, _ = fetch(ng.port, path)
     return int(json.loads(b).get(name, 0))
+
+
+def _admin_str(ng: Nginx, name: str, path: str = "/_cache") -> str:
+    """String-valued sibling of _admin_stat, for breaker_state (the only
+    non-numeric field on the admin JSON). Deliberately defaults to "" rather
+    than "closed" on a missing key: a build that stopped emitting the field
+    must fail the assertion, not read as the state the caller hoped for."""
+    import json
+    _, b, _ = fetch(ng.port, path)
+    return str(json.loads(b).get(name, ""))
 
 
 def test_cold_single_flight(ng: Nginx, origin: Origin) -> None:
