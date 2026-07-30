@@ -879,13 +879,20 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
         # the L2 (Redis) arm, not L1 (module.c:5296). An L2 entry can be
         # YOUNGER than the L1 copy (a peer refreshed it), so the verdict must
         # be re-run on the L2 blob's own created/fresh_ttl rather than reusing
-        # the L1 verdict. `cache_turbo_purge on` lets the test drop the L1
-        # copy only (same trick as /sfgu/) so a read is forced to consult L2.
+        # the L1 verdict.
+        #
+        # NOTE: `cache_turbo_purge on` is NOT an L1-only drop. purge_request()
+        # calls clcf->backend->del() unconditionally whenever a backend is
+        # configured (module.c ~1711, "Drop from L2 too, so a purge can't be
+        # silently refilled from Redis") -- and this location configures one,
+        # so a PURGE here empties BOTH tiers. To leave L2 populated while
+        # emptying L1 there is no directive: capture the blob with
+        # redis.get_raw(), PURGE, then redis.set_raw() it back.
         location /reqccl2/ {{
             cache_turbo          main;
             cache_turbo_key      $uri;
             cache_turbo_valid    30s;
-            cache_turbo_purge    on;   # test drops L1 so the read consults L2
+            cache_turbo_purge    on;   # drops L1 AND L2 -- see the note above
             cache_turbo_redis    127.0.0.1:{redis_port} prefix=ct: timeout=250ms;
             add_header           X-CT-Status $cache_turbo_status always;
             proxy_pass http://127.0.0.1:{origin_port}/;
@@ -1100,7 +1107,13 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             cache_turbo_valid    30s;
             cache_turbo_stale_mult 1;
             cache_turbo_lock_ttl 5s;
-            cache_turbo_purge    on;   # test drops L1 so the burst consults L2
+            # NOT an L1-only drop: purge_request() calls backend->del()
+            # unconditionally when a backend is configured (module.c ~1711),
+            # and this location configures one, so a PURGE empties BOTH tiers.
+            # This comment previously claimed otherwise and is the documented
+            # origin of that error (issues.md OBS-2, mis-scoped twice).
+            cache_turbo_purge    on;
+
             cache_turbo_redis    127.0.0.1:{redis_port} prefix=ct: timeout=250ms;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
