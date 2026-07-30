@@ -161,6 +161,70 @@ check_probe_layout() {
 }
 check_probe_layout
 
+# PERF-7: the blob refcount header is hand-mirrored into test_shm_state.c (the
+# harness declares its own structs rather than including module.h). CT_BLOBREF()
+# steps BACK by sizeof(that struct) from the blob pointer, so if the mirror ever
+# has a different size or field order than production, the sliced bodies read a
+# header at the wrong offset -- and every blob test would still pass, because
+# the mirror and the tests would agree with each other while both disagreed with
+# the shipped layout. That is precisely how the H-1 wrong-layout bug survived, so
+# the mirror is pinned structurally here rather than trusted.
+check_blobref_mirror() {
+    # extract_define() anchors on the macro name followed by whitespace, a
+    # continuation or EOL -- a function-like macro is followed by '(', so the
+    # parameter list is part of the name we match on.
+    hdr_macro=$(extract_define 'CT_BLOBREF\\(data\\)' "$HDR")
+    test_macro=$(extract_define 'CT_BLOBREF\\(data\\)' "$UNIT_DIR/test_shm_state.c")
+    if [ -z "$hdr_macro" ] || [ -z "$test_macro" ]; then
+        echo "✗ CT_BLOBREF not found in both $HDR and test_shm_state.c" >&2
+        exit 1
+    fi
+    if [ "$hdr_macro" != "$test_macro" ]; then
+        echo "✗ CT_BLOBREF drifted between module.h ('$hdr_macro') and" \
+             "test_shm_state.c ('$test_macro')" >&2
+        exit 1
+    fi
+
+    # Field list + order of ngx_http_cache_turbo_blobref_t, normalised to
+    # "type name;" tokens. Compares the struct BODY in both files: a reordered,
+    # added, removed or retyped field changes the size or the offsets and must
+    # fail the build rather than silently shift the header.
+    blobref_fields() {
+        awk '
+            /^typedef struct \{/ { buf = ""; cap = 1; next }
+            cap && /^\} ngx_http_cache_turbo_blobref_t;/ { print buf; exit }
+            cap { line = $0
+                  # Drop whole-line and trailing comments, and any line that is
+                  # purely a comment continuation (" * text" or " */"), so only
+                  # "type name;" survives. Without the continuation rule a
+                  # comment REFLOWED across lines in one file but not the other
+                  # would diverge the two field lists and fail the build on
+                  # cosmetic drift alone.
+                  gsub(/\/\*[^*]*\*+([^\/*][^*]*\*+)*\//, "", line)
+                  sub(/\/\*.*/, "", line)
+                  if (line ~ /^[[:space:]]*\*/) next
+                  gsub(/[[:space:]]+/, " ", line)
+                  gsub(/^ | $/, "", line)
+                  if (line != "") buf = buf line "|"
+                }
+        ' "$1"
+    }
+    hdr_fields=$(blobref_fields "$HDR")
+    test_fields=$(blobref_fields "$UNIT_DIR/test_shm_state.c")
+    if [ -z "$hdr_fields" ] || [ -z "$test_fields" ]; then
+        echo "✗ ngx_http_cache_turbo_blobref_t body not found in both" \
+             "$HDR and test_shm_state.c" >&2
+        exit 1
+    fi
+    if [ "$hdr_fields" != "$test_fields" ]; then
+        echo "✗ ngx_http_cache_turbo_blobref_t drifted between module.h" \
+             "('$hdr_fields') and test_shm_state.c ('$test_fields')" >&2
+        echo "  the mirrored header size/offsets no longer match production" >&2
+        exit 1
+    fi
+}
+check_blobref_mirror
+
 # --- slice the function bodies in source order.
 # nginx style: a definition is a bare return-type line (`void`, `ngx_int_t`,
 # `static void *`, `ngx_http_cache_turbo_node_t *`, ...) immediately followed
@@ -170,7 +234,7 @@ awk '
     /^(static )?(void|ngx_int_t|ngx_uint_t|time_t|u_char|const char|ngx_http_cache_turbo_node_t)[[:space:]]*\**$/ {
         pending = 1; buf = $0 ORS; next
     }
-    pending && /^ngx_http_cache_turbo_(shm_(lookup|evict_one|alloc_evict|claim|unstub|count_miss|l2_neg_check|l2_neg_set|touch_lru|brk_probe_age|breaker_state|breaker_record|breaker_state_str)|lru_(link_head|unlink|insert_new|enforce_cap))\(/ {
+    pending && /^ngx_http_cache_turbo_(shm_(lookup|evict_one|alloc_evict|claim|unstub|count_miss|l2_neg_check|l2_neg_set|touch_lru|brk_probe_age|breaker_state|breaker_record|breaker_state_str)|lru_(link_head|unlink|insert_new|enforce_cap)|blob_(alloc|node_release|acquire|release))\(/ {
         capture = 1; pending = 0; printf "%s", buf; print; next
     }
     pending { pending = 0; buf = "" }
@@ -321,7 +385,11 @@ for fn in \
     'ngx_http_cache_turbo_shm_l2_neg_set(' \
     'ngx_http_cache_turbo_shm_breaker_state(' \
     'ngx_http_cache_turbo_shm_breaker_record(' \
-    'ngx_http_cache_turbo_shm_breaker_state_str('
+    'ngx_http_cache_turbo_shm_breaker_state_str(' \
+    'ngx_http_cache_turbo_blob_alloc(' \
+    'ngx_http_cache_turbo_blob_node_release(' \
+    'ngx_http_cache_turbo_blob_acquire(' \
+    'ngx_http_cache_turbo_blob_release('
 do
     if ! grep -qF "$fn" "$OUT"; then
         echo "✗ failed to extract $fn from $SRC" >&2

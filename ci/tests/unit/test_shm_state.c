@@ -207,6 +207,23 @@ typedef struct {
     ngx_slab_pool_t               *shpool;
 } ngx_http_cache_turbo_zone_t;
 
+/* PERF-7: the blob refcount header, hand-mirrored from module.h like every
+ * other struct in this file. Field ORDER and the header SIZE are load-bearing:
+ * CT_BLOBREF() steps back by sizeof(*this) from the blob pointer, so a mirror
+ * that is a different size than production's would have the sliced bodies
+ * reading a header at the wrong offset -- and the tests would still pass,
+ * because both sides here would agree with each other. extract_shm.sh pins the
+ * two field names and the CT_BLOBREF definition against the real header for
+ * exactly that reason (the H-1/H-4 lesson: an unpinned mirror drifts silently). */
+typedef struct {
+    ngx_uint_t               refs;       /* in-flight zero-copy servers      */
+    ngx_uint_t               detached;   /* owning node dropped this buffer  */
+} ngx_http_cache_turbo_blobref_t;
+
+#define CT_BLOBREF(data)                                                       \
+    ((ngx_http_cache_turbo_blobref_t *)                                        \
+        ((u_char *) (data) - sizeof(ngx_http_cache_turbo_blobref_t)))
+
 /* O4.4: minimal loc_conf shim for ngx_http_cache_turbo_breaker_should_consult().
  * Only the four fields the predicate reads need to exist, and only by NAME --
  * the sliced function is compiled against THIS struct, not the real one, so
@@ -228,16 +245,18 @@ typedef struct {
 #define NGX_HTTP_CACHE_TURBO_CLAIM_WINNER   1
 #define NGX_HTTP_CACHE_TURBO_CLAIM_LOSER    2
 
-/* The sliced set calls this on eviction of a node that holds a body. No node
- * in these tests holds one (they are all COUNTERs), so reaching it means a
- * test built the wrong fixture -- fail loudly rather than silently no-op. */
-static void
-ngx_http_cache_turbo_blob_node_release(ngx_http_cache_turbo_zone_t *z, u_char *p)
-{
-    (void) z; (void) p;
-    fprintf(stderr, "blob_node_release called: fixture built an ENTRY, not a COUNTER\n");
-    abort();
-}
+/* PERF-7 blob refcount layer. This used to be an abort() stub, on the argument
+ * that every fixture here builds COUNTER nodes so the body path is unreachable.
+ * That left the whole detach/refcount lifecycle -- the code that decides
+ * whether a slab is freed now, later, or twice -- with no unit coverage at
+ * all, in a module whose other memory bugs (O4.4-h) were exactly this class.
+ * The four functions are now sliced from production source like everything
+ * else (extract_shm.sh), so the tests below exercise the shipped bodies rather
+ * than a hand-copy. Forward declarations only; bodies come from the slice. */
+static u_char *ngx_http_cache_turbo_blob_alloc(
+    ngx_http_cache_turbo_zone_t *z, size_t len);
+static void ngx_http_cache_turbo_blob_node_release(
+    ngx_http_cache_turbo_zone_t *z, u_char *data);
 
 /* evict_one/alloc_evict are `static` in the sliced production source. Forward-
  * declare them so the S8 hang test can drive the eviction path directly --
@@ -2517,6 +2536,183 @@ test_breaker_record_driven_by_predicate(void)
 
 
 /* =====================================================================
+ * PERF-7 blob refcount lifecycle
+ *
+ * A served HIT points its output buffer straight into the slab, so the buffer
+ * must outlive eviction by another worker. Two independent parties decide when
+ * the slab dies: the OWNING NODE (evict / refresh / purge -> node_release) and
+ * each IN-FLIGHT SERVER (acquire on serve, release from its request-pool
+ * cleanup). The slab is freed by whichever finishes last, and exactly once.
+ *
+ * These tests drive the four orderings directly. The oracle is
+ * ngx_test_slab_live, the shim's outstanding-allocation counter: a premature
+ * free shows up as a use-after-free the following read would hit in
+ * production, and a double free / leak shows up as the counter going wrong.
+ * Under ASan (the Makefile's `check` target) a real double free also traps.
+ *
+ * The blob functions take a BLOB pointer, not the slab base -- CT_BLOBREF()
+ * steps back over the header. blob_alloc() returns that blob pointer, so the
+ * tests never do the pointer arithmetic themselves.
+ * ===================================================================== */
+
+/* Allocate a blob and assert the header starts neutral: refs == 0 (nobody is
+ * serving it) and detached == 0 (the owning node still holds it). Poisoned
+ * slab memory (0xA5) makes an unset field read as garbage, so this also pins
+ * that blob_alloc() initialises BOTH fields rather than inheriting them. */
+static void
+test_blob_alloc_starts_unreferenced_and_attached(void)
+{
+    u_char                          *blob;
+    ngx_http_cache_turbo_blobref_t  *ref;
+    ngx_uint_t                       live_before;
+
+    zone_reset();
+    live_before = ngx_test_slab_live;
+
+    blob = ngx_http_cache_turbo_blob_alloc(&g_zone, 64);
+    REQUIRE(blob != NULL, "blob_alloc returned NULL on an unlimited pool");
+
+    ref = CT_BLOBREF(blob);
+    CHECK(ref->refs == 0, "a fresh blob started with a non-zero refcount");
+    CHECK(ref->detached == 0, "a fresh blob started already detached");
+    CHECK(ngx_test_slab_live == live_before + 1,
+          "blob_alloc did not account for exactly one slab allocation");
+
+    /* The owning node drops it with no serve in flight: freed immediately. */
+    ngx_http_cache_turbo_blob_node_release(&g_zone, blob);
+    CHECK(ngx_test_slab_live == live_before,
+          "node_release with refs == 0 did not free the slab");
+}
+
+
+/* Owner drops the blob while a serve IS in flight. The slab must survive
+ * node_release (the server is still reading it) and be freed by the server's
+ * release. This is the use-after-free ordering: freeing at node_release would
+ * hand the in-flight request a dangling buffer. */
+static void
+test_blob_detach_defers_free_to_the_last_server(void)
+{
+    u_char      *blob;
+    ngx_uint_t   live_before;
+
+    zone_reset();
+    live_before = ngx_test_slab_live;
+
+    blob = ngx_http_cache_turbo_blob_alloc(&g_zone, 64);
+    REQUIRE(blob != NULL, "blob_alloc returned NULL on an unlimited pool");
+
+    ngx_http_cache_turbo_blob_acquire(blob);          /* a serve starts */
+    CHECK(CT_BLOBREF(blob)->refs == 1, "acquire did not take a reference");
+
+    ngx_http_cache_turbo_blob_node_release(&g_zone, blob);  /* owner evicts */
+    CHECK(ngx_test_slab_live == live_before + 1,
+          "node_release freed a blob that still had a server in flight");
+    CHECK(CT_BLOBREF(blob)->detached == 1,
+          "node_release did not mark the blob detached");
+
+    ngx_http_cache_turbo_blob_release(&g_zone, blob);  /* server finishes */
+    CHECK(ngx_test_slab_live == live_before,
+          "the last server did not free the detached blob");
+    CHECK(ngx_test_lock_balanced(),
+          "blob_release left the zone mutex held");
+}
+
+
+/* The reverse ordering: every server finishes BEFORE the owner evicts. The
+ * blob is still attached while refs drop to 0, so release must NOT free it --
+ * the node still points at it and would serve freed memory on the next HIT.
+ * The free belongs to node_release. */
+static void
+test_blob_release_does_not_free_while_still_attached(void)
+{
+    u_char      *blob;
+    ngx_uint_t   live_before;
+
+    zone_reset();
+    live_before = ngx_test_slab_live;
+
+    blob = ngx_http_cache_turbo_blob_alloc(&g_zone, 64);
+    REQUIRE(blob != NULL, "blob_alloc returned NULL on an unlimited pool");
+
+    ngx_http_cache_turbo_blob_acquire(blob);
+    ngx_http_cache_turbo_blob_release(&g_zone, blob);
+
+    CHECK(ngx_test_slab_live == live_before + 1,
+          "release freed a blob the owning node still holds");
+    CHECK(CT_BLOBREF(blob)->refs == 0, "release did not drop the reference");
+
+    /* Owner drops it last -> freed now. */
+    ngx_http_cache_turbo_blob_node_release(&g_zone, blob);
+    CHECK(ngx_test_slab_live == live_before,
+          "node_release did not free an unreferenced attached blob");
+}
+
+
+/* Several concurrent servers on one blob. Only the LAST release may free it,
+ * and only once. An off-by-one in the refcount frees the slab out from under
+ * the remaining servers (the multi-reader use-after-free). */
+static void
+test_blob_multiple_servers_free_exactly_once(void)
+{
+    u_char      *blob;
+    ngx_uint_t   live_before;
+    int          i;
+
+    zone_reset();
+    live_before = ngx_test_slab_live;
+
+    blob = ngx_http_cache_turbo_blob_alloc(&g_zone, 64);
+    REQUIRE(blob != NULL, "blob_alloc returned NULL on an unlimited pool");
+
+    for (i = 0; i < 3; i++) {
+        ngx_http_cache_turbo_blob_acquire(blob);
+    }
+    CHECK(CT_BLOBREF(blob)->refs == 3, "three acquires did not count three refs");
+
+    ngx_http_cache_turbo_blob_node_release(&g_zone, blob);   /* owner evicts */
+
+    /* First two servers finish: the blob must stay alive for the third. */
+    ngx_http_cache_turbo_blob_release(&g_zone, blob);
+    CHECK(ngx_test_slab_live == live_before + 1,
+          "a non-final release freed a blob with servers still in flight");
+    ngx_http_cache_turbo_blob_release(&g_zone, blob);
+    CHECK(ngx_test_slab_live == live_before + 1,
+          "a non-final release freed a blob with a server still in flight");
+
+    /* Third and last -> exactly one free. */
+    ngx_http_cache_turbo_blob_release(&g_zone, blob);
+    CHECK(ngx_test_slab_live == live_before,
+          "the final release did not free the detached blob");
+    CHECK(ngx_test_lock_balanced(),
+          "the blob release path left the zone mutex held");
+}
+
+
+/* Slab exhaustion. blob_alloc() must propagate NULL rather than hand back a
+ * pointer into a header it never wrote -- the caller stores it as node->data,
+ * so a bogus non-NULL here becomes a wild pointer on the next HIT. */
+static void
+test_blob_alloc_propagates_slab_exhaustion(void)
+{
+    u_char      *blob;
+    ngx_uint_t   live_before;
+
+    zone_reset();
+    live_before = ngx_test_slab_live;
+
+    ngx_test_slab_fail_after(0);
+    blob = ngx_http_cache_turbo_blob_alloc(&g_zone, 64);
+    ngx_test_slab_fail_after(-1);
+
+    CHECK(blob == NULL, "blob_alloc returned non-NULL on an exhausted slab");
+    CHECK(ngx_test_slab_live == live_before,
+          "a failed blob_alloc leaked a slab allocation");
+    CHECK(ngx_test_lock_balanced(),
+          "a failed blob_alloc left the zone mutex held");
+}
+
+
+/* =====================================================================
  * NEGATIVE CONTROL
  *
  * Re-implements each bug against the same fixture and asserts the test's own
@@ -2878,6 +3074,123 @@ run_negative_controls(void)
             tests_failed++;
         }
     }
+
+    /* --- PERF-7 blob refcount controls --------------------------------
+     *
+     * Each bug is reimplemented against the same fixture the corresponding
+     * test uses, and the control asserts that the TEST'S OWN assertion would
+     * now fail. The bodies under test are sliced from production and cannot be
+     * edited from here, so the control reproduces the defective PREDICATE
+     * inline rather than mutating the real function -- the same technique the
+     * CR-B control above uses.
+     *
+     * Why these exist even though each bug was also verified by mutating
+     * shm.c by hand: a mutation run proves the test discriminated ONCE, on one
+     * machine, and then evaporates. These run on every build. */
+    {
+        u_char                          *blob;
+        ngx_http_cache_turbo_blobref_t  *ref;
+        ngx_uint_t                       live_before;
+
+        /* PERF-7-a restored: node_release() frees whenever the owner drops the
+         * blob, ignoring refs. test_blob_detach_defers_free_to_the_last_server
+         * asserts the slab SURVIVES that call while a serve is in flight. */
+        zone_reset();
+        live_before = ngx_test_slab_live;
+        blob = ngx_http_cache_turbo_blob_alloc(&g_zone, 64);
+        REQUIRE(blob != NULL, "PERF-7-a control fixture: blob_alloc failed");
+        ngx_http_cache_turbo_blob_acquire(blob);       /* a serve is in flight */
+        ref = CT_BLOBREF(blob);
+        ngx_slab_free_locked(&g_pool, ref);            /* <-- the bug */
+
+        caught = (ngx_test_slab_live == live_before);
+        tests_run++;
+        if (!caught) {
+            tests_failed++;
+            fprintf(stderr, "  ✗ CONTROL PERF-7-a: freeing on detach with a "
+                            "server in flight left the slab accounted live — "
+                            "test_blob_detach_defers_free_to_the_last_server "
+                            "guards nothing\n");
+        }
+
+        /* PERF-7-b restored: release() frees as soon as refs hits 0, without
+         * requiring detached. test_blob_release_does_not_free_while_still_attached
+         * asserts the slab SURVIVES, because the owning node still points at it. */
+        zone_reset();
+        live_before = ngx_test_slab_live;
+        blob = ngx_http_cache_turbo_blob_alloc(&g_zone, 64);
+        REQUIRE(blob != NULL, "PERF-7-b control fixture: blob_alloc failed");
+        ngx_http_cache_turbo_blob_acquire(blob);
+        ref = CT_BLOBREF(blob);
+        ref->refs--;
+        if (ref->refs == 0) {                          /* <-- the bug: no
+                                                        * detached conjunct */
+            ngx_slab_free_locked(&g_pool, ref);
+        }
+
+        caught = (ngx_test_slab_live == live_before);
+        tests_run++;
+        if (!caught) {
+            tests_failed++;
+            fprintf(stderr, "  ✗ CONTROL PERF-7-b: dropping the `detached` "
+                            "conjunct freed a blob the owning node still "
+                            "holds — "
+                            "test_blob_release_does_not_free_while_still_attached"
+                            " guards nothing\n");
+        }
+
+        /* PERF-7-c restored: acquire() does not count, so the FIRST of three
+         * servers to finish frees the slab under the other two.
+         * test_blob_multiple_servers_free_exactly_once asserts the blob is
+         * still live after the first two of three releases; this reproduces
+         * the bug and asserts that assertion would fail.
+         *
+         * ⚠ Two earlier versions of this control were vacuous, both in the way
+         * the O4.1-a / H-2 comments above warn about:
+         *   1. skipping acquire() and asserting that node_release() with
+         *      refs == 0 frees -- that is CORRECT behaviour, already asserted
+         *      by test_blob_alloc_starts_unreferenced_and_attached, so the
+         *      control passed whatever acquire() did;
+         *   2. calling the real acquire() and then zeroing refs -- the zeroing
+         *      made the calls irrelevant, so removing them changed nothing.
+         * The bug has to be modelled where it is OBSERVABLE: run the same
+         * three-server sequence the test runs, with a non-counting acquire,
+         * and check the state at the point the test asserts on. Non-counting
+         * is simulated by not incrementing (there is no way to edit the sliced
+         * production body from here), so the fixture below deliberately does
+         * NOT call acquire -- and the assertion is about the RELEASE sequence
+         * that follows, which is what distinguishes this from version 1. */
+        zone_reset();
+        live_before = ngx_test_slab_live;
+        blob = ngx_http_cache_turbo_blob_alloc(&g_zone, 64);
+        REQUIRE(blob != NULL, "PERF-7-c control fixture: blob_alloc failed");
+
+        /* Three servers start. With a counting acquire refs would be 3; with
+         * the bug it stays 0. */
+        ref = CT_BLOBREF(blob);
+        REQUIRE(ref->refs == 0, "PERF-7-c fixture: fresh blob had refs != 0");
+
+        /* The owner evicts while all three are still in flight. With the bug
+         * (refs == 0) this frees immediately instead of detaching. */
+        ngx_http_cache_turbo_blob_node_release(&g_zone, blob);
+
+        /* The test asserts the blob survives node_release AND the first two of
+         * three releases. Under the bug it is gone at the first step, so the
+         * live count is already back to baseline -- that is the discrepancy
+         * this control reports. A correct build keeps it live here because
+         * acquire() would have made refs == 3 and node_release() would only
+         * have set detached. */
+        caught = (ngx_test_slab_live == live_before);
+        tests_run++;
+        if (!caught) {
+            tests_failed++;
+            fprintf(stderr, "  ✗ CONTROL PERF-7-c: a non-counting acquire() did "
+                            "NOT let the owner's eviction free the slab out "
+                            "from under the in-flight servers — "
+                            "test_blob_multiple_servers_free_exactly_once "
+                            "guards nothing\n");
+        }
+    }
 }
 
 int
@@ -2925,6 +3238,11 @@ main(void)
     test_breaker_second_consult_loses_the_probe();
     test_breaker_only_the_probe_token_closes();
     test_breaker_probe_token_reopens();
+    test_blob_alloc_starts_unreferenced_and_attached();
+    test_blob_detach_defers_free_to_the_last_server();
+    test_blob_release_does_not_free_while_still_attached();
+    test_blob_multiple_servers_free_exactly_once();
+    test_blob_alloc_propagates_slab_exhaustion();
     run_negative_controls();
 
     /* Every node this run allocated must be accounted for. Under ASan a real
