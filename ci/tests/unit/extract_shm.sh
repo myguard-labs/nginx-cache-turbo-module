@@ -98,13 +98,41 @@ check_define NGX_HTTP_CACHE_TURBO_BRK_ACT_FAIL  2
 # (#if NGX_PTR_SIZE >= 8); only the >= 8 arm ships (H-2/O4.4-j rejects the
 # narrow layout at compile time -- see the layout comment in module.h), so
 # only that arm's literal is pinned here.
+extract_define() {
+    # Extract the full value of a #define, following backslash line
+    # continuations rather than assuming a fixed line count -- a macro
+    # reflowed onto one line (or across N lines) must still be captured
+    # in full. Strips the trailing '\' and all whitespace, concatenates
+    # the continuation lines, and drops the macro name from the first
+    # line so only the value remains.
+    name="$1"
+    file="$2"
+    awk -v name="$name" '
+        $0 ~ "^#define[[:space:]]+" name "([[:space:]]|\\\\|$)" {
+            line = $0
+            sub("^#define[[:space:]]+" name, "", line)
+            cont = (line ~ /\\[[:space:]]*$/)
+            sub(/\\[[:space:]]*$/, "", line)
+            val = val line
+            if (!cont) { print val; exit }
+            getline line
+            while (1) {
+                cont = (line ~ /\\[[:space:]]*$/)
+                sub(/\\[[:space:]]*$/, "", line)
+                val = val line
+                if (!cont) { print val; exit }
+                getline line
+            }
+        }
+    ' "$file" | tr -d '[:space:]'
+}
+
 check_probe_layout() {
-    hdr_expr=$(grep -A1 \
-        '^#define NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_WORD_BITS' "$HDR" \
-        | tail -n1 | tr -d '[:space:]')
-    test_expr=$(grep -A1 \
-        '^#define NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_WORD_BITS' \
-        "$UNIT_DIR/test_shm_state.c" | tail -n1 | tr -d '[:space:]')
+    hdr_expr=$(extract_define \
+        'NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_WORD_BITS' "$HDR")
+    test_expr=$(extract_define \
+        'NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_WORD_BITS' \
+        "$UNIT_DIR/test_shm_state.c")
     if [ -z "$hdr_expr" ] || [ -z "$test_expr" ]; then
         echo "✗ NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_WORD_BITS not found in both" \
              "$HDR and test_shm_state.c" >&2

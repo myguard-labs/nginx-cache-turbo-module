@@ -1379,13 +1379,24 @@ ngx_http_cache_turbo_shm_breaker_state(ngx_http_cache_turbo_zone_t *z,
         } else {
 #if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
     && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
-            /* H-2/O4.4-j: this else is reached whenever open_for > 0 and the
-             * equality arm above failed. Count it as a wedge candidate only
-             * for the actual mismatch case -- NOT the "no probe yet"
+            /* H-2/O4.4-j: this else is reached whenever the reclaim arm above
+             * failed, for ANY of its conjuncts. Count it as a wedge candidate
+             * only for the actual mismatch case -- NOT the "no probe yet"
              * (NO_PROBE) or "probe still fresh" (age < LEASE) cases, which
              * also fall through here on every ordinary request and would
-             * swamp the counter with non-events. */
-            if (ngx_http_cache_turbo_brk_probe_gen(probe_word)
+             * swamp the counter with non-events.
+             *
+             * ⚠ open_for > 0 must be re-tested here, and it is not redundant
+             * with the arm above: it is that arm's FIRST conjunct, so with the
+             * timed reopen disabled the predicate short-circuits straight into
+             * this else. A probe word left mismatched by an earlier
+             * configuration (a lease published before breaker_open was set to
+             * 0 across a reload) would then bump on every single request.
+             * Nothing is wedged in that state -- with no timed reopen there is
+             * no promotion to be starved of -- and a counter that ticks up
+             * forever in a working deployment is not an anomaly signal. */
+            if (open_for > 0
+                && ngx_http_cache_turbo_brk_probe_gen(probe_word)
                     != NGX_HTTP_CACHE_TURBO_BREAKER_NO_PROBE
                 && ngx_http_cache_turbo_brk_probe_gen(probe_word)
                        != (ngx_http_cache_turbo_brk_gen(word)

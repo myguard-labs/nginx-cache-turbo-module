@@ -1627,11 +1627,11 @@ brk_probe_age_at_width(ngx_uint_t stamp_bits, ngx_uint_t rel_raw,
  * its 12-bit generation field gives a masked-generation ABA wrap reachable
  * by ~34h of continuous open/probe/reopen flapping -- the H-2 wedge
  * producer. There is now only one layout this module ships, so only it is
- * exercised; the function stays parametric over stamp_bits rather than
- * hardcoding 32 so a future, deliberately-added second layout can extend
- * this loop instead of rewriting it. */
+ * exercised here; the function stays parametric over stamp_bits rather than
+ * hardcoding 32 so a future, deliberately-added second layout can add its
+ * own call to this function instead of rewriting it. */
 static void
-test_breaker_probe_age_is_modular_both_widths(void)
+test_breaker_probe_age_is_modular_at_shipped_width(void)
 {
     ngx_uint_t  stamp_bits = 32;
     ngx_uint_t  span       = (((ngx_uint_t) 1) << stamp_bits);
@@ -1714,16 +1714,22 @@ test_breaker_backwards_clock_step_does_not_reclaim(void)
 }
 
 
-/* H-2 is NOT fixed in this pass -- see the decision-packet comment at the
- * reclaim predicate in shm.c (search "H-2 (open, NOT fixed here"). Both
- * candidate fixes tried during this rework broke
- * test_breaker_fresh_lease_not_reclaimable_via_old_stamp() (proof, not
- * argument: unconditional-mismatch-reclaim admitted a second probe against a
- * provably fresh generation; gating on breaker_opened_at could not tell that
- * fixture apart from a genuinely wedged one, since neither sets
- * breaker_opened_at). No wedge-reclaim test is added here on purpose --
- * asserting behavior the code does not implement would be exactly the
- * "test encodes the bug" trap. */
+/* H-2 (resolved -- O4.4-j): see the decision-packet comment at the reclaim
+ * predicate in shm.c, ngx_http_cache_turbo_shm_breaker_state(). A generation
+ * MISMATCH is never reclaimed by that predicate -- the equality arm requires
+ * an exact generation match before the age test even runs -- so the fix was
+ * making the mismatch unreachable rather than teaching the predicate to
+ * reclaim it. Divergence is unreachable via promotion (state and probe are
+ * loaded ONCE, together, so a promoter working from a stale snapshot fails
+ * its publication CAS and writes nothing) and unreachable via
+ * _breaker_record() (none of its state writers bumps the generation). The
+ * one remaining producer -- ABA on the masked generation field wrapping
+ * while a promoter is parked mid-CAS -- is closed by rejecting the 32-bit
+ * (12-bit generation) layout at compile time; only the 64-bit (32-bit
+ * generation) layout ships, and its wrap period is not reachable in
+ * practice. See test_breaker_wedge_counter_observes_mismatch() immediately
+ * below for the operator-visible counter that would surface a wedge if this
+ * analysis is ever wrong. */
 
 
 /* O4.4-a: the probe lease is bounded by BREAKER_PROBE_LEASE, not by open_for.
@@ -2801,34 +2807,74 @@ run_negative_controls(void)
         }
     }
 
-    /* H-2/O4.4-j: model the bug of bumping breaker_wedge_observed for EVERY
-     * reach of the reclaim predicate's else (not just an actual generation
-     * mismatch) -- the "bumped outside the specific condition" mistake the
-     * real increment site's comment warns against. Re-implemented here
-     * against the same fixture test_breaker_wedge_counter_observes_mismatch()
-     * uses for its NO_PROBE negative case: with the bug, that ordinary
-     * zeroed-zone HALF_OPEN (no probe published yet) would ALSO bump the
-     * counter, which is exactly the false-positive the real site's scoping
-     * exists to avoid. */
-    zone_reset();
-    g_sh.breaker_state = NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN; /* gen 0 */
-    g_sh.breaker_probe = 0;                                      /* NO_PROBE */
+    /* H-2/O4.4-j: this control must exercise the REAL increment site (the
+     * `else` in ngx_http_cache_turbo_shm_breaker_state()) through the real
+     * function, not a local shadow counter bumped beside it -- a shadow
+     * variable incremented on the line above its own assertion can never
+     * fail, so it cannot model a regression in the increment site's guard
+     * (see the "control must call the real function" lesson and the O4.1-a
+     * warning above about controls that hardcode their own verdict).
+     *
+     * The mutation worth modelling is the increment site losing a conjunct
+     * of `open_for > 0 && probe.gen != NO_PROBE && probe.gen != state.gen`.
+     * So drive brk_probe_state() -- the real production call -- through
+     * every fall-through case a correctly-scoped guard must NOT count, and
+     * assert the REAL counter (g_sh.breaker_wedge_observed) stays at 0
+     * across all of them; then construct a genuine mismatch and assert it
+     * DOES bump. If any dropped conjunct is what is actually enforcing one
+     * of these zeros, that case starts bumping and the control fails for
+     * real -- verified in s141 by dropping each conjunct in turn against
+     * this exact fixture set. */
     {
-        ngx_uint_t          probe_b;
-        ngx_atomic_uint_t   buggy_wedge_counter = 0;
+        ngx_uint_t  probe_b;
 
+        /* (a) open_for == 0: no timed reopen, so nothing is ever promoted
+         * or reclaimed here -- must not count. */
+        zone_reset();
+        brk_set_probe(9, ngx_test_now);
+        g_sh.breaker_state = (ngx_atomic_t) ngx_http_cache_turbo_brk_pack(
+                                 3, NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN);
+        (void) brk_probe_state(0, &probe_b);
+
+        /* (b) NO_PROBE: nothing published yet -- must not count. */
+        g_sh.breaker_state = NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN;
+        g_sh.breaker_probe = 0;
         (void) brk_probe_state(30, &probe_b);
-        /* the bug: unconditional bump on reaching the else at all */
-        buggy_wedge_counter++;
 
-        caught = (buggy_wedge_counter == 1 && g_sh.breaker_wedge_observed == 0);
+        /* (c) live, SAME-generation, not-yet-expired probe -- the ordinary
+         * in-flight case -- must not count. */
+        brk_set_probe(5, ngx_test_now);
+        g_sh.breaker_state = (ngx_atomic_t) ngx_http_cache_turbo_brk_pack(
+                                 5, NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN);
+        (void) brk_probe_state(30, &probe_b);
+
+        caught = (g_sh.breaker_wedge_observed == 0);
         tests_run++;
         if (!caught) {
-            fprintf(stderr, "  ✗ CONTROL H-2/O4.4-j: an unconditional bump "
-                            "on the else branch did not diverge from the "
-                            "scoped real counter — the NO_PROBE negative "
-                            "case in test_breaker_wedge_counter_observes_"
-                            "mismatch() guards nothing\n");
+            fprintf(stderr, "  ✗ CONTROL H-2/O4.4-j (negative): a "
+                            "fall-through case that must not count as a "
+                            "wedge bumped breaker_wedge_observed — the "
+                            "increment site's guard lost a conjunct\n");
+            tests_failed++;
+        }
+
+        /* (d) positive: a genuine mismatch DOES count, on the same fixture
+         * set, proving the counter is not simply dead. */
+        zone_reset();
+        brk_set_probe(7, ngx_test_now);
+        ngx_test_advance_time(
+            (time_t) NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_LEASE + 1);
+        g_sh.breaker_state = (ngx_atomic_t) ngx_http_cache_turbo_brk_pack(
+                                 8, NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN);
+        (void) brk_probe_state(30, &probe_b);
+
+        caught = (g_sh.breaker_wedge_observed == 1);
+        tests_run++;
+        if (!caught) {
+            fprintf(stderr, "  ✗ CONTROL H-2/O4.4-j (positive): a genuine "
+                            "generation mismatch did not bump "
+                            "breaker_wedge_observed — the counter is dead, "
+                            "not merely over-scoped\n");
             tests_failed++;
         }
     }
@@ -2860,7 +2906,7 @@ main(void)
     test_breaker_fresh_lease_not_reclaimable_via_old_stamp();
     test_breaker_wedge_counter_observes_mismatch();
     test_breaker_probe_age_is_modular();
-    test_breaker_probe_age_is_modular_both_widths();
+    test_breaker_probe_age_is_modular_at_shipped_width();
     test_breaker_backwards_clock_step_does_not_reclaim();
     test_breaker_probe_lease_is_independent_of_open();
     test_breaker_stale_probe_cannot_resolve_new_lease();

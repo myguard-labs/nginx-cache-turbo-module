@@ -1025,9 +1025,10 @@ typedef struct {
     ngx_atomic_t             test_brk_armings;
 
     /* H-2/O4.4-j: lifetime count of times the reclaim predicate's `else`
-     * (breaker_state.c ~1339) was reached with an observed generation
-     * MISMATCH (probe.gen != state.gen && probe.gen != NO_PROBE) -- i.e. a
-     * wedge candidate, the H-2 condition. Part 1 closes the only known
+     * (ngx_http_cache_turbo_shm.c, ngx_http_cache_turbo_shm_breaker_state())
+     * was reached with an observed generation MISMATCH (open_for > 0 &&
+     * probe.gen != NO_PROBE && probe.gen != state.gen) -- i.e. a wedge
+     * candidate, the H-2 condition. Part 1 closes the only known
      * reachable producer (the masked-generation ABA wrap) at compile time,
      * so this should read 0 in any real deployment; it exists to make a
      * wedge OPERATOR-VISIBLE rather than silent if that analysis is ever
