@@ -10177,9 +10177,9 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
         {
             ngx_str_t  zname = clcf->admin_zone->shm.name;
 
-            /* Fourteen counters (*_total) + three gauges, each labelled by zone
+            /* Fifteen counters (*_total) + four gauges, each labelled by zone
              * so one Prometheus job can scrape many zones. Exposition format
-             * 0.0.4. The per-metric budget must track the emitted count (17):
+             * 0.0.4. The per-metric budget must track the emitted count (19):
              * every metric line renders one %V (zone) + one %uA (value), so a
              * short multiplier could truncate the last line under a long zone
              * name. The fixed term covers the HELP/TYPE prose, which grows
@@ -10187,8 +10187,12 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
              * the 14th and needed ~180 bytes of prose; a stale 13 truncated
              * the JSON arm's neighbour into invalid output; S7.1 added three
              * more, prose term bumped by ~450 bytes for their HELP/TYPE
-             * lines). */
-            len = 3550 + 17 * zname.len + 17 * NGX_ATOMIC_T_LEN;
+             * lines; H7.3a added breaker_opens_total (counter) and
+             * breaker_state (gauge), prose term bumped by ~350 bytes -- the
+             * breaker_state HELP documents the numeric mapping since the
+             * value itself is deliberately NOT a label, see the emit call
+             * below). */
+            len = 3900 + 19 * zname.len + 19 * NGX_ATOMIC_T_LEN;
             p = ngx_pnalloc(r->pool, len);
             if (p == NULL) {
                 return NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -10245,7 +10249,13 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
                 "cache_turbo_breaker_serves_total{zone=\"%V\"} %uA\n"
                 "# HELP cache_turbo_origin_failures_total Origin responses recorded as a failure by the circuit breaker.\n"
                 "# TYPE cache_turbo_origin_failures_total counter\n"
-                "cache_turbo_origin_failures_total{zone=\"%V\"} %uA\n",
+                "cache_turbo_origin_failures_total{zone=\"%V\"} %uA\n"
+                "# HELP cache_turbo_breaker_opens_total Lifetime count of CLOSED->OPEN circuit breaker trips.\n"
+                "# TYPE cache_turbo_breaker_opens_total counter\n"
+                "cache_turbo_breaker_opens_total{zone=\"%V\"} %uA\n"
+                "# HELP cache_turbo_breaker_state Circuit breaker state (0=closed, 1=open, 2=half-open).\n"
+                "# TYPE cache_turbo_breaker_state gauge\n"
+                "cache_turbo_breaker_state{zone=\"%V\"} %uA\n",
                 &zname, st.hits, &zname, st.misses, &zname, st.stale_serves,
                 &zname, st.refreshes, &zname, st.evictions,
                 &zname, st.l2_hits, &zname, st.l2_misses, &zname, st.lock_waits,
@@ -10254,7 +10264,10 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
                 &zname, st.cost_ms, &zname, st.autotuned_beta,
                 &zname, st.autotuned_load,
                 &zname, st.sie_serves, &zname, st.breaker_serves,
-                &zname, st.origin_failures) - p;
+                &zname, st.origin_failures,
+                &zname, st.breaker_opens,
+                &zname, (ngx_atomic_uint_t) ngx_http_cache_turbo_brk_state(
+                    (ngx_uint_t) st.breaker_state)) - p;
 
             return ngx_http_cache_turbo_send_body(r, NGX_HTTP_OK, &body,
                 "text/plain; version=0.0.4; charset=utf-8",
