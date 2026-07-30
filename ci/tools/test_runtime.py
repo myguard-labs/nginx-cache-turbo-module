@@ -8083,10 +8083,23 @@ def test_breaker_record_native_proxy_cache_hit_no_record(ng: Nginx) -> None:
 
     s0, b0, _ = fetch(ng.port, path)
     assert s0 == 200 and b0, f"MISS failed for {path}: {s0} {b0!r}"
-    s1, b1, _ = fetch(ng.port, path)
+
+    # nginx writes the native proxy_cache entry asynchronously -- the MISS
+    # response can complete before the cache file is in place, so an
+    # immediately-following request legitimately MISSes again on a loaded box
+    # (this failed exactly that way on a CI runner while passing locally).
+    # Same async-store hazard test_suppress_native_e2e_proxy_cache handles with
+    # its "let the cache manager settle" sleeps; polled here instead of a fixed
+    # sleep so a fast box pays ~nothing and a slow one still gets its HIT.
+    b1 = None
+    for _ in range(50):
+        s1, b1, _ = fetch(ng.port, path)
+        if s1 == 200 and b1 == b0:
+            break
+        time.sleep(0.1)
     assert s1 == 200 and b1 == b0, (
-        f"expected a native proxy_cache HIT (identical body) for {path}, "
-        f"got status={s1} body-changed={b1 != b0}")
+        f"expected a native proxy_cache HIT (identical body) for {path} "
+        f"within 5s, got status={s1} body-changed={b1 != b0}")
 
     of_after = _admin_stat(ng, "origin_failures", "/_cache_o45hit")
     assert of_after == of_before, (
