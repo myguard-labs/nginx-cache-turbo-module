@@ -652,6 +652,24 @@ typedef struct {
      | ((ngx_uint_t) (stamp)                                                  \
         & NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_STAMP_MASK))
 
+/* H-2/O4.4-j: the #error above gates on NGX_PTR_SIZE, but the hazard is a
+ * function of the ATOMIC width -- PROBE_WORD_BITS is sizeof(ngx_atomic_t), not
+ * sizeof(void *). On every target this module ships they agree, and on the
+ * usual ILP32/LP64 models they always do. They are not the same thing though:
+ * a model with 64-bit pointers and a 32-bit long (x32) would satisfy the
+ * NGX_PTR_SIZE >= 8 gate while giving a 32-bit word, so STAMP_BITS 32 would
+ * leave GEN_BITS 0 and GEN_MASK 0 -- every generation would read as NO_PROBE
+ * and the breaker would never promote a probe at all. That is worse than the
+ * wedge the gate exists to prevent, and #if cannot see sizeof, so it is
+ * asserted at compile time here instead.
+ *
+ * A negative width is the standard trick: the array is well-formed only while
+ * the generation field has room left. Keep this beside the pack macros -- it is
+ * the only check tying the #if-selected split back to the real atomic. */
+typedef char ngx_http_cache_turbo_brk_probe_layout_assert
+    [(NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_WORD_BITS
+      > NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_STAMP_BITS) ? 1 : -1];
+
 /* P6/O4.3 serve-path actions, the verdict of
  * ngx_http_cache_turbo_breaker_action(). PASS is the only one that lets the
  * request reach the origin.
