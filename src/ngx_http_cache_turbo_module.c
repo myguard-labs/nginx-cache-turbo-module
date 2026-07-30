@@ -5385,6 +5385,10 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                    == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN)
         {
             (void) ngx_atomic_fetch_add(&z->sh->stale_serves, 1);
+            /* S7.1: a genuine breaker-fallback SERVE (this is the
+             * only-if-cached twin of the pre-origin-gate ACT_SERVE site
+             * below; both deliver a STALE-BREAKER response). */
+            (void) ngx_atomic_fetch_add(&z->sh->breaker_serves, 1);
             ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                            "cache_turbo: only-if-cached + breaker OPEN -> "
                            "STALE-BREAKER serve \"%V\" key=%ui len=%uz",
@@ -5532,6 +5536,11 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                  * 304 would tell the client its cached copy is still good on
                  * the authority of an origin we cannot reach. */
                 (void) ngx_atomic_fetch_add(&z->sh->stale_serves, 1);
+                /* S7.1: the pre-origin-gate breaker-fallback SERVE. Bumped
+                 * here (the delivery site), not at breaker_action()/
+                 * ACT_SERVE classification, so this counts responses actually
+                 * served, matching sie_serves/origin_failures discipline. */
+                (void) ngx_atomic_fetch_add(&z->sh->breaker_serves, 1);
                 ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                                "cache_turbo: breaker OPEN -> STALE-BREAKER serve "
                                "\"%V\" key=%ui len=%uz",
@@ -5558,9 +5567,9 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
              * stale_serves / misses, and a branch that bumps nothing makes
              * hits+stale_serves+misses silently undercount once O4.4 makes the
              * breaker reachable. A miss is also what this is -- nothing was
-             * served from cache. A dedicated breaker_serves/breaker_opens pair
-             * belongs to S7.1, which owns the observability surface; do not
-             * invent one here. */
+             * served from cache. This is the ACT_FAIL branch (no body armed),
+             * so it does not touch breaker_serves (S7.1) -- that counter is
+             * bumped only at the two ACT_SERVE delivery sites above. */
             (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
             ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                            "cache_turbo: breaker OPEN, no body \"%V\" key=%ui "
@@ -7191,10 +7200,24 @@ ngx_http_cache_turbo_header_filter(ngx_http_request_t *r)
          * probe actually tested. Non-probe requests pass 0 (NO_PROBE) and can
          * still count failures toward a CLOSED breaker's threshold, which is
          * the one thing they legitimately observe. */
+        ngx_http_cache_turbo_zone_t  *bz = clcf->shm_zone->data;
+        ngx_uint_t  is_failure = ngx_http_cache_turbo_breaker_is_origin_failure(
+                                      r->headers_out.status);
+
+        /* S7.1: count the origin request as a failure right where the
+         * breaker itself is fed that verdict, so this counter and the
+         * breaker's own fail/window accounting can never disagree about what
+         * counts as a failure. Bumped before the record() call (not after)
+         * only as a matter of local ordering -- record() cannot fail and
+         * there is no early-return between the two, so the order is not
+         * load-bearing. */
+        if (is_failure) {
+            (void) ngx_atomic_fetch_add(&bz->sh->origin_failures, 1);
+        }
+
         ngx_http_cache_turbo_shm_breaker_record(
             clcf->shm_zone->data,
-            !ngx_http_cache_turbo_breaker_is_origin_failure(
-                r->headers_out.status),
+            !is_failure,
             clcf->breaker_threshold,
             clcf->breaker_window,
             ctx->brk_probe);
@@ -7216,6 +7239,16 @@ ngx_http_cache_turbo_header_filter(ngx_http_request_t *r)
         if (rc == NGX_OK) {
             ctx->served = 1;      /* block capture of the replaced error */
             ctx->sie_serving = 1; /* body filter emits the snapshot body */
+
+            /* S7.1: this IS the SIE serve -- sie_rewrite() returning NGX_OK
+             * means the error response was actually replaced with the stale
+             * snapshot and will be delivered. Bumped here rather than inside
+             * sie_rewrite() itself so the counter lives beside sie_serving,
+             * the other "this response is now the SIE snapshot" flag. */
+            if (clcf->shm_zone != NULL) {
+                ngx_http_cache_turbo_zone_t  *sz = clcf->shm_zone->data;
+                (void) ngx_atomic_fetch_add(&sz->sh->sie_serves, 1);
+            }
 
             if (ctx->cold_winner && !ctx->cold_stored
                 && ctx->cold_zone != NULL)
@@ -10144,16 +10177,18 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
         {
             ngx_str_t  zname = clcf->admin_zone->shm.name;
 
-            /* Eleven counters (*_total) + three gauges, each labelled by zone so
-             * one Prometheus job can scrape many zones. Exposition format 0.0.4.
-             * The per-metric budget must track the emitted count (14): every
-             * metric line renders one %V (zone) + one %uA (value), so a short
-             * multiplier could truncate the last line under a long zone name.
-             * The fixed term covers the HELP/TYPE prose, which grows with every
-             * metric added -- bump BOTH when adding one (L13 added the 14th and
-             * needed ~180 bytes of prose; a stale 13 truncated the JSON arm's
-             * neighbour into invalid output). */
-            len = 3100 + 14 * zname.len + 14 * NGX_ATOMIC_T_LEN;
+            /* Fourteen counters (*_total) + three gauges, each labelled by zone
+             * so one Prometheus job can scrape many zones. Exposition format
+             * 0.0.4. The per-metric budget must track the emitted count (17):
+             * every metric line renders one %V (zone) + one %uA (value), so a
+             * short multiplier could truncate the last line under a long zone
+             * name. The fixed term covers the HELP/TYPE prose, which grows
+             * with every metric added -- bump BOTH when adding one (L13 added
+             * the 14th and needed ~180 bytes of prose; a stale 13 truncated
+             * the JSON arm's neighbour into invalid output; S7.1 added three
+             * more, prose term bumped by ~450 bytes for their HELP/TYPE
+             * lines). */
+            len = 3550 + 17 * zname.len + 17 * NGX_ATOMIC_T_LEN;
             p = ngx_pnalloc(r->pool, len);
             if (p == NULL) {
                 return NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -10201,14 +10236,25 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
                 "cache_turbo_autotuned_beta{zone=\"%V\"} %uA\n"
                 "# HELP cache_turbo_autotuned_load Live load factor widening stale window + lock_ttl under load (x1000; 1000 = none).\n"
                 "# TYPE cache_turbo_autotuned_load gauge\n"
-                "cache_turbo_autotuned_load{zone=\"%V\"} %uA\n",
+                "cache_turbo_autotuned_load{zone=\"%V\"} %uA\n"
+                "# HELP cache_turbo_sie_serves_total Responses served from a stale-if-error snapshot.\n"
+                "# TYPE cache_turbo_sie_serves_total counter\n"
+                "cache_turbo_sie_serves_total{zone=\"%V\"} %uA\n"
+                "# HELP cache_turbo_breaker_serves_total Responses served from the circuit breaker's armed fallback while OPEN.\n"
+                "# TYPE cache_turbo_breaker_serves_total counter\n"
+                "cache_turbo_breaker_serves_total{zone=\"%V\"} %uA\n"
+                "# HELP cache_turbo_origin_failures_total Origin responses recorded as a failure by the circuit breaker.\n"
+                "# TYPE cache_turbo_origin_failures_total counter\n"
+                "cache_turbo_origin_failures_total{zone=\"%V\"} %uA\n",
                 &zname, st.hits, &zname, st.misses, &zname, st.stale_serves,
                 &zname, st.refreshes, &zname, st.evictions,
                 &zname, st.l2_hits, &zname, st.l2_misses, &zname, st.lock_waits,
                 &zname, st.min_uses_skips, &zname, st.l2_neg_skips,
                 &zname, st.bypasses,
                 &zname, st.cost_ms, &zname, st.autotuned_beta,
-                &zname, st.autotuned_load) - p;
+                &zname, st.autotuned_load,
+                &zname, st.sie_serves, &zname, st.breaker_serves,
+                &zname, st.origin_failures) - p;
 
             return ngx_http_cache_turbo_send_body(r, NGX_HTTP_OK, &body,
                 "text/plain; version=0.0.4; charset=utf-8",
@@ -10220,8 +10266,10 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
                      "\"min_uses_skips\":,\"l2_neg_skips\":,\"bypasses\":,"
                      "\"cost_ms\":,"
                      "\"autotuned_beta\":,\"autotuned_load\":,"
-                     "\"breaker_state\":\"\",\"breaker_opens\":}\n")
-              + 15 * NGX_ATOMIC_T_LEN
+                     "\"breaker_state\":\"\",\"breaker_opens\":,"
+                     "\"sie_serves\":,\"breaker_serves\":,"
+                     "\"origin_failures\":}\n")
+              + 18 * NGX_ATOMIC_T_LEN
               + sizeof("half-open") - 1;   /* longest _breaker_state_str value */
         p = ngx_pnalloc(r->pool, len);
         if (p == NULL) {
@@ -10235,7 +10283,9 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
             "\"l2_neg_skips\":%uA,"
             "\"bypasses\":%uA,\"cost_ms\":%uA,\"autotuned_beta\":%uA,"
             "\"autotuned_load\":%uA,"
-            "\"breaker_state\":\"%s\",\"breaker_opens\":%uA}\n",
+            "\"breaker_state\":\"%s\",\"breaker_opens\":%uA,"
+            "\"sie_serves\":%uA,\"breaker_serves\":%uA,"
+            "\"origin_failures\":%uA}\n",
             st.hits, st.misses, st.stale_serves,
             st.refreshes, st.evictions, st.l2_hits, st.l2_misses,
             st.lock_waits, st.min_uses_skips, st.l2_neg_skips,
@@ -10243,7 +10293,8 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
             st.autotuned_beta, st.autotuned_load,
             ngx_http_cache_turbo_shm_breaker_state_str(
                 (ngx_uint_t) st.breaker_state),
-            st.breaker_opens) - p;
+            st.breaker_opens,
+            st.sie_serves, st.breaker_serves, st.origin_failures) - p;
     }
     return ngx_http_cache_turbo_send_json(r, NGX_HTTP_OK, &body);
 }

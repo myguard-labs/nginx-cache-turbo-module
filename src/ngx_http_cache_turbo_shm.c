@@ -135,6 +135,11 @@ ngx_http_cache_turbo_shm_init_zone(ngx_shm_zone_t *shm_zone, void *data)
     ctx->sh->breaker_epoch = (ngx_atomic_t) ngx_time();
     ctx->sh->breaker_opens = 0;
 
+    /* S7.1: production observability counters. */
+    ctx->sh->sie_serves = 0;
+    ctx->sh->breaker_serves = 0;
+    ctx->sh->origin_failures = 0;
+
     ctx->shpool->log_nomem = 0;
 
     return NGX_OK;
@@ -728,6 +733,13 @@ ngx_http_cache_turbo_shm_stats(ngx_http_cache_turbo_zone_t *z,
      * admin GET must observe the breaker, never drive it. */
     out->breaker_state = z->sh->breaker_state;
     out->breaker_opens = z->sh->breaker_opens;
+
+    /* S7.1: production serve/failure counters. Plain reads, same as every
+     * other counter above -- these are simple lifetime tallies, not the
+     * breaker's transitioning state. */
+    out->sie_serves      = z->sh->sie_serves;
+    out->breaker_serves  = z->sh->breaker_serves;
+    out->origin_failures = z->sh->origin_failures;
 }
 
 
