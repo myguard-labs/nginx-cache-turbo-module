@@ -1737,7 +1737,7 @@ scrape_configs:
 > public out.
 
 A ready-made **Grafana dashboard** is in
-[`tools/grafana-dashboard.json`](ci/tools/grafana-dashboard.json) — import it and
+[`contrib/grafana-dashboard.json`](contrib/grafana-dashboard.json) — import it and
 pick your Prometheus datasource (hit ratios, L1/L2 request rates, regen cost,
 autotuned beta, per-`zone` template variable).
 
