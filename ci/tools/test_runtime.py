@@ -1583,6 +1583,33 @@ http {{
     # s71z would let /s71brk/'s trip leave it OPEN too early or too late
     # relative to this test's own sequencing.
     cache_turbo_zone name=sr72z 16m;
+    # O4.5: private zone for the breaker LIFECYCLE runtime coverage (state
+    # machine end-to-end: OPEN on N failures, zero origin contact while OPEN,
+    # 503+Retry-After on a cold key, CLOSE via the post-open probe). Own zone,
+    # not s71z/brkiz/h73z/sr72z -- every one of those is left in a tripped or
+    # otherwise non-CLOSED state by an earlier test in run_all()'s ordering,
+    # and this test needs to observe the FULL CLOSED->OPEN->(probe)->CLOSED
+    # cycle from a known-clean start. A short 2s breaker_open (vs. the 30s
+    # every other breaker fixture uses) keeps the CLOSE-via-probe assertion
+    # fast without idling the suite.
+    cache_turbo_zone name=o45z 16m;
+    # O4.5 negative control: identical shape, breaker OFF -- proves the OPEN
+    # zone's zero-origin-contact result above is caused by the breaker, not
+    # some other widening (e.g. keep_stale). Own zone so its origin hit count
+    # is never polluted by o45z's traffic.
+    cache_turbo_zone name=o45offz 16m;
+    # O4.5 / O4.2-f: private zone for the header-filter recording-block pins
+    # (success/failure sense of the argument; a cache-turbo HIT records
+    # nothing). Own zone so its origin_failures counter cannot be moved by
+    # o45z's own trip.
+    cache_turbo_zone name=o45hitz 16m;
+    # O4.5 / O4.2-f: SEPARATE zone for the POSITION pin only (recording
+    # happens before the SIE rewrite). Threshold=1 means the very failure
+    # this claim exercises trips the zone's breaker OPEN, and a SECOND trip
+    # on a shared zone would hit the pre-origin gate instead of the origin
+    # -- own zone so o45hitz's own claim-1 trip (recorded separately) cannot
+    # leave this claim's zone already OPEN, or vice versa.
+    cache_turbo_zone name=o45hitposz 16m;
     # SUITE-1: private zone for /l2neg/. l2_neg_skips is PER-ZONE
     # (z->sh->l2_neg_skips, module.c:4832), and the outage test asserts a delta
     # of exactly 0 over one request, so any other location writing that counter
@@ -1662,6 +1689,13 @@ http {{
     proxy_cache_path {root}/pcache_on  keys_zone=ctpcon:1m  levels=1:2
                      inactive=10m max_size=64m;
     proxy_cache_path {root}/pcache_off keys_zone=ctpcoff:1m levels=1:2
+                     inactive=10m max_size=64m;
+    # O4.2-f: dedicated proxy_cache zone for /o45natpc/'s native-HIT-records-
+    # nothing check. NOT ctpcon -- test_suppress_native_e2e_proxy_cache
+    # asserts ctpcon stays EMPTY (proof cache_turbo_suppress_native
+    # suppressed it), and /o45natpc/ deliberately stores through its own
+    # proxy_cache normally, which would pollute that assertion.
+    proxy_cache_path {root}/pcache_o45 keys_zone=ctpo45:1m levels=1:2
                      inactive=10m max_size=64m;
 
     server {{
@@ -2347,6 +2381,131 @@ http {{
             cache_turbo_admin    s71z;
             allow 127.0.0.1;
             deny all;
+        }}
+
+        # O4.5: breaker LIFECYCLE end-to-end. /o45/o45cache is primed then
+        # tripped (same 1s-fresh/x4=4s-stale/threshold=1 shape as /s71brk/) so
+        # a re-fetch while OPEN proves zero origin contact (origin.hits_for
+        # unchanged) by serving the armed any-age snapshot. /o45/o45cold shares
+        # the zone but is NEVER primed, so once OPEN it has no snapshot to
+        # arm and falls into breaker_unavailable() (503 + Retry-After) --
+        # same "second, never-primed uri on the same zone" shape as
+        # /sr72brk/'s BREAKER-503 arm. breaker_open is 2s (vs. the 30s other
+        # fixtures use) so the CLOSE-via-probe assertion does not idle the
+        # suite for 30+ seconds.
+        # cache_turbo_breaker_retry_after is set EXPLICITLY here (not left to
+        # track cache_turbo_breaker_open automatically) -- an unset
+        # breaker_retry_after inherits the ENCLOSING server block's
+        # already-resolved default (30s, from breaker_open's OWN 30s default
+        # at that level) rather than being derived from THIS location's
+        # breaker_open, so leaving it unset with breaker_open 2s here would
+        # read 30 instead of 2 (a pre-existing inheritance gap, reported
+        # separately -- not what this fixture is testing). An explicit
+        # directive is unaffected by that gap and is what this test verifies.
+        location /o45/ {{
+            cache_turbo                    o45z;
+            cache_turbo_key                $uri;
+            cache_turbo_valid               1s;
+            cache_turbo_breaker              on;
+            cache_turbo_breaker_threshold    1;
+            cache_turbo_breaker_window      60s;
+            cache_turbo_breaker_open         2s;
+            cache_turbo_breaker_retry_after  2s;
+            cache_turbo_lock_timeout         2s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        location = /_cache_o45 {{
+            cache_turbo_admin    o45z;
+            allow 127.0.0.1;
+            deny all;
+        }}
+
+        # O4.5 negative control: identical shape to /o45/ (SAME threshold/
+        # window/open, so only the breaker on|off flag itself differs -- a
+        # mutation that ignores breaker_enable in breaker_should_consult()
+        # would otherwise still be blocked by threshold/window and this
+        # control would pass for the wrong reason). With the breaker off a
+        # dead origin gets no fallback at all -- the origin hit count keeps
+        # climbing (every request reaches it) rather than flatlining behind
+        # an OPEN breaker.
+        location /o45off/ {{
+            cache_turbo                    o45offz;
+            cache_turbo_key                $uri;
+            cache_turbo_valid               1s;
+            cache_turbo_breaker              off;
+            cache_turbo_breaker_threshold    1;
+            cache_turbo_breaker_window      60s;
+            cache_turbo_breaker_open         2s;
+            cache_turbo_lock_timeout         2s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # O4.5 / O4.2-f: header-filter recording-block pins (claims 1+2: a
+        # 5xx records a failure, a cache-turbo HIT records nothing). Own
+        # zone (o45hitz) so origin_failures here is never moved by /o45/'s
+        # own trip. threshold=1/window=60s/open=30s -- same shape as the
+        # other breaker fixtures; claim 1's drop DOES trip this zone's
+        # breaker, which is why it runs after claim 2's HIT check.
+        #
+        # valid is 30s, NOT the 1s the sibling breaker fixtures use: claim 2
+        # puts an _admin_stat round trip between the prime and the HIT fetch,
+        # so a 1s window can expire on a loaded or ASan runner and the HIT
+        # becomes a re-fetch -- failing on box speed rather than on module
+        # behaviour, the same SUITE-4 trap the /ccignmr/ comment records.
+        # Neither claim here needs a short TTL: /o45hit/dropme is never primed,
+        # and the staleness step runs on /o45hitpos/, a different zone.
+        location /o45hit/ {{
+            cache_turbo                    o45hitz;
+            cache_turbo_key                $uri;
+            cache_turbo_valid              30s;
+            cache_turbo_breaker              on;
+            cache_turbo_breaker_threshold    1;
+            cache_turbo_breaker_window      60s;
+            cache_turbo_breaker_open        30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        location = /_cache_o45hit {{
+            cache_turbo_admin    o45hitz;
+            allow 127.0.0.1;
+            deny all;
+        }}
+
+        # O4.5 / O4.2-f: POSITION-claim-only location (see the o45hitposz
+        # zone comment above for why this is not on o45hitz). keep_stale
+        # forever so the same key's expired entry can be pushed through the
+        # SIE rewrite, masking a real origin 502 with a 200/stale body while
+        # still needing to have recorded the 502 as a breaker failure.
+        location /o45hitpos/ {{
+            cache_turbo                    o45hitposz;
+            cache_turbo_key                $uri;
+            cache_turbo_valid               1s;
+            cache_turbo_keep_stale     forever;
+            cache_turbo_breaker              on;
+            cache_turbo_breaker_threshold    1;
+            cache_turbo_breaker_window      60s;
+            cache_turbo_breaker_open        30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        location = /_cache_o45hitpos {{
+            cache_turbo_admin    o45hitposz;
+            allow 127.0.0.1;
+            deny all;
+        }}
+
+        # O4.2-f: a native proxy_cache HIT must not touch the breaker's
+        # recording block at all (ctx is NULL/ctx->served on a HIT --
+        # never a cache-turbo location, so the header filter never reaches
+        # the record() call). Own proxy_cache zone (ctpo45, not ctpcon --
+        # see the proxy_cache_path comment above); no cache_turbo directive
+        # here at all, so no ctx and no breaker.
+        location /o45natpc/ {{
+            proxy_cache          ctpo45;
+            proxy_cache_valid    200 5m;
+            proxy_cache_key      $uri;
+            proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
         # Negative control for /keepstale/: identical location, keep_stale off
@@ -7769,6 +7928,369 @@ def test_breaker_l2_arming_site_gated_white_box(ng: Nginx, origin: Origin,
         drain_origin(origin)
 
 
+def test_breaker_lifecycle_open_zero_contact_close(ng: Nginx, origin: Origin) -> None:
+    """O4.5: the breaker STATE MACHINE end-to-end, not just its config/counter
+    surfaces (existing test_*breaker* tests cover config-parse, arming gates,
+    counters and Prometheus, but none drives CLOSED -> OPEN -> HALF_OPEN ->
+    CLOSED for real).
+
+    ⚠ SEMANTICS pinned here, not to be re-litigated: an OPEN breaker makes NO
+    origin contact at all. There is no "one request per refresh cycle probes
+    the origin" during OPEN -- the single probe is promoted only once
+    cache_turbo_breaker_open has ELAPSED (ngx_http_cache_turbo_shm_breaker_
+    state(), shm.c ~1424). See README.md's cache_turbo_breaker_open row.
+
+    Four claims, in sequence on /o45/ (o45z, threshold=1, window=60s,
+    open=2s):
+
+      1. N (=1) origin failures trips the breaker OPEN.
+      2. A CACHED key (/o45/o45cache, already armed by the priming fetch) still
+         answers 200 while OPEN, with origin.hits_for("o45cache")
+         UNCHANGED across the OPEN-window fetch -- proving zero origin
+         contact, not just "some 200".
+      3. A COLD key sharing the same zone (/o45/o45cold, never primed, so it has
+         no snapshot to arm) gets 503 + a Retry-After header while OPEN,
+         matching this location's explicit cache_turbo_breaker_retry_after
+         (2s -- set explicitly rather than left to track breaker_open, see
+         the fixture comment on /o45/: an unset breaker_retry_after inherits
+         the ENCLOSING server{} context's already-resolved 30s default
+         rather than being derived from this location's own breaker_open,
+         a separate pre-existing gap reported to the ledger, not what this
+         claim is testing).
+      4. Origin restored + the probe promoted after breaker_open (2s) elapses
+         CLOSES the breaker: the next fetch after the wait reaches the (now
+         healthy) origin and origin.hits_for("o45cache") MOVES.
+    """
+    # NOTE: proxy_pass strips the /o45/ location prefix before the request
+    # reaches the origin, so origin.hits_for() must be given the ORIGIN-side
+    # needle (post-strip), not the client-facing path -- using the full
+    # client path as the needle silently never matches anything, which
+    # measured 0 the whole way through until this was caught by the trip
+    # assertion below firing "did not actually reach the origin". Neither
+    # needle collides with an existing fixture's URI (unlike bare
+    # "cached"/"cold", which /cold/ already uses elsewhere in this file).
+    cached_path = "/o45/o45cache"
+    cold_path = "/o45/o45cold"
+    cached_needle = "o45cache"
+    cold_needle = "o45cold"
+
+    # Prime /o45/o45cache only -- /o45/o45cold is deliberately NEVER primed (claim 3
+    # needs a key with no armed snapshot at all once OPEN).
+    s0, b0, _ = fetch(ng.port, cached_path)
+    assert s0 == 200 and b0, f"prime failed for {cached_path}: {s0} {b0!r}"
+
+    time.sleep(4.3)   # past fresh (1s) AND the x4 stale window (4s): L1-expired
+    origin.fail = True
+    try:
+        hits_before_trip = origin.hits_for(cached_needle)
+
+        # --- claim 1: the tripping request reaches the (now dead) origin ---
+        s_trip, _, _ = fetch(ng.port, cached_path)
+        assert s_trip != 200, (
+            f"tripping request was answered 200 -- expected it to reach the "
+            f"dead origin and fail, got {s_trip}")
+        assert origin.hits_for(cached_needle) - hits_before_trip == 1, (
+            "the tripping request did not actually reach the origin -- claim "
+            "1 (N failures trips OPEN) would be vacuous without this")
+
+        # --- claim 2: a cached key answers 200 with ZERO origin contact -----
+        hits_before_open_serve = origin.hits_for(cached_needle)
+        s_open, b_open, _ = fetch(ng.port, cached_path)
+        assert s_open == 200, (
+            f"breaker OPEN: cached key was not served from the any-age "
+            f"snapshot, got {s_open}")
+        assert b_open, "breaker OPEN serve returned an empty body"
+        hits_after_open_serve = origin.hits_for(cached_needle)
+        assert hits_after_open_serve == hits_before_open_serve, (
+            f"breaker OPEN: origin.hits_for({cached_path!r}) moved "
+            f"{hits_before_open_serve} -> {hits_after_open_serve} while "
+            f"serving a cached key -- an OPEN breaker must make ZERO origin "
+            f"contact, not just avoid surfacing the failure")
+
+        # --- claim 3: a cold key gets 503 + Retry-After while OPEN ----------
+        hits_before_cold = origin.hits_for(cold_needle)
+        s_cold, _, h_cold = fetch(ng.port, cold_path)
+        assert s_cold == 503, (
+            f"breaker OPEN: cold key (no armed snapshot) expected 503, got "
+            f"{s_cold}")
+        assert origin.hits_for(cold_needle) == hits_before_cold, (
+            "breaker OPEN: the cold-key 503 must not have reached the origin "
+            "either")
+        ra = h_cold.get("retry-after")
+        assert ra is not None, (
+            "breaker OPEN: cold-key 503 carries no Retry-After header -- "
+            "expected the explicit cache_turbo_breaker_retry_after (2s)")
+        assert ra == "2", (
+            f"breaker OPEN: Retry-After should match the explicit "
+            f"cache_turbo_breaker_retry_after (2), got {ra!r}")
+
+        # --- claim 4: origin restored + probe after `open` elapses CLOSES --
+        origin.fail = False
+        time.sleep(2.3)   # past breaker_open (2s): the next request is the probe
+        hits_before_probe = origin.hits_for(cached_needle)
+        s_probe, b_probe, _ = fetch(ng.port, cached_path)
+        assert s_probe == 200, (
+            f"post-open-window probe: expected 200 from the now-healthy "
+            f"origin, got {s_probe}")
+        assert b_probe, "post-open-window probe returned an empty body"
+        assert origin.hits_for(cached_needle) - hits_before_probe == 1, (
+            "post-open-window probe did not reach the origin -- the breaker "
+            "must promote exactly one request to the origin once "
+            "breaker_open has elapsed, closing on success")
+
+        # A second fetch right after must find the breaker CLOSED (normal
+        # service resumed) rather than still routing through the fallback.
+        #
+        # The status alone cannot say that: a still-OPEN breaker serving the
+        # armed any-age snapshot answers 200 too. Nor can an origin-hit delta
+        # -- the probe above just re-stored this key and cache_turbo_valid is
+        # 1s, so a CLOSED breaker legitimately answers from cache with zero
+        # origin contact, and asserting a hit would fail on timing rather than
+        # behaviour. The zone's own breaker_state is the discriminating read:
+        # shm_stats() snapshots the word (shm.c:734) instead of going through
+        # _breaker_state(), so unlike the request path it promotes nothing and
+        # observing it cannot change what it reports.
+        drain_origin(origin)
+        s_confirm, _, _ = fetch(ng.port, cached_path)
+        assert s_confirm == 200, (
+            f"post-close confirm fetch: expected 200, got {s_confirm}")
+        brk_state = _admin_str(ng, "breaker_state", "/_cache_o45")
+        assert brk_state == "closed", (
+            f"the successful probe must CLOSE the breaker, but the zone still "
+            f"reports breaker_state={brk_state!r} -- a 200 here proves nothing "
+            f"on its own, since an OPEN breaker serving the armed snapshot "
+            f"answers 200 as well")
+    finally:
+        origin.fail = False
+        drain_origin(origin)
+
+
+def test_breaker_off_negative_control_origin_climbs(ng: Nginx, origin: Origin) -> None:
+    """O4.5 MANDATORY negative control for the suite: with cache_turbo_breaker
+    off (/o45off/, o45offz), a dead origin gets NO fallback at all -- every
+    request keeps reaching it, so the origin hit count keeps CLIMBING rather
+    than flatlining behind an OPEN breaker. This is the control that proves
+    the zero-origin-contact result in test_breaker_lifecycle_open_zero_
+    contact_close is actually caused by the breaker, not by keep_stale or some
+    other widening: an identical shape with only the breaker flag flipped
+    must show origin traffic continuing."""
+    # See the O4.5 lifecycle test above for why the needle must survive the
+    # /o45off/ proxy_pass prefix-strip and must not collide with an existing
+    # fixture's URI ("probe" alone already belongs to /at/, /atc/, /atl/).
+    path = "/o45off/o45offprobe"
+    s0, b0, _ = fetch(ng.port, path)
+    assert s0 == 200 and b0, f"prime failed for {path}: {s0} {b0!r}"
+
+    time.sleep(4.3)   # past fresh (1s) AND the x4 stale window (4s): L1-expired
+    origin.fail = True
+    try:
+        hits_before = origin.hits_for("o45offprobe")
+        for _ in range(3):
+            fetch(ng.port, path)
+        hits_after = origin.hits_for("o45offprobe")
+        assert hits_after - hits_before == 3, (
+            f"breaker off: expected all 3 requests to reach the (dead) "
+            f"origin (no breaker protection), but origin.hits_for("
+            f"'o45offprobe') moved only {hits_after - hits_before}")
+    finally:
+        origin.fail = False
+        drain_origin(origin)
+
+
+def test_breaker_record_position_and_sense(ng: Nginx, origin: Origin) -> None:
+    """O4.5 owns O4.2's declared test gap (O4.2-f): the header-filter
+    recording block (module.c ~7201-7243) has no automated guard on either
+    its POSITION (before the RFC-2 stale-if-error rewrite at ~7250) or the
+    sense of its success argument (module.c passes `!is_failure`, i.e. a
+    5xx origin status records a FAILURE, everything else a success).
+
+    Claims 1+2 run on /o45hit/ (o45hitz, threshold=1/window=60s/open=30s).
+    Claim 3 (position) runs on a SEPARATE location/zone, /o45hitpos/
+    (o45hitposz, keep_stale forever) -- see the o45hitposz zone comment for
+    why: threshold=1 means the failure each claim exercises trips that
+    zone's breaker OPEN, and a shared zone would make the second claim to
+    run fail for an unrelated reason (the pre-origin gate blocking all
+    origin contact once OPEN), not because of an actual position/sense bug.
+
+      1. An origin 5xx (drop -> 502) on a COLD key records a failure:
+         origin_failures moves by exactly one, and the raw 502 surfaces
+         (nothing armed yet to swap it for).
+      2. A cache-turbo HIT (served from ctx->served, never reaching the
+         recording block at all) records NOTHING: origin_failures does not
+         move across a HIT.
+      3. POSITION: recording happens BEFORE the SIE rewrite at ~7250, not
+         after. Primes a key, lets it go stale (past cache_turbo_valid +
+         the x4 stale window), then drops the origin on THAT key --
+         keep_stale forever arms the SIE rewrite, which swaps the 502 for
+         the stale body (client sees 200, body unchanged from the prime).
+         origin_failures must STILL move by one: if recording ran after the
+         rewrite instead of before, r->headers_out.status would already be
+         the rewritten 200 by the time is_origin_failure() ran, and this
+         delta would read 0 -- the exact regression a records-after-rewrite
+         mutation produces.
+
+    O4.2-f's own third claim ("a native proxy_cache HIT records nothing") is
+    covered by test_breaker_record_native_proxy_cache_hit_no_record below,
+    split out because it needs its own on-disk proxy_cache dir and the
+    single/multi-process + sanitizer skip that test already carries."""
+    hit_path = "/o45hit/x"
+    cold_path = "/o45hit/dropme"
+    stale_path = "/o45hitpos/staleme"
+
+    # claim 2: prime + a genuine cache-turbo HIT (well within the 1s valid).
+    s0, b0, _ = fetch(ng.port, hit_path)
+    assert s0 == 200 and b0, f"prime failed for {hit_path}: {s0} {b0!r}"
+
+    of_before_hit = _admin_stat(ng, "origin_failures", "/_cache_o45hit")
+    s_hit, b_hit, _ = fetch(ng.port, hit_path)
+    assert s_hit == 200 and b_hit == b0, (
+        f"expected a cache-turbo HIT (identical body) for {hit_path}, got "
+        f"status={s_hit} body-changed={b_hit != b0}")
+    of_after_hit = _admin_stat(ng, "origin_failures", "/_cache_o45hit")
+    assert of_after_hit == of_before_hit, (
+        f"origin_failures moved {of_before_hit} -> {of_after_hit} across a "
+        f"cache-turbo HIT -- the recording block must not run at all when "
+        f"ctx->served short-circuits the header filter")
+
+    # claim 1: drop the connection (502, transport-level failure -- a
+    # different error class than the clean 503 `fail` mode) on a FRESH,
+    # never-primed key, so the raw 502 has nothing to be swapped for and
+    # must surface as-is.
+    origin.drop = True
+    try:
+        of_before_fail = _admin_stat(ng, "origin_failures", "/_cache_o45hit")
+        s_fail, _, _ = fetch(ng.port, cold_path)
+        assert s_fail != 200, (
+            f"expected the dropped-connection origin failure (502) to "
+            f"surface, got {s_fail}")
+        of_after_fail = _admin_stat(ng, "origin_failures", "/_cache_o45hit")
+        assert of_after_fail - of_before_fail == 1, (
+            f"origin_failures did not move by exactly one on a genuine "
+            f"origin drop (502): {of_before_fail} -> {of_after_fail}")
+    finally:
+        origin.drop = False
+        drain_origin(origin)
+
+    # claim 3 (POSITION): on the SEPARATE o45hitposz zone/location so this
+    # claim's own trip cannot be confused with (or blocked by) claim 1's.
+    # Prime, let it go stale, then drop the origin on the SAME key --
+    # keep_stale forever arms the SIE rewrite, so the client-visible
+    # response becomes 200/unchanged-body even though the origin genuinely
+    # answered (dropped to) a 502. origin_failures on o45hitposz must still
+    # move, proving the record() call sees the ORIGINAL 502 status, not the
+    # rewritten 200.
+    s2, b2, _ = fetch(ng.port, stale_path)
+    assert s2 == 200 and b2, f"prime failed for {stale_path}: {s2} {b2!r}"
+    time.sleep(4.3)   # past fresh (1s) AND the x4 stale window (4s)
+    origin.drop = True
+    try:
+        of_before_stale = _admin_stat(ng, "origin_failures", "/_cache_o45hitpos")
+        s_stale, b_stale, _ = fetch(ng.port, stale_path)
+        assert s_stale == 200 and b_stale == b2, (
+            f"expected keep_stale to swap the dropped-connection 502 for "
+            f"the stale body (unchanged from the prime), got status="
+            f"{s_stale} body-changed={b_stale != b2} -- without this the "
+            f"position claim below is not actually exercising the SIE "
+            f"rewrite at all")
+        of_after_stale = _admin_stat(ng, "origin_failures", "/_cache_o45hitpos")
+        assert of_after_stale - of_before_stale == 1, (
+            f"origin_failures did not move on a stale-serve that masked a "
+            f"genuine origin 502 -- the recording block must run BEFORE "
+            f"the SIE rewrite overwrites r->headers_out.status, not after: "
+            f"{of_before_stale} -> {of_after_stale}")
+    finally:
+        origin.drop = False
+        drain_origin(origin)
+
+
+def test_breaker_record_native_proxy_cache_hit_no_record(ng: Nginx) -> None:
+    """O4.2-f (third claim): a native `proxy_cache` HIT must record NOTHING
+    on the breaker's origin_failures counter -- /o45natpc/ carries no
+    cache_turbo directive at all, so the module never builds a ctx for it
+    (ngx_http_get_module_ctx() returns NULL) and the header filter's very
+    first line (`ctx == NULL || ctx->served`) returns before the recording
+    block is ever reached, on both the MISS and every later HIT.
+
+    Reads o45hitz's origin_failures as the observation point (o45hitz is
+    never touched by /o45natpc/'s traffic at all -- there is no shared state
+    between an uninstrumented location and a private zone -- so a delta of
+    zero here is not a coincidence of an inert counter; it is the only
+    counter this suite has that could have moved had /o45natpc/ somehow
+    touched the breaker machinery, and it stays flat throughout).
+
+    NEGATIVE CONTROL: manual, not an automated mutation, and documented as
+    such rather than silently skipped (same precedent as
+    test_breaker_policy_identical_no_warning's arm (b) elsewhere in this
+    file). This claim is protected by TWO independent structural gates --
+    ctx == NULL (no cache_turbo directive on this location at all) AND
+    clcf->shm_zone == NULL (cache_turbo_zone never bound here either) -- so
+    any single-line mutation that defeats one gate alone (e.g. dropping the
+    ctx->served half of the early-return, tried and confirmed to still pass
+    because the shm_zone gate independently blocks it) proves nothing; a
+    mutation that defeats BOTH would deref a NULL ctx/shm_zone and crash
+    rather than silently pass, which is not a meaningful control either.
+    test_breaker_record_position_and_sense's sense (is_failure) and position
+    (before/after the SIE rewrite) mutations, run against /o45hit/ +
+    /o45hitpos/ above, exercise the SAME recording block this test relies on
+    being unreachable -- so that block's mutation coverage is not skipped,
+    just not re-proven a second time from this angle.
+
+    Note on the MISS+HIT pair below: the HIT is a PRECONDITION (it makes the
+    counter check interesting), not the claim, and it is advisory. Both gates
+    above hold on a MISS as well, so a cache-visibility race on a loaded runner
+    cannot invalidate the assertion -- see the comment at the poll."""
+    if ng.single_process or ng.sanitizer:
+        # Same core-nginx UBSan/ASan false-positive + cache-manager-process
+        # skip as test_suppress_native_e2e_proxy_cache above.
+        return
+
+    path = "/o45natpc/y"
+    of_before = _admin_stat(ng, "origin_failures", "/_cache_o45hit")
+
+    s0, b0, _ = fetch(ng.port, path)
+    assert s0 == 200 and b0, f"MISS failed for {path}: {s0} {b0!r}"
+
+    # Second request: ideally a native proxy_cache HIT, which is what makes the
+    # counter assertion below interesting rather than vacuous. Polled (not a
+    # fixed sleep) because nginx writes the cache entry after the response
+    # completes, so a loaded box can MISS again immediately afterwards.
+    #
+    # ADVISORY, NOT AN ASSERTION -- deliberately. The claim this test makes is
+    # the origin_failures delta below, and that claim does NOT depend on
+    # request 2 being a HIT: the header filter returns at
+    # `ctx == NULL || ctx->served` (module.c:7122) and /o45natpc/ carries no
+    # cache_turbo directive at all, so ngx_http_get_module_ctx() is NULL on
+    # EVERY request here -- MISS and HIT alike -- and the recording block
+    # (module.c:7234) is unreachable either way. A MISS therefore still
+    # exercises the claim. Hard-failing on it cost three sessions chasing an
+    # environment-dependent runner MISS that endangered nothing (see
+    # lessons.md); a note is the right severity.
+    #
+    # Short budget on purpose: this is advisory, so a runner that is never
+    # going to produce the HIT should not pay 5s to learn that.
+    b1 = None
+    for _ in range(10):
+        s1, b1, _ = fetch(ng.port, path)
+        if s1 == 200 and b1 == b0:
+            break
+        time.sleep(0.1)
+    assert s1 == 200, (
+        f"native proxy_cache request 2 for {path} must still be a healthy 200 "
+        f"(HIT or MISS), got {s1} -- an error response would mean the origin "
+        f"or the location itself broke, not a cache-visibility race")
+    if b1 != b0:
+        print(f"    note: {path} did not become a native proxy_cache HIT "
+              f"within 1s (request 2 re-fetched from origin). Harmless here -- "
+              f"the origin_failures claim below holds for a MISS too.",
+              flush=True)
+
+    of_after = _admin_stat(ng, "origin_failures", "/_cache_o45hit")
+    assert of_after == of_before, (
+        f"origin_failures moved {of_before} -> {of_after} across a native "
+        f"proxy_cache MISS+HIT with no cache_turbo directive present at all "
+        f"-- the breaker recording block must be unreachable without a ctx")
+
+
 # The directive line the separator tests rewrite. Kept as one constant so a
 # config reshuffle breaks these loudly (via the `old in cfg` assert) instead of
 # silently skipping them.
@@ -10490,6 +11012,16 @@ def _admin_stat(ng: Nginx, name: str, path: str = "/_cache") -> int:
     import json
     _, b, _ = fetch(ng.port, path)
     return int(json.loads(b).get(name, 0))
+
+
+def _admin_str(ng: Nginx, name: str, path: str = "/_cache") -> str:
+    """String-valued sibling of _admin_stat, for breaker_state (the only
+    non-numeric field on the admin JSON). Deliberately defaults to "" rather
+    than "closed" on a missing key: a build that stopped emitting the field
+    must fail the assertion, not read as the state the caller hoped for."""
+    import json
+    _, b, _ = fetch(ng.port, path)
+    return str(json.loads(b).get(name, ""))
 
 
 def test_cold_single_flight(ng: Nginx, origin: Origin) -> None:
@@ -14694,6 +15226,10 @@ def run_all(ng: Nginx, origin: Origin,
         # while proving nothing. Guarded rather than unconditional for that
         # reason -- a no-Redis run must SKIP it, not fake it.
         test_breaker_l2_arming_site_gated_white_box(ng, origin, redis)
+    test_breaker_lifecycle_open_zero_contact_close(ng, origin)  # O4.5
+    test_breaker_off_negative_control_origin_climbs(ng, origin)  # O4.5
+    test_breaker_record_position_and_sense(ng, origin)          # O4.5 / O4.2-f
+    test_breaker_record_native_proxy_cache_hit_no_record(ng)    # O4.2-f
     test_backend_separators(ng)
     test_backend_malformed_pipes(ng)
     test_backend_none_is_exclusive(ng)
