@@ -3074,6 +3074,97 @@ run_negative_controls(void)
             tests_failed++;
         }
     }
+
+    /* --- PERF-7 blob refcount controls --------------------------------
+     *
+     * Each bug is reimplemented against the same fixture the corresponding
+     * test uses, and the control asserts that the TEST'S OWN assertion would
+     * now fail. The bodies under test are sliced from production and cannot be
+     * edited from here, so the control reproduces the defective PREDICATE
+     * inline rather than mutating the real function -- the same technique the
+     * CR-B control above uses.
+     *
+     * Why these exist even though each bug was also verified by mutating
+     * shm.c by hand: a mutation run proves the test discriminated ONCE, on one
+     * machine, and then evaporates. These run on every build. */
+    {
+        u_char                          *blob;
+        ngx_http_cache_turbo_blobref_t  *ref;
+        ngx_uint_t                       live_before;
+
+        /* PERF-7-a restored: node_release() frees whenever the owner drops the
+         * blob, ignoring refs. test_blob_detach_defers_free_to_the_last_server
+         * asserts the slab SURVIVES that call while a serve is in flight. */
+        zone_reset();
+        live_before = ngx_test_slab_live;
+        blob = ngx_http_cache_turbo_blob_alloc(&g_zone, 64);
+        REQUIRE(blob != NULL, "PERF-7-a control fixture: blob_alloc failed");
+        ngx_http_cache_turbo_blob_acquire(blob);       /* a serve is in flight */
+        ref = CT_BLOBREF(blob);
+        ngx_slab_free_locked(&g_pool, ref);            /* <-- the bug */
+
+        caught = (ngx_test_slab_live == live_before);
+        tests_run++;
+        if (!caught) {
+            tests_failed++;
+            fprintf(stderr, "  ✗ CONTROL PERF-7-a: freeing on detach with a "
+                            "server in flight left the slab accounted live — "
+                            "test_blob_detach_defers_free_to_the_last_server "
+                            "guards nothing\n");
+        }
+
+        /* PERF-7-b restored: release() frees as soon as refs hits 0, without
+         * requiring detached. test_blob_release_does_not_free_while_still_attached
+         * asserts the slab SURVIVES, because the owning node still points at it. */
+        zone_reset();
+        live_before = ngx_test_slab_live;
+        blob = ngx_http_cache_turbo_blob_alloc(&g_zone, 64);
+        REQUIRE(blob != NULL, "PERF-7-b control fixture: blob_alloc failed");
+        ngx_http_cache_turbo_blob_acquire(blob);
+        ref = CT_BLOBREF(blob);
+        ref->refs--;
+        if (ref->refs == 0) {                          /* <-- the bug: no
+                                                        * detached conjunct */
+            ngx_slab_free_locked(&g_pool, ref);
+        }
+
+        caught = (ngx_test_slab_live == live_before);
+        tests_run++;
+        if (!caught) {
+            tests_failed++;
+            fprintf(stderr, "  ✗ CONTROL PERF-7-b: dropping the `detached` "
+                            "conjunct freed a blob the owning node still "
+                            "holds — "
+                            "test_blob_release_does_not_free_while_still_attached"
+                            " guards nothing\n");
+        }
+
+        /* PERF-7-c restored: acquire() does not take a reference, so the FIRST
+         * of several servers to finish frees the slab under the others.
+         * test_blob_multiple_servers_free_exactly_once asserts the blob is
+         * still live after the first two of three releases. */
+        zone_reset();
+        live_before = ngx_test_slab_live;
+        blob = ngx_http_cache_turbo_blob_alloc(&g_zone, 64);
+        REQUIRE(blob != NULL, "PERF-7-c control fixture: blob_alloc failed");
+        ref = CT_BLOBREF(blob);
+        /* three servers start, but acquire is a no-op (the bug) */
+        ngx_http_cache_turbo_blob_node_release(&g_zone, blob);  /* owner evicts;
+                                                                 * refs == 0 so
+                                                                 * this frees it
+                                                                 * immediately */
+
+        caught = (ngx_test_slab_live == live_before);
+        tests_run++;
+        if (!caught) {
+            tests_failed++;
+            fprintf(stderr, "  ✗ CONTROL PERF-7-c: with acquire() not counting, "
+                            "the owner's eviction did not free the slab out "
+                            "from under the in-flight servers — "
+                            "test_blob_multiple_servers_free_exactly_once "
+                            "guards nothing\n");
+        }
+    }
 }
 
 int
