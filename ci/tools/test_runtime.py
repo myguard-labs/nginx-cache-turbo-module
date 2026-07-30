@@ -6887,7 +6887,7 @@ def _config_warns(ng: Nginx, tag: str, old: str, new: str, want: str) -> None:
 def test_breaker_policy_divergence_warns(ng: Nginx) -> None:
     """O4.4-d: breaker STATE/counters are per-ZONE but the five breaker
     directives are per-LOCATION. Two sibling locations sharing one zone
-    (`main`) with divergent EFFECTIVE breaker tuples (open=30s vs open=5m)
+    (`brkpolz`) with divergent EFFECTIVE breaker tuples (open=30s vs open=5m)
     must load successfully (WARN, not reject -- a hard reject would break
     configs that work today) and must print the divergence diagnostic added
     at merge_loc_conf just after the shm_zone inheritance block."""
