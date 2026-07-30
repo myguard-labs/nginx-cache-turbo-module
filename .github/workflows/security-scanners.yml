@@ -68,7 +68,7 @@ jobs:
           # field op->recv (not the recv(2) syscall) and on FF1029 sites that
           # contain no loop. 34 such alerts were dismissed as false positives.
           #
-          # REPORT at 3, GATE at 4. Until 2026-07-31 this step had no
+          # REPORT at 3, GATE at 4. This step previously had no
           # --error-level at all, so it could not fail whatever it found, while
           # .pre-commit-config.yaml gated locally at 4 -- a finding blocked a
           # commit and then sailed through CI. 4 is the pre-commit threshold;
@@ -97,7 +97,7 @@ jobs:
       - name: semgrep (gate on >=WARNING)
         run: |
           set -euo pipefail
-          # GATED as of 2026-07-31. This step previously ended in `|| true`,
+          # GATED. This step previously ended in `|| true`,
           # so it reported and never blocked, while .pre-commit-config.yaml
           # gated locally with --error at the same severity floor. Matching
           # thresholds is the point: pre-commit exists to predict this job.

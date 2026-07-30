@@ -479,7 +479,7 @@ jobs:
           #
           # REPORT at 3, GATE at 4 -- see the identical step in
           # security-scanners.yml for why (pre-commit gated stricter than CI
-          # until 2026-07-31). Keep the two files equal.
+          # before this gate). Keep the two files equal.
           #
           # pipefail is load-bearing: without it `tee` supplies the exit status
           # and the gate silently passes on every finding.
@@ -503,7 +503,7 @@ jobs:
       - name: semgrep (gate on >=WARNING)
         run: |
           set -euo pipefail
-          # GATED as of 2026-07-31 -- see the identical step in
+          # GATED -- see the identical step in
           # security-scanners.yml for the full reasoning.
           #
           # -j 1 IS LOAD-BEARING: parallel semgrep-core shards exhaust

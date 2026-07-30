@@ -76,7 +76,7 @@ jobs:
         run: |
           set -euo pipefail
           # ci/tools/test_runtime.py IS the runtime suite (~15.6k lines) and
-          # went unlinted until 2026-07-31. RUF059 (unused-unpacked-variable)
+          # went unlinted before this gate. RUF059 (unused-unpacked-variable)
           # is the reason this gate exists: a captured-then-never-read variable
           # is the tell for the vacuous-assertion class that produced a test
           # whose only surviving assertion was satisfied by BOTH the pass and
