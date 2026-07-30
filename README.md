@@ -1137,6 +1137,31 @@ refused connection and a real 502 are the same number. So `error` behaves as
 `http_502` and `timeout` behaves as `http_504`. Write whichever reads better;
 they select the same responses.
 
+### Circuit breaker + stale-on-error for origin protection
+
+When the origin becomes unreliable (degraded response times, rare failures), you can combine the circuit breaker with `cache_turbo_keep_stale` to shield downstream clients and give the origin time to recover:
+
+```nginx
+location / {
+    cache_turbo                       ct;
+    cache_turbo_valid                 5m;         # fresh TTL: 5 minutes
+    cache_turbo_keep_stale            24h;        # if origin is down, serve stale for up to 24 hours
+    cache_turbo_background_update     on;         # stale-while-revalidate during normal operation
+
+    # Circuit breaker: trip after 3 consecutive 5xx in a 30-second window
+    cache_turbo_breaker               on;
+    cache_turbo_breaker_threshold     3;          # fail count needed to open
+    cache_turbo_breaker_window        30s;        # rolling window for counting failures
+    cache_turbo_breaker_open          2m;         # stay open for 2 minutes, then probe once
+
+    proxy_pass http://backend;
+}
+```
+
+The breaker trips OPEN after three 5xx responses within 30 seconds. While it is OPEN it does not contact the origin at all — that is the point — and requests are answered from the cached copy, fresh if it is under 5 minutes old and stale if it is older. Once the 2-minute OPEN window elapses, exactly one request is promoted to probe the origin: if that probe succeeds the breaker closes and normal traffic resumes, and if it fails the breaker stays OPEN for another window.
+
+A URI with no cached copy at all has nothing to fall back on, so those requests get a `503` carrying a `Retry-After` hint that tracks `cache_turbo_breaker_open`. The same applies once a copy ages past the 24-hour `cache_turbo_keep_stale` window: serving indefinitely old data is an explicit choice, not a default.
+
 ### What outage handling cannot do
 
 Some failure modes are outside what a cache can fix. They are listed here so you
