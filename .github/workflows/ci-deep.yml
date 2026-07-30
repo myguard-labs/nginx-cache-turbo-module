@@ -470,12 +470,21 @@ jobs:
           bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" module
           echo "NGINX_SRC_TREE=$GITHUB_WORKSPACE/.build/nginx-${NGINX_VERSION}" \
             >> "$GITHUB_ENV"
-      - name: flawfinder
+      - name: flawfinder (gate on >=4)
         run: |
+          set -euo pipefail
           # minlevel=3: level 1-2 is dominated by token-matches on the struct
           # field op->recv (not the recv(2) syscall) and on FF1029 sites that
           # contain no loop. 34 such alerts were dismissed as false positives.
-          flawfinder --minlevel=3 "$GITHUB_WORKSPACE"/src/*.c 2>&1 | tee flawfinder.log
+          #
+          # REPORT at 3, GATE at 4 -- see the identical step in
+          # security-scanners.yml for why (pre-commit gated stricter than CI
+          # until 2026-07-31). Keep the two files equal.
+          #
+          # pipefail is load-bearing: without it `tee` supplies the exit status
+          # and the gate silently passes on every finding.
+          flawfinder --minlevel=3 --error-level=4 \
+            "$GITHUB_WORKSPACE"/src/*.c 2>&1 | tee flawfinder.log
       - name: clang-tidy (cert-*, security.*)
         run: |
           set -euo pipefail
@@ -491,10 +500,18 @@ jobs:
               -- $INCLUDES 2>&1 | tee -a clang-tidy.log || status=1
           done
           exit "$status"
-      - name: semgrep
+      - name: semgrep (gate on >=WARNING)
         run: |
-          semgrep scan --config p/c --config p/security-audit \
-            "$GITHUB_WORKSPACE/src/" 2>&1 | tee semgrep.log || true
+          set -euo pipefail
+          # GATED as of 2026-07-31 -- see the identical step in
+          # security-scanners.yml for the full reasoning.
+          #
+          # -j 1 IS LOAD-BEARING: parallel semgrep-core shards exhaust
+          # RLIMIT_MEMLOCK on io_uring init and die with EXIT CODE 0, i.e. a
+          # crashed scanner that reads as a clean scan. Do not drop it.
+          semgrep scan -j 1 --config p/c --config p/security-audit \
+            --severity=WARNING --severity=ERROR --error \
+            "$GITHUB_WORKSPACE/src/" 2>&1 | tee semgrep.log
       - name: Upload reports
         if: always()
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5

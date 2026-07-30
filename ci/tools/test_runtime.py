@@ -3582,6 +3582,11 @@ http {{
             cache_turbo_key      $request_uri;
             cache_turbo_valid    30s;
             cache_turbo_auto_vary on;
+            # X-CT-Status is the canary the primary-subtag share test asserts
+            # on: "b1 == b2" alone is equally satisfied by two independent
+            # origin misses that happen to return byte-identical bodies, so
+            # the HIT status is what distinguishes a real shared slot.
+            add_header           X-CT-Status $cache_turbo_status always;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
@@ -5485,7 +5490,7 @@ def test_redmine_key_arg_bypasses_without_cookie(ng: Nginx,
     The negative control is the same path WITHOUT the arg: it must still cache,
     proving the bypass comes from the arg rule and not from the path being
     uncacheable anyway."""
-    _, _, h1 = fetch(ng.port, "/redmine/issues?key=abc123deadbeef")
+    _, _, _h1 = fetch(ng.port, "/redmine/issues?key=abc123deadbeef")
     _, _, h2 = fetch(ng.port, "/redmine/issues?key=abc123deadbeef")
     assert "x-cache" not in h2, \
         (f"?key= MUST bypass with no cookie, got {h2.get('x-cache')} -- it "
@@ -6560,7 +6565,7 @@ def test_magento_preset(ng: Nginx, origin: Origin) -> None:
 
     # VALUE-KEYED: same vary value hits its own entry ...
     v_a = {"Cookie": "X-Magento-Vary=9f2a4c1e8b7d6f5a4c3b2a1908070605"}
-    _, b1, h1 = fetch(ng.port, "/mg/product-a", headers=v_a)
+    _, b1, _h1 = fetch(ng.port, "/mg/product-a", headers=v_a)
     _, b2, h2 = fetch(ng.port, "/mg/product-a", headers=v_a)
     assert h2.get("x-cache") == "HIT", \
         ("X-Magento-Vary must be KEYED, not bypassed -- a segment repeats and "
@@ -6571,7 +6576,7 @@ def test_magento_preset(ng: Nginx, origin: Origin) -> None:
     # presence-keying rejection was worried about, and it is the whole point of
     # keying on the VALUE.
     v_b = {"Cookie": "X-Magento-Vary=0000111122223333444455556666777"}
-    _, b3, h3 = fetch(ng.port, "/mg/product-a", headers=v_b)
+    _, b3, _h3 = fetch(ng.port, "/mg/product-a", headers=v_b)
     assert b3 != b1, \
         ("magento: a DIFFERENT X-Magento-Vary value was served another "
          "segment's cached body -- this is a cross-user leak")
@@ -7839,7 +7844,7 @@ def test_breaker_l2_arming_site_gated_white_box(ng: Nginx, origin: Origin,
         blob = redis.get_raw(key)
         assert blob is not None and len(blob) >= 44, \
             f"short/absent L2 blob for {path}: {blob!r}"
-        fresh_ttl, stale_ttl, sie_ttl = struct.unpack("<III", blob[32:44])
+        _fresh_ttl, stale_ttl, sie_ttl = struct.unpack("<III", blob[32:44])
         assert sie_ttl > 60, (
             f"{path} fixture drifted: sie_ttl={sie_ttl}, expected > 60 from "
             f"keep_stale 300s. Without a wide sie window the aged blob has no "
@@ -8884,7 +8889,7 @@ def test_no_cache_set_cookie(ng: Nginx) -> None:
     per-client state) — repeated reads keep hitting the origin."""
     s1, b1, h1 = fetch(ng.port, "/cc/setcookie")
     assert s1 == 200 and "x-cache" not in h1, "first read should be a miss"
-    s2, b2, h2 = fetch(ng.port, "/cc/setcookie")
+    _s2, b2, h2 = fetch(ng.port, "/cc/setcookie")
     assert "x-cache" not in h2, "Set-Cookie response must not be cached"
     assert b1 != b2, "both reads should have gone to the origin"
 
@@ -9263,13 +9268,13 @@ def test_honor_ttl_clamped_to_max(ng: Nginx, origin: Origin) -> None:
     Observable proof: the entry stays a FRESH HIT (no re-hit to origin) rather
     than going stale — a wrapped TTL would surface as a STALE serve here."""
     base = origin.hits_for("ttlclamp")           # path-scoped: immune to bg-refresh noise
-    _, b0, h0 = fetch(ng.port, "/cc7/ttlclamp")
+    _, _b0, h0 = fetch(ng.port, "/cc7/ttlclamp")
     assert "x-cache" not in h0, "first should miss to origin"
-    _, b1, h1 = fetch(ng.port, "/cc7/ttlclamp")
+    _, _b1, h1 = fetch(ng.port, "/cc7/ttlclamp")
     assert h1.get("x-cache") == "HIT", \
         f"clamped huge max-age must serve a FRESH HIT, got {h1.get('x-cache')}"
     time.sleep(2.0)
-    _, b2, h2 = fetch(ng.port, "/cc7/ttlclamp")
+    _, _b2, h2 = fetch(ng.port, "/cc7/ttlclamp")
     assert h2.get("x-cache") == "HIT", \
         ("clamped max-age must still be fresh after a delay (no overflow-to-stale), "
          f"got {h2.get('x-cache')}")
@@ -9524,7 +9529,7 @@ def test_rfc1_request_no_store(ng: Nginx, origin: Origin) -> None:
     assert "x-cache" not in h, "a no-store request is an origin miss, not a HIT"
     assert origin.hits == before + 1, "no-store must reach the origin"
     # nothing was stored: the next plain GET is itself a miss (origin hit again)
-    s2, _, h2 = fetch_raw(ng.port, "/cond/rns")
+    _s2, _, h2 = fetch_raw(ng.port, "/cond/rns")
     assert "x-cache" not in h2 and origin.hits == before + 2, \
         f"no-store response must not have been cached: {h2}"
 
@@ -9549,7 +9554,7 @@ def test_rfc1_request_max_age_n(ng: Nginx, origin: Origin) -> None:
     fetch_raw(ng.port, "/cond/man")                                # prime
     time.sleep(2.2)
     before = origin.hits
-    s0, _, h0 = fetch_raw(ng.port, "/cond/man",
+    _s0, _, h0 = fetch_raw(ng.port, "/cond/man",
                           headers={"Cache-Control": "max-age=30"})
     assert h0.get("x-cache") == "HIT" and origin.hits == before, \
         f"max-age=30 on a ~2s entry should HIT: {h0}"
@@ -9565,7 +9570,7 @@ def test_rfc1_request_min_fresh(ng: Nginx, origin: Origin) -> None:
     fresh for at least N more seconds."""
     fetch_raw(ng.port, "/cond/mf")                                 # prime, fresh 30s
     before = origin.hits
-    s0, _, h0 = fetch_raw(ng.port, "/cond/mf",
+    _s0, _, h0 = fetch_raw(ng.port, "/cond/mf",
                           headers={"Cache-Control": "min-fresh=5"})
     assert h0.get("x-cache") == "HIT" and origin.hits == before, \
         f"min-fresh=5 with ~30s left should HIT: {h0}"
@@ -9610,7 +9615,7 @@ def test_p4_multi_directive_single_resolve(ng: Nginx, origin: Origin) -> None:
         entry serves the stale copy (max-stale honoured off the same resolve)."""
     # (a) no-store on a fresh cold key: not stored -> second GET re-hits origin.
     before = origin.hits
-    s0, _, h0 = fetch_raw(ng.port, "/condst/p4-nostore",
+    s0, _, _h0 = fetch_raw(ng.port, "/condst/p4-nostore",
                           headers={"Cache-Control": "no-store, max-age=99"})
     assert s0 == 200 and origin.hits == before + 1, \
         f"no-store request must reach origin: {s0} hits={origin.hits}"
@@ -10479,7 +10484,7 @@ def test_sie_serves_counter(ng: Nginx, origin: Origin) -> None:
     try:
         before = _admin_stat(ng, "sie_serves")
 
-        s, b, h = fetch(ng.port, "/sieserve/sieserve-cnt-pos")
+        s, _b, h = fetch(ng.port, "/sieserve/sieserve-cnt-pos")
         assert s == 200, f"SIE serve-on-error returned {s}, expected stale 200"
         assert h.get("x-cache") == "STALE-IF-ERROR", \
             f"expected STALE-IF-ERROR, got x-cache={h.get('x-cache')}"
@@ -12576,14 +12581,20 @@ def test_l2_keepalive_db_isolation(ng: Nginx, origin: Origin,
 
         fetch(ng.port, f"/l2ka0/x?k={k0}")
         assert wait_for(
-            lambda: redis.cli("-n", "0", "EXISTS", key0) == "1",
+            # noqa: B023 -- late binding is safe here: wait_for consumes the
+            # lambda before this iteration ends, so key0 cannot have been
+            # rebound. Do not "fix" with a default arg; it would hide a real
+            # deferred-closure bug if one is ever introduced below.
+            lambda: redis.cli("-n", "0", "EXISTS", key0) == "1",  # noqa: B023
             timeout=4.0), f"DB 0 keepalive write missing for {k0}"
         assert redis.cli("-n", "1", "EXISTS", key0) == "0", \
             f"DB 0 key leaked into DB 1 through keepalive reuse: {k0}"
 
         fetch(ng.port, f"/l2ka1/x?k={k1}")
         assert wait_for(
-            lambda: redis.cli("-n", "1", "EXISTS", key1) == "1",
+            # noqa: B023 -- same as the DB 0 case above: consumed within the
+            # iteration, so the late binding cannot observe a rebound key1.
+            lambda: redis.cli("-n", "1", "EXISTS", key1) == "1",  # noqa: B023
             timeout=4.0), f"DB 1 keepalive write missing for {k1}"
         assert redis.cli("-n", "0", "EXISTS", key1) == "0", \
             f"DB 1 key leaked into DB 0 through keepalive reuse: {k1}"
@@ -13725,7 +13736,7 @@ def test_lock_self_heal(ng: Nginx, origin: Origin, redis: RedisServer) -> None:
     uri = "/lockh/heal"
     redis.cli("DEL", l2_key(uri), lock_key(uri))
 
-    s, body_a, h = fetch(ng.port, uri)             # prime -> origin -> L1 + L2
+    s, _body_a, h = fetch(ng.port, uri)             # prime -> origin -> L1 + L2
     assert s == 200 and "x-cache" not in h, "prime should miss to origin"
     assert wait_for(lambda: redis.cli("EXISTS", l2_key(uri)) == "1"), \
         "prime never wrote L2"
@@ -13822,7 +13833,7 @@ def test_lock_redis_outage_fallback(ng: Nginx, origin: Origin,
     uri = f"/lock/{slug}"
     redis.cli("DEL", l2_key(uri), lock_key(uri))
 
-    s, body_a, h = fetch(ng.port, uri)             # prime -> origin -> L1 + L2
+    s, _body_a, h = fetch(ng.port, uri)             # prime -> origin -> L1 + L2
     assert s == 200 and "x-cache" not in h, "prime should miss to origin"
     assert wait_for(lambda: redis.cli("EXISTS", l2_key(uri)) == "1"), \
         "prime never wrote L2"
@@ -14017,7 +14028,7 @@ def test_normalize_arg_order(ng: Nginx, origin: Origin) -> None:
     base = origin.hits
     s1, b1, h1 = fetch(ng.port, "/n/order?b=2&a=1")
     assert s1 == 200 and "x-cache" not in h1, "first request should miss to origin"
-    s2, b2, h2 = fetch(ng.port, "/n/order?a=1&b=2")
+    _s2, b2, h2 = fetch(ng.port, "/n/order?a=1&b=2")
     assert h2.get("x-cache") == "HIT", \
         f"reordered args should HIT, got X-Cache={h2.get('x-cache')}"
     assert b2 == b1, "reordered request served a different body"
@@ -14286,6 +14297,14 @@ def test_auto_vary_language_primary_subtag_shares(ng: Nginx,
     s2, b2, h2 = fetch(ng.port, p, {"Accept-Language": "en-GB,en;q=0.8"})
     assert s1 == 200 and s2 == 200, (s1, s2)
     assert b1 == b2, ("en-US and en-GB did not share a slot", b1, b2)
+    # The canary the docstring promises. Body identity alone is equally
+    # satisfied by two independent origin misses returning the same bytes;
+    # only the HIT proves en-GB landed on the slot en-US filled.
+    assert h1.get("x-ct-status") == "MISS", \
+        f"en-US should prime the 'en' class slot, got {h1.get('x-ct-status')}"
+    assert h2.get("x-ct-status") == "HIT", \
+        ("en-GB must HIT the slot en-US filled, not re-fetch an identical body",
+         h2.get("x-ct-status"))
     assert origin.hits - base == 1, \
         ("en-US and en-GB should fold to one 'en' class -> one origin hit",
          origin.hits - base)
@@ -14314,9 +14333,9 @@ def test_auto_vary_language_absent_splits_from_class(ng: Nginx,
     would collide a present-but-empty header with an absent one)."""
     base = origin.hits
     p = "/av/langabsent?v=al"
-    s1, absent1, h1 = fetch(ng.port, p)  # no Accept-Language header at all
-    s2, absent2, h2 = fetch(ng.port, p)
-    s3, en1, h3 = fetch(ng.port, p, {"Accept-Language": "en-US,en;q=0.9"})
+    s1, absent1, _h1 = fetch(ng.port, p)  # no Accept-Language header at all
+    s2, absent2, _h2 = fetch(ng.port, p)
+    s3, en1, _h3 = fetch(ng.port, p, {"Accept-Language": "en-US,en;q=0.9"})
     assert s1 == 200 and s2 == 200 and s3 == 200, (s1, s2, s3)
     assert absent1 == absent2, ("absent header should share its own slot",
                                  absent1, absent2)
@@ -14357,9 +14376,9 @@ def test_auto_vary_origin_not_class_folded(ng: Nginx, origin: Origin) -> None:
     p = "/av/orgnofold?v=or"
     o1 = "https://a-one.example"
     o2 = "https://a-two.example"
-    s1, b1, h1 = fetch(ng.port, p, {"Origin": o1})
-    s2, b2, h2 = fetch(ng.port, p, {"Origin": o1})
-    s3, b3, h3 = fetch(ng.port, p, {"Origin": o2})
+    s1, b1, _h1 = fetch(ng.port, p, {"Origin": o1})
+    s2, b2, _h2 = fetch(ng.port, p, {"Origin": o1})
+    s3, b3, _h3 = fetch(ng.port, p, {"Origin": o2})
     assert s1 == 200 and s2 == 200 and s3 == 200, (s1, s2, s3)
     assert b1 == b2, ("same Origin should share a slot", b1, b2)
     assert b1 != b3, (
@@ -14879,7 +14898,7 @@ def test_l2_backend_inheritance_child_redis_over_parent_memcached(
     redis.cli("DEL", r_key)
     mc.command(b"delete " + m_key.encode() + b"\r\n")
 
-    s, body, h = fetch(ng.port, uri)               # miss -> origin -> store
+    s, _body, h = fetch(ng.port, uri)               # miss -> origin -> store
     assert s == 200, f"child store status {s}"
     assert "x-cache" not in h, "first request should be a miss"
 
@@ -15675,4 +15694,3 @@ if __name__ == "__main__":
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         raise
-

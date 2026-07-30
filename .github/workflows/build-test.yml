@@ -54,6 +54,25 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y cppcheck shellcheck
+          # ruff: pinned so a new release cannot add a rule to the selected
+          # tiers and land this job red on an unrelated PR.
+          pipx install 'ruff==0.15.20' || pip3 install --quiet --user \
+            --break-system-packages 'ruff==0.15.20'
+
+      - name: ruff (Python correctness tiers F,B,RUF059)
+        run: |
+          set -euo pipefail
+          # ci/tools/test_runtime.py IS the runtime suite (~15.6k lines) and
+          # went unlinted until 2026-07-31. RUF059 (unused-unpacked-variable)
+          # is the reason this gate exists: a captured-then-never-read variable
+          # is the tell for the vacuous-assertion class that produced a test
+          # whose only surviving assertion was satisfied by BOTH the pass and
+          # the fail state. Mirrors the ruff hook in .pre-commit-config.yaml --
+          # move both together.
+          #
+          # Style tiers (PT018, E501) are deliberately excluded: 257 findings
+          # would land this red on arrival and train --no-verify.
+          ruff check --select F,B,RUF059 ci/
 
       - name: Validate scripts and source
         run: |
