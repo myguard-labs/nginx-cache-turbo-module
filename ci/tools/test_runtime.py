@@ -1271,23 +1271,23 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
         location /brkil2on/ {{
             cache_turbo                    brkil2z;
             cache_turbo_key                $uri;
-            # LONG valid on purpose. The L1 copy is removed by EVICTION (the
-            # tiny brkil2z zone), NOT by expiry, so the entry must still be
-            # inside its freshness window when the fallback runs -- otherwise
-            # the L2 blob has expired too and there is nothing left to arm
-            # from. Measured with valid 1s: the brkil2:* keys drop from 174
-            # to 13 across the wait, and the l2 delta then reads 0 for a
-            # reason that has nothing to do with gating.
             # valid 1s + keep_stale 300s. The entry is past its x4 stale
             # window within ~4s (so rem_stale <= 0, which is the L2 arming
             # site's precondition -- module.c ~5203), while keep_stale
             # pushes the REDIS retention window out to 300s via sie_ttl
             # (retain_ttl = max(stale_window, sie_window), module.c ~7705)
-            # so the blob is still in L2 to be armed from. The tiny
-            # brkil2z zone evicts the L1 copy so the L1 site cannot claim
-            # the arming first.
+            # so the blob is still in L2 to be armed from.
+            #
+            # `cache_turbo_purge on` is what makes the L1 copy ABSENT rather
+            # than merely expired -- the test PURGEs both keys and rewrites
+            # the blob back into Redis (PURGE is L2-aware and DELs the key
+            # too, module.c ~1711, so the order matters). Eviction via a
+            # filler loop was tried and rejected: brkil2z eviction is LRU and
+            # left the OFF key resident, which is exactly what made the OFF
+            # half of the test vacuous for three sessions.
             cache_turbo_valid               1s;
             cache_turbo_keep_stale        300s;
+            cache_turbo_purge               on;
             cache_turbo_breaker             on;
             cache_turbo_breaker_threshold   1;
             cache_turbo_breaker_window     60s;
@@ -1302,6 +1302,7 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             cache_turbo_key                $uri;
             cache_turbo_valid               1s;   # see /brkil2on/
             cache_turbo_keep_stale        300s;
+            cache_turbo_purge               on;   # see /brkil2on/
             cache_turbo_breaker            off;
             cache_turbo_breaker_threshold   1;
             cache_turbo_breaker_window     60s;
@@ -7096,55 +7097,96 @@ def test_breaker_l2_arming_site_gated_white_box(ng: Nginx, origin: Origin,
 
       1. **A separate counter.** The header reports `l1=<n>,l2=<n>` and this
          test asserts on `l2`. Against a single shared total the L1 site
-         supplies the bump and the assertion passes with the L2 gate broken --
-         measured: the L2 mutation was applied, rebuilt, and the test PASSED.
-      2. **`rem_stale <= 0` with the blob still in Redis.** `valid 1s` puts the
-         entry past its x4 stale window within ~4s (the site's precondition),
-         while `keep_stale 300s` pushes the L2 RETENTION window out via
-         `sie_ttl` -- retention is `max(stale_window, sie_window)` -- so the
-         object is still there to arm from. With `valid 300s` instead the entry
-         is a plain fresh HIT and the origin is never contacted; with no
-         `keep_stale` the Redis keys expire alongside the stale window and the
-         l2 delta reads 0 for a reason unrelated to gating.
-      3. **L1 evicted.** The 64k `brkil2z` zone plus the filler loop below
-         removes the L1 copy, so the L1 site cannot claim the arming first.
+         supplies the bump and the assertion would pass with the L2 gate broken
+         -- measured on an earlier shared-counter version of this test.
+      2. **`rem_stale <= 0` with the blob still in Redis.** The blob is aged in
+         place (`created` rewritten, i64 @24) so `age > stale_ttl` and the L2
+         branch's `rem_stale <= 0` precondition holds immediately, with no
+         sleep. `keep_stale 300s` leaves `sie_ttl` wide, so the aged blob still
+         carries a serve-on-error window and the fallback has something to arm.
+      3. **L1 ABSENT, not expired.** This is the part three earlier fixture
+         attempts got wrong. While an L1 copy exists AND its stamped `sie_ttl`
+         window is open, the L1 SIE arm (module.c ~5122) runs BEFORE the L2 GET
+         and the request is served STALE-IF-ERROR without ever entering the
+         `rem_stale <= 0` branch -- so `l2` stays 0 whether the gate is right or
+         wrong. And the L1 SIE window cannot be closed independently: the same
+         `sie_window` feeds both `bhw.sie_ttl` (~7681) and the L2 key's
+         `retain_ttl = max(stale_window, sie_window)` (~7695), and the blob is
+         stamped once at store time, so "L2 object alive" and "L1 SIE window
+         open" are the SAME condition by construction. No valid/keep_stale/
+         stale_mult combination separates them -- do not look for one.
+         The escape is to remove L1 entirely: `cache_turbo_purge on` on both
+         locations, PURGE each key, then rewrite the (aged) blob back into
+         Redis. PURGE is L2-aware and DELs the Redis key too (module.c ~1711),
+         so the rewrite MUST come after the purge -- same ordering constraint as
+         /sfgu/. LRU eviction via a filler loop was tried and rejected: it left
+         the OFF key resident and is what made this half vacuous.
 
     The fixture serves 200 STALE-IF-ERROR / STALE-BREAKER rather than an error,
     so the STATUS is not the oracle here -- the per-site counter is. Both
     claims are therefore deltas on `l2`:
 
-      1. breaker ON  => the l2 counter MOVES (measured: l1=0, l2=2)
+      1. breaker ON  => the l2 counter MOVES
       2. breaker OFF => the l2 counter does NOT move
 
-    ⚠ SCOPE, stated plainly: only claim 1 is real today. Claim 2 currently
-    holds for the wrong reason -- the OFF request is served STALE-IF-ERROR from
-    L1 and never reaches the L2 branch at all, so its counter cannot move
-    whether the gate is right or wrong. Verified by mutation: with the L2 gate
-    reduced to a bare `breaker_threshold > 0`, this test still passes. The
-    assertion carries a full note at the call site; do not read a green run
-    here as "the L2 arming site is gated".
+    ⚠ A SECOND defect had to be fixed before claim 2 could fail at all, and it
+    was in the module, not the fixture: `sie_rewrite()` (module.c ~6814)
+    ngx_list_init()s `headers_out.headers` to make the snapshot's headers
+    authoritative, which WIPES the arming header the header filter already
+    stamped. Every STALE-IF-ERROR response therefore carried the snapshot's
+    stored counter (0) while the live zone counter had moved -- measured: the
+    filter logged l2=3 and l2=4 for the two /brkil2off/ requests while the
+    client received `l1=0,l2=0`. The OFF fixture is served exactly that way, so
+    the oracle read 0 no matter what the gate did. `sie_rewrite()` now re-stamps
+    the header after restore_response. Anything else asserting on a counter
+    header off a STALE-IF-ERROR response has the same exposure.
+
+    Both halves are real controls. Mutation-verified: reducing the L2 arming
+    gate (module.c ~5227) from `breaker_should_consult(clcf)` to a bare
+    `clcf->breaker_threshold > 0` makes the claim-2 assertion FAIL
+    ("breaker OFF armed 1 time(s) at the L2 arming call site"), and reverting it
+    makes the test pass again.
     """
     base = {}
+    blobs = {}
     for path in ("/brkil2on/dead", "/brkil2off/dead"):
         s0, b0, h0 = fetch(ng.port, path)
         assert s0 == 200, f"prime failed for {path}: {s0}"
         assert b0, f"prime returned an empty body for {path}"
         base[path] = _armings(h0, f"prime {path}", site="l2")
 
-    # Evict the L1 copies of BOTH primed keys. The zone is shared, but eviction
-    # is LRU -- a filler loop only pushes out entries OLDER than the filler, so
-    # priming /brkil2off/dead and then filling would leave it resident while
-    # /brkil2on/dead went. It would then be served STALE-IF-ERROR from its L1
-    # snapshot and never enter the L2 `rem_stale <= 0` branch at all, so the
-    # OFF half of this test would measure nothing and pass with the L2 gate
-    # broken. (That is not hypothetical: it is what the first version of this
-    # test did, and the L2 mutation passed it.) Both keys are primed above,
-    # before this loop, so both are older than every filler entry.
-    for i in range(400):
-        fetch(ng.port, f"/brkil2on/filler-{i}")
-        fetch(ng.port, f"/brkil2off/filler-{i}")
+        key = l2_key(path, prefix="brkil2:")
+        assert wait_for(lambda k=key: redis.cli("EXISTS", k) == "1"), \
+            f"{path} never reached L2 -- nothing to arm the L2 site from"
+        blob = redis.get_raw(key)
+        assert blob is not None and len(blob) >= 44, \
+            f"short/absent L2 blob for {path}: {blob!r}"
+        fresh_ttl, stale_ttl, sie_ttl = struct.unpack("<III", blob[32:44])
+        assert sie_ttl > 60, (
+            f"{path} fixture drifted: sie_ttl={sie_ttl}, expected > 60 from "
+            f"keep_stale 300s. Without a wide sie window the aged blob has no "
+            f"serve-on-error window and the breaker fallback arms nothing, "
+            f"making claim 1 fail for a reason unrelated to gating.")
+        blobs[path] = (key, blob, stale_ttl)
 
-    time.sleep(4.3)   # past fresh (1s) AND the x4 stale window: rem_stale <= 0
+    # Make L1 ABSENT and leave L2 PRESENT-but-past-its-window. See condition 3
+    # in the docstring: expiring L1 is not enough, because the L1 SIE arm
+    # short-circuits the L2 GET, and the SIE window cannot be narrowed without
+    # also dropping the L2 object. PURGE removes L1 outright; because PURGE is
+    # L2-aware the Redis key goes with it, so the aged blob is written back
+    # AFTERWARDS -- order matters, reversing it deletes the object under test.
+    for path, (key, blob, stale_ttl) in blobs.items():
+        s_p, b_p, _ = fetch_raw(ng.port, path, method="PURGE")
+        assert s_p == 200, f"PURGE {path} -> {s_p}: {b_p}"
+        aged = (blob[:24]
+                + struct.pack("<q", int(time.time()) - (int(stale_ttl) + 60))
+                + blob[32:])
+        redis.set_raw(key, aged, 3_600_000)
+        # PROVE the L2 blob survived the L1 drop. If it did not, both claims
+        # would read l2 == 0 and claim 2 would be vacuous again.
+        assert redis.get_raw(key) == aged, \
+            f"aged L2 blob for {path} did not land in Redis"
+
     origin.fail = True
     try:
         # --- claim 1: breaker ON arms from L2, so the l2 counter must move ---
@@ -7160,47 +7202,44 @@ def test_breaker_l2_arming_site_gated_white_box(ng: Nginx, origin: Origin,
         assert armed_on > 0, (
             "breaker ON armed nothing at the L2 call site (l2 counter delta 0). "
             "Either the fallback came from L1 rather than L2 -- check that the "
-            "filler loop above still evicts from brkil2z -- or the L2 blob had "
+            "PURGE above still drops the L1 copy -- or the aged L2 blob had "
             "already left Redis, or the site no longer bumps its counter. The "
             "'breaker OFF arms nothing' assertion below would be vacuous in "
             "every one of those cases, so fail here instead")
 
         # --- claim 2: breaker OFF must arm nothing at the L2 site ------------
+        # This IS a control: /brkil2off/dead has no L1 copy (purged above) and a
+        # live-but-past-window L2 blob, so the request DOES enter the
+        # `rem_stale <= 0` branch where the L2 arming site lives. The only
+        # reason `l2` must not move is `breaker_should_consult()` returning
+        # false for `cache_turbo_breaker off`. Mutation-verified: reduce that
+        # gate to a bare `clcf->breaker_threshold > 0` and this assertion fails.
+        #
         # ⚠ The baseline is read from a /brkil2off/ RESPONSE, not carried over
-        # from h_on. brkil2z is deliberately tiny (64k) and the filler loop
-        # above runs it hard; a counter read on one request is not a safe
-        # baseline for a later one. Reading it off the first OFF response and
-        # differencing against the second keeps both samples inside the window
-        # being measured -- differencing across the ON phase produced a
-        # NEGATIVE delta, which is how this was found.
+        # from h_on: differencing across the ON phase produced a NEGATIVE delta
+        # (brkil2z is small and shared), which is how that was found.
+        #
+        # ⚠ The L1 copy is RE-DROPPED between the two samples. The first OFF
+        # request restores the L2 blob into L1 (the `rem_stale <= 0` branch both
+        # serves and stores), so without this the MEASURED request would find an
+        # L1 copy and never re-enter the L2 branch -- the same short-circuit that
+        # made this half vacuous before. The re-drop is what keeps the measured
+        # request on the branch under test.
         _, _, h_off0 = fetch(ng.port, "/brkil2off/dead")
         before_off = _armings(h_off0, "breaker OFF baseline", site="l2")
+        okey, oblob, ostale = blobs["/brkil2off/dead"]
+        s_p2, b_p2, _ = fetch_raw(ng.port, "/brkil2off/dead", method="PURGE")
+        assert s_p2 == 200, f"re-PURGE /brkil2off/dead -> {s_p2}: {b_p2}"
+        oaged = (oblob[:24]
+                 + struct.pack("<q", int(time.time()) - (int(ostale) + 60))
+                 + oblob[32:])
+        redis.set_raw(okey, oaged, 3_600_000)
+        assert redis.get_raw(okey) == oaged, \
+            "aged L2 blob for /brkil2off/dead did not survive the re-drop"
         _, _, h_off = fetch(ng.port, "/brkil2off/dead")
         armed_off = _armings(h_off, "breaker OFF L2 error",
                              site="l2") - before_off
 
-        # ⚠⚠ THIS HALF IS NOT YET A CONTROL -- do not read a pass as coverage.
-        #
-        # On the OFF location the request is served STALE-IF-ERROR from its L1
-        # snapshot: the L1 block (which arms SIE, module.c ~5122) runs BEFORE
-        # the L2 GET, so the request never enters the `rem_stale <= 0` branch
-        # where the L2 arming site lives, and l2 stays 0 whether the gate is
-        # correct or not. Measured directly: with the L2 gate mutated to a bare
-        # `breaker_threshold > 0`, this test still PASSED.
-        #
-        # Three fixture attempts did not move it -- longer valid (entry becomes
-        # a plain fresh HIT, origin never contacted), keep_stale (retains the L2
-        # blob but is exactly what enables the SIE serve that short-circuits
-        # this), and driving the filler loop through both locations. The ON half
-        # above IS real: it reaches the L2 site and its l2 delta is attributable
-        # (l1=0,l2=2 measured), which is what the per-site counter split bought.
-        #
-        # So this assertion is currently a placeholder that happens to hold. It
-        # is left in place, and loudly annotated, rather than deleted, because
-        # the ON half is worth having now and the remaining work is fixture
-        # shape, not counter plumbing. Closing it needs an OFF fixture whose
-        # request reaches the L2 branch -- i.e. no serveable L1 copy AND no SIE
-        # window -- while still retaining the L2 blob. See the O4.4-i row.
         assert armed_off == 0, (
             f"breaker OFF armed {armed_off} time(s) at the L2 arming call site "
             f"-- cache_turbo_breaker off must gate it through "
