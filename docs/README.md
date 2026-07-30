@@ -298,7 +298,7 @@ a bypass on it would bypass **100%** of requests. Independently, `send_headers()
 anyway. It is also commonly installed in a subdirectory, which breaks position-0
 prefix matching. Three independent failures.
 
-**PrestaShop.** The cookie name is `PrestaShop-<md5(version + name + domain)>` —
+**[PrestaShop](prestashop.md).** The cookie name is `PrestaShop-<md5(version + name + domain)>` —
 per-install *and* it changes on every minor upgrade — and auth state lives **inside
 that cookie's encrypted value**, invisible to a presence matcher. Its cart/account
 paths are operator- and language-editable via a database `meta` table (`/panier`,
@@ -360,7 +360,7 @@ serves one user's page to another, there is no preset.**
 > Being able to *match* a cookie is not the same as being able to *tell users
 > apart*. That is why [`joomla`](joomla.md) still carries the ‡ warning.
 
-**Grav, Craft, October, Statamic.** All four die on the cookie, in the two ways this
+**[Grav](grav.md), [Craft](craft.md), October, Statamic.** All four die on the cookie, in the two ways this
 page keeps repeating. *Guest-issued*: Craft's `CraftSessionId` and October's
 `october_session` are perfectly stable literals handed to **every** anonymous
 visitor (Craft's own issue tracker: *"the cookie is being set for any user visiting
@@ -369,7 +369,7 @@ the site, even if they're not logged in"*). *Per-install*: Grav's session cookie
 is per-install *and* set for every guest. Grav is the painful one: flat-file traffic
 is the ideal shape for a page cache, and it still cannot be expressed.
 
-**NodeBB.** Its only session cookie, `express.sid` (config-renameable via
+**[NodeBB](nodebb.md).** Its only session cookie, `express.sid` (config-renameable via
 `sessionKey`), is issued to every visitor — guest and member alike — with an
 opaque, session-store-backed value carrying no guest/member marker (auth state
 lives server-side against Redis/Mongo, not in the cookie). NodeBB's own GitHub
