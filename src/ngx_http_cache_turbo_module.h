@@ -1004,6 +1004,24 @@ typedef struct {
                                                     * reload INHERITS it with
                                                     * the rest of the shm     */
     ngx_atomic_t             breaker_opens;        /* lifetime CLOSED→OPEN     */
+
+    /* S7.1: production observability counters (NOT TEST_FAULTS-gated -- these
+     * are permanent operator-facing fields, unlike the O4.4-i arming counters
+     * below). Each counts SERVES -- responses actually delivered that way --
+     * not arm/consult events; see the bump-site comments for why each site
+     * was chosen over other plausible ones.
+     *
+     *   sie_serves      -- responses served from a stale-if-error snapshot
+     *                      (ngx_http_cache_turbo_sie_rewrite() succeeding).
+     *   breaker_serves  -- responses served from the breaker's armed fallback
+     *                      while OPEN (the STALE-BREAKER serve, both the
+     *                      only-if-cached and pre-origin-gate sites).
+     *   origin_failures -- origin responses that fed the breaker as a
+     *                      failure (ngx_http_cache_turbo_breaker_is_origin_failure()
+     *                      true at the same site _breaker_record() is called). */
+    ngx_atomic_t             sie_serves;
+    ngx_atomic_t             breaker_serves;
+    ngx_atomic_t             origin_failures;
 #if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
     && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
     /* O4.4-i: lifetime count of breaker-fallback ARMINGS, bumped inside the
@@ -1109,6 +1127,11 @@ typedef struct {
      * raw -- the stats op must never call _breaker_state(), which transitions. */
     ngx_atomic_uint_t   breaker_state;
     ngx_atomic_uint_t   breaker_opens;
+    /* S7.1: production serve/failure counters. See the shctx field block for
+     * exact semantics of each. */
+    ngx_atomic_uint_t   sie_serves;
+    ngx_atomic_uint_t   breaker_serves;
+    ngx_atomic_uint_t   origin_failures;
 } ngx_http_cache_turbo_stats_t;
 
 

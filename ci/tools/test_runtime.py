@@ -1225,6 +1225,15 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             deny all;
         }}
 
+        # S7.1: admin endpoint for /s71brk/'s private zone (s71z). Same
+        # reasoning as /_cache_l2neg above -- /_cache reports `main`, which
+        # never sees this zone's breaker_serves/origin_failures counters.
+        location = /_cache_s71 {{
+            cache_turbo_admin    s71z;
+            allow 127.0.0.1;
+            deny all;
+        }}
+
         # SUITE-1: same pairing for the long-memo outage location. A zone
         # without its own admin endpoint cannot be measured at all.
         location = /_cache_l2negout {{
@@ -1527,6 +1536,16 @@ http {{
     # matching an unrelated fixture's numbers instead of on the two injected
     # locations agreeing with each other.
     cache_turbo_zone name=brkpolz 16m;
+    # S7.1: private zone for the breaker_serves/origin_failures counter tests.
+    # Its OWN zone, not `brkiz` or `main` -- both already carry breaker trips
+    # from other tests by the time these run, and a delta-based assertion
+    # needs a breaker that starts CLOSED so the "tripping request reaches the
+    # dead origin, the NEXT one is the counted breaker_serves" sequencing
+    # (same two-fetch shape as test_breaker_arming_gated_on_breaker_enable) is
+    # unambiguous. Its own admin endpoint (/_cache_s71) for the same reason
+    # l2negz needed /_cache_l2neg: /_cache is bound to `main` and would read a
+    # counter this zone never writes.
+    cache_turbo_zone name=s71z 16m;
     # SUITE-1: private zone for /l2neg/. l2_neg_skips is PER-ZONE
     # (z->sh->l2_neg_skips, module.c:4832), and the outage test asserts a delta
     # of exactly 0 over one request, so any other location writing that counter
@@ -2165,6 +2184,22 @@ http {{
             cache_turbo_key                $uri;
             cache_turbo_valid               1s;
             cache_turbo_breaker            off;
+            cache_turbo_breaker_threshold   1;
+            cache_turbo_breaker_window     60s;
+            cache_turbo_breaker_open       30s;
+            cache_turbo_lock_timeout        2s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # S7.1: breaker_serves / origin_failures counter coverage. Same shape
+        # as /breakeron/ (1s fresh, x4=4s stale, threshold=1) but on its own
+        # zone (s71z) so the admin JSON delta is not polluted by /breakeron/'s
+        # or /brkion/'s already-tripped breaker. Drives test_breaker_counters.
+        location /s71brk/ {{
+            cache_turbo                    s71z;
+            cache_turbo_key                $uri;
+            cache_turbo_valid               1s;
+            cache_turbo_breaker             on;
             cache_turbo_breaker_threshold   1;
             cache_turbo_breaker_window     60s;
             cache_turbo_breaker_open       30s;
@@ -7088,6 +7123,59 @@ def test_breaker_arming_gated_on_breaker_enable(ng: Nginx, origin: Origin) -> No
         drain_origin(origin)
 
 
+def test_breaker_counters(ng: Nginx, origin: Origin) -> None:
+    """S7.1: breaker_serves counts responses actually delivered from the
+    breaker's armed fallback (STALE-BREAKER), and origin_failures counts
+    origin responses recorded as a failure by the breaker -- not every
+    request through a breaker-enabled location.
+
+    Same two-fetch trip sequence as test_breaker_arming_gated_on_breaker_enable
+    (threshold=1, so the FIRST dead-origin request trips CLOSED->OPEN and
+    still surfaces the raw origin failure itself; the SECOND finds the
+    breaker OPEN and is served the fallback), but on the private s71z zone
+    with its own admin endpoint so the deltas cannot be polluted by
+    /breakeron/ or /brkion/, which have already tripped their own breakers by
+    the time this runs in run_all()'s ordering.
+
+    origin_failures must move on the FIRST (tripping) fetch -- that is the
+    request whose 5xx status actually reaches ngx_http_cache_turbo_breaker_is_
+    origin_failure() and feeds _breaker_record(). breaker_serves must NOT
+    move on that fetch (nothing is armed/served from the breaker yet -- the
+    origin's own error passes through) and MUST move on the second."""
+    s0, b0, _ = fetch(ng.port, "/s71brk/dead")
+    assert s0 == 200 and b0, f"prime failed: {s0} {b0!r}"
+
+    time.sleep(4.3)   # past fresh (1s) AND the x4 stale window (4s): L1-expired
+    origin.fail = True
+    try:
+        of_before = _admin_stat(ng, "origin_failures", "/_cache_s71")
+        bs_before = _admin_stat(ng, "breaker_serves", "/_cache_s71")
+
+        s_trip, _, _ = fetch(ng.port, "/s71brk/dead")
+        assert s_trip != 200, \
+            (f"tripping request was answered 200 -- expected it to reach "
+             f"the dead origin and fail, got {s_trip}")
+
+        of_trip = _admin_stat(ng, "origin_failures", "/_cache_s71")
+        bs_trip = _admin_stat(ng, "breaker_serves", "/_cache_s71")
+        assert of_trip - of_before > 0, \
+            "origin_failures did not move on the origin failure that tripped the breaker"
+        assert bs_trip == bs_before, \
+            (f"breaker_serves moved on the TRIPPING request, which surfaces "
+             f"the raw origin error and serves nothing from the breaker -- "
+             f"{bs_before} -> {bs_trip}")
+
+        s_on, _, _ = fetch(ng.port, "/s71brk/dead")
+        assert s_on == 200, \
+            f"breaker OPEN did not fall back to the any-age snapshot, got {s_on}"
+
+        bs_after = _admin_stat(ng, "breaker_serves", "/_cache_s71")
+        assert bs_after - bs_trip > 0, \
+            "breaker_serves did not move on the STALE-BREAKER fallback serve"
+    finally:
+        origin.fail = False
+        drain_origin(origin)
+
 
 # Response-header names arrive lower-cased from fetch()'s dict.
 _ARMINGS_HDR = "x-cache-turbo-test-armings"
@@ -9453,6 +9541,55 @@ def test_sie_serve_on_error(ng: Nginx, origin: Origin) -> None:
         drain_origin(origin)
 
 
+def test_sie_serves_counter(ng: Nginx, origin: Origin) -> None:
+    """S7.1: sie_serves counts responses actually served from a stale-if-error
+    snapshot -- ngx_http_cache_turbo_sie_rewrite() winning inside the header
+    filter -- not every armed-SIE request or every 5xx origin response.
+
+    Same fixture shape as test_sie_serve_on_error (a fully expired /sieserve/
+    entry whose response carried stale-if-error=30, replayed with
+    X-Cache: STALE-IF-ERROR when the origin then 5xxs), but reads the admin
+    counter delta around the exact triggering fetch instead of only checking
+    the header.
+
+    Negative control (mandatory): the sibling /sieserve/plain-* key carries no
+    stale-if-error window, so the same expired-origin-5xx sequence surfaces
+    the origin's 503 directly (proven by test_sie_serve_on_error) instead of
+    taking the sie_rewrite() path -- sie_serves must NOT move for it, proving
+    the counter is pinned to the rewrite succeeding, not to "any 5xx on an
+    expired SIE-eligible location"."""
+    s0, b0, _ = fetch(ng.port, "/sieserve/sieserve-cnt-pos")
+    assert s0 == 200 and b0, f"prime failed: {s0} {b0!r}"
+    sn0, bn0, _ = fetch(ng.port, "/sieserve/plain-cnt-neg")
+    assert sn0 == 200 and bn0, f"control prime failed: {sn0} {bn0!r}"
+
+    time.sleep(4.6)     # past fresh (1s) AND the stale window (x4 = 4s): expired
+    origin.fail = True
+    try:
+        before = _admin_stat(ng, "sie_serves")
+
+        s, b, h = fetch(ng.port, "/sieserve/sieserve-cnt-pos")
+        assert s == 200, f"SIE serve-on-error returned {s}, expected stale 200"
+        assert h.get("x-cache") == "STALE-IF-ERROR", \
+            f"expected STALE-IF-ERROR, got x-cache={h.get('x-cache')}"
+        after_pos = _admin_stat(ng, "sie_serves")
+        assert after_pos - before > 0, \
+            "sie_serves did not move on an actual SIE serve-on-error"
+
+        # Negative control: no SIE window on this key -> 503 surfaced directly,
+        # no sie_rewrite() call, counter must stay put.
+        sc, _, hc = fetch(ng.port, "/sieserve/plain-cnt-neg")
+        assert sc == 503, f"no-SIE expired entry served {sc}, expected origin 503"
+        assert hc.get("x-cache") != "STALE-IF-ERROR"
+        after_neg = _admin_stat(ng, "sie_serves")
+        assert after_neg == after_pos, \
+            ("sie_serves moved on a plain 503 with no armed SIE snapshot -- "
+             f"{after_pos} -> {after_neg}")
+    finally:
+        origin.fail = False
+        drain_origin(origin)
+
+
 def test_sie_origin_recovers_serves_fresh(ng: Nginx, origin: Origin) -> None:
     """RFC-2 serve-on-error must NOT hijack a SUCCESSFUL revalidation: when the
     expired entry's origin comes back 200, the client gets the FRESH new body and
@@ -9949,6 +10086,21 @@ def _admin_lock_waits(ng: Nginx) -> int:
     import json
     _, b, _ = fetch(ng.port, "/_cache")
     return int(json.loads(b).get("lock_waits", 0))
+
+
+def _admin_stat(ng: Nginx, name: str, path: str = "/_cache") -> int:
+    """S7.1: read one named counter off an admin JSON endpoint (default
+    /_cache, zone `main`; pass path= for a private-zone endpoint like
+    /_cache_s71). Generic sibling of _admin_lock_waits, used for the new
+    sie_serves / breaker_serves / origin_failures fields so each test does
+    not restate its own json.loads. A missing key reads 0 via .get(),
+    matching the field's "not yet exercised" state -- the tests below never
+    assert a bare presence check, only that a delta MOVES, so a build without
+    the field would show a 0 delta and fail loudly rather than silently
+    pass."""
+    import json
+    _, b, _ = fetch(ng.port, path)
+    return int(json.loads(b).get(name, 0))
 
 
 def test_cold_single_flight(ng: Nginx, origin: Origin) -> None:
@@ -14062,6 +14214,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_breaker_policy_identical_no_warning(ng)              # O4.4-d
     test_breaker_open_zero_rejected(ng)                      # O4.4 / O4.3-a
     test_breaker_arming_gated_on_breaker_enable(ng, origin)  # O4.4
+    test_breaker_counters(ng, origin)                        # S7.1 breaker_serves/origin_failures
     test_breaker_arming_sites_gated_white_box(ng, origin)    # O4.4-i (L1)
     if redis is not None:
         # O4.4-i (L2). Needs a real Redis: without an L2 backend the L2 arming
@@ -14187,6 +14340,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_stale_if_error(ng, origin)
     test_stale_serves_stale_origin_hard_dead(ng, origin)
     test_sie_serve_on_error(ng, origin)                     # RFC-2 CTB4 serve-on-error
+    test_sie_serves_counter(ng, origin)                     # S7.1 sie_serves counter
     test_sie_origin_recovers_serves_fresh(ng, origin)       # RFC-2 success not hijacked
     test_keep_stale_serves_dead_origin(ng, origin)          # S2.2 keep_stale fallback
     test_keep_stale_loses_to_response_sie(ng, origin)       # S2.2 / D-1 precedence
