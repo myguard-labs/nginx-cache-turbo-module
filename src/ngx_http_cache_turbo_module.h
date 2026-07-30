@@ -1354,8 +1354,10 @@ typedef struct {
      * that) and leave it off unless L2 misses dominate the miss path. */
     time_t                   l2_negative_ttl;
 
-    /* cache_turbo_keep_stale <off|time|forever> (S2.1). Parser-only for now --
-     * NOT read on any request path yet (that lands in S2.2). 0 = OFF (the
+    /* cache_turbo_keep_stale <off|time|forever> (S2.1; read side wired in
+     * S2.2). Consulted on the store path, where it widens sie_window -- see
+     * the `ttl > 0 && clcf->keep_stale > 0` and
+     * `ttl > 0 && clcf->ignore_cc && clcf->keep_stale > 0` gates. 0 = OFF (the
      * default, today's behaviour unchanged); NGX_HTTP_CACHE_TURBO_FOREVER_TTL
      * for the `forever` keyword; otherwise the parsed+clamped seconds value.
      * Deliberately NOT a synonym for cache_turbo_valid's "0 = forever"
