@@ -1225,15 +1225,6 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             deny all;
         }}
 
-        # S7.1: admin endpoint for /s71brk/'s private zone (s71z). Same
-        # reasoning as /_cache_l2neg above -- /_cache reports `main`, which
-        # never sees this zone's breaker_serves/origin_failures counters.
-        location = /_cache_s71 {{
-            cache_turbo_admin    s71z;
-            allow 127.0.0.1;
-            deny all;
-        }}
-
         # SUITE-1: same pairing for the long-memo outage location. A zone
         # without its own admin endpoint cannot be measured at all.
         location = /_cache_l2negout {{
@@ -2267,6 +2258,16 @@ http {{
             cache_turbo_breaker_open       30s;
             cache_turbo_lock_timeout        2s;
             proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # S7.1: admin endpoint for /s71brk/'s private zone (s71z). This must NOT
+        # sit in the redis-gated block because it carries no cache_turbo_redis
+        # directive -- placing it here alongside /s71brk/ ensures it exists even
+        # when Redis is unavailable, so test_breaker_counters can query the counters.
+        location = /_cache_s71 {{
+            cache_turbo_admin    s71z;
+            allow 127.0.0.1;
+            deny all;
         }}
 
         # Negative control for /keepstale/: identical location, keep_stale off
