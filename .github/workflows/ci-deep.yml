@@ -9,7 +9,7 @@ name: CI Deep
 # Jobs: fuzz (up to 14400s/target × 4) · legacy-runtime (pre-1.23 ABI) ·
 #       clang-analyze (full-source path-flow) · memcheck soak · helgrind soak ·
 #       asan-soak (ASan multi-worker fault-injection ×N — flake repetition) ·
-#       scanners.
+#       scanners · coverage (gcov report — a REPORT, never a gate).
 #   * memcheck AND helgrind run under ci/tools/soak.sh, which passes
 #     --suppressions=ci/tools/valgrind.supp for BOTH, and --error-exitcode=99 for
 #     helgrind — the drift-fix baseline for every module.
@@ -505,3 +505,100 @@ jobs:
             ${{ github.workspace }}/clang-tidy.log
             ${{ github.workspace }}/semgrep.log
           retention-days: 14
+
+  coverage:
+    # gcov line+branch coverage of the module's own sources.
+    #
+    # ci/tools/coverage.sh has existed since the coverage work landed but NO
+    # workflow ever invoked it, so the repo had a coverage tool and zero
+    # coverage visibility — a report nobody ran. This job is what runs it.
+    #
+    # Deliberately a REPORT, not a gate: COVERAGE_FAIL_UNDER is left unset, per
+    # the repo policy of meaningful tests over a percentage threshold (see
+    # feedback-coverage-badge-vs-test-integrity — a % gate invites tests written
+    # to move the number rather than to catch bugs). The artifact is what the
+    # next session reads to pick the NEXT uncovered path worth a real test.
+    #
+    # Lives in ci-deep (schedule + dispatch) rather than on the PR gate because
+    # it is a full instrumented build plus the complete runtime suite (redis +
+    # memcached + fault injection) at -O0 — far too slow for the per-PR path,
+    # and its output is a trend to read, not a green/red signal to block on.
+    name: Coverage (gcov report)
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02"]') }}
+    timeout-minutes: 60
+    steps:
+      - name: Checkout module
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - name: Install build and runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential ccache curl eatmydata gcovr \
+            libpcre2-dev libssl-dev mold redis-server memcached zlib1g-dev
+
+      - name: Restore build caches
+        uses: ./.github/actions/build-cache
+        with:
+          mode: coverage
+          nginx-version: ${{ env.NGINX_VERSION }}
+
+      - name: Sweep stale test listeners
+        run: |
+          command -v fuser >/dev/null || sudo apt-get install -y psmisc
+          for p in $(seq 18870 18999); do
+            fuser -k -TERM "${p}/tcp" 2>/dev/null || true
+          done
+          sleep 1
+
+      - name: Build instrumented, run suite, report
+        # coverage.sh drives all three steps (ci-build.sh coverage -> runtime
+        # suite -> gcovr). The instrumented build is -O0 and the suite seeds
+        # real bodies, so the per-test timeout needs the same headroom the
+        # script's own default gives it.
+        env:
+          TEST_NGINX_TIMEOUT: "30"
+        run: bash ci/tools/coverage.sh nginx "$NGINX_VERSION"
+
+      - name: Coverage summary to job log
+        if: always()
+        run: |
+          # The percentages in the step log make the trend readable without
+          # downloading the artifact.
+          if [ -f coverage-report/coverage.txt ]; then
+            {
+              echo '### Module coverage'
+              echo '```'
+              tail -n 20 coverage-report/coverage.txt
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ -f coverage-report/unit/coverage.txt ]; then
+            {
+              echo '### swr/autotune unit coverage'
+              echo '```'
+              tail -n 20 coverage-report/unit/coverage.txt
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: coverage-report
+          path: ${{ github.workspace }}/coverage-report
+          retention-days: 14
+
+      - name: Notify Discord on failure
+        if: failure() && github.event_name == 'schedule'
+        env:
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_CHANNEL_BUILDS: ${{ secrets.DISCORD_CHANNEL_BUILDS }}
+        run: |
+          [ -n "$DISCORD_BOT_TOKEN" ] || exit 0
+          curl -fsS -X POST -H "Authorization: Bot $DISCORD_BOT_TOKEN" \
+            -H "Content-Type: application/json" \
+            "https://discord.com/api/v10/channels/$DISCORD_CHANNEL_BUILDS/messages" \
+            -d "{\"content\":\"🔴 ${{ github.repository }} — CI Deep / coverage FAILED. ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" || true
