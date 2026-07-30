@@ -65,6 +65,33 @@
 #include <string.h>
 #include <time.h>
 
+/* H-1: the real nginx build derives NGX_PTR_SIZE from objs/ngx_auto_config.h,
+ * which this harness never sees -- test_shm_state.c used to leave the macro
+ * entirely undefined, so `#if (NGX_PTR_SIZE >= 8)` at the packed-probe layout
+ * select silently evaluated to 0 and every unit build compiled the 32-bit
+ * (20/12-bit) layout regardless of host width, while shipped x86-64 uses the
+ * 64-bit (32/32-bit) layout. `-Wundef` catches this ("not defined, evaluates
+ * to 0") but -Wundef is not in -Wall/-Wextra, so plain -Werror never did.
+ *
+ * Fix: define it here from the portable predefined `__SIZEOF_POINTER__`
+ * (the actual host pointer width in BYTES -- NGX_PTR_SIZE is 8 or 4 in real
+ * nginx, matching sizeof(void *), not a bit count), never a hardcoded 8 --
+ * hardcoding 8 would just move the same silent-wrong-layout bug from
+ * "undefined" to "wrong on a 32-bit host". Both the real header and this
+ * mirror now also #error outright if NGX_PTR_SIZE is somehow still
+ * undefined at the layout-select site, so this can never again pick a
+ * layout silently. */
+#define NGX_PTR_SIZE  __SIZEOF_POINTER__
+
+/* H-2/O4.4-j: this harness always builds the TEST_FAULTS-gated diagnostic
+ * paths (breaker_wedge_observed here; test_brk_armings is exercised by a
+ * different, black-box test instead and is not referenced by this file).
+ * Defined here, once, ahead of generated_shm.inc's #include, rather than as
+ * a Makefile -D so `make check`/`make run` need no flag threading and stay
+ * the single source of truth for "this harness always compiles the
+ * TEST_FAULTS arms". Production and package builds never define this. */
+#define NGX_HTTP_CACHE_TURBO_TEST_FAULTS  1
+
 /* --- core types (nginx ngx_config.h / ngx_core.h) --- */
 typedef intptr_t    ngx_int_t;
 typedef uintptr_t   ngx_uint_t;

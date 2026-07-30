@@ -77,12 +77,19 @@ jobs:
           bash ci/tools/lint-shm-lock.sh
           # Scan every source (CI-4): the explicit list previously omitted
           # src/ngx_http_cache_turbo_autotune.c. A glob keeps new sources covered.
+          # -DNGX_PTR_SIZE=8: the breaker probe-word layout selects on it and
+          # #errors when it is undefined (H-1 -- an undefined macro in #if
+          # silently evaluates to 0 and picked the wrong layout for the whole
+          # unit suite). It normally arrives from nginx's generated
+          # objs/ngx_auto_config.h, which cppcheck never sees here, so it has to
+          # be supplied. 8 matches every target this module builds for.
           cppcheck \
             --enable=warning,performance,portability \
             --error-exitcode=1 \
             --suppress=missingIncludeSystem \
             --suppress=normalCheckLevelMaxBranches \
             --suppress=unusedFunction \
+            -DNGX_PTR_SIZE=8 \
             src/*.c
           git diff --check
 

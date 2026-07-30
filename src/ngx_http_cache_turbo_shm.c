@@ -124,7 +124,15 @@ ngx_http_cache_turbo_shm_init_zone(ngx_shm_zone_t *shm_zone, void *data)
     ctx->sh->breaker_fails = 0;
     ctx->sh->breaker_window_start = 0;
     ctx->sh->breaker_opened_at = 0;
-    ctx->sh->breaker_probe_at = 0;
+    /* O4.4-h: the packed probe word. Generation 0 is NO_PROBE, so a zeroed word
+     * reads "no lease held" whatever the stamp bits say -- the fail-safe
+     * direction, and the reason the old `stamp != 0` guard is gone. */
+    ctx->sh->breaker_probe = 0;
+
+    /* O4.4-h: anchor for the probe word's RELATIVE stamp. Set once here; a
+     * reload deliberately inherits the live shm (see the field block), so it
+     * keeps the anchor an in-flight lease was stamped against. */
+    ctx->sh->breaker_epoch = (ngx_atomic_t) ngx_time();
     ctx->sh->breaker_opens = 0;
 
     ctx->shpool->log_nomem = 0;
@@ -1146,12 +1154,68 @@ ngx_http_cache_turbo_shm_l2_neg_set(ngx_http_cache_turbo_zone_t *z,
  * OPEN until that probe reports back through _record(). That is the property
  * that stops a thundering herd from all "probing" a still-dead origin at once.
  */
+/*
+ * O4.4-h: how long ago the lease carried by `probe_word` was stamped, in
+ * seconds. The stamp is RELATIVE to sh->breaker_epoch (see the packed-probe
+ * block in the header: an absolute epoch stamp does not fit beside a generation
+ * on a 32-bit ngx_atomic_t), so the age is the difference of two relative
+ * values and, like every other deadline test in this file, is written as
+ * `elapsed CMP duration` rather than `now CMP stamp + duration` -- O4.4-b.
+ *
+ * ⚠ The subtraction is MODULAR IN THE STAMP FIELD, and it must stay that way.
+ * Subtracting a masked stamp from a full-width `now - epoch` looks equivalent
+ * and is not: once the relative clock passes the field's range, a lease stamped
+ * moments ago reads as a whole field-width old and is reclaimed on the spot --
+ * on the 20-bit (32-bit atomic) layout that is roughly every twelve days, and
+ * it would be reached by an ordinary long-lived zone rather than by any attack.
+ * Masking both sides keeps the difference correct across a wrap, because the
+ * true age is always far smaller than the field.
+ *
+ * The age is therefore only meaningful for stamps younger than one field wrap,
+ * which the lease constant guarantees for any lease this function is asked
+ * about. Pinned by test_breaker_probe_age_is_modular().
+ *
+ * ⚠ H-3: `now` is nginx's cached wall clock (ngx_time()), which follows
+ * settimeofday()/NTP steps rather than a monotonic source. A BACKWARDS step
+ * to before sh->breaker_epoch makes `now - epoch` negative; cast to
+ * ngx_uint_t that wraps to near-UINT_MAX, which then masks to near-MASK --
+ * i.e. it reads as an almost-maximally-OLD lease and gets reclaimed while
+ * still live. This is the ORIGINAL O4.4-h failure mode, reintroduced by the
+ * very epoch anchor that fixed the other one.
+ *
+ * The fix clamps: when `now` precedes the epoch, the lease is reported as
+ * age 0 (brand new) rather than computing a meaningless negative-turned-huge
+ * age. That fails CLOSED -- a spuriously "young" reading only means one
+ * fewer reclaim opportunity until the clock catches back up, never an
+ * incorrect reclaim of a live lease. A monotonic clock source would remove
+ * the hazard at its root, but that is a module-wide change out of scope
+ * here. Pinned by test_breaker_backwards_clock_step_does_not_reclaim().
+ */
+static time_t
+ngx_http_cache_turbo_shm_brk_probe_age(ngx_http_cache_turbo_zone_t *z,
+    ngx_uint_t probe_word, time_t now)
+{
+    ngx_uint_t  rel, stamp;
+
+    if (now < (time_t) z->sh->breaker_epoch) {
+        return (time_t) 0;
+    }
+
+    rel   = ((ngx_uint_t) (now - (time_t) z->sh->breaker_epoch))
+            & NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_STAMP_MASK;
+    stamp = ngx_http_cache_turbo_brk_probe_stamp(probe_word);
+
+    return (time_t) ((rel - stamp)
+                     & NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_STAMP_MASK);
+}
+
+
 ngx_uint_t
 ngx_http_cache_turbo_shm_breaker_state(ngx_http_cache_turbo_zone_t *z,
     time_t open_for, ngx_uint_t *probe)
 {
     time_t      now;
-    ngx_uint_t  word, state;
+    ngx_uint_t  word, state, probe_word;
 
     /* O4.3: default to "no lease". Only the promotion CAS below overwrites
      * this, so every caller that is merely OBSERVING the breaker -- including
@@ -1171,6 +1235,12 @@ ngx_http_cache_turbo_shm_breaker_state(ngx_http_cache_turbo_zone_t *z,
     word  = (ngx_uint_t) z->sh->breaker_state;
     state = ngx_http_cache_turbo_brk_state(word);
 
+    /* O4.4-h: one load of the probe word, reused for BOTH the reclaim test
+     * below and, as the expected value, for the publication CAS on the
+     * promotion path. Re-reading it at either site would reintroduce a
+     * mispairing window. */
+    probe_word = (ngx_uint_t) z->sh->breaker_probe;
+
     now = ngx_time();
 
     /* ⚠ A caller that merely OBSERVES a HALF_OPEN installed by somebody else is
@@ -1184,7 +1254,7 @@ ngx_http_cache_turbo_shm_breaker_state(ngx_http_cache_turbo_zone_t *z,
      * The exception is a probe that never reported back (its request was
      * aborted, or its worker was killed between promotion and _record()).
      * Nothing would ever move the state again, so the breaker would wedge in
-     * HALF_OPEN forever. breaker_probe_at makes the promotion a time-bounded
+     * HALF_OPEN forever. breaker_probe makes the promotion a time-bounded
      * LEASE: once it has gone stale by BREAKER_PROBE_LEASE, the next caller
      * reclaims the probe slot with a CAS -- again a single winner.
      *
@@ -1198,23 +1268,80 @@ ngx_http_cache_turbo_shm_breaker_state(ngx_http_cache_turbo_zone_t *z,
      * breaker_threshold, not this -- see the merge note on breaker_open.) */
     if (state == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN) {
 
-        /* ⚠ O4.3-c: a lease whose stamp is not yet PUBLISHED is not stale, it
-         * is brand new. The promoting worker publishes HALF_OPEN and stamps
-         * breaker_probe_at as two stores, so a reader can land between them and
-         * see this HALF_OPEN paired with the previous lease's stamp -- which is
-         * necessarily older, and exactly 0 on the very first lease of a zeroed
-         * zone. Treating that as an abandoned lease reclaims a probe that is
-         * merely mid-publication and admits a SECOND concurrent probe, which is
-         * the herd this breaker exists to prevent.
+        /* ⚠ O4.4-h: a lease may only be reclaimed on a deadline that PROVABLY
+         * belongs to the generation this caller observed. The probe word is read
+         * ONCE into a local and carries its own generation, so the two halves of
+         * the test cannot come from different leases -- which is exactly the bug
+         * this replaced. Reading the field twice here reopens it.
          *
-         * A zero stamp therefore means "published moments ago, deadline not
-         * written yet" and must never satisfy the staleness test. Every real
-         * lease carries a non-zero ngx_time(), so this costs nothing outside
-         * the window it closes. Pinned by
-         * test_breaker_unpublished_lease_is_not_reclaimable(). */
+         * The predicate is deliberately three-part:
+         *
+         *   - generations MATCH: a probe word whose generation is BEHIND belongs
+         *     to a lease already superseded (stale mispairing -- the O4.4-h
+         *     race); one that runs AHEAD belongs to a promoter that published
+         *     its probe word and has not yet won the state CAS. Neither is an
+         *     abandoned lease, and both must be left alone.
+         *   - the stamp has aged past BREAKER_PROBE_LEASE (O4.4-a: that internal
+         *     constant, never open_for -- reclaiming on open_for tore the lease
+         *     out from under any probe slower than it, so a slow-but-healthy
+         *     origin could never close the breaker).
+         *   - the whole state word still CASes, so there is a single winner.
+         *
+         * ⚠ The explicit NO_PROBE test is NOT redundant with the equality test
+         * below it, and removing it reopens the zeroed-zone hole the old
+         * `stamp != 0` guard used to cover. A zone whose state word is a bare
+         * HALF_OPEN carries generation 0, and a zeroed probe word ALSO reads
+         * generation 0 -- so the two "match", the zero stamp reads as ancient,
+         * and the brand-new lease is reclaimed. Verified by mutation: dropping
+         * this line fails test_breaker_unpublished_lease_is_not_reclaimable().
+         * The generation equality alone is therefore necessary but not
+         * sufficient; NO_PROBE must be rejected on its own.
+         *
+         * ⚠⚠ H-2 (resolved -- O4.4-j): a generation MISMATCH (state gen N,
+         * probe gen != N, not NO_PROBE) is never reclaimed by this predicate,
+         * because the equality arm above requires an exact match before the
+         * age test even runs. Every caller reaching the `else` below with a
+         * mismatch returns OPEN -- so the fix is making that mismatch
+         * unreachable, not teaching this predicate to reclaim it (both tried
+         * directions there broke test_breaker_fresh_lease_not_reclaimable_
+         * via_old_stamp(), which correctly pins that a momentarily-mismatched
+         * FRESH generation must not be torn down on sight).
+         *
+         * Divergence was traced to exactly one reachable producer:
+         *   - The promotion path cannot produce it: `word` and `probe_word`
+         *     are loaded ONCE, together, above (see the comment there), and
+         *     `gen` is derived from that same snapshot. A promoter working
+         *     from a stale snapshot fails its publication CAS below and
+         *     writes nothing -- it cannot drive probe.gen backwards or publish
+         *     against a generation other than the one it observed.
+         *   - _breaker_record()'s three state writers (close, failed-probe,
+         *     trip) each write breaker_state alone and never bump the
+         *     generation, so none of them can produce a divergent pair either.
+         *   - The one real producer is ABA on the MASKED generation field: a
+         *     promoter parked between the publish CAS and the state CAS
+         *     across a full wrap of the masked generation finds its stale
+         *     expectation coincidentally matching again. That wrap is closed
+         *     by construction on the 64-bit (32-bit generation) layout and
+         *     the 32-bit-atomic layout is rejected at compile time rather
+         *     than shipped with a reachable wrap -- see the packed-probe
+         *     layout comment in the header for the wrap-period arithmetic
+         *     and why no other bit split fixes it.
+         * A wedge landing here despite that is therefore now itself the
+         * anomaly signal: see the else-branch counter below.
+         *
+         * Pinned by test_breaker_unpublished_lease_is_not_reclaimable() and
+         * test_breaker_fresh_lease_not_reclaimable_via_old_stamp().
+         *
+         * O4.4-a's open_for gate stays: with open_for == 0 there is no timed
+         * reopen, so no probe is ever promoted and there is no lease to
+         * reclaim. */
         if (open_for > 0
-            && z->sh->breaker_probe_at != 0
-            && now - (time_t) z->sh->breaker_probe_at
+            && ngx_http_cache_turbo_brk_probe_gen(probe_word)
+                   != NGX_HTTP_CACHE_TURBO_BREAKER_NO_PROBE
+            && ngx_http_cache_turbo_brk_probe_gen(probe_word)
+                   == (ngx_http_cache_turbo_brk_gen(word)
+                       & NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_GEN_MASK)
+            && ngx_http_cache_turbo_shm_brk_probe_age(z, probe_word, now)
                    >= (time_t) NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_LEASE
             && ngx_atomic_cmp_set(&z->sh->breaker_state, (ngx_atomic_uint_t) word,
                                   (ngx_atomic_uint_t)
@@ -1250,6 +1377,34 @@ ngx_http_cache_turbo_shm_breaker_state(ngx_http_cache_turbo_zone_t *z,
             state = NGX_HTTP_CACHE_TURBO_BREAKER_OPEN;
 
         } else {
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+            /* H-2/O4.4-j: this else is reached whenever the reclaim arm above
+             * failed, for ANY of its conjuncts. Count it as a wedge candidate
+             * only for the actual mismatch case -- NOT the "no probe yet"
+             * (NO_PROBE) or "probe still fresh" (age < LEASE) cases, which
+             * also fall through here on every ordinary request and would
+             * swamp the counter with non-events.
+             *
+             * ⚠ open_for > 0 must be re-tested here, and it is not redundant
+             * with the arm above: it is that arm's FIRST conjunct, so with the
+             * timed reopen disabled the predicate short-circuits straight into
+             * this else. A probe word left mismatched by an earlier
+             * configuration (a lease published before breaker_open was set to
+             * 0 across a reload) would then bump on every single request.
+             * Nothing is wedged in that state -- with no timed reopen there is
+             * no promotion to be starved of -- and a counter that ticks up
+             * forever in a working deployment is not an anomaly signal. */
+            if (open_for > 0
+                && ngx_http_cache_turbo_brk_probe_gen(probe_word)
+                    != NGX_HTTP_CACHE_TURBO_BREAKER_NO_PROBE
+                && ngx_http_cache_turbo_brk_probe_gen(probe_word)
+                       != (ngx_http_cache_turbo_brk_gen(word)
+                           & NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_GEN_MASK))
+            {
+                (void) ngx_atomic_fetch_add(&z->sh->breaker_wedge_observed, 1);
+            }
+#endif
             return NGX_HTTP_CACHE_TURBO_BREAKER_OPEN;
         }
     }
@@ -1277,27 +1432,79 @@ ngx_http_cache_turbo_shm_breaker_state(ngx_http_cache_turbo_zone_t *z,
          * a zeroed zone's first promotion must not hand out a token that reads
          * as "no lease held". Wrapping past 2^62 lands back on 0 for the same
          * reason, hence the explicit skip rather than a bare increment. */
+        /* ⚠ O4.4-h: the skip must hold for the MASKED generation too. The probe
+         * word carries only the low PROBE_GEN_BITS of the generation, so a full
+         * generation whose masked value is 0 would publish a probe word reading
+         * NO_PROBE that never matches its own state word -- and that lease could
+         * then never be reclaimed. Skipping on the masked value keeps both
+         * widths consistent, at a cost of one extra promotion per wrap of the
+         * narrow field. */
         gen = ngx_http_cache_turbo_brk_gen(word) + 1;
-        if (gen == NGX_HTTP_CACHE_TURBO_BREAKER_NO_PROBE) {
-            gen = 1;
+        if (gen == NGX_HTTP_CACHE_TURBO_BREAKER_NO_PROBE
+            || (gen & NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_GEN_MASK)
+                   == NGX_HTTP_CACHE_TURBO_BREAKER_NO_PROBE)
+        {
+            gen++;
+            if (gen == NGX_HTTP_CACHE_TURBO_BREAKER_NO_PROBE) {
+                gen = 1;
+            }
         }
 
         next = ngx_http_cache_turbo_brk_pack(
                    gen, NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN);
 
+        /* ⚠ O4.4-h: PUBLISH THE PROBE WORD BEFORE THE STATE CAS. The ordering
+         * is load-bearing and it is the REVERSE of what this code did before.
+         *
+         * Stamping after the CAS left a window in which a concurrent reader saw
+         * the fresh HALF_OPEN paired with the PREVIOUS lease's expired stamp and
+         * reclaimed a lease milliseconds old. The generation did not save it,
+         * because nothing tied the stamp TO a generation -- the reader's reclaim
+         * CAS named the word it had loaded, which was current, so it SUCCEEDED.
+         * (The comment that used to sit here claimed such a reader "is testing
+         * against generation N-1 and loses". It had loaded N. Do not restore
+         * that reasoning.)
+         *
+         * Publishing first inverts the failure direction. A probe word whose
+         * generation runs AHEAD of the state word is inert by construction: the
+         * reclaim branch demands the generations MATCH, so a promoter that
+         * publishes here and then LOSES the CAS below leaves nothing any reader
+         * will act on, and the next promotion overwrites it. Hence no rollback
+         * on a lost CAS.
+         *
+         * ⚠ This publication is a CAS, not a plain store, and the difference is
+         * a real race rather than caution. Promoters racing the same word all
+         * derive the SAME generation from it, so a plain store lets a DELAYED
+         * LOSER land its own stamp on top of the winner's afterwards -- same
+         * generation, so the reclaim branch's equality test cannot tell them
+         * apart, and the winner's live lease silently inherits a stamp it never
+         * wrote. Expecting the prior word makes exactly one publication succeed;
+         * a loser's CAS fails and it writes nothing.
+         *
+         * A failed publication CAS means somebody else already published for
+         * this generation, so this caller must NOT go on to claim the lease --
+         * it returns OPEN and lets the winner probe.
+         *
+         * ⚠ The stamp is RELATIVE to breaker_epoch -- see the packed-probe block
+         * in the header for why an absolute epoch stamp cannot sit beside a
+         * generation on a 32-bit ngx_atomic_t. */
+        if (!ngx_atomic_cmp_set(&z->sh->breaker_probe,
+                                (ngx_atomic_uint_t) probe_word,
+                                (ngx_atomic_uint_t)
+                                    ngx_http_cache_turbo_brk_probe_pack(
+                                        gen,
+                                        (ngx_uint_t) (now
+                                            - (time_t) z->sh->breaker_epoch))))
+        {
+            return NGX_HTTP_CACHE_TURBO_BREAKER_OPEN;
+        }
+
         if (ngx_atomic_cmp_set(&z->sh->breaker_state, (ngx_atomic_uint_t) word,
                                (ngx_atomic_uint_t) next))
         {
-            /* ⚠ The stamp is published AFTER the CAS, so a concurrent reader
-             * can briefly see this HALF_OPEN while breaker_probe_at still holds
-             * the PREVIOUS lease's value, which may already look expired. That
-             * no longer admits a second probe: the reclaim path CASes the whole
-             * word, so a reader acting on the stale deadline is testing against
-             * generation N-1 and loses to the generation N we just installed.
-             * The generation is what makes the two-store publication safe --
-             * the zero-stamp guard above covers only the first lease of a
-             * zeroed zone, where there is no previous generation to lose to. */
-            z->sh->breaker_probe_at = (ngx_atomic_t) now;
+            /* O4.4-h: the lease deadline was already published above, together
+             * with this generation, in one word. Nothing is stamped here -- a
+             * store after this CAS is exactly the bug that was fixed. */
 
             /* The GENERATION is the lease token, not the stamp. Two leases
              * promoted in the same wall-clock second are stamp-equal, which is
@@ -1369,7 +1576,7 @@ ngx_http_cache_turbo_shm_breaker_record(ngx_http_cache_turbo_zone_t *z,
          * leftover token from a previous lease fails this comparison too, which
          * closes the ABA case the O4.1 comment flagged as residual. */
         /* ⚠ O4.3-c: the token is the lease GENERATION, and the CAS carries it.
-         * Comparing against breaker_probe_at was not enough -- the stamp is a
+         * Comparing against the probe STAMP was not enough -- the stamp is a
          * wall-clock second, so a superseded probe and its replacement are
          * stamp-EQUAL whenever both promotions land in the same second, and the
          * old probe's state-only CAS then closed a lease it did not own. Testing

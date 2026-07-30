@@ -84,6 +84,83 @@ check_define NGX_HTTP_CACHE_TURBO_BRK_ACT_PASS  0
 check_define NGX_HTTP_CACHE_TURBO_BRK_ACT_SERVE 1
 check_define NGX_HTTP_CACHE_TURBO_BRK_ACT_FAIL  2
 
+# H-4: the packed-probe layout macros are hand-mirrored into test_shm_state.c
+# (NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_WORD_BITS / _STAMP_BITS / _GEN_BITS /
+# _STAMP_MASK / _GEN_MASK and the pack/unpack macros built from them). Two
+# comments used to CLAIM this was already pinned by this script -- it was not,
+# and that is exactly how the wrong-layout bug in H-1 stayed invisible: the
+# unit build silently compiled a different layout than production with
+# nothing to fail loudly on the drift. check_define() only compares a single
+# literal value, and NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_WORD_BITS is an
+# expression (sizeof(ngx_atomic_t) * 8), not a literal, so it is verified
+# structurally instead: assert both copies of the expression are textually
+# identical. The STAMP_BITS/GEN_BITS split is width-conditional
+# (#if NGX_PTR_SIZE >= 8); only the >= 8 arm ships (H-2/O4.4-j rejects the
+# narrow layout at compile time -- see the layout comment in module.h), so
+# only that arm's literal is pinned here.
+extract_define() {
+    # Extract the full value of a #define, following backslash line
+    # continuations rather than assuming a fixed line count -- a macro
+    # reflowed onto one line (or across N lines) must still be captured
+    # in full. Strips the trailing '\' and all whitespace, concatenates
+    # the continuation lines, and drops the macro name from the first
+    # line so only the value remains.
+    name="$1"
+    file="$2"
+    awk -v name="$name" '
+        $0 ~ "^#define[[:space:]]+" name "([[:space:]]|\\\\|$)" {
+            line = $0
+            sub("^#define[[:space:]]+" name, "", line)
+            cont = (line ~ /\\[[:space:]]*$/)
+            sub(/\\[[:space:]]*$/, "", line)
+            val = val line
+            if (!cont) { print val; exit }
+            getline line
+            while (1) {
+                cont = (line ~ /\\[[:space:]]*$/)
+                sub(/\\[[:space:]]*$/, "", line)
+                val = val line
+                if (!cont) { print val; exit }
+                getline line
+            }
+        }
+    ' "$file" | tr -d '[:space:]'
+}
+
+check_probe_layout() {
+    hdr_expr=$(extract_define \
+        'NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_WORD_BITS' "$HDR")
+    test_expr=$(extract_define \
+        'NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_WORD_BITS' \
+        "$UNIT_DIR/test_shm_state.c")
+    if [ -z "$hdr_expr" ] || [ -z "$test_expr" ]; then
+        echo "✗ NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_WORD_BITS not found in both" \
+             "$HDR and test_shm_state.c" >&2
+        exit 1
+    fi
+    if [ "$hdr_expr" != "$test_expr" ]; then
+        echo "✗ NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_WORD_BITS drifted between" \
+             "module.h ('$hdr_expr') and test_shm_state.c ('$test_expr')" >&2
+        exit 1
+    fi
+
+    for bits in 32; do
+        hdr_n=$(grep -c \
+            "NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_STAMP_BITS  $bits\$" "$HDR" \
+            || true)
+        test_n=$(grep -c \
+            "NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_STAMP_BITS  $bits\$" \
+            "$UNIT_DIR/test_shm_state.c" || true)
+        if [ "$hdr_n" -lt 1 ] || [ "$test_n" -lt 1 ]; then
+            echo "✗ NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_STAMP_BITS $bits arm" \
+                 "missing from module.h ($hdr_n) or test_shm_state.c" \
+                 "($test_n) -- the width-conditional mirror drifted" >&2
+            exit 1
+        fi
+    done
+}
+check_probe_layout
+
 # --- slice the function bodies in source order.
 # nginx style: a definition is a bare return-type line (`void`, `ngx_int_t`,
 # `static void *`, `ngx_http_cache_turbo_node_t *`, ...) immediately followed
@@ -93,7 +170,7 @@ awk '
     /^(static )?(void|ngx_int_t|ngx_uint_t|time_t|u_char|const char|ngx_http_cache_turbo_node_t)[[:space:]]*\**$/ {
         pending = 1; buf = $0 ORS; next
     }
-    pending && /^ngx_http_cache_turbo_(shm_(lookup|evict_one|alloc_evict|claim|unstub|count_miss|l2_neg_check|l2_neg_set|touch_lru|breaker_state|breaker_record|breaker_state_str)|lru_(link_head|unlink|insert_new|enforce_cap))\(/ {
+    pending && /^ngx_http_cache_turbo_(shm_(lookup|evict_one|alloc_evict|claim|unstub|count_miss|l2_neg_check|l2_neg_set|touch_lru|brk_probe_age|breaker_state|breaker_record|breaker_state_str)|lru_(link_head|unlink|insert_new|enforce_cap))\(/ {
         capture = 1; pending = 0; printf "%s", buf; print; next
     }
     pending { pending = 0; buf = "" }
