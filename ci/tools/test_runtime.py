@@ -1546,6 +1546,13 @@ http {{
     # l2negz needed /_cache_l2neg: /_cache is bound to `main` and would read a
     # counter this zone never writes.
     cache_turbo_zone name=s71z 16m;
+    # H7.3a: private zone for the Prometheus breaker_opens_total/breaker_state
+    # coverage. NOT s71z -- s71z's breaker is left OPEN by test_breaker_counters
+    # by the time this runs in run_all()'s ordering, which would make this
+    # test's own prime fetch (expected 200, CLOSED) 503 instead. Same
+    # "own zone" reasoning as brkiz/s71z above, just one more private zone
+    # because s71z is already spent by the time H7.3a needs a CLOSED breaker.
+    cache_turbo_zone name=h73z 16m;
     # SUITE-1: private zone for /l2neg/. l2_neg_skips is PER-ZONE
     # (z->sh->l2_neg_skips, module.c:4832), and the outage test asserts a delta
     # of exactly 0 over one request, so any other location writing that counter
@@ -3527,6 +3534,27 @@ http {{
         }}
         location = /_cache_shmref {{
             cache_turbo_admin shmref;
+            allow 127.0.0.1;
+            deny all;
+        }}
+
+        # H7.3a: Prometheus breaker_opens_total/breaker_state coverage. Own
+        # zone (h73z, not s71z -- see the zone declaration comment) and own
+        # admin endpoint for the same reason /_cache_s71 exists: /_cache
+        # reports `main`, which never sees this zone's breaker_opens.
+        location /h73brk/ {{
+            cache_turbo                    h73z;
+            cache_turbo_key                $uri;
+            cache_turbo_valid               1s;
+            cache_turbo_breaker             on;
+            cache_turbo_breaker_threshold   1;
+            cache_turbo_breaker_window     60s;
+            cache_turbo_breaker_open       30s;
+            cache_turbo_lock_timeout        2s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        location = /_cache_h73 {{
+            cache_turbo_admin    h73z;
             allow 127.0.0.1;
             deny all;
         }}
@@ -7172,6 +7200,70 @@ def test_breaker_counters(ng: Nginx, origin: Origin) -> None:
         bs_after = _admin_stat(ng, "breaker_serves", "/_cache_s71")
         assert bs_after - bs_trip > 0, \
             "breaker_serves did not move on the STALE-BREAKER fallback serve"
+    finally:
+        origin.fail = False
+        drain_origin(origin)
+
+
+def test_prometheus_breaker_metrics(ng: Nginx, origin: Origin) -> None:
+    """H7.3a: cache_turbo_breaker_opens_total and cache_turbo_breaker_state
+    are emitted on the Prometheus surface, not just the admin JSON.
+
+    Own private zone (h73z) and admin endpoint (/_cache_h73), same shape as
+    /s71brk/ + /_cache_s71 (test_breaker_counters above) -- NOT a reuse of
+    s71z, because s71z's breaker is already OPEN by the time run_all() gets
+    here (test_breaker_counters trips it and never resets it), which would
+    make this test's own prime fetch fail before the assertions under test
+    even run.
+
+    Two claims:
+      1. cache_turbo_breaker_opens_total{zone="h73z"} moves by exactly one
+         on the tripping request (CLOSED -> OPEN, threshold=1).
+      2. cache_turbo_breaker_state{zone="h73z"} reads the OPEN numeric value
+         (NGX_HTTP_CACHE_TURBO_BREAKER_OPEN == 1, module.h) while OPEN, and
+         is back to CLOSED (0) beforehand.
+    """
+    import re
+
+    def _prom_int(body: str, metric: str, zone: str = "h73z") -> int:
+        m = re.search(
+            r'cache_turbo_%s\{zone="%s"\} (\d+)' % (re.escape(metric), zone),
+            body)
+        assert m, f"no {metric} sample for zone={zone}:\n{body[:400]}"
+        return int(m.group(1))
+
+    s0, b0, _ = fetch(ng.port, "/h73brk/prom")
+    assert s0 == 200 and b0, f"prime failed: {s0} {b0!r}"
+
+    time.sleep(4.3)   # past fresh (1s) AND the x4 stale window (4s): L1-expired
+    origin.fail = True
+    try:
+        _, prom_before, _ = fetch(ng.port, "/_cache_h73?format=prometheus")
+        opens_before = _prom_int(prom_before, "breaker_opens_total")
+        state_before = _prom_int(prom_before, "breaker_state")
+        assert state_before == 0, (
+            f"breaker_state should read CLOSED (0) before the trip, got "
+            f"{state_before}")
+
+        s_trip, _, _ = fetch(ng.port, "/h73brk/prom")
+        assert s_trip != 200, \
+            (f"tripping request was answered 200 -- expected it to reach "
+             f"the dead origin and fail, got {s_trip}")
+
+        _, prom_after, _ = fetch(ng.port, "/_cache_h73?format=prometheus")
+        opens_after = _prom_int(prom_after, "breaker_opens_total")
+        state_after = _prom_int(prom_after, "breaker_state")
+
+        assert opens_after - opens_before == 1, (
+            f"cache_turbo_breaker_opens_total did not move by exactly one "
+            f"on the CLOSED->OPEN trip: {opens_before} -> {opens_after}")
+        assert state_after == 1, (
+            f"cache_turbo_breaker_state should report OPEN (1) once tripped, "
+            f"got {state_after}")
+
+        s_on, _, _ = fetch(ng.port, "/h73brk/prom")
+        assert s_on == 200, \
+            f"breaker OPEN did not fall back to the any-age snapshot, got {s_on}"
     finally:
         origin.fail = False
         drain_origin(origin)
@@ -14215,6 +14307,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_breaker_open_zero_rejected(ng)                      # O4.4 / O4.3-a
     test_breaker_arming_gated_on_breaker_enable(ng, origin)  # O4.4
     test_breaker_counters(ng, origin)                        # S7.1 breaker_serves/origin_failures
+    test_prometheus_breaker_metrics(ng, origin)               # H7.3a breaker_opens_total/breaker_state on prometheus
     test_breaker_arming_sites_gated_white_box(ng, origin)    # O4.4-i (L1)
     if redis is not None:
         # O4.4-i (L2). Needs a real Redis: without an L2 backend the L2 arming
