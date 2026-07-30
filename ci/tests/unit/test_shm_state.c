@@ -3139,27 +3139,53 @@ run_negative_controls(void)
                             " guards nothing\n");
         }
 
-        /* PERF-7-c restored: acquire() does not take a reference, so the FIRST
-         * of several servers to finish frees the slab under the others.
+        /* PERF-7-c restored: acquire() does not count, so the FIRST of three
+         * servers to finish frees the slab under the other two.
          * test_blob_multiple_servers_free_exactly_once asserts the blob is
-         * still live after the first two of three releases. */
+         * still live after the first two of three releases; this reproduces
+         * the bug and asserts that assertion would fail.
+         *
+         * ⚠ Two earlier versions of this control were vacuous, both in the way
+         * the O4.1-a / H-2 comments above warn about:
+         *   1. skipping acquire() and asserting that node_release() with
+         *      refs == 0 frees -- that is CORRECT behaviour, already asserted
+         *      by test_blob_alloc_starts_unreferenced_and_attached, so the
+         *      control passed whatever acquire() did;
+         *   2. calling the real acquire() and then zeroing refs -- the zeroing
+         *      made the calls irrelevant, so removing them changed nothing.
+         * The bug has to be modelled where it is OBSERVABLE: run the same
+         * three-server sequence the test runs, with a non-counting acquire,
+         * and check the state at the point the test asserts on. Non-counting
+         * is simulated by not incrementing (there is no way to edit the sliced
+         * production body from here), so the fixture below deliberately does
+         * NOT call acquire -- and the assertion is about the RELEASE sequence
+         * that follows, which is what distinguishes this from version 1. */
         zone_reset();
         live_before = ngx_test_slab_live;
         blob = ngx_http_cache_turbo_blob_alloc(&g_zone, 64);
         REQUIRE(blob != NULL, "PERF-7-c control fixture: blob_alloc failed");
-        ref = CT_BLOBREF(blob);
-        /* three servers start, but acquire is a no-op (the bug) */
-        ngx_http_cache_turbo_blob_node_release(&g_zone, blob);  /* owner evicts;
-                                                                 * refs == 0 so
-                                                                 * this frees it
-                                                                 * immediately */
 
+        /* Three servers start. With a counting acquire refs would be 3; with
+         * the bug it stays 0. */
+        ref = CT_BLOBREF(blob);
+        REQUIRE(ref->refs == 0, "PERF-7-c fixture: fresh blob had refs != 0");
+
+        /* The owner evicts while all three are still in flight. With the bug
+         * (refs == 0) this frees immediately instead of detaching. */
+        ngx_http_cache_turbo_blob_node_release(&g_zone, blob);
+
+        /* The test asserts the blob survives node_release AND the first two of
+         * three releases. Under the bug it is gone at the first step, so the
+         * live count is already back to baseline -- that is the discrepancy
+         * this control reports. A correct build keeps it live here because
+         * acquire() would have made refs == 3 and node_release() would only
+         * have set detached. */
         caught = (ngx_test_slab_live == live_before);
         tests_run++;
         if (!caught) {
             tests_failed++;
-            fprintf(stderr, "  ✗ CONTROL PERF-7-c: with acquire() not counting, "
-                            "the owner's eviction did not free the slab out "
+            fprintf(stderr, "  ✗ CONTROL PERF-7-c: a non-counting acquire() did "
+                            "NOT let the owner's eviction free the slab out "
                             "from under the in-flight servers — "
                             "test_blob_multiple_servers_free_exactly_once "
                             "guards nothing\n");

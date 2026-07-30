@@ -194,7 +194,15 @@ check_blobref_mirror() {
             /^typedef struct \{/ { buf = ""; cap = 1; next }
             cap && /^\} ngx_http_cache_turbo_blobref_t;/ { print buf; exit }
             cap { line = $0
+                  # Drop whole-line and trailing comments, and any line that is
+                  # purely a comment continuation (" * text" or " */"), so only
+                  # "type name;" survives. Without the continuation rule a
+                  # comment REFLOWED across lines in one file but not the other
+                  # would diverge the two field lists and fail the build on
+                  # cosmetic drift alone.
+                  gsub(/\/\*[^*]*\*+([^\/*][^*]*\*+)*\//, "", line)
                   sub(/\/\*.*/, "", line)
+                  if (line ~ /^[[:space:]]*\*/) next
                   gsub(/[[:space:]]+/, " ", line)
                   gsub(/^ | $/, "", line)
                   if (line != "") buf = buf line "|"
