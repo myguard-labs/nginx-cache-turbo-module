@@ -11938,6 +11938,59 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
         conf->key = prev->key;
     }
 
+    /* O4.4-d: the breaker's STATE and counters live in the ZONE (shared
+     * across every location bound to it), but breaker_enable/threshold/
+     * window/open/retry_after above are all per-LOCATION. Sibling locations
+     * sharing one zone can therefore feed one state machine different
+     * policies -- reopen timing becomes "whichever location last called
+     * _breaker_state() decides". This is legal (nothing rejects it) and
+     * already documented in the README; this block only detects it at
+     * config time and warns -- see the O4.4-d ledger entry for the
+     * rejected alternatives (main_conf sees unmerged sentinels; a
+     * postconfiguration location-tree walk misses named/regex locations,
+     * which ngx_http_init_locations() queue_splits off before any walk
+     * could reach them).
+     *
+     * Guarded the same way the request path decides the breaker is live
+     * for this location, to avoid a false positive from a server{} block
+     * that binds the zone but whose own effective tuple no request ever
+     * consults (every location under it overrides the breaker itself). */
+    if (conf->shm_zone != NULL
+        && ngx_http_cache_turbo_breaker_should_consult(conf))
+    {
+        ngx_http_cache_turbo_zone_t  *zctx = conf->shm_zone->data;
+
+        /* NULL when the zone is referenced before its cache_turbo_zone
+         * directive appears textually -- skip rather than dereference. */
+        if (zctx != NULL) {
+            if (!zctx->policy_seen) {
+                zctx->policy_seen         = 1;
+                zctx->policy_threshold    = conf->breaker_threshold;
+                zctx->policy_window       = conf->breaker_window;
+                zctx->policy_open         = conf->breaker_open;
+                zctx->policy_retry_after  = conf->breaker_retry_after;
+            } else if (zctx->policy_threshold != conf->breaker_threshold
+                       || zctx->policy_window != conf->breaker_window
+                       || zctx->policy_open != conf->breaker_open
+                       || zctx->policy_retry_after != conf->breaker_retry_after)
+            {
+                ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+                    "cache_turbo circuit breaker: this location's effective "
+                    "policy (threshold=%ui window=%T open=%T "
+                    "retry_after=%T) diverges from another location sharing "
+                    "the same cache_turbo_zone (threshold=%ui window=%T "
+                    "open=%T retry_after=%T); breaker STATE is per-zone but "
+                    "policy is per-location, so whichever location last "
+                    "calls the state machine decides effective reopen "
+                    "timing for the whole zone",
+                    conf->breaker_threshold, conf->breaker_window,
+                    conf->breaker_open, conf->breaker_retry_after,
+                    zctx->policy_threshold, zctx->policy_window,
+                    zctx->policy_open, zctx->policy_retry_after);
+            }
+        }
+    }
+
     /* Default cache key (no explicit cache_turbo_key) for an enabled location:
      * $host$uri$cache_turbo_normalized_args — tracking params stripped + args
      * sorted out of the box. Compiled lazily here; the normalized_args variable

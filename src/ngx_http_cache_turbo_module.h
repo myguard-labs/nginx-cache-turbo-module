@@ -1062,6 +1062,23 @@ typedef struct {
 typedef struct {
     ngx_http_cache_turbo_shctx_t  *sh;
     ngx_slab_pool_t               *shpool;
+
+    /* O4.4-d: config-time-only "first policy seen" accumulator for the
+     * breaker tuple this zone is bound to. NOT shm state -- this struct is
+     * allocated from cf->pool (see cache_turbo_zone's handler), so these
+     * fields cost zero shared memory and never cross a worker boundary.
+     * Populated the first time a location with a live breaker (per
+     * ngx_http_cache_turbo_breaker_should_consult()) merges against this
+     * zone; every later location on the same zone is compared against it.
+     * policy_seen guards the "first" case; the recorded tuple is the
+     * EFFECTIVE post-merge values, matching what _breaker_state() actually
+     * receives (deliberately not a *_raw explicitness sidecar -- see
+     * O4.4-d ledger). */
+    ngx_flag_t               policy_seen;
+    ngx_uint_t               policy_threshold;
+    time_t                   policy_window;
+    time_t                   policy_open;
+    time_t                   policy_retry_after;
 } ngx_http_cache_turbo_zone_t;
 
 
