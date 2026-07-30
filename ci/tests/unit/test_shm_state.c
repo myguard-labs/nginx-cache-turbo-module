@@ -1845,6 +1845,91 @@ test_breaker_probe_lease_is_independent_of_open(void)
 }
 
 
+/* O4.4-g: a probe slower than the LEASE cannot close the breaker.
+ *
+ * O4.4-a moved the lease off open_for onto BREAKER_PROBE_LEASE, which widens the
+ * safe band but does not end the class: time-to-response-headers is genuinely
+ * unbounded (proxy_read_timeout is measured between successive READS, and
+ * proxy_next_upstream_tries/_timeout default to unlimited), so a probe can
+ * outlast any finite lease. This test CHARACTERISES the surviving behaviour
+ * rather than asserting a fix -- it is the evidence O4.4-g's design decision
+ * needs, and it must be re-read (not merely re-run) if that decision changes it.
+ *
+ * The distinction it pins, and the reason this is a bounded degradation instead
+ * of a wedge: the slow probe's own success is discarded, but the reclaim that
+ * superseded it PROMOTED a replacement. So the origin is re-probed once per
+ * lease, and the first replacement whose response fits inside a lease closes the
+ * breaker. Recovery is LATE, not absent. A test asserting only the discard would
+ * leave "and then nothing ever recovers" unfalsified -- which is the strictly
+ * worse behaviour, and the one an operator would actually report. */
+static void
+test_breaker_probe_slower_than_lease_recovers_late(void)
+{
+    ngx_uint_t  probe_a, probe_b, probe_c;
+    time_t      lease = (time_t) NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_LEASE;
+
+    printf("breaker/O4.4-g: a probe slower than the lease recovers late, "
+           "not never\n");
+
+    zone_reset();
+    ngx_test_set_time(1000);
+
+    /* Trip it, wait out open_for, take the lease as probe A. */
+    brk_record(0, 1, 60);
+    ngx_test_advance_time(31);
+    REQUIRE(brk_probe_state(30, &probe_a)
+                == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN,
+            "breaker fixture: expected probe A to be promoted");
+    REQUIRE(probe_a != NGX_HTTP_CACHE_TURBO_BREAKER_NO_PROBE,
+            "breaker fixture: probe A was issued no token");
+
+    /* A is still in flight when its lease expires: traffic reclaims the slot and
+     * is issued replacement token B. This is the O4.4-g precondition -- without
+     * it the rest of the test would be characterising the ordinary path. */
+    ngx_test_advance_time((time_t) (lease + 1));
+    REQUIRE(brk_probe_state(30, &probe_b)
+                == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN,
+            "breaker fixture: A's expired lease was not reclaimed, so this test "
+            "never reaches the superseded-probe case it exists to characterise");
+    REQUIRE(probe_b != NGX_HTTP_CACHE_TURBO_BREAKER_NO_PROBE,
+            "breaker fixture: the reclaiming caller got no replacement token");
+    REQUIRE(probe_b != probe_a,
+            "breaker fixture: the replacement token equals A's, so a stale "
+            "resolution would be indistinguishable from a live one here");
+
+    /* A finally answers, healthily, on the token it still holds. It is
+     * superseded, so it is discarded -- correctly (O4.3-c: a success whose
+     * evidence predates the current lease must not release the herd). The
+     * breaker must NOT close on it. */
+    ngx_http_cache_turbo_shm_breaker_record(&g_zone, 1, 1, 60, probe_a);
+    CHECK(brk_state(30) != NGX_HTTP_CACHE_TURBO_BREAKER_CLOSED,
+          "a superseded probe's success closed the breaker; O4.3-c's token "
+          "check has stopped discarding stale evidence");
+
+    /* B, the replacement A's reclaim promoted, must still be a LIVE lease whose
+     * success closes the breaker -- that is what makes this late recovery
+     * rather than a permanent wedge.
+     *
+     * ⚠ This assertion is DELIBERATELY not treated as this test's own claim,
+     * because it has no independent mutation. Every edit that stops the
+     * replacement from closing the breaker also stops the reclaim from issuing
+     * B at all, which trips the fixture REQUIRE above (and
+     * test_breaker_probe_lease_is_independent_of_open's arm 2) first. The
+     * property is structurally entailed by the reclaim-promotes-a-replacement
+     * behaviour those tests already pin; it is restated here so the
+     * characterisation reads as "late", not merely "discarded", and is checked
+     * so a future divergence still surfaces somewhere. The controllable claim
+     * of this test is the discard above -- dropping the generation check on
+     * _breaker_record()'s success path fails it and nothing else here. */
+    ngx_http_cache_turbo_shm_breaker_record(&g_zone, 1, 1, 60, probe_b);
+    CHECK(brk_probe_state(30, &probe_c)
+              == NGX_HTTP_CACHE_TURBO_BREAKER_CLOSED,
+          "the replacement probe promoted by the reclaim could not close the "
+          "breaker either: a slow origin wedges it permanently, which is the "
+          "O4.4-g hazard in its worse form");
+}
+
+
 /* O4.3-c/F1 schedule 2 (state-only CAS -> ABA): probe A validates its token and
  * is descheduled. Its lease is reclaimed, a replacement probe B is promoted,
  * and only then does A's CAS land. The CAS tests HALF_OPEN -> CLOSED and
@@ -3222,6 +3307,7 @@ main(void)
     test_breaker_probe_age_is_modular_at_shipped_width();
     test_breaker_backwards_clock_step_does_not_reclaim();
     test_breaker_probe_lease_is_independent_of_open();
+    test_breaker_probe_slower_than_lease_recovers_late();
     test_breaker_stale_probe_cannot_resolve_new_lease();
     test_breaker_huge_durations_do_not_overflow();
     test_breaker_threshold_zero_never_trips();
