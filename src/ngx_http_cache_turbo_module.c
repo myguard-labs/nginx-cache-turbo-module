@@ -4666,6 +4666,7 @@ ngx_http_cache_turbo_breaker_unavailable(ngx_http_request_t *r,
     ngx_int_t                    rc;
     u_char                      *ra;
     size_t                       ra_len;
+    time_t                       retry_after;
     ngx_http_cache_turbo_ctx_t  *ctx;
     ngx_str_t                    body = ngx_string("503 Service Unavailable\n");
 
@@ -4673,18 +4674,30 @@ ngx_http_cache_turbo_breaker_unavailable(ngx_http_request_t *r,
     static u_char  xc_name[] = "X-Cache";
     static u_char  xc_val[]  = "BREAKER-503";
 
+    /* BRK-RA1: breaker_retry_after can now legitimately be NGX_CONF_UNSET
+     * (nobody set it anywhere, at any level) because the config-time merge
+     * no longer defaults it to breaker_open -- see the merge note above.
+     * Resolve the effective value here instead: an explicit, set value
+     * (!= NGX_CONF_UNSET) always wins, including an explicit 0 (which means
+     * "send no Retry-After"); otherwise fall back to this location's fully
+     * merged, request-scoped breaker_open. clcf is complete by request time,
+     * so this lazy resolution needs no merge-order care at all. */
+    retry_after = (clcf->breaker_retry_after != NGX_CONF_UNSET)
+                  ? clcf->breaker_retry_after
+                  : clcf->breaker_open;
+
     /* ⚠ Both headers go through ngx_http_cache_turbo_add_header() rather than a
      * bare ngx_list_push(). The helper also sets h->next = NULL on nginx 1.23+,
      * where repeated response headers form a linked chain rather than being
      * merged: a ngx_list_push() slot comes back with whatever the pool last
      * held, so an unset `next` is a dangling pointer that a downstream module
      * walking the chain will follow. */
-    if (clcf->breaker_retry_after > 0) {
+    if (retry_after > 0) {
         ra = ngx_pnalloc(r->pool, NGX_TIME_T_LEN);
         if (ra == NULL) {
             return NGX_HTTP_INTERNAL_SERVER_ERROR;
         }
-        ra_len = ngx_sprintf(ra, "%T", clcf->breaker_retry_after) - ra;
+        ra_len = ngx_sprintf(ra, "%T", retry_after) - ra;
 
         if (ngx_http_cache_turbo_add_header(r, ra_name,
                 sizeof("Retry-After") - 1, ra, ra_len) != NGX_OK)
@@ -11868,7 +11881,10 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->breaker_threshold = NGX_CONF_UNSET_UINT; /* O4.2; merges to 0 = off */
     conf->breaker_window = NGX_CONF_UNSET;         /* O4.2; merges to 0 = off */
     conf->breaker_open = NGX_CONF_UNSET;           /* O4.3; see the merge note */
-    conf->breaker_retry_after = NGX_CONF_UNSET;    /* O4.3; merges to 30s   */
+    conf->breaker_retry_after = NGX_CONF_UNSET;    /* BRK-RA1; stays UNSET if
+                                                     * never set anywhere,
+                                                     * resolved lazily at
+                                                     * request time */
     conf->max_size = NGX_CONF_UNSET_SIZE;
     conf->suppress_native = NGX_CONF_UNSET;
     conf->redis_enable = NGX_CONF_UNSET;
@@ -12043,14 +12059,27 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 
     /* Advisory only; 0 = send no Retry-After at all. cache_turbo_breaker_open
      * is rejected at 0 (see above) but the fully-merged breaker_open here can
-     * still legitimately be a small operator-chosen value, so this derives
-     * from the EFFECTIVE (post-merge) breaker_open rather than a hardcoded
-     * constant, keeping the hint in sync with the actual probe interval by
-     * default. A `cache_turbo_breaker_retry_after` directive, if given
-     * explicitly, always wins -- this fallback applies only when it was left
-     * unset. */
+     * still legitimately be a small operator-chosen value, so the effective
+     * value should track the EFFECTIVE (post-merge) breaker_open rather than
+     * a hardcoded constant, keeping the hint in sync with the actual probe
+     * interval by default. A `cache_turbo_breaker_retry_after` directive, if
+     * given explicitly, always wins -- the auto-track fallback applies only
+     * when it was left unset everywhere.
+     *
+     * BRK-RA1: this merge must NOT default to conf->breaker_open here. nginx
+     * merges the enclosing server{} block against http FIRST, before any
+     * location merge runs. If nothing sets breaker_retry_after at server
+     * scope, that level would resolve to http's breaker_open default (30)
+     * -- not NGX_CONF_UNSET -- and every child location leaving it unset
+     * would then inherit prev->breaker_retry_after == 30 instead of UNSET,
+     * so the location's own breaker_open (e.g. 2s) would never be consulted.
+     * Keep this merge plain (prev, else UNSET) so breaker_retry_after stays
+     * NGX_CONF_UNSET when nobody set it anywhere; the actual fallback to the
+     * effective breaker_open is resolved lazily at request time in
+     * ngx_http_cache_turbo_breaker_unavailable(), where clcf is fully merged
+     * and request-scoped, so merge order can no longer poison it. */
     ngx_conf_merge_sec_value(conf->breaker_retry_after,
-                             prev->breaker_retry_after, conf->breaker_open);
+                             prev->breaker_retry_after, NGX_CONF_UNSET);
 
     /* Per-status TTLs (v6): inherit the rule list if this level set none. */
     if (conf->valid_status == NULL) {
@@ -12141,16 +12170,29 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
         /* NULL when the zone is referenced before its cache_turbo_zone
          * directive appears textually -- skip rather than dereference. */
         if (zctx != NULL) {
+            /* BRK-RA1: conf->breaker_retry_after can now be NGX_CONF_UNSET
+             * (auto-track: nobody set it anywhere). Compare/store/print the
+             * EFFECTIVE value -- resolved the same way the request path
+             * resolves it, unset falling back to this location's own
+             * breaker_open -- not the raw field. Otherwise two locations
+             * that both auto-track but have different breaker_open would
+             * compare UNSET == UNSET and wrongly look identical, while a
+             * spurious -1 could reach the log format string. */
+            time_t  eff_retry_after =
+                (conf->breaker_retry_after != NGX_CONF_UNSET)
+                ? conf->breaker_retry_after
+                : conf->breaker_open;
+
             if (!zctx->policy_seen) {
                 zctx->policy_seen         = 1;
                 zctx->policy_threshold    = conf->breaker_threshold;
                 zctx->policy_window       = conf->breaker_window;
                 zctx->policy_open         = conf->breaker_open;
-                zctx->policy_retry_after  = conf->breaker_retry_after;
+                zctx->policy_retry_after  = eff_retry_after;
             } else if (zctx->policy_threshold != conf->breaker_threshold
                        || zctx->policy_window != conf->breaker_window
                        || zctx->policy_open != conf->breaker_open
-                       || zctx->policy_retry_after != conf->breaker_retry_after)
+                       || zctx->policy_retry_after != eff_retry_after)
             {
                 ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
                     "cache_turbo circuit breaker: this location's effective "
@@ -12162,7 +12204,7 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
                     "calls the state machine decides effective reopen "
                     "timing for the whole zone",
                     conf->breaker_threshold, conf->breaker_window,
-                    conf->breaker_open, conf->breaker_retry_after,
+                    conf->breaker_open, eff_retry_after,
                     zctx->policy_threshold, zctx->policy_window,
                     zctx->policy_open, zctx->policy_retry_after);
             }

@@ -1631,6 +1631,18 @@ http {{
     cache_turbo_zone name=l2neglifez 1m;
     cache_turbo_zone name=l2negmuz 1m;
 
+    # BRK-RA1: private zones for the breaker_retry_after auto-track
+    # regression pin. TWO zones, not one shared by /ra1/ and /ra1exp/ --
+    # breaker STATE is per-zone (same O4.4-d reasoning as the policy-warn
+    # block), so tripping /ra1/'s breaker OPEN would leave /ra1exp/'s own
+    # prime fetch answered straight from breaker_unavailable() too, before
+    # its own dead-origin trip ever runs. Own zones (not sr72z/s71z/brkiz/
+    # etc.) so neither test's own CLOSED-breaker prime is polluted by
+    # another test's already-tripped breaker by the time run_all() gets
+    # here, same "own zone" reasoning as s71z/h73z/sr72z above.
+    cache_turbo_zone name=raz 16m;
+    cache_turbo_zone name=raexpz 16m;
+
     # Q1 end-to-end: stacked native proxy_cache, one zone per suppress mode, so
     # a test can prove cache_turbo_suppress_native actually keeps the native
     # cache empty (vs the inert default where proxy_cache stores normally).
@@ -2257,6 +2269,44 @@ http {{
             cache_turbo_breaker_open       30s;
             cache_turbo_lock_timeout        2s;
             add_header         X-CT-Reason $cache_turbo_serve_reason always;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # BRK-RA1 regression pin: cache_turbo_breaker_open set to a small,
+        # non-30 value (2s) and NO explicit cache_turbo_breaker_retry_after
+        # -- the auto-track path. Own zone (raz) so the CLOSED-breaker prime
+        # is not polluted by any other test's already-tripped breaker.
+        # /ra1/never is deliberately never primed so, once the breaker is
+        # OPEN, it has no cached copy at all and falls straight into
+        # ngx_http_cache_turbo_breaker_unavailable() -- same COLD-url shape as
+        # /sr72brk/never above. Drives test_breaker_retry_after_auto_tracks_
+        # breaker_open.
+        location /ra1/ {{
+            cache_turbo                    raz;
+            cache_turbo_key                $uri;
+            cache_turbo_valid               1s;
+            cache_turbo_breaker             on;
+            cache_turbo_breaker_threshold   1;
+            cache_turbo_breaker_window     60s;
+            cache_turbo_breaker_open        2s;
+            cache_turbo_lock_timeout        2s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # BRK-RA1 positive control: identical shape to /ra1/ but with an
+        # EXPLICIT cache_turbo_breaker_retry_after that must still win over
+        # the derived default -- proves the fix does not break the explicit
+        # path while fixing the auto-track one.
+        location /ra1exp/ {{
+            cache_turbo                    raexpz;
+            cache_turbo_key                $uri;
+            cache_turbo_valid               1s;
+            cache_turbo_breaker             on;
+            cache_turbo_breaker_threshold   1;
+            cache_turbo_breaker_window     60s;
+            cache_turbo_breaker_open        2s;
+            cache_turbo_breaker_retry_after 7s;
+            cache_turbo_lock_timeout        2s;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
@@ -7272,6 +7322,81 @@ def test_breaker_counters(ng: Nginx, origin: Origin) -> None:
         bs_after = _admin_stat(ng, "breaker_serves", "/_cache_s71")
         assert bs_after - bs_trip > 0, \
             "breaker_serves did not move on the STALE-BREAKER fallback serve"
+    finally:
+        origin.fail = False
+        drain_origin(origin)
+
+
+def test_breaker_retry_after_auto_tracks_breaker_open(ng: Nginx, origin: Origin) -> None:
+    """BRK-RA1 regression pin: cache_turbo_breaker_retry_after, left unset,
+    must track the EFFECTIVE cache_turbo_breaker_open for that location, not
+    the module-wide 30s default.
+
+    The bug: ngx_conf_merge_sec_value(conf->breaker_retry_after,
+    prev->breaker_retry_after, conf->breaker_open) only falls back to
+    conf->breaker_open when prev->breaker_retry_after is itself UNSET. nginx
+    merges the enclosing server{} loc_conf against http FIRST, before any
+    location merge. Nothing in this config sets breaker_retry_after at
+    server scope, so that level resolves to http's breaker_open default
+    (30) -- NOT UNSET. Every child location that also leaves it unset (like
+    /ra1/ here, breaker_open 2s) then inherits prev->breaker_retry_after ==
+    30, not UNSET, so its own breaker_open is never consulted and the
+    BREAKER-503 sends Retry-After: 30 instead of 2.
+
+    Own zone (raz), same two-fetch trip shape as test_breaker_counters /
+    test_serve_reason_variable (threshold=1: the first dead-origin fetch
+    trips CLOSED->OPEN and still surfaces the raw origin failure; only the
+    SECOND finds the breaker OPEN). /ra1/never is a COLD url -- never
+    primed -- so once the breaker is OPEN it has no snapshot of any age and
+    falls straight into ngx_http_cache_turbo_breaker_unavailable(), the
+    local 503 whose Retry-After header is under test.
+
+    /ra1exp/ is the positive control: identical shape, but with an EXPLICIT
+    cache_turbo_breaker_retry_after 7s. That must still win -- proves the
+    fix resolves the UNSET case lazily without disturbing the explicit
+    path."""
+    s0, b0, _ = fetch(ng.port, "/ra1/dead")
+    assert s0 == 200 and b0, f"prime failed for /ra1/dead: {s0} {b0!r}"
+
+    time.sleep(4.3)   # past fresh (1s) AND the x4 stale window (4s): L1-expired
+    origin.fail = True
+    try:
+        s_trip, _, _ = fetch(ng.port, "/ra1/dead")
+        assert s_trip != 200, \
+            (f"tripping request was answered 200 -- expected it to reach "
+             f"the dead origin and fail, got {s_trip}")
+
+        s_503, _, h_503 = fetch(ng.port, "/ra1/never")
+        assert s_503 == 503, \
+            f"breaker OPEN + no cached copy should 503, got {s_503}"
+        assert h_503.get("retry-after") == "2", \
+            (f"auto-tracked Retry-After should equal this location's own "
+             f"cache_turbo_breaker_open (2s), got "
+             f"{h_503.get('retry-after')!r} -- BRK-RA1: breaker_retry_after "
+             f"inherited the module-wide 30s default instead of tracking "
+             f"the effective breaker_open")
+    finally:
+        origin.fail = False
+        drain_origin(origin)
+
+    # Positive control: explicit cache_turbo_breaker_retry_after still wins.
+    s0e, b0e, _ = fetch(ng.port, "/ra1exp/dead")
+    assert s0e == 200 and b0e, f"prime failed for /ra1exp/dead: {s0e} {b0e!r}"
+
+    time.sleep(4.3)
+    origin.fail = True
+    try:
+        s_trip_e, _, _ = fetch(ng.port, "/ra1exp/dead")
+        assert s_trip_e != 200, \
+            (f"tripping request was answered 200 -- expected it to reach "
+             f"the dead origin and fail, got {s_trip_e}")
+
+        s_503e, _, h_503e = fetch(ng.port, "/ra1exp/never")
+        assert s_503e == 503, \
+            f"breaker OPEN + no cached copy should 503, got {s_503e}"
+        assert h_503e.get("retry-after") == "7", \
+            (f"explicit cache_turbo_breaker_retry_after must win over the "
+             f"derived default, got {h_503e.get('retry-after')!r}")
     finally:
         origin.fail = False
         drain_origin(origin)
@@ -14547,6 +14672,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_breaker_open_zero_rejected(ng)                      # O4.4 / O4.3-a
     test_breaker_arming_gated_on_breaker_enable(ng, origin)  # O4.4
     test_breaker_counters(ng, origin)                        # S7.1 breaker_serves/origin_failures
+    test_breaker_retry_after_auto_tracks_breaker_open(ng, origin)  # BRK-RA1
     test_prometheus_breaker_metrics(ng, origin)               # H7.3a breaker_opens_total/breaker_state on prometheus
     test_breaker_arming_sites_gated_white_box(ng, origin)    # O4.4-i (L1)
     if redis is not None:
