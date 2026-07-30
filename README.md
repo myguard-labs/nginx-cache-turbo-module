@@ -684,15 +684,15 @@ preset cannot fully identify a logged-in user:
 
 ¤ **`xenforo` cannot be made both safe and fast on stock XenForo.** Stock XF2 has
 **no login-only cookie**. `xf_user` is the *remember-me* cookie — `completeLogin()`
-only mints it inside `if ($remember)`, and "Stay logged in" is **unticked by
-default** — so an ordinary member who just types their password carries **only**
-`xf_session`. The preset therefore bypasses on `xf_session` as well, which is the
-only correct cookie-only option, and it costs hit rate: XF's session is *lazy*, so
-a clean first-time guest still caches, but a guest who logs out, trips 2FA, or
-hits a captcha acquires a session and is uncacheable from then on. If you run
-LiteSpeed's XF2 plugin you get `xf_lscxf_logged_in`, a true login-only cookie (the
-plugin exists to create the cookie XF lacks) — that is the fast path, and you can
-then drop `xf_session` with your own config. See [docs/xenforo.md](docs/xenforo.md).
+only mints it inside `if ($remember)`, so any member who does not tick "Stay logged
+in" carries **only** `xf_session`. The preset therefore bypasses on `xf_session` as
+well, which is the only correct cookie-only option, and it costs hit rate: XF's
+session is *lazy*, so a clean first-time guest still caches, but a guest who logs
+out, trips 2FA, or hits a captcha acquires a session and is uncacheable from then
+on. If you run LiteSpeed's XF2 plugin you get `xf_lscxf_logged_in`, a true
+login-only cookie (the plugin exists to create the cookie XF lacks) — that is the
+fast path, and you can then drop `xf_session` with your own config. See
+[docs/xenforo.md](docs/xenforo.md).
 
 ¥ **`drupal`'s `SESS` rule over-matches, deliberately.** `SESS` is a substring of
 `PHPSESSID` and `JSESSIONID`, so a co-hosted PHP or Java app under the same server
@@ -846,9 +846,8 @@ it.** `curl -sI` your site with no cookies and look at what comes back in
 #### XenForo: which cookies bypass, and which belong in the key
 
 Stock XenForo has **no login-only cookie** (`xf_user` is only the *remember-me*
-cookie, and "Stay logged in" is off by default), so the ordinary member carries
-only `xf_session`. That forces `xf_session` into the bypass list even though
-guests get it too — the full reasoning is in
+cookie), so the ordinary member carries only `xf_session`. That forces `xf_session`
+into the bypass list even though guests get it too — the full reasoning is in
 [docs/xenforo.md](docs/xenforo.md#read-this-first-stock-xenforo-has-no-login-only-cookie).
 The preset:
 
