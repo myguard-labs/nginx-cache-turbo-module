@@ -875,6 +875,22 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # C-S5-a: RFC-1 request Cache-Control serve verdict evaluated against
+        # the L2 (Redis) arm, not L1 (module.c:5296). An L2 entry can be
+        # YOUNGER than the L1 copy (a peer refreshed it), so the verdict must
+        # be re-run on the L2 blob's own created/fresh_ttl rather than reusing
+        # the L1 verdict. `cache_turbo_purge on` lets the test drop the L1
+        # copy only (same trick as /sfgu/) so a read is forced to consult L2.
+        location /reqccl2/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    30s;
+            cache_turbo_purge    on;   # test drops L1 so the read consults L2
+            cache_turbo_redis    127.0.0.1:{redis_port} prefix=ct: timeout=250ms;
+            add_header           X-CT-Status $cache_turbo_status always;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # L2 negative memo (L13). Same shape as /l2/ above (no keepalive, so
         # every L2 op is exactly one countable Redis connection) plus a 3s memo,
         # so a repeated cold miss on the same key skips the L2 GET entirely. The
@@ -12645,6 +12661,87 @@ def test_l2_unserveable_giveup_still_single_flights(
     drain_origin(origin)
 
 
+def test_request_cc_serve_verdict_l2(ng: Nginx, origin: Origin,
+                                     redis: RedisServer) -> None:
+    """C-S5-a: RFC-1 request Cache-Control serve verdict evaluated on the L2
+    (Redis) arm at module.c:5296, NOT the L1 site at :4813 the existing
+    /reqcc/ + /reqccst/ tests exercise (neither location there carries
+    cache_turbo_redis, so the L2 branch has zero runtime coverage otherwise).
+
+    An L2 entry can be younger than the L1 copy (a peer refreshed it), so its
+    own age (bh.created / bh.fresh_ttl) has to be re-verdicted independently.
+
+    PURGE on /reqccl2/ is L2-AWARE (it DELs the Redis key too, see
+    ngx_http_cache_turbo_purge_request / module.c:1711), so it cannot be used
+    to drop L1 while leaving L2 populated -- it empties both. Instead: prime,
+    capture the stored blob's raw bytes via GET, PURGE to clear both tiers,
+    then write the SAME blob bytes back into L2 only via raw SET (mirrors the
+    /sfgu/ precedent's "aged blob written directly to L2" technique). L1 is
+    now empty and L2 holds the object, so any read is forced through the L2
+    verdict at module.c:5296.
+
+    Two-sided: a Cache-Control bound the L2 entry FAILS must revalidate at
+    origin (req_reval, observable as a body change / non-HIT status); a
+    request that does not conflict must still serve the stored L2 copy."""
+    uri = "/reqccl2/reqccl2-k1"
+    key = l2_key(uri)
+    redis.cli("DEL", key)
+
+    # prime: miss -> stored in both L1 and L2
+    s0, base, _ = fetch(ng.port, uri)
+    assert s0 == 200, f"prime should reach origin, got {s0}"
+    assert wait_for(lambda: redis.cli("EXISTS", key) == "1"), \
+        "object never written to L2"
+    blob = redis.get_raw(key)
+    assert blob is not None and len(blob) >= 44, f"short/absent blob: {blob!r}"
+
+    def _drop_l1_keep_l2() -> None:
+        """PURGE clears L1 AND L2 (module.c:1711); re-write the captured blob
+        straight into L2 afterwards so only L1 stays empty."""
+        s_p, b_p, _ = fetch_raw(ng.port, uri, method="PURGE")
+        assert s_p == 200, f"PURGE status {s_p}: {b_p}"
+        redis.set_raw(key, blob, 3_600_000)
+        assert redis.get_raw(key) == blob, "L2 restore after PURGE did not land"
+
+    _drop_l1_keep_l2()
+
+    # plain read (no request Cache-Control): must still be served from the
+    # stored L2 copy -- proves the passing/no-bound arm fills L1 from L2
+    # rather than always refetching.
+    s1, b1, h1 = fetch(ng.port, uri)
+    assert s1 == 200 and b1 == base, \
+        f"plain re-read after L1 drop should replay the L2-stored body, " \
+        f"got status={s1} body_changed={b1 != base}"
+    assert h1.get("x-ct-status") in ("HIT", "STALE"), \
+        f"plain re-read should be served from L2 (HIT/STALE), got " \
+        f"{h1.get('x-ct-status')}"
+
+    # drop L1 again (the read above refilled it) so the next read is also
+    # forced through the L2 verdict.
+    _drop_l1_keep_l2()
+
+    # min-fresh=999: client wants >=999s of remaining freshness. NOTE: this
+    # (not max-age=0) is the correct failing bound here -- max-age=0 is
+    # intercepted unconditionally by ngx_http_cache_turbo_request_revalidate()
+    # at module.c:4473, BEFORE the L1 lookup even runs, so it never reaches
+    # the L2 verdict site at :5296 at all (confirmed via error.log: it logs
+    # "request no-cache -> origin (revalidate)", not an L2 verdict line). The
+    # L2 entry has at most 30s of remaining freshness -> l2_fresh_ok=0; no
+    # max-stale -> l2_stale_ok=0 -> req_reval=1 -> refetch from origin instead
+    # of serving the rejected L2 copy.
+    s2, b2, h2 = fetch(ng.port, uri,
+                       headers={"Cache-Control": "min-fresh=999"})
+    assert s2 == 200, f"revalidated read should still be 200, got {s2}"
+    assert b2 != base, \
+        "min-fresh=999 must revalidate the L2 copy at origin (new body), " \
+        "not replay the rejected stored blob"
+    assert h2.get("x-ct-status") != "HIT", \
+        f"min-fresh=999 must refuse the L2-served HIT, got " \
+        f"{h2.get('x-ct-status')}"
+
+    drain_origin(origin)
+
+
 def tag_key(name: str, prefix: str = "ct:") -> str:
     """Mirror the module's tag-set key: <prefix>tag:<name>."""
     return f"{prefix}tag:{name}"
@@ -14638,6 +14735,7 @@ def run_all(ng: Nginx, origin: Origin,
         test_l2_cross_instance_fill(ng, origin, redis)
         test_l2_purge_key_drops_l2(ng, origin, redis)
         test_l2_expired_consults_l2(ng, origin, redis)
+        test_request_cc_serve_verdict_l2(ng, origin, redis)  # C-S5-a L2 verdict arm
         test_l2_preserves_original_freshness(ng, origin, redis)
         test_l2_malformed_blob_rejected(ng, origin, redis)  # STAB-4 validate
         test_sie_ttl_stored_in_blob(ng, origin, redis)      # RFC-2 CTB4 sie_ttl
