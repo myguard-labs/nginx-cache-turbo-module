@@ -83,6 +83,15 @@
  * layout silently. */
 #define NGX_PTR_SIZE  __SIZEOF_POINTER__
 
+/* H-2/O4.4-j: this harness always builds the TEST_FAULTS-gated diagnostic
+ * paths (breaker_wedge_observed here; test_brk_armings is exercised by a
+ * different, black-box test instead and is not referenced by this file).
+ * Defined here, once, ahead of generated_shm.inc's #include, rather than as
+ * a Makefile -D so `make check`/`make run` need no flag threading and stay
+ * the single source of truth for "this harness always compiles the
+ * TEST_FAULTS arms". Production and package builds never define this. */
+#define NGX_HTTP_CACHE_TURBO_TEST_FAULTS  1
+
 /* --- core types (nginx ngx_config.h / ngx_core.h) --- */
 typedef intptr_t    ngx_int_t;
 typedef uintptr_t   ngx_uint_t;

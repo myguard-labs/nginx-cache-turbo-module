@@ -95,7 +95,9 @@ check_define NGX_HTTP_CACHE_TURBO_BRK_ACT_FAIL  2
 # expression (sizeof(ngx_atomic_t) * 8), not a literal, so it is verified
 # structurally instead: assert both copies of the expression are textually
 # identical. The STAMP_BITS/GEN_BITS split is width-conditional
-# (#if NGX_PTR_SIZE >= 8), so both arms are checked against both copies.
+# (#if NGX_PTR_SIZE >= 8); only the >= 8 arm ships (H-2/O4.4-j rejects the
+# narrow layout at compile time -- see the layout comment in module.h), so
+# only that arm's literal is pinned here.
 check_probe_layout() {
     hdr_expr=$(grep -A1 \
         '^#define NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_WORD_BITS' "$HDR" \
@@ -114,7 +116,7 @@ check_probe_layout() {
         exit 1
     fi
 
-    for bits in 32 20; do
+    for bits in 32; do
         hdr_n=$(grep -c \
             "NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_STAMP_BITS  $bits\$" "$HDR" \
             || true)

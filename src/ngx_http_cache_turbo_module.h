@@ -570,8 +570,10 @@ typedef struct {
  * ⚠ Generation 0 stays the NO_PROBE sentinel in the MASKED field as well: the
  * promotion skips a masked generation of 0 exactly as it skips a full one, so
  * no live lease is ever identified by 0 on either width. Aliasing needs a full
- * wrap of the masked field (2^PROBE_GEN_BITS promotions) to land inside one
- * lease window, which one-promotion-per-open-window cannot reach.
+ * wrap of the masked field (2^PROBE_GEN_BITS - 1 promotions, since generation
+ * 0 is skipped) to land inside one lease window -- see H-2's resolution
+ * above for why that period must still be made unreachable rather than
+ * merely large.
  *
  * Pinned by test_breaker_fresh_lease_not_reclaimable_via_old_stamp() and
  * ci/tests/unit/check_constants.sh (H-4: NOT extract_shm.sh, which slices
@@ -582,16 +584,28 @@ typedef struct {
     ((ngx_uint_t) (sizeof(ngx_atomic_t) * 8))
 
 /* Stamp width: 32 bits of relative seconds on a 64-bit atomic (~136 years,
- * i.e. never wraps in a process lifetime); 20 bits on a 32-bit atomic (~12
- * days), which leaves 12 bits of generation.
+ * i.e. never wraps in a process lifetime), which leaves 32 bits of
+ * generation -- a masked-generation wrap period of 2^32 - 1 promotions
+ * (generation 0 is skipped as the NO_PROBE sentinel, see the pack-site
+ * comment below), unreachable by continuous flapping in any realistic
+ * uptime.
  *
- * ⚠ The narrow layout DOES wrap in ordinary operation, so the age computation
- * must be modular in this field -- see _brk_probe_age(). An earlier revision
- * subtracted a masked stamp from a full-width elapsed value, which made a lease
- * stamped moments after a wrap read as a whole field-width old and therefore
- * instantly reclaimable. That is reached by uptime alone, not by an attacker.
- * Modular subtraction is correct because a real lease age is always far smaller
- * than the field. */
+ * ⚠ The narrow (32-bit atomic) layout DOES wrap in ordinary operation. Its
+ * old 20/12 split gave a masked-generation wrap period of 2^12 - 1 = 4095
+ * promotions -- roughly 34 hours of continuous open/probe/reopen flapping at
+ * `open_for 30s` -- which is the H-2 ABA producer: a promoter parked between
+ * the publication CAS and the state CAS across a full masked-generation wrap
+ * finds its expectation coincidentally matching, publishing a probe word for
+ * the WRONG live generation. No split of a 32-bit word gives both a stamp
+ * field wide enough to measure a BREAKER_PROBE_LEASE-aged lease without
+ * wrapping (see the modular-age note above) and a generation field wide
+ * enough to put a flapping-driven wrap out of reach: shrinking the stamp
+ * to buy generation bits only trades one wrap hazard for a faster one. This
+ * module's own package builds are 64-bit, so rather than ship a layout with
+ * a reachable wedge, the narrow layout is rejected outright -- see the
+ * #error below. If a 32-bit target is ever genuinely required, closing H-2
+ * there needs a wider piece of state than one ngx_atomic_t (e.g. a separate
+ * monotonic promotion-sequence field), not a different bit split. */
 /* H-1: an undefined NGX_PTR_SIZE must be a hard build error here, not a
  * silent fallback to the narrow layout. NGX_PTR_SIZE normally comes from
  * nginx's own objs/ngx_auto_config.h; any build that reaches this point
@@ -604,10 +618,17 @@ typedef struct {
 #error "NGX_PTR_SIZE is not defined -- cannot select the breaker probe word layout"
 #endif
 
+/* H-2/O4.4-j: the 32-bit-atomic (NGX_PTR_SIZE < 8) layout is rejected
+ * outright rather than built with a reachable masked-generation ABA wrap.
+ * See the block comment above for why no bit split fixes this on a single
+ * 32-bit word. */
 #if (NGX_PTR_SIZE >= 8)
 #define NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_STAMP_BITS  32
 #else
-#define NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_STAMP_BITS  20
+#error "the 32-bit breaker probe word layout has a reachable H-2 masked-" \
+       "generation ABA wrap (~34h of continuous flapping); this module " \
+       "ships 64-bit builds only -- see the packed-probe layout comment " \
+       "in ngx_http_cache_turbo_module.h"
 #endif
 
 #define NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_STAMP_MASK                         \
@@ -984,6 +1005,27 @@ typedef struct {
      * builds do not define the macro and so have neither the field nor the
      * header that reports it. */
     ngx_atomic_t             test_brk_armings;
+
+    /* H-2/O4.4-j: lifetime count of times the reclaim predicate's `else`
+     * (breaker_state.c ~1339) was reached with an observed generation
+     * MISMATCH (probe.gen != state.gen && probe.gen != NO_PROBE) -- i.e. a
+     * wedge candidate, the H-2 condition. Part 1 closes the only known
+     * reachable producer (the masked-generation ABA wrap) at compile time,
+     * so this should read 0 in any real deployment; it exists to make a
+     * wedge OPERATOR-VISIBLE rather than silent if that analysis is ever
+     * wrong, or a future change reopens a producer.
+     *
+     * TEST_FAULTS-gated for the same reason test_brk_armings is (O4.4-i):
+     * a prior session rejected adding a permanent public admin-JSON field
+     * purely to serve a test. This is diagnostic, not test-only, but the
+     * module currently has no other precedent for a permanent counter that
+     * is not otherwise operationally load-bearing (breaker_opens feeds the
+     * admin JSON because operators act on trip counts directly) -- so it
+     * follows the existing TEST_FAULTS convention rather than adding a new
+     * one unilaterally. See the O4.4-h/H-2 decision packet in the grind
+     * ledger for the "permanent public field" vs "TEST_FAULTS-gated" choice
+     * this mirrors. */
+    ngx_atomic_t             breaker_wedge_observed;
 #endif
 } ngx_http_cache_turbo_shctx_t;
 

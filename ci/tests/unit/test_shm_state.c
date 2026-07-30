@@ -119,10 +119,19 @@ typedef struct {
 #error "NGX_PTR_SIZE is not defined -- cannot select the breaker probe word layout"
 #endif
 
+/* H-2/O4.4-j: mirrors the real header's rejection of the 32-bit-atomic
+ * layout (reachable masked-generation ABA wrap; see the layout comment in
+ * ngx_http_cache_turbo_module.h). This harness always builds at the host's
+ * real pointer width via __SIZEOF_POINTER__ (ngx_shim_shm.h), so on any
+ * 64-bit dev/CI box this arm is inert -- it exists so a 32-bit run of this
+ * same harness fails the same way the real build does, rather than silently
+ * compiling and testing a layout the header no longer ships. */
 #if (NGX_PTR_SIZE >= 8)
 #define NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_STAMP_BITS  32
 #else
-#define NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_STAMP_BITS  20
+#error "the 32-bit breaker probe word layout has a reachable H-2 masked-" \
+       "generation ABA wrap; this module ships 64-bit builds only -- see " \
+       "ngx_http_cache_turbo_module.h"
 #endif
 
 #define NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_STAMP_MASK                         \
@@ -186,6 +195,11 @@ typedef struct {
     ngx_atomic_t        breaker_state, breaker_fails, breaker_window_start;
     ngx_atomic_t        breaker_opened_at, breaker_probe, breaker_opens;
     ngx_atomic_t        breaker_epoch;
+    ngx_atomic_t        breaker_wedge_observed; /* H-2/O4.4-j, TEST_FAULTS-gated
+                                                 * in the real header; mirrored
+                                                 * unconditionally here since
+                                                 * this harness always builds
+                                                 * as if TEST_FAULTS */
 } ngx_http_cache_turbo_shctx_t;
 
 typedef struct {
@@ -1374,26 +1388,32 @@ test_breaker_unpublished_lease_is_not_reclaimable(void)
  * generation's stamp.
  *
  * ⚠ This is the case test_breaker_unpublished_lease_is_not_reclaimable() above
- * does NOT cover, and the distinction is the whole bug. That test constructs a
- * bare HALF_OPEN -- generation 0, stamp 0 -- so it is rejected by the `stamp
- * != 0` guard, which only ever covered the very first lease of a zeroed zone.
- * The reachable race has a NON-ZERO expired stamp:
+ * does NOT cover, and the distinction matters even though the fixture is now
+ * constructed rather than reachable through promotion.
  *
- *   generation N-1's lease ran its full course, so the probe word holds a
- *   real, long-expired epoch stamp. A promoter then CASes the state word to
- *   generation N and is descheduled BEFORE re-stamping. A reader now loads the
- *   packed word (generation N, HALF_OPEN) and, separately, that expired
- *   generation-N-1 stamp. Its reclaim CAS expects the word it just loaded --
- *   generation N, which IS current -- so the CAS SUCCEEDS and it reclaims a
- *   lease milliseconds old, admitting a second concurrent probe.
+ * What this pins (H-2/O4.4-j): the reclaim predicate's generation-equality
+ * arm REFUSES to tear down a fresh generation just because a stale, expired
+ * stamp from a DIFFERENT generation happens to be sitting in breaker_probe.
+ * That refusal is the correct, load-bearing half of the predicate -- without
+ * it, any mismatch reads as reclaimable and a live lease could be torn down
+ * out from under its promoter, admitting a second concurrent probe.
  *
- * The generation does not rescue this on its own: nothing compares the STAMP's
- * generation to the state word's. That is what the fix binds together, and it
- * is why the in-code comment claiming such a reader "is testing against
- * generation N-1 and loses" was wrong -- it loaded N.
+ * This exact state is no longer reachable via the promotion path: state and
+ * probe are loaded together in one snapshot and the generation is derived
+ * from that same snapshot (see the comment at the paired load site), so a
+ * promoter that publishes generation N's probe word and is then descheduled
+ * before its state CAS simply loses that CAS and writes nothing -- it cannot
+ * leave a fresh HALF_OPEN(N) paired with a stale probe(N-1) behind. The one
+ * residual, real producer of a mismatched pair is ABA on the MASKED
+ * generation field (a promoter's stale CAS expectation coincidentally
+ * matching again after a full wrap), which Part 1 closes by construction
+ * (see the packed-probe layout comment in ngx_http_cache_turbo_module.h).
  *
- * Constructed directly, like the ABA fixtures above: the state is reachable in
- * production, only the schedule that produces it is unreachable here. */
+ * The fixture is kept as a direct construction, not deleted, because the
+ * predicate's refusal-to-reclaim-a-fresh-generation invariant is worth
+ * pinning on its own merits independent of which schedule can currently
+ * produce the mismatch -- and because a future change that reopens some
+ * OTHER mismatch producer must still find this refusal intact. */
 static void
 test_breaker_fresh_lease_not_reclaimable_via_old_stamp(void)
 {
@@ -1413,9 +1433,11 @@ test_breaker_fresh_lease_not_reclaimable_via_old_stamp(void)
     brk_set_probe(7, ngx_test_now);
     ngx_test_advance_time((time_t) NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_LEASE + 1);
 
-    /* Generation N (8) has won its state CAS but its promoter was descheduled
-     * before publishing a probe word, so the fresh HALF_OPEN is paired with
-     * generation 7's stale, expired stamp. THIS is the O4.4-h state. */
+    /* Generation N (8) is constructed directly, paired with generation 7's
+     * stale, expired stamp still sitting in breaker_probe. Not reachable via
+     * the promotion path anymore (see the block comment above) -- this
+     * exercises the reclaim predicate's refusal directly, independent of
+     * which schedule produces the mismatch in production. */
     g_sh.breaker_state = (ngx_atomic_t) ngx_http_cache_turbo_brk_pack(
                              8, NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN);
 
@@ -1440,6 +1462,75 @@ test_breaker_fresh_lease_not_reclaimable_via_old_stamp(void)
     CHECK(probe_b == NGX_HTTP_CACHE_TURBO_BREAKER_NO_PROBE,
           "a second probe was issued a lease token while generation N's probe "
           "was still live");
+}
+
+
+/* H-2/O4.4-j: the wedge counter (breaker_wedge_observed) must increment
+ * exactly when the reclaim predicate's `else` is reached with an observed
+ * generation MISMATCH -- the H-2 condition -- and must NOT increment on the
+ * two adjacent, ordinary else-paths: no probe published yet (NO_PROBE) and a
+ * probe of the SAME generation that simply has not aged past the lease yet.
+ * Those two are routine and would swamp an unconditional counter with
+ * non-events, which is exactly why the increment site is scoped to the
+ * mismatch case specifically rather than the whole else branch.
+ *
+ * Uses the same fixture construction as
+ * test_breaker_fresh_lease_not_reclaimable_via_old_stamp() (direct
+ * construction of a mismatched pair -- see that test's comment for why the
+ * promotion path itself cannot produce this anymore, and why the fixture is
+ * still worth constructing directly). */
+static void
+test_breaker_wedge_counter_observes_mismatch(void)
+{
+    ngx_uint_t  probe_b;
+
+    printf("breaker: the wedge counter increments only on an observed "
+           "generation mismatch\n");
+
+    /* --- positive: construct the mismatch and confirm the counter moves. */
+    zone_reset();
+    REQUIRE(g_sh.breaker_wedge_observed == 0,
+            "breaker fixture: wedge counter not zero at zone_reset()");
+
+    brk_set_probe(7, ngx_test_now);
+    ngx_test_advance_time((time_t) NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_LEASE + 1);
+    g_sh.breaker_state = (ngx_atomic_t) ngx_http_cache_turbo_brk_pack(
+                             8, NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN);
+    REQUIRE(ngx_http_cache_turbo_brk_probe_gen(g_sh.breaker_probe)
+                != (ngx_http_cache_turbo_brk_gen(g_sh.breaker_state)
+                    & NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_GEN_MASK),
+            "breaker fixture: no mismatch constructed, counter test proves "
+            "nothing");
+
+    (void) brk_probe_state(30, &probe_b);
+    CHECK(g_sh.breaker_wedge_observed == 1,
+          "an observed generation mismatch did not increment "
+          "breaker_wedge_observed");
+
+    /* A second observation of the SAME wedge bumps it again -- it is a
+     * lifetime counter of OBSERVATIONS, not a latch. */
+    (void) brk_probe_state(30, &probe_b);
+    CHECK(g_sh.breaker_wedge_observed == 2,
+          "a second observation of the same wedge did not increment "
+          "breaker_wedge_observed again");
+
+    /* --- negative: NO_PROBE (zeroed zone) must not count as a wedge. */
+    zone_reset();
+    g_sh.breaker_state = NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN; /* gen 0 */
+    g_sh.breaker_probe = 0;                                      /* NO_PROBE */
+    (void) brk_probe_state(30, &probe_b);
+    CHECK(g_sh.breaker_wedge_observed == 0,
+          "an unpublished (NO_PROBE) lease was miscounted as a wedge");
+
+    /* --- negative: a live, SAME-generation, not-yet-expired probe must not
+     * count as a wedge either -- it is the ordinary in-flight-probe path. */
+    zone_reset();
+    brk_set_probe(5, ngx_test_now);
+    g_sh.breaker_state = (ngx_atomic_t) ngx_http_cache_turbo_brk_pack(
+                             5, NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN);
+    (void) brk_probe_state(30, &probe_b);
+    CHECK(g_sh.breaker_wedge_observed == 0,
+          "a live same-generation probe was miscounted as a wedge");
 }
 
 
@@ -1529,54 +1620,49 @@ brk_probe_age_at_width(ngx_uint_t stamp_bits, ngx_uint_t rel_raw,
     return (time_t) ((rel - stamp) & mask);
 }
 
+/* H-2/O4.4-j: this used to loop over BOTH the 32-bit-stamp (64-bit atomic)
+ * and 20-bit-stamp (32-bit atomic) widths, because both were shippable
+ * layouts. The 32-bit-atomic layout is now rejected at compile time (see the
+ * layout #error mirrored above and in ngx_http_cache_turbo_module.h) because
+ * its 12-bit generation field gives a masked-generation ABA wrap reachable
+ * by ~34h of continuous open/probe/reopen flapping -- the H-2 wedge
+ * producer. There is now only one layout this module ships, so only it is
+ * exercised; the function stays parametric over stamp_bits rather than
+ * hardcoding 32 so a future, deliberately-added second layout can extend
+ * this loop instead of rewriting it. */
 static void
 test_breaker_probe_age_is_modular_both_widths(void)
 {
-    ngx_uint_t  width;
+    ngx_uint_t  stamp_bits = 32;
+    ngx_uint_t  span       = (((ngx_uint_t) 1) << stamp_bits);
+    time_t      age;
 
-    printf("breaker: the modular age formula is correct at both the 64-bit "
-           "(32-bit stamp) and 32-bit (20-bit stamp) atomic widths\n");
+    printf("breaker: the modular age formula is correct at the only shipped "
+           "(64-bit atomic, 32-bit stamp) width\n");
 
-    for (width = 0; width < 2; width++) {
-        ngx_uint_t  stamp_bits = (width == 0) ? 32 : 20;
-        ngx_uint_t  span       = (((ngx_uint_t) 1) << stamp_bits);
-        time_t      age;
+    /* A lease stamped "now" (rel == stamp, mod width): age must be 0
+     * regardless of how large the untruncated rel is, including exactly at
+     * and just past a field wrap -- the case the non-modular form
+     * (rel_full - stamp, unmasked on the left) gets wrong. */
+    age = brk_probe_age_at_width(stamp_bits, span, 0);
+    CHECK(age == 0,
+          "32-bit stamp width: a lease stamped at a field wrap read as "
+          "non-zero age");
 
-        /* A lease stamped "now" (rel == stamp, mod width): age must be 0
-         * regardless of how large the untruncated rel is, including exactly
-         * at and just past a field wrap -- the case the non-modular form
-         * (rel_full - stamp, unmasked on the left) gets wrong. */
-        age = brk_probe_age_at_width(stamp_bits, span, 0);
-        CHECK(age == 0,
-              width == 0
-                  ? "32-bit stamp width: a lease stamped at a field wrap "
-                    "read as non-zero age"
-                  : "20-bit stamp width: a lease stamped at a field wrap "
-                    "read as non-zero age");
+    /* A lease stamped at one field-boundary, sampled 5s into the NEXT wrap:
+     * both raw values truncate to 5 and 0 respectively, so the modular age
+     * must read 5 -- not "span - stamp" (the pre-fix linear-form bug's
+     * near-field-width answer). */
+    age = brk_probe_age_at_width(stamp_bits, 2 * span + 5, span);
+    CHECK(age == 5,
+          "32-bit stamp width: modular age across a wrap did not read the "
+          "true elapsed seconds");
 
-        /* A lease stamped at one field-boundary, sampled 5s into the NEXT
-         * wrap: both raw values truncate to 5 and 0 respectively, so the
-         * modular age must read 5 -- not "span - stamp" (the pre-fix
-         * linear-form bug's near-field-width answer, e.g. failure text
-         * literally the ledger's measured "1048566" on the 20-bit layout). */
-        age = brk_probe_age_at_width(stamp_bits, 2 * span + 5, span);
-        CHECK(age == 5,
-              width == 0
-                  ? "32-bit stamp width: modular age across a wrap did not "
-                    "read the true elapsed seconds"
-                  : "20-bit stamp width: modular age across a wrap did not "
-                    "read the true elapsed seconds");
-
-        /* Sanity: a fresh, non-wrapped lease still reads correctly at both
-         * widths (span not involved at all). */
-        age = brk_probe_age_at_width(stamp_bits, 1000, 990);
-        CHECK(age == 10,
-              width == 0
-                  ? "32-bit stamp width: plain (non-wrapped) modular age "
-                    "was wrong"
-                  : "20-bit stamp width: plain (non-wrapped) modular age "
-                    "was wrong");
-    }
+    /* Sanity: a fresh, non-wrapped lease still reads correctly (span not
+     * involved at all). */
+    age = brk_probe_age_at_width(stamp_bits, 1000, 990);
+    CHECK(age == 10,
+          "32-bit stamp width: plain (non-wrapped) modular age was wrong");
 }
 
 
@@ -2714,6 +2800,38 @@ run_negative_controls(void)
             tests_failed++;
         }
     }
+
+    /* H-2/O4.4-j: model the bug of bumping breaker_wedge_observed for EVERY
+     * reach of the reclaim predicate's else (not just an actual generation
+     * mismatch) -- the "bumped outside the specific condition" mistake the
+     * real increment site's comment warns against. Re-implemented here
+     * against the same fixture test_breaker_wedge_counter_observes_mismatch()
+     * uses for its NO_PROBE negative case: with the bug, that ordinary
+     * zeroed-zone HALF_OPEN (no probe published yet) would ALSO bump the
+     * counter, which is exactly the false-positive the real site's scoping
+     * exists to avoid. */
+    zone_reset();
+    g_sh.breaker_state = NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN; /* gen 0 */
+    g_sh.breaker_probe = 0;                                      /* NO_PROBE */
+    {
+        ngx_uint_t          probe_b;
+        ngx_atomic_uint_t   buggy_wedge_counter = 0;
+
+        (void) brk_probe_state(30, &probe_b);
+        /* the bug: unconditional bump on reaching the else at all */
+        buggy_wedge_counter++;
+
+        caught = (buggy_wedge_counter == 1 && g_sh.breaker_wedge_observed == 0);
+        tests_run++;
+        if (!caught) {
+            fprintf(stderr, "  ✗ CONTROL H-2/O4.4-j: an unconditional bump "
+                            "on the else branch did not diverge from the "
+                            "scoped real counter — the NO_PROBE negative "
+                            "case in test_breaker_wedge_counter_observes_"
+                            "mismatch() guards nothing\n");
+            tests_failed++;
+        }
+    }
 }
 
 int
@@ -2740,6 +2858,7 @@ main(void)
     test_breaker_stale_success_does_not_close();
     test_breaker_unpublished_lease_is_not_reclaimable();
     test_breaker_fresh_lease_not_reclaimable_via_old_stamp();
+    test_breaker_wedge_counter_observes_mismatch();
     test_breaker_probe_age_is_modular();
     test_breaker_probe_age_is_modular_both_widths();
     test_breaker_backwards_clock_step_does_not_reclaim();

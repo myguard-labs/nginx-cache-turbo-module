@@ -1297,38 +1297,37 @@ ngx_http_cache_turbo_shm_breaker_state(ngx_http_cache_turbo_zone_t *z,
          * The generation equality alone is therefore necessary but not
          * sufficient; NO_PROBE must be rejected on its own.
          *
-         * ⚠⚠ H-2 (open, NOT fixed here -- see the module's ledger entry and
-         * the s141/grind decision packet): a generation MISMATCH (state gen
-         * N, probe gen != N, not NO_PROBE) is never reclaimed by this
-         * predicate at all, because the equality arm above requires an exact
-         * match before the age test even runs. If that mismatch is ever
-         * reached (an ABA on the probe word: a stale promoter's publication
-         * survives a HALF_OPEN later promoted by a DIFFERENT generation),
-         * every future call falls to the `else` below and returns OPEN
-         * forever -- a permanent wedge, no probe ever promoted again.
+         * ⚠⚠ H-2 (resolved -- O4.4-j): a generation MISMATCH (state gen N,
+         * probe gen != N, not NO_PROBE) is never reclaimed by this predicate,
+         * because the equality arm above requires an exact match before the
+         * age test even runs. Every caller reaching the `else` below with a
+         * mismatch returns OPEN -- so the fix is making that mismatch
+         * unreachable, not teaching this predicate to reclaim it (both tried
+         * directions there broke test_breaker_fresh_lease_not_reclaimable_
+         * via_old_stamp(), which correctly pins that a momentarily-mismatched
+         * FRESH generation must not be torn down on sight).
          *
-         * Two fix directions were tried and REJECTED, both demonstrated by a
-         * failing existing test, not merely reasoned about:
-         *   - reclaim a mismatch unconditionally: breaks
-         *     test_breaker_fresh_lease_not_reclaimable_via_old_stamp() (a
-         *     provably FRESH generation N, momentarily paired with N-1's
-         *     stale stamp by an ordinary descheduling window, must NOT be
-         *     torn down the instant it is observed).
-         *   - reclaim a mismatch once breaker_opened_at (the CURRENT
-         *     generation's own promotion stamp, unlike the mismatched probe
-         *     stamp) ages past BREAKER_PROBE_LEASE: breaks the SAME test,
-         *     because that fixture never sets breaker_opened_at either, so
-         *     it is indistinguishable from a genuinely wedged generation by
-         *     any state this function can read within one deadline window.
-         * No third signal in the current shared-memory layout separates
-         * "briefly mismatched, about to self-heal when the promoter's second
-         * store lands" from "permanently mismatched, promoter never
-         * returns" -- both look identical to a reader. Resolving this needs
-         * either a new piece of state (e.g. a monotonic per-zone promotion
-         * sequence number distinct from the masked generation) or accepting
-         * the wedge as a bounded-probability, operator-visible failure mode
-         * (a metrics/log signal + manual/orchestration-level breaker reset).
-         * Left OPEN rather than shipping either rejected fix.
+         * Divergence was traced to exactly one reachable producer:
+         *   - The promotion path cannot produce it: `word` and `probe_word`
+         *     are loaded ONCE, together, above (see the comment there), and
+         *     `gen` is derived from that same snapshot. A promoter working
+         *     from a stale snapshot fails its publication CAS below and
+         *     writes nothing -- it cannot drive probe.gen backwards or publish
+         *     against a generation other than the one it observed.
+         *   - _breaker_record()'s three state writers (close, failed-probe,
+         *     trip) each write breaker_state alone and never bump the
+         *     generation, so none of them can produce a divergent pair either.
+         *   - The one real producer is ABA on the MASKED generation field: a
+         *     promoter parked between the publish CAS and the state CAS
+         *     across a full wrap of the masked generation finds its stale
+         *     expectation coincidentally matching again. That wrap is closed
+         *     by construction on the 64-bit (32-bit generation) layout and
+         *     the 32-bit-atomic layout is rejected at compile time rather
+         *     than shipped with a reachable wrap -- see the packed-probe
+         *     layout comment in the header for the wrap-period arithmetic
+         *     and why no other bit split fixes it.
+         * A wedge landing here despite that is therefore now itself the
+         * anomaly signal: see the else-branch counter below.
          *
          * Pinned by test_breaker_unpublished_lease_is_not_reclaimable() and
          * test_breaker_fresh_lease_not_reclaimable_via_old_stamp().
@@ -1378,6 +1377,23 @@ ngx_http_cache_turbo_shm_breaker_state(ngx_http_cache_turbo_zone_t *z,
             state = NGX_HTTP_CACHE_TURBO_BREAKER_OPEN;
 
         } else {
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+            /* H-2/O4.4-j: this else is reached whenever open_for > 0 and the
+             * equality arm above failed. Count it as a wedge candidate only
+             * for the actual mismatch case -- NOT the "no probe yet"
+             * (NO_PROBE) or "probe still fresh" (age < LEASE) cases, which
+             * also fall through here on every ordinary request and would
+             * swamp the counter with non-events. */
+            if (ngx_http_cache_turbo_brk_probe_gen(probe_word)
+                    != NGX_HTTP_CACHE_TURBO_BREAKER_NO_PROBE
+                && ngx_http_cache_turbo_brk_probe_gen(probe_word)
+                       != (ngx_http_cache_turbo_brk_gen(word)
+                           & NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_GEN_MASK))
+            {
+                (void) ngx_atomic_fetch_add(&z->sh->breaker_wedge_observed, 1);
+            }
+#endif
             return NGX_HTTP_CACHE_TURBO_BREAKER_OPEN;
         }
     }
