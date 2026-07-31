@@ -13658,6 +13658,66 @@ def test_l2_tag_cap_and_dedup(ng: Nginx, origin: Origin,
         "duplicate tag produced more than one membership"
 
 
+def test_l2_tag_purge_arg_validation(ng: Nginx, origin: Origin,
+                                     redis: RedisServer) -> None:
+    """AUD-TAG1: the ?tag= purge argument is taken raw from ngx_http_arg with
+    no length/charset check of its own, unlike cache_turbo_tag's own tokeniser
+    (test_l2_tag_cap_and_dedup et al) which caps each tag at MAX_TAG_LEN (128)
+    and splits on space/tab/comma/CR/LF. The purge arg must mirror those SAME
+    rules so a purge request can never even ask about a byte string the
+    tokeniser could not have produced as a tag.
+
+    ngx_http_arg does not URL-decode, and a literal space/tab/CR/LF in the
+    request-target is invalid HTTP grammar -- nginx's own core parser 400s the
+    request before it ever reaches our handler (verified: a raw socket sending
+    '?tag=news<TAB>blog' gets nginx's stock text/html 400 page, not our JSON
+    error body). So those bytes can never actually reach ngx_http_arg; the
+    check against them is defense-in-depth against a DISTANT parser rather
+    than something a live request can exercise, exactly like the ledger's
+    note on the plain space case. Comma is the one separator byte that IS
+    valid in a request-target and reaches ngx_http_arg intact, so it is what
+    proves the charset check fires for real; length is proven directly since
+    an over-long ASCII tag is ordinary, well-formed HTTP. Rejections take the
+    existing bad-input shape for this handler: 400 with a JSON {"error": ...}
+    body (see the sibling 'requires cache_turbo_redis' 400 a few lines above
+    the validation)."""
+    # over-length: 129 bytes, one past MAX_TAG_LEN (128).
+    s, b, _ = fetch(ng.port, f"/_cache_l2?tag={'a' * 129}", method="POST")
+    assert s == 400, f"129-byte tag should be rejected, got {s}: {b}"
+    assert "invalid tag" in json.loads(b)["error"], \
+        f"expected an 'invalid tag' error for an over-length tag, got {b}"
+
+    # exactly at the cap (128 bytes) must NOT be rejected by the length check
+    # -- proves the check is > not >=. (Backend absent path already covered by
+    # the 'requires cache_turbo_redis' test elsewhere; this only needs to get
+    # past the length gate, so any redis-backed status other than the
+    # over-length 400 proves it.)
+    s, b, _ = fetch(ng.port, f"/_cache_l2?tag={'b' * 128}", method="POST")
+    assert s == 200, f"exactly-128-byte tag should pass validation, got {s}: {b}"
+
+    # comma: a real, unencoded query byte that reaches ngx_http_arg intact.
+    s, b, _ = fetch(ng.port, "/_cache_l2?tag=news,blog", method="POST")
+    assert s == 400, f"comma in tag should be rejected, got {s}: {b}"
+    assert "invalid tag" in json.loads(b)["error"], \
+        f"expected an 'invalid tag' error for a comma-bearing tag, got {b}"
+
+    # Positive control: an ordinary legitimate tag purges exactly as before --
+    # proves the new check does not over-reject real traffic. /l2tcap/ takes
+    # its tag from $arg_t so a custom tag name can be primed here.
+    redis.cli("DEL", tag_key("valtest"))
+    path = "/l2tcap/valtest-obj"
+    fetch(ng.port, f"{path}?t=valtest")               # miss -> origin -> store+tag
+    obj = l2_key(path)
+    assert wait_for(lambda: redis.cli("SISMEMBER", tag_key("valtest"),
+                                       obj) == "1"), \
+        "object never joined tag set 'valtest'"
+    s, b, _ = fetch(ng.port, "/_cache_l2?tag=valtest", method="POST")
+    assert s == 200, f"legitimate tag purge should succeed, got {s}: {b}"
+    assert json.loads(b)["purged"] == 1, f"expected 1 purged, got {b}"
+    assert wait_for(lambda: redis.cli("EXISTS", tag_key("valtest")) == "0"), \
+        "legitimate tag purge should still remove the tag set"
+
+
 def test_l2_tag_add_batched_one_op(ng: Nginx, origin: Origin,
                                    redis: RedisServer) -> None:
     """L9: a store naming N tags indexes them in ONE pipelined Redis op, not N.
