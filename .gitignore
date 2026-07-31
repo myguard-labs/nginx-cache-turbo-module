@@ -18,6 +18,7 @@ coverage-report/
 
 # Unit-test build binary (source under ci/tests/unit/ IS tracked)
 ci/tests/unit/test_math
+ci/tests/unit/test_vary_gen
 ci/tests/unit/test_shm_state
 ci/tests/unit/test_shm_state.san
 
