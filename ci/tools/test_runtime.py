@@ -9692,6 +9692,38 @@ def test_cor5_l1only_variant_purge(ng: Nginx, origin: Origin) -> None:
         f"fr variant survived PURGE: X-Cache={hf2.get('x-cache')} body={fr2!r}"
 
 
+def test_cor5_l1only_variant_purge_gen_wrap(ng: Nginx, origin: Origin) -> None:
+    """AUD-GEN1: the L1-only auto-Vary purge marker's generation is a
+    one-byte counter (module.c marker_store). The 256th PURGE of the same
+    base used to wrap the stored byte back to 0 -- the value ALSO used by a
+    never-purged base -- so a variant purged exactly 256 times could resolve
+    back to whatever was still resident under the pre-purge/never-purged
+    key and resurrect as a live HIT. Runs the base through a real 256-purge
+    cycle (the wrap boundary) and asserts the variant is still a genuine
+    MISS afterward, not a resurrected stale HIT."""
+    import json
+    en = {"Accept-Language": "en"}
+    # prime one variant so a marker (gen=0) exists for this base.
+    _, en0, _ = fetch(ng.port, "/cor5l1/gen?v=al", headers=en)
+    _, en1, he1 = fetch(ng.port, "/cor5l1/gen?v=al", headers=en)
+    assert he1.get("x-cache") == "HIT" and en1 == en0, "en variant should cache"
+    # 256 PURGEs: #1..#255 bump the marker through the normal (non-wrapping)
+    # range; #256 is the wrap (256 & 0xFF == 0, the defect boundary).
+    for i in range(1, 257):
+        s, b, _ = fetch_raw(ng.port, "/cor5l1/gen?v=al", method="PURGE")
+        assert s == 200, f"PURGE #{i} status {s}"
+        assert json.loads(b)["purged"] >= 0, f"PURGE #{i} malformed body: {b}"
+    # post-wrap: the variant must be a genuine MISS (fresh origin body), never
+    # a HIT on the pre-purge #1 body that AUD-GEN1's wrap would resurrect.
+    _, en2, he2 = fetch(ng.port, "/cor5l1/gen?v=al", headers=en)
+    assert "x-cache" not in he2, \
+        (f"AUD-GEN1: variant resolved as a HIT immediately after the 256th "
+         f"PURGE (marker generation wrap) -- X-Cache={he2.get('x-cache')}")
+    assert en2 != en0, \
+        "AUD-GEN1: post-wrap body matches the pre-purge #1 body -- purged " \
+        "variant resurrected"
+
+
 def test_cor5_redis_variant_purge(ng: Nginx, origin: Origin,
                                   redis: RedisServer) -> None:
     """COR-5 (Redis-backed): a PURGE of an auto-Vary base URI must drop every
@@ -15323,6 +15355,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_rfc2_swr_duration_extends_stale(ng, origin)
     test_purge_method(ng)
     test_cor5_l1only_variant_purge(ng, origin)
+    test_cor5_l1only_variant_purge_gen_wrap(ng, origin)
     test_cache_and_purge_respect_access_control(ng)
     test_bypass(ng)
     test_bypass_uri(ng)

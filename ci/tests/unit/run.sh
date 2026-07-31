@@ -26,6 +26,13 @@ fi
 "$CC" $CFLAGS "$DIR/test_math.c" -o "$DIR/test_math"
 "$DIR/test_math"
 
+# --- auto-Vary purge generation wrap (AUD-GEN1) ----------------------------
+# Pure-math mirror of marker_store/variant_hash's gen write/truncate/fold --
+# see the header comment in test_vary_gen.c for why a mirror, not a #include.
+# shellcheck disable=SC2086
+"$CC" $CFLAGS "$DIR/test_vary_gen.c" -o "$DIR/test_vary_gen"
+"$DIR/test_vary_gen"
+
 # --- L2 blob deserializer fixtures (AUD-HDR1 / AUD-FUZZ1) -----------------
 # Deterministic, hermetic (no nginx tree, no libFuzzer engine): one fixture per
 # header-injection primitive, driven through the SAME oracle ci/fuzz/fuzz_blob.c

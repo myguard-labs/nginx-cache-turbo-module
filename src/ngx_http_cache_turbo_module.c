@@ -1797,6 +1797,7 @@ ngx_http_cache_turbo_purge_request(ngx_http_request_t *r,
         u_char                        mk[32];
         ngx_int_t                     bits = 0;
         ngx_uint_t                    mgen = 0;
+        ngx_uint_t                    next_gen;
         time_t                        mttl = 0;
         ngx_uint_t                    have_marker = 0;
         ngx_http_cache_turbo_node_t  *m;
@@ -1852,8 +1853,31 @@ ngx_http_cache_turbo_purge_request(ngx_http_request_t *r,
              * base-only reply below. */
 
         } else if (have_marker) {
+            /* AUD-GEN1: wrap explicitly, and NEVER land back on 0. gen 0 is
+             * the permanent "never purged" identity (default when no marker
+             * exists yet); folding it unconditionally (see variant_hash)
+             * stops it colliding with the pre-COR-5 untagged keyspace, but
+             * that alone does not stop THIS purge sequence from reproducing
+             * its OWN gen-0 identity every 256 purges -- 256 & 0xFF == 0,
+             * numerically indistinguishable from "never purged" once stored
+             * in one byte, so a request racing the wrap would resolve back to
+             * whatever is still resident under the base's original,
+             * pre-first-purge key (proven by a real 256-purge round trip
+             * against the unpatched arithmetic, not just reasoned about).
+             * Skipping 0 on wrap makes 0 permanently exclusive to "never
+             * purged": once a base has been purged at all, its generation can
+             * never again equal the identity a fresh, unpurged base uses.
+             * The residual (generation N colliding with N+255, still a
+             * 1-byte counter) is the accepted trade-off the ledger row
+             * documents; this closes the specific, highest-risk collision --
+             * the one with the longest-lived, most-likely-still-resident
+             * data. */
+            next_gen = (mgen + 1) & 0xFF;
+            if (next_gen == 0) {
+                next_gen = 1;
+            }
             ngx_http_cache_turbo_marker_store(clcf, z, &ctx->cache_key, bits,
-                                              mgen + 1, mttl);
+                                              next_gen, mttl);
             purged++;
         }
     }
@@ -11143,11 +11167,23 @@ ngx_http_cache_turbo_variant_hash(ngx_http_request_t *r, ngx_str_t *base,
     ngx_http_cache_turbo_digest_init(&d);
     ngx_http_cache_turbo_digest_update(&d, base->data, base->len);
 
-    /* PURGE generation (COR-5): folded ONLY when bumped (>0) so an unpurged
-     * base keeps the pre-COR-5 variant key (no keyspace turnover on upgrade).
-     * The L1-only / memcached purge path bumps it to orphan an old generation's
-     * variants; the backend-backed purge deletes them outright and leaves gen 0. */
-    if (gen > 0) {
+    /* PURGE generation (COR-5 / AUD-GEN1): folded UNCONDITIONALLY, including
+     * gen == 0. The generation lives in one marker byte (marker_store truncates
+     * to gen & 0xFF), so the 256th purge on a base wraps back to the SAME byte
+     * value as a base that was never purged. Folding was previously skipped
+     * for gen == 0 (treated as a "never purged" sentinel, kept for pre-COR-5
+     * upgrade compatibility) -- that made the wrap land EXACTLY on the
+     * untagged/never-purged variant keyspace, so a variant purged 256 times
+     * could resurrect as a live HIT if its pre-purge/never-purged sibling was
+     * still resident (long TTL / keep_stale forever / L1 LRU). Folding gen=0
+     * too closes that specific collision at the cost of a one-time keyspace
+     * turnover on upgrade (existing warm untagged entries stop matching and
+     * are refetched once). A residual collision between generation N and
+     * N+256 on the SAME base is NOT eliminated by this alone -- it is an
+     * inherent limit of a one-byte counter, not the sentinel-vs-legacy
+     * collision this fix closes; see AUD-GEN1 for the accepted trade-off and
+     * the byte-widening follow-up it leaves open. */
+    {
         u_char  gbuf[NGX_INT_T_LEN];
         size_t  glen;
 
