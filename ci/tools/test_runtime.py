@@ -748,7 +748,9 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
                  redis_tls_ca: str | None = None,
                  memcached_port: int | None = None,
                  fault_injection: bool = False,
-                 sr_off: bool = False) -> str:
+                 sr_off: bool = False,
+                 redis_tls_untrusted_port: int | None = None,
+                 redis_tls_expired_port: int | None = None) -> str:
     """Build the generated nginx.conf for the test server.
 
     !! ASCII ONLY -- everything returned here, INCLUDING COMMENTS, is written
@@ -823,6 +825,34 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             cache_turbo_key   $uri;
             cache_turbo_valid 30s;
             cache_turbo_redis rediss://127.0.0.1:{redis_tls_port}/0 tls_ca={redis_tls_ca} tls_name=localhost keepalive=4 keepalive_timeout=30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+"""
+    if redis_tls_untrusted_port is not None:
+        # AUD-TLS1: nginx is told to trust the SAME CA as /l2tls/ (redis_tls_ca),
+        # but this backend's cert is signed by a DIFFERENT CA. With a working
+        # SSL_CTX_set_verify(PEER) the handshake must fail chain verification;
+        # the L2 write-through must never reach this server.
+        dsn_loc += f"""
+        # rediss:// TLS, server cert signed by an UNTRUSTED CA (AUD-TLS1)
+        location /l2tlsuntrusted/ {{
+            cache_turbo       main;
+            cache_turbo_key   $uri;
+            cache_turbo_valid 30s;
+            cache_turbo_redis rediss://127.0.0.1:{redis_tls_untrusted_port}/0 tls_ca={redis_tls_ca} tls_name=localhost;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+"""
+    if redis_tls_expired_port is not None:
+        # Same trusted CA as /l2tls/ (chain trust is fine), but the leaf cert's
+        # own validity window is already expired. Must also be rejected.
+        dsn_loc += f"""
+        # rediss:// TLS, server cert EXPIRED (chain-trusted CA) (AUD-TLS1)
+        location /l2tlsexpired/ {{
+            cache_turbo       main;
+            cache_turbo_key   $uri;
+            cache_turbo_valid 30s;
+            cache_turbo_redis rediss://127.0.0.1:{redis_tls_expired_port}/0 tls_ca={redis_tls_ca} tls_name=localhost;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 """
@@ -3885,7 +3915,9 @@ class Nginx:
                  single_process, redis_port=None, redis_auth_port=None,
                  redis_password=None, redis_tls_port=None,
                  redis_tls_ca=None, memcached_port=None,
-                 fault_injection=False) -> None:
+                 fault_injection=False,
+                 redis_tls_untrusted_port=None,
+                 redis_tls_expired_port=None) -> None:
         self.binary = binary
         self.module = module
         self.root = root
@@ -3902,6 +3934,8 @@ class Nginx:
         self.redis_tls_ca = redis_tls_ca
         self.memcached_port = memcached_port
         self.fault_injection = fault_injection
+        self.redis_tls_untrusted_port = redis_tls_untrusted_port
+        self.redis_tls_expired_port = redis_tls_expired_port
         self.process: subprocess.Popen | None = None
         self.output_path = root / "nginx-output.log"
 
@@ -3915,7 +3949,9 @@ class Nginx:
                          self.redis_auth_port, self.redis_password,
                          self.redis_tls_port, self.redis_tls_ca,
                          self.memcached_port, self.fault_injection,
-                         sr_off),
+                         sr_off,
+                         redis_tls_untrusted_port=self.redis_tls_untrusted_port,
+                         redis_tls_expired_port=self.redis_tls_expired_port),
             encoding="ascii")
 
     def command(self, test: bool = False) -> list[str]:
@@ -4094,7 +4130,65 @@ def gen_tls_certs(dirpath: pathlib.Path) -> dict:
     run("openssl", "x509", "-req", "-in", str(csr), "-CA", str(ca),
         "-CAkey", str(ca_key), "-CAcreateserial", "-out", str(crt),
         "-days", "1", "-extfile", str(ext))
-    return {"ca": str(ca), "cert": str(crt), "key": str(key)}
+    return {"ca": str(ca), "cert": str(crt), "key": str(key),
+            "ca_key": str(ca_key)}
+
+
+def gen_tls_expired_cert(dirpath: pathlib.Path, ca_key: str, ca: str) -> dict:
+    """Sign a server cert with an ALREADY-EXPIRED validity window (2020, well
+    in the past), using the SAME trusted CA `gen_tls_certs` produced. Chain
+    trust is fine (same CA); only the time-validity check should reject it.
+    Isolates AUD-TLS1's "wrong CA" mode (gen_tls_certs called on a second,
+    untrusted dir) from its "expired but chain-trusted" mode. Returns
+    {ca, cert, key}. Raises on any openssl failure."""
+    dirpath.mkdir(parents=True, exist_ok=True)
+    key = dirpath / "redis.key"
+    csr = dirpath / "redis.csr"
+    crt = dirpath / "redis.crt"
+    ext = dirpath / "redis.ext"
+    ext.write_text("subjectAltName=IP:127.0.0.1,DNS:localhost\n")
+
+    # `openssl x509 -req` only learned -not_before/-not_after in OpenSSL 3.2,
+    # and CI runners still ship older builds -- using them here made the
+    # fixture fail to generate and the whole redis_tls suite degrade. `openssl
+    # ca -startdate/-enddate` has been supported for many major versions, so
+    # the backdated window is portable. It needs a CA database, hence the
+    # index/serial/config scaffolding below.
+    index = dirpath / "index.txt"
+    serial = dirpath / "serial"
+    cnf = dirpath / "ca.cnf"
+    index.write_text("")
+    serial.write_text("01\n")
+    cnf.write_text(
+        "[ca]\n"
+        "default_ca = CA_default\n"
+        "[CA_default]\n"
+        f"dir = {dirpath}\n"
+        "database = $dir/index.txt\n"
+        "serial = $dir/serial\n"
+        "new_certs_dir = $dir\n"
+        f"certificate = {ca}\n"
+        f"private_key = {ca_key}\n"
+        "default_md = sha256\n"
+        "policy = policy_any\n"
+        "email_in_dn = no\n"
+        "rand_serial = no\n"
+        "unique_subject = no\n"
+        "[policy_any]\n"
+        "commonName = supplied\n"
+    )
+
+    def run(*a):
+        subprocess.run(a, check=True, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=30)
+
+    run("openssl", "req", "-newkey", "rsa:2048", "-nodes",
+        "-keyout", str(key), "-out", str(csr), "-subj", "/CN=localhost")
+    run("openssl", "ca", "-batch", "-config", str(cnf),
+        "-in", str(csr), "-out", str(crt), "-notext",
+        "-extfile", str(ext),
+        "-startdate", "20200101000000Z", "-enddate", "20200102000000Z")
+    return {"ca": ca, "cert": str(crt), "key": str(key)}
 
 
 class RedisServer:
@@ -12819,6 +12913,40 @@ def test_l2_tls(ng: Nginx, origin: Origin,
     assert h.get("x-cache") == "HIT", "second read should be an L1 hit"
 
 
+def test_redis_tls_untrusted_ca_rejected(
+        ng: Nginx, origin: Origin,
+        redis_tls_untrusted: RedisServer) -> None:
+    """AUD-TLS1: /l2tlsuntrusted/ trusts the SAME CA as /l2tls/, but this
+    backend's cert is signed by a DIFFERENT CA. A working
+    SSL_CTX_set_verify(PEER) must fail the handshake's chain check, so the
+    fire-and-forget L2 write-through must NEVER land -- the key must stay
+    absent no matter how long we wait. Before the fix, verify mode stays
+    SSL_VERIFY_NONE (the ngx_ssl_trusted_certificate call only loads a store,
+    it never flips the mode), the handshake succeeds anyway, and the key
+    shows up -- so this assertion is exactly what should currently FAIL."""
+    fetch(ng.port, "/l2tlsuntrusted/k1")
+    key = l2_key("/l2tlsuntrusted/k1")
+    assert not wait_for(
+        lambda: redis_tls_untrusted.cli("EXISTS", key) == "1", timeout=2.0), \
+        "L2 write-through reached a Redis whose cert chains to an UNTRUSTED " \
+        "CA -- SSL_CTX_set_verify(PEER) is not being applied (AUD-TLS1)"
+
+
+def test_redis_tls_expired_cert_rejected(
+        ng: Nginx, origin: Origin,
+        redis_tls_expired: RedisServer) -> None:
+    """AUD-TLS1, second mode: /l2tlsexpired/ trusts the correct CA (chain
+    trust is fine) but the leaf cert's own validity window is already
+    expired. A working verify must still reject it via the standard OpenSSL
+    time check. Same vacuous-guard failure mode as the untrusted-CA test."""
+    fetch(ng.port, "/l2tlsexpired/k1")
+    key = l2_key("/l2tlsexpired/k1")
+    assert not wait_for(
+        lambda: redis_tls_expired.cli("EXISTS", key) == "1", timeout=2.0), \
+        "L2 write-through reached a Redis with an EXPIRED cert -- " \
+        "verification is not actually checking anything (AUD-TLS1)"
+
+
 def test_l2_tls_keepalive_reuse(ng: Nginx, origin: Origin,
                                 redis_tls: RedisServer) -> None:
     """v15-2: the keepalive pool reuses TLS Redis connections across L2 ops, so
@@ -15202,7 +15330,9 @@ def run_all(ng: Nginx, origin: Origin,
             redis: RedisServer | None = None,
             redis_auth: RedisServer | None = None,
             redis_tls: RedisServer | None = None,
-            mc: MemcachedServer | None = None) -> None:
+            mc: MemcachedServer | None = None,
+            redis_tls_untrusted: RedisServer | None = None,
+            redis_tls_expired: RedisServer | None = None) -> None:
     test_miss_then_hit(ng)
     test_surrogate_key_emit_on_miss_and_hit(ng)
     if redis is not None:
@@ -15501,6 +15631,10 @@ def run_all(ng: Nginx, origin: Origin,
             # v16: plain + TLS profiles each keep their own keepalive bucket
             test_l2_keepalive_per_profile_no_starvation(
                 ng, origin, redis, redis_tls)
+    if redis_tls_untrusted is not None:
+        test_redis_tls_untrusted_ca_rejected(ng, origin, redis_tls_untrusted)
+    if redis_tls_expired is not None:
+        test_redis_tls_expired_cert_rejected(ng, origin, redis_tls_expired)
     if mc is not None:
         test_l2_memcached_write_through(ng, origin, mc)        # v13
         test_l2_memcached_cross_instance_fill(ng, origin, mc)  # v13
@@ -15539,11 +15673,34 @@ def main() -> int:
     redis_auth_port = args.port + 22 if args.redis_server else None
     redis_tls_port = args.port + 23 if args.redis_server else None
     memcached_port = args.port + 24 if args.memcached_server else None
+    # +25 is NOT free: test_mc_dirty_reply_not_pooled() stands up its
+    # DirtyMemcached on `ng.memcached_port + 1`, an offset that never appears
+    # in this block. Claiming it here made the fake memcached fail to bind and
+    # took the whole Runtime and ASan suites down with
+    # "OSError: [Errno 98] Address already in use".
+    redis_tls_untrusted_port = args.port + 27 if args.redis_server else None
+    redis_tls_expired_port = args.port + 28 if args.redis_server else None
     redis_password = "ctsecret"
+    # AUD-TESTFIX1: a fixture whose CLI flag was passed (--redis-server,
+    # --memcached-server) must fail the run if it cannot start -- redis.start()
+    # and mc.start() already raise uncaught, which is correct, leave them
+    # alone. TLS is the one sub-fixture allowed to stay best-effort (needs a
+    # TLS-capable redis-server build + working openssl), but "best-effort"
+    # must never mean *silent*: every skip prints a loud, grep-able line and
+    # is counted here so CI can assert the fixture set it asked for actually
+    # came up instead of quietly losing ~80 L2/TLS tests off the running total.
+    fixture_skips: list[str] = []
+
+    def _skip(name: str, reason: str) -> None:
+        line = f"FIXTURE SKIPPED: {name} ({reason})"
+        print(line, flush=True)
+        fixture_skips.append(name)
+
     with tempfile.TemporaryDirectory(prefix="cache-turbo-ci-") as tmp:
         root = pathlib.Path(tmp)
         origin = Origin(origin_port, delay=0.05)
         redis = redis_auth = redis_tls = mc = None
+        redis_tls_untrusted = redis_tls_expired = None
         tls_certs = None
         if args.memcached_server:
             mc = MemcachedServer(pathlib.Path(args.memcached_server),
@@ -15554,13 +15711,28 @@ def main() -> int:
             redis_auth = RedisServer(rbin, root / "redis-auth", redis_auth_port,
                                      password=redis_password)
             # TLS is best-effort: needs a TLS-capable redis + openssl. If either
-            # is missing, skip the rediss:// test rather than failing the suite.
+            # is missing, skip the rediss:// tests rather than failing the
+            # suite -- but loudly (see fixture_skips above).
             try:
                 tls_certs = gen_tls_certs(root / "redis-tls-certs")
                 redis_tls = RedisServer(rbin, root / "redis-tls", redis_tls_port,
                                         tls_certs=tls_certs)
-            except (OSError, subprocess.SubprocessError):
-                redis_tls = None
+                # AUD-TLS1 negative fixtures: a second, untrusted CA + an
+                # expired-but-chain-trusted cert. Best-effort alongside the
+                # base TLS fixture -- same openssl/redis-server dependency.
+                untrusted_certs = gen_tls_certs(root / "redis-tls-untrusted-certs")
+                redis_tls_untrusted = RedisServer(
+                    rbin, root / "redis-tls-untrusted", redis_tls_untrusted_port,
+                    tls_certs=untrusted_certs)
+                expired_certs = gen_tls_expired_cert(
+                    root / "redis-tls-expired-certs",
+                    tls_certs["ca_key"], tls_certs["ca"])
+                redis_tls_expired = RedisServer(
+                    rbin, root / "redis-tls-expired", redis_tls_expired_port,
+                    tls_certs=expired_certs)
+            except (OSError, subprocess.SubprocessError) as e:
+                _skip("redis_tls", f"cert/build generation failed: {e}")
+                redis_tls = redis_tls_untrusted = redis_tls_expired = None
                 tls_certs = None
 
         ng = Nginx(binary, module, root / "server", args.port, origin_port,
@@ -15570,7 +15742,11 @@ def main() -> int:
                    redis_tls_port=redis_tls_port if redis_tls else None,
                    redis_tls_ca=(tls_certs or {}).get("ca"),
                    memcached_port=memcached_port if mc else None,
-                   fault_injection=args.fault_injection)
+                   fault_injection=args.fault_injection,
+                   redis_tls_untrusted_port=(
+                       redis_tls_untrusted_port if redis_tls_untrusted else None),
+                   redis_tls_expired_port=(
+                       redis_tls_expired_port if redis_tls_expired else None))
         ng.sanitizer = args.sanitizer
 
         try:
@@ -15582,15 +15758,21 @@ def main() -> int:
             if redis_tls is not None:
                 try:
                     redis_tls.start()
-                except Exception:
-                    redis_tls = None        # TLS redis refused to start: skip
+                    if redis_tls_untrusted is not None:
+                        redis_tls_untrusted.start()
+                    if redis_tls_expired is not None:
+                        redis_tls_expired.start()
+                except Exception as e:
+                    _skip("redis_tls", f"start() failed: {e}")
+                    redis_tls = redis_tls_untrusted = redis_tls_expired = None
             if mc is not None:
                 mc.start()
             ng.write_config()
             ng.config_test()
             ng.start()
             _instrument(origin)   # DIAG: socket-flake attribution
-            run_all(ng, origin, redis, redis_auth, redis_tls, mc)
+            run_all(ng, origin, redis, redis_auth, redis_tls, mc,
+                    redis_tls_untrusted, redis_tls_expired)
             time.sleep(0.2)
             ng.stop()
             ng.assert_clean_logs()
@@ -15602,9 +15784,17 @@ def main() -> int:
                 redis_auth.stop()
             if redis_tls is not None:
                 redis_tls.stop()
+            if redis_tls_untrusted is not None:
+                redis_tls_untrusted.stop()
+            if redis_tls_expired is not None:
+                redis_tls_expired.stop()
             if mc is not None:
                 mc.stop()
             origin.stop()
+
+        if fixture_skips:
+            print(f"FIXTURE SUMMARY: {len(fixture_skips)} skipped: "
+                  f"{', '.join(fixture_skips)}", flush=True)
 
     print("OK: miss/hit, POST passthrough uncached (origin do_POST harness), "
           "header fidelity, max_size, "
