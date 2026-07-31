@@ -152,6 +152,12 @@ static void ngx_http_cache_turbo_vary_resolve(ngx_http_request_t *r,
 static void ngx_http_cache_turbo_variant_hash(ngx_http_request_t *r,
     ngx_str_t *base, ngx_int_t bits, ngx_uint_t gen, u_char out[32]);
 static void ngx_http_cache_turbo_marker_hash(ngx_str_t *base, u_char out[32]);
+/* AUD-HDR1: the single store/restore header gate. Declared here because
+ * restore_response() (above its definition) is one of the two callers — the
+ * point of the helper is that there is exactly ONE. */
+static ngx_int_t ngx_http_cache_turbo_header_admissible(
+    ngx_http_cache_turbo_loc_conf_t *clcf, u_char *name, size_t nlen,
+    u_char *val, size_t vlen);
 static void ngx_http_cache_turbo_marker_store(ngx_http_cache_turbo_loc_conf_t *clcf,
     ngx_http_cache_turbo_zone_t *z, ngx_str_t *base, ngx_int_t bits,
     ngx_uint_t gen, time_t ttl);
@@ -805,6 +811,31 @@ ngx_http_cache_turbo_blob_validate(const u_char *blob, size_t len,
     out->stale_ttl   = ngx_http_cache_turbo_get_u32(blob + 36);
     out->sie_ttl     = ngx_http_cache_turbo_get_u32(blob + 40);   /* CTB4 */
 
+    /*
+     * AUD-HDR1: RANGE validation, not just framing. Everything below this point
+     * is inherited by every consumer — restore_response() writes `status`
+     * straight into r->headers_out.status, and the L2-fill path computes the
+     * L1 lifetime from fresh_ttl/stale_ttl — so bounding the fields HERE is
+     * what makes "the blob passed validation" mean something. Rejecting rather
+     * than clamping is deliberate: these values are not degraded, they are
+     * impossible, and a blob carrying them was not written by this module.
+     *
+     * NOTE on the TTLs: a bare "clamp to NGX_HTTP_CACHE_TURBO_TTL_MAX" would be
+     * VACUOUS here — TTL_MAX is 0xFFFFFFFF and these are u32 wire fields, so it
+     * can never fire. The invariant that does bite is stale_ttl >= fresh_ttl:
+     * stale_ttl is the TOTAL serveable window (see the blob_hdr layout comment),
+     * and every store-path shape satisfies it — stale_ttl() multiplies by
+     * stale_mult >= 1, the stale-while-revalidate branch adds to ttl, and the
+     * must-revalidate branch collapses it to exactly ttl. A forged blob claiming
+     * a 136-year fresh_ttl under an ordinary stale window does not.
+     */
+    if (out->status < 100 || out->status > 599) {
+        return NGX_ERROR;
+    }
+    if (out->stale_ttl < out->fresh_ttl) {
+        return NGX_ERROR;
+    }
+
     /* header block + body must fit (subtract on the remaining len — no overflow) */
     if (out->headers_len > len - NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE
         || out->body_len
@@ -831,6 +862,44 @@ ngx_http_cache_turbo_blob_validate(const u_char *blob, size_t len,
 
     if (hdr_block) { *hdr_block = blob + NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE; }
     if (body)      { *body = end; }
+    return NGX_OK;
+}
+
+
+/*
+ * Decode ONE `u32 nlen | name | u32 vlen | value` TLV entry at *pp and advance
+ * *pp past it. Returns NGX_OK with the four out-params pointing INTO the caller's
+ * buffer, or NGX_DONE when the header block is exhausted or the next entry does
+ * not fit (the walk stops, it never runs off `end`).
+ *
+ * AUD-FUZZ1: this is the ONE walk. blob_validate() above pre-walks the block to
+ * reject a malformed blob before it reaches L1, restore_response() re-walks it to
+ * rebuild headers_out, and ci/fuzz/fuzz_blob.c drives this exact function — so
+ * the three can no longer disagree about where an entry ends. The previous
+ * open-coded copy in restore_response() was the only reader of the blob's TLV
+ * framing that nothing tested.
+ */
+static ngx_int_t
+ngx_http_cache_turbo_blob_next_header(const u_char **pp, const u_char *end,
+    const u_char **name, uint32_t *nlen, const u_char **val, uint32_t *vlen)
+{
+    const u_char  *p = *pp;
+    uint32_t       nl, vl;
+
+    if ((size_t) (end - p) < 8) { return NGX_DONE; }
+
+    nl = ngx_http_cache_turbo_get_u32(p); p += 4;
+    if ((size_t) (end - p) < nl) { return NGX_DONE; }
+    *name = p; p += nl;
+
+    if ((size_t) (end - p) < 4) { return NGX_DONE; }
+    vl = ngx_http_cache_turbo_get_u32(p); p += 4;
+    if ((size_t) (end - p) < vl) { return NGX_DONE; }
+    *val = p; p += vl;
+
+    *nlen = nl;
+    *vlen = vl;
+    *pp = p;
     return NGX_OK;
 }
 
@@ -5320,8 +5389,19 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                         "cache_turbo: L2 blob fails request freshness bounds "
                         "\"%V\" key=%ui -> origin", &r->uri, (ngx_uint_t) hash);
                 } else {
-                    /* The blob passed full validation above, so the slot we put
-                     * in L1 is guaranteed serveable (no poisoned L1 node). */
+                    /* The blob passed blob_validate() above: framing, the full
+                     * TLV walk, AND the status/TTL range checks — so the slot we
+                     * put in L1 cannot be structurally unserveable.
+                     *
+                     * AUD-HDR1: this comment used to claim "full validation",
+                     * which was read as licence to promote an L2 blob into shm
+                     * where every worker serves it. It was not true of the
+                     * CONTENT: blob_validate inspects no header bytes. The
+                     * content guarantee comes from header_admissible(), applied
+                     * on the way OUT in restore_response(), so a poisoned header
+                     * in this blob is dropped at serve time rather than
+                     * prevented from entering L1. Keep the two claims separate;
+                     * conflating them is what let AUD-HDR1 survive to HEAD. */
                     (void) clcf->l1->store(z, ctx->key_hash, hash,
                                ctx->l2_blob, ctx->l2_blob_len,
                                rem_fresh, rem_stale);
@@ -6276,11 +6356,15 @@ ngx_http_cache_turbo_restore_response(ngx_http_request_t *r, u_char *copy,
     uint32_t                          i;
     u_char                           *etag = NULL, *lastmod = NULL;
     size_t                            etag_len = 0, lastmod_len = 0;
+    ngx_uint_t                        dropped = 0;
+    ngx_http_cache_turbo_loc_conf_t  *clcf;
+
+    clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
 
     /* A NULL blob is never produced by a live caller (every HIT/L2 path holds a
      * real buffer), but guard at the deref site so the static analyzer can prove
      * the header walk below never reads through a null `p`. */
-    if (copy == NULL) {
+    if (copy == NULL || clcf == NULL) {
         return NGX_ERROR;
     }
 
@@ -6310,18 +6394,30 @@ ngx_http_cache_turbo_restore_response(ngx_http_request_t *r, u_char *copy,
 
     /* Restore each stored header. Content-Type is mapped to the typed field;
      * the rest go onto the headers list. */
-    for (i = 0; i < bh->nheaders && p + 8 <= end; i++) {
-        uint32_t  nl, vl;
-        u_char   *nm, *vv;
+    for (i = 0; i < bh->nheaders; i++) {
+        uint32_t       nl, vl;
+        u_char        *nm, *vv;
+        const u_char  *cp = p, *cnm, *cvv;
 
-        nl = ngx_http_cache_turbo_get_u32(p); p += 4;
-        if (p + nl > end) { break; }
-        nm = p; p += nl;
+        if (ngx_http_cache_turbo_blob_next_header(&cp, end, &cnm, &nl,
+                                                  &cvv, &vl) != NGX_OK)
+        {
+            break;
+        }
+        p = (u_char *) cp;
+        nm = (u_char *) cnm;
+        vv = (u_char *) cvv;
 
-        if (p + 4 > end) { break; }
-        vl = ngx_http_cache_turbo_get_u32(p); p += 4;
-        if (p + vl > end) { break; }
-        vv = p; p += vl;
+        /* AUD-HDR1: the restore-side mirror of the store-side filter. This runs
+         * BEFORE the Content-Type / validator branches below, because those
+         * also put the bytes into the response (content_type is serialised by
+         * core just like a list header) — a gate placed after them would leave
+         * exactly the typed fields unguarded. Drop, don't fail: one poisoned
+         * header must not cost the client the whole cached response. */
+        if (!ngx_http_cache_turbo_header_admissible(clcf, nm, nl, vv, vl)) {
+            dropped++;
+            continue;
+        }
 
         if (nl == sizeof("Content-Type") - 1
             && ngx_strncasecmp(nm, (u_char *) "Content-Type", nl) == 0)
@@ -6352,6 +6448,18 @@ ngx_http_cache_turbo_restore_response(ngx_http_request_t *r, u_char *copy,
         }
     }
 
+    /* AUD-HDR1: report ONCE per restore, not once per header. A poisoned entry is
+     * served repeatedly, and an attacker who controls the header count would
+     * otherwise pick the log-amplification factor. WARN (not INFO) because a
+     * cached copy written by this module never trips the gate: reaching here at
+     * all means the L2 copy did not come from us. */
+    if (dropped) {
+        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                      "cache_turbo: dropped %ui inadmissible stored header(s) "
+                      "while restoring \"%V\" — the cached copy may be forged",
+                      dropped, &r->uri);
+    }
+
     /* SK-A1: re-emit the CDN purge key on every HIT/STALE serve, not only on the
      * MISS that stored the entry. A fronting surrogate-key CDN refills a POP from
      * one of OUR hits whenever its own copy expired or was evicted; without the
@@ -6359,13 +6467,8 @@ ngx_http_cache_turbo_restore_response(ngx_http_request_t *r, u_char *copy,
      * stale content publicly served. Generated live from the same cache_turbo_tag
      * expression (the header is skipped at store while the directive is on, so
      * there is no duplicate), and best-effort like the MISS-path emit. */
-    {
-        ngx_http_cache_turbo_loc_conf_t  *sk_clcf;
-
-        sk_clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
-        if (sk_clcf != NULL && sk_clcf->surrogate_key) {
-            ngx_http_cache_turbo_emit_surrogate_key(r, sk_clcf);
-        }
+    if (clcf->surrogate_key) {
+        ngx_http_cache_turbo_emit_surrogate_key(r, clcf);
     }
 
     /* Conditional request (v11): a 200 HIT whose stored ETag / Last-Modified
@@ -6822,6 +6925,76 @@ ngx_http_cache_turbo_header_skip(ngx_http_cache_turbo_loc_conf_t *clcf,
     }
 
     return 0;
+}
+
+
+/*
+ * AUD-HDR1: the ONE gate both cache directions ask "may this header cross?".
+ * Returns 1 to let the pair through, 0 to drop it.
+ *
+ * Why one helper rather than a check on each side: header_skip() above used to
+ * be called only on the STORE path. The RESTORE path re-materialised whatever
+ * bytes were in the blob and handed them straight to add_header() ->
+ * ngx_list_push(), which validates nothing, after which nginx serialises
+ * "name: value\r\n" verbatim. That asymmetry is only invisible while the L2 is
+ * trusted: a writer who reaches Redis directly (compromised, or MITM'd — see
+ * AUD-TLS1) never runs the store path, so every store-side check was optional
+ * from the attacker's point of view. Concretely that bought
+ *
+ *   - CR/LF in a value            -> response splitting
+ *   - Transfer-Encoding, or a 2nd Content-Length beside the one restore sets
+ *                                 -> request smuggling vs a downstream proxy/CDN
+ *   - Set-Cookie                  -> session fixation (it is on the skip list
+ *                                    precisely because it is dangerous)
+ *
+ * Routing BOTH directions through this function is what stops them drifting
+ * again; ci/fuzz/fuzz_blob.c asserts they have not (it fails the build's
+ * fixture suite if a restored header would bypass header_skip()).
+ *
+ * The name test is RFC 9110 §5.6.2 tchar, i.e. what can legally be serialised
+ * as a field name at all. The value test is CR/LF/NUL only: HTAB and the rest
+ * of the printable range are legal field-content, and rejecting more would drop
+ * legitimate origin headers on a HIT that were served fine on the MISS.
+ */
+static ngx_int_t
+ngx_http_cache_turbo_header_admissible(ngx_http_cache_turbo_loc_conf_t *clcf,
+    u_char *name, size_t nlen, u_char *val, size_t vlen)
+{
+    size_t  i;
+
+    if (nlen == 0) {
+        return 0;
+    }
+
+    for (i = 0; i < nlen; i++) {
+        u_char  c = name[i];
+
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+            || (c >= '0' && c <= '9'))
+        {
+            continue;
+        }
+        switch (c) {
+        case '!': case '#': case '$': case '%': case '&': case '\'':
+        case '*': case '+': case '-': case '.': case '^': case '_':
+        case '`': case '|': case '~':
+            continue;
+        default:
+            return 0;                      /* not a token: unserialisable */
+        }
+    }
+
+    for (i = 0; i < vlen; i++) {
+        if (val[i] == CR || val[i] == LF || val[i] == '\0') {
+            return 0;                      /* header injection primitive */
+        }
+    }
+
+    if (ngx_http_cache_turbo_header_skip(clcf, name, nlen)) {
+        return 0;
+    }
+
+    return 1;
 }
 
 
@@ -7731,9 +7904,14 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
                 h = part->elts;
                 i = 0;
             }
-            if (h[i].hash == 0 || h[i].key.len == 0
-                || ngx_http_cache_turbo_header_skip(clcf, h[i].key.data,
-                                                    h[i].key.len))
+            /* AUD-HDR1: the same gate the restore path uses. This loop and the
+             * emit loop below MUST make identical decisions or headers_len
+             * would lie about the block that follows — one helper, called
+             * twice, is what guarantees that. */
+            if (h[i].hash == 0
+                || !ngx_http_cache_turbo_header_admissible(clcf,
+                        h[i].key.data, h[i].key.len,
+                        h[i].value.data, h[i].value.len))
             {
                 continue;
             }
@@ -7820,9 +7998,10 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
                     h = part->elts;
                     i = 0;
                 }
-                if (h[i].hash == 0 || h[i].key.len == 0
-                    || ngx_http_cache_turbo_header_skip(clcf, h[i].key.data,
-                                                        h[i].key.len))
+                if (h[i].hash == 0
+                    || !ngx_http_cache_turbo_header_admissible(clcf,
+                            h[i].key.data, h[i].key.len,
+                            h[i].value.data, h[i].value.len))
                 {
                     continue;
                 }
@@ -11069,6 +11248,14 @@ ngx_http_cache_turbo_marker_store(ngx_http_cache_turbo_loc_conf_t *clcf,
     ngx_http_cache_turbo_blob_hdr_t  bh;
 
     ngx_memzero(&bh, sizeof(bh));
+    /* A marker is a blob, so it must satisfy the blob contract: since AUD-HDR1
+     * blob_validate() rejects a status outside 100..599, a memzero'd status 0
+     * would make every marker unreadable. 200 is the only honest choice (the
+     * marker records a successful classification); the body is still the 2-byte
+     * [bits][gen] pair, which is what the readers actually consume. Markers are
+     * L1-only and node-local, so any warm pre-AUD-HDR1 marker simply fails
+     * validation once and is re-stored. */
+    bh.status = NGX_HTTP_OK;
     bh.body_len = 2;
     bh.created = (int64_t) ngx_time();
     bh.fresh_ttl = (uint32_t) (ttl > 0 ? ttl : 0);

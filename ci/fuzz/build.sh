@@ -54,4 +54,13 @@ else
     build_one fuzz_mc_parser.c "$DIR/fuzz_mc_parser"
     bash "$FUZZ_DIR/extract_auto_classify.sh"
     build_one fuzz_auto_classify.c "$DIR/fuzz_auto_classify"
+    bash "$FUZZ_DIR/extract_blob.sh"
+    build_one fuzz_blob.c "$DIR/fuzz_blob"
+    # Deterministic per-primitive fixture binary from the SAME source: no
+    # libFuzzer engine, its own main(). This is what the unit gate runs, so the
+    # AUD-HDR1 fixtures are checked on every PR, not only in the fuzz job.
+    # shellcheck disable=SC2086
+    $CC $CFLAGS -DCT_BLOB_FIXTURES -I"$FUZZ_DIR" "$FUZZ_DIR/fuzz_blob.c" \
+        -o "$DIR/fuzz_blob_fixtures"
+    echo "✓ built fixture binary: $DIR/fuzz_blob_fixtures"
 fi

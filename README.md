@@ -393,6 +393,16 @@ Hop-by-hop / framing headers (`Connection`, `Transfer-Encoding`,
 stripped before storing and rebuilt on the way out, so a cached response is
 still well-formed.
 
+The same filter runs again **on the way out of L2**. A shared Redis/memcached
+tier is not part of nginx's trust boundary — anyone who can write to it chooses
+the bytes a HIT replays — so a restored entry is re-checked before its headers
+reach the response: a field name that is not an HTTP token, a value containing
+CR, LF or NUL, or any name on the strip list above is dropped, and a blob whose
+status is outside `100..599` or whose stale window is shorter than its fresh
+window is rejected outright (the request falls through to the origin). A cached
+copy written by this module never trips any of these; one that does was not
+written by this module.
+
 The `Date` is re-emitted as a **stable** timestamp for the cached
 representation (it does not advance on every hit), and an `Age` header reports
 how long the copy has been cached — the two stay mutually consistent (RFC 9111).

@@ -6,7 +6,7 @@ name: CI Deep
 # THIS file keeps the long/exhaustive runs. CodeQL remains in codeql.yml; this
 # workflow complements it with long dynamic-analysis and scanner jobs.
 #
-# Jobs: fuzz (up to 14400s/target × 4) · legacy-runtime (pre-1.23 ABI) ·
+# Jobs: fuzz (up to 14400s/target × 5) · legacy-runtime (pre-1.23 ABI) ·
 #       clang-analyze (full-source path-flow) · memcheck soak · helgrind soak ·
 #       asan-soak (ASan multi-worker fault-injection ×N — flake repetition) ·
 #       scanners · coverage (gcov report — a REPORT, never a gate).
@@ -99,7 +99,8 @@ jobs:
           targets="fuzz_resp_parser:corpus:fuzz.dict \
                    fuzz_norm_args:corpus_norm_args: \
                    fuzz_mc_parser:corpus_mc:fuzz_mc.dict \
-                   fuzz_auto_classify:corpus_auto:"
+                   fuzz_auto_classify:corpus_auto: \
+                   fuzz_blob:corpus_blob:"
           for t in $targets; do
             bin="${t%%:*}"; rest="${t#*:}"; corp="${rest%%:*}"; dict="${rest#*:}"
             echo "=== $bin over $corp (${FUZZ_SECS}s)${dict:+ dict=$dict} ==="

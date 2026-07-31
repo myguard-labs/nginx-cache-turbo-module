@@ -1,6 +1,6 @@
 name: Fuzzing
 
-# Fast fuzz regression gate on every PR/push — 120s/target on all four parser
+# Fast fuzz regression gate on every PR/push — 120s/target on all five parser
 # fuzzers (+dict where useful), kept short so PR feedback stays quick. Long
 # discovery fuzzing (hours/target) lives in ci-deep.yml (monthly cron +
 # workflow_dispatch).
@@ -76,7 +76,8 @@ jobs:
           targets="fuzz_resp_parser:corpus:fuzz.dict \
                    fuzz_norm_args:corpus_norm_args: \
                    fuzz_mc_parser:corpus_mc:fuzz_mc.dict \
-                   fuzz_auto_classify:corpus_auto:"
+                   fuzz_auto_classify:corpus_auto: \
+                   fuzz_blob:corpus_blob:"
           for t in $targets; do
             bin="${t%%:*}"; rest="${t#*:}"; corp="${rest%%:*}"; dict="${rest#*:}"
             echo "=== $bin over $corp (120s)${dict:+ dict=$dict} ==="
