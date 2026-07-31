@@ -492,10 +492,18 @@ class Origin:
                     if rng and rng.startswith("bytes="):
                         try:
                             s, e = rng[len("bytes="):].split("-", 1)
-                            start = int(s) if s else 0
-                            end = int(e) if e else len(rbody) - 1
+                            if not s:
+                                # Suffix range "bytes=-N" = the LAST N bytes,
+                                # not the first N. Getting this wrong would
+                                # silently mis-slice for any future test that
+                                # reuses this origin with a suffix range.
+                                start = max(0, len(rbody) - int(e))
+                                end = len(rbody) - 1
+                            else:
+                                start = int(s)
+                                end = int(e) if e else len(rbody) - 1
                             end = min(end, len(rbody) - 1)
-                            partial = True
+                            partial = start <= end
                         except ValueError:
                             partial = False
                     if partial:
