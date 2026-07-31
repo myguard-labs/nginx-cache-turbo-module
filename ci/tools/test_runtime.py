@@ -68,6 +68,48 @@ def _reap_spawned() -> None:
                 proc.kill()
 
 
+# AUD-CIPORT3: single registry every fixture port -- main()'s visible
+# allocation block AND the ad-hoc ports a handful of test bodies stand up on
+# their own (a second nginx instance, a fake dirty memcached) -- must draw
+# from. All offsets are relative to args.port (== ng.port for the primary
+# instance). A collision here is invisible to anyone reading only the
+# allocation block in main(), which is exactly how #167 claimed +25 for
+# redis_tls_untrusted while test_mc_dirty_reply_not_pooled() already owned it
+# via `ng.memcached_port + 1` -- and only found out ~12 minutes into a CI run
+# via "OSError: [Errno 98] Address already in use". _check_port_registry()
+# turns that into an immediate, named startup failure instead.
+PORT_OFFSETS: dict[str, int] = {
+    "origin": 11,
+    "redis": 21,
+    "redis_auth": 22,
+    "redis_tls": 23,
+    "memcached": 24,
+    "mc_dirty_reply": 25,  # test_mc_dirty_reply_not_pooled(): ng.port + this
+    "l2_cross_instance_fill_b": 5,       # test_l2_cross_instance_fill()
+    "l2_memcached_cross_instance_fill_b": 6,  # test_l2_memcached_cross_instance_fill()
+    "redis_tls_untrusted": 27,
+    "redis_tls_expired": 28,
+}
+
+
+def _check_port_registry(offsets: dict[str, int]) -> None:
+    """Abort loudly, at startup, if two named fixtures claim the same
+    args.port offset -- instead of one of them silently failing to bind
+    minutes later inside an unrelated test."""
+    seen: dict[int, str] = {}
+    dupes: list[str] = []
+    for name, offset in offsets.items():
+        if offset in seen:
+            dupes.append(
+                f"offset +{offset}: {seen[offset]!r} and {name!r}")
+        else:
+            seen[offset] = name
+    if dupes:
+        raise SystemExit(
+            "FIXTURE PORT REGISTRY COLLISION -- refusing to start: "
+            + "; ".join(dupes))
+
+
 atexit.register(_reap_spawned)
 
 
@@ -1482,8 +1524,12 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
         }}
 
         # D-O2: a keepalive location pointed at a DELIBERATELY MISBEHAVING fake
-        # memcached (on memcached_port+1, stood up only by
-        # test_mc_dirty_reply_not_pooled). A reply that does not frame cleanly at
+        # memcached (PORT_OFFSETS["mc_dirty_reply"], stood up only by
+        # test_mc_dirty_reply_not_pooled on the PRIMARY instance). The address is
+        # derived from memcached_port, not from this instance's own `port`: a
+        # second nginx (test_l2_memcached_cross_instance_fill's instance B) runs
+        # on a different port but must still point at the one fake memcached.
+        # A reply that does not frame cleanly at
         # a boundary (trailing junk past END/STORED, a server error, a timeout)
         # must NOT be returned to the pool -- the connection is closed instead, so
         # a reuse never resumes mid-reply. Same keepalive size as /mcka/.
@@ -1491,7 +1537,7 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             cache_turbo            main;
             cache_turbo_key        $uri;
             cache_turbo_valid      30s;
-            cache_turbo_memcached  127.0.0.1:{memcached_port + 1} prefix=mcd: timeout=250ms keepalive=4 keepalive_timeout=30s;
+            cache_turbo_memcached  127.0.0.1:{memcached_port + PORT_OFFSETS["mc_dirty_reply"] - PORT_OFFSETS["memcached"]} prefix=mcd: timeout=250ms keepalive=4 keepalive_timeout=30s;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
@@ -12858,7 +12904,8 @@ def test_l2_cross_instance_fill(ng: Nginx, origin: Origin,
 
     # Instance B: separate nginx, cold L1, same Redis + same origin
     b = Nginx(ng.binary, ng.module, ng.root.parent / "server-b",
-              ng.port + 5, ng.origin_port, ng.runner_raw,
+              ng.port + PORT_OFFSETS["l2_cross_instance_fill_b"],
+              ng.origin_port, ng.runner_raw,
               ng.single_process, ng.redis_port)
     b.write_config()
     b.config_test()
@@ -15157,7 +15204,8 @@ def test_l2_memcached_cross_instance_fill(ng: Nginx, origin: Origin,
 
     # Instance B: separate nginx, cold L1, same memcached + same origin
     b = Nginx(ng.binary, ng.module, ng.root.parent / "server-b-mc",
-              ng.port + 6, ng.origin_port, ng.runner_raw,
+              ng.port + PORT_OFFSETS["l2_memcached_cross_instance_fill_b"],
+              ng.origin_port, ng.runner_raw,
               ng.single_process, memcached_port=ng.memcached_port)
     b.write_config()
     b.config_test()
@@ -15404,7 +15452,7 @@ def test_mc_dirty_reply_not_pooled(ng: Nginx, origin: Origin) -> None:
     rebuilding the .so): dirty conns get pooled -> `accepts` drops ~10x -> the
     assertion below fires. The worker-PID check also catches a crash on the
     unclean path."""
-    dirty = DirtyMemcached(ng.memcached_port + 1)
+    dirty = DirtyMemcached(ng.port + PORT_OFFSETS["mc_dirty_reply"])
     dirty.start()
     try:
         n = 30
@@ -15837,18 +15885,24 @@ def main() -> int:
     if module is not None and not module.exists():
         raise FileNotFoundError(module)
 
-    origin_port = args.port + 11
-    redis_port = args.port + 21 if args.redis_server else None
-    redis_auth_port = args.port + 22 if args.redis_server else None
-    redis_tls_port = args.port + 23 if args.redis_server else None
-    memcached_port = args.port + 24 if args.memcached_server else None
-    # +25 is NOT free: test_mc_dirty_reply_not_pooled() stands up its
-    # DirtyMemcached on `ng.memcached_port + 1`, an offset that never appears
-    # in this block. Claiming it here made the fake memcached fail to bind and
-    # took the whole Runtime and ASan suites down with
-    # "OSError: [Errno 98] Address already in use".
-    redis_tls_untrusted_port = args.port + 27 if args.redis_server else None
-    redis_tls_expired_port = args.port + 28 if args.redis_server else None
+    _check_port_registry(PORT_OFFSETS)
+
+    origin_port = args.port + PORT_OFFSETS["origin"]
+    redis_port = args.port + PORT_OFFSETS["redis"] if args.redis_server else None
+    redis_auth_port = (
+        args.port + PORT_OFFSETS["redis_auth"] if args.redis_server else None)
+    redis_tls_port = (
+        args.port + PORT_OFFSETS["redis_tls"] if args.redis_server else None)
+    memcached_port = (
+        args.port + PORT_OFFSETS["memcached"] if args.memcached_server else None)
+    # mc_dirty_reply (+25) is claimed here too: test_mc_dirty_reply_not_pooled()
+    # stands up its DirtyMemcached on `ng.port + PORT_OFFSETS["mc_dirty_reply"]`,
+    # a call site nowhere near this block. See PORT_OFFSETS above -- that is
+    # the registry a new fixture must check before picking an offset.
+    redis_tls_untrusted_port = (
+        args.port + PORT_OFFSETS["redis_tls_untrusted"] if args.redis_server else None)
+    redis_tls_expired_port = (
+        args.port + PORT_OFFSETS["redis_tls_expired"] if args.redis_server else None)
     redis_password = "ctsecret"
     # AUD-TESTFIX1: a fixture whose CLI flag was passed (--redis-server,
     # --memcached-server) must fail the run if it cannot start -- redis.start()
