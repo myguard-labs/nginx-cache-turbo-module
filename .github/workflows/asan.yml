@@ -222,10 +222,20 @@ jobs:
           TEST_CT_TIMEOUT: "30"
         run: |
           chmod +x nginx-bin/nginx
+          set -o pipefail
           python3 ci/tools/test_runtime.py \
             --fault-injection \
             --sanitizer \
             --port "$TEST_BASE_PORT" \
             --redis-server /usr/bin/redis-server \
             --memcached-server /usr/bin/memcached \
-            --nginx-binary "$GITHUB_WORKSPACE/nginx-bin/nginx"
+            --nginx-binary "$GITHUB_WORKSPACE/nginx-bin/nginx" \
+            | tee runtime-suite-multiworker.log
+
+      - name: Assert the requested fixture set actually came up (AUD-TESTFIX1)
+        run: |
+          if grep -q '^FIXTURE SKIPPED:' runtime-suite-multiworker.log; then
+            echo "::error::runtime suite skipped a requested fixture:"
+            grep '^FIXTURE SKIPPED:' runtime-suite-multiworker.log
+            exit 1
+          fi
