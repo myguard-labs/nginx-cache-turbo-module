@@ -15672,9 +15672,14 @@ def main() -> int:
     redis_port = args.port + 21 if args.redis_server else None
     redis_auth_port = args.port + 22 if args.redis_server else None
     redis_tls_port = args.port + 23 if args.redis_server else None
-    redis_tls_untrusted_port = args.port + 25 if args.redis_server else None
-    redis_tls_expired_port = args.port + 26 if args.redis_server else None
     memcached_port = args.port + 24 if args.memcached_server else None
+    # +25 is NOT free: test_mc_dirty_reply_not_pooled() stands up its
+    # DirtyMemcached on `ng.memcached_port + 1`, an offset that never appears
+    # in this block. Claiming it here made the fake memcached fail to bind and
+    # took the whole Runtime and ASan suites down with
+    # "OSError: [Errno 98] Address already in use".
+    redis_tls_untrusted_port = args.port + 27 if args.redis_server else None
+    redis_tls_expired_port = args.port + 28 if args.redis_server else None
     redis_password = "ctsecret"
     # AUD-TESTFIX1: a fixture whose CLI flag was passed (--redis-server,
     # --memcached-server) must fail the run if it cannot start -- redis.start()
