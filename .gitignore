@@ -26,10 +26,14 @@ ci/fuzz/fuzz_resp_parser
 ci/fuzz/fuzz_norm_args
 ci/fuzz/fuzz_mc_parser
 ci/fuzz/fuzz_auto_classify
+ci/fuzz/fuzz_blob
+ci/fuzz/fuzz_blob_fixtures
+ci/tests/unit/blob_fixtures
 ci/fuzz/generated_parser.inc
 ci/fuzz/generated_norm_args.inc
 ci/fuzz/generated_mc_parser.inc
 ci/fuzz/generated_auto_classify.inc
+ci/fuzz/generated_blob.inc
 ci/tests/unit/generated_shm.inc
 ci/fuzz/crash-*
 ci/fuzz/*-min/
@@ -44,3 +48,5 @@ ci/fuzz/corpus_mc/*
 !ci/fuzz/corpus_mc/[0-9][0-9]_*
 ci/fuzz/corpus_auto/*
 !ci/fuzz/corpus_auto/[0-9][0-9]_*
+ci/fuzz/corpus_blob/*
+!ci/fuzz/corpus_blob/[0-9][0-9]_*

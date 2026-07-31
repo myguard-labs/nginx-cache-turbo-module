@@ -26,6 +26,27 @@ fi
 "$CC" $CFLAGS "$DIR/test_math.c" -o "$DIR/test_math"
 "$DIR/test_math"
 
+# --- L2 blob deserializer fixtures (AUD-HDR1 / AUD-FUZZ1) -----------------
+# Deterministic, hermetic (no nginx tree, no libFuzzer engine): one fixture per
+# header-injection primitive, driven through the SAME oracle ci/fuzz/fuzz_blob.c
+# gives the fuzzer. Built here rather than only in the fuzzing workflow so the
+# guards are checked on every PR — fuzzing.yml is path-filtered to ci/fuzz/**
+# and would not run at all on a change that only touches src/.
+echo "--- L2 blob deserializer fixtures (ASan/UBSan) ---"
+FUZZ_DIR="$DIR/../../fuzz"
+BLOB_CC="${BLOB_CC:-clang}"
+if command -v "$BLOB_CC" >/dev/null 2>&1; then
+    bash "$FUZZ_DIR/extract_blob.sh"
+    "$BLOB_CC" -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined \
+        -DCT_BLOB_FIXTURES -I"$FUZZ_DIR" "$FUZZ_DIR/fuzz_blob.c" \
+        -o "$DIR/blob_fixtures"
+    "$DIR/blob_fixtures"
+else
+    # Not a silent skip: these fixtures are the only guard on the restore-side
+    # header filter, so a runner without clang must be visible in the log.
+    echo "::warning::clang not found — L2 blob fixtures NOT run"
+fi
+
 # --- shm node state machine (CR-A / CR-B guards) --------------------------
 # Unlike the pure-math tests these link nginx's real ngx_rbtree.c, so they need
 # a CONFIGURED nginx source tree (objs/ngx_auto_config.h exists only after
