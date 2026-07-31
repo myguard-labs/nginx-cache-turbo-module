@@ -10327,12 +10327,43 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
              * sends {"purged":N}. */
             ngx_http_cache_turbo_tagpurge_t  *tp;
             ngx_int_t                         rc;
+            u_char                            ch;
+            ngx_uint_t                        ti;
 
             if (clcf->backend == NULL || clcf->backend->purge_tag == NULL) {
                 ngx_str_set(&body,
                     "{\"error\":\"tag purge requires cache_turbo_redis\"}\n");
                 return ngx_http_cache_turbo_send_json(r,
                            NGX_HTTP_BAD_REQUEST, &body);
+            }
+
+            /* AUD-TAG1: mirror the surrogate-key tokeniser's own rules
+             * (ngx_http_cache_turbo_emit_surrogate_key above) so a tag never
+             * exceeds NGX_HTTP_CACHE_TURBO_MAX_TAG_LEN or contains one of the
+             * tokeniser's separator bytes. Nothing downstream URL-decodes
+             * ?tag=, so today this is belt-and-braces around a distant
+             * parser (nginx rejects a raw space in the request line) rather
+             * than a live bypass -- but the check should live locally, not
+             * depend on that. */
+            if (arg.len == 0 || arg.len > NGX_HTTP_CACHE_TURBO_MAX_TAG_LEN) {
+                ngx_str_set(&body,
+                    "{\"error\":\"invalid tag: empty or too long "
+                    "(max 128 bytes)\"}\n");
+                return ngx_http_cache_turbo_send_json(r,
+                           NGX_HTTP_BAD_REQUEST, &body);
+            }
+
+            for (ti = 0; ti < arg.len; ti++) {
+                ch = arg.data[ti];
+                if (ch == ' ' || ch == '\t' || ch == ',' || ch == '\r'
+                    || ch == '\n')
+                {
+                    ngx_str_set(&body,
+                        "{\"error\":\"invalid tag: contains a "
+                        "space/tab/comma/CR/LF\"}\n");
+                    return ngx_http_cache_turbo_send_json(r,
+                               NGX_HTTP_BAD_REQUEST, &body);
+                }
             }
 
             tp = ngx_palloc(r->pool, sizeof(ngx_http_cache_turbo_tagpurge_t));
