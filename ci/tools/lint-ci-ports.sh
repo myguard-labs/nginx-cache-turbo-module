@@ -54,8 +54,17 @@ status=0
 # shellcheck disable=SC2016
 SEQ_LITERAL='$(seq '
 
+# Single source of truth for the band width (AUD-CIPORT2). Both the overlap
+# check (2) and the sweep-width check (1) measure against this constant so a
+# sweep offset and an interval width cannot drift apart the way they did
+# before this fix: check 1 verified only that a sweep MENTIONED
+# $TEST_BASE_PORT, not that it stopped at the band edge, so a sweep of
+# $((TEST_BASE_PORT + 200)) passed clean while reaching three neighbouring
+# bands.
+BAND_WIDTH=64
+
 # --- Check 1: every `seq` in a sweep step must derive from $TEST_BASE_PORT,
-# never a bare numeric literal. ---
+# never a bare numeric literal, and must stop exactly at the band edge. ---
 for f in "${files[@]}"; do
     [ -f "$f" ] || continue
     while IFS=: read -r lineno line; do
@@ -78,24 +87,44 @@ for f in "${files[@]}"; do
                 # reason about, which is the same failure with a nicer face.
                 echo "lint-ci-ports: $f:$lineno: sweep range does not derive from \$TEST_BASE_PORT: $trimmed" >&2
                 status=1
+            elif [[ "$line" =~ TEST_BASE_PORT[[:space:]]*\+[[:space:]]*([0-9]+) ]]; then
+                # Mentioning $TEST_BASE_PORT is not the same as staying inside
+                # ITS band: $((TEST_BASE_PORT + 200)) derives from the right
+                # variable and still sweeps three neighbouring bands off the
+                # end of this job's own (AUD-CIPORT2).
+                offset="${BASH_REMATCH[1]}"
+                if [[ "$offset" -ne $((BAND_WIDTH - 1)) ]]; then
+                    echo "lint-ci-ports: $f:$lineno: sweep reaches \$TEST_BASE_PORT+$offset, past this job's ${BAND_WIDTH}-wide band (expected +$((BAND_WIDTH - 1))): $trimmed" >&2
+                    status=1
+                fi
+            else
+                # $TEST_BASE_PORT is present but not as "+ N" -- e.g. summed
+                # via an intermediate variable this lint cannot resolve. Can't
+                # prove the band width is respected, so don't report OK on it.
+                echo "lint-ci-ports: $f:$lineno: sweep upper bound is not a recognizable \$TEST_BASE_PORT + N offset: $trimmed" >&2
+                status=1
             fi
         fi
     done < <(grep -n -F "$SEQ_LITERAL" "$f")
 done
 
-# --- Check 2: every job that declares TEST_BASE_PORT must have a value
-# distinct from every other such job, across all scanned files. ---
-# "job:port:file" rows, in file order. A job-level `env:` block is indented
-# 4 spaces in every workflow here (2 for the job key + 2 for its children);
-# TEST_BASE_PORT sits one level deeper (6 spaces) as a direct child of that
-# env: block, not the job-env: block used by e.g. LEGACY_NGINX_VERSION's
-# sibling lines -- so match on the key name, not on indentation depth, to
-# stay robust to reindentation.
-declare -A seen_port_job
-declare -A seen_port_file
+# --- Check 2: every job's [base, base+BAND_WIDTH-1] port INTERVAL must be
+# disjoint from every other such job's interval, across all scanned files. ---
+# Comparing bases for equality alone is not enough: bases 18880 and 18900 are
+# distinct values, so an equality check reports OK, but their 64-wide
+# intervals still share 44 ports and collide exactly as AUD-CIPORT1 did
+# (AUD-CIPORT2). "job:port:file" rows, in file order. A job-level `env:`
+# block is indented 4 spaces in every workflow here (2 for the job key + 2
+# for its children); TEST_BASE_PORT sits one level deeper (6 spaces) as a
+# direct child of that env: block, not the job-env: block used by e.g.
+# LEGACY_NGINX_VERSION's sibling lines -- so match on the key name, not on
+# indentation depth, to stay robust to reindentation.
 declare -A job_declares_band     # "file:job" -> port
 declare -A job_starts_suite      # "file:job" -> the invoking line, trimmed
 declare -A job_passes_port       # "file:job" -> 1
+interval_starts=()
+interval_ends=()
+interval_labels=()
 
 for f in "${files[@]}"; do
     [ -f "$f" ] || continue
@@ -121,13 +150,19 @@ for f in "${files[@]}"; do
         if [[ "$line" =~ TEST_BASE_PORT:[[:space:]]*\"?([0-9]+)\"? ]]; then
             port="${BASH_REMATCH[1]}"
             job_declares_band[$key]="$port"
-            if [[ -n "${seen_port_job[$port]:-}" ]]; then
-                echo "lint-ci-ports: TEST_BASE_PORT=$port is used by both '${seen_port_job[$port]}' (${seen_port_file[$port]}) and '$job' ($f) -- runtime-bearing jobs on the shared runner must have DISTINCT bands" >&2
-                status=1
-            else
-                seen_port_job[$port]="$job"
-                seen_port_file[$port]="$f"
-            fi
+            start="$port"
+            end="$((port + BAND_WIDTH - 1))"
+            for i in "${!interval_starts[@]}"; do
+                other_start="${interval_starts[$i]}"
+                other_end="${interval_ends[$i]}"
+                if [[ "$start" -le "$other_end" && "$other_start" -le "$end" ]]; then
+                    echo "lint-ci-ports: TEST_BASE_PORT=$port ([$start-$end]) for '$job' ($f) overlaps ${interval_labels[$i]} -- runtime-bearing jobs on the shared runner must have DISJOINT bands" >&2
+                    status=1
+                fi
+            done
+            interval_starts+=("$start")
+            interval_ends+=("$end")
+            interval_labels+=("'$job' ($f, [$start-$end])")
         fi
 
         # A job that starts the runtime suite -- directly or through the
@@ -166,7 +201,7 @@ for key in "${!job_starts_suite[@]}"; do
 done
 
 if [ "$status" -eq 0 ]; then
-    echo "lint-ci-ports: OK (${#seen_port_job[@]} distinct port bands, ${#job_starts_suite[@]} runtime-bearing jobs, ${#files[@]} workflow files scanned)"
+    echo "lint-ci-ports: OK (${#interval_starts[@]} distinct port bands, ${#job_starts_suite[@]} runtime-bearing jobs, ${#files[@]} workflow files scanned)"
 fi
 
 exit "$status"
