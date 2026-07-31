@@ -46,6 +46,14 @@ fi
 
 status=0
 
+# The literal text this lint searches for. Kept in a variable so the two match
+# sites cannot drift apart, and so neither has to single-quote "$(seq " inline --
+# which SC2016 reads as an unexpanded expression, and CI's validation step runs
+# this file through shellcheck at DEFAULT severity, where info-level is fatal.
+# (The pre-commit hook gates at -S warning, so that divergence hides locally.)
+# shellcheck disable=SC2016
+SEQ_LITERAL='$(seq '
+
 # --- Check 1: every `seq` in a sweep step must derive from $TEST_BASE_PORT,
 # never a bare numeric literal. ---
 for f in "${files[@]}"; do
@@ -56,7 +64,7 @@ for f in "${files[@]}"; do
         # this lint, which is how a gate dies.
         sweep_body="$(sed -n "${lineno},$((lineno + 3))p" "$f")"
         [[ "$sweep_body" == *fuser* ]] || continue
-        if [[ "$line" == *'$(seq '* ]]; then
+        if [[ "$line" == *"$SEQ_LITERAL"* ]]; then
             # Extract the seq(1) argument list.
             args="${line#*"\$(seq "}"
             args="${args%%)*}"
@@ -72,7 +80,7 @@ for f in "${files[@]}"; do
                 status=1
             fi
         fi
-    done < <(grep -n '\$(seq ' "$f")
+    done < <(grep -n -F "$SEQ_LITERAL" "$f")
 done
 
 # --- Check 2: every job that declares TEST_BASE_PORT must have a value
