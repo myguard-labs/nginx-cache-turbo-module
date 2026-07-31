@@ -24,6 +24,11 @@
 #                          uploads the HTML/summary; it does not fail on a number.
 #   REDIS_SERVER / MEMCACHED_SERVER - binary paths (default /usr/bin/...).
 #   COVERAGE_OUT         - output dir (default coverage-report under the module).
+#   TEST_BASE_PORT       - base port handed to test_runtime.py --port (default
+#                          18880, the suite's own default). CI sets this to a
+#                          band exclusive to the coverage job so it cannot
+#                          collide with another runtime-bearing job on the
+#                          same shared self-hosted runner (AUD-CIPORT1).
 #
 set -euo pipefail
 
@@ -37,6 +42,7 @@ ADDON="$OBJDIR/addon/src"
 OUT="${COVERAGE_OUT:-$MODULE_DIR/coverage-report}"
 REDIS_SERVER="${REDIS_SERVER:-/usr/bin/redis-server}"
 MEMCACHED_SERVER="${MEMCACHED_SERVER:-/usr/bin/memcached}"
+TEST_BASE_PORT="${TEST_BASE_PORT:-18880}"
 
 # 1. instrumented build
 bash "$MODULE_DIR/ci/tools/ci-build.sh" "$FLAVOR" "$VERSION" coverage
@@ -59,6 +65,7 @@ python3 "$MODULE_DIR/ci/tools/test_runtime.py" \
     --module "$OBJDIR/ngx_http_cache_turbo_module.so" \
     --redis-server "$REDIS_SERVER" \
     --memcached-server "$MEMCACHED_SERVER" \
+    --port "$TEST_BASE_PORT" \
     --fault-injection
 
 # 2b. pure-math unit tests. They cover the SWR/autotune boundary branches the

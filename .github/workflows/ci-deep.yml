@@ -164,6 +164,10 @@ jobs:
     timeout-minutes: 20
     env:
       LEGACY_NGINX_VERSION: "1.22.1"
+      # AUD-CIPORT1: own 64-wide port band, distinct from every other
+      # runtime-bearing job on this shared runner. See
+      # ci/tools/lint-ci-ports.sh (fails CI on a collision or a hardcoded sweep).
+      TEST_BASE_PORT: 19072
     steps:
       - name: Checkout module
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -186,8 +190,12 @@ jobs:
 
       - name: Sweep stale test listeners
         run: |
+          # Kill leftovers from earlier crashed runs still holding test
+          # ports in THIS job's own band. Must never widen back to the old
+          # shared 18870-18999 -- that killed a SIBLING job's live fixtures
+          # (AUD-CIPORT1).
           command -v fuser >/dev/null || sudo apt-get install -y psmisc
-          for p in $(seq 18870 18999); do
+          for p in $(seq "$TEST_BASE_PORT" $((TEST_BASE_PORT + 63))); do
             fuser -k -TERM "${p}/tcp" 2>/dev/null || true
           done
           sleep 1
@@ -197,6 +205,7 @@ jobs:
           B="$GITHUB_WORKSPACE/.build/nginx-${LEGACY_NGINX_VERSION}/objs"
           python3 ci/tools/test_runtime.py \
             --fault-injection \
+            --port "$TEST_BASE_PORT" \
             --nginx-binary "$B/nginx" \
             --module "$B/ngx_http_cache_turbo_module.so" \
             --redis-server /usr/bin/redis-server \
@@ -369,6 +378,12 @@ jobs:
     name: ASan multi-worker soak (flake repetition)
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02"]') }}
     timeout-minutes: 60
+    # AUD-CIPORT1: own 64-wide port band, distinct from every other
+    # runtime-bearing job on this shared runner. The nested per-iteration
+    # sweep below shares this SAME band -- it is not a separate job. See
+    # ci/tools/lint-ci-ports.sh (fails CI on a collision or a hardcoded sweep).
+    env:
+      TEST_BASE_PORT: 19136
     steps:
       - name: Checkout module
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -391,8 +406,12 @@ jobs:
 
       - name: Sweep stale test listeners
         run: |
+          # Kill leftovers from earlier crashed runs still holding test
+          # ports in THIS job's own band. Must never widen back to the old
+          # shared 18870-18999 -- that killed a SIBLING job's live fixtures
+          # (AUD-CIPORT1).
           command -v fuser >/dev/null || sudo apt-get install -y psmisc
-          for p in $(seq 18870 18999); do
+          for p in $(seq "$TEST_BASE_PORT" $((TEST_BASE_PORT + 63))); do
             fuser -k -TERM "${p}/tcp" 2>/dev/null || true
           done
           sleep 1
@@ -411,13 +430,16 @@ jobs:
           echo "asan-soak: $n iterations of the multi-worker fault-injection suite"
           for i in $(seq 1 "$n"); do
             echo "=== asan-soak iteration $i/$n ==="
-            # Sweep between iterations: a crashed run can leave a listener held.
-            for p in $(seq 18870 18999); do
+            # Sweep between iterations: a crashed run can leave a listener
+            # held. Same band as the job's own pre-suite sweep above (not a
+            # separate job, so it shares TEST_BASE_PORT -- AUD-CIPORT1).
+            for p in $(seq "$TEST_BASE_PORT" $((TEST_BASE_PORT + 63))); do
               fuser -k -TERM "${p}/tcp" 2>/dev/null || true
             done
             python3 ci/tools/test_runtime.py \
               --fault-injection \
               --sanitizer \
+              --port "$TEST_BASE_PORT" \
               --redis-server /usr/bin/redis-server \
               --memcached-server /usr/bin/memcached \
               --nginx-binary "$B"
@@ -544,6 +566,13 @@ jobs:
     name: Coverage (gcov report)
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02"]') }}
     timeout-minutes: 60
+    # AUD-CIPORT1: own 64-wide port band, distinct from every other
+    # runtime-bearing job on this shared runner -- this job DOES run the full
+    # runtime suite (via ci/tools/coverage.sh), so it needs one like the
+    # others. See ci/tools/lint-ci-ports.sh (fails CI on a collision or a
+    # hardcoded sweep).
+    env:
+      TEST_BASE_PORT: 19200
     steps:
       - name: Checkout module
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -564,8 +593,12 @@ jobs:
 
       - name: Sweep stale test listeners
         run: |
+          # Kill leftovers from earlier crashed runs still holding test
+          # ports in THIS job's own band. Must never widen back to the old
+          # shared 18870-18999 -- that killed a SIBLING job's live fixtures
+          # (AUD-CIPORT1).
           command -v fuser >/dev/null || sudo apt-get install -y psmisc
-          for p in $(seq 18870 18999); do
+          for p in $(seq "$TEST_BASE_PORT" $((TEST_BASE_PORT + 63))); do
             fuser -k -TERM "${p}/tcp" 2>/dev/null || true
           done
           sleep 1
@@ -574,7 +607,8 @@ jobs:
         # coverage.sh drives all three steps (ci-build.sh coverage -> runtime
         # suite -> gcovr). The instrumented build is -O0 and the suite seeds
         # real bodies, so the per-test timeout needs the same headroom the
-        # script's own default gives it.
+        # script's own default gives it. TEST_BASE_PORT (job env, above) is
+        # read by coverage.sh itself (AUD-CIPORT1).
         env:
           TEST_NGINX_TIMEOUT: "30"
         run: bash ci/tools/coverage.sh nginx "$NGINX_VERSION"
