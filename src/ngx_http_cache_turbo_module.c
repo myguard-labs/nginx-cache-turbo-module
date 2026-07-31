@@ -6528,6 +6528,23 @@ ngx_http_cache_turbo_restore_response(ngx_http_request_t *r, u_char *copy,
         body_len = 0;
     }
 
+    /* AUD-RANGE1: tell core's range filter this response may be range-served.
+     * Upstream sets r->allow_ranges on every MISS (ngx_http_upstream.c), so a
+     * client asking for the same URL twice got 206 on MISS and 200 on HIT/STALE
+     * — a correctness regression, not just a missed optimisation (a client that
+     * requested a partial fetch by Range and got the whole body back can
+     * misinterpret it as the slice it asked for). Restrict to the plain 200
+     * serve with a known length: not the 304 branch just above (no body to
+     * range over), and not other cached statuses (redirects etc. never carry
+     * Range semantics). ngx_http_range_header_filter re-checks the request's
+     * own Range header and r->headers_out.status itself, so this only *permits*
+     * ranged replies; it does not force one. */
+    if (r->headers_out.status == NGX_HTTP_OK
+        && r->headers_out.content_length_n >= 0)
+    {
+        r->allow_ranges = 1;
+    }
+
     /* Date header (RFC 9111 §5.6.7, §4.2.3 — RFC-3): emit a STABLE Date for the
      * cached representation instead of letting core stamp the current time on
      * every hit. Core's header filter generates its own Date line only when
