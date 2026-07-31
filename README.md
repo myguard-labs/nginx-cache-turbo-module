@@ -1681,7 +1681,7 @@ http {
 |---|---|
 | `GET /_cache` | JSON stats (`?autotune=1` also forces an autotune recompute first). |
 | `GET /_cache?format=prometheus` | Same stats in Prometheus text format — scrape this. |
-| `POST /_cache?all=1` | Purge the whole zone (and the L2 keyspace, if Redis is on). |
+| `POST /_cache?all=1` | Purge the whole zone (and the L2 keyspace, if Redis is on). The L2 side is a `SCAN MATCH <prefix>*` walk; if that walk does **not** finish — read timeout, malformed reply, or the internal page cap — the response is `500` with `{"purged":N,"l2":"incomplete","reason":"…"}` and part of L2 still holds entries. A `200` means the walk reached the end of the keyspace. |
 | `POST /_cache?key=<string>` | Purge one entry. `<string>` is hashed **verbatim**, so it must equal the entry's full cache-key value — for the default key that is `<host><uri><normalized-args>` (e.g. `example.com/blog/post-42`), **not** just the path. Use a `PURGE` request to that URL (above) if you don't want to reconstruct the key. Drops L1 + L2. |
 | `POST /_cache?tag=<name>` | Purge every page tagged `<name>` across L1 + L2. |
 | `POST /_cache?url=<path[,path,...]>` | Warm those paths (background prefetch). Each warm subrequest fetches **anonymously** — the admin request's `Cookie` header is stripped, so the entry is stored under the cookieless anonymous key a visitor looks up (and no per-visitor/segment body is pulled from the origin), even if you trigger the warm from a logged-in browser. |

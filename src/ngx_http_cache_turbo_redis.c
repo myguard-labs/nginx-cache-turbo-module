@@ -33,6 +33,16 @@
  * can't make us allocate an enormous members array before any data arrives. */
 #define NGX_HTTP_CACHE_TURBO_REDIS_MAX_MEMBERS  (1024 * 1024)
 
+/* AUD-SCAN1: hard ceiling on the number of SCAN pages one all-purge walk may
+ * consume. read_scan terminates only when the server hands back cursor "0"; a
+ * broken or hostile L2 that always returns a non-zero cursor otherwise loops
+ * forever, and the per-page read timeout does not bound it because each page's
+ * write re-arms the timer. At COUNT 256 this cap covers a ~268M-key keyspace,
+ * far past any real cache, so an honest server never reaches it. Reaching it
+ * ABANDONS the walk and reports the purge INCOMPLETE — it is never silently
+ * treated as a completed purge. */
+#define NGX_HTTP_CACHE_TURBO_REDIS_SCAN_MAX_PAGES  (1024 * 1024)
+
 
 /*
  * One in-flight async redis operation. It owns its own pool so a fire-and-
@@ -76,6 +86,24 @@ typedef struct {
     size_t                       rcap;
     size_t                       rlen;
 
+    /* AUD-SCAN1: pool the reply buffer (and, on the SCAN walk, everything else
+     * that only has to live for one page) is allocated from. It is op->pool for
+     * every op except scan_del, where it is a per-page pool that is destroyed
+     * once del_many has copied the page's keys out. Without that the whole walk
+     * accumulated in op->pool: a keys array and a rebuilt SCAN command per
+     * page, plus a reply buffer that only ever doubled — bounded per page, but
+     * never released until the walk ended. */
+    ngx_pool_t                  *rpool;
+
+    /* SCAN walk bookkeeping (AUD-SCAN1). is_scan distinguishes the SCAN-del op
+     * from the SMEMBERS op, which shares smembers_finish; scan_status is the
+     * outcome handed to the completion callback (NGX_OK only when the server
+     * returned cursor "0"), and starts as NGX_ERROR so every path that reaches
+     * finish WITHOUT setting it reports INCOMPLETE rather than success. */
+    unsigned                     is_scan:1;
+    ngx_int_t                    scan_status;
+    ngx_uint_t                   scan_pages;
+
     u_char                       recv[256];/* SET/lock/preamble reply scratch */
     size_t                       recv_len; /* bytes buffered in recv[]        */
 } ngx_http_cache_turbo_redis_op_t;
@@ -107,6 +135,7 @@ static ngx_int_t ngx_http_cache_turbo_redis_frame(u_char *p, u_char *end,
     ngx_uint_t depth, u_char **next);
 static ngx_int_t ngx_http_cache_turbo_redis_resp_len(u_char *p, size_t n,
     ngx_int_t *len);
+static ngx_uint_t ngx_http_cache_turbo_redis_pool_blocks(ngx_pool_t *pool);
 #if (NGX_SSL)
 static void ngx_http_cache_turbo_redis_tls_handshake(ngx_event_t *ev);
 static void ngx_http_cache_turbo_redis_tls_handshake_done(
@@ -944,6 +973,7 @@ ngx_http_cache_turbo_redis_op_create(ngx_http_cache_turbo_loc_conf_t *clcf)
     }
 
     op->pool = pool;
+    op->rpool = pool;                      /* scan_del re-points this per page */
     op->timeout = clcf->redis_timeout;
 
     return op;
@@ -1642,16 +1672,32 @@ ngx_http_cache_turbo_redis_scan_del(ngx_http_request_t *r,
     op->clcf = clcf;
     op->members_cb = cb;
     op->members_data = data;
+    op->is_scan = 1;
+    op->scan_status = NGX_ERROR;           /* until cursor "0" says otherwise */
 
-    op->rcap = ngx_pagesize * 4;          /* grows on demand up to MAX_REPLY */
-    op->rbuf = ngx_pnalloc(op->pool, op->rcap);
-    if (op->rbuf == NULL) {
+    /* AUD-SCAN1: everything that lives for exactly one SCAN page — the reply
+     * buffer, the parsed keys array, the next SCAN command — comes out of a
+     * per-page pool, rotated in read_scan. op->pool keeps only the op itself
+     * and the connection, so the walk's footprint is O(1) in page count. */
+    op->rpool = ngx_create_pool(ngx_pagesize, ngx_cycle->log);
+    if (op->rpool == NULL) {
+        op->rpool = op->pool;
         ngx_destroy_pool(op->pool);
         return NGX_ERROR;
     }
 
-    op->send = ngx_http_cache_turbo_redis_scan_cmd(op->pool, clcf, &cursor0);
+    op->rcap = ngx_pagesize * 4;          /* grows on demand up to MAX_REPLY */
+    op->rbuf = ngx_pnalloc(op->rpool, op->rcap);
+    if (op->rbuf == NULL) {
+        ngx_destroy_pool(op->rpool);
+        op->rpool = op->pool;
+        ngx_destroy_pool(op->pool);
+        return NGX_ERROR;
+    }
+
+    op->send = ngx_http_cache_turbo_redis_scan_cmd(op->rpool, clcf, &cursor0);
     if (op->send == NULL) {
+        ngx_destroy_pool(op->rpool);
         ngx_destroy_pool(op->pool);
         return NGX_ERROR;
     }
@@ -1659,6 +1705,7 @@ ngx_http_cache_turbo_redis_scan_del(ngx_http_request_t *r,
     if (ngx_http_cache_turbo_redis_launch(op, clcf,
             ngx_http_cache_turbo_redis_read_scan) != NGX_OK)
     {
+        ngx_destroy_pool(op->rpool);
         ngx_destroy_pool(op->pool);
         return NGX_ERROR;
     }
@@ -1913,6 +1960,38 @@ ngx_http_cache_turbo_redis_read_drain(ngx_event_t *rev)
 
 
 /*
+ * AUD-SCAN1 oracle: count the allocation blocks a pool currently holds — its
+ * chained data blocks plus its large (> pool max) allocations. nginx does not
+ * record the size of a large block, so this counts blocks rather than bytes;
+ * that is enough for the property under test, which is whether the SCAN walk's
+ * footprint is CONSTANT in page count or grows with it. Pre-fix each page added
+ * at least one large block (the 256-entry keys array) plus small blocks for the
+ * rebuilt command, and nothing was ever released until the walk ended.
+ *
+ * Only ever read on the SCAN completion path and only reported under
+ * TEST_FAULTS; it walks two short lists, so it is not on any hot path.
+ */
+static ngx_uint_t
+ngx_http_cache_turbo_redis_pool_blocks(ngx_pool_t *pool)
+{
+    ngx_uint_t         n = 0;
+    ngx_pool_t        *p;
+    ngx_pool_large_t  *l;
+
+    for (p = pool; p; p = p->d.next) {
+        n++;
+    }
+    for (l = pool->large; l; l = l->next) {
+        if (l->alloc) {
+            n++;
+        }
+    }
+
+    return n;
+}
+
+
+/*
  * Append one recv() of reply bytes into op->rbuf, growing it (bounded by
  * MAX_REPLY) when full. Shared by the GET / SMEMBERS / SCAN readers so the
  * grow + recv + event-rearm boilerplate lives in one place. Returns:
@@ -1938,7 +2017,7 @@ ngx_http_cache_turbo_redis_fill(ngx_http_cache_turbo_redis_op_t *op,
         if (ncap > NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY) {
             ncap = NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY;
         }
-        nbuf = ngx_pnalloc(op->pool, ncap);
+        nbuf = ngx_pnalloc(op->rpool, ncap);
         if (nbuf == NULL) {
             return NGX_ERROR;
         }
@@ -2478,8 +2557,10 @@ ngx_http_cache_turbo_redis_parse_scan(ngx_http_cache_turbo_redis_op_t *op,
 
     list = NULL;
     if (count > 0) {
-        /* ngx_palloc (not ngx_pnalloc): ngx_str_t needs pointer alignment. */
-        list = ngx_palloc(op->pool, count * sizeof(ngx_str_t));
+        /* ngx_palloc (not ngx_pnalloc): ngx_str_t needs pointer alignment.
+         * op->rpool, not op->pool: on the SCAN walk this array belongs to the
+         * page and dies with it (AUD-SCAN1). */
+        list = ngx_palloc(op->rpool, count * sizeof(ngx_str_t));
         if (list == NULL) {
             return NGX_DECLINED;
         }
@@ -2529,18 +2610,45 @@ ngx_http_cache_turbo_redis_parse_scan(ngx_http_cache_turbo_redis_op_t *op,
  * then either finish (cursor back to "0") or post the write event to issue the
  * next SCAN with the returned cursor. Posting (not recursing) keeps the stack
  * bounded for an arbitrarily large keyspace.
+ *
+ * AUD-SCAN1: the stack was bounded, the POOL was not. Each page is now owned by
+ * its own pool (op->rpool), rotated here: the next SCAN command and the next
+ * reply buffer are allocated from a FRESH pool and the previous one is then
+ * destroyed, so the walk's live allocation is O(1) in page count instead of
+ * accumulating a keys array, a rebuilt command and a never-shrinking reply
+ * buffer per page for the entire keyspace. Two orderings make that safe, both
+ * already relied on before this change: del_many copies the page's keys before
+ * we move on, and scan_cmd/encode copies the cursor bytes (which point into the
+ * OLD reply buffer) into the new command — so the new command is built first
+ * and the old pool destroyed only afterwards.
+ *
+ * The walk is also bounded by SCAN_MAX_PAGES. Reaching it abandons the walk and
+ * reports the purge INCOMPLETE; it must never look like a completed purge.
  */
 static void
 ngx_http_cache_turbo_redis_read_scan(ngx_event_t *rev)
 {
     ngx_str_t                         cursor, *keys;
-    ngx_uint_t                        nkeys;
+    ngx_uint_t                        nkeys, max_pages;
     ngx_int_t                         rc;
+    ngx_buf_t                        *send;
+    u_char                           *rbuf;
+    ngx_pool_t                       *np, *old;
     ngx_connection_t                 *c;
     ngx_http_cache_turbo_redis_op_t  *op;
 
     c = rev->data;
     op = c->data;
+
+    max_pages = NGX_HTTP_CACHE_TURBO_REDIS_SCAN_MAX_PAGES;
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+    if (op->clcf->test_scan_max_pages > 0
+        && (ngx_uint_t) op->clcf->test_scan_max_pages < max_pages)
+    {
+        max_pages = (ngx_uint_t) op->clcf->test_scan_max_pages;
+    }
+#endif
 
     if (rev->timedout) {
         ngx_log_error(NGX_LOG_INFO, c->log, NGX_ETIMEDOUT,
@@ -2583,22 +2691,57 @@ ngx_http_cache_turbo_redis_read_scan(ngx_event_t *rev)
          * the next SCAN resets rbuf. */
         ngx_http_cache_turbo_redis_del_many(op->clcf, keys, nkeys);
 
+        op->scan_pages++;
+
         if (cursor.len == 1 && cursor.data[0] == '0') {
             /* whole keyspace walked: emit the response via the callback */
+            op->scan_status = NGX_OK;
             ngx_http_cache_turbo_redis_smembers_finish(op, NULL, 0);
             return;
         }
 
-        /* Issue the next SCAN with the returned cursor. encode copies the
-         * cursor bytes (which point into rbuf) into a fresh send buffer, so it
-         * is safe to reset rbuf afterwards. */
-        op->send = ngx_http_cache_turbo_redis_scan_cmd(op->pool, op->clcf,
-                                                       &cursor);
-        if (op->send == NULL) {
+        if (op->scan_pages >= max_pages) {
+            /* Non-termination guard: a server that never hands back cursor "0"
+             * would otherwise walk forever (the per-page read timeout does not
+             * bound the walk — each page's write re-arms it). Abandon, and let
+             * the callback report the purge INCOMPLETE. Truncating silently
+             * would swap a memory bug for a correctness bug. */
+            ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                          "cache_turbo: L2 all-purge abandoned after %ui SCAN "
+                          "pages without the cursor returning to 0; purge is "
+                          "INCOMPLETE", op->scan_pages);
+            op->scan_status = NGX_ABORT;
             ngx_http_cache_turbo_redis_smembers_finish(op, NULL, 0);
             return;
         }
+
+        /* Issue the next SCAN with the returned cursor, out of a FRESH page
+         * pool. encode copies the cursor bytes (which point into the old rbuf)
+         * into the new send buffer, so the old pool is safe to drop right
+         * after — and must be dropped, or the walk grows without bound. */
+        np = ngx_create_pool(ngx_pagesize, ngx_cycle->log);
+        if (np == NULL) {
+            ngx_http_cache_turbo_redis_smembers_finish(op, NULL, 0);
+            return;
+        }
+
+        send = ngx_http_cache_turbo_redis_scan_cmd(np, op->clcf, &cursor);
+        rbuf = send ? ngx_pnalloc(np, ngx_pagesize * 4) : NULL;
+        if (rbuf == NULL) {
+            ngx_destroy_pool(np);
+            ngx_http_cache_turbo_redis_smembers_finish(op, NULL, 0);
+            return;
+        }
+
+        old = op->rpool;
+        op->rpool = np;
+        op->send = send;
+        op->command = send;                /* old buffer dies with `old` */
+        op->rbuf = rbuf;
+        op->rcap = ngx_pagesize * 4;       /* fresh page: drop any grown cap */
         op->rlen = 0;
+        ngx_destroy_pool(old);
+
         ngx_post_event(c->write, &ngx_posted_events);
         return;
     }
@@ -2620,10 +2763,21 @@ ngx_http_cache_turbo_redis_smembers_finish(
     ngx_http_request_t                     *r = op->request;
     ngx_http_cache_turbo_redis_members_pt   cb = op->members_cb;
     void                                   *data = op->members_data;
+    ngx_http_cache_turbo_redis_walk_t       walk;
     ngx_int_t                               rc;
 
+    /* AUD-SCAN1: on the SCAN path, tell the callback HOW the walk ended.
+     * op->scan_status is NGX_OK only where the server returned cursor "0";
+     * every other terminal path (timeout, malformed reply, alloc failure, page
+     * cap) leaves it non-OK and the purge is reported INCOMPLETE. */
+    walk.status = op->scan_status;
+    walk.pages = op->scan_pages;
+    walk.blocks = ngx_http_cache_turbo_redis_pool_blocks(op->pool)
+                  + (op->rpool != op->pool
+                     ? ngx_http_cache_turbo_redis_pool_blocks(op->rpool) : 0);
+
     /* Callback consumes members (pointing into op->rbuf) synchronously. */
-    rc = cb(r, data, members, nmembers);
+    rc = cb(r, data, members, nmembers, op->is_scan ? &walk : NULL);
 
     /* Now safe to drop our connection + pool (members no longer referenced). */
     ngx_http_cache_turbo_redis_op_done(op);
@@ -2639,6 +2793,14 @@ ngx_http_cache_turbo_redis_op_done(ngx_http_cache_turbo_redis_op_t *op)
 {
     ngx_pool_t        *pool = op->pool;
     ngx_connection_t  *c = op->peer.connection;
+
+    /* AUD-SCAN1: the SCAN walk's current page pool is independent of op->pool
+     * (it is rotated per page), so it has to be released explicitly. Every
+     * other op leaves rpool == pool. */
+    if (op->rpool != pool) {
+        ngx_destroy_pool(op->rpool);
+        op->rpool = pool;
+    }
 
     if (c && ngx_http_cache_turbo_redis_ka_save(op)) {
         /* parked on the idle pool; the connection outlives this op */
