@@ -1524,8 +1524,12 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
         }}
 
         # D-O2: a keepalive location pointed at a DELIBERATELY MISBEHAVING fake
-        # memcached (on PORT_OFFSETS["mc_dirty_reply"], stood up only by
-        # test_mc_dirty_reply_not_pooled). A reply that does not frame cleanly at
+        # memcached (PORT_OFFSETS["mc_dirty_reply"], stood up only by
+        # test_mc_dirty_reply_not_pooled on the PRIMARY instance). The address is
+        # derived from memcached_port, not from this instance's own `port`: a
+        # second nginx (test_l2_memcached_cross_instance_fill's instance B) runs
+        # on a different port but must still point at the one fake memcached.
+        # A reply that does not frame cleanly at
         # a boundary (trailing junk past END/STORED, a server error, a timeout)
         # must NOT be returned to the pool -- the connection is closed instead, so
         # a reuse never resumes mid-reply. Same keepalive size as /mcka/.
@@ -1533,7 +1537,7 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             cache_turbo            main;
             cache_turbo_key        $uri;
             cache_turbo_valid      30s;
-            cache_turbo_memcached  127.0.0.1:{port + PORT_OFFSETS["mc_dirty_reply"]} prefix=mcd: timeout=250ms keepalive=4 keepalive_timeout=30s;
+            cache_turbo_memcached  127.0.0.1:{memcached_port + PORT_OFFSETS["mc_dirty_reply"] - PORT_OFFSETS["memcached"]} prefix=mcd: timeout=250ms keepalive=4 keepalive_timeout=30s;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
