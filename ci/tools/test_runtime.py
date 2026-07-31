@@ -474,6 +474,62 @@ class Origin:
                     except BrokenPipeError:
                         pass
                     return
+                # AUD-RANGE1: a real Range-capable origin (e.g. a static file
+                # server) that both advertises Accept-Ranges: bytes AND honours
+                # an incoming Range header with a genuine 206 + Content-Range +
+                # sliced body. Body is well over 100 bytes so bytes=0-99 is a
+                # true partial slice, not the whole response. Used to prove a
+                # cache-turbo HIT answers Range identically to a MISS.
+                if "rngsrc" in self.path:
+                    # Fixed (not gen-N-prefixed) body: this marker drives a
+                    # byte-for-byte comparison between a HIT's Range answer and
+                    # a MISS's Range answer against a DIFFERENT URL, so the
+                    # body must not depend on which request/URL produced it.
+                    rbody = b"R" * 200
+                    rng = self.headers.get("Range")
+                    start, end = 0, len(rbody) - 1
+                    partial = False
+                    if rng and rng.startswith("bytes="):
+                        try:
+                            s, e = rng[len("bytes="):].split("-", 1)
+                            if not s:
+                                # Suffix range "bytes=-N" = the LAST N bytes,
+                                # not the first N. Getting this wrong would
+                                # silently mis-slice for any future test that
+                                # reuses this origin with a suffix range.
+                                start = max(0, len(rbody) - int(e))
+                                end = len(rbody) - 1
+                            else:
+                                start = int(s)
+                                end = int(e) if e else len(rbody) - 1
+                            end = min(end, len(rbody) - 1)
+                            partial = start <= end
+                        except ValueError:
+                            partial = False
+                    if partial:
+                        chunk = rbody[start:end + 1]
+                        self.send_response(206)
+                        self.send_header("Content-Type", "text/plain")
+                        self.send_header("Accept-Ranges", "bytes")
+                        self.send_header("Content-Range",
+                                          f"bytes {start}-{end}/{len(rbody)}")
+                        self.send_header("Content-Length", str(len(chunk)))
+                        self.end_headers()
+                        try:
+                            self.wfile.write(chunk)
+                        except BrokenPipeError:
+                            pass
+                    else:
+                        self.send_response(200)
+                        self.send_header("Content-Type", "text/plain")
+                        self.send_header("Accept-Ranges", "bytes")
+                        self.send_header("Content-Length", str(len(rbody)))
+                        self.end_headers()
+                        try:
+                            self.wfile.write(rbody)
+                        except BrokenPipeError:
+                            pass
+                    return
                 # Per-status caching markers (v6): redirects + negative responses.
                 if "redir" in self.path:
                     self.send_response(301)
@@ -1835,6 +1891,15 @@ http {{
         # whose stored validators satisfy If-None-Match / If-Modified-Since is
         # answered 304 (no body) straight from cache.
         location /cond/ {{
+            cache_turbo       main;
+            cache_turbo_key   $uri;
+            cache_turbo_valid 30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # AUD-RANGE1: origin honours Range (rngsrc path marker); a HIT must
+        # answer Range: identically to a MISS instead of always replaying 200.
+        location /range/ {{
             cache_turbo       main;
             cache_turbo_key   $uri;
             cache_turbo_valid 30s;
@@ -9451,6 +9516,49 @@ def test_206_never_cached(ng: Nginx, origin: Origin) -> None:
         "206 was wrongly served from cache"
 
 
+def test_range_hit_matches_miss(ng: Nginx, origin: Origin) -> None:
+    """AUD-RANGE1: r->allow_ranges was never set on the restore/HIT path, so a
+    Range request against a cached (<= max_size) entry silently fell back to a
+    full 200 instead of the 206 a MISS to the same Range-capable origin
+    returns. Warm one URL (plain GET, MISS, stores), then Range-GET it (HIT)
+    and compare against Range-GET-ing a NEVER-cached URL (a fresh MISS that
+    reaches the Range-capable origin directly) -- status, Content-Range and
+    body bytes must match."""
+    range_hdr = {"Range": "bytes=0-99"}
+
+    # MISS reference: a URL never requested before, fetched WITH the Range
+    # header. cache-turbo has nothing cached for it, so this reaches the
+    # Range-capable origin directly and its 206 is relayed verbatim.
+    s_miss, b_miss, h_miss = fetch_raw(ng.port, "/range/rngsrc-miss",
+                                       headers=range_hdr)
+    assert s_miss == 206, f"MISS with Range should be 206, got {s_miss}"
+    assert "x-cache" not in h_miss, f"reference fetch should not HIT: {h_miss}"
+    assert h_miss.get("content-range"), "MISS 206 must carry Content-Range"
+
+    # Warm a SEPARATE url with a plain GET (no Range) so it gets cached as a
+    # normal 200, Accept-Ranges: bytes included (the origin always sends it).
+    s0, _, h0 = fetch_raw(ng.port, "/range/rngsrc-warm")
+    assert s0 == 200 and "x-cache" not in h0, f"prime should miss: {s0} {h0}"
+    assert h0.get("accept-ranges") == "bytes", \
+        f"origin should advertise Accept-Ranges: {h0}"
+
+    # Now Range-GET the warmed URL: cache-turbo serves it from cache (HIT).
+    s_hit, b_hit, h_hit = fetch_raw(ng.port, "/range/rngsrc-warm",
+                                    headers=range_hdr)
+    assert h_hit.get("x-cache") == "HIT", f"second fetch should HIT: {h_hit}"
+    assert s_hit == 206, \
+        f"a Range request against a cache-turbo HIT must answer 206 like a " \
+        f"MISS does, got {s_hit} (Accept-Ranges was replayed but the range " \
+        f"was not honoured)"
+    assert s_hit == s_miss, f"HIT status {s_hit} != MISS status {s_miss}"
+    assert h_hit.get("content-range") == h_miss.get("content-range"), \
+        f"HIT Content-Range {h_hit.get('content-range')!r} != " \
+        f"MISS Content-Range {h_miss.get('content-range')!r}"
+    assert b_hit == b_miss, \
+        f"HIT partial body {b_hit!r} != MISS partial body {b_miss!r}"
+    assert len(b_hit) == 100, f"bytes=0-99 should be 100 bytes, got {len(b_hit)}"
+
+
 def test_safe_key_distinct_sessionids(ng: Nginx, origin: Origin) -> None:
     """Raw-key migration (was cache_turbo_safe_key): an explicit
     cache_turbo_key $scheme$host$request_uri keeps the full raw query, so two
@@ -15530,6 +15638,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_auto_vary_unknown_axis_uncacheable(ng, origin)
     test_auto_vary_stale_marker_reachable(ng, origin)
     test_206_never_cached(ng, origin)
+    test_range_hit_matches_miss(ng, origin)
     test_safe_key_distinct_sessionids(ng, origin)
     test_conditional_inm_304(ng, origin)
     test_conditional_inm_list_short_first(ng, origin)

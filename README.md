@@ -190,6 +190,7 @@ location / {
 | **Shared / distributed cache** | Redis/memcached L2 across the fleet | per-box disk, every node cold alone |
 | **One config for php-fpm *and* APIs** | same directives (`fastcgi_pass` + `proxy_pass`) | separate `fastcgi_cache` / `proxy_cache` |
 | **Tag purge · auto-Vary · CMS auto-classify · Prometheus** | built in | none |
+| **Range requests on a HIT** | honoured (`Range:` answered `206`, same as a MISS) | honoured |
 | **Survives reload / restart** | no — shm cleared (Redis L2 softens) | yes, persists on disk |
 | **Capacity** | bounded by RAM | huge on-disk corpus |
 | **Built into nginx** | no — dynamic module | yes, nothing to install |
