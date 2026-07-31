@@ -4148,16 +4148,46 @@ def gen_tls_expired_cert(dirpath: pathlib.Path, ca_key: str, ca: str) -> dict:
     ext = dirpath / "redis.ext"
     ext.write_text("subjectAltName=IP:127.0.0.1,DNS:localhost\n")
 
+    # `openssl x509 -req` only learned -not_before/-not_after in OpenSSL 3.2,
+    # and CI runners still ship older builds -- using them here made the
+    # fixture fail to generate and the whole redis_tls suite degrade. `openssl
+    # ca -startdate/-enddate` has been supported for many major versions, so
+    # the backdated window is portable. It needs a CA database, hence the
+    # index/serial/config scaffolding below.
+    index = dirpath / "index.txt"
+    serial = dirpath / "serial"
+    cnf = dirpath / "ca.cnf"
+    index.write_text("")
+    serial.write_text("01\n")
+    cnf.write_text(
+        "[ca]\n"
+        "default_ca = CA_default\n"
+        "[CA_default]\n"
+        f"dir = {dirpath}\n"
+        "database = $dir/index.txt\n"
+        "serial = $dir/serial\n"
+        "new_certs_dir = $dir\n"
+        f"certificate = {ca}\n"
+        f"private_key = {ca_key}\n"
+        "default_md = sha256\n"
+        "policy = policy_any\n"
+        "email_in_dn = no\n"
+        "rand_serial = no\n"
+        "unique_subject = no\n"
+        "[policy_any]\n"
+        "commonName = supplied\n"
+    )
+
     def run(*a):
         subprocess.run(a, check=True, stdout=subprocess.DEVNULL,
                        stderr=subprocess.DEVNULL, timeout=30)
 
     run("openssl", "req", "-newkey", "rsa:2048", "-nodes",
         "-keyout", str(key), "-out", str(csr), "-subj", "/CN=localhost")
-    run("openssl", "x509", "-req", "-in", str(csr), "-CA", ca,
-        "-CAkey", ca_key, "-CAcreateserial", "-out", str(crt),
+    run("openssl", "ca", "-batch", "-config", str(cnf),
+        "-in", str(csr), "-out", str(crt), "-notext",
         "-extfile", str(ext),
-        "-not_before", "20200101000000Z", "-not_after", "20200102000000Z")
+        "-startdate", "20200101000000Z", "-enddate", "20200102000000Z")
     return {"ca": ca, "cert": str(crt), "key": str(key)}
 
 
