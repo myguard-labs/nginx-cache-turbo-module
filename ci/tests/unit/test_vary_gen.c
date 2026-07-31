@@ -35,11 +35,24 @@
  * collision-with-the-untagged-keyspace condition AUD-GEN1 describes, and is
  * provable without the real digest.
  *
- * GEN_PRE_FIX / GEN_CTRL_NOFOLDFIX select which half of the two-part fix
- * (module.c ~1856 write-site mask, module.c ~11150 fold-site `gen > 0` drop)
- * is REVERTED, for the pre-fix repro and the two independent mutation checks
- * (`make control` analog -- see run.sh). Unguarded build = shipped (fixed)
- * behaviour.
+ * Two mutation macros each REVERT one half of the two-part fix, and are the
+ * negative controls for it. An unguarded build is the shipped (fixed)
+ * behaviour and passes.
+ *
+ *   GEN_CTRL_NOSKIPZERO  -- reverts the write-site skip-0-on-wrap
+ *                           (module.c ~1856). Fails the "must never fold to
+ *                           the SAME key as the genesis state" assertion.
+ *   GEN_CTRL_NOFOLDFIX   -- reintroduces the fold-site `gen > 0` guard
+ *                           (module.c ~11150). Fails the "genesis key must
+ *                           carry an explicit generation tag" assertion.
+ *
+ * Defining BOTH reproduces the pre-fix code exactly, and is the AUD-GEN1
+ * repro: 3 failures, plus the reported counter "empty fold at purge #256
+ * ... = 1" -- the 256th purge folding to the same empty segment as the
+ * never-purged base. Verified 2026-07-31; each macro also fails alone, so
+ * neither half is carried by the other.
+ *
+ *   cc -DGEN_CTRL_NOSKIPZERO -DGEN_CTRL_NOFOLDFIX test_vary_gen.c -o t && ./t
  */
 
 #include <stdio.h>

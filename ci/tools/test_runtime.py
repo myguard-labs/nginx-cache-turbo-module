@@ -9712,7 +9712,13 @@ def test_cor5_l1only_variant_purge_gen_wrap(ng: Nginx, origin: Origin) -> None:
     for i in range(1, 257):
         s, b, _ = fetch_raw(ng.port, "/cor5l1/gen?v=al", method="PURGE")
         assert s == 200, f"PURGE #{i} status {s}"
-        assert json.loads(b)["purged"] >= 0, f"PURGE #{i} malformed body: {b}"
+        # Only #1 has a live variant to drop; #2.. bump the marker generation
+        # with nothing resident, so they legitimately report 0. Assert the
+        # count is present and well-formed rather than `>= 0`, which no
+        # response can fail.
+        purged = json.loads(b)["purged"]
+        if i == 1:
+            assert purged >= 1, f"PURGE #1 should drop the primed variant: {b}"
     # post-wrap: the variant must be a genuine MISS (fresh origin body), never
     # a HIT on the pre-purge #1 body that AUD-GEN1's wrap would resurrect.
     _, en2, he2 = fetch(ng.port, "/cor5l1/gen?v=al", headers=en)
