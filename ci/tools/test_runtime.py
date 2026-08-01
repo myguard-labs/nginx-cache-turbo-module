@@ -9917,9 +9917,17 @@ def test_rfc6_stale_conditional_full(ng: Nginx, origin: Origin) -> None:
     before the "fresh" leg is evaluated. That is an expired test precondition,
     not a product defect - retry with a fresh cache key (so a stale prior
     attempt's entry is never misread as this attempt's result), bounded.
+
+    KNOWN SENSITIVITY COST: a real "entries go stale too early" regression (a
+    TTL-computation bug shortening the effective window) produces the SAME
+    200 + x-cache: STALE signature as a lost race, so it now has to reproduce on
+    all 3 attempts to fail the build instead of failing on the first. Each
+    swallowed attempt therefore prints a note rather than retrying silently -
+    a run that logs these repeatedly across an UNLOADED runner is a product
+    signal, not flake, and must be investigated rather than shrugged off.
     """
     last_fresh_state = None
-    for attempt in range(4):
+    for attempt in range(3):
         key = f"/condst/cond-x-{attempt}"
         s0, _, h0 = fetch_raw(ng.port, key)                         # prime, fresh 1s
         assert s0 == 200 and h0.get("etag") == '"v11etag"', f"prime: {s0} {h0}"
@@ -9929,6 +9937,10 @@ def test_rfc6_stale_conditional_full(ng: Nginx, origin: Origin) -> None:
         if sf == 200 and hf.get("x-cache") == "STALE":
             # setup raced its own 1s TTL before the fresh leg could be read;
             # not a product failure - re-prime under a new key and retry.
+            # Printed, never silent: see KNOWN SENSITIVITY COST above.
+            print(f"    note: {key} went stale before the fresh conditional leg "
+                  f"(attempt {attempt + 1}, age={hf.get('age')}); re-priming",
+                  flush=True)
             last_fresh_state = (sf, bf, hf)
             continue
         assert sf == 304 and bf == "" and hf.get("x-cache") == "HIT", \
