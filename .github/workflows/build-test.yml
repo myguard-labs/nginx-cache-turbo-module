@@ -307,18 +307,7 @@ jobs:
             | tee runtime-suite.log
 
       - name: Assert the requested fixture set actually came up (AUD-TESTFIX1)
-        run: |
-          # --redis-server/--memcached-server were passed above: this runner has
-          # a real redis-server + openssl, so the best-effort TLS sub-fixture
-          # (redis_tls, redis_tls_untrusted, redis_tls_expired) must not have
-          # silently skipped -- that would mean ~80 L2/TLS tests, including the
-          # AUD-TLS1 negative-verification tests, never ran while the suite
-          # still exited 0.
-          if grep -q '^FIXTURE SKIPPED:' runtime-suite.log; then
-            echo "::error::runtime suite skipped a requested fixture:"
-            grep '^FIXTURE SKIPPED:' runtime-suite.log
-            exit 1
-          fi
+        run: bash ci/tools/assert-fixtures.sh runtime-suite.log
 
 # Legacy nginx (pre-1.23) runtime and ASan+UBSan moved OUT of this workflow
 # 2026-07-21:
