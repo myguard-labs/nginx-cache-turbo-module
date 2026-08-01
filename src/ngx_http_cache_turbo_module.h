@@ -1580,6 +1580,13 @@ typedef struct {
      * exercised deterministically. Delegates the UNMODIFIED in-memory chain
      * downstream and abandons capture; it does NOT forge b->in_file. */
     ngx_flag_t               test_force_file_buf;
+    /* AUD-SCAN1: lower the SCAN-del page cap so the cap branch is reachable in
+     * a test without materialising a 268M-key keyspace. 0 / unset keeps the
+     * compile-time ceiling. Test-only for the same reason the cap itself is a
+     * constant rather than a directive: the ceiling is a safety net, not a
+     * tuning knob, and a public directive would invite operators to lower it
+     * into routinely-incomplete purges. */
+    ngx_int_t                test_scan_max_pages;
 #endif
 
 
@@ -2132,14 +2139,36 @@ void ngx_http_cache_turbo_redis_tag_add_many(
     ngx_http_cache_turbo_loc_conf_t *clcf, u_char *key_hash, ngx_str_t *names,
     ngx_uint_t nnames, time_t ttl);
 
+/* AUD-SCAN1: outcome of a SCAN-del keyspace walk, handed to the completion
+ * callback so it can tell a FINISHED walk from an ABANDONED one. Before this
+ * existed every terminal path — cursor 0, read timeout, malformed reply —
+ * called the callback identically, so a half-purged L2 was reported as a clean
+ * success. NULL for the SMEMBERS path (which walks nothing).
+ *
+ *   status  NGX_OK    - cursor returned to 0: the whole keyspace was walked
+ *           NGX_ABORT - the page cap was hit: purge is INCOMPLETE by policy
+ *           NGX_ERROR - timeout / malformed reply / alloc failure: INCOMPLETE
+ *   pages   SCAN pages consumed (>= 1 once any reply was parsed)
+ *   blocks  live pool blocks held by the walk at finish. Diagnostic only, and
+ *           only reported under TEST_FAULTS: it is the oracle proving per-page
+ *           allocations are released per page (constant in `pages`) rather than
+ *           accumulating in the op pool for the whole walk. Kept unconditional
+ *           in the struct so the plumbing has no #if seams. */
+typedef struct {
+    ngx_int_t   status;
+    ngx_uint_t  pages;
+    ngx_uint_t  blocks;
+} ngx_http_cache_turbo_redis_walk_t;
+
 /* Completion callback for a SMEMBERS fetch: invoked once with the set members
  * (pointing into transient buffers — copy what must outlive the call) BEFORE
  * the request is finalized. Must produce the HTTP response and return the rc to
  * finalize with. Called with nmembers==0 on an empty/missing set or any error,
- * so the response path is uniform. */
+ * so the response path is uniform. `walk` is non-NULL only on the SCAN-del
+ * path; a callback that ignores it treats an abandoned walk as a success. */
 typedef ngx_int_t (*ngx_http_cache_turbo_redis_members_pt)(
     ngx_http_request_t *r, void *data, ngx_str_t *members,
-    ngx_uint_t nmembers);
+    ngx_uint_t nmembers, const ngx_http_cache_turbo_redis_walk_t *walk);
 
 /* Sync-park SMEMBERS "<prefix>tag:<name>": parks the request (count++) and,
  * when the array reply lands, invokes cb(r, data, members, n) then finalizes

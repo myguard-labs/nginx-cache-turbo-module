@@ -112,16 +112,22 @@ ngx_fuzz_pool_reset(ngx_pool_t *pool)
 }
 
 /*
- * The op struct, reduced to exactly the three fields the parser bodies read:
- * the accumulated reply buffer (rbuf), how many bytes are in it (rlen), and
- * the pool the members/keys array is allocated from. The shipped struct has
- * many more fields (connection, events, callbacks); the parsers touch none of
- * them.
+ * The op struct, reduced to exactly the four fields the parser bodies read:
+ * the accumulated reply buffer (rbuf), how many bytes are in it (rlen), the
+ * pool the members array is allocated from, and `rpool` -- the per-page pool
+ * parse_scan allocates its keys array from, so a multi-page SCAN walk can drop
+ * the previous page's memory. The shipped struct has many more fields
+ * (connection, events, callbacks); the parsers touch none of them.
+ *
+ * This struct is a COPY of a shipped contract: extract_parser.sh slices the
+ * parser bodies verbatim, so a field added to the shipped struct and read by a
+ * parser must be added here too or the harness stops compiling.
  */
 typedef struct {
     u_char     *rbuf;
     size_t      rlen;
     ngx_pool_t *pool;
+    ngx_pool_t *rpool;
 } ngx_http_cache_turbo_redis_op_t;
 
 /* --- verbatim from nginx src/core/ngx_string.h --- */

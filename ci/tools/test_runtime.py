@@ -1450,6 +1450,33 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             deny all;
         }}
 
+        # AUD-SCAN1. Two admin endpoints on their OWN Redis prefix (ctscan:) so
+        # a multi-page SCAN walk can be driven without touching any other L2
+        # test's keyspace. They also sit in their OWN redis db (7): SCAN pages
+        # are buckets of the whole db's hash table, not matched keys, so a db
+        # shared with other tests makes "5 keys fit in one page" depend on how
+        # much everyone else left behind. db 7 is FLUSHDB'd by these tests,
+        # which also resets the table to its initial size.
+        # /_cache_scanwalk has the production page cap;
+        # /_cache_scancap lowers it to 2 pages (TEST_FAULTS-only directive) so
+        # the "abandon the walk, report INCOMPLETE" branch is reachable without
+        # materialising a 268M-key keyspace. Same `main` zone: these tests
+        # assert on the L2 walk, not on the L1 count.
+        location = /_cache_scanwalk {{
+            cache_turbo_admin    main;
+            cache_turbo_redis    127.0.0.1:{redis_port} db=7 prefix=ctscan: timeout=2s;
+            allow 127.0.0.1;
+            deny all;
+        }}
+
+        location = /_cache_scancap {{
+            cache_turbo_admin    main;
+            cache_turbo_redis    127.0.0.1:{redis_port} db=7 prefix=ctscan: timeout=2s;
+            cache_turbo_test_scan_max_pages 2;
+            allow 127.0.0.1;
+            deny all;
+        }}
+
         # O4.4-i L2 half. Mirrors /brkion/ and /brkioff/, but with a Redis L2
         # configured so the breaker fallback is served from the L2 blob path --
         # the arming call site the L1 pair above provably cannot reach. Their own
@@ -14433,6 +14460,142 @@ def test_purge_all_escapes_redis_prefix_glob(ng: Nginx,
     redis.cli("-n", "0", "DEL", foreign)
 
 
+def _scan_fill(redis: RedisServer, n: int, tag: str) -> None:
+    """Pipeline n `ctscan:` keys onto one socket. One redis-cli per key would
+    be ~n process spawns; the SCAN-walk tests need thousands of keys, so the
+    SETs go out as a single RESP pipeline and only the reply count is checked."""
+    with socket.create_connection(("127.0.0.1", redis.port), 5) as s:
+        s.settimeout(20)
+        # The scan endpoints are configured with db=7; this raw socket starts on
+        # db 0, so it must SELECT the same db or the walk sees nothing.
+        s.sendall(b"*2\r\n$6\r\nSELECT\r\n$1\r\n7\r\n")
+        if not s.recv(4096).startswith(b"+OK"):
+            raise RuntimeError("redis SELECT 7 failed")
+        # Chunked, and each chunk's replies are drained before the next is sent:
+        # one giant sendall() can deadlock against a peer that stops reading
+        # once ITS output buffer to us is full.
+        for base in range(0, n, 500):
+            batch = range(base, min(base + 500, n))
+            cmd = bytearray()
+            for i in batch:
+                args = (b"SET", f"ctscan:{tag}:{i}".encode(), b"v",
+                        b"EX", b"300")
+                cmd += b"*%d\r\n" % len(args)
+                for a in args:
+                    cmd += b"$%d\r\n%s\r\n" % (len(a), a)
+            s.sendall(cmd)
+            buf = b""
+            while buf.count(b"\r\n") < len(batch):
+                chunk = s.recv(65536)
+                if not chunk:
+                    raise RuntimeError("redis closed mid-pipeline")
+                buf += chunk
+
+
+def _scan_purge(ng: Nginx, loc: str) -> tuple[int, dict]:
+    """POST an ?all=1 all-purge at `loc` and return (status, parsed JSON)."""
+    s, b, _ = fetch(ng.port, f"{loc}?all=1", method="POST")
+    return s, json.loads(b)
+
+
+def test_scan_walk_pool_is_o1_in_pages(ng: Nginx, redis: RedisServer) -> None:
+    """AUD-SCAN1 (a): the SCAN-based L2 all-purge must hold a CONSTANT amount of
+    memory regardless of how many SCAN pages the walk takes.
+
+    read_scan drove the whole cursor loop off ONE op pool: every page allocated
+    a fresh keys array, a rebuilt SCAN command and (on a big reply) a doubled
+    receive buffer out of it, and `op->rlen = 0` reset only the LENGTH -- nothing
+    was released until the walk ended. A large keyspace therefore grew the worker
+    monotonically for the whole purge.
+
+    The oracle is `scan_pool_blocks` (TEST_FAULTS-only): the live pool blocks the
+    walk still holds when it finishes. Two purges of the SAME keyspace shape, one
+    short walk and one an order of magnitude longer, must report the same figure.
+    Asserting an absolute number would be brittle across pool tunings and
+    NGX_DEBUG_PALLOC builds; asserting that it does not TRACK page count is the
+    actual property, and it is the one that fails when the per-page pool is
+    removed (blocks then rise by at least one large block per page).
+
+    No test drove a multi-page SCAN walk at all before this one -- the archived
+    purge tests all fit inside a single COUNT 256 page."""
+    # FLUSHDB, not a KEYS/DEL sweep: deleting keys leaves the db's hash table
+    # sized for the biggest fill it ever held, and SCAN COUNT walks BUCKETS, so
+    # a stale oversized table makes a 5-key walk span many pages.
+    redis.cli("-n", "7", "FLUSHDB")
+
+    _scan_fill(redis, 300, "small")
+    s, small = _scan_purge(ng, "/_cache_scanwalk")
+    assert s == 200, f"short walk should complete: {s} {small}"
+    assert "l2" not in small, f"short walk reported incomplete: {small}"
+
+    _scan_fill(redis, 6000, "big")
+    s, big = _scan_purge(ng, "/_cache_scanwalk")
+    assert s == 200, f"long walk should complete: {s} {big}"
+    assert "l2" not in big, f"long walk reported incomplete: {big}"
+
+    # The comparison is only meaningful if the two walks really differ in
+    # length. Without this the blocks assertion is vacuous: two one-page walks
+    # hold the same memory whether or not the pool is rotated.
+    assert big["scan_pages"] >= small["scan_pages"] + 8, \
+        f"the two walks were not different lengths: {small} vs {big}"
+
+    # +2 of slack, not 0: the reply buffer is only re-grown on a page whose
+    # reply exceeds 4 pagesize, so the two walks can legitimately differ by a
+    # block or two. Pre-fix the gap is >= one block PER EXTRA PAGE.
+    assert big["scan_pool_blocks"] <= small["scan_pool_blocks"] + 2, \
+        ("AUD-SCAN1: walk memory tracks page count -- "
+         f"{small['scan_pages']} pages held {small['scan_pool_blocks']} blocks, "
+         f"{big['scan_pages']} pages held {big['scan_pool_blocks']}")
+
+
+def test_scan_walk_page_cap_reports_incomplete(ng: Nginx,
+                                               redis: RedisServer) -> None:
+    """AUD-SCAN1 (b): read_scan used to terminate ONLY on cursor "0". A backend
+    that never returns it (broken, hostile, or simply a keyspace larger than the
+    walk can finish) looped forever -- the per-page read timeout does not bound
+    the walk, because each page's write re-arms the timer.
+
+    The walk is now capped. Two claims, and the first is what keeps the second
+    from being vacuous:
+
+      1. NEGATIVE CONTROL -- a keyspace that fits inside the cap completes
+         normally at the SAME endpoint (200, no "l2" key). A cap that fired on
+         every purge would satisfy claim 2 while destroying the feature.
+      2. Past the cap the request FINALIZES (no hang) and reports the purge as
+         INCOMPLETE with a non-2xx status -- never as a success. Silently
+         truncating and answering 200 would trade the memory bug for a
+         correctness bug: the operator is told L2 is empty when it is not."""
+    # FLUSHDB, not a KEYS/DEL sweep: deleting keys leaves the db's hash table
+    # sized for the biggest fill it ever held, and SCAN COUNT walks BUCKETS, so
+    # a stale oversized table makes a 5-key walk span many pages.
+    redis.cli("-n", "7", "FLUSHDB")
+
+    # 1. under the cap -> ordinary completion
+    _scan_fill(redis, 5, "cap-ok")
+    s, ok = _scan_purge(ng, "/_cache_scancap")
+    assert s == 200, f"a walk inside the cap must complete: {s} {ok}"
+    assert "l2" not in ok, f"cap fired on a one-page walk: {ok}"
+
+    # 2. past the cap -> abandoned, reported INCOMPLETE
+    _scan_fill(redis, 6000, "cap-over")
+    s, over = _scan_purge(ng, "/_cache_scancap")
+    assert s == 500, f"an abandoned purge must not report success: {s} {over}"
+    assert over.get("l2") == "incomplete" and over.get("reason") == "page-cap", \
+        f"abandoned purge did not report the page cap: {over}"
+    assert over["scan_pages"] == 2, \
+        f"walk did not stop AT the cap (2 pages): {over}"
+
+    # The abandoned walk must have left L2 partially populated -- that is the
+    # state the INCOMPLETE report exists to disclose. If everything were gone,
+    # the report would be describing a purge that actually finished.
+    assert int(redis.cli("-n", "7", "EVAL",
+                         "return #redis.call('KEYS','ctscan:*')",
+                         "0") or 0) > 0, \
+        "cap-abandoned purge somehow emptied the keyspace"
+
+    redis.cli("-n", "7", "FLUSHDB")
+
+
 def test_normalize_arg_order(ng: Nginx, origin: Origin) -> None:
     """v3-1: ?b=2&a=1 and ?a=1&b=2 normalize to one cache slot — the reordered
     second request is a HIT serving the first body, origin hit exactly once."""
@@ -15865,6 +16028,11 @@ def run_all(ng: Nginx, origin: Origin,
         test_cold_single_flight_cross_node(ng, origin, redis)
         test_l2_miss_counted_once_on_cold_park(ng, origin)  # double-count guard
         test_l2_db_select(ng, origin, redis)         # SELECT-only preamble
+        # AUD-SCAN1: multi-page SCAN walks. Own ctscan: prefix, and they clean up
+        # after themselves, so they must stay AHEAD of the two all-purge tests
+        # below (the last of which deliberately empties L2).
+        test_scan_walk_pool_is_o1_in_pages(ng, redis)
+        test_scan_walk_page_cap_reports_incomplete(ng, redis)
         test_purge_all_escapes_redis_prefix_glob(ng, redis)
         test_purge_all_clears_l2(ng, origin, redis)  # last L2: empties L2
         test_lock_redis_outage_fallback(ng, origin, redis)  # NGX_ERROR lock fallback (stops/restarts redis)

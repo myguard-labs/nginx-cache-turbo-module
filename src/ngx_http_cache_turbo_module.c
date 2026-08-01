@@ -130,7 +130,8 @@ typedef struct {
     ngx_str_t                         tag;    /* copied into r->pool */
 } ngx_http_cache_turbo_tagpurge_t;
 static ngx_int_t ngx_http_cache_turbo_tag_purge_complete(ngx_http_request_t *r,
-    void *data, ngx_str_t *members, ngx_uint_t nmembers);
+    void *data, ngx_str_t *members, ngx_uint_t nmembers,
+    const ngx_http_cache_turbo_redis_walk_t *walk);
 static ngx_int_t ngx_http_cache_turbo_add_variables(ngx_conf_t *cf);
 static ngx_int_t ngx_http_cache_turbo_normalized_args_variable(
     ngx_http_request_t *r, ngx_http_variable_value_t *v, uintptr_t data);
@@ -520,6 +521,15 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       ngx_conf_set_flag_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_cache_turbo_loc_conf_t, test_force_file_buf),
+      NULL },
+
+    /* AUD-SCAN1: lower the SCAN-del page cap so the "abandon the walk and
+     * report INCOMPLETE" branch is reachable without a 268M-key keyspace. */
+    { ngx_string("cache_turbo_test_scan_max_pages"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_num_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_turbo_loc_conf_t, test_scan_max_pages),
       NULL },
 #endif
 
@@ -10131,13 +10141,16 @@ ngx_http_cache_turbo_hexdecode(u_char *src, size_t len, u_char *dst)
  * acted on synchronously here. */
 static ngx_int_t
 ngx_http_cache_turbo_tag_purge_complete(ngx_http_request_t *r, void *data,
-    ngx_str_t *members, ngx_uint_t nmembers)
+    ngx_str_t *members, ngx_uint_t nmembers,
+    const ngx_http_cache_turbo_redis_walk_t *walk)
 {
     ngx_http_cache_turbo_tagpurge_t  *tp = data;
     ngx_uint_t                        i, purged = 0, ndel = 0;
     size_t                            plen, n;
     u_char                           *tagkey, *p;
     ngx_str_t                        *delkeys, body;
+
+    (void) walk;                 /* SMEMBERS walks no keyspace: always NULL */
 
     plen = tp->clcf->redis_prefix.len;
 
@@ -10221,28 +10234,70 @@ typedef struct {
 } ngx_http_cache_turbo_allpurge_t;
 
 
-/* SCAN-del completion (?all=1): the L2 keyspace has been walked + DEL'd; emit
+/* SCAN-del completion (?all=1): the L2 keyspace walk has ended; emit
  * {"purged":N} where N is the L1 count (L2 deletions are fire-and-forget and not
- * separately counted). members/nmembers are unused (always 0 here). */
+ * separately counted). members/nmembers are unused (always 0 here).
+ *
+ * AUD-SCAN1: the walk does NOT always finish. It ends early on a read timeout,
+ * a malformed reply, an allocation failure, or the SCAN page cap — and in every
+ * one of those cases part of the L2 keyspace still holds entries the caller was
+ * told were gone. That is worse than an outright error: an operator who purged
+ * before a config rollout believes L2 is empty when it is not. So a walk that
+ * did not reach cursor 0 is reported as a FAILURE (500) carrying
+ * "l2":"incomplete" plus the reason, never as a 200. `walk == NULL` cannot
+ * happen on this path (the SCAN backend always supplies it); it is treated as
+ * complete only so the callback stays total. */
 static ngx_int_t
 ngx_http_cache_turbo_all_purge_complete(ngx_http_request_t *r, void *data,
-    ngx_str_t *members, ngx_uint_t nmembers)
+    ngx_str_t *members, ngx_uint_t nmembers,
+    const ngx_http_cache_turbo_redis_walk_t *walk)
 {
     ngx_http_cache_turbo_allpurge_t  *ap = data;
     u_char                           *p;
     ngx_str_t                         body;
+    ngx_uint_t                        status;
+    const char                       *reason;
 
     (void) members;
     (void) nmembers;
 
-    p = ngx_pnalloc(r->pool, sizeof("{\"purged\":4294967295}\n"));
+    if (walk == NULL || walk->status == NGX_OK) {
+        status = NGX_HTTP_OK;
+        reason = NULL;
+    } else {
+        status = NGX_HTTP_INTERNAL_SERVER_ERROR;
+        reason = (walk->status == NGX_ABORT) ? "page-cap" : "error";
+    }
+
+    p = ngx_pnalloc(r->pool,
+                    sizeof("{\"purged\":4294967295,"
+                           "\"l2\":\"incomplete\",\"reason\":\"page-cap\","
+                           "\"scan_pages\":4294967295,"
+                           "\"scan_pool_blocks\":4294967295}\n"));
     if (p == NULL) {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
     body.data = p;
-    body.len = ngx_sprintf(p, "{\"purged\":%ui}\n", ap->purged) - p;
+    p = ngx_sprintf(p, "{\"purged\":%ui", ap->purged);
+    if (reason != NULL) {
+        p = ngx_sprintf(p, ",\"l2\":\"incomplete\",\"reason\":\"%s\"", reason);
+    }
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+    /* Walk diagnostics, CI builds only: scan_pool_blocks is the oracle for the
+     * per-page-pool release (constant in scan_pages when the walk is O(1) in
+     * page count, linear in it when the whole walk shares one pool). Not a
+     * permanent operator-facing field — same convention as the TEST_FAULTS
+     * breaker counters. */
+    if (walk != NULL) {
+        p = ngx_sprintf(p, ",\"scan_pages\":%ui,\"scan_pool_blocks\":%ui",
+                        walk->pages, walk->blocks);
+    }
+#endif
+    p = ngx_sprintf(p, "}\n");
+    body.len = p - body.data;
 
-    return ngx_http_cache_turbo_send_json(r, NGX_HTTP_OK, &body);
+    return ngx_http_cache_turbo_send_json(r, status, &body);
 }
 
 
@@ -12179,6 +12234,7 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
     conf->test_restore_alloc_fail = NGX_CONF_UNSET;
     conf->test_force_file_buf = NGX_CONF_UNSET;
+    conf->test_scan_max_pages = NGX_CONF_UNSET;
 #endif
     /* shm_zone, key, redis_addr, redis_prefix default NULL via pcalloc */
 
@@ -12383,6 +12439,8 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
                          prev->test_restore_alloc_fail, 0);
     ngx_conf_merge_value(conf->test_force_file_buf,
                          prev->test_force_file_buf, 0);
+    ngx_conf_merge_value(conf->test_scan_max_pages,
+                         prev->test_scan_max_pages, 0);
 #endif
 
     /* PURGE method (v14): off by default. */
