@@ -98,6 +98,7 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         op.rbuf = buf;
         op.rlen = size;
         op.pool = &pool;
+        op.rpool = &pool;
 
         rc = ngx_http_cache_turbo_redis_parse(&op, &blob, &blob_len);
         /* L13-fix: this parser is TRI-state on failure. NGX_DECLINED is now
@@ -131,6 +132,7 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         op.rbuf = buf;
         op.rlen = size;
         op.pool = &pool;
+        op.rpool = &pool;
 
         rc = ngx_http_cache_turbo_redis_parse_array(&op, &members, &nmembers);
         if (rc != NGX_OK && rc != NGX_AGAIN && rc != NGX_DECLINED) {
@@ -155,6 +157,7 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         op.rbuf = buf;
         op.rlen = size;
         op.pool = &pool;
+        op.rpool = &pool;
 
         rc = ngx_http_cache_turbo_redis_parse_scan(&op, &cursor, &keys, &nkeys);
         if (rc != NGX_OK && rc != NGX_AGAIN && rc != NGX_DECLINED) {

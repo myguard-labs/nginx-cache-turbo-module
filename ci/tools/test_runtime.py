@@ -1452,21 +1452,26 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
 
         # AUD-SCAN1. Two admin endpoints on their OWN Redis prefix (ctscan:) so
         # a multi-page SCAN walk can be driven without touching any other L2
-        # test's keyspace. /_cache_scanwalk has the production page cap;
+        # test's keyspace. They also sit in their OWN redis db (7): SCAN pages
+        # are buckets of the whole db's hash table, not matched keys, so a db
+        # shared with other tests makes "5 keys fit in one page" depend on how
+        # much everyone else left behind. db 7 is FLUSHDB'd by these tests,
+        # which also resets the table to its initial size.
+        # /_cache_scanwalk has the production page cap;
         # /_cache_scancap lowers it to 2 pages (TEST_FAULTS-only directive) so
         # the "abandon the walk, report INCOMPLETE" branch is reachable without
         # materialising a 268M-key keyspace. Same `main` zone: these tests
         # assert on the L2 walk, not on the L1 count.
         location = /_cache_scanwalk {{
             cache_turbo_admin    main;
-            cache_turbo_redis    127.0.0.1:{redis_port} prefix=ctscan: timeout=2s;
+            cache_turbo_redis    127.0.0.1:{redis_port} db=7 prefix=ctscan: timeout=2s;
             allow 127.0.0.1;
             deny all;
         }}
 
         location = /_cache_scancap {{
             cache_turbo_admin    main;
-            cache_turbo_redis    127.0.0.1:{redis_port} prefix=ctscan: timeout=2s;
+            cache_turbo_redis    127.0.0.1:{redis_port} db=7 prefix=ctscan: timeout=2s;
             cache_turbo_test_scan_max_pages 2;
             allow 127.0.0.1;
             deny all;
@@ -14461,6 +14466,11 @@ def _scan_fill(redis: RedisServer, n: int, tag: str) -> None:
     SETs go out as a single RESP pipeline and only the reply count is checked."""
     with socket.create_connection(("127.0.0.1", redis.port), 5) as s:
         s.settimeout(20)
+        # The scan endpoints are configured with db=7; this raw socket starts on
+        # db 0, so it must SELECT the same db or the walk sees nothing.
+        s.sendall(b"*2\r\n$6\r\nSELECT\r\n$1\r\n7\r\n")
+        if not s.recv(4096).startswith(b"+OK"):
+            raise RuntimeError("redis SELECT 7 failed")
         # Chunked, and each chunk's replies are drained before the next is sent:
         # one giant sendall() can deadlock against a peer that stops reading
         # once ITS output buffer to us is full.
@@ -14508,8 +14518,10 @@ def test_scan_walk_pool_is_o1_in_pages(ng: Nginx, redis: RedisServer) -> None:
 
     No test drove a multi-page SCAN walk at all before this one -- the archived
     purge tests all fit inside a single COUNT 256 page."""
-    redis.cli("EVAL", "for _,k in ipairs(redis.call('KEYS','ctscan:*')) "
-                      "do redis.call('DEL',k) end return 1", "0")
+    # FLUSHDB, not a KEYS/DEL sweep: deleting keys leaves the db's hash table
+    # sized for the biggest fill it ever held, and SCAN COUNT walks BUCKETS, so
+    # a stale oversized table makes a 5-key walk span many pages.
+    redis.cli("-n", "7", "FLUSHDB")
 
     _scan_fill(redis, 300, "small")
     s, small = _scan_purge(ng, "/_cache_scanwalk")
@@ -14553,8 +14565,10 @@ def test_scan_walk_page_cap_reports_incomplete(ng: Nginx,
          INCOMPLETE with a non-2xx status -- never as a success. Silently
          truncating and answering 200 would trade the memory bug for a
          correctness bug: the operator is told L2 is empty when it is not."""
-    redis.cli("EVAL", "for _,k in ipairs(redis.call('KEYS','ctscan:*')) "
-                      "do redis.call('DEL',k) end return 1", "0")
+    # FLUSHDB, not a KEYS/DEL sweep: deleting keys leaves the db's hash table
+    # sized for the biggest fill it ever held, and SCAN COUNT walks BUCKETS, so
+    # a stale oversized table makes a 5-key walk span many pages.
+    redis.cli("-n", "7", "FLUSHDB")
 
     # 1. under the cap -> ordinary completion
     _scan_fill(redis, 5, "cap-ok")
@@ -14574,12 +14588,12 @@ def test_scan_walk_page_cap_reports_incomplete(ng: Nginx,
     # The abandoned walk must have left L2 partially populated -- that is the
     # state the INCOMPLETE report exists to disclose. If everything were gone,
     # the report would be describing a purge that actually finished.
-    assert int(redis.cli("EVAL", "return #redis.call('KEYS','ctscan:*')",
+    assert int(redis.cli("-n", "7", "EVAL",
+                         "return #redis.call('KEYS','ctscan:*')",
                          "0") or 0) > 0, \
         "cap-abandoned purge somehow emptied the keyspace"
 
-    redis.cli("EVAL", "for _,k in ipairs(redis.call('KEYS','ctscan:*')) "
-                      "do redis.call('DEL',k) end return 1", "0")
+    redis.cli("-n", "7", "FLUSHDB")
 
 
 def test_normalize_arg_order(ng: Nginx, origin: Origin) -> None:
