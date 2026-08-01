@@ -97,6 +97,7 @@ jobs:
           python3 -m py_compile ci/tools/test_runtime.py
           python3 ci/tools/lint-ci-runners.py
           bash ci/tools/lint-ci-ports.sh
+          python3 ci/tools/lint-orphan-tests.py
           python3 ci/tools/test-tls-fixture-cleanup.py
 
       - name: Reject corrupt downloaded inputs
