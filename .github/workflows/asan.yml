@@ -147,16 +147,34 @@ jobs:
         # backtrace + SIGQUIT debug dump into ci-hang-artifacts/ (uploaded below) so the
         # next occurrence yields evidence instead of a mute job timeout. 1200s soft <
         # the 30-min job timeout, well above the ~7-min healthy run.
+        #
+        # AUD-TESTFIX1 log capture: ci-hang-guard.sh does `"$@" &` and tracks nginx as
+        # a descendant of $! (see descendants()/nginx_pids_under() there). Piping
+        # test_runtime.py directly (`cmd | tee log -- ...`) would make tee, not
+        # python3, the backgrounded process, and nginx would come up as a SIBLING of
+        # tee rather than a descendant — the guard would report "no nginx under pid"
+        # and never capture a hang again. Wrapping the whole pipeline in one
+        # `bash -c '...'` keeps a single process ($!) that is the ancestor of both
+        # python3 and tee, so nginx (python3's descendant) stays inside the tracked
+        # tree. `set -o pipefail` inside that inner bash makes the wrapper's exit
+        # status the suite's, not tee's, so a failing suite still fails this step.
         run: |
           chmod +x nginx-bin/nginx
           bash ci/tools/ci-hang-guard.sh 1200 "$GITHUB_WORKSPACE/ci-hang-artifacts" -- \
-            python3 ci/tools/test_runtime.py \
-              --fault-injection \
-              --single-process \
-              --port "$TEST_BASE_PORT" \
-              --redis-server /usr/bin/redis-server \
-              --memcached-server /usr/bin/memcached \
-              --nginx-binary "$GITHUB_WORKSPACE/nginx-bin/nginx"
+            bash -c '
+              set -o pipefail
+              python3 ci/tools/test_runtime.py \
+                --fault-injection \
+                --single-process \
+                --port "$TEST_BASE_PORT" \
+                --redis-server /usr/bin/redis-server \
+                --memcached-server /usr/bin/memcached \
+                --nginx-binary "$GITHUB_WORKSPACE/nginx-bin/nginx" \
+                | tee runtime-suite-single.log
+            '
+
+      - name: Assert the requested fixture set actually came up (AUD-TESTFIX1)
+        run: bash ci/tools/assert-fixtures.sh runtime-suite-single.log
 
       - name: Upload hang-capture artifacts
         if: always()
@@ -233,9 +251,4 @@ jobs:
             | tee runtime-suite-multiworker.log
 
       - name: Assert the requested fixture set actually came up (AUD-TESTFIX1)
-        run: |
-          if grep -q '^FIXTURE SKIPPED:' runtime-suite-multiworker.log; then
-            echo "::error::runtime suite skipped a requested fixture:"
-            grep '^FIXTURE SKIPPED:' runtime-suite-multiworker.log
-            exit 1
-          fi
+        run: bash ci/tools/assert-fixtures.sh runtime-suite-multiworker.log
