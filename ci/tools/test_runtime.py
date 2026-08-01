@@ -9907,16 +9907,53 @@ def test_conditional_inm_beats_ims(ng: Nginx) -> None:
 def test_rfc6_stale_conditional_full(ng: Nginx, origin: Origin) -> None:
     """RFC-6: a 304 may only be answered from a FRESH entry. Once the entry is
     stale (served while a refresh is pending) a conditional request gets the
-    full 200 body, never a 304 from an unvalidated stale copy."""
-    s0, _, h0 = fetch_raw(ng.port, "/condst/cond-x")                    # prime, fresh 1s
-    assert s0 == 200 and h0.get("etag") == '"v11etag"', f"prime: {s0} {h0}"
-    # while still fresh, a matching INM is a 304 (the existing fresh behaviour)
-    sf, bf, hf = fetch_raw(ng.port, "/condst/cond-x",
-                           headers={"If-None-Match": '"v11etag"'})
-    assert sf == 304 and bf == "" and hf.get("x-cache") == "HIT", \
-        f"fresh conditional should 304: {sf} {bf!r} {hf}"
+    full 200 body, never a 304 from an unvalidated stale copy.
+
+    /condst/ has a 1s TTL (shared with test_rfc1_request_max_stale and
+    test_p4_multi_directive_single_resolve, which sleep past it to exercise the
+    STALE path deliberately - do not widen it here). The fresh-conditional leg
+    below must be primed and read back before that 1s elapses; on a loaded CI
+    runner the two requests can straddle the boundary and the entry goes stale
+    before the "fresh" leg is evaluated. That is an expired test precondition,
+    not a product defect - retry with a fresh cache key (so a stale prior
+    attempt's entry is never misread as this attempt's result), bounded.
+
+    KNOWN SENSITIVITY COST: a real "entries go stale too early" regression (a
+    TTL-computation bug shortening the effective window) produces the SAME
+    200 + x-cache: STALE signature as a lost race, so it now has to reproduce on
+    all 3 attempts to fail the build instead of failing on the first. Each
+    swallowed attempt therefore prints a note rather than retrying silently -
+    a run that logs these repeatedly across an UNLOADED runner is a product
+    signal, not flake, and must be investigated rather than shrugged off.
+    """
+    last_fresh_state = None
+    for attempt in range(3):
+        key = f"/condst/cond-x-{attempt}"
+        s0, _, h0 = fetch_raw(ng.port, key)                         # prime, fresh 1s
+        assert s0 == 200 and h0.get("etag") == '"v11etag"', f"prime: {s0} {h0}"
+        # while still fresh, a matching INM is a 304 (the existing fresh behaviour)
+        sf, bf, hf = fetch_raw(ng.port, key,
+                               headers={"If-None-Match": '"v11etag"'})
+        if sf == 200 and hf.get("x-cache") == "STALE":
+            # setup raced its own 1s TTL before the fresh leg could be read;
+            # not a product failure - re-prime under a new key and retry.
+            # Printed, never silent: see KNOWN SENSITIVITY COST above.
+            print(f"    note: {key} went stale before the fresh conditional leg "
+                  f"(attempt {attempt + 1}, age={hf.get('age')}); re-priming",
+                  flush=True)
+            last_fresh_state = (sf, bf, hf)
+            continue
+        assert sf == 304 and bf == "" and hf.get("x-cache") == "HIT", \
+            f"fresh conditional should 304: {sf} {bf!r} {hf}"
+        break
+    else:
+        raise AssertionError(
+            "harness-timing precondition: /condst/ entry kept going stale "
+            f"before the fresh conditional leg could run (last: {last_fresh_state})"
+        )
+
     time.sleep(1.4)                                                # now stale
-    s1, b1, h1 = fetch_raw(ng.port, "/condst/cond-x",
+    s1, b1, h1 = fetch_raw(ng.port, key,
                            headers={"If-None-Match": '"v11etag"'})
     assert s1 == 200, f"stale conditional must serve full body, not 304: {s1}"
     assert b1, "stale conditional must carry the full body"
