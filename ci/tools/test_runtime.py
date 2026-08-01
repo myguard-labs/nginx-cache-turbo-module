@@ -16397,6 +16397,7 @@ def run_all(ng: Nginx, origin: Origin,
         test_request_cc_serve_verdict_l2(ng, origin, redis)  # C-S5-a L2 verdict arm
         test_l2_preserves_original_freshness(ng, origin, redis)
         test_l2_malformed_blob_rejected(ng, origin, redis)  # STAB-4 validate
+        test_l2_forged_blob_cannot_inject_headers(ng, origin, redis)   # AUD-BLOBE2E1
         test_sie_forged_blob_cannot_inject_headers(ng, origin, redis)  # AUD-SIEBLOB1
         test_sie_ttl_stored_in_blob(ng, origin, redis)      # RFC-2 CTB4 sie_ttl
         test_l2_retain_ttl_covers_sie(ng, origin, redis)    # S1.2 retain_ttl
