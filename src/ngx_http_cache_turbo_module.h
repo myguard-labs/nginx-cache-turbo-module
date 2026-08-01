@@ -186,6 +186,18 @@
  * non-negative ngx_int_t) -- purely a fail-at-runtime config trap. */
 #define NGX_HTTP_CACHE_TURBO_REDIS_DB_MAX   15
 
+/* AUD-MC1: bounds on the L2 key prefix, enforced at config time in BOTH the
+ * cache_turbo_redis and cache_turbo_memcached parsers. memcached frames its
+ * commands by spaces and CRLF, so a prefix carrying either splits the command;
+ * its keys are also capped at 250 bytes. The module's own contract
+ * (ngx_http_cache_turbo_memcached.c header) already asserts the composed key is
+ * "printable, no spaces/control chars, <=250 bytes" -- the digest half honoured
+ * it, the operator-supplied half was checked for emptiness only. KEY_SUFFIX_MAX
+ * covers the longest thing the module appends after the prefix (hex digest plus
+ * the tag/variant decorations), so the composed key stays inside 250. */
+#define NGX_HTTP_CACHE_TURBO_L2_KEY_MAX        250
+#define NGX_HTTP_CACHE_TURBO_L2_KEY_SUFFIX_MAX  64
+
 /* PERF-2: bounds on the upstream-controlled cache_turbo_tag value, so one
  * response cannot fan out into an unbounded number of SADD connections. At most
  * MAX_TAGS distinct tags are indexed per store; a token longer than MAX_TAG_LEN
