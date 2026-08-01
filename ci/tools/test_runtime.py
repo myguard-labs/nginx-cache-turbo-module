@@ -13467,6 +13467,115 @@ def test_l2_preserves_original_freshness(ng: Nginx, origin: Origin,
     assert body2 != seeded.decode()
 
 
+def _wire_response(port: int, path: str) -> tuple[bytes, bytes]:
+    """Read one response off the socket with no parsing client in between.
+    Returns (raw_head, body).
+
+    Header injection is a WIRE defect and http.client is the wrong instrument
+    for it: it normalises the header block, and a value an attacker split into
+    two lines comes back through .getheaders() looking exactly like a header the
+    module chose to emit. The raw bytes are the only place the difference is
+    visible."""
+    _bump_conn()
+    s = socket.create_connection(("127.0.0.1", port), timeout=HTTP_TIMEOUT)
+    try:
+        s.sendall(f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                  f"Connection: close\r\n\r\n".encode())
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+        head, _, rest = buf.partition(b"\r\n\r\n")
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            rest += chunk
+        return head, rest
+    finally:
+        s.close()
+
+
+def test_l2_forged_blob_cannot_inject_headers(ng: Nginx, origin: Origin,
+                                              redis: RedisServer) -> None:
+    """AUD-BLOBE2E1: the AUD-HDR1 restore-side header gate is mutation-proven at
+    the UNIT layer (ci/fuzz/fuzz_blob.c -DCT_BLOB_FIXTURES drives
+    header_admissible()/blob_validate() directly). What that cannot show is the
+    WIRING -- that restore_response() consults the gate on the LIVE serve path.
+
+    Seed L2 with a blob carrying all four AUD-HDR1 primitives at once, then read
+    it twice: the first read is the L2-fill serve, the second is the L1 HIT
+    promoted from it. Both must be clean. Nothing here reimplements the gate;
+    the assertions are on the bytes the client actually receives."""
+    uri = "/l2e/forged-headers"
+    key = l2_key(uri)
+    redis.cli("DEL", key, lock_key(uri))
+
+    seeded = b"forged-l2-body\n"
+    blob = make_ctb4_blob(seeded, headers={
+        # benign, and the POSITIVE CONTROL: it must SURVIVE. Without it a gate
+        # that dropped every stored header -- or a serve that quietly fell
+        # through to the origin -- would satisfy every assertion below.
+        "Content-Type":       "text/plain",
+        # 1. CR/LF in a value -> response splitting.
+        "X-Split":            "ok\r\nInjected: yes",
+        # 2. a header NAME that is not a token and carries its own CRLF.
+        "X-Bad\r\nEvil:":     "1",
+        # 3. Transfer-Encoding -> smuggling against a downstream proxy/CDN.
+        "Transfer-Encoding":  "chunked",
+        # 4. Set-Cookie -> session fixation from a poisoned cache entry.
+        "Set-Cookie":         "sess=attacker",
+    })
+    redis.set_raw(key, blob, 60_000)
+    assert redis.cli("EXISTS", key) == "1", "failed to seed the forged blob"
+
+    origin_before = origin.hits
+
+    def assert_clean(stage: str) -> bytes:
+        head, body = _wire_response(ng.port, uri)
+        low = head.lower()
+        assert b"injected" not in low, \
+            f"{stage}: CRLF in a stored header value SPLIT into a new response " \
+            f"header -- restore_response() did not consult header_admissible()" \
+            f"\n{head!r}"
+        assert b"evil" not in low, \
+            f"{stage}: a non-token stored header name reached the wire\n{head!r}"
+        assert b"\nset-cookie:" not in low, \
+            f"{stage}: Set-Cookie survived restore (session fixation); it is on " \
+            f"the store-side skip list and restore must mirror it\n{head!r}"
+        assert b"\ntransfer-encoding:" not in low, \
+            f"{stage}: Transfer-Encoding survived restore (smuggling)\n{head!r}"
+        # positive control -- the response really is the restored blob
+        assert b"\ncontent-type: text/plain" in low, \
+            f"{stage}: benign stored header did NOT survive, so the clean " \
+            f"assertions above prove nothing\n{head!r}"
+        assert body == seeded, \
+            f"{stage}: served body {body!r} is not the seeded blob's body"
+        return low
+
+    # 1st read: no L1 entry exists, so this is the L2-fill serve.
+    first = assert_clean("L2-fill serve")
+    assert b"x-cache: hit" in first, \
+        "seeded L2 object was not served from L2 -- this test never reached " \
+        "the restore path at all"
+    assert origin.hits == origin_before, \
+        "origin was consulted, so the response is not the forged blob"
+
+    # 2nd read: served from the L1 copy the fill above promoted. Same
+    # restore_response() call site (module.c:6738) -- what this second stage
+    # actually pins is that L1 holds the RAW forged blob and is re-filtered on
+    # every serve, rather than caching a once-sanitised copy at fill time. A
+    # future "filter once on the way in" optimisation would leave the first
+    # stage green and break this one.
+    # NOT covered here: the SIE-snapshot restore at module.c:7093, which is a
+    # genuinely separate call site and still has no e2e forged-blob test.
+    second = assert_clean("L1 HIT serve")
+    assert b"x-cache: hit" in second, "second read should be an L1 HIT"
+    assert origin.hits == origin_before, "L1 HIT unexpectedly used the origin"
+
+
 def test_l2_malformed_blob_rejected(ng: Nginx, origin: Origin,
                                     redis: RedisServer) -> None:
     """STAB-4: a malformed L2 blob must be fully validated and REJECTED before it
