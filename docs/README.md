@@ -226,7 +226,12 @@ normalization for correctness; an advanced configuration can split the original
 path from `$request_uri` with a `map` and append
 `$cache_turbo_normalized_args`.
 
-The preset URI tier also evaluates the post-redirect `$uri`. Cookies, dynamic
+The preset URI tier also evaluates the post-redirect `$uri`, **and so does
+`cache_turbo_bypass_uri`** — it matches `r->uri` through the same matcher. That
+matters more than it looks: `cache_turbo_bypass_uri` is the storage guard, the
+one recommended below for a private route, and behind a front controller
+`cache_turbo_bypass_uri /members/;` matches nothing, so the private page is
+cached and served to strangers. Cookies, dynamic
 query arguments, `Set-Cookie`, and honoured origin cache-control still apply,
 but a clean-path rule such as `/checkout` cannot fire after the redirect. When
 that route rule is load-bearing, classify `$request_uri` with a `map` and feed
@@ -656,7 +661,8 @@ admin URL with no cookie yet, a search query, a cart page). It does not replace
 them — and it is **not a security boundary for your own private routes**. A custom
 `/members/` area still needs its own `cache_turbo_bypass` **plus**
 `cache_turbo_no_store` (or a `cache_turbo_bypass_uri`, which skips storing on its
-own).
+own — but only where `$uri` still holds the original path; behind a front
+controller use the `map $request_uri` pattern above instead).
 
 ## See also
 

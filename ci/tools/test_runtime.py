@@ -3574,6 +3574,23 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # AUD-DOC1. Third copy of the same front controller, guarded ONLY by
+        # cache_turbo_bypass_uri. The directive matches r->uri, which the
+        # internal redirect has already rewritten to the front controller, so
+        # the prefix never matches and the private route is cached like any
+        # other. Pinning it here keeps the documented blind spot honest.
+        location /ctir-bu/ {{
+            try_files $uri /ctir-bu/index.php;
+        }}
+        location = /ctir-bu/index.php {{
+            cache_turbo            main;
+            cache_turbo_key        $host$request_uri;
+            cache_turbo_bypass_uri /ctir-bu/api/;
+            cache_turbo_valid      30s;
+            add_header             X-CT-Status $cache_turbo_status always;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # Same front controller, keyed the way the fixed docs now prescribe:
         # $request_uri survives the internal redirect, so distinct clean URLs
         # stay distinct and the map-driven private-route veto still fires.
@@ -6693,6 +6710,48 @@ def test_internal_redirect_key_and_veto(ng: Nginx, origin: Origin) -> None:
     assert bp2 != bp1, \
         ("private route must come from origin each time -- an identical body "
          f"means it was stored and replayed, got {bp2!r}")
+
+
+def test_bypass_uri_inert_after_internal_redirect(ng: Nginx,
+                                                  origin: Origin) -> None:
+    """AUD-DOC1: cache_turbo_bypass_uri matches r->uri, so it stops guarding a
+    route the moment a front controller rewrites r->uri -- the same blind spot
+    DOC-A2 pins for the preset URI tier, on the tier operators are told to use
+    for private paths.
+
+    This asserts the CURRENT, intended behaviour rather than a defect: the
+    matcher deliberately reads r->uri, and rebasing it onto $request_uri would
+    change what every existing config matches. The value of the test is that
+    the behaviour is now written down in two places that must agree -- here and
+    in the directive's documentation -- so a later change to either is caught.
+
+    /ctir-bu/ is guarded ONLY by cache_turbo_bypass_uri /ctir-bu/api/. If the
+    directive fired, the route would BYPASS and every request would come from
+    origin. It does not fire, so the second request is a HIT replaying the
+    first response: a private page served from a shared cache, which is exactly
+    why the docs now say a route-only guard is not enough behind a front
+    controller."""
+    s1, b1, h1 = fetch(ng.port, "/ctir-bu/api/me")
+    assert s1 == 200, f"front-controller route did not answer 200: {s1}"
+    assert h1.get("x-ct-status") != "BYPASS", \
+        ("cache_turbo_bypass_uri matched a URI the internal redirect had "
+         "already rewritten -- if this now BYPASSes, the matcher was changed "
+         "to read the original path and docs/README.md plus the README "
+         f"synopsis row must be updated with it (got {h1.get('x-ct-status')})")
+
+    _, b2, h2 = fetch(ng.port, "/ctir-bu/api/me")
+    assert h2.get("x-ct-status") == "HIT" and b2 == b1, \
+        ("the unguarded private route must be cached and replayed -- that is "
+         f"the documented blind spot (got {h2.get('x-ct-status')}, "
+         f"{b2!r} vs {b1!r})")
+
+    # Control: the directive is wired up and does work on a URI the redirect
+    # leaves alone. Without this the assertions above pass just as well for a
+    # cache_turbo_bypass_uri that is broken outright or spelled wrong.
+    _, _, hc1 = fetch(ng.port, "/bu/panel")
+    assert hc1.get("x-ct-status") == "BYPASS", \
+        ("cache_turbo_bypass_uri does not match even without a redirect, so "
+         f"the test above proves nothing: got {hc1.get('x-ct-status')}")
 
 
 def test_mediawiki_preset(ng: Nginx, origin: Origin) -> None:
@@ -15970,6 +16029,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_cache_and_purge_respect_access_control(ng)
     test_bypass(ng)
     test_bypass_uri(ng)
+    test_bypass_uri_inert_after_internal_redirect(ng, origin)
     test_backend_prefix_subdir(ng)
     test_require_header(ng)
     test_key_cookie(ng)
