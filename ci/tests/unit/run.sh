@@ -43,10 +43,8 @@ echo "--- L2 blob deserializer fixtures (ASan/UBSan) ---"
 FUZZ_DIR="$DIR/../../fuzz"
 BLOB_CC="${BLOB_CC:-clang}"
 if command -v "$BLOB_CC" >/dev/null 2>&1; then
-    bash "$FUZZ_DIR/extract_blob.sh"
-    "$BLOB_CC" -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined \
-        -DCT_BLOB_FIXTURES -I"$FUZZ_DIR" "$FUZZ_DIR/fuzz_blob.c" \
-        -o "$DIR/blob_fixtures"
+    bash "$FUZZ_DIR/build_blob_fixtures.sh" "$BLOB_CC" "$DIR/blob_fixtures" \
+        -g -O1 -fsanitize=address,undefined
     "$DIR/blob_fixtures"
 else
     # Not a silent skip: these fixtures are the only guard on the restore-side
