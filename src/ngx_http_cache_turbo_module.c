@@ -9700,6 +9700,58 @@ ngx_http_cache_turbo_redis_build_ssl(ngx_conf_t *cf,
 #endif
 
 
+/* AUD-MC1: validate an operator-supplied L2 key prefix at config time, for both
+ * backends. The composed key is prefix + a hex digest, and the module documents
+ * it as printable, space-free and <=250 bytes -- an invariant only the digest
+ * half ever honoured. On memcached a space or CRLF in the prefix splits the
+ * delimiter-framed command outright; on Redis it merely makes keys that no
+ * operator can type back into redis-cli. There is no attacker path (every
+ * request-controlled byte terminates at the digest), so this is a config typo
+ * that used to fail silently, degrading the location to L1-only.
+ *
+ * `name` is the directive, so the error names the line the operator wrote. */
+static char *
+ngx_http_cache_turbo_check_l2_prefix(ngx_conf_t *cf, ngx_str_t *prefix,
+    const char *name)
+{
+    size_t  i;
+
+    if (prefix->len == 0) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "cache_turbo: empty prefix= is not allowed "
+            "(an all-purge would match the whole L2 keyspace)");
+        return NGX_CONF_ERROR;
+    }
+
+    for (i = 0; i < prefix->len; i++) {
+        if (prefix->data[i] <= 0x20 || prefix->data[i] >= 0x7f) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                "%s: prefix= contains byte 0x%02Xd at offset %uz; the L2 key "
+                "must be printable and free of spaces and control characters",
+                name, prefix->data[i], i);
+            return NGX_CONF_ERROR;
+        }
+    }
+
+    if (prefix->len + NGX_HTTP_CACHE_TURBO_L2_KEY_SUFFIX_MAX
+        > NGX_HTTP_CACHE_TURBO_L2_KEY_MAX)
+    {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "%s: prefix= is %uz bytes; at most %uz are usable, because the "
+            "module appends up to %d bytes of key and an L2 key may not "
+            "exceed %d bytes",
+            name, prefix->len,
+            (size_t) (NGX_HTTP_CACHE_TURBO_L2_KEY_MAX
+                      - NGX_HTTP_CACHE_TURBO_L2_KEY_SUFFIX_MAX),
+            NGX_HTTP_CACHE_TURBO_L2_KEY_SUFFIX_MAX,
+            NGX_HTTP_CACHE_TURBO_L2_KEY_MAX);
+        return NGX_CONF_ERROR;
+    }
+
+    return NGX_CONF_OK;
+}
+
+
 /*
  * "cache_turbo_redis <dsn|host:port> [prefix=] [timeout=] [password=] [user=]
  *  [db=] [tls=on|off] [tls_verify=on|off] [tls_ca=<file>] [tls_name=<host>];"
@@ -9821,10 +9873,10 @@ ngx_http_cache_turbo_redis_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         if (ngx_strncmp(value[i].data, "prefix=", 7) == 0) {
             clcf->redis_prefix.data = value[i].data + 7;
             clcf->redis_prefix.len = value[i].len - 7;
-            if (clcf->redis_prefix.len == 0) {
-                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                    "cache_turbo: empty prefix= is not allowed "
-                    "(an all-purge would match the whole L2 keyspace)");
+            if (ngx_http_cache_turbo_check_l2_prefix(cf, &clcf->redis_prefix,
+                                                     "cache_turbo_redis")
+                != NGX_CONF_OK)
+            {
                 return NGX_CONF_ERROR;
             }
 
@@ -10000,10 +10052,10 @@ ngx_http_cache_turbo_memcached_conf(ngx_conf_t *cf, ngx_command_t *cmd,
         if (ngx_strncmp(value[i].data, "prefix=", 7) == 0) {
             clcf->redis_prefix.data = value[i].data + 7;
             clcf->redis_prefix.len = value[i].len - 7;
-            if (clcf->redis_prefix.len == 0) {
-                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                    "cache_turbo: empty prefix= is not allowed "
-                    "(an all-purge would match the whole L2 keyspace)");
+            if (ngx_http_cache_turbo_check_l2_prefix(cf, &clcf->redis_prefix,
+                                                     "cache_turbo_memcached")
+                != NGX_CONF_OK)
+            {
                 return NGX_CONF_ERROR;
             }
 

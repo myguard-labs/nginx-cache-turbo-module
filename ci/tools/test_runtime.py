@@ -9132,6 +9132,70 @@ def test_redis_db_cap_rejected(ng: Nginx) -> None:
         f"db=15 (the highest legal index) was rejected:\n{r.stdout}"
 
 
+def test_l2_prefix_charset_rejected(ng: Nginx) -> None:
+    """AUD-MC1: an L2 key prefix carrying a control character, or long enough to
+    push the composed key past the 250-byte memcached limit, is refused at
+    config time -- on BOTH backends, which parse `prefix=` in separate
+    functions.
+
+    Only `prefix.len != 0` used to be checked. The module documents the composed
+    L2 key as "printable, no spaces/control chars, <=250 bytes"
+    (ngx_http_cache_turbo_memcached.c header), an invariant the digest half
+    honoured and the operator-supplied half did not. memcached frames its
+    commands by spaces and CRLF, so such a prefix corrupts the command and the
+    location silently degrades to L1-only -- a config typo with no diagnostic.
+
+    The last arm is what keeps the others from being vacuous: an ordinary
+    prefix must still be accepted, or a validator that refused everything would
+    satisfy every rejection assertion above while breaking the feature."""
+    if ng.redis_port is None or ng.memcached_port is None:
+        return
+
+    redis_anchor = f"127.0.0.1:{ng.redis_port} db=1"
+    mc_anchor = f"127.0.0.1:{ng.memcached_port} prefix=mc: timeout=250ms"
+    cfg = nginx_config(
+        ng.root, ng.port, ng.module, ng.origin_port, 1, ng.redis_port,
+        ng.redis_auth_port, ng.redis_password, ng.redis_tls_port,
+        ng.redis_tls_ca, ng.memcached_port)
+    assert redis_anchor in cfg and mc_anchor in cfg, \
+        "test fixture missing an anchor for one of the two L2 parsers"
+
+    # arm 1: control byte, redis parser
+    r = _config_test_result(
+        ng, lambda c: c.replace(redis_anchor,
+                                f"127.0.0.1:{ng.redis_port} prefix=ct\x01x:", 1))
+    assert r.returncode != 0, \
+        f"a control character in prefix= was accepted by nginx -t:\n{r.stdout}"
+    assert "must be printable" in r.stdout, \
+        f"missing/odd prefix-charset diagnostic:\n{r.stdout}"
+
+    # arm 2: same byte, memcached parser -- separate function, separate message
+    r = _config_test_result(
+        ng, lambda c: c.replace(mc_anchor,
+                                f"127.0.0.1:{ng.memcached_port} prefix=mc\x01:", 1))
+    assert r.returncode != 0, \
+        f"memcached accepted a control character in prefix=:\n{r.stdout}"
+    assert "cache_turbo_memcached" in r.stdout and "must be printable" in r.stdout, \
+        f"memcached prefix diagnostic did not name its own directive:\n{r.stdout}"
+
+    # arm 3: length. 187 bytes leaves less than the 64 the module may append.
+    long_prefix = "c" * 187
+    r = _config_test_result(
+        ng, lambda c: c.replace(mc_anchor,
+                                f"127.0.0.1:{ng.memcached_port} prefix={long_prefix}", 1))
+    assert r.returncode != 0, \
+        f"an over-long prefix= was accepted by nginx -t:\n{r.stdout}"
+    assert "at most" in r.stdout and "186" in r.stdout, \
+        f"missing/odd prefix-length diagnostic:\n{r.stdout}"
+
+    # arm 4: the boundary is usable, and an ordinary prefix still parses
+    r = _config_test_result(
+        ng, lambda c: c.replace(mc_anchor,
+                                f"127.0.0.1:{ng.memcached_port} prefix={'c' * 186}", 1))
+    assert r.returncode == 0, \
+        f"a 186-byte prefix (the longest legal one) was rejected:\n{r.stdout}"
+
+
 def test_max_size_not_cached(ng: Nginx) -> None:
     """Responses larger than cache_turbo_max_size are never cached (Q2: the
     body filter early-aborts capture the moment body_len crosses max_size, so
@@ -15851,6 +15915,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_require_header_duplicate_rejected(ng)
     test_redis_bad_db_rejected(ng)
     test_redis_db_cap_rejected(ng)
+    test_l2_prefix_charset_rejected(ng)
     test_no_cache_set_cookie(ng)
     test_no_cache_cc_private(ng)
     test_no_cache_cc_nostore(ng)
