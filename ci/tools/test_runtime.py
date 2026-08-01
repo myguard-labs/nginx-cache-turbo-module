@@ -89,6 +89,11 @@ PORT_OFFSETS: dict[str, int] = {
     "l2_memcached_cross_instance_fill_b": 6,  # test_l2_memcached_cross_instance_fill()
     "redis_tls_untrusted": 27,
     "redis_tls_expired": 28,
+    # AUD-PURGE-HONESTY1: deliberately NEVER bound. Reserved here so the
+    # registry check keeps any future fixture off it -- the "L2 is down" test
+    # needs a port that reliably REFUSES, and a port nobody reserved is a port
+    # somebody eventually binds.
+    "redis_dead": 29,
 }
 
 
@@ -1473,6 +1478,17 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             cache_turbo_admin    main;
             cache_turbo_redis    127.0.0.1:{redis_port} db=7 prefix=ctscan: timeout=2s;
             cache_turbo_test_scan_max_pages 2;
+            allow 127.0.0.1;
+            deny all;
+        }}
+
+        # AUD-PURGE-HONESTY1: admin endpoint whose L2 is DOWN -- the registry's
+        # redis_dead offset is reserved and never bound, so the connect is
+        # refused and scan_del returns NGX_ERROR without ever walking a page.
+        # Its own prefix so a stray success here cannot disturb another test.
+        location = /_cache_scandown {{
+            cache_turbo_admin    main;
+            cache_turbo_redis    127.0.0.1:{port + PORT_OFFSETS["redis_dead"]} prefix=ctdown: timeout=250ms;
             allow 127.0.0.1;
             deny all;
         }}
@@ -14780,6 +14796,55 @@ def test_scan_walk_pool_is_o1_in_pages(ng: Nginx, redis: RedisServer) -> None:
          f"{big['scan_pages']} pages held {big['scan_pool_blocks']}")
 
 
+def test_all_purge_reports_l2_unavailable_when_backend_is_down(
+        ng: Nginx, redis: RedisServer) -> None:
+    """AUD-PURGE-HONESTY1: an all-purge whose L2 walk never STARTS must not
+    answer a bare success.
+
+    scan_del returning NGX_ERROR (connect refused, L2 never reached) used to
+    fall through to the synchronous 200 {"purged":<L1 count>} -- on the wire
+    that is indistinguishable from a purge that emptied both tiers. An operator
+    purging before a config rollout reads 200 and believes L2 is empty; it is
+    entirely intact. Same dishonesty class as AUD-SCAN1, which #174 fixed for
+    the walk that STARTS and ends early. Contract chosen 2026-08-01: 500 plus an
+    explicit "l2":"unavailable" -- non-2xx like the incomplete walk, a distinct
+    value because nothing was walked at all.
+
+    Two claims, and the first keeps the second from being vacuous:
+
+      1. NEGATIVE CONTROL -- the SAME request shape against a LIVE L2
+         (/_cache_scanwalk) answers 200 with no "l2" key. An endpoint that
+         reported unavailable unconditionally would satisfy claim 2 while
+         breaking every healthy purge.
+      2. Against the dead backend the reply is 500 AND carries
+         "l2":"unavailable". Asserting only "not 200" would pass on any
+         unrelated error path (a 404 from a misspelled location, a 400 from a
+         rejected arg), so both status and field are pinned.
+
+    "purged" must still be present and numeric in the failure body: L1 really
+    was purged, and dropping the count would understate what happened."""
+    # 1. control: identical request shape, live backend
+    redis.cli("-n", "7", "FLUSHDB")
+    _scan_fill(redis, 5, "down-ctrl")
+    s_ok, ok = _scan_purge(ng, "/_cache_scanwalk")
+    assert s_ok == 200, f"control purge against a LIVE L2 failed: {s_ok} {ok}"
+    assert "l2" not in ok, f"control purge reported an L2 problem: {ok}"
+    redis.cli("-n", "7", "FLUSHDB")
+
+    # 2. the claim: L2 down, nothing walked
+    s, down = _scan_purge(ng, "/_cache_scandown")
+    assert s == 500, \
+        f"purge with L2 down must not report success: {s} {down}"
+    assert down.get("l2") == "unavailable", \
+        f"purge with L2 down did not disclose the L2 state: {down}"
+    # "unavailable" must mean literally nothing was walked -- if a page had been
+    # consumed, part of L2 WOULD be purged and "incomplete" is the honest word.
+    assert down.get("scan_pages") == 0, \
+        f"reported unavailable after walking pages: {down}"
+    assert isinstance(down.get("purged"), int), \
+        f"failure body dropped the L1 purge count: {down}"
+
+
 def test_scan_walk_page_cap_reports_incomplete(ng: Nginx,
                                                redis: RedisServer) -> None:
     """AUD-SCAN1 (b): read_scan used to terminate ONLY on cursor "0". A backend
@@ -16267,6 +16332,9 @@ def run_all(ng: Nginx, origin: Origin,
         # below (the last of which deliberately empties L2).
         test_scan_walk_pool_is_o1_in_pages(ng, redis)
         test_scan_walk_page_cap_reports_incomplete(ng, redis)
+        # AUD-PURGE-HONESTY1: shares the ctscan: prefix for its control leg, so
+        # it belongs in this group and ahead of the all-purge tests below.
+        test_all_purge_reports_l2_unavailable_when_backend_is_down(ng, redis)
         test_purge_all_escapes_redis_prefix_glob(ng, redis)
         test_purge_all_clears_l2(ng, origin, redis)  # last L2: empties L2
         test_lock_redis_outage_fallback(ng, origin, redis)  # NGX_ERROR lock fallback (stops/restarts redis)
