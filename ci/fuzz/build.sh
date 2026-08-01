@@ -59,8 +59,7 @@ else
     # Deterministic per-primitive fixture binary from the SAME source: no
     # libFuzzer engine, its own main(). This is what the unit gate runs, so the
     # AUD-HDR1 fixtures are checked on every PR, not only in the fuzz job.
+    # Shared with ci/tests/unit/run.sh so the pinned flags cannot drift apart.
     # shellcheck disable=SC2086
-    $CC $CFLAGS -DCT_BLOB_FIXTURES -I"$FUZZ_DIR" "$FUZZ_DIR/fuzz_blob.c" \
-        -o "$DIR/fuzz_blob_fixtures"
-    echo "✓ built fixture binary: $DIR/fuzz_blob_fixtures"
+    bash "$FUZZ_DIR/build_blob_fixtures.sh" "$CC" "$DIR/fuzz_blob_fixtures" $CFLAGS
 fi
