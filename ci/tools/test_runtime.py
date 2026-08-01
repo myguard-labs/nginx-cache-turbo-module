@@ -13592,6 +13592,93 @@ def test_l2_forged_blob_cannot_inject_headers(ng: Nginx, origin: Origin,
     assert origin.hits == origin_before, "L1 HIT unexpectedly used the origin"
 
 
+def test_sie_forged_blob_cannot_inject_headers(ng: Nginx, origin: Origin,
+                                               redis: RedisServer) -> None:
+    """AUD-SIEBLOB1: test_l2_forged_blob_cannot_inject_headers pins the L2-fill
+    and L1-HIT serve paths, both of which call
+    ngx_http_cache_turbo_restore_response() from module.c:6738. There is a
+    SECOND, genuinely separate call site at module.c:7093
+    (ngx_http_cache_turbo_sie_rewrite(), the stale-if-error snapshot replay
+    that fires when a fully-expired entry's origin revalidation returns a
+    5xx) that was never driven with a forged blob -- so the header-admissible
+    gate's wiring on THAT path was unproven at runtime.
+
+    Seed L2 directly with a blob that is already past its serveable window
+    (rem_stale <= 0) but still inside its stale-if-error window (RFC-2 CTB4
+    sie_ttl), carrying the same AUD-HDR1 forged-header primitives as the L2
+    test. With no L1 entry present, a read consults L2, finds the object
+    EXPIRED, arms ctx->sie_snap from the L2 blob (the L2-arm branch, not the
+    L1 one), and falls through to the origin -- which is forced to answer
+    5xx, driving ngx_http_cache_turbo_sie_rewrite() -> restore_response()
+    over the forged snapshot. Assertions are on the RAW WIRE BYTES, exactly
+    like the L2 test."""
+    uri = "/l2e/forged-sie-headers"
+    key = l2_key(uri)
+    redis.cli("DEL", key, lock_key(uri))
+
+    seeded = b"forged-sie-body\n"
+    now = int(time.time())
+    blob = make_ctb4_blob(
+        seeded,
+        headers={
+            # benign positive control -- must SURVIVE, see the L2 test for why.
+            "Content-Type":       "text/plain",
+            # 1. CR/LF in a value -> response splitting.
+            "X-Split":            "ok\r\nInjected: yes",
+            # 2. a header NAME that is not a token and carries its own CRLF.
+            "X-Bad\r\nEvil:":     "1",
+            # 3. Transfer-Encoding -> smuggling against a downstream proxy/CDN.
+            "Transfer-Encoding":  "chunked",
+            # 4. Set-Cookie -> session fixation from a poisoned cache entry.
+            "Set-Cookie":         "sess=attacker",
+        },
+        # created far enough in the past that the object is already outside
+        # its serveable window (rem_stale = stale_ttl - age <= 0)...
+        created=now - 100,
+        fresh_ttl=1,
+        stale_ttl=10,
+        # ...but sie_ttl still covers "now": now < created + sie_ttl.
+        sie_ttl=300,
+    )
+    redis.set_raw(key, blob, 60_000)
+    assert redis.cli("EXISTS", key) == "1", "failed to seed the forged SIE blob"
+
+    origin_before = origin.hits
+    origin.fail = True
+    try:
+        head, body = _wire_response(ng.port, uri)
+        low = head.lower()
+        assert b"injected" not in low, \
+            f"SIE replay: CRLF in a stored header value SPLIT into a new " \
+            f"response header -- ngx_http_cache_turbo_sie_rewrite() did not " \
+            f"consult header_admissible() on the SIE snapshot path\n{head!r}"
+        assert b"evil" not in low, \
+            f"SIE replay: a non-token stored header name reached the wire " \
+            f"on the SIE snapshot path\n{head!r}"
+        assert b"\nset-cookie:" not in low, \
+            f"SIE replay: Set-Cookie survived the SIE snapshot restore " \
+            f"(session fixation)\n{head!r}"
+        assert b"\ntransfer-encoding:" not in low, \
+            f"SIE replay: Transfer-Encoding survived the SIE snapshot " \
+            f"restore (smuggling)\n{head!r}"
+        # positive control -- a truncated/short read cannot vacuously satisfy
+        # the assertions above.
+        assert b"\ncontent-type: text/plain" in low, \
+            f"SIE replay: benign stored header did NOT survive, so the " \
+            f"clean assertions above prove nothing\n{head!r}"
+        assert b"x-cache: stale-if-error" in low, \
+            "seeded blob was not replayed via the SIE snapshot path -- this " \
+            f"test never reached ngx_http_cache_turbo_sie_rewrite() at all\n{head!r}"
+        assert body == seeded, \
+            f"SIE replay: served body {body!r} is not the seeded blob's body"
+        assert origin.hits == origin_before + 1, \
+            "the failing-origin revalidation was not actually consulted -- " \
+            "this test would pass even without a real SIE rewrite"
+    finally:
+        origin.fail = False
+        drain_origin(origin)
+
+
 def test_l2_malformed_blob_rejected(ng: Nginx, origin: Origin,
                                     redis: RedisServer) -> None:
     """STAB-4: a malformed L2 blob must be fully validated and REJECTED before it
@@ -16310,6 +16397,8 @@ def run_all(ng: Nginx, origin: Origin,
         test_request_cc_serve_verdict_l2(ng, origin, redis)  # C-S5-a L2 verdict arm
         test_l2_preserves_original_freshness(ng, origin, redis)
         test_l2_malformed_blob_rejected(ng, origin, redis)  # STAB-4 validate
+        test_l2_forged_blob_cannot_inject_headers(ng, origin, redis)   # AUD-BLOBE2E1
+        test_sie_forged_blob_cannot_inject_headers(ng, origin, redis)  # AUD-SIEBLOB1
         test_sie_ttl_stored_in_blob(ng, origin, redis)      # RFC-2 CTB4 sie_ttl
         test_l2_retain_ttl_covers_sie(ng, origin, redis)    # S1.2 retain_ttl
         test_l2_sie_serve_survives_l1_purge(ng, origin, redis)  # S1.2 e2e serve
