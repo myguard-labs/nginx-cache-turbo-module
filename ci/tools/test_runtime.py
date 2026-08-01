@@ -110,6 +110,36 @@ def _check_port_registry(offsets: dict[str, int]) -> None:
             + "; ".join(dupes))
 
 
+def _start_tls_fixtures(redis_tls, redis_tls_untrusted, redis_tls_expired,
+                         _skip) -> tuple:
+    """Start the three TLS redis fixtures, one at a time.
+
+    AUD-TLSLEAK1: the old code shared one try/except across all three
+    .start() calls and, on failure, unconditionally set all three names to
+    None -- including any that HAD already started. That dropped the only
+    reference the outer finally: needed to call .stop() on it, so an already
+    -up TLS redis kept squatting its port for the rest of the process (and,
+    on this box, into the NEXT run). Track only what actually started and
+    stop exactly that on the way out, before disabling the whole TLS group.
+    """
+    started: list = []
+    try:
+        redis_tls.start()
+        started.append(redis_tls)
+        if redis_tls_untrusted is not None:
+            redis_tls_untrusted.start()
+            started.append(redis_tls_untrusted)
+        if redis_tls_expired is not None:
+            redis_tls_expired.start()
+            started.append(redis_tls_expired)
+        return redis_tls, redis_tls_untrusted, redis_tls_expired
+    except Exception as e:
+        _skip("redis_tls", f"start() failed: {e}")
+        for srv in started:
+            srv.stop()
+        return None, None, None
+
+
 atexit.register(_reap_spawned)
 
 
@@ -15979,15 +16009,10 @@ def main() -> int:
             if redis_auth is not None:
                 redis_auth.start()
             if redis_tls is not None:
-                try:
-                    redis_tls.start()
-                    if redis_tls_untrusted is not None:
-                        redis_tls_untrusted.start()
-                    if redis_tls_expired is not None:
-                        redis_tls_expired.start()
-                except Exception as e:
-                    _skip("redis_tls", f"start() failed: {e}")
-                    redis_tls = redis_tls_untrusted = redis_tls_expired = None
+                redis_tls, redis_tls_untrusted, redis_tls_expired = (
+                    _start_tls_fixtures(
+                        redis_tls, redis_tls_untrusted, redis_tls_expired,
+                        _skip))
             if mc is not None:
                 mc.start()
             ng.write_config()
