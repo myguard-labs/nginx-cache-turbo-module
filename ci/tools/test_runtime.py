@@ -418,10 +418,9 @@ class Origin:
                                    # than the clean 503 `fail` mode — Goal-2
                                    # hard-dead-upstream coverage)
         self._n = 0
-        self._paths: list[tuple[float, str]] = []   # ring: diagnostics only,
-                                                      # trimmed to the last 64
-                                                      # entries -- NOT a source
-                                                      # of truth for hits_for()
+        # ring: diagnostics only, trimmed to the last 64 entries -- NOT a
+        # source of truth for hits_for(), which reads _path_hits below.
+        self._paths: list[tuple[float, str]] = []
         self._path_hits: collections.Counter[str] = collections.Counter()
         self._lock = threading.Lock()
         self._server: http.server.ThreadingHTTPServer | None = None
