@@ -42,6 +42,13 @@
 #
 # Install (once per clone):
 #   pipx install pre-commit && pre-commit install
+#
+# This repo has no tracked .githooks/pre-commit, so .git/hooks/ is what git
+# reads. If you later adopt the tracked-hook design, `git config core.hooksPath
+# .githooks` makes this config unreachable unless that hook calls
+# `pre-commit run --hook-stage pre-commit` itself -- core.hooksPath REPLACES
+# .git/hooks/, it does not add to it.
+#
 # Run against everything without committing:
 #   pre-commit run --all-files
 #
@@ -91,6 +98,34 @@ repos:
 
   - repo: local
     hooks:
+      # Mirrors the CI "gitleaks" step. Different scope on purpose: a commit
+      # hook can only see what is being committed, so it scans the staged
+      # patch, while CI scans the whole history -- a secret that was committed
+      # and later removed is still published, and only the history scan finds
+      # it. Measured at zero findings before the gate went in.
+      #
+      # detect-private-key above is not a substitute: it matches PEM key
+      # headers only, and misses every token-shaped secret (PATs, bot tokens,
+      # cloud keys), which is what actually leaks out of these repos.
+      #
+      # VERIFY WITH A NON-EXAMPLE SECRET. The obvious probe -- AWS's own
+      # AKIAIOSFODNN7EXAMPLE / wJalrXUtnFEMI... pair -- is allowlisted by the
+      # default ruleset and reports "no leaks found", which reads exactly like
+      # a broken gate. Probe with a plausible token instead:
+      # Build the probe token from parts -- a literal one written out here is
+      # itself a leak by this hook's own rules, and would land the gate red on
+      # its own config file:
+      #   T=xoxb-2024827913265; T="$T-2024891053289-fJk2mQ8vNwLpXcRt7HzYbA31"
+      #   printf 'k = "%s"\n' "$T" > p.txt
+      #   git add p.txt && gitleaks git --staged --no-banner --redact -v
+      #   git reset -q p.txt && rm p.txt        # expect: leaks found: 1
+      - id: gitleaks
+        name: gitleaks (staged patch)
+        entry: gitleaks git --staged --no-banner --redact
+        language: system
+        pass_filenames: false
+        always_run: true
+
       # Mirrors the CI "flawfinder (gate on >=4)" step: fires on exactly what
       # CI blocks on. Noise below level 4 would train everyone to --no-verify.
       - id: flawfinder
@@ -158,13 +193,21 @@ repos:
       # CodeRabbit caught that by hand; a linter catches it for free.
       #
       # F,B are the correctness tiers (undefined names, unused imports, real
-      # bug patterns). Style tiers are deliberately NOT selected: PT018 (191
-      # findings) and E501 (66) would land this red on arrival and train
-      # everyone to --no-verify -- the same failure the shellcheck note below
-      # describes. Widen only with a commit that also fixes the backlog.
+      # bug patterns). PLE and RET joined them once measured at zero backlog --
+      # PLE is pylint's error tier, so a finding there is a bug rather than a
+      # preference. Style tiers are still deliberately NOT selected: PT018 and
+      # E501 carry three-figure backlogs and would land this red on arrival,
+      # training everyone to --no-verify -- the same failure the shellcheck
+      # note below describes. Widen only with a commit that also fixes the
+      # backlog AND moves the matching CI step.
+      #
+      # Count a tier with `ruff check --select <tier> --statistics`, never a
+      # grep: ruff 0.16 moved the path onto a `--> path:line:col` line, so a
+      # grep anchored on the old `path:line:col:` format reports 0 for every
+      # tier and makes a widening look free.
       - id: ruff
-        name: ruff (correctness tiers F,B,RUF059)
-        entry: ruff check --force-exclude --select F,B,RUF059
+        name: ruff (correctness tiers F,B,PLE,RET,RUF059)
+        entry: ruff check --force-exclude --select F,B,PLE,RET,RUF059
         language: system
         files: '^ci/.*\.py$'
         pass_filenames: true
@@ -172,8 +215,17 @@ repos:
       # CI workflows are code that breaks silently; actionlint catches bad if:
       # expressions, unknown contexts and shell errors inside run: blocks.
       #
+      # -config-file: declares this repo's self-hosted runner labels explicitly
+      # rather than relying on actionlint finding .github/actionlint.yaml by
+      # cwd-guessing -- pre-commit hooks do not guarantee cwd the way a bare
+      # `actionlint` invocation from a shell does.
+      #
       # -ignore runner-label: actionlint 1.7.7 ships a FIXED list of GitHub
-      # runner images and flags anything newer as "unknown label". Several
+      # *hosted* runner images and flags anything newer as "unknown label".
+      # A config file cannot fix this one: its label list declares SELF-hosted
+      # labels, and there is no section for "GitHub-hosted images this
+      # actionlint release does not know yet". So this ignore is needed either
+      # way. Several
       # repos legitimately target ubuntu-26.04 / ubuntu-26.04-arm, which that
       # version has never heard of. Every such report is a false positive about
       # the linter's age, not the workflow, and leaving it on lands this hook
@@ -186,7 +238,7 @@ repos:
       # in both places.
       - id: actionlint
         name: actionlint (workflow syntax)
-        entry: env SHELLCHECK_OPTS=-Swarning actionlint -ignore 'label ".+" is unknown'
+        entry: env SHELLCHECK_OPTS=-Swarning actionlint -config-file .github/actionlint.yaml -ignore 'label ".+" is unknown'
         language: system
         files: ^\.github/workflows/.*\.ya?ml$
         pass_filenames: true
@@ -196,8 +248,8 @@ repos:
       # which just teaches everyone to --no-verify.
       #
       # NOTE some repos have pre-existing warning-level findings in build/test
-      # scripts (cache-turbo ci/tests/unit/extract_shm.sh SC2043,
-      # http-sentinel fuzz/build.sh SC2010, coraza-nginx build.sh SC2089/2090).
+      # scripts (SC2043 in a unit-test helper, SC2010 in a fuzz build script,
+      # SC2089/2090 in a package build script, all seen in derived modules).
       # They do NOT block normal work, because a commit hook only ever sees the
       # files being committed -- they surface on `pre-commit run --all-files`.
       # They are real and worth fixing; they are deliberately NOT suppressed
