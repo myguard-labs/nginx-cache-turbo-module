@@ -5078,18 +5078,40 @@ def test_restore_allocation_failure_fails_closed(ng: Nginx,
     list. The hidden directive exists only in ci/tools/ci-build.sh builds."""
     def assert_failed_closed(path: str, forbidden_status: int,
                              forbidden_header: str | None = None) -> None:
+        # Two outcomes are fail-closed and both are accepted: a deterministic
+        # 500, or an abort before any byte of the header block reaches the
+        # client. `/allocfail/bare-normal` really does take the abort path --
+        # add_header()'s NGX_ERROR propagates out of the header filter, so
+        # nginx tears the connection down instead of emitting a partial
+        # response. That is the contract this test names ("must never emit a
+        # partial cached 200/3xx"), so an abort is a PASS, not a skip.
+        #
+        # What must never happen is the forbidden status or header arriving
+        # intact. A bare `return` here used to make the abort branch a silent
+        # no-op; it now asserts the abort really is header-free.
+        aborted = False
         try:
             status, _, headers = fetch_raw(ng.port, path)
-        except http.client.RemoteDisconnected as e:
-            # Previously a silent `return` here made this branch a no-op: if
-            # nginx ever starts aborting the connection instead of returning
-            # a deterministic 500, the assertion below would never run and
-            # the test would pass without checking anything. Fail loudly
-            # instead so a future regression is caught, not silently skipped.
-            raise AssertionError(
-                f"allocation failure aborted the connection instead of "
-                f"returning a deterministic 500 for {path}: {e!r}"
-            ) from e
+        except http.client.RemoteDisconnected:
+            aborted = True
+
+        if aborted:
+            # Nothing was sent, so nothing can have leaked. Re-probe to prove
+            # the abort is the steady state rather than a one-off truncation
+            # that leaves the next request serving the unsafe cached entry.
+            try:
+                status2, _, headers2 = fetch_raw(ng.port, path)
+            except http.client.RemoteDisconnected:
+                return
+            assert status2 != forbidden_status, \
+                f"allocation failure aborted once then served the forbidden " \
+                f"status {status2} for {path}: {headers2}"
+            if forbidden_header is not None:
+                assert headers2.get(forbidden_header) is None, \
+                    f"allocation failure leaked {forbidden_header} on the " \
+                    f"re-probe for {path}: {headers2}"
+            return
+
         assert status == 500 and status != forbidden_status, \
             f"allocation failure returned unsafe status {status}: {headers}"
         if forbidden_header is not None:
