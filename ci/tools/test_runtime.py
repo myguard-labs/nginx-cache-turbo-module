@@ -4821,6 +4821,51 @@ def wait_for(predicate, timeout: float = 3.0, interval: float = 0.05) -> bool:
     return False
 
 
+def wait_for_l2(redis, key: str, expected: bytes, what: str = "",
+                timeout: float = 2.0, interval: float = 0.02) -> None:
+    """Assert that `key` holds exactly `expected` in L2, allowing a bounded
+    wait for the value to land.
+
+    This is an INSTRUMENT, not a fix. Three tests write an aged blob with
+    set_raw() and immediately assert get_raw() agrees; on a shared CI Redis
+    under load that read has intermittently disagreed. A bare `assert
+    get_raw(key) == expected` cannot tell "never written" from "written late",
+    so a red said nothing about which. This waits up to `timeout` and, on
+    give-up, raises with the RAW observed value and the elapsed time -- which
+    is what separates the two.
+
+    Deliberately NOT a swallow: a wrong or absent value at the deadline still
+    raises. Widening a wait until it always passes would disable the oracle
+    ([[feedback-widening-shared-timeout-disables-oracle]]); the point here is
+    to make the eventual red diagnosable, not to make it go away."""
+    # monotonic, not time.time(): an NTP step on a CI box must not cut the wait
+    # short or stretch it. The sleep is clamped to what is left of the deadline
+    # so the wait cannot overrun `timeout` by up to a full interval.
+    start = time.monotonic()
+    got = None
+    while True:
+        got = redis.get_raw(key)
+        if got == expected:
+            return
+        remaining = timeout - (time.monotonic() - start)
+        if remaining <= 0:
+            break
+        time.sleep(min(interval, remaining))
+
+    elapsed = time.monotonic() - start
+    label = f" for {what}" if what else ""
+    seen = "absent" if got is None else f"{len(got)} bytes"
+    raise AssertionError(
+        f"L2 value{label} did not match after {elapsed:.2f}s "
+        f"(timeout {timeout:.2f}s): key={key!r}\n"
+        f"  expected ({len(expected)} bytes): {expected!r}\n"
+        f"  observed ({seen}): {got!r}\n"
+        f"  This is the state at the LAST read, not a cause: absent means the "
+        f"value was not there yet (never written, written later, or evicted), "
+        f"and a differing value means the key held something else at that "
+        f"instant. Compare the two blobs before picking a theory.")
+
+
 def drain_origin(origin: Origin, settle: float = 0.6,
                  timeout: float = 10.0) -> None:
     """Wait until the origin stops receiving hits for `settle` seconds. v8's
@@ -8257,8 +8302,7 @@ def test_breaker_l2_arming_site_gated_white_box(ng: Nginx, origin: Origin,
         redis.set_raw(key, aged, 3_600_000)
         # PROVE the L2 blob survived the L1 drop. If it did not, both claims
         # would read l2 == 0 and claim 2 would be vacuous again.
-        assert redis.get_raw(key) == aged, \
-            f"aged L2 blob for {path} did not land in Redis"
+        wait_for_l2(redis, key, aged, what=f"aged L2 blob for {path}")
 
     origin.fail = True
     try:
@@ -8307,8 +8351,8 @@ def test_breaker_l2_arming_site_gated_white_box(ng: Nginx, origin: Origin,
                  + struct.pack("<q", int(time.time()) - (int(ostale) + 60))
                  + oblob[32:])
         redis.set_raw(okey, oaged, 3_600_000)
-        assert redis.get_raw(okey) == oaged, \
-            "aged L2 blob for /brkil2off/dead did not survive the re-drop"
+        wait_for_l2(redis, okey, oaged,
+                    what="aged L2 blob for /brkil2off/dead after the re-drop")
         _, _, h_off = fetch(ng.port, "/brkil2off/dead")
         armed_off = _armings(h_off, "breaker OFF L2 error",
                              site="l2") - before_off
@@ -14117,7 +14161,7 @@ def test_l2_unserveable_giveup_still_single_flights(
     assert s_p == 200, f"PURGE status {s_p}: {b_p}"
     aged = blob[:24] + struct.pack("<q", int(time.time()) - 60) + blob[32:]
     redis.set_raw(key, aged, 3_600_000)
-    assert redis.get_raw(key) == aged, "aged blob did not land in L2"
+    wait_for_l2(redis, key, aged, what="aged blob for /sfgu/ give-up")
 
     base = origin.hits
     waits0 = _admin_lock_waits(ng)
@@ -14230,7 +14274,8 @@ def test_request_cc_serve_verdict_l2(ng: Nginx, origin: Origin,
         s_p, b_p, _ = fetch_raw(ng.port, uri, method="PURGE")
         assert s_p == 200, f"PURGE status {s_p}: {b_p}"
         redis.set_raw(key, blob, 3_600_000)
-        assert redis.get_raw(key) == blob, "L2 restore after PURGE did not land"
+        wait_for_l2(redis, key, blob,
+                    what="L2 restore after PURGE on /reqccl2/")
 
     _drop_l1_keep_l2()
 

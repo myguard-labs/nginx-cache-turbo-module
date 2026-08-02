@@ -6105,6 +6105,17 @@ ngx_http_cache_turbo_add_header(ngx_http_request_t *r,
  * that helper is deliberately suppressed by cache_turbo_test_restore_alloc_fail.
  * An oracle that vanishes under an unrelated fault flag would read as "armed 0"
  * -- the exact vacuous pass this control exists to prevent.
+ *
+ * ⚠ ADDING ANOTHER TEST/DIAGNOSTIC HEADER? It must be re-stamped on the
+ * STALE-IF-ERROR path too (OBS-1). sie_rewrite() calls ngx_list_init() on
+ * headers_out.headers (see :7079) to make the stored snapshot authoritative,
+ * which wipes everything the header filter has already stamped. A header added
+ * only in the filter therefore reports the SNAPSHOT's stored value -- normally
+ * 0 -- on every serve-on-error response, while the live counter has moved. It
+ * does not error; it silently reports a stale number, which is strictly worse
+ * for an oracle. This is a known constraint of the SIE path, not a bug to
+ * rediscover: re-stamp after restore_response() the way :7117 does, or teach
+ * the wipe to preserve module-added headers.
  */
 static ngx_int_t
 ngx_http_cache_turbo_test_armings_header(ngx_http_request_t *r)
