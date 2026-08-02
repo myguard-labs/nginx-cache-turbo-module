@@ -35,6 +35,7 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
+          fetch-depth: 0  # gitleaks scans git history
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -50,6 +51,16 @@ jobs:
             pip3 install --quiet --user --break-system-packages semgrep
             echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           fi
+      - name: gitleaks (full history scan)
+        run: |
+          set -euo pipefail
+          version=8.30.1
+          archive="/tmp/gitleaks_${version}_linux_x64.tar.gz"
+          curl -fsSL -o "$archive" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${version}/gitleaks_${version}_linux_x64.tar.gz"
+          bash ci/tools/verify-download.sh "$archive"
+          tar -xzf "$archive" -C /tmp gitleaks
+          /tmp/gitleaks git --no-banner .
       - name: Restore build caches
         uses: ./.github/actions/build-cache
         with:
