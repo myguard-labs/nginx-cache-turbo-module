@@ -9891,13 +9891,13 @@ def test_conditional_inm_304(ng: Nginx, origin: Origin) -> None:
     s0, _, h0 = fetch_raw(ng.port, "/cond/cond-inm")
     assert s0 == 200 and "x-cache" not in h0, f"prime should miss: {s0} {h0}"
     assert h0.get("etag") == '"v11etag"', f"etag not surfaced: {h0.get('etag')}"
-    before = origin.hits
+    before = origin.hits_for("cond-inm")
     s1, b1, h1 = fetch_raw(ng.port, "/cond/cond-inm",
                            headers={"If-None-Match": '"v11etag"'})
     assert s1 == 304, f"matching If-None-Match should be 304, got {s1}"
     assert b1 == "", f"304 must have no body, got {b1!r}"
     assert h1.get("x-cache") == "HIT", f"304 should be a cache HIT: {h1}"
-    assert origin.hits == before, "304 must be served from cache, not origin"
+    assert origin.hits_for("cond-inm") == before, "304 must be served from cache, not origin"
 
 
 def test_conditional_inm_list_short_first(ng: Nginx, origin: Origin) -> None:
@@ -9906,12 +9906,12 @@ def test_conditional_inm_list_short_first(ng: Nginx, origin: Origin) -> None:
     instead of bailing on the whole header."""
     s0, _, h0 = fetch_raw(ng.port, "/cond/cond-list")
     assert s0 == 200 and h0.get("etag") == '"v11etag"', f"prime: {s0} {h0}"
-    before = origin.hits
+    before = origin.hits_for("cond-list")
     s1, b1, h1 = fetch_raw(ng.port, "/cond/cond-list",
                            headers={"If-None-Match": '"x", "v11etag"'})
     assert s1 == 304, f"a later matching tag must 304, got {s1}"
     assert b1 == "", f"304 must have no body, got {b1!r}"
-    assert h1.get("x-cache") == "HIT" and origin.hits == before, \
+    assert h1.get("x-cache") == "HIT" and origin.hits_for("cond-list") == before, \
         "304 from the list must be served from cache"
 
 
@@ -13745,7 +13745,7 @@ def test_sie_forged_blob_cannot_inject_headers(ng: Nginx, origin: Origin,
     redis.set_raw(key, blob, 60_000)
     assert redis.cli("EXISTS", key) == "1", "failed to seed the forged SIE blob"
 
-    origin_before = origin.hits
+    origin_before = origin.hits_for("forged-sie-headers")
     origin.fail = True
     try:
         head, body = _wire_response(ng.port, uri)
@@ -13773,7 +13773,7 @@ def test_sie_forged_blob_cannot_inject_headers(ng: Nginx, origin: Origin,
             f"test never reached ngx_http_cache_turbo_sie_rewrite() at all\n{head!r}"
         assert body == seeded, \
             f"SIE replay: served body {body!r} is not the seeded blob's body"
-        assert origin.hits == origin_before + 1, \
+        assert origin.hits_for("forged-sie-headers") == origin_before + 1, \
             "the failing-origin revalidation was not actually consulted -- " \
             "this test would pass even without a real SIE rewrite"
     finally:
@@ -14345,6 +14345,7 @@ def test_l2_tag_purge(ng: Nginx, origin: Origin, redis: RedisServer) -> None:
     # both gone from L1: next reads miss to a fresh origin generation, and must
     # not stall — tag purge clears each member's single-flight lock too (V-HANG).
     origin_before = origin.hits
+    p1_before = origin.hits_for("p1")
     t0 = time.monotonic()
     _, nb1, h1 = fetch(ng.port, u1)
     _, nb2, h2 = fetch(ng.port, u2)
@@ -14353,7 +14354,8 @@ def test_l2_tag_purge(ng: Nginx, origin: Origin, redis: RedisServer) -> None:
         "tagged objects should be a MISS in L1 after purge"
     assert elapsed < 2.0, \
         f"post-tag-purge cold misses stalled {elapsed:.1f}s (stale lock?)"
-    assert origin.hits == origin_before + 2, "both reads should reach origin"
+    assert origin.hits_for("p1") == p1_before + 1 and origin.hits == origin_before + 2, \
+        "both reads should reach origin (/p2 collision check: global, /p1 scoped)"
     assert nb1 != body1["body"] and nb2 != body2["body"], \
         "post-purge bodies should be fresh generations"
 
@@ -14639,12 +14641,13 @@ def test_lock_self_heal(ng: Nginx, origin: Origin, redis: RedisServer) -> None:
     assert wait_for(lambda: redis.cli("EXISTS", lock_key(uri)) == "0",
                     timeout=4.0), "foreign lock never PX-expired"
     deadline = time.time() + 1.5
-    while time.time() < deadline and origin.hits == base:
+    heal_before = origin.hits_for("heal")
+    while time.time() < deadline and origin.hits_for("heal") == heal_before:
         fetch(ng.port, uri)
         time.sleep(0.05)
     time.sleep(0.4)
 
-    regens = origin.hits - base
+    regens = origin.hits_for("heal") - heal_before
     if regens != 1:
         recent = [(round(t, 2), p) for t, p in origin._paths[-15:]]
         raise AssertionError(
@@ -14846,11 +14849,11 @@ def test_purge_all_clears_l2(ng: Nginx, origin: Origin,
         "?all=1 did not clear the entry from L2 (v4-2 regression)"
 
     # next read is a true miss to a NEW origin generation, not an L2 refill
-    origin_before = origin.hits
+    origin_before = origin.hits_for("purgeall")
     s, body_b, h3 = fetch(ng.port, uri)
     assert s == 200 and "x-cache" not in h3, \
         f"post-all-purge read should miss to origin, got {h3.get('x-cache')}"
-    assert origin.hits == origin_before + 1, \
+    assert origin.hits_for("purgeall") == origin_before + 1, \
         "origin was not consulted after all-purge (L2 still served)"
     assert body_b != body_a, "post-purge body should be a fresh generation"
 
