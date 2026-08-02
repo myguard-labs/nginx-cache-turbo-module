@@ -74,7 +74,7 @@ jobs:
             echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           fi
 
-      - name: ruff (correctness tiers F,B,PLE,RET,RUF059)
+      - name: ruff (correctness tiers F,B,I,PLE,RET,RUF059)
         run: |
           set -euo pipefail
           # ci/tools/test_runtime.py IS the runtime suite (~15.6k lines) and
@@ -85,10 +85,18 @@ jobs:
           # the fail state. Mirrors the ruff hook in .pre-commit-config.yaml --
           # move both together.
           #
+          # I (import sorting) joined the gate 2026-08-02: measured across all
+          # nine module repos it is 100% safe-autofixable (`--select I --fix`),
+          # so it cannot land red on arrival. The rest of the nominally "cheap"
+          # tier (N, C4, SIM, UP, PLW, RUF) was measured at 84 findings here
+          # with only 21 safe-autofixable, i.e. 63 hand-edits to the test
+          # harness for no correctness gain -- left out deliberately, see the
+          # ruff hook comment in .pre-commit-config.yaml for the full reasoning.
+          #
           # Style tiers (PT018, E501) are deliberately excluded: 257 findings
           # would land this red on arrival and train --no-verify.
           ruff --version          # records which ruff resolved off PATH
-          ruff check --select F,B,PLE,RET,RUF059 ci/
+          ruff check --select F,B,I,PLE,RET,RUF059 ci/
 
       - name: Validate scripts and source
         run: |

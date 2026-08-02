@@ -153,17 +153,31 @@ repos:
       #
       # --quiet is also deliberately ABSENT: it suppressed exactly the error
       # text above and turned a diagnosable crash into a silent exit 2.
+      #
+      # --jobs=1 closes the SECOND source of the same crash. require_serial
+      # above stops pre-commit forking one hook process per core; it does
+      # nothing about semgrep's own internal parallelism, which forks
+      # semgrep-core per core inside that single process and allocates an
+      # io_uring for each. A target with few enough C files never reaches the
+      # limit and looks fine, so this only surfaces as the tree grows -- which
+      # is exactly when a green-to-red flip reads as a real finding.
       - id: semgrep
         name: semgrep (gate on >=WARNING)
-        entry: semgrep scan --config p/c --config p/security-audit
+        entry: semgrep scan --jobs=1 --config p/c --config p/security-audit
                --severity=WARNING --severity=ERROR --error
         language: system
         files: '^src/.*\.[ch]$'
         pass_filenames: true
         require_serial: true
 
-      # Mirrors the CI "Static analysis" step in build-test.yml, same enable
-      # set and same suppressions.
+      # Mirrors the CI "Static analysis" step in build-test.yml: same enable
+      # set, same suppressions, same -I. Any of those diverging makes local
+      # green stop predicting remote green, which is this file's whole job.
+      #
+      # unusedStructMember is suppressed because cppcheck sees one TU at a
+      # time here and cannot know a member is read from another file; -I is
+      # the C source dir, so headers next to the sources resolve rather than
+      # being reported as missing.
       #
       # -DNGX_PTR_SIZE=8: the breaker probe-word layout selects on this macro
       # and #errors when it is undefined. It normally arrives from nginx's
@@ -178,7 +192,7 @@ repos:
         entry: cppcheck --enable=warning,performance,portability
                --error-exitcode=1 --suppress=missingIncludeSystem
                --suppress=normalCheckLevelMaxBranches --suppress=unusedFunction
-               -DNGX_PTR_SIZE=8
+               --suppress=unusedStructMember -I src -DNGX_PTR_SIZE=8
         language: system
         files: '^src/.*\.[ch]$'
         pass_filenames: true
@@ -195,7 +209,24 @@ repos:
       # F,B are the correctness tiers (undefined names, unused imports, real
       # bug patterns). PLE and RET joined them once measured at zero backlog --
       # PLE is pylint's error tier, so a finding there is a bug rather than a
-      # preference. Style tiers are still deliberately NOT selected: PT018 and
+      # preference. I (import sorting) joined on the same rule: measured across
+      # all nine module repos it is 100% safe-autofixable (`ruff check --select
+      # I --fix`), so it can never land red on arrival anywhere.
+      #
+      # The rest of the "cheap" tier was MEASURED and deliberately left out
+      # 2026-08-02, because the label was wrong. Across cache-turbo: N 3, C4 8,
+      # SIM 11, UP 13, PLW 15, RUF 31 -- but only 21 of those 84 are
+      # safe-autofixable, leaving 63 hand-edits in a 15.6k-line test harness.
+      # The two biggest residuals are pure preference on test scaffolding:
+      # PLW1510 wants `check=False` spelled out at 13 call sites that already
+      # inspect `r.returncode`, and SIM105 wants contextlib.suppress for 11
+      # try/except/pass blocks. That is churn across the file every runtime
+      # test lives in, for no correctness gain, against a tree whose ledger
+      # repeatedly warns that harness churn is how vacuous assertions get
+      # introduced. Re-measure with --statistics before revisiting; do not
+      # trust a remembered count.
+      #
+      # Style tiers are still deliberately NOT selected: PT018 and
       # E501 carry three-figure backlogs and would land this red on arrival,
       # training everyone to --no-verify -- the same failure the shellcheck
       # note below describes. Widen only with a commit that also fixes the
@@ -205,9 +236,16 @@ repos:
       # grep: ruff 0.16 moved the path onto a `--> path:line:col` line, so a
       # grep anchored on the old `path:line:col:` format reports 0 for every
       # tier and makes a widening look free.
+      #
+      # `language: system` resolves whatever ruff is on PATH, while CI pins an
+      # exact version -- so local and remote can disagree if a release changes
+      # a selected rule. That is tolerable only because every tier here is
+      # verified against BOTH the pinned CI version and the local one before it
+      # is selected; the I widening was checked clean on 0.15.20 and 0.16.1.
+      # Verify the same way after any widening, or pin this entry to match.
       - id: ruff
-        name: ruff (correctness tiers F,B,PLE,RET,RUF059)
-        entry: ruff check --force-exclude --select F,B,PLE,RET,RUF059
+        name: ruff (correctness tiers F,B,I,PLE,RET,RUF059)
+        entry: ruff check --force-exclude --select F,B,I,PLE,RET,RUF059
         language: system
         files: '^ci/.*\.py$'
         pass_filenames: true
@@ -231,6 +269,15 @@ repos:
       # the linter's age, not the workflow, and leaving it on lands this hook
       # red on arrival. Drop this ignore once actionlint is new enough.
       #
+      # The pattern matches HOSTED-IMAGE-SHAPED labels only, and that narrowness
+      # is the point. actionlint emits byte-identical text for an unknown hosted
+      # image and for a MISTYPED self-hosted label, so the obvious
+      # `label ".+" is unknown` suppresses both -- and a typo'd runner label is
+      # precisely what -config-file above exists to make reportable. Verified
+      # 2026-08-02 against 1.7.7: with this pattern, ubuntu-26.04, macos-16 and
+      # windows-2028 are silent while `buidler02` (a typo for a declared label)
+      # is still reported. Do not widen it back to `.+`.
+      #
       # SHELLCHECK_OPTS applies to the shellcheck actionlint runs over `run:`
       # blocks. Without it that embedded pass reports at INFO while the
       # standalone shellcheck hook below gates at warning -- so the same SC2086
@@ -238,7 +285,7 @@ repos:
       # in both places.
       - id: actionlint
         name: actionlint (workflow syntax)
-        entry: env SHELLCHECK_OPTS=-Swarning actionlint -config-file .github/actionlint.yaml -ignore 'label ".+" is unknown'
+        entry: env SHELLCHECK_OPTS=-Swarning actionlint -config-file .github/actionlint.yaml -ignore 'label "(ubuntu|macos|windows)-[0-9]+(\.[0-9]+)?(-arm|-arm64|-large|-xlarge|-xl)?" is unknown'
         language: system
         files: ^\.github/workflows/.*\.ya?ml$
         pass_filenames: true

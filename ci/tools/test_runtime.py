@@ -42,7 +42,6 @@ import time
 import urllib.error
 import urllib.request
 
-
 # A test that raises before stop() would orphan every child we spawned:
 # an nginx master (or redis/memcached) keeps listening on its test port,
 # which collides with later runs of any repo sharing the runner. Track

@@ -55,8 +55,8 @@ EXTEND
     argument, add it to FIXTURES below.
 """
 import argparse
-import io
 import inspect
+import io
 import pathlib
 import sys
 import tempfile
