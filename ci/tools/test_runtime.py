@@ -5080,8 +5080,16 @@ def test_restore_allocation_failure_fails_closed(ng: Nginx,
                              forbidden_header: str | None = None) -> None:
         try:
             status, _, headers = fetch_raw(ng.port, path)
-        except http.client.RemoteDisconnected:
-            return  # nginx aborted before sending any partial header block
+        except http.client.RemoteDisconnected as e:
+            # Previously a silent `return` here made this branch a no-op: if
+            # nginx ever starts aborting the connection instead of returning
+            # a deterministic 500, the assertion below would never run and
+            # the test would pass without checking anything. Fail loudly
+            # instead so a future regression is caught, not silently skipped.
+            raise AssertionError(
+                f"allocation failure aborted the connection instead of "
+                f"returning a deterministic 500 for {path}: {e!r}"
+            ) from e
         assert status == 500 and status != forbidden_status, \
             f"allocation failure returned unsafe status {status}: {headers}"
         if forbidden_header is not None:
