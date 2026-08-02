@@ -5076,40 +5076,33 @@ def test_restore_allocation_failure_fails_closed(ng: Nginx,
     """Allocation failure while rebuilding a cached response must never emit a
     partial cached 200/3xx or fall through from a destructively reset SIE header
     list. The hidden directive exists only in ci/tools/ci-build.sh builds."""
+    aborted_paths: list[str] = []
+
     def assert_failed_closed(path: str, forbidden_status: int,
                              forbidden_header: str | None = None) -> None:
         # Two outcomes are fail-closed and both are accepted: a deterministic
         # 500, or an abort before any byte of the header block reaches the
-        # client. `/allocfail/bare-normal` really does take the abort path --
+        # client. Every location here currently takes the abort path --
         # add_header()'s NGX_ERROR propagates out of the header filter, so
         # nginx tears the connection down instead of emitting a partial
         # response. That is the contract this test names ("must never emit a
         # partial cached 200/3xx"), so an abort is a PASS, not a skip.
         #
-        # What must never happen is the forbidden status or header arriving
-        # intact. A bare `return` here used to make the abort branch a silent
-        # no-op; it now asserts the abort really is header-free.
-        aborted = False
+        # A bare `return` here used to swallow the abort entirely, which meant
+        # the branch asserted nothing at all. Record it instead: the caller
+        # asserts the whole set below, so a silent flip of every location to
+        # some other status can no longer pass unnoticed.
+        #
+        # Deliberately NOT re-probed. `cache_turbo_test_restore_alloc_fail` is
+        # a static loc-conf flag (module.c:512-516, merged at :12524), so a
+        # second request to the same location aborts for exactly the same
+        # reason as the first. A re-probe here cannot distinguish a one-off
+        # truncation from the steady state, and asserting on it would look
+        # like coverage while being unreachable.
         try:
             status, _, headers = fetch_raw(ng.port, path)
         except http.client.RemoteDisconnected:
-            aborted = True
-
-        if aborted:
-            # Nothing was sent, so nothing can have leaked. Re-probe to prove
-            # the abort is the steady state rather than a one-off truncation
-            # that leaves the next request serving the unsafe cached entry.
-            try:
-                status2, _, headers2 = fetch_raw(ng.port, path)
-            except http.client.RemoteDisconnected:
-                return
-            assert status2 != forbidden_status, \
-                f"allocation failure aborted once then served the forbidden " \
-                f"status {status2} for {path}: {headers2}"
-            if forbidden_header is not None:
-                assert headers2.get(forbidden_header) is None, \
-                    f"allocation failure leaked {forbidden_header} on the " \
-                    f"re-probe for {path}: {headers2}"
+            aborted_paths.append(path)
             return
 
         assert status == 500 and status != forbidden_status, \
@@ -5137,6 +5130,16 @@ def test_restore_allocation_failure_fails_closed(ng: Nginx,
     finally:
         origin.fail = False
         drain_origin(origin)
+
+    # Pin the observed shape. All three locations abort today, and each abort
+    # returned above without asserting anything -- so without this the test
+    # passes unchanged if every one of them silently starts doing something
+    # else. Both directions are real failures worth seeing: a location that
+    # stops aborting takes the 500 branch above (and must satisfy it), while
+    # this catches the set drifting as a whole.
+    assert aborted_paths == ["/allocfail/bare-normal", "/allocfailst/redir",
+                             "/allocfailsie/sieserve-alloc"], \
+        f"allocation-failure abort set changed: {aborted_paths}"
 
 
 def test_file_backed_delegate_never_stores(ng: Nginx,
