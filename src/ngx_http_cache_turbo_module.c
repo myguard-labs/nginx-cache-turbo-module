@@ -6753,8 +6753,22 @@ ngx_http_cache_turbo_serve(ngx_http_request_t *r, u_char *copy, size_t len,
         return NGX_ERROR;
     }
 
-    if (ngx_http_send_header(r) != NGX_OK) {
-        return NGX_ERROR;
+    /* A header filter may return a STATUS CODE rather than NGX_OK/NGX_ERROR,
+     * and that is not an error: ngx_http_range_header_filter answers an
+     * unsatisfiable Range with NGX_HTTP_RANGE_NOT_SATISFIABLE (416), which it
+     * expects the caller to finalize into a real 416 response. Collapsing every
+     * non-NGX_OK into NGX_ERROR turned that into ngx_http_finalize_request(-1)
+     * -- the connection was closed with NO response at all, while the SAME
+     * request against a MISS got a well-formed answer from upstream. Mirrors
+     * the core contract at ngx_http_upstream.c: `rc == NGX_ERROR || rc >
+     * NGX_OK` finalizes with rc. `rc > NGX_OK` is the status-code case (NGX_OK
+     * is 0 and every HTTP status is positive); NGX_AGAIN/NGX_DONE are negative
+     * and fall through to the body send, as they do for a normal serve. */
+    rc = ngx_http_send_header(r);
+
+    if (rc == NGX_ERROR || rc > NGX_OK) {
+        ngx_http_finalize_request(r, rc);
+        return NGX_DONE;
     }
 
     /* HEAD / conditional-304: header already sent, no body expected — done. */
