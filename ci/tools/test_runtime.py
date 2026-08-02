@@ -4850,12 +4850,12 @@ def wait_for_l2(redis, key: str, expected: bytes, what: str = "",
 
     elapsed = time.time() - start
     label = f" for {what}" if what else ""
+    seen = "absent" if got is None else f"{len(got)} bytes"
     raise AssertionError(
         f"L2 value{label} did not match after {elapsed:.2f}s "
         f"(timeout {timeout:.2f}s): key={key!r}\n"
         f"  expected ({len(expected)} bytes): {expected!r}\n"
-        f"  observed ({'absent' if got is None else f'{len(got)} bytes'}): "
-        f"{got!r}\n"
+        f"  observed ({seen}): {got!r}\n"
         f"  A None/absent observation means the write never landed (or was "
         f"evicted); a differing value means something else wrote the key.")
 
