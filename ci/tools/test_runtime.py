@@ -4838,17 +4838,21 @@ def wait_for_l2(redis, key: str, expected: bytes, what: str = "",
     raises. Widening a wait until it always passes would disable the oracle
     ([[feedback-widening-shared-timeout-disables-oracle]]); the point here is
     to make the eventual red diagnosable, not to make it go away."""
-    start = time.time()
+    # monotonic, not time.time(): an NTP step on a CI box must not cut the wait
+    # short or stretch it. The sleep is clamped to what is left of the deadline
+    # so the wait cannot overrun `timeout` by up to a full interval.
+    start = time.monotonic()
     got = None
     while True:
         got = redis.get_raw(key)
         if got == expected:
             return
-        if time.time() - start >= timeout:
+        remaining = timeout - (time.monotonic() - start)
+        if remaining <= 0:
             break
-        time.sleep(interval)
+        time.sleep(min(interval, remaining))
 
-    elapsed = time.time() - start
+    elapsed = time.monotonic() - start
     label = f" for {what}" if what else ""
     seen = "absent" if got is None else f"{len(got)} bytes"
     raise AssertionError(
@@ -4856,8 +4860,10 @@ def wait_for_l2(redis, key: str, expected: bytes, what: str = "",
         f"(timeout {timeout:.2f}s): key={key!r}\n"
         f"  expected ({len(expected)} bytes): {expected!r}\n"
         f"  observed ({seen}): {got!r}\n"
-        f"  A None/absent observation means the write never landed (or was "
-        f"evicted); a differing value means something else wrote the key.")
+        f"  This is the state at the LAST read, not a cause: absent means the "
+        f"value was not there yet (never written, written later, or evicted), "
+        f"and a differing value means the key held something else at that "
+        f"instant. Compare the two blobs before picking a theory.")
 
 
 def drain_origin(origin: Origin, settle: float = 0.6,
