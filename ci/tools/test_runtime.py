@@ -10067,15 +10067,15 @@ def test_rfc1_only_if_cached_hit(ng: Nginx, origin: Origin) -> None:
 def test_rfc1_request_no_store(ng: Nginx, origin: Origin) -> None:
     """RFC-1 (§5.2.1.5): a request Cache-Control: no-store runs to the origin and
     its response is NOT stored — a following plain GET still misses."""
-    before = origin.hits
+    before = origin.hits_for("/rns")
     s, _, h = fetch_raw(ng.port, "/cond/rns",
                         headers={"Cache-Control": "no-store"})
     assert s == 200, f"no-store request should still serve 200: {s}"
     assert "x-cache" not in h, "a no-store request is an origin miss, not a HIT"
-    assert origin.hits == before + 1, "no-store must reach the origin"
+    assert origin.hits_for("/rns") == before + 1, "no-store must reach the origin"
     # nothing was stored: the next plain GET is itself a miss (origin hit again)
     _s2, _, h2 = fetch_raw(ng.port, "/cond/rns")
-    assert "x-cache" not in h2 and origin.hits == before + 2, \
+    assert "x-cache" not in h2 and origin.hits_for("/rns") == before + 2, \
         f"no-store response must not have been cached: {h2}"
 
 
@@ -10085,12 +10085,12 @@ def test_rfc1_request_max_age_zero_revalidates(ng: Nginx, origin: Origin) -> Non
     fetch_raw(ng.port, "/cond/ma0")                                # prime
     _, _, hhit = fetch_raw(ng.port, "/cond/ma0")
     assert hhit.get("x-cache") == "HIT", "entry should be cached before refresh"
-    before = origin.hits
+    before = origin.hits_for("/ma0")
     s, _, h = fetch_raw(ng.port, "/cond/ma0",
                         headers={"Cache-Control": "max-age=0"})
     assert s == 200, f"max-age=0 should still serve 200: {s}"
     assert "x-cache" not in h, "max-age=0 must revalidate at origin, not HIT"
-    assert origin.hits == before + 1, "max-age=0 must reach the origin"
+    assert origin.hits_for("/ma0") == before + 1, "max-age=0 must reach the origin"
 
 
 def test_rfc1_request_max_age_n(ng: Nginx, origin: Origin) -> None:
@@ -10098,32 +10098,32 @@ def test_rfc1_request_max_age_n(ng: Nginx, origin: Origin) -> None:
     (revalidate at origin); a generous N still HITs the same entry."""
     fetch_raw(ng.port, "/cond/man")                                # prime
     time.sleep(2.2)
-    before = origin.hits
+    before = origin.hits_for("/man")
     _s0, _, h0 = fetch_raw(ng.port, "/cond/man",
                           headers={"Cache-Control": "max-age=30"})
-    assert h0.get("x-cache") == "HIT" and origin.hits == before, \
+    assert h0.get("x-cache") == "HIT" and origin.hits_for("/man") == before, \
         f"max-age=30 on a ~2s entry should HIT: {h0}"
     s1, _, h1 = fetch_raw(ng.port, "/cond/man",
                           headers={"Cache-Control": "max-age=1"})
     assert s1 == 200 and "x-cache" not in h1, \
         f"max-age=1 on a ~2s entry must revalidate at origin: {h1}"
-    assert origin.hits == before + 1, "tight max-age must reach the origin"
+    assert origin.hits_for("/man") == before + 1, "tight max-age must reach the origin"
 
 
 def test_rfc1_request_min_fresh(ng: Nginx, origin: Origin) -> None:
     """RFC-1 (§5.2.1.3): request min-fresh=N rejects an entry that will not stay
     fresh for at least N more seconds."""
     fetch_raw(ng.port, "/cond/mf")                                 # prime, fresh 30s
-    before = origin.hits
+    before = origin.hits_for("/mf")
     _s0, _, h0 = fetch_raw(ng.port, "/cond/mf",
                           headers={"Cache-Control": "min-fresh=5"})
-    assert h0.get("x-cache") == "HIT" and origin.hits == before, \
+    assert h0.get("x-cache") == "HIT" and origin.hits_for("/mf") == before, \
         f"min-fresh=5 with ~30s left should HIT: {h0}"
     s1, _, h1 = fetch_raw(ng.port, "/cond/mf",
                           headers={"Cache-Control": "min-fresh=600"})
     assert s1 == 200 and "x-cache" not in h1, \
         f"min-fresh=600 with ~30s left must revalidate: {h1}"
-    assert origin.hits == before + 1, "unmet min-fresh must reach the origin"
+    assert origin.hits_for("/mf") == before + 1, "unmet min-fresh must reach the origin"
 
 
 def test_rfc1_request_max_stale(ng: Nginx, origin: Origin) -> None:
@@ -10131,19 +10131,19 @@ def test_rfc1_request_max_stale(ng: Nginx, origin: Origin) -> None:
     max-stale gets a revalidation; adding max-stale re-permits the stale serve."""
     fetch_raw(ng.port, "/condst/cond-ms")                          # prime, fresh 1s
     time.sleep(1.5)                                                # now stale
-    before = origin.hits
+    before = origin.hits_for("/cond-ms")
     # max-stale present -> accept the stale copy (beta 1, no refresh)
     s0, b0, h0 = fetch_raw(ng.port, "/condst/cond-ms",
                            headers={"Cache-Control": "max-age=1, max-stale=30"})
     assert s0 == 200 and b0 and h0.get("x-cache") == "STALE", \
         f"max-stale must permit the stale serve: {s0} {h0}"
-    assert origin.hits == before, "max-stale stale serve must not hit origin"
+    assert origin.hits_for("/cond-ms") == before, "max-stale stale serve must not hit origin"
     # same tight max-age but NO max-stale -> no stale tolerance -> revalidate
     s1, _, h1 = fetch_raw(ng.port, "/condst/cond-ms",
                           headers={"Cache-Control": "max-age=1"})
     assert s1 == 200 and "x-cache" not in h1, \
         f"max-age without max-stale must revalidate a stale entry: {h1}"
-    assert origin.hits == before + 1, "no-max-stale revalidation must hit origin"
+    assert origin.hits_for("/cond-ms") == before + 1, "no-max-stale revalidation must hit origin"
 
 
 def test_p4_multi_directive_single_resolve(ng: Nginx, origin: Origin) -> None:
@@ -10187,12 +10187,12 @@ def test_rfc2_swr_duration_extends_stale(ng: Nginx, origin: Origin) -> None:
     so the copy is still STALE-serveable at ~5s."""
     fetch_raw(ng.port, "/swrdur/swrdur-x")                         # prime, fresh 1s
     time.sleep(5)                                                  # > default 4s window
-    before = origin.hits
+    before = origin.hits_for("/swrdur-x")
     s, b, h = fetch_raw(ng.port, "/swrdur/swrdur-x")
     assert s == 200 and b, f"SWR-extended entry should still serve: {s}"
     assert h.get("x-cache") == "STALE", \
         f"stale-while-revalidate must keep it serveable past the default: {h}"
-    assert origin.hits == before, "SWR stale serve (beta 1) must not hit origin"
+    assert origin.hits_for("/swrdur-x") == before, "SWR stale serve (beta 1) must not hit origin"
 
 
 def test_purge_method(ng: Nginx) -> None:
