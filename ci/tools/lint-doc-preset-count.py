@@ -50,7 +50,12 @@ DOC_PATHS = [Path("README.md")]
 ARRAY_RE = re.compile(
     r"ngx_http_cache_turbo_backend_names\[\]\s*=\s*\{(.*?)\n\};", re.S
 )
-ROW_RE = re.compile(r'\{\s*"([a-z0-9]+)"\s*,\s*(NGX_HTTP_CACHE_TURBO_BACKEND_[A-Z0-9]+)')
+# The name charset is deliberately `[^"]+` rather than `[a-z0-9]+`: every preset
+# spelled today is lowercase alphanumeric, but a future one with a `_` or `-`
+# would not match a narrow class, and the failure is silent in the direction that
+# matters -- the row vanishes from BOTH the count and the coverage arm, so the
+# lint under-counts and never checks whether the new preset is documented.
+ROW_RE = re.compile(r'\{\s*"([^"]+)"\s*,\s*(NGX_HTTP_CACHE_TURBO_BACKEND_[A-Z0-9_]+)')
 
 # "3 of the 29 presets that now exist" -- capture the number, allow any prose
 # between it and the trailing phrase so a rewording does not silently disable
