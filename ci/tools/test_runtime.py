@@ -14265,9 +14265,12 @@ def test_l2_tag_truncation_warns(ng: Nginx, origin: Origin,
         return (logf.read_text(encoding="utf-8", errors="replace")
                 if logf.exists() else "")
 
-    # Exactly 16 tags -- at the cap, nothing dropped, must NOT warn.
+    # Exactly 16 tags -- at the cap, nothing dropped, must NOT warn. Append a
+    # trailing separator so this also exercises the "skip trailing separators
+    # before deciding s < e" arm -- without it, a value ending right after the
+    # 16th tag never reaches that code path and the arm goes unexercised.
     before = len(log_text())
-    at_cap = ",".join(f"t{i}" for i in range(16))
+    at_cap = ",".join(f"t{i}" for i in range(16)) + ", "
     fetch(ng.port, f"/l2tcap/at-cap?t={at_cap}")
     time.sleep(0.3)
     new = log_text()[before:]
