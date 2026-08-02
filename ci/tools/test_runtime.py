@@ -15084,28 +15084,28 @@ def test_scan_walk_page_cap_reports_incomplete(ng: Nginx,
 def test_normalize_arg_order(ng: Nginx, origin: Origin) -> None:
     """v3-1: ?b=2&a=1 and ?a=1&b=2 normalize to one cache slot — the reordered
     second request is a HIT serving the first body, origin hit exactly once."""
-    base = origin.hits
+    base = origin.hits_for("/order")
     s1, b1, h1 = fetch(ng.port, "/n/order?b=2&a=1")
     assert s1 == 200 and "x-cache" not in h1, "first request should miss to origin"
     _s2, b2, h2 = fetch(ng.port, "/n/order?a=1&b=2")
     assert h2.get("x-cache") == "HIT", \
         f"reordered args should HIT, got X-Cache={h2.get('x-cache')}"
     assert b2 == b1, "reordered request served a different body"
-    assert origin.hits == base + 1, \
-        f"origin hit {origin.hits - base} times (args not normalized to one key)"
+    assert origin.hits_for("/order") == base + 1, \
+        f"origin hit {origin.hits_for('/order') - base} times (args not normalized to one key)"
 
 
 def test_normalize_strips_tracking(ng: Nginx, origin: Origin) -> None:
     """Built-in denylist: utm_* and fbclid are dropped, so ?p=1&utm_source=x&
     fbclid=y collapses onto the same slot as a bare ?p=1."""
-    base = origin.hits
+    base = origin.hits_for("/track")
     _, b1, h1 = fetch(ng.port, "/n/track?p=1")
     assert "x-cache" not in h1, "prime should miss to origin"
     _, b2, h2 = fetch(ng.port, "/n/track?p=1&utm_source=news&utm_medium=cpc&fbclid=z")
     assert h2.get("x-cache") == "HIT", \
         f"tracking-only diff should HIT, got X-Cache={h2.get('x-cache')}"
     assert b2 == b1, "tracking-laden request served a different body"
-    assert origin.hits == base + 1, "tracking params were not stripped from the key"
+    assert origin.hits_for("/track") == base + 1, "tracking params were not stripped from the key"
 
 
 def test_normalize_strip_custom(ng: Nginx, origin: Origin) -> None:
@@ -15138,14 +15138,14 @@ def test_normalize_strip_all(ng: Nginx, origin: Origin) -> None:
 def test_normalize_distinct_args_differ(ng: Nginx, origin: Origin) -> None:
     """Guard against over-normalizing: a meaningful arg difference (a=1 vs a=2)
     must remain two distinct cache slots, not collapse to one."""
-    base = origin.hits
+    base = origin.hits_for("/distinct")
     _, b1, h1 = fetch(ng.port, "/n/distinct?a=1")
     assert "x-cache" not in h1, "first should miss"
     _, b2, h2 = fetch(ng.port, "/n/distinct?a=2")
     assert "x-cache" not in h2, \
         f"a different value must MISS, got X-Cache={h2.get('x-cache')}"
     assert b2 != b1, "distinct args wrongly served the same cached body"
-    assert origin.hits == base + 2, "both distinct args should reach origin"
+    assert origin.hits_for("/distinct") == base + 2, "both distinct args should reach origin"
 
 
 # UA strings whose device class is unambiguous for the substring matcher.
@@ -15220,7 +15220,7 @@ def test_normalize_vary_off_by_default(ng: Nginx, origin: Origin) -> None:
     """v3-4 regression guard: WITHOUT cache_turbo_normalize_vary (location /n/),
     differing Accept-Encoding and User-Agent must NOT split the key — the v3-1
     normalized key is byte-identical, so the second request HITs the first slot."""
-    base = origin.hits
+    base = origin.hits_for("/voff")
     _, b1, h1 = fetch(ng.port, "/n/voff",
                       headers={"Accept-Encoding": "br", "User-Agent": _UA_MOBILE})
     assert "x-cache" not in h1, "prime should miss to origin"
@@ -15230,7 +15230,7 @@ def test_normalize_vary_off_by_default(ng: Nginx, origin: Origin) -> None:
         ("vary off: differing encoding/device must still HIT one slot, "
          f"got X-Cache={h2.get('x-cache')}")
     assert b2 == b1, "vary off served a different body (key wrongly split)"
-    assert origin.hits == base + 1, "vary off must keep one slot regardless of headers"
+    assert origin.hits_for("/voff") == base + 1, "vary off must keep one slot regardless of headers"
 
 
 def test_normalize_vary_encoding_zstd(ng: Nginx, origin: Origin) -> None:
