@@ -5076,12 +5076,35 @@ def test_restore_allocation_failure_fails_closed(ng: Nginx,
     """Allocation failure while rebuilding a cached response must never emit a
     partial cached 200/3xx or fall through from a destructively reset SIE header
     list. The hidden directive exists only in ci/tools/ci-build.sh builds."""
+    aborted_paths: list[str] = []
+
     def assert_failed_closed(path: str, forbidden_status: int,
                              forbidden_header: str | None = None) -> None:
+        # Two outcomes are fail-closed and both are accepted: a deterministic
+        # 500, or an abort before any byte of the header block reaches the
+        # client. Every location here currently takes the abort path --
+        # add_header()'s NGX_ERROR propagates out of the header filter, so
+        # nginx tears the connection down instead of emitting a partial
+        # response. That is the contract this test names ("must never emit a
+        # partial cached 200/3xx"), so an abort is a PASS, not a skip.
+        #
+        # A bare `return` here used to swallow the abort entirely, which meant
+        # the branch asserted nothing at all. Record it instead: the caller
+        # asserts the whole set below, so a silent flip of every location to
+        # some other status can no longer pass unnoticed.
+        #
+        # Deliberately NOT re-probed. `cache_turbo_test_restore_alloc_fail` is
+        # a static loc-conf flag (module.c:512-516, merged at :12524), so a
+        # second request to the same location aborts for exactly the same
+        # reason as the first. A re-probe here cannot distinguish a one-off
+        # truncation from the steady state, and asserting on it would look
+        # like coverage while being unreachable.
         try:
             status, _, headers = fetch_raw(ng.port, path)
         except http.client.RemoteDisconnected:
-            return  # nginx aborted before sending any partial header block
+            aborted_paths.append(path)
+            return
+
         assert status == 500 and status != forbidden_status, \
             f"allocation failure returned unsafe status {status}: {headers}"
         if forbidden_header is not None:
@@ -5107,6 +5130,16 @@ def test_restore_allocation_failure_fails_closed(ng: Nginx,
     finally:
         origin.fail = False
         drain_origin(origin)
+
+    # Pin the observed shape. All three locations abort today, and each abort
+    # returned above without asserting anything -- so without this the test
+    # passes unchanged if every one of them silently starts doing something
+    # else. Both directions are real failures worth seeing: a location that
+    # stops aborting takes the 500 branch above (and must satisfy it), while
+    # this catches the set drifting as a whole.
+    assert aborted_paths == ["/allocfail/bare-normal", "/allocfailst/redir",
+                             "/allocfailsie/sieserve-alloc"], \
+        f"allocation-failure abort set changed: {aborted_paths}"
 
 
 def test_file_backed_delegate_never_stores(ng: Nginx,
