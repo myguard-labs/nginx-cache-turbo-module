@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import collections
 import concurrent.futures
 import email.utils
 import hashlib
@@ -41,6 +42,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 
 # A test that raises before stop() would orphan every child we spawned:
 # an nginx master (or redis/memcached) keeps listening on its test port,
@@ -416,7 +418,10 @@ class Origin:
                                    # than the clean 503 `fail` mode — Goal-2
                                    # hard-dead-upstream coverage)
         self._n = 0
-        self._paths: list[tuple[float, str]] = []   # DEBUG: (time, path) log
+        # ring: diagnostics only, trimmed to the last 64 entries -- NOT a
+        # source of truth for hits_for(), which reads _path_hits below.
+        self._paths: list[tuple[float, str]] = []
+        self._path_hits: collections.Counter[str] = collections.Counter()
         self._lock = threading.Lock()
         self._server: http.server.ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
@@ -440,12 +445,25 @@ class Origin:
             return self._n
 
     def hits_for(self, needle: str) -> int:
-        """Count origin GETs whose path contains `needle`. Path-scoped, so a
-        test using a unique URL is immune to other tests' async bg-refresh
-        traffic bumping the global `hits` counter between its base capture and
-        its assertion (the test_206_never_cached deflake)."""
+        """Count origin contacts whose path contains `needle` (substring
+        match, not equality -- callers pass fragments like "forever-f" or
+        "?sessionid=AAA"). Backed by an unbounded per-path Counter
+        (`_path_hits`), incremented under `_lock` beside `_n` in EVERY request
+        handler -- do_GET, do_HEAD and do_POST -- so the total is exact
+        regardless of how many contacts happened across ALL paths in between,
+        and matches `hits` in what it counts.
+
+        Path-scoped, so a test using a unique URL is immune to other tests'
+        async bg-refresh traffic bumping the global `hits` counter between its
+        base capture and its assertion (the test_206_never_cached deflake).
+
+        NOTE: `_paths` (the (time, path) ring, trimmed to the last 64 entries)
+        is diagnostics-only -- used by `_recent_memo_skips()` and the SUITE-1
+        dump -- and is NOT what backs this count. Before the Counter was
+        added, hits_for() summed the trimmed ring directly, which silently
+        undercounted any window spanning more than 64 total origin contacts."""
         with self._lock:
-            return sum(1 for _, p in self._paths if needle in p)
+            return sum(c for p, c in self._path_hits.items() if needle in p)
 
     def start(self) -> None:
         origin = self
@@ -456,6 +474,7 @@ class Origin:
                 # store it as the GET entry.
                 with origin._lock:
                     origin._n += 1
+                    origin._path_hits[self.path] += 1
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", "0")
@@ -484,6 +503,7 @@ class Origin:
                     origin._paths.append((time.time(), self.path))
                     if len(origin._paths) > 64:        # ring: diagnostics only
                         del origin._paths[:-64]
+                    origin._path_hits[self.path] += 1
                 if origin.drop:
                     self.close_connection = True
                     return
@@ -519,6 +539,7 @@ class Origin:
                     origin._paths.append((time.time(), self.path))
                     if len(origin._paths) > 64:        # ring: diagnostics only
                         del origin._paths[:-64]
+                    origin._path_hits[self.path] += 1
                 # Hard upstream failure (Goal-2): drop the connection with no
                 # response so nginx's upstream sees a transport error (502),
                 # exercising a different error class than the clean 503 `fail`
@@ -9625,6 +9646,50 @@ def test_ignore_cc_must_revalidate_keeps_stale_window(ng: Nginx,
         "stale serve under ignore_cc unexpectedly hit origin (window collapsed?)"
 
 
+def test_hits_for_exact_beyond_ring_size(ng: Nginx, origin: Origin) -> None:
+    """hits_for() must be an EXACT per-path count, not an approximation that
+    degrades once a window spans more than 64 origin contacts.
+
+    Origin._paths is a diagnostics-only ring hard-trimmed to the last 64
+    entries (do_GET/do_POST: `if len(origin._paths) > 64: del
+    origin._paths[:-64]`; do_HEAD counts but does not append) for
+    _recent_memo_skips()/the SUITE-1 dump. Before
+    hits_for() was backed by a real Counter, it summed that ring directly, so
+    any window driving more than 64 TOTAL origin contacts (this path or any
+    other -- the ring is global, not per-path) silently undercounted: the
+    oldest hits on THIS path fall off the ring the moment other traffic pushes
+    the ring past 64 entries.
+
+    This drives 80 direct GETs at the origin on one unique path (bypassing
+    nginx entirely -- we're proving a property of the Origin test double
+    itself, not the module) inside one window, i.e. 16 more contacts than the
+    ring can hold, and asserts the exact delta. Under the old ring-summing
+    implementation the delta reads <= 64 (16 short); under the Counter it is
+    exactly 80."""
+    needle = "hitsforring-" + uuid.uuid4().hex[:8]
+    path = f"/{needle}"
+    base = origin.hits_for(needle)
+    n_contacts = 80
+    assert n_contacts > 64, "control requires more contacts than the ring holds"
+    # Borrow the delay to zero: 80 serial GETs at the suite's 0.05s baseline
+    # would add ~4s to every full-suite run, and nothing here depends on a
+    # regeneration window. Restored via reset_delay() in the finally, NOT to a
+    # hardcoded 0.0 -- see reset_delay()'s docstring for the SUITE-8 bug that
+    # shipped from exactly that mistake.
+    origin.delay = 0
+    try:
+        for _ in range(n_contacts):
+            status, _, _ = fetch(origin.port, path)
+            assert status == 200, f"origin direct GET failed: status={status}"
+    finally:
+        origin.reset_delay()
+    delta = origin.hits_for(needle) - base
+    assert delta == n_contacts, (
+        f"hits_for({needle!r}) delta must be exact: expected {n_contacts}, got "
+        f"{delta}. A delta <= 64 means hits_for() is summing the trimmed "
+        "diagnostics ring instead of a real per-path counter.")
+
+
 def test_valid_zero_is_forever(ng: Nginx, origin: Origin) -> None:
     """cache_turbo_valid 0 == "cache forever": the stored entry must stay FRESH
     (a HIT), not become instantly stale. Pre-fix a literal 0 fresh TTL made the
@@ -16294,6 +16359,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_precise_maxage_token_parse(ng)
     test_ignore_cache_control_overrides_floor(ng, origin)
     test_ignore_cc_must_revalidate_keeps_stale_window(ng, origin)
+    test_hits_for_exact_beyond_ring_size(ng, origin)        # A1: hits_for() Counter
     test_valid_zero_is_forever(ng, origin)
     test_honor_ttl_clamped_to_max(ng, origin)              # STAB-5 TTL clamp
     test_vary_encoding_qvalue(ng, origin)
