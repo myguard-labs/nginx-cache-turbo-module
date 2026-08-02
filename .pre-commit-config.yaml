@@ -236,6 +236,13 @@ repos:
       # grep: ruff 0.16 moved the path onto a `--> path:line:col` line, so a
       # grep anchored on the old `path:line:col:` format reports 0 for every
       # tier and makes a widening look free.
+      #
+      # `language: system` resolves whatever ruff is on PATH, while CI pins an
+      # exact version -- so local and remote can disagree if a release changes
+      # a selected rule. That is tolerable only because every tier here is
+      # verified against BOTH the pinned CI version and the local one before it
+      # is selected; the I widening was checked clean on 0.15.20 and 0.16.1.
+      # Verify the same way after any widening, or pin this entry to match.
       - id: ruff
         name: ruff (correctness tiers F,B,I,PLE,RET,RUF059)
         entry: ruff check --force-exclude --select F,B,I,PLE,RET,RUF059
