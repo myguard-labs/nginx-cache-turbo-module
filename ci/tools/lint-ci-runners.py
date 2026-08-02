@@ -12,7 +12,6 @@ import pathlib
 import re
 import sys
 
-
 # This script lives at ci/tools/; repo root is two levels up (ci/ -> root).
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 WORKFLOWS = ROOT / ".github" / "workflows"
