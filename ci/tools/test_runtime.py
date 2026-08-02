@@ -445,12 +445,13 @@ class Origin:
             return self._n
 
     def hits_for(self, needle: str) -> int:
-        """Count origin GET/HEAD contacts whose path contains `needle`
-        (substring match, not equality -- callers pass fragments like
-        "forever-f" or "?sessionid=AAA"). Backed by an unbounded per-path
-        Counter (`_path_hits`), incremented under `_lock` beside `_n` in both
-        do_GET and do_HEAD, so the total is exact regardless of how many
-        contacts happened across ALL paths in between.
+        """Count origin contacts whose path contains `needle` (substring
+        match, not equality -- callers pass fragments like "forever-f" or
+        "?sessionid=AAA"). Backed by an unbounded per-path Counter
+        (`_path_hits`), incremented under `_lock` beside `_n` in EVERY request
+        handler -- do_GET, do_HEAD and do_POST -- so the total is exact
+        regardless of how many contacts happened across ALL paths in between,
+        and matches `hits` in what it counts.
 
         Path-scoped, so a test using a unique URL is immune to other tests'
         async bg-refresh traffic bumping the global `hits` counter between its
@@ -9650,8 +9651,9 @@ def test_hits_for_exact_beyond_ring_size(ng: Nginx, origin: Origin) -> None:
     degrades once a window spans more than 64 origin contacts.
 
     Origin._paths is a diagnostics-only ring hard-trimmed to the last 64
-    entries (do_GET/do_HEAD: `if len(origin._paths) > 64: del
-    origin._paths[:-64]`) for _recent_memo_skips()/the SUITE-1 dump. Before
+    entries (do_GET/do_POST: `if len(origin._paths) > 64: del
+    origin._paths[:-64]`; do_HEAD counts but does not append) for
+    _recent_memo_skips()/the SUITE-1 dump. Before
     hits_for() was backed by a real Counter, it summed that ring directly, so
     any window driving more than 64 TOTAL origin contacts (this path or any
     other -- the ring is global, not per-path) silently undercounted: the
@@ -9669,9 +9671,18 @@ def test_hits_for_exact_beyond_ring_size(ng: Nginx, origin: Origin) -> None:
     base = origin.hits_for(needle)
     n_contacts = 80
     assert n_contacts > 64, "control requires more contacts than the ring holds"
-    for _ in range(n_contacts):
-        status, _, _ = fetch(origin.port, path)
-        assert status == 200, f"origin direct GET failed: status={status}"
+    # Borrow the delay to zero: 80 serial GETs at the suite's 0.05s baseline
+    # would add ~4s to every full-suite run, and nothing here depends on a
+    # regeneration window. Restored via reset_delay() in the finally, NOT to a
+    # hardcoded 0.0 -- see reset_delay()'s docstring for the SUITE-8 bug that
+    # shipped from exactly that mistake.
+    origin.delay = 0
+    try:
+        for _ in range(n_contacts):
+            status, _, _ = fetch(origin.port, path)
+            assert status == 200, f"origin direct GET failed: status={status}"
+    finally:
+        origin.reset_delay()
     delta = origin.hits_for(needle) - base
     assert delta == n_contacts, (
         f"hits_for({needle!r}) delta must be exact: expected {n_contacts}, got "
