@@ -583,6 +583,22 @@ class Origin:
                     # a MISS's Range answer against a DIFFERENT URL, so the
                     # body must not depend on which request/URL produced it.
                     rbody = b"R" * 200
+                    # This branch returns before the shared Cache-Control marker
+                    # block below (:813), so a /rngsrc/ key can never pick up the
+                    # "sieserve" stale-if-error marker the way other locations do.
+                    # rngsie emits it HERE instead, so one key can be both
+                    # Range-capable and serve-on-error armed -- the fixture
+                    # test_range_on_sie_serve needs, because allow_ranges is set
+                    # in restore_response(), which the SIE header-filter path
+                    # shares with the live HIT path.
+                    sie = "rngsie" in self.path
+                    # Same reason as rngsie: the shared "cond" validator block
+                    # (:835) is below this branch's return, so an rngsrc key can
+                    # never carry an ETag. rngcond emits one here so a
+                    # Range-capable entry can also be revalidated -- the fixture
+                    # test_range_not_offered_on_304 needs to reach the 304 branch
+                    # that module.c:6563 deliberately excludes from allow_ranges.
+                    cond = "rngcond" in self.path
                     rng = self.headers.get("Range")
                     start, end = 0, len(rbody) - 1
                     partial = False
@@ -610,6 +626,11 @@ class Origin:
                         self.send_header("Accept-Ranges", "bytes")
                         self.send_header("Content-Range",
                                           f"bytes {start}-{end}/{len(rbody)}")
+                        if sie:
+                            self.send_header("Cache-Control",
+                                             "stale-if-error=30")
+                        if cond:
+                            self.send_header("ETag", '"rngetag"')
                         self.send_header("Content-Length", str(len(chunk)))
                         self.end_headers()
                         try:
@@ -620,6 +641,11 @@ class Origin:
                         self.send_response(200)
                         self.send_header("Content-Type", "text/plain")
                         self.send_header("Accept-Ranges", "bytes")
+                        if sie:
+                            self.send_header("Cache-Control",
+                                             "stale-if-error=30")
+                        if cond:
+                            self.send_header("ETag", '"rngetag"')
                         self.send_header("Content-Length", str(len(rbody)))
                         self.end_headers()
                         try:
@@ -2042,6 +2068,20 @@ http {{
             cache_turbo       main;
             cache_turbo_key   $uri;
             cache_turbo_valid 30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # Range over a STALE-IF-ERROR serve. r->allow_ranges is set in
+        # restore_response(), which sie_rewrite() shares with the live HIT path,
+        # so the SIE serve must range identically to a HIT. Same short-fresh
+        # shape as /sieserve/ (1s fresh, stale window x4 = 4s, fully expired by
+        # ~5s) but with the rngsrc+rngsie markers so the stored blob is
+        # Range-capable AND carries stale-if-error=30. Drives
+        # test_range_on_sie_serve.
+        location /rangesie/ {{
+            cache_turbo       main;
+            cache_turbo_key   $uri;
+            cache_turbo_valid 1s;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
@@ -9942,6 +9982,178 @@ def test_range_hit_matches_miss(ng: Nginx, origin: Origin) -> None:
     assert len(b_hit) == 100, f"bytes=0-99 should be 100 bytes, got {len(b_hit)}"
 
 
+def test_range_suffix_hit_matches_miss(ng: Nginx, origin: Origin) -> None:
+    """AUD-RANGE1, suffix form. test_range_hit_matches_miss covers only the
+    prefix form (bytes=0-99). A suffix range (bytes=-N = the LAST N bytes) takes
+    a different path through core's range parser, and the module's allow_ranges
+    permit at module.c:6563 is what lets core answer it at all on a HIT. Same
+    HIT-must-equal-MISS oracle: warm one URL with a plain GET, then suffix-Range
+    it (HIT) and compare against suffix-Range-ing a never-cached URL (MISS).
+
+    The comparison is against a MISS rather than a hardcoded expectation on
+    purpose -- it pins HIT to whatever core+origin genuinely do for a suffix
+    range, so this cannot pass by both paths being wrong the same way."""
+    range_hdr = {"Range": "bytes=-50"}
+
+    s_miss, b_miss, h_miss = fetch_raw(ng.port, "/range/rngsrc-sfxmiss",
+                                       headers=range_hdr)
+    assert s_miss == 206, f"MISS with suffix Range should be 206, got {s_miss}"
+    assert "x-cache" not in h_miss, f"reference fetch should not HIT: {h_miss}"
+
+    s0, _, h0 = fetch_raw(ng.port, "/range/rngsrc-sfxwarm")
+    assert s0 == 200 and "x-cache" not in h0, f"prime should miss: {s0} {h0}"
+
+    s_hit, b_hit, h_hit = fetch_raw(ng.port, "/range/rngsrc-sfxwarm",
+                                    headers=range_hdr)
+    assert h_hit.get("x-cache") == "HIT", f"second fetch should HIT: {h_hit}"
+    assert s_hit == 206, \
+        f"a suffix Range against a HIT must answer 206 like a MISS does, " \
+        f"got {s_hit}"
+    assert h_hit.get("content-range") == h_miss.get("content-range"), \
+        f"HIT Content-Range {h_hit.get('content-range')!r} != " \
+        f"MISS Content-Range {h_miss.get('content-range')!r}"
+    assert b_hit == b_miss, \
+        f"HIT suffix body {b_hit!r} != MISS suffix body {b_miss!r}"
+    # The LAST 50 bytes, not the first 50: a mis-sliced suffix that still
+    # returned 50 bytes would pass a length-only assert.
+    assert len(b_hit) == 50, f"bytes=-50 should be 50 bytes, got {len(b_hit)}"
+    assert h_hit.get("content-range") == "bytes 150-199/200", \
+        f"bytes=-50 of a 200-byte body is 150-199, got " \
+        f"{h_hit.get('content-range')!r}"
+
+
+def test_range_unsatisfiable_hit_matches_miss(ng: Nginx,
+                                              origin: Origin) -> None:
+    """A Range wholly past the end of a cached body must be refused with a real
+    416 response.
+
+    Found a live defect. ngx_http_cache_turbo_serve() did:
+
+        if (ngx_http_send_header(r) != NGX_OK) { return NGX_ERROR; }
+
+    but a header filter may return a STATUS CODE, not just NGX_OK/NGX_ERROR:
+    ngx_http_range_header_filter answers an unsatisfiable Range with
+    NGX_HTTP_RANGE_NOT_SATISFIABLE (416), expecting the caller to finalize it
+    into a 416. Collapsing that into NGX_ERROR produced
+    ngx_http_finalize_request(r, -1) -- observed as the connection being CLOSED
+    WITH NO RESPONSE AT ALL, while the same request against a MISS answered
+    normally. Fixed to mirror the core contract in ngx_http_upstream.c
+    (`rc == NGX_ERROR || rc > NGX_OK` -> finalize with rc).
+
+    ⚠ This does NOT compare HIT against MISS, unlike its sibling Range tests.
+    The test origin ignores an unsatisfiable Range and answers 200 with the full
+    body, so a MISS here is a FIXTURE artifact, not the contract -- asserting
+    HIT == MISS would pin the module to the stub origin's behaviour. 416 is
+    asserted directly because it is what RFC 9110 6.5.4 requires and what core
+    produces once the return value is honoured."""
+    # The rngsrc body is 200 bytes, so bytes=500-599 cannot be satisfied.
+    range_hdr = {"Range": "bytes=500-599"}
+
+    s0, _, h0 = fetch_raw(ng.port, "/range/rngsrc-unsatwarm")
+    assert s0 == 200 and "x-cache" not in h0, f"prime should miss: {s0} {h0}"
+
+    s_hit, b_hit, _ = fetch_raw(ng.port, "/range/rngsrc-unsatwarm",
+                                headers=range_hdr)
+    assert s_hit == 416, \
+        f"an unsatisfiable Range against a cached entry must answer 416, got " \
+        f"{s_hit} (before the send_header fix this was not a wrong status but " \
+        f"NO RESPONSE -- the connection was closed mid-request)"
+    assert "200" not in b_hit[:200] or "416" in b_hit, \
+        f"416 body should be the range-not-satisfiable page, got {b_hit[:120]!r}"
+
+    # The entry must still be intact and servable after the refusal: a 416 is a
+    # client error, not a reason to drop or poison the cached representation.
+    s_after, b_after, h_after = fetch_raw(ng.port, "/range/rngsrc-unsatwarm")
+    assert s_after == 200 and h_after.get("x-cache") == "HIT", \
+        f"the cached entry must survive a 416, got {s_after} {h_after}"
+    assert len(b_after) == 200, \
+        f"the cached body must be intact after a 416, got {len(b_after)} bytes"
+
+
+def test_range_not_offered_on_304(ng: Nginx, origin: Origin) -> None:
+    """AUD-RANGE1, the exclusion. module.c:6563 sets r->allow_ranges only for a
+    200 serve with a known length, deliberately NOT for the conditional-304
+    branch immediately above it (a 304 has no body to range over, and
+    header_only is already set). Nothing asserted that exclusion, so a future
+    edit moving the permit above the 304 branch would be silent.
+
+    A 304 carrying Accept-Ranges would invite a client to issue a Range request
+    against a representation this response never delivered."""
+    # The rngcond marker makes the Range-capable origin branch emit an ETag, so
+    # this one key is both range-capable and revalidatable.
+    url = "/range/rngsrc-rngcond-k1"
+    s0, _, h0 = fetch_raw(ng.port, url)
+    assert s0 == 200 and "x-cache" not in h0, f"prime should miss: {s0} {h0}"
+    etag = h0.get("etag")
+    assert etag == '"rngetag"', \
+        f"fixture is wrong, not the module: rngcond must emit an ETag, got " \
+        f"{etag!r}"
+
+    # Positive half first, and it must depend on the PERMIT, not on the blob.
+    # Accept-Ranges is replayed from the stored headers (the origin sent it), so
+    # asserting that header would pass even with module.c:6563 deleted --
+    # measured: it survived that exact mutation. Issuing a real Range and
+    # requiring 206 is what the permit actually gates.
+    s_hit, b_hit, h_hit = fetch_raw(ng.port, url,
+                                    headers={"Range": "bytes=0-9"})
+    assert h_hit.get("x-cache") == "HIT", f"ranged fetch should HIT: {h_hit}"
+    assert s_hit == 206, \
+        f"a cached 200 must be range-servable (the permit at module.c:6563), " \
+        f"got {s_hit}"
+    assert len(b_hit) == 10, f"bytes=0-9 should be 10 bytes, got {len(b_hit)}"
+
+    s304, b304, h304 = fetch_raw(ng.port, url,
+                                 headers={"If-None-Match": etag})
+    assert s304 == 304, f"conditional against a HIT should be 304, got {s304}"
+    assert b304 == "", f"a 304 must carry no body, got {b304!r}"
+    assert "content-range" not in h304, \
+        f"a 304 must never carry Content-Range: {h304}"
+
+
+def test_range_on_sie_serve(ng: Nginx, origin: Origin) -> None:
+    """AUD-RANGE1 on the STALE-IF-ERROR path. r->allow_ranges is set inside
+    ngx_http_cache_turbo_restore_response() (module.c:6563), and
+    sie_rewrite() (module.c:7104) calls that same function to replay a snapshot
+    when the origin errors -- so a serve-on-error response is range-capable by
+    construction. Only the live-HIT path was ever tested.
+
+    This matters because sie_rewrite() rebuilds headers_out from scratch
+    (ngx_list_init at module.c:7090). A future change to that rebuild that
+    dropped Accept-Ranges, or that reordered the restore so the permit no longer
+    ran, would regress Range on exactly the path a client is most likely to be
+    retrying against.
+
+    Fixture: /rangesie/ keys carry both the rngsrc marker (Range-capable body)
+    and the rngsie marker (stale-if-error=30), so the entry can fully expire and
+    still be replayed when the origin then 5xxs."""
+    url = "/rangesie/rngsrc-rngsie-k1"
+    range_hdr = {"Range": "bytes=0-99"}
+
+    s0, _, h0 = fetch_raw(ng.port, url)
+    assert s0 == 200 and "x-cache" not in h0, f"prime failed: {s0} {h0}"
+
+    time.sleep(4.6)     # past fresh (1s) AND the stale window (x4 = 4s)
+    origin.fail = True
+    try:
+        s, b, h = fetch_raw(ng.port, url, headers=range_hdr)
+        assert h.get("x-cache") == "STALE-IF-ERROR", \
+            f"expected a serve-on-error replay, got x-cache={h.get('x-cache')} " \
+            f"status={s} (the fixture, not the Range, is wrong)"
+        assert s == 206, \
+            f"a Range against a STALE-IF-ERROR serve must answer 206 like a " \
+            f"HIT does, got {s} -- the client asked for a slice and got the " \
+            f"whole body"
+        assert h.get("content-range") == "bytes 0-99/200", \
+            f"Content-Range on the SIE serve is {h.get('content-range')!r}, " \
+            f"expected bytes 0-99/200"
+        assert len(b) == 100, f"bytes=0-99 should be 100 bytes, got {len(b)}"
+        assert b == "R" * 100, \
+            f"the SIE serve returned the wrong 100 bytes: {b!r}"
+    finally:
+        origin.fail = False
+        drain_origin(origin)
+
+
 def test_safe_key_distinct_sessionids(ng: Nginx, origin: Origin) -> None:
     """Raw-key migration (was cache_turbo_safe_key): an explicit
     cache_turbo_key $scheme$host$request_uri keeps the full raw query, so two
@@ -16450,6 +16662,10 @@ def run_all(ng: Nginx, origin: Origin,
     test_auto_vary_stale_marker_reachable(ng, origin)
     test_206_never_cached(ng, origin)
     test_range_hit_matches_miss(ng, origin)
+    test_range_suffix_hit_matches_miss(ng, origin)
+    test_range_unsatisfiable_hit_matches_miss(ng, origin)
+    test_range_not_offered_on_304(ng, origin)
+    test_range_on_sie_serve(ng, origin)
     test_safe_key_distinct_sessionids(ng, origin)
     test_conditional_inm_304(ng, origin)
     test_conditional_inm_list_short_first(ng, origin)
