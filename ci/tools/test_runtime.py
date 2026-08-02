@@ -9775,13 +9775,13 @@ def test_auto_vary_unknown_axis_uncacheable(ng: Nginx, origin: Origin) -> None:
     cannot key on (and is not *, Cookie, or Authorization). It must force the
     response uncacheable rather than serve one representation for every value
     (RFC 9110 12.5.5)."""
-    base = origin.hits
+    base = origin.hits_for("/u?v=cs")
     _, _, h0 = fetch(ng.port, "/av/u?v=cs")
     assert "x-cache" not in h0, "first should miss"
     _, _, h1 = fetch(ng.port, "/av/u?v=cs")
     assert "x-cache" not in h1, \
         f"Vary on an un-keyable axis must stay uncacheable, got {h1.get('x-cache')}"
-    assert origin.hits == base + 2, "un-keyable Vary axis was wrongly cached"
+    assert origin.hits_for("/u?v=cs") == base + 2, "un-keyable Vary axis was wrongly cached"
 
 
 def test_auto_vary_stale_marker_reachable(ng: Nginx, origin: Origin) -> None:
@@ -12988,40 +12988,40 @@ def test_warm_populates(ng: Nginx, origin: Origin) -> None:
     first real visit — without that visit touching the origin again."""
     import json
     uri = "/c/warm-pop"
-    base = origin.hits
+    base = origin.hits_for("warm-pop")
     s, b, _ = fetch(ng.port, f"/_cache?url={uri}", method="POST")
     assert s == 200, f"warm status {s}"
     assert json.loads(b)["warmed"] == 1, f"warmed count: {b}"
     # the bg subrequest reaching origin is our completion signal
-    assert wait_for(lambda: origin.hits == base + 1), \
+    assert wait_for(lambda: origin.hits_for("warm-pop") == base + 1), \
         "warm subrequest never hit the origin"
     time.sleep(0.2)                     # let the store settle after the response
-    after = origin.hits
+    after = origin.hits_for("warm-pop")
     # first real visit must be served from the warm-populated entry
     s2, _, h2 = fetch(ng.port, uri)
     assert s2 == 200
     assert h2.get("x-cache") == "HIT", \
         f"warm did not populate the cache (X-Cache={h2.get('x-cache')})"
-    assert origin.hits == after, \
-        f"GET after warm hit the origin ({origin.hits} vs {after})"
+    assert origin.hits_for("warm-pop") == after, \
+        f"GET after warm hit the origin ({origin.hits_for('warm-pop')} vs {after})"
 
 
 def test_warm_multi(ng: Nginx, origin: Origin) -> None:
     """v3-3: a comma-separated ?url=a,b warms both; both HIT afterwards."""
     import json
     a, b_uri = "/c/warm-m1", "/c/warm-m2"
-    base = origin.hits
+    base = origin.hits_for("warm-m")
     s, body, _ = fetch(ng.port, f"/_cache?url={a},{b_uri}", method="POST")
     assert s == 200, f"warm-multi status {s}"
     assert json.loads(body)["warmed"] == 2, f"warmed count: {body}"
-    assert wait_for(lambda: origin.hits == base + 2), \
+    assert wait_for(lambda: origin.hits_for("warm-m") == base + 2), \
         "both warm subrequests never reached origin"
     time.sleep(0.2)
-    after = origin.hits
+    after = origin.hits_for("warm-m")
     for u in (a, b_uri):
         _, _, h = fetch(ng.port, u)
         assert h.get("x-cache") == "HIT", f"{u} not warmed (X-Cache={h.get('x-cache')})"
-    assert origin.hits == after, "a warmed GET still hit origin"
+    assert origin.hits_for("warm-m") == after, "a warmed GET still hit origin"
 
 
 def test_warm_no_url(ng: Nginx) -> None:
@@ -13051,14 +13051,14 @@ def test_warm_strips_key_cookie(ng: Nginx, origin: Origin) -> None:
     import json
     uri = "/mg/ckecho-warm"
     seg = {"Cookie": "X-Magento-Vary=deadbeefdeadbeefdeadbeefdeadbeef"}
-    base = origin.hits
+    base = origin.hits_for("ckecho-warm")
     s, b, _ = fetch(ng.port, f"/_cache?url={uri}", method="POST", headers=seg)
     assert s == 200, f"warm status: {s} {b!r}"
     assert json.loads(b)["warmed"] == 1, f"warm body: {b!r}"
-    assert wait_for(lambda: origin.hits == base + 1), \
+    assert wait_for(lambda: origin.hits_for("ckecho-warm") == base + 1), \
         "warm subrequest never reached origin"
     time.sleep(0.2)                     # let the store settle
-    after = origin.hits
+    after = origin.hits_for("ckecho-warm")
 
     # (a) the cookieless anonymous lookup HITs the warmed entry -> key went anon.
     s2, body2, h2 = fetch(ng.port, uri)          # no cookie
@@ -13066,8 +13066,8 @@ def test_warm_strips_key_cookie(ng: Nginx, origin: Origin) -> None:
     assert h2.get("x-cache") == "HIT", \
         ("warm keyed to the X-Magento-Vary segment, not the anonymous bucket a "
          f"cookieless visitor looks up (X-Cache={h2.get('x-cache')})")
-    assert origin.hits == after, \
-        f"the anonymous GET hit origin instead of the warm entry ({origin.hits} vs {after})"
+    assert origin.hits_for("ckecho-warm") == after, \
+        f"the anonymous GET hit origin instead of the warm entry ({origin.hits_for('ckecho-warm')} vs {after})"
 
     # (b) the served (warm-stored) body proves the origin saw NO cookie -> no leak.
     assert "cookie=[none]" in body2, \
@@ -15306,17 +15306,17 @@ def test_auto_vary_encoding(ng: Nginx, origin: Origin) -> None:
 def test_auto_vary_encoding_same_class_shares(ng: Nginx, origin: Origin) -> None:
     """v11 auto-Vary: two Accept-Encoding headers in the same bucket (gzip and
     'gzip, deflate' both classify gzip) share one slot -> one origin hit."""
-    base = origin.hits
+    base = origin.hits_for("/encsame?v=ae")
     p = "/av/encsame?v=ae"
     _, b1, _ = fetch(ng.port, p, {"Accept-Encoding": "gzip"})
     _, b2, _ = fetch(ng.port, p, {"Accept-Encoding": "gzip, deflate"})
     assert b1 == b2, (b1, b2)
-    assert origin.hits - base == 1, origin.hits - base
+    assert origin.hits_for("/encsame?v=ae") - base == 1, origin.hits_for("/encsame?v=ae") - base
 
 
 def test_auto_vary_device(ng: Nginx, origin: Origin) -> None:
     """v11 auto-Vary: `Vary: User-Agent` splits by the coarse device class."""
-    base = origin.hits
+    base = origin.hits_for("/dev?v=ua")
     p = "/av/dev?v=ua"
     mob = {"User-Agent": "Mozilla/5.0 (iPhone; CPU) Mobile"}
     dsk = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64)"}
@@ -15326,20 +15326,20 @@ def test_auto_vary_device(ng: Nginx, origin: Origin) -> None:
     _, d2, _ = fetch(ng.port, p, dsk)
     assert m1 == m2 and d1 == d2, (m1, m2, d1, d2)
     assert m1 != d1, ("mobile and desktop shared a slot", m1, d1)
-    assert origin.hits - base == 2, origin.hits - base
+    assert origin.hits_for("/dev?v=ua") - base == 2, origin.hits_for("/dev?v=ua") - base
 
 
 def test_auto_vary_language(ng: Nginx, origin: Origin) -> None:
     """v11 auto-Vary: `Vary: Accept-Language` splits by the LANG axis class
     (S7: primary-subtag class, not the raw header)."""
-    base = origin.hits
+    base = origin.hits_for("/lang?v=al")
     p = "/av/lang?v=al"
     _, e1, _ = fetch(ng.port, p, {"Accept-Language": "en"})
     _, e2, _ = fetch(ng.port, p, {"Accept-Language": "en"})
     _, f1, _ = fetch(ng.port, p, {"Accept-Language": "fr"})
     assert e1 == e2, (e1, e2)
     assert e1 != f1, ("en and fr shared a slot", e1, f1)
-    assert origin.hits - base == 2, origin.hits - base
+    assert origin.hits_for("/lang?v=al") - base == 2, origin.hits_for("/lang?v=al") - base
 
 
 def test_auto_vary_language_primary_subtag_shares(ng: Nginx,
@@ -15351,7 +15351,7 @@ def test_auto_vary_language_primary_subtag_shares(ng: Nginx,
     the keyspace on an i18n site for representations that are byte-identical.
     Canary: $cache_turbo_status (echoed as X-CT-Status) is HIT on the second
     request, not just "body matches"."""
-    base = origin.hits
+    base = origin.hits_for("/langshare?v=al")
     p = "/av/langshare?v=al"
     s1, b1, h1 = fetch(ng.port, p, {"Accept-Language": "en-US,en;q=0.9"})
     s2, b2, h2 = fetch(ng.port, p, {"Accept-Language": "en-GB,en;q=0.8"})
@@ -15365,9 +15365,9 @@ def test_auto_vary_language_primary_subtag_shares(ng: Nginx,
     assert h2.get("x-ct-status") == "HIT", \
         ("en-GB must HIT the slot en-US filled, not re-fetch an identical body",
          h2.get("x-ct-status"))
-    assert origin.hits - base == 1, \
+    assert origin.hits_for("/langshare?v=al") - base == 1, \
         ("en-US and en-GB should fold to one 'en' class -> one origin hit",
-         origin.hits - base)
+         origin.hits_for("/langshare?v=al") - base)
 
 
 def test_auto_vary_language_different_primary_splits(ng: Nginx,
@@ -15375,14 +15375,14 @@ def test_auto_vary_language_different_primary_splits(ng: Nginx,
     """S7 negative guard: `en` and `de` are DIFFERENT primary subtags and must
     still SPLIT into distinct slots -- proves the fold isn't over-collapsing
     everything to one class."""
-    base = origin.hits
+    base = origin.hits_for("/langsplit?v=al")
     p = "/av/langsplit?v=al"
     _, en1, _ = fetch(ng.port, p, {"Accept-Language": "en-US,en;q=0.9"})
     _, en2, _ = fetch(ng.port, p, {"Accept-Language": "en-GB,en;q=0.8"})
     _, de1, _ = fetch(ng.port, p, {"Accept-Language": "de-DE,de;q=0.9"})
     assert en1 == en2, ("en variants should still share", en1, en2)
     assert en1 != de1, ("en and de shared a slot", en1, de1)
-    assert origin.hits - base == 2, origin.hits - base
+    assert origin.hits_for("/langsplit?v=al") - base == 2, origin.hits_for("/langsplit?v=al") - base
 
 
 def test_auto_vary_language_absent_splits_from_class(ng: Nginx,
@@ -15391,7 +15391,7 @@ def test_auto_vary_language_absent_splits_from_class(ng: Nginx,
     it must still split from a present `en` header, not collide with it (the
     empty class is skip-shaped but must NOT be skipped: skipping the axis
     would collide a present-but-empty header with an absent one)."""
-    base = origin.hits
+    base = origin.hits_for("/langabsent?v=al")
     p = "/av/langabsent?v=al"
     s1, absent1, _h1 = fetch(ng.port, p)  # no Accept-Language header at all
     s2, absent2, _h2 = fetch(ng.port, p)
@@ -15401,21 +15401,21 @@ def test_auto_vary_language_absent_splits_from_class(ng: Nginx,
                                  absent1, absent2)
     assert absent1 != en1, ("absent Accept-Language shared a slot with 'en'",
                              absent1, en1)
-    assert origin.hits - base == 2, origin.hits - base
+    assert origin.hits_for("/langabsent?v=al") - base == 2, origin.hits_for("/langabsent?v=al") - base
 
 
 def test_auto_vary_origin(ng: Nginx, origin: Origin) -> None:
     """v11 auto-Vary: `Vary: Origin` splits by the raw Origin header value.
     ORIGIN is a CORS security boundary and is NEVER class-folded (S7 touches
     LANG only) -- two distinct Origins must still split into distinct slots."""
-    base = origin.hits
+    base = origin.hits_for("/org?v=or")
     p = "/av/org?v=or"
     _, a1, _ = fetch(ng.port, p, {"Origin": "https://a.example"})
     _, a2, _ = fetch(ng.port, p, {"Origin": "https://a.example"})
     _, c1, _ = fetch(ng.port, p, {"Origin": "https://b.example"})
     assert a1 == a2, (a1, a2)
     assert a1 != c1, ("two Origins shared a slot", a1, c1)
-    assert origin.hits - base == 2, origin.hits - base
+    assert origin.hits_for("/org?v=or") - base == 2, origin.hits_for("/org?v=or") - base
 
 
 def test_auto_vary_origin_not_class_folded(ng: Nginx, origin: Origin) -> None:
@@ -15432,7 +15432,7 @@ def test_auto_vary_origin_not_class_folded(ng: Nginx, origin: Origin) -> None:
     Folding https://a-one.example with https://a-two.example would serve one
     origin's CORS headers to the other -- a real security bug, not just a
     cache-efficiency regression."""
-    base = origin.hits
+    base = origin.hits_for("/orgnofold?v=or")
     p = "/av/orgnofold?v=or"
     o1 = "https://a-one.example"
     o2 = "https://a-two.example"
@@ -15445,40 +15445,40 @@ def test_auto_vary_origin_not_class_folded(ng: Nginx, origin: Origin) -> None:
         "ORIGIN got class-folded -- two distinct origins sharing an 8-byte "
         "prefix collapsed onto one slot; this is a CORS cross-origin leak",
         b1, b3)
-    assert origin.hits - base == 2, (
+    assert origin.hits_for("/orgnofold?v=or") - base == 2, (
         "ORIGIN must stay raw: two distinct origins => two origin hits, "
-        "not one folded class", origin.hits - base)
+        "not one folded class", origin.hits_for("/orgnofold?v=or") - base)
 
 
 def test_auto_vary_star_uncacheable(ng: Nginx, origin: Origin) -> None:
     """v11 auto-Vary: `Vary: *` is uncacheable -> every request hits origin."""
-    base = origin.hits
+    base = origin.hits_for("/star?v=star")
     p = "/av/star?v=star"
     _, b1, _ = fetch(ng.port, p)
     _, b2, _ = fetch(ng.port, p)
     assert b1 != b2, ("Vary: * was cached", b1, b2)
-    assert origin.hits - base == 2, origin.hits - base
+    assert origin.hits_for("/star?v=star") - base == 2, origin.hits_for("/star?v=star") - base
 
 
 def test_auto_vary_cookie_uncacheable(ng: Nginx, origin: Origin) -> None:
     """v11 auto-Vary: `Vary: Cookie` is refused (per-user) -> not cached."""
-    base = origin.hits
+    base = origin.hits_for("/ck?v=ck")
     p = "/av/ck?v=ck"
     _, b1, _ = fetch(ng.port, p)
     _, b2, _ = fetch(ng.port, p)
     assert b1 != b2, ("Vary: Cookie was cached", b1, b2)
-    assert origin.hits - base == 2, origin.hits - base
+    assert origin.hits_for("/ck?v=ck") - base == 2, origin.hits_for("/ck?v=ck") - base
 
 
 def test_auto_vary_mixed_refused_wins(ng: Nginx, origin: Origin) -> None:
     """v11 auto-Vary: `Vary: Accept-Encoding, Cookie` -> the refused Cookie axis
     wins over the safe encoding axis, so the response is not cached at all."""
-    base = origin.hits
+    base = origin.hits_for("/mix?v=mix")
     p = "/av/mix?v=mix"
     _, b1, _ = fetch(ng.port, p, {"Accept-Encoding": "gzip"})
     _, b2, _ = fetch(ng.port, p, {"Accept-Encoding": "gzip"})
     assert b1 != b2, ("mixed safe+refused Vary was cached", b1, b2)
-    assert origin.hits - base == 2, origin.hits - base
+    assert origin.hits_for("/mix?v=mix") - base == 2, origin.hits_for("/mix?v=mix") - base
 
 
 def test_auto_vary_off_ignores_vary(ng: Nginx, origin: Origin) -> None:
