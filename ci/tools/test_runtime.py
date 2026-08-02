@@ -16067,7 +16067,7 @@ def test_mc_keepalive_zero_does_not_drain_pool(ng: Nginx, origin: Origin,
         assert ng.worker_pids() == workers_before, \
             "worker crashed during the mixed keepalive=0 / keepalive=4 burst"
 
-    assert zero > n, \
+    assert zero >= 2 * n - 2, \
         f"keepalive=0 location did not dial per op (accepts={zero}, ops={n})"
     # The pool holds 4 idle sockets. If /mcka0/ borrowed them it closed each one
     # after its op (ka_save refuses to re-pool at keepalive=0), so the warm burst
