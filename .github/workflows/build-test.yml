@@ -130,12 +130,21 @@ jobs:
           # unit suite). It normally arrives from nginx's generated
           # objs/ngx_auto_config.h, which cppcheck never sees here, so it has to
           # be supplied. 8 matches every target this module builds for.
+          # --suppress=unusedStructMember and -I src mirror the pre-commit hook.
+          # cppcheck analyses one TU at a time here, so it cannot see a struct
+          # member read from another file and reports every one of them as
+          # unused; unsuppressed it is a false-positive generator. -I src lets
+          # headers next to the sources resolve instead of being reported
+          # missing. The config header's rule is that a divergence gets fixed
+          # toward CI, never by relaxing the hook.
           cppcheck \
             --enable=warning,performance,portability \
             --error-exitcode=1 \
             --suppress=missingIncludeSystem \
             --suppress=normalCheckLevelMaxBranches \
             --suppress=unusedFunction \
+            --suppress=unusedStructMember \
+            -I src \
             -DNGX_PTR_SIZE=8 \
             src/*.c
           git diff --check
