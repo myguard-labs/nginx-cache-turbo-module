@@ -569,7 +569,7 @@ there is no way to opt a single location out.
 > They used to mean `wordpress` + `woocommerce` + `joomla`. That was never a safe
 > default:
 >
-> - it **never covered every backend** — it named 3 of the 29 presets that now
+> - it **never covered every backend** — it named 3 of the 34 presets that now
 >   exist, so `auto` on a Drupal site silently enabled *no* Drupal rules;
 > - its **`woocommerce`** shipped without implying `wordpress`, leaving
 >   `/wp-admin/` cacheable (see [woocommerce.md](docs/woocommerce.md));
