@@ -10159,26 +10159,26 @@ def test_p4_multi_directive_single_resolve(ng: Nginx, origin: Origin) -> None:
     (b) max-stale predicate: `Cache-Control: no-store, max-stale=30` on a stale
         entry serves the stale copy (max-stale honoured off the same resolve)."""
     # (a) no-store on a fresh cold key: not stored -> second GET re-hits origin.
-    before = origin.hits
+    before = origin.hits_for("/p4-nostore")
     s0, _, _h0 = fetch_raw(ng.port, "/condst/p4-nostore",
                           headers={"Cache-Control": "no-store, max-age=99"})
-    assert s0 == 200 and origin.hits == before + 1, \
-        f"no-store request must reach origin: {s0} hits={origin.hits}"
+    assert s0 == 200 and origin.hits_for("/p4-nostore") == before + 1, \
+        f"no-store request must reach origin: {s0} hits={origin.hits_for('/p4-nostore')}"
     s1, _, h1 = fetch_raw(ng.port, "/condst/p4-nostore")           # plain GET
     assert s1 == 200 and h1.get("x-cache") != "HIT" \
-        and origin.hits == before + 2, \
+        and origin.hits_for("/p4-nostore") == before + 2, \
         f"no-store must have suppressed storage -> second GET MISSes: {h1}"
 
     # (b) max-stale half of a combined directive on a stale entry.
     fetch_raw(ng.port, "/condst/p4-multi")                         # prime, fresh 1s
     time.sleep(1.5)                                                # now stale
-    before = origin.hits
+    before = origin.hits_for("/p4-multi")
     s2, b2, h2 = fetch_raw(ng.port, "/condst/p4-multi",
                            headers={"Cache-Control": "no-store, max-stale=30"})
     assert s2 == 200 and b2 and h2.get("x-cache") == "STALE", (
         f"max-stale half of the combined directive must permit the stale "
         f"serve: {s2} {h2}")
-    assert origin.hits == before, "combined-directive stale serve must not hit origin"
+    assert origin.hits_for("/p4-multi") == before, "combined-directive stale serve must not hit origin"
 
 
 def test_rfc2_swr_duration_extends_stale(ng: Nginx, origin: Origin) -> None:
@@ -11715,7 +11715,7 @@ def test_min_uses(ng: Nginx, origin: Origin) -> None:
     origin without storing, the third stores, the fourth is a HIT served from
     cache. The min_uses_skips counter rises by exactly the two skipped misses."""
     uri = "/minuses/page1"                       # never fetched before
-    base = origin.hits
+    base = origin.hits_for("/page1")
     skips0 = _admin_min_uses_skips(ng)
 
     # Below threshold: misses 1 and 2 both reach the origin, neither is cached.
@@ -11724,20 +11724,20 @@ def test_min_uses(ng: Nginx, origin: Origin) -> None:
         assert s == 200, f"sub-threshold req{i} status {s}"
         assert "x-cache" not in h, \
             f"req{i} must NOT be a HIT (below min_uses): {h.get('x-cache')}"
-    assert origin.hits == base + 2, \
-        f"both sub-threshold reqs must hit origin: {origin.hits - base}"
+    assert origin.hits_for("/page1") == base + 2, \
+        f"both sub-threshold reqs must hit origin: {origin.hits_for('/page1') - base}"
 
     # The third miss reaches the threshold: THIS request stores (still served
     # from the origin, no X-Cache), so its body is what later HITs return.
     s, b3, h3 = fetch(ng.port, uri)
     assert s == 200 and "x-cache" not in h3, \
         "the threshold-reaching miss is served from origin, then stored"
-    assert origin.hits == base + 3, "the storing miss must reach the origin"
+    assert origin.hits_for("/page1") == base + 3, "the storing miss must reach the origin"
 
     # The fourth request is now a cache HIT — no further origin traffic.
     s, b4, h4 = fetch(ng.port, uri)
     assert h4.get("x-cache") == "HIT", f"req4 X-Cache={h4.get('x-cache')}"
-    assert origin.hits == base + 3, "req4 must be served from cache, not origin"
+    assert origin.hits_for("/page1") == base + 3, "req4 must be served from cache, not origin"
     assert b4 == b3, "the HIT body must match the response that was stored"
 
     # Exactly the two sub-threshold misses were skipped (origin, no store).
@@ -11810,7 +11810,7 @@ def test_min_uses_band_balanced_is_1(ng: Nginx, origin: Origin) -> None:
     signed off), this test fails rather than silently changing the first-request
     store behaviour for every default-preset deployment."""
     uri = "/pbb/band-minuses-default"            # never fetched before
-    base = origin.hits
+    base = origin.hits_for("/band-minuses-default")
 
     s, _, h1 = fetch(ng.port, uri)
     assert s == 200 and "x-cache" not in h1, "first miss must reach the origin"
@@ -11820,7 +11820,7 @@ def test_min_uses_band_balanced_is_1(ng: Nginx, origin: Origin) -> None:
         ("the balanced band must store on the FIRST miss (min_uses=1); got "
          f"X-Cache={h2.get('x-cache')} -- a band row other than aggressive was "
          "given min_uses > 1, which is a semver-visible default change")
-    assert origin.hits == base + 1, "req2 must be served from cache"
+    assert origin.hits_for("/band-minuses-default") == base + 1, "req2 must be served from cache"
 
 
 def test_min_uses_directive_beats_band(ng: Nginx, origin: Origin) -> None:
@@ -11832,7 +11832,7 @@ def test_min_uses_directive_beats_band(ng: Nginx, origin: Origin) -> None:
     whereas /pab/ (same preset, no directive) needs three requests to get one.
     Without the raw/effective wiring the band would win and req2 would miss."""
     uri = "/pmu/beats-band"                      # never fetched before
-    base = origin.hits
+    base = origin.hits_for("/beats-band")
 
     s, _, h1 = fetch(ng.port, uri)
     assert s == 200 and "x-cache" not in h1, "first miss must reach the origin"
@@ -11842,7 +11842,7 @@ def test_min_uses_directive_beats_band(ng: Nginx, origin: Origin) -> None:
         ("explicit cache_turbo_min_uses 1 must beat the aggressive band's 2, so "
          f"req2 is a HIT; got X-Cache={h2.get('x-cache')} -- the directive lost "
          "to the band, i.e. min_uses_raw is not resolving ahead of band->min_uses")
-    assert origin.hits == base + 1, "req2 must be served from cache"
+    assert origin.hits_for("/beats-band") == base + 1, "req2 must be served from cache"
 
 
 def test_min_uses_rejects_out_of_range(ng: Nginx) -> None:
