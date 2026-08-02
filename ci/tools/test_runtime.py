@@ -13576,10 +13576,11 @@ def test_l2_preserves_original_freshness(ng: Nginx, origin: Origin,
     assert origin.hits == origin_before, "stale L2 hit unexpectedly used origin"
 
     time.sleep(2.3)
+    origin_before_expired = origin.hits_for("/original-lifetime")
     s, body2, h2 = fetch(ng.port, uri)
     assert s == 200 and "x-cache" not in h2, \
         f"expired L2 object was still served as {h2.get('x-cache')}"
-    assert origin.hits == origin_before + 1, \
+    assert origin.hits_for("/original-lifetime") == origin_before_expired + 1, \
         "expired L2 object did not fall through to origin"
     assert body2 != seeded.decode()
 
@@ -13809,14 +13810,14 @@ def test_l2_malformed_blob_rejected(ng: Nginx, origin: Origin,
         redis.cli("DEL", key, lock_key(uri))
         redis.set_raw(key, blob, 60_000)
 
-        before = origin.hits
+        before = origin.hits_for("/bad-")
         s, body, h = fetch(ng.port, uri)
         assert s == 200, f"{name}: status {s}"
         assert body.startswith("gen-"), \
             f"{name}: served garbage body {body!r} from a malformed L2 blob"
         assert "x-cache" not in h, \
             f"{name}: malformed blob served as {h.get('x-cache')} (not a miss)"
-        assert origin.hits == before + 1, \
+        assert origin.hits_for("/bad-") == before + 1, \
             f"{name}: malformed blob did not fall through to origin"
 
         # Second read must succeed AND be a real HIT — the rejected blob must not
