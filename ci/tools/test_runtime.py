@@ -15288,7 +15288,7 @@ def test_auto_vary_encoding(ng: Nginx, origin: Origin) -> None:
     """v11 auto-Vary: a response `Vary: Accept-Encoding` makes the module split
     by the Accept-Encoding class automatically (no operator config). Same class
     collapses onto one slot; a different class is a distinct slot."""
-    base = origin.hits_for("/enc?v=ae")
+    base = origin.hits
     p = "/av/enc?v=ae"
     _, b1, _ = fetch(ng.port, p, {"Accept-Encoding": "gzip"})  # cold -> origin
     _, b2, _ = fetch(ng.port, p, {"Accept-Encoding": "gzip"})  # marker -> HIT
@@ -15299,7 +15299,7 @@ def test_auto_vary_encoding(ng: Nginx, origin: Origin) -> None:
     assert b1 != b3, ("gzip and br shared a slot", b1, b3)
     _, b5, _ = fetch(ng.port, p, {"Accept-Encoding": "gzip"})  # still its slot
     assert b5 == b1, (b5, b1)
-    assert origin.hits_for("/enc?v=ae") - base == 2, origin.hits_for("/enc?v=ae") - base
+    assert origin.hits - base == 2, origin.hits - base
 
 
 def test_auto_vary_encoding_same_class_shares(ng: Nginx, origin: Origin) -> None:
@@ -15483,12 +15483,12 @@ def test_auto_vary_mixed_refused_wins(ng: Nginx, origin: Origin) -> None:
 def test_auto_vary_off_ignores_vary(ng: Nginx, origin: Origin) -> None:
     """v11 auto-Vary off by default: the response Vary header is ignored, so two
     different Accept-Encodings collapse onto one slot (back-compat)."""
-    base = origin.hits_for("/enc?v=ae")
+    base = origin.hits
     p = "/avoff/enc?v=ae"
     _, b1, _ = fetch(ng.port, p, {"Accept-Encoding": "gzip"})
     _, b2, _ = fetch(ng.port, p, {"Accept-Encoding": "br"})
     assert b1 == b2, ("auto_vary off still split by Vary", b1, b2)
-    assert origin.hits_for("/enc?v=ae") - base == 1, origin.hits_for("/enc?v=ae") - base
+    assert origin.hits - base == 1, origin.hits - base
 
 
 def test_preset_window_differs(ng: Nginx, origin: Origin) -> None:
