@@ -556,6 +556,23 @@ class Origin:
                     self.send_header("Content-Length", "0")
                     self.end_headers()
                     return
+                # CTXRDR: a 404 the vhost turns into an `error_page` internal
+                # redirect. Unlike try_files (which redirects during the REWRITE
+                # phase, before our PRECONTENT access handler has ever run), an
+                # error_page redirect fires from the ORIGIN's response status --
+                # i.e. after the access handler has already built ctx and after
+                # the header filter has run. ngx_http_internal_redirect() then
+                # memzeros r->ctx unconditionally (ngx_http_core_module.c:2614;
+                # the preserve-one-module dance at special_response.c:547 is the
+                # filter_finalize path, NOT this one), so the second pass starts
+                # with r->ctx[cache_turbo] == NULL while ctx's pool cleanups and
+                # its embedded cold_wait timer are still live on r->pool.
+                if "ctxrdr-missing" in self.path:
+                    self.send_response(404)
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
                 # 206 Partial Content must NEVER be cached (the key has no Range,
                 # so a stored partial could be replayed for a different/whole
                 # range). The module refuses it even with a per-status TTL.
@@ -3681,6 +3698,63 @@ http {{
             cache_turbo_no_store  $ctir_private_route;
             cache_turbo_valid     30s;
             add_header            X-CT-Status $cache_turbo_status always;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # ---- CTXRDR: error_page internal redirect AFTER ctx exists --------
+        # The /ctir* fixtures above redirect via try_files, which runs in the
+        # REWRITE phase -- before the PRECONTENT access handler, so the module
+        # only ever sees the post-redirect URI and ctx is built once. This pair
+        # covers the other order: cache-turbo is enabled on BOTH the route that
+        # 404s and the error_page target, so the access handler builds a ctx,
+        # the origin 404s, error_page fires ngx_http_internal_redirect(), and
+        # r->ctx is memzeroed mid-request while the first ctx's pool cleanups
+        # (cold-winner unstub, blob release) and its embedded cold_wait_ev timer
+        # remain registered on the still-live r->pool.
+        #
+        # Both locations emit the status/reason variables so the SECOND pass's
+        # ctx is observable: the variable getters read r->ctx directly, so a
+        # module that cached a ctx pointer across the redirect -- or that failed
+        # to rebuild one -- shows up here rather than as a silent corruption.
+        location /ctxrdr/ {{
+            cache_turbo           main;
+            cache_turbo_key       $host$request_uri;
+            cache_turbo_valid     30s;
+            error_page            404 = /ctxrdr-fallback/page;
+            # Required: without it nginx passes the origin's 404 straight to the
+            # client and error_page never fires, so the redirect under test
+            # never happens at all.
+            proxy_intercept_errors on;
+            add_header            X-CT-Status $cache_turbo_status always;
+            add_header            X-CT-Reason $cache_turbo_serve_reason always;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        location /ctxrdr-fallback/ {{
+            cache_turbo           main;
+            cache_turbo_key       $host$request_uri;
+            cache_turbo_valid     30s;
+            add_header            X-CT-Status $cache_turbo_status always;
+            add_header            X-CT-Reason $cache_turbo_serve_reason always;
+            # NOTE: the upstream path carries a marker UNIQUE to the fallback
+            # leg. (Config is written encoding="ascii" -- keep this block
+            # ASCII-only; a non-ASCII char here fails the whole suite at
+            # config-write time, before a single test runs.)
+            # Both ctxrdr locations strip their own prefix, so a bare
+            # `proxy_pass .../` made the fallback fetch plain `/page` -- and
+            # hits_for("ctxrdr-missing") then counted only the FIRST pass's 404,
+            # never the fallback's origin contact. The "exactly one origin
+            # contact" assertion was true for the wrong reason and would have
+            # stayed 1 however many times the fallback hit the origin. Keep this
+            # marker distinct from every other fixture's path.
+            proxy_pass http://127.0.0.1:{origin_port}/ctxrdr-fb-;
+        }}
+        # Negative control for the CTXRDR test: same variables, but cache_turbo
+        # is NOT enabled, so no ctx is ever created. Both variables must report
+        # "-" here. Without this arm the CTXRDR assertions would pass equally
+        # well against getters that answered from anything but r->ctx.
+        location /ctxrdr-off/ {{
+            add_header            X-CT-Status $cache_turbo_status always;
+            add_header            X-CT-Reason $cache_turbo_serve_reason always;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
@@ -6906,6 +6980,150 @@ def test_bypass_uri_inert_after_internal_redirect(ng: Nginx,
     assert hc1.get("x-ct-status") == "BYPASS", \
         ("cache_turbo_bypass_uri does not match even without a redirect, so "
          f"the test above proves nothing: got {hc1.get('x-ct-status')}")
+
+
+def test_ctx_survives_error_page_internal_redirect(ng: Nginx,
+                                                   origin: Origin) -> None:
+    """CTXRDR: an error_page internal redirect memzeros r->ctx MID-REQUEST,
+    after the access handler has already built one. The module must treat the
+    second pass as a fresh request and must not strand the first ctx's
+    registered teardown.
+
+    Why this shape and not the /ctir* ones: try_files redirects in the REWRITE
+    phase, i.e. BEFORE the PRECONTENT access handler ever runs, so those tests
+    only ever exercise a single ctx built on the post-redirect URI. error_page
+    redirects off the ORIGIN's 404 -- after the access handler built ctx and
+    after the header filter ran. ngx_http_internal_redirect() then does an
+    unconditional `ngx_memzero(r->ctx, ...)` (ngx_http_core_module.c:2614). The
+    one-module-preserving variant in special_response.c:547 is the
+    filter_finalize path and does NOT apply here.
+
+    What that makes safe, and what this pins:
+
+    1. r->pool is NOT reset by the redirect, so the first ctx's pool cleanups
+       (cold_cleanup's stub unstub, blob_cleanup's shm reference drop) and its
+       EMBEDDED cold_wait_ev timer stay registered against memory that is still
+       allocated. They key off the ctx pointer captured in cln->data, never off
+       r->ctx, so dropping r->ctx cannot orphan them -- the cleanups still run
+       at pool destroy and still see the right ctx.
+    2. The second pass re-enters the access handler, finds r->ctx NULL, and
+       pcallocs a FRESH ctx (module.c:4515). No state leaks across the two
+       passes: the fallback must report its own outcome, not the 404 pass's.
+
+    The variable getters read r->ctx directly, which is what makes pass 2's ctx
+    observable from the wire at all."""
+    # Pass 1 404s at the origin -> error_page -> internal redirect -> pass 2
+    # serves the fallback. The client sees the fallback body under the 404's
+    # status-code-preserving redirect.
+    # THE oracle for "did pass 2 park?". Timing alone cannot carry this test:
+    # `elapsed < 2.0` goes vacuous the moment cache_turbo_lock_timeout is
+    # configured below 2s, and it is a proxy for the symptom rather than the
+    # mechanism. lock_waits is bumped once per request that actually ENTERS
+    # cold_wait(), which is precisely the thing CTXRDR must prevent, so an exact
+    # "did not move" is both stronger and immune to a slow runner.
+    waits0 = _admin_lock_waits(ng)
+
+    t0 = time.monotonic()
+    s1, b1, _ = fetch(ng.port, "/ctxrdr/ctxrdr-missing")
+    elapsed1 = time.monotonic() - t0
+    assert s1 == 200, \
+        (f"error_page did not take the internal redirect (got {s1}); the "
+         "fixture, not the module, is wrong -- the rest of this test would be "
+         "vacuous")
+    assert b1, "fallback served an empty body"
+
+    # CTXRDR, the defect this test was written for. $request_uri does not change
+    # across an internal redirect, so BOTH passes hash to the same key. Pass 1
+    # won the cold-miss claim and planted a stub; the redirect then memzeroed
+    # r->ctx, so pass 2's fresh ctx has cold_winner = 0 and used to read that
+    # stub as another request's in-flight fill -- parking in cold_wait() for the
+    # FULL cache_turbo_lock_timeout (5s by default) before giving up and
+    # re-winning. It answered correctly, so only the clock showed it.
+    #
+    # None of the three header/body-filter unstub sites can prevent that: an
+    # intercepted upstream error is finalized inside
+    # ngx_http_upstream_intercept_errors() without traversing the output filter
+    # chain, leaving only the pool cleanup, which runs at teardown -- long after
+    # pass 2 has parked. The fix is _cold_adopt_own_stub(): on CLAIM_LOSER the
+    # request looks for a stub an earlier ctx of ITSELF still owns and adopts it.
+    #
+    # Timing is the assertion because latency IS the symptom. The threshold is
+    # far below the 5s timeout and far above a normal redirect (measured ~8ms),
+    # so it cannot flake into passing on a slow runner the way a tight bound
+    # would.
+    # THE assertion. Not one request may enter cold_wait(): pass 2 adopting its
+    # own stub is exactly the difference between "went straight to origin" and
+    # "parked on itself for the full lock_timeout".
+    assert _admin_lock_waits(ng) - waits0 == 0, \
+        (f"lock_waits moved by {_admin_lock_waits(ng) - waits0}: the "
+         "post-redirect pass PARKED on the cold-miss stub its OWN first pass "
+         "planted. _cold_adopt_own_stub() should have adopted it on "
+         "CLAIM_LOSER instead")
+
+    # Timing is kept as a loose diagnostic only -- it is the client-visible
+    # symptom and makes a failure obvious, but lock_waits above is what proves
+    # the mechanism. Threshold far below the 5s timeout and far above a normal
+    # redirect (~8ms) so it cannot flake on a slow runner.
+    assert elapsed1 < 2.0, \
+        (f"the post-redirect pass took {elapsed1:.2f}s: it parked on the "
+         "cold-miss stub its OWN first pass planted and waited out "
+         "cache_turbo_lock_timeout. _cold_adopt_own_stub() should have adopted "
+         "it on CLAIM_LOSER instead")
+
+    # One origin contact for the FALLBACK body, not two: adoption must make the
+    # second pass the WINNER that goes to origin, not a waiter that eventually
+    # times out and then also goes to origin.
+    #
+    # ⚠ Counted on the fallback's own upstream marker. The obvious spelling --
+    # hits_for("ctxrdr-missing") -- observes only pass 1's 404, because the
+    # fallback location proxies as /ctxrdr-fb-page; it would read 1 no matter
+    # what the fallback leg did.
+    assert origin.hits_for("ctxrdr-fb-") == 1, \
+        ("the fallback leg hit the origin "
+         f"{origin.hits_for('ctxrdr-fb-')} times, expected exactly 1")
+
+    # The post-memzero ctx must have STORED, not merely answered. Note the key
+    # is $host$request_uri and $request_uri is NOT rewritten by the redirect, so
+    # the entry lands under the ORIGINAL /ctxrdr/ctxrdr-missing key -- repeating
+    # that same request is what reads it back, not a direct fetch of the
+    # rewritten /ctxrdr-fallback/page URI (a different key entirely).
+    t1 = time.monotonic()
+    s2, b2, h2 = fetch(ng.port, "/ctxrdr/ctxrdr-missing")
+    elapsed2 = time.monotonic() - t1
+    assert s2 == 200, f"second redirecting request failed: {s2}"
+    assert h2.get("x-ct-status") == "HIT" and b2 == b1, \
+        ("the ctx rebuilt after the r->ctx memzero did not store, so the "
+         "adopted stub never became a real entry (got "
+         f"{h2.get('x-ct-status')}, {b2!r} vs {b1!r})")
+    assert h2.get("x-ct-reason") == "FRESH", \
+        ("$cache_turbo_serve_reason reads r->ctx; a HIT must report FRESH, got "
+         f"{h2.get('x-ct-reason')!r}")
+    assert elapsed2 < 2.0, \
+        f"the cached redirecting request took {elapsed2:.2f}s"
+
+    # Serving that HIT cost no further origin work: still exactly one contact.
+    assert origin.hits_for("ctxrdr-fb-") == 1, \
+        ("the HIT went to the origin anyway: "
+         f"{origin.hits_for('ctxrdr-fb-')} contacts, expected 1")
+
+    # Negative control. The assertions above are only meaningful if the
+    # variables are genuinely sourced from a per-request ctx that this fixture
+    # can move. A location with no cache-turbo ctx at all must report "-": if
+    # this returned MISS/HIT the getters would be answering from something
+    # other than r->ctx and every assertion above would be reading a constant.
+    _, _, hc = fetch(ng.port, "/ctxrdr-off/page")
+    assert hc.get("x-ct-status") in (None, "-"), \
+        ("$cache_turbo_status reports a value on a location where the module "
+         f"never engaged, so it is not reading r->ctx: got "
+         f"{hc.get('x-ct-status')!r}")
+    # Both variables, not just the status one. The HIT above asserts
+    # x-ct-reason == "FRESH", so $cache_turbo_serve_reason carries real weight
+    # here; a getter answering a constant for the reason would sail through
+    # every assertion in this test if only the status arm were controlled.
+    assert hc.get("x-ct-reason") in (None, "-"), \
+        ("$cache_turbo_serve_reason reports a value on a location where the "
+         f"module never engaged, so it is not reading r->ctx: got "
+         f"{hc.get('x-ct-reason')!r}")
 
 
 def test_mediawiki_preset(ng: Nginx, origin: Origin) -> None:
@@ -16692,6 +16910,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_bypass(ng)
     test_bypass_uri(ng)
     test_bypass_uri_inert_after_internal_redirect(ng, origin)
+    test_ctx_survives_error_page_internal_redirect(ng, origin)
     test_backend_prefix_subdir(ng)
     test_require_header(ng)
     test_key_cookie(ng)
