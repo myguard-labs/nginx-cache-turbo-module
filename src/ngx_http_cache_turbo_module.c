@@ -62,6 +62,9 @@ static void ngx_http_cache_turbo_cold_wait_cleanup(void *data);
 static void ngx_http_cache_turbo_cold_mark_winner(ngx_http_request_t *r,
     ngx_http_cache_turbo_ctx_t *ctx, ngx_http_cache_turbo_zone_t *z);
 static void ngx_http_cache_turbo_cold_cleanup(void *data);
+static ngx_int_t ngx_http_cache_turbo_cold_adopt_own_stub(
+    ngx_http_request_t *r, ngx_http_cache_turbo_ctx_t *ctx,
+    ngx_http_cache_turbo_zone_t *z);
 static ngx_int_t ngx_http_cache_turbo_send_json(ngx_http_request_t *r,
     ngx_uint_t status, ngx_str_t *body);
 
@@ -5814,6 +5817,20 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
         }
 
         if (cl == NGX_HTTP_CACHE_TURBO_CLAIM_LOSER) {
+            /* CTXRDR: we may have LOST to ourselves. An internal redirect
+             * (error_page / X-Accel-Redirect) memzeros r->ctx mid-request, so a
+             * second pass over a key that is stable across the redirect finds
+             * the stub its own first pass planted and would otherwise park on
+             * it for the full lock_timeout. Adopt it and proceed as the winner
+             * we already are. */
+            if (ngx_http_cache_turbo_cold_adopt_own_stub(r, ctx, z) == NGX_OK) {
+                ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                               "cache_turbo: cold-miss adopted OWN stub across "
+                               "internal redirect \"%V\" key=%ui",
+                               &r->uri, (ngx_uint_t) hash);
+                return NGX_DECLINED;      /* go to origin as the winner */
+            }
+
             return ngx_http_cache_turbo_cold_wait(r, clcf, z, ctx);
         }
 
@@ -6043,6 +6060,90 @@ ngx_http_cache_turbo_cold_mark_winner(ngx_http_request_t *r,
     }
     cln->handler = ngx_http_cache_turbo_cold_cleanup;
     cln->data = ctx;
+}
+
+
+/*
+ * CTXRDR: find a cold-miss stub that an EARLIER ctx of THIS SAME REQUEST is
+ * still holding for `key_hash`, and hand its ownership to `ctx`.
+ *
+ * An internal redirect (error_page, X-Accel-Redirect, a rewrite that reaches a
+ * new location) memzeros r->ctx unconditionally -- ngx_http_core_module.c:2614,
+ * and the one-module-preserving variant at special_response.c:547 is the
+ * filter_finalize path, not this one. r->pool is NOT reset, so a ctx that won a
+ * claim before the redirect keeps its pool cleanup and its cold_winner/cold_zone
+ * state, but the access handler on the second pass sees r->ctx == NULL, pcallocs
+ * a FRESH ctx (cold_winner = 0), and no longer knows the request owns the stub.
+ *
+ * With a key that is stable across the redirect -- $request_uri, the form every
+ * doc here recommends precisely because it survives one -- both passes hash to
+ * the same key, so the second pass finds its OWN stub, reads it as another
+ * request's in-flight fill, and parks in cold_wait() until lock_timeout (5s by
+ * default) before giving up and re-winning. The request answers correctly but
+ * pays the full timeout, and none of the three header/body-filter unstub sites
+ * can prevent it: an intercepted error is finalized by
+ * ngx_http_upstream_intercept_errors() without traversing the output filter
+ * chain at all, so only the pool cleanup remains and that runs at teardown --
+ * long after the second pass has already parked.
+ *
+ * The cleanup list is the authority rather than a new ctx/request field: it is
+ * already the request-lifetime record of "this ctx owns an unresolved stub",
+ * it is exactly what the redirect leaves intact, and reusing it keeps one
+ * source of truth instead of two that can disagree. The list is short (a
+ * handful of entries per request) and this runs only on the CLAIM_LOSER path.
+ */
+static ngx_int_t
+ngx_http_cache_turbo_cold_adopt_own_stub(ngx_http_request_t *r,
+    ngx_http_cache_turbo_ctx_t *ctx, ngx_http_cache_turbo_zone_t *z)
+{
+    ngx_pool_cleanup_t          *c;
+    ngx_http_cache_turbo_ctx_t  *prev;
+
+    for (c = r->pool->cleanup; c; c = c->next) {
+        if (c->handler != ngx_http_cache_turbo_cold_cleanup) {
+            continue;
+        }
+
+        prev = c->data;
+
+        if (prev == NULL || prev == ctx) {
+            continue;
+        }
+
+        /* Same key, same zone, and the stub is still unresolved: this request
+         * already owns it. Compare the full 32-byte key -- the rbtree's crc32
+         * is collision-prone by design, and adopting on a collision would clear
+         * a DIFFERENT key's stub. */
+        if (prev->cold_winner
+            && !prev->cold_stored
+            && prev->cold_zone == z
+            && ngx_memcmp(prev->key_hash, ctx->key_hash, 32) == 0)
+        {
+            /* Transfer ownership to the live ctx. The old cleanup stays
+             * registered but is now inert (cold_stored = 1), so the stub is
+             * resolved exactly once, by whichever ctx is current. */
+            prev->cold_stored = 1;
+
+            ctx->cold_winner = 1;
+            ctx->cold_zone = z;
+            /* Register a cleanup for the adopting ctx: the old one is now
+             * inert, and the stub must still be cleared at teardown if this
+             * ctx never resolves it either. Same backstop the original had. */
+            {
+                ngx_pool_cleanup_t  *cln;
+
+                cln = ngx_pool_cleanup_add(r->pool, 0);
+                if (cln != NULL) {
+                    cln->handler = ngx_http_cache_turbo_cold_cleanup;
+                    cln->data = ctx;
+                }
+            }
+
+            return NGX_OK;
+        }
+    }
+
+    return NGX_DECLINED;
 }
 
 
