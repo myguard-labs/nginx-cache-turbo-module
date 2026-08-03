@@ -60,7 +60,8 @@ static ngx_int_t ngx_http_cache_turbo_cold_wait(ngx_http_request_t *r,
 static void ngx_http_cache_turbo_cold_wait_timeout(ngx_event_t *ev);
 static void ngx_http_cache_turbo_cold_wait_cleanup(void *data);
 static void ngx_http_cache_turbo_cold_mark_winner(ngx_http_request_t *r,
-    ngx_http_cache_turbo_ctx_t *ctx, ngx_http_cache_turbo_zone_t *z);
+    ngx_http_cache_turbo_ctx_t *ctx, ngx_http_cache_turbo_zone_t *z,
+    uint64_t owner);
 static void ngx_http_cache_turbo_cold_cleanup(void *data);
 static ngx_int_t ngx_http_cache_turbo_cold_adopt_own_stub(
     ngx_http_request_t *r, ngx_http_cache_turbo_ctx_t *ctx,
@@ -5096,6 +5097,14 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                 }
                 ngx_memcpy(snap, ctn->data, snap_len);
 
+                /* CTXRDR-ADOPT-LEASE: deliberately NO refresh_owner here. This is
+                 * the v8 background-update lease on an ENTRY that still has a
+                 * body, not the cold-miss stub lease. It is resolved by store()
+                 * overwriting the node, never by unstub() -- which ignores an
+                 * ENTRY (kind == COUNTER is required) -- and it is never adopted
+                 * across a redirect, because a request holding it is serving
+                 * stale rather than parking in cold_wait(). The two leases share
+                 * the `refreshing` flag and nothing else. */
                 ctn->refreshing = 1;
                 ctn->refresh_lock_until = now + lock_ttl;
                 ngx_shmtx_unlock(&z->shpool->mutex);
@@ -5743,6 +5752,7 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
     if (clcf->lock) {
         time_t     lock_ttl = clcf->lock_ttl;
         ngx_int_t  cl;
+        uint64_t   claim_owner = 0;   /* CTXRDR-ADOPT-LEASE: set on CLAIM_WINNER */
 
         if (lock_ttl <= 0) {
             lock_ttl = 5;
@@ -5766,7 +5776,9 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
         if (ctx->lock_done) {
             if (ctx->lock_result == NGX_OK || ctx->lock_result == NGX_ERROR) {
                 (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
-                ngx_http_cache_turbo_cold_mark_winner(r, ctx, z);
+                /* Cross-node win via the L2 NX lock: no L1 lease was taken, so
+                 * there is no owner token to carry (CTXRDR-ADOPT-LEASE). */
+                ngx_http_cache_turbo_cold_mark_winner(r, ctx, z, 0);
                 ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                                "cache_turbo: cold-miss cross-node WON%s \"%V\" "
                                "key=%ui -> origin",
@@ -5780,7 +5792,7 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
             return ngx_http_cache_turbo_cold_wait(r, clcf, z, ctx);
         }
 
-        cl = clcf->l1->claim(z, ctx->key_hash, hash, lock_ttl);
+        cl = clcf->l1->claim(z, ctx->key_hash, hash, lock_ttl, &claim_owner);
 
         if (cl == NGX_HTTP_CACHE_TURBO_CLAIM_FRESH) {
             /* A real fresh entry raced in while we were on the cold path
@@ -5849,7 +5861,7 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
         }
 
         (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
-        ngx_http_cache_turbo_cold_mark_winner(r, ctx, z);
+        ngx_http_cache_turbo_cold_mark_winner(r, ctx, z, claim_owner);
         ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "cache_turbo: cold-miss single-box WON \"%V\" key=%ui "
                        "-> origin", &r->uri, (ngx_uint_t) hash);
@@ -6043,7 +6055,8 @@ ngx_http_cache_turbo_cold_wait_cleanup(void *data)
  * most once). */
 static void
 ngx_http_cache_turbo_cold_mark_winner(ngx_http_request_t *r,
-    ngx_http_cache_turbo_ctx_t *ctx, ngx_http_cache_turbo_zone_t *z)
+    ngx_http_cache_turbo_ctx_t *ctx, ngx_http_cache_turbo_zone_t *z,
+    uint64_t owner)
 {
     ngx_pool_cleanup_t  *cln;
 
@@ -6053,6 +6066,11 @@ ngx_http_cache_turbo_cold_mark_winner(ngx_http_request_t *r,
 
     ctx->cold_winner = 1;
     ctx->cold_zone = z;
+    /* CTXRDR-ADOPT-LEASE: the lease token claim() issued to us, or 0 when this
+     * win did not come with an L1 lease (the cross-node L2 path, and the
+     * out-of-slab claim that could not create a node). 0 is inert everywhere:
+     * such a winner stores normally but never clears anyone's lease. */
+    ctx->cold_owner = owner;
 
     cln = ngx_pool_cleanup_add(r->pool, 0);
     if (cln == NULL) {
@@ -6086,11 +6104,26 @@ ngx_http_cache_turbo_cold_mark_winner(ngx_http_request_t *r,
  * chain at all, so only the pool cleanup remains and that runs at teardown --
  * long after the second pass has already parked.
  *
- * The cleanup list is the authority rather than a new ctx/request field: it is
- * already the request-lifetime record of "this ctx owns an unresolved stub",
- * it is exactly what the redirect leaves intact, and reusing it keeps one
- * source of truth instead of two that can disagree. The list is short (a
- * handful of entries per request) and this runs only on the CLAIM_LOSER path.
+ * The cleanup list is the authority for WHICH ctx of this request last held a
+ * stub for the key: it is already the request-lifetime record of "this ctx owns
+ * an unresolved stub", it is exactly what the redirect leaves intact, and
+ * reusing it keeps one source of truth instead of two that can disagree. The
+ * list is short (a handful of entries per request) and this runs only on the
+ * CLAIM_LOSER path.
+ *
+ * ⚠ CTXRDR-ADOPT-LEASE -- the cleanup list is NOT sufficient on its own, and an
+ * earlier version of this function that stopped there was wrong. cold_winner +
+ * !cold_stored + zone + key prove only that this request owned a stub for this
+ * key at SOME point. They cannot prove it owns the live one, because claim()
+ * deliberately re-leases a stub whose refresh_lock_until has passed to a
+ * different request, and CLAIM_LOSER is the zone telling us authoritatively that
+ * someone else holds it NOW. Overriding that on stale request-local state let
+ * two requests regenerate concurrently and let the loser's unstub() clear the
+ * winner's live lease -- single-flight broken and the origin stampeded, exactly
+ * during the origin slowness that opened the window.
+ *
+ * So the cleanup list only nominates a candidate; shm_owns() adjudicates it
+ * against the zone under the mutex. Both must agree before we adopt.
  */
 static ngx_int_t
 ngx_http_cache_turbo_cold_adopt_own_stub(ngx_http_request_t *r,
@@ -6119,25 +6152,33 @@ ngx_http_cache_turbo_cold_adopt_own_stub(ngx_http_request_t *r,
             && prev->cold_zone == z
             && ngx_memcmp(prev->key_hash, ctx->key_hash, 32) == 0)
         {
-            /* Transfer ownership to the live ctx. The old cleanup stays
-             * registered but is now inert (cold_stored = 1), so the stub is
-             * resolved exactly once, by whichever ctx is current. */
-            prev->cold_stored = 1;
+            /* The candidate held a stub for this key. Now ask the ZONE whether
+             * that lease is still ours, rather than assuming it from the above.
+             * A mismatch means claim() re-leased it (or store()/unstub() already
+             * resolved it) and CLAIM_LOSER was right: fall through, keep
+             * searching, and ultimately wait like any other loser. */
+            if (ngx_http_cache_turbo_shm_owns(z, ctx->key_hash,
+                    ngx_crc32_short(ctx->key_hash, 32),
+                    prev->cold_owner) != NGX_OK)
+            {
+                continue;
+            }
 
+            /* Transfer ownership to the live ctx, INCLUDING the lease token --
+             * without it the adopting ctx could not prove ownership to unstub()
+             * and would leave the stub to expire on its own. Retarget this very
+             * cleanup instead of registering a second one: the entry is already
+             * in the list, so ownership moves with a single store that cannot
+             * fail, and there is exactly one cleanup per live stub. The earlier
+             * shape (mark inert + ngx_pool_cleanup_add) could fail its
+             * allocation AFTER disarming the old entry and still return NGX_OK,
+             * leaving an adopted stub with no teardown owner at all. */
             ctx->cold_winner = 1;
             ctx->cold_zone = z;
-            /* Register a cleanup for the adopting ctx: the old one is now
-             * inert, and the stub must still be cleared at teardown if this
-             * ctx never resolves it either. Same backstop the original had. */
-            {
-                ngx_pool_cleanup_t  *cln;
+            ctx->cold_owner = prev->cold_owner;
 
-                cln = ngx_pool_cleanup_add(r->pool, 0);
-                if (cln != NULL) {
-                    cln->handler = ngx_http_cache_turbo_cold_cleanup;
-                    cln->data = ctx;
-                }
-            }
+            prev->cold_stored = 1;   /* the old ctx no longer owns anything */
+            c->data = ctx;           /* ...and this cleanup now speaks for us */
 
             return NGX_OK;
         }
@@ -6161,7 +6202,8 @@ ngx_http_cache_turbo_cold_cleanup(void *data)
     }
 
     hash = ngx_crc32_short(ctx->key_hash, 32);
-    ngx_http_cache_turbo_shm_unstub(ctx->cold_zone, ctx->key_hash, hash);
+    ngx_http_cache_turbo_shm_unstub(ctx->cold_zone, ctx->key_hash, hash,
+                                    ctx->cold_owner);
 }
 
 
@@ -7637,7 +7679,8 @@ ngx_http_cache_turbo_header_filter(ngx_http_request_t *r)
             {
                 uint32_t  h = ngx_crc32_short(ctx->key_hash, 32);
                 ngx_http_cache_turbo_shm_unstub(ctx->cold_zone,
-                                                ctx->key_hash, h);
+                                                ctx->key_hash, h,
+                                                ctx->cold_owner);
                 ctx->cold_stored = 1;
             }
 
@@ -7705,7 +7748,8 @@ ngx_http_cache_turbo_header_filter(ngx_http_request_t *r)
         && ctx->cold_zone != NULL)
     {
         uint32_t  hash = ngx_crc32_short(ctx->key_hash, 32);
-        ngx_http_cache_turbo_shm_unstub(ctx->cold_zone, ctx->key_hash, hash);
+        ngx_http_cache_turbo_shm_unstub(ctx->cold_zone, ctx->key_hash, hash,
+                                        ctx->cold_owner);
         ctx->cold_stored = 1;
     }
 
@@ -8291,7 +8335,8 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
                 && ngx_memcmp(store_key, ctx->key_hash, 32) != 0)
             {
                 ngx_http_cache_turbo_shm_unstub(z, ctx->key_hash,
-                                   ngx_crc32_short(ctx->key_hash, 32));
+                                   ngx_crc32_short(ctx->key_hash, 32),
+                                   ctx->cold_owner);
             }
 
             (void) clcf->l1->store(z, store_key, hash,

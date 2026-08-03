@@ -62,6 +62,7 @@ typedef struct {
     time_t              fresh_until;
     time_t              stale_until;
     ngx_uint_t          refreshing;
+    uint64_t            refresh_owner;   /* CTXRDR-ADOPT-LEASE lease identity */
     time_t              refresh_lock_until;
     ngx_uint_t          miss_count;
     time_t              l2_neg_until;
@@ -191,6 +192,7 @@ typedef struct {
     ngx_uint_t          n_entries;
     ngx_atomic_t        hits, misses, stale_serves, refreshes, evictions;
     ngx_atomic_t        l2_hits, l2_misses, lock_waits;
+    uint64_t            owner_seq;       /* CTXRDR-ADOPT-LEASE token source */
     ngx_atomic_t        min_uses_skips, l2_neg_skips, bypasses;
     ngx_atomic_t        breaker_state, breaker_fails, breaker_window_start;
     ngx_atomic_t        breaker_opened_at, breaker_probe, breaker_opens;
@@ -311,6 +313,11 @@ static int tests_run, tests_failed;
 static ngx_http_cache_turbo_shctx_t  g_sh;
 static ngx_slab_pool_t               g_pool;
 static ngx_http_cache_turbo_zone_t   g_zone;
+
+/* CTXRDR-ADOPT-LEASE: scratch for claim()'s owner-token out-param. Tests that
+ * care about the token read it right after the call; the rest just need
+ * somewhere for it to land. */
+static uint64_t                      g_owner;
 
 /* Whether g_sh currently holds an initialised LRU list. A zeroed g_sh has
  * lru.prev == NULL, and ngx_queue_empty() (h == h->prev) reads FALSE against
@@ -718,7 +725,7 @@ test_cr_a_memo_survives_claim(void)
     /* Request 1 continues into the cold-miss single-flight and wins, which
      * turns the SAME node into a stub. This is the exact transition CR-A is
      * about: before the fix, claim() cleared l2_neg_until here. */
-    rc = ngx_http_cache_turbo_shm_claim(&g_zone, KEY(0), 5);
+    rc = ngx_http_cache_turbo_shm_claim(&g_zone, KEY(0), 5, &g_owner);
     CHECK(rc == NGX_HTTP_CACHE_TURBO_CLAIM_WINNER, "first claim should win");
     CHECK(ngx_test_lock_balanced(), "claim left the zone mutex held");
 
@@ -775,8 +782,9 @@ test_cr_b_unstub_preserves_counter(void)
      * non-cacheable, so unstub() runs. */
     ctn->refreshing         = 1;
     ctn->refresh_lock_until = ngx_test_now + 5;
+    ctn->refresh_owner      = ++g_sh.owner_seq;   /* CTXRDR-ADOPT-LEASE */
 
-    ngx_http_cache_turbo_shm_unstub(&g_zone, KEY(0));
+    ngx_http_cache_turbo_shm_unstub(&g_zone, KEY(0), ctn->refresh_owner);
     CHECK(ngx_test_lock_balanced(), "unstub left the zone mutex held");
 
     /* Job 1, unconditional: the single-flight is released. Skipping this is the
@@ -802,8 +810,9 @@ test_cr_b_unstub_preserves_counter(void)
     CHECK(ctn->miss_count == 0, "memo node should have no misses");
     ctn->refreshing         = 1;
     ctn->refresh_lock_until = ngx_test_now + 5;
+    ctn->refresh_owner      = ++g_sh.owner_seq;   /* CTXRDR-ADOPT-LEASE */
 
-    ngx_http_cache_turbo_shm_unstub(&g_zone, KEY(1));
+    ngx_http_cache_turbo_shm_unstub(&g_zone, KEY(1), ctn->refresh_owner);
     ctn = find(1);
     REQUIRE(ctn != NULL, "CR-B: unstub() freed a COUNTER holding a live memo");
     CHECK(ctn->refreshing == 0, "unstub did not release the single-flight");
@@ -813,9 +822,9 @@ test_cr_b_unstub_preserves_counter(void)
     /* The disposable case must still be reclaimed, or unstub() leaks stubs:
      * a bare stub with no miss_count and no live memo goes away entirely. */
     zone_reset();
-    CHECK(ngx_http_cache_turbo_shm_claim(&g_zone, KEY(2), 5)
+    CHECK(ngx_http_cache_turbo_shm_claim(&g_zone, KEY(2), 5, &g_owner)
               == NGX_HTTP_CACHE_TURBO_CLAIM_WINNER, "claim should win");
-    ngx_http_cache_turbo_shm_unstub(&g_zone, KEY(2));
+    ngx_http_cache_turbo_shm_unstub(&g_zone, KEY(2), g_owner);
     CHECK(find(2) == NULL, "unstub() failed to reclaim a disposable stub");
 
     /* An expired memo does not count as state worth keeping. */
@@ -825,8 +834,9 @@ test_cr_b_unstub_preserves_counter(void)
     REQUIRE(ctn != NULL, "l2_neg_set did not create the expiring memo node");
     ctn->refreshing         = 1;
     ctn->refresh_lock_until = ngx_test_now + 5;
+    ctn->refresh_owner      = ++g_sh.owner_seq;   /* CTXRDR-ADOPT-LEASE */
     ngx_test_advance_time(11);                  /* memo now expired */
-    ngx_http_cache_turbo_shm_unstub(&g_zone, KEY(3));
+    ngx_http_cache_turbo_shm_unstub(&g_zone, KEY(3), ctn->refresh_owner);
     CHECK(find(3) == NULL,
           "unstub() kept a stub whose memo had already expired");
 }
@@ -842,11 +852,11 @@ test_claim_single_flight(void)
     printf("claim(): single-flight winner/loser/self-heal\n");
     zone_reset();
 
-    rc = ngx_http_cache_turbo_shm_claim(&g_zone, KEY(0), 5);
+    rc = ngx_http_cache_turbo_shm_claim(&g_zone, KEY(0), 5, &g_owner);
     CHECK(rc == NGX_HTTP_CACHE_TURBO_CLAIM_WINNER, "first claim should win");
 
     /* Second claim while the lock is live: park, do not stampede the origin. */
-    rc = ngx_http_cache_turbo_shm_claim(&g_zone, KEY(0), 5);
+    rc = ngx_http_cache_turbo_shm_claim(&g_zone, KEY(0), 5, &g_owner);
     CHECK(rc == NGX_HTTP_CACHE_TURBO_CLAIM_LOSER,
           "second claim should lose while the lock is live");
 
@@ -854,10 +864,101 @@ test_claim_single_flight(void)
      * next arrival takes over -- otherwise a crashed worker blocks a key
      * forever. */
     ngx_test_advance_time(6);
-    rc = ngx_http_cache_turbo_shm_claim(&g_zone, KEY(0), 5);
+    rc = ngx_http_cache_turbo_shm_claim(&g_zone, KEY(0), 5, &g_owner);
     CHECK(rc == NGX_HTTP_CACHE_TURBO_CLAIM_WINNER,
           "claim did not self-heal past an expired lock");
     CHECK(ngx_test_lock_balanced(), "claim left the zone mutex held");
+}
+
+/*
+ * CTXRDR-ADOPT-LEASE. The lease is a single-writer resource with rollover, so
+ * "am I the winner?" is only answerable by identity, never by the flags.
+ *
+ * This is the unit-level oracle for the concurrency defect the PR #202 review
+ * found: A wins, A's lease expires, B takes it over, and A then finishes. A
+ * must not be able to (a) conclude it still owns the key, or (b) clear B's live
+ * lease. Both were possible when unstub() matched on kind + refreshing alone.
+ *
+ * Negative control: drop `&& ctn->refresh_owner == owner` from unstub() (or the
+ * token compare in owns()) and the CHECKs below fail -- they are written so the
+ * buggy behaviour is observable, not merely unproven.
+ */
+static void
+test_lease_owner_identity(void)
+{
+    ngx_int_t                     rc;
+    uint64_t                      owner_a, owner_b;
+    ngx_http_cache_turbo_node_t  *ctn;
+
+    printf("claim()/unstub(): lease ownership survives rollover\n");
+    zone_reset();
+
+    /* A wins the cold-miss lease and is issued a token. */
+    rc = ngx_http_cache_turbo_shm_claim(&g_zone, KEY(0), 5, &owner_a);
+    REQUIRE(rc == NGX_HTTP_CACHE_TURBO_CLAIM_WINNER, "A should win the claim");
+    CHECK(owner_a != 0, "claim() issued no owner token to the winner");
+    CHECK(ngx_http_cache_turbo_shm_owns(&g_zone, KEY(0), owner_a) == NGX_OK,
+          "the winner does not own the lease it was just issued");
+
+    /* A's lease expires; B takes over as the new single regenerator. This is
+     * claim()'s deliberate self-heal, and the moment A's token goes stale. */
+    ngx_test_advance_time(6);
+    rc = ngx_http_cache_turbo_shm_claim(&g_zone, KEY(0), 5, &owner_b);
+    REQUIRE(rc == NGX_HTTP_CACHE_TURBO_CLAIM_WINNER, "B should take over");
+    CHECK(owner_b != 0 && owner_b != owner_a,
+          "takeover reused the previous owner token (ABA: a stale holder would "
+          "still match, which is the whole defect)");
+
+    /* (a) A must no longer believe it owns the key. Adoption across an internal
+     * redirect asks exactly this question. */
+    CHECK(ngx_http_cache_turbo_shm_owns(&g_zone, KEY(0), owner_a) != NGX_OK,
+          "a re-leased key still reports the OLD holder as owner");
+    CHECK(ngx_http_cache_turbo_shm_owns(&g_zone, KEY(0), owner_b) == NGX_OK,
+          "the current holder does not own the lease");
+
+    /* (b) A finishes non-cacheable and runs unstub(). B's lease must survive:
+     * clearing it here frees every waiter to stampede the origin at once. */
+    ngx_http_cache_turbo_shm_unstub(&g_zone, KEY(0), owner_a);
+    CHECK(ngx_test_lock_balanced(), "unstub left the zone mutex held");
+
+    ctn = find(0);
+    REQUIRE(ctn != NULL, "a stale unstub() FREED the live winner's node");
+    CHECK(ctn->refreshing == 1,
+          "a stale unstub() cleared the CURRENT winner's lease "
+          "(single-flight broken, origin stampede)");
+    CHECK(ctn->refresh_owner == owner_b, "B's lease identity was overwritten");
+
+    /* And a third arrival still parks rather than becoming a second
+     * regenerator -- the single-flight is genuinely intact, not just flagged. */
+    CHECK(ngx_http_cache_turbo_shm_claim(&g_zone, KEY(0), 5, &g_owner)
+              == NGX_HTTP_CACHE_TURBO_CLAIM_LOSER,
+          "a third request won a lease B still holds");
+
+    /* B's own unstub() does work -- the guard rejects stale holders, not all. */
+    ngx_http_cache_turbo_shm_unstub(&g_zone, KEY(0), owner_b);
+    CHECK(find(0) == NULL, "the true holder could not release its own lease");
+
+    /* A zero token is inert: the cross-node winner and the out-of-slab winner
+     * both carry 0, and neither may clear a lease it never took. */
+    zone_reset();
+    rc = ngx_http_cache_turbo_shm_claim(&g_zone, KEY(1), 5, &owner_a);
+    REQUIRE(rc == NGX_HTTP_CACHE_TURBO_CLAIM_WINNER, "claim should win");
+    ngx_http_cache_turbo_shm_unstub(&g_zone, KEY(1), 0);
+    ctn = find(1);
+    REQUIRE(ctn != NULL, "a 0-token unstub() freed someone else's stub");
+    CHECK(ctn->refreshing == 1, "a 0-token unstub() cleared a live lease");
+    CHECK(ngx_http_cache_turbo_shm_owns(&g_zone, KEY(1), 0) != NGX_OK,
+          "a 0 token reported ownership");
+
+    /* store() resolving the stub ends the lease, so the winner's own late
+     * unstub() finds nothing to clear rather than re-opening a fresh entry. */
+    ctn->kind        = NGX_HTTP_CACHE_TURBO_NODE_ENTRY;
+    ctn->len         = 128;
+    ctn->refreshing  = 0;
+    ctn->refresh_owner = 0;
+    CHECK(ngx_http_cache_turbo_shm_owns(&g_zone, KEY(1), owner_a) != NGX_OK,
+          "a resolved lease still reports its old holder as owner");
+    ctn->len = 0;   /* keep zone_reset()'s drain off the blob path */
 }
 
 static void
@@ -881,6 +982,7 @@ test_count_miss_semantics(void)
     REQUIRE(ctn != NULL, "count_miss fixture: live-stub node missing");
     ctn->refreshing         = 1;
     ctn->refresh_lock_until = ngx_test_now + 5;
+    ctn->refresh_owner      = ++g_sh.owner_seq;   /* CTXRDR-ADOPT-LEASE */
     CHECK(ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(1), 4) == NGX_OK,
           "a live stub should pass through as NGX_OK");
     CHECK(ctn->miss_count == 1, "a live stub must not be counted");
@@ -937,7 +1039,7 @@ test_out_of_slab_fails_open(void)
 
     /* claim() likewise: regenerate without a single-flight marker rather than
      * park a request on a stub that can never be created. */
-    CHECK(ngx_http_cache_turbo_shm_claim(&g_zone, KEY(1), 5)
+    CHECK(ngx_http_cache_turbo_shm_claim(&g_zone, KEY(1), 5, &g_owner)
               == NGX_HTTP_CACHE_TURBO_CLAIM_WINNER,
           "claim must fail open (winner) when the slab is exhausted");
     CHECK(ngx_test_lock_balanced(), "a failed alloc leaked the zone mutex");
@@ -2815,7 +2917,7 @@ run_negative_controls(void)
     /* CR-A restored: clear l2_neg_until at the claim() takeover point. */
     zone_reset();
     ngx_http_cache_turbo_shm_l2_neg_set(&g_zone, KEY(0), 60);
-    ngx_http_cache_turbo_shm_claim(&g_zone, KEY(0), 5);
+    ngx_http_cache_turbo_shm_claim(&g_zone, KEY(0), 5, &g_owner);
     ctn = find(0);
     REQUIRE(ctn != NULL, "CR-A control fixture: memo node missing after claim");
     ctn->l2_neg_until = 0;                     /* <-- the bug */
@@ -2851,6 +2953,47 @@ run_negative_controls(void)
         tests_failed++;
         fprintf(stderr, "  ✗ CONTROL CR-B: min_uses progress survived the bug — "
                         "test_cr_b_unstub_preserves_counter guards nothing\n");
+    }
+
+    /* CTXRDR-ADOPT-LEASE restored: release the single-flight on kind +
+     * refreshing ALONE, which is what unstub() did before the owner token. The
+     * bug is injected into REAL shared state -- A's stale view clearing the
+     * lease B currently holds -- and then the REAL claim() is asked for its
+     * verdict, so the control cannot pass by asserting its own arithmetic. */
+    zone_reset();
+    {
+        uint64_t  owner_a, owner_b, owner_c;
+
+        ngx_http_cache_turbo_shm_claim(&g_zone, KEY(2), 5, &owner_a);
+        ngx_test_advance_time(6);                  /* A's lease expires */
+        ngx_http_cache_turbo_shm_claim(&g_zone, KEY(2), 5, &owner_b);
+        REQUIRE(owner_a != owner_b,
+                "CTXRDR control fixture: takeover did not re-issue the lease");
+
+        ctn = find(2);
+        REQUIRE(ctn != NULL, "CTXRDR control fixture: leased node missing");
+
+        /* A calls unstub() with its STALE token. The shipped guard rejects it;
+         * this is the predicate without the identity test. */
+        if (ctn->kind == NGX_HTTP_CACHE_TURBO_NODE_COUNTER
+            && ctn->refreshing)                    /* <-- the bug: no owner test */
+        {
+            ctn->refreshing = 0;
+            ctn->refresh_lock_until = 0;
+            ctn->refresh_owner = 0;
+        }
+
+        /* With the bug, B's lease is gone and the next arrival WINS -- two
+         * regenerators on one key. With the fix, it still parks. */
+        caught = (ngx_http_cache_turbo_shm_claim(&g_zone, KEY(2), 5, &owner_c)
+                      == NGX_HTTP_CACHE_TURBO_CLAIM_WINNER);
+        tests_run++;
+        if (!caught) {
+            tests_failed++;
+            fprintf(stderr, "  ✗ CONTROL CTXRDR-ADOPT-LEASE: single-flight held "
+                            "with the bug restored — test_lease_owner_identity "
+                            "guards nothing\n");
+        }
     }
 
     /* --- P6/O4.1 breaker controls ------------------------------------- */
@@ -3289,6 +3432,7 @@ main(void)
     test_cr_a_memo_survives_claim();
     test_cr_b_unstub_preserves_counter();
     test_claim_single_flight();
+    test_lease_owner_identity();
     test_count_miss_semantics();
     test_l2_neg_never_on_entry();
     test_out_of_slab_fails_open();

@@ -3735,7 +3735,18 @@ http {{
             cache_turbo_valid     30s;
             add_header            X-CT-Status $cache_turbo_status always;
             add_header            X-CT-Reason $cache_turbo_serve_reason always;
-            proxy_pass http://127.0.0.1:{origin_port}/;
+            # NOTE: the upstream path carries a marker UNIQUE to the fallback
+            # leg. (Config is written encoding="ascii" -- keep this block
+            # ASCII-only; a non-ASCII char here fails the whole suite at
+            # config-write time, before a single test runs.)
+            # Both ctxrdr locations strip their own prefix, so a bare
+            # `proxy_pass .../` made the fallback fetch plain `/page` -- and
+            # hits_for("ctxrdr-missing") then counted only the FIRST pass's 404,
+            # never the fallback's origin contact. The "exactly one origin
+            # contact" assertion was true for the wrong reason and would have
+            # stayed 1 however many times the fallback hit the origin. Keep this
+            # marker distinct from every other fixture's path.
+            proxy_pass http://127.0.0.1:{origin_port}/ctxrdr-fb-;
         }}
         # Negative control for the CTXRDR test: same variables, but cache_turbo
         # is NOT enabled, so no ctx is ever created. Both variables must report
@@ -7004,6 +7015,14 @@ def test_ctx_survives_error_page_internal_redirect(ng: Nginx,
     # Pass 1 404s at the origin -> error_page -> internal redirect -> pass 2
     # serves the fallback. The client sees the fallback body under the 404's
     # status-code-preserving redirect.
+    # THE oracle for "did pass 2 park?". Timing alone cannot carry this test:
+    # `elapsed < 2.0` goes vacuous the moment cache_turbo_lock_timeout is
+    # configured below 2s, and it is a proxy for the symptom rather than the
+    # mechanism. lock_waits is bumped once per request that actually ENTERS
+    # cold_wait(), which is precisely the thing CTXRDR must prevent, so an exact
+    # "did not move" is both stronger and immune to a slow runner.
+    waits0 = _admin_lock_waits(ng)
+
     t0 = time.monotonic()
     s1, b1, _ = fetch(ng.port, "/ctxrdr/ctxrdr-missing")
     elapsed1 = time.monotonic() - t0
@@ -7032,18 +7051,36 @@ def test_ctx_survives_error_page_internal_redirect(ng: Nginx,
     # far below the 5s timeout and far above a normal redirect (measured ~8ms),
     # so it cannot flake into passing on a slow runner the way a tight bound
     # would.
+    # THE assertion. Not one request may enter cold_wait(): pass 2 adopting its
+    # own stub is exactly the difference between "went straight to origin" and
+    # "parked on itself for the full lock_timeout".
+    assert _admin_lock_waits(ng) - waits0 == 0, \
+        (f"lock_waits moved by {_admin_lock_waits(ng) - waits0}: the "
+         "post-redirect pass PARKED on the cold-miss stub its OWN first pass "
+         "planted. _cold_adopt_own_stub() should have adopted it on "
+         "CLAIM_LOSER instead")
+
+    # Timing is kept as a loose diagnostic only -- it is the client-visible
+    # symptom and makes a failure obvious, but lock_waits above is what proves
+    # the mechanism. Threshold far below the 5s timeout and far above a normal
+    # redirect (~8ms) so it cannot flake on a slow runner.
     assert elapsed1 < 2.0, \
         (f"the post-redirect pass took {elapsed1:.2f}s: it parked on the "
          "cold-miss stub its OWN first pass planted and waited out "
          "cache_turbo_lock_timeout. _cold_adopt_own_stub() should have adopted "
          "it on CLAIM_LOSER instead")
 
-    # One origin contact for the fallback body, not two: adoption must make the
+    # One origin contact for the FALLBACK body, not two: adoption must make the
     # second pass the WINNER that goes to origin, not a waiter that eventually
     # times out and then also goes to origin.
-    assert origin.hits_for("ctxrdr-missing") == 1, \
-        ("the redirecting request hit the origin "
-         f"{origin.hits_for('ctxrdr-missing')} times, expected exactly 1")
+    #
+    # ⚠ Counted on the fallback's own upstream marker. The obvious spelling --
+    # hits_for("ctxrdr-missing") -- observes only pass 1's 404, because the
+    # fallback location proxies as /ctxrdr-fb-page; it would read 1 no matter
+    # what the fallback leg did.
+    assert origin.hits_for("ctxrdr-fb-") == 1, \
+        ("the fallback leg hit the origin "
+         f"{origin.hits_for('ctxrdr-fb-')} times, expected exactly 1")
 
     # The post-memzero ctx must have STORED, not merely answered. Note the key
     # is $host$request_uri and $request_uri is NOT rewritten by the redirect, so
@@ -7065,9 +7102,9 @@ def test_ctx_survives_error_page_internal_redirect(ng: Nginx,
         f"the cached redirecting request took {elapsed2:.2f}s"
 
     # Serving that HIT cost no further origin work: still exactly one contact.
-    assert origin.hits_for("ctxrdr-missing") == 1, \
+    assert origin.hits_for("ctxrdr-fb-") == 1, \
         ("the HIT went to the origin anyway: "
-         f"{origin.hits_for('ctxrdr-missing')} contacts, expected 1")
+         f"{origin.hits_for('ctxrdr-fb-')} contacts, expected 1")
 
     # Negative control. The assertions above are only meaningful if the
     # variables are genuinely sourced from a per-request ctx that this fixture

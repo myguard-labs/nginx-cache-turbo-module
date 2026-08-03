@@ -645,6 +645,11 @@ ngx_http_cache_turbo_shm_store(ngx_http_cache_turbo_zone_t *z,
         ctn->stale_until = stale_ttl ? now + stale_ttl : 0;
         ctn->refreshing = 0;
         ctn->refresh_lock_until = 0;
+        /* CTXRDR-ADOPT-LEASE: the store RESOLVES the lease, so it ends here for
+         * whoever held it. Clearing the token is what stops a later unstub() or
+         * adoption from matching a lease this node no longer has -- and, once the
+         * node is re-leased, from matching the NEXT holder's. */
+        ctn->refresh_owner = 0;
         ctn->l2_neg_until = 0;       /* L13: node now holds a body; any memo it
                                       * carried as a COUNTER is moot */
         ctn->last_access = now;      /* P1: store re-heads the LRU, sync stamp */
@@ -689,6 +694,7 @@ ngx_http_cache_turbo_shm_store(ngx_http_cache_turbo_zone_t *z,
     ctn->stale_until = stale_ttl ? now + stale_ttl : 0;
     ctn->refreshing = 0;
     ctn->refresh_lock_until = 0;
+    ctn->refresh_owner = 0;      /* CTXRDR-ADOPT-LEASE: no lease on a new ENTRY */
     ctn->miss_count = 0;
     ctn->l2_neg_until = 0;       /* L13: no memo on an ENTRY */
     ctn->last_access = now;      /* P1: fresh at LRU head */
@@ -748,12 +754,16 @@ ngx_http_cache_turbo_shm_stats(ngx_http_cache_turbo_zone_t *z,
  * See the L1 vtable `claim` comment in the header. */
 ngx_int_t
 ngx_http_cache_turbo_shm_claim(ngx_http_cache_turbo_zone_t *z,
-    u_char *key_hash, uint32_t hash, time_t lock_ttl)
+    u_char *key_hash, uint32_t hash, time_t lock_ttl, uint64_t *owner)
 {
     time_t                        now;
     ngx_http_cache_turbo_node_t  *ctn;
 
     now = ngx_time();
+
+    /* CTXRDR-ADOPT-LEASE: no lease unless we actually win one below. Cleared up
+     * front so every early return is a non-owner return by construction. */
+    *owner = 0;
 
     ngx_shmtx_lock(&z->shpool->mutex);
 
@@ -793,6 +803,12 @@ ngx_http_cache_turbo_shm_claim(ngx_http_cache_turbo_zone_t *z,
          * reset -- it identifies a stub by kind + refreshing, not by shape. */
         ctn->refreshing = 1;
         ctn->refresh_lock_until = now + lock_ttl;
+        /* CTXRDR-ADOPT-LEASE: a NEW lease, even though the node already carried
+         * one. This is precisely the rollover the token exists for -- the
+         * previous holder's token is now stale, so its unstub() and any adoption
+         * it attempts will (correctly) no longer match. */
+        ctn->refresh_owner = ++z->sh->owner_seq;
+        *owner = ctn->refresh_owner;
         ngx_shmtx_unlock(&z->shpool->mutex);
         return NGX_HTTP_CACHE_TURBO_CLAIM_WINNER;
     }
@@ -806,7 +822,10 @@ ngx_http_cache_turbo_shm_claim(ngx_http_cache_turbo_zone_t *z,
               sizeof(ngx_http_cache_turbo_node_t));
     if (ctn == NULL) {
         /* Out of slab: cannot mark the key in flight, so just regenerate
-         * (winner, no single-flight this time — correct, only less efficient). */
+         * (winner, no single-flight this time — correct, only less efficient).
+         * CTXRDR-ADOPT-LEASE: *owner stays 0 deliberately. There is no node and
+         * therefore no lease, so this winner must never later clear anyone's --
+         * a 0 token matches nothing in unstub()/owns(). */
         ngx_shmtx_unlock(&z->shpool->mutex);
         return NGX_HTTP_CACHE_TURBO_CLAIM_WINNER;
     }
@@ -820,6 +839,7 @@ ngx_http_cache_turbo_shm_claim(ngx_http_cache_turbo_zone_t *z,
     ctn->stale_until = 0;
     ctn->refreshing = 1;
     ctn->refresh_lock_until = now + lock_ttl;
+    ctn->refresh_owner = ++z->sh->owner_seq;   /* CTXRDR-ADOPT-LEASE */
     ctn->miss_count = 0;
     ctn->l2_neg_until = 0;       /* brand-new node: no memo to preserve */
     ctn->last_access = now;      /* P1: init the coarse LRU stamp */
@@ -829,8 +849,51 @@ ngx_http_cache_turbo_shm_claim(ngx_http_cache_turbo_zone_t *z,
     /* S8: every new node enters PROBATION (see lru_insert_new). */
     ngx_http_cache_turbo_lru_insert_new(z, ctn);
 
+    *owner = ctn->refresh_owner;
+
     ngx_shmtx_unlock(&z->shpool->mutex);
     return NGX_HTTP_CACHE_TURBO_CLAIM_WINNER;
+}
+
+
+/* CTXRDR-ADOPT-LEASE: is `owner` still the live lease holder for this key?
+ * See the header for why request-local state cannot answer this. */
+ngx_int_t
+ngx_http_cache_turbo_shm_owns(ngx_http_cache_turbo_zone_t *z,
+    u_char *key_hash, uint32_t hash, uint64_t owner)
+{
+    ngx_int_t                     rc;
+    ngx_http_cache_turbo_node_t  *ctn;
+
+    /* 0 is never a live token (owner_seq starts at 1), so an unclaimed or
+     * already-released ctx is rejected without touching the zone. */
+    if (owner == 0) {
+        return NGX_DECLINED;
+    }
+
+    ngx_shmtx_lock(&z->shpool->mutex);
+
+    ctn = ngx_http_cache_turbo_shm_lookup(z, key_hash, hash);
+
+    /* Identity AND liveness. `refreshing` alone would accept a node whose lease
+     * we still nominally stamp but that store()/unstub() has already resolved;
+     * the token alone would accept a resolved node that has not yet been reused.
+     * A lease is ours only while both hold.
+     *
+     * ⚠ Deliberately NOT tested: refresh_lock_until. An expired deadline does not
+     * end the lease -- it only makes the node ELIGIBLE for takeover by the next
+     * claim(). Until that takeover actually happens, refresh_owner still names
+     * us and we are still the single regenerator. Rejecting on the deadline here
+     * would send a request that legitimately owns the stub back into cold_wait()
+     * to park on its own lease, which is the original CTXRDR defect. */
+    rc = (ctn != NULL
+          && ctn->refreshing
+          && ctn->refresh_owner == owner)
+         ? NGX_OK : NGX_DECLINED;
+
+    ngx_shmtx_unlock(&z->shpool->mutex);
+
+    return rc;
 }
 
 
@@ -840,9 +903,16 @@ ngx_http_cache_turbo_shm_claim(ngx_http_cache_turbo_zone_t *z,
  * in-flight marker would otherwise block waiters until refresh_lock_until. */
 void
 ngx_http_cache_turbo_shm_unstub(ngx_http_cache_turbo_zone_t *z,
-    u_char *key_hash, uint32_t hash)
+    u_char *key_hash, uint32_t hash, uint64_t owner)
 {
     ngx_http_cache_turbo_node_t  *ctn;
+
+    /* CTXRDR-ADOPT-LEASE: never held a lease, or already released it. Nothing to
+     * clear, and matching on the flags alone here is exactly how a stale caller
+     * used to free the CURRENT winner's lease. */
+    if (owner == 0) {
+        return;
+    }
 
     ngx_shmtx_lock(&z->shpool->mutex);
 
@@ -871,14 +941,24 @@ ngx_http_cache_turbo_shm_unstub(ngx_http_cache_turbo_zone_t *z,
      * min_uses 4, a config where counters never reach here at all. Evidence of
      * absence, mistaken for absence of the path.
      *
-     * An ENTRY is never touched: it holds a body someone may still serve. */
+     * An ENTRY is never touched: it holds a body someone may still serve.
+     *
+     * ⚠ CTXRDR-ADOPT-LEASE: the owner test is NOT a fourth shape check to be
+     * folded into the ones above -- it is an identity check, and it is what makes
+     * step (1) safe to keep unconditional. claim() re-leases an expired stub to a
+     * new winner, so a slow LOSER reaching here later would otherwise satisfy
+     * kind + refreshing against the NEW holder's lease and clear it, freeing
+     * every waiter to stampede the origin. Mismatch => someone else's lease, and
+     * the only correct action is to leave the node completely alone. */
     if (ctn != NULL
         && ctn->kind == NGX_HTTP_CACHE_TURBO_NODE_COUNTER
-        && ctn->refreshing)
+        && ctn->refreshing
+        && ctn->refresh_owner == owner)
     {
-        /* (1) release the single-flight -- unconditional */
+        /* (1) release the single-flight -- unconditional, once it is OURS */
         ctn->refreshing = 0;
         ctn->refresh_lock_until = 0;
+        ctn->refresh_owner = 0;
 
         /* (2) reclaim only if nothing else lives on this node: no min_uses
          * progress and no live negative memo. Either one means the node still
@@ -962,6 +1042,7 @@ ngx_http_cache_turbo_shm_count_miss(ngx_http_cache_turbo_zone_t *z,
     ctn->stale_until = 0;
     ctn->refreshing = 0;
     ctn->refresh_lock_until = 0;
+    ctn->refresh_owner = 0;      /* CTXRDR-ADOPT-LEASE: a counter holds no lease */
     ctn->miss_count = 1;
     ctn->l2_neg_until = 0;       /* L13: no memo yet; l2_neg_set stamps it */
     ctn->last_access = now;      /* P1: init the coarse LRU stamp */
@@ -1099,6 +1180,7 @@ ngx_http_cache_turbo_shm_l2_neg_set(ngx_http_cache_turbo_zone_t *z,
     ctn->stale_until = 0;
     ctn->refreshing = 0;
     ctn->refresh_lock_until = 0;
+    ctn->refresh_owner = 0;      /* CTXRDR-ADOPT-LEASE: a memo holds no lease */
     ctn->miss_count = 0;
     ctn->l2_neg_until = now + ttl;
     ctn->last_access = now;      /* P1: init the coarse LRU stamp */

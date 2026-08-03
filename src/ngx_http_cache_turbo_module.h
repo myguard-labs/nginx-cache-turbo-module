@@ -793,6 +793,26 @@ typedef struct {
     time_t                   stale_until;   /* < now  => expired/evict      */
 
     ngx_uint_t               refreshing;    /* a single-flight regen in air */
+
+    /* CTXRDR-ADOPT-LEASE: identity of the request that currently holds the
+     * single-flight lease, as a zone-wide never-reused token (see sh->owner_seq).
+     * Assigned under the zone mutex by claim() every time it returns
+     * CLAIM_WINNER, including the TAKEOVER case where the lease is handed from a
+     * dead/expired winner to a new one.
+     *
+     * ⚠ WHY THIS EXISTS. `refreshing` + `refresh_lock_until` say a lease is live;
+     * they do NOT say whose. claim() deliberately re-leases an expired stub to a
+     * different request, so a request that once owned this key cannot conclude
+     * from its own request-local state that it still does. Without an identity
+     * here, unstub() matched on kind + refreshing alone and a late-finishing
+     * LOSER could clear the CURRENT winner's live lease -- breaking single-flight
+     * and stampeding the origin exactly during the origin slowness that opened
+     * the window. Compare this token, never the flags alone.
+     *
+     * 0 = no lease (never claimed, or released). owner_seq starts at 1 so a
+     * zeroed node can never collide with a live token. */
+    uint64_t                 refresh_owner;
+
     time_t                   refresh_lock_until; /* hard single-flight guard:
                                               * while now < this, ALL readers
                                               * serve stale and skip the dice;
@@ -920,6 +940,22 @@ typedef struct {
      * wait loop (a coalesced cold-miss that did NOT go to origin). Zero when
      * cache_turbo_lock is off. Observability for the single-flight working. */
     ngx_atomic_t             lock_waits;
+
+    /* CTXRDR-ADOPT-LEASE: monotonic source of single-flight owner tokens for
+     * this zone (node->refresh_owner). Pre-incremented under shpool->mutex by
+     * claim(), so the first token issued is 1 and 0 is always "no owner" --
+     * a zeroed or freshly-slab-allocated node can never impersonate a holder.
+     *
+     * ⚠ NOT an ngx_atomic_t and must not become one: it is only ever read and
+     * written while holding the zone mutex, together with the refreshing /
+     * refresh_lock_until fields it identifies. Making it atomic would invite a
+     * lock-free bump that could hand two requests the same token.
+     *
+     * uint64_t, so it cannot wrap in any real deployment: at a sustained one
+     * million cold-miss claims per second it takes ~584,000 years to exhaust.
+     * "Never reused" is what makes a stale token safe to compare -- an ABA on
+     * this field would resurrect exactly the defect it was added to close. */
+    uint64_t                 owner_seq;
 
     /* min_uses (v15): bumped once per cold miss that was sent to the origin
      * WITHOUT storing because the key is still below cache_turbo_min_uses. Zero
@@ -1705,6 +1741,12 @@ typedef struct {
     unsigned                 cold_winner:1;
     unsigned                 cold_stored:1;
     ngx_http_cache_turbo_zone_t *cold_zone;
+    /* CTXRDR-ADOPT-LEASE: the owner token claim() issued to THIS request when it
+     * won the lease (node->refresh_owner). cold_winner says we won a lease once;
+     * only this token says whether the lease live in the zone right now is still
+     * ours. Every unstub() and every adoption compares it under the zone mutex.
+     * 0 when this ctx never won (or inherited nothing). */
+    uint64_t                 cold_owner;
     ngx_chain_t             *body;        /* buffered response chain        */
     ngx_chain_t             *body_last;   /* tail of body, O(1) append      */
     size_t                   body_len;
@@ -2007,13 +2049,27 @@ void ngx_http_cache_turbo_shm_stats(ngx_http_cache_turbo_zone_t *z,
 /* Cold-miss single-flight claim (v10). See the L1 vtable `claim` comment.
  * Returns NGX_HTTP_CACHE_TURBO_CLAIM_{WINNER,LOSER,FRESH}. */
 ngx_int_t ngx_http_cache_turbo_shm_claim(ngx_http_cache_turbo_zone_t *z,
-    u_char *key_hash, uint32_t hash, time_t lock_ttl);
+    u_char *key_hash, uint32_t hash, time_t lock_ttl, uint64_t *owner);
 
 /* Remove a leftover cold-miss STUB (v10): drops the node ONLY if it is still a
  * stub (len == 0), so a real entry stored by someone else is never touched.
- * Used when a cold-miss winner's response turned out non-cacheable. */
+ * Used when a cold-miss winner's response turned out non-cacheable.
+ *
+ * CTXRDR-ADOPT-LEASE: `owner` is the token claim() issued to the caller. The
+ * lease is released ONLY if the node still carries that exact token, so a
+ * request whose lease was re-issued to someone else cannot clear the current
+ * holder's. Pass the ctx's cold_owner; 0 never matches a live lease. */
 void ngx_http_cache_turbo_shm_unstub(ngx_http_cache_turbo_zone_t *z,
-    u_char *key_hash, uint32_t hash);
+    u_char *key_hash, uint32_t hash, uint64_t owner);
+
+/* CTXRDR-ADOPT-LEASE: does `owner` still hold the live single-flight lease for
+ * this key? Checked under the zone mutex against node->refresh_owner, so the
+ * answer reflects the zone at the instant of the call rather than any
+ * request-local memory of having won. Returns NGX_OK when the lease is ours and
+ * still live, NGX_DECLINED otherwise (re-leased, resolved, evicted, or never
+ * ours). The ONLY sound basis for adopting a stub across an internal redirect. */
+ngx_int_t ngx_http_cache_turbo_shm_owns(ngx_http_cache_turbo_zone_t *z,
+    u_char *key_hash, uint32_t hash, uint64_t owner);
 
 /* min_uses miss counter (v15). See the L1 vtable `count_miss` comment. Returns
  * NGX_OK when the key has reached min_uses (store-eligible — proceed to the
@@ -2250,9 +2306,14 @@ struct ngx_cache_turbo_l1_backend_s {
      * decide whether this request regenerates the key or waits for someone else.
      * Returns CLAIM_WINNER (took/created the in-flight stub — go to origin),
      * CLAIM_LOSER (someone else is in flight — wait), or CLAIM_FRESH (a real
-     * fresh entry raced in — re-serve via lookup). lock_ttl bounds the stub. */
+     * fresh entry raced in — re-serve via lookup). lock_ttl bounds the stub.
+     *
+     * CTXRDR-ADOPT-LEASE: on CLAIM_WINNER, *owner receives the zone-wide token
+     * identifying THIS request as the lease holder; it must be stored in the ctx
+     * and handed back to unstub(). Set to 0 on every non-winner return. Callers
+     * must not treat a past win as current ownership -- ask shm_owns(). */
     ngx_int_t  (*claim)(ngx_http_cache_turbo_zone_t *z, u_char *key_hash,
-        uint32_t hash, time_t lock_ttl);
+        uint32_t hash, time_t lock_ttl, uint64_t *owner);
 
     /* min_uses miss counter (v15). Atomically (under the zone mutex) count one
      * cold miss for the key and decide whether it has now been requested enough

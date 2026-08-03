@@ -10,6 +10,7 @@
 #   ngx_http_cache_turbo_shm_alloc_evict()   - alloc, evicting until it fits
 #   ngx_http_cache_turbo_shm_claim()         - single-flight winner/loser/fresh
 #   ngx_http_cache_turbo_shm_unstub()        - release stub, reclaim if empty
+#   ngx_http_cache_turbo_shm_owns()          - is this token the live lease holder
 #   ngx_http_cache_turbo_shm_count_miss()    - min_uses miss counter
 #   ngx_http_cache_turbo_shm_l2_neg_check()  - read the L13 negative memo
 #   ngx_http_cache_turbo_shm_l2_neg_set()    - arm the L13 negative memo
@@ -144,20 +145,23 @@ check_probe_layout() {
         exit 1
     fi
 
-    for bits in 32; do
-        hdr_n=$(grep -c \
-            "NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_STAMP_BITS  $bits\$" "$HDR" \
-            || true)
-        test_n=$(grep -c \
-            "NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_STAMP_BITS  $bits\$" \
-            "$UNIT_DIR/test_shm_state.c" || true)
-        if [ "$hdr_n" -lt 1 ] || [ "$test_n" -lt 1 ]; then
-            echo "✗ NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_STAMP_BITS $bits arm" \
-                 "missing from module.h ($hdr_n) or test_shm_state.c" \
-                 "($test_n) -- the width-conditional mirror drifted" >&2
-            exit 1
-        fi
-    done
+    # Only the 32-bit STAMP_BITS arm ships (the narrow layout is rejected at
+    # compile time -- see the width note above), so this is a single check, not
+    # a loop over widths. It was written as `for bits in 32` for a second arm
+    # that never arrived; shellcheck SC2043 flags that correctly.
+    bits=32
+    hdr_n=$(grep -c \
+        "NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_STAMP_BITS  $bits\$" "$HDR" \
+        || true)
+    test_n=$(grep -c \
+        "NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_STAMP_BITS  $bits\$" \
+        "$UNIT_DIR/test_shm_state.c" || true)
+    if [ "$hdr_n" -lt 1 ] || [ "$test_n" -lt 1 ]; then
+        echo "✗ NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_STAMP_BITS $bits arm" \
+             "missing from module.h ($hdr_n) or test_shm_state.c" \
+             "($test_n) -- the width-conditional mirror drifted" >&2
+        exit 1
+    fi
 }
 check_probe_layout
 
@@ -234,7 +238,7 @@ awk '
     /^(static )?(void|ngx_int_t|ngx_uint_t|time_t|u_char|const char|ngx_http_cache_turbo_node_t)[[:space:]]*\**$/ {
         pending = 1; buf = $0 ORS; next
     }
-    pending && /^ngx_http_cache_turbo_(shm_(lookup|evict_one|alloc_evict|claim|unstub|count_miss|l2_neg_check|l2_neg_set|touch_lru|brk_probe_age|breaker_state|breaker_record|breaker_state_str)|lru_(link_head|unlink|insert_new|enforce_cap)|blob_(alloc|node_release|acquire|release))\(/ {
+    pending && /^ngx_http_cache_turbo_(shm_(lookup|evict_one|alloc_evict|claim|unstub|owns|count_miss|l2_neg_check|l2_neg_set|touch_lru|brk_probe_age|breaker_state|breaker_record|breaker_state_str)|lru_(link_head|unlink|insert_new|enforce_cap)|blob_(alloc|node_release|acquire|release))\(/ {
         capture = 1; pending = 0; printf "%s", buf; print; next
     }
     pending { pending = 0; buf = "" }
@@ -380,6 +384,7 @@ for fn in \
     'ngx_http_cache_turbo_shm_alloc_evict(' \
     'ngx_http_cache_turbo_shm_claim(' \
     'ngx_http_cache_turbo_shm_unstub(' \
+    'ngx_http_cache_turbo_shm_owns(' \
     'ngx_http_cache_turbo_shm_count_miss(' \
     'ngx_http_cache_turbo_shm_l2_neg_check(' \
     'ngx_http_cache_turbo_shm_l2_neg_set(' \
@@ -431,6 +436,23 @@ if ! sed -n '/^ngx_http_cache_turbo_shm_unstub(/,/^}/p' "$OUT" \
    | grep -q 'miss_count == 0'; then
     echo "✗ CR-B regression: unstub() no longer checks miss_count." >&2
     echo "  Freeing a COUNTER mid-count silently resets min_uses progress." >&2
+    rm -f "$OUT"
+    exit 1
+fi
+
+# ⚠ CTXRDR-ADOPT-LEASE: unstub() must gate on the LEASE IDENTITY, not just on
+# the stub's shape. claim() re-leases an expired stub to a new winner, so an
+# unstub() that matches kind + refreshing alone lets a stale, slow loser clear
+# the CURRENT holder's live lease -- single-flight broken and the origin
+# stampeded, exactly during the origin slowness that opens the window.
+# Comments stripped first, for the same reason as the CR-B canary above: the
+# prose around this predicate names the field, so a naive grep would match the
+# explanation of the check rather than the check.
+if ! sed -n '/^ngx_http_cache_turbo_shm_unstub(/,/^}/p' "$OUT" \
+   | sed -E 's;/\*.*;;; s;^[[:space:]]*\*.*;;' \
+   | grep -q 'refresh_owner == owner'; then
+    echo "✗ CTXRDR-ADOPT-LEASE regression: unstub() no longer compares the" >&2
+    echo "  owner token. A stale holder can now clear the live winner's lease." >&2
     rm -f "$OUT"
     exit 1
 fi
