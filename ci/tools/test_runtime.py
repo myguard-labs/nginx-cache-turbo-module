@@ -7116,6 +7116,14 @@ def test_ctx_survives_error_page_internal_redirect(ng: Nginx,
         ("$cache_turbo_status reports a value on a location where the module "
          f"never engaged, so it is not reading r->ctx: got "
          f"{hc.get('x-ct-status')!r}")
+    # Both variables, not just the status one. The HIT above asserts
+    # x-ct-reason == "FRESH", so $cache_turbo_serve_reason carries real weight
+    # here; a getter answering a constant for the reason would sail through
+    # every assertion in this test if only the status arm were controlled.
+    assert hc.get("x-ct-reason") in (None, "-"), \
+        ("$cache_turbo_serve_reason reports a value on a location where the "
+         f"module never engaged, so it is not reading r->ctx: got "
+         f"{hc.get('x-ct-reason')!r}")
 
 
 def test_mediawiki_preset(ng: Nginx, origin: Origin) -> None:
