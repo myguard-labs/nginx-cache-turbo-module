@@ -1,3 +1,4 @@
+# sync-sha: af0de2db6a48955180f62037e1d881bd236d21e673911e9b288f08e23784326b
 name: Build & Test
 
 # Runner selection: plain `[self-hosted, builder02]`, NOT `lxc`.
@@ -108,6 +109,12 @@ jobs:
           python3 ci/tools/lint-orphan-tests.py
           python3 ci/tools/lint-doc-preset-count.py
           python3 ci/tools/test-tls-fixture-cleanup.py
+          # Each stamped .github/ file carries a `# sync-sha:` of its own
+          # content, so a `--list` diff against nginx-skeleton-module names
+          # exactly which copies have drifted. The stamps are only worth
+          # reading if they cannot go stale, hence this gate: edit a workflow
+          # without running ci/tools/sync-stamp.sh and the PR goes red here.
+          bash ci/tools/sync-stamp.sh --check
 
       - name: Reject corrupt downloaded inputs
         run: |

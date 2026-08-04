@@ -1,3 +1,4 @@
+# sync-sha: 6fbccea4f06e52465e1e8cd5a0ff56a1141755bfa5f2dff0213e177cb4f9ca5a
 name: Valgrind
 
 # Valgrind memcheck lite soak (60s @ 4 conc) on every PR/push — cheap dynamic
