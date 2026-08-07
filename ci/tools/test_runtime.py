@@ -786,6 +786,16 @@ class Origin:
                     # OR-arm), 1s fresh then NO stale serving.
                     self.send_header("Cache-Control",
                                      "max-age=1, proxy-revalidate")
+                if "splitmrev" in self.path:
+                    # AUD-CC-FIRST-LINE: HTTP allows a header field to be split
+                    # across multiple field-lines (RFC 9110 SS5.3), equivalent to
+                    # one line with the values comma-joined in order. Emit TWO
+                    # separate Cache-Control lines -- max-age on the first,
+                    # must-revalidate on the SECOND -- so a reader that only
+                    # inspects the first occurrence would miss must-revalidate
+                    # entirely and stale-serve past freshness.
+                    self.send_header("Cache-Control", "max-age=1")
+                    self.send_header("Cache-Control", "must-revalidate")
                 if "expabs" in self.path:
                     # Expires-only freshness (upstream_ttl ladder step 4): NO
                     # Cache-Control/CDN-CC/Surrogate-Control, so the fresh TTL is
@@ -2152,6 +2162,19 @@ http {{
         # is NOT stale-served (as /cc7/ would be) but re-fetched. beta 1 ~ never
         # rolls a refresh, isolating the must-revalidate behaviour.
         location /mrev/ {{
+            cache_turbo                    main;
+            cache_turbo_key                $uri;
+            cache_turbo_valid              60s;
+            cache_turbo_beta               1;
+            cache_turbo_cache_control       honor;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # AUD-CC-FIRST-LINE: same must-revalidate collapse as /mrev/, but the
+        # origin (splitmrev marker) sends max-age and must-revalidate on TWO
+        # separate Cache-Control field-lines instead of one. Proves the fix
+        # walks every Cache-Control line rather than only the first.
+        location /ccsplit/ {{
             cache_turbo                    main;
             cache_turbo_key                $uri;
             cache_turbo_valid              60s;
@@ -9871,6 +9894,27 @@ def test_age_header(ng: Nginx) -> None:
     assert age >= 1, f"Age should be >=1s after a 1.2s wait, got {age}"
 
 
+def test_must_revalidate_split_header(ng: Nginx) -> None:
+    """AUD-CC-FIRST-LINE: same must-revalidate collapse as test_must_revalidate,
+    but the origin (/ccsplit/, splitmrev marker) emits max-age and
+    must-revalidate on TWO separate Cache-Control field-lines. HTTP allows a
+    field to repeat across field-lines (RFC 9110 SS5.3), equivalent to one
+    comma-joined line -- a reader that only inspects the first Cache-Control
+    line would miss the must-revalidate token on the second and wrongly
+    stale-serve past freshness."""
+    _, _, h0 = fetch(ng.port, "/ccsplit/splitmrev")
+    assert "x-cache" not in h0, "first should miss"
+    _, _, h1 = fetch(ng.port, "/ccsplit/splitmrev")
+    assert h1.get("x-cache") == "HIT", f"second should be a fresh HIT, got {h1}"
+    time.sleep(2.0)                               # past max-age=1
+    _, _, h2 = fetch(ng.port, "/ccsplit/splitmrev")
+    assert h2.get("x-cache") != "STALE", \
+        ("must-revalidate on a later Cache-Control field-line must NOT be "
+         f"ignored, got {h2.get('x-cache')}")
+    assert "x-cache" not in h2, \
+        "must-revalidate (2nd field-line) should re-fetch from origin once stale"
+
+
 def test_request_no_cache(ng: Nginx, origin: Origin) -> None:
     """RFC 9111 5.2.1.4: a request Cache-Control: no-cache skips the stored copy
     and revalidates at the origin (the fresh response still refreshes the entry).
@@ -16868,6 +16912,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_age_header(ng)
     test_request_no_cache(ng, origin)
     test_must_revalidate(ng)
+    test_must_revalidate_split_header(ng)
     test_proxy_revalidate(ng)
     test_precise_maxage_token_parse(ng)
     test_ignore_cache_control_overrides_floor(ng, origin)
