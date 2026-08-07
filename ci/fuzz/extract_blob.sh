@@ -42,7 +42,9 @@ emit_defines() {
     for name in NGX_HTTP_CACHE_TURBO_BLOB_MAGIC \
                 NGX_HTTP_CACHE_TURBO_BLOB_VERSION \
                 NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE \
-                NGX_HTTP_CACHE_TURBO_TTL_MAX
+                NGX_HTTP_CACHE_TURBO_TTL_MAX \
+                NGX_HTTP_CACHE_TURBO_FOREVER_TTL \
+                NGX_HTTP_CACHE_TURBO_BLOB_CREATED_MIN
     do
         line=$(grep -E "^#define[[:space:]]+${name}[[:space:]]" "$HDR" | head -n1)
         if [ -z "$line" ]; then

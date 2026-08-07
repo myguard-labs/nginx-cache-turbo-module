@@ -219,6 +219,20 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
                 "total-serveable-window invariant; a blob claiming a huge "
                 "fresh_ttl under a normal stale_ttl is forged metadata)");
     }
+    /* AUD-BLOB-CREATED: every consumer computes `now - created` as plain
+     * signed time_t subtraction with no overflow check before it (module.c
+     * age = ngx_time() - (time_t) bh.created, e.g. around :5344 / :6777).
+     * An accepted `created` outside a plausible epoch-seconds window is
+     * exactly the input that turns that subtraction into signed overflow —
+     * UB — before the later `age < 0` clamp ever gets a chance to run. */
+    if (hdr.created < NGX_HTTP_CACHE_TURBO_BLOB_CREATED_MIN
+        || hdr.created > (int64_t) time(NULL)
+                             + (int64_t) NGX_HTTP_CACHE_TURBO_FOREVER_TTL)
+    {
+        ct_fail("blob_validate accepted a created value outside the plausible "
+                "epoch-seconds window (age = now - created is unchecked signed "
+                "subtraction downstream; INT64_MIN/INT64_MAX overflow it)");
+    }
 
     ct_in_bounds(hb, hdr.headers_len, buf, size, "header block outside the blob");
     ct_in_bounds(body, hdr.body_len, buf, size, "body outside the blob");
@@ -322,8 +336,9 @@ static size_t  ct_blob_len;
  * guarded against drift by extract_blob.sh's HDR_WIRE check.
  */
 static void
-ct_build(uint32_t status, uint32_t fresh_ttl, uint32_t stale_ttl,
-    uint32_t sie_ttl, const ct_kv_t *kv, size_t nkv, const char *bodytext)
+ct_build_created(uint32_t status, uint32_t fresh_ttl, uint32_t stale_ttl,
+    uint32_t sie_ttl, uint64_t created, const ct_kv_t *kv, size_t nkv,
+    const char *bodytext)
 {
     u_char  *w;
     size_t   i, blen = strlen(bodytext);
@@ -346,13 +361,24 @@ ct_build(uint32_t status, uint32_t fresh_ttl, uint32_t stale_ttl,
     ct_put_u32(ct_blob + 12, (uint32_t) nkv);
     ct_put_u32(ct_blob + 16, (uint32_t) ((size_t) (w - ct_blob) - CT_HDR_WIRE));
     ct_put_u32(ct_blob + 20, (uint32_t) blen);
-    ct_put_u64(ct_blob + 24, 1767225600ULL);        /* fixed created stamp */
+    ct_put_u64(ct_blob + 24, created);
     ct_put_u32(ct_blob + 32, fresh_ttl);
     ct_put_u32(ct_blob + 36, stale_ttl);
     ct_put_u32(ct_blob + 40, sie_ttl);
 
     memcpy(w, bodytext, blen); w += blen;
     ct_blob_len = (size_t) (w - ct_blob);
+}
+
+/* Same shape as ct_build_created() but with the fixed "realistic" created
+ * stamp every existing fixture uses — keeps the pre-AUD-BLOB-CREATED call
+ * sites unchanged. */
+static void
+ct_build(uint32_t status, uint32_t fresh_ttl, uint32_t stale_ttl,
+    uint32_t sie_ttl, const ct_kv_t *kv, size_t nkv, const char *bodytext)
+{
+    ct_build_created(status, fresh_ttl, stale_ttl, sie_ttl,
+        1767225600ULL, kv, nkv, bodytext);       /* fixed created stamp */
 }
 
 /* A realistic stored blob — what a warm cache_turbo entry actually looks like
@@ -499,6 +525,22 @@ main(int argc, char **argv)
      *    always satisfies and a forged blob does not. */
     ct_build(200, 0xFFFFFFFFu, 600, 0, kv_crlf + 0, 1, "body");
     ct_run("fresh_ttl=0xFFFFFFFF under a normal stale_ttl is rejected");
+
+    /* 7. created = INT64_MIN (AUD-BLOB-CREATED). Every consumer computes
+     *    `now - created` as plain signed time_t subtraction with no overflow
+     *    check before it — INT64_MIN there is signed overflow (UB) before the
+     *    later `age < 0` clamps ever run. A hostile or corrupt L2 blob can
+     *    carry this; the deserializer must reject it outright. */
+    ct_build_created(200, 60, 600, 0, (uint64_t) INT64_MIN,
+        kv_crlf + 0, 1, "body");
+    ct_run("created=INT64_MIN is rejected");
+
+    /* 8. created = INT64_MAX: symmetric far-future forgery. Also poisons
+     *    `now - created` (a huge negative age) and claims a store time no
+     *    real node clock could produce. */
+    ct_build_created(200, 60, 600, 0, (uint64_t) INT64_MAX,
+        kv_crlf + 0, 1, "body");
+    ct_run("created=INT64_MAX is rejected");
 
     if (ct_failures) {
         printf("--- %d of %d blob fixtures FAILED ---\n", ct_failures, ct_seq);

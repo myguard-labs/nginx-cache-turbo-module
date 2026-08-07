@@ -865,6 +865,23 @@ ngx_http_cache_turbo_blob_validate(const u_char *blob, size_t len,
         return NGX_ERROR;
     }
 
+    /*
+     * AUD-BLOB-CREATED: bound `created` for the same reason status/stale_ttl
+     * are bounded above — every downstream consumer computes
+     * `now - created` (signed time_t subtraction) with no overflow check
+     * before it, so an out-of-range `created` (e.g. INT64_MIN from a hostile
+     * or corrupt L2 blob) is undefined behaviour before any later `age < 0`
+     * clamp can run. See the NGX_HTTP_CACHE_TURBO_BLOB_CREATED_MIN comment in
+     * the header for the range rationale. Reject, do not clamp: a `created`
+     * outside this window was not written by this module's store path.
+     */
+    if (out->created < NGX_HTTP_CACHE_TURBO_BLOB_CREATED_MIN
+        || out->created > (int64_t) ngx_time()
+                               + (int64_t) NGX_HTTP_CACHE_TURBO_FOREVER_TTL)
+    {
+        return NGX_ERROR;
+    }
+
     /* header block + body must fit (subtract on the remaining len — no overflow) */
     if (out->headers_len > len - NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE
         || out->body_len

@@ -1995,6 +1995,24 @@ typedef struct {
  * native padding). All blob offsets derive from this constant. */
 #define NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE 44
 
+/* Bounds on the blob's `created` field (AUD-BLOB-CREATED). It is stored as a
+ * signed int64 wire field but is always written as `(int64_t) ngx_time()` at
+ * store time (module.c) — a real store timestamp. Every consumer computes age
+ * as `now - created` (time_t, i.e. plain signed subtraction) with NO overflow
+ * check before it, e.g. `ngx_time() - (time_t) bh.created`; the `age < 0`
+ * clamps downstream run only AFTER that subtraction has already happened.
+ * A blob is not a trusted store artifact once it crosses L2 (Redis/memcached):
+ * an attacker with L2 write access, or a corrupted/bit-flipped entry, can set
+ * `created` to any int64, including INT64_MIN — `now - INT64_MIN` is signed
+ * overflow, i.e. undefined behaviour, before any clamp gets a chance to run.
+ * Reject rather than clamp, same as status/stale_ttl above: a `created` this
+ * far from "a real store timestamp" was not written by this module. The floor
+ * is 0 (this module's blob format did not exist before the Unix epoch); the
+ * ceiling is FOREVER_TTL past "now" at validation time, generous enough to
+ * absorb clock skew between nodes while still rejecting a blob claiming to
+ * have been stored decades in the future. */
+#define NGX_HTTP_CACHE_TURBO_BLOB_CREATED_MIN  ((int64_t) 0)
+
 
 extern ngx_module_t  ngx_http_cache_turbo_module;
 
