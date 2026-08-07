@@ -44,10 +44,6 @@ static EVP_MD_CTX *EVP_MD_CTX_new(void) {
     return (EVP_MD_CTX *) 1;  /* non-NULL */
 }
 
-static void EVP_MD_CTX_free(EVP_MD_CTX *ctx) {
-    (void) ctx;
-}
-
 static const void *EVP_sha256(void) {
     return (const void *) 1;
 }
@@ -94,33 +90,6 @@ typedef struct {
     uint32_t state[4];
 } ngx_md5_t;
 
-static void ngx_md5_init(ngx_md5_t *ctx) {
-    memset(ctx, 0, sizeof(*ctx));
-}
-
-static void ngx_md5_update(ngx_md5_t *ctx, const void *data, size_t len) {
-    (void) ctx;
-    (void) data;
-    (void) len;
-}
-
-static void ngx_md5_final(u_char *result, ngx_md5_t *ctx) {
-    (void) ctx;
-    /* Deterministic output */
-    memset(result, 0xCD, 16);
-}
-
-/* ---- Minimal request stub (if needed) --------------------------------- */
-typedef struct { int _unused; } ngx_http_request_t;
-
-/* ---- Pool allocator stub ------------------------------------------------ */
-typedef struct { int _unused; } ngx_pool_t;
-
-static void *ngx_pnalloc(ngx_pool_t *pool, size_t size) {
-    (void) pool;
-    return malloc(size);
-}
-
 #define ngx_memzero(p, n) memset((p), 0, (n))
 #define ngx_cpymem(dst, src, n) (memcpy((dst), (src), (n)) + (n))
 #define ngx_memcpy(dst, src, n) memcpy((dst), (src), (n))
@@ -152,8 +121,6 @@ static ngx_int_t ngx_http_cache_turbo_digest_final(ngx_http_cache_turbo_digest_t
     u_char out[32]);
 static ngx_int_t ngx_http_cache_turbo_digest(const void *data, size_t len,
     u_char out[32]);
-static ngx_int_t ngx_http_cache_turbo_build_key(ngx_http_request_t *r,
-    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx);
 
 /* SSL support check */
 #define NGX_SSL 1
