@@ -318,16 +318,17 @@ http {
 }
 ```
 
-That's the whole config. With just `cache_turbo ct;` the default key is already
-`$host$uri$cache_turbo_normalized_args`, so vhosts don't collide and tracking
-params (`utm_*`, `fbclid`, …, plus `sid`, `sessionid`, `tmp_*`) are stripped and
-args are order-insensitive out of the box — no extra directives needed. Want it
-spelled out, or to tweak it?
+That's the whole config. With just `cache_turbo ct;` the default key is
+`$host$uri$query_string` (the Host, path, and **raw query string with no
+normalization**) — vhosts don't collide, but by default tracking params and arg
+order **do matter**. To enable the automatic stripping of tracking params (`utm_*`,
+`fbclid`, …, plus `sid`, `sessionid`, `tmp_*`) and order-insensitive matching,
+you must explicitly set the key:
 
 ```nginx
 location / {
     cache_turbo                 ct;
-    cache_turbo_key             $host$uri$cache_turbo_normalized_args;  # = the default
+    cache_turbo_key             $host$uri$cache_turbo_normalized_args;  # explicit — enables param stripping
     cache_turbo_normalize_strip sid sessionid "tmp_*";                  # already built in
     proxy_pass http://127.0.0.1:8080;
 }
@@ -942,9 +943,11 @@ Three caveats worth checking against your install:
 ## The cache key
 
 A "key" is just the string that decides whether two requests are *the same
-page*. Default key is `$host$uri$cache_turbo_normalized_args` (the Host + path +
-normalized args — tracking params stripped, args sorted), so two vhosts sharing
-a zone never collide and `?utm_*`/arg-reordering hit one slot.
+page*. The **built-in default key is `$host$uri$query_string`** (the Host + path +
+raw query string, with **no argument normalization**) — two vhosts sharing a zone
+never collide, but by default `?utm_*` tracking params and arg-reordering create
+separate entries. To enable normalized matching (params stripped, args sorted),
+set `cache_turbo_key` to `$host$uri$cache_turbo_normalized_args` explicitly.
 
 Set your own with `cache_turbo_key` using any nginx variables:
 
@@ -962,13 +965,13 @@ params (built-in denylist: `utm_*`, `fbclid`, `gclid`, `msclkid`, `mc_eid`,
 `cache_turbo_normalize_strip *` (a bare `*` is a zero-length prefix that matches
 every arg name).
 
-> **Alias caveat.** Because the default key *strips* `sid`/`sessionid`/`ref` and
-> *sorts* the rest, two distinct URLs that differ only in a stripped param (e.g.
-> two `?sessionid=` values) collapse onto **one** entry. That is the point for
-> tracking junk, but it is wrong if the origin actually keys private content off
-> such a param without marking it `private`/`Set-Cookie`. For those origins use a
-> raw, no-strip/no-sort key so distinct queries never alias:
-> `cache_turbo_key $scheme$host$request_uri;`.
+> **Alias caveat.** Because `$cache_turbo_normalized_args` *strips* `sid`/`sessionid`/`ref`
+> and *sorts* the rest, two distinct URLs that differ only in a stripped param (e.g.
+> two `?sessionid=` values) collapse onto **one** entry when you use the normalized
+> key. That is the point for tracking junk, but it is wrong if the origin actually
+> keys private content off such a param without marking it `private`/`Set-Cookie`.
+> For those origins use a raw, no-strip/no-sort key so distinct queries never alias:
+> `cache_turbo_key $scheme$host$request_uri;` (or the default raw key).
 
 ```nginx
 cache_turbo_key             $host$uri$cache_turbo_normalized_args;
@@ -1575,7 +1578,7 @@ http {
 | `cache_turbo NAME` / `off` | `server`, `location` | `off` | Turn caching on (bind a zone) or off. Takes a zone name and nothing else — the old `auto` shorthand is gone (see `cache_turbo_backend`). |
 | `cache_turbo_backend NAME...` | `server`, `location` | — | Auto-classify dynamic (uncacheable) request surfaces for one or more application presets: `wordpress`, `woocommerce`, `joomla`, `xenforo`, `discourse`, `phpbb`, `drupal`, `mediawiki`, `magento`, `shopware6`, `ghost`, `wagtail`, `kirby`, `typo3`, `invision`, `smf`, `vanilla`, `punbb`, `phorum`, `yabb`, `mybb`, `vbulletin`, `textpattern`, `bludit`, `spip`, `bugzilla`, `mantisbt` (`mantis`), `plone`, `umbraco`, `dotclear`, `wikijs`, `redmine`, `flarum`, `opencart`; aliases: `classicpress` → `wordpress`, `backdrop` → `drupal`; or `none`. A matching request (login/session cookie, admin URI, dynamic arg) skips lookup **and storage** and goes straight to origin. **Every preset is opt-in**; names **stack**, separated by spaces or `\|` (`wordpress\|woocommerce` == `wordpress woocommerce`). Implies `cache_turbo_cache_control honor`. **`none`** means no preset here and exists to override one inherited from the `server` block; it is exclusive and does not imply `honor`. **`generic`/`auto` were removed** and are now a config error — the union was never a safe default ([why](#cms-backends-cache_turbo_backend)). Cookie names that an app lets you rename still need an explicit local rule; see each [application guide](docs/README.md). There is **no `django`/`laravel` preset** and never will be ([why](docs/frameworks.md)); Jira, Request Tracker and several other session-eager trackers are intentional non-presets ([research](docs/README.md#apps-we-deliberately-do-not-ship-a-preset-for)). |
 | `cache_turbo_suppress_native on` | `server`, `location` | `off` | Make `$cache_turbo_active` read `1` while cache-turbo owns a request, so a stacked native `proxy_cache` can defer via `proxy_no_cache $cache_turbo_active; proxy_cache_bypass $cache_turbo_active;`. Off (default) keeps the variable always `0` (the wiring stays inert). |
-| `cache_turbo_key STRING` | `server`, `location` | normalized | What makes two requests "the same page". The default is `$host$uri$cache_turbo_normalized_args` — Host + **normalized args** (tracking params stripped, args sorted). |
+| `cache_turbo_key STRING` | `server`, `location` | raw | What makes two requests "the same page". The built-in default is `$host$uri$query_string` — Host + raw unparsed path/query, with **no argument normalization**. To enable normalized matching (params stripped, args sorted), set it to `$host$uri$cache_turbo_normalized_args` explicitly. |
 | `cache_turbo_preset NAME` | `server`, `location` | `balanced` | `micro` / `conservative` / `balanced` / `aggressive` — sets the four knobs below at once. `micro` = 1s microcaching (valid 1s, lock_ttl 1s, ×2 stale). |
 | `cache_turbo_valid [CODE...] TIME` | `server`, `location` | preset (`60s`) | How long a copy stays *fresh* (then *stale*, still served). Bare `TIME` = the default/200 TTL. `TIME` of `0` = cache forever (stays fresh, never expires). With leading status codes (`cache_turbo_valid 301 404 1m;`) it makes those statuses cacheable too — redirects + negative caching. Repeatable. |
 | `cache_turbo_beta N` | `server`, `location` | preset (`1000`) | Refresh eagerness, ×1000 (1000 = 1.0). Higher = refresh sooner/more often. |
@@ -1682,7 +1685,7 @@ http {
 | `GET /_cache` | JSON stats (`?autotune=1` also forces an autotune recompute first). |
 | `GET /_cache?format=prometheus` | Same stats in Prometheus text format — scrape this. |
 | `POST /_cache?all=1` | Purge the whole zone (and the L2 keyspace, if Redis is on). The L2 side is a `SCAN MATCH <prefix>*` walk; if that walk does **not** finish — read timeout, malformed reply, or the internal page cap — the response is `500` with `{"purged":N,"l2":"incomplete","reason":"…"}` and part of L2 still holds entries. If the walk cannot even start — L2 unreachable, connect refused — the response is `500` with `{"purged":N,"l2":"unavailable"}` and L2 is untouched. A `200` means the walk reached the end of the keyspace. |
-| `POST /_cache?key=<string>` | Purge one entry. `<string>` is hashed **verbatim**, so it must equal the entry's full cache-key value — for the default key that is `<host><uri><normalized-args>` (e.g. `example.com/blog/post-42`), **not** just the path. Use a `PURGE` request to that URL (above) if you don't want to reconstruct the key. Drops L1 + L2. |
+| `POST /_cache?key=<string>` | Purge one entry. `<string>` is hashed **verbatim**, so it must equal the entry's full cache-key value — for the built-in default key that is `<host><uri><raw-query-string>` (e.g. `example.com/blog/post-42?id=1`), **not** just the path. Use a `PURGE` request to that URL (above) if you don't want to reconstruct the key. Drops L1 + L2. |
 | `POST /_cache?tag=<name>` | Purge every page tagged `<name>` across L1 + L2. |
 | `POST /_cache?url=<path[,path,...]>` | Warm those paths (background prefetch). Each warm subrequest fetches **anonymously** — the admin request's `Cookie` header is stripped, so the entry is stored under the cookieless anonymous key a visitor looks up (and no per-visitor/segment body is pulled from the origin), even if you trigger the warm from a logged-in browser. |
 
