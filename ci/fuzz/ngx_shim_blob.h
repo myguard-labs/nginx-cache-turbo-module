@@ -35,6 +35,16 @@ typedef ngx_int_t  ngx_flag_t;
  * faithful choice for the two accessor helpers the slice pulls in. */
 #define ngx_inline  inline
 
+/* blob_validate() bounds `created` against "now" (AUD-BLOB-CREATED). The real
+ * nginx ngx_time() reads a cached time_t updated once per event-loop tick;
+ * plain time(NULL) is a faithful-enough stand-in for a harness that only needs
+ * "roughly current wall clock", and keeps this shim dependency-free. */
+static ngx_inline time_t
+ngx_time(void)
+{
+    return time(NULL);
+}
+
 /* Mirrors src/core/ngx_string.c ngx_strncasecmp(): ASCII tolower on both
  * operands, stop at n bytes or at the first NUL in either. The skip[] entries
  * are C literals so their NUL terminates; `name` is length-bounded by nlen,
