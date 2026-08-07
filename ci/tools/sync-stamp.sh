@@ -123,10 +123,28 @@ optional_find() {
     return 0
 }
 
+# .github/workflows is REQUIRED, unlike the two optional trees below, so it gets
+# the same symlink/non-directory rejection rather than a bare `find`: `find` over
+# a regular file or a symlinked directory exits 0 having matched nothing, and with
+# .github/actions still yielding targets `count` stays non-zero -- --check would
+# then report success while gating no workflow at all.
+required_find() {
+    local d="$1"
+    shift
+    if [ -L "$d" ] || [ ! -d "$d" ]; then
+        echo "sync-stamp: $d must be a real directory" >&2
+        return 1
+    fi
+    find "$d" "$@" -print0
+}
+
+# -type f on every selector: a symlink matches -name, and insert_stamp() writes
+# through it (`cat >"$f"` follows), so a symlinked target would let a file in the
+# repo redirect a stamp write to an arbitrary path outside the checkout.
 targets() {
-    find .github/workflows -maxdepth 1 \( -name '*.yml' -o -name '*.yaml' \) -print0 &&
-        optional_find .github/scripts -maxdepth 1 -name '*.sh' &&
-        optional_find .github/actions \( -name 'action.yml' -o -name 'action.yaml' \)
+    required_find .github/workflows -maxdepth 1 -type f \( -name '*.yml' -o -name '*.yaml' \) &&
+        optional_find .github/scripts -maxdepth 1 -type f -name '*.sh' &&
+        optional_find .github/actions -type f \( -name 'action.yml' -o -name 'action.yaml' \)
 }
 
 # The digest of a file with its own stamp line stripped -- see THE
