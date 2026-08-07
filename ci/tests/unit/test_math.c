@@ -80,6 +80,43 @@ test_stale_ttl(void)
 
 
 static void
+test_add_ttl_clamped(void)
+{
+    /* normal add, well under TTL_MAX */
+    CHECK_EQ(ngx_http_cache_turbo_add_ttl_clamped(100, 50), 150,
+             "add_ttl_clamped normal add");
+
+    /* AUD-CC-DELTA-OVF: origin sends a Cache-Control delta of INT64_MAX
+     * (e.g. stale-while-revalidate=9223372036854775807, which ngx_atoi
+     * accepts verbatim -- it sits exactly at NGX_MAX_INT_T_VALUE, not past
+     * it). The delta must be clamped to TTL_MAX before the add, not after,
+     * or ttl + delta overflows signed time_t (UB, traps under UBSan on the
+     * unfixed code). */
+    CHECK_EQ(ngx_http_cache_turbo_add_ttl_clamped(60,
+                 (time_t) 9223372036854775807LL),
+             (time_t) 0xFFFFFFFF,
+             "add_ttl_clamped INT64_MAX delta -> TTL_MAX, no overflow");
+
+    /* base already at TTL_MAX plus any positive delta stays at TTL_MAX */
+    CHECK_EQ(ngx_http_cache_turbo_add_ttl_clamped((time_t) 0xFFFFFFFF, 100),
+             (time_t) 0xFFFFFFFF, "add_ttl_clamped base at ceiling");
+
+    /* sum lands exactly on TTL_MAX -> must NOT clamp (boundary, no off-by-one) */
+    CHECK_EQ(ngx_http_cache_turbo_add_ttl_clamped(100, (time_t) 0xFFFFFFFF - 100),
+             (time_t) 0xFFFFFFFF, "add_ttl_clamped exact boundary");
+
+    /* one under the boundary -> must NOT clamp */
+    CHECK_EQ(ngx_http_cache_turbo_add_ttl_clamped(100, (time_t) 0xFFFFFFFF - 101),
+             (time_t) 0xFFFFFFFF - 1, "add_ttl_clamped just under boundary");
+
+    /* negative delta (should not occur from the parser, but the helper must
+     * not underflow or subtract) treated as 0 */
+    CHECK_EQ(ngx_http_cache_turbo_add_ttl_clamped(100, -5), 100,
+             "add_ttl_clamped negative delta treated as 0");
+}
+
+
+static void
 test_should_refresh(void)
 {
     u_char  key[32];
@@ -242,6 +279,7 @@ int
 main(void)
 {
     test_stale_ttl();
+    test_add_ttl_clamped();
     test_should_refresh();
     test_autotune_record_cost();
     test_autotune_verdict();

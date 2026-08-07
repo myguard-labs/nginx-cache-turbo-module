@@ -8052,10 +8052,11 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
         if (ttl > 0 && !clcf->ignore_cc) {
             time_t  swr = ngx_http_cache_turbo_response_swr(r);
             if (swr >= 0) {
-                stale_window = ttl + swr;
-                if (stale_window > NGX_HTTP_CACHE_TURBO_TTL_MAX) {
-                    stale_window = NGX_HTTP_CACHE_TURBO_TTL_MAX;
-                }
+                /* AUD-CC-DELTA-OVF: swr is parsed straight off the wire and can
+                 * be up to NGX_MAX_INT_T_VALUE (e.g. stale-while-revalidate=
+                 * 9223372036854775807) -- clamp the delta BEFORE the add, not
+                 * the sum after, or ttl + swr overflows signed time_t (UB). */
+                stale_window = ngx_http_cache_turbo_add_ttl_clamped(ttl, swr);
                 ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                                "cache_turbo: stale-while-revalidate=%T \"%V\"",
                                swr, &r->uri);
@@ -8089,10 +8090,9 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
              * the wire format turns over once (single cold-cache event). */
             time_t  sie = ngx_http_cache_turbo_response_sie(r);
             if (sie >= 0) {
-                sie_window = ttl + sie;
-                if (sie_window > NGX_HTTP_CACHE_TURBO_TTL_MAX) {
-                    sie_window = NGX_HTTP_CACHE_TURBO_TTL_MAX;
-                }
+                /* AUD-CC-DELTA-OVF: same wire-controlled overflow as the swr
+                 * clamp above -- clamp the delta before the add. */
+                sie_window = ngx_http_cache_turbo_add_ttl_clamped(ttl, sie);
                 ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                                "cache_turbo: stale-if-error=%T \"%V\"",
                                sie, &r->uri);
