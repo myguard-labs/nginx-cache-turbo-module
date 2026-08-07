@@ -1402,6 +1402,97 @@ ngx_http_cache_turbo_header_find(ngx_list_t *headers, const char *name,
 
 
 /*
+ * HTTP allows a field to be split across multiple field-lines with the same
+ * name (RFC 9110 §5.3), semantically equivalent to one line with the values
+ * comma-joined in order. header_find() above only returns the FIRST
+ * occurrence, which is fine for headers we treat as singular, but
+ * Cache-Control is combinable: a directive on a LATER line is just as
+ * binding as one on the first. ngx_http_cache_turbo_response_cacheable()
+ * already walks every line explicitly (it needs the raw ngx_table_elt_t to
+ * also check the header name and Set-Cookie); these two helpers give the
+ * same guarantee to callers that only need a directive lookup on the
+ * response Cache-Control header, folding the list walk in once instead of
+ * being copy-pasted per caller.
+ *
+ * cc_has_all: true if the named directive appears on ANY Cache-Control line.
+ * cc_delta_all: numeric value of the named directive from the FIRST line
+ * that carries it (document order), matching the precedence a single
+ * comma-joined line would give under cc_delta's existing first-match rule.
+ */
+static ngx_int_t
+ngx_http_cache_turbo_cc_has_all(ngx_list_t *headers, const char *name,
+    size_t nlen)
+{
+    ngx_list_part_t  *part = &headers->part;
+    ngx_table_elt_t  *h = part->elts;
+    ngx_uint_t         i;
+
+    for (i = 0; /* void */ ; i++) {
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            h = part->elts;
+            i = 0;
+        }
+        if (h[i].hash == 0 || h[i].key.len != sizeof("Cache-Control") - 1) {
+            continue;
+        }
+        if (ngx_strncasecmp(h[i].key.data, (u_char *) "Cache-Control",
+                             sizeof("Cache-Control") - 1) != 0)
+        {
+            continue;
+        }
+        if (ngx_http_cache_turbo_cc_has(h[i].value.data,
+                h[i].value.data + h[i].value.len, name, nlen))
+        {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+
+static time_t
+ngx_http_cache_turbo_cc_delta_all(ngx_list_t *headers, const char *name,
+    size_t nlen)
+{
+    ngx_list_part_t  *part = &headers->part;
+    ngx_table_elt_t  *h = part->elts;
+    ngx_uint_t         i;
+    time_t             t;
+
+    for (i = 0; /* void */ ; i++) {
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            h = part->elts;
+            i = 0;
+        }
+        if (h[i].hash == 0 || h[i].key.len != sizeof("Cache-Control") - 1) {
+            continue;
+        }
+        if (ngx_strncasecmp(h[i].key.data, (u_char *) "Cache-Control",
+                             sizeof("Cache-Control") - 1) != 0)
+        {
+            continue;
+        }
+        t = ngx_http_cache_turbo_cc_delta(h[i].value.data,
+                h[i].value.data + h[i].value.len, name, nlen);
+        if (t >= 0) {
+            return t;
+        }
+    }
+
+    return -1;
+}
+
+
+/*
  * Fresh TTL derived from the response's own freshness headers (v7), or -1 if it
  * carries none. Priority ladder (highest first):
  *   1. Surrogate-Control: max-age    (Fastly/Akamai, RFC 9213)
@@ -1457,13 +1548,11 @@ ngx_http_cache_turbo_upstream_ttl(ngx_http_request_t *r)
     }
 
     if (cc.data != NULL) {
-        u_char  *cc_last = cc.data + cc.len;
-
-        t = ngx_http_cache_turbo_cc_delta(cc.data, cc_last, "s-maxage",
-                                          sizeof("s-maxage") - 1);
+        t = ngx_http_cache_turbo_cc_delta_all(&r->headers_out.headers,
+                "s-maxage", sizeof("s-maxage") - 1);
         if (t < 0) {
-            t = ngx_http_cache_turbo_cc_delta(cc.data, cc_last, "max-age",
-                                              sizeof("max-age") - 1);
+            t = ngx_http_cache_turbo_cc_delta_all(&r->headers_out.headers,
+                    "max-age", sizeof("max-age") - 1);
         }
         if (t >= 0) {
             return t;
@@ -1492,21 +1581,10 @@ ngx_http_cache_turbo_upstream_ttl(ngx_http_request_t *r)
 static ngx_int_t
 ngx_http_cache_turbo_response_must_revalidate(ngx_http_request_t *r)
 {
-    ngx_str_t  cc;
-    u_char    *v, *e;
-
-    cc = ngx_http_cache_turbo_header_find(&r->headers_out.headers,
-             "Cache-Control", sizeof("Cache-Control") - 1);
-    if (cc.data == NULL) {
-        return 0;
-    }
-
-    v = cc.data;
-    e = cc.data + cc.len;
-    return (ngx_http_cache_turbo_cc_has(v, e, "must-revalidate",
-                sizeof("must-revalidate") - 1)
-            || ngx_http_cache_turbo_cc_has(v, e, "proxy-revalidate",
-                sizeof("proxy-revalidate") - 1)) ? 1 : 0;
+    return (ngx_http_cache_turbo_cc_has_all(&r->headers_out.headers,
+                "must-revalidate", sizeof("must-revalidate") - 1)
+            || ngx_http_cache_turbo_cc_has_all(&r->headers_out.headers,
+                "proxy-revalidate", sizeof("proxy-revalidate") - 1)) ? 1 : 0;
 }
 
 
@@ -1520,14 +1598,7 @@ ngx_http_cache_turbo_response_must_revalidate(ngx_http_request_t *r)
 static time_t
 ngx_http_cache_turbo_response_swr(ngx_http_request_t *r)
 {
-    ngx_str_t  cc;
-
-    cc = ngx_http_cache_turbo_header_find(&r->headers_out.headers,
-             "Cache-Control", sizeof("Cache-Control") - 1);
-    if (cc.data == NULL) {
-        return -1;
-    }
-    return ngx_http_cache_turbo_cc_delta(cc.data, cc.data + cc.len,
+    return ngx_http_cache_turbo_cc_delta_all(&r->headers_out.headers,
                "stale-while-revalidate", sizeof("stale-while-revalidate") - 1);
 }
 
@@ -1543,14 +1614,7 @@ ngx_http_cache_turbo_response_swr(ngx_http_request_t *r)
 static time_t
 ngx_http_cache_turbo_response_sie(ngx_http_request_t *r)
 {
-    ngx_str_t  cc;
-
-    cc = ngx_http_cache_turbo_header_find(&r->headers_out.headers,
-             "Cache-Control", sizeof("Cache-Control") - 1);
-    if (cc.data == NULL) {
-        return -1;
-    }
-    return ngx_http_cache_turbo_cc_delta(cc.data, cc.data + cc.len,
+    return ngx_http_cache_turbo_cc_delta_all(&r->headers_out.headers,
                "stale-if-error", sizeof("stale-if-error") - 1);
 }
 
