@@ -1,3 +1,4 @@
+# sync-sha: e089228b270c9f5eb18e79da3a69fa88a68bd749ba0d821ffab73303597ee227
 name: Security scanners
 
 # Static/security scanners gate (flawfinder, clang-tidy cert-*/security.*,

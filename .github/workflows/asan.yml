@@ -1,3 +1,4 @@
+# sync-sha: ba4340d33556ddc768a29c9f44a1352d13999d51692306fe1447262359b25a8e
 name: ASan and UBSan
 
 # Dedicated ASan+UBSan workflow, PATH-GATED: only runs when a PR/push touches

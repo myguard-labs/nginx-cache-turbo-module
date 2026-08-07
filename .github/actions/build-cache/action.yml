@@ -1,3 +1,4 @@
+# sync-sha: a8b31429c71e0b509da7eda9353b332aac2ea3794c6481bd591b5a935ba163c0
 name: Build cache
 description: >-
   Restore the ccache + upstream-tarball caches for one build. Hybrid by design:
