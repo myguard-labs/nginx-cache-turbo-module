@@ -195,14 +195,23 @@ insert_stamp() {
 # --check reports "all N file(s) current" while silently covering fewer files
 # than it should. Materialising the list first makes that failure catchable.
 raw_list="$(mktemp)"
-trap 'rm -f "$raw_list"' EXIT
+sorted_list="$(mktemp)"
+trap 'rm -f "$raw_list" "$sorted_list"' EXIT
 if ! targets >"$raw_list"; then
     echo "sync-stamp: target discovery failed -- refusing to report a partial result" >&2
     exit 2
 fi
 
+# Same reason the discovery above is materialised: `mapfile` reports its OWN
+# status, not that of the process substitution feeding it, so a sort that dies
+# after partial output would load a subset and --check would pass on it.
+if ! LC_ALL=C sort -z -- "$raw_list" >"$sorted_list"; then
+    echo "sync-stamp: target sorting failed -- refusing to report a partial result" >&2
+    exit 2
+fi
+
 targets_list=()
-mapfile -t -d '' targets_list < <(LC_ALL=C sort -z -- "$raw_list")
+mapfile -t -d '' targets_list <"$sorted_list"
 
 rc=0
 count=0
