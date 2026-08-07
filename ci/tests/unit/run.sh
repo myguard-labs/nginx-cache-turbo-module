@@ -33,6 +33,13 @@ fi
 "$CC" $CFLAGS "$DIR/test_vary_gen.c" -o "$DIR/test_vary_gen"
 "$DIR/test_vary_gen"
 
+# --- EVP digest failure path (AUD-DIGEST-ZERO) ----------------------------
+# Unit test for the fail-closed digest handling. Tests that EVP failures are
+# propagated to callers instead of silently producing all-zero keys.
+# shellcheck disable=SC2086
+"$CC" $CFLAGS "$DIR/test_digest_fail.c" -o "$DIR/test_digest_fail" -lssl -lcrypto
+"$DIR/test_digest_fail"
+
 # --- L2 blob deserializer fixtures (AUD-HDR1 / AUD-FUZZ1) -----------------
 # Deterministic, hermetic (no nginx tree, no libFuzzer engine): one fixture per
 # header-injection primitive, driven through the SAME oracle ci/fuzz/fuzz_blob.c

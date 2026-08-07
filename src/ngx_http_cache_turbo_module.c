@@ -625,6 +625,11 @@ typedef struct {
 static EVP_MD_CTX  *ngx_http_cache_turbo_worker_md;
 #endif
 
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+static ngx_uint_t  ngx_http_cache_turbo_test_digest_fail = 0;
+#endif
+
 
 static void
 ngx_http_cache_turbo_digest_init(ngx_http_cache_turbo_digest_t *d)
@@ -662,40 +667,50 @@ ngx_http_cache_turbo_digest_update(ngx_http_cache_turbo_digest_t *d,
 }
 
 
-/* Finalise into the 32-byte slot. */
-static void
+/* Finalise into the 32-byte slot. Returns NGX_OK on success, NGX_ERROR on failure. */
+static ngx_int_t
 ngx_http_cache_turbo_digest_final(ngx_http_cache_turbo_digest_t *d,
     u_char out[32])
 {
 #if (NGX_SSL)
     unsigned int  n = 0;
 
-    if (d->ok && EVP_DigestFinal_ex(d->md, out, &n) == 1 && n == 32) {
-        /* ok */
-    } else {
-        /* EVP_MD_CTX alloc/finalise failure (OOM) — degrade to a fixed slot
-         * rather than read uninitialised bytes. Practically unreachable. */
-        ngx_memzero(out, 32);
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+    if (ngx_http_cache_turbo_test_digest_fail) {
+        d->md = NULL;
+        return NGX_ERROR;
     }
-    /* P6: the ctx is worker-persistent — do NOT free it here. The next
-     * digest_init() re-keys it via EVP_DigestInit_ex(); exit_process frees it. */
-    d->md = NULL;
+#endif
+
+    if (d->ok && EVP_DigestFinal_ex(d->md, out, &n) == 1 && n == 32) {
+        /* P6: the ctx is worker-persistent — do NOT free it here. The next
+         * digest_init() re-keys it via EVP_DigestInit_ex(); exit_process frees it. */
+        d->md = NULL;
+        return NGX_OK;
+    } else {
+        /* EVP_MD_CTX alloc/finalise failure (OOM) — fail closed: return error
+         * so the caller skips caching rather than storing under an all-zero key. */
+        d->md = NULL;
+        return NGX_ERROR;
+    }
 #else
     ngx_md5_final(out, &d->lo);          /* low 16 */
     ngx_md5_final(out + 16, &d->hi);     /* high 16 */
+    return NGX_OK;
 #endif
 }
 
 
-/* One-shot convenience for a single contiguous input. */
-static void
+/* One-shot convenience for a single contiguous input. Returns NGX_OK on success, NGX_ERROR on failure. */
+static ngx_int_t
 ngx_http_cache_turbo_digest(const void *data, size_t len, u_char out[32])
 {
     ngx_http_cache_turbo_digest_t  d;
 
     ngx_http_cache_turbo_digest_init(&d);
     ngx_http_cache_turbo_digest_update(&d, data, len);
-    ngx_http_cache_turbo_digest_final(&d, out);
+    return ngx_http_cache_turbo_digest_final(&d, out);
 }
 
 
@@ -1134,8 +1149,11 @@ ngx_http_cache_turbo_build_key(ngx_http_request_t *r,
      * 16 with the high 16 zeroed = effectively 128-bit). ctx is pcalloc'd, but
      * the digest fills all 32 bytes regardless.
      */
-    ngx_http_cache_turbo_digest(ctx->cache_key.data, ctx->cache_key.len,
-                                ctx->key_hash);
+    if (ngx_http_cache_turbo_digest(ctx->cache_key.data, ctx->cache_key.len,
+                                    ctx->key_hash) != NGX_OK)
+    {
+        return NGX_ERROR;
+    }
 
     return NGX_OK;
 }
