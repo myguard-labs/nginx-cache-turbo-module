@@ -113,6 +113,7 @@ ngx_atomic_fetch_add(ngx_atomic_t *value, ngx_atomic_int_t add)
 /* Prototypes for the units under test (definitions come from the #included
  * .c files in the driver). */
 time_t    ngx_http_cache_turbo_stale_ttl(time_t fresh_ttl, ngx_int_t stale_mult);
+time_t    ngx_http_cache_turbo_add_ttl_clamped(time_t base, time_t delta);
 ngx_int_t ngx_http_cache_turbo_should_refresh(u_char *key_hash,
               time_t fresh_until, time_t stale_window, ngx_int_t beta_milli);
 void      ngx_http_cache_turbo_autotune_record_cost(

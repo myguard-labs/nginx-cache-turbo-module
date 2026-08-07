@@ -2134,6 +2134,7 @@ const char *ngx_http_cache_turbo_shm_breaker_state_str(ngx_uint_t state);
 
 /* ---- swr.c ---- */
 time_t    ngx_http_cache_turbo_stale_ttl(time_t fresh_ttl, ngx_int_t stale_mult);
+time_t    ngx_http_cache_turbo_add_ttl_clamped(time_t base, time_t delta);
 ngx_int_t ngx_http_cache_turbo_should_refresh(u_char *key_hash,
     time_t fresh_until, time_t stale_window, ngx_int_t beta_milli);
 

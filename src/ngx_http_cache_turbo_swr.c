@@ -40,6 +40,38 @@ ngx_http_cache_turbo_stale_ttl(time_t fresh_ttl, ngx_int_t stale_mult)
 
 
 /*
+ * AUD-CC-DELTA-OVF: add a response-declared delta (stale-while-revalidate=N /
+ * stale-if-error=N, parsed straight off the wire by ngx_http_cache_turbo_cc_
+ * delta and therefore attacker/origin controlled up to NGX_MAX_INT_T_VALUE) to
+ * a base TTL, and return the sum clamped to NGX_HTTP_CACHE_TURBO_TTL_MAX.
+ *
+ * The clamp has to land on the INPUT delta, before the addition: `base + delta`
+ * with delta near INT64_MAX overflows signed time_t (UB) before any post-hoc
+ * "if (sum > MAX) sum = MAX" check ever runs — the same STAB-5 shape as
+ * ngx_http_cache_turbo_stale_ttl's pre-multiply clamp above. base is always a
+ * clamped TTL (<= TTL_MAX) by the time callers reach this, so bounding delta to
+ * TTL_MAX makes the sum representable in time_t without touching base at all.
+ */
+time_t
+ngx_http_cache_turbo_add_ttl_clamped(time_t base, time_t delta)
+{
+    if (delta < 0) {
+        delta = 0;
+    }
+
+    if (delta > NGX_HTTP_CACHE_TURBO_TTL_MAX) {
+        delta = NGX_HTTP_CACHE_TURBO_TTL_MAX;
+    }
+
+    if (base > NGX_HTTP_CACHE_TURBO_TTL_MAX - delta) {
+        return NGX_HTTP_CACHE_TURBO_TTL_MAX;
+    }
+
+    return base + delta;
+}
+
+
+/*
  * Decide whether the current read should win the refresh dice.
  *
  * Probability model (linear rise across the stale window): at fresh_until the
