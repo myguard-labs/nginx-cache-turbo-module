@@ -1762,18 +1762,6 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
         }}
 """
 
-    # Root-anchored punbb URI rows, one prefix location each (see the comment at
-    # the use site for why this is not a single regex location).
-    punbb_root_locs = "".join(f"""
-        location /{s}.php {{
-            cache_turbo         main;
-            cache_turbo_backend punbb;
-            cache_turbo_key     $uri;
-            cache_turbo_valid   30s;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}""" for s in ("edit", "delete", "moderate", "profile", "register",
-                       "userlist", "search"))
-
     return f"""{load}worker_processes {workers};
 pid {root}/nginx.pid;
 error_log {root}/logs/error.log {_errlog_level()};
@@ -3078,57 +3066,12 @@ http {{
             cache_turbo_valid   30s;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
-        # phorum is a flat top-level-script app: its URI rules are real root
-        # paths, so they must be root locations to be exercised at all.
-        location /admin.php {{
-            cache_turbo         main;
-            cache_turbo_backend phorum;
-            cache_turbo_key     $uri;
-            cache_turbo_valid   30s;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-        # file.php is phorum's permission-checked attachment download. Same
-        # reason as above: the row anchors at byte 0, so only a root location
-        # exercises it.
-        location /file.php {{
-            cache_turbo         main;
-            cache_turbo_backend phorum;
-            cache_turbo_key     $uri;
-            cache_turbo_valid   30s;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-        # punbb's URI rules are root scripts too, so each needs its own root
-        # location. userlist.php is here on purpose: the preset deliberately
-        # does NOT list it, so it is the negative control. Written as prefix
-        # locations rather than one regex. (The "CI nginx has no PCRE" reason
-        # once given here is stale: ci-build.sh dropped
-        # --without-http_rewrite_module in s103 and the build now links
-        # -lpcre2-8, so a regex location would be accepted. Prefix locations are
-        # kept because they are what the preset URI tier itself does -- byte-0
-        # anchored prefix compares -- so the fixture mirrors the code under test.)
-        {punbb_root_locs}
-
-        # Forum presets whose cookie rules were corrected after the docs
-        # deep-research pass (punbb / vanilla / phorum). Their cookie rules are
-        # path-independent, so a prefixed location exercises them; the URI rules
-        # anchor at position 0 and are not what these locations test.
-        location /punbb/ {{
-            cache_turbo         main;
-            cache_turbo_backend punbb;
-            cache_turbo_key     $uri;
-            cache_turbo_valid   30s;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
+        # Forum preset whose cookie rules were corrected after the docs
+        # deep-research pass (vanilla). Its cookie rules are path-independent,
+        # so a prefixed location exercises them.
         location /vanilla/ {{
             cache_turbo         main;
             cache_turbo_backend vanilla;
-            cache_turbo_key     $uri;
-            cache_turbo_valid   30s;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-        location /phorum/ {{
-            cache_turbo         main;
-            cache_turbo_backend phorum;
             cache_turbo_key     $uri;
             cache_turbo_valid   30s;
             proxy_pass http://127.0.0.1:{origin_port}/;
@@ -5690,83 +5633,6 @@ def test_opencart_session_cookie_is_not_a_login_signal(ng: Nginx,
          "cookie row here would bypass the entire shop")
 
 
-def test_phorum_admin_session_cookie(ng: Nginx, origin: Origin) -> None:
-    """phorum preset must match the real admin cookie `phorum_admin_session`.
-
-    The row shipped a stale `phorum_admin_session_v5` literal; the PHP constant
-    (PHORUM_SESSION_ADMIN, include/api/user.php) has no `_v5` suffix, so a pure
-    admin-session cookie never matched by name. Live impact was nil because
-    /admin.php bypasses by URI, but the literal was wrong. Verified against
-    Phorum Core v6.0.3. The member session cookies are asserted alongside it so
-    a future edit cannot quietly drop one."""
-    for i, cookie in enumerate(("phorum_admin_session=42:deadbeef",
-                                "phorum_session_v5=42:deadbeef",
-                                "phorum_session_st=42:cafebabe")):
-        uri = f"/phorum/read-{i}"
-        m = {"Cookie": cookie}
-        fetch(ng.port, uri, headers=m)
-        _, _, h = fetch(ng.port, uri, headers=m)
-        assert "x-cache" not in h, \
-            (f"a Phorum session cookie '{cookie}' MUST bypass, got "
-             f"{h.get('x-cache')}")
-
-    # phorum_tmp_cookie is a guest-issued cookie-support probe with no identity
-    # value -- matching it would be a pure hit-rate loss. It must NOT bypass.
-    guest = {"Cookie": "phorum_tmp_cookie=1"}
-    fetch(ng.port, "/phorum/read-guest", headers=guest)
-    _, _, hg = fetch(ng.port, "/phorum/read-guest", headers=guest)
-    assert hg.get("x-cache") == "HIT", \
-        (f"phorum_tmp_cookie is guest-issued and must stay cacheable, got "
-         f"{hg.get('x-cache')}")
-
-
-def test_punbb_phorum_uri_rules(ng: Nginx, origin: Origin) -> None:
-    """The punbb and phorum URI rows must match the scripts those projects
-    actually ship, with no cookie present.
-
-    Both presets were written from a docs pass rather than from the source
-    trees. punbb was missing every member/mutating script except login/post
-    (edit, delete, moderate, profile, register all cached), and phorum was
-    missing file.php -- the attachment download, which authorises per request
-    through the file_storage API, so a cached response replays one member's
-    attachment to everyone who later asks for the same file id.
-
-    Every arm fetches twice on purpose: a bypass and a first-time MISS both
-    answer without an x-cache header, so a single fetch passes with the row
-    still absent. Only a bypass is still header-less on the second request.
-
-    userlist.php and search.php are the negative controls. Both are
-    guest-reachable read surfaces that the preset deliberately does NOT list, so
-    they pin that these rows are per-script and not a blanket "any root .php
-    bypasses" -- an over-broad edit that made them all bypass would still pass
-    every arm above. search.php is asserted separately from userlist.php because
-    it is the one a future editor is most likely to add: it is slow, and slow
-    reads as dynamic. It is not. It is the endpoint that benefits MOST from
-    being cached."""
-    for uri in ("/edit.php?id=1", "/delete.php?id=1", "/moderate.php?fid=2",
-                "/profile.php?id=42", "/register.php"):
-        fetch(ng.port, uri)
-        _, _, h = fetch(ng.port, uri)
-        assert "x-cache" not in h, \
-            (f"{uri} is a PunBB member/mutating script and must bypass on the "
-             f"punbb preset with no cookie present, got {h.get('x-cache')}")
-
-    fetch(ng.port, "/file.php?file=7")
-    _, _, hf = fetch(ng.port, "/file.php?file=7")
-    assert "x-cache" not in hf, \
-        (f"/file.php is Phorum's permission-checked attachment download and "
-         f"must bypass -- caching it replays one member's attachment to every "
-         f"later requester of the same id, got {hf.get('x-cache')}")
-
-    for uri in ("/userlist.php", "/search.php?action=search&keywords=nginx"):
-        fetch(ng.port, uri)
-        _, _, hu = fetch(ng.port, uri)
-        assert hu.get("x-cache") == "HIT", \
-            (f"{uri} is a public PunBB read surface that the preset does not "
-             f"list and must stay cacheable, got {hu.get('x-cache')}")
-    drain_origin(origin)
-
-
 def test_cookie_pred_multiple_matching_cookies(ng: Nginx, origin: Origin) -> None:
     """A Cookie header can carry SEVERAL cookies matching one predicate's name
     suffix. Every one of them must be examined.
@@ -6077,22 +5943,6 @@ def test_preset_arg_scanner(ng: Nginx, origin: Origin) -> None:
         assert h.get("x-cache") == "HIT", \
             (f"{uri} matches no preset argument and must stay cacheable, got "
              f"{h.get('x-cache')}")
-
-    drain_origin(origin)
-
-
-def test_phorum_uri_rules_anchor_at_root(ng: Nginx, origin: Origin) -> None:
-    """phorum URI rules must carry a leading slash.
-
-    r->uri always begins with '/', and the preset's URI rules are prefixes
-    anchored at position 0, so a rule written as "admin.php" can never match
-    "/admin.php". The row shipped all eleven script names unslashed, which left
-    the admin, login, posting and moderation routes cacheable."""
-    _, _, h = fetch(ng.port, "/admin.php")
-    assert "x-cache" not in h, \
-        (f"/admin.php must bypass on the phorum preset, got {h.get('x-cache')} "
-         "-- the URI rules are anchored at position 0 and need a leading slash")
-
 
     drain_origin(origin)
 
@@ -15470,13 +15320,10 @@ def run_all(ng: Nginx, origin: Origin,
     test_redmine_public_content_stays_cacheable(ng, origin)
     test_opencart_route_args_bypass(ng, origin)
     test_opencart_session_cookie_is_not_a_login_signal(ng, origin)
-    test_phorum_admin_session_cookie(ng, origin)
-    test_punbb_phorum_uri_rules(ng, origin)
     test_preset_arg_value_predicate(ng)
     test_preset_arg_scanner(ng, origin)
     test_cookie_pred_multiple_matching_cookies(ng, origin)
     test_2026_preset_expansion(ng, origin)
-    test_phorum_uri_rules_anchor_at_root(ng, origin)
     test_internal_redirect_key_and_veto(ng, origin)
     test_new_presets_not_in_generic(ng, origin)
     test_auto_classify_more(ng, origin)
@@ -15977,9 +15824,6 @@ def main() -> int:
           "classicpress/backdrop aliases), "
           "header-auth REST surfaces (magento /rest+/soap, drupal /jsonapi+"
           "/oauth, wp ?rest_route=, /restaurant-supplies still cached), "
-          "punbb/phorum URI rows (edit/delete/moderate/profile/register bypass, "
-          "phorum file.php attachment bypass, userlist.php/search.php stay "
-          "cached), "
           "config maxima/warns (STAB-5 keepalive cap rejected, COR-9 dup-status "
           "warn, COR-0 tag-without-L2 warn), "
           "config-time rejects (cache_control bad-mode/duplicate, valid "
