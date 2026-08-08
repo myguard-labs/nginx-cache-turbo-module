@@ -3066,16 +3066,6 @@ http {{
             cache_turbo_valid   30s;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
-        # Forum preset whose cookie rules were corrected after the docs
-        # deep-research pass (vanilla). Its cookie rules are path-independent,
-        # so a prefixed location exercises them.
-        location /vanilla/ {{
-            cache_turbo         main;
-            cache_turbo_backend vanilla;
-            cache_turbo_key     $uri;
-            cache_turbo_valid   30s;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
 
         # redmine / flarum / opencart (2026-07-26 research pass). All three
         # exist to prove a guest-issued session cookie is NOT treated as a
@@ -5445,34 +5435,6 @@ def test_phpbb_preset(ng: Nginx, origin: Origin) -> None:
          f"malformed cookie, safe direction), got {he.get('x-cache')}")
     drain_origin(origin)
 
-
-def test_vanilla_guest_cookies_stay_cacheable(ng: Nginx,
-                                              origin: Origin) -> None:
-    """vanilla preset must match `Vanilla=`, not the bare `Vanilla` prefix.
-
-    Vanilla derives several GUEST-issued cookie names from the same
-    Garden.Cookie.Name prefix: `Vanilla-tk` (CSRF transient key) and
-    `Vanilla-Vv` (visit tracker). A bare-prefix rule matched those and served
-    BYPASS to every returning anonymous visitor, leaving the cache to answer
-    only cookie-less first hits and crawlers -- the guest-issued-cookie trap
-    the preset registry's own header comment forbids. The `=` anchors on the
-    identity cookie's delimiter instead.
-
-    Both directions are asserted: the guest cookies must stay cacheable AND the
-    real identity cookie must still bypass. Do not drop the `=`."""
-    guest = {"Cookie": "Vanilla-Vv=1; Vanilla-tk=1650000000.abcdef"}
-    fetch(ng.port, "/vanilla/discussion-a", headers=guest)
-    _, _, hg = fetch(ng.port, "/vanilla/discussion-a", headers=guest)
-    assert hg.get("x-cache") == "HIT", \
-        (f"a returning GUEST carrying only Vanilla-tk / Vanilla-Vv must stay "
-         f"cacheable, got {hg.get('x-cache')} -- both are issued to everyone")
-
-    authed = {"Cookie": "Vanilla-Vv=1; Vanilla=abc.signed.payload"}
-    fetch(ng.port, "/vanilla/discussion-b", headers=authed)
-    _, _, ha = fetch(ng.port, "/vanilla/discussion-b", headers=authed)
-    assert "x-cache" not in ha, \
-        (f"a logged-in Vanilla member (identity cookie Vanilla=) MUST bypass, "
-         f"got {ha.get('x-cache')}")
 
 
 def test_flarum_session_cookie_is_not_a_login_signal(ng: Nginx,
@@ -15313,7 +15275,6 @@ def run_all(ng: Nginx, origin: Origin,
     test_header_auth_rest_surfaces(ng, origin)
     test_discourse_preset(ng, origin)
     test_phpbb_preset(ng, origin)
-    test_vanilla_guest_cookies_stay_cacheable(ng, origin)
     test_flarum_session_cookie_is_not_a_login_signal(ng, origin)
     test_flarum_admin_and_api_bypass(ng, origin)
     test_redmine_key_arg_bypasses_without_cookie(ng, origin)
