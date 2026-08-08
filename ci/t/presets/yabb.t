@@ -163,14 +163,21 @@ __DATA__
 # beginning with a listed one would bypass -- a hit-rate loss that widens every
 # time a row is added. Requesting an unlisted extension of a listed value pins
 # the comparison as whole-value.
+#
+# post2 gets its own positive arm rather than riding on the post row above.
+# `action=post2` starts with the whole of `action=post`, so if the post2 row were
+# deleted the negative below would STILL pass -- postfoo is unlisted either way.
+# Only an explicit post2 bypass fails when its row goes.
 --- http_config eval: $::HttpConfig
 --- config eval: $::Config
 --- request eval
-["GET /yabb/d1.pl?action=postfoo", "GET /yabb/d1.pl?action=postfoo"]
+["GET /yabb/d1.pl?action=postfoo", "GET /yabb/d1.pl?action=postfoo",
+ "GET /yabb/d2.pl?action=post2",   "GET /yabb/d2.pl?action=post2"]
 --- response_headers eval
-[qq{X-Cache: }, qq{X-Cache: HIT}]
+[qq{X-Cache: }, qq{X-Cache: HIT},
+ qq{X-Cache: }, qq{X-Cache: }]
 --- error_code eval
-[200, 200]
+[200, 200, 200, 200]
 
 
 
