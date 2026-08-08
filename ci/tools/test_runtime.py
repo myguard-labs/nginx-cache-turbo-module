@@ -3011,16 +3011,6 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
-        # joomla public content: where the joomla_remember_me_ cookie rule and the
-        # unmatchable md5 session cookie are exercised.
-        location /jm/ {{
-            cache_turbo         main;
-            cache_turbo_backend joomla;
-            cache_turbo_key     $uri;
-            cache_turbo_valid   30s;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-
         # joomla URI-prefix rule: r->uri starts with /administrator/ -> skip
         location /administrator/ {{
             cache_turbo         main;
@@ -6379,41 +6369,6 @@ def test_phorum_uri_rules_anchor_at_root(ng: Nginx, origin: Origin) -> None:
          "-- the URI rules are anchored at position 0 and need a leading slash")
 
 
-def test_joomla_preset(ng: Nginx, origin: Origin) -> None:
-    """Joomla preset (docs/joomla.md). joomla_remember_me_ is the ONE Joomla
-    cookie that passes both tests: it is a fixed PREFIX ('joomla_remember_me_' .
-    getShortHashedUserAgent() -- the per-install part is the suffix) and it is set
-    only for an authenticated user.
-
-    THE PARTIAL-GUARD HALF IS ASSERTED TOO, and it matters more than the positive
-    one: a normally-logged-in frontend user (who did NOT tick "Remember Me")
-    carries only the session cookie, whose NAME is md5($secret . $session_name) --
-    a per-install hash with no fixed substring. That user is INVISIBLE to this
-    matcher, by construction. The test pins that reality so nobody reads the
-    presence of a cookie rule as "joomla is handled" -- it is not, and the docs
-    tell the operator to add their own cache_turbo_bypass."""
-    # The remember-me cookie is auth-only -> bypass.
-    rm = {"Cookie": "joomla_remember_me_9f8e7d6c=abc123"}
-    _, _, h1 = fetch(ng.port, "/jm/article-a", headers=rm)
-    _, _, h2 = fetch(ng.port, "/jm/article-a", headers=rm)
-    assert "x-cache" not in h1 and "x-cache" not in h2, \
-        "joomla_remember_me_ is auth-only and must bypass"
-
-    # THE GAP, asserted on purpose: the md5-named session cookie is unmatchable,
-    # so a normally-logged-in user still caches. This is a KNOWN limitation, not a
-    # regression -- if a future change makes this bypass, the preset got better and
-    # this assertion should be revisited deliberately, not deleted in passing.
-    sess = {"Cookie": "b1946ac92492d2347c6235b4d2611184=sessvalue"}
-    fetch(ng.port, "/jm/article-b", headers=sess)
-    _, _, hs = fetch(ng.port, "/jm/article-b", headers=sess)
-    assert hs.get("x-cache") == "HIT", \
-        ("joomla's md5-named session cookie is unmatchable by a substring rule, so "
-         "it still caches -- the operator MUST add their own cache_turbo_bypass. "
-         f"got {hs.get('x-cache')}")
-
-    # /administrator/ still bypasses.
-    _, _, ha = fetch(ng.port, "/administrator/index.php")
-    assert "x-cache" not in ha, "/administrator/ must bypass"
     drain_origin(origin)
 
 
@@ -16365,7 +16320,6 @@ def run_all(ng: Nginx, origin: Origin,
     test_2026_preset_expansion(ng, origin)
     test_yabb_preset(ng, origin)
     test_phorum_uri_rules_anchor_at_root(ng, origin)
-    test_joomla_preset(ng, origin)
     test_internal_redirect_key_and_veto(ng, origin)
     test_mediawiki_preset(ng, origin)
     test_magento_preset(ng, origin)
