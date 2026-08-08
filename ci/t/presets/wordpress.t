@@ -56,6 +56,7 @@ our $Config = ct_config(
     { path => '/wp/',          backend => 'wordpress' },
     { path => '/wpq/',         backend => 'wordpress',
       extra => 'cache_turbo_key $request_uri;' },
+    { path => '/wp-json-extra', backend => 'wordpress' },
     { path => '/gen/',         backend => 'phpbb' },
 );
 
@@ -105,14 +106,15 @@ __DATA__
 
 
 === TEST 4: a URI needle is SEGMENT-TERMINATED -- a lookalike still caches
-# /wp-login.php only matches when the next byte is '/', '.' or end-of-URI.
-# /wp/wp-loginXphp is neither a real match nor a prefix collision; it must
-# cache. (Under the /wp/ location so the request actually reaches the
-# wordpress-backed config rather than 404ing with no location match.)
+# URI rules are prefix-anchored at byte 0, so the request must hit the needle
+# there directly (a /wp/-prefixed request never starts with /wp-login.php at
+# all and would prove nothing about this rule). /wp-login.phpX starts with
+# /wp-login.php but the next byte is 'X', not '/', '.' or end-of-URI -- the
+# segment-terminator check is what forces this to cache instead of bypass.
 --- http_config eval: $::HttpConfig
 --- config eval: $::Config
 --- request eval
-["GET /wp/wp-loginXphp", "GET /wp/wp-loginXphp"]
+["GET /wp-login.phpX", "GET /wp-login.phpX"]
 --- response_headers eval
 [qq{X-Cache: }, qq{X-Cache: HIT}]
 --- error_code eval
@@ -120,13 +122,15 @@ __DATA__
 
 
 
-=== TEST 5: /wp/wp-json-extra (not the real /wp-json/ prefix) still caches
-# The needle ends in '/', so it is a plain byte-0 prefix -- "/wp-json-extra"
-# does not start with "/wp-json/" and must not bypass.
+=== TEST 5: /wp-json-extra (not the real /wp-json/ prefix) still caches
+# Fetched at byte 0 via a dedicated /wp-json-extra location so it actually
+# reaches a wordpress-backed config. The needle /wp-json/ ends in '/', so this
+# is a plain byte-0 prefix comparison -- "/wp-json-extra" does not start with
+# "/wp-json/" and must not bypass.
 --- http_config eval: $::HttpConfig
 --- config eval: $::Config
 --- request eval
-["GET /wp/wp-json-extra", "GET /wp/wp-json-extra"]
+["GET /wp-json-extra", "GET /wp-json-extra"]
 --- response_headers eval
 [qq{X-Cache: }, qq{X-Cache: HIT}]
 --- error_code eval
