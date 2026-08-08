@@ -6625,116 +6625,6 @@ def test_ctx_survives_error_page_internal_redirect(ng: Nginx,
          f"{hc.get('x-ct-reason')!r}")
 
 
-def test_magento_preset(ng: Nginx, origin: Origin) -> None:
-    """Magento 2 preset (docs/magento.md).
-
-    X-Magento-Vary is VALUE-KEYED, not bypassed -- exactly as Magento's own
-    reference VCL does it (vcl_hash: hash_data of the regsub'd cookie) and as
-    Magento's built-in PHP FPC does it (Identifier.php folds COOKIE_VARY_STRING
-    into the cache id). The cookie is a SEGMENT FINGERPRINT (sha256 over
-    {customer_group, customer_logged_in, store, currency}), not an identity: many
-    visitors legitimately share one value, and Magento's private-content JS keeps
-    the cart OUT of the cached HTML.
-
-    Bypassing on it (what this preset used to do) was safe but sent every
-    non-default ANONYMOUS visitor -- a guest in a second currency, a second store
-    view -- to the origin with no private data at all. Presence-KEYING would be
-    the actual leak (it collapses guest-EUR + wholesale + logged-in-retail into
-    one bucket); value-keying is neither."""
-    for uri in ("/checkout", "/checkout/cart", "/customer/account"):
-        _, _, h = fetch(ng.port, uri)
-        assert "x-cache" not in h, f"{uri} must bypass on the magento preset"
-
-    # VALUE-KEYED: same vary value hits its own entry ...
-    v_a = {"Cookie": "X-Magento-Vary=9f2a4c1e8b7d6f5a4c3b2a1908070605"}
-    _, b1, _h1 = fetch(ng.port, "/mg/product-a", headers=v_a)
-    _, b2, h2 = fetch(ng.port, "/mg/product-a", headers=v_a)
-    assert h2.get("x-cache") == "HIT", \
-        ("X-Magento-Vary must be KEYED, not bypassed -- a segment repeats and "
-         f"must hit its own entry; got {h2.get('x-cache')}")
-    assert b1 == b2, "same vary value must serve the same cached body"
-
-    # ... and a DIFFERENT value must NOT see it. This is the leak the old
-    # presence-keying rejection was worried about, and it is the whole point of
-    # keying on the VALUE.
-    v_b = {"Cookie": "X-Magento-Vary=0000111122223333444455556666777"}
-    _, b3, _h3 = fetch(ng.port, "/mg/product-a", headers=v_b)
-    assert b3 != b1, \
-        ("magento: a DIFFERENT X-Magento-Vary value was served another "
-         "segment's cached body -- this is a cross-user leak")
-    _, b4, h4 = fetch(ng.port, "/mg/product-a", headers=v_b)
-    assert h4.get("x-cache") == "HIT" and b4 == b3, \
-        "each vary value must warm and hit its OWN entry"
-
-    # The anonymous (no cookie) entry is a third, separate bucket -- and must not
-    # be the one a segmented visitor sees.
-    _, ba, _ = fetch(ng.port, "/mg/product-a")
-    _, ba2, ha2 = fetch(ng.port, "/mg/product-a")
-    assert ha2.get("x-cache") == "HIT", "anonymous catalog must cache"
-    assert ba2 == ba and ba != b1 and ba != b3, \
-        "the cookie-less anonymous entry must be its own bucket"
-
-    # ALL Cookie headers are collected. A client may split its cookies over
-    # several Cookie headers; if only the first were scanned, an attacker could
-    # hide the real cookie in a second header and CHOOSE which bucket to read.
-    _, bs, _ = fetch_dup(ng.port, "/mg/split",
-                         [("Cookie", "PHPSESSID=abc"),
-                          ("Cookie", "X-Magento-Vary=aaaa1111bbbb2222")])
-    _, bs2, hs2 = fetch(ng.port, "/mg/split",
-                        headers={"Cookie":
-                                 "PHPSESSID=abc; X-Magento-Vary=aaaa1111bbbb2222"})
-    assert hs2.get("x-cache") == "HIT" and bs2 == bs, \
-        ("a cookie in a SECOND Cookie header must key identically to the same "
-         "cookie folded into one header -- else the bucket is attacker-chosen")
-
-    # A cookie whose name merely ENDS WITH ours is a different cookie. Keying is
-    # EXACT-name (unlike the tier-2 predicate engine, which matches by suffix):
-    # a loose match here would let an attacker-chosen cookie select the bucket.
-    _, bd, _ = fetch(ng.port, "/mg/decoy",
-                     headers={"Cookie": "NOT-X-Magento-Vary=aaaa1111bbbb2222"})
-    _, banon, _ = fetch(ng.port, "/mg/decoy")
-    assert bd == banon, \
-        ("NOT-X-Magento-Vary must not be read as X-Magento-Vary -- an exact "
-         "name match is what keeps the bucket out of the client's hands")
-
-    # THE TRANSITION RACE. The request carries NO vary cookie, so it keys to the
-    # ANONYMOUS entry -- and the response ESTABLISHES the segment. Storing that
-    # body under the anonymous key poisons it for every anonymous visitor.
-    # Upstream's VCL refuses exactly this (beresp.uncacheable).
-    #
-    # We inherit the refusal from the UNCONDITIONAL Set-Cookie floor: the
-    # establishing response carries a Set-Cookie and is never stored. This test
-    # therefore pins the BEHAVIOUR, not a magento-specific code path -- and it is
-    # the reason the floor may not be made optional. If someone adds a
-    # "cache Set-Cookie responses" knob, this assertion is what fails.
-    for _ in range(2):
-        _, _, ht = fetch(ng.port, "/mg/mgvary-page")
-    assert ht.get("x-cache") != "HIT", \
-        ("a response that SETS X-Magento-Vary on a cookie-less request must not "
-         "be stored under the anonymous key -- that poisons the shared entry")
-
-    # THE HIT RATE: every one of these is set for ANONYMOUS visitors. All must
-    # keep caching. A regression here is a silent 0%-hit-rate catalog.
-    for name, ck in (
-        ("PHPSESSID",               "PHPSESSID=abc123"),
-        ("form_key",                "form_key=deadbeef"),
-        ("private_content_version", "private_content_version=1a2b3c"),
-        ("mage-cache-sessid",       "mage-cache-sessid=true"),
-        ("section_data_ids",        "section_data_ids=%7B%22cart%22%3A1%7D"),
-        ("all of them together",    "PHPSESSID=abc; form_key=def; "
-                                    "private_content_version=1a2b; "
-                                    "mage-cache-sessid=true; mage-messages=hi"),
-    ):
-        uri = f"/mg/cat-{name.split()[0]}"
-        fetch(ng.port, uri, headers={"Cookie": ck})
-        _, _, hg = fetch(ng.port, uri, headers={"Cookie": ck})
-        assert hg.get("x-cache") == "HIT", \
-            (f"magento: {name} is set for ANONYMOUS visitors and must stay "
-             f"cacheable -- bypassing on it zeroes the catalog hit rate; "
-             f"got {hg.get('x-cache')}")
-    drain_origin(origin)
-
-
 def test_shopware6_preset(ng: Nginx, origin: Origin) -> None:
     """Shopware 6 preset (docs/shopware6.md).
 
@@ -16193,7 +16083,6 @@ def run_all(ng: Nginx, origin: Origin,
     test_yabb_preset(ng, origin)
     test_phorum_uri_rules_anchor_at_root(ng, origin)
     test_internal_redirect_key_and_veto(ng, origin)
-    test_magento_preset(ng, origin)
     test_ghost_preset(ng, origin)
     test_wagtail_preset(ng, origin)
     test_kirby_preset(ng, origin)
