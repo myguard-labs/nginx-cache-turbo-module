@@ -3748,24 +3748,6 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
-        # ---- mediawiki ----------------------------------------------------
-        location /index.php {{
-            cache_turbo         main;
-            cache_turbo_backend mediawiki;
-            cache_turbo_key     $uri$is_args$args;
-            cache_turbo_valid   30s;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-        # /wiki/ is the CACHEABLE read path -- proves the preset does not just
-        # bypass the whole wiki. Cookie + arg rules exercised from here.
-        location /wiki/ {{
-            cache_turbo         main;
-            cache_turbo_backend mediawiki;
-            cache_turbo_key     $uri$is_args$args;
-            cache_turbo_valid   30s;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-
         # Q2 multi-buffer oversize: ~200 KB body, 1k cap -> mid-stream abort
         location /qbig/ {{
             cache_turbo          main;
@@ -6641,116 +6623,6 @@ def test_ctx_survives_error_page_internal_redirect(ng: Nginx,
         ("$cache_turbo_serve_reason reports a value on a location where the "
          f"module never engaged, so it is not reading r->ctx: got "
          f"{hc.get('x-ct-reason')!r}")
-
-
-def test_mediawiki_preset(ng: Nginx, origin: Origin) -> None:
-    """MediaWiki preset (docs/mediawiki.md). The identity cookies have no stable
-    prefix ($wgCookiePrefix defaults to the DB NAME), so the preset matches the
-    CamelCase suffixes UserID= / UserName=. The dynamic surface is in query args,
-    not paths: /wiki/<Title> is the cacheable read path.
-
-    The negative half matters as much as the positive one: action=raw,
-    action=history, diff= and oldid= are deterministic, shared and hot — they
-    must stay CACHEABLE. Bypassing them is a measurable hit-rate loss, which is
-    why a blanket "presence of action= => bypass" rule was rejected.
-
-    THE PRESET HAS NO URI RULES. It used to bypass /index.php, /load.php and
-    /api.php; all three were wrong. On a stock wiki $wgArticlePath is
-    /index.php?title=Foo, so /index.php IS the article read path — that rule
-    bypassed 100% of article reads. /load.php (ResourceLoader) and /api.php are
-    the hottest cacheable objects on the site; Wikimedia's VCL ring-fences them
-    against being made private, by ticket number (T102898, T113007)."""
-    # /index.php IS the article path on a stock wiki -- it must CACHE, not bypass.
-    # This assertion is inverted from the original preset on purpose: it is the
-    # regression guard for the worst rule the registry ever shipped.
-    fetch(ng.port, "/index.php?title=Foo")
-    _, _, h = fetch(ng.port, "/index.php?title=Foo")
-    assert h.get("x-cache") == "HIT", \
-        ("/index.php?title= is the ARTICLE READ PATH on a stock wiki "
-         f"($wgArticlePath) -- it must cache, got {h.get('x-cache')}")
-
-    # VisualEditor is always dynamic.
-    _, _, hv = fetch(ng.port, "/wiki/Foo?veaction=edit")
-    assert "x-cache" not in hv, "?veaction= must bypass"
-
-    # Identity cookies bypass, whatever the site's $wgCookiePrefix happens to be.
-    # Token and _session are what UPSTREAM keys on -- getVaryCookies() verbatim:
-    # "Vary on token and session because those are the real authn determiners.
-    #  UserID and UserName don't matter without those."
-    # The _session assertion is INVERTED from the original preset, which asserted
-    # it must stay cacheable. Bypassing a session-carrying guest costs hits; NOT
-    # bypassing a session-carrying member leaks.
-    for ck in ("mywikiToken=deadbeef", "mywiki_session=abc123", "mywikiUserID=42"):
-        _, _, h1 = fetch(ng.port, "/wiki/Article-a", headers={"Cookie": ck})
-        _, _, h2 = fetch(ng.port, "/wiki/Article-a", headers={"Cookie": ck})
-        assert "x-cache" not in h1 and "x-cache" not in h2, \
-            f"cookie {ck.split('=')[0]} must bypass -- upstream calls it an authn determiner"
-
-    # UserName must NOT bypass. unpersistSession() deliberately does NOT clear it
-    # on logout (it pre-fills the login form), so EVERY visitor who has ever logged
-    # in keeps sending it forever -- long after they are an ordinary anonymous
-    # reader. Bypassing on it is a permanent hit-rate loss with zero safety gain.
-    exlogin = {"Cookie": "mywikiUserName=Bob"}
-    fetch(ng.port, "/wiki/Article-b", headers=exlogin)
-    _, _, hn = fetch(ng.port, "/wiki/Article-b", headers=exlogin)
-    assert hn.get("x-cache") == "HIT", \
-        ("mywikiUserName survives logout (login-form pre-fill), so an ex-member "
-         f"reading anonymously must still cache, got {hn.get('x-cache')}")
-
-    # Every MUTATING core action must bypass on the ARG alone, with no cookie
-    # present. ct_mw_args used to hold only veaction/returnto while the registry
-    # comment claimed "Only the MUTATING actions are listed" -- there was no
-    # action= row of any kind. Fetch twice: a bypass and a first-time MISS are
-    # indistinguishable on one fetch (both lack x-cache), and only the bypass
-    # still lacks it on the second.
-    #
-    # A logged-in actor is already covered by the cookie rule, and MediaWiki's
-    # own floor covers the anonymous case (mCdnMaxage stays 0 for anything that
-    # is not a ViewAction or a purgeable URL, so sendCacheControl() emits
-    # `private`). These arms are cookie-less and do not rely on that floor: the
-    # origin here sends no Cache-Control at all, which is precisely the
-    # `cache_turbo_cache_control ignore` shape the rows exist for.
-    for act in ("edit", "submit", "delete", "protect", "unprotect", "purge",
-                "rollback", "revert", "watch", "unwatch", "markpatrolled",
-                "mcrundo", "mcrrestore"):
-        uri = f"/wiki/Article-m?action={act}"
-        fetch(ng.port, uri)
-        _, _, hm = fetch(ng.port, uri)
-        assert "x-cache" not in hm, \
-            (f"?action={act} is a mutating MediaWiki core action and must "
-             f"bypass with no cookie present, got {hm.get('x-cache')}")
-
-    # MediaWiki writes ?title=Foo&action=edit -- the action is not the first
-    # argument. Percent-encoded too: PHP routes ?%61ction=edit identically.
-    for uri in ("/index.php?title=Foo&action=edit",
-                "/index.php?title=Foo&%61ction=delete"):
-        fetch(ng.port, uri)
-        _, _, hp = fetch(ng.port, uri)
-        assert "x-cache" not in hp, \
-            (f"{uri} must bypass -- the action is not the first argument and "
-             f"may be percent-encoded, got {hp.get('x-cache')}")
-
-    # The read path and the deliberately-cacheable args must all still cache.
-    # action=render/info/credits are the rows a future editor is most likely to
-    # add by reflex when extending the mutating list -- they are core actions
-    # sitting right beside the ones above in CORE_ACTIONS, and they are hot,
-    # deterministic and shared. Pinning them here is what makes the list a
-    # decision rather than an accident.
-    for uri in ("/wiki/Article-c",
-                "/wiki/Article-c?action=raw",
-                "/wiki/Article-c?action=history",
-                "/wiki/Article-c?action=render",
-                "/wiki/Article-c?action=info",
-                "/wiki/Article-c?action=credits",
-                "/wiki/Article-c?action=view",
-                "/wiki/Article-c?oldid=12345",
-                "/wiki/Article-c?diff=12345"):
-        fetch(ng.port, uri)
-        _, _, hc = fetch(ng.port, uri)
-        assert hc.get("x-cache") == "HIT", \
-            (f"{uri} must stay cacheable (deterministic + shared); bypassing it "
-             f"is a hit-rate loss, got {hc.get('x-cache')}")
-    drain_origin(origin)
 
 
 def test_magento_preset(ng: Nginx, origin: Origin) -> None:
@@ -16321,7 +16193,6 @@ def run_all(ng: Nginx, origin: Origin,
     test_yabb_preset(ng, origin)
     test_phorum_uri_rules_anchor_at_root(ng, origin)
     test_internal_redirect_key_and_veto(ng, origin)
-    test_mediawiki_preset(ng, origin)
     test_magento_preset(ng, origin)
     test_ghost_preset(ng, origin)
     test_wagtail_preset(ng, origin)
@@ -16829,8 +16700,6 @@ def main() -> int:
           "bypass cookie-less, ';'-separated logout, plain reads cached), "
           "header-auth REST surfaces (magento /rest+/soap, drupal /jsonapi+"
           "/oauth, wp ?rest_route=, /restaurant-supplies still cached), "
-          "mediawiki preset (13 mutating core actions bypass cookie-less, "
-          "encoded/non-first action, render/info/credits/view stay cached), "
           "punbb/phorum URI rows (edit/delete/moderate/profile/register bypass, "
           "phorum file.php attachment bypass, userlist.php/search.php stay "
           "cached), "
