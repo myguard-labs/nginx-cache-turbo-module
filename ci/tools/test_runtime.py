@@ -3629,27 +3629,11 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
-        # ---- drupal -------------------------------------------------------
-        # Drupal's SESS substring deliberately catches SESS*/SSESS* session
-        # names; false-positive names cost a bypass rather than risking a leak.
-        location /user {{
-            cache_turbo         main;
-            cache_turbo_backend drupal;
-            cache_turbo_key     $uri;
-            cache_turbo_valid   30s;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-        # /admin is a preset URI rule too and needs its own ROOT location, or a
-        # fetch of /admin/config falls through to nginx's implicit 404 -- which
-        # carries no x-cache header either, so a "must bypass" assertion would
-        # pass without the preset ever running.
-        location /admin {{
-            cache_turbo         main;
-            cache_turbo_backend drupal;
-            cache_turbo_key     $uri;
-            cache_turbo_valid   30s;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
+        # ---- header-auth REST surfaces (drupal /jsonapi, /oauth) -----------
+        # Used by test_header_auth_rest_surfaces() -- both surfaces are
+        # header-authenticated (bearer token) and structurally invisible to
+        # the cookie tier; only the URI rule catches them. See
+        # ci/t/presets/drupal.t for the drupal preset's own cookie/URI tests.
         location /jsonapi {{
             cache_turbo         main;
             cache_turbo_backend drupal;
@@ -3658,13 +3642,6 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
         location /oauth {{
-            cache_turbo         main;
-            cache_turbo_backend drupal;
-            cache_turbo_key     $uri;
-            cache_turbo_valid   30s;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-        location /dr/ {{
             cache_turbo         main;
             cache_turbo_backend drupal;
             cache_turbo_key     $uri;
@@ -6489,56 +6466,6 @@ def test_joomla_preset(ng: Nginx, origin: Origin) -> None:
     # /administrator/ still bypasses.
     _, _, ha = fetch(ng.port, "/administrator/index.php")
     assert "x-cache" not in ha, "/administrator/ must bypass"
-    drain_origin(origin)
-
-
-def test_drupal_preset(ng: Nginx, origin: Origin) -> None:
-    """Drupal preset (docs/drupal.md).
-
-    The SESS cookie rule is a LEAK FIX and its assertions are INVERTED from the
-    original preset. This test used to assert that PHPSESSID must stay cacheable,
-    with a comment reading "If someone adds SESS, this fails" -- i.e. it encoded
-    the bug as a guarantee.
-
-    The bug: the preset shipped NO cookie rule, on the belief that anonymous
-    Drupal users never get a session cookie. False. Drupal opens a session for an
-    ANONYMOUS user as soon as anything writes to $_SESSION -- core's own
-    NoSessionOpen docblock names the cases (a status message from a form submit,
-    cart contents). A logged-in user carries the same SESS<hash> shape, so with
-    no cookie rule an authenticated response could be stored and served on.
-
-    The accepted cost: "SESS" is a substring of PHPSESSID and JSESSIONID, so a
-    co-hosted PHP/Java app's session cookie also bypasses. That is a HIT-RATE
-    loss on the other app, never a leak -- and it does not justify leaking here."""
-    for uri in ("/user", "/user/1/edit", "/admin/config"):
-        _, _, h = fetch(ng.port, uri)
-        assert "x-cache" not in h, f"{uri} must bypass on the drupal preset"
-
-    # The session cookie must bypass -- both the plain and the TLS (SSESS) form.
-    # The hash is per-install, so "SESS" as a substring is the only shippable rule.
-    for ck in ("SESS1a2b3c4d5e6f=authsession", "SSESSdeadbeefcafe=authsession"):
-        _, _, h1 = fetch(ng.port, "/dr/node-a", headers={"Cookie": ck})
-        _, _, h2 = fetch(ng.port, "/dr/node-a", headers={"Cookie": ck})
-        assert "x-cache" not in h1 and "x-cache" not in h2, \
-            (f"drupal: {ck.split('=')[0]} must bypass -- a logged-in user carries "
-             "this shape and caching it serves their page to strangers")
-
-    # The known, accepted collision: PHPSESSID contains "SESS", so it bypasses too.
-    # Asserted explicitly so the trade-off is visible and cannot regress silently.
-    php = {"Cookie": "PHPSESSID=abc123"}
-    _, _, hp1 = fetch(ng.port, "/dr/node-b", headers=php)
-    _, _, hp2 = fetch(ng.port, "/dr/node-b", headers=php)
-    assert "x-cache" not in hp1 and "x-cache" not in hp2, \
-        ("drupal: PHPSESSID collides with the SESS substring and bypasses. This is "
-         "the ACCEPTED cost of closing the anon-session leak -- a hit-rate loss on "
-         f"a co-hosted PHP app, never a leak. got {hp2.get('x-cache')}")
-
-    # A cookieless anonymous reader still caches -- the preset is not a blanket
-    # bypass, which is the whole point of it existing.
-    fetch(ng.port, "/dr/node-c")
-    _, _, hc = fetch(ng.port, "/dr/node-c")
-    assert hc.get("x-cache") == "HIT", \
-        f"drupal: a cookieless anonymous reader must cache, got {hc.get('x-cache')}"
     drain_origin(origin)
 
 
@@ -16491,7 +16418,6 @@ def run_all(ng: Nginx, origin: Origin,
     test_yabb_preset(ng, origin)
     test_phorum_uri_rules_anchor_at_root(ng, origin)
     test_joomla_preset(ng, origin)
-    test_drupal_preset(ng, origin)
     test_internal_redirect_key_and_veto(ng, origin)
     test_mediawiki_preset(ng, origin)
     test_magento_preset(ng, origin)
