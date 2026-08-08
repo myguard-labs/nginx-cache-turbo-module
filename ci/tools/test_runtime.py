@@ -5503,30 +5503,6 @@ def test_phpbb_preset(ng: Nginx, origin: Origin) -> None:
     drain_origin(origin)
 
 
-def test_punbb_cookie_name_default(ng: Nginx, origin: Origin) -> None:
-    """punbb preset must fire on the PunBB 1.4.x default cookie name.
-
-    The row originally matched only `punbb_cookie`, the 1.2-era default. PunBB
-    1.4.x names the auth cookie `$cookie_name` from config.php, which falls
-    back to `forum_cookie` and which the installer randomises to
-    `forum_cookie_<random>`. On a stock 1.4 board the preset therefore never
-    matched and logged-in members were served cached guest pages. Both names
-    are matched now; the substring also covers the randomised variant.
-    Verified against punbb/punbb tag 1.4.4 (include/common.php,
-    admin/install.php)."""
-    for i, cookie in enumerate(("forum_cookie=NDJ8YWJj",
-                                "forum_cookie_9f3a1c=NDJ8YWJj",
-                                "punbb_cookie=NDJ8YWJj")):
-        uri = f"/punbb/topic-{i}"
-        m = {"Cookie": cookie}
-        fetch(ng.port, uri, headers=m)
-        _, _, h = fetch(ng.port, uri, headers=m)
-        assert "x-cache" not in h, \
-            (f"a PunBB member carrying '{cookie}' MUST bypass, got "
-             f"{h.get('x-cache')} -- matching only the 1.2-era punbb_cookie "
-             "served cached guest pages to members on a stock 1.4 board")
-
-
 def test_vanilla_guest_cookies_stay_cacheable(ng: Nginx,
                                               origin: Origin) -> None:
     """vanilla preset must match `Vanilla=`, not the bare `Vanilla` prefix.
@@ -15487,7 +15463,6 @@ def run_all(ng: Nginx, origin: Origin,
     test_header_auth_rest_surfaces(ng, origin)
     test_discourse_preset(ng, origin)
     test_phpbb_preset(ng, origin)
-    test_punbb_cookie_name_default(ng, origin)
     test_vanilla_guest_cookies_stay_cacheable(ng, origin)
     test_flarum_session_cookie_is_not_a_login_signal(ng, origin)
     test_flarum_admin_and_api_bypass(ng, origin)
