@@ -170,6 +170,24 @@ __DATA__
 
 
 
+=== TEST 2b: byte-0 segment-termination POSITIVE -- the '.' boundary also bypasses
+# TEST 2 only exercises the trailing-byte check's REJECT arm (no boundary byte
+# at all). ct_magento_uris[] rows are also matched with a '.' boundary --
+# /health_check.php is exactly this shape -- so a change that rejects the '.'
+# arm specifically (while still accepting '/' and EOF) would pass every other
+# case in this file silently. "/customer.foo" sends the '.' boundary directly
+# at byte 0, not nested under the real prefix.
+--- http_config eval: $::HttpConfigExtra
+--- config eval: $::Config
+--- request eval
+["GET /customer.foo", "GET /customer.foo"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: }]
+--- error_code eval
+[200, 200]
+
+
+
 === TEST 3: X-Magento-Vary is VALUE-KEYED -- same value hits its own entry
 --- http_config eval: $::HttpConfigExtra
 --- config eval: $::Config
@@ -377,13 +395,19 @@ Cookie: X-Magento-Vary=9f2a4c1e8b7d6f5a4c3b2a1908070605
 
 
 === TEST 12: an X-Magento-Vary cookie does not key under the wordpress preset
-# The cookie half of TEST 11. X-Magento-Vary is not a wordpress signal, so the
-# generic location must cache it as a plain cookie-less-equivalent request --
-# proving the key-cookie rule is preset-scoped.
+# The cookie half of TEST 11. X-Magento-Vary is not a wordpress signal, so a
+# request carrying it must fold into the SAME (anonymous, cookie-less) entry
+# rather than getting its own key-cookie bucket -- proving the key-cookie rule
+# is preset-scoped, not merely that the location caches at all. Request 1 is
+# cookie-less and PRIMES the anonymous entry; request 2 carries
+# X-Magento-Vary and must HIT that same entry. If magento's key-cookie
+# folding leaked into this location, request 2 would instead MISS into its
+# own segmented bucket and this assertion would catch it.
 --- http_config eval: $::HttpConfigExtra
 --- config eval: $::Config
---- more_headers
-Cookie: X-Magento-Vary=9f2a4c1e8b7d6f5a4c3b2a1908070605
+--- more_headers eval
+["",
+ "Cookie: X-Magento-Vary=9f2a4c1e8b7d6f5a4c3b2a1908070605"]
 --- request eval
 ["GET /gen/product", "GET /gen/product"]
 --- response_headers eval
