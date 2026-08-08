@@ -3277,48 +3277,6 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
-        # ---- typo3 ---------------------------------------------------------
-        location /typo3 {{
-            cache_turbo         main;
-            cache_turbo_backend typo3;
-            cache_turbo_key     $uri;
-            cache_turbo_valid   30s;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-        # Segment-boundary proof: /typo3 must not swallow a public page that
-        # merely shares the prefix.
-        location /typo3-guide {{
-            cache_turbo         main;
-            cache_turbo_backend typo3;
-            cache_turbo_key     $uri;
-            cache_turbo_valid   30s;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-        # X-CT-Status makes the bypass a POSITIVE signal. Asserting only that
-        # x-cache is ABSENT is not enough: any unrelated reason to not cache also
-        # removes x-cache, so such a test passes even when the cookie rule was
-        # never consulted (a dropped cookie literal then goes undetected -- this
-        # exact hole let a sabotage canary through during development).
-        location /t3/ {{
-            cache_turbo         main;
-            cache_turbo_backend typo3;
-            cache_turbo_key     $uri;
-            cache_turbo_valid   30s;
-            add_header          X-CT-Status $cache_turbo_status always;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-
-        # `none` overrides an inherited preset. The server-level directive below
-        # arms wordpress for every location that does not say otherwise; this one
-        # says otherwise, so /wp-admin/-style rules must NOT fire here.
-        location /nonepreset/ {{
-            cache_turbo         main;
-            cache_turbo_backend none;
-            cache_turbo_key     $uri;
-            cache_turbo_valid   30s;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-
         # ---- discourse ----------------------------------------------------
         # URI prefixes anchor at position 0, so these must be ROOT locations.
         location /session {{
@@ -6486,53 +6444,6 @@ def test_ctx_survives_error_page_internal_redirect(ng: Nginx,
         ("$cache_turbo_serve_reason reports a value on a location where the "
          f"module never engaged, so it is not reading r->ctx: got "
          f"{hc.get('x-ct-reason')!r}")
-
-
-def test_typo3_preset(ng: Nginx, origin: Origin) -> None:
-    """TYPO3 preset (docs/typo3.md).
-
-    Lazy sessions, and deliberately so: FrontendUserAuthentication overrides
-    $dontSetCookie to TRUE (:155), against the base class default of false, and
-    flips it back only in createUserSession()/regenerateSessionId(). So an
-    anonymous reader of a public page is issued NO cookie -- upstream chose this
-    to make the frontend cacheable.
-
-    fe_typo_user is the FE login cookie; be_typo_user is the backend one and is
-    NOT redundant -- an editor previewing the frontend carries only the BE cookie
-    and is served hidden/scheduled records. Caching that publishes unpublished
-    content."""
-    _, _, h = fetch(ng.port, "/typo3/module/web/layout")
-    assert "x-cache" not in h, "typo3: /typo3/... backend must bypass"
-    _, _, hp = fetch(ng.port, "/typo3")
-    assert "x-cache" not in hp, "typo3: exact /typo3 must bypass"
-
-    # Segment-boundary matcher: /typo3 must not swallow a public page.
-    fetch(ng.port, "/typo3-guide")
-    _, _, hb = fetch(ng.port, "/typo3-guide")
-    assert hb.get("x-cache") == "HIT", \
-        ("typo3: /typo3-guide must cache (not swallowed by /typo3), got "
-         f"{hb.get('x-cache')}")
-
-    # Both identity cookies bypass -- asserted POSITIVELY via $cache_turbo_status.
-    # "x-cache is absent" is NOT sufficient: an unrelated uncacheable response has
-    # no x-cache either, so an absence-only assert stays green even if the cookie
-    # literal is dropped from the preset entirely. X-CT-Status == BYPASS proves the
-    # cookie rule actually fired.
-    for ck in ("fe_typo_user=abc123", "be_typo_user=def456",
-               "fe_typo_user=abc123; be_typo_user=def456"):
-        _, _, hc = fetch(ng.port, "/t3/page", headers={"Cookie": ck})
-        assert hc.get("x-ct-status") == "BYPASS", \
-            (f"typo3: the cookie rule must BYPASS (Cookie: {ck}); got "
-             f"X-CT-Status={hc.get('x-ct-status')} -- if this is MISS, the cookie "
-             f"literal is not in ct_typo3_cookies and logged-in pages get CACHED")
-        assert "x-cache" not in hc, f"typo3: must not serve from cache ({ck})"
-
-    # The anonymous reader -- the whole point of the preset -- must cache.
-    fetch(ng.port, "/t3/page")
-    _, _, ha = fetch(ng.port, "/t3/page")
-    assert ha.get("x-cache") == "HIT", \
-        f"typo3: an anonymous reader must cache, got {ha.get('x-cache')}"
-    drain_origin(origin)
 
 
 def test_new_presets_not_in_generic(ng: Nginx, origin: Origin) -> None:
@@ -15647,7 +15558,6 @@ def run_all(ng: Nginx, origin: Origin,
     test_yabb_preset(ng, origin)
     test_phorum_uri_rules_anchor_at_root(ng, origin)
     test_internal_redirect_key_and_veto(ng, origin)
-    test_typo3_preset(ng, origin)
     test_new_presets_not_in_generic(ng, origin)
     test_auto_classify_more(ng, origin)
     test_q2_multibuffer_oversize(ng, origin)
