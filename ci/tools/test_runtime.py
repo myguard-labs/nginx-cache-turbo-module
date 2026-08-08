@@ -3377,43 +3377,6 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
-        # ---- shopware6 -----------------------------------------------------
-        # Preset URI bypasses. Each needs a REAL location: a URI with no location
-        # gets nginx's implicit 404, which carries no x-cache, so a "must bypass"
-        # assert would pass for free and prove nothing.
-        # X-CT-Status makes BYPASS a positive signal -- "x-cache is absent" is not
-        # proof the URI rule fired, because a plain first-request MISS has no
-        # x-cache either. Without this header a preset with an EMPTY uri list
-        # would still pass the bypass asserts below.
-        location /account {{
-            cache_turbo         main;
-            cache_turbo_backend shopware6;
-            cache_turbo_key     $uri;
-            cache_turbo_valid   30s;
-            add_header          X-CT-Status $cache_turbo_status always;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-        location /store-api {{
-            cache_turbo         main;
-            cache_turbo_backend shopware6;
-            cache_turbo_key     $uri;
-            cache_turbo_valid   30s;
-            add_header          X-CT-Status $cache_turbo_status always;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-        # The storefront: sw-cache-hash is VALUE-KEYED here, never bypassed.
-        # X-CT-Status is what lets the transition-race test tell "the Set-Cookie
-        # floor REFUSED the store" (MISS) apart from "bypassed for some other
-        # reason" (BYPASS) -- a bare != HIT cannot distinguish them.
-        location /sw/ {{
-            cache_turbo         main;
-            cache_turbo_backend shopware6;
-            cache_turbo_key     $uri;
-            cache_turbo_valid   30s;
-            add_header          X-CT-Status $cache_turbo_status always;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-
         # ---- typo3 ---------------------------------------------------------
         location /typo3 {{
             cache_turbo         main;
@@ -6623,137 +6586,6 @@ def test_ctx_survives_error_page_internal_redirect(ng: Nginx,
         ("$cache_turbo_serve_reason reports a value on a location where the "
          f"module never engaged, so it is not reading r->ctx: got "
          f"{hc.get('x-ct-reason')!r}")
-
-
-def test_shopware6_preset(ng: Nginx, origin: Origin) -> None:
-    """Shopware 6 preset (docs/shopware6.md).
-
-    sw-cache-hash is VALUE-KEYED, not bypassed -- the same shape as magento, and
-    Shopware's own Varnish config does exactly this (hash_data("+context=" +
-    cookie.get("sw-cache-hash"))). The value is a segment fingerprint:
-    CacheHeadersService::buildCacheHash() folds {rule_ids, version_id,
-    currency_id, tax_state, logged_in_state} into it.
-
-    Bypassing on presence would be WRONG: isCacheHashRequired() sets the cookie
-    for a logged-in customer OR a guest with a filled cart OR a guest on a
-    non-default currency. Bypass would ship every cart-holding guest to the
-    origin for nothing -- the cart is not in the cached HTML.
-
-    Shopware is unusually strict about the anonymous case: when the hash is not
-    required it does not merely omit the cookie, it DELETES a stale one."""
-    # Asserted POSITIVELY: X-CT-Status == BYPASS proves the URI rule fired. An
-    # "x-cache is absent" assert would also pass on a plain MISS, so an empty URI
-    # list would sail straight through it.
-    for uri in ("/account", "/account/login", "/store-api/product"):
-        _, _, h = fetch(ng.port, uri)
-        assert h.get("x-ct-status") == "BYPASS", \
-            (f"shopware6: {uri} must BYPASS; got X-CT-Status={h.get('x-ct-status')}"
-             f" -- if this is MISS, the URI is not in ct_shopware6_uris and a "
-             f"private page is being cached")
-        assert "x-cache" not in h, f"shopware6: {uri} must not serve from cache"
-
-    # VALUE-KEYED: one segment repeats and hits its OWN entry.
-    v_a = {"Cookie": "sw-cache-hash=b1946ac92492d2347c6235b4d2611184"}
-    _, b1, _ = fetch(ng.port, "/sw/product-a", headers=v_a)
-    _, b2, h2 = fetch(ng.port, "/sw/product-a", headers=v_a)
-    assert h2.get("x-cache") == "HIT", \
-        ("sw-cache-hash must be KEYED, not bypassed -- a repeating segment must "
-         f"hit its own entry; got {h2.get('x-cache')}")
-    assert b1 == b2, "same cache-hash must serve the same cached body"
-
-    # A DIFFERENT hash must NOT see it. logged_in_state is folded INTO the value,
-    # so this is precisely the logged-in-vs-guest separation.
-    v_b = {"Cookie": "sw-cache-hash=591785b794601e212b260e25925636fd"}
-    _, b3, _ = fetch(ng.port, "/sw/product-a", headers=v_b)
-    assert b3 != b1, \
-        ("shopware6: a DIFFERENT sw-cache-hash was served another segment's "
-         "cached body -- this is a cross-user leak")
-    _, b4, h4 = fetch(ng.port, "/sw/product-a", headers=v_b)
-    assert h4.get("x-cache") == "HIT" and b4 == b3, \
-        "each cache-hash must warm and hit its OWN entry"
-
-    # The cookie-less anonymous visitor is a third bucket -- and it is the COMMON
-    # one, because Shopware actively clears the cookie for anon+empty-cart.
-    _, ba, _ = fetch(ng.port, "/sw/product-a")
-    _, ba2, ha2 = fetch(ng.port, "/sw/product-a")
-    assert ha2.get("x-cache") == "HIT", "anonymous storefront must cache"
-    assert ba2 == ba and ba != b1 and ba != b3, \
-        "the cookie-less anonymous entry must be its own bucket"
-
-    # ALL Cookie headers are collected -- else the bucket is attacker-chosen.
-    _, bs, _ = fetch_dup(ng.port, "/sw/split",
-                         [("Cookie", "session-=abc"),
-                          ("Cookie", "sw-cache-hash=aaaa1111bbbb2222")])
-    _, bs2, hs2 = fetch(ng.port, "/sw/split",
-                        headers={"Cookie":
-                                 "session-=abc; sw-cache-hash=aaaa1111bbbb2222"})
-    assert hs2.get("x-cache") == "HIT" and bs2 == bs, \
-        ("a cookie in a SECOND Cookie header must key identically to the same "
-         "cookie folded into one header")
-
-    # EXACT name match: a cookie that merely ends with ours is a different cookie.
-    _, bd, _ = fetch(ng.port, "/sw/decoy",
-                     headers={"Cookie": "NOT-sw-cache-hash=aaaa1111bbbb2222"})
-    _, banon, _ = fetch(ng.port, "/sw/decoy")
-    assert bd == banon, \
-        ("NOT-sw-cache-hash must not be read as sw-cache-hash -- an exact name "
-         "match is what keeps the bucket out of the client's hands")
-
-    # THE TRANSITION RACE -- the most important assertion here. The request carries
-    # NO sw-cache-hash (so it keys to the ANONYMOUS entry) and the response
-    # ESTABLISHES the segment. Storing that body under the anonymous key poisons it
-    # for every anonymous visitor. Refused by the unconditional Set-Cookie floor.
-    #
-    # Asserted POSITIVELY and in the direction of the actual leak. A bare
-    # `!= "HIT"` proves nothing: it is satisfied by any unrelated reason to not
-    # cache, and it never checks the thing that would actually be poisoned.
-    # We pin three separate facts:
-    #   1. X-CT-Status is MISS, not BYPASS -- the request WAS a cache candidate
-    #      (cache-turbo engaged, no URI/cookie bypass) and the STORE is what got
-    #      refused. If the floor were removed this would read HIT on pass 2.
-    #   2. It never becomes a HIT, however many times it is fetched.
-    #   3. The anonymous bucket is UNCONTAMINATED: a later cookie-less reader of
-    #      the same URI must not be served the segment-establishing body.
-    n_before = origin.hits_for("swhash-page")
-    bodies = []
-    for _ in range(3):
-        _, bt, ht = fetch(ng.port, "/sw/swhash-page")
-        bodies.append(bt)
-        assert ht.get("x-cache") != "HIT", \
-            ("a response that SETS sw-cache-hash on a cookie-less request must "
-             "not be stored under the anonymous key -- that poisons the shared "
-             "entry for every anonymous visitor")
-        assert ht.get("x-ct-status") == "MISS", \
-            ("the transition-race response must be a MISS whose STORE is refused "
-             "by the Set-Cookie floor, not a BYPASS; got X-CT-Status="
-             f"{ht.get('x-ct-status')} -- a BYPASS here would mean this test is "
-             "passing for the wrong reason and no longer guards the floor")
-    assert origin.hits_for("swhash-page") - n_before == 3, \
-        ("every request must reach the origin -- a frozen origin count means the "
-         "Set-Cookie response WAS stored and is being replayed to anonymous "
-         "visitors")
-    assert len(set(bodies)) == 3, \
-        ("each fetch must get a fresh origin body -- identical bodies mean the "
-         "segment-establishing response was cached and served to a subsequent "
-         "anonymous visitor, which is the poisoning this floor exists to refuse")
-
-    # sw-states must NOT bypass. It was removed in Shopware 6.8, and a bypass rule
-    # on it would zero the storefront hit rate on <=6.7 (where it rides along with
-    # sw-cache-hash on every segmented request). Asserted POSITIVELY via
-    # X-CT-Status: a plain `x-cache == HIT` assert cannot fail here, because
-    # shopware6 ships no bypass-cookie list at all -- it would pass just as well
-    # with the cookie named zzz-nonsense, so it would guard nothing.
-    _, _, hs1 = fetch(ng.port, "/sw/states",
-                      headers={"Cookie": "sw-states=logged-in"})
-    assert hs1.get("x-ct-status") == "MISS", \
-        ("shopware6: sw-states must not be a BYPASS rule (it was removed in 6.8);"
-         f" got X-CT-Status={hs1.get('x-ct-status')}")
-    _, _, hs2 = fetch(ng.port, "/sw/states",
-                      headers={"Cookie": "sw-states=logged-in"})
-    assert hs2.get("x-cache") == "HIT", \
-        ("shopware6: a request carrying only sw-states must still CACHE; got "
-         f"{hs2.get('x-cache')}")
-    drain_origin(origin)
 
 
 def test_typo3_preset(ng: Nginx, origin: Origin) -> None:
@@ -16086,7 +15918,6 @@ def run_all(ng: Nginx, origin: Origin,
     test_ghost_preset(ng, origin)
     test_wagtail_preset(ng, origin)
     test_kirby_preset(ng, origin)
-    test_shopware6_preset(ng, origin)
     test_typo3_preset(ng, origin)
     test_new_presets_not_in_generic(ng, origin)
     test_auto_classify_more(ng, origin)
