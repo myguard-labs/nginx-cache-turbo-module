@@ -77,6 +77,7 @@ our $Config = ct_config(
     { path => '/administrator/', backend => 'joomla'    },
     { path => '/jm/',            backend => 'joomla'    },
     { path => '/gen/',           backend => 'wordpress' },
+    { path => '/administratorX', backend => 'joomla'    },
 );
 
 run_tests();
@@ -137,19 +138,14 @@ __DATA__
 === TEST 2b: a merely-similar sibling path is NOT covered -- byte-0, not vacuous
 # The KNOWN VACUOUS-TEST TRAP: the lookalike must be sent DIRECTLY at byte 0, not
 # nested under the real prefix, or the test would still pass with the whole rule
-# deleted. The needle here is "/administrator/" -- already SLASH-TERMINATED, so
-# ngx_http_cache_turbo_uri_prefix() takes the "carries its own segment
-# terminator" branch and never reaches the boundary-byte ('/'/'.') check at all
-# (see the function's own comment). What this test therefore verifies is the
-# byte-0 PREFIX itself: "/administratorX" is missing the needle's trailing '/'
-# and so fails the ngx_strncmp before the boundary logic is ever consulted.
-# "/jm/administratorX" additionally does not begin with "/administrator/" at
-# position 0 -- it is a DIFFERENT route on a DIFFERENT mount -- and must NOT
-# bypass, so the second fetch must HIT.
+# deleted. "/administratorX" begins with the needle's bytes "/administrator" at
+# position 0 but lacks the needle's trailing '/', so ngx_strncmp against the
+# slash-terminated needle "/administrator/" fails and the URI never bypasses --
+# hence it must HIT on the second fetch.
 --- http_config eval: $::HttpConfig
 --- config eval: $::Config
 --- request eval
-["GET /jm/administratorX", "GET /jm/administratorX"]
+["GET /administratorX", "GET /administratorX"]
 --- response_headers eval
 [qq{X-Cache: }, qq{X-Cache: HIT}]
 --- error_code eval
