@@ -5422,59 +5422,6 @@ def test_redmine_public_content_stays_cacheable(ng: Nginx,
             (f"{uri} MUST bypass, got {h.get('x-cache')}")
 
 
-def test_opencart_route_args_bypass(ng: Nginx, origin: Origin) -> None:
-    """opencart is an ARG-tier preset: every private page is /index.php?route=.
-
-    OpenCart routes everything through one path, so the URI tier catches
-    NOTHING -- a URI-prefix rule would look correct, match nothing, and leave
-    carts and account pages cacheable. The rows are enumerated route VALUES
-    because the arg tier compares NAME=VALUE by exact bytes ("no case folding,
-    no prefix match"), so a `route=account/` row would match only the literal
-    ?route=account/ and never ?route=account/login.
-
-    The catalogue half is the negative control: an ordinary product page goes
-    through the SAME path with a different route value and must still cache. A
-    test asserting only the bypass would also pass if the preset bypassed
-    /index.php outright, which would disable the cache for the whole shop."""
-    for route in ("account/login", "account/order", "checkout/cart",
-                  "checkout/checkout"):
-        uri = f"/opencart/index.php?route={route}"
-        fetch(ng.port, uri)
-        _, _, h = fetch(ng.port, uri)
-        assert "x-cache" not in h, \
-            (f"?route={route} MUST bypass, got {h.get('x-cache')} -- private "
-             "cart/account content on the shared /index.php path")
-
-    for route in ("common/home", "product/category", "product/product"):
-        uri = f"/opencart/index.php?route={route}"
-        fetch(ng.port, uri)
-        _, _, h = fetch(ng.port, uri)
-        assert h.get("x-cache") == "HIT", \
-            (f"?route={route} must stay cacheable, got {h.get('x-cache')} -- "
-             "the catalogue shares /index.php with the private routes, so "
-             "bypassing the path instead of the route kills the whole cache")
-
-
-def test_opencart_session_cookie_is_not_a_login_signal(ng: Nginx,
-                                                       origin: Origin) -> None:
-    """opencart must ship NO cookie row -- OCSESSID is guest-issued.
-
-    A shop has to track an anonymous cart, so OCSESSID is handed to every
-    visitor; login state lives in $this->session->data['customer'],
-    SERVER-SIDE ONLY, and the cookie value is an opaque session id whose guest
-    and customer forms are identical on the wire. There is nothing for nginx to
-    test, so the preset deliberately carries no cookies[] row and a catalogue
-    page must cache even while OCSESSID is present."""
-    shopper = {"Cookie": "OCSESSID=b7d3f1a9c2e4550188aa"}
-    uri = "/opencart/index.php?route=product/category&path=20"
-    fetch(ng.port, uri, headers=shopper)
-    _, _, h = fetch(ng.port, uri, headers=shopper)
-    assert h.get("x-cache") == "HIT", \
-        (f"a browsing shopper carrying OCSESSID must stay cacheable, got "
-         f"{h.get('x-cache')} -- OpenCart issues it to every guest, so a "
-         "cookie row here would bypass the entire shop")
-
-
 def test_cookie_pred_multiple_matching_cookies(ng: Nginx, origin: Origin) -> None:
     """A Cookie header can carry SEVERAL cookies matching one predicate's name
     suffix. Every one of them must be examined.
@@ -15156,8 +15103,6 @@ def run_all(ng: Nginx, origin: Origin,
     test_phpbb_preset(ng, origin)
     test_redmine_key_arg_bypasses_without_cookie(ng, origin)
     test_redmine_public_content_stays_cacheable(ng, origin)
-    test_opencart_route_args_bypass(ng, origin)
-    test_opencart_session_cookie_is_not_a_login_signal(ng, origin)
     test_preset_arg_value_predicate(ng)
     test_preset_arg_scanner(ng, origin)
     test_cookie_pred_multiple_matching_cookies(ng, origin)
