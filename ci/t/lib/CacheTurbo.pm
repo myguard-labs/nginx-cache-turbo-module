@@ -110,6 +110,14 @@ sub ct_location {
     my $backend = $arg{backend} // die "ct_location: backend required";
     my $extra   = $arg{extra}   // '';
 
+    # $extra is interpolated at column 0 immediately before proxy_pass, so a
+    # value with no trailing newline would weld the two together into
+    # "...;            proxy_pass ...". nginx forgives that only when $extra
+    # happens to end in ';'; anything else silently corrupts the config into a
+    # directive nobody wrote. Normalise here rather than trusting every future
+    # caller to remember the newline.
+    $extra .= "\n" if length $extra && $extra !~ /\n\z/;
+
     return <<"EOL";
         location $path {
             cache_turbo         main;
