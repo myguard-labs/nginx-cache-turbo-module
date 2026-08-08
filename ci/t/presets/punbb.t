@@ -65,7 +65,7 @@
 # uri_prefix() is byte-0 anchored, so a URI test served under a DIFFERENT
 # location prefix (e.g. "/punbb/login.php") never reaches the rule at all and
 # would pass with the row deleted. TEST 1 puts every URI arm at the ROOT path;
-# TEST 10 is the explicit negative proving "/punbb/login.php" HITs precisely
+# TEST 12 is the explicit negative proving "/punbb/login.php" HITs precisely
 # because the rule never fires off byte 0.
 #
 # See ci/t/presets/xenforo.t for why every bypass case is fetched TWICE (a
