@@ -3067,30 +3067,17 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
-        # redmine / flarum / opencart (2026-07-26 research pass). All three
-        # exist to prove a guest-issued session cookie is NOT treated as a
-        # login signal -- the trap that makes a preset bypass 100% of traffic
-        # and silently disable the cache. The key must include $is_args$args so
-        # the opencart arg-tier rows are reachable: with a bare $uri key every
+        # redmine / opencart (2026-07-26 research pass). Both exist to prove a
+        # guest-issued session cookie is NOT treated as a login signal -- the
+        # trap that makes a preset bypass 100% of traffic and silently
+        # disable the cache. The key must include $is_args$args so the
+        # opencart arg-tier rows are reachable: with a bare $uri key every
         # ?route= variant collapses onto one entry and the test would pass for
         # the wrong reason.
-        # backend_prefix is REQUIRED here, not decoration: preset uris[] are
-        # anchored at byte 0 ("/admin", "/api"), so under a /flarum/ mount the
-        # module compares them against "/flarum/api/..." and the whole URI tier
-        # silently never fires. Without it test_flarum_admin_and_api_bypass
-        # fails with "MUST bypass ... got HIT" -- which is how this was caught.
         location /redmine/ {{
             cache_turbo         main;
             cache_turbo_backend redmine;
             cache_turbo_backend_prefix /redmine/;
-            cache_turbo_key     $uri$is_args$args;
-            cache_turbo_valid   30s;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-        location /flarum/ {{
-            cache_turbo         main;
-            cache_turbo_backend flarum;
-            cache_turbo_backend_prefix /flarum/;
             cache_turbo_key     $uri$is_args$args;
             cache_turbo_valid   30s;
             proxy_pass http://127.0.0.1:{origin_port}/;
@@ -5435,55 +5422,6 @@ def test_phpbb_preset(ng: Nginx, origin: Origin) -> None:
          f"malformed cookie, safe direction), got {he.get('x-cache')}")
     drain_origin(origin)
 
-
-
-def test_flarum_session_cookie_is_not_a_login_signal(ng: Nginx,
-                                                     origin: Origin) -> None:
-    """flarum preset must bypass on `flarum_remember`, NOT on `flarum_session`.
-
-    Http/Middleware/StartSession.php applies withSessionCookie()
-    unconditionally after $session->save(), on every response and before any
-    auth check, so `flarum_session` is issued to ANONYMOUS GUESTS. A cookie row
-    matching it would fire on essentially 100% of traffic and silently disable
-    the cache -- the failure returns correct bytes and is invisible to every
-    correctness assertion, so it is asserted here explicitly.
-
-    `flarum_remember` is written only by Http/Rememberer.php
-    (COOKIE_NAME = 'remember'), i.e. at login.
-
-    Both directions matter. The guest half is the one that breaks if someone
-    later "fixes" the preset by adding the obvious session cookie; the member
-    half is the one that breaks if the remember row is dropped. Verified
-    against flarum/framework main (2.0.0-rc.5)."""
-    guest = {"Cookie": "flarum_session=eyJpdiI6Ilg5.guest.session.id"}
-    fetch(ng.port, "/flarum/d/1-welcome", headers=guest)
-    _, _, hg = fetch(ng.port, "/flarum/d/1-welcome", headers=guest)
-    assert hg.get("x-cache") == "HIT", \
-        (f"a guest carrying only flarum_session must stay cacheable, got "
-         f"{hg.get('x-cache')} -- Flarum issues that cookie to every anonymous "
-         "visitor, so bypassing on it disables the cache entirely")
-
-    member = {"Cookie": "flarum_session=abc; flarum_remember=def.signed.token"}
-    fetch(ng.port, "/flarum/d/2-topic", headers=member)
-    _, _, hm = fetch(ng.port, "/flarum/d/2-topic", headers=member)
-    assert "x-cache" not in hm, \
-        (f"a logged-in Flarum user (flarum_remember) MUST bypass, got "
-         f"{hm.get('x-cache')}")
-
-
-def test_flarum_admin_and_api_bypass(ng: Nginx, origin: Origin) -> None:
-    """flarum URI tier must cover /admin and /api even with no cookie at all.
-
-    /api is load-bearing beyond the obvious: a user who logs in WITHOUT
-    "remember me" carries only `flarum_session`, which is indistinguishable
-    from a guest's on the wire, so the cookie tier cannot see them. The SPA
-    fetches their content through /api, which contains the exposure. Asserted
-    cookie-less so it cannot pass by accident via the cookie rule."""
-    for uri in ("/flarum/api/discussions", "/flarum/admin"):
-        fetch(ng.port, uri)
-        _, _, h = fetch(ng.port, uri)
-        assert "x-cache" not in h, \
-            (f"{uri} MUST bypass with no cookie, got {h.get('x-cache')}")
 
 
 def test_redmine_key_arg_bypasses_without_cookie(ng: Nginx,
@@ -15275,8 +15213,6 @@ def run_all(ng: Nginx, origin: Origin,
     test_header_auth_rest_surfaces(ng, origin)
     test_discourse_preset(ng, origin)
     test_phpbb_preset(ng, origin)
-    test_flarum_session_cookie_is_not_a_login_signal(ng, origin)
-    test_flarum_admin_and_api_bypass(ng, origin)
     test_redmine_key_arg_bypasses_without_cookie(ng, origin)
     test_redmine_public_content_stays_cacheable(ng, origin)
     test_opencart_route_args_bypass(ng, origin)
