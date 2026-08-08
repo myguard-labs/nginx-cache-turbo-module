@@ -187,7 +187,7 @@ __DATA__
 
 
 
-=== TEST 7: suffix-under-any-prefix -- _redmine_session with a prefix
+=== TEST 7: substring-under-any-prefix -- _redmine_session with a prefix
 # The cookie match is substring-on-name, so a proxy- or theme-prefixed variant
 # (e.g., `theme__redmine_session`) is still a login signal.
 --- http_config eval: $::HttpConfig
