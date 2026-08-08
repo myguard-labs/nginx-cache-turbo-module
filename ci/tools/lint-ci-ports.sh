@@ -165,24 +165,62 @@ for f in "${files[@]}"; do
             interval_labels+=("'$job' ($f, [$start-$end])")
         fi
 
-        # A job that starts the runtime suite -- directly or through the
-        # coverage wrapper -- is runtime-bearing and needs a band. Only inside
-        # `jobs:`: `on.paths` lists test_runtime.py as a trigger filter, which
-        # runs nothing.
+        # A job that starts the runtime suite -- directly, through the coverage
+        # wrapper, or as the Test::Nginx `prove` suite -- is runtime-bearing and
+        # needs a band. Only inside `jobs:`: `on.paths` lists test_runtime.py as
+        # a trigger filter, which runs nothing.
+        #
+        # `prove` counts for exactly the same reason test_runtime.py does: it
+        # starts a real nginx that binds TEST_NGINX_PORT (and the origin port
+        # beside it). It was invisible to this lint until ci/t/ existed, which
+        # is the hole check 3's own comment predicted -- a new port-binding job
+        # that neither sweeps nor bands, silently landing on another job's band.
         if [[ "$in_jobs" -eq 1 && -n "$current_job" ]]; then
-            if [[ "$line" == *test_runtime.py* || "$line" == *coverage.sh* ]]; then
-                # py_compile checks syntax and comments mention the path;
-                # neither starts a suite or binds a port.
-                if [[ "$line" != *py_compile* && "$line" != *"#"* ]]; then
-                    job_starts_suite[$key]="${line#"${line%%[![:space:]]*}"}"
+            # Match against a COMMENT-STRIPPED copy, not the raw line. Two
+            # failures share that root cause, and the second one fails OPEN:
+            #
+            #   1. skipping any line containing '#' drops a real invocation
+            #      that carries a trailing comment (`prove -j4 -r ci/t/  # par`),
+            #      so the job goes invisible to check 3;
+            #   2. matching TEST_NGINX_RANDOMIZE / TEST_NGINX_PORT on the raw
+            #      line lets PROSE satisfy the requirement. Verified: deleting
+            #      the prove job's real `TEST_NGINX_RANDOMIZE: "1"` still left
+            #      this lint reporting OK, because a band comment above it
+            #      mentions the variable by name.
+            #
+            # Strip from the first '#' to end-of-line. YAML has no escape that
+            # makes '#' start a comment mid-token here, and a '#' inside a
+            # quoted scalar would only ever cost us a match (fail closed).
+            code="${line%%#*}"
+            if [[ "$code" == *test_runtime.py* || "$code" == *coverage.sh* \
+                  || "$code" =~ (^|[[:space:]])prove([[:space:]]|$) ]]; then
+                # py_compile checks syntax; it starts no suite and binds no port.
+                if [[ "$code" != *py_compile* ]]; then
+                    job_starts_suite[$key]="${code#"${code%%[![:space:]]*}"}"
                     # coverage.sh reads TEST_BASE_PORT from the environment and
                     # passes --port itself, so the workflow line correctly has
                     # no --port of its own. Requiring one here would be a lint
                     # demanding a bug.
-                    [[ "$line" == *coverage.sh* ]] && job_passes_port[$key]=1
+                    [[ "$code" == *coverage.sh* ]] && job_passes_port[$key]=1
                 fi
             fi
-            if [[ "$line" == *--port*TEST_BASE_PORT* ]]; then
+            if [[ "$code" == *--port*TEST_BASE_PORT* ]]; then
+                job_passes_port[$key]=1
+            fi
+            # Test::Nginx takes its port from the environment, not argv, so the
+            # band is passed as TEST_NGINX_PORT: <band> rather than --port.
+            if [[ "$code" == *TEST_NGINX_PORT*TEST_BASE_PORT* ]]; then
+                job_passes_port[$key]=1
+            fi
+            # TEST_NGINX_RANDOMIZE is the ONE case where a runtime-bearing job
+            # legitimately does not run on its declared band. It is what makes
+            # `prove -jN` safe: the scaffold picks a random port PER PARALLEL
+            # JOB and binds only ports it has proved free (Util.pm
+            # gen_rand_port), so pinning TEST_NGINX_PORT would re-share the
+            # resource randomization just separated and reintroduce the
+            # collision. The band is still declared and still swept, which is
+            # what reserves this job's territory on the shared runner.
+            if [[ "$code" == *TEST_NGINX_RANDOMIZE* ]]; then
                 job_passes_port[$key]=1
             fi
         fi

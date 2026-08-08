@@ -1,4 +1,4 @@
-# sync-sha: af0de2db6a48955180f62037e1d881bd236d21e673911e9b288f08e23784326b
+# sync-sha: 268484ef9b7d7ffe9a429a10fb9b46a64fe846f9b344e194b4897b67bf6454af
 name: Build & Test
 
 # Runner selection: plain `[self-hosted, builder02]`, NOT `lxc`.
@@ -334,6 +334,120 @@ jobs:
 
       - name: Assert the requested fixture set actually came up (AUD-TESTFIX1)
         run: bash ci/tools/assert-fixtures.sh runtime-suite.log
+
+  prove:
+    name: Preset suite (Test::Nginx)
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02"]') }}
+    timeout-minutes: 15
+    needs: build
+    # AUD-CIPORT1: own 64-wide band, same rule as the runtime job above -- the
+    # band is what the sweep step below clears, and what keeps this job off a
+    # sibling job's ports.
+    #
+    # NOTE the band is swept but NOT bound: under TEST_NGINX_RANDOMIZE (see the
+    # run step) Test::Nginx picks its own random port per parallel job and
+    # binds only ports it proved free, which is what makes `prove -j` safe.
+    # The band therefore reserves this job's territory on the shared runner
+    # without pinning the suite to it.
+    env:
+      TEST_BASE_PORT: 19264
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - name: Download nginx artifact
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: nginx-mainline
+          path: nginx-bin
+
+      - name: Install Test::Nginx
+        run: |
+          # Test::Nginx::Socket is the openresty harness (NOT nginx.org's
+          # Test::Nginx). cpanminus pulls its dependency tree; the runner may
+          # already carry it, so this is idempotent.
+          # Group the install: `A || B && C` parses as `(A || B) && C`, so an
+          # ungrouped form runs the apt install even when cpanm is already here.
+          command -v cpanm >/dev/null || { sudo apt-get update && sudo apt-get install -y cpanminus; }
+          perl -MTest::Nginx::Socket -e1 2>/dev/null || sudo cpanm --notest Test::Nginx
+
+      - name: Sweep stale test listeners
+        run: |
+          # Same band-scoped sweep as the runtime job -- never widen past the
+          # band edge or it kills a sibling job's live fixtures (AUD-CIPORT1).
+          command -v fuser >/dev/null || sudo apt-get install -y psmisc
+          for p in $(seq "$TEST_BASE_PORT" $((TEST_BASE_PORT + 63))); do
+            fuser -k -TERM "${p}/tcp" 2>/dev/null || true
+          done
+          sleep 1
+
+      # AUD-CIPORT3. This job is the one that does NOT run on its declared
+      # band: TEST_NGINX_RANDOMIZE makes Test::Nginx pick from gen_rand_port's
+      # hardcoded 1988-65534 (Util.pm, no env knob), which straddles every band
+      # in this repo. So this job's nginx port -- and its origin listener at
+      # server_port()+1 -- can land inside a SIBLING job's band, where that
+      # sibling's own sweep step will SIGTERM it mid-run.
+      #
+      # With 6 sibling bands (384 swept ports) that is a ~4.7% chance per run
+      # across 4 parallel files, and it scales with the file count: at the 33
+      # preset files this suite is heading for it reaches ~33%. It would
+      # present as an unreproducible "connection refused" in an unrelated
+      # preset, which is the worst kind of CI flake to chase.
+      #
+      # Cheapest correct fix: pre-bind the sibling bands for the life of this
+      # job. gen_rand_port only returns a port it could bind itself, so a
+      # holder socket makes those ports unpickable rather than merely unlucky.
+      - name: Fence sibling port bands off from RANDOMIZE
+        run: |
+          python3 - <<'PY' &
+          import socket, time
+          # Every TEST_BASE_PORT in this repo except this job's own 19264.
+          holders = []
+          for base in (18880, 18944, 19008, 19072, 19136, 19200):
+              for p in range(base, base + 64):
+                  s = socket.socket()
+                  s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                  try:
+                      s.bind(("127.0.0.1", p))
+                      s.listen(1)
+                      holders.append(s)
+                  except OSError:
+                      # Already held -- by a live sibling job, or by a stale
+                      # listener its own sweep will clear. Either way this job
+                      # must not pick it, and gen_rand_port already cannot.
+                      s.close()
+          # Outlive the prove step; the runner reaps us at job teardown.
+          time.sleep(3600)
+          PY
+          echo "fenced 6 sibling bands (pid $!)"
+          sleep 2
+
+      - name: Run the preset suite
+        env:
+          TEST_NGINX_BINARY: ${{ github.workspace }}/nginx-bin/nginx
+          TEST_NGINX_LOAD_MODULES: ${{ github.workspace }}/nginx-bin/ngx_http_cache_turbo_module.so
+          # RANDOMIZE is what makes `prove -j` correct, not merely faster: it
+          # gives each parallel job its own random listening port AND its own
+          # t/servroot_<port>/. Without it every job shares one port and one
+          # servroot and they race -- observed as "bind() to <port> failed
+          # (98: Address already in use)" plus a truncated NOTESTS result.
+          # Do not pin TEST_NGINX_PORT or TEST_NGINX_SERVROOT alongside it;
+          # either one re-shares the resource RANDOMIZE just separated. The
+          # origin port is derived per process in ci/t/lib/CacheTurbo.pm.
+          TEST_NGINX_RANDOMIZE: "1"
+          # A shared-runner cold start competes with package builds; the
+          # default 3s bound turns that into a "flaky" failure with nothing
+          # wrong in the code. See feedback-nla-runtime-tests-timeout-env.
+          TEST_NGINX_TIMEOUT: "20"
+        run: |
+          chmod +x nginx-bin/nginx
+          set -o pipefail
+          # servroot_<port> dirs are created under t/ by the scaffold itself.
+          mkdir -p t
+          # -j runs FILES in parallel; each .t owns its own nginx and servroot.
+          prove -j4 -r ci/t/
 
 # Legacy nginx (pre-1.23) runtime and ASan+UBSan moved OUT of this workflow
 # 2026-07-21:
