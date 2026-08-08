@@ -1,4 +1,4 @@
-# sync-sha: af0de2db6a48955180f62037e1d881bd236d21e673911e9b288f08e23784326b
+# sync-sha: bf872371c6cad7069b33b5689d4815f514076190578b0e2250f7a99e3334f16e
 name: Build & Test
 
 # Runner selection: plain `[self-hosted, builder02]`, NOT `lxc`.
