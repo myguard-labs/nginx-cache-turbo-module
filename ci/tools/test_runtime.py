@@ -5529,58 +5529,6 @@ def test_woocommerce_wc_ajax(ng: Nginx, origin: Origin) -> None:
     drain_origin(origin)
 
 
-def test_wordpress_search_and_preview(ng: Nginx, origin: Origin) -> None:
-    """WordPress ?s= (site search) must CACHE; ?preview= must BYPASS.
-
-    The search assertion is INVERTED from what the preset used to ship. `s` was
-    a bare-name arg rule, so every site search bypassed. That bought nothing: a
-    logged-out visitor's results are ANONYMOUS-IDENTICAL (everyone searching
-    "foo" gets the same page), and a logged-in editor whose results include
-    drafts is already bypassed by wordpress_logged_in_ on the cookie tier.
-
-    It was also the wrong direction on load. A bypass returns NGX_DECLINED
-    before the single-flight lock, so a bypassed request gets no miss-collapsing
-    -- a ?s= flood put 100% of its load on the origin, uncollapsed, on the most
-    expensive query WordPress runs. ct_wagtail_* (/search/ absent) and the
-    mediawiki registry's refusal of a blanket action= rule already argued this
-    case; the WordPress row was the outlier.
-
-    ?preview= is asserted in the same test because it is the OTHER arg row, and
-    the failure mode of "fix search by emptying ct_wp_args" is that preview goes
-    with it. A preview renders an unpublished revision."""
-    # Search results are shared across logged-out visitors -> must cache.
-    for uri in ("/wpq/index?s=foo", "/wpq/index?s=hello+world", "/wpq/?s=x"):
-        fetch(ng.port, uri)
-        _, _, hs = fetch(ng.port, uri)
-        assert hs.get("x-cache") == "HIT", \
-            (f"{uri} is an anonymous-identical search result and must cache -- "
-             f"bypassing it is a hit-rate loss AND an uncollapsed origin flood, "
-             f"got {hs.get('x-cache')}")
-
-    # Distinct search terms must not collide (the key carries the query string).
-    _, b1, _ = fetch(ng.port, "/wpq/index?s=alpha")
-    _, b2, _ = fetch(ng.port, "/wpq/index?s=beta")
-    assert b1 != b2, "distinct ?s= terms must not share a cache entry"
-
-    # A logged-in editor's search DOES include drafts -- the cookie tier is what
-    # covers that, and it must still fire on a search URL.
-    ed = {"Cookie": "wordpress_logged_in_abc123=alice|1|deadbeef"}
-    fetch(ng.port, "/wpq/index?s=draft", headers=ed)
-    _, _, he = fetch(ng.port, "/wpq/index?s=draft", headers=ed)
-    assert "x-cache" not in he, \
-        ("a logged-in editor's search may include drafts and private posts -- "
-         f"wordpress_logged_in_ must bypass it, got {he.get('x-cache')}")
-
-    # ?preview= renders an unpublished revision -> must never be stored.
-    for uri in ("/wpq/post-1?preview=true", "/wpq/post-1?p=9&preview=true"):
-        fetch(ng.port, uri)
-        _, _, hp = fetch(ng.port, uri)
-        assert "x-cache" not in hp, \
-            (f"{uri} renders an UNPUBLISHED revision and must bypass, got "
-             f"{hp.get('x-cache')}")
-    drain_origin(origin)
-
-
 def test_header_auth_rest_surfaces(ng: Nginx, origin: Origin) -> None:
     """Header-authenticated REST surfaces must bypass on the URI/arg tier.
 
@@ -7410,9 +7358,10 @@ def test_auto_classify_more(ng: Nginx, origin: Origin) -> None:
     # safety (a logged-out visitor's results are anonymous-identical; a
     # logged-in editor is bypassed by wordpress_logged_in_ on the cookie tier)
     # and it removed miss-collapsing from the most expensive query WordPress
-    # runs. Full coverage is in test_wordpress_search_and_preview, which uses a
-    # location whose key carries the query string; /auto/ keys on $uri alone, so
-    # all that can be asserted here is that ?s= no longer classifies as dynamic.
+    # runs. Full coverage is in ci/t/presets/wordpress.t (TEST 8-9), which uses
+    # a location whose key carries the query string; /auto/ keys on $uri alone,
+    # so all that can be asserted here is that ?s= no longer classifies as
+    # dynamic.
     fetch(ng.port, "/auto/results-s?s=widgets")
     _, _, hs2 = fetch(ng.port, "/auto/results-s?s=widgets")
     assert hs2.get("x-cache") == "HIT", \
@@ -16470,7 +16419,6 @@ def run_all(ng: Nginx, origin: Origin,
     test_auto_backend_composition(ng, origin)
     test_woo_implies_wordpress_wp_admin(ng, origin)
     test_woocommerce_wc_ajax(ng, origin)
-    test_wordpress_search_and_preview(ng, origin)
     test_header_auth_rest_surfaces(ng, origin)
     test_discourse_preset(ng, origin)
     test_phpbb_preset(ng, origin)
@@ -17001,8 +16949,6 @@ def main() -> int:
           "bypass cookie-less, ';'-separated logout, plain reads cached), "
           "header-auth REST surfaces (magento /rest+/soap, drupal /jsonapi+"
           "/oauth, wp ?rest_route=, /restaurant-supplies still cached), "
-          "wordpress preset (?s= search CACHES incl. distinct terms, "
-          "logged-in editor search bypasses on cookie, ?preview= bypasses), "
           "mediawiki preset (13 mutating core actions bypass cookie-less, "
           "encoded/non-first action, render/info/credits/view stay cached), "
           "punbb/phorum URI rows (edit/delete/moderate/profile/register bypass, "
