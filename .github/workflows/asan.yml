@@ -1,10 +1,16 @@
-# sync-sha: ba4340d33556ddc768a29c9f44a1352d13999d51692306fe1447262359b25a8e
+# sync-sha: 3414952dc5535195c904775346fb9db1cb1d9c96d00f89ce131069779f849e6a
 name: ASan and UBSan
 
-# Dedicated ASan+UBSan workflow, PATH-GATED: only runs when a PR/push touches
-# code that could carry a memory/UB bug (C sources, the build/runtime harness,
-# or this workflow). A docs/memory/other-workflow PR skips it entirely instead
-# of paying the ~16-minute sanitizer build+suite for zero possible signal.
+# Dedicated ASan+UBSan workflow, POST-MERGE and PATH-GATED: it runs on pushes to
+# main that touch code which could carry a memory/UB bug (C sources, the build/
+# runtime harness, or this workflow), plus on demand. A push that only changes
+# docs/memory/other workflows skips it entirely instead of paying the
+# ~16-minute sanitizer build+suite for zero possible signal.
+#
+# NOT a PR gate: the build + max(single, multi) wall-clock is ~14 minutes and it
+# dominated every PR on this repo. Sanitizer coverage of each merged C change is
+# preserved by the push trigger; a PR that wants the signal BEFORE merge runs it
+# with `gh workflow run asan.yml --ref <branch>`.
 #
 # Structure — compile ONCE, run the two suite modes as PARALLEL jobs:
 #   build-asan            compile the static --add-module ASan binary, upload it
@@ -27,14 +33,6 @@ env:
 
 on:
   push:
-    branches: [main]
-    paths:
-      - "src/**"
-      - "ci/tools/ci-build.sh"
-      - "ci/tools/test_runtime.py"
-      - "ci/tools/ci-hang-guard.sh"
-      - ".github/workflows/asan.yml"
-  pull_request:
     branches: [main]
     paths:
       - "src/**"

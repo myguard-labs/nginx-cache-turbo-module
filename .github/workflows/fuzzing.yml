@@ -1,9 +1,12 @@
-# sync-sha: 467556b83526a779c55a8ebbd1273d29d5f880ccb0bb8dffc26acfdce476b538
+# sync-sha: 8fe2c29f3f2a58a60baefac1821e06829fc421f551a247b3045a2ad4f88a8832
 name: Fuzzing
 
-# Fast fuzz regression gate on every PR/push — 120s/target on all five parser
-# fuzzers (+dict where useful), kept short so PR feedback stays quick. Long
-# discovery fuzzing (hours/target) lives in ci-deep.yml (monthly cron +
+# Fuzz regression run — 120s/target on all five parser fuzzers (+dict where
+# useful). POST-MERGE: it runs on pushes to main and on demand, NOT on PRs. At
+# ~11 minutes it was the second-largest contributor to PR wall-clock on this
+# repo, and the targets are regression corpora rather than a pre-merge gate.
+# Run it on a branch before merge with `gh workflow run fuzzing.yml --ref <branch>`.
+# Long discovery fuzzing (hours/target) lives in ci-deep.yml (monthly cron +
 # workflow_dispatch).
 #
 # Action pins (keep in sync with build-test.yml header):
@@ -17,19 +20,13 @@ env:
   NGINX_VERSION: "1.31.1"
 
 on:
-  # Path-gated for the same reason asan.yml is: this is a ~8min job and, with only
-  # 4 matching runner slots, every long job on a PR that cannot possibly affect it
-  # pushes the whole wave's wall-clock out. The targets are built from ci/fuzz/*.c
-  # plus the shims, which mirror parser code lifted out of src/ -- so a docs, memory,
-  # or unrelated-workflow PR cannot change fuzz behaviour. Keep this list in sync
-  # with what ci/fuzz/build.sh actually compiles.
+  # Path-gated for the same reason asan.yml is: this is a ~11min job and, with only
+  # 4 matching runner slots, every long job that cannot possibly affect it pushes
+  # the whole wave's wall-clock out. The targets are built from ci/fuzz/*.c plus
+  # the shims, which mirror parser code lifted out of src/ -- so a docs, memory,
+  # or unrelated-workflow change cannot change fuzz behaviour. Keep this list in
+  # sync with what ci/fuzz/build.sh actually compiles.
   push:
-    branches: [main]
-    paths:
-      - "src/**"
-      - "ci/fuzz/**"
-      - ".github/workflows/fuzzing.yml"
-  pull_request:
     branches: [main]
     paths:
       - "src/**"
