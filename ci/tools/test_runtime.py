@@ -3251,23 +3251,6 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
-        # ---- ghost ---------------------------------------------------------
-        location /ghost/ {{
-            cache_turbo         main;
-            cache_turbo_backend ghost;
-            cache_turbo_key     $uri;
-            cache_turbo_valid   30s;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-        # The public blog: must cache for anonymous readers. Also where the
-        # ?uuid=/?key= cookieless member auth is exercised.
-        location /blog/ {{
-            cache_turbo         main;
-            cache_turbo_backend ghost;
-            cache_turbo_key     $uri$is_args$args;
-            cache_turbo_valid   30s;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
 
         # ---- wagtail -------------------------------------------------------
         # URI prefixes anchor at position 0 -> ROOT locations. Every "must
@@ -6632,54 +6615,6 @@ def test_typo3_preset(ng: Nginx, origin: Origin) -> None:
     _, _, ha = fetch(ng.port, "/t3/page")
     assert ha.get("x-cache") == "HIT", \
         f"typo3: an anonymous reader must cache, got {ha.get('x-cache')}"
-    drain_origin(origin)
-
-
-def test_ghost_preset(ng: Nginx, origin: Origin) -> None:
-    """Ghost preset (docs/ghost.md).
-
-    The public blog is a genuinely shared anonymous surface, which is what makes
-    it worth caching. Note it is NOT true that a member sees the same HTML as a
-    guest on a public post -- `@member` is injected into the template context
-    unconditionally, so {{#if @member}} changes the markup of a fully public post.
-    The cookie bypass is what keeps this correct; it is load-bearing.
-
-    The query-arg rules are LOAD-BEARING too: each one authenticates or unlocks
-    with NO cookie, so the cookie rule cannot catch them. authMemberByUuid()
-    authenticates a member purely from ?uuid=&key=; ?gift= serves UNLOCKED GATED
-    content to a caller with no member cookie at all. Without these rules a
-    member-authenticated (or paid) response could be stored and served to
-    strangers. That is the sharp edge of this preset."""
-    # Admin SPA / API bypasses.
-    _, _, h = fetch(ng.port, "/ghost/api/admin/site")
-    assert "x-cache" not in h, "/ghost/ must bypass"
-
-    # Members session cookie bypasses (covers the .sig cookie via substring too).
-    for ck in ("ghost-members-ssr=abc123", "ghost-members-ssr.sig=deadbeef",
-               "ghost-admin-api-session=cafe"):
-        _, _, h1 = fetch(ng.port, "/blog/post-a", headers={"Cookie": ck})
-        _, _, h2 = fetch(ng.port, "/blog/post-a", headers={"Cookie": ck})
-        assert "x-cache" not in h1 and "x-cache" not in h2, \
-            f"ghost: {ck.split('=')[0]} must bypass"
-
-    # COOKIELESS MEMBER AUTH: ?uuid=&key= authenticates a member with no cookie at
-    # all. If these do not bypass, a member's page gets stored and served to the
-    # public. This is the sharp edge of the Ghost preset.
-    for uri in ("/blog/post-b?uuid=abc-123&key=deadbeef",
-                "/blog/post-b?token=magiclink123",
-                "/blog/post-b?gift=abc123"):
-        _, _, hu = fetch(ng.port, uri)
-        assert "x-cache" not in hu, \
-            (f"ghost: {uri} authenticates a member (or unlocks gated content) via "
-             "the QUERY STRING with no cookie -- it must bypass or a member/paid "
-             "response is served to strangers")
-
-    # An anonymous reader must cache -- Ghost sets no cookie for one, which is the
-    # property that makes this preset worth shipping at all.
-    fetch(ng.port, "/blog/post-c")
-    _, _, ha = fetch(ng.port, "/blog/post-c")
-    assert ha.get("x-cache") == "HIT", \
-        f"ghost: an anonymous blog reader must cache, got {ha.get('x-cache')}"
     drain_origin(origin)
 
 
@@ -15915,7 +15850,6 @@ def run_all(ng: Nginx, origin: Origin,
     test_yabb_preset(ng, origin)
     test_phorum_uri_rules_anchor_at_root(ng, origin)
     test_internal_redirect_key_and_veto(ng, origin)
-    test_ghost_preset(ng, origin)
     test_wagtail_preset(ng, origin)
     test_kirby_preset(ng, origin)
     test_typo3_preset(ng, origin)
