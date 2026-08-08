@@ -3277,6 +3277,17 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # `none` overrides an inherited preset. The server-level directive below
+        # arms wordpress for every location that does not say otherwise; this one
+        # says otherwise, so /wp-admin/-style rules must NOT fire here.
+        location /nonepreset/ {{
+            cache_turbo         main;
+            cache_turbo_backend none;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # ---- discourse ----------------------------------------------------
         # URI prefixes anchor at position 0, so these must be ROOT locations.
         location /session {{
