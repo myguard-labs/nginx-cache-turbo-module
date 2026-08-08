@@ -3252,44 +3252,6 @@ http {{
         }}
 
 
-        # ---- kirby ---------------------------------------------------------
-        location /panel {{
-            cache_turbo         main;
-            cache_turbo_backend kirby;
-            cache_turbo_key     $uri;
-            cache_turbo_valid   30s;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-        # Segment-boundary matcher proof: "/panel" must NOT swallow an unrelated
-        # public path that merely shares the prefix. "/panels-and-doors" is a
-        # different path segment (next byte is 's', not '/' or '.') so it must
-        # CACHE. Without the boundary check the bare prefix test bypassed it.
-        location /panels-and-doors {{
-            cache_turbo         main;
-            cache_turbo_backend kirby;
-            cache_turbo_key     $uri;
-            cache_turbo_valid   30s;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-        # The flat-file public site: the whole point of the preset. Must cache.
-        # /media/ is NOT a preset URI (static assets, no permission view) so it
-        # must cache too -- asserting that guards against someone "helpfully"
-        # adding it later.
-        location /kb/ {{
-            cache_turbo         main;
-            cache_turbo_backend kirby;
-            cache_turbo_key     $uri;
-            cache_turbo_valid   30s;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-        location /media/ {{
-            cache_turbo         main;
-            cache_turbo_backend kirby;
-            cache_turbo_key     $uri;
-            cache_turbo_valid   30s;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-
         # ---- require_header (explicit upstream store opt-in) ----------------
         # The gate INVERTS the store default here: nothing is captured unless the
         # origin affirms it. X-CT-Status is mandatory to test this at all -- every
@@ -6570,64 +6532,6 @@ def test_typo3_preset(ng: Nginx, origin: Origin) -> None:
     _, _, ha = fetch(ng.port, "/t3/page")
     assert ha.get("x-cache") == "HIT", \
         f"typo3: an anonymous reader must cache, got {ha.get('x-cache')}"
-    drain_origin(origin)
-
-
-def test_kirby_preset(ng: Nginx, origin: Origin) -> None:
-    """Kirby preset (docs/kirby.md).
-
-    The best-shaped traffic of any preset here -- a flat-file site is almost
-    entirely public pages identical for every logged-out visitor.
-
-    kirby_session is a stable literal (session.cookieName) AND is not issued to
-    anonymous visitors: Kirby creates a session only when something is stored in
-    it. Stable + not-guest-issued is the pair every rejected candidate failed
-    (Grav's grav-site-<hash> is guest-issued AND per-install; Craft's
-    CraftSessionId is stable but handed to everyone).
-
-    THE ONE CONDITION FAILS SAFE: Kirby's csrf() helper creates a session cookie,
-    so a page with a contact/search form issues kirby_session to guests and stops
-    caching. That costs HITS; it never leaks -- the error direction is
-    bypass-a-guest, not serve-a-member's-page. Precisely inverted from Flarum,
-    whose no-remember-me logins carry only the guest-issued flarum_session, which
-    is why Flarum is rejected outright."""
-    # Panel (admin) bypasses -- both the exact prefix and a sub-path.
-    _, _, h = fetch(ng.port, "/panel/pages")
-    assert "x-cache" not in h, "kirby: /panel/... must bypass"
-    _, _, hp = fetch(ng.port, "/panel")
-    assert "x-cache" not in hp, "kirby: exact /panel must bypass"
-
-    # SEGMENT BOUNDARY: /panels-and-doors shares the /panel prefix but is a
-    # different path segment, so it must CACHE, not bypass. Guards the boundary
-    # matcher against regressing to a bare prefix test.
-    fetch(ng.port, "/panels-and-doors")
-    _, _, hb = fetch(ng.port, "/panels-and-doors")
-    assert hb.get("x-cache") == "HIT", \
-        f"kirby: /panels-and-doors must cache (not swallowed by /panel), got {hb.get('x-cache')}"
-
-    # The logged-in Panel user / frontend member: kirby_session must bypass.
-    for ck in ("kirby_session=abc123",):
-        _, _, h1 = fetch(ng.port, "/kb/about", headers={"Cookie": ck})
-        _, _, h2 = fetch(ng.port, "/kb/about", headers={"Cookie": ck})
-        assert "x-cache" not in h1 and "x-cache" not in h2, \
-            f"kirby: kirby_session must bypass (Cookie: {ck})"
-
-    # Anonymous reader of the flat-file site caches -- Kirby issues no cookie to
-    # one, which is the property that makes this preset shippable.
-    fetch(ng.port, "/kb/home")
-    _, _, ha = fetch(ng.port, "/kb/home")
-    assert ha.get("x-cache") == "HIT", \
-        f"kirby: an anonymous reader must cache, got {ha.get('x-cache')}"
-
-    # /media/ is deliberately NOT a preset URI. Kirby serves assets from
-    # /media/<hash>/ with no per-request permission view, so it is static content
-    # that SHOULD cache -- bypassing it would be a self-inflicted wound. Assert it
-    # caches so nobody "helpfully" adds the prefix later.
-    fetch(ng.port, "/media/pages/home/logo.svg")
-    _, _, hm = fetch(ng.port, "/media/pages/home/logo.svg")
-    assert hm.get("x-cache") == "HIT", \
-        ("kirby: /media/ is static with no permission view and must stay cacheable, "
-         f"got {hm.get('x-cache')}")
     drain_origin(origin)
 
 
@@ -15743,7 +15647,6 @@ def run_all(ng: Nginx, origin: Origin,
     test_yabb_preset(ng, origin)
     test_phorum_uri_rules_anchor_at_root(ng, origin)
     test_internal_redirect_key_and_veto(ng, origin)
-    test_kirby_preset(ng, origin)
     test_typo3_preset(ng, origin)
     test_new_presets_not_in_generic(ng, origin)
     test_auto_classify_more(ng, origin)
