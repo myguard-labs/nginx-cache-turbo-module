@@ -3199,22 +3199,7 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
-        # ---- discourse ----------------------------------------------------
-        # URI prefixes anchor at position 0, so these must be ROOT locations.
-        location /session {{
-            cache_turbo         main;
-            cache_turbo_backend discourse;
-            cache_turbo_key     $uri;
-            cache_turbo_valid   30s;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-        location /u/ {{
-            cache_turbo         main;
-            cache_turbo_backend discourse;
-            cache_turbo_key     $uri;
-            cache_turbo_valid   30s;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
+        # ---- discourse (arg-scanner vehicle only; see test_preset_arg_scanner)
         # Cookie/arg rules are path-independent, so a prefixed location is fine:
         # _t bypasses, but the guest _forum_session and the theme_ids /
         # forced_color_mode variant cookies must NOT.
@@ -5276,49 +5261,6 @@ def test_header_auth_rest_surfaces(ng: Nginx, origin: Origin) -> None:
         assert "x-cache" not in h, \
             (f"{uri} IS the REST API -- /wp-json/ is a rewrite to this form, so "
              f"guarding only the path leaves it open, got {h.get('x-cache')}")
-    drain_origin(origin)
-
-
-def test_discourse_preset(ng: Nginx, origin: Origin) -> None:
-    """Discourse preset (docs/discourse.md). `_t` is the auth token and bypasses.
-    `_forum_session` is the Rails session cookie that Discourse hands to EVERY
-    visitor including guests, and theme_ids/forced_color_mode are presentation
-    variants — all three must keep caching. Bypassing on _forum_session would be
-    the xf_session mistake again: it would drop all guest traffic out of the
-    cache, which is a performance bug, not a safety one."""
-    _, _, h = fetch(ng.port, "/session")
-    assert "x-cache" not in h, "/session must bypass on the discourse preset"
-
-    # /u/ (public profiles) is NO LONGER a bypass rule: profiles are anon-
-    # identical and Discourse's own anon cache caches them, so they must cache.
-    fetch(ng.port, "/u/someone")
-    _, _, hu = fetch(ng.port, "/u/someone")
-    assert hu.get("x-cache") == "HIT", \
-        f"/u/ public profile must cache now, got {hu.get('x-cache')}"
-
-    # Auth token bypasses on an otherwise cacheable page.
-    tok = {"Cookie": "_t=abc123deadbeef"}
-    _, _, h1 = fetch(ng.port, "/dc/topic-a", headers=tok)
-    _, _, h2 = fetch(ng.port, "/dc/topic-a", headers=tok)
-    assert "x-cache" not in h1 and "x-cache" not in h2, "_t must bypass"
-
-    # Guest Rails session must NOT bypass.
-    guest = {"Cookie": "_forum_session=guestsess123"}
-    fetch(ng.port, "/dc/topic-b", headers=guest)
-    _, _, hg = fetch(ng.port, "/dc/topic-b", headers=guest)
-    assert hg.get("x-cache") == "HIT", \
-        f"guest _forum_session must stay cacheable, got {hg.get('x-cache')}"
-
-    # Theme / colour-mode variants must NOT bypass (they belong in the key).
-    var = {"Cookie": "theme_ids=2; forced_color_mode=dark"}
-    fetch(ng.port, "/dc/topic-c", headers=var)
-    _, _, hv = fetch(ng.port, "/dc/topic-c", headers=var)
-    assert hv.get("x-cache") == "HIT", \
-        f"theme_ids/forced_color_mode must stay cacheable, got {hv.get('x-cache')}"
-
-    # API args bypass.
-    _, _, ha = fetch(ng.port, "/dc/topic-d?api_key=deadbeef")
-    assert "x-cache" not in ha, "?api_key= must bypass"
     drain_origin(origin)
 
 
@@ -15211,7 +15153,6 @@ def run_all(ng: Nginx, origin: Origin,
     test_woo_implies_wordpress_wp_admin(ng, origin)
     test_woocommerce_wc_ajax(ng, origin)
     test_header_auth_rest_surfaces(ng, origin)
-    test_discourse_preset(ng, origin)
     test_phpbb_preset(ng, origin)
     test_redmine_key_arg_bypasses_without_cookie(ng, origin)
     test_redmine_public_content_stays_cacheable(ng, origin)
