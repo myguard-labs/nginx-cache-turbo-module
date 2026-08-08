@@ -74,9 +74,12 @@ our $HttpConfig = ct_http_config();
 
 # The preset's URI rules are prefixes anchored at byte 0, so /user, /admin,
 # /node/add, /system/, /core/install.php, /jsonapi and /oauth must be ROOT
-# locations. /dr/ carries the cookie cases, which are path-independent. /gen/
-# is the isolation control -- a DIFFERENT preset, proving the drupal rows are
-# opt-in and do not leak into another backend's location.
+# locations. /dr/ carries the cookie cases, which are path-independent.
+# /users-directory-info is the segment-termination lookalike for TEST 6 --
+# nginx's longest-prefix-match picks this location over /user for that exact
+# path, so the request actually reaches a cache-enabled drupal backend instead
+# of 404ing. /gen/ is the isolation control -- a DIFFERENT preset, proving the
+# drupal rows are opt-in and do not leak into another backend's location.
 our $Config = ct_config(
     { path => '/user',              backend => 'drupal'    },
     { path => '/admin',             backend => 'drupal'    },
@@ -86,6 +89,7 @@ our $Config = ct_config(
     { path => '/jsonapi',           backend => 'drupal'    },
     { path => '/oauth',             backend => 'drupal'    },
     { path => '/dr/',               backend => 'drupal'    },
+    { path => '/users-directory-info', backend => 'drupal' },
     { path => '/gen/',              backend => 'wordpress' },
 );
 
@@ -165,14 +169,17 @@ __DATA__
 
 
 === TEST 6: a URI that merely shares a segment prefix does NOT bypass -- segment termination
-# /user is a slash-less needle. /users-directory continues past the matched
-# bytes with 'sers-directory', whose next byte is neither '/' nor '.', so this
-# must NOT be treated as under /user. Routed through /dr/ so a false bypass on
-# the URI rule cannot be confused with a cookie-rule bypass.
+# /users-directory-info begins with the needle /user at byte 0 and continues
+# with 's', which is neither '/' nor '.' nor end-of-URI -- so the segment-
+# terminator check in ngx_http_cache_turbo_uri_prefix must reject this as a
+# match for the /user rule. If that check were deleted (a plain raw prefix
+# match that accepts any following byte), this request would incorrectly
+# bypass the cache instead of being served from it, so caching (a HIT on the
+# second request) is what proves the terminator logic is doing its job.
 --- http_config eval: $::HttpConfig
 --- config eval: $::Config
 --- request eval
-["GET /dr/users-directory-info", "GET /dr/users-directory-info"]
+["GET /users-directory-info", "GET /users-directory-info"]
 --- response_headers eval
 [qq{X-Cache: }, qq{X-Cache: HIT}]
 --- error_code eval
