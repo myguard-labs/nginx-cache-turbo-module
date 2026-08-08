@@ -19,11 +19,16 @@
 #
 # THE COOKIE NAMES -- BOTH SHARE A PREFIX
 # ------------------------------------------------------------------------
-# `txp_login_public=` and `txp_login=` are both matched as SUFFIX predicates.
-# Both end in "=" so the SUFFIX match captures both the presence check (name
-# must be present) AND a notational cue (the cookie must have a value being set,
-# not a bare unset directive). TEST 5/6 cover each name independently; TEST 7
-# tests suffix-under-any-prefix (a proxy-prefixed variant bypasses too).
+# `txp_login_public=` and `txp_login=` are both matched via
+# ngx_http_cache_turbo_cookie_has(), a plain SUBSTRING search over the raw
+# Cookie header value -- not a name lookup, and not a suffix-of-name match
+# (that stricter matcher belongs to the separate predicate tier, which this
+# preset does not use). Both needles end in "=" so the substring match
+# captures both the presence check (name must be present) AND a notational
+# cue (the cookie must have a value being set, not a bare unset directive).
+# TEST 5/6 cover each name independently; TEST 7 tests a dynamic prefix on
+# the cookie name (a proxy-prefixed variant still bypasses, since the needle
+# can match anywhere in the header).
 #
 # THE URI LIST -- SINGLE ENTRY, SEGMENT-TERMINATED
 # ------------------------------------------------------------------------
@@ -169,9 +174,10 @@ Cookie: txp_login=def456
 
 
 
-=== TEST 7: txp_login under a proxy prefix still bypasses -- SUFFIX match
-# Both cookie names are matched as suffix predicates, so a proxy- or
-# theme-prefixed variant still matches.
+=== TEST 7: txp_login under a proxy prefix still bypasses -- SUBSTRING match
+# Both cookie names are matched by plain substring search over the raw
+# Cookie header, so a proxy- or theme-prefixed variant still matches --
+# the needle just needs to appear anywhere in the header.
 --- http_config eval: $::HttpConfig
 --- config eval: $::Config
 --- more_headers
@@ -202,8 +208,8 @@ Cookie: txp_login_public=
 
 
 === TEST 9: a bare valueless cookie (no '=') does NOT bypass
-# The suffix predicate is "txp_login_public=" (includes the '='), so a bare
-# cookie name "txp_login_public" without a '=' does NOT match the suffix and
+# The needle is "txp_login_public=" (includes the '='), so a bare cookie
+# name "txp_login_public" without a '=' does NOT contain that substring and
 # does NOT bypass. The request must cache because there is no bypass signal.
 --- http_config eval: $::HttpConfig
 --- config eval: $::Config

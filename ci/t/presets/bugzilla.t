@@ -19,14 +19,16 @@
 #
 # Both cookies are always issued on successful login but are INDEPENDENT:
 # `Bugzilla_logincookie=` does NOT end in `Bugzilla_login=`, so both rows
-# fire separately. TESTS 5 and 6 verify each cookie independently bypasses;
-# TEST 7 confirms a leading non-matching cookie does not prevent a trailing
+# fire separately. TESTS 6 and 7 verify each cookie independently bypasses;
+# TEST 8 confirms a leading non-matching cookie does not prevent a trailing
 # matching one from firing.
 #
 # ct_bugzilla_args[] is 8 rows deep, testing query-string API authentication.
-# This file covers a REPRESENTATIVE sample (4 args) plus negative controls
-# (TESTS 11/12 verify that an unrelated query arg does not bypass, and
-# presence of unrelated args does not suppress a bypassing arg).
+# This file covers a REPRESENTATIVE sample (3 distinct args: Bugzilla_api_key,
+# api_key, Bugzilla_token; TEST 13 reuses api_key alongside an unrelated arg)
+# plus negative controls (TEST 12 verifies that an unrelated query arg does
+# not bypass, and TEST 13 verifies presence of an unrelated arg does not
+# suppress a bypassing arg).
 #
 # THE URI LIST: /rest IS THE SEGMENT-TERMINATION BOUNDARY
 # --------------------------------------------------------
@@ -38,17 +40,17 @@
 #
 # "/rest" IS SLASH-LESS (no ".cgi" suffix), so it is the highest-value
 # segment-termination test in this file. It matches "/rest", "/rest/bug",
-# "/rest.cgi" -- but NOT "/restaurant". TEST 4 is the explicit negative
+# "/rest.cgi" -- but NOT "/restaurant". TEST 2 is the explicit negative
 # proving that "/restaurant" CACHES while "/rest" itself bypasses.
 #
 # TEST 1 covers a representative handful of URI rows (3-5) at the root;
-# TEST 2 is the member LEAK GUARD for the bypassable URIs.
+# TEST 5 is the member LEAK GUARD for the bypassable URIs.
 #
 # THE VACUOUS URI TEST TRAP
 # --------------------------
 # uri_prefix() is byte-0 anchored, so a URI test served under a DIFFERENT
 # location prefix (e.g. "/bugzilla/admin.cgi") never reaches the rule at all
-# and would pass with the row deleted. TEST 13 is the explicit negative proving
+# and would pass with the row deleted. TEST 15 is the explicit negative proving
 # "/bugzilla/admin.cgi" HITs precisely because the rule never fires off byte 0.
 #
 # See ci/t/presets/xenforo.t for why every bypass case is fetched TWICE (a

@@ -17,10 +17,15 @@
 #
 # __ac=, _ZopeId=, statusmessages=, and I18N_LANGUAGE= are all user-specific
 # state (identity cookie, session, status, language), so the presence of any
-# signals a bypass. The rule is presence-only (SUFFIX match), not a value
-# predicate, so an empty value or valueless cookie still triggers a bypass.
-# TESTS 6-9 cover the member leak guards for each of the four cookies and the
-# suffix-under-any-prefix variants.
+# signals a bypass. The rule is presence-only, matched via
+# ngx_http_cache_turbo_cookie_has() -- a plain SUBSTRING search over the raw
+# Cookie header value, not a value predicate and not a suffix-of-name match --
+# so an empty value still triggers a bypass, but a needle ending in '=' (like
+# "__ac=") requires the '=' byte too (see TEST 12 for the bare-valueless
+# negative). TESTS 6-9 cover the member leak guards for each of the four
+# cookies, and TEST 10 covers a dynamic prefix on the cookie name (the needle
+# can match anywhere in the header, so a proxy/theme-prefixed variant still
+# bypasses).
 #
 # THE URI LIST AND THE /@@login TRAVERSAL VIEW
 # -------------------------------------------------------
@@ -242,9 +247,10 @@ Cookie: __ac=YWxhZGRpbjplY2Q2MmE1YzI4YWUwNDQyNDg1YjRkY2FmYzA2ZGYyZWE=
 
 
 
-=== TEST 10: suffix-under-any-prefix -- __ac with a proxy prefix still bypasses
-# Cookie matching is by SUFFIX, so a proxy- or theme-prefixed variant is still
-# a login signal. A request with a prefixed __ac cookie must still bypass.
+=== TEST 10: a dynamic prefix on the cookie name still bypasses -- __ac
+# Cookie matching is a raw substring search, so a proxy- or theme-prefixed
+# variant is still a login signal. A request with a prefixed __ac cookie must
+# still bypass.
 --- http_config eval: $::HttpConfig
 --- config eval: $::Config
 --- more_headers
@@ -259,8 +265,8 @@ Cookie: myproxy___ac=YWxhZGRpbjplY2Q2MmE1YzI4YWUwNDQyNDg1YjRkY2FmYzA2ZGYyZWE=
 
 
 === TEST 11: empty __ac cookie value still bypasses
-# The rule is presence-only (suffix match), not a value predicate. An empty
-# cookie value is still a bypass. Fetched twice per the bypass rule.
+# The rule is presence-only (substring match), not a value predicate. An
+# empty cookie value is still a bypass. Fetched twice per the bypass rule.
 --- http_config eval: $::HttpConfig
 --- config eval: $::Config
 --- more_headers
@@ -275,8 +281,8 @@ Cookie: __ac=
 
 
 === TEST 12: bare valueless __ac cookie (no '=') does NOT bypass
-# The suffix match is exactly "__ac=", ending with the '=' sign. A bare
-# "Cookie: __ac" (no '=') does NOT match that suffix, so it is treated as
+# The needle is exactly "__ac=", ending with the '=' sign. A bare
+# "Cookie: __ac" (no '=') does not contain that substring, so it is treated as
 # a guest cookie and the request CACHES normally. The second request should HIT.
 --- http_config eval: $::HttpConfig
 --- config eval: $::Config

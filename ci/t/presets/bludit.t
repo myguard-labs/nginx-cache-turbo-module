@@ -4,8 +4,9 @@
 # Bludit preset (docs/bludit.md). Ported from no existing Python tests in
 # ci/tools/test_runtime.py -- a new test tier closing the suite's bludit
 # gap. The public bootstrap is session-free; only the admin bootstrap starts
-# a session. The __Secure- spelling still contains BLUDIT-KEY, so suffix/
-# substring matching buys the dual-interface support one write.
+# a session. The __Secure- spelling still contains BLUDIT-KEY, so the plain
+# substring match over the raw Cookie header buys the dual-interface support
+# one write.
 #
 # THE COOKIE RULE IS PRESENCE-ONLY
 # ------------------------------------------------------------------------
@@ -19,8 +20,10 @@
 # The presence-only rule is safe: guests never receive any of these three
 # cookies (BLUDIT-KEY, BLUDITREMEMBERUSERNAME, BLUDITREMEMBERTOKEN), so a
 # bypass on presence alone never serves a guest page to a member. Empty values
-# and bare valueless cookies still bypass -- presence-only fails CLOSED in both
-# directions. TESTS 8/9 pin that.
+# still bypass, but a bare valueless cookie (no '=' on the wire) does NOT --
+# the two BLUDITREMEMBER* entries carry a trailing '=' in the source table,
+# and the substring match needs that '=' byte too. TESTS 8/9 pin that
+# asymmetry.
 #
 # THE URI LIST
 # ------------------------------------------------------------------------
@@ -42,7 +45,7 @@
 # Substring matching means "BLUDIT-KEY" matches the prefixed spelling
 # "__Secure-BLUDIT-KEY" on the wire, and "BLUDITREMEMBERUSERNAME=" (with '=')
 # matches only the named variant, not a bare "BLUDITREMEMBERUSERNAME" (no '=').
-# TEST 6 verifies the prefixed spelling. TESTS 8/9 verify empty/bare value
+# TEST 7 verifies the prefixed spelling. TESTS 8/9 verify empty/bare value
 # handling of the '=' variants.
 #
 # THE VACUOUS URI TEST TRAP

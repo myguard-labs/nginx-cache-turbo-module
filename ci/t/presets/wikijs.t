@@ -273,10 +273,10 @@ Cookie: theme=dark; loginRedirect=/a/secret-page
 
 
 
-=== TEST 9: a suffix-under-any-prefix cookie name still bypasses
-# The match is substring-on-value-name, so a proxy/theme-prefixed variant
-# (e.g. "myapp_jwt=...") still carries the "jwt=" needle and is still a
-# login signal.
+=== TEST 9: a dynamic prefix on the cookie name still bypasses
+# The match is a substring search over the raw Cookie header value, so a
+# proxy/theme-prefixed variant (e.g. "myapp_jwt=...") still carries the
+# "jwt=" needle and is still a login signal.
 --- http_config eval: $::HttpConfig
 --- config eval: $::Config
 --- more_headers

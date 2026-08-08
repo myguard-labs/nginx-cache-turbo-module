@@ -21,13 +21,16 @@
 # No value predicate is needed: these are identity markers, written only on
 # login or configuration change. Presence alone is sufficient and safe.
 #
-# COOKIE NAMES: PREFIX-MATCHED, NO SUFFIX NORMALIZATION
+# COOKIE NAMES: MATCHED BY RAW SUBSTRING, NOT NAME-SUFFIX
 # ------------------------------------------------------------------------
 # Ten rows: UMB_UCONTEXT=, UMB_EXTLOGIN=, UMB_PREVIEW=, UMB-WEBSITE-PREVIEW-
 # ACCEPT=, UMB-XSRF-V=, UMB_SESSION=, umbAccessToken, umbRefreshToken,
-# umbPkceCode, .AspNetCore.Identity.Application=. Bypass cookie predicates
-# match by SUFFIX, so "UMB_UCONTEXT=" will match any wire name ending in that
-# string. Note that some rows carry a trailing '=' and some do NOT (the three
+# umbPkceCode, .AspNetCore.Identity.Application=. Bypass cookie rows are
+# matched via ngx_http_cache_turbo_cookie_has() -- a plain SUBSTRING search
+# over the raw Cookie header value, not a name lookup and not a suffix-of-name
+# match -- so "UMB_UCONTEXT=" matches any wire name where that string appears
+# anywhere, including a dynamic prefix on the cookie name. Note that some rows
+# carry a trailing '=' and some do NOT (the three
 # `umb*Token`/`umbPkceCode` rows and the dotted `.AspNetCore.Identity.Application=`
 # row) -- respect that difference exactly. TEST 2-6 cover 4-5 representative
 # rows in depth (including TEST 2 with umbAccessToken, which has NO trailing '=',
@@ -109,8 +112,8 @@ __DATA__
 
 
 === TEST 3: UMB_UCONTEXT= cookie (trailing '=') bypasses
-# The backoffice default. Matched by SUFFIX, so any wire name ending in
-# "UMB_UCONTEXT=" will match.
+# The backoffice default. Matched by a raw substring search, so any wire
+# cookie header containing "UMB_UCONTEXT=" will match.
 --- http_config eval: $::HttpConfig
 --- config eval: $::Config
 --- more_headers
@@ -210,9 +213,9 @@ Cookie: PHPSESSID=guest; UMB_SESSION=logged
 
 
 
-=== TEST 8: suffix matching under any prefix
-# The match is SUFFIX-on-name, so a proxy- or theme-prefixed variant is still
-# a bypass signal.
+=== TEST 8: a dynamic prefix on the cookie name still bypasses
+# The match is a raw substring search, so a proxy- or theme-prefixed variant
+# is still a bypass signal.
 --- http_config eval: $::HttpConfig
 --- config eval: $::Config
 --- more_headers

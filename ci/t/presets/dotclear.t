@@ -23,10 +23,15 @@
 # IMPORTANT: dcxd HAS NO TRAILING '=' WHILE dc_admin AND dc_passwd DO
 # -----------------------------------------------------------------------
 # This is load-bearing. `dcxd` is a bare session id, while `dc_admin=` and
-# `dc_passwd=` carry values. The suffix-matching logic respects this: a cookie
-# named exactly "dcxd" or ending with "dcxd" (e.g. "myblog_dcxd") bypasses.
-# A cookie named "dc_admin=" or ending with it (e.g. "myprefix_dc_admin=")
-# bypasses. TEST 4 pins the per-blog spellings.
+# `dc_passwd=` carry values. All three are matched via
+# ngx_http_cache_turbo_cookie_has() -- a plain SUBSTRING search over the raw
+# Cookie header value, not a suffix-of-name match -- so "dcxd" bypasses
+# whenever that string appears anywhere in the header, including inside the
+# per-blog spelling "dcxd_myblog" (a dynamic SUFFIX on the cookie NAME, which
+# the substring search matches for free). "dc_admin=" and "dc_passwd="
+# likewise match whenever those exact byte sequences (name-then-equals)
+# appear anywhere, including under an operator-added prefix like
+# "myprefix_dc_admin=". TEST 4 pins the per-blog spellings.
 #
 # THE URI LIST -- ALL THREE ARE SEPARATE AND SEGMENT-TERMINATED
 # ---------------------------------------------------------------
@@ -129,10 +134,10 @@ __DATA__
 
 === TEST 4: dcxd (no '=') and per-blog spellings bypass
 # dcxd prefixes per-blog frontend sessions. A session for blog "myblog" is sent
-# as "dcxd_myblog". The suffix-matching logic matches the trailing portion of
-# the cookie NAME, so both the bare "dcxd" and the per-blog "dcxd_myblog"
-# spelling bypass. (Note: "dcxd" has no trailing '=', unlike dc_admin= and
-# dc_passwd=.)
+# as "dcxd_myblog". The substring search over the raw Cookie header matches
+# "dcxd" wherever it appears, so both the bare "dcxd" and the per-blog
+# "dcxd_myblog" spelling bypass. (Note: "dcxd" has no trailing '=', unlike
+# dc_admin= and dc_passwd=.)
 --- http_config eval: $::HttpConfig
 --- config eval: $::Config
 --- more_headers eval
@@ -189,9 +194,10 @@ Cookie: PHPSESSID=generic; dcxd=found
 
 
 
-=== TEST 7: suffix-under-any-prefix cookie names still bypass
-# The match is suffix-based on cookie name, so a proxy- or theme-prefixed
-# variant (e.g. "mysite_dcxd") is still a login signal and bypasses.
+=== TEST 7: a dynamic prefix on the cookie name still bypasses
+# The match is a raw substring search over the Cookie header, so a proxy- or
+# theme-prefixed variant (e.g. "mysite_dcxd") is still a login signal and
+# bypasses.
 --- http_config eval: $::HttpConfig
 --- config eval: $::Config
 --- more_headers eval
