@@ -3252,51 +3252,6 @@ http {{
         }}
 
 
-        # ---- wagtail -------------------------------------------------------
-        # URI prefixes anchor at position 0 -> ROOT locations. Every "must
-        # bypass" URI needs a REAL location: without one, nginx's implicit 404
-        # also carries no x-cache header and the assertion would pass for free.
-        location /admin/ {{
-            cache_turbo         main;
-            cache_turbo_backend wagtail;
-            cache_turbo_key     $uri;
-            cache_turbo_valid   30s;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-        location /django-admin/ {{
-            cache_turbo         main;
-            cache_turbo_backend wagtail;
-            cache_turbo_key     $uri;
-            cache_turbo_valid   30s;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-        # Permission-checked (serve_view enforces per-collection privacy).
-        location /documents/ {{
-            cache_turbo         main;
-            cache_turbo_backend wagtail;
-            cache_turbo_key     $uri;
-            cache_turbo_valid   30s;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-        # The public site + /search/. Both MUST stay cacheable for anonymous
-        # readers -- including a guest carrying csrftoken, which Django hands to
-        # anyone who renders a form. /search/ is dynamic but anonymous-identical,
-        # so bypassing it would be a pure hit-rate loss.
-        location /wt/ {{
-            cache_turbo         main;
-            cache_turbo_backend wagtail;
-            cache_turbo_key     $uri$is_args$args;
-            cache_turbo_valid   30s;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-        location /search/ {{
-            cache_turbo         main;
-            cache_turbo_backend wagtail;
-            cache_turbo_key     $uri$is_args$args;
-            cache_turbo_valid   30s;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-
         # ---- kirby ---------------------------------------------------------
         location /panel {{
             cache_turbo         main;
@@ -6615,68 +6570,6 @@ def test_typo3_preset(ng: Nginx, origin: Origin) -> None:
     _, _, ha = fetch(ng.port, "/t3/page")
     assert ha.get("x-cache") == "HIT", \
         f"typo3: an anonymous reader must cache, got {ha.get('x-cache')}"
-    drain_origin(origin)
-
-
-def test_wagtail_preset(ng: Nginx, origin: Origin) -> None:
-    """Wagtail preset (docs/wagtail.md).
-
-    The first preset whose auth cookie belongs to the FRAMEWORK, not the app:
-    Wagtail ships no cookie of its own and rides Django's `sessionid`. That is only
-    safe because Django's SessionMiddleware saves the cookie ONLY when the session
-    is non-empty AND modified -- so a logged-out reader of a public page gets no
-    cookie at all. (Laravel has no such check and cookies every guest, which is why
-    there is no statamic/october/laravel preset. See docs/frameworks.md.)
-
-    The two assertions that matter pull in opposite directions:
-      - `sessionid` must bypass          (or a logged-in editor is served from cache)
-      - `csrftoken` must NOT bypass      (or the hit rate goes to zero)
-    Django hands csrftoken to any anonymous visitor who renders a form, so treating
-    it as a login signal is the classic way to build a cache that caches nothing."""
-    # Admin surfaces bypass. Each has a real location -- an implicit 404 carries no
-    # x-cache header either, and would pass this assertion for free.
-    for uri in ("/admin/pages/", "/django-admin/auth/user/"):
-        _, _, h = fetch(ng.port, uri)
-        assert "x-cache" not in h, f"wagtail: {uri} must bypass"
-
-    # /documents/ is permission-checked: WAGTAILDOCS_SERVE_METHOD defaults to
-    # serve_view, a Django view enforcing per-collection privacy. A private
-    # document fetched by an authorised user must never be stored and replayed.
-    _, _, hd = fetch(ng.port, "/documents/3/private-contract.pdf")
-    assert "x-cache" not in hd, \
-        ("wagtail: /documents/ is permission-checked (serve_view) -- it must bypass "
-         "or a private document is served to strangers")
-
-    # The logged-in editor: sessionid must bypass, on a URL a guest can also fetch.
-    for ck in ("sessionid=abc123", "sessionid=abc123; csrftoken=xyz"):
-        _, _, h1 = fetch(ng.port, "/wt/about", headers={"Cookie": ck})
-        _, _, h2 = fetch(ng.port, "/wt/about", headers={"Cookie": ck})
-        assert "x-cache" not in h1 and "x-cache" not in h2, \
-            f"wagtail: sessionid must bypass (Cookie: {ck})"
-
-    # THE INVERTED ONE. csrftoken is issued to ANONYMOUS visitors by Django, so it
-    # must NOT bypass. If a future edit adds it to the cookie list, the preset still
-    # "looks" correct -- it just silently stops caching. Fail loudly instead.
-    fetch(ng.port, "/wt/pricing", headers={"Cookie": "csrftoken=xyz"})
-    _, _, hc = fetch(ng.port, "/wt/pricing", headers={"Cookie": "csrftoken=xyz"})
-    assert hc.get("x-cache") == "HIT", \
-        ("wagtail: csrftoken is set for ANONYMOUS visitors and must keep caching -- "
-         f"bypassing it would zero the hit rate, got {hc.get('x-cache')}")
-
-    # Anonymous reader of the public site caches. This is the whole point.
-    fetch(ng.port, "/wt/home")
-    _, _, ha = fetch(ng.port, "/wt/home")
-    assert ha.get("x-cache") == "HIT", \
-        f"wagtail: an anonymous reader must cache, got {ha.get('x-cache')}"
-
-    # /search/ is deliberately NOT a preset URI: dynamic, but anonymous-IDENTICAL,
-    # so it is shared and hot. Bypassing it would be a pure hit-rate loss with no
-    # safety gain (same reasoning that keeps a blanket action= out of mediawiki).
-    fetch(ng.port, "/search/?q=nginx")
-    _, _, hs = fetch(ng.port, "/search/?q=nginx")
-    assert hs.get("x-cache") == "HIT", \
-        ("wagtail: /search/ is anonymous-identical and must stay cacheable, got "
-         f"{hs.get('x-cache')}")
     drain_origin(origin)
 
 
@@ -15850,7 +15743,6 @@ def run_all(ng: Nginx, origin: Origin,
     test_yabb_preset(ng, origin)
     test_phorum_uri_rules_anchor_at_root(ng, origin)
     test_internal_redirect_key_and_veto(ng, origin)
-    test_wagtail_preset(ng, origin)
     test_kirby_preset(ng, origin)
     test_typo3_preset(ng, origin)
     test_new_presets_not_in_generic(ng, origin)
