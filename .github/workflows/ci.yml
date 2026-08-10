@@ -1,4 +1,4 @@
-# sync-sha: 457089fae36ddc76b4fd20ee3b8e2d2fd32a7e6f65ae9c189279b7a4b5d16b37
+# sync-sha: 7a5ff5e1bf74399889051738fff87679151f0ca91424b36a9bc941cd72a0af63
 name: CI
 
 # Single entry point for the PR suite. The six checks below used to be
@@ -171,6 +171,17 @@ jobs:
     permissions:
       contents: read
     uses: ./.github/workflows/valgrind.yml
+
+  # --- unlaned: hosted, takes no self-hosted slot --------------------------
+  # The ci/linter/ gate -- the same entry point .githooks/pre-commit runs, so a
+  # clone that never set core.hooksPath still cannot land a lint regression.
+  # Hosted, unlaned and fastest in the suite: it needs no nginx build and takes
+  # no self-hosted slot, so it never competes with the soaks for the budget.
+  lint:
+    name: Lint
+    permissions:
+      contents: read
+    uses: ./.github/workflows/lint.yml
 
   # --- unlaned: hosted, takes no self-hosted slot --------------------------
   codeql:

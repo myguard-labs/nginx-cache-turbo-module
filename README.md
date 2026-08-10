@@ -1,6 +1,7 @@
 # nginx-cache-turbo-module
 
 [![CI](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/ci.yml/badge.svg)](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/ci.yml)
+[![Lint](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/lint.yml/badge.svg)](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/lint.yml)
 [![Build&Test](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/build-test.yml/badge.svg)](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/build-test.yml)
 [![Security Scanners](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/security-scanners.yml/badge.svg)](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/security-scanners.yml)
 [![Fuzzing](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/fuzzing.yml/badge.svg)](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/fuzzing.yml)
@@ -27,6 +28,7 @@ durations and the command to re-derive them live in `ci.yml`'s header comment.
 | Workflow | What it gates |
 |---|---|
 | [CI](.github/workflows/ci.yml) | orchestrator; the only `pull_request` entry point, and the changed-files gate for the two path-filtered members |
+| [Lint](.github/workflows/lint.yml) | the `ci/linter/` gate: nginx conventions, ast-grep, shell, Python, Perl, YAML/actionlint/zizmor, spelling, the workflow-policy checks, and this module's own R7 shm-lock and suite-integrity checkers |
 | [Build&Test](.github/workflows/build-test.yml) | validation (shellcheck, ruff, sync-stamp, port bands), build, the Test::Nginx preset suite, and the runtime driver |
 | [Security Scanners](.github/workflows/security-scanners.yml) | flawfinder >=4, cppcheck, semgrep >=WARNING over `src/` |
 | [Fuzzing](.github/workflows/fuzzing.yml) | replay of every recorded regression, then a time-boxed run of the five libFuzzer targets |

@@ -235,10 +235,27 @@ repos:
       # A rule joins the promoted list only after its findings are measured and
       # confirmed real. Verified 2026-08-08 that the promoted set exits 1 on a
       # real finding, 0 on a clean file, and 0 on a note-only file.
+      #
+      # LOCAL DIVERGENCE FROM THE GENERATOR, kept by hand on purpose.
+      # tools/gen-precommit-config.py emits GATE_RULES, which includes
+      # c-alloc-mul-overflow. That rule is NOT promoted in this repo: re-measured
+      # 2026-08-10 over src/, all nine of its findings are `count * sizeof(T)`
+      # where the count cannot reach overflow -- capped by REDIS_MAX_MEMBERS,
+      # bounded by r->args.len, a compile-time REDIS_DEL_CHUNK, or a config
+      # directive (redis_keepalive / memcached_keepalive). Promoting it would
+      # land this repo red on arrival on nine non-bugs, which is precisely the
+      # --no-verify training the paragraph above describes. Promotion is a
+      # measurement per repo, not a constant to copy.
+      #
+      # This list MUST equal PROMOTED in ci/linter/lint-astgrep.sh -- two gates
+      # disagreeing about what blocks is worse than one, and the hook passing
+      # while CI fails is invisible in both outputs. ci/linter/selftest.sh
+      # asserts the two sets are identical; it caught exactly this drift.
+      # Re-running the generator reintroduces c-alloc-mul-overflow, so re-apply
+      # this removal (and the selftest will say so if it is forgotten).
       - id: ast-grep
         name: ast-grep (structural sinks, gate on promoted rules)
         entry: ast-grep scan -c ci/ast-grep/sgconfig.yml
-               --error=c-alloc-mul-overflow
                --error=c-memcpy-sizeof-pointer
                --error=c-sizeof-wrong-operand
                --error=c-unbounded-string-copy
