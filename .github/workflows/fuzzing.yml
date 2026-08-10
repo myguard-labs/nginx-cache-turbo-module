@@ -35,6 +35,7 @@ on:
       - "src/**"
       - "ci/fuzz/**"
       - ".github/workflows/fuzzing.yml"
+  workflow_call: {}
   workflow_dispatch: {}
 
 concurrency:

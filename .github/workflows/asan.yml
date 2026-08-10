@@ -42,6 +42,7 @@ on:
       - "ci/tools/test_runtime.py"
       - "ci/tools/ci-hang-guard.sh"
       - ".github/workflows/asan.yml"
+  workflow_call: {}
   workflow_dispatch: {}
 
 concurrency:

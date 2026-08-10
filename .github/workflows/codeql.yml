@@ -12,6 +12,7 @@ on:
     branches: [main]
   schedule:
     - cron: "47 4 5 * *"
+  workflow_call: {}
   workflow_dispatch: {}
 
 concurrency:
