@@ -1,4 +1,4 @@
-# sync-sha: ba4340d33556ddc768a29c9f44a1352d13999d51692306fe1447262359b25a8e
+# sync-sha: cf7b81acd5a86ad8b23354c0665ab94c7db366a420146f9ca0c225c4a0eb7e4a
 name: ASan and UBSan
 
 # Dedicated ASan+UBSan workflow, PATH-GATED: only runs when a PR/push touches
@@ -26,22 +26,6 @@ env:
   NGINX_VERSION: "1.31.1"
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - "src/**"
-      - "ci/tools/ci-build.sh"
-      - "ci/tools/test_runtime.py"
-      - "ci/tools/ci-hang-guard.sh"
-      - ".github/workflows/asan.yml"
-  pull_request:
-    branches: [main]
-    paths:
-      - "src/**"
-      - "ci/tools/ci-build.sh"
-      - "ci/tools/test_runtime.py"
-      - "ci/tools/ci-hang-guard.sh"
-      - ".github/workflows/asan.yml"
   workflow_call: {}
   workflow_dispatch: {}
 

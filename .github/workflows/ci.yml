@@ -1,3 +1,4 @@
+# sync-sha: 32b6db080db3e87322ed21903c725cbd1fc67415e3a44c1cbd2bf644b3f2e733
 name: CI
 
 # Single entry point for the PR suite. The six checks below used to be

@@ -1,4 +1,4 @@
-# sync-sha: 6fbccea4f06e52465e1e8cd5a0ff56a1141755bfa5f2dff0213e177cb4f9ca5a
+# sync-sha: 83ccac9eff56c2dd60da854ee36c2109849767c295ff07b7090c362051895c72
 name: Valgrind
 
 # Valgrind memcheck lite soak (60s @ 4 conc) on every PR/push — cheap dynamic
@@ -13,10 +13,6 @@ env:
   NGINX_VERSION: "1.31.1"
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
   workflow_call: {}
   workflow_dispatch: {}
 

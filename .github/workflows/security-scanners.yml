@@ -1,4 +1,4 @@
-# sync-sha: e089228b270c9f5eb18e79da3a69fa88a68bd749ba0d821ffab73303597ee227
+# sync-sha: 617b069adc9b0aaaba8ac9591c4d3b920aefff65e840e46f97559a7b803c0466
 name: Security scanners
 
 # Static/security scanners gate (flawfinder, clang-tidy cert-*/security.*,
@@ -13,10 +13,6 @@ env:
   NGINX_VERSION: "1.31.1"
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
   workflow_call: {}
   workflow_dispatch: {}
 

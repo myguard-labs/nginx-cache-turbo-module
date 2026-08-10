@@ -1,4 +1,4 @@
-# sync-sha: 268484ef9b7d7ffe9a429a10fb9b46a64fe846f9b344e194b4897b67bf6454af
+# sync-sha: 12299333d7bac867d9999428d701f011c9d0b477cb86426d9daae720d6aae315
 name: Build & Test
 
 # Runner selection: plain `[self-hosted, builder02]`, NOT `lxc`.
@@ -29,10 +29,6 @@ env:
   NGINX_VERSION: "1.31.1"
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
   workflow_call: {}
   workflow_dispatch: {}
 
