@@ -83,14 +83,51 @@ for f in "${files[@]}"; do
         }
         line ~ /^[[:space:]]*\*/      { next }   # continuation of a block comment
         line ~ /^[[:space:]]*\/\*/    { next }   # block-comment opener line
-        line ~ /ngx_shmtx_lock[[:space:]]*\(/   { locked = 1; next }
-        line ~ /ngx_shmtx_unlock[[:space:]]*\(/ { locked = 0; next }
-        locked && line ~ forbidden {
-            trimmed = line
-            sub(/^[[:space:]]+/, "", trimmed)
-            printf "%s:%d: yielding call under shm mutex: %s\n", \
-                   file, FNR, trimmed
-            bad = 1
+
+        # Scan in SOURCE ORDER rather than per-line, so a lock (or unlock) that
+        # shares its line with a forbidden call is still judged. An earlier form
+        # flipped `locked` and did `next`, which skipped the check for the WHOLE
+        # line -- so `ngx_shmtx_lock(&z->shpool->mutex); ngx_http_finalize_request(r, rc);`
+        # passed, as did a forbidden call sitting BEFORE an unlock on one line.
+        # No source does that today, which is exactly why it needed catching by
+        # construction: same empty-selection class as the ../.. bug above, where
+        # the gate reports ok having examined nothing.
+        {
+            rest = line
+            while (rest != "") {
+                li = match(rest, /ngx_shmtx_lock[[:space:]]*\(/)
+                lp = li ? RSTART : 0
+                ll = li ? RLENGTH : 0
+                ui = match(rest, /ngx_shmtx_unlock[[:space:]]*\(/)
+                up = ui ? RSTART : 0
+                ul = ui ? RLENGTH : 0
+
+                # "unlock" contains "lock", so a bare lock match at the same
+                # offset as an unlock match is that unlock -- prefer the unlock.
+                if (up && lp && lp >= up && lp < up + ul) { lp = 0 }
+
+                if (lp && (!up || lp < up)) { pos = lp; len = ll; nowlocked = 1 }
+                else if (up)                { pos = up; len = ul; nowlocked = 0 }
+                else                        { pos = 0 }
+
+                if (pos == 0) {
+                    seg = rest
+                    rest = ""
+                } else {
+                    seg = substr(rest, 1, pos - 1)
+                    rest = substr(rest, pos + len)
+                }
+
+                if (locked && seg ~ forbidden) {
+                    trimmed = line
+                    sub(/^[[:space:]]+/, "", trimmed)
+                    printf "%s:%d: yielding call under shm mutex: %s\n", \
+                           file, FNR, trimmed
+                    bad = 1
+                }
+
+                if (pos != 0) { locked = nowlocked }
+            }
         }
         END { exit bad ? 1 : 0 }
     ' "$f" || status=1
