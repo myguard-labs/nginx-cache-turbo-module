@@ -56,7 +56,17 @@ fi
 # leaves a bare ( -> "fatal: invalid regexp: Unmatched (" on gawk (mawk was
 # lenient, which is why CI caught this and a local mawk run did not). [(]
 # carries no backslash, so it survives -v unchanged on every awk.
-forbidden='ngx_http_output_filter|ngx_http_finalize_request|ngx_http_core_run_phases|ngx_http_run_posted_requests|ngx_http_subrequest|ngx_add_timer|ngx_http_cache_turbo_serve|ngx_http_cache_turbo_warm_one|ngx_http_cache_turbo_cold_wait|return[[:space:]]+NGX_AGAIN|->[[:space:]]*get[[:space:]]*[(]|->[[:space:]]*lock[[:space:]]*[(]'
+# The list is an allowlist-by-omission: a yield point that is not named here
+# passes silently, which is the same shape of failure as the vacuous ../.. scan
+# fixed above. The second group below closes the gap for the request-engine
+# entry points a future edit is most likely to reach for -- none of them appears
+# under the lock today, so adding them is pure future-proofing, not a fix.
+#
+# Deliberately NOT listed: ->store( / ->set( / ->purge_tag(. Those slot names are
+# shared by the L1 vtable, whose store is not a yield point (shm_store takes the
+# mutex itself), so pinning them would fire on correct code. The L2 park points
+# are already covered by ->get( and ->lock(.
+forbidden='ngx_http_output_filter|ngx_http_finalize_request|ngx_http_core_run_phases|ngx_http_run_posted_requests|ngx_http_subrequest|ngx_add_timer|ngx_del_timer|ngx_http_send_header|ngx_http_send_special|ngx_http_post_request|ngx_http_internal_redirect|ngx_http_named_location|ngx_http_read_client_request_body|ngx_http_cache_turbo_serve|ngx_http_cache_turbo_warm_one|ngx_http_cache_turbo_cold_wait|return[[:space:]]+NGX_AGAIN|->[[:space:]]*get[[:space:]]*[(]|->[[:space:]]*lock[[:space:]]*[(]'
 
 status=0
 
@@ -73,14 +83,51 @@ for f in "${files[@]}"; do
         }
         line ~ /^[[:space:]]*\*/      { next }   # continuation of a block comment
         line ~ /^[[:space:]]*\/\*/    { next }   # block-comment opener line
-        line ~ /ngx_shmtx_lock[[:space:]]*\(/   { locked = 1; next }
-        line ~ /ngx_shmtx_unlock[[:space:]]*\(/ { locked = 0; next }
-        locked && line ~ forbidden {
-            trimmed = line
-            sub(/^[[:space:]]+/, "", trimmed)
-            printf "%s:%d: yielding call under shm mutex: %s\n", \
-                   file, FNR, trimmed
-            bad = 1
+
+        # Scan in SOURCE ORDER rather than per-line, so a lock (or unlock) that
+        # shares its line with a forbidden call is still judged. An earlier form
+        # flipped `locked` and did `next`, which skipped the check for the WHOLE
+        # line -- so `ngx_shmtx_lock(&z->shpool->mutex); ngx_http_finalize_request(r, rc);`
+        # passed, as did a forbidden call sitting BEFORE an unlock on one line.
+        # No source does that today, which is exactly why it needed catching by
+        # construction: same empty-selection class as the ../.. bug above, where
+        # the gate reports ok having examined nothing.
+        {
+            rest = line
+            while (rest != "") {
+                li = match(rest, /ngx_shmtx_lock[[:space:]]*\(/)
+                lp = li ? RSTART : 0
+                ll = li ? RLENGTH : 0
+                ui = match(rest, /ngx_shmtx_unlock[[:space:]]*\(/)
+                up = ui ? RSTART : 0
+                ul = ui ? RLENGTH : 0
+
+                # "unlock" contains "lock", so a bare lock match at the same
+                # offset as an unlock match is that unlock -- prefer the unlock.
+                if (up && lp && lp >= up && lp < up + ul) { lp = 0 }
+
+                if (lp && (!up || lp < up)) { pos = lp; len = ll; nowlocked = 1 }
+                else if (up)                { pos = up; len = ul; nowlocked = 0 }
+                else                        { pos = 0 }
+
+                if (pos == 0) {
+                    seg = rest
+                    rest = ""
+                } else {
+                    seg = substr(rest, 1, pos - 1)
+                    rest = substr(rest, pos + len)
+                }
+
+                if (locked && seg ~ forbidden) {
+                    trimmed = line
+                    sub(/^[[:space:]]+/, "", trimmed)
+                    printf "%s:%d: yielding call under shm mutex: %s\n", \
+                           file, FNR, trimmed
+                    bad = 1
+                }
+
+                if (pos != 0) { locked = nowlocked }
+            }
         }
         END { exit bad ? 1 : 0 }
     ' "$f" || status=1

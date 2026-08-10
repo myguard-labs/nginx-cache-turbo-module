@@ -2894,6 +2894,8 @@ static void
 ngx_http_cache_turbo_redis_read_lock(ngx_event_t *rev)
 {
     ssize_t                           n;
+    ngx_int_t                         rc;
+    u_char                           *next;
     ngx_connection_t                 *c;
     ngx_http_cache_turbo_redis_op_t  *op;
 
@@ -2907,24 +2909,60 @@ ngx_http_cache_turbo_redis_read_lock(ngx_event_t *rev)
         return;
     }
 
-    n = c->recv(c, op->recv, sizeof(op->recv));
-
-    if (n == NGX_AGAIN) {
-        if (ngx_handle_read_event(rev, 0) != NGX_OK) {
+    /* STAB-1: frame the reply before declaring the stream poolable. A single
+     * recv() is NOT a boundary — a TCP-split "+OK\r\n" can arrive as "+O" then
+     * "K\r\n", and setting clean=1 on the first chunk pools a connection with
+     * bytes still on the wire, desyncing the next reuse (it reads the leftover
+     * as its own reply type byte). read_drain already frames for exactly this
+     * reason; the lock reader was not updated with it. ka_save's boundary peek
+     * only catches the tail once it has ALREADY arrived, so it does not close
+     * this. The +/$/else verdict is unchanged and still reads the first byte,
+     * which framing guarantees is present. */
+    for ( ;; ) {
+        if (op->recv_len >= sizeof(op->recv)) {
+            /* A SET NX PX reply is "+OK\r\n", "$-1\r\n" or a short -ERR; it
+             * never fills the scratch buffer. If one somehow does, fail the
+             * lock rather than grow the buffer or pool an unframed stream. */
             ngx_http_cache_turbo_redis_lock_finish(op, NGX_ERROR);
+            return;
         }
-        return;
-    }
-    if (n <= 0) {
-        ngx_http_cache_turbo_redis_lock_finish(op, NGX_ERROR);
-        return;
-    }
 
-    op->clean = 1;                         /* reply consumed: connection poolable */
-    ngx_http_cache_turbo_redis_lock_finish(op,
-        op->recv[0] == '+' ? NGX_OK :
-        op->recv[0] == '$' ? NGX_DECLINED : /* nil: a peer holds the lock */
-        NGX_ERROR);                         /* -ERR / garbage: channel unusable */
+        n = c->recv(c, op->recv + op->recv_len,
+                    sizeof(op->recv) - op->recv_len);
+
+        if (n == NGX_AGAIN) {
+            if (ngx_handle_read_event(rev, 0) != NGX_OK) {
+                ngx_http_cache_turbo_redis_lock_finish(op, NGX_ERROR);
+            }
+            return;
+        }
+        if (n == NGX_ERROR || n == 0) {
+            ngx_http_cache_turbo_redis_lock_finish(op, NGX_ERROR);
+            return;
+        }
+
+        op->recv_len += (size_t) n;
+
+        rc = ngx_http_cache_turbo_redis_frame(op->recv,
+                                              op->recv + op->recv_len,
+                                              0, &next);
+        if (rc == NGX_AGAIN) {
+            continue;                      /* partial reply: read more bytes */
+        }
+        if (rc == NGX_DECLINED || next != op->recv + op->recv_len) {
+            /* Malformed, or a complete reply with trailing bytes behind it:
+             * either way the offset is unknown -- do not pool. */
+            ngx_http_cache_turbo_redis_lock_finish(op, NGX_ERROR);
+            return;
+        }
+
+        op->clean = 1;                     /* reply framed: connection poolable */
+        ngx_http_cache_turbo_redis_lock_finish(op,
+            op->recv[0] == '+' ? NGX_OK :
+            op->recv[0] == '$' ? NGX_DECLINED : /* nil: a peer holds the lock */
+            NGX_ERROR);                         /* -ERR / garbage: unusable */
+        return;
+    }
 }
 
 

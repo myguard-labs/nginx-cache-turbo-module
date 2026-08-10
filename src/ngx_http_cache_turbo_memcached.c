@@ -243,6 +243,22 @@ ngx_http_cache_turbo_mc_ka_save(ngx_http_cache_turbo_mc_op_t *op)
         return 0;
     }
 
+    /* Second line of defence, mirroring the Redis driver's ka_save peek: the
+     * stream must be exactly at a reply boundary, so nothing may be readable
+     * here. The parsers' consumed==rlen / line==recv_len gates already ensure
+     * that for every reply shape accepted today, making this belt-and-braces
+     * rather than a live fix -- but the clean flag is an allowlist-by-omission,
+     * and a future pipelined or multi-reply command would silently lose the
+     * only check. A readable byte (or a close) means leftover data: don't pool. */
+    {
+        u_char   scratch[1];
+        ssize_t  peek = c->recv(c, scratch, sizeof(scratch));
+
+        if (peek != NGX_AGAIN) {
+            return 0;
+        }
+    }
+
     q = ngx_queue_head(&b->free);
     item = ngx_queue_data(q, ngx_http_cache_turbo_memcached_ka_item_t, queue);
 
