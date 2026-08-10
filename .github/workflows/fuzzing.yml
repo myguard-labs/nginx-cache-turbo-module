@@ -1,4 +1,4 @@
-# sync-sha: d4eda64d074512d517b4f20a4a2849be03481e2a8c8bb6978c0b128d108a8e60
+# sync-sha: a7f2a3fd9d9ae9767102c835c1bc4a4bbebdfd6589e4988f6ff85b48e0a89101
 name: Fuzzing
 
 # Fast fuzz regression gate on every PR/push — 120s/target on all five parser
@@ -57,6 +57,48 @@ jobs:
 
       - name: Build fuzz targets
         run: bash ci/fuzz/build.sh "$GITHUB_WORKSPACE/ci/fuzz"
+
+      # Recorded crashes first: deterministic, seconds, and a returning bug fails
+      # here rather than waiting on the fresh budget below to rediscover it.
+      # Each unit is replayed as a single input (no -max_total_time): libFuzzer
+      # runs the file once and exits non-zero if it still reproduces.
+      - name: Replay recorded regressions
+        run: |
+          set -euo pipefail
+          cd ci/fuzz
+          total=0
+          failed=0
+          for dir in regressions/*/; do
+            bin="$(basename "$dir")"
+            [ -x "./$bin" ] || { echo "❌ no such fuzz target: $bin"; exit 1; }
+            # Real units only; README.md and an empty dir are both fine.
+            n=0
+            bad=0
+            for unit in $(find "$dir" -type f ! -name 'README.md' | sort); do
+              n=$((n + 1))
+              total=$((total + 1))
+              # One unit per invocation, status checked individually. Do NOT
+              # batch these through xargs: xargs reports its own 123 rather than
+              # the target's exit code, so a crashing unit reads as a pass.
+              set +e
+              out=$("./$bin" -runs=1 "$unit" 2>&1)
+              rc=$?
+              set -e
+              if [ $rc -ne 0 ]; then
+                bad=$((bad + 1))
+                failed=$((failed + 1))
+                echo "❌ $bin: $unit still reproduces (exit $rc)"
+                printf '%s\n' "$out" | tail -30
+              fi
+            done
+            if [ "$n" -eq 0 ]; then
+              echo "— $bin: no recorded regressions"
+            elif [ "$bad" -eq 0 ]; then
+              echo "✓ $bin: all $n replayed clean"
+            fi
+          done
+          [ "$failed" -eq 0 ] || { echo "❌ $failed recorded regression(s) reproduce"; exit 1; }
+          echo "replayed $total recorded regression(s) across all targets, all clean"
 
       - name: Run each target 120s
         run: |
