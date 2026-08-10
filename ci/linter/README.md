@@ -174,15 +174,37 @@ Exit codes: `0` clean, `1` findings, `2` a linter is missing.
 
 ### Speed, and why it is shaped this way
 
-Measured 2026-07-31 on the self-hosted build host (i9-14900HX, 32 threads)
-with **no CI job
-running** — see the caveat below before comparing against your own numbers:
+Re-measured for this module 2026-08-10 on the build host at load ~5, over the
+16-checker set (`/proc/loadavg` first — see the caveat below):
 
 | | before | after |
 |---|---|---|
-| full tree | 3.8s | **1.45s** |
-| one C file | 2.9s | **1.31s** |
-| full tree, `LINT_JOBS=1` | 3.2s | 2.57s |
+| one-file staged commit (the hook) | 7.4s | **1.47s** |
+
+Step 35's budget is the whole hook under ~2s on a one-file commit, and the
+first measurement was 7.4s. Where it went, per checker on that commit:
+
+| checker | time |
+|---|---|
+| `c` | 7.01s (semgrep 6.44, flawfinder 0.17, cppcheck 0.08) |
+| `suite-docs` | 1.49s |
+| `spelling` | 0.24s |
+| `astgrep` | 0.23s |
+| everything else | ≤0.10s each |
+
+The cause was not a slow checker but a **duplicated** one. `.githooks/pre-commit`
+runs both gates — it has to, since `core.hooksPath` replaces `.git/hooks/` — and
+flawfinder, cppcheck and semgrep are hooks in `.pre-commit-config.yaml` *and*
+scanners in `lint-c.sh`, at byte-identical thresholds over the same selector. So
+each ran twice for one verdict. semgrep's cost is its rule-pack load, which is
+per-invocation and does not shrink with the file count, so the `--jobs=1
+--metrics=off` flags below (already applied) could not recover it.
+
+`lint-c.sh` therefore defers to the pre-commit hooks **in staged mode only**. No
+gate is dropped: `LINT_MODE=all` still runs all three, and on the PR
+`security-scanners.yml` owns them (which is why `lint.yml`'s `LINT_ONLY`
+excludes `c`). Verified after the change that a staged C file with `strcpy`
+still refuses the commit, with flawfinder and semgrep each exiting 1.
 
 Re-measure on an idle box or not at all. This host also runs six self-hosted CI
 runner slots, and at load average ~50 the same full-tree run took 2.2s to 12.4s

@@ -29,6 +29,37 @@
 mapfile -t FILES < <(lint_files '^src/.*\.[ch]$' "$@")
 [ "${#FILES[@]}" -gt 0 ] || { echo "lint-c: no C files to check"; exit 0; }
 
+# SCOPED OUT OF HOOK MODE, and this is not a dropped gate (adoption step 35).
+#
+# All three scanners below -- flawfinder, cppcheck, semgrep -- also run as their
+# own hooks in .pre-commit-config.yaml, at byte-identical thresholds and over the
+# same '^src/.*\.[ch]$' selector. .githooks/pre-commit invokes BOTH gates (it has
+# to: core.hooksPath replaces .git/hooks/, so the pre-commit config is only
+# reachable because this hook calls it), which means a staged C commit was
+# running each scanner TWICE.
+#
+# Measured 2026-08-10 on a one-file staged commit: 7.4s total, of which lint-c
+# was 7.01s and semgrep alone 6.44s -- against step 35's ~2s budget. The cost is
+# semgrep's rule-pack load, which is per-invocation and does not shrink with the
+# file count, so --jobs/--metrics tuning (already applied) cannot recover it.
+# Paying it twice for one verdict is the whole overrun.
+#
+# What does NOT change: LINT_MODE=all still runs everything (that is what
+# `ci/linter/run-all.sh` does by hand and what `--all` means), and CI is
+# unaffected -- security-scanners.yml owns these three on the PR, which is why
+# lint.yml's LINT_ONLY excludes "c" in the first place. So every scanner still
+# gates every commit and every PR; only the duplicate invocation is gone.
+#
+# If the pre-commit hooks are ever removed, delete this block in the same commit
+# -- otherwise C stops being scanned at commit time and nothing says so.
+if [ "${LINT_MODE:-all}" = "staged" ] && [ "$#" -eq 0 ] \
+   && [ -f "$(repo_root)/.pre-commit-config.yaml" ] \
+   && grep -q 'id: semgrep' "$(repo_root)/.pre-commit-config.yaml"; then
+    echo "lint-c: ${#FILES[@]} file(s) -- deferred to the .pre-commit-config.yaml" \
+         "hooks, which run flawfinder/cppcheck/semgrep at the same thresholds"
+    exit 0
+fi
+
 echo "lint-c: ${#FILES[@]} file(s)"
 rc=0
 
