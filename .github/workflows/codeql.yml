@@ -1,4 +1,4 @@
-# sync-sha: d629d3f9afb74665a2f5fabaf45abe206c9c982fa850d196c201b5a6e949623c
+# sync-sha: 0ea23cb28a62a117d75600d61eefe6a0739030c5f347e05f1726ed20d86f1dd7
 name: CodeQL
 
 env:
@@ -24,8 +24,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
+      # Read-only checkout of this repo's source; nothing here writes to it.
       contents: read
-      security-events: write
+      # Narrowest scope that still publishes: no `contents: write`, no
+      # `actions: write`. Without it the analysis runs and the findings are
+      # silently discarded.
+      security-events: write  # upload CodeQL SARIF to code-scanning alerts
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5

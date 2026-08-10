@@ -1,4 +1,4 @@
-# sync-sha: e91e9fea26cb6bdffb962041c7be035906851a45ddfc8a90d4f2201361e95f3e
+# sync-sha: 457089fae36ddc76b4fd20ee3b8e2d2fd32a7e6f65ae9c189279b7a4b5d16b37
 name: CI
 
 # Single entry point for the PR suite. The six checks below used to be
@@ -176,9 +176,11 @@ jobs:
   codeql:
     name: CodeQL
     permissions:
+      # Read-only checkout; the called workflow does not write to the repo.
       contents: read
       # codeql.yml's analyze job declares security-events: write itself; a
       # called workflow cannot receive more than the caller grants, so it is
-      # granted here too and nowhere wider.
-      security-events: write
+      # granted here too and nowhere wider. It is what lets the CodeQL SARIF
+      # upload reach code-scanning; every other member is called without it.
+      security-events: write  # forwarded so codeql.yml can upload its SARIF
     uses: ./.github/workflows/codeql.yml

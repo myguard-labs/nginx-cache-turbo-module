@@ -1,4 +1,4 @@
-# sync-sha: 12299333d7bac867d9999428d701f011c9d0b477cb86426d9daae720d6aae315
+# sync-sha: 606d9926b3cdd8fdf553f0fbba2e3564abb3cb94401c75fcb864e1fe8143313f
 name: Build & Test
 
 # Runner selection: plain `[self-hosted, builder02]`, NOT `lxc`.
@@ -98,8 +98,13 @@ jobs:
 
       - name: Validate scripts and source
         run: |
-          bash -n ci/tools/*.sh ci/fuzz/*.sh
-          shellcheck ci/tools/*.sh ci/fuzz/*.sh
+          # ci/linter/*.sh joins the glob with the linter gate itself: without
+          # it the checker scripts were the only shell in the repo CI never
+          # syntax-checked, which is the wrong file set to leave uncovered.
+          # Default severity (no -S), so info-level findings are fatal here
+          # even though the pre-commit hook gates at -S warning.
+          bash -n ci/tools/*.sh ci/fuzz/*.sh ci/linter/*.sh
+          shellcheck ci/tools/*.sh ci/fuzz/*.sh ci/linter/*.sh
           python3 -m py_compile ci/tools/test_runtime.py
           python3 ci/tools/lint-ci-runners.py
           bash ci/tools/lint-ci-ports.sh
