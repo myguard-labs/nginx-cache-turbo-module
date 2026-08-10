@@ -131,9 +131,20 @@ esac
 # mold: faster linker, auto-detected on PATH. Appended (never clobbering) so the
 # asan/coverage LD_OPT flags set in the case above are preserved. -fuse-ld=mold
 # is understood by both gcc and clang.
-if command -v mold >/dev/null 2>&1; then
-    LD_OPT="${LD_OPT:+$LD_OPT }-fuse-ld=mold"
-fi
+#
+# SKIPPED under asan (and coverage, which links the same sanitizer-adjacent
+# runtime): the sanitizer runtimes want the toolchain's own linker, and asan.yml
+# installs mold for the other layers, so without this guard the ASan binary is
+# silently linked by mold. Speed on a job whose whole purpose is instrumentation
+# fidelity is the wrong trade -- keep the default linker there.
+case "$MODE" in
+    asan|coverage) ;;
+    *)
+        if command -v mold >/dev/null 2>&1; then
+            LD_OPT="${LD_OPT:+$LD_OPT }-fuse-ld=mold"
+        fi
+        ;;
+esac
 
 # eatmydata: drop fsync/fdatasync on the many small object + intermediate writes
 # make performs. Marginal but free; auto-detected so a local build without it is
