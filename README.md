@@ -37,6 +37,24 @@ durations and the command to re-derive them live in `ci.yml`'s header comment.
 | [A/UBSan](.github/workflows/asan.yml) | ASan+UBSan single-process and multi-worker soaks, static `--add-module` build |
 | [CI Deep](.github/workflows/ci-deep.yml) | monthly: long fuzz campaigns, memcheck and helgrind soaks, the nginx/angie compatibility matrix |
 
+### Linting
+
+The same checks run locally and on the PR, through one entry point — a CI-only
+copy would drift from the hook and the two would stop agreeing:
+
+```sh
+ci/linter/install-linters.sh          # once per clone
+git config core.hooksPath .githooks   # NOT `pre-commit install`
+ci/linter/run-all.sh                  # whole tree; the hook does --staged
+```
+
+Sixteen checkers behind `run-all.sh`, exit `0` clean / `1` findings / `2` a tool
+is missing — never a silent skip. What each one covers, which are advisory
+rather than blocking and why, and how to prove one still bites, is in
+[ci/linter/README.md](ci/linter/README.md). `ci/linter/selftest.sh` holds the
+negative controls for the gate itself, because a checker that has quietly become
+a no-op prints exactly the same clean line as one that passes.
+
 ## Contents
 
 - [The idea in 30 seconds](#the-idea-in-30-seconds)

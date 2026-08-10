@@ -25,6 +25,18 @@ finding shellcheck could have named in two seconds. Every script is standalone;
 | `lint-suite-docs.sh` | `ci/t/`, `ci/tools/`, `docs/`, `src/`, `README.md` | **this module's own**: orphan `.t` files no suite runs, the documented preset count against the presets that exist, and TLS-fixture teardown |
 | `lint-spelling.sh` | all tracked files | codespell over prose, comments and log strings; vendored trees excluded via `lib.sh` |
 | `run-all.sh` | all of the above | runs every check, reports once |
+
+**No markdown checker, on purpose** (adoption step 51). 84 tracked `.md` files
+and `markdownlint` reports 1683 findings on them, of which 1625 are pure style:
+671 MD013 line-length, 628 MD049 emphasis-style, 326 MD060 table-column-style.
+The remainder (33 MD036, 8 MD040, a handful of fence/blockquote spacing) are
+cosmetic too. Adding the checker would land the repo red on arrival on zero
+defects, which is how a gate trains everyone to `--no-verify` — the same
+reasoning that keeps `nginx-unchecked-palloc` advisory and `width` non-blocking
+in `lint-nginx.sh`. The docs ARE checked for the things that can be wrong rather
+than merely unfashionable: `codespell` covers every tracked file including
+markdown, and `lint-docs-drift.sh` gates the README's `## CI` table against the
+workflows that actually exist, in both directions.
 | `install-linters.sh` | — | apt-get → pipx → cpan → upstream binary (actionlint, ast-grep, **gitleaks** — the last one is this repo's own secret gate and has no skeleton counterpart) |
 | `lib.sh` | — | sourced helpers (file selection, missing-tool failure) |
 | `workflow_policy.py` | — | the repo-policy checks the `ci-*`/`docs-drift` wrappers call (`runners`, `ports`, `docs`, `cadence`, `secrets`) |

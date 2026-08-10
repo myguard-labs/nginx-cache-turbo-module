@@ -17,6 +17,7 @@ this code started by not knowing nginx internals either.
 
 ## TL;DR checklist
 
+- [ ] Local hook enabled once per clone (see **Before your first commit**).
 - [ ] One feature or fix per PR — no stacked PRs, no drive-by refactors.
 - [ ] Code follows nginx style and matches the code around it.
 - [ ] Every new feature or bugfix ships a test in the same PR.
@@ -25,11 +26,44 @@ this code started by not knowing nginx internals either.
 - [ ] Commit messages: imperative subject, body explains *why*.
       No AI co-author trailers.
 
+## Before your first commit
+
+Two commands, once per clone. They install the linters CI runs and point git at
+the tracked hook:
+
+```sh
+ci/linter/install-linters.sh          # apt → pipx → cpan → pinned upstream binaries
+git config core.hooksPath .githooks   # NOT `pre-commit install` — see below
+```
+
+The hook lints **staged files only**, so a commit is never blocked by a finding
+in a file it does not touch. Run the whole tree yourself with
+`ci/linter/run-all.sh`. What each checker covers, and how to prove one still
+bites, is in [ci/linter/README.md](ci/linter/README.md).
+
+**Do not run `pre-commit install`.** It writes `.git/hooks/pre-commit`, and
+`core.hooksPath` *replaces* `.git/hooks/` rather than adding to it — git reads
+one or the other, never both. The tracked hook already invokes
+`pre-commit run --hook-stage pre-commit` itself, so both gates fire; installing
+the other way silently disables every `.pre-commit-config.yaml` checker while
+looking correct from every angle you would think to check.
+
+Bypass in an emergency with `git commit --no-verify`, and expect `lint.yml` to
+catch on the PR what you skipped locally — it runs the same `run-all.sh`.
+
 ## How CI works here
 
-Every push and every PR runs four short gates. They exist to catch the
-classes of bugs that C code in a web server cannot afford:
+Every PR runs one workflow, `ci.yml`, which calls the rest. It is the single
+`pull_request:` entry point — no member workflow has a trigger of its own, so
+each runs exactly once per change rather than twice (once on the PR and again
+on the merge commit, against an identical tree). There is deliberately no
+`push:` trigger anywhere: the merge commit is the tree the PR already tested.
 
+The gates it calls, and the classes of bug they exist to catch:
+
+- **Lint** (`lint.yml`) — the same `ci/linter/run-all.sh` your commit hook
+  runs, so a clone that never enabled the hook still cannot land a regression.
+  Hosted, and the fastest feedback in the suite.
 - **Build & Test** — builds the module against current nginx (and, where
   applicable, Angie) and runs the unit tests under **ASan/UBSan**.
   AddressSanitizer and UndefinedBehaviorSanitizer are compiler
@@ -48,11 +82,15 @@ classes of bugs that C code in a web server cannot afford:
   the code in an emulated CPU and reports every invalid read/write and
   every leaked byte.
 
+- **CodeQL** (`codeql.yml`) — semantic analysis over the module's own
+  translation units, publishing to the repository's code-scanning alerts.
+
 The expensive versions of these — hours-long fuzzing per target, full
-Memcheck **and** Helgrind (thread-race detection) soaks — run monthly and
-on manual dispatch in `ci-deep.yml`, not on your PR. Some modules also run
-an extra runtime test suite; check the repo's `.github/workflows/` and the
-badges at the top of the README for the exact set.
+Memcheck **and** Helgrind (thread-race detection) soaks, and the
+nginx/angie compatibility matrix — run monthly and on manual dispatch in
+`ci-deep.yml`, not on your PR. The badge row and the `## CI` table at the top
+of the README list the full set, and `ci/linter/lint-docs-drift.sh` fails the
+build if that table and `.github/workflows/` ever disagree.
 
 Your PR merges when **all** checks are green. If a gate fails and you
 believe the gate is wrong, say so in the PR — with evidence, not vibes.
