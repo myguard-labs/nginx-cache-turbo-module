@@ -207,12 +207,15 @@ __DATA__
 
 
 === TEST 6: an unrelated query arg still caches -- the negative half of TEST 5
+# A DISTINCT path from TEST 5 on purpose: cache_turbo_key is $uri, so the two
+# blocks shared one cache entry and this MISS-then-HIT held only because TEST 5
+# bypasses and stores nothing -- an assertion resting on block order.
 # If the arg rule matched on presence of ANY query string, every parameterised
 # WooCommerce/WordPress URL would bypass and the cache would be off site-wide.
 --- http_config eval: $::HttpConfig
 --- config eval: $::Config
 --- request eval
-["GET /woo/home?utm_source=twitter", "GET /woo/home?utm_source=twitter"]
+["GET /woo/home-utm?utm_source=twitter", "GET /woo/home-utm?utm_source=twitter"]
 --- response_headers eval
 [qq{X-Cache: }, qq{X-Cache: HIT}]
 --- error_code eval

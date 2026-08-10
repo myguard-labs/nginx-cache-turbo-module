@@ -127,12 +127,20 @@ __DATA__
 
 
 
-=== TEST 4: member LEAK GUARD -- /textpattern bypasses with NO cookie present
+=== TEST 4: member LEAK GUARD -- /textpattern bypasses with a GUEST cookie too
 # The admin folder is a logged-in surface. Caching it serves one member's
-# admin view to every later requester. The bypass is per-URI, not cookie-gated,
-# so this is asserted with no Cookie header at all.
+# admin view to every later requester. The bypass is per-URI, not cookie-gated.
+#
+# A GUEST cookie is sent on purpose, and that is the whole difference from
+# TEST 1. Without it this block issued the identical request pair with the
+# identical expectations and was the same assertion written twice -- a leak
+# guard only earns its place by exercising something TEST 1 does not. Sending
+# a cookie the cookie tier does NOT match proves the URI row bypasses on its
+# own, rather than merely in the absence of any cookie at all.
 --- http_config eval: $::HttpConfig
 --- config eval: $::Config
+--- more_headers
+Cookie: txp_guest_pref=dark
 --- request eval
 ["GET /textpattern", "GET /textpattern"]
 --- response_headers eval

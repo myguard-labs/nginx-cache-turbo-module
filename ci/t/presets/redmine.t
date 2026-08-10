@@ -160,10 +160,18 @@ __DATA__
 
 === TEST 5: NEGATIVE -- unrelated arg does NOT bypass
 # Verify that only the `key` arg causes a bypass, not any arg.
+#
+# A DISTINCT path from TEST 4 on purpose. cache_turbo_key is $uri (see
+# ci/t/lib/CacheTurbo.pm), so the query string is not part of the cache key:
+# on the shared /redmine/item path this block's MISS-then-HIT held only
+# because TEST 4 bypasses and therefore stores nothing. That made a real
+# assertion depend on block ORDER rather than on the behaviour under test --
+# reorder the file, or make TEST 4 ever cache, and this goes red for a reason
+# that has nothing to do with arg matching.
 --- http_config eval: $::HttpConfig
 --- config eval: $::Config
 --- request eval
-["GET /redmine/item?other=val", "GET /redmine/item?other=val"]
+["GET /redmine/item-noarg?other=val", "GET /redmine/item-noarg?other=val"]
 --- response_headers eval
 [qq{X-Cache: }, qq{X-Cache: HIT}]
 --- error_code eval
@@ -172,8 +180,8 @@ __DATA__
 
 
 === TEST 6: member LEAK GUARD -- bypass URIs carry no cookie
-# Some URI rows in Redmine (like /admin) are sensitive and must bypass
-# regardless of cookies. This verifies the leak guard: even a URI row must
+# Some URI rows in Redmine (this block uses /account) are sensitive and must
+# bypass regardless of cookies. This verifies the leak guard: even a URI row must
 # bypass TWICE with no cookie present at all, and X-Cache must be absent both
 # times.
 --- http_config eval: $::HttpConfig

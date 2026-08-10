@@ -143,6 +143,11 @@ __DATA__
  qq{X-Cache: }, qq{X-Cache: },
  qq{X-Cache: }, qq{X-Cache: },
  qq{X-Cache: }, qq{X-Cache: },
+ qq{X-Cache: }, qq{X-Cache: },
+ # the /u.json pair: previously unasserted -- the request and error_code
+ # arrays carried 56 entries and this one 54, so Test::Nginx's positional
+ # pairing left the last two requests with no X-Cache expectation at all.
+ # They would have stayed green if /u.json started caching.
  qq{X-Cache: }, qq{X-Cache: }]
 --- error_code eval
 [200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200,

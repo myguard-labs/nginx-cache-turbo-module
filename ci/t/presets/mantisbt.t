@@ -232,6 +232,26 @@ Cookie: MANTIS_STRING_COOKIE=
 
 
 
+=== TEST 7b: a BARE valueless predicate cookie (no '=') still bypasses
+# The neighbouring edge to TEST 7, and the opposite verdict. TEST 7 pins that
+# an EMPTY value does not bypass under CVOP_NONEMPTY; a BARE cookie carries no
+# readable value at all, so the predicate engine cannot apply NONEMPTY to it
+# and fails closed to bypass rather than guessing the value is empty.
+#
+# ci/t/presets/spip.t TEST 9 pins exactly this for the other NONEMPTY preset.
+# MantisBT uses the same operator, so the two files must agree -- without this
+# block the boundary between "empty" and "absent" was asserted on one side only.
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- more_headers
+Cookie: MANTIS_STRING_COOKIE
+--- request eval
+["GET /mantisbt/view-bare", "GET /mantisbt/view-bare"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: }]
+--- error_code eval
+[200, 200]
+
 === TEST 8: the PHPSESSID cookie bypasses -- lazily-started native session
 # Mantis form tokens lazily start a native PHP session for anonymous form
 # pages, so PHPSESSID is included in ct_mantisbt_cookies[] alongside the

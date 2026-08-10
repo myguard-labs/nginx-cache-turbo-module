@@ -192,7 +192,7 @@ Cookie: __ac=YWxhZGRpbjplY2Q2MmE1YzI4YWUwNDQyNDg1YjRkY2FmYzA2ZGYyZWE=
 
 === TEST 6: member LEAK GUARD -- /logout must bypass with NO cookie
 # /logout is a bypass URI from ct_plone_uris[]; the leak guard ensures it
-# bypasses even without the __ac cookie present, the same safeguard as
+# bypasses with no Cookie header at all, the same safeguard as
 # phorum.t TEST 4.
 --- http_config eval: $::HttpConfig
 --- config eval: $::Config
@@ -207,7 +207,7 @@ Cookie: __ac=YWxhZGRpbjplY2Q2MmE1YzI4YWUwNDQyNDg1YjRkY2FmYzA2ZGYyZWE=
 
 === TEST 7: member LEAK GUARD -- /register must bypass with NO cookie
 # /register is a bypass URI from ct_plone_uris[]; the leak guard ensures it
-# bypasses even without the _ZopeId cookie present.
+# bypasses with no Cookie header at all.
 --- http_config eval: $::HttpConfig
 --- config eval: $::Config
 --- request eval
@@ -221,7 +221,7 @@ Cookie: __ac=YWxhZGRpbjplY2Q2MmE1YzI4YWUwNDQyNDg1YjRkY2FmYzA2ZGYyZWE=
 
 === TEST 8: member LEAK GUARD -- /passwordreset must bypass with NO cookie
 # /passwordreset is a bypass URI from ct_plone_uris[]; the leak guard ensures
-# it bypasses even without the statusmessages cookie present.
+# it bypasses with no Cookie header at all.
 --- http_config eval: $::HttpConfig
 --- config eval: $::Config
 --- request eval
@@ -235,7 +235,7 @@ Cookie: __ac=YWxhZGRpbjplY2Q2MmE1YzI4YWUwNDQyNDg1YjRkY2FmYzA2ZGYyZWE=
 
 === TEST 9: member LEAK GUARD -- /mail_password must bypass with NO cookie
 # /mail_password is a bypass URI from ct_plone_uris[]; the leak guard ensures
-# it bypasses even without the I18N_LANGUAGE cookie present.
+# it bypasses with no Cookie header at all.
 --- http_config eval: $::HttpConfig
 --- config eval: $::Config
 --- request eval
