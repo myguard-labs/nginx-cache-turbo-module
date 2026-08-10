@@ -24,14 +24,15 @@
 # symbolic cookie name with an operator-selected prefix
 # (`<prefix>_session`, `<prefix>_admin`, ...), so an exact-name match would
 # never fire on a real install, and presence-only would bypass on a probe
-# cookie carrying an empty value. TESTS 3-7 cover the five predicate rows
-# independently; TEST 8 is the NONEMPTY negative (an empty value must NOT
-# bypass); TEST 9 pins the suffix match firing under an operator prefix.
+# cookie carrying an empty value. TEST 6 covers all five predicate rows, one
+# arm per row in a single block; TEST 7 is the NONEMPTY negative (an empty
+# value must NOT bypass); TEST 8 pins the suffix match firing under an
+# operator prefix.
 #
 # _lang vs _lang_ecrire: `_lang_ecrire` does not end in `_lang` as a
 # substring-from-the-end (the suffix "ecrire" follows it), so the two rows
-# are independently reachable and neither subsumes the other. TEST 5/6 pin
-# both separately.
+# are independently reachable and neither subsumes the other. They are two
+# of TEST 6's arms, pinned separately there.
 #
 # THE URI LIST: /ecrire IS SEGMENT-TERMINATED
 # ------------------------------------------------------------------------

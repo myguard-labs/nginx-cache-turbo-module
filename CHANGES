@@ -1,0 +1,49 @@
+Changes with the nginx-cache-turbo-module
+
+    *) Adopted the myguard skeleton CI standard: ci/ layout, a single
+       pull_request entry point (ci.yml) with every other workflow a
+       workflow_call member, the ci/linter/ gate behind one run-all.sh entry
+       point, a tracked .githooks/pre-commit, and the badge row and ## CI
+       table kept in lockstep by lint-docs-drift.sh.
+
+    *) Fixed ci/tools/lint-shm-lock.sh, which had been reporting "ok" while
+       reading ZERO files. Its `cd "$(dirname "$0")/.."` was correct while the
+       script lived in tools/ at the repo root and was not updated when the
+       tree moved under ci/, so src/*.c matched nothing, the unmatched glob
+       stayed a literal, and the `[ -f ]` guard skipped it. The R7 shm-mutex
+       invariant is now genuinely checked; it holds in shipped code, so no
+       source change was required. An empty selection is exit 2, never 0.
+
+    *) Added lint.yml so the linter gate runs on the PR and not only in the
+       commit hook. Both call the same ci/linter/run-all.sh; a CI-only copy
+       would drift from the hook and the two would stop agreeing.
+
+    *) Moved Security Scanners beside Fuzzing instead of behind it. The chain
+       was sized when scanners took 117s; at 302s it made that lane 970s
+       against a 761s budget and the suite's critical path.
+
+    *) Cut the commit hook from 7.4s to 1.47s by no longer running flawfinder,
+       cppcheck and semgrep twice per staged commit -- each was both a
+       .pre-commit-config.yaml hook and a ci/linter/lint-c.sh scanner, at
+       identical thresholds. No gate was dropped: LINT_MODE=all still runs all
+       three, and security-scanners.yml owns them on the PR.
+
+    *) Vendored the ast-grep ruleset per module (ci/ast-grep/), so the hook
+       gates identically in a standalone clone. ast-grep resolves sgconfig.yml
+       by walking UP from the working directory, which outside the superrepo
+       finds nothing and scans an empty ruleset while reporting green.
+
+    *) Added gitleaks to ci/linter/install-linters.sh, pinned and
+       digest-verified. It gates the staged secret scan and had been present
+       only by hand on one build host -- absent from a fresh clone, and absent
+       from --check, so nothing reported it missing.
+
+    *) Fixed a Test::Nginx block that asserted only 54 of its 56 requests
+       (ci/t/presets/wikijs.t): the --- response_headers array was two entries
+       shorter than --- request, and Test::Nginx pairs them positionally, so
+       the last pair carried no X-Cache expectation at all.
+
+    *) Gave ci/t/presets/redmine.t TEST 5 and woocommerce.t TEST 6 their own
+       paths. cache_turbo_key is $uri, so each shared a cache entry with the
+       bypass block above it and its MISS-then-HIT held only because that
+       block stores nothing -- an assertion resting on block order.
