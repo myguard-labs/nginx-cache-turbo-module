@@ -54,10 +54,16 @@ catch on the PR what you skipped locally — it runs the same `run-all.sh`.
 ## How CI works here
 
 Every PR runs one workflow, `ci.yml`, which calls the rest. It is the single
-`pull_request:` entry point — no member workflow has a trigger of its own, so
-each runs exactly once per change rather than twice (once on the PR and again
-on the merge commit, against an identical tree). There is deliberately no
-`push:` trigger anywhere: the merge commit is the tree the PR already tested.
+`pull_request:` entry point — no member carries a `pull_request:` or `push:`
+trigger of its own, so each runs exactly once per change rather than twice (once
+on the PR and again on the merge commit, against an identical tree). There is
+deliberately no `push:` trigger anywhere: the merge commit is the tree the PR
+already tested.
+
+A member may still keep its own *cadence*. `codeql.yml` and `ci-deep.yml` carry
+a `schedule:`, which is independent of the PR lane and is why
+`ci/linter/lint-ci-cadence.sh` allows `schedule:` while failing the build on a
+member that grows a second PR-facing entry point.
 
 The gates it calls, and the classes of bug they exist to catch:
 

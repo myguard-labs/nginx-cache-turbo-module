@@ -34,9 +34,11 @@ cosmetic too. Adding the checker would land the repo red on arrival on zero
 defects, which is how a gate trains everyone to `--no-verify` — the same
 reasoning that keeps `nginx-unchecked-palloc` advisory and `width` non-blocking
 in `lint-nginx.sh`. The docs ARE checked for the things that can be wrong rather
-than merely unfashionable: `codespell` covers every tracked file including
-markdown, and `lint-docs-drift.sh` gates the README's `## CI` table against the
-workflows that actually exist, in both directions.
+than merely unfashionable: `codespell` covers every tracked non-vendored file
+including markdown (`lib.sh`'s `LINT_EXCLUDE_RE` drops the fuzz corpora and the
+generated/vendored trees, which are byte-exact inputs and regenerated output
+respectively), and `lint-docs-drift.sh` gates the README's `## CI` table against
+the workflows that actually exist, in both directions.
 | `install-linters.sh` | — | apt-get → pipx → cpan → upstream binary (actionlint, ast-grep, **gitleaks** — the last one is this repo's own secret gate and has no skeleton counterpart) |
 | `lib.sh` | — | sourced helpers (file selection, missing-tool failure) |
 | `workflow_policy.py` | — | the repo-policy checks the `ci-*`/`docs-drift` wrappers call (`runners`, `ports`, `docs`, `cadence`, `secrets`) |
