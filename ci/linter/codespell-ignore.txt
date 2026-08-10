@@ -1,0 +1,36 @@
+# codespell ignore list for nginx-cache-turbo-module -- read by
+# ci/linter/lint-spelling.sh.
+#
+# Every entry is a word codespell's dictionary calls a typo and this repo uses
+# as a real identifier or a legitimate spelling. Measured 2026-08-10: without
+# this list codespell reported 151 findings here, 149 of them from the five
+# classes below. An entry earns its place by being WRONG for this tree, never
+# by being inconvenient -- codespell is one of the cheapest real gates in the
+# set and a blanket relaxation would retire it.
+#
+# sie / SIE / Sie
+#     Stale-If-Error, this module's own acronym: the SIE serve path, the
+#     cache_turbo_sie_serves_total metric, NGX_HTTP_CACHE_TURBO_SIE_* flags.
+#     codespell reads it as SIZE/SIGH/SIDE. 95 of the 151.
+# clen
+#     Content-Length, the conventional short name in HTTP code. Used in
+#     ci/tools/test_runtime.py's origin server.
+# bu
+#     A URL path SEGMENT in a preset fixture ("/bu/panel"), not a word.
+# te
+#     The HTTP `TE` request header (RFC 9110 s10.1.4).
+# hel
+#     A byte sequence inside a fuzz corpus input (a deliberately TRUNCATED
+#     "hello" bulk payload). Corpus files are byte-exact inputs and must never
+#     be "corrected" -- editing one silently changes what the fuzzer replays.
+#     lib.sh excludes ci/fuzz/corpus/ already; listed here as belt-and-braces
+#     for anyone running codespell directly over the tree.
+# unparseable
+#     A standard variant of "unparsable" and the spelling this codebase uses
+#     consistently (17 sites). Rewriting them all is churn, not a fix.
+sie
+clen
+bu
+te
+hel
+unparseable

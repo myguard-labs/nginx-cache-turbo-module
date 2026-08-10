@@ -1,4 +1,4 @@
-# sync-sha: e91e9fea26cb6bdffb962041c7be035906851a45ddfc8a90d4f2201361e95f3e
+# sync-sha: 2fd222a5b6f9e5ffb00fbe03227a15a3a13bad116762e9483abe9fde49ec6b9b
 name: CI
 
 # Single entry point for the PR suite. The six checks below used to be
@@ -8,31 +8,47 @@ name: CI
 # slot, not by the jobs themselves, so six simultaneous requests just means the
 # tail waits.
 #
-# LANE MAP -- measured, not estimated. Numbers come from the last green run of
-# each workflow as of 2026-08-10, run IDs below. Re-derive with:
+# LANE MAP -- measured, not estimated. Re-derive with:
 #
 #   gh run view <id> -R myguard-labs/nginx-cache-turbo-module --json jobs \
 #     -q '.jobs[] | [.name, .conclusion,
 #                    (((.completedAt|fromdate)-(.startedAt|fromdate))|tostring)+"s"] | @tsv'
 #
-#   Build&Test  31273570848   Validation 26s, Build 86s, Presets 55s, Runtime 741s
-#   A/UBSan                   Build 137s, single-process 688s, multi-worker 795s
-#   Fuzzing                   Fuzz regression 676s
-#   Valgrind                  Memcheck lite 139s
-#   Scanners                  Security scanners 117s
-#   CodeQL                    Analyze C 83s
+# All from ONE run, 31424310119 (2026-08-10, green) -- a single run rather than
+# a per-workflow best, so the numbers are mutually consistent and the queueing
+# gaps below are real:
 #
-# The budget is the longest single JOB -- A/UBSan multi-worker at 795s -- because
-# no arrangement can finish sooner than that. Lanes:
+#   changes         7s     Build&Test  Validation 31s, Build 127s,
+#   CodeQL         88s                 Presets 59s, Runtime 755s
+#   Valgrind      132s     A/UBSan     Build 164s, single-process 703s,
+#   Scanners      302s                 multi-worker 761s
+#   Fuzzing       668s
 #
-#   A  A/UBSan     (137 build -> 688/795 the two soaks in parallel)  = ~795s
-#   B  Build&Test  (26 -> 86 -> 741/55 runtime + presets)            = ~795s
-#   C  Fuzzing (676s) -> Security scanners (117s)                    = ~793s
+# Lint is not in that run (it was added after) and is not laned: hosted,
+# no nginx build, takes no self-hosted slot, so it cannot affect the budget.
 #
-# Lane C pairs the two so it lands just under the budget rather than chaining
-# scanners behind the longest job. Valgrind (139s) is deliberately NOT chained
-# behind anything: it is short, independent, and adding it to lane C would put
-# that lane at 932s -- over budget and the suite's new critical path.
+# The budget is the longest single JOB -- A/UBSan multi-worker at 761s -- because
+# no arrangement can finish sooner than that. Lanes, measured:
+#
+#   A  A/UBSan     (164 build -> 703/761 the two soaks in parallel)  = 925s
+#   B  Build&Test  (31 -> 127 -> 755/59 runtime + presets)           = 913s
+#   C  Fuzzing (668s) and Security scanners (302s), side by side     = 668s
+#
+# Lane A is the critical path at 925s and the floor for the whole suite.
+#
+# Scanners USED to be chained behind fuzzing, when the pair fitted the budget
+# (676 + 117 = 793s against 795s). It has since grown to 302s, which made that
+# chain 970s -- 209s over -- and the suite's critical path. It now runs beside
+# fuzzing instead; see the lane C comment below. Observed total wall-clock for
+# the run above, with the chain still in place, was 1007s.
+#
+# Nothing queued in that run: every job started within 10s of its dependencies
+# finishing, so these are execution times, not waits. Check /proc/loadavg and
+# the slot count before comparing -- the host runs six ci-ephemeral@ slots
+# (four lxc + two docker) and the org pool adds builder03.
+#
+# Valgrind (132s) is deliberately NOT chained behind anything: it is short,
+# independent, and chaining it would only recreate the problem lane C just had.
 #
 # A lane is not a slot. Build&Test fans out into four jobs and A/UBSan into
 # three, so observed peak is well above three runners; the org pool answers
@@ -140,14 +156,23 @@ jobs:
       contents: read
     uses: ./.github/workflows/build-test.yml
 
-  # --- lane C: Fuzzing -> Security Scanners --------------------------------
-  # 676s + 117s = 793s, just under the 795s budget. Scanners is independent of
-  # fuzzing, so it keeps running when fuzzing fails or is skipped by the
-  # changed-files gate above -- but NOT when `changes` itself failed. That job
-  # exits 1 rather than fail open when it cannot compute its diff, and a bare
-  # `!cancelled()` would run scanners anyway on a run whose gate never produced
-  # a verdict. Requiring `needs.changes.result == 'success'` keeps the fail-loud
-  # exit fail-closed all the way down the lane.
+  # --- lane C: Fuzzing, and Security Scanners BESIDE it, not behind it -----
+  # Scanners was chained behind fuzzing while the pair fitted the budget:
+  # 676s + 117s = 793s against 795s. Re-measured 2026-08-10 (run 31424310119)
+  # it no longer does -- Security scanners has grown 117s -> 302s, so the chain
+  # is 668 + 302 = 970s against a 761s budget (the ASan multi-worker soak, the
+  # longest single job). That made lane C the critical path and put the whole
+  # suite 209s over.
+  #
+  # Unchained, lane C is max(668, 302) = 668s and the critical path returns to
+  # A/UBSan at 164 + 761 = 925s, which is the floor no arrangement can beat.
+  # The cost is one more self-hosted slot at t=0 (peak 3 -> 4 concurrent);
+  # the org pool answers `builder02` with ten slots, so the headroom is there.
+  #
+  # `needs: changes` is kept, and so is the `needs.changes.result == 'success'`
+  # guard: that job exits 1 rather than fail open when it cannot compute its
+  # diff, and a bare `!cancelled()` would run scanners anyway on a run whose
+  # gate never produced a verdict. Fail-loud stays fail-closed down the lane.
   fuzzing:
     name: Fuzzing
     needs: changes
@@ -158,7 +183,7 @@ jobs:
 
   security-scanners:
     name: Security Scanners
-    needs: [changes, fuzzing]
+    needs: changes
     if: ${{ !cancelled() && needs.changes.result == 'success' }}
     permissions:
       contents: read
@@ -173,12 +198,25 @@ jobs:
     uses: ./.github/workflows/valgrind.yml
 
   # --- unlaned: hosted, takes no self-hosted slot --------------------------
+  # The ci/linter/ gate -- the same entry point .githooks/pre-commit runs, so a
+  # clone that never set core.hooksPath still cannot land a lint regression.
+  # Hosted, unlaned and fastest in the suite: it needs no nginx build and takes
+  # no self-hosted slot, so it never competes with the soaks for the budget.
+  lint:
+    name: Lint
+    permissions:
+      contents: read
+    uses: ./.github/workflows/lint.yml
+
+  # --- unlaned: hosted, takes no self-hosted slot --------------------------
   codeql:
     name: CodeQL
     permissions:
+      # Read-only checkout; the called workflow does not write to the repo.
       contents: read
       # codeql.yml's analyze job declares security-events: write itself; a
       # called workflow cannot receive more than the caller grants, so it is
-      # granted here too and nowhere wider.
-      security-events: write
+      # granted here too and nowhere wider. It is what lets the CodeQL SARIF
+      # upload reach code-scanning; every other member is called without it.
+      security-events: write  # forwarded so codeql.yml can upload its SARIF
     uses: ./.github/workflows/codeql.yml

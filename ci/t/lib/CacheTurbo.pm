@@ -131,7 +131,13 @@ EOL
 
 # Assemble a full `--- config` from a list of ct_location() specs.
 sub ct_config {
-    return join '', map { ct_location(%$_) } @_;
+    # Unpacked before use rather than mapped over @_ directly: inside the map
+    # block @_ would be the BLOCK's arguments, not this sub's, so the current
+    # form works only because map happens not to rebind it. Naming the list
+    # makes that independent of that detail (perlcritic Subroutines::
+    # RequireArgUnpacking, PBP p.178).
+    my (@specs) = @_;
+    return join '', map { ct_location(%$_) } @specs;
 }
 
 1;

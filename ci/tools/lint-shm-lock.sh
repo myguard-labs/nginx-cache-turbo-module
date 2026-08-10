@@ -21,12 +21,28 @@
 
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+# ../.. -- the REPO ROOT, not ci/. This script lives in ci/tools/, so a single
+# climb lands in ci/, where `src/*.c` matches nothing: bash leaves an unmatched
+# glob as the literal string, the `[ -f "$f" ] || continue` guard below skips
+# it, and the loop reports "ok" having read ZERO files. The climb was correct
+# while this script lived in tools/ at the repo root and was not updated when
+# the tree moved under ci/, so the R7 gate has been vacuously green in CI and
+# in the hook ever since -- the empty-selection class, caught by planting a
+# real violation and watching the checker pass.
+cd "$(dirname "$0")/../.."
 
 if [ "$#" -gt 0 ]; then
     files=("$@")
 else
     files=(src/*.c)
+fi
+
+# An empty or unmatched selection is "could not run", never "clean". Without
+# this the only symptom of a broken path is a cheerful ok line, which is the
+# defect above wearing the face of a passing gate.
+if [ "${#files[@]}" -eq 0 ] || [ ! -f "${files[0]}" ]; then
+    echo "lint-shm-lock: no source files matched (${files[*]}) -- refusing to report ok on an empty scan" >&2
+    exit 2
 fi
 
 # Calls that hand control to the event loop / re-enter the request. Holding the

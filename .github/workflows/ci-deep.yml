@@ -1,4 +1,4 @@
-# sync-sha: a4e7573493a8c4239ec617417c6389490a9a1b20b84b5e58105a6a44e29cb574
+# sync-sha: 0f05a1e7a4e57e058ef72b0049a8605bd259d050760e5b22b7bd9ec8d0751775
 name: CI Deep
 
 # Exhaustive dynamic analysis — monthly cron + on-demand only, NEVER on PR.
@@ -140,12 +140,22 @@ jobs:
         env:
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
           DISCORD_CHANNEL_BUILDS: ${{ secrets.DISCORD_CHANNEL_BUILDS }}
+          # Passed as env, never interpolated into the run: block below.
+          # A ${{ }} inside `run:` is pasted into the shell command by the
+          # runner before bash sees it; via env: the value arrives as data.
+          # These three are GitHub-controlled, so this is hardening, not a
+          # live injection fix -- but it keeps the whole file free of the
+          # pattern, so a future edit cannot quietly add an
+          # attacker-controlled context beside a safe one.
+          GH_REPO: ${{ github.repository }}
+          GH_SERVER_URL: ${{ github.server_url }}
+          GH_RUN_ID: ${{ github.run_id }}
         run: |
           [ -n "$DISCORD_BOT_TOKEN" ] || exit 0
           curl -fsS -X POST -H "Authorization: Bot $DISCORD_BOT_TOKEN" \
             -H "Content-Type: application/json" \
             "https://discord.com/api/v10/channels/$DISCORD_CHANNEL_BUILDS/messages" \
-            -d "{\"content\":\"🔴 ${{ github.repository }} — CI Deep / fuzz FAILED. ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" || true
+            -d "{\"content\":\"🔴 $GH_REPO — CI Deep / fuzz FAILED. $GH_SERVER_URL/$GH_REPO/actions/runs/$GH_RUN_ID\"}" || true
 
   legacy-runtime:
     # Pre-1.23 nginx exposes multi-value request headers as the
@@ -217,12 +227,22 @@ jobs:
         env:
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
           DISCORD_CHANNEL_BUILDS: ${{ secrets.DISCORD_CHANNEL_BUILDS }}
+          # Passed as env, never interpolated into the run: block below.
+          # A ${{ }} inside `run:` is pasted into the shell command by the
+          # runner before bash sees it; via env: the value arrives as data.
+          # These three are GitHub-controlled, so this is hardening, not a
+          # live injection fix -- but it keeps the whole file free of the
+          # pattern, so a future edit cannot quietly add an
+          # attacker-controlled context beside a safe one.
+          GH_REPO: ${{ github.repository }}
+          GH_SERVER_URL: ${{ github.server_url }}
+          GH_RUN_ID: ${{ github.run_id }}
         run: |
           [ -n "$DISCORD_BOT_TOKEN" ] || exit 0
           curl -fsS -X POST -H "Authorization: Bot $DISCORD_BOT_TOKEN" \
             -H "Content-Type: application/json" \
             "https://discord.com/api/v10/channels/$DISCORD_CHANNEL_BUILDS/messages" \
-            -d "{\"content\":\"🔴 ${{ github.repository }} — CI Deep / legacy-runtime FAILED. ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" || true
+            -d "{\"content\":\"🔴 $GH_REPO — CI Deep / legacy-runtime FAILED. $GH_SERVER_URL/$GH_REPO/actions/runs/$GH_RUN_ID\"}" || true
 
   clang-analyze:
     # Clang path-flow static analyzer (null-deref, leaks, uninit reads, dead
@@ -277,12 +297,22 @@ jobs:
         env:
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
           DISCORD_CHANNEL_BUILDS: ${{ secrets.DISCORD_CHANNEL_BUILDS }}
+          # Passed as env, never interpolated into the run: block below.
+          # A ${{ }} inside `run:` is pasted into the shell command by the
+          # runner before bash sees it; via env: the value arrives as data.
+          # These three are GitHub-controlled, so this is hardening, not a
+          # live injection fix -- but it keeps the whole file free of the
+          # pattern, so a future edit cannot quietly add an
+          # attacker-controlled context beside a safe one.
+          GH_REPO: ${{ github.repository }}
+          GH_SERVER_URL: ${{ github.server_url }}
+          GH_RUN_ID: ${{ github.run_id }}
         run: |
           [ -n "$DISCORD_BOT_TOKEN" ] || exit 0
           curl -fsS -X POST -H "Authorization: Bot $DISCORD_BOT_TOKEN" \
             -H "Content-Type: application/json" \
             "https://discord.com/api/v10/channels/$DISCORD_CHANNEL_BUILDS/messages" \
-            -d "{\"content\":\"🔴 ${{ github.repository }} — CI Deep / clang-analyze FAILED. ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" || true
+            -d "{\"content\":\"🔴 $GH_REPO — CI Deep / clang-analyze FAILED. $GH_SERVER_URL/$GH_REPO/actions/runs/$GH_RUN_ID\"}" || true
 
   memcheck:
     name: Valgrind Memcheck soak
@@ -318,12 +348,22 @@ jobs:
         env:
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
           DISCORD_CHANNEL_BUILDS: ${{ secrets.DISCORD_CHANNEL_BUILDS }}
+          # Passed as env, never interpolated into the run: block below.
+          # A ${{ }} inside `run:` is pasted into the shell command by the
+          # runner before bash sees it; via env: the value arrives as data.
+          # These three are GitHub-controlled, so this is hardening, not a
+          # live injection fix -- but it keeps the whole file free of the
+          # pattern, so a future edit cannot quietly add an
+          # attacker-controlled context beside a safe one.
+          GH_REPO: ${{ github.repository }}
+          GH_SERVER_URL: ${{ github.server_url }}
+          GH_RUN_ID: ${{ github.run_id }}
         run: |
           [ -n "$DISCORD_BOT_TOKEN" ] || exit 0
           curl -fsS -X POST -H "Authorization: Bot $DISCORD_BOT_TOKEN" \
             -H "Content-Type: application/json" \
             "https://discord.com/api/v10/channels/$DISCORD_CHANNEL_BUILDS/messages" \
-            -d "{\"content\":\"🔴 ${{ github.repository }} — CI Deep / memcheck FAILED. ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" || true
+            -d "{\"content\":\"🔴 $GH_REPO — CI Deep / memcheck FAILED. $GH_SERVER_URL/$GH_REPO/actions/runs/$GH_RUN_ID\"}" || true
 
   helgrind:
     name: Valgrind Helgrind soak
@@ -359,12 +399,22 @@ jobs:
         env:
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
           DISCORD_CHANNEL_BUILDS: ${{ secrets.DISCORD_CHANNEL_BUILDS }}
+          # Passed as env, never interpolated into the run: block below.
+          # A ${{ }} inside `run:` is pasted into the shell command by the
+          # runner before bash sees it; via env: the value arrives as data.
+          # These three are GitHub-controlled, so this is hardening, not a
+          # live injection fix -- but it keeps the whole file free of the
+          # pattern, so a future edit cannot quietly add an
+          # attacker-controlled context beside a safe one.
+          GH_REPO: ${{ github.repository }}
+          GH_SERVER_URL: ${{ github.server_url }}
+          GH_RUN_ID: ${{ github.run_id }}
         run: |
           [ -n "$DISCORD_BOT_TOKEN" ] || exit 0
           curl -fsS -X POST -H "Authorization: Bot $DISCORD_BOT_TOKEN" \
             -H "Content-Type: application/json" \
             "https://discord.com/api/v10/channels/$DISCORD_CHANNEL_BUILDS/messages" \
-            -d "{\"content\":\"🔴 ${{ github.repository }} — CI Deep / helgrind FAILED. ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" || true
+            -d "{\"content\":\"🔴 $GH_REPO — CI Deep / helgrind FAILED. $GH_SERVER_URL/$GH_REPO/actions/runs/$GH_RUN_ID\"}" || true
 
   asan-soak:
     # Flake-repetition soak. The per-PR asan.yml runs the fault-injection suite
@@ -452,12 +502,22 @@ jobs:
         env:
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
           DISCORD_CHANNEL_BUILDS: ${{ secrets.DISCORD_CHANNEL_BUILDS }}
+          # Passed as env, never interpolated into the run: block below.
+          # A ${{ }} inside `run:` is pasted into the shell command by the
+          # runner before bash sees it; via env: the value arrives as data.
+          # These three are GitHub-controlled, so this is hardening, not a
+          # live injection fix -- but it keeps the whole file free of the
+          # pattern, so a future edit cannot quietly add an
+          # attacker-controlled context beside a safe one.
+          GH_REPO: ${{ github.repository }}
+          GH_SERVER_URL: ${{ github.server_url }}
+          GH_RUN_ID: ${{ github.run_id }}
         run: |
           [ -n "$DISCORD_BOT_TOKEN" ] || exit 0
           curl -fsS -X POST -H "Authorization: Bot $DISCORD_BOT_TOKEN" \
             -H "Content-Type: application/json" \
             "https://discord.com/api/v10/channels/$DISCORD_CHANNEL_BUILDS/messages" \
-            -d "{\"content\":\"🔴 ${{ github.repository }} — CI Deep / asan-soak FAILED. ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" || true
+            -d "{\"content\":\"🔴 $GH_REPO — CI Deep / asan-soak FAILED. $GH_SERVER_URL/$GH_REPO/actions/runs/$GH_RUN_ID\"}" || true
 
   scanners:
     name: Security scanners
@@ -663,9 +723,19 @@ jobs:
         env:
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
           DISCORD_CHANNEL_BUILDS: ${{ secrets.DISCORD_CHANNEL_BUILDS }}
+          # Passed as env, never interpolated into the run: block below.
+          # A ${{ }} inside `run:` is pasted into the shell command by the
+          # runner before bash sees it; via env: the value arrives as data.
+          # These three are GitHub-controlled, so this is hardening, not a
+          # live injection fix -- but it keeps the whole file free of the
+          # pattern, so a future edit cannot quietly add an
+          # attacker-controlled context beside a safe one.
+          GH_REPO: ${{ github.repository }}
+          GH_SERVER_URL: ${{ github.server_url }}
+          GH_RUN_ID: ${{ github.run_id }}
         run: |
           [ -n "$DISCORD_BOT_TOKEN" ] || exit 0
           curl -fsS -X POST -H "Authorization: Bot $DISCORD_BOT_TOKEN" \
             -H "Content-Type: application/json" \
             "https://discord.com/api/v10/channels/$DISCORD_CHANNEL_BUILDS/messages" \
-            -d "{\"content\":\"🔴 ${{ github.repository }} — CI Deep / coverage FAILED. ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" || true
+            -d "{\"content\":\"🔴 $GH_REPO — CI Deep / coverage FAILED. $GH_SERVER_URL/$GH_REPO/actions/runs/$GH_RUN_ID\"}" || true

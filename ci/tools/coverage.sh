@@ -89,7 +89,11 @@ COVERAGE=1 bash "$UNIT_DIR/run.sh"
 # core sources because they live under the unpacked nginx tree, not our root
 # ("Cannot open source file src/core/ngx_palloc.c"). We only care about the
 # module's six objects under addon/src, so:
-#   --gcov-object-directory addon/src  restricts the object scan to those,
+#   --object-directory addon/src      restricts the object scan to those,
+#       spelled the portable way ON PURPOSE: the --gcov-object-directory alias
+#       only exists on gcovr >= 7.0, and ci-deep.yml installs gcovr unpinned
+#       from apt. On an older runner the long spelling is an unknown flag and
+#       the report dies; --object-directory is accepted by both.
 #   --filter src/                      restricts the report to our sources,
 #   --gcov-ignore-errors=all           tolerates gcov's "cannot open source"
 #       on the nginx HEADERS the module includes (ngx_string.h, etc. — pulled
@@ -101,7 +105,7 @@ mkdir -p "$OUT"
 GCOVR_ARGS=(
     --root "$MODULE_DIR"
     --filter "$MODULE_DIR/src/"
-    --gcov-object-directory "$ADDON"
+    --object-directory "$ADDON"
     --gcov-ignore-errors=all
     --branches
     --decisions
@@ -130,7 +134,7 @@ gcovr \
     --root "$MODULE_DIR" \
     --filter "$MODULE_DIR/src/ngx_http_cache_turbo_swr.c" \
     --filter "$MODULE_DIR/src/ngx_http_cache_turbo_autotune.c" \
-    --gcov-object-directory "$UNIT_DIR" \
+    --object-directory "$UNIT_DIR" \
     --gcov-ignore-errors=all \
     --branches \
     --decisions \

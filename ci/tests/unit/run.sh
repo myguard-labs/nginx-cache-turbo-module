@@ -33,6 +33,16 @@ fi
 "$CC" $CFLAGS "$DIR/test_vary_gen.c" -o "$DIR/test_vary_gen"
 "$DIR/test_vary_gen"
 
+# --- the same claim, against the REAL variant_hash (AUD-GEN1) --------------
+# test_vary_gen.c above mirrors the arithmetic; this one links the production
+# function, sliced verbatim out of src/ by extract_variant_hash.sh, so drift
+# between the mirror and the shipped code cannot pass unnoticed. The extractor
+# also fails the build if the gen fold is guarded on `gen` again.
+bash "$DIR/extract_variant_hash.sh"
+# shellcheck disable=SC2086
+"$CC" $CFLAGS "$DIR/test_variant_gen.c" -o "$DIR/test_variant_gen" -lssl -lcrypto
+"$DIR/test_variant_gen"
+
 # --- EVP digest failure path (AUD-DIGEST-ZERO) ----------------------------
 # Unit test for the fail-closed digest handling. Tests that EVP failures are
 # propagated to callers instead of silently producing all-zero keys.

@@ -5666,7 +5666,7 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
      *
      * ⚠ Placed AFTER the only-if-cached 504. RFC 9111 §5.2.1.7 makes 504 the
      * required answer when the cache cannot satisfy such a request, so the
-     * breaker must not pre-empt it with a 503 -- and, more importantly, an
+     * breaker must not preempt it with a 503 -- and, more importantly, an
      * only-if-cached request must never become the origin PROBE, because by
      * definition it will not contact the origin. It would win the promotion and
      * then exit locally, burning one recovery lease per open window. A request
