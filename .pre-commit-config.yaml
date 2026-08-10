@@ -24,7 +24,7 @@
 # Detected in this repo:
 #   C source dirs : src
 #   Python dirs   : ci
-#   fuzz corpora  : ci/fuzz/corpus, ci/fuzz/corpus_auto, ci/fuzz/corpus_blob, ci/fuzz/corpus_mc, ci/fuzz/corpus_norm_args
+#   fuzz corpora  : ci/fuzz/corpus, ci/fuzz/corpus_auto, ci/fuzz/corpus_blob, ci/fuzz/corpus_mc, ci/fuzz/corpus_norm_args, ci/fuzz/regressions
 #
 # What is NOT here, and why:
 #   clang-tidy   -- needs ngx_auto_config.h, which only exists after nginx is
@@ -41,13 +41,18 @@
 # unsafe things with untrusted input and would trip flawfinder forever.
 #
 # Install (once per clone):
-#   pipx install pre-commit && pre-commit install
+#   pipx install pre-commit
+#   git config core.hooksPath .githooks
 #
-# This repo has no tracked .githooks/pre-commit, so .git/hooks/ is what git
-# reads. If you later adopt the tracked-hook design, `git config core.hooksPath
-# .githooks` makes this config unreachable unless that hook calls
-# `pre-commit run --hook-stage pre-commit` itself -- core.hooksPath REPLACES
-# .git/hooks/, it does not add to it.
+# Do NOT run `pre-commit install` in this repo. It writes .git/hooks/pre-commit,
+# and core.hooksPath REPLACES .git/hooks/ entirely -- git consults one or the
+# other, never both. The result is an inert config that looks installed from
+# every angle: config present, install reported success, hook file on disk with
+# a plausible date, and nothing ever going red to reveal it.
+# .githooks/pre-commit invokes `pre-commit run --hook-stage pre-commit` itself,
+# which is what actually runs these hooks. A missing pre-commit binary is exit 2
+# there (blocking), not a skip -- a gate that skips when its tool is absent
+# reports green while checking nothing.
 #
 # Run against everything without committing:
 #   pre-commit run --all-files
@@ -69,7 +74,7 @@
 # Skipped" as probe.pem and "Private key found" as probe.txt. They are excluded
 # per-hook on the three fixers below instead, which is the only reason they were
 # ever in this list.
-exclude: '^ci/fuzz/corpus/|^ci/fuzz/corpus_auto/|^ci/fuzz/corpus_blob/|^ci/fuzz/corpus_mc/|^ci/fuzz/corpus_norm_args/|\.traefik-ref/|\.claude/worktrees/|\.build/|(^|/)objs/|(^|/)vendor/|(^|/)node_modules/|(^|/)\.venv/|\.(bin|gz|zip|png|ico|so|o|a)$'
+exclude: '^ci/fuzz/corpus/|^ci/fuzz/corpus_auto/|^ci/fuzz/corpus_blob/|^ci/fuzz/corpus_mc/|^ci/fuzz/corpus_norm_args/|^ci/fuzz/regressions/|\.traefik-ref/|\.claude/worktrees/|\.build/|(^|/)objs/|(^|/)vendor/|(^|/)node_modules/|(^|/)\.venv/|\.(bin|gz|zip|png|ico|so|o|a)$'
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
@@ -94,7 +99,12 @@ repos:
       # vector); gating on those is a pure false positive, while the hook still
       # guards every real path.
       - id: detect-private-key
-        exclude: '^tests?/'
+        # `(ci/)?` because the skeleton standard relocates the suite under ci/:
+        # a root-anchored ^tests?/ stops matching the moment a module moves
+        # tests/ to ci/tests/, and the hook then fires on the relocated PEM
+        # fixtures and blocks the move commit itself. Hit in every module
+        # adopting the ci/ layout.
+        exclude: '^(ci/)?tests?/'
 
   - repo: local
     hooks:
@@ -197,6 +207,47 @@ repos:
         files: '^src/.*\.[ch]$'
         pass_filenames: true
 
+      # Structural sink sweep: this superrepo's own c-* / nginx-* rules plus
+      # the C/C++ slice of CodeRabbit's ast-grep essentials pack (Apache-2.0,
+      # CWE-tagged). Those are the rules CodeRabbit runs on a pull request, so
+      # a hit here is a finding the bot would have raised -- caught before the
+      # push rather than in review.
+      #
+      # -c ci/ast-grep/sgconfig.yml is LOAD-BEARING, do not drop it to let
+      # ast-grep "find the config itself". It resolves sgconfig.yml by walking
+      # UP from the working directory, so without -c this hook would silently
+      # bind to /opt/myguard/sgconfig.yml while the clone sits there, and bind
+      # to NOTHING in a standalone clone -- scanning against an empty ruleset
+      # and reporting green. The rules are vendored into ci/ast-grep/ by
+      # tools/vendor-astgrep-rules.py precisely so this gate is self-contained.
+      # Refresh them with that script; `--check` makes staleness CI-able.
+      #
+      # ast-grep has NO severity-threshold flag (unlike semgrep --severity), and
+      # exits non-zero only on `error`. The gate is therefore built by PROMOTING
+      # named rules with --error=; everything else stays advisory -- printed,
+      # never blocking. That distinction is the whole reason this can be gated
+      # at all: measured across every module repo 2026-08-08, 318 of 368
+      # findings are note[nginx-unchecked-palloc], which in nginx C is
+      # frequently legitimate (call sites propagate NULL deliberately). Gating
+      # the note tier would land every repo red on arrival and train everyone
+      # to --no-verify -- the same failure the shellcheck note below describes.
+      #
+      # A rule joins the promoted list only after its findings are measured and
+      # confirmed real. Verified 2026-08-08 that the promoted set exits 1 on a
+      # real finding, 0 on a clean file, and 0 on a note-only file.
+      - id: ast-grep
+        name: ast-grep (structural sinks, gate on promoted rules)
+        entry: ast-grep scan -c ci/ast-grep/sgconfig.yml
+               --error=c-alloc-mul-overflow
+               --error=c-memcpy-sizeof-pointer
+               --error=c-sizeof-wrong-operand
+               --error=c-unbounded-string-copy
+               --error=c-format-string
+               --error=c-shell-exec
+        language: system
+        files: '^src/.*\.[ch]$'
+        pass_filenames: true
+
       # Python is the runtime TEST HARNESS in these repos, so it carries the
       # same weight as C -- but nothing linted it before this hook.
       #
@@ -258,26 +309,6 @@ repos:
       # cwd-guessing -- pre-commit hooks do not guarantee cwd the way a bare
       # `actionlint` invocation from a shell does.
       #
-      # -ignore runner-label: actionlint 1.7.7 ships a FIXED list of GitHub
-      # *hosted* runner images and flags anything newer as "unknown label".
-      # A config file cannot fix this one: its label list declares SELF-hosted
-      # labels, and there is no section for "GitHub-hosted images this
-      # actionlint release does not know yet". So this ignore is needed either
-      # way. Several
-      # repos legitimately target ubuntu-26.04 / ubuntu-26.04-arm, which that
-      # version has never heard of. Every such report is a false positive about
-      # the linter's age, not the workflow, and leaving it on lands this hook
-      # red on arrival. Drop this ignore once actionlint is new enough.
-      #
-      # The pattern matches HOSTED-IMAGE-SHAPED labels only, and that narrowness
-      # is the point. actionlint emits byte-identical text for an unknown hosted
-      # image and for a MISTYPED self-hosted label, so the obvious
-      # `label ".+" is unknown` suppresses both -- and a typo'd runner label is
-      # precisely what -config-file above exists to make reportable. Verified
-      # 2026-08-02 against 1.7.7: with this pattern, ubuntu-26.04, macos-16 and
-      # windows-2028 are silent while `buidler02` (a typo for a declared label)
-      # is still reported. Do not widen it back to `.+`.
-      #
       # SHELLCHECK_OPTS applies to the shellcheck actionlint runs over `run:`
       # blocks. Without it that embedded pass reports at INFO while the
       # standalone shellcheck hook below gates at warning -- so the same SC2086
@@ -285,7 +316,7 @@ repos:
       # in both places.
       - id: actionlint
         name: actionlint (workflow syntax)
-        entry: env SHELLCHECK_OPTS=-Swarning actionlint -config-file .github/actionlint.yaml -ignore 'label "(ubuntu|macos|windows)-[0-9]+(\.[0-9]+)?(-arm|-arm64|-large|-xlarge|-xl)?" is unknown'
+        entry: env SHELLCHECK_OPTS=-Swarning actionlint -config-file .github/actionlint.yaml
         language: system
         files: ^\.github/workflows/.*\.ya?ml$
         pass_filenames: true
