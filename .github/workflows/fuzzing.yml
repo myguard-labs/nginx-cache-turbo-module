@@ -1,4 +1,4 @@
-# sync-sha: 467556b83526a779c55a8ebbd1273d29d5f880ccb0bb8dffc26acfdce476b538
+# sync-sha: d4eda64d074512d517b4f20a4a2849be03481e2a8c8bb6978c0b128d108a8e60
 name: Fuzzing
 
 # Fast fuzz regression gate on every PR/push — 120s/target on all five parser
@@ -23,18 +23,7 @@ on:
   # plus the shims, which mirror parser code lifted out of src/ -- so a docs, memory,
   # or unrelated-workflow PR cannot change fuzz behaviour. Keep this list in sync
   # with what ci/fuzz/build.sh actually compiles.
-  push:
-    branches: [main]
-    paths:
-      - "src/**"
-      - "ci/fuzz/**"
-      - ".github/workflows/fuzzing.yml"
-  pull_request:
-    branches: [main]
-    paths:
-      - "src/**"
-      - "ci/fuzz/**"
-      - ".github/workflows/fuzzing.yml"
+  workflow_call: {}
   workflow_dispatch: {}
 
 concurrency:

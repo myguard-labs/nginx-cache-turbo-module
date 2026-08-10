@@ -1,0 +1,184 @@
+# sync-sha: e91e9fea26cb6bdffb962041c7be035906851a45ddfc8a90d4f2201361e95f3e
+name: CI
+
+# Single entry point for the PR suite. The six checks below used to be
+# independent workflows, each carrying its own push/pull_request trigger, so a
+# PR asked for all of them at once. On the self-hosted pool that is the wrong
+# shape: wall-clock here is dominated by jobs QUEUEING for a label-matching
+# slot, not by the jobs themselves, so six simultaneous requests just means the
+# tail waits.
+#
+# LANE MAP -- measured, not estimated. Numbers come from the last green run of
+# each workflow as of 2026-08-10, run IDs below. Re-derive with:
+#
+#   gh run view <id> -R myguard-labs/nginx-cache-turbo-module --json jobs \
+#     -q '.jobs[] | [.name, .conclusion,
+#                    (((.completedAt|fromdate)-(.startedAt|fromdate))|tostring)+"s"] | @tsv'
+#
+#   Build&Test  31273570848   Validation 26s, Build 86s, Presets 55s, Runtime 741s
+#   A/UBSan                   Build 137s, single-process 688s, multi-worker 795s
+#   Fuzzing                   Fuzz regression 676s
+#   Valgrind                  Memcheck lite 139s
+#   Scanners                  Security scanners 117s
+#   CodeQL                    Analyze C 83s
+#
+# The budget is the longest single JOB -- A/UBSan multi-worker at 795s -- because
+# no arrangement can finish sooner than that. Lanes:
+#
+#   A  A/UBSan     (137 build -> 688/795 the two soaks in parallel)  = ~795s
+#   B  Build&Test  (26 -> 86 -> 741/55 runtime + presets)            = ~795s
+#   C  Fuzzing (676s) -> Security scanners (117s)                    = ~793s
+#
+# Lane C pairs the two so it lands just under the budget rather than chaining
+# scanners behind the longest job. Valgrind (139s) is deliberately NOT chained
+# behind anything: it is short, independent, and adding it to lane C would put
+# that lane at 932s -- over budget and the suite's new critical path.
+#
+# A lane is not a slot. Build&Test fans out into four jobs and A/UBSan into
+# three, so observed peak is well above three runners; the org pool answers
+# `builder02` with ten online slots (four lxc + two docker on builder02, four on
+# builder03), so brief oversubscription at t=0 is absorbed.
+#
+# Lint and CodeQL run on ubuntu-latest, take no self-hosted slot, and are
+# therefore not laned at all -- no `needs:`, they start immediately.
+#
+# Follow-ups use !cancelled() so a FAILING first check does not suppress an
+# unrelated second one, and so a chain survives an earlier job being SKIPPED by
+# the changed-files gate below.
+#
+# No `push:` trigger, by repo policy: CI runs on the PR, and the merge commit is
+# identical to the tested PR head, so re-running it on merge buys nothing.
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+concurrency:
+  # "orchestrator-", not "ci-": build-test.yml already uses
+  # ci-${{ github.workflow }}-${{ github.ref }}, and a called workflow inherits
+  # the caller's github.workflow/github.ref -- so an identical group string
+  # would make the member cancel its own caller and kill the lane before it
+  # starts a single job. The prefix is what keeps the two apart.
+  group: orchestrator-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # --- changed-files gate --------------------------------------------------
+  # asan.yml and fuzzing.yml previously carried their own `paths:` filters. A
+  # reusable workflow cannot filter its own triggering, so those gates move here
+  # as explicit job-level `if`s over this job's outputs. Dropping them silently
+  # would run the ~800s sanitizer and ~680s fuzz jobs on every docs-only PR.
+  changes:
+    name: Detect relevant changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      asan: ${{ steps.filter.outputs.asan }}
+      fuzz: ${{ steps.filter.outputs.fuzz }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+          # Full history: a shallow clone has no common ancestor with the base,
+          # so `base...HEAD` dies with "no merge base" and the gate would fall
+          # through to false -- skipping the sanitizer on exactly the PRs that
+          # need it.
+          fetch-depth: 0
+      - id: filter
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          # workflow_dispatch has no PR base; treat that as "run everything".
+          if [ -z "${BASE_SHA:-}" ]; then
+            echo "asan=true" >> "$GITHUB_OUTPUT"
+            echo "fuzz=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Fail loudly rather than fail open. A gate that cannot compute its
+          # diff must stop the run, not report "nothing relevant changed".
+          if ! changed=$(git diff --name-only "$BASE_SHA"...HEAD); then
+            echo "::error::cannot diff $BASE_SHA...HEAD -- refusing to fail open" >&2
+            exit 1
+          fi
+          printf '%s\n' "$changed"
+          # Mirrors the paths: filters asan.yml and fuzzing.yml carried before
+          # the demotion. Keep in sync with what each job actually consumes.
+          if printf '%s\n' "$changed" | grep -qE '^(src/|ci/tools/(ci-build\.sh|test_runtime\.py|ci-hang-guard\.sh)|\.github/workflows/(asan|ci)\.yml)'; then
+            echo "asan=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "asan=false" >> "$GITHUB_OUTPUT"
+          fi
+          if printf '%s\n' "$changed" | grep -qE '^(src/|ci/fuzz/|\.github/workflows/(fuzzing|ci)\.yml)'; then
+            echo "fuzz=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "fuzz=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # --- lane A: the budget-setting workflow, alone --------------------------
+  # A/UBSan's multi-worker soak is the longest job in the suite at 795s, so the
+  # suite cannot finish sooner. Nothing is chained behind it.
+  asan:
+    name: A/UBSan
+    needs: changes
+    if: ${{ needs.changes.outputs.asan == 'true' }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/asan.yml
+
+  # --- lane B: Build&Test, alone -------------------------------------------
+  # Its Runtime job is 741s, close enough to the budget that chaining anything
+  # behind it would make this lane the critical path.
+  build-test:
+    name: Build&Test
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-test.yml
+
+  # --- lane C: Fuzzing -> Security Scanners --------------------------------
+  # 676s + 117s = 793s, just under the 795s budget. Scanners is independent of
+  # fuzzing, so it keeps running when fuzzing fails or is skipped by the
+  # changed-files gate above -- but NOT when `changes` itself failed. That job
+  # exits 1 rather than fail open when it cannot compute its diff, and a bare
+  # `!cancelled()` would run scanners anyway on a run whose gate never produced
+  # a verdict. Requiring `needs.changes.result == 'success'` keeps the fail-loud
+  # exit fail-closed all the way down the lane.
+  fuzzing:
+    name: Fuzzing
+    needs: changes
+    if: ${{ needs.changes.outputs.fuzz == 'true' }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/fuzzing.yml
+
+  security-scanners:
+    name: Security Scanners
+    needs: [changes, fuzzing]
+    if: ${{ !cancelled() && needs.changes.result == 'success' }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/security-scanners.yml
+
+  # --- unlaned: short, independent, self-hosted ----------------------------
+  # 139s. Chaining it behind fuzzing would put lane C at 932s -- over budget.
+  valgrind:
+    name: Valgrind
+    permissions:
+      contents: read
+    uses: ./.github/workflows/valgrind.yml
+
+  # --- unlaned: hosted, takes no self-hosted slot --------------------------
+  codeql:
+    name: CodeQL
+    permissions:
+      contents: read
+      # codeql.yml's analyze job declares security-events: write itself; a
+      # called workflow cannot receive more than the caller grants, so it is
+      # granted here too and nowhere wider.
+      security-events: write
+    uses: ./.github/workflows/codeql.yml

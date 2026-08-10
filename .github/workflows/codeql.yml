@@ -1,4 +1,4 @@
-# sync-sha: 747fdc50d835068937fec372a57088cc4dfff15ba09cdbc2cd457f38335f846e
+# sync-sha: d629d3f9afb74665a2f5fabaf45abe206c9c982fa850d196c201b5a6e949623c
 name: CodeQL
 
 env:
@@ -6,12 +6,9 @@ env:
   NGINX_VERSION: "1.31.1"
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
   schedule:
     - cron: "47 4 5 * *"
+  workflow_call: {}
   workflow_dispatch: {}
 
 concurrency:

@@ -1,7 +1,8 @@
 # nginx-cache-turbo-module
 
-[![Build & Test](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/build-test.yml/badge.svg)](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/build-test.yml)
-[![Security scanners](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/security-scanners.yml/badge.svg)](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/security-scanners.yml)
+[![CI](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/ci.yml/badge.svg)](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/ci.yml)
+[![Build&Test](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/build-test.yml/badge.svg)](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/build-test.yml)
+[![Security Scanners](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/security-scanners.yml/badge.svg)](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/security-scanners.yml)
 [![Fuzzing](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/fuzzing.yml/badge.svg)](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/fuzzing.yml)
 [![Valgrind](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/valgrind.yml/badge.svg)](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/valgrind.yml)
 [![CodeQL](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/codeql.yml/badge.svg)](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/codeql.yml)
@@ -15,6 +16,24 @@ A built-in page cache for nginx. Think of it as a tiny Varnish that lives
 > Ships in the **deb.myguard.nl nginx/angie stack** as
 > `libnginx-mod-http-cache-turbo` (nginx) / `angie-module-http-cache-turbo`
 > (Angie) — see [Building & the stack](#building--the-stack).
+
+## CI
+
+One `pull_request:` entry point. `ci.yml` is the orchestrator; every workflow
+below it is a `workflow_call:` member with no trigger of its own, so a change
+gets exactly one run of each rather than one per workflow. Lane map, measured
+durations and the command to re-derive them live in `ci.yml`'s header comment.
+
+| Workflow | What it gates |
+|---|---|
+| [CI](.github/workflows/ci.yml) | orchestrator; the only `pull_request` entry point, and the changed-files gate for the two path-filtered members |
+| [Build&Test](.github/workflows/build-test.yml) | validation (shellcheck, ruff, sync-stamp, port bands), build, the Test::Nginx preset suite, and the runtime driver |
+| [Security Scanners](.github/workflows/security-scanners.yml) | flawfinder >=4, cppcheck, semgrep >=WARNING over `src/` |
+| [Fuzzing](.github/workflows/fuzzing.yml) | replay of every recorded regression, then a time-boxed run of the five libFuzzer targets |
+| [Valgrind](.github/workflows/valgrind.yml) | 60s memcheck soak on the merge path |
+| [CodeQL](.github/workflows/codeql.yml) | CodeQL over the module TU; keeps its own monthly `schedule:` |
+| [A/UBSan](.github/workflows/asan.yml) | ASan+UBSan single-process and multi-worker soaks, static `--add-module` build |
+| [CI Deep](.github/workflows/ci-deep.yml) | monthly: long fuzz campaigns, memcheck and helgrind soaks, the nginx/angie compatibility matrix |
 
 ## Contents
 
