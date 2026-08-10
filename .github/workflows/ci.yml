@@ -1,4 +1,4 @@
-# sync-sha: 32b6db080db3e87322ed21903c725cbd1fc67415e3a44c1cbd2bf644b3f2e733
+# sync-sha: e91e9fea26cb6bdffb962041c7be035906851a45ddfc8a90d4f2201361e95f3e
 name: CI
 
 # Single entry point for the PR suite. The six checks below used to be
@@ -142,8 +142,12 @@ jobs:
 
   # --- lane C: Fuzzing -> Security Scanners --------------------------------
   # 676s + 117s = 793s, just under the 795s budget. Scanners is independent of
-  # fuzzing, so !cancelled() keeps it running when fuzzing fails or is skipped
-  # by the changed-files gate above.
+  # fuzzing, so it keeps running when fuzzing fails or is skipped by the
+  # changed-files gate above -- but NOT when `changes` itself failed. That job
+  # exits 1 rather than fail open when it cannot compute its diff, and a bare
+  # `!cancelled()` would run scanners anyway on a run whose gate never produced
+  # a verdict. Requiring `needs.changes.result == 'success'` keeps the fail-loud
+  # exit fail-closed all the way down the lane.
   fuzzing:
     name: Fuzzing
     needs: changes
@@ -155,7 +159,7 @@ jobs:
   security-scanners:
     name: Security Scanners
     needs: [changes, fuzzing]
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && needs.changes.result == 'success' }}
     permissions:
       contents: read
     uses: ./.github/workflows/security-scanners.yml
