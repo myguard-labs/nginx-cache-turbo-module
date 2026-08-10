@@ -56,7 +56,17 @@ fi
 # leaves a bare ( -> "fatal: invalid regexp: Unmatched (" on gawk (mawk was
 # lenient, which is why CI caught this and a local mawk run did not). [(]
 # carries no backslash, so it survives -v unchanged on every awk.
-forbidden='ngx_http_output_filter|ngx_http_finalize_request|ngx_http_core_run_phases|ngx_http_run_posted_requests|ngx_http_subrequest|ngx_add_timer|ngx_http_cache_turbo_serve|ngx_http_cache_turbo_warm_one|ngx_http_cache_turbo_cold_wait|return[[:space:]]+NGX_AGAIN|->[[:space:]]*get[[:space:]]*[(]|->[[:space:]]*lock[[:space:]]*[(]'
+# The list is an allowlist-by-omission: a yield point that is not named here
+# passes silently, which is the same shape of failure as the vacuous ../.. scan
+# fixed above. The second group below closes the gap for the request-engine
+# entry points a future edit is most likely to reach for -- none of them appears
+# under the lock today, so adding them is pure future-proofing, not a fix.
+#
+# Deliberately NOT listed: ->store( / ->set( / ->purge_tag(. Those slot names are
+# shared by the L1 vtable, whose store is not a yield point (shm_store takes the
+# mutex itself), so pinning them would fire on correct code. The L2 park points
+# are already covered by ->get( and ->lock(.
+forbidden='ngx_http_output_filter|ngx_http_finalize_request|ngx_http_core_run_phases|ngx_http_run_posted_requests|ngx_http_subrequest|ngx_add_timer|ngx_del_timer|ngx_http_send_header|ngx_http_send_special|ngx_http_post_request|ngx_http_internal_redirect|ngx_http_named_location|ngx_http_read_client_request_body|ngx_http_cache_turbo_serve|ngx_http_cache_turbo_warm_one|ngx_http_cache_turbo_cold_wait|return[[:space:]]+NGX_AGAIN|->[[:space:]]*get[[:space:]]*[(]|->[[:space:]]*lock[[:space:]]*[(]'
 
 status=0
 
