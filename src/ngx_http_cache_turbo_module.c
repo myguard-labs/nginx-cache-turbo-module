@@ -7928,12 +7928,47 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
      * with the stale snapshot; discard the upstream error body and emit the
      * snapshot body ONCE with last_buf. Checked before the served/captured gate
      * (the header filter set ctx->served to stop capture). sie_body_sent swallows
-     * any trailing error buffers the upstream still streams after the last_buf. */
+     * any trailing error buffers the upstream still streams after the last_buf.
+     * The discarded upstream chain (`in`) is marked consumed (pos=last, buffers
+     * released back to the upstream) on both exits below: with proxy_buffering
+     * off, nothing else ever advances those buffers, so skipping this leaves
+     * them stuck on the upstream's busy_bufs forever and the request hangs. */
     if (ctx != NULL && ctx->sie_serving) {
         ngx_buf_t    *eb;
         ngx_chain_t   eout;
 
         if (ctx->sie_body_sent) {
+            for (cl = in; cl; cl = cl->next) {
+                cl->buf->pos = cl->buf->last;
+                cl->buf->file_pos = cl->buf->file_last;
+                cl->buf->sync = 1;
+            }
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+            /* AUD-SIE-BODY: observe the chain AFTER the consume loop above --
+             * this is the postcondition the fix is supposed to establish
+             * (every buffer in `in` fully consumed), not a pre-count of how
+             * much data arrived. With the fix present the loop always leaves
+             * pos == last, so this is always 0; reverting ONLY the consume
+             * loop (this counter/log stays) leaves the buffers exactly as the
+             * upstream delivered them, so this counts them > 0. Logged (not a
+             * response header): by the time this block runs,
+             * ngx_http_next_header_filter() has already returned for this
+             * request -- nginx's header filter chain serializes
+             * r->headers_out.headers into the wire buffer synchronously and
+             * has no postponement contract, so a header added here would be
+             * invisible to the client and would always read 0 (verified). The
+             * greppable "cache_turbo: test_sie_unconsumed=" token is the
+             * oracle the runtime test reads out of logs/error.log instead. */
+            for (cl = in; cl; cl = cl->next) {
+                if (cl->buf->pos != cl->buf->last) {
+                    ctx->test_sie_unconsumed++;
+                }
+            }
+            ngx_log_error(NGX_LOG_NOTICE, r->connection->log, 0,
+                          "cache_turbo: test_sie_unconsumed=%ui",
+                          ctx->test_sie_unconsumed);
+#endif
             return NGX_OK;
         }
         ctx->sie_body_sent = 1;
@@ -7950,6 +7985,26 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
         if (ctx->sie_body_len == 0) {
             eb->sync = 1;
         }
+
+        for (cl = in; cl; cl = cl->next) {
+            cl->buf->pos = cl->buf->last;
+            cl->buf->file_pos = cl->buf->file_last;
+            cl->buf->sync = 1;
+        }
+
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+        /* AUD-SIE-BODY: same observe-AFTER-consume ordering and logged oracle
+         * as the sie_body_sent exit above, for the main snapshot-emitting exit. */
+        for (cl = in; cl; cl = cl->next) {
+            if (cl->buf->pos != cl->buf->last) {
+                ctx->test_sie_unconsumed++;
+            }
+        }
+        ngx_log_error(NGX_LOG_NOTICE, r->connection->log, 0,
+                      "cache_turbo: test_sie_unconsumed=%ui",
+                      ctx->test_sie_unconsumed);
+#endif
 
         eout.buf = eb;
         eout.next = NULL;
