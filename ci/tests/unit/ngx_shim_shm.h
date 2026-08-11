@@ -125,9 +125,56 @@ typedef volatile ngx_atomic_uint_t ngx_atomic_t;
  * unreachable state. The multi-worker interleaving is covered by the ASan
  * multi-worker runtime arm, not here -- do not read a green run of this file
  * as proof the breaker is race-free. */
+/* --- O4.5: a CAS the test can make LOSE ----------------------------------
+ * The sequential shim above can never produce a losing CAS: nothing else
+ * mutates the word between the caller's read and its compare-and-set, so every
+ * CAS in this harness wins and the loser branches are dead code under test.
+ * That is not a cosmetic gap. The breaker's rolling-window re-anchor is
+ * correct precisely BECAUSE the loser skips the counter clear, so a harness in
+ * which nobody ever loses cannot tell the CAS version apart from the unguarded
+ * read-modify-write it replaced -- verified by reverting the fix, at which
+ * point every test here stayed green.
+ *
+ * ct_cas_steal_arm() models the one event the sequential shim cannot: another
+ * worker wins the race. When armed for an address, the next CAS on it stores
+ * the value that "other worker" committed and reports FAILURE to the caller,
+ * which is exactly what the caller observes in production when it loses. The
+ * production code is unmodified and unaware; only the primitive's outcome is
+ * driven, the same way ngx_time() is driven above.
+ *
+ * Scoped to one address and one shot: an armed steal that is never consumed is
+ * a fixture bug, so ct_cas_steal_assert_used() must be called at the end of any
+ * test that arms one. */
+extern ngx_atomic_t      *ct_cas_steal_addr;
+extern ngx_atomic_uint_t  ct_cas_steal_value;
+extern int                ct_cas_steal_fired;
+
+static inline void
+ct_cas_steal_arm(ngx_atomic_t *p, ngx_atomic_uint_t committed_by_other)
+{
+    ct_cas_steal_addr  = p;
+    ct_cas_steal_value = committed_by_other;
+    ct_cas_steal_fired = 0;
+}
+
+static inline int
+ct_cas_steal_consume(ngx_atomic_t *p)
+{
+    if (ct_cas_steal_addr != p) {
+        return 0;
+    }
+    /* The rival's write lands, then our CAS reports the loss. */
+    *p = ct_cas_steal_value;
+    ct_cas_steal_addr  = NULL;
+    ct_cas_steal_fired = 1;
+    return 1;
+}
+
 #define ngx_atomic_cmp_set(p, old, set)                                       \
-    ((*(p)) == (ngx_atomic_uint_t) (old)                                      \
-     ? ((*(p)) = (ngx_atomic_uint_t) (set), 1) : 0)
+    (ct_cas_steal_consume((ngx_atomic_t *) (p))                               \
+     ? 0                                                                      \
+     : ((*(p)) == (ngx_atomic_uint_t) (old)                                   \
+        ? ((*(p)) = (ngx_atomic_uint_t) (set), 1) : 0))
 
 /* --- settable clock ------------------------------------------------------
  * The code under test stamps and compares TTL deadlines (refresh_lock_until,

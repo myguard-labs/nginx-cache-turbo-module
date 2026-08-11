@@ -1718,7 +1718,7 @@ ngx_http_cache_turbo_shm_breaker_record(ngx_http_cache_turbo_zone_t *z,
     ngx_uint_t success, ngx_uint_t threshold, time_t window, ngx_uint_t probe)
 {
     time_t            now;
-    ngx_atomic_uint_t fails;
+    ngx_atomic_uint_t fails, window_start;
     ngx_uint_t        word, state;
 
     now   = ngx_time();
@@ -1828,10 +1828,41 @@ ngx_http_cache_turbo_shm_breaker_record(ngx_http_cache_turbo_zone_t *z,
     }
 
     /* Rolling window: re-anchor if the previous one has expired, so only a
-     * BURST of failures trips the breaker. */
-    if (now - (time_t) z->sh->breaker_window_start >= window) {
-        z->sh->breaker_window_start = (ngx_atomic_t) now;
-        z->sh->breaker_fails        = 0;
+     * BURST of failures trips the breaker.
+     *
+     * ⚠ O4.5: the re-anchor is a CAS, and ONLY the worker that wins it clears
+     * the counter. The plain check-then-write this replaced was a read-modify-
+     * write with no exclusion, so every worker whose read saw the expired
+     * anchor executed BOTH stores. During exactly the burst the window exists
+     * to catch, N workers re-zero the counter as fast as they increment it: the
+     * count never reaches threshold and the breaker stays CLOSED against a dead
+     * origin. The failure direction is "misses a real outage", not "trips
+     * early", which is why it survived every single-threaded test here.
+     *
+     * A loser does NOT retry and does NOT clear. It falls through to the
+     * fetch_add and counts into the window the winner just opened -- the
+     * correct window for it, since its failure is concurrent with the winner's
+     * rather than older. Losing the CAS is the normal path, not an error.
+     *
+     * The winner clears the counter AFTER winning. Clearing before the CAS
+     * would restore the bug outright: losers would clear too, and their stores
+     * can land after the winner's fetch_add.
+     *
+     * ⚠ RESIDUAL, deliberately accepted: the winner's clear is not atomic with
+     * its CAS, so a loser's fetch_add landing in that gap is erased. nginx
+     * exposes only cmp_set and fetch_add on ngx_atomic_t -- there is no atomic
+     * exchange -- so closing it would need a lock on the header-filter path,
+     * far too expensive for the failure path of an advisory counter. The
+     * residual is BOUNDED: at most the failures racing one re-anchor, once per
+     * window, and it can only DELAY a trip, never cause a spurious one. The
+     * STATE transitions below are the part that must be exact; those are CAS. */
+    window_start = (ngx_atomic_uint_t) z->sh->breaker_window_start;
+
+    if (now - (time_t) window_start >= window
+        && ngx_atomic_cmp_set(&z->sh->breaker_window_start,
+                              window_start, (ngx_atomic_uint_t) now))
+    {
+        z->sh->breaker_fails = 0;
     }
 
     fails = (ngx_atomic_uint_t) ngx_atomic_fetch_add(&z->sh->breaker_fails, 1) + 1;

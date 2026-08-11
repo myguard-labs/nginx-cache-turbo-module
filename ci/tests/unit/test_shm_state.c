@@ -42,6 +42,11 @@ NGX_CT_ASSERT_LAYOUTS("mirrored decl (ngx_shim_shm.h):");
 
 /* --- shim state ---------------------------------------------------------- */
 time_t      ngx_test_now        = 1000000;
+
+/* O4.5: backing store for the losable-CAS seam declared in ngx_shim_shm.h. */
+ngx_atomic_t      *ct_cas_steal_addr  = NULL;
+ngx_atomic_uint_t  ct_cas_steal_value = 0;
+int                ct_cas_steal_fired = 0;
 long        ngx_test_slab_budget = -1;
 ngx_uint_t  ngx_test_slab_live   = 0;
 ngx_uint_t  ngx_test_lock_depth  = 0;
@@ -1276,6 +1281,69 @@ test_breaker_window_rolls(void)
               == NGX_HTTP_CACHE_TURBO_BREAKER_CLOSED,
           "a trickle of failures a window apart tripped the breaker");
     CHECK(g_sh.breaker_opens == 0, "breaker opened on a rolled window");
+}
+
+
+/* O4.5: a worker that LOSES the window re-anchor must not clear the counter.
+ *
+ * The re-anchor used to be a bare check-then-write -- read the anchor, store
+ * `now`, store 0 over the counter -- executed in full by EVERY worker whose
+ * read saw the expiry. During exactly the burst the window exists to catch, N
+ * workers re-zero the counter as fast as they increment it, the count never
+ * reaches threshold, and the breaker stays CLOSED against a dead origin. The
+ * failure direction is "misses a real outage", never "trips early", which is
+ * why no single-threaded test noticed it.
+ *
+ * ⚠ Simply calling brk_record() N times at one instant does NOT reproduce this
+ * and must not be mistaken for it. The calls run sequentially: the first
+ * re-anchors, and every later one reads the FRESH anchor and skips the branch
+ * entirely, so the counter climbs unimpeded under the bug too. That version of
+ * this test was written first, stayed green with the fix reverted, and proved
+ * nothing -- see the shim's own warning above ngx_atomic_cmp_set.
+ *
+ * The distinguishing event is a LOSING CAS, which the sequential shim can never
+ * produce on its own. ct_cas_steal_arm() supplies it: the rival's re-anchor
+ * lands and our CAS reports failure, exactly as production sees it. Under the
+ * fix the loser skips the clear and its failure still counts; under the
+ * unguarded RMW the loser clears the winner's count and the trip is lost. */
+static void
+test_breaker_losing_reanchor_does_not_clear_count(void)
+{
+    printf("breaker: a worker losing the window re-anchor keeps the count\n");
+    zone_reset();
+    ngx_test_set_time(1000);
+
+    /* An expired window, and two failures already counted inside the window a
+     * rival is about to open -- the evidence that must survive our loss. */
+    g_sh.breaker_window_start = (ngx_atomic_t) 1000;
+    ngx_test_advance_time(61);
+    g_sh.breaker_fails = 2;
+
+    /* A rival worker wins the re-anchor to this instant while we are mid-call.
+     * Our CAS will fail; the branch under test is what we do next. */
+    ct_cas_steal_arm(&g_sh.breaker_window_start,
+                     (ngx_atomic_uint_t) ngx_test_now);
+
+    brk_record(0, 3, 60);
+
+    REQUIRE(ct_cas_steal_fired,
+            "breaker fixture: the armed re-anchor CAS never fired — the "
+            "re-anchor no longer goes through cmp_set, so this test is not "
+            "exercising the losing path at all");
+
+    /* The loser must have counted its own failure ON TOP of the two already
+     * there, reaching the threshold of 3 and tripping the breaker. Clearing on
+     * the losing path drops the count to 1 and nothing opens. */
+    CHECK(brk_state(30)
+              == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
+          "a worker that lost the window re-anchor cleared the counter: the "
+          "burst's own evidence was erased and the breaker stayed CLOSED "
+          "against a failing origin");
+    CHECK(g_sh.breaker_opens == 1, "breaker_opens was not bumped on the trip");
+
+    /* The rival's anchor stands: the loser must not have overwritten it. */
+    CHECK(g_sh.breaker_window_start == (ngx_atomic_t) ngx_test_now,
+          "the losing worker overwrote the winner's window anchor");
 }
 
 
@@ -3030,6 +3098,46 @@ run_negative_controls(void)
         }
     }
 
+    /* O4.5 restored: the re-anchor as a bare check-then-write, so a worker that
+     * would have LOST the CAS clears the counter anyway. Replayed against REAL
+     * shared state in the same fixture test_breaker_losing_reanchor_does_not_
+     * clear_count() uses: an expired window, two failures already counted, and
+     * a rival that re-anchors first.
+     *
+     * With the bug, our worker stores its own anchor and zeroes the counter
+     * regardless of the rival, so its own failure counts as 1, the threshold of
+     * 3 is never met, and the breaker cannot open. If this control does NOT
+     * catch that, the test guards nothing. */
+    zone_reset();
+    ngx_test_set_time(1000);
+    g_sh.breaker_window_start = (ngx_atomic_t) 1000;
+    ngx_test_advance_time(61);
+    g_sh.breaker_fails = 2;
+    {
+        time_t  seen_start = (time_t) g_sh.breaker_window_start;
+
+        /* The rival wins the re-anchor first, exactly as the armed steal does. */
+        g_sh.breaker_window_start = (ngx_atomic_t) ngx_test_now;
+
+        /* <-- the bug: the loser acts on the anchor it READ, with no CAS to
+         * tell it that someone else already re-anchored. */
+        if (ngx_test_now - seen_start >= 60) {
+            g_sh.breaker_window_start = (ngx_atomic_t) ngx_test_now;
+            g_sh.breaker_fails        = 0;
+        }
+        g_sh.breaker_fails++;
+
+        caught = (g_sh.breaker_fails < 3);
+        tests_run++;
+        if (!caught) {
+            fprintf(stderr, "  ✗ CONTROL O4.5: the unguarded re-anchor still "
+                            "reached the threshold — "
+                            "test_breaker_losing_reanchor_does_not_clear_count "
+                            "guards nothing\n");
+            tests_failed++;
+        }
+    }
+
     /* O4.1-b restored: return the STORED state instead of reserving HALF_OPEN
      * for the CAS winner. That is what the first revision of this code did, and
      * it is the herd bug: once one caller is promoted, every subsequent caller
@@ -3439,6 +3547,7 @@ main(void)
     test_breaker_zeroed_zone_is_closed();
     test_breaker_trips_at_threshold();
     test_breaker_window_rolls();
+    test_breaker_losing_reanchor_does_not_clear_count();
     test_breaker_half_open_admits_one_probe();
     test_breaker_probe_success_closes();
     test_breaker_abandoned_probe_lease_recovers();
