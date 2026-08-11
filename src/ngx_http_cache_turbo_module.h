@@ -1640,6 +1640,12 @@ typedef struct {
      * tuning knob, and a public directive would invite operators to lower it
      * into routinely-incomplete purges. */
     ngx_int_t                test_scan_max_pages;
+    /* AUD-L2-PROMOTE-RACE: milliseconds to block the CURRENT worker right
+     * before the L2-promote store_if() call, so a test can race a concurrent
+     * write from a different worker into the gap. 0/unset = no hold. See the
+     * directive comment in the conf array for why this is a plain blocking
+     * ngx_msleep rather than an async timer. */
+    ngx_int_t                test_l2_promote_hold_ms;
 #endif
 
 
@@ -2087,6 +2093,13 @@ ngx_int_t ngx_http_cache_turbo_shm_store(ngx_http_cache_turbo_zone_t *z,
     u_char *key_hash, uint32_t hash, u_char *data, size_t len,
     time_t fresh_ttl, time_t stale_ttl);
 
+/* Atomic decide-then-write store. See the L1 vtable `store_if` comment for
+ * the return contract (NGX_OK / NGX_DECLINED / NGX_ERROR) and predicate
+ * semantics. */
+ngx_int_t ngx_http_cache_turbo_shm_store_if(ngx_http_cache_turbo_zone_t *z,
+    u_char *key_hash, uint32_t hash, u_char *data, size_t len,
+    time_t fresh_ttl, time_t stale_ttl, ngx_uint_t predicate);
+
 /* Purge a single entry by key hash. Returns 1 if an entry was removed, 0 if
  * not present. */
 ngx_int_t ngx_http_cache_turbo_shm_purge_key(ngx_http_cache_turbo_zone_t *z,
@@ -2350,6 +2363,37 @@ struct ngx_cache_turbo_l1_backend_s {
     ngx_int_t  (*store)(ngx_http_cache_turbo_zone_t *z, u_char *key_hash,
         uint32_t hash, u_char *data, size_t len,
         time_t fresh_ttl, time_t stale_ttl);
+
+    /* Atomic "decide-then-write" store (AUD-L2-PROMOTE-RACE / AUD-5XX-CTA).
+     * Modeled on `claim`, NOT on `store`: the predicate is evaluated and the
+     * write performed under ONE hold of the zone mutex, closing the
+     * check-then-act window a separate lookup-then-store pair leaves open.
+     *
+     * Returns:
+     *   NGX_OK       -- predicate passed, entry written (as store() today).
+     *   NGX_DECLINED -- predicate REFUSED the write; nothing was modified.
+     *                   This is a NORMAL outcome, not an error -- callers
+     *                   must treat it as a distinct third value, never as
+     *                   NGX_ERROR and never silently as NGX_OK.
+     *   NGX_ERROR    -- predicate passed but the write itself failed
+     *                   (alloc/evict), same meaning as store() returning
+     *                   NGX_ERROR today.
+     *
+     * predicate selects which refusal rule gates the write:
+     *   NGX_HTTP_CACHE_TURBO_STORE_IF_NEWER -- refuse iff the resident node
+     *     is a real entry (kind == ENTRY, len > 0) strictly fresher than the
+     *     value about to be written (ctn->fresh_until > now + fresh_ttl).
+     *     Used by the L2 promote path: never let a parked, slow L2 reply
+     *     displace a newer origin response that landed while it was parked.
+     *   NGX_HTTP_CACHE_TURBO_STORE_IF_ABSENT_OR_DEAD -- refuse iff the
+     *     resident node is a real entry (kind == ENTRY, len > 0) still
+     *     within its stale window (stale_until == 0, meaning forever, OR
+     *     now < stale_until). Used by the 5xx store path: never let an
+     *     error response overwrite a still-servable good body. */
+    ngx_int_t  (*store_if)(ngx_http_cache_turbo_zone_t *z, u_char *key_hash,
+        uint32_t hash, u_char *data, size_t len,
+        time_t fresh_ttl, time_t stale_ttl, ngx_uint_t predicate);
+
     ngx_int_t  (*purge_key)(ngx_http_cache_turbo_zone_t *z, u_char *key_hash,
         uint32_t hash);
     ngx_uint_t (*purge_all)(ngx_http_cache_turbo_zone_t *z);
@@ -2401,6 +2445,11 @@ struct ngx_cache_turbo_l1_backend_s {
 #define NGX_HTTP_CACHE_TURBO_CLAIM_WINNER  0
 #define NGX_HTTP_CACHE_TURBO_CLAIM_LOSER   1
 #define NGX_HTTP_CACHE_TURBO_CLAIM_FRESH   2
+
+/* store_if() predicates (AUD-L2-PROMOTE-RACE / AUD-5XX-CTA) -- see the L1
+ * vtable `store_if` comment for the exact refusal rule each one applies. */
+#define NGX_HTTP_CACHE_TURBO_STORE_IF_NEWER            0
+#define NGX_HTTP_CACHE_TURBO_STORE_IF_ABSENT_OR_DEAD   1
 
 /* Cold-miss wait-loop poll interval (ms): a loser re-checks L1/L2 this often
  * until the winner fills the entry or cache_turbo_lock_timeout elapses (v10). */

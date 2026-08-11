@@ -587,8 +587,16 @@ ngx_http_cache_turbo_shm_purge_all(ngx_http_cache_turbo_zone_t *z)
 }
 
 
-ngx_int_t
-ngx_http_cache_turbo_shm_store(ngx_http_cache_turbo_zone_t *z,
+/* AUD-L2-PROMOTE-RACE / AUD-5XX-CTA: the body of what used to be
+ * ngx_http_cache_turbo_shm_store(), with its own lock/unlock removed. Runs
+ * with the zone mutex ALREADY HELD by the caller, so store() and store_if()
+ * can share it -- store_if() adds its predicate check under the SAME lock
+ * acquisition that performs the write, closing the check-then-act window a
+ * separate lookup-then-store pair leaves open. Behaviour is byte-identical
+ * to the pre-refactor store(): every `unlock; return X` below is exactly
+ * where store()'s used to be, now just `return X`. */
+static ngx_int_t
+ngx_http_cache_turbo_shm_store_locked(ngx_http_cache_turbo_zone_t *z,
     u_char *key_hash, uint32_t hash, u_char *data, size_t len,
     time_t fresh_ttl, time_t stale_ttl)
 {
@@ -600,8 +608,6 @@ ngx_http_cache_turbo_shm_store(ngx_http_cache_turbo_zone_t *z,
      * then lands in the past and the node is served via the stale path. stale_ttl
      * is the absolute serveable window from now (0 = no stale serving). */
     now = ngx_time();
-
-    ngx_shmtx_lock(&z->shpool->mutex);
 
     /* Already present? Update in place (refresh path). */
     ctn = ngx_http_cache_turbo_shm_lookup(z, key_hash, hash);
@@ -626,7 +632,6 @@ ngx_http_cache_turbo_shm_store(ngx_http_cache_turbo_zone_t *z,
             /* Refresh failed: keep the existing (stale) entry reachable, on
              * its original segment. */
             ngx_http_cache_turbo_lru_link_head(z, ctn);
-            ngx_shmtx_unlock(&z->shpool->mutex);
             return NGX_ERROR;
         }
 
@@ -664,7 +669,6 @@ ngx_http_cache_turbo_shm_store(ngx_http_cache_turbo_zone_t *z,
         ctn->promotable = 0;
         ngx_http_cache_turbo_lru_link_head(z, ctn);
 
-        ngx_shmtx_unlock(&z->shpool->mutex);
         return NGX_OK;
     }
 
@@ -672,14 +676,12 @@ ngx_http_cache_turbo_shm_store(ngx_http_cache_turbo_zone_t *z,
     ctn = ngx_http_cache_turbo_shm_alloc_evict(z,
               sizeof(ngx_http_cache_turbo_node_t));
     if (ctn == NULL) {
-        ngx_shmtx_unlock(&z->shpool->mutex);
         return NGX_ERROR;
     }
 
     body = ngx_http_cache_turbo_blob_alloc(z, len);
     if (body == NULL) {
         ngx_slab_free_locked(z->shpool, ctn);
-        ngx_shmtx_unlock(&z->shpool->mutex);
         return NGX_ERROR;
     }
 
@@ -704,8 +706,86 @@ ngx_http_cache_turbo_shm_store(ngx_http_cache_turbo_zone_t *z,
     /* S8: every new node enters PROBATION (see lru_insert_new). */
     ngx_http_cache_turbo_lru_insert_new(z, ctn);
 
-    ngx_shmtx_unlock(&z->shpool->mutex);
     return NGX_OK;
+}
+
+
+ngx_int_t
+ngx_http_cache_turbo_shm_store(ngx_http_cache_turbo_zone_t *z,
+    u_char *key_hash, uint32_t hash, u_char *data, size_t len,
+    time_t fresh_ttl, time_t stale_ttl)
+{
+    ngx_int_t  rc;
+
+    ngx_shmtx_lock(&z->shpool->mutex);
+    rc = ngx_http_cache_turbo_shm_store_locked(z, key_hash, hash, data, len,
+                                                fresh_ttl, stale_ttl);
+    ngx_shmtx_unlock(&z->shpool->mutex);
+
+    return rc;
+}
+
+
+/* AUD-L2-PROMOTE-RACE / AUD-5XX-CTA: decide-then-write, one lock acquisition.
+ * See the L1 vtable `store_if` comment in the header for the return contract
+ * and the exact refusal rule each predicate applies. `now` is taken ONCE
+ * inside the lock so the decision and the write see the same clock reading. */
+ngx_int_t
+ngx_http_cache_turbo_shm_store_if(ngx_http_cache_turbo_zone_t *z,
+    u_char *key_hash, uint32_t hash, u_char *data, size_t len,
+    time_t fresh_ttl, time_t stale_ttl, ngx_uint_t predicate)
+{
+    time_t                        now;
+    ngx_int_t                     rc;
+    ngx_uint_t                    refuse;
+    ngx_http_cache_turbo_node_t  *ctn;
+
+    ngx_shmtx_lock(&z->shpool->mutex);
+
+    now = ngx_time();
+    ctn = ngx_http_cache_turbo_shm_lookup(z, key_hash, hash);
+    refuse = 0;
+
+    if (ctn != NULL
+        && ctn->kind == NGX_HTTP_CACHE_TURBO_NODE_ENTRY
+        && ctn->len > 0)
+    {
+        switch (predicate) {
+
+        case NGX_HTTP_CACHE_TURBO_STORE_IF_NEWER:
+            /* Refuse iff the resident entry is strictly fresher than the
+             * blob we are about to promote -- a slow L2 reply must never
+             * displace a newer origin response that landed while it was
+             * parked. */
+            if (ctn->fresh_until > now + fresh_ttl) {
+                refuse = 1;
+            }
+            break;
+
+        case NGX_HTTP_CACHE_TURBO_STORE_IF_ABSENT_OR_DEAD:
+            /* Exactly today's "protect" predicate, moved inside the lock:
+             * refuse iff the resident entry is still within its stale
+             * window. stale_until == 0 means FOREVER, not expired. */
+            if (ctn->stale_until == 0 || now < ctn->stale_until) {
+                refuse = 1;
+            }
+            break;
+
+        default:
+            break;
+        }
+    }
+
+    if (refuse) {
+        ngx_shmtx_unlock(&z->shpool->mutex);
+        return NGX_DECLINED;
+    }
+
+    rc = ngx_http_cache_turbo_shm_store_locked(z, key_hash, hash, data, len,
+                                                fresh_ttl, stale_ttl);
+    ngx_shmtx_unlock(&z->shpool->mutex);
+
+    return rc;
 }
 
 
@@ -1810,6 +1890,7 @@ ngx_cache_turbo_l1_backend_t  ngx_http_cache_turbo_shm_backend = {
     ngx_string("shm"),
     ngx_http_cache_turbo_shm_lookup,
     ngx_http_cache_turbo_shm_store,
+    ngx_http_cache_turbo_shm_store_if,
     ngx_http_cache_turbo_shm_purge_key,
     ngx_http_cache_turbo_shm_purge_all,
     ngx_http_cache_turbo_shm_stats,

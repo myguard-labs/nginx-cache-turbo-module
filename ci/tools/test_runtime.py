@@ -1170,6 +1170,38 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # AUD-L2-PROMOTE-RACE: dedicated L2 location with NO cache_turbo_purge
+        # (unlike /reqccl2/, whose PURGE would DEL the L2 key too -- this test
+        # needs to seed L1 and L2 independently via raw redis writes, never
+        # through the module's own PURGE) and cache_turbo_bypass on the SAME
+        # key ($uri, so a bypassed and a non-bypassed request share one L1/L2
+        # slot). A bypassed request on this URI never touches redis at all
+        # (module.c: bypass returns NGX_DECLINED before the L1 lookup/lock,
+        # straight to origin, straight to a plain store()), so it can land a
+        # NEWER L1 write from a different worker while another request is
+        # still inside the L2-promote critical section.
+        #
+        # cache_turbo_test_l2_promote_hold_ms is the load-bearing knob: the
+        # actual race window (between the resumed L2-hit handler's own
+        # already-unlocked L1 re-check and its store_if() call) is pure CPU
+        # with no I/O or yield point in between -- unreachable from black-box
+        # HTTP timing regardless of how the L2 GET itself is delayed. The hold
+        # blocks the CURRENT worker for exactly that gap so a concurrent
+        # bypass write from a DIFFERENT worker can land inside it
+        # deterministically. TEST_FAULTS-only; see the field comment in
+        # ngx_http_cache_turbo_module.h. Drives
+        # test_l2_promote_race_never_overwrites_newer_l1_entry.
+        location /l2promo/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    30s;
+            cache_turbo_redis    127.0.0.1:{redis_port} prefix=ct: timeout=5s;
+            cache_turbo_bypass   $arg_nocache;
+            cache_turbo_test_l2_promote_hold_ms 2000;
+            add_header           X-CT-Status $cache_turbo_status always;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # L2 negative memo (L13). Same shape as /l2/ above (no keepalive, so
         # every L2 op is exactly one countable Redis connection) plus a 3s memo,
         # so a repeated cold miss on the same key skips the L2 GET entirely. The
@@ -2964,6 +2996,22 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # AUD-5XX-CTA: cache_turbo_bypass skips the LOOKUP *and* single-flight
+        # but still permits storing, so it is the one path that can reach the
+        # 5xx guard with NO earlier serialization point at all -- exactly the
+        # reachability the check-then-act race needed. Negative-cache 503 so a
+        # bypassed 5xx is actually eligible to be stored (a non-cacheable
+        # status never reaches the guard). Drives test_5xx_cta_bypass_never_
+        # overwrites_cached_body.
+        location /cta5xx/ {{
+            cache_turbo         main;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            cache_turbo_valid   503 1m;
+            cache_turbo_bypass  $arg_nocache;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # S2.3: no-reaper contract. keep_stale is a generous 1h -- an entry
         # here is way inside its keep-stale window at every point this test
         # checks it, so if the entry ever disappears on its own that proves a
@@ -4356,6 +4404,14 @@ class RedisServer:
             "--save", "",
             "--appendonly", "no",
             "--dir", str(self.root),
+            # AUD-L2-PROMOTE-RACE: DEBUG SLEEP is how
+            # test_l2_promote_race_never_overwrites_newer_l1_entry blocks this
+            # server's single-threaded command loop for a bounded window,
+            # giving a real (not simulated) parked-request race to test
+            # against. "local" scopes it to loopback connections only (this
+            # fixture is never reachable off-box); Redis refuses DEBUG
+            # entirely without this flag.
+            "--enable-debug-command", "local",
         ]
         if self.tls_certs:
             # TLS-only listener: plaintext port off, tls-port on.
@@ -10595,6 +10651,61 @@ def test_5xx_never_overwrites_cached_body(ng: Nginx, origin: Origin) -> None:
     assert b3, "post-recovery served an empty body"
 
 
+def test_5xx_cta_bypass_never_overwrites_cached_body(ng: Nginx,
+                                                      origin: Origin) -> None:
+    """AUD-5XX-CTA: the "refuse to overwrite a good cached body with an error
+    status" guard used to be a separate check-then-act -- lock, lookup,
+    decide `protect`, unlock, THEN store re-locked later. cache_turbo_bypass
+    is the one path that skips BOTH the lookup and the single-flight claim
+    while still permitting a store, so a bypassed request has no earlier
+    serialization point at all and drives the guard's predicate and its write
+    through two independent lock acquisitions -- exactly the window
+    AUD-5XX-CTA closes by folding both into shm_store_if() under ONE lock.
+
+    /cta5xx/ seeds a normal 200 (cacheable 30s), then every further request
+    goes through ?nocache=1 (cache_turbo_bypass), which always reaches the
+    origin and always attempts a store on the way back regardless of cache
+    state. With the origin forced to answer 503 (negative-cacheable via
+    `cache_turbo_valid 503 1m`), the guard must refuse to let that 503
+    displace the still-fresh 200 seeded above. A subsequent NON-bypassed read
+    must still return the original 200 body -- under the pre-fix bug the 503
+    clobbers the entry and this read comes back as a cached 503 (or a
+    mismatched body from a second store race)."""
+    s0, b0, _ = fetch(ng.port, "/cta5xx/x")
+    assert s0 == 200 and b0, f"prime failed: {s0} {b0!r}"
+
+    origin.fail = True
+    origin.fail_status = 503
+    try:
+        # Bypass: skips lookup + single-flight, still stores. This is the
+        # store-path call that must be refused by the guard.
+        s1, _, _ = fetch(ng.port, "/cta5xx/x?nocache=1")
+        assert s1 == 503, \
+            f"bypassed request should reach origin's 503, got {s1}"
+
+        # A second bypass for good measure -- makes a single successful
+        # refusal insufficient if the guard only holds up once.
+        s1b, _, _ = fetch(ng.port, "/cta5xx/x?nocache=1")
+        assert s1b == 503, \
+            f"second bypassed request should also reach origin's 503, got {s1b}"
+    finally:
+        origin.fail = False
+        drain_origin(origin)
+
+    # THE DISCRIMINATING ASSERTION: a plain (non-bypass) read must still HIT
+    # the original 200 body. Under the pre-fix check-then-act bug, the
+    # bypassed store above overwrote the entry with the negative-cached 503,
+    # and this read would come back 503 with an empty/mismatched body.
+    s2, b2, h2 = fetch(ng.port, "/cta5xx/x")
+    assert s2 == 200, (
+        f"post-bypass plain read got {s2}, expected 200 -- the bypassed 5xx "
+        "store was allowed to overwrite the cached body (AUD-5XX-CTA)"
+    )
+    assert b2 == b0, f"served {b2!r}, expected original body {b0!r}"
+    assert h2.get("x-cache") == "HIT", \
+        f"post-bypass plain read expected a cache HIT, got {h2.get('x-cache')!r}"
+
+
 def test_keep_stale_no_reaper_lru_only_reclaim(ng: Nginx, origin: Origin) -> None:
     """S2.3 CONTRACT: an L1 node past its stale deadline but still inside its
     cache_turbo_keep_stale window is reclaimed ONLY by LRU/max_size pressure --
@@ -13415,6 +13526,177 @@ def test_l2_unserveable_giveup_still_single_flights(
     drain_origin(origin)
 
 
+def _errlog_l2_promote_rc_in_window(ng: Nginx, start: int) -> list[int]:
+    """AUD-L2-PROMOTE-RACE oracle: every `cache_turbo: test_l2_promote_rc=<N>`
+    value logged strictly after byte offset `start`, in emission order. NGX_OK
+    is 0 and NGX_DECLINED is -5 in nginx's ngx_int_t space, so this also
+    accepts a leading '-'. Mirrors _errlog_sie_unconsumed_in_window's
+    window-bracketing discipline exactly (see that function's docstring for
+    why: attributing a debug/notice line to the wrong concurrent request is
+    the failure mode this guards against)."""
+    log = ng.root / "logs" / "error.log"
+    try:
+        with log.open("rb") as f:
+            f.seek(start)
+            tail = f.read()
+    except OSError as exc:
+        raise AssertionError(f"error.log unreadable: {exc}") from None
+    text = tail.decode("utf-8", errors="replace")
+    return [int(m) for m in
+            re.findall(r"cache_turbo: test_l2_promote_rc=(-?\d+)", text)]
+
+
+def test_l2_promote_race_never_overwrites_newer_l1_entry(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    """AUD-L2-PROMOTE-RACE: the L2 GET is async -- it parks the request (zone
+    mutex NOT held) and resumes it when the redis reply lands. On resume, the
+    pre-fix code promoted the L2 blob into L1 unconditionally, so a slow L2
+    reply could overwrite a NEWER origin response that landed in L1 while the
+    first request was parked. store_if(..., STORE_IF_NEWER) closes that by
+    deciding "is the resident entry newer?" and writing under ONE lock hold.
+
+    WHY NOT A PLAIN BLACK-BOX TIMING RACE: the actual window this fix closes
+    is the gap between the resumed handler's own (already-unlocked) L1
+    re-check and its store_if() call -- pure CPU, no I/O, no yield point in
+    between (confirmed: firing a concurrent write any time before the L2
+    reply arrives is simply seen by that SAME re-check on resume and short-
+    circuits the promote call entirely, producing "L1 HIT (fresh)" and never
+    reaching the vulnerable line -- that dead end was tried and measured
+    before landing on this design). No amount of delaying the L2 GET itself
+    (redis DEBUG SLEEP, a slow origin, etc.) can widen a gap with no yield
+    point in it. cache_turbo_test_l2_promote_hold_ms (TEST_FAULTS-only, module.c
+    ~L2-promote site) blocks the CURRENT worker for a bounded, deterministic
+    window at EXACTLY that gap via a plain ngx_msleep -- it stalls only this
+    worker's own event loop, so with 4 workers configured a concurrent
+    request lands on a different worker and is unaffected.
+
+    Two-part oracle, matching the item's explicit requirement to distinguish
+    "declined" from "never reached": the NOTICE-level `test_l2_promote_rc=`
+    line (module.c, right after the store_if() call, inside TEST_FAULTS) is
+    asserted PRESENT (an absent line fails, never reads as anything) and
+    equal to NGX_DECLINED. A black-box read of the final L1 body is used
+    alongside it, since it is independently reachable here (unlike the
+    unconsumed-buffer case _errlog_sie_unconsumed_in_window's sibling
+    docstring explains): the body proves the DECLINED promote was correct
+    behaviour (the newer entry, not the stale L2 blob, is what gets served),
+    while the log line proves the guarded branch, specifically, is what
+    produced it -- a passing body check with an absent/wrong log line would
+    mean the assertion is passing for an unrelated reason and must fail.
+
+    Sequence:
+      1. Seed L2 (only) with body A by writing it through the module on a
+         throwaway URI sharing /l2promo/'s config, then copying the raw blob
+         bytes into THIS test's key via redis.set_raw() -- keeps the exact
+         on-wire blob format (module-produced) while leaving /l2promo/x's own
+         L1 slot virgin, so the very first real read of it is a guaranteed
+         cold L1 miss that must consult L2.
+      2. Fire the L2-bound read in the background; it parks on the L2 GET,
+         resumes, and -- because /l2promo/ sets
+         cache_turbo_test_l2_promote_hold_ms -- blocks its own worker for
+         2000ms immediately before the promote decision.
+      3. While it is held, fire the bypass read on the SAME key (never
+         touches redis, reaches origin fast, stores body B into L1 via a
+         plain unconditional store() -- on a different nginx worker).
+      4. The held worker wakes, decides (L1 now holds B, newer than the L2
+         blob) and must DECLINE the promote. A follow-up plain read must
+         still see body B, never body A; the NOTICE line must read
+         NGX_DECLINED."""
+    uri = "/l2promo/x"
+    seed_uri = "/l2promo/seed-for-x"
+    key = l2_key(uri)
+    redis.cli("DEL", key)
+
+    # Produce a module-correct blob for body A on a THROWAWAY key (own L2
+    # slot), then copy its raw bytes into uri's L2 slot directly -- this
+    # leaves /l2promo/x's L1 completely virgin (never touched), which is what
+    # forces the first real read of it through the cold-L1-miss -> L2-consult
+    # path rather than serving a live L1 HIT.
+    s0, bodyA, _ = fetch(ng.port, seed_uri)
+    assert s0 == 200 and bodyA, f"seed prime failed: {s0} {bodyA!r}"
+    seed_key = l2_key(seed_uri)
+    assert wait_for(lambda: redis.cli("EXISTS", seed_key) == "1"), \
+        "seed body never reached L2"
+    blobA = redis.get_raw(seed_key)
+    assert blobA is not None, "could not read back the seed L2 blob"
+
+    # AGE the blob's `created` stamp (u64 LE at byte offset 24, per
+    # ngx_http_cache_turbo_blob_hdr_write / blob_validate -- no checksum
+    # covers the header, so a direct byte patch is safe and does not need to
+    # re-derive anything else) by 25s BEFORE seeding it into L2. This is what
+    # makes STORE_IF_NEWER's comparison unambiguous regardless of scheduling
+    # jitter: the promoted blob's remaining freshness (rem_fresh = fresh_ttl -
+    # age) is forced to ~5s while the bypass write's fresh_until (anchored
+    # fresh, cache_turbo_valid 30s from ITS OWN write time) is ~30s out -- a
+    # >20s margin, immune to any sub-second timing wobble. Without this the
+    # seed and the bypass write land within a few hundred ms of each other
+    # (both use the same 30s TTL), so "is the resident entry newer" turns on
+    # exactly the race's own jitter and the assertion flakes both ways
+    # (measured: NGX_OK observed on an unaged blob in ~2 of 5 runs).
+    assert len(blobA) >= 32, f"seed blob too short to carry a header: {blobA!r}"
+    created = int.from_bytes(blobA[24:32], "little")
+    aged_created = created - 25
+    blobA = blobA[:24] + aged_created.to_bytes(8, "little") + blobA[32:]
+
+    redis.set_raw(key, blobA, 30_000)
+    wait_for_l2(redis, key, blobA, what="L2 seed for /l2promo/x")
+
+    window_start = _errlog_window_start(ng)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        # Parked read: /l2promo/x's L1 slot is virgin, so this is a
+        # guaranteed cold L1 miss -> L2 GET -> resume -> held for 2000ms
+        # (cache_turbo_test_l2_promote_hold_ms) right before the promote
+        # decision.
+        held_fut = pool.submit(fetch, ng.port, uri)
+
+        # Give the held request time to actually park on L2, resume, and
+        # enter the hold -- comfortably under the 2000ms hold itself (wide
+        # margin against redis round-trip / scheduler jitter on a loaded CI
+        # box), so the bypass write below reliably lands INSIDE the window.
+        time.sleep(0.5)
+
+        # Concurrent newer write: bypass never touches redis or the hold
+        # (different code path entirely), so it proceeds immediately on
+        # whichever worker picks it up -- almost certainly a different one
+        # from the held request, since that worker's event loop is blocked.
+        s_bp, bodyB, _h_bp = fetch(ng.port, uri + "?nocache=1")
+        assert s_bp == 200 and bodyB, f"bypass write failed: {s_bp} {bodyB!r}"
+        assert bodyB != bodyA, \
+            "bypass must hit the origin for a fresh body, not replay bodyA"
+
+        s_held, _b_held, _h_held = held_fut.result(timeout=10)
+
+    assert s_held == 200, f"held L2 read returned {s_held}, expected 200"
+
+    # Oracle part 1: the NOTICE line must be PRESENT and read NGX_DECLINED.
+    # Absent is a FAIL, never read as 0/NGX_OK -- see the docstring on why an
+    # absent line cannot be trusted as "the guard passed".
+    rcs = _errlog_l2_promote_rc_in_window(ng, window_start)
+    assert rcs, (
+        "no 'cache_turbo: test_l2_promote_rc=' line found in this request's "
+        "error.log window -- the oracle line is MISSING, which must fail "
+        "(never silently read as declined): either TEST_FAULTS is not "
+        "actually compiled in, or the L2-promote branch was never entered "
+        "for this request")
+    NGX_DECLINED = -5
+    assert all(v == NGX_DECLINED for v in rcs), (
+        f"L2 promote was not declined: test_l2_promote_rc values in window = "
+        f"{rcs} (NGX_DECLINED == {NGX_DECLINED}) -- the race was not closed, "
+        f"a slow L2 reply was allowed to promote over a newer L1 entry")
+
+    # Oracle part 2 (black-box, reachable here unlike the SIE-buffer case):
+    # a follow-up plain read must see bodyB (the newer L1 entry), never
+    # bodyA (the stale L2 blob). Under the pre-fix bug this comes back with
+    # bodyA instead -- exactly the race AUD-L2-PROMOTE-RACE exists to close.
+    s_final, b_final, _h_final = fetch(ng.port, uri)
+    assert s_final == 200, f"final read returned {s_final}, expected 200"
+    assert b_final == bodyB, (
+        f"final L1 body was overwritten by the slow L2 promote: "
+        f"got {b_final!r}, expected the newer bypass body {bodyB!r} "
+        f"(bodyA was {bodyA!r})"
+    )
+
+
 def test_request_cc_serve_verdict_l2(ng: Nginx, origin: Origin,
                                      redis: RedisServer) -> None:
     """C-S5-a: RFC-1 request Cache-Control serve verdict evaluated on the L2
@@ -15693,6 +15975,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_use_stale_403_429(ng, origin)                      # S4.2 non-5xx tokens
     test_keep_stale_no_reaper_lru_only_reclaim(ng, origin)  # S2.3 no-reaper contract
     test_5xx_never_overwrites_cached_body(ng, origin)       # O6/S3.1 5xx-never-clobbers
+    test_5xx_cta_bypass_never_overwrites_cached_body(ng, origin)  # AUD-5XX-CTA
     test_background_update_off_regenerates_inline(ng, origin)
     test_normalize_arg_order(ng, origin)
     test_normalize_strips_tracking(ng, origin)
@@ -15745,6 +16028,8 @@ def run_all(ng: Nginx, origin: Origin,
         test_l2_purge_key_drops_l2(ng, origin, redis)
         test_l2_expired_consults_l2(ng, origin, redis)
         test_request_cc_serve_verdict_l2(ng, origin, redis)  # C-S5-a L2 verdict arm
+        test_l2_promote_race_never_overwrites_newer_l1_entry(
+            ng, origin, redis)                          # AUD-L2-PROMOTE-RACE
         test_l2_preserves_original_freshness(ng, origin, redis)
         test_l2_malformed_blob_rejected(ng, origin, redis)  # STAB-4 validate
         test_l2_forged_blob_cannot_inject_headers(ng, origin, redis)   # AUD-BLOBE2E1
