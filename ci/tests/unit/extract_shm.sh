@@ -370,6 +370,28 @@ if sed -n '/^ngx_http_cache_turbo_breaker_action(/,/^}/p' "$OUT" \
     exit 1
 fi
 
+# ⚠ O4.5: the rolling-window re-anchor must stay a CAS on breaker_window_start.
+# The bare check-then-write it replaced let every worker observing the expiry
+# store both the new anchor AND a zeroed counter, so a burst of concurrent
+# failures erased its own evidence and the breaker never reached threshold --
+# it stayed CLOSED against a dead origin, the exact outage it exists to catch.
+#
+# Reverting the CAS reads as a simplification ("why cmp_set for a counter?") and
+# leaves every breaker test green: the single-threaded ones never race, and only
+# the concurrent-arrival test notices. Pinned structurally so the build fails
+# instead. Comments stripped first, for the same reason as every check above --
+# the prose around the fix names cmp_set repeatedly, so a naive grep would match
+# the explanation rather than the code.
+if ! sed -n '/^ngx_http_cache_turbo_shm_breaker_record(/,/^}/p' "$OUT" \
+   | sed -E 's;/\*.*;;; s;^[[:space:]]*\*.*;;' \
+   | grep -q 'ngx_atomic_cmp_set(&z->sh->breaker_window_start'; then
+    echo "✗ O4.5 regression: the rolling-window re-anchor is no longer a CAS" >&2
+    echo "  on breaker_window_start. Concurrent failures then clear each" >&2
+    echo "  other's count and the breaker cannot trip during a real burst." >&2
+    rm -f "$OUT"
+    exit 1
+fi
+
 # --- sanity: every wanted function must be present, and the file must end on a
 # closing brace (a truncated slice would otherwise fail to compile in a
 # confusing place, or worse, compile with a body silently cut short).
