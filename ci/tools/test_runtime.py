@@ -3484,7 +3484,9 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
-        # ---- discourse (arg-scanner vehicle only; see test_preset_arg_scanner)
+        # ---- discourse (ported to ci/t/preset-engine/arg-scanner.t and
+        # ci/t/presets/discourse.t; kept here only as long as another Python
+        # test in this file still references /dc/)
         # Cookie/arg rules are path-independent, so a prefixed location is fine:
         # _t bypasses, but the guest _forum_session and the theme_ids /
         # forced_color_mode variant cookies must NOT.
@@ -5903,120 +5905,6 @@ def test_2026_preset_expansion(ng: Nginx, origin: Origin) -> None:
         assert status == 200, f"{root} alternate-cookie request returned {status}"
         assert "x-cache" not in h, \
             f"{root} alternate cookie {cookie!r} must bypass, got {h.get('x-cache')}"
-
-    drain_origin(origin)
-
-
-def test_preset_arg_value_predicate(ng: Nginx) -> None:
-    """Preset query-arg rules written as `name=value` must match the VALUE.
-
-    The single-entry-script forums (SMF, MyBB, YaBB, Invision) route every page
-    through one `action` / `do` argument, so the argument NAME carries the
-    ordinary read routes too. The classifier originally looked every args entry
-    up as a bare argument name, which meant `action=login` was searched for as
-    an argument literally called "action=login" and never matched anything --
-    login, PM and moderation routes stayed cacheable. Matching on the name
-    alone is not the fix either: it would bypass the whole board.
-
-    So both halves are asserted. A listed value bypasses; an unlisted value on
-    the SAME argument name still caches."""
-    # A listed route value must bypass. Fetch TWICE: a bypassed response and an
-    # ordinary first-time MISS both come back with no x-cache header, so a
-    # single fetch cannot tell them apart and would pass even with the rule
-    # removed. Only a bypass keeps the header absent on the SECOND request --
-    # a mere MISS would have been stored and would answer HIT.
-    for i, q in enumerate(("action=login", "action=admin", "action=pm")):
-        uri = f"/smf/index.php?{q}&t={i}"
-        fetch(ng.port, uri)
-        _, _, h = fetch(ng.port, uri)
-        assert "x-cache" not in h, \
-            (f"?{q} must bypass on the smf preset (still no x-cache on the "
-             f"second request), got {h.get('x-cache')}")
-
-    # An UNLISTED value on the same argument name is an ordinary read and must
-    # stay cacheable -- this is what a bare-name match would have broken.
-    for q in ("action=display", "action=recent"):
-        uri = f"/smf/index.php?{q}"
-        fetch(ng.port, uri)
-        _, _, h = fetch(ng.port, uri)
-        assert h.get("x-cache") == "HIT", \
-            (f"?{q} is an ordinary read route and must stay cacheable, got "
-             f"{h.get('x-cache')} -- matching the bare arg NAME bypasses the "
-             "entire board")
-
-
-def test_preset_arg_scanner(ng: Nginx, origin: Origin) -> None:
-    """The preset arg scanner must percent-decode, split on ';', and look past
-    the first occurrence of a name.
-
-    All three of these were fail-OPEN with core nginx's ngx_http_arg():
-
-      * ngx_http_arg splits only on '&'. SMF and YaBB build nearly every
-        multi-argument URL with ';' ("?u=42;action=login"), so everything after
-        the first argument was invisible and those presets' arg rows matched
-        nothing on a real board URL.
-      * ngx_http_arg does not percent-decode. PHP routes "%61ction=log%69n"
-        exactly like "action=login", so an encoded login URL was cached.
-      * ngx_http_arg returns the FIRST occurrence and stops. PHP's $_GET keeps
-        the LAST, so a harmless value prefixed onto the real one
-        ("?action=display&action=login") hid the dynamic route.
-
-    Each case is fetched TWICE for the same reason as the value-predicate test:
-    a bypass and a first-time MISS are indistinguishable on one request, so a
-    single fetch would pass with the scanner removed."""
-    bypass_cases = (
-        ("u=42;action=login", "';' is a query separator for SMF/YaBB"),
-        ("%61ction=login", "the argument NAME may be percent-encoded"),
-        ("action=log%69n", "the argument VALUE may be percent-encoded"),
-        ("action=display&action=login", "a later occurrence still counts"),
-        ("board=1;u=42;action=pm", "the match may be the LAST of several"),
-    )
-    for i, (q, why) in enumerate(bypass_cases):
-        uri = f"/smf/index.php?{q}&n={i}"
-        fetch(ng.port, uri)
-        _, _, h = fetch(ng.port, uri)
-        assert "x-cache" not in h, \
-            (f"?{q} must bypass on the smf preset ({why}), got "
-             f"{h.get('x-cache')}")
-
-    # The negative half. Decoding and ';'-splitting must not turn an ordinary
-    # read route into a bypass, or the scanner has simply un-cached the board.
-    for q in ("u=42;action=display", "action=%64isplay", "actionx=login"):
-        uri = f"/smf/index.php?{q}"
-        fetch(ng.port, uri)
-        _, _, h = fetch(ng.port, uri)
-        assert h.get("x-cache") == "HIT", \
-            (f"?{q} is an ordinary read route and must stay cacheable, got "
-             f"{h.get('x-cache')}")
-
-    # PHP's key mangling. php_register_variable_ex() rewrites '.' and ' ' to
-    # '_' when it builds a $_GET key, so "?.xfToken=" reaches XenForo as
-    # "_xfToken" -- the exact argument name the preset bypasses on, and a
-    # percent-decoding-only matcher misses every alias. A literal '+' is a
-    # space in form encoding and mangles the same way. The fold is applied to
-    # every preset, not only the PHP ones: on Discourse (Rack, which does not
-    # mangle) it can only ever cost an unnecessary bypass, which is the safe
-    # direction, so the discourse arms below pin the uniform behaviour.
-    for uri in ("/xf/thread-mangle?%2ExfToken=1650000000,abcdef",
-                "/xf/thread-mangle2?+xfToken=1650000000,abcdef",
-                "/dc/topic-mangle?api%2Ekey=deadbeef",
-                "/dc/topic-mangle2?api%20username=admin"):
-        fetch(ng.port, uri)
-        _, _, h = fetch(ng.port, uri)
-        assert "x-cache" not in h, \
-            (f"{uri} must bypass -- PHP folds '.', ' ' and a literal '+' in an "
-             f"argument NAME to '_', got {h.get('x-cache')}")
-
-    # ...but the mangling is a NAME rule only, and PHP leaves values alone.
-    # An unrelated name that merely contains the fold characters must not
-    # suddenly match, or every preset with an underscore in an arg row starts
-    # bypassing traffic it has no business seeing.
-    for uri in ("/xf/thread-nomangle?x.xfToken=1", "/dc/topic-nomangle?api.keyx=1"):
-        fetch(ng.port, uri)
-        _, _, h = fetch(ng.port, uri)
-        assert h.get("x-cache") == "HIT", \
-            (f"{uri} matches no preset argument and must stay cacheable, got "
-             f"{h.get('x-cache')}")
 
     drain_origin(origin)
 
@@ -16061,8 +15949,6 @@ def run_all(ng: Nginx, origin: Origin,
     test_phpbb_preset(ng, origin)
     test_redmine_key_arg_bypasses_without_cookie(ng, origin)
     test_redmine_public_content_stays_cacheable(ng, origin)
-    test_preset_arg_value_predicate(ng)
-    test_preset_arg_scanner(ng, origin)
     test_cookie_pred_multiple_matching_cookies(ng, origin)
     test_2026_preset_expansion(ng, origin)
     test_internal_redirect_key_and_veto(ng, origin)
@@ -16567,9 +16453,6 @@ def main() -> int:
           "invalid-name rejected), "
           "cookie predicate multi-match (guest cookie must not mask a member "
           "in the same header, both orders, two-guests still cacheable), "
-          "preset arg scanner (';' separator, percent-decoded name and value, "
-          "later occurrence, PHP '.'/' '/'+' key mangling, read routes still "
-          "cached), "
           "2026 preset expansion (textpattern/bludit/spip/bugzilla/mantisbt/"
           "plone/umbraco/dotclear/wikijs: public HIT + state-cookie/URI/arg "
           "BYPASS, custom "
