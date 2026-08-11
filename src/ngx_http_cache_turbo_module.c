@@ -542,6 +542,23 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_cache_turbo_loc_conf_t, test_scan_max_pages),
       NULL },
+
+    /* AUD-L2-PROMOTE-RACE: the gap between the resumed L2-hit handler's own
+     * (already-unlocked) L1 re-check and its store_if() call is pure CPU with
+     * no I/O or yield point in between -- unreachable from a black-box HTTP
+     * timing race. This blocks the CURRENT WORKER for up to N ms, right
+     * before the promote call, so a test can land a concurrent write from a
+     * DIFFERENT worker into that exact window. ngx_msleep is a plain
+     * usleep(): it stalls only this worker's event loop, not the others, so
+     * with >1 worker configured the concurrent write is unaffected. 0/unset
+     * = no hold (production default; the directive does not exist outside
+     * TEST_FAULTS builds at all). */
+    { ngx_string("cache_turbo_test_l2_promote_hold_ms"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_num_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_turbo_loc_conf_t, test_l2_promote_hold_ms),
+      NULL },
 #endif
 
       ngx_null_command
@@ -5528,6 +5545,7 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                  * verdict. If it fails, revalidate at origin instead of serving
                  * the rejected copy (req_reval blocks the cold-claim re-serve). */
                 ngx_int_t  l2_fresh_ok = 1, l2_stale_ok = 1;
+                ngx_int_t  promote_rc;
 
                 /* P2: same gate as the L1 verdict above — only run the bounds
                  * check when the client actually sent one. With none set the
@@ -5562,9 +5580,57 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                      * in this blob is dropped at serve time rather than
                      * prevented from entering L1. Keep the two claims separate;
                      * conflating them is what let AUD-HDR1 survive to HEAD. */
-                    (void) clcf->l1->store(z, ctx->key_hash, hash,
+                    /* AUD-L2-PROMOTE-RACE: this GET unlocked before the
+                     * request parked; on resume it used to promote
+                     * unconditionally, so a slow L2 reply could overwrite a
+                     * NEWER origin response that landed while parked.
+                     * store_if() decides "is the resident entry newer?" and
+                     * writes under ONE lock hold, closing that window.
+                     * NGX_DECLINED means the promotion did not happen -- that
+                     * is CORRECT, not an error: the blob we hold is still
+                     * valid and gets served below exactly as before, we
+                     * simply declined to displace a fresher L1 entry. */
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+                    /* AUD-L2-PROMOTE-RACE test hook: the gap this fix closes
+                     * is pure CPU between the unlock above and store_if()'s
+                     * own lock -- no I/O, no yield point, unreachable from a
+                     * black-box HTTP timing race. Blocking THIS worker here
+                     * (ngx_msleep = plain usleep, stalls only its own event
+                     * loop) gives a test a deterministic window to land a
+                     * concurrent write from a DIFFERENT worker before the
+                     * decide-and-store below runs. 0/unset = no hold. */
+                    if (clcf->test_l2_promote_hold_ms > 0) {
+                        ngx_msleep((ngx_msec_t) clcf->test_l2_promote_hold_ms);
+                    }
+#endif
+                    promote_rc = clcf->l1->store_if(z,
+                               ctx->key_hash, hash,
                                ctx->l2_blob, ctx->l2_blob_len,
-                               rem_fresh, rem_stale);
+                               rem_fresh, rem_stale,
+                               NGX_HTTP_CACHE_TURBO_STORE_IF_NEWER);
+
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+                    /* AUD-L2-PROMOTE-RACE oracle: NOTICE (not debug) so it is
+                     * readable at the harness's default log level -- same
+                     * reasoning as test_sie_unconsumed (AUD-SIE-BODY). Two
+                     * DISTINCT values so a test can tell "declined" from
+                     * "stored" apart, never inferring one from the other's
+                     * absence: an absent line must fail the test, not read
+                     * as either. */
+                    ngx_log_error(NGX_LOG_NOTICE, r->connection->log, 0,
+                                  "cache_turbo: test_l2_promote_rc=%i",
+                                  promote_rc);
+#endif
+
+                    if (promote_rc == NGX_DECLINED) {
+                        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                                       "cache_turbo: L2 promote skipped, "
+                                       "newer entry resident \"%V\" key=%ui",
+                                       &r->uri, (ngx_uint_t) hash);
+                    }
+
                     (void) ngx_atomic_fetch_add(&z->sh->hits, 1);
                     (void) ngx_atomic_fetch_add(&z->sh->l2_hits, 1);
                     ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
@@ -8436,21 +8502,22 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 
             /* O6/S3.1: a negative-cached error (e.g. "cache_turbo_valid 503 1m")
              * must never overwrite a body that is still worth serving -- that is
-             * the exact inverse of outage resilience. There is no pre-existing
-             * node in scope in this body filter (only ctx->sie_snap, populated
-             * only when SIE was already armed at ACCESS time), so this does its
-             * own lookup under the zone mutex. Modeled on
-             * ngx_http_cache_turbo_shm_claim()'s lock/unlock discipline --
-             * shm_lookup() does not lock itself.
+             * the exact inverse of outage resilience.
              *
-             * Predicate ("holds a body worth protecting"):
+             * AUD-5XX-CTA: this used to be a separate check-then-act -- lock,
+             * lookup, decide `protect`, unlock, THEN store re-locked later.
+             * Reachable under cache_turbo_bypass (skips lookup AND
+             * single-flight, still permits storing), another worker could
+             * change the node in the gap between the two critical sections.
+             * Folded into a single store_if() call below: the predicate
+             * (search "refusing to overwrite cached body") and the write now
+             * share ONE lock hold, via
+             * NGX_HTTP_CACHE_TURBO_STORE_IF_ABSENT_OR_DEAD, which is exactly
+             * the old `protect` predicate --
              *   kind == ENTRY && ctn->len > 0 && (stale_until == 0
              *                                     || now < stale_until)
-             *
-             * stale_until == 0 means FOREVER, not expired (special-cased
-             * elsewhere in this file); a naive `now < stale_until` would invert
-             * the sentinel and skip the guard on exactly the never-expiring
-             * entries.
+             * -- moved inside shm_store_if(). stale_until == 0 means FOREVER,
+             * not expired.
              *
              * ⚠ D-4 ("does this also cover a body alive ONLY via
              * cache_turbo_keep_stale, i.e. past stale_until?") is YES, and it is
@@ -8470,41 +8537,13 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
              * Do not "restore" the sie_ttl arm without first writing a test
              * that reaches it.
              *
-             * ⚠ This MUST run here, not earlier: it has to probe the key this
-             * store will actually write, and `store_key` only diverges from
-             * ctx->key_hash above (auto-Vary variant relocation). Probing
-             * ctx->key_hash instead would check the BASE key while the store
-             * overwrites the VARIANT -- protecting on an unrelated body and
-             * still clobbering the variant this guard exists to save. */
-            if (r->headers_out.status >= NGX_HTTP_INTERNAL_SERVER_ERROR) {
-                ngx_http_cache_turbo_node_t      *gctn;
-                ngx_int_t                         protect = 0;
-
-                ngx_shmtx_lock(&z->shpool->mutex);
-
-                gctn = ngx_http_cache_turbo_shm_lookup(z, store_key, hash);
-
-                if (gctn != NULL
-                    && gctn->kind == NGX_HTTP_CACHE_TURBO_NODE_ENTRY
-                    && gctn->len > 0)
-                {
-                    time_t  gnow = ngx_time();
-
-                    if (gctn->stale_until == 0 || gnow < gctn->stale_until) {
-                        protect = 1;
-                    }
-                }
-
-                ngx_shmtx_unlock(&z->shpool->mutex);
-
-                if (protect) {
-                    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                                   "cache_turbo: refusing to overwrite cached "
-                                   "body \"%V\" with error status=%ui",
-                                   &r->uri, r->headers_out.status);
-                    return ngx_http_cache_turbo_forward_body(r, in);
-                }
-            }
+             * ⚠ store_if() MUST probe the key this store will actually write,
+             * and `store_key` only diverges from ctx->key_hash above (auto-Vary
+             * variant relocation). Probing ctx->key_hash instead would check
+             * the BASE key while the store overwrites the VARIANT --
+             * protecting on an unrelated body and still clobbering the variant
+             * this guard exists to save. store_if() is called with store_key,
+             * below, preserving that property. */
 
             /* If we relocated the key away from the base (cold-miss winner that
              * only learned the Vary now), the cold-miss stub the access handler
@@ -8521,6 +8560,8 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 
             {
             ngx_int_t  store_rc;
+            ngx_uint_t is_5xx = (r->headers_out.status
+                                  >= NGX_HTTP_INTERNAL_SERVER_ERROR);
 
 #if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
     && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
@@ -8537,16 +8578,42 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
             if (clcf->test_store_fail) {
                 store_rc = NGX_ERROR;
 
+            } else if (is_5xx) {
+                store_rc = clcf->l1->store_if(z, store_key, hash,
+                           blob, blob_len, ttl, stale_window,
+                           NGX_HTTP_CACHE_TURBO_STORE_IF_ABSENT_OR_DEAD);
+
             } else {
                 store_rc = clcf->l1->store(z, store_key, hash,
                            blob, blob_len, ttl,
                            stale_window);
             }
 #else
-            store_rc = clcf->l1->store(z, store_key, hash,
-                       blob, blob_len, ttl,
-                       stale_window);
+            if (is_5xx) {
+                store_rc = clcf->l1->store_if(z, store_key, hash,
+                           blob, blob_len, ttl, stale_window,
+                           NGX_HTTP_CACHE_TURBO_STORE_IF_ABSENT_OR_DEAD);
+
+            } else {
+                store_rc = clcf->l1->store(z, store_key, hash,
+                           blob, blob_len, ttl,
+                           stale_window);
+            }
 #endif
+
+            /* AUD-5XX-CTA: NGX_DECLINED means store_if() refused the write
+             * because a still-servable good body is resident under
+             * store_key -- equivalent to the old `protect` branch. Return
+             * BEFORE touching ctx->cold_stored, same as before: nothing was
+             * written, so the cold-miss stub cleanup (AUD-STORE-ERR-STUB,
+             * just below) must still run. */
+            if (store_rc == NGX_DECLINED) {
+                ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                               "cache_turbo: refusing to overwrite cached "
+                               "body \"%V\" with error status=%ui",
+                               &r->uri, r->headers_out.status);
+                return ngx_http_cache_turbo_forward_body(r, in);
+            }
 
             if (store_rc == NGX_OK) {
                 ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
@@ -12713,6 +12780,7 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->test_force_file_buf = NGX_CONF_UNSET;
     conf->test_store_fail = NGX_CONF_UNSET;
     conf->test_scan_max_pages = NGX_CONF_UNSET;
+    conf->test_l2_promote_hold_ms = NGX_CONF_UNSET;
 #endif
     /* shm_zone, key, redis_addr, redis_prefix default NULL via pcalloc */
 
@@ -12921,6 +12989,8 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
                          prev->test_store_fail, 0);
     ngx_conf_merge_value(conf->test_scan_max_pages,
                          prev->test_scan_max_pages, 0);
+    ngx_conf_merge_value(conf->test_l2_promote_hold_ms,
+                         prev->test_l2_promote_hold_ms, 0);
 #endif
 
     /* PURGE method (v14): off by default. */
