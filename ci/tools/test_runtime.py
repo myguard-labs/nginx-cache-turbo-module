@@ -10418,6 +10418,18 @@ def test_unbuf_oversize_abort_mid_stream(ng: Nginx, origin: Origin) -> None:
     assert b0.startswith("big-"), "oversize body missing its origin marker"
     assert b0.endswith("\n"), \
         "oversize body does not end cleanly -- looks truncated mid-chunk"
+    # Every chunk, not just the length and the end markers: the delegated path
+    # hands each buffer downstream individually, so a lost, duplicated or
+    # reordered INTERIOR chunk is exactly the failure mode this test exists to
+    # catch -- and a length-plus-first-and-last-marker assertion accepts all
+    # three. `gen` is constant within one response, so the expected body is
+    # reconstructible from the first chunk's generation.
+    gen0 = b0.split("-")[1]
+    expected0 = "".join(f"big-{gen0}-{i:02d}-" + "Z" * 4000 + "\n"
+                        for i in range(16))
+    assert b0 == expected0, \
+        ("delegated oversize body is not the origin's byte stream -- a chunk "
+         "was lost, duplicated or reordered mid-stream")
 
     # Re-fetch: must still be a live MISS (never cached), and origin must be
     # contacted again (distinct generation-tagged body).
@@ -10431,6 +10443,12 @@ def test_unbuf_oversize_abort_mid_stream(ng: Nginx, origin: Origin) -> None:
         "been served from a cache after all"
     assert len(b1) == len(b0), \
         f"second oversize body length {len(b1)} != first {len(b0)}"
+    gen1 = b1.split("-")[1]
+    expected1 = "".join(f"big-{gen1}-{i:02d}-" + "Z" * 4000 + "\n"
+                        for i in range(16))
+    assert b1 == expected1, \
+        ("second delegated oversize body is not the origin's byte stream -- a "
+         "chunk was lost, duplicated or reordered mid-stream")
 
 
 def test_sie_serves_counter(ng: Nginx, origin: Origin) -> None:
