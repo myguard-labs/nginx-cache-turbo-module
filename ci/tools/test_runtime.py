@@ -1451,6 +1451,7 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             cache_turbo          main;
             cache_turbo_key      $uri;
             cache_turbo_valid    1s;
+            cache_turbo_stale_mult 1;
             cache_turbo_redis    127.0.0.1:{redis_port} prefix=ct: timeout=250ms;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
@@ -1928,6 +1929,7 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             cache_turbo                         main;
             cache_turbo_key                     $uri;
             cache_turbo_valid                   1s;
+            cache_turbo_stale_mult              1;
             cache_turbo_test_restore_alloc_fail on;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
@@ -2312,14 +2314,15 @@ http {{
         # Range over a STALE-IF-ERROR serve. r->allow_ranges is set in
         # restore_response(), which sie_rewrite() shares with the live HIT path,
         # so the SIE serve must range identically to a HIT. Same short-fresh
-        # shape as /sieserve/ (1s fresh, stale window x4 = 4s, fully expired by
-        # ~5s) but with the rngsrc+rngsie markers so the stored blob is
-        # Range-capable AND carries stale-if-error=30. Drives
+        # shape as /sieserve/ (1s fresh, stale_mult 1 -> 1s stale window, fully
+        # expired by ~1.3s) but with the rngsrc+rngsie markers so the stored
+        # blob is Range-capable AND carries stale-if-error=30. Drives
         # test_range_on_sie_serve.
         location /rangesie/ {{
             cache_turbo       main;
             cache_turbo_key   $uri;
             cache_turbo_valid 1s;
+            cache_turbo_stale_mult 1;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
@@ -2631,8 +2634,8 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
-        # RFC-2 stale-if-error serve-on-error (CTB4). Short fresh (1s -> stale
-        # window x4 = 4s, fully expired by ~5s). The origin emits
+        # RFC-2 stale-if-error serve-on-error (CTB4). Short fresh (1s, stale_mult
+        # 1 -> 1s stale window, fully expired by ~1.3s). The origin emits
         # stale-if-error=30 ONLY when the request suffix carries the "sieserve"
         # marker (proxy_pass strips the /sieserve/ prefix), so a /sieserve/sieserve-*
         # key gets a serve-on-error window and a /sieserve/plain-* key does NOT.
@@ -2642,6 +2645,7 @@ http {{
             cache_turbo          main;
             cache_turbo_key      $uri;
             cache_turbo_valid    1s;
+            cache_turbo_stale_mult 1;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
@@ -2658,6 +2662,7 @@ http {{
             cache_turbo          main;
             cache_turbo_key      $uri;
             cache_turbo_valid    1s;
+            cache_turbo_stale_mult 1;
             proxy_buffering       off;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
@@ -2695,12 +2700,13 @@ http {{
         # carries NO stale-if-error of its own (D-1 precedence table). Origin
         # for this location sends no Cache-Control at all -> keep_stale is the
         # only thing standing between an expired entry and a surfaced error.
-        # Short fresh (1s) / stale (x4 = 4s) window like /sieserve/ so the
-        # entry is fully expired quickly. Drives test_keep_stale_serves_dead_origin.
+        # Short fresh (1s) / stale (stale_mult 1 -> 1s) window like /sieserve/ so
+        # the entry is fully expired quickly. Drives test_keep_stale_serves_dead_origin.
         location /keepstale/ {{
             cache_turbo          main;
             cache_turbo_key      $uri;
             cache_turbo_valid    1s;
+            cache_turbo_stale_mult 1;
             cache_turbo_keep_stale 1h;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
@@ -2718,6 +2724,7 @@ http {{
             cache_turbo          main;
             cache_turbo_key      $uri;
             cache_turbo_valid    1s;
+            cache_turbo_stale_mult 1;
             cache_turbo_keep_stale 1h;
             cache_turbo_use_stale http_404;
             proxy_pass http://127.0.0.1:{origin_port}/;
@@ -2731,6 +2738,7 @@ http {{
             cache_turbo          main;
             cache_turbo_key      $uri;
             cache_turbo_valid    1s;
+            cache_turbo_stale_mult 1;
             cache_turbo_keep_stale 1h;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
@@ -2744,6 +2752,7 @@ http {{
             cache_turbo          main;
             cache_turbo_key      $uri;
             cache_turbo_valid    1s;
+            cache_turbo_stale_mult 1;
             cache_turbo_keep_stale 1h;
             cache_turbo_use_stale http_500;
             proxy_pass http://127.0.0.1:{origin_port}/;
@@ -2757,6 +2766,7 @@ http {{
             cache_turbo          main;
             cache_turbo_key      $uri;
             cache_turbo_valid    1s;
+            cache_turbo_stale_mult 1;
             cache_turbo_keep_stale 1h;
             cache_turbo_use_stale off;
             proxy_pass http://127.0.0.1:{origin_port}/;
@@ -2769,6 +2779,7 @@ http {{
             cache_turbo          main;
             cache_turbo_key      $uri;
             cache_turbo_valid    1s;
+            cache_turbo_stale_mult 1;
             cache_turbo_keep_stale 1h;
             cache_turbo_use_stale http_403 http_429;
             proxy_pass http://127.0.0.1:{origin_port}/;
@@ -2777,8 +2788,8 @@ http {{
         # O4.4: the circuit breaker's own on/off switch (cache_turbo_breaker),
         # independent of the threshold/window off-switches the config-parse
         # tests already cover. NO keep_stale/use_stale window here on purpose:
-        # once the entry is past its stale window (1s fresh, x4=4s stale) the
-        # ONLY thing that can still answer a dead origin with a cached body is
+        # once the entry is past its stale window (1s fresh, stale_mult 1 -> 1s
+        # stale) the ONLY thing that can still answer a dead origin with a cached body is
         # the breaker's own any-age fallback (call site 1 in
         # ngx_http_cache_turbo_access_handler) -- so this isolates that call
         # site's routing through breaker_should_consult() rather than
@@ -2788,6 +2799,7 @@ http {{
             cache_turbo                    main;
             cache_turbo_key                $uri;
             cache_turbo_valid               1s;
+            cache_turbo_stale_mult          1;
             cache_turbo_breaker             on;
             cache_turbo_breaker_threshold   1;
             cache_turbo_breaker_window     60s;
@@ -2808,6 +2820,7 @@ http {{
             cache_turbo                    main;
             cache_turbo_key                $uri;
             cache_turbo_valid               1s;
+            cache_turbo_stale_mult          1;
             cache_turbo_breaker             off;
             cache_turbo_breaker_threshold   1;
             cache_turbo_breaker_window     60s;
@@ -2825,6 +2838,7 @@ http {{
             cache_turbo                    brkiz;
             cache_turbo_key                $uri;
             cache_turbo_valid               1s;
+            cache_turbo_stale_mult          1;
             cache_turbo_breaker             on;
             cache_turbo_breaker_threshold   1;
             cache_turbo_breaker_window     60s;
@@ -2837,6 +2851,7 @@ http {{
             cache_turbo                    brkiz;
             cache_turbo_key                $uri;
             cache_turbo_valid               1s;
+            cache_turbo_stale_mult          1;
             cache_turbo_breaker            off;
             cache_turbo_breaker_threshold   1;
             cache_turbo_breaker_window     60s;
@@ -2867,13 +2882,14 @@ http {{
             cache_turbo        sr72z;
             cache_turbo_key    $uri;
             cache_turbo_valid  1s;
+            cache_turbo_stale_mult 1;
             add_header         X-CT-Reason $cache_turbo_serve_reason always;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
         # S7.2: $cache_turbo_serve_reason coverage, STALE-BREAKER + BREAKER-503
-        # arms. Same shape as /s71brk/ (1s fresh, x4=4s stale, threshold=1) but
-        # on sr72z: the /dead key gets primed then trips the breaker OPEN, the
+        # arms. Same shape as /s71brk/ (1s fresh, stale_mult 1 -> 1s stale,
+        # threshold=1) but on sr72z: the /dead key gets primed then trips the breaker OPEN, the
         # /never key is NEVER primed so once the breaker is OPEN it has no
         # armed copy at all and falls into breaker_unavailable() (BREAKER-503).
         # Drives test_serve_reason_variable.
@@ -2881,6 +2897,7 @@ http {{
             cache_turbo                    sr72z;
             cache_turbo_key                $uri;
             cache_turbo_valid               1s;
+            cache_turbo_stale_mult          1;
             cache_turbo_breaker             on;
             cache_turbo_breaker_threshold   1;
             cache_turbo_breaker_window     60s;
@@ -2903,6 +2920,7 @@ http {{
             cache_turbo                    raz;
             cache_turbo_key                $uri;
             cache_turbo_valid               1s;
+            cache_turbo_stale_mult          1;
             cache_turbo_breaker             on;
             cache_turbo_breaker_threshold   1;
             cache_turbo_breaker_window     60s;
@@ -2919,6 +2937,7 @@ http {{
             cache_turbo                    raexpz;
             cache_turbo_key                $uri;
             cache_turbo_valid               1s;
+            cache_turbo_stale_mult          1;
             cache_turbo_breaker             on;
             cache_turbo_breaker_threshold   1;
             cache_turbo_breaker_window     60s;
@@ -2929,13 +2948,14 @@ http {{
         }}
 
         # S7.1: breaker_serves / origin_failures counter coverage. Same shape
-        # as /breakeron/ (1s fresh, x4=4s stale, threshold=1) but on its own
+        # as /breakeron/ (1s fresh, stale_mult 1 -> 1s stale, threshold=1) but on its own
         # zone (s71z) so the admin JSON delta is not polluted by /breakeron/'s
         # or /brkion/'s already-tripped breaker. Drives test_breaker_counters.
         location /s71brk/ {{
             cache_turbo                    s71z;
             cache_turbo_key                $uri;
             cache_turbo_valid               1s;
+            cache_turbo_stale_mult          1;
             cache_turbo_breaker             on;
             cache_turbo_breaker_threshold   1;
             cache_turbo_breaker_window     60s;
@@ -2955,7 +2975,7 @@ http {{
         }}
 
         # O4.5: breaker LIFECYCLE end-to-end. /o45/o45cache is primed then
-        # tripped (same 1s-fresh/x4=4s-stale/threshold=1 shape as /s71brk/) so
+        # tripped (same 1s-fresh/stale_mult-1-1s-stale/threshold=1 shape as /s71brk/) so
         # a re-fetch while OPEN proves zero origin contact (origin.hits_for
         # unchanged) by serving the armed any-age snapshot. /o45/o45cold shares
         # the zone but is NEVER primed, so once OPEN it has no snapshot to
@@ -2977,6 +2997,7 @@ http {{
             cache_turbo                    o45z;
             cache_turbo_key                $uri;
             cache_turbo_valid               1s;
+            cache_turbo_stale_mult           1;
             cache_turbo_breaker              on;
             cache_turbo_breaker_threshold    1;
             cache_turbo_breaker_window      60s;
@@ -3004,6 +3025,7 @@ http {{
             cache_turbo                    o45offz;
             cache_turbo_key                $uri;
             cache_turbo_valid               1s;
+            cache_turbo_stale_mult           1;
             cache_turbo_breaker              off;
             cache_turbo_breaker_threshold    1;
             cache_turbo_breaker_window      60s;
@@ -3052,6 +3074,7 @@ http {{
             cache_turbo                    o45hitposz;
             cache_turbo_key                $uri;
             cache_turbo_valid               1s;
+            cache_turbo_stale_mult          1;
             cache_turbo_keep_stale     forever;
             cache_turbo_breaker              on;
             cache_turbo_breaker_threshold    1;
@@ -3087,6 +3110,7 @@ http {{
             cache_turbo          main;
             cache_turbo_key      $uri;
             cache_turbo_valid    1s;
+            cache_turbo_stale_mult 1;
             cache_turbo_keep_stale off;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
@@ -3108,8 +3132,8 @@ http {{
         # S3.1: a negative-cached 5xx must never overwrite a still-serveable
         # body (cache_turbo_valid 503 1m legitimately negative-caches errors,
         # but that must not let an error blob clobber a good 200 -- the
-        # inverse of outage resilience). Short fresh/stale window (1s / x4=4s)
-        # like /keepstale/ so the entry goes stale quickly; the 503 negative
+        # inverse of outage resilience). Short fresh/stale window (1s / x4=4s,
+        # default stale_mult) so the entry goes stale quickly; the 503 negative
         # cache rule is what a "cache negative responses too" config looks
         # like. Drives test_5xx_never_overwrites_cached_body.
         location /noclobber/ {{
@@ -4198,6 +4222,7 @@ http {{
             cache_turbo                    h73z;
             cache_turbo_key                $uri;
             cache_turbo_valid               1s;
+            cache_turbo_stale_mult          1;
             cache_turbo_breaker             on;
             cache_turbo_breaker_threshold   1;
             cache_turbo_breaker_window     60s;
@@ -5269,7 +5294,7 @@ def test_restore_allocation_failure_fails_closed(ng: Nginx,
 
     ss0, bs0, _ = fetch_raw(ng.port, "/allocfailsie/sieserve-alloc")
     assert ss0 == 200 and bs0, f"SIE allocation-fault prime failed: {ss0}"
-    time.sleep(4.6)  # fully expired, but inside stale-if-error=30
+    time.sleep(1.3)  # fully expired (stale_mult 1: 1s window), but inside stale-if-error=30
     origin.fail = True
     try:
         assert_failed_closed("/allocfailsie/sieserve-alloc", 503,
@@ -6527,7 +6552,7 @@ def test_breaker_arming_gated_on_breaker_enable(ng: Nginx, origin: Origin) -> No
         assert s0 == 200, f"prime failed for {path}: {s0}"
         assert b0, f"prime returned an empty body for {path}"
 
-    time.sleep(4.3)   # past fresh (1s) AND the x4 stale window (4s): L1-expired
+    time.sleep(1.3)   # past fresh (1s), stale_mult 1 -> 1s window: L1-expired
     origin.fail = True
     try:
         s_trip, _, _ = fetch(ng.port, "/breakeron/dead")
@@ -6576,7 +6601,7 @@ def test_breaker_counters(ng: Nginx, origin: Origin) -> None:
     s0, b0, _ = fetch(ng.port, "/s71brk/dead")
     assert s0 == 200 and b0, f"prime failed: {s0} {b0!r}"
 
-    time.sleep(4.3)   # past fresh (1s) AND the x4 stale window (4s): L1-expired
+    time.sleep(1.3)   # past fresh (1s), stale_mult 1 -> 1s window: L1-expired
     origin.fail = True
     try:
         of_before = _admin_stat(ng, "origin_failures", "/_cache_s71")
@@ -6639,7 +6664,7 @@ def test_breaker_retry_after_auto_tracks_breaker_open(ng: Nginx, origin: Origin)
     s0, b0, _ = fetch(ng.port, "/ra1/dead")
     assert s0 == 200 and b0, f"prime failed for /ra1/dead: {s0} {b0!r}"
 
-    time.sleep(4.3)   # past fresh (1s) AND the x4 stale window (4s): L1-expired
+    time.sleep(1.3)   # past fresh (1s), stale_mult 1 -> 1s window: L1-expired
     origin.fail = True
     try:
         s_trip, _, _ = fetch(ng.port, "/ra1/dead")
@@ -6664,7 +6689,7 @@ def test_breaker_retry_after_auto_tracks_breaker_open(ng: Nginx, origin: Origin)
     s0e, b0e, _ = fetch(ng.port, "/ra1exp/dead")
     assert s0e == 200 and b0e, f"prime failed for /ra1exp/dead: {s0e} {b0e!r}"
 
-    time.sleep(4.3)
+    time.sleep(1.3)   # past fresh (1s), stale_mult 1 -> 1s window: L1-expired
     origin.fail = True
     try:
         s_trip_e, _, _ = fetch(ng.port, "/ra1exp/dead")
@@ -6713,7 +6738,7 @@ def test_prometheus_breaker_metrics(ng: Nginx, origin: Origin) -> None:
     s0, b0, _ = fetch(ng.port, "/h73brk/prom")
     assert s0 == 200 and b0, f"prime failed: {s0} {b0!r}"
 
-    time.sleep(4.3)   # past fresh (1s) AND the x4 stale window (4s): L1-expired
+    time.sleep(1.3)   # past fresh (1s), stale_mult 1 -> 1s window: L1-expired
     origin.fail = True
     try:
         _, prom_before, _ = fetch(ng.port, "/_cache_h73?format=prometheus")
@@ -6833,7 +6858,7 @@ def test_breaker_arming_sites_gated_white_box(ng: Nginx, origin: Origin) -> None
         assert b0, f"prime returned an empty body for {path}"
         base[path] = _armings(h0, f"prime {path}", site="l1")
 
-    time.sleep(4.3)   # past fresh (1s) AND the x4 stale window (4s): L1-expired
+    time.sleep(1.3)   # past fresh (1s), stale_mult 1 -> 1s window: L1-expired
     origin.fail = True
     try:
         # --- claim 1: breaker ON arms, so the counter must move ---------------
@@ -7087,7 +7112,7 @@ def test_breaker_lifecycle_open_zero_contact_close(ng: Nginx, origin: Origin) ->
     s0, b0, _ = fetch(ng.port, cached_path)
     assert s0 == 200 and b0, f"prime failed for {cached_path}: {s0} {b0!r}"
 
-    time.sleep(4.3)   # past fresh (1s) AND the x4 stale window (4s): L1-expired
+    time.sleep(1.3)   # past fresh (1s), stale_mult 1 -> 1s window: L1-expired
     origin.fail = True
     try:
         hits_before_trip = origin.hits_for(cached_needle)
@@ -7189,7 +7214,7 @@ def test_breaker_off_negative_control_origin_climbs(ng: Nginx, origin: Origin) -
     s0, b0, _ = fetch(ng.port, path)
     assert s0 == 200 and b0, f"prime failed for {path}: {s0} {b0!r}"
 
-    time.sleep(4.3)   # past fresh (1s) AND the x4 stale window (4s): L1-expired
+    time.sleep(1.3)   # past fresh (1s), stale_mult 1 -> 1s window: L1-expired
     origin.fail = True
     try:
         hits_before = origin.hits_for("o45offprobe")
@@ -7289,7 +7314,7 @@ def test_breaker_record_position_and_sense(ng: Nginx, origin: Origin) -> None:
     # rewritten 200.
     s2, b2, _ = fetch(ng.port, stale_path)
     assert s2 == 200 and b2, f"prime failed for {stale_path}: {s2} {b2!r}"
-    time.sleep(4.3)   # past fresh (1s) AND the x4 stale window (4s)
+    time.sleep(1.3)   # past fresh (1s), stale_mult 1 -> 1s window
     origin.drop = True
     try:
         of_before_stale = _admin_stat(ng, "origin_failures", "/_cache_o45hitpos")
@@ -8819,7 +8844,7 @@ def test_range_on_sie_serve(ng: Nginx, origin: Origin) -> None:
     s0, _, h0 = fetch_raw(ng.port, url)
     assert s0 == 200 and "x-cache" not in h0, f"prime failed: {s0} {h0}"
 
-    time.sleep(4.6)     # past fresh (1s) AND the stale window (x4 = 4s)
+    time.sleep(1.3)     # past fresh (1s), stale_mult 1 -> 1s window
     origin.fail = True
     try:
         s, b, h = fetch_raw(ng.port, url, headers=range_hdr)
@@ -9580,7 +9605,7 @@ def test_serve_reason_variable(ng: Nginx, origin: Origin) -> None:
     STALE  : /sr72/ third fetch, past fresh (1s) but within the x4=4s stale
              window (beta 1 keeps the refresh dice from firing, same
              discipline as test_status_stale).
-    STALE-IF-ERROR : /sr72sie/ fully expired (past the 4s stale window) with
+    STALE-IF-ERROR : /sr72sie/ fully expired (past the stale_mult-1 1s stale window) with
              the origin down; the "sieserve" request-suffix marker armed a
              serve-on-error snapshot on priming (same convention as
              test_sie_serve_on_error).
@@ -9613,7 +9638,7 @@ def test_serve_reason_variable(ng: Nginx, origin: Origin) -> None:
     # STALE-IF-ERROR
     s0, b0, _ = fetch(ng.port, "/sr72sie/sieserve-k1")   # arms sie window
     assert s0 == 200 and b0, f"sie prime failed: {s0} {b0!r}"
-    time.sleep(4.6)                                # past fresh (1s) + stale (4s)
+    time.sleep(1.3)                                # past fresh (1s), stale_mult 1 -> 1s window
     origin.fail = True
     try:
         s_sie, b_sie, h_sie = fetch(ng.port, "/sr72sie/sieserve-k1")
@@ -9630,7 +9655,7 @@ def test_serve_reason_variable(ng: Nginx, origin: Origin) -> None:
     s_prime, b_prime, _ = fetch(ng.port, "/sr72brk/dead")
     assert s_prime == 200 and b_prime, f"breaker prime failed: {s_prime} {b_prime!r}"
 
-    time.sleep(4.3)   # past fresh (1s) AND the x4 stale window (4s): L1-expired
+    time.sleep(1.3)   # past fresh (1s), stale_mult 1 -> 1s window: L1-expired
     origin.fail = True
     try:
         s_trip, _, _ = fetch(ng.port, "/sr72brk/dead")
@@ -9987,7 +10012,7 @@ def test_sie_serve_on_error(ng: Nginx, origin: Origin) -> None:
     sn, bn, _ = fetch(ng.port, "/sieserve/plain-k1")
     assert sn == 200 and bn, f"control prime failed: {sn} {bn!r}"
 
-    time.sleep(4.6)     # past fresh (1s) AND the stale window (x4 = 4s): expired
+    time.sleep(1.3)     # past fresh (1s), stale_mult 1 -> 1s window: expired
     origin.fail = True
     try:
         s, b, h = fetch(ng.port, "/sieserve/sieserve-k1")
@@ -10099,7 +10124,7 @@ def test_sie_serve_on_error_unbuffered(ng: Nginx, origin: Origin) -> None:
     s0, b0, _ = fetch(ng.port, "/siebuf/sieserve-unbuf-k1")
     assert s0 == 200 and b0, f"prime failed: {s0} {b0!r}"
 
-    time.sleep(4.6)     # past fresh (1s) AND the stale window (x4 = 4s): expired
+    time.sleep(1.3)     # past fresh (1s), stale_mult 1 -> 1s window: expired
     origin.fail = True
     try:
         window_start = _errlog_window_start(ng)
@@ -10221,7 +10246,7 @@ def test_sie_serves_counter(ng: Nginx, origin: Origin) -> None:
     sn0, bn0, _ = fetch(ng.port, "/sieserve/plain-cnt-neg")
     assert sn0 == 200 and bn0, f"control prime failed: {sn0} {bn0!r}"
 
-    time.sleep(4.6)     # past fresh (1s) AND the stale window (x4 = 4s): expired
+    time.sleep(1.3)     # past fresh (1s), stale_mult 1 -> 1s window: expired
     origin.fail = True
     try:
         before = _admin_stat(ng, "sie_serves")
@@ -10255,7 +10280,7 @@ def test_sie_origin_recovers_serves_fresh(ng: Nginx, origin: Origin) -> None:
     snapshot."""
     s0, b0, _ = fetch(ng.port, "/sieserve/sieserve-k2")
     assert s0 == 200 and b0, f"prime failed: {s0} {b0!r}"
-    time.sleep(4.6)                                # fully expired
+    time.sleep(1.3)                                # fully expired (stale_mult 1: 1s window)
     s, b, h = fetch(ng.port, "/sieserve/sieserve-k2")
     assert s == 200, f"recovered origin served {s}, expected fresh 200"
     assert b != b0, f"served stale {b!r}, expected a fresh new gen"
@@ -10286,7 +10311,7 @@ def test_keep_stale_serves_dead_origin(ng: Nginx, origin: Origin) -> None:
     sn0, bn0, _ = fetch(ng.port, "/keepstaleoff/x")
     assert sn0 == 200 and bn0, f"control prime failed: {sn0} {bn0!r}"
 
-    time.sleep(4.6)     # past fresh (1s) AND the stale window (x4 = 4s): expired
+    time.sleep(1.3)     # past fresh (1s), stale_mult 1 -> 1s window: expired
     origin.drop = True
     try:
         # Positive: keep_stale covers the outage -> stale body served.
@@ -10336,7 +10361,7 @@ def test_use_stale_http_404(ng: Nginx, origin: Origin) -> None:
     sd0, bd0, _ = fetch(ng.port, "/usestaledefault/x")
     assert sd0 == 200 and bd0, f"default-location prime failed: {sd0} {bd0!r}"
 
-    time.sleep(4.6)     # past fresh (1s) AND the stale window (x4 = 4s): expired
+    time.sleep(1.3)     # past fresh (1s), stale_mult 1 -> 1s window: expired
     origin.fail = True
     try:
         # 1. named status triggers.
@@ -10403,7 +10428,7 @@ def test_use_stale_any_5xx_bit(ng: Nginx, origin: Origin) -> None:
     s500, b500, _ = fetch(ng.port, "/usestale500/y")
     assert s500 == 200 and b500, f"http_500-location prime failed: {s500} {b500!r}"
 
-    time.sleep(4.6)     # fully expired
+    time.sleep(1.3)     # fully expired (stale_mult 1: 1s window)
     origin.fail = True
     origin.fail_status = 507
     try:
@@ -10444,7 +10469,7 @@ def test_use_stale_off(ng: Nginx, origin: Origin) -> None:
     sd0, bd0, _ = fetch(ng.port, "/usestaledefault/z")
     assert sd0 == 200 and bd0, f"default-location prime failed: {sd0} {bd0!r}"
 
-    time.sleep(4.6)     # fully expired
+    time.sleep(1.3)     # fully expired (stale_mult 1: 1s window)
     origin.fail = True
     try:
         s, _, h = fetch(ng.port, "/usestaleoff/z")
@@ -10476,7 +10501,7 @@ def test_use_stale_403_429(ng: Nginx, origin: Origin) -> None:
     s0, b0, _ = fetch(ng.port, "/usestale403429/w")
     assert s0 == 200 and b0, f"prime failed: {s0} {b0!r}"
 
-    time.sleep(4.6)     # fully expired
+    time.sleep(1.3)     # fully expired (stale_mult 1: 1s window)
     origin.fail = True
     try:
         for status in (403, 429):
@@ -12890,7 +12915,7 @@ def test_l2_expired_consults_l2(ng: Nginx, origin: Origin,
     redis.cli("DEL", l2_key(uri))
 
     fetch(ng.port, uri)                            # prime: L1 (valid=1s) + L2
-    time.sleep(4.3)                                # past stale_until (valid*4=4s)
+    time.sleep(1.3)                                # past stale_until (stale_mult 1 -> 1s)
     # both L1 and L2 are expired now; reseed ONLY L2 with a fresh, valid blob
     seeded = b"l2-seeded\n"
     blob = make_ctb4_blob(seeded, headers={"Content-Type": "text/plain"})
