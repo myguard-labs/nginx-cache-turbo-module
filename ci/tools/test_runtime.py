@@ -2398,12 +2398,12 @@ http {{
         # make the ENTIRE response Cache-Control inert, not just the cacheability
         # floor. The origin emits "max-age=1, must-revalidate"; without ignore
         # the must-revalidate token collapses the stale window (like /mrev/), but
-        # with ignore the window stays valid*stale_mult (4s*4 = 16s), so at ~8s
-        # the entry is still STALE-served, not a hard miss. fresh = valid 4s
+        # with ignore the window stays valid*stale_mult (2s*4 = 8s), so at ~4s
+        # the entry is still STALE-served, not a hard miss. fresh = valid 2s
         # (ignore forces honor off). beta 1 ~never rolls a refresh, so the
         # stale read is a clean STALE serve (no dice regen polluting origin).
         #
-        # !! valid is 4s, NOT the 1s the origin declares, and the test's sleep
+        # !! valid is 2s, NOT the 1s the origin declares, and the test's sleep
         # is sized from it. At valid 1s the prime->HIT assert raced the 1s fresh
         # edge: a loaded runner (ASan, busy CI box) taking >1s between the two
         # fetches makes STALE the CORRECT answer and the test fails on box speed,
