@@ -15345,9 +15345,22 @@ def test_autotune_raises_beta_within_band(ng: Nginx, origin: Origin) -> None:
         _fire_misses(ng, "/at/k", 110)           # 110 distinct slow misses
         st = _autotune_force(ng, "/_cache_at")   # recompute over the whole window
 
-        assert 25 <= st["cost_ms"] <= 200, f"cost not measured sanely: {st}"
+        # Lower bound is the real oracle: a 40ms origin MUST show up as a
+        # measured cost, so 0/garbage still fails. The upper bound only rejects
+        # an absurd reading -- a loaded runner (ASan, shared CI) inflates the
+        # observed regen well past the nominal 40ms without the module being
+        # wrong (cost_ms=488 seen on run 31537424551). Beta is asserted below
+        # against the module's own clamp, which is what actually pins the
+        # behaviour, so the band here does not need to be tight.
+        assert 25 <= st["cost_ms"] <= 2000, f"cost not measured sanely: {st}"
+        # beta = clamp(500, cost_ms*1000/20, 3000): any cost_ms >= 60 saturates
+        # at BETA_MAX, so the expected verdict is derived, not hardcoded -- it
+        # stays exact under a stall instead of flaking.
         beta = st["autotuned_beta"]
-        assert 1500 <= beta <= 3000, f"autotuned beta not raised: {st}"
+        expect_beta = max(500, min(st["cost_ms"] * 1000 // 20, 3000))
+        assert beta == expect_beta, \
+            f"autotuned beta {beta} != clamp(500, cost_ms*1000/20, 3000)={expect_beta}: {st}"
+        assert beta >= 1500, f"autotuned beta not raised: {st}"
 
         _, _, hb = fetch(ng.port, "/at/probe")
         _, _, hc = fetch(ng.port, "/atc/probe")
@@ -15712,12 +15725,21 @@ def test_mc_keepalive_zero_does_not_drain_pool(ng: Nginx, origin: Origin,
     assert zero >= 2 * n - 2, \
         f"keepalive=0 location did not dial per op (accepts={zero}, ops={n})"
     # The pool holds 4 idle sockets. If /mcka0/ borrowed them it closed each one
-    # after its op (ka_save refuses to re-pool at keepalive=0), so the warm burst
-    # must re-dial the whole pool. Untouched, the warm burst reuses what is
-    # already pooled and opens (almost) nothing.
-    assert warm <= 1, (
+    # after its op (ka_save refuses to re-pool at keepalive=0), so a drained pool
+    # re-dials essentially per op and `warm` climbs to the connect-per-op level
+    # `zero` (~2N). Untouched, the warm burst reuses what is already pooled.
+    #
+    # Bound is the pool size, not an exact count: the earlier `warm <= 1` form
+    # was over-tight, because `warm` counts accepts across a 4-socket pool shared
+    # with the fire-and-forget SET path, so under ASan a burst can legitimately
+    # re-dial more than one without the pool having been drained. 4 is still far
+    # below the drain level, so the defect this was written for (D-O1 ka_save at
+    # keepalive=0) fails just as loudly.
+    pool_size = 4                # /mcka/ config at the top of this file: keepalive=4
+    assert warm <= pool_size, (
         "the keepalive=0 location drained the shared peer's pool: the warm "
-        f"burst re-dialled {warm} connection(s) (zero={zero}, ops={n})")
+        f"burst re-dialled {warm} connection(s), at/above the pooled-socket count "
+        f"{pool_size} (zero={zero}, ops={n})")
 
 
 def test_mc_keepalive_idle_timeout_drops(ng: Nginx, origin: Origin,
