@@ -1,0 +1,25 @@
+# Files executed or sourced by POSIX sh/perl on Linux (including WSL builds
+# from a Windows checkout) must stay LF: nginx's ./configure sources `config`
+# with sh, which treats a CR as part of the line and fails with
+# "$'\r': command not found" when core.autocrlf=true has smudged the
+# checkout to CRLF.
+config text eol=lf
+*/config text eol=lf
+auto/* text eol=lf
+*.sh text eol=lf
+*.pl text eol=lf
+*.pm text eol=lf
+*.py text eol=lf
+
+# Test::Nginx suites are read by perl and carry inline conf/response
+# fixtures whose byte length is asserted; keep them LF.
+*.t text eol=lf
+
+# Byte-exact fixtures: fuzz corpus entries are raw protocol/header bytes
+# and any EOL conversion corrupts them — a smudged seed silently stops
+# reproducing the crash it was committed for.
+ci/fuzz/corpus/** -text
+ci/fuzz/corpus_*/** -text
+ci/fuzz/regressions/** -text
+ci/fuzz/fuzz.dict* -text
+*.bin -text
