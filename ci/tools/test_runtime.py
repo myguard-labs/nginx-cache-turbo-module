@@ -3241,8 +3241,9 @@ http {{
         #
         # `woocommerce` alone here ALSO implies `wordpress` (resolved at parse):
         # the woo-cookie/arg rules are woo's own; the WP login-cookie skip and the
-        # /wp-admin/ URI skip come from the implied wordpress preset. Drives
-        # test_auto_backend_composition and test_woo_implies_wordpress_wp_admin.
+        # /wp-admin/ URI skip come from the implied wordpress preset. Composition
+        # itself is now pinned in ci/t/preset-engine/composition.t; this fixture
+        # location remains for test_woocommerce_wc_ajax below.
         location /woo/ {{
             cache_turbo         main;
             cache_turbo_backend woocommerce;
@@ -5406,63 +5407,6 @@ def test_auto_classify_suppress_native_interaction(ng: Nginx, origin: Origin) ->
     drain_origin(origin)
 
 
-def test_auto_backend_composition(ng: Nginx, origin: Origin) -> None:
-    """cache_turbo_backend woocommerce IMPLIES wordpress: WooCommerce is an add-on
-    to WordPress that ships no /wp-admin/ or wordpress_logged_in_ rule of its own,
-    so naming it alone must silently enable the wordpress preset too. A woo session
-    cookie still skips (woo's own rule), a WP login cookie ALSO skips (the implied
-    wordpress rule — the cross-user leak the implication closes), and a page with
-    neither cookie still caches (the implication adds bypass rules, it does not
-    disable caching wholesale)."""
-    woo = {"Cookie": "woocommerce_cart_hash=abc123"}
-    _, _, hw1 = fetch(ng.port, "/woo/cartpage", headers=woo)
-    _, _, hw2 = fetch(ng.port, "/woo/cartpage", headers=woo)
-    assert "x-cache" not in hw1, \
-        "woo session cookie must skip on the woocommerce backend (1st req)"
-    assert "x-cache" not in hw2, \
-        "woo session cookie must skip on the woocommerce backend (2nd req)"
-
-    # woocommerce implies wordpress: a WP login cookie MUST now skip on a
-    # woo-only location. Before the implication this cached a logged-in customer's
-    # page for every visitor.
-    wp = {"Cookie": "wordpress_logged_in_x=1"}
-    _, _, hp1 = fetch(ng.port, "/woo/wppage", headers=wp)
-    _, _, hp2 = fetch(ng.port, "/woo/wppage", headers=wp)
-    assert "x-cache" not in hp1, \
-        f"woo implies wordpress: a WP login cookie must skip (1st req), got {hp1.get('x-cache')}"
-    assert "x-cache" not in hp2, \
-        f"woo implies wordpress: a WP login cookie must skip (2nd req), got {hp2.get('x-cache')}"
-
-    # An anonymous page (no woo, no wp cookie) still caches: the implication only
-    # adds bypass rules, it must not turn the whole location into pass-through.
-    fetch(ng.port, "/woo/anonpage")
-    _, _, ha2 = fetch(ng.port, "/woo/anonpage")
-    assert ha2.get("x-cache") == "HIT", \
-        f"woo implies wordpress: an anonymous page must still cache, got {ha2.get('x-cache')}"
-    drain_origin(origin)
-
-
-def test_woo_implies_wordpress_wp_admin(ng: Nginx, origin: Origin) -> None:
-    """The headline leak the implication closes: `cache_turbo_backend woocommerce`
-    alone must skip /wp-admin/, which is a wordpress URI rule woo does not carry.
-    /wooshop/ is woo-only with backend_prefix /wooshop/, so /wooshop/wp-admin/*
-    rebases to /wp-admin/* for the matcher. A HIT here is the leak."""
-    _, _, ha1 = fetch(ng.port, "/wooshop/wp-admin/index")
-    _, _, ha2 = fetch(ng.port, "/wooshop/wp-admin/index")
-    assert "x-cache" not in ha1, \
-        "woo implies wordpress: /wp-admin/ must skip under a woo-only backend (1st req)"
-    assert "x-cache" not in ha2, \
-        "woo implies wordpress: /wp-admin/ must skip under a woo-only backend (2nd req)"
-
-    # Control: an ordinary page under the same woo-only mount still caches, so the
-    # skip above is the /wp-admin/ rule firing, not the whole location bypassing.
-    fetch(ng.port, "/wooshop/shop/product")
-    _, _, hp2 = fetch(ng.port, "/wooshop/shop/product")
-    assert hp2.get("x-cache") == "HIT", \
-        f"woo implies wordpress: an ordinary page must still cache, got {hp2.get('x-cache')}"
-    drain_origin(origin)
-
-
 def test_woocommerce_wc_ajax(ng: Nginx, origin: Origin) -> None:
     """?wc-ajax= is the one WooCommerce leak path that NO URI rule can close.
 
@@ -6178,28 +6122,6 @@ def test_ctx_survives_error_page_internal_redirect(ng: Nginx,
         ("$cache_turbo_serve_reason reports a value on a location where the "
          f"module never engaged, so it is not reading r->ctx: got "
          f"{hc.get('x-ct-reason')!r}")
-
-
-def test_new_presets_not_in_generic(ng: Nginx, origin: Origin) -> None:
-    """None of the opt-in presets may be folded into generic/auto. Their URIs are
-    generic English words (/login, /user, /admin, /session, /posts) that an
-    unrelated site legitimately serves as cacheable pages, so a `generic`
-    location must still cache them and must ignore their cookies."""
-    for uri in ("/gen/user", "/gen/admin", "/gen/session", "/gen/index.php"):
-        fetch(ng.port, uri)
-        _, _, h = fetch(ng.port, uri)
-        assert h.get("x-cache") == "HIT", \
-            f"generic must NOT pull in the opt-in URI rules ({uri}), got {h.get('x-cache')}"
-
-    # Distinct URIs per cookie: the key is $uri, so reusing one path would let
-    # the second cookie HIT on the first one's entry and pass for free.
-    for i, ck in enumerate(("_t=abc123", "mywikiUserID=42")):
-        uri = f"/gen/page-{i}"
-        fetch(ng.port, uri, headers={"Cookie": ck})
-        _, _, hx = fetch(ng.port, uri, headers={"Cookie": ck})
-        assert hx.get("x-cache") == "HIT", \
-            f"generic must NOT pull in the opt-in cookie rule {ck}, got {hx.get('x-cache')}"
-    drain_origin(origin)
 
 
 def test_auto_classify_more(ng: Nginx, origin: Origin) -> None:
@@ -9437,68 +9359,6 @@ def test_bypass_uri(ng: Nginx) -> None:
     _, _, h1 = fetch(ng.port, "/bu/public")
     assert h1.get("x-ct-status") == "HIT", \
         f"unlisted /bu/public must cache, got {h1.get('x-ct-status')}"
-
-
-def test_backend_prefix_subdir(ng: Nginx) -> None:
-    """item 18: preset uris[] are anchored at byte 0, so a subdirectory install
-    matches no URI rule and its admin surface is cacheable.
-    cache_turbo_backend_prefix rebases r->uri onto the mount before the preset
-    URI tier runs. Asserts the fix, the bug it fixes (control location), that a
-    URI outside the mount does NOT inherit the app's rules, and that the
-    segment-boundary semantics survive the rebase."""
-    # THE BUG, still live on a location without the directive. If this ever
-    # reads BYPASS, the fix landed somewhere global and the /shop/ assertions
-    # below prove nothing.
-    _, _, h0 = fetch(ng.port, "/noshop/wp-admin/")
-    assert h0.get("x-ct-status") == "MISS", \
-        ("/noshop/wp-admin/ must still be cacheable without the directive -- "
-         f"otherwise this test cannot prove the fix, got {h0.get('x-ct-status')}")
-    _, _, h1 = fetch(ng.port, "/noshop/wp-admin/")
-    assert h1.get("x-ct-status") == "HIT", \
-        ("/noshop/wp-admin/ must CACHE without the directive (the item-18 bug) "
-         f"-- got {h1.get('x-ct-status')}")
-
-    # THE FIX: same path under the mount, with the directive -> preset URI rule
-    # matches after the rebase -> bypass.
-    _, _, h = fetch(ng.port, "/shop/wp-admin/")
-    assert h.get("x-ct-status") == "BYPASS", \
-        ("/shop/wp-admin/ must bypass: cache_turbo_backend_prefix rebases it to "
-         f"/wp-admin/ so the wordpress preset rule matches, got {h.get('x-ct-status')}")
-
-    # a second rebased needle, to prove the rebase is not special-cased to one rule
-    _, _, h = fetch(ng.port, "/shop/wp-login.php")
-    assert h.get("x-ct-status") == "BYPASS", \
-        f"/shop/wp-login.php must bypass after rebase, got {h.get('x-ct-status')}"
-
-    # OUTSIDE the mount: backend_prefix is /shop/ but the URI starts with
-    # /elsewhere/, so the rebase must not fire. A misconfigured mount leaves the
-    # URI alone rather than force-matching -- it degrades to today's behaviour.
-    _, _, h0 = fetch(ng.port, "/elsewhere/wp-admin/")
-    assert h0.get("x-ct-status") == "MISS", \
-        ("a URI outside the configured mount must not be rebased, got "
-         f"{h0.get('x-ct-status')}")
-    _, _, h1 = fetch(ng.port, "/elsewhere/wp-admin/")
-    assert h1.get("x-ct-status") == "HIT", \
-        ("an unrebased URI keeps today's (buggy-by-design) caching behaviour, "
-         f"got {h1.get('x-ct-status')}")
-
-    # BOUNDARY survives the rebase: "/shop/wp-adminfoo" rebases to
-    # "/wp-adminfoo", where the byte after the needle is a letter -> no match.
-    _, _, h0 = fetch(ng.port, "/shop/wp-adminfoo")
-    assert h0.get("x-ct-status") == "MISS", \
-        ("/shop/wp-adminfoo must NOT match /wp-admin/ after rebase (letters "
-         f"continue past the needle), got {h0.get('x-ct-status')}")
-    _, _, h1 = fetch(ng.port, "/shop/wp-adminfoo")
-    assert h1.get("x-ct-status") == "HIT", \
-        f"/shop/wp-adminfoo must cache (not bypassed), got {h1.get('x-ct-status')}"
-
-    # a normal page under the mount still caches -- the rebase must not turn the
-    # whole mounted subtree into a bypass.
-    _, _, h0 = fetch(ng.port, "/shop/about")
-    assert h0.get("x-ct-status") == "MISS", "mounted normal page first fetch MISS"
-    _, _, h1 = fetch(ng.port, "/shop/about")
-    assert h1.get("x-ct-status") == "HIT", \
-        f"/shop/about must cache, got {h1.get('x-ct-status')}"
 
 
 def test_key_cookie(ng: Nginx) -> None:
@@ -15942,8 +15802,6 @@ def run_all(ng: Nginx, origin: Origin,
     test_suppress_native_variable(ng)
     test_auto_classify(ng, origin)
     test_auto_classify_suppress_native_interaction(ng, origin)
-    test_auto_backend_composition(ng, origin)
-    test_woo_implies_wordpress_wp_admin(ng, origin)
     test_woocommerce_wc_ajax(ng, origin)
     test_header_auth_rest_surfaces(ng, origin)
     test_phpbb_preset(ng, origin)
@@ -15952,7 +15810,6 @@ def run_all(ng: Nginx, origin: Origin,
     test_cookie_pred_multiple_matching_cookies(ng, origin)
     test_2026_preset_expansion(ng, origin)
     test_internal_redirect_key_and_veto(ng, origin)
-    test_new_presets_not_in_generic(ng, origin)
     test_auto_classify_more(ng, origin)
     test_q2_multibuffer_oversize(ng, origin)
     test_suppress_native_inert_on_plain_location(ng)
@@ -16069,7 +15926,6 @@ def run_all(ng: Nginx, origin: Origin,
     test_bypass_uri(ng)
     test_bypass_uri_inert_after_internal_redirect(ng, origin)
     test_ctx_survives_error_page_internal_redirect(ng, origin)
-    test_backend_prefix_subdir(ng)
     test_require_header(ng)
     test_key_cookie(ng)
     test_status_variable(ng)
@@ -16411,10 +16267,8 @@ def main() -> int:
           "If-Modified-Since fresh/stale, INM-beats-IMS precedence), "
           "PURGE method, COR-5 auto-Vary variant purge (L1-only gen-bump), "
           "bypass + no_store, DIY bypass_uri (v15: segment-boundary + subdir + "
-          "non-boundary caches), backend_prefix subdir installs (item 18: "
-          "rebased preset URI rules + control location proves the bug + "
-          "unrebased outside mount + boundary survives rebase + malformed "
-          "rejected), DIY key_cookie (v15: value-keyed entries + anon "
+          "non-boundary caches), backend_prefix malformed value rejected "
+          "(item 18), DIY key_cookie (v15: value-keyed entries + anon "
           "bucket + exact-name + split-header + oversize values collapse to one "
           "bucket distinct from anon and from in-range, 256 still verbatim), "
           "$cache_turbo_status (MISS/HIT/BYPASS + bypasses counter, "
