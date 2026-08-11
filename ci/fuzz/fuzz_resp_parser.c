@@ -264,7 +264,7 @@ check_split_delivery(u_char *buf, size_t size, ngx_pool_t *pool)
 {
     if (size >= 2) {
         u_char    *whole = NULL;
-        size_t     whole_len = 0, split;
+        size_t     whole_len = 0, split, reply_end;
         ngx_int_t  rc_whole;
 
         /* Reference verdict: the identical bytes parsed in one piece. */
@@ -293,6 +293,42 @@ check_split_delivery(u_char *buf, size_t size, ngx_pool_t *pool)
                 whole_len = blob_len;
             }
             ngx_fuzz_pool_reset(pool);
+        }
+
+        /* Where does the reply actually END? Not necessarily at `size`: the
+         * input may carry trailing bytes the parser never consumes, and a
+         * zero-length bulk string ($0\r\n\r\n) reaches its verdict in five
+         * bytes no matter how much follows. The prefix oracle below is only
+         * valid for a split INSIDE the reply, so find the shortest prefix that
+         * already parses to the same verdict and treat that as the boundary.
+         *
+         * The parser reports no consumed length, so this is a linear probe.
+         * It costs another O(size) parses over an input libFuzzer keeps short,
+         * which is cheaper than an oracle that fires on valid input. */
+        reply_end = size;
+
+        if (rc_whole == NGX_OK) {
+            size_t  probe;
+
+            for (probe = 1; probe <= size; probe++) {
+                ngx_http_cache_turbo_redis_op_t  pop;
+                u_char  *pblob = NULL;
+                size_t   pblob_len = 0;
+
+                pop.rbuf = buf;
+                pop.rlen = probe;
+                pop.pool = pool;
+                pop.rpool = pool;
+
+                if (ngx_http_cache_turbo_redis_parse(&pop, &pblob, &pblob_len)
+                    == NGX_OK)
+                {
+                    reply_end = probe;
+                    ngx_fuzz_pool_reset(pool);
+                    break;
+                }
+                ngx_fuzz_pool_reset(pool);
+            }
         }
 
         /* Sweep EVERY boundary rather than sampling one. The reply is short
@@ -352,8 +388,17 @@ check_split_delivery(u_char *buf, size_t size, ngx_pool_t *pool)
                      * complete answer: the parser must ask for more, not invent
                      * a verdict from truncated bytes. (Only checked when the
                      * whole reply parses — for malformed input the parser is
-                     * entitled to reject the prefix outright.) */
-                    if (rc_whole == NGX_OK && rc == NGX_OK) {
+                     * entitled to reject the prefix outright.)
+                     *
+                     * Only splits strictly INSIDE the reply qualify. A split at
+                     * or past `reply_end` hands over a complete reply plus
+                     * surplus bytes, and NGX_OK is then the correct answer, not
+                     * a verdict invented from a truncated one. Gating on `size`
+                     * instead of `reply_end` made this trap fire on the
+                     * perfectly legal $0\r\n\r\n followed by trailing bytes. */
+                    if (rc_whole == NGX_OK && rc == NGX_OK
+                        && split < reply_end)
+                    {
                         __builtin_trap();  /* answered from a partial reply */
                     }
                     continue;
