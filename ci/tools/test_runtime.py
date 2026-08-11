@@ -3104,9 +3104,9 @@ http {{
 
         # Precedence test: both a response stale-if-error AND cache_turbo_keep_stale
         # are in play here. keep_stale is a generous 1h baseline; the response's
-        # own stale-if-error=3 (via the "sieshort" request-suffix marker -- a
+        # own stale-if-error=5 (via the "sieshort" request-suffix marker -- a
         # short-window sibling of the "sieserve" convention used by /sieserve/)
-        # must WIN -- sie_window = ttl + 3, not ttl + 3600 and not max() of the
+        # must WIN -- sie_window = ttl + 5, not ttl + 3600 and not max() of the
         # two. Drives test_keep_stale_loses_to_response_sie.
         location /keepstalewins/ {{
             cache_turbo          main;
@@ -10524,7 +10524,7 @@ def test_keep_stale_loses_to_response_sie(ng: Nginx, origin: Origin) -> None:
     the location's own stale window -- stale_mult default 4 x 1s fresh = 4s --
     so phase 1 below lands inside the SIE window, not the ordinary stale one).
     If the precedence were max(), sie_window would be ttl+3600 and a request
-    timed at ttl+~6.5s (well past the response SIE window but nowhere near the
+    timed at ttl+~7.5s (well past the response SIE window but nowhere near the
     keep_stale window) would still serve stale. The correct precedence
     (response SIE wins outright, keep_stale is not consulted at all) makes that
     same request surface the dead origin's error instead."""
@@ -10558,7 +10558,11 @@ def test_keep_stale_loses_to_response_sie(ng: Nginx, origin: Origin) -> None:
     # a max(). Re-prime first: phase 1 left the entry untouched (a stale serve
     # does not re-store), so its absolute sie deadline is still ~6s from the
     # ORIGINAL store -- sleeping the remainder is what crosses it.
-    time.sleep(1.9)    # ~6.5s total since the store: response SIE expired
+    # 2.9s (not the bare 1.4s that would just clear 6s): overshooting the sie
+    # deadline is free -- keep_stale runs to 3600s, so any time between 6s and
+    # 3600s discriminates identically. The margin is deliberate; this box runs
+    # loaded and a 0.5s cushion turns a correct test into a flake.
+    time.sleep(2.9)    # ~7.5s total since the store: response SIE expired
     origin.fail = True
     try:
         s2, _, h2 = fetch(ng.port, "/keepstalewins/sieshort-p1")
