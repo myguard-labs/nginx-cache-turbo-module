@@ -4959,6 +4959,43 @@ def wait_for(predicate, timeout: float = 3.0, interval: float = 0.05) -> bool:
     return False
 
 
+def wait_for_l2_absent(redis, key: str, what: str = "",
+                       timeout: float = 2.0, interval: float = 0.02) -> None:
+    """Wait until `key` is GONE from L2, then return.
+
+    The counterpart to wait_for_l2 below, and the ordering primitive a test
+    needs between an L2-aware PURGE and a set_raw() that writes the key back.
+
+    PURGE returning 200 means the module ACCEPTED the purge, not that the Redis
+    DEL has already been executed. A test that PURGEs and immediately
+    set_raw()s the same key is racing the module: when the DEL lands late it
+    deletes the blob the test just wrote, and the failure surfaces at the NEXT
+    read as "the value I wrote is absent" -- which reads as Redis latency and
+    was mis-ledgered as exactly that three times.
+
+    Waiting for absence first makes the write unambiguously the last operation
+    on the key. Deliberately NOT a swallow: a key still present at the deadline
+    raises, because that means the purge genuinely did not happen and the test
+    that follows would be testing the wrong object
+    ([[feedback-widening-shared-timeout-disables-oracle]])."""
+    start = time.monotonic()
+    while True:
+        if redis.get_raw(key) is None:
+            return
+        remaining = timeout - (time.monotonic() - start)
+        if remaining <= 0:
+            break
+        time.sleep(min(interval, remaining))
+
+    elapsed = time.monotonic() - start
+    label = f" for {what}" if what else ""
+    raise AssertionError(
+        f"L2 key{label} still present {elapsed:.2f}s after PURGE returned 200 "
+        f"(timeout {timeout:.2f}s): key={key!r}\n"
+        f"  The module accepted the purge but the Redis DEL never landed, so "
+        f"anything written to this key now may still be deleted afterwards.")
+
+
 def wait_for_l2(redis, key: str, expected: bytes, what: str = "",
                 timeout: float = 2.0, interval: float = 0.02) -> None:
     """Assert that `key` holds exactly `expected` in L2, allowing a bounded
@@ -7001,6 +7038,10 @@ def test_breaker_l2_arming_site_gated_white_box(ng: Nginx, origin: Origin,
     for path, (key, blob, stale_ttl) in blobs.items():
         s_p, b_p, _ = fetch_raw(ng.port, path, method="PURGE")
         assert s_p == 200, f"PURGE {path} -> {s_p}: {b_p}"
+        # PURGE 200 means accepted, not that the Redis DEL ran. Wait for the
+        # key to actually vanish before writing the aged blob, or a late DEL
+        # deletes what we write and the next read reports it absent.
+        wait_for_l2_absent(redis, key, what=f"PURGE of {path}")
         aged = (blob[:24]
                 + struct.pack("<q", int(time.time()) - (int(stale_ttl) + 60))
                 + blob[32:])
@@ -7052,6 +7093,8 @@ def test_breaker_l2_arming_site_gated_white_box(ng: Nginx, origin: Origin,
         okey, oblob, ostale = blobs["/brkil2off/dead"]
         s_p2, b_p2, _ = fetch_raw(ng.port, "/brkil2off/dead", method="PURGE")
         assert s_p2 == 200, f"re-PURGE /brkil2off/dead -> {s_p2}: {b_p2}"
+        wait_for_l2_absent(redis, okey,
+                           what="re-PURGE of /brkil2off/dead")
         oaged = (oblob[:24]
                  + struct.pack("<q", int(time.time()) - (int(ostale) + 60))
                  + oblob[32:])
@@ -13479,6 +13522,7 @@ def test_l2_unserveable_giveup_still_single_flights(
     # deletes the very object under test and the burst sees a plain cold miss.
     s_p, b_p, _ = fetch_raw(ng.port, uri, method="PURGE")
     assert s_p == 200, f"PURGE status {s_p}: {b_p}"
+    wait_for_l2_absent(redis, key, what="PURGE of /sfgu/ before the aged write")
     aged = blob[:24] + struct.pack("<q", int(time.time()) - 60) + blob[32:]
     redis.set_raw(key, aged, 3_600_000)
     wait_for_l2(redis, key, aged, what="aged blob for /sfgu/ give-up")
