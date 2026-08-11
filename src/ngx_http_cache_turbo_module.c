@@ -11334,6 +11334,47 @@ ngx_http_cache_turbo_warm_one(ngx_http_request_t *r, ngx_str_t *uri,
 
 
 /*
+ * ngx_http_subrequest() does NOT run ngx_http_parse_complex_uri() on the URI
+ * we hand it -- that normalization only happens for a real client request
+ * line, before any module sees it. A hand-built subrequest URI goes straight
+ * into sr->uri and location matching verbatim, so a percent-decoded "?url="
+ * value must be validated ourselves: reject an embedded NUL (truncates
+ * downstream ngx_str_t-vs-C-string consumers, e.g. proxy_pass URI
+ * construction or $uri in a log format) and reject any ".." path segment
+ * (traversal past the intended location, e.g. "/%2e%2e/%2e%2e/etc/x").
+ * Returns 1 if `uri` is safe to warm, 0 if it must be skipped.
+ */
+static ngx_uint_t
+ngx_http_cache_turbo_warm_uri_is_safe(ngx_str_t *uri)
+{
+    u_char  *p, *last, *seg;
+
+    last = uri->data + uri->len;
+
+    for (p = uri->data; p < last; p++) {
+        if (*p == '\0') {
+            return 0;
+        }
+    }
+
+    /* uri->data[0] == '/' is guaranteed by the caller, so every segment
+     * starts right after a '/'. Walk segments delimited by '/' and reject
+     * one that is exactly "..". */
+    seg = uri->data + 1;
+    for (p = seg; p <= last; p++) {
+        if (p == last || *p == '/') {
+            if (p - seg == 2 && seg[0] == '.' && seg[1] == '.') {
+                return 0;
+            }
+            seg = p + 1;
+        }
+    }
+
+    return 1;
+}
+
+
+/*
  * POST /_cache?url=<path[,path,...]> — warm each comma-separated path. Each path
  * is percent-decoded (so an encoded URL still resolves) and an optional "?query"
  * suffix is passed through as the subrequest args. Only absolute paths ('/'...)
@@ -11388,6 +11429,7 @@ ngx_http_cache_turbo_warm(ngx_http_request_t *r, ngx_str_t *urls)
                 }
 
                 if (uri.len > 0 && uri.data[0] == '/'
+                    && ngx_http_cache_turbo_warm_uri_is_safe(&uri)
                     && ngx_http_cache_turbo_warm_one(r, &uri, &args) == NGX_OK)
                 {
                     warmed++;
