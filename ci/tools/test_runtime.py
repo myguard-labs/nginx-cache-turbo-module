@@ -747,6 +747,55 @@ class Origin:
                     except BrokenPipeError:
                         pass
                     return
+                if "unbuf-stream" in self.path:
+                    # UNBUF: streamed multi-call capture on the SUCCESS path
+                    # (the "sieserve-unbuf" marker above only fires under
+                    # origin.fail). Each chunk is distinct (an index-tagged
+                    # line) so a truncated, reordered or short capture is
+                    # detectable byte-for-byte, not just non-empty. Many
+                    # flushed writes, well beyond proxy_buffer_size's default
+                    # one 4k page, force the body filter to run across
+                    # multiple invocations instead of nginx's upstream
+                    # preread coalescing everything into one recv().
+                    n_chunks = 16
+                    chunks = [f"chunk-{n}-{i:02d}-".encode() + b"Q" * 4000
+                              + b"\n" for i in range(n_chunks)]
+                    body = b"".join(chunks)
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    try:
+                        for c in chunks:
+                            self.wfile.write(c)
+                            self.wfile.flush()
+                            time.sleep(0.02)
+                    except BrokenPipeError:
+                        pass
+                    return
+                if "unbuf-big" in self.path:
+                    # UNBUF oversize: same streamed-chunk shape as
+                    # unbuf-stream, but ~64 KiB total against a small
+                    # cache_turbo_max_size (see /unbufbig/) so the limit is
+                    # crossed on a LATER filter invocation, not the first
+                    # buffer -- exercising the mid-stream early-abort path
+                    # instead of the single-buffer case /big/ already covers.
+                    n_chunks = 16
+                    chunks = [f"big-{n}-{i:02d}-".encode() + b"Z" * 4000
+                              + b"\n" for i in range(n_chunks)]
+                    body = b"".join(chunks)
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    try:
+                        for c in chunks:
+                            self.wfile.write(c)
+                            self.wfile.flush()
+                            time.sleep(0.02)
+                    except BrokenPipeError:
+                        pass
+                    return
                 if "ckecho" in self.path:
                     # B-S4: echo the received Cookie header so a test can prove a
                     # warm subrequest reaches the origin ANONYMOUSLY (with none of
@@ -2609,6 +2658,35 @@ http {{
             cache_turbo          main;
             cache_turbo_key      $uri;
             cache_turbo_valid    1s;
+            proxy_buffering       off;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # UNBUF: proxy_buffering off with an ordinary (non-error) streamed
+        # multi-chunk origin body. /siebuf/ above only drives the SIE
+        # serve-on-error body-filter consume path; this location covers the
+        # ordinary capture/store + HIT-serve path under the SAME
+        # multi-invocation body filter, exercising ctx->body_last append and
+        # last_buf/last_in_chain accumulation across calls. Drives
+        # test_unbuf_streamed_store_and_hit.
+        location /unbuf/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    30s;
+            proxy_buffering       off;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # UNBUF oversize: same proxy_buffering off + streamed multi-chunk
+        # origin body as /unbuf/, but with a small cache_turbo_max_size so the
+        # limit is crossed MID-STREAM on a later body-filter invocation
+        # rather than on the first buffer. Drives
+        # test_unbuf_oversize_abort_mid_stream.
+        location /unbufbig/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    30s;
+            cache_turbo_max_size 8k;
             proxy_buffering       off;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
@@ -10300,6 +10378,61 @@ def test_sie_serve_on_error_unbuffered(ng: Nginx, origin: Origin) -> None:
         drain_origin(origin)
 
 
+def test_unbuf_streamed_store_and_hit(ng: Nginx) -> None:
+    """proxy_buffering off coverage gap: ordinary capture/store + HIT serve
+    when the origin body arrives as MANY flushed body-filter invocations
+    instead of one coalesced chain. /siebuf/ only drives the SIE
+    serve-on-error consume path; this proves the everyday store path is
+    correct under the same multi-call streaming, exercising
+    ctx->body_last append-cursor accumulation and last_buf detection across
+    calls. A truncated or reordered capture must fail: assert full length
+    AND byte-identity, not just non-empty."""
+    s0, b0, h0 = fetch(ng.port, "/unbuf/unbuf-stream-k1")
+    assert s0 == 200, f"prime fetch returned {s0}"
+    assert "x-cache" not in h0, f"prime should MISS, got {h0.get('x-cache')}"
+    assert len(b0) > 60000, f"prime body suspiciously short: {len(b0)} bytes"
+
+    s1, b1, h1 = fetch(ng.port, "/unbuf/unbuf-stream-k1")
+    assert s1 == 200, f"second fetch returned {s1}"
+    assert h1.get("x-cache") == "HIT", \
+        f"expected HIT after streamed store, got x-cache={h1.get('x-cache')}"
+    assert len(b1) == len(b0), \
+        f"HIT body length {len(b1)} != origin body length {len(b0)} " \
+        f"-- streamed capture was truncated or padded"
+    assert b1 == b0, "HIT body differs from the primed origin body byte-for-byte"
+
+
+def test_unbuf_oversize_abort_mid_stream(ng: Nginx, origin: Origin) -> None:
+    """proxy_buffering off + cache_turbo_max_size: the oversize origin body
+    (~64 KiB, streamed as 16 flushed chunks) crosses the 8k cap on a LATER
+    body-filter invocation, not the first buffer -- unlike test_max_size_not_
+    cached's /big/ (single-buffer, buffered upstream). Delegation must still
+    deliver the response COMPLETE and byte-correct to the client (no
+    truncation), and the entry must never be cached."""
+    s0, b0, h0 = fetch(ng.port, "/unbufbig/unbuf-big-k1")
+    assert s0 == 200, f"oversize streamed fetch returned {s0}"
+    assert "x-cache" not in h0, \
+        f"oversize response must not be served from cache: {h0.get('x-cache')}"
+    assert len(b0) > 60000, \
+        f"oversize body truncated by the mid-stream abort: {len(b0)} bytes"
+    assert b0.startswith("big-"), "oversize body missing its origin marker"
+    assert b0.endswith("\n"), \
+        "oversize body does not end cleanly -- looks truncated mid-chunk"
+
+    # Re-fetch: must still be a live MISS (never cached), and origin must be
+    # contacted again (distinct generation-tagged body).
+    hits_before = origin.hits
+    s1, b1, h1 = fetch(ng.port, "/unbufbig/unbuf-big-k1")
+    assert s1 == 200, f"second oversize fetch returned {s1}"
+    assert "x-cache" not in h1, \
+        f"oversize entry must not have been cached: {h1.get('x-cache')}"
+    assert origin.hits > hits_before, \
+        "second fetch did not reach the origin -- oversize entry may have " \
+        "been served from a cache after all"
+    assert len(b1) == len(b0), \
+        f"second oversize body length {len(b1)} != first {len(b0)}"
+
+
 def test_sie_serves_counter(ng: Nginx, origin: Origin) -> None:
     """S7.1: sie_serves counts responses actually served from a stale-if-error
     snapshot -- ngx_http_cache_turbo_sie_rewrite() winning inside the header
@@ -16078,6 +16211,8 @@ def run_all(ng: Nginx, origin: Origin,
     test_stale_serves_stale_origin_hard_dead(ng, origin)
     test_sie_serve_on_error(ng, origin)                     # RFC-2 CTB4 serve-on-error
     test_sie_serve_on_error_unbuffered(ng, origin)          # AUD-SIE-BODY proxy_buffering off
+    test_unbuf_streamed_store_and_hit(ng)                   # UNBUF streamed store + HIT round-trip
+    test_unbuf_oversize_abort_mid_stream(ng, origin)        # UNBUF oversize mid-stream abort
     test_sie_serves_counter(ng, origin)                     # S7.1 sie_serves counter
     test_sie_origin_recovers_serves_fresh(ng, origin)       # RFC-2 success not hijacked
     test_keep_stale_serves_dead_origin(ng, origin)          # S2.2 keep_stale fallback
