@@ -1905,13 +1905,26 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
         # oracle is the lock_waits counter, so nothing here waits out a
         # timeout -- lock_timeout stays short to bound the buggy-build park.
         location /storefail/ {{
-            cache_turbo                  main;
+            cache_turbo                  storefailz;
             cache_turbo_key              $uri;
             cache_turbo_valid            30s;
             cache_turbo_lock_ttl         30s;
             cache_turbo_lock_timeout     2s;
             cache_turbo_test_store_fail  on;
             proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # AUD-STORE-ERR-STUB: admin endpoint for /storefail/'s private zone
+        # (storefailz), same reasoning as /_cache_s71 -- /_cache is bound to
+        # `main` and would read a lock_waits counter this zone never writes,
+        # and (unlike s71z) `main` is never quiescent: it is shared by 166
+        # other locations, so an exact-equality assert against it is
+        # order-dependent on whatever else in the suite happens to park in
+        # cold_wait() between this test's two samples.
+        location = /_cache_storefail {{
+            cache_turbo_admin    storefailz;
+            allow 127.0.0.1;
+            deny all;
         }}
 """
 
@@ -2101,6 +2114,14 @@ http {{
     # here, same "own zone" reasoning as s71z/h73z/sr72z above.
     cache_turbo_zone name=raz 16m;
     cache_turbo_zone name=raexpz 16m;
+    # AUD-STORE-ERR-STUB: private zone for /storefail/'s lock_waits oracle.
+    # NOT `main` -- `main` is shared by 166 other test locations, including
+    # test_cold_single_flight's 40 deliberately-parking concurrent readers,
+    # whose stragglers can land between this test's w0/w1 samples and move
+    # the exact-equality assert on an unrelated build (see
+    # test_store_failure_cleans_up_cold_stub). Own zone + own admin endpoint
+    # (/_cache_storefail) makes the assert observe only /storefail/ traffic.
+    cache_turbo_zone name=storefailz 16m;
 
     # Q1 end-to-end: stacked native proxy_cache, one zone per suppress mode, so
     # a test can prove cache_turbo_suppress_native actually keeps the native
@@ -10876,9 +10897,12 @@ def test_background_update_off_regenerates_inline(ng: Nginx,
         "bg-off winner should serve a freshly regenerated body inline"
 
 
-def _admin_lock_waits(ng: Nginx) -> int:
+def _admin_lock_waits(ng: Nginx, path: str = "/_cache") -> int:
+    """Default path reads zone `main`'s admin endpoint; pass path= for a
+    private-zone endpoint like /_cache_s71 or /_cache_storefail so the
+    lock_waits delta is not polluted by unrelated locations sharing `main`."""
     import json
-    _, b, _ = fetch(ng.port, "/_cache")
+    _, b, _ = fetch(ng.port, path)
     return int(json.loads(b).get("lock_waits", 0))
 
 
@@ -10982,24 +11006,29 @@ def test_store_failure_cleans_up_cold_stub(ng: Nginx, origin: Origin) -> None:
     not exist. lock_ttl is 30s here so the lease cannot expire out from under
     the assertion and turn a park into an adopt.
 
+    /storefail/ binds its OWN zone (storefailz), not `main` -- `main` is
+    shared by 166 other test locations, including test_cold_single_flight's
+    40 deliberately-parking concurrent readers, and a straggler from that
+    (or any other) test landing between this test's w0/w1 samples used to
+    break the exact-equality assert on an unrelated build. Reading
+    lock_waits off /_cache_storefail (storefailz's own admin endpoint)
+    instead of /_cache (zone `main`) makes the delta observe only
+    /storefail/'s own traffic, so the exact-equality assert is meaningful
+    again.
+
     Fixed build: request 1's cleanup unstubs (store failed => cold_stored
     stays 0), request 2 claims a virgin key, lock_waits does not move.
     Buggy build: the stub survives with a live lease, request 2 parks,
     lock_waits increments."""
-    def lock_waits() -> int:
-        import json
-        _, b, _ = fetch(ng.port, "/_cache")
-        return int(json.loads(b).get("lock_waits", 0))
-
     uri = f"/storefail/stub-{time.time()}"
 
-    w0 = lock_waits()
+    w0 = _admin_lock_waits(ng, "/_cache_storefail")
     s1, b1, _ = fetch(ng.port, uri)
     assert s1 == 200 and b1, f"cold-miss winner (store forced to fail) failed: {s1}"
 
     s2, b2, _ = fetch(ng.port, uri)
     assert s2 == 200 and b2, f"second request after failed store got {s2}"
-    w1 = lock_waits()
+    w1 = _admin_lock_waits(ng, "/_cache_storefail")
 
     assert w1 == w0, (
         f"lock_waits moved {w0} -> {w1}: the second request parked in "
