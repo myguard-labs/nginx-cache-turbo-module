@@ -11307,6 +11307,21 @@ ngx_http_cache_turbo_warm_one(ngx_http_request_t *r, ngx_str_t *uri,
         return NGX_ERROR;
     }
 
+    /* Seed the ctx FIRST, before anything below that can fail. A background
+     * subrequest cannot be unwound once ngx_http_subrequest() has posted it, so
+     * an early return here leaves `sr` live but ctx-less -- and the body filter
+     * treats a NULL ctx as "not ours" and FORWARDS the body
+     * (ngx_http_cache_turbo_body_filter, ctx == NULL arm). A warm subrequest
+     * whose body is forwarded rather than captured is the documented s84
+     * shutdown-hang condition. Allocating the ctx up front means every failure
+     * arm below leaves a subrequest that is still recognisably ours. */
+    wctx = ngx_pcalloc(sr->pool, sizeof(ngx_http_cache_turbo_ctx_t));
+    if (wctx == NULL) {
+        return NGX_ERROR;
+    }
+    wctx->warm = 1;
+    ngx_http_set_ctx(sr, wctx, ngx_http_cache_turbo_module);
+
     /* Warm anonymously: strip inherited cookies so both the cache key and the
      * upstream request are the cookieless anonymous variant a visitor gets. */
     if (ngx_http_cache_turbo_warm_anonymize(sr) != NGX_OK) {
@@ -11321,13 +11336,6 @@ ngx_http_cache_turbo_warm_one(ngx_http_request_t *r, ngx_str_t *uri,
      * suppresses that streaming and the warm entry is never populated
      * (test_warm_populates). */
     sr->header_only = 0;
-
-    wctx = ngx_pcalloc(sr->pool, sizeof(ngx_http_cache_turbo_ctx_t));
-    if (wctx == NULL) {
-        return NGX_ERROR;
-    }
-    wctx->warm = 1;
-    ngx_http_set_ctx(sr, wctx, ngx_http_cache_turbo_module);
 
     return NGX_OK;
 }
