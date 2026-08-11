@@ -1427,8 +1427,8 @@ ngx_http_cache_turbo_header_find(ngx_list_t *headers, const char *name,
  * comma-joined line would give under cc_delta's existing first-match rule.
  */
 static ngx_int_t
-ngx_http_cache_turbo_cc_has_all(ngx_list_t *headers, const char *name,
-    size_t nlen)
+ngx_http_cache_turbo_cc_has_all(ngx_list_t *headers, const char *hname,
+    size_t hnlen, const char *name, size_t nlen)
 {
     ngx_list_part_t  *part = &headers->part;
     ngx_table_elt_t  *h = part->elts;
@@ -1443,12 +1443,10 @@ ngx_http_cache_turbo_cc_has_all(ngx_list_t *headers, const char *name,
             h = part->elts;
             i = 0;
         }
-        if (h[i].hash == 0 || h[i].key.len != sizeof("Cache-Control") - 1) {
+        if (h[i].hash == 0 || h[i].key.len != hnlen) {
             continue;
         }
-        if (ngx_strncasecmp(h[i].key.data, (u_char *) "Cache-Control",
-                             sizeof("Cache-Control") - 1) != 0)
-        {
+        if (ngx_strncasecmp(h[i].key.data, (u_char *) hname, hnlen) != 0) {
             continue;
         }
         if (ngx_http_cache_turbo_cc_has(h[i].value.data,
@@ -1462,9 +1460,18 @@ ngx_http_cache_turbo_cc_has_all(ngx_list_t *headers, const char *name,
 }
 
 
+/*
+ * Generalized over the header NAME (CQ-3 follow-up, AUD2-CC-TARGETED): the
+ * targeted freshness headers Surrogate-Control / CDN-Cache-Control share the
+ * same combinable-field-line semantics as Cache-Control (RFC 9110 §5.3), so
+ * their TTL selection needs the same every-line walk that response_cacheable()
+ * already applies to all three names on the veto path. Single-line lookup via
+ * header_find() only sees the FIRST field-line; a later line carrying the
+ * authoritative max-age/s-maxage was silently ignored.
+ */
 static time_t
-ngx_http_cache_turbo_cc_delta_all(ngx_list_t *headers, const char *name,
-    size_t nlen)
+ngx_http_cache_turbo_cc_delta_all(ngx_list_t *headers, const char *hname,
+    size_t hnlen, const char *name, size_t nlen)
 {
     ngx_list_part_t  *part = &headers->part;
     ngx_table_elt_t  *h = part->elts;
@@ -1480,12 +1487,10 @@ ngx_http_cache_turbo_cc_delta_all(ngx_list_t *headers, const char *name,
             h = part->elts;
             i = 0;
         }
-        if (h[i].hash == 0 || h[i].key.len != sizeof("Cache-Control") - 1) {
+        if (h[i].hash == 0 || h[i].key.len != hnlen) {
             continue;
         }
-        if (ngx_strncasecmp(h[i].key.data, (u_char *) "Cache-Control",
-                             sizeof("Cache-Control") - 1) != 0)
-        {
+        if (ngx_strncasecmp(h[i].key.data, (u_char *) hname, hnlen) != 0) {
             continue;
         }
         t = ngx_http_cache_turbo_cc_delta(h[i].value.data,
@@ -1518,52 +1523,51 @@ ngx_http_cache_turbo_cc_delta_all(ngx_list_t *headers, const char *name,
 static time_t
 ngx_http_cache_turbo_upstream_ttl(ngx_http_request_t *r)
 {
-    ngx_str_t  cc, expires, sc, cdn;
+    ngx_str_t  expires;
     time_t     t;
 
-    sc = ngx_http_cache_turbo_header_find(&r->headers_out.headers,
-             "Surrogate-Control", sizeof("Surrogate-Control") - 1);
-    cdn = ngx_http_cache_turbo_header_find(&r->headers_out.headers,
-             "CDN-Cache-Control", sizeof("CDN-Cache-Control") - 1);
-    cc = ngx_http_cache_turbo_header_find(&r->headers_out.headers,
-             "Cache-Control", sizeof("Cache-Control") - 1);
     expires = ngx_http_cache_turbo_header_find(&r->headers_out.headers,
              "Expires", sizeof("Expires") - 1);
 
-    /* 1. Surrogate-Control: only max-age is defined for freshness (no s-maxage). */
-    if (sc.data != NULL) {
-        t = ngx_http_cache_turbo_cc_delta(sc.data, sc.data + sc.len, "max-age",
-                                          sizeof("max-age") - 1);
-        if (t >= 0) {
-            return t;
-        }
+    /*
+     * 1. Surrogate-Control: only max-age is defined for freshness (no
+     * s-maxage). Multi-line-safe (AUD2-CC-TARGETED): a later field-line
+     * carrying max-age is just as binding as the first (RFC 9110 §5.3), so
+     * this walks every Surrogate-Control line rather than only the first.
+     */
+    t = ngx_http_cache_turbo_cc_delta_all(&r->headers_out.headers,
+            "Surrogate-Control", sizeof("Surrogate-Control") - 1,
+            "max-age", sizeof("max-age") - 1);
+    if (t >= 0) {
+        return t;
     }
 
-    /* 2. CDN-Cache-Control: s-maxage wins over max-age, same as Cache-Control. */
-    if (cdn.data != NULL) {
-        u_char  *cdn_last = cdn.data + cdn.len;
-
-        t = ngx_http_cache_turbo_cc_delta(cdn.data, cdn_last, "s-maxage",
-                                          sizeof("s-maxage") - 1);
-        if (t < 0) {
-            t = ngx_http_cache_turbo_cc_delta(cdn.data, cdn_last, "max-age",
-                                              sizeof("max-age") - 1);
-        }
-        if (t >= 0) {
-            return t;
-        }
-    }
-
-    if (cc.data != NULL) {
+    /*
+     * 2. CDN-Cache-Control: s-maxage wins over max-age, same as
+     * Cache-Control. Multi-line-safe for the same reason as arm 1.
+     */
+    t = ngx_http_cache_turbo_cc_delta_all(&r->headers_out.headers,
+            "CDN-Cache-Control", sizeof("CDN-Cache-Control") - 1,
+            "s-maxage", sizeof("s-maxage") - 1);
+    if (t < 0) {
         t = ngx_http_cache_turbo_cc_delta_all(&r->headers_out.headers,
-                "s-maxage", sizeof("s-maxage") - 1);
-        if (t < 0) {
-            t = ngx_http_cache_turbo_cc_delta_all(&r->headers_out.headers,
-                    "max-age", sizeof("max-age") - 1);
-        }
-        if (t >= 0) {
-            return t;
-        }
+                "CDN-Cache-Control", sizeof("CDN-Cache-Control") - 1,
+                "max-age", sizeof("max-age") - 1);
+    }
+    if (t >= 0) {
+        return t;
+    }
+
+    t = ngx_http_cache_turbo_cc_delta_all(&r->headers_out.headers,
+            "Cache-Control", sizeof("Cache-Control") - 1,
+            "s-maxage", sizeof("s-maxage") - 1);
+    if (t < 0) {
+        t = ngx_http_cache_turbo_cc_delta_all(&r->headers_out.headers,
+                "Cache-Control", sizeof("Cache-Control") - 1,
+                "max-age", sizeof("max-age") - 1);
+    }
+    if (t >= 0) {
+        return t;
     }
 
     if (expires.len) {
@@ -1589,8 +1593,10 @@ static ngx_int_t
 ngx_http_cache_turbo_response_must_revalidate(ngx_http_request_t *r)
 {
     return (ngx_http_cache_turbo_cc_has_all(&r->headers_out.headers,
+                "Cache-Control", sizeof("Cache-Control") - 1,
                 "must-revalidate", sizeof("must-revalidate") - 1)
             || ngx_http_cache_turbo_cc_has_all(&r->headers_out.headers,
+                "Cache-Control", sizeof("Cache-Control") - 1,
                 "proxy-revalidate", sizeof("proxy-revalidate") - 1)) ? 1 : 0;
 }
 
@@ -1606,6 +1612,7 @@ static time_t
 ngx_http_cache_turbo_response_swr(ngx_http_request_t *r)
 {
     return ngx_http_cache_turbo_cc_delta_all(&r->headers_out.headers,
+               "Cache-Control", sizeof("Cache-Control") - 1,
                "stale-while-revalidate", sizeof("stale-while-revalidate") - 1);
 }
 
@@ -1622,6 +1629,7 @@ static time_t
 ngx_http_cache_turbo_response_sie(ngx_http_request_t *r)
 {
     return ngx_http_cache_turbo_cc_delta_all(&r->headers_out.headers,
+               "Cache-Control", sizeof("Cache-Control") - 1,
                "stale-if-error", sizeof("stale-if-error") - 1);
 }
 
