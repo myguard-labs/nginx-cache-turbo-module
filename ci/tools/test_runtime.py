@@ -975,7 +975,18 @@ class Origin:
                     # blob back from L2 even though sie_ttl says it should.
                     self.send_header("Cache-Control",
                                      "max-age=1, stale-if-error=3600")
-                if "sieserve" in self.path:
+                if "sieshort" in self.path:
+                    # Same convention as "sieserve" below, but a SHORT
+                    # stale-if-error window so a test that only needs to cross
+                    # the sie deadline (not exercise the full 30s) doesn't have
+                    # to sleep 27s+ to get there. cache_turbo_valid (1s) sets
+                    # the fresh TTL; sie_ttl = 1 + 5 = 6s -- deliberately past
+                    # the location's own stale window (stale_mult default 4 =>
+                    # 4s), so phase 1 of the discriminating test still lands
+                    # inside the SIE window rather than the ordinary stale
+                    # window. Drives test_keep_stale_loses_to_response_sie.
+                    self.send_header("Cache-Control", "stale-if-error=5")
+                elif "sieserve" in self.path:
                     # RFC-2 serve-on-error: short fresh window + a long
                     # stale-if-error so the entry can FULLY expire (past its stale
                     # window) yet stay inside the serve-on-error window. No max-age
@@ -3117,10 +3128,10 @@ http {{
 
         # Precedence test: both a response stale-if-error AND cache_turbo_keep_stale
         # are in play here. keep_stale is a generous 1h baseline; the response's
-        # own stale-if-error=30 (via the "sieserve" request-suffix marker, same
-        # origin convention as /sieserve/) must WIN -- sie_window = ttl + 30, not
-        # ttl + 3600 and not max() of the two. Drives
-        # test_keep_stale_loses_to_response_sie.
+        # own stale-if-error=5 (via the "sieshort" request-suffix marker -- a
+        # short-window sibling of the "sieserve" convention used by /sieserve/)
+        # must WIN -- sie_window = ttl + 5, not ttl + 3600 and not max() of the
+        # two. Drives test_keep_stale_loses_to_response_sie.
         location /keepstalewins/ {{
             cache_turbo          main;
             cache_turbo_key      $uri;
@@ -10575,24 +10586,29 @@ def test_use_stale_403_429(ng: Nginx, origin: Origin) -> None:
 def test_keep_stale_loses_to_response_sie(ng: Nginx, origin: Origin) -> None:
     """S2.2 / D-1: a HONORED response stale-if-error wins over
     cache_turbo_keep_stale when both are available -- NOT max(). /keepstalewins/
-    has keep_stale 1h (3600s) configured; the "sieserve" request-suffix marker
-    makes the origin emit stale-if-error=30 for this request, same convention as
-    /sieserve/. If the precedence were max(), sie_window would be ttl+3600 and a
-    request timed at ttl+~35s (well past the response SIE window but nowhere near
-    the keep_stale window) would still serve stale. The correct precedence
+    has keep_stale 1h (3600s) configured; the "sieshort" request-suffix marker
+    makes the origin emit stale-if-error=5 for this request, a short-window
+    sibling of the "sieserve" convention used by /sieserve/ (deliberately past
+    the location's own stale window -- stale_mult default 4 x 1s fresh = 4s --
+    so phase 1 below lands inside the SIE window, not the ordinary stale one).
+    If the precedence were max(), sie_window would be ttl+3600 and a request
+    timed at ttl+~7.5s (well past the response SIE window but nowhere near the
+    keep_stale window) would still serve stale. The correct precedence
     (response SIE wins outright, keep_stale is not consulted at all) makes that
     same request surface the dead origin's error instead."""
-    s0, b0, _ = fetch(ng.port, "/keepstalewins/sieserve-p1")
+    s0, b0, _ = fetch(ng.port, "/keepstalewins/sieshort-p1")
     assert s0 == 200 and b0, f"prime failed: {s0} {b0!r}"
 
-    # Phase 1 -- inside the response's own SIE window (~31s). Serves stale.
+    # Phase 1 -- past the ordinary stale window (4s) but inside the response's
+    # own SIE window (1+5=6s). Serves stale via SIE, not the ordinary stale path.
     # NB this assertion is NOT the discriminating one: it passes identically
-    # whether the precedence is "response SIE wins" (window ~31s) or a max()
+    # whether the precedence is "response SIE wins" (window ~6s) or a max()
     # bug (window ~3601s). It only establishes that a window exists at all.
-    time.sleep(4.6)     # past fresh (1s) and stale_mult x4 (4s): fully expired
+    time.sleep(4.6)     # past fresh (1s) and the 4s stale window: fully expired,
+                        # but still inside the sie window (1+5=6s)
     origin.fail = True
     try:
-        s, b, h = fetch(ng.port, "/keepstalewins/sieserve-p1")
+        s, b, h = fetch(ng.port, "/keepstalewins/sieshort-p1")
         assert s == 200, f"within response-SIE window served {s}, expected 200"
         assert b == b0, f"served {b!r}, expected stale {b0!r}"
         assert h.get("x-cache") == "STALE-IF-ERROR", \
@@ -10602,25 +10618,29 @@ def test_keep_stale_loses_to_response_sie(ng: Nginx, origin: Origin) -> None:
         drain_origin(origin)
 
     # Phase 2 -- THE DISCRIMINATING ASSERTION. Past the response's own SIE
-    # window (fresh 1s + sie 30s = ~31s) but far short of keep_stale's 3600s.
-    # Correct precedence: sie_window ended at ~31s, keep_stale was never
+    # window (fresh 1s + sie 5s = ~6s) but far short of keep_stale's 3600s.
+    # Correct precedence: sie_window ended at ~6s, keep_stale was never
     # consulted -> the dead origin surfaces as 502. Under a max() bug the
     # window would run to ~3601s and this would still serve a stale 200, so
     # this assertion is what fails if anyone "reconciles" the precedence into
     # a max(). Re-prime first: phase 1 left the entry untouched (a stale serve
-    # does not re-store), so its absolute sie deadline is still ~31s from the
+    # does not re-store), so its absolute sie deadline is still ~6s from the
     # ORIGINAL store -- sleeping the remainder is what crosses it.
-    time.sleep(27.0)    # ~31.6s total since the store: response SIE expired
+    # 2.9s (not the bare 1.4s that would just clear 6s): overshooting the sie
+    # deadline is free -- keep_stale runs to 3600s, so any time between 6s and
+    # 3600s discriminates identically. The margin is deliberate; this box runs
+    # loaded and a 0.5s cushion turns a correct test into a flake.
+    time.sleep(2.9)    # ~7.5s total since the store: response SIE expired
     origin.fail = True
     try:
-        s2, _, h2 = fetch(ng.port, "/keepstalewins/sieserve-p1")
+        s2, _, h2 = fetch(ng.port, "/keepstalewins/sieshort-p1")
         # 503 (not 502): origin.fail returns an upstream 503, which passes
         # through once no serve-on-error window covers the request.
         # origin.drop is the transport-level failure that yields 502.
         assert s2 == 503, (
             f"past the response stale-if-error window served {s2}, expected 503. "
             "A 200 here means keep_stale (3600s) widened the window the response "
-            "had already scoped to 30s -- i.e. the precedence became max(), which "
+            "had already scoped to 5s -- i.e. the precedence became max(), which "
             "D-1 explicitly rejects."
         )
         assert h2.get("x-cache") != "STALE-IF-ERROR", \
