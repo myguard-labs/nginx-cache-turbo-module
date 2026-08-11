@@ -10023,6 +10023,58 @@ def test_native_cache_headers_stripped(ng: Nginx) -> None:
         f"upstream X-Cache-Status leaked: {h.get('x-cache-status')}"
 
 
+def test_warm_rejects_traversal(ng: Nginx, origin: Origin) -> None:
+    """AUD3-WARM-URI-NORM: ngx_http_subrequest() does not run
+    ngx_http_parse_complex_uri() on a hand-built URI, so a percent-decoded
+    "?url=" value that resolves to a ".." segment must be rejected before it
+    ever reaches location matching -- otherwise "/%2e%2e/%2e%2e/etc/x" decodes
+    to "/../../etc/x" and is matched un-normalized. The bad entry must simply
+    not be warmed (warmed count excludes it); a comma-separated list with a
+    good entry alongside it must still warm the good one."""
+    import json
+    good = "/c/warm-trav-ok"
+    base = origin.hits_for("warm-trav-ok")
+    s, b, _ = fetch(ng.port, "/_cache?url=/%2e%2e/%2e%2e/etc/x", method="POST")
+    assert s == 200, f"warm status {s}"
+    assert json.loads(b)["warmed"] == 0, \
+        f"traversal url must not be warmed: {b}"
+
+    # a bad entry alongside a good one must not kill the good one.
+    s2, b2, _ = fetch(
+        ng.port, f"/_cache?url=/%2e%2e/%2e%2e/etc/x,{good}", method="POST")
+    assert s2 == 200, f"warm status {s2}"
+    assert json.loads(b2)["warmed"] == 1, \
+        f"good url in the same list must still warm: {b2}"
+    assert wait_for(lambda: origin.hits_for("warm-trav-ok") == base + 1), \
+        "the good warm subrequest never reached origin"
+
+
+def test_warm_rejects_embedded_nul(ng: Nginx, origin: Origin) -> None:
+    """AUD3-WARM-URI-NORM: a percent-decoded %00 produces an embedded NUL in
+    sr->uri; downstream ngx_str_t-vs-C-string consumers (proxy_pass URI
+    construction, $uri in a log format) would truncate at it. Reject and skip
+    rather than warm."""
+    import json
+    s, b, _ = fetch(ng.port, "/_cache?url=/c/warm-nul%00trunc", method="POST")
+    assert s == 200, f"warm status {s}"
+    assert json.loads(b)["warmed"] == 0, \
+        f"NUL-containing url must not be warmed: {b}"
+
+
+def test_warm_normal_url_still_warms(ng: Nginx, origin: Origin) -> None:
+    """AUD3-WARM-URI-NORM guard: the new URI-safety check must not over-reject
+    an ordinary valid warm target. Same shape as test_warm_populates, kept
+    separate so the traversal/NUL fix has its own positive control."""
+    import json
+    uri = "/c/warm-norm-ok"
+    base = origin.hits_for("warm-norm-ok")
+    s, b, _ = fetch(ng.port, f"/_cache?url={uri}", method="POST")
+    assert s == 200, f"warm status {s}"
+    assert json.loads(b)["warmed"] == 1, f"warmed count: {b}"
+    assert wait_for(lambda: origin.hits_for("warm-norm-ok") == base + 1), \
+        "warm subrequest never hit the origin"
+
+
 def test_stale_serves_stale(ng: Nginx, origin: Origin) -> None:
     """R3: once fresh TTL passes, the cache serves the stale copy (not a miss),
     and a refresh eventually lands (the served body advances to a new gen)."""
@@ -16064,6 +16116,9 @@ def run_all(ng: Nginx, origin: Origin,
     test_warm_multi(ng, origin)
     test_warm_no_url(ng)
     test_warm_strips_key_cookie(ng, origin)
+    test_warm_rejects_traversal(ng, origin)
+    test_warm_rejects_embedded_nul(ng, origin)
+    test_warm_normal_url_still_warms(ng, origin)
     test_stale_serves_stale(ng, origin)
     test_single_flight(ng, origin)
     test_cold_single_flight(ng, origin)
