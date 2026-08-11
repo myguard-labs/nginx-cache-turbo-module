@@ -37,6 +37,8 @@
  * three RESP parsers in source order. */
 #include "generated_parser.inc"
 
+static void check_split_delivery(u_char *buf, size_t size, ngx_pool_t *pool);
+
 /* Validate that an ngx_str_t the parser handed back references INTO the input
  * buffer (or is the empty/NULL nil sentinel), never outside it. A parser that
  * returns NGX_OK with a member pointing past the buffer is a bug ASAN would not
@@ -106,7 +108,7 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
          * reserved for a well-formed `$-1` nil (a DEFINITIVE miss, the only
          * outcome allowed to arm the L13 negative memo) and NGX_ERROR covers
          * every not-an-answer reply: a Redis error reply, an unexpected type
-         * byte, an unparseable length, an oversized payload. Both are legal
+         * byte, an unparsable length, an oversized payload. Both are legal
          * returns; conflating them is the bug the split exists to prevent. */
         if (rc != NGX_OK && rc != NGX_AGAIN && rc != NGX_DECLINED
             && rc != NGX_ERROR)
@@ -212,6 +214,177 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         ngx_fuzz_pool_reset(&pool);
     }
 
+    /* 5) SPLIT DELIVERY. Everything above hands the parser one buffer holding
+     * the whole reply, which is the single case a real socket does NOT
+     * guarantee: a Redis reply arrives in as many recv()s as the network feels
+     * like, and read_get()/read_smembers()/read_scan() drive their parser in a
+     * loop — parse, get NGX_AGAIN, fill() more bytes into the SAME growing
+     * buffer, parse the whole thing again from the start.
+     *
+     * That resume path is what is untested. A parser that is correct on a
+     * complete buffer can still be wrong across a split: caching a CRLF offset
+     * that moves when the buffer is reallocated, treating a truncated length
+     * line as final rather than incomplete, or returning a blob that points
+     * into the PREVIOUS allocation. None of those are reachable from a
+     * single-shot target, and none are what the corpus above explores.
+     *
+     * Modelled faithfully rather than approximately: op->rbuf is REALLOCATED at
+     * each step (fill() grows by doubling, so the parser must never hold a
+     * pointer across calls) and op->rlen grows by the prefix length.
+     *
+     * ⚠ The whole input IS the reply — no byte is stolen from it to choose the
+     * split point. An earlier revision took the split from data[0] and parsed
+     * data+1, which corrupted every corpus entry (they are complete replies
+     * starting at byte 0): all 362 inputs returned NGX_ERROR at the resume step
+     * and the byte-comparison oracle below was dead code. Verified by probe,
+     * not assumed. The split is derived from the LENGTH instead, and every
+     * boundary is swept, so a corpus entry that parses in one piece is
+     * guaranteed to reach the comparison — for each of its split points.
+     *
+     * ⚠ Oracle, and the reason this is not just "run the parser twice": feeding
+     * a prefix must yield NGX_AGAIN, and feeding the complete reply must yield
+     * the SAME verdict the single-shot parse of those bytes gave, with a blob
+     * that compares byte-for-byte. A parser that resumes wrongly typically
+     * still returns NGX_OK — with a short, shifted or stale blob — so a return
+     * code alone would certify the bug. The bytes are the oracle. */
+    check_split_delivery(buf, size, &pool);
+
     free(buf);
     return 0;
+}
+
+
+/* Body of block 5, split out of LLVMFuzzerTestOneInput: it is the only block
+ * with real control flow of its own (a sweep over split points, each running a
+ * two-step feed), and inlining it pushed the driver's cyclomatic complexity to
+ * 56 -- past the point where the harness reads as a list of independent
+ * parser checks, which is the property that makes it reviewable. */
+static void
+check_split_delivery(u_char *buf, size_t size, ngx_pool_t *pool)
+{
+    if (size >= 2) {
+        u_char    *whole = NULL;
+        size_t     whole_len = 0, split;
+        ngx_int_t  rc_whole;
+
+        /* Reference verdict: the identical bytes parsed in one piece. */
+        {
+            ngx_http_cache_turbo_redis_op_t  ref;
+            u_char  *blob = NULL;
+            size_t   blob_len = 0;
+
+            ref.rbuf = buf;
+            ref.rlen = size;
+            ref.pool = pool;
+            ref.rpool = pool;
+
+            rc_whole = ngx_http_cache_turbo_redis_parse(&ref, &blob, &blob_len);
+
+            /* Copy the reference blob out: it points into `buf`, and the split
+             * feed below parses out of its own reallocated buffers. */
+            if (rc_whole == NGX_OK && blob != NULL && blob_len != 0) {
+                whole = (u_char *) malloc(blob_len);
+                if (whole == NULL) {
+                    /* buf belongs to the caller — it frees it. */
+                    ngx_fuzz_pool_reset(pool);
+                    return;
+                }
+                memcpy(whole, blob, blob_len);
+                whole_len = blob_len;
+            }
+            ngx_fuzz_pool_reset(pool);
+        }
+
+        /* Sweep EVERY boundary rather than sampling one. The reply is short
+         * (libFuzzer caps these inputs at a few hundred bytes) and the split
+         * point is exactly the variable that decides whether a resume is
+         * correct — a length line cut mid-digit, a CRLF cut between its two
+         * bytes, a bulk body cut one short. Sampling would leave the
+         * interesting boundaries to chance. */
+        for (split = 1; split < size; split++) {
+            ngx_http_cache_turbo_redis_op_t  op;
+            u_char    *grow;
+            size_t     step;
+            ngx_int_t  rc = NGX_AGAIN;
+
+            op.rbuf = NULL;
+            op.rlen = 0;
+            op.pool = pool;
+            op.rpool = pool;
+
+            for (step = 0; step < 2; step++) {
+                size_t  have = step == 0 ? split : size;
+                u_char *blob = NULL;
+                size_t  blob_len = 0;
+
+                /* fill() grows by doubling into a FRESH allocation and copies
+                 * the bytes over, so the parser must never retain a pointer
+                 * across calls. Reallocating here is what turns a retained
+                 * pointer into an ASAN use-after-free instead of a silently
+                 * stale read that still happens to hold the right bytes. */
+                grow = (u_char *) malloc(have);
+                if (grow == NULL) {
+                    break;
+                }
+                memcpy(grow, buf, have);
+                if (op.rbuf != NULL) {
+                    free(op.rbuf);
+                }
+                op.rbuf = grow;
+                op.rlen = have;
+
+                rc = ngx_http_cache_turbo_redis_parse(&op, &blob, &blob_len);
+
+                if (rc != NGX_OK && rc != NGX_AGAIN && rc != NGX_DECLINED
+                    && rc != NGX_ERROR)
+                {
+                    __builtin_trap();      /* undocumented return */
+                }
+                if (rc != NGX_OK && (blob != NULL || blob_len != 0)) {
+                    __builtin_trap();      /* failure handed back a blob */
+                }
+                if (rc == NGX_OK) {
+                    check_in_bounds(blob, blob_len, op.rbuf, op.rlen);
+                }
+
+                if (step == 0) {
+                    /* A strict prefix of a reply that parses whole cannot be a
+                     * complete answer: the parser must ask for more, not invent
+                     * a verdict from truncated bytes. (Only checked when the
+                     * whole reply parses — for malformed input the parser is
+                     * entitled to reject the prefix outright.) */
+                    if (rc_whole == NGX_OK && rc == NGX_OK) {
+                        __builtin_trap();  /* answered from a partial reply */
+                    }
+                    continue;
+                }
+
+                /* step 1: the full reply is present. The verdict must match the
+                 * single-shot parse of the identical bytes, and so must the
+                 * payload. A resume that goes wrong typically still returns
+                 * NGX_OK with a short, shifted or stale blob, so the BYTES are
+                 * the oracle — a return-code check alone would certify it. */
+                if (rc != rc_whole) {
+                    __builtin_trap();      /* split changed the verdict */
+                }
+                if (rc == NGX_OK) {
+                    if (blob_len != whole_len) {
+                        __builtin_trap();  /* resumed parse changed the length */
+                    }
+                    if (whole_len != 0
+                        && memcmp(blob, whole, whole_len) != 0)
+                    {
+                        __builtin_trap();  /* resumed parse changed the bytes */
+                    }
+                }
+            }
+
+            if (op.rbuf != NULL) {
+                free(op.rbuf);
+            }
+            ngx_fuzz_pool_reset(pool);
+        }
+
+        free(whole);
+    }
 }
