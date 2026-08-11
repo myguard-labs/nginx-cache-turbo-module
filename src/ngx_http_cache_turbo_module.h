@@ -1628,6 +1628,11 @@ typedef struct {
      * exercised deterministically. Delegates the UNMODIFIED in-memory chain
      * downstream and abandons capture; it does NOT forge b->in_file. */
     ngx_flag_t               test_force_file_buf;
+    /* AUD-STORE-ERR-STUB: force the body filter's l1->store() call to fail
+     * deterministically, so the cold-miss stub cleanup path (armed only when
+     * store did NOT succeed) is reachable without depending on real slab
+     * exhaustion timing. */
+    ngx_flag_t               test_store_fail;
     /* AUD-SCAN1: lower the SCAN-del page cap so the cap branch is reachable in
      * a test without materialising a 268M-key keyspace. 0 / unset keeps the
      * compile-time ceiling. Test-only for the same reason the cap itself is a
