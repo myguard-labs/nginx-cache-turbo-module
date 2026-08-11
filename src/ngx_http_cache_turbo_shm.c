@@ -772,6 +772,14 @@ ngx_http_cache_turbo_shm_store_if(ngx_http_cache_turbo_zone_t *z,
             break;
 
         default:
+            /* Fail CLOSED. This is a guard API: an unrecognised predicate is
+             * a programming error, and the safe answer to "may I overwrite
+             * this entry?" from a rule nobody implemented is no. Falling
+             * through with refuse = 0 would make a forgotten `case` overwrite
+             * live entries silently -- and since STORE_IF_NEWER is 0, an
+             * omitted argument would land on a real predicate rather than an
+             * obviously invalid one. */
+            refuse = 1;
             break;
         }
     }

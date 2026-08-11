@@ -4404,14 +4404,6 @@ class RedisServer:
             "--save", "",
             "--appendonly", "no",
             "--dir", str(self.root),
-            # AUD-L2-PROMOTE-RACE: DEBUG SLEEP is how
-            # test_l2_promote_race_never_overwrites_newer_l1_entry blocks this
-            # server's single-threaded command loop for a bounded window,
-            # giving a real (not simulated) parked-request race to test
-            # against. "local" scopes it to loopback connections only (this
-            # fixture is never reachable off-box); Redis refuses DEBUG
-            # entirely without this flag.
-            "--enable-debug-command", "local",
         ]
         if self.tls_certs:
             # TLS-only listener: plaintext port off, tls-port on.
@@ -13600,7 +13592,21 @@ def test_l2_promote_race_never_overwrites_newer_l1_entry(
       4. The held worker wakes, decides (L1 now holds B, newer than the L2
          blob) and must DECLINE the promote. A follow-up plain read must
          still see body B, never body A; the NOTICE line must read
-         NGX_DECLINED."""
+         NGX_DECLINED.
+
+    Skipped in single-process mode (the ASan single-process job), which runs
+    `workers = 1`. Step 3 requires the concurrent bypass write to land on a
+    DIFFERENT worker while this one is inside its ngx_msleep; with one worker
+    that write cannot be serviced until the hold expires, by which point the
+    promote has already been decided against an L1 slot that still holds
+    nothing newer -- the promote is then correctly allowed and the oracle
+    reads NGX_OK. That is the harness losing the race setup, not the fix
+    regressing, so asserting it here would be asserting a property this
+    configuration cannot express. The multi-worker Runtime and ASan
+    multi-worker jobs both exercise it for real."""
+    if ng.single_process:
+        return
+
     uri = "/l2promo/x"
     seed_uri = "/l2promo/seed-for-x"
     key = l2_key(uri)
