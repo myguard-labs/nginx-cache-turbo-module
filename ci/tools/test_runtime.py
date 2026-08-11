@@ -552,6 +552,42 @@ class Origin:
                 # counted (so a test can prove the refresh reached the origin),
                 # but the response is a 5xx the module must NOT cache or surface.
                 if origin.fail:
+                    # AUD-SIE-BODY: the "sieserve-unbuf" marker asks for a
+                    # non-empty error body instead of the usual Content-Length:
+                    # 0. The stuck-buffer regression this drives needs the
+                    # discarded upstream chain to actually carry a data buffer
+                    # -- a header-only, zero-length error response leaves
+                    # nothing behind for the sie_serving block to fail to
+                    # consume, so the bug does not reproduce without this.
+                    if "sieserve-unbuf" in self.path:
+                        # Many flushed chunks, well beyond proxy_buffer_size's
+                        # default one 4k page: a body that arrives in a SINGLE
+                        # recv() (a same-host, no-delay write easily coalesces
+                        # into one) gets fully drained by nginx's upstream
+                        # preread before the body filter ever runs, so there is
+                        # no second read that needs the discarded buffer
+                        # recycled and the bug does not reproduce. Splitting
+                        # into many flushed writes forces multiple recv()
+                        # cycles, each of which can only proceed once the
+                        # PREVIOUS response buffer is released back to the
+                        # upstream -- with enough of them, at least one lands
+                        # as its own read even under scheduler/coalescing
+                        # jitter, so the reproduction is not a one-shot race.
+                        chunk = b"E" * 4096
+                        n_chunks = 16   # 64 KiB total, ~16x proxy_buffer_size
+                        err_body = chunk * n_chunks
+                        self.send_response(origin.fail_status)
+                        self.send_header("Content-Type", "text/plain")
+                        self.send_header("Content-Length", str(len(err_body)))
+                        self.end_headers()
+                        try:
+                            for _ in range(n_chunks):
+                                self.wfile.write(chunk)
+                                self.wfile.flush()
+                                time.sleep(0.02)
+                        except BrokenPipeError:
+                            pass
+                        return
                     self.send_response(origin.fail_status)
                     self.send_header("Content-Length", "0")
                     self.end_headers()
@@ -2477,6 +2513,23 @@ http {{
             cache_turbo          main;
             cache_turbo_key      $uri;
             cache_turbo_valid    1s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # AUD-SIE-BODY regression: same fixture shape as /sieserve/ (the
+        # "sieserve" request-suffix marker still reaches the origin, since
+        # proxy_pass only strips the /siebuf/ prefix) but with proxy_buffering
+        # off. The body filter's sie_serving block discards the incoming
+        # upstream error chain without marking it consumed; under a buffered
+        # upstream there is slack so the bug never reproduces, but with
+        # buffering off the discarded buffers stay on the upstream's
+        # busy_bufs forever and the request hangs. Drives
+        # test_sie_serve_on_error_unbuffered.
+        location /siebuf/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    1s;
+            proxy_buffering       off;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
@@ -9995,6 +10048,126 @@ def test_sie_serve_on_error(ng: Nginx, origin: Origin) -> None:
         drain_origin(origin)
 
 
+def _errlog_window_start(ng: Nginx) -> int:
+    """Byte offset into logs/error.log at the moment of the call, for
+    bracketing a later grep to lines written strictly during this test's own
+    window -- the pattern test_l2_negative_ttl_expires established (see the
+    long comment above it) to avoid attributing a debug line emitted by an
+    unrelated concurrent/earlier request to the wrong test.
+
+    0 (file absent yet) is a legal starting offset, not an error -- the log is
+    created lazily on first write."""
+    log = ng.root / "logs" / "error.log"
+    try:
+        return log.stat().st_size
+    except OSError:
+        return 0
+
+
+def _errlog_sie_unconsumed_in_window(ng: Nginx, start: int) -> list[int]:
+    """AUD-SIE-BODY oracle: every `cache_turbo: test_sie_unconsumed=<N>` value
+    logged strictly after byte offset `start`, in emission order.
+
+    The module emits these at NOTICE, so they clear the harness's default log
+    level with no TEST_CT_ERRLOG and no per-location debug error_log (see the
+    long note in test_sie_serve_on_error_unbuffered for why debug is not an
+    option here). Callers must still assert the list is non-empty before
+    trusting any 0 in it: a missing line means the sie_serving block was never
+    entered, or TEST_FAULTS was not compiled in -- not evidence of a fixed
+    bug."""
+    log = ng.root / "logs" / "error.log"
+    try:
+        with log.open("rb") as f:
+            f.seek(start)
+            tail = f.read()
+    except OSError as exc:
+        raise AssertionError(f"error.log unreadable: {exc}") from None
+    text = tail.decode("utf-8", errors="replace")
+    return [int(m) for m in
+            re.findall(r"cache_turbo: test_sie_unconsumed=(\d+)", text)]
+
+
+def test_sie_serve_on_error_unbuffered(ng: Nginx, origin: Origin) -> None:
+    """AUD-SIE-BODY regression: same scenario as test_sie_serve_on_error (a
+    fully expired /sieserve/-style entry replayed from its stale-if-error
+    snapshot when the origin 5xxs) but through /siebuf/, which sets
+    proxy_buffering off.
+
+    A client-visible hang is the WRONG oracle for this bug: /siebuf/'s
+    upstream has no keepalive pool, so ngx_http_upstream_finalize_request()
+    unconditionally close()s the upstream connection on request teardown,
+    which reclaims any stuck buffers as an OS side effect regardless of
+    whether the module marked them consumed -- the request completes either
+    way (proven: an earlier version of this test used a raw keep-alive socket
+    with a bounded recv() timeout and did not reliably discriminate fix from
+    revert). Only the module's INTERNAL buffer accounting differs, so this
+    test asserts that directly via ctx->test_sie_unconsumed (TEST_FAULTS-only,
+    see the field comment in ngx_http_cache_turbo_module.h): the count of
+    incoming upstream buffers left with buf->pos != buf->last at the point the
+    sie_serving block in the body filter returns, on both of its exits. With
+    the fix this is always 0; reverting the two consume loops (pos = last /
+    file_pos = file_last / sync = 1) leaves the discarded error-body buffers
+    un-advanced and it is > 0.
+
+    A response header cannot carry this value: by the time the body filter
+    runs, ngx_http_next_header_filter() has already returned for this request
+    (the sie_serving header-filter exit at :7807 calls it unconditionally,
+    and nginx's header filter chain serializes r->headers_out.headers into
+    the wire buffer synchronously with no postponement contract) -- a header
+    stamped from the body filter would always read 0, which is the exact
+    vacuous-pass shape this test must not have. Instead the module logs
+    `cache_turbo: test_sie_unconsumed=<N>` at NOTICE level (not debug) and
+    this test reads it out of logs/error.log, bracketed by byte offset so a
+    line is provably attributable to this test's own triggering request and
+    not a neighbour's.
+
+    NOTICE, not ngx_log_debug1(), is deliberate. The line has to be readable
+    at the harness's default level because CI never sets TEST_CT_ERRLOG, and
+    the obvious alternative -- a location-scoped `error_log ... debug` on
+    /siebuf/ -- kills the ASan job: debug logging in the proxy path trips a
+    PRE-EXISTING UBSan null-pointer report in nginx core
+    (src/core/ngx_string.c:586, "null pointer passed as argument 2"), and the
+    sanitizer workflow runs with halt_on_error=1, so the worker aborts on the
+    very first request. That reproduces on unmodified upstream code with a
+    debug error_log added to the existing /sieserve/ location, so it is not
+    this module's bug -- but it does make debug-level logging unusable inside
+    a CI-visible fixture. The counter is TEST_FAULTS-only, so NOTICE costs
+    production nothing.
+
+    The origin's "sieserve-unbuf" marker (see Origin.do_GET) answers `fail`
+    with an 8192-byte body written as two flushed chunks: a zero-length or
+    single-recv error body leaves nothing behind for the sie_serving block to
+    fail to consume, so the bug does not reproduce without it."""
+    s0, b0, _ = fetch(ng.port, "/siebuf/sieserve-unbuf-k1")
+    assert s0 == 200 and b0, f"prime failed: {s0} {b0!r}"
+
+    time.sleep(4.6)     # past fresh (1s) AND the stale window (x4 = 4s): expired
+    origin.fail = True
+    try:
+        window_start = _errlog_window_start(ng)
+
+        s, b, h = fetch(ng.port, "/siebuf/sieserve-unbuf-k1")
+        assert s == 200, f"unbuffered SIE serve-on-error returned {s}"
+        assert b == b0, f"served {b!r}, expected stale {b0!r}"
+        assert h.get("x-cache") == "STALE-IF-ERROR", \
+            f"expected STALE-IF-ERROR, got x-cache={h.get('x-cache')}"
+
+        values = _errlog_sie_unconsumed_in_window(ng, window_start)
+        assert values, (
+            "no 'cache_turbo: test_sie_unconsumed=' line found in this "
+            "request's error.log window -- the oracle line is MISSING, which "
+            "must fail (never silently read as 0): either TEST_FAULTS is not "
+            "actually compiled in, or the sie_serving block was not entered "
+            "at all for this request")
+        assert all(v == 0 for v in values), \
+            (f"sie_serving left unconsumed upstream buffers on the fixed "
+             f"build: test_sie_unconsumed values in window = {values} "
+             f"(expected all 0)")
+    finally:
+        origin.fail = False
+        drain_origin(origin)
+
+
 def test_sie_serves_counter(ng: Nginx, origin: Origin) -> None:
     """S7.1: sie_serves counts responses actually served from a stale-if-error
     snapshot -- ngx_http_cache_turbo_sie_rewrite() winning inside the header
@@ -15509,6 +15682,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_stale_if_error(ng, origin)
     test_stale_serves_stale_origin_hard_dead(ng, origin)
     test_sie_serve_on_error(ng, origin)                     # RFC-2 CTB4 serve-on-error
+    test_sie_serve_on_error_unbuffered(ng, origin)          # AUD-SIE-BODY proxy_buffering off
     test_sie_serves_counter(ng, origin)                     # S7.1 sie_serves counter
     test_sie_origin_recovers_serves_fresh(ng, origin)       # RFC-2 success not hijacked
     test_keep_stale_serves_dead_origin(ng, origin)          # S2.2 keep_stale fallback

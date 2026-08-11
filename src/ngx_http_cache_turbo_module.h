@@ -1842,6 +1842,27 @@ typedef struct {
     u_char                  *sie_body;        /* body slice inside sie_snap        */
     size_t                   sie_body_len;
 
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+    /* AUD-SIE-BODY: count of incoming `in` buffers left UNCONSUMED (buf->pos !=
+     * buf->last) at the point the sie_serving block in the body filter returns,
+     * summed across both its exits. With the consume-loop fix in place this is
+     * always 0; reverting the fix leaves the upstream's error-body buffers
+     * un-advanced and this counts them.
+     *
+     * NOT exposed as a response header: by the time the body filter runs,
+     * ngx_http_next_header_filter() has already returned for this request (the
+     * sie_serving header-filter exit calls it unconditionally and synchronously
+     * -- nginx's header filter chain serializes r->headers_out.headers into the
+     * wire buffer inside that call, with no postponement contract), so a header
+     * written from here would be invisible to the client and would always read
+     * 0. Logged instead via ngx_log_debug1() with the greppable
+     * "cache_turbo: test_sie_unconsumed=" token; a runtime test with
+     * TEST_CT_ERRLOG=debug reads it out of logs/error.log, bracketed by byte
+     * offset to attribute the line to one request. */
+    ngx_uint_t                test_sie_unconsumed;
+#endif
+
     /* P6/O4.3 circuit-breaker fallback snapshot. Taken at the SAME two
      * fall-through sites that arm SIE (L1 past its stale window, L2 blob past
      * rem_stale), but under a DIFFERENT and much wider rule: SIE is armed only
