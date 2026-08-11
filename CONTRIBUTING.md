@@ -139,6 +139,22 @@ Test::Nginx files, runtime suites under `tools/`) — look at the existing
 tests in this repo and put yours next to them. A PR that adds code without
 a test will not be merged, and yes, we check.
 
+### Running the runtime test suite
+
+The end-to-end test suite (`ci/tools/test_runtime.py`) requires the module to be
+built with the test-faults build flag. It will fail at nginx startup with
+`unknown directive "cache_turbo_test_*"` if this flag is missing.
+
+Build a test-enabled binary with:
+
+```sh
+ci/tools/ci-build.sh nginx 1.31.1 debug
+```
+
+This passes `-DNGX_HTTP_CACHE_TURBO_TEST_FAULTS=1` automatically. A production
+build (without this flag) will reject the test directives emitted by the test
+config builder and cannot run the suite.
+
 ## Pull requests
 
 - **One feature or issue per PR.** The title says what it does. If a PR
