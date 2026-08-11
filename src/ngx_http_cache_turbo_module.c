@@ -527,6 +527,13 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       offsetof(ngx_http_cache_turbo_loc_conf_t, test_force_file_buf),
       NULL },
 
+    { ngx_string("cache_turbo_test_store_fail"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_turbo_loc_conf_t, test_store_fail),
+      NULL },
+
     /* AUD-SCAN1: lower the SCAN-del page cap so the "abandon the walk and
      * report INCOMPLETE" branch is reachable without a 268M-key keyspace. */
     { ngx_string("cache_turbo_test_scan_max_pages"),
@@ -8438,18 +8445,58 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
                                    ctx->cold_owner);
             }
 
-            (void) clcf->l1->store(z, store_key, hash,
+            {
+            ngx_int_t  store_rc;
+
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+            /* AUD-STORE-ERR-STUB: deterministically simulate a failed store
+             * without depending on real slab exhaustion timing.
+             *
+             * The store is SKIPPED, not called-then-overridden. Masking the
+             * return value of a store that actually succeeded is not the same
+             * fault: the entry lands in L1 anyway, the next request is a plain
+             * L1 HIT, and no cold-miss stub is ever orphaned -- so the test
+             * built on it passed identically with and without the fix. The
+             * defect under test is "no entry was written, so the stub must be
+             * cleaned up", which requires no entry to be written. */
+            if (clcf->test_store_fail) {
+                store_rc = NGX_ERROR;
+
+            } else {
+                store_rc = clcf->l1->store(z, store_key, hash,
+                           blob, blob_len, ttl,
+                           stale_window);
+            }
+#else
+            store_rc = clcf->l1->store(z, store_key, hash,
                        blob, blob_len, ttl,
                        stale_window);
+#endif
 
-            ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                           "cache_turbo: stored \"%V\" len=%uz ttl=%T",
-                           &r->uri, blob_len, ttl);
+            if (store_rc == NGX_OK) {
+                ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                               "cache_turbo: stored \"%V\" len=%uz ttl=%T",
+                               &r->uri, blob_len, ttl);
 
-            /* v10: store overwrote any cold-miss stub into a real entry (or we
-             * cleared the relocated base stub above), so the cleanup must not
-             * remove it. */
-            ctx->cold_stored = 1;
+                /* v10: store overwrote any cold-miss stub into a real entry (or
+                 * we cleared the relocated base stub above), so the cleanup
+                 * must not remove it. */
+                ctx->cold_stored = 1;
+
+            } else {
+                /* AUD-STORE-ERR-STUB: a failed store leaves whatever was under
+                 * store_key untouched -- no real entry was written, so the
+                 * cold-miss stub (if any) still needs the pool cleanup to run
+                 * and unstub it. Leaving ctx->cold_stored at 0 here is what
+                 * arms that cleanup; setting it unconditionally (the bug) told
+                 * the cleanup a real entry existed and left the stub to block
+                 * every waiter until lock_ttl. */
+                ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                               "cache_turbo: store failed \"%V\" len=%uz "
+                               "ttl=%T", &r->uri, blob_len, ttl);
+            }
+            }
 
             /* auto-Vary: persist the active-axis bitmask as an L1 marker under
              * the base key so the next request resolves straight to this variant
@@ -12590,6 +12637,7 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
     conf->test_restore_alloc_fail = NGX_CONF_UNSET;
     conf->test_force_file_buf = NGX_CONF_UNSET;
+    conf->test_store_fail = NGX_CONF_UNSET;
     conf->test_scan_max_pages = NGX_CONF_UNSET;
 #endif
     /* shm_zone, key, redis_addr, redis_prefix default NULL via pcalloc */
@@ -12795,6 +12843,8 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
                          prev->test_restore_alloc_fail, 0);
     ngx_conf_merge_value(conf->test_force_file_buf,
                          prev->test_force_file_buf, 0);
+    ngx_conf_merge_value(conf->test_store_fail,
+                         prev->test_store_fail, 0);
     ngx_conf_merge_value(conf->test_scan_max_pages,
                          prev->test_scan_max_pages, 0);
 #endif

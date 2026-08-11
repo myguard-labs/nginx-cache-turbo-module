@@ -1760,6 +1760,26 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             cache_turbo_test_force_file_buf on;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
+
+        # AUD-STORE-ERR-STUB: force the body filter's l1->store() to fail
+        # deterministically, so a cold-miss winner's stub cleanup path is
+        # reachable without depending on real slab exhaustion timing.
+        #
+        # lock_ttl is LONG (30s) on purpose: the leaked stub must still hold a
+        # LIVE lease when the second request arrives, or claim() adopts the
+        # expired stub instead of parking on it and the test stops
+        # discriminating (see test_store_failure_cleans_up_cold_stub). The
+        # oracle is the lock_waits counter, so nothing here waits out a
+        # timeout -- lock_timeout stays short to bound the buggy-build park.
+        location /storefail/ {{
+            cache_turbo                  main;
+            cache_turbo_key              $uri;
+            cache_turbo_valid            30s;
+            cache_turbo_lock_ttl         30s;
+            cache_turbo_lock_timeout     2s;
+            cache_turbo_test_store_fail  on;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
 """
 
     return f"""{load}worker_processes {workers};
@@ -10562,6 +10582,55 @@ def test_cold_lock_off_stampedes(ng: Nginx, origin: Origin) -> None:
     drain_origin(origin)
 
 
+def test_store_failure_cleans_up_cold_stub(ng: Nginx, origin: Origin) -> None:
+    """AUD-STORE-ERR-STUB: a failed store() must NOT leave ctx->cold_stored set,
+    or the cold-miss winner's pool cleanup (armed only while !cold_stored) never
+    runs and the stub it left behind blocks every waiter until lock_timeout.
+
+    /storefail/ forces l1->store() to fail deterministically
+    (cache_turbo_test_store_fail) on a virgin key. Request 1 is the cold-miss
+    winner: its store fails, so with the bug (ctx->cold_stored set
+    unconditionally) the winner's pool cleanup sees cold_stored=1, skips
+    unstub(), and the stub is never reclaimed. Request 2 then finds that live
+    stub and PARKS in cold_wait().
+
+    The oracle is cache_turbo's own lock_waits counter, not wall-clock time.
+    An earlier version of this test asserted `elapsed < 1.0` and passed against
+    a deliberately reintroduced bug: with a short lock_ttl the leaked stub's
+    lease is already expired by the time request 2 arrives, so claim() ADOPTS
+    it (module.c:5942) instead of waiting, and the buggy build is just as fast
+    as the fixed one. lock_waits increments at module.c:6003, on entry to
+    cold_wait() -- exactly and only when a request parks on a stub that should
+    not exist. lock_ttl is 30s here so the lease cannot expire out from under
+    the assertion and turn a park into an adopt.
+
+    Fixed build: request 1's cleanup unstubs (store failed => cold_stored
+    stays 0), request 2 claims a virgin key, lock_waits does not move.
+    Buggy build: the stub survives with a live lease, request 2 parks,
+    lock_waits increments."""
+    def lock_waits() -> int:
+        import json
+        _, b, _ = fetch(ng.port, "/_cache")
+        return int(json.loads(b).get("lock_waits", 0))
+
+    uri = f"/storefail/stub-{time.time()}"
+
+    w0 = lock_waits()
+    s1, b1, _ = fetch(ng.port, uri)
+    assert s1 == 200 and b1, f"cold-miss winner (store forced to fail) failed: {s1}"
+
+    s2, b2, _ = fetch(ng.port, uri)
+    assert s2 == 200 and b2, f"second request after failed store got {s2}"
+    w1 = lock_waits()
+
+    assert w1 == w0, (
+        f"lock_waits moved {w0} -> {w1}: the second request parked in "
+        "cold_wait() on the cold-miss stub left behind by the failed store "
+        "(AUD-STORE-ERR-STUB: ctx->cold_stored was set even though store() "
+        "returned NGX_ERROR, so the pool cleanup skipped unstub())")
+    drain_origin(origin)
+
+
 def _admin_l2_misses(ng: Nginx) -> int:
     import json
     _, b, _ = fetch(ng.port, "/_cache")
@@ -15145,6 +15214,7 @@ def run_all(ng: Nginx, origin: Origin,
     if ng.fault_injection:
         test_restore_allocation_failure_fails_closed(ng, origin)
         test_file_backed_delegate_never_stores(ng, origin)
+        test_store_failure_cleans_up_cold_stub(ng, origin)
     test_max_size_not_cached(ng)
     test_suppress_native_variable(ng)
     test_auto_classify(ng, origin)
