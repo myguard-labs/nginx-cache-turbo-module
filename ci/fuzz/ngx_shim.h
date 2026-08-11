@@ -60,6 +60,11 @@ typedef struct {
 #define NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY    (64 * 1024 * 1024)
 #define NGX_HTTP_CACHE_TURBO_REDIS_MAX_MEMBERS  (1024 * 1024)
 
+/* Recursion bound for the _frame() pre-framer. Same drift guard as above: the
+ * fuzzer must hit the SHIPPED depth limit, since the depth check is the only
+ * thing standing between a nested `*1` chain and stack exhaustion. */
+#define NGX_HTTP_CACHE_TURBO_REDIS_FRAME_MAX_DEPTH  8
+
 /*
  * Pool shim. The parsers allocate one ngx_str_t[] per call via ngx_palloc.
  * We back each alloc with malloc and register it so the harness can free the

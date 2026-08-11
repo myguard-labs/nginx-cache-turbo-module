@@ -7,9 +7,12 @@
 #   ngx_http_cache_turbo_redis_parse_array()  - SMEMBERS array reply
 #   ngx_http_cache_turbo_redis_parse_scan()   - SCAN [cursor, keys] 2-tuple
 #
-# plus the NGX_HTTP_CACHE_TURBO_REDIS_MAX_MEMBERS #define that sits between the
-# first two. They are captured in source order so the .inc compiles standalone
-# (no forward declarations needed — none of the three calls another).
+#   ngx_http_cache_turbo_redis_frame()        - STAB-3 pre-framer (recursive)
+#
+# plus the MAX_MEMBERS #define that sits among them (FRAME_MAX_DEPTH comes from
+# ngx_shim.h instead — see the awk rule below). They are captured in source order. _frame() is directly recursive, so the .inc emits a
+# forward declaration for it ahead of the bodies; the other three call nothing
+# but _resp_len(), which precedes them in source order.
 #
 # This keeps the fuzz target locked to production code: there is no hand-copied
 # parser. If a signature or body changes upstream, the next fuzz build picks it
@@ -49,20 +52,37 @@ check_define() {
 }
 check_define NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY
 check_define NGX_HTTP_CACHE_TURBO_REDIS_MAX_MEMBERS
+check_define NGX_HTTP_CACHE_TURBO_REDIS_FRAME_MAX_DEPTH
 
-# --- slice the three parser bodies + the MAX_MEMBERS define, in source order.
-# Each parser opens with a bare `static ngx_int_t` line immediately followed by
-# its `ngx_http_cache_turbo_redis_parse...(` definition line, and closes with a
-# bare `}` in column 0 (nginx style). The interleaved read handlers are
-# `static void`, so matching on `static ngx_int_t` + the parse-name regex picks
-# out exactly the three we want (and not _fill / _launch, which are ngx_int_t
-# but differently named).
+# --- slice the four parser bodies + the MAX_MEMBERS / FRAME_MAX_DEPTH defines,
+# in source order. Each opens with a bare `static ngx_int_t` line immediately
+# followed by its definition line, and closes with a bare `}` in column 0 (nginx
+# style). The interleaved read handlers are `static void`, so matching on
+# `static ngx_int_t` + the name regex picks out exactly the four we want (and not
+# _fill / _launch, which are ngx_int_t but differently named).
+#
+# _frame() is directly recursive: its body calls itself before the definition is
+# complete, so the slice needs a prototype up front. Emitted here rather than in
+# ngx_shim.h so it stays adjacent to the extraction that requires it.
+cat > "$OUT" <<'PROTO'
+/* forward declaration — ngx_http_cache_turbo_redis_frame() is recursive */
+static ngx_int_t ngx_http_cache_turbo_redis_frame(u_char *p, u_char *end,
+    ngx_uint_t depth, u_char **next);
+
+PROTO
+
 awk '
     /^#define[[:space:]]+NGX_HTTP_CACHE_TURBO_REDIS_MAX_MEMBERS[[:space:]]/ {
         print; next
     }
+    # FRAME_MAX_DEPTH is deliberately NOT copied: ngx_shim.h defines it, and
+    # check_define above already fails the build if the two ever drift. Copying
+    # it here as well would be a macro redefinition under -Werror.
+    /^#define[[:space:]]+NGX_HTTP_CACHE_TURBO_REDIS_FRAME_MAX_DEPTH[[:space:]]/ {
+        next
+    }
     /^static ngx_int_t$/ { pending = 1; buf = $0 ORS; next }
-    pending && /^ngx_http_cache_turbo_redis_(parse(_array|_scan)?|resp_len)\(/ {
+    pending && /^ngx_http_cache_turbo_redis_(parse(_array|_scan)?|resp_len|frame)\(/ {
         capture = 1; pending = 0; printf "%s", buf; print; next
     }
     pending { pending = 0; buf = "" }
@@ -70,16 +90,20 @@ awk '
         print
         if ($0 == "}") { capture = 0 }
     }
-' "$SRC" > "$OUT"
+' "$SRC" >> "$OUT"
 
 # --- sanity: all three must be present and the file must end on a closing brace.
 for fn in \
     'ngx_http_cache_turbo_redis_resp_len(' \
     'ngx_http_cache_turbo_redis_parse(' \
     'ngx_http_cache_turbo_redis_parse_array(' \
-    'ngx_http_cache_turbo_redis_parse_scan('
+    'ngx_http_cache_turbo_redis_parse_scan(' \
+    'ngx_http_cache_turbo_redis_frame('
 do
-    if ! grep -qF "$fn" "$OUT"; then
+    # Anchored at column 0: this matches the DEFINITION line only. A bare -F
+    # match would also hit the forward declaration this script emits for
+    # _frame(), turning a failed body slice into a silent pass.
+    if ! grep -qE "^${fn//(/\\(}" "$OUT"; then
         echo "✗ failed to extract $fn from $SRC" >&2
         echo "  (source layout changed? update extract_parser.sh)" >&2
         rm -f "$OUT"
@@ -93,4 +117,4 @@ if [ "$(tail -n1 "$OUT")" != "}" ]; then
 fi
 
 LINES=$(wc -l < "$OUT")
-echo "✓ extracted redis_parse() + _parse_array() + _parse_scan() — $LINES lines -> $OUT"
+echo "✓ extracted redis_parse() + _parse_array() + _parse_scan() + _frame() — $LINES lines -> $OUT"

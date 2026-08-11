@@ -3,6 +3,7 @@
  *   ngx_http_cache_turbo_redis_parse()        - bulk-string GET reply
  *   ngx_http_cache_turbo_redis_parse_array()  - SMEMBERS array reply
  *   ngx_http_cache_turbo_redis_parse_scan()   - SCAN [cursor, keys] 2-tuple
+ *   ngx_http_cache_turbo_redis_frame()        - STAB-3 pre-framer (recursive)
  *
  * Why this target: these functions parse a Redis reply — attacker-influenceable
  * bytes from a shared, possibly buggy or compromised L2 — doing length-line and
@@ -14,7 +15,7 @@
  * off-by-one — into an immediate, reproducible heap-buffer-overflow.
  *
  * The real parser bodies live in ../../src/ngx_http_cache_turbo_redis.c and depend
- * on the nginx tree; ci/fuzz/extract_parser.sh slices just those three functions
+ * on the nginx tree; ci/fuzz/extract_parser.sh slices just those four functions
  * into generated_parser.inc at build time, so we always fuzz the SHIPPED code
  * with no copy drift. ngx_shim.h supplies the tiny nginx surface they need
  * (op struct, pool, ngx_atoi/ngx_strlchr) with faithful upstream semantics.
@@ -167,6 +168,45 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
             check_in_bounds(cursor.data, cursor.len, buf, size);
             for (ngx_uint_t i = 0; i < nkeys; i++) {
                 check_in_bounds(keys[i].data, keys[i].len, buf, size);
+            }
+        }
+        ngx_fuzz_pool_reset(&pool);
+    }
+
+    /* 4) STAB-3 pre-framer. Unlike the three above it takes raw pointers rather
+     * than an op, reports progress through *next, and is the module's ONLY
+     * recursive parser: a `*<count>` array recurses per element, bounded by
+     * FRAME_MAX_DEPTH. It is the pre-framer for read_smembers/read_scan and,
+     * since PR #233, the keepalive clean gate in read_lock depends on it too —
+     * so a frame that reports the wrong end advances the read cursor onto
+     * attacker-chosen bytes.
+     *
+     * Oracle: on NGX_OK, *next must land within [buf, buf + size]. Landing past
+     * the end means the caller's next frame() starts out of bounds; landing
+     * before the start means pointer arithmetic underflowed. Neither is
+     * something ASAN catches here — the bad read happens later, in the caller —
+     * so it is asserted explicitly. next == buf + size is legal: the frame
+     * consumed the buffer exactly.
+     *
+     * A non-OK return must not be trusted to have set *next at all, so it is
+     * only checked on NGX_OK. The sentinel below would be outside the buffer,
+     * which is precisely what makes it a usable "was it written" marker. */
+    {
+        u_char    *next = NULL;
+        ngx_int_t  rc;
+
+        rc = ngx_http_cache_turbo_redis_frame(buf, buf + size, 0, &next);
+        if (rc != NGX_OK && rc != NGX_AGAIN && rc != NGX_DECLINED) {
+            __builtin_trap();              /* undocumented return */
+        }
+        if (rc == NGX_OK) {
+            if (next == NULL) {
+                __builtin_trap();          /* OK but never reported an end */
+            }
+            if ((uintptr_t) next < (uintptr_t) buf
+                || (uintptr_t) next > (uintptr_t) buf + size)
+            {
+                __builtin_trap();          /* cursor outside the input buffer */
             }
         }
         ngx_fuzz_pool_reset(&pool);
