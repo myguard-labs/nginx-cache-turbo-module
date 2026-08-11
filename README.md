@@ -357,10 +357,14 @@ http {
 }
 ```
 
-That's the whole config. With just `cache_turbo ct;` the default key is
-`$host$uri$query_string` (the Host, path, and **raw query string with no
-normalization**) — vhosts don't collide, but by default tracking params and arg
-order **do matter**. To enable the automatic stripping of tracking params (`utm_*`,
+That's the whole config. With just `cache_turbo ct;` the default key is the
+Host header (`r->headers_in.server` — the validated Host, or matched
+server_name) plus the raw unparsed request URI (path + raw query string, **no
+decoding, no normalization**) — not the nginx `$host$uri$query_string`
+expression, since `$uri` is decoded/normalized and `unparsed_uri` is not; the
+closer nginx-variable spelling is `$host$request_uri`. Vhosts don't collide,
+but by default tracking params and arg order **do matter**. To enable the
+automatic stripping of tracking params (`utm_*`,
 `fbclid`, …, plus `sid`, `sessionid`, `tmp_*`) and order-insensitive matching,
 you must explicitly set the key:
 
@@ -982,11 +986,30 @@ Three caveats worth checking against your install:
 ## The cache key
 
 A "key" is just the string that decides whether two requests are *the same
-page*. The **built-in default key is `$host$uri$query_string`** (the Host + path +
-raw query string, with **no argument normalization**) — two vhosts sharing a zone
-never collide, but by default `?utm_*` tracking params and arg-reordering create
-separate entries. To enable normalized matching (params stripped, args sorted),
-set `cache_turbo_key` to `$host$uri$cache_turbo_normalized_args` explicitly.
+page*. The **built-in default key is the Host header plus the raw unparsed
+request URI** — `r->headers_in.server` (the validated Host, or matched
+server_name) concatenated with `r->unparsed_uri` (path + raw query string,
+with **no decoding and no argument normalization**). This is *not* the same
+as the nginx expression `$host$uri$query_string`: `$uri` is decoded and
+normalized (dot-segments collapsed, percent-decoded) while `unparsed_uri` is
+not, so the closer nginx-variable equivalent is `$host$request_uri`. Two
+vhosts sharing a zone never collide (the Host is in the key), but by default
+`?utm_*` tracking params and arg-reordering create separate entries. To
+enable normalized matching (params stripped, args sorted), set
+`cache_turbo_key` to `$host$uri$cache_turbo_normalized_args` explicitly.
+
+> **Scheme and port are not in the default key.** The default key has no
+> `$scheme` and no listener port, so an HTTP request and an HTTPS request for
+> the same Host + path map to the **same** cache entry whenever both server
+> blocks share one `cache_turbo` zone. The Host is still in the key, so this
+> is not cross-tenant poisoning — it is representation-mixing of what the
+> module treats as the same resource served two ways. If the origin's
+> response actually differs by scheme (scheme-absolute URLs in the body,
+> per-scheme HSTS or redirect behavior), a response fetched under one scheme
+> can be served back under the other. Fix by putting `$scheme` (and, if you
+> multiplex ports within one scheme, `$server_port`) into the key:
+> `cache_turbo_key $scheme$host$request_uri;`. Giving the HTTP and HTTPS
+> `server` blocks separate `cache_turbo_zone`s is an equally valid fix.
 
 Set your own with `cache_turbo_key` using any nginx variables:
 
@@ -1617,7 +1640,7 @@ http {
 | `cache_turbo NAME` / `off` | `server`, `location` | `off` | Turn caching on (bind a zone) or off. Takes a zone name and nothing else — the old `auto` shorthand is gone (see `cache_turbo_backend`). |
 | `cache_turbo_backend NAME...` | `server`, `location` | — | Auto-classify dynamic (uncacheable) request surfaces for one or more application presets: `wordpress`, `woocommerce`, `joomla`, `xenforo`, `discourse`, `phpbb`, `drupal`, `mediawiki`, `magento`, `shopware6`, `ghost`, `wagtail`, `kirby`, `typo3`, `invision`, `smf`, `vanilla`, `punbb`, `phorum`, `yabb`, `mybb`, `vbulletin`, `textpattern`, `bludit`, `spip`, `bugzilla`, `mantisbt` (`mantis`), `plone`, `umbraco`, `dotclear`, `wikijs`, `redmine`, `flarum`, `opencart`; aliases: `classicpress` → `wordpress`, `backdrop` → `drupal`; or `none`. A matching request (login/session cookie, admin URI, dynamic arg) skips lookup **and storage** and goes straight to origin. **Every preset is opt-in**; names **stack**, separated by spaces or `\|` (`wordpress\|woocommerce` == `wordpress woocommerce`). Implies `cache_turbo_cache_control honor`. **`none`** means no preset here and exists to override one inherited from the `server` block; it is exclusive and does not imply `honor`. **`generic`/`auto` were removed** and are now a config error — the union was never a safe default ([why](#cms-backends-cache_turbo_backend)). Cookie names that an app lets you rename still need an explicit local rule; see each [application guide](docs/README.md). There is **no `django`/`laravel` preset** and never will be ([why](docs/frameworks.md)); Jira, Request Tracker and several other session-eager trackers are intentional non-presets ([research](docs/README.md#apps-we-deliberately-do-not-ship-a-preset-for)). |
 | `cache_turbo_suppress_native on` | `server`, `location` | `off` | Make `$cache_turbo_active` read `1` while cache-turbo owns a request, so a stacked native `proxy_cache` can defer via `proxy_no_cache $cache_turbo_active; proxy_cache_bypass $cache_turbo_active;`. Off (default) keeps the variable always `0` (the wiring stays inert). |
-| `cache_turbo_key STRING` | `server`, `location` | raw | What makes two requests "the same page". The built-in default is `$host$uri$query_string` — Host + raw unparsed path/query, with **no argument normalization**. To enable normalized matching (params stripped, args sorted), set it to `$host$uri$cache_turbo_normalized_args` explicitly. |
+| `cache_turbo_key STRING` | `server`, `location` | raw | What makes two requests "the same page". The built-in default is the Host header + raw unparsed path/query (not `$host$uri$query_string` — closer to `$host$request_uri`, since `unparsed_uri` is undecoded), with **no argument normalization** and **no scheme/port**. To enable normalized matching, set it to `$host$uri$cache_turbo_normalized_args`; to separate HTTP/HTTPS entries, use `$scheme$host$request_uri`. |
 | `cache_turbo_preset NAME` | `server`, `location` | `balanced` | `micro` / `conservative` / `balanced` / `aggressive` — sets the four knobs below at once. `micro` = 1s microcaching (valid 1s, lock_ttl 1s, ×2 stale). |
 | `cache_turbo_valid [CODE...] TIME` | `server`, `location` | preset (`60s`) | How long a copy stays *fresh* (then *stale*, still served). Bare `TIME` = the default/200 TTL. `TIME` of `0` = cache forever (stays fresh, never expires). With leading status codes (`cache_turbo_valid 301 404 1m;`) it makes those statuses cacheable too — redirects + negative caching. Repeatable. |
 | `cache_turbo_beta N` | `server`, `location` | preset (`1000`) | Refresh eagerness, ×1000 (1000 = 1.0). Higher = refresh sooner/more often. |
