@@ -1752,6 +1752,15 @@ typedef struct {
      * ours. Every unstub() and every adoption compares it under the zone mutex.
      * 0 when this ctx never won (or inherited nothing). */
     uint64_t                 cold_owner;
+    /* CTXRDR-ADOPT-LEASE (cross-node resume): claim() issues the L1 lease
+     * token BEFORE the cross-node NX lock fires and the request parks
+     * (NGX_AGAIN) waiting for the Redis reply. The claim_owner that carried
+     * it was a stack local in the caller's frame and does not survive the
+     * park/resume; stash it here at claim time so the resume path (ctx->
+     * lock_done) can hand the real token to cold_mark_winner() instead of a
+     * literal 0, which would leave the lease unowned and shm_unstub() a
+     * permanent no-op for this key. */
+    uint64_t                 pending_l1_owner;
     ngx_chain_t             *body;        /* buffered response chain        */
     ngx_chain_t             *body_last;   /* tail of body, O(1) append      */
     size_t                   body_len;

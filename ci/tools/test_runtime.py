@@ -1469,6 +1469,44 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # AUD-NXLOCK-OWNER: same shape as /coldl2/ (cold-miss, L2-backed, lock
+        # default ON) but with cache_turbo_no_store so the cross-node NX winner's
+        # response is non-cacheable and the header filter's unstub() fires
+        # immediately (module.c ~7861) instead of waiting for the pool cleanup
+        # backstop. lock_ttl is LONG (30s) so the leaked L1 lease -- if the fix
+        # regresses -- cannot expire mid-test and mask the bug (a short TTL lets
+        # claim() ADOPT the stub instead of parking, making a buggy build look
+        # exactly as fast as a fixed one). cache_turbo_key is a FIXED string,
+        # not $uri, so /coldl2ns_probe/ below can hash to the identical L1 node
+        # while never touching Redis -- see that location's comment for why.
+        location /coldl2ns/ {{
+            cache_turbo           main;
+            cache_turbo_key       "aud-nxlock-owner-probe";
+            cache_turbo_valid     30s;
+            cache_turbo_lock_ttl  30s;
+            cache_turbo_no_store  $arg_private;
+            cache_turbo_redis     127.0.0.1:{redis_port} prefix=ct: timeout=250ms;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # AUD-NXLOCK-OWNER probe: same zone (main) and the SAME fixed key as
+        # /coldl2ns/, but no cache_turbo_redis / cache_turbo_lock_ttl override
+        # of its own -- cache_turbo_lock stays default ON but there is no L2
+        # backend configured here, so clcf->backend->lock is never armed and a
+        # claim() on this location can never fire (or park on) the Redis NX
+        # lock. It can only ever see the SHARED zone's L1 node for that key.
+        # This is what lets the test tell "L1 stub still refreshing" (the bug)
+        # apart from "Redis NX lock still held by design" (expected, and NOT
+        # what this item is about -- unlock() is intentionally never called
+        # for the cross-node lock, so a second /coldl2ns/ request always parks
+        # on Redis regardless of the L1 fix).
+        location /coldl2ns_probe/ {{
+            cache_turbo           main;
+            cache_turbo_key       "aud-nxlock-owner-probe";
+            cache_turbo_valid     30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # admin endpoint that is itself L2-aware: a single-key purge here must
         # also DEL the entry from Redis (P6), not just drop L1.
         location = /_cache_l2 {{
@@ -10637,6 +10675,87 @@ def _admin_l2_misses(ng: Nginx) -> int:
     return int(json.loads(b).get("l2_misses", 0))
 
 
+def test_cross_node_winner_owner_token_preserved(ng: Nginx, origin: Origin,
+                                                 redis: RedisServer) -> None:
+    """AUD-NXLOCK-OWNER: the cross-node NX-lock resume path must hand
+    cold_mark_winner() the SAME L1 owner token claim() issued before the park,
+    not a literal 0.
+
+    Mechanism: claim() at the top of the `if (clcf->lock)` block takes an L1
+    lease (a stack local claim_owner, non-zero) before firing the cross-node
+    Redis NX lock and parking (NGX_AGAIN). On resume (ctx->lock_done), the
+    request is unconditionally a former CLAIM_WINNER -- an L1 lease WAS taken
+    -- yet the pre-fix code passed a literal 0 to cold_mark_winner(), because
+    the stack local does not survive the park/resume. shm_unstub() is a no-op
+    when owner == 0 (ngx_http_cache_turbo_shm.c ~913), so a winner whose
+    response turns out non-cacheable can never release its stub: the header
+    filter's immediate unstub() (module.c ~7861) and the pool-cleanup backstop
+    both pass owner=0 and both silently no-op, leaving the node `refreshing`
+    with a lease nobody can ever match (CTXRDR-ADOPT-LEASE's owner identity
+    check requires refresh_owner == owner, and 0 is rejected outright).
+
+    Oracle: lock_waits (bumped only on ENTRY to cold_wait()), not wall clock.
+    A leaked stub only delays a later request while the lease is still live;
+    with a short lock_ttl the lease would simply expire and the next claim()
+    would ADOPT the stub instead of parking, making a buggy build exactly as
+    fast as a fixed one. /coldl2ns/ uses a 30s lock_ttl so that cannot happen
+    inside this test's timeframe.
+
+    Why the second probe is a SEPARATE, redis-less location and not a second
+    /coldl2ns/ request: the cross-node Redis NX lock is deliberately never
+    unlock()ed (module.c ~6015 -- unlocking early would re-open the fleet-wide
+    dogpile window), so it stays SET for the full lock_ttl regardless of this
+    bug. A second /coldl2ns/ request always parks on THAT lock, which would
+    make lock_waits move on a fixed build too and give a vacuous test. The two
+    locations share the `main` zone and a FIXED cache_turbo_key (not $uri), so
+    they hash to the identical L1 node -- but /coldl2ns_probe/ has no L2
+    backend configured, so its claim() can only ever see the shared L1 state
+    and can never itself touch or park on Redis.
+
+    /coldl2ns/ (cache_turbo_no_store $arg_private, lock default ON, L2-backed)
+    makes the FIRST request for a virgin key a non-cacheable cross-node
+    winner: it takes the L1 claim, fires+wins the uncontested NX lock, resumes
+    with lock_result == NGX_OK, and its no_store response never reaches the
+    body-filter store -- forcing the header-filter unstub() at ~7861 to be the
+    ONLY thing that can release the L1 lease. A probe request against the SAME
+    key on /coldl2ns_probe/ must then find the L1 stub already released
+    (claim() sees `refreshing == 0` -> CLAIM_WINNER, straight to origin) and
+    must NOT park in cold_wait(), because parking there is only reachable via
+    CLAIM_LOSER, which requires the stub to still read `refreshing` -- exactly
+    the leak this test targets."""
+    key = "aud-nxlock-owner-probe"
+    redis.cli("DEL", l2_key(key), lock_key(key))
+
+    waits0 = _admin_lock_waits(ng)
+
+    s1, _, h1 = fetch(ng.port, "/coldl2ns/owner?private=1")
+    assert s1 == 200, f"cross-node winner status {s1}"
+    assert "x-cache" not in h1, \
+        f"no_store response must not be a HIT: {h1.get('x-cache')}"
+
+    # The winner's own request must not have parked (it IS the winner).
+    assert _admin_lock_waits(ng) - waits0 == 0, \
+        (f"lock_waits moved by {_admin_lock_waits(ng) - waits0} on the winner's "
+         "own request -- fixture defect, not the bug under test")
+
+    # THE assertion. The probe location shares the L1 zone + key with the
+    # winner above but has no L2 backend of its own, so it can only observe
+    # -- never touch -- the shared L1 stub. If owner==0 leaked past unstub(),
+    # the L1 node is still `refreshing` and this probe's claim() returns
+    # CLAIM_LOSER, parking in cold_wait() and bumping lock_waits.
+    s2, _, _ = fetch(ng.port, "/coldl2ns_probe/owner")
+    assert s2 == 200, f"probe request status {s2}"
+    assert _admin_lock_waits(ng) - waits0 == 0, \
+        (f"lock_waits moved by {_admin_lock_waits(ng) - waits0}: the probe "
+         "request for the same L1 key PARKED in cold_wait() instead of "
+         "finding the L1 stub already released -- the cross-node resume path "
+         "handed cold_mark_winner() owner=0 instead of the stashed L1 lease "
+         "token (ctx->pending_l1_owner), so shm_unstub() no-opped and the "
+         "lease leaked (AUD-NXLOCK-OWNER)")
+
+    drain_origin(origin)
+
+
 def test_l2_miss_counted_once_on_cold_park(ng: Nginx, origin: Origin) -> None:
     """metrics: a single cold miss on an L2-backed, lock-ON location parks TWICE
     (once on the async L2 GET, once on the v4-2 NX lock) and re-enters the access
@@ -15472,6 +15591,7 @@ def run_all(ng: Nginx, origin: Origin,
         test_multinode_lock(ng, origin, redis)
         test_lock_self_heal(ng, origin, redis)
         test_cold_single_flight_cross_node(ng, origin, redis)
+        test_cross_node_winner_owner_token_preserved(ng, origin, redis)  # AUD-NXLOCK-OWNER
         test_l2_miss_counted_once_on_cold_park(ng, origin)  # double-count guard
         test_l2_db_select(ng, origin, redis)         # SELECT-only preamble
         # AUD-SCAN1: multi-page SCAN walks. Own ctscan: prefix, and they clean up
