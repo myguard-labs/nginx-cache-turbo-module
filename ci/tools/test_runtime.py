@@ -13451,9 +13451,21 @@ def test_request_cc_serve_verdict_l2(ng: Nginx, origin: Origin,
 
     def _drop_l1_keep_l2() -> None:
         """PURGE clears L1 AND L2 (module.c:1711); re-write the captured blob
-        straight into L2 afterwards so only L1 stays empty."""
+        straight into L2 afterwards so only L1 stays empty.
+
+        ⚠ The PURGE-side L2 DEL is FIRE-AND-FORGET: the 200 is written from the
+        L1 count and does not await Redis (see the purge completion comment,
+        "L2 deletions are fire-and-forget and not reflected in {"purged":N}").
+        So the DEL can land AFTER our set_raw() and delete the very blob under
+        test -- an unrecoverable loss that wait_for_l2() below can only report
+        as `observed (absent): None`, never wait out. Observed as an ASan
+        single-process red on run 31464424090. Wait for the DEL to be OBSERVED
+        (key gone) before writing, so the two operations cannot interleave."""
         s_p, b_p, _ = fetch_raw(ng.port, uri, method="PURGE")
         assert s_p == 200, f"PURGE status {s_p}: {b_p}"
+        assert wait_for(lambda: redis.cli("EXISTS", key) == "0"), \
+            "PURGE's fire-and-forget L2 DEL never landed; writing the blob " \
+            "back now would race it and could be deleted after the fact"
         redis.set_raw(key, blob, 3_600_000)
         wait_for_l2(redis, key, blob,
                     what="L2 restore after PURGE on /reqccl2/")
