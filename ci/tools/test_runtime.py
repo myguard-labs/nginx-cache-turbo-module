@@ -872,6 +872,27 @@ class Origin:
                     self.send_header("Cache-Control", "public, max-age=60")
                     self.send_header("CDN-Cache-Control", "max-age=30")
                     self.send_header("Surrogate-Control", "max-age=30")
+                if "scsplit" in self.path:
+                    # AUD2-CC-TARGETED: Surrogate-Control split across TWO
+                    # field-lines, max-age on the SECOND. A single-line reader
+                    # (header_find only sees the first occurrence) would see
+                    # stale-while-revalidate=30 alone, find no max-age and fall
+                    # through the ladder to Cache-Control's 60s -- the effective
+                    # TTL must come from the second SC line's max-age=1, not
+                    # from CC.
+                    self.send_header("Cache-Control", "public, max-age=60")
+                    self.send_header("Surrogate-Control",
+                                     "stale-while-revalidate=30")
+                    self.send_header("Surrogate-Control", "max-age=1")
+                if "cdnsplit" in self.path:
+                    # AUD2-CC-TARGETED: CDN-Cache-Control split across TWO
+                    # field-lines, max-age on the SECOND (first line carries an
+                    # unrelated directive only). Same defect as scsplit but for
+                    # arm 2 of the ladder.
+                    self.send_header("Cache-Control", "public, max-age=60")
+                    self.send_header("CDN-Cache-Control",
+                                     "stale-while-revalidate=30")
+                    self.send_header("CDN-Cache-Control", "max-age=1")
                 if "ccpad" in self.path:
                     # leading-zero max-age: precise token parse must read this as
                     # 1000s fresh (cacheable), NOT trip the substring "max-age=0".
@@ -8311,6 +8332,43 @@ def test_surrogate_control_ttl_outranks_cdn_and_cache_control(ng: Nginx) -> None
          f"should be STALE at 2s, got {h2.get('x-cache')}")
 
 
+def test_surrogate_control_split_header_ttl(ng: Nginx) -> None:
+    """AUD2-CC-TARGETED: Surrogate-Control split across TWO field-lines
+    (/cc7/scsplit) -- stale-while-revalidate=30 on the first, max-age=1 on the
+    SECOND. header_find() only sees the first occurrence; a single-line TTL
+    read would miss max-age entirely and fall through to Cache-Control's 60s,
+    caching far longer than Surrogate-Control authorized. STALE at ~2s proves
+    the second SC line's max-age=1 won, not CC's 60s."""
+    _, _, h0 = fetch(ng.port, "/cc7/scsplit")
+    assert "x-cache" not in h0, "first should miss"
+    _, _, h1 = fetch(ng.port, "/cc7/scsplit")
+    assert h1.get("x-cache") == "HIT", "second should be a fresh HIT (<1s)"
+    time.sleep(2.0)                               # past SC max-age=1 (2nd line)
+    _, _, h2 = fetch(ng.port, "/cc7/scsplit")
+    assert h2.get("x-cache") == "STALE", \
+        ("Surrogate-Control max-age on a later field-line must not be ignored: "
+         f"entry should be STALE at 2s (SC max-age=1), got {h2.get('x-cache')} "
+         "(a single-line reader would wrongly stay fresh on CC max-age=60)")
+
+
+def test_cdn_cache_control_split_header_ttl(ng: Nginx) -> None:
+    """AUD2-CC-TARGETED: CDN-Cache-Control split across TWO field-lines
+    (/cc7/cdnsplit) -- stale-while-revalidate=30 on the first, max-age=1 on the
+    SECOND. Same defect as scsplit but for ladder arm 2. STALE at ~2s proves
+    the second CDN-CC line's max-age=1 won over Cache-Control's 60s."""
+    _, _, h0 = fetch(ng.port, "/cc7/cdnsplit")
+    assert "x-cache" not in h0, "first should miss"
+    _, _, h1 = fetch(ng.port, "/cc7/cdnsplit")
+    assert h1.get("x-cache") == "HIT", "second should be a fresh HIT (<1s)"
+    time.sleep(2.0)                               # past CDN-CC max-age=1 (2nd line)
+    _, _, h2 = fetch(ng.port, "/cc7/cdnsplit")
+    assert h2.get("x-cache") == "STALE", \
+        ("CDN-Cache-Control max-age on a later field-line must not be ignored: "
+         f"entry should be STALE at 2s (CDN-CC max-age=1), got "
+         f"{h2.get('x-cache')} (a single-line reader would wrongly stay fresh "
+         "on CC max-age=60)")
+
+
 def test_cdn_cache_control_no_store_refuses(ng: Nginx) -> None:
     """RFC 9213: a targeted CDN-Cache-Control: no-store must veto the shared store
     even though plain Cache-Control (max-age=60) would permit it. The /cc7/ honor
@@ -15591,6 +15649,8 @@ def run_all(ng: Nginx, origin: Origin,
     test_honor_expires_absolute_ttl(ng)                    # upstream_ttl Expires arm
     test_cdn_cache_control_ttl_outranks_cache_control(ng)   # RFC 9213
     test_surrogate_control_ttl_outranks_cdn_and_cache_control(ng)  # RFC 9213
+    test_surrogate_control_split_header_ttl(ng)             # AUD2-CC-TARGETED
+    test_cdn_cache_control_split_header_ttl(ng)             # AUD2-CC-TARGETED
     test_cdn_cache_control_no_store_refuses(ng)             # RFC 9213
     test_targeted_cache_control_stripped_from_serve(ng)     # RFC 9213
     test_age_header(ng)
