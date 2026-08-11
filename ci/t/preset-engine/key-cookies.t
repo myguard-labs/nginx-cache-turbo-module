@@ -134,24 +134,45 @@ __DATA__
 
 
 === TEST 4: ALL THREE key cookies present, each contributes -- changing any one alone must miss the full-set entry
+# Each pair below holds two of the three fixed and moves the third, so every
+# slot of ct_invision_key_cookies[] is exercised as the ONLY thing that changed.
+# Varying just the first (ips4_hasJS) would leave the later two unpinned
+# whenever the first is present: TEST 3 covers ips4_theme/ips4_language with
+# ips4_hasJS ABSENT, which is a different scan path -- a fold that stops after
+# the first MATCH (rather than the first miss) still passes TEST 3, and only
+# the ips4_theme and ips4_language pairs here catch it.
 --- http_config eval: $::HttpConfig
 --- config eval: $::Config
 --- request eval
 ["GET /inv/page-d", "GET /inv/page-d",
+ "GET /inv/page-d", "GET /inv/page-d",
+ "GET /inv/page-d", "GET /inv/page-d",
  "GET /inv/page-d", "GET /inv/page-d"]
 --- more_headers eval
 ["Cookie: ips4_hasJS=1; ips4_theme=dark; ips4_language=de",
  "Cookie: ips4_hasJS=1; ips4_theme=dark; ips4_language=de",
  "Cookie: ips4_hasJS=0; ips4_theme=dark; ips4_language=de",
- "Cookie: ips4_hasJS=0; ips4_theme=dark; ips4_language=de"]
+ "Cookie: ips4_hasJS=0; ips4_theme=dark; ips4_language=de",
+ "Cookie: ips4_hasJS=1; ips4_theme=light; ips4_language=de",
+ "Cookie: ips4_hasJS=1; ips4_theme=light; ips4_language=de",
+ "Cookie: ips4_hasJS=1; ips4_theme=dark; ips4_language=fr",
+ "Cookie: ips4_hasJS=1; ips4_theme=dark; ips4_language=fr"]
 --- response_headers eval
 [qq{X-Cache: }, qq{X-Cache: HIT},
+ qq{X-Cache: }, qq{X-Cache: HIT},
+ qq{X-Cache: }, qq{X-Cache: HIT},
  qq{X-Cache: }, qq{X-Cache: HIT}]
 --- response_body_like eval
-[qr/ips4_hasJS=1/, qr/ips4_hasJS=1/,
- qr/ips4_hasJS=0/, qr/ips4_hasJS=0/]
+[qr/ips4_hasJS=1; ips4_theme=dark; ips4_language=de/,
+ qr/ips4_hasJS=1; ips4_theme=dark; ips4_language=de/,
+ qr/ips4_hasJS=0; ips4_theme=dark; ips4_language=de/,
+ qr/ips4_hasJS=0; ips4_theme=dark; ips4_language=de/,
+ qr/ips4_hasJS=1; ips4_theme=light; ips4_language=de/,
+ qr/ips4_hasJS=1; ips4_theme=light; ips4_language=de/,
+ qr/ips4_hasJS=1; ips4_theme=dark; ips4_language=fr/,
+ qr/ips4_hasJS=1; ips4_theme=dark; ips4_language=fr/]
 --- error_code eval
-[200, 200, 200, 200]
+[200, 200, 200, 200, 200, 200, 200, 200]
 
 
 
