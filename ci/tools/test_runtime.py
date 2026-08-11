@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """End-to-end tests for ngx_http_cache_turbo_module.
 
+REQUIRED: The module MUST be built with -DNGX_HTTP_CACHE_TURBO_TEST_FAULTS=1.
+This script's config builder emits cache_turbo_test_* directives that are only
+valid in TEST_FAULTS builds. Running the suite against a production (non-TEST_FAULTS)
+module will fail at nginx startup with: unknown directive "cache_turbo_test_*".
+See CONTRIBUTING.md § Tests for the correct build command.
+
 Covers v1/v1.1 features and the regressions logged in
 memory/nginx+angie/cache-turbo/issues.md:
 
