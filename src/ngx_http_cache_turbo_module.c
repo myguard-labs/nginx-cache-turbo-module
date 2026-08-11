@@ -5882,9 +5882,15 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
         if (ctx->lock_done) {
             if (ctx->lock_result == NGX_OK || ctx->lock_result == NGX_ERROR) {
                 (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
-                /* Cross-node win via the L2 NX lock: no L1 lease was taken, so
-                 * there is no owner token to carry (CTXRDR-ADOPT-LEASE). */
-                ngx_http_cache_turbo_cold_mark_winner(r, ctx, z, 0);
+                /* This resume always follows a CLAIM_WINNER below that fired
+                 * the cross-node NX lock and parked: an L1 lease WAS taken
+                 * (CTXRDR-ADOPT-LEASE) and its token is stashed in
+                 * ctx->pending_l1_owner since the claim_owner stack local
+                 * that carried it does not survive the park/resume. Hand it
+                 * to the winner so the lease is cleared by shm_unstub()
+                 * instead of leaking. */
+                ngx_http_cache_turbo_cold_mark_winner(r, ctx, z,
+                                                       ctx->pending_l1_owner);
                 ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                                "cache_turbo: cold-miss cross-node WON%s \"%V\" "
                                "key=%ui -> origin",
@@ -5899,6 +5905,11 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
         }
 
         cl = clcf->l1->claim(z, ctx->key_hash, hash, lock_ttl, &claim_owner);
+        /* Stash the lease token now: if this claim is a CLAIM_WINNER that
+         * goes on to fire the cross-node NX lock below, the request parks
+         * (NGX_AGAIN) and resumes at the top of this block on a fresh call
+         * where claim_owner (a stack local) no longer holds it. */
+        ctx->pending_l1_owner = claim_owner;
 
         if (cl == NGX_HTTP_CACHE_TURBO_CLAIM_FRESH) {
             /* A real fresh entry raced in while we were on the cold path
