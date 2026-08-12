@@ -10348,6 +10348,11 @@ ngx_http_cache_turbo_redis_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                                    "cache_turbo_redis: bad timeout \"%V\"", &s);
                 return NGX_CONF_ERROR;
             }
+            if (t == 0) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "cache_turbo_redis: timeout must be > 0");
+                return NGX_CONF_ERROR;
+            }
             clcf->redis_timeout = (ngx_msec_t) t;
 
         } else if (ngx_strncmp(value[i].data, "keepalive=", 10) == 0) {
@@ -10525,6 +10530,11 @@ ngx_http_cache_turbo_memcached_conf(ngx_conf_t *cf, ngx_command_t *cmd,
             if (t == NGX_ERROR) {
                 ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                     "cache_turbo_memcached: bad timeout \"%V\"", &s);
+                return NGX_CONF_ERROR;
+            }
+            if (t == 0) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                    "cache_turbo_memcached: timeout must be > 0");
                 return NGX_CONF_ERROR;
             }
             clcf->redis_timeout = (ngx_msec_t) t;
