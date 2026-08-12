@@ -11,6 +11,15 @@ Changes with the nginx-cache-turbo-module
        cache_turbo_auto_vary off explicitly to keep caching them -- see
        docs/wagtail.md.
 
+    *) Bugfix: a PURGE that reached the Redis variant-index walk leaked the
+       client connection. The request was parked with a reference that
+       nothing released, because the PRECONTENT phase handler returning
+       NGX_DONE never reaches ngx_http_finalize_request. The connection
+       stayed open with its fd held until worker shutdown, which logged
+       "open socket left in connection". Only reachable with
+       cache_turbo_auto_vary on, so the default change above is what exposed
+       it.
+
     *) Adopted the myguard skeleton CI standard: ci/ layout, a single
        pull_request entry point (ci.yml) with every other workflow a
        workflow_call member, the ci/linter/ gate behind one run-all.sh entry
