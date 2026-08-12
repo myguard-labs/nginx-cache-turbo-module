@@ -42,12 +42,12 @@ fi
 # accident must read as ENTRY, the safe direction), so a silent flip of these
 # values would invert several assertions while leaving them green.
 check_define() {
-    name="$1"; want="$2"
-    got=$(grep -E "^#define[[:space:]]+${name}[[:space:]]" "$HDR" \
+    name="$1"; want="$2"; where="${3:-$HDR}"
+    got=$(grep -E "^#define[[:space:]]+${name}[[:space:]]" "$where" \
           | head -n1 | sed -E "s/^#define[[:space:]]+${name}[[:space:]]+//" \
           | sed -E 's;/\*.*;;' | tr -d '[:space:]')
     if [ -z "$got" ]; then
-        echo "✗ $name not found in $HDR (renamed? update extract_shm.sh)" >&2
+        echo "✗ $name not found in $where (renamed? update extract_shm.sh)" >&2
         exit 1
     fi
     if [ "$got" != "$want" ]; then
@@ -84,6 +84,14 @@ check_define NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_LEASE 300
 check_define NGX_HTTP_CACHE_TURBO_BRK_ACT_PASS  0
 check_define NGX_HTTP_CACHE_TURBO_BRK_ACT_SERVE 1
 check_define NGX_HTTP_CACHE_TURBO_BRK_ACT_FAIL  2
+# S231-PERF-LRUCAP: the per-call demotion bound. Mirrored into
+# test_shm_state.c, and test_s231_lru_enforce_cap_is_bounded() asserts the
+# EXACT number demoted (== the bound, not merely <=), so a silent change to
+# the value in shm.c would leave the test asserting the old number against
+# the new behaviour and failing for a reason that looks unrelated -- or, if
+# the test copy were changed to match, passing while measuring nothing.
+# Lives in the .c, not the header, hence the third argument.
+check_define NGX_HTTP_CACHE_TURBO_LRU_CAP_MAX_EVICT 8 "$SRC"
 
 # H-4: the packed-probe layout macros are hand-mirrored into test_shm_state.c
 # (NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_WORD_BITS / _STAMP_BITS / _GEN_BITS /
