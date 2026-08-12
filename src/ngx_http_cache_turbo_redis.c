@@ -2755,29 +2755,19 @@ ngx_http_cache_turbo_redis_read_scan(ngx_event_t *rev)
  * rc the callback returned. On any failure the callback runs with 0 members so
  * the caller always gets a well-formed response.
  *
- * S231-VARY-LEAK: unlike get_finish/lock_finish (which resume the parked
- * request through ngx_http_core_run_phases, so the RE-ENTERED handler supplies
- * a second, natural finalize_request of its own), the callback here builds and
- * sends the whole HTTP response itself and this function finalizes exactly
- * ONCE. One finalize_request only ever drops ONE reference. Whether that single
- * drop balances the park's r->main->count++ depends on WHICH PHASE the entry
- * point sits in, and the two entry points differ -- which is why the decrement
- * below is conditional rather than unconditional:
- *
- *   - smembers()/purge_tag (!is_scan), from purge_request, PRECONTENT phase.
- *     ngx_http_core_generic_phase answers NGX_DONE with a bare `return NGX_OK`
- *     -- no finalize at all. So the park is unbalanced: count sits at 2 (1
- *     original + 1 park), this function's finalize takes it to 1, and nothing
- *     will ever call finalize again. The client connection is orphaned with its
- *     fd open, surfacing only at worker shutdown as "open socket left in
- *     connection". This path needs the explicit drop.
- *
- *   - scan_del (is_scan), from admin_handler, which is core->handler.
- *     ngx_http_core_content_phase ALWAYS calls ngx_http_finalize_request(r, rc),
- *     and rc == NGX_DONE goes straight to ngx_http_finalize_connection, which
- *     decrements. The park is therefore ALREADY balanced, and an unconditional
- *     drop here would take the count negative -- nginx logs "http request count
- *     is zero" and aborts. This path must NOT get the explicit drop.
+ * S231-VARY-LEAK: this function finalizes the parked request exactly ONCE, and
+ * one finalize_request only ever drops ONE reference. Whether that single drop
+ * balances the park's r->main->count++ depends on the PHASE the parking caller
+ * returns NGX_DONE into, which differs between callers -- so the park's release
+ * is owned by each CALL SITE, not by this function. Callers reached through
+ * core->handler (admin_handler's ?tag= and all-purge) are balanced already,
+ * because ngx_http_core_content_phase always runs ngx_http_finalize_request and
+ * NGX_DONE routes into ngx_http_finalize_connection, which decrements. The
+ * PRECONTENT caller (purge_request) gets no such drop -- ngx_http_core_generic
+ * _phase answers NGX_DONE with a bare `return NGX_OK` -- so IT does its own
+ * r->main->count-- right after the park returns. Do not "simplify" that by
+ * moving the decrement in here: it would over-drop the content-phase callers
+ * and trip "http request count is zero".
  */
 static void
 ngx_http_cache_turbo_redis_smembers_finish(
@@ -2789,7 +2779,6 @@ ngx_http_cache_turbo_redis_smembers_finish(
     void                                   *data = op->members_data;
     ngx_http_cache_turbo_redis_walk_t       walk;
     ngx_int_t                               rc;
-    ngx_uint_t                              op_is_scan;
 
     /* AUD-SCAN1: on the SCAN path, tell the callback HOW the walk ended.
      * op->scan_status is NGX_OK only where the server returned cursor "0";
@@ -2804,31 +2793,8 @@ ngx_http_cache_turbo_redis_smembers_finish(
     /* Callback consumes members (pointing into op->rbuf) synchronously. */
     rc = cb(r, data, members, nmembers, op->is_scan ? &walk : NULL);
 
-    /* Read before op_done() frees the pool op lives in. */
-    op_is_scan = op->is_scan;
-
     /* Now safe to drop our connection + pool (members no longer referenced). */
     ngx_http_cache_turbo_redis_op_done(op);
-
-    /* Release the SMEMBERS park before the completion finalize below, but ONLY
-     * on that path -- the two entry points sit in different nginx phases and
-     * only one of them gets a free drop. See the S231-VARY-LEAK comment above.
-     *
-     *   - smembers()/purge_tag (!is_scan) is reached from purge_request in the
-     *     PRECONTENT phase. ngx_http_core_generic_phase answers NGX_DONE with a
-     *     bare `return NGX_OK` and never finalizes, so the park's count++ has no
-     *     counterpart and the single finalize below leaves count at 1 forever.
-     *     Drop it here.
-     *   - scan_del (is_scan) is reached from admin_handler, which is
-     *     core->handler. ngx_http_core_content_phase ALWAYS runs
-     *     ngx_http_finalize_request(r, rc), and rc == NGX_DONE routes straight
-     *     into ngx_http_finalize_connection -- which decrements. That already
-     *     balances the park, so decrementing here too would drive the count
-     *     negative and trip "http request count is zero".
-     */
-    if (!op_is_scan) {
-        r->main->count--;
-    }
 
     ngx_http_run_posted_requests(r->connection);
     ngx_http_finalize_request(r, rc);
