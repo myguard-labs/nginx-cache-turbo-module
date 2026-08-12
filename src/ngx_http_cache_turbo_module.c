@@ -4809,8 +4809,12 @@ ngx_http_cache_turbo_blob_cleanup(void *data)
  * same blob would double-drop the refcount and free a slab still in use
  * elsewhere.
  *
- * Returns NGX_ERROR when the cleanup cannot be registered; the caller must then
- * release the reference itself and arm nothing.
+ * Returns NGX_ERROR when the cleanup cannot be registered. Both callers run
+ * this BEFORE ngx_http_cache_turbo_blob_acquire() precisely so that failure
+ * path owns nothing: no reference has been taken yet, so the caller arms
+ * nothing and releases nothing. A future caller that acquires first would have
+ * to release here -- and could not, because blob_release() takes the zone mutex
+ * the arming sites already hold. Keep the order.
  */
 static ngx_int_t
 ngx_http_cache_turbo_blob_ref_cleanup(ngx_http_request_t *r,

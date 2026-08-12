@@ -1850,8 +1850,9 @@ typedef struct {
      * (ngx_http_cache_turbo_blob_ref_cleanup, out-param NULL -- nothing here
      * needs to drop the reference early) that releases the shm reference once
      * the request pool is destroyed; sie_snap then points straight into the
-     * shm slab. The L2 arm at :5513 instead points sie_snap at ctx->l2_blob,
-     * an r->pool buffer with no shm reference to release. Either way this
+     * shm slab. The L2 arm instead copies ctx->l2_blob into a fresh r->pool
+     * buffer and points sie_snap at that copy -- no shm reference exists on
+     * that path, so there is nothing to release. Either way this
      * replaced a memcpy of the whole blob under the ZONE MUTEX on every
      * expired-but-within-SIE-window entry, serialising concurrent workers on
      * a 1 MiB-default (configurable) copy exactly during the outage this
