@@ -5139,13 +5139,36 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                  * default) refresh in the background and serve stale now; else
                  * fall through to the origin and regenerate inline. */
                 if (clcf->background_update) {
-                    u_char *snap = ngx_pnalloc(r->pool, ctn->len);
-                    size_t  snap_len = ctn->len;
-                    if (snap == NULL) {
+                    /* S231-PERF-BGSNAP: PERF-7 style zero-copy pin instead of a
+                     * full-body memcpy under the zone mutex -- same treatment as
+                     * the SIE/breaker arms above (S231-PERF-SIEARM). UNLIKE
+                     * those arming sites, the pinned pointer is used
+                     * immediately (not stashed for a maybe-never-consumed
+                     * fallback): it must stay valid across the unlock below,
+                     * across warm_one() (which may itself touch this zone), and
+                     * into serve(), which is exactly what the refcount is for
+                     * -- see the PERF-7 comment on the fresh-HIT site above
+                     * ("eviction/refresh by any worker is safe meanwhile").
+                     *
+                     * Register the drop BEFORE acquiring, same ordering
+                     * invariant as blob_ref_cleanup()'s own comment: the only
+                     * failing call here is ngx_pool_cleanup_add(), which
+                     * touches r->pool only, so failing first costs nothing to
+                     * undo. Acquiring first would force the failure arm to
+                     * call blob_release(), which takes the zone mutex we are
+                     * still holding here (ngx_shmtx is not recursive). */
+                    u_char *snap;
+                    size_t  snap_len;
+
+                    if (ngx_http_cache_turbo_blob_ref_cleanup(r, z, ctn->data,
+                            NULL) != NGX_OK)
+                    {
                         ngx_shmtx_unlock(&z->shpool->mutex);
                         return NGX_ERROR;
                     }
-                    ngx_memcpy(snap, ctn->data, snap_len);
+                    ngx_http_cache_turbo_blob_acquire(ctn->data);
+                    snap = ctn->data;
+                    snap_len = ctn->len;
                     ngx_shmtx_unlock(&z->shpool->mutex);
                     (void) ngx_http_cache_turbo_warm_one(r, &r->uri, &r->args);
                     (void) ngx_atomic_fetch_add(&z->sh->stale_serves, 1);
@@ -5153,6 +5176,10 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                                    "cache_turbo: cross-node WON bg-refresh + STALE "
                                    "serve \"%V\" key=%ui len=%uz",
                                    &r->uri, (ngx_uint_t) hash, snap_len);
+                    /* ref_data is NULL: the cleanup was already registered
+                     * above (blob_ref_cleanup), so serve() must not register a
+                     * second one for the same pointer -- see the double-drop
+                     * warning on blob_ref_cleanup()'s comment. */
                     return ngx_http_cache_turbo_serve(r, snap, snap_len, 1,
                                                       z, NULL, NULL);
                 }
@@ -5223,15 +5250,35 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                     * ngx_http_cache_turbo_effective_load(clcf, z)
                     / NGX_HTTP_CACHE_TURBO_AT_LOAD_BASE;
 
-                /* snapshot the stale copy under the lock — used to serve stale on
-                 * the single-box background-update path below. */
+                /* S231-PERF-BGSNAP: pin the stale copy under the lock instead
+                 * of memcpy'ing the full body — used to serve stale on the
+                 * single-box background-update path below (PERF-7 zero-copy,
+                 * same treatment as the cross-node WON arm just above and the
+                 * SIE/breaker arms, S231-PERF-SIEARM). The pin must outlive
+                 * this critical section: a cross-node lock() call below can
+                 * park this request (NGX_AGAIN) and never consume `snap` on
+                 * this stack at all, or `background_update` can be off and
+                 * fall straight through without consuming it either — both are
+                 * fine, since the ref is dropped by the pool cleanup
+                 * registered here regardless of whether it is ever served (the
+                 * same "arm now, maybe never consumed" shape the SIE/breaker
+                 * comment describes), not by anything on this stack.
+                 *
+                 * Register the drop BEFORE acquiring, per the ordering
+                 * invariant on blob_ref_cleanup(): the only failing call here
+                 * is ngx_pool_cleanup_add() (r->pool only), so failing first
+                 * costs nothing to undo, whereas acquiring first would force
+                 * the failure arm to call blob_release() while still holding
+                 * this same zone mutex (ngx_shmtx is not recursive). */
                 snap_len = ctn->len;
-                snap = ngx_pnalloc(r->pool, snap_len);
-                if (snap == NULL) {
+                if (ngx_http_cache_turbo_blob_ref_cleanup(r, z, ctn->data,
+                        NULL) != NGX_OK)
+                {
                     ngx_shmtx_unlock(&z->shpool->mutex);
                     return NGX_ERROR;
                 }
-                ngx_memcpy(snap, ctn->data, snap_len);
+                ngx_http_cache_turbo_blob_acquire(ctn->data);
+                snap = ctn->data;
 
                 /* CTXRDR-ADOPT-LEASE: deliberately NO refresh_owner here. This is
                  * the v8 background-update lease on an ENTRY that still has a
