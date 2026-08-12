@@ -13044,11 +13044,14 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
      * (off) at every preset, so this is inert unless explicitly configured. */
     ngx_conf_merge_sec_value(conf->l2_negative_ttl, prev->l2_negative_ttl, 0);
 
-    /* cache_turbo_keep_stale (S2.1). Plain inherit/default-0, same shape as
-     * l2_negative_ttl above -- not a preset band column, and off unless an
-     * operator opts in. Consulted on the store path, where a non-zero value
-     * widens sie_window (S2.2). */
-    ngx_conf_merge_sec_value(conf->keep_stale, prev->keep_stale, 0);
+    /* cache_turbo_keep_stale (S2.1). Not a preset band column, but shipped ON
+     * by default (S231-DEFAULTS): outage resilience -- serving a stale object
+     * past its normal window beats a hard miss when the origin is down, and
+     * an operator who wants the old strict-off behavior still has
+     * `cache_turbo_keep_stale off` to get it back explicitly. 86400 (24h)
+     * matches the approved default value. Consulted on the store path, where
+     * a non-zero value widens sie_window (S2.2). */
+    ngx_conf_merge_sec_value(conf->keep_stale, prev->keep_stale, 86400);
 
     /* cache_turbo_use_stale (S4.1). Plain inherit/default, same shape as
      * keep_stale above. Default is USE_STALE_DEFAULT (HTTP_500|502|503|504 +
@@ -13062,16 +13065,22 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 
     /* O4.4: the breaker's own on/off switch, independent of clcf->enable and
      * of the threshold/window off-switches below -- see
-     * ngx_http_cache_turbo_breaker_should_consult(). */
-    ngx_conf_merge_value(conf->breaker_enable, prev->breaker_enable, 0);
+     * ngx_http_cache_turbo_breaker_should_consult(). Shipped ON by default
+     * (S231-DEFAULTS): outage resilience -- a flapping/dead origin should
+     * trip the breaker out of the box, not only after an operator discovers
+     * and opts into it. `cache_turbo_breaker off` (or either off-switch
+     * below at 0) restores the old fully-disabled behavior explicitly. */
+    ngx_conf_merge_value(conf->breaker_enable, prev->breaker_enable, 1);
 
-    /* P6/O4.2 breaker tuning. Both default to 0, which _breaker_record()
-     * treats as INERT (no tripping, no window accounting) -- these are two
-     * more of the three independent off-switches alongside breaker_enable
-     * above. */
+    /* P6/O4.2 breaker tuning. Shipped ON by default (S231-DEFAULTS) alongside
+     * breaker_enable above: 5 failures within a 10s window is a reasonable
+     * out-of-the-box trip point for a flapping origin, tight enough to react
+     * fast, loose enough not to trip on ordinary transient errors. An
+     * explicit 0 on either one still fully disables tripping/window
+     * accounting in _breaker_record(), same as before. */
     ngx_conf_merge_uint_value(conf->breaker_threshold,
-                              prev->breaker_threshold, 0);
-    ngx_conf_merge_sec_value(conf->breaker_window, prev->breaker_window, 0);
+                              prev->breaker_threshold, 5);
+    ngx_conf_merge_sec_value(conf->breaker_window, prev->breaker_window, 10);
 
     /* P6/O4.3. ⚠ breaker_open merges to a NON-ZERO default, unlike every other
      * breaker field. 0 is not "off" for this one -- it is the one value that
@@ -13080,9 +13089,11 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
      * since nobody contacts the origin while OPEN no success can ever be
      * recorded to close it either. The breaker would stay open until reload.
      *
-     * The whole feature is still off by default via breaker_threshold == 0
-     * (which skips the state call outright), so this default only takes effect
-     * once an operator switches the breaker on. cache_turbo_breaker_open's
+     * The feature is now ON by default (S231-DEFAULTS: breaker_enable=1,
+     * breaker_threshold=5, breaker_window=10s), so this default takes effect
+     * out of the box, not only once an operator opts in. An operator who sets
+     * breaker_threshold to 0 (or breaker_enable off) still skips the state
+     * call outright, same as before. cache_turbo_breaker_open's
      * custom handler REJECTS an explicit 0 at parse time rather than accept
      * it as a disable -- tracked as O4.3-a -- so 0 can never reach this merge
      * from an explicit directive; NGX_CONF_UNSET is the only way through.

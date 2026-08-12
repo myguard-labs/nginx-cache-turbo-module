@@ -1230,6 +1230,12 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             cache_turbo          main;
             cache_turbo_key      $uri;
             cache_turbo_valid    30s;
+            # S231-DEFAULTS: pinned off. retain_ttl = max(stale_window,
+            # sie_window) folds keep_stale's window into the L2 (Redis) PTTL
+            # (module.c ~7705) -- left at the new 24h default,
+            # test_l2_write_through's PTTL bound (<=120s, i.e. valid*4) would
+            # fail because the stored blob would carry a ~24h TTL instead.
+            cache_turbo_keep_stale off;
             cache_turbo_redis    127.0.0.1:{redis_port} prefix=ct: timeout=250ms;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
@@ -1463,6 +1469,13 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             cache_turbo_key      $uri;
             cache_turbo_valid    1s;
             cache_turbo_stale_mult 1;
+            # S231-DEFAULTS: pinned off. keep_stale widens the blob's sie_ttl
+            # field the same way a response stale-if-error does (module.c
+            # ~7705, S2.2) -- left at the new 24h default,
+            # test_sie_ttl_stored_in_blob's "no stale-if-error header -> sie_ttl
+            # == 0" negative control would fail (sie_ttl would carry
+            # fresh_ttl+86400 instead).
+            cache_turbo_keep_stale off;
             cache_turbo_redis    127.0.0.1:{redis_port} prefix=ct: timeout=250ms;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
@@ -2035,6 +2048,13 @@ http {{
     # test_breaker_arming_gated_on_breaker_enable() (also on `main`) serve its
     # tripping request from the fallback instead of reaching the dead origin.
     cache_turbo_zone name=brkiz 16m;
+    # /breakeron/ and /breakeroff/'s own zone (S231-DEFAULTS) -- see the
+    # comment on /breakeron/ below for why this can no longer share `main`.
+    cache_turbo_zone name=brkonoffz 16m;
+    # S231-DEFAULTS: own zone for /brkdefault/ (compiled-in shipped-default
+    # breaker), same reasoning as brkiz above -- tripping it must not perturb
+    # /breakeron/'s state on `main`.
+    cache_turbo_zone name=brkdefz 16m;
     # O4.4-i L2 half. A SECOND private zone for the L2-backed arming pair
     # (/brkil2on/, /brkil2off/). Separate from brkiz because the L1 pair leaves
     # its own breaker OPEN and the two must not share a breaker state; separate
@@ -2657,6 +2677,12 @@ http {{
             cache_turbo_key      $uri;
             cache_turbo_valid    1s;
             cache_turbo_stale_mult 1;
+            # S231-DEFAULTS: pinned off. The no-SIE negative controls here
+            # (test_sie_serve_on_error, test_sie_serves_counter) rely on a
+            # PLAIN expired entry surfacing the origin's 503 directly -- left
+            # at the new 24h default, cache_turbo_keep_stale would serve it
+            # stale via S2.2 instead and make those negative controls vacuous.
+            cache_turbo_keep_stale off;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
@@ -2719,6 +2745,22 @@ http {{
             cache_turbo_valid    1s;
             cache_turbo_stale_mult 1;
             cache_turbo_keep_stale 1h;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # S231-DEFAULTS: NO cache_turbo_keep_stale directive at all -- proves
+        # the compiled-in merge default is 24h, not just that `24h;` works
+        # when written out explicitly (every /keepstale*/ location above opts
+        # in explicitly). Same short fresh/stale shape as /keepstale/ (1s
+        # fresh, stale_mult 1 -> 1s stale window) so a dead-origin fetch
+        # against a fully expired entry isolates the shipped default rather
+        # than the explicit 1h window. Drives
+        # test_keep_stale_shipped_default_serves_dead_origin.
+        location /ksdefault/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    1s;
+            cache_turbo_stale_mult 1;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
@@ -2805,12 +2847,26 @@ http {{
         # ngx_http_cache_turbo_access_handler) -- so this isolates that call
         # site's routing through breaker_should_consult() rather than
         # overlapping RFC-2/keep_stale, which have their own coverage above.
-        # Drives test_breaker_arming_gated_on_breaker_enable.
+        # Drives test_breaker_arming_gated_on_breaker_enable. Own zone
+        # (brkonoffz), not `main`: S231-DEFAULTS made breaker_enable/
+        # threshold/window shipped-on by default, so `main`'s ~120+ other
+        # locations (which set no breaker directives at all) now pick up the
+        # compiled-in defaults (5/10s) -- sharing `main` here would make this
+        # location's deliberately-fast explicit tuple (threshold=1/window=60s,
+        # chosen to trip on a single request) diverge from that ambient
+        # default and trip the O4.4-d policy-divergence warning on every
+        # config load. /breakeroff/ shares brkonoffz with this location (they
+        # need to compare against each other, not against `main`).
         location /breakeron/ {{
-            cache_turbo                    main;
+            cache_turbo                    brkonoffz;
             cache_turbo_key                $uri;
             cache_turbo_valid               1s;
             cache_turbo_stale_mult          1;
+            # keep_stale is ALSO on by default now (S231-DEFAULTS, 24h) and
+            # would mask the dead origin behind S2.2's serve-on-error
+            # fallback before the tripping request ever reached it -- off
+            # here so this isolates the breaker call site alone.
+            cache_turbo_keep_stale          off;
             cache_turbo_breaker             on;
             cache_turbo_breaker_threshold   1;
             cache_turbo_breaker_window     60s;
@@ -2826,17 +2882,45 @@ http {{
         # site, this location would ALSO fall back to the stale snapshot on a
         # dead origin, exactly like /breakeron/. It must instead surface the
         # origin failure, because with the breaker off nothing may EVER be
-        # armed or consulted.
+        # armed or consulted. keep_stale off for the same reason as
+        # /breakeron/ above (S231-DEFAULTS): it would otherwise mask the
+        # dead origin via S2.2 regardless of the breaker flag, making this
+        # negative control vacuous.
         location /breakeroff/ {{
-            cache_turbo                    main;
+            cache_turbo                    brkonoffz;
             cache_turbo_key                $uri;
             cache_turbo_valid               1s;
             cache_turbo_stale_mult          1;
+            cache_turbo_keep_stale          off;
             cache_turbo_breaker             off;
             cache_turbo_breaker_threshold   1;
             cache_turbo_breaker_window     60s;
             cache_turbo_breaker_open       30s;
             cache_turbo_lock_timeout        2s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # S231-DEFAULTS: NO cache_turbo_breaker/threshold/window directives at
+        # all -- proves the compiled-in merge defaults are breaker_enable=1,
+        # breaker_threshold=5, breaker_window=10s, not just that `on;
+        # threshold 1; window 60s;` works when written out explicitly (every
+        # /breaker*/ location above opts in explicitly). Own zone so tripping
+        # it here cannot perturb /breakeron/'s counters on `main`. threshold=5
+        # means five failing responses are needed to trip CLOSED -> OPEN (vs.
+        # threshold=1 on /breakeron/), so the test below drives five tripping
+        # fetches before the sixth observes the tripped state. Drives
+        # test_breaker_shipped_default_trips_and_serves_stale.
+        location /brkdefault/ {{
+            cache_turbo             brkdefz;
+            cache_turbo_key         $uri;
+            cache_turbo_valid       1s;
+            cache_turbo_stale_mult  1;
+            cache_turbo_lock_timeout 2s;
+            # keep_stale is now ALSO on by default (S231-DEFAULTS, 24h) and
+            # would mask a dead origin behind S2.2's serve-on-error fallback
+            # before the breaker ever gets a chance to trip -- explicitly off
+            # here so this location isolates the breaker default alone.
+            cache_turbo_keep_stale  off;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
@@ -2849,6 +2933,7 @@ http {{
             cache_turbo                    brkiz;
             cache_turbo_key                $uri;
             cache_turbo_valid               1s;
+            cache_turbo_keep_stale         off;  # S231-DEFAULTS: isolate dead-origin arming from the 24h keep_stale default
             cache_turbo_stale_mult          1;
             cache_turbo_breaker             on;
             cache_turbo_breaker_threshold   1;
@@ -2862,6 +2947,7 @@ http {{
             cache_turbo                    brkiz;
             cache_turbo_key                $uri;
             cache_turbo_valid               1s;
+            cache_turbo_keep_stale         off;  # S231-DEFAULTS: isolate dead-origin arming from the 24h keep_stale default
             cache_turbo_stale_mult          1;
             cache_turbo_breaker            off;
             cache_turbo_breaker_threshold   1;
@@ -2880,6 +2966,12 @@ http {{
             cache_turbo_key    $uri;
             cache_turbo_valid  1s;
             cache_turbo_beta   1;
+            # S231-DEFAULTS: pinned off explicitly. This location does not
+            # exercise the breaker; left at the (now shipped-on) default it
+            # would diverge from /sr72brk/'s deliberately fast explicit tuple
+            # (threshold=1/window=60s) on this shared zone and trip the
+            # O4.4-d policy-divergence warning on every config load.
+            cache_turbo_breaker off;
             add_header         X-CT-Reason $cache_turbo_serve_reason always;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
@@ -2894,6 +2986,8 @@ http {{
             cache_turbo_key    $uri;
             cache_turbo_valid  1s;
             cache_turbo_stale_mult 1;
+            # S231-DEFAULTS: see /sr72/ above -- same reason, pinned off.
+            cache_turbo_breaker off;
             add_header         X-CT-Reason $cache_turbo_serve_reason always;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
@@ -2908,6 +3002,7 @@ http {{
             cache_turbo                    sr72z;
             cache_turbo_key                $uri;
             cache_turbo_valid               1s;
+            cache_turbo_keep_stale         off;  # S231-DEFAULTS: isolate dead-origin arming from the 24h keep_stale default
             cache_turbo_stale_mult          1;
             cache_turbo_breaker             on;
             cache_turbo_breaker_threshold   1;
@@ -2931,6 +3026,7 @@ http {{
             cache_turbo                    raz;
             cache_turbo_key                $uri;
             cache_turbo_valid               1s;
+            cache_turbo_keep_stale         off;  # S231-DEFAULTS: isolate dead-origin arming from the 24h keep_stale default
             cache_turbo_stale_mult          1;
             cache_turbo_breaker             on;
             cache_turbo_breaker_threshold   1;
@@ -2948,6 +3044,7 @@ http {{
             cache_turbo                    raexpz;
             cache_turbo_key                $uri;
             cache_turbo_valid               1s;
+            cache_turbo_keep_stale         off;  # S231-DEFAULTS: isolate dead-origin arming from the 24h keep_stale default
             cache_turbo_stale_mult          1;
             cache_turbo_breaker             on;
             cache_turbo_breaker_threshold   1;
@@ -2966,6 +3063,7 @@ http {{
             cache_turbo                    s71z;
             cache_turbo_key                $uri;
             cache_turbo_valid               1s;
+            cache_turbo_keep_stale         off;  # S231-DEFAULTS: isolate dead-origin arming from the 24h keep_stale default
             cache_turbo_stale_mult          1;
             cache_turbo_breaker             on;
             cache_turbo_breaker_threshold   1;
@@ -3008,6 +3106,7 @@ http {{
             cache_turbo                    o45z;
             cache_turbo_key                $uri;
             cache_turbo_valid               1s;
+            cache_turbo_keep_stale         off;  # S231-DEFAULTS: isolate dead-origin arming from the 24h keep_stale default
             cache_turbo_stale_mult           1;
             cache_turbo_breaker              on;
             cache_turbo_breaker_threshold    1;
@@ -3036,6 +3135,7 @@ http {{
             cache_turbo                    o45offz;
             cache_turbo_key                $uri;
             cache_turbo_valid               1s;
+            cache_turbo_keep_stale         off;  # S231-DEFAULTS: isolate dead-origin arming from the 24h keep_stale default
             cache_turbo_stale_mult           1;
             cache_turbo_breaker              off;
             cache_turbo_breaker_threshold    1;
@@ -3063,6 +3163,7 @@ http {{
             cache_turbo                    o45hitz;
             cache_turbo_key                $uri;
             cache_turbo_valid              30s;
+            cache_turbo_keep_stale         off;  # S231-DEFAULTS: isolate dead-origin arming from the 24h keep_stale default
             cache_turbo_breaker              on;
             cache_turbo_breaker_threshold    1;
             cache_turbo_breaker_window      60s;
@@ -3114,9 +3215,11 @@ http {{
         }}
 
         # Negative control for /keepstale/: identical location, keep_stale off
-        # (the default) -> an expired entry with a dead origin must surface the
-        # error (502), not serve stale. Proves the positive result above is
-        # actually caused by keep_stale, not some other widening.
+        # (explicit -- S231-DEFAULTS made 24h the default, so this is no
+        # longer "the default", it is an opt-out) -> an expired entry with a
+        # dead origin must surface the error (502), not serve stale. Proves
+        # the positive result above is actually caused by keep_stale, not
+        # some other widening.
         location /keepstaleoff/ {{
             cache_turbo          main;
             cache_turbo_key      $uri;
@@ -4247,6 +4350,7 @@ http {{
             cache_turbo                    h73z;
             cache_turbo_key                $uri;
             cache_turbo_valid               1s;
+            cache_turbo_keep_stale         off;  # S231-DEFAULTS: isolate dead-origin arming from the 24h keep_stale default
             cache_turbo_stale_mult          1;
             cache_turbo_breaker             on;
             cache_turbo_breaker_threshold   1;
@@ -6636,6 +6740,54 @@ def test_breaker_arming_gated_on_breaker_enable(ng: Nginx, origin: Origin) -> No
             ("breaker OFF: a dead origin was still answered 200 from a stale "
              "snapshot -- cache_turbo_breaker off did not disable arming at "
              "the L1-expired call site")
+    finally:
+        origin.fail = False
+        drain_origin(origin)
+
+
+def test_breaker_shipped_default_trips_and_serves_stale(ng: Nginx, origin: Origin) -> None:
+    """S231-DEFAULTS: `/brkdefault/` sets NO cache_turbo_breaker/threshold/
+    window directives at all -- proves the compiled-in merge defaults are
+    breaker_enable=1, breaker_threshold=5, breaker_window=10s, not just that
+    writing them out explicitly works (test_breaker_arming_gated_on_breaker_enable
+    above covers the explicit threshold=1 case). Before S231-DEFAULTS this
+    location would have behaved like /breakeroff/ (breaker_enable merge
+    default was 0/off) -- a dead origin behind it would never fall back to a
+    stale snapshot, no matter how many times it failed.
+
+    threshold=5 means FIVE failing responses are needed to trip CLOSED ->
+    OPEN, one more than /breakeron/'s threshold=1 -- so this drives five
+    tripping fetches (all still reaching the dead origin, i.e. NOT 200)
+    before the sixth observes the tripped state and gets the breaker's
+    any-age stale fallback instead of the origin's error.
+
+    /brkdefault/ pins `cache_turbo_keep_stale off` explicitly: keep_stale is
+    ALSO on by default now (S231-DEFAULTS, 24h), and left at ITS default it
+    would serve the expired entry back via S2.2's serve-on-error fallback on
+    every one of the five tripping fetches, so none of them would ever reach
+    the origin and the breaker would never see a failure to count. Pinning it
+    off isolates the breaker default from the keep_stale default -- confirmed
+    by the first version of this test failing exactly that way (200 on the
+    very first tripping fetch) before this override was added."""
+    s0, b0, _ = fetch(ng.port, "/brkdefault/dead")
+    assert s0 == 200 and b0, f"prime failed: {s0} {b0!r}"
+
+    time.sleep(1.3)   # past fresh (1s), stale_mult 1 -> 1s window: L1-expired
+    origin.fail = True
+    try:
+        for i in range(5):
+            s_trip, _, _ = fetch(ng.port, "/brkdefault/dead")
+            assert s_trip != 200, \
+                (f"shipped breaker default: tripping request {i + 1}/5 was "
+                 f"answered 200 -- expected it to reach the (dead) origin and "
+                 f"fail, got {s_trip}")
+
+        s_open, b_open, _ = fetch(ng.port, "/brkdefault/dead")
+        assert s_open == 200, \
+            (f"shipped breaker default: expired entry + dead origin did not "
+             f"fall back to the breaker's any-age snapshot after 5 failures "
+             f"tripped it, got {s_open}")
+        assert b_open == b0, f"served {b_open!r}, expected stale {b0!r}"
     finally:
         origin.fail = False
         drain_origin(origin)
@@ -10435,6 +10587,32 @@ def test_keep_stale_serves_dead_origin(ng: Nginx, origin: Origin) -> None:
             f"keep_stale off served {sc}, expected 502 (no serve-on-error window)"
         assert hc.get("x-cache") != "STALE-IF-ERROR", \
             "keep_stale off must not serve-on-error"
+    finally:
+        origin.drop = False
+        drain_origin(origin)
+
+
+def test_keep_stale_shipped_default_serves_dead_origin(ng: Nginx, origin: Origin) -> None:
+    """S231-DEFAULTS: `/ksdefault/` sets NO cache_turbo_keep_stale directive at
+    all -- proves the compiled-in merge default is a non-zero grace window
+    (24h), not just that `cache_turbo_keep_stale 24h;` works when written out
+    explicitly (test_keep_stale_serves_dead_origin above covers the explicit
+    case). Same shape: prime, expire past the 1s fresh/stale window, drop the
+    connection, and expect the cached body back with X-Cache: STALE-IF-ERROR
+    instead of a surfaced 502. Before S231-DEFAULTS this location would have
+    behaved exactly like /keepstaleoff/ (merge default was 0/off)."""
+    s0, b0, _ = fetch(ng.port, "/ksdefault/x")
+    assert s0 == 200 and b0, f"prime failed: {s0} {b0!r}"
+
+    time.sleep(1.3)     # past fresh (1s), stale_mult 1 -> 1s window: expired
+    origin.drop = True
+    try:
+        s, b, h = fetch(ng.port, "/ksdefault/x")
+        assert s == 200, \
+            f"shipped keep_stale default: dead-origin served {s}, expected stale 200"
+        assert b == b0, f"served {b!r}, expected stale {b0!r}"
+        assert h.get("x-cache") == "STALE-IF-ERROR", \
+            f"expected STALE-IF-ERROR, got x-cache={h.get('x-cache')}"
     finally:
         origin.drop = False
         drain_origin(origin)
@@ -16081,6 +16259,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_breaker_policy_identical_no_warning(ng)              # O4.4-d
     test_breaker_open_zero_rejected(ng)                      # O4.4 / O4.3-a
     test_breaker_arming_gated_on_breaker_enable(ng, origin)  # O4.4
+    test_breaker_shipped_default_trips_and_serves_stale(ng, origin)  # S231-DEFAULTS
     test_breaker_counters(ng, origin)                        # S7.1 breaker_serves/origin_failures
     test_breaker_retry_after_auto_tracks_breaker_open(ng, origin)  # BRK-RA1
     test_prometheus_breaker_metrics(ng, origin)               # H7.3a breaker_opens_total/breaker_state on prometheus
@@ -16237,6 +16416,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_sie_serves_counter(ng, origin)                     # S7.1 sie_serves counter
     test_sie_origin_recovers_serves_fresh(ng, origin)       # RFC-2 success not hijacked
     test_keep_stale_serves_dead_origin(ng, origin)          # S2.2 keep_stale fallback
+    test_keep_stale_shipped_default_serves_dead_origin(ng, origin)  # S231-DEFAULTS
     test_keep_stale_loses_to_response_sie(ng, origin)       # S2.2 / D-1 precedence
     test_use_stale_http_404(ng, origin)                     # S4.2 mask selects trigger
     test_use_stale_any_5xx_bit(ng, origin)                  # S4.2 ANY_5XX bit
