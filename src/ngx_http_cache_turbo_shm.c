@@ -309,18 +309,34 @@ ngx_http_cache_turbo_lru_insert_new(ngx_http_cache_turbo_zone_t *z,
 }
 
 
+/* Cap on demotions performed by ONE call to lru_enforce_cap().
+ *
+ * This runs on the hot touch_lru() path while holding the shpool mutex, so an
+ * unbounded loop is a latency spike an attacker can steer: a burst of stores
+ * that pushes n_protected far over cap (e.g. a protected_pct config reload
+ * shrinking the segment while it is full) makes one unlucky request pay for
+ * unwinding all of it. Bounding the pass to a small, fixed amount of work
+ * keeps worst-case call latency flat; the cap converges over subsequent calls
+ * rather than in one, since it is safe for n_protected to sit above cap
+ * between calls -- nothing reads n_protected except this function, and no
+ * caller assumes the cap holds the instant this returns (S231-PERF-LRUCAP). */
+#define NGX_HTTP_CACHE_TURBO_LRU_CAP_MAX_EVICT  8
+
 /* Enforce the protected-segment cap by demoting protected tails to the
  * PROBATION HEAD (not tail -- a demoted-but-hot entry deserves a second
  * chance before a cold probation entry). Caller holds the shpool mutex.
  *
  * A loop, not an `if`: protected_pct can shrink across a reload while entries
  * are already resident, so more than one demotion may be owed. It is bounded
- * by n_protected and each pass strictly decrements it, so it terminates. */
+ * by n_protected and each pass strictly decrements it, so it terminates --
+ * and additionally capped at NGX_HTTP_CACHE_TURBO_LRU_CAP_MAX_EVICT per call
+ * so it terminates quickly, not just eventually. */
 static void
 ngx_http_cache_turbo_lru_enforce_cap(ngx_http_cache_turbo_zone_t *z,
     ngx_uint_t protected_pct)
 {
     ngx_uint_t                    cap;
+    ngx_uint_t                    demoted;
     ngx_queue_t                  *q;
     ngx_http_cache_turbo_node_t  *victim;
 
@@ -338,9 +354,14 @@ ngx_http_cache_turbo_lru_enforce_cap(ngx_http_cache_turbo_zone_t *z,
         cap = 1;
     }
 
+    demoted = 0;
+
     while (z->sh->n_protected > cap
-           && !ngx_queue_empty(&z->sh->lru_protected))
+           && !ngx_queue_empty(&z->sh->lru_protected)
+           && demoted < NGX_HTTP_CACHE_TURBO_LRU_CAP_MAX_EVICT)
     {
+        demoted++;
+
         q = ngx_queue_last(&z->sh->lru_protected);
         victim = ngx_queue_data(q, ngx_http_cache_turbo_node_t, lru);
 

@@ -84,6 +84,11 @@ typedef struct {
 #define NGX_HTTP_CACHE_TURBO_SEG_PROTECTED  1
 #define NGX_HTTP_CACHE_TURBO_PROTECTED_PCT_DEFAULT 80
 
+/* S231-PERF-LRUCAP: mirrors the bound in shm.c. Kept as a literal match
+ * (not sliced) since it is a single #define, same pattern as the SEG_* ids
+ * above; extract_shm.sh only slices function bodies. */
+#define NGX_HTTP_CACHE_TURBO_LRU_CAP_MAX_EVICT  8
+
 /* P6/O4.1 breaker states. CLOSED == 0 is load-bearing for the same reason
  * NODE_ENTRY == 0 and SEG_PROBATION == 0 are -- a zeroed zone must read as "not
  * tripped", the direction that sends traffic to the origin as if the feature
@@ -633,6 +638,101 @@ test_s8_promote_on_second_hit(void)
           "S8: l2_neg_check promoted a memo COUNTER");
 
     CHECK(ngx_test_lock_balanced(), "touch path left the zone mutex held");
+}
+
+/* =====================================================================
+ * S231-PERF-LRUCAP: lru_enforce_cap() must bound its per-call work.
+ *
+ * The unbounded version walked and demoted every over-cap entry in one pass
+ * while holding the shpool mutex -- a latency spike an attacker can steer
+ * (a burst of stores that pushes n_protected far over cap, e.g. via a
+ * protected_pct reload that shrinks the segment while it is full, makes one
+ * unlucky request pay for unwinding the whole backlog). Two invariants, both
+ * required:
+ *
+ *   1. a single call demotes at most
+ *      NGX_HTTP_CACHE_TURBO_LRU_CAP_MAX_EVICT entries, even when the queue is
+ *      far over cap -- proves the bound holds.
+ *   2. repeated calls still converge n_protected down to the configured cap
+ *      -- proves the bound doesn't just silently stop working; a function
+ *      that evicted NOTHING would also pass invariant 1.
+ *
+ * Builds synthetic nodes directly on lru_protected (no rbtree/count_miss --
+ * enforce_cap only ever touches the queue and n_protected, so a stack node is
+ * enough and sidesteps mkkey()'s 8-slot cap).
+ * ===================================================================== */
+static void
+test_s231_lru_enforce_cap_is_bounded(void)
+{
+    ngx_http_cache_turbo_node_t  nodes[40];
+    ngx_uint_t                   i, n, before;
+
+    printf("S231-PERF-LRUCAP: one call demotes at most the bound, "
+           "convergence is amortized\n");
+    zone_reset();
+
+    n = 40;
+    for (i = 0; i < n; i++) {
+        memset(&nodes[i], 0, sizeof(nodes[i]));
+        nodes[i].kind = NGX_HTTP_CACHE_TURBO_NODE_ENTRY;
+        nodes[i].seg  = NGX_HTTP_CACHE_TURBO_SEG_PROTECTED;
+        ngx_queue_insert_head(&g_sh.lru_protected, &nodes[i].lru);
+    }
+    g_sh.n_entries   = n;
+    g_sh.n_protected = n;
+
+    /* cap = ceil(40 * 1 / 100) -> floored at 1: force a huge backlog (39 over
+     * cap) with a single low protected_pct. */
+    before = g_sh.n_protected;
+    ngx_http_cache_turbo_lru_enforce_cap(&g_zone, 1);
+
+    CHECK(before - g_sh.n_protected <= NGX_HTTP_CACHE_TURBO_LRU_CAP_MAX_EVICT,
+          "S231: a single call demoted more than the configured bound");
+    CHECK(g_sh.n_protected == n - NGX_HTTP_CACHE_TURBO_LRU_CAP_MAX_EVICT,
+          "S231: a single call must demote EXACTLY the bound while still "
+          "far over cap (not fewer -- that would also satisfy invariant 1 "
+          "without doing the amortized work)");
+    CHECK(g_sh.n_protected > 1,
+          "fixture sanity: must still be far over cap after one call");
+
+    /* Convergence: repeated calls keep chipping away until the cap holds,
+     * proving the bound does not just permanently wedge the segment over
+     * cap. Bounded loop count so a regression here fails fast, not hangs. */
+    for (i = 0; i < n && g_sh.n_protected > 1; i++) {
+        ngx_http_cache_turbo_lru_enforce_cap(&g_zone, 1);
+    }
+
+    CHECK(g_sh.n_protected == 1,
+          "S231: repeated calls must still converge n_protected to the "
+          "configured cap");
+    CHECK(i < n, "S231: convergence took more calls than there were "
+          "entries -- the bound is not amortizing progress");
+
+    /* The queue and the counter must agree throughout -- a bound that
+     * decrements n_protected without actually unlinking (or vice versa)
+     * would desync the two, and the next real touch would corrupt the
+     * list. */
+    n = 0;
+    { ngx_queue_t *q; for (q = ngx_queue_head(&g_sh.lru_protected);
+          q != &g_sh.lru_protected;
+          q = q->next) { n++; } }
+    CHECK(n == g_sh.n_protected,
+          "S231: lru_protected queue length disagrees with n_protected "
+          "after bounded demotion");
+
+    CHECK(ngx_test_lock_balanced(), "enforce_cap left the zone mutex held");
+
+    /* The stack-local `nodes` fixture is about to go out of scope. Everything
+     * that got demoted is re-linked onto g_sh.lru, and the sole survivor is
+     * still on g_sh.lru_protected -- both queues would otherwise dangle into
+     * a freed stack frame for the next test. Cannot use zone_reset() here:
+     * it drains via ngx_rbtree_delete(), and these synthetic nodes were never
+     * inserted into the rbtree (enforce_cap only touches the queue), so
+     * re-initialising both queues by hand is the correct cleanup. */
+    ngx_queue_init(&g_sh.lru);
+    ngx_queue_init(&g_sh.lru_protected);
+    g_sh.n_entries   = 0;
+    g_sh.n_protected = 0;
 }
 
 /* =====================================================================
@@ -3536,6 +3636,7 @@ main(void)
 
     test_s8_evict_terminates_on_empty_queues();
     test_s8_promote_on_second_hit();
+    test_s231_lru_enforce_cap_is_bounded();
     test_s8_off_demotes_inherited_protected_nodes();
     test_cr_a_memo_survives_claim();
     test_cr_b_unstub_preserves_counter();
