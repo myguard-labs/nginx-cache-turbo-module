@@ -515,9 +515,10 @@ the full body rather than asserting "still current" with a `304` (RFC 9111).
 
 ### Auto-Vary (read the response `Vary`)
 
-Turn on `cache_turbo_auto_vary on` and the module reads the response's own
-`Vary` header and splits the cache by the named **request** header automatically
-— no need to pre-declare the axes. It honours a safe whitelist:
+**On by default** (`cache_turbo_auto_vary off;` reverts to the old Vary-blind
+behavior described below). The module reads the response's own `Vary` header
+and splits the cache by the named **request** header automatically — no need
+to pre-declare the axes. It honours a safe whitelist:
 `Accept-Encoding` (bucketed br/gzip/identity/zstd), `User-Agent` (mobile/desktop
 class), `Accept-Language` (primary-subtag class) and `Origin` (raw value,
 unfolded: it's a CORS security boundary, collapsing distinct origins into one
@@ -554,7 +555,7 @@ vary, the module records a tiny *vary marker* in L1 and stores the body under a
 secondary *variant* key; later requests read the marker and resolve straight to
 their variant. The base slot stays empty for varied URLs, so a node that hasn't
 learned the `Vary` yet simply misses to origin — it never serves the wrong
-variant. Off by default.
+variant. On by default.
 
 > **`Vary: Accept-Encoding` is harmless but redundant here.** The module captures
 > the **identity** (uncompressed) body — its body filter runs *above*
@@ -568,13 +569,14 @@ variant. Off by default.
 > [What it will and won't cache](#what-it-will-and-wont-cache) — so encoding-keyed
 > caching is never actually needed.)
 
-> **If your origin emits `Vary`, turn `cache_turbo_auto_vary on`.** With
-> auto-Vary **off** (the default) the cache keys on the **request**, not on the
-> response's `Vary`, and there is **no safety net**: a `Vary:`-carrying response
-> is stored under a Vary-blind key and the first variant stored is served to
-> *every* client (gzip-vs-brotli, mobile-vs-desktop, language, …) — a
-> cache-poisoning / wrong-representation hazard (RFC 9110 §12.5.5). So for any
-> varied origin either enable `cache_turbo_auto_vary`, or fold the axis into the
+> **Don't turn `cache_turbo_auto_vary off` on a varied origin.** It is on by
+> default precisely because, with it **off**, the cache keys on the
+> **request**, not on the response's `Vary`, and there is **no safety net**: a
+> `Vary:`-carrying response is stored under a Vary-blind key and the first
+> variant stored is served to *every* client (gzip-vs-brotli, mobile-vs-desktop,
+> language, …) — a cache-poisoning / wrong-representation hazard (RFC 9110
+> §12.5.5), and for `Vary: Cookie`/`Authorization` a privacy leak across users
+> on the stale-serve path. Leave auto-Vary on unless you fold the axis into the
 > key yourself with `cache_turbo_normalize_vary` (below) or an explicit
 > `cache_turbo_key`. (There is no `cache_turbo_vary_safe` refuse-to-store knob —
 > `auto_vary` is the supported mechanism.)
@@ -1595,7 +1597,7 @@ http {
             cache_turbo_require_header    X-GraphQL-Cacheable;          # store ONLY if origin affirms
 
             # ── Vary handling ───────────────────────────────────────────
-            cache_turbo_auto_vary         off;       # on = read response Vary, split automatically
+            cache_turbo_auto_vary         on;        # off = ignore response Vary (old Vary-blind behavior)
 
             # ── tags: local purge-by-tag (Redis) + downstream CDN sync ──
             cache_turbo_tag               $upstream_http_x_cache_tags;  # purge-by-tag index needs cache_turbo_redis
@@ -1676,7 +1678,7 @@ http {
 | `cache_turbo_admin NAME` | `location` | — | Make this location a control endpoint for zone `NAME` (stats/purge/warm). Gate with `allow`/`deny`. |
 | `cache_turbo_normalize_strip NAME...` | `server`, `location` | — | Extra query args to drop from `$cache_turbo_normalized_args` (trailing `*` = prefix; a bare `*` matches every name = drop all), on top of the built-ins. |
 | `cache_turbo_normalize_vary TOKEN...` | `server`, `location` | off | Append a variant bucket to `$cache_turbo_normalized_args`: `encoding` (br/gzip/identity) and/or `device` (mobile/desktop). |
-| `cache_turbo_auto_vary on` | `server`, `location` | `off` | Read the response's own `Vary` header and split the cache by the named request header automatically. Safe whitelist: `Accept-Encoding`, `User-Agent` (device class), `Accept-Language` (primary-subtag class), `Origin` (raw — CORS boundary, never folded). `Vary: *`/`Cookie`/`Authorization` — **or any other header not on the whitelist** — ⇒ uncacheable (so an un-split Vary axis can never serve the wrong representation). Two-level, node-local keying. See [Auto-Vary](#auto-vary-read-the-response-vary). |
+| `cache_turbo_auto_vary on` | `server`, `location` | `on` | Read the response's own `Vary` header and split the cache by the named request header automatically. Safe whitelist: `Accept-Encoding`, `User-Agent` (device class), `Accept-Language` (primary-subtag class), `Origin` (raw — CORS boundary, never folded). `Vary: *`/`Cookie`/`Authorization` — **or any other header not on the whitelist** — ⇒ uncacheable (so an un-split Vary axis can never serve the wrong representation). Two-level, node-local keying. See [Auto-Vary](#auto-vary-read-the-response-vary). |
 
 > **The breaker is per-ZONE state driven by per-LOCATION policy — so its reopen
 > timing is "last reader decides".** The failure counter, the window anchor and

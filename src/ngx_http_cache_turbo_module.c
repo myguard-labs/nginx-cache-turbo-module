@@ -13066,7 +13066,12 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
                               NGX_HTTP_CACHE_TURBO_CC_RESPECT);
     conf->honor_cc  = (conf->cc_mode == NGX_HTTP_CACHE_TURBO_CC_HONOR);
     conf->ignore_cc = (conf->cc_mode == NGX_HTTP_CACHE_TURBO_CC_IGNORE);
-    ngx_conf_merge_value(conf->auto_vary, prev->auto_vary, 0);
+    /* S231-VARY: shipped default is ON. Off, the Vary: Cookie veto below
+     * (~:7918) never fires, so a response that varies per-user could be
+     * served to a different cookie on the stale-serve path -- the one
+     * privacy defect that path had. Explicit `cache_turbo_auto_vary off;`
+     * still disables it. */
+    ngx_conf_merge_value(conf->auto_vary, prev->auto_vary, 1);
 #if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
     && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
     ngx_conf_merge_value(conf->test_restore_alloc_fail,

@@ -4025,9 +4025,23 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
-        # auto-Vary OFF (default): the same response Vary header is ignored, so
-        # two encodings collapse onto one slot (back-compat proof).
+        # auto-Vary explicitly OFF (S231-VARY: no longer the shipped default --
+        # see /avdefault/ below for that): the same response Vary header is
+        # ignored, so two encodings collapse onto one slot (back-compat proof
+        # for an operator who opts back out).
         location /avoff/ {{
+            cache_turbo          main;
+            cache_turbo_key      $request_uri;
+            cache_turbo_valid    30s;
+            cache_turbo_auto_vary off;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # S231-VARY: NO cache_turbo_auto_vary directive at all -- this is the
+        # only location that proves the *compiled-in* default rather than an
+        # explicit `on;` (every /av/ location above opts in explicitly). Must
+        # behave exactly like /av/: safe axes split, Vary: Cookie is refused.
+        location /avdefault/ {{
             cache_turbo          main;
             cache_turbo_key      $request_uri;
             cache_turbo_valid    30s;
@@ -15155,14 +15169,44 @@ def test_auto_vary_mixed_refused_wins(ng: Nginx, origin: Origin) -> None:
 
 
 def test_auto_vary_off_ignores_vary(ng: Nginx, origin: Origin) -> None:
-    """v11 auto-Vary off by default: the response Vary header is ignored, so two
-    different Accept-Encodings collapse onto one slot (back-compat)."""
+    """S231-VARY: `cache_turbo_auto_vary off;` (explicit, no longer the shipped
+    default -- see test_auto_vary_shipped_default_* below) still ignores the
+    response Vary header, so two different Accept-Encodings collapse onto one
+    slot (back-compat for an operator who opts back out)."""
     base = origin.hits
     p = "/avoff/enc?v=ae"
     _, b1, _ = fetch(ng.port, p, {"Accept-Encoding": "gzip"})
     _, b2, _ = fetch(ng.port, p, {"Accept-Encoding": "br"})
     assert b1 == b2, ("auto_vary off still split by Vary", b1, b2)
     assert origin.hits - base == 1, origin.hits - base
+
+
+def test_auto_vary_shipped_default_splits_encoding(ng: Nginx, origin: Origin) -> None:
+    """S231-VARY: `/avdefault/` sets NO cache_turbo_auto_vary directive at all
+    -- proves the compiled-in merge default is 1, not just that `on;` works
+    when written out. A safe axis (Accept-Encoding) must still split, exactly
+    like the explicit-`on;` /av/ location does in test_auto_vary_encoding."""
+    base = origin.hits
+    p = "/avdefault/enc?v=ae"
+    _, b1, _ = fetch(ng.port, p, {"Accept-Encoding": "gzip"})
+    _, b2, _ = fetch(ng.port, p, {"Accept-Encoding": "gzip"})
+    assert b1 == b2, (b1, b2)
+    _, b3, _ = fetch(ng.port, p, {"Accept-Encoding": "br"})
+    assert b1 != b3, ("shipped default: gzip and br shared a slot", b1, b3)
+    assert origin.hits - base == 2, origin.hits - base
+
+
+def test_auto_vary_shipped_default_cookie_refused(ng: Nginx, origin: Origin) -> None:
+    """S231-VARY: with NO cache_turbo_auto_vary directive, `Vary: Cookie` must
+    still be refused (the veto at ~:7918 only fires when clcf->auto_vary is
+    true). This is the privacy defect the shipped-default flip closes: while
+    the default was off, this veto was dead code on the stale-serve path."""
+    base = origin.hits
+    p = "/avdefault/ck?v=ck"
+    _, b1, _ = fetch(ng.port, p)
+    _, b2, _ = fetch(ng.port, p)
+    assert b1 != b2, ("shipped default: Vary: Cookie was cached", b1, b2)
+    assert origin.hits - base == 2, origin.hits - base
 
 
 def test_preset_window_differs(ng: Nginx, origin: Origin) -> None:
@@ -16152,6 +16196,8 @@ def run_all(ng: Nginx, origin: Origin,
     test_auto_vary_cookie_uncacheable(ng, origin)
     test_auto_vary_mixed_refused_wins(ng, origin)
     test_auto_vary_off_ignores_vary(ng, origin)
+    test_auto_vary_shipped_default_splits_encoding(ng, origin)
+    test_auto_vary_shipped_default_cookie_refused(ng, origin)
     test_preset_window_differs(ng, origin)
     test_stale_mult_directive_beats_preset(ng, origin)
     test_stale_mult_rejects_out_of_range(ng)
@@ -16444,7 +16490,8 @@ def main() -> int:
           "vary suffix (v3-4: encoding/device/both/off-by-default, "
           "zstd>br bucket (V6), invalid-token rejected), "
           "auto-Vary (v11: encoding/same-class/device/language/origin split, "
-          "Vary:*/Cookie/mixed-refused uncacheable, off-by-default ignores Vary), "
+          "Vary:*/Cookie/mixed-refused uncacheable, on-by-default splits+"
+          "refuses with no directive, explicit off still ignores Vary), "
           "presets (v3-2: conservative/aggressive stale-window differ, "
           "explicit cache_turbo_stale_mult beats the band + range-rejects, "
           "invalid-name rejected), "
