@@ -15268,11 +15268,17 @@ def test_auto_vary_shipped_default_cookie_refused(ng: Nginx, origin: Origin) -> 
     """S231-VARY: with NO cache_turbo_auto_vary directive, `Vary: Cookie` must
     still be refused (the veto at ~:7918 only fires when clcf->auto_vary is
     true). This is the privacy defect the shipped-default flip closes: while
-    the default was off, this veto was dead code on the stale-serve path."""
+    the default was off, this veto was dead code on the stale-serve path.
+
+    Two DIFFERENT cookies, so this asserts the per-user case the veto exists
+    for and not merely "the second request missed": if the response were ever
+    stored under the Vary-blind base key, user b would be served user a's body.
+    The veto keys on the RESPONSE's Vary header, so the cookie values only have
+    to differ -- they are what makes a wrong-serve observable."""
     base = origin.hits
     p = "/avdefault/ck?v=ck"
-    _, b1, _ = fetch(ng.port, p)
-    _, b2, _ = fetch(ng.port, p)
+    _, b1, _ = fetch(ng.port, p, headers={"Cookie": "ct_user=a"})
+    _, b2, _ = fetch(ng.port, p, headers={"Cookie": "ct_user=b"})
     assert b1 != b2, ("shipped default: Vary: Cookie was cached", b1, b2)
     assert origin.hits - base == 2, origin.hits - base
 
