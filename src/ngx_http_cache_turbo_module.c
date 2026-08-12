@@ -7284,20 +7284,22 @@ static ngx_int_t
 ngx_http_cache_turbo_header_skip(ngx_http_cache_turbo_loc_conf_t *clcf,
     u_char *name, size_t nlen)
 {
-    static const char  *skip[] = {
-        "Connection", "Keep-Alive", "Proxy-Authenticate",
-        "Proxy-Authorization", "TE", "Trailer", "Transfer-Encoding",
-        "Upgrade", "Content-Length", "Content-Encoding", "Set-Cookie",
-        "Date", "Server", "Age", "X-Cache", "X-Cache-Status",
+    static const ngx_str_t  skip[] = {
+        ngx_string("Connection"), ngx_string("Keep-Alive"),
+        ngx_string("Proxy-Authenticate"), ngx_string("Proxy-Authorization"),
+        ngx_string("TE"), ngx_string("Trailer"),
+        ngx_string("Transfer-Encoding"), ngx_string("Upgrade"),
+        ngx_string("Content-Length"), ngx_string("Content-Encoding"),
+        ngx_string("Set-Cookie"), ngx_string("Date"), ngx_string("Server"),
+        ngx_string("Age"), ngx_string("X-Cache"), ngx_string("X-Cache-Status"),
         /* RFC 9213 targeted cache directives: we (the shared cache / edge) are
          * their intended consumer, so strip them before store — replaying them
          * downstream would wrongly steer the browser or a next cache tier with a
          * TTL meant for us. Same rationale as the Age strip above. */
-        "CDN-Cache-Control", "Surrogate-Control",
-        NULL
+        ngx_string("CDN-Cache-Control"), ngx_string("Surrogate-Control"),
+        ngx_null_string
     };
     ngx_uint_t  i;
-    size_t      sl;
 
     /* SK-A1: Surrogate-Key describes the representation, so it must travel WITH
      * it. A CDN POP whose copy expired refills from OUR hit; if that hit carries
@@ -7315,10 +7317,9 @@ ngx_http_cache_turbo_header_skip(ngx_http_cache_turbo_loc_conf_t *clcf,
         return 1;
     }
 
-    for (i = 0; skip[i] != NULL; i++) {
-        sl = ngx_strlen(skip[i]);
-        if (nlen == sl
-            && ngx_strncasecmp(name, (u_char *) skip[i], sl) == 0)
+    for (i = 0; skip[i].len != 0; i++) {
+        if (nlen == skip[i].len
+            && ngx_strncasecmp(name, skip[i].data, skip[i].len) == 0)
         {
             return 1;
         }

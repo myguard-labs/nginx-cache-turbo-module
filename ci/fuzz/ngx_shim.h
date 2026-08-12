@@ -37,6 +37,12 @@ typedef struct {
     u_char  *data;
 } ngx_str_t;
 
+/* nginx ngx_string.h verbatim: both are plain brace-initializer macros
+ * (compile-time constants, no function call), safe in static/const array
+ * initializers exactly as in the real headers. */
+#define ngx_string(str)     { sizeof(str) - 1, (u_char *) str }
+#define ngx_null_string     { 0, NULL }
+
 /* --- core constants (nginx ngx_core.h / ngx_config.h) --- */
 #define NGX_OK            0
 #define NGX_ERROR        -1
