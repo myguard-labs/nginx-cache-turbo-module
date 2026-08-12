@@ -1,4 +1,4 @@
-# sync-sha: 2fd222a5b6f9e5ffb00fbe03227a15a3a13bad116762e9483abe9fde49ec6b9b
+# sync-sha: 1bf266342b892c57722f3f334848886dda8b45ca02b4942d8e55cc5f74d79224
 name: CI
 
 # Single entry point for the PR suite. The six checks below used to be
@@ -125,12 +125,12 @@ jobs:
           printf '%s\n' "$changed"
           # Mirrors the paths: filters asan.yml and fuzzing.yml carried before
           # the demotion. Keep in sync with what each job actually consumes.
-          if printf '%s\n' "$changed" | grep -qE '^(src/|ci/tools/(ci-build\.sh|test_runtime\.py|ci-hang-guard\.sh)|\.github/workflows/(asan|ci)\.yml)'; then
+          if printf '%s\n' "$changed" | grep -qE '^(src/|ci/tools/(ci-build\.sh|test_runtime\.py|ci-hang-guard\.sh|assert-fixtures\.sh)|\.github/actions/build-cache/|\.github/workflows/(asan|ci)\.yml)'; then
             echo "asan=true" >> "$GITHUB_OUTPUT"
           else
             echo "asan=false" >> "$GITHUB_OUTPUT"
           fi
-          if printf '%s\n' "$changed" | grep -qE '^(src/|ci/fuzz/|\.github/workflows/(fuzzing|ci)\.yml)'; then
+          if printf '%s\n' "$changed" | grep -qE '^(src/|ci/fuzz/|ci/tools/assert-fixtures\.sh|\.github/actions/build-cache/|\.github/workflows/(fuzzing|ci)\.yml)'; then
             echo "fuzz=true" >> "$GITHUB_OUTPUT"
           else
             echo "fuzz=false" >> "$GITHUB_OUTPUT"
