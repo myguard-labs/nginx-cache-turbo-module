@@ -2754,6 +2754,24 @@ ngx_http_cache_turbo_redis_read_scan(ngx_event_t *rev)
  * valid), tears down the op pool, then finalizes the parked request with the
  * rc the callback returned. On any failure the callback runs with 0 members so
  * the caller always gets a well-formed response.
+ *
+ * S231-VARY-LEAK: unlike get_finish/lock_finish (which resume the parked
+ * request through ngx_http_core_run_phases -- the RE-ENTERED content handler
+ * supplies its own, natural finalize_request call, so their trailing
+ * ngx_http_finalize_request(r, NGX_DONE) is the SECOND drop the park's
+ * r->main->count++ needs), the callback here builds and sends the whole HTTP
+ * response itself and this function finalizes only ONCE. A single
+ * finalize_request() only ever drops ONE reference
+ * (ngx_http_finalize_connection's r->main->count != 1 branch routes to
+ * ngx_http_close_request, which decrements and returns without closing
+ * anything when the result is still non-zero) -- so with count at 2 (1
+ * original + 1 park) after finalize returns it is exactly 1, and NOTHING is
+ * ever going to call finalize again: the client connection is orphaned with
+ * its fd open forever, caught only at worker shutdown as "open socket left in
+ * connection". Drop the park's own reference explicitly first, the same way
+ * ngx_http_request.c's own subrequest-finalize path does, so this function's
+ * single finalize_request call is the true last reference and actually closes
+ * (or keepalive-parks) the connection.
  */
 static void
 ngx_http_cache_turbo_redis_smembers_finish(
@@ -2781,6 +2799,10 @@ ngx_http_cache_turbo_redis_smembers_finish(
 
     /* Now safe to drop our connection + pool (members no longer referenced). */
     ngx_http_cache_turbo_redis_op_done(op);
+
+    /* Release the park taken by redis_smembers()/redis_scan_del() before the
+     * completion finalize below -- see the S231-VARY-LEAK comment above. */
+    r->main->count--;
 
     ngx_http_run_posted_requests(r->connection);
     ngx_http_finalize_request(r, rc);
