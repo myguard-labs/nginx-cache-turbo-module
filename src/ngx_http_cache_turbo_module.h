@@ -1843,8 +1843,19 @@ typedef struct {
     unsigned                 sie_armed:1;     /* a within-SIE snapshot is stashed */
     unsigned                 sie_serving:1;   /* filters replacing error w/ snap  */
     unsigned                 sie_body_sent:1; /* snapshot last_buf already emitted */
-    u_char                  *sie_snap;        /* stale blob copy (r->pool)         */
+    u_char                  *sie_snap;        /* blob bytes, any age               */
     size_t                   sie_snap_len;
+    /* PERF (S231-PERF-SIEARM): the L1 arm pins the blob under the zone mutex
+     * (PERF-7 style) instead of copying it out, and registers a pool cleanup
+     * (ngx_http_cache_turbo_blob_ref_cleanup, out-param NULL -- nothing here
+     * needs to drop the reference early) that releases the shm reference once
+     * the request pool is destroyed; sie_snap then points straight into the
+     * shm slab. The L2 arm at :5513 instead points sie_snap at ctx->l2_blob,
+     * an r->pool buffer with no shm reference to release. Either way this
+     * replaced a memcpy of the whole blob under the ZONE MUTEX on every
+     * expired-but-within-SIE-window entry, serialising concurrent workers on
+     * a 1 MiB-default (configurable) copy exactly during the outage this
+     * feature exists to smooth over. */
     u_char                  *sie_body;        /* body slice inside sie_snap        */
     size_t                   sie_body_len;
 
