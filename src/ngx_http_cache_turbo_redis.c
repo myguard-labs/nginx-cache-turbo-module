@@ -2754,6 +2754,20 @@ ngx_http_cache_turbo_redis_read_scan(ngx_event_t *rev)
  * valid), tears down the op pool, then finalizes the parked request with the
  * rc the callback returned. On any failure the callback runs with 0 members so
  * the caller always gets a well-formed response.
+ *
+ * S231-VARY-LEAK: this function finalizes the parked request exactly ONCE, and
+ * one finalize_request only ever drops ONE reference. Whether that single drop
+ * balances the park's r->main->count++ depends on the PHASE the parking caller
+ * returns NGX_DONE into, which differs between callers -- so the park's release
+ * is owned by each CALL SITE, not by this function. Callers reached through
+ * core->handler (admin_handler's ?tag= and all-purge) are balanced already,
+ * because ngx_http_core_content_phase always runs ngx_http_finalize_request and
+ * NGX_DONE routes into ngx_http_finalize_connection, which decrements. The
+ * PRECONTENT caller (purge_request) gets no such drop -- ngx_http_core_generic
+ * _phase answers NGX_DONE with a bare `return NGX_OK` -- so IT does its own
+ * r->main->count-- right after the park returns. Do not "simplify" that by
+ * moving the decrement in here: it would over-drop the content-phase callers
+ * and trip "http request count is zero".
  */
 static void
 ngx_http_cache_turbo_redis_smembers_finish(

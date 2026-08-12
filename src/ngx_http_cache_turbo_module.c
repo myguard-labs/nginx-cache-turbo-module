@@ -1990,6 +1990,33 @@ ngx_http_cache_turbo_purge_request(ngx_http_request_t *r,
                     if (prc == NGX_DONE) {
                         /* parked; the completion drops every variant + the index
                          * set and sends {"purged":N}. */
+
+                        /* S231-VARY-LEAK: release the park's reference here,
+                         * because THIS caller is the one that never gets a free
+                         * drop. purge_request runs in the PRECONTENT phase, and
+                         * ngx_http_core_generic_phase answers NGX_DONE with a
+                         * bare `return NGX_OK` -- it never calls
+                         * ngx_http_finalize_request at all. The completion's
+                         * single finalize would therefore leave count at 1 with
+                         * nothing left to drop it, orphaning the client
+                         * connection with its fd open (visible only at worker
+                         * shutdown as "open socket left in connection").
+                         *
+                         * The module's other two parked purge entry points --
+                         * admin_handler's ?tag= (purge_tag) and its all-purge
+                         * (scan_del) -- must NOT do this: they are reached
+                         * through core->handler, and
+                         * ngx_http_core_content_phase ALWAYS runs
+                         * ngx_http_finalize_request(r, rc), where NGX_DONE goes
+                         * to ngx_http_finalize_connection -> the count != 1
+                         * branch -> ngx_http_close_request, which decrements.
+                         * Their parks are already balanced; dropping again
+                         * there trips "http request count is zero". The
+                         * asymmetry is the CALLER'S PHASE, not the op kind, so
+                         * the release belongs at each acquire site rather than
+                         * in the shared completion. */
+                        r->main->count--;
+
                         return NGX_DONE;
                     }
                 }
@@ -13113,7 +13140,12 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
                               NGX_HTTP_CACHE_TURBO_CC_RESPECT);
     conf->honor_cc  = (conf->cc_mode == NGX_HTTP_CACHE_TURBO_CC_HONOR);
     conf->ignore_cc = (conf->cc_mode == NGX_HTTP_CACHE_TURBO_CC_IGNORE);
-    ngx_conf_merge_value(conf->auto_vary, prev->auto_vary, 0);
+    /* S231-VARY: shipped default is ON. Off, the Vary: Cookie veto below
+     * (~:7918) never fires, so a response that varies per-user could be
+     * served to a different cookie on the stale-serve path -- the one
+     * privacy defect that path had. Explicit `cache_turbo_auto_vary off;`
+     * still disables it. */
+    ngx_conf_merge_value(conf->auto_vary, prev->auto_vary, 1);
 #if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
     && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
     ngx_conf_merge_value(conf->test_restore_alloc_fail,

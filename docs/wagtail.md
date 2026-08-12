@@ -144,6 +144,11 @@ http {
             cache_turbo_valid   60s;
             cache_turbo_valid   404 410 1m;
             cache_turbo_preset  balanced;
+            # S231-VARY: auto_vary is ON by default module-wide; explicitly OFF
+            # here because Django's SessionMiddleware/CsrfViewMiddleware add
+            # `Vary: Cookie` to most non-trivial views, and auto-Vary treats
+            # that as uncacheable -- see "Runtime settings / gotchas" below.
+            cache_turbo_auto_vary off;
 
             proxy_pass http://127.0.0.1:8000;
             proxy_set_header Host              $host;
@@ -254,16 +259,17 @@ operational levers are different from the PHP presets. These are Wagtail/Django-
   Wagtail's own middleware all read the session, so most non-trivial views carry it.
   `CsrfViewMiddleware` adds the same header whenever the `{% csrf_token %}` tag
   renders. It is a keying instruction, **not** a `Cache-Control: private`; it does
-  not stop a store. **With `cache_turbo_auto_vary off` (the default) the module
-  ignores the response `Vary` and classifies the request per the preset's
-  `sessionid` bypass rule — which is exactly what you want here:** an anonymous
-  page carries no `sessionid`, so it is not bypassed and caches correctly
-  regardless of a stray `Vary: Cookie`. Do
-  **not** reflexively enable `cache_turbo_auto_vary` for a Wagtail origin — auto-Vary
-  treats `Vary: Cookie` as *uncacheable*, so turning it on would make every public
-  page that renders a form (a header search box is enough) stop caching entirely.
-  The cookie rule is the guard; leave Vary blind. (Verified: Django middleware +
-  CSRF docs.)
+  not stop a store. **`cache_turbo_auto_vary` is ON module-wide by default, but
+  the sample config above sets it explicitly `off` for this location:** with it
+  off, the module ignores the response `Vary` and classifies the request per
+  the preset's `sessionid` bypass rule — which is exactly what you want here —
+  an anonymous page carries no `sessionid`, so it is not bypassed and caches
+  correctly regardless of a stray `Vary: Cookie`. Do
+  **not** leave `cache_turbo_auto_vary` at its default for a Wagtail origin —
+  auto-Vary treats `Vary: Cookie` as *uncacheable*, so leaving it on would make
+  every public page that renders a form (a header search box is enough) stop
+  caching entirely. The cookie rule is the guard; explicitly disable auto-Vary
+  and leave Vary blind here. (Verified: Django middleware + CSRF docs.)
 - **`csrftoken` on GET pages is fine — keep it lazy, don't force it.** The preset
   deliberately does not bypass on `csrftoken`, so a guest carrying it still HITs. The
   risk is upstream: if the origin sets `csrftoken` (and the accompanying
