@@ -1,4 +1,4 @@
-# sync-sha: 1bf266342b892c57722f3f334848886dda8b45ca02b4942d8e55cc5f74d79224
+# sync-sha: 87e62804de9de8b439e2d32cae7af77af0504b402143490568a0628dee7ef38d
 name: CI
 
 # Single entry point for the PR suite. The six checks below used to be
@@ -91,6 +91,7 @@ jobs:
   changes:
     name: Detect relevant changes
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       contents: read
     outputs:
