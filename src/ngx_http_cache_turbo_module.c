@@ -4795,24 +4795,29 @@ ngx_http_cache_turbo_blob_cleanup(void *data)
 }
 
 
-/* P6/O4.3: register the pool cleanup that drops a breaker-armed blob's slab
- * reference.
+/* P6/O4.3, S231-PERF-SIEARM: register the pool cleanup that drops an armed
+ * blob's slab reference. Shared by the circuit-breaker arm and the SIE arm --
+ * both pin a blob under the zone mutex (PERF-7 style) instead of copying it,
+ * but UNLIKE the serve paths neither yet knows whether the blob will ever be
+ * sent: most armed requests never consume their fallback (breaker: the gate
+ * stays CLOSED; SIE: the origin revalidation does not come back 5xx). So the
+ * reference is dropped by a cleanup tied to the REQUEST POOL rather than to a
+ * serve call, which covers both outcomes with one drop.
  *
- * The arming site pins the blob under the zone mutex (PERF-7 style) instead of
- * copying it, but UNLIKE the serve paths it does not yet know whether the blob
- * will ever be sent: most armed requests find a CLOSED breaker and run to the
- * origin. So the reference is dropped by a cleanup tied to the REQUEST POOL
- * rather than to a serve call, which covers both outcomes with one drop.
+ * ⚠ That is also why the breaker's and SIE's own _serve()/restore call sites
+ * never pass this same data as a second ref_data. A second cleanup for the
+ * same blob would double-drop the refcount and free a slab still in use
+ * elsewhere.
  *
- * ⚠ That is also why the breaker's _serve() calls pass ref_data = NULL. A
- * second cleanup for the same blob would double-drop the refcount and free a
- * slab still in use elsewhere.
- *
- * Returns NGX_ERROR when the cleanup cannot be registered; the caller must then
- * release the reference itself and arm nothing.
+ * Returns NGX_ERROR when the cleanup cannot be registered. Both callers run
+ * this BEFORE ngx_http_cache_turbo_blob_acquire() precisely so that failure
+ * path owns nothing: no reference has been taken yet, so the caller arms
+ * nothing and releases nothing. A future caller that acquires first would have
+ * to release here -- and could not, because blob_release() takes the zone mutex
+ * the arming sites already hold. Keep the order.
  */
 static ngx_int_t
-ngx_http_cache_turbo_brk_ref_cleanup(ngx_http_request_t *r,
+ngx_http_cache_turbo_blob_ref_cleanup(ngx_http_request_t *r,
     ngx_http_cache_turbo_zone_t *z, u_char *data,
     ngx_http_cache_turbo_blob_cln_t **out)
 {
@@ -4832,7 +4837,7 @@ ngx_http_cache_turbo_brk_ref_cleanup(ngx_http_request_t *r,
 
     /* O4.3-c: hand the record back so the caller can drop the reference early
      * (see ngx_http_cache_turbo_brk_ref_drop). Optional -- pass NULL when the
-     * pool-lifetime drop is all that is wanted. */
+     * pool-lifetime drop is all that is wanted (the SIE arm does this). */
     if (out != NULL) {
         *out = cc;
     }
@@ -5354,7 +5359,7 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
              * it, leaving the SIE block below dereferencing freed slab. */
             ngx_http_cache_turbo_blob_cln_t  *bcc = NULL;
 
-            if (ngx_http_cache_turbo_brk_ref_cleanup(r, z, ctn->data, &bcc)
+            if (ngx_http_cache_turbo_blob_ref_cleanup(r, z, ctn->data, &bcc)
                 == NGX_OK)
             {
                 ctx->brk_arm_done = 1;
@@ -5386,10 +5391,32 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
             uint32_t  sie_ttl = ngx_http_cache_turbo_get_u32(ctn->data + 40);
 
             if (sie_ttl > 0 && now < created + (time_t) sie_ttl) {
-                u_char *snap = ngx_pnalloc(r->pool, ctn->len);
-                if (snap != NULL) {
-                    ngx_memcpy(snap, ctn->data, ctn->len);
-                    ctx->sie_snap = snap;
+                /* S231-PERF-SIEARM: PERF-7 style zero-copy arm, same reasoning
+                 * as the breaker arm just above -- see its comment for the
+                 * full rationale; this is the identical hazard on the SAME
+                 * `ctn`, still under the SAME mutex hold.
+                 *
+                 * Register the drop BEFORE acquiring. ngx_pool_cleanup_add()
+                 * is the only thing here that can fail, and it touches
+                 * r->pool only -- no slab, no zone mutex -- so failing first
+                 * costs nothing to undo. Acquiring first would force the
+                 * failure arm to call blob_release(), which takes the zone
+                 * mutex itself (shm.c) and so requires unlocking here;
+                 * ngx_shmtx is not recursive. That unlock would invalidate
+                 * `ctn` -- it was resolved at the lookup and is only valid
+                 * while the mutex is held -- letting a concurrent
+                 * evict/refresh/purge detach the blob and our own release
+                 * then free it, leaving the L2-consult code below
+                 * dereferencing freed slab. */
+                /* No early-drop caller for the SIE arm (unlike the breaker's
+                 * brk_ref_drop), so nothing needs the cleanup record back --
+                 * pass NULL and let the pool-lifetime drop be the only
+                 * owner. */
+                if (ngx_http_cache_turbo_blob_ref_cleanup(r, z, ctn->data,
+                        NULL) == NGX_OK)
+                {
+                    ngx_http_cache_turbo_blob_acquire(ctn->data);
+                    ctx->sie_snap = ctn->data;
                     ctx->sie_snap_len = ctn->len;
                     ctx->sie_armed = 1;
                     ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
