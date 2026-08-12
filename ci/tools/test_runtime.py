@@ -9983,6 +9983,15 @@ def test_stale_serves_stale(ng: Nginx, origin: Origin) -> None:
     assert s1 == 200 and b1, f"stale serve failed: {s1} {b1!r}"
     assert h1.get("x-cache") in ("STALE", None), \
         f"expected STALE or fresh-regen, got {h1.get('x-cache')}"
+    if h1.get("x-cache") == "STALE":
+        # S231-PERF-BGSNAP: this is the single-box background-update arm that
+        # now pins the shm blob instead of memcpy'ing it under the zone
+        # mutex (ngx_http_cache_turbo_module.c, the `refresh == NGX_OK` /
+        # `clcf->background_update` site). Byte-exact match proves the
+        # pinned pointer served the right bytes, not stale/corrupted slab
+        # data from a use-after-release.
+        assert b1 == b0, \
+            f"STALE serve returned a wrong body: {b1!r} != {b0!r}"
     # within the stale window the entry refreshes to a new generation
     deadline = time.time() + 2.0
     advanced = False
@@ -14283,6 +14292,65 @@ def test_multinode_lock(ng: Nginx, origin: Origin, redis: RedisServer) -> None:
         drain_origin(origin)   # v8: settle async bg refreshes before next test
 
 
+def test_cross_node_won_stale_body(ng: Nginx, origin: Origin,
+                                   redis: RedisServer) -> None:
+    """S231-PERF-BGSNAP: the cross-node lock-WINNER's background-update stale
+    serve (ngx_http_cache_turbo_module.c, the `ctx->lock_done && (lock_result
+    == NGX_OK || NGX_ERROR)` arm under `clcf->background_update`) now pins the
+    shm blob instead of memcpy'ing the full body under the zone mutex. A single
+    node with no contention wins the Redis SET NX PX lock uncontested on its
+    first stale read, so that read is guaranteed to take the WON arm.
+
+    Proves: (1) the served body is byte-exact -- a use-after-release or a
+    pointer into freed/reused slab would show up here, not just as a crash;
+    (2) the background refresh still lands and a later read sees the NEW
+    generation, i.e. the entry is still evictable/replaceable afterward --
+    a leaked reference from this arm would pin the OLD generation forever."""
+    uri = "/lock/won"
+    redis.cli("DEL", l2_key(uri), lock_key(uri))
+
+    s0, body0, h0 = fetch(ng.port, uri)
+    assert s0 == 200 and "x-cache" not in h0, "prime should miss to origin"
+    assert wait_for(lambda: redis.cli("EXISTS", l2_key(uri)) == "1"), \
+        "prime never wrote L2"
+
+    time.sleep(2.5)                     # stale (fresh=2s), still < 8s window
+    drain_origin(origin)                # absorb any stray async bg before counting
+    base = origin.hits
+
+    # Single node, uncontended: the first stale read wins the cross-node NX
+    # lock and takes the WON arm (background_update default ON) -- serve
+    # stale now, refresh in the background.
+    s1, body1, h1 = fetch(ng.port, uri)
+    assert s1 == 200, f"cross-node WON stale serve status {s1}"
+    assert h1.get("x-cache") == "STALE", \
+        f"expected STALE from the cross-node WON arm, got {h1.get('x-cache')}"
+    assert body1 == body0, \
+        f"cross-node WON stale serve returned a wrong body: " \
+        f"{body1!r} != {body0!r}"
+
+    # the background refresh reaches the origin and a later read is fresh.
+    assert wait_for(lambda: origin.hits > base, timeout=2.0), \
+        "cross-node WON arm never fired the background refresh"
+    deadline = time.time() + 2.0
+    refreshed = False
+    while time.time() < deadline:
+        _, b, h = fetch(ng.port, uri)
+        if b != body0 and h.get("x-cache") == "HIT":
+            refreshed = True
+            break
+        time.sleep(0.1)
+    assert refreshed, "stale entry never refreshed to a new generation"
+
+    # No refcount leak: a subsequent read must see the NEW generation, proving
+    # the node was genuinely overwritten and not pinned on the old blob.
+    s2, body2, _h2 = fetch(ng.port, uri)
+    assert s2 == 200 and body2 != body0, \
+        "entry still serving the OLD generation after refresh -- possible " \
+        "refcount leak from the cross-node WON pin"
+    drain_origin(origin)   # v8: settle async bg refreshes before the next test
+
+
 def test_lock_self_heal(ng: Nginx, origin: Origin, redis: RedisServer) -> None:
     """v4-2: a held cross-node lock (a peer mid-regen) makes other nodes serve
     stale without piling on origin; once the lock PX-expires (the peer 'died'
@@ -16245,6 +16313,7 @@ def run_all(ng: Nginx, origin: Origin,
         test_l2_tag_add_batched_one_op(ng, origin, redis)  # L9 one op for N tags
         test_cor5_redis_variant_purge(ng, origin, redis)  # COR-5 variant index
         test_multinode_lock(ng, origin, redis)
+        test_cross_node_won_stale_body(ng, origin, redis)  # S231-PERF-BGSNAP
         test_lock_self_heal(ng, origin, redis)
         test_cold_single_flight_cross_node(ng, origin, redis)
         test_cross_node_winner_owner_token_preserved(ng, origin, redis)  # AUD-NXLOCK-OWNER
