@@ -7827,6 +7827,36 @@ def test_memcached_keepalive_timeout_invalid_rejected(ng: Nginx) -> None:
         f"missing bad-timeout diagnostic:\n{r.stdout}"
 
 
+def test_redis_timeout_zero_rejected(ng: Nginx) -> None:
+    """S231-L2-TIMEOUT0: cache_turbo_redis timeout=0 is rejected."""
+    if ng.redis_port is None:
+        return
+    def mutate(c):
+        return c.replace(
+            f"cache_turbo_redis  127.0.0.1:{ng.redis_port} prefix=ct: timeout=250ms;",
+            f"cache_turbo_redis  127.0.0.1:{ng.redis_port} prefix=ct: timeout=0;", 1)
+    r = _config_test_result(ng, mutate)
+    assert r.returncode != 0, \
+        f"timeout=0 was accepted by nginx -t:\n{r.stdout}"
+    assert "timeout must be > 0" in r.stdout, \
+        f"missing timeout-must-be-positive diagnostic:\n{r.stdout}"
+
+
+def test_memcached_timeout_zero_rejected(ng: Nginx) -> None:
+    """S231-L2-TIMEOUT0: cache_turbo_memcached timeout=0 is rejected."""
+    if ng.memcached_port is None:
+        return
+    def mutate(c):
+        return c.replace(
+            f"cache_turbo_memcached  127.0.0.1:{ng.memcached_port} prefix=mc: timeout=250ms;",
+            f"cache_turbo_memcached  127.0.0.1:{ng.memcached_port} prefix=mc: timeout=0;", 1)
+    r = _config_test_result(ng, mutate)
+    assert r.returncode != 0, \
+        f"timeout=0 was accepted by nginx -t:\n{r.stdout}"
+    assert "timeout must be > 0" in r.stdout, \
+        f"missing timeout-must-be-positive diagnostic:\n{r.stdout}"
+
+
 def test_valid_dup_status_warns(ng: Nginx) -> None:
     """COR-9: a second cache_turbo_valid rule for a status code is dead
     (status_ttl returns the first match). nginx -t loads but must warn."""
@@ -15961,6 +15991,8 @@ def run_all(ng: Nginx, origin: Origin,
     test_memcached_keepalive_invalid_rejected(ng)
     test_memcached_keepalive_cap_rejected(ng)
     test_memcached_keepalive_timeout_invalid_rejected(ng)
+    test_redis_timeout_zero_rejected(ng)                     # S231-L2-TIMEOUT0
+    test_memcached_timeout_zero_rejected(ng)                 # S231-L2-TIMEOUT0
     test_valid_dup_status_warns(ng)
     test_tag_without_l2_warns(ng)
     test_tag_without_l2_but_surrogate_key_no_warn(ng)
