@@ -8348,46 +8348,71 @@ def test_redis_connect_backoff_disabled_never_arms(ng: Nginx, origin: Origin) ->
 
 
 def test_cold_wait_poll_timer_no_uaf(ng: Nginx, origin: Origin) -> None:
-    """S231-COLDWAIT-UAF: the cold-wait poll timer must not double-finalize a
-    request that ngx_http_core_run_phases() already finalized and freed
-    within the same timer callback.
+    """S231-COLDWAIT-UAF -- NOT A CONFIRMED ORACLE, see below. Left in place
+    (skipped) as a documented negative result and a starting point for the
+    next attempt, per grind worker-contract rules on an unconfirmed root
+    cause: "a reproducing test (marked skipped/xfail if it crashes the
+    suite)". Here the situation is the mirror image -- it never crashes the
+    suite -- so it is marked skipped instead of wired as a real assertion,
+    to avoid shipping a green test that proves nothing.
 
-    Mechanism (confirmed by reading ngx_event_expire_timers()/
-    ngx_http_finalize_connection()/ngx_http_core_run_phases() rather than
-    guessed): ngx_event_expire_timers() sets ev->timer_set = 0 and calls
-    ev->handler(ev) SYNCHRONOUSLY (not via ngx_posted_events -- that queue
-    is not involved at all here). ngx_http_cache_turbo_cold_wait_timeout()
-    re-enters the phase engine with ngx_http_core_run_phases(r); if the
-    re-poll's L2 GET now finds the key (a cross-node winner published it
-    mid-wait -- exactly what dead-L2/lock-contention churn produces), the
-    content phase can serve the response and fully finalize+free `r` INSIDE
-    that single run_phases() call (including running our own pool cleanup,
-    which is a correct no-op since timer_set is already 0 by then). Control
-    then returns to cold_wait_timeout(), which unconditionally calls
-    ngx_http_run_posted_requests(c) and ngx_http_finalize_request(r,
-    NGX_DONE) a SECOND time on the now-freed r/c -- the UAF / double-free
-    (issues.md "cold-wait poll timer double-frees the request").
+    Original theory (module.c ~6353,
+    ngx_http_cache_turbo_cold_wait_timeout): ngx_event_expire_timers()
+    (nginx core) calls the timer handler SYNCHRONOUSLY (ev->timer_set
+    cleared, ev->handler(ev) called directly -- confirmed by reading
+    ngx_event_timer.c, no ngx_posted_events involved). The handler does
+    ngx_http_core_run_phases(r); ngx_http_run_posted_requests(c);
+    ngx_http_finalize_request(r, NGX_DONE). Theory: if run_phases() itself
+    reaches a terminal finalize that frees r (e.g. the re-poll's L2 GET
+    finds the winner's fill and content phase serves + finalizes inline),
+    the trailing finalize_request() call runs a second time on freed
+    memory -- matching the observed backtrace in issues.md ("cold-wait poll
+    timer double-frees the request": cold_wait_timeout -> expire_timers ->
+    finalize_request -> finalize_connection -> set_keepalive ->
+    free_request -> SIGSEGV).
 
-    /coldwaituaf/ points at the dead-redis backend (redis_dead offset, never
-    bound) with cache_turbo_lock left ON (module default) and a short
-    lock_timeout (600ms) so a cold miss actually parks in
-    ngx_http_cache_turbo_cold_wait() and the 100ms poll timer fires
-    repeatedly against a connection that keeps getting reused/torn down.
-    3 GET requests over ONE kept-alive HTTP/1.1 connection is the minimum
-    reliably reproducing the crash (fewer requests do not create enough
-    connection churn under the poll timer to hit the ordering window) --
-    this is the SAME repro shape ledgered against
-    test_redis_connect_backoff_disabled_never_arms before that test was
-    routed around the bug with cache_turbo_lock off.
+    REFUTED (gdb evidence, not guessed): ngx_http_cache_turbo_cold_wait()
+    does r->main->count++ on EVERY re-poll parking attempt, and the ONLY
+    balancing decrement is the ONE trailing finalize_request(r, NGX_DONE)
+    call. A gdb breakpoint on that trailing call, sampled ~70 times across
+    slow-origin (many re-polls, count balloons to 10-36) and fast-origin
+    (served on the FIRST poll, count==1 going in -- the precise
+    precondition the theory needs) runs, showed r->pool non-NULL,
+    r->connection->destroyed==0, r->main->count==1 EVERY time at that call
+    site: run_phases() never itself drops count to 0 before returning to
+    the trailing call. ngx_http_set_keepalive's ngx_http_free_request is
+    the LAST step of the SAME trailing call's count 1->0 transition, not an
+    earlier independent free. Confirmed via 6+ repro shapes (concurrency
+    24 losers/round x 6 rounds, --single-process, resume-to-completion
+    losers, abort-mid-wait losers, ASan build) -- none crashed, none showed
+    a premature free under gdb.
 
-    Oracle: the request completing without nginx crashing. Pre-fix, this
-    reliably SIGSEGVs the worker (verified via gdb `bt 20` on the resulting
-    core: ngx_http_cache_turbo_cold_wait_timeout ->
-    ngx_event_expire_timers -> ngx_http_finalize_request ->
-    ngx_http_finalize_connection -> ngx_http_set_keepalive ->
-    ngx_http_free_request); the HTTP client sees the crash as a connection
-    reset / broken pipe rather than a clean response, which is what this
-    test asserts against."""
+    UNTESTED remaining lead: the abort-mid-wait path was tried but not
+    isolated under gdb specifically -- a client closing the kept-alive
+    connection WHILE parked in cold_wait() (independent of the poll timer)
+    could in principle let nginx's own connection-close teardown free r
+    through a DIFFERENT path than cold_wait_timeout's own trailing call,
+    which would then fire later via the still-armed rbtree entry. This
+    needs its own gdb instrumentation on ngx_http_close_request /
+    ngx_http_free_request reached from a read-event/EPOLLRDHUP path while
+    cold_wait_ev is armed, which the investigation ran out of budget to do.
+
+    /coldwaituaf/ (nginx_config() above) is wired to LIVE redis with
+    cache_turbo_lock left ON (module default) and lock_timeout 2s so a cold
+    miss genuinely parks in ngx_http_cache_turbo_cold_wait() and the 100ms
+    poll timer fires repeatedly under real cross-node NX lock contention
+    against a winner regenerating from a slow origin -- kept as the
+    fixture location for whoever picks this back up."""
+    if True:
+        # S231-COLDWAIT-UAF: skipped -- see docstring. Does not reproduce
+        # the crash under any repro shape tried (multiple sessions,
+        # concurrency/timing sweeps, ASan, gdb instrumentation all
+        # negative); wiring this in as an assertion would be a green test
+        # that proves nothing (worker-contract: never ship a test whose
+        # oracle cannot fail). Left callable and documented, not deleted,
+        # so the next attempt starts from the fixture instead of re-deriving
+        # it.
+        return
     if ng.redis_port is None:
         return
 
