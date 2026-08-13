@@ -1406,6 +1406,209 @@ test_count_miss_semantics(void)
     ctn->kind = NGX_HTTP_CACHE_TURBO_NODE_COUNTER;
 }
 
+/* S231-PERF-MISSLOCKS: resolve_miss() merges count_miss()+claim() into one
+ * lock/one rbtree lookup for the min_uses>1 && cache_turbo_lock-on cold path.
+ * These pin that the merge reproduces count_miss() then claim() EXACTLY --
+ * same decisions, same mutations, same node -- and in particular the one seam
+ * the merge has to close by hand: count_miss_locked() may allocate the
+ * counter node when the key was absent, and claim_locked() must operate on
+ * THAT node (not re-discover "absent" and allocate a second one, which would
+ * silently break single-flight by letting two stubs exist for one key). */
+static void
+test_resolve_miss_merged(void)
+{
+    ngx_int_t                     rc, count_miss_rc;
+    uint64_t                      owner;
+    u_char                        *fresh_data;
+    size_t                         fresh_len;
+    ngx_http_cache_turbo_node_t   *ctn;
+
+    printf("resolve_miss(): merged count_miss+claim reproduces both exactly\n");
+
+    /* --- below threshold: claim() must NOT run, no lease taken, no node
+     * mutated beyond the counter bump count_miss() alone would have done. */
+    zone_reset();
+    owner = 999;   /* poison: must come back 0 on a DECLINED resolve */
+    fresh_data = (u_char *) 0x1;   /* poison: must come back NULL/unset */
+    fresh_len = 999;
+    rc = ngx_http_cache_turbo_shm_resolve_miss(&g_zone, KEY(0), 4, 5,
+             &owner, &count_miss_rc, &fresh_data, &fresh_len);
+    (void) rc;   /* the ngx_int_t return is not meaningful on DECLINED */
+    CHECK(count_miss_rc == NGX_DECLINED,
+          "first miss of 4 must still be below threshold");
+    CHECK(owner == 0, "no lease may be taken when count_miss declines");
+    ctn = find(0);
+    REQUIRE(ctn != NULL, "resolve_miss must still create the counter node");
+    CHECK(ctn->miss_count == 1, "the single miss must be counted once");
+    CHECK(!ctn->refreshing,
+          "claim() must not have run (declined count_miss short-circuits it, "
+          "same as the standalone two-call caller in module.c)");
+    CHECK(ngx_test_lock_balanced(), "resolve_miss (declined) leaked the mutex");
+
+    /* Drive it to 3/4 with plain count_miss(), mirroring how module.c's own
+     * gate would have counted the earlier misses via the standalone call
+     * (lock-off case, or a resume) before the merged call ever fires. */
+    ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(0), 4);
+    ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(0), 4);
+    ctn = find(0);
+    REQUIRE(ctn != NULL, "priming fixture lost the counter node");
+    CHECK(ctn->miss_count == 3, "priming fixture: expected 3/4");
+
+    /* --- the threshold-crossing call: count_miss must return NGX_OK (4th
+     * miss reaches min_uses 4) AND claim() must run in the SAME call,
+     * winning the single-flight stub on the SAME node count_miss just
+     * bumped -- not a second, newly-allocated one. */
+    owner = 0;
+    rc = ngx_http_cache_turbo_shm_resolve_miss(&g_zone, KEY(0), 4, 5,
+             &owner, &count_miss_rc, &fresh_data, &fresh_len);
+    CHECK(count_miss_rc == NGX_OK, "the 4th miss must reach min_uses 4");
+    CHECK(rc == NGX_HTTP_CACHE_TURBO_CLAIM_WINNER,
+          "the threshold-crossing request must win the claim in the same call");
+    CHECK(owner != 0, "a CLAIM_WINNER must receive a live lease token");
+    ctn = find(0);
+    REQUIRE(ctn != NULL, "resolve_miss must not have dropped the node");
+    CHECK(ctn->miss_count == 4, "miss_count must read exactly 4, not reset");
+    CHECK(ctn->refreshing, "the winning claim must mark the node refreshing");
+    CHECK(ctn->refresh_owner == owner,
+          "the node's lease token must match what resolve_miss returned");
+
+    /* Exactly ONE node exists for this key -- the seam canary. A regression
+     * that re-resolved "ctn == NULL" inside claim_locked() after
+     * count_miss_locked() had just inserted a node would either crash (double
+     * rbtree insert of colliding keys) or -- if it happened to look up
+     * correctly by accident -- this count still proves no duplicate silently
+     * exists beside it. Walked via the same key-hash lookup all these tests
+     * use, so a duplicate under a colliding rbtree slot would still be
+     * findable and is asserted absent by construction: shm_lookup finds the
+     * FIRST match, and a correct build has only one to find. */
+    /* zone_reset()'s own bookkeeping already tracks total node count via the
+     * zone's used-slab accounting exercised elsewhere in this file; a second,
+     * independent duplicate-key check would duplicate that machinery for a
+     * narrow case, so instead assert the behavioural symptom a duplicate stub
+     * would cause: a losing concurrent claim() on the SAME key must see the
+     * WINNER's stub (CLAIM_LOSER), never allocate its own (which would only
+     * be possible if resolve_miss had left two nodes, or none, behind). */
+    {
+        uint64_t   owner2 = 0;
+        ngx_int_t  cm2;
+        u_char    *fd2 = NULL;
+        size_t     fl2 = 0;
+        ngx_int_t  rc2 = ngx_http_cache_turbo_shm_resolve_miss(&g_zone,
+                             KEY(0), 4, 5, &owner2, &cm2, &fd2, &fl2);
+        CHECK(cm2 == NGX_OK,
+              "an ENTRY-less body-less node with refreshing set is a live "
+              "stub, and count_miss's own pass-through rule (a live stub "
+              "returns NGX_OK without counting) must still apply through "
+              "resolve_miss");
+        CHECK(rc2 == NGX_HTTP_CACHE_TURBO_CLAIM_LOSER,
+              "a second resolver on the same key while the first still holds "
+              "the lease must LOSE, proving only one stub exists for the key");
+        CHECK(owner2 == 0, "a CLAIM_LOSER must not receive a lease token");
+    }
+    CHECK(ngx_test_lock_balanced(), "resolve_miss (winner) leaked the mutex");
+
+    /* --- CLAIM_FRESH: the UAF regression this function exists to catch.
+     * claim_locked() must acquire the PERF-7 refcount on ctn->data BEFORE
+     * resolve_miss() unlocks -- an earlier version of this merge returned
+     * the raw pointer and let the CALLER acquire() after unlocking, which
+     * is a use-after-free (a concurrent evict can free the blob in the gap
+     * between the unlock and the caller's acquire()). This drives that
+     * exact race deterministically: acquire the blob's ref via
+     * resolve_miss(), then simulate the concurrent evict with
+     * blob_node_release() -- the blob's underlying slab must SURVIVE
+     * because resolve_miss() already holds a reference on it, proving the
+     * acquire happened before the window a concurrent evict could exploit,
+     * not after. */
+    zone_reset();
+    {
+        ngx_http_cache_turbo_node_t   *ctn3;
+        u_char                        *blob;
+        uint64_t                       owner3 = 0;
+        ngx_int_t                      cm3;
+        u_char                         *fd3 = NULL;
+        size_t                          fl3 = 0;
+        ngx_int_t                      rc3;
+        ngx_uint_t                      live_before;
+
+        ctn3 = ngx_slab_alloc_locked(&g_pool, sizeof(*ctn3));
+        REQUIRE(ctn3 != NULL, "CLAIM_FRESH fixture: node alloc failed");
+        memset(ctn3, 0, sizeof(*ctn3));
+        memcpy(ctn3->key, mkkey(5), 32);
+        ctn3->node.key = (uint32_t) (0x1000 + 5);
+        ngx_rbtree_insert(&g_sh.rbtree, &ctn3->node);
+        ctn3->kind = NGX_HTTP_CACHE_TURBO_NODE_ENTRY;
+        ctn3->seg  = NGX_HTTP_CACHE_TURBO_SEG_PROBATION;
+
+        live_before = ngx_test_slab_live;
+        blob = ngx_http_cache_turbo_blob_alloc(&g_zone, 64);
+        REQUIRE(blob != NULL, "CLAIM_FRESH fixture: blob_alloc failed");
+        CHECK(CT_BLOBREF(blob)->refs == 0,
+              "CLAIM_FRESH fixture: blob started already referenced");
+
+        ctn3->data        = blob;
+        ctn3->len         = 64;
+        ctn3->fresh_until = ngx_test_now + 30;   /* well inside the fresh window */
+
+        /* min_uses 1 so count_miss's own gate never declines (an ENTRY with
+         * len > 0 is exempt anyway -- see count_miss_semantics above); the
+         * point of this fixture is claim_locked()'s CLAIM_FRESH branch, not
+         * the counting gate. */
+        rc3 = ngx_http_cache_turbo_shm_resolve_miss(&g_zone, KEY(5), 1, 5,
+                  &owner3, &cm3, &fd3, &fl3);
+        CHECK(cm3 == NGX_OK, "an ENTRY must never be re-gated by min_uses");
+        CHECK(rc3 == NGX_HTTP_CACHE_TURBO_CLAIM_FRESH,
+              "a fresh, unexpired ENTRY must return CLAIM_FRESH");
+        CHECK(owner3 == 0, "CLAIM_FRESH must not hand out a lease token");
+        CHECK(fd3 == blob, "CLAIM_FRESH must hand back the ENTRY's own blob");
+        CHECK(fl3 == 64, "CLAIM_FRESH must hand back the ENTRY's own length");
+
+        /* The regression canary: resolve_miss() already unlocked by this
+         * point (single-threaded, so no real race is needed to prove the
+         * ordering) -- refs must already read 1, not 0, because acquire()
+         * ran INSIDE claim_locked(), before resolve_miss()'s unlock. */
+        CHECK(CT_BLOBREF(blob)->refs == 1,
+              "UAF regression: claim_locked() did not acquire the blob "
+              "before resolve_miss() unlocked -- a concurrent evict between "
+              "the unlock and any caller-side acquire() would free this "
+              "blob out from under the returned pointer");
+        CHECK(ngx_test_lock_balanced(),
+              "resolve_miss (CLAIM_FRESH) left the zone mutex held");
+
+        /* Simulate the concurrent evict this test exists to rule out: the
+         * owning node drops the blob WHILE our resolve_miss() reference is
+         * still outstanding. A correct build defers the free (detached ==
+         * 1, slab count unchanged); the pre-fix code would have raced this
+         * against an unreferenced pointer and the slab would already be
+         * free by the time a caller got around to acquire()ing it. */
+        ngx_http_cache_turbo_blob_node_release(&g_zone, blob);
+        CHECK(ngx_test_slab_live == live_before + 1,
+              "the concurrent evict freed the blob while resolve_miss()'s "
+              "CLAIM_FRESH reference was still outstanding");
+        CHECK(CT_BLOBREF(blob)->detached == 1,
+              "node_release did not mark the blob detached");
+
+        /* The caller's eventual serve()/cleanup drops the reference
+         * resolve_miss() took; this is what finally frees it. */
+        ngx_http_cache_turbo_blob_release(&g_zone, blob);
+        CHECK(ngx_test_slab_live == live_before,
+              "the last reference (resolve_miss()'s own) did not free the "
+              "detached blob");
+        CHECK(ngx_test_lock_balanced(), "blob_release left the zone mutex held");
+
+        /* This fixture built ctn3 by hand (ngx_slab_alloc_locked, not via
+         * lru_insert_new), unlike every other fixture in this file, because
+         * it needed an ENTRY with a pre-armed fresh blob rather than a
+         * COUNTER count_miss()/claim() would build. zone_reset()'s own drain
+         * walks the LRU queues, so a node never threaded onto either queue is
+         * invisible to it -- free ctn3 explicitly or the next zone_reset()
+         * (or the end-of-run leak check) reports it as a leaked slab
+         * allocation for a reason that has nothing to do with the refcount
+         * bug this test exists to catch. */
+        ngx_rbtree_delete(&g_sh.rbtree, &ctn3->node);
+        ngx_slab_free_locked(&g_pool, ctn3);
+    }
+}
+
 static void
 test_l2_neg_never_on_entry(void)
 {
@@ -3997,6 +4200,7 @@ main(void)
     test_claim_single_flight();
     test_lease_owner_identity();
     test_count_miss_semantics();
+    test_resolve_miss_merged();
     test_l2_neg_never_on_entry();
     test_out_of_slab_fails_open();
     test_breaker_zeroed_zone_is_closed();
