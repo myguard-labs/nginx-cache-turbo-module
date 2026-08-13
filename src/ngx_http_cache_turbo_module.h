@@ -1507,6 +1507,17 @@ typedef struct {
     ngx_str_t                redis_prefix; /* key prefix, default "ct:"        */
     ngx_msec_t               redis_timeout;/* connect/read timeout             */
 
+    /* L2 per-worker connect backoff (S231). After a connect FAILURE (not a
+     * protocol/reply error) to redis_addr, this worker fails L2 ops fast for
+     * connect_backoff ms instead of paying a fresh connect() attempt on every
+     * request during an L2 outage. Shared by both drivers (redis + memcached)
+     * the same way redis_addr/redis_timeout already are: one L2 backend per
+     * location, keyed by peer address, state kept in each driver's own
+     * process-global table (mirrors the *_ka keepalive-pool pattern). 0 =
+     * disabled (never back off); a nonzero value that is too small to matter
+     * is still a config choice, not something this field validates. */
+    ngx_msec_t               redis_connect_backoff;
+
     /* L2 memcached (v13). A second, simpler L2 backend selected by
      * cache_turbo_memcached HOST:PORT (mutually exclusive with cache_turbo_redis
      * — both reuse redis_addr/redis_prefix/redis_timeout/redis_enable; the flag

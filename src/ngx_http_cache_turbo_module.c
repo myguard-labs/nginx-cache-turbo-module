@@ -6649,6 +6649,59 @@ ngx_http_cache_turbo_test_armings_header(ngx_http_request_t *r)
 
     return NGX_OK;
 }
+
+
+/* S231: per-worker counters bumped exactly once per request that hit the L2
+ * connect backoff fail-fast path -- one counter per driver, defined in
+ * ngx_http_cache_turbo_redis.c / ngx_http_cache_turbo_memcached.c next to the
+ * backoff table each guards. Unlike X-Cache-Turbo-Test-Armings these are
+ * process-global (not zone/shm), matching the backoff state itself being
+ * per-worker, not per-zone -- so no shm_zone guard is needed here.
+ *
+ * Same re-stamp-on-SIE requirement as the armings header above: call this
+ * everywhere ngx_http_cache_turbo_test_armings_header is called. */
+extern ngx_atomic_uint_t  ngx_http_cache_turbo_redis_test_backoff_skips;
+extern ngx_atomic_uint_t  ngx_http_cache_turbo_mc_test_backoff_skips;
+
+static ngx_int_t
+ngx_http_cache_turbo_test_backoff_header(ngx_http_request_t *r)
+{
+    ngx_table_elt_t  *h;
+    u_char           *v;
+    size_t            vlen;
+
+    static u_char  name[] = "X-Cache-Turbo-Test-L2-Backoff";
+
+    /* "redis=<n>,memcached=<n>" -- split the same way the armings header
+     * splits l1/l2, so a test asserting on ONE driver cannot be satisfied by
+     * the other driver's counter moving. */
+    v = ngx_pnalloc(r->pool,
+                    sizeof("redis=,memcached=") - 1 + 2 * NGX_ATOMIC_T_LEN);
+    if (v == NULL) {
+        return NGX_ERROR;
+    }
+
+    vlen = ngx_sprintf(v, "redis=%uA,memcached=%uA",
+                ngx_atomic_fetch_add(&ngx_http_cache_turbo_redis_test_backoff_skips, 0),
+                ngx_atomic_fetch_add(&ngx_http_cache_turbo_mc_test_backoff_skips, 0))
+           - v;
+
+    h = ngx_list_push(&r->headers_out.headers);
+    if (h == NULL) {
+        return NGX_ERROR;
+    }
+
+    h->hash = 1;
+    h->key.len = sizeof("X-Cache-Turbo-Test-L2-Backoff") - 1;
+    h->key.data = name;
+    h->value.len = vlen;
+    h->value.data = v;
+#if (nginx_version >= 1023000)
+    h->next = NULL;
+#endif
+
+    return NGX_OK;
+}
 #endif
 
 
@@ -7621,6 +7674,7 @@ ngx_http_cache_turbo_sie_rewrite(ngx_http_request_t *r,
      * in the test's own oracle (_armings), so a silent drop cannot read as
      * "armed 0". */
     (void) ngx_http_cache_turbo_test_armings_header(r);
+    (void) ngx_http_cache_turbo_test_backoff_header(r);
 #endif
 
     ctx->sie_body = body;
@@ -7872,6 +7926,7 @@ ngx_http_cache_turbo_header_filter(ngx_http_request_t *r)
         if (ctx != NULL) {
             (void) ngx_http_cache_turbo_test_armings_header(r);
         }
+        (void) ngx_http_cache_turbo_test_backoff_header(r);
 #endif
         return ngx_http_next_header_filter(r);
     }
@@ -7881,6 +7936,7 @@ ngx_http_cache_turbo_header_filter(ngx_http_request_t *r)
 #if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
     && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
     (void) ngx_http_cache_turbo_test_armings_header(r);
+    (void) ngx_http_cache_turbo_test_backoff_header(r);
 #endif
 
     /* P6/O4.2: feed this origin outcome into the per-zone circuit breaker.
@@ -10530,6 +10586,17 @@ ngx_http_cache_turbo_redis_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             }
             clcf->redis_keepalive_timeout = (ngx_msec_t) t;
 
+        } else if (ngx_strncmp(value[i].data, "connect_backoff=", 16) == 0) {
+            s.data = value[i].data + 16;
+            s.len = value[i].len - 16;
+            t = ngx_parse_time(&s, 0);   /* milliseconds; 0 = disabled */
+            if (t == NGX_ERROR) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                    "cache_turbo_redis: bad connect_backoff \"%V\"", &s);
+                return NGX_CONF_ERROR;
+            }
+            clcf->redis_connect_backoff = (ngx_msec_t) t;
+
         } else if (ngx_strncmp(value[i].data, "password=", 9) == 0) {
             clcf->redis_password.data = value[i].data + 9;
             clcf->redis_password.len = value[i].len - 9;
@@ -10713,6 +10780,17 @@ ngx_http_cache_turbo_memcached_conf(ngx_conf_t *cf, ngx_command_t *cmd,
                 return NGX_CONF_ERROR;
             }
             clcf->memcached_keepalive_timeout = (ngx_msec_t) t;
+
+        } else if (ngx_strncmp(value[i].data, "connect_backoff=", 16) == 0) {
+            s.data = value[i].data + 16;
+            s.len = value[i].len - 16;
+            t = ngx_parse_time(&s, 0);   /* milliseconds; 0 = disabled */
+            if (t == NGX_ERROR) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                    "cache_turbo_memcached: bad connect_backoff \"%V\"", &s);
+                return NGX_CONF_ERROR;
+            }
+            clcf->redis_connect_backoff = (ngx_msec_t) t;
 
         } else {
             ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
@@ -12967,6 +13045,7 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->redis_enable = NGX_CONF_UNSET;
     conf->memcached = NGX_CONF_UNSET;
     conf->redis_timeout = NGX_CONF_UNSET_MSEC;
+    conf->redis_connect_backoff = NGX_CONF_UNSET_MSEC;
     conf->redis_keepalive = NGX_CONF_UNSET;
     conf->redis_keepalive_timeout = NGX_CONF_UNSET_MSEC;
     conf->memcached_keepalive = NGX_CONF_UNSET;
@@ -13349,6 +13428,13 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_value(conf->redis_enable, prev->redis_enable, 0);
     ngx_conf_merge_value(conf->memcached, prev->memcached, 0);
     ngx_conf_merge_msec_value(conf->redis_timeout, prev->redis_timeout, 250);
+    /* S231: safe non-zero small default. 0 = disabled (never back off).
+     * 2s comfortably outlasts a single connect() timeout/RST so a worker
+     * doesn't immediately re-hammer a peer that just refused, but is short
+     * enough that a recovered backend is back in rotation within a couple of
+     * requests worth of wall clock. */
+    ngx_conf_merge_msec_value(conf->redis_connect_backoff,
+                              prev->redis_connect_backoff, 2000);
     ngx_conf_merge_value(conf->redis_keepalive, prev->redis_keepalive, 0);
     ngx_conf_merge_msec_value(conf->redis_keepalive_timeout,
                               prev->redis_keepalive_timeout, 60000);
