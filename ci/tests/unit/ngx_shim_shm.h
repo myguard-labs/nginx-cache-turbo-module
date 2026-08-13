@@ -97,6 +97,13 @@ typedef intptr_t    ngx_int_t;
 typedef uintptr_t   ngx_uint_t;
 typedef unsigned char u_char;
 typedef intptr_t    ngx_atomic_int_t;
+/* S231-EVICT-BLIND: ngx_http_cache_turbo_shm_node_sie_live() returns
+ * ngx_flag_t, and its two byte-reader helpers are ngx_inline, matching
+ * production (ngx_config.h). ngx_inline collapses to plain `inline` here --
+ * production's own value is compiler-specific and irrelevant to this
+ * standalone harness, which only needs the keyword to compile. */
+typedef ngx_int_t   ngx_flag_t;
+#define ngx_inline  inline
 typedef uintptr_t   ngx_atomic_uint_t;
 typedef volatile ngx_atomic_uint_t ngx_atomic_t;
 
@@ -297,6 +304,10 @@ struct ngx_queue_s {
 
 #define ngx_queue_head(h)   (h)->next
 #define ngx_queue_last(h)   (h)->prev
+/* S231-EVICT-BLIND: evict_one()'s second-chance walk steps to the
+ * next-oldest candidate within a queue via ngx_queue_prev(), same macro
+ * production's ngx_queue.h defines. */
+#define ngx_queue_prev(q)   (q)->prev
 
 #define ngx_queue_remove(x)                                                   \
     (x)->next->prev = (x)->prev;                                              \

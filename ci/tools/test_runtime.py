@@ -2306,6 +2306,12 @@ http {{
     # test_store_failure_cleans_up_cold_stub). Own zone + own admin endpoint
     # (/_cache_storefail) makes the assert observe only /storefail/ traffic.
     cache_turbo_zone name=storefailz 16m;
+    # S231-EVICT-BLIND: private tiny zone (64k == enforced minimum, same
+    # reasoning as srz/ksevz above -- a handful of unique keys genuinely
+    # overflow it and force real eviction) with its own breaker, so tripping
+    # it OPEN and filling the zone cannot perturb any other zone's breaker
+    # state or LRU contents.
+    cache_turbo_zone name=evblindz 64k;
 
     # Q1 end-to-end: stacked native proxy_cache, one zone per suppress mode, so
     # a test can prove cache_turbo_suppress_native actually keeps the native
@@ -4146,6 +4152,37 @@ http {{
             cache_turbo_valid    30s;
             add_header           X-CT-Status $cache_turbo_status always;
             proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # S231-EVICT-BLIND: private tiny zone (evblindz, 64k) + own breaker
+        # (threshold=1, same trip shape as /s71brk/). proxy_pass is the bare
+        # origin root (not /sieserve/) so callers choose per-key whether the
+        # upstream response carries a stale-if-error window: /evblind/sieserve/*
+        # gets one (fresh=1s + stale-if-error=30 -> sie_ttl=31s from creation,
+        # SIE-live for the whole test), /evblind/_trip_plain does not, which is
+        # what lets the trip fetch surface the origin's raw failure instead of
+        # a 200 STALE-IF-ERROR replay. Drives test_evict_blind_second_chance:
+        # fills the zone while the breaker is OPEN (must still store, never
+        # ENOMEM/store failure) and pins that a live-SIE entry survives
+        # exactly one eviction pass, not every pass.
+        location /evblind/ {{
+            cache_turbo                     evblindz;
+            cache_turbo_key                 $uri;
+            cache_turbo_valid               1s;
+            cache_turbo_keep_stale          off;  # S231-DEFAULTS: isolate dead-origin arming from the 24h keep_stale default, same as /s71brk/
+            cache_turbo_stale_mult          1;
+            cache_turbo_breaker             on;
+            cache_turbo_breaker_threshold   1;
+            cache_turbo_breaker_window      10s;
+            cache_turbo_breaker_open        30s;
+            add_header                      X-CT-Status $cache_turbo_status always;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        location = /_cache_evblind {{
+            cache_turbo_admin    evblindz;
+            allow 127.0.0.1;
+            deny all;
         }}
 
         # S8: scan-resistant segmented LRU, ON. Own tiny zone so the scan below
@@ -11974,6 +12011,143 @@ def test_store_failure_cleans_up_cold_stub(ng: Nginx, origin: Origin) -> None:
     drain_origin(origin)
 
 
+def _evblind_trip_breaker(ng: Nginx, origin: Origin) -> None:
+    """Prime one /evblind/ key then trip its breaker OPEN, same two-fetch
+    shape as /s71brk/ (test_breaker_counters): threshold=1, so the tripping
+    fetch itself reaches the dead origin (must NOT be 200) and leaves the
+    zone's breaker OPEN for every call after it. Callers run this ONCE per
+    test on a freshly-relevant key; evblindz's breaker state persists for the
+    rest of the suite once tripped, same as every other private-zone breaker
+    fixture in this file.
+
+    ⚠ The tripping key is "_trip_plain", deliberately NOT one of the
+    "sieserve"-marked keys the rest of this test uses. Every /evblind/ key
+    proxies through /sieserve/ upstream (so the eviction candidates are
+    SIE-live), but a key WITH an armed serve-on-error window answers a dead
+    origin with a 200 STALE-IF-ERROR replay instead of surfacing the error --
+    that is RFC-2 working as designed (see test_sie_serve_on_error), not a
+    breaker trip. Tripping needs the origin's raw failure to actually reach
+    the response, so it must go through a key /sieserve/ has nothing to arm
+    for. "_trip_plain" still lands on evblindz/the breaker under test; only
+    its own SIE arming is what must not fire."""
+    s0, b0, _ = fetch(ng.port, "/evblind/_trip_plain")
+    assert s0 == 200 and b0, f"evblind prime failed: {s0} {b0!r}"
+
+    time.sleep(1.3)   # past fresh (1s), stale_mult 1 -> 1s window: L1-expired
+    origin.fail = True
+    try:
+        s_trip, _, _ = fetch(ng.port, "/evblind/_trip")
+        assert s_trip != 200, (
+            f"evblind: tripping request itself was answered 200 -- expected "
+            f"it to reach the dead origin and fail, got {s_trip}")
+    finally:
+        origin.fail = False
+        drain_origin(origin)
+
+    state = _admin_str(ng, "breaker_state", "/_cache_evblind")
+    assert state == "open", (
+        f"evblind: breaker did not trip OPEN after the threshold=1 failure "
+        f"(breaker_state={state!r})")
+
+
+def test_evict_blind_second_chance(ng: Nginx, origin: Origin) -> None:
+    """S231-EVICT-BLIND reachability smoke test.
+
+    ⚠ SCOPE NOTE: the actual second-chance MECHANISM (spare-once,
+    evict-on-the-next-pass, bounded by n_entries so it can never wedge) is
+    proven at the C level by ci/tests/unit/test_shm_state.c's
+    test_evict_blind_second_chance_unit() and its paired mutation control --
+    that harness drives the real, sliced production evict_one() directly
+    against a fabricated live-SIE node and a forced breaker_state word, which
+    is the only way to observe "spared exactly once" at all (see below for
+    why the black-box surface cannot).
+
+    What THIS test covers instead: a virgin (never-cached) key behind an
+    ALREADY-OPEN breaker with no armed snapshot legitimately 503s at the
+    pre-origin gate (breaker_unavailable(), module.c ~6044) -- a store is
+    never attempted for it, by design, regardless of second-chance. That
+    means the black-box surface has NO reachable path that stores a brand
+    new key while the breaker is OPEN, so a black-box fill-the-zone-while-
+    OPEN test (this function's previous shape) was asserting against a
+    scenario the request path cannot produce, and its "must always 200"
+    loop failed with 503 on the very first fill key -- not a bug, a fixture
+    that assumed an unreachable route. This test instead proves the
+    REACHABLE half: entries stored while the breaker is CLOSED survive a
+    later transition to OPEN and continue to serve normally (STALE-BREAKER
+    fallback, no hang, no request-path regression) even once the zone has
+    been filled past capacity and second-chance has been exercised for real
+    by ordinary churn -- end-to-end evidence that wiring the feature in did
+    not break the ordinary request path it shares evict_one() with."""
+    tracked = "/evblind/sieserve/tracked"
+
+    # Fill the (tiny, 64k) zone first, all while the breaker is still CLOSED
+    # (the only state a virgin key can be stored in at all) -- this is what
+    # exercises real eviction/second-chance churn under ordinary conditions.
+    for i in range(120):
+        s, _, _ = fetch(ng.port, f"/evblind/sieserve/fill1-{i}")
+        assert s == 200, f"evblind: fill wave key {i} returned {s}"
+
+    # Store the tracked key LAST, so it is the most-recently-used entry and
+    # therefore still resident (not yet aged to the LRU tail) when the
+    # breaker below trips OPEN.
+    s, _, h = fetch(ng.port, tracked)
+    assert s == 200, f"evblind: tracked-key store returned {s}"
+    assert h.get("x-ct-status") == "MISS", (
+        f"evblind: tracked-key initial store should MISS, got "
+        f"{h.get('x-ct-status')}")
+
+    _evblind_trip_breaker(ng, origin)
+
+    # Re-fetching an already-cached key while OPEN must not hang or error --
+    # this is the STALE-BREAKER fallback path (ACT_SERVE), which shares
+    # evict_one()'s zone and mutex but never itself calls it (a HIT/STALE
+    # serve replays existing bytes, no allocation). The assertion is
+    # therefore reachability/no-regression, not a second-chance proof.
+    s, _, h = fetch(ng.port, tracked)
+    assert s == 200, (
+        f"evblind: an already-cached key behind an OPEN breaker must still "
+        f"be served (STALE-BREAKER fallback), got {s}")
+    st = h.get("x-ct-status", "")
+    assert st in ("HIT", "STALE"), (
+        f"evblind: expected a cache-served status while OPEN, got {st!r}")
+
+
+def test_evict_blind_negative_control_closed_breaker_evicts_normally(
+        ng: Nginx) -> None:
+    """S231-EVICT-BLIND negative control: with the breaker CLOSED (its
+    default state -- this test runs standalone against evblindz and never
+    trips it), a live-SIE-shaped entry gets NO second chance at all -- it is
+    evicted on the very first pass, exactly like the pre-S231-EVICT-BLIND
+    behaviour. This isolates that the spare is conditioned on breaker_open,
+    not on "this key looks like it could carry an SIE window" alone -- a
+    build that always spares a live-SIE candidate (breaker state ignored)
+    would fail this control by keeping the tracked key resident.
+
+    Deliberately evblindz (not /e/'s shared `tiny` 8m zone, which needs
+    ~200 keys to force eviction and is shared with test_lru_eviction and
+    test_p1_coarse_lru_splice_keeps_hot_key_resident -- a borderline fill
+    count on an already-populated shared zone risks the control passing for
+    the wrong reason). evblindz's own /evblind/sieserve/ location DOES carry
+    a live stale-if-error window, so this control also proves the
+    SIE-liveness half is insufficient alone: the entries here ARE live-SIE,
+    and still get no spare, because the breaker was never tripped."""
+    tracked = "/evblind/sieserve/control-tracked"
+
+    s, _, h = fetch(ng.port, tracked)
+    assert s == 200, f"control: tracked-key store returned {s}"
+
+    for i in range(120):
+        s, _, _ = fetch(ng.port, f"/evblind/sieserve/control-fill-{i}")
+        assert s == 200, f"control: fill key {i} returned {s}"
+
+    s, _, h = fetch(ng.port, tracked)
+    st = h.get("x-ct-status", "")
+    assert s == 200 and st == "MISS", (
+        f"control: tracked key survived a single eviction pass under a "
+        f"CLOSED breaker (status={st!r}, expected MISS) -- no second chance "
+        "should apply here at all")
+
+
 def _admin_l2_misses(ng: Nginx) -> int:
     import json
     _, b, _ = fetch(ng.port, "/_cache")
@@ -17163,6 +17337,8 @@ def run_all(ng: Nginx, origin: Origin,
     test_admin_purge_post_with_body(ng)
     test_concurrent_hits_no_deadlock(ng)
     test_lru_eviction(ng)
+    test_evict_blind_negative_control_closed_breaker_evicts_normally(ng)  # S231-EVICT-BLIND, must run BEFORE the breaker trips
+    test_evict_blind_second_chance(ng, origin)                    # S231-EVICT-BLIND
     test_p1_coarse_lru_splice_keeps_hot_key_resident(ng)
     test_s8_scan_resistant_keeps_hot_key(ng)
     test_s8_default_off_is_unchanged(ng)

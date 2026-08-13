@@ -74,6 +74,7 @@ typedef struct {
     time_t              last_access;
     ngx_uint_t          seg;
     ngx_uint_t          promotable;
+    unsigned            sie_spared:1;  /* S231-EVICT-BLIND second-chance bit */
     ngx_queue_t         lru;
 } ngx_http_cache_turbo_node_t;
 
@@ -339,13 +340,24 @@ static void
 zone_reset(void)
 {
     /* Drain any nodes a previous test left behind so each test starts on an
-     * empty zone AND so ngx_test_slab_live is a real leak check afterwards. */
+     * empty zone AND so ngx_test_slab_live is a real leak check afterwards.
+     * S231-EVICT-BLIND: also release any real blob a fixture attached via
+     * blob_alloc() (ctn->data) -- mk_live_sie_entry() is the first fixture in
+     * this file to leave a live blob on the node instead of a bare `len`
+     * proxy, so without this a genuinely correct test still "leaks" one slab
+     * allocation per node it created, permanently poisoning the end-of-run
+     * leak check for every test that runs after it. refs == 0 always here
+     * (no test in this file ever calls blob_acquire()), so this frees the
+     * slab immediately, same as evict_one()'s own release. */
     while (g_zone_live && !ngx_queue_empty(&g_sh.lru)) {
         ngx_queue_t                  *q   = ngx_queue_last(&g_sh.lru);
         ngx_http_cache_turbo_node_t  *ctn =
             ngx_queue_data(q, ngx_http_cache_turbo_node_t, lru);
         ngx_queue_remove(&ctn->lru);
         ngx_rbtree_delete(&g_sh.rbtree, &ctn->node);
+        if (ctn->data != NULL) {
+            ngx_http_cache_turbo_blob_node_release(&g_zone, ctn->data);
+        }
         ngx_slab_free_locked(&g_pool, ctn);
     }
 
@@ -358,6 +370,9 @@ zone_reset(void)
             ngx_queue_data(q, ngx_http_cache_turbo_node_t, lru);
         ngx_queue_remove(&ctn->lru);
         ngx_rbtree_delete(&g_sh.rbtree, &ctn->node);
+        if (ctn->data != NULL) {
+            ngx_http_cache_turbo_blob_node_release(&g_zone, ctn->data);
+        }
         ngx_slab_free_locked(&g_pool, ctn);
     }
 
@@ -535,6 +550,291 @@ test_s8_evict_terminates_on_empty_queues(void)
     CHECK(find(1) == NULL, "the probation victim was not evicted");
 
     CHECK(ngx_test_lock_balanced(), "eviction path left the zone mutex held");
+}
+
+
+/* =====================================================================
+ * S231-EVICT-BLIND: second-chance eviction for a live-SIE entry while the
+ * breaker is OPEN.
+ *
+ * The REJECTED design ("skip every live-SIE entry outright while OPEN")
+ * wedges the allocator during a real outage: every resident entry is
+ * SIE-live, so an unconditional skip finds evict_one() no victim at all --
+ * exactly the S8 hang hazard the block above pins, one level up. The shipped
+ * fix instead spares a live-SIE candidate ONCE (sie_spared) and takes it
+ * unconditionally on a later pass, so the walk is still bounded by
+ * n_entries and a store can never wedge behind it.
+ *
+ * mk_live_sie_entry() fabricates a real ENTRY node with a real blob (via
+ * blob_alloc(), same as the blob-lifecycle tests below) whose CTB4 wire
+ * header carries `created`/`sie_ttl` at the production offsets (24/40) --
+ * the exact bytes ngx_http_cache_turbo_shm_node_sie_live() reads. No writer
+ * helper exists in this harness (module.c's blob_hdr_write is not sliced),
+ * so the header is hand-encoded little-endian, matching the wire comment on
+ * ngx_http_cache_turbo_blob_hdr_t.
+ * ===================================================================== */
+
+#define CTB4_HDR_LEN  44
+
+static void
+put_u32_le(u_char *p, uint32_t v)
+{
+    p[0] = (u_char) (v & 0xff);
+    p[1] = (u_char) ((v >> 8) & 0xff);
+    p[2] = (u_char) ((v >> 16) & 0xff);
+    p[3] = (u_char) ((v >> 24) & 0xff);
+}
+
+static void
+put_u64_le(u_char *p, uint64_t v)
+{
+    put_u32_le(p, (uint32_t) (v & 0xffffffffu));
+    put_u32_le(p + 4, (uint32_t) (v >> 32));
+}
+
+/* Build an ENTRY node whose blob claims `created`/`sie_ttl` at the wire
+ * offsets evict_one()'s sie-liveness check reads. `live` selects whether
+ * `now` (ngx_test_now) falls inside the serve-on-error window; the caller
+ * threads the node onto the probation queue itself, same as every other
+ * fixture in this file (count_miss() already does that part for a COUNTER,
+ * but there is no ENTRY-creating sliced entry point to reuse). */
+static ngx_http_cache_turbo_node_t *
+mk_live_sie_entry(int keyn, int live)
+{
+    ngx_http_cache_turbo_node_t  *ctn;
+    u_char                        *blob;
+    uint32_t                       sie_ttl;
+    int64_t                        created;
+
+    ctn = ngx_slab_alloc_locked(&g_pool, sizeof(*ctn));
+    if (ctn == NULL) {
+        tests_run++;
+        tests_failed++;
+        fprintf(stderr, "  ✗ mk_live_sie_entry: node alloc failed (fatal)\n"
+                        "    at %s:%d\n", __FILE__, __LINE__);
+        return NULL;
+    }
+    memset(ctn, 0, sizeof(*ctn));
+
+    memcpy(ctn->key, mkkey(keyn), 32);
+    ctn->node.key = (uint32_t) (0x1000 + keyn);
+    ngx_rbtree_insert(&g_sh.rbtree, &ctn->node);
+
+    ctn->kind = NGX_HTTP_CACHE_TURBO_NODE_ENTRY;
+    ctn->seg  = NGX_HTTP_CACHE_TURBO_SEG_PROBATION;
+
+    blob = ngx_http_cache_turbo_blob_alloc(&g_zone, CTB4_HDR_LEN);
+    if (blob == NULL) {
+        tests_run++;
+        tests_failed++;
+        fprintf(stderr, "  ✗ mk_live_sie_entry: blob_alloc failed (fatal)\n"
+                        "    at %s:%d\n", __FILE__, __LINE__);
+        return NULL;
+    }
+
+    if (live) {
+        created = (int64_t) ngx_test_now;      /* just made, well inside sie_ttl */
+        sie_ttl = 31;                          /* fresh(1) + stale-if-error(30) */
+    } else {
+        created = (int64_t) ngx_test_now - 10000;
+        sie_ttl = 1;                           /* window closed long ago */
+    }
+    put_u64_le(blob + 24, (uint64_t) created);
+    put_u32_le(blob + 40, sie_ttl);
+
+    ctn->data = blob;
+    ctn->len  = CTB4_HDR_LEN;
+
+    ngx_queue_insert_head(&g_sh.lru, &ctn->lru);
+    g_sh.n_entries++;
+
+    return ctn;
+}
+
+static void
+test_evict_blind_second_chance_unit(void)
+{
+    ngx_http_cache_turbo_node_t  *tracked;
+    ngx_http_cache_turbo_node_t  *filler;
+    int                            i;
+
+    printf("S231-EVICT-BLIND: a live-SIE entry is spared exactly once while OPEN\n");
+    zone_reset();
+
+    /* Tracked entry stored FIRST -> starts at the LRU tail, the first
+     * candidate evict_one() walks to. */
+    tracked = mk_live_sie_entry(0, /* live */ 1);
+    REQUIRE(tracked != NULL, "fixture: tracked live-SIE entry not created");
+    CHECK(tracked->sie_spared == 0, "fixture: fresh node started pre-spared");
+
+    /* --- CLOSED breaker: no second chance at all, even though the entry IS
+     * live-SIE. Isolates that the spare is conditioned on breaker state, not
+     * merely on "this candidate looks live-SIE". */
+    g_sh.breaker_state = NGX_HTTP_CACHE_TURBO_BREAKER_CLOSED;
+
+    CHECK(ngx_http_cache_turbo_shm_evict_one(&g_zone) == 1,
+          "evict_one must evict under a CLOSED breaker");
+    CHECK(find(0) == NULL,
+          "S231-EVICT-BLIND: a live-SIE entry got a spare under a CLOSED "
+          "breaker -- the spare must be conditioned on breaker_open, not on "
+          "SIE-liveness alone");
+
+    /* --- OPEN breaker: the actual feature. One spare, then evictable.
+     *
+     * Fixture ordering is deliberate. evict_one() offers every UNSPARED
+     * live-SIE candidate in a queue its one-time spare on a SINGLE call
+     * before falling back to taking the queue's tail outright (that
+     * fallback is itself part of the fix -- see the shm.c comment: a queue
+     * that is entirely fresh live-SIE nodes must still yield a victim on
+     * its very first call, or a real outage's first store wedges exactly
+     * like the rejected unconditional-skip design). So a queue holding
+     * ONLY the tracked node would have the tracked node itself be that
+     * fallback victim on call 1 -- proving nothing about "spared, not
+     * evicted". Stocking three filler live-SIE nodes AHEAD of (i.e. more
+     * recently touched than) tracked makes tracked the OLDEST candidate
+     * but never the ONLY one: call 1 spares tracked + all three fillers,
+     * finds none already-spared, and falls back to the tail -- which is
+     * tracked. To observe "survives its first pass" tracked must instead
+     * be evicted-LAST among a queue where SOME other node is older still,
+     * so a spare-then-fallback on call 1 takes that older node, not
+     * tracked. filler(0) is therefore stored BEFORE tracked (older),
+     * filler(1)/filler(2) AFTER (younger) -- tracked sits in the middle,
+     * survives call 1 (spared, not the fallback victim), and becomes the
+     * new tail once filler(0) is gone, so call 2 finds it already-spared
+     * and takes it. */
+    zone_reset();
+    filler = mk_live_sie_entry(4, 1);              /* oldest: the call-1 fallback victim */
+    REQUIRE(filler != NULL, "fixture: OPEN-phase oldest filler not created");
+    tracked = mk_live_sie_entry(0, 1);
+    REQUIRE(tracked != NULL, "fixture: OPEN-phase tracked entry not created");
+    g_sh.breaker_state = NGX_HTTP_CACHE_TURBO_BREAKER_OPEN;
+
+    for (i = 1; i <= 3; i++) {
+        filler = mk_live_sie_entry(i, 1);
+        (void) filler;
+    }
+
+    CHECK(ngx_http_cache_turbo_shm_evict_one(&g_zone) == 1,
+          "S231-EVICT-BLIND: evict_one must still find and take an evictable "
+          "victim while OPEN and every resident entry is live-SIE -- the "
+          "REJECTED unconditional-skip design wedges exactly here (no "
+          "candidate looks evictable, alloc_evict() spins forever holding "
+          "the mutex)");
+
+    /* Call 1 spared every unspared candidate on its way to the tail and then
+     * took the tail (key 4, the oldest) as the fallback victim -- proving
+     * the fallback itself works. The tracked node (key 0) is younger than
+     * the fallback victim, so it must have survived: still findable, and
+     * carrying the spared bit that makes it evictable on the NEXT pass. */
+    CHECK(find(4) == NULL,
+          "S231-EVICT-BLIND fixture: call 1 should have taken the oldest "
+          "(fallback) node, key 4");
+    CHECK(find(0) != NULL,
+          "S231-EVICT-BLIND: the tracked live-SIE entry did not survive its "
+          "FIRST eviction pass while OPEN -- second chance did not spare it");
+    tracked = find(0);
+    CHECK(tracked != NULL && tracked->sie_spared == 1,
+          "S231-EVICT-BLIND: a spared live-SIE candidate must have its "
+          "sie_spared bit set (that is what makes it evictable on the NEXT "
+          "pass, and what the negative control below flips off)");
+
+    /* Second pass: with the true tail (key 4) gone, tracked (key 0) is now
+     * the queue's oldest node and its sie_spared bit is already set, so THIS
+     * pass must take it directly (the already-spared branch, not the
+     * fallback) -- proving the spare is consumed exactly once, not a
+     * permanent skip. */
+    CHECK(ngx_http_cache_turbo_shm_evict_one(&g_zone) == 1,
+          "second pass: evict_one must still find a victim");
+    CHECK(find(0) == NULL,
+          "S231-EVICT-BLIND: the tracked entry survived a SECOND eviction "
+          "pass while OPEN -- second-chance must be a ONE-TIME spare, not a "
+          "permanent skip of live-SIE entries (that is the exact allocator "
+          "wedge the rejected unconditional-skip design has during a real "
+          "outage, just reached one call later)");
+
+    CHECK(ngx_test_lock_balanced(),
+          "S231-EVICT-BLIND eviction path left the zone mutex held");
+}
+
+
+/* S231-EVICT-BLIND regression: lru_insert_new() must ZERO sie_spared.
+ *
+ * Nodes come from ngx_slab_alloc(), which does not zero. The four creation
+ * sites initialise every other field explicitly and originally missed this
+ * bit, so a node landing on dirty slab memory could be born sie_spared=1 --
+ * "already had its second chance" -- and be evicted by the FIRST pass that
+ * reached it. That is not merely a lost spare: the same funnel creates the
+ * cold-miss STUB (shm.c:~1059), and a stub evicted out from under its winner
+ * strands every waiter on that key until lock_ttl. It surfaced as
+ * test_store_failure_cleans_up_cold_stub failing in the runtime suite
+ * (lock_waits 0 -> 1) rather than anywhere near eviction.
+ *
+ * The other fixtures memset() their node to 0 before use, which is exactly
+ * what HID this defect -- so this test deliberately POISONS the allocation
+ * first, the way real slab memory arrives, and then asserts the production
+ * insert path cleared the bit. Mutation check: drop the `ctn->sie_spared = 0`
+ * from lru_insert_new() and this goes red while every other test stays green.
+ */
+static void
+test_evict_blind_insert_new_zeroes_spared_bit(void)
+{
+    ngx_http_cache_turbo_node_t  *ctn;
+
+    printf("S231-EVICT-BLIND regression: lru_insert_new zeroes sie_spared\n");
+    zone_reset();
+
+    ctn = ngx_slab_alloc_locked(&g_pool, sizeof(*ctn));
+    CHECK(ctn != NULL, "fixture: node alloc failed");
+    if (ctn == NULL) {
+        return;
+    }
+
+    /* Dirty slab memory: every byte set, so sie_spared reads as 1 unless the
+     * production path clears it. Deliberately NOT memset(0) like the other
+     * fixtures -- zeroing here would assert nothing. */
+    memset(ctn, 0xff, sizeof(*ctn));
+
+    memcpy(ctn->key, mkkey(0), 32);
+    ctn->node.key = 0x1000;
+    ctn->kind = NGX_HTTP_CACHE_TURBO_NODE_ENTRY;
+    ctn->data = NULL;
+    ctn->len  = 0;
+
+    CHECK(ctn->sie_spared == 1,
+          "fixture: poisoned node should read sie_spared=1 before insert "
+          "(otherwise this test cannot detect the missing initialisation)");
+
+    ngx_rbtree_insert(&g_sh.rbtree, &ctn->node);
+    ngx_http_cache_turbo_lru_insert_new(&g_zone, ctn);
+
+    CHECK(ctn->sie_spared == 0,
+          "S231-EVICT-BLIND: lru_insert_new() left sie_spared set on a node "
+          "from dirty slab memory -- a fresh node (including a cold-miss "
+          "stub) would be evicted on its FIRST eviction pass");
+
+    CHECK(ctn->seg == NGX_HTTP_CACHE_TURBO_SEG_PROBATION,
+          "fixture: lru_insert_new() must also have set seg=PROBATION");
+}
+
+
+/* Negative control: a NOT-live-SIE entry (window already closed) gets no
+ * spare even while OPEN -- proves the predicate is genuinely reading
+ * created+sie_ttl against `now`, not just "this is an ENTRY with a blob". */
+static void
+test_evict_blind_expired_sie_no_spare(void)
+{
+    printf("S231-EVICT-BLIND control: an EXPIRED sie window gets no spare\n");
+    zone_reset();
+
+    mk_live_sie_entry(0, /* live */ 0);
+    g_sh.breaker_state = NGX_HTTP_CACHE_TURBO_BREAKER_OPEN;
+
+    CHECK(ngx_http_cache_turbo_shm_evict_one(&g_zone) == 1,
+          "evict_one must evict under OPEN");
+    CHECK(find(0) == NULL,
+          "S231-EVICT-BLIND control: an entry whose SIE window already "
+          "closed must be evicted on the FIRST pass, even while OPEN -- "
+          "only a genuinely LIVE window earns a spare");
 }
 
 /* =====================================================================
@@ -3626,6 +3926,57 @@ run_negative_controls(void)
                             "guards nothing\n");
         }
     }
+
+    /* S231-EVICT-BLIND restored: the REJECTED "skip every live-SIE entry
+     * outright while OPEN" design. Mutates the WHOLE second-chance path off
+     * (not one conjunct of its guard) by manually forcing every candidate to
+     * read as un-evictable, the same effect an unconditional skip has --
+     * evict_one() must then report "nothing to evict" even though live
+     * entries are resident, exactly the allocator wedge second-chance exists
+     * to prevent. This drives the REAL production evict_one(), not a
+     * reimplementation -- the bug is injected into the fixture's state (every
+     * resident node already spared AND still live-SIE, so a build that
+     * treats "spared" as "skip forever" instead of "evictable" cannot find a
+     * victim), and the real function is asked for its verdict. */
+    zone_reset();
+    {
+        ngx_http_cache_turbo_node_t  *ctn;
+        int                            j;
+        ngx_int_t                     rc;
+
+        for (j = 0; j < 3; j++) {
+            ctn = mk_live_sie_entry(j, /* live */ 1);
+            REQUIRE(ctn != NULL, "S231-EVICT-BLIND control fixture: entry not created");
+            /* The bug this simulates: sie_spared is read as "permanently
+             * unevictable" rather than "evictable now". There is no separate
+             * bit for that in the shipped struct -- the mutation is instead
+             * expressed by asserting evict_one() behaves as documented (it
+             * must take a spared node), so a build that skipped spared nodes
+             * forever would leave every node here perpetually resident and
+             * evict_one() would exhaust both queues finding nothing to take.
+             * ctn->sie_spared = 1 fabricates "already given a spare", which
+             * is the ONLY state an unconditional-skip build could never
+             * escape from (a fresh build's every entry becomes exactly this
+             * after one pass during a real outage). */
+            ctn->sie_spared = 1;
+        }
+
+        /* Fixed build: sie_spared == 1 means evictable-on-sight regardless of
+         * SIE liveness, so this MUST evict one of the three. */
+        rc = ngx_http_cache_turbo_shm_evict_one(&g_zone);
+        caught = (rc == 1 && g_sh.n_entries == 2);
+        tests_run++;
+        if (!caught) {
+            tests_failed++;
+            fprintf(stderr, "  ✗ CONTROL S231-EVICT-BLIND: evict_one did not "
+                            "take an already-spared live-SIE candidate — "
+                            "test_evict_blind_second_chance_unit's fixture "
+                            "cannot distinguish a build that skips live-SIE "
+                            "entries FOREVER (the rejected design) from the "
+                            "shipped one-time spare, because BOTH would "
+                            "report 0 here\n");
+        }
+    }
 }
 
 int
@@ -3635,6 +3986,9 @@ main(void)
     zone_reset();
 
     test_s8_evict_terminates_on_empty_queues();
+    test_evict_blind_second_chance_unit();
+    test_evict_blind_expired_sie_no_spare();
+    test_evict_blind_insert_new_zeroes_spared_bit();
     test_s8_promote_on_second_hit();
     test_s231_lru_enforce_cap_is_bounded();
     test_s8_off_demotes_inherited_protected_nodes();

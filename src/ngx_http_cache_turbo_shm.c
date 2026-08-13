@@ -304,6 +304,17 @@ ngx_http_cache_turbo_lru_insert_new(ngx_http_cache_turbo_zone_t *z,
     ngx_http_cache_turbo_node_t *ctn)
 {
     ctn->seg = NGX_HTTP_CACHE_TURBO_SEG_PROBATION;
+
+    /* S231-EVICT-BLIND: nodes come from ngx_slab_alloc(), which does NOT zero
+     * -- every other field is initialised explicitly by the four creation
+     * sites, and this bit must be too. A node born with a garbage sie_spared
+     * of 1 reads as "already had its second chance" and is evicted on sight by
+     * the very first eviction pass that reaches it, including a cold-miss STUB
+     * (shm.c:~1059) whose disappearance strands every waiter on that key until
+     * lock_ttl. Initialised here rather than at each creation site because all
+     * four funnel through this function, exactly like `seg` above. */
+    ctn->sie_spared = 0;
+
     ngx_queue_insert_head(&z->sh->lru, &ctn->lru);
     z->sh->n_entries++;
 }
@@ -444,8 +455,59 @@ ngx_http_cache_turbo_shm_touch_lru(ngx_http_cache_turbo_zone_t *z,
 }
 
 
+/* Little-endian u32/u64 readers, duplicated from the `static` helpers of the
+ * same name in ngx_http_cache_turbo_module.c (not visible across TUs) so this
+ * file can read the CTB4 wire header's `created`/`sie_ttl` fields without
+ * threading a request ctx through -- see ngx_http_cache_turbo_shm_node_sie_live()
+ * just below for why. Same wire offsets, same byte order; keep in sync with
+ * the CTB4 layout comment in ngx_http_cache_turbo_module.h. */
+static ngx_inline uint32_t
+ngx_http_cache_turbo_shm_get_u32(const u_char *p)
+{
+    return (uint32_t) p[0]
+         | ((uint32_t) p[1] << 8)
+         | ((uint32_t) p[2] << 16)
+         | ((uint32_t) p[3] << 24);
+}
+
+static ngx_inline uint64_t
+ngx_http_cache_turbo_shm_get_u64(const u_char *p)
+{
+    return (uint64_t) ngx_http_cache_turbo_shm_get_u32(p)
+         | ((uint64_t) ngx_http_cache_turbo_shm_get_u32(p + 4) << 32);
+}
+
+
+/* S231-EVICT-BLIND: is `ctn` a live stale-if-error entry right now? Only an
+ * ENTRY carries a blob (a COUNTER's `data` is NULL / not a CTB4 blob), and
+ * only while `now` is still inside the absolute (created + sie_ttl) window --
+ * the identical test the request path uses to decide whether to arm an SIE
+ * snapshot (ngx_http_cache_turbo_module.c, the `ctx->sie_armed` arm site).
+ * Duplicated here rather than shared because that site works off a live
+ * request's `ctx`/blob-header parse and this one only has the raw node under
+ * the shpool mutex -- same offsets (24 = created, 40 = sie_ttl), same wire
+ * format, no ctx to thread through.
+ */
+static ngx_flag_t
+ngx_http_cache_turbo_shm_node_sie_live(ngx_http_cache_turbo_node_t *ctn,
+    time_t now)
+{
+    time_t    created;
+    uint32_t  sie_ttl;
+
+    if (ctn->kind != NGX_HTTP_CACHE_TURBO_NODE_ENTRY || ctn->data == NULL) {
+        return 0;
+    }
+
+    created  = (time_t) ngx_http_cache_turbo_shm_get_u64(ctn->data + 24);
+    sie_ttl  = ngx_http_cache_turbo_shm_get_u32(ctn->data + 40);
+
+    return sie_ttl > 0 && now < created + (time_t) sie_ttl;
+}
+
+
 /* Evict the least-recently-used entry. Caller holds the shpool mutex. Returns 1
- * if an entry was evicted, 0 if BOTH queues were already empty (no candidate).
+ * if an entry was evicted, 0 if nothing was evictable (no candidate).
  *
  * ⚠ THE HANG HAZARD. With two queues, `ngx_queue_empty(&z->sh->lru)` is no
  * longer the "nothing to evict" test in either direction:
@@ -463,38 +525,116 @@ ngx_http_cache_turbo_shm_touch_lru(ngx_http_cache_turbo_zone_t *z,
  * through to the protected tail, and return 0 only when BOTH are empty.
  * Pinned by test_s8_evict_terminates_on_empty_queues() under a SIGALRM
  * watchdog, so a regression fails in bounded time instead of hanging CI.
- */
+ *
+ * S231-EVICT-BLIND: while the breaker is OPEN, a live-SIE tail candidate is
+ * given ONE second chance instead of being taken -- its `sie_spared` bit is
+ * set and the walk moves to the next tail candidate (same queue, then falls
+ * through to the other queue exactly as before). A candidate whose bit is
+ * ALREADY set is taken unconditionally, spared or not. This is why the
+ * "skip every live-SIE entry" design was rejected in favour of this one:
+ * during an outage every resident entry can be SIE-live, and an unconditional
+ * skip would make BOTH queues look candidate-less to this function while
+ * neither is actually empty -- the exact hang the two-queue fallthrough above
+ * exists to avoid, just moved one level up. Sparing at most once per node
+ * bounds the walk by 2 * n_entries, so it still always terminates and a
+ * store during an OPEN-breaker outage still succeeds instead of failing
+ * closed. Reading breaker_state here is a raw unpack, never
+ * ngx_http_cache_turbo_shm_breaker_state() -- that call TRANSITIONS the
+ * state machine and must not be invoked from an unrelated eviction walk. */
 static ngx_int_t
 ngx_http_cache_turbo_shm_evict_one(ngx_http_cache_turbo_zone_t *z)
 {
+    ngx_queue_t                  *queues[2];
+    ngx_queue_t                  *head;
     ngx_queue_t                  *q;
+    ngx_queue_t                  *prev;
+    ngx_queue_t                  *fallback;
     ngx_http_cache_turbo_node_t  *ctn;
+    ngx_flag_t                     breaker_open;
+    time_t                        now;
+    ngx_uint_t                    i;
 
-    if (!ngx_queue_empty(&z->sh->lru)) {
-        q = ngx_queue_last(&z->sh->lru);
+    breaker_open = ngx_http_cache_turbo_brk_state(z->sh->breaker_state)
+                   == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN;
+    now = ngx_time();
 
-    } else if (!ngx_queue_empty(&z->sh->lru_protected)) {
-        /* Probation drained: a full-but-all-protected zone must still be
-         * reclaimable, or the loop in alloc_evict() never terminates. */
-        q = ngx_queue_last(&z->sh->lru_protected);
+    /* Probation tail first (that ordering IS the scan resistance), protected
+     * tail second. Walking each queue tail-to-head (oldest candidate first),
+     * and within a queue skipping over an already-spared-once live-SIE node
+     * to the next-oldest. Bounded by n_entries per queue -- each node is
+     * visited at most twice total across the whole function (once to spare
+     * it, once more to take it on a LATER call) -- so this always
+     * terminates, satisfying the same contract the caller relies on. */
+    queues[0] = &z->sh->lru;
+    queues[1] = &z->sh->lru_protected;
 
-    } else {
-        return 0;                    /* genuinely nothing to evict */
+    for (i = 0; i < 2; i++) {
+        head = queues[i];
+
+        if (ngx_queue_empty(head)) {
+            continue;
+        }
+
+        /* fallback remembers the OLDEST (tail) candidate in this queue: if
+         * every candidate turns out to need sparing on THIS pass (a queue
+         * that is entirely fresh live-SIE nodes -- the exact state a real
+         * outage's first eviction ever sees), sparing everyone once and then
+         * reporting "nothing evictable" would still wedge alloc_evict() on
+         * the very first store, identical to the rejected unconditional-skip
+         * design just delayed by one full queue walk. So once every
+         * candidate has been offered its one-time spare, this call falls
+         * back to taking the tail anyway -- it is guaranteed sie_spared by
+         * then, exactly the state a LATER call would evict it in, just
+         * reached within this same call instead of a subsequent one. */
+        fallback = ngx_queue_last(head);
+
+        for (q = ngx_queue_last(head); q != head; q = prev) {
+            ctn = ngx_queue_data(q, ngx_http_cache_turbo_node_t, lru);
+
+            if (breaker_open && !ctn->sie_spared
+                && ngx_http_cache_turbo_shm_node_sie_live(ctn, now))
+            {
+                /* Live-SIE candidate, breaker OPEN, not yet spared: spare it
+                 * once and try the next-oldest node in this same queue. */
+                ctn->sie_spared = 1;
+                prev = ngx_queue_prev(q);
+                continue;
+            }
+
+            /* Evictable: not SIE-live, breaker CLOSED/HALF_OPEN, or already
+             * spared once before. */
+            ngx_http_cache_turbo_lru_unlink(z, ctn);
+            z->sh->n_entries--;
+            ngx_rbtree_delete(&z->sh->rbtree, &ctn->node);
+
+            if (ctn->data) {
+                ngx_http_cache_turbo_blob_node_release(z, ctn->data);
+            }
+            ngx_slab_free_locked(z->shpool, ctn);
+
+            (void) ngx_atomic_fetch_add(&z->sh->evictions, 1);
+            return 1;
+        }
+
+        /* Every node in this queue was freshly spared this call, none was
+         * already-spared -- take the fallback (the tail, now sie_spared)
+         * rather than leaving a full queue of reclaimable memory unreported. */
+        ctn = ngx_queue_data(fallback, ngx_http_cache_turbo_node_t, lru);
+
+        ngx_http_cache_turbo_lru_unlink(z, ctn);
+        z->sh->n_entries--;
+        ngx_rbtree_delete(&z->sh->rbtree, &ctn->node);
+
+        if (ctn->data) {
+            ngx_http_cache_turbo_blob_node_release(z, ctn->data);
+        }
+        ngx_slab_free_locked(z->shpool, ctn);
+
+        (void) ngx_atomic_fetch_add(&z->sh->evictions, 1);
+        return 1;
     }
 
-    ctn = ngx_queue_data(q, ngx_http_cache_turbo_node_t, lru);
-
-    ngx_http_cache_turbo_lru_unlink(z, ctn);
-    z->sh->n_entries--;
-    ngx_rbtree_delete(&z->sh->rbtree, &ctn->node);
-
-    if (ctn->data) {
-        ngx_http_cache_turbo_blob_node_release(z, ctn->data);
-    }
-    ngx_slab_free_locked(z->shpool, ctn);
-
-    (void) ngx_atomic_fetch_add(&z->sh->evictions, 1);
-    return 1;
+    return 0;                        /* genuinely nothing to evict */
 }
 
 
@@ -688,6 +828,14 @@ ngx_http_cache_turbo_shm_store_locked(ngx_http_cache_turbo_zone_t *z,
          * hold protected residency indefinitely without ever being read. */
         ctn->seg = NGX_HTTP_CACHE_TURBO_SEG_PROBATION;
         ctn->promotable = 0;
+
+        /* S231-EVICT-BLIND: a refresh installs a new representation with its
+         * own SIE window, so it re-earns its second chance rather than
+         * inheriting a spare already consumed by the body it replaced. This
+         * node is reused in place (not freshly allocated), so lru_insert_new()
+         * does not run for it and the bit would otherwise persist. */
+        ctn->sie_spared = 0;
+
         ngx_http_cache_turbo_lru_link_head(z, ctn);
 
         return NGX_OK;
