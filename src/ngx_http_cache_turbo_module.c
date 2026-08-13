@@ -962,9 +962,22 @@ ngx_http_cache_turbo_blob_validate(const u_char *blob, size_t len,
      * by headers_len/8 above, and headers_len <= len <= cache_turbo_max_object
      * (1 MiB by default, configurable), so the allocation is bounded by the
      * same blob-size ceiling that already bounds everything else here. A zero
-     * count allocates nothing (ngx_pnalloc(pool, 0) is never called). */
+     * count allocates nothing (ngx_palloc(pool, 0) is never called).
+     *
+     * ngx_palloc(), NOT ngx_pnalloc(): ngx_http_cache_turbo_blob_href_t holds
+     * two `const u_char *` members and needs NGX_ALIGNMENT (8-byte) placement.
+     * ngx_pnalloc() is nginx's UNALIGNED allocator (used for strings/byte
+     * buffers) -- pool->d.last is only byte-advanced by prior nlen/vlen-sized
+     * requests in the same pool, so an odd offset there hands back a
+     * misaligned `refs` pointer. Every `refs[i].name = ...` below then derefs
+     * a pointer-typed struct member off an unaligned base, which is UB (caught
+     * live by UBSan: "member access within misaligned address ... requires
+     * 8 byte alignment" at this call site) and can fault on strict-alignment
+     * platforms. ngx_palloc() rounds up to NGX_ALIGNMENT before handing back
+     * memory, exactly like any other pointer-bearing struct allocated from
+     * this pool. */
     if (pool != NULL && refs_out != NULL && out->nheaders > 0) {
-        refs = ngx_pnalloc(pool,
+        refs = ngx_palloc(pool,
                    out->nheaders * sizeof(ngx_http_cache_turbo_blob_href_t));
         if (refs == NULL) {
             return NGX_ERROR;
