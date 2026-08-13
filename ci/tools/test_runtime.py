@@ -1821,6 +1821,49 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             cache_turbo_redis              127.0.0.1:{redis_port} prefix=brkil2: timeout=250ms;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
+
+        # S231-L2-BACKOFF: per-worker L2 connect backoff. Same dead peer as
+        # /_cache_scandown (redis_dead offset, never bound -> every connect
+        # is refused), but wired to a normal GET/miss location so it goes
+        # through ngx_http_cache_turbo_redis_get -> launch(), the fail-fast
+        # choke point, not the admin scan path.
+        #
+        # /l2backoff/ arms a 5s window: request 1 pays the real refused
+        # connect() (the ordinary per-request path), request 2 must fail
+        # fast on the SAME worker without another connect attempt. Both are
+        # indistinguishable from the client's perspective (both a plain L2
+        # miss -> origin serve) -- the oracle is the X-Cache-Turbo-Test-L2-
+        # Backoff counter (TEST_FAULTS-only), never response equality.
+        # cache_turbo_lock off: this location's job is purely to exercise the
+        # L2 connect path, not the cold-miss cross-node NX lock. With locking
+        # on, a dead L2 peer makes every miss retry through the cold-miss
+        # WAIT poll (module.c's cold_wait_ev/cold_wait_timeout), which was
+        # measured to leave a timer armed past its owning request's response
+        # in a way that can outlive a since-closed keepalive connection and
+        # crash the worker on shutdown (pre-existing race, unrelated to L2
+        # backoff, ledgered in issues.md). Locking off avoids that path
+        # entirely and is irrelevant to what this fixture tests.
+        location /l2backoff/ {{
+            cache_turbo                    main;
+            cache_turbo_key                $uri;
+            cache_turbo_valid               1s;
+            cache_turbo_lock               off;
+            cache_turbo_redis              127.0.0.1:{port + PORT_OFFSETS["redis_dead"]} prefix=ctbo: timeout=250ms connect_backoff=5000ms;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # Negative control: connect_backoff=0 (disabled) against the SAME
+        # dead peer -- every request must pay its own connect failure, so the
+        # counter never moves no matter how many requests land back to back.
+        # Same cache_turbo_lock off reasoning as /l2backoff/ above.
+        location /l2backoffoff/ {{
+            cache_turbo                    main;
+            cache_turbo_key                $uri;
+            cache_turbo_valid               1s;
+            cache_turbo_lock               off;
+            cache_turbo_redis              127.0.0.1:{port + PORT_OFFSETS["redis_dead"]} prefix=ctboo: timeout=250ms connect_backoff=0;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
 """
 
     # L2 memcached (v13): a location wired to the memcached backend instead of
@@ -1901,6 +1944,18 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             cache_turbo_memcached  127.0.0.1:{memcached_port} prefix=mc: timeout=250ms;
             allow 127.0.0.1;
             deny all;
+        }}
+
+        # S231-L2-BACKOFF, memcached side. Same dead-peer/cache_turbo_lock off
+        # shape as /l2backoff/ above (redis_dead offset -- never bound, plain
+        # TCP refuse works identically for either driver's connect()).
+        location /mcbackoff/ {{
+            cache_turbo            main;
+            cache_turbo_key        $uri;
+            cache_turbo_valid      1s;
+            cache_turbo_lock       off;
+            cache_turbo_memcached  127.0.0.1:{port + PORT_OFFSETS["redis_dead"]} prefix=mcbo: timeout=250ms connect_backoff=5000ms;
+            proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 """
 
@@ -7081,6 +7136,33 @@ def test_prometheus_breaker_metrics(ng: Nginx, origin: Origin) -> None:
 
 # Response-header names arrive lower-cased from fetch()'s dict.
 _ARMINGS_HDR = "x-cache-turbo-test-armings"
+_BACKOFF_HDR = "x-cache-turbo-test-l2-backoff"
+
+
+def _backoff_skips(hdrs: dict, where: str, driver: str = "redis") -> int:
+    """Pull ONE driver's lifetime L2-connect-backoff fail-fast counter out of
+    a response's headers (S231-L2-BACKOFF, TEST_FAULTS-only).
+
+    Mirrors _armings() above: the header carries both drivers as
+    `redis=<n>,memcached=<n>` so an assertion on one driver cannot be
+    satisfied by the other driver's counter moving. A missing header or
+    missing key is a hard failure, not a skip -- same reasoning as _armings:
+    its absence would make every delta read 0 and the test would pass while
+    proving nothing."""
+    assert driver in ("redis", "memcached"), f"unknown backoff driver {driver!r}"
+    raw = hdrs.get(_BACKOFF_HDR)
+    assert raw is not None, (
+        f"{_BACKOFF_HDR} missing on {where} -- this build has no backoff "
+        f"counter, so the S231-L2-BACKOFF control cannot distinguish "
+        f"'fail-fast fired' from 'never checked'")
+    parts = dict(
+        kv.split("=", 1) for kv in raw.split(",") if "=" in kv
+    )
+    assert driver in parts, (
+        f"{_BACKOFF_HDR} on {where} is {raw!r}, which carries no {driver!r} "
+        f"key -- the header format drifted and this assertion would silently "
+        f"measure nothing")
+    return int(parts[driver])
 
 
 def _armings(hdrs: dict, where: str, site: str = "l1") -> int:
@@ -8114,6 +8196,218 @@ def test_memcached_timeout_zero_rejected(ng: Nginx) -> None:
         f"timeout=0 was accepted by nginx -t:\n{r.stdout}"
     assert "timeout must be > 0" in r.stdout, \
         f"missing timeout-must-be-positive diagnostic:\n{r.stdout}"
+
+
+def _fetch_keepalive(conn: http.client.HTTPConnection, path: str):
+    """GET on an ALREADY-OPEN HTTPConnection, without closing it. nginx pins
+    every request on one accepted TCP connection to whichever worker accepted
+    it, so this is what makes a same-worker request sequence possible against
+    the harness's 4-worker default (fetch() sends `Connection: close` and
+    opens a fresh socket per call, which round-robins across workers and
+    cannot pin anything -- measured: two ordinary fetch() calls landed on
+    different worker PIDs, so a second call's fail-fast state was for a
+    worker the first call never touched)."""
+    conn.request("GET", path, headers={"Connection": "keep-alive"})
+    resp = conn.getresponse()
+    body = resp.read().decode("utf-8", "replace")
+    return (resp.status, body, {k.lower(): v for k, v in resp.getheaders()})
+
+
+def test_redis_connect_backoff_fails_fast(ng: Nginx, origin: Origin) -> None:
+    """S231-L2-BACKOFF: after a redis connect FAILURE, this worker must skip
+    the connect() attempt entirely for the rest of the backoff window instead
+    of paying one on every request during an outage.
+
+    /l2backoff/ points at the redis_dead offset (a port that is never bound,
+    same fixture /_cache_scandown uses) with connect_backoff=5000ms (the unit
+    suffix is load-bearing: `ngx_parse_time` reads a bare "5000" as SECONDS,
+    not ms, same trap this repo's `timeout=` directives always spell out
+    explicitly -- measured, cost a debugging round-trip). `cache_turbo_lock
+    off` keeps this fixture to exactly ONE L2 attempt per request (no
+    cold-miss cross-node lock retry), so the counter's per-request delta is
+    exact, not just "moved". Every request there is an L2 miss served from
+    origin either way -- the response body/status is IDENTICAL whether the
+    fail-fast path fired or an ordinary per-request connect() was refused,
+    which is exactly why response equality cannot be the oracle here (a plain
+    L2-down miss reproduces it). The oracle is the X-Cache-Turbo-Test-L2-
+    Backoff counter, bumped ONLY on the fail-fast path, never on the ordinary
+    connect-refused branch.
+
+    All three requests go over ONE kept-alive connection (see
+    _fetch_keepalive's docstring) so they are guaranteed to land on the SAME
+    worker -- backoff state is per-worker (a process-global table), so two
+    requests on different workers would each see their own never-armed table
+    and the test would be a coin flip on the harness's 4-worker default.
+
+    Sequence:
+      1. request 1 ARMS the window (the connect failure itself) -- the
+         counter does NOT move for this one; arming and fail-fast-skipping
+         are different events (armed=0 -> the failure that ordinarily always
+         happens; only a request that finds the window already armed skips).
+      2. request 2, entirely inside the 5s window, must fail fast: counter
+         goes from 0 to 1.
+      3. request 3, still inside the window, must fail fast again: counter
+         goes from 1 to 2 -- proves it is not a one-shot arm.
+
+    All three requests still get a normal 200 from origin (L2 is advisory),
+    so a functional regression here would be invisible without the counter."""
+    if ng.redis_port is None:
+        return
+
+    conn = http.client.HTTPConnection("127.0.0.1", ng.port, timeout=HTTP_TIMEOUT)
+    try:
+        s1, b1, h1 = _fetch_keepalive(conn, "/l2backoff/probe-one")
+        assert s1 == 200, f"request 1 (arms backoff) did not reach origin: {s1} {b1}"
+        n1 = _backoff_skips(h1, "request 1", driver="redis")
+        assert n1 == 0, (
+            f"request 1 is the connect failure that ARMS the window -- it "
+            f"must not itself be counted as a fail-fast skip (counter={n1})")
+
+        s2, b2, h2 = _fetch_keepalive(conn, "/l2backoff/probe-two")
+        assert s2 == 200, f"request 2 (fail-fast) did not reach origin: {s2} {b2}"
+        n2 = _backoff_skips(h2, "request 2", driver="redis")
+        assert n2 > n1, (
+            f"request 2 landed inside the armed backoff window but the redis "
+            f"fail-fast counter did not move ({n1} -> {n2}) -- it re-attempted "
+            f"a connect() to the dead peer instead of failing fast")
+
+        s3, b3, h3 = _fetch_keepalive(conn, "/l2backoff/probe-three")
+        assert s3 == 200, f"request 3 (fail-fast) did not reach origin: {s3} {b3}"
+        n3 = _backoff_skips(h3, "request 3", driver="redis")
+        assert n3 > n2, (
+            f"request 3, still inside the 5s window, did not fail fast again "
+            f"({n2} -> {n3}) -- the backoff looks like a one-shot arm instead "
+            f"of a window")
+    finally:
+        conn.close()
+
+
+def test_redis_connect_backoff_disabled_never_arms(ng: Nginx, origin: Origin) -> None:
+    """S231-L2-BACKOFF negative control: connect_backoff=0 must mean "never
+    back off" -- every request against a dead peer pays its own connect
+    failure, so the fail-fast counter never moves no matter how many requests
+    land back to back on the same worker.
+
+    This is the config-level equivalent of compiling the backoff path out:
+    with connect_backoff=0, ngx_http_cache_turbo_redis_backoff_active() short
+    -circuits to 0 unconditionally (redis.c), so launch() always falls
+    through to the real keepalive-lookup + connect() attempt. Without this
+    control, test_redis_connect_backoff_fails_fast() alone cannot show that
+    connect_backoff=0 truly disables tracking rather than just using an
+    unusably-short window.
+
+    Needs the SAME same-worker pinning as the positive test (see
+    _fetch_keepalive's docstring) -- comparing two DIFFERENT workers'
+    independent counters would be meaningless (worker A's baseline having
+    nothing to do with worker B's), not a same-vs-different-worker question.
+    `cache_turbo_lock off` on /l2backoffoff/ keeps this to one real connect()
+    attempt per request, same as /l2backoff/ above."""
+    if ng.redis_port is None:
+        return
+
+    conn = http.client.HTTPConnection("127.0.0.1", ng.port, timeout=HTTP_TIMEOUT)
+    try:
+        _, _, h1 = _fetch_keepalive(conn, "/l2backoffoff/probe-one")
+        n1 = _backoff_skips(h1, "off/request 1", driver="redis")
+
+        _, _, h2 = _fetch_keepalive(conn, "/l2backoffoff/probe-two")
+        n2 = _backoff_skips(h2, "off/request 2", driver="redis")
+        assert n2 == n1, (
+            f"connect_backoff=0 must disable fail-fast entirely, but the redis "
+            f"counter moved ({n1} -> {n2}) on the second back-to-back request")
+
+        _, _, h3 = _fetch_keepalive(conn, "/l2backoffoff/probe-three")
+        n3 = _backoff_skips(h3, "off/request 3", driver="redis")
+        assert n3 == n1, (
+            f"connect_backoff=0 must disable fail-fast entirely, but the redis "
+            f"counter moved ({n1} -> {n3}) on the third back-to-back request")
+    finally:
+        conn.close()
+
+
+def test_memcached_connect_backoff_fails_fast(ng: Nginx, origin: Origin) -> None:
+    """S231-L2-BACKOFF, memcached driver: same fail-fast contract as the redis
+    test above, proven independently against the memcached backoff table
+    (ngx_http_cache_turbo_mc_backoff in memcached.c) and its own counter
+    (X-Cache-Turbo-Test-L2-Backoff's `memcached=` field) -- the redis test
+    proves nothing about this driver's table, since they are two entirely
+    separate process-global structures with separate arm/clear/fail-fast call
+    sites (memcached.c's mc_connect/mc_write/mc_op_fail/mc_get_finish).
+
+    /mcbackoff/ mirrors /l2backoff/ exactly: dead peer (redis_dead offset,
+    works for any TCP protocol), connect_backoff=5000ms, cache_turbo_lock off
+    (memcached has no lock op at all -- vtable slot is NULL -- so this is
+    belt-and-suspenders, not load-bearing here, but keeps the fixture
+    symmetric with the redis one). Same same-worker kept-alive-connection
+    requirement as the redis test; see _fetch_keepalive's docstring."""
+    if ng.memcached_port is None:
+        return
+
+    conn = http.client.HTTPConnection("127.0.0.1", ng.port, timeout=HTTP_TIMEOUT)
+    try:
+        s1, b1, h1 = _fetch_keepalive(conn, "/mcbackoff/probe-one")
+        assert s1 == 200, f"request 1 (arms backoff) did not reach origin: {s1} {b1}"
+        n1 = _backoff_skips(h1, "mc request 1", driver="memcached")
+        assert n1 == 0, (
+            f"request 1 is the connect failure that ARMS the window -- it "
+            f"must not itself be counted as a fail-fast skip (counter={n1})")
+
+        s2, b2, h2 = _fetch_keepalive(conn, "/mcbackoff/probe-two")
+        assert s2 == 200, f"request 2 (fail-fast) did not reach origin: {s2} {b2}"
+        n2 = _backoff_skips(h2, "mc request 2", driver="memcached")
+        assert n2 > n1, (
+            f"request 2 landed inside the armed backoff window but the "
+            f"memcached fail-fast counter did not move ({n1} -> {n2}) -- it "
+            f"re-attempted a connect() to the dead peer instead of failing "
+            f"fast")
+    finally:
+        conn.close()
+
+
+def test_redis_connect_backoff_config_parse(ng: Nginx) -> None:
+    """S231-L2-BACKOFF: connect_backoff= parses as a time value on both
+    drivers and rejects garbage the same way timeout= already does."""
+    if ng.redis_port is not None:
+        def mutate_ok(c):
+            return c.replace(
+                f"cache_turbo_redis  127.0.0.1:{ng.redis_port} prefix=ct: timeout=250ms;",
+                f"cache_turbo_redis  127.0.0.1:{ng.redis_port} prefix=ct: "
+                f"timeout=250ms connect_backoff=500ms;", 1)
+        r_ok = _config_test_result(ng, mutate_ok)
+        assert r_ok.returncode == 0, \
+            f"cache_turbo_redis connect_backoff=500ms rejected:\n{r_ok.stdout}"
+
+        def mutate_bad(c):
+            return c.replace(
+                f"cache_turbo_redis  127.0.0.1:{ng.redis_port} prefix=ct: timeout=250ms;",
+                f"cache_turbo_redis  127.0.0.1:{ng.redis_port} prefix=ct: "
+                f"timeout=250ms connect_backoff=notatime;", 1)
+        r_bad = _config_test_result(ng, mutate_bad)
+        assert r_bad.returncode != 0, \
+            f"cache_turbo_redis connect_backoff=notatime was accepted:\n{r_bad.stdout}"
+        assert "bad connect_backoff" in r_bad.stdout, \
+            f"missing bad-connect_backoff diagnostic:\n{r_bad.stdout}"
+
+    if ng.memcached_port is not None:
+        def mutate_mc_ok(c):
+            return c.replace(
+                f"cache_turbo_memcached  127.0.0.1:{ng.memcached_port} prefix=mc: timeout=250ms;",
+                f"cache_turbo_memcached  127.0.0.1:{ng.memcached_port} prefix=mc: "
+                f"timeout=250ms connect_backoff=500ms;", 1)
+        r_mc_ok = _config_test_result(ng, mutate_mc_ok)
+        assert r_mc_ok.returncode == 0, \
+            f"cache_turbo_memcached connect_backoff=500ms rejected:\n{r_mc_ok.stdout}"
+
+        def mutate_mc_bad(c):
+            return c.replace(
+                f"cache_turbo_memcached  127.0.0.1:{ng.memcached_port} prefix=mc: timeout=250ms;",
+                f"cache_turbo_memcached  127.0.0.1:{ng.memcached_port} prefix=mc: "
+                f"timeout=250ms connect_backoff=notatime;", 1)
+        r_mc_bad = _config_test_result(ng, mutate_mc_bad)
+        assert r_mc_bad.returncode != 0, \
+            f"cache_turbo_memcached connect_backoff=notatime was accepted:\n{r_mc_bad.stdout}"
+        assert "bad connect_backoff" in r_mc_bad.stdout, \
+            f"missing bad-connect_backoff diagnostic:\n{r_mc_bad.stdout}"
 
 
 def test_valid_dup_status_warns(ng: Nginx) -> None:
@@ -16541,6 +16835,10 @@ def run_all(ng: Nginx, origin: Origin,
     test_memcached_keepalive_timeout_invalid_rejected(ng)
     test_redis_timeout_zero_rejected(ng)                     # S231-L2-TIMEOUT0
     test_memcached_timeout_zero_rejected(ng)                 # S231-L2-TIMEOUT0
+    test_redis_connect_backoff_config_parse(ng)               # S231-L2-BACKOFF
+    test_redis_connect_backoff_fails_fast(ng, origin)          # S231-L2-BACKOFF
+    test_redis_connect_backoff_disabled_never_arms(ng, origin) # S231-L2-BACKOFF
+    test_memcached_connect_backoff_fails_fast(ng, origin)       # S231-L2-BACKOFF
     test_valid_dup_status_warns(ng)
     test_tag_without_l2_warns(ng)
     test_tag_without_l2_but_surrogate_key_no_warn(ng)

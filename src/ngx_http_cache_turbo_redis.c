@@ -63,6 +63,19 @@ typedef struct {
     unsigned                     clean:1;  /* reply fully consumed at boundary:
                                             * connection is reusable (v15)     */
 
+    /* S231: 1 from a fresh (non-reused, non-TLS-handshake) connect() attempt
+     * until the FIRST byte is actually written on the wire. A write-path
+     * failure (op_fail) that fires while this is still 1 means nothing ever
+     * left the socket -- the async ECONNREFUSED/RST/connect-timeout case,
+     * which on this platform is how a closed-port connect actually surfaces
+     * (ngx_event_connect_peer's own non-blocking connect() returns EINPROGRESS
+     * -> NGX_AGAIN on loopback even for a port nothing listens on; the refusal
+     * is only observable later, on the write event). Cleared to 0 the moment
+     * any data is sent, so a later send()/timeout error (a real transport
+     * failure mid-command, or a protocol error after the reply starts) is
+     * correctly NOT treated as a connect failure and does not arm backoff. */
+    unsigned                     unconnected:1;
+
     /* AUTH/SELECT preamble (v5 DSN). When the backend needs auth or a non-zero
      * db, `preamble` holds the pipelined AUTH (+SELECT) RESP; it is written
      * first and its `preamble_replies` simple replies consumed before `command`
@@ -629,6 +642,151 @@ ngx_http_cache_turbo_redis_encode(ngx_pool_t *pool, ngx_str_t *argv,
 }
 
 
+/* S231: per-worker L2 connect backoff, redis side.
+ *
+ * After a connect FAILURE (ngx_event_connect_peer returning ERROR/BUSY/
+ * DECLINED -- never a protocol/reply error) to a given peer, this worker
+ * fails L2 ops fast for redis_connect_backoff ms instead of paying a fresh
+ * connect() attempt on every request during an outage. A successful connect
+ * (rc == NGX_OK or NGX_AGAIN from ngx_event_connect_peer) clears the window.
+ *
+ * Same shape as the keepalive pool above (process-global; each worker gets
+ * its own copy after fork), keyed the same way: peer sockaddr only -- unlike
+ * the KA bucket this deliberately does NOT include db/credentials/TLS
+ * fingerprint, because a connect failure is about reaching the socket, not
+ * about which profile was being negotiated once connected. A small fixed
+ * table (not a hash) is enough: realistic deployments touch 1-3 distinct L2
+ * peers per worker; overflow just never arms (fail open on the backoff
+ * itself -- the ordinary per-request connect failure path still applies). */
+#define NGX_HTTP_CACHE_TURBO_REDIS_BACKOFF_MAX_PEERS  16
+
+typedef struct {
+    ngx_uint_t       used;
+    socklen_t        socklen;
+    ngx_sockaddr_t   sockaddr;
+    ngx_msec_t       until;    /* ngx_current_msec deadline; 0 = not armed */
+} ngx_http_cache_turbo_redis_backoff_slot_t;
+
+typedef struct {
+    ngx_uint_t  nslots;
+    ngx_http_cache_turbo_redis_backoff_slot_t
+                slots[NGX_HTTP_CACHE_TURBO_REDIS_BACKOFF_MAX_PEERS];
+} ngx_http_cache_turbo_redis_backoff_t;
+
+static ngx_http_cache_turbo_redis_backoff_t  ngx_http_cache_turbo_redis_backoff;
+
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+/* Test-only observable: bumped exactly once per request that hit the
+ * fail-fast backoff path (never on an ordinary connect failure, never on a
+ * cache hit/miss that never touched L2). See test_armings-style headers in
+ * ngx_http_cache_turbo_module.c for the surfacing convention this mirrors. */
+ngx_atomic_uint_t  ngx_http_cache_turbo_redis_test_backoff_skips = 0;
+#endif
+
+
+static ngx_http_cache_turbo_redis_backoff_slot_t *
+ngx_http_cache_turbo_redis_backoff_find(ngx_addr_t *addr, ngx_uint_t create)
+{
+    ngx_uint_t                                  i;
+    ngx_http_cache_turbo_redis_backoff_slot_t  *s, *free_slot = NULL;
+
+    for (i = 0; i < ngx_http_cache_turbo_redis_backoff.nslots; i++) {
+        s = &ngx_http_cache_turbo_redis_backoff.slots[i];
+        if (s->used
+            && s->socklen == addr->socklen
+            && ngx_memcmp(&s->sockaddr, addr->sockaddr, addr->socklen) == 0)
+        {
+            return s;
+        }
+    }
+
+    if (!create) {
+        return NULL;
+    }
+
+    if (ngx_http_cache_turbo_redis_backoff.nslots
+        < NGX_HTTP_CACHE_TURBO_REDIS_BACKOFF_MAX_PEERS)
+    {
+        free_slot = &ngx_http_cache_turbo_redis_backoff.slots[
+            ngx_http_cache_turbo_redis_backoff.nslots++];
+    }
+
+    if (free_slot == NULL) {
+        /* Table full (pathological config): degrade gracefully, same as the
+         * KA bucket cap -- no backoff tracking for the overflow peer rather
+         * than corrupting another peer's slot. */
+        return NULL;
+    }
+
+    ngx_memzero(free_slot, sizeof(ngx_http_cache_turbo_redis_backoff_slot_t));
+    free_slot->used = 1;
+    free_slot->socklen = addr->socklen;
+    ngx_memcpy(&free_slot->sockaddr, addr->sockaddr, addr->socklen);
+
+    return free_slot;
+}
+
+
+/* Is addr currently inside its backoff window? backoff_ms == 0 means the
+ * feature is disabled for this location -- never back off, regardless of
+ * this worker's failure history against addr. */
+static ngx_uint_t
+ngx_http_cache_turbo_redis_backoff_active(ngx_addr_t *addr,
+    ngx_msec_t backoff_ms)
+{
+    ngx_http_cache_turbo_redis_backoff_slot_t  *s;
+
+    if (backoff_ms == 0) {
+        return 0;
+    }
+
+    s = ngx_http_cache_turbo_redis_backoff_find(addr, 0);
+    if (s == NULL || s->until == 0) {
+        return 0;
+    }
+
+    if ((ngx_msec_int_t) (s->until - ngx_current_msec) > 0) {
+        return 1;
+    }
+
+    /* Window elapsed: clear it so the next check is O(1) again and a later
+     * success doesn't have to fight a stale deadline. */
+    s->until = 0;
+    return 0;
+}
+
+
+static void
+ngx_http_cache_turbo_redis_backoff_arm(ngx_addr_t *addr, ngx_msec_t backoff_ms)
+{
+    ngx_http_cache_turbo_redis_backoff_slot_t  *s;
+
+    if (backoff_ms == 0) {
+        return;
+    }
+
+    s = ngx_http_cache_turbo_redis_backoff_find(addr, 1);
+    if (s == NULL) {
+        return;
+    }
+
+    s->until = ngx_current_msec + backoff_ms;
+}
+
+
+static void
+ngx_http_cache_turbo_redis_backoff_clear(ngx_addr_t *addr)
+{
+    ngx_http_cache_turbo_redis_backoff_slot_t  *s;
+
+    s = ngx_http_cache_turbo_redis_backoff_find(addr, 0);
+    if (s != NULL) {
+        s->until = 0;
+    }
+}
+
+
 /* Open a connection for op and arm the shared write handler. Returns NGX_OK on
  * success (op now owns the connection), NGX_ERROR if it could not start (caller
  * still owns op->pool and must destroy it). */
@@ -652,11 +810,23 @@ ngx_http_cache_turbo_redis_connect(ngx_http_cache_turbo_redis_op_t *op,
             ngx_close_connection(op->peer.connection);
             op->peer.connection = NULL;
         }
+        if (op->clcf != NULL) {
+            ngx_http_cache_turbo_redis_backoff_arm(addr,
+                op->clcf->redis_connect_backoff);
+        }
         return NGX_ERROR;
     }
 
+    /* rc == NGX_OK/NGX_AGAIN here only means the non-blocking connect()
+     * STARTED without an immediate synchronous error -- on loopback even a
+     * refused port typically returns EINPROGRESS, with ECONNREFUSED only
+     * surfacing later on the write event. So this is NOT "connected" for
+     * backoff purposes: op->unconnected stays armed (set below) and the
+     * write handler is what actually confirms or arms backoff. */
+
     c = op->peer.connection;
     c->data = op;
+    op->unconnected = 1;
 
     ngx_log_debug2(NGX_LOG_DEBUG_HTTP, c->log, 0,
                    "cache_turbo: redis connect fd:%d -> %V",
@@ -810,6 +980,25 @@ ngx_http_cache_turbo_redis_launch(ngx_http_cache_turbo_redis_op_t *op,
     op->clcf = clcf;
     op->command = op->send;
     op->read_handler = read_handler;
+
+    /* S231: fail fast during an armed backoff window instead of paying a
+     * fresh connect() attempt on every request while this peer is known-down.
+     * Checked BEFORE the keepalive lookup so the two never race: a pooled
+     * idle connection that is still genuinely alive gets drained by ordinary
+     * traffic and eventually reaped by its own keepalive_timeout even while
+     * backoff is armed (nothing here closes it), but a fresh op does not go
+     * looking for one -- keeping one single choke point for the fail-fast
+     * check, and matching "connect failure only" scope: backoff never claims
+     * a live pooled connection is down. */
+    if (ngx_http_cache_turbo_redis_backoff_active(&clcf->redis_addr,
+            clcf->redis_connect_backoff))
+    {
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+        ngx_atomic_fetch_add(&ngx_http_cache_turbo_redis_test_backoff_skips, 1);
+#endif
+        return NGX_ERROR;
+    }
 
     /* Keepalive (v15): reuse a pooled idle connection if one is live. A pooled
      * connection is already AUTH'd + SELECT'd (and, for TLS (v15-2), already
@@ -1751,6 +1940,16 @@ ngx_http_cache_turbo_redis_write(ngx_event_t *wev)
             ngx_http_cache_turbo_redis_op_fail(op);
             return;
         }
+        /* S231: deliberately NOT clearing op->unconnected here. A refused
+         * loopback connect can still accept a send() into the kernel's
+         * socket buffer before the RST is processed -- measured: a dead
+         * redis_dead peer logs "cache_turbo: redis connect" immediately
+         * followed by "recv() failed (111: Connection refused)" with no
+         * intervening write failure, so a write succeeding is NOT proof the
+         * peer ever accepted the connection. Only a genuine reply byte
+         * (first successful recv(), in _fill()/read_preamble()/the SET+lock
+         * scratch reader) proves that. See op_fail() for where unconnected
+         * actually gets resolved either way. */
         b->pos += n;
     }
 
@@ -1820,6 +2019,17 @@ ngx_http_cache_turbo_redis_read_preamble(ngx_event_t *rev)
         if (n == NGX_ERROR || n == 0) {
             ngx_http_cache_turbo_redis_op_fail(op);
             return;
+        }
+
+        /* S231: a genuine reply byte proves the peer really accepted this
+         * connection -- see op_fail()'s comment for why a write succeeding
+         * is NOT proof (a refused loopback connect can still swallow a
+         * send() before the RST surfaces). */
+        if (op->unconnected) {
+            op->unconnected = 0;
+            if (op->clcf != NULL) {
+                ngx_http_cache_turbo_redis_backoff_clear(&op->clcf->redis_addr);
+            }
         }
 
         op->recv_len += (size_t) n;
@@ -2036,6 +2246,15 @@ ngx_http_cache_turbo_redis_fill(ngx_http_cache_turbo_redis_op_t *op,
     }
     if (n == NGX_ERROR || n == 0) {
         return NGX_ERROR;
+    }
+
+    /* S231: see op_fail()'s comment -- a genuine reply byte is the actual
+     * proof this connection reached a live peer. */
+    if (op->unconnected) {
+        op->unconnected = 0;
+        if (op->clcf != NULL) {
+            ngx_http_cache_turbo_redis_backoff_clear(&op->clcf->redis_addr);
+        }
     }
 
     op->rlen += (size_t) n;
@@ -2864,6 +3083,19 @@ ngx_http_cache_turbo_redis_get_finish(ngx_http_cache_turbo_redis_op_t *op,
     ngx_http_cache_turbo_ctx_t       *ctx = op->ctx;
     u_char                           *copy;
 
+    /* S231: read failures on a GET (timeout / fill error / malformed reply) are
+     * reported straight here rather than through op_fail(), so the same
+     * "still unconnected" classification has to be repeated at this other
+     * terminal point. op->unconnected only survives to here when NO reply
+     * byte was ever read on this connection (see the field comment + the
+     * clear sites in _fill()/read_preamble()), so a malformed/error REPLY
+     * (which requires bytes to have arrived) can never hit this branch --
+     * only a genuine connect-phase failure can. */
+    if (result == NGX_ERROR && op->unconnected && op->clcf != NULL) {
+        ngx_http_cache_turbo_redis_backoff_arm(&op->clcf->redis_addr,
+            op->clcf->redis_connect_backoff);
+    }
+
     if (result == NGX_OK && blob_len > 0) {
         copy = ngx_pnalloc(r->pool, blob_len);
         if (copy == NULL) {
@@ -2955,6 +3187,15 @@ ngx_http_cache_turbo_redis_read_lock(ngx_event_t *rev)
             return;
         }
 
+        /* S231: see op_fail()'s comment -- a genuine reply byte is proof of
+         * a live peer. */
+        if (op->unconnected) {
+            op->unconnected = 0;
+            if (op->clcf != NULL) {
+                ngx_http_cache_turbo_redis_backoff_clear(&op->clcf->redis_addr);
+            }
+        }
+
         op->recv_len += (size_t) n;
 
         rc = ngx_http_cache_turbo_redis_frame(op->recv,
@@ -2993,6 +3234,13 @@ ngx_http_cache_turbo_redis_lock_finish(ngx_http_cache_turbo_redis_op_t *op,
     ngx_http_request_t          *r = op->request;
     ngx_http_cache_turbo_ctx_t  *ctx = op->ctx;
 
+    /* S231: same "still unconnected" arm as get_finish() -- the lock reader
+     * calls this directly instead of through op_fail(). */
+    if (result == NGX_ERROR && op->unconnected && op->clcf != NULL) {
+        ngx_http_cache_turbo_redis_backoff_arm(&op->clcf->redis_addr,
+            op->clcf->redis_connect_backoff);
+    }
+
     ctx->lock_result = result;
     ctx->lock_done = 1;
 
@@ -3006,10 +3254,28 @@ ngx_http_cache_turbo_redis_lock_finish(ngx_http_cache_turbo_redis_op_t *op,
 
 /* Terminal failure on the shared write path: dispatch by op kind. members_cb is
  * set for both SMEMBERS and SCAN (both finish through smembers_finish); is_lock
- * distinguishes a lock from a GET (both pin op->request + op->ctx). */
+ * distinguishes a lock from a GET (both pin op->request + op->ctx).
+ *
+ * S231: single choke point for the connect-failure classification. Every
+ * write/read/protocol failure on this op funnels through here (write timeout,
+ * send() error, read timeout, recv() error, a malformed/error reply), and
+ * op->unconnected is true iff no reply byte has EVER been read on this
+ * connection since a fresh (non-reused) connect() -- see the field comment.
+ * That is exactly "this op never got a real answer from the peer", which for
+ * a freshly opened connection means the peer was never actually reachable:
+ * arm the backoff window. A reused (keepalive) connection is never
+ * "unconnected" (op_create zeroes it, only _connect's fresh-connect branch
+ * sets it), so its failures never arm backoff, matching "connect failure
+ * only, not protocol/reply errors" precisely -- a reused connection failing
+ * mid-protocol is definitionally not a connect failure. */
 static void
 ngx_http_cache_turbo_redis_op_fail(ngx_http_cache_turbo_redis_op_t *op)
 {
+    if (op->unconnected && op->clcf != NULL) {
+        ngx_http_cache_turbo_redis_backoff_arm(&op->clcf->redis_addr,
+            op->clcf->redis_connect_backoff);
+    }
+
     if (op->members_cb) {
         ngx_http_cache_turbo_redis_smembers_finish(op, NULL, 0);
     } else if (op->is_lock) {
