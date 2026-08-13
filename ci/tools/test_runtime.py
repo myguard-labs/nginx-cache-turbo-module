@@ -6398,76 +6398,96 @@ def test_cookie_prefilter_counter_oracle(ng: Nginx, origin: Origin) -> None:
     scan-count assertion go red while every functional test (cache hit,
     negative control above) stays green, since the filter is provably
     lossless. That is the mutation this test exists to catch; it was verified
-    by hand -- see the PR description for the exact diff and counts."""
-    # Baseline: a normal small-cookie request on the same preset union as the
-    # oversized one below, to establish "the prefilter runs on every request"
-    # without asserting an exact call count (the preset roster can grow).
-    _, _, hbase1 = fetch(ng.port, "/auto/normal",
-                          headers={"Cookie": "unrelated=1"})
-    n_before = _cookie_scans(hbase1, "baseline request")
+    by hand -- see the PR description for the exact diff and counts.
 
-    # A large Cookie header matching NOTHING: every byte is drawn from a set
-    # that appears in no preset's cookie needles (digits + a few separators),
-    # so the prefilter should skip essentially all 75 needles' ngx_strnstr()
-    # calls on this request, and the number of calls counted for THIS request
-    # must be far smaller than the needle count -- not the wall-clock time.
-    big_cookie = "n" + "0123456789" * 800  # ~8KB, no needle first byte here
-    # every preset needle in the table starts with an uppercase/lowercase
-    # letter or '.'; the digit-only body plus a leading 'n' (shared with none
-    # of them at position 0 of a *name*, since needles are matched as
-    # substrings anywhere in the cookie -- so avoid 'n' collisions with none
-    # of the needles either) keeps this cookie byte-disjoint from every
-    # needle's first byte except by construction below.
-    headers = {"Cookie": f"harmless={big_cookie}"}
-    status, body1, h1 = fetch(ng.port, "/auto/miss1", headers=headers)
-    assert status == 200
-    n_after_first = _cookie_scans(h1, "large non-matching cookie, request 1")
+    X-Cache-Turbo-Test-Cookie-Scans is a process-global (per-worker)
+    monotonic counter, so it can never decrease within one worker but tells
+    you nothing when two probes land on DIFFERENT workers -- each worker has
+    its own independent counter, and comparing across them can even go
+    negative. All four probes below therefore share ONE kept-alive
+    HTTPConnection (see _fetch_keepalive's docstring) so nginx pins them all
+    to the same accepted-connection worker; a plain fetch() opens a fresh
+    socket per call and round-robins across the harness's 4-worker default,
+    which is exactly what produced a spurious negative delta here."""
+    conn = http.client.HTTPConnection("127.0.0.1", ng.port, timeout=HTTP_TIMEOUT)
+    try:
+        # Baseline: a normal small-cookie request on the same preset union as
+        # the oversized one below, to establish "the prefilter runs on every
+        # request" without asserting an exact call count (the preset roster
+        # can grow).
+        _, _, hbase1 = _fetch_keepalive(conn, "/auto/normal",
+                                         headers={"Cookie": "unrelated=1"})
+        n_before = _cookie_scans(hbase1, "baseline request")
 
-    status, body2, h2 = fetch(ng.port, "/auto/miss1", headers=headers)
-    assert status == 200
-    n_after_second = _cookie_scans(h2, "large non-matching cookie, request 2")
+        # A large Cookie header matching NOTHING: every byte is drawn from a
+        # set that appears in no preset's cookie needles (digits + a few
+        # separators), so the prefilter should skip essentially all 75
+        # needles' ngx_strnstr() calls on this request, and the number of
+        # calls counted for THIS request must be far smaller than the needle
+        # count -- not the wall-clock time.
+        big_cookie = "n" + "0123456789" * 800  # ~8KB, no needle first byte here
+        # every preset needle in the table starts with an uppercase/lowercase
+        # letter or '.'; the digit-only body plus a leading 'n' (shared with
+        # none of them at position 0 of a *name*, since needles are matched
+        # as substrings anywhere in the cookie -- so avoid 'n' collisions
+        # with none of the needles either) keeps this cookie byte-disjoint
+        # from every needle's first byte except by construction below.
+        headers = {"Cookie": f"harmless={big_cookie}"}
+        status, body1, h1 = _fetch_keepalive(conn, "/auto/miss1", headers=headers)
+        assert status == 200
+        n_after_first = _cookie_scans(h1, "large non-matching cookie, request 1")
 
-    # Classification must be UNCHANGED: this is the correctness half of the
-    # proof -- a non-matching cookie was always cacheable, and it still is.
-    assert "x-cache" not in h1, (
-        "first request should be a miss (no x-cache yet)")
-    assert h2.get("x-cache") == "HIT", (
-        f"a large Cookie header matching no needle must still let the page "
-        f"cache -- got x-cache={h2.get('x-cache')} (byte-identical "
-        f"classification is the whole point of the prefilter proof)")
-    assert body1 == body2, "cached body must be byte-identical"
+        status, body2, h2 = _fetch_keepalive(conn, "/auto/miss1", headers=headers)
+        assert status == 200
+        n_after_second = _cookie_scans(h2, "large non-matching cookie, request 2")
 
-    # Counter oracle: each of the two /auto/miss1 requests independently runs
-    # cookie_has() over wordpress+woocommerce+joomla's needle union (7
-    # needles). Every one of those needles' first byte (w, c, j) is checked
-    # against the 256-byte set built from "harmless=" + digits + the leading
-    # 'n' -- none of which contains w/c/j -- so EVERY ngx_strnstr() call on
-    # this request must be skipped: the delta this request contributes is 0.
-    delta_first = n_after_first - n_before
-    delta_second = n_after_second - n_after_first
-    assert delta_first == 0, (
-        f"large non-matching cookie should trigger ZERO ngx_strnstr() calls "
-        f"(every needle's first byte is absent from the header), got a "
-        f"delta of {delta_first} -- the first-byte prefilter is not cutting "
-        f"scans")
-    assert delta_second == 0, (
-        f"second request (same cookie) should also trigger ZERO "
-        f"ngx_strnstr() calls, got a delta of {delta_second}")
+        # Classification must be UNCHANGED: this is the correctness half of
+        # the proof -- a non-matching cookie was always cacheable, and it
+        # still is.
+        assert "x-cache" not in h1, (
+            "first request should be a miss (no x-cache yet)")
+        assert h2.get("x-cache") == "HIT", (
+            f"a large Cookie header matching no needle must still let the "
+            f"page cache -- got x-cache={h2.get('x-cache')} (byte-identical "
+            f"classification is the whole point of the prefilter proof)")
+        assert body1 == body2, "cached body must be byte-identical"
 
-    # Contrast: a request whose cookie DOES contain a needle's first byte (but
-    # not the needle itself) must NOT be skipped by the byte test alone --
-    # only ngx_strnstr() itself decides a real match, and the byte set only
-    # gates whether that call happens. This proves the filter is not simply
-    # returning "no scans, ever": a 'w'-containing miss still counts calls.
-    _, _, h3 = fetch(ng.port, "/auto/normal",
-                      headers={"Cookie": "walnut=1"})
-    n_after_w = _cookie_scans(h3, "byte-colliding but non-matching cookie")
-    delta_w = n_after_w - n_after_second
-    assert delta_w > 0, (
-        f"a cookie containing 'w' (wordpress_logged_in_'s first byte) must "
-        f"still trigger the wordpress needle's ngx_strnstr() call even "
-        f"though it does not match -- got a delta of {delta_w}, meaning the "
-        f"prefilter is skipping scans it has no right to skip")
+        # Counter oracle: each of the two /auto/miss1 requests independently
+        # runs cookie_has() over wordpress+woocommerce+joomla's needle union
+        # (7 needles). Every one of those needles' first byte (w, c, j) is
+        # checked against the 256-byte set built from "harmless=" + digits +
+        # the leading 'n' -- none of which contains w/c/j -- so EVERY
+        # ngx_strnstr() call on this request must be skipped: the delta this
+        # request contributes is 0.
+        delta_first = n_after_first - n_before
+        delta_second = n_after_second - n_after_first
+        assert delta_first == 0, (
+            f"large non-matching cookie should trigger ZERO ngx_strnstr() "
+            f"calls (every needle's first byte is absent from the header), "
+            f"got a delta of {delta_first} -- the first-byte prefilter is "
+            f"not cutting scans")
+        assert delta_second == 0, (
+            f"second request (same cookie) should also trigger ZERO "
+            f"ngx_strnstr() calls, got a delta of {delta_second}")
+
+        # Contrast: a request whose cookie DOES contain a needle's first byte
+        # (but not the needle itself) must NOT be skipped by the byte test
+        # alone -- only ngx_strnstr() itself decides a real match, and the
+        # byte set only gates whether that call happens. This proves the
+        # filter is not simply returning "no scans, ever": a 'w'-containing
+        # miss still counts calls.
+        _, _, h3 = _fetch_keepalive(conn, "/auto/normal",
+                                     headers={"Cookie": "walnut=1"})
+        n_after_w = _cookie_scans(h3, "byte-colliding but non-matching cookie")
+        delta_w = n_after_w - n_after_second
+        assert delta_w > 0, (
+            f"a cookie containing 'w' (wordpress_logged_in_'s first byte) "
+            f"must still trigger the wordpress needle's ngx_strnstr() call "
+            f"even though it does not match -- got a delta of {delta_w}, "
+            f"meaning the prefilter is skipping scans it has no right to "
+            f"skip")
+    finally:
+        conn.close()
     drain_origin(origin)
 
 
@@ -8600,7 +8620,8 @@ def test_memcached_timeout_zero_rejected(ng: Nginx) -> None:
         f"missing timeout-must-be-positive diagnostic:\n{r.stdout}"
 
 
-def _fetch_keepalive(conn: http.client.HTTPConnection, path: str):
+def _fetch_keepalive(conn: http.client.HTTPConnection, path: str,
+                      headers: dict | None = None):
     """GET on an ALREADY-OPEN HTTPConnection, without closing it. nginx pins
     every request on one accepted TCP connection to whichever worker accepted
     it, so this is what makes a same-worker request sequence possible against
@@ -8608,8 +8629,14 @@ def _fetch_keepalive(conn: http.client.HTTPConnection, path: str):
     opens a fresh socket per call, which round-robins across workers and
     cannot pin anything -- measured: two ordinary fetch() calls landed on
     different worker PIDs, so a second call's fail-fast state was for a
-    worker the first call never touched)."""
-    conn.request("GET", path, headers={"Connection": "keep-alive"})
+    worker the first call never touched).
+
+    `headers`, if given, are merged with the mandatory keep-alive header
+    (caller's values win on collision)."""
+    req_headers = {"Connection": "keep-alive"}
+    if headers:
+        req_headers.update(headers)
+    conn.request("GET", path, headers=req_headers)
     resp = conn.getresponse()
     body = resp.read().decode("utf-8", "replace")
     return (resp.status, body, {k.lower(): v for k, v in resp.getheaders()})
