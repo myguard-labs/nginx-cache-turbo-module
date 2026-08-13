@@ -151,7 +151,9 @@ static char *ngx_http_cache_turbo_key_cookie_conf(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 /* auto-Vary (v11 other half) — defined near the v3-4 vary helpers but called
  * from the access/header/body paths above them, so forward-declared here. */
-static void ngx_http_cache_turbo_vary_resolve(ngx_http_request_t *r,
+static ngx_inline void ngx_http_cache_turbo_vary_prepare(
+    ngx_http_cache_turbo_ctx_t *ctx);
+static void ngx_http_cache_turbo_vary_apply(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_zone_t *z,
     ngx_http_cache_turbo_ctx_t *ctx, uint32_t *hash);
 static void ngx_http_cache_turbo_variant_hash(ngx_http_request_t *r,
@@ -4995,13 +4997,14 @@ ngx_http_cache_turbo_access_prologue(ngx_http_request_t *r,
         }
     }
 
-    /* auto-Vary (v11 other half): probe the L1 vary marker for this base key and,
-     * if a previous store told us this URL varies, recompute key_hash to the
-     * variant (folding the named request headers) BEFORE the lookup below, so the
-     * whole single-flight/serve flow runs unchanged on the variant key. No marker
-     * (or auto_vary off) => key_hash stays the base key. */
+    /* auto-Vary (v11 other half), lock-free half only (S231-PERF-VARYLOCK):
+     * precompute the marker key bytes for this base key. The lock-holding
+     * marker LOOKUP + key_hash recompute now happens in access_handler,
+     * folded into the same critical section as the main L1 lookup, so it no
+     * longer pays a separate zone-mutex acquisition here. No marker (or
+     * auto_vary off) => key_hash stays the base key, same as before. */
     if (clcf->auto_vary) {
-        ngx_http_cache_turbo_vary_resolve(r, clcf, z, ctx, &hash);
+        ngx_http_cache_turbo_vary_prepare(ctx);
     }
 
     /* Bypass (v9): when a cache_turbo_bypass predicate trips, skip the cache
@@ -5270,14 +5273,24 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
     clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
 
     /* Prologue: enablement, method/subrequest/auth vetoes, ctx + key, auto-
-     * classify, request no-cache, auto-Vary, bypass, autotune. NGX_OK => proceed
-     * with ctx/z/hash set; otherwise that is our return value. */
+     * classify, request no-cache, auto-Vary key prep, bypass, autotune. NGX_OK
+     * => proceed with ctx/z/hash set; otherwise that is our return value. */
     prc = ngx_http_cache_turbo_access_prologue(r, clcf, &ctx, &z, &hash);
     if (prc != NGX_OK) {
         return prc;
     }
 
     ngx_shmtx_lock(&z->shpool->mutex);
+
+    /* S231-PERF-VARYLOCK: the marker lookup + key_hash recompute is folded
+     * into THIS critical section (was a standalone lock/unlock pair in the
+     * prologue) so a request pays one zone-mutex acquisition for both the
+     * vary-marker probe and the main lookup below, not two. Must run before
+     * the main lookup: it may rewrite ctx->key_hash/hash to the variant key
+     * that lookup below needs to use. */
+    if (clcf->auto_vary) {
+        ngx_http_cache_turbo_vary_apply(r, clcf, z, ctx, &hash);
+    }
 
     ctn = clcf->l1->lookup(z, ctx->key_hash, hash);
 
@@ -12548,26 +12561,62 @@ ngx_http_cache_turbo_marker_store(ngx_http_cache_turbo_loc_conf_t *clcf,
 }
 
 
-/* Probe the L1 vary marker for the request's base key. If a fresh marker exists,
- * recompute ctx->key_hash to the variant key (and the caller's crc32) so the
- * whole lookup/single-flight/serve flow below runs on the variant. No marker =>
- * key_hash unchanged (base key) => a miss to origin, never a wrong-variant
- * serve. L1-only: cross-node first-hit re-fetches once per node until its marker
- * warms (the safe, non-invasive trade documented on loc_conf.auto_vary). */
+/* Lock-free half of the vary-marker probe: compute the marker key bytes for
+ * the request's base key into ctx->vary_marker_key. marker_hash() only reads
+ * ctx->cache_key and writes local/output stack memory, so this needs no zone
+ * lock. Split out (S231-PERF-VARYLOCK) so the marker LOOKUP itself can be
+ * folded into the caller's existing critical section instead of paying its
+ * own separate ngx_shmtx_lock/unlock pair. */
+static ngx_inline void
+ngx_http_cache_turbo_vary_prepare(ngx_http_cache_turbo_ctx_t *ctx)
+{
+    ngx_http_cache_turbo_marker_hash(&ctx->cache_key, ctx->vary_marker_key);
+}
+
+
+/* Lock-HELD half of the vary-marker probe. Caller MUST already hold
+ * z->shpool->mutex (S231-PERF-VARYLOCK: this used to take its own lock; it is
+ * now folded into the main L1-lookup critical section in access_handler so a
+ * request pays one shm-mutex acquisition for both lookups instead of two).
+ *
+ * Contract-diff vs. the old ngx_http_cache_turbo_vary_resolve() (which locked,
+ * did exactly this read, and unlocked before returning):
+ *  - Every early-return / no-op case is preserved verbatim: no marker, a NULL
+ *    marker->data, too-short marker, an expired-with-no-grace marker, or a
+ *    marker that fails blob_validate() (magic/version mismatch on a hash
+ *    collision) all leave bits==0/gen==0 exactly as before, so key_hash/hash
+ *    are left untouched by the caller and the request still falls through to
+ *    a base-key miss -> origin. No case was dropped, widened or narrowed.
+ *  - ctx->vary_gen is set unconditionally (bits==0 => gen==0), same as before.
+ *  - On bits>0 it recomputes ctx->key_hash and *hash to the variant key, same as
+ *    before, still called with the lock held (unlike the old code, which
+ *    called variant_hash() AFTER unlocking — variant_hash() only reads
+ *    ctx->cache_key/r and writes ctx->key_hash, none of which are shm-backed,
+ *    so moving it inside the lock is a widening of the critical section, not
+ *    a narrowing; nothing that used to run lock-free now depends on staying
+ *    lock-free).
+ *
+ * Locking-window proof: `m` is a pointer INTO shm (the L1 vtable's lookup()
+ * return), read here (m->data/m->len/m->stale_until, then a memcpy-free byte
+ * read of m->data[...]) and never touched again after this function returns —
+ * no pointer derived from `m` crosses the unlock at the end of the caller's
+ * critical section, no refcount/acquire on `m` or its blob happens here (the
+ * marker blob is never zero-copy-served, unlike a real object's ctn->data;
+ * PERF-7's ngx_http_cache_turbo_blob_acquire() is never called on a marker
+ * node in this function or its old counterpart). The only state that outlives
+ * the lock is by-value: ctx->vary_gen (ngx_uint_t) and the bytes copied into
+ * ctx->key_hash and *hash — plain stack/ctx memory, not shm. */
 static void
-ngx_http_cache_turbo_vary_resolve(ngx_http_request_t *r,
+ngx_http_cache_turbo_vary_apply(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_zone_t *z,
     ngx_http_cache_turbo_ctx_t *ctx, uint32_t *hash)
 {
-    u_char                        mk[32];
     ngx_int_t                     bits = 0;
     ngx_uint_t                    gen = 0;
     ngx_http_cache_turbo_node_t  *m;
 
-    ngx_http_cache_turbo_marker_hash(&ctx->cache_key, mk);
-
-    ngx_shmtx_lock(&z->shpool->mutex);
-    m = clcf->l1->lookup(z, mk, ngx_crc32_short(mk, 32));
+    m = clcf->l1->lookup(z, ctx->vary_marker_key,
+                          ngx_crc32_short(ctx->vary_marker_key, 32));
     /* Accept a stale-but-serveable marker, not only a fresh one (codex
      * follow-up): the object variants it points at are themselves served stale
      * within their stale window, so gating the marker on fresh_until alone made
@@ -12596,7 +12645,6 @@ ngx_http_cache_turbo_vary_resolve(ngx_http_request_t *r,
             }
         }
     }
-    ngx_shmtx_unlock(&z->shpool->mutex);
 
     /* Carry the generation to the store path so the variant key + the refreshed
      * marker agree on it (store reuses ctx->vary_gen). */

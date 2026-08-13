@@ -16381,6 +16381,61 @@ def test_auto_vary_encoding(ng: Nginx, origin: Origin) -> None:
     assert origin.hits - base == 2, origin.hits - base
 
 
+def test_auto_vary_marker_probe_selects_correct_variant(ng: Nginx,
+                                                          origin: Origin) -> None:
+    """S231-PERF-VARYLOCK pin: the vary-marker probe now runs inside the SAME
+    zone-mutex critical section as the main L1 lookup (previously its own
+    separate lock/unlock pair). Re-assert the marker probe's actual job —
+    correct HIT/MISS + variant selection across THREE distinct Accept-Encoding
+    classes on one URL, interleaved so a wrong fold (e.g. always resolving to
+    whichever variant happened to be looked up last, or the base key never
+    updating) would show up as a MISS where a HIT is expected or as one
+    variant's body leaking into another's slot. X-CT-Status is the canary
+    (not just body equality — see test_auto_vary_language_primary_subtag_shares
+    for why body-only assertions are not a real oracle here)."""
+    base = origin.hits_for("/vlock?v=ae")
+    p = "/av/vlock?v=ae"
+    gz = {"Accept-Encoding": "gzip"}
+    br = {"Accept-Encoding": "br"}
+    zs = {"Accept-Encoding": "zstd"}
+
+    # First touch of each variant: no marker yet (or a marker for a DIFFERENT
+    # variant) -> MISS, one origin hit each.
+    _, gz1, hgz1 = fetch(ng.port, p, gz)
+    assert hgz1.get("x-ct-status") == "MISS", \
+        f"gzip cold fetch must MISS, got {hgz1.get('x-ct-status')}"
+    _, br1, _ = fetch(ng.port, p, br)
+    _, zs1, _ = fetch(ng.port, p, zs)
+    assert origin.hits_for("/vlock?v=ae") - base == 3, \
+        origin.hits_for("/vlock?v=ae") - base
+
+    # Re-probe each variant, interleaved (not sequential re-hits of the same
+    # one) so the marker lookup must resolve the RIGHT variant key every time,
+    # not just "the last one resolved". Each must now HIT its own slot and
+    # never cross-serve another variant's body.
+    _, gz2, hgz2 = fetch(ng.port, p, gz)
+    _, zs2, hzs2 = fetch(ng.port, p, zs)
+    _, br2, hbr2 = fetch(ng.port, p, br)
+
+    assert hgz2.get("x-ct-status") == "HIT", f"gzip re-fetch must HIT, got {hgz2}"
+    assert hbr2.get("x-ct-status") == "HIT", f"br re-fetch must HIT, got {hbr2}"
+    assert hzs2.get("x-ct-status") == "HIT", f"zstd re-fetch must HIT, got {hzs2}"
+
+    assert gz1 == gz2, ("gzip slot changed body across HIT", gz1, gz2)
+    assert br1 == br2, ("br slot changed body across HIT", br1, br2)
+    assert zs1 == zs2, ("zstd slot changed body across HIT", zs1, zs2)
+
+    assert gz1 != br1 and gz1 != zs1 and br1 != zs1, \
+        ("two variants shared a slot", gz1, br1, zs1)
+
+    # No new origin hits: every second-round request must have resolved via
+    # its own marker + variant key, not fallen back to the base key.
+    assert origin.hits_for("/vlock?v=ae") - base == 3, (
+        "a marker-probe/main-lookup fold regression sent a HIT-eligible "
+        "variant back to origin",
+        origin.hits_for("/vlock?v=ae") - base)
+
+
 def test_auto_vary_encoding_same_class_shares(ng: Nginx, origin: Origin) -> None:
     """v11 auto-Vary: two Accept-Encoding headers in the same bucket (gzip and
     'gzip, deflate' both classify gzip) share one slot -> one origin hit."""
@@ -17595,6 +17650,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_normalize_vary_encoding_zstd(ng, origin)
     test_invalid_normalize_vary_token(ng)
     test_auto_vary_encoding(ng, origin)
+    test_auto_vary_marker_probe_selects_correct_variant(ng, origin)
     test_auto_vary_encoding_same_class_shares(ng, origin)
     test_auto_vary_device(ng, origin)
     test_auto_vary_language(ng, origin)
