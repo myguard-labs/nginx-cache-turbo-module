@@ -43,6 +43,17 @@ bash "$DIR/extract_variant_hash.sh"
 "$CC" $CFLAGS "$DIR/test_variant_gen.c" -o "$DIR/test_variant_gen" -lssl -lcrypto
 "$DIR/test_variant_gen"
 
+# --- cache-key fold, single-allocation (S231-PERF-KEYFOLD) -----------------
+# Pins the digest of known multi-part / empty-value / oversize keys against
+# the byte-framing contract (0x1f tag + 4B name-len + 4B val-len + name +
+# value), against the REAL fold_size/fold_append/fold_all sliced out of
+# src/ by extract_key_fold.sh. Byte-identity here is what proves the
+# single-allocation fold did not change the stored cache key.
+bash "$DIR/extract_key_fold.sh"
+# shellcheck disable=SC2086
+"$CC" $CFLAGS "$DIR/test_key_fold.c" -o "$DIR/test_key_fold" -lssl -lcrypto
+"$DIR/test_key_fold"
+
 # --- EVP digest failure path (AUD-DIGEST-ZERO) ----------------------------
 # Unit test for the fail-closed digest handling. Tests that EVP failures are
 # propagated to callers instead of silently producing all-zero keys.
