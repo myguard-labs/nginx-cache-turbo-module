@@ -24,6 +24,8 @@ ci/tests/unit/generated_variant.inc
 ci/tests/unit/test_shm_state
 ci/tests/unit/test_shm_state.san
 ci/tests/unit/test_digest_fail
+ci/tests/unit/test_key_fold
+ci/tests/unit/generated_key_fold.inc
 
 # Fuzzing build artifacts (seed corpus IS tracked; everything else is not)
 ci/fuzz/fuzz_resp_parser

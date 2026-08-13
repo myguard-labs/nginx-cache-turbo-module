@@ -991,15 +991,53 @@ ngx_http_cache_turbo_blob_next_header(const u_char **pp, const u_char *end,
 
 
 /*
- * Append ONE key cookie to the key under construction, with the unforgeable
- * length-prefixed framing both the preset and the DIY path use: 0x1f tag, then
- * the name length and the value length as fixed 4-byte fields, then the name
- * and value bytes. See the call sites for why a length prefix and not a
- * delimiter (a delimiter would be forgeable from a request header).
+ * One matched key cookie, queued for folding. Only the name/value POINTERS are
+ * kept (name is either a preset's static C string or a config ngx_str_t, value
+ * points into r->headers_in.cookie); nothing is copied here.
+ */
+typedef struct {
+    ngx_str_t   name;
+    ngx_str_t   val;
+} ngx_http_cache_turbo_key_cookie_slot_t;
+
+
+/*
+ * Queue ONE matched key cookie for folding — no allocation, no copy, just an
+ * array_push. Splitting "collect" from "append" (below) lets the caller size
+ * ONE buffer for every fold up front instead of reallocating and re-copying
+ * the whole growing key once per cookie (which was O(n^2) in the number of
+ * folded cookies): every real deployment folds a handful, but a config or
+ * preset list is not bounded, so the old per-cookie realloc was the thing that
+ * scaled badly, not a byte count.
+ */
+static ngx_int_t
+ngx_http_cache_turbo_key_cookie_queue(ngx_array_t *slots, ngx_str_t *name,
+    ngx_str_t *val)
+{
+    ngx_http_cache_turbo_key_cookie_slot_t  *slot;
+
+    slot = ngx_array_push(slots);
+    if (slot == NULL) {
+        return NGX_ERROR;
+    }
+
+    slot->name = *name;
+    slot->val = *val;
+    return NGX_OK;
+}
+
+
+/*
+ * Append ONE queued key cookie into the key buffer under construction, with
+ * the unforgeable length-prefixed framing both the preset and the DIY path
+ * use: 0x1f tag, then the name length and the value length as fixed 4-byte
+ * fields, then the name and value bytes. See the call sites for why a length
+ * prefix and not a delimiter (a delimiter would be forgeable from a request
+ * header). Returns the buffer position after the appended entry.
  *
- * Folding is append-only, so calling this once per present cookie yields a key
- * that depends on every one of them. Order is the caller's iteration order,
- * which is fixed by the preset table / the config, so the key is deterministic.
+ * Folding is append-only, so one call per queued cookie yields a key that
+ * depends on every one of them. Order is the caller's iteration order, which
+ * is fixed by the preset table / the config, so the key is deterministic.
  *
  * A value longer than _KEY_COOKIE_MAX is NOT folded verbatim. All such values
  * collapse to ONE bucket, marked by the reserved _OVERSIZE length field and no
@@ -1027,12 +1065,11 @@ ngx_http_cache_turbo_blob_next_header(const u_char **pp, const u_char *end,
  * would be protecting against. The framing above already makes arbitrary bytes
  * unambiguous.
  */
-static ngx_int_t
-ngx_http_cache_turbo_key_fold_cookie(ngx_http_request_t *r,
-    ngx_http_cache_turbo_ctx_t *ctx, ngx_str_t *name, ngx_str_t *val)
+static size_t
+ngx_http_cache_turbo_key_fold_size(ngx_http_request_t *r, ngx_str_t *name,
+    ngx_str_t *val, size_t *vlen_out, uint32_t *vfield_out)
 {
-    u_char    *k, *p;
-    size_t     klen, vlen;
+    size_t     vlen;
     uint32_t   vfield;
 
     if (val->len > NGX_HTTP_CACHE_TURBO_KEY_COOKIE_MAX) {
@@ -1050,14 +1087,17 @@ ngx_http_cache_turbo_key_fold_cookie(ngx_http_request_t *r,
         vfield = (uint32_t) val->len;
     }
 
-    klen = ctx->cache_key.len + 1 + 4 + 4 + name->len + vlen;
+    *vlen_out = vlen;
+    *vfield_out = vfield;
 
-    k = ngx_pnalloc(r->pool, klen);
-    if (k == NULL) {
-        return NGX_ERROR;
-    }
+    return 1 + 4 + 4 + name->len + vlen;
+}
 
-    p = ngx_cpymem(k, ctx->cache_key.data, ctx->cache_key.len);
+
+static u_char *
+ngx_http_cache_turbo_key_fold_append(u_char *p, ngx_str_t *name,
+    size_t vlen, uint32_t vfield, ngx_str_t *val)
+{
     *p++ = '\x1f';
     ngx_http_cache_turbo_put_u32(p, (uint32_t) name->len);
     p += 4;
@@ -1065,7 +1105,63 @@ ngx_http_cache_turbo_key_fold_cookie(ngx_http_request_t *r,
     p += 4;
     p = ngx_cpymem(p, name->data, name->len);
     if (vlen) {
-        ngx_memcpy(p, val->data, vlen);
+        p = ngx_cpymem(p, val->data, vlen);
+    }
+
+    return p;
+}
+
+
+/*
+ * Fold every QUEUED key cookie into ctx->cache_key in ONE pass: size every
+ * entry first (this also resolves the oversize/vfield decision once per
+ * cookie, before any byte is written), allocate a single buffer sized for the
+ * base key plus all of them, then append the base key and every entry in
+ * order. Replaces the previous per-cookie realloc-and-copy-the-whole-prefix,
+ * which re-copied the growing key on every fold call (O(n^2) in the number of
+ * folded cookies) — this is the SAME bytes in the SAME order, just written
+ * once instead of n times.
+ */
+static ngx_int_t
+ngx_http_cache_turbo_key_fold_all(ngx_http_request_t *r,
+    ngx_http_cache_turbo_ctx_t *ctx, ngx_array_t *slots)
+{
+    ngx_http_cache_turbo_key_cookie_slot_t  *s = slots->elts;
+    size_t                                   klen = ctx->cache_key.len;
+    size_t                                  *vlen;
+    uint32_t                                *vfield;
+    u_char                                  *k, *p;
+    ngx_uint_t                               i;
+
+    if (slots->nelts == 0) {
+        return NGX_OK;
+    }
+
+    vlen = ngx_palloc(r->pool, slots->nelts * sizeof(size_t));
+    if (vlen == NULL) {
+        return NGX_ERROR;
+    }
+
+    vfield = ngx_palloc(r->pool, slots->nelts * sizeof(uint32_t));
+    if (vfield == NULL) {
+        return NGX_ERROR;
+    }
+
+    for (i = 0; i < slots->nelts; i++) {
+        klen += ngx_http_cache_turbo_key_fold_size(r, &s[i].name, &s[i].val,
+                                                    &vlen[i], &vfield[i]);
+    }
+
+    k = ngx_pnalloc(r->pool, klen);
+    if (k == NULL) {
+        return NGX_ERROR;
+    }
+
+    p = ngx_cpymem(k, ctx->cache_key.data, ctx->cache_key.len);
+
+    for (i = 0; i < slots->nelts; i++) {
+        p = ngx_http_cache_turbo_key_fold_append(p, &s[i].name, vlen[i],
+                                                  vfield[i], &s[i].val);
     }
 
     ctx->cache_key.data = k;
@@ -1126,6 +1222,18 @@ ngx_http_cache_turbo_build_key(ngx_http_request_t *r,
      * confusable with content either. Including the name keeps two presets'
      * key cookies from ever producing the same fold from different cookies.
      */
+    {
+    ngx_array_t  slots;
+
+    /* Small typical case (0-2 folded cookies): a 4-element inline pool
+     * allocation covers it without a second array_push growth. */
+    if (ngx_array_init(&slots, r->pool, 4,
+                        sizeof(ngx_http_cache_turbo_key_cookie_slot_t))
+        != NGX_OK)
+    {
+        return NGX_ERROR;
+    }
+
     if (NGX_HTTP_CACHE_TURBO_HAS_BACKEND(clcf->backend_presets)) {
         ngx_str_t   kcname, kcval;
         ngx_uint_t  cursor = 0;
@@ -1136,7 +1244,7 @@ ngx_http_cache_turbo_build_key(ngx_http_request_t *r,
         while (ngx_http_cache_turbo_key_cookie(r, clcf->backend_presets,
                                                &cursor, &kcname, &kcval))
         {
-            if (ngx_http_cache_turbo_key_fold_cookie(r, ctx, &kcname, &kcval)
+            if (ngx_http_cache_turbo_key_cookie_queue(&slots, &kcname, &kcval)
                 != NGX_OK)
             {
                 return NGX_ERROR;
@@ -1175,12 +1283,20 @@ ngx_http_cache_turbo_build_key(ngx_http_request_t *r,
                 continue;
             }
 
-            if (ngx_http_cache_turbo_key_fold_cookie(r, ctx, &nm[i], &kcval)
+            if (ngx_http_cache_turbo_key_cookie_queue(&slots, &nm[i], &kcval)
                 != NGX_OK)
             {
                 return NGX_ERROR;
             }
         }
+    }
+
+    /* Fold every queued cookie in ONE pass: size all of them, allocate a
+     * single buffer sized for the base key plus every entry, then append —
+     * instead of the previous realloc-and-copy-the-whole-prefix per cookie. */
+    if (ngx_http_cache_turbo_key_fold_all(r, ctx, &slots) != NGX_OK) {
+        return NGX_ERROR;
+    }
     }
 
     /*
