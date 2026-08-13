@@ -1,5 +1,16 @@
 Changes with the nginx-cache-turbo-module
 
+    *) Bugfix: a ?all=1 L2 all-purge's SCAN walk had only a per-page bound
+       (each page's read re-arms the read timeout), never a bound on the
+       whole walk. A backend that always returned a non-zero cursor just
+       under that timeout could park the purge request for up to the fixed
+       page cap's worth of pages -- hours, not seconds. cache_turbo_redis now
+       accepts scan_deadline= (default 30s), a wall-clock ceiling checked at
+       every page boundary alongside the page cap; 0 disables it (page-cap
+       only, prior behaviour). A walk abandoned by the deadline reports the
+       purge INCOMPLETE the same way the page cap does, with
+       "reason":"deadline" distinguishing it from "reason":"page-cap".
+
     *) BEHAVIOUR CHANGE: cache_turbo_auto_vary now defaults to on. While it
        defaulted to off, the module ignored the response's own Vary header,
        which left the Vary: Cookie / Authorization veto as dead code: a

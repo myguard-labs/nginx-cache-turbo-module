@@ -1762,6 +1762,28 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             deny all;
         }}
 
+        # S231-L2-SCANTIME. /_cache_scandeadline sets scan_deadline=1ms -- far
+        # below any real page round-trip over TCP, so a walk spanning 2+ pages
+        # is deterministically past it by the second page boundary (no timing
+        # band: 1ms is chosen to be unmeetable, not "usually enough"). The page
+        # cap stays at its production value so only the deadline can explain an
+        # abort at scan_pages < the cap. /_cache_scandeadlineoff is the negative
+        # control: same location shape, scan_deadline=0 (disabled), so a walk
+        # spanning the same number of pages must complete normally.
+        location = /_cache_scandeadline {{
+            cache_turbo_admin    main;
+            cache_turbo_redis    127.0.0.1:{redis_port} db=7 prefix=ctscan: timeout=2s scan_deadline=1ms;
+            allow 127.0.0.1;
+            deny all;
+        }}
+
+        location = /_cache_scandeadlineoff {{
+            cache_turbo_admin    main;
+            cache_turbo_redis    127.0.0.1:{redis_port} db=7 prefix=ctscan: timeout=2s scan_deadline=0;
+            allow 127.0.0.1;
+            deny all;
+        }}
+
         # AUD-PURGE-HONESTY1: admin endpoint whose L2 is DOWN -- the registry's
         # redis_dead offset is reserved and never bound, so the connect is
         # refused and scan_del returns NGX_ERROR without ever walking a page.
@@ -15266,6 +15288,61 @@ def test_scan_walk_page_cap_reports_incomplete(ng: Nginx,
     redis.cli("-n", "7", "FLUSHDB")
 
 
+def test_scan_walk_deadline_reports_incomplete(ng: Nginx,
+                                               redis: RedisServer) -> None:
+    """S231-L2-SCANTIME: SCAN_MAX_PAGES bounds MEMORY, not TIME -- each page's
+    read re-arms redis_timeout (redis.c:1766), so a backend that always hands
+    back a non-zero cursor just under that timeout can park a purge request for
+    up to SCAN_MAX_PAGES pages (hours), never tripping the page cap. A
+    wall-clock deadline across the WHOLE walk, checked at every page boundary
+    alongside the page cap, closes that gap.
+
+    Oracle: this must NOT be "the purge finished" or "the request returned" --
+    an ordinary fast SCAN reproduces both. The observable marker unique to this
+    path is reason=="deadline" in the failure body (page-cap abandonment
+    reports reason=="page-cap" at the same status/l2 values -- see
+    test_scan_walk_page_cap_reports_incomplete). Two claims:
+
+      1. NEGATIVE CONTROL -- the identical multi-page keyspace against
+         /_cache_scandeadlineoff (scan_deadline=0, disabled) completes
+         normally: 200, no "l2" key. Proves the deadline check itself, not
+         some other abort path, is what fires below.
+      2. Against /_cache_scandeadline (scan_deadline=1ms -- unmeetable by any
+         real page round-trip) the walk is abandoned with reason=="deadline",
+         distinct from "page-cap", at fewer than SCAN_MAX_PAGES pages."""
+    redis.cli("-n", "7", "FLUSHDB")
+
+    # 1. negative control: deadline disabled, same multi-page keyspace, same
+    # location shape -> ordinary completion.
+    _scan_fill(redis, 6000, "dl-ctrl")
+    s_off, off = _scan_purge(ng, "/_cache_scandeadlineoff")
+    assert s_off == 200, f"deadline=0 must not abort a normal walk: {s_off} {off}"
+    assert "l2" not in off, f"disabled deadline still reported an L2 problem: {off}"
+    redis.cli("-n", "7", "FLUSHDB")
+
+    # 2. the claim: an unmeetable wall-clock deadline aborts the walk.
+    _scan_fill(redis, 6000, "dl-over")
+    s, over = _scan_purge(ng, "/_cache_scandeadline")
+    assert s == 500, f"a deadline-abandoned purge must not report success: {s} {over}"
+    assert over.get("l2") == "incomplete" and over.get("reason") == "deadline", \
+        f"deadline abort did not report reason=deadline: {over}"
+    # Distinct from the page-cap path: this location never lowers the page cap,
+    # so an abort at a small page count can only be explained by the deadline.
+    assert 0 < over.get("scan_pages", 0) < 100, \
+        f"walk did not abort quickly on the deadline: {over}"
+    assert isinstance(over.get("purged"), int), \
+        f"failure body dropped the L1 purge count: {over}"
+
+    # The abandoned walk must have left L2 partially populated, same disclosure
+    # contract as the page-cap path.
+    assert int(redis.cli("-n", "7", "EVAL",
+                         "return #redis.call('KEYS','ctscan:*')",
+                         "0") or 0) > 0, \
+        "deadline-abandoned purge somehow emptied the keyspace"
+
+    redis.cli("-n", "7", "FLUSHDB")
+
+
 def test_normalize_arg_order(ng: Nginx, origin: Origin) -> None:
     """v3-1: ?b=2&a=1 and ?a=1&b=2 normalize to one cache slot — the reordered
     second request is a HIT serving the first body, origin hit exactly once."""
@@ -16765,6 +16842,7 @@ def run_all(ng: Nginx, origin: Origin,
         # below (the last of which deliberately empties L2).
         test_scan_walk_pool_is_o1_in_pages(ng, redis)
         test_scan_walk_page_cap_reports_incomplete(ng, redis)
+        test_scan_walk_deadline_reports_incomplete(ng, redis)  # S231-L2-SCANTIME
         # AUD-PURGE-HONESTY1: shares the ctscan: prefix for its control leg, so
         # it belongs in this group and ahead of the all-purge tests below.
         test_all_purge_reports_l2_unavailable_when_backend_is_down(ng, redis)
