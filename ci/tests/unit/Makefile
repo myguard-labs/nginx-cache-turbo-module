@@ -43,21 +43,42 @@ INCS_NGX  = -I$(NGINX_SRC)/core -I$(NGINX_SRC)/event -I$(NGINX_SRC)/os/unix \
 
 GEN = $(HERE)/generated_shm.inc
 
-.PHONY: check run extract layout-check clean
+# frame_scan() (S231-L2-FRAMEQUAD) needs no nginx source tree at all -- it
+# compiles the shared fuzz slice (ci/fuzz/generated_parser.inc, produced by
+# ci/fuzz/extract_parser.sh from src/ngx_http_cache_turbo_redis.c) against
+# ci/fuzz/ngx_shim.h's minimal nginx surface, the same production-code-no-copy
+# approach as test_shm_state.c uses for the real nginx headers. It legitimately
+# leaves several sibling functions in that shared slice unused (this test only
+# exercises frame_scan()), hence -Wno-unused-function only for this target.
+FUZZ_DIR    = $(HERE)/../../fuzz
+FRAME_GEN   = $(FUZZ_DIR)/generated_parser.inc
 
-check: extract layout-check
+.PHONY: check run extract layout-check extract-frame-scan clean
+
+check: extract layout-check extract-frame-scan
 	@$(CC) $(CFLAGS) $(SAN) $(INCS_NGX) -c $(NGINX_SRC)/core/ngx_rbtree.c \
 	    -o $(HERE)/ngx_rbtree.san.o
 	@$(CC) $(CFLAGS) $(SAN) $(INCS_TEST) -c $(HERE)/test_shm_state.c \
 	    -o $(HERE)/test_shm_state.san.o
 	@$(CC) $(SAN) $(HERE)/test_shm_state.san.o $(HERE)/ngx_rbtree.san.o -o $(HERE)/test_shm_state.san
 	@ASAN_OPTIONS=detect_leaks=1 $(HERE)/test_shm_state.san
+	@$(CC) $(CFLAGS) -Wno-unused-function $(SAN) -I$(FUZZ_DIR) \
+	    -o $(HERE)/test_frame_scan.san $(HERE)/test_frame_scan.c
+	@ASAN_OPTIONS=detect_leaks=1 $(HERE)/test_frame_scan.san
 
-run: extract layout-check
+run: extract layout-check extract-frame-scan
 	@$(CC) $(CFLAGS) $(INCS_NGX) -c $(NGINX_SRC)/core/ngx_rbtree.c -o $(HERE)/ngx_rbtree.o
 	@$(CC) $(CFLAGS) $(INCS_TEST) -c $(HERE)/test_shm_state.c -o $(HERE)/test_shm_state.o
 	@$(CC) $(HERE)/test_shm_state.o $(HERE)/ngx_rbtree.o -o $(HERE)/test_shm_state
 	@$(HERE)/test_shm_state
+	@$(CC) $(CFLAGS) -Wno-unused-function -I$(FUZZ_DIR) \
+	    -o $(HERE)/test_frame_scan $(HERE)/test_frame_scan.c
+	@$(HERE)/test_frame_scan
+
+extract-frame-scan: $(FRAME_GEN)
+
+$(FRAME_GEN): $(REPO)/src/ngx_http_cache_turbo_redis.c $(FUZZ_DIR)/ngx_shim.h $(FUZZ_DIR)/extract_parser.sh
+	@$(FUZZ_DIR)/extract_parser.sh
 
 # Static-asserts the mirrored structs against the real nginx headers. Drift here
 # would otherwise be silent memory corruption at run time, not a build error.
@@ -77,3 +98,4 @@ $(GEN): $(REPO)/src/ngx_http_cache_turbo_shm.c $(REPO)/src/ngx_http_cache_turbo_
 
 clean:
 	@rm -f $(HERE)/test_shm_state $(HERE)/test_shm_state.san $(HERE)/*.o $(GEN)
+	@rm -f $(HERE)/test_frame_scan $(HERE)/test_frame_scan.san
