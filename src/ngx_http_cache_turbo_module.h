@@ -1812,8 +1812,14 @@ typedef struct {
      * refuses (*, Cookie, Authorization) => do not capture/store. */
     unsigned                 vary_nocache:1;
     ngx_int_t                vary_bits;
+    /* S231-PERF-VARYLOCK: the marker key bytes, computed lock-free in the
+     * prologue (marker_hash() only touches ctx->cache_key and local stack
+     * memory) so the marker lookup itself can run inside the SAME critical
+     * section as the main L1 lookup in access_handler, instead of its own
+     * separate lock/unlock pair. Only meaningful when clcf->auto_vary. */
+    u_char                   vary_marker_key[32];
     /* auto-Vary PURGE generation (COR-5). Resolved from the L1 marker by
-     * vary_resolve and reused at store so the variant key + marker agree. Stays
+     * vary_apply and reused at store so the variant key + marker agree. Stays
      * 0 for the backend-backed purge path (variants are physically removed +
      * the marker deleted, so the keyspace resets cleanly to gen 0); only the
      * L1-only / memcached purge path bumps it (no enumerable L2 index, so an
