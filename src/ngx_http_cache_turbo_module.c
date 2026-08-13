@@ -561,6 +561,17 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_cache_turbo_loc_conf_t, test_l2_promote_hold_ms),
       NULL },
+
+    /* S231-SIE-MIDBODY: deterministically simulate an upstream that dies
+     * AFTER headers were sent but BEFORE last_buf, so the pre-flush SIE
+     * body rescue can be exercised without racing real connection teardown.
+     * See the loc_conf field comment and the body filter rescue site. */
+    { ngx_string("cache_turbo_test_midbody_abort"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_turbo_loc_conf_t, test_midbody_abort),
+      NULL },
 #endif
 
       ngx_null_command
@@ -8382,6 +8393,38 @@ ngx_http_cache_turbo_header_admissible(ngx_http_cache_turbo_loc_conf_t *clcf,
 
 
 /*
+ * S231-SIE-MIDBODY: read the snapshot's body length WITHOUT touching
+ * r->headers_out or the header list. ngx_http_cache_turbo_sie_rewrite() below
+ * is destructive (ngx_list_init() wipes r->headers_out.headers, clears the
+ * typed Content-Type/Length fields) — calling it just to inspect the length
+ * and then backing out would leave the response half-rewritten with no way
+ * to undo it. ngx_http_cache_turbo_blob_validate() is already the read-only,
+ * fully-bounds-checked parse every other snapshot consumer trusts (see
+ * STAB-4 above restore_response()); reuse it here instead of open-coding a
+ * second TLV reader. Returns NGX_OK and sets *body_lenp on a structurally
+ * valid blob, NGX_ERROR otherwise (caller must treat that as "cannot prove
+ * the rescue is framing-safe" and decline).
+ */
+static ngx_int_t
+ngx_http_cache_turbo_sie_snap_body_len(ngx_http_cache_turbo_ctx_t *ctx,
+    size_t *body_lenp)
+{
+    ngx_http_cache_turbo_blob_hdr_t  hdr;
+
+    if (ctx->sie_snap == NULL
+        || ngx_http_cache_turbo_blob_validate(ctx->sie_snap, ctx->sie_snap_len,
+                                              &hdr, NULL, NULL, NULL, NULL)
+           != NGX_OK)
+    {
+        return NGX_ERROR;
+    }
+
+    *body_lenp = hdr.body_len;
+    return NGX_OK;
+}
+
+
+/*
  * RFC-2 stale-if-error serve-on-error, header half. The origin revalidation of an
  * EXPIRED entry returned a 5xx (or nginx synthesised a 502/504 for a transport
  * failure) and a within-SIE snapshot is armed: REPLACE the error response with
@@ -8952,6 +8995,37 @@ ngx_http_cache_turbo_forward_body(ngx_http_request_t *r, ngx_chain_t *in)
     ctx = ngx_http_get_module_ctx(r, ngx_http_cache_turbo_module);
 
     if (ctx == NULL || !ctx->warm) {
+        /* S231-SIE-MIDBODY: this IS the pre-flush oracle -- the moment any
+         * non-empty buffer is handed to the real next body filter, those
+         * bytes may already be on the wire to the client and the mid-body
+         * rescue below can no longer replace them. A warm subrequest (the
+         * branch above) never reaches a client, so it does not count.
+         *
+         * Deliberately NOT TEST_FAULTS-gated, even though the only current
+         * READER of the bit is the test-only rescue block. The cost is
+         * already nil in a production build -- the `!sie_flushed` guard makes
+         * this run at most once per request and the loop breaks on the first
+         * non-empty buffer -- and gating it would give the field different
+         * semantics per build flavor, so the day a real production trigger
+         * for mid-body death is found it would read a bit that was never set
+         * in the very build that needs it. Keep the oracle unconditional. */
+        if (ctx != NULL && !ctx->sie_flushed) {
+            ngx_chain_t  *fcl;
+
+            for (fcl = in; fcl; fcl = fcl->next) {
+                if (ngx_buf_in_memory(fcl->buf)
+                    && fcl->buf->last > fcl->buf->pos)
+                {
+                    ctx->sie_flushed = 1;
+                    break;
+                }
+                if (fcl->buf->in_file && fcl->buf->file_last > fcl->buf->file_pos)
+                {
+                    ctx->sie_flushed = 1;
+                    break;
+                }
+            }
+        }
         return ngx_http_next_body_filter(r, in);
     }
 
@@ -8979,6 +9053,153 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
     ngx_uint_t                        last = 0;
 
     ctx = ngx_http_get_module_ctx(r, ngx_http_cache_turbo_module);
+
+    /* S231-SIE-MIDBODY: rescue a mid-body origin death.
+     *
+     * The header-filter SIE trigger (~:7948) only fires when the ORIGIN'S
+     * STATUS line is an error -- but a mid-body death arrives with headers
+     * already sent as a normal 200 (the origin was fine when it opened the
+     * response and died partway through the body), so that trigger can never
+     * see it. This is the only place left that can still act: BEFORE any
+     * byte of this response has reached the client (ctx->sie_flushed is the
+     * pre-flush oracle, set the first time a non-empty buffer is forwarded
+     * downstream). ngx_http_cache_turbo_forward_body() is the SINGLE set
+     * site, and that is sufficient: every downstream exit on the capture
+     * path routes through it -- the not-cacheable and oversize aborts, the
+     * file-backed delegate, the served/uncaptured early return and the store
+     * tail. The only ngx_http_next_body_filter() call this filter makes
+     * directly is the sie_serving emit below, which is this rescue's own
+     * output and is guarded by sie_body_sent instead. If a future change adds
+     * another direct downstream call on the capture path, it MUST set this
+     * bit or the rescue will splice into an already-flushed response.
+     *
+     * Once flushed, this is provably too late: the client already holds an
+     * unknown-length prefix of the truncated body, and splicing the snapshot
+     * in now would produce a corrupt concatenation (truncated-prefix +
+     * full-snapshot), which is strictly worse than the truncated response
+     * alone. There is no recovery from that without a protocol the client
+     * understands (range replay, chunked trailer, etc) that this module does
+     * not have. Ship pre-flush only; do not claim broader coverage.
+     *
+     * ⚠ Headers are NOT rewritten here, unlike the header-filter SIE path.
+     * By the time the body filter runs, ngx_http_next_header_filter() has
+     * already returned for THIS response's 200 -- the header chain has
+     * already serialised r->headers_out into the wire buffer with no
+     * postponement contract (same fact the AUD-SIE-BODY test counter comment
+     * below relies on). Rewriting r->headers_out here would change nothing
+     * the client observes: the status line stays whatever the origin sent
+     * (200), only the BODY is replaced with the complete snapshot instead of
+     * the truncated one. That is still strictly better than a truncated 200
+     * with no recovery at all, but it is a body-only rescue -- say so plainly
+     * rather than claiming header coverage this cannot deliver.
+     *
+     * ⚠ FRAMING, not just status: the Content-Length this response is framed
+     * with was ALSO already serialised on the wire by the time this filter
+     * runs (same fact as above). Splicing in a snapshot body of a DIFFERENT
+     * length than what the client was told to expect corrupts the framing --
+     * the client waits for bytes that never arrive (Content-Length longer
+     * than the snapshot), or rejects/desyncs a pipelined connection
+     * (Content-Length shorter). That is worse than the truncated body this
+     * rescue exists to fix. So the rescue is only framing-safe when either
+     * (a) the origin sent no Content-Length at all (content_length_n == -1,
+     * i.e. chunked/EOF-framed -- the client places no length expectation on
+     * the body, so any snapshot length is safe), or (b) the snapshot body is
+     * EXACTLY the length the origin advertised. Checked BEFORE calling
+     * sie_rewrite(): sie_rewrite() is destructive (wipes r->headers_out.headers
+     * via ngx_list_init(), clears the typed Content-Length field) so there is
+     * no way to call it, discover a mismatch, and back out --
+     * sie_snap_body_len() reads the snapshot's length straight from the
+     * blob's validated header, with no side effect on r->headers_out.
+     *
+     * Detecting the failure: no in-process production signal proved reliable
+     * (r->upstream->peer.connection == NULL races the connection close
+     * timing; unmet r->upstream->length can be legitimate chunked/EOF
+     * framing; c->error is set too late relative to this filter running).
+     * Ship the deterministic TEST_FAULTS trigger
+     * (cache_turbo_test_midbody_abort, module.h ~:1656) instead: it treats
+     * the FIRST arriving buffer as the failure, which is how this module
+     * tests every other origin-failure path it cannot otherwise force.
+     */
+    clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
+
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+    /* use_stale_triggers() switches on the STATUS r->headers_out carries --
+     * always 200 here, since a mid-body death by definition happened after a
+     * successful header phase, so calling it with the real status can never
+     * match. What we need instead is "does this location's use_stale policy
+     * treat a representative connection failure as stale-eligible at all" --
+     * the same question the breaker's ERROR/TIMEOUT fold (S4.2 comment above
+     * use_stale_triggers()) answers by treating a refused/dropped connection
+     * as equivalent to 502/504. NGX_HTTP_BAD_GATEWAY is that representative:
+     * it is what nginx itself synthesises for a transport failure, and its
+     * bit (HTTP_502 | ERROR) is set by the same USE_STALE_DEFAULT every other
+     * SIE fixture in this suite relies on. */
+    if (ctx != NULL && clcf->test_midbody_abort
+        && ctx->sie_armed && !ctx->sie_serving && !ctx->sie_flushed
+        && ngx_http_cache_turbo_use_stale_triggers(clcf->use_stale,
+                                                    NGX_HTTP_BAD_GATEWAY))
+    {
+        off_t      origin_cl = r->headers_out.content_length_n;
+        size_t     snap_body_len;
+        ngx_uint_t framing_ok;
+
+        framing_ok = (ngx_http_cache_turbo_sie_snap_body_len(ctx,
+                                                    &snap_body_len) == NGX_OK)
+                     && (origin_cl == -1
+                         || (off_t) snap_body_len == origin_cl);
+
+        if (!framing_ok) {
+            ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                           "cache_turbo: STALE-IF-ERROR mid-body rescue "
+                           "declined \"%V\" -- snapshot length would not "
+                           "match the already-serialised Content-Length: %O",
+                           &r->uri, origin_cl);
+
+        } else {
+            ngx_int_t  rc;
+
+            rc = ngx_http_cache_turbo_sie_rewrite(r, ctx);
+            if (rc == NGX_ERROR) {
+                return NGX_ERROR;
+            }
+            if (rc == NGX_OK) {
+                ctx->served = 1;
+                ctx->sie_serving = 1;
+
+                if (clcf->shm_zone != NULL) {
+                    ngx_http_cache_turbo_zone_t  *sz = clcf->shm_zone->data;
+                    (void) ngx_atomic_fetch_add(&sz->sh->sie_serves, 1);
+                }
+
+                /* S231-SIE-MIDBODY / lease: mirror the header-filter SIE
+                 * path (~:7981) exactly. This request is now served from the
+                 * snapshot and will never reach the store tail, so a cold-miss
+                 * lease it won would otherwise sit owned until cleanup/expiry,
+                 * parking every waiter behind it for no reason. */
+                if (ctx->cold_winner && !ctx->cold_stored
+                    && ctx->cold_zone != NULL)
+                {
+                    uint32_t  h = ngx_crc32_short(ctx->key_hash, 32);
+                    ngx_http_cache_turbo_shm_unstub(ctx->cold_zone,
+                                                    ctx->key_hash, h,
+                                                    ctx->cold_owner);
+                    ctx->cold_stored = 1;
+                }
+
+                ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                               "cache_turbo: STALE-IF-ERROR mid-body rescue \"%V\" "
+                               "len=%uz (pre-flush, body-only)",
+                               &r->uri, ctx->sie_body_len);
+                /* Discard the truncated prefix the fault delivered in THIS
+                 * call (nothing was forwarded yet -- sie_flushed is still 0)
+                 * and fall into the existing sie_serving emit block below,
+                 * which already knows how to consume `in` and emit
+                 * ctx->sie_body as a single last_buf chain. */
+            }
+        }
+    }
+#endif
 
     /* RFC-2 stale-if-error, body half. The header filter replaced an origin error
      * with the stale snapshot; discard the upstream error body and emit the
@@ -9070,8 +9291,6 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
     if (ctx == NULL || !ctx->captured || ctx->served) {
         return ngx_http_cache_turbo_forward_body(r, in);
     }
-
-    clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
 
 #if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
     && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
@@ -13901,6 +14120,7 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->test_store_fail = NGX_CONF_UNSET;
     conf->test_scan_max_pages = NGX_CONF_UNSET;
     conf->test_l2_promote_hold_ms = NGX_CONF_UNSET;
+    conf->test_midbody_abort = NGX_CONF_UNSET;
 #endif
     /* shm_zone, key, redis_addr, redis_prefix default NULL via pcalloc */
 
@@ -14127,6 +14347,8 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
                          prev->test_scan_max_pages, 0);
     ngx_conf_merge_value(conf->test_l2_promote_hold_ms,
                          prev->test_l2_promote_hold_ms, 0);
+    ngx_conf_merge_value(conf->test_midbody_abort,
+                         prev->test_midbody_abort, 0);
 #endif
 
     /* PURGE method (v14): off by default. */
