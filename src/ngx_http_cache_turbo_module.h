@@ -2203,11 +2203,17 @@ ngx_int_t ngx_http_cache_turbo_shm_count_miss(ngx_http_cache_turbo_zone_t *z,
  * must check *count_miss_rc first, exactly as they already check
  * count_miss()'s return before ever calling claim(). When *count_miss_rc is
  * NGX_OK, the return value is claim()'s own CLAIM_WINNER/LOSER/FRESH and
- * *owner / *fresh_data / *fresh_len are populated exactly as claim() (plus, on
- * CLAIM_FRESH, the blob pointer/len claim() would have required a SECOND
- * lock+lookup in the caller to obtain -- see module.c's old CLAIM_FRESH
- * branch) would have. l2_neg_check is intentionally NOT part of this merge;
- * see the definition's comment for why. */
+ * *owner / *fresh_data / *fresh_len are populated exactly as claim() would
+ * have. On CLAIM_FRESH, *fresh_data is an ALREADY-REFERENCED blob pointer --
+ * the PERF-7 refcount (ngx_http_cache_turbo_blob_acquire()) was taken inside
+ * the same critical section that read it, before this function's internal
+ * unlock, precisely because that refcount is what keeps the pointer valid
+ * once the lock is gone. The caller OWNS that reference on any non-NULL
+ * *fresh_data and MUST release it (ngx_http_cache_turbo_blob_release()) on
+ * every path that does not hand it to ngx_http_cache_turbo_serve(). See the
+ * definition's comment for the full pointer-by-pointer locking-window
+ * argument. l2_neg_check is intentionally NOT part of this merge; see the
+ * definition's comment for why. */
 ngx_int_t ngx_http_cache_turbo_shm_resolve_miss(ngx_http_cache_turbo_zone_t *z,
     u_char *key_hash, uint32_t hash, ngx_int_t min_uses, time_t lock_ttl,
     uint64_t *owner, ngx_int_t *count_miss_rc,

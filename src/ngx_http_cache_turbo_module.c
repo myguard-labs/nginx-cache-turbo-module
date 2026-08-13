@@ -6290,14 +6290,25 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
 
             if (cl == NGX_HTTP_CACHE_TURBO_CLAIM_FRESH) {
                 /* Mirrors the CLAIM_FRESH branch below, but resolve_miss()
-                 * already handed back the raced-in blob under the SAME lock
-                 * hold that produced it -- no second lock+lookup needed (that
-                 * second acquisition is exactly one of the four this item
-                 * removes). RFC-1 re-validation kept identical: a request
-                 * revalidation-forced by its own freshness bounds must still
-                 * fall through to the origin rather than re-serve. */
+                 * already handed back the raced-in blob PRE-REFERENCED (the
+                 * PERF-7 blob_acquire() ran inside claim_locked()'s own
+                 * critical section, before resolve_miss()'s internal unlock
+                 * -- see its contract comment in shm.c). This request now
+                 * OWNS that one reference: it must reach serve() (which
+                 * registers the pool-lifetime release) on every path, or be
+                 * explicitly released here if it does not. Acquiring AGAIN
+                 * here would be a double-acquire leaking a reference every
+                 * fresh-raced request; acquiring only after this unlock
+                 * (what an earlier version of this diff did) is a
+                 * use-after-free -- a concurrent evict can free the blob in
+                 * the gap between resolve_miss()'s unlock and this line.
+                 *
+                 * RFC-1 re-validation kept identical to the pre-merge
+                 * branch: a request revalidation-forced by its own
+                 * freshness bounds must still fall through to the origin
+                 * rather than re-serve -- but it must also release the
+                 * reference it already owns instead of leaking it. */
                 if (fresh_data != NULL && !ctx->req_reval) {
-                    ngx_http_cache_turbo_blob_acquire(fresh_data);
                     (void) ngx_atomic_fetch_add(&z->sh->hits, 1);
                     ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                                    "cache_turbo: cold-miss raced to FRESH \"%V\" "
@@ -6305,7 +6316,14 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                     return ngx_http_cache_turbo_serve(r, fresh_data,
                                fresh_len_out, 0, z, fresh_data, NULL);
                 }
-                /* vanished again, or blocked by RFC-1: go to origin */
+                if (fresh_data != NULL) {
+                    /* req_reval blocked the re-serve: release the reference
+                     * resolve_miss() already took on our behalf, or it leaks
+                     * for the life of the shm zone. */
+                    ngx_http_cache_turbo_blob_release(z, fresh_data);
+                }
+                /* vanished again (fresh_data NULL -- claim_locked() found no
+                 * fresh entry this pass), or blocked by RFC-1: go to origin */
                 (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
                 return NGX_DECLINED;
             }

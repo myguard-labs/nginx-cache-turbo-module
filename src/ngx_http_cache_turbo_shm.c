@@ -1021,14 +1021,31 @@ ngx_http_cache_turbo_shm_count_miss_locked(ngx_http_cache_turbo_zone_t *z,
  * `ctn` may be NULL (key absent), matching the original single-call version.
  *
  * On CLAIM_FRESH the raced-in entry's blob pointer/len are handed back via
- * *fresh_data / *fresh_len (still under the caller's lock) so a merged caller
- * can acquire the blob ref itself without a second lock+lookup, exactly
- * mirroring what module.c's separate re-lookup used to do right after
- * unlocking here. A standalone caller that does not need the blob (there is
- * none today) may pass NULL for either out-param.
+ * *fresh_data / *fresh_len, and the PERF-7 refcount is acquired RIGHT HERE,
+ * still inside this function's critical section (the caller holds the lock
+ * across this whole call -- see resolve_miss() below). This is load-bearing,
+ * not an optimisation: ngx_http_cache_turbo_blob_acquire()'s own contract
+ * (module.h) requires it be called "with shpool->mutex held (same critical
+ * section as the lookup that produced `data`)" -- pinning the refcount is
+ * what makes the pointer safe to dereference AFTER the caller unlocks. An
+ * earlier version of this merge returned the raw pointer and left the
+ * caller to acquire() after unlocking, which is a use-after-free: another
+ * worker can evict the entry and drop the last reference in the gap between
+ * the unlock and the caller's acquire(), so acquire() then increments a
+ * refcount inside already-freed slab memory and the caller's serve() reads
+ * a freed body.
  *
- * Every read/mutate/return here is byte-for-byte the original claim() body --
- * only the lock and the lookup moved to the caller. */
+ * *fresh_data is non-NULL if and only if the caller now OWNS a reference
+ * that MUST be released on every path that does not hand it to serve()
+ * (serve() takes ownership of exactly one reference via its own cleanup
+ * registration). A standalone caller that does not want the blob at all
+ * (there is none today) may pass NULL for `fresh_data` and this function
+ * skips the acquire() entirely -- no reference is taken, so there is
+ * nothing for that caller to release.
+ *
+ * Every read/mutate/return here is byte-for-byte the original claim() body,
+ * plus this one acquire() call -- only the lock and the lookup moved to the
+ * caller. */
 static ngx_int_t
 ngx_http_cache_turbo_shm_claim_locked(ngx_http_cache_turbo_zone_t *z,
     uint32_t hash, u_char *key_hash, time_t lock_ttl, uint64_t *owner,
@@ -1044,6 +1061,12 @@ ngx_http_cache_turbo_shm_claim_locked(ngx_http_cache_turbo_zone_t *z,
          * it, do NOT regenerate. */
         if (ctn->len > 0 && now < ctn->fresh_until) {
             if (fresh_data != NULL) {
+                /* Acquire the PERF-7 refcount HERE, still under the caller's
+                 * lock -- see the function comment above for why this may
+                 * not move to the caller after unlock. The caller now owns
+                 * this reference and must release it on any path that does
+                 * not hand *fresh_data to serve(). */
+                ngx_http_cache_turbo_blob_acquire(ctn->data);
                 *fresh_data = ctn->data;
             }
             if (fresh_len != NULL) {
@@ -1182,10 +1205,32 @@ ngx_http_cache_turbo_shm_claim(ngx_http_cache_turbo_zone_t *z,
  *     the same node, under the same lock hold count_miss() and claim() used
  *     to take separately.
  *   - On CLAIM_FRESH, *fresh_data / *fresh_len are populated exactly as
- *     claim_locked() documents above, letting the caller acquire the blob
- *     ref under ITS OWN subsequent lock instead of trusting a pointer read
- *     after this function unlocks (blob_acquire still happens under a lock
- *     the caller holds, in module.c, unchanged from before).
+ *     claim_locked() documents above -- INCLUDING that claim_locked() has
+ *     already called blob_acquire() on *fresh_data before this function
+ *     unlocks. The caller receives an already-referenced pointer, not a
+ *     bare one to acquire later: nothing may read ctn->data and defer the
+ *     acquire() past this function's unlock, because the mutex is the only
+ *     thing stopping a concurrent evict from freeing that blob out from
+ *     under an unreferenced pointer. The caller owns that one reference and
+ *     must release it (ngx_http_cache_turbo_blob_release()) on every path
+ *     that does not hand it to ngx_http_cache_turbo_serve() -- serve()'s
+ *     cleanup registration is what eventually drops it on the pool-lifetime
+ *     path, so a caller that decides NOT to serve (e.g. RFC-1 req_reval)
+ *     must release it explicitly or leak the reference.
+ *
+ * LOCKING WINDOW, pointer by pointer -- everything resolve_miss() hands back
+ * across its own unlock:
+ *   - *owner (a uint64_t token, not a pointer): safe by value, no lifetime
+ *     issue. Its liveness as a lease is re-checked later via shm_owns(),
+ *     never assumed from having once been returned here.
+ *   - *count_miss_rc (an ngx_int_t verdict): safe by value.
+ *   - *fresh_data / *fresh_len: *fresh_data is safe ACROSS the unlock
+ *     specifically because claim_locked() already pinned it with
+ *     blob_acquire() before returning -- the refcount, not the mutex, is
+ *     what keeps the blob alive from here on. *fresh_len is a snapshot
+ *     size_t copied from ctn->len while the lock was held; it describes the
+ *     referenced blob's length at accept time and does not need its own
+ *     protection once the reference exists.
  *
  * l2_neg_check is deliberately NOT folded in here: on the request path it
  * runs before this call and can be followed by an async L2 GET
