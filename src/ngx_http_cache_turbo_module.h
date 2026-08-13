@@ -1507,6 +1507,14 @@ typedef struct {
     ngx_str_t                redis_prefix; /* key prefix, default "ct:"        */
     ngx_msec_t               redis_timeout;/* connect/read timeout             */
 
+    /* S231-L2-SCANTIME: wall-clock ceiling on one all-purge SCAN walk, checked
+     * at every page boundary alongside SCAN_MAX_PAGES. The page cap alone is a
+     * MEMORY guard: each page's read re-arms redis_timeout, so a server that
+     * always returns a non-zero cursor just before that timer fires can park
+     * the request for up to SCAN_MAX_PAGES pages (hours). scan_deadline= on
+     * cache_turbo_redis sets it; 0 = disabled (unbounded, page-cap only). */
+    ngx_msec_t               redis_scan_deadline;
+
     /* L2 per-worker connect backoff (S231). After a connect FAILURE (not a
      * protocol/reply error) to redis_addr, this worker fails L2 ops fast for
      * connect_backoff ms instead of paying a fresh connect() attempt on every
@@ -2304,18 +2312,23 @@ void ngx_http_cache_turbo_redis_tag_add_many(
  * success. NULL for the SMEMBERS path (which walks nothing).
  *
  *   status  NGX_OK    - cursor returned to 0: the whole keyspace was walked
- *           NGX_ABORT - the page cap was hit: purge is INCOMPLETE by policy
+ *           NGX_ABORT - the page cap or scan_deadline was hit: purge is
+ *                       INCOMPLETE by policy (see `deadline` below for which)
  *           NGX_ERROR - timeout / malformed reply / alloc failure: INCOMPLETE
  *   pages   SCAN pages consumed (>= 1 once any reply was parsed)
  *   blocks  live pool blocks held by the walk at finish. Diagnostic only, and
  *           only reported under TEST_FAULTS: it is the oracle proving per-page
  *           allocations are released per page (constant in `pages`) rather than
  *           accumulating in the op pool for the whole walk. Kept unconditional
- *           in the struct so the plumbing has no #if seams. */
+ *           in the struct so the plumbing has no #if seams.
+ *   deadline S231-L2-SCANTIME: 1 when NGX_ABORT was reached via the wall-clock
+ *           scan_deadline= rather than the page cap — the observable marker
+ *           that distinguishes the two ABORT causes for callers/tests. */
 typedef struct {
     ngx_int_t   status;
     ngx_uint_t  pages;
     ngx_uint_t  blocks;
+    unsigned    deadline:1;
 } ngx_http_cache_turbo_redis_walk_t;
 
 /* Completion callback for a SMEMBERS fetch: invoked once with the set members

@@ -10415,7 +10415,8 @@ ngx_http_cache_turbo_check_l2_prefix(ngx_conf_t *cf, ngx_str_t *prefix,
 
 /*
  * "cache_turbo_redis <dsn|host:port> [prefix=] [timeout=] [password=] [user=]
- *  [db=] [tls=on|off] [tls_verify=on|off] [tls_ca=<file>] [tls_name=<host>];"
+ *  [db=] [tls=on|off] [tls_verify=on|off] [tls_ca=<file>] [tls_name=<host>]
+ *  [scan_deadline=];"
  *
  * The DSN is redis://[user:pass@]host:port/db ; rediss:// selects TLS. Bare
  * host:port still works (legacy). Trailing params override whatever the DSN
@@ -10653,6 +10654,22 @@ ngx_http_cache_turbo_redis_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         } else if (ngx_strncmp(value[i].data, "tls_name=", 9) == 0) {
             clcf->redis_tls_name.data = value[i].data + 9;
             clcf->redis_tls_name.len = value[i].len - 9;
+
+        } else if (ngx_strncmp(value[i].data, "scan_deadline=", 14) == 0) {
+            /* S231-L2-SCANTIME: wall-clock ceiling on one all-purge SCAN walk,
+             * on top of the fixed SCAN_MAX_PAGES page cap. "0" disables it
+             * (page-cap-only, legacy behaviour) rather than being rejected
+             * like a zero connect timeout: the page cap alone is a legitimate,
+             * if generous, non-termination guard. */
+            s.data = value[i].data + 14;
+            s.len = value[i].len - 14;
+            t = ngx_parse_time(&s, 0);   /* milliseconds */
+            if (t == NGX_ERROR) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                    "cache_turbo_redis: bad scan_deadline \"%V\"", &s);
+                return NGX_CONF_ERROR;
+            }
+            clcf->redis_scan_deadline = (ngx_msec_t) t;
 
         } else {
             ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
@@ -11016,7 +11033,8 @@ ngx_http_cache_turbo_all_purge_complete(ngx_http_request_t *r, void *data,
         reason = NULL;
     } else {
         status = NGX_HTTP_INTERNAL_SERVER_ERROR;
-        reason = (walk->status == NGX_ABORT) ? "page-cap" : "error";
+        reason = (walk->status != NGX_ABORT) ? "error"
+                 : walk->deadline ? "deadline" : "page-cap";
 
         /* AUD-PURGE-HONESTY1: separate "the walk ran and stopped early" from
          * "the walk never happened". Zero pages consumed means no SCAN reply
@@ -13045,6 +13063,7 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->redis_enable = NGX_CONF_UNSET;
     conf->memcached = NGX_CONF_UNSET;
     conf->redis_timeout = NGX_CONF_UNSET_MSEC;
+    conf->redis_scan_deadline = NGX_CONF_UNSET_MSEC;
     conf->redis_connect_backoff = NGX_CONF_UNSET_MSEC;
     conf->redis_keepalive = NGX_CONF_UNSET;
     conf->redis_keepalive_timeout = NGX_CONF_UNSET_MSEC;
@@ -13428,6 +13447,15 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_value(conf->redis_enable, prev->redis_enable, 0);
     ngx_conf_merge_value(conf->memcached, prev->memcached, 0);
     ngx_conf_merge_msec_value(conf->redis_timeout, prev->redis_timeout, 250);
+
+    /* S231-L2-SCANTIME: default 30s wall-clock ceiling on one all-purge SCAN
+     * walk. Generous for any real keyspace (SCAN_MAX_PAGES already tolerates
+     * ~268M keys at COUNT 256), but far below the ~72h an adversarial or
+     * pathological L2 could otherwise park a purge request for by returning a
+     * non-zero cursor just under redis_timeout on every page. 0 disables it
+     * (page-cap-only, pre-S231-L2-SCANTIME behaviour). */
+    ngx_conf_merge_msec_value(conf->redis_scan_deadline,
+                              prev->redis_scan_deadline, 30000);
     /* S231: safe non-zero small default. 0 = disabled (never back off).
      * 2s comfortably outlasts a single connect() timeout/RST so a worker
      * doesn't immediately re-hammer a peer that just refused, but is short

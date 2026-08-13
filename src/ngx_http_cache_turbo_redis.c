@@ -116,6 +116,14 @@ typedef struct {
     unsigned                     is_scan:1;
     ngx_int_t                    scan_status;
     ngx_uint_t                   scan_pages;
+    ngx_msec_t                   scan_start; /* S231-L2-SCANTIME: walk start
+                                              * (ngx_current_msec), set once when
+                                              * the SCAN op is launched          */
+    unsigned                     scan_deadline_hit:1; /* S231-L2-SCANTIME: walk
+                                              * abandoned by the wall-clock
+                                              * deadline, not the page cap —
+                                              * the oracle marker unique to this
+                                              * path (surfaced via walk.status)  */
 
     u_char                       recv[256];/* SET/lock/preamble reply scratch */
     size_t                       recv_len; /* bytes buffered in recv[]        */
@@ -1863,6 +1871,7 @@ ngx_http_cache_turbo_redis_scan_del(ngx_http_request_t *r,
     op->members_data = data;
     op->is_scan = 1;
     op->scan_status = NGX_ERROR;           /* until cursor "0" says otherwise */
+    op->scan_start = ngx_current_msec;     /* S231-L2-SCANTIME: walk start    */
 
     /* AUD-SCAN1: everything that lives for exactly one SCAN page — the reply
      * buffer, the parsed keys array, the next SCAN command — comes out of a
@@ -2934,6 +2943,29 @@ ngx_http_cache_turbo_redis_read_scan(ngx_event_t *rev)
             return;
         }
 
+        /* S231-L2-SCANTIME: wall-clock ceiling on the WHOLE walk, checked here
+         * alongside the page cap. The page cap is a memory guard; this is the
+         * time guard — each page's read re-arms redis_timeout, so a server
+         * that always returns a non-zero cursor just under that timeout
+         * otherwise parks the request for up to SCAN_MAX_PAGES pages (hours).
+         * ngx_current_msec wraps, so compare with the signed-difference idiom,
+         * never a plain '>'. 0 = disabled (page-cap only, legacy behaviour). */
+        if (op->clcf->redis_scan_deadline > 0
+            && (ngx_msec_int_t) (ngx_current_msec
+                                  - (op->scan_start
+                                     + op->clcf->redis_scan_deadline)) > 0)
+        {
+            ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                          "cache_turbo: L2 all-purge abandoned after %ui SCAN "
+                          "pages, wall-clock deadline %Mms exceeded; purge is "
+                          "INCOMPLETE", op->scan_pages,
+                          op->clcf->redis_scan_deadline);
+            op->scan_status = NGX_ABORT;
+            op->scan_deadline_hit = 1;
+            ngx_http_cache_turbo_redis_smembers_finish(op, NULL, 0);
+            return;
+        }
+
         /* Issue the next SCAN with the returned cursor, out of a FRESH page
          * pool. encode copies the cursor bytes (which point into the old rbuf)
          * into the new send buffer, so the old pool is safe to drop right
@@ -3005,6 +3037,7 @@ ngx_http_cache_turbo_redis_smembers_finish(
      * cap) leaves it non-OK and the purge is reported INCOMPLETE. */
     walk.status = op->scan_status;
     walk.pages = op->scan_pages;
+    walk.deadline = op->scan_deadline_hit;
     walk.blocks = ngx_http_cache_turbo_redis_pool_blocks(op->pool)
                   + (op->rpool != op->pool
                      ? ngx_http_cache_turbo_redis_pool_blocks(op->rpool) : 0);
