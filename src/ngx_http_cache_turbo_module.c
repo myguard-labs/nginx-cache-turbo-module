@@ -147,6 +147,8 @@ static char *ngx_http_cache_turbo_backend_prefix(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 static char *ngx_http_cache_turbo_bypass_uri(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
+static char *ngx_http_cache_turbo_bypass_stale_uri(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
 static char *ngx_http_cache_turbo_key_cookie_conf(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 /* auto-Vary (v11 other half) — defined near the v3-4 vary helpers but called
@@ -499,6 +501,13 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       0,
       NULL },
 
+    { ngx_string("cache_turbo_bypass_stale_uri"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_1MORE,
+      ngx_http_cache_turbo_bypass_stale_uri,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+
     { ngx_string("cache_turbo_backend_prefix"),
       NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
       ngx_http_cache_turbo_backend_prefix,
@@ -826,7 +835,7 @@ ngx_http_cache_turbo_blob_hdr_write(u_char *dst,
 {
     ngx_http_cache_turbo_put_u32(dst + 0,  NGX_HTTP_CACHE_TURBO_BLOB_MAGIC);
     ngx_http_cache_turbo_put_u16(dst + 4,  NGX_HTTP_CACHE_TURBO_BLOB_VERSION);
-    ngx_http_cache_turbo_put_u16(dst + 6,  0);            /* flags reserved */
+    ngx_http_cache_turbo_put_u16(dst + 6,  (uint16_t) h->flags);  /* BLOBF_* */
     ngx_http_cache_turbo_put_u32(dst + 8,  h->status);
     ngx_http_cache_turbo_put_u32(dst + 12, h->nheaders);
     ngx_http_cache_turbo_put_u32(dst + 16, h->headers_len);
@@ -900,6 +909,11 @@ ngx_http_cache_turbo_blob_validate(const u_char *blob, size_t len,
     out->fresh_ttl   = ngx_http_cache_turbo_get_u32(blob + 32);
     out->stale_ttl   = ngx_http_cache_turbo_get_u32(blob + 36);
     out->sie_ttl     = ngx_http_cache_turbo_get_u32(blob + 40);   /* CTB4 */
+    /* S232-BYPASS-STALE: BLOBF_* bits from the formerly-reserved u16. No range
+     * check -- unknown bits are ignored by every consumer (each tests its own
+     * bit), and an old blob reads 0 = no bits set. Rejecting on an unknown bit
+     * would make a future bit a keyspace-turnover event for no safety gain. */
+    out->flags       = ngx_http_cache_turbo_get_u16(blob + 6);
 
     /*
      * AUD-HDR1: RANGE validation, not just framing. Everything below this point
@@ -5153,6 +5167,34 @@ ngx_http_cache_turbo_bypass_uri_match(ngx_http_request_t *r,
 }
 
 
+/* S232-BYPASS-STALE: does r->uri opt in to breaker-only storage? Same
+ * segment-boundary matcher as the bypass_uri walk above. */
+static ngx_uint_t
+ngx_http_cache_turbo_bypass_stale_uri_match(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf)
+{
+    ngx_str_t   *pfx;
+    ngx_uint_t   i;
+
+    if (clcf->bypass_stale_uri == NULL
+        || clcf->bypass_stale_uri == NGX_CONF_UNSET_PTR)
+    {
+        return 0;
+    }
+
+    pfx = clcf->bypass_stale_uri->elts;
+    for (i = 0; i < clcf->bypass_stale_uri->nelts; i++) {
+        if (ngx_http_cache_turbo_uri_prefix(&r->uri, (char *) pfx[i].data,
+                                            pfx[i].len))
+        {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+
 /*
  * Config-driven cookie lookup for cache_turbo_key_cookie: find NAME's value
  * across EVERY Cookie header (same all-headers scan and first-occurrence-wins
@@ -5300,6 +5342,61 @@ ngx_http_cache_turbo_access_prologue(ngx_http_request_t *r,
      * the body filter). Sits under the manual bypass/no_store overrides below.
      * honor_cc is auto-enabled with a preset so a plugin's own Cache-Control:
      * no-cache on an anon page self-excludes at store time. */
+    /*
+     * S232-BYPASS-STALE: an opted-in URI bypasses the LOOKUP exactly like the
+     * arm below -- a stored breaker-only copy must never answer a normal
+     * request -- but takes its own arm so capture is NOT vetoed, leaving a body
+     * for the breaker to fall back on. Checked FIRST: this directive is the
+     * operator naming these URIs explicitly, so it wins over an auto-classify
+     * heuristic that would otherwise silently drop the fallback. It does NOT
+     * override a manual cache_turbo_bypass predicate -- that check runs later
+     * and still returns DECLINED without capture, so an operator's explicit
+     * "never cache this" is never reinterpreted by this directive.
+     */
+    if (ngx_http_cache_turbo_bypass_stale_uri_match(r, clcf)) {
+        ctx->brk_only = 1;
+
+        /*
+         * OPEN => fall through instead of declining, the same shape as the
+         * request-revalidate gate below (see its comment for why falling
+         * through is the whole mechanism rather than a shortcut). Declining
+         * unconditionally here is what the first revision did, and it made the
+         * feature inert: the breaker ARMS from the expired-entry site inside
+         * the lookup, so a request that never reaches the lookup arms nothing
+         * and the gate has no fallback to serve -- the stored copy existed and
+         * the client still got the breaker's 503.
+         *
+         * Falling through is safe precisely because the stored blob carries
+         * BLOBF_BREAKER_ONLY: the lookup may now find it, but the enforcement
+         * in ngx_http_cache_turbo_serve() refuses it on every path except the
+         * breaker's own STALE-BREAKER serve. So an OPEN breaker gets the
+         * fallback while a normal hit still cannot happen.
+         *
+         * CLOSED (or breaker disabled) keeps the plain bypass: decline to the
+         * origin without a lookup, which is the pre-existing behaviour for
+         * these URLs and what the CLOSED-breaker negative control pins.
+         */
+        if (ngx_http_cache_turbo_breaker_should_consult(clcf)
+            && ngx_http_cache_turbo_brk_state(z->sh->breaker_state)
+                   == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN)
+        {
+            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                           "cache_turbo: bypass-stale \"%V\" + breaker OPEN "
+                           "-> lookup for a breaker-only fallback", &r->uri);
+
+        } else {
+            /* Engaged: unlike the auto_skip arm we DO store, so a stacked
+             * native cache must keep deferring to us on this URL. */
+            ctx->status = NGX_HTTP_CACHE_TURBO_ST_BYPASS;
+            (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
+            (void) ngx_atomic_fetch_add(&z->sh->bypasses, 1);
+            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                           "cache_turbo: bypass-stale \"%V\" -> origin "
+                           "(breaker-only store)", &r->uri);
+            return NGX_DECLINED;
+        }
+    }
+
     if ((NGX_HTTP_CACHE_TURBO_HAS_BACKEND(clcf->backend_presets)
          && ngx_http_cache_turbo_auto_skip(r, clcf))
         || ngx_http_cache_turbo_bypass_uri_match(r, clcf))
@@ -5759,7 +5856,30 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
             }
         }
 
-        if (now < fresh_until && fresh_ok) {
+        /*
+         * S232-BYPASS-STALE: a breaker-only entry is never a HIT, at any age.
+         * Only a request that fell through the bypass-stale arm above (i.e.
+         * the breaker is OPEN) gets here at all, and what it needs is the
+         * fallback ARMED, not served -- so skip the fresh/stale serve arms
+         * entirely and let the expired-entry arming site below pick this entry
+         * up, exactly as it would an aged-out one.
+         *
+         * Without this the fresh arm calls serve(), the BLOBF_BREAKER_ONLY
+         * guard there correctly refuses it, and the request goes to the dead
+         * origin having armed NOTHING -- the stored copy exists and the client
+         * still gets a 503. The guard is the backstop; this is the path.
+         *
+         * Deliberately keyed on ctx->brk_only (this request opted in) rather
+         * than on the stored blob's bit: an ordinary entry must keep its
+         * normal fresh-HIT behaviour even in a location that names other
+         * prefixes, which the scope negative control pins.
+         */
+        if (ctx->brk_only) {
+            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                           "cache_turbo: bypass-stale \"%V\" -> arm only, "
+                           "never a hit", &r->uri);
+
+        } else if (now < fresh_until && fresh_ok) {
             /* PERF-7 fresh hit: serve the blob DIRECTLY out of shm (zero-copy).
              * Pin it with a reference under the mutex we already hold; the serve
              * path registers a pool cleanup that drops the ref once the response
@@ -5786,7 +5906,10 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                                               NULL);
         }
 
-        if ((stale_until == 0 || now < stale_until) && ctn->len > 0 && stale_ok) {
+        if (!ctx->brk_only
+            && (stale_until == 0 || now < stale_until) && ctn->len > 0
+            && stale_ok)
+        {
             /* stale-but-serveable. The `len > 0` guard skips a cold-miss
              * single-flight STUB (v10: data == NULL, len == 0, stale_until == 0)
              * — a stub is an in-flight marker, never serveable; it falls through
@@ -8030,7 +8153,12 @@ ngx_http_cache_turbo_serve(ngx_http_request_t *r, u_char *copy, size_t len,
     ngx_chain_t                       out;
     ngx_http_cache_turbo_ctx_t       *ctx;
     ngx_pool_cleanup_t               *cln;
-    ngx_http_cache_turbo_blob_cln_t  *cc;
+    /* S232-BYPASS-STALE: initialised because the breaker-only guard below
+     * disarms this cleanup, and it reads `cc` under the same `ref_data != NULL`
+     * condition that assigns it. gcc at -O1 cannot prove the two conditions
+     * coincide and rejects the read under -Werror=maybe-uninitialized (-O0
+     * builds do not warn, so this surfaces only in the sanitizer job). */
+    ngx_http_cache_turbo_blob_cln_t  *cc = NULL;
 
     /* PERF-7: arm the reference drop FIRST, before any early return below, so the
      * acquired ref is released exactly once on every exit path (the cleanup fires
@@ -8048,6 +8176,53 @@ ngx_http_cache_turbo_serve(ngx_http_request_t *r, u_char *copy, size_t len,
         cc = cln->data;
         cc->z = z;
         cc->data = ref_data;
+    }
+
+    /*
+     * S232-BYPASS-STALE: enforce BLOBF_BREAKER_ONLY at the ONE chokepoint every
+     * serve passes through, rather than at each call site. A blob stamped
+     * breaker-only may leave this function only as the breaker's fallback; on
+     * any other path it is not a response, and we return NGX_DECLINED so the
+     * caller proceeds to the origin exactly as if nothing were cached.
+     *
+     * ⚠ Placed here and keyed on the BLOB'S OWN BIT deliberately. The call
+     * sites are numerous (L1 hit, L2 fill, stale-while-revalidate, SIE, cold
+     * wait) and more get added; a per-site check would silently fail open the
+     * day someone adds the tenth one, and the failure mode is a cross-user
+     * disclosure on precisely the URLs an operator had excluded from the cache.
+     * Fail CLOSED: the allowance is the narrow, explicit "STALE-BREAKER"
+     * reason, so a new call site is refused until it opts in on purpose.
+     *
+     * The read is bounded by the same 44-byte header check blob_validate()
+     * applies; a buffer too short to hold the header cannot be served at all,
+     * so treat it as not-permitted rather than reading past it. The NULL check
+     * is load-bearing, not defensive noise: this runs BEFORE restore_response()
+     * (which is where a NULL copy used to be caught first), so without it a
+     * caller passing copy == NULL faults here instead -- clang-analyzer
+     * core.NullDereference flagged exactly that path.
+     */
+    if (copy != NULL && len >= NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE) {
+        if ((ngx_http_cache_turbo_get_u16(copy + 6)
+             & NGX_HTTP_CACHE_TURBO_BLOBF_BREAKER_ONLY)
+            && (xcache == NULL || ngx_strcmp(xcache, "STALE-BREAKER") != 0))
+        {
+            if (ref_data != NULL && cc != NULL) {
+                /* The cleanup registered above owns the ref; disarm it and drop
+                 * the reference now, the same way the breaker gate releases a
+                 * fallback nothing will consume (a pool cleanup cannot be
+                 * unregistered, so clearing its payload is how one is voided).
+                 * `cc != NULL` is implied by ref_data != NULL (the block above
+                 * assigns both or returns), and is tested anyway so the
+                 * initialiser cannot silently turn a future divergence into a
+                 * NULL deref here. */
+                cc->data = NULL;
+                ngx_http_cache_turbo_blob_release(z, ref_data);
+            }
+            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                           "cache_turbo: breaker-only entry \"%V\" refused on "
+                           "the normal path -> origin", &r->uri);
+            return NGX_DECLINED;
+        }
     }
 
     ctx = ngx_http_get_module_ctx(r, ngx_http_cache_turbo_module);
@@ -9621,6 +9796,14 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
             bhw.fresh_ttl = (uint32_t) (ttl > 0 ? ttl : 0);
             bhw.stale_ttl = (uint32_t) stale_window;
             bhw.sie_ttl = (uint32_t) sie_window;   /* CTB4 (RFC-2 SIE) */
+            /* S232-BYPASS-STALE: stamp breaker-only on an opted-in URI's blob.
+             * ⚠ Assigned unconditionally (bhw is an uninitialised stack struct
+             * populated field-by-field) -- an unset flags here would stamp
+             * stack garbage, and a stray BLOBF_BREAKER_ONLY would make an
+             * ordinary entry unserveable while a MISSING one would publish a
+             * breaker-only body to the normal hit path. */
+            bhw.flags = ctx->brk_only
+                        ? NGX_HTTP_CACHE_TURBO_BLOBF_BREAKER_ONLY : 0;
             ngx_http_cache_turbo_blob_hdr_write(blob, &bhw);
 
             /* The L2 retention window, used for the object key AND for every L2
@@ -14012,6 +14195,46 @@ ngx_http_cache_turbo_bypass_uri(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 }
 
 
+/* S232-BYPASS-STALE: cache_turbo_bypass_stale_uri <prefix>... -- same parsing
+ * and same segment-boundary matcher as cache_turbo_bypass_uri above, but the
+ * effect is the opposite: these prefixes are STORED (as breaker-only fallback)
+ * rather than skipped. See the bypass_stale_uri field comment in module.h for
+ * why this is a separate directive instead of a flag on the bypass rules. */
+static char *
+ngx_http_cache_turbo_bypass_stale_uri(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf)
+{
+    ngx_http_cache_turbo_loc_conf_t  *clcf = conf;
+    ngx_str_t                        *value, *s;
+    ngx_uint_t                        i;
+
+    if (clcf->bypass_stale_uri == NGX_CONF_UNSET_PTR) {
+        clcf->bypass_stale_uri = ngx_array_create(cf->pool, 4,
+                                                  sizeof(ngx_str_t));
+        if (clcf->bypass_stale_uri == NULL) {
+            return NGX_CONF_ERROR;
+        }
+    }
+
+    value = cf->args->elts;
+    for (i = 1; i < cf->args->nelts; i++) {
+        if (value[i].len == 0 || value[i].data[0] != '/') {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                "cache_turbo_bypass_stale_uri prefix \"%V\" must begin "
+                "with \"/\"", &value[i]);
+            return NGX_CONF_ERROR;
+        }
+        s = ngx_array_push(clcf->bypass_stale_uri);
+        if (s == NULL) {
+            return NGX_CONF_ERROR;
+        }
+        *s = value[i];
+    }
+
+    return NGX_CONF_OK;
+}
+
+
 /* cache_turbo_key_cookie name...  — DIY equivalent of a preset key cookie. The
  * VALUE of each named cookie is folded into the cache key (tier-3 value-keying)
  * so segment variants get their own entries instead of bypassing. EXACT name
@@ -14111,6 +14334,7 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->bypass = NGX_CONF_UNSET_PTR;
     conf->no_store = NGX_CONF_UNSET_PTR;
     conf->bypass_uri = NGX_CONF_UNSET_PTR;
+    conf->bypass_stale_uri = NGX_CONF_UNSET_PTR;
     conf->key_cookies = NGX_CONF_UNSET_PTR;
     conf->backend_prefix = NGX_CONF_UNSET_PTR;
 #if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
@@ -14615,6 +14839,9 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
      * — matching how the append happens within a level, not across). */
     if (conf->bypass_uri == NGX_CONF_UNSET_PTR) {
         conf->bypass_uri = prev->bypass_uri;
+    }
+    if (conf->bypass_stale_uri == NGX_CONF_UNSET_PTR) {
+        conf->bypass_stale_uri = prev->bypass_stale_uri;
     }
     if (conf->backend_prefix == NGX_CONF_UNSET_PTR) {
         conf->backend_prefix = prev->backend_prefix;

@@ -1307,6 +1307,36 @@ typedef struct {
     ngx_array_t             *bypass_uri;
     ngx_array_t             *key_cookies;
 
+    /*
+     * S232-BYPASS-STALE (cache_turbo_bypass_stale_uri): array of ngx_str_t URI
+     * prefixes whose responses are stored ONLY as circuit-breaker fallback --
+     * matched by the same segment-boundary ngx_http_cache_turbo_uri_prefix()
+     * as bypass_uri, for the same subdirectory-install reason.
+     *
+     * The problem this solves: a bypassed URL skips the lookup AND vetoes
+     * capture, so when the origin dies the breaker has nothing to serve and the
+     * client gets a 503. That is the correct PRIVACY default and is NOT relaxed
+     * here.
+     *
+     * ⚠ Deliberately INDEPENDENT of bypass / bypass_uri rather than a flag on
+     * them. An operator's bypass rules mean "never cache this", and they cover
+     * per-user surfaces (cart, checkout, my-account). A knob that reinterpreted
+     * those existing rules as cacheable-during-an-outage would silently turn
+     * every one of them into a cross-user disclosure, precisely during an
+     * incident when nobody is reading logs. So eligibility is never inherited:
+     * the operator names the URIs here, explicitly, and a cookie-bypassed
+     * request never becomes eligible by matching some other rule.
+     *
+     * The stored entry carries BLOBF_BREAKER_ONLY, so it is unreachable on the
+     * normal hit path at ANY age -- only the pre-origin breaker gate can serve
+     * it, and only while the breaker is OPEN. Point these at surfaces that are
+     * shared by construction (a public catalog/inventory API), never at an
+     * authenticated per-user response: the breaker serves ONE stored body to
+     * every client, so a per-user body here IS a cross-user leak.
+     *
+     * NGX_CONF_UNSET_PTR until set. */
+    ngx_array_t             *bypass_stale_uri;
+
     /* cache_turbo_backend_prefix: mount point of a subdirectory install, e.g.
      * "/shop/" for a WordPress served from https://example.com/shop/. Preset
      * uris[] rules are literals anchored at byte 0 ("/wp-admin/"), so without
@@ -1707,6 +1737,11 @@ typedef struct {
                                            * $cache_turbo_active var reads 1     */
     unsigned                 auto_skip:1; /* auto-classify ruled this request
                                            * dynamic -> origin, never capture    */
+    /* S232-BYPASS-STALE: r->uri matched cache_turbo_bypass_stale_uri. Bypasses
+     * the LOOKUP like auto_skip (the stored copy must never answer a normal
+     * request) but deliberately does NOT veto capture, so a breaker-only
+     * fallback body exists. Sets BLOBF_BREAKER_ONLY on the stored blob. */
+    unsigned                 brk_only:1;
     unsigned                 captured:1;  /* response captured for store    */
     unsigned                 served:1;    /* we served from cache           */
     unsigned                 stale_hit:1; /* served stale (for X-Cache)      */
@@ -2072,8 +2107,15 @@ typedef struct {
  * Wire offsets (little-endian):
  *   0  u32 magic     ("CTB4")    16  u32 headers_len   32  u32 fresh_ttl
  *   4  u16 version   (= 4)       20  u32 body_len      36  u32 stale_ttl
- *   6  u16 flags     (reserved)  24  i64 created       40  u32 sie_ttl
+ *   6  u16 flags     (BLOBF_*)   24  i64 created       40  u32 sie_ttl
  *   8  u32 status    12 u32 nheaders                   44  = header size
+ *
+ * S232-BYPASS-STALE: the u16 at offset 6 was reserved-and-always-0; it now
+ * carries BLOBF_* bits. This is NOT a wire-layout change (the field was already
+ * in the 44-byte header, already written as 0 and already skipped by every
+ * reader), so magic/version are deliberately NOT bumped and no keyspace
+ * turnover happens -- see the NOTE on BLOB_VERSION below for that rule. An old
+ * CTB4 blob reads back flags = 0, which is exactly "no bits set".
  */
 typedef struct {
     uint32_t                 magic;       /* 0x43544234 = "CTB4"            */
@@ -2086,7 +2128,25 @@ typedef struct {
     uint32_t                 fresh_ttl;   /* freshness seconds from created  */
     uint32_t                 stale_ttl;   /* total serveable window (>=fresh) */
     uint32_t                 sie_ttl;     /* abs serve-on-error window; 0=none */
+    uint32_t                 flags;       /* BLOBF_* bits (wire u16 at off 6) */
 } ngx_http_cache_turbo_blob_hdr_t;
+
+/*
+ * S232-BYPASS-STALE: this entry may ONLY be served by the pre-origin circuit
+ * breaker gate, while the breaker is OPEN. It is permanently unreachable on the
+ * normal hit path regardless of its age or TTLs -- the same "stored but only
+ * the breaker can serve it" property an EXPIRED entry has (module.c, the L1
+ * breaker-arm site), except it holds from the moment of the store rather than
+ * being reached by ageing out.
+ *
+ * ⚠ This bit is the ENTIRE safety argument for cache_turbo_bypass_stale_uri.
+ * The URIs an operator opts in are ones they had otherwise excluded from the
+ * cache; storing them is only acceptable because nothing on the normal path can
+ * reach the stored copy. Any code that serves a blob WITHOUT consulting this
+ * bit reintroduces a cross-user disclosure on exactly those URIs. Grep for
+ * BLOBF_BREAKER_ONLY before adding a new serve site.
+ */
+#define NGX_HTTP_CACHE_TURBO_BLOBF_BREAKER_ONLY  0x0001
 
 /*
  * S231-PERF-HDRWALK: one parsed TLV header entry, as produced by the single
