@@ -43,6 +43,12 @@
  * treated as a completed purge. */
 #define NGX_HTTP_CACHE_TURBO_REDIS_SCAN_MAX_PAGES  (1024 * 1024)
 
+/* Cap recursion/nesting so a buggy/hostile server can't blow the stack (or the
+ * resume stack below) with deeply nested arrays. Replies to the commands we
+ * issue nest at most 2 deep (SCAN). Sizes op->frame_stack, so it must be
+ * defined before the op struct. */
+#define NGX_HTTP_CACHE_TURBO_REDIS_FRAME_MAX_DEPTH  8
+
 
 /*
  * One in-flight async redis operation. It owns its own pool so a fire-and-
@@ -98,6 +104,23 @@ typedef struct {
     u_char                      *rbuf;     /* GET/SMEMBERS: growable reply buf */
     size_t                       rcap;
     size_t                       rlen;
+
+    /* S231-L2-FRAMEQUAD: resume state for the iterative
+     * ngx_http_cache_turbo_redis_frame_scan() walk, so a dribbled large array
+     * is framed in ONE pass across many fill() calls instead of being
+     * re-walked from byte 0 every time. frame_off is a BYTE OFFSET (not a
+     * pointer) into op->rbuf: fill() may ngx_pnalloc() a bigger buffer and
+     * memcpy the old bytes to the same relative position on grow, so an
+     * offset survives that where a raw pointer would dangle. frame_remain[d]
+     * is the element count still outstanding at nesting depth d (index 0 =
+     * outermost array); frame_depth is the current stack height (0 = not
+     * inside any array). Both are reset to 0 whenever rbuf/rlen are reset for
+     * a new command (op init, and the SCAN per-page reset in read_scan) --
+     * resuming into a buffer that no longer holds the same bytes is a
+     * correctness bug, not just a stale-cache inefficiency. */
+    size_t                       frame_off;
+    ngx_uint_t                   frame_remain[NGX_HTTP_CACHE_TURBO_REDIS_FRAME_MAX_DEPTH];
+    ngx_uint_t                   frame_depth;
 
     /* AUD-SCAN1: pool the reply buffer (and, on the SCAN walk, everything else
      * that only has to live for one page) is allocated from. It is op->pool for
@@ -2442,11 +2465,6 @@ ngx_http_cache_turbo_redis_read_get(ngx_event_t *rev)
 }
 
 
-/* Cap recursion so a buggy/hostile server can't blow the stack with deeply
- * nested arrays. Replies to the commands we issue nest at most 2 deep (SCAN). */
-#define NGX_HTTP_CACHE_TURBO_REDIS_FRAME_MAX_DEPTH  8
-
-
 /*
  * Scan exactly ONE complete RESP reply in [p, end) WITHOUT allocating or
  * interpreting the payload, recursing into arrays. On NGX_OK *next points one
@@ -2537,6 +2555,180 @@ ngx_http_cache_turbo_redis_frame(u_char *p, u_char *end, ngx_uint_t depth,
     default:
         return NGX_DECLINED;
     }
+}
+
+
+/*
+ * Frame a top-level array reply (SMEMBERS / SCAN), same acceptance set and
+ * same *next contract as ngx_http_cache_turbo_redis_frame(NULL depth 0), but
+ * resumable across fill() calls via op->frame_off / frame_remain / frame_depth
+ * so a dribbled large array is framed in ONE linear pass instead of being
+ * re-walked from op->rbuf on every partial fill (S231-L2-FRAMEQUAD).
+ *
+ * Contract (part 1 of the required proof -- NOT stricter than frame()):
+ *   - accepts exactly the byte sequences frame() accepts: same RESP grammar,
+ *     same MAX_REPLY / MAX_MEMBERS / MAX_DEPTH ceilings, same '*'-only
+ *     entrypoint (the GET reply path keeps using plain frame(), unchanged).
+ *   - same return values: NGX_OK with *next one byte past the reply,
+ *     NGX_AGAIN on a short buffer, NGX_DECLINED on malformed/too-deep/oversize.
+ *   - same mutations: this function and frame() are both read-only over
+ *     [rbuf, rbuf+rlen) -- neither touches the bytes. The only new mutation is
+ *     to op->frame_off/frame_remain/frame_depth, which are pure resume state
+ *     private to this op and read by no one else.
+ *   - a resumed walk is byte-for-byte the SAME walk a fresh frame() call
+ *     would perform on the same final buffer: every element this function
+ *     confirms complete is one frame() would also confirm complete at the
+ *     same offset, because the header/type-byte/length checks it runs when
+ *     first entering an element are identical to frame()'s, just run once
+ *     instead of once per fill() iteration.
+ *
+ * Iterative, not recursive, because a recursive call cannot resume mid-stack
+ * without unwinding through frames that no longer exist across separate
+ * event-loop re-entries into read_smembers/read_scan. frame_remain[d] holds
+ * the element count still outstanding at nesting depth d (element index, not
+ * byte offset); frame_off is the byte offset of the next unconfirmed element.
+ * Nested arrays (SCAN's replies are flat; this exists only so a hostile/odd
+ * server that nests one level deeper is still framed correctly, capped as
+ * before by FRAME_MAX_DEPTH) push a new frame_remain[] entry.
+ */
+static ngx_int_t
+ngx_http_cache_turbo_redis_frame_scan(ngx_http_cache_turbo_redis_op_t *op,
+    u_char **next)
+{
+    u_char     *p, *end, *crlf;
+    ngx_int_t   v, rc;
+
+    end = op->rbuf + op->rlen;
+
+    /* Fresh walk (frame_depth == 0 means "not currently inside an array"):
+     * parse the top-level element exactly like frame() would. It must be an
+     * array ('*') for the resumable path -- SCAN/SMEMBERS replies are always
+     * arrays; anything else is handed to plain frame() by the caller-side
+     * convention (both callers only ever hit this on the '*' reply). */
+    if (op->frame_depth == 0 && op->frame_off == 0) {
+        p = op->rbuf;
+        if (p >= end) {
+            return NGX_AGAIN;
+        }
+        if (*p != '*') {
+            return NGX_DECLINED;
+        }
+        crlf = ngx_strlchr(p + 1, end, CR);
+        if (crlf == NULL || crlf + 1 >= end || crlf[1] != LF) {
+            return NGX_AGAIN;
+        }
+        rc = ngx_http_cache_turbo_redis_resp_len(p + 1, crlf - (p + 1), &v);
+        if (rc == NGX_ERROR) {
+            return NGX_DECLINED;
+        }
+        p = crlf + 2;
+        if (rc == NGX_DONE) {              /* *-1 nil array: no elements */
+            *next = p;
+            return NGX_OK;
+        }
+        if (v > NGX_HTTP_CACHE_TURBO_REDIS_MAX_MEMBERS) {
+            return NGX_DECLINED;
+        }
+        op->frame_remain[0] = (ngx_uint_t) v;
+        op->frame_depth = 1;
+        op->frame_off = (size_t) (p - op->rbuf);
+    }
+
+    p = op->rbuf + op->frame_off;
+
+    /* Drain elements at the current depth, descending into nested arrays and
+     * popping back up when one completes. Every element this loop confirms
+     * advances frame_off permanently -- a later call re-enters at exactly
+     * this p, never earlier, so already-confirmed elements are never
+     * re-parsed. */
+    while (op->frame_depth > 0) {
+        ngx_uint_t  d = op->frame_depth - 1;
+
+        if (op->frame_remain[d] == 0) {
+            op->frame_depth--;
+            op->frame_off = (size_t) (p - op->rbuf);
+            continue;
+        }
+
+        if (p >= end) {
+            op->frame_off = (size_t) (p - op->rbuf);
+            return NGX_AGAIN;
+        }
+
+        switch (*p) {
+
+        case '+':
+        case '-':
+        case ':':
+            crlf = ngx_strlchr(p + 1, end, CR);
+            if (crlf == NULL || crlf + 1 >= end || crlf[1] != LF) {
+                op->frame_off = (size_t) (p - op->rbuf);
+                return NGX_AGAIN;
+            }
+            p = crlf + 2;
+            op->frame_remain[d]--;
+            break;
+
+        case '$':
+            crlf = ngx_strlchr(p + 1, end, CR);
+            if (crlf == NULL || crlf + 1 >= end || crlf[1] != LF) {
+                op->frame_off = (size_t) (p - op->rbuf);
+                return NGX_AGAIN;
+            }
+            rc = ngx_http_cache_turbo_redis_resp_len(p + 1, crlf - (p + 1), &v);
+            if (rc == NGX_ERROR) {
+                return NGX_DECLINED;
+            }
+            if (rc == NGX_DONE) {          /* $-1 nil element */
+                p = crlf + 2;
+                op->frame_remain[d]--;
+                break;
+            }
+            if (v > NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY) {
+                return NGX_DECLINED;
+            }
+            if (end - (crlf + 2) < v + 2) {
+                op->frame_off = (size_t) (p - op->rbuf);
+                return NGX_AGAIN;
+            }
+            p = crlf + 2 + v + 2;
+            op->frame_remain[d]--;
+            break;
+
+        case '*':
+            if (op->frame_depth >= NGX_HTTP_CACHE_TURBO_REDIS_FRAME_MAX_DEPTH) {
+                return NGX_DECLINED;
+            }
+            crlf = ngx_strlchr(p + 1, end, CR);
+            if (crlf == NULL || crlf + 1 >= end || crlf[1] != LF) {
+                op->frame_off = (size_t) (p - op->rbuf);
+                return NGX_AGAIN;
+            }
+            rc = ngx_http_cache_turbo_redis_resp_len(p + 1, crlf - (p + 1), &v);
+            if (rc == NGX_ERROR) {
+                return NGX_DECLINED;
+            }
+            p = crlf + 2;
+            op->frame_remain[d]--;         /* the nested array itself counts
+                                             * as ONE element of its parent */
+            if (rc == NGX_DONE || v == 0) { /* *-1 or *0: no children to push */
+                break;
+            }
+            if (v > NGX_HTTP_CACHE_TURBO_REDIS_MAX_MEMBERS) {
+                return NGX_DECLINED;
+            }
+            op->frame_remain[op->frame_depth] = (ngx_uint_t) v;
+            op->frame_depth++;
+            break;
+
+        default:
+            return NGX_DECLINED;
+        }
+    }
+
+    op->frame_off = (size_t) (p - op->rbuf);
+    *next = p;
+    return NGX_OK;
 }
 
 
@@ -2677,9 +2869,11 @@ ngx_http_cache_turbo_redis_read_smembers(ngx_event_t *rev)
 
         /* STAB-3: confirm the ENTIRE array reply is buffered before the single
          * alloc+parse pass, so a reply split across recvs no longer re-allocs
-         * the members array (and re-walks it) on every partial fill. */
-        rc = ngx_http_cache_turbo_redis_frame(op->rbuf, op->rbuf + op->rlen,
-                                              0, &next);
+         * the members array. S231-L2-FRAMEQUAD: frame_scan() also stops the
+         * FRAMING itself re-walking already-confirmed elements on every
+         * partial fill (STAB-3 only fixed the alloc+parse re-walk) -- it
+         * resumes from op->frame_off/frame_remain instead of op->rbuf. */
+        rc = ngx_http_cache_turbo_redis_frame_scan(op, &next);
         if (rc == NGX_AGAIN) {
             continue;                      /* read more before parsing */
         }
@@ -2899,9 +3093,11 @@ ngx_http_cache_turbo_redis_read_scan(ngx_event_t *rev)
 
         /* STAB-3: frame the whole [cursor, keys] page before parsing, so a
          * SCAN reply split across recvs doesn't re-alloc the keys array each
-         * partial fill. */
-        rc = ngx_http_cache_turbo_redis_frame(op->rbuf, op->rbuf + op->rlen,
-                                              0, &next);
+         * partial fill. S231-L2-FRAMEQUAD: frame_scan() resumes framing from
+         * op->frame_off/frame_remain instead of re-walking op->rbuf from
+         * byte 0 on every partial fill within one page (per-page reset in
+         * the cursor-rebuild block below keeps this correct across pages). */
+        rc = ngx_http_cache_turbo_redis_frame_scan(op, &next);
         if (rc == NGX_AGAIN) {
             continue;                      /* read more before parsing */
         }
@@ -2991,6 +3187,15 @@ ngx_http_cache_turbo_redis_read_scan(ngx_event_t *rev)
         op->rbuf = rbuf;
         op->rcap = ngx_pagesize * 4;       /* fresh page: drop any grown cap */
         op->rlen = 0;
+        /* S231-L2-FRAMEQUAD part 4: frame_off/frame_remain/frame_depth are
+         * resume state indexed into the OLD op->rbuf being replaced right
+         * here. Carrying them forward would resume the next page's frame
+         * walk at a byte offset and element-remaining count that belong to a
+         * buffer this SCAN page never even wrote -- reset before the new
+         * page's first fill() so read_scan's next frame_scan() call starts a
+         * fresh walk exactly like a brand-new op would. */
+        op->frame_off = 0;
+        op->frame_depth = 0;
         ngx_destroy_pool(old);
 
         ngx_post_event(c->write, &ngx_posted_events);

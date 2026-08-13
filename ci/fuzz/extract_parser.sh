@@ -8,11 +8,15 @@
 #   ngx_http_cache_turbo_redis_parse_scan()   - SCAN [cursor, keys] 2-tuple
 #
 #   ngx_http_cache_turbo_redis_frame()        - STAB-3 pre-framer (recursive)
+#   ngx_http_cache_turbo_redis_frame_scan()   - S231-L2-FRAMEQUAD resumable framer
 #
 # plus the MAX_MEMBERS #define that sits among them (FRAME_MAX_DEPTH comes from
 # ngx_shim.h instead — see the awk rule below). They are captured in source order. _frame() is directly recursive, so the .inc emits a
 # forward declaration for it ahead of the bodies; the other three call nothing
-# but _resp_len(), which precedes them in source order.
+# but _resp_len(), which precedes them in source order. _frame_scan() calls
+# neither of the other two -- it is a standalone iterative walk over the op's
+# resume state -- but is captured for the same reason: fuzz production code
+# with no hand-copy.
 #
 # This keeps the fuzz target locked to production code: there is no hand-copied
 # parser. If a signature or body changes upstream, the next fuzz build picks it
@@ -82,7 +86,7 @@ awk '
         next
     }
     /^static ngx_int_t$/ { pending = 1; buf = $0 ORS; next }
-    pending && /^ngx_http_cache_turbo_redis_(parse(_array|_scan)?|resp_len|frame)\(/ {
+    pending && /^ngx_http_cache_turbo_redis_(parse(_array|_scan)?|resp_len|frame|frame_scan)\(/ {
         capture = 1; pending = 0; printf "%s", buf; print; next
     }
     pending { pending = 0; buf = "" }
@@ -98,7 +102,8 @@ for fn in \
     'ngx_http_cache_turbo_redis_parse(' \
     'ngx_http_cache_turbo_redis_parse_array(' \
     'ngx_http_cache_turbo_redis_parse_scan(' \
-    'ngx_http_cache_turbo_redis_frame('
+    'ngx_http_cache_turbo_redis_frame(' \
+    'ngx_http_cache_turbo_redis_frame_scan('
 do
     # Anchored at column 0: this matches the DEFINITION line only. A bare -F
     # match would also hit the forward declaration this script emits for
@@ -117,4 +122,4 @@ if [ "$(tail -n1 "$OUT")" != "}" ]; then
 fi
 
 LINES=$(wc -l < "$OUT")
-echo "✓ extracted redis_parse() + _parse_array() + _parse_scan() + _frame() — $LINES lines -> $OUT"
+echo "✓ extracted redis_parse() + _parse_array() + _parse_scan() + _frame() + _frame_scan() — $LINES lines -> $OUT"

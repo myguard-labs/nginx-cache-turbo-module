@@ -139,6 +139,12 @@ typedef struct {
     size_t      rlen;
     ngx_pool_t *pool;
     ngx_pool_t *rpool;
+
+    /* S231-L2-FRAMEQUAD resume state for _frame_scan(). See the shipped op
+     * struct in src/ngx_http_cache_turbo_redis.c for the field contract. */
+    size_t      frame_off;
+    ngx_uint_t  frame_remain[NGX_HTTP_CACHE_TURBO_REDIS_FRAME_MAX_DEPTH];
+    ngx_uint_t  frame_depth;
 } ngx_http_cache_turbo_redis_op_t;
 
 /* --- verbatim from nginx src/core/ngx_string.h --- */
