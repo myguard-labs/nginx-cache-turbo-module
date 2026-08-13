@@ -825,6 +825,14 @@ ngx_http_cache_turbo_blob_hdr_write(u_char *dst,
 }
 
 
+/* Forward-declared so blob_validate() below can drive the same TLV iterator
+ * it used to only be mirrored by; see the S231-PERF-HDRWALK comment on
+ * ngx_http_cache_turbo_blob_next_header()'s definition further down. */
+static ngx_int_t ngx_http_cache_turbo_blob_next_header(const u_char **pp,
+    const u_char *end, const u_char **name, uint32_t *nlen,
+    const u_char **val, uint32_t *vlen);
+
+
 /*
  * Parse AND fully validate a stored blob in one place (STAB-4). On NGX_OK *out
  * holds the parsed header and (when non-NULL) *hdr_block / *body point at the
@@ -834,14 +842,30 @@ ngx_http_cache_turbo_blob_hdr_write(u_char *dst,
  * lets the L2-fill path reject a malformed blob BEFORE inserting it into L1 —
  * the old code stored first and only failed later in serve(), poisoning the L1
  * slot with a node that could never be served.
+ *
+ * S231-PERF-HDRWALK: when `pool` and `refs_out` are both non-NULL, the SAME
+ * walk that validates each TLV entry's framing also records its four decoded
+ * fields (name/nlen/val/vlen) into a pool-allocated array of *out->nheaders
+ * ngx_http_cache_turbo_blob_href_t, written to *refs_out. A caller that only
+ * needs framing validation (the L2-fill decide-and-store path, the fuzz
+ * harness) passes pool == NULL and gets the original walk with no allocation.
+ * ngx_http_cache_turbo_restore_response() passes r->pool and consumes the
+ * array directly instead of re-walking the same bytes with
+ * ngx_http_cache_turbo_blob_next_header() a second time — one walk, one set
+ * of bounds checks, for every HIT. The array is bounded by nheaders, which is
+ * itself bounded by headers_len <= len (each TLV entry costs >= 8 bytes), so
+ * its size never exceeds len/8 pointers -- the same blob-size ceiling
+ * (cache_turbo_max_object) that already bounds everything else here.
  */
 static ngx_int_t
 ngx_http_cache_turbo_blob_validate(const u_char *blob, size_t len,
     ngx_http_cache_turbo_blob_hdr_t *out, const u_char **hdr_block,
-    const u_char **body)
+    const u_char **body, ngx_pool_t *pool,
+    ngx_http_cache_turbo_blob_href_t **refs_out)
 {
-    const u_char  *p, *end;
-    uint32_t       i;
+    const u_char                      *p, *end;
+    uint32_t                           i;
+    ngx_http_cache_turbo_blob_href_t  *refs = NULL;
 
     if (blob == NULL || len < NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE) {
         return NGX_ERROR;
@@ -914,24 +938,65 @@ ngx_http_cache_turbo_blob_validate(const u_char *blob, size_t len,
         return NGX_ERROR;
     }
 
+    /* S231-PERF-HDRWALK: reject an nheaders that cannot possibly fit BEFORE
+     * sizing the refs allocation below on it. Every TLV entry costs at least
+     * 8 bytes (u32 name_len + u32 val_len, both possibly zero-length), so a
+     * genuine blob never claims more than headers_len/8 entries; the walk
+     * below would reject such a blob anyway (the first `end - p < 4/8` check
+     * fails), but that rejection happens AFTER the allocation this bound now
+     * guards. Without it a forged nheaders (e.g. 0xFFFFFFFF) on a tiny blob
+     * would size a multi-GB pool allocation purely from an unvalidated wire
+     * field -- not a size_t overflow (nheaders is u32, sizeof(href) is small,
+     * the product fits in 64-bit size_t), but a self-inflicted allocation-size
+     * DoS this validator exists to prevent. */
+    if (out->nheaders > out->headers_len / 8) {
+        return NGX_ERROR;
+    }
+
     p   = blob + NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE;
     end = p + out->headers_len;
 
-    for (i = 0; i < out->nheaders; i++) {
-        uint32_t  nl, vl;
+    /* Allocate the refs array (if requested) BEFORE the walk so each
+     * iteration below can record straight into it -- one walk, not a
+     * validate-pass followed by a separate fill-pass. nheaders is now bounded
+     * by headers_len/8 above, and headers_len <= len <= cache_turbo_max_object
+     * (1 MiB by default, configurable), so the allocation is bounded by the
+     * same blob-size ceiling that already bounds everything else here. A zero
+     * count allocates nothing (ngx_pnalloc(pool, 0) is never called). */
+    if (pool != NULL && refs_out != NULL && out->nheaders > 0) {
+        refs = ngx_pnalloc(pool,
+                   out->nheaders * sizeof(ngx_http_cache_turbo_blob_href_t));
+        if (refs == NULL) {
+            return NGX_ERROR;
+        }
+    }
 
-        if ((size_t) (end - p) < 4) { return NGX_ERROR; }
-        nl = ngx_http_cache_turbo_get_u32(p); p += 4;
-        if ((size_t) (end - p) < nl) { return NGX_ERROR; }
-        p += nl;
-        if ((size_t) (end - p) < 4) { return NGX_ERROR; }
-        vl = ngx_http_cache_turbo_get_u32(p); p += 4;
-        if ((size_t) (end - p) < vl) { return NGX_ERROR; }
-        p += vl;
+    for (i = 0; i < out->nheaders; i++) {
+        uint32_t       nl, vl;
+        const u_char  *name, *val;
+
+        /* AUD-FUZZ1 / S231-PERF-HDRWALK: drive the SAME iterator restore used
+         * to re-walk with, so blob_validate's bounds checks and the decoded
+         * name/value pointers can never drift from each other -- one
+         * implementation of "where does a TLV entry end", called from the
+         * one place that walks the block. */
+        if (ngx_http_cache_turbo_blob_next_header(&p, end, &name, &nl,
+                                                   &val, &vl) != NGX_OK)
+        {
+            return NGX_ERROR;
+        }
+
+        if (refs != NULL) {
+            refs[i].name = name;
+            refs[i].nlen = nl;
+            refs[i].val  = val;
+            refs[i].vlen = vl;
+        }
     }
 
     if (hdr_block) { *hdr_block = blob + NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE; }
     if (body)      { *body = end; }
+    if (pool != NULL && refs_out != NULL) { *refs_out = refs; }
     return NGX_OK;
 }
 
@@ -942,12 +1007,15 @@ ngx_http_cache_turbo_blob_validate(const u_char *blob, size_t len,
  * buffer, or NGX_DONE when the header block is exhausted or the next entry does
  * not fit (the walk stops, it never runs off `end`).
  *
- * AUD-FUZZ1: this is the ONE walk. blob_validate() above pre-walks the block to
- * reject a malformed blob before it reaches L1, restore_response() re-walks it to
- * rebuild headers_out, and ci/fuzz/fuzz_blob.c drives this exact function — so
- * the three can no longer disagree about where an entry ends. The previous
+ * AUD-FUZZ1 / S231-PERF-HDRWALK: this is the ONE walk. blob_validate() above
+ * calls this exact function to both reject a malformed blob before it reaches
+ * L1 AND (when asked) capture the decoded name/value pointers restore_response()
+ * consumes directly — so validate and restore can no longer disagree about
+ * where an entry ends, and the header region is walked once per HIT, not
+ * twice. ci/fuzz/fuzz_blob.c drives this exact function too. The previous
  * open-coded copy in restore_response() was the only reader of the blob's TLV
- * framing that nothing tested.
+ * framing that nothing tested; that copy is gone, this is the sole
+ * implementation.
  */
 static ngx_int_t
 ngx_http_cache_turbo_blob_next_header(const u_char **pp, const u_char *end,
@@ -1955,7 +2023,7 @@ ngx_http_cache_turbo_purge_request(ngx_http_request_t *r,
         {
             ngx_http_cache_turbo_blob_hdr_t  mh;
             if (ngx_http_cache_turbo_blob_validate(m->data, m->len, &mh,
-                    NULL, NULL) == NGX_OK)
+                    NULL, NULL, NULL, NULL) == NGX_OK)
             {
                 have_marker = 1;
                 bits = m->data[NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE];
@@ -5592,7 +5660,8 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
         ngx_http_cache_turbo_blob_hdr_t  bh;
 
         if (ngx_http_cache_turbo_blob_validate(ctx->l2_blob, ctx->l2_blob_len,
-                                               &bh, NULL, NULL) == NGX_OK)
+                                               &bh, NULL, NULL,
+                                               NULL, NULL) == NGX_OK)
         {
             time_t  age, rem_fresh, rem_stale;
 
@@ -6927,15 +6996,17 @@ ngx_http_cache_turbo_restore_response(ngx_http_request_t *r, u_char *copy,
     size_t len, ngx_uint_t stale, const char *xcache,
     u_char **bodyp, size_t *body_lenp)
 {
-    u_char                           *p, *end, *body;
-    size_t                            body_len;
-    ngx_http_cache_turbo_blob_hdr_t   hdr;
-    ngx_http_cache_turbo_blob_hdr_t  *bh;
-    uint32_t                          i;
-    u_char                           *etag = NULL, *lastmod = NULL;
-    size_t                            etag_len = 0, lastmod_len = 0;
-    ngx_uint_t                        dropped = 0;
-    ngx_http_cache_turbo_loc_conf_t  *clcf;
+    u_char                            *body;
+    size_t                             body_len;
+    ngx_http_cache_turbo_blob_hdr_t    hdr;
+    ngx_http_cache_turbo_blob_hdr_t   *bh;
+    uint32_t                           i;
+    u_char                            *etag = NULL, *lastmod = NULL;
+    size_t                             etag_len = 0, lastmod_len = 0;
+    ngx_uint_t                         dropped = 0;
+    ngx_http_cache_turbo_loc_conf_t   *clcf;
+    const u_char                      *body_start;
+    ngx_http_cache_turbo_blob_href_t  *refs;
 
     clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
 
@@ -6946,21 +7017,24 @@ ngx_http_cache_turbo_restore_response(ngx_http_request_t *r, u_char *copy,
         return NGX_ERROR;
     }
 
-    /* STAB-4: one validated parse. blob_validate checks magic+version, that the
-     * header block and body fit, AND walks every TLV header entry — so the
-     * restore loop below cannot run off the end. The blob is byte-aligned
+    /* S231-PERF-HDRWALK: ONE validated parse AND ONE header walk. blob_validate
+     * checks magic+version, that the header block and body fit, walks every TLV
+     * header entry to prove the restore loop below cannot run off the end, AND
+     * (r->pool + &refs passed) records each entry's decoded name/value pointers
+     * into `refs` in that same pass -- the loop below consumes `refs` directly
+     * instead of re-deriving the same offsets with a second bounds-checked walk
+     * (ngx_http_cache_turbo_blob_next_header). The blob is byte-aligned
      * (ngx_pnalloc); the validator reads the wire header with fixed-endian
      * getters, no misaligned struct cast. */
-    if (ngx_http_cache_turbo_blob_validate(copy, len, &hdr, NULL, NULL)
+    if (ngx_http_cache_turbo_blob_validate(copy, len, &hdr, NULL, &body_start,
+                                           r->pool, &refs)
         != NGX_OK)
     {
         return NGX_ERROR;
     }
     bh = &hdr;
 
-    p   = copy + NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE;
-    end = p + bh->headers_len;
-    body = end;
+    body = (u_char *) body_start;
     body_len = bh->body_len;
 
     ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
@@ -6975,16 +7049,11 @@ ngx_http_cache_turbo_restore_response(ngx_http_request_t *r, u_char *copy,
     for (i = 0; i < bh->nheaders; i++) {
         uint32_t       nl, vl;
         u_char        *nm, *vv;
-        const u_char  *cp = p, *cnm, *cvv;
 
-        if (ngx_http_cache_turbo_blob_next_header(&cp, end, &cnm, &nl,
-                                                  &cvv, &vl) != NGX_OK)
-        {
-            break;
-        }
-        p = (u_char *) cp;
-        nm = (u_char *) cnm;
-        vv = (u_char *) cvv;
+        nl = refs[i].nlen;
+        vl = refs[i].vlen;
+        nm = (u_char *) refs[i].name;
+        vv = (u_char *) refs[i].val;
 
         /* AUD-HDR1: the restore-side mirror of the store-side filter. This runs
          * BEFORE the Content-Type / validator branches below, because those
@@ -12296,7 +12365,8 @@ ngx_http_cache_turbo_vary_resolve(ngx_http_request_t *r,
          * here, but a hash collision must not be read as an axis bitmask). The
          * 1-byte body sits just past the fixed wire header. */
         ngx_http_cache_turbo_blob_hdr_t  mh;
-        if (ngx_http_cache_turbo_blob_validate(m->data, m->len, &mh, NULL, NULL)
+        if (ngx_http_cache_turbo_blob_validate(m->data, m->len, &mh, NULL, NULL,
+                                               NULL, NULL)
             == NGX_OK)
         {
             bits = m->data[NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE];
