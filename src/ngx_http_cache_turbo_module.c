@@ -6167,8 +6167,22 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
      * by min_uses) and BEFORE the v10 lock path (no point single-flighting a key
      * we are not going to store yet). Run once per request — min_uses_passed
      * guards the park/resume re-entries (the L2 GET / NX lock / cold-wait wakes
-     * all re-enter this handler from the top). */
-    if (clcf->min_uses > 1 && !ctx->min_uses_passed && !ctx->lock_done) {
+     * all re-enter this handler from the top).
+     *
+     * S231-PERF-MISSLOCKS: when cache_turbo_lock is ALSO on, count_miss() here
+     * and claim() in the block below fire back-to-back on this same call with
+     * no park between them -- two separate zone-mutex acquisitions and two
+     * rbtree descents on the identical key. clcf->l1->resolve_miss() (see its
+     * contract comment in shm.c) collapses that into one lock/one lookup; the
+     * `clcf->lock` case is handled entirely inside the block below via
+     * ctx->min_uses_merged so this gate's own control flow (min_uses_skip,
+     * misses/min_uses_skips counters, min_uses_passed, the NGX_DECLINED
+     * short-circuit) stays exactly as it was for the lock-off case, where
+     * there is no claim() to merge with and the standalone count_miss() call
+     * is unchanged below. */
+    if (clcf->min_uses > 1 && !ctx->min_uses_passed && !ctx->lock_done
+        && !clcf->lock)
+    {
         if (clcf->l1->count_miss(z, ctx->key_hash, hash, clcf->min_uses)
             == NGX_DECLINED)
         {
@@ -6195,6 +6209,7 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
         time_t     lock_ttl = clcf->lock_ttl;
         ngx_int_t  cl;
         uint64_t   claim_owner = 0;   /* CTXRDR-ADOPT-LEASE: set on CLAIM_WINNER */
+        ngx_int_t  merge_min_uses = 0;
 
         if (lock_ttl <= 0) {
             lock_ttl = 5;
@@ -6240,14 +6255,70 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
             return ngx_http_cache_turbo_cold_wait(r, clcf, z, ctx);
         }
 
-        cl = clcf->l1->claim(z, ctx->key_hash, hash, lock_ttl, &claim_owner);
+        /* S231-PERF-MISSLOCKS: min_uses>1 && lock-on is exactly the case the
+         * gate above deferred to here -- merge_min_uses fires resolve_miss()
+         * (count_miss()+claim() under one lock) instead of a bare claim(). The
+         * same reentry guards as the gate above (!min_uses_passed &&
+         * !lock_done) apply: on the cross-node park/resume paths above we
+         * already returned, so reaching here with merge_min_uses true always
+         * means this is the first synchronous pass. */
+        merge_min_uses = (clcf->min_uses > 1 && !ctx->min_uses_passed);
+
+        if (merge_min_uses) {
+            ngx_int_t  count_miss_rc;
+            u_char    *fresh_data = NULL;
+            size_t     fresh_len_out = 0;
+
+            cl = clcf->l1->resolve_miss(z, ctx->key_hash, hash, clcf->min_uses,
+                     lock_ttl, &claim_owner, &count_miss_rc,
+                     &fresh_data, &fresh_len_out);
+
+            if (count_miss_rc == NGX_DECLINED) {
+                /* Identical to the standalone gate above: still below
+                 * threshold, run to origin without storing. claim() did not
+                 * run (see resolve_miss()'s contract). */
+                ctx->min_uses_skip = 1;
+                (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
+                (void) ngx_atomic_fetch_add(&z->sh->min_uses_skips, 1);
+                ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                               "cache_turbo: below min_uses \"%V\" key=%ui -> "
+                               "origin (no store)", &r->uri, (ngx_uint_t) hash);
+                return NGX_DECLINED;
+            }
+
+            ctx->min_uses_passed = 1;
+
+            if (cl == NGX_HTTP_CACHE_TURBO_CLAIM_FRESH) {
+                /* Mirrors the CLAIM_FRESH branch below, but resolve_miss()
+                 * already handed back the raced-in blob under the SAME lock
+                 * hold that produced it -- no second lock+lookup needed (that
+                 * second acquisition is exactly one of the four this item
+                 * removes). RFC-1 re-validation kept identical: a request
+                 * revalidation-forced by its own freshness bounds must still
+                 * fall through to the origin rather than re-serve. */
+                if (fresh_data != NULL && !ctx->req_reval) {
+                    ngx_http_cache_turbo_blob_acquire(fresh_data);
+                    (void) ngx_atomic_fetch_add(&z->sh->hits, 1);
+                    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                                   "cache_turbo: cold-miss raced to FRESH \"%V\" "
+                                   "key=%ui -> serve", &r->uri, (ngx_uint_t) hash);
+                    return ngx_http_cache_turbo_serve(r, fresh_data,
+                               fresh_len_out, 0, z, fresh_data, NULL);
+                }
+                /* vanished again, or blocked by RFC-1: go to origin */
+                (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
+                return NGX_DECLINED;
+            }
+        } else {
+            cl = clcf->l1->claim(z, ctx->key_hash, hash, lock_ttl, &claim_owner);
+        }
         /* Stash the lease token now: if this claim is a CLAIM_WINNER that
          * goes on to fire the cross-node NX lock below, the request parks
          * (NGX_AGAIN) and resumes at the top of this block on a fresh call
          * where claim_owner (a stack local) no longer holds it. */
         ctx->pending_l1_owner = claim_owner;
 
-        if (cl == NGX_HTTP_CACHE_TURBO_CLAIM_FRESH) {
+        if (!merge_min_uses && cl == NGX_HTTP_CACHE_TURBO_CLAIM_FRESH) {
             /* A real fresh entry raced in while we were on the cold path
              * (another local winner finished): re-serve it from L1. */
             ngx_http_cache_turbo_node_t  *fresh;

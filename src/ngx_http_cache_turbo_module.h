@@ -2189,6 +2189,30 @@ ngx_int_t ngx_http_cache_turbo_shm_owns(ngx_http_cache_turbo_zone_t *z,
 ngx_int_t ngx_http_cache_turbo_shm_count_miss(ngx_http_cache_turbo_zone_t *z,
     u_char *key_hash, uint32_t hash, ngx_int_t min_uses);
 
+/* S231-PERF-MISSLOCKS: merged count_miss()+claim() for the min_uses>1 &&
+ * cache_turbo_lock-on cold path -- one zone-mutex hold, one rbtree descent,
+ * instead of the two each standalone call used to take back-to-back on the
+ * same key with no park between them. See the definition in
+ * ngx_http_cache_turbo_shm.c for the exact contract (this is NOT a new
+ * behaviour -- it is count_miss() immediately followed by claim() when it
+ * returns NGX_OK, byte-identical to calling them separately).
+ *
+ * *count_miss_rc receives count_miss()'s own NGX_OK/NGX_DECLINED. When it is
+ * NGX_DECLINED, claim() was NOT invoked (matches the caller's pre-existing
+ * short-circuit) and the ngx_int_t return value is not meaningful -- callers
+ * must check *count_miss_rc first, exactly as they already check
+ * count_miss()'s return before ever calling claim(). When *count_miss_rc is
+ * NGX_OK, the return value is claim()'s own CLAIM_WINNER/LOSER/FRESH and
+ * *owner / *fresh_data / *fresh_len are populated exactly as claim() (plus, on
+ * CLAIM_FRESH, the blob pointer/len claim() would have required a SECOND
+ * lock+lookup in the caller to obtain -- see module.c's old CLAIM_FRESH
+ * branch) would have. l2_neg_check is intentionally NOT part of this merge;
+ * see the definition's comment for why. */
+ngx_int_t ngx_http_cache_turbo_shm_resolve_miss(ngx_http_cache_turbo_zone_t *z,
+    u_char *key_hash, uint32_t hash, ngx_int_t min_uses, time_t lock_ttl,
+    uint64_t *owner, ngx_int_t *count_miss_rc,
+    u_char **fresh_data, size_t *fresh_len);
+
 /* L2 negative memo (L13). See the L1 vtable `l2_neg_check` / `l2_neg_set`
  * comments. check returns NGX_DECLINED to SKIP the L2 GET (a live memo), NGX_OK
  * to consult L2 as usual; set records a memo and is best-effort. */
@@ -2471,6 +2495,16 @@ struct ngx_cache_turbo_l1_backend_s {
      * re-gated). Only called when min_uses > 1. */
     ngx_int_t  (*count_miss)(ngx_http_cache_turbo_zone_t *z, u_char *key_hash,
         uint32_t hash, ngx_int_t min_uses);
+
+    /* S231-PERF-MISSLOCKS: merged count_miss()+claim() -- see
+     * ngx_http_cache_turbo_shm_resolve_miss()'s comment for the exact
+     * contract. Only called when min_uses > 1 AND cache_turbo_lock is on
+     * (the case where count_miss() and claim() would otherwise run
+     * back-to-back under two separate mutex holds on the same request pass). */
+    ngx_int_t  (*resolve_miss)(ngx_http_cache_turbo_zone_t *z,
+        u_char *key_hash, uint32_t hash, ngx_int_t min_uses, time_t lock_ttl,
+        uint64_t *owner, ngx_int_t *count_miss_rc,
+        u_char **fresh_data, size_t *fresh_len);
 
     /* L2 negative memo (L13). Both halves take the zone mutex internally.
      *

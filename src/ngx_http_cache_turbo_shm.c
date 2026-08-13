@@ -1006,37 +1006,54 @@ ngx_http_cache_turbo_shm_stats(ngx_http_cache_turbo_zone_t *z,
 }
 
 
-/* Cold-miss single-flight claim (v10). Atomically decide, under the zone mutex,
- * whether this request becomes the single regenerator for a cold key or waits.
- * See the L1 vtable `claim` comment in the header. */
-ngx_int_t
-ngx_http_cache_turbo_shm_claim(ngx_http_cache_turbo_zone_t *z,
-    u_char *key_hash, uint32_t hash, time_t lock_ttl, uint64_t *owner)
+/* Forward declaration: resolve_miss() (below) needs this before its
+ * definition further down the file. */
+static ngx_int_t
+ngx_http_cache_turbo_shm_count_miss_locked(ngx_http_cache_turbo_zone_t *z,
+    u_char *key_hash, uint32_t hash, ngx_int_t min_uses,
+    ngx_http_cache_turbo_node_t *ctn, time_t now);
+
+
+/* Cold-miss single-flight claim (v10), LOCK-HELD core. Operates on a `ctn`
+ * the caller already resolved via shm_lookup() under the SAME mutex hold --
+ * factored out for S231-PERF-MISSLOCKS so resolve_miss() below can share one
+ * lookup/lock between this and count_miss() instead of each doing its own.
+ * `ctn` may be NULL (key absent), matching the original single-call version.
+ *
+ * On CLAIM_FRESH the raced-in entry's blob pointer/len are handed back via
+ * *fresh_data / *fresh_len (still under the caller's lock) so a merged caller
+ * can acquire the blob ref itself without a second lock+lookup, exactly
+ * mirroring what module.c's separate re-lookup used to do right after
+ * unlocking here. A standalone caller that does not need the blob (there is
+ * none today) may pass NULL for either out-param.
+ *
+ * Every read/mutate/return here is byte-for-byte the original claim() body --
+ * only the lock and the lookup moved to the caller. */
+static ngx_int_t
+ngx_http_cache_turbo_shm_claim_locked(ngx_http_cache_turbo_zone_t *z,
+    uint32_t hash, u_char *key_hash, time_t lock_ttl, uint64_t *owner,
+    ngx_http_cache_turbo_node_t *ctn, time_t now,
+    u_char **fresh_data, size_t *fresh_len)
 {
-    time_t                        now;
-    ngx_http_cache_turbo_node_t  *ctn;
-
-    now = ngx_time();
-
     /* CTXRDR-ADOPT-LEASE: no lease unless we actually win one below. Cleared up
      * front so every early return is a non-owner return by construction. */
     *owner = 0;
-
-    ngx_shmtx_lock(&z->shpool->mutex);
-
-    ctn = ngx_http_cache_turbo_shm_lookup(z, key_hash, hash);
 
     if (ctn != NULL) {
         /* A real fresh entry raced in while we were on the cold path: re-serve
          * it, do NOT regenerate. */
         if (ctn->len > 0 && now < ctn->fresh_until) {
-            ngx_shmtx_unlock(&z->shpool->mutex);
+            if (fresh_data != NULL) {
+                *fresh_data = ctn->data;
+            }
+            if (fresh_len != NULL) {
+                *fresh_len = ctn->len;
+            }
             return NGX_HTTP_CACHE_TURBO_CLAIM_FRESH;
         }
 
         /* Someone is already regenerating and the lock has not expired: wait. */
         if (ctn->refreshing && now < ctn->refresh_lock_until) {
-            ngx_shmtx_unlock(&z->shpool->mutex);
             return NGX_HTTP_CACHE_TURBO_CLAIM_LOSER;
         }
 
@@ -1066,7 +1083,6 @@ ngx_http_cache_turbo_shm_claim(ngx_http_cache_turbo_zone_t *z,
          * it attempts will (correctly) no longer match. */
         ctn->refresh_owner = ++z->sh->owner_seq;
         *owner = ctn->refresh_owner;
-        ngx_shmtx_unlock(&z->shpool->mutex);
         return NGX_HTTP_CACHE_TURBO_CLAIM_WINNER;
     }
 
@@ -1083,7 +1099,6 @@ ngx_http_cache_turbo_shm_claim(ngx_http_cache_turbo_zone_t *z,
          * CTXRDR-ADOPT-LEASE: *owner stays 0 deliberately. There is no node and
          * therefore no lease, so this winner must never later clear anyone's --
          * a 0 token matches nothing in unstub()/owns(). */
-        ngx_shmtx_unlock(&z->shpool->mutex);
         return NGX_HTTP_CACHE_TURBO_CLAIM_WINNER;
     }
 
@@ -1108,8 +1123,124 @@ ngx_http_cache_turbo_shm_claim(ngx_http_cache_turbo_zone_t *z,
 
     *owner = ctn->refresh_owner;
 
-    ngx_shmtx_unlock(&z->shpool->mutex);
     return NGX_HTTP_CACHE_TURBO_CLAIM_WINNER;
+}
+
+
+/* Cold-miss single-flight claim (v10), public single-call form. See the L1
+ * vtable `claim` comment in the header. Thin lock+lookup wrapper around the
+ * _locked core above -- unchanged behaviour, still one lock/one lookup per
+ * call when used standalone (the min_uses<=1 case, where there is no
+ * count_miss() to merge with). */
+ngx_int_t
+ngx_http_cache_turbo_shm_claim(ngx_http_cache_turbo_zone_t *z,
+    u_char *key_hash, uint32_t hash, time_t lock_ttl, uint64_t *owner)
+{
+    ngx_int_t                     rc;
+    time_t                        now;
+    ngx_http_cache_turbo_node_t  *ctn;
+
+    now = ngx_time();
+
+    ngx_shmtx_lock(&z->shpool->mutex);
+    ctn = ngx_http_cache_turbo_shm_lookup(z, key_hash, hash);
+    rc = ngx_http_cache_turbo_shm_claim_locked(z, hash, key_hash, lock_ttl,
+             owner, ctn, now, NULL, NULL);
+    ngx_shmtx_unlock(&z->shpool->mutex);
+
+    return rc;
+}
+
+
+/* S231-PERF-MISSLOCKS: merged cold-miss resolution. A cold miss with
+ * min_uses > 1 and cache_turbo_lock on used to take the zone mutex twice and
+ * descend the rbtree twice for the SAME key on the SAME request pass --
+ * count_miss() followed immediately by claim(), with no park/I-O between
+ * them (see module.c's access handler: count_miss only runs when
+ * `!ctx->lock_done`, i.e. strictly before claim() fires on that same call).
+ * This does one lock/one lookup and runs both cores against the shared `ctn`.
+ *
+ * Contract: identical to calling count_miss() then, only if it returned
+ * NGX_OK, claim() -- in that order, both under what is now a single
+ * critical section instead of two:
+ *
+ *   - count_miss_rc receives exactly what standalone count_miss() would have
+ *     returned (NGX_OK / NGX_DECLINED). Its mutation (miss_count++, or a new
+ *     counter node) happens exactly once, identically to the standalone call.
+ *   - If count_miss_rc is NGX_DECLINED, claim() is NOT invoked (matching the
+ *     caller's own `if (... == NGX_DECLINED) return` short-circuit in
+ *     module.c -- claim() never ran in that case before either) and the
+ *     return value is CLAIM_WINNER/LOSER/FRESH's caller must not consult;
+ *     the function returns NGX_HTTP_CACHE_TURBO_CLAIM_WINNER as a dummy that
+ *     the caller ignores (mirrors "no claim attempted").
+ *   - If count_miss_rc is NGX_OK, claim_locked() runs against the SAME ctn
+ *     (re-fetched from the rbtree only once, at the top) with the SAME `now`,
+ *     producing exactly the CLAIM_WINNER/LOSER/FRESH / *owner claim() would
+ *     have returned had it been called separately right after -- the two
+ *     mutations (count_miss's counter bump / node creation, then claim's
+ *     refreshing/owner stamp or stub creation) apply in the same order, to
+ *     the same node, under the same lock hold count_miss() and claim() used
+ *     to take separately.
+ *   - On CLAIM_FRESH, *fresh_data / *fresh_len are populated exactly as
+ *     claim_locked() documents above, letting the caller acquire the blob
+ *     ref under ITS OWN subsequent lock instead of trusting a pointer read
+ *     after this function unlocks (blob_acquire still happens under a lock
+ *     the caller holds, in module.c, unchanged from before).
+ *
+ * l2_neg_check is deliberately NOT folded in here: on the request path it
+ * runs before this call and can be followed by an async L2 GET
+ * (clcf->backend->get() park/resume) before count_miss/claim ever run, so
+ * its own lock/lookup is not always adjacent to these two -- merging it would
+ * either force it onto the wrong side of a potential async park (widening
+ * the critical section across a redis round-trip: never acceptable) or
+ * require plumbing an "was there a park" flag through the whole request
+ * struct for a case (no L2 backend, or an already-resolved L2) that is not
+ * always true. count_miss and claim, by contrast, are ALWAYS adjacent on the
+ * first pass with no possible park between them (see module.c), so only
+ * those two merge here. */
+ngx_int_t
+ngx_http_cache_turbo_shm_resolve_miss(ngx_http_cache_turbo_zone_t *z,
+    u_char *key_hash, uint32_t hash, ngx_int_t min_uses, time_t lock_ttl,
+    uint64_t *owner, ngx_int_t *count_miss_rc,
+    u_char **fresh_data, size_t *fresh_len)
+{
+    ngx_int_t                     rc;
+    time_t                        now;
+    ngx_http_cache_turbo_node_t  *ctn;
+
+    now = ngx_time();
+    *owner = 0;
+
+    ngx_shmtx_lock(&z->shpool->mutex);
+
+    ctn = ngx_http_cache_turbo_shm_lookup(z, key_hash, hash);
+
+    *count_miss_rc = ngx_http_cache_turbo_shm_count_miss_locked(z, key_hash,
+                          hash, min_uses, ctn, now);
+
+    if (*count_miss_rc == NGX_DECLINED) {
+        /* Matches the standalone caller's own short-circuit: claim() never
+         * ran when count_miss() declined. Nothing further to report. */
+        ngx_shmtx_unlock(&z->shpool->mutex);
+        return NGX_HTTP_CACHE_TURBO_CLAIM_WINNER;   /* caller must not use this */
+    }
+
+    /* count_miss_locked() may have just allocated the counter node (key was
+     * absent). Re-resolve so claim_locked() sees it instead of racing its own
+     * "no node" branch and allocating a SECOND node for the same key -- this
+     * is the one behavioural seam the merge must close: the two-call version
+     * had claim() do its own fresh lookup after count_miss()'s unlock, which
+     * naturally picked up whatever count_miss() had just inserted. */
+    if (ctn == NULL) {
+        ctn = ngx_http_cache_turbo_shm_lookup(z, key_hash, hash);
+    }
+
+    rc = ngx_http_cache_turbo_shm_claim_locked(z, hash, key_hash, lock_ttl,
+             owner, ctn, now, fresh_data, fresh_len);
+
+    ngx_shmtx_unlock(&z->shpool->mutex);
+
+    return rc;
 }
 
 
@@ -1233,27 +1364,22 @@ ngx_http_cache_turbo_shm_unstub(ngx_http_cache_turbo_zone_t *z,
 }
 
 
-/* min_uses miss counter (v15). Count one cold miss for the key and decide
- * whether it has been requested enough times to be worth caching. See the L1
- * vtable `count_miss` comment in the header. Only called when min_uses > 1. */
-ngx_int_t
-ngx_http_cache_turbo_shm_count_miss(ngx_http_cache_turbo_zone_t *z,
-    u_char *key_hash, uint32_t hash, ngx_int_t min_uses)
+/* min_uses miss counter (v15), LOCK-HELD core. Operates on a `ctn` the caller
+ * already resolved via shm_lookup() under the SAME mutex hold -- factored out
+ * so S231-PERF-MISSLOCKS can share one lookup/lock between this and claim()
+ * instead of each doing its own. `ctn` may be NULL (key absent); on a NULL
+ * `ctn` this allocates the counter node exactly as the original single-call
+ * version did. Every read/mutate/return here is byte-for-byte the original
+ * count_miss body -- only the lock and the lookup moved to the caller. */
+static ngx_int_t
+ngx_http_cache_turbo_shm_count_miss_locked(ngx_http_cache_turbo_zone_t *z,
+    u_char *key_hash, uint32_t hash, ngx_int_t min_uses,
+    ngx_http_cache_turbo_node_t *ctn, time_t now)
 {
-    time_t                        now;
-    ngx_http_cache_turbo_node_t  *ctn;
-
-    now = ngx_time();
-
-    ngx_shmtx_lock(&z->shpool->mutex);
-
-    ctn = ngx_http_cache_turbo_shm_lookup(z, key_hash, hash);
-
     if (ctn != NULL) {
         /* A real entry (even expired/stale being refreshed) is already proven
          * cacheable — never re-gate it, and do not touch its counter. */
         if (ctn->kind == NGX_HTTP_CACHE_TURBO_NODE_ENTRY && ctn->len > 0) {
-            ngx_shmtx_unlock(&z->shpool->mutex);
             return NGX_OK;
         }
 
@@ -1261,7 +1387,6 @@ ngx_http_cache_turbo_shm_count_miss(ngx_http_cache_turbo_zone_t *z,
          * threshold and is regenerating. Proceed so the caller's claim() makes
          * this request a waiter; don't count (this is not an un-coalesced miss). */
         if (ctn->refreshing && now < ctn->refresh_lock_until) {
-            ngx_shmtx_unlock(&z->shpool->mutex);
             return NGX_OK;
         }
 
@@ -1269,10 +1394,8 @@ ngx_http_cache_turbo_shm_count_miss(ngx_http_cache_turbo_zone_t *z,
          * not yet cached. Count it; cross the threshold => store-eligible. */
         ctn->miss_count++;
         if ((ngx_int_t) ctn->miss_count >= min_uses) {
-            ngx_shmtx_unlock(&z->shpool->mutex);
             return NGX_OK;
         }
-        ngx_shmtx_unlock(&z->shpool->mutex);
         return NGX_DECLINED;
     }
 
@@ -1286,7 +1409,6 @@ ngx_http_cache_turbo_shm_count_miss(ngx_http_cache_turbo_zone_t *z,
     if (ctn == NULL) {
         /* Out of slab: cannot track the count, so just let it cache now
          * (correct, only less selective than min_uses would like). */
-        ngx_shmtx_unlock(&z->shpool->mutex);
         return NGX_OK;
     }
 
@@ -1309,10 +1431,33 @@ ngx_http_cache_turbo_shm_count_miss(ngx_http_cache_turbo_zone_t *z,
     /* S8: every new node enters PROBATION (see lru_insert_new). */
     ngx_http_cache_turbo_lru_insert_new(z, ctn);
 
-    ngx_shmtx_unlock(&z->shpool->mutex);
-
     /* First miss: below threshold unless min_uses == 1 (caller guards that). */
     return (min_uses <= 1) ? NGX_OK : NGX_DECLINED;
+}
+
+
+/* min_uses miss counter (v15), public single-call form. See the L1 vtable
+ * `count_miss` comment in the header. Only called when min_uses > 1. Thin
+ * lock+lookup wrapper around the _locked core above -- unchanged behaviour,
+ * still one lock/one lookup per call when used standalone (the min_uses>1 &&
+ * cache_turbo_lock-off case, where there is no claim() to merge with). */
+ngx_int_t
+ngx_http_cache_turbo_shm_count_miss(ngx_http_cache_turbo_zone_t *z,
+    u_char *key_hash, uint32_t hash, ngx_int_t min_uses)
+{
+    ngx_int_t                     rc;
+    time_t                        now;
+    ngx_http_cache_turbo_node_t  *ctn;
+
+    now = ngx_time();
+
+    ngx_shmtx_lock(&z->shpool->mutex);
+    ctn = ngx_http_cache_turbo_shm_lookup(z, key_hash, hash);
+    rc = ngx_http_cache_turbo_shm_count_miss_locked(z, key_hash, hash,
+             min_uses, ctn, now);
+    ngx_shmtx_unlock(&z->shpool->mutex);
+
+    return rc;
 }
 
 
@@ -2104,6 +2249,7 @@ ngx_cache_turbo_l1_backend_t  ngx_http_cache_turbo_shm_backend = {
     ngx_http_cache_turbo_shm_stats,
     ngx_http_cache_turbo_shm_claim,
     ngx_http_cache_turbo_shm_count_miss,
+    ngx_http_cache_turbo_shm_resolve_miss,
     ngx_http_cache_turbo_shm_l2_neg_check,
     ngx_http_cache_turbo_shm_l2_neg_set,
 };

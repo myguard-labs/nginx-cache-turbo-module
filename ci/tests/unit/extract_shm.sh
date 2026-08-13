@@ -249,7 +249,7 @@ awk '
     /^static ngx_inline (uint32_t|uint64_t)$/ {
         pending = 1; buf = $0 ORS; next
     }
-    pending && /^ngx_http_cache_turbo_(shm_(lookup|evict_one|alloc_evict|claim|unstub|owns|count_miss|l2_neg_check|l2_neg_set|touch_lru|brk_probe_age|breaker_state|breaker_record|breaker_state_str|get_u32|get_u64|node_sie_live)|lru_(link_head|unlink|insert_new|enforce_cap)|blob_(alloc|node_release|acquire|release))\(/ {
+    pending && /^ngx_http_cache_turbo_(shm_(lookup|evict_one|alloc_evict|claim_locked|claim|resolve_miss|unstub|owns|count_miss_locked|count_miss|l2_neg_check|l2_neg_set|touch_lru|brk_probe_age|breaker_state|breaker_record|breaker_state_str|get_u32|get_u64|node_sie_live)|lru_(link_head|unlink|insert_new|enforce_cap)|blob_(alloc|node_release|acquire|release))\(/ {
         capture = 1; pending = 0; printf "%s", buf; print; next
     }
     pending { pending = 0; buf = "" }
@@ -415,9 +415,12 @@ for fn in \
     'ngx_http_cache_turbo_shm_lookup(' \
     'ngx_http_cache_turbo_shm_evict_one(' \
     'ngx_http_cache_turbo_shm_alloc_evict(' \
+    'ngx_http_cache_turbo_shm_claim_locked(' \
     'ngx_http_cache_turbo_shm_claim(' \
+    'ngx_http_cache_turbo_shm_resolve_miss(' \
     'ngx_http_cache_turbo_shm_unstub(' \
     'ngx_http_cache_turbo_shm_owns(' \
+    'ngx_http_cache_turbo_shm_count_miss_locked(' \
     'ngx_http_cache_turbo_shm_count_miss(' \
     'ngx_http_cache_turbo_shm_l2_neg_check(' \
     'ngx_http_cache_turbo_shm_l2_neg_set(' \
@@ -453,7 +456,13 @@ fi
 # l2_neg_until there is the CR-A bug. The new-node path further down legitimately
 # zeroes it (a brand-new node has no memo to preserve), so the whole-function
 # grep this used to do was a false positive on correct code.
-if sed -n '/^ngx_http_cache_turbo_shm_claim(/,/return NGX_HTTP_CACHE_TURBO_CLAIM_WINNER;/p' "$OUT" \
+# S231-PERF-MISSLOCKS: the mutation this canary guards moved into
+# claim_locked() when claim() was split into a lock+lookup wrapper around a
+# LOCK-HELD core (shared with count_miss() via resolve_miss()). The public
+# claim() wrapper's body no longer contains the takeover branch at all, so the
+# canary must scope to claim_locked() to keep testing the real code instead of
+# vacuously passing against a thin pass-through.
+if sed -n '/^ngx_http_cache_turbo_shm_claim_locked(/,/return NGX_HTTP_CACHE_TURBO_CLAIM_WINNER;/p' "$OUT" \
    | grep -qE 'l2_neg_until[[:space:]]*=[[:space:]]*0;'; then
     echo "✗ CR-A regression: claim() clears l2_neg_until on stub takeover." >&2
     echo "  The memo must survive the claim that turns its node into a stub." >&2

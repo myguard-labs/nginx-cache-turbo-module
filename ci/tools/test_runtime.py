@@ -2312,6 +2312,14 @@ http {{
     # it OPEN and filling the zone cannot perturb any other zone's breaker
     # state or LRU contents.
     cache_turbo_zone name=evblindz 64k;
+    # S231-PERF-MISSLOCKS: private zone for /mmulock/'s concurrent min_uses +
+    # cache_turbo_lock race (a second worker claiming the key between what
+    # used to be count_miss()'s and claim()'s separate mutex acquisitions).
+    # NOT `main` -- min_uses_skips and lock_waits are zone-global counters and
+    # `main` already carries traffic from 166+ other locations by the time
+    # this runs, so a delta-based assert here needs its own zone + admin
+    # endpoint for the same reason storefailz does.
+    cache_turbo_zone name=mmulockz 16m;
 
     # Q1 end-to-end: stacked native proxy_cache, one zone per suppress mode, so
     # a test can prove cache_turbo_suppress_native actually keeps the native
@@ -4181,6 +4189,29 @@ http {{
 
         location = /_cache_evblind {{
             cache_turbo_admin    evblindz;
+            allow 127.0.0.1;
+            deny all;
+        }}
+
+        # S231-PERF-MISSLOCKS: min_uses > 1 AND cache_turbo_lock on (the
+        # default) TOGETHER -- the exact combination the merged resolve_miss()
+        # path covers. lock_ttl left short so a losing waiter does not have to
+        # wait long, and lock_timeout is generous so a slow CI runner cannot
+        # make a genuine waiter give up and stampede the origin, which would
+        # look like a correctness failure but would only be scheduling noise.
+        location /mmulock/ {{
+            cache_turbo               mmulockz;
+            cache_turbo_key           $uri;
+            cache_turbo_valid         30s;
+            cache_turbo_min_uses      3;
+            cache_turbo_lock          on;
+            cache_turbo_lock_ttl      2s;
+            cache_turbo_lock_timeout  5s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        location = /_cache_mmulock {{
+            cache_turbo_admin    mmulockz;
             allow 127.0.0.1;
             deny all;
         }}
@@ -12273,6 +12304,93 @@ def _admin_min_uses_skips(ng: Nginx, endpoint: str = "/_cache") -> int:
     return int(json.loads(b).get("min_uses_skips", 0))
 
 
+def test_min_uses_lock_merged_concurrent_claim(ng: Nginx, origin: Origin) -> None:
+    """S231-PERF-MISSLOCKS: count_miss() + claim() now run under ONE zone-mutex
+    hold (clcf->l1->resolve_miss()) instead of two back-to-back acquisitions on
+    the min_uses>1 && cache_turbo_lock-on cold path. This pins the merged
+    behaviour, including the concurrent case the two-lock version had to
+    handle across its (now closed) gap between the two acquisitions: a second
+    worker claiming the key in between.
+
+    /mmulock/ (private zone mmulockz) sets min_uses 3 with cache_turbo_lock on
+    (its default). Prime the key to 2/3 -- one below the threshold that flips
+    count_miss() from NGX_DECLINED to NGX_OK -- then fire a CONCURRENT burst.
+    Every burst request's count_miss() sees the SAME already-2 counter and
+    crosses to 3 (min_uses counts every miss on a body-less node, not just the
+    winner's), so all of them proceed into claim() on this pass. Exactly one
+    must become the CLAIM_WINNER regenerator; the rest must take CLAIM_LOSER
+    (or, once the winner's store lands, CLAIM_FRESH) and wait rather than each
+    independently reaching the origin -- collapsing the burst to the SAME
+    small number of origin fetches test_cold_single_flight requires, proving
+    the merge did not reopen the single-flight window between the counting
+    decision and the claim decision. A regression that ran claim() against a
+    STALE pre-merge lookup (the seam resolve_miss()'s contract comment calls
+    out: re-resolving ctn after count_miss_locked() may have just inserted a
+    counter node) would let a second burst request also see the key "absent"
+    and allocate a SECOND stub, breaking single-flight — this test's origin
+    fetch bound catches that the same way test_cold_single_flight's bound
+    catches the classic v10 stampede."""
+    uri = f"/mmulock/mmu-{time.time()}"          # never fetched before
+    base = origin.hits_for("/mmu-")
+    skips0 = _admin_min_uses_skips(ng, "/_cache_mmulock")
+    waits0 = _admin_lock_waits(ng, "/_cache_mmulock")
+
+    # Prime to 2/3, serially, so the fixture starts from a known counter state
+    # (mirrors test_min_uses's own priming) before the concurrent burst below
+    # exercises the merged resolve_miss() at the exact miss that crosses the
+    # threshold and enters claim() for the first time.
+    for i in (1, 2):
+        s, _, h = fetch(ng.port, uri)
+        assert s == 200, f"priming req{i} status {s}"
+        assert "x-cache" not in h, f"priming req{i} must not be a HIT: {h}"
+    assert origin.hits_for("/mmu-") == base + 2, "both priming misses must reach origin"
+    assert _admin_min_uses_skips(ng, "/_cache_mmulock") - skips0 == 2, \
+        "priming misses must both be counted as min_uses skips"
+
+    # Rendezvous burst on the threshold-crossing request, same discipline as
+    # test_cold_single_flight: unsynchronised starts let a straggler arrive
+    # after the winner's fill and take CLAIM_FRESH without ever parking,
+    # driving lock_waits to 0 while single-flight still worked correctly.
+    readers = 24
+    barrier = threading.Barrier(readers)
+
+    def _burst_reader(_i: int) -> tuple[int, bytes, dict]:
+        barrier.wait()
+        return fetch(ng.port, uri)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=readers) as pool:
+        results = list(pool.map(_burst_reader, range(readers)))
+    assert {r[0] for r in results} == {200}, \
+        f"threshold-crossing burst returned {set(r[0] for r in results)}"
+
+    # All readers must agree on one body: exactly one regenerated copy, not
+    # one per request (which is what a reopened window between count_miss()
+    # and claim() would produce -- see test_cold_lock_off_stampedes for the
+    # contrast when single-flight is genuinely off).
+    bodies = {r[1] for r in results}
+    assert len(bodies) == 1, \
+        f"threshold-crossing burst served {len(bodies)} distinct bodies " \
+        f"(single-flight window reopened between count_miss and claim)"
+
+    regens = origin.hits_for("/mmu-") - base - 2   # minus the 2 priming misses
+    assert regens <= 3, \
+        f"merged min_uses+lock single-flight failed: {regens} origin fetches " \
+        f"for {readers} concurrent threshold-crossing readers"
+
+    # The collapse must have happened via the wait path, not just lucky
+    # timing -- same liveness proof test_cold_single_flight requires.
+    assert _admin_lock_waits(ng, "/_cache_mmulock") - waits0 > 0, \
+        "no requests waited on the merged claim -- single-flight did not engage"
+
+    # No further min_uses skip: the threshold was already crossed by the first
+    # burst request's count_miss(), so every subsequent one in the burst takes
+    # the NGX_OK arm (proceeds into claim()), never the NGX_DECLINED short-
+    # circuit resolve_miss() also has to reproduce.
+    assert _admin_min_uses_skips(ng, "/_cache_mmulock") - skips0 == 2, \
+        "the burst must not add any further min_uses skip past the threshold"
+    drain_origin(origin)
+
+
 def test_min_uses(ng: Nginx, origin: Origin) -> None:
     """v15 cache_turbo_min_uses N: a response is cached only after its key has
     cold-missed N times. /minuses/ sets N=3 — the first two misses run to the
@@ -17360,6 +17478,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_single_flight(ng, origin)
     test_cold_single_flight(ng, origin)
     test_cold_lock_off_stampedes(ng, origin)
+    test_min_uses_lock_merged_concurrent_claim(ng, origin)
     test_min_uses(ng, origin)
     test_min_uses_off_by_default(ng)
     test_min_uses_band_aggressive(ng, origin)

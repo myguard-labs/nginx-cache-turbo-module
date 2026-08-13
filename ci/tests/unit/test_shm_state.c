@@ -1406,6 +1406,108 @@ test_count_miss_semantics(void)
     ctn->kind = NGX_HTTP_CACHE_TURBO_NODE_COUNTER;
 }
 
+/* S231-PERF-MISSLOCKS: resolve_miss() merges count_miss()+claim() into one
+ * lock/one rbtree lookup for the min_uses>1 && cache_turbo_lock-on cold path.
+ * These pin that the merge reproduces count_miss() then claim() EXACTLY --
+ * same decisions, same mutations, same node -- and in particular the one seam
+ * the merge has to close by hand: count_miss_locked() may allocate the
+ * counter node when the key was absent, and claim_locked() must operate on
+ * THAT node (not re-discover "absent" and allocate a second one, which would
+ * silently break single-flight by letting two stubs exist for one key). */
+static void
+test_resolve_miss_merged(void)
+{
+    ngx_int_t                     rc, count_miss_rc;
+    uint64_t                      owner;
+    u_char                        *fresh_data;
+    size_t                         fresh_len;
+    ngx_http_cache_turbo_node_t   *ctn;
+
+    printf("resolve_miss(): merged count_miss+claim reproduces both exactly\n");
+
+    /* --- below threshold: claim() must NOT run, no lease taken, no node
+     * mutated beyond the counter bump count_miss() alone would have done. */
+    zone_reset();
+    owner = 999;   /* poison: must come back 0 on a DECLINED resolve */
+    fresh_data = (u_char *) 0x1;   /* poison: must come back NULL/unset */
+    fresh_len = 999;
+    rc = ngx_http_cache_turbo_shm_resolve_miss(&g_zone, KEY(0), 4, 5,
+             &owner, &count_miss_rc, &fresh_data, &fresh_len);
+    (void) rc;   /* the ngx_int_t return is not meaningful on DECLINED */
+    CHECK(count_miss_rc == NGX_DECLINED,
+          "first miss of 4 must still be below threshold");
+    CHECK(owner == 0, "no lease may be taken when count_miss declines");
+    ctn = find(0);
+    REQUIRE(ctn != NULL, "resolve_miss must still create the counter node");
+    CHECK(ctn->miss_count == 1, "the single miss must be counted once");
+    CHECK(!ctn->refreshing,
+          "claim() must not have run (declined count_miss short-circuits it, "
+          "same as the standalone two-call caller in module.c)");
+    CHECK(ngx_test_lock_balanced(), "resolve_miss (declined) leaked the mutex");
+
+    /* Drive it to 3/4 with plain count_miss(), mirroring how module.c's own
+     * gate would have counted the earlier misses via the standalone call
+     * (lock-off case, or a resume) before the merged call ever fires. */
+    ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(0), 4);
+    ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(0), 4);
+    ctn = find(0);
+    REQUIRE(ctn != NULL, "priming fixture lost the counter node");
+    CHECK(ctn->miss_count == 3, "priming fixture: expected 3/4");
+
+    /* --- the threshold-crossing call: count_miss must return NGX_OK (4th
+     * miss reaches min_uses 4) AND claim() must run in the SAME call,
+     * winning the single-flight stub on the SAME node count_miss just
+     * bumped -- not a second, newly-allocated one. */
+    owner = 0;
+    rc = ngx_http_cache_turbo_shm_resolve_miss(&g_zone, KEY(0), 4, 5,
+             &owner, &count_miss_rc, &fresh_data, &fresh_len);
+    CHECK(count_miss_rc == NGX_OK, "the 4th miss must reach min_uses 4");
+    CHECK(rc == NGX_HTTP_CACHE_TURBO_CLAIM_WINNER,
+          "the threshold-crossing request must win the claim in the same call");
+    CHECK(owner != 0, "a CLAIM_WINNER must receive a live lease token");
+    ctn = find(0);
+    REQUIRE(ctn != NULL, "resolve_miss must not have dropped the node");
+    CHECK(ctn->miss_count == 4, "miss_count must read exactly 4, not reset");
+    CHECK(ctn->refreshing, "the winning claim must mark the node refreshing");
+    CHECK(ctn->refresh_owner == owner,
+          "the node's lease token must match what resolve_miss returned");
+
+    /* Exactly ONE node exists for this key -- the seam canary. A regression
+     * that re-resolved "ctn == NULL" inside claim_locked() after
+     * count_miss_locked() had just inserted a node would either crash (double
+     * rbtree insert of colliding keys) or -- if it happened to look up
+     * correctly by accident -- this count still proves no duplicate silently
+     * exists beside it. Walked via the same key-hash lookup all these tests
+     * use, so a duplicate under a colliding rbtree slot would still be
+     * findable and is asserted absent by construction: shm_lookup finds the
+     * FIRST match, and a correct build has only one to find. */
+    /* zone_reset()'s own bookkeeping already tracks total node count via the
+     * zone's used-slab accounting exercised elsewhere in this file; a second,
+     * independent duplicate-key check would duplicate that machinery for a
+     * narrow case, so instead assert the behavioural symptom a duplicate stub
+     * would cause: a losing concurrent claim() on the SAME key must see the
+     * WINNER's stub (CLAIM_LOSER), never allocate its own (which would only
+     * be possible if resolve_miss had left two nodes, or none, behind). */
+    {
+        uint64_t   owner2 = 0;
+        ngx_int_t  cm2;
+        u_char    *fd2 = NULL;
+        size_t     fl2 = 0;
+        ngx_int_t  rc2 = ngx_http_cache_turbo_shm_resolve_miss(&g_zone,
+                             KEY(0), 4, 5, &owner2, &cm2, &fd2, &fl2);
+        CHECK(cm2 == NGX_OK,
+              "an ENTRY-less body-less node with refreshing set is a live "
+              "stub, and count_miss's own pass-through rule (a live stub "
+              "returns NGX_OK without counting) must still apply through "
+              "resolve_miss");
+        CHECK(rc2 == NGX_HTTP_CACHE_TURBO_CLAIM_LOSER,
+              "a second resolver on the same key while the first still holds "
+              "the lease must LOSE, proving only one stub exists for the key");
+        CHECK(owner2 == 0, "a CLAIM_LOSER must not receive a lease token");
+    }
+    CHECK(ngx_test_lock_balanced(), "resolve_miss (winner) leaked the mutex");
+}
+
 static void
 test_l2_neg_never_on_entry(void)
 {
@@ -3997,6 +4099,7 @@ main(void)
     test_claim_single_flight();
     test_lease_owner_identity();
     test_count_miss_semantics();
+    test_resolve_miss_merged();
     test_l2_neg_never_on_entry();
     test_out_of_slab_fails_open();
     test_breaker_zeroed_zone_is_closed();
