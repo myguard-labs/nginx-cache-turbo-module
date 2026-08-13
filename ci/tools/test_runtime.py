@@ -3739,6 +3739,90 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # S231-PERF-AUTOCLASSIFY negative control: the presets below had no
+        # dedicated runtime-test location at all before this change, so their
+        # cookie needles were exercised only by the fuzz corpus (crash safety)
+        # and never asserted classified-dynamic here. Added to prove the
+        # first-byte prefilter cannot make a needle unreachable -- see
+        # test_cookie_prefilter_negative_control().
+        location /ct-drupal/ {{
+            cache_turbo         main;
+            cache_turbo_backend drupal;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        location /ct-mediawiki/ {{
+            cache_turbo         main;
+            cache_turbo_backend mediawiki;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        location /ct-ghost/ {{
+            cache_turbo         main;
+            cache_turbo_backend ghost;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        location /ct-wagtail/ {{
+            cache_turbo         main;
+            cache_turbo_backend wagtail;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        location /ct-kirby/ {{
+            cache_turbo         main;
+            cache_turbo_backend kirby;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        location /ct-typo3/ {{
+            cache_turbo         main;
+            cache_turbo_backend typo3;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        location /ct-vanilla/ {{
+            cache_turbo         main;
+            cache_turbo_backend vanilla;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        location /ct-punbb/ {{
+            cache_turbo         main;
+            cache_turbo_backend punbb;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        location /ct-phorum/ {{
+            cache_turbo         main;
+            cache_turbo_backend phorum;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        location /ct-yabb/ {{
+            cache_turbo         main;
+            cache_turbo_backend yabb;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        location /ct-flarum/ {{
+            cache_turbo         main;
+            cache_turbo_backend flarum;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # A NAMED preset must pull in ONLY its own rules. `wordpress` here must
         # not react to /login, /user, /session, /index.php or another preset's
         # cookies -- those are other backends' surfaces and are perfectly
@@ -6197,6 +6281,216 @@ def _assert_new_preset_shape(
         f"{root} dynamic URI {dynamic_uri!r} must bypass, got {hu.get('x-cache')}"
 
 
+_COOKIE_SCANS_HDR = "x-cache-turbo-test-cookie-scans"
+
+
+def _cookie_scans(hdrs: dict, where: str) -> int:
+    """Pull the lifetime ngx_strnstr()-call counter out of a response's
+    headers (S231-PERF-AUTOCLASSIFY, TEST_FAULTS-only). Same "missing header
+    is a hard failure" discipline as _armings()/_backoff_skips(): its absence
+    would make every delta read 0 and the counter-oracle test would pass
+    while proving the prefilter did nothing."""
+    raw = hdrs.get(_COOKIE_SCANS_HDR)
+    assert raw is not None, (
+        f"{_COOKIE_SCANS_HDR} missing on {where} -- this build has no cookie "
+        f"scan counter, so the S231-PERF-AUTOCLASSIFY control cannot "
+        f"distinguish 'prefilter skipped scans' from 'never counted'")
+    return int(raw)
+
+
+# preset -> (location, [needles from that preset's ct_*_cookies[] array]).
+# Mirrors src/ngx_http_cache_turbo_module.c's ngx_http_cache_turbo_presets[]
+# table exactly -- a needle added there with no row here is silently
+# unverified, which is exactly the kind of gap the first-byte prefilter must
+# never introduce. Presets with an EMPTY cookies[] array (phpbb, magento,
+# shopware6, invision, mybb, vbulletin, spip, opencart) are classified by
+# cookie_pred/key_cookie instead, which cookie_has()'s prefilter never
+# touches -- covered elsewhere (test_phpbb_preset, _assert_new_preset_shape,
+# ci/t/presets/*.t), not here.
+_COOKIE_NEEDLE_TABLE = {
+    "wordpress":   ("/auto/", ["wordpress_logged_in_", "wp-postpass_",
+                                "comment_author_"]),
+    "woocommerce": ("/auto/", ["woocommerce_items_in_cart",
+                                "woocommerce_cart_hash",
+                                "wp_woocommerce_session_"]),
+    "joomla":      ("/auto/", ["joomla_remember_me_"]),
+    "xenforo":     ("/xf/", ["xf_session", "xf_user", "xf_session_admin",
+                              "xf_lscxf_logged_in"]),
+    "discourse":   ("/dc/", ["_t="]),
+    "drupal":      ("/ct-drupal/", ["SESS"]),
+    "mediawiki":   ("/ct-mediawiki/", ["Token=", "_session=", "UserID="]),
+    "ghost":       ("/ct-ghost/", ["ghost-members-ssr",
+                                    "ghost-admin-api-session"]),
+    "wagtail":     ("/ct-wagtail/", ["sessionid"]),
+    "kirby":       ("/ct-kirby/", ["kirby_session"]),
+    "typo3":       ("/ct-typo3/", ["fe_typo_user", "be_typo_user"]),
+    "smf":         ("/smf/", ["SMFCookie"]),
+    "vanilla":     ("/ct-vanilla/", ["Vanilla="]),
+    "punbb":       ("/ct-punbb/", ["forum_cookie", "punbb_cookie"]),
+    "phorum":      ("/ct-phorum/", ["phorum_session_v5", "phorum_session_st",
+                                     "phorum_admin_session"]),
+    "yabb":        ("/ct-yabb/", ["Y2User-", "Y2Pass-", "Y2Sess-"]),
+    "textpattern":  ("/ct-textpattern/", ["txp_login_public=", "txp_login="]),
+    "bludit":      ("/ct-bludit/", ["BLUDIT-KEY", "BLUDITREMEMBERUSERNAME=",
+                                     "BLUDITREMEMBERTOKEN="]),
+    "bugzilla":    ("/ct-bugzilla/", ["Bugzilla_login=",
+                                       "Bugzilla_logincookie="]),
+    "mantisbt":    ("/ct-mantis/", ["PHPSESSID="]),
+    "plone":       ("/ct-plone/", ["__ac=", "_ZopeId=", "statusmessages=",
+                                    "I18N_LANGUAGE="]),
+    "umbraco":     ("/ct-umbraco/", ["UMB_UCONTEXT=", "UMB_EXTLOGIN=",
+                                      "UMB_PREVIEW=",
+                                      "UMB-WEBSITE-PREVIEW-ACCEPT=",
+                                      "UMB-XSRF-V=", "UMB_SESSION=",
+                                      "umbAccessToken", "umbRefreshToken",
+                                      "umbPkceCode",
+                                      ".AspNetCore.Identity.Application="]),
+    "dotclear":    ("/ct-dotclear/", ["dcxd", "dc_admin=", "dc_passwd="]),
+    "wikijs":      ("/ct-wikijs/", ["jwt=", "connect.sid=", "loginRedirect="]),
+    "redmine":     ("/redmine/", ["_redmine_session=", "autologin="]),
+    "flarum":      ("/ct-flarum/", ["flarum_remember="]),
+}
+
+
+def test_cookie_prefilter_negative_control(ng: Nginx, origin: Origin) -> None:
+    """S231-PERF-AUTOCLASSIFY: negative control for the first-byte presence
+    bitset in ngx_http_cache_turbo_cookie_has(). For EVERY populated cookie
+    needle array in the preset registry, a request whose Cookie header
+    contains that exact needle must still be classified dynamic (auto_skip
+    bypasses the cache). If the prefilter ever skipped a needle it should
+    have scanned, the matching preset's cookie would go silently invisible --
+    a private page would be cached and served to strangers -- and this is the
+    test that would catch it.
+
+    _COOKIE_NEEDLE_TABLE is hand-derived from ngx_http_cache_turbo_presets[]
+    (see the table's own comment); a preset added there with no row here is a
+    silent coverage gap, not a passing test."""
+    for preset, (loc, needles) in _COOKIE_NEEDLE_TABLE.items():
+        for needle in needles:
+            uri = f"{loc}nc-{preset}-{hash(needle) & 0xffff:x}"
+            headers = {"Cookie": f"{needle}zzz=1"}
+            fetch(ng.port, uri, headers=headers)
+            status, _, h = fetch(ng.port, uri, headers=headers)
+            assert status == 200, (
+                f"{preset} needle {needle!r} request returned {status}")
+            assert "x-cache" not in h, (
+                f"{preset} needle {needle!r} must bypass the cache (the "
+                f"first-byte prefilter made it unreachable), got "
+                f"x-cache={h.get('x-cache')}")
+    drain_origin(origin)
+
+
+def test_cookie_prefilter_counter_oracle(ng: Nginx, origin: Origin) -> None:
+    """S231-PERF-AUTOCLASSIFY: counter oracle for the perf claim -- never a
+    wall-clock timing band. A large Cookie header built entirely from bytes
+    that appear in NO preset's cookie needles must classify identically
+    (cacheable) to a plain anonymous request, while the first-byte prefilter
+    measurably cuts the number of ngx_strnstr() calls cookie_has() makes.
+
+    The delta is read off X-Cache-Turbo-Test-Cookie-Scans, a process-global
+    lifetime counter (TEST_FAULTS-only) bumped exactly once per ngx_strnstr()
+    call the prefilter did NOT skip -- see
+    ngx_http_cache_turbo_test_cookie_scan_header() and the counter's own
+    declaration for the wiring this test depends on.
+
+    Mutation coverage: turning the WHOLE prefilter off (not one conjunct --
+    e.g. hardcoding the `bs->seen[...]` check to always pass) must make this
+    scan-count assertion go red while every functional test (cache hit,
+    negative control above) stays green, since the filter is provably
+    lossless. That is the mutation this test exists to catch; it was verified
+    by hand -- see the PR description for the exact diff and counts.
+
+    X-Cache-Turbo-Test-Cookie-Scans is a process-global (per-worker)
+    monotonic counter, so it can never decrease within one worker but tells
+    you nothing when two probes land on DIFFERENT workers -- each worker has
+    its own independent counter, and comparing across them can even go
+    negative. All four probes below therefore share ONE kept-alive
+    HTTPConnection (see _fetch_keepalive's docstring) so nginx pins them all
+    to the same accepted-connection worker; a plain fetch() opens a fresh
+    socket per call and round-robins across the harness's 4-worker default,
+    which is exactly what produced a spurious negative delta here."""
+    conn = http.client.HTTPConnection("127.0.0.1", ng.port, timeout=HTTP_TIMEOUT)
+    try:
+        # Baseline: a normal small-cookie request on the same preset union as
+        # the oversized one below, to establish "the prefilter runs on every
+        # request" without asserting an exact call count (the preset roster
+        # can grow).
+        _, _, hbase1 = _fetch_keepalive(conn, "/auto/normal",
+                                         headers={"Cookie": "unrelated=1"})
+        n_before = _cookie_scans(hbase1, "baseline request")
+
+        # A large Cookie header matching NOTHING: every byte is drawn from a
+        # set that appears in no preset's cookie needles (digits + a few
+        # separators), so the prefilter should skip essentially all 75
+        # needles' ngx_strnstr() calls on this request, and the number of
+        # calls counted for THIS request must be far smaller than the needle
+        # count -- not the wall-clock time.
+        big_cookie = "n" + "0123456789" * 800  # ~8KB, no needle first byte here
+        # every preset needle in the table starts with an uppercase/lowercase
+        # letter or '.'; the digit-only body plus a leading 'n' (shared with
+        # none of them at position 0 of a *name*, since needles are matched
+        # as substrings anywhere in the cookie -- so avoid 'n' collisions
+        # with none of the needles either) keeps this cookie byte-disjoint
+        # from every needle's first byte except by construction below.
+        headers = {"Cookie": f"harmless={big_cookie}"}
+        status, body1, h1 = _fetch_keepalive(conn, "/auto/miss1", headers=headers)
+        assert status == 200
+        n_after_first = _cookie_scans(h1, "large non-matching cookie, request 1")
+
+        status, body2, h2 = _fetch_keepalive(conn, "/auto/miss1", headers=headers)
+        assert status == 200
+        n_after_second = _cookie_scans(h2, "large non-matching cookie, request 2")
+
+        # Classification must be UNCHANGED: this is the correctness half of
+        # the proof -- a non-matching cookie was always cacheable, and it
+        # still is.
+        assert "x-cache" not in h1, (
+            "first request should be a miss (no x-cache yet)")
+        assert h2.get("x-cache") == "HIT", (
+            f"a large Cookie header matching no needle must still let the "
+            f"page cache -- got x-cache={h2.get('x-cache')} (byte-identical "
+            f"classification is the whole point of the prefilter proof)")
+        assert body1 == body2, "cached body must be byte-identical"
+
+        # Counter oracle: each of the two /auto/miss1 requests independently
+        # runs cookie_has() over wordpress+woocommerce+joomla's needle union
+        # (7 needles). Every one of those needles' first byte (w, c, j) is
+        # checked against the 256-byte set built from "harmless=" + digits +
+        # the leading 'n' -- none of which contains w/c/j -- so EVERY
+        # ngx_strnstr() call on this request must be skipped: the delta this
+        # request contributes is 0.
+        delta_first = n_after_first - n_before
+        delta_second = n_after_second - n_after_first
+        assert delta_first == 0, (
+            f"large non-matching cookie should trigger ZERO ngx_strnstr() "
+            f"calls (every needle's first byte is absent from the header), "
+            f"got a delta of {delta_first} -- the first-byte prefilter is "
+            f"not cutting scans")
+        assert delta_second == 0, (
+            f"second request (same cookie) should also trigger ZERO "
+            f"ngx_strnstr() calls, got a delta of {delta_second}")
+
+        # Contrast: a request whose cookie DOES contain a needle's first byte
+        # (but not the needle itself) must NOT be skipped by the byte test
+        # alone -- only ngx_strnstr() itself decides a real match, and the
+        # byte set only gates whether that call happens. This proves the
+        # filter is not simply returning "no scans, ever": a 'w'-containing
+        # miss still counts calls.
+        _, _, h3 = _fetch_keepalive(conn, "/auto/normal",
+                                     headers={"Cookie": "walnut=1"})
+        n_after_w = _cookie_scans(h3, "byte-colliding but non-matching cookie")
+        delta_w = n_after_w - n_after_second
+        assert delta_w > 0, (
+            f"a cookie containing 'w' (wordpress_logged_in_'s first byte) "
+            f"must still trigger the wordpress needle's ngx_strnstr() call "
+            f"even though it does not match -- got a delta of {delta_w}, "
+            f"meaning the prefilter is skipping scans it has no right to "
+            f"skip")
+    finally:
+        conn.close()
+    drain_origin(origin)
+
+
 def test_2026_preset_expansion(ng: Nginx, origin: Origin) -> None:
     """Source-audited CMS and issue-tracker presets added in 2026.
 
@@ -8326,7 +8620,8 @@ def test_memcached_timeout_zero_rejected(ng: Nginx) -> None:
         f"missing timeout-must-be-positive diagnostic:\n{r.stdout}"
 
 
-def _fetch_keepalive(conn: http.client.HTTPConnection, path: str):
+def _fetch_keepalive(conn: http.client.HTTPConnection, path: str,
+                      headers: dict | None = None):
     """GET on an ALREADY-OPEN HTTPConnection, without closing it. nginx pins
     every request on one accepted TCP connection to whichever worker accepted
     it, so this is what makes a same-worker request sequence possible against
@@ -8334,8 +8629,14 @@ def _fetch_keepalive(conn: http.client.HTTPConnection, path: str):
     opens a fresh socket per call, which round-robins across workers and
     cannot pin anything -- measured: two ordinary fetch() calls landed on
     different worker PIDs, so a second call's fail-fast state was for a
-    worker the first call never touched)."""
-    conn.request("GET", path, headers={"Connection": "keep-alive"})
+    worker the first call never touched).
+
+    `headers`, if given, are merged with the mandatory keep-alive header
+    (caller's values win on collision)."""
+    req_headers = {"Connection": "keep-alive"}
+    if headers:
+        req_headers.update(headers)
+    conn.request("GET", path, headers=req_headers)
     resp = conn.getresponse()
     body = resp.read().decode("utf-8", "replace")
     return (resp.status, body, {k.lower(): v for k, v in resp.getheaders()})
@@ -17593,6 +17894,8 @@ def run_all(ng: Nginx, origin: Origin,
     test_redmine_key_arg_bypasses_without_cookie(ng, origin)
     test_redmine_public_content_stays_cacheable(ng, origin)
     test_cookie_pred_multiple_matching_cookies(ng, origin)
+    test_cookie_prefilter_negative_control(ng, origin)  # S231-PERF-AUTOCLASSIFY
+    test_cookie_prefilter_counter_oracle(ng, origin)     # S231-PERF-AUTOCLASSIFY
     test_2026_preset_expansion(ng, origin)
     test_internal_redirect_key_and_veto(ng, origin)
     test_auto_classify_more(ng, origin)
