@@ -892,6 +892,19 @@ typedef struct {
      * so it re-earns protection rather than inheriting it. */
     ngx_uint_t               promotable;
 
+    /* S231-EVICT-BLIND: second-chance bit for a live-SIE entry evicted while
+     * the breaker is OPEN. evict_one() does not skip a live-SIE candidate
+     * outright -- during an outage every resident entry can be SIE-live, and
+     * an unconditional skip finds alloc_evict() no victim at all, wedging
+     * every store behind a mutex-held spin (the same hang hazard evict_one()
+     * already guards against for the two-queue walk above). Instead a
+     * live-SIE candidate is passed over ONCE: this bit is set and the walk
+     * moves to the next tail candidate. A candidate whose bit is ALREADY set
+     * is evictable on sight, so the walk is still bounded by n_entries and
+     * still terminates. 0 = not yet spared (fresh node, or spared bit
+     * consumed by a prior eviction pass and the node re-inserted since). */
+    unsigned                 sie_spared:1;
+
     ngx_queue_t              lru;           /* LRU list linkage             */
 } ngx_http_cache_turbo_node_t;
 
