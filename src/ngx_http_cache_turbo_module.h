@@ -2064,6 +2064,21 @@ typedef struct {
     uint32_t                 sie_ttl;     /* abs serve-on-error window; 0=none */
 } ngx_http_cache_turbo_blob_hdr_t;
 
+/*
+ * S231-PERF-HDRWALK: one parsed TLV header entry, as produced by the single
+ * walk inside ngx_http_cache_turbo_blob_validate() and consumed directly by
+ * ngx_http_cache_turbo_restore_response() -- no second bounds-checking pass
+ * over the same bytes. name/val point INTO the caller's blob buffer (same
+ * lifetime as the blob itself; no copy).
+ */
+typedef struct {
+    const u_char             *name;
+    uint32_t                  nlen;
+    const u_char              *val;
+    uint32_t                   vlen;
+} ngx_http_cache_turbo_blob_href_t;
+
+
 /* CTB4 (RFC-2 stale-if-error): fixed-endian versioned wire format. CTB4 adds the
  * sie_ttl u32 after stale_ttl (44-byte header). Old CTB1/CTB2/CTB3 blobs in L2
  * fail the magic/version check and are treated as a miss (cache self-heals), so

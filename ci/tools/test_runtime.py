@@ -14258,6 +14258,85 @@ def test_l2_forged_blob_cannot_inject_headers(ng: Nginx, origin: Origin,
     assert origin.hits == origin_before, "L1 HIT unexpectedly used the origin"
 
 
+def test_l2_restore_href_array_alignment_ubsan(ng: Nginx, origin: Origin,
+                                               redis: RedisServer) -> None:
+    """S231-HDRWALK-VALIDATE-STRICTER regression: blob_validate()'s
+    S231-PERF-HDRWALK refs array (ngx_http_cache_turbo_blob_href_t, which holds
+    two `const u_char *` members) was allocated with ngx_pnalloc() -- nginx's
+    UNALIGNED byte allocator -- instead of ngx_palloc(). Under UBSan this was
+    caught immediately on the very first L2-fill restore carrying a header:
+
+        ngx_http_cache_turbo_module.c:990:26: runtime error: member access
+        within misaligned address ... which requires 8 byte alignment
+
+    and the worker exited (code 1) mid-response, which is why
+    test_breaker_l2_arming_site_gated_white_box (an unrelated test that merely
+    happens to exercise an L2-fill restore) died with a bare
+    RemoteDisconnected under the ASan/UBSan job with no other signal. This
+    test pins the actual defect directly rather than relying on that
+    coincidence: seed a real multi-header L2 blob, restore it (L2-fill serve,
+    then the promoted L1 HIT), and require BOTH the response bytes to be
+    correct AND the worker to still be alive afterward. A misaligned refs[]
+    write/read either crashes the worker outright (caught by assert_clean_logs
+    -> nginx exiting non-zero) or, under plain ASan without UBSan, is silently
+    tolerated by x86's relaxed alignment -- so the byte-correctness assertions
+    below are the fallback oracle for a non-UBSan build, and assert_clean_logs
+    at suite teardown is what actually proves the worker survived.
+    """
+    uri = "/l2e/href-align"
+    key = l2_key(uri)
+    redis.cli("DEL", key, lock_key(uri))
+
+    # Multiple headers so the refs[] array holds more than one entry -- a
+    # single-entry array can land on an accidentally-aligned offset and hide
+    # the bug. Values are distinct so a misaligned/garbage read is visible as
+    # wrong bytes even if the worker does not outright crash.
+    seeded = b"href-align-body\n"
+    blob = make_ctb4_blob(seeded, headers={
+        "Content-Type": "text/plain",
+        "X-Align-A":    "alpha",
+        "X-Align-B":    "bravo-bravo",
+        "X-Align-C":    "charlie-charlie-charlie",
+    })
+    redis.set_raw(key, blob, 60_000)
+    assert redis.cli("EXISTS", key) == "1", "failed to seed the alignment blob"
+
+    origin_before = origin.hits
+
+    # 1st read: L2-fill restore (the call site that allocates refs[] via
+    # blob_validate(..., r->pool, &refs)).
+    s1, body1, h1 = fetch(ng.port, uri)
+    assert s1 == 200, f"L2-fill serve: status {s1}"
+    assert h1.get("x-cache") == "HIT", \
+        f"L2-fill serve: expected HIT from the seeded L2 blob, got " \
+        f"x-cache={h1.get('x-cache')!r} (status {s1})"
+    assert body1 == seeded.decode(), \
+        f"L2-fill serve: body corrupted -- {body1!r} != {seeded!r}"
+    assert h1.get("x-align-a") == "alpha", \
+        f"L2-fill serve: X-Align-A corrupted: {h1.get('x-align-a')!r}"
+    assert h1.get("x-align-b") == "bravo-bravo", \
+        f"L2-fill serve: X-Align-B corrupted: {h1.get('x-align-b')!r}"
+    assert h1.get("x-align-c") == "charlie-charlie-charlie", \
+        f"L2-fill serve: X-Align-C corrupted: {h1.get('x-align-c')!r}"
+    assert origin.hits == origin_before, \
+        "origin was consulted; response is not the seeded L2 blob"
+
+    # 2nd read: L1 HIT promoted from the fill above -- same restore_response()
+    # call site, second walk of the same refs-array allocation path.
+    s2, body2, h2 = fetch(ng.port, uri)
+    assert s2 == 200 and h2.get("x-cache") == "HIT", \
+        f"L1 HIT serve: status {s2}, x-cache={h2.get('x-cache')!r}"
+    assert body2 == seeded.decode(), \
+        f"L1 HIT serve: body corrupted -- {body2!r} != {seeded!r}"
+    assert h2.get("x-align-a") == "alpha", \
+        f"L1 HIT serve: X-Align-A corrupted: {h2.get('x-align-a')!r}"
+    assert h2.get("x-align-b") == "bravo-bravo", \
+        f"L1 HIT serve: X-Align-B corrupted: {h2.get('x-align-b')!r}"
+    assert h2.get("x-align-c") == "charlie-charlie-charlie", \
+        f"L1 HIT serve: X-Align-C corrupted: {h2.get('x-align-c')!r}"
+    assert origin.hits == origin_before, "L1 HIT unexpectedly used the origin"
+
+
 def test_sie_forged_blob_cannot_inject_headers(ng: Nginx, origin: Origin,
                                                redis: RedisServer) -> None:
     """AUD-SIEBLOB1: test_l2_forged_blob_cannot_inject_headers pins the L2-fill
@@ -17443,6 +17522,7 @@ def run_all(ng: Nginx, origin: Origin,
         test_l2_preserves_original_freshness(ng, origin, redis)
         test_l2_malformed_blob_rejected(ng, origin, redis)  # STAB-4 validate
         test_l2_forged_blob_cannot_inject_headers(ng, origin, redis)   # AUD-BLOBE2E1
+        test_l2_restore_href_array_alignment_ubsan(ng, origin, redis)  # S231-HDRWALK-VALIDATE-STRICTER
         test_sie_forged_blob_cannot_inject_headers(ng, origin, redis)  # AUD-SIEBLOB1
         test_sie_ttl_stored_in_blob(ng, origin, redis)      # RFC-2 CTB4 sie_ttl
         test_l2_retain_ttl_covers_sie(ng, origin, redis)    # S1.2 retain_ttl

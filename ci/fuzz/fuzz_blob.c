@@ -196,7 +196,8 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         memcpy(buf, data, size);
     }
 
-    if (ngx_http_cache_turbo_blob_validate(buf, size, &hdr, &hb, &body)
+    if (ngx_http_cache_turbo_blob_validate(buf, size, &hdr, &hb, &body,
+                                           NULL, NULL)
         != NGX_OK)
     {
         free(buf);

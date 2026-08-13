@@ -65,10 +65,32 @@ emit_defines() {
          cap { buf = buf $0 ORS
                if ($0 ~ /^\} ngx_http_cache_turbo_blob_hdr_t;/) { printf "%s", buf; exit }
                if ($0 ~ /^\} /) { cap = 0; buf = "" } }' "$HDR"
+    echo ""
+    # S231-PERF-HDRWALK: the parsed-header-ref struct blob_validate() now fills
+    # in the same walk blob_next_header() drives. Same slice-not-mirror
+    # reasoning as the struct above.
+    awk '/^typedef struct \{/ { buf = $0 ORS; cap = 1; next }
+         cap { buf = buf $0 ORS
+               if ($0 ~ /^\} ngx_http_cache_turbo_blob_href_t;/) { printf "%s", buf; exit }
+               if ($0 ~ /^\} /) { cap = 0; buf = "" } }' "$HDR"
+    echo ""
+    # S231-PERF-HDRWALK: blob_validate() now calls blob_next_header() (defined
+    # further down in module.c, same as production), so the harness needs the
+    # same forward declaration module.c carries.
+    echo "static ngx_int_t ngx_http_cache_turbo_blob_next_header(const u_char **pp,"
+    echo "    const u_char *end, const u_char **name, uint32_t *nlen,"
+    echo "    const u_char **val, uint32_t *vlen);"
+    echo ""
 } > "$OUT"
 
 if ! grep -qF '} ngx_http_cache_turbo_blob_hdr_t;' "$OUT"; then
     echo "✗ could not slice ngx_http_cache_turbo_blob_hdr_t from $HDR" >&2
+    rm -f "$OUT"
+    exit 1
+fi
+
+if ! grep -qF '} ngx_http_cache_turbo_blob_href_t;' "$OUT"; then
+    echo "✗ could not slice ngx_http_cache_turbo_blob_href_t from $HDR" >&2
     rm -f "$OUT"
     exit 1
 fi
