@@ -757,6 +757,66 @@ test_evict_blind_second_chance_unit(void)
 }
 
 
+/* S231-EVICT-BLIND regression: lru_insert_new() must ZERO sie_spared.
+ *
+ * Nodes come from ngx_slab_alloc(), which does not zero. The four creation
+ * sites initialise every other field explicitly and originally missed this
+ * bit, so a node landing on dirty slab memory could be born sie_spared=1 --
+ * "already had its second chance" -- and be evicted by the FIRST pass that
+ * reached it. That is not merely a lost spare: the same funnel creates the
+ * cold-miss STUB (shm.c:~1059), and a stub evicted out from under its winner
+ * strands every waiter on that key until lock_ttl. It surfaced as
+ * test_store_failure_cleans_up_cold_stub failing in the runtime suite
+ * (lock_waits 0 -> 1) rather than anywhere near eviction.
+ *
+ * The other fixtures memset() their node to 0 before use, which is exactly
+ * what HID this defect -- so this test deliberately POISONS the allocation
+ * first, the way real slab memory arrives, and then asserts the production
+ * insert path cleared the bit. Mutation check: drop the `ctn->sie_spared = 0`
+ * from lru_insert_new() and this goes red while every other test stays green.
+ */
+static void
+test_evict_blind_insert_new_zeroes_spared_bit(void)
+{
+    ngx_http_cache_turbo_node_t  *ctn;
+
+    printf("S231-EVICT-BLIND regression: lru_insert_new zeroes sie_spared\n");
+    zone_reset();
+
+    ctn = ngx_slab_alloc_locked(&g_pool, sizeof(*ctn));
+    CHECK(ctn != NULL, "fixture: node alloc failed");
+    if (ctn == NULL) {
+        return;
+    }
+
+    /* Dirty slab memory: every byte set, so sie_spared reads as 1 unless the
+     * production path clears it. Deliberately NOT memset(0) like the other
+     * fixtures -- zeroing here would assert nothing. */
+    memset(ctn, 0xff, sizeof(*ctn));
+
+    memcpy(ctn->key, mkkey(0), 32);
+    ctn->node.key = 0x1000;
+    ctn->kind = NGX_HTTP_CACHE_TURBO_NODE_ENTRY;
+    ctn->data = NULL;
+    ctn->len  = 0;
+
+    CHECK(ctn->sie_spared == 1,
+          "fixture: poisoned node should read sie_spared=1 before insert "
+          "(otherwise this test cannot detect the missing initialisation)");
+
+    ngx_rbtree_insert(&g_sh.rbtree, &ctn->node);
+    ngx_http_cache_turbo_lru_insert_new(&g_zone, ctn);
+
+    CHECK(ctn->sie_spared == 0,
+          "S231-EVICT-BLIND: lru_insert_new() left sie_spared set on a node "
+          "from dirty slab memory -- a fresh node (including a cold-miss "
+          "stub) would be evicted on its FIRST eviction pass");
+
+    CHECK(ctn->seg == NGX_HTTP_CACHE_TURBO_SEG_PROBATION,
+          "fixture: lru_insert_new() must also have set seg=PROBATION");
+}
+
+
 /* Negative control: a NOT-live-SIE entry (window already closed) gets no
  * spare even while OPEN -- proves the predicate is genuinely reading
  * created+sie_ttl against `now`, not just "this is an ENTRY with a blob". */
@@ -3928,6 +3988,7 @@ main(void)
     test_s8_evict_terminates_on_empty_queues();
     test_evict_blind_second_chance_unit();
     test_evict_blind_expired_sie_no_spare();
+    test_evict_blind_insert_new_zeroes_spared_bit();
     test_s8_promote_on_second_hit();
     test_s231_lru_enforce_cap_is_bounded();
     test_s8_off_demotes_inherited_protected_nodes();

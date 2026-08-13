@@ -304,6 +304,17 @@ ngx_http_cache_turbo_lru_insert_new(ngx_http_cache_turbo_zone_t *z,
     ngx_http_cache_turbo_node_t *ctn)
 {
     ctn->seg = NGX_HTTP_CACHE_TURBO_SEG_PROBATION;
+
+    /* S231-EVICT-BLIND: nodes come from ngx_slab_alloc(), which does NOT zero
+     * -- every other field is initialised explicitly by the four creation
+     * sites, and this bit must be too. A node born with a garbage sie_spared
+     * of 1 reads as "already had its second chance" and is evicted on sight by
+     * the very first eviction pass that reaches it, including a cold-miss STUB
+     * (shm.c:~1059) whose disappearance strands every waiter on that key until
+     * lock_ttl. Initialised here rather than at each creation site because all
+     * four funnel through this function, exactly like `seg` above. */
+    ctn->sie_spared = 0;
+
     ngx_queue_insert_head(&z->sh->lru, &ctn->lru);
     z->sh->n_entries++;
 }
@@ -817,6 +828,14 @@ ngx_http_cache_turbo_shm_store_locked(ngx_http_cache_turbo_zone_t *z,
          * hold protected residency indefinitely without ever being read. */
         ctn->seg = NGX_HTTP_CACHE_TURBO_SEG_PROBATION;
         ctn->promotable = 0;
+
+        /* S231-EVICT-BLIND: a refresh installs a new representation with its
+         * own SIE window, so it re-earns its second chance rather than
+         * inheriting a spare already consumed by the body it replaced. This
+         * node is reused in place (not freshly allocated), so lru_insert_new()
+         * does not run for it and the bit would otherwise persist. */
+        ctn->sie_spared = 0;
+
         ngx_http_cache_turbo_lru_link_head(z, ctn);
 
         return NGX_OK;
