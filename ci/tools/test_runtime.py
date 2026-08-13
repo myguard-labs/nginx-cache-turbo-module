@@ -1171,6 +1171,22 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             cache_turbo_redis rediss://127.0.0.1:{redis_tls_untrusted_port}/0 tls_ca={redis_tls_ca} tls_name=localhost;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
+
+        # S231-L2-BACKOFF (TLS follow-up): same untrusted-CA backend as
+        # /l2tlsuntrusted/ above, but with connect_backoff armed. Every
+        # request's TLS handshake fails cert verification -- a TERMINAL
+        # handshake failure, not a TCP connect refusal -- so this proves the
+        # backoff also arms off the TLS path, not just a plain-TCP connect()
+        # error. cache_turbo_lock off for the same reason as /l2backoff/: one
+        # L2 attempt per request, exact counter deltas.
+        location /l2tlsbackoff/ {{
+            cache_turbo       main;
+            cache_turbo_key   $uri;
+            cache_turbo_valid 1s;
+            cache_turbo_lock  off;
+            cache_turbo_redis rediss://127.0.0.1:{redis_tls_untrusted_port}/0 tls_ca={redis_tls_ca} tls_name=localhost prefix=ctbotls: connect_backoff=5000ms;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
 """
     if redis_tls_expired_port is not None:
         # Same trusted CA as /l2tls/ (chain trust is fine), but the leaf cert's
@@ -14066,6 +14082,112 @@ def test_redis_tls_untrusted_ca_rejected(
         "CA -- SSL_CTX_set_verify(PEER) is not being applied (AUD-TLS1)"
 
 
+def test_redis_tls_handshake_failure_arms_backoff(
+        ng: Nginx, origin: Origin,
+        redis_tls_untrusted: RedisServer) -> None:
+    """S231-L2-BACKOFF TLS follow-up: a TERMINAL TLS handshake failure
+    (bad cert chain here; the same code path also covers wrong SNI, protocol
+    mismatch, or the peer closing mid-handshake) must arm the SAME
+    per-worker connect backoff a plain TCP connect() refusal arms. Before
+    the fix, ngx_http_cache_turbo_redis_tls_handshake_done()'s three failure
+    branches (not c->ssl->handshaked, verify-result != X509_V_OK, SNI/host
+    mismatch) called op_fail() without op->clcf carrying the backoff
+    context far enough for the arm to survive to op_fail() -- so every
+    request kept re-dialing and re-handshaking a doomed TLS peer forever
+    instead of failing fast after the first failure.
+
+    /l2tlsbackoff/ points at redis_tls_untrusted (cert signed by a CA nginx
+    does not trust for this location -- see /l2tlsuntrusted/ above), with
+    connect_backoff=5000ms. Unlike /l2backoff/'s plain-TCP fixture, this
+    location cannot use `cache_turbo_lock off` + a raw connection-count
+    oracle to get an exact "one L2 attempt per request" delta: a MISS here
+    still fires a fire-and-forget write-through SET as a SECOND, independent
+    L2 op alongside the GET (measured -- a single client request produces
+    TWO separate "cache_turbo: redis connect" attempts against
+    redis_tls_untrusted, one per op), so raw connection counts are not a
+    precise 1:1 oracle. Instead this reuses the SAME oracle
+    test_redis_connect_backoff_fails_fast() uses for the plain-TCP case:
+    the X-Cache-Turbo-Test-L2-Backoff header's redis fail-fast-skip counter,
+    bumped exactly once per op that finds the window already armed
+    (_launch()'s choke point), regardless of whether that op is the GET or
+    the write-through SET -- so it stays exact no matter how many L2 ops one
+    client request fans out into.
+
+    All three requests share ONE kept-alive connection so they land on the
+    same worker (per-worker backoff table -- see _fetch_keepalive's
+    docstring):
+      0. baseline read of the SAME global counter off a request that never
+         touches this backend at all (see baseline note below).
+      1. request 1 ARMS the window (the handshake failure itself) -- it must
+         add exactly ZERO to the counter measured from the baseline.
+      2. request 2, inside the 5s window, must fail fast: counter increases.
+      3. request 3, still inside the window, must fail fast again: counter
+         increases again -- proves it is not a one-shot arm.
+
+    BASELINE NOTE: `ngx_http_cache_turbo_redis_test_backoff_skips` (the
+    counter behind the X-Cache-Turbo-Test-L2-Backoff header, see its field
+    comment in ngx_http_cache_turbo_module.c ~L6940 -- "process-global...
+    per-worker") is a single lifetime atomic for the whole worker process,
+    not a per-location or per-test value. `test_redis_connect_backoff_fails_fast`
+    (this file, ~L8344) runs EARLIER in run_all() against the SAME worker
+    (both tests land on worker 0 under the suite's ordinary scheduling) and
+    deliberately leaves it at a nonzero value (its own n2/n3 assertions
+    require 2 fail-fast skips to have landed). Reading this counter as if it
+    started at 0 for THIS test is a baseline artifact of test ordering, not a
+    property of the TLS arm path -- CI's own failure shows the counter at 3
+    (Runtime + both ASan jobs, at this exact n1==0 assertion) after
+    test_redis_connect_backoff_fails_fast's own n2/n3 sequence left it at 2,
+    while a fresh-process, single-test run against this same backend
+    measures n1==0 every time -- the counter genuinely starts wherever the
+    process's history left it, never per-location zero. So the oracle here
+    is a DELTA against a baseline captured from a request
+    that provably cannot itself move this counter: /c/ is a plain L1-only
+    cache_turbo location (no cache_turbo_redis backend at all), so a GET
+    there cannot dial redis and cannot bump the fail-fast skip counter --
+    its response's copy of the header is a pure read of "whatever this
+    worker's counter already was", taken on the SAME kept-alive connection
+    (same worker) as the three probes that follow. This preserves the
+    original invariant under test (arming is not itself counted as a skip)
+    while dropping the false assumption that the counter starts at absolute
+    zero."""
+    if ng.redis_port is None:
+        return
+
+    conn = http.client.HTTPConnection("127.0.0.1", ng.port, timeout=HTTP_TIMEOUT)
+    try:
+        s0, b0, h0 = _fetch_keepalive(conn, "/c/l2tlsbackoff-baseline")
+        assert s0 == 200, f"baseline request did not reach origin: {s0} {b0}"
+        n0 = _backoff_skips(h0, "TLS baseline", driver="redis")
+
+        s1, b1, h1 = _fetch_keepalive(conn, "/l2tlsbackoff/probe-one")
+        assert s1 == 200, f"request 1 (arms backoff) did not reach origin: {s1} {b1}"
+        n1 = _backoff_skips(h1, "TLS request 1", driver="redis")
+        assert n1 == n0, (
+            f"request 1 is the TLS handshake failure that ARMS the window "
+            f"-- it must not itself be counted as a fail-fast skip "
+            f"(baseline={n0}, after arming={n1})")
+
+        s2, b2, h2 = _fetch_keepalive(conn, "/l2tlsbackoff/probe-two")
+        assert s2 == 200, f"request 2 (fail-fast) did not reach origin: {s2} {b2}"
+        n2 = _backoff_skips(h2, "TLS request 2", driver="redis")
+        assert n2 > n1, (
+            f"request 2 landed inside the window armed by request 1's TLS "
+            f"handshake failure, but the redis fail-fast counter did not "
+            f"move ({n1} -> {n2}) -- a TLS handshake failure did not arm "
+            f"the connect backoff, so this worker re-dialed and "
+            f"re-handshaked a peer already known to be rejecting us")
+
+        s3, b3, h3 = _fetch_keepalive(conn, "/l2tlsbackoff/probe-three")
+        assert s3 == 200, f"request 3 (fail-fast) did not reach origin: {s3} {b3}"
+        n3 = _backoff_skips(h3, "TLS request 3", driver="redis")
+        assert n3 > n2, (
+            f"request 3, still inside the 5s window, did not fail fast "
+            f"again ({n2} -> {n3}) -- the TLS handshake-failure arm looks "
+            f"like a one-shot instead of a window")
+    finally:
+        conn.close()
+
+
 def test_redis_tls_expired_cert_rejected(
         ng: Nginx, origin: Origin,
         redis_tls_expired: RedisServer) -> None:
@@ -17743,6 +17865,8 @@ def run_all(ng: Nginx, origin: Origin,
                 ng, origin, redis, redis_tls)
     if redis_tls_untrusted is not None:
         test_redis_tls_untrusted_ca_rejected(ng, origin, redis_tls_untrusted)
+        test_redis_tls_handshake_failure_arms_backoff(
+            ng, origin, redis_tls_untrusted)  # S231-L2-BACKOFF TLS follow-up
     if redis_tls_expired is not None:
         test_redis_tls_expired_cert_rejected(ng, origin, redis_tls_expired)
     if mc is not None:

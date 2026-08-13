@@ -165,6 +165,8 @@ def main() -> int:
     redis_auth_port = args.port + 22 if args.redis_server else None
     redis_tls_port = args.port + 23 if args.redis_server else None
     memcached_port = args.port + 24 if args.memcached_server else None
+    redis_tls_untrusted_port = args.port + 25 if args.redis_server else None
+    redis_tls_expired_port = args.port + 26 if args.redis_server else None
     redis_password = "ctsecret"
 
     rc = 0
@@ -172,6 +174,7 @@ def main() -> int:
         root = pathlib.Path(tmp)
         origin = T.Origin(origin_port, delay=0.05)
         redis = redis_auth = redis_tls = mc = None
+        redis_tls_untrusted = redis_tls_expired = None
         tls_certs = None
 
         if args.memcached_server:
@@ -186,8 +189,24 @@ def main() -> int:
                 tls_certs = T.gen_tls_certs(root / "redis-tls-certs")
                 redis_tls = T.RedisServer(rbin, root / "redis-tls",
                                           redis_tls_port, tls_certs=tls_certs)
+                # AUD-TLS1 negative fixtures, same as test_runtime.py's own
+                # main(): a second untrusted CA + an expired-but-trusted cert,
+                # needed by any named test that exercises a genuine TLS
+                # handshake FAILURE (S231-L2-BACKOFF TLS follow-up) rather
+                # than a successful handshake.
+                untrusted_certs = T.gen_tls_certs(
+                    root / "redis-tls-untrusted-certs")
+                redis_tls_untrusted = T.RedisServer(
+                    rbin, root / "redis-tls-untrusted",
+                    redis_tls_untrusted_port, tls_certs=untrusted_certs)
+                expired_certs = T.gen_tls_expired_cert(
+                    root / "redis-tls-expired-certs",
+                    tls_certs["ca_key"], tls_certs["ca"])
+                redis_tls_expired = T.RedisServer(
+                    rbin, root / "redis-tls-expired",
+                    redis_tls_expired_port, tls_certs=expired_certs)
             except Exception:
-                redis_tls = None
+                redis_tls = redis_tls_untrusted = redis_tls_expired = None
                 tls_certs = None
 
         ng = T.Nginx(binary, module, root / "server", args.port, origin_port,
@@ -197,7 +216,13 @@ def main() -> int:
                      redis_tls_port=redis_tls_port if redis_tls else None,
                      redis_tls_ca=(tls_certs or {}).get("ca"),
                      memcached_port=memcached_port if mc else None,
-                     fault_injection=args.fault_injection)
+                     fault_injection=args.fault_injection,
+                     redis_tls_untrusted_port=(
+                         redis_tls_untrusted_port
+                         if redis_tls_untrusted else None),
+                     redis_tls_expired_port=(
+                         redis_tls_expired_port
+                         if redis_tls_expired else None))
         ng.sanitizer = args.sanitizer
 
         try:
@@ -206,10 +231,10 @@ def main() -> int:
                 if srv is not None:
                     srv.start()
             if redis_tls is not None:
-                try:
-                    redis_tls.start()
-                except Exception:
-                    redis_tls = None
+                redis_tls, redis_tls_untrusted, redis_tls_expired = (
+                    T._start_tls_fixtures(
+                        redis_tls, redis_tls_untrusted, redis_tls_expired,
+                        lambda *a, **kw: None))
             if mc is not None:
                 mc.start()
 
@@ -220,6 +245,8 @@ def main() -> int:
             FIXTURES = {
                 "ng": ng, "origin": origin, "redis": redis,
                 "redis_auth": redis_auth, "redis_tls": redis_tls, "mc": mc,
+                "redis_tls_untrusted": redis_tls_untrusted,
+                "redis_tls_expired": redis_tls_expired,
             }
             for name, fn in fns:
                 kw = {}
