@@ -1864,6 +1864,28 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             cache_turbo_redis              127.0.0.1:{port + PORT_OFFSETS["redis_dead"]} prefix=ctboo: timeout=250ms connect_backoff=0;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
+
+        # S231-COLDWAIT-UAF repro: live redis (cache_turbo_lock default ON),
+        # short lock_timeout so the 100ms cold_wait poll fires repeatedly
+        # against LOSER requests parked behind a same-key cross-node NX
+        # lock while the winner regenerates from a deliberately slow
+        # origin. This is the fixture that reproduces the cold-wait poll
+        # timer double-free (issues.md "cold-wait poll timer double-frees
+        # the request"): a loser's kept-alive connection is aborted by the
+        # client WHILE parked in cold_wait, independently of the poll
+        # timer; nginx's own connection-close path can finalize+free `r`
+        # before the already-armed cold_wait_ev fires via
+        # ngx_event_expire_timers(), which then calls
+        # ngx_http_cache_turbo_cold_wait_timeout() -> ...
+        # -> ngx_http_finalize_request() a second time on freed memory.
+        location /coldwaituaf/ {{
+            cache_turbo                    main;
+            cache_turbo_key                $uri;
+            cache_turbo_valid               1s;
+            cache_turbo_lock_timeout        2s;
+            cache_turbo_redis              127.0.0.1:{redis_port} prefix=ctcw: timeout=250ms;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
 """
 
     # L2 memcached (v13): a location wired to the memcached backend instead of
@@ -8323,6 +8345,136 @@ def test_redis_connect_backoff_disabled_never_arms(ng: Nginx, origin: Origin) ->
             f"counter moved ({n1} -> {n3}) on the third back-to-back request")
     finally:
         conn.close()
+
+
+def test_cold_wait_poll_timer_no_uaf(ng: Nginx, origin: Origin) -> None:
+    """S231-COLDWAIT-UAF -- NOT A CONFIRMED ORACLE, see below. Left in place
+    (skipped) as a documented negative result and a starting point for the
+    next attempt, per grind worker-contract rules on an unconfirmed root
+    cause: "a reproducing test (marked skipped/xfail if it crashes the
+    suite)". Here the situation is the mirror image -- it never crashes the
+    suite -- so it is marked skipped instead of wired as a real assertion,
+    to avoid shipping a green test that proves nothing.
+
+    Original theory (module.c ~6353,
+    ngx_http_cache_turbo_cold_wait_timeout): ngx_event_expire_timers()
+    (nginx core) calls the timer handler SYNCHRONOUSLY (ev->timer_set
+    cleared, ev->handler(ev) called directly -- confirmed by reading
+    ngx_event_timer.c, no ngx_posted_events involved). The handler does
+    ngx_http_core_run_phases(r); ngx_http_run_posted_requests(c);
+    ngx_http_finalize_request(r, NGX_DONE). Theory: if run_phases() itself
+    reaches a terminal finalize that frees r (e.g. the re-poll's L2 GET
+    finds the winner's fill and content phase serves + finalizes inline),
+    the trailing finalize_request() call runs a second time on freed
+    memory -- matching the observed backtrace in issues.md ("cold-wait poll
+    timer double-frees the request": cold_wait_timeout -> expire_timers ->
+    finalize_request -> finalize_connection -> set_keepalive ->
+    free_request -> SIGSEGV).
+
+    REFUTED (gdb evidence, not guessed): ngx_http_cache_turbo_cold_wait()
+    does r->main->count++ on EVERY re-poll parking attempt, and the ONLY
+    balancing decrement is the ONE trailing finalize_request(r, NGX_DONE)
+    call. A gdb breakpoint on that trailing call, sampled ~70 times across
+    slow-origin (many re-polls, count balloons to 10-36) and fast-origin
+    (served on the FIRST poll, count==1 going in -- the precise
+    precondition the theory needs) runs, showed r->pool non-NULL,
+    r->connection->destroyed==0, r->main->count==1 EVERY time at that call
+    site: run_phases() never itself drops count to 0 before returning to
+    the trailing call. ngx_http_set_keepalive's ngx_http_free_request is
+    the LAST step of the SAME trailing call's count 1->0 transition, not an
+    earlier independent free. Confirmed via 6+ repro shapes (concurrency
+    24 losers/round x 6 rounds, --single-process, resume-to-completion
+    losers, abort-mid-wait losers, ASan build) -- none crashed, none showed
+    a premature free under gdb.
+
+    UNTESTED remaining lead: the abort-mid-wait path was tried but not
+    isolated under gdb specifically -- a client closing the kept-alive
+    connection WHILE parked in cold_wait() (independent of the poll timer)
+    could in principle let nginx's own connection-close teardown free r
+    through a DIFFERENT path than cold_wait_timeout's own trailing call,
+    which would then fire later via the still-armed rbtree entry. This
+    needs its own gdb instrumentation on ngx_http_close_request /
+    ngx_http_free_request reached from a read-event/EPOLLRDHUP path while
+    cold_wait_ev is armed, which the investigation ran out of budget to do.
+
+    /coldwaituaf/ (nginx_config() above) is wired to LIVE redis with
+    cache_turbo_lock left ON (module default) and lock_timeout 2s so a cold
+    miss genuinely parks in ngx_http_cache_turbo_cold_wait() and the 100ms
+    poll timer fires repeatedly under real cross-node NX lock contention
+    against a winner regenerating from a slow origin -- kept as the
+    fixture location for whoever picks this back up."""
+    if True:
+        # S231-COLDWAIT-UAF: skipped -- see docstring. Does not reproduce
+        # the crash under any repro shape tried (multiple sessions,
+        # concurrency/timing sweeps, ASan, gdb instrumentation all
+        # negative); wiring this in as an assertion would be a green test
+        # that proves nothing (worker-contract: never ship a test whose
+        # oracle cannot fail). Left callable and documented, not deleted,
+        # so the next attempt starts from the fixture instead of re-deriving
+        # it.
+        return
+    if ng.redis_port is None:
+        return
+
+    origin.delay = 1.5  # slow enough that losers really park across >1 poll
+    try:
+        key = "/coldwaituaf/racekey"
+        winner_sock = socket.create_connection(("127.0.0.1", ng.port), 5)
+        winner_sock.sendall(
+            f"GET {key} HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n"
+            .encode())
+
+        # give the winner time to take the NX lock and start regenerating
+        time.sleep(0.2)
+
+        # loser connections, each parked on the same key behind the NX
+        # lock, each aborted mid-wait (client closes while cold_wait_ev is
+        # still armed) instead of read to completion -- this is what races
+        # nginx's own connection-close teardown against the poll timer.
+        # Abort delays sweep across and past the 100ms poll boundary so at
+        # least one loser is aborted right as its timer is about to (or
+        # just did) fire.
+        abort_delays = [0.05, 0.09, 0.10, 0.11, 0.15, 0.20, 0.30, 0.45]
+        for d in abort_delays:
+            loser = socket.create_connection(("127.0.0.1", ng.port), 5)
+            loser.sendall(
+                f"GET {key} HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n"
+                .encode())
+            time.sleep(d)
+            loser.close()
+
+        # let any timers scheduled against the aborted losers actually fire
+        time.sleep(1.5)
+
+        # drain the winner so the response doesn't wedge the test
+        winner_sock.settimeout(5)
+        try:
+            while winner_sock.recv(4096):
+                pass
+        except (socket.timeout, ConnectionResetError, BrokenPipeError):
+            pass
+        winner_sock.close()
+
+        # liveness probe: a crashed worker either refuses the connection or
+        # the master respawns a worker that has lost in-flight test-fault
+        # state; either way this must still cleanly answer 200.
+        conn = http.client.HTTPConnection("127.0.0.1", ng.port, timeout=HTTP_TIMEOUT)
+        try:
+            s, b, _ = _fetch_keepalive(conn, "/coldwaituaf/liveness-probe")
+        except (http.client.RemoteDisconnected, ConnectionResetError,
+                BrokenPipeError, http.client.CannotSendRequest,
+                ConnectionRefusedError) as exc:
+            raise AssertionError(
+                f"worker did not survive the cold-wait poll timer race "
+                f"({exc!r}) -- UAF/double-free on cold_wait_ev "
+                f"(S231-COLDWAIT-UAF)") from exc
+        finally:
+            conn.close()
+        assert s == 200, (
+            f"post-race liveness probe expected 200, got {s}: {b[:200]!r}")
+    finally:
+        origin.reset_delay()
+        drain_origin(origin)
 
 
 def test_memcached_connect_backoff_fails_fast(ng: Nginx, origin: Origin) -> None:
@@ -16838,6 +16990,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_redis_connect_backoff_config_parse(ng)               # S231-L2-BACKOFF
     test_redis_connect_backoff_fails_fast(ng, origin)          # S231-L2-BACKOFF
     test_redis_connect_backoff_disabled_never_arms(ng, origin) # S231-L2-BACKOFF
+    test_cold_wait_poll_timer_no_uaf(ng, origin)                # S231-COLDWAIT-UAF
     test_memcached_connect_backoff_fails_fast(ng, origin)       # S231-L2-BACKOFF
     test_valid_dup_status_warns(ng)
     test_tag_without_l2_warns(ng)
