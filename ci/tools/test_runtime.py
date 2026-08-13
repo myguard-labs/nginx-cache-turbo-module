@@ -8367,15 +8367,36 @@ def test_redis_connect_backoff_fails_fast(ng: Nginx, origin: Origin) -> None:
     requests on different workers would each see their own never-armed table
     and the test would be a coin flip on the harness's 4-worker default.
 
+    BASELINE NOTE: `ngx_http_cache_turbo_redis_test_backoff_skips` (the
+    counter behind the X-Cache-Turbo-Test-L2-Backoff header, see its field
+    comment in ngx_http_cache_turbo_module.c ~L6940 -- "process-global...
+    per-worker") is a single lifetime atomic for the whole worker process,
+    not a per-location or per-test value. This test runs in run_all() on the
+    same worker as other backoff tests (e.g., test_redis_tls_handshake_failure_arms_backoff
+    around line 14085) and may find the counter at a nonzero value from
+    prior tests. Reading this counter as if it started at 0 for THIS test is a
+    baseline artifact of test ordering, not a property of the backoff arm path.
+    The oracle here is a DELTA against a baseline captured from a request
+    that provably cannot itself move this counter: /c/ is a plain L1-only
+    cache_turbo location (no cache_turbo_redis backend at all), so a GET
+    there cannot dial redis and cannot bump the fail-fast skip counter -- its
+    response's copy of the header is a pure read of "whatever this worker's
+    counter already was", taken on the SAME kept-alive connection (same worker)
+    as the three probes that follow. This preserves the original invariant
+    under test (arming is not itself counted as a skip) while dropping the
+    false assumption that the counter starts at absolute zero.
+
     Sequence:
+      0. baseline read of the SAME global counter off a request that never
+         touches the redis backend at all.
       1. request 1 ARMS the window (the connect failure itself) -- the
          counter does NOT move for this one; arming and fail-fast-skipping
          are different events (armed=0 -> the failure that ordinarily always
          happens; only a request that finds the window already armed skips).
       2. request 2, entirely inside the 5s window, must fail fast: counter
-         goes from 0 to 1.
+         increases relative to baseline.
       3. request 3, still inside the window, must fail fast again: counter
-         goes from 1 to 2 -- proves it is not a one-shot arm.
+         increases again -- proves it is not a one-shot arm.
 
     All three requests still get a normal 200 from origin (L2 is advisory),
     so a functional regression here would be invisible without the counter."""
@@ -8384,12 +8405,17 @@ def test_redis_connect_backoff_fails_fast(ng: Nginx, origin: Origin) -> None:
 
     conn = http.client.HTTPConnection("127.0.0.1", ng.port, timeout=HTTP_TIMEOUT)
     try:
+        s0, b0, h0 = _fetch_keepalive(conn, "/c/l2backoff-baseline")
+        assert s0 == 200, f"baseline request did not reach origin: {s0} {b0}"
+        n0 = _backoff_skips(h0, "baseline", driver="redis")
+
         s1, b1, h1 = _fetch_keepalive(conn, "/l2backoff/probe-one")
         assert s1 == 200, f"request 1 (arms backoff) did not reach origin: {s1} {b1}"
         n1 = _backoff_skips(h1, "request 1", driver="redis")
-        assert n1 == 0, (
+        assert n1 == n0, (
             f"request 1 is the connect failure that ARMS the window -- it "
-            f"must not itself be counted as a fail-fast skip (counter={n1})")
+            f"must not itself be counted as a fail-fast skip (baseline={n0}, "
+            f"after arming={n1})")
 
         s2, b2, h2 = _fetch_keepalive(conn, "/l2backoff/probe-two")
         assert s2 == 200, f"request 2 (fail-fast) did not reach origin: {s2} {b2}"
