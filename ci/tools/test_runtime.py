@@ -811,7 +811,19 @@ class Origin:
                     except BrokenPipeError:
                         pass
                     return
-                body = f"gen-{n}\n".encode()
+                if "midbody-mismatch" in self.path:
+                    # S231-SIE-MIDBODY framing test: a body deliberately a
+                    # DIFFERENT length than the already-primed snapshot for
+                    # the same cache key ($uri excludes the query string this
+                    # marker rides in on, so it does not create a new key).
+                    # Content-Length below is correctly the length of THIS
+                    # body -- that is the framing the client is told to
+                    # expect, and the module's rescue must decline once the
+                    # snapshot cannot match it. See
+                    # test_sie_midbody_rescue_declines_on_length_mismatch.
+                    body = f"gen-{n}-mismatch-longer-body\n".encode()
+                else:
+                    body = f"gen-{n}\n".encode()
                 self.send_response(200)
                 self.send_header("Content-Type",
                                  "application/json; charset=utf-8")
@@ -2115,6 +2127,40 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             cache_turbo_admin    storefailz;
             allow 127.0.0.1;
             deny all;
+        }}
+
+        # S231-SIE-MIDBODY: same short fresh/stale window + "sieserve" marker
+        # convention as /sieserve/ so a warmed key gets a serve-on-error
+        # snapshot armed (sie_armed), but the fault fires in the BODY filter
+        # instead of driving the origin to a real 5xx -- cache_turbo_test_
+        # midbody_abort treats the first arriving body buffer as a mid-body
+        # origin death regardless of what status the origin actually sent.
+        # This is the header-filter trigger's blind spot: that trigger only
+        # ever sees r->headers_out.status, and a mid-body death arrives with
+        # headers already serialised as a normal 200. Drives
+        # test_sie_midbody_rescue.
+        location /midbody/ {{
+            cache_turbo                  main;
+            cache_turbo_key              $uri;
+            cache_turbo_valid            1s;
+            cache_turbo_stale_mult       1;
+            cache_turbo_keep_stale       off;
+            cache_turbo_test_midbody_abort on;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # S231-SIE-MIDBODY negative control: identical fault directive, but
+        # NO stale-if-error window ever gets armed (no "sieserve" marker in
+        # the key, so sie_armed stays 0 for every request). Proves the fault
+        # cannot fabricate a body out of nothing -- with nothing armed the
+        # rescue's own `ctx->sie_armed` guard must refuse it and the
+        # (truncated-by-the-fault) response must pass through unchanged.
+        location /midbodycold/ {{
+            cache_turbo                  main;
+            cache_turbo_key              $uri;
+            cache_turbo_valid            30s;
+            cache_turbo_test_midbody_abort on;
+            proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 """
 
@@ -11852,6 +11898,124 @@ def test_unbuf_oversize_abort_mid_stream(ng: Nginx, origin: Origin) -> None:
          "chunk was lost, duplicated or reordered mid-stream")
 
 
+def test_sie_midbody_rescue(ng: Nginx, origin: Origin) -> None:
+    """S231-SIE-MIDBODY: the header-filter SIE trigger (module.c ~:7948) only
+    fires on the ORIGIN'S STATUS -- it can never see a mid-body origin death,
+    because that arrives with headers already sent as an ordinary 200. This
+    is the body filter's own pre-flush rescue: cache_turbo_test_midbody_abort
+    makes the body filter treat the FIRST arriving buffer as that failure,
+    deterministically, without depending on real connection-teardown timing.
+
+    /midbody/ shares the /sieserve/ fixture shape (1s fresh, stale_mult 1,
+    the "sieserve" request-suffix marker that makes the origin emit
+    stale-if-error=30) so a warmed key both fully expires past its stale
+    window AND stays inside its SIE window. The assertion is on the BODY,
+    per the row's own done criterion, not the status: the rescue is body-only
+    (headers were already 200 by the time the body filter can act -- see the
+    long comment at the rescue site in ngx_http_cache_turbo_body_filter for
+    why rewriting r->headers_out here would be invisible to the client), so
+    the client-visible status stays 200. What must NOT happen is a truncated
+    prefix -- the body must equal the full warmed snapshot exactly.
+
+    Negative control (mandatory, S231-SIE-MIDBODY's own requirement): the
+    same fault directive on /midbodycold/, where no "sieserve" marker is ever
+    sent so sie_armed stays 0 for every request -- the fault must not
+    fabricate a body out of nothing; the (fault-truncated) response passes
+    through unchanged."""
+    # Prime /midbody/ with a real (non-fault) response so a snapshot lands
+    # armed with an SIE window, exactly as /sieserve/'s own prime does.
+    s0, b0, _ = fetch(ng.port, "/midbody/sieserve-mb1")
+    assert s0 == 200 and b0, f"prime failed: {s0} {b0!r}"
+
+    time.sleep(1.3)     # past fresh (1s), stale_mult 1 -> 1s window: expired
+
+    s, b, _ = fetch(ng.port, "/midbody/sieserve-mb1")
+    assert s == 200, f"mid-body rescue returned {s}, expected 200"
+    assert b == b0, \
+        (f"mid-body rescue served {b!r} ({len(b)} bytes), expected the full "
+         f"warmed snapshot {b0!r} ({len(b0)} bytes) -- a truncated prefix "
+         "means the rescue did not replace the fault-truncated body")
+
+    # Negative control: no SIE window ever armed on this key -> the rescue's
+    # own `ctx->sie_armed` guard must refuse, and the fault must not fabricate
+    # a body out of nothing.
+    #
+    # ⚠ The assertion is on the FIRST (cold-miss) fetch, not a follow-up. This
+    # location caches for 30s with no "sieserve" marker, so a second fetch is
+    # an ordinary HIT that never re-enters the rescue guard at all -- asserting
+    # there would be vacuous. The cold miss is the only request on this key
+    # where the fault fires AND the guard is evaluated, so it is the only one
+    # that can falsify "the fault fabricates a snapshot".
+    sc0, bc0, hc0 = fetch(ng.port, "/midbodycold/cold-mb1")
+    assert sc0 == 200, f"cold control returned {sc0}"
+    assert hc0.get("x-cache") != "STALE-IF-ERROR", \
+        "no SIE window was ever armed on this key -- the fault must not " \
+        "fabricate a STALE-IF-ERROR serve"
+    # The origin numbers every body ("gen-<n>"), and the warmed /midbody/
+    # snapshot above is a DIFFERENT counter value, so this also proves the
+    # rescue did not splice some other key's snapshot in here.
+    assert bc0 != b0, \
+        (f"cold control served {bc0!r}, the same bytes as the /midbody/ "
+         "snapshot -- with nothing armed on this key the rescue must not "
+         "produce a snapshot body at all")
+
+
+def test_sie_midbody_rescue_declines_on_length_mismatch(ng: Nginx,
+                                                          origin: Origin) -> None:
+    """S231-SIE-MIDBODY / framing: by the time the body filter can act, the
+    header filter chain has ALREADY serialised r->headers_out.content_length_n
+    onto the wire for this 200 -- the client is committed to that framing
+    before the rescue ever gets a chance to run. If the warmed snapshot's body
+    is a DIFFERENT length than what the origin's (fault-truncated) response
+    advertised, splicing the snapshot in anyway corrupts the framing: the
+    client either hangs waiting for bytes that will never arrive, or desyncs a
+    kept-alive connection. That is worse than the truncated body the rescue
+    exists to fix, so the module must decline the rescue whenever the lengths
+    cannot be proven equal, and let the (fault-truncated) response through
+    unchanged instead -- exactly like the /midbodycold/ negative control in
+    test_sie_midbody_rescue, but here sie_armed IS true and the only thing
+    that differs is the length.
+
+    /midbody/ is keyed on $uri, which excludes the query string, so priming
+    with a plain body and then re-requesting with the `midbody-mismatch`
+    marker hits the SAME cache key but drives the origin to advertise a
+    DIFFERENT Content-Length on the abort-triggering request.
+
+    ⚠ The key MUST carry the "sieserve" marker. Without it the origin never
+    emits stale-if-error, so no snapshot ever arms, `ctx->sie_armed` stays 0
+    and the rescue is refused by the ARMING guard — which would make this
+    test a duplicate of the /midbodycold/ control and vacuous as a framing
+    oracle. Mutation-verified: with the framing check forced to always-pass,
+    this test must FAIL."""
+    key = "/midbody/sieserve-mismatch-mb1"
+
+    s0, b0, _ = fetch(ng.port, key)
+    assert s0 == 200 and b0, f"prime failed: {s0} {b0!r}"
+
+    time.sleep(1.3)     # past fresh (1s), stale_mult 1 -> 1s window: expired
+
+    # Same cache key ($uri has no query string), but the origin's live
+    # response for this request now carries a body of a different length --
+    # the mismatch the rescue must detect and decline.
+    s, b, h = fetch(ng.port, key + "?midbody-mismatch=1")
+    assert h.get("x-cache") != "STALE-IF-ERROR", \
+        ("the rescue served the warmed snapshot despite a Content-Length "
+         "mismatch with the origin's live response -- this corrupts response "
+         "framing for the client")
+    assert b != b0, \
+        (f"declined-rescue response {b!r} unexpectedly equals the warmed "
+         f"snapshot {b0!r} -- the rescue must not have spliced the snapshot "
+         "in when framing could not be proven safe")
+    # The fault still truncates the FIRST buffer of the live response to
+    # nothing forwarded before the abort fires, so the client sees a short
+    # (possibly empty-prefix) body -- assert what must NOT happen (the full
+    # snapshot leaking through), not a specific truncated byte count, since
+    # that is an artifact of exactly where the fault trips relative to
+    # buffering and is not this test's contract.
+    assert s in (200, 502, 504), \
+        f"declined-rescue mid-body fault surfaced unexpected status {s}"
+
+
 def test_sie_serves_counter(ng: Nginx, origin: Origin) -> None:
     """S7.1: sie_serves counts responses actually served from a stale-if-error
     snapshot -- ngx_http_cache_turbo_sie_rewrite() winning inside the header
@@ -18357,6 +18521,9 @@ def run_all(ng: Nginx, origin: Origin,
     test_stale_serves_stale_origin_hard_dead(ng, origin)
     test_sie_serve_on_error(ng, origin)                     # RFC-2 CTB4 serve-on-error
     test_sie_serve_on_error_unbuffered(ng, origin)          # AUD-SIE-BODY proxy_buffering off
+    if ng.fault_injection:
+        test_sie_midbody_rescue(ng, origin)                 # S231-SIE-MIDBODY pre-flush rescue
+        test_sie_midbody_rescue_declines_on_length_mismatch(ng, origin)  # S231-SIE-MIDBODY framing guard
     test_unbuf_streamed_store_and_hit(ng)                   # UNBUF streamed store + HIT round-trip
     test_unbuf_oversize_abort_mid_stream(ng, origin)        # UNBUF oversize mid-stream abort
     test_sie_serves_counter(ng, origin)                     # S7.1 sie_serves counter

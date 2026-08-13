@@ -116,6 +116,34 @@ error (**stale-if-error**), automatically, no config. An origin
 window (served as `X-Cache: STALE-IF-ERROR`). The one thing it can't do is
 shield a page it never cached, so warm critical URLs ahead of an outage.
 
+**The stale-if-error rescue is pre-flush only, and only for a response that
+opens with an origin *error* status.** It replaces that error response before
+any byte of it reaches the client — for that path, no config is needed.
+
+A mid-body death is a *different* failure shape: the origin answers with a
+normal 200 and then dies partway through the body (headers already sent, body
+cut short). In production this module has **no reliable in-process signal**
+that this happened — a closed upstream connection, an unmet
+`Content-Length`, or a late-set connection error can each also mean "this is
+legitimately chunked/EOF-framed" or arrive too late relative to the filter
+that would need to act on it — so there is currently no automatic rescue for
+it. What exists is a deterministic **test-only** fault path, gated behind the
+build-time `TEST_FAULTS` flag and the `cache_turbo_test_midbody_abort`
+directive (used by this module's own test suite to force a mid-body failure
+predictably); it is not compiled into a normal build and there is no way to
+turn it on in production. Even inside that test path, the rescue only splices
+in the cached body when doing so preserves response framing — it checks the
+already-serialized `Content-Length` against the cached snapshot's length and
+declines rather than risk a client hang or a desynced connection when they
+don't match. And like the error-status rescue, it is pre-flush only: once a
+byte of the truncated body has gone out, the client already holds an
+unrecoverable partial response and there is no way to un-send it. In that
+pre-flush window the client-visible status stays whatever the origin sent
+(200) — headers were already serialized before the body filter can act, so
+only the body would ever be replaced. This window closes on the first flushed
+buffer, which for a small/buffered response is typically the whole body at
+once.
+
 Optional extras: a shared **Redis** tier so a cluster of nginx boxes share one
 cache, tag-based purging, cache warming, and live auto-tuning.
 
@@ -1245,10 +1273,15 @@ A URI with no cached copy at all has nothing to fall back on, so those requests 
 Some failure modes are outside what a cache can fix. They are listed here so you
 can plan around them rather than discover them during an incident.
 
-- **The origin dies after the response headers are already on the wire.** The
-  client has a `200` and a partial body; there is no way to retract that and
-  substitute a cached copy. Recovering would mean buffering every complete
-  response before sending any of it, which costs more than the failure does.
+- **The origin dies mid-body, after the response headers are already on the
+  wire.** In production there is no automatic rescue for this at all — see
+  "The idea in 30 seconds" above for why no reliable in-process signal
+  distinguishes it from legitimate chunked/EOF framing (only this module's
+  own `TEST_FAULTS`-only test suite can force it deterministically). Once
+  even one byte of that partial body has reached the client, there is no way
+  to retract it and substitute a cached copy regardless — buffering every
+  complete response before sending any of it would fix this at the cost of
+  the exact latency cache-turbo exists to avoid.
 - **Nothing was ever cached for the URL.** Serving stale needs something stale
   to serve. A cold URL during an outage has nothing, and no directive changes
   that — see the `error_page` note below for making the failure look better.

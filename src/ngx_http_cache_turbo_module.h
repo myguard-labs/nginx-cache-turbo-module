@@ -1678,6 +1678,14 @@ typedef struct {
      * directive comment in the conf array for why this is a plain blocking
      * ngx_msleep rather than an async timer. */
     ngx_int_t                test_l2_promote_hold_ms;
+    /* S231-SIE-MIDBODY: no production signal for "the upstream died after
+     * sending headers but before last_buf" is reliable enough to trigger the
+     * rescue from (see the body filter comment at the rescue site for the
+     * candidates considered and rejected). This directive makes the body
+     * filter treat the FIRST arriving buffer as that failure deterministically,
+     * so the pre-flush rescue path is reachable in a test without depending on
+     * upstream connection-teardown timing. */
+    ngx_flag_t               test_midbody_abort;
 #endif
 
 
@@ -1881,6 +1889,16 @@ typedef struct {
     unsigned                 sie_armed:1;     /* a within-SIE snapshot is stashed */
     unsigned                 sie_serving:1;   /* filters replacing error w/ snap  */
     unsigned                 sie_body_sent:1; /* snapshot last_buf already emitted */
+    /* S231-SIE-MIDBODY: set the moment the body filter has forwarded ANY
+     * non-empty buffer downstream on the capture/forward path (i.e. bytes the
+     * client may already have received). This is the pre-flush oracle: once
+     * set, a mid-body origin death can no longer be rescued -- the client
+     * already has an unknown-length prefix of the truncated response and
+     * splicing the snapshot body in now would produce a corrupt concatenation,
+     * not a fix. ngx_http_cache_turbo_forward_body() is the single set site --
+     * every downstream exit on the capture path routes through it; see the
+     * rescue-site comment in the body filter for why that is exhaustive. */
+    unsigned                 sie_flushed:1;
     u_char                  *sie_snap;        /* blob bytes, any age               */
     size_t                   sie_snap_len;
     /* PERF (S231-PERF-SIEARM): the L1 arm pins the blob under the zone mutex
