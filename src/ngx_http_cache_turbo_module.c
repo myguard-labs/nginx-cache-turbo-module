@@ -8153,7 +8153,12 @@ ngx_http_cache_turbo_serve(ngx_http_request_t *r, u_char *copy, size_t len,
     ngx_chain_t                       out;
     ngx_http_cache_turbo_ctx_t       *ctx;
     ngx_pool_cleanup_t               *cln;
-    ngx_http_cache_turbo_blob_cln_t  *cc;
+    /* S232-BYPASS-STALE: initialised because the breaker-only guard below
+     * disarms this cleanup, and it reads `cc` under the same `ref_data != NULL`
+     * condition that assigns it. gcc at -O1 cannot prove the two conditions
+     * coincide and rejects the read under -Werror=maybe-uninitialized (-O0
+     * builds do not warn, so this surfaces only in the sanitizer job). */
+    ngx_http_cache_turbo_blob_cln_t  *cc = NULL;
 
     /* PERF-7: arm the reference drop FIRST, before any early return below, so the
      * acquired ref is released exactly once on every exit path (the cleanup fires
@@ -8201,11 +8206,15 @@ ngx_http_cache_turbo_serve(ngx_http_request_t *r, u_char *copy, size_t len,
              & NGX_HTTP_CACHE_TURBO_BLOBF_BREAKER_ONLY)
             && (xcache == NULL || ngx_strcmp(xcache, "STALE-BREAKER") != 0))
         {
-            if (ref_data != NULL) {
+            if (ref_data != NULL && cc != NULL) {
                 /* The cleanup registered above owns the ref; disarm it and drop
                  * the reference now, the same way the breaker gate releases a
                  * fallback nothing will consume (a pool cleanup cannot be
-                 * unregistered, so clearing its payload is how one is voided). */
+                 * unregistered, so clearing its payload is how one is voided).
+                 * `cc != NULL` is implied by ref_data != NULL (the block above
+                 * assigns both or returns), and is tested anyway so the
+                 * initialiser cannot silently turn a future divergence into a
+                 * NULL deref here. */
                 cc->data = NULL;
                 ngx_http_cache_turbo_blob_release(z, ref_data);
             }
