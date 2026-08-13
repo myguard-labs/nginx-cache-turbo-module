@@ -4545,6 +4545,207 @@ ngx_http_cache_turbo_qs_eq(u_char *p, u_char *end, const char *needle,
 
 
 /*
+ * S231-PERF-AUTOCLASSIFY (args half): parse r->args ONCE per request instead
+ * of once per needle. auto_skip() below loops every enabled preset's args[]
+ * row (~109 needles across the registry today) and, before this change, each
+ * one re-walked the ENTIRE query string from scratch via arg_match() — r->args
+ * is client-controlled, so the cost of classifying one request scaled with
+ * (query-string length) * (needle count), an attacker-amplified DoS surface
+ * exactly like cookie_has()'s pre-bitset shape.
+ *
+ * ONE span array, built by a single linear pass, replaces the re-parse: each
+ * entry records a NAME=VALUE (or bare NAME) pair's byte spans, split by the
+ * SAME rules arg_match() always used (both '&' and ';' as separators, the
+ * empty-pair "&&"/leading/trailing '&' skip, the no-'=' valueless case) --
+ * see those rules' own comments below, unchanged and still authoritative.
+ *
+ * Fixed capacity, MUST fail safe on overflow: the fuzz shim's reduced
+ * ngx_http_request_t has no r->pool field at all (ci/fuzz/ngx_shim_auto.h),
+ * so growing the array from the pool is not an option inside this
+ * FUZZ-EXTRACT region -- the shim would fail to compile. The chosen fallback
+ * is CAP-AND-REFALL-BACK: on overflow, set `truncated` and stop recording
+ * further spans; arg_match() below checks that flag FIRST and, when set,
+ * falls through to the exact original re-parsing walk for that one needle,
+ * so an argument past the cap is still fully scanned rather than silently
+ * dropped (dropping would be a fail-open: an auth arg past the cap would go
+ * unseen and the response would cache). The cap only ever costs the
+ * uncommon-case perf win it would have bought, never correctness.
+ *
+ * A SECOND, independent first-byte presence set is built in the same pass,
+ * keyed on each argument NAME's MANGLED first byte (the byte
+ * ngx_http_cache_turbo_qs_eq() would compare at i=0), not the raw query-string
+ * byte -- raw bytes would be WRONG here, unlike the cookie half's bitset:
+ * qs_eq() percent-decodes and, for NAMES, folds '+' (literal, not %2B), '.'
+ * and ' ' all to '_'. A raw-byte set built over r->args would therefore MISS
+ * '_'-needle matches spelled ".xfToken", "+xfToken", " xfToken", "%5FxfToken"
+ * or "%2ExfToken" -- a fail-open that caches a private response. Folding the
+ * first byte the same way qs_eq() would is what keeps the set sound.
+ *
+ * PROOF this cannot fail open: if qs_eq(name_span, needle) returns 1 for some
+ * pair, then by construction (the `i >= nlen || c != (u_char) needle[i]`
+ * check at i=0, which qs_eq() performs BEFORE any later byte) the span's
+ * first byte, decoded and name-mangled exactly as qs_eq() does it, equals
+ * needle[0]. The set below is built by applying that identical decode+mangle
+ * step to every recorded name span's first byte and setting its bit, so
+ * needle[0]'s bit is set whenever any span could have matched it -- the set
+ * is a superset of "needles reachable by some span", never a subset. A
+ * needle is skipped only when its first byte's bit is ABSENT, i.e. only when
+ * no recorded span's mangled first byte can equal it, i.e. only when qs_eq()
+ * was certain to return 0 for every span against that needle. This holds
+ * per-occurrence: with a repeated name ("action=profile&action=logout") both
+ * spans are recorded and both contribute their (identical) first byte, so
+ * repetition cannot suppress a bit either.
+ *
+ * nlen == 0 is guarded explicitly (skip is never applied) since qs_eq() with
+ * an empty needle has no i=0 byte to compare and the "first byte" concept is
+ * undefined; every real needle in the registry is a nonempty literal, so this
+ * is defence, not a live path.
+ *
+ * All array indices below are (u_char)-cast before indexing the 256-entry
+ * set, matching the cookie half's discipline -- a bare `char` is signed on
+ * this platform's default and a high-bit byte would index out of bounds.
+ *
+ * Both tiers key off the NAME only (bare-NAME rules and NAME=VALUE rules
+ * alike), so one span array + one first-byte set covers both.
+ */
+#define NGX_HTTP_CACHE_TURBO_ARGS_MAX  64
+
+typedef struct {
+    u_char  *name_start;
+    u_char  *name_end;
+    u_char  *value_start;               /* NULL => valueless ("?...&sid&...") */
+    u_char  *value_end;
+} ngx_http_cache_turbo_argspan_t;
+
+typedef struct {
+    ngx_http_cache_turbo_argspan_t  spans[NGX_HTTP_CACHE_TURBO_ARGS_MAX];
+    ngx_uint_t                      nspans;
+    ngx_uint_t                      truncated; /* cap hit: fall back per-needle */
+    u_char                          name_first[256]; /* mangled first-byte set */
+} ngx_http_cache_turbo_argparse_t;
+
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+/* Test-only observable: counts qs_eq() NAME comparisons actually performed
+ * by arg_match() across the whole request, mirroring the cookie half's
+ * ngx_http_cache_turbo_test_cookie_scans counter -- a COUNTER oracle, never a
+ * wall-clock timing band. Process-global; tests read a DELTA, never an
+ * absolute value, and drive every probe of one oracle over one kept-alive
+ * connection (nginx pins an accepted connection to one worker; each worker
+ * owns its own copy of this global). */
+ngx_atomic_uint_t  ngx_http_cache_turbo_test_arg_scans = 0;
+#endif
+
+/* Fold one raw (possibly percent-encoded) first byte the same way qs_eq()
+ * would at i=0 for a NAME span: decode a valid %HH escape first, then apply
+ * the name-mangling rule (literal '+' -> '_', '.' -> '_', ' ' -> '_'). `p`
+ * must have at least one byte remaining (p < end checked by the caller). */
+static u_char
+ngx_http_cache_turbo_qs_first_mangled(u_char *p, u_char *end)
+{
+    u_char     c;
+    ngx_int_t  hi, lo, decoded;
+
+    c = *p++;
+    decoded = 0;
+
+    if (c == '%' && (size_t) (end - p) >= 2
+        && (hi = ngx_http_cache_turbo_hexval(p[0])) >= 0
+        && (lo = ngx_http_cache_turbo_hexval(p[1])) >= 0)
+    {
+        c = (u_char) ((hi << 4) | lo);
+        decoded = 1;
+    }
+
+    if (c == '+' && !decoded) {
+        c = '_';
+
+    } else if (c == '.' || c == ' ') {
+        c = '_';
+    }
+
+    return c;
+}
+
+/* Single linear pass over r->args: records every NAME (=VALUE)? span into
+ * ap->spans[] and unions every recorded NAME's mangled first byte into
+ * ap->name_first[]. Splitting rules are byte-for-byte identical to
+ * arg_match()'s original walk (see that function's header comment for why
+ * each one matters) -- this is that walk, run once and cached, not a
+ * different parser. */
+static void
+ngx_http_cache_turbo_argparse_build(ngx_http_request_t *r,
+    ngx_http_cache_turbo_argparse_t *ap)
+{
+    u_char      *p, *end, *pair, *pend, *eq;
+    ngx_uint_t   b;
+
+    ap->nspans = 0;
+    ap->truncated = 0;
+
+    for (b = 0; b < 256; b++) {
+        ap->name_first[b] = 0;
+    }
+
+    if (r->args.data == NULL || r->args.len == 0) {
+        return;
+    }
+
+    p = r->args.data;
+    end = p + r->args.len;
+
+    while (p < end) {
+
+        pair = p;
+        while (p < end && *p != '&' && *p != ';') {
+            p++;
+        }
+        pend = p;
+
+        if (p < end) {
+            p++;                        /* step over the separator */
+        }
+
+        if (pend == pair) {
+            continue;                   /* "&&", leading '&', trailing '&' */
+        }
+
+        eq = ngx_strlchr(pair, pend, '=');
+
+        if (ap->nspans >= NGX_HTTP_CACHE_TURBO_ARGS_MAX) {
+            ap->truncated = 1;
+            continue;                   /* keep scanning for the byte set */
+        }
+
+        ap->spans[ap->nspans].name_start = pair;
+        ap->spans[ap->nspans].name_end   = (eq != NULL) ? eq : pend;
+
+        if (eq != NULL) {
+            ap->spans[ap->nspans].value_start = eq + 1;
+            ap->spans[ap->nspans].value_end   = pend;
+
+        } else {
+            ap->spans[ap->nspans].value_start = NULL;
+            ap->spans[ap->nspans].value_end   = NULL;
+        }
+
+        ap->nspans++;
+
+        /* Union this name's mangled first byte. nlen == 0 (an empty name,
+         * "?=x" or "?&=x&") has no first byte to fold -- leave the set
+         * untouched for it; qs_eq() against a nonempty needle already
+         * returns 0 for an empty span via the `i >= nlen` check, so no
+         * needle can legitimately match it and there is nothing to protect
+         * by adding a bit here. */
+        if (pair < ((eq != NULL) ? eq : pend)) {
+            b = ngx_http_cache_turbo_qs_first_mangled(pair,
+                                                       (eq != NULL) ? eq : pend);
+            ap->name_first[(u_char) b] = 1;
+        }
+    }
+}
+
+/*
  * Scan the query string for an argument, and keep scanning past a non-match.
  *
  * Replaces ngx_http_arg() for preset classification. ngx_http_arg has two
@@ -4571,9 +4772,18 @@ ngx_http_cache_turbo_qs_eq(u_char *p, u_char *end, const char *needle,
  * ("?next=/a;b"), which can only ever manufacture an EXTRA apparent argument.
  * That direction fails safe: the worst case is an unnecessary bypass (hit-rate
  * loss), never a cached private page.
+ *
+ * S231-PERF-AUTOCLASSIFY: `ap` is the request's pre-parsed span array (see the
+ * builder above). When `ap->truncated` is set, this falls through to the
+ * ORIGINAL full re-parsing walk (kept below unchanged) rather than trust a
+ * partial span list -- an argument past the capacity must still be found, so
+ * silently skipping the tail would be the exact fail-open the item forbids.
+ * Otherwise, a needle is skipped only when its first byte is absent from
+ * ap->name_first[] -- see the byteset builder's proof for why that cannot
+ * skip a needle qs_eq() would have matched.
  */
 static ngx_int_t
-ngx_http_cache_turbo_arg_match(ngx_http_request_t *r, const char *name,
+ngx_http_cache_turbo_arg_match_rescan(ngx_http_request_t *r, const char *name,
     size_t nlen, const char *value, size_t vlen)
 {
     u_char  *p, *end, *pair, *pend, *eq;
@@ -4630,6 +4840,59 @@ ngx_http_cache_turbo_arg_match(ngx_http_request_t *r, const char *name,
     return 0;
 }
 
+static ngx_int_t
+ngx_http_cache_turbo_arg_match(ngx_http_request_t *r,
+    const ngx_http_cache_turbo_argparse_t *ap, const char *name,
+    size_t nlen, const char *value, size_t vlen)
+{
+    ngx_uint_t                              i;
+    const ngx_http_cache_turbo_argspan_t   *sp;
+
+    if (ap->truncated) {
+        return ngx_http_cache_turbo_arg_match_rescan(r, name, nlen,
+                                                       value, vlen);
+    }
+
+    if (nlen > 0 && !ap->name_first[(u_char) name[0]]) {
+        return 0;
+    }
+
+    for (i = 0; i < ap->nspans; i++) {
+        sp = &ap->spans[i];
+
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+        ngx_atomic_fetch_add(&ngx_http_cache_turbo_test_arg_scans, 1);
+#endif
+
+        if (!ngx_http_cache_turbo_qs_eq(sp->name_start, sp->name_end,
+                                         name, nlen, 1))
+        {
+            continue;
+        }
+
+        if (sp->value_start == NULL) {
+            /* Valueless argument. Only a bare-NAME rule can match it. */
+            if (value == NULL) {
+                return 1;
+            }
+            continue;
+        }
+
+        if (value == NULL) {
+            return 1;
+        }
+
+        if (ngx_http_cache_turbo_qs_eq(sp->value_start, sp->value_end,
+                                        value, vlen, 0))
+        {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
 
 /*
  * Auto-classify gate. Returns 1 when the request matches a dynamic surface of
@@ -4647,14 +4910,24 @@ ngx_http_cache_turbo_auto_skip(ngx_http_request_t *r,
     const char                           *eq;
     size_t                                l, nlen, vlen;
     ngx_str_t                             uri;
+    ngx_http_cache_turbo_argparse_t       argparse;
     ngx_http_cache_turbo_byteset_t        cookie_bytes;
 
-    /* S231-PERF-AUTOCLASSIFY: built ONCE per request, unioned over every
-     * Cookie header, and reused by cookie_has() for every preset below --
-     * see the byteset builder's comment for the correctness proof. An empty
-     * (or absent) Cookie means an all-zero set, so every needle is skipped
-     * and cookie_has() returns 0, matching the pre-existing behaviour for
-     * that case exactly. */
+    /* S231-PERF-AUTOCLASSIFY (args half): parsed ONCE per request, reused by
+     * arg_match() for every preset's args[] row below -- see the builder's
+     * comment for the fail-safe overflow rule and the mangled-first-byte
+     * correctness proof. An empty (or absent) query string yields nspans==0
+     * and an all-zero name_first[], so every needle is skipped and
+     * arg_match() returns 0, matching the pre-existing r->args.len==0 guard
+     * exactly. */
+    ngx_http_cache_turbo_argparse_build(r, &argparse);
+
+    /* S231-PERF-AUTOCLASSIFY (cookie half): built ONCE per request, unioned
+     * over every Cookie header, and reused by cookie_has() for every preset
+     * below -- see the byteset builder's comment for the correctness proof.
+     * An empty (or absent) Cookie means an all-zero set, so every needle is
+     * skipped and cookie_has() returns 0, matching the pre-existing
+     * behaviour for that case exactly. */
     ngx_http_cache_turbo_cookie_byteset_build(r, &cookie_bytes);
 
     /* Preset uris[] are literals anchored at byte 0 ("/wp-admin/"), so a
@@ -4700,7 +4973,7 @@ ngx_http_cache_turbo_auto_skip(ngx_http_request_t *r,
                 if (eq == NULL) {
                     /* Bare NAME: presence of the argument is the signal,
                      * whatever its value ("_xfToken", "sid"). */
-                    if (ngx_http_cache_turbo_arg_match(r, *pp,
+                    if (ngx_http_cache_turbo_arg_match(r, &argparse, *pp,
                                                        ngx_strlen(*pp), NULL, 0))
                     {
                         return 1;
@@ -4718,7 +4991,7 @@ ngx_http_cache_turbo_auto_skip(ngx_http_request_t *r,
                 nlen = (size_t) (eq - *pp);
                 vlen = ngx_strlen(eq + 1);
 
-                if (ngx_http_cache_turbo_arg_match(r, *pp, nlen,
+                if (ngx_http_cache_turbo_arg_match(r, &argparse, *pp, nlen,
                                                    eq + 1, vlen))
                 {
                     return 1;
@@ -7117,6 +7390,50 @@ ngx_http_cache_turbo_test_backoff_header(ngx_http_request_t *r)
 }
 
 
+/* S231-PERF-AUTOCLASSIFY: report the process-global qs_eq() NAME-comparison
+ * count from arg_match()'s pre-parsed-span/first-byte prefilter, so a runtime
+ * test can assert the prefilter is actually cutting scans (a COUNTER oracle,
+ * never a wall-clock timing band) instead of just trusting that it compiles.
+ * Same TEST_FAULTS-only / re-stamp-on-SIE discipline as the two headers
+ * above. */
+extern ngx_atomic_uint_t  ngx_http_cache_turbo_test_arg_scans;
+
+static ngx_int_t
+ngx_http_cache_turbo_test_arg_scan_header(ngx_http_request_t *r)
+{
+    ngx_table_elt_t  *h;
+    u_char           *v;
+    size_t            vlen;
+
+    static u_char  name[] = "X-Cache-Turbo-Test-Arg-Scans";
+
+    v = ngx_pnalloc(r->pool, NGX_ATOMIC_T_LEN);
+    if (v == NULL) {
+        return NGX_ERROR;
+    }
+
+    vlen = ngx_sprintf(v, "%uA",
+                ngx_atomic_fetch_add(&ngx_http_cache_turbo_test_arg_scans, 0))
+           - v;
+
+    h = ngx_list_push(&r->headers_out.headers);
+    if (h == NULL) {
+        return NGX_ERROR;
+    }
+
+    h->hash = 1;
+    h->key.len = sizeof("X-Cache-Turbo-Test-Arg-Scans") - 1;
+    h->key.data = name;
+    h->value.len = vlen;
+    h->value.data = v;
+#if (nginx_version >= 1023000)
+    h->next = NULL;
+#endif
+
+    return NGX_OK;
+}
+
+
 /* S231-PERF-AUTOCLASSIFY: report the process-global ngx_strnstr() call count
  * from cookie_has()'s first-byte prefilter, so a runtime test can assert the
  * prefilter is actually cutting scans (a COUNTER oracle, never a wall-clock
@@ -8131,6 +8448,7 @@ ngx_http_cache_turbo_sie_rewrite(ngx_http_request_t *r,
      * "armed 0". */
     (void) ngx_http_cache_turbo_test_armings_header(r);
     (void) ngx_http_cache_turbo_test_backoff_header(r);
+    (void) ngx_http_cache_turbo_test_arg_scan_header(r);
     (void) ngx_http_cache_turbo_test_cookie_scan_header(r);
 #endif
 
@@ -8384,6 +8702,7 @@ ngx_http_cache_turbo_header_filter(ngx_http_request_t *r)
             (void) ngx_http_cache_turbo_test_armings_header(r);
         }
         (void) ngx_http_cache_turbo_test_backoff_header(r);
+        (void) ngx_http_cache_turbo_test_arg_scan_header(r);
         (void) ngx_http_cache_turbo_test_cookie_scan_header(r);
 #endif
         return ngx_http_next_header_filter(r);
@@ -8395,6 +8714,7 @@ ngx_http_cache_turbo_header_filter(ngx_http_request_t *r)
     && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
     (void) ngx_http_cache_turbo_test_armings_header(r);
     (void) ngx_http_cache_turbo_test_backoff_header(r);
+    (void) ngx_http_cache_turbo_test_arg_scan_header(r);
     (void) ngx_http_cache_turbo_test_cookie_scan_header(r);
 #endif
 

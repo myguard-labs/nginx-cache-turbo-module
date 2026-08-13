@@ -4003,6 +4003,32 @@ http {{
             cache_turbo_valid   30s;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
+
+        # S231-PERF-AUTOCLASSIFY (args half) negative control: ghost/mediawiki/
+        # yabb have non-empty args[] rows but no dedicated arg-classification
+        # location elsewhere in this config. $uri$is_args$args in the key so
+        # distinct query strings do not collapse onto one cache entry.
+        location /ct-ghost-args/ {{
+            cache_turbo         main;
+            cache_turbo_backend ghost;
+            cache_turbo_key     $uri$is_args$args;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        location /ct-mediawiki-args/ {{
+            cache_turbo         main;
+            cache_turbo_backend mediawiki;
+            cache_turbo_key     $uri$is_args$args;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        location /ct-yabb-args/ {{
+            cache_turbo         main;
+            cache_turbo_backend yabb;
+            cache_turbo_key     $uri$is_args$args;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
         location /ct-bugzilla/ {{
             cache_turbo         main;
             cache_turbo_backend bugzilla;
@@ -6928,6 +6954,219 @@ def test_auto_classify_more(ng: Nginx, origin: Origin) -> None:
     _, _, hm3 = fetch(ng.port, "/multi/plain")
     assert hm3.get("x-cache") == "HIT", \
         f"anon page on /multi/ should cache, got {hm3.get('x-cache')}"
+    drain_origin(origin)
+
+
+_ARG_SCANS_HDR = "x-cache-turbo-test-arg-scans"
+
+
+def _arg_scans(hdrs: dict, where: str) -> int:
+    """Pull the lifetime qs_eq()-NAME-comparison counter out of a response's
+    headers (S231-PERF-AUTOCLASSIFY args half, TEST_FAULTS-only). Same
+    "missing header is a hard failure" discipline as _cookie_scans()/
+    _armings()/_backoff_skips(): its absence would make every delta read 0
+    and the counter-oracle test would pass while proving the prefilter did
+    nothing."""
+    raw = hdrs.get(_ARG_SCANS_HDR)
+    assert raw is not None, (
+        f"{_ARG_SCANS_HDR} missing on {where} -- this build has no arg scan "
+        f"counter, so the S231-PERF-AUTOCLASSIFY args-half control cannot "
+        f"distinguish 'prefilter skipped scans' from 'never counted'")
+    return int(raw)
+
+
+# preset -> (location, [(query-string suffix, needle-name-first-byte)]) for
+# the negative control below. Mirrors src/ngx_http_cache_turbo_module.c's
+# ngx_http_cache_turbo_presets[] table exactly -- ENUMERATED by reading every
+# non-empty ct_*_args[] array in the source directly (15 of the 34 declared
+# args arrays are non-empty; the other 19 are `{ NULL }` and carry no query-
+# arg tier at all, classified by cookie/URI/cookie_pred instead -- not a gap
+# here since there is nothing to prefilter). A preset added here with a
+# non-empty args[] row and no entry below is a silent coverage gap.
+_ARG_NEEDLE_TABLE = {
+    "wordpress":   ("/auto/", ["preview", "rest_route"]),
+    "woocommerce": ("/auto/", ["wc-ajax"]),
+    "xenforo":     ("/xf/", ["_xfToken"]),
+    "discourse":   ("/dc/", ["api_key", "api_username"]),
+    "phpbb":       ("/phpbb/", ["sid"]),
+    "mediawiki":   ("/ct-mediawiki-args/", ["veaction", "returnto"]),
+    "ghost":       ("/ct-ghost-args/", ["uuid", "key", "token", "gift"]),
+    "invision":    ("/ips/", ["do=compose", "do=post", "do=reply",
+                               "do=report", "module=messaging"]),
+    "smf":         ("/smf/", ["action=admin", "action=login",
+                               "action=logout", "action=post"]),
+    "yabb":        ("/ct-yabb-args/", ["action=post", "action=login",
+                                        "action=register"]),
+    "mybb":        ("/mybb/", ["action=login", "action=logout",
+                                "action=register"]),
+    "spip":        ("/ct-spip/", ["action", "var_mode"]),
+    "bugzilla":    ("/ct-bugzilla/", ["Bugzilla_api_key", "api_key",
+                                       "Bugzilla_login", "token"]),
+    "redmine":     ("/redmine/", ["key"]),
+    "opencart":    ("/opencart/", ["route=checkout/cart", "user_token",
+                                    "customer_token"]),
+}
+
+
+def test_arg_prefilter_negative_control(ng: Nginx, origin: Origin) -> None:
+    """S231-PERF-AUTOCLASSIFY (args half): negative control for the
+    pre-parsed-span array + mangled-first-byte presence set in
+    ngx_http_cache_turbo_arg_match(). For EVERY preset with a non-empty
+    args[] row, a request carrying that exact needle in the query string
+    must still be classified dynamic (auto_skip bypasses the cache). If the
+    prefilter ever skipped a needle it should have scanned, the matching
+    preset's dynamic route would go silently invisible -- a private page
+    would be cached and served to strangers -- and this is the test that
+    would catch it.
+
+    _ARG_NEEDLE_TABLE is hand-derived from ngx_http_cache_turbo_presets[]
+    (see the table's own comment); a preset added there with a non-empty
+    args[] row and no row here is a silent coverage gap, not a passing
+    test."""
+    for preset, (loc, needles) in _ARG_NEEDLE_TABLE.items():
+        for needle in needles:
+            path = f"nc-{preset}-{hash(needle) & 0xffff:x}"
+            if "=" in needle:
+                qs = needle
+            else:
+                qs = f"{needle}=1"
+            uri = f"{loc}{path}?{qs}"
+            fetch(ng.port, uri)
+            status, _, h = fetch(ng.port, uri)
+            assert status == 200, (
+                f"{preset} needle {needle!r} request returned {status}")
+            assert "x-cache" not in h, (
+                f"{preset} needle {needle!r} must bypass the cache (the "
+                f"first-byte prefilter made it unreachable), got "
+                f"x-cache={h.get('x-cache')}")
+    drain_origin(origin)
+
+
+def test_arg_prefilter_mangling_regression(ng: Nginx, origin: Origin) -> None:
+    """S231-PERF-AUTOCLASSIFY (args half): regression test for the trap this
+    item exists to prevent -- a first-byte set built over RAW query-string
+    bytes instead of the byte ngx_http_cache_turbo_qs_eq() would actually
+    compare. `_xfToken` (xenforo) starts with '_', which qs_eq() reaches
+    from several different raw spellings via percent-decoding and PHP's
+    register_globals-derived key mangling (literal '+', '.', ' ' all fold to
+    '_' for argument NAMES). A prefilter keyed on the raw first byte would
+    set bit '.'/'+'/' '/etc. instead of '_', never see '_xfToken's needle
+    bit satisfied by any of these, and skip a scan that qs_eq() would have
+    matched -- caching a private xenforo response. Each spelling below must
+    still classify dynamic.
+
+    "%20xfToken" exercises the SAME post-decode mangling branch
+    (`c == '.' || c == ' '`) an unencoded literal space would -- a raw space
+    byte in a URI query string is not a spelling any HTTP client library
+    used here will emit unencoded, so %20 is the reachable way to drive that
+    branch; ".xfToken" and " " share qs_eq()'s decoded-then-mangled
+    codepath, so both are exercised by this set.
+
+    "%2BxfToken" is DELIBERATELY EXCLUDED: qs_eq()'s mangling rule only folds
+    a LITERAL '+' (the `!decoded` guard), never a percent-decoded one -- a
+    decoded '+' is a real plus sign PHP leaves alone, so "%2BxfToken" compares
+    as "+xfToken", not "_xfToken", and correctly does NOT match. Asserting a
+    bypass there would pin the WRONG behaviour and fight the real qs_eq()
+    semantics, not the prefilter."""
+    for spelling in (".xfToken", "+xfToken",
+                      "%5FxfToken", "%2ExfToken", "%20xfToken"):
+        uri = f"/xf/nc-mangle-{hash(spelling) & 0xffff:x}?{spelling}=1"
+        fetch(ng.port, uri)
+        status, _, h = fetch(ng.port, uri)
+        assert status == 200, f"{spelling!r} request returned {status}"
+        assert "x-cache" not in h, (
+            f"query spelling {spelling!r} must still be recognised as "
+            f"_xfToken and bypass the cache, got x-cache={h.get('x-cache')} "
+            f"-- a raw-byte first-byte prefilter would fail exactly this "
+            f"case")
+    drain_origin(origin)
+
+
+def test_arg_prefilter_counter_oracle(ng: Nginx, origin: Origin) -> None:
+    """S231-PERF-AUTOCLASSIFY (args half): counter oracle for the perf claim
+    -- never a wall-clock timing band. A query string built entirely from
+    bytes that appear in NO preset's arg-needle NAME first byte (after
+    mangling) must classify identically (cacheable) to a plain anonymous
+    request, while the pre-parsed-span/first-byte prefilter measurably cuts
+    the number of qs_eq() NAME comparisons arg_match() makes.
+
+    The delta is read off X-Cache-Turbo-Test-Arg-Scans, a process-global
+    lifetime counter (TEST_FAULTS-only) bumped exactly once per qs_eq() NAME
+    comparison the prefilter did NOT skip -- see
+    ngx_http_cache_turbo_test_arg_scan_header() and the counter's own
+    declaration.
+
+    X-Cache-Turbo-Test-Arg-Scans is a process-global (per-worker) monotonic
+    counter, so all probes below share ONE kept-alive HTTPConnection (see
+    _fetch_keepalive's docstring) so nginx pins them all to the same
+    accepted-connection worker -- a plain fetch() opens a fresh socket per
+    call and round-robins across workers, which produced an impossible
+    negative delta on the cookie half's equivalent oracle (#278) and is the
+    exact trap this test is built to avoid."""
+    conn = http.client.HTTPConnection("127.0.0.1", ng.port, timeout=HTTP_TIMEOUT)
+    try:
+        # Baseline on /auto/ (wordpress+woocommerce+joomla: 3 arg needles --
+        # preview, rest_route, wc-ajax).
+        _, _, hbase = _fetch_keepalive(conn, "/auto/argbaseline?zz=1")
+        n_before = _arg_scans(hbase, "baseline request")
+
+        # A query string matching NOTHING: every arg NAME's first byte
+        # (after mangling) is a digit, which is not the mangled first byte
+        # of "preview", "rest_route" or "wc-ajax" (p / r / w). The prefilter
+        # should skip essentially all needle comparisons for this request.
+        big_qs = "n9=1&" + "&".join(f"z{i}=1" for i in range(400))
+        status, body1, h1 = _fetch_keepalive(conn, f"/auto/argmiss1?{big_qs}")
+        assert status == 200
+        n_after_first = _arg_scans(h1, "large non-matching query, request 1")
+
+        status, body2, h2 = _fetch_keepalive(conn, f"/auto/argmiss1?{big_qs}")
+        assert status == 200
+        n_after_second = _arg_scans(h2, "large non-matching query, request 2")
+
+        # Correctness half: classification is UNCHANGED -- a non-matching
+        # query string was always cacheable, and it still is.
+        assert "x-cache" not in h1, (
+            "first request should be a miss (no x-cache yet)")
+        assert h2.get("x-cache") == "HIT", (
+            f"a large query string matching no needle must still let the "
+            f"page cache -- got x-cache={h2.get('x-cache')} (byte-identical "
+            f"classification is the whole point of the prefilter proof)")
+        assert body1 == body2, "cached body must be byte-identical"
+
+        # Counter oracle: each of the two /auto/argmiss1 requests
+        # independently runs arg_match() over wordpress+woocommerce+joomla's
+        # 3-needle union (preview, rest_route, wc-ajax; joomla has none).
+        # None of their first bytes (p, r, w) collide with the digit/'z'
+        # bytes in big_qs's argument NAMES, so EVERY qs_eq() NAME comparison
+        # on this request must be skipped: the delta this request
+        # contributes is 0.
+        delta_first = n_after_first - n_before
+        delta_second = n_after_second - n_after_first
+        assert delta_first == 0, (
+            f"large non-matching query string should trigger ZERO qs_eq() "
+            f"NAME comparisons (every needle's first byte is absent from "
+            f"the query), got a delta of {delta_first} -- the first-byte "
+            f"prefilter is not cutting scans")
+        assert delta_second == 0, (
+            f"second request (same query) should also trigger ZERO qs_eq() "
+            f"NAME comparisons, got a delta of {delta_second}")
+
+        # Anti-vacuity arm: a query string whose arg NAME DOES start with a
+        # needle's first byte ('p', from "preview") but is not the needle
+        # itself must NOT be skipped by the byte test alone -- only qs_eq()
+        # itself decides a real match, and the byte set only gates whether
+        # that comparison happens. This proves the filter is not simply
+        # returning "no scans, ever": a 'p'-colliding miss still counts.
+        _, _, h3 = _fetch_keepalive(conn, "/auto/argnormal?plum=1")
+        n_after_p = _arg_scans(h3, "byte-colliding but non-matching query")
+        delta_p = n_after_p - n_after_second
+        assert delta_p > 0, (
+            f"a query arg starting with 'p' (preview's first byte) must "
+            f"still trigger at least one qs_eq() comparison, got delta="
+            f"{delta_p} -- a filter that skips everything would pass the "
+            f"zero-delta assertions above for the wrong reason")
+    finally:
+        conn.close()
     drain_origin(origin)
 
 
@@ -12372,6 +12611,47 @@ def test_store_failure_cleans_up_cold_stub(ng: Nginx, origin: Origin) -> None:
     w0 = _admin_lock_waits(ng, "/_cache_storefail")
     s1, b1, _ = fetch(ng.port, uri)
     assert s1 == 200 and b1, f"cold-miss winner (store forced to fail) failed: {s1}"
+
+    # Settle barrier (S231, cycle 14 -- the THIRD distinct defect in this test;
+    # PR #242's private-zone fix was the first).
+    #
+    # Request 1's leftover stub is removed by ngx_http_cache_turbo_cold_cleanup,
+    # registered with ngx_pool_cleanup_add(r->pool, ...). An r->pool cleanup
+    # runs at ngx_http_free_request(), which fires AFTER the response body has
+    # already been written to the socket. So fetch() returning request 1's body
+    # is NOT proof the stub is gone: firing request 2 immediately lands in the
+    # window between "body on the wire" and "pool destroyed", finds the stub
+    # still live, parks in cold_wait(), and moves lock_waits 0 -> 1 on a FIXED
+    # build. That is a defect in this test's timing, not in the module.
+    #
+    # There is no stub-count or key-count field on the admin JSON (checked:
+    # hits/misses/stale_serves/refreshes/evictions/l2_*/lock_waits/... carry no
+    # per-key observable), so the barrier waits for the zone to go QUIESCENT
+    # instead: two consecutive reads of storefailz's own counters that agree.
+    # Request 1 is the only traffic this zone has seen, so once its accounting
+    # has stopped moving, its request has been fully torn down -- which is
+    # exactly the event that runs the pool cleanup.
+    #
+    # Why this cannot mask the bug: the barrier runs BEFORE request 2 is issued,
+    # so it observes only request 1. On a buggy build the stub survives its
+    # owner's teardown by design (that IS the bug), the counters still go
+    # quiescent, request 2 still parks, and the assert below still fires. The
+    # barrier polls the admin endpoint only -- it never touches /storefail/,
+    # which would risk resolving the very stub under test with a third request.
+    # The exact-equality assert below is unchanged.
+    _settle: dict[str, tuple[int, int] | None] = {"prev": None}
+
+    def _storefailz_quiescent() -> bool:
+        cur = (_admin_lock_waits(ng, "/_cache_storefail"),
+               _admin_stat(ng, "misses", "/_cache_storefail"))
+        stable = (cur == _settle["prev"])
+        _settle["prev"] = cur
+        return stable
+
+    assert wait_for(_storefailz_quiescent, timeout=5.0, interval=0.05), \
+        "storefailz counters never went quiescent after request 1 -- the zone " \
+        "saw traffic other than this test's, so the exact-equality oracle below " \
+        "would be measuring someone else's park"
 
     s2, b2, _ = fetch(ng.port, uri)
     assert s2 == 200 and b2, f"second request after failed store got {s2}"
@@ -17899,6 +18179,9 @@ def run_all(ng: Nginx, origin: Origin,
     test_2026_preset_expansion(ng, origin)
     test_internal_redirect_key_and_veto(ng, origin)
     test_auto_classify_more(ng, origin)
+    test_arg_prefilter_negative_control(ng, origin)
+    test_arg_prefilter_mangling_regression(ng, origin)
+    test_arg_prefilter_counter_oracle(ng, origin)
     test_q2_multibuffer_oversize(ng, origin)
     test_suppress_native_inert_on_plain_location(ng)
     test_suppress_native_e2e_proxy_cache(ng)
