@@ -1506,6 +1506,107 @@ test_resolve_miss_merged(void)
         CHECK(owner2 == 0, "a CLAIM_LOSER must not receive a lease token");
     }
     CHECK(ngx_test_lock_balanced(), "resolve_miss (winner) leaked the mutex");
+
+    /* --- CLAIM_FRESH: the UAF regression this function exists to catch.
+     * claim_locked() must acquire the PERF-7 refcount on ctn->data BEFORE
+     * resolve_miss() unlocks -- an earlier version of this merge returned
+     * the raw pointer and let the CALLER acquire() after unlocking, which
+     * is a use-after-free (a concurrent evict can free the blob in the gap
+     * between the unlock and the caller's acquire()). This drives that
+     * exact race deterministically: acquire the blob's ref via
+     * resolve_miss(), then simulate the concurrent evict with
+     * blob_node_release() -- the blob's underlying slab must SURVIVE
+     * because resolve_miss() already holds a reference on it, proving the
+     * acquire happened before the window a concurrent evict could exploit,
+     * not after. */
+    zone_reset();
+    {
+        ngx_http_cache_turbo_node_t   *ctn3;
+        u_char                        *blob;
+        uint64_t                       owner3 = 0;
+        ngx_int_t                      cm3;
+        u_char                         *fd3 = NULL;
+        size_t                          fl3 = 0;
+        ngx_int_t                      rc3;
+        ngx_uint_t                      live_before;
+
+        ctn3 = ngx_slab_alloc_locked(&g_pool, sizeof(*ctn3));
+        REQUIRE(ctn3 != NULL, "CLAIM_FRESH fixture: node alloc failed");
+        memset(ctn3, 0, sizeof(*ctn3));
+        memcpy(ctn3->key, mkkey(5), 32);
+        ctn3->node.key = (uint32_t) (0x1000 + 5);
+        ngx_rbtree_insert(&g_sh.rbtree, &ctn3->node);
+        ctn3->kind = NGX_HTTP_CACHE_TURBO_NODE_ENTRY;
+        ctn3->seg  = NGX_HTTP_CACHE_TURBO_SEG_PROBATION;
+
+        live_before = ngx_test_slab_live;
+        blob = ngx_http_cache_turbo_blob_alloc(&g_zone, 64);
+        REQUIRE(blob != NULL, "CLAIM_FRESH fixture: blob_alloc failed");
+        CHECK(CT_BLOBREF(blob)->refs == 0,
+              "CLAIM_FRESH fixture: blob started already referenced");
+
+        ctn3->data        = blob;
+        ctn3->len         = 64;
+        ctn3->fresh_until = ngx_test_now + 30;   /* well inside the fresh window */
+
+        /* min_uses 1 so count_miss's own gate never declines (an ENTRY with
+         * len > 0 is exempt anyway -- see count_miss_semantics above); the
+         * point of this fixture is claim_locked()'s CLAIM_FRESH branch, not
+         * the counting gate. */
+        rc3 = ngx_http_cache_turbo_shm_resolve_miss(&g_zone, KEY(5), 1, 5,
+                  &owner3, &cm3, &fd3, &fl3);
+        CHECK(cm3 == NGX_OK, "an ENTRY must never be re-gated by min_uses");
+        CHECK(rc3 == NGX_HTTP_CACHE_TURBO_CLAIM_FRESH,
+              "a fresh, unexpired ENTRY must return CLAIM_FRESH");
+        CHECK(owner3 == 0, "CLAIM_FRESH must not hand out a lease token");
+        CHECK(fd3 == blob, "CLAIM_FRESH must hand back the ENTRY's own blob");
+        CHECK(fl3 == 64, "CLAIM_FRESH must hand back the ENTRY's own length");
+
+        /* The regression canary: resolve_miss() already unlocked by this
+         * point (single-threaded, so no real race is needed to prove the
+         * ordering) -- refs must already read 1, not 0, because acquire()
+         * ran INSIDE claim_locked(), before resolve_miss()'s unlock. */
+        CHECK(CT_BLOBREF(blob)->refs == 1,
+              "UAF regression: claim_locked() did not acquire the blob "
+              "before resolve_miss() unlocked -- a concurrent evict between "
+              "the unlock and any caller-side acquire() would free this "
+              "blob out from under the returned pointer");
+        CHECK(ngx_test_lock_balanced(),
+              "resolve_miss (CLAIM_FRESH) left the zone mutex held");
+
+        /* Simulate the concurrent evict this test exists to rule out: the
+         * owning node drops the blob WHILE our resolve_miss() reference is
+         * still outstanding. A correct build defers the free (detached ==
+         * 1, slab count unchanged); the pre-fix code would have raced this
+         * against an unreferenced pointer and the slab would already be
+         * free by the time a caller got around to acquire()ing it. */
+        ngx_http_cache_turbo_blob_node_release(&g_zone, blob);
+        CHECK(ngx_test_slab_live == live_before + 1,
+              "the concurrent evict freed the blob while resolve_miss()'s "
+              "CLAIM_FRESH reference was still outstanding");
+        CHECK(CT_BLOBREF(blob)->detached == 1,
+              "node_release did not mark the blob detached");
+
+        /* The caller's eventual serve()/cleanup drops the reference
+         * resolve_miss() took; this is what finally frees it. */
+        ngx_http_cache_turbo_blob_release(&g_zone, blob);
+        CHECK(ngx_test_slab_live == live_before,
+              "the last reference (resolve_miss()'s own) did not free the "
+              "detached blob");
+        CHECK(ngx_test_lock_balanced(), "blob_release left the zone mutex held");
+
+        /* This fixture built ctn3 by hand (ngx_slab_alloc_locked, not via
+         * lru_insert_new), unlike every other fixture in this file, because
+         * it needed an ENTRY with a pre-armed fresh blob rather than a
+         * COUNTER count_miss()/claim() would build. zone_reset()'s own drain
+         * walks the LRU queues, so a node never threaded onto either queue is
+         * invisible to it -- free ctn3 explicitly or the next zone_reset()
+         * (or the end-of-run leak check) reports it as a leaked slab
+         * allocation for a reason that has nothing to do with the refcount
+         * bug this test exists to catch. */
+        ngx_rbtree_delete(&g_sh.rbtree, &ctn3->node);
+        ngx_slab_free_locked(&g_pool, ctn3);
+    }
 }
 
 static void
