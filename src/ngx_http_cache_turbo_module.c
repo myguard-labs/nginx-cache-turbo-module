@@ -4734,23 +4734,68 @@ ngx_http_cache_turbo_access_prologue(ngx_http_request_t *r,
      * With no validation channel for a hit, skip the lookup and go to the
      * origin — the fresh response still stores (refreshing the entry), like a
      * bypass. With only-if-cached the client refuses origin contact and we
-     * cannot validate, so the answer is 504 (RFC 9111 §5.2.1.7). */
+     * cannot validate, so the answer is 504 (RFC 9111 §5.2.1.7).
+     *
+     * S231-NOCACHE-OUTAGE: that "skip the lookup" shortcut assumes the origin
+     * is reachable to actually perform the revalidation. When the breaker for
+     * this zone is already OPEN, taking it anyway would force every no-cache
+     * request straight past a serveable stale copy and onto an origin we
+     * already know is down -- exactly the stampede the breaker exists to
+     * prevent. Read the breaker state RAW (ngx_http_cache_turbo_brk_state on
+     * the shm word), the same pattern the only-if-cached breaker-serve site
+     * above^ uses, rather than through _breaker_state(): that call is not a
+     * pure getter, it performs the due OPEN -> HALF_OPEN promotion, and this
+     * is not the place to spend it (the promoted probe must be the request
+     * that reaches the pre-origin breaker gate below, not this early exit).
+     * should_consult() is a plain config check (enabled/threshold/window),
+     * so it's free to call unconditionally here.
+     *
+     * OPEN => fall through instead of declining. This is deliberately placed
+     * BEFORE auto-Vary resolve (:4762 below) and the cache lookup: falling
+     * through here means the request runs the EXACT SAME vary-resolve ->
+     * L1/L2 lookup -> pre-origin breaker gate path as any other request, so
+     * the variant key is resolved before any lookup happens (no separate
+     * probe is added at this gate), and the existing breaker gate at the
+     * lookup's end serves ctx->brk_snap under STALE-BREAKER when armed, or
+     * falls through to the origin unchanged when nothing is armed for this
+     * key. A stale-if-error window is handled the same way for free: SIE
+     * only ever fires as a post-origin-failure fallback (sie_rewrite, called
+     * from the upstream error path), so it never needed a pre-check here --
+     * letting the request reach the origin normally is exactly what lets
+     * sie_armed / sie_rewrite catch a failing revalidation, same as it does
+     * for any other request today. CLOSED (or breaker disabled) takes the
+     * original NGX_DECLINED unchanged -- today's behaviour, verified by a
+     * negative-control test. */
     if (ngx_http_cache_turbo_request_revalidate(r, ctx)) {
-        (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
+        ngx_uint_t  brk_open_now;
+
+        brk_open_now = ngx_http_cache_turbo_breaker_should_consult(clcf)
+            && ngx_http_cache_turbo_brk_state(z->sh->breaker_state)
+                   == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN;
+
         if (ctx->req_only_if_cached) {
             /* Nothing serveable without origin contact the client forbids:
              * a cache miss from the client's view ($cache_turbo_status MISS,
              * the pcalloc default). EXPIRED is reserved for the case where we
              * DID find a cached entry but it was past its serveable window. */
+            (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
             ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                            "cache_turbo: request revalidate + only-if-cached "
                            "\"%V\" -> 504", &r->uri);
             return NGX_HTTP_GATEWAY_TIME_OUT;
         }
-        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                       "cache_turbo: request no-cache \"%V\" -> origin (revalidate)",
-                       &r->uri);
-        return NGX_DECLINED;
+
+        if (brk_open_now) {
+            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                           "cache_turbo: request no-cache + breaker OPEN "
+                           "\"%V\" -> honour cache", &r->uri);
+        } else {
+            (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
+            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                           "cache_turbo: request no-cache \"%V\" -> origin "
+                           "(revalidate)", &r->uri);
+            return NGX_DECLINED;
+        }
     }
 
     /* auto-Vary (v11 other half): probe the L1 vary marker for this base key and,

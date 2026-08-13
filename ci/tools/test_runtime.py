@@ -2097,6 +2097,9 @@ http {{
     # s71z would let /s71brk/'s trip leave it OPEN too early or too late
     # relative to this test's own sequencing.
     cache_turbo_zone name=sr72z 16m;
+    cache_turbo_zone name=s231ncz 16m;   # S231-NOCACHE-OUTAGE (breaker gets tripped OPEN)
+    cache_turbo_zone name=s231nccz 16m;  # S231-NOCACHE-OUTAGE negative control (breaker CLOSED)
+    cache_turbo_zone name=s231ncvz 16m;  # S231-NOCACHE-OUTAGE ordering (auto-Vary)
     # O4.5: private zone for the breaker LIFECYCLE runtime coverage (state
     # machine end-to-end: OPEN on N failures, zero origin contact while OPEN,
     # 503+Retry-After on a cold key, CLOSE via the post-open probe). Own zone,
@@ -3010,6 +3013,96 @@ http {{
             cache_turbo_breaker_open       30s;
             cache_turbo_lock_timeout        2s;
             add_header         X-CT-Reason $cache_turbo_serve_reason always;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # S231-NOCACHE-OUTAGE: private zone for the "honour cache instead of a
+        # client's Cache-Control: no-cache while the origin is known down" gate
+        # (:4749 in ngx_http_cache_turbo_module.c). Own zone (s231ncz), not
+        # sr72z/brkiz/s71z/etc: this location primes then trips ITS OWN breaker
+        # OPEN, which must not perturb any other test's CLOSED-breaker
+        # expectations on a shared zone. threshold=1/stale_mult=1/keep_stale off
+        # mirror /sr72brk/'s fast-trip shape. Drives
+        # test_nocache_breaker_open_honours_cache and
+        # test_nocache_breaker_closed_still_revalidates (negative control).
+        location /s231nc/ {{
+            cache_turbo                    s231ncz;
+            cache_turbo_key                $uri;
+            cache_turbo_valid               1s;
+            cache_turbo_keep_stale         off;  # isolate from the 24h keep_stale default
+            cache_turbo_stale_mult          1;
+            cache_turbo_breaker             on;
+            cache_turbo_breaker_threshold   1;
+            cache_turbo_breaker_window     60s;
+            cache_turbo_breaker_open       30s;
+            cache_turbo_lock_timeout        2s;
+            add_header         X-CT-Reason $cache_turbo_serve_reason always;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # S231-NOCACHE-OUTAGE negative control: identical shape to /s231nc/ but
+        # on its OWN zone (s231nccz) that is NEVER tripped -- proves the fix
+        # only kicks in while the breaker is actually OPEN, not unconditionally.
+        # Drives test_nocache_breaker_closed_still_revalidates. Also carries
+        # the only-if-cached-out-of-scope regression pin
+        # (test_nocache_only_if_cached_still_504), since that arm is unaffected
+        # by breaker state either way and needs no tripping.
+        location /s231ncc/ {{
+            cache_turbo                    s231nccz;
+            cache_turbo_key                $uri;
+            cache_turbo_valid               1s;
+            cache_turbo_keep_stale         off;
+            cache_turbo_stale_mult          1;
+            cache_turbo_breaker             on;
+            cache_turbo_breaker_threshold   1;
+            cache_turbo_breaker_window     60s;
+            cache_turbo_breaker_open       30s;
+            cache_turbo_lock_timeout        2s;
+            add_header         X-CT-Reason $cache_turbo_serve_reason always;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # S231-NOCACHE-OUTAGE ordering-hazard regression: same breaker shape as
+        # /s231nc/ but with auto-Vary on, on its OWN zone (s231ncvz) so tripping
+        # this breaker cannot perturb /s231nc/'s. The gate at :4749 runs BEFORE
+        # ngx_http_cache_turbo_vary_resolve() (:4762) -- falling through on a
+        # breaker-OPEN no-cache request must still resolve the variant key
+        # before the cache lookup below it runs, or a varying URL would probe
+        # the BASE key and silently serve the wrong (or no) variant. Drives
+        # test_nocache_breaker_open_varying_url_serves_correct_variant.
+        location /s231ncv/ {{
+            cache_turbo                    s231ncvz;
+            cache_turbo_key                $request_uri;
+            cache_turbo_valid               30s;
+            cache_turbo_auto_vary           on;
+            cache_turbo_breaker             on;
+            cache_turbo_breaker_threshold   1;
+            cache_turbo_breaker_window     60s;
+            cache_turbo_breaker_open       30s;
+            cache_turbo_lock_timeout        2s;
+            add_header         X-CT-Reason $cache_turbo_serve_reason always;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # S231-NOCACHE-OUTAGE ordering-hazard breaker trigger: SAME zone
+        # (s231ncvz) as /s231ncv/ above -- the breaker STATE is per-zone, so
+        # tripping it here also flips /s231ncv/'s view of the breaker -- but a
+        # SHORT cache_turbo_valid (1s) of its own, distinct from /s231ncv/'s
+        # 30s. This lets the tripping key (/dead) expire and trip fast while
+        # the gzip/br variants primed on /s231ncv/ stay comfortably fresh for
+        # the whole sequence. Drives
+        # test_nocache_breaker_open_varying_url_serves_correct_variant.
+        location /s231ncvbrk/ {{
+            cache_turbo                    s231ncvz;
+            cache_turbo_key                $request_uri;
+            cache_turbo_valid               1s;
+            cache_turbo_keep_stale         off;
+            cache_turbo_stale_mult          1;
+            cache_turbo_breaker             on;
+            cache_turbo_breaker_threshold   1;
+            cache_turbo_breaker_window     60s;
+            cache_turbo_breaker_open       30s;
+            cache_turbo_lock_timeout        2s;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
@@ -9931,6 +10024,164 @@ def test_serve_reason_variable(ng: Nginx, origin: Origin) -> None:
         drain_origin(origin)
 
 
+def test_nocache_breaker_open_honours_cache(ng: Nginx, origin: Origin) -> None:
+    """S231-NOCACHE-OUTAGE: a client Cache-Control: no-cache must NOT force an
+    origin trip while the breaker for this zone is OPEN -- honour the cache
+    instead. /s231nc/ (own zone s231ncz, threshold=1) is primed, expired past
+    its 1s window, then the origin is killed: the first dead-origin request
+    trips CLOSED -> OPEN and still surfaces the raw failure (not a serve), the
+    SECOND finds the breaker OPEN. A no-cache request sent to THAT state must
+    be served STALE-BREAKER from cache with zero further origin contact,
+    exactly like an ordinary request would (see the pre-origin breaker gate at
+    module.c ~5891 that this fall-through now reaches instead of the early
+    NGX_DECLINED at ~4749)."""
+    s0, b0, _ = fetch(ng.port, "/s231nc/oc1")
+    assert s0 == 200 and b0, f"prime failed: {s0} {b0!r}"
+
+    time.sleep(1.3)   # past fresh (1s), stale_mult 1 -> 1s window: L1-expired
+    origin.fail = True
+    try:
+        s_trip, _, _ = fetch(ng.port, "/s231nc/oc1")
+        assert s_trip != 200, \
+            (f"tripping request was answered 200 -- expected it to reach "
+             f"the dead origin and fail, got {s_trip}")
+
+        before = origin.hits_for("/oc1")
+        s_nc, b_nc, h_nc = fetch(ng.port, "/s231nc/oc1",
+                                  headers={"Cache-Control": "no-cache"})
+        assert s_nc == 200 and b_nc == b0, \
+            (f"breaker OPEN + client no-cache should serve the cached body, "
+             f"got {s_nc} {b_nc!r}")
+        assert h_nc.get("x-ct-reason") == "STALE-BREAKER", \
+            (f"breaker OPEN + no-cache should report STALE-BREAKER, got "
+             f"{h_nc.get('x-ct-reason')}")
+        assert origin.hits_for("/oc1") == before, \
+            ("breaker OPEN + client no-cache must NOT trip a further origin "
+             "request -- honour the cache instead")
+    finally:
+        origin.fail = False
+        drain_origin(origin)
+
+
+def test_nocache_breaker_closed_still_revalidates(ng: Nginx, origin: Origin) -> None:
+    """S231-NOCACHE-OUTAGE negative control: with the breaker CLOSED (origin
+    healthy, never tripped), a client Cache-Control: no-cache on a warmed
+    /s231ncc/ key must still go to the origin -- today's behaviour, unchanged.
+    Without this control the fix above is indistinguishable from "always
+    ignore no-cache", which would silently serve stale content while the
+    origin is perfectly reachable."""
+    s0, b0, _ = fetch(ng.port, "/s231ncc/oc2")
+    assert s0 == 200 and b0, f"prime failed: {s0} {b0!r}"
+    _, _, h1 = fetch(ng.port, "/s231ncc/oc2")
+    assert h1.get("x-cache") == "HIT", "entry should be primed"
+
+    before = origin.hits_for("/oc2")
+    _, b_nc, h_nc = fetch(ng.port, "/s231ncc/oc2",
+                           headers={"Cache-Control": "no-cache"})
+    assert "x-cache" not in h_nc, \
+        (f"breaker CLOSED + no-cache must still reach the origin, got "
+         f"X-Cache={h_nc.get('x-cache')}")
+    assert origin.hits_for("/oc2") == before + 1, \
+        (f"breaker CLOSED + no-cache must consult the origin exactly once, "
+         f"got {origin.hits_for('/oc2')} vs before={before}")
+    assert b_nc != b0, "no-cache response should be a fresh origin generation"
+
+
+def test_nocache_only_if_cached_still_504(ng: Nginx, origin: Origin) -> None:
+    """S231-NOCACHE-OUTAGE regression pin: the req_only_if_cached arm at
+    module.c ~4751-4759 (returns 504 GATEWAY_TIMEOUT) is explicitly OUT OF
+    SCOPE for this item and must be byte-for-byte unchanged -- a client that
+    both revalidates (no-cache) and forbids origin contact (only-if-cached) on
+    a key with nothing cached still gets 504, breaker state notwithstanding."""
+    before = origin.hits_for("/oic-miss")
+    s, _, _ = fetch(ng.port, "/s231ncc/oic-miss",
+                     headers={"Cache-Control": "no-cache, only-if-cached"})
+    assert s == 504, f"no-cache + only-if-cached miss must still be 504, got {s}"
+    assert origin.hits_for("/oic-miss") == before, \
+        "only-if-cached must never reach the origin"
+
+
+def test_nocache_breaker_open_varying_url_serves_correct_variant(
+        ng: Nginx, origin: Origin) -> None:
+    """S231-NOCACHE-OUTAGE ordering-hazard regression: the no-cache/breaker
+    gate at module.c ~4749 runs BEFORE ngx_http_cache_turbo_vary_resolve()
+    (~4762) and the bypass predicate (~4776). Falling through on a
+    breaker-OPEN no-cache request must reach vary_resolve() before any cache
+    lookup, exactly like every other request -- otherwise the gate would probe
+    the BASE key and silently serve the wrong (or no) variant on a URL that
+    varies, or miss it entirely.
+
+    /s231ncv/ (own zone s231ncvz, cache_turbo_valid 30s) auto-Vary-splits by
+    Accept-Encoding ("v=ae" query marker, same convention as
+    test_auto_vary_encoding). /s231ncvbrk/ shares the SAME zone (so it shares
+    the SAME breaker state) but has its OWN short cache_turbo_valid (1s) and
+    is used ONLY to trip the breaker via an unrelated key (/dead) -- letting
+    the tripping key expire and trip fast while the gzip/br variants (primed
+    first, on their 30s window) stay comfortably fresh for the rest of the
+    test. With the zone breaker OPEN, a no-cache request for the fresh br
+    variant must still resolve to ITS OWN key and serve the br body from
+    cache (a plain HIT, since a fresh entry never reaches the pre-origin
+    breaker gate at all) -- not the gzip variant, not a miss to origin.
+    Serving the gzip body here would mean the gate probed the BASE key
+    instead of the variant (the ordering hazard); forcing an origin trip
+    would mean the no-cache fix isn't reached at all for varying URLs."""
+    p = "/s231ncv/k1?v=ae"
+
+    # Prime the gzip/br variants FIRST, breaker still CLOSED -- their 30s
+    # window comfortably outlives the whole breaker-tripping sequence below.
+    s_gz0, b_gz0, _ = fetch(ng.port, p, {"Accept-Encoding": "gzip"})
+    assert s_gz0 == 200 and b_gz0, f"gzip prime failed: {s_gz0} {b_gz0!r}"
+    s_br0, b_br0, _ = fetch(ng.port, p, {"Accept-Encoding": "br"})
+    assert s_br0 == 200 and b_br0, f"br prime failed: {s_br0} {b_br0!r}"
+    assert b_gz0 != b_br0, \
+        ("gzip and br primed to the same body -- variants did not split, "
+         "the ordering regression this test targets cannot be proven")
+    _, b_gz1, h_gz1 = fetch(ng.port, p, {"Accept-Encoding": "gzip"})
+    assert h_gz1.get("x-cache") == "HIT" and b_gz1 == b_gz0, \
+        (f"gzip variant not a fresh HIT: X-Cache={h_gz1.get('x-cache')} "
+         f"body_match={b_gz1 == b_gz0} headers={h_gz1}")
+    _, b_br1, h_br1 = fetch(ng.port, p, {"Accept-Encoding": "br"})
+    assert h_br1.get("x-cache") == "HIT" and b_br1 == b_br0, \
+        (f"br variant not a fresh HIT: X-Cache={h_br1.get('x-cache')} "
+         f"body_match={b_br1 == b_br0} headers={h_br1}")
+
+    # Trip THIS ZONE's breaker OPEN via /s231ncvbrk/dead -- own 1s window on
+    # the same zone, so tripping it flips /s231ncv/'s view of the breaker too
+    # without ever touching the gzip/br keys above (different location AND
+    # different $request_uri).
+    dead = "/s231ncvbrk/dead"
+    s_prime, b_prime, _ = fetch(ng.port, dead)
+    assert s_prime == 200 and b_prime, f"breaker-trip prime failed: {s_prime} {b_prime!r}"
+    time.sleep(1.3)   # past fresh (1s), stale_mult 1 -> 1s window: L1-expired
+    origin.fail = True
+    try:
+        s_trip, _, _ = fetch(ng.port, dead)
+        assert s_trip != 200, \
+            (f"tripping request was answered 200 -- expected it to reach "
+             f"the dead origin and fail, got {s_trip}")
+        s_open, _, _ = fetch(ng.port, dead)
+        assert s_open == 200, \
+            f"breaker did not report OPEN via /dead's own fallback, got {s_open}"
+    finally:
+        origin.fail = False
+        drain_origin(origin)
+
+    before = origin.hits_for("/k1?v=ae")
+    s_nc, b_nc, h_nc = fetch(
+        ng.port, p,
+        {"Accept-Encoding": "br", "Cache-Control": "no-cache"})
+    assert s_nc == 200 and b_nc == b_br0, \
+        (f"breaker OPEN + no-cache on a varying URL must serve the "
+         f"REQUESTED variant's cached body (br), got {b_nc!r}, expected "
+         f"{b_br0!r} -- the base/gzip key was probed instead (ordering "
+         f"hazard), or the request forced an origin trip")
+    assert h_nc.get("x-cache") == "HIT", \
+        (f"a fresh br variant, once correctly resolved, should serve as "
+         f"an ordinary HIT, got X-Cache={h_nc.get('x-cache')}")
+    assert origin.hits_for("/k1?v=ae") == before, \
+        "breaker OPEN + no-cache must not trip a further origin request"
+
+
 def test_request_cc_serve_verdict_fresh(ng: Nginx, origin: Origin) -> None:
     """RFC-1 request Cache-Control against a FRESH entry (req_serve_verdict,
     module.c:1403-1409). A client's own max-age/min-fresh can refuse an entry
@@ -16372,6 +16623,10 @@ def run_all(ng: Nginx, origin: Origin,
     test_status_stale(ng, origin)
     test_status_expired(ng, origin)
     test_serve_reason_variable(ng, origin)                   # S7.2 unfolded serve reason
+    test_nocache_breaker_open_honours_cache(ng, origin)              # S231-NOCACHE-OUTAGE
+    test_nocache_breaker_closed_still_revalidates(ng, origin)        # S231-NOCACHE-OUTAGE negctrl
+    test_nocache_only_if_cached_still_504(ng, origin)                # S231-NOCACHE-OUTAGE regression pin
+    test_nocache_breaker_open_varying_url_serves_correct_variant(ng, origin)  # S231-NOCACHE-OUTAGE ordering
     test_request_cc_serve_verdict_fresh(ng, origin)
     test_request_cc_serve_verdict_stale(ng, origin)
     test_cc_mode_inheritance_child_preset_overrides_parent_ignore(ng, origin)
