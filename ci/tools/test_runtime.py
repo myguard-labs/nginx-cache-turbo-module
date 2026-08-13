@@ -2216,6 +2216,26 @@ http {{
     # breaker), same reasoning as brkiz above -- tripping it must not perturb
     # /breakeron/'s state on `main`.
     cache_turbo_zone name=brkdefz 16m;
+    # S232-BYPASS-STALE: own zone for /bstale/, same isolation reasoning as
+    # brkiz -- tripping the breaker there must not perturb any other location.
+    cache_turbo_zone name=bstalez 16m;
+    # S232-BYPASS-STALE: a SECOND zone for the tests that must run against a
+    # CLOSED breaker. breaker_open is 30s, so a test that trips /bstale/ leaves
+    # that zone's breaker OPEN far longer than the suite takes to reach the
+    # next test -- sharing one zone made the no-trip controls 503 on a breaker
+    # someone else tripped, measuring nothing about their own subject.
+    cache_turbo_zone name=bstalecz 16m;
+    # S232-BYPASS-STALE: a THIRD zone for the never-primed control, which trips
+    # its own breaker. It cannot share bstalez: the feature test trips that one
+    # and breaker_open holds it OPEN for 30s, so this test's own priming
+    # request would 503 on someone else's breaker before it measured anything.
+    cache_turbo_zone name=bstalenz 16m;
+    # S232-BYPASS-STALE: a FOURTH zone for the safety control, which also trips
+    # its own breaker. Every bypass-stale test that trips one needs a private
+    # zone: breaker_open holds the state OPEN for 30s, far longer than the gap
+    # between two tests, so a shared zone makes the SECOND test 503 on the
+    # FIRST test's breaker before it can prime.
+    cache_turbo_zone name=bstalesz 16m;
     # O4.4-i L2 half. A SECOND private zone for the L2-backed arming pair
     # (/brkil2on/, /brkil2off/). Separate from brkiz because the L1 pair leaves
     # its own breaker OPEN and the two must not share a breaker state; separate
@@ -3099,6 +3119,76 @@ http {{
             # before the breaker ever gets a chance to trip -- explicitly off
             # here so this location isolates the breaker default alone.
             cache_turbo_keep_stale  off;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # S232-BYPASS-STALE. /bstale/api/ is opted in to breaker-only storage;
+        # /bstale/plain/ is NOT, and is the negative control proving the
+        # directive is scoped rather than blanket. threshold=1 so a single dead
+        # -origin request trips CLOSED -> OPEN. keep_stale off for the same
+        # reason as /brkdefault/: it would answer from the stale entry before
+        # the breaker could trip, masking what these tests measure.
+        location /bstale/ {{
+            cache_turbo             bstalez;
+            cache_turbo_key         $uri;
+            cache_turbo_valid       1s;
+            cache_turbo_stale_mult  1;
+            cache_turbo_keep_stale  off;
+            cache_turbo_breaker             on;
+            cache_turbo_breaker_threshold   1;
+            cache_turbo_breaker_window     60s;
+            cache_turbo_breaker_open       30s;
+            cache_turbo_lock_timeout        2s;
+            cache_turbo_bypass_stale_uri  /bstale/api;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # S232-BYPASS-STALE, safety control. Own zone + own breaker to trip,
+        # for the same 30s-open-window reason as /bstalen/ below.
+        location /bstales/ {{
+            cache_turbo             bstalesz;
+            cache_turbo_key         $uri;
+            cache_turbo_valid       1s;
+            cache_turbo_stale_mult  1;
+            cache_turbo_keep_stale  off;
+            cache_turbo_breaker             on;
+            cache_turbo_breaker_threshold   1;
+            cache_turbo_breaker_window     60s;
+            cache_turbo_breaker_open       30s;
+            cache_turbo_lock_timeout        2s;
+            cache_turbo_bypass_stale_uri  /bstales/api;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # S232-BYPASS-STALE, never-primed control. Its own zone + its own
+        # breaker to trip, so it never races the feature test's 30s open window.
+        location /bstalen/ {{
+            cache_turbo             bstalenz;
+            cache_turbo_key         $uri;
+            cache_turbo_valid       1s;
+            cache_turbo_stale_mult  1;
+            cache_turbo_keep_stale  off;
+            cache_turbo_breaker             on;
+            cache_turbo_breaker_threshold   1;
+            cache_turbo_breaker_window     60s;
+            cache_turbo_breaker_open       30s;
+            cache_turbo_lock_timeout        2s;
+            cache_turbo_bypass_stale_uri  /bstalen/api;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # S232-BYPASS-STALE, CLOSED-breaker half. Same directives as /bstale/
+        # but on its own zone and with the breaker left at its default (never
+        # tripped here), so the normal-path and scope controls measure their
+        # own subject rather than a breaker some earlier test opened.
+        location /bstalec/ {{
+            cache_turbo             bstalecz;
+            cache_turbo_key         $uri;
+            cache_turbo_valid       1s;
+            cache_turbo_stale_mult  1;
+            cache_turbo_keep_stale  off;
+            cache_turbo_bypass_stale_uri  /bstalec/api;
+            add_header              X-CT-Status $cache_turbo_status always;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
@@ -7905,6 +7995,149 @@ def _armings(hdrs: dict, where: str, site: str = "l1") -> int:
         f"key -- the header format drifted and this assertion would silently "
         f"measure nothing")
     return int(parts[site])
+
+
+def test_bypass_stale_serves_fallback_when_breaker_open(
+        ng: Nginx, origin: Origin) -> None:
+    """S232-BYPASS-STALE, the feature itself: a URI named by
+    cache_turbo_bypass_stale_uri is stored as breaker-only fallback, so when
+    the origin dies the OPEN breaker answers from it instead of 503-ing.
+
+    Before this change /bstale/api/ would have been a plain bypass: nothing
+    stored, so the breaker had nothing to arm from and the client got the
+    breaker's 503. That is what the assertion below distinguishes -- a 200
+    carrying the primed body can ONLY come from a stored copy."""
+    s0, b0, h0 = fetch(ng.port, "/bstale/api/items")
+    assert s0 == 200 and b0, f"prime failed: {s0} {b0!r}"
+    # The priming request itself must NOT be served from cache: an opted-in URI
+    # still bypasses the lookup. It reached the origin, so it is a BYPASS.
+    assert h0.get("x-cache") != "HIT", \
+        f"priming request was served from cache (X-Cache={h0.get('x-cache')!r})"
+
+    origin.fail = True
+    try:
+        # threshold=1: this first dead-origin request trips CLOSED -> OPEN and
+        # still surfaces the raw origin failure itself.
+        s_trip, _, _ = fetch(ng.port, "/bstale/api/items")
+        assert s_trip != 200, \
+            (f"tripping request was answered 200 -- expected it to reach the "
+             f"dead origin and fail, got {s_trip}")
+
+        s_open, b_open, h_open = fetch(ng.port, "/bstale/api/items")
+        assert s_open == 200, \
+            (f"breaker OPEN + a bypass-stale entry did not fall back to the "
+             f"stored copy, got {s_open} -- the entry was never stored, or the "
+             f"breaker could not arm from it")
+        assert b_open == b0, f"served {b_open!r}, expected the primed {b0!r}"
+        assert h_open.get("x-cache") == "STALE-BREAKER", \
+            (f"fallback served with X-Cache={h_open.get('x-cache')!r}, "
+             f"expected STALE-BREAKER -- it came from some other serve path")
+    finally:
+        origin.fail = False
+        drain_origin(origin)
+
+
+def test_bypass_stale_never_serves_on_normal_path(
+        ng: Nginx, origin: Origin) -> None:
+    """S232-BYPASS-STALE SAFETY CONTROL -- the property the whole feature
+    rests on: a BLOBF_BREAKER_ONLY entry is served ONLY as the breaker's
+    fallback, never as an ordinary HIT/STALE.
+
+    ⚠ Must be run against an OPEN breaker. An earlier revision of this test
+    used a CLOSED one and was VACUOUS: with the breaker closed the request
+    declines at the bypass-stale arm and never performs a lookup at all, so
+    the guard in ngx_http_cache_turbo_serve() is never reached and the test
+    passed with that guard compiled out. Verified by mutation -- deleting the
+    guard leaves this version RED and the closed-breaker version GREEN.
+
+    So: trip the breaker, which is the ONLY state in which the lookup can
+    reach the stored blob, and then pin what comes back. A 200 is expected
+    (that is the feature), but it must be the breaker's fallback, identified
+    by X-Cache: STALE-BREAKER. If the guard is gone the same request is
+    answered from the fresh entry as a plain HIT instead -- same status code,
+    same body, different and disclosing path -- which is what the X-Cache
+    assertion below distinguishes."""
+    s0, b0, _ = fetch(ng.port, "/bstales/api/private")
+    assert s0 == 200 and b0, f"prime failed: {s0} {b0!r}"
+
+    origin.fail = True
+    try:
+        s_trip, _, _ = fetch(ng.port, "/bstales/api/private")
+        assert s_trip != 200, \
+            f"tripping request answered 200, expected an origin failure: {s_trip}"
+
+        # The entry is still FRESH here (valid 1s, these requests are ms
+        # apart). Fresh is the state a normal-path HIT would fire in, so it is
+        # exactly the state that exercises the guard.
+        s, b, h = fetch(ng.port, "/bstales/api/private")
+        assert s == 200 and b == b0, \
+            (f"breaker OPEN did not serve the stored fallback: {s} {b!r} -- "
+             f"expected the primed {b0!r}")
+        assert h.get("x-cache") == "STALE-BREAKER", \
+            (f"a breaker-only entry was served with X-Cache="
+             f"{h.get('x-cache')!r}, not STALE-BREAKER. It came back on the "
+             f"NORMAL path (a fresh HIT) rather than as the breaker's "
+             f"fallback -- BLOBF_BREAKER_ONLY is not being enforced in "
+             f"ngx_http_cache_turbo_serve(), and every URL named by "
+             f"cache_turbo_bypass_stale_uri is now an ordinary cache entry "
+             f"whose body is served to any client that asks")
+    finally:
+        origin.fail = False
+        drain_origin(origin)
+
+
+def test_bypass_stale_scoped_not_blanket(ng: Nginx, origin: Origin) -> None:
+    """S232-BYPASS-STALE NEGATIVE CONTROL: the directive is URI-SCOPED. A
+    sibling location under the same cache_turbo_bypass_stale_uri-carrying
+    location, whose URI does NOT match the configured prefix, must be
+    unaffected -- it keeps ordinary caching semantics and never gets stamped
+    breaker-only.
+
+    Guards the failure mode where the match is wired to the location rather
+    than the prefix, which would silently opt in every URL under it."""
+    s0, b0, _ = fetch(ng.port, "/bstalec/plain/doc")
+    assert s0 == 200 and b0, f"prime failed: {s0} {b0!r}"
+
+    s1, b1, h1 = fetch(ng.port, "/bstalec/plain/doc")
+    assert s1 == 200, f"second request failed: {s1}"
+    assert h1.get("x-cache") == "HIT", \
+        (f"a non-matching URI under the same location did not cache normally "
+         f"(X-Cache={h1.get('x-cache')!r}) -- the bypass_stale_uri prefix is "
+         f"being applied to the whole location instead of the named prefix")
+    assert b1 == b0, f"HIT served {b1!r}, expected the cached {b0!r}"
+
+
+def test_bypass_stale_absent_directive_has_no_fallback(
+        ng: Nginx, origin: Origin) -> None:
+    """S232-BYPASS-STALE NEGATIVE CONTROL: without the directive, the
+    privacy default is unchanged -- a bypassed URL still stores NOTHING and
+    still gets the breaker's 503 when the origin dies.
+
+    A URI that never matched the directive and was never primed has nothing
+    stored under its key. With the breaker OPEN it must still NOT be answered
+    200 -- if it is, the breaker served some other entry's body, which is the
+    cross-key confusion this feature must not introduce."""
+    s0, b0, _ = fetch(ng.port, "/bstalen/plain/gone")
+    assert s0 == 200 and b0, f"prime failed: {s0} {b0!r}"
+    time.sleep(1.3)   # past fresh + stale: L1-expired
+
+    origin.fail = True
+    try:
+        s_trip, _, _ = fetch(ng.port, "/bstalen/plain/gone")
+        assert s_trip != 200, f"tripping request answered 200, got {s_trip}"
+
+        # The breaker is OPEN now. /bstale/plain/ is NOT opted in, but it IS
+        # ordinarily cacheable, so it legitimately has an expired entry the
+        # breaker may serve -- that is pre-existing keep-stale behaviour, not
+        # this feature. What must NOT happen is the opted-in path's body
+        # appearing here, or a 200 on a URL that never stored anything.
+        s_new, _, _ = fetch(ng.port, "/bstalen/api/never-primed")
+        assert s_new != 200, \
+            (f"a bypass-stale URI that was NEVER primed answered 200 ({s_new}) "
+             f"with a dead origin -- it served some other entry's body")
+    finally:
+        origin.fail = False
+        drain_origin(origin)
 
 
 def test_breaker_arming_sites_gated_white_box(ng: Nginx, origin: Origin) -> None:
@@ -18362,6 +18595,10 @@ def run_all(ng: Nginx, origin: Origin,
     test_breaker_retry_after_auto_tracks_breaker_open(ng, origin)  # BRK-RA1
     test_prometheus_breaker_metrics(ng, origin)               # H7.3a breaker_opens_total/breaker_state on prometheus
     test_breaker_arming_sites_gated_white_box(ng, origin)    # O4.4-i (L1)
+    test_bypass_stale_serves_fallback_when_breaker_open(ng, origin)  # S232-BYPASS-STALE
+    test_bypass_stale_never_serves_on_normal_path(ng, origin)        # S232 safety control
+    test_bypass_stale_scoped_not_blanket(ng, origin)                 # S232 scope control
+    test_bypass_stale_absent_directive_has_no_fallback(ng, origin)   # S232 default-unchanged control
     if redis is not None:
         # O4.4-i (L2). Needs a real Redis: without an L2 backend the L2 arming
         # path never executes and every delta reads 0, so the test would pass
