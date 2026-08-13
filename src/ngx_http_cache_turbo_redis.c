@@ -2568,7 +2568,7 @@ ngx_http_cache_turbo_redis_frame(u_char *p, u_char *end, ngx_uint_t depth,
  * Contract (part 1 of the required proof -- NOT stricter than frame()):
  *   - accepts exactly the byte sequences frame() accepts: same RESP grammar,
  *     same MAX_REPLY / MAX_MEMBERS / MAX_DEPTH ceilings, same '*'-only
- *     entrypoint (GET's own reply path keeps using plain frame(), unchanged).
+ *     entrypoint (the GET reply path keeps using plain frame(), unchanged).
  *   - same return values: NGX_OK with *next one byte past the reply,
  *     NGX_AGAIN on a short buffer, NGX_DECLINED on malformed/too-deep/oversize.
  *   - same mutations: this function and frame() are both read-only over
