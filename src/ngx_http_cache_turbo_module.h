@@ -99,84 +99,6 @@
  * tighter, bespoke ceiling the way l2_negative_ttl does (that ceiling exists
  * because THAT memo has no invalidation channel; this window does). */
 
-/*
- * cache_turbo_use_stale <off | error | timeout | http_403 | http_404 |
- *                         http_429 | http_500 | http_502 | http_503 |
- *                         http_504> ... Bitmask of which upstream response
- * classes are allowed to fall back to a stale cached copy, mirroring nginx's
- * own `proxy_cache_use_stale` vocabulary. Read on the request path by
- * ngx_http_cache_turbo_use_stale_triggers(), which gates the stale-if-error
- * rewrite in ngx_http_cache_turbo_header_filter() (S4.2).
- *
- * Bits are `ull` and the carrier is ngx_uint_t, same convention as
- * backend_presets above -- an unsuffixed literal at/above bit 31 would be
- * `unsigned int` and get truncated by promotion into a 64-bit mask.
- *
- * ⚠ `error` and `timeout` are NOT nginx-equivalent here, and the difference is
- * a known limitation rather than an oversight. In nginx these are
- * communication-failure classes inherited from proxy_next_upstream: `error`
- * means the connection failed/reset, `http_502` means the upstream really
- * answered 502. They are distinct conditions.
- *
- * This module cannot make that distinction. Its only observation point is
- * ngx_http_cache_turbo_header_filter, which sees r->headers_out.status and
- * nothing else -- there is no NGX_HTTP_UPSTREAM_FT_* state, no peer status, no
- * upstream failure provenance reachable from a header filter. By the time this
- * module runs, a refused connection and a genuine upstream 502 are the same
- * 502, and a timeout and a genuine 504 are the same 504.
- *
- * Consequence, which S4.2 must NOT paper over: with a status-only consumer,
- * `error` and `http_502` match the same set of responses, as do `timeout` and
- * `http_504`. An operator asking for `error` alone will also get stale serves
- * on a real upstream 502. The tokens exist for vocabulary compatibility with
- * proxy_cache_use_stale, not for behavioural parity.
- *
- * They carry their own bits so the parser records what the operator wrote and a
- * future consumer that DOES have provenance (e.g. one reading upstream state
- * rather than the final status) can honour the distinction without a config
- * break. Until such a consumer exists, treat ERROR as equivalent to HTTP_502
- * and TIMEOUT as equivalent to HTTP_504, and document the collapse rather than
- * claiming a fidelity this trigger site cannot deliver.
- *
- * `off` is exclusive: it is only accepted alone (any token alongside it is a
- * config error), and it means an EMPTY mask, not "keep default."
- *
- * DEFAULT (see ngx_http_cache_turbo_merge_loc_conf): HTTP_500 | HTTP_502 |
- * HTTP_503 | HTTP_504 | ANY_5XX. Today's only trigger site
- * (ngx_http_cache_turbo_header_filter) is unconditional on
- * `status >= NGX_HTTP_INTERNAL_SERVER_ERROR && status <= 599` -- i.e. EVERY
- * 5xx, not just the four named ones (506, 507, 508, 510, 511, ... are all
- * covered today). The four HTTP_5xx bits alone would silently narrow that on
- * the day S4.2 wires the read side, so ANY_5XX is a fifth bit carrying "every
- * other 5xx not already named by one of the four explicit bits" -- the merge
- * default sets all five bits, together reproducing "any 5xx" byte-for-byte.
- * ANY_5XX is deliberately NOT settable directly from the config vocabulary
- * (there is no `any_5xx` token): it exists solely so the default can be
- * expressed as a sum of named bits without the parser having to special-case
- * "no directive configured" as anything other than the ordinary UNSET/merge
- * path every other directive in this file already uses.
- */
-#define NGX_HTTP_CACHE_TURBO_USE_STALE_ERROR      0x01ull /* own bit; folded onto 502 at the trigger */
-#define NGX_HTTP_CACHE_TURBO_USE_STALE_TIMEOUT    0x02ull /* own bit; folded onto 504 at the trigger */
-#define NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_403   0x04ull
-#define NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_404   0x08ull
-#define NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_429   0x10ull
-#define NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_500   0x20ull
-#define NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_502   0x40ull
-#define NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_503   0x80ull
-#define NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_504   0x100ull
-/* "any other 5xx" -- see comment above. Kept well clear of the named bits and
- * of any future sentinel (backend_presets' NONE sentinel lives at bit 63; this
- * mask has no sentinel of its own, so there is no collision to avoid there,
- * but the gap still documents that this bit is not a real HTTP status). */
-#define NGX_HTTP_CACHE_TURBO_USE_STALE_ANY_5XX    0x200ull
-
-#define NGX_HTTP_CACHE_TURBO_USE_STALE_DEFAULT \
-    (NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_500 \
-     | NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_502 \
-     | NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_503 \
-     | NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_504 \
-     | NGX_HTTP_CACHE_TURBO_USE_STALE_ANY_5XX)
 
 /* Upper bound on the cache_turbo_redis database index, accepted both as the
  * `db=N` param and as the `/N` DSN suffix. Redis ships `databases 16`, i.e.
@@ -229,76 +151,6 @@
 
 
 /*
- * Auto-classify CMS backend presets (distinct from the stale-window PRESET_*
- * above). A bitmask in loc_conf->backend_presets; each bit pulls in one row of
- * the preset registry (cookie/URI/arg dynamic-surface rules).
- *
- * EVERY preset is opt-in — you name the backends you actually run. There is no
- * `generic` / `auto` union, and deliberately so. It used to mean
- * WORDPRESS|WOOCOMMERCE|JOOMLA, and it was never a safe default:
- *
- *   - it never covered every backend, so `auto` on a Drupal or XenForo site
- *     silently enabled no rules for it at all;
- *   - WOOCOMMERCE inside it leaves /wp-admin/ cacheable unless stacked with
- *     WORDPRESS — a union whose members you must know how to combine is not a
- *     default;
- *   - JOOMLA inside it ships no cookie rule, so `auto` on a Joomla site LOOKED
- *     like it protected logged-in users and did not.
- *
- * Both spellings are now rejected at config parse (see cache_turbo_backend).
- *
- * The other reason no union is safe: most of these presets have generic-English
- * dynamic URIs — /login, /register, /contact, /misc (xenforo), /login, /signup,
- * /posts (discourse), /user, /admin, /node (drupal), /index.php (mediawiki) —
- * which an unrelated site may legitimately serve as perfectly cacheable pages.
- * Enabling one you do not run punches holes in your own cache.
- *
- * WIDTH: the bits are `ull` and the mask field is ngx_uint_t (64-bit on every
- * platform this module targets; nginx defines it as uintptr_t). The run was
- * 32-bit until it filled up at 31 presets + the NONE sentinel — a 32nd preset
- * would have aliased NONE and been silently invisible, because HAS_BACKEND()
- * masks NONE out. Keep every literal suffixed `ull`: an unsuffixed 0x80000000
- * is `unsigned int`, and the promotion in `mask & ~BIT` would then clear the
- * high half of a 64-bit mask on a plain-int operand. There is room for 63
- * presets; NONE is pinned to bit 63, the far end, so the preset run can grow
- * contiguously from bit 0 without ever colliding with it again.
- */
-#define NGX_HTTP_CACHE_TURBO_BACKEND_WORDPRESS    0x0001ull
-#define NGX_HTTP_CACHE_TURBO_BACKEND_WOOCOMMERCE  0x0002ull
-#define NGX_HTTP_CACHE_TURBO_BACKEND_JOOMLA       0x0004ull
-#define NGX_HTTP_CACHE_TURBO_BACKEND_XENFORO      0x0008ull
-#define NGX_HTTP_CACHE_TURBO_BACKEND_DISCOURSE    0x0010ull
-#define NGX_HTTP_CACHE_TURBO_BACKEND_PHPBB        0x0020ull
-#define NGX_HTTP_CACHE_TURBO_BACKEND_DRUPAL       0x0040ull
-#define NGX_HTTP_CACHE_TURBO_BACKEND_MEDIAWIKI    0x0080ull
-#define NGX_HTTP_CACHE_TURBO_BACKEND_MAGENTO      0x0100ull
-#define NGX_HTTP_CACHE_TURBO_BACKEND_GHOST        0x0200ull
-#define NGX_HTTP_CACHE_TURBO_BACKEND_WAGTAIL      0x0400ull
-#define NGX_HTTP_CACHE_TURBO_BACKEND_KIRBY        0x0800ull
-#define NGX_HTTP_CACHE_TURBO_BACKEND_SHOPWARE6    0x1000ull
-#define NGX_HTTP_CACHE_TURBO_BACKEND_TYPO3        0x2000ull
-#define NGX_HTTP_CACHE_TURBO_BACKEND_INVISION     0x4000ull
-#define NGX_HTTP_CACHE_TURBO_BACKEND_SMF          0x8000ull
-#define NGX_HTTP_CACHE_TURBO_BACKEND_VANILLA      0x10000ull
-#define NGX_HTTP_CACHE_TURBO_BACKEND_PUNBB        0x20000ull
-#define NGX_HTTP_CACHE_TURBO_BACKEND_PHORUM       0x40000ull
-#define NGX_HTTP_CACHE_TURBO_BACKEND_YABB         0x80000ull
-#define NGX_HTTP_CACHE_TURBO_BACKEND_MYBB         0x100000ull
-#define NGX_HTTP_CACHE_TURBO_BACKEND_VBULLETIN    0x200000ull
-#define NGX_HTTP_CACHE_TURBO_BACKEND_TEXTPATTERN  0x400000ull
-#define NGX_HTTP_CACHE_TURBO_BACKEND_BLUDIT       0x800000ull
-#define NGX_HTTP_CACHE_TURBO_BACKEND_SPIP         0x1000000ull
-#define NGX_HTTP_CACHE_TURBO_BACKEND_BUGZILLA     0x2000000ull
-#define NGX_HTTP_CACHE_TURBO_BACKEND_MANTISBT     0x4000000ull
-#define NGX_HTTP_CACHE_TURBO_BACKEND_PLONE        0x8000000ull
-#define NGX_HTTP_CACHE_TURBO_BACKEND_UMBRACO      0x10000000ull
-#define NGX_HTTP_CACHE_TURBO_BACKEND_DOTCLEAR     0x20000000ull
-#define NGX_HTTP_CACHE_TURBO_BACKEND_WIKIJS       0x40000000ull
-#define NGX_HTTP_CACHE_TURBO_BACKEND_REDMINE      0x80000000ull
-#define NGX_HTTP_CACHE_TURBO_BACKEND_FLARUM       0x100000000ull
-#define NGX_HTTP_CACHE_TURBO_BACKEND_OPENCART     0x200000000ull
-
-/*
  * "cache_turbo_backend none;" — explicitly NO preset here.
  *
  * This is a sentinel, not a registry row: it matches no backend and pulls in no
@@ -336,32 +188,6 @@
 #define NGX_HTTP_CACHE_TURBO_CC_RESPECT  0
 #define NGX_HTTP_CACHE_TURBO_CC_HONOR    1
 #define NGX_HTTP_CACHE_TURBO_CC_IGNORE   2
-
-/* Per-request serve outcome (ctx.status), surfaced by $cache_turbo_status.
- * Tokens mirror nginx $upstream_cache_status (HIT/MISS/EXPIRED/STALE/BYPASS).
- * MISS is 0 so a pcalloc'd ctx defaults to it; the serve/bypass/expired paths
- * override. EXPIRED = a cached entry was found past its serveable window and
- * refetched (NOT a cold miss, NOT only-if-cached-504 which stays MISS).
- * Keep ngx_http_cache_turbo_status_str() in the .c in sync with these. */
-#define NGX_HTTP_CACHE_TURBO_ST_MISS     0
-#define NGX_HTTP_CACHE_TURBO_ST_HIT      1
-#define NGX_HTTP_CACHE_TURBO_ST_STALE    2
-#define NGX_HTTP_CACHE_TURBO_ST_BYPASS   3
-#define NGX_HTTP_CACHE_TURBO_ST_EXPIRED  4
-
-/* S7.2: unfolded per-request serve reason, surfaced by
- * $cache_turbo_serve_reason. Unlike ctx.status/$cache_turbo_status (which
- * folds every non-HIT reason to STALE for $upstream_cache_status
- * compatibility and MUST keep doing so), this enum keeps the caller-supplied
- * reason distinct. NONE is 0 so a pcalloc'd ctx defaults to it (never
- * engaged / not yet decided -> "-" via not_found, same as status).
- * Keep ngx_http_cache_turbo_serve_reason_str() in the .c in sync. */
-#define NGX_HTTP_CACHE_TURBO_SR_NONE            0
-#define NGX_HTTP_CACHE_TURBO_SR_FRESH           1
-#define NGX_HTTP_CACHE_TURBO_SR_STALE           2
-#define NGX_HTTP_CACHE_TURBO_SR_STALE_IF_ERROR  3
-#define NGX_HTTP_CACHE_TURBO_SR_STALE_BREAKER   4
-#define NGX_HTTP_CACHE_TURBO_SR_BREAKER_503     5
 
 
 /*
@@ -406,33 +232,6 @@
 /* Fixed autotune recompute cadence (seconds) when cache_turbo_autotune is on. */
 #define NGX_HTTP_CACHE_TURBO_AT_INTERVAL       30
 
-
-/*
- * Vary-aware normalize suffix (v3-4). Bitmask in loc_conf.normalize_vary chosen
- * by `cache_turbo_normalize_vary encoding device`. ENCODING appends an
- * Accept-Encoding class (br/gzip/identity); DEVICE appends a User-Agent device
- * class (mobile/desktop). Off by default so v3-1 keys are unchanged.
- */
-#define NGX_HTTP_CACHE_TURBO_VARY_ENCODING  0x1
-#define NGX_HTTP_CACHE_TURBO_VARY_DEVICE    0x2
-/* auto-Vary (v11 other half): the same bits also drive the automatic variant
- * key derived from a response `Vary:` header (cache_turbo_auto_vary). LANG keys
- * on the Accept-Language PRIMARY SUBTAG CLASS (first language-range, cut at
- * '-', lowercased, capped at 8 bytes — e.g. `en-US,en;q=0.9` -> "en"; absent/
- * malformed folds to the empty class, it is not skipped); ORIGIN keys on the
- * raw Origin value (a CORS security boundary — folding it would let one
- * origin's response serve another's CORS headers, so it stays raw by design).
- * Only this safe whitelist is honoured — Vary: * / Cookie / Authorization make
- * the response uncacheable instead (cross-user poisoning/leak guard). */
-#define NGX_HTTP_CACHE_TURBO_VARY_LANG      0x4
-#define NGX_HTTP_CACHE_TURBO_VARY_ORIGIN    0x8
-
-/* Worst-case suffix bytes: "\x1Fae=identity" (12) + "\x1Fdev=desktop" (12). The
- * delimiter is the raw 0x1F (US) byte, which a query string can never contain
- * (clients percent-encode control bytes), so the suffix cannot collide with a
- * real arg value. */
-#define NGX_HTTP_CACHE_TURBO_VARY_SUFFIX_MAX  32
-
 /* A preset band: the default value for each preset-controlled knob, plus the
  * [beta_min, beta_max] window the live autotune (v4-3) may move beta within for
  * this preset. The autotune computes a cost-derived target clamped to the global
@@ -449,59 +248,11 @@ typedef struct {
 } ngx_http_cache_turbo_band_t;
 
 
-/* PERF-7: reference header prefixed to every slab-allocated response body so a
- * cache HIT can serve the blob DIRECTLY out of shm (zero-copy) instead of
- * memcpy'ing it into r->pool under the zone mutex. `data` (below) points at the
- * blob bytes that follow this header; the header is recovered with CT_BLOBREF().
- *
- * Lifetime: while a request serves a blob its output buffer points into the
- * slab, so the buffer must outlive eviction/refresh by another worker. `refs`
- * counts the in-flight zero-copy servers; `detached` is set when the owning node
- * has dropped this buffer (evict / refresh / purge). The slab is freed only when
- * refs == 0 AND detached — i.e. by whichever side is last (the evicting worker if
- * no serve is in flight, otherwise the last server's request-pool cleanup).
- * ALL fields are mutated only under shpool->mutex, so plain ints suffice (the
- * mutex is the barrier); no atomics. */
-typedef struct {
-    ngx_uint_t               refs;       /* in-flight zero-copy servers      */
-    ngx_uint_t               detached;   /* owning node dropped this buffer  */
-} ngx_http_cache_turbo_blobref_t;
-
-#define CT_BLOBREF(data)                                                       \
-    ((ngx_http_cache_turbo_blobref_t *)                                        \
-        ((u_char *) (data) - sizeof(ngx_http_cache_turbo_blobref_t)))
-
-
 /*
  * One cached object living in the shared-memory slab. The node key is the
  * 32-byte hash of the cache key; the variable-length body (headers + payload,
  * serialised) is slab-allocated separately and pointed to by data/len.
  */
-/* L1 node kind (L13-fix). What the node HOLDS -- the single authority, replacing
- * the old ad-hoc `len == 0 && data == NULL` shape sniffing. Every guard that used
- * to infer a node's role from its shape now reads `kind` instead.
- *
- * ⚠ ORTHOGONAL TO `refreshing`. A node's kind says what it holds; `refreshing`
- * says whether a single-flight regen is in the air for it. BOTH kinds can be
- * refreshing: an ENTRY refreshes while still serving its stale body (the v8
- * background-update dice, module.c), and a COUNTER refreshing is what the rest
- * of the code calls a STUB. So "is this a stub?" is exactly
- * `kind == COUNTER && refreshing`, never a shape test.
- *
- * History: stub / negative memo / min_uses counter were three meanings overloaded
- * onto one body-less shape, disambiguated by a different field at each site. Five
- * confirmed defects (Codex #1/#4/#5, CodeRabbit CR-A/CR-B on PR #77) were all
- * sites that picked the wrong disambiguator. See memory issues.md 2026-07-19. */
-#define NGX_HTTP_CACHE_TURBO_NODE_ENTRY    0  /* holds a body (len > 0)        */
-#define NGX_HTTP_CACHE_TURBO_NODE_COUNTER  1  /* no body: min_uses counter
-                                               * and/or L13 negative memo, and
-                                               * (when refreshing) the v10
-                                               * cold-miss stub               */
-
-/* S8 segmented-LRU segment ids. See the `seg` field below for why PROBATION
- * must stay 0. ci/tests/unit/extract_shm.sh pins both values. */
-#define NGX_HTTP_CACHE_TURBO_SEG_PROBATION  0  /* on &sh->lru               */
-#define NGX_HTTP_CACHE_TURBO_SEG_PROTECTED  1  /* on &sh->lru_protected     */
 
 /* P6 circuit-breaker states (D-5: scope is PER-ZONE -- the shm zone is already
  * the accounting unit for autotune and stats, and a per-upstream breaker would
@@ -2076,128 +1827,6 @@ typedef struct {
 } ngx_http_cache_turbo_ctx_t;
 
 
-/*
- * Serialised cache blob layout (one contiguous slab allocation):
- *
- *   [ 44-byte fixed wire header (see ngx_http_cache_turbo_blob_hdr_write) ]
- *   [ nheaders * { u32 name_len, name, u32 val_len, value } ]   (all u32 LE)
- *   [ body bytes ]
- *
- * The header block lets us restore Content-Type and any other response
- * headers on a cache hit, so cached responses are byte-identical to origin.
- *
- * created/fresh_ttl/stale_ttl/sie_ttl carry the object's ORIGINAL freshness so
- * an L2 hit can rebuild L1 with the remaining lifetime instead of resetting it
- * to the location default — without these, every L2 hit would re-promote a stale
- * object as fresh and it could live forever (and per-status/upstream TTLs would
- * be lost across the L2 round-trip). sie_ttl (RFC-2 stale-if-error, CTB4) is the
- * absolute serve-on-origin-error window from creation (fresh + stale-if-error N);
- * 0 = no serve-on-error past the normal stale window.
- *
- * STAB-4: the wire header is a FIXED little-endian, 44-byte, padding-free layout
- * (NOT this struct's native ABI) written/read only via the blob_hdr_write/
- * blob_validate helpers in module.c — so the on-disk format is independent of
- * compiler struct padding and host endianness. This struct is the in-memory
- * PARSED form; its field order/size is irrelevant to the wire. A single
- * ngx_http_cache_turbo_blob_validate() fully validates magic+version+all length
- * fields+the TLV header walk in one place, so a malformed L2 blob is rejected
- * BEFORE it is inserted into L1 (the old inline parse stored first, then serve()
- * failed = a poisoned L1 slot).
- *
- * Wire offsets (little-endian):
- *   0  u32 magic     ("CTB4")    16  u32 headers_len   32  u32 fresh_ttl
- *   4  u16 version   (= 4)       20  u32 body_len      36  u32 stale_ttl
- *   6  u16 flags     (BLOBF_*)   24  i64 created       40  u32 sie_ttl
- *   8  u32 status    12 u32 nheaders                   44  = header size
- *
- * S232-BYPASS-STALE: the u16 at offset 6 was reserved-and-always-0; it now
- * carries BLOBF_* bits. This is NOT a wire-layout change (the field was already
- * in the 44-byte header, already written as 0 and already skipped by every
- * reader), so magic/version are deliberately NOT bumped and no keyspace
- * turnover happens -- see the NOTE on BLOB_VERSION below for that rule. An old
- * CTB4 blob reads back flags = 0, which is exactly "no bits set".
- */
-typedef struct {
-    uint32_t                 magic;       /* 0x43544234 = "CTB4"            */
-    uint32_t                 version;
-    uint32_t                 nheaders;
-    uint32_t                 headers_len; /* bytes of the header block      */
-    uint32_t                 body_len;
-    uint32_t                 status;
-    int64_t                  created;     /* unix time (s) the blob was made */
-    uint32_t                 fresh_ttl;   /* freshness seconds from created  */
-    uint32_t                 stale_ttl;   /* total serveable window (>=fresh) */
-    uint32_t                 sie_ttl;     /* abs serve-on-error window; 0=none */
-    uint32_t                 flags;       /* BLOBF_* bits (wire u16 at off 6) */
-} ngx_http_cache_turbo_blob_hdr_t;
-
-/*
- * S232-BYPASS-STALE: this entry may ONLY be served by the pre-origin circuit
- * breaker gate, while the breaker is OPEN. It is permanently unreachable on the
- * normal hit path regardless of its age or TTLs -- the same "stored but only
- * the breaker can serve it" property an EXPIRED entry has (module.c, the L1
- * breaker-arm site), except it holds from the moment of the store rather than
- * being reached by ageing out.
- *
- * ⚠ This bit is the ENTIRE safety argument for cache_turbo_bypass_stale_uri.
- * The URIs an operator opts in are ones they had otherwise excluded from the
- * cache; storing them is only acceptable because nothing on the normal path can
- * reach the stored copy. Any code that serves a blob WITHOUT consulting this
- * bit reintroduces a cross-user disclosure on exactly those URIs. Grep for
- * BLOBF_BREAKER_ONLY before adding a new serve site.
- */
-#define NGX_HTTP_CACHE_TURBO_BLOBF_BREAKER_ONLY  0x0001
-
-/*
- * S231-PERF-HDRWALK: one parsed TLV header entry, as produced by the single
- * walk inside ngx_http_cache_turbo_blob_validate() and consumed directly by
- * ngx_http_cache_turbo_restore_response() -- no second bounds-checking pass
- * over the same bytes. name/val point INTO the caller's blob buffer (same
- * lifetime as the blob itself; no copy).
- */
-typedef struct {
-    const u_char             *name;
-    uint32_t                  nlen;
-    const u_char              *val;
-    uint32_t                   vlen;
-} ngx_http_cache_turbo_blob_href_t;
-
-
-/* CTB4 (RFC-2 stale-if-error): fixed-endian versioned wire format. CTB4 adds the
- * sie_ttl u32 after stale_ttl (44-byte header). Old CTB1/CTB2/CTB3 blobs in L2
- * fail the magic/version check and are treated as a miss (cache self-heals), so
- * no migration is needed — the keyspace turns over once on upgrade.
- *
- * NOTE: the magic/version are bumped ONLY for an actual wire-LAYOUT change. A
- * purely semantic shift in already-laid-out bytes (e.g. the 2bcb914 switch from
- * storing a compressed body to an identity one) does NOT bump it — a reload
- * clears L1 shm and short TTLs age out any L2 copy, so a global keyspace
- * turnover would be unwarranted churn for a not-yet-in-production module. */
-#define NGX_HTTP_CACHE_TURBO_BLOB_MAGIC    0x43544234
-#define NGX_HTTP_CACHE_TURBO_BLOB_VERSION  4
-/* Fixed wire size of the blob header (NOT sizeof the struct — that carries
- * native padding). All blob offsets derive from this constant. */
-#define NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE 44
-
-/* Bounds on the blob's `created` field (AUD-BLOB-CREATED). It is stored as a
- * signed int64 wire field but is always written as `(int64_t) ngx_time()` at
- * store time (module.c) — a real store timestamp. Every consumer computes age
- * as `now - created` (time_t, i.e. plain signed subtraction) with NO overflow
- * check before it, e.g. `ngx_time() - (time_t) bh.created`; the `age < 0`
- * clamps downstream run only AFTER that subtraction has already happened.
- * A blob is not a trusted store artifact once it crosses L2 (Redis/memcached):
- * an attacker with L2 write access, or a corrupted/bit-flipped entry, can set
- * `created` to any int64, including INT64_MIN — `now - INT64_MIN` is signed
- * overflow, i.e. undefined behaviour, before any clamp gets a chance to run.
- * Reject rather than clamp, same as status/stale_ttl above: a `created` this
- * far from "a real store timestamp" was not written by this module. The floor
- * is 0 (this module's blob format did not exist before the Unix epoch); the
- * ceiling is FOREVER_TTL past "now" at validation time, generous enough to
- * absorb clock skew between nodes while still rejecting a blob claiming to
- * have been stored decades in the future. */
-#define NGX_HTTP_CACHE_TURBO_BLOB_CREATED_MIN  ((int64_t) 0)
-
-
 extern ngx_module_t  ngx_http_cache_turbo_module;
 
 
@@ -2494,9 +2123,6 @@ struct ngx_cache_turbo_l1_backend_s {
 #define NGX_HTTP_CACHE_TURBO_STORE_IF_NEWER            0
 #define NGX_HTTP_CACHE_TURBO_STORE_IF_ABSENT_OR_DEAD   1
 
-/* Cold-miss wait-loop poll interval (ms): a loser re-checks L1/L2 this often
- * until the winner fills the entry or cache_turbo_lock_timeout elapses (v10). */
-#define NGX_HTTP_CACHE_TURBO_LOCK_POLL_MS  100
 
 extern ngx_cache_turbo_l1_backend_t  ngx_http_cache_turbo_shm_backend;
 
@@ -2559,39 +2185,6 @@ struct ngx_cache_turbo_backend_s {
         ngx_str_t *owner);
 };
 
-
-/* Memcached keepalive pool per-profile bucket (v14). Peer addr is the only
- * profile identity (no auth/TLS/db like redis). */
-typedef struct ngx_http_cache_turbo_memcached_ka_bucket_s
-    ngx_http_cache_turbo_memcached_ka_bucket_t;
-
-typedef struct {
-    ngx_queue_t                                     queue;
-    ngx_connection_t                               *connection;
-    ngx_http_cache_turbo_memcached_ka_bucket_t    *bucket;
-} ngx_http_cache_turbo_memcached_ka_item_t;
-
-struct ngx_http_cache_turbo_memcached_ka_bucket_s {
-    ngx_uint_t   inited;
-    ngx_uint_t   max;
-    ngx_uint_t   count;
-    ngx_msec_t   timeout;
-    ngx_queue_t  cache;
-    ngx_queue_t  free;
-    ngx_http_cache_turbo_memcached_ka_item_t *items;
-    socklen_t    socklen;
-    ngx_sockaddr_t sockaddr;
-};
-
-#define NGX_HTTP_CACHE_TURBO_MEMCACHED_KA_MAX_BUCKETS  16
-
-typedef struct {
-    ngx_uint_t  nbuckets;
-    ngx_http_cache_turbo_memcached_ka_bucket_t
-                buckets[NGX_HTTP_CACHE_TURBO_MEMCACHED_KA_MAX_BUCKETS];
-} ngx_http_cache_turbo_memcached_ka_t;
-
-extern ngx_http_cache_turbo_memcached_ka_t ngx_http_cache_turbo_memcached_ka;
 
 extern ngx_cache_turbo_backend_t  ngx_http_cache_turbo_redis_backend;
 extern ngx_cache_turbo_backend_t  ngx_http_cache_turbo_memcached_backend;

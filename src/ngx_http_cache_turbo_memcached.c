@@ -36,6 +36,7 @@
  */
 
 #include "ngx_http_cache_turbo_module.h"
+#include "ngx_http_cache_turbo_internal.h"
 
 
 /* memcached's default single-item ceiling is 1 MiB (-I default). A value at or

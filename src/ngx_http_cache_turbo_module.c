@@ -18,6 +18,7 @@
  */
 
 #include "ngx_http_cache_turbo_module.h"
+#include "ngx_http_cache_turbo_internal.h"
 
 #if (NGX_SSL)
 #include <ngx_event_openssl.h>
