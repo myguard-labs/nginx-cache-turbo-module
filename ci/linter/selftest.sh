@@ -251,7 +251,14 @@ for s in ci/linter/lint-*.sh; do
     # "c" is deliberately excluded in CI (see lint.yml's header): the src/
     # scanners run in security-scanners.yml instead.
     [ "$n" = "c" ] && continue
-    printf '%s\n' "$only" | tr ' ' '\n' | grep -qx "$n" || missing="$missing $n"
+    # In-process membership. `printf | grep -qx` can invert its verdict when
+    # grep -q exits early and printf's write hits EPIPE -- same defect that
+    # took the astgrep guard red on CI only; see lint-astgrep.sh.
+    found=""
+    for k in $only; do
+        [ "$k" = "$n" ] && { found=1; break; }
+    done
+    [ -n "$found" ] || missing="$missing $n"
 done
 if [ -z "$missing" ]; then
     echo "ok   every checker is named in lint.yml LINT_ONLY"
@@ -286,6 +293,38 @@ else
     echo "FAIL ast-grep promoted set differs between the hook and the checker" >&2
     diff <(printf '%s\n' "$pc") <(printf '%s\n' "$ck") | sed 's/^/       | /' >&2
     rc=1
+fi
+
+# Every PROMOTED name must be accepted by the guard against the REAL ruleset.
+# This is the control for the CI-only inversion fixed 2026-08-14: the guard was
+# built on `printf "%s\n" "${KNOWN[@]}" | grep -qx`, and when grep -q exited on
+# its first match printf could take an EPIPE, whose non-zero status the `||`
+# read as "this rule does not exist". c-format-string was condemned on the
+# runner while its rule file sat in the tree, correctly tagged.
+#
+# Asserting "the checker exits 0 today" would NOT catch that -- it was green
+# locally throughout. So drive the guard's own inputs: resolve the ids exactly
+# as the checker does and require every promoted name to be found.
+known_ids="$(grep -rhE '^id:[[:space:]]*' ci/ast-grep/rules/ \
+             | sed -E 's/^id:[[:space:]]*//; s/[[:space:]]*$//' | sort -u)"
+if [ -z "$known_ids" ]; then
+    echo "FAIL promoted-resolves control: no rule ids parsed from ci/ast-grep/rules/" >&2
+    rc=1
+else
+    unresolved=""
+    for r in $ck; do
+        hit=""
+        for k in $known_ids; do
+            [ "$k" = "$r" ] && { hit=1; break; }
+        done
+        [ -n "$hit" ] || unresolved="$unresolved $r"
+    done
+    if [ -z "$unresolved" ]; then
+        echo "ok   every PROMOTED ast-grep rule resolves to a defined rule id"
+    else
+        echo "FAIL PROMOTED names with no defining rule id:$unresolved" >&2
+        rc=1
+    fi
 fi
 
 # Unparsable YAML is "could not run" (2), never "clean" -- GitHub may still
