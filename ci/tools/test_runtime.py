@@ -17,18 +17,18 @@ Both properties come from the star-imports below; keep them.
 
 from __future__ import annotations
 
-from areas.admin import *  # noqa: F401,F403
-from areas.breaker import *  # noqa: F401,F403
-from areas.core import *  # noqa: F401,F403
-from areas.http import *  # noqa: F401,F403
-from areas.l2 import *  # noqa: F401,F403
-from areas.policy import *  # noqa: F401,F403
-from areas.tune import *  # noqa: F401,F403
+from areas.admin import *
+from areas.breaker import *
+from areas.core import *
+from areas.http import *
+from areas.l2 import *
+from areas.policy import *
+from areas.tune import *
 
 # Underscore-prefixed names are NOT re-exported by `import *`, so the
 # private helpers this module actually calls are imported explicitly.
-from test_runtime_base import *  # noqa: F401,F403
-from test_runtime_base import (  # noqa: F401
+from test_runtime_base import *
+from test_runtime_base import (
     MemcachedServer,
     Nginx,
     Origin,
