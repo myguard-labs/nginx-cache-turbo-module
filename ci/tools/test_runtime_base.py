@@ -240,21 +240,39 @@ def _instrument(origin: "Origin") -> None:
     global _ORIGIN_REF
     _ORIGIN_REF = origin
     import inspect
-    for _name, _fn in list(globals().items()):
-        if not (_name.startswith("test_") and inspect.isfunction(_fn)):
-            continue
 
-        def _wrap(name, fn):
-            def _runner(*a, **kw):
-                before = _conn_cursor()
-                _write_breadcrumb(f"{name} {before}")
-                try:
-                    return fn(*a, **kw)
-                finally:
-                    _SPANS.append((name, before, _conn_cursor()))
-                    _write_breadcrumb(f"DONE {name}")
-            return _runner
-        globals()[_name] = _wrap(_name, _fn)
+    def _wrap(name, fn):
+        def _runner(*a, **kw):
+            before = _conn_cursor()
+            _write_breadcrumb(f"{name} {before}")
+            try:
+                return fn(*a, **kw)
+            finally:
+                _SPANS.append((name, before, _conn_cursor()))
+                _write_breadcrumb(f"DONE {name}")
+        _runner._ct_instrumented = True   # type: ignore[attr-defined]
+        return _runner
+
+    # MAINT-T1: the tests no longer live in THIS module's globals(), so
+    # instrumenting only globals() would wrap nothing at all and disable the
+    # breadcrumb/attribution machinery without a word. Wrap in each area
+    # module, then rebind the same wrapper in the facade -- run_all() resolves
+    # test names against the facade's globals, so an area-only rebind would
+    # leave run_all() calling the unwrapped originals.
+    targets = [m for n, m in sys.modules.items()
+               if m is not None and (n == "test_runtime" or n.startswith("areas."))]
+    wrapped: dict[str, object] = {}
+    for _mod in targets:
+        _g = vars(_mod)
+        for _name, _fn in list(_g.items()):
+            if not (_name.startswith("test_") and inspect.isfunction(_fn)):
+                continue
+            if getattr(_fn, "_ct_instrumented", False):
+                wrapped.setdefault(_name, _fn)     # already wrapped: keep it
+                continue
+            if _name not in wrapped:
+                wrapped[_name] = _wrap(_name, _fn)
+            _g[_name] = wrapped[_name]
 
 
 def _attribute_alert(conn_number: int) -> str:

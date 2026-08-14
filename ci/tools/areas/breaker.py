@@ -234,7 +234,7 @@ def test_breaker_arming_sites_gated_white_box(ng: Nginx, origin: Origin) -> None
 
         # --- claim 2: breaker OFF must arm nothing ---------------------------
         # Baseline is the counter AFTER the breaker-ON phase, since both
-        # locations share the `main` zone.
+        # locations share the dedicated `brkiz` zone.
         before_off = _armings(h_on, "breaker ON fallback", site="l1")
         s_off_trip, _, _ = fetch(ng.port, "/brkioff/dead")
         assert s_off_trip != 200, \
@@ -464,7 +464,7 @@ def test_breaker_lifecycle_open_zero_contact_close(ng: Nginx, origin: Origin) ->
     # measured 0 the whole way through until this was caught by the trip
     # assertion below firing "did not actually reach the origin". Neither
     # needle collides with an existing fixture's URI (unlike bare
-    # "cached"/"cold", which /cold/ already uses elsewhere in this file).
+    # "cached"/"cold", which /cold/ already uses in another area module).
     cached_path = "/o45/o45cache"
     cold_path = "/o45/o45cold"
     cached_needle = "o45cache"
@@ -737,7 +737,7 @@ def test_breaker_record_native_proxy_cache_hit_no_record(ng: Nginx) -> None:
     cannot invalidate the assertion -- see the comment at the poll."""
     if ng.single_process or ng.sanitizer:
         # Same core-nginx UBSan/ASan false-positive + cache-manager-process
-        # skip as test_suppress_native_e2e_proxy_cache above.
+        # skip as test_suppress_native_e2e_proxy_cache (core area).
         return
 
     path = "/o45natpc/y"
@@ -1179,8 +1179,9 @@ def test_redis_connect_backoff_fails_fast(ng: Nginx, origin: Origin) -> None:
     comment in ngx_http_cache_turbo_module.c ~L6940 -- "process-global...
     per-worker") is a single lifetime atomic for the whole worker process,
     not a per-location or per-test value. This test runs in run_all() on the
-    same worker as other backoff tests (e.g., test_redis_tls_handshake_failure_arms_backoff
-    around line 14085) and may find the counter at a nonzero value from
+    same worker as other backoff tests (e.g.,
+    test_redis_tls_handshake_failure_arms_backoff, now in the l2 area) and may
+    find the counter at a nonzero value from
     prior tests. Reading this counter as if it started at 0 for THIS test is a
     baseline artifact of test ordering, not a property of the backoff arm path.
     The oracle here is a DELTA against a baseline captured from a request
@@ -1336,7 +1337,7 @@ def test_cold_wait_poll_timer_no_uaf(ng: Nginx, origin: Origin) -> None:
     ngx_http_free_request reached from a read-event/EPOLLRDHUP path while
     cold_wait_ev is armed, which the investigation ran out of budget to do.
 
-    /coldwaituaf/ (nginx_config() above) is wired to LIVE redis with
+    /coldwaituaf/ (test_runtime_base's nginx_config()) is wired to LIVE redis with
     cache_turbo_lock left ON (module default) and lock_timeout 2s so a cold
     miss genuinely parks in ngx_http_cache_turbo_cold_wait() and the 100ms
     poll timer fires repeatedly under real cross-node NX lock contention

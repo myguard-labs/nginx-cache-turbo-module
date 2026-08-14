@@ -821,7 +821,7 @@ def test_autotune_load_widens_stale_window(ng: Nginx, origin: Origin) -> None:
     assert any(h.get("x-cache") == "STALE" for _, _, h in res), \
         ("load-widened stale window should still serve STALE at t=3s (a static "
          "conservative ×2 window would hard-expire and MISS); got "
-         + repr(sorted({h.get("x-cache") for _, _, h in res})))
+         + repr(sorted(str(h.get("x-cache")) for _, _, h in res)))
     drain_origin(origin)
 
 
@@ -1044,9 +1044,13 @@ def test_mc_keepalive_reuse(ng: Nginx, origin: Origin,
     stamp = time.time()
 
     def burst(prefix: str) -> int:
-        # each probe opens one stats connection; subtract it so we count only
-        # nginx's accepts, not our own measurement conns (mirrors the redis test)
-        before = mc.total_connections() - 1
+        # Subtract our OWN stats connection once, on the closing reading only.
+        # total_connections() opens a connection to ask, so the closing probe is
+        # inside its own answer while the opening probe's is already inside
+        # `before`. Subtracting on both readings cancels out and leaves every
+        # burst reporting nginx's accepts + 1 -- which `warm <= pool_size` below
+        # has no headroom to absorb.
+        before = mc.total_connections()
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
             list(ex.map(lambda i: fetch(ng.port, f"{prefix}reuse-{stamp}-{i}"),
                         range(n)))
@@ -1118,7 +1122,7 @@ def test_mc_keepalive_zero_does_not_drain_pool(ng: Nginx, origin: Origin,
     # re-dial more than one without the pool having been drained. 4 is still far
     # below the drain level, so the defect this was written for (D-O1 ka_save at
     # keepalive=0) fails just as loudly.
-    pool_size = 4                # /mcka/ config at the top of this file: keepalive=4
+    pool_size = 4                # /mcka/ in test_runtime_base nginx_config(): keepalive=4
     assert warm <= pool_size, (
         "the keepalive=0 location drained the shared peer's pool: the warm "
         f"burst re-dialled {warm} connection(s), at/above the pooled-socket count "
