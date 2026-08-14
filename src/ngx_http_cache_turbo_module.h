@@ -2763,4 +2763,37 @@ ngx_uint_t ngx_http_cache_turbo_breaker_should_consult(
     ngx_http_cache_turbo_loc_conf_t *clcf);
 
 
+/* ---- module.c: response helpers shared with admin.c ---- */
+ngx_int_t ngx_http_cache_turbo_send_body(ngx_http_request_t *r,
+    ngx_uint_t status, ngx_str_t *body, const char *ctype, size_t ctype_len);
+ngx_int_t ngx_http_cache_turbo_send_json(ngx_http_request_t *r,
+    ngx_uint_t status, ngx_str_t *body);
+
+/* One-shot digest convenience for a single contiguous input (module.c).
+ * Returns NGX_OK on success, NGX_ERROR on failure. */
+ngx_int_t ngx_http_cache_turbo_digest(const void *data, size_t len,
+    u_char out[32]);
+
+/* State carried through an async tag purge from the admin handler (or the
+ * variant-index purge in module.c) to the SMEMBERS completion callback. */
+typedef struct {
+    ngx_http_cache_turbo_loc_conf_t  *clcf;
+    ngx_http_cache_turbo_zone_t      *zone;
+    ngx_str_t                         tag;    /* copied into r->pool */
+} ngx_http_cache_turbo_tagpurge_t;
+
+ngx_int_t ngx_http_cache_turbo_tag_purge_complete(ngx_http_request_t *r,
+    void *data, ngx_str_t *members, ngx_uint_t nmembers,
+    const ngx_http_cache_turbo_redis_walk_t *walk);
+
+/* Fire one background subrequest for `uri` (+ optional `args`) so the origin is
+ * hit and the response stored (module.c; shared with the admin warm path). */
+ngx_int_t ngx_http_cache_turbo_warm_one(ngx_http_request_t *r,
+    ngx_str_t *uri, ngx_str_t *args);
+
+
+/* ---- admin.c (admin request handler) ---- */
+ngx_int_t ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r);
+
+
 #endif /* NGX_HTTP_CACHE_TURBO_MODULE_H_INCLUDED_ */

@@ -3,6 +3,7 @@ ngx_addon_name=ngx_http_cache_turbo_module
 CACHE_TURBO_SRCS="                                                       \
                   $ngx_addon_dir/src/ngx_http_cache_turbo_module.c      \
                   $ngx_addon_dir/src/ngx_http_cache_turbo_conf.c        \
+                  $ngx_addon_dir/src/ngx_http_cache_turbo_admin.c       \
                   $ngx_addon_dir/src/ngx_http_cache_turbo_shm.c         \
                   $ngx_addon_dir/src/ngx_http_cache_turbo_swr.c         \
                   $ngx_addon_dir/src/ngx_http_cache_turbo_autotune.c    \
