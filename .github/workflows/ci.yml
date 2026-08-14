@@ -1,4 +1,4 @@
-# sync-sha: 87e62804de9de8b439e2d32cae7af77af0504b402143490568a0628dee7ef38d
+# sync-sha: 240d213fe25bde768262aa29cb9ec426d84aee008dab5441dfae8989a87c21ee
 name: CI
 
 # Single entry point for the PR suite. The six checks below used to be
@@ -126,7 +126,12 @@ jobs:
           printf '%s\n' "$changed"
           # Mirrors the paths: filters asan.yml and fuzzing.yml carried before
           # the demotion. Keep in sync with what each job actually consumes.
-          if printf '%s\n' "$changed" | grep -qE '^(src/|ci/tools/(ci-build\.sh|test_runtime\.py|ci-hang-guard\.sh|assert-fixtures\.sh)|\.github/actions/build-cache/|\.github/workflows/(asan|ci)\.yml)'; then
+          # ci/tools/areas/ holds the split-out runtime tests (MAINT-T1). It
+          # MUST stay in this alternation: the suite used to be one file, and a
+          # filter naming only test_runtime.py would stop triggering ASan the
+          # moment a test moved into an area module -- coverage lost silently,
+          # on every later PR, with nothing red to notice.
+          if printf '%s\n' "$changed" | grep -qE '^(src/|ci/tools/(ci-build\.sh|test_runtime\.py|areas/|ci-hang-guard\.sh|assert-fixtures\.sh)|\.github/actions/build-cache/|\.github/workflows/(asan|ci)\.yml)'; then
             echo "asan=true" >> "$GITHUB_OUTPUT"
           else
             echo "asan=false" >> "$GITHUB_OUTPUT"

@@ -1,4 +1,4 @@
-# sync-sha: 22e7f9600ee64d208734175e111bc763ee5670abd4e5b58956b726d7b3e3a0f0
+# sync-sha: c1a79bd2ff4ba1cec1771da3918151ac9afae6cb4073f02448b496948bba7570
 name: Build & Test
 
 # Runner selection: plain `[self-hosted, builder02]`, NOT `lxc`.
@@ -105,7 +105,16 @@ jobs:
           # even though the pre-commit hook gates at -S warning.
           bash -n ci/tools/*.sh ci/fuzz/*.sh ci/linter/*.sh
           shellcheck ci/tools/*.sh ci/fuzz/*.sh ci/linter/*.sh
+          # The runtime suite is a package (facade + ci/tools/areas/*.py), so
+          # compile every part: a single-file py_compile of the facade would
+          # let a syntax error in an area module reach the suite run instead
+          # of failing in this cheap gate. The glob is nullglob-free on
+          # purpose -- if areas/ ever disappears this errors rather than
+          # silently checking one file.
           python3 -m py_compile ci/tools/test_runtime.py
+          if [ -d ci/tools/areas ]; then
+            python3 -m py_compile ci/tools/areas/*.py
+          fi
           python3 ci/tools/lint-ci-runners.py
           bash ci/tools/lint-ci-ports.sh
           python3 ci/tools/lint-orphan-tests.py
