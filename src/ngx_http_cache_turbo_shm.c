@@ -8,6 +8,7 @@
  */
 
 #include "ngx_http_cache_turbo_module.h"
+#include "ngx_http_cache_turbo_internal.h"
 
 
 static void
