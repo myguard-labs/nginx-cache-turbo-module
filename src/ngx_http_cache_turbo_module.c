@@ -5740,25 +5740,48 @@ ngx_http_cache_turbo_breaker_unavailable(ngx_http_request_t *r,
 }
 
 
+
+
+/* MAINT-H2 phase helper for ngx_http_cache_turbo_access_handler().
+ * PHASE 1 -- the L1 critical section, extracted whole.
+ *
+ * ⚠ LOCK WINDOW: this helper takes the zone mutex on its FIRST line and every
+ * exit path releases it before returning, exactly as the inline block did.
+ * The mutex is never held across the helper boundary in either direction, so
+ * no lock or unlock moved relative to any pointer that crosses it. The 9 lock
+ * operations of this phase (1 lock + 8 unlocks) are all inside this function.
+ *
+ * ⚠ BREAKER ORDERING (#281): the circuit breaker ARMS from the expired-entry
+ * site INSIDE this lookup, and the arming site's position relative to the
+ * lookup, the vary_apply() key rewrite and the fresh/stale serve arms is
+ * unchanged -- the whole span from ngx_shmtx_lock() to ngx_shmtx_unlock()
+ * moved as ONE contiguous block with no reordering and no guard hoisted out.
+ * The caller invokes this helper at exactly the point the inline code ran,
+ * immediately after the prologue returns NGX_OK, so WHEN the lookup is
+ * reached is bit-identical.
+ *
+ * `hash` is in/out: ngx_http_cache_turbo_vary_apply() may rewrite it to the
+ * variant key that the lookup below must use, and the L2 phase's log lines
+ * and l2_neg_set() key must see the rewritten value -- hence a pointer, not
+ * a by-value copy.
+ *
+ * Returns NGX_DECLINED to mean "fall through to the L2 phase" (the inline
+ * fall-through past the final unlock); NGX_DONE means this phase produced the
+ * handler's return value, which it wrote to *out_rc. */
 static ngx_int_t
-ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
+ngx_http_cache_turbo_access_l1(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx,
+    ngx_http_cache_turbo_zone_t *z, uint32_t *hashp, ngx_int_t *out_rc)
 {
-    uint32_t                          hash;
-    ngx_int_t                         prc;
-    ngx_http_cache_turbo_ctx_t       *ctx;
-    ngx_http_cache_turbo_node_t      *ctn;
-    ngx_http_cache_turbo_zone_t      *z;
-    ngx_http_cache_turbo_loc_conf_t  *clcf;
-
-    clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
-
-    /* Prologue: enablement, method/subrequest/auth vetoes, ctx + key, auto-
-     * classify, request no-cache, auto-Vary key prep, bypass, autotune. NGX_OK
-     * => proceed with ctx/z/hash set; otherwise that is our return value. */
-    prc = ngx_http_cache_turbo_access_prologue(r, clcf, &ctx, &z, &hash);
-    if (prc != NGX_OK) {
-        return prc;
-    }
+    /* Local copy of the caller's `hash`, written back on the fall-through
+     * path only. vary_apply() below may rewrite it to the variant key, and
+     * every subsequent phase (the L2 log lines, l2_neg_set()) must see the
+     * rewritten value -- so the write-back sits immediately before the
+     * NGX_DECLINED return, which is the only exit that has a next phase. On
+     * every terminal exit the caller returns *rc without reading hash again,
+     * exactly as the inline code left its own `hash` local behind. */
+    uint32_t                      hash = *hashp;
+    ngx_http_cache_turbo_node_t  *ctn;
 
     ngx_shmtx_lock(&z->shpool->mutex);
 
@@ -5888,8 +5911,11 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
             ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                            "cache_turbo: L1 HIT (fresh) \"%V\" key=%ui len=%uz",
                            &r->uri, (ngx_uint_t) hash, body_len);
-            return ngx_http_cache_turbo_serve(r, body, body_len, 0, z, body,
-                                              NULL);
+
+            *out_rc = ngx_http_cache_turbo_serve(r, body, body_len, 0, z, body,
+                      NULL);
+            return NGX_DONE;
+
         }
 
         if (!ctx->brk_only
@@ -5952,7 +5978,10 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                             NULL) != NGX_OK)
                     {
                         ngx_shmtx_unlock(&z->shpool->mutex);
-                        return NGX_ERROR;
+
+                        *out_rc = NGX_ERROR;
+                        return NGX_DONE;
+
                     }
                     ngx_http_cache_turbo_blob_acquire(ctn->data);
                     snap = ctn->data;
@@ -5968,14 +5997,20 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                      * above (blob_ref_cleanup), so serve() must not register a
                      * second one for the same pointer -- see the double-drop
                      * warning on blob_ref_cleanup()'s comment. */
-                    return ngx_http_cache_turbo_serve(r, snap, snap_len, 1,
-                                                      z, NULL, NULL);
+
+                    *out_rc = ngx_http_cache_turbo_serve(r, snap, snap_len, 1,
+                              z, NULL, NULL);
+                    return NGX_DONE;
+
                 }
                 ngx_shmtx_unlock(&z->shpool->mutex);
                 ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                                "cache_turbo: cross-node lock WON \"%V\" key=%ui "
                                "-> regenerate", &r->uri, (ngx_uint_t) hash);
-                return NGX_DECLINED;
+
+                *out_rc = NGX_DECLINED;
+                return NGX_DONE;
+
             }
 
             /* Refresh-dice window from the OBJECT's own deadlines, not the
@@ -6063,7 +6098,10 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                         NULL) != NGX_OK)
                 {
                     ngx_shmtx_unlock(&z->shpool->mutex);
-                    return NGX_ERROR;
+
+                    *out_rc = NGX_ERROR;
+                    return NGX_DONE;
+
                 }
                 ngx_http_cache_turbo_blob_acquire(ctn->data);
                 snap = ctn->data;
@@ -6096,7 +6134,10 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                         ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                                        "cache_turbo: parked on L2 lock NX \"%V\" "
                                        "key=%ui", &r->uri, (ngx_uint_t) hash);
-                        return NGX_AGAIN;       /* parked; resume re-enters */
+
+                        *out_rc = NGX_AGAIN;
+                        return NGX_DONE;
+       /* parked; resume re-enters */
                     }
                 }
 
@@ -6109,11 +6150,17 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                                    "cache_turbo: bg-refresh + STALE serve \"%V\" "
                                    "key=%ui len=%uz", &r->uri, (ngx_uint_t) hash,
                                    snap_len);
-                    return ngx_http_cache_turbo_serve(r, snap, snap_len, 1,
-                                                      z, NULL, NULL);
+
+                    *out_rc = ngx_http_cache_turbo_serve(r, snap, snap_len, 1,
+                              z, NULL, NULL);
+                    return NGX_DONE;
+
                 }
 
-                return NGX_DECLINED;       /* inline regen (serves fresh) */
+
+                *out_rc = NGX_DECLINED;
+                return NGX_DONE;
+       /* inline regen (serves fresh) */
             }
 
             /* serve stale, no regeneration on this request */
@@ -6127,8 +6174,11 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                 ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                                "cache_turbo: STALE serve \"%V\" key=%ui len=%uz",
                                &r->uri, (ngx_uint_t) hash, body_len);
-                return ngx_http_cache_turbo_serve(r, body, body_len, 1, z, body,
-                                                  NULL);
+
+                *out_rc = ngx_http_cache_turbo_serve(r, body, body_len, 1, z, body,
+                          NULL);
+                return NGX_DONE;
+
             }
         }
 
@@ -6269,6 +6319,30 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
      * when the reply lands (see ngx_http_cache_turbo_redis_get). */
     ngx_shmtx_unlock(&z->shpool->mutex);
 
+    *hashp = hash;
+    return NGX_DECLINED;
+}
+
+
+
+/* MAINT-H2 phase helper for ngx_http_cache_turbo_access_handler().
+ * PHASE 2 -- the L2 consult: negative-memo short-circuit, the (parking)
+ * backend GET, and the L2-hit validate/arm/promote/serve block.
+ *
+ * ⚠ LOCK WINDOW: the zone mutex is NOT held on entry (phase 1 released it on
+ * its fall-through path) and is not taken here; l1->l2_neg_check(),
+ * l1->l2_neg_set() and l1->store_if() each acquire and release it internally,
+ * so no callee re-acquires a mutex this caller holds.
+ *
+ * ⚠ This phase can PARK the request (NGX_AGAIN on the backend GET). A resume
+ * re-enters the handler from the top, which is why every state change here is
+ * guarded by an idempotency flag (l2_done, brk_arm_done, sie_armed,
+ * l2_neg_skipped) exactly as before. */
+static ngx_int_t
+ngx_http_cache_turbo_access_l2(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx,
+    ngx_http_cache_turbo_zone_t *z, uint32_t hash, ngx_int_t *out_rc)
+{
     /* L13: a live negative memo says an L2 GET for this key missed within the
      * last cache_turbo_l2_negative_ttl seconds. Skip the round-trip and treat
      * it as an L2 miss directly. Marking l2_done keeps the rest of the handler
@@ -6297,7 +6371,10 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
             ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                            "cache_turbo: parked on L2 GET \"%V\" key=%ui",
                            &r->uri, (ngx_uint_t) hash);
-            return NGX_AGAIN;           /* parked; redis read handler resumes */
+
+            *out_rc = NGX_AGAIN;
+            return NGX_DONE;
+           /* parked; redis read handler resumes */
         }
         /* NGX_DECLINED: L2 disabled or could not start; go to origin */
     }
@@ -6500,16 +6577,33 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                                    "cache_turbo: L2 HIT \"%V\" key=%ui len=%uz "
                                    "(filled L1)", &r->uri, (ngx_uint_t) hash,
                                    ctx->l2_blob_len);
-                    return ngx_http_cache_turbo_serve(r, ctx->l2_blob,
-                               ctx->l2_blob_len, rem_fresh <= 0 ? 1 : 0,
-                               z, NULL, NULL);
+
+                    *out_rc = ngx_http_cache_turbo_serve(r, ctx->l2_blob,
+                              ctx->l2_blob_len, rem_fresh <= 0 ? 1 : 0,
+                              z, NULL, NULL);
+                    return NGX_DONE;
+
                                           /* L2 blob lives in r->pool, no ref */
                 }
             }
         }
         /* corrupt/short/expired blob: treat as a miss, fall through to origin */
     }
+    return NGX_DECLINED;
+}
 
+
+
+/* MAINT-H2 phase helper for ngx_http_cache_turbo_access_handler().
+ * PHASE 3 -- account the L2 miss once per request and arm the negative memo.
+ *
+ * void: the inline block had no return of any kind; the handler always
+ * continues into the only-if-cached gate afterwards. */
+static void
+ngx_http_cache_turbo_access_l2_miss_account(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx,
+    ngx_http_cache_turbo_zone_t *z, uint32_t hash)
+{
     /* L2 was consulted but did not satisfy the request (v12 metric). Count it
      * at most once per request: a cold miss parks on the L2 GET and then parks
      * AGAIN on the v4-2 NX lock / v10 cold-wait, re-entering this handler from
@@ -6543,7 +6637,22 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                                  clcf->l2_negative_ttl);
         }
     }
+}
 
+
+
+/* MAINT-H2 phase helper for ngx_http_cache_turbo_access_handler().
+ * PHASE 4 -- only-if-cached (RFC 9111 5.2.1.7): both caches are exhausted,
+ * so either serve the breaker's armed snapshot (an OPEN breaker makes that a
+ * pure cache serve) or answer 504. Reads the breaker state RAW so this
+ * request cannot be promoted to probe.
+ *
+ * ⚠ Must stay BEFORE the breaker gate helper -- see that helper's comment. */
+static ngx_int_t
+ngx_http_cache_turbo_access_only_if_cached(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx,
+    ngx_http_cache_turbo_zone_t *z, uint32_t hash, ngx_int_t *out_rc)
+{
     /* only-if-cached (RFC 9111 §5.2.1.7): L1 missed/expired and L2 (if any) did
      * not satisfy it either — both caches are exhausted. The client refuses
      * origin contact, so answer 504 rather than engaging the cold-miss
@@ -6578,16 +6687,44 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                            "STALE-BREAKER serve \"%V\" key=%ui len=%uz",
                            &r->uri, (ngx_uint_t) hash, ctx->brk_snap_len);
             /* ref_data = NULL: the arming site owns the reference drop. */
-            return ngx_http_cache_turbo_serve(r, ctx->brk_snap,
-                       ctx->brk_snap_len, 1, z, NULL, "STALE-BREAKER");
+
+            *out_rc = ngx_http_cache_turbo_serve(r, ctx->brk_snap,
+                      ctx->brk_snap_len, 1, z, NULL, "STALE-BREAKER");
+            return NGX_DONE;
+
         }
 
         ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "cache_turbo: only-if-cached miss \"%V\" key=%ui -> 504",
                        &r->uri, (ngx_uint_t) hash);
-        return NGX_HTTP_GATEWAY_TIME_OUT;
-    }
 
+        *out_rc = NGX_HTTP_GATEWAY_TIME_OUT;
+        return NGX_DONE;
+
+    }
+    return NGX_DECLINED;
+}
+
+
+
+/* MAINT-H2 phase helper for ngx_http_cache_turbo_access_handler().
+ * PHASE 5 -- the pre-origin circuit-breaker gate: the chokepoint every
+ * origin-bound request passes exactly once.
+ *
+ * ⚠ ORDERING IS LOAD-BEARING and unchanged by this extraction: this helper is
+ * called AFTER the only-if-cached phase (so a 504 is never preempted by a 503
+ * and an only-if-cached request can never win the probe promotion) and BEFORE
+ * the min_uses and cold-miss phases (so a stampede onto a dead origin never
+ * claims a stub and parks in cold_wait for a fill that cannot arrive). The
+ * full rationale is preserved in the comment inside.
+ *
+ * ⚠ Does NOT touch the zone mutex. _shm_breaker_state(), _brk_ref_drop() and
+ * _breaker_unavailable() manage their own locking internally. */
+static ngx_int_t
+ngx_http_cache_turbo_access_breaker_gate(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx,
+    ngx_http_cache_turbo_zone_t *z, uint32_t hash, ngx_int_t *out_rc)
+{
     /* ------------------------------------------------------------------
      * P6/O4.3: the pre-origin circuit-breaker gate.
      *
@@ -6690,7 +6827,10 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                            "cache_turbo: breaker probe bypasses single-flight "
                            "\"%V\" key=%ui -> origin",
                            &r->uri, (ngx_uint_t) hash);
-            return NGX_DECLINED;
+
+            *out_rc = NGX_DECLINED;
+            return NGX_DONE;
+
         }
 
         /* O4.3-c (F3): same for an ordinary CLOSED-breaker request -- it falls
@@ -6737,8 +6877,11 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                  * serving. The single cleanup covers both outcomes -- served
                  * and not served -- because it is tied to the request pool, not
                  * to this call. */
-                return ngx_http_cache_turbo_serve(r, ctx->brk_snap,
-                           ctx->brk_snap_len, 1, z, NULL, "STALE-BREAKER");
+
+                *out_rc = ngx_http_cache_turbo_serve(r, ctx->brk_snap,
+                          ctx->brk_snap_len, 1, z, NULL, "STALE-BREAKER");
+                return NGX_DONE;
+
             }
 
             /* Nothing cached at any age: answer immediately rather than
@@ -6758,10 +6901,27 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
             ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                            "cache_turbo: breaker OPEN, no body \"%V\" key=%ui "
                            "-> 503", &r->uri, (ngx_uint_t) hash);
-            return ngx_http_cache_turbo_breaker_unavailable(r, clcf);
+
+            *out_rc = ngx_http_cache_turbo_breaker_unavailable(r, clcf);
+            return NGX_DONE;
+
         }
     }
+    return NGX_DECLINED;
+}
 
+
+
+/* MAINT-H2 phase helper for ngx_http_cache_turbo_access_handler().
+ * PHASE 6 -- the min_uses gate for the cache_turbo_lock OFF case only. When
+ * lock is ON the gate is merged into resolve_miss() inside the cold phase
+ * (S231-PERF-MISSLOCKS); the `!clcf->lock` conjunct in the condition is what
+ * keeps the two mutually exclusive, and it moved with the block. */
+static ngx_int_t
+ngx_http_cache_turbo_access_min_uses(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx,
+    ngx_http_cache_turbo_zone_t *z, uint32_t hash, ngx_int_t *out_rc)
+{
     /* min_uses (v15): defer caching until the key has cold-missed min_uses times,
      * so one-hit-wonder URLs never occupy the cache. The gate sits AFTER the L2
      * consult (a popular key already held in L2 was served above, never blocked
@@ -6795,12 +6955,41 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
             ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                            "cache_turbo: below min_uses \"%V\" key=%ui -> origin "
                            "(no store)", &r->uri, (ngx_uint_t) hash);
-            return NGX_DECLINED;
+
+            *out_rc = NGX_DECLINED;
+            return NGX_DONE;
+
         }
         /* Threshold reached: this request stores via the normal cold path below. */
         ctx->min_uses_passed = 1;
     }
+    return NGX_DECLINED;
+}
 
+
+
+/* MAINT-H2 phase helper for ngx_http_cache_turbo_access_handler().
+ * PHASE 7 -- the cold-miss single-flight (cache_turbo_lock on).
+ *
+ * ⚠ LOCK WINDOW: this phase holds the zone mutex over exactly one span, the
+ * CLAIM_FRESH re-lookup (lock / lookup / blob_acquire / unlock, plus the
+ * second unlock on the not-fresh arm) -- 3 of the handler's 12 lock
+ * operations. Both the acquire and both releases are inside this helper, so
+ * the window is unchanged and `fresh`/`body` never escape it unpinned: the
+ * blob_acquire() runs under the same hold that resolved the node, and the
+ * reference is handed to serve() which registers the pool-lifetime drop.
+ * l1->claim() and l1->resolve_miss() lock internally and are called with the
+ * mutex NOT held, as before.
+ *
+ * ⚠ Can park (NGX_AGAIN on the cross-node NX lock); the lease token is
+ * stashed in ctx->pending_l1_owner precisely because the claim_owner stack
+ * local does not survive the park, and that local stays a local of THIS
+ * helper -- the stash/restore pair moved together. */
+static ngx_int_t
+ngx_http_cache_turbo_access_cold(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx,
+    ngx_http_cache_turbo_zone_t *z, uint32_t hash, ngx_int_t *out_rc)
+{
     /* Cold-miss single-flight (v10). L1 absent/expired and L2 missed: rather than
      * let every concurrent first-hit stampede the origin, the first request
      * becomes the single regenerator (per box via a stub shm node, cross-node via
@@ -6848,12 +7037,18 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                                "key=%ui -> origin",
                                ctx->lock_result == NGX_ERROR ? " (L2 down)" : "",
                                &r->uri, (ngx_uint_t) hash);
-                return NGX_DECLINED;
+
+                *out_rc = NGX_DECLINED;
+                return NGX_DONE;
+
             }
             ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                            "cache_turbo: cold-miss cross-node LOST \"%V\" key=%ui "
                            "-> wait for L2 fill", &r->uri, (ngx_uint_t) hash);
-            return ngx_http_cache_turbo_cold_wait(r, clcf, z, ctx);
+
+            *out_rc = ngx_http_cache_turbo_cold_wait(r, clcf, z, ctx);
+            return NGX_DONE;
+
         }
 
         /* S231-PERF-MISSLOCKS: min_uses>1 && lock-on is exactly the case the
@@ -6884,7 +7079,10 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                 ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                                "cache_turbo: below min_uses \"%V\" key=%ui -> "
                                "origin (no store)", &r->uri, (ngx_uint_t) hash);
-                return NGX_DECLINED;
+
+                *out_rc = NGX_DECLINED;
+                return NGX_DONE;
+
             }
 
             ctx->min_uses_passed = 1;
@@ -6914,8 +7112,11 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                     ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                                    "cache_turbo: cold-miss raced to FRESH \"%V\" "
                                    "key=%ui -> serve", &r->uri, (ngx_uint_t) hash);
-                    return ngx_http_cache_turbo_serve(r, fresh_data,
-                               fresh_len_out, 0, z, fresh_data, NULL);
+
+                    *out_rc = ngx_http_cache_turbo_serve(r, fresh_data,
+                              fresh_len_out, 0, z, fresh_data, NULL);
+                    return NGX_DONE;
+
                 }
                 if (fresh_data != NULL) {
                     /* req_reval blocked the re-serve: release the reference
@@ -6926,7 +7127,10 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                 /* vanished again (fresh_data NULL -- claim_locked() found no
                  * fresh entry this pass), or blocked by RFC-1: go to origin */
                 (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
-                return NGX_DECLINED;
+
+                *out_rc = NGX_DECLINED;
+                return NGX_DONE;
+
             }
         } else {
             cl = clcf->l1->claim(z, ctx->key_hash, hash, lock_ttl, &claim_owner);
@@ -6962,13 +7166,19 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                 ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                                "cache_turbo: cold-miss raced to FRESH \"%V\" "
                                "key=%ui -> serve", &r->uri, (ngx_uint_t) hash);
-                return ngx_http_cache_turbo_serve(r, body, snap_len, 0, z, body,
-                                                  NULL);
+
+                *out_rc = ngx_http_cache_turbo_serve(r, body, snap_len, 0, z, body,
+                          NULL);
+                return NGX_DONE;
+
             }
             ngx_shmtx_unlock(&z->shpool->mutex);
             /* vanished again (evicted/expired in the race): go to origin */
             (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
-            return NGX_DECLINED;
+
+            *out_rc = NGX_DECLINED;
+            return NGX_DONE;
+
         }
 
         if (cl == NGX_HTTP_CACHE_TURBO_CLAIM_LOSER) {
@@ -6983,10 +7193,16 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                                "cache_turbo: cold-miss adopted OWN stub across "
                                "internal redirect \"%V\" key=%ui",
                                &r->uri, (ngx_uint_t) hash);
-                return NGX_DECLINED;      /* go to origin as the winner */
+
+                *out_rc = NGX_DECLINED;
+                return NGX_DONE;
+      /* go to origin as the winner */
             }
 
-            return ngx_http_cache_turbo_cold_wait(r, clcf, z, ctx);
+
+            *out_rc = ngx_http_cache_turbo_cold_wait(r, clcf, z, ctx);
+            return NGX_DONE;
+
         }
 
         /* CLAIM_WINNER: we created/took over the in-flight stub. Fire the
@@ -6999,7 +7215,10 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                 ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                                "cache_turbo: cold-miss parked on L2 lock NX \"%V\" "
                                "key=%ui", &r->uri, (ngx_uint_t) hash);
-                return NGX_AGAIN;
+
+                *out_rc = NGX_AGAIN;
+                return NGX_DONE;
+
             }
         }
 
@@ -7008,7 +7227,86 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
         ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "cache_turbo: cold-miss single-box WON \"%V\" key=%ui "
                        "-> origin", &r->uri, (ngx_uint_t) hash);
-        return NGX_DECLINED;
+
+        *out_rc = NGX_DECLINED;
+        return NGX_DONE;
+
+    }
+    return NGX_DECLINED;
+}
+
+
+
+/* MAINT-H2: the access handler is a fixed SEQUENCE of phases, each extracted
+ * above into a named helper and each able to terminate the request. The parent
+ * is a straight-line driver: it evaluates the phases in the original order and
+ * returns the first phase-produced verdict.
+ *
+ * Every helper returns NGX_DECLINED for "I did not answer, continue to the
+ * next phase" and NGX_DONE for "I produced the handler's return value", which
+ * it writes to `out_rc`. NGX_DONE is safe as the sentinel because no phase ever
+ * *returns* NGX_DONE as the handler's own value -- the two terminal helpers
+ * that finalize the request (_breaker_unavailable via the gate, and
+ * _cold_wait via the cold phase) hand back their own value through `rc`.
+ *
+ * The ordering between phases is load-bearing throughout (see each helper's
+ * comment); no phase was merged with another and no lock operation moved
+ * across a helper boundary. */
+static ngx_int_t
+ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
+{
+    uint32_t                          hash;
+    ngx_int_t                         prc, rc;
+    ngx_http_cache_turbo_ctx_t       *ctx;
+    ngx_http_cache_turbo_zone_t      *z;
+    ngx_http_cache_turbo_loc_conf_t  *clcf;
+
+    clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
+
+    /* Prologue: enablement, method/subrequest/auth vetoes, ctx + key, auto-
+     * classify, request no-cache, auto-Vary key prep, bypass, autotune. NGX_OK
+     * => proceed with ctx/z/hash set; otherwise that is our return value. */
+    prc = ngx_http_cache_turbo_access_prologue(r, clcf, &ctx, &z, &hash);
+    if (prc != NGX_OK) {
+        return prc;
+    }
+
+    if (ngx_http_cache_turbo_access_l1(r, clcf, ctx, z, &hash, &rc)
+        == NGX_DONE)
+    {
+        return rc;
+    }
+
+    if (ngx_http_cache_turbo_access_l2(r, clcf, ctx, z, hash, &rc)
+        == NGX_DONE)
+    {
+        return rc;
+    }
+
+    ngx_http_cache_turbo_access_l2_miss_account(r, clcf, ctx, z, hash);
+
+    if (ngx_http_cache_turbo_access_only_if_cached(r, clcf, ctx, z, hash, &rc)
+        == NGX_DONE)
+    {
+        return rc;
+    }
+
+    if (ngx_http_cache_turbo_access_breaker_gate(r, clcf, ctx, z, hash, &rc)
+        == NGX_DONE)
+    {
+        return rc;
+    }
+
+    if (ngx_http_cache_turbo_access_min_uses(r, clcf, ctx, z, hash, &rc)
+        == NGX_DONE)
+    {
+        return rc;
+    }
+
+    if (ngx_http_cache_turbo_access_cold(r, clcf, ctx, z, hash, &rc)
+        == NGX_DONE)
+    {
+        return rc;
     }
 
     /* true miss (cache_turbo_lock off): mark for capture, run to the origin */
@@ -7018,6 +7316,7 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                    &r->uri, (ngx_uint_t) hash);
     return NGX_DECLINED;
 }
+
 
 
 /* Cold-miss single-flight waiter (v10). A request that lost the cold-miss claim
