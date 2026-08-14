@@ -75,33 +75,6 @@ def _reap_spawned() -> None:
                 proc.kill()
 
 
-# AUD-CIPORT3: single registry every fixture port -- main()'s visible
-# allocation block AND the ad-hoc ports a handful of test bodies stand up on
-# their own (a second nginx instance, a fake dirty memcached) -- must draw
-# from. All offsets are relative to args.port (== ng.port for the primary
-# instance). A collision here is invisible to anyone reading only the
-# allocation block in main(), which is exactly how #167 claimed +25 for
-# redis_tls_untrusted while test_mc_dirty_reply_not_pooled() already owned it
-# via `ng.memcached_port + 1` -- and only found out ~12 minutes into a CI run
-# via "OSError: [Errno 98] Address already in use". _check_port_registry()
-# turns that into an immediate, named startup failure instead.
-PORT_OFFSETS: dict[str, int] = {
-    "origin": 11,
-    "redis": 21,
-    "redis_auth": 22,
-    "redis_tls": 23,
-    "memcached": 24,
-    "mc_dirty_reply": 25,  # test_mc_dirty_reply_not_pooled(): ng.port + this
-    "l2_cross_instance_fill_b": 5,       # test_l2_cross_instance_fill()
-    "l2_memcached_cross_instance_fill_b": 6,  # test_l2_memcached_cross_instance_fill()
-    "redis_tls_untrusted": 27,
-    "redis_tls_expired": 28,
-    # AUD-PURGE-HONESTY1: deliberately NEVER bound. Reserved here so the
-    # registry check keeps any future fixture off it -- the "L2 is down" test
-    # needs a port that reliably REFUSES, and a port nobody reserved is a port
-    # somebody eventually binds.
-    "redis_dead": 29,
-}
 
 
 def _check_port_registry(offsets: dict[str, int]) -> None:
@@ -1077,32 +1050,17 @@ class Origin:
             self._server = None
 
 
-def _errlog_level() -> str:
-    """error_log level for the harness nginx, overridable for diagnosis.
-
-    Defaults to `notice`, which is what CI and every normal run want. Set
-    TEST_CT_ERRLOG=debug to make the module's ngx_log_debug sites (memo skips,
-    cold-wait give-ups, L2 verdicts) land in logs/error.log -- the cheap way to
-    identify WHICH uri tripped a zone-global counter assertion in a long suite,
-    instead of bisecting a couple of hundred tests by hand.
-
-    The binary must be built --with-debug for `debug` to do anything; the
-    harness build is (see objs/ngx_auto_config.h). Debug on a full suite is a
-    large log, hence opt-in rather than the default.
-    """
-    lvl = os.environ.get("TEST_CT_ERRLOG", "notice").strip() or "notice"
-    allowed = {"debug", "info", "notice", "warn", "error", "crit", "alert", "emerg"}
-    if lvl not in allowed:
-        raise SystemExit(f"TEST_CT_ERRLOG={lvl!r} is not an nginx log level "
-                         f"(one of: {', '.join(sorted(allowed))})")
-    return lvl
 
 
 # MAINT-T2: nginx_config() moved to its own module (a 3.8k-line template, not
 # test logic). Re-exported here (not via `import *`) so the area modules'
 # `from test_runtime_base import *` chain keeps resolving the bare name --
 # star-import does not chain transitively through this module.
-from nginx_config import nginx_config
+from nginx_config import (  # noqa: F401  (re-exported for the areas)
+    PORT_OFFSETS,
+    _errlog_level,
+    nginx_config,
+)
 
 
 class Nginx:

@@ -5,13 +5,68 @@ large f-string builder, not test logic, so it lives here on its own. It is
 re-exported from test_runtime_base so the area modules' `from
 test_runtime_base import *` chain keeps resolving it -- see the explicit
 import there.
+
+This module is a LEAF: it must never import from test_runtime_base. The two
+names nginx_config() needs from the old file (PORT_OFFSETS, _errlog_level)
+were moved down here with it and are re-exported upwards instead. An import
+in the other direction is a cycle that only fails when nginx_config is the
+first of the pair to be imported -- an order the suite never takes, so it
+stays green while any other entrypoint dies at import time.
 """
 
 from __future__ import annotations
 
+import os
 import pathlib
 
-from test_runtime_base import PORT_OFFSETS, _errlog_level
+# AUD-CIPORT3: single registry every fixture port -- main()'s visible
+# allocation block AND the ad-hoc ports a handful of test bodies stand up on
+# their own (a second nginx instance, a fake dirty memcached) -- must draw
+# from. All offsets are relative to args.port (== ng.port for the primary
+# instance). A collision here is invisible to anyone reading only the
+# allocation block in main(), which is exactly how #167 claimed +25 for
+# redis_tls_untrusted while test_mc_dirty_reply_not_pooled() already owned it
+# via `ng.memcached_port + 1` -- and only found out ~12 minutes into a CI run
+# via "OSError: [Errno 98] Address already in use". _check_port_registry()
+# turns that into an immediate, named startup failure instead.
+PORT_OFFSETS: dict[str, int] = {
+    "origin": 11,
+    "redis": 21,
+    "redis_auth": 22,
+    "redis_tls": 23,
+    "memcached": 24,
+    "mc_dirty_reply": 25,  # test_mc_dirty_reply_not_pooled(): ng.port + this
+    "l2_cross_instance_fill_b": 5,       # test_l2_cross_instance_fill()
+    "l2_memcached_cross_instance_fill_b": 6,  # test_l2_memcached_cross_instance_fill()
+    "redis_tls_untrusted": 27,
+    "redis_tls_expired": 28,
+    # AUD-PURGE-HONESTY1: deliberately NEVER bound. Reserved here so the
+    # registry check keeps any future fixture off it -- the "L2 is down" test
+    # needs a port that reliably REFUSES, and a port nobody reserved is a port
+    # somebody eventually binds.
+    "redis_dead": 29,
+}
+
+
+def _errlog_level() -> str:
+    """error_log level for the harness nginx, overridable for diagnosis.
+
+    Defaults to `notice`, which is what CI and every normal run want. Set
+    TEST_CT_ERRLOG=debug to make the module's ngx_log_debug sites (memo skips,
+    cold-wait give-ups, L2 verdicts) land in logs/error.log -- the cheap way to
+    identify WHICH uri tripped a zone-global counter assertion in a long suite,
+    instead of bisecting a couple of hundred tests by hand.
+
+    The binary must be built --with-debug for `debug` to do anything; the
+    harness build is (see objs/ngx_auto_config.h). Debug on a full suite is a
+    large log, hence opt-in rather than the default.
+    """
+    lvl = os.environ.get("TEST_CT_ERRLOG", "notice").strip() or "notice"
+    allowed = {"debug", "info", "notice", "warn", "error", "crit", "alert", "emerg"}
+    if lvl not in allowed:
+        raise SystemExit(f"TEST_CT_ERRLOG={lvl!r} is not an nginx log level "
+                         f"(one of: {', '.join(sorted(allowed))})")
+    return lvl
 
 
 def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
