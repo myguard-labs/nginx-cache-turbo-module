@@ -9576,91 +9576,88 @@ ngx_http_cache_turbo_forward_body(ngx_http_request_t *r, ngx_chain_t *in)
 }
 
 
-static ngx_int_t
-ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
-{
-    uint32_t                          hash;
-    u_char                           *p;
-    size_t                            n;
-    ngx_buf_t                        *b;
-    ngx_chain_t                      *cl, **ll;
-    ngx_http_cache_turbo_ctx_t       *ctx;
-    ngx_http_cache_turbo_zone_t      *z;
-    ngx_http_cache_turbo_loc_conf_t  *clcf;
-    ngx_uint_t                        last = 0;
-
-    ctx = ngx_http_get_module_ctx(r, ngx_http_cache_turbo_module);
-
-    /* S231-SIE-MIDBODY: rescue a mid-body origin death.
-     *
-     * The header-filter SIE trigger (~:7948) only fires when the ORIGIN'S
-     * STATUS line is an error -- but a mid-body death arrives with headers
-     * already sent as a normal 200 (the origin was fine when it opened the
-     * response and died partway through the body), so that trigger can never
-     * see it. This is the only place left that can still act: BEFORE any
-     * byte of this response has reached the client (ctx->sie_flushed is the
-     * pre-flush oracle, set the first time a non-empty buffer is forwarded
-     * downstream). ngx_http_cache_turbo_forward_body() is the SINGLE set
-     * site, and that is sufficient: every downstream exit on the capture
-     * path routes through it -- the not-cacheable and oversize aborts, the
-     * file-backed delegate, the served/uncaptured early return and the store
-     * tail. The only ngx_http_next_body_filter() call this filter makes
-     * directly is the sie_serving emit below, which is this rescue's own
-     * output and is guarded by sie_body_sent instead. If a future change adds
-     * another direct downstream call on the capture path, it MUST set this
-     * bit or the rescue will splice into an already-flushed response.
-     *
-     * Once flushed, this is provably too late: the client already holds an
-     * unknown-length prefix of the truncated body, and splicing the snapshot
-     * in now would produce a corrupt concatenation (truncated-prefix +
-     * full-snapshot), which is strictly worse than the truncated response
-     * alone. There is no recovery from that without a protocol the client
-     * understands (range replay, chunked trailer, etc) that this module does
-     * not have. Ship pre-flush only; do not claim broader coverage.
-     *
-     * ⚠ Headers are NOT rewritten here, unlike the header-filter SIE path.
-     * By the time the body filter runs, ngx_http_next_header_filter() has
-     * already returned for THIS response's 200 -- the header chain has
-     * already serialised r->headers_out into the wire buffer with no
-     * postponement contract (same fact the AUD-SIE-BODY test counter comment
-     * below relies on). Rewriting r->headers_out here would change nothing
-     * the client observes: the status line stays whatever the origin sent
-     * (200), only the BODY is replaced with the complete snapshot instead of
-     * the truncated one. That is still strictly better than a truncated 200
-     * with no recovery at all, but it is a body-only rescue -- say so plainly
-     * rather than claiming header coverage this cannot deliver.
-     *
-     * ⚠ FRAMING, not just status: the Content-Length this response is framed
-     * with was ALSO already serialised on the wire by the time this filter
-     * runs (same fact as above). Splicing in a snapshot body of a DIFFERENT
-     * length than what the client was told to expect corrupts the framing --
-     * the client waits for bytes that never arrive (Content-Length longer
-     * than the snapshot), or rejects/desyncs a pipelined connection
-     * (Content-Length shorter). That is worse than the truncated body this
-     * rescue exists to fix. So the rescue is only framing-safe when either
-     * (a) the origin sent no Content-Length at all (content_length_n == -1,
-     * i.e. chunked/EOF-framed -- the client places no length expectation on
-     * the body, so any snapshot length is safe), or (b) the snapshot body is
-     * EXACTLY the length the origin advertised. Checked BEFORE calling
-     * sie_rewrite(): sie_rewrite() is destructive (wipes r->headers_out.headers
-     * via ngx_list_init(), clears the typed Content-Length field) so there is
-     * no way to call it, discover a mismatch, and back out --
-     * sie_snap_body_len() reads the snapshot's length straight from the
-     * blob's validated header, with no side effect on r->headers_out.
-     *
-     * Detecting the failure: no in-process production signal proved reliable
-     * (r->upstream->peer.connection == NULL races the connection close
-     * timing; unmet r->upstream->length can be legitimate chunked/EOF
-     * framing; c->error is set too late relative to this filter running).
-     * Ship the deterministic TEST_FAULTS trigger
-     * (cache_turbo_test_midbody_abort, module.h ~:1656) instead: it treats
-     * the FIRST arriving buffer as the failure, which is how this module
-     * tests every other origin-failure path it cannot otherwise force.
-     */
-    clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
-
+/* S231-SIE-MIDBODY: rescue a mid-body origin death.
+ *
+ * The header-filter SIE trigger (~:7948) only fires when the ORIGIN'S
+ * STATUS line is an error -- but a mid-body death arrives with headers
+ * already sent as a normal 200 (the origin was fine when it opened the
+ * response and died partway through the body), so that trigger can never
+ * see it. This is the only place left that can still act: BEFORE any
+ * byte of this response has reached the client (ctx->sie_flushed is the
+ * pre-flush oracle, set the first time a non-empty buffer is forwarded
+ * downstream). ngx_http_cache_turbo_forward_body() is the SINGLE set
+ * site, and that is sufficient: every downstream exit on the capture
+ * path routes through it -- the not-cacheable and oversize aborts, the
+ * file-backed delegate, the served/uncaptured early return and the store
+ * tail. The only ngx_http_next_body_filter() call this filter makes
+ * directly is the sie_serving emit below, which is this rescue's own
+ * output and is guarded by sie_body_sent instead. If a future change adds
+ * another direct downstream call on the capture path, it MUST set this
+ * bit or the rescue will splice into an already-flushed response.
+ *
+ * Once flushed, this is provably too late: the client already holds an
+ * unknown-length prefix of the truncated body, and splicing the snapshot
+ * in now would produce a corrupt concatenation (truncated-prefix +
+ * full-snapshot), which is strictly worse than the truncated response
+ * alone. There is no recovery from that without a protocol the client
+ * understands (range replay, chunked trailer, etc) that this module does
+ * not have. Ship pre-flush only; do not claim broader coverage.
+ *
+ * ⚠ Headers are NOT rewritten here, unlike the header-filter SIE path.
+ * By the time the body filter runs, ngx_http_next_header_filter() has
+ * already returned for THIS response's 200 -- the header chain has
+ * already serialised r->headers_out into the wire buffer with no
+ * postponement contract (same fact the AUD-SIE-BODY test counter comment
+ * below relies on). Rewriting r->headers_out here would change nothing
+ * the client observes: the status line stays whatever the origin sent
+ * (200), only the BODY is replaced with the complete snapshot instead of
+ * the truncated one. That is still strictly better than a truncated 200
+ * with no recovery at all, but it is a body-only rescue -- say so plainly
+ * rather than claiming header coverage this cannot deliver.
+ *
+ * ⚠ FRAMING, not just status: the Content-Length this response is framed
+ * with was ALSO already serialised on the wire by the time this filter
+ * runs (same fact as above). Splicing in a snapshot body of a DIFFERENT
+ * length than what the client was told to expect corrupts the framing --
+ * the client waits for bytes that never arrive (Content-Length longer
+ * than the snapshot), or rejects/desyncs a pipelined connection
+ * (Content-Length shorter). That is worse than the truncated body this
+ * rescue exists to fix. So the rescue is only framing-safe when either
+ * (a) the origin sent no Content-Length at all (content_length_n == -1,
+ * i.e. chunked/EOF-framed -- the client places no length expectation on
+ * the body, so any snapshot length is safe), or (b) the snapshot body is
+ * EXACTLY the length the origin advertised. Checked BEFORE calling
+ * sie_rewrite(): sie_rewrite() is destructive (wipes r->headers_out.headers
+ * via ngx_list_init(), clears the typed Content-Length field) so there is
+ * no way to call it, discover a mismatch, and back out --
+ * sie_snap_body_len() reads the snapshot's length straight from the
+ * blob's validated header, with no side effect on r->headers_out.
+ *
+ * Detecting the failure: no in-process production signal proved reliable
+ * (r->upstream->peer.connection == NULL races the connection close
+ * timing; unmet r->upstream->length can be legitimate chunked/EOF
+ * framing; c->error is set too late relative to this filter running).
+ * Ship the deterministic TEST_FAULTS trigger
+ * (cache_turbo_test_midbody_abort, module.h ~:1656) instead: it treats
+ * the FIRST arriving buffer as the failure, which is how this module
+ * tests every other origin-failure path it cannot otherwise force.
+ *
+ * Returns NGX_ERROR if sie_rewrite() failed (the caller must propagate it);
+ * NGX_OK otherwise. On a successful rescue ctx->sie_serving is set, so the
+ * caller falls into the sie_serving emit phase below -- exactly as when the
+ * block was inline.
+ */
 #if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
     && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+static ngx_int_t
+ngx_http_cache_turbo_body_filter_midbody_rescue(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx)
+{
+    off_t      origin_cl;
+    size_t     snap_body_len;
+    ngx_uint_t framing_ok;
+    ngx_int_t  rc;
+
     /* use_stale_triggers() switches on the STATUS r->headers_out carries --
      * always 200 here, since a mid-body death by definition happened after a
      * successful header phase, so calling it with the real status can never
@@ -9672,185 +9669,219 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
      * it is what nginx itself synthesises for a transport failure, and its
      * bit (HTTP_502 | ERROR) is set by the same USE_STALE_DEFAULT every other
      * SIE fixture in this suite relies on. */
-    if (ctx != NULL && clcf->test_midbody_abort
-        && ctx->sie_armed && !ctx->sie_serving && !ctx->sie_flushed
-        && ngx_http_cache_turbo_use_stale_triggers(clcf->use_stale,
+    if (ctx == NULL || !clcf->test_midbody_abort
+        || !ctx->sie_armed || ctx->sie_serving || ctx->sie_flushed
+        || !ngx_http_cache_turbo_use_stale_triggers(clcf->use_stale,
                                                     NGX_HTTP_BAD_GATEWAY))
     {
-        off_t      origin_cl = r->headers_out.content_length_n;
-        size_t     snap_body_len;
-        ngx_uint_t framing_ok;
-
-        framing_ok = (ngx_http_cache_turbo_sie_snap_body_len(ctx,
-                                                    &snap_body_len) == NGX_OK)
-                     && (origin_cl == -1
-                         || (off_t) snap_body_len == origin_cl);
-
-        if (!framing_ok) {
-            ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                           "cache_turbo: STALE-IF-ERROR mid-body rescue "
-                           "declined \"%V\" -- snapshot length would not "
-                           "match the already-serialised Content-Length: %O",
-                           &r->uri, origin_cl);
-
-        } else {
-            ngx_int_t  rc;
-
-            rc = ngx_http_cache_turbo_sie_rewrite(r, ctx);
-            if (rc == NGX_ERROR) {
-                return NGX_ERROR;
-            }
-            if (rc == NGX_OK) {
-                ctx->served = 1;
-                ctx->sie_serving = 1;
-
-                if (clcf->shm_zone != NULL) {
-                    ngx_http_cache_turbo_zone_t  *sz = clcf->shm_zone->data;
-                    (void) ngx_atomic_fetch_add(&sz->sh->sie_serves, 1);
-                }
-
-                /* S231-SIE-MIDBODY / lease: mirror the header-filter SIE
-                 * path (~:7981) exactly. This request is now served from the
-                 * snapshot and will never reach the store tail, so a cold-miss
-                 * lease it won would otherwise sit owned until cleanup/expiry,
-                 * parking every waiter behind it for no reason. */
-                if (ctx->cold_winner && !ctx->cold_stored
-                    && ctx->cold_zone != NULL)
-                {
-                    uint32_t  h = ngx_crc32_short(ctx->key_hash, 32);
-                    ngx_http_cache_turbo_shm_unstub(ctx->cold_zone,
-                                                    ctx->key_hash, h,
-                                                    ctx->cold_owner);
-                    ctx->cold_stored = 1;
-                }
-
-                ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                               "cache_turbo: STALE-IF-ERROR mid-body rescue \"%V\" "
-                               "len=%uz (pre-flush, body-only)",
-                               &r->uri, ctx->sie_body_len);
-                /* Discard the truncated prefix the fault delivered in THIS
-                 * call (nothing was forwarded yet -- sie_flushed is still 0)
-                 * and fall into the existing sie_serving emit block below,
-                 * which already knows how to consume `in` and emit
-                 * ctx->sie_body as a single last_buf chain. */
-            }
-        }
-    }
-#endif
-
-    /* RFC-2 stale-if-error, body half. The header filter replaced an origin error
-     * with the stale snapshot; discard the upstream error body and emit the
-     * snapshot body ONCE with last_buf. Checked before the served/captured gate
-     * (the header filter set ctx->served to stop capture). sie_body_sent swallows
-     * any trailing error buffers the upstream still streams after the last_buf.
-     * The discarded upstream chain (`in`) is marked consumed (pos=last, buffers
-     * released back to the upstream) on both exits below: with proxy_buffering
-     * off, nothing else ever advances those buffers, so skipping this leaves
-     * them stuck on the upstream's busy_bufs forever and the request hangs. */
-    if (ctx != NULL && ctx->sie_serving) {
-        ngx_buf_t    *eb;
-        ngx_chain_t   eout;
-
-        if (ctx->sie_body_sent) {
-            for (cl = in; cl; cl = cl->next) {
-                cl->buf->pos = cl->buf->last;
-                cl->buf->file_pos = cl->buf->file_last;
-                cl->buf->sync = 1;
-            }
-#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
-    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
-            /* AUD-SIE-BODY: observe the chain AFTER the consume loop above --
-             * this is the postcondition the fix is supposed to establish
-             * (every buffer in `in` fully consumed), not a pre-count of how
-             * much data arrived. With the fix present the loop always leaves
-             * pos == last, so this is always 0; reverting ONLY the consume
-             * loop (this counter/log stays) leaves the buffers exactly as the
-             * upstream delivered them, so this counts them > 0. Logged (not a
-             * response header): by the time this block runs,
-             * ngx_http_next_header_filter() has already returned for this
-             * request -- nginx's header filter chain serializes
-             * r->headers_out.headers into the wire buffer synchronously and
-             * has no postponement contract, so a header added here would be
-             * invisible to the client and would always read 0 (verified). The
-             * greppable "cache_turbo: test_sie_unconsumed=" token is the
-             * oracle the runtime test reads out of logs/error.log instead. */
-            for (cl = in; cl; cl = cl->next) {
-                if (cl->buf->pos != cl->buf->last) {
-                    ctx->test_sie_unconsumed++;
-                }
-            }
-            ngx_log_error(NGX_LOG_NOTICE, r->connection->log, 0,
-                          "cache_turbo: test_sie_unconsumed=%ui",
-                          ctx->test_sie_unconsumed);
-#endif
-            return NGX_OK;
-        }
-        ctx->sie_body_sent = 1;
-
-        eb = ngx_calloc_buf(r->pool);
-        if (eb == NULL) {
-            return NGX_ERROR;
-        }
-        eb->pos = ctx->sie_body;
-        eb->last = ctx->sie_body + ctx->sie_body_len;
-        eb->memory = (ctx->sie_body_len > 0) ? 1 : 0;
-        eb->last_buf = (r == r->main) ? 1 : 0;
-        eb->last_in_chain = 1;
-        if (ctx->sie_body_len == 0) {
-            eb->sync = 1;
-        }
-
-        for (cl = in; cl; cl = cl->next) {
-            cl->buf->pos = cl->buf->last;
-            cl->buf->file_pos = cl->buf->file_last;
-            cl->buf->sync = 1;
-        }
-
-#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
-    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
-        /* AUD-SIE-BODY: same observe-AFTER-consume ordering and logged oracle
-         * as the sie_body_sent exit above, for the main snapshot-emitting exit. */
-        for (cl = in; cl; cl = cl->next) {
-            if (cl->buf->pos != cl->buf->last) {
-                ctx->test_sie_unconsumed++;
-            }
-        }
-        ngx_log_error(NGX_LOG_NOTICE, r->connection->log, 0,
-                      "cache_turbo: test_sie_unconsumed=%ui",
-                      ctx->test_sie_unconsumed);
-#endif
-
-        eout.buf = eb;
-        eout.next = NULL;
-        return ngx_http_next_body_filter(r, &eout);
+        return NGX_OK;
     }
 
-    if (ctx == NULL || !ctx->captured || ctx->served) {
-        return ngx_http_cache_turbo_forward_body(r, in);
+    origin_cl = r->headers_out.content_length_n;
+
+    framing_ok = (ngx_http_cache_turbo_sie_snap_body_len(ctx,
+                                                &snap_body_len) == NGX_OK)
+                 && (origin_cl == -1
+                     || (off_t) snap_body_len == origin_cl);
+
+    if (!framing_ok) {
+        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "cache_turbo: STALE-IF-ERROR mid-body rescue "
+                       "declined \"%V\" -- snapshot length would not "
+                       "match the already-serialised Content-Length: %O",
+                       &r->uri, origin_cl);
+        return NGX_OK;
+    }
+
+    rc = ngx_http_cache_turbo_sie_rewrite(r, ctx);
+    if (rc == NGX_ERROR) {
+        return NGX_ERROR;
+    }
+    if (rc == NGX_OK) {
+        ctx->served = 1;
+        ctx->sie_serving = 1;
+
+        if (clcf->shm_zone != NULL) {
+            ngx_http_cache_turbo_zone_t  *sz = clcf->shm_zone->data;
+            (void) ngx_atomic_fetch_add(&sz->sh->sie_serves, 1);
+        }
+
+        /* S231-SIE-MIDBODY / lease: mirror the header-filter SIE
+         * path (~:7981) exactly. This request is now served from the
+         * snapshot and will never reach the store tail, so a cold-miss
+         * lease it won would otherwise sit owned until cleanup/expiry,
+         * parking every waiter behind it for no reason. */
+        if (ctx->cold_winner && !ctx->cold_stored
+            && ctx->cold_zone != NULL)
+        {
+            uint32_t  h = ngx_crc32_short(ctx->key_hash, 32);
+            ngx_http_cache_turbo_shm_unstub(ctx->cold_zone,
+                                            ctx->key_hash, h,
+                                            ctx->cold_owner);
+            ctx->cold_stored = 1;
+        }
+
+        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "cache_turbo: STALE-IF-ERROR mid-body rescue \"%V\" "
+                       "len=%uz (pre-flush, body-only)",
+                       &r->uri, ctx->sie_body_len);
+        /* Discard the truncated prefix the fault delivered in THIS
+         * call (nothing was forwarded yet -- sie_flushed is still 0)
+         * and fall into the existing sie_serving emit block below,
+         * which already knows how to consume `in` and emit
+         * ctx->sie_body as a single last_buf chain. */
+    }
+
+    return NGX_OK;
+}
+#endif
+
+
+/* Mark every buffer in `in` fully consumed (pos=last, buffers released back
+ * to the upstream). With proxy_buffering off, nothing else ever advances
+ * those buffers, so skipping this leaves them stuck on the upstream's
+ * busy_bufs forever and the request hangs.
+ *
+ * AUD-SIE-BODY: the TEST_FAULTS counter observes the chain AFTER the consume
+ * loop -- this is the postcondition the fix is supposed to establish (every
+ * buffer in `in` fully consumed), not a pre-count of how much data arrived.
+ * With the fix present the loop always leaves pos == last, so this is always
+ * 0; reverting ONLY the consume loop (this counter/log stays) leaves the
+ * buffers exactly as the upstream delivered them, so this counts them > 0.
+ * Logged (not a response header): by the time this runs,
+ * ngx_http_next_header_filter() has already returned for this request --
+ * nginx's header filter chain serializes r->headers_out.headers into the wire
+ * buffer synchronously and has no postponement contract, so a header added
+ * here would be invisible to the client and would always read 0 (verified).
+ * The greppable "cache_turbo: test_sie_unconsumed=" token is the oracle the
+ * runtime test reads out of logs/error.log instead. */
+static void
+ngx_http_cache_turbo_body_filter_sie_consume(ngx_http_request_t *r,
+    ngx_http_cache_turbo_ctx_t *ctx, ngx_chain_t *in)
+{
+    ngx_chain_t  *cl;
+
+    for (cl = in; cl; cl = cl->next) {
+        cl->buf->pos = cl->buf->last;
+        cl->buf->file_pos = cl->buf->file_last;
+        cl->buf->sync = 1;
     }
 
 #if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
     && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
-    /* CI-only: deterministically drive the file-backed delegate path. The real
-     * trigger (an in_file && !in_memory buffer) is fs/directio dependent and
-     * cannot be produced reliably in the harness. Take the SAME abort-capture +
-     * delegate-unmodified-chain action here, without forging b->in_file (which
-     * would make downstream sendfile garbage). */
-    if (clcf->test_force_file_buf) {
-        ctx->captured = 0;
-        ctx->body = NULL;
-        ctx->body_last = NULL;
-        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                       "cache_turbo: test_force_file_buf \"%V\" -> delegate to "
-                       "native (capture abandoned)", &r->uri);
-        return ngx_http_cache_turbo_forward_body(r, in);
+    for (cl = in; cl; cl = cl->next) {
+        if (cl->buf->pos != cl->buf->last) {
+            ctx->test_sie_unconsumed++;
+        }
     }
+    ngx_log_error(NGX_LOG_NOTICE, r->connection->log, 0,
+                  "cache_turbo: test_sie_unconsumed=%ui",
+                  ctx->test_sie_unconsumed);
+#else
+    (void) r;
+    (void) ctx;
+#endif
+}
+
+
+/* RFC-2 stale-if-error, body half. The header filter replaced an origin error
+ * with the stale snapshot; discard the upstream error body and emit the
+ * snapshot body ONCE with last_buf. sie_body_sent swallows any trailing error
+ * buffers the upstream still streams after the last_buf.
+ *
+ * Returns NGX_DECLINED when the snapshot body was already sent and the caller
+ * must simply return NGX_OK (the upstream chain has been consumed here);
+ * NGX_ERROR on allocation failure; NGX_OK with *out set to the single-link
+ * chain the caller hands to ngx_http_next_body_filter(). The downstream
+ * hand-off deliberately stays in the parent. */
+static ngx_int_t
+ngx_http_cache_turbo_body_filter_sie_emit(ngx_http_request_t *r,
+    ngx_http_cache_turbo_ctx_t *ctx, ngx_chain_t *in, ngx_chain_t *out)
+{
+    ngx_buf_t  *eb;
+
+    if (ctx->sie_body_sent) {
+        ngx_http_cache_turbo_body_filter_sie_consume(r, ctx, in);
+        return NGX_DECLINED;
+    }
+    ctx->sie_body_sent = 1;
+
+    eb = ngx_calloc_buf(r->pool);
+    if (eb == NULL) {
+        return NGX_ERROR;
+    }
+    eb->pos = ctx->sie_body;
+    eb->last = ctx->sie_body + ctx->sie_body_len;
+    eb->memory = (ctx->sie_body_len > 0) ? 1 : 0;
+    eb->last_buf = (r == r->main) ? 1 : 0;
+    eb->last_in_chain = 1;
+    if (ctx->sie_body_len == 0) {
+        eb->sync = 1;
+    }
+
+    ngx_http_cache_turbo_body_filter_sie_consume(r, ctx, in);
+
+    out->buf = eb;
+    out->next = NULL;
+    return NGX_OK;
+}
+
+
+/* CI-only: deterministically drive the file-backed delegate path. The real
+ * trigger (an in_file && !in_memory buffer) is fs/directio dependent and
+ * cannot be produced reliably in the harness. Take the SAME abort-capture +
+ * delegate-unmodified-chain action here, without forging b->in_file (which
+ * would make downstream sendfile garbage).
+ *
+ * Returns NGX_DECLINED when the fault fired and the caller must delegate the
+ * chain downstream; NGX_OK otherwise. */
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+static ngx_int_t
+ngx_http_cache_turbo_body_filter_force_file_buf(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx)
+{
+    if (!clcf->test_force_file_buf) {
+        return NGX_OK;
+    }
+
+    ctx->captured = 0;
+    ctx->body = NULL;
+    ctx->body_last = NULL;
+    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "cache_turbo: test_force_file_buf \"%V\" -> delegate to "
+                   "native (capture abandoned)", &r->uri);
+    return NGX_DECLINED;
+}
 #endif
 
-    /* Append the incoming buffers to our captured chain (copying the bytes
-     * into the request pool so they survive past this filter call). Seed the
-     * append cursor from the cached tail so a multi-call streamed body does not
-     * re-walk the whole chain every filter invocation (was O(n²)). */
+
+/* Append the incoming buffers to our captured chain (copying the bytes into
+ * the request pool so they survive past this filter call). Seed the append
+ * cursor from the cached tail so a multi-call streamed body does not re-walk
+ * the whole chain every filter invocation (was O(n²)).
+ *
+ * ⚠ The cursor that survives re-entry is ctx->body_last, a chain LINK we
+ * allocated in r->pool and own -- not a pointer into any upstream buffer.
+ * r->pool blocks are never realloc'd or moved, and nothing frees an
+ * individual link before the pool dies at request end, so it stays valid
+ * across filter invocations. Every path that abandons capture
+ * (file-backed, oversize, test_force_file_buf) resets body/body_last to NULL
+ * together with captured=0, so no stale cursor survives an abort.
+ *
+ * Returns NGX_DECLINED when capture was abandoned and the caller must
+ * delegate the chain downstream; NGX_ERROR on allocation failure; NGX_OK
+ * otherwise, with *last set when the response is complete. */
+static ngx_int_t
+ngx_http_cache_turbo_body_filter_capture(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx,
+    ngx_chain_t *in, ngx_uint_t *last)
+{
+    u_char        *p;
+    size_t         n;
+    ngx_buf_t     *b;
+    ngx_chain_t   *cl, **ll;
+
     ll = ctx->body_last ? &ctx->body_last->next : &ctx->body;
 
     for (cl = in; cl; cl = cl->next) {
@@ -9872,7 +9903,7 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
             ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                            "cache_turbo: file-backed body \"%V\" -> delegate to "
                            "native (cannot capture from memory)", &r->uri);
-            return ngx_http_cache_turbo_forward_body(r, in);
+            return NGX_DECLINED;
         }
 
         n = ngx_buf_in_memory(b) ? (size_t) (b->last - b->pos) : 0;
@@ -9895,7 +9926,7 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
                                "cache_turbo: oversize capture aborted \"%V\" "
                                "body>%uz -> delegate to native",
                                &r->uri, clcf->max_size);
-                return ngx_http_cache_turbo_forward_body(r, in);
+                return NGX_DECLINED;
             }
 
             p = ngx_pnalloc(r->pool, n);
@@ -9927,8 +9958,836 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
         }
 
         if (b->last_buf || b->last_in_chain) {
-            last = 1;
+            *last = 1;
         }
+    }
+
+    return NGX_OK;
+}
+
+
+/* Compute this response's freshness windows: the fresh TTL, the absolute
+ * serveable window (fresh + stale) and the RFC-2 stale-if-error deadline.
+ * Pure computation off clcf + r->headers_out; no shared state is touched, so
+ * this takes no lock and holds none.
+ *
+ * Returns NGX_DECLINED when the status is not cacheable at all (the caller
+ * must delegate downstream); NGX_OK with the three out-params set. */
+static ngx_int_t
+ngx_http_cache_turbo_body_filter_windows(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf, time_t *out_ttl,
+    time_t *out_stale_window, time_t *out_sie_window)
+{
+    time_t  ttl, stale_window, sie_window = 0;
+
+    ttl = ngx_http_cache_turbo_status_ttl(clcf, r->headers_out.status);
+    if (ttl < 0) {
+        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "cache_turbo: not cacheable \"%V\" status=%ui",
+                       &r->uri, r->headers_out.status);
+        return NGX_DECLINED;                            /* not cacheable */
+    }
+
+    /* O6/S3.1: a negative-cached error (e.g. "cache_turbo_valid 503 1m")
+     * must never overwrite a body that is still worth serving. The guard
+     * itself lives at the store site below (search "refusing to overwrite
+     * cached body"), which is the single source of truth for the predicate
+     * and why it looks the way it does -- including why the blob's sie_ttl
+     * is deliberately NOT consulted. Do not restate the predicate here; an
+     * earlier copy of it in this comment went stale the moment the
+     * implementation changed. */
+    /* Honor upstream freshness (v7): let the response's own
+     * Cache-Control/Expires set the fresh TTL when enabled. ignore_cc wins:
+     * if the operator told us to ignore Cache-Control, the TTL is the static
+     * cache_turbo_valid, never the (ignored) upstream max-age/Expires. */
+    if (clcf->honor_cc && !clcf->ignore_cc) {
+        time_t  up = ngx_http_cache_turbo_upstream_ttl(r);
+        if (up >= 0) {
+            ttl = up;
+        }
+    }
+
+    /* STAB-5: clamp the fresh TTL to the uint32 ceiling before it feeds the
+     * blob fresh_ttl cast, the stale-window multiply, and the L2 PX. An
+     * unbounded upstream max-age (honor_cc) is the realistic source. */
+    if (ttl > NGX_HTTP_CACHE_TURBO_TTL_MAX) {
+        ttl = NGX_HTTP_CACHE_TURBO_TTL_MAX;
+    }
+
+    /* Absolute serveable window (fresh + stale) from now, reused by the blob
+     * metadata, the L1 store, and the L2 EXPIRE so all three agree. */
+    stale_window = ngx_http_cache_turbo_stale_ttl(ttl, clcf->stale_mult);
+
+    /* RFC 5861 / RFC-2: a response stale-while-revalidate=N sets the stale
+     * window explicitly (fresh + N), overriding the cache_turbo_stale_mult
+     * default. The existing SWR machinery (background_update) then serves
+     * stale + refreshes within it. must-revalidate below still wins (it
+     * collapses the window). Only meaningful for a finite TTL.
+     *
+     * ignore_cc skips ALL three response-Cache-Control window adjustments
+     * (swr here, must-revalidate + stale-if-error below): the operator told
+     * us to ignore the upstream Cache-Control, so an upstream max-age=0 /
+     * must-revalidate / stale-while|if-* must NOT reshape the window built
+     * from cache_turbo_valid + cache_turbo_stale_mult. Matches the
+     * proxy_ignore_headers Cache-Control contract (the whole header is
+     * inert), not just the cacheability floor. */
+    if (ttl > 0 && !clcf->ignore_cc) {
+        time_t  swr = ngx_http_cache_turbo_response_swr(r);
+        if (swr >= 0) {
+            /* AUD-CC-DELTA-OVF: swr is parsed straight off the wire and can
+             * be up to NGX_MAX_INT_T_VALUE (e.g. stale-while-revalidate=
+             * 9223372036854775807) -- clamp the delta BEFORE the add, not
+             * the sum after, or ttl + swr overflows signed time_t (UB). */
+            stale_window = ngx_http_cache_turbo_add_ttl_clamped(ttl, swr);
+            ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                           "cache_turbo: stale-while-revalidate=%T \"%V\"",
+                           swr, &r->uri);
+        }
+    }
+
+    /* RFC 9111 must-revalidate / proxy-revalidate: once stale, the response
+     * must NOT be served without revalidation. We have no validation channel
+     * for a hit, so collapse the stale window to the fresh TTL — the object
+     * is served fresh until its deadline, then re-fetched (no stale serve,
+     * no stale-if-error). Only meaningful for a finite TTL. Skipped under
+     * ignore_cc (see the swr block above — the whole upstream Cache-Control
+     * is inert, so an upstream must-revalidate must not collapse the
+     * operator-configured stale window). */
+    if (ttl > 0 && !clcf->ignore_cc
+        && ngx_http_cache_turbo_response_must_revalidate(r))
+    {
+        stale_window = ttl;
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "cache_turbo: must-revalidate \"%V\" -> no stale window",
+                       &r->uri);
+
+    } else if (ttl > 0 && !clcf->ignore_cc) {
+        /* RFC 5861 §4 / RFC-2: a response stale-if-error=N records an absolute
+         * serve-on-error window (fresh + N) in the blob's sie_ttl (CTB4), so a
+         * later origin failure may serve this copy PAST the normal stale
+         * window. 0 = absent => no serve-on-error beyond the stale window.
+         * Gated behind !must-revalidate above (must-revalidate forbids any
+         * stale serve, stale-if-error included). The serve-on-error path that
+         * consumes sie_ttl lands in a follow-up; the field is carried now so
+         * the wire format turns over once (single cold-cache event). */
+        time_t  sie = ngx_http_cache_turbo_response_sie(r);
+        if (sie >= 0) {
+            /* AUD-CC-DELTA-OVF: same wire-controlled overflow as the swr
+             * clamp above -- clamp the delta before the add. */
+            sie_window = ngx_http_cache_turbo_add_ttl_clamped(ttl, sie);
+            ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                           "cache_turbo: stale-if-error=%T \"%V\"",
+                           sie, &r->uri);
+
+        } else if (ttl > 0 && clcf->keep_stale > 0) {
+            /* S2.2 / D-1: no response stale-if-error to honor here, so fall
+             * back to the operator's cache_turbo_keep_stale baseline (fresh +
+             * keep_stale). This branch only runs when a response SIE was
+             * absent -- a HONORED response stale-if-error above already took
+             * this window and we must NOT also apply keep_stale on top of it
+             * (that would be max(), which the plan explicitly rejects: an
+             * origin that states its own error window is making a statement,
+             * not setting a floor). Still gated behind the outer
+             * !must-revalidate branch above, so a honored must-revalidate
+             * still collapses the window to `ttl` and suppresses keep_stale
+             * too -- must-revalidate forbids ANY stale serve. */
+            sie_window = ttl + clcf->keep_stale;
+            if (sie_window > NGX_HTTP_CACHE_TURBO_TTL_MAX) {
+                sie_window = NGX_HTTP_CACHE_TURBO_TTL_MAX;
+            }
+            ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                           "cache_turbo: keep_stale=%T \"%V\"",
+                           clcf->keep_stale, &r->uri);
+        }
+
+    } else if (ttl > 0 && clcf->ignore_cc && clcf->keep_stale > 0) {
+        /* D-1: under ignore_cc the response-derived swr/must-revalidate/sie
+         * branches above never run (the whole upstream Cache-Control is
+         * inert), so this location's stale window is untouched by the
+         * response and sie_window is still 0 here. keep_stale is OPERATOR
+         * config, not upstream config -- ignore_cc only makes the upstream
+         * header inert, it does not disable operator-configured retention.
+         * Apply the keep_stale baseline unconditionally in this case (no
+         * response SIE to compare against, and no honored must-revalidate
+         * to suppress it -- must-revalidate is itself response-derived and
+         * therefore inert under ignore_cc). */
+        sie_window = ttl + clcf->keep_stale;
+        if (sie_window > NGX_HTTP_CACHE_TURBO_TTL_MAX) {
+            sie_window = NGX_HTTP_CACHE_TURBO_TTL_MAX;
+        }
+        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "cache_turbo: keep_stale=%T (ignore_cc) \"%V\"",
+                       clcf->keep_stale, &r->uri);
+    }
+
+    *out_ttl = ttl;
+    *out_stale_window = stale_window;
+    *out_sie_window = sie_window;
+    return NGX_OK;
+}
+
+
+/* First pass: measure the header block that _blob_write() will emit.
+ *
+ * ⚠ AUD-HDR1: this walk and the emit walk in _blob_write() MUST make
+ * identical decisions or headers_len would lie about the block that follows.
+ * They are deliberately NOT merged into one walk: the measure pass has to
+ * complete before the blob can be sized and allocated, so a single fused
+ * walk is not expressible without buffering the whole block twice. The
+ * shared ngx_http_cache_turbo_header_admissible() gate is what guarantees
+ * the two passes agree -- one helper, called twice. */
+static void
+ngx_http_cache_turbo_body_filter_measure_headers(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_str_t *ct, size_t *out_hdr_bytes,
+    uint32_t *out_nheaders)
+{
+    ngx_list_part_t  *part;
+    ngx_table_elt_t  *h;
+    size_t            hdr_bytes = 0;
+    uint32_t          nheaders = 0;
+    ngx_uint_t        i;
+
+    if (ct->len) {
+        hdr_bytes += sizeof(uint32_t) + sizeof("Content-Type") - 1
+                     + sizeof(uint32_t) + ct->len;
+        nheaders++;
+    }
+
+    part = &r->headers_out.headers.part;
+    h = part->elts;
+    for (i = 0; /* void */ ; i++) {
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            h = part->elts;
+            i = 0;
+        }
+        if (h[i].hash == 0
+            || !ngx_http_cache_turbo_header_admissible(clcf,
+                    h[i].key.data, h[i].key.len,
+                    h[i].value.data, h[i].value.len))
+        {
+            continue;
+        }
+        hdr_bytes += sizeof(uint32_t) + h[i].key.len
+                     + sizeof(uint32_t) + h[i].value.len;
+        nheaders++;
+    }
+
+    *out_hdr_bytes = hdr_bytes;
+    *out_nheaders = nheaders;
+}
+
+
+/* Serialise the blob: the fixed 44-byte LE wire header (STAB-4), then the
+ * header block, then the captured body. `blob` must be at least
+ * NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE + hdr_bytes + ctx->body_len bytes, as
+ * measured by _measure_headers(). The header emit walk here is the second
+ * half of the AUD-HDR1 pair -- see that helper's comment. */
+static void
+ngx_http_cache_turbo_body_filter_blob_write(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx,
+    u_char *blob, ngx_str_t *ct, size_t hdr_bytes, uint32_t nheaders,
+    time_t ttl, time_t stale_window, time_t sie_window)
+{
+    ngx_http_cache_turbo_blob_hdr_t   bhw;
+    ngx_list_part_t                  *part;
+    ngx_table_elt_t                  *h;
+    ngx_chain_t                      *cl;
+    u_char                           *w;
+    ngx_uint_t                        i;
+
+    bhw.nheaders = nheaders;
+    bhw.headers_len = (uint32_t) hdr_bytes;
+    bhw.body_len = (uint32_t) ctx->body_len;
+    bhw.status = (uint32_t) r->headers_out.status;
+    /* Freshness metadata so an L2 hit restores the remaining lifetime
+     * (not the location default). stale_ttl is the absolute serveable
+     * window from creation (fresh + stale), matching shm_store. */
+    bhw.created = (int64_t) ngx_time();
+    bhw.fresh_ttl = (uint32_t) (ttl > 0 ? ttl : 0);
+    bhw.stale_ttl = (uint32_t) stale_window;
+    bhw.sie_ttl = (uint32_t) sie_window;   /* CTB4 (RFC-2 SIE) */
+    /* S232-BYPASS-STALE: stamp breaker-only on an opted-in URI's blob.
+     * ⚠ Assigned unconditionally (bhw is an uninitialised stack struct
+     * populated field-by-field) -- an unset flags here would stamp
+     * stack garbage, and a stray BLOBF_BREAKER_ONLY would make an
+     * ordinary entry unserveable while a MISSING one would publish a
+     * breaker-only body to the normal hit path. */
+    bhw.flags = ctx->brk_only
+                ? NGX_HTTP_CACHE_TURBO_BLOBF_BREAKER_ONLY : 0;
+    ngx_http_cache_turbo_blob_hdr_write(blob, &bhw);
+
+    w = blob + NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE;
+
+    /* write a single name/value pair (lengths fixed-endian, STAB-4) */
+    #define CT_PUT(np, nl, vp, vl)                                     \
+        do {                                                          \
+            ngx_http_cache_turbo_put_u32(w, (uint32_t) (nl)); w += 4; \
+            ngx_memcpy(w, (np), (nl)); w += (nl);                     \
+            ngx_http_cache_turbo_put_u32(w, (uint32_t) (vl)); w += 4; \
+            ngx_memcpy(w, (vp), (vl)); w += (vl);                     \
+        } while (0)
+
+    if (ct->len) {
+        CT_PUT("Content-Type", sizeof("Content-Type") - 1,
+               ct->data, ct->len);
+    }
+
+    part = &r->headers_out.headers.part;
+    h = part->elts;
+    for (i = 0; /* void */ ; i++) {
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            h = part->elts;
+            i = 0;
+        }
+        if (h[i].hash == 0
+            || !ngx_http_cache_turbo_header_admissible(clcf,
+                    h[i].key.data, h[i].key.len,
+                    h[i].value.data, h[i].value.len))
+        {
+            continue;
+        }
+        CT_PUT(h[i].key.data, h[i].key.len,
+               h[i].value.data, h[i].value.len);
+    }
+    #undef CT_PUT
+
+    /* append body */
+    for (cl = ctx->body; cl; cl = cl->next) {
+        size_t bn = ngx_buf_size(cl->buf);
+        ngx_memcpy(w, cl->buf->pos, bn);
+        w += bn;
+    }
+}
+
+
+/* The L1 store, kept whole as ONE helper because it is one decision: the
+ * 5xx-protecting store_if() and the plain store() are two arms of the same
+ * choice, and the AUD-5XX-CTA fold that made the predicate and the write
+ * share a single lock hold lives inside shm_store_if(). Splitting the arms
+ * apart, or hoisting the store_rc dispatch into the parent, would put a
+ * caller boundary between the predicate and the write it guards.
+ *
+ * O6/S3.1: a negative-cached error (e.g. "cache_turbo_valid 503 1m")
+ * must never overwrite a body that is still worth serving -- that is
+ * the exact inverse of outage resilience.
+ *
+ * AUD-5XX-CTA: this used to be a separate check-then-act -- lock,
+ * lookup, decide `protect`, unlock, THEN store re-locked later.
+ * Reachable under cache_turbo_bypass (skips lookup AND
+ * single-flight, still permits storing), another worker could
+ * change the node in the gap between the two critical sections.
+ * Folded into a single store_if() call below: the predicate
+ * (search "refusing to overwrite cached body") and the write now
+ * share ONE lock hold, via
+ * NGX_HTTP_CACHE_TURBO_STORE_IF_ABSENT_OR_DEAD, which is exactly
+ * the old `protect` predicate --
+ *   kind == ENTRY && ctn->len > 0 && (stale_until == 0
+ *                                     || now < stale_until)
+ * -- moved inside shm_store_if(). stale_until == 0 means FOREVER,
+ * not expired.
+ *
+ * ⚠ D-4 ("does this also cover a body alive ONLY via
+ * cache_turbo_keep_stale, i.e. past stale_until?") is YES, and it is
+ * ALREADY SATISFIED UPSTREAM -- deliberately NOT by a second branch
+ * on the blob's sie_ttl here. A keep-stale-only body arms an SIE
+ * snapshot at access time (see the `sie_ttl > 0 && now < created +
+ * sie_ttl` arming test in the access handler), and the header filter
+ * then rewrites the origin's 5xx into that snapshot and sets
+ * ctx->served = 1 BEFORE the capture gate -- so the 5xx never
+ * reaches this body filter at all and there is nothing here to
+ * guard. An earlier revision of this guard did test
+ * `now < created + sie_ttl` as a fallback arm; it was UNREACHABLE
+ * (identical predicate to the arming test, evaluated on the same
+ * fields) and was removed rather than shipped as dead weight. The
+ * only way past the arming test is its ngx_pnalloc() for the
+ * snapshot failing under memory pressure -- not worth a branch.
+ * Do not "restore" the sie_ttl arm without first writing a test
+ * that reaches it.
+ *
+ * ⚠ store_if() MUST probe the key this store will actually write,
+ * and `store_key` only diverges from ctx->key_hash at the auto-Vary
+ * variant relocation in the caller. Probing ctx->key_hash instead
+ * would check the BASE key while the store overwrites the VARIANT --
+ * protecting on an unrelated body and still clobbering the variant
+ * this guard exists to save. store_key is what is passed in here,
+ * preserving that property.
+ *
+ * Returns NGX_DECLINED when store_if() refused the write because a still-
+ * servable good body is resident under store_key (the caller must delegate
+ * downstream and must NOT touch ctx->cold_stored -- nothing was written, so
+ * the cold-miss stub cleanup must still run); NGX_OK otherwise. */
+static ngx_int_t
+ngx_http_cache_turbo_body_filter_store(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx,
+    ngx_http_cache_turbo_zone_t *z, u_char *store_key, uint32_t hash,
+    u_char *blob, size_t blob_len, time_t ttl, time_t stale_window)
+{
+    ngx_int_t  store_rc;
+    ngx_uint_t is_5xx = (r->headers_out.status
+                          >= NGX_HTTP_INTERNAL_SERVER_ERROR);
+
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+    /* AUD-STORE-ERR-STUB: deterministically simulate a failed store
+     * without depending on real slab exhaustion timing.
+     *
+     * The store is SKIPPED, not called-then-overridden. Masking the
+     * return value of a store that actually succeeded is not the same
+     * fault: the entry lands in L1 anyway, the next request is a plain
+     * L1 HIT, and no cold-miss stub is ever orphaned -- so the test
+     * built on it passed identically with and without the fix. The
+     * defect under test is "no entry was written, so the stub must be
+     * cleaned up", which requires no entry to be written. */
+    if (clcf->test_store_fail) {
+        store_rc = NGX_ERROR;
+
+    } else if (is_5xx) {
+        store_rc = clcf->l1->store_if(z, store_key, hash,
+                   blob, blob_len, ttl, stale_window,
+                   NGX_HTTP_CACHE_TURBO_STORE_IF_ABSENT_OR_DEAD);
+
+    } else {
+        store_rc = clcf->l1->store(z, store_key, hash,
+                   blob, blob_len, ttl,
+                   stale_window);
+    }
+#else
+    if (is_5xx) {
+        store_rc = clcf->l1->store_if(z, store_key, hash,
+                   blob, blob_len, ttl, stale_window,
+                   NGX_HTTP_CACHE_TURBO_STORE_IF_ABSENT_OR_DEAD);
+
+    } else {
+        store_rc = clcf->l1->store(z, store_key, hash,
+                   blob, blob_len, ttl,
+                   stale_window);
+    }
+#endif
+
+    /* AUD-5XX-CTA: NGX_DECLINED means store_if() refused the write
+     * because a still-servable good body is resident under
+     * store_key -- equivalent to the old `protect` branch. Return
+     * BEFORE touching ctx->cold_stored, same as before: nothing was
+     * written, so the cold-miss stub cleanup (AUD-STORE-ERR-STUB,
+     * just below) must still run. */
+    if (store_rc == NGX_DECLINED) {
+        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "cache_turbo: refusing to overwrite cached "
+                       "body \"%V\" with error status=%ui",
+                       &r->uri, r->headers_out.status);
+        return NGX_DECLINED;
+    }
+
+    if (store_rc == NGX_OK) {
+        ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "cache_turbo: stored \"%V\" len=%uz ttl=%T",
+                       &r->uri, blob_len, ttl);
+
+        /* v10: store overwrote any cold-miss stub into a real entry (or
+         * we cleared the relocated base stub above), so the cleanup
+         * must not remove it. */
+        ctx->cold_stored = 1;
+
+    } else {
+        /* AUD-STORE-ERR-STUB: a failed store leaves whatever was under
+         * store_key untouched -- no real entry was written, so the
+         * cold-miss stub (if any) still needs the pool cleanup to run
+         * and unstub it. Leaving ctx->cold_stored at 0 here is what
+         * arms that cleanup; setting it unconditionally (the bug) told
+         * the cleanup a real entry existed and left the stub to block
+         * every waiter until lock_ttl. */
+        ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "cache_turbo: store failed \"%V\" len=%uz "
+                       "ttl=%T", &r->uri, blob_len, ttl);
+    }
+
+    return NGX_OK;
+}
+
+
+/* Tokenise the cache_turbo_tag value into `seen`, deduped within the value and
+ * capped at NGX_HTTP_CACHE_TURBO_MAX_TAGS entries of at most MAX_TAG_LEN bytes
+ * each. Returns the tag count.
+ *
+ * ⚠ `*sp` is an IN/OUT cursor into the caller's tagval, advanced to where the
+ * tokeniser stopped. The caller needs that resume point to tell "the value ran
+ * out" from "the cap was reached" for the truncation warning, so it is returned
+ * rather than recomputed. It stays valid because tagval lives in r->pool for
+ * the whole call and nothing here reallocates or reorders it; seen[] points
+ * INTO that same buffer, so the entries are only valid for this call's
+ * lifetime, which is exactly how the caller uses them (SADD, then done).
+ *
+ * PERF-2: the tag value is upstream-controlled (e.g. an X-Cache-Tags header),
+ * so without bounds a hostile/buggy origin could name thousands of tags and
+ * make ONE response fire thousands of SADD connections. Cap the count, cap each
+ * tag's length, and dedup so the same tag in one value is SADD'd once. */
+static ngx_uint_t
+ngx_http_cache_turbo_body_filter_tag_split(u_char **sp, u_char *e,
+    ngx_str_t *seen)
+{
+    u_char     *s = *sp, *tok;
+    size_t      toklen;
+    ngx_uint_t  ntags = 0, k;
+
+    while (s < e && ntags < NGX_HTTP_CACHE_TURBO_MAX_TAGS) {
+        while (s < e && (*s == ' ' || *s == '\t' || *s == ','
+                         || *s == '\r' || *s == '\n'))
+        {
+            s++;
+        }
+        tok = s;
+        while (s < e && *s != ' ' && *s != '\t' && *s != ','
+               && *s != '\r' && *s != '\n')
+        {
+            s++;
+        }
+        toklen = (size_t) (s - tok);
+        if (toklen == 0
+            || toklen > NGX_HTTP_CACHE_TURBO_MAX_TAG_LEN)
+        {
+            continue;          /* empty or over-long: skip */
+        }
+
+        for (k = 0; k < ntags; k++) {   /* dedup within value */
+            if (seen[k].len == toklen
+                && ngx_memcmp(seen[k].data, tok, toklen) == 0)
+            {
+                break;
+            }
+        }
+        if (k < ntags) {
+            continue;          /* already added this tag */
+        }
+
+        seen[ntags].data = tok;
+        seen[ntags].len = toklen;
+        ntags++;
+    }
+
+    *sp = s;
+    return ntags;
+}
+
+
+/* Tag index (v2c): for each tag in the cache_turbo_tag expression, SADD this
+ * object's L2 key to the tag set so it can be purged by tag later. Tags live
+ * only in L2; skip when Redis is off. The memcached backend has no tag support
+ * (tag_add == NULL, v13).
+ *
+ * cache_turbo_surrogate_key (emit the same tags downstream for a fronting CDN)
+ * is handled separately in the HEADER filter -- headers are already sent by
+ * the time this body-filter store runs, so the emit MUST happen before
+ * next_header_filter, not here. */
+static void
+ngx_http_cache_turbo_body_filter_tag_index(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf, u_char *store_key, time_t retain_ttl)
+{
+    ngx_str_t  tagval;
+    u_char    *s, *e;
+    ngx_uint_t ntags, k;
+    /* Bounded and deduped by _tag_split(); see that helper for the PERF-2
+     * rationale behind the count and length caps. */
+    ngx_str_t  seen[NGX_HTTP_CACHE_TURBO_MAX_TAGS];
+
+    if (ngx_http_complex_value(r, clcf->tag, &tagval) != NGX_OK
+        || tagval.len == 0)
+    {
+        return;
+    }
+
+    s = tagval.data;
+    e = tagval.data + tagval.len;
+
+    ntags = ngx_http_cache_turbo_body_filter_tag_split(&s, e, seen);
+
+    /* L9: index the whole deduped set in ONE pipelined op
+     * (one pool, one connection, one round trip) rather than
+     * one op per tag -- a MAX_TAGS response fired up to 16.
+     * seen[] is already deduped and cap-bound by the loop
+     * above, which is exactly tag_add_many's contract. Fall
+     * back to per-tag calls on a backend that predates the
+     * batched slot. */
+    if (ntags > 0) {
+        if (clcf->backend->tag_add_many) {
+            clcf->backend->tag_add_many(clcf, store_key, seen,
+                                        ntags, retain_ttl);
+        } else {
+            for (k = 0; k < ntags; k++) {
+                clcf->backend->tag_add(clcf, store_key,
+                                       seen[k].data,
+                                       seen[k].len, retain_ttl);
+            }
+        }
+    }
+
+    /* The MAX_TAGS cap is a DoS bound (above), not a hint -- but
+     * hitting it SILENTLY is a correctness trap: the tags past the
+     * cap are never indexed, so a later purge of one of them does
+     * NOT invalidate this page and the operator sees stale content
+     * with no signal anywhere. Real origins hit this: a Magento
+     * category page emits one cat_p_<id> tag PER PRODUCT, so a
+     * 40-product page overflows a 16-tag cap and quietly stops
+     * being purgeable on the dropped tags.
+     *
+     * Warn, once per affected response, only when tags were
+     * actually dropped -- s < e means the tokeniser stopped early
+     * because the cap was reached, not because the value ran out.
+     * Skip trailing separators first so a value ending in ", "
+     * does not report a phantom drop. */
+    while (s < e && (*s == ' ' || *s == '\t' || *s == ','
+                     || *s == '\r' || *s == '\n'))
+    {
+        s++;
+    }
+    if (s < e) {
+        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+            "cache_turbo: tag list truncated at %ui tags for "
+            "\"%V\" -- the remaining tags are NOT indexed and a "
+            "purge of them will NOT invalidate this entry "
+            "(raise NGX_HTTP_CACHE_TURBO_MAX_TAGS or emit fewer "
+            "tags)", (ngx_uint_t) NGX_HTTP_CACHE_TURBO_MAX_TAGS,
+            &r->uri);
+    }
+}
+
+
+/* The store tail: everything that happens once the response is complete and
+ * within max_size -- blob serialisation, the L1 store, the auto-Vary marker
+ * and variant index, the autotune cost sample, the L2 write-through and the
+ * tag index.
+ *
+ * Returns NGX_DECLINED when the response must simply be delegated downstream
+ * without being stored (not cacheable, or store_if() refused the overwrite);
+ * NGX_OK otherwise. */
+static ngx_int_t
+ngx_http_cache_turbo_body_filter_store_tail(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx)
+{
+    uint32_t                      hash, nheaders = 0;
+    u_char                       *blob;
+    u_char                        store_key[32];
+    size_t                        hdr_bytes = 0, blob_len = 0;
+    ngx_str_t                     ct;
+    time_t                        ttl, stale_window, sie_window;
+    time_t                        retain_ttl;
+    ngx_http_cache_turbo_zone_t  *z;
+
+    if (ngx_http_cache_turbo_body_filter_windows(r, clcf, &ttl, &stale_window,
+                                                 &sie_window) == NGX_DECLINED)
+    {
+        return NGX_DECLINED;
+    }
+
+    /* Synthesise a Content-Type entry from the typed field (it is not in
+     * the headers list). Everything else comes from headers_out.headers. */
+    ct = r->headers_out.content_type;
+
+    ngx_http_cache_turbo_body_filter_measure_headers(r, clcf, &ct, &hdr_bytes,
+                                                     &nheaders);
+
+    /* STAB-5: headers_len and body_len are uint32 in the blob header. Refuse
+     * to store (rather than write a header that lies about the layout) if a
+     * pathological response would truncate either. body_len is already
+     * bounded by max_size on the capture path; this also covers a max_size
+     * configured above 4 GiB and an unbounded header block. Reuse the
+     * blob==NULL skip below (same as an alloc failure: silently don't cache). */
+    if (hdr_bytes > 0xFFFFFFFFUL || ctx->body_len > 0xFFFFFFFFUL) {
+        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                      "cache_turbo: \"%V\" not cached: header/body block "
+                      "exceeds the 4 GiB blob field limit", &r->uri);
+        blob = NULL;
+    } else {
+        blob_len = NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE
+                   + hdr_bytes + ctx->body_len;
+        blob = ngx_pnalloc(r->pool, blob_len);
+    }
+
+    if (blob == NULL) {
+        return NGX_OK;
+    }
+
+    ngx_http_cache_turbo_body_filter_blob_write(r, clcf, ctx, blob, &ct,
+                                                hdr_bytes, nheaders, ttl,
+                                                stale_window, sie_window);
+
+    /* The L2 retention window, used for the object key AND for every L2
+     * index that points at it (variant index, tag index). stale_window
+     * already carries any stale-while-revalidate widening; sie_window is
+     * the RFC-2 stale-if-error deadline and can extend past it entirely.
+     * Both are absolute windows off the same base ttl and are already
+     * clamped to TTL_MAX, so max() needs no further bounding.
+     *
+     * The indexes MUST NOT outlive-mismatch the object: if an index
+     * expired at the stale window while the object survived into the
+     * SIE-only interval, a tag or base purge in that interval could no
+     * longer find the object and would leave it undeletable in L2. */
+    retain_ttl = stale_window;
+    if (sie_window > retain_ttl) {
+        retain_ttl = sie_window;
+    }
+
+    z = clcf->shm_zone->data;
+
+    /* auto-Vary (v11 other half): when the response varies on a safe
+     * axis, store the object under the SECONDARY variant key (folding the
+     * named request headers) instead of the base key, so distinct
+     * representations never collide. store_key == key_hash otherwise (no
+     * auto_vary, no/whitelist-only Vary, or key_hash was already the
+     * variant via the request-time marker). */
+    ngx_memcpy(store_key, ctx->key_hash, 32);
+    if (clcf->auto_vary && ctx->vary_bits > 0) {
+        ngx_http_cache_turbo_variant_hash(r, &ctx->cache_key,
+                                          ctx->vary_bits, ctx->vary_gen,
+                                          store_key);
+    }
+    hash = ngx_crc32_short(store_key, 32);
+
+    /* If we relocated the key away from the base (cold-miss winner that
+     * only learned the Vary now), the cold-miss stub the access handler
+     * left under the base key would never be overwritten by this store →
+     * clear it so waiters on the base key stop blocking. unstub only drops
+     * a still-stub node, so a real base entry (if any) is untouched. */
+    if (ctx->cold_winner && !ctx->cold_stored
+        && ngx_memcmp(store_key, ctx->key_hash, 32) != 0)
+    {
+        ngx_http_cache_turbo_shm_unstub(z, ctx->key_hash,
+                           ngx_crc32_short(ctx->key_hash, 32),
+                           ctx->cold_owner);
+    }
+
+    if (ngx_http_cache_turbo_body_filter_store(r, clcf, ctx, z, store_key,
+                                               hash, blob, blob_len, ttl,
+                                               stale_window) == NGX_DECLINED)
+    {
+        return NGX_DECLINED;
+    }
+
+    /* auto-Vary: persist the active-axis bitmask as an L1 marker under
+     * the base key so the next request resolves straight to this variant
+     * (node-local; self-heals if evicted). */
+    if (clcf->auto_vary && ctx->vary_bits > 0) {
+        ngx_http_cache_turbo_marker_store(clcf, z, &ctx->cache_key,
+                                          ctx->vary_bits, ctx->vary_gen,
+                                          ttl);
+
+        /* COR-5 variant index: SADD this variant's L2 key into the
+         * per-base index set so a later PURGE of the base URI can
+         * enumerate + drop every variant from L1+L2. Redis only
+         * (memcached has no sets => tag_add NULL; its variants are
+         * invalidated by the L1-only generation bump + TTL instead). */
+        if (clcf->backend && clcf->backend->tag_add) {
+            u_char  vname[1 + 64];
+            size_t  vlen;
+
+            vlen = ngx_http_cache_turbo_variant_index_name(
+                       &ctx->cache_key, vname);
+            clcf->backend->tag_add(clcf, store_key, vname, vlen,
+                                   retain_ttl);
+        }
+    }
+
+    ngx_log_debug4(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "cache_turbo: STORE \"%V\" key=%ui len=%uz ttl=%T",
+                   &r->uri, (ngx_uint_t) hash, blob_len, ttl);
+
+    /* Record this origin regeneration's cost for the autotune (v4-3).
+     * This store site is the origin→cache path only (the L2→L1 fill in
+     * the access handler is a separate store call), so request_time here
+     * is real origin latency — exactly the miss-cost the autotune feeds
+     * on. Recorded unconditionally so the admin cost_ms is meaningful and
+     * autotune has history the moment it is enabled; just two atomics. */
+    {
+        ngx_time_t      *tp = ngx_timeofday();
+        ngx_msec_int_t   ms;
+
+        ms = (ngx_msec_int_t)
+             ((tp->sec - r->start_sec) * 1000
+              + (tp->msec - r->start_msec));
+        ngx_http_cache_turbo_autotune_record_cost(z, ms);
+    }
+
+    /* L2 write-through (async, fire-and-forget). Copies the blob into
+     * its own pool, so it is safe even though `blob` lives in r->pool.
+     * The caller owns the L2 key's retention window: retain_ttl (computed
+     * above, shared with the L2 index writes) is max(stale_window,
+     * sie_window). Passing stale_window alone here would silently
+     * truncate the L2 key's PX/EXPIRE to the stale deadline, so an
+     * SIE-armed object's L2 copy is already gone by the time an origin
+     * failure needs it — the access handler's SIE-from-L2 path would
+     * then always miss. */
+    if (clcf->backend) {
+        clcf->backend->set(r, clcf, store_key,
+                           blob, blob_len, ttl, retain_ttl);
+    }
+
+    if (clcf->backend && clcf->backend->tag_add && clcf->tag) {
+        ngx_http_cache_turbo_body_filter_tag_index(r, clcf, store_key,
+                                                   retain_ttl);
+    }
+
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
+{
+    ngx_int_t                         rc;
+    ngx_chain_t                       eout;
+    ngx_http_cache_turbo_ctx_t       *ctx;
+    ngx_http_cache_turbo_loc_conf_t  *clcf;
+    ngx_uint_t                        last = 0;
+
+    ctx = ngx_http_get_module_ctx(r, ngx_http_cache_turbo_module);
+    clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
+
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+    if (ngx_http_cache_turbo_body_filter_midbody_rescue(r, clcf, ctx)
+        == NGX_ERROR)
+    {
+        return NGX_ERROR;
+    }
+#endif
+
+    if (ctx != NULL && ctx->sie_serving) {
+        rc = ngx_http_cache_turbo_body_filter_sie_emit(r, ctx, in, &eout);
+        if (rc == NGX_DECLINED) {
+            return NGX_OK;
+        }
+        if (rc == NGX_ERROR) {
+            return NGX_ERROR;
+        }
+        return ngx_http_next_body_filter(r, &eout);
+    }
+
+    if (ctx == NULL || !ctx->captured || ctx->served) {
+        return ngx_http_cache_turbo_forward_body(r, in);
+    }
+
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+    if (ngx_http_cache_turbo_body_filter_force_file_buf(r, clcf, ctx)
+        == NGX_DECLINED)
+    {
+        return ngx_http_cache_turbo_forward_body(r, in);
+    }
+#endif
+
+    rc = ngx_http_cache_turbo_body_filter_capture(r, clcf, ctx, in, &last);
+    if (rc == NGX_ERROR) {
+        return NGX_ERROR;
+    }
+    if (rc == NGX_DECLINED) {
+        return ngx_http_cache_turbo_forward_body(r, in);
     }
 
     /* Store once the response is complete and within max_size. A zero-length
@@ -9937,627 +10796,7 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
     if (last
         && (clcf->max_size == 0 || ctx->body_len <= clcf->max_size))
     {
-        ngx_list_part_t                  *part;
-        ngx_table_elt_t                  *h;
-        ngx_str_t                         ct;
-        size_t                            hdr_bytes = 0, blob_len = 0;
-        uint32_t                          nheaders = 0;
-        u_char                           *blob, *w;
-        ngx_uint_t                        i;
-        time_t                            ttl, stale_window, sie_window = 0;
-        time_t                            retain_ttl;
-
-        ttl = ngx_http_cache_turbo_status_ttl(clcf, r->headers_out.status);
-        if (ttl < 0) {
-            ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                           "cache_turbo: not cacheable \"%V\" status=%ui",
-                           &r->uri, r->headers_out.status);
-            return ngx_http_cache_turbo_forward_body(r, in);   /* not cacheable */
-        }
-
-        /* O6/S3.1: a negative-cached error (e.g. "cache_turbo_valid 503 1m")
-         * must never overwrite a body that is still worth serving. The guard
-         * itself lives at the store site below (search "refusing to overwrite
-         * cached body"), which is the single source of truth for the predicate
-         * and why it looks the way it does -- including why the blob's sie_ttl
-         * is deliberately NOT consulted. Do not restate the predicate here; an
-         * earlier copy of it in this comment went stale the moment the
-         * implementation changed. */
-        /* Honor upstream freshness (v7): let the response's own
-         * Cache-Control/Expires set the fresh TTL when enabled. ignore_cc wins:
-         * if the operator told us to ignore Cache-Control, the TTL is the static
-         * cache_turbo_valid, never the (ignored) upstream max-age/Expires. */
-        if (clcf->honor_cc && !clcf->ignore_cc) {
-            time_t  up = ngx_http_cache_turbo_upstream_ttl(r);
-            if (up >= 0) {
-                ttl = up;
-            }
-        }
-
-        /* STAB-5: clamp the fresh TTL to the uint32 ceiling before it feeds the
-         * blob fresh_ttl cast, the stale-window multiply, and the L2 PX. An
-         * unbounded upstream max-age (honor_cc) is the realistic source. */
-        if (ttl > NGX_HTTP_CACHE_TURBO_TTL_MAX) {
-            ttl = NGX_HTTP_CACHE_TURBO_TTL_MAX;
-        }
-
-        /* Absolute serveable window (fresh + stale) from now, reused by the blob
-         * metadata, the L1 store, and the L2 EXPIRE so all three agree. */
-        stale_window = ngx_http_cache_turbo_stale_ttl(ttl, clcf->stale_mult);
-
-        /* RFC 5861 / RFC-2: a response stale-while-revalidate=N sets the stale
-         * window explicitly (fresh + N), overriding the cache_turbo_stale_mult
-         * default. The existing SWR machinery (background_update) then serves
-         * stale + refreshes within it. must-revalidate below still wins (it
-         * collapses the window). Only meaningful for a finite TTL.
-         *
-         * ignore_cc skips ALL three response-Cache-Control window adjustments
-         * (swr here, must-revalidate + stale-if-error below): the operator told
-         * us to ignore the upstream Cache-Control, so an upstream max-age=0 /
-         * must-revalidate / stale-while|if-* must NOT reshape the window built
-         * from cache_turbo_valid + cache_turbo_stale_mult. Matches the
-         * proxy_ignore_headers Cache-Control contract (the whole header is
-         * inert), not just the cacheability floor. */
-        if (ttl > 0 && !clcf->ignore_cc) {
-            time_t  swr = ngx_http_cache_turbo_response_swr(r);
-            if (swr >= 0) {
-                /* AUD-CC-DELTA-OVF: swr is parsed straight off the wire and can
-                 * be up to NGX_MAX_INT_T_VALUE (e.g. stale-while-revalidate=
-                 * 9223372036854775807) -- clamp the delta BEFORE the add, not
-                 * the sum after, or ttl + swr overflows signed time_t (UB). */
-                stale_window = ngx_http_cache_turbo_add_ttl_clamped(ttl, swr);
-                ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                               "cache_turbo: stale-while-revalidate=%T \"%V\"",
-                               swr, &r->uri);
-            }
-        }
-
-        /* RFC 9111 must-revalidate / proxy-revalidate: once stale, the response
-         * must NOT be served without revalidation. We have no validation channel
-         * for a hit, so collapse the stale window to the fresh TTL — the object
-         * is served fresh until its deadline, then re-fetched (no stale serve,
-         * no stale-if-error). Only meaningful for a finite TTL. Skipped under
-         * ignore_cc (see the swr block above — the whole upstream Cache-Control
-         * is inert, so an upstream must-revalidate must not collapse the
-         * operator-configured stale window). */
-        if (ttl > 0 && !clcf->ignore_cc
-            && ngx_http_cache_turbo_response_must_revalidate(r))
-        {
-            stale_window = ttl;
-            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                           "cache_turbo: must-revalidate \"%V\" -> no stale window",
-                           &r->uri);
-
-        } else if (ttl > 0 && !clcf->ignore_cc) {
-            /* RFC 5861 §4 / RFC-2: a response stale-if-error=N records an absolute
-             * serve-on-error window (fresh + N) in the blob's sie_ttl (CTB4), so a
-             * later origin failure may serve this copy PAST the normal stale
-             * window. 0 = absent => no serve-on-error beyond the stale window.
-             * Gated behind !must-revalidate above (must-revalidate forbids any
-             * stale serve, stale-if-error included). The serve-on-error path that
-             * consumes sie_ttl lands in a follow-up; the field is carried now so
-             * the wire format turns over once (single cold-cache event). */
-            time_t  sie = ngx_http_cache_turbo_response_sie(r);
-            if (sie >= 0) {
-                /* AUD-CC-DELTA-OVF: same wire-controlled overflow as the swr
-                 * clamp above -- clamp the delta before the add. */
-                sie_window = ngx_http_cache_turbo_add_ttl_clamped(ttl, sie);
-                ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                               "cache_turbo: stale-if-error=%T \"%V\"",
-                               sie, &r->uri);
-
-            } else if (ttl > 0 && clcf->keep_stale > 0) {
-                /* S2.2 / D-1: no response stale-if-error to honor here, so fall
-                 * back to the operator's cache_turbo_keep_stale baseline (fresh +
-                 * keep_stale). This branch only runs when a response SIE was
-                 * absent -- a HONORED response stale-if-error above already took
-                 * this window and we must NOT also apply keep_stale on top of it
-                 * (that would be max(), which the plan explicitly rejects: an
-                 * origin that states its own error window is making a statement,
-                 * not setting a floor). Still gated behind the outer
-                 * !must-revalidate branch above, so a honored must-revalidate
-                 * still collapses the window to `ttl` and suppresses keep_stale
-                 * too -- must-revalidate forbids ANY stale serve. */
-                sie_window = ttl + clcf->keep_stale;
-                if (sie_window > NGX_HTTP_CACHE_TURBO_TTL_MAX) {
-                    sie_window = NGX_HTTP_CACHE_TURBO_TTL_MAX;
-                }
-                ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                               "cache_turbo: keep_stale=%T \"%V\"",
-                               clcf->keep_stale, &r->uri);
-            }
-
-        } else if (ttl > 0 && clcf->ignore_cc && clcf->keep_stale > 0) {
-            /* D-1: under ignore_cc the response-derived swr/must-revalidate/sie
-             * branches above never run (the whole upstream Cache-Control is
-             * inert), so this location's stale window is untouched by the
-             * response and sie_window is still 0 here. keep_stale is OPERATOR
-             * config, not upstream config -- ignore_cc only makes the upstream
-             * header inert, it does not disable operator-configured retention.
-             * Apply the keep_stale baseline unconditionally in this case (no
-             * response SIE to compare against, and no honored must-revalidate
-             * to suppress it -- must-revalidate is itself response-derived and
-             * therefore inert under ignore_cc). */
-            sie_window = ttl + clcf->keep_stale;
-            if (sie_window > NGX_HTTP_CACHE_TURBO_TTL_MAX) {
-                sie_window = NGX_HTTP_CACHE_TURBO_TTL_MAX;
-            }
-            ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                           "cache_turbo: keep_stale=%T (ignore_cc) \"%V\"",
-                           clcf->keep_stale, &r->uri);
-        }
-
-        /* Synthesise a Content-Type entry from the typed field (it is not in
-         * the headers list). Everything else comes from headers_out.headers. */
-        ct = r->headers_out.content_type;
-
-        /* First pass: measure the header block. */
-        if (ct.len) {
-            hdr_bytes += sizeof(uint32_t) + sizeof("Content-Type") - 1
-                         + sizeof(uint32_t) + ct.len;
-            nheaders++;
-        }
-
-        part = &r->headers_out.headers.part;
-        h = part->elts;
-        for (i = 0; /* void */ ; i++) {
-            if (i >= part->nelts) {
-                if (part->next == NULL) {
-                    break;
-                }
-                part = part->next;
-                h = part->elts;
-                i = 0;
-            }
-            /* AUD-HDR1: the same gate the restore path uses. This loop and the
-             * emit loop below MUST make identical decisions or headers_len
-             * would lie about the block that follows — one helper, called
-             * twice, is what guarantees that. */
-            if (h[i].hash == 0
-                || !ngx_http_cache_turbo_header_admissible(clcf,
-                        h[i].key.data, h[i].key.len,
-                        h[i].value.data, h[i].value.len))
-            {
-                continue;
-            }
-            hdr_bytes += sizeof(uint32_t) + h[i].key.len
-                         + sizeof(uint32_t) + h[i].value.len;
-            nheaders++;
-        }
-
-        /* STAB-5: headers_len and body_len are uint32 in the blob header. Refuse
-         * to store (rather than write a header that lies about the layout) if a
-         * pathological response would truncate either. body_len is already
-         * bounded by max_size on the capture path; this also covers a max_size
-         * configured above 4 GiB and an unbounded header block. Reuse the
-         * blob==NULL skip below (same as an alloc failure: silently don't cache). */
-        if (hdr_bytes > 0xFFFFFFFFUL || ctx->body_len > 0xFFFFFFFFUL) {
-            ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
-                          "cache_turbo: \"%V\" not cached: header/body block "
-                          "exceeds the 4 GiB blob field limit", &r->uri);
-            blob = NULL;
-        } else {
-            blob_len = NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE
-                       + hdr_bytes + ctx->body_len;
-            blob = ngx_pnalloc(r->pool, blob_len);
-        }
-
-        if (blob != NULL) {
-            ngx_http_cache_turbo_blob_hdr_t  bhw;
-            u_char                           store_key[32];
-
-            /* STAB-4: serialise the header into the fixed 44-byte LE wire form. */
-            bhw.nheaders = nheaders;
-            bhw.headers_len = (uint32_t) hdr_bytes;
-            bhw.body_len = (uint32_t) ctx->body_len;
-            bhw.status = (uint32_t) r->headers_out.status;
-            /* Freshness metadata so an L2 hit restores the remaining lifetime
-             * (not the location default). stale_ttl is the absolute serveable
-             * window from creation (fresh + stale), matching shm_store. */
-            bhw.created = (int64_t) ngx_time();
-            bhw.fresh_ttl = (uint32_t) (ttl > 0 ? ttl : 0);
-            bhw.stale_ttl = (uint32_t) stale_window;
-            bhw.sie_ttl = (uint32_t) sie_window;   /* CTB4 (RFC-2 SIE) */
-            /* S232-BYPASS-STALE: stamp breaker-only on an opted-in URI's blob.
-             * ⚠ Assigned unconditionally (bhw is an uninitialised stack struct
-             * populated field-by-field) -- an unset flags here would stamp
-             * stack garbage, and a stray BLOBF_BREAKER_ONLY would make an
-             * ordinary entry unserveable while a MISSING one would publish a
-             * breaker-only body to the normal hit path. */
-            bhw.flags = ctx->brk_only
-                        ? NGX_HTTP_CACHE_TURBO_BLOBF_BREAKER_ONLY : 0;
-            ngx_http_cache_turbo_blob_hdr_write(blob, &bhw);
-
-            /* The L2 retention window, used for the object key AND for every L2
-             * index that points at it (variant index, tag index). stale_window
-             * already carries any stale-while-revalidate widening; sie_window is
-             * the RFC-2 stale-if-error deadline and can extend past it entirely.
-             * Both are absolute windows off the same base ttl and are already
-             * clamped to TTL_MAX, so max() needs no further bounding.
-             *
-             * The indexes MUST NOT outlive-mismatch the object: if an index
-             * expired at the stale window while the object survived into the
-             * SIE-only interval, a tag or base purge in that interval could no
-             * longer find the object and would leave it undeletable in L2. */
-            retain_ttl = stale_window;
-            if (sie_window > retain_ttl) {
-                retain_ttl = sie_window;
-            }
-
-            w = blob + NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE;
-
-            /* write a single name/value pair (lengths fixed-endian, STAB-4) */
-            #define CT_PUT(np, nl, vp, vl)                                     \
-                do {                                                          \
-                    ngx_http_cache_turbo_put_u32(w, (uint32_t) (nl)); w += 4; \
-                    ngx_memcpy(w, (np), (nl)); w += (nl);                     \
-                    ngx_http_cache_turbo_put_u32(w, (uint32_t) (vl)); w += 4; \
-                    ngx_memcpy(w, (vp), (vl)); w += (vl);                     \
-                } while (0)
-
-            if (ct.len) {
-                CT_PUT("Content-Type", sizeof("Content-Type") - 1,
-                       ct.data, ct.len);
-            }
-
-            part = &r->headers_out.headers.part;
-            h = part->elts;
-            for (i = 0; /* void */ ; i++) {
-                if (i >= part->nelts) {
-                    if (part->next == NULL) {
-                        break;
-                    }
-                    part = part->next;
-                    h = part->elts;
-                    i = 0;
-                }
-                if (h[i].hash == 0
-                    || !ngx_http_cache_turbo_header_admissible(clcf,
-                            h[i].key.data, h[i].key.len,
-                            h[i].value.data, h[i].value.len))
-                {
-                    continue;
-                }
-                CT_PUT(h[i].key.data, h[i].key.len,
-                       h[i].value.data, h[i].value.len);
-            }
-            #undef CT_PUT
-
-            /* append body */
-            for (cl = ctx->body; cl; cl = cl->next) {
-                size_t bn = ngx_buf_size(cl->buf);
-                ngx_memcpy(w, cl->buf->pos, bn);
-                w += bn;
-            }
-
-            z = clcf->shm_zone->data;
-
-            /* auto-Vary (v11 other half): when the response varies on a safe
-             * axis, store the object under the SECONDARY variant key (folding the
-             * named request headers) instead of the base key, so distinct
-             * representations never collide. store_key == key_hash otherwise (no
-             * auto_vary, no/whitelist-only Vary, or key_hash was already the
-             * variant via the request-time marker). */
-            ngx_memcpy(store_key, ctx->key_hash, 32);
-            if (clcf->auto_vary && ctx->vary_bits > 0) {
-                ngx_http_cache_turbo_variant_hash(r, &ctx->cache_key,
-                                                  ctx->vary_bits, ctx->vary_gen,
-                                                  store_key);
-            }
-            hash = ngx_crc32_short(store_key, 32);
-
-            /* O6/S3.1: a negative-cached error (e.g. "cache_turbo_valid 503 1m")
-             * must never overwrite a body that is still worth serving -- that is
-             * the exact inverse of outage resilience.
-             *
-             * AUD-5XX-CTA: this used to be a separate check-then-act -- lock,
-             * lookup, decide `protect`, unlock, THEN store re-locked later.
-             * Reachable under cache_turbo_bypass (skips lookup AND
-             * single-flight, still permits storing), another worker could
-             * change the node in the gap between the two critical sections.
-             * Folded into a single store_if() call below: the predicate
-             * (search "refusing to overwrite cached body") and the write now
-             * share ONE lock hold, via
-             * NGX_HTTP_CACHE_TURBO_STORE_IF_ABSENT_OR_DEAD, which is exactly
-             * the old `protect` predicate --
-             *   kind == ENTRY && ctn->len > 0 && (stale_until == 0
-             *                                     || now < stale_until)
-             * -- moved inside shm_store_if(). stale_until == 0 means FOREVER,
-             * not expired.
-             *
-             * ⚠ D-4 ("does this also cover a body alive ONLY via
-             * cache_turbo_keep_stale, i.e. past stale_until?") is YES, and it is
-             * ALREADY SATISFIED UPSTREAM -- deliberately NOT by a second branch
-             * on the blob's sie_ttl here. A keep-stale-only body arms an SIE
-             * snapshot at access time (see the `sie_ttl > 0 && now < created +
-             * sie_ttl` arming test in the access handler), and the header filter
-             * then rewrites the origin's 5xx into that snapshot and sets
-             * ctx->served = 1 BEFORE the capture gate -- so the 5xx never
-             * reaches this body filter at all and there is nothing here to
-             * guard. An earlier revision of this guard did test
-             * `now < created + sie_ttl` as a fallback arm; it was UNREACHABLE
-             * (identical predicate to the arming test, evaluated on the same
-             * fields) and was removed rather than shipped as dead weight. The
-             * only way past the arming test is its ngx_pnalloc() for the
-             * snapshot failing under memory pressure -- not worth a branch.
-             * Do not "restore" the sie_ttl arm without first writing a test
-             * that reaches it.
-             *
-             * ⚠ store_if() MUST probe the key this store will actually write,
-             * and `store_key` only diverges from ctx->key_hash above (auto-Vary
-             * variant relocation). Probing ctx->key_hash instead would check
-             * the BASE key while the store overwrites the VARIANT --
-             * protecting on an unrelated body and still clobbering the variant
-             * this guard exists to save. store_if() is called with store_key,
-             * below, preserving that property. */
-
-            /* If we relocated the key away from the base (cold-miss winner that
-             * only learned the Vary now), the cold-miss stub the access handler
-             * left under the base key would never be overwritten by this store →
-             * clear it so waiters on the base key stop blocking. unstub only drops
-             * a still-stub node, so a real base entry (if any) is untouched. */
-            if (ctx->cold_winner && !ctx->cold_stored
-                && ngx_memcmp(store_key, ctx->key_hash, 32) != 0)
-            {
-                ngx_http_cache_turbo_shm_unstub(z, ctx->key_hash,
-                                   ngx_crc32_short(ctx->key_hash, 32),
-                                   ctx->cold_owner);
-            }
-
-            {
-            ngx_int_t  store_rc;
-            ngx_uint_t is_5xx = (r->headers_out.status
-                                  >= NGX_HTTP_INTERNAL_SERVER_ERROR);
-
-#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
-    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
-            /* AUD-STORE-ERR-STUB: deterministically simulate a failed store
-             * without depending on real slab exhaustion timing.
-             *
-             * The store is SKIPPED, not called-then-overridden. Masking the
-             * return value of a store that actually succeeded is not the same
-             * fault: the entry lands in L1 anyway, the next request is a plain
-             * L1 HIT, and no cold-miss stub is ever orphaned -- so the test
-             * built on it passed identically with and without the fix. The
-             * defect under test is "no entry was written, so the stub must be
-             * cleaned up", which requires no entry to be written. */
-            if (clcf->test_store_fail) {
-                store_rc = NGX_ERROR;
-
-            } else if (is_5xx) {
-                store_rc = clcf->l1->store_if(z, store_key, hash,
-                           blob, blob_len, ttl, stale_window,
-                           NGX_HTTP_CACHE_TURBO_STORE_IF_ABSENT_OR_DEAD);
-
-            } else {
-                store_rc = clcf->l1->store(z, store_key, hash,
-                           blob, blob_len, ttl,
-                           stale_window);
-            }
-#else
-            if (is_5xx) {
-                store_rc = clcf->l1->store_if(z, store_key, hash,
-                           blob, blob_len, ttl, stale_window,
-                           NGX_HTTP_CACHE_TURBO_STORE_IF_ABSENT_OR_DEAD);
-
-            } else {
-                store_rc = clcf->l1->store(z, store_key, hash,
-                           blob, blob_len, ttl,
-                           stale_window);
-            }
-#endif
-
-            /* AUD-5XX-CTA: NGX_DECLINED means store_if() refused the write
-             * because a still-servable good body is resident under
-             * store_key -- equivalent to the old `protect` branch. Return
-             * BEFORE touching ctx->cold_stored, same as before: nothing was
-             * written, so the cold-miss stub cleanup (AUD-STORE-ERR-STUB,
-             * just below) must still run. */
-            if (store_rc == NGX_DECLINED) {
-                ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                               "cache_turbo: refusing to overwrite cached "
-                               "body \"%V\" with error status=%ui",
-                               &r->uri, r->headers_out.status);
-                return ngx_http_cache_turbo_forward_body(r, in);
-            }
-
-            if (store_rc == NGX_OK) {
-                ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                               "cache_turbo: stored \"%V\" len=%uz ttl=%T",
-                               &r->uri, blob_len, ttl);
-
-                /* v10: store overwrote any cold-miss stub into a real entry (or
-                 * we cleared the relocated base stub above), so the cleanup
-                 * must not remove it. */
-                ctx->cold_stored = 1;
-
-            } else {
-                /* AUD-STORE-ERR-STUB: a failed store leaves whatever was under
-                 * store_key untouched -- no real entry was written, so the
-                 * cold-miss stub (if any) still needs the pool cleanup to run
-                 * and unstub it. Leaving ctx->cold_stored at 0 here is what
-                 * arms that cleanup; setting it unconditionally (the bug) told
-                 * the cleanup a real entry existed and left the stub to block
-                 * every waiter until lock_ttl. */
-                ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                               "cache_turbo: store failed \"%V\" len=%uz "
-                               "ttl=%T", &r->uri, blob_len, ttl);
-            }
-            }
-
-            /* auto-Vary: persist the active-axis bitmask as an L1 marker under
-             * the base key so the next request resolves straight to this variant
-             * (node-local; self-heals if evicted). */
-            if (clcf->auto_vary && ctx->vary_bits > 0) {
-                ngx_http_cache_turbo_marker_store(clcf, z, &ctx->cache_key,
-                                                  ctx->vary_bits, ctx->vary_gen,
-                                                  ttl);
-
-                /* COR-5 variant index: SADD this variant's L2 key into the
-                 * per-base index set so a later PURGE of the base URI can
-                 * enumerate + drop every variant from L1+L2. Redis only
-                 * (memcached has no sets => tag_add NULL; its variants are
-                 * invalidated by the L1-only generation bump + TTL instead). */
-                if (clcf->backend && clcf->backend->tag_add) {
-                    u_char  vname[1 + 64];
-                    size_t  vlen;
-
-                    vlen = ngx_http_cache_turbo_variant_index_name(
-                               &ctx->cache_key, vname);
-                    clcf->backend->tag_add(clcf, store_key, vname, vlen,
-                                           retain_ttl);
-                }
-            }
-
-            ngx_log_debug4(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                           "cache_turbo: STORE \"%V\" key=%ui len=%uz ttl=%T",
-                           &r->uri, (ngx_uint_t) hash, blob_len, ttl);
-
-            /* Record this origin regeneration's cost for the autotune (v4-3).
-             * This store site is the origin→cache path only (the L2→L1 fill in
-             * the access handler is a separate store call), so request_time here
-             * is real origin latency — exactly the miss-cost the autotune feeds
-             * on. Recorded unconditionally so the admin cost_ms is meaningful and
-             * autotune has history the moment it is enabled; just two atomics. */
-            {
-                ngx_time_t      *tp = ngx_timeofday();
-                ngx_msec_int_t   ms;
-
-                ms = (ngx_msec_int_t)
-                     ((tp->sec - r->start_sec) * 1000
-                      + (tp->msec - r->start_msec));
-                ngx_http_cache_turbo_autotune_record_cost(z, ms);
-            }
-
-            /* L2 write-through (async, fire-and-forget). Copies the blob into
-             * its own pool, so it is safe even though `blob` lives in r->pool.
-             * The caller owns the L2 key's retention window: retain_ttl (computed
-             * above, shared with the L2 index writes) is max(stale_window,
-             * sie_window). Passing stale_window alone here would silently
-             * truncate the L2 key's PX/EXPIRE to the stale deadline, so an
-             * SIE-armed object's L2 copy is already gone by the time an origin
-             * failure needs it — the access handler's SIE-from-L2 path would
-             * then always miss. */
-            if (clcf->backend) {
-                clcf->backend->set(r, clcf, store_key,
-                                   blob, blob_len, ttl, retain_ttl);
-            }
-
-            /* Tag index (v2c): for each tag in the cache_turbo_tag expression,
-             * SADD this object's L2 key to the tag set so it can be purged by
-             * tag later. Tags live only in L2; skip when Redis is off. The
-             * memcached backend has no tag support (tag_add == NULL, v13).
-             *
-             * cache_turbo_surrogate_key (emit the same tags downstream for a
-             * fronting CDN) is handled separately in the HEADER filter -- headers
-             * are already sent by the time this body-filter store runs, so the
-             * emit MUST happen before next_header_filter, not here. */
-            if (clcf->backend && clcf->backend->tag_add && clcf->tag) {
-                ngx_str_t  tagval;
-
-                if (ngx_http_complex_value(r, clcf->tag, &tagval) == NGX_OK
-                    && tagval.len)
-                {
-                    u_char    *s, *e, *tok;
-                    size_t     toklen;
-                    ngx_uint_t ntags = 0, k;
-                    /* PERF-2: the tag value is upstream-controlled (e.g. an
-                     * X-Cache-Tags header), so without bounds a hostile/buggy
-                     * origin could name thousands of tags and make ONE response
-                     * fire thousands of SADD connections. Cap the count, cap
-                     * each tag's length, and dedup so the same tag in one value
-                     * is SADD'd once. */
-                    ngx_str_t  seen[NGX_HTTP_CACHE_TURBO_MAX_TAGS];
-
-                    s = tagval.data;
-                    e = tagval.data + tagval.len;
-
-                    while (s < e && ntags < NGX_HTTP_CACHE_TURBO_MAX_TAGS) {
-                        while (s < e && (*s == ' ' || *s == '\t' || *s == ','
-                                         || *s == '\r' || *s == '\n'))
-                        {
-                            s++;
-                        }
-                        tok = s;
-                        while (s < e && *s != ' ' && *s != '\t' && *s != ','
-                               && *s != '\r' && *s != '\n')
-                        {
-                            s++;
-                        }
-                        toklen = (size_t) (s - tok);
-                        if (toklen == 0
-                            || toklen > NGX_HTTP_CACHE_TURBO_MAX_TAG_LEN)
-                        {
-                            continue;          /* empty or over-long: skip */
-                        }
-
-                        for (k = 0; k < ntags; k++) {   /* dedup within value */
-                            if (seen[k].len == toklen
-                                && ngx_memcmp(seen[k].data, tok, toklen) == 0)
-                            {
-                                break;
-                            }
-                        }
-                        if (k < ntags) {
-                            continue;          /* already added this tag */
-                        }
-
-                        seen[ntags].data = tok;
-                        seen[ntags].len = toklen;
-                        ntags++;
-                    }
-
-                    /* L9: index the whole deduped set in ONE pipelined op
-                     * (one pool, one connection, one round trip) rather than
-                     * one op per tag -- a MAX_TAGS response fired up to 16.
-                     * seen[] is already deduped and cap-bound by the loop
-                     * above, which is exactly tag_add_many's contract. Fall
-                     * back to per-tag calls on a backend that predates the
-                     * batched slot. */
-                    if (ntags > 0) {
-                        if (clcf->backend->tag_add_many) {
-                            clcf->backend->tag_add_many(clcf, store_key, seen,
-                                                        ntags, retain_ttl);
-                        } else {
-                            for (k = 0; k < ntags; k++) {
-                                clcf->backend->tag_add(clcf, store_key,
-                                                       seen[k].data,
-                                                       seen[k].len, retain_ttl);
-                            }
-                        }
-                    }
-
-                    /* The MAX_TAGS cap is a DoS bound (above), not a hint -- but
-                     * hitting it SILENTLY is a correctness trap: the tags past the
-                     * cap are never indexed, so a later purge of one of them does
-                     * NOT invalidate this page and the operator sees stale content
-                     * with no signal anywhere. Real origins hit this: a Magento
-                     * category page emits one cat_p_<id> tag PER PRODUCT, so a
-                     * 40-product page overflows a 16-tag cap and quietly stops
-                     * being purgeable on the dropped tags.
-                     *
-                     * Warn, once per affected response, only when tags were
-                     * actually dropped -- s < e means the tokeniser stopped early
-                     * because the cap was reached, not because the value ran out.
-                     * Skip trailing separators first so a value ending in ", "
-                     * does not report a phantom drop. */
-                    while (s < e && (*s == ' ' || *s == '\t' || *s == ','
-                                     || *s == '\r' || *s == '\n'))
-                    {
-                        s++;
-                    }
-                    if (s < e) {
-                        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
-                            "cache_turbo: tag list truncated at %ui tags for "
-                            "\"%V\" -- the remaining tags are NOT indexed and a "
-                            "purge of them will NOT invalidate this entry "
-                            "(raise NGX_HTTP_CACHE_TURBO_MAX_TAGS or emit fewer "
-                            "tags)", (ngx_uint_t) NGX_HTTP_CACHE_TURBO_MAX_TAGS,
-                            &r->uri);
-                    }
-                }
-            }
-        }
+        (void) ngx_http_cache_turbo_body_filter_store_tail(r, clcf, ctx);
     }
 
     return ngx_http_cache_turbo_forward_body(r, in);
