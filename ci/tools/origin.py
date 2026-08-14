@@ -180,16 +180,10 @@ class Origin:
                 except BrokenPipeError:
                     pass
 
-            def do_GET(self):
-                if origin.delay:
-                    time.sleep(origin.delay)
-                with origin._lock:
-                    origin._n += 1
-                    n = origin._n
-                    origin._paths.append((time.time(), self.path))
-                    if len(origin._paths) > 64:        # ring: diagnostics only
-                        del origin._paths[:-64]
-                    origin._path_hits[self.path] += 1
+            def _get_handle_hard_failure(self, n: int) -> bool:
+                """origin.drop / origin.fail early-return cases. Returns True
+                if a complete response was written (caller must stop), False
+                to fall through to the marker-driven special cases."""
                 # Hard upstream failure (Goal-2): drop the connection with no
                 # response so nginx's upstream sees a transport error (502),
                 # exercising a different error class than the clean 503 `fail`
@@ -197,7 +191,7 @@ class Origin:
                 # reached the origin); serving stale must not depend on it.
                 if origin.drop:
                     self.close_connection = True
-                    return
+                    return True
                 # Origin failure injection (v8 stale-if-error): the hit is still
                 # counted (so a test can prove the refresh reached the origin),
                 # but the response is a 5xx the module must NOT cache or surface.
@@ -237,11 +231,103 @@ class Origin:
                                 time.sleep(0.02)
                         except BrokenPipeError:
                             pass
-                        return
+                        return True
                     self.send_response(origin.fail_status)
                     self.send_header("Content-Length", "0")
                     self.end_headers()
-                    return
+                    return True
+                return False
+
+            def _get_handle_rngsrc(self) -> None:
+                """AUD-RANGE1: a real Range-capable origin (e.g. a static
+                file server) that both advertises Accept-Ranges: bytes AND
+                honours an incoming Range header with a genuine 206 +
+                Content-Range + sliced body. Body is well over 100 bytes so
+                bytes=0-99 is a true partial slice, not the whole response.
+                Used to prove a cache-turbo HIT answers Range identically to
+                a MISS. Writes a complete response; caller returns after."""
+                # Fixed (not gen-N-prefixed) body: this marker drives a
+                # byte-for-byte comparison between a HIT's Range answer and
+                # a MISS's Range answer against a DIFFERENT URL, so the
+                # body must not depend on which request/URL produced it.
+                rbody = b"R" * 200
+                # This branch returns before the shared Cache-Control marker
+                # block below (:813), so a /rngsrc/ key can never pick up the
+                # "sieserve" stale-if-error marker the way other locations do.
+                # rngsie emits it HERE instead, so one key can be both
+                # Range-capable and serve-on-error armed -- the fixture
+                # test_range_on_sie_serve needs, because allow_ranges is set
+                # in restore_response(), which the SIE header-filter path
+                # shares with the live HIT path.
+                sie = "rngsie" in self.path
+                # Same reason as rngsie: the shared "cond" validator block
+                # (:835) is below this branch's return, so an rngsrc key can
+                # never carry an ETag. rngcond emits one here so a
+                # Range-capable entry can also be revalidated -- the fixture
+                # test_range_not_offered_on_304 needs to reach the 304 branch
+                # that module.c:6563 deliberately excludes from allow_ranges.
+                cond = "rngcond" in self.path
+                rng = self.headers.get("Range")
+                start, end = 0, len(rbody) - 1
+                partial = False
+                if rng and rng.startswith("bytes="):
+                    try:
+                        s, e = rng[len("bytes="):].split("-", 1)
+                        if not s:
+                            # Suffix range "bytes=-N" = the LAST N bytes,
+                            # not the first N. Getting this wrong would
+                            # silently mis-slice for any future test that
+                            # reuses this origin with a suffix range.
+                            start = max(0, len(rbody) - int(e))
+                            end = len(rbody) - 1
+                        else:
+                            start = int(s)
+                            end = int(e) if e else len(rbody) - 1
+                        end = min(end, len(rbody) - 1)
+                        partial = start <= end
+                    except ValueError:
+                        partial = False
+                if partial:
+                    chunk = rbody[start:end + 1]
+                    self.send_response(206)
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("Accept-Ranges", "bytes")
+                    self.send_header("Content-Range",
+                                      f"bytes {start}-{end}/{len(rbody)}")
+                    if sie:
+                        self.send_header("Cache-Control",
+                                         "stale-if-error=30")
+                    if cond:
+                        self.send_header("ETag", '"rngetag"')
+                    self.send_header("Content-Length", str(len(chunk)))
+                    self.end_headers()
+                    try:
+                        self.wfile.write(chunk)
+                    except BrokenPipeError:
+                        pass
+                else:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("Accept-Ranges", "bytes")
+                    if sie:
+                        self.send_header("Cache-Control",
+                                         "stale-if-error=30")
+                    if cond:
+                        self.send_header("ETag", '"rngetag"')
+                    self.send_header("Content-Length", str(len(rbody)))
+                    self.end_headers()
+                    try:
+                        self.wfile.write(rbody)
+                    except BrokenPipeError:
+                        pass
+
+            def _get_handle_special_cases(self, n: int) -> tuple[bool, bytes | None]:
+                """Marker-driven special-case responses (ctxrdr-missing,
+                partial, rngsrc, redir, notfound, bigbody, unbuf-stream,
+                unbuf-big, ckecho) plus the midbody-mismatch body computation.
+                Returns (True, None) if a complete response was written
+                (caller must stop), or (False, body) with the body for the
+                common 200 path to send."""
                 # CTXRDR: a 404 the vhost turns into an `error_page` internal
                 # redirect. Unlike try_files (which redirects during the REWRITE
                 # phase, before our PRECONTENT access handler has ever run), an
@@ -258,7 +344,7 @@ class Origin:
                     self.send_header("Content-Type", "text/plain")
                     self.send_header("Content-Length", "0")
                     self.end_headers()
-                    return
+                    return True, None
                 # 206 Partial Content must NEVER be cached (the key has no Range,
                 # so a stored partial could be replayed for a different/whole
                 # range). The module refuses it even with a per-status TTL.
@@ -273,7 +359,7 @@ class Origin:
                         self.wfile.write(body)
                     except BrokenPipeError:
                         pass
-                    return
+                    return True, None
                 # AUD-RANGE1: a real Range-capable origin (e.g. a static file
                 # server) that both advertises Accept-Ranges: bytes AND honours
                 # an incoming Range header with a genuine 206 + Content-Range +
@@ -281,88 +367,15 @@ class Origin:
                 # true partial slice, not the whole response. Used to prove a
                 # cache-turbo HIT answers Range identically to a MISS.
                 if "rngsrc" in self.path:
-                    # Fixed (not gen-N-prefixed) body: this marker drives a
-                    # byte-for-byte comparison between a HIT's Range answer and
-                    # a MISS's Range answer against a DIFFERENT URL, so the
-                    # body must not depend on which request/URL produced it.
-                    rbody = b"R" * 200
-                    # This branch returns before the shared Cache-Control marker
-                    # block below (:813), so a /rngsrc/ key can never pick up the
-                    # "sieserve" stale-if-error marker the way other locations do.
-                    # rngsie emits it HERE instead, so one key can be both
-                    # Range-capable and serve-on-error armed -- the fixture
-                    # test_range_on_sie_serve needs, because allow_ranges is set
-                    # in restore_response(), which the SIE header-filter path
-                    # shares with the live HIT path.
-                    sie = "rngsie" in self.path
-                    # Same reason as rngsie: the shared "cond" validator block
-                    # (:835) is below this branch's return, so an rngsrc key can
-                    # never carry an ETag. rngcond emits one here so a
-                    # Range-capable entry can also be revalidated -- the fixture
-                    # test_range_not_offered_on_304 needs to reach the 304 branch
-                    # that module.c:6563 deliberately excludes from allow_ranges.
-                    cond = "rngcond" in self.path
-                    rng = self.headers.get("Range")
-                    start, end = 0, len(rbody) - 1
-                    partial = False
-                    if rng and rng.startswith("bytes="):
-                        try:
-                            s, e = rng[len("bytes="):].split("-", 1)
-                            if not s:
-                                # Suffix range "bytes=-N" = the LAST N bytes,
-                                # not the first N. Getting this wrong would
-                                # silently mis-slice for any future test that
-                                # reuses this origin with a suffix range.
-                                start = max(0, len(rbody) - int(e))
-                                end = len(rbody) - 1
-                            else:
-                                start = int(s)
-                                end = int(e) if e else len(rbody) - 1
-                            end = min(end, len(rbody) - 1)
-                            partial = start <= end
-                        except ValueError:
-                            partial = False
-                    if partial:
-                        chunk = rbody[start:end + 1]
-                        self.send_response(206)
-                        self.send_header("Content-Type", "text/plain")
-                        self.send_header("Accept-Ranges", "bytes")
-                        self.send_header("Content-Range",
-                                          f"bytes {start}-{end}/{len(rbody)}")
-                        if sie:
-                            self.send_header("Cache-Control",
-                                             "stale-if-error=30")
-                        if cond:
-                            self.send_header("ETag", '"rngetag"')
-                        self.send_header("Content-Length", str(len(chunk)))
-                        self.end_headers()
-                        try:
-                            self.wfile.write(chunk)
-                        except BrokenPipeError:
-                            pass
-                    else:
-                        self.send_response(200)
-                        self.send_header("Content-Type", "text/plain")
-                        self.send_header("Accept-Ranges", "bytes")
-                        if sie:
-                            self.send_header("Cache-Control",
-                                             "stale-if-error=30")
-                        if cond:
-                            self.send_header("ETag", '"rngetag"')
-                        self.send_header("Content-Length", str(len(rbody)))
-                        self.end_headers()
-                        try:
-                            self.wfile.write(rbody)
-                        except BrokenPipeError:
-                            pass
-                    return
+                    self._get_handle_rngsrc()
+                    return True, None
                 # Per-status caching markers (v6): redirects + negative responses.
                 if "redir" in self.path:
                     self.send_response(301)
                     self.send_header("Location", f"/dest-{n}")
                     self.send_header("Content-Length", "0")
                     self.end_headers()
-                    return
+                    return True, None
                 if "notfound" in self.path:
                     body = f"missing-{n}\n".encode()
                     self.send_response(404)
@@ -373,7 +386,7 @@ class Origin:
                         self.wfile.write(body)
                     except BrokenPipeError:
                         pass
-                    return
+                    return True, None
                 if "bigbody" in self.path:
                     # ~200 KB body so nginx streams it to our body filter in
                     # several buffers/calls -> exercises the Q2 mid-stream
@@ -390,7 +403,7 @@ class Origin:
                         self.wfile.write(body)
                     except BrokenPipeError:
                         pass
-                    return
+                    return True, None
                 if "unbuf-stream" in self.path:
                     # UNBUF: streamed multi-call capture on the SUCCESS path
                     # (the "sieserve-unbuf" marker above only fires under
@@ -416,7 +429,7 @@ class Origin:
                             time.sleep(0.02)
                     except BrokenPipeError:
                         pass
-                    return
+                    return True, None
                 if "unbuf-big" in self.path:
                     # UNBUF oversize: same streamed-chunk shape as
                     # unbuf-stream, but ~64 KiB total against a small
@@ -439,7 +452,7 @@ class Origin:
                             time.sleep(0.02)
                     except BrokenPipeError:
                         pass
-                    return
+                    return True, None
                 if "ckecho" in self.path:
                     # B-S4: echo the received Cookie header so a test can prove a
                     # warm subrequest reaches the origin ANONYMOUSLY (with none of
@@ -454,7 +467,7 @@ class Origin:
                         self.wfile.write(body)
                     except BrokenPipeError:
                         pass
-                    return
+                    return True, None
                 if "midbody-mismatch" in self.path:
                     # S231-SIE-MIDBODY framing test: a body deliberately a
                     # DIFFERENT length than the already-primed snapshot for
@@ -468,9 +481,11 @@ class Origin:
                     body = f"gen-{n}-mismatch-longer-body\n".encode()
                 else:
                     body = f"gen-{n}\n".encode()
-                self.send_response(200)
-                self.send_header("Content-Type",
-                                 "application/json; charset=utf-8")
+                return False, body
+
+            def _get_send_common_status_headers(self, n: int) -> None:
+                """Decorate the shared 200 response: X-Backend/X-GraphQL echo
+                headers, per-status Set-Cookie/Surrogate-Key markers."""
                 if "bare" not in self.path:
                     self.send_header("X-Backend", "origin-42")
                 # Same request-echo contract as do_POST: a test drives the
@@ -512,6 +527,11 @@ class Origin:
                     # be stored and replayed on every HIT, or a CDN refilling
                     # from our hit caches an object outside its tag purge.
                     self.send_header("Surrogate-Key", "origin-a origin-b")
+
+            def _get_send_cache_control_headers(self) -> None:
+                """Decorate the shared 200 response with the Cache-Control /
+                CDN-Cache-Control / Surrogate-Control / Expires / ETag /
+                Last-Modified TTL-ladder markers."""
                 if "ccprivate" in self.path:
                     self.send_header("Cache-Control", "private, max-age=60")
                 if "ccnostore" in self.path:
@@ -655,10 +675,15 @@ class Origin:
                     self.send_header("ETag", '"v11etag"')
                     self.send_header("Last-Modified",
                                      "Wed, 21 Oct 2015 07:28:00 GMT")
-                # auto-Vary (v11 other half): emit a response Vary driven by a
-                # query marker so a test can prove the module splits (or refuses)
-                # by the named request header. The body is the global gen-N, so a
-                # new origin hit == a distinct body == a distinct variant slot.
+
+            def _get_send_vary_headers(self) -> None:
+                """Decorate the shared 200 response with auto-Vary markers.
+
+                (v11 other half): emit a response Vary driven by a query
+                marker so a test can prove the module splits (or refuses)
+                by the named request header. The body is the global gen-N, so
+                a new origin hit == a distinct body == a distinct variant
+                slot."""
                 if "v=ae" in self.path:
                     self.send_header("Vary", "Accept-Encoding")
                 if "v=ua" in self.path:
@@ -679,6 +704,28 @@ class Origin:
                 if "v=mix" in self.path:
                     # safe axis + refused axis: the refused one must win (no cache)
                     self.send_header("Vary", "Accept-Encoding, Cookie")
+
+            def do_GET(self):
+                if origin.delay:
+                    time.sleep(origin.delay)
+                with origin._lock:
+                    origin._n += 1
+                    n = origin._n
+                    origin._paths.append((time.time(), self.path))
+                    if len(origin._paths) > 64:        # ring: diagnostics only
+                        del origin._paths[:-64]
+                    origin._path_hits[self.path] += 1
+                if self._get_handle_hard_failure(n):
+                    return
+                handled, body = self._get_handle_special_cases(n)
+                if handled:
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type",
+                                 "application/json; charset=utf-8")
+                self._get_send_common_status_headers(n)
+                self._get_send_cache_control_headers()
+                self._get_send_vary_headers()
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 try:
