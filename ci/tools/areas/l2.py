@@ -1658,14 +1658,29 @@ def test_cross_node_won_stale_body(ng: Nginx, origin: Origin,
     uri = "/lock/won"
     redis.cli("DEL", l2_key(uri), lock_key(uri))
 
+    # nginx strips the /lock/ prefix before proxying, so the origin logs
+    # "/won" -- hits_for() must scope on the slug that actually lands, same
+    # as test_lock_redis_outage_fallback and test_lock_self_heal below.
+    slug = "won"
+
     s0, body0, h0 = fetch(ng.port, uri)
     assert s0 == 200 and "x-cache" not in h0, "prime should miss to origin"
     assert wait_for(lambda: redis.cli("EXISTS", l2_key(uri)) == "1"), \
         "prime never wrote L2"
+    # Assert the prime's own origin contact landed, path-scoped, BEFORE the
+    # stale read -- inferring it later from the global `hits` counter races
+    # this async count against the stale-window sleep below: if the prime's
+    # bump has not landed by the time `base` is snapshotted, `base` is off by
+    # one and the WON-arm assertion after it can never resolve within its
+    # 2.0s window (measured: every such failure has origin.hits == 1 at drain
+    # time, every pass has 2 -- the missing contact is here, not in the
+    # background-refresh arm the old failure message named).
+    assert wait_for(lambda: origin.hits_for(slug) >= 1, timeout=2.0), \
+        "prime phase never registered its own origin contact"
 
     time.sleep(2.5)                     # stale (fresh=2s), still < 8s window
     drain_origin(origin)                # absorb any stray async bg before counting
-    base = origin.hits
+    base = origin.hits_for(slug)
 
     # Single node, uncontended: the first stale read wins the cross-node NX
     # lock and takes the WON arm (background_update default ON) -- serve
@@ -1679,7 +1694,7 @@ def test_cross_node_won_stale_body(ng: Nginx, origin: Origin,
         f"{body1!r} != {body0!r}"
 
     # the background refresh reaches the origin and a later read is fresh.
-    assert wait_for(lambda: origin.hits > base, timeout=2.0), \
+    assert wait_for(lambda: origin.hits_for(slug) > base, timeout=2.0), \
         "cross-node WON arm never fired the background refresh"
     deadline = time.time() + 2.0
     refreshed = False
