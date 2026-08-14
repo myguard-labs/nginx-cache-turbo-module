@@ -521,8 +521,7 @@ ngx_http_cache_turbo_merge_basic(ngx_http_cache_turbo_loc_conf_t *conf,
  * min_uses) + the S8 scan-resistant flag, which must resolve before the band
  * block only insofar as it does not depend on it (kept in original order). */
 static void
-ngx_http_cache_turbo_merge_presets(ngx_conf_t *cf,
-    ngx_http_cache_turbo_loc_conf_t *conf,
+ngx_http_cache_turbo_merge_presets(ngx_http_cache_turbo_loc_conf_t *conf,
     ngx_http_cache_turbo_loc_conf_t *prev)
 {
     /*
@@ -588,8 +587,6 @@ ngx_http_cache_turbo_merge_presets(ngx_conf_t *cf,
         conf->min_uses = (conf->min_uses_raw == NGX_CONF_UNSET)
                           ? band->min_uses : conf->min_uses_raw;
     }
-
-    (void) cf;
 }
 
 /* Group 3: L2 negative memo, keep_stale, use_stale, and the circuit breaker's
@@ -719,11 +716,11 @@ ngx_http_cache_turbo_merge_cc_and_bypass(
                               NGX_HTTP_CACHE_TURBO_CC_RESPECT);
     conf->honor_cc  = (conf->cc_mode == NGX_HTTP_CACHE_TURBO_CC_HONOR);
     conf->ignore_cc = (conf->cc_mode == NGX_HTTP_CACHE_TURBO_CC_IGNORE);
-    /* S231-VARY: shipped default is ON. Off, the Vary: Cookie veto below
-     * (~:7918) never fires, so a response that varies per-user could be
-     * served to a different cookie on the stale-serve path -- the one
-     * privacy defect that path had. Explicit `cache_turbo_auto_vary off;`
-     * still disables it. */
+    /* S231-VARY: shipped default is ON. Off, the Vary: Cookie veto in
+     * ngx_http_cache_turbo_header_filter never fires, so a response that
+     * varies per-user could be served to a different cookie on the
+     * stale-serve path -- the one privacy defect that path had.
+     * Explicit `cache_turbo_auto_vary off;` still disables it. */
     ngx_conf_merge_value(conf->auto_vary, prev->auto_vary, 1);
 #if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
     && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
@@ -1075,7 +1072,7 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_http_cache_turbo_loc_conf_t  *conf = child;
 
     ngx_http_cache_turbo_merge_basic(conf, prev);
-    ngx_http_cache_turbo_merge_presets(cf, conf, prev);
+    ngx_http_cache_turbo_merge_presets(conf, prev);
     ngx_http_cache_turbo_merge_breaker(conf, prev);
     ngx_http_cache_turbo_merge_cc_and_bypass(conf, prev);
     ngx_http_cache_turbo_merge_zone_and_lock(conf, prev);
