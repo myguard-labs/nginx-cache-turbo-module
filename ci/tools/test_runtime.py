@@ -346,6 +346,7 @@ def run_all(ng: Nginx, origin: Origin,
         test_l2_unserveable_giveup_still_single_flights(ng, origin, redis)
         test_l2_tag_add_on_store(ng, origin, redis)
         test_l2_tag_truncation_warns(ng, origin, redis)
+        test_l2_tag_overlong_warns(ng, origin, redis)  # CR297-TAGLEN
         test_l2_tag_purge(ng, origin, redis)
         test_l2_tag_purge_large(ng, origin, redis)  # STAB-3 + PERF-1/2 pipeline
         test_l2_tag_purge_arg_validation(ng, origin, redis)  # AUD-TAG1

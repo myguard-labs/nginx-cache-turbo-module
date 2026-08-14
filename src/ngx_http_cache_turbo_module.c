@@ -10428,10 +10428,17 @@ ngx_http_cache_turbo_body_filter_store(ngx_http_request_t *r,
  * PERF-2: the tag value is upstream-controlled (e.g. an X-Cache-Tags header),
  * so without bounds a hostile/buggy origin could name thousands of tags and
  * make ONE response fire thousands of SADD connections. Cap the count, cap each
- * tag's length, and dedup so the same tag in one value is SADD'd once. */
+ * tag's length, and dedup so the same tag in one value is SADD'd once.
+ *
+ * CR297-TAGLEN: an over-long single tag is silently dropped here -- unlike the
+ * MAX_TAGS count cap (which the caller detects via the returned `*sp` cursor
+ * and warns on), a length drop still advances `s` past the whole token, so
+ * the caller's `s < e` check cannot see it: the entry becomes unpurgeable on
+ * that tag with no signal anywhere. Warn here, at the point the drop actually
+ * happens, naming the tag length and the limit. */
 static ngx_uint_t
-ngx_http_cache_turbo_body_filter_tag_split(u_char **sp, u_char *e,
-    ngx_str_t *seen)
+ngx_http_cache_turbo_body_filter_tag_split(ngx_http_request_t *r, u_char **sp,
+    u_char *e, ngx_str_t *seen)
 {
     u_char     *s = *sp, *tok;
     size_t      toklen;
@@ -10450,10 +10457,17 @@ ngx_http_cache_turbo_body_filter_tag_split(u_char **sp, u_char *e,
             s++;
         }
         toklen = (size_t) (s - tok);
-        if (toklen == 0
-            || toklen > NGX_HTTP_CACHE_TURBO_MAX_TAG_LEN)
-        {
-            continue;          /* empty or over-long: skip */
+        if (toklen == 0) {
+            continue;          /* empty: skip, nothing to warn about */
+        }
+        if (toklen > NGX_HTTP_CACHE_TURBO_MAX_TAG_LEN) {
+            ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                "cache_turbo: tag of length %uz for \"%V\" exceeds "
+                "NGX_HTTP_CACHE_TURBO_MAX_TAG_LEN=%ui -- this tag is NOT "
+                "indexed and a purge of it will NOT invalidate this entry",
+                toklen, &r->uri,
+                (ngx_uint_t) NGX_HTTP_CACHE_TURBO_MAX_TAG_LEN);
+            continue;          /* over-long: skip */
         }
 
         for (k = 0; k < ntags; k++) {   /* dedup within value */
@@ -10506,7 +10520,7 @@ ngx_http_cache_turbo_body_filter_tag_index(ngx_http_request_t *r,
     s = tagval.data;
     e = tagval.data + tagval.len;
 
-    ntags = ngx_http_cache_turbo_body_filter_tag_split(&s, e, seen);
+    ntags = ngx_http_cache_turbo_body_filter_tag_split(r, &s, e, seen);
 
     /* L9: index the whole deduped set in ONE pipelined op
      * (one pool, one connection, one round trip) rather than

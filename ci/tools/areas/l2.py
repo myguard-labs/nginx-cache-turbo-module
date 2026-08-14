@@ -1388,6 +1388,55 @@ def test_l2_tag_truncation_warns(ng: Nginx, origin: Origin,
     drain_origin(origin)
 
 
+def test_l2_tag_overlong_warns(ng: Nginx, origin: Origin,
+                               redis: RedisServer) -> None:
+    """CR297-TAGLEN: a single tag longer than MAX_TAG_LEN (128) is silently
+    dropped by _tag_split() -- unlike the MAX_TAGS count cap, this drop still
+    advances the tokeniser's cursor past the whole token, so the caller's
+    `s < e` count-cap check structurally cannot see it. The entry becomes
+    unpurgeable on that tag with no signal anywhere. This pins the warning
+    that makes the drop diagnosable, at the point it actually happens."""
+    logf = ng.root / "logs" / "error.log"
+
+    def log_text() -> str:
+        return (logf.read_text(encoding="utf-8", errors="replace")
+                if logf.exists() else "")
+
+    # A normal, well-within-limit tag alongside one long tag must NOT warn
+    # for the short tag and must NOT drop it.
+    before = len(log_text())
+    redis.cli("DEL", tag_key("short"))
+    fetch(ng.port, "/l2tcap/overlong-ok?t=short")
+    time.sleep(0.3)
+    new = log_text()[before:]
+    assert "exceeds NGX_HTTP_CACHE_TURBO_MAX_TAG_LEN" not in new, \
+        "a tag within the length limit must not warn"
+    assert wait_for(
+        lambda: redis.cli("SISMEMBER", tag_key("short"),
+                           l2_key("/l2tcap/overlong-ok")) == "1"), \
+        "in-limit tag must still be indexed"
+
+    # One tag of 129 bytes (one over MAX_TAG_LEN=128) -- silently dropped
+    # pre-fix, must now warn naming the length and the limit.
+    before = len(log_text())
+    long_tag = "y" * 129
+    redis.cli("DEL", tag_key(long_tag))
+    fetch(ng.port, f"/l2tcap/overlong-drop?t={long_tag}")
+    time.sleep(0.3)
+    new = log_text()[before:]
+    assert "exceeds NGX_HTTP_CACHE_TURBO_MAX_TAG_LEN=128" in new, \
+        ("a 129-byte tag exceeds the 128-byte MAX_TAG_LEN and is dropped -- "
+         "that must be logged, or the operator sees stale content with no "
+         "signal. Missing warning in:\n" + new[-800:])
+    assert "length 129" in new, \
+        "the warning must name the tag's own length, not just the limit"
+    assert "/l2tcap/overlong-drop" in new, \
+        "the warning must name the URI it dropped the tag for"
+    assert redis.cli("EXISTS", tag_key(long_tag)) == "0", \
+        "the over-long tag must not be indexed"
+    drain_origin(origin)
+
+
 def test_l2_tag_add_on_store(ng: Nginx, origin: Origin,
                              redis: RedisServer) -> None:
     """v2c: a tagged store SADDs the object's L2 key into every tag set named by
