@@ -2741,6 +2741,27 @@ extern ngx_http_cache_turbo_memcached_ka_t ngx_http_cache_turbo_memcached_ka;
 extern ngx_cache_turbo_backend_t  ngx_http_cache_turbo_redis_backend;
 extern ngx_cache_turbo_backend_t  ngx_http_cache_turbo_memcached_backend;
 
+/* Preset bands (v3-2): defined in ngx_http_cache_turbo_module.c, indexed by
+ * ngx_http_cache_turbo_loc_conf_t.preset. Shared with
+ * ngx_http_cache_turbo_conf.c's merge_loc_conf. */
+extern const ngx_http_cache_turbo_band_t  ngx_http_cache_turbo_bands[];
+
+/* Cross-file (MAINT-C1): ngx_http_cache_turbo_conf.c holds merge_loc_conf and
+ * the redis_conf/memcached_conf directive handlers, split out of
+ * ngx_http_cache_turbo_module.c for size. These were `static` in module.c and
+ * are now shared; new module.c call sites of breaker_should_consult /
+ * redis_build_ssl are unaffected -- only the storage class changed. */
+char *ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent,
+    void *child);
+char *ngx_http_cache_turbo_redis_conf(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
+char *ngx_http_cache_turbo_memcached_conf(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
+char *ngx_http_cache_turbo_redis_build_ssl(ngx_conf_t *cf,
+    ngx_http_cache_turbo_loc_conf_t *clcf);
+ngx_uint_t ngx_http_cache_turbo_breaker_should_consult(
+    ngx_http_cache_turbo_loc_conf_t *clcf);
+
 
 /* ---- module.c: response helpers shared with admin.c ---- */
 ngx_int_t ngx_http_cache_turbo_send_body(ngx_http_request_t *r,
