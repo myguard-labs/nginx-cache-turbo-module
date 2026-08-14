@@ -8886,100 +8886,102 @@ ngx_http_cache_turbo_breaker_action(ngx_uint_t state, ngx_uint_t has_body)
 /* UNIT-EXTRACT breaker-failure END */
 
 
-static ngx_int_t
-ngx_http_cache_turbo_header_filter(ngx_http_request_t *r)
+/* Stamp the TEST_FAULTS-only observability headers onto this response.
+ *
+ * `has_ctx` distinguishes the two call sites: the ctx==NULL/served early-return
+ * path may run with no module ctx at all, and the armings header is stamped
+ * only when a ctx exists (O4.4-i: a request that armed from L1 is frequently
+ * the one that then serves the snapshot, and the test must be able to read the
+ * counter off any response it makes). The remaining three read no ctx and are
+ * stamped unconditionally. In a production build the whole body compiles away
+ * and this is an empty function the compiler inlines to nothing. */
+static void
+ngx_http_cache_turbo_header_filter_test_headers(ngx_http_request_t *r,
+    ngx_uint_t has_ctx)
 {
-    ngx_http_cache_turbo_ctx_t       *ctx;
-    ngx_http_cache_turbo_loc_conf_t  *clcf;
-    ngx_int_t                         rc;
-
-    ctx = ngx_http_get_module_ctx(r, ngx_http_cache_turbo_module);
-
-    if (ctx == NULL || ctx->served) {
 #if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
     && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
-        /* O4.4-i: report the zone's arming count on cache-serve responses too.
-         * Stamped BEFORE this early-return because a request that armed from L1
-         * is frequently the one that then serves the snapshot, and the test must
-         * be able to read the counter off any response it makes. */
-        if (ctx != NULL) {
-            (void) ngx_http_cache_turbo_test_armings_header(r);
-        }
-        (void) ngx_http_cache_turbo_test_backoff_header(r);
-        (void) ngx_http_cache_turbo_test_arg_scan_header(r);
-        (void) ngx_http_cache_turbo_test_cookie_scan_header(r);
-#endif
-        return ngx_http_next_header_filter(r);
+    if (has_ctx) {
+        (void) ngx_http_cache_turbo_test_armings_header(r);
     }
-
-    clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
-
-#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
-    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
-    (void) ngx_http_cache_turbo_test_armings_header(r);
     (void) ngx_http_cache_turbo_test_backoff_header(r);
     (void) ngx_http_cache_turbo_test_arg_scan_header(r);
     (void) ngx_http_cache_turbo_test_cookie_scan_header(r);
+#else
+    (void) r;
+    (void) has_ctx;
 #endif
+}
 
-    /* P6/O4.2: feed this origin outcome into the per-zone circuit breaker.
-     *
-     * Placement matters in three ways:
-     *
-     * 1. AFTER the ctx->served early-return above, so only responses that
-     *    really came from the origin are recorded. A cache serve never reaches
-     *    here, and must not -- a breaker fed by its own cache hits would read a
-     *    dead origin as healthy for as long as the cache kept serving.
-     * 2. BEFORE the stale-if-error rewrite below, which overwrites
-     *    r->headers_out.status with the snapshot's 200. Recorded after it, the
-     *    origin's 502 would be counted as a success and the breaker could never
-     *    trip on exactly the outage it exists to handle.
-     * 3. OUTSIDE the `ctx->sie_armed` guard the SIE trigger sits behind. A cold
-     *    URL with no armed snapshot is precisely the case where the breaker
-     *    matters most, and those failures must count even though nothing
-     *    stale-serves them.
-     *
-     * O4.4: gated on breaker_should_consult() rather than the bare
-     * clcf->enable this used before the breaker had its own directives.
-     * threshold/window at their 0 defaults (or breaker_enable off, or the
-     * module itself disabled) make _breaker_record() inert (it returns before
-     * touching any window state), so this predicate simply makes that "no
-     * config can trip it" state explicit and skips the shm read entirely
-     * rather than paying it every response. Successes are recorded just as
-     * broadly as failures -- a breaker that only ever hears about failures
-     * can never close again.
-     *
-     * ⚠ NOT recorded at the autotune_record_cost() site the plan first named.
-     * That call lives inside the store block, behind ~10 cacheability gates
-     * (enable, not-HEAD, status_ttl >= 0, response_cacheable, require_hdr_ok,
-     * not-encoded, no_store predicates, ...). A healthy origin serving an
-     * uncacheable 200 would never record a success there, so a breaker tripped
-     * by a transient outage could never close. Success recording has to be at
-     * least as broad as failure recording, which is why both live here.
-     *
-     * ⚠ r->upstream is the load-bearing part of this condition, not decoration.
-     * !ctx->served proves we are not replaying a cached body; it does NOT prove
-     * the origin was ever contacted. This module generates 5xx locally: a
-     * request carrying `Cache-Control: only-if-cached` that finds nothing
-     * serveable is answered NGX_HTTP_GATEWAY_TIME_OUT straight from the access
-     * handler (module.c:4422 and :5002), with ctx allocated and ctx->served
-     * unset, having spoken to no upstream at all. Counting those would let a
-     * client trip a HEALTHY zone's breaker on demand simply by repeating a
-     * request header -- a remote denial of service against the origin's own
-     * traffic. Only a response with an upstream behind it carries information
-     * about whether the origin is up.
-     *
-     * ⚠ The threshold/window off-switch is now enforced entirely by
-     * should_consult(clcf) above -- should_record()'s own `threshold` argument
-     * is a legacy positional parameter kept for the unit slice, not a second
-     * independent gate. The reason this call must still be SKIPPED outright
-     * (rather than trusting _breaker_record() to be inert when off) is that
-     * _breaker_record() only checks the off-switch on its FAILURE path
-     * (shm.c:1297); the success path returns earlier at :1266 having already
-     * written breaker_fails = 0. Calling it unconditionally would therefore
-     * put a shared-memory write on every successful response even with the
-     * breaker disabled -- not the no-op this step is supposed to be.
-     * Skipping the call outright keeps "breaker off" genuinely free. */
+
+/* P6/O4.2: feed this origin outcome into the per-zone circuit breaker.
+ *
+ * Placement matters in three ways:
+ *
+ * 1. AFTER the ctx->served early-return above, so only responses that
+ *    really came from the origin are recorded. A cache serve never reaches
+ *    here, and must not -- a breaker fed by its own cache hits would read a
+ *    dead origin as healthy for as long as the cache kept serving.
+ * 2. BEFORE the stale-if-error rewrite below, which overwrites
+ *    r->headers_out.status with the snapshot's 200. Recorded after it, the
+ *    origin's 502 would be counted as a success and the breaker could never
+ *    trip on exactly the outage it exists to handle.
+ * 3. OUTSIDE the `ctx->sie_armed` guard the SIE trigger sits behind. A cold
+ *    URL with no armed snapshot is precisely the case where the breaker
+ *    matters most, and those failures must count even though nothing
+ *    stale-serves them.
+ *
+ * O4.4: gated on breaker_should_consult() rather than the bare
+ * clcf->enable this used before the breaker had its own directives.
+ * threshold/window at their 0 defaults (or breaker_enable off, or the
+ * module itself disabled) make _breaker_record() inert (it returns before
+ * touching any window state), so this predicate simply makes that "no
+ * config can trip it" state explicit and skips the shm read entirely
+ * rather than paying it every response. Successes are recorded just as
+ * broadly as failures -- a breaker that only ever hears about failures
+ * can never close again.
+ *
+ * ⚠ NOT recorded at the autotune_record_cost() site the plan first named.
+ * That call lives inside the store block, behind ~10 cacheability gates
+ * (enable, not-HEAD, status_ttl >= 0, response_cacheable, require_hdr_ok,
+ * not-encoded, no_store predicates, ...). A healthy origin serving an
+ * uncacheable 200 would never record a success there, so a breaker tripped
+ * by a transient outage could never close. Success recording has to be at
+ * least as broad as failure recording, which is why both live here.
+ *
+ * ⚠ r->upstream is the load-bearing part of this condition, not decoration.
+ * !ctx->served proves we are not replaying a cached body; it does NOT prove
+ * the origin was ever contacted. This module generates 5xx locally: a
+ * request carrying `Cache-Control: only-if-cached` that finds nothing
+ * serveable is answered NGX_HTTP_GATEWAY_TIME_OUT straight from the access
+ * handler (module.c:4422 and :5002), with ctx allocated and ctx->served
+ * unset, having spoken to no upstream at all. Counting those would let a
+ * client trip a HEALTHY zone's breaker on demand simply by repeating a
+ * request header -- a remote denial of service against the origin's own
+ * traffic. Only a response with an upstream behind it carries information
+ * about whether the origin is up.
+ *
+ * ⚠ The threshold/window off-switch is now enforced entirely by
+ * should_consult(clcf) above -- should_record()'s own `threshold` argument
+ * is a legacy positional parameter kept for the unit slice, not a second
+ * independent gate. The reason this call must still be SKIPPED outright
+ * (rather than trusting _breaker_record() to be inert when off) is that
+ * _breaker_record() only checks the off-switch on its FAILURE path
+ * (shm.c:1297); the success path returns earlier at :1266 having already
+ * written breaker_fails = 0. Calling it unconditionally would therefore
+ * put a shared-memory write on every successful response even with the
+ * breaker disabled -- not the no-op this step is supposed to be.
+ * Skipping the call outright keeps "breaker off" genuinely free.
+ *
+ * Extracted verbatim from the header filter; the caller must still invoke
+ * it at exactly that point in the sequence -- after the ctx->served
+ * early-return and before the stale-if-error rewrite -- for reasons 1-3
+ * above. It takes no lock of its own; _breaker_record() owns the zone
+ * mutex internally and nothing here holds it across the call. */
+static void
+ngx_http_cache_turbo_header_filter_record_breaker(ngx_http_request_t *r,
+    ngx_http_cache_turbo_ctx_t *ctx, ngx_http_cache_turbo_loc_conf_t *clcf)
+{
     if (ngx_http_cache_turbo_breaker_should_consult(clcf)
         && clcf->shm_zone != NULL
         && ngx_http_cache_turbo_breaker_should_record(
@@ -9023,12 +9025,30 @@ ngx_http_cache_turbo_header_filter(ngx_http_request_t *r)
             clcf->breaker_window,
             ctx->brk_probe);
     }
+}
 
-    /* RFC-2 stale-if-error: an armed serve-on-error snapshot + a status the
-     * configured `cache_turbo_use_stale` set names means replace the error with
-     * the stale copy. Do this BEFORE the capture gate so the (replaced) error is
-     * never captured, and clear any cold-miss stub we own so waiters do not
-     * block on a key we will not store. */
+
+/* RFC-2 stale-if-error: an armed serve-on-error snapshot + a status the
+ * configured `cache_turbo_use_stale` set names means replace the error with
+ * the stale copy. Do this BEFORE the capture gate so the (replaced) error is
+ * never captured, and clear any cold-miss stub we own so waiters do not
+ * block on a key we will not store.
+ *
+ * Returns, exactly mirroring the three outcomes of the inline block it
+ * replaces:
+ *   NGX_ERROR -- sie_rewrite() failed; the caller must return NGX_ERROR.
+ *   NGX_OK    -- the error WAS replaced by the snapshot; the caller must hand
+ *                off to the next header filter immediately and run none of the
+ *                remaining phases.
+ *   NGX_DECLINED -- no SIE serve happened (gate not met, or sie_rewrite()
+ *                returned neither OK nor ERROR); the caller continues into the
+ *                auto-Vary / capture phases as before. */
+static ngx_int_t
+ngx_http_cache_turbo_header_filter_try_sie(ngx_http_request_t *r,
+    ngx_http_cache_turbo_ctx_t *ctx, ngx_http_cache_turbo_loc_conf_t *clcf)
+{
+    ngx_int_t  rc;
+
     if (ctx->sie_armed && !ctx->sie_serving
         && ngx_http_cache_turbo_use_stale_triggers(clcf->use_stale,
                                                    r->headers_out.status))
@@ -9064,10 +9084,28 @@ ngx_http_cache_turbo_header_filter(ngx_http_request_t *r)
             ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                            "cache_turbo: STALE-IF-ERROR serve \"%V\" len=%uz",
                            &r->uri, ctx->sie_body_len);
-            return ngx_http_next_header_filter(r);
+            return NGX_OK;
         }
     }
 
+    return NGX_DECLINED;
+}
+
+
+/* Decide whether this response is captured for storage, and do the work that
+ * hangs off that decision: the auto-Vary classification that can veto capture,
+ * the cacheability gate itself, the warm-subrequest key build, the
+ * Surrogate-Key emission, and the cold-miss stub clear for the not-captured
+ * case.
+ *
+ * Returns void: the one early exit inside (a warm subrequest whose key could
+ * not be built) short-circuited straight to the next header filter in the
+ * original, and the caller forwards downstream unconditionally either way, so
+ * there is no outcome for the caller to branch on. */
+static void
+ngx_http_cache_turbo_header_filter_capture(ngx_http_request_t *r,
+    ngx_http_cache_turbo_ctx_t *ctx, ngx_http_cache_turbo_loc_conf_t *clcf)
+{
     /* auto-Vary (v11 other half): classify the response Vary header once. bits =
      * the safe-axis bitmask the body filter folds into the variant key + marker;
      * vary_nocache vetoes caching when the response varies on something the
@@ -9103,7 +9141,7 @@ ngx_http_cache_turbo_header_filter(ngx_http_request_t *r)
         if (ctx->warm
             && ngx_http_cache_turbo_build_key(r, clcf, ctx) != NGX_OK)
         {
-            return ngx_http_next_header_filter(r);
+            return;
         }
         ctx->captured = 1;
 
@@ -9129,6 +9167,45 @@ ngx_http_cache_turbo_header_filter(ngx_http_request_t *r)
                                         ctx->cold_owner);
         ctx->cold_stored = 1;
     }
+}
+
+
+/* MAINT-H1: this filter is a fixed SEQUENCE of independent phases, each
+ * extracted above into a named helper. The ordering between them is
+ * load-bearing (see each helper's own comment) but no phase reads state a
+ * later phase has not yet written, so the parent is a straight-line driver.
+ * Every phase takes (r, ctx, clcf) and returns to this one function for the
+ * hand-off to ngx_http_next_header_filter(), which stays here so there is
+ * exactly one downstream-forward site on the non-error path. */
+static ngx_int_t
+ngx_http_cache_turbo_header_filter(ngx_http_request_t *r)
+{
+    ngx_http_cache_turbo_ctx_t       *ctx;
+    ngx_http_cache_turbo_loc_conf_t  *clcf;
+
+    ctx = ngx_http_get_module_ctx(r, ngx_http_cache_turbo_module);
+
+    if (ctx == NULL || ctx->served) {
+        ngx_http_cache_turbo_header_filter_test_headers(r, ctx != NULL);
+        return ngx_http_next_header_filter(r);
+    }
+
+    clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
+
+    ngx_http_cache_turbo_header_filter_test_headers(r, 1);
+
+    ngx_http_cache_turbo_header_filter_record_breaker(r, ctx, clcf);
+
+    switch (ngx_http_cache_turbo_header_filter_try_sie(r, ctx, clcf)) {
+    case NGX_ERROR:
+        return NGX_ERROR;
+    case NGX_OK:
+        return ngx_http_next_header_filter(r);
+    default:
+        break;
+    }
+
+    ngx_http_cache_turbo_header_filter_capture(r, ctx, clcf);
 
     return ngx_http_next_header_filter(r);
 }
