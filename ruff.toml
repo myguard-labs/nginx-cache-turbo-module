@@ -1,0 +1,30 @@
+# Ruff configuration.
+#
+# The selected rule tiers live in .pre-commit-config.yaml and in the CI lint
+# step (F,B,I,PLE,RET,RUF059), not here -- this file only records the
+# exceptions those tiers cannot express, so widening a tier stays a one-place
+# edit.
+
+[lint.per-file-ignores]
+# The runtime suite is a package built on re-exports (MAINT-T1). The facade
+# star-imports every area module so that:
+#
+#   * run_all() can call each test by BARE NAME -- ci/tools/lint-orphan-tests.py
+#     only follows `ast.Call` whose func is an `ast.Name`, so a qualified
+#     `areas.core.test_foo(ng)` would be invisible to it and the reachability
+#     count would silently collapse.
+#   * every test stays reachable as `test_runtime.<name>` for
+#     ci/tools/run_named.py, which resolves names with `getattr(T, name)`.
+#
+# That design is what F403/F405 flag, so they are off for these files only.
+# The orphan lint is the real check here and it is stricter: it fails on a test
+# that no longer reaches run_all(), which is the failure F405 would only ever
+# hint at.
+"ci/tools/test_runtime.py" = ["F403", "F405"]
+"ci/tools/areas/*.py" = ["F403", "F405"]
+
+# test_runtime_base holds the stdlib imports the area modules consume THROUGH
+# the star-import above. Ruff does not follow re-exports, so it reports these as
+# unused; they are not, and deleting them breaks the suite at import time.
+# Verified used in ci/tools/areas/: concurrent, json, sys, tempfile, uuid.
+"ci/tools/test_runtime_base.py" = ["F401"]
