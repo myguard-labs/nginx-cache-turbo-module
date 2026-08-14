@@ -1056,7 +1056,7 @@ class Origin:
 # test logic). Re-exported here (not via `import *`) so the area modules'
 # `from test_runtime_base import *` chain keeps resolving the bare name --
 # star-import does not chain transitively through this module.
-from nginx_config import (  # noqa: F401  (re-exported for the areas)
+from nginx_config import (  # re-exported for the areas; F401 via ruff.toml
     PORT_OFFSETS,
     _errlog_level,
     nginx_config,
