@@ -1048,17 +1048,13 @@ ngx_http_cache_turbo_merge_key_and_tag(ngx_conf_t *cf,
     return NGX_CONF_OK;
 }
 
-/* Group 8: L2 backend selection + connection knobs, identity/credential
- * inherit-or-replace, SSL context build, vtable resolution, and the
- * tag-without-Redis warning. Must run after Group 5 (shm_zone/key) and
- * before nothing else depends on it within merge_loc_conf. */
-static char *
-ngx_http_cache_turbo_merge_l2_backend(ngx_conf_t *cf,
+/* Merge L2 connection knobs: redis_enable, memcached, timeouts, keepalive.
+ * CCN 1: pure linear merge sequence. */
+static void
+ngx_http_cache_turbo_merge_l2_connknobs(
     ngx_http_cache_turbo_loc_conf_t *conf,
     ngx_http_cache_turbo_loc_conf_t *prev)
 {
-    /* L2 backend selection + connection knobs. These are behavioural tunables,
-     * not backend identity, so they inherit independently as before. */
     ngx_conf_merge_value(conf->redis_enable, prev->redis_enable, 0);
     ngx_conf_merge_value(conf->memcached, prev->memcached, 0);
     ngx_conf_merge_msec_value(conf->redis_timeout, prev->redis_timeout, 250);
@@ -1084,7 +1080,17 @@ ngx_http_cache_turbo_merge_l2_backend(ngx_conf_t *cf,
     ngx_conf_merge_value(conf->memcached_keepalive, prev->memcached_keepalive, 0);
     ngx_conf_merge_msec_value(conf->memcached_keepalive_timeout,
                               prev->memcached_keepalive_timeout, 60000);
+}
 
+
+/* Merge Redis address and identity fields. Own backend (redis_addr set) takes
+ * prefix + credentials from self; inherited backend takes all from parent.
+ * CCN 1: single if-else with no nested branches. */
+static void
+ngx_http_cache_turbo_merge_l2_backend_identity(
+    ngx_http_cache_turbo_loc_conf_t *conf,
+    ngx_http_cache_turbo_loc_conf_t *prev)
+{
     if (conf->redis_addr.sockaddr != NULL) {
         /* COR-6: this block ran its own cache_turbo_redis — a complete backend
          * in its own right (address set at parse). Treat its identity /
@@ -1133,7 +1139,16 @@ ngx_http_cache_turbo_merge_l2_backend(ngx_conf_t *cf,
         conf->redis_ssl = prev->redis_ssl;   /* reuse parent's built context */
 #endif
     }
+}
 
+
+/* Build Redis TLS context after identity merge completes. Runs after
+ * merge_l2_backend_identity so redis_tls/tls_verify/tls_ca are resolved.
+ * CCN 2: check NGX_SSL guard, check redis_enable/redis_tls/redis_ssl conditions. */
+static char *
+ngx_http_cache_turbo_merge_l2_backend_tls(ngx_conf_t *cf,
+    ngx_http_cache_turbo_loc_conf_t *conf)
+{
 #if (NGX_SSL)
     /* COR-6: build the client TLS context HERE, after redis_tls / tls_verify /
      * tls_ca are fully resolved — not at directive-parse time, when a tls=on
@@ -1154,6 +1169,16 @@ ngx_http_cache_turbo_merge_l2_backend(ngx_conf_t *cf,
     }
 #endif
 
+    return NGX_CONF_OK;
+}
+
+
+/* Resolve backend vtables: l1 (always set) and backend (conditional on
+ * redis_enable + memcached). CCN 1: single assignment sequence. */
+static void
+ngx_http_cache_turbo_merge_l2_backend_vtables(
+    ngx_http_cache_turbo_loc_conf_t *conf)
+{
     /* Resolve the backend vtables (v4-1). l1 is a stateless dispatch table, so
      * it is always wired (the zone is an argument, not driver state). backend is
      * the remote L2 driver, present only when cache_turbo_redis was configured;
@@ -1164,7 +1189,16 @@ ngx_http_cache_turbo_merge_l2_backend(ngx_conf_t *cf,
                                ? &ngx_http_cache_turbo_memcached_backend
                                : &ngx_http_cache_turbo_redis_backend)
                         : NULL;
+}
 
+
+/* Warn if cache_turbo_tag is set but the L2 backend cannot index tags.
+ * Runs after merge_l2_backend_vtables so conf->backend is resolved.
+ * CCN 2: check tag != NULL, check surrogate_key, check backend availability. */
+static void
+ngx_http_cache_turbo_check_l2_tag_usage(ngx_conf_t *cf,
+    ngx_http_cache_turbo_loc_conf_t *conf)
+{
     /* COR-0: the tag INDEX (purge-by-tag) lives only in a Redis L2 (the memcached
      * backend has no atomic tag set: tag_add == NULL). A cache_turbo_tag with no L2,
      * or with the memcached backend, cannot be purged by tag — warn at config time
@@ -1183,6 +1217,30 @@ ngx_http_cache_turbo_merge_l2_backend(ngx_conf_t *cf,
             "(cache_turbo_surrogate_key still emits the tags downstream)",
             conf->backend == NULL ? "no L2 backend" : "the memcached backend");
     }
+}
+
+
+/* Group 8: L2 backend selection + connection knobs, identity/credential
+ * inherit-or-replace, SSL context build, vtable resolution, and the
+ * tag-without-Redis warning. Must run after Group 5 (shm_zone/key) and
+ * before nothing else depends on it within merge_loc_conf.
+ *
+ * Decomposed into ordered helpers: connknobs → identity → tls → vtables → tag.
+ * Ordering is critical (tls runs after identity, vtables before tag check). */
+static char *
+ngx_http_cache_turbo_merge_l2_backend(ngx_conf_t *cf,
+    ngx_http_cache_turbo_loc_conf_t *conf,
+    ngx_http_cache_turbo_loc_conf_t *prev)
+{
+    ngx_http_cache_turbo_merge_l2_connknobs(conf, prev);
+    ngx_http_cache_turbo_merge_l2_backend_identity(conf, prev);
+
+    if (ngx_http_cache_turbo_merge_l2_backend_tls(cf, conf) != NGX_CONF_OK) {
+        return NGX_CONF_ERROR;
+    }
+
+    ngx_http_cache_turbo_merge_l2_backend_vtables(conf);
+    ngx_http_cache_turbo_check_l2_tag_usage(cf, conf);
 
     return NGX_CONF_OK;
 }
