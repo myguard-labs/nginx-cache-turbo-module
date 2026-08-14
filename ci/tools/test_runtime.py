@@ -125,6 +125,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_memcached_keepalive_cap_rejected(ng)
     test_memcached_keepalive_timeout_invalid_rejected(ng)
     test_redis_timeout_zero_rejected(ng)                     # S231-L2-TIMEOUT0
+    test_redis_param_reject_keeps_own_diagnostic(ng)         # MAINT-C1b
     test_memcached_timeout_zero_rejected(ng)                 # S231-L2-TIMEOUT0
     test_redis_connect_backoff_config_parse(ng)               # S231-L2-BACKOFF
     test_redis_connect_backoff_fails_fast(ng, origin)          # S231-L2-BACKOFF

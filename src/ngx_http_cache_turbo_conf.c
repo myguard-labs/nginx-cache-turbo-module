@@ -193,7 +193,15 @@ ngx_http_cache_turbo_redis_resolve(ngx_conf_t *cf,
  * parameter name did not match any literal I test" so the caller can try
  * the next handler in the chain, preserving the original single-loop's
  * left-to-right literal match order across the split. */
-#define NGX_HTTP_CACHE_TURBO_PARAM_NOMATCH  ((char *) -1)
+/* ⚠ Must NOT alias NGX_CONF_ERROR, which nginx defines as (void *) -1: a
+ * handler that REJECTS a parameter it did own (bad timeout=, prefix=,
+ * keepalive=, db=) returns NGX_CONF_ERROR, and a (char *) -1 sentinel would
+ * make the dispatcher read that rejection as "no match" and fall through to
+ * the next handler, replacing the specific diagnostic with the generic
+ * "invalid parameter". A unique object address collides with nothing. */
+static char  ngx_http_cache_turbo_param_nomatch_obj;
+#define NGX_HTTP_CACHE_TURBO_PARAM_NOMATCH \
+    (&ngx_http_cache_turbo_param_nomatch_obj)
 
 /* First third of the trailing "name=value" parameters, in the same order the
  * original loop tested them: prefix, timeout, keepalive. */

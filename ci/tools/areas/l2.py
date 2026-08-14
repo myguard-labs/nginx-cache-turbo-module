@@ -16,10 +16,57 @@ from test_runtime_base import (
     _admin_lock_waits,
     _backoff_skips,
     _bump_conn,
+    _config_test_result,
     _errlog_window_start,
     _fetch_keepalive,
     _redis_conns_received,
 )
+
+
+def test_redis_param_reject_keeps_own_diagnostic(ng: Nginx) -> None:
+    """MAINT-C1b regression: a REJECTED redis parameter must keep its own
+    config-time diagnostic.
+
+    cache_turbo_redis's trailing-parameter chain is split across several
+    handlers that pass an unmatched name down the chain via a NOMATCH
+    sentinel. If that sentinel aliases NGX_CONF_ERROR -- which nginx defines
+    as (void *) -1, so a `(char *) -1` sentinel DOES alias it -- then a
+    handler that owned the parameter and rejected its VALUE is misread by the
+    dispatcher as "I did not match this name". The parameter then falls
+    through to the last handler in the chain, whose else-branch replaces the
+    specific message with the generic "invalid parameter".
+
+    ⚠ The oracle is the ABSENCE of the generic message, not the presence of
+    the specific one. Measured against a deliberately-broken build: the owning
+    handler logs its diagnostic and THEN returns, so the specific message is
+    still emitted; the sentinel collision merely appends a second, bogus
+    "invalid parameter" line before the config test fails. A returncode check
+    passes on both builds, and so does a substring check for the specific
+    message -- which is exactly why the pre-existing
+    test_redis_timeout_zero_rejected stayed green through this regression.
+    """
+    for bad, want in (
+        ("timeout=0", "timeout must be > 0"),
+        ("db=-1", "bad db"),
+        ("keepalive=-1", "bad keepalive"),
+    ):
+        def mutate(cfg: str, bad: str = bad) -> str:
+            marker = "cache_turbo_redis 127.0.0.1:"
+            i = cfg.index(marker)
+            end = cfg.index(";", i)
+            return cfg[:end] + " " + bad + cfg[end:]
+
+        r = _config_test_result(ng, mutate)
+        assert r.returncode != 0, \
+            f"cache_turbo_redis {bad} was ACCEPTED by nginx -t:\n{r.stdout}"
+        assert want in r.stdout, (
+            f"cache_turbo_redis {bad}: the owning handler's diagnostic "
+            f"({want!r}) is missing entirely:\n{r.stdout}")
+        assert "invalid parameter" not in r.stdout, (
+            f"cache_turbo_redis {bad}: a rejected value ALSO produced the "
+            f"generic \"invalid parameter\" error -- the handler's "
+            f"NGX_CONF_ERROR was misread as the NOMATCH sentinel and fell "
+            f"through the rest of the parameter chain:\n{r.stdout}")
 
 
 def test_redis_tls_untrusted_ca_rejected(
