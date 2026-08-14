@@ -116,9 +116,30 @@ mapfile -t KNOWN < <(grep -rhE '^id:[[:space:]]*' ci/ast-grep/rules/ \
                      | sed -E 's/^id:[[:space:]]*//; s/[[:space:]]*$//' | sort -u)
 [ "${#KNOWN[@]}" -gt 0 ] || die "no rule ids under ci/ast-grep/rules/ -- ruleset empty or unported"
 
+# Membership is tested in-process, NOT via `printf ... | grep -qx`.
+#
+# `grep -q` exits on its FIRST match and closes the read end. The printf
+# builtin can still be mid-write, and on some bash builds that write fails with
+# EPIPE, printing "printf: write error: Broken pipe" AND returning non-zero for
+# the pipeline -- whereupon the `||` reads a successful match as "no match" and
+# condemns a rule that plainly exists.
+#
+# Observed 2026-08-14: `Lint / Linters` red with
+#   line 121: printf: write error: Broken pipe
+#   ERROR: PROMOTED names no rule defines: c-format-string
+# while c-format-string.yml has been present and correctly `id:`-tagged since
+# d085d68. It reproduced ONLY on the runner -- the same SHA went green on one
+# dispatch run and red on another, and never locally -- because whether the
+# write races the close depends on bash version and scheduling, not on source.
+# A verdict that flips on pipe timing is not a verdict, so the pipe is gone:
+# the loop below cannot fail this way on any shell.
 unknown=""
 for r in "${PROMOTED[@]}"; do
-    printf '%s\n' "${KNOWN[@]}" | grep -qx "$r" || unknown="$unknown $r"
+    found=""
+    for k in "${KNOWN[@]}"; do
+        [ "$k" = "$r" ] && { found=1; break; }
+    done
+    [ -n "$found" ] || unknown="$unknown $r"
 done
 [ -z "$unknown" ] || die "PROMOTED names no rule defines:$unknown
        | ast-grep ignores an unknown --error= silently, so these gate NOTHING.
