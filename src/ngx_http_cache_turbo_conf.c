@@ -72,104 +72,102 @@ ngx_http_cache_turbo_check_l2_prefix(ngx_conf_t *cf, ngx_str_t *prefix,
 }
 
 
-/*
- * "cache_turbo_redis <dsn|host:port> [prefix=] [timeout=] [password=] [user=]
- *  [db=] [tls=on|off] [tls_verify=on|off] [tls_ca=<file>] [tls_name=<host>]
- *  [scan_deadline=];"
- *
- * The DSN is redis://[user:pass@]host:port/db ; rediss:// selects TLS. Bare
- * host:port still works (legacy). Trailing params override whatever the DSN
- * carried. The address is resolved at config time; settable at http/server/
- * location level and merged down, so a whole http{} block can share one L2.
+/* MAINT-C1b: ngx_http_cache_turbo_redis_conf decomposition. ⚠ ORDER- AND
+ * PRECEDENCE-SENSITIVE: each helper below runs in the exact same relative
+ * order the original single function ran its statements in (DSN split ->
+ * host:port resolve -> trailing-param loop, each param literal tested in
+ * the same sequence, each error string unchanged verbatim) — a config-time
+ * error message is part of the directive's contract, and a DSN userinfo/db
+ * would be silently overridden by a differently-ordered trailing param.
+ * Do not reorder the calls in ngx_http_cache_turbo_redis_conf().
  */
-char *
-ngx_http_cache_turbo_redis_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+
+/* Split the DSN into scheme (-> redis_tls), userinfo (-> redis_user/password),
+ * db (-> redis_db) and the bare host:port left in *hostport for the resolver.
+ * Bare "host:port" (no scheme) is legacy syntax: hostport is left == *arg1
+ * and every optional piece stays untouched. */
+static char *
+ngx_http_cache_turbo_redis_split_dsn(ngx_conf_t *cf,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_str_t *arg1,
+    ngx_str_t *hostport)
 {
-    ngx_http_cache_turbo_loc_conf_t  *clcf = conf;
+    u_char  *rest, *last, *at, *slash, *colon;
 
-    ngx_str_t   *value, s, hostport, arg1;
-    ngx_url_t    u;
-    ngx_uint_t   i;
-    ngx_int_t    t;
-    u_char      *rest, *last, *at, *slash, *colon;
+    *hostport = *arg1;
 
-    value = cf->args->elts;
-    arg1 = value[1];
-
-    if (clcf->memcached == 1) {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-            "cache_turbo_redis: an L2 backend (cache_turbo_memcached) is already "
-            "configured in this block; the two are mutually exclusive");
-        return NGX_CONF_ERROR;
-    }
-
-    /* --- 1. split the DSN (scheme / userinfo / host:port / db) ------------- */
-    hostport = arg1;
-
-    if (arg1.len > sizeof("rediss://") - 1
-        && ngx_strncasecmp(arg1.data, (u_char *) "rediss://",
+    if (arg1->len > sizeof("rediss://") - 1
+        && ngx_strncasecmp(arg1->data, (u_char *) "rediss://",
                            sizeof("rediss://") - 1) == 0)
     {
         clcf->redis_tls = 1;
-        rest = arg1.data + sizeof("rediss://") - 1;
+        rest = arg1->data + sizeof("rediss://") - 1;
 
-    } else if (arg1.len > sizeof("redis://") - 1
-               && ngx_strncasecmp(arg1.data, (u_char *) "redis://",
+    } else if (arg1->len > sizeof("redis://") - 1
+               && ngx_strncasecmp(arg1->data, (u_char *) "redis://",
                                   sizeof("redis://") - 1) == 0)
     {
-        rest = arg1.data + sizeof("redis://") - 1;
+        rest = arg1->data + sizeof("redis://") - 1;
 
     } else {
         rest = NULL;        /* bare host:port */
     }
 
-    if (rest != NULL) {
-        last = arg1.data + arg1.len;
-
-        at = ngx_strlchr(rest, last, '@');
-        if (at != NULL) {
-            colon = ngx_strlchr(rest, at, ':');
-            if (colon != NULL) {
-                clcf->redis_user.data = rest;
-                clcf->redis_user.len = colon - rest;
-                clcf->redis_password.data = colon + 1;
-                clcf->redis_password.len = at - (colon + 1);
-            } else {
-                clcf->redis_user.data = rest;
-                clcf->redis_user.len = at - rest;
-            }
-            rest = at + 1;
-        }
-
-        slash = ngx_strlchr(rest, last, '/');
-        if (slash != NULL) {
-            if (last - (slash + 1) > 0) {
-                clcf->redis_db = ngx_atoi(slash + 1,
-                                          last - (slash + 1));
-                if (clcf->redis_db == NGX_ERROR || clcf->redis_db < 0) {
-                    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                        "cache_turbo_redis: bad db in DSN \"%V\"", &arg1);
-                    return NGX_CONF_ERROR;
-                }
-                if (clcf->redis_db > NGX_HTTP_CACHE_TURBO_REDIS_DB_MAX) {
-                    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                        "cache_turbo_redis: db in DSN \"%V\" exceeds the "
-                        "maximum %d", &arg1,
-                        NGX_HTTP_CACHE_TURBO_REDIS_DB_MAX);
-                    return NGX_CONF_ERROR;
-                }
-            }
-            hostport.data = rest;
-            hostport.len = slash - rest;
-        } else {
-            hostport.data = rest;
-            hostport.len = last - rest;
-        }
+    if (rest == NULL) {
+        return NGX_CONF_OK;
     }
 
-    /* --- 2. resolve the host:port ----------------------------------------- */
+    last = arg1->data + arg1->len;
+
+    at = ngx_strlchr(rest, last, '@');
+    if (at != NULL) {
+        colon = ngx_strlchr(rest, at, ':');
+        if (colon != NULL) {
+            clcf->redis_user.data = rest;
+            clcf->redis_user.len = colon - rest;
+            clcf->redis_password.data = colon + 1;
+            clcf->redis_password.len = at - (colon + 1);
+        } else {
+            clcf->redis_user.data = rest;
+            clcf->redis_user.len = at - rest;
+        }
+        rest = at + 1;
+    }
+
+    slash = ngx_strlchr(rest, last, '/');
+    if (slash != NULL) {
+        if (last - (slash + 1) > 0) {
+            clcf->redis_db = ngx_atoi(slash + 1, last - (slash + 1));
+            if (clcf->redis_db == NGX_ERROR || clcf->redis_db < 0) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                    "cache_turbo_redis: bad db in DSN \"%V\"", arg1);
+                return NGX_CONF_ERROR;
+            }
+            if (clcf->redis_db > NGX_HTTP_CACHE_TURBO_REDIS_DB_MAX) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                    "cache_turbo_redis: db in DSN \"%V\" exceeds the "
+                    "maximum %d", arg1, NGX_HTTP_CACHE_TURBO_REDIS_DB_MAX);
+                return NGX_CONF_ERROR;
+            }
+        }
+        hostport->data = rest;
+        hostport->len = slash - rest;
+    } else {
+        hostport->data = rest;
+        hostport->len = last - rest;
+    }
+
+    return NGX_CONF_OK;
+}
+
+/* Resolve the split-out host:port and set redis_addr/redis_host. */
+static char *
+ngx_http_cache_turbo_redis_resolve(ngx_conf_t *cf,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_str_t *hostport)
+{
+    ngx_url_t  u;
+
     ngx_memzero(&u, sizeof(ngx_url_t));
-    u.url = hostport;
+    u.url = *hostport;
     u.default_port = 6379;
 
     if (ngx_parse_url(cf->pool, &u) != NGX_OK) {
@@ -188,153 +186,289 @@ ngx_http_cache_turbo_redis_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     clcf->redis_addr = u.addrs[0];
     clcf->redis_host = u.host;        /* default SNI / verify name */
 
-    /* --- 3. trailing params override the DSN ------------------------------ */
-    for (i = 2; i < cf->args->nelts; i++) {
+    return NGX_CONF_OK;
+}
 
-        if (ngx_strncmp(value[i].data, "prefix=", 7) == 0) {
-            clcf->redis_prefix.data = value[i].data + 7;
-            clcf->redis_prefix.len = value[i].len - 7;
-            if (ngx_http_cache_turbo_check_l2_prefix(cf, &clcf->redis_prefix,
-                                                     "cache_turbo_redis")
-                != NGX_CONF_OK)
-            {
-                return NGX_CONF_ERROR;
-            }
+/* Sentinel: split_dsn/pool/tls param handlers return this to say "the
+ * parameter name did not match any literal I test" so the caller can try
+ * the next handler in the chain, preserving the original single-loop's
+ * left-to-right literal match order across the split. */
+/* ⚠ Must NOT alias NGX_CONF_ERROR, which nginx defines as (void *) -1: a
+ * handler that REJECTS a parameter it did own (bad timeout=, prefix=,
+ * keepalive=, db=) returns NGX_CONF_ERROR, and a (char *) -1 sentinel would
+ * make the dispatcher read that rejection as "no match" and fall through to
+ * the next handler, replacing the specific diagnostic with the generic
+ * "invalid parameter". A unique object address collides with nothing. */
+static char  ngx_http_cache_turbo_param_nomatch_obj;
+#define NGX_HTTP_CACHE_TURBO_PARAM_NOMATCH \
+    (&ngx_http_cache_turbo_param_nomatch_obj)
 
-        } else if (ngx_strncmp(value[i].data, "timeout=", 8) == 0) {
-            s.data = value[i].data + 8;
-            s.len = value[i].len - 8;
-            t = ngx_parse_time(&s, 0);   /* milliseconds */
-            if (t == NGX_ERROR) {
-                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                                   "cache_turbo_redis: bad timeout \"%V\"", &s);
-                return NGX_CONF_ERROR;
-            }
-            if (t == 0) {
-                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                                   "cache_turbo_redis: timeout must be > 0");
-                return NGX_CONF_ERROR;
-            }
-            clcf->redis_timeout = (ngx_msec_t) t;
+/* First third of the trailing "name=value" parameters, in the same order the
+ * original loop tested them: prefix, timeout, keepalive. */
+static char *
+ngx_http_cache_turbo_redis_param_pool_a(ngx_conf_t *cf,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_str_t *value)
+{
+    ngx_str_t  s;
+    ngx_int_t  t;
 
-        } else if (ngx_strncmp(value[i].data, "keepalive=", 10) == 0) {
-            clcf->redis_keepalive = ngx_atoi(value[i].data + 10,
-                                             value[i].len - 10);
-            if (clcf->redis_keepalive == NGX_ERROR
-                || clcf->redis_keepalive < 0)
-            {
-                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                    "cache_turbo_redis: bad keepalive \"%V\"", &value[i]);
-                return NGX_CONF_ERROR;
-            }
-            /* STAB-5: bound N so the pool's N*sizeof(item) alloc can't overflow. */
-            if (clcf->redis_keepalive > NGX_HTTP_CACHE_TURBO_KEEPALIVE_MAX) {
-                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                    "cache_turbo_redis: keepalive %V exceeds the maximum %d",
-                    &value[i], NGX_HTTP_CACHE_TURBO_KEEPALIVE_MAX);
-                return NGX_CONF_ERROR;
-            }
+    if (ngx_strncmp(value->data, "prefix=", 7) == 0) {
+        clcf->redis_prefix.data = value->data + 7;
+        clcf->redis_prefix.len = value->len - 7;
+        if (ngx_http_cache_turbo_check_l2_prefix(cf, &clcf->redis_prefix,
+                                                 "cache_turbo_redis")
+            != NGX_CONF_OK)
+        {
+            return NGX_CONF_ERROR;
+        }
 
-        } else if (ngx_strncmp(value[i].data, "keepalive_timeout=", 18) == 0) {
-            s.data = value[i].data + 18;
-            s.len = value[i].len - 18;
-            t = ngx_parse_time(&s, 0);   /* milliseconds */
-            if (t == NGX_ERROR) {
-                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                    "cache_turbo_redis: bad keepalive_timeout \"%V\"", &s);
-                return NGX_CONF_ERROR;
-            }
-            clcf->redis_keepalive_timeout = (ngx_msec_t) t;
+    } else if (ngx_strncmp(value->data, "timeout=", 8) == 0) {
+        s.data = value->data + 8;
+        s.len = value->len - 8;
+        t = ngx_parse_time(&s, 0);   /* milliseconds */
+        if (t == NGX_ERROR) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "cache_turbo_redis: bad timeout \"%V\"", &s);
+            return NGX_CONF_ERROR;
+        }
+        if (t == 0) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "cache_turbo_redis: timeout must be > 0");
+            return NGX_CONF_ERROR;
+        }
+        clcf->redis_timeout = (ngx_msec_t) t;
 
-        } else if (ngx_strncmp(value[i].data, "connect_backoff=", 16) == 0) {
-            s.data = value[i].data + 16;
-            s.len = value[i].len - 16;
-            t = ngx_parse_time(&s, 0);   /* milliseconds; 0 = disabled */
-            if (t == NGX_ERROR) {
-                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                    "cache_turbo_redis: bad connect_backoff \"%V\"", &s);
-                return NGX_CONF_ERROR;
-            }
-            clcf->redis_connect_backoff = (ngx_msec_t) t;
+    } else if (ngx_strncmp(value->data, "keepalive=", 10) == 0) {
+        clcf->redis_keepalive = ngx_atoi(value->data + 10, value->len - 10);
+        if (clcf->redis_keepalive == NGX_ERROR || clcf->redis_keepalive < 0) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                "cache_turbo_redis: bad keepalive \"%V\"", value);
+            return NGX_CONF_ERROR;
+        }
+        /* STAB-5: bound N so the pool's N*sizeof(item) alloc can't overflow. */
+        if (clcf->redis_keepalive > NGX_HTTP_CACHE_TURBO_KEEPALIVE_MAX) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                "cache_turbo_redis: keepalive %V exceeds the maximum %d",
+                value, NGX_HTTP_CACHE_TURBO_KEEPALIVE_MAX);
+            return NGX_CONF_ERROR;
+        }
 
-        } else if (ngx_strncmp(value[i].data, "password=", 9) == 0) {
-            clcf->redis_password.data = value[i].data + 9;
-            clcf->redis_password.len = value[i].len - 9;
+    } else {
+        return NGX_HTTP_CACHE_TURBO_PARAM_NOMATCH;
+    }
 
-        } else if (ngx_strncmp(value[i].data, "user=", 5) == 0) {
-            clcf->redis_user.data = value[i].data + 5;
-            clcf->redis_user.len = value[i].len - 5;
+    return NGX_CONF_OK;
+}
 
-        } else if (ngx_strncmp(value[i].data, "db=", 3) == 0) {
-            clcf->redis_db = ngx_atoi(value[i].data + 3, value[i].len - 3);
-            if (clcf->redis_db == NGX_ERROR || clcf->redis_db < 0) {
-                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                                   "cache_turbo_redis: bad db \"%V\"", &value[i]);
-                return NGX_CONF_ERROR;
-            }
-            if (clcf->redis_db > NGX_HTTP_CACHE_TURBO_REDIS_DB_MAX) {
-                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                                   "cache_turbo_redis: db \"%V\" exceeds the "
-                                   "maximum %d", &value[i],
-                                   NGX_HTTP_CACHE_TURBO_REDIS_DB_MAX);
-                return NGX_CONF_ERROR;
-            }
+/* Second third: keepalive_timeout, connect_backoff, password, user, db —
+ * tried only after param_pool_a reports no match. */
+static char *
+ngx_http_cache_turbo_redis_param_pool_b(ngx_conf_t *cf,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_str_t *value)
+{
+    ngx_str_t  s;
+    ngx_int_t  t;
 
-        } else if (ngx_strncmp(value[i].data, "tls=", 4) == 0) {
-            s.data = value[i].data + 4;
-            s.len = value[i].len - 4;
-            if (s.len == 2 && ngx_strncmp(s.data, "on", 2) == 0) {
-                clcf->redis_tls = 1;
-            } else if (s.len == 3 && ngx_strncmp(s.data, "off", 3) == 0) {
-                clcf->redis_tls = 0;
-            } else {
-                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                                   "cache_turbo_redis: tls must be on|off");
-                return NGX_CONF_ERROR;
-            }
+    if (ngx_strncmp(value->data, "keepalive_timeout=", 18) == 0) {
+        s.data = value->data + 18;
+        s.len = value->len - 18;
+        t = ngx_parse_time(&s, 0);   /* milliseconds */
+        if (t == NGX_ERROR) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                "cache_turbo_redis: bad keepalive_timeout \"%V\"", &s);
+            return NGX_CONF_ERROR;
+        }
+        clcf->redis_keepalive_timeout = (ngx_msec_t) t;
 
-        } else if (ngx_strncmp(value[i].data, "tls_verify=", 11) == 0) {
-            s.data = value[i].data + 11;
-            s.len = value[i].len - 11;
-            if (s.len == 2 && ngx_strncmp(s.data, "on", 2) == 0) {
-                clcf->redis_tls_verify = 1;
-            } else if (s.len == 3 && ngx_strncmp(s.data, "off", 3) == 0) {
-                clcf->redis_tls_verify = 0;
-            } else {
-                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                                   "cache_turbo_redis: tls_verify must be on|off");
-                return NGX_CONF_ERROR;
-            }
+    } else if (ngx_strncmp(value->data, "connect_backoff=", 16) == 0) {
+        s.data = value->data + 16;
+        s.len = value->len - 16;
+        t = ngx_parse_time(&s, 0);   /* milliseconds; 0 = disabled */
+        if (t == NGX_ERROR) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                "cache_turbo_redis: bad connect_backoff \"%V\"", &s);
+            return NGX_CONF_ERROR;
+        }
+        clcf->redis_connect_backoff = (ngx_msec_t) t;
 
-        } else if (ngx_strncmp(value[i].data, "tls_ca=", 7) == 0) {
-            clcf->redis_tls_ca.data = value[i].data + 7;
-            clcf->redis_tls_ca.len = value[i].len - 7;
+    } else if (ngx_strncmp(value->data, "password=", 9) == 0) {
+        clcf->redis_password.data = value->data + 9;
+        clcf->redis_password.len = value->len - 9;
 
-        } else if (ngx_strncmp(value[i].data, "tls_name=", 9) == 0) {
-            clcf->redis_tls_name.data = value[i].data + 9;
-            clcf->redis_tls_name.len = value[i].len - 9;
+    } else if (ngx_strncmp(value->data, "user=", 5) == 0) {
+        clcf->redis_user.data = value->data + 5;
+        clcf->redis_user.len = value->len - 5;
 
-        } else if (ngx_strncmp(value[i].data, "scan_deadline=", 14) == 0) {
-            /* S231-L2-SCANTIME: wall-clock ceiling on one all-purge SCAN walk,
-             * on top of the fixed SCAN_MAX_PAGES page cap. "0" disables it
-             * (page-cap-only, legacy behaviour) rather than being rejected
-             * like a zero connect timeout: the page cap alone is a legitimate,
-             * if generous, non-termination guard. */
-            s.data = value[i].data + 14;
-            s.len = value[i].len - 14;
-            t = ngx_parse_time(&s, 0);   /* milliseconds */
-            if (t == NGX_ERROR) {
-                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                    "cache_turbo_redis: bad scan_deadline \"%V\"", &s);
-                return NGX_CONF_ERROR;
-            }
-            clcf->redis_scan_deadline = (ngx_msec_t) t;
+    } else if (ngx_strncmp(value->data, "db=", 3) == 0) {
+        clcf->redis_db = ngx_atoi(value->data + 3, value->len - 3);
+        if (clcf->redis_db == NGX_ERROR || clcf->redis_db < 0) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "cache_turbo_redis: bad db \"%V\"", value);
+            return NGX_CONF_ERROR;
+        }
+        if (clcf->redis_db > NGX_HTTP_CACHE_TURBO_REDIS_DB_MAX) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "cache_turbo_redis: db \"%V\" exceeds the "
+                               "maximum %d", value,
+                               NGX_HTTP_CACHE_TURBO_REDIS_DB_MAX);
+            return NGX_CONF_ERROR;
+        }
 
+    } else {
+        return NGX_HTTP_CACHE_TURBO_PARAM_NOMATCH;
+    }
+
+    return NGX_CONF_OK;
+}
+
+/* First two-thirds: try param_pool_a then param_pool_b, in that order. */
+static char *
+ngx_http_cache_turbo_redis_param_pool(ngx_conf_t *cf,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_str_t *value)
+{
+    char  *rc;
+
+    rc = ngx_http_cache_turbo_redis_param_pool_a(cf, clcf, value);
+    if (rc != NGX_HTTP_CACHE_TURBO_PARAM_NOMATCH) {
+        return rc;
+    }
+
+    return ngx_http_cache_turbo_redis_param_pool_b(cf, clcf, value);
+}
+
+/* Second half: tls, tls_verify, tls_ca, tls_name, scan_deadline — tried only
+ * after the pool-param handler reports no match, so the combined order is
+ * identical to the original single if/else-if chain. */
+static char *
+ngx_http_cache_turbo_redis_param_tls(ngx_conf_t *cf,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_str_t *value)
+{
+    ngx_str_t  s;
+    ngx_int_t  t;
+
+    if (ngx_strncmp(value->data, "tls=", 4) == 0) {
+        s.data = value->data + 4;
+        s.len = value->len - 4;
+        if (s.len == 2 && ngx_strncmp(s.data, "on", 2) == 0) {
+            clcf->redis_tls = 1;
+        } else if (s.len == 3 && ngx_strncmp(s.data, "off", 3) == 0) {
+            clcf->redis_tls = 0;
         } else {
             ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                               "cache_turbo_redis: invalid parameter \"%V\"",
-                               &value[i]);
+                               "cache_turbo_redis: tls must be on|off");
             return NGX_CONF_ERROR;
+        }
+
+    } else if (ngx_strncmp(value->data, "tls_verify=", 11) == 0) {
+        s.data = value->data + 11;
+        s.len = value->len - 11;
+        if (s.len == 2 && ngx_strncmp(s.data, "on", 2) == 0) {
+            clcf->redis_tls_verify = 1;
+        } else if (s.len == 3 && ngx_strncmp(s.data, "off", 3) == 0) {
+            clcf->redis_tls_verify = 0;
+        } else {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "cache_turbo_redis: tls_verify must be on|off");
+            return NGX_CONF_ERROR;
+        }
+
+    } else if (ngx_strncmp(value->data, "tls_ca=", 7) == 0) {
+        clcf->redis_tls_ca.data = value->data + 7;
+        clcf->redis_tls_ca.len = value->len - 7;
+
+    } else if (ngx_strncmp(value->data, "tls_name=", 9) == 0) {
+        clcf->redis_tls_name.data = value->data + 9;
+        clcf->redis_tls_name.len = value->len - 9;
+
+    } else if (ngx_strncmp(value->data, "scan_deadline=", 14) == 0) {
+        /* S231-L2-SCANTIME: wall-clock ceiling on one all-purge SCAN walk,
+         * on top of the fixed SCAN_MAX_PAGES page cap. "0" disables it
+         * (page-cap-only, legacy behaviour) rather than being rejected
+         * like a zero connect timeout: the page cap alone is a legitimate,
+         * if generous, non-termination guard. */
+        s.data = value->data + 14;
+        s.len = value->len - 14;
+        t = ngx_parse_time(&s, 0);   /* milliseconds */
+        if (t == NGX_ERROR) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                "cache_turbo_redis: bad scan_deadline \"%V\"", &s);
+            return NGX_CONF_ERROR;
+        }
+        clcf->redis_scan_deadline = (ngx_msec_t) t;
+
+    } else {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "cache_turbo_redis: invalid parameter \"%V\"",
+                           value);
+        return NGX_CONF_ERROR;
+    }
+
+    return NGX_CONF_OK;
+}
+
+/* One trailing "name=value" parameter: try the pool group, then the TLS
+ * group, in that order — identical left-to-right precedence to the original
+ * single if/else-if chain. */
+static char *
+ngx_http_cache_turbo_redis_param(ngx_conf_t *cf,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_str_t *value)
+{
+    char  *rc;
+
+    rc = ngx_http_cache_turbo_redis_param_pool(cf, clcf, value);
+    if (rc != NGX_HTTP_CACHE_TURBO_PARAM_NOMATCH) {
+        return rc;
+    }
+
+    return ngx_http_cache_turbo_redis_param_tls(cf, clcf, value);
+}
+
+/*
+ * "cache_turbo_redis <dsn|host:port> [prefix=] [timeout=] [password=] [user=]
+ *  [db=] [keepalive=] [keepalive_timeout=] [connect_backoff=] [tls=on|off]
+ *  [tls_verify=on|off] [tls_ca=<file>] [tls_name=<host>] [scan_deadline=];"
+ *
+ * The DSN is redis://[user:pass@]host:port/db ; rediss:// selects TLS. Bare
+ * host:port still works (legacy). Trailing params override whatever the DSN
+ * carried. The address is resolved at config time; settable at http/server/
+ * location level and merged down, so a whole http{} block can share one L2.
+ */
+char *
+ngx_http_cache_turbo_redis_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_cache_turbo_loc_conf_t  *clcf = conf;
+
+    ngx_str_t   *value, hostport, arg1;
+    ngx_uint_t   i;
+    char        *rc;
+
+    value = cf->args->elts;
+    arg1 = value[1];
+
+    if (clcf->memcached == 1) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "cache_turbo_redis: an L2 backend (cache_turbo_memcached) is already "
+            "configured in this block; the two are mutually exclusive");
+        return NGX_CONF_ERROR;
+    }
+
+    /* --- 1. split the DSN (scheme / userinfo / host:port / db) ------------- */
+    rc = ngx_http_cache_turbo_redis_split_dsn(cf, clcf, &arg1, &hostport);
+    if (rc != NGX_CONF_OK) {
+        return rc;
+    }
+
+    /* --- 2. resolve the host:port ----------------------------------------- */
+    rc = ngx_http_cache_turbo_redis_resolve(cf, clcf, &hostport);
+    if (rc != NGX_CONF_OK) {
+        return rc;
+    }
+
+    /* --- 3. trailing params override the DSN ------------------------------ */
+    for (i = 2; i < cf->args->nelts; i++) {
+        rc = ngx_http_cache_turbo_redis_param(cf, clcf, &value[i]);
+        if (rc != NGX_CONF_OK) {
+            return rc;
         }
     }
 
@@ -352,8 +486,97 @@ ngx_http_cache_turbo_redis_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 }
 
 
+/* MAINT-C1b: ngx_http_cache_turbo_memcached_conf decomposition. Same
+ * ordering-sensitivity rule as the redis_conf split above: resolve ->
+ * trailing-param loop, param literals tested in the same sequence, error
+ * strings unchanged verbatim. Do not reorder the calls below. */
+
+/* One trailing "name=value" parameter. */
+static char *
+ngx_http_cache_turbo_memcached_param(ngx_conf_t *cf,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_str_t *value)
+{
+    ngx_str_t  s;
+    ngx_int_t  t;
+
+    if (ngx_strncmp(value->data, "prefix=", 7) == 0) {
+        clcf->redis_prefix.data = value->data + 7;
+        clcf->redis_prefix.len = value->len - 7;
+        if (ngx_http_cache_turbo_check_l2_prefix(cf, &clcf->redis_prefix,
+                                                 "cache_turbo_memcached")
+            != NGX_CONF_OK)
+        {
+            return NGX_CONF_ERROR;
+        }
+
+    } else if (ngx_strncmp(value->data, "timeout=", 8) == 0) {
+        s.data = value->data + 8;
+        s.len = value->len - 8;
+        t = ngx_parse_time(&s, 0);   /* milliseconds */
+        if (t == NGX_ERROR) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                "cache_turbo_memcached: bad timeout \"%V\"", &s);
+            return NGX_CONF_ERROR;
+        }
+        if (t == 0) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                "cache_turbo_memcached: timeout must be > 0");
+            return NGX_CONF_ERROR;
+        }
+        clcf->redis_timeout = (ngx_msec_t) t;
+
+    } else if (ngx_strncmp(value->data, "keepalive=", 10) == 0) {
+        s.data = value->data + 10;
+        s.len = value->len - 10;
+        clcf->memcached_keepalive = ngx_atoi(s.data, s.len);
+        if (clcf->memcached_keepalive == NGX_ERROR
+            || clcf->memcached_keepalive < 0)
+        {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                "cache_turbo_memcached: bad keepalive \"%V\"", &s);
+            return NGX_CONF_ERROR;
+        }
+        if (clcf->memcached_keepalive > NGX_HTTP_CACHE_TURBO_KEEPALIVE_MAX) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                "cache_turbo_memcached: keepalive must be <= %d",
+                NGX_HTTP_CACHE_TURBO_KEEPALIVE_MAX);
+            return NGX_CONF_ERROR;
+        }
+
+    } else if (ngx_strncmp(value->data, "keepalive_timeout=", 18) == 0) {
+        s.data = value->data + 18;
+        s.len = value->len - 18;
+        t = ngx_parse_time(&s, 0);
+        if (t == NGX_ERROR) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                "cache_turbo_memcached: bad keepalive_timeout \"%V\"", &s);
+            return NGX_CONF_ERROR;
+        }
+        clcf->memcached_keepalive_timeout = (ngx_msec_t) t;
+
+    } else if (ngx_strncmp(value->data, "connect_backoff=", 16) == 0) {
+        s.data = value->data + 16;
+        s.len = value->len - 16;
+        t = ngx_parse_time(&s, 0);   /* milliseconds; 0 = disabled */
+        if (t == NGX_ERROR) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                "cache_turbo_memcached: bad connect_backoff \"%V\"", &s);
+            return NGX_CONF_ERROR;
+        }
+        clcf->redis_connect_backoff = (ngx_msec_t) t;
+
+    } else {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "cache_turbo_memcached: invalid parameter \"%V\"", value);
+        return NGX_CONF_ERROR;
+    }
+
+    return NGX_CONF_OK;
+}
+
 /*
- * "cache_turbo_memcached <host:port> [prefix=] [timeout=];"  (v13)
+ * "cache_turbo_memcached <host:port> [prefix=] [timeout=] [keepalive=]
+ *  [keepalive_timeout=] [connect_backoff=];"  (v13)
  *
  * Selects the memcached L2 backend instead of Redis. Reuses the redis_addr/
  * redis_prefix/redis_timeout/redis_enable fields (the two backends are mutually
@@ -367,10 +590,10 @@ ngx_http_cache_turbo_memcached_conf(ngx_conf_t *cf, ngx_command_t *cmd,
 {
     ngx_http_cache_turbo_loc_conf_t  *clcf = conf;
 
-    ngx_str_t   *value, s;
+    ngx_str_t   *value;
     ngx_url_t    u;
     ngx_uint_t   i;
-    ngx_int_t    t;
+    char        *rc;
 
     value = cf->args->elts;
 
@@ -401,77 +624,9 @@ ngx_http_cache_turbo_memcached_conf(ngx_conf_t *cf, ngx_command_t *cmd,
     clcf->redis_addr = u.addrs[0];
 
     for (i = 2; i < cf->args->nelts; i++) {
-
-        if (ngx_strncmp(value[i].data, "prefix=", 7) == 0) {
-            clcf->redis_prefix.data = value[i].data + 7;
-            clcf->redis_prefix.len = value[i].len - 7;
-            if (ngx_http_cache_turbo_check_l2_prefix(cf, &clcf->redis_prefix,
-                                                     "cache_turbo_memcached")
-                != NGX_CONF_OK)
-            {
-                return NGX_CONF_ERROR;
-            }
-
-        } else if (ngx_strncmp(value[i].data, "timeout=", 8) == 0) {
-            s.data = value[i].data + 8;
-            s.len = value[i].len - 8;
-            t = ngx_parse_time(&s, 0);   /* milliseconds */
-            if (t == NGX_ERROR) {
-                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                    "cache_turbo_memcached: bad timeout \"%V\"", &s);
-                return NGX_CONF_ERROR;
-            }
-            if (t == 0) {
-                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                    "cache_turbo_memcached: timeout must be > 0");
-                return NGX_CONF_ERROR;
-            }
-            clcf->redis_timeout = (ngx_msec_t) t;
-
-        } else if (ngx_strncmp(value[i].data, "keepalive=", 10) == 0) {
-            s.data = value[i].data + 10;
-            s.len = value[i].len - 10;
-            clcf->memcached_keepalive = ngx_atoi(s.data, s.len);
-            if (clcf->memcached_keepalive == NGX_ERROR
-                || clcf->memcached_keepalive < 0)
-            {
-                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                    "cache_turbo_memcached: bad keepalive \"%V\"", &s);
-                return NGX_CONF_ERROR;
-            }
-            if (clcf->memcached_keepalive > NGX_HTTP_CACHE_TURBO_KEEPALIVE_MAX) {
-                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                    "cache_turbo_memcached: keepalive must be <= %d",
-                    NGX_HTTP_CACHE_TURBO_KEEPALIVE_MAX);
-                return NGX_CONF_ERROR;
-            }
-
-        } else if (ngx_strncmp(value[i].data, "keepalive_timeout=", 18) == 0) {
-            s.data = value[i].data + 18;
-            s.len = value[i].len - 18;
-            t = ngx_parse_time(&s, 0);
-            if (t == NGX_ERROR) {
-                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                    "cache_turbo_memcached: bad keepalive_timeout \"%V\"", &s);
-                return NGX_CONF_ERROR;
-            }
-            clcf->memcached_keepalive_timeout = (ngx_msec_t) t;
-
-        } else if (ngx_strncmp(value[i].data, "connect_backoff=", 16) == 0) {
-            s.data = value[i].data + 16;
-            s.len = value[i].len - 16;
-            t = ngx_parse_time(&s, 0);   /* milliseconds; 0 = disabled */
-            if (t == NGX_ERROR) {
-                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                    "cache_turbo_memcached: bad connect_backoff \"%V\"", &s);
-                return NGX_CONF_ERROR;
-            }
-            clcf->redis_connect_backoff = (ngx_msec_t) t;
-
-        } else {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                "cache_turbo_memcached: invalid parameter \"%V\"", &value[i]);
-            return NGX_CONF_ERROR;
+        rc = ngx_http_cache_turbo_memcached_param(cf, clcf, &value[i]);
+        if (rc != NGX_CONF_OK) {
+            return rc;
         }
     }
 
