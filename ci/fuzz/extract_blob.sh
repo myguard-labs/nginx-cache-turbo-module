@@ -27,7 +27,16 @@ set -euo pipefail
 
 FUZZ_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC="$FUZZ_DIR/../../src/ngx_http_cache_turbo_module.c"
-HDR="$FUZZ_DIR/../../src/ngx_http_cache_turbo_module.h"
+# ⚠ The wire constants below span TWO headers as of MAINT-C3b: the BLOB_* ones
+# are module.c-private and live in _internal.h, while TTL_MAX and FOREVER_TTL
+# stay public in module.h. This extractor is a NON-COMPILER consumer of those
+# declarations, so a move between headers breaks THIS grep rather than any
+# build. Search both; the names are unique across them.
+HDR_PUB="$FUZZ_DIR/../../src/ngx_http_cache_turbo_module.h"
+HDR_INT="$FUZZ_DIR/../../src/ngx_http_cache_turbo_internal.h"
+HDRS=("$HDR_PUB" "$HDR_INT")
+# blob_hdr_t and blob_href_t are module.c-private and sliced from _internal.h.
+HDR_STRUCTS="$HDR_INT"
 OUT="$FUZZ_DIR/generated_blob.inc"
 
 if [ ! -f "$SRC" ]; then
@@ -46,12 +55,25 @@ emit_defines() {
                 NGX_HTTP_CACHE_TURBO_FOREVER_TTL \
                 NGX_HTTP_CACHE_TURBO_BLOB_CREATED_MIN
     do
-        line=$(grep -E "^#define[[:space:]]+${name}[[:space:]]" "$HDR" | head -n1)
-        if [ -z "$line" ]; then
-            echo "✗ $name not found in $HDR (renamed? update extract_blob.sh)" >&2
+        # A name defined in more than one header is itself drift: the harness
+        # would silently take whichever came first. Collect every hit.
+        # `|| true`: grep exits 1 when the constant is absent, and under
+        # `set -e` that kills the function BEFORE the diagnostic below runs --
+        # the build then fails with no message at all. Keep the guard's own
+        # error reachable.
+        hits=$(grep -hE "^#define[[:space:]]+${name}[[:space:]]" "${HDRS[@]}" || true)
+        n=$(printf '%s\n' "$hits" | grep -c . || true)
+        if [ "$n" -eq 0 ]; then
+            echo "✗ $name not found in ${HDRS[*]} (renamed or moved?" \
+                 "update extract_blob.sh)" >&2
             exit 1
         fi
-        echo "$line"
+        if [ "$n" -gt 1 ]; then
+            echo "✗ $name defined $n times across the module headers —" \
+                 "the harness cannot tell which layout production writes" >&2
+            exit 1
+        fi
+        printf '%s\n' "$hits"
     done
 }
 
@@ -64,7 +86,7 @@ emit_defines() {
     awk '/^typedef struct \{/ { buf = $0 ORS; cap = 1; next }
          cap { buf = buf $0 ORS
                if ($0 ~ /^\} ngx_http_cache_turbo_blob_hdr_t;/) { printf "%s", buf; exit }
-               if ($0 ~ /^\} /) { cap = 0; buf = "" } }' "$HDR"
+               if ($0 ~ /^\} /) { cap = 0; buf = "" } }' "$HDR_STRUCTS"
     echo ""
     # S231-PERF-HDRWALK: the parsed-header-ref struct blob_validate() now fills
     # in the same walk blob_next_header() drives. Same slice-not-mirror
@@ -72,7 +94,7 @@ emit_defines() {
     awk '/^typedef struct \{/ { buf = $0 ORS; cap = 1; next }
          cap { buf = buf $0 ORS
                if ($0 ~ /^\} ngx_http_cache_turbo_blob_href_t;/) { printf "%s", buf; exit }
-               if ($0 ~ /^\} /) { cap = 0; buf = "" } }' "$HDR"
+               if ($0 ~ /^\} /) { cap = 0; buf = "" } }' "$HDR_STRUCTS"
     echo ""
     # S231-PERF-HDRWALK: blob_validate() now calls blob_next_header() (defined
     # further down in module.c, same as production), so the harness needs the
@@ -84,13 +106,13 @@ emit_defines() {
 } > "$OUT"
 
 if ! grep -qF '} ngx_http_cache_turbo_blob_hdr_t;' "$OUT"; then
-    echo "✗ could not slice ngx_http_cache_turbo_blob_hdr_t from $HDR" >&2
+    echo "✗ could not slice ngx_http_cache_turbo_blob_hdr_t from $HDR_STRUCTS" >&2
     rm -f "$OUT"
     exit 1
 fi
 
 if ! grep -qF '} ngx_http_cache_turbo_blob_href_t;' "$OUT"; then
-    echo "✗ could not slice ngx_http_cache_turbo_blob_href_t from $HDR" >&2
+    echo "✗ could not slice ngx_http_cache_turbo_blob_href_t from $HDR_STRUCTS" >&2
     rm -f "$OUT"
     exit 1
 fi
