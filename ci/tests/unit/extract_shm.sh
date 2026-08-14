@@ -29,7 +29,17 @@ set -euo pipefail
 
 UNIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC="$UNIT_DIR/../../../src/ngx_http_cache_turbo_shm.c"
+# ⚠ The declarations this script mirrors are split across TWO headers as of
+# MAINT-C3b, so there is no single $HDR:
+#   _internal.h -- shm.c-private: the NODE_/SEG_ kind and segment values,
+#                  CT_BLOBREF() and ngx_http_cache_turbo_blobref_t
+#   module.h    -- cross-file: the BREAKER_* state and BREAKER_PROBE_* widths
+# This extractor is a NON-COMPILER consumer of those declarations. Moving one
+# between headers does not break any build -- it breaks this script's greps,
+# and the drift checks below then fail with an empty `got=`. If a mirrored
+# declaration moves again, repoint its check at the header that now holds it.
 HDR="$UNIT_DIR/../../../src/ngx_http_cache_turbo_module.h"
+HDR_INT="$UNIT_DIR/../../../src/ngx_http_cache_turbo_internal.h"
 OUT="$UNIT_DIR/generated_shm.inc"
 
 if [ ! -f "$SRC" ]; then
@@ -56,13 +66,13 @@ check_define() {
         exit 1
     fi
 }
-check_define NGX_HTTP_CACHE_TURBO_NODE_ENTRY   0
-check_define NGX_HTTP_CACHE_TURBO_NODE_COUNTER 1
+check_define NGX_HTTP_CACHE_TURBO_NODE_ENTRY   0 "$HDR_INT"
+check_define NGX_HTTP_CACHE_TURBO_NODE_COUNTER 1 "$HDR_INT"
 # S8: PROBATION == 0 is load-bearing for the same reason ENTRY == 0 is -- a node
 # zeroed by accident must read as the EVICTABLE segment. A silent flip would
 # invert the promotion assertions while leaving them green.
-check_define NGX_HTTP_CACHE_TURBO_SEG_PROBATION 0
-check_define NGX_HTTP_CACHE_TURBO_SEG_PROTECTED 1
+check_define NGX_HTTP_CACHE_TURBO_SEG_PROBATION 0 "$HDR_INT"
+check_define NGX_HTTP_CACHE_TURBO_SEG_PROTECTED 1 "$HDR_INT"
 # P6/O4.1: CLOSED == 0 is load-bearing for the third time in this file -- a
 # zeroed zone must come up with the breaker NOT tripped (traffic flows to origin
 # as if the feature were off). A silent flip would bring every fresh worker up
@@ -185,14 +195,14 @@ check_blobref_mirror() {
     # extract_define() anchors on the macro name followed by whitespace, a
     # continuation or EOL -- a function-like macro is followed by '(', so the
     # parameter list is part of the name we match on.
-    hdr_macro=$(extract_define 'CT_BLOBREF\\(data\\)' "$HDR")
+    hdr_macro=$(extract_define 'CT_BLOBREF\\(data\\)' "$HDR_INT")
     test_macro=$(extract_define 'CT_BLOBREF\\(data\\)' "$UNIT_DIR/test_shm_state.c")
     if [ -z "$hdr_macro" ] || [ -z "$test_macro" ]; then
-        echo "✗ CT_BLOBREF not found in both $HDR and test_shm_state.c" >&2
+        echo "✗ CT_BLOBREF not found in both $HDR_INT and test_shm_state.c" >&2
         exit 1
     fi
     if [ "$hdr_macro" != "$test_macro" ]; then
-        echo "✗ CT_BLOBREF drifted between module.h ('$hdr_macro') and" \
+        echo "✗ CT_BLOBREF drifted between _internal.h ('$hdr_macro') and" \
              "test_shm_state.c ('$test_macro')" >&2
         exit 1
     fi
@@ -221,11 +231,11 @@ check_blobref_mirror() {
                 }
         ' "$1"
     }
-    hdr_fields=$(blobref_fields "$HDR")
+    hdr_fields=$(blobref_fields "$HDR_INT")
     test_fields=$(blobref_fields "$UNIT_DIR/test_shm_state.c")
     if [ -z "$hdr_fields" ] || [ -z "$test_fields" ]; then
         echo "✗ ngx_http_cache_turbo_blobref_t body not found in both" \
-             "$HDR and test_shm_state.c" >&2
+             "$HDR_INT and test_shm_state.c" >&2
         exit 1
     fi
     if [ "$hdr_fields" != "$test_fields" ]; then

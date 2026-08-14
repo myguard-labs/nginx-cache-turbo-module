@@ -9,6 +9,9 @@ set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HDR="$DIR/../../../src/ngx_http_cache_turbo_module.h"
+# module.c-private declarations (MAINT-C3b) — the BACKEND_ preset bits scanned
+# by the auto-classify guard below. The fixed-point math CONSTS stay in $HDR.
+HDR_INT="$DIR/../../../src/ngx_http_cache_turbo_internal.h"
 SHIM="$DIR/ngx_shim_math.h"
 
 CONSTS=(
@@ -60,8 +63,15 @@ fi
 echo "✓ unit-test shim constants match module.h (${#CONSTS[@]} checked)"
 
 # ---------------------------------------------------------------------------
-# Auto-classify preset bits: src/ngx_http_cache_turbo_module.h vs the FUZZ shim
+# Auto-classify preset bits: the module headers vs the FUZZ shim
 # (ci/fuzz/ngx_shim_auto.h), which mirrors them by hand.
+#
+# ⚠ The bits are SPLIT across two headers as of MAINT-C3b and both must be
+# scanned: the 34 individual preset bits (WORDPRESS..OPENCART) are module.c-
+# private and live in _internal.h, while BACKEND_NONE stays in module.h because
+# the public HAS_BACKEND() macro references it. Scanning only one header makes
+# every bit in the other read as "in the fuzz shim but not the header" — a
+# whole-guard false failure, not a real drift.
 #
 # The fuzz build already fails on a bit that is MISSING from the mirror (an
 # undeclared identifier in BACKEND_ALL). It does NOT catch a bit that is present
@@ -80,37 +90,49 @@ if [ ! -f "$AUTOSHIM" ]; then
     exit 1
 fi
 
-python3 - "$HDR" "$AUTOSHIM" <<'PY'
+python3 - "$HDR" "$HDR_INT" "$AUTOSHIM" <<'PY'
 import re, sys
 
-hdr_path, shim_path = sys.argv[1], sys.argv[2]
+*hdr_paths, shim_path = sys.argv[1:]
 
 def bits(path):
     pat = r'#define\s+NGX_HTTP_CACHE_TURBO_BACKEND_([A-Z0-9]+)\s+(0x[0-9A-Fa-f]+)(ull|ul|u)?\b'
     return {m.group(1): (int(m.group(2), 16), m.group(3) or "<none>")
             for m in re.finditer(pat, open(path).read())}
 
-hdr, shim = bits(hdr_path), bits(shim_path)
+# The preset bits span module.h + _internal.h (see the MAINT-C3b note above);
+# a name defined in both with different values is itself drift, so union with
+# an explicit collision check rather than letting one side silently win.
+hdr = {}
+for p in hdr_paths:
+    for name, entry in bits(p).items():
+        if name in hdr and hdr[name] != entry:
+            print(f"✗ BACKEND_{name} defined differently in two headers: "
+                  f"{hex(hdr[name][0])} vs {hex(entry[0])}", file=sys.stderr)
+            sys.exit(1)
+        hdr[name] = entry
+shim = bits(shim_path)
 rc = 0
 
 if "NONE" not in hdr:
-    print("✗ BACKEND_NONE missing from module.h", file=sys.stderr); sys.exit(1)
+    print("✗ BACKEND_NONE missing from the module headers", file=sys.stderr)
+    sys.exit(1)
 none_val, none_suf = hdr.pop("NONE")
 
 # 1. every header preset mirrored in the shim, with the same value
 for name in sorted(set(hdr) | set(shim)):
     h, s = hdr.get(name), shim.get(name)
     if h is None:
-        print(f"✗ {name} in fuzz shim but not module.h", file=sys.stderr); rc = 1
+        print(f"✗ {name} in fuzz shim but not the module headers", file=sys.stderr); rc = 1
     elif s is None:
-        print(f"✗ {name} in module.h but not the fuzz shim — add it there and to "
+        print(f"✗ {name} in the module headers but not the fuzz shim — add it there and to "
               f"BACKEND_ALL, or the fuzzer never walks its row", file=sys.stderr); rc = 1
     elif h[0] != s[0]:
-        print(f"✗ {name} value drift: module.h={hex(h[0])} shim={hex(s[0])}",
+        print(f"✗ {name} value drift: header={hex(h[0])} shim={hex(s[0])}",
               file=sys.stderr); rc = 1
 
 # 2. every literal is ull (see comment above)
-for label, table in (("module.h", {**hdr, "NONE": (none_val, none_suf)}),
+for label, table in (("module headers", {**hdr, "NONE": (none_val, none_suf)}),
                      ("fuzz shim", shim)):
     for name, (val, suf) in sorted(table.items()):
         if suf != "ull":
