@@ -34,9 +34,8 @@ static ngx_int_t ngx_http_cache_turbo_serve(ngx_http_request_t *r,
     u_char *copy, size_t len, ngx_uint_t stale,
     ngx_http_cache_turbo_zone_t *z, u_char *ref_data, const char *xcache);
 /* P6/O4.3: the breaker's 503 path needs the shared small-body sender, which is
- * defined with the other response helpers far below the access handler. */
-static ngx_int_t ngx_http_cache_turbo_send_body(ngx_http_request_t *r,
-    ngx_uint_t status, ngx_str_t *body, const char *ctype, size_t ctype_len);
+ * defined with the other response helpers far below the access handler.
+ * Declared non-static in ngx_http_cache_turbo_module.h (shared with admin.c). */
 /* P6/O4.3: the serve-path breaker predicates. Defined beside the O4.2 recording
  * rule inside the UNIT-EXTRACT block (so the unit suite slices all of the
  * breaker's decision logic from one place), which is below the access handler
@@ -66,8 +65,8 @@ static void ngx_http_cache_turbo_cold_cleanup(void *data);
 static ngx_int_t ngx_http_cache_turbo_cold_adopt_own_stub(
     ngx_http_request_t *r, ngx_http_cache_turbo_ctx_t *ctx,
     ngx_http_cache_turbo_zone_t *z);
-static ngx_int_t ngx_http_cache_turbo_send_json(ngx_http_request_t *r,
-    ngx_uint_t status, ngx_str_t *body);
+/* ngx_http_cache_turbo_send_json declared non-static in
+ * ngx_http_cache_turbo_module.h (shared with admin.c). */
 
 static void *ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf);
 static char *ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf,
@@ -119,23 +118,14 @@ static char *ngx_http_cache_turbo_use_stale(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 static char *ngx_http_cache_turbo_preset(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
-static ngx_int_t ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r);
-static ngx_int_t ngx_http_cache_turbo_warm(ngx_http_request_t *r,
-    ngx_str_t *urls);
-static ngx_int_t ngx_http_cache_turbo_warm_one(ngx_http_request_t *r,
-    ngx_str_t *uri, ngx_str_t *args);
-/* State carried through an async tag purge from the admin handler to the
- * SMEMBERS completion callback. Also reused for the COR-5 variant-index purge
- * (the index is a per-base tag set), so it is defined up here for
- * purge_request near the top of the file. */
-typedef struct {
-    ngx_http_cache_turbo_loc_conf_t  *clcf;
-    ngx_http_cache_turbo_zone_t      *zone;
-    ngx_str_t                         tag;    /* copied into r->pool */
-} ngx_http_cache_turbo_tagpurge_t;
-static ngx_int_t ngx_http_cache_turbo_tag_purge_complete(ngx_http_request_t *r,
-    void *data, ngx_str_t *members, ngx_uint_t nmembers,
-    const ngx_http_cache_turbo_redis_walk_t *walk);
+/* ngx_http_cache_turbo_admin_handler now lives in admin.c; declared in
+ * ngx_http_cache_turbo_module.h (non-static, core->handler assigns it below). */
+/* ngx_http_cache_turbo_warm_one declared non-static in
+ * ngx_http_cache_turbo_module.h (shared with admin.c's warm dispatch). */
+/* ngx_http_cache_turbo_tagpurge_t now lives in ngx_http_cache_turbo_module.h
+ * (shared with admin.c); reused for the COR-5 variant-index purge below and
+ * for the admin tag-purge path. ngx_http_cache_turbo_tag_purge_complete
+ * declared non-static in ngx_http_cache_turbo_module.h (shared with admin.c). */
 static ngx_int_t ngx_http_cache_turbo_add_variables(ngx_conf_t *cf);
 static ngx_int_t ngx_http_cache_turbo_normalized_args_variable(
     ngx_http_request_t *r, ngx_http_variable_value_t *v, uintptr_t data);
@@ -748,8 +738,9 @@ ngx_http_cache_turbo_digest_final(ngx_http_cache_turbo_digest_t *d,
 }
 
 
-/* One-shot convenience for a single contiguous input. Returns NGX_OK on success, NGX_ERROR on failure. */
-static ngx_int_t
+/* One-shot convenience for a single contiguous input. Returns NGX_OK on success,
+ * NGX_ERROR on failure. Non-static: called from admin.c too. */
+ngx_int_t
 ngx_http_cache_turbo_digest(const void *data, size_t len, u_char out[32])
 {
     ngx_http_cache_turbo_digest_t  d;
@@ -12005,8 +11996,8 @@ ngx_http_cache_turbo_memcached_conf(ngx_conf_t *cf, ngx_command_t *cmd,
 
 
 /* Send a small body with the given status and content-type. Returns the rc to
- * propagate/finalize with. */
-static ngx_int_t
+ * propagate/finalize with. Non-static: called from admin.c too. */
+ngx_int_t
 ngx_http_cache_turbo_send_body(ngx_http_request_t *r, ngx_uint_t status,
     ngx_str_t *body, const char *ctype, size_t ctype_len)
 {
@@ -12041,8 +12032,8 @@ ngx_http_cache_turbo_send_body(ngx_http_request_t *r, ngx_uint_t status,
 
 
 /* Send a small JSON body. Shared by the admin handler and the async tag-purge
- * completion. */
-static ngx_int_t
+ * completion. Non-static: called from admin.c too. */
+ngx_int_t
 ngx_http_cache_turbo_send_json(ngx_http_request_t *r, ngx_uint_t status,
     ngx_str_t *body)
 {
@@ -12074,15 +12065,16 @@ ngx_http_cache_turbo_hexdecode(u_char *src, size_t len, u_char *dst)
 }
 
 
-/* ngx_http_cache_turbo_tagpurge_t is defined near the top of the file (shared
- * with the COR-5 variant-index purge launched from purge_request). */
+/* ngx_http_cache_turbo_tagpurge_t is defined in ngx_http_cache_turbo_module.h
+ * (shared with the COR-5 variant-index purge launched from purge_request, and
+ * with the admin tag-purge path in admin.c). */
 
 
 /* SMEMBERS completion: drop every member object from L1 + L2, delete the now-
  * empty tag set, and answer {"purged":N}. Runs while `members` (which point
  * into the redis op buffer) are still valid; everything it keeps is copied or
- * acted on synchronously here. */
-static ngx_int_t
+ * acted on synchronously here. Non-static: called from admin.c too. */
+ngx_int_t
 ngx_http_cache_turbo_tag_purge_complete(ngx_http_request_t *r, void *data,
     ngx_str_t *members, ngx_uint_t nmembers,
     const ngx_http_cache_turbo_redis_walk_t *walk)
@@ -12169,471 +12161,10 @@ ngx_http_cache_turbo_tag_purge_complete(ngx_http_request_t *r, void *data,
 }
 
 
-/* State carried through an async all-purge (?all=1) from the admin handler to
- * the SCAN-del completion callback. Holds the L1 count purged synchronously so
- * the reply can report it after the parked L2 SCAN finishes. */
-typedef struct {
-    ngx_uint_t  purged;        /* L1 entries dropped (reported as "purged") */
-} ngx_http_cache_turbo_allpurge_t;
-
-
-/* SCAN-del completion (?all=1): the L2 keyspace walk has ended; emit
- * {"purged":N} where N is the L1 count (L2 deletions are fire-and-forget and not
- * separately counted). members/nmembers are unused (always 0 here).
- *
- * AUD-SCAN1: the walk does NOT always finish. It ends early on a read timeout,
- * a malformed reply, an allocation failure, or the SCAN page cap — and in every
- * one of those cases part of the L2 keyspace still holds entries the caller was
- * told were gone. That is worse than an outright error: an operator who purged
- * before a config rollout believes L2 is empty when it is not. So a walk that
- * did not reach cursor 0 is reported as a FAILURE (500) carrying
- * "l2":"incomplete" plus the reason, never as a 200. AUD-PURGE-HONESTY1
- * refines that: a walk that consumed ZERO pages never ran at all (L2 refused
- * the connection), so it reports "l2":"unavailable" — L2 is intact, not partly
- * purged. `walk == NULL` cannot
- * happen on this path (the SCAN backend always supplies it); it is treated as
- * complete only so the callback stays total. */
-static ngx_int_t
-ngx_http_cache_turbo_all_purge_complete(ngx_http_request_t *r, void *data,
-    ngx_str_t *members, ngx_uint_t nmembers,
-    const ngx_http_cache_turbo_redis_walk_t *walk)
-{
-    ngx_http_cache_turbo_allpurge_t  *ap = data;
-    u_char                           *p;
-    ngx_str_t                         body;
-    ngx_uint_t                        status;
-    const char                       *reason;
-    const char                       *state;
-
-    (void) members;
-    (void) nmembers;
-
-    if (walk == NULL || walk->status == NGX_OK) {
-        status = NGX_HTTP_OK;
-        state = NULL;
-        reason = NULL;
-    } else {
-        status = NGX_HTTP_INTERNAL_SERVER_ERROR;
-        reason = (walk->status != NGX_ABORT) ? "error"
-                 : walk->deadline ? "deadline" : "page-cap";
-
-        /* AUD-PURGE-HONESTY1: separate "the walk ran and stopped early" from
-         * "the walk never happened". Zero pages consumed means no SCAN reply
-         * was ever parsed -- L2 refused the connection, or died before the
-         * first page -- so the whole keyspace is intact rather than partly
-         * purged. Both are 500; the field tells the operator which state L2 is
-         * actually in, and "incomplete" would overstate what was done. */
-        state = (walk->pages == 0) ? "unavailable" : "incomplete";
-    }
-
-    p = ngx_pnalloc(r->pool,
-                    sizeof("{\"purged\":4294967295,"
-                           "\"l2\":\"unavailable\",\"reason\":\"page-cap\","
-                           "\"scan_pages\":4294967295,"
-                           "\"scan_pool_blocks\":4294967295}\n"));
-    if (p == NULL) {
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
-    }
-    body.data = p;
-    p = ngx_sprintf(p, "{\"purged\":%ui", ap->purged);
-    if (reason != NULL) {
-        p = ngx_sprintf(p, ",\"l2\":\"%s\",\"reason\":\"%s\"", state, reason);
-    }
-#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
-    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
-    /* Walk diagnostics, CI builds only: scan_pool_blocks is the oracle for the
-     * per-page-pool release (constant in scan_pages when the walk is O(1) in
-     * page count, linear in it when the whole walk shares one pool). Not a
-     * permanent operator-facing field — same convention as the TEST_FAULTS
-     * breaker counters. */
-    if (walk != NULL) {
-        p = ngx_sprintf(p, ",\"scan_pages\":%ui,\"scan_pool_blocks\":%ui",
-                        walk->pages, walk->blocks);
-    }
-#endif
-    p = ngx_sprintf(p, "}\n");
-    body.len = p - body.data;
-
-    return ngx_http_cache_turbo_send_json(r, status, &body);
-}
-
-
-/* GET  -> JSON stats for the zone.
- * POST -> purge: ?all=1 purges the whole zone; ?key=<string> purges one key
- *         (hashed the same way the cache hashes its key); ?tag=<name> purges
- *         every object tagged <name> across L1 + L2 (needs cache_turbo_redis).
- * Gating is the caller's responsibility (allow/deny in the location). */
-static ngx_int_t
-ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
-{
-    ngx_http_cache_turbo_loc_conf_t  *clcf;
-    ngx_http_cache_turbo_zone_t      *z;
-    ngx_str_t                         body;
-    u_char                           *p;
-    size_t                            len;
-    ngx_int_t                         drc;
-
-    clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
-    if (!clcf->admin || clcf->admin_zone == NULL) {
-        return NGX_HTTP_NOT_FOUND;
-    }
-
-    /* Content handler must consume any request body (a purge/warm POST may carry
-     * one) or the bytes desync a keepalive connection. */
-    drc = ngx_http_discard_request_body(r);
-    if (drc != NGX_OK) {
-        return drc;
-    }
-
-    z = clcf->admin_zone->data;
-
-    if (r->method & (NGX_HTTP_POST|NGX_HTTP_PUT|NGX_HTTP_DELETE)) {
-        ngx_str_t  arg;
-        ngx_uint_t purged = 0;
-
-        /* Require all=1 explicitly (COR-10): mere presence of the arg used to
-         * purge, so a typo like ?all=0 destroyed the whole zone. Only the exact
-         * value "1" triggers the all-purge now. */
-        if (r->args.len
-            && ngx_http_arg(r, (u_char *) "all", 3, &arg) == NGX_OK
-            && arg.len == 1 && arg.data[0] == '1')
-        {
-            purged = clcf->l1->purge_all(z);
-
-            /* L2-aware all-purge (v4-2): also clear the whole L2 keyspace for
-             * this prefix via a parked SCAN MATCH <prefix>* + DEL loop, so an
-             * object cleared from L1 cannot be silently refilled from Redis on
-             * the next miss. Needs cache_turbo_redis on this admin location.
-             * The completion callback emits {"purged":<L1 count>}. */
-            if (clcf->backend && clcf->backend->scan_del) {
-                ngx_http_cache_turbo_allpurge_t  *ap;
-                ngx_int_t                         rc;
-
-                ap = ngx_palloc(r->pool,
-                                sizeof(ngx_http_cache_turbo_allpurge_t));
-                if (ap == NULL) {
-                    return NGX_HTTP_INTERNAL_SERVER_ERROR;
-                }
-                ap->purged = purged;
-
-                rc = clcf->backend->scan_del(r, clcf,
-                         ngx_http_cache_turbo_all_purge_complete, ap);
-                if (rc == NGX_DONE) {
-                    return NGX_DONE;        /* parked; completion sends reply */
-                }
-
-                /* AUD-PURGE-HONESTY1: the walk did not even START — L2 is down,
-                 * or the connection was never established — so the entire L2
-                 * keyspace still holds entries the caller asked to be gone.
-                 * This used to fall through to the synchronous
-                 * 200 {"purged":<L1 count>} below, which reads as a complete
-                 * purge. Same dishonesty class as AUD-SCAN1 (a walk that starts
-                 * and ends early), so it gets the same answer shape: non-2xx
-                 * plus an explicit L2 state. "unavailable" rather than
-                 * "incomplete" — nothing was walked at all. L1 really was
-                 * purged and "purged" still reports that count. */
-                p = ngx_pnalloc(r->pool,
-                                sizeof("{\"purged\":4294967295,"
-                                       "\"l2\":\"unavailable\"}\n"));
-                if (p == NULL) {
-                    return NGX_HTTP_INTERNAL_SERVER_ERROR;
-                }
-                body.data = p;
-                body.len = ngx_sprintf(p,
-                               "{\"purged\":%ui,\"l2\":\"unavailable\"}\n",
-                               purged) - p;
-                return ngx_http_cache_turbo_send_json(r,
-                           NGX_HTTP_INTERNAL_SERVER_ERROR, &body);
-            }
-
-        } else if (r->args.len
-                   && ngx_http_arg(r, (u_char *) "key", 3, &arg) == NGX_OK)
-        {
-            u_char     key_hash[32];
-            uint32_t   hash;
-
-            /* SEC-2: must match build_key's digest so ?key=<rendered key>
-             * resolves to the same slot. */
-            ngx_http_cache_turbo_digest(arg.data, arg.len, key_hash);
-            hash = ngx_crc32_short(key_hash, 32);
-
-            purged = clcf->l1->purge_key(z, key_hash, hash);
-
-            /* L2-aware purge (issue P6): also drop the entry from Redis, so a
-             * purge that cleared L1 cannot be silently refilled from L2 on the
-             * next miss. Fire-and-forget; needs cache_turbo_redis on this admin
-             * location (inherit it from server/http level). Reported "purged"
-             * still reflects the L1 removal only. */
-            if (clcf->backend) {
-                clcf->backend->del(clcf, key_hash);
-            }
-
-        } else if (r->args.len
-                   && ngx_http_arg(r, (u_char *) "tag", 3, &arg) == NGX_OK)
-        {
-            /* Purge by tag. The tag index lives only in L2, so this needs
-             * cache_turbo_redis. SMEMBERS parks the request; the completion
-             * callback drops each object from L1 + L2, deletes the tag set, and
-             * sends {"purged":N}. */
-            ngx_http_cache_turbo_tagpurge_t  *tp;
-            ngx_int_t                         rc;
-            u_char                            ch;
-            ngx_uint_t                        ti;
-
-            if (clcf->backend == NULL || clcf->backend->purge_tag == NULL) {
-                ngx_str_set(&body,
-                    "{\"error\":\"tag purge requires cache_turbo_redis\"}\n");
-                return ngx_http_cache_turbo_send_json(r,
-                           NGX_HTTP_BAD_REQUEST, &body);
-            }
-
-            /* AUD-TAG1: mirror the surrogate-key tokeniser's own rules
-             * (ngx_http_cache_turbo_emit_surrogate_key above) so a tag never
-             * exceeds NGX_HTTP_CACHE_TURBO_MAX_TAG_LEN or contains one of the
-             * tokeniser's separator bytes. Nothing downstream URL-decodes
-             * ?tag=, so today this is belt-and-braces around a distant
-             * parser (nginx rejects a raw space in the request line) rather
-             * than a live bypass -- but the check should live locally, not
-             * depend on that. */
-            if (arg.len == 0 || arg.len > NGX_HTTP_CACHE_TURBO_MAX_TAG_LEN) {
-                ngx_str_set(&body,
-                    "{\"error\":\"invalid tag: empty or too long "
-                    "(max 128 bytes)\"}\n");
-                return ngx_http_cache_turbo_send_json(r,
-                           NGX_HTTP_BAD_REQUEST, &body);
-            }
-
-            for (ti = 0; ti < arg.len; ti++) {
-                ch = arg.data[ti];
-                if (ch == ' ' || ch == '\t' || ch == ',' || ch == '\r'
-                    || ch == '\n')
-                {
-                    ngx_str_set(&body,
-                        "{\"error\":\"invalid tag: contains a "
-                        "space/tab/comma/CR/LF\"}\n");
-                    return ngx_http_cache_turbo_send_json(r,
-                               NGX_HTTP_BAD_REQUEST, &body);
-                }
-            }
-
-            tp = ngx_palloc(r->pool, sizeof(ngx_http_cache_turbo_tagpurge_t));
-            if (tp == NULL) {
-                return NGX_HTTP_INTERNAL_SERVER_ERROR;
-            }
-            tp->clcf = clcf;
-            tp->zone = z;
-            tp->tag.len = arg.len;
-            tp->tag.data = ngx_pnalloc(r->pool, arg.len);
-            if (tp->tag.data == NULL) {
-                return NGX_HTTP_INTERNAL_SERVER_ERROR;
-            }
-            ngx_memcpy(tp->tag.data, arg.data, arg.len);
-
-            rc = clcf->backend->purge_tag(r, clcf,
-                     tp->tag.data, tp->tag.len,
-                     ngx_http_cache_turbo_tag_purge_complete, tp);
-            if (rc == NGX_DONE) {
-                return NGX_DONE;            /* parked; completion sends reply */
-            }
-
-            ngx_str_set(&body,
-                "{\"error\":\"tag purge backend unavailable\"}\n");
-            return ngx_http_cache_turbo_send_json(r, NGX_HTTP_BAD_GATEWAY,
-                       &body);
-
-        } else if (r->args.len
-                   && ngx_http_arg(r, (u_char *) "url", 3, &arg) == NGX_OK)
-        {
-            /* Warm (v3-3): pre-populate the cache for one or more comma-
-             * separated site URLs by firing background subrequests that hit the
-             * origin and store the result. Best-effort/async — the reply reports
-             * how many warm subrequests were fired, not how many actually
-             * stored. Sends its own JSON, so return its rc directly. */
-            return ngx_http_cache_turbo_warm(r, &arg);
-
-        } else {
-            ngx_str_set(&body,
-                "{\"error\":\"specify ?all=1, ?key=<string>, ?tag=<name> "
-                "or ?url=<path[,path...]>\"}\n");
-            return ngx_http_cache_turbo_send_json(r, NGX_HTTP_BAD_REQUEST,
-                       &body);
-        }
-
-        p = ngx_pnalloc(r->pool, sizeof("{\"purged\":4294967295}\n"));
-        if (p == NULL) {
-            return NGX_HTTP_INTERNAL_SERVER_ERROR;
-        }
-        body.data = p;
-        body.len = ngx_sprintf(p, "{\"purged\":%ui}\n", purged) - p;
-        return ngx_http_cache_turbo_send_json(r, NGX_HTTP_OK, &body);
-    }
-
-    /* GET / HEAD -> stats. `?autotune=1` first forces an immediate autotune
-     * recompute over the window since the last tick (operator "recompute now"),
-     * so the returned autotuned_beta reflects current stats without waiting on the
-     * interval. `?format=prometheus` renders the Prometheus text exposition
-     * format (for a scrape) instead of JSON. Snapshot the counters through the L1
-     * backend rather than reading the live shctx here. */
-    {
-        ngx_http_cache_turbo_stats_t  st;
-        ngx_str_t                     arg;
-
-        if (r->args.len
-            && ngx_http_arg(r, (u_char *) "autotune", 8, &arg) == NGX_OK)
-        {
-            ngx_http_cache_turbo_autotune_force(z);
-        }
-
-        clcf->l1->stats(z, &st);
-
-        if (r->args.len
-            && ngx_http_arg(r, (u_char *) "format", 6, &arg) == NGX_OK
-            && arg.len == sizeof("prometheus") - 1
-            && ngx_strncmp(arg.data, "prometheus", arg.len) == 0)
-        {
-            ngx_str_t  zname = clcf->admin_zone->shm.name;
-
-            /* Fifteen counters (*_total) + four gauges, each labelled by zone
-             * so one Prometheus job can scrape many zones. Exposition format
-             * 0.0.4. The per-metric budget must track the emitted count (19):
-             * every metric line renders one %V (zone) + one %uA (value), so a
-             * short multiplier could truncate the last line under a long zone
-             * name. The fixed term covers the HELP/TYPE prose, which grows
-             * with every metric added -- bump BOTH when adding one (L13 added
-             * the 14th and needed ~180 bytes of prose; a stale 13 truncated
-             * the JSON arm's neighbour into invalid output; S7.1 added three
-             * more, prose term bumped by ~450 bytes for their HELP/TYPE
-             * lines; H7.3a added breaker_opens_total (counter) and
-             * breaker_state (gauge), prose term bumped by ~350 bytes -- the
-             * breaker_state HELP documents the numeric mapping since the
-             * value itself is deliberately NOT a label, see the emit call
-             * below). */
-            len = 3900 + 19 * zname.len + 19 * NGX_ATOMIC_T_LEN;
-            p = ngx_pnalloc(r->pool, len);
-            if (p == NULL) {
-                return NGX_HTTP_INTERNAL_SERVER_ERROR;
-            }
-            body.data = p;
-            body.len = ngx_snprintf(p, len,
-                "# HELP cache_turbo_hits_total Fresh L1 cache hits served.\n"
-                "# TYPE cache_turbo_hits_total counter\n"
-                "cache_turbo_hits_total{zone=\"%V\"} %uA\n"
-                "# HELP cache_turbo_misses_total Misses that went to the origin.\n"
-                "# TYPE cache_turbo_misses_total counter\n"
-                "cache_turbo_misses_total{zone=\"%V\"} %uA\n"
-                "# HELP cache_turbo_stale_serves_total Stale copies served while a refresh ran.\n"
-                "# TYPE cache_turbo_stale_serves_total counter\n"
-                "cache_turbo_stale_serves_total{zone=\"%V\"} %uA\n"
-                "# HELP cache_turbo_refreshes_total Background single-flight refreshes started.\n"
-                "# TYPE cache_turbo_refreshes_total counter\n"
-                "cache_turbo_refreshes_total{zone=\"%V\"} %uA\n"
-                "# HELP cache_turbo_evictions_total Entries evicted under memory pressure (LRU).\n"
-                "# TYPE cache_turbo_evictions_total counter\n"
-                "cache_turbo_evictions_total{zone=\"%V\"} %uA\n"
-                "# HELP cache_turbo_l2_hits_total L1 misses satisfied by the L2 tier (Redis or memcached).\n"
-                "# TYPE cache_turbo_l2_hits_total counter\n"
-                "cache_turbo_l2_hits_total{zone=\"%V\"} %uA\n"
-                "# HELP cache_turbo_l2_misses_total L1 misses that L2 could not satisfy (went to origin).\n"
-                "# TYPE cache_turbo_l2_misses_total counter\n"
-                "cache_turbo_l2_misses_total{zone=\"%V\"} %uA\n"
-                "# HELP cache_turbo_lock_waits_total Cold-miss requests that waited for a single-flight fill (v10).\n"
-                "# TYPE cache_turbo_lock_waits_total counter\n"
-                "cache_turbo_lock_waits_total{zone=\"%V\"} %uA\n"
-                "# HELP cache_turbo_min_uses_skips_total Cold misses sent to origin without storing because the key is below cache_turbo_min_uses (v15).\n"
-                "# TYPE cache_turbo_min_uses_skips_total counter\n"
-                "cache_turbo_min_uses_skips_total{zone=\"%V\"} %uA\n"
-                "# HELP cache_turbo_l2_neg_skips_total L2 GETs skipped because a negative memo already recorded a miss for the key (L13).\n"
-                "# TYPE cache_turbo_l2_neg_skips_total counter\n"
-                "cache_turbo_l2_neg_skips_total{zone=\"%V\"} %uA\n"
-                "# HELP cache_turbo_bypasses_total Requests skipped straight to origin by a cache_turbo_bypass predicate or a CMS backend preset (subset of misses).\n"
-                "# TYPE cache_turbo_bypasses_total counter\n"
-                "cache_turbo_bypasses_total{zone=\"%V\"} %uA\n"
-                "# HELP cache_turbo_regen_cost_ms Average origin regeneration cost in milliseconds.\n"
-                "# TYPE cache_turbo_regen_cost_ms gauge\n"
-                "cache_turbo_regen_cost_ms{zone=\"%V\"} %uA\n"
-                "# HELP cache_turbo_autotuned_beta Live autotuned SWR beta (x1000; 0 = none).\n"
-                "# TYPE cache_turbo_autotuned_beta gauge\n"
-                "cache_turbo_autotuned_beta{zone=\"%V\"} %uA\n"
-                "# HELP cache_turbo_autotuned_load Live load factor widening stale window + lock_ttl under load (x1000; 1000 = none).\n"
-                "# TYPE cache_turbo_autotuned_load gauge\n"
-                "cache_turbo_autotuned_load{zone=\"%V\"} %uA\n"
-                "# HELP cache_turbo_sie_serves_total Responses served from a stale-if-error snapshot.\n"
-                "# TYPE cache_turbo_sie_serves_total counter\n"
-                "cache_turbo_sie_serves_total{zone=\"%V\"} %uA\n"
-                "# HELP cache_turbo_breaker_serves_total Responses served from the circuit breaker's armed fallback while OPEN.\n"
-                "# TYPE cache_turbo_breaker_serves_total counter\n"
-                "cache_turbo_breaker_serves_total{zone=\"%V\"} %uA\n"
-                "# HELP cache_turbo_origin_failures_total Origin responses recorded as a failure by the circuit breaker.\n"
-                "# TYPE cache_turbo_origin_failures_total counter\n"
-                "cache_turbo_origin_failures_total{zone=\"%V\"} %uA\n"
-                "# HELP cache_turbo_breaker_opens_total Lifetime count of CLOSED->OPEN circuit breaker trips.\n"
-                "# TYPE cache_turbo_breaker_opens_total counter\n"
-                "cache_turbo_breaker_opens_total{zone=\"%V\"} %uA\n"
-                "# HELP cache_turbo_breaker_state Circuit breaker state (0=closed, 1=open, 2=half-open).\n"
-                "# TYPE cache_turbo_breaker_state gauge\n"
-                "cache_turbo_breaker_state{zone=\"%V\"} %uA\n",
-                &zname, st.hits, &zname, st.misses, &zname, st.stale_serves,
-                &zname, st.refreshes, &zname, st.evictions,
-                &zname, st.l2_hits, &zname, st.l2_misses, &zname, st.lock_waits,
-                &zname, st.min_uses_skips, &zname, st.l2_neg_skips,
-                &zname, st.bypasses,
-                &zname, st.cost_ms, &zname, st.autotuned_beta,
-                &zname, st.autotuned_load,
-                &zname, st.sie_serves, &zname, st.breaker_serves,
-                &zname, st.origin_failures,
-                &zname, st.breaker_opens,
-                &zname, (ngx_atomic_uint_t) ngx_http_cache_turbo_brk_state(
-                    (ngx_uint_t) st.breaker_state)) - p;
-
-            return ngx_http_cache_turbo_send_body(r, NGX_HTTP_OK, &body,
-                "text/plain; version=0.0.4; charset=utf-8",
-                sizeof("text/plain; version=0.0.4; charset=utf-8") - 1);
-        }
-
-        len = sizeof("{\"hits\":,\"misses\":,\"stale_serves\":,\"refreshes\":,"
-                     "\"evictions\":,\"l2_hits\":,\"l2_misses\":,\"lock_waits\":,"
-                     "\"min_uses_skips\":,\"l2_neg_skips\":,\"bypasses\":,"
-                     "\"cost_ms\":,"
-                     "\"autotuned_beta\":,\"autotuned_load\":,"
-                     "\"breaker_state\":\"\",\"breaker_opens\":,"
-                     "\"sie_serves\":,\"breaker_serves\":,"
-                     "\"origin_failures\":}\n")
-              + 18 * NGX_ATOMIC_T_LEN
-              + sizeof("half-open") - 1;   /* longest _breaker_state_str value */
-        p = ngx_pnalloc(r->pool, len);
-        if (p == NULL) {
-            return NGX_HTTP_INTERNAL_SERVER_ERROR;
-        }
-        body.data = p;
-        body.len = ngx_sprintf(p,
-            "{\"hits\":%uA,\"misses\":%uA,\"stale_serves\":%uA,"
-            "\"refreshes\":%uA,\"evictions\":%uA,\"l2_hits\":%uA,"
-            "\"l2_misses\":%uA,\"lock_waits\":%uA,\"min_uses_skips\":%uA,"
-            "\"l2_neg_skips\":%uA,"
-            "\"bypasses\":%uA,\"cost_ms\":%uA,\"autotuned_beta\":%uA,"
-            "\"autotuned_load\":%uA,"
-            "\"breaker_state\":\"%s\",\"breaker_opens\":%uA,"
-            "\"sie_serves\":%uA,\"breaker_serves\":%uA,"
-            "\"origin_failures\":%uA}\n",
-            st.hits, st.misses, st.stale_serves,
-            st.refreshes, st.evictions, st.l2_hits, st.l2_misses,
-            st.lock_waits, st.min_uses_skips, st.l2_neg_skips,
-            st.bypasses, st.cost_ms,
-            st.autotuned_beta, st.autotuned_load,
-            ngx_http_cache_turbo_shm_breaker_state_str(
-                (ngx_uint_t) st.breaker_state),
-            st.breaker_opens,
-            st.sie_serves, st.breaker_serves, st.origin_failures) - p;
-    }
-    return ngx_http_cache_turbo_send_json(r, NGX_HTTP_OK, &body);
-}
-
-
 /* ----- warm (v3-3) --------------------------------------------------------- */
 
-/* Cap on URLs warmed per request. Keeps a single call well under nginx's
- * subrequest-depth limit and bounds the work one admin POST can schedule. */
-#define NGX_HTTP_CACHE_TURBO_WARM_MAX  32
+/* NGX_HTTP_CACHE_TURBO_WARM_MAX (cap on URLs warmed per request) moved to
+ * admin.c with the only caller, ngx_http_cache_turbo_warm. */
 
 
 /*
@@ -12727,7 +12258,8 @@ ngx_http_cache_turbo_warm_anonymize(ngx_http_request_t *sr)
     return NGX_OK;
 }
 
-static ngx_int_t
+/* Non-static: called from admin.c's warm dispatch too. */
+ngx_int_t
 ngx_http_cache_turbo_warm_one(ngx_http_request_t *r, ngx_str_t *uri,
     ngx_str_t *args)
 {
@@ -12772,123 +12304,6 @@ ngx_http_cache_turbo_warm_one(ngx_http_request_t *r, ngx_str_t *uri,
     sr->header_only = 0;
 
     return NGX_OK;
-}
-
-
-/*
- * ngx_http_subrequest() does NOT run ngx_http_parse_complex_uri() on the URI
- * we hand it -- that normalization only happens for a real client request
- * line, before any module sees it. A hand-built subrequest URI goes straight
- * into sr->uri and location matching verbatim, so a percent-decoded "?url="
- * value must be validated ourselves: reject an embedded NUL (truncates
- * downstream ngx_str_t-vs-C-string consumers, e.g. proxy_pass URI
- * construction or $uri in a log format) and reject any ".." path segment
- * (traversal past the intended location, e.g. "/%2e%2e/%2e%2e/etc/x").
- * Returns 1 if `uri` is safe to warm, 0 if it must be skipped.
- */
-static ngx_uint_t
-ngx_http_cache_turbo_warm_uri_is_safe(ngx_str_t *uri)
-{
-    u_char  *p, *last, *seg;
-
-    last = uri->data + uri->len;
-
-    for (p = uri->data; p < last; p++) {
-        if (*p == '\0') {
-            return 0;
-        }
-    }
-
-    /* uri->data[0] == '/' is guaranteed by the caller, so every segment
-     * starts right after a '/'. Walk segments delimited by '/' and reject
-     * one that is exactly "..". */
-    seg = uri->data + 1;
-    for (p = seg; p <= last; p++) {
-        if (p == last || *p == '/') {
-            if (p - seg == 2 && seg[0] == '.' && seg[1] == '.') {
-                return 0;
-            }
-            seg = p + 1;
-        }
-    }
-
-    return 1;
-}
-
-
-/*
- * POST /_cache?url=<path[,path,...]> — warm each comma-separated path. Each path
- * is percent-decoded (so an encoded URL still resolves) and an optional "?query"
- * suffix is passed through as the subrequest args. Only absolute paths ('/'...)
- * are accepted; anything else is skipped. Replies {"warmed":N} with N = number
- * of warm subrequests actually fired. The bg subrequests outlive this reply:
- * each bumped r->main->count, so the connection survives admin finalize until
- * they complete.
- */
-static ngx_int_t
-ngx_http_cache_turbo_warm(ngx_http_request_t *r, ngx_str_t *urls)
-{
-    u_char     *p, *last, *comma, *q, *dst, *s;
-    ngx_uint_t  warmed = 0;
-    ngx_str_t   uri, args, body;
-    u_char     *out;
-
-    p = urls->data;
-    last = p + urls->len;
-
-    while (p < last && warmed < NGX_HTTP_CACHE_TURBO_WARM_MAX) {
-        comma = ngx_strlchr(p, last, ',');
-        if (comma == NULL) {
-            comma = last;
-        }
-
-        if (comma > p) {
-            uri.data = p;
-            uri.len = comma - p;
-            ngx_str_null(&args);
-
-            /* split off a "?query" suffix; keep it as the subrequest args */
-            q = ngx_strlchr(uri.data, uri.data + uri.len, '?');
-            if (q != NULL) {
-                args.data = q + 1;
-                args.len = uri.data + uri.len - (q + 1);
-                uri.len = q - uri.data;
-            }
-
-            /* percent-decode the path into a fresh buffer (subrequest expects an
-             * unescaped uri); decoding never grows the string. */
-            if (uri.len > 0 && uri.data[0] == '/') {
-                dst = ngx_pnalloc(r->pool, uri.len);
-                if (dst == NULL) {
-                    return NGX_HTTP_INTERNAL_SERVER_ERROR;
-                }
-                s = uri.data;
-                {
-                    u_char  *d = dst;
-                    ngx_unescape_uri(&d, &s, uri.len, 0);
-                    uri.data = dst;
-                    uri.len = d - dst;
-                }
-
-                if (uri.len > 0 && uri.data[0] == '/'
-                    && ngx_http_cache_turbo_warm_uri_is_safe(&uri)
-                    && ngx_http_cache_turbo_warm_one(r, &uri, &args) == NGX_OK)
-                {
-                    warmed++;
-                }
-            }
-        }
-
-        p = comma + 1;
-    }
-
-    out = ngx_pnalloc(r->pool, sizeof("{\"warmed\":4294967295}\n"));
-    if (out == NULL) {
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
-    }
-    body.data = out;
-    body.len = ngx_sprintf(out, "{\"warmed\":%ui}\n", warmed) - out;
-    return ngx_http_cache_turbo_send_json(r, NGX_HTTP_OK, &body);
 }
 
 
