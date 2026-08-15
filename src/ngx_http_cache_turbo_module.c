@@ -5861,6 +5861,556 @@ ngx_http_cache_turbo_breaker_unavailable(ngx_http_request_t *r,
  * Returns NGX_DECLINED to mean "fall through to the L2 phase" (the inline
  * fall-through past the final unlock); NGX_DONE means this phase produced the
  * handler's return value, which it wrote to *out_rc. */
+/* MAINT-H4d phase helper for ngx_http_cache_turbo_access_l1().
+ * v4-4 load-adaptive stale window: widen ONLY the local `*stale_until` by the
+ * autotune load factor when under sustained backend load. Pure computation,
+ * no lock ops of its own -- always called while the caller already holds
+ * z->shpool->mutex (it reads z's autotune state), and it must run before the
+ * caller's serve/refresh-dice decisions, which is why it stays a plain
+ * in/out helper rather than something the caller could defer. */
+static void
+ngx_http_cache_turbo_access_l1_stale_window(ngx_http_cache_turbo_loc_conf_t *clcf,
+    ngx_http_cache_turbo_zone_t *z, time_t fresh_until, time_t *stale_until)
+{
+    if (*stale_until != 0 && clcf->autotune) {
+        ngx_int_t  load = ngx_http_cache_turbo_effective_load(clcf, z);
+
+        if (load > NGX_HTTP_CACHE_TURBO_AT_LOAD_BASE) {
+            time_t  win = *stale_until - fresh_until;   /* stored stale span */
+
+            if (win > 0) {
+                *stale_until += win
+                    * (load - NGX_HTTP_CACHE_TURBO_AT_LOAD_BASE)
+                    / NGX_HTTP_CACHE_TURBO_AT_LOAD_BASE;
+            }
+        }
+    }
+}
+
+
+
+/* MAINT-H4d phase helper for ngx_http_cache_turbo_access_l1().
+ * RFC-1 request freshness bounds (max-age / min-fresh / max-stale): an
+ * existing entry may be unacceptable to THIS client even when the cache
+ * would serve it. Sets fresh_ok / stale_ok (out-params) and ctx->req_reval.
+ * Pure computation, no lock ops -- always called while the caller holds the
+ * zone mutex, purely to read ctn->data (already resolved by the caller). */
+static void
+ngx_http_cache_turbo_access_l1_req_bounds(ngx_http_request_t *r,
+    ngx_http_cache_turbo_ctx_t *ctx, ngx_http_cache_turbo_node_t *ctn,
+    time_t now, time_t fresh_until, time_t stale_until,
+    ngx_int_t *fresh_ok, ngx_int_t *stale_ok)
+{
+    /* P2: only run the request-freshness-bounds verdict when the client
+     * actually sent max-age/min-fresh/max-stale. With none set,
+     * req_serve_verdict returns fresh_ok=stale_ok=1 unconditionally, so
+     * the block below can never set req_reval — pure dead work on the
+     * common (no request CC) hot path. only-if-cached is unaffected: it
+     * is gated at :2998/:3511, not here.
+     * len > 0 implies data != NULL (a real entry always has both; a
+     * stub/counter node is len == 0) — the serve blocks below already
+     * rely on this when they memcpy ctn->data. */
+    if (!(ctx->has_req_bounds && ctn->len > 0)) {
+        return;
+    }
+
+    {
+        time_t  created = (time_t)
+            ngx_http_cache_turbo_get_u64(ctn->data + 24);
+        ngx_int_t  in_window = (now < fresh_until)
+            || (stale_until == 0 || now < stale_until);
+
+        ngx_http_cache_turbo_req_serve_verdict(ctx, created, now,
+            fresh_until, fresh_ok, stale_ok);
+
+        if (in_window
+            && !((now < fresh_until) && *fresh_ok)
+            && !(((stale_until == 0) || now < stale_until) && *stale_ok))
+        {
+            ctx->req_reval = 1;
+            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                "cache_turbo: entry fails request freshness bounds "
+                "\"%V\" -> revalidate", &r->uri);
+        }
+    }
+}
+
+
+
+/* MAINT-H4d phase helper for ngx_http_cache_turbo_access_l1().
+ * PHASE -- the fresh-HIT serve arm (S232-BYPASS-STALE already routed
+ * ctx->brk_only away before the caller reaches here).
+ *
+ * ⚠ LOCK WINDOW: entered with z->shpool->mutex HELD (the caller's lock from
+ * the lookup above); this helper is the one that unlocks it, then pins the
+ * blob with a refcount BEFORE unlocking (ngx_http_cache_turbo_blob_acquire),
+ * so the pointer handed to serve() stays valid across the unlock -- eviction
+ * or refresh by any other worker after the unlock only drops the shared
+ * slab slot, never this ref. Always terminal (NGX_DONE): the caller must not
+ * touch the mutex or `ctn` again after this returns. */
+static ngx_int_t
+ngx_http_cache_turbo_access_l1_serve_fresh(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_zone_t *z,
+    ngx_http_cache_turbo_node_t *ctn, time_t now, uint32_t hash,
+    ngx_int_t *out_rc)
+{
+    /* PERF-7 fresh hit: serve the blob DIRECTLY out of shm (zero-copy).
+     * Pin it with a reference under the mutex we already hold; the serve
+     * path registers a pool cleanup that drops the ref once the response
+     * has drained, so eviction/refresh by any worker is safe meanwhile. */
+    u_char *body = ctn->data;
+    size_t  body_len = ctn->len;
+    ngx_http_cache_turbo_blob_acquire(body);
+    /* True LRU: promote this node to the head on access, so eviction
+     * targets the genuinely least-recently-used entry (not the oldest by
+     * insertion/refresh). P1: coarse-gate the splice — skip the LRU WRITE
+     * when this node was already spliced within the last second, so a
+     * hot key serializes readers on the mutex at most once/second. */
+    /* S8: shared promote-on-second-hit helper; also applies the P1
+     * 1s coarse gate internally. clcf->scan_resistant_pct == 0 (the
+     * default) makes this a plain probation re-head. */
+    ngx_http_cache_turbo_shm_touch_lru(z, ctn, now,
+                                       clcf->scan_resistant_pct);
+    ngx_shmtx_unlock(&z->shpool->mutex);
+    (void) ngx_atomic_fetch_add(&z->sh->hits, 1);
+    ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "cache_turbo: L1 HIT (fresh) \"%V\" key=%ui len=%uz",
+                   &r->uri, (ngx_uint_t) hash, body_len);
+
+    *out_rc = ngx_http_cache_turbo_serve(r, body, body_len, 0, z, body,
+              NULL);
+    return NGX_DONE;
+}
+
+
+
+/* MAINT-H4d phase helper for ngx_http_cache_turbo_access_l1().
+ * PHASE -- the stale-but-serveable arm: cross-node single-flight resolution,
+ * the per-box refresh dice, and the plain stale serve when nobody wins it.
+ *
+ * ⚠ LOCK WINDOW: entered with z->shpool->mutex HELD (same lock as the
+ * fresh-hit arm above). This phase stayed WHOLE rather than being split
+ * further: every pointer this phase pins (ctn->data via blob_acquire) is
+ * registered with a pool cleanup (blob_ref_cleanup) BEFORE the matching
+ * unlock, so it stays valid across the unlock and into warm_one()/serve() --
+ * splitting the cross-node-lock / refresh-dice / plain-stale-serve arms
+ * into separate helpers would force the lock (or an already-armed pin)
+ * across a helper boundary, which PR #296 fixed this exact function to
+ * avoid. No callee here re-acquires z->shpool->mutex: backend->lock() talks
+ * to L2 (Redis), not the zone mutex, and warm_one()/serve() are called only
+ * after this phase's own unlock. Always terminal (NGX_DONE) on every path
+ * that runs, matching every unlock below. */
+static ngx_int_t
+ngx_http_cache_turbo_access_l1_serve_stale(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx,
+    ngx_http_cache_turbo_zone_t *z, ngx_http_cache_turbo_node_t *ctn,
+    time_t now, time_t fresh_until, uint32_t hash, ngx_int_t *out_rc)
+{
+    time_t  stale_window;
+    ngx_int_t  refresh;
+
+    /* stale-but-serveable. The `len > 0` guard skips a cold-miss
+     * single-flight STUB (v10: data == NULL, len == 0, stale_until == 0)
+     * — a stub is an in-flight marker, never serveable; it falls through
+     * to the cold path below where the waiter/claim logic handles it. */
+
+    /* True LRU: promote on access (still a live, serveable entry).
+     * P1: coarse-gate the splice (see the fresh-HIT site above). */
+    /* S8: shared promote-on-second-hit helper; also applies the P1
+     * 1s coarse gate internally. clcf->scan_resistant_pct == 0 (the
+     * default) makes this a plain probation re-head. */
+    ngx_http_cache_turbo_shm_touch_lru(z, ctn, now,
+                                       clcf->scan_resistant_pct);
+
+    /* Cross-node single-flight resolved (v4-2): we parked for the Redis
+     * NX and the phase engine re-entered. If we won (NGX_OK), we own the
+     * cluster-wide regen → go to origin. If the lock channel FAILED
+     * (NGX_ERROR: Redis timeout/outage), there is no cross-node
+     * coordination to honour, so degrade to per-box single-flight and
+     * regenerate locally — `refreshing` is already claimed, so this box
+     * still single-flights while a peer with a live Redis can win the NX.
+     * Only a genuine peer-holds (NGX_DECLINED) falls through to serve
+     * stale: the dice is skipped (refreshing claimed) and the tail below
+     * serves stale — no extra state needed. */
+    if (ctx->lock_done
+        && (ctx->lock_result == NGX_OK || ctx->lock_result == NGX_ERROR))
+    {
+        /* We own the (cluster-wide, or per-box on L2 failure) regen. With
+         * background_update (v8,
+         * default) refresh in the background and serve stale now; else
+         * fall through to the origin and regenerate inline. */
+        if (clcf->background_update) {
+            /* S231-PERF-BGSNAP: PERF-7 style zero-copy pin instead of a
+             * full-body memcpy under the zone mutex -- same treatment as
+             * the SIE/breaker arms above (S231-PERF-SIEARM). UNLIKE
+             * those arming sites, the pinned pointer is used
+             * immediately (not stashed for a maybe-never-consumed
+             * fallback): it must stay valid across the unlock below,
+             * across warm_one() (which may itself touch this zone), and
+             * into serve(), which is exactly what the refcount is for
+             * -- see the PERF-7 comment on the fresh-HIT site above
+             * ("eviction/refresh by any worker is safe meanwhile").
+             *
+             * Register the drop BEFORE acquiring, same ordering
+             * invariant as blob_ref_cleanup()'s own comment: the only
+             * failing call here is ngx_pool_cleanup_add(), which
+             * touches r->pool only, so failing first costs nothing to
+             * undo. Acquiring first would force the failure arm to
+             * call blob_release(), which takes the zone mutex we are
+             * still holding here (ngx_shmtx is not recursive). */
+            u_char *snap;
+            size_t  snap_len;
+
+            if (ngx_http_cache_turbo_blob_ref_cleanup(r, z, ctn->data,
+                    NULL) != NGX_OK)
+            {
+                ngx_shmtx_unlock(&z->shpool->mutex);
+
+                *out_rc = NGX_ERROR;
+                return NGX_DONE;
+
+            }
+            ngx_http_cache_turbo_blob_acquire(ctn->data);
+            snap = ctn->data;
+            snap_len = ctn->len;
+            ngx_shmtx_unlock(&z->shpool->mutex);
+            (void) ngx_http_cache_turbo_warm_one(r, &r->uri, &r->args);
+            (void) ngx_atomic_fetch_add(&z->sh->stale_serves, 1);
+            ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                           "cache_turbo: cross-node WON bg-refresh + STALE "
+                           "serve \"%V\" key=%ui len=%uz",
+                           &r->uri, (ngx_uint_t) hash, snap_len);
+            /* ref_data is NULL: the cleanup was already registered
+             * above (blob_ref_cleanup), so serve() must not register a
+             * second one for the same pointer -- see the double-drop
+             * warning on blob_ref_cleanup()'s comment. */
+
+            *out_rc = ngx_http_cache_turbo_serve(r, snap, snap_len, 1,
+                      z, NULL, NULL);
+            return NGX_DONE;
+
+        }
+        ngx_shmtx_unlock(&z->shpool->mutex);
+        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "cache_turbo: cross-node lock WON \"%V\" key=%ui "
+                       "-> regenerate", &r->uri, (ngx_uint_t) hash);
+
+        *out_rc = NGX_DECLINED;
+        return NGX_DONE;
+
+    }
+
+    /* Refresh-dice window from the OBJECT's own deadlines, not the
+     * location default (COR-3): a per-status TTL or an honor_cc upstream
+     * max-age gives this node a different fresh/stale span than
+     * clcf->valid, so using clcf->valid here mis-scaled the dice and such
+     * objects could expire cold. stale_until == 0 (no stale deadline)
+     * falls back to the location-derived window. */
+    if (ctn->stale_until != 0) {
+        stale_window = ctn->stale_until - fresh_until;
+    } else {
+        stale_window = ngx_http_cache_turbo_stale_ttl(clcf->valid,
+                           clcf->stale_mult)
+                       - clcf->valid;
+    }
+    if (stale_window <= 0) {
+        stale_window = 1;
+    }
+
+    /* Hard single-flight: if a refresh is already claimed and its lock
+     * window hasn't expired, every reader serves stale and skips the
+     * dice entirely. Only when no lock is held (or it has expired, i.e.
+     * the previous refresh died) does anyone roll to become the single
+     * regenerator. This caps origin regens at ~one per stale cycle even
+     * with many workers and aggressive beta. */
+    refresh = NGX_DECLINED;
+    if (!ctx->lock_done
+        && (!ctn->refreshing || now >= ctn->refresh_lock_until))
+    {
+        refresh = ngx_http_cache_turbo_should_refresh(ctx->key_hash,
+                      fresh_until, stale_window,
+                      ngx_http_cache_turbo_effective_beta(clcf, z));
+    }
+
+    if (refresh == NGX_OK) {
+        /* We win the per-box dice: claim the refresh under lock (atomic
+         * with the check above). With background_update on (v8, default)
+         * this request serves STALE and refreshes in the background — it
+         * never blocks on origin; the bg subrequest restores a fresh copy
+         * and a failed origin (5xx/timeout) leaves the stale entry intact
+         * (stale-if-error). With background_update off it falls through to
+         * the origin and regenerates SYNCHRONOUSLY (serving fresh). Either
+         * way the OTHER concurrent readers serve stale. We count a
+         * `refresh` here (the regen we triggered) plus a `stale_serve` on
+         * the bg path (the stale response we hand back). The lock
+         * self-heals after lock_ttl if the refresh never completes. */
+        time_t  lock_ttl = clcf->lock_ttl;
+        u_char *snap;
+        size_t  snap_len;
+
+        if (lock_ttl <= 0) {
+            lock_ttl = 5;
+        }
+
+        /* v4-4: a slow origin (the load case) takes longer to regen, so
+         * widen the single-flight window by the load factor — hold the
+         * claim long enough that a still-running slow refresh isn't
+         * re-claimed, collapsing more requests onto the one regen. */
+        lock_ttl = lock_ttl
+            * ngx_http_cache_turbo_effective_load(clcf, z)
+            / NGX_HTTP_CACHE_TURBO_AT_LOAD_BASE;
+
+        /* S231-PERF-BGSNAP: pin the stale copy under the lock instead
+         * of memcpy'ing the full body — used to serve stale on the
+         * single-box background-update path below (PERF-7 zero-copy,
+         * same treatment as the cross-node WON arm just above and the
+         * SIE/breaker arms, S231-PERF-SIEARM). The pin must outlive
+         * this critical section: a cross-node lock() call below can
+         * park this request (NGX_AGAIN) and never consume `snap` on
+         * this stack at all, or `background_update` can be off and
+         * fall straight through without consuming it either — both are
+         * fine, since the ref is dropped by the pool cleanup
+         * registered here regardless of whether it is ever served (the
+         * same "arm now, maybe never consumed" shape the SIE/breaker
+         * comment describes), not by anything on this stack.
+         *
+         * Register the drop BEFORE acquiring, per the ordering
+         * invariant on blob_ref_cleanup(): the only failing call here
+         * is ngx_pool_cleanup_add() (r->pool only), so failing first
+         * costs nothing to undo, whereas acquiring first would force
+         * the failure arm to call blob_release() while still holding
+         * this same zone mutex (ngx_shmtx is not recursive). */
+        snap_len = ctn->len;
+        if (ngx_http_cache_turbo_blob_ref_cleanup(r, z, ctn->data,
+                NULL) != NGX_OK)
+        {
+            ngx_shmtx_unlock(&z->shpool->mutex);
+
+            *out_rc = NGX_ERROR;
+            return NGX_DONE;
+
+        }
+        ngx_http_cache_turbo_blob_acquire(ctn->data);
+        snap = ctn->data;
+
+        /* CTXRDR-ADOPT-LEASE: deliberately NO refresh_owner here. This is
+         * the v8 background-update lease on an ENTRY that still has a
+         * body, not the cold-miss stub lease. It is resolved by store()
+         * overwriting the node, never by unstub() -- which ignores an
+         * ENTRY (kind == COUNTER is required) -- and it is never adopted
+         * across a redirect, because a request holding it is serving
+         * stale rather than parking in cold_wait(). The two leases share
+         * the `refreshing` flag and nothing else. */
+        ctn->refreshing = 1;
+        ctn->refresh_lock_until = now + lock_ttl;
+        ngx_shmtx_unlock(&z->shpool->mutex);
+        (void) ngx_atomic_fetch_add(&z->sh->refreshes, 1);
+        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "cache_turbo: stale, refresh dice WON \"%V\" "
+                       "key=%ui", &r->uri, (ngx_uint_t) hash);
+
+        /* Cross-node gate (v4-2): the per-box L1 dice win is necessary
+         * but not sufficient — only the node that ALSO wins the Redis
+         * SET NX PX regenerates; the rest serve stale. lock() parks for
+         * the NX reply and re-enters this handler (ctx->lock_done set,
+         * resolved at the top of this block — bg or inline). NGX_DECLINED
+         * = L2 off / could not start → single-box fallback below. */
+        if (clcf->backend && clcf->backend->lock) {
+            ngx_int_t  lrc = clcf->backend->lock(r, clcf, ctx, lock_ttl);
+            if (lrc == NGX_AGAIN) {
+                ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                               "cache_turbo: parked on L2 lock NX \"%V\" "
+                               "key=%ui", &r->uri, (ngx_uint_t) hash);
+
+                *out_rc = NGX_AGAIN;
+                return NGX_DONE;
+       /* parked; resume re-enters */
+            }
+        }
+
+        /* single-box winner (no L2 lock, or it could not start). */
+        if (clcf->background_update) {
+            /* v8: fire a background refresh of this URI, serve stale. */
+            (void) ngx_http_cache_turbo_warm_one(r, &r->uri, &r->args);
+            (void) ngx_atomic_fetch_add(&z->sh->stale_serves, 1);
+            ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                           "cache_turbo: bg-refresh + STALE serve \"%V\" "
+                           "key=%ui len=%uz", &r->uri, (ngx_uint_t) hash,
+                           snap_len);
+
+            *out_rc = ngx_http_cache_turbo_serve(r, snap, snap_len, 1,
+                      z, NULL, NULL);
+            return NGX_DONE;
+
+        }
+
+
+        *out_rc = NGX_DECLINED;
+        return NGX_DONE;
+       /* inline regen (serves fresh) */
+    }
+
+    /* serve stale, no regeneration on this request */
+    {
+        /* PERF-7: zero-copy stale serve (see the fresh-hit path). */
+        u_char *body = ctn->data;
+        size_t  body_len = ctn->len;
+        ngx_http_cache_turbo_blob_acquire(body);
+        ngx_shmtx_unlock(&z->shpool->mutex);
+        (void) ngx_atomic_fetch_add(&z->sh->stale_serves, 1);
+        ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "cache_turbo: STALE serve \"%V\" key=%ui len=%uz",
+                       &r->uri, (ngx_uint_t) hash, body_len);
+
+        *out_rc = ngx_http_cache_turbo_serve(r, body, body_len, 1, z, body,
+                  NULL);
+        return NGX_DONE;
+
+    }
+}
+
+
+
+/* MAINT-H4d phase helper for ngx_http_cache_turbo_access_l1().
+ * PHASE -- breaker-fallback arm from an expired L1 entry (P6/O4.3). Pure
+ * arm-and-log, no lock ops of its own: always called while the caller still
+ * holds z->shpool->mutex from the lookup (it pins ctn->data under that
+ * lock). void: the inline block had no return, the caller always continues
+ * into the SIE-arm phase afterward regardless of outcome. */
+static void
+ngx_http_cache_turbo_access_l1_breaker_arm(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_zone_t *z,
+    ngx_http_cache_turbo_ctx_t *ctx, ngx_http_cache_turbo_node_t *ctn,
+    uint32_t hash)
+{
+    /* P6/O4.3: arm the circuit-breaker fallback from this expired L1 entry.
+     *
+     * Unconditional on age, unlike the SIE arming below: the breaker's
+     * contract is "any body beats a 503 once the origin is known down". The
+     * entry has already fallen past its stale window here, so nothing on the
+     * NORMAL path will ever serve it -- only the pre-origin breaker gate
+     * can, and only while the breaker is OPEN.
+     *
+     * ⚠ Gated on breaker_should_consult() so this costs nothing when the
+     * breaker is off by ANY of its off-switches: it is a full-blob memcpy
+     * on the expired-entry path, which is every request to a cold-ish
+     * key. Same predicate the pre-origin gate below uses.
+     *
+     * The !brk_armed guard makes the park/resume re-entries idempotent (the
+     * L2 GET and the cold-wait both re-enter this handler from the top),
+     * exactly as !sie_armed does below. */
+    if (ctn->len > 0 && !ctx->brk_arm_done
+        && ngx_http_cache_turbo_breaker_should_consult(clcf))
+    {
+        /* PERF-7 style zero-copy arm: pin the blob in the slab under the
+         * mutex we already hold instead of copying it. A full-blob memcpy
+         * here would run on EVERY enabled request that finds an expired
+         * entry, inside the cross-worker zone lock, on objects up to
+         * cache_turbo_max_object (1 MiB by default, configurable higher) --
+         * a lock convoy on precisely the outage path this feature is meant
+         * to smooth. The reference is released by the pool cleanup that
+         * ngx_http_cache_turbo_serve() registers for ref_data.
+         *
+         * ⚠ Arming does not mean serving: most armed requests fall through
+         * to the origin with a CLOSED breaker and never call _serve(). The
+         * ref must therefore be dropped when nobody consumes it, which is
+         * what the explicit cleanup below is for -- see brk_ref. */
+        /* Register the drop BEFORE acquiring. ngx_pool_cleanup_add() is
+         * the only thing here that can fail, and it touches r->pool only
+         * -- no slab, no zone mutex -- so failing first costs nothing to
+         * undo. Acquiring first would force the failure arm to call
+         * blob_release(), which takes the zone mutex itself (shm.c) and so
+         * requires unlocking here; ngx_shmtx is not recursive. That unlock
+         * would invalidate `ctn` -- it was resolved at the lookup and is
+         * only valid while the mutex is held -- letting a concurrent
+         * evict/refresh/purge detach the blob and our own release then free
+         * it, leaving the SIE block below dereferencing freed slab. */
+        ngx_http_cache_turbo_blob_cln_t  *bcc = NULL;
+
+        if (ngx_http_cache_turbo_blob_ref_cleanup(r, z, ctn->data, &bcc)
+            == NGX_OK)
+        {
+            ctx->brk_arm_done = 1;
+            ngx_http_cache_turbo_blob_acquire(ctn->data);
+            ctx->brk_snap = ctn->data;
+            ctx->brk_snap_len = ctn->len;
+            ctx->brk_ref = ctn->data;
+            ctx->brk_cln = bcc;
+            ctx->brk_armed = 1;
+
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+            /* O4.4-i negative control for THIS site. Inside the
+             * should_consult() branch on purpose -- see the field comment.
+             * Bumps the L1 field only: a shared counter would let an L2
+             * assertion pass on this site's bump. */
+            (void) ngx_atomic_fetch_add(&z->sh->test_brk_armings_l1, 1);
+#endif
+
+            ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                           "cache_turbo: breaker fallback armed from L1 "
+                           "\"%V\" key=%ui", &r->uri, (ngx_uint_t) hash);
+        }
+    }
+}
+
+
+
+/* MAINT-H4d phase helper for ngx_http_cache_turbo_access_l1().
+ * PHASE -- serve-on-error (RFC 5861 §4 / CTB4) snapshot arm from an expired
+ * L1 entry. Pure arm-and-log, no lock ops of its own: always called while
+ * the caller still holds z->shpool->mutex (same as the breaker-arm phase
+ * just above). void: the inline block had no return, the caller always
+ * continues to the L1 unlock afterward regardless of outcome. */
+static void
+ngx_http_cache_turbo_access_l1_sie_arm(ngx_http_request_t *r,
+    ngx_http_cache_turbo_zone_t *z, ngx_http_cache_turbo_ctx_t *ctx,
+    ngx_http_cache_turbo_node_t *ctn, time_t now, uint32_t hash)
+{
+    if (ctn->len > 0 && !ctx->sie_armed) {
+        time_t    created = (time_t)
+            ngx_http_cache_turbo_get_u64(ctn->data + 24);
+        uint32_t  sie_ttl = ngx_http_cache_turbo_get_u32(ctn->data + 40);
+
+        if (sie_ttl > 0 && now < created + (time_t) sie_ttl) {
+            /* S231-PERF-SIEARM: PERF-7 style zero-copy arm, same reasoning
+             * as the breaker arm just above -- see its comment for the
+             * full rationale; this is the identical hazard on the SAME
+             * `ctn`, still under the SAME mutex hold.
+             *
+             * Register the drop BEFORE acquiring. ngx_pool_cleanup_add()
+             * is the only thing here that can fail, and it touches
+             * r->pool only -- no slab, no zone mutex -- so failing first
+             * costs nothing to undo. Acquiring first would force the
+             * failure arm to call blob_release(), which takes the zone
+             * mutex itself (shm.c) and so requires unlocking here;
+             * ngx_shmtx is not recursive. That unlock would invalidate
+             * `ctn` -- it was resolved at the lookup and is only valid
+             * while the mutex is held -- letting a concurrent
+             * evict/refresh/purge detach the blob and our own release
+             * then free it, leaving the L2-consult code below
+             * dereferencing freed slab. */
+            /* No early-drop caller for the SIE arm (unlike the breaker's
+             * brk_ref_drop), so nothing needs the cleanup record back --
+             * pass NULL and let the pool-lifetime drop be the only
+             * owner. */
+            if (ngx_http_cache_turbo_blob_ref_cleanup(r, z, ctn->data,
+                    NULL) == NGX_OK)
+            {
+                ngx_http_cache_turbo_blob_acquire(ctn->data);
+                ctx->sie_snap = ctn->data;
+                ctx->sie_snap_len = ctn->len;
+                ctx->sie_armed = 1;
+                ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                               "cache_turbo: SIE armed from L1 \"%V\" key=%ui",
+                               &r->uri, (ngx_uint_t) hash);
+            }
+        }
+    }
+}
+
+
+
 static ngx_int_t
 ngx_http_cache_turbo_access_l1(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx,
@@ -5894,69 +6444,16 @@ ngx_http_cache_turbo_access_l1(ngx_http_request_t *r,
         time_t     now = ngx_time();
         time_t     fresh_until = ctn->fresh_until;
         time_t     stale_until = ctn->stale_until;
-        time_t     stale_window;
-        ngx_int_t  refresh;
         ngx_int_t  fresh_ok = 1, stale_ok = 1;
 
-        /* v4-4 load-adaptive stale window. Under sustained backend load
-         * autotune publishes a load factor (>BASE); widen ONLY the serveable
-         * stale deadline by it, so a slow origin is shielded by serving stale
-         * longer before a hard miss. The FRESH deadline (fresh_until) is left
-         * untouched — the freshness contract the operator configured is never
-         * relaxed, only the best-effort stale grace is. stale_until == 0 means
-         * "no stale deadline" (e.g. cache-forever) and is left as-is. The widen
-         * applies to the local `stale_until` only; the refresh-dice window below
-         * still reads ctn->stale_until (the STORED window), so beta keeps owning
-         * refresh timing while the load factor owns serve-stale reach. */
-        if (stale_until != 0 && clcf->autotune) {
-            ngx_int_t  load = ngx_http_cache_turbo_effective_load(clcf, z);
-
-            if (load > NGX_HTTP_CACHE_TURBO_AT_LOAD_BASE) {
-                time_t  win = stale_until - fresh_until;   /* stored stale span */
-
-                if (win > 0) {
-                    stale_until += win
-                        * (load - NGX_HTTP_CACHE_TURBO_AT_LOAD_BASE)
-                        / NGX_HTTP_CACHE_TURBO_AT_LOAD_BASE;
-                }
-            }
-        }
-
-        /* RFC-1 request freshness bounds (max-age / min-fresh / max-stale): an
-         * existing entry may be unacceptable to THIS client even when the cache
-         * would serve it. Read the blob's created stamp (offset 24) for an exact
-         * age; the verdict gates the two serve blocks below. When a serveable
-         * entry is blocked by the bounds, req_reval makes this a revalidation:
-         * the cold-miss CLAIM_FRESH path must not re-serve the raced-in fresh
-         * entry, and only-if-cached still 504s at the post-L2 chokepoint. */
-        if (ctx->has_req_bounds && ctn->len > 0) {
-            /* P2: only run the request-freshness-bounds verdict when the client
-             * actually sent max-age/min-fresh/max-stale. With none set,
-             * req_serve_verdict returns fresh_ok=stale_ok=1 unconditionally, so
-             * the block below can never set req_reval — pure dead work on the
-             * common (no request CC) hot path. only-if-cached is unaffected: it
-             * is gated at :2998/:3511, not here.
-             * len > 0 implies data != NULL (a real entry always has both; a
-             * stub/counter node is len == 0) — the serve blocks below already
-             * rely on this when they memcpy ctn->data. */
-            time_t  created = (time_t)
-                ngx_http_cache_turbo_get_u64(ctn->data + 24);
-            ngx_int_t  in_window = (now < fresh_until)
-                || (stale_until == 0 || now < stale_until);
-
-            ngx_http_cache_turbo_req_serve_verdict(ctx, created, now,
-                fresh_until, &fresh_ok, &stale_ok);
-
-            if (in_window
-                && !((now < fresh_until) && fresh_ok)
-                && !(((stale_until == 0) || now < stale_until) && stale_ok))
-            {
-                ctx->req_reval = 1;
-                ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                    "cache_turbo: entry fails request freshness bounds "
-                    "\"%V\" -> revalidate", &r->uri);
-            }
-        }
+        /* v4-4 load-adaptive stale window + RFC-1 request freshness bounds:
+         * two independent, pure, lock-free computations that must both run
+         * before the serve/expire decisions below can read fresh_until /
+         * stale_until / fresh_ok / stale_ok. Neither touches the mutex. */
+        ngx_http_cache_turbo_access_l1_stale_window(clcf, z, fresh_until,
+            &stale_until);
+        ngx_http_cache_turbo_access_l1_req_bounds(r, ctx, ctn, now,
+            fresh_until, stale_until, &fresh_ok, &stale_ok);
 
         /*
          * S232-BYPASS-STALE: a breaker-only entry is never a HIT, at any age.
@@ -5982,297 +6479,16 @@ ngx_http_cache_turbo_access_l1(ngx_http_request_t *r,
                            "never a hit", &r->uri);
 
         } else if (now < fresh_until && fresh_ok) {
-            /* PERF-7 fresh hit: serve the blob DIRECTLY out of shm (zero-copy).
-             * Pin it with a reference under the mutex we already hold; the serve
-             * path registers a pool cleanup that drops the ref once the response
-             * has drained, so eviction/refresh by any worker is safe meanwhile. */
-            u_char *body = ctn->data;
-            size_t  body_len = ctn->len;
-            ngx_http_cache_turbo_blob_acquire(body);
-            /* True LRU: promote this node to the head on access, so eviction
-             * targets the genuinely least-recently-used entry (not the oldest by
-             * insertion/refresh). P1: coarse-gate the splice — skip the LRU WRITE
-             * when this node was already spliced within the last second, so a
-             * hot key serializes readers on the mutex at most once/second. */
-            /* S8: shared promote-on-second-hit helper; also applies the P1
-             * 1s coarse gate internally. clcf->scan_resistant_pct == 0 (the
-             * default) makes this a plain probation re-head. */
-            ngx_http_cache_turbo_shm_touch_lru(z, ctn, now,
-                                               clcf->scan_resistant_pct);
-            ngx_shmtx_unlock(&z->shpool->mutex);
-            (void) ngx_atomic_fetch_add(&z->sh->hits, 1);
-            ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                           "cache_turbo: L1 HIT (fresh) \"%V\" key=%ui len=%uz",
-                           &r->uri, (ngx_uint_t) hash, body_len);
-
-            *out_rc = ngx_http_cache_turbo_serve(r, body, body_len, 0, z, body,
-                      NULL);
-            return NGX_DONE;
-
+            return ngx_http_cache_turbo_access_l1_serve_fresh(r, clcf, z,
+                ctn, now, hash, out_rc);
         }
 
         if (!ctx->brk_only
             && (stale_until == 0 || now < stale_until) && ctn->len > 0
             && stale_ok)
         {
-            /* stale-but-serveable. The `len > 0` guard skips a cold-miss
-             * single-flight STUB (v10: data == NULL, len == 0, stale_until == 0)
-             * — a stub is an in-flight marker, never serveable; it falls through
-             * to the cold path below where the waiter/claim logic handles it. */
-
-            /* True LRU: promote on access (still a live, serveable entry).
-             * P1: coarse-gate the splice (see the fresh-HIT site above). */
-            /* S8: shared promote-on-second-hit helper; also applies the P1
-             * 1s coarse gate internally. clcf->scan_resistant_pct == 0 (the
-             * default) makes this a plain probation re-head. */
-            ngx_http_cache_turbo_shm_touch_lru(z, ctn, now,
-                                               clcf->scan_resistant_pct);
-
-            /* Cross-node single-flight resolved (v4-2): we parked for the Redis
-             * NX and the phase engine re-entered. If we won (NGX_OK), we own the
-             * cluster-wide regen → go to origin. If the lock channel FAILED
-             * (NGX_ERROR: Redis timeout/outage), there is no cross-node
-             * coordination to honour, so degrade to per-box single-flight and
-             * regenerate locally — `refreshing` is already claimed, so this box
-             * still single-flights while a peer with a live Redis can win the NX.
-             * Only a genuine peer-holds (NGX_DECLINED) falls through to serve
-             * stale: the dice is skipped (refreshing claimed) and the tail below
-             * serves stale — no extra state needed. */
-            if (ctx->lock_done
-                && (ctx->lock_result == NGX_OK || ctx->lock_result == NGX_ERROR))
-            {
-                /* We own the (cluster-wide, or per-box on L2 failure) regen. With
-                 * background_update (v8,
-                 * default) refresh in the background and serve stale now; else
-                 * fall through to the origin and regenerate inline. */
-                if (clcf->background_update) {
-                    /* S231-PERF-BGSNAP: PERF-7 style zero-copy pin instead of a
-                     * full-body memcpy under the zone mutex -- same treatment as
-                     * the SIE/breaker arms above (S231-PERF-SIEARM). UNLIKE
-                     * those arming sites, the pinned pointer is used
-                     * immediately (not stashed for a maybe-never-consumed
-                     * fallback): it must stay valid across the unlock below,
-                     * across warm_one() (which may itself touch this zone), and
-                     * into serve(), which is exactly what the refcount is for
-                     * -- see the PERF-7 comment on the fresh-HIT site above
-                     * ("eviction/refresh by any worker is safe meanwhile").
-                     *
-                     * Register the drop BEFORE acquiring, same ordering
-                     * invariant as blob_ref_cleanup()'s own comment: the only
-                     * failing call here is ngx_pool_cleanup_add(), which
-                     * touches r->pool only, so failing first costs nothing to
-                     * undo. Acquiring first would force the failure arm to
-                     * call blob_release(), which takes the zone mutex we are
-                     * still holding here (ngx_shmtx is not recursive). */
-                    u_char *snap;
-                    size_t  snap_len;
-
-                    if (ngx_http_cache_turbo_blob_ref_cleanup(r, z, ctn->data,
-                            NULL) != NGX_OK)
-                    {
-                        ngx_shmtx_unlock(&z->shpool->mutex);
-
-                        *out_rc = NGX_ERROR;
-                        return NGX_DONE;
-
-                    }
-                    ngx_http_cache_turbo_blob_acquire(ctn->data);
-                    snap = ctn->data;
-                    snap_len = ctn->len;
-                    ngx_shmtx_unlock(&z->shpool->mutex);
-                    (void) ngx_http_cache_turbo_warm_one(r, &r->uri, &r->args);
-                    (void) ngx_atomic_fetch_add(&z->sh->stale_serves, 1);
-                    ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                                   "cache_turbo: cross-node WON bg-refresh + STALE "
-                                   "serve \"%V\" key=%ui len=%uz",
-                                   &r->uri, (ngx_uint_t) hash, snap_len);
-                    /* ref_data is NULL: the cleanup was already registered
-                     * above (blob_ref_cleanup), so serve() must not register a
-                     * second one for the same pointer -- see the double-drop
-                     * warning on blob_ref_cleanup()'s comment. */
-
-                    *out_rc = ngx_http_cache_turbo_serve(r, snap, snap_len, 1,
-                              z, NULL, NULL);
-                    return NGX_DONE;
-
-                }
-                ngx_shmtx_unlock(&z->shpool->mutex);
-                ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                               "cache_turbo: cross-node lock WON \"%V\" key=%ui "
-                               "-> regenerate", &r->uri, (ngx_uint_t) hash);
-
-                *out_rc = NGX_DECLINED;
-                return NGX_DONE;
-
-            }
-
-            /* Refresh-dice window from the OBJECT's own deadlines, not the
-             * location default (COR-3): a per-status TTL or an honor_cc upstream
-             * max-age gives this node a different fresh/stale span than
-             * clcf->valid, so using clcf->valid here mis-scaled the dice and such
-             * objects could expire cold. stale_until == 0 (no stale deadline)
-             * falls back to the location-derived window. */
-            if (ctn->stale_until != 0) {
-                stale_window = ctn->stale_until - fresh_until;
-            } else {
-                stale_window = ngx_http_cache_turbo_stale_ttl(clcf->valid,
-                                   clcf->stale_mult)
-                               - clcf->valid;
-            }
-            if (stale_window <= 0) {
-                stale_window = 1;
-            }
-
-            /* Hard single-flight: if a refresh is already claimed and its lock
-             * window hasn't expired, every reader serves stale and skips the
-             * dice entirely. Only when no lock is held (or it has expired, i.e.
-             * the previous refresh died) does anyone roll to become the single
-             * regenerator. This caps origin regens at ~one per stale cycle even
-             * with many workers and aggressive beta. */
-            refresh = NGX_DECLINED;
-            if (!ctx->lock_done
-                && (!ctn->refreshing || now >= ctn->refresh_lock_until))
-            {
-                refresh = ngx_http_cache_turbo_should_refresh(ctx->key_hash,
-                              fresh_until, stale_window,
-                              ngx_http_cache_turbo_effective_beta(clcf, z));
-            }
-
-            if (refresh == NGX_OK) {
-                /* We win the per-box dice: claim the refresh under lock (atomic
-                 * with the check above). With background_update on (v8, default)
-                 * this request serves STALE and refreshes in the background — it
-                 * never blocks on origin; the bg subrequest restores a fresh copy
-                 * and a failed origin (5xx/timeout) leaves the stale entry intact
-                 * (stale-if-error). With background_update off it falls through to
-                 * the origin and regenerates SYNCHRONOUSLY (serving fresh). Either
-                 * way the OTHER concurrent readers serve stale. We count a
-                 * `refresh` here (the regen we triggered) plus a `stale_serve` on
-                 * the bg path (the stale response we hand back). The lock
-                 * self-heals after lock_ttl if the refresh never completes. */
-                time_t  lock_ttl = clcf->lock_ttl;
-                u_char *snap;
-                size_t  snap_len;
-
-                if (lock_ttl <= 0) {
-                    lock_ttl = 5;
-                }
-
-                /* v4-4: a slow origin (the load case) takes longer to regen, so
-                 * widen the single-flight window by the load factor — hold the
-                 * claim long enough that a still-running slow refresh isn't
-                 * re-claimed, collapsing more requests onto the one regen. */
-                lock_ttl = lock_ttl
-                    * ngx_http_cache_turbo_effective_load(clcf, z)
-                    / NGX_HTTP_CACHE_TURBO_AT_LOAD_BASE;
-
-                /* S231-PERF-BGSNAP: pin the stale copy under the lock instead
-                 * of memcpy'ing the full body — used to serve stale on the
-                 * single-box background-update path below (PERF-7 zero-copy,
-                 * same treatment as the cross-node WON arm just above and the
-                 * SIE/breaker arms, S231-PERF-SIEARM). The pin must outlive
-                 * this critical section: a cross-node lock() call below can
-                 * park this request (NGX_AGAIN) and never consume `snap` on
-                 * this stack at all, or `background_update` can be off and
-                 * fall straight through without consuming it either — both are
-                 * fine, since the ref is dropped by the pool cleanup
-                 * registered here regardless of whether it is ever served (the
-                 * same "arm now, maybe never consumed" shape the SIE/breaker
-                 * comment describes), not by anything on this stack.
-                 *
-                 * Register the drop BEFORE acquiring, per the ordering
-                 * invariant on blob_ref_cleanup(): the only failing call here
-                 * is ngx_pool_cleanup_add() (r->pool only), so failing first
-                 * costs nothing to undo, whereas acquiring first would force
-                 * the failure arm to call blob_release() while still holding
-                 * this same zone mutex (ngx_shmtx is not recursive). */
-                snap_len = ctn->len;
-                if (ngx_http_cache_turbo_blob_ref_cleanup(r, z, ctn->data,
-                        NULL) != NGX_OK)
-                {
-                    ngx_shmtx_unlock(&z->shpool->mutex);
-
-                    *out_rc = NGX_ERROR;
-                    return NGX_DONE;
-
-                }
-                ngx_http_cache_turbo_blob_acquire(ctn->data);
-                snap = ctn->data;
-
-                /* CTXRDR-ADOPT-LEASE: deliberately NO refresh_owner here. This is
-                 * the v8 background-update lease on an ENTRY that still has a
-                 * body, not the cold-miss stub lease. It is resolved by store()
-                 * overwriting the node, never by unstub() -- which ignores an
-                 * ENTRY (kind == COUNTER is required) -- and it is never adopted
-                 * across a redirect, because a request holding it is serving
-                 * stale rather than parking in cold_wait(). The two leases share
-                 * the `refreshing` flag and nothing else. */
-                ctn->refreshing = 1;
-                ctn->refresh_lock_until = now + lock_ttl;
-                ngx_shmtx_unlock(&z->shpool->mutex);
-                (void) ngx_atomic_fetch_add(&z->sh->refreshes, 1);
-                ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                               "cache_turbo: stale, refresh dice WON \"%V\" "
-                               "key=%ui", &r->uri, (ngx_uint_t) hash);
-
-                /* Cross-node gate (v4-2): the per-box L1 dice win is necessary
-                 * but not sufficient — only the node that ALSO wins the Redis
-                 * SET NX PX regenerates; the rest serve stale. lock() parks for
-                 * the NX reply and re-enters this handler (ctx->lock_done set,
-                 * resolved at the top of this block — bg or inline). NGX_DECLINED
-                 * = L2 off / could not start → single-box fallback below. */
-                if (clcf->backend && clcf->backend->lock) {
-                    ngx_int_t  lrc = clcf->backend->lock(r, clcf, ctx, lock_ttl);
-                    if (lrc == NGX_AGAIN) {
-                        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                                       "cache_turbo: parked on L2 lock NX \"%V\" "
-                                       "key=%ui", &r->uri, (ngx_uint_t) hash);
-
-                        *out_rc = NGX_AGAIN;
-                        return NGX_DONE;
-       /* parked; resume re-enters */
-                    }
-                }
-
-                /* single-box winner (no L2 lock, or it could not start). */
-                if (clcf->background_update) {
-                    /* v8: fire a background refresh of this URI, serve stale. */
-                    (void) ngx_http_cache_turbo_warm_one(r, &r->uri, &r->args);
-                    (void) ngx_atomic_fetch_add(&z->sh->stale_serves, 1);
-                    ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                                   "cache_turbo: bg-refresh + STALE serve \"%V\" "
-                                   "key=%ui len=%uz", &r->uri, (ngx_uint_t) hash,
-                                   snap_len);
-
-                    *out_rc = ngx_http_cache_turbo_serve(r, snap, snap_len, 1,
-                              z, NULL, NULL);
-                    return NGX_DONE;
-
-                }
-
-
-                *out_rc = NGX_DECLINED;
-                return NGX_DONE;
-       /* inline regen (serves fresh) */
-            }
-
-            /* serve stale, no regeneration on this request */
-            {
-                /* PERF-7: zero-copy stale serve (see the fresh-hit path). */
-                u_char *body = ctn->data;
-                size_t  body_len = ctn->len;
-                ngx_http_cache_turbo_blob_acquire(body);
-                ngx_shmtx_unlock(&z->shpool->mutex);
-                (void) ngx_atomic_fetch_add(&z->sh->stale_serves, 1);
-                ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                               "cache_turbo: STALE serve \"%V\" key=%ui len=%uz",
-                               &r->uri, (ngx_uint_t) hash, body_len);
-
-                *out_rc = ngx_http_cache_turbo_serve(r, body, body_len, 1, z, body,
-                          NULL);
-                return NGX_DONE;
-
-            }
+            return ngx_http_cache_turbo_access_l1_serve_stale(r, clcf, ctx,
+                z, ctn, now, fresh_until, hash, out_rc);
         }
 
         /* expired: the L1 copy is past its stale window. Fall through to the
@@ -6293,116 +6509,8 @@ ngx_http_cache_turbo_access_l1(ngx_http_request_t *r,
          * stub; the !sie_armed guard makes the park/resume re-entries idempotent. */
         ctx->status = NGX_HTTP_CACHE_TURBO_ST_EXPIRED;
 
-        /* P6/O4.3: arm the circuit-breaker fallback from this expired L1 entry.
-         *
-         * Unconditional on age, unlike the SIE arming below: the breaker's
-         * contract is "any body beats a 503 once the origin is known down". The
-         * entry has already fallen past its stale window here, so nothing on the
-         * NORMAL path will ever serve it -- only the pre-origin breaker gate
-         * can, and only while the breaker is OPEN.
-         *
-         * ⚠ Gated on breaker_should_consult() so this costs nothing when the
-         * breaker is off by ANY of its off-switches: it is a full-blob memcpy
-         * on the expired-entry path, which is every request to a cold-ish
-         * key. Same predicate the pre-origin gate below uses.
-         *
-         * The !brk_armed guard makes the park/resume re-entries idempotent (the
-         * L2 GET and the cold-wait both re-enter this handler from the top),
-         * exactly as !sie_armed does below. */
-        if (ctn->len > 0 && !ctx->brk_arm_done
-            && ngx_http_cache_turbo_breaker_should_consult(clcf))
-        {
-            /* PERF-7 style zero-copy arm: pin the blob in the slab under the
-             * mutex we already hold instead of copying it. A full-blob memcpy
-             * here would run on EVERY enabled request that finds an expired
-             * entry, inside the cross-worker zone lock, on objects up to
-             * cache_turbo_max_object (1 MiB by default, configurable higher) --
-             * a lock convoy on precisely the outage path this feature is meant
-             * to smooth. The reference is released by the pool cleanup that
-             * ngx_http_cache_turbo_serve() registers for ref_data.
-             *
-             * ⚠ Arming does not mean serving: most armed requests fall through
-             * to the origin with a CLOSED breaker and never call _serve(). The
-             * ref must therefore be dropped when nobody consumes it, which is
-             * what the explicit cleanup below is for -- see brk_ref. */
-            /* Register the drop BEFORE acquiring. ngx_pool_cleanup_add() is
-             * the only thing here that can fail, and it touches r->pool only
-             * -- no slab, no zone mutex -- so failing first costs nothing to
-             * undo. Acquiring first would force the failure arm to call
-             * blob_release(), which takes the zone mutex itself (shm.c) and so
-             * requires unlocking here; ngx_shmtx is not recursive. That unlock
-             * would invalidate `ctn` -- it was resolved at the lookup and is
-             * only valid while the mutex is held -- letting a concurrent
-             * evict/refresh/purge detach the blob and our own release then free
-             * it, leaving the SIE block below dereferencing freed slab. */
-            ngx_http_cache_turbo_blob_cln_t  *bcc = NULL;
-
-            if (ngx_http_cache_turbo_blob_ref_cleanup(r, z, ctn->data, &bcc)
-                == NGX_OK)
-            {
-                ctx->brk_arm_done = 1;
-                ngx_http_cache_turbo_blob_acquire(ctn->data);
-                ctx->brk_snap = ctn->data;
-                ctx->brk_snap_len = ctn->len;
-                ctx->brk_ref = ctn->data;
-                ctx->brk_cln = bcc;
-                ctx->brk_armed = 1;
-
-#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
-    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
-                /* O4.4-i negative control for THIS site. Inside the
-                 * should_consult() branch on purpose -- see the field comment.
-                 * Bumps the L1 field only: a shared counter would let an L2
-                 * assertion pass on this site's bump. */
-                (void) ngx_atomic_fetch_add(&z->sh->test_brk_armings_l1, 1);
-#endif
-
-                ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                               "cache_turbo: breaker fallback armed from L1 "
-                               "\"%V\" key=%ui", &r->uri, (ngx_uint_t) hash);
-            }
-        }
-
-        if (ctn->len > 0 && !ctx->sie_armed) {
-            time_t    created = (time_t)
-                ngx_http_cache_turbo_get_u64(ctn->data + 24);
-            uint32_t  sie_ttl = ngx_http_cache_turbo_get_u32(ctn->data + 40);
-
-            if (sie_ttl > 0 && now < created + (time_t) sie_ttl) {
-                /* S231-PERF-SIEARM: PERF-7 style zero-copy arm, same reasoning
-                 * as the breaker arm just above -- see its comment for the
-                 * full rationale; this is the identical hazard on the SAME
-                 * `ctn`, still under the SAME mutex hold.
-                 *
-                 * Register the drop BEFORE acquiring. ngx_pool_cleanup_add()
-                 * is the only thing here that can fail, and it touches
-                 * r->pool only -- no slab, no zone mutex -- so failing first
-                 * costs nothing to undo. Acquiring first would force the
-                 * failure arm to call blob_release(), which takes the zone
-                 * mutex itself (shm.c) and so requires unlocking here;
-                 * ngx_shmtx is not recursive. That unlock would invalidate
-                 * `ctn` -- it was resolved at the lookup and is only valid
-                 * while the mutex is held -- letting a concurrent
-                 * evict/refresh/purge detach the blob and our own release
-                 * then free it, leaving the L2-consult code below
-                 * dereferencing freed slab. */
-                /* No early-drop caller for the SIE arm (unlike the breaker's
-                 * brk_ref_drop), so nothing needs the cleanup record back --
-                 * pass NULL and let the pool-lifetime drop be the only
-                 * owner. */
-                if (ngx_http_cache_turbo_blob_ref_cleanup(r, z, ctn->data,
-                        NULL) == NGX_OK)
-                {
-                    ngx_http_cache_turbo_blob_acquire(ctn->data);
-                    ctx->sie_snap = ctn->data;
-                    ctx->sie_snap_len = ctn->len;
-                    ctx->sie_armed = 1;
-                    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                                   "cache_turbo: SIE armed from L1 \"%V\" key=%ui",
-                                   &r->uri, (ngx_uint_t) hash);
-                }
-            }
-        }
+        ngx_http_cache_turbo_access_l1_breaker_arm(r, clcf, z, ctx, ctn, hash);
+        ngx_http_cache_turbo_access_l1_sie_arm(r, z, ctx, ctn, now, hash);
     }
 
     /* L1 absent (miss) or expired. Consult L2 (Redis or memcached -- the
