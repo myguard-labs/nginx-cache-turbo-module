@@ -8338,82 +8338,112 @@ ngx_http_cache_turbo_restore_alloc_fails(ngx_http_request_t *r)
  * weak comparator (correct for GET/HEAD): strip an optional "W/" from both the
  * stored tag and each list entry, then octet-compare the quoted opaque tag.
  */
+
+/* Phase 1 of ngx_http_cache_turbo_not_modified(): check If-None-Match header
+ * (etag matching). Returns non-zero if a match is found (resource not modified).
+ */
 static ngx_uint_t
-ngx_http_cache_turbo_not_modified(ngx_http_request_t *r,
-    u_char *etag, size_t etag_len, u_char *lm, size_t lm_len)
+ngx_http_cache_turbo_not_modified_etag(ngx_http_request_t *r,
+    u_char *etag, size_t etag_len)
 {
     ngx_table_elt_t  *inm = r->headers_in.if_none_match;
-    ngx_table_elt_t  *ims = r->headers_in.if_modified_since;
+    u_char           *start, *end, ch;
 
-    if (inm != NULL) {
-        u_char  *start = inm->value.data;
-        u_char  *end = start + inm->value.len;
-        u_char   ch;
-
-        /* "*" matches any current representation (we have one cached). */
-        if (inm->value.len == 1 && start[0] == '*') {
-            return 1;
-        }
-
-        if (etag_len == 0) {
-            return 0;
-        }
-
-        if (etag_len > 2 && etag[0] == 'W' && etag[1] == '/') {
-            etag += 2;
-            etag_len -= 2;
-        }
-
-        while (start < end) {
-
-            if (end - start > 2 && start[0] == 'W' && start[1] == '/') {
-                start += 2;
-            }
-
-            if (etag_len > (size_t) (end - start)) {
-                return 0;
-            }
-
-            if (ngx_strncmp(start, etag, etag_len) != 0) {
-                goto skip;
-            }
-
-            start += etag_len;
-
-            while (start < end) {
-                ch = *start;
-                if (ch == ' ' || ch == '\t') { start++; continue; }
-                break;
-            }
-
-            if (start == end || *start == ',') {
-                return 1;
-            }
-
-        skip:
-            while (start < end && *start != ',') { start++; }
-            while (start < end) {
-                ch = *start;
-                if (ch == ' ' || ch == '\t' || ch == ',') { start++; continue; }
-                break;
-            }
-        }
-
+    if (inm == NULL) {
         return 0;
     }
 
-    if (ims != NULL && lm_len) {
-        time_t  ims_t, lm_t;
+    start = inm->value.data;
+    end = start + inm->value.len;
 
-        ims_t = ngx_parse_http_time(ims->value.data, ims->value.len);
-        lm_t  = ngx_parse_http_time(lm, lm_len);
+    /* "*" matches any current representation (we have one cached). */
+    if (inm->value.len == 1 && start[0] == '*') {
+        return 1;
+    }
 
-        if (ims_t != NGX_ERROR && lm_t != NGX_ERROR && lm_t <= ims_t) {
+    if (etag_len == 0) {
+        return 0;
+    }
+
+    if (etag_len > 2 && etag[0] == 'W' && etag[1] == '/') {
+        etag += 2;
+        etag_len -= 2;
+    }
+
+    while (start < end) {
+
+        if (end - start > 2 && start[0] == 'W' && start[1] == '/') {
+            start += 2;
+        }
+
+        if (etag_len > (size_t) (end - start)) {
+            return 0;
+        }
+
+        if (ngx_strncmp(start, etag, etag_len) != 0) {
+            goto skip;
+        }
+
+        start += etag_len;
+
+        while (start < end) {
+            ch = *start;
+            if (ch == ' ' || ch == '\t') { start++; continue; }
+            break;
+        }
+
+        if (start == end || *start == ',') {
             return 1;
+        }
+
+    skip:
+        while (start < end && *start != ',') { start++; }
+        while (start < end) {
+            ch = *start;
+            if (ch == ' ' || ch == '\t' || ch == ',') { start++; continue; }
+            break;
         }
     }
 
     return 0;
+}
+
+
+/* Phase 2 of ngx_http_cache_turbo_not_modified(): check If-Modified-Since
+ * header (time comparison). Returns non-zero if resource was not modified
+ * (Last-Modified <= If-Modified-Since).
+ */
+static ngx_uint_t
+ngx_http_cache_turbo_not_modified_time(ngx_http_request_t *r,
+    u_char *lm, size_t lm_len)
+{
+    ngx_table_elt_t  *ims = r->headers_in.if_modified_since;
+    time_t           ims_t, lm_t;
+
+    if (ims == NULL || lm_len == 0) {
+        return 0;
+    }
+
+    ims_t = ngx_parse_http_time(ims->value.data, ims->value.len);
+    lm_t  = ngx_parse_http_time(lm, lm_len);
+
+    if (ims_t != NGX_ERROR && lm_t != NGX_ERROR && lm_t <= ims_t) {
+        return 1;
+    }
+
+    return 0;
+}
+
+
+static ngx_uint_t
+ngx_http_cache_turbo_not_modified(ngx_http_request_t *r,
+    u_char *etag, size_t etag_len, u_char *lm, size_t lm_len)
+{
+    if (ngx_http_cache_turbo_not_modified_etag(r, etag, etag_len)) {
+        return 1;
+    }
+
+    return ngx_http_cache_turbo_not_modified_time(r, lm, lm_len);
 }
 
 
