@@ -2592,6 +2592,59 @@ ngx_http_cache_turbo_redis_frame(u_char *p, u_char *end, ngx_uint_t depth,
  * server that nests one level deeper is still framed correctly, capped as
  * before by FRAME_MAX_DEPTH) push a new frame_remain[] entry.
  */
+/*
+ * Fresh-walk prologue for frame_scan(): runs exactly once per page, when
+ * frame_depth == 0 && frame_off == 0 ("not currently inside an array").
+ * Parses the top-level element exactly like the resume loop below would.
+ * It must be an array ('*') for the resumable path -- SCAN/SMEMBERS replies
+ * are always arrays; anything else is handed to plain frame() by the
+ * caller-side convention (both callers only ever hit this on the '*' reply).
+ *
+ * Hands off purely through op->frame_* (and next/done on the *-1 short
+ * circuit) -- no coupling to the resume loop's local state, so this is a
+ * safe extraction per the MAINT-REDIS seam map.
+ */
+static ngx_int_t
+ngx_http_cache_turbo_redis_frame_scan_prologue(
+    ngx_http_cache_turbo_redis_op_t *op, u_char *end, u_char **next,
+    ngx_int_t *done)
+{
+    u_char     *p, *crlf;
+    ngx_int_t   v, rc;
+
+    p = op->rbuf;
+    if (p >= end) {
+        return NGX_AGAIN;
+    }
+    if (*p != '*') {
+        return NGX_DECLINED;
+    }
+    crlf = ngx_strlchr(p + 1, end, CR);
+    if (crlf == NULL || crlf + 1 >= end || crlf[1] != LF) {
+        return NGX_AGAIN;
+    }
+    rc = ngx_http_cache_turbo_redis_resp_len(p + 1, crlf - (p + 1), &v);
+    if (rc == NGX_ERROR) {
+        return NGX_DECLINED;
+    }
+    p = crlf + 2;
+    if (rc == NGX_DONE) {                  /* *-1 nil array: no elements */
+        *next = p;
+        *done = 1;
+        return NGX_OK;
+    }
+    if (v > NGX_HTTP_CACHE_TURBO_REDIS_MAX_MEMBERS) {
+        return NGX_DECLINED;
+    }
+    op->frame_remain[0] = (ngx_uint_t) v;
+    op->frame_depth = 1;
+    op->frame_off = (size_t) (p - op->rbuf);
+    *done = 0;
+
+    return NGX_OK;
+}
+
+
 static ngx_int_t
 ngx_http_cache_turbo_redis_frame_scan(ngx_http_cache_turbo_redis_op_t *op,
     u_char **next)
@@ -2602,37 +2655,16 @@ ngx_http_cache_turbo_redis_frame_scan(ngx_http_cache_turbo_redis_op_t *op,
     end = op->rbuf + op->rlen;
 
     /* Fresh walk (frame_depth == 0 means "not currently inside an array"):
-     * parse the top-level element exactly like frame() would. It must be an
-     * array ('*') for the resumable path -- SCAN/SMEMBERS replies are always
-     * arrays; anything else is handed to plain frame() by the caller-side
-     * convention (both callers only ever hit this on the '*' reply). */
+     * see ngx_http_cache_turbo_redis_frame_scan_prologue() -- extracted
+     * because it runs once per page and hands off purely through op->frame_*. */
     if (op->frame_depth == 0 && op->frame_off == 0) {
-        p = op->rbuf;
-        if (p >= end) {
-            return NGX_AGAIN;
+        ngx_int_t  done;
+
+        rc = ngx_http_cache_turbo_redis_frame_scan_prologue(op, end, next,
+                                                              &done);
+        if (rc != NGX_OK || done) {
+            return rc;
         }
-        if (*p != '*') {
-            return NGX_DECLINED;
-        }
-        crlf = ngx_strlchr(p + 1, end, CR);
-        if (crlf == NULL || crlf + 1 >= end || crlf[1] != LF) {
-            return NGX_AGAIN;
-        }
-        rc = ngx_http_cache_turbo_redis_resp_len(p + 1, crlf - (p + 1), &v);
-        if (rc == NGX_ERROR) {
-            return NGX_DECLINED;
-        }
-        p = crlf + 2;
-        if (rc == NGX_DONE) {              /* *-1 nil array: no elements */
-            *next = p;
-            return NGX_OK;
-        }
-        if (v > NGX_HTTP_CACHE_TURBO_REDIS_MAX_MEMBERS) {
-            return NGX_DECLINED;
-        }
-        op->frame_remain[0] = (ngx_uint_t) v;
-        op->frame_depth = 1;
-        op->frame_off = (size_t) (p - op->rbuf);
     }
 
     p = op->rbuf + op->frame_off;
@@ -2898,12 +2930,76 @@ ngx_http_cache_turbo_redis_read_smembers(ngx_event_t *rev)
  * rbuf) are filled. Returns NGX_AGAIN (need more bytes) or NGX_DECLINED
  * (malformed / not the expected shape).
  */
+/*
+ * Parse one bulk string ($<len>\r\n<bytes>\r\n) at *p, bounded by end, into
+ * *out. *p is advanced past the whole element on success. allow_nil selects
+ * whether a $-1 nil element is accepted (out set to {NULL,0}) or treated as
+ * malformed -- the SCAN cursor must be a real bulk string, but array/scan-key
+ * elements may legitimately be nil.
+ *
+ * Shared by parse_array()'s key loop and parse_scan()'s cursor + key loop --
+ * those three call sites were near-identical clones; a bound/overflow fix
+ * now lands in one place instead of three. Also folds AUD-REDIS-PARSE-SCAN-
+ * COUNT for free wherever it is used: callers that need resp_len()'s
+ * sign/nil split (rather than a plain ngx_atoi) get it uniformly.
+ */
+static ngx_int_t
+ngx_http_cache_turbo_redis_parse_bulk(u_char **p, u_char *end,
+    ngx_int_t allow_nil, ngx_str_t *out)
+{
+    u_char     *crlf;
+    ngx_int_t   len, rc;
+
+    if (*p >= end) {
+        return NGX_AGAIN;
+    }
+    if (**p != '$') {
+        return NGX_DECLINED;
+    }
+
+    crlf = ngx_strlchr(*p + 1, end, CR);
+    if (crlf == NULL || crlf + 1 >= end || crlf[1] != LF) {
+        return NGX_AGAIN;
+    }
+
+    rc = ngx_http_cache_turbo_redis_resp_len(*p + 1, crlf - (*p + 1), &len);
+    if (rc == NGX_ERROR) {
+        return NGX_DECLINED;
+    }
+
+    if (rc == NGX_DONE) {                  /* $-1 nil element */
+        if (!allow_nil) {
+            return NGX_DECLINED;
+        }
+        out->data = NULL;
+        out->len = 0;
+        *p = crlf + 2;
+        return NGX_OK;
+    }
+
+    if (len > NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY) {
+        return NGX_DECLINED;               /* bound before len + 2 (no overflow) */
+    }
+
+    *p = crlf + 2;
+    if (end - *p < len + 2) {              /* payload + trailing CRLF */
+        return NGX_AGAIN;
+    }
+
+    out->data = *p;
+    out->len = (size_t) len;
+    *p += len + 2;
+
+    return NGX_OK;
+}
+
+
 static ngx_int_t
 ngx_http_cache_turbo_redis_parse_scan(ngx_http_cache_turbo_redis_op_t *op,
     ngx_str_t *cursor, ngx_str_t **keys, ngx_uint_t *nkeys)
 {
     u_char     *p, *crlf, *end;
-    ngx_int_t   count, len, rc;
+    ngx_int_t   count, rc;
     ngx_uint_t  i;
     ngx_str_t  *list;
 
@@ -2921,39 +3017,17 @@ ngx_http_cache_turbo_redis_parse_scan(ngx_http_cache_turbo_redis_op_t *op,
     if (crlf == NULL || crlf + 1 >= end || crlf[1] != LF) {
         return NGX_AGAIN;
     }
-    count = ngx_atoi(p + 1, crlf - (p + 1));
-    if (count != 2) {
-        return NGX_DECLINED;               /* SCAN always replies a 2-tuple */
+    rc = ngx_http_cache_turbo_redis_resp_len(p + 1, crlf - (p + 1), &count);
+    if (rc != NGX_OK || count != 2) {
+        return NGX_DECLINED;               /* SCAN always replies a real 2-tuple */
     }
     p = crlf + 2;
 
-    /* element 0: the next cursor, a bulk string */
-    if (p >= end) {
-        return NGX_AGAIN;
+    /* element 0: the next cursor, a bulk string (nil is malformed here) */
+    rc = ngx_http_cache_turbo_redis_parse_bulk(&p, end, 0, cursor);
+    if (rc != NGX_OK) {
+        return rc;
     }
-    if (*p != '$') {
-        return NGX_DECLINED;
-    }
-    crlf = ngx_strlchr(p + 1, end, CR);
-    if (crlf == NULL || crlf + 1 >= end || crlf[1] != LF) {
-        return NGX_AGAIN;
-    }
-    /* The SCAN cursor is always a real bulk string; nil ($-1) here is malformed. */
-    if (ngx_http_cache_turbo_redis_resp_len(p + 1, crlf - (p + 1), &len)
-        != NGX_OK)
-    {
-        return NGX_DECLINED;
-    }
-    if (len > NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY) {
-        return NGX_DECLINED;               /* bound before len + 2 (no overflow) */
-    }
-    p = crlf + 2;
-    if (end - p < len + 2) {
-        return NGX_AGAIN;
-    }
-    cursor->data = p;
-    cursor->len = (size_t) len;
-    p += len + 2;
 
     /* element 1: the array of matched keys */
     if (p >= end) {
@@ -2990,36 +3064,10 @@ ngx_http_cache_turbo_redis_parse_scan(ngx_http_cache_turbo_redis_op_t *op,
     }
 
     for (i = 0; i < (ngx_uint_t) count; i++) {
-        if (p >= end) {
-            return NGX_AGAIN;
+        rc = ngx_http_cache_turbo_redis_parse_bulk(&p, end, 1, &list[i]);
+        if (rc != NGX_OK) {
+            return rc;
         }
-        if (*p != '$') {
-            return NGX_DECLINED;
-        }
-        crlf = ngx_strlchr(p + 1, end, CR);
-        if (crlf == NULL || crlf + 1 >= end || crlf[1] != LF) {
-            return NGX_AGAIN;
-        }
-        rc = ngx_http_cache_turbo_redis_resp_len(p + 1, crlf - (p + 1), &len);
-        if (rc == NGX_ERROR) {
-            return NGX_DECLINED;
-        }
-        if (rc == NGX_DONE) {              /* $-1 nil element */
-            list[i].data = NULL;
-            list[i].len = 0;
-            p = crlf + 2;
-            continue;
-        }
-        if (len > NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY) {
-            return NGX_DECLINED;
-        }
-        p = crlf + 2;
-        if (end - p < len + 2) {
-            return NGX_AGAIN;
-        }
-        list[i].data = p;
-        list[i].len = (size_t) len;
-        p += len + 2;
     }
 
     *keys = list;
