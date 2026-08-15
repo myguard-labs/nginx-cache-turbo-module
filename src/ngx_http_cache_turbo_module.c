@@ -52,6 +52,22 @@ static ngx_uint_t ngx_http_cache_turbo_breaker_action(ngx_uint_t state,
 static ngx_int_t ngx_http_cache_turbo_restore_response(ngx_http_request_t *r,
     u_char *copy, size_t len, ngx_uint_t stale, const char *xcache,
     u_char **bodyp, size_t *body_lenp);
+static ngx_int_t ngx_http_cache_turbo_restore_response_prologue(
+    ngx_http_request_t *r, u_char *copy, size_t len, ngx_uint_t stale,
+    ngx_http_cache_turbo_blob_hdr_t *bhp,
+    ngx_http_cache_turbo_blob_href_t **refsp,
+    u_char **bodyp, size_t *body_lenp);
+static ngx_int_t ngx_http_cache_turbo_restore_response_headers(
+    ngx_http_request_t *r, ngx_http_cache_turbo_loc_conf_t *clcf,
+    ngx_http_cache_turbo_blob_hdr_t *bh,
+    ngx_http_cache_turbo_blob_href_t *refs,
+    u_char **etagp, size_t *etag_lenp,
+    u_char **lastmodp, size_t *lastmod_lenp);
+static ngx_int_t ngx_http_cache_turbo_restore_response_finalize(
+    ngx_http_request_t *r, ngx_http_cache_turbo_loc_conf_t *clcf,
+    ngx_http_cache_turbo_blob_hdr_t *bh, ngx_uint_t stale,
+    const char *xcache, u_char *etag, size_t etag_len,
+    u_char *lastmod, size_t lastmod_len, size_t *body_lenp);
 static ngx_uint_t ngx_http_cache_turbo_restore_alloc_fails(
     ngx_http_request_t *r);
 static ngx_int_t ngx_http_cache_turbo_cold_wait(ngx_http_request_t *r,
@@ -8107,29 +8123,24 @@ ngx_http_cache_turbo_not_modified(ngx_http_request_t *r,
 }
 
 
-/* Rebuild r->headers_out from a validated, pool-owned cache blob (caller already
- * copied it out of shm and released the zone lock): set status / Content-Type /
- * Content-Length, replay the stored headers, answer a conditional 200 with 304
- * (live serves only), and stamp Date / Age / X-Cache. Returns the body slice via
- * *bodyp / *body_lenp. Does NOT send the header or body — ngx_http_cache_turbo_
- * serve() does that for a live HIT, while the RFC-2 serve-on-error path calls
- * this from the header filter and lets the filter chain carry the response. */
+/* Phase 1 of ngx_http_cache_turbo_restore_response(): validate the pool-owned
+ * blob and set the two headers_out fields that only depend on the blob
+ * envelope (status, Content-Length) before any per-header work starts.
+ * Out-params: *bhp receives the decoded header (copied into the caller's own
+ * ngx_http_cache_turbo_blob_hdr_t, so it stays valid once this stack frame
+ * returns), *refsp the r->pool-owned per-header ref array from the single
+ * validated walk, *bodyp / *body_lenp the body slice. Returns NGX_ERROR on a
+ * NULL blob/loc-conf or a failed blob_validate(); the caller must not use any
+ * out-param when this happens. */
 static ngx_int_t
-ngx_http_cache_turbo_restore_response(ngx_http_request_t *r, u_char *copy,
-    size_t len, ngx_uint_t stale, const char *xcache,
+ngx_http_cache_turbo_restore_response_prologue(ngx_http_request_t *r,
+    u_char *copy, size_t len, ngx_uint_t stale,
+    ngx_http_cache_turbo_blob_hdr_t *bhp,
+    ngx_http_cache_turbo_blob_href_t **refsp,
     u_char **bodyp, size_t *body_lenp)
 {
-    u_char                            *body;
-    size_t                             body_len;
-    ngx_http_cache_turbo_blob_hdr_t    hdr;
-    ngx_http_cache_turbo_blob_hdr_t   *bh;
-    uint32_t                           i;
-    u_char                            *etag = NULL, *lastmod = NULL;
-    size_t                             etag_len = 0, lastmod_len = 0;
-    ngx_uint_t                         dropped = 0;
-    ngx_http_cache_turbo_loc_conf_t   *clcf;
     const u_char                      *body_start;
-    ngx_http_cache_turbo_blob_href_t  *refs;
+    ngx_http_cache_turbo_loc_conf_t   *clcf;
 
     clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
 
@@ -8149,23 +8160,45 @@ ngx_http_cache_turbo_restore_response(ngx_http_request_t *r, u_char *copy,
      * (ngx_http_cache_turbo_blob_next_header). The blob is byte-aligned
      * (ngx_pnalloc); the validator reads the wire header with fixed-endian
      * getters, no misaligned struct cast. */
-    if (ngx_http_cache_turbo_blob_validate(copy, len, &hdr, NULL, &body_start,
-                                           r->pool, &refs)
+    if (ngx_http_cache_turbo_blob_validate(copy, len, bhp, NULL, &body_start,
+                                           r->pool, refsp)
         != NGX_OK)
     {
         return NGX_ERROR;
     }
-    bh = &hdr;
 
-    body = (u_char *) body_start;
-    body_len = bh->body_len;
+    *bodyp = (u_char *) body_start;
+    *body_lenp = bhp->body_len;
 
     ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "cache_turbo: serve status=%ui body=%uz stale=%ui",
-                   (ngx_uint_t) bh->status, body_len, stale);
+                   (ngx_uint_t) bhp->status, *body_lenp, stale);
 
-    r->headers_out.status = bh->status;
-    r->headers_out.content_length_n = body_len;
+    r->headers_out.status = bhp->status;
+    r->headers_out.content_length_n = *body_lenp;
+
+    return NGX_OK;
+}
+
+
+/* Phase 2 of ngx_http_cache_turbo_restore_response(): replay every stored
+ * header off the ref array the prologue's single validated walk already
+ * built. Content-Type is mapped onto the typed field; ETag / Last-Modified
+ * are also captured (via *etagp / *etag_lenp / *lastmodp / *lastmod_lenp) for the
+ * conditional-request phase that follows; everything else goes onto the
+ * headers list. Returns NGX_ERROR the moment ngx_http_cache_turbo_add_header()
+ * fails to allocate — the caller must return NGX_ERROR immediately, same as
+ * the inline loop this replaces. */
+static ngx_int_t
+ngx_http_cache_turbo_restore_response_headers(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf,
+    ngx_http_cache_turbo_blob_hdr_t *bh,
+    ngx_http_cache_turbo_blob_href_t *refs,
+    u_char **etagp, size_t *etag_lenp,
+    u_char **lastmodp, size_t *lastmod_lenp)
+{
+    uint32_t     i;
+    ngx_uint_t   dropped = 0;
 
     /* Restore each stored header. Content-Type is mapped to the typed field;
      * the rest go onto the headers list. */
@@ -8203,14 +8236,14 @@ ngx_http_cache_turbo_restore_response(ngx_http_request_t *r, u_char *copy,
         if (nl == sizeof("ETag") - 1
             && ngx_strncasecmp(nm, (u_char *) "ETag", nl) == 0)
         {
-            etag = vv;
-            etag_len = vl;
+            *etagp = vv;
+            *etag_lenp = vl;
 
         } else if (nl == sizeof("Last-Modified") - 1
                    && ngx_strncasecmp(nm, (u_char *) "Last-Modified", nl) == 0)
         {
-            lastmod = vv;
-            lastmod_len = vl;
+            *lastmodp = vv;
+            *lastmod_lenp = vl;
         }
 
         if (ngx_http_cache_turbo_add_header(r, nm, nl, vv, vl) != NGX_OK) {
@@ -8230,6 +8263,28 @@ ngx_http_cache_turbo_restore_response(ngx_http_request_t *r, u_char *copy,
                       dropped, &r->uri);
     }
 
+    return NGX_OK;
+}
+
+
+/* Phase 3 of ngx_http_cache_turbo_restore_response(): everything after the
+ * header-restore loop — surrogate-key re-emit, the conditional 200->304
+ * rewrite, the range-filter permit, and the Date / Age / X-Cache trailer
+ * headers (the last of which also records $cache_turbo_status /
+ * $cache_turbo_serve_reason). *body_lenp is read (for the range permit,
+ * folded into the 200 check by way of r->headers_out.content_length_n) and
+ * conditionally zeroed by the 304 rewrite, matching the inline block this
+ * replaces exactly. Returns NGX_ERROR on the first allocation failure in the
+ * Date/Age/X-Cache trailer; the caller must return NGX_ERROR immediately. */
+static ngx_int_t
+ngx_http_cache_turbo_restore_response_finalize(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf,
+    ngx_http_cache_turbo_blob_hdr_t *bh,
+    ngx_uint_t stale, const char *xcache,
+    u_char *etag, size_t etag_len,
+    u_char *lastmod, size_t lastmod_len,
+    size_t *body_lenp)
+{
     /* SK-A1: re-emit the CDN purge key on every HIT/STALE serve, not only on the
      * MISS that stored the entry. A fronting surrogate-key CDN refills a POP from
      * one of OUR hits whenever its own copy expired or was evicted; without the
@@ -8271,7 +8326,7 @@ ngx_http_cache_turbo_restore_response(ngx_http_request_t *r, u_char *copy,
         r->headers_out.content_type.len = 0;
         r->headers_out.content_type.data = NULL;
         r->header_only = 1;        /* serve() short-circuits the body below */
-        body_len = 0;
+        *body_lenp = 0;
     }
 
     /* AUD-RANGE1: tell core's range filter this response may be range-served.
@@ -8404,6 +8459,62 @@ ngx_http_cache_turbo_restore_response(ngx_http_request_t *r, u_char *copy,
                 sctx->serve_reason = NGX_HTTP_CACHE_TURBO_SR_STALE_BREAKER;
             }
         }
+    }
+
+    return NGX_OK;
+}
+
+
+/* Rebuild r->headers_out from a validated, pool-owned cache blob (caller already
+ * copied it out of shm and released the zone lock): set status / Content-Type /
+ * Content-Length, replay the stored headers, answer a conditional 200 with 304
+ * (live serves only), and stamp Date / Age / X-Cache. Returns the body slice via
+ * *bodyp / *body_lenp. Does NOT send the header or body — ngx_http_cache_turbo_
+ * serve() does that for a live HIT, while the RFC-2 serve-on-error path calls
+ * this from the header filter and lets the filter chain carry the response.
+ *
+ * Decomposed (MAINT-H4a) into prologue / headers / finalize phases above;
+ * this orchestrator only owns the local state that crosses phase boundaries
+ * (hdr/refs/etag/lastmod/body) and the downstream hand-off, unchanged from
+ * before the split. */
+static ngx_int_t
+ngx_http_cache_turbo_restore_response(ngx_http_request_t *r, u_char *copy,
+    size_t len, ngx_uint_t stale, const char *xcache,
+    u_char **bodyp, size_t *body_lenp)
+{
+    u_char                            *body;
+    size_t                             body_len;
+    ngx_http_cache_turbo_blob_hdr_t    hdr;
+    u_char                            *etag = NULL, *lastmod = NULL;
+    size_t                             etag_len = 0, lastmod_len = 0;
+    ngx_http_cache_turbo_loc_conf_t   *clcf;
+    ngx_http_cache_turbo_blob_href_t  *refs;
+
+    clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
+
+    if (ngx_http_cache_turbo_restore_response_prologue(r, copy, len, stale,
+                                                        &hdr, &refs,
+                                                        &body, &body_len)
+        != NGX_OK)
+    {
+        return NGX_ERROR;
+    }
+
+    if (ngx_http_cache_turbo_restore_response_headers(r, clcf, &hdr, refs,
+                                                       &etag, &etag_len,
+                                                       &lastmod, &lastmod_len)
+        != NGX_OK)
+    {
+        return NGX_ERROR;
+    }
+
+    if (ngx_http_cache_turbo_restore_response_finalize(r, clcf, &hdr, stale,
+                                                        xcache, etag, etag_len,
+                                                        lastmod, lastmod_len,
+                                                        &body_len)
+        != NGX_OK)
+    {
+        return NGX_ERROR;
     }
 
     *bodyp = body;
