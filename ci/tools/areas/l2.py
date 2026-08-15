@@ -1707,6 +1707,10 @@ def test_multinode_lock(ng: Nginx, origin: Origin, redis: RedisServer) -> None:
     uri = "/lock/mn"
     redis.cli("DEL", l2_key(uri), lock_key(uri))
 
+    # nginx strips the /lock/ prefix before proxying, so the origin logs "/mn"
+    # -- same convention as test_cross_node_won_stale_body's "won" slug.
+    slug = "mn"
+
     # Node A primes the key: origin -> L1_A + L2 fresh.
     sa, body_a, ha = fetch(ng.port, uri)
     assert sa == 200 and "x-cache" not in ha, "A should miss to origin first"
@@ -1726,7 +1730,12 @@ def test_multinode_lock(ng: Nginx, origin: Origin, redis: RedisServer) -> None:
         # 2.5s sleep puts both past fresh yet well inside the 8s stale window.
         time.sleep(2.5)                            # stale on both, still < 8s
         drain_origin(origin)       # absorb any stray async bg before counting
-        base = origin.hits
+        # FLAKE-L2-PAIRWISE: path-scoped, not the global `hits`. Node B is live
+        # for this whole window and fires its own async bg refreshes; a global
+        # delta counts those too, so the single-flight assertion below could
+        # read 2 regens when the cross-node lock did its job perfectly. Also
+        # decouples this test from whatever the PREVIOUS test left in flight.
+        base = origin.hits_for(slug)
 
         # Hammer both nodes through the stale window. The dice fires a refresh on
         # at least one; the NX lock lets exactly one node reach origin.
@@ -1737,7 +1746,7 @@ def test_multinode_lock(ng: Nginx, origin: Origin, redis: RedisServer) -> None:
             time.sleep(0.05)
         time.sleep(0.4)                            # let any in-flight regen land
 
-        regens = origin.hits - base
+        regens = origin.hits_for(slug) - base
         assert regens == 1, \
             f"cross-node single-flight failed: {regens} origin regens (want 1)"
 
@@ -1747,6 +1756,13 @@ def test_multinode_lock(ng: Nginx, origin: Origin, redis: RedisServer) -> None:
     finally:
         b.stop()
         drain_origin(origin)   # v8: settle async bg refreshes before next test
+        # FLAKE-L2-PAIRWISE (open): drain_origin() settles ORIGIN traffic only.
+        # The regen this test provokes also writes the new generation back to
+        # L2, and that SET can still be in flight once the origin has gone
+        # quiet, so this test can still leak a tail into the next one. Not
+        # fixed here: an EXISTS wait is useless (the key is present from the
+        # prime onward) and wait_for_l2() needs the expected bytes, which this
+        # test never captures. See issues.md § FLAKE-L2-PAIRWISE.
 
 
 def test_cross_node_won_stale_body(ng: Nginx, origin: Origin,
@@ -1801,9 +1817,34 @@ def test_cross_node_won_stale_body(ng: Nginx, origin: Origin,
         f"cross-node WON stale serve returned a wrong body: " \
         f"{body1!r} != {body0!r}"
 
-    # the background refresh reaches the origin and a later read is fresh.
-    assert wait_for(lambda: origin.hits_for(slug) > base, timeout=2.0), \
-        "cross-node WON arm never fired the background refresh"
+    # The background refresh reaches the origin and a later read is fresh.
+    #
+    # FLAKE-L2-PAIRWISE root cause: the refresh dice is PROBABILISTIC and runs
+    # on 1-SECOND granularity (should_refresh(): now = ngx_time(), threshold =
+    # elapsed/window * beta). With cache_turbo_valid 2s and a 2.5s sleep,
+    # `elapsed` truncates to 0 or 1 depending on where the prime landed inside
+    # its second. At elapsed == 0 the threshold is 0 and `dice < threshold` is
+    # IMPOSSIBLE -- no beta value can make it fire, so the single read below
+    # could never trigger a refresh and this assertion could not pass. Measured
+    # on this box: forcing elapsed == 0 fails 3/5, forcing elapsed >= 1 passes
+    # 8/8, and the unmodified 2.5s straddles the boundary at ~2 fails in 9.
+    #
+    # The fix is NOT a longer sleep (that is a timing band, and the stale
+    # window's far end would eventually collide with valid*4). Each read rolls
+    # its own dice, so keep reading through the stale window until one wins.
+    # `x-cache` stays STALE for every one of these reads, so this cannot mask a
+    # broken WON arm -- it only removes the single-read coin flip. A genuinely
+    # dead background-refresh arm still fails here, just deterministically.
+    def _refresh_fired() -> bool:
+        if origin.hits_for(slug) > base:
+            return True
+        fetch(ng.port, uri)            # re-roll: each read rolls its own dice
+        return origin.hits_for(slug) > base
+
+    assert wait_for(_refresh_fired, timeout=2.0, interval=0.1), \
+        f"cross-node WON arm never fired the background refresh " \
+        f"[base={base} now={origin.hits_for(slug)} global={origin.hits} " \
+        f"x_cache={h1.get('x-cache')!r}]"
 
     def _got_refreshed() -> bool:
         _, b, h = fetch(ng.port, uri)
