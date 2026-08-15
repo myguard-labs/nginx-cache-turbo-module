@@ -2766,6 +2766,74 @@ ngx_http_cache_turbo_redis_frame_scan(ngx_http_cache_turbo_redis_op_t *op,
 
 
 /*
+ * Parse one bulk string ($<len>\r\n<bytes>\r\n) at *p, bounded by end, into
+ * *out. *p is advanced past the whole element on success. allow_nil selects
+ * whether a $-1 nil element is accepted (out set to {NULL,0}) or treated as
+ * malformed -- the SCAN cursor must be a real bulk string, but array/scan-key
+ * elements may legitimately be nil.
+ *
+ * Shared by parse_scan()'s cursor read and its key loop, which were
+ * near-identical clones; a bound/overflow fix now lands in one place instead
+ * of two. Also folds AUD-REDIS-PARSE-SCAN-COUNT: callers that need
+ * resp_len()'s sign/nil split (rather than a plain ngx_atoi) get it
+ * uniformly.
+ *
+ * parse_array()'s per-element loop is the third caller (MAINT-REDIS), folded
+ * in after the decomposition landed. Its *-1 nil-ARRAY and count == 0 cases
+ * are a different shape and stay in parse_array above the loop.
+ */
+static ngx_int_t
+ngx_http_cache_turbo_redis_parse_bulk(u_char **p, u_char *end,
+    ngx_int_t allow_nil, ngx_str_t *out)
+{
+    u_char     *crlf;
+    ngx_int_t   len, rc;
+
+    if (*p >= end) {
+        return NGX_AGAIN;
+    }
+    if (**p != '$') {
+        return NGX_DECLINED;
+    }
+
+    crlf = ngx_strlchr(*p + 1, end, CR);
+    if (crlf == NULL || crlf + 1 >= end || crlf[1] != LF) {
+        return NGX_AGAIN;
+    }
+
+    rc = ngx_http_cache_turbo_redis_resp_len(*p + 1, crlf - (*p + 1), &len);
+    if (rc == NGX_ERROR) {
+        return NGX_DECLINED;
+    }
+
+    if (rc == NGX_DONE) {                  /* $-1 nil element */
+        if (!allow_nil) {
+            return NGX_DECLINED;
+        }
+        out->data = NULL;
+        out->len = 0;
+        *p = crlf + 2;
+        return NGX_OK;
+    }
+
+    if (len > NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY) {
+        return NGX_DECLINED;               /* bound before len + 2 (no overflow) */
+    }
+
+    *p = crlf + 2;
+    if (end - *p < len + 2) {              /* payload + trailing CRLF */
+        return NGX_AGAIN;
+    }
+
+    out->data = *p;
+    out->len = (size_t) len;
+    *p += len + 2;
+
+    return NGX_OK;
+}
+
+
+/*
  * Parse an accumulated SMEMBERS array reply in op->rbuf[0..op->rlen]:
  *   *<count>\r\n  then count bulk strings  $<len>\r\n<bytes>\r\n
  * On NGX_OK, *members (allocated from op->pool) points at ngx_str_t entries that
@@ -2777,7 +2845,7 @@ ngx_http_cache_turbo_redis_parse_array(ngx_http_cache_turbo_redis_op_t *op,
     ngx_str_t **members, ngx_uint_t *nmembers)
 {
     u_char     *p, *crlf, *end;
-    ngx_int_t   count, len, rc;
+    ngx_int_t   count, rc;
     ngx_uint_t  i;
     ngx_str_t  *list;
 
@@ -2825,42 +2893,14 @@ ngx_http_cache_turbo_redis_parse_array(ngx_http_cache_turbo_redis_op_t *op,
     p = crlf + 2;
 
     for (i = 0; i < (ngx_uint_t) count; i++) {
-        if (p >= end) {
-            return NGX_AGAIN;
+        /* MAINT-REDIS: the per-element walk was a byte-identical third copy of
+         * parse_bulk(allow_nil=1) -- a nil element yields an empty member here,
+         * exactly as it does for a scan key. The *-1 nil-array and count == 0
+         * early returns above the loop are NOT part of that shape and stay. */
+        rc = ngx_http_cache_turbo_redis_parse_bulk(&p, end, 1, &list[i]);
+        if (rc != NGX_OK) {
+            return rc;                     /* NGX_AGAIN or NGX_DECLINED */
         }
-        if (*p != '$') {
-            return NGX_DECLINED;
-        }
-
-        crlf = ngx_strlchr(p + 1, end, CR);
-        if (crlf == NULL || crlf + 1 >= end || crlf[1] != LF) {
-            return NGX_AGAIN;
-        }
-
-        rc = ngx_http_cache_turbo_redis_resp_len(p + 1, crlf - (p + 1), &len);
-        if (rc == NGX_ERROR) {
-            return NGX_DECLINED;
-        }
-
-        if (rc == NGX_DONE) {              /* $-1 nil element: empty member */
-            list[i].data = NULL;
-            list[i].len = 0;
-            p = crlf + 2;
-            continue;
-        }
-
-        if (len > NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY) {
-            return NGX_DECLINED;
-        }
-
-        p = crlf + 2;
-        if (end - p < len + 2) {           /* payload + trailing CRLF */
-            return NGX_AGAIN;
-        }
-
-        list[i].data = p;
-        list[i].len = (size_t) len;
-        p += len + 2;
     }
 
     *members = list;
@@ -2930,72 +2970,6 @@ ngx_http_cache_turbo_redis_read_smembers(ngx_event_t *rev)
  * rbuf) are filled. Returns NGX_AGAIN (need more bytes) or NGX_DECLINED
  * (malformed / not the expected shape).
  */
-/*
- * Parse one bulk string ($<len>\r\n<bytes>\r\n) at *p, bounded by end, into
- * *out. *p is advanced past the whole element on success. allow_nil selects
- * whether a $-1 nil element is accepted (out set to {NULL,0}) or treated as
- * malformed -- the SCAN cursor must be a real bulk string, but array/scan-key
- * elements may legitimately be nil.
- *
- * Shared by parse_scan()'s cursor read and its key loop, which were
- * near-identical clones; a bound/overflow fix now lands in one place instead
- * of two. Also folds AUD-REDIS-PARSE-SCAN-COUNT: callers that need
- * resp_len()'s sign/nil split (rather than a plain ngx_atoi) get it
- * uniformly.
- *
- * parse_array()'s key loop is a third copy of this same shape and is a
- * candidate to fold in here; it was left alone deliberately to keep this
- * refactor's blast radius to the two functions being decomposed.
- */
-static ngx_int_t
-ngx_http_cache_turbo_redis_parse_bulk(u_char **p, u_char *end,
-    ngx_int_t allow_nil, ngx_str_t *out)
-{
-    u_char     *crlf;
-    ngx_int_t   len, rc;
-
-    if (*p >= end) {
-        return NGX_AGAIN;
-    }
-    if (**p != '$') {
-        return NGX_DECLINED;
-    }
-
-    crlf = ngx_strlchr(*p + 1, end, CR);
-    if (crlf == NULL || crlf + 1 >= end || crlf[1] != LF) {
-        return NGX_AGAIN;
-    }
-
-    rc = ngx_http_cache_turbo_redis_resp_len(*p + 1, crlf - (*p + 1), &len);
-    if (rc == NGX_ERROR) {
-        return NGX_DECLINED;
-    }
-
-    if (rc == NGX_DONE) {                  /* $-1 nil element */
-        if (!allow_nil) {
-            return NGX_DECLINED;
-        }
-        out->data = NULL;
-        out->len = 0;
-        *p = crlf + 2;
-        return NGX_OK;
-    }
-
-    if (len > NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY) {
-        return NGX_DECLINED;               /* bound before len + 2 (no overflow) */
-    }
-
-    *p = crlf + 2;
-    if (end - *p < len + 2) {              /* payload + trailing CRLF */
-        return NGX_AGAIN;
-    }
-
-    out->data = *p;
-    out->len = (size_t) len;
-    *p += len + 2;
-
-    return NGX_OK;
-}
 
 
 static ngx_int_t
