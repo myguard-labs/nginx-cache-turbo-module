@@ -333,8 +333,12 @@ def test_l2_purge_key_drops_l2(ng: Nginx, origin: Origin,
     elapsed = time.monotonic() - t0
     assert s == 200 and "x-cache" not in h3, \
         f"post-purge read should miss to origin, got {h3.get('x-cache')}"
-    assert elapsed < 2.0, \
-        f"post-purge cold miss stalled {elapsed:.1f}s (stale single-flight lock?)"
+    # Scaled by ASAN_TIME_SCALE (FLAKE-ASAN-TIMING-BAND): unscaled outside a
+    # sanitizer run.
+    budget = 2.0 * sanitizer_time_scale()
+    assert elapsed < budget, \
+        f"post-purge cold miss stalled {elapsed:.1f}s (stale single-flight " \
+        f"lock?, budget {budget:.1f}s)"
     assert origin.hits == origin_before + 1, "origin was not consulted after purge"
     assert body_b != body_a, "post-purge body should be a fresh generation"
 
@@ -899,11 +903,15 @@ def test_l2_stale_refetch_does_not_stall_on_lock(ng: Nginx, origin: Origin,
     assert s1 == 200, f"stale refetch should serve 200 from origin, got {s1}"
     # lock_timeout defaults to 5000ms; the stall was the FULL window. A healthy
     # refetch is ~50ms here, so 2s is far above real latency and far below the
-    # 5s bug -- it cannot pass with the give-up removed.
-    assert elapsed < 2.0, (
+    # 5s bug -- it cannot pass with the give-up removed. Scaled by
+    # ASAN_TIME_SCALE (FLAKE-ASAN-TIMING-BAND): unscaled outside a sanitizer
+    # run; ASAN_TIME_SCALE is kept low enough (2.0) that the scaled budget
+    # (4.0s) still stays below the 5s bug window it must distinguish from.
+    budget = 2.0 * sanitizer_time_scale()
+    assert elapsed < budget, (
         f"stale refetch took {elapsed:.2f}s -- it stalled in the cold-miss wait "
-        f"loop waiting out the cross-node NX lock (V-HANG-2). Expected <2s; "
-        f"the bug parks for the full lock_timeout (~5s).")
+        f"loop waiting out the cross-node NX lock (V-HANG-2). Expected "
+        f"<{budget:.1f}s; the bug parks for the full lock_timeout (~5s).")
 
     drain_origin(origin)
 
@@ -1491,8 +1499,12 @@ def test_l2_tag_purge(ng: Nginx, origin: Origin, redis: RedisServer) -> None:
     elapsed = time.monotonic() - t0
     assert "x-cache" not in h1 and "x-cache" not in h2, \
         "tagged objects should be a MISS in L1 after purge"
-    assert elapsed < 2.0, \
-        f"post-tag-purge cold misses stalled {elapsed:.1f}s (stale lock?)"
+    # Scaled by ASAN_TIME_SCALE (FLAKE-ASAN-TIMING-BAND): unscaled outside a
+    # sanitizer run.
+    budget = 2.0 * sanitizer_time_scale()
+    assert elapsed < budget, \
+        f"post-tag-purge cold misses stalled {elapsed:.1f}s (stale lock?, " \
+        f"budget {budget:.1f}s)"
     assert origin.hits == origin_before + 2, "both reads should reach origin"
     assert nb1 != body1["body"] and nb2 != body2["body"], \
         "post-purge bodies should be fresh generations"
@@ -1792,15 +1804,15 @@ def test_cross_node_won_stale_body(ng: Nginx, origin: Origin,
     # the background refresh reaches the origin and a later read is fresh.
     assert wait_for(lambda: origin.hits_for(slug) > base, timeout=2.0), \
         "cross-node WON arm never fired the background refresh"
-    deadline = time.time() + 2.0
-    refreshed = False
-    while time.time() < deadline:
+
+    def _got_refreshed() -> bool:
         _, b, h = fetch(ng.port, uri)
-        if b != body0 and h.get("x-cache") == "HIT":
-            refreshed = True
-            break
-        time.sleep(0.1)
-    assert refreshed, "stale entry never refreshed to a new generation"
+        return b != body0 and h.get("x-cache") == "HIT"
+
+    # wait_for() applies sanitizer_time_scale() internally -- unscaled (2.0s)
+    # outside a sanitizer run, matching this call site's old raw deadline loop.
+    assert wait_for(_got_refreshed, timeout=2.0, interval=0.1), \
+        "stale entry never refreshed to a new generation"
 
     # No refcount leak: a subsequent read must see the NEW generation, proving
     # the node was genuinely overwritten and not pinned on the old blob.

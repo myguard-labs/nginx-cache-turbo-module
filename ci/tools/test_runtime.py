@@ -46,6 +46,7 @@ def run_all(ng: Nginx, origin: Origin,
             mc: MemcachedServer | None = None,
             redis_tls_untrusted: RedisServer | None = None,
             redis_tls_expired: RedisServer | None = None) -> None:
+    test_sanitizer_time_scale()  # FLAKE-ASAN-TIMING-BAND: pure, no fixtures
     test_miss_then_hit(ng)
     test_surrogate_key_emit_on_miss_and_hit(ng)
     if redis is not None:

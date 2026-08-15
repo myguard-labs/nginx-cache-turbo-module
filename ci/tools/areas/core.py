@@ -23,6 +23,37 @@ from test_runtime_base import (
 )
 
 
+def test_sanitizer_time_scale() -> None:
+    """FLAKE-ASAN-TIMING-BAND: pure harness self-check for sanitizer_time_scale
+    (test_runtime_base.py) -- both states, ASAN_OPTIONS set and unset. No
+    fixtures needed, so it takes no arguments (run_all() calls it bare).
+
+    The DONE criterion this proves: a non-sanitizer run gets EXACTLY today's
+    bands (factor 1.0, byte-for-byte unchanged), and ASAN_OPTIONS present
+    scales them up by ASAN_TIME_SCALE."""
+    saved = os.environ.pop("ASAN_OPTIONS", None)
+    try:
+        os.environ.pop("ASAN_OPTIONS", None)
+        assert sanitizer_time_scale() == 1.0, \
+            "scale must be exactly 1.0 with ASAN_OPTIONS unset (non-ASan " \
+            "bands must stay byte-for-byte unchanged)"
+
+        os.environ["ASAN_OPTIONS"] = "detect_leaks=0:halt_on_error=1"
+        assert sanitizer_time_scale() == ASAN_TIME_SCALE, \
+            (f"scale must be ASAN_TIME_SCALE ({ASAN_TIME_SCALE}) with "
+             f"ASAN_OPTIONS set, got {sanitizer_time_scale()}")
+
+        os.environ["ASAN_OPTIONS"] = ""
+        assert sanitizer_time_scale() == ASAN_TIME_SCALE, \
+            "an empty (but present) ASAN_OPTIONS value must still count as " \
+            "'under a sanitizer build' -- presence, not content, is the signal"
+    finally:
+        if saved is None:
+            os.environ.pop("ASAN_OPTIONS", None)
+        else:
+            os.environ["ASAN_OPTIONS"] = saved
+
+
 def test_compressed_edge_identity_capture(ng: Nginx) -> None:
     """REGRESSION (2026-06-13 incident): cache_turbo behind a real compression
     filter must cache the IDENTITY body and let the downstream gzip filter
