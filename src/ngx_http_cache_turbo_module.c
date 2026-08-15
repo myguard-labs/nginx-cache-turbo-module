@@ -10348,18 +10348,9 @@ ngx_http_cache_turbo_body_filter_store(ngx_http_request_t *r,
      * cleaned up", which requires no entry to be written. */
     if (clcf->test_store_fail) {
         store_rc = NGX_ERROR;
-
-    } else if (is_5xx) {
-        store_rc = clcf->l1->store_if(z, store_key, hash,
-                   blob, blob_len, ttl, stale_window,
-                   NGX_HTTP_CACHE_TURBO_STORE_IF_ABSENT_OR_DEAD);
-
-    } else {
-        store_rc = clcf->l1->store(z, store_key, hash,
-                   blob, blob_len, ttl,
-                   stale_window);
     }
-#else
+    else
+#endif
     if (is_5xx) {
         store_rc = clcf->l1->store_if(z, store_key, hash,
                    blob, blob_len, ttl, stale_window,
@@ -10370,7 +10361,6 @@ ngx_http_cache_turbo_body_filter_store(ngx_http_request_t *r,
                    blob, blob_len, ttl,
                    stale_window);
     }
-#endif
 
     /* AUD-5XX-CTA: NGX_DECLINED means store_if() refused the write
      * because a still-servable good body is resident under
