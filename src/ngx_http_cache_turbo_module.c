@@ -13085,6 +13085,46 @@ ngx_http_cache_turbo_ae_q_ok(u_char *p, u_char *last)
 }
 
 
+/* MAINT-H4f phase helper for ngx_http_cache_turbo_ae_class().
+ * PHASE 1 -- match a trimmed coding name token against known algorithms and set flags.
+ * The coding name (length clen) is matched case-insensitively by exact length against
+ * {zstd, br, gzip}; a match sets *zstd, *br or *gzip to 1. No-op if clen does not
+ * match any algorithm or the token does not match the bytes. */
+static void
+ngx_http_cache_turbo_ae_class_match_coding(u_char *tok, size_t clen,
+    ngx_uint_t *zstd, ngx_uint_t *br, ngx_uint_t *gzip)
+{
+    if (clen == 4 && ngx_strncasecmp(tok, (u_char *) "zstd", 4) == 0) {
+        *zstd = 1;
+    } else if (clen == 2 && ngx_strncasecmp(tok, (u_char *) "br", 2) == 0) {
+        *br = 1;
+    } else if (clen == 4 && ngx_strncasecmp(tok, (u_char *) "gzip", 4) == 0) {
+        *gzip = 1;
+    }
+}
+
+
+/* MAINT-H4f phase helper for ngx_http_cache_turbo_ae_class().
+ * PHASE 2 -- dispatch to the highest-priority accepted encoding.
+ * Returns the encoding string for the first (highest-priority) algorithm that is set:
+ * zstd > br > gzip > identity. Priority order matches what our stack serves. */
+static const char *
+ngx_http_cache_turbo_ae_class_dispatch(ngx_uint_t zstd, ngx_uint_t br,
+    ngx_uint_t gzip)
+{
+    if (zstd) {
+        return "zstd";
+    }
+    if (br) {
+        return "br";
+    }
+    if (gzip) {
+        return "gzip";
+    }
+    return "identity";
+}
+
+
 /* Accept-Encoding collapsed to a small, stable enum so the cache shards by what
  * the response actually IS (zstd/br/gzip/identity), not by the per-browser raw
  * header. Priority zstd > br > gzip mirrors what our stack serves when the client
@@ -13136,30 +13176,14 @@ ngx_http_cache_turbo_ae_class(ngx_http_request_t *r)
         clen = (size_t) (ce - tok);
 
         if (clen > 0 && ngx_http_cache_turbo_ae_q_ok(semi, end)) {
-            if (clen == 4 && ngx_strncasecmp(tok, (u_char *) "zstd", 4) == 0) {
-                zstd = 1;
-            } else if (clen == 2
-                       && ngx_strncasecmp(tok, (u_char *) "br", 2) == 0) {
-                br = 1;
-            } else if (clen == 4
-                       && ngx_strncasecmp(tok, (u_char *) "gzip", 4) == 0) {
-                gzip = 1;
-            }
+            ngx_http_cache_turbo_ae_class_match_coding(tok, clen, &zstd, &br,
+                &gzip);
         }
 
         p = (end < last) ? end + 1 : end;
     }
 
-    if (zstd) {
-        return "zstd";
-    }
-    if (br) {
-        return "br";
-    }
-    if (gzip) {
-        return "gzip";
-    }
-    return "identity";
+    return ngx_http_cache_turbo_ae_class_dispatch(zstd, br, gzip);
 }
 
 
