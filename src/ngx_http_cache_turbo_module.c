@@ -9254,6 +9254,64 @@ ngx_http_cache_turbo_header_skip(ngx_http_cache_turbo_loc_conf_t *clcf,
 }
 
 
+/* MAINT-H4f phase helper for ngx_http_cache_turbo_header_admissible().
+ * PHASE 1 -- validate header name token characters per RFC 9110 §5.6.2 tchar.
+ * Returns NGX_OK if name is a valid token (or empty), NGX_DECLINED otherwise.
+ * The tokenizer walk stays WHOLE rather than being split: it operates on the
+ * character stream sequentially and cannot be fragmented across function
+ * boundaries. */
+static ngx_int_t
+ngx_http_cache_turbo_header_admissible_name(u_char *name, size_t nlen)
+{
+    size_t   i;
+    u_char   c;
+
+    if (nlen == 0) {
+        return NGX_DECLINED;
+    }
+
+    for (i = 0; i < nlen; i++) {
+        c = name[i];
+
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+            || (c >= '0' && c <= '9'))
+        {
+            continue;
+        }
+        switch (c) {
+        case '!': case '#': case '$': case '%': case '&': case '\'':
+        case '*': case '+': case '-': case '.': case '^': case '_':
+        case '`': case '|': case '~':
+            continue;
+        default:
+            return NGX_DECLINED;               /* not a token: unserialisable */
+        }
+    }
+
+    return NGX_OK;
+}
+
+
+/* MAINT-H4f phase helper for ngx_http_cache_turbo_header_admissible().
+ * PHASE 2 -- validate header value for response-splitting primitives (CR/LF/NUL).
+ * Returns NGX_OK if value is safe, NGX_DECLINED if any byte is CR/LF/NUL.
+ * The bounds check stays WHOLE: it validates a flat byte span and cannot be
+ * split across function boundaries. */
+static ngx_int_t
+ngx_http_cache_turbo_header_admissible_value(u_char *val, size_t vlen)
+{
+    size_t   i;
+
+    for (i = 0; i < vlen; i++) {
+        if (val[i] == CR || val[i] == LF || val[i] == '\0') {
+            return NGX_DECLINED;               /* header injection primitive */
+        }
+    }
+
+    return NGX_OK;
+}
+
+
 /*
  * AUD-HDR1: the ONE gate both cache directions ask "may this header cross?".
  * Returns 1 to let the pair through, 0 to drop it.
@@ -9286,34 +9344,12 @@ static ngx_int_t
 ngx_http_cache_turbo_header_admissible(ngx_http_cache_turbo_loc_conf_t *clcf,
     u_char *name, size_t nlen, u_char *val, size_t vlen)
 {
-    size_t  i;
-
-    if (nlen == 0) {
+    if (ngx_http_cache_turbo_header_admissible_name(name, nlen) != NGX_OK) {
         return 0;
     }
 
-    for (i = 0; i < nlen; i++) {
-        u_char  c = name[i];
-
-        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
-            || (c >= '0' && c <= '9'))
-        {
-            continue;
-        }
-        switch (c) {
-        case '!': case '#': case '$': case '%': case '&': case '\'':
-        case '*': case '+': case '-': case '.': case '^': case '_':
-        case '`': case '|': case '~':
-            continue;
-        default:
-            return 0;                      /* not a token: unserialisable */
-        }
-    }
-
-    for (i = 0; i < vlen; i++) {
-        if (val[i] == CR || val[i] == LF || val[i] == '\0') {
-            return 0;                      /* header injection primitive */
-        }
+    if (ngx_http_cache_turbo_header_admissible_value(val, vlen) != NGX_OK) {
+        return 0;
     }
 
     if (ngx_http_cache_turbo_header_skip(clcf, name, nlen)) {

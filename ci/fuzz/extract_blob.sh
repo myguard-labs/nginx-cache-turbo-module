@@ -122,7 +122,7 @@ fi
 # follows, and the body closes on a bare `}` in column 0.
 awk '
     /^static / { pending = 1; buf = $0 ORS; next }
-    pending && /^ngx_http_cache_turbo_(get_u(16|32|64)|blob_validate|blob_next_header|header_skip|header_admissible)\(/ {
+    pending && /^ngx_http_cache_turbo_(get_u(16|32|64)|blob_validate|blob_next_header|header_skip|header_admissible|header_admissible_name|header_admissible_value)\(/ {
         capture = 1; pending = 0; printf "%s", buf; print; next
     }
     pending { pending = 0; buf = "" }
