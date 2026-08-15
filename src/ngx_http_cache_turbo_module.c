@@ -10199,6 +10199,7 @@ ngx_http_cache_turbo_body_filter_blob_write(ngx_http_request_t *r,
     u_char                           *w;
     ngx_uint_t                        i;
 
+    ngx_memzero(&bhw, sizeof(bhw));
     bhw.nheaders = nheaders;
     bhw.headers_len = (uint32_t) hdr_bytes;
     bhw.body_len = (uint32_t) ctx->body_len;
