@@ -6526,23 +6526,20 @@ ngx_http_cache_turbo_access_l1(ngx_http_request_t *r,
 
 
 
-/* MAINT-H2 phase helper for ngx_http_cache_turbo_access_handler().
- * PHASE 2 -- the L2 consult: negative-memo short-circuit, the (parking)
- * backend GET, and the L2-hit validate/arm/promote/serve block.
+/* MAINT-H4e phase helper for ngx_http_cache_turbo_access_l2().
+ * PHASE 1 -- the negative-memo short-circuit, extracted whole.
  *
- * ⚠ LOCK WINDOW: the zone mutex is NOT held on entry (phase 1 released it on
- * its fall-through path) and is not taken here; l1->l2_neg_check(),
- * l1->l2_neg_set() and l1->store_if() each acquire and release it internally,
- * so no callee re-acquires a mutex this caller holds.
+ * ⚠ LOCK WINDOW: takes no lock of its own; l1->l2_neg_check() acquires and
+ * releases the zone mutex internally, exactly as the inline call did. No
+ * pointer crosses an unlock here.
  *
- * ⚠ This phase can PARK the request (NGX_AGAIN on the backend GET). A resume
- * re-enters the handler from the top, which is why every state change here is
- * guarded by an idempotency flag (l2_done, brk_arm_done, sie_armed,
- * l2_neg_skipped) exactly as before. */
-static ngx_int_t
-ngx_http_cache_turbo_access_l2(ngx_http_request_t *r,
+ * void: sets ctx state (l2_done/l2_result/l2_neg_skipped) but never produces
+ * a value the caller must branch on -- the next phase re-reads ctx->l2_done
+ * itself, same as the inline code fell through unconditionally. */
+static void
+ngx_http_cache_turbo_access_l2_neg_memo(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx,
-    ngx_http_cache_turbo_zone_t *z, uint32_t hash, ngx_int_t *out_rc)
+    ngx_http_cache_turbo_zone_t *z, uint32_t hash)
 {
     /* L13: a live negative memo says an L2 GET for this key missed within the
      * last cache_turbo_l2_negative_ttl seconds. Skip the round-trip and treat
@@ -6565,7 +6562,29 @@ ngx_http_cache_turbo_access_l2(ngx_http_request_t *r,
                        "cache_turbo: L2 GET skipped by negative memo \"%V\" "
                        "key=%ui", &r->uri, (ngx_uint_t) hash);
     }
+}
 
+
+
+/* MAINT-H4e phase helper for ngx_http_cache_turbo_access_l2().
+ * PHASE 2 -- the (parking) backend GET, extracted whole.
+ *
+ * ⚠ This phase is the one that can PARK the request (NGX_AGAIN on
+ * backend->get()). A resume re-enters the whole handler from the top, not
+ * this function -- ctx->l2_done/l2_result/l2_blob live in the request ctx
+ * (r->pool lifetime), not a stack local, so nothing cached here needs to
+ * survive the park; the next call to access_l2() re-derives everything from
+ * ctx exactly as the inline code did.
+ *
+ * Returns NGX_DONE with *out_rc == NGX_AGAIN when parked (caller must return
+ * immediately without touching ctx again); NGX_DECLINED otherwise, meaning
+ * "fall through to the L2-result phase" -- ctx->l2_done tells that phase
+ * whether a result is actually ready. */
+static ngx_int_t
+ngx_http_cache_turbo_access_l2_get(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx,
+    uint32_t hash, ngx_int_t *out_rc)
+{
     if (clcf->backend && !ctx->l2_done) {
         ngx_int_t  rc = clcf->backend->get(r, clcf, ctx);
         if (rc == NGX_AGAIN) {
@@ -6578,6 +6597,270 @@ ngx_http_cache_turbo_access_l2(ngx_http_request_t *r,
            /* parked; redis read handler resumes */
         }
         /* NGX_DECLINED: L2 disabled or could not start; go to origin */
+    }
+
+    return NGX_DECLINED;
+}
+
+
+
+/* MAINT-H4e phase helper for ngx_http_cache_turbo_access_l2().
+ * PHASE 3a -- the L2 blob is present but past its serveable window: arm the
+ * breaker/SIE fallbacks from it and mark EXPIRED. Stayed WHOLE rather than
+ * being split further: the breaker-arm and SIE-arm blocks share the same
+ * `bh` (validated header) and the same any-age arming rule, and both are
+ * pure ctx writes with no lock of their own -- there is no lock or pinned
+ * pointer to move across a boundary by keeping them together. void: this
+ * arm-only path never produces a value the caller branches on; the caller
+ * always falls through to the shared "corrupt/expired -> miss" return after
+ * it, same as the inline code. */
+static void
+ngx_http_cache_turbo_access_l2_expired_arm(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx,
+    ngx_http_cache_turbo_zone_t *z, ngx_http_cache_turbo_blob_hdr_t *bh,
+    uint32_t hash)
+{
+    /* Object outlived its serveable window in L2 (Redis TTL slack): treat
+     * as a miss and go to origin.
+     *
+     * NOTE (v4-4 asymmetry, intentional): the load-adaptive stale
+     * widening is applied to the L1 serve decision only (it widens
+     * the local stale_until without rewriting the stored window).
+     * It is deliberately NOT applied here: this branch both SERVES
+     * and STORES the L2 blob into L1 (rem_stale below feeds
+     * l1->store), so widening rem_stale would PERSIST a stretched
+     * window into L1 and diverge from the serve-only L1 semantics.
+     * An L2-restored entry past its stored window is conservatively
+     * a miss; the origin single-flight bounds the refetch.
+     *
+     * RFC-2 stale-if-error (CTB4): if the L1 path did not already arm
+     * a snapshot (L1 evicted, or this is a peer's fresher-but-expired
+     * copy) and this L2 blob still carries a serve-on-error window
+     * (created + sie_ttl) covering now, arm from it so a failing
+     * origin below replays it instead of erroring. */
+    /* P6/O4.3: arm the breaker fallback from the L2 blob too. This
+     * is the L1-absent / L1-evicted case -- a peer's copy that is
+     * past its serveable window. Same any-age rule and same
+     * breaker_should_consult() off-switch as the L1 site above. */
+    if (!ctx->brk_arm_done
+        && ngx_http_cache_turbo_breaker_should_consult(clcf))
+    {
+        /* No copy: ctx->l2_blob already lives in r->pool with the
+         * same lifetime as this request, so pointing at it is both
+         * correct and free. brk_ref stays NULL -- there is no shm
+         * slab reference to drop. */
+        ctx->brk_snap = ctx->l2_blob;
+        ctx->brk_snap_len = ctx->l2_blob_len;
+        ctx->brk_ref = NULL;
+        ctx->brk_arm_done = 1;
+        ctx->brk_armed = 1;
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+        /* O4.4-i negative control for THIS site. Inside the
+         * should_consult() branch on purpose -- see field comment.
+         * Bumps the L2 field only, so a delta here cannot have come
+         * from the L1 site above. */
+        (void) ngx_atomic_fetch_add(&z->sh->test_brk_armings_l2, 1);
+#endif
+        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "cache_turbo: breaker fallback armed from "
+                       "L2 \"%V\" key=%ui", &r->uri,
+                       (ngx_uint_t) hash);
+    }
+
+    if (!ctx->sie_armed && bh->sie_ttl > 0
+        && ngx_time() < (time_t) bh->created + (time_t) bh->sie_ttl)
+    {
+        u_char *snap = ngx_pnalloc(r->pool, ctx->l2_blob_len);
+        if (snap != NULL) {
+            ngx_memcpy(snap, ctx->l2_blob, ctx->l2_blob_len);
+            ctx->sie_snap = snap;
+            ctx->sie_snap_len = ctx->l2_blob_len;
+            ctx->sie_armed = 1;
+            ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                           "cache_turbo: SIE armed from L2 \"%V\" "
+                           "key=%ui", &r->uri, (ngx_uint_t) hash);
+        }
+    }
+    /* L2 held this object but it is past its serveable window:
+     * EXPIRED (a cached entry was found and refetched), not a cold
+     * MISS. Covers the L1-absent / L1-evicted case where the L1
+     * fall-through above never ran. */
+    ctx->status = NGX_HTTP_CACHE_TURBO_ST_EXPIRED;
+    /* V-HANG-2: L2 HAS the key, we just cannot serve it. If we are
+     * a cold-miss waiter, the fill we are parked for has already
+     * landed — every further poll re-fetches this same unserveable
+     * blob, so waiting out lock_timeout adds pure latency. Record
+     * it; the wait loop gives up on the next re-entry. */
+    ctx->l2_present_unserveable = 1;
+    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "cache_turbo: L2 blob expired \"%V\" key=%ui "
+                   "-> origin", &r->uri, (ngx_uint_t) hash);
+}
+
+
+
+/* MAINT-H4e phase helper for ngx_http_cache_turbo_access_l2().
+ * PHASE 3b -- the L2 blob is still serveable: request-freshness-bounds
+ * check, then promote into L1 and serve as a HIT. Stayed WHOLE rather than
+ * being split further: promote (store_if) and serve must observe the SAME
+ * rem_fresh/rem_stale decided together, and there is no lock held across
+ * this phase to move by splitting it -- store_if() takes and releases the
+ * zone mutex internally, same as the inline code, so no callee re-acquires
+ * a mutex the caller holds.
+ *
+ * Returns NGX_DONE with *out_rc set when this phase served the response
+ * (the "passed bounds and promoted" arm); NGX_DECLINED when the blob failed
+ * request freshness bounds and must fall through to origin, matching the
+ * inline req_reval arm. */
+static ngx_int_t
+ngx_http_cache_turbo_access_l2_promote_serve(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx,
+    ngx_http_cache_turbo_zone_t *z, ngx_http_cache_turbo_blob_hdr_t *bh,
+    time_t rem_fresh, time_t rem_stale, uint32_t hash, ngx_int_t *out_rc)
+{
+    /* RFC-1: the L2 copy must also satisfy the request freshness
+     * bounds. An L2 entry can be younger than the L1 one (a peer
+     * refreshed it), so evaluate it on its own age, not the L1
+     * verdict. If it fails, revalidate at origin instead of serving
+     * the rejected copy (req_reval blocks the cold-claim re-serve). */
+    ngx_int_t  l2_fresh_ok = 1, l2_stale_ok = 1;
+    ngx_int_t  promote_rc;
+
+    /* P2: same gate as the L1 verdict above — only run the bounds
+     * check when the client actually sent one. With none set the
+     * verdict leaves l2_fresh_ok/l2_stale_ok at 1 and the block below
+     * can never set req_reval, so it is pure dead work on the L2 hot
+     * path. The defaults are the no-bounds answer. */
+    if (ctx->has_req_bounds) {
+        ngx_http_cache_turbo_req_serve_verdict(ctx,
+            (time_t) bh->created, ngx_time(),
+            (time_t) bh->created + (time_t) bh->fresh_ttl,
+            &l2_fresh_ok, &l2_stale_ok);
+    }
+
+    if ((rem_fresh > 0 && !l2_fresh_ok)
+        || (rem_fresh <= 0 && !l2_stale_ok))
+    {
+        ctx->req_reval = 1;
+        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+            "cache_turbo: L2 blob fails request freshness bounds "
+            "\"%V\" key=%ui -> origin", &r->uri, (ngx_uint_t) hash);
+        return NGX_DECLINED;
+    }
+
+    /* The blob passed blob_validate() above: framing, the full
+     * TLV walk, AND the status/TTL range checks — so the slot we
+     * put in L1 cannot be structurally unserveable.
+     *
+     * AUD-HDR1: this comment used to claim "full validation",
+     * which was read as licence to promote an L2 blob into shm
+     * where every worker serves it. It was not true of the
+     * CONTENT: blob_validate inspects no header bytes. The
+     * content guarantee comes from header_admissible(), applied
+     * on the way OUT in restore_response(), so a poisoned header
+     * in this blob is dropped at serve time rather than
+     * prevented from entering L1. Keep the two claims separate;
+     * conflating them is what let AUD-HDR1 survive to HEAD. */
+    /* AUD-L2-PROMOTE-RACE: this GET unlocked before the
+     * request parked; on resume it used to promote
+     * unconditionally, so a slow L2 reply could overwrite a
+     * NEWER origin response that landed while parked.
+     * store_if() decides "is the resident entry newer?" and
+     * writes under ONE lock hold, closing that window.
+     * NGX_DECLINED means the promotion did not happen -- that
+     * is CORRECT, not an error: the blob we hold is still
+     * valid and gets served below exactly as before, we
+     * simply declined to displace a fresher L1 entry. */
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+    /* AUD-L2-PROMOTE-RACE test hook: the gap this fix closes
+     * is pure CPU between the unlock above and store_if()'s
+     * own lock -- no I/O, no yield point, unreachable from a
+     * black-box HTTP timing race. Blocking THIS worker here
+     * (ngx_msleep = plain usleep, stalls only its own event
+     * loop) gives a test a deterministic window to land a
+     * concurrent write from a DIFFERENT worker before the
+     * decide-and-store below runs. 0/unset = no hold. */
+    if (clcf->test_l2_promote_hold_ms > 0) {
+        ngx_msleep((ngx_msec_t) clcf->test_l2_promote_hold_ms);
+    }
+#endif
+    promote_rc = clcf->l1->store_if(z,
+               ctx->key_hash, hash,
+               ctx->l2_blob, ctx->l2_blob_len,
+               rem_fresh, rem_stale,
+               NGX_HTTP_CACHE_TURBO_STORE_IF_NEWER);
+
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+    /* AUD-L2-PROMOTE-RACE oracle: NOTICE (not debug) so it is
+     * readable at the harness's default log level -- same
+     * reasoning as test_sie_unconsumed (AUD-SIE-BODY). Two
+     * DISTINCT values so a test can tell "declined" from
+     * "stored" apart, never inferring one from the other's
+     * absence: an absent line must fail the test, not read
+     * as either. */
+    ngx_log_error(NGX_LOG_NOTICE, r->connection->log, 0,
+                  "cache_turbo: test_l2_promote_rc=%i",
+                  promote_rc);
+#endif
+
+    if (promote_rc == NGX_DECLINED) {
+        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "cache_turbo: L2 promote skipped, "
+                       "newer entry resident \"%V\" key=%ui",
+                       &r->uri, (ngx_uint_t) hash);
+    }
+
+    (void) ngx_atomic_fetch_add(&z->sh->hits, 1);
+    (void) ngx_atomic_fetch_add(&z->sh->l2_hits, 1);
+    ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "cache_turbo: L2 HIT \"%V\" key=%ui len=%uz "
+                   "(filled L1)", &r->uri, (ngx_uint_t) hash,
+                   ctx->l2_blob_len);
+
+    *out_rc = ngx_http_cache_turbo_serve(r, ctx->l2_blob,
+              ctx->l2_blob_len, rem_fresh <= 0 ? 1 : 0,
+              z, NULL, NULL);
+    return NGX_DONE;
+
+                          /* L2 blob lives in r->pool, no ref */
+}
+
+
+
+/* MAINT-H2 phase helper for ngx_http_cache_turbo_access_handler().
+ * PHASE 2 -- the L2 consult: negative-memo short-circuit, the (parking)
+ * backend GET, and the L2-hit validate/arm/promote/serve block.
+ *
+ * ⚠ LOCK WINDOW: the zone mutex is NOT held on entry (phase 1 released it on
+ * its fall-through path) and is not taken here; l1->l2_neg_check(),
+ * l1->l2_neg_set() and l1->store_if() each acquire and release it internally,
+ * so no callee re-acquires a mutex this caller holds.
+ *
+ * ⚠ This phase can PARK the request (NGX_AGAIN on the backend GET). A resume
+ * re-enters the handler from the top, which is why every state change here is
+ * guarded by an idempotency flag (l2_done, brk_arm_done, sie_armed,
+ * l2_neg_skipped) exactly as before.
+ *
+ * MAINT-H4e: decomposed into ngx_http_cache_turbo_access_l2_neg_memo() (PHASE
+ * 1), ngx_http_cache_turbo_access_l2_get() (PHASE 2), and
+ * ngx_http_cache_turbo_access_l2_expired_arm() /
+ * ngx_http_cache_turbo_access_l2_promote_serve() (PHASE 3a/3b, the two
+ * mutually exclusive arms after blob_validate). This function is now the
+ * dispatcher; every phase runs at exactly the point the inline code did. */
+static ngx_int_t
+ngx_http_cache_turbo_access_l2(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx,
+    ngx_http_cache_turbo_zone_t *z, uint32_t hash, ngx_int_t *out_rc)
+{
+    ngx_http_cache_turbo_access_l2_neg_memo(r, clcf, ctx, z, hash);
+
+    if (ngx_http_cache_turbo_access_l2_get(r, clcf, ctx, hash, out_rc)
+        == NGX_DONE)
+    {
+        return NGX_DONE;
     }
 
     if (ctx->l2_done && ctx->l2_result == NGX_OK && ctx->l2_blob) {
@@ -6603,188 +6886,14 @@ ngx_http_cache_turbo_access_l2(ngx_http_request_t *r,
             rem_stale = (time_t) bh.stale_ttl - age;   /* total window left */
 
             if (rem_stale <= 0) {
-                /* Object outlived its serveable window in L2 (Redis TTL
-                 * slack): treat as a miss and go to origin.
-                 *
-                 * NOTE (v4-4 asymmetry, intentional): the load-adaptive stale
-                 * widening is applied to the L1 serve decision only (it widens
-                 * the local stale_until without rewriting the stored window).
-                 * It is deliberately NOT applied here: this branch both SERVES
-                 * and STORES the L2 blob into L1 (rem_stale below feeds
-                 * l1->store), so widening rem_stale would PERSIST a stretched
-                 * window into L1 and diverge from the serve-only L1 semantics.
-                 * An L2-restored entry past its stored window is conservatively
-                 * a miss; the origin single-flight bounds the refetch.
-                 *
-                 * RFC-2 stale-if-error (CTB4): if the L1 path did not already arm
-                 * a snapshot (L1 evicted, or this is a peer's fresher-but-expired
-                 * copy) and this L2 blob still carries a serve-on-error window
-                 * (created + sie_ttl) covering now, arm from it so a failing
-                 * origin below replays it instead of erroring. */
-                /* P6/O4.3: arm the breaker fallback from the L2 blob too. This
-                 * is the L1-absent / L1-evicted case -- a peer's copy that is
-                 * past its serveable window. Same any-age rule and same
-                 * breaker_should_consult() off-switch as the L1 site above. */
-                if (!ctx->brk_arm_done
-                    && ngx_http_cache_turbo_breaker_should_consult(clcf))
-                {
-                    /* No copy: ctx->l2_blob already lives in r->pool with the
-                     * same lifetime as this request, so pointing at it is both
-                     * correct and free. brk_ref stays NULL -- there is no shm
-                     * slab reference to drop. */
-                    ctx->brk_snap = ctx->l2_blob;
-                    ctx->brk_snap_len = ctx->l2_blob_len;
-                    ctx->brk_ref = NULL;
-                    ctx->brk_arm_done = 1;
-                    ctx->brk_armed = 1;
-#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
-    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
-                    /* O4.4-i negative control for THIS site. Inside the
-                     * should_consult() branch on purpose -- see field comment.
-                     * Bumps the L2 field only, so a delta here cannot have come
-                     * from the L1 site above. */
-                    (void) ngx_atomic_fetch_add(&z->sh->test_brk_armings_l2, 1);
-#endif
-                    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                                   "cache_turbo: breaker fallback armed from "
-                                   "L2 \"%V\" key=%ui", &r->uri,
-                                   (ngx_uint_t) hash);
-                }
-
-                if (!ctx->sie_armed && bh.sie_ttl > 0
-                    && ngx_time() < (time_t) bh.created + (time_t) bh.sie_ttl)
-                {
-                    u_char *snap = ngx_pnalloc(r->pool, ctx->l2_blob_len);
-                    if (snap != NULL) {
-                        ngx_memcpy(snap, ctx->l2_blob, ctx->l2_blob_len);
-                        ctx->sie_snap = snap;
-                        ctx->sie_snap_len = ctx->l2_blob_len;
-                        ctx->sie_armed = 1;
-                        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                                       "cache_turbo: SIE armed from L2 \"%V\" "
-                                       "key=%ui", &r->uri, (ngx_uint_t) hash);
-                    }
-                }
-                /* L2 held this object but it is past its serveable window:
-                 * EXPIRED (a cached entry was found and refetched), not a cold
-                 * MISS. Covers the L1-absent / L1-evicted case where the L1
-                 * fall-through above never ran. */
-                ctx->status = NGX_HTTP_CACHE_TURBO_ST_EXPIRED;
-                /* V-HANG-2: L2 HAS the key, we just cannot serve it. If we are
-                 * a cold-miss waiter, the fill we are parked for has already
-                 * landed — every further poll re-fetches this same unserveable
-                 * blob, so waiting out lock_timeout adds pure latency. Record
-                 * it; the wait loop gives up on the next re-entry. */
-                ctx->l2_present_unserveable = 1;
-                ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                               "cache_turbo: L2 blob expired \"%V\" key=%ui "
-                               "-> origin", &r->uri, (ngx_uint_t) hash);
+                ngx_http_cache_turbo_access_l2_expired_arm(r, clcf, ctx, z,
+                    &bh, hash);
             } else {
-                /* RFC-1: the L2 copy must also satisfy the request freshness
-                 * bounds. An L2 entry can be younger than the L1 one (a peer
-                 * refreshed it), so evaluate it on its own age, not the L1
-                 * verdict. If it fails, revalidate at origin instead of serving
-                 * the rejected copy (req_reval blocks the cold-claim re-serve). */
-                ngx_int_t  l2_fresh_ok = 1, l2_stale_ok = 1;
-                ngx_int_t  promote_rc;
-
-                /* P2: same gate as the L1 verdict above — only run the bounds
-                 * check when the client actually sent one. With none set the
-                 * verdict leaves l2_fresh_ok/l2_stale_ok at 1 and the block below
-                 * can never set req_reval, so it is pure dead work on the L2 hot
-                 * path. The defaults are the no-bounds answer. */
-                if (ctx->has_req_bounds) {
-                    ngx_http_cache_turbo_req_serve_verdict(ctx,
-                        (time_t) bh.created, ngx_time(),
-                        (time_t) bh.created + (time_t) bh.fresh_ttl,
-                        &l2_fresh_ok, &l2_stale_ok);
-                }
-
-                if ((rem_fresh > 0 && !l2_fresh_ok)
-                    || (rem_fresh <= 0 && !l2_stale_ok))
+                if (ngx_http_cache_turbo_access_l2_promote_serve(r, clcf,
+                        ctx, z, &bh, rem_fresh, rem_stale, hash, out_rc)
+                    == NGX_DONE)
                 {
-                    ctx->req_reval = 1;
-                    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                        "cache_turbo: L2 blob fails request freshness bounds "
-                        "\"%V\" key=%ui -> origin", &r->uri, (ngx_uint_t) hash);
-                } else {
-                    /* The blob passed blob_validate() above: framing, the full
-                     * TLV walk, AND the status/TTL range checks — so the slot we
-                     * put in L1 cannot be structurally unserveable.
-                     *
-                     * AUD-HDR1: this comment used to claim "full validation",
-                     * which was read as licence to promote an L2 blob into shm
-                     * where every worker serves it. It was not true of the
-                     * CONTENT: blob_validate inspects no header bytes. The
-                     * content guarantee comes from header_admissible(), applied
-                     * on the way OUT in restore_response(), so a poisoned header
-                     * in this blob is dropped at serve time rather than
-                     * prevented from entering L1. Keep the two claims separate;
-                     * conflating them is what let AUD-HDR1 survive to HEAD. */
-                    /* AUD-L2-PROMOTE-RACE: this GET unlocked before the
-                     * request parked; on resume it used to promote
-                     * unconditionally, so a slow L2 reply could overwrite a
-                     * NEWER origin response that landed while parked.
-                     * store_if() decides "is the resident entry newer?" and
-                     * writes under ONE lock hold, closing that window.
-                     * NGX_DECLINED means the promotion did not happen -- that
-                     * is CORRECT, not an error: the blob we hold is still
-                     * valid and gets served below exactly as before, we
-                     * simply declined to displace a fresher L1 entry. */
-#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
-    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
-                    /* AUD-L2-PROMOTE-RACE test hook: the gap this fix closes
-                     * is pure CPU between the unlock above and store_if()'s
-                     * own lock -- no I/O, no yield point, unreachable from a
-                     * black-box HTTP timing race. Blocking THIS worker here
-                     * (ngx_msleep = plain usleep, stalls only its own event
-                     * loop) gives a test a deterministic window to land a
-                     * concurrent write from a DIFFERENT worker before the
-                     * decide-and-store below runs. 0/unset = no hold. */
-                    if (clcf->test_l2_promote_hold_ms > 0) {
-                        ngx_msleep((ngx_msec_t) clcf->test_l2_promote_hold_ms);
-                    }
-#endif
-                    promote_rc = clcf->l1->store_if(z,
-                               ctx->key_hash, hash,
-                               ctx->l2_blob, ctx->l2_blob_len,
-                               rem_fresh, rem_stale,
-                               NGX_HTTP_CACHE_TURBO_STORE_IF_NEWER);
-
-#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
-    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
-                    /* AUD-L2-PROMOTE-RACE oracle: NOTICE (not debug) so it is
-                     * readable at the harness's default log level -- same
-                     * reasoning as test_sie_unconsumed (AUD-SIE-BODY). Two
-                     * DISTINCT values so a test can tell "declined" from
-                     * "stored" apart, never inferring one from the other's
-                     * absence: an absent line must fail the test, not read
-                     * as either. */
-                    ngx_log_error(NGX_LOG_NOTICE, r->connection->log, 0,
-                                  "cache_turbo: test_l2_promote_rc=%i",
-                                  promote_rc);
-#endif
-
-                    if (promote_rc == NGX_DECLINED) {
-                        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                                       "cache_turbo: L2 promote skipped, "
-                                       "newer entry resident \"%V\" key=%ui",
-                                       &r->uri, (ngx_uint_t) hash);
-                    }
-
-                    (void) ngx_atomic_fetch_add(&z->sh->hits, 1);
-                    (void) ngx_atomic_fetch_add(&z->sh->l2_hits, 1);
-                    ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                                   "cache_turbo: L2 HIT \"%V\" key=%ui len=%uz "
-                                   "(filled L1)", &r->uri, (ngx_uint_t) hash,
-                                   ctx->l2_blob_len);
-
-                    *out_rc = ngx_http_cache_turbo_serve(r, ctx->l2_blob,
-                              ctx->l2_blob_len, rem_fresh <= 0 ? 1 : 0,
-                              z, NULL, NULL);
                     return NGX_DONE;
-
-                                          /* L2 blob lives in r->pool, no ref */
                 }
             }
         }
