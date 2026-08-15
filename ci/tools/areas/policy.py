@@ -236,14 +236,7 @@ def test_cdn_cache_control_split_header_ttl(ng: Nginx) -> None:
     assert "x-cache" not in h0, "first should miss"
     _, _, h1 = fetch(ng.port, "/cc7/cdnsplit")
     assert h1.get("x-cache") == "HIT", "second should be a fresh HIT (<1s)"
-    # past CDN-CC max-age=1 (2nd line). Scaled by ASAN_TIME_SCALE
-    # (FLAKE-ASAN-TIMING-BAND): an ASan build can be slow enough that the two
-    # fetch() round-trips around the sleep eat into the margin over the 1s
-    # TTL; more sleep only widens the "definitely past max-age=1" margin, it
-    # does not weaken the STALE assertion below (there is no upper bound
-    # here -- cache_turbo_valid is 60s, far above any scaled sleep).
-    # Unscaled outside a sanitizer run.
-    time.sleep(2.0 * sanitizer_time_scale())
+    time.sleep(2.0)                               # past CDN-CC max-age=1 (2nd line)
     _, _, h2 = fetch(ng.port, "/cc7/cdnsplit")
     assert h2.get("x-cache") == "STALE", \
         ("CDN-Cache-Control max-age on a later field-line must not be ignored: "
@@ -304,12 +297,7 @@ def test_must_revalidate_split_header(ng: Nginx) -> None:
     assert "x-cache" not in h0, "first should miss"
     _, _, h1 = fetch(ng.port, "/ccsplit/splitmrev")
     assert h1.get("x-cache") == "HIT", f"second should be a fresh HIT, got {h1}"
-    # past max-age=1. Scaled by ASAN_TIME_SCALE (FLAKE-ASAN-TIMING-BAND): more
-    # sleep only widens the "definitely past max-age=1" margin -- the
-    # assertions below check must-revalidate forced a re-fetch, not an upper
-    # bound, so widening does not weaken them. Unscaled outside a sanitizer
-    # run.
-    time.sleep(2.0 * sanitizer_time_scale())
+    time.sleep(2.0)                               # past max-age=1
     _, _, h2 = fetch(ng.port, "/ccsplit/splitmrev")
     assert h2.get("x-cache") != "STALE", \
         ("must-revalidate on a later Cache-Control field-line must NOT be "
