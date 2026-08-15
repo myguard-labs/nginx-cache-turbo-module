@@ -1756,13 +1756,13 @@ def test_multinode_lock(ng: Nginx, origin: Origin, redis: RedisServer) -> None:
     finally:
         b.stop()
         drain_origin(origin)   # v8: settle async bg refreshes before next test
-        # FLAKE-L2-PAIRWISE (open): drain_origin() settles ORIGIN traffic only.
-        # The regen this test provokes also writes the new generation back to
-        # L2, and that SET can still be in flight once the origin has gone
-        # quiet, so this test can still leak a tail into the next one. Not
-        # fixed here: an EXISTS wait is useless (the key is present from the
-        # prime onward) and wait_for_l2() needs the expected bytes, which this
-        # test never captures. See issues.md § FLAKE-L2-PAIRWISE.
+        # FLAKE-L2-PAIRWISE: drain_origin() settles ORIGIN traffic only. The
+        # regen this test provokes also writes the new generation back to L2,
+        # and that Redis SET can still be in flight after the origin goes
+        # quiet, leaking a tail into the next dispatched test. DEL this
+        # test's own L2 + lock keys so a late SET lands on a key nothing else
+        # reads instead of racing the next test's fixture.
+        redis.cli("DEL", l2_key(uri), lock_key(uri))
 
 
 def test_cross_node_won_stale_body(ng: Nginx, origin: Origin,
