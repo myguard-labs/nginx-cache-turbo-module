@@ -4163,6 +4163,167 @@ ngx_http_cache_turbo_name_has_suffix(u_char *n, size_t nlen, const char *suffix)
 }
 
 
+/* Phase 1 of ngx_http_cache_turbo_cookie_pred_one(): locate the next
+ * ';'-separated pair starting at *pp (bounded by end), OWS-trim it, and
+ * advance *pp past it so the caller's loop can call this again for the next
+ * pair. Returns the trimmed pair in the name/plen out-params. Returns 0 when the pair
+ * was empty ("; ;") or the scan hit `end` with nothing left — the caller
+ * must `continue`/`break` its loop on that value without reading *namep or
+ * *plenp, exactly as the inline loop this replaces did. Returns 1 when a
+ * non-empty pair was produced. */
+static ngx_int_t
+ngx_http_cache_turbo_cookie_pred_one_next_pair(u_char **pp, u_char *end,
+    u_char **namep, size_t *plenp)
+{
+    u_char  *p, *name;
+    size_t   plen;
+
+    p = *pp;
+
+    /* Skip leading OWS and stray ';' before this pair. */
+    while (p < end && (*p == ' ' || *p == '\t' || *p == ';')) {
+        p++;
+    }
+    if (p >= end) {
+        *pp = p;
+        return 0;
+    }
+
+    /* The pair runs to the next ';' or to the end of the header value. */
+    name = p;
+    while (p < end && *p != ';') {
+        p++;
+    }
+    plen = (size_t) (p - name);
+
+    /* Trim trailing OWS off the pair. */
+    while (plen > 0 && (name[plen - 1] == ' ' || name[plen - 1] == '\t')) {
+        plen--;
+    }
+
+    *pp = p;
+
+    if (plen == 0) {
+        return 0;                           /* empty pair ("; ;") — ignore */
+    }
+
+    *namep = name;
+    *plenp = plen;
+    return 1;
+}
+
+
+/* Phase 2 of ngx_http_cache_turbo_cookie_pred_one(): split one OWS-trimmed
+ * pair [name, name+plen) on '=' and test the name against pr->name_suffix.
+ * Returns NGX_ERROR when the name does not match (caller must `continue`,
+ * reading no out-param). Returns NGX_DECLINED when the name matches but the
+ * pair is bare (no '=') — this is the fail-closed "unparseable => bypass"
+ * case, and the caller must return 1 immediately without reading *valp/
+ * *vlenp. Returns NGX_OK when the name matches and a value was split out
+ * into the value/vlen out-params for the op dispatch that follows. */
+static ngx_int_t
+ngx_http_cache_turbo_cookie_pred_one_split(u_char *name, size_t plen,
+    const ngx_http_cache_turbo_cookie_pred_t *pr, u_char **valp, size_t *vlenp)
+{
+    u_char  *eq, *val;
+    size_t   nlen;
+
+    /* Split name '=' value, bounded by plen (no NUL to lean on). */
+    eq = ngx_strlchr(name, name + plen, '=');
+
+    if (eq == NULL) {
+        /* A bare cookie with no '='. If its NAME is the one we key on, we
+         * cannot read a value and must not guess: fail closed to bypass. */
+        nlen = plen;
+        while (nlen > 0 && (name[nlen - 1] == ' ' || name[nlen - 1] == '\t')) {
+            nlen--;
+        }
+        if (ngx_http_cache_turbo_name_has_suffix(name, nlen,
+                                                 pr->name_suffix))
+        {
+            return NGX_DECLINED;            /* unparseable => bypass */
+        }
+        return NGX_ERROR;                   /* different cookie */
+    }
+
+    nlen = (size_t) (eq - name);
+    while (nlen > 0 && (name[nlen - 1] == ' ' || name[nlen - 1] == '\t')) {
+        nlen--;                              /* OWS before '=' */
+    }
+
+    if (!ngx_http_cache_turbo_name_has_suffix(name, nlen, pr->name_suffix)) {
+        return NGX_ERROR;                    /* different cookie */
+    }
+
+    /* Value = everything after '=' to the end of the pair, OWS-trimmed. */
+    val = eq + 1;
+    while (val < name + plen && (*val == ' ' || *val == '\t')) {
+        val++;
+    }
+
+    *valp = val;
+    *vlenp = (size_t) ((name + plen) - val);
+    return NGX_OK;
+}
+
+
+/* Phase 3 of ngx_http_cache_turbo_cookie_pred_one(): apply pr->op to one
+ * already-matched cookie value. Returns 1 = this pair decides bypass (the
+ * caller must return immediately), 0 = this pair has no opinion (the caller
+ * must `continue` its scan — see the comment at the call site on why a
+ * "cacheable" answer from one pair must not end the scan). Arm order and
+ * short-circuit behaviour are unchanged from the inline switch: NONEMPTY,
+ * then EQ, then NE/default, each returning before any later arm is reached. */
+static ngx_int_t
+ngx_http_cache_turbo_cookie_pred_one_dispatch(u_char *val, size_t vlen,
+    const ngx_http_cache_turbo_cookie_pred_t *pr)
+{
+    size_t  cmplen;
+
+    /* cmplen is deliberately NOT plen: plen was this pair's length and only
+     * bounded `val` in the split phase. Reusing it for the predicate value's
+     * length is safe only for as long as every arm returns. */
+    cmplen = (pr->value != NULL) ? ngx_strlen(pr->value) : 0;
+
+    switch (pr->op) {
+
+    case NGX_HTTP_CACHE_TURBO_CVOP_NONEMPTY:
+        if (vlen > 0) {
+            return 1;
+        }
+        return 0;
+
+    case NGX_HTTP_CACHE_TURBO_CVOP_EQ:
+        /* A value-comparing op with no literal cannot match anything. Guard
+         * it: the registry never ships such a row, but the compare below
+         * passes pr->value to a nonnull parameter. */
+        if (pr->value != NULL
+            && vlen == cmplen
+            && ngx_strncmp(val, pr->value, cmplen) == 0)
+        {
+            return 1;
+        }
+        return 0;
+
+    case NGX_HTTP_CACHE_TURBO_CVOP_NE:
+    default:
+        /* The phpBB case. An EMPTY value ("_u=") is not the guest literal
+         * "1", so by the letter of != it is a member — but it is really a
+         * malformed/cleared cookie. Bypass either way: both readings agree,
+         * and bypass is the safe direction. */
+        if (pr->value != NULL
+            && vlen == cmplen
+            && ngx_strncmp(val, pr->value, cmplen) == 0)
+        {
+            return 0;                        /* == the guest literal: cacheable */
+        }
+        return 1;                            /* anything else (incl. a row with
+                                              * no literal): bypass, the safe
+                                              * direction */
+    }
+}
+
+
 /*
  * Evaluate one predicate against one Cookie header value (which may itself hold
  * several ';'-separated pairs). Returns 1 = request is dynamic (bypass), 0 = no
@@ -4175,8 +4336,9 @@ static ngx_int_t
 ngx_http_cache_turbo_cookie_pred_one(u_char *data, size_t len,
     const ngx_http_cache_turbo_cookie_pred_t *pr)
 {
-    u_char  *p, *end, *name, *eq, *val;
-    size_t   nlen, vlen, plen, cmplen;
+    u_char      *p, *end, *name, *val;
+    size_t       plen, vlen;
+    ngx_int_t    rc;
 
     /* An empty (or absent) Cookie value: nothing to match, and no opinion. The
      * explicit guard is required, not cosmetic — a header can carry data == NULL
@@ -4192,66 +4354,20 @@ ngx_http_cache_turbo_cookie_pred_one(u_char *data, size_t len,
 
     while (p < end) {
 
-        /* Skip leading OWS and stray ';' before this pair. */
-        while (p < end && (*p == ' ' || *p == '\t' || *p == ';')) {
-            p++;
-        }
-        if (p >= end) {
-            break;
-        }
-
-        /* The pair runs to the next ';' or to the end of the header value. */
-        name = p;
-        while (p < end && *p != ';') {
-            p++;
-        }
-        plen = (size_t) (p - name);
-
-        /* Trim trailing OWS off the pair. */
-        while (plen > 0
-               && (name[plen - 1] == ' ' || name[plen - 1] == '\t'))
+        if (!ngx_http_cache_turbo_cookie_pred_one_next_pair(&p, end, &name,
+                                                             &plen))
         {
-            plen--;
-        }
-        if (plen == 0) {
-            continue;                       /* empty pair ("; ;") — ignore */
+            continue;                        /* empty pair, or scan exhausted */
         }
 
-        /* Split name '=' value, bounded by plen (no NUL to lean on). */
-        eq = ngx_strlchr(name, name + plen, '=');
-
-        if (eq == NULL) {
-            /* A bare cookie with no '='. If its NAME is the one we key on, we
-             * cannot read a value and must not guess: fail closed to bypass. */
-            nlen = plen;
-            while (nlen > 0 && (name[nlen - 1] == ' ' || name[nlen - 1] == '\t')) {
-                nlen--;
-            }
-            if (ngx_http_cache_turbo_name_has_suffix(name, nlen,
-                                                     pr->name_suffix))
-            {
-                return 1;                   /* unparseable => bypass */
-            }
-            continue;
-        }
-
-        nlen = (size_t) (eq - name);
-        while (nlen > 0 && (name[nlen - 1] == ' ' || name[nlen - 1] == '\t')) {
-            nlen--;                          /* OWS before '=' */
-        }
-
-        if (!ngx_http_cache_turbo_name_has_suffix(name, nlen,
-                                                  pr->name_suffix))
-        {
+        rc = ngx_http_cache_turbo_cookie_pred_one_split(name, plen, pr,
+                                                         &val, &vlen);
+        if (rc == NGX_ERROR) {
             continue;                        /* different cookie */
         }
-
-        /* Value = everything after '=' to the end of the pair, OWS-trimmed. */
-        val = eq + 1;
-        while (val < name + plen && (*val == ' ' || *val == '\t')) {
-            val++;
+        if (rc == NGX_DECLINED) {
+            return 1;                        /* unparseable => bypass */
         }
-        vlen = (size_t) ((name + plen) - val);
 
         /* A "this pair says cacheable" answer must NOT end the scan: the header
          * can carry several cookies whose names all end in the suffix (phpBB
@@ -4261,48 +4377,9 @@ ngx_http_cache_turbo_cookie_pred_one(u_char *data, size_t len,
          * leading guest `_u=1` would mask a member `_u=42` behind it — serving
          * and storing that member's page. So only `continue` here; bypass (1)
          * still returns immediately, and "no pair objected" is the loop's exit
-         * value below.
-         *
-         * cmplen is deliberately NOT plen: plen is this pair's length and is
-         * still what bounds `val` above. Reusing it for the predicate value's
-         * length is safe only for as long as every arm returns. */
-        cmplen = (pr->value != NULL) ? ngx_strlen(pr->value) : 0;
-
-        switch (pr->op) {
-
-        case NGX_HTTP_CACHE_TURBO_CVOP_NONEMPTY:
-            if (vlen > 0) {
-                return 1;
-            }
-            continue;
-
-        case NGX_HTTP_CACHE_TURBO_CVOP_EQ:
-            /* A value-comparing op with no literal cannot match anything.
-             * Guard it: the registry never ships such a row, but the compare
-             * below passes pr->value to a nonnull parameter. */
-            if (pr->value != NULL
-                && vlen == cmplen
-                && ngx_strncmp(val, pr->value, cmplen) == 0)
-            {
-                return 1;
-            }
-            continue;
-
-        case NGX_HTTP_CACHE_TURBO_CVOP_NE:
-        default:
-            /* The phpBB case. An EMPTY value ("_u=") is not the guest literal
-             * "1", so by the letter of != it is a member — but it is really a
-             * malformed/cleared cookie. Bypass either way: both readings agree,
-             * and bypass is the safe direction. */
-            if (pr->value != NULL
-                && vlen == cmplen
-                && ngx_strncmp(val, pr->value, cmplen) == 0)
-            {
-                continue;                    /* == the guest literal: cacheable */
-            }
-            return 1;                        /* anything else (incl. a row with
-                                              * no literal): bypass, the safe
-                                              * direction */
+         * value below. */
+        if (ngx_http_cache_turbo_cookie_pred_one_dispatch(val, vlen, pr)) {
+            return 1;
         }
     }
 
