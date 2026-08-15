@@ -8226,26 +8226,24 @@ ngx_http_cache_turbo_test_cookie_scan_header(ngx_http_request_t *r)
  * Best-effort: empty tag value, zero surviving tags, or any allocation failure
  * simply skips the header. A missing CDN purge-key is a degraded-but-correct
  * edge (still cached, just not CDN-tag-purgeable), never a response failure. */
+
+/* MAINT-H4f phase helper for ngx_http_cache_turbo_emit_surrogate_key().
+ * PHASE 2 -- parse tag directive value, tokenize on space/tab/comma/CRLF,
+ * deduplicate within value, and count unique tags. Stays WHOLE rather than
+ * being split: the tokenizer walk operates on cached pointers within
+ * tagval.data and cannot be fragmented across function boundaries. void:
+ * this phase only populates an array and counter the caller inspects before
+ * proceeding; there is nothing to branch on. */
 static void
-ngx_http_cache_turbo_emit_surrogate_key(ngx_http_request_t *r,
-    ngx_http_cache_turbo_loc_conf_t *clcf)
+ngx_http_cache_turbo_emit_surrogate_key_parse(ngx_str_t *tagval,
+    ngx_str_t *seen, ngx_uint_t *out_ntags)
 {
-    ngx_str_t    tagval, seen[NGX_HTTP_CACHE_TURBO_MAX_TAGS];
-    u_char      *s, *e, *tok, *buf, *p;
-    size_t       toklen, len = 0;
-    ngx_uint_t   ntags = 0, i, k;
+    u_char      *s, *e, *tok;
+    size_t       toklen;
+    ngx_uint_t   ntags = 0, k;
 
-    if (clcf->tag == NULL) {
-        return;
-    }
-    if (ngx_http_complex_value(r, clcf->tag, &tagval) != NGX_OK
-        || tagval.len == 0)
-    {
-        return;
-    }
-
-    s = tagval.data;
-    e = tagval.data + tagval.len;
+    s = tagval->data;
+    e = tagval->data + tagval->len;
 
     while (s < e && ntags < NGX_HTTP_CACHE_TURBO_MAX_TAGS) {
         while (s < e && (*s == ' ' || *s == '\t' || *s == ','
@@ -8280,9 +8278,22 @@ ngx_http_cache_turbo_emit_surrogate_key(ngx_http_request_t *r,
         ntags++;
     }
 
-    if (ntags == 0) {
-        return;
-    }
+    *out_ntags = ntags;
+}
+
+
+/* MAINT-H4f phase helper for ngx_http_cache_turbo_emit_surrogate_key().
+ * PHASE 3 -- calculate buffer size, allocate, format space-separated tags,
+ * and emit Surrogate-Key header. void: best-effort like the MISS-path emit.
+ * Allocation failure is benign: response stays cached, just not CDN-tag-
+ * purgeable. */
+static void
+ngx_http_cache_turbo_emit_surrogate_key_format(ngx_http_request_t *r,
+    ngx_str_t *seen, ngx_uint_t ntags)
+{
+    u_char      *buf, *p;
+    size_t       len = 0;
+    ngx_uint_t   i;
 
     for (i = 0; i < ntags; i++) {
         len += seen[i].len + 1;                /* +1 for a separating space */
@@ -8304,6 +8315,32 @@ ngx_http_cache_turbo_emit_surrogate_key(ngx_http_request_t *r,
     (void) ngx_http_cache_turbo_add_header(r,
                (u_char *) "Surrogate-Key", sizeof("Surrogate-Key") - 1,
                buf, (size_t) (p - buf));
+}
+
+
+static void
+ngx_http_cache_turbo_emit_surrogate_key(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf)
+{
+    ngx_str_t    tagval, seen[NGX_HTTP_CACHE_TURBO_MAX_TAGS];
+    ngx_uint_t   ntags = 0;
+
+    if (clcf->tag == NULL) {
+        return;
+    }
+    if (ngx_http_complex_value(r, clcf->tag, &tagval) != NGX_OK
+        || tagval.len == 0)
+    {
+        return;
+    }
+
+    ngx_http_cache_turbo_emit_surrogate_key_parse(&tagval, seen, &ntags);
+
+    if (ntags == 0) {
+        return;
+    }
+
+    ngx_http_cache_turbo_emit_surrogate_key_format(r, seen, ntags);
 }
 
 
