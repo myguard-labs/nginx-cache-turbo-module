@@ -5347,24 +5347,19 @@ ngx_http_cache_turbo_precontent_handler(ngx_http_request_t *r)
 
 
 /*
- * CQ-2: prologue gates + per-request setup shared by every (re)entry of the
- * access handler (a parked L2/lock resume re-enters the handler, so this runs
- * again — build_key/auto-classify/no-cache/vary/bypass all re-evaluate, exactly
- * as before the extraction). Returns NGX_OK with ctxp/zp/hashp populated when
- * the caller should proceed to the L1 lookup; any other value is what the
- * handler must return (NGX_DECLINED for the not-cacheable/skip/bypass gates,
- * NGX_ERROR on ctx alloc / key build failure).
+ * MAINT-SEAM: the request-shape eligibility gates that run before any cache
+ * state is touched. Pure predicate over (r, clcf) -- no ctx, no zone, no
+ * allocation, no side effects -- so it re-evaluates identically on a parked
+ * L2/lock resume, exactly as the inline run of early returns did.
+ *
+ * NGX_OK = this request may proceed to the engaged path; NGX_DECLINED = the
+ * caller declines. Split out of access_prologue() to keep the prologue's
+ * branching about cache state rather than about request shape.
  */
 static ngx_int_t
-ngx_http_cache_turbo_access_prologue(ngx_http_request_t *r,
-    ngx_http_cache_turbo_loc_conf_t *clcf,
-    ngx_http_cache_turbo_ctx_t **ctxp, ngx_http_cache_turbo_zone_t **zp,
-    uint32_t *hashp)
+ngx_http_cache_turbo_access_eligible(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf)
 {
-    uint32_t                      hash;
-    ngx_http_cache_turbo_ctx_t   *ctx;
-    ngx_http_cache_turbo_zone_t  *z;
-
     if (!clcf->enable || clcf->shm_zone == NULL) {
         return NGX_DECLINED;
     }
@@ -5388,6 +5383,33 @@ ngx_http_cache_turbo_access_prologue(ngx_http_request_t *r,
      * request carrying credentials. response_cacheable() already prevents the
      * resulting response from being stored; this is the matching lookup gate. */
     if (r->headers_in.authorization != NULL) {
+        return NGX_DECLINED;
+    }
+
+    return NGX_OK;
+}
+
+
+/*
+ * CQ-2: prologue gates + per-request setup shared by every (re)entry of the
+ * access handler (a parked L2/lock resume re-enters the handler, so this runs
+ * again — build_key/auto-classify/no-cache/vary/bypass all re-evaluate, exactly
+ * as before the extraction). Returns NGX_OK with ctxp/zp/hashp populated when
+ * the caller should proceed to the L1 lookup; any other value is what the
+ * handler must return (NGX_DECLINED for the not-cacheable/skip/bypass gates,
+ * NGX_ERROR on ctx alloc / key build failure).
+ */
+static ngx_int_t
+ngx_http_cache_turbo_access_prologue(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf,
+    ngx_http_cache_turbo_ctx_t **ctxp, ngx_http_cache_turbo_zone_t **zp,
+    uint32_t *hashp)
+{
+    uint32_t                      hash;
+    ngx_http_cache_turbo_ctx_t   *ctx;
+    ngx_http_cache_turbo_zone_t  *z;
+
+    if (ngx_http_cache_turbo_access_eligible(r, clcf) != NGX_OK) {
         return NGX_DECLINED;
     }
 
@@ -7278,6 +7300,53 @@ ngx_http_cache_turbo_access_min_uses(ngx_http_request_t *r,
 
 
 
+/*
+ * MAINT-SEAM: the cross-node NX resume arms of the cold-miss phase, taken when
+ * ctx->lock_done says this request is re-entering after a park.
+ *
+ * ⚠ Called with the zone mutex NOT held, from before access_cold()'s
+ * CLAIM_FRESH span -- it takes no lock of its own, and cold_wait() parks as it
+ * did inline. The WON arm must run cold_mark_winner() with
+ * ctx->pending_l1_owner: the claim_owner stack local that carried the lease
+ * token does not survive the park, so the stash is the only handle left and
+ * dropping it here would leak the L1 lease.
+ *
+ * Returns the value the caller assigns to *out_rc; the caller returns NGX_DONE
+ * on both arms, exactly as the inline block did.
+ */
+static ngx_int_t
+ngx_http_cache_turbo_cold_resume_locked(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_zone_t *z,
+    ngx_http_cache_turbo_ctx_t *ctx, uint32_t hash)
+{
+    /* won -> we own the fleet-wide regen, go to origin; lost -> another node is
+     * filling, wait for its L2 write-through. An NGX_ERROR (Redis outage: lock
+     * channel failed) is NOT a peer holding the lock — going to origin would
+     * stampede, but cold-waiting would add a full lock_timeout of dead latency
+     * for a fill that will never arrive. Treat it as a win: the per-box stub we
+     * already hold still single-flights this box, so degrade to per-box
+     * single-flight and regenerate now (codex). */
+    if (ctx->lock_result == NGX_OK || ctx->lock_result == NGX_ERROR) {
+        (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
+        ngx_http_cache_turbo_cold_mark_winner(r, ctx, z,
+                                              ctx->pending_l1_owner);
+        ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "cache_turbo: cold-miss cross-node WON%s \"%V\" "
+                       "key=%ui -> origin",
+                       ctx->lock_result == NGX_ERROR ? " (L2 down)" : "",
+                       &r->uri, (ngx_uint_t) hash);
+
+        return NGX_DECLINED;
+    }
+
+    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "cache_turbo: cold-miss cross-node LOST \"%V\" key=%ui "
+                   "-> wait for L2 fill", &r->uri, (ngx_uint_t) hash);
+
+    return ngx_http_cache_turbo_cold_wait(r, clcf, z, ctx);
+}
+
+
 /* MAINT-H2 phase helper for ngx_http_cache_turbo_access_handler().
  * PHASE 7 -- the cold-miss single-flight (cache_turbo_lock on).
  *
@@ -7331,34 +7400,9 @@ ngx_http_cache_turbo_access_cold(ngx_http_request_t *r,
          * as a win: the per-box stub we already hold still single-flights this box,
          * so degrade to per-box single-flight and regenerate now (codex). */
         if (ctx->lock_done) {
-            if (ctx->lock_result == NGX_OK || ctx->lock_result == NGX_ERROR) {
-                (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
-                /* This resume always follows a CLAIM_WINNER below that fired
-                 * the cross-node NX lock and parked: an L1 lease WAS taken
-                 * (CTXRDR-ADOPT-LEASE) and its token is stashed in
-                 * ctx->pending_l1_owner since the claim_owner stack local
-                 * that carried it does not survive the park/resume. Hand it
-                 * to the winner so the lease is cleared by shm_unstub()
-                 * instead of leaking. */
-                ngx_http_cache_turbo_cold_mark_winner(r, ctx, z,
-                                                       ctx->pending_l1_owner);
-                ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                               "cache_turbo: cold-miss cross-node WON%s \"%V\" "
-                               "key=%ui -> origin",
-                               ctx->lock_result == NGX_ERROR ? " (L2 down)" : "",
-                               &r->uri, (ngx_uint_t) hash);
-
-                *out_rc = NGX_DECLINED;
-                return NGX_DONE;
-
-            }
-            ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                           "cache_turbo: cold-miss cross-node LOST \"%V\" key=%ui "
-                           "-> wait for L2 fill", &r->uri, (ngx_uint_t) hash);
-
-            *out_rc = ngx_http_cache_turbo_cold_wait(r, clcf, z, ctx);
+            *out_rc = ngx_http_cache_turbo_cold_resume_locked(r, clcf, z, ctx,
+                                                              hash);
             return NGX_DONE;
-
         }
 
         /* S231-PERF-MISSLOCKS: min_uses>1 && lock-on is exactly the case the
@@ -12445,6 +12489,32 @@ ngx_http_cache_turbo_keep_stale(ngx_conf_t *cf, ngx_command_t *cmd,
  * ngx_conf_set_bitmask_slot anywhere, by established convention (see
  * cache_turbo_scan_resistant, cache_turbo_normalize_strip, and the directive
  * this one is modelled on, cache_turbo_keep_stale, immediately above). */
+/* MAINT-SEAM: the token vocabulary as data. The chain of length+strncmp arms
+ * this replaces carried one branch pair per token, which is what put this
+ * function at the top of the complexity list; adding a token now means adding
+ * a row, not another arm. `off` stays a special case above the table -- it
+ * sets no bit and is the only token that cannot be combined. Terminated by a
+ * zero-length name. */
+typedef struct {
+    ngx_str_t   name;
+    ngx_uint_t  bit;
+} ngx_http_cache_turbo_use_stale_token_t;
+
+static const ngx_http_cache_turbo_use_stale_token_t
+    ngx_http_cache_turbo_use_stale_tokens[] = {
+    { ngx_string("error"),    NGX_HTTP_CACHE_TURBO_USE_STALE_ERROR    },
+    { ngx_string("timeout"),  NGX_HTTP_CACHE_TURBO_USE_STALE_TIMEOUT  },
+    { ngx_string("http_403"), NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_403 },
+    { ngx_string("http_404"), NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_404 },
+    { ngx_string("http_429"), NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_429 },
+    { ngx_string("http_500"), NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_500 },
+    { ngx_string("http_502"), NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_502 },
+    { ngx_string("http_503"), NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_503 },
+    { ngx_string("http_504"), NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_504 },
+    { ngx_null_string, 0 }
+};
+
+
 static char *
 ngx_http_cache_turbo_use_stale(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
@@ -12452,6 +12522,8 @@ ngx_http_cache_turbo_use_stale(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
     ngx_str_t   *value;
     ngx_uint_t   i, mask, saw_off;
+
+    const ngx_http_cache_turbo_use_stale_token_t  *t;
 
     if (clcf->use_stale != NGX_CONF_UNSET_UINT) {
         return "is duplicate";
@@ -12470,52 +12542,16 @@ ngx_http_cache_turbo_use_stale(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             continue;
         }
 
-        if (value[i].len == 5
-            && ngx_strncmp(value[i].data, "error", 5) == 0)
-        {
-            mask |= NGX_HTTP_CACHE_TURBO_USE_STALE_ERROR;
+        for (t = ngx_http_cache_turbo_use_stale_tokens; t->name.len; t++) {
+            if (value[i].len == t->name.len
+                && ngx_strncmp(value[i].data, t->name.data, t->name.len) == 0)
+            {
+                mask |= t->bit;
+                break;
+            }
+        }
 
-        } else if (value[i].len == 7
-            && ngx_strncmp(value[i].data, "timeout", 7) == 0)
-        {
-            mask |= NGX_HTTP_CACHE_TURBO_USE_STALE_TIMEOUT;
-
-        } else if (value[i].len == 8
-            && ngx_strncmp(value[i].data, "http_403", 8) == 0)
-        {
-            mask |= NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_403;
-
-        } else if (value[i].len == 8
-            && ngx_strncmp(value[i].data, "http_404", 8) == 0)
-        {
-            mask |= NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_404;
-
-        } else if (value[i].len == 8
-            && ngx_strncmp(value[i].data, "http_429", 8) == 0)
-        {
-            mask |= NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_429;
-
-        } else if (value[i].len == 8
-            && ngx_strncmp(value[i].data, "http_500", 8) == 0)
-        {
-            mask |= NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_500;
-
-        } else if (value[i].len == 8
-            && ngx_strncmp(value[i].data, "http_502", 8) == 0)
-        {
-            mask |= NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_502;
-
-        } else if (value[i].len == 8
-            && ngx_strncmp(value[i].data, "http_503", 8) == 0)
-        {
-            mask |= NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_503;
-
-        } else if (value[i].len == 8
-            && ngx_strncmp(value[i].data, "http_504", 8) == 0)
-        {
-            mask |= NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_504;
-
-        } else {
+        if (t->name.len == 0) {
             ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                 "invalid value \"%V\" in \"%V\" directive",
                 &value[i], &cmd->name);
