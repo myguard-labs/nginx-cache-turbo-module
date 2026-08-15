@@ -1289,8 +1289,13 @@ def test_concurrent_hits_no_deadlock(ng: Nginx) -> None:
     assert all(r[0] == 200 for r in results), "some concurrent HITs failed"
     assert all(r[2].get("x-cache") == "HIT" for r in results), \
         "some concurrent reads were not HITs"
-    # 500 cached HITs should be fast; serialising under a held lock would blow this.
-    assert elapsed < 10, f"concurrent HITs took {elapsed:.1f}s (possible lock stall)"
+    # 500 cached HITs should be fast; serialising under a held lock would blow
+    # this. Scaled by ASAN_TIME_SCALE: an ASan build is slow enough on a loaded
+    # runner to make the fixed 10s band marginal even with no lock stall
+    # (FLAKE-ASAN-TIMING-BAND); unscaled (factor 1.0) outside a sanitizer run.
+    budget = 10 * sanitizer_time_scale()
+    assert elapsed < budget, \
+        f"concurrent HITs took {elapsed:.1f}s (possible lock stall, budget {budget:.1f}s)"
 
 
 def test_admin_stats(ng: Nginx) -> None:

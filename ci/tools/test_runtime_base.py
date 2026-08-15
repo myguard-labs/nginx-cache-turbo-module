@@ -1067,8 +1067,46 @@ def lock_key(uri: str, prefix: str = "ct:") -> str:
     return prefix + "lock:" + hashlib.sha256(uri.encode()).hexdigest()
 
 
+# FLAKE-ASAN-TIMING-BAND: three unrelated tests (test_cross_node_won_stale_body,
+# test_concurrent_hits_no_deadlock, test_cdn_cache_control_split_header_ttl /
+# test_must_revalidate_split_header) intermittently fail ONLY under ASan, with
+# zero sanitizer output -- a functional/timing failure, not a memory defect. A
+# rerun of the same SHA flips it to green. ASan slows the module enough that
+# fixed wall-clock bands become marginal on a loaded runner; the fix is not a
+# wider band (that would silently disable the oracle on a NORMAL build too,
+# see [[feedback-widening-shared-timeout-disables-oracle]]) but a band that
+# scales ONLY when a sanitizer is actually instrumenting this run.
+#
+# .github/workflows/asan.yml sets ASAN_OPTIONS in the env of both runtime
+# steps and no other workflow does, so its presence in os.environ is a
+# reliable, already-existing signal that needs no workflow change.
+# Kept modest (not larger): test_l2_stale_refetch_does_not_stall_on_lock
+# asserts a request completes well UNDER the 5s lock_timeout bug window
+# (budget 2.0s today) -- a factor that pushes 2.0*factor past 5.0 would start
+# colliding with that bug signal instead of just absorbing ASan slowdown.
+ASAN_TIME_SCALE = 2.0
+
+
+def sanitizer_time_scale() -> float:
+    """Return the wall-clock multiplier for this run: ASAN_TIME_SCALE under a
+    sanitizer build (ASAN_OPTIONS present in the environment), 1.0 otherwise.
+
+    Applied inside wait_for()/wait_for_l2()/wait_for_l2_absent() so every call
+    site benefits without touching call sites, including ones that pass an
+    explicit timeout= -- the scaling happens on the value AFTER the caller's
+    default/explicit timeout is resolved, so both are covered identically.
+    Call sites that assert elapsed wall-clock directly (not via wait_for) must
+    scale their own comparison constant through this same function; grep
+    ASAN_TIME_SCALE for the existing call sites.
+
+    Non-ASan effective bands are unchanged byte-for-byte: this returns exactly
+    1.0 when ASAN_OPTIONS is unset, so `timeout * sanitizer_time_scale() ==
+    timeout`."""
+    return ASAN_TIME_SCALE if "ASAN_OPTIONS" in os.environ else 1.0
+
+
 def wait_for(predicate, timeout: float = 3.0, interval: float = 0.05) -> bool:
-    deadline = time.time() + timeout
+    deadline = time.time() + timeout * sanitizer_time_scale()
     while time.time() < deadline:
         if predicate():
             return True
@@ -1094,7 +1132,11 @@ def wait_for_l2_absent(redis, key: str, what: str = "",
     on the key. Deliberately NOT a swallow: a key still present at the deadline
     raises, because that means the purge genuinely did not happen and the test
     that follows would be testing the wrong object
-    ([[feedback-widening-shared-timeout-disables-oracle]])."""
+    ([[feedback-widening-shared-timeout-disables-oracle]]).
+
+    `timeout` is scaled by sanitizer_time_scale() -- 1.0 outside a sanitizer
+    build, so the non-ASan deadline is unchanged."""
+    timeout = timeout * sanitizer_time_scale()
     start = time.monotonic()
     while True:
         if redis.get_raw(key) is None:
@@ -1129,7 +1171,11 @@ def wait_for_l2(redis, key: str, expected: bytes, what: str = "",
     Deliberately NOT a swallow: a wrong or absent value at the deadline still
     raises. Widening a wait until it always passes would disable the oracle
     ([[feedback-widening-shared-timeout-disables-oracle]]); the point here is
-    to make the eventual red diagnosable, not to make it go away."""
+    to make the eventual red diagnosable, not to make it go away.
+
+    `timeout` is scaled by sanitizer_time_scale() -- 1.0 outside a sanitizer
+    build, so the non-ASan deadline is unchanged."""
+    timeout = timeout * sanitizer_time_scale()
     # monotonic, not time.time(): an NTP step on a CI box must not cut the wait
     # short or stretch it. The sleep is clamped to what is left of the deadline
     # so the wait cannot overrun `timeout` by up to a full interval.
