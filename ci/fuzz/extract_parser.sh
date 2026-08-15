@@ -86,7 +86,7 @@ awk '
         next
     }
     /^static ngx_int_t$/ { pending = 1; buf = $0 ORS; next }
-    pending && /^ngx_http_cache_turbo_redis_(parse(_array|_scan)?|resp_len|frame|frame_scan)\(/ {
+    pending && /^ngx_http_cache_turbo_redis_(parse(_array|_scan|_bulk)?|resp_len|frame|frame_scan|frame_scan_prologue)\(/ {
         capture = 1; pending = 0; printf "%s", buf; print; next
     }
     pending { pending = 0; buf = "" }
@@ -102,8 +102,10 @@ for fn in \
     'ngx_http_cache_turbo_redis_parse(' \
     'ngx_http_cache_turbo_redis_parse_array(' \
     'ngx_http_cache_turbo_redis_parse_scan(' \
+    'ngx_http_cache_turbo_redis_parse_bulk(' \
     'ngx_http_cache_turbo_redis_frame(' \
-    'ngx_http_cache_turbo_redis_frame_scan('
+    'ngx_http_cache_turbo_redis_frame_scan(' \
+    'ngx_http_cache_turbo_redis_frame_scan_prologue('
 do
     # Anchored at column 0: this matches the DEFINITION line only. A bare -F
     # match would also hit the forward declaration this script emits for
