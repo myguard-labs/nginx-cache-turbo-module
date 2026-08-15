@@ -2524,6 +2524,11 @@ ngx_http_cache_turbo_redis_frame(u_char *p, u_char *end, ngx_uint_t depth,
         if (end - p < v + 2) {             /* payload + trailing CRLF */
             return NGX_AGAIN;
         }
+        /* Same delimiter check as parse_bulk(): buffered is not the same as
+         * well-formed, and framing off a bad length desynchronises the walk. */
+        if (p[v] != CR || p[v + 1] != LF) {
+            return NGX_DECLINED;
+        }
         *next = p + v + 2;
         return NGX_OK;
 
@@ -2724,6 +2729,12 @@ ngx_http_cache_turbo_redis_frame_scan(ngx_http_cache_turbo_redis_op_t *op,
                 op->frame_off = (size_t) (p - op->rbuf);
                 return NGX_AGAIN;
             }
+            /* Same delimiter check as parse_bulk()/frame(): the length test
+             * above only proves the bytes are buffered, not that they are the
+             * delimiter. Resuming off a bad length desynchronises the walk. */
+            if ((crlf + 2)[v] != CR || (crlf + 2)[v + 1] != LF) {
+                return NGX_DECLINED;
+            }
             p = crlf + 2 + v + 2;
             op->frame_remain[d]--;
             break;
@@ -2823,6 +2834,14 @@ ngx_http_cache_turbo_redis_parse_bulk(u_char **p, u_char *end,
     *p = crlf + 2;
     if (end - *p < len + 2) {              /* payload + trailing CRLF */
         return NGX_AGAIN;
+    }
+
+    /* The two bytes after the payload must BE the delimiter, not merely exist:
+     * the length check above only proves they are buffered. Without this,
+     * "$1\r\naXX" parses as a valid 1-byte bulk string and the cursor lands
+     * mid-element, desynchronising every following element in the reply. */
+    if ((*p)[len] != CR || (*p)[len + 1] != LF) {
+        return NGX_DECLINED;
     }
 
     out->data = *p;
