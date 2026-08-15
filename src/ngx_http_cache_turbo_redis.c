@@ -2937,11 +2937,15 @@ ngx_http_cache_turbo_redis_read_smembers(ngx_event_t *rev)
  * malformed -- the SCAN cursor must be a real bulk string, but array/scan-key
  * elements may legitimately be nil.
  *
- * Shared by parse_array()'s key loop and parse_scan()'s cursor + key loop --
- * those three call sites were near-identical clones; a bound/overflow fix
- * now lands in one place instead of three. Also folds AUD-REDIS-PARSE-SCAN-
- * COUNT for free wherever it is used: callers that need resp_len()'s
- * sign/nil split (rather than a plain ngx_atoi) get it uniformly.
+ * Shared by parse_scan()'s cursor read and its key loop, which were
+ * near-identical clones; a bound/overflow fix now lands in one place instead
+ * of two. Also folds AUD-REDIS-PARSE-SCAN-COUNT: callers that need
+ * resp_len()'s sign/nil split (rather than a plain ngx_atoi) get it
+ * uniformly.
+ *
+ * parse_array()'s key loop is a third copy of this same shape and is a
+ * candidate to fold in here; it was left alone deliberately to keep this
+ * refactor's blast radius to the two functions being decomposed.
  */
 static ngx_int_t
 ngx_http_cache_turbo_redis_parse_bulk(u_char **p, u_char *end,
