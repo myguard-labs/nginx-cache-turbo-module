@@ -13337,6 +13337,102 @@ ngx_http_cache_turbo_response_encoded(ngx_http_request_t *r)
 }
 
 
+/* Phase 1 of ngx_http_cache_turbo_classify_vary(): is this header instance a
+ * Vary header at all. Pure predicate, no state — kept as its own phase
+ * because the caller's list-walk loop needs to `continue` on a non-Vary
+ * instance before touching h[i].value, exactly as the inline check did. */
+static ngx_int_t
+ngx_http_cache_turbo_classify_vary_is_vary_header(const ngx_table_elt_t *h)
+{
+    return h->hash != 0
+        && h->key.len == sizeof("Vary") - 1
+        && ngx_strncasecmp(h->key.data, (u_char *) "Vary",
+                            sizeof("Vary") - 1) == 0;
+}
+
+
+/* Phase 2 of ngx_http_cache_turbo_classify_vary(): locate the next
+ * comma/whitespace-separated token starting at *pp (bounded by end), and
+ * advance *pp past it so the caller's loop can call this again for the next
+ * token. Returns the token in the tok/tl out-params. Returns 0 when the scan
+ * hit `end` with nothing left, or produced a zero-length token (consecutive
+ * separators) — the caller must `continue`/`break` its loop on that value
+ * without reading *tokp or *tlp, exactly as the inline loop this replaces
+ * did. Returns 1 when a non-empty token was produced. */
+static ngx_int_t
+ngx_http_cache_turbo_classify_vary_next_token(u_char **pp, u_char *end,
+    u_char **tokp, size_t *tlp)
+{
+    u_char  *s, *tok;
+    size_t   tl;
+
+    s = *pp;
+
+    while (s < end && (*s == ' ' || *s == '\t' || *s == ',')) {
+        s++;
+    }
+    tok = s;
+    while (s < end && *s != ' ' && *s != '\t' && *s != ',') {
+        s++;
+    }
+    tl = (size_t) (s - tok);
+
+    *pp = s;
+
+    if (tl == 0) {
+        return 0;
+    }
+
+    *tokp = tok;
+    *tlp = tl;
+    return 1;
+}
+
+
+/* Phase 3 of ngx_http_cache_turbo_classify_vary(): classify one already-
+ * tokenised Vary axis name and fold it into *bits and *nocache. Arm order and
+ * every veto trigger condition are unchanged from the inline if/else chain:
+ * "*", Cookie, Authorization and any unrecognised axis each set the nocache
+ * veto with the exact same test they used inline; the four whitelisted axes
+ * each OR in their own bit and nothing else. This is the security-relevant
+ * arm — a Vary axis we cannot key on must force nocache, because serving one
+ * stored representation for every value of an un-split axis returns the
+ * wrong representation to the wrong client (RFC 9110 12.5.5). Do not reorder
+ * or collapse these arms. */
+static void
+ngx_http_cache_turbo_classify_vary_classify_token(u_char *tok, size_t tl,
+    ngx_int_t *bits, ngx_uint_t *nocache)
+{
+    if (tl == 1 && tok[0] == '*') {
+        *nocache = 1;
+    } else if (tl == sizeof("Cookie") - 1
+        && ngx_strncasecmp(tok, (u_char *) "Cookie", tl) == 0) {
+        *nocache = 1;
+    } else if (tl == sizeof("Authorization") - 1
+        && ngx_strncasecmp(tok, (u_char *) "Authorization", tl) == 0) {
+        *nocache = 1;
+    } else if (tl == sizeof("Accept-Encoding") - 1
+        && ngx_strncasecmp(tok, (u_char *) "Accept-Encoding", tl) == 0) {
+        *bits |= NGX_HTTP_CACHE_TURBO_VARY_ENCODING;
+    } else if (tl == sizeof("User-Agent") - 1
+        && ngx_strncasecmp(tok, (u_char *) "User-Agent", tl) == 0) {
+        *bits |= NGX_HTTP_CACHE_TURBO_VARY_DEVICE;
+    } else if (tl == sizeof("Accept-Language") - 1
+        && ngx_strncasecmp(tok, (u_char *) "Accept-Language", tl) == 0) {
+        *bits |= NGX_HTTP_CACHE_TURBO_VARY_LANG;
+    } else if (tl == sizeof("Origin") - 1
+        && ngx_strncasecmp(tok, (u_char *) "Origin", tl) == 0) {
+        *bits |= NGX_HTTP_CACHE_TURBO_VARY_ORIGIN;
+    } else {
+        /* A Vary axis we cannot key on. Caching anyway would serve one
+         * stored representation for every value of this header - i.e.
+         * the wrong representation (RFC 9110 12.5.5 / RFC 9111 4.1).
+         * Refuse to cache, same as Cookie/Authorization/"*". */
+        *nocache = 1;
+    }
+}
+
+
 /* Classify the response Vary header into a safe-axis bitmask (what we may key
  * on) and a nocache veto. Only the whitelist (Accept-Encoding, User-Agent,
  * Accept-Language, Origin) contributes to the key. Anything else — Vary: *,
@@ -13356,6 +13452,7 @@ ngx_http_cache_turbo_classify_vary(ngx_http_request_t *r,
 
     for (i = 0; /* void */ ; i++) {
         u_char  *s, *e, *tok;
+        size_t   tl;
 
         if (i >= part->nelts) {
             if (part->next == NULL) {
@@ -13365,11 +13462,7 @@ ngx_http_cache_turbo_classify_vary(ngx_http_request_t *r,
             h = part->elts;
             i = 0;
         }
-        if (h[i].hash == 0
-            || h[i].key.len != sizeof("Vary") - 1
-            || ngx_strncasecmp(h[i].key.data, (u_char *) "Vary",
-                               sizeof("Vary") - 1) != 0)
-        {
+        if (!ngx_http_cache_turbo_classify_vary_is_vary_header(&h[i])) {
             continue;
         }
 
@@ -13377,47 +13470,15 @@ ngx_http_cache_turbo_classify_vary(ngx_http_request_t *r,
         e = s + h[i].value.len;
 
         while (s < e) {
-            size_t  tl;
-
-            while (s < e && (*s == ' ' || *s == '\t' || *s == ',')) {
-                s++;
-            }
-            tok = s;
-            while (s < e && *s != ' ' && *s != '\t' && *s != ',') {
-                s++;
-            }
-            tl = (size_t) (s - tok);
-            if (tl == 0) {
+            if (!ngx_http_cache_turbo_classify_vary_next_token(&s, e, &tok,
+                                                                 &tl))
+            {
                 continue;
             }
 
-            if (tl == 1 && tok[0] == '*') {
-                nocache = 1;
-            } else if (tl == sizeof("Cookie") - 1
-                && ngx_strncasecmp(tok, (u_char *) "Cookie", tl) == 0) {
-                nocache = 1;
-            } else if (tl == sizeof("Authorization") - 1
-                && ngx_strncasecmp(tok, (u_char *) "Authorization", tl) == 0) {
-                nocache = 1;
-            } else if (tl == sizeof("Accept-Encoding") - 1
-                && ngx_strncasecmp(tok, (u_char *) "Accept-Encoding", tl) == 0) {
-                bits |= NGX_HTTP_CACHE_TURBO_VARY_ENCODING;
-            } else if (tl == sizeof("User-Agent") - 1
-                && ngx_strncasecmp(tok, (u_char *) "User-Agent", tl) == 0) {
-                bits |= NGX_HTTP_CACHE_TURBO_VARY_DEVICE;
-            } else if (tl == sizeof("Accept-Language") - 1
-                && ngx_strncasecmp(tok, (u_char *) "Accept-Language", tl) == 0) {
-                bits |= NGX_HTTP_CACHE_TURBO_VARY_LANG;
-            } else if (tl == sizeof("Origin") - 1
-                && ngx_strncasecmp(tok, (u_char *) "Origin", tl) == 0) {
-                bits |= NGX_HTTP_CACHE_TURBO_VARY_ORIGIN;
-            } else {
-                /* A Vary axis we cannot key on. Caching anyway would serve one
-                 * stored representation for every value of this header — i.e.
-                 * the wrong representation (RFC 9110 12.5.5 / RFC 9111 4.1).
-                 * Refuse to cache, same as Cookie/Authorization/"*". */
-                nocache = 1;
-            }
+            ngx_http_cache_turbo_classify_vary_classify_token(tok, tl,
+                                                                &bits,
+                                                                &nocache);
         }
     }
 
