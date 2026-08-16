@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# Slice the verbatim auto-classify block (preset registry + cookie_has +
-# auto_skip) out of ../src/ngx_http_cache_turbo_module.c into
+# Slice the verbatim auto-classify block (preset registry + bounded Cookie
+# helpers + auto_skip) out of ../src/ngx_http_cache_turbo_module.c into
 # generated_auto_classify.inc, delimited by the FUZZ-EXTRACT markers in the
 # source. This keeps the fuzz target locked to production code — no hand copy.
 # If the markers move or vanish, fail loudly rather than fuzz nothing.
@@ -23,16 +23,19 @@ awk '
     cap { print }
 ' "$SRC" > "$OUT"
 
-if ! grep -qF 'ngx_http_cache_turbo_auto_skip(' "$OUT"; then
-    echo "✗ failed to extract auto_skip from $SRC (markers moved?)" >&2
-    rm -f "$OUT"
-    exit 1
-fi
-if ! grep -qF 'ngx_http_cache_turbo_cookie_has(' "$OUT"; then
-    echo "✗ failed to extract cookie_has from $SRC (markers moved?)" >&2
-    rm -f "$OUT"
-    exit 1
-fi
+required_helpers=(
+    ngx_http_cache_turbo_cookie_byteset_build
+    ngx_http_cache_turbo_cookie_contains
+    ngx_http_cache_turbo_cookie_has
+    ngx_http_cache_turbo_auto_skip
+)
+for helper in "${required_helpers[@]}"; do
+    if ! grep -qF "$helper(" "$OUT"; then
+        echo "✗ failed to extract $helper from $SRC (markers moved?)" >&2
+        rm -f "$OUT"
+        exit 1
+    fi
+done
 
 LINES=$(wc -l < "$OUT")
 echo "✓ extracted auto-classify block — $LINES lines -> $OUT"

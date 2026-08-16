@@ -64,10 +64,10 @@ bash "$DIR/extract_key_fold.sh"
 FUZZ_DIR="$DIR/../../fuzz"
 BLOB_CC="${BLOB_CC:-clang}"
 if command -v "$BLOB_CC" >/dev/null 2>&1; then
-    # --- arg-span overflow allocation failure (AUD4-PERF-ARG64) -----------
-    # Exercise the fail-closed branch against the same extracted production
-    # code as fuzz_auto_classify.
-    echo "--- auto-classify overflow allocation fixture (ASan/UBSan) ---"
+    # --- bounded/fail-closed auto-classification fixtures -----------------
+    # Exercise the Cookie cap/work oracle and arg allocation-failure branch
+    # against the same extracted production code as fuzz_auto_classify.
+    echo "--- auto-classify bounded-work fixtures (ASan/UBSan) ---"
     bash "$FUZZ_DIR/extract_auto_classify.sh"
     "$BLOB_CC" -g -O1 -fsanitize=address,undefined \
         -DNGX_HTTP_CACHE_TURBO_AUTO_FIXTURES=1 -I"$FUZZ_DIR" \

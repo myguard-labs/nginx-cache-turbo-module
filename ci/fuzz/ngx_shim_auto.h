@@ -4,10 +4,10 @@
  *
  * auto_skip reads attacker-controlled request bytes — the URI and, via
  * cookie_has, every Cookie header value — doing manual length-bounded scanning
- * (ngx_strnstr over a non-NUL-terminated cookie value of length ck->value.len,
- * ngx_strncmp of a URI prefix guarded by r->uri.len). A reintroduced
- * NUL-bounded scan or an off-by-one in those bounds is a worker-crashing
- * OOB read the runtime suite can't reach. The fuzzer drives the SHIPPED code
+ * (cookie_contains over a value of length ck->value.len, ngx_strncmp of a URI
+ * prefix guarded by r->uri.len). A reintroduced unbounded scan or an off-by-one
+ * in those bounds is a worker-crashing OOB read the runtime suite can't reach.
+ * The fuzzer drives the SHIPPED code
  * (generated_auto_classify.inc, sliced at build time) against arbitrary URI +
  * cookie bytes with NO trailing NUL, so ASAN turns any over-read into an
  * immediate heap-buffer-overflow.
@@ -32,36 +32,6 @@ typedef ngx_int_t  ngx_flag_t;
 /* String primitives the block uses, faithful to nginx's ngx_string.h. */
 #define ngx_strncmp(s1, s2, n)  strncmp((char *) (s1), (char *) (s2), n)
 #define ngx_strlen(s)           strlen((const char *) (s))
-
-/* ngx_strnstr: locate NUL-terminated s2 within the first n bytes of s1, never
- * reading past s1 + n. Mirrors src/core/ngx_string.c. */
-static u_char *
-ngx_strnstr(u_char *s1, char *s2, size_t n)
-{
-    u_char  c1, c2;
-    size_t  len;
-
-    c2 = *(u_char *) s2++;
-    len = strlen(s2);
-
-    do {
-        do {
-            if (n-- == 0) {
-                return NULL;
-            }
-            c1 = *s1++;
-            if (c1 == 0) {
-                return NULL;
-            }
-        } while (c1 != c2);
-
-        if (n < len) {
-            return NULL;
-        }
-    } while (strncmp((const char *) s1, s2, len) != 0);
-
-    return --s1;
-}
 
 /* Reduced request/loc-conf/table structs: exactly the fields the block reads. */
 typedef struct ngx_table_elt_s  ngx_table_elt_t;

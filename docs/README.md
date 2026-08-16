@@ -253,6 +253,11 @@ enough that it cannot turn up as an arbitrary cookie *value*, which a visitor ma
 control; a too-generic literal costs hit rate (bypass is the safe direction, so it
 is never a leak). This is a different tier from the value predicates (cookie
 name-suffix plus a value operator) and from `cache_turbo_key_cookie` (exact name).
+Across repeated `Cookie` fields the classifier accepts an aggregate **8 KiB** of
+value bytes, matching nginx's default per-field large-header ceiling. Anything
+larger is treated as private/bypass before a partial scan is consulted. Raising
+nginx's header limit can therefore reduce hit rate for oversized requests, but
+cannot make one cacheable by overflowing the classifier's work budget.
 
 **A cookie name that isn't stable across installs needs a stable fragment or a
 value predicate.** Joomla's ordinary session name is a whole-site hash, so its

@@ -33,8 +33,9 @@
 # -------------------------------------------------------------------
 # Unlike the predicate/key-cookie tiers used by other presets, this preset's
 # cookie rule (ct_drupal_cookies) is checked by
-# ngx_http_cache_turbo_cookie_has(), which runs ngx_strnstr() over the RAW
-# Cookie header bytes -- it does not parse cookie names at all. "SESS" bypasses
+# ngx_http_cache_turbo_cookie_has(), which runs a bounded substring scan over
+# the RAW Cookie header bytes -- it does not parse cookie names at all. "SESS"
+# bypasses
 # if it appears ANYWHERE in the header, cookie name or value, which is what
 # makes both SESS<hash> and SSESS<hash> match with one literal and is also why
 # PHPSESSID (a *substring* match, not a suffix or prefix) collides.
@@ -242,7 +243,7 @@ Cookie: PHPSESSID=abc123
 
 
 === TEST 10: a leading logged-out SESS pair must not mask a later logged-in one
-# The cookie scan (ngx_strnstr over the raw header) is a substring search, so
+# The bounded scan over the raw header is a substring search, so
 # a SECOND occurrence of "SESS" later in the header must still be found -- the
 # scan must not stop at the first cookie in the pair. Two Set-Cookie-shaped
 # entries in one header, only the second carrying a value; the whole header

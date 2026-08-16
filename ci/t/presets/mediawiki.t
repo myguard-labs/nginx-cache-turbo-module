@@ -24,7 +24,7 @@
 # $wgCookiePrefix defaults to the DATABASE NAME, so there is no shippable
 # literal prefix -- same shape as joomla's md5 session cookie, opposite fix:
 # here the SUFFIX is fixed. ct_mw_cookies[] is evaluated by
-# ngx_http_cache_turbo_cookie_has(), a raw ngx_strnstr() search for the needle
+# ngx_http_cache_turbo_cookie_has(), a raw bounded search for the needle
 # ANYWHERE in the whole Cookie header value -- it is not a name/value-pair
 # parser and does not anchor on the suffix actually being at the END of a
 # cookie NAME. Do not "fix" this into a name-anchored match.
