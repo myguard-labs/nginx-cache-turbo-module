@@ -41,7 +41,7 @@
 # directions asserted -- Vanilla-tk / Vanilla-Vv guest cookies stay
 # cacheable, and the real `Vanilla=` identity cookie still bypasses. TEST 7
 # is the suffix-under-any-prefix leg the registry's cookie_preds engine
-# implies (ngx_http_cache_turbo_cookie_has() uses ngx_strnstr anywhere in the
+# implies (ngx_http_cache_turbo_cookie_has() scans for a substring anywhere in the
 # Cookie header, not an anchored match): `MyVanilla=` also bypasses.
 #
 # NO /api ROW, DELIBERATELY, AND THIS IS AN UNRESOLVED GAP
@@ -225,7 +225,7 @@ Cookie: Vanilla-Vv=1; Vanilla=abc.signed.payload
 
 === TEST 7: suffix-under-any-prefix -- MyVanilla= also bypasses
 # ngx_http_cache_turbo_cookie_has() matches the cookie NAME by SUFFIX
-# (ngx_strnstr anywhere in the Cookie header), so a prefixed cookie name
+# (a substring anywhere in the Cookie header), so a prefixed cookie name
 # ending in the same needle also matches. Pinned, not "fixed" -- this is the
 # engine's documented behaviour, same shape as every other cookie_has() leg
 # in this registry.

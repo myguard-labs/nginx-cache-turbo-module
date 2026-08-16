@@ -796,7 +796,7 @@ _COOKIE_SCANS_HDR = "x-cache-turbo-test-cookie-scans"
 
 
 def _cookie_scans(hdrs: dict, where: str) -> int:
-    """Pull the lifetime ngx_strnstr()-call counter out of a response's
+    """Pull the lifetime bounded-substring-scan counter out of a response's
     headers (S231-PERF-AUTOCLASSIFY, TEST_FAULTS-only). Same "missing header
     is a hard failure" discipline as _armings()/_backoff_skips(): its absence
     would make every delta read 0 and the counter-oracle test would pass
@@ -896,10 +896,10 @@ def test_cookie_prefilter_counter_oracle(ng: Nginx, origin: Origin) -> None:
     wall-clock timing band. A large Cookie header built entirely from bytes
     that appear in NO preset's cookie needles must classify identically
     (cacheable) to a plain anonymous request, while the first-byte prefilter
-    measurably cuts the number of ngx_strnstr() calls cookie_has() makes.
+    measurably cuts the number of substring scans cookie_has() makes.
 
     The delta is read off X-Cache-Turbo-Test-Cookie-Scans, a process-global
-    lifetime counter (TEST_FAULTS-only) bumped exactly once per ngx_strnstr()
+    lifetime counter (TEST_FAULTS-only) bumped exactly once per bounded scan
     call the prefilter did NOT skip -- see
     ngx_http_cache_turbo_test_cookie_scan_header() and the counter's own
     declaration for the wiring this test depends on.
@@ -932,8 +932,8 @@ def test_cookie_prefilter_counter_oracle(ng: Nginx, origin: Origin) -> None:
 
         # A large Cookie header matching NOTHING: every byte is drawn from a
         # set that appears in no preset's cookie needles (digits + a few
-        # separators), so the prefilter should skip essentially all 75
-        # needles' ngx_strnstr() calls on this request, and the number of
+        # separators), so the prefilter should skip every unreachable
+        # needle's substring scan on this request, and the number of
         # calls counted for THIS request must be far smaller than the needle
         # count -- not the wall-clock time.
         big_cookie = "n" + "0123456789" * 800  # ~8KB, no needle first byte here
@@ -968,22 +968,22 @@ def test_cookie_prefilter_counter_oracle(ng: Nginx, origin: Origin) -> None:
         # (7 needles). Every one of those needles' first byte (w, c, j) is
         # checked against the 256-byte set built from "harmless=" + digits +
         # the leading 'n' -- none of which contains w/c/j -- so EVERY
-        # ngx_strnstr() call on this request must be skipped: the delta this
+        # substring scan on this request must be skipped: the delta this
         # request contributes is 0.
         delta_first = n_after_first - n_before
         delta_second = n_after_second - n_after_first
         assert delta_first == 0, (
-            f"large non-matching cookie should trigger ZERO ngx_strnstr() "
-            f"calls (every needle's first byte is absent from the header), "
+            f"large non-matching cookie should trigger ZERO substring "
+            f"scans (every needle's first byte is absent from the header), "
             f"got a delta of {delta_first} -- the first-byte prefilter is "
             f"not cutting scans")
         assert delta_second == 0, (
             f"second request (same cookie) should also trigger ZERO "
-            f"ngx_strnstr() calls, got a delta of {delta_second}")
+            f"scans, got a delta of {delta_second}")
 
         # Contrast: a request whose cookie DOES contain a needle's first byte
         # (but not the needle itself) must NOT be skipped by the byte test
-        # alone -- only ngx_strnstr() itself decides a real match, and the
+        # alone -- only the bounded substring helper decides a real match, and
         # byte set only gates whether that call happens. This proves the
         # filter is not simply returning "no scans, ever": a 'w'-containing
         # miss still counts calls.
@@ -993,7 +993,7 @@ def test_cookie_prefilter_counter_oracle(ng: Nginx, origin: Origin) -> None:
         delta_w = n_after_w - n_after_second
         assert delta_w > 0, (
             f"a cookie containing 'w' (wordpress_logged_in_'s first byte) "
-            f"must still trigger the wordpress needle's ngx_strnstr() call "
+            f"must still trigger the wordpress needle's substring scan "
             f"even though it does not match -- got a delta of {delta_w}, "
             f"meaning the prefilter is skipping scans it has no right to "
             f"skip")

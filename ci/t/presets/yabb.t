@@ -225,7 +225,8 @@ Cookie: Y2User-91827=alice; Y2Sess-91827=deadbeef
 
 === TEST 9: the cookie name is matched as a SUBSTRING, not byte-0 anchored
 # THE STEP-4 ENGINE ORACLE for this file. ngx_http_cache_turbo_cookie_has()
-# searches the whole Cookie header with ngx_strnstr, so a rule literal need not
+# searches the whole Cookie header with a raw bounded substring scan, so a rule
+# literal need not
 # start at byte 0 of a cookie name. That is load-bearing for YaBB because the
 # suffix is random and an operator may prepend a board prefix. Narrowing the
 # match to an anchored ngx_strncmp turns exactly this arm red.

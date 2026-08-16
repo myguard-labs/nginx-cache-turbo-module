@@ -4,9 +4,9 @@
  *
  * Why this target: auto_skip decides whether to cache a request by scanning
  * attacker-controlled bytes — the request URI (prefix match) and every Cookie
- * header value (substring match via ngx_strnstr over a buffer bounded by
- * ck->value.len, NOT NUL-terminated). An off-by-one or a reintroduced
- * NUL-bounded scan would over-read a worker. The runtime suite only feeds
+ * header value (manual substring match over a buffer bounded by ck->value.len,
+ * NOT NUL-terminated). An off-by-one or a reintroduced unbounded scan would
+ * over-read a worker. The runtime suite only feeds
  * well-formed cookies; this fuzzes arbitrary URI + cookie bytes.
  *
  * The real code lives in ../../src/ngx_http_cache_turbo_module.c between the
@@ -40,13 +40,56 @@
 #include "generated_auto_classify.inc"
 
 #if defined(NGX_HTTP_CACHE_TURBO_AUTO_FIXTURES)
-/* Deterministic allocation-failure fixture. Filling the shim pool's allocation
- * registry forces the 65th-pair extension allocation to fail; auto_skip must
- * then return the private/bypass classification rather than inspect the
- * partial 64-span prefix. Kept in this translation unit so the fixture and
- * fuzzer both exercise the same extracted production code. */
-int
-main(void)
+/* Deterministic fixtures against the extracted production classifier. */
+static void
+auto_fixture_request(ngx_http_request_t *r, ngx_pool_t *pool,
+    ngx_table_elt_t *cookies)
+{
+    static u_char  root[] = "/";
+
+    memset(r, 0, sizeof(*r));
+    memset(pool, 0, sizeof(*pool));
+    r->uri.data = root;
+    r->uri.len = 1;
+    r->headers_in.cookie = cookies;
+    r->pool = pool;
+}
+
+
+static ngx_int_t
+auto_fixture_classify(ngx_table_elt_t *cookies, ngx_uint_t preset)
+{
+    ngx_http_request_t               r;
+    ngx_http_cache_turbo_loc_conf_t  clcf;
+    ngx_pool_t                       pool;
+
+    auto_fixture_request(&r, &pool, cookies);
+    memset(&clcf, 0, sizeof(clcf));
+    clcf.backend_presets = preset;
+
+    return ngx_http_cache_turbo_auto_skip(&r, &clcf);
+}
+
+
+static size_t
+auto_fixture_length_work(const char *const *subs)
+{
+    const char *const  *pp;
+    size_t              work = 0;
+
+    for (pp = subs; *pp; pp++) {
+        work += strlen(*pp) + 1;
+    }
+
+    return work;
+}
+
+
+/* Filling the shim pool's allocation registry forces the arg parser's 65th-
+ * pair extension allocation to fail. auto_skip must return private/bypass
+ * rather than inspect the partial 64-span prefix. */
+static int
+auto_fixture_arg_allocation_failure(void)
 {
     ngx_http_request_t               r;
     ngx_http_cache_turbo_loc_conf_t  clcf;
@@ -77,6 +120,266 @@ main(void)
     }
 
     puts("auto-classify: overflow allocation failure fails closed");
+    return 0;
+}
+
+
+/* Prove the Cookie-byte cap is inclusive, aggregate across header fields, and
+ * fail-closed at cap+1 and on impossible sizing/null-backed shapes. The work
+ * counter's exact boundary values prove the rejected tail is never scanned. */
+static int
+auto_fixture_cookie_boundaries(void)
+{
+    u_char           cookie[NGX_HTTP_CACHE_TURBO_COOKIE_BYTES_MAX + 1];
+    ngx_table_elt_t  first, second;
+    size_t           expected, half;
+
+    memset(cookie, '~', sizeof(cookie));
+    memset(&first, 0, sizeof(first));
+    memset(&second, 0, sizeof(second));
+
+    half = NGX_HTTP_CACHE_TURBO_COOKIE_BYTES_MAX / 2;
+    first.value.data = cookie;
+    first.value.len = half;
+    first.next = &second;
+    second.value.data = cookie + half;
+    second.value.len = NGX_HTTP_CACHE_TURBO_COOKIE_BYTES_MAX - half;
+
+    ngx_http_cache_turbo_cookie_work = 0;
+    if (auto_fixture_classify(&first,
+            NGX_HTTP_CACHE_TURBO_BACKEND_WORDPRESS) != 0)
+    {
+        fprintf(stderr, "Cookie request at the inclusive cap bypassed\n");
+        return 1;
+    }
+    expected = NGX_HTTP_CACHE_TURBO_COOKIE_BYTES_MAX
+               + auto_fixture_length_work(ct_wp_cookies);
+    if (ngx_http_cache_turbo_cookie_work != expected) {
+        fprintf(stderr, "at-cap work mismatch: got %zu, expected %zu\n",
+                ngx_http_cache_turbo_cookie_work, expected);
+        return 1;
+    }
+
+    second.value.len++;
+    ngx_http_cache_turbo_cookie_work = 0;
+    if (auto_fixture_classify(&first,
+            NGX_HTTP_CACHE_TURBO_BACKEND_WORDPRESS) != 1)
+    {
+        fprintf(stderr, "Cookie request at cap+1 did not fail closed\n");
+        return 1;
+    }
+    if (ngx_http_cache_turbo_cookie_work != half) {
+        fprintf(stderr, "cap+1 inspected rejected tail: work=%zu, expected %zu\n",
+                ngx_http_cache_turbo_cookie_work, half);
+        return 1;
+    }
+
+    first.next = NULL;
+    first.value.len = NGX_MAX_SIZE_T_VALUE;
+    ngx_http_cache_turbo_cookie_work = 0;
+    if (auto_fixture_classify(&first,
+            NGX_HTTP_CACHE_TURBO_BACKEND_WORDPRESS) != 1
+        || ngx_http_cache_turbo_cookie_work != 0)
+    {
+        fprintf(stderr, "impossible Cookie size did not fail closed pre-scan\n");
+        return 1;
+    }
+
+    first.value.data = NULL;
+    first.value.len = 1;
+    if (auto_fixture_classify(&first,
+            NGX_HTTP_CACHE_TURBO_BACKEND_WORDPRESS) != 1)
+    {
+        fprintf(stderr, "null-backed Cookie value did not fail closed\n");
+        return 1;
+    }
+
+    printf("auto-classify: Cookie cap %d inclusive; cap+1/sizing fail closed\n",
+           NGX_HTTP_CACHE_TURBO_COOKIE_BYTES_MAX);
+    return 0;
+}
+
+
+/* Every populated registry family and every one of its current needles is
+ * driven at the cap, at the final possible byte of the SECOND Cookie field.
+ * The single-needle helper call prevents an earlier overlapping registry
+ * literal from satisfying the assertion vacuously; auto_skip then proves the
+ * owning preset row still maps that match to private/bypass. */
+static int
+auto_fixture_cookie_needles(void)
+{
+    const ngx_http_cache_turbo_preset_t  *ps;
+    const char *const                    *pp;
+    const char                           *single[2];
+    ngx_http_cache_turbo_byteset_t        bs;
+    ngx_http_request_t                    r;
+    ngx_pool_t                            pool;
+    ngx_table_elt_t                       first, second;
+    u_char                                cookie[NGX_HTTP_CACHE_TURBO_COOKIE_BYTES_MAX];
+    size_t                                bound, candidates, half, nlen;
+    ngx_uint_t                            families = 0, needles = 0;
+
+    half = NGX_HTTP_CACHE_TURBO_COOKIE_BYTES_MAX / 2;
+
+    for (ps = ngx_http_cache_turbo_presets; ps->bit; ps++) {
+        if (ps->cookies == NULL || ps->cookies[0] == NULL) {
+            continue;
+        }
+        families++;
+
+        for (pp = ps->cookies; *pp; pp++) {
+            nlen = strlen(*pp);
+            if (nlen == 0 || nlen > half) {
+                fprintf(stderr, "invalid Cookie registry needle length: %s\n",
+                        *pp);
+                return 1;
+            }
+            needles++;
+
+            memset(cookie, '~', sizeof(cookie));
+            memcpy(cookie + sizeof(cookie) - nlen, *pp, nlen);
+            memset(&first, 0, sizeof(first));
+            memset(&second, 0, sizeof(second));
+            first.value.data = cookie;
+            first.value.len = half;
+            first.next = &second;
+            second.value.data = cookie + half;
+            second.value.len = sizeof(cookie) - half;
+
+            auto_fixture_request(&r, &pool, &first);
+            ngx_http_cache_turbo_cookie_work = 0;
+            if (ngx_http_cache_turbo_cookie_byteset_build(&r, &bs) != NGX_OK) {
+                fprintf(stderr, "at-cap byteset rejected needle: %s\n", *pp);
+                return 1;
+            }
+
+            single[0] = *pp;
+            single[1] = NULL;
+            if (!ngx_http_cache_turbo_cookie_has(&r, single, &bs)) {
+                fprintf(stderr, "at-cap final-position needle unreachable: %s\n",
+                        *pp);
+                return 1;
+            }
+
+            candidates = 2 * (half - nlen + 1);
+            bound = NGX_HTTP_CACHE_TURBO_COOKIE_BYTES_MAX + nlen + 1
+                    + candidates * nlen;
+            if (ngx_http_cache_turbo_cookie_work > bound) {
+                fprintf(stderr, "needle work exceeded bound: %s (%zu > %zu)\n",
+                        *pp, ngx_http_cache_turbo_cookie_work, bound);
+                return 1;
+            }
+
+            if (auto_fixture_classify(&first, ps->bit) != 1) {
+                fprintf(stderr, "preset did not bypass for Cookie needle: %s\n",
+                        *pp);
+                return 1;
+            }
+        }
+    }
+
+    if (families == 0 || needles == 0) {
+        fprintf(stderr, "Cookie registry fixture reached no populated rows\n");
+        return 1;
+    }
+
+    printf("auto-classify: %u Cookie families / %u needles reachable at cap\n",
+           (unsigned) families, (unsigned) needles);
+    return 0;
+}
+
+
+/* Exact operation oracle for the worst useful prefilter shape: the needle's
+ * first byte occurs at every haystack position, its second byte never does,
+ * so every candidate performs exactly two comparisons and no timing is used. */
+static int
+auto_fixture_cookie_work_oracle(void)
+{
+    const char       *needle = ct_wp_cookies[0];
+    const char       *single[] = { NULL, NULL };
+    ngx_http_cache_turbo_byteset_t  bs;
+    ngx_http_request_t              r;
+    ngx_pool_t                      pool;
+    ngx_table_elt_t                 first, second;
+    u_char                          cookie[NGX_HTTP_CACHE_TURBO_COOKIE_BYTES_MAX];
+    size_t                          candidates, expected, half, nlen;
+
+    nlen = strlen(needle);
+    half = sizeof(cookie) / 2;
+    memset(cookie, needle[0], sizeof(cookie));
+    memset(&first, 0, sizeof(first));
+    memset(&second, 0, sizeof(second));
+    first.value.data = cookie;
+    first.value.len = half;
+    first.next = &second;
+    second.value.data = cookie + half;
+    second.value.len = sizeof(cookie) - half;
+    single[0] = needle;
+
+    auto_fixture_request(&r, &pool, &first);
+    ngx_http_cache_turbo_cookie_work = 0;
+    if (ngx_http_cache_turbo_cookie_byteset_build(&r, &bs) != NGX_OK
+        || ngx_http_cache_turbo_cookie_has(&r, single, &bs) != 0)
+    {
+        fprintf(stderr, "work-oracle non-match classified as a match\n");
+        return 1;
+    }
+
+    candidates = 2 * (half - nlen + 1);
+    expected = sizeof(cookie) + nlen + 1 + candidates * 2;
+    if (ngx_http_cache_turbo_cookie_work != expected) {
+        fprintf(stderr, "Cookie work oracle mismatch: got %zu, expected %zu\n",
+                ngx_http_cache_turbo_cookie_work, expected);
+        return 1;
+    }
+
+    printf("auto-classify: Cookie work oracle exact at %zu operations\n",
+           expected);
+    return 0;
+}
+
+
+/* A needle split across Cookie fields must not be manufactured by the union
+ * byteset. Each complete field is searched independently, as before. */
+static int
+auto_fixture_cookie_split_negative(void)
+{
+    const char       *needle = ct_wp_cookies[0];
+    ngx_table_elt_t   first, second;
+    size_t            split = strlen(needle) / 2;
+
+    memset(&first, 0, sizeof(first));
+    memset(&second, 0, sizeof(second));
+    first.value.data = (u_char *) needle;
+    first.value.len = split;
+    first.next = &second;
+    second.value.data = (u_char *) needle + split;
+    second.value.len = strlen(needle) - split;
+
+    if (auto_fixture_classify(&first,
+            NGX_HTTP_CACHE_TURBO_BACKEND_WORDPRESS) != 0)
+    {
+        fprintf(stderr, "split Cookie fields manufactured a substring match\n");
+        return 1;
+    }
+
+    puts("auto-classify: split Cookie fields remain independent");
+    return 0;
+}
+
+
+int
+main(void)
+{
+    if (auto_fixture_arg_allocation_failure()
+        || auto_fixture_cookie_boundaries()
+        || auto_fixture_cookie_needles()
+        || auto_fixture_cookie_work_oracle()
+        || auto_fixture_cookie_split_negative())
+    {
+        return 1;
+    }
+
     return 0;
 }
 #endif

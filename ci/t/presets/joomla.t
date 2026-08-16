@@ -47,7 +47,7 @@
 # THE COOKIE RULE IS A PLAIN SUBSTRING MATCH, NOT A NAME-SUFFIX PARSE
 # ---------------------------------------------------------------------
 # ct_joomla_cookies[] is evaluated by ngx_http_cache_turbo_cookie_has(), which is
-# a raw ngx_strnstr() search for the needle ANYWHERE in the whole Cookie header
+# a raw bounded search for the needle ANYWHERE in the whole Cookie header
 # value -- not the name/value-pair suffix parser phpBB's _u predicate uses. So
 # TEST 3 (partial word match) and TEST 4 (needle spanning a NAME=VALUE boundary)
 # both pass, because the matcher never looks for a '=' or a pair boundary at
@@ -202,7 +202,7 @@ Cookie: joomla_remember_me_9f8e7d6c=
 
 
 === TEST 4: the match is a SUBSTRING anywhere in the header, not a name lookup
-# ngx_http_cache_turbo_cookie_has() is ngx_strnstr() over the whole Cookie
+# ngx_http_cache_turbo_cookie_has() scans for a substring over the whole Cookie
 # header value, so the needle also fires from inside an adjacent pair's VALUE,
 # with no '=' or ';' boundary required. Pinning this (rather than assuming a
 # name-anchored parse) is what stops a future "helpful" rewrite to the

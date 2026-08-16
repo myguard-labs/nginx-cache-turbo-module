@@ -666,6 +666,13 @@ search is not anchored to a name, a cookie **value** can trip the rule as
 readily as a name: a rule's literal must be distinctive enough that it cannot
 plausibly appear as an arbitrary value.
 
+The preset classifier inspects at most **8 KiB of Cookie value bytes in total**
+across all `Cookie` header fields. That matches nginx's default 8 KiB ceiling
+for one large request-header field while preventing repeated Cookie fields from
+multiplying classifier work. If nginx is configured to accept more, an
+over-budget request is conservatively sent to the origin without lookup or
+storage; the trade is a lost cache hit, never a cacheable private request.
+
 | Preset | URI prefixes | Query args | Cookie header substrings |
 |---|---|---|---|
 | `wordpress`   | `/wp-admin/`, `/wp-login.php`, `/wp-cron.php`, `/xmlrpc.php`, `/wp-json/` | `preview`, `rest_route` | `wordpress_logged_in_`, `wp-postpass_`, `comment_author_` |

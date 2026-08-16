@@ -13,7 +13,7 @@
 # key_cookies = NULL in the ngx_http_cache_turbo_backends[] registry row), so
 # it has no value-predicate leg and no value-keying leg -- every cookie row is
 # PRESENCE-ONLY, matched via ngx_http_cache_turbo_cookie_has(), which is a
-# SUBSTRING search over the raw Cookie header VALUE (ngx_strnstr), not a
+# bounded SUBSTRING search over the raw Cookie header VALUE, not a
 # suffix-of-name match against a parsed cookie name -- that stricter
 # name_has_suffix() matcher belongs to the separate value-predicate tier
 # (cookie_preds, tier 2), which this preset's registry row does not use. Same
@@ -84,7 +84,7 @@
 # value-predicate matcher) would never fire on that: the cookie's name does
 # not END in the needle. But this preset's bypass check is
 # ngx_http_cache_turbo_cookie_has(), which does a plain SUBSTRING search
-# (ngx_strnstr) over the raw Cookie header VALUE -- not a suffix check against
+# over the raw Cookie header VALUE -- not a suffix check against
 # a parsed cookie NAME at all. `wp_woocommerce_session_` is found verbatim
 # inside `wp_woocommerce_session_a1b2c3...=...`, so the row DOES fire, and
 # TEST 9 is the regression pin for that. Worth pinning precisely because the

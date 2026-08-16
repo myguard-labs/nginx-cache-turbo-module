@@ -3960,42 +3960,57 @@ static const ngx_http_cache_turbo_preset_t  ngx_http_cache_turbo_presets[] = {
 
 
 /*
- * S231-PERF-AUTOCLASSIFY: first-byte presence bitset. cookie_has() below runs
- * ngx_strnstr() once per needle per enabled preset over the WHOLE Cookie
- * header -- 41 cookie arrays / 75 needles today -- and its cost scales with
- * the client-controlled Cookie header length. Since this surface decides
- * private-vs-cacheable, a prefilter that fails OPEN would cache a private
- * response and serve it to other users, so it must be provably conservative,
- * not merely fast in practice.
+ * S231-PERF-AUTOCLASSIFY: bounded Cookie substring classification. nginx's
+ * default large_client_header_buffers size is 8 KiB, so a single accepted
+ * Cookie field is already bounded there on a default server (the runtime
+ * large-Cookie fixture deliberately stays just below it). Multiple Cookie
+ * fields can otherwise multiply that budget. Cap their AGGREGATE value bytes
+ * at the same 8 KiB: a request over the cap is classified private/bypass, so
+ * raising nginx's header limit can cost cache hits but can never make private
+ * content cacheable. Splitting a Cookie across fields cannot multiply work.
  *
  * The set is built ONCE per request (ngx_http_cache_turbo_auto_skip(), before
  * the preset loop) by a single linear pass over every Cookie header value,
- * unioned across all of them. Needle first bytes are free -- needles are
- * compile-time C string literals, so (*pp)[0] costs nothing and no
- * precomputed table is needed.
+ * unioned across all of them. Needle first bytes are compile-time C string
+ * literals, so (*pp)[0] needs no separate table.
  *
- * PROOF this cannot fail open: if ngx_strnstr(hay, needle) would return
- * non-NULL, then needle[0] occurs in hay. The set contains every byte
+ * PROOF this cannot fail open: if cookie_contains(hay, needle) would return 1,
+ * then needle[0] occurs in hay. The set contains every byte
  * occurring in ANY Cookie header value, so needle[0]'s bit is set, so the
  * prefilter does NOT skip that needle. The observable result of cookie_has()
- * is therefore byte-identical to the un-prefiltered implementation for every
- * input; the filter can only skip scans that were already guaranteed to miss.
- * Unioning across multiple Cookie headers is a SUPERSET of any single
- * header's bytes, which only makes the filter weaker (fewer skips skipped),
- * never wrong.
+ * is therefore byte-identical to the old implementation for every in-budget
+ * input; the filter can only skip scans that were guaranteed to miss. Unioning
+ * across multiple Cookie headers is a SUPERSET of any single header's bytes,
+ * which only makes the filter weaker (fewer scans skipped), never wrong.
  *
- * A zero-length needle ("") must not be skipped by the presence test --
- * ngx_strnstr("", ...) with a real needle is unreachable here since every
- * needle is a nonempty literal, but the guard costs nothing and removes the
- * one case where "needle[0] not in set" would be meaningless.
+ * cookie_has() computes each literal needle length ONCE, outside the Cookie-
+ * field loop, then passes it to cookie_contains(). This avoids ngx_strnstr()'s
+ * repeated NUL-length discovery without changing the registry's simple
+ * NULL-terminated literal arrays. A zero-length registry needle is ambiguous
+ * and therefore fails closed to bypass instead of entering the prefilter.
  */
+#define NGX_HTTP_CACHE_TURBO_COOKIE_BYTES_MAX  8192
+
 typedef struct {
     u_char  seen[256];
 } ngx_http_cache_turbo_byteset_t;
 
+#if defined(NGX_HTTP_CACHE_TURBO_AUTO_FIXTURES)
+/* Deterministic unit-fixture oracle. Counts Cookie value bytes inspected by
+ * byteset_build(), literal bytes read by the once-per-needle length pass, and
+ * haystack/needle byte comparisons in cookie_contains(). It is absent from
+ * production and fuzz builds; the fixture uses it to prove an operation bound
+ * without a wall-clock timing band. */
+static size_t  ngx_http_cache_turbo_cookie_work = 0;
+#define ngx_http_cache_turbo_cookie_work_add(n)                              \
+    (ngx_http_cache_turbo_cookie_work += (n))
+#else
+#define ngx_http_cache_turbo_cookie_work_add(n)  ((void) 0)
+#endif
+
 #if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
     && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
-/* Test-only observable: counts ngx_strnstr() calls actually made by
+/* Test-only observable: counts bounded substring scans actually made by
  * cookie_has() across the whole request, so a runtime test can assert the
  * prefilter is cutting scans on a large Cookie header that matches nothing,
  * without resorting to a wall-clock timing band. Process-global, matching the
@@ -4006,15 +4021,19 @@ ngx_atomic_uint_t  ngx_http_cache_turbo_test_cookie_scans = 0;
 
 /* Union the bytes of every request Cookie header value into *bs. Must be
  * called once per request before any cookie_has() call in the same request.
+ * Returns NGX_ERROR before inspecting an over-budget/null-backed value; the
+ * caller maps every such sizing/shape ambiguity to private/bypass.
+ *
  * Zeroes *bs itself with a plain loop rather than ngx_memzero(), so this
  * builder has no dependency on ngx_string.h beyond what cookie_has() already
  * needs -- the fuzz harness's minimal shim (ngx_shim_auto.h) does not supply
  * ngx_memzero(). */
-static void
+static ngx_int_t
 ngx_http_cache_turbo_cookie_byteset_build(ngx_http_request_t *r,
     ngx_http_cache_turbo_byteset_t *bs)
 {
     ngx_uint_t           b;
+    size_t               total;
 #if (nginx_version >= 1023000)
     ngx_table_elt_t     *ck;
     u_char              *p, *end;
@@ -4027,89 +4046,163 @@ ngx_http_cache_turbo_cookie_byteset_build(ngx_http_request_t *r,
     for (b = 0; b < 256; b++) {
         bs->seen[b] = 0;
     }
+    total = 0;
 
 #if (nginx_version >= 1023000)
     for (ck = r->headers_in.cookie; ck; ck = ck->next) {
-        if (ck->value.data == NULL || ck->value.len == 0) {
+        if (ck->value.len == 0) {
             continue;
         }
+        if (ck->value.data == NULL
+            || ck->value.len > NGX_HTTP_CACHE_TURBO_COOKIE_BYTES_MAX - total)
+        {
+            return NGX_ERROR;
+        }
+        total += ck->value.len;
         for (p = ck->value.data, end = p + ck->value.len; p < end; p++) {
             bs->seen[*p] = 1;
+            ngx_http_cache_turbo_cookie_work_add(1);
         }
     }
 #else
     ckp = r->headers_in.cookies.elts;
     for (i = 0; i < r->headers_in.cookies.nelts; i++) {
-        if (ckp[i]->value.data == NULL || ckp[i]->value.len == 0) {
+        if (ckp[i]->value.len == 0) {
             continue;
         }
+        if (ckp[i]->value.data == NULL
+            || ckp[i]->value.len
+               > NGX_HTTP_CACHE_TURBO_COOKIE_BYTES_MAX - total)
+        {
+            return NGX_ERROR;
+        }
+        total += ckp[i]->value.len;
         for (p = ckp[i]->value.data, end = p + ckp[i]->value.len;
              p < end; p++)
         {
             bs->seen[*p] = 1;
+            ngx_http_cache_turbo_cookie_work_add(1);
         }
     }
 #endif
+
+    return NGX_OK;
 }
+
+
+/* Length-bounded, case-sensitive substring search with ngx_strnstr()'s Cookie
+ * semantics: an embedded NUL terminates the searchable value. `nlen` is
+ * precomputed once by cookie_has(), not rediscovered at every candidate byte.
+ * The fixture-only counter records every byte comparison exactly. */
+static ngx_int_t
+ngx_http_cache_turbo_cookie_contains(u_char *data, size_t len,
+    const char *needle, size_t nlen)
+{
+    size_t  i, limit, off;
+
+    if (nlen == 0 || len < nlen) {
+        return 0;
+    }
+
+    limit = len - nlen;
+
+    for (off = 0; off <= limit; off++) {
+        ngx_http_cache_turbo_cookie_work_add(1);
+
+        if (data[off] == '\0') {
+            return 0;
+        }
+        if (data[off] != (u_char) needle[0]) {
+            continue;
+        }
+
+        for (i = 1; i < nlen; i++) {
+            ngx_http_cache_turbo_cookie_work_add(1);
+
+            if (data[off + i] == '\0') {
+                return 0;
+            }
+            if (data[off + i] != (u_char) needle[i]) {
+                break;
+            }
+        }
+
+        if (i == nlen) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
 
 /* True if any request Cookie header contains one of the NULL-terminated name
  * substrings (the login/session cookies carry dynamic suffixes, so a substring
  * match on the distinctive prefix is the right test, not an exact-name lookup).
- * `bs` is the request's byte-presence set (see above); the ngx_strnstr() call
- * below is skipped whenever needle[0] cannot possibly occur in any Cookie
- * header, per the proof above. */
+ * `bs` is the request's byte-presence set (see above); the bounded substring
+ * scan is skipped whenever needle[0] cannot occur in any Cookie header, per the
+ * proof above. Needle-outer ordering precomputes its length once while retaining
+ * the union-of-all-Cookie-fields result. */
 static ngx_int_t
 ngx_http_cache_turbo_cookie_has(ngx_http_request_t *r,
     const char *const *subs, const ngx_http_cache_turbo_byteset_t *bs)
 {
     const char *const  *pp;
+    size_t              nlen;
 #if (nginx_version >= 1023000)
     ngx_table_elt_t    *ck;
-
-    for (ck = r->headers_in.cookie; ck; ck = ck->next) {
-        if (ck->value.data == NULL || ck->value.len == 0) {
-            continue;
-        }
-        for (pp = subs; *pp; pp++) {
-            if ((*pp)[0] != '\0' && !bs->seen[(u_char) (*pp)[0]]) {
-                continue;
-            }
-#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
-    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
-            ngx_atomic_fetch_add(&ngx_http_cache_turbo_test_cookie_scans, 1);
-#endif
-            if (ngx_strnstr(ck->value.data, (char *) *pp, ck->value.len)
-                != NULL)
-            {
-                return 1;
-            }
-        }
-    }
 #else
     ngx_table_elt_t   **ckp;
     ngx_uint_t          i;
+#endif
 
-    ckp = r->headers_in.cookies.elts;
-    for (i = 0; i < r->headers_in.cookies.nelts; i++) {
-        if (ckp[i]->value.data == NULL || ckp[i]->value.len == 0) {
+    for (pp = subs; *pp; pp++) {
+        nlen = ngx_strlen(*pp);
+        ngx_http_cache_turbo_cookie_work_add(nlen + 1);
+
+        if (nlen == 0) {
+            return 1;                   /* ambiguous registry row: fail closed */
+        }
+        if (!bs->seen[(u_char) (*pp)[0]]) {
             continue;
         }
-        for (pp = subs; *pp; pp++) {
-            if ((*pp)[0] != '\0' && !bs->seen[(u_char) (*pp)[0]]) {
+
+#if (nginx_version >= 1023000)
+        for (ck = r->headers_in.cookie; ck; ck = ck->next) {
+            if (ck->value.len == 0) {
                 continue;
             }
 #if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
     && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
             ngx_atomic_fetch_add(&ngx_http_cache_turbo_test_cookie_scans, 1);
 #endif
-            if (ngx_strnstr(ckp[i]->value.data, (char *) *pp,
-                            ckp[i]->value.len) != NULL)
+            if (ngx_http_cache_turbo_cookie_contains(ck->value.data,
+                                                     ck->value.len,
+                                                     *pp, nlen))
             {
                 return 1;
             }
         }
-    }
+#else
+        ckp = r->headers_in.cookies.elts;
+        for (i = 0; i < r->headers_in.cookies.nelts; i++) {
+            if (ckp[i]->value.len == 0) {
+                continue;
+            }
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+            ngx_atomic_fetch_add(&ngx_http_cache_turbo_test_cookie_scans, 1);
 #endif
+            if (ngx_http_cache_turbo_cookie_contains(ckp[i]->value.data,
+                                                     ckp[i]->value.len,
+                                                     *pp, nlen))
+            {
+                return 1;
+            }
+        }
+#endif
+    }
+
     return 0;
 }
 
@@ -5033,11 +5126,13 @@ ngx_http_cache_turbo_auto_skip(ngx_http_request_t *r,
 
     /* S231-PERF-AUTOCLASSIFY (cookie half): built ONCE per request, unioned
      * over every Cookie header, and reused by cookie_has() for every preset
-     * below -- see the byteset builder's comment for the correctness proof.
-     * An empty (or absent) Cookie means an all-zero set, so every needle is
-     * skipped and cookie_has() returns 0, matching the pre-existing
-     * behaviour for that case exactly. */
-    ngx_http_cache_turbo_cookie_byteset_build(r, &cookie_bytes);
+     * below -- see the byteset builder's correctness/bounded-work proof. An
+     * empty (or absent) Cookie means an all-zero set. Aggregate Cookie values
+     * over the fixed work cap, a null-backed nonempty value, or any sizing
+     * ambiguity fail closed before a partial set can be consulted. */
+    if (ngx_http_cache_turbo_cookie_byteset_build(r, &cookie_bytes) != NGX_OK) {
+        return 1;                       /* fail closed: private / bypass */
+    }
 
     /* Preset uris[] are literals anchored at byte 0 ("/wp-admin/"), so a
      * subdirectory install matches nothing unless we rebase the URI onto the
@@ -8212,7 +8307,7 @@ ngx_http_cache_turbo_test_arg_scan_header(ngx_http_request_t *r)
 }
 
 
-/* S231-PERF-AUTOCLASSIFY: report the process-global ngx_strnstr() call count
+/* S231-PERF-AUTOCLASSIFY: report the process-global substring-scan call count
  * from cookie_has()'s first-byte prefilter, so a runtime test can assert the
  * prefilter is actually cutting scans (a COUNTER oracle, never a wall-clock
  * timing band) instead of just trusting that it compiles. Same
