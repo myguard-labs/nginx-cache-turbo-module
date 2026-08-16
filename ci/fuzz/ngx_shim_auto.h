@@ -76,7 +76,14 @@ typedef struct {
     } headers_in;
     ngx_str_t  uri;
     ngx_str_t  args;
+    ngx_pool_t *pool;
 } ngx_http_request_t;
+
+#ifndef NGX_MAX_SIZE_T_VALUE
+#define NGX_MAX_SIZE_T_VALUE  ((size_t) -1)
+#endif
+
+#define ngx_memcpy(dst, src, n)  memcpy(dst, src, n)
 
 /* NGX_CONF_UNSET_PTR is nginx's "directive not set" sentinel. The sliced code
  * tests pointer conf fields against it, so the shim must define it with the

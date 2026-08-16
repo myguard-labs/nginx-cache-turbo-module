@@ -29,6 +29,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -37,12 +38,55 @@
 /* Verbatim auto-classify block sliced from the shipped module. */
 #include "generated_auto_classify.inc"
 
+#if defined(NGX_HTTP_CACHE_TURBO_AUTO_FIXTURES)
+/* Deterministic allocation-failure fixture. Filling the shim pool's allocation
+ * registry forces the 65th-pair extension allocation to fail; auto_skip must
+ * then return the private/bypass classification rather than inspect the
+ * partial 64-span prefix. Kept in this translation unit so the fixture and
+ * fuzzer both exercise the same extracted production code. */
+int
+main(void)
+{
+    ngx_http_request_t               r;
+    ngx_http_cache_turbo_loc_conf_t  clcf;
+    ngx_pool_t                       pool;
+    u_char                           args[65 * 2 - 1];
+    ngx_uint_t                       i;
+
+    memset(&r, 0, sizeof(r));
+    memset(&clcf, 0, sizeof(clcf));
+    memset(&pool, 0, sizeof(pool));
+
+    for (i = 0; i < 65; i++) {
+        args[i * 2] = 'z';
+        if (i + 1 < 65) {
+            args[i * 2 + 1] = '&';
+        }
+    }
+
+    pool.nallocs = NGX_FUZZ_POOL_MAX_ALLOCS;
+    r.args.data = args;
+    r.args.len = sizeof(args);
+    r.pool = &pool;
+    clcf.backend_presets = NGX_HTTP_CACHE_TURBO_BACKEND_WORDPRESS;
+
+    if (ngx_http_cache_turbo_auto_skip(&r, &clcf) != 1) {
+        fprintf(stderr, "allocation failure did not fail closed\n");
+        return 1;
+    }
+
+    puts("auto-classify: overflow allocation failure fails closed");
+    return 0;
+}
+#endif
+
 int
 LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
     ngx_http_request_t               r;
     ngx_http_cache_turbo_loc_conf_t  clcf;
     ngx_table_elt_t                  cookie;
+    ngx_pool_t                       pool;
     const uint8_t                   *sep, *ck_src, *sep2, *arg_src;
     size_t                           uri_len, ck_len, arg_len;
     u_char                          *uri_buf = NULL;
@@ -101,6 +145,7 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 
     memset(&r, 0, sizeof(r));
     memset(&cookie, 0, sizeof(cookie));
+    memset(&pool, 0, sizeof(pool));
 
     r.uri.data = uri_buf;
     r.uri.len = uri_len;
@@ -109,6 +154,7 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
      * so those bytes are now OUR parser's problem and must be fuzzed. */
     r.args.data = arg_buf;
     r.args.len = arg_len;
+    r.pool = &pool;
 
     cookie.value.data = ck_buf;
     cookie.value.len = ck_len;
@@ -164,5 +210,6 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     free(uri_buf);
     free(ck_buf);
     free(arg_buf);
+    ngx_fuzz_pool_reset(&pool);
     return 0;
 }

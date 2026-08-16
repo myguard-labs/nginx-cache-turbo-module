@@ -37,6 +37,7 @@ ci/fuzz/fuzz_auto_classify
 ci/fuzz/fuzz_blob
 ci/fuzz/fuzz_blob_fixtures
 ci/tests/unit/blob_fixtures
+ci/tests/unit/auto_classify_fixtures
 ci/fuzz/generated_parser.inc
 ci/fuzz/generated_norm_args.inc
 ci/fuzz/generated_mc_parser.inc
