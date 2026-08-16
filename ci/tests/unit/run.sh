@@ -61,23 +61,30 @@ bash "$DIR/extract_key_fold.sh"
 "$CC" $CFLAGS "$DIR/test_digest_fail.c" -o "$DIR/test_digest_fail" -lssl -lcrypto
 "$DIR/test_digest_fail"
 
-# --- L2 blob deserializer fixtures (AUD-HDR1 / AUD-FUZZ1) -----------------
-# Deterministic, hermetic (no nginx tree, no libFuzzer engine): one fixture per
-# header-injection primitive, driven through the SAME oracle ci/fuzz/fuzz_blob.c
-# gives the fuzzer. Built here rather than only in the fuzzing workflow so the
-# guards are checked on every PR — fuzzing.yml is path-filtered to ci/fuzz/**
-# and would not run at all on a change that only touches src/.
-echo "--- L2 blob deserializer fixtures (ASan/UBSan) ---"
 FUZZ_DIR="$DIR/../../fuzz"
 BLOB_CC="${BLOB_CC:-clang}"
 if command -v "$BLOB_CC" >/dev/null 2>&1; then
+    # --- arg-span overflow allocation failure (AUD4-PERF-ARG64) -----------
+    # Exercise the fail-closed branch against the same extracted production
+    # code as fuzz_auto_classify.
+    echo "--- auto-classify overflow allocation fixture (ASan/UBSan) ---"
+    bash "$FUZZ_DIR/extract_auto_classify.sh"
+    "$BLOB_CC" -g -O1 -fsanitize=address,undefined \
+        -DNGX_HTTP_CACHE_TURBO_AUTO_FIXTURES=1 -I"$FUZZ_DIR" \
+        "$FUZZ_DIR/fuzz_auto_classify.c" -o "$DIR/auto_classify_fixtures"
+    "$DIR/auto_classify_fixtures"
+
+    # --- L2 blob deserializer fixtures (AUD-HDR1 / AUD-FUZZ1) ------------
+    # One fixture per header-injection primitive, driven through the same
+    # oracle ci/fuzz/fuzz_blob.c gives the fuzzer.
+    echo "--- L2 blob deserializer fixtures (ASan/UBSan) ---"
     bash "$FUZZ_DIR/build_blob_fixtures.sh" "$BLOB_CC" "$DIR/blob_fixtures" \
         -g -O1 -fsanitize=address,undefined
     "$DIR/blob_fixtures"
 else
-    # Not a silent skip: these fixtures are the only guard on the restore-side
-    # header filter, so a runner without clang must be visible in the log.
-    echo "::warning::clang not found — L2 blob fixtures NOT run"
+    # Not a silent skip: these fixtures are the only deterministic guards on
+    # the two sanitizer-backed paths, so a runner without clang is visible.
+    echo "::warning::clang not found — auto-classify/L2 fixtures NOT run"
 fi
 
 # --- shm node state machine (CR-A / CR-B guards) --------------------------

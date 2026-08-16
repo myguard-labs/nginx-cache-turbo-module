@@ -1655,6 +1655,76 @@ def test_arg_prefilter_counter_oracle(ng: Nginx, origin: Origin) -> None:
     drain_origin(origin)
 
 
+def test_arg_span_overflow_boundary(ng: Nginx, origin: Origin) -> None:
+    """AUD4-PERF-ARG64: the 64-span inline fast path must extend without
+    falling back to one whole-query rescan per enabled needle.
+
+    The three dynamic cases pin the private ``preview`` argument at the last
+    inline slot, the first overflow slot, and the last slot of a longer query.
+    The non-matching control proves that a long query is not blanket-bypassed.
+    The scan-counter arm is a deterministic cliff oracle: with only ``p``
+    names present, /auto/ must compare only WordPress's ``preview`` needle, so
+    N pairs cost exactly N name comparisons at both sides of the boundary.
+    The former rescan fallback instead compared all 65 pairs independently
+    against preview, rest_route, and wc-ajax (195 comparisons)."""
+
+    def query_with_private(total: int, position: int) -> str:
+        pairs = [f"z{i}=1" for i in range(total)]
+        pairs[position - 1] = "preview=1"
+        return "&".join(pairs)
+
+    for label, total, position in (
+            ("inline-last", 64, 64),
+            ("overflow-first", 65, 65),
+            ("overflow-last", 96, 96)):
+        uri = f"/auto/argspan-{label}?{query_with_private(total, position)}"
+        for attempt in (1, 2):
+            status, _, headers = fetch(ng.port, uri)
+            assert status == 200, (
+                f"private arg at position {position}/{total}, attempt "
+                f"{attempt}, returned {status}")
+            assert "x-cache" not in headers, (
+                f"private arg at position {position}/{total} must bypass the "
+                f"cache, got x-cache={headers.get('x-cache')} on attempt "
+                f"{attempt}")
+
+    public_qs = "&".join(f"z{i}=1" for i in range(96))
+    public_uri = f"/auto/argspan-public?{public_qs}"
+    fetch(ng.port, public_uri)
+    _, _, public_headers = fetch(ng.port, public_uri)
+    assert public_headers.get("x-cache") == "HIT", (
+        "a long query with no private argument must remain cacheable; "
+        f"got x-cache={public_headers.get('x-cache')}")
+
+    conn = http.client.HTTPConnection("127.0.0.1", ng.port,
+                                      timeout=HTTP_TIMEOUT)
+    try:
+        _, _, baseline_headers = _fetch_keepalive(
+            conn, "/auto/argspan-counter-baseline?zz=1")
+        before = _arg_scans(baseline_headers, "arg-span cliff baseline")
+
+        qs64 = "&".join(f"p{i}=1" for i in range(64))
+        _, _, headers64 = _fetch_keepalive(
+            conn, f"/auto/argspan-counter-64?{qs64}")
+        after64 = _arg_scans(headers64, "64-pair arg-span query")
+
+        qs65 = "&".join(f"p{i}=1" for i in range(65))
+        _, _, headers65 = _fetch_keepalive(
+            conn, f"/auto/argspan-counter-65?{qs65}")
+        after65 = _arg_scans(headers65, "65-pair arg-span query")
+
+        assert after64 - before == 64, (
+            "64 pairs should cost exactly 64 cached-span name comparisons, "
+            f"got {after64 - before}")
+        assert after65 - after64 == 65, (
+            "crossing from 64 to 65 pairs must add one comparison, not fall "
+            "off the per-needle rescan cliff; got "
+            f"{after65 - after64} comparisons")
+    finally:
+        conn.close()
+    drain_origin(origin)
+
+
 def test_q2_multibuffer_oversize(ng: Nginx, origin: Origin) -> None:
     """Q2: a ~200 KB response (streamed in several buffers) over a 1k max_size
     must early-abort capture mid-stream — never cached, body intact, no error,

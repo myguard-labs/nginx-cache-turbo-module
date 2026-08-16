@@ -81,6 +81,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_arg_prefilter_negative_control(ng, origin)
     test_arg_prefilter_mangling_regression(ng, origin)
     test_arg_prefilter_counter_oracle(ng, origin)
+    test_arg_span_overflow_boundary(ng, origin)  # AUD4-PERF-ARG64
     test_q2_multibuffer_oversize(ng, origin)
     test_suppress_native_inert_on_plain_location(ng)
     test_suppress_native_e2e_proxy_cache(ng)
