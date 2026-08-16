@@ -4030,6 +4030,9 @@ ngx_http_cache_turbo_cookie_byteset_build(ngx_http_request_t *r,
 
 #if (nginx_version >= 1023000)
     for (ck = r->headers_in.cookie; ck; ck = ck->next) {
+        if (ck->value.data == NULL || ck->value.len == 0) {
+            continue;
+        }
         for (p = ck->value.data, end = p + ck->value.len; p < end; p++) {
             bs->seen[*p] = 1;
         }
@@ -4037,6 +4040,9 @@ ngx_http_cache_turbo_cookie_byteset_build(ngx_http_request_t *r,
 #else
     ckp = r->headers_in.cookies.elts;
     for (i = 0; i < r->headers_in.cookies.nelts; i++) {
+        if (ckp[i]->value.data == NULL || ckp[i]->value.len == 0) {
+            continue;
+        }
         for (p = ckp[i]->value.data, end = p + ckp[i]->value.len;
              p < end; p++)
         {
@@ -4061,6 +4067,9 @@ ngx_http_cache_turbo_cookie_has(ngx_http_request_t *r,
     ngx_table_elt_t    *ck;
 
     for (ck = r->headers_in.cookie; ck; ck = ck->next) {
+        if (ck->value.data == NULL || ck->value.len == 0) {
+            continue;
+        }
         for (pp = subs; *pp; pp++) {
             if ((*pp)[0] != '\0' && !bs->seen[(u_char) (*pp)[0]]) {
                 continue;
@@ -4082,6 +4091,9 @@ ngx_http_cache_turbo_cookie_has(ngx_http_request_t *r,
 
     ckp = r->headers_in.cookies.elts;
     for (i = 0; i < r->headers_in.cookies.nelts; i++) {
+        if (ckp[i]->value.data == NULL || ckp[i]->value.len == 0) {
+            continue;
+        }
         for (pp = subs; *pp; pp++) {
             if ((*pp)[0] != '\0' && !bs->seen[(u_char) (*pp)[0]]) {
                 continue;
