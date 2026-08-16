@@ -3962,9 +3962,9 @@ static const ngx_http_cache_turbo_preset_t  ngx_http_cache_turbo_presets[] = {
 /*
  * S231-PERF-AUTOCLASSIFY: first-byte presence bitset. cookie_has() below runs
  * ngx_strnstr() once per needle per enabled preset over the WHOLE Cookie
- * header -- 41 cookie arrays / 75 needles today -- and its cost scales with
- * the client-controlled Cookie header length. Since this surface decides
- * private-vs-cacheable, a prefilter that fails OPEN would cache a private
+ * header -- across the registry's cookie arrays and needles -- and its cost
+ * scales with the length of the client-controlled Cookie header. Since this
+ * surface decides private-vs-cacheable, a prefilter that fails OPEN would cache a
  * response and serve it to other users, so it must be provably conservative,
  * not merely fast in practice.
  *
