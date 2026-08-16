@@ -140,13 +140,13 @@ ngx_http_cache_turbo_redis_split_dsn(ngx_conf_t *cf,
             clcf->redis_db = ngx_atoi(slash + 1, last - (slash + 1));
             if (clcf->redis_db == NGX_ERROR || clcf->redis_db < 0) {
                 ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                    "cache_turbo_redis: bad db in DSN \"%V\"", arg1);
+                    "cache_turbo_redis: bad db in DSN");
                 return NGX_CONF_ERROR;
             }
             if (clcf->redis_db > NGX_HTTP_CACHE_TURBO_REDIS_DB_MAX) {
                 ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                    "cache_turbo_redis: db in DSN \"%V\" exceeds the "
-                    "maximum %d", arg1, NGX_HTTP_CACHE_TURBO_REDIS_DB_MAX);
+                    "cache_turbo_redis: db in DSN exceeds the maximum %d",
+                    NGX_HTTP_CACHE_TURBO_REDIS_DB_MAX);
                 return NGX_CONF_ERROR;
             }
         }

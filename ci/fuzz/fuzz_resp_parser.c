@@ -27,6 +27,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -264,7 +265,7 @@ check_split_delivery(u_char *buf, size_t size, ngx_pool_t *pool)
 {
     if (size >= 2) {
         u_char    *whole = NULL;
-        size_t     whole_len = 0, split, reply_end;
+        size_t     whole_len = 0, split;
         ngx_int_t  rc_whole;
 
         /* Reference verdict: the identical bytes parsed in one piece. */
@@ -293,42 +294,6 @@ check_split_delivery(u_char *buf, size_t size, ngx_pool_t *pool)
                 whole_len = blob_len;
             }
             ngx_fuzz_pool_reset(pool);
-        }
-
-        /* Where does the reply actually END? Not necessarily at `size`: the
-         * input may carry trailing bytes the parser never consumes, and a
-         * zero-length bulk string ($0\r\n\r\n) reaches its verdict in five
-         * bytes no matter how much follows. The prefix oracle below is only
-         * valid for a split INSIDE the reply, so find the shortest prefix that
-         * already parses to the same verdict and treat that as the boundary.
-         *
-         * The parser reports no consumed length, so this is a linear probe.
-         * It costs another O(size) parses over an input libFuzzer keeps short,
-         * which is cheaper than an oracle that fires on valid input. */
-        reply_end = size;
-
-        if (rc_whole == NGX_OK) {
-            size_t  probe;
-
-            for (probe = 1; probe <= size; probe++) {
-                ngx_http_cache_turbo_redis_op_t  pop;
-                u_char  *pblob = NULL;
-                size_t   pblob_len = 0;
-
-                pop.rbuf = buf;
-                pop.rlen = probe;
-                pop.pool = pool;
-                pop.rpool = pool;
-
-                if (ngx_http_cache_turbo_redis_parse(&pop, &pblob, &pblob_len)
-                    == NGX_OK)
-                {
-                    reply_end = probe;
-                    ngx_fuzz_pool_reset(pool);
-                    break;
-                }
-                ngx_fuzz_pool_reset(pool);
-            }
         }
 
         /* Sweep EVERY boundary rather than sampling one. The reply is short
@@ -389,16 +354,10 @@ check_split_delivery(u_char *buf, size_t size, ngx_pool_t *pool)
                      * a verdict from truncated bytes. (Only checked when the
                      * whole reply parses — for malformed input the parser is
                      * entitled to reject the prefix outright.)
-                     *
-                     * Only splits strictly INSIDE the reply qualify. A split at
-                     * or past `reply_end` hands over a complete reply plus
-                     * surplus bytes, and NGX_OK is then the correct answer, not
-                     * a verdict invented from a truncated one. Gating on `size`
-                     * instead of `reply_end` made this trap fire on the
-                     * perfectly legal $0\r\n\r\n followed by trailing bytes. */
-                    if (rc_whole == NGX_OK && rc == NGX_OK
-                        && split < reply_end)
-                    {
+                     * A successful whole parse now proves the reply consumes
+                     * the entire input exactly, so every split below `size` is
+                     * necessarily inside that reply. */
+                    if (rc_whole == NGX_OK && rc == NGX_OK) {
                         __builtin_trap();  /* answered from a partial reply */
                     }
                     continue;
@@ -433,3 +392,71 @@ check_split_delivery(u_char *buf, size_t size, ngx_pool_t *pool)
         free(whole);
     }
 }
+
+#if defined(NGX_HTTP_CACHE_TURBO_RESP_FIXTURES)
+static int
+check_get_fixture(const char *name, const u_char *wire, size_t wire_len,
+    ngx_int_t want, const u_char *want_blob, size_t want_blob_len)
+{
+    ngx_pool_t                       pool = { 0 };
+    ngx_http_cache_turbo_redis_op_t  op = { 0 };
+    u_char                          *blob = NULL;
+    size_t                           blob_len = 0;
+    ngx_int_t                        got;
+
+    op.rbuf = (u_char *) wire;
+    op.rlen = wire_len;
+    op.pool = &pool;
+    op.rpool = &pool;
+
+    got = ngx_http_cache_turbo_redis_parse(&op, &blob, &blob_len);
+    if (got != want) {
+        fprintf(stderr, "%s: got rc=%ld, want rc=%ld\n",
+                name, (long) got, (long) want);
+        return 1;
+    }
+    if (got == NGX_OK
+        && (blob_len != want_blob_len
+            || memcmp(blob, want_blob, want_blob_len) != 0))
+    {
+        fprintf(stderr, "%s: payload mismatch\n", name);
+        return 1;
+    }
+    if (got != NGX_OK && (blob != NULL || blob_len != 0)) {
+        fprintf(stderr, "%s: failure returned a payload\n", name);
+        return 1;
+    }
+    return 0;
+}
+
+
+int
+main(void)
+{
+    int  failures = 0;
+
+    failures += check_get_fixture("exact hit",
+        (const u_char *) "$3\r\nfoo\r\n", sizeof("$3\r\nfoo\r\n") - 1,
+        NGX_OK, (const u_char *) "foo", 3);
+    failures += check_get_fixture("exact nil",
+        (const u_char *) "$-1\r\n", sizeof("$-1\r\n") - 1,
+        NGX_DECLINED, NULL, 0);
+    failures += check_get_fixture("partial payload",
+        (const u_char *) "$3\r\nfo", sizeof("$3\r\nfo") - 1,
+        NGX_AGAIN, NULL, 0);
+    failures += check_get_fixture("wrong payload delimiter",
+        (const u_char *) "$3\r\nfooXX", sizeof("$3\r\nfooXX") - 1,
+        NGX_ERROR, NULL, 0);
+    failures += check_get_fixture("trailing partial reply after hit",
+        (const u_char *) "$3\r\nfoo\r\n+", sizeof("$3\r\nfoo\r\n+") - 1,
+        NGX_ERROR, NULL, 0);
+    failures += check_get_fixture("trailing partial reply after nil",
+        (const u_char *) "$-1\r\n+", sizeof("$-1\r\n+") - 1,
+        NGX_ERROR, NULL, 0);
+
+    if (failures == 0) {
+        fprintf(stderr, "RESP GET fixtures: 6 checks, 0 failures\n");
+    }
+    return failures != 0;
+}
+#endif

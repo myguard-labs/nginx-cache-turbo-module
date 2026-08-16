@@ -854,12 +854,10 @@ ngx_http_cache_turbo_mc_write(ngx_event_t *wev)
             ngx_http_cache_turbo_mc_op_fail(op);
             return;
         }
-        if (op->unconnected) {
-            op->unconnected = 0;
-            if (op->clcf != NULL) {
-                ngx_http_cache_turbo_mc_backoff_clear(&op->clcf->redis_addr);
-            }
-        }
+        /* A successful send only proves that the local socket accepted bytes;
+         * a peer can accept the command and close before replying. Keep this
+         * connection unproven until the first successful recv(), where both
+         * memcached read paths clear the flag and any armed backoff. */
         b->pos += n;
     }
 

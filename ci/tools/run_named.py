@@ -160,13 +160,22 @@ def main() -> int:
     if module is not None and not module.exists():
         raise FileNotFoundError(module)
 
-    origin_port = args.port + 11
-    redis_port = args.port + 21 if args.redis_server else None
-    redis_auth_port = args.port + 22 if args.redis_server else None
-    redis_tls_port = args.port + 23 if args.redis_server else None
-    memcached_port = args.port + 24 if args.memcached_server else None
-    redis_tls_untrusted_port = args.port + 25 if args.redis_server else None
-    redis_tls_expired_port = args.port + 26 if args.redis_server else None
+    T._check_port_registry(T.PORT_OFFSETS)
+    origin_port = args.port + T.PORT_OFFSETS["origin"]
+    redis_port = (args.port + T.PORT_OFFSETS["redis"]
+                  if args.redis_server else None)
+    redis_auth_port = (args.port + T.PORT_OFFSETS["redis_auth"]
+                       if args.redis_server else None)
+    redis_tls_port = (args.port + T.PORT_OFFSETS["redis_tls"]
+                      if args.redis_server else None)
+    memcached_port = (args.port + T.PORT_OFFSETS["memcached"]
+                      if args.memcached_server else None)
+    redis_tls_untrusted_port = (
+        args.port + T.PORT_OFFSETS["redis_tls_untrusted"]
+        if args.redis_server else None)
+    redis_tls_expired_port = (
+        args.port + T.PORT_OFFSETS["redis_tls_expired"]
+        if args.redis_server else None)
     redis_password = "ctsecret"
 
     rc = 0

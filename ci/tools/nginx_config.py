@@ -36,6 +36,7 @@ PORT_OFFSETS: dict[str, int] = {
     "redis_tls": 23,
     "memcached": 24,
     "mc_dirty_reply": 25,  # test_mc_dirty_reply_not_pooled(): ng.port + this
+    "mc_drop_reply": 26,   # test_memcached_replyless_peer_arms_backoff()
     "l2_cross_instance_fill_b": 5,       # test_l2_cross_instance_fill()
     "l2_memcached_cross_instance_fill_b": 6,  # test_l2_memcached_cross_instance_fill()
     "redis_tls_untrusted": 27,
@@ -45,6 +46,7 @@ PORT_OFFSETS: dict[str, int] = {
     # needs a port that reliably REFUSES, and a port nobody reserved is a port
     # somebody eventually binds.
     "redis_dead": 29,
+    "redis_dirty_reply": 30,  # test_redis_dirty_reply_not_pooled()
 }
 
 
@@ -904,6 +906,18 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # Exact RESP-boundary gate. The test's fake peer appends one partial
+        # reply byte after every GET/SET response. keepalive must reject both
+        # the GET parser's and the fire-and-forget drain's dirty boundaries.
+        location /redisdirty/ {{
+            cache_turbo                    main;
+            cache_turbo_key                $uri;
+            cache_turbo_valid               1s;
+            cache_turbo_lock               off;
+            cache_turbo_redis              127.0.0.1:{port + PORT_OFFSETS["redis_dirty_reply"]} prefix=ctdirty: timeout=250ms keepalive=4 keepalive_timeout=30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # S231-COLDWAIT-UAF repro: live redis (cache_turbo_lock default ON),
         # short lock_timeout so the 100ms cold_wait poll fires repeatedly
         # against LOSER requests parked behind a same-key cross-node NX
@@ -1016,6 +1030,20 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             cache_turbo_valid      1s;
             cache_turbo_lock       off;
             cache_turbo_memcached  127.0.0.1:{port + PORT_OFFSETS["redis_dead"]} prefix=mcbo: timeout=250ms connect_backoff=5000ms;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # A peer on this port accepts and reads the GET, then closes without a
+        # reply. A successful local send must not clear the connection's
+        # unproven state: the read-side EOF must arm connect_backoff. no_store
+        # prevents the response body from becoming a normal cached entry.
+        location /mcdrop/ {{
+            cache_turbo            main;
+            cache_turbo_key        $uri;
+            cache_turbo_valid      1s;
+            cache_turbo_lock       off;
+            cache_turbo_no_store   $arg_private;
+            cache_turbo_memcached  127.0.0.1:{port + PORT_OFFSETS["mc_drop_reply"]} prefix=mcdrop: timeout=250ms connect_backoff=5000ms;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 """

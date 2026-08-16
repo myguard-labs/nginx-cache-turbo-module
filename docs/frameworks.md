@@ -403,9 +403,11 @@ authenticated response is still stored under the shared key.
 
 Why a directive and not just `cache_turbo_key $cookie_x`:
 
-- The name is matched **EXACTLY** and **every** `Cookie:` header is scanned, so
-  a client cannot hide the real cookie in a second header (or use a name that
-  merely ends with yours) to choose which cache bucket it reads or writes.
+- The name is matched **EXACTLY** and **every** `Cookie:` header is scanned in
+  header order. If the same name occurs more than once, the first exact match
+  wins and later duplicates are ignored; header order therefore selects the
+  bucket for duplicate names. A suffix match or a later header cannot override
+  an earlier exact match.
 - The value is folded with an **unforgeable length-prefixed framing**, so no
   cookie value can splice itself into a neighbouring key field — a plain
   delimiter in `cache_turbo_key` *is* forgeable (nginx permits the `0x1f`

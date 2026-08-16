@@ -1,4 +1,40 @@
-Changes with the nginx-cache-turbo-module
+Changes with the nginx-cache-turbo-module 1.1.0                 17 Aug 2026
+
+    *) Security: invalid or out-of-range Redis database suffixes no longer
+       echo a credential-bearing DSN into nginx configuration-error logs.
+
+    *) Bugfix: a memcached connection was treated as proven after send()
+       accepted the command locally. A peer that closed without replying
+       therefore failed to arm connect_backoff and was redialled on every
+       miss. The connection is now proven only by the first reply byte.
+
+    *) Bugfix: Redis GET and fire-and-forget reply handlers now require an
+       exact RESP boundary before accepting a payload or pooling a keepalive
+       connection. Malformed payload delimiters and trailing partial replies
+       close the connection instead of desynchronising its next reuse.
+
+    *) Feature: cache_turbo_bypass_stale_uri can retain selected public,
+       normally-bypassed responses solely as circuit-breaker fallback. These
+       entries remain unreachable as ordinary HIT or STALE responses.
+
+    *) Bugfix: stale-if-error can rescue a response when the origin fails in
+       the middle of its body before any bytes have been flushed downstream.
+       Live stale-if-error entries also get a second-chance eviction while
+       their circuit breaker is open.
+
+    *) Bugfix: over-long cache tags now emit a configuration warning instead
+       of being dropped silently, and L2 blob storage no longer reads an
+       uninitialised stack field while assembling metadata.
+
+    *) Performance: bounded Cookie classification removes attacker-controlled
+       scan work, query-argument classification no longer rescans after 64
+       spans, cache-key cookie folding uses one allocation, and the Redis SCAN
+       framer resumes linearly across partial reads.
+
+    *) Maintenance: decomposed the configuration, request, restore, classifier,
+       Redis and admin paths into smaller helpers without changing their public
+       directives; expanded unit, fuzz, preset-parity and runtime regressions
+       around the resulting seams.
 
     *) Bugfix: a ?all=1 L2 all-purge's SCAN walk had only a per-page bound
        (each page's read re-arms the read timeout), never a bound on the

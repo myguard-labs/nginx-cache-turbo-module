@@ -24,6 +24,8 @@ from test_runtime_base import (
     _fetch_keepalive,
 )
 
+_DSN_REDACTION_MARKER = "credential-must-not-appear"
+
 
 def test_bypass_stale_serves_fallback_when_breaker_open(
         ng: Nginx, origin: Origin) -> None:
@@ -1456,6 +1458,50 @@ def test_memcached_connect_backoff_fails_fast(ng: Nginx, origin: Origin) -> None
         conn.close()
 
 
+def test_memcached_replyless_peer_arms_backoff(ng: Nginx) -> None:
+    """A successful send is not proof that a fresh memcached connection works.
+
+    The fake peer reads the complete GET and closes without one reply byte. The
+    first request must arm the per-worker backoff; the second request, on the
+    same nginx keepalive connection, must skip dialing it. This is distinct from
+    the dead-port test: connect() and send() both succeed here, and only recv()
+    exposes the outage.
+    """
+    if ng.memcached_port is None:
+        return
+
+    peer = DropReplyMemcached(ng.port + PORT_OFFSETS["mc_drop_reply"])
+    peer.start()
+    conn = http.client.HTTPConnection("127.0.0.1", ng.port, timeout=HTTP_TIMEOUT)
+    try:
+        s0, b0, h0 = _fetch_keepalive(conn, "/c/mcdrop-baseline")
+        assert s0 == 200, f"baseline request did not reach origin: {s0} {b0}"
+        n0 = _backoff_skips(h0, "replyless baseline", driver="memcached")
+
+        s1, b1, h1 = _fetch_keepalive(conn, "/mcdrop/probe-one?private=1")
+        assert s1 == 200, f"replyless request 1 did not reach origin: {s1} {b1}"
+        n1 = _backoff_skips(h1, "replyless request 1", driver="memcached")
+        assert n1 == n0, (
+            f"the failure that arms backoff was counted as a skip ({n0} -> {n1})")
+        assert wait_for(lambda: peer.commands > 0), \
+            "fake peer never read the first request's command"
+        time.sleep(0.1)  # let any first-request follow-up settle before baseline
+        first_commands = peer.commands
+
+        s2, b2, h2 = _fetch_keepalive(conn, "/mcdrop/probe-two?private=1")
+        assert s2 == 200, f"replyless request 2 did not reach origin: {s2} {b2}"
+        n2 = _backoff_skips(h2, "replyless request 2", driver="memcached")
+        assert n2 > n1, (
+            f"replyless EOF did not arm fail-fast backoff ({n1} -> {n2})")
+        time.sleep(0.1)
+        assert peer.commands == first_commands, (
+            f"second request redialed the replyless peer "
+            f"({first_commands} -> {peer.commands} commands)")
+    finally:
+        conn.close()
+        peer.stop()
+
+
 def test_redis_connect_backoff_config_parse(ng: Nginx) -> None:
     """S231-L2-BACKOFF: connect_backoff= parses as a time value on both
     drivers and rejects garbage the same way timeout= already does."""
@@ -1673,11 +1719,14 @@ def test_redis_bad_db_rejected(ng: Nginx) -> None:
     # arm 2: /N DSN suffix -- distinct code path, distinct message
     r = _config_test_result(
         ng, lambda c: c.replace(param_anchor,
-                                f"redis://127.0.0.1:{ng.redis_port}/xy", 1))
+                                f"redis://user:{_DSN_REDACTION_MARKER}"
+                                f"@127.0.0.1:{ng.redis_port}/xy", 1))
     assert r.returncode != 0, \
         f"bad DSN db was accepted by nginx -t:\n{r.stdout}"
     assert "bad db in DSN" in r.stdout, \
         f"missing/odd bad-DSN-db diagnostic:\n{r.stdout}"
+    assert _DSN_REDACTION_MARKER not in r.stdout, \
+        f"invalid DSN leaked its credential marker:\n{r.stdout}"
 
 
 def test_redis_db_cap_rejected(ng: Nginx) -> None:
@@ -1712,11 +1761,14 @@ def test_redis_db_cap_rejected(ng: Nginx) -> None:
     # arm 2: /N DSN suffix -- distinct code path, distinct message
     r = _config_test_result(
         ng, lambda c: c.replace(param_anchor,
-                                f"redis://127.0.0.1:{ng.redis_port}/99", 1))
+                                f"redis://user:{_DSN_REDACTION_MARKER}"
+                                f"@127.0.0.1:{ng.redis_port}/99", 1))
     assert r.returncode != 0, \
         f"out-of-range DSN db was accepted by nginx -t:\n{r.stdout}"
     assert "db in DSN" in r.stdout and "exceeds the maximum" in r.stdout, \
         f"missing/odd DSN-db-cap diagnostic:\n{r.stdout}"
+    assert _DSN_REDACTION_MARKER not in r.stdout, \
+        f"out-of-range DSN leaked its credential marker:\n{r.stdout}"
 
     # the boundary itself must still be accepted -- a cap that rejects the
     # highest legal index would be an off-by-one that no bad-value test catches
