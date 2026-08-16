@@ -1,4 +1,4 @@
-# sync-sha: a7f2a3fd9d9ae9767102c835c1bc4a4bbebdfd6589e4988f6ff85b48e0a89101
+# sync-sha: 74430c561d33ceabae2fd36c8bacb238dcad2033d7e76f8e97bf802b375b6694
 name: Fuzzing
 
 # Fast fuzz regression gate on every PR/push — 120s/target on all five parser
@@ -57,6 +57,12 @@ jobs:
 
       - name: Build fuzz targets
         run: bash ci/fuzz/build.sh "$GITHUB_WORKSPACE/ci/fuzz"
+
+      - name: Smoke absent and present-empty Cookie headers under ASan/UBSan
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1:abort_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: ci/fuzz/auto_classify_empty_smoke
 
       # Recorded crashes first: deterministic, seconds, and a returning bug fails
       # here rather than waiting on the fresh budget below to rediscover it.

@@ -16,11 +16,12 @@
  *
  * Input layout: bytes up to the first 0x00 are the URI; bytes between the first
  * and second 0x00 are one Cookie value; bytes after the second 0x00 are the
- * query string (a missing separator => that field is empty). The query string
- * is last so every pre-existing one-NUL corpus entry keeps its exact old
- * meaning. All three buffers are sized EXACTLY, with no trailing NUL, so ASAN
- * flags any read at or past the end. All presets are enabled to exercise every
- * cookie/URI/arg rule each call.
+ * query string. A missing first separator means no Cookie header; a first
+ * separator followed immediately by EOF means a present-empty Cookie header.
+ * The query string is last so every pre-existing one-NUL corpus entry keeps its
+ * exact old meaning. All three buffers are sized EXACTLY, with no trailing NUL,
+ * so ASAN flags any read at or past the end. All presets are enabled to exercise
+ * every cookie/URI/arg rule each call.
  *
  * Build (see ci/fuzz/build.sh):
  *   clang -g -O1 -fsanitize=fuzzer,address,undefined \
@@ -45,6 +46,7 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     ngx_table_elt_t                  cookie;
     const uint8_t                   *sep, *ck_src, *sep2, *arg_src;
     size_t                           uri_len, ck_len, arg_len;
+    int                              has_cookie;
     u_char                          *uri_buf = NULL;
     u_char                          *ck_buf = NULL;
     u_char                          *arg_buf = NULL;
@@ -52,6 +54,7 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     /* URI = before the first NUL, cookie = up to the second, args = the rest. */
     sep = (const uint8_t *) memchr(data, 0x00, size);
     if (sep != NULL) {
+        has_cookie = 1;
         uri_len = (size_t) (sep - data);
         ck_src = sep + 1;
         ck_len = size - uri_len - 1;       /* drop the separator byte */
@@ -66,6 +69,7 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
             arg_len = 0;
         }
     } else {
+        has_cookie = 0;
         uri_len = size;
         ck_src = NULL;
         ck_len = 0;
@@ -113,7 +117,7 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     cookie.value.data = ck_buf;
     cookie.value.len = ck_len;
     cookie.next = NULL;
-    r.headers_in.cookie = &cookie;
+    r.headers_in.cookie = has_cookie ? &cookie : NULL;
 
     /* Arm EVERY preset row. There is no GENERIC union any more — every preset is
      * opt-in — so the fuzzer must name them all or a row's cookie/URI/arg lists

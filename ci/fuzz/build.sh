@@ -39,6 +39,15 @@ build_one() {
     echo "✓ built fuzz target: $out"
 }
 
+build_auto_classify_empty_smoke() {
+    local out="$1"
+    # The smoke has its own main(), so it deliberately omits libFuzzer's engine
+    # while retaining this script's ASan/UBSan CFLAGS.
+    # shellcheck disable=SC2086
+    $CC $CFLAGS -I"$FUZZ_DIR" "$FUZZ_DIR/test_auto_classify_empty.c" -o "$out"
+    echo "✓ built auto-classify empty-cookie smoke: $out"
+}
+
 ARG="${1:-}"
 if [ -n "$ARG" ] && [ ! -d "$ARG" ]; then
     # Explicit single-file output path -> RESP-reply target only (CI compat).
@@ -54,6 +63,7 @@ else
     build_one fuzz_mc_parser.c "$DIR/fuzz_mc_parser"
     bash "$FUZZ_DIR/extract_auto_classify.sh"
     build_one fuzz_auto_classify.c "$DIR/fuzz_auto_classify"
+    build_auto_classify_empty_smoke "$DIR/auto_classify_empty_smoke"
     bash "$FUZZ_DIR/extract_blob.sh"
     build_one fuzz_blob.c "$DIR/fuzz_blob"
     # Deterministic per-primitive fixture binary from the SAME source: no

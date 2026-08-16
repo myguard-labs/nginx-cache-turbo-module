@@ -34,6 +34,7 @@ ci/fuzz/fuzz_resp_parser
 ci/fuzz/fuzz_norm_args
 ci/fuzz/fuzz_mc_parser
 ci/fuzz/fuzz_auto_classify
+ci/fuzz/auto_classify_empty_smoke
 ci/fuzz/fuzz_blob
 ci/fuzz/fuzz_blob_fixtures
 ci/tests/unit/blob_fixtures
