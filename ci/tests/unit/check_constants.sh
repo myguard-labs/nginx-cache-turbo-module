@@ -62,6 +62,14 @@ if [ "$rc" -ne 0 ]; then
 fi
 echo "✓ unit-test shim constants match module.h (${#CONSTS[@]} checked)"
 
+# Runtime preset-oracle tables are intentionally hand-written for readable
+# semantic tests.  Parse both those Python literals and the C preset registry
+# so a populated source row, a needle, or a test location cannot drift quietly.
+python3 "$DIR/check_preset_mirrors.py" \
+    "$DIR/../../../src/ngx_http_cache_turbo_module.c" \
+    "$DIR/../../tools/areas/core.py" \
+    "$DIR/../../tools/nginx_config.py"
+
 # ---------------------------------------------------------------------------
 # Auto-classify preset bits: the module headers vs the FUZZ shim
 # (ci/fuzz/ngx_shim_auto.h), which mirrors them by hand.
