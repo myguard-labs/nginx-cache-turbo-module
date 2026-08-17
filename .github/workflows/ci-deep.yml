@@ -1,4 +1,4 @@
-# sync-sha: e60a94831b238fe98c7a11317b9c9c054484841b0a488e8a4efebc89e4326679
+# sync-sha: 8eacbe70fc851c660f6c88e1bff8c8ceb496d4a455a58cfbd8ee23c8c35a8152
 name: CI Deep
 
 # Exhaustive dynamic analysis — monthly cron + on-demand only, NEVER on PR.
@@ -43,7 +43,14 @@ on:
         default: 8
 
 concurrency:
-  group: ci-deep-${{ github.workflow }}-${{ github.ref }}
+  # "-${{ github.event_name }}": schedule and workflow_dispatch resolve the same
+  # github.workflow AND the same github.ref on the default branch, so without it
+  # both triggers hash to one group and cancel-in-progress makes a dispatch kill
+  # a running monthly soak. Hit live: run 32060092573 was cancelled 58 min in,
+  # superseded by a dispatch (32065298347). The PR gate drops Valgrind on the
+  # grounds ci-deep still covers it -- true only if the deep run finishes.
+  # Two triggers therefore get two groups; each still self-cancels.
+  group: ci-deep-${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 permissions:
