@@ -32,13 +32,148 @@ package CacheTurbo;
 use strict;
 use warnings;
 
+use File::Spec ();
+use IO::Socket::INET;
+
 use Test::Nginx::Util qw( server_port );
 
 use Exporter 'import';
 our @EXPORT_OK = qw( ct_http_config ct_location ct_config ct_origin_port );
 
-# The origin listens BESIDE nginx, on a port derived from the one Test::Nginx
-# picked for this process.
+# THE PORT THE SCAFFOLD PROVED FREE IS NOT THE PORT NGINX BINDS
+# -------------------------------------------------------------
+# gen_rand_port() (Util.pm) probes a candidate with LocalAddr => $ServerAddr,
+# i.e. 127.0.0.1 ONLY. The server it then generates listens on a BARE port --
+# Util.pm's template is `listen $ServerPort$listen_opts;` with no address -- so
+# nginx binds 0.0.0.0, every interface. A wildcard bind needs the port free
+# everywhere, so a loopback-scoped probe systematically over-approximates
+# availability: anything on this host holding the port on a non-loopback
+# address passes the probe and then fails the bind.
+#
+# On a shared CI runner that is not hypothetical. Observed 2026-08-17 (run
+# 32075040354): every preset assertion PASSED (278 tests, "All tests
+# successful") and the job still failed 255, because nginx could not bind
+# 0.0.0.0:34782 -- a port the scaffold had just proved free on 127.0.0.1.
+#
+# It does not look like a race and does not behave like one. Test::Nginx
+# retries the SAME port ~20 times over 20s and then bails the whole file set;
+# it never re-draws. So a stable off-loopback holder is a stable failure, which
+# is why this reproduces only on a loaded runner and never on an idle box, and
+# why green reruns say nothing about it.
+#
+# Both halves are fixed here rather than upstream: probe the address nginx
+# actually binds, and RE-DRAW instead of retrying a doomed port. This runs at
+# import time -- every .t does `use Test::Nginx::Socket` (which runs Util.pm's
+# $Randomize block and sets $ServerPort) before `use CacheTurbo`, so the port
+# is already chosen and no nginx has started yet.
+#
+# The fence step in ci.yml and the "proved free" note in
+# ci/tools/lint-ci-ports.sh rest on the same loopback-only premise; both are
+# annotated to point here.
+
+# A port is usable only if BOTH the nginx listener (wildcard) and the origin
+# beside it (loopback, +1) can bind. Probing wildcard alone would still leave
+# the origin's port unchecked -- the old code never probed +1 at all, on the
+# false premise that Util.pm "reserves" $ServerPort+1..+3. It does not: that
+# comment in gen_rand_port only explains why the random RANGE starts at 1988.
+# Nothing binds, tracks or excludes +1.
+sub _pair_is_free {
+    my ($port) = @_;
+
+    return 0 if $port + 1 > 65535;
+
+    # Same scope nginx uses. No SO_REUSEADDR: a successful bind here must mean
+    # the port is genuinely unheld, not that we were allowed to share it.
+    my $wildcard = IO::Socket::INET->new(
+        LocalAddr => '0.0.0.0',
+        LocalPort => $port,
+        Proto     => 'tcp',
+        Listen    => 5,
+    ) or return 0;
+
+    my $origin = IO::Socket::INET->new(
+        LocalAddr => '127.0.0.1',
+        LocalPort => $port + 1,
+        Proto     => 'tcp',
+        Listen    => 5,
+    );
+
+    # Close in the same order they were opened; the caller re-binds immediately.
+    $wildcard->close();
+    return 0 unless defined $origin;
+    $origin->close();
+
+    return 1;
+}
+
+# Util.pm derives the servroot and its log paths from $ServerPort ONCE, at its
+# own import (Util.pm:601 `t/servroot_$ServerPort`, then $LogDir/$ErrLogFile/
+# $AccLogFile under it) -- which is before this module loads. Changing the port
+# without repointing them would leave this process writing into another job's
+# servroot_<port>, reintroducing under a new name exactly the cross-job sharing
+# the randomization exists to prevent. It would also defeat Util.pm's cleanup
+# guard, which only removes a dir matching m{/t/servroot_\d+}.
+sub _repoint_servroot {
+    my ($port) = @_;
+
+    my $root     = File::Spec->rel2abs("t/servroot_$port");
+    my $log_dir  = File::Spec->catfile($root, 'logs');
+    my $conf_dir = File::Spec->catfile($root, 'conf');
+
+    # The full set Util.pm:601-615 derives from $ServRoot. Missing one leaves
+    # this process reading or writing a path under the OLD port's servroot.
+    ## no critic (Variables::ProhibitPackageVars)
+    $Test::Nginx::Util::ServRoot   = $root;
+    $Test::Nginx::Util::LogDir     = $log_dir;
+    $Test::Nginx::Util::ErrLogFile = File::Spec->catfile($log_dir, 'error.log');
+    $Test::Nginx::Util::AccLogFile = File::Spec->catfile($log_dir, 'access.log');
+    $Test::Nginx::Util::HtmlDir    = File::Spec->catfile($root, 'html');
+    $Test::Nginx::Util::ConfDir    = $conf_dir;
+    $Test::Nginx::Util::ConfFile   = File::Spec->catfile($conf_dir, 'nginx.conf');
+    $Test::Nginx::Util::PidFile    = File::Spec->catfile($log_dir, 'nginx.pid');
+    $Test::Nginx::Util::CacheDir   = File::Spec->catfile($root, 'cache');
+    ## use critic
+
+    # NOT local: nginx is started later, from a different scope, and must
+    # inherit this. A localised assignment would revert before it ever reached
+    # the child, leaving it on the old servroot -- the exact bug this fixes.
+    ## no critic (Variables::RequireLocalizedPunctuationVars)
+    $ENV{TEST_NGINX_SERVER_ROOT} = $root;
+    ## use critic
+
+    return;
+}
+
+# Re-draw from the same range Util.pm uses (1988 .. 65534, see gen_rand_port)
+# until a pair binds. Leaves $ServerPort untouched when it is already good, so
+# the common case keeps the scaffold's own choice and its servroot_<port> name.
+#
+# This closes the TOCTOU window no further than gen_rand_port does -- the
+# sockets are closed before nginx starts either way. It removes the systematic
+# blind spot (wrong address family, unprobed origin port), not the last
+# microsecond of race, which is why the value is in the re-draw: a collision
+# now costs one more draw instead of bailing 41 files.
+sub _ensure_bindable_port {
+    my $port = server_port();
+
+    return if _pair_is_free($port);
+
+    for (1 .. 1000) {
+        my $candidate = int(rand 63546) + 1988;    # leaves room for +1
+        next unless _pair_is_free($candidate);
+
+        Test::Nginx::Util::server_port($candidate);
+        Test::Nginx::Util::server_port_for_client($candidate);
+        _repoint_servroot($candidate);
+        return;
+    }
+
+    die "CacheTurbo: no bindable (port, port+1) pair after 1000 draws\n";
+}
+
+_ensure_bindable_port();
+
+# The origin listens BESIDE nginx, on $ServerPort + 1.
 #
 # It must not be a fixed number. Under TEST_NGINX_RANDOMIZE (which is what
 # makes `prove -jN` safe -- it gives every parallel job its own random
@@ -46,10 +181,10 @@ our @EXPORT_OK = qw( ct_http_config ct_location ct_config ct_origin_port );
 # ONE thing still shared between jobs, and two jobs racing it fail with
 # "bind() to 127.0.0.1:<port> failed (98: Address already in use)".
 #
-# +1 is safe: gen_rand_port() only hands out a port it could actually bind, and
-# Test::Nginx itself reserves $ServerPort+1..+3 for its stream_server_config
-# blocks (Util.pm gen_rand_port, "NB: reserved ports for stream_server_config").
-# This suite declares no stream servers, so that reserved window is free here.
+# +1 is checked, not assumed: _pair_is_free() above proves this exact port
+# bindable before any nginx starts. Test::Nginx reserves $ServerPort+1..+3 for
+# stream_server_config blocks and this suite declares none, so the window is
+# free for the origin to claim.
 sub ct_origin_port { return server_port() + 1 }
 
 # The origin every preset file proxies to. Lives in the same nginx as the code

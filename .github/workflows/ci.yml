@@ -1,12 +1,28 @@
-# sync-sha: bfa0f9a5576c36c6c9c22aee34488b88496667b99d764624c9932a66b7798dfa
+# sync-sha: 4aa396dc1051aeb2a184176b4bcadb29135ae609f5b71e7fbad4ba4b7cd4203f
 name: CI
 
-# Single entry point for the PR suite. The six checks below used to be
-# independent workflows, each carrying its own push/pull_request trigger, so a
-# PR asked for all of them at once. On the self-hosted pool that is the wrong
-# shape: wall-clock here is dominated by jobs QUEUEING for a label-matching
-# slot, not by the jobs themselves, so six simultaneous requests just means the
-# tail waits.
+# Single entry point for the PR suite. The checks below used to be independent
+# workflows, each carrying its own push/pull_request trigger, so a PR asked for
+# all of them at once.
+#
+# SCHEDULING MODEL -- the pool is sized at 4 concurrent slots, and at that width
+# this gate is WORK-BOUND, not latency-bound. That distinction drives every
+# decision in this file, so it is worth stating precisely:
+#
+#   critical path (longest dependency chain)  =  921s
+#   total work / 4 slots                      = 1001s   <-- the binding limit
+#
+# Because total work exceeds the critical path, makespan is set by the SUM of
+# job durations, not by the longest chain. The practical consequence is
+# counter-intuitive and has already been measured:
+#
+#   *** SHARDING A JOB MAKES THIS GATE SLOWER, NOT FASTER. ***
+#
+# Splitting Runtime into 2 shards was simulated at 1433s vs 1232s unsharded;
+# 3 shards 1335s; sharding Fuzzing 1461s. Each shard re-pays the runtime
+# suite's fixture setup (redis + memcached + TLS cert generation, ~30s) and
+# there is no idle slot to absorb it. Only REMOVING work shortens this gate.
+# Do not "parallelize" anything here without re-running that arithmetic.
 #
 # LANE MAP -- measured, not estimated. Re-derive with:
 #
@@ -15,46 +31,50 @@ name: CI
 #                    (((.completedAt|fromdate)-(.startedAt|fromdate))|tostring)+"s",
 #                    .startedAt, .completedAt] | @tsv'
 #
-# All from ONE run, 31979233426 (2026-08-16, green) -- a single run rather than
-# a per-workflow best, so the numbers are mutually consistent and the queueing
-# gaps below are real:
+# Medians over runs 32065061015 and 32061694088 (2026-08-17, both green 13/13):
 #
-#   changes         8s     Build&Test  Validation 59s, Build 141s,
-#   Lint           76s                 Presets 107s, Runtime 703s
-#   CodeQL         85s     A/UBSan     Build 185s, single-process 715s,
-#   Valgrind      132s                 multi-worker 710s
-#   Scanners      210s     Fuzzing     671s
+#   changes        12s     Build&Test  Validation 50s, Build 157s,
+#   Lint           41s                 Presets 182s, Runtime 764s
+#   Scanners      174s     A/UBSan     Build 154s, single-process 725s,
+#                                      multi-worker 738s
+#   Fuzzing       ~370s (5 targets x 60s + replay; was 664s at 120s/target)
 #
-# The longest single job is the 715s ASan single-process run. Its 185s build is
-# a mandatory prerequisite, not an independent follow-up that can be moved, so
-# the irreducible lane budget is 900s. Nothing is chained after either sanitizer
-# terminal. Lanes, measured:
+# Chains, measured:
 #
-#   A  A/UBSan     (185 build -> 715/710 parallel soaks)             = 900s
-#   B  Build&Test  (141 build -> 703/107 runtime + presets)          = 844s
-#   C  Fuzzing (671s) and Security scanners (210s), side by side     = 671s
+#   A  A/UBSan     (154 build -> 725/738 parallel soaks)   = 892s
+#   B  Build&Test  (157 build -> 764/182 runtime+presets)  = 921s  <-- longest
+#   C  Fuzzing, and Security scanners beside it            = ~370s
 #
-# Lane B is the fullest non-budget lane: 844s, leaving 56s headroom. Valgrind
-# remains independent at 132s. Lint and CodeQL are hosted and deliberately have
-# no `needs:`, so they start immediately and consume no self-hosted slot.
+# WHAT IS DELIBERATELY *NOT* HERE, and where it went. Each was removed because
+# ci-deep.yml already runs a strictly stronger version of it; the PR leg was
+# paying for a weaker duplicate:
 #
-# Six ci-ephemeral runner slots were active when measured. No job waited for a
-# slot: root jobs started at 23:28:38-40Z and the path-gated jobs at 23:28:51-52Z,
-# immediately after changes completed at 23:28:48Z. Host load at re-check was
-# 0.45/0.36/0.53; compare future runs only with their own load and timestamps.
+#   Valgrind memcheck lite (60s soak, 158s job)
+#       -> ci-deep.yml `memcheck` (600s soak, + `helgrind`). ASan already
+#          covers memory errors on this leg, so the lite soak was the single
+#          cheapest cut: dropping it alone recovers 6-slot makespan at 4 slots.
+#   CodeQL (185s job)
+#       -> codeql.yml's OWN monthly cron ("47 4 5 * *") -- it was never
+#          exclusive to this gate, so nothing needed to move. Its findings
+#          overlap the scanners job on the PR leg.
 #
-# Valgrind (132s) is deliberately NOT chained behind anything: it is short,
-# independent, and chaining it would only recreate the problem lane C just had.
+# Fuzzing stays, at a reduced 60s/target budget: its recorded-crash REPLAY step
+# is the actual regression gate and is unaffected by that budget. Long
+# exploration (3600s/target) is ci-deep.yml's `fuzz` job.
 #
 # A lane is not a slot. Build&Test fans out into four jobs and A/UBSan into
-# three, so the initial peak reaches the six-slot pool even though there are
-# only three conceptual lanes.
+# three, so the initial peak still exceeds 4 and the pool serializes the tail.
 #
-# Lint and CodeQL are not laned -- no `needs:`, so they start immediately.
+# Lint is not laned -- no `needs:`, so it starts immediately.
 #
 # Follow-ups use !cancelled() so a FAILING first check does not suppress an
 # unrelated second one, and so a chain survives an earlier job being SKIPPED by
 # the changed-files gate below.
+#
+# NOTE: every job here, Lint included, resolves `runs-on` from vars.POOL and so
+# consumes a self-hosted slot. An earlier revision of this header claimed Lint
+# and CodeQL were hosted and slot-free; they were not, and the lane budget built
+# on that claim was wrong. There are no hosted jobs in this gate.
 #
 # No `push:` trigger, by repo policy: CI runs on the PR, and the merge commit is
 # identical to the tested PR head, so re-running it on merge buys nothing.
@@ -173,6 +193,13 @@ jobs:
       contents: read
     uses: ./.github/workflows/fuzzing.yml
 
+  # Scanners run on EVERY PR -- unlike asan/fuzzing they are not path-gated,
+  # because a scanner finding can come from any file (workflow YAML, scripts,
+  # docs with embedded commands), not only from src/. `needs: changes` is kept
+  # solely to inherit that job's fail-closed behaviour: `changes` exits 1 rather
+  # than fail open when it cannot compute its diff, and the explicit
+  # `result == 'success'` test means a run whose gate never produced a verdict
+  # does not silently scan anyway. A bare `!cancelled()` would lose that.
   security-scanners:
     name: Security Scanners
     needs: changes
@@ -181,35 +208,14 @@ jobs:
       contents: read
     uses: ./.github/workflows/security-scanners.yml
 
-  # --- unlaned: short, independent, self-hosted ----------------------------
-  # 132s. Chaining it behind fuzzing would put lane C at 803s and provide no
-  # slot saving on the six-runner pool, so it remains independent.
-  valgrind:
-    name: Valgrind
-    permissions:
-      contents: read
-    uses: ./.github/workflows/valgrind.yml
-
   # --- unlaned --------------------------------------------------------------
   # The ci/linter/ gate -- the same entry point .githooks/pre-commit runs, so a
   # clone that never set core.hooksPath still cannot land a lint regression.
-  # Hosted, unlaned and fastest in the suite: it needs no nginx build and takes
-  # It remains outside the runtime lanes because it has no runtime dependency.
+  # Fastest job in the suite: it needs no nginx build. It stays outside the
+  # runtime lanes because it has no runtime dependency (but it DOES take a
+  # pool slot -- see the note in the header).
   lint:
     name: Lint
     permissions:
       contents: read
     uses: ./.github/workflows/lint.yml
-
-  # --- unlaned --------------------------------------------------------------
-  codeql:
-    name: CodeQL
-    permissions:
-      # Read-only checkout; the called workflow does not write to the repo.
-      contents: read
-      # codeql.yml's analyze job declares security-events: write itself; a
-      # called workflow cannot receive more than the caller grants, so it is
-      # granted here too and nowhere wider. It is what lets the CodeQL SARIF
-      # upload reach code-scanning; every other member is called without it.
-      security-events: write  # forwarded so codeql.yml can upload its SARIF
-    uses: ./.github/workflows/codeql.yml

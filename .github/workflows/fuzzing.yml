@@ -1,7 +1,7 @@
-# sync-sha: c94188cb08f1d8c2081a71a343941f5283cc1ded2a887ea10b2c463b1def1c9b
+# sync-sha: 7eca610296200def80c9032c670a3977222d0b858e047f2305d6bb4ebff88207
 name: Fuzzing
 
-# Fast fuzz regression gate on every PR/push — 120s/target on all five parser
+# Fast fuzz regression gate on every PR/push — 60s/target on all five parser
 # fuzzers (+dict where useful), kept short so PR feedback stays quick. Long
 # discovery fuzzing (hours/target) lives in ci-deep.yml (monthly cron +
 # workflow_dispatch).
@@ -16,12 +16,15 @@ env:
   # the nginx source tree); keep in sync with the other workflows' pin.
 
 on:
-  # Path-gated for the same reason asan.yml is: this is a ~8min job and, with only
-  # 4 matching runner slots, every long job on a PR that cannot possibly affect it
-  # pushes the whole wave's wall-clock out. The targets are built from ci/fuzz/*.c
-  # plus the shims, which mirror parser code lifted out of src/ -- so a docs, memory,
-  # or unrelated-workflow PR cannot change fuzz behaviour. Keep this list in sync
-  # with what ci/fuzz/build.sh actually compiles.
+  # No triggers of its own: ci.yml is the single PR entry point, and the
+  # path gate that used to live here is now the `changes` job there (a
+  # reusable workflow cannot filter its own triggering). That gate still
+  # matters -- with only 4 runner slots, a long job on a PR that cannot
+  # possibly affect it pushes the whole wave's wall-clock out. The targets
+  # are built from ci/fuzz/*.c plus the shims, which mirror parser code
+  # lifted out of src/, so a docs or unrelated-workflow PR cannot change
+  # fuzz behaviour. Keep ci.yml's `fuzz=` alternation in sync with what
+  # ci/fuzz/build.sh actually compiles.
   workflow_call: {}
   workflow_dispatch: {}
 
@@ -34,9 +37,17 @@ permissions:
 
 jobs:
   fuzz-regression:
-    name: Fuzz regression (120s/target)
+    name: Fuzz regression (60s/target)
     runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 45
+    env:
+      # Single source for the per-target exploration budget. This is the
+      # REGRESSION gate: the recorded-crash replay step above is what proves
+      # known bugs stay fixed, and it is unaffected by this budget. Long
+      # exploration (3600s/target, dispatch-tunable) lives in ci-deep.yml's
+      # fuzz job. Kept as one env key so the value cannot drift between the
+      # step name, the echo lines and the -max_total_time flag.
+      FUZZ_SECONDS: 60
     steps:
       - name: Checkout module
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -108,7 +119,10 @@ jobs:
           [ "$failed" -eq 0 ] || { echo "❌ $failed recorded regression(s) reproduce"; exit 1; }
           echo "replayed $total recorded regression(s) across all targets, all clean"
 
-      - name: Run each target 120s
+      # Name carries the literal, not ${{ env.FUZZ_SECONDS }}: the run: block
+      # below is the single consumer of that value, and a step name is not
+      # worth an expression. Update both together if the budget changes.
+      - name: Run each target 60s
         run: |
           set -euo pipefail
           cd ci/fuzz
@@ -120,8 +134,8 @@ jobs:
                    fuzz_blob:corpus_blob:"
           for t in $targets; do
             bin="${t%%:*}"; rest="${t#*:}"; corp="${rest%%:*}"; dict="${rest#*:}"
-            echo "=== $bin over $corp (120s)${dict:+ dict=$dict} ==="
-            args="-max_total_time=120 -print_final_stats=1 -artifact_prefix=crash-${bin}-"
+            echo "=== $bin over $corp (${FUZZ_SECONDS}s)${dict:+ dict=$dict} ==="
+            args="-max_total_time=${FUZZ_SECONDS} -print_final_stats=1 -artifact_prefix=crash-${bin}-"
             [ -n "$dict" ] && args="$args -dict=$dict"
             set +e
             # shellcheck disable=SC2086
@@ -129,7 +143,7 @@ jobs:
             rc=$?
             set -e
             [ $rc -eq 0 ] || { echo "❌ $bin crash (exit $rc)"; exit 1; }
-            echo "✓ $bin: no crashes in 120s"
+            echo "✓ $bin: no crashes in ${FUZZ_SECONDS}s"
           done
 
       - name: Upload crash artifacts

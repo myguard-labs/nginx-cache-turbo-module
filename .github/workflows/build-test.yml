@@ -1,4 +1,4 @@
-# sync-sha: 465bd645531bf2df9117ebbfa9f15c5e3181cadc52893b8b869a613478873eac
+# sync-sha: 8ccd7eb9fd89a1f8cf95206886bb70ddce97ae3095af884aaf041155ccdf4e93
 name: Build & Test
 
 # Runner labels live in the POOL repository variable. Every checked-in selector
@@ -414,8 +414,20 @@ jobs:
       # preset, which is the worst kind of CI flake to chase.
       #
       # Cheapest correct fix: pre-bind the sibling bands for the life of this
-      # job. gen_rand_port only returns a port it could bind itself, so a
-      # holder socket makes those ports unpickable rather than merely unlucky.
+      # job, so those ports are unpickable rather than merely unlucky.
+      #
+      # BIND SCOPE IS LOAD-BEARING. The generated nginx server listens on a
+      # BARE port (Test::Nginx Util.pm `listen $ServerPort;`), i.e. 0.0.0.0.
+      # A fence bound to 127.0.0.1 does not stop a wildcard bind from taking
+      # the same port, so fencing loopback-only left exactly the collision
+      # this step exists to prevent. Fence the same scope nginx uses.
+      #
+      # The converse half of the same asymmetry -- gen_rand_port PROBES only
+      # 127.0.0.1 while nginx binds 0.0.0.0, so a "proved free" port can still
+      # fail to bind -- is fixed suite-side in ci/t/lib/CacheTurbo.pm, which
+      # re-probes on the wildcard address and re-draws. Read that header
+      # before changing either half. Observed as run 32075040354: 278 preset
+      # assertions passed and the job still failed on bind(0.0.0.0:34782).
       - name: Fence sibling port bands off from RANDOMIZE
         run: |
           python3 - <<'PY' &
@@ -425,15 +437,18 @@ jobs:
           for base in (18880, 18944, 19008, 19072, 19136, 19200):
               for p in range(base, base + 64):
                   s = socket.socket()
-                  s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                  # No SO_REUSEADDR: holding the port is the entire point, and
+                  # sharing it would make the fence a no-op against a wildcard
+                  # binder.
                   try:
-                      s.bind(("127.0.0.1", p))
+                      s.bind(("0.0.0.0", p))
                       s.listen(1)
                       holders.append(s)
                   except OSError:
                       # Already held -- by a live sibling job, or by a stale
                       # listener its own sweep will clear. Either way this job
-                      # must not pick it, and gen_rand_port already cannot.
+                      # must not pick it, and the suite's own wildcard probe
+                      # will now decline it too.
                       s.close()
           # Outlive the prove step; the runner reaps us at job teardown.
           time.sleep(3600)

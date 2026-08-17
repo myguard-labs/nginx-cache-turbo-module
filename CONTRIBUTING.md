@@ -69,7 +69,7 @@ The gates it calls, and the classes of bug they exist to catch:
 
 - **Lint** (`lint.yml`) — the same `ci/linter/run-all.sh` your commit hook
   runs, so a clone that never enabled the hook still cannot land a regression.
-  Hosted, and the fastest feedback in the suite.
+  The fastest feedback in the suite.
 - **Build & Test** — builds the module against current nginx (and, where
   applicable, Angie) and runs the unit tests under **ASan/UBSan**.
   AddressSanitizer and UndefinedBehaviorSanitizer are compiler
@@ -81,15 +81,25 @@ The gates it calls, and the classes of bug they exist to catch:
   (`cert-*`, `clang-analyzer-security.*`) and semgrep over the module
   sources. Static analysis: it reads the code without running it and
   flags dangerous patterns.
-- **Fuzzing** (`fuzzing.yml`) — a ~120-second libFuzzer regression run over
-  the module's input parsers. Fuzzing feeds a parser millions of mutated
-  inputs and watches for crashes. Short on PRs so feedback stays fast.
-- **Valgrind** (`valgrind.yml`) — a short Memcheck soak. Valgrind executes
-  the code in an emulated CPU and reports every invalid read/write and
-  every leaked byte.
+- **Fuzzing** (`fuzzing.yml`) — a libFuzzer regression run over the module's
+  input parsers: every recorded past crash is replayed, then each of the five
+  targets explores for 60 seconds. Fuzzing feeds a parser millions of mutated
+  inputs and watches for crashes. The replay step is the actual regression
+  gate; the 60s budget is kept short so PR feedback stays fast.
 
+Two checks are deliberately **not** on the PR lane, because the runner pool is
+sized at 4 concurrent slots and at that width the gate is limited by total work
+rather than by its longest chain — so every job removed is wall-clock saved on
+every PR. Both were strict subsets of coverage that still runs:
+
+- **Valgrind** (`valgrind.yml`) — a short Memcheck soak, now
+  `workflow_dispatch` only. ASan/UBSan already covers memory errors on the PR
+  leg, and `ci-deep.yml` runs the full 600s Memcheck soak. Dispatch it by hand
+  for a quick check on a suspect branch.
 - **CodeQL** (`codeql.yml`) — semantic analysis over the module's own
-  translation units, publishing to the repository's code-scanning alerts.
+  translation units, publishing to the repository's code-scanning alerts. It
+  keeps its own monthly `schedule:` and is no longer called from `ci.yml`,
+  where it overlapped the security-scanners job.
 
 The expensive versions of these — hours-long fuzzing per target, full
 Memcheck **and** Helgrind (thread-race detection) soaks, and the
