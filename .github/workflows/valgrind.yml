@@ -1,9 +1,22 @@
-# sync-sha: 9816615f426832fd56be361696ee05ef6c31550868b06c16a51c98f5e56f7fbb
+# sync-sha: aa4d54fc3f5ce13c5128637d500b6c6a8c392249e0e745ef1a36c5c45f56a79f
 name: Valgrind
 
-# Valgrind memcheck lite soak (60s @ 4 conc) on every PR/push — cheap dynamic
-# gate kept short so PR feedback stays quick. The full 600s memcheck + helgrind
-# soaks live in ci-deep.yml (monthly cron + workflow_dispatch).
+# Valgrind memcheck lite soak (60s @ 4 conc) — ON-DEMAND ONLY.
+#
+# This is NO LONGER part of the PR gate. It was removed from ci.yml when the
+# runner pool was sized at 4 concurrent slots: at that width the gate is
+# work-bound (total work / 4 > critical path), so its 158s of work cost real
+# wall-clock on every PR, and dropping this one job alone recovered 6-slot
+# makespan at 4 slots. It was the cheapest cut available because it is a strict
+# subset of coverage that runs elsewhere:
+#
+#   - ASan/UBSan still runs on every PR and covers memory errors on that leg;
+#   - ci-deep.yml runs the full 600s `memcheck` AND `helgrind` soaks monthly.
+#
+# Kept (rather than deleted) as a workflow_dispatch entry point: a 60s soak is
+# the right tool for a quick manual check on a suspect branch without waiting
+# for a full ci-deep run. Retaining workflow_call also means re-adding it to a
+# gate is a one-line change if the pool ever widens.
 #
 # Action pins (keep in sync with build-test.yml header):
 # actions/checkout@v5        -> 93cb6efe18208431cddfb8368fd83d5badbf9bfd
