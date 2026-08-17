@@ -1,4 +1,4 @@
-# sync-sha: b1b69889290aacd2d1e05ab7a3eb3e70929d58938714376706f7d277d94557f7
+# sync-sha: e60a94831b238fe98c7a11317b9c9c054484841b0a488e8a4efebc89e4326679
 name: CI Deep
 
 # Exhaustive dynamic analysis — monthly cron + on-demand only, NEVER on PR.
@@ -425,7 +425,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             build-essential ccache curl eatmydata libpcre2-dev libssl-dev mold pkg-config \
-            valgrind zlib1g-dev
+            redis-server memcached valgrind zlib1g-dev
       - name: Restore build caches
         uses: ./.github/actions/build-cache
         with:
@@ -433,9 +433,17 @@ jobs:
           nginx-version: ${{ env.NGINX_VERSION }}
       - name: Build debug nginx + cache-turbo module
         run: bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" debug
-      - name: Memcheck soak (600s @ 4 conc, WITH suppressions)
+      - name: Memcheck soak (600s @ 4 conc, WITH suppressions, L1+L2)
         env:
           USE_VALGRIND: "1"
+          # apt's redis-server/memcached start as systemd services on their
+          # package defaults (127.0.0.1:6379, 127.0.0.1:11211) -- same
+          # binaries the runtime-suite jobs above already install. Setting
+          # both here is what makes soak.sh build the L2 vhost instead of
+          # its L1-only default; see soak.sh's own header for the gate this
+          # trips if either tier never actually gets hit.
+          REDIS: "127.0.0.1:6379"
+          MEMCACHED: "127.0.0.1:11211"
         run: |
           B="$GITHUB_WORKSPACE/.build/nginx-${NGINX_VERSION}/objs"
           MODULE="$B/ngx_http_cache_turbo_module.so" \
@@ -480,7 +488,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             build-essential ccache curl eatmydata libpcre2-dev libssl-dev mold pkg-config \
-            valgrind zlib1g-dev
+            redis-server memcached valgrind zlib1g-dev
       - name: Restore build caches
         uses: ./.github/actions/build-cache
         with:
@@ -488,9 +496,14 @@ jobs:
           nginx-version: ${{ env.NGINX_VERSION }}
       - name: Build debug nginx + cache-turbo module
         run: bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" debug
-      - name: Helgrind soak (600s @ 4 conc, --error-exitcode=99, WITH suppressions)
+      - name: Helgrind soak (600s @ 4 conc, --error-exitcode=99, WITH suppressions, L1+L2)
         env:
           USE_HELGRIND: "1"
+          # See the memcheck job above: same apt packages, same defaults,
+          # same reason -- without these two, soak.sh silently builds the
+          # L1-only vhost and the L2 drivers never run under helgrind.
+          REDIS: "127.0.0.1:6379"
+          MEMCACHED: "127.0.0.1:11211"
         run: |
           B="$GITHUB_WORKSPACE/.build/nginx-${NGINX_VERSION}/objs"
           MODULE="$B/ngx_http_cache_turbo_module.so" \
