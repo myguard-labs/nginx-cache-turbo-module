@@ -134,6 +134,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_redis_connect_backoff_disabled_never_arms(ng, origin) # S231-L2-BACKOFF
     test_cold_wait_poll_timer_no_uaf(ng, origin)                # S231-COLDWAIT-UAF
     test_memcached_connect_backoff_fails_fast(ng, origin)       # S231-L2-BACKOFF
+    test_memcached_replyless_peer_arms_backoff(ng)              # release audit
     test_valid_dup_status_warns(ng)
     test_tag_without_l2_warns(ng)
     test_tag_without_l2_but_surrogate_key_no_warn(ng)
@@ -330,6 +331,7 @@ def run_all(ng: Nginx, origin: Origin,
         test_l2_negative_ttl_rejects_out_of_range(ng)              # L13
         test_l2_keepalive_reuse(ng, origin, redis)
         test_l2_keepalive_db_isolation(ng, origin, redis)
+        test_redis_dirty_reply_not_pooled(ng)                 # exact RESP gate
         test_l2_cross_instance_fill(ng, origin, redis)
         test_l2_purge_key_drops_l2(ng, origin, redis)
         test_l2_expired_consults_l2(ng, origin, redis)

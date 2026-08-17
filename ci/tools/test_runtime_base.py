@@ -776,6 +776,112 @@ class RedisServer:
         return RedisMonitor(self)
 
 
+class DirtyRedis:
+    """A fake Redis that appends a partial RESP frame after every reply.
+
+    GET returns a nil bulk and writes return ``+OK``; both carry one trailing
+    ``+`` byte. A correct keepalive driver consumes an exact frame boundary and
+    closes these connections. ``accepts`` makes accidental pooling observable.
+    """
+
+    def __init__(self, port: int) -> None:
+        self.port = port
+        self._sock: socket.socket | None = None
+        self._thread: threading.Thread | None = None
+        self._running = False
+        self._lock = threading.Lock()
+        self.accepts = 0
+
+    def start(self) -> None:
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind(("127.0.0.1", self.port))
+        self._sock.listen(32)
+        self._running = True
+        self._thread = threading.Thread(target=self._accept_loop, daemon=True)
+        self._thread.start()
+        wait_port(self.port)
+
+    @staticmethod
+    def _pop_command(buf: bytes) -> tuple[bytes, bytes] | None:
+        """Return (command name, remaining bytes) for one complete RESP array."""
+        line_end = buf.find(b"\r\n")
+        if line_end < 0 or not buf.startswith(b"*"):
+            return None
+        try:
+            count = int(buf[1:line_end])
+        except ValueError:
+            return None
+        pos = line_end + 2
+        command = b""
+        for i in range(count):
+            if pos >= len(buf) or buf[pos:pos + 1] != b"$":
+                return None
+            line_end = buf.find(b"\r\n", pos)
+            if line_end < 0:
+                return None
+            try:
+                length = int(buf[pos + 1:line_end])
+            except ValueError:
+                return None
+            pos = line_end + 2
+            if length < 0 or len(buf) - pos < length + 2:
+                return None
+            if buf[pos + length:pos + length + 2] != b"\r\n":
+                return None
+            if i == 0:
+                command = buf[pos:pos + length].upper()
+            pos += length + 2
+        return command, buf[pos:]
+
+    def _accept_loop(self) -> None:
+        sock = self._sock
+        assert sock is not None
+        while self._running:
+            try:
+                conn, _ = sock.accept()
+            except OSError:
+                return
+            with self._lock:
+                self.accepts += 1
+            threading.Thread(target=self._serve, args=(conn,), daemon=True).start()
+
+    def _serve(self, conn: socket.socket) -> None:
+        buf = b""
+        try:
+            conn.settimeout(10)
+            while self._running:
+                parsed = self._pop_command(buf)
+                while parsed is None:
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        return
+                    buf += chunk
+                    parsed = self._pop_command(buf)
+                command, buf = parsed
+                reply = b"$-1\r\n+" if command == b"GET" else b"+OK\r\n+"
+                conn.sendall(reply)
+        except OSError:
+            return
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def stop(self) -> None:
+        self._running = False
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+            self._sock = None
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+            self._thread = None
+
+
 class RedisMonitor:
     """Background reader of `MONITOR` output for one RedisServer. Requires its
     own raw socket (redis-cli MONITOR blocks the process), authenticating first
@@ -1033,6 +1139,75 @@ class DirtyMemcached:
                     conn.sendall(b"OK\r\n")
                 else:
                     conn.sendall(b"ERROR\r\n")
+        except OSError:
+            return
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def stop(self) -> None:
+        self._running = False
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+            self._sock = None
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+            self._thread = None
+
+
+class DropReplyMemcached:
+    """A fake peer that reads one complete memcached command, then closes.
+
+    The successful client-side send followed by a replyless EOF is the ordering
+    that proves connect backoff stays armed until a real reply byte arrives.
+    ``commands`` excludes the readiness probe, which connects without sending.
+    """
+
+    def __init__(self, port: int) -> None:
+        self.port = port
+        self._sock: socket.socket | None = None
+        self._thread: threading.Thread | None = None
+        self._running = False
+        self._lock = threading.Lock()
+        self.commands = 0
+
+    def start(self) -> None:
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind(("127.0.0.1", self.port))
+        self._sock.listen(16)
+        self._running = True
+        self._thread = threading.Thread(target=self._accept_loop, daemon=True)
+        self._thread.start()
+        wait_port(self.port)
+
+    def _accept_loop(self) -> None:
+        sock = self._sock
+        assert sock is not None
+        while self._running:
+            try:
+                conn, _ = sock.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._drop_after_command, args=(conn,),
+                             daemon=True).start()
+
+    def _drop_after_command(self, conn: socket.socket) -> None:
+        buf = b""
+        try:
+            conn.settimeout(5)
+            while b"\r\n" not in buf:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    return
+                buf += chunk
+            with self._lock:
+                self.commands += 1
         except OSError:
             return
         finally:

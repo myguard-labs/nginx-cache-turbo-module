@@ -1216,6 +1216,29 @@ def test_mc_dirty_reply_not_pooled(ng: Nginx, origin: Origin) -> None:
         dirty.stop()
 
 
+def test_redis_dirty_reply_not_pooled(ng: Nginx) -> None:
+    """Redis GET and write-drain keepalive require one exact RESP boundary.
+
+    The fake peer returns a valid frame plus one byte of the next frame. Each
+    distinct cold key drives GET -> origin -> SET. Both replies are dirty, so
+    every operation must close instead of pooling the socket.
+    """
+    dirty = DirtyRedis(ng.port + PORT_OFFSETS["redis_dirty_reply"])
+    dirty.start()
+    try:
+        n = 10
+        stamp = time.time()
+        for i in range(n):
+            s, _, _ = fetch(ng.port, f"/redisdirty/d-{stamp}-{i}")
+            assert s == 200, f"dirty Redis request {i} failed with {s}"
+
+        assert wait_for(lambda: dirty.accepts >= 2 * n, timeout=3.0), (
+            f"dirty Redis connections were reused ({dirty.accepts} accepts for "
+            f"{n} cold keys / {2 * n} GET+SET operations)")
+    finally:
+        dirty.stop()
+
+
 def test_mc_keepalive_server_close_survives(ng: Nginx, origin: Origin,
                                             mc: MemcachedServer) -> None:
     """D-O1: an idle memcached keepalive connection whose server drops it must

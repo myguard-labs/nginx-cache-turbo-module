@@ -90,6 +90,8 @@ __DATA__
 --- config eval: $::Config
 --- request eval
 ["GET /api/threads/1/", "GET /api/threads/1/"]
+--- more_headers eval
+["XF-Api-Key: client-a", "XF-Api-Key: client-b"]
 --- response_headers eval
 [qq{X-Cache: }, qq{X-Cache: }]
 --- error_code eval

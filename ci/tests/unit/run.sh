@@ -64,6 +64,17 @@ bash "$DIR/extract_key_fold.sh"
 FUZZ_DIR="$DIR/../../fuzz"
 BLOB_CC="${BLOB_CC:-clang}"
 if command -v "$BLOB_CC" >/dev/null 2>&1; then
+    # --- Redis GET RESP exact-boundary fixtures --------------------------
+    # The production parser is extracted verbatim. Pin malformed payload
+    # delimiters and trailing partial replies so neither can become a HIT or
+    # make a keepalive connection look clean again.
+    echo "--- Redis RESP exact-boundary fixtures (ASan/UBSan) ---"
+    bash "$FUZZ_DIR/extract_parser.sh"
+    "$BLOB_CC" -g -O1 -fsanitize=address,undefined \
+        -DNGX_HTTP_CACHE_TURBO_RESP_FIXTURES=1 -I"$FUZZ_DIR" \
+        "$FUZZ_DIR/fuzz_resp_parser.c" -o "$DIR/resp_parser_fixtures"
+    "$DIR/resp_parser_fixtures"
+
     # --- bounded/fail-closed auto-classification fixtures -----------------
     # Exercise the Cookie cap/work oracle and arg allocation-failure branch
     # against the same extracted production code as fuzz_auto_classify.

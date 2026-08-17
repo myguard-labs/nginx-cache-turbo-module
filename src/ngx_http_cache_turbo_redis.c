@@ -2195,7 +2195,14 @@ ngx_http_cache_turbo_redis_read_drain(ngx_event_t *rev)
             continue;                      /* need more reply bytes */
         }
 
-        op->clean = 1;                     /* all replies consumed: poolable */
+        if (p != last) {
+            /* Extra buffered bytes are an unexpected partial/additional reply.
+             * Closing is the only safe boundary; pooling would discard them. */
+            ngx_http_cache_turbo_redis_op_done(op);
+            return;
+        }
+
+        op->clean = 1;                     /* exact reply boundary: poolable */
         ngx_http_cache_turbo_redis_op_done(op);
         return;
     }
@@ -2336,13 +2343,13 @@ ngx_http_cache_turbo_redis_resp_len(u_char *p, size_t n, ngx_int_t *len)
 
 /*
  * Parse an accumulated GET reply in op->rbuf[0..op->rlen]. Returns:
- *   NGX_OK       - bulk string complete; blob/blob_len point into rbuf
+ *   NGX_OK       - one exact bulk-string frame; blob/blob_len point into rbuf
  *   NGX_AGAIN    - need more bytes
  *   NGX_DECLINED - DEFINITIVE miss: a well-formed `$-1` nil. The key is absent.
  *   NGX_ERROR    - the reply was not a usable answer: a Redis error reply, an
  *                  unexpected type byte, an unparseable length, or an oversized
- *                  payload. The request still proceeds as a miss, but L2's answer
- *                  is UNKNOWN.
+ *                  payload, delimiter, or trailing bytes. The request still
+ *                  proceeds as a miss, but L2's answer is UNKNOWN.
  *
  * ⚠ The NGX_DECLINED / NGX_ERROR split is load-bearing, not cosmetic: only
  * NGX_DECLINED may arm the L13 negative memo. Collapsing them (as this function
@@ -2382,6 +2389,9 @@ ngx_http_cache_turbo_redis_parse(ngx_http_cache_turbo_redis_op_t *op,
     switch (ngx_http_cache_turbo_redis_resp_len(p + 1, crlf - (p + 1), &len)) {
 
     case NGX_DONE:
+        if (crlf + 2 != end) {
+            return NGX_ERROR;                  /* trailing bytes: not poolable */
+        }
         return NGX_DECLINED;               /* $-1 nil: definitive miss */
 
     case NGX_OK:
@@ -2400,7 +2410,12 @@ ngx_http_cache_turbo_redis_parse(ngx_http_cache_turbo_redis_op_t *op,
     if (end - p < len + 2) {               /* payload + trailing CRLF */
         return NGX_AGAIN;
     }
-
+    if (p[len] != CR || p[len + 1] != LF) {
+        return NGX_ERROR;                  /* malformed payload delimiter */
+    }
+    if (end - p != len + 2) {
+        return NGX_ERROR;                  /* trailing bytes: not poolable */
+    }
     *blob = p;
     *blob_len = (size_t) len;
     return NGX_OK;
