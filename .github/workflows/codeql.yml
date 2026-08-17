@@ -1,9 +1,8 @@
-# sync-sha: 8cd4f1c754afa8d5aa1e3565118dba329c2cc2e9f29f486b01ab1ad464355847
+# sync-sha: 3ad5c08b17231c03a830a8ec18b5e8e2f4444aecc85346605a66067a60b2fb35
 name: CodeQL
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  NGINX_VERSION: "1.31.1"
 
 on:
   schedule:
@@ -35,6 +34,9 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
+
+      - name: Load version pins
+        run: bash .github/scripts/load-versions.sh
 
       - name: Install build dependencies
         run: |

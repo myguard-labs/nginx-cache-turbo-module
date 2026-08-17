@@ -1,4 +1,4 @@
-# sync-sha: 340f0b3bb4bc4f24151f1f0b7e2f46dc74ef0bfe111f5c9ce279551012017a1e
+# sync-sha: 9816615f426832fd56be361696ee05ef6c31550868b06c16a51c98f5e56f7fbb
 name: Valgrind
 
 # Valgrind memcheck lite soak (60s @ 4 conc) on every PR/push — cheap dynamic
@@ -10,7 +10,6 @@ name: Valgrind
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  NGINX_VERSION: "1.31.1"
 
 on:
   workflow_call: {}
@@ -33,6 +32,9 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
+
+      - name: Load version pins
+        run: bash .github/scripts/load-versions.sh
 
       - name: Install dependencies
         run: |

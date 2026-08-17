@@ -1,4 +1,4 @@
-# sync-sha: 94a96e4ae1fdb7b38bb726912f6138a278567698248b49e5ce3eded270ff846e
+# sync-sha: c94188cb08f1d8c2081a71a343941f5283cc1ded2a887ea10b2c463b1def1c9b
 name: Fuzzing
 
 # Fast fuzz regression gate on every PR/push — 120s/target on all five parser
@@ -14,7 +14,6 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   # Only used to namespace the ccache cache key (the fuzz targets do not link
   # the nginx source tree); keep in sync with the other workflows' pin.
-  NGINX_VERSION: "1.31.1"
 
 on:
   # Path-gated for the same reason asan.yml is: this is a ~8min job and, with only
@@ -43,6 +42,9 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
+
+      - name: Load version pins
+        run: bash .github/scripts/load-versions.sh
 
       - name: Install clang + libFuzzer
         run: |

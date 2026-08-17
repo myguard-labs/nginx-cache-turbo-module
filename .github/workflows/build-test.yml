@@ -1,4 +1,4 @@
-# sync-sha: bfdbf5af76a97c5308abde3d09016a834d521d0da38d273b9ec6980091f6e2f3
+# sync-sha: 465bd645531bf2df9117ebbfa9f15c5e3181cadc52893b8b869a613478873eac
 name: Build & Test
 
 # Runner labels live in the POOL repository variable. Every checked-in selector
@@ -6,7 +6,6 @@ name: Build & Test
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  NGINX_VERSION: "1.31.1"
 
 on:
   workflow_call: {}
@@ -178,6 +177,9 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Load version pins
+        run: bash .github/scripts/load-versions.sh
+
       - name: Install build dependencies
         run: |
           sudo apt-get update
@@ -199,6 +201,9 @@ jobs:
           build=".build/nginx-${NGINX_VERSION}/objs"
           test -x "$build/nginx"
           test -f "$build/ngx_http_cache_turbo_module.so"
+
+      - name: Report compiler-cache effectiveness
+        run: ccache --show-stats
 
       - name: No hiredis dependency (native Redis driver)
         run: |
@@ -309,6 +314,9 @@ jobs:
             fuser -k -TERM "${p}/tcp" 2>/dev/null || true
           done
           sleep 1
+
+      - name: Verify runtime port band
+        run: ci/tools/max-port.sh "$TEST_BASE_PORT"
 
       - name: Run runtime suite
         # Wrapped in ci-hang-guard.sh, same pattern as asan.yml: 749s worst-observed

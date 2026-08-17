@@ -1,4 +1,4 @@
-# sync-sha: 4ade941ae867e5f4529f2ae91914c3b7159e2a770fe0c94f045b5be5989c62d1
+# sync-sha: b8a7284f358f61c536e208737c93a35b968cdac1cee010deb0ab9edd56a733bb
 name: CI Deep
 
 # Exhaustive dynamic analysis — monthly cron + on-demand only, NEVER on PR.
@@ -23,7 +23,6 @@ name: CI Deep
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  NGINX_VERSION: "1.31.1"
 
 on:
   schedule:
@@ -51,6 +50,81 @@ permissions:
   contents: read
 
 jobs:
+  build-flavors:
+    name: Compatibility (${{ matrix.flavor }} ${{ matrix.label }})
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
+    timeout-minutes: 45
+    env:
+      TEST_BASE_PORT: 19328
+    strategy:
+      fail-fast: false
+      # The matrix deliberately reuses one verified band, so its legs are
+      # serialized instead of racing three Test::Nginx servers on it.
+      max-parallel: 1
+      matrix:
+        include:
+          - flavor: nginx
+            version_key: NGINX_MAINLINE
+            label: mainline
+          - flavor: nginx
+            version_key: NGINX_STABLE
+            label: stable
+          - flavor: angie
+            version_key: ANGIE_VERSION
+            label: angie
+    steps:
+      - name: Checkout module
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - name: Load version pins
+        run: bash .github/scripts/load-versions.sh
+
+      - name: Resolve matrix version
+        env:
+          VERSION_KEY: ${{ matrix.version_key }}
+        run: |
+          value="${!VERSION_KEY:-}"
+          [ -n "$value" ] || { echo "::error::$VERSION_KEY is not pinned"; exit 1; }
+          echo "MATRIX_VERSION=$value" >> "$GITHUB_ENV"
+
+      - name: Install build and Test::Nginx dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential ccache cpanminus curl eatmydata \
+            libio-socket-ssl-perl libpcre2-dev libssl-dev mold zlib1g-dev
+          perl -MTest::Nginx::Socket -e1 2>/dev/null || sudo cpanm --notest Test::Nginx
+
+      - name: Restore build caches
+        uses: ./.github/actions/build-cache
+        with:
+          mode: debug
+          flavor: ${{ matrix.flavor }}
+          nginx-version: ${{ env.MATRIX_VERSION }}
+
+      - name: Build server and module
+        env:
+          MATRIX_FLAVOR: ${{ matrix.flavor }}
+        run: |
+          bash ci/tools/ci-build.sh "$MATRIX_FLAVOR" "$MATRIX_VERSION" debug
+          objs="$GITHUB_WORKSPACE/.build/${MATRIX_FLAVOR}-${MATRIX_VERSION}/objs"
+          case "$MATRIX_FLAVOR" in angie) server=angie ;; *) server=nginx ;; esac
+          test -x "$objs/$server"
+          test -f "$objs/ngx_http_cache_turbo_module.so"
+          echo "TEST_NGINX_BINARY=$objs/$server" >> "$GITHUB_ENV"
+          echo "TEST_NGINX_LOAD_MODULES=$objs/ngx_http_cache_turbo_module.so" >> "$GITHUB_ENV"
+
+      - name: Verify compatibility port band
+        run: ci/tools/max-port.sh "$TEST_BASE_PORT"
+
+      - name: Run Test::Nginx compatibility suite
+        env:
+          TEST_NGINX_PORT: ${{ env.TEST_BASE_PORT }}
+          TEST_NGINX_SERVROOT: ${{ github.workspace }}/t/servroot-compat
+          TEST_NGINX_TIMEOUT: 20
+        run: PATH="$(dirname "$TEST_NGINX_BINARY"):$PATH" prove -r ci/t/
+
   fuzz:
     name: Fuzz (all targets, long)
     runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
@@ -60,6 +134,9 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
+
+      - name: Load version pins
+        run: bash .github/scripts/load-versions.sh
 
       - name: Install clang + libFuzzer
         run: |
@@ -174,7 +251,6 @@ jobs:
     runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 20
     env:
-      LEGACY_NGINX_VERSION: "1.22.1"
       # AUD-CIPORT1: own 64-wide port band, distinct from every other
       # runtime-bearing job on this shared runner. See
       # ci/tools/lint-ci-ports.sh (fails CI on a collision or a hardcoded sweep).
@@ -184,6 +260,9 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
+
+      - name: Load version pins
+        run: bash .github/scripts/load-versions.sh
 
       - name: Install build and runtime dependencies
         run: |
@@ -210,6 +289,9 @@ jobs:
             fuser -k -TERM "${p}/tcp" 2>/dev/null || true
           done
           sleep 1
+
+      - name: Verify legacy runtime port band
+        run: ci/tools/max-port.sh "$TEST_BASE_PORT"
 
       - name: Run runtime suite against legacy nginx
         run: |
@@ -259,6 +341,9 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
+
+      - name: Load version pins
+        run: bash .github/scripts/load-versions.sh
 
       - name: Install build dependencies
         run: |
@@ -323,6 +408,10 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
+
+      - name: Load version pins
+        run: bash .github/scripts/load-versions.sh
+
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -374,6 +463,10 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
+
+      - name: Load version pins
+        run: bash .github/scripts/load-versions.sh
+
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -441,6 +534,9 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Load version pins
+        run: bash .github/scripts/load-versions.sh
+
       - name: Install build and runtime dependencies
         run: |
           sudo apt-get update
@@ -466,6 +562,9 @@ jobs:
             fuser -k -TERM "${p}/tcp" 2>/dev/null || true
           done
           sleep 1
+
+      - name: Verify ASan soak port band
+        run: ci/tools/max-port.sh "$TEST_BASE_PORT"
 
       - name: Run multi-worker fault-injection suite N times (fail-fast)
         env:
@@ -529,6 +628,10 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0  # gitleaks scans git history
+
+      - name: Load version pins
+        run: bash .github/scripts/load-versions.sh
+
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -654,11 +757,20 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Load version pins
+        run: bash .github/scripts/load-versions.sh
+
       - name: Install build and runtime dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential ccache curl eatmydata gcovr \
-            libpcre2-dev libssl-dev mold redis-server memcached zlib1g-dev
+          sudo apt-get install -y build-essential ccache curl eatmydata \
+            libpcre2-dev libssl-dev mold python3-venv redis-server memcached zlib1g-dev
+          # Ubuntu's gcovr 6 parser rejects GCC 14's `10000-block` records.
+          # Keep the report reproducible and new enough to read the compiler's
+          # gcov output instead of relying on the runner image's apt version.
+          python3 -m venv "$RUNNER_TEMP/gcovr"
+          "$RUNNER_TEMP/gcovr/bin/pip" install --disable-pip-version-check gcovr==7.2
+          echo "$RUNNER_TEMP/gcovr/bin" >> "$GITHUB_PATH"
 
       - name: Restore build caches
         uses: ./.github/actions/build-cache
@@ -677,6 +789,9 @@ jobs:
             fuser -k -TERM "${p}/tcp" 2>/dev/null || true
           done
           sleep 1
+
+      - name: Verify coverage port band
+        run: ci/tools/max-port.sh "$TEST_BASE_PORT"
 
       - name: Build instrumented, run suite, report
         # coverage.sh drives all three steps (ci-build.sh coverage -> runtime
