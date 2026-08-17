@@ -343,7 +343,7 @@ The prefix needs a `/` or `.` boundary after it, so a catalog URL like
 
 ## Origin failure: stale-if-error
 
-By default this module serves a stale cached copy when the origin returns 5xx; nginx turns a refused connection into a 502 and a hung one into a 504, so a dead origin is covered. Once the cached copy's TTL has expired, `cache_turbo_keep_stale` supplies the grace window — it defaults to `24h`, and `cache_turbo_keep_stale off` removes it so errors surface normally. Most CMS/app stacks emit no `stale-if-error` of their own. `cache_turbo_use_stale` selects which statuses count as "down" (default: every 5xx); naming tokens replaces the default rather than extending it. Nothing was ever cached for a URL ⇒ nothing to serve; `error_page 502 503 504 /maintenance.html` is the nicer failure.
+By default this module can serve a stale cached copy when the origin returns 5xx; nginx turns a refused connection into a 502 and a hung one into a 504, so a dead origin is covered. If the response supplies no `stale-if-error`, `cache_turbo_keep_stale` provides the fallback window — it defaults to `24h`, and `cache_turbo_keep_stale off` removes that fallback. An honored response `stale-if-error` takes precedence, while an honored `must-revalidate` forbids stale serving. `cache_turbo_use_stale` selects which statuses count as "down" (default: every 5xx); listing any tokens replaces the default rather than extending it. Nothing was ever cached for a URL ⇒ nothing to serve; `error_page 502 503 504 /maintenance.html` is the final fallback.
 
 ```nginx
 cache_turbo_keep_stale    2h;
