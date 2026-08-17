@@ -1,0 +1,60 @@
+# sync-sha: 4ce150ea38729696deebe2a775367479cf61550c6e1899b52eac9b718480488f
+name: Bump versions
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+on:
+  schedule:
+    - cron: "0 4 * * 1"
+  workflow_dispatch: {}
+
+concurrency:
+  group: bump-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  bump:
+    name: Refresh upstream pins
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Resolve versions and verified digests
+        env:
+          GITHUB_TOKEN: ${{ secrets.BUMP_PR_TOKEN }}
+        run: bash .github/scripts/compute-versions.sh
+
+      - name: Open update PR
+        env:
+          GH_TOKEN: ${{ secrets.BUMP_PR_TOKEN }}
+          BUMP_PR_TOKEN: ${{ secrets.BUMP_PR_TOKEN }}
+        run: |
+          set -euo pipefail
+          git diff --quiet -- .github/versions.env && { echo "pins already current"; exit 0; }
+          branch="bump/versions-$(date -u +%Y%m%d)"
+          git config user.name myguard-bump-bot
+          git config user.email actions@users.noreply.github.com
+          git switch -c "$branch"
+          git add .github/versions.env
+          git commit -S -m "chore: refresh upstream version pins"
+          askpass="$(mktemp)"
+          trap 'rm -f "$askpass"' EXIT
+          # Expanded when the generated helper runs, not while it is written.
+          # shellcheck disable=SC2016
+          printf '%s\n' '#!/bin/sh' 'case "$1" in Username*) echo x-access-token ;; *) printf "%s" "$BUMP_PR_TOKEN" ;; esac' > "$askpass"
+          chmod 700 "$askpass"
+          GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 \
+            git push --force-with-lease origin "$branch"
+          existing="$(gh pr list -R myguard-labs/nginx-cache-turbo-module --head "$branch" --state open --json number --jq '.[0].number')"
+          [ -n "$existing" ] || gh pr create -R myguard-labs/nginx-cache-turbo-module --base main --head "$branch" \
+            --title "chore: refresh upstream version pins" \
+            --body "Automated weekly refresh of version and SHA-256 pins."

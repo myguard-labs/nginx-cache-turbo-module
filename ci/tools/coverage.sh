@@ -5,7 +5,7 @@
 #
 #   ci/tools/coverage.sh [flavor] [version]
 #     flavor : nginx | angie   (default nginx)
-#     version: upstream version (default 1.31.1)
+#     version: upstream version (default .github/versions.env NGINX_VERSION)
 #
 # Steps:
 #   1. ci-build.sh <flavor> <version> coverage  -> instrumented .so + binary,
@@ -32,8 +32,22 @@
 #
 set -euo pipefail
 
+if ! command -v gcovr >/dev/null 2>&1; then
+    echo "coverage: gcovr is required" >&2
+    exit 2
+fi
+GCOVR_MAJOR="$(gcovr --version | awk 'NR == 1 { split($2, v, "."); print v[1] }')"
+if [ -z "$GCOVR_MAJOR" ] || [ "$GCOVR_MAJOR" -lt 7 ]; then
+    echo "coverage: gcovr >= 7 is required for GCC 14 gcov output" >&2
+    exit 2
+fi
+
 FLAVOR="${1:-nginx}"
-VERSION="${2:-1.31.1}"
+if [ -f .github/versions.env ]; then
+    # shellcheck disable=SC1091
+    source .github/versions.env
+fi
+VERSION="${2:-${NGINX_VERSION:-1.31.1}}"
 MODULE_DIR="$PWD"
 ROOT="${BUILD_ROOT:-$PWD/.build}"
 DIR="${FLAVOR}-${VERSION}"

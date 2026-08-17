@@ -20,8 +20,12 @@
 
 set -euo pipefail
 
+if [ -f .github/versions.env ]; then
+    # shellcheck disable=SC1091
+    source .github/versions.env
+fi
 FLAVOR="${1:-nginx}"
-VERSION="${2:-1.31.1}"
+VERSION="${2:-${NGINX_VERSION:-1.31.1}}"
 MODE="${3:-debug}"
 ROOT="${BUILD_ROOT:-$PWD/.build}"
 MODULE_DIR="$PWD"
@@ -32,11 +36,18 @@ case "$FLAVOR" in
         URL="https://nginx.org/download/nginx-${VERSION}.tar.gz"
         DIR="nginx-${VERSION}"
         BINARY="nginx"
+        case "$VERSION" in
+            "${NGINX_MAINLINE:-}") EXPECTED_SHA256="${NGINX_MAINLINE_SHA256:-}" ;;
+            "${NGINX_STABLE:-}") EXPECTED_SHA256="${NGINX_STABLE_SHA256:-}" ;;
+            "${LEGACY_NGINX_VERSION:-}") EXPECTED_SHA256="${LEGACY_NGINX_VERSION_SHA256:-}" ;;
+            *) echo "no sha256 pin for nginx $VERSION" >&2; exit 2 ;;
+        esac
         ;;
     angie)
         URL="https://download.angie.software/files/angie-${VERSION}.tar.gz"
         DIR="angie-${VERSION}"
         BINARY="angie"
+        EXPECTED_SHA256="${ANGIE_SHA256:-}"
         ;;
     *)
         echo "unsupported flavor: $FLAVOR" >&2
@@ -45,10 +56,8 @@ case "$FLAVOR" in
 esac
 
 mkdir -p "$ROOT"
-if [ ! -f "$ROOT/${DIR}.tar.gz" ]; then
-    curl -fsSL "$URL" -o "$ROOT/${DIR}.tar.gz"
-fi
-bash "$MODULE_DIR/ci/tools/verify-download.sh" "$ROOT/${DIR}.tar.gz"
+bash "$MODULE_DIR/.github/scripts/fetch-verify.sh" \
+    "$URL" "$EXPECTED_SHA256" "$ROOT/${DIR}.tar.gz"
 if [ ! -d "$ROOT/$DIR" ]; then
     tar -xzf "$ROOT/${DIR}.tar.gz" -C "$ROOT"
 fi
