@@ -2228,6 +2228,16 @@ ngx_http_cache_turbo_redis_pool_blocks(ngx_pool_t *pool)
     ngx_pool_t        *p;
     ngx_pool_large_t  *l;
 
+    /* The chain walk below already tolerates a NULL pool; the large-list walk
+     * dereferenced it unguarded, so the two disagreed about the contract and
+     * clang --analyze reported core.NullDereference here. No caller passes NULL
+     * today (both sites in redis_smembers_finish pass op->pool / op->rpool,
+     * and every rpool assignment falls back to op->pool), so this is defensive,
+     * not a bug fix -- it makes the function agree with its own first loop. */
+    if (pool == NULL) {
+        return 0;
+    }
+
     for (p = pool; p; p = p->d.next) {
         n++;
     }
