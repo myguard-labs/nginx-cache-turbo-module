@@ -1495,7 +1495,6 @@ typedef struct {
     unsigned                 brk_only:1;
     unsigned                 captured:1;  /* response captured for store    */
     unsigned                 served:1;    /* we served from cache           */
-    unsigned                 stale_hit:1; /* served stale (for X-Cache)      */
     unsigned                 warm:1;      /* warm subrequest: force a miss,  */
                                           /* capture + store though !r->main */
     unsigned                 l2_done:1;   /* L2 GET finished (hit or miss)   */
