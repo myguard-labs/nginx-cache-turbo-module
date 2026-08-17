@@ -1,4 +1,4 @@
-# sync-sha: 617b069adc9b0aaaba8ac9591c4d3b920aefff65e840e46f97559a7b803c0466
+# sync-sha: 0ea7bcf7d3949637710c6c452742aaa99747daf69f45ab8e1b9f00df136dc3ff
 name: Security scanners
 
 # Static/security scanners gate (flawfinder, clang-tidy cert-*/security.*,
@@ -26,7 +26,7 @@ permissions:
 jobs:
   scanners:
     name: Security scanners
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02"]') }}
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 20
     steps:
       - name: Checkout module

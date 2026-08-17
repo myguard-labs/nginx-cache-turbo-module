@@ -1,4 +1,4 @@
-# sync-sha: 5db92ebc034e073163c41674282153d31bf5d0326f6309c3452e24a53c6186ca
+# sync-sha: 340f0b3bb4bc4f24151f1f0b7e2f46dc74ef0bfe111f5c9ce279551012017a1e
 name: Valgrind
 
 # Valgrind memcheck lite soak (60s @ 4 conc) on every PR/push — cheap dynamic
@@ -26,7 +26,7 @@ permissions:
 jobs:
   memcheck-lite:
     name: Memcheck lite (60s soak)
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02"]') }}
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 15
     steps:
       - name: Checkout module

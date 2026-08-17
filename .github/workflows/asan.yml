@@ -1,4 +1,4 @@
-# sync-sha: cf7b81acd5a86ad8b23354c0665ab94c7db366a420146f9ca0c225c4a0eb7e4a
+# sync-sha: 95c894e1c9a2c4998be1772dae2a929f374d2dfa016ec3aa5e31fa0ed7d39bbf
 name: ASan and UBSan
 
 # Dedicated ASan+UBSan workflow, PATH-GATED: only runs when a PR/push touches
@@ -39,7 +39,7 @@ permissions:
 jobs:
   build-asan:
     name: Build (ASan/UBSan)
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02"]') }}
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 30
     steps:
       - name: Checkout
@@ -77,7 +77,7 @@ jobs:
 
   asan-single-process:
     name: ASan single-process
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02"]') }}
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 30
     needs: build-asan
     # AUD-CIPORT1: own 64-wide port band, distinct from every other
@@ -173,7 +173,7 @@ jobs:
 
   asan-multi-worker:
     name: ASan multi-worker
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02"]') }}
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 30
     needs: build-asan
     # AUD-CIPORT1: own 64-wide port band, distinct from every other

@@ -1,4 +1,4 @@
-# sync-sha: 0f05a1e7a4e57e058ef72b0049a8605bd259d050760e5b22b7bd9ec8d0751775
+# sync-sha: 4ade941ae867e5f4529f2ae91914c3b7159e2a770fe0c94f045b5be5989c62d1
 name: CI Deep
 
 # Exhaustive dynamic analysis — monthly cron + on-demand only, NEVER on PR.
@@ -53,7 +53,7 @@ permissions:
 jobs:
   fuzz:
     name: Fuzz (all targets, long)
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02"]') }}
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 600
     steps:
       - name: Checkout module
@@ -171,7 +171,7 @@ jobs:
     # 2026-07-21: the ABI branch changes rarely, so nightly coverage is enough
     # and it no longer sits on the per-PR critical path.
     name: Legacy nginx (pre-1.23) runtime
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02"]') }}
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 20
     env:
       LEGACY_NGINX_VERSION: "1.22.1"
@@ -252,7 +252,7 @@ jobs:
     # pass already covers per-PR clang static analysis — so this deeper full-source
     # pass runs nightly rather than duplicating clang work on every PR.
     name: Clang static analyzer
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02"]') }}
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 30
     steps:
       - name: Checkout module
@@ -316,7 +316,7 @@ jobs:
 
   memcheck:
     name: Valgrind Memcheck soak
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02"]') }}
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 240
     steps:
       - name: Checkout module
@@ -367,7 +367,7 @@ jobs:
 
   helgrind:
     name: Valgrind Helgrind soak
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02"]') }}
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 240
     steps:
       - name: Checkout module
@@ -427,7 +427,7 @@ jobs:
     # not a merge gate. Builds its own ASan binary (ci-deep jobs are
     # self-contained; no cross-workflow artifact reuse).
     name: ASan multi-worker soak (flake repetition)
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02"]') }}
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 60
     # AUD-CIPORT1: own 64-wide port band, distinct from every other
     # runtime-bearing job on this shared runner. The nested per-iteration
@@ -521,7 +521,7 @@ jobs:
 
   scanners:
     name: Security scanners
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02"]') }}
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 20
     steps:
       - name: Checkout module
@@ -639,7 +639,7 @@ jobs:
     # memcached + fault injection) at -O0 — far too slow for the per-PR path,
     # and its output is a trend to read, not a green/red signal to block on.
     name: Coverage (gcov report)
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02"]') }}
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 60
     # AUD-CIPORT1: own 64-wide port band, distinct from every other
     # runtime-bearing job on this shared runner -- this job DOES run the full

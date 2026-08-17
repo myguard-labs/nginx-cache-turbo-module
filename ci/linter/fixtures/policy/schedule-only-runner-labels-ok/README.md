@@ -8,7 +8,7 @@ labels are spelled correctly and the selector is an approved `TRUST_SPLITS`
 entry. Expected: `runners` exit 0.
 
 Retargeted for nginx-cache-turbo-module (adoption step 32): the selector here
-is this repo's own `["self-hosted","builder02"]`, not the skeleton's
+is this repo's own `["self-hosted","some-pool"]`, not the skeleton's
 three-label `lxc` variant. `TRUST_SPLITS` in ci/linter/workflow_policy.py was
 narrowed to the one selector this repo actually uses, so the skeleton's
 spelling is correctly REJECTED here — carried over unedited this positive

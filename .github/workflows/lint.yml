@@ -1,4 +1,4 @@
-# sync-sha: 65b2cc70ece10a3be63f4356518fef304cd6a6da3b28a82dbd77af0cfb8a91a5
+# sync-sha: 83f50441ef7ba902405ecf76651362b01eeb6dc5e07ee30b74178557c9bcc315
 name: Lint
 
 # The same ci/linter/ scripts a developer runs locally, run again on the PR --
@@ -26,10 +26,8 @@ name: Lint
 # belt-and-braces, not duplication to remove, since the two workflows are
 # independently skippable.
 #
-# runs-on: ubuntu-latest, NOT the self-hosted pool. This job needs no nginx
-# build, and ci.yml's lane budget is set by the 795s A/UBSan soak; putting lint
-# on a hosted runner keeps the self-hosted slots for the jobs that need them
-# while giving the fastest feedback in the suite.
+# This job uses the shared POOL selector like every other job. Repositories
+# without POOL configured fall back to a hosted runner.
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -51,7 +49,7 @@ permissions:
 jobs:
   lint:
     name: Linters
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 15
     steps:
       - name: Checkout module

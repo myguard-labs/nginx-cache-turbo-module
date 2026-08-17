@@ -15,7 +15,7 @@ ternary, which it walks past without a word — so `.github/actionlint.yaml`'s
 declared-label list is never consulted for them. A quiet linter and a clean
 linter print the same thing.
 
-Measured in the real tree, 2026-08-02: `builder02` -> `buidler02` in
+Measured in the real tree, 2026-08-02: `builder` -> `misspelled-pool` in
 `build-test.yml` (`workflow_call`, PR-reachable) was reported; the same edit in
 `bump.yml` and `ci-deep.yml` (`schedule` + `workflow_dispatch`) was silent, on
 both this check and actionlint. Six selectors had no label checking anywhere.

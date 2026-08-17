@@ -10,6 +10,6 @@ on:
 permissions: {}
 jobs:
   soak:
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02"]') }}
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     steps:
       - run: echo soak

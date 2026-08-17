@@ -3,7 +3,7 @@
 # Enforce the per-job port-band split (AUD-CIPORT1).
 #
 # build-test.yml, asan.yml and ci-deep.yml all pin the SAME self-hosted
-# runner (builder02) and have DISJOINT per-workflow concurrency groups, so
+# runner (builder) and have DISJOINT per-workflow concurrency groups, so
 # nothing serialises them against each other. Every runtime-bearing job used
 # to sweep stale test listeners over the same hardcoded 18870-18999 range and
 # start test_runtime.py on the same default --port 18880: the later-starting
