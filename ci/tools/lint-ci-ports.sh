@@ -215,11 +215,17 @@ for f in "${files[@]}"; do
             # TEST_NGINX_RANDOMIZE is the ONE case where a runtime-bearing job
             # legitimately does not run on its declared band. It is what makes
             # `prove -jN` safe: the scaffold picks a random port PER PARALLEL
-            # JOB and binds only ports it has proved free (Util.pm
-            # gen_rand_port), so pinning TEST_NGINX_PORT would re-share the
+            # JOB, so pinning TEST_NGINX_PORT would re-share the
             # resource randomization just separated and reintroduce the
             # collision. The band is still declared and still swept, which is
             # what reserves this job's territory on the shared runner.
+            #
+            # Do NOT restate this as "the scaffold binds only ports it has
+            # proved free". It does not: gen_rand_port probes 127.0.0.1 while
+            # the generated server binds 0.0.0.0, so a port can pass the probe
+            # and still fail the bind (run 32075040354). The suite closes that
+            # gap itself in ci/t/lib/CacheTurbo.pm -- wildcard probe plus
+            # re-draw -- which is what this exemption now rests on.
             if [[ "$code" == *TEST_NGINX_RANDOMIZE* ]]; then
                 job_passes_port[$key]=1
             fi
