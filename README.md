@@ -1079,7 +1079,7 @@ cache_turbo_normalize_vary  encoding device;   # keep gzip≠brotli, mobile≠de
 
 ## Presets (pick a vibe, skip the knobs)
 
-Don't want to tune four numbers? Pick a preset:
+Don't want to tune five numbers? Pick a preset:
 
 ```nginx
 cache_turbo        ct;
@@ -1609,7 +1609,7 @@ http {
             cache_turbo_normalize_vary    encoding device;        # add variant buckets to the key
 
             # ── freshness / staleness ───────────────────────────────────
-            cache_turbo_preset            balanced;  # micro|conservative|balanced|aggressive — sets the 4 knobs below
+            cache_turbo_preset            balanced;  # micro|conservative|balanced|aggressive — sets the 5 knobs below
             cache_turbo_valid             60s;       # 200 TTL; 0 = cache forever
             cache_turbo_valid             301 302 308 1h;   # repeatable: cache redirects
             cache_turbo_valid             404 410 1m;       #            negative caching
@@ -1684,7 +1684,7 @@ http {
 | `cache_turbo_backend NAME...` | `server`, `location` | — | Auto-classify dynamic (uncacheable) request surfaces for one or more application presets: `wordpress`, `woocommerce`, `joomla`, `xenforo`, `discourse`, `phpbb`, `drupal`, `mediawiki`, `magento`, `shopware6`, `ghost`, `wagtail`, `kirby`, `typo3`, `invision`, `smf`, `vanilla`, `punbb`, `phorum`, `yabb`, `mybb`, `vbulletin`, `textpattern`, `bludit`, `spip`, `bugzilla`, `mantisbt` (`mantis`), `plone`, `umbraco`, `dotclear`, `wikijs`, `redmine`, `flarum`, `opencart`; aliases: `classicpress` → `wordpress`, `backdrop` → `drupal`; or `none`. A matching request (login/session cookie, admin URI, dynamic arg) skips lookup **and storage** and goes straight to origin. **Every preset is opt-in**; names **stack**, separated by spaces or `\|` (`wordpress\|woocommerce` == `wordpress woocommerce`). Implies `cache_turbo_cache_control honor`. **`none`** means no preset here and exists to override one inherited from the `server` block; it is exclusive and does not imply `honor`. **`generic`/`auto` were removed** and are now a config error — the union was never a safe default ([why](#cms-backends-cache_turbo_backend)). Cookie names that an app lets you rename still need an explicit local rule; see each [application guide](docs/README.md). There is **no `django`/`laravel` preset** and never will be ([why](docs/frameworks.md)); Jira, Request Tracker and several other session-eager trackers are intentional non-presets ([research](docs/README.md#apps-we-deliberately-do-not-ship-a-preset-for)). |
 | `cache_turbo_suppress_native on` | `server`, `location` | `off` | Make `$cache_turbo_active` read `1` while cache-turbo owns a request, so a stacked native `proxy_cache` can defer via `proxy_no_cache $cache_turbo_active; proxy_cache_bypass $cache_turbo_active;`. Off (default) keeps the variable always `0` (the wiring stays inert). |
 | `cache_turbo_key STRING` | `server`, `location` | raw | What makes two requests "the same page". The built-in default is the Host header + raw unparsed path/query (not `$host$uri$query_string` — closer to `$host$request_uri`, since `unparsed_uri` is undecoded), with **no argument normalization** and **no scheme/port**. To enable normalized matching, set it to `$host$uri$cache_turbo_normalized_args`; to separate HTTP/HTTPS entries, use `$scheme$host$request_uri`. |
-| `cache_turbo_preset NAME` | `server`, `location` | `balanced` | `micro` / `conservative` / `balanced` / `aggressive` — sets the four knobs below at once. `micro` = 1s microcaching (valid 1s, lock_ttl 1s, ×2 stale). |
+| `cache_turbo_preset NAME` | `server`, `location` | `balanced` | `micro` / `conservative` / `balanced` / `aggressive` — sets the five knobs below at once (`valid`, `beta`, `lock_ttl`, `stale_mult`, `min_uses`). `micro` = 1s microcaching (valid 1s, lock_ttl 1s, ×2 stale). |
 | `cache_turbo_valid [CODE...] TIME` | `server`, `location` | preset (`60s`) | How long a copy stays *fresh* (then *stale*, still served). Bare `TIME` = the default/200 TTL. `TIME` of `0` = cache forever (stays fresh, never expires). With leading status codes (`cache_turbo_valid 301 404 1m;`) it makes those statuses cacheable too — redirects + negative caching. Repeatable. |
 | `cache_turbo_beta N` | `server`, `location` | preset (`1000`) | Refresh eagerness, ×1000 (1000 = 1.0). Higher = refresh sooner/more often. |
 | `cache_turbo_lock_ttl TIME` | `server`, `location` | preset (`5s`) | Single-flight window: once one refresh is claimed, others serve stale until it finishes. Caps backend regens to ~one per cycle. |
