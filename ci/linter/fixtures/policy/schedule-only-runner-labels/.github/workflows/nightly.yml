@@ -1,7 +1,7 @@
 ---
 # Schedule-only, so nothing a fork can reach -- and until 2026-08-02 that meant
 # the runner selector was not read at all. The pool label below is misspelled
-# (`buidler02`); the shape is otherwise the approved trust split byte for byte,
+# (`misspelled-pool`); the shape is otherwise the approved trust split byte for byte,
 # so only the label check can tell this apart from a correct file.
 name: nightly
 on:
@@ -11,6 +11,6 @@ on:
 permissions: {}
 jobs:
   soak:
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","buidler02","lxc"]') }}
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","misspelled-pool","lxc"]') }}
     steps:
       - run: echo soak

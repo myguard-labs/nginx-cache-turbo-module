@@ -312,9 +312,8 @@ LINT_ONLY=ci-ports    ci/linter/run-all.sh    # -> starts the driver, no band
 LINT_ONLY=docs-drift  ci/linter/run-all.sh    # -> workflow not in README.md
 rm .github/workflows/_probe.yml
 
-# Runner LABELS, on a workflow no pull request can reach. Nothing else reads
-# these: actionlint validates labels for a literal `runs-on` only, and every
-# self-hosted selector here is a fromJSON(...) ternary it stays silent on.
+# Runner selector shape, on a workflow no pull request can reach. The actual
+# pool labels live in the POOL repository variable and never in this tree.
 cat > .github/workflows/_probe.yml <<'EOF'
 name: probe
 on:
@@ -322,11 +321,11 @@ on:
     - cron: "0 4 * * 1"
 jobs:
   p:
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","buidler02","lxc"]') }}
+    runs-on: ${{ fromJSON('["self-hosted","some-pool","lxc"]') }}
     steps:
       - run: echo probe
 EOF
-LINT_ONLY=ci-runners  ci/linter/run-all.sh    # -> not an approved selector (label typo)
+LINT_ONLY=ci-runners  ci/linter/run-all.sh    # -> not the approved selector
 rm .github/workflows/_probe.yml
 
 # a secret wired at the caller that the member never declared -- both halves

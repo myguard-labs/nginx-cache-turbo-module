@@ -3,6 +3,6 @@ name: scalar
 on: pull_request
 jobs:
   evil:
-    runs-on: [self-hosted, builder02]
+    runs-on: [self-hosted, some-pool]
     steps:
       - run: echo pwn

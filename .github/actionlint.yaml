@@ -1,8 +1,4 @@
 self-hosted-runner:
   labels:
-    # Selectors use plain [self-hosted, builder02]; every slot in the org group
-    # carries `builder02`, so that one label reaches the whole pool. `lxc` and
-    # `docker` still distinguish the runner families on the hosts, but no
-    # `runs-on` names them any more, so they are not listed here — actionlint
-    # only needs the labels the workflows actually select on.
-    - builder02
+    # Negative-control fixtures use this deliberately nonexistent label.
+    - some-pool

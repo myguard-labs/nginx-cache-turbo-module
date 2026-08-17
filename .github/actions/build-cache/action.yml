@@ -1,4 +1,4 @@
-# sync-sha: a8b31429c71e0b509da7eda9353b332aac2ea3794c6481bd591b5a935ba163c0
+# sync-sha: 5ef65b1acb5bd1929771eb0bda0d4a6d7a94cdf950ef0e48fbbd248cd3519a37
 name: Build cache
 description: >-
   Restore the ccache + upstream-tarball caches for one build. Hybrid by design:
@@ -29,7 +29,7 @@ runs:
   using: composite
   steps:
     # Why hybrid:
-    #   The builder02 runners are persistent incus containers today, so
+    #   The builder runners are persistent incus containers today, so
     #   ~/.cache/ccache survives between jobs on disk -- the fastest possible
     #   cache, no upload/download at all. But that is a property of the CURRENT
     #   runner topology, not a guarantee: an ephemeral conversion is possible,
@@ -81,7 +81,7 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        # Present on the builder02 runners already; installed only on a hosted
+        # Present on the builder runners already; installed only on a hosted
         # runner (codeql.yml, fork PRs). Cheap to check, and it keeps the
         # workflows portable to a fresh runner image.
         need=()

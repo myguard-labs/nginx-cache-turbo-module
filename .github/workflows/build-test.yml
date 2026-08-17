@@ -1,28 +1,8 @@
-# sync-sha: c1a79bd2ff4ba1cec1771da3918151ac9afae6cb4073f02448b496948bba7570
+# sync-sha: bfdbf5af76a97c5308abde3d09016a834d521d0da38d273b9ec6980091f6e2f3
 name: Build & Test
 
-# Runner selection: plain `[self-hosted, builder02]`, NOT `lxc`.
-#
-# `lxc` matched only the builder02-runner-* slots while the *-docker-* slots sat
-# idle because they carry `docker` instead. A 10-job wave therefore ran a few at a
-# time and spent more time queueing than executing (measured 2026-07-26: 24min wall
-# for ~40min of job time). The families are equivalent for this suite: both have
-# gcc/clang/make/ccache/mold/valgrind/python3/fuser, 8 CPU / 8G,
-# nginx+redis+memcached installed-but-inactive, nothing enabled, and the test port
-# range 18880-19263 free (six disjoint 64-wide bands, one per runtime-bearing
-# job across build-test/asan/ci-deep -- see AUD-CIPORT1 and
-# ci/tools/lint-ci-ports.sh). The old docker-golden :80 collision is fixed on both.
-#
-# Every slot in the org group carries `builder02`, so the bare selector reaches all
-# of them: the local builder02 lxc + docker slots AND builder03-docker-01. Adding a
-# slot => register it with `builder02`; no workflow edit needed.
-#
-# NOTE: builder03-docker-01 is an incus container on a WSL2 workstation reached over
-# the LAN, so a job landing there has a network hop the local slots do not. Its lxc
-# siblings (builder03-runner-01..06) are registered but usually offline. If this
-# suite starts showing host-correlated flakes — dropped connections mid-run, stalled
-# background jobs — check which runner the job took before suspecting the code;
-# WSL2 has a known habit of killing backgrounded children on a broken pipe.
+# Runner labels live in the POOL repository variable. Every checked-in selector
+# therefore stays portable and falls back to GitHub-hosted execution when unset.
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -42,7 +22,7 @@ permissions:
 jobs:
   validation:
     name: Validation
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02"]') }}
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -59,7 +39,7 @@ jobs:
           #
           # Same pipx-with-pip-fallback shape as the semgrep install in
           # security-scanners.yml: PEP 668 blocks a bare pip3 install into the
-          # system Python on the Ubuntu 24.04 self-hosted runner. Both paths
+          # system Python on Ubuntu 24.04. Both paths
           # land the binary in ~/.local/bin, which is NOT on the runner's
           # default PATH -- without the GITHUB_PATH append the next step dies
           # with "ruff: command not found", i.e. a gate that fails for a reason
@@ -115,7 +95,7 @@ jobs:
           if [ -d ci/tools/areas ]; then
             python3 -m py_compile ci/tools/areas/*.py
           fi
-          python3 ci/tools/lint-ci-runners.py
+          LINT_ONLY=ci-runners ci/linter/run-all.sh
           bash ci/tools/lint-ci-ports.sh
           python3 ci/tools/lint-orphan-tests.py
           python3 ci/tools/lint-doc-preset-count.py
@@ -190,7 +170,7 @@ jobs:
 
   build:
     name: Build
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02"]') }}
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 30
     steps:
       - name: Checkout
@@ -291,7 +271,7 @@ jobs:
 
   runtime:
     name: Runtime
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02"]') }}
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 20
     needs: build
     # AUD-CIPORT1: own 64-wide port band so this job's fixtures cannot be
@@ -366,7 +346,7 @@ jobs:
 
   prove:
     name: Preset suite (Test::Nginx)
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02"]') }}
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 15
     needs: build
     # AUD-CIPORT1: own 64-wide band, same rule as the runtime job above -- the

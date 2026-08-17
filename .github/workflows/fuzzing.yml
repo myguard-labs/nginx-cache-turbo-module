@@ -1,4 +1,4 @@
-# sync-sha: 74430c561d33ceabae2fd36c8bacb238dcad2033d7e76f8e97bf802b375b6694
+# sync-sha: 94a96e4ae1fdb7b38bb726912f6138a278567698248b49e5ce3eded270ff846e
 name: Fuzzing
 
 # Fast fuzz regression gate on every PR/push — 120s/target on all five parser
@@ -36,7 +36,7 @@ permissions:
 jobs:
   fuzz-regression:
     name: Fuzz regression (120s/target)
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02"]') }}
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 45
     steps:
       - name: Checkout module

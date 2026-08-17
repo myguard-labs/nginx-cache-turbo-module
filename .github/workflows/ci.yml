@@ -1,4 +1,4 @@
-# sync-sha: 240d213fe25bde768262aa29cb9ec426d84aee008dab5441dfae8989a87c21ee
+# sync-sha: 8762a422d2a39f4137cc59184fb4a7b5987d2801ef82347d4e1dc69334a2736e
 name: CI
 
 # Single entry point for the PR suite. The six checks below used to be
@@ -43,20 +43,16 @@ name: CI
 # the run above, with the chain still in place, was 1007s.
 #
 # Nothing queued in that run: every job started within 10s of its dependencies
-# finishing, so these are execution times, not waits. Check /proc/loadavg and
-# the slot count before comparing -- the host runs six ci-ephemeral@ slots
-# (four lxc + two docker) and the org pool adds builder03.
+# finishing, so these are execution times, not waits. Check pool load and slot
+# count before comparing.
 #
 # Valgrind (132s) is deliberately NOT chained behind anything: it is short,
 # independent, and chaining it would only recreate the problem lane C just had.
 #
 # A lane is not a slot. Build&Test fans out into four jobs and A/UBSan into
-# three, so observed peak is well above three runners; the org pool answers
-# `builder02` with ten online slots (four lxc + two docker on builder02, four on
-# builder03), so brief oversubscription at t=0 is absorbed.
+# three, so observed peak is well above three runners.
 #
-# Lint and CodeQL run on ubuntu-latest, take no self-hosted slot, and are
-# therefore not laned at all -- no `needs:`, they start immediately.
+# Lint and CodeQL are not laned -- no `needs:`, so they start immediately.
 #
 # Follow-ups use !cancelled() so a FAILING first check does not suppress an
 # unrelated second one, and so a chain survives an earlier job being SKIPPED by
@@ -90,7 +86,7 @@ jobs:
   # would run the ~800s sanitizer and ~680s fuzz jobs on every docs-only PR.
   changes:
     name: Detect relevant changes
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 5
     permissions:
       contents: read
@@ -173,7 +169,6 @@ jobs:
   # Unchained, lane C is max(668, 302) = 668s and the critical path returns to
   # A/UBSan at 164 + 761 = 925s, which is the floor no arrangement can beat.
   # The cost is one more self-hosted slot at t=0 (peak 3 -> 4 concurrent);
-  # the org pool answers `builder02` with ten slots, so the headroom is there.
   #
   # `needs: changes` is kept, and so is the `needs.changes.result == 'success'`
   # guard: that job exits 1 rather than fail open when it cannot compute its
@@ -203,18 +198,18 @@ jobs:
       contents: read
     uses: ./.github/workflows/valgrind.yml
 
-  # --- unlaned: hosted, takes no self-hosted slot --------------------------
+  # --- unlaned --------------------------------------------------------------
   # The ci/linter/ gate -- the same entry point .githooks/pre-commit runs, so a
   # clone that never set core.hooksPath still cannot land a lint regression.
   # Hosted, unlaned and fastest in the suite: it needs no nginx build and takes
-  # no self-hosted slot, so it never competes with the soaks for the budget.
+  # It remains outside the runtime lanes because it has no runtime dependency.
   lint:
     name: Lint
     permissions:
       contents: read
     uses: ./.github/workflows/lint.yml
 
-  # --- unlaned: hosted, takes no self-hosted slot --------------------------
+  # --- unlaned --------------------------------------------------------------
   codeql:
     name: CodeQL
     permissions:

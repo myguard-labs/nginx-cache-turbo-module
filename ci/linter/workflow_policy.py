@@ -60,48 +60,12 @@ class PolicyError(Exception):
     """Could not run the check (exit 2) -- never confused with "clean"."""
 
 
-def _trust_split(labels: list[str]) -> str:
-    """The one approved runner selector shape, for a given self-hosted label set.
-
-    Built rather than pasted three times: the FORK ARM is the security-relevant
-    half and must be byte-identical in every accepted form. Three hand-written
-    copies drift, and a drifted copy is silently accepted by the membership test
-    below while meaning something slightly different.
-    """
-    inner = ",".join(f'"{label}"' for label in labels)
-    return (
-        "${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || "
-        + f"fromJSON('[{inner}]') }}}}"
-    )
-
-
-# Accepted self-hosted label sets. Each keeps FORK pull requests on a
-# GitHub-hosted runner and everything else on the self-hosted pool.
-#
-# Why the split matters here specifically: a `pull_request`-triggered job checks
-# out and EXECUTES scripts from the PR head. The self-hosted runners are persistent
-# and shared with the Debian package builds, so running a fork's code on them is
-# arbitrary code execution on the build host, with whatever the previous job
-# left behind still on disk. The hosted arm is what makes this repo safe to
-# accept outside contributions to -- which a public template repo exists to do.
-#
-# Widening the label set only changes WHICH slots are eligible, so a new entry
-# here is fine. Changing the fork arm is not, which is why it is not a parameter.
-# RETARGETED for nginx-cache-turbo-module (adoption step 13/14). The skeleton
-# ships three label sets; this repo selects on exactly one, the bare
-# `[self-hosted, builder02]` form, which is also the only label declared in
-# .github/actionlint.yaml. The narrower set is the point: an approved-selector
-# list copied wider than the repo actually uses approves a selector nobody
-# reviewed, and `lxc`/`docker` are runner families no `runs-on` here names.
-# Verified against all 15 selectors in .github/workflows/ on 2026-08-10.
-#
-# POOL_OWNED=yes: origin is myguard-labs, and the builder02 pool answers these
-# labels. A fork of this repo inherits a selector it cannot satisfy -- that is
-# what the fork arm above is for, and why it is not a parameter.
-TRUST_SPLITS = frozenset(
-    _trust_split(labels)
-    for labels in (["self-hosted", "builder02"],)
-)
+# The pool label belongs in the POOL repository variable, while the checked-in
+# expression keeps a safe hosted fallback for repos where the variable is unset.
+# Fork execution is gated by GitHub's all_external_contributors approval policy;
+# pull_request_target remains forbidden below because that event bypasses it.
+APPROVED_SELECTOR = "${{ fromJSON(vars.POOL || '[\"ubuntu-latest\"]') }}"
+SELF_HOSTED_ALLOWED = True
 
 HOSTED = re.compile(r"ubuntu-(?:latest|[0-9]+\.[0-9]+)")
 
@@ -198,7 +162,7 @@ def selector(node) -> str:
     """Render a `runs-on:` node back to one comparable string.
 
     The list and mapping forms are rendered rather than flattened so that a
-    `runs-on: [self-hosted, builder02]` fails the membership test as ONE finding
+    `runs-on: [self-hosted, some-pool]` fails the membership test as ONE finding
     naming the whole selector, instead of one confusing finding per label.
     """
     if isinstance(node, str):
@@ -266,13 +230,14 @@ def check_runners() -> int:
                     )
                 continue
             runner = selector(node["runs-on"])
-            if runner in TRUST_SPLITS or HOSTED.fullmatch(runner):
+            approved = SELF_HOSTED_ALLOWED and runner == APPROVED_SELECTOR
+            if approved or HOSTED.fullmatch(runner):
                 continue
             if pr_reachable:
                 errors.append(
                     f"{path.name}:{job} has runs-on: {runner} -- must be "
-                    "GitHub-hosted or an approved fork-aware trust split "
-                    "(see TRUST_SPLITS in ci/linter/workflow_policy.py)"
+                    "GitHub-hosted or the approved vars.POOL selector "
+                    "(see APPROVED_SELECTOR in ci/linter/workflow_policy.py)"
                 )
                 continue
             # NOT PR-reachable, so there is no fork-trust question to answer --
@@ -287,7 +252,7 @@ def check_runners() -> int:
             # actually catches a mistyped pool label, so skipping it for
             # schedule-only workflows left bump.yml and ci-deep.yml (six
             # selectors) with no label checking anywhere. Measured 2026-08-02:
-            # `builder02` -> `buidler02` in build-test.yml was reported, the
+            # `builder` -> `misspelled-pool` in build-test.yml was reported, the
             # same edit in bump.yml and ci-deep.yml was silent on both this
             # check and actionlint.
             #
@@ -295,17 +260,15 @@ def check_runners() -> int:
             # fails as a queued job that never picks up a runner, on a weekly
             # schedule nobody is watching.
             errors.append(
-                f"{path.name}:{job} has runs-on: {runner} -- not an approved "
+                f"{path.name}:{job} has runs-on: {runner} -- not the approved "
                 "selector. This workflow is not PR-reachable, so the finding is "
-                "about the LABELS, not fork trust: nothing else validates them "
-                "(actionlint skips non-literal runs-on) and an unknown label is "
-                "a job that never starts "
-                "(see TRUST_SPLITS in ci/linter/workflow_policy.py)"
+                "about selector shape, not fork trust "
+                "(see APPROVED_SELECTOR in ci/linter/workflow_policy.py)"
             )
     return report(
         "lint-ci-runners",
         errors,
-        "fork PRs stay on hosted runners; trusted events reach self-hosted",
+        "no pull_request_target; every runs-on is hosted or the vars.POOL selector",
     )
 
 
