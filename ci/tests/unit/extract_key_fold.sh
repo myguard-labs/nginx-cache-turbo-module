@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
 #
-# Slice the verbatim body of the cache-turbo key-fold functions out of the
-# shipped ../../src/ngx_http_cache_turbo_module.c into generated_key_fold.inc:
+# Slice the verbatim body of the cache-turbo key-fold functions into
+# generated_key_fold.inc:
 #
 #   ngx_http_cache_turbo_put_u32          little-endian u32 writer
+#                                         (MAINT-SPLIT: now ../../../src/
+#                                         ngx_http_cache_turbo_blob.c)
 #   ngx_http_cache_turbo_key_fold_size    per-cookie size + oversize decision
 #   ngx_http_cache_turbo_key_fold_append  per-cookie byte-framing (0x1f tag +
 #                                         4B namelen + 4B vallen + name + value)
 #   ngx_http_cache_turbo_key_fold_all     single-alloc fold over every queued
 #                                         cookie (S231-PERF-KEYFOLD)
+#                                         (the last three stay in
+#                                         ../../../src/ngx_http_cache_turbo_module.c)
 #
 # S231-PERF-KEYFOLD replaced the old per-cookie realloc-and-copy-the-whole-key
 # with a two-pass size-then-append over a single allocation. The digest that
@@ -30,10 +34,16 @@ set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC="$DIR/../../../src/ngx_http_cache_turbo_module.c"
+SRC_BLOB="$DIR/../../../src/ngx_http_cache_turbo_blob.c"
 OUT="$DIR/generated_key_fold.inc"
 
 if [ ! -f "$SRC" ]; then
     echo "✗ cannot find $SRC" >&2
+    exit 1
+fi
+
+if [ ! -f "$SRC_BLOB" ]; then
+    echo "✗ cannot find $SRC_BLOB" >&2
     exit 1
 fi
 
@@ -43,30 +53,28 @@ fi
 } > "$OUT"
 
 extract_fn() {
-    local name="$1"
+    local name="$1" src="$2"
     awk -v name="$name" '
-        /^static / { pending = 1; buf = $0 ORS; next }
-        pending && index($0, name "(") == 1 {
-            capture = 1; pending = 0; printf "%s", buf; print; next
-        }
-        pending { pending = 0; buf = "" }
-        capture {
-            print
-            if ($0 == "}") { capture = 0; print ""; exit }
-        }
-    ' "$SRC"
+        capture { print; if ($0 == "}") { capture = 0; print ""; exit }; next }
+        index($0, name "(") == 1 { capture = 1; printf "%s", buf; print; buf = ""; next }
+        { buf = $0 ORS }
+    ' "$src"
 }
 
-for fn in \
-    ngx_http_cache_turbo_put_u32 \
-    ngx_http_cache_turbo_key_fold_size \
-    ngx_http_cache_turbo_key_fold_append \
-    ngx_http_cache_turbo_key_cookie_queue \
-    ngx_http_cache_turbo_key_fold_all
+# ngx_http_cache_turbo_put_u32 is non-static in blob.c (module.c calls it
+# directly too); the other three stay static in module.c.
+for spec in \
+    "ngx_http_cache_turbo_put_u32:$SRC_BLOB" \
+    "ngx_http_cache_turbo_key_fold_size:$SRC" \
+    "ngx_http_cache_turbo_key_fold_append:$SRC" \
+    "ngx_http_cache_turbo_key_cookie_queue:$SRC" \
+    "ngx_http_cache_turbo_key_fold_all:$SRC"
 do
-    body="$(extract_fn "$fn")"
+    fn="${spec%%:*}"
+    src="${spec#*:}"
+    body="$(extract_fn "$fn" "$src")"
     if [ -z "$body" ]; then
-        echo "✗ failed to extract $fn from $SRC" >&2
+        echo "✗ failed to extract $fn from $src" >&2
         echo "  (source layout changed? update extract_key_fold.sh)" >&2
         rm -f "$OUT"
         exit 1

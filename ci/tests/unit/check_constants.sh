@@ -65,8 +65,10 @@ echo "✓ unit-test shim constants match module.h (${#CONSTS[@]} checked)"
 # Runtime preset-oracle tables are intentionally hand-written for readable
 # semantic tests.  Parse both those Python literals and the C preset registry
 # so a populated source row, a needle, or a test location cannot drift quietly.
+# MAINT-SPLIT: the ngx_http_cache_turbo_presets[] registry moved out of
+# module.c into its own TU, ngx_http_cache_turbo_presets.c.
 python3 "$DIR/check_preset_mirrors.py" \
-    "$DIR/../../../src/ngx_http_cache_turbo_module.c" \
+    "$DIR/../../../src/ngx_http_cache_turbo_presets.c" \
     "$DIR/../../tools/areas/core.py" \
     "$DIR/../../tools/nginx_config.py"
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# Slice the verbatim bodies of the cache-turbo L2 BLOB deserializer out of the
-# shipped ../../src/ngx_http_cache_turbo_module.c into generated_blob.inc:
+# Slice the verbatim bodies of the cache-turbo L2 BLOB deserializer into
+# generated_blob.inc:
 #
 #   ngx_http_cache_turbo_get_u16/_u32/_u64   fixed-endian wire accessors
 #   ngx_http_cache_turbo_blob_validate()     framing + range validation
@@ -15,6 +15,12 @@
 # defined before its caller: the get_u* accessors precede blob_validate, and
 # header_skip precedes header_admissible).
 #
+# MAINT-SPLIT: get_u16/_u32/_u64, blob_validate and blob_next_header now live
+# in ../../src/ngx_http_cache_turbo_blob.c; header_skip/header_admissible*
+# stay in ../../src/ngx_http_cache_turbo_module.c (they are called from many
+# more module.c sites and were not part of this move). Slice both files in
+# the SAME order the .inc has always needed and concatenate.
+#
 # This keeps the fuzz target locked to production code — there is no hand-copied
 # deserializer. If a body changes upstream the next fuzz build picks it up; if a
 # function can no longer be found we fail loudly rather than silently fuzz
@@ -27,6 +33,7 @@ set -euo pipefail
 
 FUZZ_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC="$FUZZ_DIR/../../src/ngx_http_cache_turbo_module.c"
+SRC_BLOB="$FUZZ_DIR/../../src/ngx_http_cache_turbo_blob.c"
 # ⚠ The wire constants below span TWO headers as of MAINT-C3b: the BLOB_* ones
 # are module.c-private and live in _internal.h, while TTL_MAX and FOREVER_TTL
 # stay public in module.h. This extractor is a NON-COMPILER consumer of those
@@ -41,6 +48,11 @@ OUT="$FUZZ_DIR/generated_blob.inc"
 
 if [ ! -f "$SRC" ]; then
     echo "✗ cannot find $SRC" >&2
+    exit 1
+fi
+
+if [ ! -f "$SRC_BLOB" ]; then
+    echo "✗ cannot find $SRC_BLOB" >&2
     exit 1
 fi
 
@@ -120,17 +132,26 @@ fi
 # --- slice the function bodies, in source order.
 # nginx style: the return type sits alone on one line, the name+params line
 # follows, and the body closes on a bare `}` in column 0.
-awk '
-    /^static / { pending = 1; buf = $0 ORS; next }
-    pending && /^ngx_http_cache_turbo_(get_u(16|32|64)|blob_validate|blob_next_header|header_skip|header_admissible|header_admissible_name|header_admissible_value)\(/ {
-        capture = 1; pending = 0; printf "%s", buf; print; next
-    }
-    pending { pending = 0; buf = "" }
-    capture {
-        print
-        if ($0 == "}") { capture = 0; print "" }
-    }
-' "$SRC" >> "$OUT"
+# get_u16/_u32/_u64, blob_validate, blob_next_header: ngx_http_cache_turbo_blob.c
+# (MAINT-SPLIT made get_u16/_u32/_u64 and blob_validate non-static, since
+# module.c calls them directly, so the return-type line no longer starts with
+# `static` for those two -- match ANY line that is not itself the function's
+# own name+params line as the "pending" return-type line, not just a
+# static-prefixed one).
+# header_skip, header_admissible*: still ngx_http_cache_turbo_module.c, still static.
+slice_fns() {
+    local pattern="$1" src="$2"
+    awk -v pattern="$pattern" '
+        capture { print; if ($0 == "}") { capture = 0; print "" }; next }
+        $0 ~ pattern { capture = 1; printf "%s", buf; print; buf = ""; next }
+        { buf = $0 ORS }
+    ' "$src"
+}
+
+slice_fns '^ngx_http_cache_turbo_(get_u(16|32|64)|blob_validate|blob_next_header)[(]' \
+    "$SRC_BLOB" >> "$OUT"
+slice_fns '^ngx_http_cache_turbo_(header_skip|header_admissible|header_admissible_name|header_admissible_value)[(]' \
+    "$SRC" >> "$OUT"
 
 # --- sanity: every function must be present and the file must end on a brace.
 for fn in \
@@ -142,7 +163,7 @@ for fn in \
     'ngx_http_cache_turbo_header_skip('
 do
     if ! grep -qF "$fn" "$OUT"; then
-        echo "✗ failed to extract $fn from $SRC" >&2
+        echo "✗ failed to extract $fn from $SRC / $SRC_BLOB" >&2
         echo "  (source layout changed? update extract_blob.sh)" >&2
         rm -f "$OUT"
         exit 1

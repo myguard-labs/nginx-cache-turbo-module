@@ -20,6 +20,113 @@
 
 #include "ngx_http_cache_turbo_module.h"
 
+#if (NGX_SSL)
+#include <ngx_event_openssl.h>
+#endif
+
+
+/* ---- blob.c (SHA-256 digest + blob deserializer + exit_process; module.c
+ * calls the digest/blob_validate helpers from many sites, so these are the
+ * ONLY declarations here with external linkage that is not a whole-function
+ * prototype) ---- */
+
+typedef struct {
+#if (NGX_SSL)
+    EVP_MD_CTX  *md;
+    ngx_int_t    ok;
+#else
+    ngx_md5_t    lo;
+    ngx_md5_t    hi;
+#endif
+} ngx_http_cache_turbo_digest_t;
+
+#if (NGX_SSL)
+/* Worker-persistent digest ctx (see blob.c digest_init for the safety
+ * argument). Defined and freed in blob.c's exit_process(); extern only so a
+ * future second TU could inspect it, same visibility it had pre-split. */
+extern EVP_MD_CTX  *ngx_http_cache_turbo_worker_md;
+#endif
+
+/* Registered in module.c's ngx_module_t (ngx_http_cache_turbo_module), which
+ * keeps its own forward declaration of this prototype; defined in blob.c. */
+void ngx_http_cache_turbo_exit_process(ngx_cycle_t *cycle);
+
+/* module.c's variant_hash()/varymark/varidx sites stream digests directly
+ * (not through the one-shot ngx_http_cache_turbo_digest(), whose prototype
+ * already lives in ngx_http_cache_turbo_module.h). */
+void ngx_http_cache_turbo_digest_init(ngx_http_cache_turbo_digest_t *d);
+void ngx_http_cache_turbo_digest_update(ngx_http_cache_turbo_digest_t *d,
+    const void *data, size_t len);
+ngx_int_t ngx_http_cache_turbo_digest_final(ngx_http_cache_turbo_digest_t *d,
+    u_char out[32]);
+
+/* Fixed little-endian wire accessors (STAB-4). module.c's key-fold
+ * (put_u32) and body-filter/variant (blob_hdr_write, get_u16/32/64 via
+ * blob_validate) sites call these directly. */
+void ngx_http_cache_turbo_put_u16(u_char *p, uint16_t v);
+void ngx_http_cache_turbo_put_u32(u_char *p, uint32_t v);
+void ngx_http_cache_turbo_put_u64(u_char *p, uint64_t v);
+uint16_t ngx_http_cache_turbo_get_u16(const u_char *p);
+uint32_t ngx_http_cache_turbo_get_u32(const u_char *p);
+uint64_t ngx_http_cache_turbo_get_u64(const u_char *p);
+/* ngx_http_cache_turbo_blob_hdr_write()'s prototype needs
+ * ngx_http_cache_turbo_blob_hdr_t, which is defined further down in this
+ * header (the "layout group" for blob_hdr_t / blob_href_t / BLOB_* below);
+ * declared there instead, next to ngx_http_cache_turbo_blob_validate() which
+ * has the same dependency. */
+
+/* Test-only observable, defined and read entirely within module.c
+ * (cookie_has() / cookie_scan_header sites); module.c already carries its own
+ * `extern` immediately above its later use, this one is redundant but
+ * harmless. TEST_FAULTS-gated so the symbol only exists in a test build. */
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+extern ngx_atomic_uint_t  ngx_http_cache_turbo_test_cookie_scans;
+#endif
+
+
+/* ---- presets.c (CMS auto-classify preset registry) ----
+ *
+ * ngx_http_cache_turbo_preset_t and its cookie-predicate struct are ALSO
+ * defined verbatim in presets.c (inside its FUZZ-EXTRACT block), so the
+ * generated fuzz .inc stays self-contained with no project-header include.
+ * presets.c DOES include this header too (it needs the NGX_HTTP_CACHE_TURBO_
+ * BACKEND_* bit constants that live in it), so it defines
+ * NGX_HTTP_CACHE_TURBO_PRESETS_C first to suppress the typedef AND the
+ * `extern ngx_http_cache_turbo_presets[]` declaration below -- a definition
+ * needs neither a prior typedef (its own FUZZ-EXTRACT copy already supplied
+ * one) nor a prior extern declaration in the same TU. Keep the two typedef
+ * copies in sync if the layout ever changes. */
+
+#ifndef NGX_HTTP_CACHE_TURBO_PRESETS_C
+
+typedef struct ngx_http_cache_turbo_cookie_pred_s
+               ngx_http_cache_turbo_cookie_pred_t;
+
+#define NGX_HTTP_CACHE_TURBO_CVOP_NE        0   /* bypass when value != literal */
+#define NGX_HTTP_CACHE_TURBO_CVOP_EQ        1   /* bypass when value == literal */
+#define NGX_HTTP_CACHE_TURBO_CVOP_NONEMPTY  2   /* bypass when value is non-empty */
+
+struct ngx_http_cache_turbo_cookie_pred_s {
+    const char  *name_suffix;  /* cookie NAME must END with this (prefix-agnostic) */
+    ngx_uint_t   op;           /* NGX_HTTP_CACHE_TURBO_CVOP_*                       */
+    const char  *value;        /* literal compared against, NULL for NONEMPTY       */
+};
+
+typedef struct {
+    ngx_uint_t           bit;
+    const char *const   *cookies;  /* substrings in the request Cookie header */
+    const char *const   *uris;     /* r->uri prefixes                         */
+    const char *const   *args;     /* "name" (presence) or "name=value"       */
+    const ngx_http_cache_turbo_cookie_pred_t  *cookie_preds;
+    const char *const  *key_cookies;
+} ngx_http_cache_turbo_preset_t;
+
+/* Non-static: module.c iterates it (auto_skip / auto_key sites). */
+extern const ngx_http_cache_turbo_preset_t  ngx_http_cache_turbo_presets[];
+
+#endif /* !NGX_HTTP_CACHE_TURBO_PRESETS_C */
+
 
 /* ---- shm.c (used only within ngx_http_cache_turbo_shm.c) ---- */
 
@@ -519,6 +626,17 @@ typedef struct {
     const u_char              *val;
     uint32_t                   vlen;
 } ngx_http_cache_turbo_blob_href_t;
+
+/* ---- blob.c: helpers whose signature needs the two structs just above ----
+ * module.c calls all three: blob_hdr_write() from body-filter/variant sites,
+ * blob_validate() from the purge, access-L1-bounds, serve, SIE-arm and
+ * body-filter sites. */
+void ngx_http_cache_turbo_blob_hdr_write(u_char *dst,
+    const ngx_http_cache_turbo_blob_hdr_t *h);
+ngx_int_t ngx_http_cache_turbo_blob_validate(const u_char *blob, size_t len,
+    ngx_http_cache_turbo_blob_hdr_t *out, const u_char **hdr_block,
+    const u_char **body, ngx_pool_t *pool,
+    ngx_http_cache_turbo_blob_href_t **refs_out);
 
 
 /* CTB4 (RFC-2 stale-if-error): fixed-endian versioned wire format. CTB4 adds the
