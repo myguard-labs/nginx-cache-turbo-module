@@ -1429,7 +1429,10 @@ def _config_test_result(ng: Nginx, mutate) -> subprocess.CompletedProcess[str]:
         bad, ng.port, ng.module, ng.origin_port, 1, ng.redis_port,
         ng.redis_auth_port, ng.redis_password, ng.redis_tls_port,
         ng.redis_tls_ca, ng.memcached_port)
+    cfg_before = cfg
     cfg = mutate(cfg)
+    assert cfg != cfg_before, \
+        "mutator produced no change: test would be vacuous (never validates a mutation)"
     (bad / "conf" / "nginx.conf").write_text(cfg, encoding="ascii")
     cmd = ng.runner + [str(ng.binary), "-p", str(bad),
                        "-c", str(bad / "conf" / "nginx.conf"), "-t"]
