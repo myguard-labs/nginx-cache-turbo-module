@@ -16,6 +16,19 @@
 #include "ngx_http_cache_turbo_module.h"
 #include "ngx_http_cache_turbo_internal.h"
 
+/* Log config error and return NGX_CONF_ERROR. Replaces the idiomatic
+ * ngx_conf_log_error(...); return NGX_CONF_ERROR; pattern to reduce noise
+ * at call sites. Defined here, above every use: a macro has no forward
+ * declaration, so a definition placed later in the file is invisible to
+ * the call sites above it.
+ *
+ * This does not interact with the NGX_HTTP_CACHE_TURBO_PARAM_NOMATCH
+ * sentinel-aliasing hazard documented further down: the macro yields
+ * NGX_CONF_ERROR itself, so a rejecting handler returns exactly what it
+ * returned before. */
+#define NGX_HTTP_CACHE_TURBO_CONF_ERROR(level, cf, err, ...) \
+    ((void) (ngx_conf_log_error(level, cf, err, __VA_ARGS__)), NGX_CONF_ERROR)
+
 #if (NGX_SSL)
 #include <ngx_event_openssl.h>
 
@@ -202,16 +215,6 @@ ngx_http_cache_turbo_redis_resolve(ngx_conf_t *cf,
 static char  ngx_http_cache_turbo_param_nomatch_obj;
 #define NGX_HTTP_CACHE_TURBO_PARAM_NOMATCH \
     (&ngx_http_cache_turbo_param_nomatch_obj)
-
-/* Log config error and return NGX_CONF_ERROR. Replaces the idiomatic
- * ngx_conf_log_error(...); return NGX_CONF_ERROR; pattern to reduce noise
- * at call sites. The sentinel-aliasing hazard noted above does not apply:
- * a macro that returns NGX_CONF_ERROR literally cannot make that value
- * indistinguishable from a nomatch sentinel — the caller sees the return,
- * not the value. Cast to (char *) ensures the macro yields the right type
- * when used in a return statement. */
-#define NGX_HTTP_CACHE_TURBO_CONF_ERROR(level, cf, err, ...) \
-    ((void) (ngx_conf_log_error(level, cf, err, __VA_ARGS__)), NGX_CONF_ERROR)
 
 /* First third of the trailing "name=value" parameters, in the same order the
  * original loop tested them: prefix, timeout, keepalive. */
