@@ -189,7 +189,7 @@ PY
 # recorded in .claude/skills/audit-api-contract: a diagnostic that goes stale
 # when the thing it describes gains an entry.
 # ---------------------------------------------------------------------------
-python3 - "$DIR/../../../src/ngx_http_cache_turbo_module.c" <<'PY'
+python3 - "$DIR/../../../src/ngx_http_cache_turbo_conf.c" <<'PY'
 import re, sys
 
 src = open(sys.argv[1]).read()

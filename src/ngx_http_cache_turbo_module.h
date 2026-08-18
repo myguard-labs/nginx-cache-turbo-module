@@ -2206,8 +2206,9 @@ char *ngx_http_cache_turbo_redis_conf(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 char *ngx_http_cache_turbo_memcached_conf(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
-char *ngx_http_cache_turbo_redis_build_ssl(ngx_conf_t *cf,
-    ngx_http_cache_turbo_loc_conf_t *clcf);
+/* ngx_http_cache_turbo_redis_build_ssl moved to ngx_http_cache_turbo_conf.c
+ * alongside its only caller (merge_loc_conf) in MAINT-SPLIT step H and is
+ * static there now. */
 ngx_uint_t ngx_http_cache_turbo_breaker_should_consult(
     ngx_http_cache_turbo_loc_conf_t *clcf);
 

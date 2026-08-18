@@ -42,7 +42,7 @@ import re
 import sys
 from pathlib import Path
 
-SRC = Path("src/ngx_http_cache_turbo_module.c")
+SRC = Path("src/ngx_http_cache_turbo_conf.c")
 DOC_PATHS = [Path("README.md")]
 
 # The array's rows: { "name", NGX_HTTP_CACHE_TURBO_BACKEND_BIT, implies },
