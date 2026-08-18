@@ -43,26 +43,24 @@ ngx_http_cache_turbo_check_l2_prefix(ngx_conf_t *cf, ngx_str_t *prefix,
     size_t  i;
 
     if (prefix->len == 0) {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+        return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
             "cache_turbo: empty prefix= is not allowed "
             "(an all-purge would match the whole L2 keyspace)");
-        return NGX_CONF_ERROR;
     }
 
     for (i = 0; i < prefix->len; i++) {
         if (prefix->data[i] <= 0x20 || prefix->data[i] >= 0x7f) {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
                 "%s: prefix= contains byte 0x%02Xd at offset %uz; the L2 key "
                 "must be printable and free of spaces and control characters",
                 name, prefix->data[i], i);
-            return NGX_CONF_ERROR;
         }
     }
 
     if (prefix->len + NGX_HTTP_CACHE_TURBO_L2_KEY_SUFFIX_MAX
         > NGX_HTTP_CACHE_TURBO_L2_KEY_MAX)
     {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+        return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
             "%s: prefix= is %uz bytes; at most %uz are usable, because the "
             "module appends up to %d bytes of key and an L2 key may not "
             "exceed %d bytes",
@@ -71,7 +69,6 @@ ngx_http_cache_turbo_check_l2_prefix(ngx_conf_t *cf, ngx_str_t *prefix,
                       - NGX_HTTP_CACHE_TURBO_L2_KEY_SUFFIX_MAX),
             NGX_HTTP_CACHE_TURBO_L2_KEY_SUFFIX_MAX,
             NGX_HTTP_CACHE_TURBO_L2_KEY_MAX);
-        return NGX_CONF_ERROR;
     }
 
     return NGX_CONF_OK;
@@ -144,15 +141,13 @@ ngx_http_cache_turbo_redis_split_dsn(ngx_conf_t *cf,
         if (last - (slash + 1) > 0) {
             clcf->redis_db = ngx_atoi(slash + 1, last - (slash + 1));
             if (clcf->redis_db == NGX_ERROR || clcf->redis_db < 0) {
-                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
                     "cache_turbo_redis: bad db in DSN");
-                return NGX_CONF_ERROR;
             }
             if (clcf->redis_db > NGX_HTTP_CACHE_TURBO_REDIS_DB_MAX) {
-                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
                     "cache_turbo_redis: db in DSN exceeds the maximum %d",
                     NGX_HTTP_CACHE_TURBO_REDIS_DB_MAX);
-                return NGX_CONF_ERROR;
             }
         }
         hostport->data = rest;
@@ -184,9 +179,8 @@ ngx_http_cache_turbo_redis_resolve(ngx_conf_t *cf,
         return NGX_CONF_ERROR;
     }
     if (u.naddrs == 0) {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+        return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
                            "cache_turbo_redis: no addresses for \"%V\"", &u.url);
-        return NGX_CONF_ERROR;
     }
 
     clcf->redis_addr = u.addrs[0];
@@ -208,6 +202,16 @@ ngx_http_cache_turbo_redis_resolve(ngx_conf_t *cf,
 static char  ngx_http_cache_turbo_param_nomatch_obj;
 #define NGX_HTTP_CACHE_TURBO_PARAM_NOMATCH \
     (&ngx_http_cache_turbo_param_nomatch_obj)
+
+/* Log config error and return NGX_CONF_ERROR. Replaces the idiomatic
+ * ngx_conf_log_error(...); return NGX_CONF_ERROR; pattern to reduce noise
+ * at call sites. The sentinel-aliasing hazard noted above does not apply:
+ * a macro that returns NGX_CONF_ERROR literally cannot make that value
+ * indistinguishable from a nomatch sentinel — the caller sees the return,
+ * not the value. Cast to (char *) ensures the macro yields the right type
+ * when used in a return statement. */
+#define NGX_HTTP_CACHE_TURBO_CONF_ERROR(level, cf, err, ...) \
+    ((void) (ngx_conf_log_error(level, cf, err, __VA_ARGS__)), NGX_CONF_ERROR)
 
 /* First third of the trailing "name=value" parameters, in the same order the
  * original loop tested them: prefix, timeout, keepalive. */
@@ -233,30 +237,26 @@ ngx_http_cache_turbo_redis_param_pool_a(ngx_conf_t *cf,
         s.len = value->len - 8;
         t = ngx_parse_time(&s, 0);   /* milliseconds */
         if (t == NGX_ERROR) {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
                                "cache_turbo_redis: bad timeout \"%V\"", &s);
-            return NGX_CONF_ERROR;
         }
         if (t == 0) {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
                                "cache_turbo_redis: timeout must be > 0");
-            return NGX_CONF_ERROR;
         }
         clcf->redis_timeout = (ngx_msec_t) t;
 
     } else if (ngx_strncmp(value->data, "keepalive=", 10) == 0) {
         clcf->redis_keepalive = ngx_atoi(value->data + 10, value->len - 10);
         if (clcf->redis_keepalive == NGX_ERROR || clcf->redis_keepalive < 0) {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
                 "cache_turbo_redis: bad keepalive \"%V\"", value);
-            return NGX_CONF_ERROR;
         }
         /* STAB-5: bound N so the pool's N*sizeof(item) alloc can't overflow. */
         if (clcf->redis_keepalive > NGX_HTTP_CACHE_TURBO_KEEPALIVE_MAX) {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
                 "cache_turbo_redis: keepalive %V exceeds the maximum %d",
                 value, NGX_HTTP_CACHE_TURBO_KEEPALIVE_MAX);
-            return NGX_CONF_ERROR;
         }
 
     } else {
@@ -280,9 +280,8 @@ ngx_http_cache_turbo_redis_param_pool_b(ngx_conf_t *cf,
         s.len = value->len - 18;
         t = ngx_parse_time(&s, 0);   /* milliseconds */
         if (t == NGX_ERROR) {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
                 "cache_turbo_redis: bad keepalive_timeout \"%V\"", &s);
-            return NGX_CONF_ERROR;
         }
         clcf->redis_keepalive_timeout = (ngx_msec_t) t;
 
@@ -291,9 +290,8 @@ ngx_http_cache_turbo_redis_param_pool_b(ngx_conf_t *cf,
         s.len = value->len - 16;
         t = ngx_parse_time(&s, 0);   /* milliseconds; 0 = disabled */
         if (t == NGX_ERROR) {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
                 "cache_turbo_redis: bad connect_backoff \"%V\"", &s);
-            return NGX_CONF_ERROR;
         }
         clcf->redis_connect_backoff = (ngx_msec_t) t;
 
@@ -308,16 +306,14 @@ ngx_http_cache_turbo_redis_param_pool_b(ngx_conf_t *cf,
     } else if (ngx_strncmp(value->data, "db=", 3) == 0) {
         clcf->redis_db = ngx_atoi(value->data + 3, value->len - 3);
         if (clcf->redis_db == NGX_ERROR || clcf->redis_db < 0) {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
                                "cache_turbo_redis: bad db \"%V\"", value);
-            return NGX_CONF_ERROR;
         }
         if (clcf->redis_db > NGX_HTTP_CACHE_TURBO_REDIS_DB_MAX) {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
                                "cache_turbo_redis: db \"%V\" exceeds the "
                                "maximum %d", value,
                                NGX_HTTP_CACHE_TURBO_REDIS_DB_MAX);
-            return NGX_CONF_ERROR;
         }
 
     } else {
@@ -360,9 +356,8 @@ ngx_http_cache_turbo_redis_param_tls(ngx_conf_t *cf,
         } else if (s.len == 3 && ngx_strncmp(s.data, "off", 3) == 0) {
             clcf->redis_tls = 0;
         } else {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
                                "cache_turbo_redis: tls must be on|off");
-            return NGX_CONF_ERROR;
         }
 
     } else if (ngx_strncmp(value->data, "tls_verify=", 11) == 0) {
@@ -373,9 +368,8 @@ ngx_http_cache_turbo_redis_param_tls(ngx_conf_t *cf,
         } else if (s.len == 3 && ngx_strncmp(s.data, "off", 3) == 0) {
             clcf->redis_tls_verify = 0;
         } else {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
                                "cache_turbo_redis: tls_verify must be on|off");
-            return NGX_CONF_ERROR;
         }
 
     } else if (ngx_strncmp(value->data, "tls_ca=", 7) == 0) {
@@ -396,17 +390,15 @@ ngx_http_cache_turbo_redis_param_tls(ngx_conf_t *cf,
         s.len = value->len - 14;
         t = ngx_parse_time(&s, 0);   /* milliseconds */
         if (t == NGX_ERROR) {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
                 "cache_turbo_redis: bad scan_deadline \"%V\"", &s);
-            return NGX_CONF_ERROR;
         }
         clcf->redis_scan_deadline = (ngx_msec_t) t;
 
     } else {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+        return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
                            "cache_turbo_redis: invalid parameter \"%V\"",
                            value);
-        return NGX_CONF_ERROR;
     }
 
     return NGX_CONF_OK;
@@ -452,10 +444,9 @@ ngx_http_cache_turbo_redis_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     arg1 = value[1];
 
     if (clcf->memcached == 1) {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+        return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
             "cache_turbo_redis: an L2 backend (cache_turbo_memcached) is already "
             "configured in this block; the two are mutually exclusive");
-        return NGX_CONF_ERROR;
     }
 
     /* --- 1. split the DSN (scheme / userinfo / host:port / db) ------------- */
@@ -520,14 +511,12 @@ ngx_http_cache_turbo_memcached_param(ngx_conf_t *cf,
         s.len = value->len - 8;
         t = ngx_parse_time(&s, 0);   /* milliseconds */
         if (t == NGX_ERROR) {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
                 "cache_turbo_memcached: bad timeout \"%V\"", &s);
-            return NGX_CONF_ERROR;
         }
         if (t == 0) {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
                 "cache_turbo_memcached: timeout must be > 0");
-            return NGX_CONF_ERROR;
         }
         clcf->redis_timeout = (ngx_msec_t) t;
 
@@ -538,15 +527,13 @@ ngx_http_cache_turbo_memcached_param(ngx_conf_t *cf,
         if (clcf->memcached_keepalive == NGX_ERROR
             || clcf->memcached_keepalive < 0)
         {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
                 "cache_turbo_memcached: bad keepalive \"%V\"", &s);
-            return NGX_CONF_ERROR;
         }
         if (clcf->memcached_keepalive > NGX_HTTP_CACHE_TURBO_KEEPALIVE_MAX) {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
                 "cache_turbo_memcached: keepalive must be <= %d",
                 NGX_HTTP_CACHE_TURBO_KEEPALIVE_MAX);
-            return NGX_CONF_ERROR;
         }
 
     } else if (ngx_strncmp(value->data, "keepalive_timeout=", 18) == 0) {
@@ -554,9 +541,8 @@ ngx_http_cache_turbo_memcached_param(ngx_conf_t *cf,
         s.len = value->len - 18;
         t = ngx_parse_time(&s, 0);
         if (t == NGX_ERROR) {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
                 "cache_turbo_memcached: bad keepalive_timeout \"%V\"", &s);
-            return NGX_CONF_ERROR;
         }
         clcf->memcached_keepalive_timeout = (ngx_msec_t) t;
 
@@ -565,16 +551,14 @@ ngx_http_cache_turbo_memcached_param(ngx_conf_t *cf,
         s.len = value->len - 16;
         t = ngx_parse_time(&s, 0);   /* milliseconds; 0 = disabled */
         if (t == NGX_ERROR) {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
                 "cache_turbo_memcached: bad connect_backoff \"%V\"", &s);
-            return NGX_CONF_ERROR;
         }
         clcf->redis_connect_backoff = (ngx_msec_t) t;
 
     } else {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+        return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
             "cache_turbo_memcached: invalid parameter \"%V\"", value);
-        return NGX_CONF_ERROR;
     }
 
     return NGX_CONF_OK;
@@ -604,10 +588,9 @@ ngx_http_cache_turbo_memcached_conf(ngx_conf_t *cf, ngx_command_t *cmd,
     value = cf->args->elts;
 
     if (clcf->redis_enable == 1 && clcf->memcached != 1) {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+        return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
             "cache_turbo_memcached: an L2 backend (cache_turbo_redis) is already "
             "configured in this block; the two are mutually exclusive");
-        return NGX_CONF_ERROR;
     }
 
     ngx_memzero(&u, sizeof(ngx_url_t));
@@ -622,9 +605,8 @@ ngx_http_cache_turbo_memcached_conf(ngx_conf_t *cf, ngx_command_t *cmd,
         return NGX_CONF_ERROR;
     }
     if (u.naddrs == 0) {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+        return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
             "cache_turbo_memcached: no addresses for \"%V\"", &u.url);
-        return NGX_CONF_ERROR;
     }
 
     clcf->redis_addr = u.addrs[0];
@@ -1168,10 +1150,9 @@ ngx_http_cache_turbo_merge_l2_backend_tls(ngx_conf_t *cf,
     }
 #else
     if (conf->redis_enable && conf->redis_tls == 1) {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+        return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
             "cache_turbo_redis: TLS (rediss:// / tls=on) requires nginx built "
             "with --with-http_ssl_module");
-        return NGX_CONF_ERROR;
     }
 #endif
 
@@ -1347,17 +1328,15 @@ ngx_http_cache_turbo_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     }
 
     if (name.len == 0) {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+        return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
                            "invalid cache_turbo_zone name");
-        return NGX_CONF_ERROR;
     }
 
     s = value[2];
     size = ngx_parse_size(&s);
     if (size == NGX_ERROR || size < (ssize_t) (8 * ngx_pagesize)) {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+        return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
                            "invalid cache_turbo_zone size \"%V\"", &s);
-        return NGX_CONF_ERROR;
     }
 
     ctx = ngx_pcalloc(cf->pool, sizeof(ngx_http_cache_turbo_zone_t));
@@ -1372,9 +1351,8 @@ ngx_http_cache_turbo_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     }
 
     if (shm_zone->data) {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+        return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
                            "duplicate cache_turbo_zone \"%V\"", &name);
-        return NGX_CONF_ERROR;
     }
 
     shm_zone->init = ngx_http_cache_turbo_shm_init_zone;
@@ -1423,21 +1401,19 @@ ngx_http_cache_turbo(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
      */
     if (cf->args->nelts == 3) {
         if (ngx_strcmp(value[2].data, "auto") == 0) {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
                 "\"cache_turbo %V auto\" is no longer supported: the `auto` / "
                 "`generic` preset union has been removed because it was not a "
                 "safe default (it never covered every backend, and `joomla` in "
                 "it ships no cookie rule at all). Name the backends you actually "
                 "run, e.g. \"cache_turbo %V; cache_turbo_backend wordpress;\"",
                 &value[1], &value[1]);
-            return NGX_CONF_ERROR;
         }
 
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+        return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
             "invalid cache_turbo mode \"%V\" (cache_turbo takes a zone name "
             "only; use cache_turbo_backend to enable a CMS preset)",
             &value[2]);
-        return NGX_CONF_ERROR;
     }
 
     return NGX_CONF_OK;
@@ -1640,10 +1616,9 @@ ngx_http_cache_turbo_backend(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             }
 
             if (p == tok) {          /* empty slice: "||", leading/trailing "|" */
-                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
                     "empty backend name in cache_turbo_backend \"%V\" "
                     "(stray '|')", &value[i]);
-                return NGX_CONF_ERROR;
             }
 
             bit = ngx_http_cache_turbo_backend_bit(tok, (size_t) (p - tok));
@@ -1665,7 +1640,7 @@ ngx_http_cache_turbo_backend(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                     || (bad.len == sizeof("auto") - 1
                         && ngx_strncmp(bad.data, "auto", bad.len) == 0))
                 {
-                    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                    return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
                         "cache_turbo_backend \"%V\" has been removed: it was a "
                         "union of wordpress+woocommerce+joomla, which was never "
                         "a safe default — it did not cover every backend, "
@@ -1674,10 +1649,9 @@ ngx_http_cache_turbo_backend(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                         "cookie rule at all. Name the backends you actually run, "
                         "e.g. \"cache_turbo_backend wordpress|woocommerce;\"",
                         &bad);
-                    return NGX_CONF_ERROR;
                 }
 
-                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
                     "unknown cache_turbo_backend \"%V\" (want wordpress, "
                     "woocommerce, joomla, xenforo, discourse, phpbb, drupal, "
                     "mediawiki, magento, ghost, wagtail, kirby, shopware6, "
@@ -1687,7 +1661,6 @@ ngx_http_cache_turbo_backend(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                     "flarum, opencart, "
                     "classicpress, backdrop, or none — "
                     "separated by spaces or '|')", &bad);
-                return NGX_CONF_ERROR;
             }
 
             mask |= bit;
@@ -1701,10 +1674,9 @@ ngx_http_cache_turbo_backend(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                  * typo. Catch it here; the empty-slice check above only fires
                  * for a leading or doubled pipe. */
                 if (p == end) {
-                    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                    return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
                         "empty backend name in cache_turbo_backend \"%V\" "
                         "(trailing '|')", &value[i]);
-                    return NGX_CONF_ERROR;
                 }
             }
         }
@@ -1716,7 +1688,7 @@ ngx_http_cache_turbo_backend(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
      * like it says something and silently does nothing. NGX_CONF_1MORE already
      * guarantees at least one argument; this catches the degenerate one. */
     if (mask == 0) {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+        return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
             "cache_turbo_backend names no backend (want wordpress, woocommerce, "
             "joomla, xenforo, discourse, phpbb, drupal, mediawiki, magento, "
             "ghost, wagtail, kirby, shopware6, typo3, invision, smf, vanilla, "
@@ -1724,7 +1696,6 @@ ngx_http_cache_turbo_backend(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             "bugzilla, mantisbt, mantis, plone, umbraco, dotclear, wikijs, "
             "redmine, flarum, opencart, "
             "classicpress, backdrop, or none)");
-        return NGX_CONF_ERROR;
     }
 
     /* Resolve add-on implications (woocommerce -> wordpress) to a fixpoint.
@@ -1749,11 +1720,10 @@ ngx_http_cache_turbo_backend(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     if ((mask & NGX_HTTP_CACHE_TURBO_BACKEND_NONE)
         && NGX_HTTP_CACHE_TURBO_HAS_BACKEND(mask))
     {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+        return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
             "cache_turbo_backend \"none\" cannot be combined with other backends "
             "— it means \"no preset in this location\" (and overrides one "
             "inherited from the server block). Use it alone.");
-        return NGX_CONF_ERROR;
     }
 
     clcf->backend_presets = mask;
@@ -1784,10 +1754,9 @@ ngx_http_cache_turbo_cache_control(ngx_conf_t *cf, ngx_command_t *cmd,
     } else if (ngx_strcmp(value[1].data, "ignore") == 0) {
         clcf->cc_mode = NGX_HTTP_CACHE_TURBO_CC_IGNORE;
     } else {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+        return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
             "invalid cache_turbo_cache_control \"%V\" "
             "(want respect|honor|ignore)", &value[1]);
-        return NGX_CONF_ERROR;
     }
 
     return NGX_CONF_OK;
@@ -1845,10 +1814,9 @@ ngx_http_cache_turbo_valid_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
     valid = ngx_parse_time(&value[cf->args->nelts - 1], 1);   /* seconds */
     if (valid == (time_t) NGX_ERROR) {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+        return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
                            "cache_turbo_valid: bad time \"%V\"",
                            &value[cf->args->nelts - 1]);
-        return NGX_CONF_ERROR;
     }
 
     /* "0" means "cache forever" (the documented contract). Resolve it to a long
@@ -1876,9 +1844,8 @@ ngx_http_cache_turbo_valid_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     for (i = 1; i < cf->args->nelts - 1; i++) {
         code = ngx_atoi(value[i].data, value[i].len);
         if (code < 100 || code > 599) {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
                 "cache_turbo_valid: bad status code \"%V\"", &value[i]);
-            return NGX_CONF_ERROR;
         }
         /* Reject statuses that must not stand alone as a cached representation
          * (COR-12): 1xx informational are not final responses; 206 has no Range
@@ -1889,10 +1856,9 @@ ngx_http_cache_turbo_valid_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         if (code < 200 || code == NGX_HTTP_PARTIAL_CONTENT
             || code == NGX_HTTP_NOT_MODIFIED)
         {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
                 "cache_turbo_valid: status %V cannot be cached standalone "
                 "(1xx/206/304 refused)", &value[i]);
-            return NGX_CONF_ERROR;
         }
         /* COR-9: status_ttl() returns the FIRST matching rule, so a second rule
          * for the same code is dead. Warn rather than silently ignore it. */
@@ -1987,10 +1953,9 @@ ngx_http_cache_turbo_require_header(ngx_conf_t *cf, ngx_command_t *cmd,
             || c == '\\' || c == '"' || c == '/' || c == '[' || c == ']'
             || c == '?' || c == '=' || c == '{' || c == '}')
         {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
                                "invalid header name \"%V\" in "
                                "\"cache_turbo_require_header\"", &value[1]);
-            return NGX_CONF_ERROR;
         }
     }
 
@@ -2089,19 +2054,17 @@ ngx_http_cache_turbo_stale_mult(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
     n = ngx_atoi(value[1].data, value[1].len);
     if (n == NGX_ERROR) {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+        return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
             "cache_turbo_stale_mult: bad value \"%V\"", &value[1]);
-        return NGX_CONF_ERROR;
     }
 
     if (n < NGX_HTTP_CACHE_TURBO_STALE_MULT_MIN
         || n > NGX_HTTP_CACHE_TURBO_STALE_MULT_MAX)
     {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+        return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
             "cache_turbo_stale_mult \"%V\" is out of range: expected %d..%d",
             &value[1], NGX_HTTP_CACHE_TURBO_STALE_MULT_MIN,
             NGX_HTTP_CACHE_TURBO_STALE_MULT_MAX);
-        return NGX_CONF_ERROR;
     }
 
     clcf->stale_mult_raw = n;
@@ -2132,19 +2095,17 @@ ngx_http_cache_turbo_min_uses(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
      * two diagnostics are deliberately distinct — see the H5 lesson. */
     n = ngx_atoi(value[1].data, value[1].len);
     if (n == NGX_ERROR) {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+        return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
             "cache_turbo_min_uses: bad value \"%V\"", &value[1]);
-        return NGX_CONF_ERROR;
     }
 
     if (n < NGX_HTTP_CACHE_TURBO_MIN_USES_MIN
         || n > NGX_HTTP_CACHE_TURBO_MIN_USES_MAX)
     {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+        return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
             "cache_turbo_min_uses \"%V\" is out of range: expected %d..%d",
             &value[1], NGX_HTTP_CACHE_TURBO_MIN_USES_MIN,
             NGX_HTTP_CACHE_TURBO_MIN_USES_MAX);
-        return NGX_CONF_ERROR;
     }
 
     clcf->min_uses_raw = n;
@@ -2182,20 +2143,18 @@ ngx_http_cache_turbo_breaker_open_conf(ngx_conf_t *cf, ngx_command_t *cmd,
 
     n = ngx_parse_time(&value[1], 1);
     if (n == NGX_ERROR) {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+        return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
             "cache_turbo_breaker_open: invalid value \"%V\"", &value[1]);
-        return NGX_CONF_ERROR;
     }
 
     if (n == 0) {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+        return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
             "cache_turbo_breaker_open \"%V\" must be greater than 0 "
             "(0 wedges the breaker OPEN forever: it never reopens and, with "
             "no origin contact while OPEN, never closes either -- use "
             "cache_turbo_breaker off, cache_turbo_breaker_threshold 0, or "
             "cache_turbo_breaker_window 0 to disable the breaker instead)",
             &value[1]);
-        return NGX_CONF_ERROR;
     }
 
     clcf->breaker_open = (time_t) n;
@@ -2245,10 +2204,9 @@ ngx_http_cache_turbo_scan_resistant(ngx_conf_t *cf, ngx_command_t *cmd,
         on = 0;
 
     } else {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+        return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
             "cache_turbo_scan_resistant: bad value \"%V\": expected "
             "\"on\" or \"off\"", &value[1]);
-        return NGX_CONF_ERROR;
     }
 
     pct = NGX_HTTP_CACHE_TURBO_PROTECTED_PCT_DEFAULT;
@@ -2263,38 +2221,34 @@ ngx_http_cache_turbo_scan_resistant(ngx_conf_t *cf, ngx_command_t *cmd,
              * same split as cache_turbo_stale_mult (the H5 lesson). */
             pct = ngx_atoi(value[i].data + 14, value[i].len - 14);
             if (pct == NGX_ERROR) {
-                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
                     "cache_turbo_scan_resistant: bad protected_pct \"%V\"",
                     &value[i]);
-                return NGX_CONF_ERROR;
             }
 
             if (pct < NGX_HTTP_CACHE_TURBO_PROTECTED_PCT_MIN
                 || pct > NGX_HTTP_CACHE_TURBO_PROTECTED_PCT_MAX)
             {
-                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
                     "cache_turbo_scan_resistant: protected_pct \"%V\" is out "
                     "of range: expected %d..%d", &value[i],
                     NGX_HTTP_CACHE_TURBO_PROTECTED_PCT_MIN,
                     NGX_HTTP_CACHE_TURBO_PROTECTED_PCT_MAX);
-                return NGX_CONF_ERROR;
             }
 
             continue;
         }
 
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+        return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
             "cache_turbo_scan_resistant: unknown parameter \"%V\"", &value[i]);
-        return NGX_CONF_ERROR;
     }
 
     /* protected_pct on an `off` directive is accepted-but-inert config: reject
      * it rather than store a value that will never be read. */
     if (!on && cf->args->nelts > 2) {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+        return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
             "cache_turbo_scan_resistant: protected_pct is meaningless with "
             "\"off\"");
-        return NGX_CONF_ERROR;
     }
 
     clcf->scan_resistant_pct = on ? (ngx_uint_t) pct : 0;
@@ -2327,21 +2281,19 @@ ngx_http_cache_turbo_l2_negative_ttl(ngx_conf_t *cf, ngx_command_t *cmd,
 
     n = ngx_atoi(value[1].data, value[1].len);
     if (n == NGX_ERROR) {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+        return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
             "cache_turbo_l2_negative_ttl: bad value \"%V\"", &value[1]);
-        return NGX_CONF_ERROR;
     }
 
     if (n != 0
         && (n < NGX_HTTP_CACHE_TURBO_L2_NEG_TTL_MIN
             || n > NGX_HTTP_CACHE_TURBO_L2_NEG_TTL_MAX))
     {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+        return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
             "cache_turbo_l2_negative_ttl \"%V\" is out of range: expected 0 "
             "(off) or %d..%d",
             &value[1], NGX_HTTP_CACHE_TURBO_L2_NEG_TTL_MIN,
             NGX_HTTP_CACHE_TURBO_L2_NEG_TTL_MAX);
-        return NGX_CONF_ERROR;
     }
 
     clcf->l2_negative_ttl = (time_t) n;
@@ -2416,9 +2368,8 @@ ngx_http_cache_turbo_keep_stale(ngx_conf_t *cf, ngx_command_t *cmd,
 
     t = ngx_parse_time(&value[1], 1);   /* seconds, matches cache_turbo_valid */
     if (t == (time_t) NGX_ERROR) {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+        return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
             "cache_turbo_keep_stale: bad value \"%V\"", &value[1]);
-        return NGX_CONF_ERROR;
     }
 
     /* Clamp rather than reject (matches the store path's own TTL_MAX clamp,
@@ -2515,18 +2466,16 @@ ngx_http_cache_turbo_use_stale(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         }
 
         if (t->name.len == 0) {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
                 "invalid value \"%V\" in \"%V\" directive",
                 &value[i], &cmd->name);
-            return NGX_CONF_ERROR;
         }
     }
 
     if (saw_off && mask != 0) {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+        return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
             "invalid value \"off\" in \"%V\" directive: "
             "\"off\" cannot be combined with other tokens", &cmd->name);
-        return NGX_CONF_ERROR;
     }
 
     /* saw_off with mask == 0 -> empty mask (off). Any other combination of
@@ -2564,11 +2513,10 @@ ngx_http_cache_turbo_preset(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         clcf->preset = NGX_HTTP_CACHE_TURBO_PRESET_MICRO;
 
     } else {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+        return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
             "invalid cache_turbo_preset \"%V\": "
             "expected micro, conservative, balanced, or aggressive",
             &value[1]);
-        return NGX_CONF_ERROR;
     }
 
     return NGX_CONF_OK;
@@ -2706,10 +2654,9 @@ ngx_http_cache_turbo_normalize_vary(ngx_conf_t *cf, ngx_command_t *cmd,
             vary |= NGX_HTTP_CACHE_TURBO_VARY_DEVICE;
 
         } else {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
                 "invalid cache_turbo_normalize_vary token \"%V\": "
                 "expected encoding and/or device", &value[i]);
-            return NGX_CONF_ERROR;
         }
     }
 
@@ -2750,11 +2697,10 @@ ngx_http_cache_turbo_backend_prefix(ngx_conf_t *cf, ngx_command_t *cmd,
     if (value[1].len < 2 || value[1].data[0] != '/'
         || value[1].data[value[1].len - 1] != '/')
     {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+        return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
             "cache_turbo_backend_prefix \"%V\" must begin and end with \"/\" "
             "(e.g. \"/shop/\"); \"/\" alone is the root mount and is the "
             "default behaviour, so it is not a valid value", &value[1]);
-        return NGX_CONF_ERROR;
     }
 
     clcf->backend_prefix = ngx_palloc(cf->pool, sizeof(ngx_str_t));
@@ -2789,10 +2735,9 @@ ngx_http_cache_turbo_bypass_uri(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     value = cf->args->elts;
     for (i = 1; i < cf->args->nelts; i++) {
         if (value[i].len == 0 || value[i].data[0] != '/') {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
                 "cache_turbo_bypass_uri prefix \"%V\" must begin with \"/\"",
                 &value[i]);
-            return NGX_CONF_ERROR;
         }
         s = ngx_array_push(clcf->bypass_uri);
         if (s == NULL) {
@@ -2829,10 +2774,9 @@ ngx_http_cache_turbo_bypass_stale_uri(ngx_conf_t *cf, ngx_command_t *cmd,
     value = cf->args->elts;
     for (i = 1; i < cf->args->nelts; i++) {
         if (value[i].len == 0 || value[i].data[0] != '/') {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
                 "cache_turbo_bypass_stale_uri prefix \"%V\" must begin "
                 "with \"/\"", &value[i]);
-            return NGX_CONF_ERROR;
         }
         s = ngx_array_push(clcf->bypass_stale_uri);
         if (s == NULL) {
@@ -2869,9 +2813,8 @@ ngx_http_cache_turbo_key_cookie_conf(ngx_conf_t *cf, ngx_command_t *cmd,
     value = cf->args->elts;
     for (i = 1; i < cf->args->nelts; i++) {
         if (value[i].len == 0) {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
                 "cache_turbo_key_cookie name must not be empty");
-            return NGX_CONF_ERROR;
         }
         s = ngx_array_push(clcf->key_cookies);
         if (s == NULL) {
