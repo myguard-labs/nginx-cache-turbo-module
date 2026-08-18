@@ -75,9 +75,9 @@ uint64_t ngx_http_cache_turbo_get_u64(const u_char *p);
  * declared there instead, next to ngx_http_cache_turbo_blob_validate() which
  * has the same dependency. */
 
-/* Test-only observable, defined and read entirely within module.c
- * (cookie_has() / cookie_scan_header sites); module.c already carries its own
- * `extern` immediately above its later use, this one is redundant but
+/* Test-only observable, DEFINED in match.c (cookie_has()'s scan site,
+ * MAINT-SPLIT moved it out of module.c) and read from module.c, which carries
+ * its own `extern` immediately above that use — this one is redundant but
  * harmless. TEST_FAULTS-gated so the symbol only exists in a test build. */
 #if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
     && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
@@ -746,5 +746,28 @@ ngx_int_t ngx_http_cache_turbo_var_set(ngx_http_request_t *r,
 ngx_int_t ngx_http_cache_turbo_name_denied(ngx_http_cache_turbo_loc_conf_t *clcf,
     u_char *name, size_t nlen);
 ngx_int_t ngx_http_cache_turbo_tok_cmp(const void *one, const void *two);
+
+/* ---- match.c (cookie / query-arg / URI matching group, MAINT-SPLIT) ----
+ *
+ * Split out of module.c together with the FUZZ-EXTRACT auto-classify block it
+ * lives in. Only the symbols module.c still calls across the TU boundary lose
+ * `static`; every other helper in that group stays file-local. None of them
+ * carried `ngx_inline`, so no qualifier had to be dropped for the cross-TU
+ * call. */
+ngx_int_t ngx_http_cache_turbo_auto_skip(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf);
+ngx_int_t ngx_http_cache_turbo_key_cookie(ngx_http_request_t *r,
+    ngx_uint_t backend_presets, ngx_uint_t *cursor, ngx_str_t *name_out,
+    ngx_str_t *val_out);
+ngx_int_t ngx_http_cache_turbo_cookie_lookup(ngx_http_request_t *r,
+    ngx_str_t *name, ngx_str_t *val_out);
+ngx_int_t ngx_http_cache_turbo_bypass_uri_match(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf);
+ngx_uint_t ngx_http_cache_turbo_bypass_stale_uri_match(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf);
+
+/* Shared with the hex-decode helpers that stayed in module.c — the reason the
+ * comment above its definition gives for hexval living inside the FUZZ region. */
+ngx_int_t ngx_http_cache_turbo_hexval(u_char c);
 
 #endif /* NGX_HTTP_CACHE_TURBO_INTERNAL_H_INCLUDED_ */
