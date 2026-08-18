@@ -292,6 +292,18 @@ if [ ! -f "$FILTERSRC" ]; then
     exit 1
 fi
 
+# The access/precontent handler group lives in its own TU since MAINT-SPLIT
+# step F. The O4.3 pre-origin gate canary below is a CALL-SITE invariant stated
+# inside the access handler, so it follows that handler to this file. The
+# breaker predicates it calls still live in module.c's UNIT-EXTRACT block and
+# are still sliced from there, unchanged.
+ACCESSSRC="$UNIT_DIR/../../../src/ngx_http_cache_turbo_access.c"
+if [ ! -f "$ACCESSSRC" ]; then
+    echo "✗ cannot find $ACCESSSRC" >&2
+    rm -f "$OUT"
+    exit 1
+fi
+
 {
     echo ""
     awk '
@@ -534,8 +546,11 @@ FNS=$(grep -cE '^ngx_http_cache_turbo_[a-z_]+\(' "$OUT")
 # its resume, answers it locally, and leaves nobody to close the breaker -- one
 # burnt probe per window, indefinitely.
 #
-# Checked against module.c rather than the slice: the gate lives in the access
-# handler, which is not extracted. Comments stripped first, as everywhere here.
+# Checked against access.c rather than the slice: the gate lives in the access
+# handler, which is not extracted -- and which MAINT-SPLIT step F moved out of
+# module.c into src/ngx_http_cache_turbo_access.c. The predicate it calls still
+# lives in module.c's UNIT-EXTRACT block, so only this call-site check follows
+# the handler. Comments stripped first, as everywhere here.
 #
 # ⚠ The block is delimited by BRACE DEPTH, not by a `^    }$` line. The previous
 # form anchored on exact 4-space indentation and an exactly-indented closing
@@ -550,10 +565,10 @@ FNS=$(grep -cE '^ngx_http_cache_turbo_[a-z_]+\(' "$OUT")
 # own. If a second bare `should_consult(clcf)` gate block is ever added, this
 # picks the FIRST and the invariant would need re-scoping -- hence the count
 # guard below, which fails loudly instead of silently checking the wrong block.
-GATES=$(grep -cE '^[[:space:]]*if \(ngx_http_cache_turbo_breaker_should_consult\(clcf\)\)[[:space:]]*\{?$' "$MODSRC")
+GATES=$(grep -cE '^[[:space:]]*if \(ngx_http_cache_turbo_breaker_should_consult\(clcf\)\)[[:space:]]*\{?$' "$ACCESSSRC")
 if [ "$GATES" -ne 1 ]; then
     echo "✗ O4.3 canary cannot scope itself: expected exactly 1 bare" >&2
-    echo "  'if (breaker_should_consult(clcf))' gate in $MODSRC, found $GATES." >&2
+    echo "  'if (breaker_should_consult(clcf))' gate in $ACCESSSRC, found $GATES." >&2
     echo "  Re-scope this check (it verifies the FIRST such block only)." >&2
     rm -f "$OUT"
     exit 1
@@ -573,7 +588,7 @@ if ! awk '
         depth -= gsub(/\}/, "}")
         if (seen_open && depth <= 0) { exit }
     }
-' "$MODSRC" \
+' "$ACCESSSRC" \
    | sed -E 's;/\*.*;;; s;^[[:space:]]*\*.*;;' \
    | grep -q 'brk_consulted'; then
     echo "✗ O4.3 regression: the pre-origin breaker gate lost its" >&2

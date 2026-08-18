@@ -830,4 +830,88 @@ ngx_int_t ngx_http_cache_turbo_body_filter(ngx_http_request_t *r,
     ngx_chain_t *in);
 ngx_int_t ngx_http_cache_turbo_filter_chain_init(void);
 
+
+/* ---- access.c (access/precontent request-handling group, MAINT-SPLIT step F) --
+ *
+ * The request HOT PATH and the module's main entry point. Split out of module.c
+ * verbatim: the PURGE precontent handler, the access handler with its prologue
+ * and eligibility gates, the L1 and L2 phases, the only-if-cached / breaker /
+ * min-uses gates, the cold-miss single-flight machinery, and the blob-reference
+ * pool cleanups.
+ *
+ * Three symbols leave access.c. The two phase handlers lose `static` because
+ * ngx_http_cache_turbo_init() in module.c pushes their ADDRESS onto
+ * cmcf->phases[NGX_HTTP_PRECONTENT_PHASE].handlers, unchanged and in the same
+ * order as before the split -- nothing mutable crosses the boundary, so no
+ * *_init() shim is warranted here (step E needed one only because it owned two
+ * MUTABLE next-filter pointers). blob_cleanup leaves because
+ * ngx_http_cache_turbo_serve(), which stays in module.c, registers it as a pool
+ * cleanup handler; the record it fills is per-request pool memory, so this is a
+ * shared type and a function address, never shared mutable module-scope state.
+ *
+ * Eleven module.c helpers lose `static` in the other direction, below.
+ *
+ * None of the six carried `ngx_inline`, and no function in the moved range did
+ * either, so no inlining qualifier was dropped and the hot path gains no call
+ * the compiler was previously required to inline. */
+ngx_int_t ngx_http_cache_turbo_access_handler(ngx_http_request_t *r);
+ngx_int_t ngx_http_cache_turbo_precontent_handler(ngx_http_request_t *r);
+
+/* PERF-7 blob-reference cleanup record. Lives here rather than in access.c
+ * because ngx_http_cache_turbo_serve() (module.c) allocates one as pool cleanup
+ * data and writes both fields, while access.c owns the handler that reads and
+ * releases them. */
+typedef struct {
+    ngx_http_cache_turbo_zone_t  *z;
+    u_char                       *data;
+} ngx_http_cache_turbo_blob_cln_t;
+
+void ngx_http_cache_turbo_blob_cleanup(void *data);
+
+/* ---- module.c helpers the access.c group calls across the TU boundary ----
+ *
+ * Each was `static` in module.c before MAINT-SPLIT step F and lost the
+ * qualifier so the moved access/L1/L2/breaker paths can still reach it.
+ * Definitions stay in ngx_http_cache_turbo_module.c.
+ *
+ * breaker_action stays inside module.c's UNIT-EXTRACT breaker-failure block
+ * with the other four breaker predicates, which are already non-static there
+ * and slice identically; ci/tests/unit/extract_shm.sh is unaffected. */
+ngx_int_t ngx_http_cache_turbo_serve(ngx_http_request_t *r, u_char *copy,
+    size_t len, ngx_uint_t stale, ngx_http_cache_turbo_zone_t *z,
+    u_char *ref_data, const char *xcache);
+ngx_int_t ngx_http_cache_turbo_add_header(ngx_http_request_t *r, u_char *name,
+    size_t nlen, u_char *val, size_t vlen);
+ngx_uint_t ngx_http_cache_turbo_breaker_action(ngx_uint_t state,
+    ngx_uint_t has_body);
+
+/* Request Cache-Control interpretation and the autotune effective-value pair.
+ * These sit above the moved range in module.c and are its remaining inbound
+ * dependencies. Six of the eight now have access.c as their ONLY caller;
+ * effective_beta is also used by module.c's refresh-dice path and
+ * purge_request is the PURGE body that access.c's precontent handler
+ * dispatches to (refactor.md assigns purge_request to step G's _purge.c, so it
+ * deliberately stays put rather than widening this split's range).
+ *
+ * All eight are pure functions of their arguments over per-request ctx or the
+ * zone's own state -- none of them touches module-scope mutable state, so
+ * nothing shared crosses the TU boundary here beyond the call itself. */
+ngx_int_t ngx_http_cache_turbo_effective_beta(
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_zone_t *z);
+ngx_int_t ngx_http_cache_turbo_effective_load(
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_zone_t *z);
+ngx_int_t ngx_http_cache_turbo_purge_request(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf);
+void ngx_http_cache_turbo_req_serve_verdict(ngx_http_cache_turbo_ctx_t *ctx,
+    time_t created, time_t now, time_t fresh_until,
+    ngx_int_t *fresh_ok, ngx_int_t *stale_ok);
+void ngx_http_cache_turbo_request_freshness_bounds(ngx_http_request_t *r,
+    ngx_http_cache_turbo_ctx_t *ctx);
+ngx_int_t ngx_http_cache_turbo_request_no_store(ngx_http_request_t *r,
+    ngx_http_cache_turbo_ctx_t *ctx);
+ngx_int_t ngx_http_cache_turbo_request_only_if_cached(ngx_http_request_t *r,
+    ngx_http_cache_turbo_ctx_t *ctx);
+ngx_int_t ngx_http_cache_turbo_request_revalidate(ngx_http_request_t *r,
+    ngx_http_cache_turbo_ctx_t *ctx);
+
 #endif /* NGX_HTTP_CACHE_TURBO_INTERNAL_H_INCLUDED_ */

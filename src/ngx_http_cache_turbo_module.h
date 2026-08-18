@@ -1772,8 +1772,10 @@ typedef struct {
      * metadata and still not reclaim its blob, so the zone drains without
      * freeing space (Codex F3, PR #135). NULL once dropped or never armed.
      *
-     * void * because ngx_http_cache_turbo_blob_cln_t is private to module.c,
-     * which is the only file that dereferences this. */
+     * void * because this header is the public one: the layout of
+     * ngx_http_cache_turbo_blob_cln_t lives in
+     * ngx_http_cache_turbo_internal.h, and access.c is the only file that
+     * dereferences this. */
     void                    *brk_cln;
 
     /* P6/O4.3: the pre-origin gate's verdict, latched on first consult.
