@@ -195,6 +195,14 @@ cppcheck --enable=unusedFunction,style --inline-suppr -DNGX_PTR_SIZE=8 \
   correspondence unauditable. Same for `not_modified_etag`,
   `emit_surrogate_key_parse`. **CCN is measuring the spec here, not the code** —
   resist any blanket "get CCN under 20" push.
+- **`ngx_http_cache_turbo_cookie_value`** (`match.c:626`, CCN 29/NLOC 58).
+  MAINT-H4f examined it and concluded leave-whole; PR #308 closed unmerged as a
+  decision document, so the analysis exists nowhere in the tree. It is a
+  single-pass cookie scanner whose cursor `p`, pair bounds (`pair`/`plen`) and
+  equals position `eq` advance together inside one iteration. Splitting it means
+  passing that state through every helper and rebuilding the buffer invariants
+  in each: indirection that does not shorten the longest phase. Same call as
+  `not_modified_etag` above.
 - **`classify_vary_classify_token`** (`module.c:13329-13346`) unless test-pinned
   first. It is a textbook table-driven candidate, but the comment at `:13325`
   reads *"Do not reorder or collapse these arms"* — arm order is load-bearing for
