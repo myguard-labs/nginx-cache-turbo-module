@@ -3188,6 +3188,21 @@ ngx_http_cache_turbo_redis_read_scan(ngx_event_t *rev)
 
         op->scan_pages++;
 
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+        /* S231-L2-SCANTIME: hold this page boundary so the deadline check
+         * below is reachable regardless of runner speed. Placed BEFORE the
+         * cursor==0 completion return on purpose: that return is what makes
+         * the deadline unreachable on a walk that finishes, so the hold has to
+         * precede it to bound a walk of any size. ngx_current_msec is the
+         * CACHED clock, so this also forces the event loop's time to advance
+         * across the walk. 0/unset = no hold. */
+        if (op->clcf->test_scan_page_hold_ms > 0) {
+            ngx_msleep((ngx_msec_t) op->clcf->test_scan_page_hold_ms);
+            ngx_time_update();
+        }
+#endif
+
         if (cursor.len == 1 && cursor.data[0] == '0') {
             /* whole keyspace walked: emit the response via the callback */
             op->scan_status = NGX_OK;
