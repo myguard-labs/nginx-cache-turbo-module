@@ -806,13 +806,25 @@ ngx_http_cache_turbo_build_key(ngx_http_request_t *r,
     {
     ngx_array_t  slots;
 
-    /* Small typical case (0-2 folded cookies): a 4-element inline pool
-     * allocation covers it without a second array_push growth. */
-    if (ngx_array_init(&slots, r->pool, 4,
-                        sizeof(ngx_http_cache_turbo_key_cookie_slot_t))
-        != NGX_OK)
+    /* Guard the unconditional pool allocation: slots is only needed if either
+     * a backend preset has key_cookies OR DIY cache_turbo_key_cookie is
+     * configured. The common case (no presets, no key_cookies) skips the 4-slot
+     * allocation per request by zero-initializing the struct instead — the fold
+     * loop below (ngx_http_cache_turbo_key_fold_all) checks nelts == 0 and
+     * returns early. */
+    ngx_memzero(&slots, sizeof(slots));
+
+    if (NGX_HTTP_CACHE_TURBO_HAS_BACKEND(clcf->backend_presets) ||
+        (clcf->key_cookies != NULL && clcf->key_cookies != NGX_CONF_UNSET_PTR))
     {
-        return NGX_ERROR;
+        /* Small typical case (0-2 folded cookies): a 4-element inline pool
+         * allocation covers it without a second array_push growth. */
+        if (ngx_array_init(&slots, r->pool, 4,
+                            sizeof(ngx_http_cache_turbo_key_cookie_slot_t))
+            != NGX_OK)
+        {
+            return NGX_ERROR;
+        }
     }
 
     if (NGX_HTTP_CACHE_TURBO_HAS_BACKEND(clcf->backend_presets)) {
