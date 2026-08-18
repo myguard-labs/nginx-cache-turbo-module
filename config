@@ -13,6 +13,7 @@ CACHE_TURBO_SRCS="                                                       \
                   $ngx_addon_dir/src/ngx_http_cache_turbo_blob.c        \
                   $ngx_addon_dir/src/ngx_http_cache_turbo_vary.c        \
                   $ngx_addon_dir/src/ngx_http_cache_turbo_match.c       \
+                  $ngx_addon_dir/src/ngx_http_cache_turbo_filters.c     \
                   "
 
 CACHE_TURBO_DEPS="                                                      \
