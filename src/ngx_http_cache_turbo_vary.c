@@ -49,15 +49,19 @@ static ngx_str_t  ngx_http_cache_turbo_default_strip[] = {
 };
 
 
-/* Does an arg name match a denylist pattern? Trailing '*' => prefix match. */
+/* Does an arg name match a denylist pattern? Trailing '*' => prefix match.
+ * Case-insensitive: query-arg names reach here straight from r->args.data
+ * (see ngx_http_cache_turbo_normalized_args_variable), never lowercased by
+ * anything upstream, while every built-in and configured pattern is
+ * lowercase -- so "UTM_Source" must still match "utm_*". */
 static ngx_int_t
 ngx_http_cache_turbo_pat_match(ngx_str_t *pat, u_char *name, size_t nlen)
 {
     if (pat->len > 0 && pat->data[pat->len - 1] == '*') {
         size_t  plen = pat->len - 1;
-        return nlen >= plen && ngx_strncmp(name, pat->data, plen) == 0;
+        return nlen >= plen && ngx_strncasecmp(name, pat->data, plen) == 0;
     }
-    return nlen == pat->len && ngx_strncmp(name, pat->data, nlen) == 0;
+    return nlen == pat->len && ngx_strncasecmp(name, pat->data, nlen) == 0;
 }
 
 
