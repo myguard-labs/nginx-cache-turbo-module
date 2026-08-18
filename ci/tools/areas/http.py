@@ -500,6 +500,172 @@ def test_stale_serves_stale_origin_hard_dead(ng: Nginx, origin: Origin) -> None:
         drain_origin(origin)   # settle the failing bg refreshes before next test
 
 
+def test_cold_wait_loser_serves_stale_on_lock_timeout(
+        ng: Nginx, origin: Origin) -> None:
+    """P1-8: a cold-miss LOSER that times out waiting on the single-flight
+    winner (cache_turbo_lock_timeout) must serve an already-armed
+    stale-if-error snapshot instead of falling through to a (possibly slow)
+    origin itself -- the exact moment a stampede hurts most.
+
+    /coldwaitsie/ (valid 1s, stale_mult 1) primes with the "sieserve" origin
+    marker so the stored blob carries a stale-if-error=30 window. After the
+    entry fully expires (~1.3s), the SAME key is fetched with the origin
+    made slow (origin.delay >> lock_timeout 1s): the first request becomes
+    the CLAIM_WINNER and blocks in the slow origin fetch; a second,
+    concurrent request on the same key is a genuine CLAIM_LOSER and parks in
+    cold_wait(). Its lock_timeout (1s) expires long before the winner's slow
+    origin fetch returns, so with the fix it must serve the armed SIE
+    snapshot (x-cache: STALE-IF-ERROR) rather than issuing its own origin
+    request.
+
+    The oracle is origin.hits_for(), not just status/body: with the bug, the
+    timed-out loser falls through to NGX_DECLINED and issues a SECOND origin
+    request of its own (a genuine stampede) even though its body would
+    still equal the primed body once the slow winner eventually returns --
+    an equality-only assertion could not tell "served the loser's own
+    origin fetch" from "served the stashed snapshot" since both eventually
+    produce the same bytes here. Counting origin contacts for this key
+    distinguishes them: exactly one (the winner's) with the fix, at least
+    two without it.
+
+    Negative-control sibling below (test_cold_wait_loser_no_snapshot_goes_to_origin)
+    proves the ordinary give-up-to-origin behaviour is unchanged when no SIE
+    snapshot is armed."""
+    key = "sieserve-cw1"
+    uri = f"/coldwaitsie/sieserve-{key}"
+
+    s0, b0, _ = fetch(ng.port, uri)
+    assert s0 == 200 and b0, f"prime failed: {s0} {b0!r}"
+
+    time.sleep(1.3)   # past fresh (1s) + stale (stale_mult 1 -> 1s): expired
+
+    base = origin.hits_for(key)
+    sie_before = _admin_stat(ng, "sie_serves")
+    origin.delay = 3.0   # >> lock_timeout (1s), << fetch()'s 5s client timeout
+    try:
+        results: list[tuple[int, str, dict]] = [None, None]  # type: ignore[list-item]
+
+        def _winner() -> None:
+            results[0] = fetch(ng.port, uri)
+
+        def _loser() -> None:
+            results[1] = fetch(ng.port, uri)
+
+        t_winner = threading.Thread(target=_winner)
+        t_winner.start()
+        time.sleep(0.15)   # let the winner claim the stub before the loser arrives
+        t_loser = threading.Thread(target=_loser)
+        t_loser.start()
+        t_loser.join(timeout=4.0)
+        assert not t_loser.is_alive(), \
+            "loser did not return within lock_timeout + margin"
+
+        sl, bl, hl = results[1]
+        assert sl == 200, f"loser expected 200 stale serve, got {sl}"
+        assert bl == b0, f"loser served {bl!r}, expected stale {b0!r}"
+        assert hl.get("x-cache") == "STALE-IF-ERROR", \
+            (f"loser should serve the armed SIE snapshot, got "
+             f"x-cache={hl.get('x-cache')}")
+
+        # S7.1: the dedicated sie_serves counter must move for this delivery
+        # site too, not just the generic stale_serves -- same discipline the
+        # header-filter SIE serve and the breaker-fallback serve both follow.
+        assert _admin_stat(ng, "sie_serves") - sie_before == 1, \
+            "sie_serves did not move for the cold-wait-timeout SIE delivery"
+
+        # THE assertion: the loser must not have made its own origin request.
+        # With the bug it falls through to NGX_DECLINED at lock_timeout and
+        # issues a second origin fetch for this key; the fix serves the
+        # snapshot with zero extra origin contact from the loser.
+        hits_after_loser = origin.hits_for(key)
+        assert hits_after_loser - base == 0, \
+            (f"loser reached the origin ({hits_after_loser - base} extra "
+             "hit(s)) instead of serving the armed SIE snapshot -- cold-wait "
+             "timeout stampeded the slow origin")
+
+        t_winner.join(timeout=6.0)
+        assert not t_winner.is_alive(), "winner never returned"
+        sw, bw, _ = results[0]
+        assert sw == 200 and bw, f"winner (slow origin) failed: {sw} {bw!r}"
+
+        # Exactly one origin contact total for this key: the winner's own
+        # (slow) regen. The loser contributed none.
+        assert origin.hits_for(key) - base == 1, \
+            (f"expected exactly 1 origin contact for {key} (the winner's), "
+             f"got {origin.hits_for(key) - base}")
+    finally:
+        origin.reset_delay()
+        drain_origin(origin)
+
+
+def test_cold_wait_loser_no_snapshot_goes_to_origin(
+        ng: Nginx, origin: Origin) -> None:
+    """P1-8 negative control: a cold-miss LOSER whose key has NO armed SIE
+    snapshot (a plain expired-with-no-stale-if-error entry, same shape as
+    /sieserve/'s "plain" control) must still give up at lock_timeout and go
+    to the origin itself, exactly as before this change -- the byte-identical
+    fall-through path for the common case (no snapshot armed) must not
+    regress."""
+    key = "plain-cw1"
+    uri = f"/coldwaitsie/plain-{key}"
+
+    s0, b0, _ = fetch(ng.port, uri)
+    assert s0 == 200 and b0, f"prime failed: {s0} {b0!r}"
+
+    time.sleep(1.3)   # expired; no stale-if-error on this marker -> sie_ttl == 0
+
+    base = origin.hits_for(key)
+    sie_before = _admin_stat(ng, "sie_serves")
+    # Unlike the positive test, this control's loser does NOT serve a
+    # snapshot: it gives up at lock_timeout (~1s) and then makes its OWN
+    # origin request, so its total wall time is lock_timeout + whatever the
+    # origin takes, not just lock_timeout. A shorter delay than the positive
+    # test's (still comfortably longer than lock_timeout, so the winner is
+    # provably still in flight when the loser's wait expires) keeps the
+    # loser's own fetch well under fetch()'s 5s client ceiling.
+    origin.delay = 1.5
+    try:
+        results: list[tuple[int, str, dict]] = [None, None]  # type: ignore[list-item]
+
+        def _winner() -> None:
+            results[0] = fetch(ng.port, uri)
+
+        def _loser() -> None:
+            results[1] = fetch(ng.port, uri)
+
+        t_winner = threading.Thread(target=_winner)
+        t_winner.start()
+        time.sleep(0.15)
+        t_loser = threading.Thread(target=_loser)
+        t_loser.start()
+        t_loser.join(timeout=4.0)
+        assert not t_loser.is_alive(), \
+            "loser did not return within lock_timeout + its own origin delay"
+
+        sl, _bl, hl = results[1]
+        assert sl == 200, f"loser expected 200 (its own origin fetch), got {sl}"
+        assert hl.get("x-cache") != "STALE-IF-ERROR", \
+            ("no SIE snapshot was armed for this key; the loser must not "
+             f"serve one, got x-cache={hl.get('x-cache')}")
+
+        # Unchanged behaviour: the timed-out loser makes its OWN origin
+        # request when nothing is armed to serve instead.
+        assert origin.hits_for(key) - base >= 1, \
+            "loser with no armed snapshot should have gone to the origin " \
+            "itself at lock_timeout, but made no origin contact"
+
+        # sie_serves must NOT move: no snapshot was armed, so this delivery
+        # is not an SIE serve by any path.
+        assert _admin_stat(ng, "sie_serves") - sie_before == 0, \
+            "sie_serves moved even though no SIE snapshot was armed"
+
+        t_winner.join(timeout=6.0)
+        assert not t_winner.is_alive(), "winner never returned"
+    finally:
+        origin.reset_delay()
+        drain_origin(origin)
+
+
 def test_sie_serve_on_error(ng: Nginx, origin: Origin) -> None:
     """RFC-2 (CTB4) stale-if-error serve-on-error: a FULLY EXPIRED entry (past its
     stale window) whose blob carries a serve-on-error window (created + sie_ttl) is
