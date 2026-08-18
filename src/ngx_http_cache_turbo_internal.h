@@ -770,4 +770,64 @@ ngx_uint_t ngx_http_cache_turbo_bypass_stale_uri_match(ngx_http_request_t *r,
  * comment above its definition gives for hexval living inside the FUZZ region. */
 ngx_int_t ngx_http_cache_turbo_hexval(u_char c);
 
+/* ---- module.c helpers the filters.c group calls across the TU boundary ----
+ *
+ * MAINT-SPLIT step E moved the header/body filters out of module.c; these
+ * twenty helpers stayed behind (their other callers are in module.c) and lose
+ * `static` so the moved filters can still reach them. Definitions are
+ * unchanged apart from the dropped qualifier, and none carried `ngx_inline`.
+ *
+ * ⚠ breaker_is_origin_failure and breaker_should_record live inside module.c's
+ * UNIT-EXTRACT breaker-failure block, so ci/tests/unit/generated_shm.inc now
+ * carries them without `static` too -- the same shape breaker_should_consult
+ * already had inside that block before this split. */
+ngx_uint_t ngx_http_cache_turbo_breaker_from_origin(ngx_uint_t upstream,
+    ngx_uint_t native_cached);
+ngx_uint_t ngx_http_cache_turbo_breaker_is_origin_failure(ngx_uint_t status);
+ngx_uint_t ngx_http_cache_turbo_breaker_should_record(ngx_uint_t served,
+    ngx_uint_t from_origin, ngx_uint_t is_main, ngx_uint_t threshold);
+ngx_int_t ngx_http_cache_turbo_build_key(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx);
+void ngx_http_cache_turbo_emit_surrogate_key(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf);
+ngx_int_t ngx_http_cache_turbo_header_admissible(ngx_http_cache_turbo_loc_conf_t *clcf,
+    u_char *name, size_t nlen, u_char *val, size_t vlen);
+ngx_int_t ngx_http_cache_turbo_require_hdr_ok(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf);
+ngx_int_t ngx_http_cache_turbo_response_cacheable(ngx_http_request_t *r);
+ngx_int_t ngx_http_cache_turbo_response_must_revalidate(ngx_http_request_t *r);
+time_t ngx_http_cache_turbo_response_sie(ngx_http_request_t *r);
+time_t ngx_http_cache_turbo_response_swr(ngx_http_request_t *r);
+ngx_int_t ngx_http_cache_turbo_sie_rewrite(ngx_http_request_t *r,
+    ngx_http_cache_turbo_ctx_t *ctx);
+ngx_int_t ngx_http_cache_turbo_sie_snap_body_len(ngx_http_cache_turbo_ctx_t *ctx,
+    size_t *body_lenp);
+time_t ngx_http_cache_turbo_status_ttl(ngx_http_cache_turbo_loc_conf_t *clcf,
+    ngx_uint_t status);
+ngx_int_t ngx_http_cache_turbo_test_arg_scan_header(ngx_http_request_t *r);
+ngx_int_t ngx_http_cache_turbo_test_armings_header(ngx_http_request_t *r);
+ngx_int_t ngx_http_cache_turbo_test_backoff_header(ngx_http_request_t *r);
+ngx_int_t ngx_http_cache_turbo_test_cookie_scan_header(ngx_http_request_t *r);
+time_t ngx_http_cache_turbo_upstream_ttl(ngx_http_request_t *r);
+ngx_uint_t ngx_http_cache_turbo_use_stale_triggers(ngx_uint_t mask, ngx_uint_t status);
+
+/* ---- filters.c (response header/body filter group, MAINT-SPLIT step E) ----
+ *
+ * The request HOT PATH. Split out of module.c verbatim; the two next-filter
+ * chain pointers moved with it because every call site is in that file, so
+ * filters.c owns the chain hand-off end to end.
+ *
+ * Only three symbols cross the TU boundary. header_filter and body_filter lose
+ * `static` because ngx_http_cache_turbo_filter_chain_init() installs them (and
+ * module.c reaches them only through that call); chain_init itself is the new
+ * seam module.c's ngx_http_cache_turbo_filter_init() calls in place of the two
+ * save-and-install pairs it used to perform inline, at the same point and in
+ * the same order. Every other helper in the group stays file-local static, and
+ * none of them carried `ngx_inline`, so no qualifier had to be dropped and the
+ * hot path gains no cross-TU call that was previously inlined. */
+ngx_int_t ngx_http_cache_turbo_header_filter(ngx_http_request_t *r);
+ngx_int_t ngx_http_cache_turbo_body_filter(ngx_http_request_t *r,
+    ngx_chain_t *in);
+ngx_int_t ngx_http_cache_turbo_filter_chain_init(void);
+
 #endif /* NGX_HTTP_CACHE_TURBO_INTERNAL_H_INCLUDED_ */

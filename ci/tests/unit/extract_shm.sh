@@ -282,6 +282,16 @@ if [ ! -f "$MODSRC" ]; then
     exit 1
 fi
 
+# The header/body filter group lives in its own TU since MAINT-SPLIT step E.
+# Call-site invariants that used to be checked against module.c and are stated
+# inside a filter are checked against this file instead.
+FILTERSRC="$UNIT_DIR/../../../src/ngx_http_cache_turbo_filters.c"
+if [ ! -f "$FILTERSRC" ]; then
+    echo "✗ cannot find $FILTERSRC" >&2
+    rm -f "$OUT"
+    exit 1
+fi
+
 {
     echo ""
     awk '
@@ -325,9 +335,12 @@ fi
 # cache with r->upstream already allocated. Those hits would then clear a real
 # failure run, or close a HALF_OPEN breaker with no probe reaching the origin.
 #
-# Checked against module.c rather than the slice: the call site is in the header
-# filter, which is not extracted. Comments stripped first, as everywhere here.
-if ! sed -n '/ngx_http_cache_turbo_breaker_should_record($/,/^    {$/p' "$MODSRC" \
+# Checked against filters.c rather than the slice: the call site is in the
+# header filter, which is not extracted -- and which MAINT-SPLIT step E moved
+# out of module.c into src/ngx_http_cache_turbo_filters.c. The predicate itself
+# still lives in module.c's UNIT-EXTRACT block, so only this call-site check
+# follows the filter. Comments stripped first, as everywhere here.
+if ! sed -n '/ngx_http_cache_turbo_breaker_should_record($/,/^    {$/p' "$FILTERSRC" \
    | sed -E 's;/\*.*;;; s;^[[:space:]]*\*.*;;' \
    | grep -q 'r->cached'; then
     echo "✗ O4.2 regression: the breaker call site no longer excludes" >&2
