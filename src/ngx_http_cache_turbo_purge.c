@@ -43,6 +43,156 @@
 #include "ngx_http_cache_turbo_internal.h"
 
 
+/* COR-5 helper: invalidate every auto-Vary variant of the base URI just
+ * purged. Variants are stored under variant keys (base material + the
+ * folded axis values), not the base key, so the base purge in the caller
+ * never touches them. Two strategies by L2 capability:
+ *   - Redis (purge_tag): the variants were SADD'd into a per-base index set
+ *     at store time. SMEMBERS it and drop every variant from L1 + L2 + the
+ *     set (async). Delete the node-local marker so this node stops resolving
+ *     to the now-removed variants; the keyspace resets cleanly to gen 0.
+ *   - L1-only / memcached (no enumerable index): bump the marker generation
+ *     so old-generation variants are orphaned (new requests key on gen+1;
+ *     orphans age out via L1 LRU + TTL / memcached value TTL).
+ *
+ * Returns NGX_DONE if the async purge_tag path parked the request (caller
+ * must return NGX_DONE immediately, without touching r->main->count again);
+ * returns NGX_OK otherwise, in which case *purged has been updated in
+ * place for the caller's synchronous JSON reply. */
+static ngx_int_t
+ngx_http_cache_turbo_purge_auto_vary(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_zone_t *z,
+    ngx_http_cache_turbo_ctx_t *ctx, ngx_uint_t *purged)
+{
+    u_char                        mk[32];
+    ngx_int_t                     bits = 0;
+    ngx_uint_t                    mgen = 0;
+    ngx_uint_t                    next_gen;
+    time_t                        mttl = 0;
+    ngx_uint_t                    have_marker = 0;
+    ngx_http_cache_turbo_node_t  *m;
+
+    ngx_http_cache_turbo_marker_hash(&ctx->cache_key, mk);
+    ngx_shmtx_lock(&z->shpool->mutex);
+    m = clcf->l1->lookup(z, mk, ngx_crc32_short(mk, 32));
+    if (m != NULL && m->data != NULL
+        && m->len >= NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE + 1)
+    {
+        ngx_http_cache_turbo_blob_hdr_t  mh;
+        if (ngx_http_cache_turbo_blob_validate(m->data, m->len, &mh,
+                NULL, NULL, NULL, NULL) == NGX_OK)
+        {
+            have_marker = 1;
+            bits = m->data[NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE];
+            if (m->len >= NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE + 2) {
+                mgen = m->data[NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE + 1];
+            }
+            mttl = (time_t) mh.fresh_ttl;
+        }
+    }
+    ngx_shmtx_unlock(&z->shpool->mutex);
+
+    if (clcf->backend && clcf->backend->purge_tag) {
+        u_char                            vname[1 + 64];
+        size_t                            vlen;
+        ngx_http_cache_turbo_tagpurge_t  *tp;
+        ngx_int_t                         prc;
+
+        (void) clcf->l1->purge_key(z, mk, ngx_crc32_short(mk, 32));
+
+        tp = ngx_pcalloc(r->pool, sizeof(*tp));
+        if (tp == NULL) {
+            /* could not launch (alloc): fall through to the sync
+             * base-only reply below. */
+            return NGX_OK;
+        }
+
+        vlen = ngx_http_cache_turbo_variant_index_name(&ctx->cache_key,
+                                                        vname);
+        tp->clcf = clcf;
+        tp->zone = z;
+        tp->tag.data = ngx_pnalloc(r->pool, vlen);
+        if (tp->tag.data == NULL) {
+            return NGX_OK;
+        }
+
+        ngx_memcpy(tp->tag.data, vname, vlen);
+        tp->tag.len = vlen;
+        prc = clcf->backend->purge_tag(r, clcf, vname, vlen,
+                  ngx_http_cache_turbo_tag_purge_complete, tp);
+        if (prc != NGX_DONE) {
+            /* could not launch (L2 down): fall through to the sync
+             * base-only reply below. */
+            return NGX_OK;
+        }
+
+        /* parked; the completion drops every variant + the index
+         * set and sends {"purged":N}. */
+
+        /* S231-VARY-LEAK: release the park's reference here,
+         * because THIS caller is the one that never gets a free
+         * drop. purge_request runs in the PRECONTENT phase, and
+         * ngx_http_core_generic_phase answers NGX_DONE with a
+         * bare `return NGX_OK` -- it never calls
+         * ngx_http_finalize_request at all. The completion's
+         * single finalize would therefore leave count at 1 with
+         * nothing left to drop it, orphaning the client
+         * connection with its fd open (visible only at worker
+         * shutdown as "open socket left in connection").
+         *
+         * The module's other two parked purge entry points --
+         * admin_handler's ?tag= (purge_tag) and its all-purge
+         * (scan_del) -- must NOT do this: they are reached
+         * through core->handler, and
+         * ngx_http_core_content_phase ALWAYS runs
+         * ngx_http_finalize_request(r, rc), where NGX_DONE goes
+         * to ngx_http_finalize_connection -> the count != 1
+         * branch -> ngx_http_close_request, which decrements.
+         * Their parks are already balanced; dropping again
+         * there trips "http request count is zero". The
+         * asymmetry is the CALLER'S PHASE, not the op kind, so
+         * the release belongs at each acquire site rather than
+         * in the shared completion. */
+        r->main->count--;
+
+        return NGX_DONE;
+    }
+
+    if (!have_marker) {
+        return NGX_OK;
+    }
+
+    /* AUD-GEN1: wrap explicitly, and NEVER land back on 0. gen 0 is
+     * the permanent "never purged" identity (default when no marker
+     * exists yet); folding it unconditionally (see variant_hash)
+     * stops it colliding with the pre-COR-5 untagged keyspace, but
+     * that alone does not stop THIS purge sequence from reproducing
+     * its OWN gen-0 identity every 256 purges -- 256 & 0xFF == 0,
+     * numerically indistinguishable from "never purged" once stored
+     * in one byte, so a request racing the wrap would resolve back to
+     * whatever is still resident under the base's original,
+     * pre-first-purge key (proven by a real 256-purge round trip
+     * against the unpatched arithmetic, not just reasoned about).
+     * Skipping 0 on wrap makes 0 permanently exclusive to "never
+     * purged": once a base has been purged at all, its generation can
+     * never again equal the identity a fresh, unpurged base uses.
+     * The residual (generation N colliding with N+255, still a
+     * 1-byte counter) is the accepted trade-off the ledger row
+     * documents; this closes the specific, highest-risk collision --
+     * the one with the longest-lived, most-likely-still-resident
+     * data. */
+    next_gen = (mgen + 1) & 0xFF;
+    if (next_gen == 0) {
+        next_gen = 1;
+    }
+    ngx_http_cache_turbo_marker_store(clcf, z, &ctx->cache_key, bits,
+                                      next_gen, mttl);
+    (*purged)++;
+
+    return NGX_OK;
+}
+
+
 /* PURGE <uri> (v14): drop this URI's entry from L1 (+ L2) and answer
  * {"purged":N}. Reuses the request's own key (built via the configured
  * cache_turbo_key), so the purged slot matches what a GET would look up. The
@@ -87,130 +237,14 @@ ngx_http_cache_turbo_purge_request(ngx_http_request_t *r,
     }
 
     /* COR-5: a PURGE of the base URI must also invalidate every auto-Vary
-     * variant. Variants are stored under variant keys (base material + the
-     * folded axis values), not the base key, so the base purge above never
-     * touches them. Two strategies by L2 capability:
-     *   - Redis (purge_tag): the variants were SADD'd into a per-base index set
-     *     at store time. SMEMBERS it and drop every variant from L1 + L2 + the
-     *     set (async). Delete the node-local marker so this node stops resolving
-     *     to the now-removed variants; the keyspace resets cleanly to gen 0.
-     *   - L1-only / memcached (no enumerable index): bump the marker generation
-     *     so old-generation variants are orphaned (new requests key on gen+1;
-     *     orphans age out via L1 LRU + TTL / memcached value TTL). */
-    if (clcf->auto_vary) {
-        u_char                        mk[32];
-        ngx_int_t                     bits = 0;
-        ngx_uint_t                    mgen = 0;
-        ngx_uint_t                    next_gen;
-        time_t                        mttl = 0;
-        ngx_uint_t                    have_marker = 0;
-        ngx_http_cache_turbo_node_t  *m;
-
-        ngx_http_cache_turbo_marker_hash(&ctx->cache_key, mk);
-        ngx_shmtx_lock(&z->shpool->mutex);
-        m = clcf->l1->lookup(z, mk, ngx_crc32_short(mk, 32));
-        if (m != NULL && m->data != NULL
-            && m->len >= NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE + 1)
-        {
-            ngx_http_cache_turbo_blob_hdr_t  mh;
-            if (ngx_http_cache_turbo_blob_validate(m->data, m->len, &mh,
-                    NULL, NULL, NULL, NULL) == NGX_OK)
-            {
-                have_marker = 1;
-                bits = m->data[NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE];
-                if (m->len >= NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE + 2) {
-                    mgen = m->data[NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE + 1];
-                }
-                mttl = (time_t) mh.fresh_ttl;
-            }
-        }
-        ngx_shmtx_unlock(&z->shpool->mutex);
-
-        if (clcf->backend && clcf->backend->purge_tag) {
-            u_char                            vname[1 + 64];
-            size_t                            vlen;
-            ngx_http_cache_turbo_tagpurge_t  *tp;
-            ngx_int_t                         prc;
-
-            (void) clcf->l1->purge_key(z, mk, ngx_crc32_short(mk, 32));
-
-            tp = ngx_pcalloc(r->pool, sizeof(*tp));
-            if (tp != NULL) {
-                vlen = ngx_http_cache_turbo_variant_index_name(&ctx->cache_key,
-                                                               vname);
-                tp->clcf = clcf;
-                tp->zone = z;
-                tp->tag.data = ngx_pnalloc(r->pool, vlen);
-                if (tp->tag.data != NULL) {
-                    ngx_memcpy(tp->tag.data, vname, vlen);
-                    tp->tag.len = vlen;
-                    prc = clcf->backend->purge_tag(r, clcf, vname, vlen,
-                              ngx_http_cache_turbo_tag_purge_complete, tp);
-                    if (prc == NGX_DONE) {
-                        /* parked; the completion drops every variant + the index
-                         * set and sends {"purged":N}. */
-
-                        /* S231-VARY-LEAK: release the park's reference here,
-                         * because THIS caller is the one that never gets a free
-                         * drop. purge_request runs in the PRECONTENT phase, and
-                         * ngx_http_core_generic_phase answers NGX_DONE with a
-                         * bare `return NGX_OK` -- it never calls
-                         * ngx_http_finalize_request at all. The completion's
-                         * single finalize would therefore leave count at 1 with
-                         * nothing left to drop it, orphaning the client
-                         * connection with its fd open (visible only at worker
-                         * shutdown as "open socket left in connection").
-                         *
-                         * The module's other two parked purge entry points --
-                         * admin_handler's ?tag= (purge_tag) and its all-purge
-                         * (scan_del) -- must NOT do this: they are reached
-                         * through core->handler, and
-                         * ngx_http_core_content_phase ALWAYS runs
-                         * ngx_http_finalize_request(r, rc), where NGX_DONE goes
-                         * to ngx_http_finalize_connection -> the count != 1
-                         * branch -> ngx_http_close_request, which decrements.
-                         * Their parks are already balanced; dropping again
-                         * there trips "http request count is zero". The
-                         * asymmetry is the CALLER'S PHASE, not the op kind, so
-                         * the release belongs at each acquire site rather than
-                         * in the shared completion. */
-                        r->main->count--;
-
-                        return NGX_DONE;
-                    }
-                }
-            }
-            /* could not launch (alloc / L2 down): fall through to the sync
-             * base-only reply below. */
-
-        } else if (have_marker) {
-            /* AUD-GEN1: wrap explicitly, and NEVER land back on 0. gen 0 is
-             * the permanent "never purged" identity (default when no marker
-             * exists yet); folding it unconditionally (see variant_hash)
-             * stops it colliding with the pre-COR-5 untagged keyspace, but
-             * that alone does not stop THIS purge sequence from reproducing
-             * its OWN gen-0 identity every 256 purges -- 256 & 0xFF == 0,
-             * numerically indistinguishable from "never purged" once stored
-             * in one byte, so a request racing the wrap would resolve back to
-             * whatever is still resident under the base's original,
-             * pre-first-purge key (proven by a real 256-purge round trip
-             * against the unpatched arithmetic, not just reasoned about).
-             * Skipping 0 on wrap makes 0 permanently exclusive to "never
-             * purged": once a base has been purged at all, its generation can
-             * never again equal the identity a fresh, unpurged base uses.
-             * The residual (generation N colliding with N+255, still a
-             * 1-byte counter) is the accepted trade-off the ledger row
-             * documents; this closes the specific, highest-risk collision --
-             * the one with the longest-lived, most-likely-still-resident
-             * data. */
-            next_gen = (mgen + 1) & 0xFF;
-            if (next_gen == 0) {
-                next_gen = 1;
-            }
-            ngx_http_cache_turbo_marker_store(clcf, z, &ctx->cache_key, bits,
-                                              next_gen, mttl);
-            purged++;
-        }
+     * variant; see ngx_http_cache_turbo_purge_auto_vary() for the L2
+     * strategy split. NGX_DONE means it parked the async completion, which
+     * already sent the reply and finalized the request. */
+    if (clcf->auto_vary
+        && ngx_http_cache_turbo_purge_auto_vary(r, clcf, z, ctx, &purged)
+               == NGX_DONE)
+    {
+        return NGX_DONE;
     }
 
     p = ngx_pnalloc(r->pool, sizeof("{\"purged\":4294967295}\n"));
