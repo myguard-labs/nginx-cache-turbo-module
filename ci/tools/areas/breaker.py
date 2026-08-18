@@ -1052,7 +1052,7 @@ def test_s8_scan_resistant_config_rejects(ng: Nginx) -> None:
 
     # 8. the pristine config must still pass, or every arm above is vacuous
     #    (a config broken for an unrelated reason fails all seven).
-    r = _config_test_result(ng, lambda c: c)
+    r = _config_test_result(ng, lambda c: c, expect_unchanged=True)
     assert r.returncode == 0, \
         f"baseline config does not pass nginx -t:\n{r.stdout}"
 

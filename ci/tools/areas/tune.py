@@ -638,10 +638,15 @@ def test_stale_mult_rejects_out_of_range(ng: Nginx) -> None:
             f"missing/odd bad-value diagnostic for {bad}:\n{r.stdout}"
 
     # both boundaries stay legal
+    # good="1" is the lower boundary, already present in the fixture at the anchor,
+    # so it's a positive control asserting the pristine config with default lower
+    # boundary is accepted (not mutating anything). good="8" is a real upper-bound
+    # mutation. The guard caught this vacuous arm; see #340.
     for good in ("1", "8"):
         r = _config_test_result(
             ng, lambda c, g=good: c.replace(
-                anchor, f"cache_turbo_stale_mult  {g};", 1))
+                anchor, f"cache_turbo_stale_mult  {g};", 1),
+            expect_unchanged=(good == "1"))
         assert r.returncode == 0, \
             f"cache_turbo_stale_mult {good} (a legal boundary) was rejected:\n{r.stdout}"
 
