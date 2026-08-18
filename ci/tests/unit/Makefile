@@ -93,7 +93,11 @@ extract: $(GEN)
 # leaves a STALE generated_shm.inc in place and the suite silently tests the
 # previous copy -- a mutation of the production predicate then "passes",
 # which is exactly how a negative control ends up guarding nothing.
-$(GEN): $(REPO)/src/ngx_http_cache_turbo_shm.c $(REPO)/src/ngx_http_cache_turbo_module.h $(REPO)/src/ngx_http_cache_turbo_internal.h $(REPO)/src/ngx_http_cache_turbo_module.c $(HERE)/extract_shm.sh
+# access.c is a prerequisite for the same reason since MAINT-SPLIT step F: the
+# O4.3 pre-origin gate canary is a CALL-SITE invariant checked against the
+# access handler, which now lives there. Dropping the latch without this listed
+# would leave a stale .inc and the canary unrun.
+$(GEN): $(REPO)/src/ngx_http_cache_turbo_shm.c $(REPO)/src/ngx_http_cache_turbo_module.h $(REPO)/src/ngx_http_cache_turbo_internal.h $(REPO)/src/ngx_http_cache_turbo_module.c $(REPO)/src/ngx_http_cache_turbo_access.c $(HERE)/extract_shm.sh
 	@$(HERE)/extract_shm.sh
 
 clean:
