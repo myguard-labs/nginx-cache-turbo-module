@@ -27,7 +27,7 @@
 set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SRC="$DIR/../../../src/ngx_http_cache_turbo_module.c"
+SRC="$DIR/../../../src/ngx_http_cache_turbo_vary.c"
 OUT="$DIR/generated_variant.inc"
 
 if [ ! -f "$SRC" ]; then
@@ -42,9 +42,11 @@ fi
 
 # --- slice the function body.
 # nginx style: the return type sits alone on one line, the name+params line
-# follows, and the body closes on a bare `}` in column 0.
+# follows, and the body closes on a bare `}` in column 0. variant_hash is
+# non-static in vary.c (module.c calls it cross-TU), so the return-type line
+# has no `static` prefix -- match either form.
 awk '
-    /^static / { pending = 1; buf = $0 ORS; next }
+    /^static / || /^void$/ { pending = 1; buf = $0 ORS; next }
     pending && /^ngx_http_cache_turbo_variant_hash\(/ {
         capture = 1; pending = 0; printf "%s", buf; print; next
     }

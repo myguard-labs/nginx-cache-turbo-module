@@ -11,6 +11,7 @@ CACHE_TURBO_SRCS="                                                       \
                   $ngx_addon_dir/src/ngx_http_cache_turbo_memcached.c   \
                   $ngx_addon_dir/src/ngx_http_cache_turbo_presets.c     \
                   $ngx_addon_dir/src/ngx_http_cache_turbo_blob.c        \
+                  $ngx_addon_dir/src/ngx_http_cache_turbo_vary.c        \
                   "
 
 CACHE_TURBO_DEPS="                                                      \

@@ -712,4 +712,39 @@ typedef struct {
 
 extern ngx_http_cache_turbo_memcached_ka_t ngx_http_cache_turbo_memcached_ka;
 
+
+/* ---- vary.c (Vary/variant/Accept-Encoding classification group) ----
+ *
+ * module.c's access/header/body-filter phases (above this group's old
+ * position in the file) call the auto-Vary prepare/apply pair and the
+ * variant/marker digest helpers; ngx_http_cache_turbo_normalized_args_variable
+ * (kept in module.c, in the $cache_turbo_normalized_args variable
+ * registration block) calls the query-arg denylist and Vary-suffix helpers.
+ * ngx_http_cache_turbo_vary_prepare loses the `ngx_inline` it had while
+ * single-TU -- a cross-TU call cannot stay inline. */
+
+void ngx_http_cache_turbo_vary_prepare(ngx_http_cache_turbo_ctx_t *ctx);
+void ngx_http_cache_turbo_vary_apply(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_zone_t *z,
+    ngx_http_cache_turbo_ctx_t *ctx, uint32_t *hash);
+void ngx_http_cache_turbo_variant_hash(ngx_http_request_t *r,
+    ngx_str_t *base, ngx_int_t bits, ngx_uint_t gen, u_char out[32]);
+void ngx_http_cache_turbo_marker_hash(ngx_str_t *base, u_char out[32]);
+void ngx_http_cache_turbo_marker_store(ngx_http_cache_turbo_loc_conf_t *clcf,
+    ngx_http_cache_turbo_zone_t *z, ngx_str_t *base, ngx_int_t bits,
+    ngx_uint_t gen, time_t ttl);
+size_t ngx_http_cache_turbo_variant_index_name(ngx_str_t *base, u_char *buf);
+void ngx_http_cache_turbo_classify_vary(ngx_http_request_t *r,
+    ngx_int_t *bits_out, ngx_uint_t *nocache_out);
+ngx_uint_t ngx_http_cache_turbo_response_encoded(ngx_http_request_t *r);
+
+/* Called from ngx_http_cache_turbo_normalized_args_variable() in module.c. */
+size_t ngx_http_cache_turbo_vary_suffix(ngx_http_request_t *r,
+    ngx_int_t vary, u_char *buf);
+ngx_int_t ngx_http_cache_turbo_var_set(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, u_char *src, size_t len);
+ngx_int_t ngx_http_cache_turbo_name_denied(ngx_http_cache_turbo_loc_conf_t *clcf,
+    u_char *name, size_t nlen);
+ngx_int_t ngx_http_cache_turbo_tok_cmp(const void *one, const void *two);
+
 #endif /* NGX_HTTP_CACHE_TURBO_INTERNAL_H_INCLUDED_ */
