@@ -1812,6 +1812,14 @@ cache_turbo_evictions_total{zone="ct"} 0
 cache_turbo_l2_hits_total{zone="ct"} 61
 cache_turbo_l2_misses_total{zone="ct"} 22
 cache_turbo_bypasses_total{zone="ct"} 5
+cache_turbo_refuse_set_cookie_total{zone="ct"} 3
+cache_turbo_refuse_encoded_total{zone="ct"} 0
+cache_turbo_refuse_vary_unsafe_total{zone="ct"} 7
+cache_turbo_refuse_authorization_total{zone="ct"} 41
+cache_turbo_refuse_cache_control_total{zone="ct"} 2
+cache_turbo_refuse_require_header_total{zone="ct"} 0
+cache_turbo_refuse_partial_total{zone="ct"} 0
+cache_turbo_refuse_head_total{zone="ct"} 6
 cache_turbo_regen_cost_ms{zone="ct"} 34
 cache_turbo_autotuned_beta{zone="ct"} 1700
 cache_turbo_autotuned_load{zone="ct"} 1000
@@ -1832,6 +1840,14 @@ Every sample is labelled by `zone`, so one job can scrape many zones. Metrics:
 | `cache_turbo_min_uses_skips_total` | counter | Requests sent to origin (not stored) for being below `cache_turbo_min_uses`. |
 | `cache_turbo_l2_neg_skips_total` | counter | L2 `GET`s skipped because a `cache_turbo_l2_negative_ttl` memo already recorded a miss for the key. Each unit is one L2 round-trip not taken. |
 | `cache_turbo_bypasses_total` | counter | Requests skipped to origin by a `cache_turbo_bypass` predicate or a CMS backend preset (a subset of misses). |
+| `cache_turbo_refuse_set_cookie_total` | counter | Store refused because the response carried `Set-Cookie` (RFC 9111 floor). |
+| `cache_turbo_refuse_encoded_total` | counter | Store refused because the response was already `Content-Encoding`'d — origin pre-compression, or a filter-order mistake. A rising count on an otherwise well-behaved origin usually means the origin pre-compresses; see [Mixing with nginx's native cache](#mixing-with-nginxs-native-cache). |
+| `cache_turbo_refuse_vary_unsafe_total` | counter | Store refused because the response `Vary` header named an axis outside the whitelist (`Accept-Encoding`/`User-Agent`/`Accept-Language`/`Origin`) or `*`. Does **not** include `Vary: Cookie`/`Authorization` (those are RFC 9111 floors, already visible via `refuse_set_cookie_total`/`refuse_authorization_total`'s siblings) — a rising count here is the signal to reach for `cache_turbo_vary_ignore`/`cache_turbo_vary_key` once available. |
+| `cache_turbo_refuse_authorization_total` | counter | Requests refused (lookup and store) for carrying `Authorization` (RFC 9111 floor). |
+| `cache_turbo_refuse_cache_control_total` | counter | Store refused by a `Cache-Control`/`CDN-Cache-Control`/`Surrogate-Control` directive (`no-store`/`no-cache`/`private`/`max-age=0`/`s-maxage=0`). |
+| `cache_turbo_refuse_require_header_total` | counter | Store refused because `cache_turbo_require_header` was unmet (header absent, or present without an affirmative value). Zero unless the directive is configured. |
+| `cache_turbo_refuse_partial_total` | counter | Store refused because the response was `206 Partial Content` (never cached — the key carries no `Range`). |
+| `cache_turbo_refuse_head_total` | counter | Store refused because the request was `HEAD` (its empty body must never overwrite the stored `GET` entry). |
 | `cache_turbo_regen_cost_ms` | gauge | Average backend regeneration time (ms). |
 | `cache_turbo_autotuned_beta` | gauge | Live autotuned `beta` ×1000 (0 = none). |
 | `cache_turbo_autotuned_load` | gauge | Live load factor ×1000 widening the stale window + `lock_ttl` under load (1000 = baseline / not under load, up to 4000). |

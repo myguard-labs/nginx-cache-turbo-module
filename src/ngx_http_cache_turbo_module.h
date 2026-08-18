@@ -740,6 +740,34 @@ typedef struct {
      * subset for $cache_turbo_status / Prometheus. */
     ngx_atomic_t             bypasses;
 
+    /* P0-1: ngx_http_cache_turbo_response_cacheable()'s reason_out. NONE (0)
+     * only when the function itself returns 1 -- a caller must not read a
+     * stale/uninitialised reason after a 1 return. */
+#define NGX_HTTP_CACHE_TURBO_REFUSE_NONE            0
+#define NGX_HTTP_CACHE_TURBO_REFUSE_SET_COOKIE      1
+#define NGX_HTTP_CACHE_TURBO_REFUSE_AUTHORIZATION   2
+#define NGX_HTTP_CACHE_TURBO_REFUSE_CACHE_CONTROL   3
+
+    /* P0-1: per-reason store-refusal counters. All eight fire ONLY on the
+     * capture (store) decision path in the header filter -- never on a HIT,
+     * so they add no work to the serve path. Each isolates one arm of the
+     * "do not store" gate chain (filters.c capture condition +
+     * response_cacheable() + classify_vary()) so an operator sees WHY the
+     * hit ratio is low instead of a bare 0%. A response can trip more than
+     * one reason in principle (e.g. Set-Cookie AND pre-encoded); each arm
+     * that observes its own condition bumps independently, so these do NOT
+     * sum to (misses - hits) and must not be read as mutually exclusive. */
+    ngx_atomic_t             refuse_set_cookie;    /* response sets Set-Cookie */
+    ngx_atomic_t             refuse_encoded;       /* response pre-encoded (Content-Encoding) */
+    ngx_atomic_t             refuse_vary_unsafe;   /* unknown/non-whitelisted Vary axis, or Vary: * */
+    ngx_atomic_t             refuse_authorization; /* request carried Authorization */
+    ngx_atomic_t             refuse_cache_control; /* response Cache-Control/CDN-Cache-Control/
+                                                     * Surrogate-Control veto (no-store/no-cache/
+                                                     * private/max-age=0/s-maxage=0) */
+    ngx_atomic_t             refuse_require_header;/* cache_turbo_require_header unmet/absent */
+    ngx_atomic_t             refuse_partial;       /* 206 Partial Content */
+    ngx_atomic_t             refuse_head;          /* HEAD request (never overwrites the GET entry) */
+
     /*
      * Live autotune state (v4-3). cost_sum_ms / cost_count accumulate the
      * wall-clock cost of every origin regeneration (request_time at the
@@ -941,6 +969,15 @@ typedef struct {
     ngx_atomic_uint_t   min_uses_skips; /* v15 cold misses below min_uses     */
     ngx_atomic_uint_t   l2_neg_skips;   /* L13 L2 GETs skipped by a memo      */
     ngx_atomic_uint_t   bypasses;     /* bypass / auto-classify skips to origin */
+    /* P0-1: per-reason store-refusal counters, mirrors shctx_t. */
+    ngx_atomic_uint_t   refuse_set_cookie;
+    ngx_atomic_uint_t   refuse_encoded;
+    ngx_atomic_uint_t   refuse_vary_unsafe;
+    ngx_atomic_uint_t   refuse_authorization;
+    ngx_atomic_uint_t   refuse_cache_control;
+    ngx_atomic_uint_t   refuse_require_header;
+    ngx_atomic_uint_t   refuse_partial;
+    ngx_atomic_uint_t   refuse_head;
     /* Autotune introspection (v4-3): cost_ms = the measured average origin-regen
      * cost (cost_sum_ms / cost_count, 0 when nothing measured); autotuned_beta =
      * the live verdict ×1000 (0 = none). Rendered by the admin GET so a test (or

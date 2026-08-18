@@ -323,8 +323,9 @@ class Origin:
 
             def _get_handle_special_cases(self, n: int) -> tuple[bool, bytes | None]:
                 """Marker-driven special-case responses (ctxrdr-missing,
-                partial, rngsrc, redir, notfound, bigbody, unbuf-stream,
-                unbuf-big, ckecho) plus the midbody-mismatch body computation.
+                precompressed, partial, rngsrc, redir, notfound, bigbody,
+                unbuf-stream, unbuf-big, ckecho) plus the midbody-mismatch body
+                computation.
                 Returns (True, None) if a complete response was written
                 (caller must stop), or (False, body) with the body for the
                 common 200 path to send."""
@@ -344,6 +345,26 @@ class Origin:
                     self.send_header("Content-Type", "text/plain")
                     self.send_header("Content-Length", "0")
                     self.end_headers()
+                    return True, None
+                # P0-1: a response that arrives ALREADY Content-Encoding'd (the
+                # origin pre-compressed it, or -- defense-in-depth -- cache_turbo
+                # somehow ended up below a compressor). The module's body filter
+                # only ever captures the IDENTITY body, so a coding-specific one
+                # must never be stored (see response_encoded()'s own comment in
+                # ngx_http_cache_turbo_vary.c). The gzip magic bytes are enough to
+                # exercise the gate; the module never inflates or validates the
+                # body, it only reads the header.
+                if "precompressed" in self.path:
+                    body = b"\x1f\x8b" + f"pre-{n}\n".encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("Content-Encoding", "gzip")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    try:
+                        self.wfile.write(body)
+                    except BrokenPipeError:
+                        pass
                     return True, None
                 # 206 Partial Content must NEVER be cached (the key has no Range,
                 # so a stored partial could be replayed for a different/whole

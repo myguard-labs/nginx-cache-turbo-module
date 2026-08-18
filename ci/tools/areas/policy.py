@@ -13,6 +13,7 @@ from __future__ import annotations
 # private helpers this module actually calls are imported explicitly.
 from test_runtime_base import *
 from test_runtime_base import (
+    _admin_stat,
     _bump_conn,
 )
 
@@ -590,6 +591,142 @@ def test_206_never_cached(ng: Nginx, origin: Origin) -> None:
         f"206 must never be cached, got X-Cache={h1.get('x-cache')}"
     assert origin.hits_for("partial-206flake") == base + 2, \
         "206 was wrongly served from cache"
+
+
+def test_refuse_partial_counter(ng: Nginx, origin: Origin) -> None:
+    """P0-1: cache_turbo_refuse_partial_total rises by exactly one per 206
+    response, the same fixture as test_206_never_cached but observing the new
+    per-reason counter instead of the store outcome."""
+    url = "/c/partial-206ctr"
+    r0 = _admin_stat(ng, "refuse_partial")
+    s0, _, _ = fetch(ng.port, url)
+    assert s0 == 206
+    assert _admin_stat(ng, "refuse_partial") - r0 == 1, \
+        "refuse_partial_total must rise by 1 for a single 206 response"
+    fetch(ng.port, url)
+    assert _admin_stat(ng, "refuse_partial") - r0 == 2, \
+        "refuse_partial_total must rise once per 206, not just the first"
+
+
+def test_refuse_head_counter(ng: Nginx, origin: Origin) -> None:
+    """P0-1: cache_turbo_refuse_head_total rises once per HEAD request that
+    reaches the header filter's capture gate -- HEAD's empty body must never
+    overwrite the stored GET entry, so it always trips this counter."""
+    url = "/c/headctr"
+    r0 = _admin_stat(ng, "refuse_head")
+    s0, _, _ = fetch(ng.port, url, method="HEAD")
+    assert s0 == 200, f"HEAD should reach the origin cleanly, got {s0}"
+    assert _admin_stat(ng, "refuse_head") - r0 == 1, \
+        "refuse_head_total must rise by 1 for a single HEAD request"
+    # A GET on the SAME url must not itself trip refuse_head -- proves the
+    # counter is keyed on the request method, not the URL.
+    fetch(ng.port, url)
+    assert _admin_stat(ng, "refuse_head") - r0 == 1, \
+        "a GET must not bump refuse_head_total"
+
+
+def test_refuse_set_cookie_counter(ng: Nginx, origin: Origin) -> None:
+    """P0-1: cache_turbo_refuse_set_cookie_total rises once per Set-Cookie
+    response refused by the store floor -- same fixture as
+    test_no_cache_set_cookie, observing the new counter."""
+    url = "/cc/setcookiectr"
+    r0 = _admin_stat(ng, "refuse_set_cookie")
+    fetch(ng.port, url)
+    assert _admin_stat(ng, "refuse_set_cookie") - r0 == 1, \
+        "refuse_set_cookie_total must rise by 1 for a single Set-Cookie response"
+    fetch(ng.port, url)
+    assert _admin_stat(ng, "refuse_set_cookie") - r0 == 2, \
+        "refuse_set_cookie_total must rise once per refused response"
+
+
+def test_refuse_cache_control_counter(ng: Nginx, origin: Origin) -> None:
+    """P0-1: cache_turbo_refuse_cache_control_total rises once per response
+    vetoed by Cache-Control (no-store/no-cache/private/max-age=0/s-maxage=0)
+    -- same fixture as test_no_cache_cc_private / test_no_cache_cc_nostore."""
+    r0 = _admin_stat(ng, "refuse_cache_control")
+    fetch(ng.port, "/cc/ccprivatectr")
+    assert _admin_stat(ng, "refuse_cache_control") - r0 == 1, \
+        "Cache-Control: private must bump refuse_cache_control_total"
+    fetch(ng.port, "/cc/ccnostorectr")
+    assert _admin_stat(ng, "refuse_cache_control") - r0 == 2, \
+        "Cache-Control: no-store must also bump refuse_cache_control_total"
+
+
+def test_refuse_authorization_counter(ng: Nginx, origin: Origin) -> None:
+    """P0-1: cache_turbo_refuse_authorization_total rises once per request
+    that carried Authorization -- same fixture as test_no_cache_authorization.
+    Bumped in access_eligible()'s LOOKUP-side gate (access.c), not the header
+    filter's response_cacheable() call: an Authorization request never
+    allocates ctx (access_eligible() declines before ctx exists), so the
+    header filter bails on ctx==NULL before response_cacheable()'s own
+    AUTHORIZATION reason could ever fire on this path."""
+    r0 = _admin_stat(ng, "refuse_authorization")
+    fetch(ng.port, "/c/authreq-ctr", headers={"Authorization": "Bearer x"})
+    assert _admin_stat(ng, "refuse_authorization") - r0 == 1, \
+        "refuse_authorization_total must rise by 1 for a single Authorization request"
+
+
+def test_refuse_require_header_counter(ng: Nginx, origin: Origin) -> None:
+    """P0-1: cache_turbo_refuse_require_header_total rises once per response
+    refused by cache_turbo_require_header (absent or non-affirmative) --
+    same /gql/ fixture as test_require_header."""
+    r0 = _admin_stat(ng, "refuse_require_header")
+    # header absent entirely
+    fetch(ng.port, "/gql/absentctr")
+    assert _admin_stat(ng, "refuse_require_header") - r0 == 1, \
+        "an absent require_header must bump refuse_require_header_total"
+    # non-affirmative value
+    fetch(ng.port, "/gql/noctr", headers={"X-Want-Cacheable": "no"})
+    assert _admin_stat(ng, "refuse_require_header") - r0 == 2, \
+        "a non-affirmative require_header value must also bump the counter"
+    # affirmative value must NOT bump it
+    fetch(ng.port, "/gql/okctr", headers={"X-Want-Cacheable": "yes"})
+    assert _admin_stat(ng, "refuse_require_header") - r0 == 2, \
+        "an affirmative require_header value must not bump refuse_require_header_total"
+
+
+def test_refuse_encoded_counter(ng: Nginx, origin: Origin) -> None:
+    """P0-1: cache_turbo_refuse_encoded_total rises once per response that
+    arrives already Content-Encoding'd (origin pre-compression). Uses the
+    "precompressed" origin marker added alongside this counter."""
+    url = "/c/precompressedctr"
+    r0 = _admin_stat(ng, "refuse_encoded")
+    s0, _, h0 = fetch(ng.port, url)
+    assert s0 == 200 and h0.get("content-encoding") == "gzip", \
+        f"origin should answer pre-encoded, got status={s0} headers={h0}"
+    assert "x-cache" not in h0, "a pre-encoded response must never be a HIT"
+    assert _admin_stat(ng, "refuse_encoded") - r0 == 1, \
+        "refuse_encoded_total must rise by 1 for a single pre-encoded response"
+    fetch(ng.port, url)
+    assert _admin_stat(ng, "refuse_encoded") - r0 == 2, \
+        "a pre-encoded response is refused every time, never cached"
+
+
+def test_refuse_vary_unsafe_counter(ng: Nginx, origin: Origin) -> None:
+    """P0-1: cache_turbo_refuse_vary_unsafe_total rises once per response
+    whose Vary header names an axis outside the whitelist -- same fixture as
+    test_auto_vary_unknown_axis_uncacheable. Does NOT fire for Vary: Cookie /
+    Authorization / "*" (see test_refuse_vary_unsafe_excludes_named_vetoes),
+    since those are separately attributable causes."""
+    r0 = _admin_stat(ng, "refuse_vary_unsafe")
+    fetch(ng.port, "/av/unsafectr?v=cs")
+    assert _admin_stat(ng, "refuse_vary_unsafe") - r0 == 1, \
+        "an un-whitelisted Vary axis must bump refuse_vary_unsafe_total"
+
+
+def test_refuse_vary_unsafe_excludes_named_vetoes(ng: Nginx,
+                                                   origin: Origin) -> None:
+    """P0-1: Vary: Cookie / Authorization / "*" are already attributable to a
+    NAMED cause elsewhere (the request-side Authorization counter, or -- for
+    Cookie/"*" -- they are RFC 9111 floors distinct from 'axis we don't
+    recognise'). refuse_vary_unsafe must stay at 0 for these so it measures
+    only the genuinely-unknown-axis case test_refuse_vary_unsafe_counter
+    drives, not every auto-Vary veto."""
+    r0 = _admin_stat(ng, "refuse_vary_unsafe")
+    fetch(ng.port, "/av/starctr?v=star")
+    fetch(ng.port, "/av/cookiectr?v=ck")
+    assert _admin_stat(ng, "refuse_vary_unsafe") - r0 == 0, \
+        "Vary: * / Cookie must not bump refuse_vary_unsafe_total (named vetoes)"
 
 
 def test_range_hit_matches_miss(ng: Nginx, origin: Origin) -> None:
