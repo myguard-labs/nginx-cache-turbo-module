@@ -806,7 +806,7 @@ def test_keep_stale_config_parse(ng: Nginx) -> None:
     # negative control: the pristine (unmutated) config must still pass, or
     # every reject arm above is vacuous (a config broken for an unrelated
     # reason fails all of them regardless of this directive).
-    r = _config_test_result(ng, lambda c: c)
+    r = _config_test_result(ng, lambda c: c, expect_unchanged=True)
     assert r.returncode == 0, \
         f"pristine config (no mutation) failed nginx -t:\n{r.stdout}"
 
@@ -892,7 +892,7 @@ def test_use_stale_config_parse(ng: Nginx) -> None:
 
     # negative control: the pristine (unmutated) config must still pass, or
     # every reject arm above is vacuous.
-    r = _config_test_result(ng, lambda c: c)
+    r = _config_test_result(ng, lambda c: c, expect_unchanged=True)
     assert r.returncode == 0, \
         f"pristine config (no mutation) failed nginx -t:\n{r.stdout}"
 

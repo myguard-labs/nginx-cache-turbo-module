@@ -1419,9 +1419,15 @@ def drain_origin(origin: Origin, settle: float = 0.6,
 _BACKEND_LINE = "cache_turbo_backend wordpress woocommerce joomla;"
 
 
-def _config_test_result(ng: Nginx, mutate) -> subprocess.CompletedProcess[str]:
+def _config_test_result(ng: Nginx, mutate, *, expect_unchanged: bool = False) -> subprocess.CompletedProcess[str]:
     """Render the full config, apply `mutate(cfg) -> cfg`, write it, and run
-    nginx -t. Returns the CompletedProcess (returncode + combined stdout)."""
+    nginx -t. Returns the CompletedProcess (returncode + combined stdout).
+
+    By default, asserts that mutate produces a change to the config, to guard
+    against silently no-op mutators that would make the test vacuous (never
+    validating an actual mutation). Pass expect_unchanged=True only for a
+    deliberate identity/positive-control check, which asserts the opposite:
+    that the config is genuinely unchanged."""
     bad = ng.root.parent / "cfgcheck"
     (bad / "conf").mkdir(parents=True, exist_ok=True)
     (bad / "logs").mkdir(parents=True, exist_ok=True)
@@ -1431,8 +1437,12 @@ def _config_test_result(ng: Nginx, mutate) -> subprocess.CompletedProcess[str]:
         ng.redis_tls_ca, ng.memcached_port)
     cfg_before = cfg
     cfg = mutate(cfg)
-    assert cfg != cfg_before, \
-        "mutator produced no change: test would be vacuous (never validates a mutation)"
+    if expect_unchanged:
+        assert cfg == cfg_before, \
+            "mutator unexpectedly changed config when identity mutation was expected"
+    else:
+        assert cfg != cfg_before, \
+            "mutator produced no change: test would be vacuous (never validates a mutation)"
     (bad / "conf" / "nginx.conf").write_text(cfg, encoding="ascii")
     cmd = ng.runner + [str(ng.binary), "-p", str(bad),
                        "-c", str(bad / "conf" / "nginx.conf"), "-t"]
