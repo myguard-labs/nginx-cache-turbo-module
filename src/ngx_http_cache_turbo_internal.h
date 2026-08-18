@@ -888,10 +888,11 @@ ngx_uint_t ngx_http_cache_turbo_breaker_action(ngx_uint_t state,
 /* Request Cache-Control interpretation and the autotune effective-value pair.
  * These sit above the moved range in module.c and are its remaining inbound
  * dependencies. Six of the eight now have access.c as their ONLY caller;
- * effective_beta is also used by module.c's refresh-dice path and
- * purge_request is the PURGE body that access.c's precontent handler
- * dispatches to (refactor.md assigns purge_request to step G's _purge.c, so it
- * deliberately stays put rather than widening this split's range).
+ * effective_beta is also used by module.c's refresh-dice path. purge_request
+ * is the PURGE body that access.c's precontent handler dispatches to; it has
+ * since moved to ngx_http_cache_turbo_purge.c (MAINT-SPLIT step G), so its
+ * declaration below is now purge.c's inbound dependency on this header, not
+ * module.c's.
  *
  * All eight are pure functions of their arguments over per-request ctx or the
  * zone's own state -- none of them touches module-scope mutable state, so
