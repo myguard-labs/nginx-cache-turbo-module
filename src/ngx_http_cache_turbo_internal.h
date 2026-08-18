@@ -735,7 +735,8 @@ void ngx_http_cache_turbo_marker_store(ngx_http_cache_turbo_loc_conf_t *clcf,
     ngx_uint_t gen, time_t ttl);
 size_t ngx_http_cache_turbo_variant_index_name(ngx_str_t *base, u_char *buf);
 void ngx_http_cache_turbo_classify_vary(ngx_http_request_t *r,
-    ngx_int_t *bits_out, ngx_uint_t *nocache_out);
+    ngx_int_t *bits_out, ngx_uint_t *nocache_out,
+    ngx_uint_t *unsafe_axis_out);
 ngx_uint_t ngx_http_cache_turbo_response_encoded(ngx_http_request_t *r);
 
 /* Called from ngx_http_cache_turbo_normalized_args_variable() in module.c. */
@@ -844,7 +845,12 @@ char *ngx_http_cache_turbo_bypass_stale_uri(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 char *ngx_http_cache_turbo_key_cookie_conf(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
-ngx_int_t ngx_http_cache_turbo_response_cacheable(ngx_http_request_t *r);
+/* P0-1: reason_out receives which arm vetoed (see the
+ * NGX_HTTP_CACHE_TURBO_REFUSE_* enum in module.h), or _NONE (0) when the
+ * function returns 1 (cacheable) -- reason_out may be NULL for callers that
+ * do not need the breakdown. */
+ngx_int_t ngx_http_cache_turbo_response_cacheable(ngx_http_request_t *r,
+    ngx_uint_t *reason_out);
 ngx_int_t ngx_http_cache_turbo_response_must_revalidate(ngx_http_request_t *r);
 time_t ngx_http_cache_turbo_response_sie(ngx_http_request_t *r);
 time_t ngx_http_cache_turbo_response_swr(ngx_http_request_t *r);

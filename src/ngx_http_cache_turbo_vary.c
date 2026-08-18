@@ -805,9 +805,15 @@ ngx_http_cache_turbo_classify_vary_next_token(u_char **pp, u_char *end,
  * stored representation for every value of an un-split axis returns the
  * wrong representation to the wrong client (RFC 9110 12.5.5). Do not reorder
  * or collapse these arms. */
+/* P0-1: unsafe_axis distinguishes the "genuinely unrecognised token" arm
+ * (the final else) from the three NAMED vetoes ("*", Cookie, Authorization)
+ * above it -- those three are attributable to a specific, already-documented
+ * cause; an operator debugging a 0% hit ratio needs to know when it is
+ * neither of those three, i.e. some other axis (Accept, X-Requested-With,
+ * Sec-CH-* client hints, ...) the whitelist has no bit for (see PLAN P3-3). */
 static void
 ngx_http_cache_turbo_classify_vary_classify_token(u_char *tok, size_t tl,
-    ngx_int_t *bits, ngx_uint_t *nocache)
+    ngx_int_t *bits, ngx_uint_t *nocache, ngx_uint_t *unsafe_axis)
 {
     if (tl == 1 && tok[0] == '*') {
         *nocache = 1;
@@ -835,6 +841,7 @@ ngx_http_cache_turbo_classify_vary_classify_token(u_char *tok, size_t tl,
          * the wrong representation (RFC 9110 12.5.5 / RFC 9111 4.1).
          * Refuse to cache, same as Cookie/Authorization/"*". */
         *nocache = 1;
+        *unsafe_axis = 1;
     }
 }
 
@@ -845,15 +852,20 @@ ngx_http_cache_turbo_classify_vary_classify_token(u_char *tok, size_t tl,
  * Cookie, Authorization, OR any header we cannot key on — forces the response
  * uncacheable, because serving one stored representation for every value of an
  * un-split Vary axis would return the wrong representation (RFC 9110 12.5.5).
- * Walks every Vary header instance and tokenises on comma/whitespace. */
+ * Walks every Vary header instance and tokenises on comma/whitespace.
+ *
+ * P0-1: unsafe_axis_out (may be NULL) is set when the veto came from a
+ * genuinely unrecognised axis token, as opposed to "*"/Cookie/Authorization
+ * -- see classify_vary_classify_token(). */
 void
 ngx_http_cache_turbo_classify_vary(ngx_http_request_t *r,
-    ngx_int_t *bits_out, ngx_uint_t *nocache_out)
+    ngx_int_t *bits_out, ngx_uint_t *nocache_out, ngx_uint_t *unsafe_axis_out)
 {
     ngx_list_part_t  *part = &r->headers_out.headers.part;
     ngx_table_elt_t  *h = part->elts;
     ngx_int_t         bits = 0;
     ngx_uint_t        nocache = 0;
+    ngx_uint_t        unsafe_axis = 0;
     ngx_uint_t        i;
 
     for (i = 0; /* void */ ; i++) {
@@ -884,8 +896,13 @@ ngx_http_cache_turbo_classify_vary(ngx_http_request_t *r,
 
             ngx_http_cache_turbo_classify_vary_classify_token(tok, tl,
                                                                 &bits,
-                                                                &nocache);
+                                                                &nocache,
+                                                                &unsafe_axis);
         }
+    }
+
+    if (unsafe_axis_out != NULL) {
+        *unsafe_axis_out = unsafe_axis;
     }
 
     /* A refused axis wins over any safe axis: don't cache a response that also

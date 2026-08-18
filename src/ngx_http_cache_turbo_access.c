@@ -141,8 +141,22 @@ ngx_http_cache_turbo_access_eligible(ngx_http_request_t *r,
 
     /* RFC 9111 shared-cache safety: do not reuse a public representation for a
      * request carrying credentials. response_cacheable() already prevents the
-     * resulting response from being stored; this is the matching lookup gate. */
+     * resulting response from being stored; this is the matching lookup gate.
+     *
+     * P0-1: this early return means ctx is NEVER allocated for an
+     * Authorization request (see access_prologue() below), so the header
+     * filter bails on `ctx == NULL` before response_cacheable()'s own
+     * AUTHORIZATION reason can ever fire on the ordinary capture path --
+     * that arm only protects an unusual caller that reaches
+     * response_cacheable() with a ctx already in hand (a warm subrequest,
+     * say). This IS the reachable site for the request-side refusal, so the
+     * counter is bumped HERE, not in the header filter. */
     if (r->headers_in.authorization != NULL) {
+        if (clcf->shm_zone != NULL) {
+            ngx_http_cache_turbo_zone_t  *rz = clcf->shm_zone->data;
+
+            (void) ngx_atomic_fetch_add(&rz->sh->refuse_authorization, 1);
+        }
         return NGX_DECLINED;
     }
 

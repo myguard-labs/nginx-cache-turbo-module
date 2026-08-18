@@ -102,6 +102,14 @@ ngx_http_cache_turbo_shm_init_zone(ngx_shm_zone_t *shm_zone, void *data)
     ctx->sh->min_uses_skips = 0;
     ctx->sh->l2_neg_skips = 0;
     ctx->sh->bypasses = 0;
+    ctx->sh->refuse_set_cookie = 0;
+    ctx->sh->refuse_encoded = 0;
+    ctx->sh->refuse_vary_unsafe = 0;
+    ctx->sh->refuse_authorization = 0;
+    ctx->sh->refuse_cache_control = 0;
+    ctx->sh->refuse_require_header = 0;
+    ctx->sh->refuse_partial = 0;
+    ctx->sh->refuse_head = 0;
 
     /* Autotune state (v4-3): everything zeroed. autotune_next = 0 makes the first
      * recompute fire immediately; the snapshots being 0 means the first window is
@@ -984,6 +992,15 @@ ngx_http_cache_turbo_shm_stats(ngx_http_cache_turbo_zone_t *z,
     out->min_uses_skips = z->sh->min_uses_skips;
     out->l2_neg_skips = z->sh->l2_neg_skips;
     out->bypasses     = z->sh->bypasses;
+
+    out->refuse_set_cookie    = z->sh->refuse_set_cookie;
+    out->refuse_encoded       = z->sh->refuse_encoded;
+    out->refuse_vary_unsafe   = z->sh->refuse_vary_unsafe;
+    out->refuse_authorization = z->sh->refuse_authorization;
+    out->refuse_cache_control = z->sh->refuse_cache_control;
+    out->refuse_require_header = z->sh->refuse_require_header;
+    out->refuse_partial       = z->sh->refuse_partial;
+    out->refuse_head          = z->sh->refuse_head;
 
     /* Autotune introspection (v4-3): average origin-regen cost and the live beta
      * verdict, so the admin GET can render the tuning without an internal probe. */

@@ -261,25 +261,120 @@ ngx_http_cache_turbo_header_filter_try_sie(ngx_http_request_t *r,
  * not be built) short-circuited straight to the next header filter in the
  * original, and the caller forwards downstream unconditionally either way, so
  * there is no outcome for the caller to branch on. */
+
+/* P0-1 phase helper: HEAD and 206 are cheap, request/status-only facts
+ * already available before the capture gate runs, so they are counted here
+ * rather than duplicating the gate's own tests inside it. */
+static void
+ngx_http_cache_turbo_capture_count_head_partial(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf)
+{
+    ngx_http_cache_turbo_zone_t  *rz;
+
+    if (clcf->shm_zone == NULL) {
+        return;
+    }
+    rz = clcf->shm_zone->data;
+
+    if (r->method & NGX_HTTP_HEAD) {
+        (void) ngx_atomic_fetch_add(&rz->sh->refuse_head, 1);
+    }
+    if (r->headers_out.status == NGX_HTTP_PARTIAL_CONTENT) {
+        (void) ngx_atomic_fetch_add(&rz->sh->refuse_partial, 1);
+    }
+}
+
+
+/* P0-1 phase helper: attribute a NOT-captured response to whichever of
+ * response_cacheable()/require_hdr_ok()/response_encoded() actually vetoed
+ * it. Called only when the capture gate's shared legs (enable, method,
+ * vary_nocache, min_uses_skip, auto_skip, req_no_store, status_ttl) already
+ * passed and the response still was not captured, so cacheable_reason is
+ * meaningful exactly when it is non-NONE (the short-circuit chain stops AT
+ * the first false leg, so a later leg failing means every earlier one,
+ * including response_cacheable(), passed). require_hdr_ok()/
+ * response_encoded() are re-evaluated here (small, bounded header-list
+ * scans, same cost class as their gate call) rather than threaded through
+ * as extra out-params -- this path never runs on a HIT. */
+static void
+ngx_http_cache_turbo_capture_count_refusal(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_uint_t cacheable_reason)
+{
+    ngx_http_cache_turbo_zone_t  *rz;
+
+    if (clcf->shm_zone == NULL) {
+        return;
+    }
+    rz = clcf->shm_zone->data;
+
+    switch (cacheable_reason) {
+    case NGX_HTTP_CACHE_TURBO_REFUSE_SET_COOKIE:
+        (void) ngx_atomic_fetch_add(&rz->sh->refuse_set_cookie, 1);
+        return;
+    case NGX_HTTP_CACHE_TURBO_REFUSE_AUTHORIZATION:
+        (void) ngx_atomic_fetch_add(&rz->sh->refuse_authorization, 1);
+        return;
+    case NGX_HTTP_CACHE_TURBO_REFUSE_CACHE_CONTROL:
+        (void) ngx_atomic_fetch_add(&rz->sh->refuse_cache_control, 1);
+        return;
+    default:
+        break;
+    }
+
+    if (!ngx_http_cache_turbo_require_hdr_ok(r, clcf)) {
+        (void) ngx_atomic_fetch_add(&rz->sh->refuse_require_header, 1);
+    } else if (ngx_http_cache_turbo_response_encoded(r)) {
+        (void) ngx_atomic_fetch_add(&rz->sh->refuse_encoded, 1);
+    }
+}
+
+
 static void
 ngx_http_cache_turbo_header_filter_capture(ngx_http_request_t *r,
     ngx_http_cache_turbo_ctx_t *ctx, ngx_http_cache_turbo_loc_conf_t *clcf)
 {
+    ngx_uint_t  cacheable_reason = NGX_HTTP_CACHE_TURBO_REFUSE_NONE;
+
     /* auto-Vary (v11 other half): classify the response Vary header once. bits =
      * the safe-axis bitmask the body filter folds into the variant key + marker;
      * vary_nocache vetoes caching when the response varies on something the
      * whitelist refuses (*, Cookie, Authorization). Done before the capture gate
-     * so vary_nocache can suppress capture (and the cold-stub clear below fires). */
+     * so vary_nocache can suppress capture (and the cold-stub clear below fires).
+     *
+     * P0-1: classify_vary() also reports (via unsafe_axis_out, out-param -- no
+     * extra header walk) whether the veto was itself an unrecognised/non-
+     * whitelisted axis, as opposed to the two axes ("*", request-adjacent
+     * Cookie/Authorization tokens named IN THE VARY HEADER) that are already
+     * covered by dedicated Vary-unrelated counters elsewhere. Only the
+     * "genuinely unknown axis" case is unique to this path, so that is what
+     * refuse_vary_unsafe measures -- it does not double-count every
+     * vary_nocache trip. */
     if (clcf->auto_vary) {
         ngx_uint_t  nocache = 0;
-        ngx_http_cache_turbo_classify_vary(r, &ctx->vary_bits, &nocache);
+        ngx_uint_t  unsafe_axis = 0;
+
+        ngx_http_cache_turbo_classify_vary(r, &ctx->vary_bits, &nocache,
+                                            &unsafe_axis);
         ctx->vary_nocache = nocache ? 1 : 0;
+
+        if (unsafe_axis && clcf->shm_zone != NULL) {
+            ngx_http_cache_turbo_zone_t  *rz = clcf->shm_zone->data;
+
+            (void) ngx_atomic_fetch_add(&rz->sh->refuse_vary_unsafe, 1);
+        }
     }
+
+    ngx_http_cache_turbo_capture_count_head_partial(r, clcf);
 
     /* Only capture cacheable responses. 200 always, plus any status named by a
      * cache_turbo_valid <code> rule (redirects / negative caching, v6). Never a
      * HEAD — its empty body must not overwrite the GET entry. Normally the main
-     * request only; a warm subrequest (ctx->warm) is the deliberate exception. */
+     * request only; a warm subrequest (ctx->warm) is the deliberate exception.
+     *
+     * P0-1: response_cacheable() reports its own refusal reason via an
+     * out-param (no extra header-list walk; see its definition). The boolean
+     * short-circuit chain and evaluation order below are otherwise
+     * byte-for-byte unchanged from before P0-1. */
     if (clcf->enable && (r == r->main || ctx->warm)
         && !(r->method & NGX_HTTP_HEAD)
         && !ctx->vary_nocache
@@ -287,7 +382,7 @@ ngx_http_cache_turbo_header_filter_capture(ngx_http_request_t *r,
         && !ctx->auto_skip
         && !ctx->req_no_store
         && ngx_http_cache_turbo_status_ttl(clcf, r->headers_out.status) >= 0
-        && ngx_http_cache_turbo_response_cacheable(r)
+        && ngx_http_cache_turbo_response_cacheable(r, &cacheable_reason)
         && ngx_http_cache_turbo_require_hdr_ok(r, clcf)
         && !ngx_http_cache_turbo_response_encoded(r)
         && (clcf->no_store == NULL
@@ -312,6 +407,16 @@ ngx_http_cache_turbo_header_filter_capture(ngx_http_request_t *r,
         if (clcf->surrogate_key) {
             ngx_http_cache_turbo_emit_surrogate_key(r, clcf);
         }
+    } else if (clcf->enable && (r == r->main || ctx->warm)
+               && !(r->method & NGX_HTTP_HEAD) && !ctx->vary_nocache
+               && !ctx->min_uses_skip && !ctx->auto_skip
+               && !ctx->req_no_store
+               && ngx_http_cache_turbo_status_ttl(clcf,
+                      r->headers_out.status) >= 0)
+    {
+        /* Every shared leg up to response_cacheable() passed and the
+         * response still was not captured -- attribute the refusal. */
+        ngx_http_cache_turbo_capture_count_refusal(r, clcf, cacheable_reason);
     }
 
     /* Cold-miss single-flight (v10): if we are the winner but this response is

@@ -151,6 +151,9 @@ def run_all(ng: Nginx, origin: Origin,
     test_no_cache_cc_private(ng)
     test_no_cache_cc_nostore(ng)
     test_no_cache_authorization(ng)
+    test_refuse_set_cookie_counter(ng, origin)                # P0-1
+    test_refuse_cache_control_counter(ng, origin)              # P0-1
+    test_refuse_authorization_counter(ng, origin)               # P0-1
     test_default_key_varies_by_host(ng)
     test_default_key_normalizes(ng)
     test_cache_redirect(ng)
@@ -177,8 +180,14 @@ def run_all(ng: Nginx, origin: Origin,
     test_honor_ttl_clamped_to_max(ng, origin)              # STAB-5 TTL clamp
     test_vary_encoding_qvalue(ng, origin)
     test_auto_vary_unknown_axis_uncacheable(ng, origin)
+    test_refuse_vary_unsafe_counter(ng, origin)                        # P0-1
+    test_refuse_vary_unsafe_excludes_named_vetoes(ng, origin)          # P0-1
     test_auto_vary_stale_marker_reachable(ng, origin)
     test_206_never_cached(ng, origin)
+    test_refuse_partial_counter(ng, origin)                    # P0-1
+    test_refuse_head_counter(ng, origin)                       # P0-1
+    test_refuse_require_header_counter(ng, origin)             # P0-1
+    test_refuse_encoded_counter(ng, origin)                    # P0-1
     test_range_hit_matches_miss(ng, origin)
     test_range_suffix_hit_matches_miss(ng, origin)
     test_range_unsatisfiable_hit_matches_miss(ng, origin)

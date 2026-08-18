@@ -365,9 +365,9 @@ ngx_http_cache_turbo_admin_stats_prometheus(ngx_http_request_t *r,
     u_char     *p;
     size_t      len;
 
-    /* Fifteen counters (*_total) + four gauges, each labelled by zone
+    /* Twenty-three counters (*_total) + four gauges, each labelled by zone
      * so one Prometheus job can scrape many zones. Exposition format
-     * 0.0.4. The per-metric budget must track the emitted count (19):
+     * 0.0.4. The per-metric budget must track the emitted count (27):
      * every metric line renders one %V (zone) + one %uA (value), so a
      * short multiplier could truncate the last line under a long zone
      * name. The fixed term covers the HELP/TYPE prose, which grows
@@ -379,8 +379,9 @@ ngx_http_cache_turbo_admin_stats_prometheus(ngx_http_request_t *r,
      * breaker_state (gauge), prose term bumped by ~350 bytes -- the
      * breaker_state HELP documents the numeric mapping since the
      * value itself is deliberately NOT a label, see the emit call
-     * below). */
-    len = 3900 + 19 * zname.len + 19 * NGX_ATOMIC_T_LEN;
+     * below; P0-1 added eight refuse_*_total counters, prose term
+     * bumped by ~1050 bytes for their HELP/TYPE lines). */
+    len = 4950 + 27 * zname.len + 27 * NGX_ATOMIC_T_LEN;
     p = ngx_pnalloc(r->pool, len);
     if (p == NULL) {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -420,6 +421,30 @@ ngx_http_cache_turbo_admin_stats_prometheus(ngx_http_request_t *r,
         "# HELP cache_turbo_bypasses_total Requests skipped straight to origin by a cache_turbo_bypass predicate or a CMS backend preset (subset of misses).\n"
         "# TYPE cache_turbo_bypasses_total counter\n"
         "cache_turbo_bypasses_total{zone=\"%V\"} %uA\n"
+        "# HELP cache_turbo_refuse_set_cookie_total Store refused because the response carried a Set-Cookie header.\n"
+        "# TYPE cache_turbo_refuse_set_cookie_total counter\n"
+        "cache_turbo_refuse_set_cookie_total{zone=\"%V\"} %uA\n"
+        "# HELP cache_turbo_refuse_encoded_total Store refused because the response was already Content-Encoding'd (origin pre-compression or filter mis-order).\n"
+        "# TYPE cache_turbo_refuse_encoded_total counter\n"
+        "cache_turbo_refuse_encoded_total{zone=\"%V\"} %uA\n"
+        "# HELP cache_turbo_refuse_vary_unsafe_total Store refused: Vary named an axis outside the whitelist or \"*\".\n"
+        "# TYPE cache_turbo_refuse_vary_unsafe_total counter\n"
+        "cache_turbo_refuse_vary_unsafe_total{zone=\"%V\"} %uA\n"
+        "# HELP cache_turbo_refuse_authorization_total Store refused because the request carried Authorization.\n"
+        "# TYPE cache_turbo_refuse_authorization_total counter\n"
+        "cache_turbo_refuse_authorization_total{zone=\"%V\"} %uA\n"
+        "# HELP cache_turbo_refuse_cache_control_total Store refused by a Cache-Control (or CDN-/Surrogate-) no-store/no-cache/private/max-age=0 directive.\n"
+        "# TYPE cache_turbo_refuse_cache_control_total counter\n"
+        "cache_turbo_refuse_cache_control_total{zone=\"%V\"} %uA\n"
+        "# HELP cache_turbo_refuse_require_header_total Store refused because cache_turbo_require_header was unmet (absent or not affirmative).\n"
+        "# TYPE cache_turbo_refuse_require_header_total counter\n"
+        "cache_turbo_refuse_require_header_total{zone=\"%V\"} %uA\n"
+        "# HELP cache_turbo_refuse_partial_total Store refused because the response was 206 Partial Content.\n"
+        "# TYPE cache_turbo_refuse_partial_total counter\n"
+        "cache_turbo_refuse_partial_total{zone=\"%V\"} %uA\n"
+        "# HELP cache_turbo_refuse_head_total Store refused because the request was HEAD.\n"
+        "# TYPE cache_turbo_refuse_head_total counter\n"
+        "cache_turbo_refuse_head_total{zone=\"%V\"} %uA\n"
         "# HELP cache_turbo_regen_cost_ms Average origin regeneration cost in milliseconds.\n"
         "# TYPE cache_turbo_regen_cost_ms gauge\n"
         "cache_turbo_regen_cost_ms{zone=\"%V\"} %uA\n"
@@ -449,6 +474,10 @@ ngx_http_cache_turbo_admin_stats_prometheus(ngx_http_request_t *r,
         &zname, st->l2_hits, &zname, st->l2_misses, &zname, st->lock_waits,
         &zname, st->min_uses_skips, &zname, st->l2_neg_skips,
         &zname, st->bypasses,
+        &zname, st->refuse_set_cookie, &zname, st->refuse_encoded,
+        &zname, st->refuse_vary_unsafe, &zname, st->refuse_authorization,
+        &zname, st->refuse_cache_control, &zname, st->refuse_require_header,
+        &zname, st->refuse_partial, &zname, st->refuse_head,
         &zname, st->cost_ms, &zname, st->autotuned_beta,
         &zname, st->autotuned_load,
         &zname, st->sie_serves, &zname, st->breaker_serves,
@@ -476,12 +505,16 @@ ngx_http_cache_turbo_admin_stats_json(ngx_http_request_t *r,
     len = sizeof("{\"hits\":,\"misses\":,\"stale_serves\":,\"refreshes\":,"
                  "\"evictions\":,\"l2_hits\":,\"l2_misses\":,\"lock_waits\":,"
                  "\"min_uses_skips\":,\"l2_neg_skips\":,\"bypasses\":,"
+                 "\"refuse_set_cookie\":,\"refuse_encoded\":,"
+                 "\"refuse_vary_unsafe\":,\"refuse_authorization\":,"
+                 "\"refuse_cache_control\":,\"refuse_require_header\":,"
+                 "\"refuse_partial\":,\"refuse_head\":,"
                  "\"cost_ms\":,"
                  "\"autotuned_beta\":,\"autotuned_load\":,"
                  "\"breaker_state\":\"\",\"breaker_opens\":,"
                  "\"sie_serves\":,\"breaker_serves\":,"
                  "\"origin_failures\":}\n")
-          + 18 * NGX_ATOMIC_T_LEN
+          + 26 * NGX_ATOMIC_T_LEN
           + sizeof("half-open") - 1;   /* longest _breaker_state_str value */
     p = ngx_pnalloc(r->pool, len);
     if (p == NULL) {
@@ -493,7 +526,12 @@ ngx_http_cache_turbo_admin_stats_json(ngx_http_request_t *r,
         "\"refreshes\":%uA,\"evictions\":%uA,\"l2_hits\":%uA,"
         "\"l2_misses\":%uA,\"lock_waits\":%uA,\"min_uses_skips\":%uA,"
         "\"l2_neg_skips\":%uA,"
-        "\"bypasses\":%uA,\"cost_ms\":%uA,\"autotuned_beta\":%uA,"
+        "\"bypasses\":%uA,"
+        "\"refuse_set_cookie\":%uA,\"refuse_encoded\":%uA,"
+        "\"refuse_vary_unsafe\":%uA,\"refuse_authorization\":%uA,"
+        "\"refuse_cache_control\":%uA,\"refuse_require_header\":%uA,"
+        "\"refuse_partial\":%uA,\"refuse_head\":%uA,"
+        "\"cost_ms\":%uA,\"autotuned_beta\":%uA,"
         "\"autotuned_load\":%uA,"
         "\"breaker_state\":\"%s\",\"breaker_opens\":%uA,"
         "\"sie_serves\":%uA,\"breaker_serves\":%uA,"
@@ -501,7 +539,11 @@ ngx_http_cache_turbo_admin_stats_json(ngx_http_request_t *r,
         st->hits, st->misses, st->stale_serves,
         st->refreshes, st->evictions, st->l2_hits, st->l2_misses,
         st->lock_waits, st->min_uses_skips, st->l2_neg_skips,
-        st->bypasses, st->cost_ms,
+        st->bypasses,
+        st->refuse_set_cookie, st->refuse_encoded, st->refuse_vary_unsafe,
+        st->refuse_authorization, st->refuse_cache_control,
+        st->refuse_require_header, st->refuse_partial, st->refuse_head,
+        st->cost_ms,
         st->autotuned_beta, st->autotuned_load,
         ngx_http_cache_turbo_shm_breaker_state_str(
             (ngx_uint_t) st->breaker_state),

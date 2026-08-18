@@ -2693,16 +2693,29 @@ ngx_http_cache_turbo_serve(ngx_http_request_t *r, u_char *copy, size_t len,
  * Without this the module would store an authenticated 200 under its URL key and
  * serve it to everyone — a cache-poisoning / data-leak hole. Cheap: one walk of
  * the (small) response header list, only on the store path.
+ *
+ * P0-1: reason_out (may be NULL) receives which arm vetoed, one of the
+ * NGX_HTTP_CACHE_TURBO_REFUSE_* constants, so the header-filter capture gate
+ * can attribute a refusal to a Prometheus counter without a second header
+ * walk. Purely observational -- does not change which responses are refused.
  */
 ngx_int_t
-ngx_http_cache_turbo_response_cacheable(ngx_http_request_t *r)
+ngx_http_cache_turbo_response_cacheable(ngx_http_request_t *r,
+    ngx_uint_t *reason_out)
 {
     ngx_list_part_t                  *part;
     ngx_table_elt_t                  *h;
     ngx_uint_t                        i;
     ngx_http_cache_turbo_loc_conf_t  *clcf;
 
+    if (reason_out != NULL) {
+        *reason_out = NGX_HTTP_CACHE_TURBO_REFUSE_NONE;
+    }
+
     if (r->headers_in.authorization != NULL) {
+        if (reason_out != NULL) {
+            *reason_out = NGX_HTTP_CACHE_TURBO_REFUSE_AUTHORIZATION;
+        }
         return 0;
     }
 
@@ -2743,6 +2756,9 @@ ngx_http_cache_turbo_response_cacheable(ngx_http_request_t *r)
             && ngx_strncasecmp(h[i].key.data, (u_char *) "Set-Cookie",
                                sizeof("Set-Cookie") - 1) == 0)
         {
+            if (reason_out != NULL) {
+                *reason_out = NGX_HTTP_CACHE_TURBO_REFUSE_SET_COOKIE;
+            }
             return 0;
         }
 
@@ -2786,6 +2802,9 @@ ngx_http_cache_turbo_response_cacheable(ngx_http_request_t *r)
                 || ngx_http_cache_turbo_cc_delta(v, e, "s-maxage",
                     sizeof("s-maxage") - 1) == 0)
             {
+                if (reason_out != NULL) {
+                    *reason_out = NGX_HTTP_CACHE_TURBO_REFUSE_CACHE_CONTROL;
+                }
                 return 0;
             }
         }
