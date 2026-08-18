@@ -1270,6 +1270,61 @@ ngx_http_cache_turbo_merge_normalize(ngx_http_cache_turbo_loc_conf_t *conf,
     }
 }
 
+
+/* P1-7: config-time warning for double-partitioned axes.
+ *
+ * If cache_turbo_auto_vary is on (the default) and cache_turbo_normalize_vary
+ * enables a bucket for the SAME axis (encoding or device), the cache splits on
+ * that axis TWICE -- once via the auto-detected Vary header (in vary_bits),
+ * once via the normalized-args key suffix. This multiplies the slot count for
+ * the same partitioning, wasting space with no benefit.
+ *
+ * Warn at config merge time, naming the doubled axis and suggesting to pick
+ * one mechanism. The config still loads (a warning, not an error). */
+static void
+ngx_http_cache_turbo_warn_double_partition(ngx_conf_t *cf,
+    ngx_http_cache_turbo_loc_conf_t *conf)
+{
+    /* Only warn if caching is enabled at this location. */
+    if (!conf->enable) {
+        return;
+    }
+
+    /* auto_vary defaults to ON (1). Only warn if it is actually on. */
+    if (!conf->auto_vary) {
+        return;
+    }
+
+    /* No normalize_vary set (0), so no overlap. */
+    if (conf->normalize_vary == 0 || conf->normalize_vary == NGX_CONF_UNSET) {
+        return;
+    }
+
+    /* Check each axis that can be double-partitioned:
+     * - VARY_ENCODING (0x1): auto_vary can set it from Accept-Encoding header,
+     *   and normalize_vary can set it from "encoding" token.
+     * - VARY_DEVICE (0x2): auto_vary can set it from User-Agent header,
+     *   and normalize_vary can set it from "device" token. */
+
+    if (conf->normalize_vary & NGX_HTTP_CACHE_TURBO_VARY_ENCODING) {
+        ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+            "cache_turbo_auto_vary is on (default) and cache_turbo_normalize_vary "
+            "includes 'encoding': the 'encoding' axis is partitioned TWICE "
+            "(once by auto-detected Vary, once by the normalized-args suffix), "
+            "multiplying slot count for no benefit. Pick one: remove 'encoding' "
+            "from cache_turbo_normalize_vary, or set cache_turbo_auto_vary off");
+    }
+
+    if (conf->normalize_vary & NGX_HTTP_CACHE_TURBO_VARY_DEVICE) {
+        ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+            "cache_turbo_auto_vary is on (default) and cache_turbo_normalize_vary "
+            "includes 'device': the 'device' axis is partitioned TWICE "
+            "(once by auto-detected Vary, once by the normalized-args suffix), "
+            "multiplying slot count for no benefit. Pick one: remove 'device' "
+            "from cache_turbo_normalize_vary, or set cache_turbo_auto_vary off");
+    }
+}
+
 char *
 ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 {
@@ -1292,6 +1347,7 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     }
 
     ngx_http_cache_turbo_merge_normalize(conf, prev);
+    ngx_http_cache_turbo_warn_double_partition(cf, conf);
 
     return NGX_CONF_OK;
 }

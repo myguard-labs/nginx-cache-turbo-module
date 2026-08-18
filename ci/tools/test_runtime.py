@@ -97,6 +97,9 @@ def run_all(ng: Nginx, origin: Origin,
     test_breaker_counters(ng, origin)                        # S7.1 breaker_serves/origin_failures
     test_breaker_retry_after_auto_tracks_breaker_open(ng, origin)  # BRK-RA1
     test_prometheus_breaker_metrics(ng, origin)               # H7.3a breaker_opens_total/breaker_state on prometheus
+    test_double_partition_encoding_warns(ng)                  # P1-7
+    test_double_partition_device_warns(ng)                    # P1-7
+    test_double_partition_both_warns(ng)                      # P1-7
     test_breaker_arming_sites_gated_white_box(ng, origin)    # O4.4-i (L1)
     test_bypass_stale_serves_fallback_when_breaker_open(ng, origin)  # S232-BYPASS-STALE
     test_bypass_stale_never_serves_on_normal_path(ng, origin)        # S232 safety control
