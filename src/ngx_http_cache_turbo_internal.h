@@ -794,6 +794,56 @@ ngx_int_t ngx_http_cache_turbo_header_admissible(ngx_http_cache_turbo_loc_conf_t
     u_char *name, size_t nlen, u_char *val, size_t vlen);
 ngx_int_t ngx_http_cache_turbo_require_hdr_ok(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf);
+
+/* Directive setters + the ngx_http_cache_turbo(...) top-level directive, now
+ * defined in ngx_http_cache_turbo_conf.c (MAINT-SPLIT step H). Non-static:
+ * ngx_http_cache_turbo_commands[] in module.c references each as a function
+ * pointer. */
+char *ngx_http_cache_turbo_zone(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
+char *ngx_http_cache_turbo(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
+char *ngx_http_cache_turbo_backend(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
+char *ngx_http_cache_turbo_cache_control(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
+char *ngx_http_cache_turbo_key(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
+char *ngx_http_cache_turbo_valid_conf(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
+char *ngx_http_cache_turbo_admin(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
+char *ngx_http_cache_turbo_tag(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
+char *ngx_http_cache_turbo_require_header(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
+char *ngx_http_cache_turbo_stale_mult(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
+char *ngx_http_cache_turbo_min_uses(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
+char *ngx_http_cache_turbo_breaker_open_conf(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
+char *ngx_http_cache_turbo_scan_resistant(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
+char *ngx_http_cache_turbo_l2_negative_ttl(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
+char *ngx_http_cache_turbo_keep_stale(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
+char *ngx_http_cache_turbo_use_stale(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
+char *ngx_http_cache_turbo_preset(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
+char *ngx_http_cache_turbo_normalize_strip(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
+char *ngx_http_cache_turbo_normalize_vary(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
+char *ngx_http_cache_turbo_backend_prefix(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
+char *ngx_http_cache_turbo_bypass_uri(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
+char *ngx_http_cache_turbo_bypass_stale_uri(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
+char *ngx_http_cache_turbo_key_cookie_conf(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
 ngx_int_t ngx_http_cache_turbo_response_cacheable(ngx_http_request_t *r);
 ngx_int_t ngx_http_cache_turbo_response_must_revalidate(ngx_http_request_t *r);
 time_t ngx_http_cache_turbo_response_sie(ngx_http_request_t *r);
