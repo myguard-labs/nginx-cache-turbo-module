@@ -2347,3 +2347,98 @@ def test_prometheus_breaker_metrics(ng: Nginx, origin: Origin) -> None:
     finally:
         origin.fail = False
         drain_origin(origin)
+
+
+def test_double_partition_encoding_warns(ng: Nginx) -> None:
+    """P1-7: config-time warning for double-partitioned axes.
+
+    When both cache_turbo_auto_vary is on (the default) and
+    cache_turbo_normalize_vary includes 'encoding', the 'encoding' axis is
+    partitioned TWICE (once by auto-detected Vary, once by the normalized-args
+    suffix), multiplying slot count for no benefit. The config must still load
+    (WARN, not reject), and the diagnostic must name the doubled axis and
+    suggest picking one mechanism."""
+    _config_warns(ng, "double-partition-encoding",
+        "        location /forever/ {\n"
+        "            cache_turbo          main;\n"
+        "            cache_turbo_key      $uri;\n"
+        "            cache_turbo_valid    0;\n"
+        "            proxy_pass http://127.0.0.1:{origin_port}/;\n"
+        "        }\n".replace("{origin_port}", str(ng.origin_port)),
+        "        location /forever/ {\n"
+        "            cache_turbo          main;\n"
+        "            cache_turbo_key      $uri;\n"
+        "            cache_turbo_valid    0;\n"
+        "            proxy_pass http://127.0.0.1:%d/;\n"
+        "        }\n"
+        "\n"
+        "        location /double-encoding/ {\n"
+        "            cache_turbo                    main;\n"
+        "            cache_turbo_key                $uri;\n"
+        "            cache_turbo_valid              30s;\n"
+        "            cache_turbo_normalize_vary     encoding;\n"
+        "            proxy_pass http://127.0.0.1:%d/;\n"
+        "        }\n"
+        % (ng.origin_port, ng.origin_port),
+        "'encoding' axis is partitioned TWICE")
+
+
+def test_double_partition_device_warns(ng: Nginx) -> None:
+    """P1-7: config-time warning for double-partitioned axes (device variant).
+
+    When both cache_turbo_auto_vary is on (the default) and
+    cache_turbo_normalize_vary includes 'device', the 'device' axis is
+    partitioned TWICE. Must warn, must load."""
+    _config_warns(ng, "double-partition-device",
+        "        location /forever/ {\n"
+        "            cache_turbo          main;\n"
+        "            cache_turbo_key      $uri;\n"
+        "            cache_turbo_valid    0;\n"
+        "            proxy_pass http://127.0.0.1:{origin_port}/;\n"
+        "        }\n".replace("{origin_port}", str(ng.origin_port)),
+        "        location /forever/ {\n"
+        "            cache_turbo          main;\n"
+        "            cache_turbo_key      $uri;\n"
+        "            cache_turbo_valid    0;\n"
+        "            proxy_pass http://127.0.0.1:%d/;\n"
+        "        }\n"
+        "\n"
+        "        location /double-device/ {\n"
+        "            cache_turbo                    main;\n"
+        "            cache_turbo_key                $uri;\n"
+        "            cache_turbo_valid              30s;\n"
+        "            cache_turbo_normalize_vary     device;\n"
+        "            proxy_pass http://127.0.0.1:%d/;\n"
+        "        }\n"
+        % (ng.origin_port, ng.origin_port),
+        "'device' axis is partitioned TWICE")
+
+
+def test_double_partition_both_warns(ng: Nginx) -> None:
+    """P1-7: negative control -- both axes double-partitioned at once.
+
+    When both cache_turbo_normalize_vary encoding device (both axes),
+    should warn for BOTH."""
+    _config_warns(ng, "double-partition-both",
+        "        location /forever/ {\n"
+        "            cache_turbo          main;\n"
+        "            cache_turbo_key      $uri;\n"
+        "            cache_turbo_valid    0;\n"
+        "            proxy_pass http://127.0.0.1:{origin_port}/;\n"
+        "        }\n".replace("{origin_port}", str(ng.origin_port)),
+        "        location /forever/ {\n"
+        "            cache_turbo          main;\n"
+        "            cache_turbo_key      $uri;\n"
+        "            cache_turbo_valid    0;\n"
+        "            proxy_pass http://127.0.0.1:%d/;\n"
+        "        }\n"
+        "\n"
+        "        location /double-both/ {\n"
+        "            cache_turbo                    main;\n"
+        "            cache_turbo_key                $uri;\n"
+        "            cache_turbo_valid              30s;\n"
+        "            cache_turbo_normalize_vary     encoding device;\n"
+        "            proxy_pass http://127.0.0.1:%d/;\n"
+        "        }\n"
+        % (ng.origin_port, ng.origin_port),
+        "'encoding' axis is partitioned TWICE")  # First one fires
