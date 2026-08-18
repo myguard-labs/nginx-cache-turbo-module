@@ -257,7 +257,7 @@ location / {
 | **One config for php-fpm *and* APIs** | same directives (`fastcgi_pass` + `proxy_pass`) | separate `fastcgi_cache` / `proxy_cache` |
 | **Tag purge · auto-Vary · CMS auto-classify · Prometheus** | built in | none |
 | **Range requests on a HIT** | honoured (`Range:` answered `206`, same as a MISS) | honoured |
-| **Survives reload / restart** | no — shm cleared (Redis L2 softens) | yes, persists on disk |
+| **Survives reload / restart** | reload yes, restart no — shm cleared on restart (Redis L2 softens) | yes, persists on disk |
 | **Capacity** | bounded by RAM | huge on-disk corpus |
 | **Built into nginx** | no — dynamic module | yes, nothing to install |
 | **Maturity** | newer | a decade of edge cases |
@@ -1866,6 +1866,32 @@ Useful PromQL: **hit ratio**
 rate(cache_turbo_misses_total[5m]))`, **backend regen rate**
 `rate(cache_turbo_refreshes_total[5m])`, plus `cache_turbo_regen_cost_ms` and
 `cache_turbo_autotuned_beta` as plain gauges.
+
+### Eviction pressure alert
+
+The `cache_turbo_evictions_total` counter rises when entries are dropped to stay under the zone's memory ceiling — a sign of LRU pressure under load. A zone that is too small for the working set will evict entries faster than they are used, thrashing the cache and defeating compression gains.
+
+**Prometheus alert rule** (adapt thresholds to your workload):
+
+```yaml
+- alert: CacheTurboEvictionThrashing
+  expr: rate(cache_turbo_evictions_total[5m]) > 100
+  for: 5m
+  annotations:
+    summary: "Zone {{ $labels.zone }} evicting {{ $value | humanize }} entries/sec"
+    description: |
+      High eviction rate indicates the zone is sized too small for the working
+      set. Increase cache_turbo_zone size, enable Redis L2 to warm cold hits,
+      or reduce the requested TTLs to lower the retention burden.
+```
+
+**Interpretation:**
+
+- **Eviction rate near 0** — healthy; entries live their full TTL and age out naturally.
+- **Eviction rate creeping up** — the working set is growing relative to zone capacity. Monitor and plan for expansion.
+- **Eviction rate sustained and high** — zone is under severe pressure. LRU eviction is too aggressive; legitimate hot entries are being dropped.
+
+The eviction counter is cumulative; in Prometheus use `rate()` over a 5-minute window to surface the per-second eviction rate. Pair this with hit ratio (`rate(cache_turbo_hits_total[5m]) / (rate(cache_turbo_hits_total[5m]) + rate(cache_turbo_misses_total[5m]))`) — a coinciding hit-ratio drop + eviction spike confirms the zone needs more memory.
 
 ## Redis L2 (shared cache)
 
