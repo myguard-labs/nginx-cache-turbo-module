@@ -1459,6 +1459,18 @@ typedef struct {
      * directive comment in the conf array for why this is a plain blocking
      * ngx_msleep rather than an async timer. */
     ngx_int_t                test_l2_promote_hold_ms;
+    /* S231-L2-SCANTIME: milliseconds to block the worker at every SCAN page
+     * boundary of an L2 all-purge, so the wall-clock deadline check is
+     * REACHABLE deterministically. Without it the deadline test is a race
+     * against runner speed: the walk's `cursor == 0` completion check returns
+     * BEFORE the deadline check, so a keyspace small enough to finish inside
+     * the page cap can answer 200 having never evaluated the deadline at all --
+     * and ngx_current_msec is nginx's CACHED clock, refreshed at event-loop
+     * wakeups, so a fast walk may observe no elapsed time whatsoever. Blocking
+     * (ngx_msleep) for the same reason as test_l2_promote_hold_ms: the walk is
+     * driven off one connection's read handler and an async timer would not
+     * hold the page boundary. 0/unset = no hold. */
+    ngx_int_t                test_scan_page_hold_ms;
     /* S231-SIE-MIDBODY: no production signal for "the upstream died after
      * sending headers but before last_buf" is reliable enough to trigger the
      * rescue from (see the body filter comment at the rescue site for the

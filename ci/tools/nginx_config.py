@@ -781,17 +781,38 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             deny all;
         }}
 
-        # S231-L2-SCANTIME. /_cache_scandeadline sets scan_deadline=1ms -- far
-        # below any real page round-trip over TCP, so a walk spanning 2+ pages
-        # is deterministically past it by the second page boundary (no timing
-        # band: 1ms is chosen to be unmeetable, not "usually enough"). The page
-        # cap stays at its production value so only the deadline can explain an
-        # abort at scan_pages < the cap. /_cache_scandeadlineoff is the negative
-        # control: same location shape, scan_deadline=0 (disabled), so a walk
-        # spanning the same number of pages must complete normally.
+        # S231-L2-SCANTIME. The deadline is checked at a page boundary and only
+        # AFTER the cursor==0 completion return, so a walk that finishes never
+        # evaluates it. A bare "unmeetable" 1ms deadline therefore does NOT make
+        # the abort deterministic: 6000 keys at COUNT 256 complete in ~24 pages,
+        # and on a fast runner the whole walk can finish inside one tick of
+        # ngx_current_msec (nginx's CACHED clock) having never checked. That is
+        # a race against runner speed, and it is what made this test red on CI
+        # and green locally.
+        #
+        # The hold is what makes it deterministic: 40ms per page boundary puts
+        # the SECOND boundary ~40ms in, far past a 5ms deadline, on any runner.
+        # The deadline is 5ms rather than 1ms so it still exceeds a real page
+        # round-trip -- the abort is explained by elapsed wall-clock, not by a
+        # deadline no walk could ever meet. The page cap stays at its production
+        # value so only the deadline can explain an abort at scan_pages < cap.
+        #
+        # /_cache_scandeadlineoff is the negative control: same shape and the
+        # same per-page hold, deadline disabled, so it must still complete
+        # normally. Sharing the hold is what makes it a control for the DEADLINE
+        # rather than for the hold.
+        #
+        # The hold blocks the worker INSIDE the SCAN read handler while the 2s
+        # read timer keeps running, so the control's keyspace is deliberately
+        # small (see _scan_fill's n at the call site): a full ~24-page walk at
+        # 40ms/page would spend ~1s of the 2s budget and stall the single worker
+        # for that whole time. The control only has to prove that a walk which
+        # crosses a held page boundary still completes when the deadline is
+        # off -- two pages is enough to prove that, and 6000 keys is not.
         location = /_cache_scandeadline {{
             cache_turbo_admin    main;
-            cache_turbo_redis    127.0.0.1:{redis_port} db=7 prefix=ctscan: timeout=2s scan_deadline=1ms;
+            cache_turbo_redis    127.0.0.1:{redis_port} db=7 prefix=ctscan: timeout=2s scan_deadline=5ms;
+            cache_turbo_test_scan_page_hold_ms 40;
             allow 127.0.0.1;
             deny all;
         }}
@@ -799,6 +820,7 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
         location = /_cache_scandeadlineoff {{
             cache_turbo_admin    main;
             cache_turbo_redis    127.0.0.1:{redis_port} db=7 prefix=ctscan: timeout=2s scan_deadline=0;
+            cache_turbo_test_scan_page_hold_ms 40;
             allow 127.0.0.1;
             deny all;
         }}

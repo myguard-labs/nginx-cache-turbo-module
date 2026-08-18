@@ -2365,18 +2365,34 @@ def test_scan_walk_deadline_reports_incomplete(ng: Nginx,
     reports reason=="page-cap" at the same status/l2 values -- see
     test_scan_walk_page_cap_reports_incomplete). Two claims:
 
-      1. NEGATIVE CONTROL -- the identical multi-page keyspace against
-         /_cache_scandeadlineoff (scan_deadline=0, disabled) completes
+      1. NEGATIVE CONTROL -- a keyspace that crosses a held page boundary
+         against /_cache_scandeadlineoff (scan_deadline=0, disabled) completes
          normally: 200, no "l2" key. Proves the deadline check itself, not
          some other abort path, is what fires below.
-      2. Against /_cache_scandeadline (scan_deadline=1ms -- unmeetable by any
-         real page round-trip) the walk is abandoned with reason=="deadline",
-         distinct from "page-cap", at fewer than SCAN_MAX_PAGES pages."""
+      2. Against /_cache_scandeadline (scan_deadline=5ms, with a 40ms hold at
+         every page boundary) the walk is abandoned with reason=="deadline",
+         distinct from "page-cap", at fewer than SCAN_MAX_PAGES pages.
+
+    ⚠ Why the hold exists, and why a bare "unmeetable" 1ms deadline was NOT
+    enough (this test was CI-red / locally-green until 2026-08-18): the walk's
+    cursor==0 completion return (redis.c:3191) sits BEFORE the deadline check
+    (redis.c:3213), so a walk that reaches the end of the keyspace NEVER
+    evaluates the deadline. 6000 keys at SCAN COUNT 256 (redis.c:1820) complete
+    in ~24 pages, and ngx_current_msec is nginx's CACHED clock -- so on a fast
+    runner the whole walk could finish inside one tick and answer 200 with
+    scan_pages==24, which is exactly the failure that was seen. The 40ms
+    per-page hold makes a non-final boundary outlive the deadline on any
+    runner. Do NOT "fix" a recurrence by widening the deadline: that disables
+    the oracle ([[feedback-widening-shared-timeout-disables-oracle]]). The knob
+    to move is the hold."""
     redis.cli("-n", "7", "FLUSHDB")
 
-    # 1. negative control: deadline disabled, same multi-page keyspace, same
-    # location shape -> ordinary completion.
-    _scan_fill(redis, 6000, "dl-ctrl")
+    # 1. negative control: deadline disabled, a keyspace that still crosses a
+    # held page boundary, same location shape -> ordinary completion.
+    # Sized small on purpose: the hold blocks the worker inside the SCAN read
+    # handler while the 2s read timer runs, so a full ~24-page control walk
+    # would burn ~1s of that budget for no extra proof.
+    _scan_fill(redis, 400, "dl-ctrl")
     s_off, off = _scan_purge(ng, "/_cache_scandeadlineoff")
     assert s_off == 200, f"deadline=0 must not abort a normal walk: {s_off} {off}"
     assert "l2" not in off, f"disabled deadline still reported an L2 problem: {off}"
