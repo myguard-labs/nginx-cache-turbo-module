@@ -2521,9 +2521,15 @@ ngx_int_t ngx_http_cache_turbo_tag_purge_complete(ngx_http_request_t *r,
     const ngx_http_cache_turbo_redis_walk_t *walk);
 
 /* Fire one background subrequest for `uri` (+ optional `args`) so the origin is
- * hit and the response stored (module.c; shared with the admin warm path). */
+ * hit and the response stored (module.c; shared with the admin warm path).
+ * `snap`/`snap_len` are an optional pinned copy of the entry's current stored
+ * blob (as used by the SWR background-refresh callers) -- when non-NULL, its
+ * ETag / Last-Modified (if any) are injected as If-None-Match /
+ * If-Modified-Since on the subrequest so a stale-while-revalidate refresh can
+ * be answered 304 by the origin instead of always paying a full body. Pass
+ * NULL/0 (the admin warm path) for the old unconditional-GET behaviour. */
 ngx_int_t ngx_http_cache_turbo_warm_one(ngx_http_request_t *r,
-    ngx_str_t *uri, ngx_str_t *args);
+    ngx_str_t *uri, ngx_str_t *args, u_char *snap, size_t snap_len);
 
 
 /* ---- admin.c (admin request handler) ---- */

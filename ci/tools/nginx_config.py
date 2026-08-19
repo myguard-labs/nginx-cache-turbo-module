@@ -2721,6 +2721,32 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # P1-4: background_update ON (default) with a huge beta so the FIRST
+        # stale read deterministically wins the refresh dice. The origin's
+        # "vldecho" marker echoes back whatever If-None-Match /
+        # If-Modified-Since it received AND stamps a stable ETag/Last-Modified
+        # on every response, so a primed entry always has a validator for the
+        # next background refresh to inject.
+        location /swrval/ {{
+            cache_turbo                   main;
+            cache_turbo_key               $uri;
+            cache_turbo_valid             1s;
+            cache_turbo_beta              5000;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # P1-4 negative control: same shape as /swrval/ but the origin path
+        # never carries "vldecho"/"cond" so the stored entry has NEITHER
+        # validator -- the background refresh must stay an unconditional GET,
+        # exactly like today.
+        location /swrvalnone/ {{
+            cache_turbo                   main;
+            cache_turbo_key               $uri;
+            cache_turbo_valid             1s;
+            cache_turbo_beta              5000;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # background_update OFF (v8): the stale dice-winner regenerates INLINE
         # and serves the fresh body on that request (pre-v8 behaviour).
         location /noswr/ {{

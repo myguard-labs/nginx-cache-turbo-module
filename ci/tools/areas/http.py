@@ -1640,6 +1640,88 @@ def test_background_update_off_regenerates_inline(ng: Nginx,
         "bg-off winner should serve a freshly regenerated body inline"
 
 
+def test_swr_refresh_injects_stored_validators(ng: Nginx,
+                                               origin: Origin) -> None:
+    """P1-4: a stale-while-revalidate background refresh must carry the
+    entry's stored ETag/Last-Modified as If-None-Match/If-Modified-Since,
+    instead of an unconditional GET every stale cycle -- the largest
+    origin-offload lever in PLAN-optimize.md.
+
+    /swrval/ (beta 5000) deterministically wins the refresh dice on the very
+    first stale read; the origin's "vldecho" marker stamps a stable ETag on
+    the PRIMING response and echoes back whatever If-None-Match it received
+    on every hit, including the background refresh. The refreshed body (which
+    the bg subrequest's capture overwrites the stale entry with) is later
+    served as a HIT and its echoed inm=[...] is asserted against the ETag the
+    prime itself received.
+    """
+    uri = "/swrval/vldecho-a"
+    s0, b0, _ = fetch(ng.port, uri)                # prime: MISS, stores ETag
+    assert s0 == 200 and b0, f"prime failed: {s0} {b0!r}"
+    assert "inm=[none]" in b0, \
+        f"prime itself should be unconditional (no prior entry): {b0!r}"
+
+    time.sleep(1.3)                                 # past the 1s valid window
+
+    # beta 5000 wins the dice on the first stale read; that request also
+    # serves stale immediately, so poll a LATER hit for the refreshed body
+    # instead of asserting on this one.
+    s1, b1, h1 = fetch(ng.port, uri)
+    assert s1 == 200 and h1.get("x-cache") == "STALE", \
+        f"expected the dice-winning read itself to serve STALE, got {s1} " \
+        f"x-cache={h1.get('x-cache')}: {b1!r}"
+    assert b1 == b0, f"stale serve should be the ORIGINAL body: {b1!r} vs {b0!r}"
+
+    deadline = time.monotonic() + 5.0
+    refreshed_body = None
+    while time.monotonic() < deadline:
+        s, b, _h = fetch(ng.port, uri)
+        assert s == 200
+        if b != b0:
+            refreshed_body = b
+            break
+        time.sleep(0.1)
+    assert refreshed_body is not None, \
+        "background refresh never landed a new generation within 5s"
+    assert 'inm=[' + '"vldechoetag"' + ']' in refreshed_body, (
+        "background-refresh subrequest did not carry the stored ETag as "
+        f"If-None-Match: {refreshed_body!r}"
+    )
+
+
+def test_swr_refresh_no_validator_stays_unconditional(ng: Nginx,
+                                                       origin: Origin) -> None:
+    """P1-4 negative control: an entry stored WITHOUT an ETag and WITHOUT a
+    Last-Modified (origin never emits either for a "vldechonone" path) must
+    still produce an UNCONDITIONAL background refresh, exactly as before this
+    change -- there is nothing to inject."""
+    uri = "/swrvalnone/vldechonone-a"
+    s0, b0, _ = fetch(ng.port, uri)                # prime: MISS, no validator
+    assert s0 == 200 and b0, f"prime failed: {s0} {b0!r}"
+    assert "inm=[none]" in b0 and "ims=[none]" in b0, \
+        f"prime itself should be unconditional: {b0!r}"
+
+    time.sleep(1.3)                                  # past the 1s valid window
+
+    s1, b1, h1 = fetch(ng.port, uri)                 # wins the dice, serves stale
+    assert s1 == 200 and h1.get("x-cache") == "STALE", \
+        f"expected STALE serve, got {s1} x-cache={h1.get('x-cache')}: {b1!r}"
+
+    deadline = time.monotonic() + 5.0
+    refreshed_body = None
+    while time.monotonic() < deadline:
+        s, b, _h = fetch(ng.port, uri)
+        assert s == 200
+        if b != b0:
+            refreshed_body = b
+            break
+        time.sleep(0.1)
+    assert refreshed_body is not None, \
+        "background refresh never landed a new generation within 5s"
+    assert "inm=[none]" in refreshed_body and "ims=[none]" in refreshed_body, (
+        "background refresh injected a validator for an entry that stored "
+        f"neither: {refreshed_body!r}"
+    )
 
 
 
