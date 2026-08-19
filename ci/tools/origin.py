@@ -508,6 +508,80 @@ class Origin:
                     except BrokenPipeError:
                         pass
                     return True, None
+                if "vldechonone" in self.path:
+                    # P1-4 negative control: echo received If-None-Match /
+                    # If-Modified-Since like "vldecho" below, but emit NO
+                    # ETag/Last-Modified -- the stored entry then has neither
+                    # validator, so a later background refresh must stay an
+                    # unconditional GET (both echoed values read "none").
+                    # Checked BEFORE the plain "vldecho" substring match below
+                    # (this path contains it) so the negative-control marker
+                    # is actually reachable.
+                    inm = self.headers.get("If-None-Match") or "none"
+                    ims = self.headers.get("If-Modified-Since") or "none"
+                    body = f"gen-{n} inm=[{inm}] ims=[{ims}]\n".encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    try:
+                        self.wfile.write(body)
+                    except BrokenPipeError:
+                        pass
+                    return True, None
+                if "vld304" in self.path:
+                    # P1-4 safety probe: behave like a REAL conditional origin
+                    # -- answer 304 (no body) whenever the request carries the
+                    # matching If-None-Match, else 200 with the validator. This
+                    # is what a background refresh actually meets in production
+                    # once P1-4 injects validators, and it is the case that
+                    # decides whether injection ALONE is safe: the stored entry
+                    # must survive a 304 refresh unchanged, still be served, and
+                    # still be correct. (Reusing the stored body ON the 304 --
+                    # freshening -- is the separate row P5-4.)
+                    if self.headers.get("If-None-Match") == '"vld304etag"':
+                        self.send_response(304)
+                        self.send_header("ETag", '"vld304etag"')
+                        self.end_headers()
+                        return True, None
+                    body = f"gen-{n} vld304\n".encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header("ETag", '"vld304etag"')
+                    self.end_headers()
+                    try:
+                        self.wfile.write(body)
+                    except BrokenPipeError:
+                        pass
+                    return True, None
+                if "vldecho" in self.path:
+                    # P1-4: echo the received If-None-Match / If-Modified-Since
+                    # so a test can prove a background-refresh subrequest
+                    # carried the entry's stored validators upstream (instead
+                    # of an unconditional GET every stale cycle). Always
+                    # answers 200 with a fresh body/generation like the plain
+                    # path -- this marker only needs the REQUEST headers it
+                    # received, never a 304 (304-freshening is a separate,
+                    # deliberately unimplemented row, P5-4).
+                    inm = self.headers.get("If-None-Match") or "none"
+                    ims = self.headers.get("If-Modified-Since") or "none"
+                    body = f"gen-{n} inm=[{inm}] ims=[{ims}]\n".encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    # Stable validators (same convention as "cond") so the
+                    # PRIMING response stores an ETag + Last-Modified for the
+                    # later background refresh to read back and inject.
+                    self.send_header("ETag", '"vldechoetag"')
+                    self.send_header("Last-Modified",
+                                     "Wed, 21 Oct 2015 07:28:00 GMT")
+                    self.end_headers()
+                    try:
+                        self.wfile.write(body)
+                    except BrokenPipeError:
+                        pass
+                    return True, None
                 if "midbody-mismatch" in self.path:
                     # S231-SIE-MIDBODY framing test: a body deliberately a
                     # DIFFERENT length than the already-primed snapshot for

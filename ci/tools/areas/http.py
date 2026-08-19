@@ -1640,6 +1640,155 @@ def test_background_update_off_regenerates_inline(ng: Nginx,
         "bg-off winner should serve a freshly regenerated body inline"
 
 
+def test_swr_refresh_injects_stored_validators(ng: Nginx,
+                                               origin: Origin) -> None:
+    """P1-4: a stale-while-revalidate background refresh must carry the
+    entry's stored ETag/Last-Modified as If-None-Match/If-Modified-Since,
+    instead of an unconditional GET every stale cycle -- the largest
+    origin-offload lever in PLAN-optimize.md.
+
+    /swrval/ (beta 5000) deterministically wins the refresh dice on the very
+    first stale read; the origin's "vldecho" marker stamps a stable ETag on
+    the PRIMING response and echoes back whatever If-None-Match it received
+    on every hit, including the background refresh. The refreshed body (which
+    the bg subrequest's capture overwrites the stale entry with) is later
+    served as a HIT and its echoed inm=[...] is asserted against the ETag the
+    prime itself received.
+    """
+    uri = "/swrval/vldecho-a"
+    s0, b0, _ = fetch(ng.port, uri)                # prime: MISS, stores ETag
+    assert s0 == 200 and b0, f"prime failed: {s0} {b0!r}"
+    assert "inm=[none]" in b0, \
+        f"prime itself should be unconditional (no prior entry): {b0!r}"
+
+    time.sleep(1.3)                                 # past the 1s valid window
+
+    # beta 5000 wins the dice on the first stale read; that request also
+    # serves stale immediately, so poll a LATER hit for the refreshed body
+    # instead of asserting on this one.
+    s1, b1, h1 = fetch(ng.port, uri)
+    assert s1 == 200 and h1.get("x-cache") == "STALE", \
+        f"expected the dice-winning read itself to serve STALE, got {s1} " \
+        f"x-cache={h1.get('x-cache')}: {b1!r}"
+    assert b1 == b0, f"stale serve should be the ORIGINAL body: {b1!r} vs {b0!r}"
+
+    deadline = time.monotonic() + 5.0
+    refreshed_body = None
+    while time.monotonic() < deadline:
+        s, b, _h = fetch(ng.port, uri)
+        assert s == 200
+        if b != b0:
+            refreshed_body = b
+            break
+        time.sleep(0.1)
+    assert refreshed_body is not None, \
+        "background refresh never landed a new generation within 5s"
+    assert 'inm=[' + '"vldechoetag"' + ']' in refreshed_body, (
+        "background-refresh subrequest did not carry the stored ETag as "
+        f"If-None-Match: {refreshed_body!r}"
+    )
+
+
+def test_swr_refresh_304_keeps_entry_and_serves_it(ng: Nginx,
+                                                   origin: Origin) -> None:
+    """P1-4 BLOCKER PROBE -- currently EXPECTED TO FAIL. Do not "fix" this by
+    weakening it; it is the gate that keeps P1-4 from shipping ahead of P5-4.
+
+    /swr304/'s origin behaves like a real conditional origin: it answers 304
+    to the If-None-Match this change injects, and 200 otherwise. That is what
+    a background refresh meets in production once P1-4 injects validators.
+
+    A 304 stores nothing, and `refreshing` / `refresh_lock_until` are cleared
+    on STORE (shm.c) -- so a 304-answered refresh never extends the entry's
+    freshness. The stale-while-revalidate loop therefore stops revalidating:
+    the entry decays until it is dropped and a client eats a full BLOCKING
+    inline regeneration.
+
+    Measured on these fixtures (nginx 1.31.3, debug build, 25 reads at 200ms):
+      * /swrval/  (origin answers 200): 0 client-blocking regenerations, the
+        entry cycles HIT -> STALE -> HIT and every refresh carries the stored
+        ETag.
+      * /swr304/  (origin answers 304): the entry never returns to HIT after
+        the first refresh, then the client sees x-cache absent and a ~3s stall.
+
+    So injecting validators without 304-freshening INVERTS the lever it was
+    meant to pull: it trades a background body for a foreground full fetch.
+    P1-4 (injection) cannot ship without P5-4 (reuse the stored body on a 304
+    to extend the TTL).
+
+    The assertion below is the liveness property: once the entry is primed and
+    its refresh has been answered 304, the client must still be served from
+    cache and must never pay a synchronous regeneration -- exactly as it does
+    against a 200-answering origin."""
+    uri = "/swr304/vld304-a"
+    s0, b0, _ = fetch(ng.port, uri)                  # prime: 200 + ETag
+    assert s0 == 200 and b0, f"prime failed: {s0} {b0!r}"
+
+    time.sleep(1.3)                                   # past the 1s valid window
+
+    s1, b1, h1 = fetch(ng.port, uri)                  # wins the dice, serves stale
+    assert s1 == 200 and h1.get("x-cache") == "STALE", \
+        f"expected STALE serve, got {s1} x-cache={h1.get('x-cache')}: {b1!r}"
+    assert b1 == b0, f"stale serve must be the ORIGINAL body: {b1!r}"
+
+    # Watch a full multi-cycle window. Against a 200-answering origin this
+    # window contains repeated fresh HITs and ZERO client-blocking
+    # regenerations (measured on /swrval/); against the 304-answering origin
+    # the refresh never re-freshens the entry.
+    saw_fresh_hit = False
+    blocking = 0
+    deadline = time.monotonic() + 8.0
+    while time.monotonic() < deadline:
+        _s, _b, h = fetch(ng.port, uri)
+        xc = h.get("x-cache")
+        if xc == "HIT":
+            saw_fresh_hit = True
+        elif xc is None:
+            blocking += 1
+        time.sleep(0.2)
+
+    assert blocking == 0 and saw_fresh_hit, (
+        "P1-4 BLOCKER: a 304-answered background refresh does not extend the "
+        "entry's TTL, so stale-while-revalidate stops revalidating -- "
+        f"saw_fresh_hit={saw_fresh_hit} client-blocking regenerations="
+        f"{blocking} (expected True and 0, as on the 200-answering /swrval/ "
+        "fixture). Injection (P1-4) requires 304-freshening (P5-4) to ship."
+    )
+
+
+def test_swr_refresh_no_validator_stays_unconditional(ng: Nginx,
+                                                       origin: Origin) -> None:
+    """P1-4 negative control: an entry stored WITHOUT an ETag and WITHOUT a
+    Last-Modified (origin never emits either for a "vldechonone" path) must
+    still produce an UNCONDITIONAL background refresh, exactly as before this
+    change -- there is nothing to inject."""
+    uri = "/swrvalnone/vldechonone-a"
+    s0, b0, _ = fetch(ng.port, uri)                # prime: MISS, no validator
+    assert s0 == 200 and b0, f"prime failed: {s0} {b0!r}"
+    assert "inm=[none]" in b0 and "ims=[none]" in b0, \
+        f"prime itself should be unconditional: {b0!r}"
+
+    time.sleep(1.3)                                  # past the 1s valid window
+
+    s1, b1, h1 = fetch(ng.port, uri)                 # wins the dice, serves stale
+    assert s1 == 200 and h1.get("x-cache") == "STALE", \
+        f"expected STALE serve, got {s1} x-cache={h1.get('x-cache')}: {b1!r}"
+
+    deadline = time.monotonic() + 5.0
+    refreshed_body = None
+    while time.monotonic() < deadline:
+        s, b, _h = fetch(ng.port, uri)
+        assert s == 200
+        if b != b0:
+            refreshed_body = b
+            break
+        time.sleep(0.1)
+    assert refreshed_body is not None, \
+        "background refresh never landed a new generation within 5s"
+    assert "inm=[none]" in refreshed_body and "ims=[none]" in refreshed_body, (
+        "background refresh injected a validator for an entry that stored "
+        f"neither: {refreshed_body!r}"
+    )
 
 
 

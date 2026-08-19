@@ -3762,10 +3762,113 @@ ngx_http_cache_turbo_bginflight_cleanup(void *data)
     (void) ngx_atomic_fetch_add(&c->z->sh->bg_inflight, -1);
 }
 
+/*
+ * P1-4: push one validator header (If-None-Match from a stored ETag, or
+ * If-Modified-Since from a stored Last-Modified) onto a warm/refresh
+ * subrequest's private headers_in list, the same list warm_anonymize()
+ * already builds in place. name/value are copied by VALUE (ngx_list_push +
+ * struct assignment), matching warm_anonymize()'s existing elements -- no new
+ * copy semantics introduced here.
+ */
+static ngx_int_t
+ngx_http_cache_turbo_warm_add_validator(ngx_http_request_t *sr,
+    const char *name, size_t name_len, u_char *value, size_t value_len)
+{
+    ngx_table_elt_t  *h;
+
+    h = ngx_list_push(&sr->headers_in.headers);
+    if (h == NULL) {
+        return NGX_ERROR;
+    }
+
+    h->hash = 1;
+    h->key.data = (u_char *) name;
+    h->key.len = name_len;
+    h->value.data = value;
+    h->value.len = value_len;
+    h->lowcase_key = (u_char *) name;   /* markers below are already lower */
+    h->next = NULL;
+
+    return NGX_OK;
+}
+
+/*
+ * P1-4: inject If-None-Match / If-Modified-Since onto a background-refresh
+ * subrequest from the entry's CURRENTLY STORED blob, so stale-while-revalidate
+ * refreshes can be answered 304 by the origin instead of always paying a full
+ * body -- see PLAN-optimize.md row P1-4. `snap`/`snap_len` is the pinned blob
+ * copy the caller already holds (SWR callers only; the admin warm path passes
+ * NULL/0 and gets today's unconditional GET). Only a validator the entry
+ * ACTUALLY has is injected: an entry stored without an ETag and without a
+ * Last-Modified must still produce an unconditional GET, exactly as before
+ * this change -- so a failed/absent parse here is silently a no-op, never an
+ * error that would abort the refresh. This is INJECTION ONLY: a 304 answer is
+ * simply not cache_turbo_valid by default (ngx_http_cache_turbo_status_ttl()
+ * returns -1 for any status the operator has not explicitly listed), so the
+ * capture gate in the body filter declines it and the existing stale entry is
+ * left exactly as it was -- 304-freshening (reusing the stored body) is the
+ * deliberately separate row P5-4.
+ */
+static void
+ngx_http_cache_turbo_warm_inject_validators(ngx_http_request_t *sr,
+    u_char *snap, size_t snap_len)
+{
+    ngx_http_cache_turbo_blob_hdr_t    bh;
+    ngx_http_cache_turbo_blob_href_t  *refs;
+    const u_char                      *body_start;
+    uint32_t                           i;
+    u_char                             *etag = NULL, *lastmod = NULL;
+    size_t                              etag_len = 0, lastmod_len = 0;
+
+    if (snap == NULL || snap_len == 0) {
+        return;
+    }
+
+    if (ngx_http_cache_turbo_blob_validate(snap, snap_len, &bh, NULL,
+                                           &body_start, sr->pool, &refs)
+        != NGX_OK)
+    {
+        return;
+    }
+
+    for (i = 0; i < bh.nheaders; i++) {
+        uint32_t  nl = refs[i].nlen;
+
+        if (nl == sizeof("ETag") - 1
+            && ngx_strncasecmp((u_char *) refs[i].name, (u_char *) "ETag", nl)
+               == 0)
+        {
+            etag = (u_char *) refs[i].val;
+            etag_len = refs[i].vlen;
+
+        } else if (nl == sizeof("Last-Modified") - 1
+                   && ngx_strncasecmp((u_char *) refs[i].name,
+                                     (u_char *) "Last-Modified", nl) == 0)
+        {
+            lastmod = (u_char *) refs[i].val;
+            lastmod_len = refs[i].vlen;
+        }
+    }
+
+    /* If-None-Match takes precedence over If-Modified-Since on the response
+     * side (RFC 7232 SS6); mirror that here by preferring ETag when both are
+     * present, matching ngx_http_cache_turbo_not_modified()'s own order. */
+    if (etag != NULL && etag_len > 0) {
+        (void) ngx_http_cache_turbo_warm_add_validator(sr,
+                   "If-None-Match", sizeof("If-None-Match") - 1,
+                   etag, etag_len);
+
+    } else if (lastmod != NULL && lastmod_len > 0) {
+        (void) ngx_http_cache_turbo_warm_add_validator(sr,
+                   "If-Modified-Since", sizeof("If-Modified-Since") - 1,
+                   lastmod, lastmod_len);
+    }
+}
+
 /* Non-static: called from admin.c's warm dispatch too. */
 ngx_int_t
 ngx_http_cache_turbo_warm_one(ngx_http_request_t *r, ngx_str_t *uri,
-    ngx_str_t *args)
+    ngx_str_t *args, u_char *snap, size_t snap_len)
 {
     ngx_http_request_t                     *sr;
     ngx_http_cache_turbo_ctx_t             *wctx;
@@ -3887,6 +3990,13 @@ ngx_http_cache_turbo_warm_one(ngx_http_request_t *r, ngx_str_t *uri,
     {
         return NGX_ERROR;
     }
+
+    /* P1-4: inject a conditional validator from the currently stored blob (if
+     * any) AFTER anonymize has rebuilt the private headers list -- anonymize
+     * allocates that list, so an injection before it would land in the OLD
+     * (still shared-with-parent) list and be discarded when anonymize swaps
+     * it out from under us. */
+    ngx_http_cache_turbo_warm_inject_validators(sr, snap, snap_len);
 
     /* Force a clean GET to the origin regardless of the admin request's method
      * (the admin POST is what triggered the warm). header_only stays 0: unlike

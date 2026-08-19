@@ -893,7 +893,8 @@ ngx_http_cache_turbo_access_l1_serve_stale(ngx_http_request_t *r,
             snap = ctn->data;
             snap_len = ctn->len;
             ngx_shmtx_unlock(&z->shpool->mutex);
-            (void) ngx_http_cache_turbo_warm_one(r, &r->uri, &r->args);
+            (void) ngx_http_cache_turbo_warm_one(r, &r->uri, &r->args,
+                                                 snap, snap_len);
             (void) ngx_atomic_fetch_add(&z->sh->stale_serves, 1);
             ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                            "cache_turbo: cross-node WON bg-refresh + STALE "
@@ -1050,7 +1051,8 @@ ngx_http_cache_turbo_access_l1_serve_stale(ngx_http_request_t *r,
         /* single-box winner (no L2 lock, or it could not start). */
         if (clcf->background_update) {
             /* v8: fire a background refresh of this URI, serve stale. */
-            (void) ngx_http_cache_turbo_warm_one(r, &r->uri, &r->args);
+            (void) ngx_http_cache_turbo_warm_one(r, &r->uri, &r->args,
+                                                 snap, snap_len);
             (void) ngx_atomic_fetch_add(&z->sh->stale_serves, 1);
             ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                            "cache_turbo: bg-refresh + STALE serve \"%V\" "
