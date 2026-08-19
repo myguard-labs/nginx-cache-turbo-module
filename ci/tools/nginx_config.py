@@ -2735,6 +2735,18 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # P1-4 safety probe: same shape as /swrval/, but the origin ANSWERS
+        # 304 to the injected If-None-Match (the "vld304" marker). Proves the
+        # stored entry survives a 304-answered background refresh intact --
+        # the case that decides whether injection alone is safe.
+        location /swr304/ {{
+            cache_turbo                   main;
+            cache_turbo_key               $uri;
+            cache_turbo_valid             1s;
+            cache_turbo_beta              5000;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # P1-4 negative control: same shape as /swrval/ but the origin path
         # never carries "vldecho"/"cond" so the stored entry has NEITHER
         # validator -- the background refresh must stay an unconditional GET,

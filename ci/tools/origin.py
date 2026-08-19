@@ -529,6 +529,32 @@ class Origin:
                     except BrokenPipeError:
                         pass
                     return True, None
+                if "vld304" in self.path:
+                    # P1-4 safety probe: behave like a REAL conditional origin
+                    # -- answer 304 (no body) whenever the request carries the
+                    # matching If-None-Match, else 200 with the validator. This
+                    # is what a background refresh actually meets in production
+                    # once P1-4 injects validators, and it is the case that
+                    # decides whether injection ALONE is safe: the stored entry
+                    # must survive a 304 refresh unchanged, still be served, and
+                    # still be correct. (Reusing the stored body ON the 304 --
+                    # freshening -- is the separate row P5-4.)
+                    if self.headers.get("If-None-Match") == '"vld304etag"':
+                        self.send_response(304)
+                        self.send_header("ETag", '"vld304etag"')
+                        self.end_headers()
+                        return True, None
+                    body = f"gen-{n} vld304\n".encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header("ETag", '"vld304etag"')
+                    self.end_headers()
+                    try:
+                        self.wfile.write(body)
+                    except BrokenPipeError:
+                        pass
+                    return True, None
                 if "vldecho" in self.path:
                     # P1-4: echo the received If-None-Match / If-Modified-Since
                     # so a test can prove a background-refresh subrequest

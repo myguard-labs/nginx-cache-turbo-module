@@ -1689,6 +1689,73 @@ def test_swr_refresh_injects_stored_validators(ng: Nginx,
     )
 
 
+def test_swr_refresh_304_keeps_entry_and_serves_it(ng: Nginx,
+                                                   origin: Origin) -> None:
+    """P1-4 BLOCKER PROBE -- currently EXPECTED TO FAIL. Do not "fix" this by
+    weakening it; it is the gate that keeps P1-4 from shipping ahead of P5-4.
+
+    /swr304/'s origin behaves like a real conditional origin: it answers 304
+    to the If-None-Match this change injects, and 200 otherwise. That is what
+    a background refresh meets in production once P1-4 injects validators.
+
+    A 304 stores nothing, and `refreshing` / `refresh_lock_until` are cleared
+    on STORE (shm.c) -- so a 304-answered refresh never extends the entry's
+    freshness. The stale-while-revalidate loop therefore stops revalidating:
+    the entry decays until it is dropped and a client eats a full BLOCKING
+    inline regeneration.
+
+    Measured on these fixtures (nginx 1.31.3, debug build, 25 reads at 200ms):
+      * /swrval/  (origin answers 200): 0 client-blocking regenerations, the
+        entry cycles HIT -> STALE -> HIT and every refresh carries the stored
+        ETag.
+      * /swr304/  (origin answers 304): the entry never returns to HIT after
+        the first refresh, then the client sees x-cache absent and a ~3s stall.
+
+    So injecting validators without 304-freshening INVERTS the lever it was
+    meant to pull: it trades a background body for a foreground full fetch.
+    P1-4 (injection) cannot ship without P5-4 (reuse the stored body on a 304
+    to extend the TTL).
+
+    The assertion below is the liveness property: once the entry is primed and
+    its refresh has been answered 304, the client must still be served from
+    cache and must never pay a synchronous regeneration -- exactly as it does
+    against a 200-answering origin."""
+    uri = "/swr304/vld304-a"
+    s0, b0, _ = fetch(ng.port, uri)                  # prime: 200 + ETag
+    assert s0 == 200 and b0, f"prime failed: {s0} {b0!r}"
+
+    time.sleep(1.3)                                   # past the 1s valid window
+
+    s1, b1, h1 = fetch(ng.port, uri)                  # wins the dice, serves stale
+    assert s1 == 200 and h1.get("x-cache") == "STALE", \
+        f"expected STALE serve, got {s1} x-cache={h1.get('x-cache')}: {b1!r}"
+    assert b1 == b0, f"stale serve must be the ORIGINAL body: {b1!r}"
+
+    # Watch a full multi-cycle window. Against a 200-answering origin this
+    # window contains repeated fresh HITs and ZERO client-blocking
+    # regenerations (measured on /swrval/); against the 304-answering origin
+    # the refresh never re-freshens the entry.
+    saw_fresh_hit = False
+    blocking = 0
+    deadline = time.monotonic() + 8.0
+    while time.monotonic() < deadline:
+        _s, _b, h = fetch(ng.port, uri)
+        xc = h.get("x-cache")
+        if xc == "HIT":
+            saw_fresh_hit = True
+        elif xc is None:
+            blocking += 1
+        time.sleep(0.2)
+
+    assert blocking == 0 and saw_fresh_hit, (
+        "P1-4 BLOCKER: a 304-answered background refresh does not extend the "
+        "entry's TTL, so stale-while-revalidate stops revalidating -- "
+        f"saw_fresh_hit={saw_fresh_hit} client-blocking regenerations="
+        f"{blocking} (expected True and 0, as on the 200-answering /swrval/ "
+        "fixture). Injection (P1-4) requires 304-freshening (P5-4) to ship."
+    )
+
+
 def test_swr_refresh_no_validator_stays_unconditional(ng: Nginx,
                                                        origin: Origin) -> None:
     """P1-4 negative control: an entry stored WITHOUT an ETag and WITHOUT a

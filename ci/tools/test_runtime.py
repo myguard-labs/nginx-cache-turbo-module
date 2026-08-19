@@ -305,6 +305,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_background_update_off_regenerates_inline(ng, origin)
     test_swr_refresh_injects_stored_validators(ng, origin)  # P1-4
     test_swr_refresh_no_validator_stays_unconditional(ng, origin)  # P1-4
+    test_swr_refresh_304_keeps_entry_and_serves_it(ng, origin)  # P1-4 safety
     test_normalize_arg_order(ng, origin)
     test_normalize_strips_tracking(ng, origin)
     test_normalize_strip_custom(ng, origin)
