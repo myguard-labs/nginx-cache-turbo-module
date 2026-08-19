@@ -1453,6 +1453,32 @@ ngx_http_cache_turbo_access_l2_marker_consume(ngx_http_request_t *r,
 
     ctx->vary_marker_l2_tried = 0;
 
+    /* S231-L2-BACKOFF (P3-5 CI regression): the marker GET is a SECOND,
+     * sequential L2 round trip ahead of the object GET on the marker-cold
+     * path. Against a healthy backend this costs one extra GET only when
+     * genuinely needed; against a DOWN backend it means this request's own
+     * marker GET is what discovers the outage and arms connect_backoff --
+     * and the object GET that follows a few lines below in this SAME
+     * request then finds backoff already active and gets counted as a
+     * fail-fast SKIP, even though this is still the very first request to
+     * notice the outage, not a later one riding an already-armed window.
+     * (Confirmed by log: two connects launched sequentially inside one
+     * request against a dead peer, request 1's own skip counter moving
+     * 0->1 -- ci/tools/areas/breaker.py's test_redis_connect_backoff_
+     * fails_fast pins "the arming request must not count itself".)
+     * NGX_ERROR here is the marker GET's transport-failure outcome
+     * (connect refused/timeout/malformed reply -- the same class that arms
+     * backoff, per redis.c's op_fail/get_finish "unconnected" classifi-
+     * cation): this request has ALREADY paid for and learned that L2 is
+     * unreachable, so let the object-GET phase skip its own connect
+     * attempt entirely instead of paying (and miscounting) a second one
+     * for information this request already has. NGX_OK (a real, if
+     * marker-shaped-invalid, reply) and NGX_DECLINED (definitive miss) are
+     * untouched -- only a transport failure short-circuits the next phase. */
+    if (ctx->l2_result == NGX_ERROR) {
+        ctx->vary_marker_l2_down = 1;
+    }
+
     /* codex-review P3-5: an L1 marker can appear WHILE this request's own
      * marker GET (launched on an earlier pass) is still in flight -- a
      * concurrent request on this node classifying + storing the same base
@@ -1619,6 +1645,26 @@ ngx_http_cache_turbo_access_l2_get(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx,
     uint32_t hash, ngx_int_t *out_rc)
 {
+    /* S231-L2-BACKOFF: this request's own marker GET already proved L2
+     * unreachable (transport failure -- see access_l2_marker_consume()).
+     * Skip paying (and miscounting against connect_backoff's fail-fast
+     * window) a second, redundant connect attempt for information already
+     * known; report the SAME "unknown" outcome an ordinary failed GET
+     * would (NGX_ERROR, never NGX_DECLINED -- this is not a definitive
+     * miss and must not arm the L13 negative memo). l2_done=1 so every
+     * downstream reader (miss accounting, the negative-memo phase) treats
+     * this exactly like a completed-but-inconclusive GET, not a GET that
+     * never ran. */
+    if (ctx->vary_marker_l2_down) {
+        ctx->l2_done = 1;
+        ctx->l2_result = NGX_ERROR;
+        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "cache_turbo: L2 GET skipped -- this request's own "
+                       "marker GET already proved L2 down \"%V\" key=%ui",
+                       &r->uri, (ngx_uint_t) hash);
+        return NGX_DECLINED;
+    }
+
     if (clcf->backend && !ctx->l2_done) {
         ngx_int_t  rc = clcf->backend->get(r, clcf, ctx);
         if (rc == NGX_AGAIN) {

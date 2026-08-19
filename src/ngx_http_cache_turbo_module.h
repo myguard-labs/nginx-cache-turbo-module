@@ -1727,6 +1727,15 @@ typedef struct {
      * re-asserts vary_marker_l1_miss. */
     unsigned                 vary_marker_l2_tried:1;
     unsigned                 vary_marker_l2_done:1;
+    /* S231-L2-BACKOFF: set when the marker GET's OWN result was a transport
+     * failure (NGX_ERROR -- connect refused/timeout/malformed reply), i.e.
+     * this request already paid for and proved L2 is unreachable. Read by
+     * access_l2_get() to skip its own connect attempt for the object GET
+     * rather than paying (and, worse, miscounting against connect_backoff's
+     * fail-fast window) a second, redundant discovery of the SAME outage
+     * within one request. See access_l2_marker_consume()'s field comment
+     * for the concrete failure this closes. */
+    unsigned                 vary_marker_l2_down:1;
     /* P3-5: the variant this request resolved to via the L2-backed marker
      * consult, persisted so it survives a park/resume boundary. A plain
      * rewrite of ctx->key_hash does NOT survive: ngx_http_cache_turbo_
