@@ -1490,6 +1490,23 @@ typedef struct {
      * Authorization make the response uncacheable. Off by default. */
     ngx_flag_t               auto_vary;
 
+    /* cache_turbo_key_encoded_origin (P3-2). An origin that always sends a
+     * non-identity Content-Encoding (most Node/Python stacks with
+     * compression middleware on) is otherwise 100% uncacheable, silently --
+     * response_encoded() vetoes capture unconditionally. When ON, the
+     * capture gate instead stores the origin's own pre-compressed bytes,
+     * FORCES the VARY_ENCODING bit so the object is keyed by ae-class (the
+     * same variant_hash/marker machinery auto_vary already uses), and stamps
+     * BLOBF_ORIGIN_ENCODED + the packed ae-class on the blob so the serve
+     * chokepoint (ngx_http_cache_turbo_serve() / _sie_rewrite()) refuses to
+     * serve it to a client whose Accept-Encoding does not actually accept
+     * that class. Requires auto_vary (the variant-keying machinery this
+     * relies on) -- checked at merge time. Off by default: this only helps
+     * an always-encoded origin, and does nothing for one that already
+     * negotiates via Vary: Accept-Encoding (classify_vary() already handles
+     * that case). */
+    ngx_flag_t               key_encoded_origin;
+
     /* cache_turbo_vary_ignore <header>... (P3-3). Header names (case-
      * insensitive match against tokens in a response Vary header) to drop
      * BEFORE classify_vary()'s whitelist/unsafe-axis check, i.e. treated as
@@ -1580,6 +1597,18 @@ typedef struct {
      * request) but deliberately does NOT veto capture, so a breaker-only
      * fallback body exists. Sets BLOBF_BREAKER_ONLY on the stored blob. */
     unsigned                 brk_only:1;
+    /* P3-2: this response is being captured as origin-pre-compressed under
+     * cache_turbo_key_encoded_origin -- the body filter must stamp
+     * BLOBF_ORIGIN_ENCODED + the packed ae-class on the stored blob. Set by
+     * the capture gate, which also force-sets VARY_ENCODING into vary_bits
+     * so the object stores under an ae-class variant key even though the
+     * origin never sent a Vary: Accept-Encoding header for classify_vary()
+     * to pick up. */
+    unsigned                 origin_encoded_capture:1;
+    /* P3-2: the packed NGX_HTTP_CACHE_TURBO_AE_CLASS_* value to stamp on the
+     * blob when origin_encoded_capture is set -- only meaningful then. 2
+     * bits is enough (0..3), matching BLOBF_AE_CLASS_MASK's width. */
+    unsigned                 origin_encoded_class:2;
     unsigned                 captured:1;  /* response captured for store    */
     unsigned                 served:1;    /* we served from cache           */
     unsigned                 warm:1;      /* warm subrequest: force a miss,  */

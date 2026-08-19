@@ -614,6 +614,38 @@ typedef struct {
 #define NGX_HTTP_CACHE_TURBO_BLOBF_BREAKER_ONLY  0x0001
 
 /*
+ * P3-2: this blob's body is the ORIGIN's own pre-compressed bytes (the origin
+ * sent a non-identity Content-Encoding and cache_turbo_key_encoded_origin let
+ * us capture it instead of refusing, forcing VARY_ENCODING so the object is
+ * stored under an ae-class variant key). The coding itself is packed into the
+ * 2-bit NGX_HTTP_CACHE_TURBO_BLOBF_AE_CLASS_MASK field alongside this bit.
+ *
+ * ⚠ Like BLOBF_BREAKER_ONLY, this bit is the ENTIRE safety argument for
+ * cache_turbo_key_encoded_origin: vary.c:196-201 records a REAL prior bug
+ * where a zstd-only client read an identity entry because the variant hash
+ * alone did not keep classes apart. This bit is belt-and-braces on top of the
+ * variant key, not instead of it -- the one chokepoint every serve path goes
+ * through (ngx_http_cache_turbo_serve() and ngx_http_cache_turbo_sie_rewrite(),
+ * both read the flags straight off the wire header before any header replay)
+ * MUST refuse to serve a stamped blob unless the requesting client's
+ * Accept-Encoding actually accepts the packed class. Grep for
+ * BLOBF_ORIGIN_ENCODED before adding a new serve site.
+ */
+#define NGX_HTTP_CACHE_TURBO_BLOBF_ORIGIN_ENCODED  0x0002
+
+/* 2-bit ae-class enum packed into the blob flags u16, valid only when
+ * BLOBF_ORIGIN_ENCODED is set. Bits 2-3 of the u16 (mask 0x000C, shift 2).
+ * Mirrors the same zstd > br > gzip priority ngx_http_cache_turbo_ae_class()
+ * uses for the request-side variant key, so the class the object was stored
+ * under and the class checked on serve are the same enum. */
+#define NGX_HTTP_CACHE_TURBO_AE_CLASS_IDENTITY  0
+#define NGX_HTTP_CACHE_TURBO_AE_CLASS_GZIP      1
+#define NGX_HTTP_CACHE_TURBO_AE_CLASS_BR        2
+#define NGX_HTTP_CACHE_TURBO_AE_CLASS_ZSTD      3
+#define NGX_HTTP_CACHE_TURBO_BLOBF_AE_CLASS_SHIFT  2
+#define NGX_HTTP_CACHE_TURBO_BLOBF_AE_CLASS_MASK   0x000C
+
+/*
  * S231-PERF-HDRWALK: one parsed TLV header entry, as produced by the single
  * walk inside ngx_http_cache_turbo_blob_validate() and consumed directly by
  * ngx_http_cache_turbo_restore_response() -- no second bounds-checking pass
@@ -739,6 +771,9 @@ void ngx_http_cache_turbo_classify_vary(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, ngx_int_t *bits_out,
     ngx_uint_t *nocache_out, ngx_uint_t *unsafe_axis_out);
 ngx_uint_t ngx_http_cache_turbo_response_encoded(ngx_http_request_t *r);
+ngx_uint_t ngx_http_cache_turbo_response_ae_class(ngx_http_request_t *r);
+ngx_uint_t ngx_http_cache_turbo_ae_class_accepted(ngx_http_request_t *r,
+    ngx_uint_t class);
 
 /* Called from ngx_http_cache_turbo_normalized_args_variable() in module.c. */
 size_t ngx_http_cache_turbo_vary_suffix(ngx_http_request_t *r,

@@ -29,6 +29,8 @@ ci/tests/unit/test_digest_fail
 ci/tests/unit/test_key_fold
 ci/tests/unit/generated_key_fold.inc
 ci/tests/unit/test_vary_marker_fastpath
+ci/tests/unit/test_ae_class_guard
+ci/tests/unit/test_ae_class_guard.san
 
 # Fuzzing build artifacts (seed corpus IS tracked; everything else is not)
 ci/fuzz/fuzz_resp_parser

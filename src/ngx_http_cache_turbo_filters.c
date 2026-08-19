@@ -329,11 +329,51 @@ ngx_http_cache_turbo_capture_count_refusal(ngx_http_request_t *r,
 }
 
 
+/* P3-2: may an ENCODED response (response_encoded() == 1) still be captured?
+ * Off by default (cache_turbo_key_encoded_origin unset) this is always 0,
+ * unchanged from the original all-or-nothing refusal.
+ *
+ * When the directive is on, only the three classes the variant-key/serve-
+ * guard machinery actually understands (gzip/br/zstd, via
+ * response_ae_class()) are captured -- `compress`, `deflate` or any other
+ * Content-Encoding this module has no ae-class bucket for is still refused,
+ * because there would be nothing for the serve-side guard to check the
+ * request's Accept-Encoding against (see response_ae_class()'s own
+ * docstring: it folds an unrecognised coding to IDENTITY, which would
+ * wrongly mark the object as always-acceptable). On a match, force
+ * VARY_ENCODING into *vary_bits (the origin never sent a Vary:
+ * Accept-Encoding header for classify_vary() to have picked this up from --
+ * that IS the all-or-nothing case this item targets) and report the class
+ * via *class_out so the caller can stamp ctx->origin_encoded_capture. */
+static ngx_uint_t
+ngx_http_cache_turbo_capture_encoded_ok(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_int_t *vary_bits,
+    ngx_uint_t *class_out)
+{
+    ngx_uint_t  class;
+
+    if (!clcf->key_encoded_origin) {
+        return 0;
+    }
+
+    class = ngx_http_cache_turbo_response_ae_class(r);
+    if (class == NGX_HTTP_CACHE_TURBO_AE_CLASS_IDENTITY) {
+        return 0;                              /* unrecognised coding */
+    }
+
+    *vary_bits |= NGX_HTTP_CACHE_TURBO_VARY_ENCODING;
+    *class_out = class;
+    return 1;
+}
+
+
 static void
 ngx_http_cache_turbo_header_filter_capture(ngx_http_request_t *r,
     ngx_http_cache_turbo_ctx_t *ctx, ngx_http_cache_turbo_loc_conf_t *clcf)
 {
     ngx_uint_t  cacheable_reason = NGX_HTTP_CACHE_TURBO_REFUSE_NONE;
+    ngx_uint_t  encoded_ok = 0;
+    ngx_uint_t  encoded_class = NGX_HTTP_CACHE_TURBO_AE_CLASS_IDENTITY;
 
     /* auto-Vary (v11 other half): classify the response Vary header once. bits =
      * the safe-axis bitmask the body filter folds into the variant key + marker;
@@ -366,6 +406,20 @@ ngx_http_cache_turbo_header_filter_capture(ngx_http_request_t *r,
 
     ngx_http_cache_turbo_capture_count_head_partial(r, clcf);
 
+    /* P3-2: decide, BEFORE the capture gate below, whether an encoded
+     * response gets a pass. Deliberately computed unconditionally (not only
+     * when response_encoded() is already known true) so ctx->vary_bits picks
+     * up VARY_ENCODING in the same pass classify_vary() already ran in,
+     * exactly like every other axis bit -- doing this INSIDE the gate's
+     * boolean chain would make it conditional on evaluation order instead of
+     * a single well-defined point. capture_encoded_ok() itself re-derives
+     * the class from response_ae_class() (cheap: one typed-field read, same
+     * cost class as response_encoded()) rather than trusting a response that
+     * is not actually encoded, so it is always safe to call. */
+    encoded_ok = ngx_http_cache_turbo_capture_encoded_ok(r, clcf,
+                                                          &ctx->vary_bits,
+                                                          &encoded_class);
+
     /* Only capture cacheable responses. 200 always, plus any status named by a
      * cache_turbo_valid <code> rule (redirects / negative caching, v6). Never a
      * HEAD — its empty body must not overwrite the GET entry. Normally the main
@@ -374,7 +428,14 @@ ngx_http_cache_turbo_header_filter_capture(ngx_http_request_t *r,
      * P0-1: response_cacheable() reports its own refusal reason via an
      * out-param (no extra header-list walk; see its definition). The boolean
      * short-circuit chain and evaluation order below are otherwise
-     * byte-for-byte unchanged from before P0-1. */
+     * byte-for-byte unchanged from before P0-1.
+     *
+     * P3-2: an encoded response is no longer an unconditional refusal --
+     * !response_encoded(r) || encoded_ok. encoded_ok is 0 whenever
+     * cache_turbo_key_encoded_origin is off (the directive's default), so
+     * this collapses back to the original `!response_encoded(r)` test in
+     * every existing deployment; nothing changes unless an operator opts
+     * in. */
     if (clcf->enable && (r == r->main || ctx->warm)
         && !(r->method & NGX_HTTP_HEAD)
         && !ctx->vary_nocache
@@ -384,10 +445,15 @@ ngx_http_cache_turbo_header_filter_capture(ngx_http_request_t *r,
         && ngx_http_cache_turbo_status_ttl(clcf, r->headers_out.status) >= 0
         && ngx_http_cache_turbo_response_cacheable(r, &cacheable_reason)
         && ngx_http_cache_turbo_require_hdr_ok(r, clcf)
-        && !ngx_http_cache_turbo_response_encoded(r)
+        && (!ngx_http_cache_turbo_response_encoded(r) || encoded_ok)
         && (clcf->no_store == NULL
             || ngx_http_test_predicates(r, clcf->no_store) == NGX_OK))
     {
+        if (encoded_ok) {
+            ctx->origin_encoded_capture = 1;
+            ctx->origin_encoded_class = encoded_class;
+        }
+
         /* A warm subrequest is deliberately excluded from lookup, so its key
          * was never built. Build it here from the subrequest URI before flagging
          * capture, so the body filter stores under the same key a later real
@@ -1181,9 +1247,21 @@ ngx_http_cache_turbo_body_filter_blob_write(ngx_http_request_t *r,
      * populated field-by-field) -- an unset flags here would stamp
      * stack garbage, and a stray BLOBF_BREAKER_ONLY would make an
      * ordinary entry unserveable while a MISSING one would publish a
-     * breaker-only body to the normal hit path. */
+     * breaker-only body to the normal hit path.
+     *
+     * P3-2: same "assign unconditionally" reasoning applies to
+     * BLOBF_ORIGIN_ENCODED + the packed ae-class -- a missing bit on a body
+     * that IS origin-pre-compressed would let the serve chokepoint hand it
+     * to a client whose Accept-Encoding cannot decode it (the exact failure
+     * mode the class exists to prevent, vary.c:196-201). */
     bhw.flags = ctx->brk_only
                 ? NGX_HTTP_CACHE_TURBO_BLOBF_BREAKER_ONLY : 0;
+    if (ctx->origin_encoded_capture) {
+        bhw.flags |= NGX_HTTP_CACHE_TURBO_BLOBF_ORIGIN_ENCODED;
+        bhw.flags |= ((uint32_t) ctx->origin_encoded_class
+                          << NGX_HTTP_CACHE_TURBO_BLOBF_AE_CLASS_SHIFT)
+                      & NGX_HTTP_CACHE_TURBO_BLOBF_AE_CLASS_MASK;
+    }
     ngx_http_cache_turbo_blob_hdr_write(blob, &bhw);
 
     w = blob + NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE;

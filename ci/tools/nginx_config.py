@@ -3675,6 +3675,23 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # cache_turbo_key_encoded_origin (P3-2): an origin that ALWAYS sends a
+        # non-identity Content-Encoding (no Vary: Accept-Encoding at all --
+        # the /precompressed marker) is otherwise 100% uncacheable, silently
+        # (see /av/'s test_auto_vary_encoding_precompressed_still_never_cached,
+        # which pins that OLD default-off behaviour and must stay green). ON
+        # here, so this location stores the origin's own pre-compressed bytes
+        # keyed by ae-class instead of refusing outright.
+        location /avenc/ {{
+            cache_turbo          main;
+            cache_turbo_key      $request_uri;
+            cache_turbo_valid    30s;
+            cache_turbo_auto_vary on;
+            cache_turbo_key_encoded_origin on;
+            add_header            X-CT-Status $cache_turbo_status always;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # cache_turbo_vary_ignore (P3-3): Accept is dropped from the response
         # Vary header BEFORE the whitelist/unknown-axis check, so a response
         # varying only on Accept (a very common API/image-CDN axis the

@@ -319,6 +319,129 @@ def test_auto_vary_encoding_precompressed_still_never_cached(
         origin.hits - base)
 
 
+def test_key_encoded_origin_caches_and_keys_by_ae_class(ng: Nginx,
+                                                          origin: Origin) -> None:
+    """P3-2: cache_turbo_key_encoded_origin on (/avenc/) flips the all-or-
+    nothing refusal test_auto_vary_encoding_precompressed_still_never_cached
+    pins for the DEFAULT-OFF case -- an origin that always sends
+    Content-Encoding: gzip with NO Vary header at all (the `/precompressed`
+    marker: gzip magic bytes, no Vary: Accept-Encoding) is captured instead
+    of refused, and the object is reachable as a HIT to a gzip-accepting
+    client on the SAME ae-class.
+
+    Two requests, same Accept-Encoding (gzip): first MISSes (nothing cached
+    yet), second HITs the now-stored slot with the identical body -- proving
+    this is a real HIT (the same origin body would never repeat verbatim
+    across two independent /precompressed MISSes, since the origin marker
+    embeds its own monotonic counter into the body on every real contact,
+    exactly like test_auto_vary_encoding_precompressed_still_never_cached's
+    `b1 != b2` proves for the refused case)."""
+    base = origin.hits_for("/precompressed")
+    p = "/avenc/precompressed?t=basic"
+    _, b1, h1 = fetch(ng.port, p, {"Accept-Encoding": "gzip"})
+    assert h1.get("x-ct-status") == "MISS", \
+        f"first request should MISS, got {h1.get('x-ct-status')}"
+    _, b2, h2 = fetch(ng.port, p, {"Accept-Encoding": "gzip"})
+    assert h2.get("x-ct-status") == "HIT", (
+        "cache_turbo_key_encoded_origin on must capture and re-serve an "
+        f"always-gzip origin, got X-CT-Status={h2.get('x-ct-status')}")
+    assert b1 == b2, ("HIT served a different body than the captured MISS",
+                       b1, b2)
+    assert origin.hits_for("/precompressed") - base == 1, (
+        "origin should be hit exactly once (second request served from cache)",
+        origin.hits_for("/precompressed") - base)
+
+
+def test_key_encoded_origin_serve_guard_refuses_wrong_ae_class(
+        ng: Nginx, origin: Origin) -> None:
+    """P3-2 MANDATORY SAFETY REQUIREMENT: the strict serve-side guard must
+    refuse to serve a stamped origin-encoded blob to a client whose
+    Accept-Encoding does not accept the stored coding -- belt-and-braces on
+    top of the ae-class variant key, because vary.c:196-201 already
+    documents ONE real bug where the variant hash ALONE let a zstd-only
+    client read an identity entry.
+
+    First request (Accept-Encoding: gzip) captures + stores the gzip body
+    under the gzip variant slot. A second request from a client that sends
+    Accept-Encoding: br (does NOT include gzip) must NOT receive that stored
+    gzip body -- either it MISSes and gets its own fresh origin contact (the
+    variant key correctly routed it away from the gzip slot), or, if it
+    somehow reached the guard at the gzip slot, the guard's own refusal
+    forces a fresh origin contact instead of serving cross-coding bytes. Both
+    outcomes are observable the same way here: a SECOND origin contact and a
+    body that differs from the gzip response (the origin marker's per-request
+    counter proves it is not a replay of the same stored bytes)."""
+    base = origin.hits_for("/precompressed")
+    # A distinct query string from test_key_encoded_origin_caches_and_keys_by_
+    # ae_class's plain /avenc/precompressed URL -- cache_turbo_key is
+    # $request_uri on this location, so a shared path would let this test
+    # observe the OTHER test's already-stored gzip slot instead of its own
+    # cold state, order-coupling the two tests together.
+    p = "/avenc/precompressed?t=guard"
+    _, b_gzip, h_gzip = fetch(ng.port, p, {"Accept-Encoding": "gzip"})
+    assert h_gzip.get("x-ct-status") == "MISS", \
+        f"gzip cold fetch must MISS, got {h_gzip.get('x-ct-status')}"
+    assert origin.hits_for("/precompressed") - base == 1, \
+        origin.hits_for("/precompressed") - base
+
+    _, b_br, h_br = fetch(ng.port, p, {"Accept-Encoding": "br"})
+    assert h_br.get("x-ct-status") != "HIT", (
+        "a br-only client got X-CT-Status=HIT against a gzip-class stored "
+        "blob -- the serve-side ae-class guard did not refuse it",
+        h_br.get("x-ct-status"))
+    assert b_br != b_gzip, (
+        "a br-only client received the gzip-class stored body -- the "
+        "serve-side ae-class guard did not refuse a cross-coding serve",
+        b_gzip, b_br)
+    assert origin.hits_for("/precompressed") - base == 2, (
+        "a br-only client must cause a fresh origin contact, never be "
+        "served the gzip-class blob (guard failed open)",
+        origin.hits_for("/precompressed") - base)
+
+
+def test_key_encoded_origin_requires_auto_vary(ng: Nginx) -> None:
+    """P3-2: cache_turbo_key_encoded_origin depends entirely on the auto_vary
+    variant-keying machinery to separate ae-classes (the capture gate force-
+    sets VARY_ENCODING into ctx->vary_bits, but filters.c only stores/serves
+    a variant at all when clcf->auto_vary is ALSO on -- without it the object
+    would silently store under the BASE key regardless of the forced bit,
+    defeating the whole point of forcing it). Config must be REJECTED
+    (nginx -t fails) rather than silently no-op or rely on the serve-side
+    guard alone -- see the config-merge check's own comment in
+    ngx_http_cache_turbo_conf.c for why this is a hard error, not a warning
+    like the double-partition case."""
+    anchor = (
+        "            cache_turbo_auto_vary on;\n"
+        "            cache_turbo_key_encoded_origin on;\n"
+    )
+    assert anchor in nginx_config(
+        ng.root, ng.port, ng.module, ng.origin_port, 1, ng.redis_port,
+        ng.redis_auth_port, ng.redis_password, ng.redis_tls_port,
+        ng.redis_tls_ca, ng.memcached_port), \
+        f"test fixture missing anchor {anchor!r}"
+
+    r = _config_test_result(
+        ng, lambda c: c.replace(
+            anchor,
+            "            cache_turbo_auto_vary off;\n"
+            "            cache_turbo_key_encoded_origin on;\n",
+            1))
+    assert r.returncode != 0, (
+        "cache_turbo_key_encoded_origin on + cache_turbo_auto_vary off was "
+        f"accepted by nginx -t (must be rejected):\n{r.stdout}")
+    assert "requires cache_turbo_auto_vary" in r.stdout, \
+        f"missing/odd diagnostic for the auto_vary requirement:\n{r.stdout}"
+
+    # positive control: the pristine fixture (auto_vary on + key_encoded_origin
+    # on, unmodified) is accepted -- proves the rejection above is about the
+    # auto_vary/off combination specifically, not key_encoded_origin itself.
+    r = _config_test_result(
+        ng, lambda c: c, expect_unchanged=True)
+    assert r.returncode == 0, (
+        "the pristine fixture (auto_vary on + key_encoded_origin on) was "
+        f"rejected by nginx -t:\n{r.stdout}")
+
+
 def test_auto_vary_marker_probe_selects_correct_variant(ng: Nginx,
                                                           origin: Origin) -> None:
     """S231-PERF-VARYLOCK pin: the vary-marker probe now runs inside the SAME

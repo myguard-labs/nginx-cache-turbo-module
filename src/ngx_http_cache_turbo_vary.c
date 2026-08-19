@@ -827,6 +827,121 @@ ngx_http_cache_turbo_response_encoded(ngx_http_request_t *r)
 }
 
 
+/* P3-2: map a response's own Content-Encoding to the same 3-way enum
+ * ngx_http_cache_turbo_ae_class() collapses the REQUEST's Accept-Encoding
+ * into (zstd > br > gzip > identity, issues V6 priority). Used only when
+ * response_encoded() has already proven the coding is non-identity, so the
+ * IDENTITY return here means "some OTHER coding we don't special-case" (e.g.
+ * `compress`, `deflate`) rather than "not encoded" -- callers that stamp
+ * BLOBF_ORIGIN_ENCODED must treat that case as "cannot prove which class
+ * accepts it" and refuse to key/serve it via this path at all. */
+ngx_uint_t
+ngx_http_cache_turbo_response_ae_class(ngx_http_request_t *r)
+{
+    ngx_table_elt_t  *ce = r->headers_out.content_encoding;
+
+    if (ce == NULL || ce->hash == 0) {
+        return NGX_HTTP_CACHE_TURBO_AE_CLASS_IDENTITY;
+    }
+
+    if (ce->value.len == 4
+        && ngx_strncasecmp(ce->value.data, (u_char *) "zstd", 4) == 0)
+    {
+        return NGX_HTTP_CACHE_TURBO_AE_CLASS_ZSTD;
+    }
+    if (ce->value.len == 2
+        && ngx_strncasecmp(ce->value.data, (u_char *) "br", 2) == 0)
+    {
+        return NGX_HTTP_CACHE_TURBO_AE_CLASS_BR;
+    }
+    if (ce->value.len == 4
+        && ngx_strncasecmp(ce->value.data, (u_char *) "gzip", 4) == 0)
+    {
+        return NGX_HTTP_CACHE_TURBO_AE_CLASS_GZIP;
+    }
+
+    return NGX_HTTP_CACHE_TURBO_AE_CLASS_IDENTITY;
+}
+
+
+/* P3-2 SERVE-SIDE GUARD: does the REQUEST's Accept-Encoding actually accept
+ * `class` (one of the NGX_HTTP_CACHE_TURBO_AE_CLASS_* enum values packed
+ * into a BLOBF_ORIGIN_ENCODED blob's flags)? Reuses the same tokenised,
+ * q-value-aware scan ngx_http_cache_turbo_ae_class() uses for the request-
+ * side variant key, so "accepted" here means exactly what the variant key
+ * itself would have classed the request as -- belt-and-braces on top of the
+ * variant hash, not a second independent notion of acceptance (see
+ * vary.c:196-201: the variant hash alone has already failed once).
+ *
+ * IDENTITY is always "accepted" (every client accepts identity, RFC 9110
+ * 12.5.3) -- but a blob is only ever stamped ORIGIN_ENCODED for a NON-
+ * identity coding (response_ae_class() returning IDENTITY at capture time
+ * means "not one of zstd/br/gzip", which the capture gate below refuses to
+ * key at all), so this arm is defensive completeness, not a live path. */
+ngx_uint_t
+ngx_http_cache_turbo_ae_class_accepted(ngx_http_request_t *r,
+    ngx_uint_t class)
+{
+    ngx_table_elt_t  *ae = r->headers_in.accept_encoding;
+    u_char           *p, *last, *end, *tok, *semi, *ce;
+    size_t            clen;
+    const char       *name;
+    size_t            nlen;
+
+    if (class == NGX_HTTP_CACHE_TURBO_AE_CLASS_IDENTITY) {
+        return 1;
+    }
+    if (class == NGX_HTTP_CACHE_TURBO_AE_CLASS_ZSTD) {
+        name = "zstd"; nlen = 4;
+    } else if (class == NGX_HTTP_CACHE_TURBO_AE_CLASS_BR) {
+        name = "br"; nlen = 2;
+    } else if (class == NGX_HTTP_CACHE_TURBO_AE_CLASS_GZIP) {
+        name = "gzip"; nlen = 4;
+    } else {
+        return 0;                              /* unknown class -> refuse */
+    }
+
+    if (ae == NULL || ae->value.len == 0) {
+        return 0;                              /* absent AE accepts identity only */
+    }
+
+    p = ae->value.data;
+    last = p + ae->value.len;
+
+    while (p < last) {
+        end = p;
+        while (end < last && *end != ',') {
+            end++;
+        }
+
+        semi = p;
+        while (semi < end && *semi != ';') {
+            semi++;
+        }
+
+        tok = p;
+        while (tok < semi && (*tok == ' ' || *tok == '\t')) {
+            tok++;
+        }
+        ce = semi;
+        while (ce > tok && (ce[-1] == ' ' || ce[-1] == '\t')) {
+            ce--;
+        }
+        clen = (size_t) (ce - tok);
+
+        if (clen == nlen && ngx_strncasecmp(tok, (u_char *) name, nlen) == 0
+            && ngx_http_cache_turbo_ae_q_ok(semi, end))
+        {
+            return 1;
+        }
+
+        p = (end < last) ? end + 1 : end;
+    }
+
+    return 0;
+}
+
+
 /* Phase 1 of ngx_http_cache_turbo_classify_vary(): is this header instance a
  * Vary header at all. Pure predicate, no state — kept as its own phase
  * because the caller's list-walk loop needs to `continue` on a non-Vary
