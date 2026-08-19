@@ -1033,7 +1033,7 @@ ngx_http_cache_turbo_shm_stats(ngx_http_cache_turbo_zone_t *z,
  * definition further down the file. */
 static ngx_int_t
 ngx_http_cache_turbo_shm_count_miss_locked(ngx_http_cache_turbo_zone_t *z,
-    u_char *key_hash, uint32_t hash, ngx_int_t min_uses,
+    u_char *key_hash, uint32_t hash, ngx_int_t min_uses, time_t min_uses_window,
     ngx_http_cache_turbo_node_t *ctn, time_t now);
 
 
@@ -1268,8 +1268,8 @@ ngx_http_cache_turbo_shm_claim(ngx_http_cache_turbo_zone_t *z,
  * those two merge here. */
 ngx_int_t
 ngx_http_cache_turbo_shm_resolve_miss(ngx_http_cache_turbo_zone_t *z,
-    u_char *key_hash, uint32_t hash, ngx_int_t min_uses, time_t lock_ttl,
-    uint64_t *owner, ngx_int_t *count_miss_rc,
+    u_char *key_hash, uint32_t hash, ngx_int_t min_uses, time_t min_uses_window,
+    time_t lock_ttl, uint64_t *owner, ngx_int_t *count_miss_rc,
     u_char **fresh_data, size_t *fresh_len)
 {
     ngx_int_t                     rc;
@@ -1284,7 +1284,7 @@ ngx_http_cache_turbo_shm_resolve_miss(ngx_http_cache_turbo_zone_t *z,
     ctn = ngx_http_cache_turbo_shm_lookup(z, key_hash, hash);
 
     *count_miss_rc = ngx_http_cache_turbo_shm_count_miss_locked(z, key_hash,
-                          hash, min_uses, ctn, now);
+                          hash, min_uses, min_uses_window, ctn, now);
 
     if (*count_miss_rc == NGX_DECLINED) {
         /* Matches the standalone caller's own short-circuit: claim() never
@@ -1438,10 +1438,15 @@ ngx_http_cache_turbo_shm_unstub(ngx_http_cache_turbo_zone_t *z,
  * instead of each doing its own. `ctn` may be NULL (key absent); on a NULL
  * `ctn` this allocates the counter node exactly as the original single-call
  * version did. Every read/mutate/return here is byte-for-byte the original
- * count_miss body -- only the lock and the lookup moved to the caller. */
+ * count_miss body -- only the lock and the lookup moved to the caller.
+ *
+ * P3-6: min_uses_window enables windowed miss_count resets. When a counter node
+ * is accessed for a miss, if now - last_access > window, reset miss_count to 0
+ * before incrementing (treating this as a fresh miscount cycle). 0 = OFF
+ * (lifetime counter, v15 behavior). */
 static ngx_int_t
 ngx_http_cache_turbo_shm_count_miss_locked(ngx_http_cache_turbo_zone_t *z,
-    u_char *key_hash, uint32_t hash, ngx_int_t min_uses,
+    u_char *key_hash, uint32_t hash, ngx_int_t min_uses, time_t min_uses_window,
     ngx_http_cache_turbo_node_t *ctn, time_t now)
 {
     if (ctn != NULL) {
@@ -1459,7 +1464,16 @@ ngx_http_cache_turbo_shm_count_miss_locked(ngx_http_cache_turbo_zone_t *z,
         }
 
         /* A counter node (or a dead stub): this is a genuine cold miss for a key
-         * not yet cached. Count it; cross the threshold => store-eligible. */
+         * not yet cached. Count it; cross the threshold => store-eligible.
+         *
+         * P3-6: apply windowing reset BEFORE incrementing. If min_uses_window > 0
+         * and now - last_access > window, reset the counter as if it were a fresh
+         * node. This uses last_access BEFORE updating it (which happens later
+         * when the node is touched after claim()). */
+        if (min_uses_window > 0 && (now - ctn->last_access) > min_uses_window) {
+            ctn->miss_count = 0;
+        }
+
         ctn->miss_count++;
         if ((ngx_int_t) ctn->miss_count >= min_uses) {
             return NGX_OK;
@@ -1508,10 +1522,12 @@ ngx_http_cache_turbo_shm_count_miss_locked(ngx_http_cache_turbo_zone_t *z,
  * `count_miss` comment in the header. Only called when min_uses > 1. Thin
  * lock+lookup wrapper around the _locked core above -- unchanged behaviour,
  * still one lock/one lookup per call when used standalone (the min_uses>1 &&
- * cache_turbo_lock-off case, where there is no claim() to merge with). */
+ * cache_turbo_lock-off case, where there is no claim() to merge with).
+ *
+ * P3-6: min_uses_window enables windowed resets (see count_miss_locked). */
 ngx_int_t
 ngx_http_cache_turbo_shm_count_miss(ngx_http_cache_turbo_zone_t *z,
-    u_char *key_hash, uint32_t hash, ngx_int_t min_uses)
+    u_char *key_hash, uint32_t hash, ngx_int_t min_uses, time_t min_uses_window)
 {
     ngx_int_t                     rc;
     time_t                        now;
@@ -1522,7 +1538,7 @@ ngx_http_cache_turbo_shm_count_miss(ngx_http_cache_turbo_zone_t *z,
     ngx_shmtx_lock(&z->shpool->mutex);
     ctn = ngx_http_cache_turbo_shm_lookup(z, key_hash, hash);
     rc = ngx_http_cache_turbo_shm_count_miss_locked(z, key_hash, hash,
-             min_uses, ctn, now);
+             min_uses, min_uses_window, ctn, now);
     ngx_shmtx_unlock(&z->shpool->mutex);
 
     return rc;

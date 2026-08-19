@@ -2049,8 +2049,8 @@ ngx_http_cache_turbo_access_min_uses(ngx_http_request_t *r,
     if (clcf->min_uses > 1 && !ctx->min_uses_passed && !ctx->lock_done
         && !clcf->lock)
     {
-        if (clcf->l1->count_miss(z, ctx->key_hash, hash, clcf->min_uses)
-            == NGX_DECLINED)
+        if (clcf->l1->count_miss(z, ctx->key_hash, hash, clcf->min_uses,
+                clcf->min_uses_window) == NGX_DECLINED)
         {
             /* Still below the threshold: run to the origin but do NOT store (the
              * header filter checks min_uses_skip before capturing). */
@@ -2193,7 +2193,7 @@ ngx_http_cache_turbo_access_cold(ngx_http_request_t *r,
             size_t     fresh_len_out = 0;
 
             cl = clcf->l1->resolve_miss(z, ctx->key_hash, hash, clcf->min_uses,
-                     lock_ttl, &claim_owner, &count_miss_rc,
+                     clcf->min_uses_window, lock_ttl, &claim_owner, &count_miss_rc,
                      &fresh_data, &fresh_len_out);
 
             if (count_miss_rc == NGX_DECLINED) {

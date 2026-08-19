@@ -1,3 +1,17 @@
+Changes with the nginx-cache-turbo-module (unreleased)
+
+    *) Feature: cache_turbo_min_uses_window adds time-windowed reset to the
+       min_uses miss counter. Without a window, miss_count persists for the
+       node's lifetime (reset only on LRU eviction). With a window, the counter
+       resets when accessed and `now - last_access > window`, forcing recent
+       misses to drive the admission gate instead of counting arbitrary-aged
+       accesses. One-hit-wonders that recur in distinct time windows now
+       correctly do not satisfy min_uses 2 and bypass the cache unless they
+       establish a pattern within the window. Directive accepts 0..86400
+       seconds; default 0 (off, preserving v15 lifetime-counter behavior).
+       Only affects cache_turbo_min_uses > 1 AND min_uses_window > 0.
+
+
 Changes with the nginx-cache-turbo-module 1.1.0                 17 Aug 2026
 
     *) Behaviour change: cache_turbo_scan_resistant is now ON by default

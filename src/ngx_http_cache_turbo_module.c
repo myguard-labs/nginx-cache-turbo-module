@@ -269,6 +269,13 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       0,
       NULL },
 
+    { ngx_string("cache_turbo_min_uses_window"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_sec_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_turbo_loc_conf_t, min_uses_window),
+      NULL },
+
     { ngx_string("cache_turbo_scan_resistant"),
       NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE12,
       ngx_http_cache_turbo_scan_resistant,
@@ -3941,6 +3948,7 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->surrogate_key = NGX_CONF_UNSET;
     conf->lock = NGX_CONF_UNSET;
     conf->lock_timeout = NGX_CONF_UNSET_MSEC;
+    conf->min_uses_window = NGX_CONF_UNSET;  /* P3-6; merges to 0 = off */
     conf->min_uses_raw = NGX_CONF_UNSET;
     /* S8: NGX_CONF_UNSET (not 0) so merge can tell "never set here" from an
      * explicit `off`, and an explicit off in a location still beats an

@@ -921,6 +921,11 @@ ngx_http_cache_turbo_merge_zone_and_lock(
     ngx_conf_merge_value(conf->lock, prev->lock, 1);
     ngx_conf_merge_msec_value(conf->lock_timeout, prev->lock_timeout, 5000);
 
+    /* P3-6: miss_count window resets (seconds). 0 = OFF (default, v15
+     * behavior: counter persists until LRU eviction). 1..86400 = enabled,
+     * reset miss_count when now - last_access > window. */
+    ngx_conf_merge_sec_value(conf->min_uses_window, prev->min_uses_window, 0);
+
     /* min_uses (v15) is resolved in the preset block above (H3c): it inherits as
      * min_uses_raw with an UNSET fallback and resolves against the band, exactly
      * like valid/beta/lock_ttl/stale_mult. Do NOT merge it to a literal here —
