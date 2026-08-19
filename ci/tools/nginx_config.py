@@ -3692,6 +3692,27 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # cache_turbo_serve_authorized (P3-4): the LOOKUP-side Authorization
+        # refusal is lifted here, so a credentialed request may READ an
+        # anonymously-stored entry. The STORE floor is untouched and ungated,
+        # so nothing stored here was ever written by a credentialed request.
+        # Serving is additionally gated on the stored response carrying an
+        # RFC 9111 SS3.5 reuse authorisation (public / s-maxage /
+        # must-revalidate), enforced at the serve chokepoint via
+        # BLOBF_AUTH_SHAREABLE.
+        #
+        # /c/ and /cc/ deliberately do NOT set this -- test_no_cache_
+        # authorization and test_refuse_authorization_counter pin the
+        # DEFAULT-OFF behaviour there and must stay meaningful.
+        location /sauth/ {{
+            cache_turbo          main;
+            cache_turbo_key      $request_uri;
+            cache_turbo_valid    30s;
+            cache_turbo_serve_authorized on;
+            add_header            X-CT-Status $cache_turbo_status always;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # cache_turbo_vary_ignore (P3-3): Accept is dropped from the response
         # Vary header BEFORE the whitelist/unknown-axis check, so a response
         # varying only on Accept (a very common API/image-CDN axis the

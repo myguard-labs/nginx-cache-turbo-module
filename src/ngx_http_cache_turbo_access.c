@@ -150,8 +150,32 @@ ngx_http_cache_turbo_access_eligible(ngx_http_request_t *r,
      * that arm only protects an unusual caller that reaches
      * response_cacheable() with a ctx already in hand (a warm subrequest,
      * say). This IS the reachable site for the request-side refusal, so the
-     * counter is bumped HERE, not in the header filter. */
-    if (r->headers_in.authorization != NULL) {
+     * counter is bumped HERE, not in the header filter.
+     *
+     * P3-4: cache_turbo_serve_authorized (off by default) lifts THIS gate
+     * only -- the credentialed request proceeds to the lookup and may be
+     * served an existing entry. It does NOT touch the store floor: the
+     * Authorization arm of response_cacheable() is that function's first
+     * test, ungated by any directive, and ctx->captured (the sole gate on the
+     * body filter's store) is only set when response_cacheable() returns
+     * true. So every blob that exists was written by a request carrying NO
+     * credentials, and relaxing the read side cannot expose one principal's
+     * response to another -- no such response is ever stored.
+     *
+     * RFC 9111 SS3.5 needs more than anonymity of the stored copy: reuse FOR
+     * an authenticated request additionally requires the response to have
+     * authorised it (public / s-maxage / must-revalidate). That is enforced
+     * at the serve chokepoint against BLOBF_AUTH_SHAREABLE, stamped at store
+     * -- not here, because at this point no entry has been looked up yet.
+     *
+     * With the directive ON, ctx now IS allocated for an Authorization
+     * request, so the header filter no longer bails on ctx == NULL and
+     * response_cacheable()'s AUTHORIZATION arm becomes the reachable
+     * refusal site for the STORE -- which is exactly why the counter bump
+     * stays behind the !serve_authorized guard here: filters.c's
+     * capture_count_refusal() attributes it instead, and counting it in both
+     * places would double-count a single request. */
+    if (r->headers_in.authorization != NULL && !clcf->serve_authorized) {
         if (clcf->shm_zone != NULL) {
             ngx_http_cache_turbo_zone_t  *rz = clcf->shm_zone->data;
 

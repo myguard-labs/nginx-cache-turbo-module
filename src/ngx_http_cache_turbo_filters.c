@@ -454,6 +454,14 @@ ngx_http_cache_turbo_header_filter_capture(ngx_http_request_t *r,
             ctx->origin_encoded_class = encoded_class;
         }
 
+        /* P3-4: resolve the RFC 9111 SS3.5 reuse authorisation NOW, while the
+         * response headers still exist. The body filter stamps it onto the
+         * blob; it cannot re-derive it after headers are sent. Recorded on
+         * every capture regardless of clcf->serve_authorized, so enabling the
+         * directive later does not require flushing entries stored before. */
+        ctx->auth_shareable =
+            ngx_http_cache_turbo_response_auth_shareable(r) ? 1 : 0;
+
         /* A warm subrequest is deliberately excluded from lookup, so its key
          * was never built. Build it here from the subrequest URI before flagging
          * capture, so the body filter stores under the same key a later real
@@ -1261,6 +1269,9 @@ ngx_http_cache_turbo_body_filter_blob_write(ngx_http_request_t *r,
         bhw.flags |= ((uint32_t) ctx->origin_encoded_class
                           << NGX_HTTP_CACHE_TURBO_BLOBF_AE_CLASS_SHIFT)
                       & NGX_HTTP_CACHE_TURBO_BLOBF_AE_CLASS_MASK;
+    }
+    if (ctx->auth_shareable) {
+        bhw.flags |= NGX_HTTP_CACHE_TURBO_BLOBF_AUTH_SHAREABLE;
     }
     ngx_http_cache_turbo_blob_hdr_write(blob, &bhw);
 

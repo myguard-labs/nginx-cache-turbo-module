@@ -646,6 +646,24 @@ typedef struct {
 #define NGX_HTTP_CACHE_TURBO_BLOBF_AE_CLASS_MASK   0x000C
 
 /*
+ * P3-4: the stored response carried an RFC 9111 SS3.5 shared-cache reuse
+ * authorisation (Cache-Control: public / s-maxage / must-revalidate) at STORE
+ * time, so it may be reused for a request that carries Authorization when
+ * cache_turbo_serve_authorized is on. Bit 4 of the u16 (the AE-class field
+ * occupies bits 2-3).
+ *
+ * Recorded on the blob rather than re-derived at serve because the serve path
+ * has only the stored bytes, not the origin response that produced them.
+ *
+ * ⚠ Like BLOBF_BREAKER_ONLY and BLOBF_ORIGIN_ENCODED, this bit is checked at
+ * the serve chokepoint every hit path shares. It is NOT the anonymity
+ * guarantee -- that comes from response_cacheable()'s unconditional
+ * Authorization arm, which is what makes every stored blob anonymous in the
+ * first place. This bit only adds the SS3.5 reuse permission on top.
+ */
+#define NGX_HTTP_CACHE_TURBO_BLOBF_AUTH_SHAREABLE  0x0010
+
+/*
  * S231-PERF-HDRWALK: one parsed TLV header entry, as produced by the single
  * walk inside ngx_http_cache_turbo_blob_validate() and consumed directly by
  * ngx_http_cache_turbo_restore_response() -- no second bounds-checking pass
@@ -890,6 +908,7 @@ char *ngx_http_cache_turbo_key_cookie_conf(ngx_conf_t *cf,
 ngx_int_t ngx_http_cache_turbo_response_cacheable(ngx_http_request_t *r,
     ngx_uint_t *reason_out);
 ngx_int_t ngx_http_cache_turbo_response_must_revalidate(ngx_http_request_t *r);
+ngx_int_t ngx_http_cache_turbo_response_auth_shareable(ngx_http_request_t *r);
 time_t ngx_http_cache_turbo_response_sie(ngx_http_request_t *r);
 time_t ngx_http_cache_turbo_response_swr(ngx_http_request_t *r);
 ngx_int_t ngx_http_cache_turbo_sie_rewrite(ngx_http_request_t *r,

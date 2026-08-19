@@ -12,6 +12,21 @@ Changes with the nginx-cache-turbo-module (unreleased)
        additional round trip, and a resolved L2 marker self-heals the node's
        own L1 marker so the next request pays nothing.
 
+    *) Feature: cache_turbo_serve_authorized allows a request carrying an
+       Authorization header to be SERVED an already-cached entry, where it was
+       previously declined before the cache was consulted at all. An API that
+       authenticates every call to a shareable public endpoint had a hit ratio
+       of exactly zero. The store floor is unchanged and remains ungated: a
+       response produced for a credentialed request is still never stored, so
+       no private response exists in the cache to expose. Serving is further
+       gated per RFC 9111 section 3.5 on the stored response carrying public,
+       s-maxage or must-revalidate/proxy-revalidate; entries lacking it --
+       including every entry stored before this release -- are refused to a
+       credentialed requester and fall through to the origin. Off by default;
+       it widens who may read a cached body, so it is an opt-in the operator
+       asserts is correct for the endpoint. See README's
+       cache_turbo_serve_authorized section.
+
     *) Feature: cache_turbo_min_uses_window adds time-windowed reset to the
        min_uses miss counter. Without a window, miss_count persists for the
        node's lifetime (reset only on LRU eviction). With a window, the counter

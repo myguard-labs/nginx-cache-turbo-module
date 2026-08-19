@@ -576,6 +576,12 @@ class Origin:
                     self.send_header("Cache-Control", "private, max-age=60")
                 if "ccnostore" in self.path:
                     self.send_header("Cache-Control", "no-store")
+                if "ccpublic" in self.path:
+                    # P3-4: bare `public` -- an RFC 9111 SS3.5 shared-cache
+                    # reuse authorisation with NO max-age, so the entry's TTL
+                    # still comes from cache_turbo_valid and this marker only
+                    # exercises the SS3.5 permission, nothing else.
+                    self.send_header("Cache-Control", "public")
                 if "nativecache" in self.path:
                     # mimic a native nginx cache (proxy_cache) sitting behind us
                     self.send_header("Age", "123")
