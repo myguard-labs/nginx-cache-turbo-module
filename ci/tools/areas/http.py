@@ -108,37 +108,46 @@ def test_nocache_breaker_open_varying_url_serves_correct_variant(
     varies, or miss it entirely.
 
     /s231ncv/ (own zone s231ncvz, cache_turbo_valid 30s) auto-Vary-splits by
-    Accept-Encoding ("v=ae" query marker, same convention as
-    test_auto_vary_encoding). /s231ncvbrk/ shares the SAME zone (so it shares
-    the SAME breaker state) but has its OWN short cache_turbo_valid (1s) and
-    is used ONLY to trip the breaker via an unrelated key (/dead) -- letting
-    the tripping key expire and trip fast while the gzip/br variants (primed
-    first, on their 30s window) stay comfortably fresh for the rest of the
-    test. With the zone breaker OPEN, a no-cache request for the fresh br
-    variant must still resolve to ITS OWN key and serve the br body from
-    cache (a plain HIT, since a fresh entry never reaches the pre-origin
-    breaker gate at all) -- not the gzip variant, not a miss to origin.
-    Serving the gzip body here would mean the gate probed the BASE key
-    instead of the variant (the ordering hazard); forcing an origin trip
-    would mean the no-cache fix isn't reached at all for varying URLs."""
-    p = "/s231ncv/k1?v=ae"
+    Origin ("v=or" query marker). /s231ncvbrk/ shares the SAME zone (so it
+    shares the SAME breaker state) but has its OWN short cache_turbo_valid
+    (1s) and is used ONLY to trip the breaker via an unrelated key (/dead) --
+    letting the tripping key expire and trip fast while the two Origin
+    variants (primed first, on their 30s window) stay comfortably fresh for
+    the rest of the test. With the zone breaker OPEN, a no-cache request for
+    the fresh "b" variant must still resolve to ITS OWN key and serve the "b"
+    body from cache (a plain HIT, since a fresh entry never reaches the
+    pre-origin breaker gate at all) -- not the "a" variant, not a miss to
+    origin. Serving the "a" body here would mean the gate probed the BASE
+    key instead of the variant (the ordering hazard); forcing an origin trip
+    would mean the no-cache fix isn't reached at all for varying URLs.
 
-    # Prime the gzip/br variants FIRST, breaker still CLOSED -- their 30s
+    P1-1: this used to split by Accept-Encoding (gzip vs br); the encoding
+    axis now collapses for an unencoded body (see
+    test_auto_vary_encoding_collapses_when_body_unencoded), so gzip and br
+    would land on the SAME slot here and the "variants did not split"
+    assertion below would trip on every run, not just a real regression.
+    Origin (an unbounded raw-value axis, unaffected by P1-1) exercises the
+    identical vary_resolve()/breaker-gate ordering this test targets."""
+    p = "/s231ncv/k1?v=or"
+    hdr_a = {"Origin": "https://a.example"}
+    hdr_b = {"Origin": "https://b.example"}
+
+    # Prime the two Origin variants FIRST, breaker still CLOSED -- their 30s
     # window comfortably outlives the whole breaker-tripping sequence below.
-    s_gz0, b_gz0, _ = fetch(ng.port, p, {"Accept-Encoding": "gzip"})
-    assert s_gz0 == 200 and b_gz0, f"gzip prime failed: {s_gz0} {b_gz0!r}"
-    s_br0, b_br0, _ = fetch(ng.port, p, {"Accept-Encoding": "br"})
-    assert s_br0 == 200 and b_br0, f"br prime failed: {s_br0} {b_br0!r}"
+    s_gz0, b_gz0, _ = fetch(ng.port, p, hdr_a)
+    assert s_gz0 == 200 and b_gz0, f"origin-a prime failed: {s_gz0} {b_gz0!r}"
+    s_br0, b_br0, _ = fetch(ng.port, p, hdr_b)
+    assert s_br0 == 200 and b_br0, f"origin-b prime failed: {s_br0} {b_br0!r}"
     assert b_gz0 != b_br0, \
-        ("gzip and br primed to the same body -- variants did not split, "
-         "the ordering regression this test targets cannot be proven")
-    _, b_gz1, h_gz1 = fetch(ng.port, p, {"Accept-Encoding": "gzip"})
+        ("origin-a and origin-b primed to the same body -- variants did not "
+         "split, the ordering regression this test targets cannot be proven")
+    _, b_gz1, h_gz1 = fetch(ng.port, p, hdr_a)
     assert h_gz1.get("x-cache") == "HIT" and b_gz1 == b_gz0, \
-        (f"gzip variant not a fresh HIT: X-Cache={h_gz1.get('x-cache')} "
+        (f"origin-a variant not a fresh HIT: X-Cache={h_gz1.get('x-cache')} "
          f"body_match={b_gz1 == b_gz0} headers={h_gz1}")
-    _, b_br1, h_br1 = fetch(ng.port, p, {"Accept-Encoding": "br"})
+    _, b_br1, h_br1 = fetch(ng.port, p, hdr_b)
     assert h_br1.get("x-cache") == "HIT" and b_br1 == b_br0, \
-        (f"br variant not a fresh HIT: X-Cache={h_br1.get('x-cache')} "
+        (f"origin-b variant not a fresh HIT: X-Cache={h_br1.get('x-cache')} "
          f"body_match={b_br1 == b_br0} headers={h_br1}")
 
     # Trip THIS ZONE's breaker OPEN via /s231ncvbrk/dead -- own 1s window on
@@ -162,19 +171,19 @@ def test_nocache_breaker_open_varying_url_serves_correct_variant(
         origin.fail = False
         drain_origin(origin)
 
-    before = origin.hits_for("/k1?v=ae")
+    before = origin.hits_for("/k1?v=or")
     s_nc, b_nc, h_nc = fetch(
         ng.port, p,
-        {"Accept-Encoding": "br", "Cache-Control": "no-cache"})
+        {**hdr_b, "Cache-Control": "no-cache"})
     assert s_nc == 200 and b_nc == b_br0, \
         (f"breaker OPEN + no-cache on a varying URL must serve the "
-         f"REQUESTED variant's cached body (br), got {b_nc!r}, expected "
-         f"{b_br0!r} -- the base/gzip key was probed instead (ordering "
-         f"hazard), or the request forced an origin trip")
+         f"REQUESTED variant's cached body (origin-b), got {b_nc!r}, "
+         f"expected {b_br0!r} -- the base/origin-a key was probed instead "
+         f"(ordering hazard), or the request forced an origin trip")
     assert h_nc.get("x-cache") == "HIT", \
-        (f"a fresh br variant, once correctly resolved, should serve as "
-         f"an ordinary HIT, got X-Cache={h_nc.get('x-cache')}")
-    assert origin.hits_for("/k1?v=ae") == before, \
+        (f"a fresh origin-b variant, once correctly resolved, should serve "
+         f"as an ordinary HIT, got X-Cache={h_nc.get('x-cache')}")
+    assert origin.hits_for("/k1?v=or") == before, \
         "breaker OPEN + no-cache must not trip a further origin request"
 
 

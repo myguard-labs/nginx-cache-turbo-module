@@ -354,6 +354,25 @@ class Origin:
                 # ngx_http_cache_turbo_vary.c). The gzip magic bytes are enough to
                 # exercise the gate; the module never inflates or validates the
                 # body, it only reads the header.
+                # P1-1: the negative control for the Accept-Encoding vary-axis
+                # collapse. Same pre-encoded body as "precompressed" above, but
+                # ALSO advertises `Vary: Accept-Encoding` so a test can prove the
+                # module still partitions by encoding class when the origin's
+                # body genuinely is coding-specific -- collapse must only apply
+                # when response_encoded() is false.
+                if "precompressed-vary" in self.path:
+                    body = b"\x1f\x8b" + f"prevary-{n}\n".encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("Content-Encoding", "gzip")
+                    self.send_header("Vary", "Accept-Encoding")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    try:
+                        self.wfile.write(body)
+                    except BrokenPipeError:
+                        pass
+                    return True, None
                 if "precompressed" in self.path:
                     body = b"\x1f\x8b" + f"pre-{n}\n".encode()
                     self.send_response(200)

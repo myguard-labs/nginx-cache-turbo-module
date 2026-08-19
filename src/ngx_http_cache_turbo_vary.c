@@ -845,7 +845,8 @@ ngx_http_cache_turbo_classify_vary_next_token(u_char **pp, u_char *end,
  * Sec-CH-* client hints, ...) the whitelist has no bit for (see PLAN P3-3). */
 static void
 ngx_http_cache_turbo_classify_vary_classify_token(u_char *tok, size_t tl,
-    ngx_int_t *bits, ngx_uint_t *nocache, ngx_uint_t *unsafe_axis)
+    ngx_int_t *bits, ngx_uint_t *nocache, ngx_uint_t *unsafe_axis,
+    ngx_uint_t response_encoded)
 {
     if (tl == 1 && tok[0] == '*') {
         *nocache = 1;
@@ -857,7 +858,18 @@ ngx_http_cache_turbo_classify_vary_classify_token(u_char *tok, size_t tl,
         *nocache = 1;
     } else if (tl == sizeof("Accept-Encoding") - 1
         && ngx_strncasecmp(tok, (u_char *) "Accept-Encoding", tl) == 0) {
-        *bits |= NGX_HTTP_CACHE_TURBO_VARY_ENCODING;
+        /* P1-1: response_encoded() == 0 here means the stored representation
+         * is provably identity (response_encoded()'s own capture-gate refusal
+         * keeps any pre-encoded body out of the store), so the encoding axis
+         * is inert for this response -- every Accept-Encoding value maps to
+         * the same identity bytes. Skip the bit so the variant key collapses
+         * instead of partitioning by a client header that cannot select a
+         * different stored representation. A genuinely pre-encoded origin
+         * response (response_encoded() == 1) still sets the bit and
+         * partitions as before -- that copy IS coding-specific. */
+        if (response_encoded) {
+            *bits |= NGX_HTTP_CACHE_TURBO_VARY_ENCODING;
+        }
     } else if (tl == sizeof("User-Agent") - 1
         && ngx_strncasecmp(tok, (u_char *) "User-Agent", tl) == 0) {
         *bits |= NGX_HTTP_CACHE_TURBO_VARY_DEVICE;
@@ -898,7 +910,14 @@ ngx_http_cache_turbo_classify_vary(ngx_http_request_t *r,
     ngx_int_t         bits = 0;
     ngx_uint_t        nocache = 0;
     ngx_uint_t        unsafe_axis = 0;
+    ngx_uint_t        response_encoded;
     ngx_uint_t        i;
+
+    /* P1-1: computed once per response, not per token -- same cost class as
+     * the header-list walk this function already does, and the capture gate
+     * re-checks response_encoded() itself later at no extra correctness
+     * cost. */
+    response_encoded = ngx_http_cache_turbo_response_encoded(r);
 
     for (i = 0; /* void */ ; i++) {
         u_char  *s, *e, *tok;
@@ -929,7 +948,8 @@ ngx_http_cache_turbo_classify_vary(ngx_http_request_t *r,
             ngx_http_cache_turbo_classify_vary_classify_token(tok, tl,
                                                                 &bits,
                                                                 &nocache,
-                                                                &unsafe_axis);
+                                                                &unsafe_axis,
+                                                                response_encoded);
         }
     }
 

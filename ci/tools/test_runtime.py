@@ -307,6 +307,8 @@ def run_all(ng: Nginx, origin: Origin,
     test_normalize_vary_encoding_zstd(ng, origin)
     test_invalid_normalize_vary_token(ng)
     test_auto_vary_encoding(ng, origin)
+    test_auto_vary_encoding_collapses_when_body_unencoded(ng, origin)      # P1-1
+    test_auto_vary_encoding_precompressed_still_never_cached(ng, origin)  # P1-1
     test_auto_vary_marker_probe_selects_correct_variant(ng, origin)
     test_auto_vary_encoding_same_class_shares(ng, origin)
     test_auto_vary_device(ng, origin)
@@ -622,7 +624,9 @@ def main() -> int:
           "zstd>br bucket (V6), invalid-token rejected), "
           "auto-Vary (v11: encoding/same-class/device/language/origin split, "
           "Vary:*/Cookie/mixed-refused uncacheable, on-by-default splits+"
-          "refuses with no directive, explicit off still ignores Vary), "
+          "refuses with no directive, explicit off still ignores Vary, "
+          "P1-1: encoding axis collapses when the body is unencoded, still "
+          "splits when genuinely pre-encoded), "
           "presets (v3-2: conservative/aggressive stale-window differ, "
           "explicit cache_turbo_stale_mult beats the band + range-rejects, "
           "invalid-name rejected), "
