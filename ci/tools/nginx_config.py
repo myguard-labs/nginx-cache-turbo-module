@@ -3675,6 +3675,20 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # cache_turbo_vary_ignore (P3-3): Accept is dropped from the response
+        # Vary header BEFORE the whitelist/unknown-axis check, so a response
+        # varying only on Accept (a very common API/image-CDN axis the
+        # built-in whitelist has no bit for) stays cacheable instead of being
+        # permanently refused like /av/ would refuse it.
+        location /avi/ {{
+            cache_turbo          main;
+            cache_turbo_key      $request_uri;
+            cache_turbo_valid    30s;
+            cache_turbo_auto_vary on;
+            cache_turbo_vary_ignore Accept;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # auto-Vary with a SHORT fresh TTL so the variant (and its L1 vary marker)
         # go stale fast: a request after the fresh deadline but inside the stale
         # window must still resolve to the variant via the now-stale marker

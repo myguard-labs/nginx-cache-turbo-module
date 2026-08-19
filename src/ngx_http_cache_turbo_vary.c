@@ -890,6 +890,39 @@ ngx_http_cache_turbo_classify_vary_classify_token(u_char *tok, size_t tl,
 }
 
 
+/* P3-3: is `tok`/`tl` (one already-tokenised Vary axis name) named by
+ * `cache_turbo_vary_ignore`? Case-insensitive, same as every other header-name
+ * compare in this file -- HTTP header names are case-insensitive and the
+ * origin's casing on the Vary line is not under our control. clcf->vary_ignore
+ * may be NULL/NGX_CONF_UNSET_PTR (nothing configured, the default) or an empty
+ * array; both return 0 with no match attempted. */
+static ngx_int_t
+ngx_http_cache_turbo_vary_ignore_match(ngx_http_cache_turbo_loc_conf_t *clcf,
+    u_char *tok, size_t tl)
+{
+    ngx_str_t   *ignored;
+    ngx_uint_t   i;
+
+    if (clcf == NULL || clcf->vary_ignore == NULL
+        || clcf->vary_ignore == NGX_CONF_UNSET_PTR)
+    {
+        return 0;
+    }
+
+    ignored = clcf->vary_ignore->elts;
+
+    for (i = 0; i < clcf->vary_ignore->nelts; i++) {
+        if (ignored[i].len == tl
+            && ngx_strncasecmp(ignored[i].data, tok, tl) == 0)
+        {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+
 /* Classify the response Vary header into a safe-axis bitmask (what we may key
  * on) and a nocache veto. Only the whitelist (Accept-Encoding, User-Agent,
  * Accept-Language, Origin) contributes to the key. Anything else — Vary: *,
@@ -900,10 +933,22 @@ ngx_http_cache_turbo_classify_vary_classify_token(u_char *tok, size_t tl,
  *
  * P0-1: unsafe_axis_out (may be NULL) is set when the veto came from a
  * genuinely unrecognised axis token, as opposed to "*"/Cookie/Authorization
- * -- see classify_vary_classify_token(). */
+ * -- see classify_vary_classify_token().
+ *
+ * P3-3: a token named by `cache_turbo_vary_ignore` (clcf may be NULL, e.g.
+ * from a caller with no location config in scope) is dropped BEFORE it ever
+ * reaches classify_vary_classify_token() -- i.e. before the "*"/Cookie/
+ * Authorization vetoes AND before the unknown-axis veto. An ignored token is
+ * therefore treated exactly as if the origin had never listed it: it does not
+ * contribute a bit to the variant key, it does not set nocache/unsafe_axis,
+ * and it is NOT folded into the safe whitelist -- classify_token() never
+ * sees it, so it cannot accidentally match one of the four whitelisted axis
+ * names either. This is a deliberate cache-correctness override the operator
+ * opts into per-header; see cache_turbo_vary_ignore's own doc comment. */
 void
 ngx_http_cache_turbo_classify_vary(ngx_http_request_t *r,
-    ngx_int_t *bits_out, ngx_uint_t *nocache_out, ngx_uint_t *unsafe_axis_out)
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_int_t *bits_out,
+    ngx_uint_t *nocache_out, ngx_uint_t *unsafe_axis_out)
 {
     ngx_list_part_t  *part = &r->headers_out.headers.part;
     ngx_table_elt_t  *h = part->elts;
@@ -942,6 +987,10 @@ ngx_http_cache_turbo_classify_vary(ngx_http_request_t *r,
             if (!ngx_http_cache_turbo_classify_vary_next_token(&s, e, &tok,
                                                                  &tl))
             {
+                continue;
+            }
+
+            if (ngx_http_cache_turbo_vary_ignore_match(clcf, tok, tl)) {
                 continue;
             }
 

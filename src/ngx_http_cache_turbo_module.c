@@ -234,6 +234,13 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       offsetof(ngx_http_cache_turbo_loc_conf_t, auto_vary),
       NULL },
 
+    { ngx_string("cache_turbo_vary_ignore"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_1MORE,
+      ngx_http_cache_turbo_vary_ignore,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+
     { ngx_string("cache_turbo_purge"),
       NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_FLAG,
       ngx_conf_set_flag_slot,
@@ -3980,6 +3987,7 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->bypass_stale_uri = NGX_CONF_UNSET_PTR;
     conf->key_cookies = NGX_CONF_UNSET_PTR;
     conf->backend_prefix = NGX_CONF_UNSET_PTR;
+    conf->vary_ignore = NGX_CONF_UNSET_PTR;
 #if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
     && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
     conf->test_restore_alloc_fail = NGX_CONF_UNSET;

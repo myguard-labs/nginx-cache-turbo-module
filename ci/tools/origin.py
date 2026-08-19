@@ -744,6 +744,13 @@ class Origin:
                 if "v=mix" in self.path:
                     # safe axis + refused axis: the refused one must win (no cache)
                     self.send_header("Vary", "Accept-Encoding, Cookie")
+                if "v=acc" in self.path:
+                    # P3-3: Accept is a common real-world Vary axis the built-in
+                    # whitelist has no bit for. On /av/ (no vary_ignore) this must
+                    # be refused like v=cs; on /avi/ (cache_turbo_vary_ignore
+                    # Accept) it must be dropped before the refusal check and
+                    # stay cacheable.
+                    self.send_header("Vary", "Accept")
 
             def do_GET(self):
                 if origin.delay:

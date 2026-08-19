@@ -1467,6 +1467,21 @@ typedef struct {
      * Authorization make the response uncacheable. Off by default. */
     ngx_flag_t               auto_vary;
 
+    /* cache_turbo_vary_ignore <header>... (P3-3). Header names (case-
+     * insensitive match against tokens in a response Vary header) to drop
+     * BEFORE classify_vary()'s whitelist/unsafe-axis check, i.e. treated as
+     * if the origin never listed them at all -- NOT folded into the safe
+     * whitelist and NOT contributing to the variant key. This is a
+     * deliberate cache-correctness override: naming a header here means the
+     * operator accepts that clients who would have received different
+     * bodies for that axis now share one cached copy. Off by default
+     * (NGX_CONF_UNSET_PTR = empty list, nothing ignored). Never widens the
+     * built-in safe-axis whitelist (Accept-Encoding/User-Agent/
+     * Accept-Language/Origin) -- an ignored axis is dropped, not promoted to
+     * safe. "*", Cookie and Authorization are rejected at config time --
+     * see ngx_http_cache_turbo_vary_ignore()'s own doc comment. */
+    ngx_array_t             *vary_ignore;         /* ngx_str_t[], UNSET = none */
+
 #if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
     && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
     /* CI-only fault injection; production/package builds do not define the

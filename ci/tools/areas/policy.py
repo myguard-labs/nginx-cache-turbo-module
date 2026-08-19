@@ -555,6 +555,77 @@ def test_auto_vary_unknown_axis_uncacheable(ng: Nginx, origin: Origin) -> None:
     assert origin.hits_for("/u?v=cs") == base + 2, "un-keyable Vary axis was wrongly cached"
 
 
+def test_vary_ignore_makes_named_axis_cacheable(ng: Nginx, origin: Origin) -> None:
+    """P3-3: `cache_turbo_vary_ignore Accept` drops the Accept token BEFORE
+    classify_vary()'s whitelist/unknown-axis check. `Vary: Accept` is a real-
+    world killer (very common on APIs/image CDNs) that the built-in whitelist
+    has no bit for, so /av/ (no vary_ignore) permanently refuses it -- see
+    test_auto_vary_unknown_axis_uncacheable. On /avi/ (vary_ignore Accept) the
+    SAME response must become cacheable and serve a HIT on re-fetch."""
+    base = origin.hits_for("/u?v=acc")
+    _, _, h0 = fetch(ng.port, "/avi/u?v=acc")
+    assert "x-cache" not in h0, "first should miss"
+    _, _, h1 = fetch(ng.port, "/avi/u?v=acc")
+    assert h1.get("x-cache") == "HIT", \
+        f"vary_ignore Accept should make this cacheable, got {h1.get('x-cache')}"
+    assert origin.hits_for("/u?v=acc") == base + 1, \
+        "vary_ignore Accept did not actually collapse to one origin hit"
+
+
+def test_vary_ignore_negative_control_without_directive(ng: Nginx,
+                                                          origin: Origin) -> None:
+    """P3-3 negative control: the SAME `Vary: Accept` response against /av/
+    (identical config MINUS cache_turbo_vary_ignore) must stay uncacheable --
+    proving the directive, not something else (a different URL, a different
+    origin behaviour), is what changed the outcome in the sibling test."""
+    base = origin.hits_for("/u?v=acc")
+    _, _, h0 = fetch(ng.port, "/av/u?v=acc")
+    assert "x-cache" not in h0, "first should miss"
+    _, _, h1 = fetch(ng.port, "/av/u?v=acc")
+    assert "x-cache" not in h1, \
+        f"without vary_ignore, Vary: Accept must stay uncacheable, got {h1.get('x-cache')}"
+    assert origin.hits_for("/u?v=acc") == base + 2, \
+        "un-keyable Vary: Accept was wrongly cached without the directive"
+
+
+def test_vary_ignore_axis_excluded_from_variant_key(ng: Nginx,
+                                                      origin: Origin) -> None:
+    """P3-3: an ignored axis must not enter the variant key. Two requests
+    differing ONLY in the ignored header (Accept) must hit the SAME cache
+    entry -- i.e. the second request, with a DIFFERENT Accept value, still
+    HITs the first request's slot instead of missing to a distinct one."""
+    base = origin.hits_for("/u?v=acc&t=key")
+    p = "/avi/u?v=acc&t=key"
+    _, b1, h1 = fetch(ng.port, p, {"Accept": "text/html"})
+    assert "x-cache" not in h1, "first should miss"
+    _, b2, h2 = fetch(ng.port, p, {"Accept": "application/json"})
+    assert h2.get("x-cache") == "HIT", \
+        ("a different Accept value must still hit the SAME slot once the "
+         f"axis is ignored, got {h2.get('x-cache')}")
+    assert b1 == b2, ("ignored axis leaked into the variant key -- two "
+                       "different Accept values produced two different "
+                       "bodies", b1, b2)
+    assert origin.hits_for("/u?v=acc&t=key") == base + 1, \
+        "ignored Accept axis wrongly caused a second origin hit"
+
+
+def test_vary_ignore_does_not_disable_other_unknown_axes(ng: Nginx,
+                                                           origin: Origin) -> None:
+    """P3-3: cache_turbo_vary_ignore Accept must not accidentally disable the
+    unknown-axis refusal arm generally -- a DIFFERENT un-whitelisted, non-
+    ignored axis (Accept-Charset, same as test_auto_vary_unknown_axis_uncacheable)
+    on the SAME /avi/ location must still refuse to cache."""
+    base = origin.hits_for("/u?v=cs")
+    _, _, h0 = fetch(ng.port, "/avi/u?v=cs")
+    assert "x-cache" not in h0, "first should miss"
+    _, _, h1 = fetch(ng.port, "/avi/u?v=cs")
+    assert "x-cache" not in h1, \
+        ("vary_ignore Accept must not disable the unknown-axis refusal for "
+         f"OTHER un-ignored axes, got {h1.get('x-cache')}")
+    assert origin.hits_for("/u?v=cs") == base + 2, \
+        "un-keyable, non-ignored Vary axis was wrongly cached on /avi/"
+
+
 def test_auto_vary_stale_marker_reachable(ng: Nginx, origin: Origin) -> None:
     """auto-Vary: once the variant and its L1 vary marker go stale (but are still
     inside the stale window), a request must still resolve to the variant via the

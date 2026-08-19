@@ -735,8 +735,8 @@ void ngx_http_cache_turbo_marker_store(ngx_http_cache_turbo_loc_conf_t *clcf,
     ngx_uint_t gen, time_t ttl);
 size_t ngx_http_cache_turbo_variant_index_name(ngx_str_t *base, u_char *buf);
 void ngx_http_cache_turbo_classify_vary(ngx_http_request_t *r,
-    ngx_int_t *bits_out, ngx_uint_t *nocache_out,
-    ngx_uint_t *unsafe_axis_out);
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_int_t *bits_out,
+    ngx_uint_t *nocache_out, ngx_uint_t *unsafe_axis_out);
 ngx_uint_t ngx_http_cache_turbo_response_encoded(ngx_http_request_t *r);
 
 /* Called from ngx_http_cache_turbo_normalized_args_variable() in module.c. */
@@ -836,6 +836,8 @@ char *ngx_http_cache_turbo_preset(ngx_conf_t *cf, ngx_command_t *cmd,
 char *ngx_http_cache_turbo_normalize_strip(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 char *ngx_http_cache_turbo_normalize_vary(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
+char *ngx_http_cache_turbo_vary_ignore(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 char *ngx_http_cache_turbo_backend_prefix(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
