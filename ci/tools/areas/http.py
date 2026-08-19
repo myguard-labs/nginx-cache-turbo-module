@@ -1340,6 +1340,88 @@ def test_use_stale_403_429(ng: Nginx, origin: Origin) -> None:
         drain_origin(origin)
 
 
+def test_use_stale_error_transport_only(ng: Nginx, origin: Origin) -> None:
+    """P5-5: `cache_turbo_use_stale error timeout` (no http_502/http_504) must
+    trigger ONLY on a genuine transport failure -- nginx never receiving a
+    parseable response from the origin -- and NOT on an origin that is up and
+    honestly answers 502/504 itself. Before this change ERROR/TIMEOUT were
+    folded onto 502/504 unconditionally, so `error` alone was a silent synonym
+    for `http_502`; this is the discriminating negative that catches a
+    regression back to that behaviour.
+
+    origin.drop (transport-level: connection closed with no response at all,
+    see ci/tools/origin.py) versus origin.fail with fail_status=502 (a
+    complete, real 502 the origin sends deliberately) is exactly the pair
+    ngx_http_cache_turbo_transport_failure() exists to tell apart via
+    r->upstream->state->header_time -- not a timing margin, so this is not
+    the kind of assertion the Test::Nginx `--- wait` flakiness warning
+    applies to.
+
+    Each sub-case primes and reads its OWN key (y1/y2/y3), not a shared one:
+    a stale serve fires an async background-refresh subrequest that takes the
+    key's cache lock, and a second request for the SAME key made before that
+    refresh settles becomes a cold-wait waiter blocked on lock_timeout
+    (default 5s) -- a shared key would make this test slow and would be
+    exercising the lock-wait path, not the transport-failure discrimination
+    under test."""
+    try:
+        # 1. transport failure (connection dropped, no response at all) DOES
+        #    trigger: this is exactly what `error`/`timeout` alone now name.
+        s0, b0, _ = fetch(ng.port, "/usestaleerroronly/y1")
+        assert s0 == 200 and b0, f"prime failed: {s0} {b0!r}"
+        time.sleep(1.3)  # past fresh (1s), stale_mult 1 -> 1s window: expired
+
+        origin.drop = True
+        s, b, h = fetch(ng.port, "/usestaleerroronly/y1")
+        assert s == 200, \
+            f"use_stale error on transport failure served {s}, expected stale 200"
+        assert b == b0, f"served {b!r}, expected stale {b0!r}"
+        assert h.get("x-cache") == "STALE-IF-ERROR", \
+            f"expected STALE-IF-ERROR, got x-cache={h.get('x-cache')}"
+        drain_origin(origin)
+        origin.drop = False
+
+        # 2. a REAL origin-emitted 502 must NOT trigger -- this is the
+        #    assertion that fails if ERROR still folds onto HTTP_502
+        #    unconditionally regardless of provenance.
+        s0b, b0b, _ = fetch(ng.port, "/usestaleerroronly/y2")
+        assert s0b == 200 and b0b, f"prime failed: {s0b} {b0b!r}"
+        time.sleep(1.3)
+
+        origin.fail = True
+        origin.fail_status = 502
+        s2, _, h2 = fetch(ng.port, "/usestaleerroronly/y2")
+        assert s2 == 502, \
+            f"use_stale error(-only) served {s2} on an origin-emitted 502, " \
+            "expected the origin's 502 to surface"
+        assert h2.get("x-cache") != "STALE-IF-ERROR", \
+            "an origin-emitted 502 must not serve-on-error under error-only " \
+            "(no http_502) use_stale"
+        origin.fail = False
+        drain_origin(origin)
+
+        # 3. same distinction for timeout/504: a real origin 504 must not
+        #    trigger either.
+        s0c, b0c, _ = fetch(ng.port, "/usestaleerroronly/y3")
+        assert s0c == 200 and b0c, f"prime failed: {s0c} {b0c!r}"
+        time.sleep(1.3)
+
+        origin.fail = True
+        origin.fail_status = 504
+        s3, _, h3 = fetch(ng.port, "/usestaleerroronly/y3")
+        assert s3 == 504, \
+            f"use_stale timeout(-only) served {s3} on an origin-emitted 504, " \
+            "expected the origin's 504 to surface"
+        assert h3.get("x-cache") != "STALE-IF-ERROR", \
+            "an origin-emitted 504 must not serve-on-error under timeout-only " \
+            "(no http_504) use_stale"
+    finally:
+        origin.drop = False
+        origin.fail = False
+        origin.fail_status = 503
+        drain_origin(origin)
+
+
 def test_keep_stale_loses_to_response_sie(ng: Nginx, origin: Origin) -> None:
     """S2.2 / D-1: a HONORED response stale-if-error wins over
     cache_turbo_keep_stale when both are available -- NOT max(). /keepstalewins/

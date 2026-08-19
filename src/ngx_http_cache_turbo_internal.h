@@ -345,8 +345,19 @@ ngx_int_t ngx_http_cache_turbo_redis_scan_del(ngx_http_request_t *r,
  * "no directive configured" as anything other than the ordinary UNSET/merge
  * path every other directive in this file already uses.
  */
-#define NGX_HTTP_CACHE_TURBO_USE_STALE_ERROR      0x01ull /* own bit; folded onto 502 at the trigger */
-#define NGX_HTTP_CACHE_TURBO_USE_STALE_TIMEOUT    0x02ull /* own bit; folded onto 504 at the trigger */
+/* P5-5: ERROR/TIMEOUT now discriminate a genuine TRANSPORT failure (connect
+ * refused, DNS failure, upstream timeout -- nginx never received a parseable
+ * response) from an origin that is up and explicitly answered 502/504 itself.
+ * The trigger reads this off r->upstream->state->header_time: nginx sets it
+ * to (ngx_msec_t) -1 at connect and overwrites it with a real elapsed value
+ * ONLY after a response header was actually parsed (ngx_http_upstream.c,
+ * ngx_http_upstream_process_header()); a synthesized failure status never
+ * reaches that line, so -1 survives to the header filter. HTTP_502/HTTP_504
+ * are unaffected and keep matching the status alone regardless of origin
+ * provenance -- an operator who wants "any 502" still gets it from http_502;
+ * error/timeout alone now mean "only when nginx never heard back at all". */
+#define NGX_HTTP_CACHE_TURBO_USE_STALE_ERROR      0x01ull /* transport failure only, folded onto 502 */
+#define NGX_HTTP_CACHE_TURBO_USE_STALE_TIMEOUT    0x02ull /* transport failure only, folded onto 504 */
 #define NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_403   0x04ull
 #define NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_404   0x08ull
 #define NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_429   0x10ull
@@ -980,7 +991,9 @@ ngx_int_t ngx_http_cache_turbo_test_armings_header(ngx_http_request_t *r);
 ngx_int_t ngx_http_cache_turbo_test_backoff_header(ngx_http_request_t *r);
 ngx_int_t ngx_http_cache_turbo_test_cookie_scan_header(ngx_http_request_t *r);
 time_t ngx_http_cache_turbo_upstream_ttl(ngx_http_request_t *r);
-ngx_uint_t ngx_http_cache_turbo_use_stale_triggers(ngx_uint_t mask, ngx_uint_t status);
+ngx_uint_t ngx_http_cache_turbo_use_stale_triggers(ngx_uint_t mask,
+    ngx_uint_t status, ngx_uint_t transport_failure);
+ngx_uint_t ngx_http_cache_turbo_transport_failure(ngx_http_request_t *r);
 
 /* ---- filters.c (response header/body filter group, MAINT-SPLIT step E) ----
  *

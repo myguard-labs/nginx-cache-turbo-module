@@ -3369,21 +3369,68 @@ ngx_http_cache_turbo_sie_rewrite(ngx_http_request_t *r,
 }
 
 
-/* S4.2: does `status` trigger a stale serve under the configured use_stale mask?
+/* P5-5: does r->upstream carry a genuine TRANSPORT failure -- connect
+ * refused, DNS failure, upstream timeout -- as opposed to a real response the
+ * origin sent (even an origin-generated 502/504)?
+ *
+ * Discriminator: r->upstream->state->header_time. nginx sets it to
+ * (ngx_msec_t) -1 the moment it opens a peer attempt and overwrites it with a
+ * real elapsed-time value ONLY on the success path of
+ * ngx_http_upstream_process_header(), immediately after a response header was
+ * actually parsed (rc == NGX_OK) -- see ngx_http_upstream.c. Every failure
+ * path that synthesizes a status (connect error, DNS failure,
+ * next_upstream_timeout, proxy_next_upstream exhaustion) reaches
+ * ngx_http_upstream_finalize_request() without ever executing that line, so
+ * -1 survives unchanged to the point this module's header filter runs. A -1
+ * therefore means "the last peer attempt never produced a parseable header",
+ * true regardless of whether nginx folds that into a synthesized 502 or 504.
+ *
+ * r->upstream->state is nginx's own pointer to the CURRENT (last) attempt's
+ * slot in r->upstream_states -- no walk needed, and it is populated before
+ * ngx_http_send_header() ever reaches this module's filter chain, so this is
+ * reliable at header-filter time. It is a DIFFERENT, earlier point than the
+ * mid-body SIE rescue in ngx_http_cache_turbo_body_filter_midbody_rescue()
+ * (filters.c), whose own comment rules out u->peer.connection and
+ * r->upstream->length as unreliable there -- that timing is post-body-start,
+ * with headers already serialised and the connection potentially closing
+ * concurrently; this check runs before any byte of THIS response's headers
+ * has left the filter chain, on the state nginx itself finished writing for
+ * the attempt already selected as final. Do not reuse this helper from the
+ * mid-body rescue: nothing there proves this same reliability. */
+ngx_uint_t
+ngx_http_cache_turbo_transport_failure(ngx_http_request_t *r)
+{
+    ngx_http_upstream_t  *u = r->upstream;
+
+    if (u == NULL || u->state == NULL) {
+        return 0;
+    }
+
+    return u->state->header_time == (ngx_msec_t) -1;
+}
+
+
+/* S4.2: does `status` trigger a stale serve under the configured use_stale
+ * mask, given whether this response arrived via a transport failure (P5-5,
+ * ngx_http_cache_turbo_transport_failure() above)?
  *
  * The mask is the operator's `cache_turbo_use_stale` set (S4.1); the default
  * (USE_STALE_DEFAULT) reproduces the pre-S4.2 hardcoded "every 5xx" condition
- * byte-for-byte via the four named 5xx bits plus ANY_5XX.
+ * byte-for-byte via the four named 5xx bits plus ANY_5XX -- transport_failure
+ * changes nothing about DEFAULT, because DEFAULT never sets the ERROR/TIMEOUT
+ * bits in the first place.
  *
- * ERROR/TIMEOUT are folded onto 502/504 here, NOT honoured as distinct
- * conditions: this site sees only r->headers_out.status, so a refused
- * connection and a genuine upstream 502 are the same value by the time we run
- * (see the USE_STALE_* comment block in the header for why the bits stay
- * separate anyway). Do not "fix" this into a distinction without first giving
- * the trigger access to upstream provenance.
+ * ERROR/TIMEOUT are folded onto 502/504 ONLY when transport_failure is true:
+ * an operator running `cache_turbo_use_stale error timeout;` alone (no
+ * http_502/http_504) now serves stale strictly for "nginx never heard back",
+ * leaving a real origin-emitted 502/504 to surface as-is unless http_502 /
+ * http_504 is also configured. HTTP_502/HTTP_504 are unaffected either way --
+ * they still match the status alone, transport failure or not, so an
+ * operator who wants "stale on any 502" keeps that from http_502 regardless.
  */
 ngx_uint_t
-ngx_http_cache_turbo_use_stale_triggers(ngx_uint_t mask, ngx_uint_t status)
+ngx_http_cache_turbo_use_stale_triggers(ngx_uint_t mask, ngx_uint_t status,
+    ngx_uint_t transport_failure)
 {
     ngx_uint_t  bit;
 
@@ -3401,15 +3448,19 @@ ngx_http_cache_turbo_use_stale_triggers(ngx_uint_t mask, ngx_uint_t status)
         bit = NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_500;
         break;
     case NGX_HTTP_BAD_GATEWAY:
-        bit = NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_502
-              | NGX_HTTP_CACHE_TURBO_USE_STALE_ERROR;
+        bit = NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_502;
+        if (transport_failure) {
+            bit |= NGX_HTTP_CACHE_TURBO_USE_STALE_ERROR;
+        }
         break;
     case NGX_HTTP_SERVICE_UNAVAILABLE:
         bit = NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_503;
         break;
     case NGX_HTTP_GATEWAY_TIME_OUT:
-        bit = NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_504
-              | NGX_HTTP_CACHE_TURBO_USE_STALE_TIMEOUT;
+        bit = NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_504;
+        if (transport_failure) {
+            bit |= NGX_HTTP_CACHE_TURBO_USE_STALE_TIMEOUT;
+        }
         break;
     default:
         /* Every other 5xx (506, 507, 508, 510, 511, ...) is covered only by

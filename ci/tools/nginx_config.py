@@ -2105,6 +2105,22 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # P5-5: error/timeout now mean "transport failure only", NOT "any
+        # 502/504 regardless of origin provenance". This location names error
+        # and timeout ALONE (no http_502/http_504), so a stale serve here can
+        # only come from the transport-failure discrimination -- a real
+        # origin-emitted 502/504 must surface unchanged. Drives
+        # test_use_stale_error_transport_only.
+        location /usestaleerroronly/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    1s;
+            cache_turbo_stale_mult 1;
+            cache_turbo_keep_stale 1h;
+            cache_turbo_use_stale error timeout;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # O4.4: the circuit breaker's own on/off switch (cache_turbo_breaker),
         # independent of the threshold/window off-switches the config-parse
         # tests already cover. NO keep_stale/use_stale window here on purpose:
