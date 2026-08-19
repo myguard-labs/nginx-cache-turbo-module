@@ -517,7 +517,7 @@ test_s8_evict_terminates_on_empty_queues(void)
      * naive port either wedges or refuses to evict a full-but-all-protected
      * zone. Assert it evicts the protected tail instead. */
     zone_reset();
-    ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(0), 4);
+    ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(0), 4, 0);
     REQUIRE(find(0) != NULL, "fixture: count_miss did not create the node");
     find(0)->seg = NGX_HTTP_CACHE_TURBO_SEG_PROTECTED;
     ngx_queue_remove(&find(0)->lru);
@@ -544,7 +544,7 @@ test_s8_evict_terminates_on_empty_queues(void)
     /* (a) The opposite direction: a victim in probation must be found even
      * though a segmented implementation might consult the wrong head. */
     zone_reset();
-    ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(1), 4);
+    ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(1), 4, 0);
     CHECK(ngx_http_cache_turbo_shm_evict_one(&g_zone) == 1,
           "evict_one must evict a probation victim");
     CHECK(find(1) == NULL, "the probation victim was not evicted");
@@ -868,7 +868,7 @@ test_s8_promote_on_second_hit(void)
     zone_reset();
 
     /* Build a real ENTRY the way store() would leave one: in probation. */
-    ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(0), 1);
+    ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(0), 1, 0);
     ctn = find(0);
     REQUIRE(ctn != NULL, "S8 fixture: count_miss did not create the ENTRY");
     ctn->kind = NGX_HTTP_CACHE_TURBO_NODE_ENTRY;
@@ -1058,7 +1058,7 @@ test_s8_off_demotes_inherited_protected_nodes(void)
     zone_reset();
 
     /* Build the post-reload state: an ENTRY promoted while the feature was on. */
-    ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(0), 1);
+    ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(0), 1, 0);
     ctn = find(0);
     REQUIRE(ctn != NULL, "S8-off fixture: count_miss did not create the ENTRY");
     ctn->kind = NGX_HTTP_CACHE_TURBO_NODE_ENTRY;
@@ -1171,11 +1171,11 @@ test_cr_b_unstub_preserves_counter(void)
     zone_reset();
 
     /* Three cold misses under min_uses 4: the key is at 3/4, not yet cacheable. */
-    CHECK(ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(0), 4) == NGX_DECLINED,
+    CHECK(ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(0), 4, 0) == NGX_DECLINED,
           "miss 1 should be below the min_uses threshold");
-    CHECK(ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(0), 4) == NGX_DECLINED,
+    CHECK(ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(0), 4, 0) == NGX_DECLINED,
           "miss 2 should be below the min_uses threshold");
-    CHECK(ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(0), 4) == NGX_DECLINED,
+    CHECK(ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(0), 4, 0) == NGX_DECLINED,
           "miss 3 should be below the min_uses threshold");
     CHECK(ngx_test_lock_balanced(), "count_miss left the zone mutex held");
 
@@ -1204,7 +1204,7 @@ test_cr_b_unstub_preserves_counter(void)
      * crosses the threshold. If unstub() had freed the node this returns
      * NGX_DECLINED (count restarts at 1) and the key needs 4 more misses. */
     CHECK(ctn->miss_count == 3, "CR-B: unstub() reset min_uses progress");
-    CHECK(ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(0), 4) == NGX_OK,
+    CHECK(ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(0), 4, 0) == NGX_OK,
           "CR-B: 4th miss did not cross the threshold after unstub");
 
     /* Same guard for a live memo on an otherwise-empty counter. */
@@ -1375,31 +1375,31 @@ test_count_miss_semantics(void)
     zone_reset();
 
     /* min_uses 1 is the default: never defer. */
-    CHECK(ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(0), 1) == NGX_OK,
+    CHECK(ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(0), 1, 0) == NGX_OK,
           "min_uses 1 should be store-eligible on the first miss");
 
     /* A live stub returns NGX_OK so the caller's claim() makes it a waiter --
      * this is NOT an un-coalesced miss and must not be counted. It is also the
      * reason a park is reachable with no concurrency at all. */
     zone_reset();
-    ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(1), 4);
+    ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(1), 4, 0);
     ctn = find(1);
     REQUIRE(ctn != NULL, "count_miss fixture: live-stub node missing");
     ctn->refreshing         = 1;
     ctn->refresh_lock_until = ngx_test_now + 5;
     ctn->refresh_owner      = ++g_sh.owner_seq;   /* CTXRDR-ADOPT-LEASE */
-    CHECK(ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(1), 4) == NGX_OK,
+    CHECK(ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(1), 4, 0) == NGX_OK,
           "a live stub should pass through as NGX_OK");
     CHECK(ctn->miss_count == 1, "a live stub must not be counted");
 
     /* A proven-cacheable ENTRY is never re-gated. */
     zone_reset();
-    ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(2), 4);
+    ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(2), 4, 0);
     ctn = find(2);
     REQUIRE(ctn != NULL, "count_miss fixture: ENTRY node missing");
     ctn->kind = NGX_HTTP_CACHE_TURBO_NODE_ENTRY;
     ctn->len  = 128;
-    CHECK(ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(2), 4) == NGX_OK,
+    CHECK(ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(2), 4, 0) == NGX_OK,
           "an ENTRY must never be re-gated by min_uses");
     CHECK(ctn->miss_count == 1, "an ENTRY's counter must not be touched");
     ctn->len = 0;   /* keep zone_reset()'s drain off the blob path */
@@ -1431,7 +1431,7 @@ test_resolve_miss_merged(void)
     owner = 999;   /* poison: must come back 0 on a DECLINED resolve */
     fresh_data = (u_char *) 0x1;   /* poison: must come back NULL/unset */
     fresh_len = 999;
-    rc = ngx_http_cache_turbo_shm_resolve_miss(&g_zone, KEY(0), 4, 5,
+    rc = ngx_http_cache_turbo_shm_resolve_miss(&g_zone, KEY(0), 4, 0, 5,
              &owner, &count_miss_rc, &fresh_data, &fresh_len);
     (void) rc;   /* the ngx_int_t return is not meaningful on DECLINED */
     CHECK(count_miss_rc == NGX_DECLINED,
@@ -1448,8 +1448,8 @@ test_resolve_miss_merged(void)
     /* Drive it to 3/4 with plain count_miss(), mirroring how module.c's own
      * gate would have counted the earlier misses via the standalone call
      * (lock-off case, or a resume) before the merged call ever fires. */
-    ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(0), 4);
-    ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(0), 4);
+    ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(0), 4, 0);
+    ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(0), 4, 0);
     ctn = find(0);
     REQUIRE(ctn != NULL, "priming fixture lost the counter node");
     CHECK(ctn->miss_count == 3, "priming fixture: expected 3/4");
@@ -1459,7 +1459,7 @@ test_resolve_miss_merged(void)
      * winning the single-flight stub on the SAME node count_miss just
      * bumped -- not a second, newly-allocated one. */
     owner = 0;
-    rc = ngx_http_cache_turbo_shm_resolve_miss(&g_zone, KEY(0), 4, 5,
+    rc = ngx_http_cache_turbo_shm_resolve_miss(&g_zone, KEY(0), 4, 0, 5,
              &owner, &count_miss_rc, &fresh_data, &fresh_len);
     CHECK(count_miss_rc == NGX_OK, "the 4th miss must reach min_uses 4");
     CHECK(rc == NGX_HTTP_CACHE_TURBO_CLAIM_WINNER,
@@ -1494,7 +1494,7 @@ test_resolve_miss_merged(void)
         u_char    *fd2 = NULL;
         size_t     fl2 = 0;
         ngx_int_t  rc2 = ngx_http_cache_turbo_shm_resolve_miss(&g_zone,
-                             KEY(0), 4, 5, &owner2, &cm2, &fd2, &fl2);
+                             KEY(0), 4, 0, 5, &owner2, &cm2, &fd2, &fl2);
         CHECK(cm2 == NGX_OK,
               "an ENTRY-less body-less node with refreshing set is a live "
               "stub, and count_miss's own pass-through rule (a live stub "
@@ -1553,7 +1553,7 @@ test_resolve_miss_merged(void)
          * len > 0 is exempt anyway -- see count_miss_semantics above); the
          * point of this fixture is claim_locked()'s CLAIM_FRESH branch, not
          * the counting gate. */
-        rc3 = ngx_http_cache_turbo_shm_resolve_miss(&g_zone, KEY(5), 1, 5,
+        rc3 = ngx_http_cache_turbo_shm_resolve_miss(&g_zone, KEY(5), 1, 0, 5,
                   &owner3, &cm3, &fd3, &fl3);
         CHECK(cm3 == NGX_OK, "an ENTRY must never be re-gated by min_uses");
         CHECK(rc3 == NGX_HTTP_CACHE_TURBO_CLAIM_FRESH,
@@ -1617,7 +1617,7 @@ test_l2_neg_never_on_entry(void)
     printf("l2_neg: an ENTRY is never memoed, and never reads one\n");
     zone_reset();
 
-    ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(0), 4);
+    ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(0), 4, 0);
     ctn = find(0);
     REQUIRE(ctn != NULL, "ENTRY-never-memoed fixture: node missing");
     ctn->kind = NGX_HTTP_CACHE_TURBO_NODE_ENTRY;
@@ -1641,7 +1641,7 @@ test_out_of_slab_fails_open(void)
     /* No slab left. count_miss() cannot track the count, so it must let the
      * request cache now (less selective, still correct) rather than refuse. */
     ngx_test_slab_fail_after(0);
-    CHECK(ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(0), 4) == NGX_OK,
+    CHECK(ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(0), 4, 0) == NGX_OK,
           "count_miss must fail open when the slab is exhausted");
     CHECK(find(0) == NULL, "no node should exist after a failed alloc");
 
@@ -3604,9 +3604,9 @@ run_negative_controls(void)
     /* CR-B restored: free any body-less node with no live memo, ignoring
      * miss_count (the exact predicate that discarded min_uses progress). */
     zone_reset();
-    ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(1), 4);
-    ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(1), 4);
-    ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(1), 4);
+    ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(1), 4, 0);
+    ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(1), 4, 0);
+    ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(1), 4, 0);
     ctn = find(1);
     REQUIRE(ctn != NULL, "CR-B control fixture: COUNTER node missing");
     ctn->refreshing = 1;
@@ -3618,7 +3618,7 @@ run_negative_controls(void)
         ngx_slab_free_locked(&g_pool, ctn);
     }
 
-    caught = (ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(1), 4) != NGX_OK);
+    caught = (ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(1), 4, 0) != NGX_OK);
     tests_run++;
     if (!caught) {
         tests_failed++;
