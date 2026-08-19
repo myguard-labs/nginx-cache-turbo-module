@@ -980,6 +980,72 @@ ngx_http_cache_turbo_shm_store_if(ngx_http_cache_turbo_zone_t *z,
 }
 
 
+/* P5-4: 304 freshening. A revalidation (client-conditional main request or
+ * SWR background refresh) came back 304 Not Modified -- the origin's own
+ * confirmation that the stored body is still correct. status_ttl() refuses
+ * 304 unconditionally (conf.c: cache_turbo_valid rejects it at config time,
+ * so it can never appear in valid_status; status_ttl() returns -1), which is
+ * deliberate for the ordinary capture path -- a 304 has no body and must
+ * never be STORED as if it were a representation. But that left no way to
+ * extend an existing entry's life from a 304 either, so the entry just aged
+ * out and the next request paid a full blocking regeneration -- exactly
+ * what the swr-validators probe (PR #350) demonstrates.
+ *
+ * This is NOT store(): no allocation, no LRU re-segmentation, no touching
+ * ctn->data. It bumps ONLY the freshness window on the resident node, in
+ * place, under the SAME zone mutex every other node-field mutation in this
+ * file uses (store_locked above, blob_acquire/release, the SWR claim/lease
+ * fields) -- there is exactly one lock protecting node metadata in this
+ * module and this reuses it rather than inventing a second protocol. A
+ * concurrent reader takes the identical lock before it can observe
+ * fresh_until/stale_until (the L1 access-prologue site in access.c holds
+ * z->shpool->mutex across its lookup + snapshot), so it either sees the pair
+ * entirely before this write or entirely after -- never torn.
+ *
+ * Refuses (NGX_DECLINED) when there is nothing to freshen: no resident
+ * entry, a stub/counter node (kind != ENTRY), or an entry with no body
+ * (len == 0) -- freshening a body that was never captured would fabricate a
+ * lifetime for content this zone never actually held.
+ *
+ * Also clears refreshing/refresh_lock_until, same as a real store does
+ * (shm_store_locked above): a 304 answers the outstanding revalidation just
+ * as conclusively as a 200 would, and leaving the single-flight lease held
+ * would wedge the SWR loop out of ever revalidating this key again until
+ * the lease's own TTL expires. */
+ngx_int_t
+ngx_http_cache_turbo_shm_freshen(ngx_http_cache_turbo_zone_t *z,
+    u_char *key_hash, uint32_t hash, time_t fresh_ttl, time_t stale_ttl)
+{
+    time_t                        now;
+    ngx_http_cache_turbo_node_t  *ctn;
+
+    ngx_shmtx_lock(&z->shpool->mutex);
+
+    ctn = ngx_http_cache_turbo_shm_lookup(z, key_hash, hash);
+
+    if (ctn == NULL
+        || ctn->kind != NGX_HTTP_CACHE_TURBO_NODE_ENTRY
+        || ctn->len == 0)
+    {
+        ngx_shmtx_unlock(&z->shpool->mutex);
+        return NGX_DECLINED;
+    }
+
+    now = ngx_time();
+
+    ctn->fresh_until = now + fresh_ttl;
+    ctn->stale_until = stale_ttl ? now + stale_ttl : 0;
+    ctn->refreshing = 0;
+    ctn->refresh_lock_until = 0;
+    ctn->refresh_owner = 0;
+    ctn->last_access = now;
+
+    ngx_shmtx_unlock(&z->shpool->mutex);
+
+    return NGX_OK;
+}
+
+
 void
 ngx_http_cache_turbo_shm_stats(ngx_http_cache_turbo_zone_t *z,
     ngx_http_cache_turbo_stats_t *out)
@@ -2340,4 +2406,5 @@ ngx_cache_turbo_l1_backend_t  ngx_http_cache_turbo_shm_backend = {
     ngx_http_cache_turbo_shm_resolve_miss,
     ngx_http_cache_turbo_shm_l2_neg_check,
     ngx_http_cache_turbo_shm_l2_neg_set,
+    ngx_http_cache_turbo_shm_freshen,
 };
