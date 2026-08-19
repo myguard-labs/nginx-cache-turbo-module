@@ -33,6 +33,15 @@ fi
 "$CC" $CFLAGS "$DIR/test_vary_gen.c" -o "$DIR/test_vary_gen"
 "$DIR/test_vary_gen"
 
+# --- auto-Vary Accept-Encoding axis collapse (P1-1) -------------------------
+# Pure-math mirror of classify_vary_classify_token()'s Accept-Encoding arm --
+# see the header comment in test_vary_encoding_collapse.c for why this is the
+# only place the response_encoded()==1 case can be proven at all (the
+# capture gate refuses that response end-to-end before the bit ever matters).
+# shellcheck disable=SC2086
+"$CC" $CFLAGS "$DIR/test_vary_encoding_collapse.c" -o "$DIR/test_vary_encoding_collapse"
+"$DIR/test_vary_encoding_collapse"
+
 # --- the same claim, against the REAL variant_hash (AUD-GEN1) --------------
 # test_vary_gen.c above mirrors the arithmetic; this one links the production
 # function, sliced verbatim out of src/ by extract_variant_hash.sh, so drift

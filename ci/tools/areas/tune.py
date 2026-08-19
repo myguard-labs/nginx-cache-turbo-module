@@ -221,21 +221,102 @@ def test_invalid_normalize_vary_token(ng: Nginx) -> None:
 
 
 def test_auto_vary_encoding(ng: Nginx, origin: Origin) -> None:
-    """v11 auto-Vary: a response `Vary: Accept-Encoding` makes the module split
-    by the Accept-Encoding class automatically (no operator config). Same class
-    collapses onto one slot; a different class is a distinct slot."""
+    """v11 auto-Vary: a response `Vary: Accept-Encoding` makes the module
+    learn the axis automatically (no operator config) -- exercised here on
+    the two request-shapes the encoding axis can still actually distinguish
+    from each other: TWO DIFFERENT unencoded classes (gzip, br) now share
+    ONE slot (P1-1: see test_auto_vary_encoding_collapses_when_body_unencoded
+    for that assertion in detail; every unencoded body collapses, so `gzip`
+    and `br` requests against the SAME unencoded body land on the same slot
+    exactly like `gzip` vs absent does), while re-fetching the same class
+    keeps hitting that one shared slot.
+
+    P1-1: this replaces the old assertion (gzip and br land on DISTINCT
+    slots) -- response_encoded() proves the stored representation here is
+    always identity, so that split was already dead weight before this
+    change and is provably wrong to keep asserting after it. The genuinely
+    encoded case (which the encoding axis DOES still key on, but which can
+    never be observed as a HIT because response_encoded() refuses capture
+    outright before classify_vary()'s bit ever matters -- see the module's
+    own README note "encoding-keyed caching is never actually needed") is
+    covered at the classify_vary() unit level, not here -- see
+    ci/tests/unit/test_vary_gen.c's mirror_classify_encoding()."""
     base = origin.hits
     p = "/av/enc?v=ae"
     _, b1, _ = fetch(ng.port, p, {"Accept-Encoding": "gzip"})  # cold -> origin
     _, b2, _ = fetch(ng.port, p, {"Accept-Encoding": "gzip"})  # marker -> HIT
     assert b1 == b2, (b1, b2)
-    _, b3, _ = fetch(ng.port, p, {"Accept-Encoding": "br"})    # new variant
-    _, b4, _ = fetch(ng.port, p, {"Accept-Encoding": "br"})    # HIT
-    assert b3 == b4, (b3, b4)
-    assert b1 != b3, ("gzip and br shared a slot", b1, b3)
-    _, b5, _ = fetch(ng.port, p, {"Accept-Encoding": "gzip"})  # still its slot
-    assert b5 == b1, (b5, b1)
-    assert origin.hits - base == 2, origin.hits - base
+    _, b3, _ = fetch(ng.port, p, {"Accept-Encoding": "br"})    # collapsed: same slot
+    assert b3 == b1, ("collapsed encoding axis: gzip and br must now share a slot",
+                       b1, b3)
+    _, b4, _ = fetch(ng.port, p, {"Accept-Encoding": "gzip"})  # still that slot
+    assert b4 == b1, (b4, b1)
+    assert origin.hits - base == 1, origin.hits - base
+
+
+def test_auto_vary_encoding_collapses_when_body_unencoded(ng: Nginx,
+                                                            origin: Origin) -> None:
+    """P1-1: response_encoded() proves the stored representation is always
+    identity when the origin does NOT send Content-Encoding -- classify_vary()
+    no longer sets VARY_ENCODING in that case, so two requests differing only
+    in Accept-Encoding now share ONE slot instead of two. Same origin marker
+    (v=ae, ordinary uncompressed body) as test_auto_vary_encoding above, which
+    still proves the OLD per-class behaviour for a genuinely different
+    Accept-Encoding pair (gzip vs br); this test uses gzip vs ABSENT to prove
+    the axis is now inert end-to-end: one MISS, then a HIT, one origin hit
+    total for both requests."""
+    base = origin.hits
+    p = "/av/enccollapse?v=ae"
+    _, b1, h1 = fetch(ng.port, p, {"Accept-Encoding": "gzip"})       # cold -> origin
+    assert h1.get("x-ct-status") == "MISS", \
+        f"first request should MISS, got {h1.get('x-ct-status')}"
+    _, b2, h2 = fetch(ng.port, p, {})                                # no AE header at all
+    assert h2.get("x-ct-status") == "HIT", (
+        "Accept-Encoding: gzip vs absent must now share one slot "
+        f"(collapsed axis), got X-CT-Status={h2.get('x-ct-status')}")
+    assert b1 == b2, ("collapsed encoding axis still split the slot", b1, b2)
+    assert origin.hits - base == 1, (
+        "collapsed encoding axis still hit the origin twice",
+        origin.hits - base)
+
+
+def test_auto_vary_encoding_precompressed_still_never_cached(
+        ng: Nginx, origin: Origin) -> None:
+    """P1-1 negative control: a genuinely pre-encoded response
+    (response_encoded() == 1) must still never be cached at all -- the
+    unconditional `!response_encoded(r)` leg of the capture gate
+    (ngx_http_cache_turbo_filters.c, header_filter_capture) is untouched by
+    this change and refuses capture BEFORE classify_vary()'s bit can ever
+    matter, so this response can never become a HIT regardless of the
+    Accept-Encoding axis -- exactly the same as before P1-1.
+
+    This is the reachable half of the "encoded body still partitions by
+    encoding" claim: since the response can never be served from cache, an
+    end-to-end HIT/MISS test cannot observe classify_vary() actually setting
+    VARY_ENCODING for it (the README already documents this: "an origin that
+    pre-compresses its own response is refused outright ... so encoding-keyed
+    caching is never actually needed"). The bit itself is still asserted at
+    the unit level, in ci/tests/unit/test_vary_gen.c's
+    mirror_classify_encoding().
+
+    Uses the origin's dedicated `precompressed-vary` marker (gzip body + a
+    real Vary: Accept-Encoding) rather than `/precompressed`, which sends no
+    Vary at all -- this proves the refusal holds even when classify_vary()
+    genuinely would key on the response's own Vary header."""
+    base = origin.hits
+    p = "/av/precompressed-vary"
+    _, b1, h1 = fetch(ng.port, p, {"Accept-Encoding": "gzip"})
+    assert h1.get("x-ct-status") == "MISS", \
+        f"pre-encoded response must MISS (never captured), got {h1.get('x-ct-status')}"
+    _, b2, h2 = fetch(ng.port, p, {"Accept-Encoding": "gzip"})  # SAME class, re-fetched
+    assert h2.get("x-ct-status") == "MISS", (
+        "pre-encoded response became a HIT -- the response_encoded() capture "
+        f"refusal was bypassed, got X-CT-Status={h2.get('x-ct-status')}")
+    assert b1 != b2, ("pre-encoded response was served from a stale slot", b1, b2)
+    assert origin.hits - base == 2, (
+        ("pre-encoded response should hit the origin on every request "
+         "(never cached)"),
+        origin.hits - base)
 
 
 def test_auto_vary_marker_probe_selects_correct_variant(ng: Nginx,
@@ -243,54 +324,62 @@ def test_auto_vary_marker_probe_selects_correct_variant(ng: Nginx,
     """S231-PERF-VARYLOCK pin: the vary-marker probe now runs inside the SAME
     zone-mutex critical section as the main L1 lookup (previously its own
     separate lock/unlock pair). Re-assert the marker probe's actual job —
-    correct HIT/MISS + variant selection across THREE distinct Accept-Encoding
+    correct HIT/MISS + variant selection across THREE distinct variant
     classes on one URL, interleaved so a wrong fold (e.g. always resolving to
     whichever variant happened to be looked up last, or the base key never
     updating) would show up as a MISS where a HIT is expected or as one
     variant's body leaking into another's slot. X-CT-Status is the canary
     (not just body equality — see test_auto_vary_language_primary_subtag_shares
-    for why body-only assertions are not a real oracle here)."""
-    base = origin.hits_for("/vlock?v=ae")
-    p = "/av/vlock?v=ae"
-    gz = {"Accept-Encoding": "gzip"}
-    br = {"Accept-Encoding": "br"}
-    zs = {"Accept-Encoding": "zstd"}
+    for why body-only assertions are not a real oracle here).
+
+    P1-1: switched from Accept-Encoding to Origin (v=or, an unbounded raw-
+    value axis with three arbitrary distinct values) -- the encoding axis
+    now collapses for this endpoint's unencoded body (see
+    test_auto_vary_encoding_collapses_when_body_unencoded), so it can no
+    longer produce three genuinely distinct slots. The marker-probe/lock
+    mechanism this test targets is axis-agnostic; Origin exercises the exact
+    same vary_prepare/vary_apply code path test_auto_vary_origin covers."""
+    base = origin.hits_for("/vlock?v=or")
+    p = "/av/vlock?v=or"
+    a = {"Origin": "https://a.example"}
+    b = {"Origin": "https://b.example"}
+    c = {"Origin": "https://c.example"}
 
     # First touch of each variant: no marker yet (or a marker for a DIFFERENT
     # variant) -> MISS, one origin hit each.
-    _, gz1, hgz1 = fetch(ng.port, p, gz)
-    assert hgz1.get("x-ct-status") == "MISS", \
-        f"gzip cold fetch must MISS, got {hgz1.get('x-ct-status')}"
-    _, br1, _ = fetch(ng.port, p, br)
-    _, zs1, _ = fetch(ng.port, p, zs)
-    assert origin.hits_for("/vlock?v=ae") - base == 3, \
-        origin.hits_for("/vlock?v=ae") - base
+    _, a1, ha1 = fetch(ng.port, p, a)
+    assert ha1.get("x-ct-status") == "MISS", \
+        f"origin-a cold fetch must MISS, got {ha1.get('x-ct-status')}"
+    _, b1, _ = fetch(ng.port, p, b)
+    _, c1, _ = fetch(ng.port, p, c)
+    assert origin.hits_for("/vlock?v=or") - base == 3, \
+        origin.hits_for("/vlock?v=or") - base
 
     # Re-probe each variant, interleaved (not sequential re-hits of the same
     # one) so the marker lookup must resolve the RIGHT variant key every time,
     # not just "the last one resolved". Each must now HIT its own slot and
     # never cross-serve another variant's body.
-    _, gz2, hgz2 = fetch(ng.port, p, gz)
-    _, zs2, hzs2 = fetch(ng.port, p, zs)
-    _, br2, hbr2 = fetch(ng.port, p, br)
+    _, a2, ha2 = fetch(ng.port, p, a)
+    _, c2, hc2 = fetch(ng.port, p, c)
+    _, b2, hb2 = fetch(ng.port, p, b)
 
-    assert hgz2.get("x-ct-status") == "HIT", f"gzip re-fetch must HIT, got {hgz2}"
-    assert hbr2.get("x-ct-status") == "HIT", f"br re-fetch must HIT, got {hbr2}"
-    assert hzs2.get("x-ct-status") == "HIT", f"zstd re-fetch must HIT, got {hzs2}"
+    assert ha2.get("x-ct-status") == "HIT", f"origin-a re-fetch must HIT, got {ha2}"
+    assert hb2.get("x-ct-status") == "HIT", f"origin-b re-fetch must HIT, got {hb2}"
+    assert hc2.get("x-ct-status") == "HIT", f"origin-c re-fetch must HIT, got {hc2}"
 
-    assert gz1 == gz2, ("gzip slot changed body across HIT", gz1, gz2)
-    assert br1 == br2, ("br slot changed body across HIT", br1, br2)
-    assert zs1 == zs2, ("zstd slot changed body across HIT", zs1, zs2)
+    assert a1 == a2, ("origin-a slot changed body across HIT", a1, a2)
+    assert b1 == b2, ("origin-b slot changed body across HIT", b1, b2)
+    assert c1 == c2, ("origin-c slot changed body across HIT", c1, c2)
 
-    assert gz1 != br1 and gz1 != zs1 and br1 != zs1, \
-        ("two variants shared a slot", gz1, br1, zs1)
+    assert a1 != b1 and a1 != c1 and b1 != c1, \
+        ("two variants shared a slot", a1, b1, c1)
 
     # No new origin hits: every second-round request must have resolved via
     # its own marker + variant key, not fallen back to the base key.
-    assert origin.hits_for("/vlock?v=ae") - base == 3, (
-        "a marker-probe/main-lookup fold regression sent a HIT-eligible "
-        "variant back to origin",
-        origin.hits_for("/vlock?v=ae") - base)
+    assert origin.hits_for("/vlock?v=or") - base == 3, (
+        ("a marker-probe/main-lookup fold regression sent a HIT-eligible "
+         "variant back to origin"),
+        origin.hits_for("/vlock?v=or") - base)
 
 
 def test_auto_vary_encoding_same_class_shares(ng: Nginx, origin: Origin) -> None:
@@ -487,15 +576,21 @@ def test_auto_vary_off_ignores_vary(ng: Nginx, origin: Origin) -> None:
 def test_auto_vary_shipped_default_splits_encoding(ng: Nginx, origin: Origin) -> None:
     """S231-VARY: `/avdefault/` sets NO cache_turbo_auto_vary directive at all
     -- proves the compiled-in merge default is 1, not just that `on;` works
-    when written out. A safe axis (Accept-Encoding) must still split, exactly
-    like the explicit-`on;` /av/ location does in test_auto_vary_encoding."""
+    when written out. A safe axis must still split, exactly like the
+    explicit-`on;` /av/ location does.
+
+    P1-1: uses Origin (v=or), not Accept-Encoding -- the encoding axis now
+    collapses for an unencoded body (see
+    test_auto_vary_encoding_collapses_when_body_unencoded), so it can no
+    longer prove "a safe axis splits" on its own; Origin exercises the same
+    clcf->auto_vary merge-default code path this test targets."""
     base = origin.hits
-    p = "/avdefault/enc?v=ae"
-    _, b1, _ = fetch(ng.port, p, {"Accept-Encoding": "gzip"})
-    _, b2, _ = fetch(ng.port, p, {"Accept-Encoding": "gzip"})
+    p = "/avdefault/enc?v=or"
+    _, b1, _ = fetch(ng.port, p, {"Origin": "https://a.example"})
+    _, b2, _ = fetch(ng.port, p, {"Origin": "https://a.example"})
     assert b1 == b2, (b1, b2)
-    _, b3, _ = fetch(ng.port, p, {"Accept-Encoding": "br"})
-    assert b1 != b3, ("shipped default: gzip and br shared a slot", b1, b3)
+    _, b3, _ = fetch(ng.port, p, {"Origin": "https://b.example"})
+    assert b1 != b3, ("shipped default: two Origins shared a slot", b1, b3)
     assert origin.hits - base == 2, origin.hits - base
 
 

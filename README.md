@@ -546,7 +546,9 @@ the full body rather than asserting "still current" with a `304` (RFC 9111).
 behavior described below). The module reads the response's own `Vary` header
 and splits the cache by the named **request** header automatically — no need
 to pre-declare the axes. It honours a safe whitelist:
-`Accept-Encoding` (bucketed br/gzip/identity/zstd), `User-Agent` (mobile/desktop
+`Accept-Encoding` (bucketed br/gzip/identity/zstd — but only for a response the
+module actually stores encoded; the identity body it normally captures makes
+this axis a no-op, see the note below), `User-Agent` (mobile/desktop
 class), `Accept-Language` (primary-subtag class) and `Origin` (raw value,
 unfolded: it's a CORS security boundary, collapsing distinct origins into one
 class would let one origin's response serve another's CORS headers). A response
@@ -584,17 +586,18 @@ their variant. The base slot stays empty for varied URLs, so a node that hasn't
 learned the `Vary` yet simply misses to origin — it never serves the wrong
 variant. On by default.
 
-> **`Vary: Accept-Encoding` is harmless but redundant here.** The module captures
+> **`Vary: Accept-Encoding` is collapsed automatically.** The module captures
 > the **identity** (uncompressed) body — its body filter runs *above*
 > gzip/zstd/brotli, which then re-encode per client on every MISS *and* HIT (the
 > `proxy_cache` model). So one stored copy already serves every encoding
-> correctly; an `Accept-Encoding` vary axis just stores up to four byte-identical
-> copies (`zstd`/`br`/`gzip`/`identity`) of the same URL. It is **correct, only
-> wasteful** — most origins set `Vary: Accept-Encoding` by default, so `auto_vary`
-> will partition on it. Leave it; a future version may collapse the axis. (An
-> origin that *pre-compresses* its own response is refused outright — see
-> [What it will and won't cache](#what-it-will-and-wont-cache) — so encoding-keyed
-> caching is never actually needed.)
+> correctly, and `auto_vary` no longer partitions on `Accept-Encoding` when the
+> response it captured is unencoded: `gzip`, `br`, `zstd` and no header at all
+> all resolve to the **same** slot instead of stacking up to four
+> byte-identical copies of the same URL. (An origin that *pre-compresses* its
+> own response is refused outright — see
+> [What it will and won't cache](#what-it-will-and-wont-cache) — so this never
+> trades away correctness: a response the module actually stores is always
+> encoding-agnostic, and encoding-keyed caching was never actually needed.)
 
 > **Don't turn `cache_turbo_auto_vary off` on a varied origin.** It is on by
 > default precisely because, with it **off**, the cache keys on the
