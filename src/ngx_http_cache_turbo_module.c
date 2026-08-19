@@ -241,6 +241,13 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       0,
       NULL },
 
+    { ngx_string("cache_turbo_key_encoded_origin"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_turbo_loc_conf_t, key_encoded_origin),
+      NULL },
+
     { ngx_string("cache_turbo_purge"),
       NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_FLAG,
       ngx_conf_set_flag_slot,
@@ -2630,6 +2637,48 @@ ngx_http_cache_turbo_serve(ngx_http_request_t *r, u_char *copy, size_t len,
                            "the normal path -> origin", &r->uri);
             return NGX_DECLINED;
         }
+
+        /*
+         * P3-2: enforce BLOBF_ORIGIN_ENCODED at this SAME chokepoint, right
+         * beside BLOBF_BREAKER_ONLY, for the same reason -- every live serve
+         * (L1 hit, L2 fill, stale-while-revalidate, cold wait, the breaker's
+         * own fallback) passes through here, and a per-call-site check would
+         * silently fail open on the next one added. This bit's whole point
+         * is belt-and-braces on top of the ae-class variant key
+         * (cache_turbo_key_encoded_origin, P3-2): vary.c:196-201 already
+         * documents ONE real bug where the variant hash alone let a
+         * zstd-only client read an identity entry, so the guard here must
+         * NOT rely on the variant key having routed the request to the
+         * right slot -- it independently re-checks the REQUEST's own
+         * Accept-Encoding against the class the blob says it was stored
+         * under, and fails closed (NGX_DECLINED -> caller proceeds to
+         * origin exactly as on a miss) on any mismatch, including a
+         * malformed/absent Accept-Encoding.
+         *
+         * (ngx_http_cache_turbo_get_u16(copy + 6) & BLOBF_ORIGIN_ENCODED)
+         * reads the SAME already-bounds-checked u16 the breaker check above
+         * just read -- no second length check needed, `len >=
+         * NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE` from the outer `if` already
+         * covers this offset. */
+        if (ngx_http_cache_turbo_get_u16(copy + 6)
+            & NGX_HTTP_CACHE_TURBO_BLOBF_ORIGIN_ENCODED)
+        {
+            ngx_uint_t  class = (ngx_http_cache_turbo_get_u16(copy + 6)
+                                  & NGX_HTTP_CACHE_TURBO_BLOBF_AE_CLASS_MASK)
+                                 >> NGX_HTTP_CACHE_TURBO_BLOBF_AE_CLASS_SHIFT;
+
+            if (!ngx_http_cache_turbo_ae_class_accepted(r, class)) {
+                if (ref_data != NULL && cc != NULL) {
+                    cc->data = NULL;
+                    ngx_http_cache_turbo_blob_release(z, ref_data);
+                }
+                ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                               "cache_turbo: origin-encoded entry \"%V\" "
+                               "class=%ui not accepted by request "
+                               "Accept-Encoding -> origin", &r->uri, class);
+                return NGX_DECLINED;
+            }
+        }
     }
 
     ctx = ngx_http_get_module_ctx(r, ngx_http_cache_turbo_module);
@@ -3082,6 +3131,44 @@ ngx_http_cache_turbo_sie_rewrite(ngx_http_request_t *r,
 {
     u_char  *body;
     size_t   body_len;
+
+    /*
+     * P3-2: this is the SECOND (and only other) call site of
+     * ngx_http_cache_turbo_restore_response() -- see the identical guard in
+     * ngx_http_cache_turbo_serve() for the full rationale (belt-and-braces
+     * on top of the ae-class variant key, vary.c:196-201). Checked BEFORE
+     * the destructive ngx_list_init() below (which wipes r->headers_out) so
+     * a refusal can return cleanly without leaving the response half
+     * rewritten; the caller (header_filter_try_sie()) treats NGX_DECLINED
+     * as "no SIE serve happened, continue as before", i.e. the original
+     * upstream error response is left to flow through the filter chain
+     * untouched -- the same safe fallback the breaker-only style guard in
+     * serve() gets via NGX_DECLINED.
+     *
+     * ctx->sie_snap is a private r->pool snapshot (never a live shm blob,
+     * see its own comments), so there is no reference to release on
+     * refusal, unlike the serve() call site.
+     */
+    if (ctx->sie_snap != NULL
+        && ctx->sie_snap_len >= NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE)
+    {
+        uint16_t  snap_flags = ngx_http_cache_turbo_get_u16(ctx->sie_snap + 6);
+
+        if (snap_flags & NGX_HTTP_CACHE_TURBO_BLOBF_ORIGIN_ENCODED) {
+            ngx_uint_t  class = (snap_flags
+                                  & NGX_HTTP_CACHE_TURBO_BLOBF_AE_CLASS_MASK)
+                                 >> NGX_HTTP_CACHE_TURBO_BLOBF_AE_CLASS_SHIFT;
+
+            if (!ngx_http_cache_turbo_ae_class_accepted(r, class)) {
+                ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                               "cache_turbo: origin-encoded SIE snapshot "
+                               "\"%V\" class=%ui not accepted by request "
+                               "Accept-Encoding -> origin error stands",
+                               &r->uri, class);
+                return NGX_DECLINED;
+            }
+        }
+    }
 
     /* Drop the error response's headers and the typed fields it set (Content-Type
      * / Content-Length) so the snapshot's own headers are authoritative. The
@@ -3950,6 +4037,7 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->autotune = NGX_CONF_UNSET;
     conf->cc_mode = NGX_CONF_UNSET_UINT;
     conf->auto_vary = NGX_CONF_UNSET;
+    conf->key_encoded_origin = NGX_CONF_UNSET;
     conf->purge = NGX_CONF_UNSET;
     conf->background_update = NGX_CONF_UNSET;
     conf->surrogate_key = NGX_CONF_UNSET;

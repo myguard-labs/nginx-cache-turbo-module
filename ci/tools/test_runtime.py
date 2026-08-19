@@ -313,6 +313,9 @@ def run_all(ng: Nginx, origin: Origin,
     test_auto_vary_encoding(ng, origin)
     test_auto_vary_encoding_collapses_when_body_unencoded(ng, origin)      # P1-1
     test_auto_vary_encoding_precompressed_still_never_cached(ng, origin)  # P1-1
+    test_key_encoded_origin_caches_and_keys_by_ae_class(ng, origin)        # P3-2
+    test_key_encoded_origin_serve_guard_refuses_wrong_ae_class(ng, origin)  # P3-2
+    test_key_encoded_origin_requires_auto_vary(ng)                         # P3-2
     test_auto_vary_marker_probe_selects_correct_variant(ng, origin)
     test_auto_vary_encoding_same_class_shares(ng, origin)
     test_auto_vary_device(ng, origin)

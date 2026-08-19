@@ -880,6 +880,10 @@ ngx_http_cache_turbo_merge_cc_and_bypass(
      * stale-serve path -- the one privacy defect that path had.
      * Explicit `cache_turbo_auto_vary off;` still disables it. */
     ngx_conf_merge_value(conf->auto_vary, prev->auto_vary, 1);
+    /* P3-2: off by default -- an always-encoded origin is a deliberate
+     * opt-in (it changes what gets captured, not just how it's keyed). */
+    ngx_conf_merge_value(conf->key_encoded_origin, prev->key_encoded_origin,
+                         0);
 #if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
     && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
     ngx_conf_merge_value(conf->test_restore_alloc_fail,
@@ -1348,6 +1352,39 @@ ngx_http_cache_turbo_warn_double_partition(ngx_conf_t *cf,
     }
 }
 
+
+/* P3-2: cache_turbo_key_encoded_origin relies entirely on the auto_vary
+ * variant-keying machinery (variant_hash/marker_store keyed off vary_bits)
+ * to separate ae-classes -- see the capture-gate site in filters.c, which
+ * force-sets VARY_ENCODING into ctx->vary_bits but never stores/serves a
+ * variant at all unless clcf->auto_vary is also on (filters.c:1616-1620,
+ * 1646-1648 both gate on `clcf->auto_vary && ctx->vary_bits > 0`). Without
+ * auto_vary the object would store under the BASE key regardless of the
+ * forced bit, silently defeating the whole point of forcing it: a base-key
+ * hit is unconditional and would serve the origin-encoded body to the very
+ * first request regardless of its Accept-Encoding, with only the serve-side
+ * guard (which the base-key path never even reaches -- it is not a
+ * BLOBF_ORIGIN_ENCODED-aware call site distinction, it is keyed identically)
+ * standing between it and a client that cannot decode it. Refuse the config
+ * outright rather than silently no-op or rely on the guard alone -- this is
+ * exactly the "belt and braces, because the hash is exactly what failed
+ * before" posture the feature was speced to have (vary.c:196-201). */
+static char *
+ngx_http_cache_turbo_require_auto_vary_for_key_encoded_origin(ngx_conf_t *cf,
+    ngx_http_cache_turbo_loc_conf_t *conf)
+{
+    if (conf->key_encoded_origin && !conf->auto_vary) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "cache_turbo_key_encoded_origin requires cache_turbo_auto_vary "
+            "on (it is the default; this location must not have set "
+            "cache_turbo_auto_vary off) -- key_encoded_origin depends on the "
+            "auto_vary variant-keying machinery to separate ae-classes");
+        return NGX_CONF_ERROR;
+    }
+
+    return NGX_CONF_OK;
+}
+
 char *
 ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 {
@@ -1371,6 +1408,12 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 
     ngx_http_cache_turbo_merge_normalize(conf, prev);
     ngx_http_cache_turbo_warn_double_partition(cf, conf);
+
+    if (ngx_http_cache_turbo_require_auto_vary_for_key_encoded_origin(cf, conf)
+        == NGX_CONF_ERROR)
+    {
+        return NGX_CONF_ERROR;
+    }
 
     return NGX_CONF_OK;
 }

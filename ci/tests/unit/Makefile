@@ -65,6 +65,9 @@ check: extract layout-check extract-frame-scan
 	@$(CC) $(CFLAGS) -Wno-unused-function $(SAN) -I$(FUZZ_DIR) \
 	    -o $(HERE)/test_frame_scan.san $(HERE)/test_frame_scan.c
 	@ASAN_OPTIONS=detect_leaks=1 $(HERE)/test_frame_scan.san
+	@$(CC) $(CFLAGS) $(SAN) -o $(HERE)/test_ae_class_guard.san \
+	    $(HERE)/test_ae_class_guard.c
+	@ASAN_OPTIONS=detect_leaks=1 $(HERE)/test_ae_class_guard.san
 
 run: extract layout-check extract-frame-scan
 	@$(CC) $(CFLAGS) $(INCS_NGX) -c $(NGINX_SRC)/core/ngx_rbtree.c -o $(HERE)/ngx_rbtree.o
@@ -74,6 +77,8 @@ run: extract layout-check extract-frame-scan
 	@$(CC) $(CFLAGS) -Wno-unused-function -I$(FUZZ_DIR) \
 	    -o $(HERE)/test_frame_scan $(HERE)/test_frame_scan.c
 	@$(HERE)/test_frame_scan
+	@$(CC) $(CFLAGS) -o $(HERE)/test_ae_class_guard $(HERE)/test_ae_class_guard.c
+	@$(HERE)/test_ae_class_guard
 
 extract-frame-scan: $(FRAME_GEN)
 
