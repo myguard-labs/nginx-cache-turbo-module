@@ -1228,9 +1228,9 @@ http {{
     # real eviction -- an 8m zone holds tens of thousands of these tiny bodies,
     # so the scan would evict nothing and every S8 assertion would pass for the
     # wrong reason.
-    cache_turbo_zone name=srz 64k;    # S8 scan-resistant ON
-    cache_turbo_zone name=sroffz 64k; # S8 default-off control (absent)
-    cache_turbo_zone name=srexpz 64k; # S8 explicit `off` control
+    cache_turbo_zone name=srz 64k;    # S8 scan-resistant ON (explicit)
+    cache_turbo_zone name=sroffz 64k; # P3-1 default-on control (directive absent)
+    cache_turbo_zone name=srexpz 64k; # S8 explicit `off` control (pre-P3-1 flat LRU)
     cache_turbo_zone name=shmref 16m; # refresh-under-pressure (R6b)
     cache_turbo_zone name=at 16m;    # autotune raise/clamp/off (v4-3)
     cache_turbo_zone name=atl 16m;   # autotune load-adaptive stale widen (v4-4)
@@ -3558,9 +3558,11 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
-        # S8: the SAME shape with the directive ABSENT -- the default-off
-        # control. Any behavioural difference between /sr/ and /sroff/ is
-        # attributable to the directive and nothing else.
+        # S8/P3-1: the SAME shape with the directive ABSENT -- the
+        # default-on control (P3-1 flipped the compiled-in default from off
+        # to on). Any behavioural difference between /sr/ and /sroff/ would
+        # be attributable to the directive; since P3-1 there should be NONE,
+        # because absent now means the same effective config as `on`.
         location /sroff/ {{
             cache_turbo          sroffz;
             cache_turbo_key      $uri;
@@ -3569,8 +3571,9 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
-        # S8: explicit `off` must behave identically to absent (not merely
-        # parse). Separate zone again so it is independently measurable.
+        # S8/P3-1: explicit `off` must restore the pre-P3-1 flat LRU -- the
+        # migration path for a deployment that relies on the old default.
+        # Separate zone again so it is independently measurable.
         location /srexpoff/ {{
             cache_turbo               srexpz;
             cache_turbo_key           $uri;
