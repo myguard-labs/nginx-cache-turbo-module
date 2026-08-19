@@ -16,6 +16,12 @@ from test_runtime_base import (
     _config_test_result,
 )
 
+# P4-3: the raw-socket reader. It lives in areas/l2.py beside the redis
+# forged-blob tests; header injection is a WIRE defect and a parsing client
+# would normalise the split away, so the memcached twin below must use the
+# SAME instrument rather than a second, subtly weaker one.
+from areas.l2 import _wire_response
+
 
 def test_normalize_arg_order(ng: Nginx, origin: Origin) -> None:
     """v3-1: ?b=2&a=1 and ?a=1&b=2 normalize to one cache slot — the reordered
@@ -1170,6 +1176,72 @@ def test_l2_memcached_cross_instance_fill(ng: Nginx, origin: Origin,
         b.assert_clean_logs()
     finally:
         b.stop()
+
+
+# P4-3: wire value of NGX_HTTP_CACHE_TURBO_BLOBF_HDRS_VETTED. Spelled out
+# rather than imported -- see the twin in areas/l2.py.
+BLOBF_HDRS_VETTED = 0x0020
+
+
+def test_l2_memcached_forged_vetted_bit_does_not_bypass_header_gate(
+        ng: Nginx, origin: Origin, mc: MemcachedServer) -> None:
+    """P4-3: the memcached twin of
+    test_l2_forged_vetted_bit_does_not_bypass_header_gate (areas/l2.py).
+
+    BLOBF_HDRS_VETTED is stripped at L2 INGRESS, and there are exactly two
+    ingress points: redis.c and memcached.c, each assigning ctx->l2_blob from
+    its own private r->pool copy. They are separate call sites in separate
+    files, so a fix applied to one and forgotten on the other leaves a live
+    header-injection bypass on every deployment using the other backend --
+    and the redis test would stay green throughout. This test is what makes
+    the enumeration ("both ingress points, therefore all consumers") an
+    asserted fact rather than a claim in a comment.
+
+    Seed memcached directly with a blob carrying the AUD-HDR1 primitives AND
+    a forged vetted bit; the fill must still run the full gate."""
+    uri = "/mc/forged-vetted"
+    key = l2_key(uri, prefix="mc:")
+    mc.command(b"delete " + key.encode() + b"\r\n")
+
+    seeded = b"mc-forged-vetted-body\n"
+    blob = make_ctb4_blob(seeded, headers={
+        # positive control: must survive, else the clean assertions are vacuous.
+        "Content-Type":       "text/plain",
+        "X-Split":            "ok\r\nInjected: yes",
+        "Transfer-Encoding":  "chunked",
+        "Set-Cookie":         "sess=attacker",
+    }, flags=BLOBF_HDRS_VETTED)
+
+    assert struct.unpack_from("<H", blob, 6)[0] & BLOBF_HDRS_VETTED, \
+        "the seeded blob does not carry BLOBF_HDRS_VETTED; this test would " \
+        "prove nothing about the forged-bit path"
+
+    resp = mc.command(
+        b"set " + key.encode() + b" 0 60 "
+        + str(len(blob)).encode() + b"\r\n" + blob + b"\r\n")
+    assert b"STORED" in resp, f"failed to seed the forged blob: {resp!r}"
+
+    origin_before = origin.hits
+
+    head, body = _wire_response(ng.port, uri)
+    low = head.lower()
+    assert b"injected" not in low, \
+        "memcached L2 fill: a forged BLOBF_HDRS_VETTED bit switched off the " \
+        f"restore-side header gate -- CRLF SPLIT into a new header.\n{head!r}"
+    assert b"\nset-cookie:" not in low, \
+        f"memcached L2 fill: forged vetted bit let Set-Cookie through\n{head!r}"
+    assert b"\ntransfer-encoding:" not in low, \
+        f"memcached L2 fill: forged vetted bit let Transfer-Encoding " \
+        f"through\n{head!r}"
+    assert b"\ncontent-type: text/plain" in low, \
+        f"memcached L2 fill: benign header did NOT survive, so the clean " \
+        f"assertions above prove nothing\n{head!r}"
+    assert body == seeded, f"served body {body!r} is not the seeded body"
+    assert b"x-cache: hit" in low, \
+        "the seeded object was not served from memcached -- this test never " \
+        "reached the restore path"
+    assert origin.hits == origin_before, \
+        "origin was consulted, so the response is not the forged blob"
 
 
 def test_l2_memcached_purge_key_drops_l2(ng: Nginx, origin: Origin,

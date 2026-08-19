@@ -65,7 +65,8 @@ emit_defines() {
                 NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE \
                 NGX_HTTP_CACHE_TURBO_TTL_MAX \
                 NGX_HTTP_CACHE_TURBO_FOREVER_TTL \
-                NGX_HTTP_CACHE_TURBO_BLOB_CREATED_MIN
+                NGX_HTTP_CACHE_TURBO_BLOB_CREATED_MIN \
+                NGX_HTTP_CACHE_TURBO_BLOBF_HDRS_VETTED
     do
         # A name defined in more than one header is itself drift: the harness
         # would silently take whichever came first. Collect every hit.
@@ -148,7 +149,14 @@ slice_fns() {
     ' "$src"
 }
 
-slice_fns '^ngx_http_cache_turbo_(get_u(16|32|64)|blob_validate|blob_next_header)[(]' \
+# P4-3: put_u16 and blob_clear_vetted are sliced too. The harness's input
+# stands in for bytes read out of L2, so it MUST run the same ingress
+# demotion redis.c/memcached.c apply before anything downstream reads the
+# blob -- otherwise the harness would be fuzzing a trust level production
+# never grants to L2 bytes. Sliced, not mirrored, for the same reason as
+# every other function here: a change to the real clearing is a change to
+# the harness.
+slice_fns '^ngx_http_cache_turbo_(get_u(16|32|64)|put_u16|blob_validate|blob_next_header|blob_clear_vetted)[(]' \
     "$SRC_BLOB" >> "$OUT"
 slice_fns '^ngx_http_cache_turbo_(header_skip|header_admissible|header_admissible_name|header_admissible_value)[(]' \
     "$SRC" >> "$OUT"
@@ -160,7 +168,9 @@ for fn in \
     'ngx_http_cache_turbo_get_u64(' \
     'ngx_http_cache_turbo_blob_validate(' \
     'ngx_http_cache_turbo_blob_next_header(' \
-    'ngx_http_cache_turbo_header_skip('
+    'ngx_http_cache_turbo_header_skip(' \
+    'ngx_http_cache_turbo_put_u16(' \
+    'ngx_http_cache_turbo_blob_clear_vetted('
 do
     if ! grep -qF "$fn" "$OUT"; then
         echo "✗ failed to extract $fn from $SRC / $SRC_BLOB" >&2

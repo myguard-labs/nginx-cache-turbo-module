@@ -2287,6 +2287,26 @@ ngx_http_cache_turbo_restore_response_headers(ngx_http_request_t *r,
 {
     uint32_t     i;
     ngx_uint_t   dropped = 0;
+    ngx_uint_t   vetted;
+
+    /*
+     * P4-3: skip the per-header re-validation when the blob carries
+     * BLOBF_HDRS_VETTED. That bit is set at store time (filters.c
+     * body_filter_blob_write) only after this very gate has already accepted
+     * every pair in the block, so on a fresh L1 hit the loop below would be
+     * re-deriving an answer this worker computed when it serialised the
+     * bytes: a tchar scan of the name, a CR/LF/NUL scan of the value, and a
+     * linear walk of the 18-entry header_skip table, per header, per hit.
+     *
+     * ⚠ The bit is NOT trusted off the wire. Anything arriving from L2 has it
+     * stripped at ingress (blob.c clear_vetted, called from redis.c and
+     * memcached.c on the private r->pool copy), so `vetted` can only be true
+     * for a blob this process serialised. A blob with the bit clear -- an L2
+     * restore, a pre-P4-3 warm entry, or anything malformed -- takes the full
+     * gate below, unchanged. Fail-safe direction: the bit only ever removes
+     * work from a path whose input we produced.
+     */
+    vetted = (bh->flags & NGX_HTTP_CACHE_TURBO_BLOBF_HDRS_VETTED) ? 1 : 0;
 
     /* Restore each stored header. Content-Type is mapped to the typed field;
      * the rest go onto the headers list. */
@@ -2305,7 +2325,9 @@ ngx_http_cache_turbo_restore_response_headers(ngx_http_request_t *r,
          * core just like a list header) — a gate placed after them would leave
          * exactly the typed fields unguarded. Drop, don't fail: one poisoned
          * header must not cost the client the whole cached response. */
-        if (!ngx_http_cache_turbo_header_admissible(clcf, nm, nl, vv, vl)) {
+        if (!vetted
+            && !ngx_http_cache_turbo_header_admissible(clcf, nm, nl, vv, vl))
+        {
             dropped++;
             continue;
         }

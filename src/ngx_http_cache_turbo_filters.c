@@ -1186,7 +1186,22 @@ ngx_http_cache_turbo_body_filter_measure_headers(ngx_http_request_t *r,
     uint32_t          nheaders = 0;
     ngx_uint_t        i;
 
-    if (ct->len) {
+    /* P4-3: Content-Type goes through the SAME admissibility gate as every
+     * other pair. It used to be emitted unconditionally, so a CR/LF in an
+     * origin's Content-Type was caught only on the way OUT, by
+     * restore_response_headers(). That was survivable while restore always
+     * re-validated; it is not survivable once BLOBF_HDRS_VETTED lets restore
+     * skip that pass, because the bit would then assert a check that never
+     * ran on this one field. Gating it here is what makes the bit's claim
+     * true for the whole blob.
+     *
+     * ⚠ Must stay byte-identical to the emit pass in _blob_write(), or
+     * headers_len lies about the block that follows (AUD-HDR1). */
+    if (ct->len
+        && ngx_http_cache_turbo_header_admissible(clcf,
+               (u_char *) "Content-Type", sizeof("Content-Type") - 1,
+               ct->data, ct->len))
+    {
         hdr_bytes += sizeof(uint32_t) + sizeof("Content-Type") - 1
                      + sizeof(uint32_t) + ct->len;
         nheaders++;
@@ -1273,6 +1288,27 @@ ngx_http_cache_turbo_body_filter_blob_write(ngx_http_request_t *r,
     if (ctx->auth_shareable) {
         bhw.flags |= NGX_HTTP_CACHE_TURBO_BLOBF_AUTH_SHAREABLE;
     }
+
+    /* P4-3: every pair this function emits below passed
+     * ngx_http_cache_turbo_header_admissible() first -- the Content-Type
+     * branch and the headers-list loop both gate on it, and the measure pass
+     * gated identically. So the claim the bit makes ("the AUD-HDR1 gate has
+     * already run over this header block") is true for the blob we are about
+     * to write, and restore_response_headers() may skip re-running it on an
+     * L1 hit.
+     *
+     * ⚠ Set unconditionally for the same reason bhw.flags is assigned
+     * unconditionally above: this is the ONE place the bit is ever set. If a
+     * future edit makes any pair reach CT_PUT without the gate, this line
+     * becomes a lie and the restore-side skip becomes a header-injection
+     * bypass -- keep the gate and this stamp in the same function.
+     *
+     * The bit is stripped again the moment such a blob comes back from L2
+     * (blob.c ngx_http_cache_turbo_blob_clear_vetted, called at both L2
+     * ingress points), which is what keeps an untrusted L2 writer from
+     * setting it themselves. */
+    bhw.flags |= NGX_HTTP_CACHE_TURBO_BLOBF_HDRS_VETTED;
+
     ngx_http_cache_turbo_blob_hdr_write(blob, &bhw);
 
     w = blob + NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE;
@@ -1286,7 +1322,12 @@ ngx_http_cache_turbo_body_filter_blob_write(ngx_http_request_t *r,
             ngx_memcpy(w, (vp), (vl)); w += (vl);                     \
         } while (0)
 
-    if (ct->len) {
+    /* P4-3: mirror of the measure pass's gate -- see the comment there. */
+    if (ct->len
+        && ngx_http_cache_turbo_header_admissible(clcf,
+               (u_char *) "Content-Type", sizeof("Content-Type") - 1,
+               ct->data, ct->len))
+    {
         CT_PUT("Content-Type", sizeof("Content-Type") - 1,
                ct->data, ct->len);
     }
