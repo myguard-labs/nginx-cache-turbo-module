@@ -2500,6 +2500,42 @@ ngx_http_cache_turbo_cold_wait(ngx_http_request_t *r,
 
     remaining = (ngx_msec_int_t) (ctx->wait_deadline - now);
     if (remaining <= 0) {
+        /* Waited long enough: give up. If a stale-if-error snapshot is
+         * already armed (from an earlier expired-but-within-SIE-window L1/L2
+         * lookup on THIS request, ctx->sie_snap / ctx->sie_armed -- armed at
+         * :1196-1198 (L1, shm-pinned) or :1469-1474 (L2, r->pool copy)),
+         * serve it instead of stampeding the origin: a slow origin is
+         * exactly the case where every timed-out loser piling on at once
+         * hurts most. `ref_data` is NULL on purpose here even for the L1
+         * (shm-pinned) case -- the arm site already registered the pool
+         * cleanup that drops the blob reference (S231-PERF-SIEARM), so
+         * passing sie_snap again as ref_data would register a SECOND
+         * cleanup for the same pointer and double-drop the refcount (see
+         * the identical warning at :880). The snapshot is safe to read
+         * here regardless of which arm produced it: the L1 pin is refcounted
+         * and only released when r->pool is destroyed, and the L2 copy lives
+         * in r->pool directly -- both outlive this request-scoped ctx,
+         * which is the only place any of these fields are ever read.
+         * "STALE-IF-ERROR" matches the diagnostic header already used for
+         * this exact snapshot on its other serve path (module.c:3080). */
+        if (ctx->sie_armed && ctx->sie_snap != NULL) {
+            ctx->waiting = 0;
+            (void) ngx_atomic_fetch_add(&z->sh->stale_serves, 1);
+            /* S7.1: dedicated SIE counter, bumped alongside stale_serves at
+             * the delivery site -- same "generic + reason-specific, both at
+             * the actual serve" discipline the breaker-fallback stale serve
+             * uses for stale_serves/breaker_serves (:1967-1972). Without
+             * this, sie_serves silently undercounts whenever delivery comes
+             * from a cold-wait timeout rather than an upstream error
+             * rewrite. */
+            (void) ngx_atomic_fetch_add(&z->sh->sie_serves, 1);
+            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                           "cache_turbo: cold-miss wait timeout \"%V\" -> "
+                           "serving armed SIE snapshot", &r->uri);
+            return ngx_http_cache_turbo_serve(r, ctx->sie_snap,
+                       ctx->sie_snap_len, 1, z, NULL, "STALE-IF-ERROR");
+        }
+
         /* Waited long enough: give up and regenerate ourselves. Our store ends
          * the wait for any remaining readers. Bounded by lock_timeout. */
         ctx->waiting = 0;

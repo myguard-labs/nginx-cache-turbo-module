@@ -1941,6 +1941,36 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # P1-8: cold-miss LOSER serves the armed stale-if-error snapshot
+        # instead of stampeding the origin when lock_timeout expires.
+        # Same expiry shape as /sieserve/ (valid 1s, stale_mult 1 -> fully
+        # expired ~1.3s after priming, "sieserve" request-suffix marker gets
+        # the origin's stale-if-error=30). lock_ttl 5s / lock_timeout 1s:
+        # long enough that the CLAIM_WINNER (made slow via origin.delay)
+        # never finishes inside the loser's wait window, short enough that
+        # the loser's park+giveup completes well under fetch()'s 5s client
+        # timeout. cache_turbo_lock stays ON (default) so a second request
+        # against the same key while the first is in flight becomes a real
+        # CLAIM_LOSER, not an independent cold miss. Drives
+        # test_cold_wait_loser_serves_stale_on_lock_timeout.
+        location /coldwaitsie/ {{
+            cache_turbo              main;
+            cache_turbo_key          $uri;
+            cache_turbo_valid        1s;
+            cache_turbo_stale_mult   1;
+            cache_turbo_lock_ttl     5s;
+            cache_turbo_lock_timeout 1s;
+            # S231-DEFAULTS: pinned off, same reasoning as /sieserve/ above --
+            # the negative control here (a "plain" key with no response
+            # stale-if-error) relies on sie_ttl staying 0 so the timed-out
+            # loser's fall-through-to-origin behaviour is genuinely
+            # unexercised by SIE. Left at the 24h default, keep_stale would
+            # arm a snapshot for EVERY key regardless of the origin's
+            # headers and the negative control would be vacuous.
+            cache_turbo_keep_stale off;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # UNBUF: proxy_buffering off with an ordinary (non-error) streamed
         # multi-chunk origin body. /siebuf/ above only drives the SIE
         # serve-on-error body-filter consume path; this location covers the
