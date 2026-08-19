@@ -193,12 +193,15 @@ check_probe_layout
 # within the 256B class is permitted; leaving this check as-is (it will now cover
 # a wider range) is the right behaviour.
 check_node_size() {
-    # pahole availability check: it is needed to measure struct sizes for P2-3.
-    # If not available (dwarves package not installed), skip this check and log
-    # a note. The check still runs locally in dev builds and catches regressions there.
+    # pahole (dwarves package) is a required CI dependency -- see the
+    # "Install build dependencies" step in .github/workflows/build-test.yml.
+    # Skipping this check when the tool is missing would make the P2-3
+    # assertion silently vacuous instead of failing loudly on the exact
+    # regression it exists to catch, so a missing tool is itself a failure.
     if ! command -v pahole >/dev/null 2>&1; then
-        echo "⊘ ngx_http_cache_turbo_node_t size check skipped (pahole not available)" >&2
-        return 0
+        echo "✗ pahole not found; required to measure" \
+             "ngx_http_cache_turbo_node_t (P2-3 slab-class check)" >&2
+        return 1
     fi
 
     # Find the struct size from pahole output in one of the compiled objects.

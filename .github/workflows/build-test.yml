@@ -1,4 +1,4 @@
-# sync-sha: 8ccd7eb9fd89a1f8cf95206886bb70ddce97ae3095af884aaf041155ccdf4e93
+# sync-sha: 902cf3dabcfdae72783345f4a6cdde6aa8eafd314d8680746fdc61c095b67139
 name: Build & Test
 
 # Runner labels live in the POOL repository variable. Every checked-in selector
@@ -183,7 +183,11 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential ccache clang curl eatmydata libpcre2-dev libssl-dev mold zlib1g-dev
+          # dwarves provides pahole, which ci/tests/unit/extract_shm.sh needs
+          # to measure ngx_http_cache_turbo_node_t's size (P2-3 slab-class
+          # assertion). Without it the check has nothing to skip TO but a
+          # silent pass -- so it is a required dependency, not optional.
+          sudo apt-get install -y build-essential ccache clang curl dwarves eatmydata libpcre2-dev libssl-dev mold zlib1g-dev
 
       # ccache + upstream-tarball cache (see .github/actions/build-cache). No
       # whole-.build tree cache: ci-build.sh writes every mode into the shared
