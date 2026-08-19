@@ -1389,15 +1389,45 @@ ngx_http_cache_turbo_access_l1(ngx_http_request_t *r,
 static ngx_int_t
 ngx_http_cache_turbo_access_l2_marker_get(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx,
-    ngx_int_t *out_rc)
+    ngx_http_cache_turbo_zone_t *z, ngx_int_t *out_rc)
 {
     ngx_int_t   rc;
     u_char      saved_key[32];
+    uint32_t    marker_hash;
 
     if (!clcf->auto_vary || !ctx->vary_marker_l1_miss
         || ctx->vary_marker_l2_tried || ctx->vary_marker_l2_done
         || !clcf->backend || !clcf->backend->get)
     {
+        return NGX_DECLINED;
+    }
+
+    marker_hash = ngx_crc32_short(ctx->vary_marker_key, 32);
+
+    /* L13, extended to the marker key (admin.py CI regression): the marker
+     * GET is exactly as memoable as the object GET it sits ahead of -- a
+     * memo asserts "an L2 GET for this key missed within the last
+     * l2_negative_ttl seconds", and that is just as true of the marker key
+     * as of any object key. Skipping this check made the marker GET fire on
+     * EVERY request regardless of a live memo (measured: a 5s burst issued
+     * one GET per request, 0 suppressed -- test_l2_negative_ttl_expires
+     * caught it), defeating l2_negative_ttl for every varied URL exactly
+     * the way the base-key path is protected from. Mirrors
+     * access_l2_neg_memo()'s check on ctx->key_hash, keyed on
+     * vary_marker_key instead. vary_marker_l1_miss is left untouched on a
+     * memoed skip (not cleared, not consumed) so this pass falls through to
+     * the ordinary base-key object GET exactly as an unmemoized miss
+     * would -- the memo answers "no marker", not "try again later". */
+    if (clcf->l2_negative_ttl > 0
+        && clcf->l1->l2_neg_check(z, ctx->vary_marker_key, marker_hash)
+               == NGX_DECLINED)
+    {
+        ctx->vary_marker_l1_miss = 0;
+        ctx->vary_marker_l2_done = 1;
+        (void) ngx_atomic_fetch_add(&z->sh->l2_neg_skips, 1);
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "cache_turbo: L2 vary-marker GET skipped by negative "
+                       "memo \"%V\"", &r->uri);
         return NGX_DECLINED;
     }
 
@@ -1573,6 +1603,23 @@ ngx_http_cache_turbo_access_l2_marker_consume(ngx_http_request_t *r,
                                &r->uri, bits);
             }
         }
+    }
+
+    /* L13, extended to the marker key (admin.py CI regression): arm the
+     * negative memo on a DEFINITIVE marker miss, mirroring
+     * access_l2_miss_account()'s guard on ctx->key_hash exactly --
+     * NGX_DECLINED only (a well-formed reply said "not there"; NGX_ERROR is
+     * "unknown", per the tri-state contract on ctx->l2_result, and must
+     * never arm a memo that asserts absence). No !l2_neg_skipped guard is
+     * needed here the way access_l2_miss_account() has one: this function
+     * only reaches this point when vary_marker_l2_get() actually LAUNCHED a
+     * GET (a memoed skip returns straight from marker_get() and never sets
+     * vary_marker_l2_tried, so consume() never runs for it), so a real
+     * round-trip backs every arm site here, exactly the invariant that
+     * guard protects on the object-key path. */
+    if (clcf->l2_negative_ttl > 0 && ctx->l2_result == NGX_DECLINED) {
+        clcf->l1->l2_neg_set(z, ctx->vary_marker_key,
+            ngx_crc32_short(ctx->vary_marker_key, 32), clcf->l2_negative_ttl);
     }
 
     /* Consumed: clear the marker GET result so the object-GET phase right
@@ -1945,7 +1992,7 @@ ngx_http_cache_turbo_access_l2(ngx_http_request_t *r,
      * costs the warm path nothing beyond the two flag reads. */
     ngx_http_cache_turbo_access_l2_marker_consume(r, clcf, ctx, z, &hash);
 
-    if (ngx_http_cache_turbo_access_l2_marker_get(r, clcf, ctx, out_rc)
+    if (ngx_http_cache_turbo_access_l2_marker_get(r, clcf, ctx, z, out_rc)
         == NGX_DONE)
     {
         return NGX_DONE;
