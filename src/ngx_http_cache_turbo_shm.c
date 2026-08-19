@@ -1026,6 +1026,10 @@ ngx_http_cache_turbo_shm_stats(ngx_http_cache_turbo_zone_t *z,
     out->sie_serves      = z->sh->sie_serves;
     out->breaker_serves  = z->sh->breaker_serves;
     out->origin_failures = z->sh->origin_failures;
+
+    /* P3-7: live gauge, not a lifetime tally -- read the same as every other
+     * counter here (plain, unlocked; the atomic itself is the sync point). */
+    out->bg_inflight = z->sh->bg_inflight;
 }
 
 

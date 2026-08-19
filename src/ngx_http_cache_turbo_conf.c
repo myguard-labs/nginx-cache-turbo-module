@@ -896,6 +896,8 @@ ngx_http_cache_turbo_merge_cc_and_bypass(
                          prev->test_l2_promote_hold_ms, 0);
     ngx_conf_merge_value(conf->test_midbody_abort,
                          prev->test_midbody_abort, 0);
+    ngx_conf_merge_value(conf->test_warm_ctx_fail,
+                         prev->test_warm_ctx_fail, 0);
 #endif
 }
 
@@ -914,6 +916,23 @@ ngx_http_cache_turbo_merge_zone_and_lock(
     /* v8: background update / SWR defaults ON — the dice-winner serves stale and
      * refreshes in the background rather than blocking on origin. */
     ngx_conf_merge_value(conf->background_update, prev->background_update, 1);
+
+    /* P3-7: zone-wide concurrent-background-refresh cap. Default 0
+     * (unlimited) rather than a nonzero number: this directive is new and
+     * every deployment already in production relied on the previously
+     * ungated behaviour (each stale key fires its own bg subrequest,
+     * unconditionally). A nonzero default would silently start REFUSING
+     * background regens — falling back to a plain stale serve with no
+     * refresh — for any zone whose legitimate steady-state concurrency
+     * exceeds whatever number was picked, which is exactly the kind of
+     * default flip the "reachability change" hazard in the worker
+     * contract warns about (a control path that used to always fire now
+     * sometimes doesn't, and nothing before this PR could observe or
+     * tune that). 0 keeps today's behaviour byte-for-byte identical until
+     * an operator opts in with an explicit cap sized to their origin's
+     * real concurrent-regen budget. */
+    ngx_conf_merge_value(conf->background_update_max,
+                         prev->background_update_max, 0);
 
     /* v10: cold-miss single-flight defaults ON — concurrent first-hits for one
      * cold key collapse to a single origin fetch; the rest wait up to
