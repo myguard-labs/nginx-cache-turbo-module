@@ -1,5 +1,16 @@
 Changes with the nginx-cache-turbo-module 1.1.0                 17 Aug 2026
 
+    *) Behaviour change: cache_turbo_scan_resistant is now ON by default
+       (protected_pct=80), where it was previously off. A stock install
+       without the directive now gets segmented probation/protected LRU, so
+       a crawler, sitemap fetch or scanner walking a large unique keyspace no
+       longer evicts the hot set. scanbench.sh measured 0.0% hot-set survival
+       under a crawler scan on the old flat-LRU default vs 82.0% with
+       segmented LRU at protected_pct=80. This changes eviction ORDER on
+       upgrade for any location that did not already set the directive; add
+       cache_turbo_scan_resistant off; explicitly to restore the pre-1.1.0
+       flat LRU. See README's "Scan-resistant eviction" section.
+
     *) Security: invalid or out-of-range Redis database suffixes no longer
        echo a credential-bearing DSN into nginx configuration-error logs.
 

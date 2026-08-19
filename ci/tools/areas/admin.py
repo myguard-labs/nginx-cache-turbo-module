@@ -1020,31 +1020,46 @@ def test_s8_scan_resistant_keeps_hot_key(ng: Nginx) -> None:
         "promote-on-second-hit or the probation-first victim pick is broken")
 
 
-def test_s8_default_off_is_unchanged(ng: Nginx) -> None:
-    """S8 test 2 -- OFF BY DEFAULT, and off means genuinely unchanged.
+def test_s8_default_on_is_scan_resistant(ng: Nginx) -> None:
+    """P3-1 test -- ON BY DEFAULT, and the compiled-in default is genuinely
+    scan-resistant, not merely settable.
 
-    Same location shape, same zone size, same traffic, directive ABSENT. The
-    flat LRU has no notion of protection, so the scan walks the hot key out of
-    the zone exactly as it did before S8 and the post-scan fetch MISSes.
+    Same location shape, same zone size, same traffic, directive ABSENT (the
+    `/sroff/` location declares no cache_turbo_scan_resistant at all -- see
+    nginx_config.py). Before P3-1 the flat LRU had no notion of protection and
+    this fetch MISSed; P3-1 flipped conf.c's merge default from 0 to
+    PROTECTED_PCT_DEFAULT (80), so the SAME unmodified config now gets
+    segmented LRU and the hot key survives the scan -> HIT.
 
-    This is the off-by-default regression guard: if a future edit ever makes
-    segmentation apply unconditionally, this test flips to HIT and fails. It is
-    also the inverse arm of test 1 -- the two together show the behavioural
-    difference is caused by the directive and by nothing else, since the only
-    difference between /sr/ and /sroff/ is that one line of config."""
+    This is the on-by-default regression guard: it exercises the
+    compiled-in default with NO directive present at all, so it is the one
+    test in this file that actually proves the flip landed -- every other S8
+    test sets the directive explicitly and would pass unchanged even if the
+    merge default had never been touched. If a future edit reverts the
+    default to off, this test flips to MISS and fails.
+
+    NEGATIVE CONTROL (verified by hand for this change): reverting
+    ngx_http_cache_turbo_conf.c's merge default from
+    NGX_HTTP_CACHE_TURBO_PROTECTED_PCT_DEFAULT back to 0 makes this assertion
+    fail with X-CT-Status=MISS -- the hot key is evicted by the scan exactly
+    as it was pre-P3-1."""
     st = _s8_hot_status(ng, "/sroff/", "off")
-    assert st == "MISS", (
-        f"S8: default-off behaviour CHANGED (X-CT-Status={st}, expected MISS). "
-        "Scan resistance must not apply unless cache_turbo_scan_resistant is on")
+    assert st == "HIT", (
+        f"S8/P3-1: default (directive absent) is not scan-resistant "
+        f"(X-CT-Status={st}, expected HIT). The conf.c merge default for "
+        "scan_resistant_pct must be PROTECTED_PCT_DEFAULT, not 0")
 
 
-def test_s8_explicit_off_matches_absent(ng: Nginx) -> None:
-    """S8: `cache_turbo_scan_resistant off` must be identical to omitting it --
-    not merely accepted by the parser. Pins that `off` stores 0 rather than
-    falling through to the default-on-when-present trap."""
+def test_s8_explicit_off_restores_flat_lru(ng: Nginx) -> None:
+    """P3-1: `cache_turbo_scan_resistant off` is the migration path back to
+    the pre-P3-1 flat LRU for a deployment that relies on the old default.
+    Since the compiled-in default flipped to on, explicit `off` must now
+    differ from an absent directive (see test_s8_default_on_is_scan_resistant)
+    and must still reproduce the original flat-LRU MISS."""
     st = _s8_hot_status(ng, "/srexpoff/", "expoff")
     assert st == "MISS", (
-        f"S8: explicit `off` did not match absent (X-CT-Status={st})")
+        f"S8: explicit `off` no longer restores the flat LRU "
+        f"(X-CT-Status={st}, expected MISS)")
 
 
 def test_s8_reload_on_to_off_drains_protected(ng: Nginx) -> None:
@@ -1061,7 +1076,7 @@ def test_s8_reload_on_to_off_drains_protected(ng: Nginx) -> None:
     Sequence: promote a hot key to PROTECTED while `on`, reload the SAME zone to
     `off`, then touch the hot key (which must DEMOTE it to probation) and run a
     scan. With `off` genuinely restoring pre-S8 behaviour the scan walks the key
-    out of the zone exactly as in test_s8_default_off_is_unchanged -> MISS.
+    out of the zone exactly as in test_s8_explicit_off_restores_flat_lru -> MISS.
 
     NEGATIVE CONTROL (required by TODO, verified by hand -- see the PR body):
     delete the `ctn->seg = ...SEG_PROBATION;` demote in

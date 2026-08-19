@@ -692,16 +692,28 @@ ngx_http_cache_turbo_merge_presets(ngx_http_cache_turbo_loc_conf_t *conf,
         conf->preset = prev->preset;
     }
 
-    /* S8: deliberately NOT band-resolved. No preset enables scan resistance --
-     * it is a behaviour change with a keyspace-shape trade-off, so it is opt-in
-     * per location and nothing else. Plain inherit, then default to 0 = OFF.
-     * An explicit `off` stores 0 (not UNSET), so it correctly overrides an
-     * inherited `on` rather than re-inheriting it here. */
+    /* S8/P3-1: deliberately NOT band-resolved -- no preset enables or disables
+     * scan resistance, it is a plain per-location default. Plain inherit, then
+     * fall back to ON at the standard protected_pct (80) when nothing in the
+     * chain set it explicitly. An explicit `off` stores 0 (not UNSET), so it
+     * correctly overrides an inherited `on` rather than re-inheriting it here.
+     *
+     * P3-1 flipped this from 0 (OFF) to PROTECTED_PCT_DEFAULT (80, ON):
+     * scanbench.sh measured flat LRU at 0.0% hot-set survival across a
+     * crawler/sitemap/scanner scan vs 82.0% with segmented LRU at the SAME 80%
+     * cap -- a stock install with the old default had zero scan resistance and
+     * any crawl flushed the hot set. 80 is not a new number invented for this
+     * flip: it is the existing PROTECTED_PCT_DEFAULT the `on` directive itself
+     * has always used when protected_pct is omitted, so "on by default" and
+     * "on explicitly with no tuning" are now the same effective config. See
+     * README's Upgrading section for the eviction-behaviour-changes migration
+     * note and how to restore the pre-P3-1 flat LRU with an explicit
+     * `cache_turbo_scan_resistant off`. */
     if (conf->scan_resistant_pct == (ngx_uint_t) NGX_CONF_UNSET) {
         conf->scan_resistant_pct = prev->scan_resistant_pct;
     }
     if (conf->scan_resistant_pct == (ngx_uint_t) NGX_CONF_UNSET) {
-        conf->scan_resistant_pct = 0;
+        conf->scan_resistant_pct = NGX_HTTP_CACHE_TURBO_PROTECTED_PCT_DEFAULT;
     }
 
     {
@@ -2224,12 +2236,17 @@ ngx_http_cache_turbo_breaker_open_conf(ngx_conf_t *cf, ngx_command_t *cmd,
 }
 
 
-/* cache_turbo_scan_resistant on|off [protected_pct=N]   (S8)
+/* cache_turbo_scan_resistant on|off [protected_pct=N]   (S8, default flipped P3-1)
  *
- * Segmented (probation/protected) LRU. OFF BY DEFAULT: when absent, or set to
- * `off`, scan_resistant_pct is 0 and every LRU path behaves exactly as the flat
- * single-queue LRU did before S8 -- no node is ever promoted, the protected
- * queue stays empty, and eviction always finds its victim on probation.
+ * Segmented (probation/protected) LRU. ON BY DEFAULT since P3-1 (protected_pct
+ * 80, the same PROTECTED_PCT_DEFAULT the bare `on` directive has always used):
+ * when absent, or set to `on`, a key needs a second hit to promote out of
+ * probation, so a one-hit crawler/sitemap/scanner walk cannot evict it.
+ * Explicit `off` sets scan_resistant_pct to 0 and every LRU path behaves
+ * exactly as the flat single-queue LRU did before S8 -- no node is ever
+ * promoted, the protected queue stays empty, and eviction always finds its
+ * victim on probation. Use `off` to restore that pre-P3-1 behaviour on
+ * upgrade; see README's Upgrading section.
  *
  * `on` stores the protected-segment cap (1..99, default 80) in the same field,
  * so "on" and the tuning cannot disagree and there is no representable

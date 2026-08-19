@@ -1417,22 +1417,32 @@ See also: [Auto-Vary marker/variant scheme](#auto-vary-read-the-response-vary) (
 
 ## Scan-resistant eviction: `cache_turbo_scan_resistant`
 
-**Off by default.** With the flat LRU, a crawler that walks N unique URLs
-evicts your entire hot set: every first store goes straight to the LRU head,
-and every eviction takes the tail. The crawler's one-hit-wonder URLs are the
-newest thing in the zone, so they push out the pages real users actually
-request.
-
-`cache_turbo_scan_resistant on` splits the LRU into two segments:
+**On by default since v-P3-1** (`protected_pct=80`). With the flat LRU a
+crawler that walks N unique URLs evicts your entire hot set: every first store
+goes straight to the LRU head, and every eviction takes the tail. The
+crawler's one-hit-wonder URLs are the newest thing in the zone, so they push
+out the pages real users actually request. `scanbench.sh` measured this at
+0.0% hot-set survival under a crawler scan on the old flat-LRU default vs
+82.0% with segmented LRU at the same `protected_pct=80` -- so a stock install
+on the old default had zero scan resistance against any crawler, sitemap
+fetch or scanner. A stock install now gets segmented LRU with no config
+needed:
 
 ```nginx
 location / {
-    cache_turbo               ct;
-    cache_turbo_scan_resistant on;                    # default protected_pct=80
-    # cache_turbo_scan_resistant on protected_pct=60; # or tune it
-    proxy_pass http://backend;
+    cache_turbo ct;
+    proxy_pass  http://backend;
+    # cache_turbo_scan_resistant on protected_pct=60; # tune the cap
+    # cache_turbo_scan_resistant off;                 # restore pre-P3-1 flat LRU
 }
 ```
+
+**Upgrading:** existing deployments get segmented LRU automatically on
+upgrade to v-P3-1+ -- this changes eviction ORDER (never what is served,
+cacheable, or freshness) but is a real behaviour change: a previously flat LRU
+now protects twice-hit keys and evicts one-hit keys first. If you rely on the
+old flat single-queue eviction order, add `cache_turbo_scan_resistant off;`
+explicitly to any location that must keep it.
 
 - A **new store enters PROBATION.** An unproven key never starts out protected.
 - On its **second hit** an entry is promoted to **PROTECTED**. One hit is not
@@ -1695,7 +1705,7 @@ http {
 | `cache_turbo_lock on` / `off` | `server`, `location` | `on` | Cold-miss single-flight: when an *uncached* key is hit by many requests at once, the first goes to the origin and the rest **wait** for it to fill the cache (per box via a stub, cluster-wide via the Redis lock) rather than all stampeding the origin. **Off** = every cold miss goes straight to the origin. |
 | `cache_turbo_lock_timeout TIME` | `server`, `location` | `5s` | How long a waiting cold-miss request waits for the winner's fill before giving up and going to the origin itself. |
 | `cache_turbo_min_uses N` | `server`, `location` | preset (`1`, `2` aggressive) | Cache a page only after its key has been requested `N` times — keep one-hit-wonder URLs out of the cache. Below the threshold each request goes to the origin and is **not** stored; the `N`-th miss stores it. A key already present in the L2 (Redis or memcached) tier is served from L2 regardless (it is already proven popular). `1` = store on the first miss (off), which is the band value for every preset except `aggressive` (`2`). An explicit value overrides the preset's band, like `cache_turbo_valid`/`_beta`/`_lock_ttl`/`_stale_mult`. Range `1`..`32`; `0` and negatives are rejected at config time rather than silently meaning `1`. Note each sub-threshold miss still costs a lightweight counter node in the zone — `min_uses` saves the response *body*, not the key slot, so raising it on a site without a long tail is a pure origin-load increase. |
-| `cache_turbo_scan_resistant on\|off [protected_pct=N]` | `server`, `location` | `off` | Split the LRU into PROBATION and PROTECTED segments so a crawler walking a large unique keyspace cannot evict the hot set. A new store enters probation; a **second** hit promotes to protected; eviction takes the probation tail first and only falls through to protected when probation is empty. `protected_pct` caps the protected segment as a percentage of resident entries (`1`..`99`, default `80`); on overflow the protected tail is demoted to the probation head rather than dropped. Counter/stub/memo nodes never promote (they hold no body). `off` and omitting the directive are byte-for-byte the flat LRU. `protected_pct=0`, values outside `1..99`, non-numeric values, and `protected_pct` combined with `off` are all rejected at config time rather than silently coerced. Changes eviction ORDER only -- never what is served, what is cacheable, or any freshness decision. |
+| `cache_turbo_scan_resistant on\|off [protected_pct=N]` | `server`, `location` | `on protected_pct=80` (P3-1+; was `off`) | Split the LRU into PROBATION and PROTECTED segments so a crawler walking a large unique keyspace cannot evict the hot set. A new store enters probation; a **second** hit promotes to protected; eviction takes the probation tail first and only falls through to protected when probation is empty. `protected_pct` caps the protected segment as a percentage of resident entries (`1`..`99`, default `80`); on overflow the protected tail is demoted to the probation head rather than dropped. Counter/stub/memo nodes never promote (they hold no body). Explicit `off` is byte-for-byte the pre-P3-1 flat LRU; omitting the directive now means `on` (see Upgrading note above). `protected_pct=0`, values outside `1..99`, non-numeric values, and `protected_pct` combined with `off` are all rejected at config time rather than silently coerced. Changes eviction ORDER only -- never what is served, what is cacheable, or any freshness decision. |
 | `cache_turbo_l2_negative_ttl N` | `server`, `location` | `0` (off) | Remember for `N` seconds that an L2 (Redis/memcached) `GET` missed a key, so the next cold request for it **skips the L2 round-trip** instead of paying a full RTT to be told "absent" again. Off by default and **not** a preset band value — it must be opted into explicitly, because it trades L2 coherence for that saved round-trip. Like every other `server`-scoped directive here it **inherits**: set it at `server` level and every location under it that does not override it gets the same window, so scope it to the locations you mean rather than assuming it stays where you wrote it. **Bounded staleness by construction:** nothing invalidates the memo when a *peer* node stores the key, so for up to `N` seconds this node may go to the origin for an object L2 actually holds. That is a hit-rate cost, never a correctness one — the memo carries no body and can never cause a stale serve. Keep `N` at a few seconds (the cold-key stampede it collapses is far shorter) and leave it off unless L2 misses dominate your miss path. Range `0` (off) or `1`..`60`; negatives are rejected at config time. Watch `cache_turbo_l2_neg_skips_total` against `cache_turbo_l2_hits_total` — rising skips with falling L2 hits means the window is too long. |
 | `cache_turbo_max_size SIZE` | `server`, `location` | `1m` | Don't cache responses bigger than this. |
 | `cache_turbo_bypass VAR...` | `server`, `location` | — | If any variable is non-empty and not `0`, skip the cache lookup (go to origin) — but still store the fresh response. E.g. `cache_turbo_bypass $cookie_session;` to always revalidate logged-in users. **Never put a client-controlled variable (`$arg_nocache`, `$http_x_no_cache`, …) in this list on a public endpoint** — the bypass returns before the single-flight lock is taken, so miss-collapsing does not apply and `ab -n 200000 'https://site/?nocache=1'` puts 100% of a flood on the origin. If you need a manual cache-buster, gate it on something only you can send (a shared secret in a header, or `$remote_addr` via a `map`). **On an identity predicate (session/login cookie, auth token, private-surface flag) always pair it with the same variables on `cache_turbo_no_store`** — on its own a bypass still writes that user's personalised response under the shared key, where the next anonymous visitor can be served it. Bypass controls the *lookup*; `cache_turbo_no_store` controls the *store*. (`cache_turbo_bypass_uri` and the `cache_turbo_backend` presets do skip storing as well; only `cache_turbo_bypass` does not.) |

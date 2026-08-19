@@ -245,8 +245,8 @@ def run_all(ng: Nginx, origin: Origin,
     test_evict_blind_second_chance(ng, origin)                    # S231-EVICT-BLIND
     test_p1_coarse_lru_splice_keeps_hot_key_resident(ng)
     test_s8_scan_resistant_keeps_hot_key(ng)
-    test_s8_default_off_is_unchanged(ng)
-    test_s8_explicit_off_matches_absent(ng)
+    test_s8_default_on_is_scan_resistant(ng)
+    test_s8_explicit_off_restores_flat_lru(ng)
     test_s8_reload_on_to_off_drains_protected(ng)
     test_s8_scan_still_stores_and_evicts(ng)
     test_admin_stats(ng)
