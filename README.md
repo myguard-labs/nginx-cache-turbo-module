@@ -611,6 +611,48 @@ variant. On by default.
 > `cache_turbo_key`. (There is no `cache_turbo_vary_safe` refuse-to-store knob —
 > `auto_vary` is the supported mechanism.)
 
+#### `cache_turbo_vary_ignore` — opt out of one axis's refusal
+
+**Off by default (empty list).** `Vary: Accept` is very common on APIs and
+image CDNs, `X-Requested-With` still shows up, and `Sec-CH-*` client hints are
+an increasingly *default* origin behavior — none of them are on the safe
+whitelist above, so with plain `auto_vary` any one of them makes the whole
+response permanently uncacheable. `cache_turbo_vary_ignore` names the header(s)
+to drop from a response's `Vary` line **before** that whitelist/unknown-axis
+check runs, so the module behaves exactly as if the origin had never listed
+them:
+
+```nginx
+location / {
+    cache_turbo               main;
+    cache_turbo_auto_vary     on;
+    cache_turbo_vary_ignore   Accept Sec-CH-UA Save-Data;
+    proxy_pass                http://backend;
+}
+```
+
+Matching is case-insensitive against the tokens in the response `Vary` header
+(HTTP header names are case-insensitive and the origin's casing is not under
+your control).
+
+> ⚠ **This is a cache-correctness decision, not a free win.** Naming a header
+> here means you are telling the module that clients differing *only* on that
+> axis may share one cached body — even though the origin's own `Vary` line
+> said they should get different bodies. Only ignore an axis you have verified
+> the origin does not actually vary the *body* on for your traffic (a common
+> case: an origin that echoes `Vary: Accept` for content-negotiation
+> bookkeeping but always returns the same JSON shape). Ignoring an axis that
+> genuinely selects a different body will serve the wrong representation to
+> some clients — the same failure mode `auto_vary`'s refusal exists to prevent
+> (RFC 9110 §12.5.5).
+>
+> `cache_turbo_vary_ignore` can **never** be used to ignore `*`, `Cookie` or
+> `Authorization` — those three keep their dedicated privacy/security veto
+> regardless of this list, and the directive is rejected at config-load time
+> if you name one. It also never widens the built-in safe-axis whitelist: an
+> ignored token is *dropped*, not promoted to a keyed axis, so it still never
+> contributes to the variant key even implicitly.
+
 ## CMS backends (`cache_turbo_backend`)
 
 A page cache in front of a CMS has one classic footgun: cache a *logged-in* page,
@@ -1735,6 +1777,7 @@ http {
 | `cache_turbo_normalize_strip NAME...` | `server`, `location` | — | Extra query args to drop from `$cache_turbo_normalized_args` (trailing `*` = prefix; a bare `*` matches every name = drop all), on top of the built-ins. |
 | `cache_turbo_normalize_vary TOKEN...` | `server`, `location` | off | Append a variant bucket to `$cache_turbo_normalized_args`: `encoding` (br/gzip/identity) and/or `device` (mobile/desktop). |
 | `cache_turbo_auto_vary on\|off` | `server`, `location` | `on` | Read the response's own `Vary` header and split the cache by the named request header automatically. Safe whitelist: `Accept-Encoding`, `User-Agent` (device class), `Accept-Language` (primary-subtag class), `Origin` (raw — CORS boundary, never folded). `Vary: *`/`Cookie`/`Authorization` — **or any other header not on the whitelist** — ⇒ uncacheable (so an un-split Vary axis can never serve the wrong representation). Two-level, node-local keying. See [Auto-Vary](#auto-vary-read-the-response-vary). |
+| `cache_turbo_vary_ignore HEADER...` | `server`, `location` | off (empty) | Drop the named header(s) from a response's `Vary` line **before** `cache_turbo_auto_vary`'s whitelist/unknown-axis check — the ignored token is treated as if the origin never listed it: it does not contribute to the variant key and is **not** promoted into the safe whitelist. Case-insensitive. Only takes effect when `cache_turbo_auto_vary` is also on. **Cache-correctness override, not a free win** — only ignore an axis you have verified does not select a different body for your traffic; see the warning in [Auto-Vary](#cache_turbo_vary_ignore--opt-out-of-one-axiss-refusal). `*`, `Cookie` and `Authorization` are rejected at config time — their veto cannot be disabled this way. |
 
 > **The breaker is per-ZONE state driven by per-LOCATION policy — so its reopen
 > timing is "last reader decides".** The failure counter, the window anchor and

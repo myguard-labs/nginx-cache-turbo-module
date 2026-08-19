@@ -1280,6 +1280,12 @@ ngx_http_cache_turbo_merge_normalize(ngx_http_cache_turbo_loc_conf_t *conf,
     if (conf->key_cookies == NGX_CONF_UNSET_PTR) {
         conf->key_cookies = prev->key_cookies;
     }
+    /* cache_turbo_vary_ignore (P3-3): inherit UNSET-only, same as
+     * normalize_strip -- a location that sets its own list fully replaces the
+     * parent's rather than appending to it. */
+    if (conf->vary_ignore == NGX_CONF_UNSET_PTR) {
+        conf->vary_ignore = prev->vary_ignore;
+    }
     /* Vary suffix bitmask: inherit UNSET-only; the variable handler reads UNSET
      * as 0 (off), so v3-1 keys are unchanged unless a directive opts in. */
     if (conf->normalize_vary == NGX_CONF_UNSET) {
@@ -2744,6 +2750,66 @@ ngx_http_cache_turbo_normalize_vary(ngx_conf_t *cf, ngx_command_t *cmd,
     }
 
     clcf->normalize_vary = vary;
+
+    return NGX_CONF_OK;
+}
+
+
+/* "cache_turbo_vary_ignore Accept X-Requested-With ...;" (P3-3) — append
+ * header names that classify_vary() drops from a response's Vary header
+ * BEFORE the whitelist/unknown-axis check, i.e. treated as absent rather than
+ * safe: an ignored token contributes nothing to the variant key and does NOT
+ * get folded into the built-in safe-axis whitelist (Accept-Encoding/
+ * User-Agent/Accept-Language/Origin), which stays fixed. Off by default
+ * (nothing ignored) -- only takes effect once cache_turbo_auto_vary is also
+ * on, since that is the only caller of classify_vary().
+ *
+ * ⚠ Correctness override, not a free win: naming a header here is the
+ * operator asserting that clients differing only on that axis may share one
+ * cached body even though the origin's Vary line said otherwise. Cookie,
+ * Authorization and "*" are REJECTED at config time (see the loop below) --
+ * classify_vary() drops an ignored token before classify_token() ever runs,
+ * which is exactly where those three tokens' dedicated veto lives; silently
+ * accepting them here would let one directive line disable a
+ * security-relevant refusal (RFC 9110 12.5.5) rather than a keying
+ * optimisation, so they are refused outright instead of silently ignored. */
+char *
+ngx_http_cache_turbo_vary_ignore(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf)
+{
+    ngx_http_cache_turbo_loc_conf_t  *clcf = conf;
+    ngx_str_t                        *value, *s;
+    ngx_uint_t                        i;
+
+    if (clcf->vary_ignore == NULL || clcf->vary_ignore == NGX_CONF_UNSET_PTR) {
+        clcf->vary_ignore = ngx_array_create(cf->pool, 4, sizeof(ngx_str_t));
+        if (clcf->vary_ignore == NULL) {
+            return NGX_CONF_ERROR;
+        }
+    }
+
+    value = cf->args->elts;
+    for (i = 1; i < cf->args->nelts; i++) {
+        if ((value[i].len == 1 && value[i].data[0] == '*')
+            || (value[i].len == sizeof("Cookie") - 1
+                && ngx_strncasecmp(value[i].data, (u_char *) "Cookie",
+                                    value[i].len) == 0)
+            || (value[i].len == sizeof("Authorization") - 1
+                && ngx_strncasecmp(value[i].data, (u_char *) "Authorization",
+                                    value[i].len) == 0))
+        {
+            return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
+                "cache_turbo_vary_ignore \"%V\": refusing to ignore a "
+                "security-relevant Vary axis (\"*\", Cookie, Authorization "
+                "always veto caching)", &value[i]);
+        }
+
+        s = ngx_array_push(clcf->vary_ignore);
+        if (s == NULL) {
+            return NGX_CONF_ERROR;
+        }
+        *s = value[i];
+    }
 
     return NGX_CONF_OK;
 }

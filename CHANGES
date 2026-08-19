@@ -14,6 +14,19 @@ Changes with the nginx-cache-turbo-module (unreleased)
 
 Changes with the nginx-cache-turbo-module 1.1.0                 17 Aug 2026
 
+    *) Feature: cache_turbo_vary_ignore <header>... drops named headers from
+       a response's Vary line before cache_turbo_auto_vary's whitelist/
+       unknown-axis check, treating them as absent rather than safe. Real-
+       world Vary axes like Accept (common on APIs/image CDNs), Sec-CH-*
+       client hints and Save-Data are not on the built-in safe whitelist, so
+       auto_vary alone refuses such a response outright; this directive lets
+       an operator opt a specific header out of that refusal without
+       widening the whitelist itself. Off by default (nothing ignored); "*",
+       Cookie and Authorization are rejected at config time and can never be
+       ignored this way. This is a cache-correctness override the operator
+       opts into, not a free win -- see README's cache_turbo_vary_ignore
+       section.
+
     *) Behaviour change: cache_turbo_scan_resistant is now ON by default
        (protected_pct=80), where it was previously off. A stock install
        without the directive now gets segmented probation/protected LRU, so

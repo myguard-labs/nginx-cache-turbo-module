@@ -353,7 +353,7 @@ ngx_http_cache_turbo_header_filter_capture(ngx_http_request_t *r,
         ngx_uint_t  nocache = 0;
         ngx_uint_t  unsafe_axis = 0;
 
-        ngx_http_cache_turbo_classify_vary(r, &ctx->vary_bits, &nocache,
+        ngx_http_cache_turbo_classify_vary(r, clcf, &ctx->vary_bits, &nocache,
                                             &unsafe_axis);
         ctx->vary_nocache = nocache ? 1 : 0;
 

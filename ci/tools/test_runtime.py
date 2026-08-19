@@ -183,6 +183,10 @@ def run_all(ng: Nginx, origin: Origin,
     test_honor_ttl_clamped_to_max(ng, origin)              # STAB-5 TTL clamp
     test_vary_encoding_qvalue(ng, origin)
     test_auto_vary_unknown_axis_uncacheable(ng, origin)
+    test_vary_ignore_makes_named_axis_cacheable(ng, origin)           # P3-3
+    test_vary_ignore_negative_control_without_directive(ng, origin)   # P3-3
+    test_vary_ignore_axis_excluded_from_variant_key(ng, origin)       # P3-3
+    test_vary_ignore_does_not_disable_other_unknown_axes(ng, origin)  # P3-3
     test_refuse_vary_unsafe_counter(ng, origin)                        # P0-1
     test_refuse_vary_unsafe_excludes_named_vetoes(ng, origin)          # P0-1
     test_auto_vary_stale_marker_reachable(ng, origin)
