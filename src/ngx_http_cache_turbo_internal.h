@@ -168,7 +168,7 @@ ngx_int_t ngx_http_cache_turbo_shm_claim(ngx_http_cache_turbo_zone_t *z,
  * the origin without storing). A real entry (len > 0) or an in-flight stub
  * always returns NGX_OK without counting — refreshes are never re-gated. */
 ngx_int_t ngx_http_cache_turbo_shm_count_miss(ngx_http_cache_turbo_zone_t *z,
-    u_char *key_hash, uint32_t hash, ngx_int_t min_uses);
+    u_char *key_hash, uint32_t hash, ngx_int_t min_uses, time_t min_uses_window);
 
 /* S231-PERF-MISSLOCKS: merged count_miss()+claim() for the min_uses>1 &&
  * cache_turbo_lock-on cold path -- one zone-mutex hold, one rbtree descent,
@@ -196,8 +196,8 @@ ngx_int_t ngx_http_cache_turbo_shm_count_miss(ngx_http_cache_turbo_zone_t *z,
  * argument. l2_neg_check is intentionally NOT part of this merge; see the
  * definition's comment for why. */
 ngx_int_t ngx_http_cache_turbo_shm_resolve_miss(ngx_http_cache_turbo_zone_t *z,
-    u_char *key_hash, uint32_t hash, ngx_int_t min_uses, time_t lock_ttl,
-    uint64_t *owner, ngx_int_t *count_miss_rc,
+    u_char *key_hash, uint32_t hash, ngx_int_t min_uses, time_t min_uses_window,
+    time_t lock_ttl, uint64_t *owner, ngx_int_t *count_miss_rc,
     u_char **fresh_data, size_t *fresh_len);
 
 /* L2 negative memo (L13). See the L1 vtable `l2_neg_check` / `l2_neg_set`

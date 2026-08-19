@@ -46,6 +46,15 @@
 #define NGX_HTTP_CACHE_TURBO_MIN_USES_MIN  1
 #define NGX_HTTP_CACHE_TURBO_MIN_USES_MAX  32
 
+/* Bounds on cache_turbo_min_uses_window N (P3-6). 0 = OFF (disable windowing,
+ * miss_count persists until LRU eviction — v15 behavior). 1..86400 enables
+ * windowing; resets miss_count on access when `now - last_access > window`.
+ * The ceiling is 1 day. An operator typo of "3600" means 1 hour; 86400 means
+ * 1 day; there is no use case for windows longer than one day (a cache entry
+ * that has not been accessed in 24 hours is practically evicted anyway). */
+#define NGX_HTTP_CACHE_TURBO_MIN_USES_WINDOW_MIN  1
+#define NGX_HTTP_CACHE_TURBO_MIN_USES_WINDOW_MAX  86400
+
 /* Bounds on cache_turbo_l2_negative_ttl N (L13). 0 = OFF and is the default in
  * every preset -- this is NOT a preset band column, precisely because the memo
  * trades coherence for a round-trip and that trade must be opted into per
@@ -1234,6 +1243,20 @@ typedef struct {
      * regardless (the gate sits after the L2 consult). */
     ngx_int_t                min_uses;
 
+    /* cache_turbo_min_uses_window N (P3-6). Seconds to retain the miss_count
+     * on a counter node before resetting it. Without a window, miss_count
+     * persists for the lifetime of the counter node (reset only on LRU
+     * eviction), so two misses a week apart count the same as two a second
+     * apart, admitting genuine one-hit-wonders that happen to recur. With a
+     * window, a miss older than N seconds is discarded on the next access,
+     * forcing recent misses to drive the min_uses decision. 0 = OFF (the
+     * default, v15 behavior unchanged), meaning miss_count never resets until
+     * the node is evicted. The window applies when the node is read for a miss
+     * at the point miss_count is incremented, checking `now - last_access >
+     * window` using the last_access value BEFORE the current access updates it.
+     * Bounded by NGX_HTTP_CACHE_TURBO_MIN_USES_WINDOW_MAX (86400, 1 day). */
+    time_t                   min_uses_window;
+
     /* cache_turbo_l2_negative_ttl N (L13). Seconds to remember that an L2 GET
      * missed a key, so the next cold request for it skips the L2 round-trip
      * instead of paying a full RTT to be told "absent" again. 0 = OFF (the
@@ -2133,7 +2156,7 @@ struct ngx_cache_turbo_l1_backend_s {
      * NGX_OK without counting (a refresh of an already-cached key is never
      * re-gated). Only called when min_uses > 1. */
     ngx_int_t  (*count_miss)(ngx_http_cache_turbo_zone_t *z, u_char *key_hash,
-        uint32_t hash, ngx_int_t min_uses);
+        uint32_t hash, ngx_int_t min_uses, time_t min_uses_window);
 
     /* S231-PERF-MISSLOCKS: merged count_miss()+claim() -- see
      * ngx_http_cache_turbo_shm_resolve_miss()'s comment for the exact
@@ -2141,8 +2164,8 @@ struct ngx_cache_turbo_l1_backend_s {
      * (the case where count_miss() and claim() would otherwise run
      * back-to-back under two separate mutex holds on the same request pass). */
     ngx_int_t  (*resolve_miss)(ngx_http_cache_turbo_zone_t *z,
-        u_char *key_hash, uint32_t hash, ngx_int_t min_uses, time_t lock_ttl,
-        uint64_t *owner, ngx_int_t *count_miss_rc,
+        u_char *key_hash, uint32_t hash, ngx_int_t min_uses, time_t min_uses_window,
+        time_t lock_ttl, uint64_t *owner, ngx_int_t *count_miss_rc,
         u_char **fresh_data, size_t *fresh_len);
 
     /* L2 negative memo (L13). Both halves take the zone mutex internally.
