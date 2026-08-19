@@ -1,5 +1,23 @@
 Changes with the nginx-cache-turbo-module (unreleased)
 
+    *) Feature: cache_turbo_background_update_max N adds a zone-wide cap on
+       CONCURRENT background-refresh (stale-while-revalidate) subrequests.
+       Per-key single-flight already bounded regens for one key, but nothing
+       bounded the sum across keys sharing a zone: a synchronized mass
+       staleness event (a deploy, a mass purge, a restart touching a shared
+       TTL) could fire one background subrequest per stale key at once,
+       sending the origin as many concurrent requests as there are stale
+       keys while every client is served stale -- invisible to the module's
+       own metrics because each key still looks correctly single-flighted.
+       Default 0 (unlimited), preserving the previously-ungated behavior
+       byte-for-byte until an operator opts in with a cap sized to their
+       origin's real concurrent-regen budget. The live in-flight count is
+       exposed as bg_inflight in both stats formats (JSON and Prometheus)
+       so the cross-key total is now directly observable. Applies to every
+       background-refresh subrequest through the shared warm_one() chokepoint
+       -- both the SWR dice-winner's own bg-refresh and the admin warm
+       endpoint's ?url= warms against the same zone.
+
     *) Fix: the auto-Vary marker is now written through to L2 (Redis), keyed
        by the same marker hash the L1 marker uses, and consulted on an L1
        marker miss before falling back to a base-key L2 lookup that a varied

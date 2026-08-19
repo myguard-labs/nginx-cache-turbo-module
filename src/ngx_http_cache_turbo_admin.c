@@ -365,9 +365,9 @@ ngx_http_cache_turbo_admin_stats_prometheus(ngx_http_request_t *r,
     u_char     *p;
     size_t      len;
 
-    /* Twenty-three counters (*_total) + four gauges, each labelled by zone
+    /* Twenty-three counters (*_total) + five gauges, each labelled by zone
      * so one Prometheus job can scrape many zones. Exposition format
-     * 0.0.4. The per-metric budget must track the emitted count (27):
+     * 0.0.4. The per-metric budget must track the emitted count (28):
      * every metric line renders one %V (zone) + one %uA (value), so a
      * short multiplier could truncate the last line under a long zone
      * name. The fixed term covers the HELP/TYPE prose, which grows
@@ -380,8 +380,9 @@ ngx_http_cache_turbo_admin_stats_prometheus(ngx_http_request_t *r,
      * breaker_state HELP documents the numeric mapping since the
      * value itself is deliberately NOT a label, see the emit call
      * below; P0-1 added eight refuse_*_total counters, prose term
-     * bumped by ~1050 bytes for their HELP/TYPE lines). */
-    len = 4950 + 27 * zname.len + 27 * NGX_ATOMIC_T_LEN;
+     * bumped by ~1050 bytes for their HELP/TYPE lines; P3-7 added
+     * bg_inflight (gauge), prose term bumped by ~180 bytes). */
+    len = 5130 + 28 * zname.len + 28 * NGX_ATOMIC_T_LEN;
     p = ngx_pnalloc(r->pool, len);
     if (p == NULL) {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -468,7 +469,10 @@ ngx_http_cache_turbo_admin_stats_prometheus(ngx_http_request_t *r,
         "cache_turbo_breaker_opens_total{zone=\"%V\"} %uA\n"
         "# HELP cache_turbo_breaker_state Circuit breaker state (0=closed, 1=open, 2=half-open).\n"
         "# TYPE cache_turbo_breaker_state gauge\n"
-        "cache_turbo_breaker_state{zone=\"%V\"} %uA\n",
+        "cache_turbo_breaker_state{zone=\"%V\"} %uA\n"
+        "# HELP cache_turbo_bg_inflight Background-refresh subrequests currently in flight for this zone (cache_turbo_background_update_max cap).\n"
+        "# TYPE cache_turbo_bg_inflight gauge\n"
+        "cache_turbo_bg_inflight{zone=\"%V\"} %uA\n",
         &zname, st->hits, &zname, st->misses, &zname, st->stale_serves,
         &zname, st->refreshes, &zname, st->evictions,
         &zname, st->l2_hits, &zname, st->l2_misses, &zname, st->lock_waits,
@@ -484,7 +488,8 @@ ngx_http_cache_turbo_admin_stats_prometheus(ngx_http_request_t *r,
         &zname, st->origin_failures,
         &zname, st->breaker_opens,
         &zname, (ngx_atomic_uint_t) ngx_http_cache_turbo_brk_state(
-            (ngx_uint_t) st->breaker_state)) - p;
+            (ngx_uint_t) st->breaker_state),
+        &zname, st->bg_inflight) - p;
 
     return ngx_http_cache_turbo_send_body(r, NGX_HTTP_OK, &body,
         "text/plain; version=0.0.4; charset=utf-8",
@@ -513,8 +518,8 @@ ngx_http_cache_turbo_admin_stats_json(ngx_http_request_t *r,
                  "\"autotuned_beta\":,\"autotuned_load\":,"
                  "\"breaker_state\":\"\",\"breaker_opens\":,"
                  "\"sie_serves\":,\"breaker_serves\":,"
-                 "\"origin_failures\":}\n")
-          + 26 * NGX_ATOMIC_T_LEN
+                 "\"origin_failures\":,\"bg_inflight\":}\n")
+          + 27 * NGX_ATOMIC_T_LEN
           + sizeof("half-open") - 1;   /* longest _breaker_state_str value */
     p = ngx_pnalloc(r->pool, len);
     if (p == NULL) {
@@ -535,7 +540,7 @@ ngx_http_cache_turbo_admin_stats_json(ngx_http_request_t *r,
         "\"autotuned_load\":%uA,"
         "\"breaker_state\":\"%s\",\"breaker_opens\":%uA,"
         "\"sie_serves\":%uA,\"breaker_serves\":%uA,"
-        "\"origin_failures\":%uA}\n",
+        "\"origin_failures\":%uA,\"bg_inflight\":%uA}\n",
         st->hits, st->misses, st->stale_serves,
         st->refreshes, st->evictions, st->l2_hits, st->l2_misses,
         st->lock_waits, st->min_uses_skips, st->l2_neg_skips,
@@ -548,7 +553,8 @@ ngx_http_cache_turbo_admin_stats_json(ngx_http_request_t *r,
         ngx_http_cache_turbo_shm_breaker_state_str(
             (ngx_uint_t) st->breaker_state),
         st->breaker_opens,
-        st->sie_serves, st->breaker_serves, st->origin_failures) - p;
+        st->sie_serves, st->breaker_serves, st->origin_failures,
+        st->bg_inflight) - p;
 
     return ngx_http_cache_turbo_send_json(r, NGX_HTTP_OK, &body);
 }

@@ -702,6 +702,29 @@ typedef struct {
     ngx_atomic_t             refreshes;
     ngx_atomic_t             evictions;
 
+    /* P3-7: zone-wide count of background-refresh (SWR bg-update) subrequests
+     * currently in flight, gated by cache_turbo_background_update_max. Per-key
+     * single-flight (refreshing/refresh_lock_until above) caps regens for ONE
+     * key; nothing capped the SUM across keys, so a synchronized mass-expiry
+     * (deploy, mass purge, restart touching a shared TTL) could fire one
+     * background subrequest per stale key simultaneously — thousands of
+     * concurrent origin requests, invisible to per-key metrics because each
+     * key is still correctly single-flighted.
+     *
+     * ⚠ Incremented in ngx_http_cache_turbo_warm_one() only after the cap
+     * check passes and ngx_http_subrequest() has posted the subrequest.
+     * Decremented ONLY by a pool cleanup registered on the subrequest's OWN
+     * pool (sr->pool), never by a return-value check at the call site: once
+     * ngx_http_subrequest() succeeds, warm_one() has several early-return
+     * failure arms (anonymize failure, ctx alloc failure) that leave the
+     * subrequest posted and running while returning NGX_ERROR to the caller.
+     * A decrement keyed to warm_one()'s return value would never fire on
+     * those arms and would leak the counter — permanently wedging background
+     * refresh for the whole zone once bg_inflight saturates
+     * background_update_max. The cleanup fires exactly once, whether the
+     * subrequest finishes cleanly or one of those arms tears it down early. */
+    ngx_atomic_t             bg_inflight;
+
     /* L2 (Redis or memcached) outcome counters (v12): incremented on an L1
      * miss that consulted L2 — l2_hits when L2 held the object (filled L1),
      * l2_misses when it did not (went to origin). Zero when no L2 is
@@ -1004,6 +1027,13 @@ typedef struct {
     ngx_atomic_uint_t   sie_serves;
     ngx_atomic_uint_t   breaker_serves;
     ngx_atomic_uint_t   origin_failures;
+    /* P3-7: live count of background-refresh subrequests in flight right
+     * now (a gauge, not a counter -- goes up on fire, down on completion).
+     * Answers exactly the "invisible to the module's own metrics" gap the
+     * cap was added to close: an operator can see the cross-key total
+     * saturating cache_turbo_background_update_max, which no per-key
+     * metric could ever show. */
+    ngx_atomic_uint_t   bg_inflight;
 } ngx_http_cache_turbo_stats_t;
 
 
@@ -1216,6 +1246,15 @@ typedef struct {
      * stale-if-error for free. Off restores the old block-and-serve-fresh
      * winner. Mirrors proxy_cache_background_update (but default on here). */
     ngx_flag_t               background_update;
+
+    /* cache_turbo_background_update_max N (P3-7). Zone-wide cap on
+     * CONCURRENT background-refresh subrequests (z->sh->bg_inflight), across
+     * every key sharing the zone. warm_one() refuses to fire (falls back to
+     * a plain stale serve, no regen) once the cap is reached. 0 = unlimited
+     * (today's ungated behaviour, preserved as the default — see the
+     * directive handler for why 0 was chosen over a nonzero default). Only
+     * meaningful with background_update on; ignored otherwise. */
+    ngx_int_t                background_update_max;
 
     /* Cold-miss single-flight (v10). When on (default), the FIRST request to
      * cold-miss a key (no L1 node, L2 also misses) becomes the single
@@ -1571,6 +1610,19 @@ typedef struct {
      * so the pre-flush rescue path is reachable in a test without depending on
      * upstream connection-teardown timing. */
     ngx_flag_t               test_midbody_abort;
+    /* P3-7: force ngx_http_cache_turbo_warm_one()'s warm_anonymize() call to
+     * fail deterministically (module.c), so a test can exercise the
+     * "subrequest posted, ctx already seeded, then an early NGX_ERROR
+     * return before the subrequest completes" hazard that makes the
+     * bg_inflight decrement pool-cleanup-based rather than
+     * return-value-based -- see the bg_inflight field comment in module.h.
+     * Deliberately NOT the earlier ctx-alloc arm: forcing THAT
+     * reintroduces the ctx-less "body forwarded, main->count never
+     * dropped" hang s84 already fixed (see the ctx-alloc comment in
+     * warm_one()), which would test a known-fixed bug instead of this
+     * feature's own decrement. Without this hook the anonymize arm depends
+     * on real pool exhaustion, which is not reproducible on demand. */
+    ngx_flag_t               test_warm_ctx_fail;
 #endif
 
 

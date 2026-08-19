@@ -262,6 +262,16 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       offsetof(ngx_http_cache_turbo_loc_conf_t, background_update),
       NULL },
 
+    /* P3-7: zone-wide cap on concurrent background-refresh subrequests.
+     * 0 = unlimited (default; see conf->background_update_max init and the
+     * merge below for why 0 rather than a nonzero default was chosen). */
+    { ngx_string("cache_turbo_background_update_max"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_num_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_turbo_loc_conf_t, background_update_max),
+      NULL },
+
     { ngx_string("cache_turbo_lock"),
       NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_FLAG,
       ngx_conf_set_flag_slot,
@@ -482,6 +492,16 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       ngx_conf_set_flag_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_cache_turbo_loc_conf_t, test_store_fail),
+      NULL },
+
+    /* P3-7: force warm_one()'s warm_anonymize() call to fail (posted
+     * subrequest, ctx already seeded, early NGX_ERROR return) so the
+     * bg_inflight leak scenario is testable on demand. */
+    { ngx_string("cache_turbo_test_warm_ctx_fail"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_turbo_loc_conf_t, test_warm_ctx_fail),
       NULL },
 
     /* AUD-SCAN1: lower the SCAN-del page cap so the "abandon the walk and
@@ -3597,19 +3617,110 @@ ngx_http_cache_turbo_warm_anonymize(ngx_http_request_t *sr)
     return NGX_OK;
 }
 
+/* P3-7: cleanup record for the zone-wide bg_inflight decrement. Lives in
+ * sr->pool (the SUBREQUEST's own pool, not r->pool) so it runs exactly once
+ * when the subrequest's request object is freed -- whether that happens
+ * because the subrequest ran to completion or because one of warm_one()'s
+ * own failure arms below tears it down early. This is deliberately NOT a
+ * decrement keyed to warm_one()'s return value: ngx_http_subrequest()
+ * already posted the subrequest by the time any of those arms can fail, so
+ * a return-value decrement would never run on those paths and would leak
+ * the counter -- see the bg_inflight field comment in module.h. */
+typedef struct {
+    ngx_http_cache_turbo_zone_t  *z;
+} ngx_http_cache_turbo_bginflight_cln_t;
+
+static void
+ngx_http_cache_turbo_bginflight_cleanup(void *data)
+{
+    ngx_http_cache_turbo_bginflight_cln_t  *c = data;
+
+    (void) ngx_atomic_fetch_add(&c->z->sh->bg_inflight, -1);
+}
+
 /* Non-static: called from admin.c's warm dispatch too. */
 ngx_int_t
 ngx_http_cache_turbo_warm_one(ngx_http_request_t *r, ngx_str_t *uri,
     ngx_str_t *args)
 {
-    ngx_http_request_t          *sr;
-    ngx_http_cache_turbo_ctx_t  *wctx;
+    ngx_http_request_t                     *sr;
+    ngx_http_cache_turbo_ctx_t             *wctx;
+    ngx_http_cache_turbo_loc_conf_t        *clcf;
+    ngx_http_cache_turbo_zone_t            *z;
+    ngx_pool_cleanup_t                     *cln;
+    ngx_http_cache_turbo_bginflight_cln_t  *cc;
+
+    /* P3-7: `r` here is whichever request CALLED warm_one() -- the SWR
+     * dice-winner itself (access.c, r is the caching location) OR the admin
+     * warm endpoint (admin.c, r is the `cache_turbo_admin` location, which
+     * sets admin_zone, never shm_zone). Both name the SAME shared-memory
+     * zone in every real deployment (the admin endpoint manages the zone it
+     * warms into), so fall back to admin_zone when shm_zone is unset rather
+     * than silently treating an admin-triggered warm as capless. */
+    clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
+    if (clcf->shm_zone != NULL) {
+        z = clcf->shm_zone->data;
+    } else if (clcf->admin_zone != NULL) {
+        z = clcf->admin_zone->data;
+    } else {
+        z = NULL;
+    }
+
+    /* P3-7: zone-wide cap on concurrent background-refresh subrequests.
+     * 0 (the default) is the "unlimited" sentinel -- preserves the ungated
+     * behaviour that shipped before this directive existed, so an operator
+     * who has not read about the new knob sees no change. A nonzero cap
+     * checks-and-increments the atomic; if the zone is already at the cap
+     * this call refuses to fire and the caller's stale copy is served
+     * without a regen (the same outcome as a peer already holding the
+     * per-key single-flight lock -- no new failure mode). Checked BEFORE
+     * ngx_http_subrequest(): unlike the failure arms below, refusing here
+     * costs nothing to unwind because nothing has been posted yet. */
+    if (z != NULL && clcf->background_update_max != 0) {
+        for ( ;; ) {
+            ngx_atomic_uint_t  cur = *(volatile ngx_atomic_uint_t *)
+                                          &z->sh->bg_inflight;
+
+            if (cur >= (ngx_atomic_uint_t) clcf->background_update_max) {
+                return NGX_DECLINED;
+            }
+            if (ngx_atomic_cmp_set(&z->sh->bg_inflight, cur, cur + 1)) {
+                break;
+            }
+        }
+    }
 
     if (ngx_http_subrequest(r, uri, args->len ? args : NULL, &sr, NULL,
                             NGX_HTTP_SUBREQUEST_BACKGROUND)
         != NGX_OK)
     {
+        if (z != NULL && clcf->background_update_max != 0) {
+            (void) ngx_atomic_fetch_add(&z->sh->bg_inflight, -1);
+        }
         return NGX_ERROR;
+    }
+
+    /* Arm the bg_inflight decrement on the SUBREQUEST's pool, immediately
+     * after the subrequest is posted and before anything else that can fail.
+     * From this point on the subrequest is live and will eventually free
+     * sr->pool no matter which return path below is taken, so the cleanup is
+     * the only decrement site that cannot be skipped by an early return. */
+    if (z != NULL && clcf->background_update_max != 0) {
+        cln = ngx_pool_cleanup_add(sr->pool,
+                  sizeof(ngx_http_cache_turbo_bginflight_cln_t));
+        if (cln == NULL) {
+            /* Cannot arm the cleanup: undo the increment now, since nothing
+             * else will. The subrequest itself still runs (unthrottled by
+             * this cap for its remaining lifetime) rather than being torn
+             * down -- ngx_http_subrequest() has already posted it and it
+             * cannot be unwound, same rationale as the ctx-alloc failure
+             * below. */
+            (void) ngx_atomic_fetch_add(&z->sh->bg_inflight, -1);
+        } else {
+            cln->handler = ngx_http_cache_turbo_bginflight_cleanup;
+            cc = cln->data;
+            cc->z = z;
+        }
     }
 
     /* Seed the ctx FIRST, before anything below that can fail. A background
@@ -3619,7 +3730,12 @@ ngx_http_cache_turbo_warm_one(ngx_http_request_t *r, ngx_str_t *uri,
      * (ngx_http_cache_turbo_body_filter, ctx == NULL arm). A warm subrequest
      * whose body is forwarded rather than captured is the documented s84
      * shutdown-hang condition. Allocating the ctx up front means every failure
-     * arm below leaves a subrequest that is still recognisably ours. */
+     * arm below leaves a subrequest that is still recognisably ours.
+     *
+     * P3-7: NOTE this and the anonymize failure below are exactly the "return
+     * before the subrequest completes" arms the bg_inflight decrement must
+     * survive -- the cleanup armed above already covers them; nothing here
+     * touches the counter. */
     wctx = ngx_pcalloc(sr->pool, sizeof(ngx_http_cache_turbo_ctx_t));
     if (wctx == NULL) {
         return NGX_ERROR;
@@ -3628,8 +3744,23 @@ ngx_http_cache_turbo_warm_one(ngx_http_request_t *r, ngx_str_t *uri,
     ngx_http_set_ctx(sr, wctx, ngx_http_cache_turbo_module);
 
     /* Warm anonymously: strip inherited cookies so both the cache key and the
-     * upstream request are the cookieless anonymous variant a visitor gets. */
-    if (ngx_http_cache_turbo_warm_anonymize(sr) != NGX_OK) {
+     * upstream request are the cookieless anonymous variant a visitor gets.
+     *
+     * P3-7: this is the fault-injectable arm for the bg_inflight leak test,
+     * deliberately NOT the ctx-alloc arm just above. ctx is already seeded by
+     * this point, so a forced failure here still leaves the subrequest
+     * recognisably ours to the body filter and finalizes normally -- unlike
+     * forcing wctx == NULL, which reintroduces the ctx-less "body forwarded,
+     * main->count never dropped" condition s84 already fixed (see the
+     * comment on the ctx alloc above). Injecting THAT would test a
+     * known-fixed hang, not this feature's own decrement. */
+    if (ngx_http_cache_turbo_warm_anonymize(sr) != NGX_OK
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+        || clcf->test_warm_ctx_fail
+#endif
+       )
+    {
         return NGX_ERROR;
     }
 
@@ -4040,6 +4171,7 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->key_encoded_origin = NGX_CONF_UNSET;
     conf->purge = NGX_CONF_UNSET;
     conf->background_update = NGX_CONF_UNSET;
+    conf->background_update_max = NGX_CONF_UNSET;  /* P3-7; merges to 0 = unlimited */
     conf->surrogate_key = NGX_CONF_UNSET;
     conf->lock = NGX_CONF_UNSET;
     conf->lock_timeout = NGX_CONF_UNSET_MSEC;
@@ -4093,6 +4225,7 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->test_scan_page_hold_ms = NGX_CONF_UNSET;
     conf->test_l2_promote_hold_ms = NGX_CONF_UNSET;
     conf->test_midbody_abort = NGX_CONF_UNSET;
+    conf->test_warm_ctx_fail = NGX_CONF_UNSET;
 #endif
     /* shm_zone, key, redis_addr, redis_prefix default NULL via pcalloc */
 
