@@ -183,6 +183,39 @@ check_probe_layout() {
 }
 check_probe_layout
 
+# P2-3: pin the size of ngx_http_cache_turbo_node_t so it does not silently grow
+# or shrink and change which slab class it lands in. Measured with pahole; the
+# struct is currently 200 bytes and fits the 256B slab class. If a field is added
+# or the layout changes, this MUST be re-measured and the assertion below MUST be
+# updated to match the new reality.
+check_node_size() {
+    # Find the struct size from pahole output in one of the compiled objects.
+    # The struct is only in one TU at most, so try a few.
+    for obj in ./.build/nginx-*/objs/addon/src/ngx_http_cache_turbo_module.o; do
+        if [ ! -f "$obj" ]; then
+            continue
+        fi
+        size=$(pahole -C ngx_http_cache_turbo_node_t "$obj" 2>/dev/null \
+               | grep "/\* size:" | head -1 \
+               | sed -E 's/.*size:[[:space:]]*([0-9]+).*/\1/')
+        if [ -n "$size" ]; then
+            if [ "$size" != "200" ]; then
+                echo "✗ ngx_http_cache_turbo_node_t size changed: was 200 bytes," \
+                     "now $size bytes" >&2
+                echo "  Update this check, P4-3 assumptions, and the slab class" \
+                     "analysis in memory/PLAN-optimize.md" >&2
+                return 1
+            fi
+            return 0
+        fi
+    done
+    # If pahole is not available or the struct not found, fail rather than
+    # silently passing: this check is not optional.
+    echo "✗ could not measure ngx_http_cache_turbo_node_t size with pahole" >&2
+    return 1
+}
+check_node_size || exit 1
+
 # PERF-7: the blob refcount header is hand-mirrored into test_shm_state.c (the
 # harness declares its own structs rather than including module.h). CT_BLOBREF()
 # steps BACK by sizeof(that struct) from the blob pointer, so if the mirror ever
