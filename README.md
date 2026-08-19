@@ -699,6 +699,55 @@ there is no way to opt a single location out.
 > replacement — rather than accepting the word and enabling nothing, which on an
 > existing WordPress config would quietly start caching `/wp-admin/`.
 
+#### `cache_turbo_serve_authorized` — let credentialed requests read public entries
+
+**Off by default.** By default a request carrying an `Authorization` header is
+declined before the cache is even consulted, so a credentialed client can never
+read a cached entry — not even the anonymously stored, explicitly `public` copy
+of the very same URL. On an API that authenticates every call to a shareable
+public endpoint (`GET /v1/catalog` with `Authorization: Bearer …`), that makes
+the hit ratio **exactly zero**.
+
+`cache_turbo_serve_authorized on;` lifts the *lookup* refusal only:
+
+```nginx
+location /v1/catalog/ {
+    cache_turbo               main;
+    cache_turbo_valid         30s;
+    cache_turbo_serve_authorized on;
+    proxy_pass http://api;
+}
+```
+
+**What stays enforced.** Two independent guarantees remain, and both are
+required before a credentialed request is served anything:
+
+1. **Nothing stored under credentials, ever.** The store floor is untouched and
+   ungated by any directive: a response produced for a request that carried
+   `Authorization` is never captured, so no principal's private response is in
+   the cache to leak in the first place. Turning this directive on cannot
+   change what gets stored — only who may read what was already stored
+   anonymously.
+2. **RFC 9111 §3.5 reuse authorisation.** §3.5 permits reusing a stored
+   response for an authenticated request only when the response explicitly
+   allows it. The entry must have been stored carrying `Cache-Control: public`,
+   `s-maxage=…`, or `must-revalidate`/`proxy-revalidate`; anything else is
+   refused to a credentialed requester and falls through to the origin exactly
+   as on a miss. Entries stored before this feature existed carry no such mark
+   and are refused, so enabling the directive never retroactively exposes an
+   older entry.
+
+> ⚠️ **This widens who may read a cached body.** It is safe only if the
+> endpoint's `public` representation really is identical for every principal.
+> If the origin returns per-user data on a URL while still marking it `public`,
+> that is an origin bug — and this directive will faithfully share it. Leave it
+> off unless you have checked the endpoint, and prefer scoping it to the
+> specific `location` that serves shareable content rather than a whole server.
+
+Nothing about the `Vary` machinery changes: a response carrying
+`Vary: Authorization` still makes the entry uncacheable, and
+`cache_turbo_vary_ignore` still refuses to ignore that axis.
+
 ### What each preset skips
 
 A request is sent to the origin uncached if it matches **any** of three checks

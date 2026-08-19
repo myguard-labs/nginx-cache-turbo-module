@@ -248,6 +248,13 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       offsetof(ngx_http_cache_turbo_loc_conf_t, key_encoded_origin),
       NULL },
 
+    { ngx_string("cache_turbo_serve_authorized"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_turbo_loc_conf_t, serve_authorized),
+      NULL },
+
     { ngx_string("cache_turbo_purge"),
       NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_FLAG,
       ngx_conf_set_flag_slot,
@@ -1365,6 +1372,49 @@ ngx_http_cache_turbo_response_must_revalidate(ngx_http_request_t *r)
             || ngx_http_cache_turbo_cc_has_all(&r->headers_out.headers,
                 "Cache-Control", sizeof("Cache-Control") - 1,
                 "proxy-revalidate", sizeof("proxy-revalidate") - 1)) ? 1 : 0;
+}
+
+
+/*
+ * P3-4 / RFC 9111 §3.5: may a stored response be REUSED for a request that
+ * carried Authorization? A shared cache MUST NOT do so unless the response
+ * explicitly authorises it, which §3.5 spells out as one of:
+ *
+ *   - Cache-Control: public
+ *   - Cache-Control: s-maxage=<delta>   (any value; presence is the signal)
+ *   - Cache-Control: must-revalidate    (proxy-revalidate is its shared-cache
+ *                                        synonym, already folded into
+ *                                        response_must_revalidate())
+ *
+ * Evaluated at STORE time and recorded as a blob flag bit, exactly like
+ * BLOBF_ORIGIN_ENCODED: the serve path must not have to re-derive it from a
+ * response it no longer has. Note s-maxage=0 still counts as "authorised" here
+ * -- it is a freshness lifetime, not a permission, and response_cacheable()
+ * has already refused to store an s-maxage=0 response at all, so no blob can
+ * reach the serve path carrying it.
+ *
+ * ⚠ This is ONLY the §3.5 reuse authorisation. It says nothing about whether
+ * the entry was stored anonymously; that is guaranteed separately and
+ * unconditionally by response_cacheable()'s Authorization arm. Both hold.
+ */
+ngx_int_t
+ngx_http_cache_turbo_response_auth_shareable(ngx_http_request_t *r)
+{
+    if (ngx_http_cache_turbo_cc_has_all(&r->headers_out.headers,
+            "Cache-Control", sizeof("Cache-Control") - 1,
+            "public", sizeof("public") - 1))
+    {
+        return 1;
+    }
+
+    if (ngx_http_cache_turbo_cc_delta_all(&r->headers_out.headers,
+            "Cache-Control", sizeof("Cache-Control") - 1,
+            "s-maxage", sizeof("s-maxage") - 1) >= 0)
+    {
+        return 1;
+    }
+
+    return ngx_http_cache_turbo_response_must_revalidate(r);
 }
 
 
@@ -2659,6 +2709,43 @@ ngx_http_cache_turbo_serve(ngx_http_request_t *r, u_char *copy, size_t len,
         }
 
         /*
+         * P3-4 / RFC 9111 SS3.5: this request carries Authorization. It only
+         * got past access_eligible() because cache_turbo_serve_authorized is
+         * on for its location. Anonymity of the stored copy is already
+         * guaranteed (response_cacheable()'s unconditional Authorization arm
+         * gates ctx->captured, the sole store trigger), but SS3.5 also
+         * requires the RESPONSE to have authorised reuse for an authenticated
+         * request. Enforce that here, at the same chokepoint and with the same
+         * fail-closed discipline as BLOBF_BREAKER_ONLY: an entry stored
+         * WITHOUT public / s-maxage / must-revalidate is refused
+         * (NGX_DECLINED -> caller proceeds to origin exactly as on a miss),
+         * including every blob written before the bit existed, whose flags
+         * word has the bit clear.
+         *
+         * Checked on the request's OWN Authorization header rather than on a
+         * ctx flag, so it holds on every serve path (L1 hit, L2 fill, SWR,
+         * SIE, cold wait) and cannot be bypassed by a call site that forgot
+         * to thread the state through.
+         *
+         * Reads the SAME already-bounds-checked u16 the breaker check read;
+         * `len >= BLOB_HDR_WIRE` from the outer `if` covers this offset.
+         */
+        if (r->headers_in.authorization != NULL
+            && !(ngx_http_cache_turbo_get_u16(copy + 6)
+                 & NGX_HTTP_CACHE_TURBO_BLOBF_AUTH_SHAREABLE))
+        {
+            if (ref_data != NULL && cc != NULL) {
+                cc->data = NULL;
+                ngx_http_cache_turbo_blob_release(z, ref_data);
+            }
+            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                           "cache_turbo: entry \"%V\" lacks RFC 9111 3.5 "
+                           "reuse authorisation for a credentialed request "
+                           "-> origin", &r->uri);
+            return NGX_DECLINED;
+        }
+
+        /*
          * P3-2: enforce BLOBF_ORIGIN_ENCODED at this SAME chokepoint, right
          * beside BLOBF_BREAKER_ONLY, for the same reason -- every live serve
          * (L1 hit, L2 fill, stale-while-revalidate, cold wait, the breaker's
@@ -3173,6 +3260,21 @@ ngx_http_cache_turbo_sie_rewrite(ngx_http_request_t *r,
         && ctx->sie_snap_len >= NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE)
     {
         uint16_t  snap_flags = ngx_http_cache_turbo_get_u16(ctx->sie_snap + 6);
+
+        /* P3-4: the same RFC 9111 SS3.5 reuse gate serve() applies, for the
+         * same reason -- this is the other path a stored body can reach a
+         * client on, so leaving it out would serve a non-shareable entry to a
+         * credentialed requester whenever the SIE window opened. Fail closed
+         * on a missing bit, exactly as serve() does. */
+        if (r->headers_in.authorization != NULL
+            && !(snap_flags & NGX_HTTP_CACHE_TURBO_BLOBF_AUTH_SHAREABLE))
+        {
+            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                           "cache_turbo: SIE snapshot \"%V\" lacks RFC 9111 "
+                           "3.5 reuse authorisation for a credentialed "
+                           "request -> no SIE serve", &r->uri);
+            return NGX_DECLINED;
+        }
 
         if (snap_flags & NGX_HTTP_CACHE_TURBO_BLOBF_ORIGIN_ENCODED) {
             ngx_uint_t  class = (snap_flags
@@ -4169,6 +4271,7 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->cc_mode = NGX_CONF_UNSET_UINT;
     conf->auto_vary = NGX_CONF_UNSET;
     conf->key_encoded_origin = NGX_CONF_UNSET;
+    conf->serve_authorized = NGX_CONF_UNSET;
     conf->purge = NGX_CONF_UNSET;
     conf->background_update = NGX_CONF_UNSET;
     conf->background_update_max = NGX_CONF_UNSET;  /* P3-7; merges to 0 = unlimited */

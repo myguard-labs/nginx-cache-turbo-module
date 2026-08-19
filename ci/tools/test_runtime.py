@@ -157,6 +157,10 @@ def run_all(ng: Nginx, origin: Origin,
     test_refuse_set_cookie_counter(ng, origin)                # P0-1
     test_refuse_cache_control_counter(ng, origin)              # P0-1
     test_refuse_authorization_counter(ng, origin)               # P0-1
+    test_serve_authorized_reads_public_anonymous_entry(ng, origin)     # P3-4
+    test_serve_authorized_refuses_non_shareable_entry(ng, origin)      # P3-4
+    test_serve_authorized_never_stores_under_credentials(ng, origin)   # P3-4
+    test_serve_authorized_off_by_default_still_refuses_lookup(ng, origin)
     test_default_key_varies_by_host(ng)
     test_default_key_normalizes(ng)
     test_cache_redirect(ng)

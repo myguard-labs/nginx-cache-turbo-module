@@ -1546,6 +1546,34 @@ typedef struct {
      * that case). */
     ngx_flag_t               key_encoded_origin;
 
+    /* cache_turbo_serve_authorized (P3-4). The LOOKUP-side counterpart of the
+     * Authorization floor. By default a request carrying Authorization is
+     * declined in access_eligible() before any cache state is touched, so a
+     * credentialed client can never READ an entry -- even the anonymously
+     * stored, explicitly public copy of the very same URL. That costs every
+     * hit on an API that authenticates each call to a shareable public
+     * endpoint (hit ratio is exactly zero there today).
+     *
+     * When ON, an Authorization-bearing request is allowed to PROCEED to the
+     * lookup and may be served an already-stored entry. The STORE floor in
+     * ngx_http_cache_turbo_response_cacheable() is deliberately untouched:
+     * its `r->headers_in.authorization != NULL` arm is the FIRST test in the
+     * function, ungated by any directive, and ctx->captured (the sole gate on
+     * the body filter's store, filters.c) is only set when it returns true.
+     * So the set of entries this can expose is exactly the set stored by
+     * requests that carried NO credentials -- relaxing the read side cannot
+     * make a credentialed response reachable by anyone, because none is ever
+     * written in the first place.
+     *
+     * RFC 9111 SS3.5 additionally requires an explicit shared-cache
+     * authorisation to REUSE a stored response for an authenticated request,
+     * so serving is further gated at the serve site on the stored response
+     * carrying public / s-maxage / must-revalidate. Off by default: it widens
+     * who may read a cached body, and an operator must assert that the
+     * endpoint's public representation really is identical for every
+     * principal. */
+    ngx_flag_t               serve_authorized;
+
     /* cache_turbo_vary_ignore <header>... (P3-3). Header names (case-
      * insensitive match against tokens in a response Vary header) to drop
      * BEFORE classify_vary()'s whitelist/unsafe-axis check, i.e. treated as
@@ -1661,6 +1689,15 @@ typedef struct {
      * blob when origin_encoded_capture is set -- only meaningful then. 2
      * bits is enough (0..3), matching BLOBF_AE_CLASS_MASK's width. */
     unsigned                 origin_encoded_class:2;
+    /* P3-4: the response carried an RFC 9111 SS3.5 shared-cache reuse
+     * authorisation (public / s-maxage / must-revalidate). Resolved in the
+     * HEADER filter, where the response headers still exist, and consumed by
+     * the body filter to stamp BLOBF_AUTH_SHAREABLE -- the body filter runs
+     * after the headers have been sent and cannot re-derive it. Independent
+     * of whether serve_authorized is on anywhere: the bit is recorded on
+     * every stored blob so an operator can enable the directive later
+     * without invalidating the cache. */
+    unsigned                 auth_shareable:1;
     unsigned                 captured:1;  /* response captured for store    */
     unsigned                 served:1;    /* we served from cache           */
     unsigned                 warm:1;      /* warm subrequest: force a miss,  */

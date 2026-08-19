@@ -884,6 +884,10 @@ ngx_http_cache_turbo_merge_cc_and_bypass(
      * opt-in (it changes what gets captured, not just how it's keyed). */
     ngx_conf_merge_value(conf->key_encoded_origin, prev->key_encoded_origin,
                          0);
+    /* P3-4: off by default -- it widens WHO may read a cached body, so an
+     * operator must assert that the endpoint's public representation is
+     * identical for every principal. */
+    ngx_conf_merge_value(conf->serve_authorized, prev->serve_authorized, 0);
 #if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
     && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
     ngx_conf_merge_value(conf->test_restore_alloc_fail,

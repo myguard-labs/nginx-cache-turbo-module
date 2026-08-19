@@ -71,6 +71,156 @@ def test_no_cache_authorization(ng: Nginx) -> None:
     assert b1 != b2
 
 
+def test_serve_authorized_reads_public_anonymous_entry(
+        ng: Nginx, origin: Origin) -> None:
+    """P3-4: with cache_turbo_serve_authorized on (/sauth/), a credentialed
+    request may READ an anonymously-stored entry whose response carried an RFC
+    9111 SS3.5 reuse authorisation (`Cache-Control: public` via the ccpublic
+    marker). This is the whole point of the row: hit ratio on an API that
+    authenticates every call to a shareable public endpoint is exactly zero
+    under the default-off LOOKUP refusal.
+
+    Prime ANONYMOUSLY, then read WITH Authorization and require a real HIT.
+    The HIT is proved by the origin counter, not by body equality alone: the
+    origin body embeds a per-hit counter, so an unchanged origin hit count is
+    what distinguishes a cache HIT from a second origin contact that happened
+    to look similar."""
+    base = origin.hits_for("ccpublic-read")
+    p = "/sauth/ccpublic-read"
+    _, b1, h1 = fetch(ng.port, p)
+    assert "x-cache" not in h1, f"cold anonymous read should MISS, got {h1}"
+    assert origin.hits_for("ccpublic-read") - base == 1, origin.hits_for("ccpublic-read") - base
+
+    _, b2, h2 = fetch(ng.port, p, headers={"Authorization": "Bearer tok"})
+    assert h2.get("x-cache") == "HIT", (
+        "a credentialed request must be served the anonymously-stored public "
+        f"entry when serve_authorized is on, got x-cache={h2.get('x-cache')}")
+    assert b2 == b1, ("HIT served a different body than the primed entry",
+                      b1, b2)
+    assert origin.hits_for("ccpublic-read") - base == 1, (
+        "the credentialed read must be served from cache, not the origin",
+        origin.hits_for("ccpublic-read") - base)
+
+
+def test_serve_authorized_refuses_non_shareable_entry(
+        ng: Nginx, origin: Origin) -> None:
+    """P3-4 MANDATORY NEGATIVE CONTROL: a response that is storable but carries
+    NO RFC 9111 SS3.5 reuse authorisation (no public / s-maxage /
+    must-revalidate -- the plain /sauth/ marker, cacheable only via
+    cache_turbo_valid) must still be REFUSED to a credentialed requester, even
+    though serve_authorized is on for this location.
+
+    Without the BLOBF_AUTH_SHAREABLE serve gate this would HIT, which is
+    exactly the over-relaxation the row must not ship: SS3.5 permits reuse for
+    an authenticated request only when the RESPONSE authorised it, not merely
+    because the stored copy happens to be anonymous.
+
+    The anonymous prime + anonymous HIT first proves the entry really IS
+    stored and serveable -- otherwise the credentialed miss below would pass
+    vacuously against an empty cache."""
+    base = origin.hits_for("plain-nonshareable")
+    p = "/sauth/plain-nonshareable"
+    _, b1, h1 = fetch(ng.port, p)
+    assert "x-cache" not in h1, f"cold anonymous read should MISS, got {h1}"
+    _, b2, h2 = fetch(ng.port, p)
+    assert h2.get("x-cache") == "HIT" and b2 == b1, (
+        ("the entry must be stored and anonymously serveable, or the "
+         "credentialed assertion below proves nothing"), h2)
+    assert origin.hits_for("plain-nonshareable") - base == 1, origin.hits_for("plain-nonshareable") - base
+
+    _, b3, h3 = fetch(ng.port, p, headers={"Authorization": "Bearer tok"})
+    assert h3.get("x-cache") != "HIT", (
+        "a credentialed request was served an entry with NO RFC 9111 SS3.5 "
+        "reuse authorisation -- the BLOBF_AUTH_SHAREABLE serve gate failed "
+        f"open, x-cache={h3.get('x-cache')}")
+    assert b3 != b1, (
+        "the credentialed request received the stored non-shareable body",
+        b1, b3)
+    assert origin.hits_for("plain-nonshareable") - base == 2, (
+        "the refused credentialed request must fall through to the origin",
+        origin.hits_for("plain-nonshareable") - base)
+
+
+def test_serve_authorized_never_stores_under_credentials(
+        ng: Nginx, origin: Origin) -> None:
+    """P3-4 MANDATORY CROSS-PRINCIPAL CONTROL: a response produced FOR a
+    credentialed request is never stored, so it can never be served to a
+    different principal -- even on a location with serve_authorized on, and
+    even when the origin marks it `public`.
+
+    This pins the guarantee the whole relaxation rests on: serve_authorized
+    lifts only the LOOKUP gate in access_eligible(). The STORE floor
+    (response_cacheable()'s Authorization arm) is the function's first test,
+    ungated by any directive, and ctx->captured -- the sole trigger for the
+    body filter's store -- is only set when it returns true.
+
+    Principal A fetches COLD with credentials (nothing cached). If that
+    response were stored, principal B (a different token, and then an
+    anonymous client) would be served A's bytes. Both must instead reach the
+    origin and get their own distinct body."""
+    base = origin.hits_for("ccpublic-cold-auth")
+    p = "/sauth/ccpublic-cold-auth"
+    _, a_body, ha = fetch(ng.port, p, headers={"Authorization": "Bearer AAA"})
+    assert "x-cache" not in ha, f"cold credentialed read must MISS, got {ha}"
+    assert origin.hits_for("ccpublic-cold-auth") - base == 1, origin.hits_for("ccpublic-cold-auth") - base
+
+    _, b_body, hb = fetch(ng.port, p, headers={"Authorization": "Bearer BBB"})
+    assert hb.get("x-cache") != "HIT", (
+        "principal B was served a cache HIT on a URL only ever fetched under "
+        f"principal A's credentials -- the store floor leaked, x-cache={hb.get('x-cache')}")
+    assert b_body != a_body, (
+        "principal B received principal A's credentialed response body",
+        a_body, b_body)
+
+    _, anon_body, hanon = fetch(ng.port, p)
+    assert hanon.get("x-cache") != "HIT", (
+        "an anonymous client was served a cache HIT on a URL only ever "
+        f"fetched under credentials, x-cache={hanon.get('x-cache')}")
+    assert anon_body != a_body, (
+        "an anonymous client received a credentialed response body",
+        a_body, anon_body)
+    assert origin.hits_for("ccpublic-cold-auth") - base == 3, (
+        ("every one of the three requests must reach the origin (nothing "
+         "was ever stored)"), origin.hits_for("ccpublic-cold-auth") - base)
+
+
+def test_serve_authorized_off_by_default_still_refuses_lookup(
+        ng: Nginx, origin: Origin) -> None:
+    """P3-4: the COMPILED-IN DEFAULT. /c/ sets no cache_turbo_serve_authorized
+    directive at all, so this exercises the merge default rather than an
+    explicit `off` -- a location that opted out explicitly would pass even if
+    the default had been flipped to on, so only a directive-free location can
+    prove the default is still off.
+
+    Same shape as test_no_cache_authorization's primed arm, kept separate so
+    the P3-4 default has its own named guard: prime anonymously, then a
+    credentialed request must NOT be served that entry.
+
+    The path carries the `ccpublic` marker DELIBERATELY. Two independent
+    guards can refuse a credentialed serve -- this LOOKUP gate, and the
+    RFC 9111 SS3.5 BLOBF_AUTH_SHAREABLE gate at the serve chokepoint -- and a
+    plain (non-public) entry is refused by the SECOND one no matter what the
+    first does. Against such a path this test passes even with the default
+    flipped to on, i.e. it would assert nothing: verified by mutation, the row
+    SURVIVED. Priming with `public` satisfies the SS3.5 gate, so the lookup
+    gate is the only thing left to fail, and the assertion becomes reachable."""
+    base = origin.hits_for("p34-default-off-ccpublic")
+    p = "/c/p34-default-off-ccpublic"
+    _, anon, _ = fetch(ng.port, p)
+    _, anon_hit, hp = fetch(ng.port, p)
+    assert hp.get("x-cache") == "HIT" and anon_hit == anon, (
+        ("the anonymous entry must be primed, or the assertion below is "
+         "vacuous"), hp)
+    assert origin.hits_for("p34-default-off-ccpublic") - base == 1, origin.hits_for("p34-default-off-ccpublic") - base
+
+    _, auth_body, ha = fetch(ng.port, p, headers={"Authorization": "Bearer x"})
+    assert "x-cache" not in ha, (
+        "with no cache_turbo_serve_authorized directive the LOOKUP refusal "
+        f"must still apply, got x-cache={ha.get('x-cache')}")
+    assert auth_body != anon, "the credentialed request did not reach the origin"
+    assert origin.hits_for("p34-default-off-ccpublic") - base == 2, origin.hits_for("p34-default-off-ccpublic") - base
+
+
 def test_default_key_varies_by_host(ng: Nginx) -> None:
     """Default key (no cache_turbo_key) is $host$request_uri: the same path
     under two Host headers must NOT collide (cross-vhost poisoning guard)."""
