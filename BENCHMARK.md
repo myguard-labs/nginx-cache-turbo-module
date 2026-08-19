@@ -177,7 +177,8 @@ nothing else. It deliberately omits:
 - **Network reality** — loopback has no RTT, no loss, no TLS, no real client
   concurrency mix.
 - **Real key distributions** — production traffic is many keys with a long tail,
-  not one hot key.
+  not one hot key. See [`tools/zipfbench.sh`](#zipf-multi-key-hit-ratio--throughput-harness)
+  below for the harness that covers this.
 - **Cross-box L2 behaviour** — the whole point of the Redis tier, untestable on
   one host.
 
@@ -186,10 +187,117 @@ not this one.
 
 ---
 
+## Zipf multi-key hit-ratio + throughput harness
+
+`bench.sh` above answers "how fast is a hit"; it cannot answer "how often do we
+get one" — it primes every key first, so HIT % is ~100 % by construction on a
+single hot key. [`tools/scanbench.sh`](ci/tools/scanbench.sh) covers one specific
+churn shape (a one-shot crawl against a hot set). Neither exercises a real
+multi-key request distribution, so neither can validate anything that depends on
+*which* key gets evicted: admission policy, eviction ordering, or working-set
+sizing. [`tools/zipfbench.sh`](ci/tools/zipfbench.sh) fills that gap.
+
+It drives a **Zipf(s)-distributed** stream of requests over a configurable
+key-space — a small number of keys take most of the traffic, with a long tail,
+the shape real cache traffic actually has — from **multiple concurrent
+workers** (`xargs -P`, real parallel `curl` processes, not a serial loop), with
+**no priming pass**: whatever misses, misses, because the distribution and the
+zone size say it should.
+
+### What it measures
+
+- **HIT ratio** — from the edge access log's `$cache_turbo_status` field (a
+  logging variable; an `add_header` readback of it is documented elsewhere in
+  this file as unreliable on the deciding request, so the harness reads the
+  log the same way `scanbench.sh` does).
+- **p50 / p99 latency** — from `curl -w '%{time_total}'` per request.
+- **Origin request count** — read from the **origin's own access log**, not
+  inferred from the edge's status counts. This is the number that matters
+  most: it is the real offload figure, and an edge-side HIT/MISS tally can be
+  wrong under concurrent fills or a status variable that races the response
+  write. The origin log has no cache-status field at all — it is ground truth
+  for "did a request reach the backend", independent of what the edge believes
+  about itself.
+
+### How to run it
+
+```console
+$ eval "$(ci/tools/ci-build.sh nginx 1.31.3 nginx)"     # exports binary= module=
+$ KEYS=5000 ZIPF_S=1.0 ZONE=8m WORKERS=8 REQS=20000 \
+  ci/tools/zipfbench.sh "$binary" "$module"
+```
+
+| var | meaning | default |
+|---|---|---|
+| `KEYS`    | size of the key-space | `5000` |
+| `ZIPF_S`  | Zipf exponent — higher = more skewed toward a few hot keys | `1.0` |
+| `ZONE`    | `cache_turbo_zone` size | `8m` |
+| `BODY`    | body bytes per key | `2048` |
+| `WORKERS` | concurrent client workers | `8` |
+| `REQS`    | total requests issued | `20000` |
+| `PASSES`  | measured passes, reports the median | `1` |
+
+### Choosing parameters
+
+`KEYS * BODY` vs `ZONE` is the knob that puts a run into or out of the eviction
+regime **on purpose**:
+
+- `KEYS * BODY` well under `ZONE` → the whole key-space fits, nothing is
+  evicted — useful as the *fitting* baseline arm of a comparison.
+- `KEYS * BODY` well over `ZONE`, or a flatter `ZIPF_S` (closer to 0, less
+  skewed) → the working set overflows the zone and eviction/admission policy
+  is actually exercised — the *overflowing* arm.
+
+A real discrimination run pairs the two: same `KEYS`/`BODY`/`WORKERS`/`REQS`,
+`ZONE` sized to hold the working set in one arm and deliberately too small in
+the other, and reads the HIT ratio gap between them.
+
+**Reference pair** (nginx 1.31.3, `stock -O` build, loopback, `WORKERS=8`,
+`BODY=2048`, `REQS=8000`, single pass, 2026-08-19):
+
+| arm | KEYS | ZIPF_S | ZONE | HIT ratio | origin requests |
+|---|--:|--:|--:|--:|--:|
+| fitting | 200 | 1.0 | 8m | **97.5 %** | 200 / 8000 |
+| overflowing | 5000 | 0.7 | 256k | **7.0 %** | 7444 / 8000 |
+
+The 90-point gap is the harness discriminating on a real configuration
+difference, not noise — same request count, same body size, same worker count,
+only the zone-vs-working-set ratio changed. (Note it does not read a clean
+100 % even in the fitting arm: with no priming pass, the first request to any
+key is always a MISS, so a fully-resident zone still shows a small, expected
+miss floor near `KEYS / REQS`.)
+
+### ⚠ Two self-invalidation traps — copied from `scanbench.sh`
+
+Both were hit while writing this harness. Both produce a plausible-looking
+number that actually means the run measured **nothing**:
+
+1. **`ZONE` far bigger than `KEYS * BODY`.** The whole key-space fits, nothing
+   is ever evicted, HIT ratio saturates near 100 % regardless of `ZIPF_S` or
+   whatever admission policy is under test. A "100 % HIT, looks great" result
+   here proves the harness isn't exercising eviction at all — not that the
+   config being compared is good.
+2. **`ZONE` far smaller than the Zipf head, or `REQS` too low** for the hot
+   keys to repeat before their first eviction. The effective working set never
+   survives long enough to register a HIT, and every arm reads ~0 % regardless
+   of what's being compared.
+
+**A result of 0-vs-0 or 100-vs-100 between two configurations you expected to
+differ means "re-tune `ZONE`/`KEYS`/`ZIPF_S`/`REQS`", never "no effect".** The
+script detects both degenerate bands itself (HIT ≤ 0.5 % or ≥ 99.5 %) and exits
+non-zero with `INVALID RUN` instead of printing a clean-looking number, so a
+mis-tuned run cannot be mistaken for a real result further down the pipeline.
+
+---
+
 ## See also
 
 - [README.md](README.md) — what the module is, every directive, configuration.
-- [`tools/bench.sh`](ci/tools/bench.sh) — this harness.
+- [`tools/bench.sh`](ci/tools/bench.sh) — pure-hit throughput/latency harness.
+- [`tools/scanbench.sh`](ci/tools/scanbench.sh) — scan-resistance under a
+  one-shot crawl against a hot set.
+- [`tools/zipfbench.sh`](ci/tools/zipfbench.sh) — Zipf multi-key hit-ratio,
+  throughput and origin-offload harness (this section).
 - [`tools/soak.sh`](ci/tools/soak.sh) — correctness/stability soak under ASAN/valgrind.
 - [Monitoring (Prometheus + Grafana)](README.md#monitoring-prometheus--grafana)
   — the same counters bench.sh reads for its HIT % column.
