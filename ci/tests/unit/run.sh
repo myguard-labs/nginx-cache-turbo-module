@@ -54,6 +54,17 @@ bash "$DIR/extract_key_fold.sh"
 "$CC" $CFLAGS "$DIR/test_key_fold.c" -o "$DIR/test_key_fold" -lssl -lcrypto
 "$DIR/test_key_fold"
 
+# --- auto-Vary marker fast-path magic/version gate (P1-6) ------------------
+# Mirror of the old blob_validate()-gated read vs. the new cheap
+# magic+version+length gate in ngx_http_cache_turbo_vary_apply() -- proves
+# the fast path accepts a superset containing every real marker shape (legacy
+# 1-byte and current 2-byte) with byte-identical (bits, gen), and that a
+# truncated / bad-magic / bad-version marker is still rejected by both. See
+# the header comment in test_vary_marker_fastpath.c for the divergence proof.
+# shellcheck disable=SC2086
+"$CC" $CFLAGS "$DIR/test_vary_marker_fastpath.c" -o "$DIR/test_vary_marker_fastpath"
+"$DIR/test_vary_marker_fastpath"
+
 # --- EVP digest failure path (AUD-DIGEST-ZERO) ----------------------------
 # Unit test for the fail-closed digest handling. Tests that EVP failures are
 # propagated to callers instead of silently producing all-zero keys.

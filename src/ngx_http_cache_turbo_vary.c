@@ -674,19 +674,47 @@ ngx_http_cache_turbo_vary_apply(ngx_http_request_t *r,
         && m->len >= NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE + 1
         && (m->stale_until == 0 || ngx_time() < m->stale_until))
     {
-        /* Validate the marker's blob magic+version before trusting the bits byte
-         * (the marker key folds "varymark" so a real object can't normally land
-         * here, but a hash collision must not be read as an axis bitmask). The
-         * 1-byte body sits just past the fixed wire header. */
-        ngx_http_cache_turbo_blob_hdr_t  mh;
-        if (ngx_http_cache_turbo_blob_validate(m->data, m->len, &mh, NULL, NULL,
-                                               NULL, NULL)
-            == NGX_OK)
+        /* P1-6 (S231-PERF-VARYMAGIC): validate magic+version directly instead
+         * of calling ngx_http_cache_turbo_blob_validate(), which additionally
+         * walks the header-block TLV entries to decode/verify fields (status,
+         * created, stale_ttl, nheaders, the header block itself) that this
+         * caller never reads and immediately discards (pool == NULL, refs_out
+         * == NULL). The marker blob has a fixed shape written only by
+         * ngx_http_cache_turbo_marker_store(): headers_len == 0 (bh is
+         * ngx_memzero'd and never sets it), so there is no TLV block to walk,
+         * and the two body bytes this function reads sit at the FIXED offsets
+         * NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE / +1, immediately after the
+         * fixed-size (44-byte) wire header -- independent of headers_len,
+         * nheaders or anything the TLV walk computes. Reading them safely
+         * requires exactly three things, all proven here: the magic matches
+         * (blob_validate's own first check), the version matches (ditto), and
+         * the buffer is at least HDR_WIRE + 1 byte (the `m->len >=
+         * HDR_WIRE + 1` guard above, identical to what the outer `if` already
+         * required before calling blob_validate) -- the bits-byte offset is
+         * the same offset blob_validate would have proven safe via its
+         * unconditional `len >= HDR_WIRE` check, since it lies exactly one
+         * byte past the fixed header-sized prefix.
+         *
+         * A hash collision landing a real (non-marker) object blob under this
+         * marker key still carries valid magic+version (same writer,
+         * ngx_http_cache_turbo_blob_hdr_write()), so the extended
+         * status/created/stale_ttl/TLV checks blob_validate performs never
+         * actually distinguished a collision from a marker in practice --
+         * they only ever rejected genuine corruption/truncation, which magic
+         * + version + length continue to reject exactly as before. A
+         * corrupt/truncated marker (bad magic, unknown version, or too short)
+         * still leaves bits==0/gen==0, same fallthrough-to-base-key-miss
+         * behaviour as the old blob_validate()-gated path. */
+        if (ngx_http_cache_turbo_get_u32(m->data)
+                == NGX_HTTP_CACHE_TURBO_BLOB_MAGIC
+            && ngx_http_cache_turbo_get_u16(m->data + 4)
+                   == NGX_HTTP_CACHE_TURBO_BLOB_VERSION)
         {
             bits = m->data[NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE];
             /* COR-5: the purge generation lives in the 2nd body byte. Older
              * 1-byte markers (pre-COR-5, still warm in L1 after upgrade) lack
-             * it => treat as gen 0. */
+             * it => treat as gen 0. Same `len >= HDR_WIRE + 2` bounds check
+             * as the old code before reading the 2nd body byte. */
             if (m->len >= NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE + 2) {
                 gen = m->data[NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE + 1];
             }
