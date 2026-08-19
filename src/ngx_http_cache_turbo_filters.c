@@ -1644,7 +1644,7 @@ ngx_http_cache_turbo_body_filter_store_tail(ngx_http_request_t *r,
      * the base key so the next request resolves straight to this variant
      * (node-local; self-heals if evicted). */
     if (clcf->auto_vary && ctx->vary_bits > 0) {
-        ngx_http_cache_turbo_marker_store(clcf, z, &ctx->cache_key,
+        ngx_http_cache_turbo_marker_store(r, clcf, z, &ctx->cache_key,
                                           ctx->vary_bits, ctx->vary_gen,
                                           ttl);
 

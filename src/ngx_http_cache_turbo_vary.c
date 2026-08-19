@@ -571,7 +571,8 @@ ngx_http_cache_turbo_variant_index_name(ngx_str_t *base, u_char *buf)
  * validate the magic before trusting the byte. L1-only and node-local by design
  * (see the loc_conf auto_vary comment); shm store copies the stack blob in. */
 void
-ngx_http_cache_turbo_marker_store(ngx_http_cache_turbo_loc_conf_t *clcf,
+ngx_http_cache_turbo_marker_store(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf,
     ngx_http_cache_turbo_zone_t *z, ngx_str_t *base, ngx_int_t bits,
     ngx_uint_t gen, time_t ttl)
 {
@@ -579,6 +580,7 @@ ngx_http_cache_turbo_marker_store(ngx_http_cache_turbo_loc_conf_t *clcf,
     u_char                           blob[NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE
                                           + 2];
     ngx_http_cache_turbo_blob_hdr_t  bh;
+    time_t                           retain_ttl;
 
     ngx_memzero(&bh, sizeof(bh));
     /* A marker is a blob, so it must satisfy the blob contract: since AUD-HDR1
@@ -602,9 +604,26 @@ ngx_http_cache_turbo_marker_store(ngx_http_cache_turbo_loc_conf_t *clcf,
 
     ngx_http_cache_turbo_marker_hash(base, mk);
 
+    retain_ttl = ngx_http_cache_turbo_stale_ttl(ttl, clcf->stale_mult);
+
     (void) clcf->l1->store(z, mk, ngx_crc32_short(mk, 32),
-               blob, sizeof(blob), ttl,
-               ngx_http_cache_turbo_stale_ttl(ttl, clcf->stale_mult));
+               blob, sizeof(blob), ttl, retain_ttl);
+
+    /* P3-5: write the marker through to L2 too, keyed by marker_hash (the
+     * SAME key a marker-cold consult GETs -- see access_l2_marker_get()).
+     * The L1 store above is node-local by design (see the loc_conf
+     * auto_vary comment); this is what lets a DIFFERENT node, cold for this
+     * marker (fresh boot, LRU-evicted marker node), still learn "this base
+     * URL has a classified variant" from L2 instead of falling straight
+     * through to an unpopulated base-key L2 GET. Fire-and-forget async SET,
+     * same as the L9 tag_add write-through a few lines below this call site
+     * in filters.c -- never on the request's blocking path, and NULL-safe
+     * (memcached's vtable has no atomic SADD/SMEMBERS for the variant
+     * index, but `set` IS implemented on both backends, so this write-through
+     * is not gated on backend->tag_add the way the variant index is). */
+    if (clcf->backend && clcf->backend->set && r != NULL) {
+        clcf->backend->set(r, clcf, mk, blob, sizeof(blob), ttl, retain_ttl);
+    }
 }
 
 
@@ -732,6 +751,16 @@ ngx_http_cache_turbo_vary_apply(ngx_http_request_t *r,
         ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "cache_turbo: auto-Vary marker hit \"%V\" bits=0x%xi "
                        "-> variant key", &r->uri, bits);
+
+    } else {
+        /* P3-5: the L1 marker MISSED. key_hash is still the base key, and a
+         * cold node (restart, LRU-evicted marker node) cannot tell from L1
+         * alone whether a peer already classified + stored a variant for
+         * this URL in L2 -- flag it so the L2 phase can consult the marker's
+         * OWN L2-backed copy (marker_hash-keyed, written through by
+         * marker_store) before falling back to a base-key L2 GET that a
+         * varied URL's base slot never populates. */
+        ctx->vary_marker_l1_miss = 1;
     }
 }
 

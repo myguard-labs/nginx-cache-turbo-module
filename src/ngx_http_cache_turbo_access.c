@@ -1233,6 +1233,25 @@ ngx_http_cache_turbo_access_l1(ngx_http_request_t *r,
         ngx_http_cache_turbo_vary_apply(r, clcf, z, ctx, &hash);
     }
 
+    /* P3-5: re-derive an L2-resolved variant on EVERY entry, exactly the way
+     * vary_apply() just re-derived an L1-resolved one above -- see the field
+     * comment on ctx->vary_marker_l2_bits for why this cannot instead rely
+     * on the ctx->key_hash rewrite made at consult time surviving: build_key()
+     * (called at the top of every access_prologue(), i.e. every re-entry of
+     * this whole handler after a park) unconditionally resets ctx->key_hash
+     * to the base key first. Only runs when vary_apply() did NOT already
+     * resolve bits from L1 (an L1 hit is authoritative and always wins; an
+     * L2-cached resolution from an EARLIER pass of this same request must
+     * never override a marker that has since appeared in L1, e.g. via this
+     * very self-heal). */
+    if (clcf->auto_vary && ctx->vary_marker_l2_bits > 0 && hash == *hashp) {
+        ngx_http_cache_turbo_variant_hash(r, &ctx->cache_key,
+            ctx->vary_marker_l2_bits, ctx->vary_marker_l2_gen,
+            ctx->key_hash);
+        hash = ngx_crc32_short(ctx->key_hash, 32);
+        ctx->vary_gen = ctx->vary_marker_l2_gen;
+    }
+
     ctn = clcf->l1->lookup(z, ctx->key_hash, hash);
 
     if (ctn != NULL) {
@@ -1319,6 +1338,185 @@ ngx_http_cache_turbo_access_l1(ngx_http_request_t *r,
     return NGX_DECLINED;
 }
 
+
+
+/* P3-5 phase helper for ngx_http_cache_turbo_access_l2().
+ * PHASE 0 -- L2-backed vary marker consult, extracted whole.
+ *
+ * Only fires when vary_apply() (access_l1, still under the zone mutex)
+ * flagged an L1 marker MISS (ctx->vary_marker_l1_miss) -- i.e. auto_vary is
+ * on and key_hash is still the BASE key. On a warm marker (the common case)
+ * this function is never called at all, so the warm path pays no extra L2
+ * round trip; see the caller.
+ *
+ * The marker GET reuses ngx_cache_turbo_backend_t.get(), which always reads
+ * ctx->key_hash -- there is no key-parametrised variant of get(). We
+ * therefore point key_hash at ctx->vary_marker_key (the SAME marker_hash key
+ * marker_store() writes through to L2), issue the GET, and restore key_hash
+ * to the base key before returning either way. This is safe: both backend
+ * get() implementations copy the key bytes into their own async op's buffer
+ * synchronously, before this function returns/parks (redis.c
+ * ngx_http_cache_turbo_redis_get / memcached.c ..._memcached_get both build
+ * their wire key from key_hash inline, not by holding a pointer into ctx),
+ * so nothing downstream can observe key_hash mid-flight with the marker
+ * value still in it once this function returns.
+ *
+ * The result of the marker GET lands in the SAME ctx->l2_done/l2_result/l2_blob
+ * fields the object GET uses (both backends' get_finish() write those
+ * unconditionally) -- ctx->vary_marker_l2_tried disambiguates "this is the
+ * marker's answer" from "this is the object's answer" on the re-entry after
+ * park/resume, and is cleared before returning so the object-GET phase right
+ * after this one in access_l2() sees a clean l2_done/l2_result/l2_blob to
+ * fill in on its own park/resume, exactly as if this phase had not run.
+ *
+ * A validated marker hit rewrites key_hash/hash to the variant key (the same
+ * transform vary_apply() itself performs from an L1 hit) and self-heals the
+ * L1 marker so subsequent requests on this node resolve from L1 without
+ * paying this GET again. Validation is the FULL blob_validate() (magic +
+ * version + status/created/stale_ttl/TLV walk) -- the fast magic+version-only
+ * check vary_apply() uses (S231-PERF-VARYMAGIC) is an optimisation that
+ * trades a marginally weaker collision check for staying inside an
+ * already-held zone mutex; an L2 blob is not read under that mutex and has
+ * already paid a network round trip, so there is no lock-window budget to
+ * economise here, and the extra fields blob_validate walks (headers_len==0
+ * for a genuine marker) reject an L2 GET that landed a same-hash but
+ * differently-shaped object blob (a marker_hash/key_hash collision) that the
+ * cheap check alone would not catch on this less-trusted path. A corrupt,
+ * too-short, or validation-failing reply is treated exactly like an L1
+ * marker miss: bits stay 0, key_hash/hash are left as the base key, and the
+ * request falls through to the normal (now correctly base-keyed) L2 object
+ * GET below -- never to a wrong variant. */
+static ngx_int_t
+ngx_http_cache_turbo_access_l2_marker_get(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx,
+    ngx_int_t *out_rc)
+{
+    ngx_int_t   rc;
+    u_char      saved_key[32];
+
+    if (!clcf->auto_vary || !ctx->vary_marker_l1_miss
+        || ctx->vary_marker_l2_tried || ctx->vary_marker_l2_done
+        || !clcf->backend || !clcf->backend->get)
+    {
+        return NGX_DECLINED;
+    }
+
+    ctx->vary_marker_l1_miss = 0;
+    ctx->vary_marker_l2_tried = 1;
+    ctx->vary_marker_l2_done = 1;
+
+    ngx_memcpy(saved_key, ctx->key_hash, 32);
+    ngx_memcpy(ctx->key_hash, ctx->vary_marker_key, 32);
+
+    rc = clcf->backend->get(r, clcf, ctx);
+
+    if (rc == NGX_AGAIN) {
+        /* Parked on the MARKER GET. Restore key_hash before returning: the
+         * op already copied the marker key bytes it needs, and a resume
+         * re-enters the whole handler from the top (access_l1 runs again,
+         * recomputing key_hash from vary_marker_key/vary_apply exactly as on
+         * the first pass), so key_hash must not be left pointing at the
+         * marker mid-park for any other reader of ctx in the meantime. */
+        ngx_memcpy(ctx->key_hash, saved_key, 32);
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "cache_turbo: parked on L2 vary-marker GET \"%V\"",
+                       &r->uri);
+        *out_rc = NGX_AGAIN;
+        return NGX_DONE;
+    }
+
+    /* NGX_DECLINED: backend could not launch (L2 down / disabled). No result
+     * to consume -- key_hash/l2_done are untouched, fall through exactly as
+     * an L1 marker miss with no L2 configured always has. */
+    ngx_memcpy(ctx->key_hash, saved_key, 32);
+    return NGX_DECLINED;
+}
+
+
+/* P3-5 phase helper for ngx_http_cache_turbo_access_l2().
+ * PHASE 0b -- consume the result of a completed marker GET (the park/resume half
+ * of the phase above). Called at the top of access_l2() on every entry;
+ * a no-op unless a marker GET is actually in flight/landed
+ * (vary_marker_l2_tried && l2_done). */
+static void
+ngx_http_cache_turbo_access_l2_marker_consume(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx,
+    ngx_http_cache_turbo_zone_t *z, uint32_t *hashp)
+{
+    ngx_int_t                        bits = 0;
+    ngx_uint_t                       gen = 0;
+    ngx_http_cache_turbo_blob_hdr_t  bh;
+
+    if (!ctx->vary_marker_l2_tried || !ctx->l2_done) {
+        return;
+    }
+
+    ctx->vary_marker_l2_tried = 0;
+
+    if (ctx->l2_result == NGX_OK && ctx->l2_blob != NULL
+        && ctx->l2_blob_len >= NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE + 1
+        && ngx_http_cache_turbo_blob_validate(ctx->l2_blob, ctx->l2_blob_len,
+               &bh, NULL, NULL, NULL, NULL) == NGX_OK)
+    {
+        bits = ctx->l2_blob[NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE];
+        if (ctx->l2_blob_len >= NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE + 2) {
+            gen = ctx->l2_blob[NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE + 1];
+        }
+
+        if (bits > 0) {
+            time_t  age, rem_fresh, rem_stale;
+
+            age = ngx_time() - (time_t) bh.created;
+            if (age < 0) {
+                age = 0;
+            }
+            rem_fresh = (time_t) bh.fresh_ttl - age;
+            rem_stale = (time_t) bh.stale_ttl - age;
+
+            if (rem_stale > 0) {
+                ngx_http_cache_turbo_variant_hash(r, &ctx->cache_key, bits,
+                                                  gen, ctx->key_hash);
+                *hashp = ngx_crc32_short(ctx->key_hash, 32);
+                ctx->vary_gen = gen;
+
+                /* Persist the resolution -- see the field comment on
+                 * vary_marker_l2_bits: a raw ctx->key_hash rewrite does NOT
+                 * survive the next access_prologue()'s build_key() call, so
+                 * access_l2_marker_apply() re-derives key_hash from these on
+                 * every access_l1() entry instead. */
+                ctx->vary_marker_l2_bits = bits;
+                ctx->vary_marker_l2_gen = gen;
+
+                /* Self-heal L1: the next request on THIS node resolves from
+                 * the (node-local, by-design) L1 marker without paying this
+                 * L2 GET again. rem_fresh may be <=0 (the marker itself is
+                 * past its fresh TTL but still within its stale window --
+                 * exactly the "accept a stale-but-serveable marker" contract
+                 * vary_apply() already applies to an L1 hit); marker_store's
+                 * own stale_ttl derivation from `ttl` requires a positive
+                 * fresh value, so floor it at 1s rather than storing a
+                 * zero/negative TTL that would misrepresent the marker's
+                 * remaining life. */
+                ngx_http_cache_turbo_marker_store(r, clcf, z, &ctx->cache_key,
+                    bits, gen, rem_fresh > 0 ? rem_fresh : 1);
+
+                ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                               "cache_turbo: L2 vary-marker hit \"%V\" "
+                               "bits=0x%xi -> variant key, L1 self-healed",
+                               &r->uri, bits);
+            }
+        }
+    }
+
+    /* Consumed: clear the marker GET result so the object-GET phase right
+     * after this one sees a clean slate and fills l2_done/l2_result/l2_blob
+     * in for the (now correctly keyed, whether base or variant) object
+     * itself -- same contract as a request that never had a marker miss. */
+    ctx->l2_done = 0;
+    ctx->l2_result = 0;
+    ctx->l2_blob = NULL;
+    ctx->l2_blob_len = 0;
+}
 
 
 /* MAINT-H4e phase helper for ngx_http_cache_turbo_access_l2().
@@ -1650,6 +1848,22 @@ ngx_http_cache_turbo_access_l2(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx,
     ngx_http_cache_turbo_zone_t *z, uint32_t hash, ngx_int_t *out_rc)
 {
+    /* P3-5 PHASE -1/0: consume the result of a previously-parked marker GET (a
+     * no-op on every entry except the resume of that specific park), then --
+     * only on a genuine L1 marker miss with auto_vary on -- try the L2-backed
+     * marker before the neg-memo/object-GET phases below, which are keyed on
+     * `hash`/ctx->key_hash and must see the corrected variant key/hash if the
+     * marker consult resolves one. Both are no-ops (return immediately) on
+     * the warm-marker path: vary_marker_l1_miss is never set there, so this
+     * costs the warm path nothing beyond the two flag reads. */
+    ngx_http_cache_turbo_access_l2_marker_consume(r, clcf, ctx, z, &hash);
+
+    if (ngx_http_cache_turbo_access_l2_marker_get(r, clcf, ctx, out_rc)
+        == NGX_DONE)
+    {
+        return NGX_DONE;
+    }
+
     ngx_http_cache_turbo_access_l2_neg_memo(r, clcf, ctx, z, hash);
 
     if (ngx_http_cache_turbo_access_l2_get(r, clcf, ctx, hash, out_rc)

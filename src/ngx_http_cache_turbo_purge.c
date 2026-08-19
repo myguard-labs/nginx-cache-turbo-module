@@ -185,7 +185,7 @@ ngx_http_cache_turbo_purge_auto_vary(ngx_http_request_t *r,
     if (next_gen == 0) {
         next_gen = 1;
     }
-    ngx_http_cache_turbo_marker_store(clcf, z, &ctx->cache_key, bits,
+    ngx_http_cache_turbo_marker_store(r, clcf, z, &ctx->cache_key, bits,
                                       next_gen, mttl);
     (*purged)++;
 

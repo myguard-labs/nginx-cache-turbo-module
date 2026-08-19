@@ -1698,6 +1698,53 @@ typedef struct {
      * section as the main L1 lookup in access_handler, instead of its own
      * separate lock/unlock pair. Only meaningful when clcf->auto_vary. */
     u_char                   vary_marker_key[32];
+    /* P3-5: set by vary_apply() when the L1 marker probe MISSED (no marker
+     * node, expired-with-no-grace, or a corrupt/collided blob) while
+     * clcf->auto_vary is on -- i.e. key_hash is still the BASE key, not a
+     * variant key, and we do not yet know whether a peer node has already
+     * classified + stored a variant for this URL in L2. Consumed by the L2
+     * phase (access_l2) to decide whether an extra marker GET is worth
+     * issuing before the main object GET; cleared once that consult has run
+     * (or was skipped, e.g. no backend) so it can never fire twice on a
+     * park/resume re-entry. Left 0 (no-op downstream) whenever auto_vary is
+     * off or the L1 marker DID resolve bits -- the marker-warm path must
+     * never pay this extra round trip. */
+    unsigned                 vary_marker_l1_miss:1;
+    /* P3-5: vary_marker_l2_tried is the park/consume in-flight flag for the
+     * marker GET (set when launched, cleared once its result is consumed --
+     * see access_l2_marker_get()/_consume()). vary_marker_l2_done is a
+     * SEPARATE, request-lifetime, NEVER-cleared latch: the L2 marker consult
+     * may only ever be attempted ONCE per request. Without it, a genuine L2
+     * miss (no peer has this URL either) leaves bits==0, so vary_apply()
+     * re-sets vary_marker_l1_miss=1 on EVERY re-entry of access_l1 (which
+     * runs before access_l2 on every resume, including the resume of the
+     * marker GET itself) -- gating solely on vary_marker_l1_miss/
+     * vary_marker_l2_tried therefore re-fires the marker GET forever
+     * (confirmed: an infinite parked-GET loop against a real redis-server in
+     * this fix's own development, caught by the existing non-vary L2 tests
+     * hanging). vary_marker_l2_done stops that: once set, marker_get() never
+     * launches again for this request no matter how many times access_l1
+     * re-asserts vary_marker_l1_miss. */
+    unsigned                 vary_marker_l2_tried:1;
+    unsigned                 vary_marker_l2_done:1;
+    /* P3-5: the variant this request resolved to via the L2-backed marker
+     * consult, persisted so it survives a park/resume boundary. A plain
+     * rewrite of ctx->key_hash does NOT survive: ngx_http_cache_turbo_
+     * build_key() runs at the TOP of every access_prologue() call --
+     * including every re-entry after a park -- and unconditionally
+     * recomputes ctx->key_hash from ctx->cache_key, silently reverting any
+     * mid-request rewrite back to the base key (confirmed: an L2 marker hit
+     * correctly resolved the variant key, but the object GET launched right
+     * after it, on the NEXT access_l1() entry, was observed back on the base
+     * key -- see access_l2_marker_apply(), which re-derives key_hash from
+     * these fields on every access_l1() entry the same way vary_apply()
+     * re-derives it from the L1 marker every time, rather than depending on
+     * a value surviving in ctx->key_hash across the reset). 0/bits==0 means
+     * "no L2 marker resolution yet" -- indistinguishable from "resolved
+     * bits=0", which cannot happen (marker_consume only sets these when
+     * bits>0). */
+    ngx_int_t                vary_marker_l2_bits;
+    ngx_uint_t                vary_marker_l2_gen;
     /* auto-Vary PURGE generation (COR-5). Resolved from the L1 marker by
      * vary_apply and reused at store so the variant key + marker agree. Stays
      * 0 for the backend-backed purge path (variants are physically removed +

@@ -1765,6 +1765,120 @@ def test_multinode_lock(ng: Nginx, origin: Origin, redis: RedisServer) -> None:
         redis.cli("DEL", l2_key(uri), lock_key(uri))
 
 
+def _redis_get_calls(redis: RedisServer) -> str:
+    """Cumulative GET call count from Redis's own INFO commandstats -- an
+    oracle external to the module under test, so it cannot be fooled by a
+    log line the module chose (or forgot) to emit. Returns "0" if the server
+    has served no GETs yet (no cmdstat_get line at all)."""
+    out = redis.cli("INFO", "commandstats")
+    for line in out.splitlines():
+        if line.startswith("cmdstat_get:"):
+            # cmdstat_get:calls=N,usec=...,...
+            for field in line.split(":", 1)[1].split(","):
+                if field.startswith("calls="):
+                    return field[len("calls="):]
+    return "0"
+
+
+def test_l2_vary_marker_cold_node_finds_peer_variant(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    """P3-5: the auto-Vary marker is L1-only and node-local BY DESIGN, but
+    before this fix the L2 consult for a varied URL used the BASE key
+    (ctx->key_hash), which a varied URL's base slot never populates -- so a
+    node with no L1 marker (a fresh node, a restart, an LRU-evicted marker)
+    missed L1 AND L2 even though a peer had already classified + stored the
+    variant in the SAME shared Redis. That defeats the whole point of a
+    shared L2 tier for any Vary-emitting origin with auto_vary on (the
+    default).
+
+    Node A (`ng`) primes ONE variant of a Vary: Origin URL on /cor5/ (auto_vary
+    + Redis, COR-5 location). Node B is a FRESHLY SPAWNED, entirely separate
+    nginx sharing the same Redis -- its L1 has never seen this URL at all, so
+    it is the cold node the plan describes without needing any eviction
+    trick. Before the fix, B's first request for the SAME variant must MISS
+    both tiers (fresh origin hit, X-Cache absent). After the fix, B's L2
+    consult finds the marker (write-through by marker_store on A's store)
+    and resolves straight to A's variant in Redis -- no new origin hit, body
+    matches A's.
+
+    Oracle is origin.hits_for(the concrete path), NOT body equality alone: a
+    passthrough MISS that happens to return byte-identical JSON on both nodes
+    (same gen counter momentarily) would satisfy body==body without ever
+    having consulted L2 -- see the mutation-verify note in the PR body for
+    the assertion that actually caught this."""
+    uri = "/cor5/vmark?v=or"
+    l2_uri = "/vmark?v=or"          # nginx strips /cor5/ before proxying
+    origin_hdr = {"Origin": "https://cold-node.example"}
+
+    redis.cli("KEYS", "ct:*")       # smoke: backend reachable before priming
+
+    base = origin.hits_for(l2_uri)
+
+    # Node A primes this variant: cold -> origin -> L1_A (marker + variant) +
+    # L2 write-through (both the variant object AND, after this fix, the
+    # marker itself).
+    sa, body_a, ha = fetch(ng.port, uri, origin_hdr)
+    assert sa == 200 and "x-cache" not in ha, \
+        f"A's first fetch should MISS to origin, got X-Cache={ha.get('x-cache')}"
+    assert origin.hits_for(l2_uri) - base == 1, \
+        "A's prime should cost exactly one origin hit"
+
+    # The variant object must actually be in L2 before B can possibly find
+    # it -- this is the store side, already covered elsewhere; just gate on
+    # it so a slow async write-through can't flake this test.
+    assert wait_for(lambda: redis.cli("KEYS", "ct:*") != ""), \
+        "auto-Vary store never reached L2 at all"
+
+    b = _spawn_node(ng, "server-vmark-cold", 8)
+    try:
+        # Node B: entirely fresh L1, has NEVER looked up this URL -- the
+        # exact "cold node" the plan describes, no eviction needed.
+        origin_before_b = origin.hits_for(l2_uri)
+        sb, body_b, hb = fetch(b.port, uri, origin_hdr)
+
+        assert sb == 200, f"B's fetch failed: {sb}"
+        assert body_b == body_a, \
+            ("B served a DIFFERENT body than A's stored variant -- either "
+             "it went to origin for a fresh gen, or (far worse) it resolved "
+             "the WRONG variant", body_a, body_b)
+        assert origin.hits_for(l2_uri) - origin_before_b == 0, (
+            "B went to the ORIGIN instead of finding A's variant in L2 -- "
+            "the L2-backed marker consult on B's cold L1 either did not "
+            "run or did not resolve the variant key "
+            f"(X-Cache={hb.get('x-cache')!r})")
+        assert hb.get("x-cache") == "HIT", \
+            f"B's marker-cold read should still land an L2 HIT, got {hb}"
+
+        # Second read on B must now be an L1 HIT (self-healed marker) with
+        # STILL no new origin traffic, AND -- the warm-path claim -- no extra
+        # L2 round trip: the marker consult must fire ONLY on the marker-cold
+        # path, never once B's own L1 marker is warm. Oracle is Redis's own
+        # GET call counter (INFO commandstats), not a log grep or a timing
+        # budget: B's ordinary object GET still fires on every miss regardless
+        # of the marker, so the assertion is on the DELTA staying at the
+        # pre-fix baseline (this same request, right before the marker
+        # self-heal landed, already issued its own object GET as part of a
+        # normal L2 consult) rather than on an absolute zero.
+        gets_before = int(_redis_get_calls(redis))
+        origin_before_b2 = origin.hits_for(l2_uri)
+        _, body_b2, hb2 = fetch(b.port, uri, origin_hdr)
+        assert body_b2 == body_a
+        assert origin.hits_for(l2_uri) - origin_before_b2 == 0
+        assert hb2.get("x-cache") == "HIT"
+        gets_after = int(_redis_get_calls(redis))
+        assert gets_after - gets_before == 0, (
+            "B's SECOND read (L1 marker now self-healed) issued a Redis GET "
+            "at all -- the marker-warm path must resolve entirely from L1 "
+            f"and pay NO L2 round trip, got {gets_after - gets_before} GETs")
+
+        b.stop()
+        b.assert_clean_logs()
+    finally:
+        b.stop()
+        drain_origin(origin)
+        redis.cli("FLUSHDB")
+
+
 def test_cross_node_won_stale_body(ng: Nginx, origin: Origin,
                                    redis: RedisServer) -> None:
     """S231-PERF-BGSNAP: the cross-node lock-WINNER's background-update stale
