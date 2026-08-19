@@ -4,7 +4,7 @@
 #   ci-build.sh <flavor> <version> <mode>
 #     flavor : nginx | angie         (default nginx)
 #     version: upstream version      (default 1.31.1)
-#     mode   : debug | nginx | asan | module | coverage
+#     mode   : debug | nginx | asan | module | coverage | profile
 #              debug    - debug build + module (default)
 #              nginx    - release-ish build + module
 #              asan     - static --add-module build with ASan+UBSan (no .so)
@@ -14,6 +14,12 @@
 #                         .gcno files land under objs/addon/src/; the matching
 #                         .gcda are written when the instrumented nginx exits.
 #                         ci/tools/coverage.sh drives build -> run -> report.
+#              profile  - optimized (-O2) dynamic module + binary with debug
+#                         symbols and frame pointers kept, for `perf record`.
+#                         Same optimization level as a real release build
+#                         (unlike `nginx` mode's -O1), so the profile reflects
+#                         the shipped code path, not a slower unoptimized one.
+#                         See ci/tools/perf-profile.sh.
 #
 # No hiredis: cache-turbo's L2 Redis driver is native nginx, so the build has
 # no -lhiredis dependency (see memory/.../cache-turbo-module-design.md).
@@ -133,6 +139,16 @@ case "$MODE" in
         # hardened -O2 set — it is a neutral upstream baseline. The module stays
         # a dynamic .so; bench it with MODULE=<.so> ci/tools/bench.sh.
         CC_OPT="$TEST_OPT"
+        WITH_DEBUG=""
+        ;;
+    profile)
+        # -O2 to match a real release build (bench.sh's `nginx` mode is only
+        # -O1), plus -g and an explicit -fno-omit-frame-pointer so `perf
+        # record`'s frame-pointer unwinder resolves the hit-path call stack
+        # instead of dropping into '[unknown]'. No NGX_DEBUG_PALLOC / --with-debug
+        # so nothing extra runs on the profiled path. The module stays a
+        # dynamic .so; profile it with MODULE=<.so> ci/tools/perf-profile.sh.
+        CC_OPT="$TEST_OPT -g -O2 -fno-omit-frame-pointer"
         WITH_DEBUG=""
         ;;
 esac
