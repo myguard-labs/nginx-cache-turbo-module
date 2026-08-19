@@ -1453,10 +1453,43 @@ ngx_http_cache_turbo_access_l2_marker_consume(ngx_http_request_t *r,
 
     ctx->vary_marker_l2_tried = 0;
 
+    /* codex-review P3-5: an L1 marker can appear WHILE this request's own
+     * marker GET (launched on an earlier pass) is still in flight -- a
+     * concurrent request on this node classifying + storing the same base
+     * URL's marker into L1 mid-park. access_l1() always runs vary_apply()
+     * BEFORE calling into access_l2() (and therefore before this function),
+     * so if THIS pass's vary_apply() already resolved bits from L1, it just
+     * cleared vary_marker_l1_miss to 0 -- meaning ctx->key_hash/hashp already
+     * carry L1's answer, strictly newer than whatever this now-landed L2 GET
+     * (launched on a PRIOR pass, against a PRIOR L1 state) is about to say.
+     * Applying the L2 answer here would silently overwrite the newer L1
+     * resolution with a stale one -- wrong variant, not merely wrong
+     * performance. L1 is authoritative and wins unconditionally; drop the L2
+     * answer on the floor (it already did its job of proving A a variant
+     * exists, and the self-heal below is what would have (re)written this
+     * same L1 marker anyway). */
+    if (!ctx->vary_marker_l1_miss) {
+        return;
+    }
+
     if (ctx->l2_result == NGX_OK && ctx->l2_blob != NULL
         && ctx->l2_blob_len >= NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE + 1
         && ngx_http_cache_turbo_blob_validate(ctx->l2_blob, ctx->l2_blob_len,
-               &bh, NULL, NULL, NULL, NULL) == NGX_OK)
+               &bh, NULL, NULL, NULL, NULL) == NGX_OK
+        /* P3-5 (codex-review MINOR): blob_validate() proves generic object
+         * framing (magic/version/status/TTL ordering), NOT that this blob IS
+         * a marker -- an ordinary captured response happens to satisfy every
+         * check blob_validate performs. Require the exact shape
+         * marker_store() writes (headers_len==0: markers are memzero'd and
+         * never set it; body_len==2: the [bits][gen] pair) before trusting
+         * the two body bytes below as an axis bitmask + purge generation
+         * rather than the first two content bytes of an unrelated cached
+         * response that happened to land under this key (a marker_hash/
+         * key_hash collision, or a prefix/namespace mixup between multiple
+         * cache_turbo_redis backends sharing one keyspace). A blob that
+         * fails this is treated exactly like a corrupt/short marker: bits
+         * stay 0, fall through to the ordinary base-key object GET. */
+        && bh.headers_len == 0 && bh.body_len == 2)
     {
         bits = ctx->l2_blob[NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE];
         if (ctx->l2_blob_len >= NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE + 2) {
@@ -1487,18 +1520,26 @@ ngx_http_cache_turbo_access_l2_marker_consume(ngx_http_request_t *r,
                 ctx->vary_marker_l2_bits = bits;
                 ctx->vary_marker_l2_gen = gen;
 
-                /* Self-heal L1: the next request on THIS node resolves from
-                 * the (node-local, by-design) L1 marker without paying this
-                 * L2 GET again. rem_fresh may be <=0 (the marker itself is
-                 * past its fresh TTL but still within its stale window --
-                 * exactly the "accept a stale-but-serveable marker" contract
-                 * vary_apply() already applies to an L1 hit); marker_store's
-                 * own stale_ttl derivation from `ttl` requires a positive
-                 * fresh value, so floor it at 1s rather than storing a
-                 * zero/negative TTL that would misrepresent the marker's
-                 * remaining life. */
+                /* Self-heal L1 (+ refresh L2): the next request on THIS node
+                 * resolves from the (node-local, by-design) L1 marker without
+                 * paying this L2 GET again. rem_fresh may be <=0 (the marker
+                 * itself is past its fresh TTL but still within its stale
+                 * window -- exactly the "accept a stale-but-serveable
+                 * marker" contract vary_apply() already applies to an L1
+                 * hit), so it is floored at 1s for the blob's fresh_ttl
+                 * field, which must stay positive to mean anything. Pass
+                 * rem_stale as retain_ttl EXPLICITLY (codex-review perf
+                 * finding): marker_store() used to re-derive retain_ttl from
+                 * `ttl` via stale_mult internally, which for a small
+                 * rem_fresh produced a retention window far short of the
+                 * marker's/object's REAL remaining life (rem_stale, already
+                 * computed above from the L2 blob's own header) -- silently
+                 * truncating a marker that had hundreds of seconds left down
+                 * to a handful on every self-heal. rem_stale is already
+                 * proven >0 by the `if (rem_stale > 0)` guard this block is
+                 * inside. */
                 ngx_http_cache_turbo_marker_store(r, clcf, z, &ctx->cache_key,
-                    bits, gen, rem_fresh > 0 ? rem_fresh : 1);
+                    bits, gen, rem_fresh > 0 ? rem_fresh : 1, rem_stale);
 
                 ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                                "cache_turbo: L2 vary-marker hit \"%V\" "

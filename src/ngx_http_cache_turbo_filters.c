@@ -1646,7 +1646,7 @@ ngx_http_cache_turbo_body_filter_store_tail(ngx_http_request_t *r,
     if (clcf->auto_vary && ctx->vary_bits > 0) {
         ngx_http_cache_turbo_marker_store(r, clcf, z, &ctx->cache_key,
                                           ctx->vary_bits, ctx->vary_gen,
-                                          ttl);
+                                          ttl, retain_ttl);
 
         /* COR-5 variant index: SADD this variant's L2 key into the
          * per-base index set so a later PURGE of the base URI can

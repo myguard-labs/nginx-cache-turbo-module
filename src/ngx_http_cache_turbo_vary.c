@@ -574,13 +574,12 @@ void
 ngx_http_cache_turbo_marker_store(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf,
     ngx_http_cache_turbo_zone_t *z, ngx_str_t *base, ngx_int_t bits,
-    ngx_uint_t gen, time_t ttl)
+    ngx_uint_t gen, time_t ttl, time_t retain_ttl)
 {
     u_char                           mk[32];
     u_char                           blob[NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE
                                           + 2];
     ngx_http_cache_turbo_blob_hdr_t  bh;
-    time_t                           retain_ttl;
 
     ngx_memzero(&bh, sizeof(bh));
     /* A marker is a blob, so it must satisfy the blob contract: since AUD-HDR1
@@ -594,8 +593,23 @@ ngx_http_cache_turbo_marker_store(ngx_http_request_t *r,
     bh.body_len = 2;
     bh.created = (int64_t) ngx_time();
     bh.fresh_ttl = (uint32_t) (ttl > 0 ? ttl : 0);
-    bh.stale_ttl = (uint32_t) ngx_http_cache_turbo_stale_ttl(ttl,
-                       clcf->stale_mult);
+    /* P3-5 (codex-review perf finding): stale_ttl used to be re-derived from
+     * `ttl` via stale_mult unconditionally, which was correct for a FRESH
+     * classification (filters.c/purge.c: ttl IS the object's real fresh_ttl,
+     * so stale_mult*ttl IS the object's real stale window) but wrong for the
+     * L2-marker self-heal (access_l2_marker_consume()): there `ttl` is only
+     * the marker's remaining FRESH life (rem_fresh, possibly floored to 1s),
+     * and stale_mult*rem_fresh is nowhere close to the object's actual
+     * remaining stale life (rem_stale) already known at that call site --
+     * re-deriving from it silently truncated both the blob's own stale_ttl
+     * field AND (see retain_ttl below) the L1/L2 slot's physical retention,
+     * shortening a marker with hundreds of seconds left to a handful.
+     * retain_ttl is now the caller's job explicitly: the two ORIGINAL
+     * call sites (a fresh capture) pass stale_ttl(ttl, stale_mult), same
+     * derivation as before; the self-heal call site passes the real
+     * rem_stale it already computed, so the blob's own advertised
+     * lifetime and the slot's physical retention finally agree. */
+    bh.stale_ttl = (uint32_t) (retain_ttl > 0 ? retain_ttl : 0);
     ngx_http_cache_turbo_blob_hdr_write(blob, &bh);
     /* body = [axis bitmask][purge generation] (COR-5). The generation lets the
      * L1-only purge path orphan an old generation's variants by bumping it. */
@@ -603,8 +617,6 @@ ngx_http_cache_turbo_marker_store(ngx_http_request_t *r,
     blob[NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE + 1] = (u_char) (gen & 0xFF);
 
     ngx_http_cache_turbo_marker_hash(base, mk);
-
-    retain_ttl = ngx_http_cache_turbo_stale_ttl(ttl, clcf->stale_mult);
 
     (void) clcf->l1->store(z, mk, ngx_crc32_short(mk, 32),
                blob, sizeof(blob), ttl, retain_ttl);
@@ -748,6 +760,17 @@ ngx_http_cache_turbo_vary_apply(ngx_http_request_t *r,
         ngx_http_cache_turbo_variant_hash(r, &ctx->cache_key, bits, gen,
                                           ctx->key_hash);
         *hash = ngx_crc32_short(ctx->key_hash, 32);
+        /* P3-5: an L1 hit is authoritative and strictly newer than any
+         * earlier-pass L2 marker resolution still pending consumption (a
+         * concurrent request could have written this very marker into L1
+         * WHILE this request's own marker GET from a prior pass was still
+         * in flight) -- clear vary_marker_l1_miss explicitly rather than
+         * merely not setting it, since a stale 1 from an earlier pass of
+         * THIS SAME request must not survive to gate anything after an L1
+         * hit supersedes it. See access_l2_marker_consume(), which must
+         * not let a landed-but-now-STALE L2 answer override what THIS pass
+         * already resolved from L1. */
+        ctx->vary_marker_l1_miss = 0;
         ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "cache_turbo: auto-Vary marker hit \"%V\" bits=0x%xi "
                        "-> variant key", &r->uri, bits);
