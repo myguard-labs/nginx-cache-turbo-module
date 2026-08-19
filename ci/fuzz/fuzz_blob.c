@@ -26,6 +26,12 @@
  *   5. every (name,len)/(value,len) the walk yields lies inside the buffer
  *   6. every header restore would EMIT has a valid HTTP token name (RFC 9110
  *      §5.6.2) and a value free of CR, LF and NUL
+ *   7. (P4-3) the blob does NOT carry BLOBF_HDRS_VETTED once the L2 ingress
+ *      demotion has run. That bit switches assertion (6)'s production gate
+ *      OFF, so an L2 writer able to set it owns the response-splitting
+ *      primitive outright; the harness runs the real
+ *      ngx_http_cache_turbo_blob_clear_vetted() over the input first, exactly
+ *      as redis.c/memcached.c do, then asserts the demotion held.
  *
  * (6) is the AUD-HDR1 assertion. What "would emit" means is read from the
  * SHIPPED code, not modelled here: when src/ngx_http_cache_turbo_module.c
@@ -196,12 +202,42 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         memcpy(buf, data, size);
     }
 
+    /*
+     * P4-3: this input models bytes read out of L2, so it goes through the
+     * SAME ingress demotion redis.c / memcached.c apply to their private
+     * r->pool copy before any consumer sees the blob. Skipping this would let
+     * the harness fuzz a trust level production never grants to L2 bytes --
+     * and would silently stop testing the AUD-HDR1 gate the moment a fuzzed
+     * blob happened to set 0x0020, because restore skips the gate on a vetted
+     * blob. Clearing first is what keeps assertion (6) below live on every
+     * input.
+     */
+    ngx_http_cache_turbo_blob_clear_vetted(buf, size);
+
     if (ngx_http_cache_turbo_blob_validate(buf, size, &hdr, &hb, &body,
                                            NULL, NULL)
         != NGX_OK)
     {
         free(buf);
         return 0;                          /* rejected: nothing is promised */
+    }
+
+    /*
+     * P4-3, the security-critical assertion of this whole change: after the
+     * ingress demotion above, NO blob reaching the restore path from L2 may
+     * still claim to be vetted. If this ever fires, an L2 writer has regained
+     * the ability to switch off ngx_http_cache_turbo_header_admissible() by
+     * setting one bit -- i.e. a one-bit response-splitting / smuggling /
+     * Set-Cookie primitive, the exact AUD-HDR1 threat model. It fires if
+     * clear_vetted() stops clearing, if the bit's value drifts away from what
+     * clear_vetted() masks, or if a future edit reorders the demotion after
+     * the parse.
+     */
+    if (hdr.flags & NGX_HTTP_CACHE_TURBO_BLOBF_HDRS_VETTED) {
+        ct_fail("an L2-sourced blob survived ingress demotion still carrying "
+                "BLOBF_HDRS_VETTED — restore would SKIP header_admissible() "
+                "on attacker-controlled bytes (response splitting, smuggling, "
+                "Set-Cookie)");
     }
 
     /* --- header-field contract the L1 fill and the serve path both inherit. */
@@ -382,6 +418,19 @@ ct_build(uint32_t status, uint32_t fresh_ttl, uint32_t stale_ttl,
         1767225600ULL, kv, nkv, bodytext);       /* fixed created stamp */
 }
 
+/* P4-3: stamp arbitrary BLOBF_* bits onto the blob ct_build*() just produced.
+ * Used to forge the one thing an L2 writer would most want to forge:
+ * BLOBF_HDRS_VETTED, which claims header_admissible() has already run. The
+ * fixtures below pair it with a genuinely poisoned header block, so a harness
+ * (or a production ingress) that honoured the bit off the wire fails on the
+ * poison rather than passing quietly. */
+static void
+ct_stamp_flags(uint16_t flags)
+{
+    ct_put_u16(ct_blob + 6, flags);
+}
+
+
 /* A realistic stored blob — what a warm cache_turbo entry actually looks like
  * in L2. Used as the benign fixture and as libFuzzer seed #0. */
 static void
@@ -514,6 +563,48 @@ main(int argc, char **argv)
     /* 4. a non-token header NAME containing its own CRLF. */
     ct_build(200, 60, 600, 0, kv_badname, 2, "body");
     ct_run("non-token header name is dropped");
+
+    /*
+     * 4a-4d (P4-3). THE security-critical fixtures for BLOBF_HDRS_VETTED.
+     *
+     * The bit tells restore_response_headers() "header_admissible() already
+     * ran over this block, skip it". That is true only of a blob this worker
+     * serialised. Because the store path writes the SAME buffer to L1 and to
+     * L2 (filters.c backend->set), a stamped blob genuinely does reach Redis
+     * / memcached -- so an L2 writer can hand it straight back, or simply set
+     * the bit themselves on a blob of their own. If that bit survived
+     * ingress, one bit would disable the entire AUD-HDR1 gate on
+     * attacker-controlled bytes.
+     *
+     * Each fixture re-runs a poison from above with 0x0020 forged on top. The
+     * assertion that catches it is the demotion check in
+     * LLVMFuzzerTestOneInput(): the harness clears the bit exactly as
+     * redis.c/memcached.c do, then requires it to be gone. If clear_vetted()
+     * stops clearing, or the bit drifts from what it masks, every one of
+     * these goes red -- AND so does the underlying poison assertion, because
+     * a vetted blob would take the skip path. Two independent reds, which is
+     * the point: neither can mask the other into silence.
+     */
+    ct_build(200, 60, 600, 0, kv_crlf, 2, "body");
+    ct_stamp_flags(NGX_HTTP_CACHE_TURBO_BLOBF_HDRS_VETTED);
+    ct_run("forged HDRS_VETTED does not smuggle a CRLF value past the gate");
+
+    ct_build(200, 60, 600, 0, kv_te, 2, "body");
+    ct_stamp_flags(NGX_HTTP_CACHE_TURBO_BLOBF_HDRS_VETTED);
+    ct_run("forged HDRS_VETTED does not smuggle Transfer-Encoding");
+
+    ct_build(200, 60, 600, 0, kv_cookie, 2, "body");
+    ct_stamp_flags(NGX_HTTP_CACHE_TURBO_BLOBF_HDRS_VETTED);
+    ct_run("forged HDRS_VETTED does not smuggle Set-Cookie");
+
+    /* 4d: the bit forged on an OTHERWISE CLEAN blob. Negative control for the
+     * three above -- it proves the demotion assertion fires on the BIT alone,
+     * not merely as a side effect of the poisoned header. Without this, a
+     * clear_vetted() that had been deleted entirely would still look caught,
+     * because the poison assertions alone would explain every red. */
+    ct_build_real();
+    ct_stamp_flags(NGX_HTTP_CACHE_TURBO_BLOBF_HDRS_VETTED);
+    ct_run("forged HDRS_VETTED on a clean blob is stripped at ingress");
 
     /* 5. status = 0xFFFFFFFF -> written straight to headers_out.status. */
     ct_build(0xFFFFFFFFu, 60, 600, 0, kv_crlf + 0, 1, "body");

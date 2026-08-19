@@ -508,6 +508,161 @@ def test_l2_forged_blob_cannot_inject_headers(ng: Nginx, origin: Origin,
     assert origin.hits == origin_before, "L1 HIT unexpectedly used the origin"
 
 
+# P4-3: the wire value of NGX_HTTP_CACHE_TURBO_BLOBF_HDRS_VETTED. Spelled out
+# here rather than imported because these tests are a BLACK-BOX consumer of the
+# wire format -- a test that read the constant from the same source the module
+# reads it from could not notice the two drifting apart.
+BLOBF_HDRS_VETTED = 0x0020
+
+
+def test_l2_store_stamps_hdrs_vetted_bit(ng: Nginx, origin: Origin,
+                                         redis: RedisServer) -> None:
+    """P4-3, the POSITIVE control for BLOBF_HDRS_VETTED.
+
+    Every other P4-3 test is a safety assertion -- they all pass just as well
+    if the bit is never set at all, because the fail-safe direction of this
+    change is "no bit => run the full gate => today's behaviour". So without
+    this test the entire optimisation could silently never engage and CI would
+    stay green forever.
+
+    The store path writes ONE buffer to both L1 and L2 (filters.c hands the
+    same `blob` to l1->store() and backend->set()), so the bytes sitting in
+    Redis after a MISS are byte-identical to the ones in L1. Reading the flags
+    u16 back out of Redis is therefore a direct observation of what the store
+    path stamped -- no module introspection needed.
+
+    ⚠ This is also the test that fails if someone later removes the store-time
+    stamp as "dead code": it is the only place the bit's presence is asserted
+    rather than its absence."""
+    uri = "/l2e/vetted-stamp"
+    key = l2_key(uri)
+    redis.cli("DEL", key, lock_key(uri))
+
+    status, _body, hdrs = fetch(ng.port, uri)
+    assert status == 200 and "x-cache" not in hdrs, \
+        f"first request should MISS to origin, got X-Cache={hdrs.get('x-cache')}"
+
+    # the L2 write-through is fire-and-forget
+    assert wait_for(lambda: redis.cli("EXISTS", key) == "1"), \
+        "the store path never wrote the object through to L2"
+
+    blob = redis.get_raw(key)
+    assert blob is not None and len(blob) >= 44, \
+        f"could not read the stored blob back out of L2: {blob!r}"
+
+    flags = struct.unpack_from("<H", blob, 6)[0]
+    assert flags & BLOBF_HDRS_VETTED, \
+        f"the store path did NOT stamp BLOBF_HDRS_VETTED (flags=0x{flags:04x}). " \
+        f"The restore-side fast path can never engage, so P4-3 is a no-op -- " \
+        f"and every other P4-3 test still passes, because they only assert " \
+        f"the SAFE direction."
+
+    # The bits P3-2/S232 own must be untouched on an ordinary entry: this is a
+    # plain cacheable 200, neither breaker-only nor origin-pre-compressed. A
+    # stamp that scribbled a wider mask than its own bit would show up here.
+    assert not (flags & 0x0001), \
+        f"an ordinary entry was stamped BLOBF_BREAKER_ONLY (flags=0x{flags:04x})"
+    assert not (flags & 0x000E), \
+        f"an ordinary entry was stamped BLOBF_ORIGIN_ENCODED or a non-zero " \
+        f"ae-class (flags=0x{flags:04x})"
+
+
+def test_l2_forged_vetted_bit_does_not_bypass_header_gate(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    """P4-3, THE security assertion of BLOBF_HDRS_VETTED.
+
+    The bit means "ngx_http_cache_turbo_header_admissible() has already run
+    over every header in this blob, restore may skip it". That is only true of
+    a blob this worker serialised. But the store path hands the SAME buffer to
+    l1->store() AND to backend->set(), so a stamped blob really does travel out
+    to Redis -- and an L2 writer (compromised, other-tenant, or MITM'd:
+    AUD-TLS1) can hand one back, or simply set 0x0020 on a blob of their own.
+    Honouring it off the wire would turn ONE BIT into a response-splitting,
+    smuggling and Set-Cookie primitive.
+
+    So: seed L2 with the SAME four AUD-HDR1 primitives
+    test_l2_forged_blob_cannot_inject_headers uses, but with the vetted bit
+    FORGED on. The module must clear the bit at L2 ingress (redis.c, on its
+    private r->pool copy) and run the full gate regardless. Both stages of the
+    read must be as clean as the unforged case.
+
+    ⚠ This is deliberately NOT a variant of the fast path. The fast path going
+    wrong costs CPU; this going wrong is a cross-user disclosure. It is also
+    NOT redundant with the fixture suite in ci/fuzz: that drives clear_vetted()
+    and the gate directly, and cannot show that redis.c actually CALLS the
+    demotion on the live fill path. Here the assertions are on the raw wire
+    bytes the client receives."""
+    uri = "/l2e/forged-vetted"
+    key = l2_key(uri)
+    redis.cli("DEL", key, lock_key(uri))
+
+    seeded = b"forged-vetted-body\n"
+    blob = make_ctb4_blob(seeded, headers={
+        # positive control -- must SURVIVE, or a gate that dropped everything
+        # (or a silent fall-through to origin) would satisfy the rest vacuously.
+        "Content-Type":       "text/plain",
+        "X-Split":            "ok\r\nInjected: yes",
+        "X-Bad\r\nEvil:":     "1",
+        "Transfer-Encoding":  "chunked",
+        "Set-Cookie":         "sess=attacker",
+    }, flags=BLOBF_HDRS_VETTED)
+
+    # Prove the fixture really carries the bit before asserting the module
+    # ignores it. Without this, a make_ctb4_blob() that silently dropped the
+    # flags argument would leave every assertion below passing for the wrong
+    # reason -- it would just be re-running the unforged test.
+    assert struct.unpack_from("<H", blob, 6)[0] & BLOBF_HDRS_VETTED, \
+        "the seeded blob does not actually carry BLOBF_HDRS_VETTED, so this " \
+        "test would prove nothing about the forged-bit path"
+
+    redis.set_raw(key, blob, 60_000)
+    assert redis.cli("EXISTS", key) == "1", \
+        "failed to seed the forged vetted blob"
+
+    origin_before = origin.hits
+
+    def assert_clean(stage: str) -> bytes:
+        head, body = _wire_response(ng.port, uri)
+        low = head.lower()
+        assert b"injected" not in low, \
+            f"{stage}: a forged BLOBF_HDRS_VETTED bit switched off the " \
+            f"restore-side header gate -- CRLF in a stored value SPLIT into a " \
+            f"new response header. One bit = response splitting.\n{head!r}"
+        assert b"evil" not in low, \
+            f"{stage}: forged vetted bit let a non-token stored header name " \
+            f"reach the wire\n{head!r}"
+        assert b"\nset-cookie:" not in low, \
+            f"{stage}: forged vetted bit let Set-Cookie survive restore " \
+            f"(session fixation)\n{head!r}"
+        assert b"\ntransfer-encoding:" not in low, \
+            f"{stage}: forged vetted bit let Transfer-Encoding survive " \
+            f"restore (request smuggling)\n{head!r}"
+        assert b"\ncontent-type: text/plain" in low, \
+            f"{stage}: benign stored header did NOT survive, so the clean " \
+            f"assertions above prove nothing\n{head!r}"
+        assert body == seeded, \
+            f"{stage}: served body {body!r} is not the seeded blob's body"
+        return low
+
+    # 1st read: the L2-fill serve. This is the stage the ingress demotion in
+    # redis.c directly protects.
+    first = assert_clean("L2-fill serve with forged vetted bit")
+    assert b"x-cache: hit" in first, \
+        "seeded L2 object was not served from L2 -- this test never reached " \
+        "the restore path at all"
+    assert origin.hits == origin_before, \
+        "origin was consulted, so the response is not the forged blob"
+
+    # 2nd read: served from the L1 copy the fill promoted. The promotion writes
+    # the SAME demoted buffer, so the bit must still be absent -- if the
+    # clearing happened anywhere later than ingress (say, only in serve()), the
+    # copy that landed in L1 would still carry it and THIS stage would be the
+    # one that leaks, on every subsequent hit, for the entry's whole lifetime.
+    second = assert_clean("L1 HIT promoted from the forged L2 blob")
+    assert b"x-cache: hit" in second, "second read should be an L1 HIT"
+    assert origin.hits == origin_before, "L1 HIT unexpectedly used the origin"
+
+
 def test_l2_restore_href_array_alignment_ubsan(ng: Nginx, origin: Origin,
                                                redis: RedisServer) -> None:
     """S231-HDRWALK-VALIDATE-STRICTER regression: blob_validate()'s

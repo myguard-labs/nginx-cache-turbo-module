@@ -1,0 +1,42 @@
+id: nginx-l2-blob-ingress-unvetted
+language: c
+severity: error
+message: >-
+  ctx->l2_blob is assigned without ngx_http_cache_turbo_blob_clear_vetted()
+  in the same block. This is an L2 INGRESS POINT: the bytes came from Redis /
+  memcached, i.e. from a writer this worker does not control (compromised,
+  other-tenant, or MITM'd -- AUD-TLS1). BLOBF_HDRS_VETTED (0x0020) tells
+  restore_response_headers() to SKIP ngx_http_cache_turbo_header_admissible()
+  entirely, so a blob that reaches L1 or the serve path with the bit still set
+  hands an L2 writer a one-bit response-splitting / request-smuggling /
+  Set-Cookie primitive. Call
+  ngx_http_cache_turbo_blob_clear_vetted(copy, blob_len) on the private copy
+  BEFORE the assignment.
+note: >-
+  The clearing must happen at ingress, not at serve: the L2 promotion
+  (access.c store_if) writes the SAME buffer into L1, where it is served for
+  the entry's whole lifetime. Clearing later than the assignment leaves that
+  promoted copy poisoned. See NGX_HTTP_CACHE_TURBO_BLOBF_HDRS_VETTED in
+  src/ngx_http_cache_turbo_internal.h for the full argument.
+rule:
+  kind: assignment_expression
+  all:
+    - has:
+        field: left
+        regex: l2_blob$
+    # A `ctx->l2_blob = NULL` reset is not an ingress -- there are no bytes to
+    # demote. Only an assignment of a real buffer is an ingress point.
+    - not:
+        has:
+          field: right
+          regex: ^NULL$
+    - inside:
+        kind: compound_statement
+        stopBy: end
+        not:
+          has:
+            stopBy: end
+            kind: call_expression
+            has:
+              field: function
+              regex: ^ngx_http_cache_turbo_blob_clear_vetted$

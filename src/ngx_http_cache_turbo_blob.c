@@ -260,6 +260,45 @@ ngx_http_cache_turbo_blob_hdr_write(u_char *dst,
 }
 
 
+/*
+ * P4-3: clear BLOBF_HDRS_VETTED on a blob that arrived from L2.
+ *
+ * The vetted bit asserts "ngx_http_cache_turbo_header_admissible() has
+ * already run over every header pair in this blob". That is only true of a
+ * blob this worker serialised itself. The store path hands the SAME buffer to
+ * l1->store() and to backend->set() (filters.c), so the bit reaches Redis /
+ * memcached and would come straight back set -- from a writer we do not
+ * control. Honouring it off the wire turns one bit into a response-splitting
+ * and Set-Cookie primitive (AUD-HDR1's exact threat model, AUD-TLS1's exact
+ * attacker). Stripping it here demotes every L2 blob back to "must be
+ * re-validated", i.e. to the behaviour that shipped before P4-3.
+ *
+ * Deliberately unconditional and total: it rewrites the u16 rather than
+ * testing first, so there is no "was it set?" branch whose inverse could be
+ * got wrong, and it is a no-op on a buffer too short to hold the 44-byte wire
+ * header (such a blob is rejected by blob_validate() anyway, but the bounds
+ * check must not depend on that ordering).
+ *
+ * The other flag bits are preserved untouched: BLOBF_BREAKER_ONLY and
+ * BLOBF_ORIGIN_ENCODED are enforced at the serve chokepoint and are
+ * RESTRICTIONS -- clearing them would fail OPEN. Only the vetted bit is a
+ * permission, so only the vetted bit is dropped.
+ */
+void
+ngx_http_cache_turbo_blob_clear_vetted(u_char *blob, size_t len)
+{
+    uint16_t  flags;
+
+    if (blob == NULL || len < NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE) {
+        return;
+    }
+
+    flags = (uint16_t) ngx_http_cache_turbo_get_u16(blob + 6);
+    flags = (uint16_t) (flags & ~NGX_HTTP_CACHE_TURBO_BLOBF_HDRS_VETTED);
+    ngx_http_cache_turbo_put_u16(blob + 6, flags);
+}
+
+
 /* Forward-declared so blob_validate() below can drive the same TLV iterator
  * it used to only be mirrored by; see the S231-PERF-HDRWALK comment on
  * ngx_http_cache_turbo_blob_next_header()'s definition further down. */

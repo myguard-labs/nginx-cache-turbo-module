@@ -367,7 +367,14 @@ def run_all(ng: Nginx, origin: Origin,
             ng, origin, redis)                          # AUD-L2-PROMOTE-RACE
         test_l2_preserves_original_freshness(ng, origin, redis)
         test_l2_malformed_blob_rejected(ng, origin, redis)  # STAB-4 validate
+        # P4-3 positive control: the store path really does stamp the bit,
+        # so the fast path is not silently a no-op.
+        test_l2_store_stamps_hdrs_vetted_bit(ng, origin, redis)        # P4-3
         test_l2_forged_blob_cannot_inject_headers(ng, origin, redis)   # AUD-BLOBE2E1
+        # P4-3: same primitives, but with BLOBF_HDRS_VETTED forged on -- the
+        # bit must be stripped at L2 ingress, not honoured off the wire.
+        test_l2_forged_vetted_bit_does_not_bypass_header_gate(
+            ng, origin, redis)                                         # P4-3
         test_l2_restore_href_array_alignment_ubsan(ng, origin, redis)  # S231-HDRWALK-VALIDATE-STRICTER
         test_sie_forged_blob_cannot_inject_headers(ng, origin, redis)  # AUD-SIEBLOB1
         test_sie_ttl_stored_in_blob(ng, origin, redis)      # RFC-2 CTB4 sie_ttl
@@ -423,6 +430,11 @@ def run_all(ng: Nginx, origin: Origin,
     if mc is not None:
         test_l2_memcached_write_through(ng, origin, mc)        # v13
         test_l2_memcached_cross_instance_fill(ng, origin, mc)  # v13
+        # P4-3: the memcached ingress point is a SEPARATE call site from
+        # redis.c; without this the redis test alone would stay green while
+        # memcached deployments kept the bypass.
+        test_l2_memcached_forged_vetted_bit_does_not_bypass_header_gate(
+            ng, origin, mc)                                    # P4-3
         test_l2_memcached_purge_key_drops_l2(ng, origin, mc)   # v13
         if redis is not None:
             # child redis over parent memcached — precedence regression lock

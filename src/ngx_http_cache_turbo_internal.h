@@ -664,6 +664,53 @@ typedef struct {
 #define NGX_HTTP_CACHE_TURBO_BLOBF_AUTH_SHAREABLE  0x0010
 
 /*
+ * P4-3: every header pair in this blob has ALREADY passed
+ * ngx_http_cache_turbo_header_admissible() -- this worker wrote the blob on
+ * its own store path (filters.c body_filter_blob_write), where the identical
+ * gate runs on the way IN. When the bit is set, restore_response_headers()
+ * may skip the per-header re-validation (tchar name scan + CR/LF/NUL value
+ * scan + the 18-entry header_skip walk, ~20 strncasecmp per header) instead
+ * of paying it again on every L1 hit for bytes we produced and vetted.
+ *
+ * ⚠ THIS BIT IS A SECURITY GATE'S OFF SWITCH. It says "the AUD-HDR1 gate has
+ * already run", and the ONLY thing that makes that claim true is that the
+ * bytes never left this process's own trust domain. The blob written on the
+ * store path is handed to BOTH l1->store() and backend->set()
+ * (filters.c:1775), so a stamped blob DOES travel out to Redis/memcached and
+ * can come back -- possibly from a compromised, MITM'd or simply
+ * other-tenant L2 writer (AUD-TLS1). Honouring the bit off the wire would
+ * hand an L2 writer a one-bit response-splitting / smuggling / Set-Cookie
+ * primitive: set 0x0020, put "X: a\r\nSet-Cookie: sid=1" in the blob, and
+ * restore replays it verbatim.
+ *
+ * Therefore the bit is CLEARED at every L2 ingress point, on the private
+ * r->pool copy, before any consumer sees it:
+ *   - redis.c     ngx_http_cache_turbo_redis_get_finish()
+ *   - memcached.c ngx_http_cache_turbo_mc_get_finish()
+ * (both at their `ctx->l2_blob = copy;` assignment)
+ * Those two assignments are the ONLY producers of ctx->l2_blob, and every
+ * downstream L2 consumer (the L1 promotion via store_if(), the breaker
+ * snapshot, the SIE snapshot, the vary-marker consume, and serve() itself)
+ * reads that same buffer -- so clearing there covers all of them by
+ * construction rather than by enumeration. Use
+ * ngx_http_cache_turbo_blob_clear_vetted() (blob.c); do not open-code it.
+ *
+ * Anything that adds a THIRD way for foreign bytes to become a blob this
+ * process serves MUST clear the bit at that ingress too. Grep for
+ * BLOBF_HDRS_VETTED before adding one.
+ *
+ * Bit choice: 0x0020. 0x0001 = BLOBF_BREAKER_ONLY, 0x0002 =
+ * BLOBF_ORIGIN_ENCODED, 0x000C = the 2-bit ae-class, 0x0010 =
+ * BLOBF_AUTH_SHAREABLE (P3-4). Next free bit is 0x0040.
+ *
+ * Fail-safe direction: an OLD blob (or any blob whose bit is 0) simply gets
+ * the full gate, which is today's behaviour. The bit can only ever REMOVE
+ * work, never add trust that was not there, so a missing bit costs CPU and a
+ * spurious one is what the clearing above exists to make impossible.
+ */
+#define NGX_HTTP_CACHE_TURBO_BLOBF_HDRS_VETTED  0x0020
+
+/*
  * S231-PERF-HDRWALK: one parsed TLV header entry, as produced by the single
  * walk inside ngx_http_cache_turbo_blob_validate() and consumed directly by
  * ngx_http_cache_turbo_restore_response() -- no second bounds-checking pass
@@ -683,6 +730,12 @@ typedef struct {
  * body-filter sites. */
 void ngx_http_cache_turbo_blob_hdr_write(u_char *dst,
     const ngx_http_cache_turbo_blob_hdr_t *h);
+/* P4-3: strip NGX_HTTP_CACHE_TURBO_BLOBF_HDRS_VETTED from a blob that came
+ * from L2. MUST be called on the private copy at every L2 ingress point
+ * before any consumer reads it -- see the bit's definition above for why this
+ * is the whole security argument. Safe on a buffer too short to hold the wire
+ * header (no-op) and on a blob that never had the bit. */
+void ngx_http_cache_turbo_blob_clear_vetted(u_char *blob, size_t len);
 ngx_int_t ngx_http_cache_turbo_blob_validate(const u_char *blob, size_t len,
     ngx_http_cache_turbo_blob_hdr_t *out, const u_char **hdr_block,
     const u_char **body, ngx_pool_t *pool,

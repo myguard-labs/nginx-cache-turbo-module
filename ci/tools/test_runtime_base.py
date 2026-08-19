@@ -1652,12 +1652,18 @@ def make_ctb4_blob(body: bytes, status: int = 200,
                    created: int | None = None, fresh_ttl: int = 60,
                    stale_ttl: int = 240, sie_ttl: int = 0,
                    magic: int = 0x43544234,
-                   version: int = 4) -> bytes:
+                   version: int = 4, flags: int = 0) -> bytes:
     """Hand-build a CTB4 cache blob exactly as the module serialises it (STAB-4 +
     RFC-2: fixed 44-byte little-endian, padding-free header). Pass a wrong
     magic/version to exercise the validator's reject path. Wire layout (LE):
       u32 magic, u16 version, u16 flags, u32 status, u32 nheaders, u32 headers_len,
-      u32 body_len, i64 created, u32 fresh_ttl, u32 stale_ttl, u32 sie_ttl."""
+      u32 body_len, i64 created, u32 fresh_ttl, u32 stale_ttl, u32 sie_ttl.
+
+    `flags` writes the BLOBF_* u16 at offset 6. It defaults to 0 (no bits),
+    which is what every pre-P4-3 caller assumed. Pass BLOBF_HDRS_VETTED
+    (0x0020) to FORGE the "these headers were already vetted" claim an L2
+    writer would most want to make -- the module must strip it at L2 ingress
+    and re-run header_admissible() anyway."""
     headers = headers or {"Content-Type": "text/plain"}
     created = int(time.time()) if created is None else created
     hdr_block = b""
@@ -1668,7 +1674,7 @@ def make_ctb4_blob(body: bytes, status: int = 200,
         hdr_block += struct.pack("<I", len(nb)) + nb
         hdr_block += struct.pack("<I", len(vb)) + vb
         nheaders += 1
-    head = struct.pack("<IHHIIIIqIII", magic, version, 0, status, nheaders,
+    head = struct.pack("<IHHIIIIqIII", magic, version, flags, status, nheaders,
                        len(hdr_block), len(body), created, fresh_ttl, stale_ttl,
                        sie_ttl)
     return head + hdr_block + body

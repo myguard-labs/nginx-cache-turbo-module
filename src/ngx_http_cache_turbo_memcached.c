@@ -1264,6 +1264,17 @@ ngx_http_cache_turbo_mc_get_finish(ngx_http_cache_turbo_mc_op_t *op,
             result = NGX_ERROR;
         } else {
             ngx_memcpy(copy, blob, blob_len);
+            /* P4-3: these bytes came from L2 -- a writer this worker does not
+             * control (a compromised or shared memcached, another tenant, a
+             * MITM: AUD-TLS1).
+             * Strip BLOBF_HDRS_VETTED on our private copy BEFORE anything
+             * reads it, so restore_response_headers() runs the full AUD-HDR1
+             * gate over them exactly as it did before P4-3. This assignment
+             * and its redis.c twin are the ONLY producers of ctx->l2_blob,
+             * so clearing here covers every downstream L2 consumer (the L1
+             * promotion, the breaker/SIE snapshots, the vary-marker consume
+             * and serve() itself) by construction. */
+            ngx_http_cache_turbo_blob_clear_vetted(copy, blob_len);
             ctx->l2_blob = copy;
             ctx->l2_blob_len = blob_len;
         }
