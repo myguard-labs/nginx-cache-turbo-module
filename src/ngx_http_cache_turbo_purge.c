@@ -100,6 +100,20 @@ ngx_http_cache_turbo_purge_auto_vary(ngx_http_request_t *r,
 
         (void) clcf->l1->purge_key(z, mk, ngx_crc32_short(mk, 32));
 
+        /* P3-5 (codex-review MINOR): the marker write-through means an L2
+         * copy of THIS base's marker can now exist independently of the L1
+         * one just purged above -- drop it too, or a cold node's later
+         * marker-miss consult resolves stale pre-purge bits/gen and chases a
+         * variant key every one of the SMEMBERS-driven deletes below is
+         * about to remove, costing an extra round trip for nothing (never a
+         * wrong-variant risk: the variant OBJECT itself is gone from L2 by
+         * the time any such consult could complete, so it can only ever
+         * miss through to origin, not misresolve). Fire-and-forget, same as
+         * every other write-through/delete on this path. */
+        if (clcf->backend->del) {
+            clcf->backend->del(clcf, mk);
+        }
+
         tp = ngx_pcalloc(r->pool, sizeof(*tp));
         if (tp == NULL) {
             /* could not launch (alloc): fall through to the sync
@@ -185,8 +199,10 @@ ngx_http_cache_turbo_purge_auto_vary(ngx_http_request_t *r,
     if (next_gen == 0) {
         next_gen = 1;
     }
-    ngx_http_cache_turbo_marker_store(clcf, z, &ctx->cache_key, bits,
-                                      next_gen, mttl);
+    ngx_http_cache_turbo_marker_store(r, clcf, z, &ctx->cache_key, bits,
+                                      next_gen, mttl,
+                                      ngx_http_cache_turbo_stale_ttl(mttl,
+                                          clcf->stale_mult));
     (*purged)++;
 
     return NGX_OK;

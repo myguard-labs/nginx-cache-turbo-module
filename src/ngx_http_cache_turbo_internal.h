@@ -730,9 +730,10 @@ void ngx_http_cache_turbo_vary_apply(ngx_http_request_t *r,
 void ngx_http_cache_turbo_variant_hash(ngx_http_request_t *r,
     ngx_str_t *base, ngx_int_t bits, ngx_uint_t gen, u_char out[32]);
 void ngx_http_cache_turbo_marker_hash(ngx_str_t *base, u_char out[32]);
-void ngx_http_cache_turbo_marker_store(ngx_http_cache_turbo_loc_conf_t *clcf,
+void ngx_http_cache_turbo_marker_store(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf,
     ngx_http_cache_turbo_zone_t *z, ngx_str_t *base, ngx_int_t bits,
-    ngx_uint_t gen, time_t ttl);
+    ngx_uint_t gen, time_t ttl, time_t retain_ttl);
 size_t ngx_http_cache_turbo_variant_index_name(ngx_str_t *base, u_char *buf);
 void ngx_http_cache_turbo_classify_vary(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, ngx_int_t *bits_out,

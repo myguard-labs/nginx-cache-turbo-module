@@ -1,5 +1,17 @@
 Changes with the nginx-cache-turbo-module (unreleased)
 
+    *) Fix: the auto-Vary marker is now written through to L2 (Redis), keyed
+       by the same marker hash the L1 marker uses, and consulted on an L1
+       marker miss before falling back to a base-key L2 lookup that a varied
+       URL's base slot never populates. Previously the shared L2 tier was
+       effectively disabled for any Vary-emitting origin with auto_vary on
+       (the default) on a multi-node deployment: a node with no L1 marker
+       (a fresh boot, an LRU-evicted marker) missed both L1 and L2 for a
+       variant a peer had already stored in Redis. The extra L2 GET fires
+       only on the marker-cold path; a warm L1 marker still resolves with no
+       additional round trip, and a resolved L2 marker self-heals the node's
+       own L1 marker so the next request pays nothing.
+
     *) Feature: cache_turbo_min_uses_window adds time-windowed reset to the
        min_uses miss counter. Without a window, miss_count persists for the
        node's lifetime (reset only on LRU eviction). With a window, the counter

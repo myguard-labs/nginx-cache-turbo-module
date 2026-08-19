@@ -377,6 +377,7 @@ def run_all(ng: Nginx, origin: Origin,
         test_l2_tag_cap_and_dedup(ng, origin, redis)  # PERF-2 tag cap/dedup
         test_l2_tag_add_batched_one_op(ng, origin, redis)  # L9 one op for N tags
         test_cor5_redis_variant_purge(ng, origin, redis)  # COR-5 variant index
+        test_l2_vary_marker_cold_node_finds_peer_variant(ng, origin, redis)  # P3-5
         test_multinode_lock(ng, origin, redis)
         test_cross_node_won_stale_body(ng, origin, redis)  # S231-PERF-BGSNAP
         test_lock_self_heal(ng, origin, redis)
