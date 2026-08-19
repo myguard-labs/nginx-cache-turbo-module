@@ -183,6 +183,67 @@ check_probe_layout() {
 }
 check_probe_layout
 
+# P2-3: pin the size of ngx_http_cache_turbo_node_t so it does not silently grow
+# or shrink and change which slab class it lands in. The node must remain in the
+# 256B slab class (nginx slab sizes are powers of 2: 128, 256, 512, ...).
+# Measured with pahole; currently 200 bytes. The bounds check (128 < size <= 256)
+# is portable across architectures and toolchains, while the exact size is not
+# (padding, alignment, and type widths vary). If the struct grows past 256B or
+# shrinks below 128B, the check fails loudly. Adding fields that change the size
+# within the 256B class is permitted; leaving this check as-is (it will now cover
+# a wider range) is the right behaviour.
+check_node_size() {
+    # pahole (dwarves package) is a required CI dependency -- see the
+    # "Install build dependencies" step in .github/workflows/build-test.yml.
+    # Skipping this check when the tool is missing would make the P2-3
+    # assertion silently vacuous instead of failing loudly on the exact
+    # regression it exists to catch, so a missing tool is itself a failure.
+    if ! command -v pahole >/dev/null 2>&1; then
+        echo "✗ pahole not found; required to measure" \
+             "ngx_http_cache_turbo_node_t (P2-3 slab-class check)" >&2
+        return 1
+    fi
+
+    # Find the struct size from pahole output in one of the compiled objects.
+    # The struct is only in one TU at most, so try a few.
+    # REPO-relative, not cwd-relative: this script runs under `make -C
+    # ci/tests/unit`, whose cwd is ci/tests/unit, not the repo root where
+    # ci-build.sh writes .build/. A ./.build/... glob from that cwd matches
+    # nothing and the loop falls straight through to the "not found" error.
+    for obj in "$UNIT_DIR"/../../../.build/nginx-*/objs/addon/src/ngx_http_cache_turbo_module.o; do
+        if [ ! -f "$obj" ]; then
+            continue
+        fi
+        # -F dwarf: this object has no .BTF section (only clang/pahole's BTF
+        # encoder emits one), so the default BTF-first probe exits non-zero
+        # with no size line and the loop silently tries the next object.
+        # DWARF is always present from a normal -g compile, so pin the
+        # source format explicitly rather than relying on pahole's fallback.
+        size=$(pahole -F dwarf -C ngx_http_cache_turbo_node_t "$obj" 2>/dev/null \
+               | grep "/\* size:" | head -1 \
+               | sed -E 's/.*size:[[:space:]]*([0-9]+).*/\1/')
+        if [ -n "$size" ]; then
+            # Ensure the node fits in the 256B slab class (>128, <=256).
+            # A node that grows past 256B moves to the 512B class and is a
+            # significant memory-efficiency regression.
+            if [ "$size" -le 128 ] || [ "$size" -gt 256 ]; then
+                echo "✗ ngx_http_cache_turbo_node_t size is $size bytes;" \
+                     "must be in the 256B slab class (128 < size <= 256)" >&2
+                echo "  If the struct grew past 256B, this is a P4-3 blocker." \
+                     "Update memory/PLAN-optimize.md with the new size and" \
+                     "slab class, and justify the change." >&2
+                return 1
+            fi
+            return 0
+        fi
+    done
+    # If the struct size could not be measured (pahole ran but found nothing),
+    # that is unexpected and should fail.
+    echo "✗ could not measure ngx_http_cache_turbo_node_t size with pahole" >&2
+    return 1
+}
+check_node_size || exit 1
+
 # PERF-7: the blob refcount header is hand-mirrored into test_shm_state.c (the
 # harness declares its own structs rather than including module.h). CT_BLOBREF()
 # steps BACK by sizeof(that struct) from the blob pointer, so if the mirror ever

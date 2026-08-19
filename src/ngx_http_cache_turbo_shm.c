@@ -5,6 +5,11 @@
  * L1 shared-memory page cache: rbtree of cached objects keyed by the 32-byte
  * hash of the cache key, an LRU queue for eviction, and atomic stat counters.
  * Modelled on ngx_http_limit_req_module's slab+rbtree zone.
+ *
+ * Shared mutex: the zone mutex (z->shpool->mutex) uses nginx's ngx_shmtx,
+ * which compiles to the atomic spin-then-futex variant when NGX_HAVE_ATOMIC_OPS
+ * and NGX_HAVE_POSIX_SEM are both available (GCC atomics + POSIX semaphores).
+ * This is the expected variant for contention analysis (P4-1).
  */
 
 #include "ngx_http_cache_turbo_module.h"
