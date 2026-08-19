@@ -491,6 +491,73 @@ ngx_http_cache_turbo_header_filter_capture(ngx_http_request_t *r,
         /* Every shared leg up to response_cacheable() passed and the
          * response still was not captured -- attribute the refusal. */
         ngx_http_cache_turbo_capture_count_refusal(r, clcf, cacheable_reason);
+    } else if (clcf->enable && clcf->shm_zone != NULL
+               && (r == r->main || ctx->warm)
+               && !(r->method & NGX_HTTP_HEAD)
+               && !ctx->req_no_store
+               && r->headers_out.status == NGX_HTTP_NOT_MODIFIED)
+    {
+        /* P5-4: 304 freshening. This is an ORIGIN-sent 304 answering a
+         * revalidation (the client-facing 304 replay module.c synthesizes
+         * from a HIT sets ctx->served, which returns at the top of
+         * ngx_http_cache_turbo_header_filter() long before this function
+         * runs -- so a served-from-cache 304 can never reach here; only a
+         * real round trip to the origin can). status_ttl() refuses 304
+         * unconditionally (it is not `cache_turbo_valid`-able at all, see
+         * conf.c), so the normal capture branch above never fires for it --
+         * this is the distinct path that exists BECAUSE that refusal is
+         * correct and permanent, not a bug to route around.
+         *
+         * Deliberately its own `else if`, gated on none of vary_nocache /
+         * min_uses_skip / auto_skip / status_ttl: those gate whether a BODY
+         * may be captured, and this never captures a body -- it only
+         * extends the life of one already resident from an earlier 200.
+         * req_no_store is still honoured: a request that opted this
+         * response out of caching gets no side effect from it either. */
+        time_t  fresh_ttl = clcf->valid;
+
+        if (clcf->honor_cc && !clcf->ignore_cc) {
+            time_t  up = ngx_http_cache_turbo_upstream_ttl(r);
+            if (up >= 0) {
+                fresh_ttl = up;
+            }
+        }
+
+        if (fresh_ttl > NGX_HTTP_CACHE_TURBO_TTL_MAX) {
+            fresh_ttl = NGX_HTTP_CACHE_TURBO_TTL_MAX;
+        }
+
+        if (ctx->warm && ngx_http_cache_turbo_build_key(r, clcf, ctx) != NGX_OK) {
+            return;
+        }
+
+        {
+            ngx_http_cache_turbo_zone_t  *z = clcf->shm_zone->data;
+            uint32_t                      hash =
+                ngx_crc32_short(ctx->key_hash, 32);
+            time_t                        stale_window =
+                ngx_http_cache_turbo_stale_ttl(fresh_ttl, clcf->stale_mult);
+            ngx_int_t                     rc;
+
+            rc = clcf->l1->freshen(z, ctx->key_hash, hash, fresh_ttl,
+                                    stale_window);
+
+            if (rc == NGX_OK) {
+                ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                               "cache_turbo: 304 freshened \"%V\" "
+                               "fresh_ttl=%T", &r->uri, fresh_ttl);
+                (void) ngx_atomic_fetch_add(&z->sh->refreshes, 1);
+            } else {
+                /* No resident entry to freshen (evicted/never stored/not
+                 * yet this key) -- nothing to extend, and nothing to store
+                 * either (a 304 still has no body). The revalidation was
+                 * not wasted from the origin's point of view, but this zone
+                 * has no record of it. */
+                ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                               "cache_turbo: 304 with nothing to freshen "
+                               "\"%V\"", &r->uri);
+            }
+        }
     }
 
     /* Cold-miss single-flight (v10): if we are the winner but this response is

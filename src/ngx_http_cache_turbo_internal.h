@@ -145,6 +145,11 @@ ngx_int_t ngx_http_cache_turbo_shm_store_if(ngx_http_cache_turbo_zone_t *z,
     u_char *key_hash, uint32_t hash, u_char *data, size_t len,
     time_t fresh_ttl, time_t stale_ttl, ngx_uint_t predicate);
 
+/* P5-4: 304 freshening. See the L1 vtable `freshen` comment for the return
+ * contract. */
+ngx_int_t ngx_http_cache_turbo_shm_freshen(ngx_http_cache_turbo_zone_t *z,
+    u_char *key_hash, uint32_t hash, time_t fresh_ttl, time_t stale_ttl);
+
 /* Purge a single entry by key hash. Returns 1 if an entry was removed, 0 if
  * not present. */
 ngx_int_t ngx_http_cache_turbo_shm_purge_key(ngx_http_cache_turbo_zone_t *z,

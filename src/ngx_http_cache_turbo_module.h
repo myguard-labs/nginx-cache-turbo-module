@@ -2374,6 +2374,29 @@ struct ngx_cache_turbo_l1_backend_s {
         uint32_t hash);
     void       (*l2_neg_set)(ngx_http_cache_turbo_zone_t *z, u_char *key_hash,
         uint32_t hash, time_t ttl);
+
+    /* P5-4: 304 freshening. Bump a resident entry's fresh_until/stale_until
+     * IN PLACE (no body touched, no re-alloc) when a revalidation came back
+     * 304 Not Modified -- the origin's own confirmation that the stored body
+     * is still correct. Unlike store()/store_if(), this never creates a new
+     * node: a 304 with no matching resident entry has nothing to confirm and
+     * must not fabricate one (NGX_DECLINED).
+     *
+     * Returns:
+     *   NGX_OK       -- resident entry found (kind == ENTRY, len > 0) and
+     *                    its freshness window extended.
+     *   NGX_DECLINED -- no resident entry, or a stub/counter node -- nothing
+     *                    to freshen. Not an error; the caller falls back to
+     *                    the ordinary "304 with nothing to extend" case
+     *                    (log and move on, same as before this existed).
+     *
+     * fresh_ttl/stale_ttl are seconds from now, same units and same-origin
+     * meaning as store()'s -- the caller derives them from the revalidation
+     * response's own Cache-Control/Expires (or the location's configured
+     * `valid`/`stale` if the 304 carried none), never from the stale entry's
+     * OLD ttls, which would compound rather than refresh. */
+    ngx_int_t  (*freshen)(ngx_http_cache_turbo_zone_t *z, u_char *key_hash,
+        uint32_t hash, time_t fresh_ttl, time_t stale_ttl);
 };
 
 #define NGX_HTTP_CACHE_TURBO_CLAIM_WINNER  0
