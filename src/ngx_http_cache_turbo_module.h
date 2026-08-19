@@ -1727,7 +1727,7 @@ typedef struct {
      * re-asserts vary_marker_l1_miss. */
     unsigned                 vary_marker_l2_tried:1;
     unsigned                 vary_marker_l2_done:1;
-    /* S231-L2-BACKOFF: set when the marker GET's OWN result was a transport
+    /* S231-L2-BACKOFF: set when the RESULT of the marker GET was a transport
      * failure (NGX_ERROR -- connect refused/timeout/malformed reply), i.e.
      * this request already paid for and proved L2 is unreachable. Read by
      * access_l2_get() to skip its own connect attempt for the object GET

@@ -1466,7 +1466,7 @@ ngx_http_cache_turbo_access_l2_marker_consume(ngx_http_request_t *r,
      * request against a dead peer, request 1's own skip counter moving
      * 0->1 -- ci/tools/areas/breaker.py's test_redis_connect_backoff_
      * fails_fast pins "the arming request must not count itself".)
-     * NGX_ERROR here is the marker GET's transport-failure outcome
+     * NGX_ERROR here is the transport-failure outcome of the marker GET
      * (connect refused/timeout/malformed reply -- the same class that arms
      * backoff, per redis.c's op_fail/get_finish "unconnected" classifi-
      * cation): this request has ALREADY paid for and learned that L2 is
