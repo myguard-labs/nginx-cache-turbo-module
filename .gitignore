@@ -71,3 +71,7 @@ ci/fuzz/corpus_blob/*
 # servroot instead lands beside the .t files, as ci/t/servroot/. It holds a
 # generated nginx.conf plus access/error logs -- scratch, never source.
 ci/t/servroot/
+
+# perf-profile.sh output (ci/tools/perf-profile.sh) -- perf.data + report,
+# regenerated per run, not source.
+ci/tools/perf-out/
