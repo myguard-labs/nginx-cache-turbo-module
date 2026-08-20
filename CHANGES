@@ -1,5 +1,32 @@
 Changes with the nginx-cache-turbo-module (unreleased)
 
+    *) Feature: cache_turbo_ignore_set_cookie NAME... relaxes the Set-Cookie
+       store floor for explicitly named, non-identifying cookies -- the
+       module's equivalent of nginx proxy_ignore_headers Set-Cookie, except
+       named rather than blanket. A response carrying any Set-Cookie was
+       previously never stored; CMS and analytics stacks that staple _ga, an
+       A/B bucket or a consent flag onto otherwise shareable HTML therefore
+       made every response uncacheable, which on a WordPress or Magento origin
+       with any analytics or consent plugin can be the dominant cause of a
+       near-zero hit ratio.
+       Fail-closed at every ambiguity: the store is permitted only when EVERY
+       Set-Cookie in the response resolves to exactly one RFC 6265 token
+       cookie name AND that name is on the configured list. One unlisted name
+       among several listed ones, a value with no '=', an empty or quoted
+       name, or an embedded space each refuse the store exactly as before.
+       The name is parsed from the cookie-pair only, never from the
+       attributes, so "Set-Cookie: sessionid=x; Path=/_ga" is not matched by a
+       listed _ga.
+       Hard-vetoed whenever cookie value-keying is configured in the location
+       (any cache_turbo_backend preset active, or any cache_turbo_key_cookie
+       set): a request without the key cookie hashes to the anonymous entry
+       while the response establishes the segment, so storing it would poison
+       the anonymous entry for every anonymous visitor. What is STORED is
+       unchanged -- Set-Cookie remains unconditionally stripped before
+       serialisation, so no cached entry can ever replay a cookie to a
+       different client. Default off; absent the directive behaviour is
+       byte-identical to before.
+
     *) Feature: cache_turbo_background_update_max N adds a zone-wide cap on
        CONCURRENT background-refresh (stale-while-revalidate) subrequests.
        Per-key single-flight already bounded regens for one key, but nothing

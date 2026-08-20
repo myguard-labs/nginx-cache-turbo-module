@@ -111,8 +111,10 @@ typedef struct {
      * hashes to the ANONYMOUS entry, and if the response ESTABLISHES the segment
      * (Set-Cookie: <keycookie>=...) then storing that body under the anonymous
      * key poisons it for every anonymous visitor. The floor refuses to store ANY
-     * Set-Cookie response, unconditionally, which covers that case exactly.
-     * DO NOT relax that floor without adding a preset-level veto here first.
+     * Set-Cookie response, which covers that case exactly. Its only relax,
+     * P5-8's cache_turbo_ignore_set_cookie, is hard-vetoed for any location
+     * with an active backend preset -- that IS the preset-level veto this
+     * comment used to demand. DO NOT weaken it.
      */
     const char *const  *key_cookies;
 } ngx_http_cache_turbo_preset_t;
@@ -675,10 +677,12 @@ static const char *const  ct_mw_args[] = {
  * poisons it for everyone. Upstream refuses to cache exactly this
  * (vcl_backend_response: beresp.uncacheable when the request had no vary cookie
  * and the response sets one). We inherit the identical refusal from the
- * UNCONDITIONAL Set-Cookie floor in ngx_http_cache_turbo_response_cacheable():
- * the response that establishes the segment carries a Set-Cookie, so it is never
- * stored, under any key. A dedicated preset veto would be dead code today — but
- * this preset DEPENDS on that floor, and the floor says so.
+ * Set-Cookie floor in ngx_http_cache_turbo_response_cacheable(): the response
+ * that establishes the segment carries a Set-Cookie, so it is never stored,
+ * under any key. This preset DEPENDS on that floor, and the floor says so.
+ * The floor's only relax (P5-8's cache_turbo_ignore_set_cookie) is hard-vetoed
+ * for any location with an active backend preset, so the dedicated preset veto
+ * that would have been dead code when this was written now exists.
  *
  * The raw Cookie header is parsed directly because nginx does NOT expose a
  * hyphenated cookie via $cookie_ (there is no '-' -> '_' translation for cookie

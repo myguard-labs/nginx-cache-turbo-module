@@ -970,6 +970,35 @@ char *ngx_http_cache_turbo_bypass_stale_uri(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 char *ngx_http_cache_turbo_key_cookie_conf(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
+char *ngx_http_cache_turbo_ignore_set_cookie_conf(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
+
+/*
+ * P5-8: is C a legal RFC 6265 cookie-name byte?
+ *
+ * cookie-name is an RFC 9110 token: any VCHAR except the separators. Written as
+ * ONE table rather than duplicated inline chains, because the config-time
+ * validator and the runtime Set-Cookie parser MUST agree exactly -- a byte the
+ * validator accepts but the parser rejects makes a configured name silently
+ * inert, and a byte the parser accepts but the validator rejects is a name the
+ * operator can never configure. Two hand-maintained lists WILL drift; one table
+ * cannot.
+ *
+ * Rejects CTLs and SP (c <= 0x20), DEL and everything above (c >= 0x7f), and
+ * the separator set.
+ */
+static ngx_inline ngx_int_t
+ngx_http_cache_turbo_is_cookie_name_byte(u_char c)
+{
+    static const char  seps[] = "=;,\"()<>@:\\/[]?{}\t";
+
+    if (c <= 0x20 || c >= 0x7f) {
+        return 0;
+    }
+
+    return ngx_strchr(seps, (int) c) == NULL;
+}
+
 /* P0-1: reason_out receives which arm vetoed (see the
  * NGX_HTTP_CACHE_TURBO_REFUSE_* enum in module.h), or _NONE (0) when the
  * function returns 1 (cacheable) -- reason_out may be NULL for callers that

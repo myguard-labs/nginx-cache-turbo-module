@@ -1307,6 +1307,10 @@ ngx_http_cache_turbo_merge_normalize(ngx_http_cache_turbo_loc_conf_t *conf,
     if (conf->key_cookies == NGX_CONF_UNSET_PTR) {
         conf->key_cookies = prev->key_cookies;
     }
+    /* P5-8 named Set-Cookie ignore list: same UNSET-only inherit. */
+    if (conf->ignore_set_cookie == NGX_CONF_UNSET_PTR) {
+        conf->ignore_set_cookie = prev->ignore_set_cookie;
+    }
     /* cache_turbo_vary_ignore (P3-3): inherit UNSET-only, same as
      * normalize_strip -- a location that sets its own list fully replaces the
      * parent's rather than appending to it. */
@@ -3032,6 +3036,77 @@ ngx_http_cache_turbo_key_cookie_conf(ngx_conf_t *cf, ngx_command_t *cmd,
                 "cache_turbo_key_cookie name must not be empty");
         }
         s = ngx_array_push(clcf->key_cookies);
+        if (s == NULL) {
+            return NGX_CONF_ERROR;
+        }
+        *s = value[i];
+    }
+
+    return NGX_CONF_OK;
+}
+
+
+/*
+ * cache_turbo_ignore_set_cookie name...  (P5-8) -- the module's NAMED
+ * equivalent of nginx `proxy_ignore_headers Set-Cookie`.
+ *
+ * The unconditional Set-Cookie store floor in
+ * ngx_http_cache_turbo_response_cacheable() exists because a per-client cookie
+ * on a shared body is a cross-user leak. But CMS/analytics stacks staple an
+ * ANONYMOUS, non-identifying cookie (_ga, an A/B bucket, a consent flag) onto
+ * perfectly shareable HTML, making it uncacheable on every request. This
+ * directive lets the operator name exactly those cookies.
+ *
+ * It relaxes NOTHING by itself: the floor still refuses unless EVERY Set-Cookie
+ * in the response names a cookie on this list. Blanket ignore is deliberately
+ * not offered -- there is no directive value that means "all".
+ *
+ * Appends across a level, replaces across levels (same as key_cookies).
+ */
+char *
+ngx_http_cache_turbo_ignore_set_cookie_conf(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf)
+{
+    ngx_http_cache_turbo_loc_conf_t  *clcf = conf;
+    ngx_str_t                        *value, *s;
+    ngx_uint_t                        i, j;
+
+    if (clcf->ignore_set_cookie == NGX_CONF_UNSET_PTR) {
+        clcf->ignore_set_cookie = ngx_array_create(cf->pool, 4,
+                                                   sizeof(ngx_str_t));
+        if (clcf->ignore_set_cookie == NULL) {
+            return NGX_CONF_ERROR;
+        }
+    }
+
+    value = cf->args->elts;
+    for (i = 1; i < cf->args->nelts; i++) {
+
+        if (value[i].len == 0) {
+            return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
+                "cache_turbo_ignore_set_cookie name must not be empty");
+        }
+
+        /*
+         * Reject anything that is not an RFC 6265 cookie-name token. A name
+         * carrying '=', ';', a space or a control byte could never be produced
+         * by the strict parser the floor uses, so it would be dead config that
+         * silently never matches -- and an operator who typed
+         * `_ga=` or `_ga; path=/` believing it matched would think they had
+         * configured a relax that is in fact inert. Fail at config time instead.
+         */
+        for (j = 0; j < value[i].len; j++) {
+            /* SAME predicate the runtime Set-Cookie parser applies, so a name
+             * accepted here can never be one the parser silently refuses to
+             * match (an inert relax the operator believes is active). */
+            if (!ngx_http_cache_turbo_is_cookie_name_byte(value[i].data[j])) {
+                return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
+                    "cache_turbo_ignore_set_cookie name \"%V\" is not a valid "
+                    "cookie name (RFC 6265 token)", &value[i]);
+            }
+        }
+
+        s = ngx_array_push(clcf->ignore_set_cookie);
         if (s == NULL) {
             return NGX_CONF_ERROR;
         }

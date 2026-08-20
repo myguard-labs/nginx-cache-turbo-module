@@ -1552,6 +1552,69 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # P5-8: cache_turbo_ignore_set_cookie names the cookies whose presence
+        # in a response must NOT block the store. The relax applies ONLY when
+        # EVERY Set-Cookie in the response names a listed cookie; one unlisted
+        # or unparseable name refuses the store exactly as /cc/ does. No key
+        # cookie is configured here, which is the precondition for the relax to
+        # be permitted at all. key=$uri to share a slot, so a wrong store shows
+        # up as a HIT rather than hiding behind a key split.
+        # `none` is REQUIRED, not decoration: this server sets
+        # `cache_turbo_backend wordpress` at server level, and any backend preset
+        # is a hard veto on the relax (a preset may declare key cookies, and may
+        # gain them later). Without `none` here every store case below would be
+        # refused by the veto and this location would test nothing.
+        location /scign/ {{
+            cache_turbo                    main;
+            cache_turbo_key                $uri;
+            cache_turbo_valid              30s;
+            cache_turbo_backend            none;
+            cache_turbo_ignore_set_cookie  _ga ab_bucket;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # P5-8 DEFAULT-OFF control. `cache_turbo_backend none` so NO veto arm is
+        # armed, and NO cache_turbo_ignore_set_cookie. Nothing here refuses the
+        # store except the compiled-in default of the directive itself, so a
+        # relax that shipped enabled-by-default would turn this location's
+        # refusal into a HIT. /cc/ cannot prove that: it inherits the
+        # server-level wordpress preset, so its refusal is over-determined.
+        location /scdefault/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    30s;
+            cache_turbo_backend  none;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # P5-8 PRESET VETO: identical to /scign/ but WITHOUT `cache_turbo_backend
+        # none`, so the server-level wordpress preset is inherited. The relax must
+        # be off, proving the veto keys on a preset being active and not only on a
+        # DIY key cookie.
+        location /scignpreset/ {{
+            cache_turbo                    main;
+            cache_turbo_key                $uri;
+            cache_turbo_valid              30s;
+            cache_turbo_ignore_set_cookie  _ga ab_bucket;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # P5-8 HARD VETO: identical ignore list, but a DIY key cookie is also
+        # configured. Value-keying means a request WITHOUT the cookie hashes to
+        # the anonymous entry while the response ESTABLISHES the segment - the
+        # transition race the Set-Cookie floor exists to refuse. The relax must
+        # be off here regardless of the list, so every /scign/ store case must
+        # come back a refusal under /scignkc/.
+        location /scignkc/ {{
+            cache_turbo                    main;
+            cache_turbo_key                $uri;
+            cache_turbo_valid              30s;
+            cache_turbo_backend            none;
+            cache_turbo_ignore_set_cookie  _ga ab_bucket;
+            cache_turbo_key_cookie         seg_id;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # default cache key (no cache_turbo_key) = $host$request_uri, so two
         # Host headers on the same path must NOT collide.
         location /dk/ {{

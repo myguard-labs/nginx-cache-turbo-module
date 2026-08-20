@@ -1135,6 +1135,24 @@ typedef struct {
     ngx_array_t             *key_cookies;
 
     /*
+     * P5-8 (cache_turbo_ignore_set_cookie): array of ngx_str_t cookie NAMES the
+     * operator declares ignorable, the module's equivalent of nginx
+     * `proxy_ignore_headers Set-Cookie` -- except NAMED, not blanket. A response
+     * whose EVERY Set-Cookie names a cookie on this list may be stored despite
+     * the Set-Cookie floor; one unlisted name, one value this module cannot
+     * parse unambiguously, or ANY key cookie being configured (preset or DIY)
+     * refuses the store exactly as before.
+     *
+     * The stored blob never carries the cookie: Set-Cookie is on the
+     * unconditional header_skip[] list, so it is dropped at serialisation and
+     * cannot replay to a different client. The relax changes WHETHER the body is
+     * stored, never WHAT is stored.
+     *
+     * NGX_CONF_UNSET_PTR until set; absent the directive the floor is
+     * byte-identical to before. */
+    ngx_array_t             *ignore_set_cookie;
+
+    /*
      * S232-BYPASS-STALE (cache_turbo_bypass_stale_uri): array of ngx_str_t URI
      * prefixes whose responses are stored ONLY as circuit-breaker fallback --
      * matched by the same segment-boundary ngx_http_cache_turbo_uri_prefix()

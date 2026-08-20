@@ -478,6 +478,13 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       0,
       NULL },
 
+    { ngx_string("cache_turbo_ignore_set_cookie"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_1MORE,
+      ngx_http_cache_turbo_ignore_set_cookie_conf,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+
 #if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
     && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
     { ngx_string("cache_turbo_test_restore_alloc_fail"),
@@ -905,11 +912,14 @@ ngx_http_cache_turbo_build_key(ngx_http_request_t *r,
      * header and pick the bucket). An absent cookie leaves the key unchanged
      * (the anonymous entry), matching the preset semantics.
      *
-     * SAFETY: like the presets, this DEPENDS on the unconditional Set-Cookie
-     * store floor in ngx_http_cache_turbo_response_cacheable() to refuse the
-     * transition race (request without the cookie keys to the anon entry, the
-     * response then SETS the cookie -> storing under the anon key would poison
-     * it). Do not relax that floor.
+     * SAFETY: like the presets, this DEPENDS on the Set-Cookie store floor in
+     * ngx_http_cache_turbo_response_cacheable() to refuse the transition race
+     * (request without the cookie keys to the anon entry, the response then
+     * SETS the cookie -> storing under the anon key would poison it). The floor
+     * is unconditional for THIS location by construction: P5-8's
+     * cache_turbo_ignore_set_cookie relax is hard-vetoed whenever key_cookies
+     * is non-empty, precisely so this dependency cannot be configured away.
+     * Do not weaken that veto.
      */
     if (clcf->key_cookies != NULL
         && clcf->key_cookies != NGX_CONF_UNSET_PTR)
@@ -2888,6 +2898,169 @@ ngx_http_cache_turbo_serve(ngx_http_request_t *r, u_char *copy, size_t len,
 
 
 /*
+ * P5-8: extract the cookie NAME from one Set-Cookie field value, strictly.
+ *
+ * RFC 6265 SS4.1.1: set-cookie-string = cookie-pair *( ";" SP cookie-av ), and
+ * cookie-pair = cookie-name "=" cookie-value. The NAME is therefore everything
+ * before the FIRST '=', and only that -- the attributes after the first ';'
+ * (Path, Domain, Secure, HttpOnly, Max-Age, an Expires date containing commas
+ * and spaces) are NOT part of it and must never be matched against.
+ *
+ * This is deliberately NOT ngx_http_cache_turbo_cookie_value(): that parses the
+ * REQUEST Cookie header, whose grammar is a ';'-separated list of pairs. Reusing
+ * it here would read "Path=/" out of a Set-Cookie's ATTRIBUTES as though it were
+ * a second cookie -- a name-confusion bug that turns an attribute an attacker
+ * influences into a list match.
+ *
+ * FAIL-CLOSED. Returns 0 (and the caller refuses the store) for every value this
+ * cannot resolve to exactly one unambiguous token name:
+ *   - empty value, or no '=' at all (an attribute-only / malformed field);
+ *   - an EMPTY name ("=v"), which RFC 6265 does not define and clients disagree
+ *     on;
+ *   - a name containing a byte outside the RFC 6265 token set -- CTLs, SP, '=',
+ *     ';', ',', '"' and the RFC 9110 separators. A quoted name ("a"=v), a name
+ *     with an embedded space, or one carrying a stray ',' (which some stacks use
+ *     to fold two Set-Cookies into ONE field value -- a fold this parser
+ *     explicitly refuses to guess at) all land here.
+ * Leading OWS before the name is skipped (nginx keeps the value verbatim after
+ * the ':' OWS, but a folded/re-emitted value can carry more); nothing else is
+ * normalised.
+ */
+static ngx_int_t
+ngx_http_cache_turbo_set_cookie_name(u_char *data, size_t len,
+    ngx_str_t *name_out)
+{
+    u_char  *p, *end, *eq;
+    size_t   i;
+
+    if (data == NULL || len == 0) {
+        return 0;
+    }
+
+    p = data;
+    end = data + len;
+
+    while (p < end && (*p == ' ' || *p == '\t')) {
+        p++;
+    }
+
+    eq = ngx_strlchr(p, end, '=');
+    if (eq == NULL || eq == p) {
+        /* No cookie-pair at all, or an empty name. Fail closed. */
+        return 0;
+    }
+
+    name_out->data = p;
+    name_out->len = (size_t) (eq - p);
+
+    for (i = 0; i < name_out->len; i++) {
+        if (!ngx_http_cache_turbo_is_cookie_name_byte(name_out->data[i])) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+
+/*
+ * P5-8: may THIS Set-Cookie field value be ignored for store purposes?
+ *
+ * 1 only when the operator configured cache_turbo_ignore_set_cookie AND the
+ * value parses to exactly one token cookie name AND that name matches a
+ * configured entry EXACTLY and CASE-SENSITIVELY. RFC 6265 cookie names are
+ * case-sensitive on the wire, and a case-insensitive match here would only ever
+ * ACCEPT MORE responses than the operator named -- the wrong direction for a
+ * fail-closed gate. `_GA` therefore never satisfies a list entry of `_ga`.
+ *
+ * Every other outcome is 0 and the caller refuses the store exactly as it did
+ * before this directive existed.
+ */
+static ngx_int_t
+ngx_http_cache_turbo_set_cookie_ignorable(
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_table_elt_t *h)
+{
+    ngx_str_t   name;
+    ngx_str_t  *nm;
+    ngx_uint_t  i;
+
+    if (clcf->ignore_set_cookie == NULL
+        || clcf->ignore_set_cookie == NGX_CONF_UNSET_PTR
+        || clcf->ignore_set_cookie->nelts == 0)
+    {
+        return 0;
+    }
+
+    if (!ngx_http_cache_turbo_set_cookie_name(h->value.data, h->value.len,
+                                              &name))
+    {
+        return 0;
+    }
+
+    nm = clcf->ignore_set_cookie->elts;
+
+    for (i = 0; i < clcf->ignore_set_cookie->nelts; i++) {
+        if (name.len == nm[i].len
+            && ngx_strncmp(name.data, nm[i].data, name.len) == 0)
+        {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+
+/*
+ * P5-8: is the named-ignore relax permitted AT ALL for this location?
+ *
+ * HARD VETO on the key-cookie machinery, which is the precondition the Set-Cookie
+ * floor's own comment names. A key cookie (a backend preset's, or a DIY
+ * cache_turbo_key_cookie) folds a cookie VALUE into the cache key, so a request
+ * arriving WITHOUT that cookie hashes to the ANONYMOUS entry. The response that
+ * first establishes the segment is distinguishable by exactly one thing: it
+ * carries a Set-Cookie. Storing it under the anonymous key poisons that entry
+ * for every anonymous visitor -- upstream Magento's VCL refuses the identical
+ * case (vcl_backend_response: beresp.uncacheable).
+ *
+ * The veto is on the CONFIGURATION, not on which cookies this particular
+ * response happens to set, because the relax would otherwise depend on the
+ * operator having listed every key cookie -- and a list that omits one silently
+ * reopens the race. With any key cookie configured the location keeps the
+ * original unconditional floor, whatever the ignore list says.
+ */
+static ngx_int_t
+ngx_http_cache_turbo_set_cookie_relax_allowed(
+    ngx_http_cache_turbo_loc_conf_t *clcf)
+{
+    if (clcf->ignore_set_cookie == NULL
+        || clcf->ignore_set_cookie == NGX_CONF_UNSET_PTR
+        || clcf->ignore_set_cookie->nelts == 0)
+    {
+        return 0;
+    }
+
+    /* DIY value-keying configured => transition race is live. */
+    if (clcf->key_cookies != NULL
+        && clcf->key_cookies != NGX_CONF_UNSET_PTR
+        && clcf->key_cookies->nelts > 0)
+    {
+        return 0;
+    }
+
+    /* A backend preset is enabled. Vetoed whether or not the preset declares
+     * key_cookies: presets gain key cookies over time, and a relax that silently
+     * turns itself back on when a preset is extended is exactly the failure this
+     * veto exists to prevent. */
+    if (NGX_HTTP_CACHE_TURBO_HAS_BACKEND(clcf->backend_presets)) {
+        return 0;
+    }
+
+    return 1;
+}
+
+
+/*
  * RFC 9111 shared-cache safety floor: decide whether THIS response may be stored
  * and replayed to other clients. Refuses when
  *   - the request carried Authorization (the response is per-user), or
@@ -2941,9 +3114,11 @@ ngx_http_cache_turbo_response_cacheable(ngx_http_request_t *r,
         }
 
         /*
-         * The Set-Cookie floor. Unconditional on purpose — NOT gated by
-         * ignore_cc, because relaxing it does more than staple one visitor's
-         * session cookie into a shared body.
+         * The Set-Cookie floor. NOT gated by ignore_cc, because relaxing it
+         * does more than staple one visitor's session cookie into a shared
+         * body. The ONE way to relax it is P5-8's
+         * cache_turbo_ignore_set_cookie, off by default and carrying the
+         * preset-level veto the paragraph below demands.
          *
          * PRESET KEY COOKIES DEPEND ON THIS. A request that carries no key
          * cookie (Magento's X-Magento-Vary) hashes to the ANONYMOUS entry, and
@@ -2952,14 +3127,46 @@ ngx_http_cache_turbo_response_cacheable(ngx_http_request_t *r,
          * entry now serves segmented content to every anonymous visitor —
          * upstream Magento's own VCL refuses the identical case
          * (vcl_backend_response: beresp.uncacheable). Anyone adding a knob that
-         * caches Set-Cookie responses must add a preset-level veto in the header
-         * filter FIRST (request had no key cookie && response sets one => do not
-         * capture), or reintroduce a cross-user leak.
+         * caches Set-Cookie responses must add a preset-level veto FIRST
+         * (request had no key cookie && response sets one => do not capture),
+         * or reintroduce a cross-user leak.
+         *
+         * P5-8 SATISFIES THAT PRECONDITION, and more strictly than the
+         * paragraph asks: instead of deciding per response whether a key cookie
+         * was involved, ngx_http_cache_turbo_set_cookie_relax_allowed() vetoes
+         * on the CONFIGURATION -- any active backend preset, or any
+         * cache_turbo_key_cookie, disables the relax for the whole location
+         * whatever the ignore list says. A per-response test would depend on
+         * the operator having listed every key cookie, and a list that omits
+         * one silently reopens the race; a per-location veto cannot.
          */
         if (h[i].key.len == sizeof("Set-Cookie") - 1
             && ngx_strncasecmp(h[i].key.data, (u_char *) "Set-Cookie",
                                sizeof("Set-Cookie") - 1) == 0)
         {
+            /*
+             * P5-8: the named relax. This `continue` is reached ONLY when the
+             * operator listed this exact cookie name AND the location has no
+             * key-cookie machinery at all -- the preset-level veto the comment
+             * above demands, implemented in
+             * ngx_http_cache_turbo_set_cookie_relax_allowed().
+             *
+             * It is a `continue`, NOT a `return 1`: the loop must keep walking,
+             * because a response may carry SEVERAL Set-Cookie fields (nginx
+             * hands them to us as separate entries in this very list) and ONE
+             * unlisted or unparseable name among them must still refuse the
+             * whole store. Every other veto arm below still applies too.
+             *
+             * What gets STORED is unaffected: "Set-Cookie" is on the
+             * unconditional header_skip[] list, so no Set-Cookie is ever
+             * serialised into a blob and none can replay to another client.
+             */
+            if (ngx_http_cache_turbo_set_cookie_relax_allowed(clcf)
+                && ngx_http_cache_turbo_set_cookie_ignorable(clcf, &h[i]))
+            {
+                continue;
+            }
+
             if (reason_out != NULL) {
                 *reason_out = NGX_HTTP_CACHE_TURBO_REFUSE_SET_COOKIE;
             }
@@ -4500,6 +4707,7 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->bypass_uri = NGX_CONF_UNSET_PTR;
     conf->bypass_stale_uri = NGX_CONF_UNSET_PTR;
     conf->key_cookies = NGX_CONF_UNSET_PTR;
+    conf->ignore_set_cookie = NGX_CONF_UNSET_PTR;
     conf->backend_prefix = NGX_CONF_UNSET_PTR;
     conf->vary_ignore = NGX_CONF_UNSET_PTR;
 #if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \

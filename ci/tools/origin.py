@@ -616,6 +616,49 @@ class Origin:
                 # collapses repeated requests onto one slot.
                 if "setcookie" in self.path:
                     self.send_header("Set-Cookie", "sess=abc; Path=/")
+                # P5-8 named Set-Cookie ignore-list fixtures. Each emits a
+                # DIFFERENT shape of Set-Cookie so one test can pin one
+                # behaviour. Checked before the generic "setcookie" marker below
+                # would be reached only by substring luck, so every name here is
+                # deliberately distinct from it.
+                if "p58listed" in self.path:
+                    # Exactly one Set-Cookie, on the configured ignore list.
+                    self.send_header("Set-Cookie",
+                                     "_ga=GA1.2.99; Path=/; Max-Age=63072000")
+                if "p58multi" in self.path:
+                    # SEVERAL Set-Cookie fields, EVERY one on the list. nginx
+                    # hands these to the module as separate header entries, so
+                    # this is the case that proves the walk checks all of them
+                    # rather than just the first.
+                    self.send_header("Set-Cookie", "_ga=GA1.2.99; Path=/")
+                    self.send_header("Set-Cookie", "ab_bucket=B; Path=/")
+                if "p58mixed" in self.path:
+                    # THE assertion that matters: two listed cookies with ONE
+                    # unlisted cookie among them. A guard that stops at the first
+                    # Set-Cookie, or that ORs instead of ANDs, stores this.
+                    self.send_header("Set-Cookie", "_ga=GA1.2.99; Path=/")
+                    self.send_header("Set-Cookie", "sessionid=deadbeef; Path=/; HttpOnly")
+                    self.send_header("Set-Cookie", "ab_bucket=B; Path=/")
+                if "p58noeq" in self.path:
+                    # Malformed: no '=' at all, so no cookie-pair. Fail closed.
+                    self.send_header("Set-Cookie", "justjunk; Path=/")
+                if "p58emptyname" in self.path:
+                    # Empty cookie name. RFC 6265 does not define it and clients
+                    # disagree; fail closed.
+                    self.send_header("Set-Cookie", "=GA1.2.99; Path=/")
+                if "p58attrname" in self.path:
+                    # An UNLISTED cookie whose ATTRIBUTES contain a listed name.
+                    # A substring search, or a request-Cookie-grammar parser that
+                    # treats "; " as a pair separator, matches "_ga" here and
+                    # wrongly stores a real session cookie.
+                    self.send_header("Set-Cookie",
+                                     "sessionid=deadbeef; Path=/_ga; Domain=_ga")
+                if "p58quoted" in self.path:
+                    # Quoted name: not a token, so unparseable. Fail closed.
+                    self.send_header("Set-Cookie", '"_ga"=GA1.2.99; Path=/')
+                if "p58spacedname" in self.path:
+                    # Embedded space in the name. Fail closed.
+                    self.send_header("Set-Cookie", "_g a=GA1.2.99; Path=/")
                 if "mgvary" in self.path:
                     # Magento's transition race: the request arrived with NO
                     # X-Magento-Vary (so it keyed to the ANONYMOUS entry) and the

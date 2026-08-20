@@ -28,6 +28,156 @@ def test_no_cache_set_cookie(ng: Nginx) -> None:
     assert b1 != b2, "both reads should have gone to the origin"
 
 
+def test_p58_default_off_set_cookie_still_refused(ng: Nginx) -> None:
+    """P5-8 NEGATIVE CONTROL. Without cache_turbo_ignore_set_cookie the floor is
+    byte-identical to before the directive existed: /scdefault/ has no ignore
+    list, so a response setting a cookie whose name IS on the /scign/ list is
+    still refused.
+
+    This is the test that proves the COMPILED-IN default is OFF, and it is
+    deliberately NOT /cc/: that location inherits the server-level wordpress
+    preset, so its refusal is over-determined by the preset veto and would stay
+    green even if the relax shipped on by default. /scdefault/ sets
+    `cache_turbo_backend none`, so the ONLY thing refusing the store here is the
+    directive's own default. Every other P5-8 case opts in explicitly and would
+    pass even if the relax were unconditional."""
+    _, b1, h1 = fetch(ng.port, "/scdefault/p58listed")
+    assert "x-cache" not in h1, "first read should be a miss"
+    _, b2, h2 = fetch(ng.port, "/scdefault/p58listed")
+    assert "x-cache" not in h2, \
+        ("default-off: a Set-Cookie response must not be stored without "
+         f"cache_turbo_ignore_set_cookie; got X-Cache={h2.get('x-cache')}")
+    assert b1 != b2, "both reads should have gone to the origin"
+
+
+def test_p58_listed_cookie_is_stored(ng: Nginx) -> None:
+    """P5-8: one Set-Cookie, name on the list, no key cookie configured => the
+    response IS stored and the second read is a HIT."""
+    fetch(ng.port, "/scign/p58listed")                     # prime (miss, stores)
+    _, _, h = fetch(ng.port, "/scign/p58listed")
+    assert h.get("x-cache") == "HIT", \
+        ("a Set-Cookie naming a listed cookie must be storable; got "
+         f"X-Cache={h.get('x-cache')}")
+
+
+def test_p58_stored_blob_carries_no_set_cookie(ng: Nginx) -> None:
+    """P5-8, the security assertion: the relax changes WHETHER the body is
+    stored, never WHAT is stored. The HIT served from the blob must carry NO
+    Set-Cookie at all — otherwise one visitor's cookie replays to every other
+    client from a SHARED entry.
+
+    Asserted on the HIT (served from the stored bytes), not on the MISS: the miss
+    is a pass-through from the origin and legitimately carries the cookie."""
+    _, _, hm = fetch(ng.port, "/scign/p58multi")           # prime (miss, stores)
+    assert "set-cookie" in hm, \
+        "fixture check: the origin MISS must carry Set-Cookie, else this proves nothing"
+    _, _, h = fetch(ng.port, "/scign/p58multi")
+    assert h.get("x-cache") == "HIT", \
+        f"expected a HIT to inspect the stored bytes; got X-Cache={h.get('x-cache')}"
+    assert "set-cookie" not in h, \
+        ("the stored blob must NOT replay Set-Cookie to another client; got "
+         f"{h.get('set-cookie')!r} — cross-user cookie disclosure")
+
+
+def test_p58_all_listed_multi_is_stored(ng: Nginx) -> None:
+    """P5-8: SEVERAL Set-Cookie fields, every one on the list => stored. Pairs
+    with test_p58_one_unlisted_refuses: same multi-header shape, opposite
+    verdict, so the difference is the unlisted NAME and nothing else."""
+    fetch(ng.port, "/scign/p58multi")                      # prime (miss, stores)
+    _, _, h = fetch(ng.port, "/scign/p58multi")
+    assert h.get("x-cache") == "HIT", \
+        ("several Set-Cookie fields, all listed, must be storable; got "
+         f"X-Cache={h.get('x-cache')}")
+
+
+def test_p58_one_unlisted_refuses(ng: Nginx) -> None:
+    """P5-8, THE assertion that matters most. Three Set-Cookie fields: _ga
+    (listed), sessionid (NOT listed), ab_bucket (listed). One unlisted name
+    among several listed ones must refuse the whole store.
+
+    This is what a guard that stops at the first Set-Cookie, that ORs the per-
+    header verdicts instead of ANDing them, or that checks only the last field,
+    gets wrong — and getting it wrong stores a real session cookie's response
+    into a SHARED entry."""
+    _, b1, h1 = fetch(ng.port, "/scign/p58mixed")
+    assert "x-cache" not in h1, "first read should be a miss"
+    _, b2, h2 = fetch(ng.port, "/scign/p58mixed")
+    assert "x-cache" not in h2, \
+        ("ONE unlisted Set-Cookie (sessionid) among listed ones must refuse the "
+         f"store; got X-Cache={h2.get('x-cache')} — a per-user session cookie's "
+         "response was cached in a shared entry")
+    assert b1 != b2, "both reads should have gone to the origin"
+
+
+def test_p58_key_cookie_vetoes_the_relax(ng: Nginx) -> None:
+    """P5-8 HARD VETO. /scignkc/ carries the SAME ignore list as /scign/ plus a
+    DIY cache_turbo_key_cookie. Value-keying means a request without the cookie
+    hashes to the ANONYMOUS entry while the response establishes the segment —
+    the transition race the unconditional floor was protecting. With any key
+    cookie configured the relax must be off entirely, so the case that STORES
+    under /scign/ must be REFUSED here.
+
+    The veto is on the configuration, not on which cookie this response sets:
+    an operator whose ignore list omits a key cookie must not silently reopen
+    the race."""
+    _, b1, h1 = fetch(ng.port, "/scignkc/p58listed")
+    assert "x-cache" not in h1, "first read should be a miss"
+    _, b2, h2 = fetch(ng.port, "/scignkc/p58listed")
+    assert "x-cache" not in h2, \
+        ("a configured key cookie must veto the Set-Cookie relax regardless of "
+         f"the ignore list; got X-Cache={h2.get('x-cache')} — the key-cookie "
+         "transition race was reopened")
+    assert b1 != b2, "both reads should have gone to the origin"
+
+
+def test_p58_backend_preset_vetoes_the_relax(ng: Nginx) -> None:
+    """P5-8 HARD VETO, preset arm. /scignpreset/ carries the same ignore list as
+    /scign/ but omits `cache_turbo_backend none`, so it inherits the server-level
+    wordpress preset. Any active backend preset vetoes the relax.
+
+    The veto is on a preset being ACTIVE rather than on the preset declaring key
+    cookies today: presets gain key cookies over time, and a relax that silently
+    switches itself back on when a preset is extended is exactly the regression
+    this veto exists to prevent.
+
+    Pairs with test_p58_listed_cookie_is_stored: identical URI marker, identical
+    ignore list, opposite verdict, and the only difference is the preset."""
+    _, b1, h1 = fetch(ng.port, "/scignpreset/p58listed")
+    assert "x-cache" not in h1, "first read should be a miss"
+    _, b2, h2 = fetch(ng.port, "/scignpreset/p58listed")
+    assert "x-cache" not in h2, \
+        ("an active backend preset must veto the Set-Cookie relax; got "
+         f"X-Cache={h2.get('x-cache')}")
+    assert b1 != b2, "both reads should have gone to the origin"
+
+
+def test_p58_malformed_set_cookie_fails_closed(ng: Nginx) -> None:
+    """P5-8 fail-closed parsing. Every Set-Cookie shape the strict RFC 6265
+    cookie-name extractor cannot resolve to exactly one token name must refuse
+    the store, even under an enabled ignore list.
+
+    p58attrname is the important one: an UNLISTED session cookie whose
+    ATTRIBUTES contain the listed name (`Path=/_ga; Domain=_ga`). A substring
+    search over the header value, or a parser that reuses the request-Cookie
+    grammar (where `;` separates PAIRS rather than attributes), matches `_ga`
+    there and stores a real session cookie's response."""
+    for marker, why in (
+        ("p58noeq", "no '=' at all: not a cookie-pair"),
+        ("p58emptyname", "empty cookie name"),
+        ("p58attrname", "listed name appears only in the ATTRIBUTES"),
+        ("p58quoted", "quoted name is not an RFC 6265 token"),
+        ("p58spacedname", "embedded space is not an RFC 6265 token"),
+    ):
+        uri = f"/scign/{marker}"
+        _, b1, h1 = fetch(ng.port, uri)
+        assert "x-cache" not in h1, f"{marker}: first read should be a miss"
+        _, b2, h2 = fetch(ng.port, uri)
+        assert "x-cache" not in h2, \
+            (f"{marker} ({why}) must fail closed and refuse the store; got "
+             f"X-Cache={h2.get('x-cache')}")
+        assert b1 != b2, f"{marker}: both reads should have gone to the origin"
+
+
 def test_no_cache_cc_private(ng: Nginx) -> None:
     """RFC 9111 floor: Cache-Control: private is not stored in a shared cache."""
     _, b1, h1 = fetch(ng.port, "/cc/ccprivate")
