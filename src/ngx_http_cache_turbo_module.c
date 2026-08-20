@@ -4113,7 +4113,9 @@ ngx_http_cache_turbo_warm_add_validator(ngx_http_request_t *sr,
     h->value.data = value;
     h->value.len = value_len;
     h->lowcase_key = (u_char *) name;   /* markers below are already lower */
+#if (nginx_version >= 1023000)
     h->next = NULL;
+#endif
 
     return NGX_OK;
 }
