@@ -1377,17 +1377,17 @@ A URI with no cached copy at all has nothing to fall back on, so those requests 
 
 ```nginx
 http {
-    proxy_cache_path /var/cache/zone_a levels=1:2 keys_zone=ct_zone:10m;
+    cache_turbo_zone name=ct 256m;             # ONE zone, ONE breaker
 
     server {
         location /service-a/ {
-            cache_turbo_zone ct_zone;          # ← same zone
+            cache_turbo         ct;            # ← same zone
             cache_turbo_breaker on;
             proxy_pass http://service-a.example.com;
         }
 
         location /service-b/ {
-            cache_turbo_zone ct_zone;          # ← same zone
+            cache_turbo         ct;            # ← same zone
             cache_turbo_breaker on;
             proxy_pass http://service-b.example.com;
         }
@@ -1403,18 +1403,18 @@ This is a deliberate design choice documented in the source (ngx_http_cache_turb
 
 ```nginx
 http {
-    proxy_cache_path /var/cache/zone_a levels=1:2 keys_zone=ct_zone_a:10m;
-    proxy_cache_path /var/cache/zone_b levels=1:2 keys_zone=ct_zone_b:10m;
+    cache_turbo_zone name=ct_a 128m;           # separate failure domains
+    cache_turbo_zone name=ct_b 128m;
 
     server {
         location /service-a/ {
-            cache_turbo_zone ct_zone_a;        # ← separate zone A
+            cache_turbo         ct_a;          # ← separate zone A
             cache_turbo_breaker on;
             proxy_pass http://service-a.example.com;
         }
 
         location /service-b/ {
-            cache_turbo_zone ct_zone_b;        # ← separate zone B
+            cache_turbo         ct_b;          # ← separate zone B
             cache_turbo_breaker on;
             proxy_pass http://service-b.example.com;
         }
@@ -1424,7 +1424,7 @@ http {
 
 Now each upstream has its own breaker state. If `service-a` is down, it trips only `ct_zone_a`'s breaker and serves stale to its own clients; `service-b` remains on its normal path and responds normally.
 
-The downside is **memory**: each zone reserves the size you allocate with `keys_zone=…:SIZE`, regardless of fill. Split zones only when the failure domains actually differ. For a monolithic origin or a tightly coupled service pair that fails together, one shared zone is correct and saves memory.
+The downside is **memory**: each zone reserves the size you give `cache_turbo_zone name=… SIZE`, regardless of fill. Split zones only when the failure domains actually differ. For a monolithic origin or a tightly coupled service pair that fails together, one shared zone is correct and saves memory.
 
 ### What outage handling cannot do
 
