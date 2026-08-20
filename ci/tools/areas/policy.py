@@ -1619,8 +1619,13 @@ def test_rfc1_request_max_stale(ng: Nginx, origin: Origin) -> None:
     Fix: use a dedicated location, /maxstale/, with stale_mult 8 (the
     module's max) instead of widening /condst/'s window out from under its
     other two consumers (test_rfc6_stale_conditional_full,
-    test_p4_multi_directive_single_resolve). That gives a stale window of
-    1s-8s:
+    test_p4_multi_directive_single_resolve). The proxied key is
+    /maxstale/cond-max-ms: it keeps the "cond" substring origin.py requires
+    to emit ETag/Last-Modified (dropping it would silently downgrade this
+    test's coverage to a validator-less origin -- caught in review) while
+    staying distinct from /cond-ms and /condst/'s other keys so this test's
+    origin.hits_for() oracle is never shared with another test's traffic.
+    That gives a stale window of 1s-8s:
         non-ASan sleep 1.75s -> 0.75s clear of the 1s lower bound,
                                  6.25s clear of the 8s upper bound
         ASan     sleep 3.50s -> 2.50s clear of the 1s lower bound,
@@ -1628,23 +1633,30 @@ def test_rfc1_request_max_stale(ng: Nginx, origin: Origin) -> None:
     Both lanes land comfortably inside the window with multi-second margin
     on each side. If ttl, slack or stale_mult ever change here, recompute
     both margins and keep them positive under the 2.0 ASan scale."""
-    fetch_raw(ng.port, "/maxstale/max-ms")                         # prime, fresh 1s
+    # "cond" in the proxied path is LOAD-BEARING: origin.py gates ETag /
+    # Last-Modified emission on that substring (see the /maxstale/ location
+    # comment in nginx_config.py), and this test's coverage previously
+    # depended on the entry carrying validators. Assert it below rather than
+    # merely assuming the substring worked.
+    sp, _, hp = fetch_raw(ng.port, "/maxstale/cond-max-ms")        # prime, fresh 1s
+    assert sp == 200 and hp.get("etag") == '"v11etag"', \
+        f"prime must carry the origin's conditional validator: {sp} {hp}"
     ttl = 1.0
     slack = 0.75                    # generous margin: a long wait is cheap,
                                      # a flake is not -- see TTL-REVAL-RACE
     time.sleep((ttl + slack) * sanitizer_time_scale())
-    before = origin.hits_for("/max-ms")
+    before = origin.hits_for("/cond-max-ms")
     # max-stale present -> accept the stale copy (beta 1, no refresh)
-    s0, b0, h0 = fetch_raw(ng.port, "/maxstale/max-ms",
+    s0, b0, h0 = fetch_raw(ng.port, "/maxstale/cond-max-ms",
                            headers={"Cache-Control": "max-age=1, max-stale=30"})
-    assert origin.hits_for("/max-ms") == before, \
+    assert origin.hits_for("/cond-max-ms") == before, \
         f"max-stale stale serve must not hit origin: {s0} {h0}"
     assert s0 == 200 and b0 and h0.get("x-cache") == "STALE", \
         f"max-stale must permit the stale serve: {s0} {h0}"
     # same tight max-age but NO max-stale -> no stale tolerance -> revalidate
-    s1, _, h1 = fetch_raw(ng.port, "/maxstale/max-ms",
+    s1, _, h1 = fetch_raw(ng.port, "/maxstale/cond-max-ms",
                           headers={"Cache-Control": "max-age=1"})
-    assert origin.hits_for("/max-ms") == before + 1, \
+    assert origin.hits_for("/cond-max-ms") == before + 1, \
         f"no-max-stale revalidation must hit origin: {s1} {h1}"
     assert s1 == 200 and "x-cache" not in h1, \
         f"max-age without max-stale must revalidate a stale entry: {h1}"

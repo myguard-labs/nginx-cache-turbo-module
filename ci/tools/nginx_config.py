@@ -1676,6 +1676,13 @@ http {{
         # DEFAULT stale_mult and must not have their window widened out from
         # under them. fresh 1s, stale_mult 8 (module max) -> stale 1s-8s,
         # fully expired only after 8s. beta 1 ~ never refresh.
+        #
+        # LOAD-BEARING: the test proxies to a key containing "cond" (see
+        # origin.py's ETag/Last-Modified gate, `if "cond" in self.path`) so
+        # the stored entry carries conditional validators, same as /condst/.
+        # A key rename that drops the "cond" substring silently downgrades
+        # this test to exercising a validator-less origin -- caught once in
+        # review, do not repeat it.
         location /maxstale/ {{
             cache_turbo             main;
             cache_turbo_key         $uri;
