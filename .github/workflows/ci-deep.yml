@@ -1,4 +1,4 @@
-# sync-sha: 8eacbe70fc851c660f6c88e1bff8c8ceb496d4a455a58cfbd8ee23c8c35a8152
+# sync-sha: 1bd9ca9647b1ddad6263c08d78640fcef76d8ec005c94880fabb7cae432f099a
 name: CI Deep
 
 # Exhaustive dynamic analysis — monthly cron + on-demand only, NEVER on PR.
@@ -645,6 +645,59 @@ jobs:
             -H "Content-Type: application/json" \
             "https://discord.com/api/v10/channels/$DISCORD_CHANNEL_BUILDS/messages" \
             -d "{\"content\":\"🔴 $GH_REPO — CI Deep / asan-soak FAILED. $GH_SERVER_URL/$GH_REPO/actions/runs/$GH_RUN_ID\"}" || true
+
+  scanbench:
+    name: Zipf hit-ratio benchmark
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
+    timeout-minutes: 60
+    steps:
+      - name: Checkout module
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - name: Load version pins
+        run: bash .github/scripts/load-versions.sh
+
+      - name: Install build and benchmark dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential ccache curl eatmydata libpcre2-dev libssl-dev mold python3 zlib1g-dev
+
+      - name: Restore build caches
+        uses: ./.github/actions/build-cache
+        with:
+          mode: debug
+          nginx-version: ${{ env.NGINX_VERSION }}
+
+      - name: Build server and module
+        run: |
+          bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" debug
+          BUILD_DIR="$GITHUB_WORKSPACE/.build/nginx-${NGINX_VERSION}/objs"
+          echo "NGINX_BINARY=$BUILD_DIR/nginx" >> "$GITHUB_ENV"
+          echo "MODULE_SO=$BUILD_DIR/ngx_http_cache_turbo_module.so" >> "$GITHUB_ENV"
+
+      - name: Run Zipf hit-ratio benchmark
+        run: |
+          echo "=== Zipf hit-ratio benchmark ==="
+          bash ci/tools/zipfbench.sh "$NGINX_BINARY" "$MODULE_SO"
+          echo ""
+          echo "Benchmark complete; hit-ratio recorded above."
+
+      - name: Notify Discord on failure
+        if: failure() && github.event_name == 'schedule'
+        env:
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_CHANNEL_BUILDS: ${{ secrets.DISCORD_CHANNEL_BUILDS }}
+          GH_REPO: ${{ github.repository }}
+          GH_SERVER_URL: ${{ github.server_url }}
+          GH_RUN_ID: ${{ github.run_id }}
+        run: |
+          [ -n "$DISCORD_BOT_TOKEN" ] || exit 0
+          curl -fsS -X POST -H "Authorization: Bot $DISCORD_BOT_TOKEN" \
+            -H "Content-Type: application/json" \
+            "https://discord.com/api/v10/channels/$DISCORD_CHANNEL_BUILDS/messages" \
+            -d "{\"content\":\"🔴 $GH_REPO — CI Deep / scanbench FAILED. $GH_SERVER_URL/$GH_REPO/actions/runs/$GH_RUN_ID\"}" || true
 
   scanners:
     name: Security scanners
