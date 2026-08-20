@@ -1368,6 +1368,64 @@ The breaker trips OPEN after three 5xx responses within 30 seconds. While it is 
 
 A URI with no cached copy at all has nothing to fall back on, so those requests get a `503` carrying a `Retry-After` hint that tracks `cache_turbo_breaker_open`. The same applies once a copy ages past a location's `cache_turbo_keep_stale` window (24 hours by default): serving indefinitely old data is an explicit choice, not a default.
 
+
+### Circuit breaker isolation: per-zone, not per-upstream
+
+⚠ **The breaker is keyed PER ZONE, not per upstream.** All locations sharing the same `cache_turbo_zone` name share one breaker state. This means **one failing upstream can trip the breaker for every location in that zone**, even locations proxying to unrelated healthy upstreams.
+
+**Observable effect:** If you have two API services in one zone:
+
+```nginx
+http {
+    cache_turbo_zone name=ct 256m;             # ONE zone, ONE breaker
+
+    server {
+        location /service-a/ {
+            cache_turbo         ct;            # ← same zone
+            cache_turbo_breaker on;
+            proxy_pass http://service-a.example.com;
+        }
+
+        location /service-b/ {
+            cache_turbo         ct;            # ← same zone
+            cache_turbo_breaker on;
+            proxy_pass http://service-b.example.com;
+        }
+    }
+}
+```
+
+If `service-a.example.com` is down and trips the breaker (5 consecutive 5xx within 10 seconds, by default), then **`service-b.example.com` also gets rejected with a `503` while the breaker is open**, even though `service-b` is healthy. The breaker does not discriminate per-upstream — it only knows "the zone is down, do not call any origin".
+
+This is a deliberate design choice documented in the source (ngx_http_cache_turbo_module.h:266): the zone is already the accounting unit for stats and autotune, and a per-upstream breaker would need new keying logic with no proven operational gain.
+
+**Remedy:** Give independently failing or latency-sensitive upstreams their own zone:
+
+```nginx
+http {
+    cache_turbo_zone name=ct_a 128m;           # separate failure domains
+    cache_turbo_zone name=ct_b 128m;
+
+    server {
+        location /service-a/ {
+            cache_turbo         ct_a;          # ← separate zone A
+            cache_turbo_breaker on;
+            proxy_pass http://service-a.example.com;
+        }
+
+        location /service-b/ {
+            cache_turbo         ct_b;          # ← separate zone B
+            cache_turbo_breaker on;
+            proxy_pass http://service-b.example.com;
+        }
+    }
+}
+```
+
+Now each upstream has its own breaker state. If `service-a` is down, it trips only `ct_zone_a`'s breaker and serves stale to its own clients; `service-b` remains on its normal path and responds normally.
+
+The downside is **memory**: each zone reserves the size you give `cache_turbo_zone name=… SIZE`, regardless of fill. Split zones only when the failure domains actually differ. For a monolithic origin or a tightly coupled service pair that fails together, one shared zone is correct and saves memory.
+
 ### What outage handling cannot do
 
 Some failure modes are outside what a cache can fix. They are listed here so you
@@ -1813,7 +1871,7 @@ http {
 | `cache_turbo_background_update on` / `off` | `server`, `location` | `on` | The stale-while-revalidate behaviour. **On** (default): a stale page is served *immediately* while one request quietly refreshes it in the background — **nobody waits on the backend**, and if that refresh hits a 5xx/timeout the old copy is left untouched and keeps being served (**stale-if-error**). **Off**: the chosen refresher regenerates inline (it waits for the backend and serves the fresh body), the pre-SWR behaviour. |
 | `cache_turbo_keep_stale off` \| `<time>` \| `forever` | `server`, `location` | `24h` | Origin-independent last-resort retention. When a cached entry has fully expired and the origin is DOWN, serve the stale copy if the `cache_turbo_keep_stale` window covers the request. Default `24h`: outage resilience out of the box. `off`: no grace window, errors surface normally. `<time>` (e.g. `6h`): serve stale for up to that long, clamped to the module's internal TTL ceiling. `forever`: never give up the stale copy. Argument forms: a bare `0` is also `off` (unlike `cache_turbo_valid 0`, which means cache forever — note this! A bare `0` here is deliberately the OPPOSITE.) **Precedence (decision D-1):** a honored response `stale-if-error` (RFC 5861) **wins outright** over `cache_turbo_keep_stale` — it is not a `max()` of the two. `cache_turbo_cache_control ignore` does **not** disable `cache_turbo_keep_stale`; it makes the *upstream* `Cache-Control` inert, but `keep_stale` is *operator* configuration. A honored `must-revalidate` from the response DOES suppress `keep_stale` — `must-revalidate` forbids any stale serve at all, `stale-if-error` included. |
 | `cache_turbo_use_stale off` \| `error` \| `timeout` \| `http_403` \| `http_404` \| `http_429` \| `http_500` \| `http_502` \| `http_503` \| `http_504` ... | `server`, `location` | every 5xx | Which upstream statuses count as "the origin is down" and so may be answered from a stale cached copy. Multiple tokens may be listed in one directive. The default is every 5xx (including ones no token names, e.g. 501, 505, 507, 508, 510, 511), so omitting the directive keeps the pre-existing behaviour byte-for-byte. ⚠ **Naming any token REPLACES that default rather than extending it** — `cache_turbo_use_stale http_500 http_502 http_503 http_504` reads like the default written out, but it is strictly narrower, because the unnamed 5xx statuses are covered by an internal `ANY_5XX` bit that no token can set. `off` disables serve-on-error entirely and is only accepted on its own — listing it alongside any other token is a config error. This selects the TRIGGER; the retention WINDOW still comes from a response `stale-if-error` or from `cache_turbo_keep_stale`, so a status named here is only served stale while such a window is open. ⚠ **`error` and `timeout` are not nginx-equivalent here.** In `proxy_cache_use_stale` they are communication-failure classes (`error` = the connection failed, as opposed to an upstream that really answered 502). This module triggers in the response header filter, which sees only the final status, so a refused connection and a genuine 502 are indistinguishable at that point: `error` behaves as `http_502` and `timeout` as `http_504`. The tokens exist so the configuration vocabulary matches nginx's, and they carry their own bits so a future trigger site with access to upstream state can honour the distinction without a config break. |
-| `cache_turbo_breaker on` \| `off` | `server`, `location` | `on` | Turn the circuit breaker on for this location, independently of `cache_turbo` itself. The breaker consults `cache_turbo_breaker_threshold`/`cache_turbo_breaker_window` before it can ever trip, and `cache_turbo_breaker_open` for how long an OPEN trip lasts before probing the origin again. Shipped `on` by default for outage resilience. **Three independent ways to express "off"**: this flag, `cache_turbo_breaker_threshold 0`, or `cache_turbo_breaker_window 0` — any one alone disables the breaker. There is no `cache_turbo_breaker_probe` directive: the probe lease is a fixed internal constant, not operator-tunable. |
+| `cache_turbo_breaker on` \| `off` | `server`, `location` | `on` | Turn the circuit breaker on for this location, independently of `cache_turbo` itself. The breaker consults `cache_turbo_breaker_threshold`/`cache_turbo_breaker_window` before it can ever trip, and `cache_turbo_breaker_open` for how long an OPEN trip lasts before probing the origin again. Shipped `on` by default for outage resilience. **Three independent ways to express "off"**: this flag, `cache_turbo_breaker_threshold 0`, or `cache_turbo_breaker_window 0` — any one alone disables the breaker. There is no `cache_turbo_breaker_probe` directive: the probe lease is a fixed internal constant, not operator-tunable. ⚠ **Breaker state is PER ZONE**: all locations sharing `cache_turbo_zone` share one breaker. See [Circuit breaker isolation: per-zone, not per-upstream](#circuit-breaker-isolation-per-zone-not-per-upstream) for blast radius and remedy. |
 | `cache_turbo_breaker_threshold N` | `server`, `location` | `5` | Consecutive origin failures (5xx, within the rolling `cache_turbo_breaker_window`) needed to trip the breaker OPEN. `0` disables the breaker — see `cache_turbo_breaker` above for the other two off-switches. |
 | `cache_turbo_breaker_window TIME` | `server`, `location` | `10s` | The rolling window failures are counted over. `0` disables the breaker (a threshold with no window is meaningless), same as `cache_turbo_breaker_threshold 0`. |
 | `cache_turbo_breaker_open TIME` | `server`, `location` | `30s` | How long an OPEN breaker lasts before promoting exactly one request to probe the origin. **`0` is a hard config error, not a disable** — `open_for > 0` is what lets an OPEN breaker ever reopen; `0` would wedge it OPEN permanently (no probe promoted, and with no origin contact while OPEN, no success can ever close it either). To disable the breaker use `cache_turbo_breaker off`, `cache_turbo_breaker_threshold 0`, or `cache_turbo_breaker_window 0` instead. |
@@ -1879,6 +1937,18 @@ http {
 > shared counters this location's traffic never contributed to. A zone whose
 > breaker looks OPEN in the stats while one location behaves as if nothing is
 > wrong is both of these rules working as designed.
+>
+> Sharing a zone also cuts the other way, and this direction is the easier one
+> to miss: **healthy traffic from one backend can mask a failure in another.**
+> The trip test is a run of *consecutive* failures inside the rolling
+> `cache_turbo_breaker_window` (default `5` failures over `10s`), and a success
+> clears the run. When a failing upstream shares a zone with a busy healthy one,
+> the healthy responses are interleaved into the same shared counter and keep
+> resetting it, so the failing backend may never accumulate an unbroken sequence
+> long enough to trip — the breaker can stay CLOSED against a genuinely dead
+> backend. See [Circuit breaker isolation: per-zone, not per-upstream](#circuit-breaker-isolation-per-zone-not-per-upstream)
+> for the opposite direction (one dead backend tripping healthy ones) and the
+> one-zone-per-upstream remedy.
 
 
 ### Variables
