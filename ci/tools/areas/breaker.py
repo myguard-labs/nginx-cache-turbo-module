@@ -9,6 +9,8 @@ star-imports this module, so every test stays reachable as
 
 from __future__ import annotations
 
+import re
+
 # Underscore-prefixed names are NOT re-exported by `import *`, so the
 # private helpers this module actually calls are imported explicitly.
 from test_runtime_base import *
@@ -1123,10 +1125,22 @@ def test_redis_timeout_zero_rejected(ng: Nginx) -> None:
     if ng.redis_port is None:
         return
     def mutate(c):
-        return c.replace(
-            f"cache_turbo_redis  127.0.0.1:{ng.redis_port} prefix=ct: timeout=250ms;",
-            f"cache_turbo_redis  127.0.0.1:{ng.redis_port} prefix=ct: timeout=0;", 1)
-    r = _config_test_result(ng, mutate)
+        # Anchor the mutator inside the /l2/ location block to target the
+        # unconditional Redis directive. The whitespace between directive
+        # and address is variable (2+ spaces), so use \s+ to be robust
+        # across config reformatting. re.DOTALL lets [^}]* cross newlines
+        # within the location block.
+        pattern = re.compile(
+            rf"location /l2/ \{{[^}}]*cache_turbo_redis\s+127\.0\.0\.1:{re.escape(str(ng.redis_port))}\s+prefix=ct:\s+timeout=250ms;",
+            re.MULTILINE | re.DOTALL
+        )
+        new_cfg = pattern.sub(
+            lambda m: m.group(0).replace("timeout=250ms;", "timeout=0;"), c
+        )
+        assert new_cfg != c, \
+            "mutator produced no change: test would be vacuous (never validates a mutation)"
+        return new_cfg
+    r = _config_test_result(ng, mutate, expect_unchanged=False)
     assert r.returncode != 0, \
         f"timeout=0 was accepted by nginx -t:\n{r.stdout}"
     assert "timeout must be > 0" in r.stdout, \
@@ -1138,10 +1152,22 @@ def test_memcached_timeout_zero_rejected(ng: Nginx) -> None:
     if ng.memcached_port is None:
         return
     def mutate(c):
-        return c.replace(
-            f"cache_turbo_memcached  127.0.0.1:{ng.memcached_port} prefix=mc: timeout=250ms;",
-            f"cache_turbo_memcached  127.0.0.1:{ng.memcached_port} prefix=mc: timeout=0;", 1)
-    r = _config_test_result(ng, mutate)
+        # Anchor the mutator inside the /mc/ location block to target the
+        # unconditional memcached directive. The whitespace between directive
+        # and address is variable (2+ spaces), so use \s+ to be robust
+        # across config reformatting. re.DOTALL lets [^}]* cross newlines
+        # within the location block.
+        pattern = re.compile(
+            rf"location /mc/ \{{[^}}]*cache_turbo_memcached\s+127\.0\.0\.1:{re.escape(str(ng.memcached_port))}\s+prefix=mc:\s+timeout=250ms;",
+            re.MULTILINE | re.DOTALL
+        )
+        new_cfg = pattern.sub(
+            lambda m: m.group(0).replace("timeout=250ms;", "timeout=0;"), c
+        )
+        assert new_cfg != c, \
+            "mutator produced no change: test would be vacuous (never validates a mutation)"
+        return new_cfg
+    r = _config_test_result(ng, mutate, expect_unchanged=False)
     assert r.returncode != 0, \
         f"timeout=0 was accepted by nginx -t:\n{r.stdout}"
     assert "timeout must be > 0" in r.stdout, \
