@@ -902,9 +902,9 @@ def test_vary_ignore_axis_excluded_from_variant_key(ng: Nginx,
     assert h2.get("x-cache") == "HIT", \
         ("a different Accept value must still hit the SAME slot once the "
          f"axis is ignored, got {h2.get('x-cache')}")
-    assert b1 == b2, ("ignored axis leaked into the variant key -- two "
+    assert b1 == b2, (("ignored axis leaked into the variant key -- two "
                        "different Accept values produced two different "
-                       "bodies", b1, b2)
+                       "bodies"), b1, b2)
     assert origin.hits_for("/u?v=acc&t=key") == base + 1, \
         "ignored Accept axis wrongly caused a second origin hit"
 
