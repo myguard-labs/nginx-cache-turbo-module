@@ -759,6 +759,18 @@ ngx_http_cache_turbo_merge_breaker(ngx_http_cache_turbo_loc_conf_t *conf,
      * (off) at every preset, so this is inert unless explicitly configured. */
     ngx_conf_merge_sec_value(conf->l2_negative_ttl, prev->l2_negative_ttl, 0);
 
+    /* c-2: cross-node marker staleness. NOT a preset band column, same
+     * reasoning as l2_negative_ttl -- it trades a bounded cross-node
+     * coherence window for a node-local L2 GET, opted into per location.
+     * Shipped ON by default at 2s (S231-DEFAULTS-style: the correctness gap
+     * -- a peer's PURGE invisible to this node's warm L1 marker until the
+     * marker's own TTL, hours under keep_stale -- is worse by default than
+     * paying one extra L2 GET per hot base per 2s window). An operator who
+     * wants today's unconditional-trust behaviour still has
+     * `cache_turbo_vary_marker_revalidate 0` to restore it explicitly. */
+    ngx_conf_merge_sec_value(conf->vary_marker_revalidate,
+                             prev->vary_marker_revalidate, 2);
+
     /* cache_turbo_keep_stale (S2.1). Not a preset band column, but shipped ON
      * by default (S231-DEFAULTS): outage resilience -- serving a stale object
      * past its normal window beats a hard miss when the origin is down, and
@@ -2514,6 +2526,53 @@ ngx_http_cache_turbo_l2_negative_ttl(ngx_conf_t *cf, ngx_command_t *cmd,
     }
 
     clcf->l2_negative_ttl = (time_t) n;
+
+    return NGX_CONF_OK;
+}
+
+
+/* cache_turbo_vary_marker_revalidate N (c-2). Seconds a warm L1 auto-Vary
+ * marker may be trusted before this node revalidates it against the
+ * authoritative L2 generation. See the field comment on
+ * ngx_http_cache_turbo_loc_conf_t.vary_marker_revalidate for the gap this
+ * closes.
+ *
+ * Same shape as cache_turbo_l2_negative_ttl immediately above: 0 is ACCEPTED
+ * and means OFF (the default, today's behaviour exactly -- a warm L1 marker
+ * is trusted unconditionally regardless of age); anything else is
+ * range-checked against NGX_HTTP_CACHE_TURBO_VARY_MARKER_REVALIDATE_MIN/MAX. */
+char *
+ngx_http_cache_turbo_vary_marker_revalidate(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf)
+{
+    ngx_http_cache_turbo_loc_conf_t  *clcf = conf;
+
+    ngx_str_t  *value = cf->args->elts;
+    ngx_int_t   n;
+
+    if (clcf->vary_marker_revalidate != NGX_CONF_UNSET) {
+        return "is duplicate";
+    }
+
+    n = ngx_atoi(value[1].data, value[1].len);
+    if (n == NGX_ERROR) {
+        return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
+            "cache_turbo_vary_marker_revalidate: bad value \"%V\"",
+            &value[1]);
+    }
+
+    if (n != 0
+        && (n < NGX_HTTP_CACHE_TURBO_VARY_MARKER_REVALIDATE_MIN
+            || n > NGX_HTTP_CACHE_TURBO_VARY_MARKER_REVALIDATE_MAX))
+    {
+        return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
+            "cache_turbo_vary_marker_revalidate \"%V\" is out of range: "
+            "expected 0 (off) or %d..%d",
+            &value[1], NGX_HTTP_CACHE_TURBO_VARY_MARKER_REVALIDATE_MIN,
+            NGX_HTTP_CACHE_TURBO_VARY_MARKER_REVALIDATE_MAX);
+    }
+
+    clcf->vary_marker_revalidate = (time_t) n;
 
     return NGX_CONF_OK;
 }

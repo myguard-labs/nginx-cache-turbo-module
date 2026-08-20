@@ -321,6 +321,13 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       0,
       NULL },
 
+    { ngx_string("cache_turbo_vary_marker_revalidate"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
+      ngx_http_cache_turbo_vary_marker_revalidate,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+
     { ngx_string("cache_turbo_keep_stale"),
       NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
       ngx_http_cache_turbo_keep_stale,
@@ -4907,6 +4914,7 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->scan_resistant_pct = (ngx_uint_t) NGX_CONF_UNSET;
     conf->min_uses = NGX_CONF_UNSET;
     conf->l2_negative_ttl = NGX_CONF_UNSET;   /* L13; merges to 0 = off */
+    conf->vary_marker_revalidate = NGX_CONF_UNSET;  /* c-2; merges to 2s */
     conf->keep_stale = NGX_CONF_UNSET;   /* S2.1; merges to 0 = off */
     conf->use_stale = NGX_CONF_UNSET_UINT;   /* S4.1; merges to USE_STALE_DEFAULT */
     conf->breaker_enable = NGX_CONF_UNSET;         /* O4.4; merges to 0 = off */

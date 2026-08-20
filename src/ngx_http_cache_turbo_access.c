@@ -1411,19 +1411,50 @@ ngx_http_cache_turbo_access_l1(ngx_http_request_t *r,
          * normal fresh-HIT behaviour even in a location that names other
          * prefixes, which the scope negative control pins.
          */
+        /* c-2: a marker revalidation just armed by vary_apply() (this SAME
+         * lock-held pass, immediately above) must not be short-circuited by
+         * the ordinary fresh/stale serve arms below -- those serve the
+         * OBJECT node `ctn` this lookup already found under the (possibly
+         * stale, that is the whole point) resolved variant key, and every
+         * exit from this function except the "fall through to L2" one below
+         * returns straight to the caller without ever reaching
+         * access_l2()/access_l2_marker_get(), where the revalidation GET
+         * actually lives. Skipping both serve arms here is what makes the
+         * fall-through happen: this object node itself is untouched (no
+         * status/SIE/breaker state is set the way the genuinely-expired arm
+         * below does), so a fail-open L2 GET failure still resolves back to
+         * serving this exact node on the object-GET phase right after the
+         * marker consult -- same fresh/stale object, just reached one phase
+         * later than usual.
+         *
+         * Two flags, not one: vary_marker_revalidate is set by THIS pass's
+         * own vary_apply() a few lines above and does NOT survive a park --
+         * a resumed pass re-runs vary_apply() from the top, which re-derives
+         * it fresh and (correctly) finds !vary_marker_l2_done false, so it
+         * resets to 0 on exactly the resume that most needs the skip.
+         * vary_marker_revalidate_inflight is the request-lifetime latch set
+         * once at GET-launch time (access_l2_marker_get()) and cleared once
+         * at consume time (access_l2_marker_consume()) -- see its own field
+         * comment -- so it is what actually covers the resume. Checking
+         * both here (rather than only the inflight one) keeps the skip
+         * correct on the FIRST pass too, before the GET has even launched. */
         if (ctx->brk_only) {
             ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                            "cache_turbo: bypass-stale \"%V\" -> arm only, "
                            "never a hit", &r->uri);
 
-        } else if (now < fresh_until && fresh_ok) {
+        } else if (!ctx->vary_marker_revalidate
+                   && !ctx->vary_marker_revalidate_inflight
+                   && now < fresh_until && fresh_ok)
+        {
             /* serve_fresh() runs the COR-5(b) re-issue itself, immediately
              * after its own unlock and before it serves. */
             return ngx_http_cache_turbo_access_l1_serve_fresh(r, clcf, ctx,
                 z, ctn, now, hash, out_rc);
         }
 
-        if (!ctx->brk_only
+        if (!ctx->vary_marker_revalidate && !ctx->vary_marker_revalidate_inflight
+            && !ctx->brk_only
             && (stale_until == 0 || now < stale_until) && ctn->len > 0
             && stale_ok)
         {
@@ -1458,11 +1489,24 @@ ngx_http_cache_turbo_access_l1(ngx_http_request_t *r,
          * fails (5xx/timeout), the header/body filters replay this snapshot
          * instead of surfacing the error. Arming only STASHES — the L2 consult
          * below still runs first (a peer may hold a fresh copy). len > 0 skips a
-         * stub; the !sie_armed guard makes the park/resume re-entries idempotent. */
-        ctx->status = NGX_HTTP_CACHE_TURBO_ST_EXPIRED;
+         * stub; the !sie_armed guard makes the park/resume re-entries idempotent.
+         *
+         * c-2: this whole arm is the GENUINELY-expired path -- status/breaker/
+         * SIE all assume the object itself aged out, which is false for a
+         * revalidation fall-through (the object is fresh or serveable-stale;
+         * only the MARKER's resolve time is what triggered the fall-through).
+         * Skip it entirely for that case: the object-GET phase right after
+         * the marker consult in access_l2() re-derives whatever status this
+         * node deserves from its own fresh/stale math, exactly as it already
+         * does for the ordinary marker-hit path when access_l2_marker_get()
+         * declines to fire at all (auto_vary off, no backend, etc). */
+        if (!ctx->vary_marker_revalidate && !ctx->vary_marker_revalidate_inflight) {
+            ctx->status = NGX_HTTP_CACHE_TURBO_ST_EXPIRED;
 
-        ngx_http_cache_turbo_access_l1_breaker_arm(r, clcf, z, ctx, ctn, hash);
-        ngx_http_cache_turbo_access_l1_sie_arm(r, z, ctx, ctn, now, hash);
+            ngx_http_cache_turbo_access_l1_breaker_arm(r, clcf, z, ctx, ctn,
+                hash);
+            ngx_http_cache_turbo_access_l1_sie_arm(r, z, ctx, ctn, now, hash);
+        }
     }
 
     /* L1 absent (miss) or expired. Consult L2 (Redis or memcached -- the
@@ -1538,8 +1582,19 @@ ngx_http_cache_turbo_access_l2_marker_get(ngx_http_request_t *r,
     ngx_int_t   rc;
     u_char      saved_key[32];
     uint32_t    marker_hash;
+    ngx_uint_t  revalidate;
 
-    if (!clcf->auto_vary || !ctx->vary_marker_l1_miss
+    /* c-2: a warm marker revalidation (ctx->vary_marker_revalidate, set by
+     * vary_apply() -- see its field comment) reuses this SAME GET, gated
+     * identically except for the two differences noted at each site below.
+     * The two triggers are mutually exclusive by construction
+     * (vary_apply() sets vary_marker_l1_miss XOR vary_marker_revalidate,
+     * never both), so `revalidate` here can only be true when
+     * vary_marker_l1_miss is 0 and the `|| !ctx->vary_marker_l1_miss` arm
+     * below would otherwise have declined -- hence the explicit OR. */
+    revalidate = ctx->vary_marker_revalidate;
+
+    if (!clcf->auto_vary || (!ctx->vary_marker_l1_miss && !revalidate)
         || ctx->vary_marker_l2_tried || ctx->vary_marker_l2_done
         || !clcf->backend || !clcf->backend->get)
     {
@@ -1561,8 +1616,29 @@ ngx_http_cache_turbo_access_l2_marker_get(ngx_http_request_t *r,
      * vary_marker_key instead. vary_marker_l1_miss is left untouched on a
      * memoed skip (not cleared, not consumed) so this pass falls through to
      * the ordinary base-key object GET exactly as an unmemoized miss
-     * would -- the memo answers "no marker", not "try again later". */
-    if (clcf->l2_negative_ttl > 0
+     * would -- the memo answers "no marker", not "try again later".
+     *
+     * c-2 (integration hazard, verified at source): this memo is what fires
+     * on EVERY request if a revalidation naively entered here on the
+     * l1_miss path -- ctx->vary_marker_l1_miss is 0 for a warm-hit
+     * revalidation (there IS a marker; vary_apply() just resolved it), so
+     * this memo (an L2-GET-for-this-key-missed record) would never even be
+     * SET by a revalidation's own GETs, which all land NGX_OK. That is not
+     * why revalidation must skip this check, though -- the real reason is
+     * semantic: the memo answers "does a marker exist at all", which a
+     * revalidation already knows the answer to (yes, L1 just proved it).
+     * Gating a revalidation on it would be gating on the wrong question,
+     * and would let a stale-negative-memo edge case (this marker key was
+     * memoed missing before self-healing, memo TTL not yet expired) silently
+     * suppress every revalidation attempt for up to l2_negative_ttl
+     * seconds -- worse than the every-request-GET regression this same memo
+     * exists to prevent on the l1-miss path, because there the memo is
+     * doing its documented job (this marker really doesn't exist yet) and
+     * here it would not be (the marker demonstrably exists, right now, in
+     * L1). Only the ORIGINAL l1-miss trigger consults the memo; a
+     * revalidate trigger bypasses it and always proceeds to the rate-limit
+     * below instead. */
+    if (!revalidate && clcf->l2_negative_ttl > 0
         && clcf->l1->l2_neg_check(z, ctx->vary_marker_key, marker_hash)
                == NGX_DECLINED)
     {
@@ -1573,6 +1649,14 @@ ngx_http_cache_turbo_access_l2_marker_get(ngx_http_request_t *r,
                        "cache_turbo: L2 vary-marker GET skipped by negative "
                        "memo \"%V\"", &r->uri);
         return NGX_DECLINED;
+    }
+
+    /* c-2: latch WHY before either trigger flag is touched below --
+     * vary_marker_revalidate is about to be superseded by vary_marker_l2_tried/
+     * l2_done for the rest of this pass, and will not survive a park/resume
+     * at all (see the field comment on vary_marker_revalidate_inflight). */
+    if (revalidate) {
+        ctx->vary_marker_revalidate_inflight = 1;
     }
 
     ctx->vary_marker_l1_miss = 0;
@@ -1619,6 +1703,7 @@ ngx_http_cache_turbo_access_l2_marker_consume(ngx_http_request_t *r,
 {
     ngx_int_t                        bits = 0;
     ngx_uint_t                       gen = 0;
+    ngx_uint_t                       revalidate;
     ngx_http_cache_turbo_blob_hdr_t  bh;
 
     if (!ctx->vary_marker_l2_tried || !ctx->l2_done) {
@@ -1626,6 +1711,13 @@ ngx_http_cache_turbo_access_l2_marker_consume(ngx_http_request_t *r,
     }
 
     ctx->vary_marker_l2_tried = 0;
+
+    /* c-2: capture + consume the launch reason now, once, regardless of
+     * which arm below returns -- see the field comment on
+     * vary_marker_revalidate_inflight for why this cannot be re-derived
+     * from ctx->vary_marker_revalidate at this point. */
+    revalidate = ctx->vary_marker_revalidate_inflight;
+    ctx->vary_marker_revalidate_inflight = 0;
 
     /* S231-L2-BACKOFF (P3-5 CI regression): the marker GET is a SECOND,
      * sequential L2 round trip ahead of the object GET on the marker-cold
@@ -1667,8 +1759,32 @@ ngx_http_cache_turbo_access_l2_marker_consume(ngx_http_request_t *r,
      * performance. L1 is authoritative and wins unconditionally; drop the L2
      * answer on the floor (it already did its job of proving A a variant
      * exists, and the self-heal below is what would have (re)written this
-     * same L1 marker anyway). */
-    if (!ctx->vary_marker_l1_miss) {
+     * same L1 marker anyway).
+     *
+     * c-2: this guard is exactly right for the l1-miss trigger (`revalidate`
+     * false) and is left untouched for it. A revalidate trigger is the
+     * opposite situation on purpose: vary_apply() only ever arms it when L1
+     * DID resolve bits (ctx->vary_marker_l1_miss is 0 by construction on
+     * that path -- see its field comment), so this same test would ALWAYS
+     * return and the L2 answer this GET was launched specifically to obtain
+     * would never be applied, silently defeating the whole feature. The
+     * mid-park-fresher-L1-marker race this guard protects against is real
+     * for a revalidate GET too (self-heal on THIS node, or a concurrent
+     * request on this node, can refresh the marker while the GET is in
+     * flight) -- but it is provably harmless here rather than needing the
+     * same blanket drop: whatever refreshed L1 mid-flight already re-ran
+     * vary_apply() on the resume pass immediately before this function (P3-5
+     * `access_l1() always runs vary_apply() BEFORE access_l2()`, same
+     * invariant this comment leans on above), so ctx->key_hash / *hashp and
+     * ctx->vary_gen already carry that refreshed L1 answer walking in here.
+     * The apply-if-bits>0 block below only OVERWRITES them if the landed L2
+     * blob's own gen is >= ctx->vary_gen (never regresses to an older
+     * generation than what L1 -- possibly refreshed since launch -- already
+     * has) and always self-heals L1 from whichever generation wins, so a
+     * mid-flight refresh cannot be clobbered by a stale L2 answer landing
+     * after it: it is simply a no-op tie or the L2 answer confirms what L1
+     * already had. */
+    if (!ctx->vary_marker_l1_miss && !revalidate) {
         return;
     }
 
@@ -1694,6 +1810,23 @@ ngx_http_cache_turbo_access_l2_marker_consume(ngx_http_request_t *r,
         bits = ctx->l2_blob[NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE];
         if (ctx->l2_blob_len >= NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE + 2) {
             gen = ctx->l2_blob[NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE + 1];
+        }
+
+        /* c-2: on a revalidate trigger only, never regress to a generation
+         * OLDER than what this pass's own vary_apply() already resolved
+         * from L1 (ctx->vary_gen -- set immediately before access_l2() was
+         * called, and re-set on every re-entry including the resume this
+         * function is consuming). AUD-GEN1's skip-0-on-wrap invariant
+         * means a strict >= is the right test throughout the non-wrapped
+         * range this feature operates in (generations bump by PURGE, not by
+         * client traffic, so the request volume needed to wrap a one-byte
+         * counter mid-revalidation-window is not a realistic race here).
+         * Guards exactly the mid-flight-refresh case the guard above's
+         * comment describes: if this node's own L1 self-healed to a newer
+         * generation while this GET was in flight, an L2 reply still
+         * carrying the OLDER generation must not clobber it. */
+        if (revalidate && bits > 0 && gen < ctx->vary_gen) {
+            bits = 0;
         }
 
         if (bits > 0) {
@@ -1749,6 +1882,64 @@ ngx_http_cache_turbo_access_l2_marker_consume(ngx_http_request_t *r,
         }
     }
 
+    /* c-2: a revalidation that reaches here with bits still 0 -- either the
+     * outer `if` never entered at all (a genuine ctx->l2_result ==
+     * NGX_DECLINED: L2 has no marker for this base) or bits<=0 after the
+     * mid-flight-refresh gen check just above -- means the authoritative L2
+     * side no longer agrees this base has a live variant classification.
+     * That is exactly what a Redis-backed PURGE produces on a PEER node:
+     * the purging node DELETES the L2 marker outright (purge.c's
+     * backend->del(clcf, mk), never a gen-bump -- the gen-bump path is
+     * L1-only/memcached ONLY, per that function's own doc comment), so a
+     * peer's revalidation GET against the now-purged base gets a
+     * well-formed NGX_DECLINED, not a lower generation to compare against.
+     * The `bits > 0 && gen < ctx->vary_gen` check above cannot catch this
+     * case at all (bits is already 0, nothing to compare) -- this is the
+     * separate arm that closes it.
+     *
+     * This node's own warm L1 marker (still resolving the OLD variant --
+     * that resolution is what armed this revalidation in the first place)
+     * must be dropped, or the fail-open contract quietly defeats the whole
+     * feature for exactly the case it exists to close: a peer's PURGE never
+     * becomes visible here, because bits==0 already fails open to "keep
+     * what vary_apply() resolved" everywhere else in this function. Rewind
+     * to the BASE key: re-derive it from ctx->cache_key the same way
+     * build_key() originally computed it (P3-5's own field comment on
+     * vary_marker_l2_bits: a raw rewrite does not survive the next
+     * access_prologue(), so this reset is only needed to steer THIS pass's
+     * remaining phases -- the object-GET phase right after this one reads
+     * *hashp/ctx->key_hash and must see the base key, not the stale
+     * variant). Also purge the node-local L1 marker itself so the NEXT
+     * request on this node re-arms vary_marker_l1_miss instead of
+     * re-resolving the same now-invalid marker and re-triggering another
+     * revalidation every window forever. */
+    if (revalidate && bits == 0 && ctx->l2_result == NGX_DECLINED) {
+        if (ngx_http_cache_turbo_digest(ctx->cache_key.data,
+                ctx->cache_key.len, ctx->key_hash) == NGX_OK)
+        {
+            *hashp = ngx_crc32_short(ctx->key_hash, 32);
+        }
+        ctx->vary_gen = 0;
+        ctx->vary_marker_l2_bits = 0;
+        ctx->vary_marker_l2_gen = 0;
+
+        /* purge_key() takes and releases the zone mutex ITSELF (see
+         * ngx_http_cache_turbo_shm_purge_key() / purge.c's own call site at
+         * ~line 101, both unlocked callers) -- this function runs entirely
+         * outside any lock (access_l2()'s whole contract, verified by the
+         * c-2 design's own park-safety note), so wrapping this call in an
+         * extra lock/unlock pair here self-deadlocks on re-entry into the
+         * SAME non-recursive ngx_shmtx. */
+        (void) clcf->l1->purge_key(z, ctx->vary_marker_key,
+            ngx_crc32_short(ctx->vary_marker_key, 32));
+
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "cache_turbo: auto-Vary marker revalidation found "
+                       "the L2 marker gone (peer PURGE) -- dropping stale "
+                       "L1 resolution for \"%V\", falling back to base key",
+                       &r->uri);
+    }
+
     /* L13, extended to the marker key (admin.py CI regression): arm the
      * negative memo on a DEFINITIVE marker miss, mirroring
      * access_l2_miss_account()'s guard on ctx->key_hash exactly --
@@ -1760,8 +1951,22 @@ ngx_http_cache_turbo_access_l2_marker_consume(ngx_http_request_t *r,
      * GET (a memoed skip returns straight from marker_get() and never sets
      * vary_marker_l2_tried, so consume() never runs for it), so a real
      * round-trip backs every arm site here, exactly the invariant that
-     * guard protects on the object-key path. */
-    if (clcf->l2_negative_ttl > 0 && ctx->l2_result == NGX_DECLINED) {
+     * guard protects on the object-key path.
+     *
+     * c-2: `!revalidate` excludes the revalidate trigger from ever arming
+     * this memo. An L2 NGX_DECLINED here does NOT mean "no marker exists"
+     * the way it does on the l1-miss path -- L1 already has a live marker
+     * (that is the entire reason a revalidate GET was launched); an
+     * NGX_DECLINED just means L2 does not (yet, or no longer) have its own
+     * copy, which the fail-open contract already handles by leaving the L1
+     * answer in place untouched. Arming the memo here would instead
+     * SUPPRESS every future revalidation attempt for this base key for up
+     * to l2_negative_ttl seconds regardless of window -- defeating the
+     * feature's own bound (the ⚠ hazard this row exists to close, applied
+     * to the fix itself). */
+    if (!revalidate && clcf->l2_negative_ttl > 0
+        && ctx->l2_result == NGX_DECLINED)
+    {
         clcf->l1->l2_neg_set(z, ctx->vary_marker_key,
             ngx_crc32_short(ctx->vary_marker_key, 32), clcf->l2_negative_ttl);
     }

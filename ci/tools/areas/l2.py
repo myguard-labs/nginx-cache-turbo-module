@@ -2034,6 +2034,138 @@ def test_l2_vary_marker_cold_node_finds_peer_variant(
         redis.cli("FLUSHDB")
 
 
+def _c2_purge_stops_peer(ng: Nginx, origin: Origin, redis: RedisServer,
+                         base_path: str, revalidate_window: float,
+                         require_healed: bool) -> None:
+    """c-2 shared driver. `base_path` is /c2revalidate/ (window=1s, the fix
+    ON) or /c2revalidate0/ (window=0, the fix OFF -- today's behaviour).
+
+    Node A primes a variant and self-heals a SECOND node B's own L1 marker
+    (the marker-cold-finds-peer path this row's fix reuses, proven above by
+    test_l2_vary_marker_cold_node_finds_peer_variant). B is then warm and
+    resolves entirely from its own L1 -- the gap this row closes. A PURGEs
+    the base; on the Redis-backed COR-5 path a PURGE DELETES the L2 marker +
+    every variant (purge.c: backend->del(clcf, mk), never a gen-bump -- the
+    gen-bump path is L1-only/memcached only), so B's still-warm L1 marker is
+    now provably stale versus the authoritative L2 state.
+
+    Oracle: origin.hits_for() on the concrete upstream path, mirroring the
+    cold-node test's own reasoning -- a stale L1 HIT on B would return the
+    SAME (pre-purge) body without ever touching the origin, which body
+    equality alone cannot distinguish from a correct re-fetch that happens
+    to race to the same bytes. `require_healed` controls what "success"
+    means for the caller: True asserts B eventually serves FRESH (post-purge
+    generation) content; False asserts B is STILL serving the stale
+    pre-purge body at the same point in time -- the negative control's own
+    positive assertion, not merely the absence of the True-side one."""
+    uri = f"{base_path}c2check?v=al"
+    origin_hdr = {"Accept-Language": "en"}
+
+    # A primes; B self-heals its OWN L1 marker off A's L2 write-through
+    # (identical mechanism to test_l2_vary_marker_cold_node_finds_peer_variant).
+    sa, body_a, ha = fetch(ng.port, uri, origin_hdr)
+    assert sa == 200 and "x-cache" not in ha, \
+        f"A's first fetch should MISS to origin, got X-Cache={ha.get('x-cache')}"
+    assert wait_for(lambda: redis.cli("KEYS", "*") != ""), \
+        "auto-Vary store never reached L2 at all"
+
+    b = _spawn_node(ng, f"server-c2-{'on' if require_healed else 'off'}", 10)
+    try:
+        sb, body_b0, hb0 = fetch(b.port, uri, origin_hdr)
+        assert sb == 200 and body_b0 == body_a, \
+            "B should L2-fill A's variant via the marker-cold consult"
+        assert hb0.get("x-cache") == "HIT"
+
+        # B's SECOND read must now resolve entirely from its own (just
+        # self-healed) warm L1 marker -- the exact state a peer's PURGE has
+        # to reach through.
+        origin_before = origin.hits_for("c2check")
+        _, body_b1, hb1 = fetch(b.port, uri, origin_hdr)
+        assert body_b1 == body_a and hb1.get("x-cache") == "HIT"
+        assert origin.hits_for("c2check") - origin_before == 0, \
+            "B's second read should resolve from its own warm L1 marker, " \
+            "not pay another round trip"
+
+        # A PURGEs the base. On the redis-backed COR-5 path this deletes the
+        # L2 marker + every variant outright.
+        s, purge_body, _ = fetch_raw(ng.port, f"{base_path}c2check?v=al",
+                                     method="PURGE")
+        assert s == 200, f"PURGE status {s}: {purge_body}"
+
+        # Give the revalidation window room to elapse (only meaningful when
+        # revalidate_window > 0; a 0-window location never arms it, so this
+        # sleep is inert there -- the negative control still exercises the
+        # SAME wall-clock budget as the positive case, which is the point:
+        # nothing about elapsed time alone should matter with the knob off).
+        time.sleep(revalidate_window + 0.7)
+
+        origin_before2 = origin.hits_for("c2check")
+        _, body_b2, hb2 = fetch(b.port, uri, origin_hdr)
+
+        if require_healed:
+            assert body_b2 != body_a, (
+                "B (peer node) served the OLD variant body AFTER A's PURGE "
+                "and past the revalidation window -- cross-node marker "
+                "staleness was not closed",
+                body_a, body_b2)
+            assert "x-cache" not in hb2 or hb2.get("x-cache") != "HIT", (
+                "B's post-PURGE, post-window read must not be a stale L1 "
+                f"HIT, got X-Cache={hb2.get('x-cache')!r}")
+        else:
+            assert body_b2 == body_a, (
+                "NEGATIVE CONTROL FAILED: with "
+                "cache_turbo_vary_marker_revalidate 0, B (peer node) is "
+                "EXPECTED to keep serving the stale pre-PURGE variant "
+                "(today's unbounded behaviour) -- it did not, so this test "
+                "shape does not actually discriminate the fix from the "
+                "no-fix baseline",
+                body_a, body_b2)
+            assert hb2.get("x-cache") == "HIT", (
+                "negative control: B should still be resolving the stale "
+                f"variant as an L1 HIT with the knob off, got {hb2}")
+        assert origin.hits_for("c2check") - origin_before2 == \
+            (1 if require_healed else 0)
+
+        b.stop()
+        b.assert_clean_logs()
+    finally:
+        b.stop()
+        drain_origin(origin)
+        redis.cli("FLUSHDB")
+
+
+def test_c2_vary_marker_revalidate_closes_cross_node_staleness(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    """c-2 (TODO.md 'sonnet -- serial', DECIDED design in issues.md): a warm
+    L1 auto-Vary marker is authoritative and NEVER consults L2
+    (access_l1()/vary_apply()), so a PURGE handled by a PEER node bumps/
+    deletes the generation there but THIS node's own warm, node-local L1
+    marker keeps resolving the pre-purge variant until the marker's own TTL
+    (hours under keep_stale) -- unbounded staleness.
+
+    On /c2revalidate/ (cache_turbo_vary_marker_revalidate 1s), a peer node's
+    warm marker must stop resolving the pre-purge variant within window +
+    slack of a PURGE landing anywhere in the cluster -- proven by origin
+    hits (a fresh origin regen, X-Cache no longer a stale HIT), not body
+    inequality alone (see _c2_purge_stops_peer's oracle note)."""
+    _c2_purge_stops_peer(ng, origin, redis, "/c2revalidate/",
+                         revalidate_window=1.0, require_healed=True)
+
+
+def test_c2_vary_marker_revalidate_negative_control_knob_zero(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    """c-2 negative control (DONE criterion #2, mandatory alongside the
+    positive test above): cache_turbo_vary_marker_revalidate 0 on
+    /c2revalidate0/ must reproduce TODAY'S (broken, pre-c-2) behaviour --
+    B keeps serving the pre-PURGE variant indefinitely, proving this test
+    shape genuinely discriminates the fix (window > 0) from no-fix (window
+    == 0) rather than passing either way. If this assertion ever goes red on
+    an unmodified /c2revalidate0/, the positive test above is not trustworthy
+    evidence that c-2 did anything."""
+    _c2_purge_stops_peer(ng, origin, redis, "/c2revalidate0/",
+                         revalidate_window=1.0, require_healed=False)
+
+
 def test_cross_node_won_stale_body(ng: Nginx, origin: Origin,
                                    redis: RedisServer) -> None:
     """S231-PERF-BGSNAP: the cross-node lock-WINNER's background-update stale

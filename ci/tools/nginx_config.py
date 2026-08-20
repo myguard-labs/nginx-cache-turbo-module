@@ -609,6 +609,38 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # c-2: cross-node marker staleness. Same shape as /cor5/ (Redis-backed
+        # auto-Vary + PURGE), but with a short, test-friendly
+        # cache_turbo_vary_marker_revalidate window so a peer node's stale L1
+        # marker resolution can be proven to close within a couple of seconds
+        # instead of waiting out cache_turbo_valid. Own Redis prefix (c2:) so
+        # its variant-index sets never collide with /cor5/'s ct:tag:* counts.
+        location /c2revalidate/ {{
+            cache_turbo          main;
+            cache_turbo_key      $request_uri;
+            cache_turbo_valid    30s;
+            cache_turbo_auto_vary on;
+            cache_turbo_purge    on;
+            cache_turbo_redis    127.0.0.1:{redis_port} prefix=c2: timeout=250ms;
+            cache_turbo_vary_marker_revalidate 1;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # c-2 negative control: identical location, revalidation explicitly
+        # OFF (the pre-c-2 default posture). Proves the two-node test actually
+        # discriminates -- it must still catch today's (unbounded) staleness
+        # here, or the positive-location assertion proves nothing.
+        location /c2revalidate0/ {{
+            cache_turbo          main;
+            cache_turbo_key      $request_uri;
+            cache_turbo_valid    30s;
+            cache_turbo_auto_vary on;
+            cache_turbo_purge    on;
+            cache_turbo_redis    127.0.0.1:{redis_port} prefix=c20: timeout=250ms;
+            cache_turbo_vary_marker_revalidate 0;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # COR-5(b) variant-index self-heal. Same shape as /cor5/ above, with
         # one difference: cache_turbo_test_varidx_fail arms a PER-REQUEST
         # fault -- a request carrying X-Cache-Turbo-Test-Varidx-Drop: 1 has

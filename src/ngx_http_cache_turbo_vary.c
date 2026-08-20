@@ -691,6 +691,7 @@ ngx_http_cache_turbo_vary_apply(ngx_http_request_t *r,
 {
     ngx_int_t                     bits = 0;
     ngx_uint_t                    gen = 0;
+    time_t                        resolve_created = 0;
     ngx_http_cache_turbo_node_t  *m;
 
     m = clcf->l1->lookup(z, ctx->vary_marker_key,
@@ -749,6 +750,23 @@ ngx_http_cache_turbo_vary_apply(ngx_http_request_t *r,
             if (m->len >= NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE + 2) {
                 gen = m->data[NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE + 1];
             }
+
+            /* c-2: `created` (the marker's resolve time) already lives at
+             * the fixed offset every blob_hdr_write() writes it to -- see
+             * blob.c's blob_hdr_write()/put_u64(dst+24, created) and the
+             * matching blob_validate() get_u64(blob+24). marker_store()
+             * stamps it via ngx_time() on EVERY store, including the
+             * self-heal writes below and in access_l2_marker_consume(), so
+             * it doubles as "how long ago was this marker last resolved
+             * from an authoritative source" with no wire-format change and
+             * no second decode pass -- read directly like the magic/
+             * version/bits/gen fields immediately above, not through the
+             * full blob_validate() TLV walk (S231-PERF-VARYMAGIC's
+             * reasoning applies identically here: this call already proved
+             * the buffer is at least HDR_WIRE bytes, and offset 24..31 sits
+             * inside that fixed-size prefix regardless of headers_len). */
+            resolve_created = (time_t) ngx_http_cache_turbo_get_u64(
+                                   m->data + 24);
         }
     }
 
@@ -771,6 +789,33 @@ ngx_http_cache_turbo_vary_apply(ngx_http_request_t *r,
          * not let a landed-but-now-STALE L2 answer override what THIS pass
          * already resolved from L1. */
         ctx->vary_marker_l1_miss = 0;
+
+        /* c-2: a warm L1 hit is authoritative for THIS request's answer
+         * (key_hash/hash above are already the right variant to serve --
+         * fail-open per the c-2 design, never blocked on the check below),
+         * but it may be resolving a generation a PEER already orphaned via
+         * PURGE. clcf->vary_marker_revalidate == 0 is the off switch
+         * (today's behaviour: never re-check, matches the pre-c-2
+         * contract exactly). Age is computed the same clock-skew-floored
+         * way access_l2_marker_consume()/access_l2() already compute `age`
+         * from a blob's `created`. This only ARMS the L2 revalidation
+         * consult (access_l2_marker_get()/_consume()) for THIS pass; it
+         * never issues a GET itself and never blocks -- see those
+         * functions' field comments for how vary_marker_revalidate is
+         * consumed without reintroducing a per-request round trip. */
+        ctx->vary_marker_revalidate = 0;
+
+        if (clcf->vary_marker_revalidate > 0 && !ctx->vary_marker_l2_done) {
+            time_t  age = ngx_time() - resolve_created;
+
+            if (age < 0) {          /* clock skew between writers */
+                age = 0;
+            }
+            if (age >= clcf->vary_marker_revalidate) {
+                ctx->vary_marker_revalidate = 1;
+            }
+        }
+
         ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "cache_turbo: auto-Vary marker hit \"%V\" bits=0x%xi "
                        "-> variant key", &r->uri, bits);
