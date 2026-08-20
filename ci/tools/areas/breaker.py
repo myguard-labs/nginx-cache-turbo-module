@@ -1134,13 +1134,13 @@ def test_redis_timeout_zero_rejected(ng: Nginx) -> None:
             rf"location /l2/ \{{[^}}]*cache_turbo_redis\s+127\.0\.0\.1:{re.escape(str(ng.redis_port))}\s+prefix=ct:\s+timeout=250ms;",
             re.MULTILINE | re.DOTALL
         )
-        new_cfg = pattern.sub(
-            lambda m: m.group(0).replace("timeout=250ms;", "timeout=0;"), c
+        new_cfg, sub_count = pattern.subn(
+            lambda m: m.group(0).replace("timeout=250ms;", "timeout=0;"), c, count=1
         )
-        assert new_cfg != c, \
-            "mutator produced no change: test would be vacuous (never validates a mutation)"
+        assert sub_count == 1, \
+            f"expected to mutate cache_turbo_redis directive exactly once, got {sub_count} substitutions"
         return new_cfg
-    r = _config_test_result(ng, mutate, expect_unchanged=False)
+    r = _config_test_result(ng, mutate)
     assert r.returncode != 0, \
         f"timeout=0 was accepted by nginx -t:\n{r.stdout}"
     assert "timeout must be > 0" in r.stdout, \
@@ -1161,13 +1161,13 @@ def test_memcached_timeout_zero_rejected(ng: Nginx) -> None:
             rf"location /mc/ \{{[^}}]*cache_turbo_memcached\s+127\.0\.0\.1:{re.escape(str(ng.memcached_port))}\s+prefix=mc:\s+timeout=250ms;",
             re.MULTILINE | re.DOTALL
         )
-        new_cfg = pattern.sub(
-            lambda m: m.group(0).replace("timeout=250ms;", "timeout=0;"), c
+        new_cfg, sub_count = pattern.subn(
+            lambda m: m.group(0).replace("timeout=250ms;", "timeout=0;"), c, count=1
         )
-        assert new_cfg != c, \
-            "mutator produced no change: test would be vacuous (never validates a mutation)"
+        assert sub_count == 1, \
+            f"expected to mutate cache_turbo_memcached directive exactly once, got {sub_count} substitutions"
         return new_cfg
-    r = _config_test_result(ng, mutate, expect_unchanged=False)
+    r = _config_test_result(ng, mutate)
     assert r.returncode != 0, \
         f"timeout=0 was accepted by nginx -t:\n{r.stdout}"
     assert "timeout must be > 0" in r.stdout, \
