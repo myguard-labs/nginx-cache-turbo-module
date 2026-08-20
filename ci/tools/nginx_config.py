@@ -2463,7 +2463,14 @@ http {{
         location /s231ncc/ {{
             cache_turbo                    s231nccz;
             cache_turbo_key                $uri;
-            cache_turbo_valid               1s;
+            # 30s (not the sibling zones' 1s): this zone's test primes then
+            # re-fetches immediately expecting a HIT -- the TTL is incidental
+            # scaffolding here (nothing in the test relies on expiry), so a
+            # short window only produces a 1.0s wall-clock margin between
+            # prime and re-fetch that flakes under sanitizer-slowed CI
+            # (ASan). 30s gives the re-fetch a comfortable margin without
+            # weakening what the test asserts.
+            cache_turbo_valid               30s;
             cache_turbo_keep_stale         off;
             cache_turbo_stale_mult          1;
             cache_turbo_breaker             on;
