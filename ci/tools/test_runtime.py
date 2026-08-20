@@ -415,6 +415,14 @@ def run_all(ng: Nginx, origin: Origin,
         # degraded one when a drop is still outstanding at purge time.
         test_cor5_purge_reports_degraded_enumeration(ng, origin, redis)
         test_l2_vary_marker_cold_node_finds_peer_variant(ng, origin, redis)  # P3-5
+        # c-2: a peer's PURGE must stop a warm-marker node from serving the
+        # old variant within cache_turbo_vary_marker_revalidate's window; the
+        # negative control (knob at 0) must reproduce today's unbounded
+        # staleness, proving the positive test actually discriminates.
+        test_c2_vary_marker_revalidate_closes_cross_node_staleness(
+            ng, origin, redis)
+        test_c2_vary_marker_revalidate_negative_control_knob_zero(
+            ng, origin, redis)
         test_multinode_lock(ng, origin, redis)
         test_cross_node_won_stale_body(ng, origin, redis)  # S231-PERF-BGSNAP
         test_lock_self_heal(ng, origin, redis)

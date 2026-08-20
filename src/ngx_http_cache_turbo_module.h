@@ -68,6 +68,19 @@
 #define NGX_HTTP_CACHE_TURBO_L2_NEG_TTL_MIN  1
 #define NGX_HTTP_CACHE_TURBO_L2_NEG_TTL_MAX  60
 
+/* Bounds on cache_turbo_vary_marker_revalidate N (c-2). 0 = OFF (today's
+ * behaviour exactly: a warm L1 marker is trusted unconditionally, no matter
+ * its age) and is the default.
+ *
+ * The ceiling mirrors l2_negative_ttl's reasoning: this directive trades
+ * cross-node marker coherence for avoiding a blocking per-request L2 round
+ * trip, and the window is exactly how long a peer's PURGE can stay invisible
+ * to THIS node after a warm L1 marker resolve. Seconds are the useful range
+ * (see c-2 design in issues.md); minutes would let a typo silently widen the
+ * cross-node staleness window back toward "unbounded". */
+#define NGX_HTTP_CACHE_TURBO_VARY_MARKER_REVALIDATE_MIN  1
+#define NGX_HTTP_CACHE_TURBO_VARY_MARKER_REVALIDATE_MAX  60
+
 /* "Forever" fresh TTL. `cache_turbo_valid 0` ("cache forever", per the code's
  * long-standing contract) resolves to this long-but-finite TTL rather than a
  * literal 0 — a literal 0 made the object instantly+permanently STALE and
@@ -1451,6 +1464,29 @@ typedef struct {
      * that) and leave it off unless L2 misses dominate the miss path. */
     time_t                   l2_negative_ttl;
 
+    /* cache_turbo_vary_marker_revalidate N (c-2). Seconds a warm L1 auto-Vary
+     * marker may be trusted before a request revalidates it against the
+     * authoritative L2 generation instead of serving the L1 answer
+     * unconditionally. 0 = OFF (the default -- today's behaviour: an L1 hit
+     * is authoritative forever, per vary_apply()'s existing contract).
+     *
+     * Closes a real gap: access_l1()/vary_apply() treats any warm, unexpired
+     * L1 marker as authoritative and never consults L2, so a PURGE handled by
+     * a PEER node bumps the generation there but this node's own warm L1
+     * marker (node-local by design) keeps resolving the OLD generation until
+     * it naturally expires -- unbounded under cache_turbo_keep_stale. This
+     * directive node-local-window-bounds that gap by re-checking L2's gen no
+     * more often than once per window per base key, reusing the EXISTING
+     * access_l2_marker_get() GET (never a new per-request round trip -- see
+     * that function's field comment on the negative-memo bypass this
+     * directive needs). Gated on clcf->auto_vary: meaningless without the
+     * marker machinery auto_vary provides. Requires auto_vary to be
+     * meaningful (checked at the call site, not at config time -- unlike
+     * key_encoded_origin this is a pure staleness-window tightening with no
+     * correctness hazard if auto_vary is later turned off, so a config-time
+     * refusal is not warranted; it simply becomes inert). */
+    time_t                   vary_marker_revalidate;
+
     /* cache_turbo_keep_stale <off|time|forever> (S2.1; read side wired in
      * S2.2). Consulted on the store path, where it widens sie_window -- see
      * the `ttl > 0 && clcf->keep_stale > 0` and
@@ -2059,6 +2095,39 @@ typedef struct {
      * within one request. See access_l2_marker_consume()'s field comment
      * for the concrete failure this closes. */
     unsigned                 vary_marker_l2_down:1;
+    /* c-2: set by vary_apply() (NOT vary_marker_l1_miss -- the marker DID
+     * resolve, from L1) when clcf->vary_marker_revalidate > 0 and the warm
+     * L1 marker's resolve time is older than that window. Consulted by
+     * access_l2_marker_get()/_consume() so a WARM marker also gets routed
+     * through the existing L2 marker GET -- distinct from
+     * vary_marker_l1_miss, which means "no marker at all". The two are
+     * mutually exclusive (vary_apply only sets one or the other, never
+     * both) but consumed identically by the L2 phase except for two things:
+     * (1) the l2_negative_ttl memo check in marker_get() must NOT gate this
+     * case (that memo answers "an L2 GET for this key missed recently",
+     * which says nothing about whether an L1 marker known to exist is
+     * stale), and (2) marker_consume() must not drop the landed answer just
+     * because ctx->vary_marker_l1_miss is already 0 (that early-return
+     * exists to protect against overriding a NEWER L1 resolution that
+     * appeared mid-park; a revalidation's whole point is to let the L2
+     * answer override the L1 one it is checking). Cleared by
+     * marker_consume() once the GET result (hit, miss, or transport
+     * failure) has been applied or fail-open has been confirmed, so it
+     * never survives past the request that set it. */
+    unsigned                 vary_marker_revalidate:1;
+    /* c-2: persists WHY the in-flight/landed marker GET was launched across
+     * a park/resume boundary. ctx->vary_marker_revalidate itself does not
+     * survive a park: vary_apply() re-runs on every access_l1() re-entry
+     * (including the resume of this very GET) and only re-arms it when
+     * !vary_marker_l2_done, which access_l2_marker_get() has by then already
+     * set -- so by the time access_l2_marker_consume() sees the landed
+     * result, ctx->vary_marker_revalidate has already been reset to 0 by the
+     * resume's own vary_apply() pass. Set once, at launch, only on the
+     * revalidate trigger (the l1-miss trigger needs no such memory --
+     * vary_marker_l1_miss itself is what consume() already keys its
+     * apply-vs-drop decision on); never cleared until consume() is done with
+     * it. */
+    unsigned                 vary_marker_revalidate_inflight:1;
     /* P3-5: the variant this request resolved to via the L2-backed marker
      * consult, persisted so it survives a park/resume boundary. A plain
      * rewrite of ctx->key_hash does NOT survive: ngx_http_cache_turbo_
