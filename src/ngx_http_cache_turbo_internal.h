@@ -970,6 +970,8 @@ char *ngx_http_cache_turbo_bypass_stale_uri(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 char *ngx_http_cache_turbo_key_cookie_conf(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
+char *ngx_http_cache_turbo_ignore_set_cookie_conf(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
 /* P0-1: reason_out receives which arm vetoed (see the
  * NGX_HTTP_CACHE_TURBO_REFUSE_* enum in module.h), or _NONE (0) when the
  * function returns 1 (cacheable) -- reason_out may be NULL for callers that
