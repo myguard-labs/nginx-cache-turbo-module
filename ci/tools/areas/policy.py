@@ -1423,9 +1423,11 @@ def test_rfc6_stale_conditional_full(ng: Nginx, origin: Origin) -> None:
     stale (served while a refresh is pending) a conditional request gets the
     full 200 body, never a 304 from an unvalidated stale copy.
 
-    /condst/ has a 1s TTL (shared with test_rfc1_request_max_stale and
-    test_p4_multi_directive_single_resolve, which sleep past it to exercise the
-    STALE path deliberately - do not widen it here). The fresh-conditional leg
+    /condst/ has a 1s TTL (shared with test_p4_multi_directive_single_resolve,
+    which sleeps past it to exercise the STALE path deliberately - do not
+    widen it here; test_rfc1_request_max_stale moved to its own /maxstale/
+    location with a wider stale window, see STALE-WINDOW-OVERSHOOT there).
+    The fresh-conditional leg
     below must be primed and read back before that 1s elapses; on a loaded CI
     runner the two requests can straddle the boundary and the entry goes stale
     before the "fresh" leg is evaluated. That is an expired test precondition,
@@ -1596,24 +1598,65 @@ def test_rfc1_request_max_stale(ng: Nginx, origin: Origin) -> None:
     request actually reach the origin to revalidate), not the x-cache header
     alone -- a re-primed entry can also read back as a fresh HIT with age=0,
     which is indistinguishable from "still fresh" if x-cache is the only
-    signal."""
-    fetch_raw(ng.port, "/condst/cond-ms")                          # prime, fresh 1s
+    signal.
+
+    STALE-WINDOW-OVERSHOOT (2026-08-20, failed under both ASan lanes on an
+    innocent PR): #379 fixed the too-SMALL lower margin above but only
+    checked the lower bound. The stale window is FINITE -- it also has an
+    upper bound where the entry expires outright and falls through to
+    origin, which trips the very "must not hit origin" assertion this test
+    is making. `sanitizer_time_scale()` returns 2.0 under ASan, so the sleep
+    is `(ttl + slack) * scale`:
+        non-ASan: (1.0 + 0.75) * 1.0 = 1.75s
+        ASan:     (1.0 + 0.75) * 2.0 = 3.50s
+    On /condst/ (default stale_mult 4 -> stale window 1s-4s) the ASan sleep
+    of 3.5s left only 0.5s before the 4s expiry -- easily eaten by the
+    prime request's own wall-clock time plus scheduling jitter on a loaded
+    runner, so the entry EXPIRED instead of going STALE and the request fell
+    through to origin. The wait must land INSIDE a window with margin on
+    BOTH sides, not merely past a single deadline.
+
+    Fix: use a dedicated location, /maxstale/, with stale_mult 8 (the
+    module's max) instead of widening /condst/'s window out from under its
+    other two consumers (test_rfc6_stale_conditional_full,
+    test_p4_multi_directive_single_resolve). The proxied key is
+    /maxstale/cond-max-ms: it keeps the "cond" substring origin.py requires
+    to emit ETag/Last-Modified (dropping it would silently downgrade this
+    test's coverage to a validator-less origin -- caught in review) while
+    staying distinct from /cond-ms and /condst/'s other keys so this test's
+    origin.hits_for() oracle is never shared with another test's traffic.
+    That gives a stale window of 1s-8s:
+        non-ASan sleep 1.75s -> 0.75s clear of the 1s lower bound,
+                                 6.25s clear of the 8s upper bound
+        ASan     sleep 3.50s -> 2.50s clear of the 1s lower bound,
+                                 4.50s clear of the 8s upper bound
+    Both lanes land comfortably inside the window with multi-second margin
+    on each side. If ttl, slack or stale_mult ever change here, recompute
+    both margins and keep them positive under the 2.0 ASan scale."""
+    # "cond" in the proxied path is LOAD-BEARING: origin.py gates ETag /
+    # Last-Modified emission on that substring (see the /maxstale/ location
+    # comment in nginx_config.py), and this test's coverage previously
+    # depended on the entry carrying validators. Assert it below rather than
+    # merely assuming the substring worked.
+    sp, _, hp = fetch_raw(ng.port, "/maxstale/cond-max-ms")        # prime, fresh 1s
+    assert sp == 200 and hp.get("etag") == '"v11etag"', \
+        f"prime must carry the origin's conditional validator: {sp} {hp}"
     ttl = 1.0
     slack = 0.75                    # generous margin: a long wait is cheap,
                                      # a flake is not -- see TTL-REVAL-RACE
     time.sleep((ttl + slack) * sanitizer_time_scale())
-    before = origin.hits_for("/cond-ms")
+    before = origin.hits_for("/cond-max-ms")
     # max-stale present -> accept the stale copy (beta 1, no refresh)
-    s0, b0, h0 = fetch_raw(ng.port, "/condst/cond-ms",
+    s0, b0, h0 = fetch_raw(ng.port, "/maxstale/cond-max-ms",
                            headers={"Cache-Control": "max-age=1, max-stale=30"})
-    assert origin.hits_for("/cond-ms") == before, \
+    assert origin.hits_for("/cond-max-ms") == before, \
         f"max-stale stale serve must not hit origin: {s0} {h0}"
     assert s0 == 200 and b0 and h0.get("x-cache") == "STALE", \
         f"max-stale must permit the stale serve: {s0} {h0}"
     # same tight max-age but NO max-stale -> no stale tolerance -> revalidate
-    s1, _, h1 = fetch_raw(ng.port, "/condst/cond-ms",
+    s1, _, h1 = fetch_raw(ng.port, "/maxstale/cond-max-ms",
                           headers={"Cache-Control": "max-age=1"})
-    assert origin.hits_for("/cond-ms") == before + 1, \
+    assert origin.hits_for("/cond-max-ms") == before + 1, \
         f"no-max-stale revalidation must hit origin: {s1} {h1}"
     assert s1 == 200 and "x-cache" not in h1, \
         f"max-age without max-stale must revalidate a stale entry: {h1}"

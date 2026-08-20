@@ -1669,6 +1669,29 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # RFC-1 (test_rfc1_request_max_stale): dedicated from /condst/ so this
+        # test's sleep-past-TTL can use a wide stale window without perturbing
+        # the other /condst/ consumers (test_rfc6_stale_conditional_full,
+        # test_p4_multi_directive_single_resolve), which assert against the
+        # DEFAULT stale_mult and must not have their window widened out from
+        # under them. fresh 1s, stale_mult 8 (module max) -> stale 1s-8s,
+        # fully expired only after 8s. beta 1 ~ never refresh.
+        #
+        # LOAD-BEARING: the test proxies to a key containing "cond" (see
+        # origin.py's ETag/Last-Modified gate, `if "cond" in self.path`) so
+        # the stored entry carries conditional validators, same as /condst/.
+        # A key rename that drops the "cond" substring silently downgrades
+        # this test to exercising a validator-less origin -- caught once in
+        # review, do not repeat it.
+        location /maxstale/ {{
+            cache_turbo             main;
+            cache_turbo_key         $uri;
+            cache_turbo_valid       1s;
+            cache_turbo_stale_mult  8;
+            cache_turbo_beta        1;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # RFC-2: fresh 1s; default stale window would be 3s (stale_mult 4 ->
         # expire at 4s), but the origin's stale-while-revalidate=10 extends it,
         # so the entry is still STALE-serveable at 5s. beta 1 ~ no refresh.
