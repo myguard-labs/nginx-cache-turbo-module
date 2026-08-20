@@ -797,6 +797,17 @@ ngx_http_cache_turbo_merge_breaker(ngx_http_cache_turbo_loc_conf_t *conf,
                               prev->breaker_threshold, 5);
     ngx_conf_merge_sec_value(conf->breaker_window, prev->breaker_window, 10);
 
+    /* P5-5r: OPT-IN, default OFF -- deliberately NOT part of S231-DEFAULTS.
+     * Every other breaker knob above ships pre-tuned because turning the
+     * breaker itself on cannot change an existing deployment's observable
+     * responses (a CLOSED breaker with recording off behaves exactly as
+     * before). This one is different: it changes WHEN the breaker trips for
+     * a site that already relies on proxy_next_upstream retries, so it must
+     * stay off until an operator asks for it. See the field comment on
+     * breaker_count_retries in the .h. */
+    ngx_conf_merge_value(conf->breaker_count_retries,
+                          prev->breaker_count_retries, 0);
+
     /* P6/O4.3. ⚠ breaker_open merges to a NON-ZERO default, unlike every other
      * breaker field. 0 is not "off" for this one -- it is the one value that
      * WEDGES the breaker: _breaker_state() guards its timed reopen on

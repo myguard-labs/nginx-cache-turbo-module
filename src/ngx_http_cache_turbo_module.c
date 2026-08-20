@@ -363,6 +363,17 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       offsetof(ngx_http_cache_turbo_loc_conf_t, breaker_window),
       NULL },
 
+    /* P5-5r: OPT-IN, default off -- see the field comment on
+     * breaker_count_retries in the .h for why this does not ship on. When
+     * on, every proxy_next_upstream peer attempt that failed before the
+     * final one also counts toward the breaker's failure run. */
+    { ngx_string("cache_turbo_breaker_count_retries"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_turbo_loc_conf_t, breaker_count_retries),
+      NULL },
+
     /* ⚠ NOT ngx_conf_set_sec_slot: 0 must be a hard config error here, not a
      * silent disable. See ngx_http_cache_turbo_breaker_open_conf() and the
      * O4.3-a note on the breaker_open field in the .h. */
@@ -3851,6 +3862,63 @@ ngx_http_cache_turbo_breaker_action(ngx_uint_t state, ngx_uint_t has_body)
 /* UNIT-EXTRACT breaker-failure END */
 
 
+/* P5-5r: count peer attempts that FAILED before the one whose status this
+ * response reports, i.e. every ngx_http_upstream_state_t entry in
+ * r->upstream_states except the last (r->upstream->state, already handled
+ * by the caller via ngx_http_cache_turbo_breaker_is_origin_failure() /
+ * ngx_http_cache_turbo_transport_failure()).
+ *
+ * Deliberately NOT part of the UNIT-EXTRACT breaker-failure block above:
+ * every function there is a pure predicate the unit harness can drive with
+ * scalars; this one walks a live ngx_http_request_t's upstream_states array,
+ * which only exists inside a real request and cannot be sliced into that
+ * harness. It is exercised by the Test::Nginx integration suite instead
+ * (t/breaker-retry-count.t).
+ *
+ * WHY a prior attempt counts as a failure without re-deriving is_origin_failure
+ * on its recorded `status`: a retried attempt's status field is only ever
+ * meaningful when nginx itself decided to retry past it, and nginx retries
+ * past 5xx (via proxy_next_upstream's default) or a transport failure (no
+ * status at all, header_time == -1) -- see the same -1 sentinel
+ * ngx_http_cache_turbo_transport_failure() reads on the CURRENT attempt.
+ * Reusing breaker_is_origin_failure() on a retried entry's `status` handles
+ * both: a transport failure leaves `status` at 0 (ngx_memzero at push time,
+ * ngx_http_upstream_connect() above), which is outside the 500..599 range
+ * and would go uncounted by is_origin_failure() alone -- so this function
+ * treats header_time == -1 as an additional failure signal, exactly
+ * mirroring ngx_http_cache_turbo_transport_failure()'s own test, rather than
+ * inventing a second one.
+ *
+ * Only counts entries STRICTLY BEFORE the last: the last entry is the
+ * response this filter is already handling via the existing single-status
+ * path in the caller, and counting it again here would double-count that
+ * exact outcome. A request with only one attempt (the common case, no
+ * retry occurred) returns 0 -- this function changes nothing when
+ * proxy_next_upstream never fired. */
+ngx_uint_t
+ngx_http_cache_turbo_breaker_retry_failures(ngx_http_request_t *r)
+{
+    ngx_http_upstream_state_t  *state;
+    ngx_uint_t                  i, n, fails;
+
+    if (r->upstream_states == NULL || r->upstream_states->nelts < 2) {
+        return 0;
+    }
+
+    state = r->upstream_states->elts;
+    n     = r->upstream_states->nelts - 1; /* exclude the final/current attempt */
+    fails = 0;
+
+    for (i = 0; i < n; i++) {
+        if (state[i].header_time == (ngx_msec_t) -1
+            || ngx_http_cache_turbo_breaker_is_origin_failure(state[i].status))
+        {
+            fails++;
+        }
+    }
+
+    return fails;
+}
 
 
 
@@ -4681,6 +4749,7 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->breaker_enable = NGX_CONF_UNSET;         /* O4.4; merges to 0 = off */
     conf->breaker_threshold = NGX_CONF_UNSET_UINT; /* O4.2; merges to 0 = off */
     conf->breaker_window = NGX_CONF_UNSET;         /* O4.2; merges to 0 = off */
+    conf->breaker_count_retries = NGX_CONF_UNSET;  /* P5-5r; merges to 0=off */
     conf->breaker_open = NGX_CONF_UNSET;           /* O4.3; see the merge note */
     conf->breaker_retry_after = NGX_CONF_UNSET;    /* BRK-RA1; stays UNSET if
                                                      * never set anywhere,

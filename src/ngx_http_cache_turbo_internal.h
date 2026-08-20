@@ -1023,6 +1023,7 @@ time_t ngx_http_cache_turbo_upstream_ttl(ngx_http_request_t *r);
 ngx_uint_t ngx_http_cache_turbo_use_stale_triggers(ngx_uint_t mask,
     ngx_uint_t status, ngx_uint_t transport_failure);
 ngx_uint_t ngx_http_cache_turbo_transport_failure(ngx_http_request_t *r);
+ngx_uint_t ngx_http_cache_turbo_breaker_retry_failures(ngx_http_request_t *r);
 
 /* ---- filters.c (response header/body filter group, MAINT-SPLIT step E) ----
  *

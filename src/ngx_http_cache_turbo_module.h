@@ -1378,6 +1378,34 @@ typedef struct {
     ngx_uint_t               breaker_threshold; /* failures to trip; 0 = off  */
     time_t                   breaker_window;    /* rolling window s; 0 = off  */
 
+    /* P5-5r: cache_turbo_breaker_count_retries off|on. OPT-IN, default off,
+     * unlike every other breaker knob above (which ship on/pre-tuned by
+     * S231-DEFAULTS). proxy_next_upstream runs UNDERNEATH this module: by
+     * the time the header filter records an outcome, nginx may already have
+     * burned several peer attempts, each recorded as its own entry in
+     * r->upstream_states with its own status/header_time, and folded the
+     * final one into a single response this module sees. With this off
+     * (the default), only that final attempt is recorded -- byte-for-byte
+     * today's behaviour, so an existing deployment's trip point does not
+     * move. With it on, every FAILED attempt that precedes the final one in
+     * upstream_states also feeds the breaker as one additional failure via
+     * the same ngx_http_cache_turbo_shm_breaker_record() call -- see
+     * ngx_http_cache_turbo_breaker_retry_failures() in module.c, and the
+     * ordering note on its call site in filters.c
+     * (ngx_http_cache_turbo_header_filter_record_breaker()) for why this
+     * only lets a SINGLE request's own retry chain trip the breaker, not a
+     * trickle of failures smeared across separately-successful requests:
+     * shm_breaker_record()'s success branch unconditionally clears the
+     * failure run, so a later request's own success always erases an
+     * earlier request's retry evidence. Left off by default because it
+     * changes WHEN a request's own retries can trip the group: a site that
+     * already free-rides on proxy_next_upstream retries today never trips
+     * the breaker on those, no matter how many peers one request burns
+     * through; turning this on makes such a request trip the breaker where
+     * it previously could not, which is the point, but only for an
+     * operator who asks for it. */
+    ngx_flag_t               breaker_count_retries;
+
     /* P6/O4.3 serve-path tuning. Read by the pre-origin breaker gate in
      * ngx_http_cache_turbo_access_handler(); the directives that set them are
      * O4.4, so both still merge to their inert defaults here.
