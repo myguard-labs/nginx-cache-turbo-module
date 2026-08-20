@@ -805,7 +805,32 @@ ngx_http_cache_turbo_vary_apply(ngx_http_request_t *r,
          * consumed without reintroducing a per-request round trip. */
         ctx->vary_marker_revalidate = 0;
 
-        if (clcf->vary_marker_revalidate > 0 && !ctx->vary_marker_l2_done) {
+        /* S231-NOCACHE-OUTAGE follow-up: never arm a revalidation while the
+         * breaker is OPEN. access_l1()'s serve arms (serve_fresh/serve_stale)
+         * are what run the breaker-fallback arm/SIE-arm phases and hand this
+         * exact object to the pre-origin breaker gate as the STALE-BREAKER
+         * snapshot -- diverting a request into the marker-revalidation
+         * fall-through instead skips straight past that machinery on THIS
+         * pass. That is fine when the origin is healthy (the object-GET
+         * phase re-derives the correct status a moment later), but during a
+         * real outage it means a routine, bounded generation recheck can
+         * turn an ordinary cached HIT into extra latency riding the same
+         * outage the breaker exists to shield against. A possibly-stale
+         * cached variant must always beat that cost; revalidation is a
+         * correctness improvement on the healthy path only. Peeking via
+         * ngx_http_cache_turbo_brk_state() (a pure read of z->sh->
+         * breaker_state) rather than the state-machine-driving
+         * ngx_http_cache_turbo_shm_breaker_state() is deliberate: the latter
+         * performs the due OPEN -> HALF_OPEN transition and promotes exactly
+         * one caller per window to be the probe, and this is neither a
+         * breaker consult nor a request that should ever become the probe --
+         * it is speculative, pre-lookup work that must not perturb the
+         * breaker state machine at all. */
+        if (clcf->vary_marker_revalidate > 0 && !ctx->vary_marker_l2_done
+            && !(ngx_http_cache_turbo_breaker_should_consult(clcf)
+                 && ngx_http_cache_turbo_brk_state(z->sh->breaker_state)
+                        == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN))
+        {
             time_t  age = ngx_time() - resolve_created;
 
             if (age < 0) {          /* clock skew between writers */

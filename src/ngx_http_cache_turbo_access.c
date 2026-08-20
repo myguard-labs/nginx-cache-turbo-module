@@ -1491,22 +1491,31 @@ ngx_http_cache_turbo_access_l1(ngx_http_request_t *r,
          * below still runs first (a peer may hold a fresh copy). len > 0 skips a
          * stub; the !sie_armed guard makes the park/resume re-entries idempotent.
          *
-         * c-2: this whole arm is the GENUINELY-expired path -- status/breaker/
-         * SIE all assume the object itself aged out, which is false for a
-         * revalidation fall-through (the object is fresh or serveable-stale;
-         * only the MARKER's resolve time is what triggered the fall-through).
-         * Skip it entirely for that case: the object-GET phase right after
-         * the marker consult in access_l2() re-derives whatever status this
-         * node deserves from its own fresh/stale math, exactly as it already
-         * does for the ordinary marker-hit path when access_l2_marker_get()
-         * declines to fire at all (auto_vary off, no backend, etc). */
-        if (!ctx->vary_marker_revalidate && !ctx->vary_marker_revalidate_inflight) {
-            ctx->status = NGX_HTTP_CACHE_TURBO_ST_EXPIRED;
+         * c-2 correction (S231-NOCACHE-OUTAGE): status alone is the
+         * GENUINELY-expired bookkeeping -- $cache_turbo_status assumes the
+         * object itself aged out, which is false for a revalidation
+         * fall-through (the object is fresh or serveable-stale; only the
+         * MARKER's resolve time triggered the fall-through), so ONLY that
+         * assignment is conditional. The breaker-arm and SIE-arm calls are
+         * NOT part of that reasoning and must run unconditionally: both are
+         * documented "arm-only, idempotent, unconditional on age" pure
+         * snapshots of `ctn` (see their own function comments -- breaker_arm
+         * explicitly: "any body beats a 503 once the origin is known down"),
+         * and the pre-origin breaker gate a few phases later reads
+         * ctx->brk_armed regardless of WHY this request fell through past
+         * the serve arms above. Skipping them here previously meant ANY
+         * revalidation fall-through on a varying URL left nothing armed, so
+         * an OPEN breaker's ACT_SERVE verdict had no snapshot to serve and
+         * fell to ACT_FAIL's 503 -- turning a routine, bounded generation
+         * recheck into an availability regression during exactly the outage
+         * this module exists to smooth over. A possibly-stale cached variant
+         * must always beat a 503; revalidation is a correctness improvement
+         * on the healthy path only, never a reason to fail closed. */
+        ctx->status = NGX_HTTP_CACHE_TURBO_ST_EXPIRED;
 
-            ngx_http_cache_turbo_access_l1_breaker_arm(r, clcf, z, ctx, ctn,
-                hash);
-            ngx_http_cache_turbo_access_l1_sie_arm(r, z, ctx, ctn, now, hash);
-        }
+        ngx_http_cache_turbo_access_l1_breaker_arm(r, clcf, z, ctx, ctn,
+            hash);
+        ngx_http_cache_turbo_access_l1_sie_arm(r, z, ctx, ctn, now, hash);
     }
 
     /* L1 absent (miss) or expired. Consult L2 (Redis or memcached -- the
