@@ -6,6 +6,7 @@
 #   ngx_http_cache_turbo_lru_*()             - S8 segment linkage helpers
 #   ngx_http_cache_turbo_shm_touch_lru()     - S8 promote-on-second-hit
 #   ngx_http_cache_turbo_shm_lookup()        - rbtree lookup by hash + key
+#   ngx_http_cache_turbo_shm_admit()         - P4-1b W-TinyLFU admission test
 #   ngx_http_cache_turbo_shm_evict_one()     - LRU tail reclaim
 #   ngx_http_cache_turbo_shm_alloc_evict()   - alloc, evicting until it fits
 #   ngx_http_cache_turbo_shm_claim()         - single-flight winner/loser/fresh
@@ -333,7 +334,7 @@ awk '
     /^static ngx_inline (uint32_t|uint64_t|ngx_uint_t|void)$/ {
         pending = 1; buf = $0 ORS; next
     }
-    pending && /^ngx_http_cache_turbo_(shm_(sketch_bump|sketch_estimate|lookup|evict_one|alloc_evict|claim_locked|claim|resolve_miss|unstub|owns|count_miss_locked|count_miss|l2_neg_check|l2_neg_set|touch_lru|brk_probe_age|breaker_state|breaker_record|breaker_state_str|get_u32|get_u64|node_sie_live)|lru_(link_head|unlink|insert_new|enforce_cap)|sketch_(row_hash|get|inc|halve)|blob_(alloc|node_release|acquire|release))\(/ {
+    pending && /^ngx_http_cache_turbo_(shm_(sketch_bump|sketch_estimate|admit|lookup|evict_one|alloc_evict|claim_locked|claim|resolve_miss|unstub|owns|count_miss_locked|count_miss|l2_neg_check|l2_neg_set|touch_lru|brk_probe_age|breaker_state|breaker_record|breaker_state_str|get_u32|get_u64|node_sie_live)|lru_(link_head|unlink|insert_new|enforce_cap)|sketch_(row_hash|get|inc|halve)|blob_(alloc|node_release|acquire|release))\(/ {
         capture = 1; pending = 0; printf "%s", buf; print; next
     }
     pending { pending = 0; buf = "" }
@@ -528,6 +529,7 @@ for fn in \
     'ngx_http_cache_turbo_shm_sketch_bump(' \
     'ngx_http_cache_turbo_shm_sketch_estimate(' \
     'ngx_http_cache_turbo_shm_lookup(' \
+    'ngx_http_cache_turbo_shm_admit(' \
     'ngx_http_cache_turbo_shm_evict_one(' \
     'ngx_http_cache_turbo_shm_alloc_evict(' \
     'ngx_http_cache_turbo_shm_claim_locked(' \
@@ -641,6 +643,54 @@ if ! sed -n '/^ngx_http_cache_turbo_shm_touch_lru(/,/^}/p' "$OUT" \
     rm -f "$OUT"
     exit 1
 fi
+
+# ⚠ P4-1b-ADMIT-ORDER: the admission test must stay in store_locked()'s
+# NEW-ENTRY path, and STRICTLY BEFORE the alloc_evict() call there. That
+# ordering is the whole termination argument: called before the loop, a refusal
+# REMOVES an alloc_evict() call; called inside or after it, a refusal that
+# undoes a store after eviction has already run turns "evict then decide" into
+# a policy that can burn victims for a candidate it then rejects, and a caller
+# that retried would drive evict_one() repeatedly on the same decision.
+#
+# store_locked() is deliberately NOT sliced (it pulls in the blob refcount
+# layer), so this is checked against the SOURCE, scoped to that one function.
+# Comments stripped first, exactly as above: the prose beside the call names
+# both alloc_evict and shm_admit.
+admit_order=$(sed -n '/^ngx_http_cache_turbo_shm_store_locked(/,/^}/p' "$SRC" \
+   | sed -E 's;/\*.*;;; s;^[[:space:]]*\*.*;;' \
+   | grep -nE 'ngx_http_cache_turbo_shm_admit\(|ngx_http_cache_turbo_shm_alloc_evict\(' \
+   | head -n2)
+if ! printf '%s\n' "$admit_order" \
+   | awk -F: 'NR==1 && $2 !~ /shm_admit\(/ { bad=1 }
+              NR==2 && $2 !~ /alloc_evict\(/ { bad=1 }
+              END { exit (bad || NR < 2) }'; then
+    echo "✗ P4-1b-ADMIT-ORDER regression: store_locked()'s admission test is" >&2
+    echo "  no longer the first of the pair (admit, alloc_evict). Got:" >&2
+    printf '%s\n' "$admit_order" >&2
+    echo "  The termination argument in shm_admit() depends on the refusal" >&2
+    echo "  happening BEFORE any eviction loop is entered." >&2
+    rm -f "$OUT"
+    exit 1
+fi
+
+# ⚠ P4-1b-FAIL-OPEN: shm_admit() must keep all three fail-open early-outs.
+# Each one alone is enough to turn a refusal into a permanent silent cache
+# miss if it goes: without the `!admission` test the policy ships ON; without
+# the NULL-sketch test a zone whose sketch failed to allocate refuses on no
+# evidence; without the empty-probation test a cold zone refuses to fill
+# itself. All three are single `return 1;` lines that read as redundant, which
+# is exactly why they are pinned here rather than left to review.
+admit_body=$(sed -n '/^ngx_http_cache_turbo_shm_admit(/,/^}/p' "$OUT" \
+   | sed -E 's;/\*.*;;; s;^[[:space:]]*\*.*;;')
+for guard in '!z->sh->admission' 'z->sh->sketch == NULL' \
+             'ngx_queue_empty(&z->sh->lru)'; do
+    if ! printf '%s\n' "$admit_body" | grep -qF "$guard"; then
+        echo "✗ P4-1b-FAIL-OPEN regression: shm_admit() no longer guards on" >&2
+        echo "  '$guard' -- admission can now refuse on no evidence." >&2
+        rm -f "$OUT"
+        exit 1
+    fi
+done
 
 LINES=$(wc -l < "$OUT")
 # Derive the count rather than hardcoding it: a literal here goes stale the

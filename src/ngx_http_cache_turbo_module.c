@@ -137,7 +137,7 @@ const ngx_http_cache_turbo_band_t  ngx_http_cache_turbo_bands[] = {
 static ngx_command_t  ngx_http_cache_turbo_commands[] = {
 
     { ngx_string("cache_turbo_zone"),
-      NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE2,
+      NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE23,   /* P4-1b: optional admission=on|off */
       ngx_http_cache_turbo_zone,
       0,
       0,

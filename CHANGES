@@ -1,5 +1,33 @@
 Changes with the nginx-cache-turbo-module (unreleased)
 
+    *) Feature: W-TinyLFU admission control, opt-in per zone via
+       cache_turbo_zone name=NAME SIZE admission=on. When a NEW key would be
+       stored, its estimated access frequency (from the count-min sketch added
+       in the previous release) is compared against the probation-tail entry it
+       would displace; a candidate that is STRICTLY COLDER is refused and the
+       resident entry keeps its slot. Previously eviction was 100% recency and
+       a one-hit wonder always displaced a resident entry, with no admission
+       decision anywhere in the module.
+       OFF BY DEFAULT, and deliberately not flipped the way
+       cache_turbo_scan_resistant was: scan resistance only changes WHICH
+       resident entry is given up, whereas admission changes whether a response
+       is cached at all, and a wrongly refused store is a silent permanent
+       extra origin hit. It is a zone parameter rather than a location
+       directive because the decision is made inside the shared-memory store
+       path, whose L1-vtable signature carries the zone and no location config.
+       Fails open in every ambiguous direction: policy off, sketch
+       unallocated, empty probation queue, or a tie all ADMIT. Refreshes of an
+       already-resident entry are never subject to it (they displace nobody).
+       The decision runs strictly BEFORE the eviction loop it would otherwise
+       feed, so a refusal removes an eviction rather than driving one -- the
+       ordering is pinned structurally by the P4-1b-ADMIT-ORDER canary and the
+       termination property by a watchdogged unit test.
+       Three new stats on the admin endpoint, in JSON and Prometheus:
+       admission_refused / cache_turbo_admission_refused_total,
+       sketch_bumps / cache_turbo_sketch_bumps_total (lifetime, survives the
+       sketch's aging halvings, so 0 on a live zone means the sketch was never
+       allocated) and sketch_gen / cache_turbo_sketch_gen.
+
     *) Feature: cache_turbo_ignore_set_cookie NAME... relaxes the Set-Cookie
        store floor for explicitly named, non-identifying cookies -- the
        module's equivalent of nginx proxy_ignore_headers Set-Cookie, except

@@ -1470,6 +1470,21 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
  * ngx_http_cache_turbo_internal.h. */
 
 char *
+/* cache_turbo_zone name=NAME SIZE [admission=on|off]
+ *
+ * P4-1b: `admission` enables W-TinyLFU admission control on this zone. A NEW
+ * key is refused a slot when the frequency sketch estimates it strictly colder
+ * than the probation tail it would displace (ngx_http_cache_turbo_shm_admit).
+ *
+ * DEFAULT OFF, deliberately, and unlike cache_turbo_scan_resistant (which was
+ * flipped on in P3-1). Scan resistance only changes WHICH resident entry is
+ * evicted; admission changes whether a response is cached AT ALL. A wrongly
+ * refused store is a silent, permanent extra origin hit for that key, invisible
+ * in the hit counters as anything but a lower ratio -- so the flip is an
+ * operator decision, made per zone, after watching admission_refused. It is a
+ * zone parameter rather than a location directive because the decision is made
+ * inside shm_store_locked(), whose L1-vtable signature carries the zone and no
+ * loc conf. */
 ngx_http_cache_turbo_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
     u_char                       *p;
@@ -1507,6 +1522,36 @@ ngx_http_cache_turbo_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     ctx = ngx_pcalloc(cf->pool, sizeof(ngx_http_cache_turbo_zone_t));
     if (ctx == NULL) {
         return NGX_CONF_ERROR;
+    }
+
+    /* P4-1b: optional `admission=on|off`. OFF unless asked for -- see the
+     * directive comment above for why the default does not flip. Range-checked
+     * by hand for the same reason cache_turbo_scan_resistant is (a silently
+     * coerced value makes the config mean something other than what it says);
+     * anything that is not exactly "on" or "off" is a config ERROR. */
+    if (cf->args->nelts == 4) {
+
+        if (ngx_strncmp(value[3].data, "admission=", 10) != 0) {
+            return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
+                "cache_turbo_zone: unknown parameter \"%V\" (expected "
+                "admission=on or admission=off)", &value[3]);
+        }
+
+        if (value[3].len == sizeof("admission=on") - 1
+            && ngx_strncmp(value[3].data + 10, "on", 2) == 0)
+        {
+            ctx->admission = 1;
+
+        } else if (value[3].len == sizeof("admission=off") - 1
+                   && ngx_strncmp(value[3].data + 10, "off", 3) == 0)
+        {
+            ctx->admission = 0;
+
+        } else {
+            return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
+                "cache_turbo_zone: bad admission value \"%V\": expected "
+                "\"on\" or \"off\"", &value[3]);
+        }
     }
 
     shm_zone = ngx_shared_memory_add(cf, &name, size,

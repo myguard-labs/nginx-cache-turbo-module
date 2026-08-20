@@ -215,6 +215,10 @@ typedef struct {
     ngx_uint_t          sketch_ops;
     ngx_uint_t          sketch_reset_at;
     ngx_uint_t          sketch_gen;
+    /* P4-1b admission. Same plain-field / mutex-held discipline. */
+    ngx_uint_t          admission;
+    ngx_uint_t          sketch_bumps;
+    ngx_uint_t          admission_refused;
     ngx_atomic_t        breaker_wedge_observed; /* H-2/O4.4-j, TEST_FAULTS-gated
                                                  * in the real header; mirrored
                                                  * unconditionally here since
@@ -4561,6 +4565,351 @@ test_p4_1a_rows_are_independently_positioned(void)
 }
 
 
+/* --- P4-1b: W-TinyLFU admission control ------------------------------------
+ *
+ * shm_admit() is the whole decision. store_locked() is not sliced into this
+ * harness (it pulls in the blob refcount layer and the response wire format),
+ * so these test the decision function DIRECTLY -- which is the honest oracle
+ * anyway: an end-to-end "was it cached?" assertion cannot distinguish a
+ * refusal from a slab failure, an unstorable status or a bypass, and all four
+ * produce the same absent entry.
+ *
+ * The CALL-SITE invariant that shm_admit() runs before alloc_evict() in
+ * store_locked() is a source-structure property, not a runtime one, and is
+ * pinned by the P4-1b-ADMIT-ORDER canary in extract_shm.sh. The three
+ * fail-open early-outs are pinned by P4-1b-FAIL-OPEN there.
+ */
+
+/* Seat one entry on the probation tail under key `n` and give it `freq`
+ * sketch bumps. void, not node-returning: REQUIRE() bails with a bare
+ * `return`, so the fixture helper has to be void for it to compile. */
+static void
+admit_seat_victim(int n, ngx_uint_t freq)
+{
+    ngx_uint_t  i;
+
+    ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(n), 4, 0);
+    REQUIRE(find(n) != NULL, "fixture: count_miss did not create the victim");
+
+    for (i = 0; i < freq; i++) {
+        ngx_http_cache_turbo_shm_sketch_bump(&g_zone, (uint32_t) (0x1000 + n));
+    }
+}
+
+
+/* OFF BY DEFAULT. The shipped default must admit unconditionally, even when
+ * the candidate is provably colder than the resident victim -- i.e. exactly
+ * the input the ON policy refuses. Without this, the flip could land silently.
+ *
+ * Deliberately does NOT set g_sh.admission at all: it exercises the ZEROED
+ * field, which is what an inherited or freshly created zone actually has.
+ * A test that set `admission = 0` explicitly would pass even if the default
+ * had flipped, since it opts out by hand. */
+static void
+test_p4_1b_admission_off_by_default(void)
+{
+    printf("P4-1b: admission is OFF unless the zone asks for it\n");
+    zone_reset();
+    sketch_attach();
+
+    CHECK(g_sh.admission == 0,
+          "P4-1b: a zeroed zone must have admission OFF -- the DEFAULT flipped");
+
+    /* Hot victim (10 bumps), stone-cold candidate (0 bumps). */
+    admit_seat_victim(0, 10);
+
+    CHECK(ngx_http_cache_turbo_shm_sketch_estimate(&g_zone, 0xdeadbeefu) == 0,
+          "fixture: the candidate should be cold");
+    CHECK(ngx_http_cache_turbo_shm_sketch_estimate(&g_zone, 0x1000) == 10,
+          "fixture: the victim should be hot");
+
+    CHECK(ngx_http_cache_turbo_shm_admit(&g_zone, 0xdeadbeefu) == 1,
+          "P4-1b: admission is OFF by default and must admit a cold candidate");
+    CHECK(g_sh.admission_refused == 0,
+          "P4-1b: an OFF policy must not count a refusal");
+}
+
+
+/* ON, and the candidate is COLDER than the probation tail: refuse, and count
+ * the refusal. This is the one input the whole item exists to change. */
+static void
+test_p4_1b_refuses_colder_candidate(void)
+{
+    printf("P4-1b: a candidate colder than the probation tail is refused\n");
+    zone_reset();
+    sketch_attach();
+    g_sh.admission = 1;
+
+    admit_seat_victim(0, 10);
+
+    CHECK(ngx_http_cache_turbo_shm_admit(&g_zone, 0xdeadbeefu) == 0,
+          "P4-1b: a cold candidate must be refused against a hot victim");
+    CHECK(g_sh.admission_refused == 1,
+          "P4-1b: the refusal must be counted (admission_refused)");
+
+    /* And the refusal must not have DONE anything: no eviction, no linkage
+     * change. shm_admit() is a predicate, and a predicate with a side effect
+     * on the LRU would make the ordering canary's termination argument
+     * meaningless. */
+    CHECK(find(0) != NULL, "P4-1b: a refusal must not evict the victim");
+    CHECK(g_sh.evictions == 0, "P4-1b: a refusal must not count an eviction");
+    CHECK(g_sh.n_entries == 1, "P4-1b: a refusal must not change n_entries");
+}
+
+
+/* ON, and the candidate is HOTTER than (or as hot as) the tail: admit. Two
+ * arms, because the tie is the interesting half -- a sketch estimate is
+ * one-sided (over-counts on collision, never under-counts), so equality is
+ * ambiguous and the ambiguous answer must be the fail-open one. A `<=`
+ * written where `<` belongs refuses every tie and is invisible to the
+ * strictly-hotter arm alone. */
+static void
+test_p4_1b_admits_hotter_and_tied_candidate(void)
+{
+    uint32_t  cand = 0xdeadbeefu;
+
+    printf("P4-1b: a hotter candidate is admitted; a tie admits too\n");
+    zone_reset();
+    sketch_attach();
+    g_sh.admission = 1;
+
+    admit_seat_victim(0, 3);
+
+    /* Strictly hotter: 5 > 3. */
+    ngx_http_cache_turbo_shm_sketch_bump(&g_zone, cand);
+    ngx_http_cache_turbo_shm_sketch_bump(&g_zone, cand);
+    ngx_http_cache_turbo_shm_sketch_bump(&g_zone, cand);
+    ngx_http_cache_turbo_shm_sketch_bump(&g_zone, cand);
+    ngx_http_cache_turbo_shm_sketch_bump(&g_zone, cand);
+
+    REQUIRE(ngx_http_cache_turbo_shm_sketch_estimate(&g_zone, cand) == 5,
+            "fixture: candidate estimate should be 5");
+    CHECK(ngx_http_cache_turbo_shm_admit(&g_zone, cand) == 1,
+          "P4-1b: a strictly hotter candidate must be admitted");
+
+    /* The tie. Rebuild so the victim's estimate is exactly the candidate's. */
+    zone_reset();
+    sketch_attach();
+    g_sh.admission = 1;
+    admit_seat_victim(0, 4);
+    ngx_http_cache_turbo_shm_sketch_bump(&g_zone, cand);
+    ngx_http_cache_turbo_shm_sketch_bump(&g_zone, cand);
+    ngx_http_cache_turbo_shm_sketch_bump(&g_zone, cand);
+    ngx_http_cache_turbo_shm_sketch_bump(&g_zone, cand);
+
+    REQUIRE(ngx_http_cache_turbo_shm_sketch_estimate(&g_zone, cand)
+                == ngx_http_cache_turbo_shm_sketch_estimate(&g_zone, 0x1000),
+            "fixture: candidate and victim estimates should tie");
+    CHECK(ngx_http_cache_turbo_shm_admit(&g_zone, cand) == 1,
+          "P4-1b: a TIE must admit (strict <, not <=)");
+    CHECK(g_sh.admission_refused == 0,
+          "P4-1b: neither the hotter nor the tied arm may count a refusal");
+}
+
+
+/* THE THREE FAIL-OPEN DIRECTIONS. Each is a separate silent-permanent-miss
+ * hazard, so each gets its own arm with the OTHER two conditions arranged to
+ * refuse -- otherwise an arm passes for the wrong reason.
+ *
+ * ⚠ The NULL-sketch arm is the one the packet names explicitly: a zone whose
+ * sketch allocation failed at init must still ADMIT everything, never treat
+ * "no estimate" as "cold". */
+static void
+test_p4_1b_fails_open_three_ways(void)
+{
+    printf("P4-1b: refuses on no evidence in none of three directions\n");
+
+    /* (1) NULL sketch. Policy ON, hot victim resident -- everything set up to
+     * refuse except that there is no sketch to read. zone_reset() leaves
+     * sketch NULL, so this is the production degraded state exactly. */
+    zone_reset();
+    sketch_attach();
+    g_sh.admission = 1;
+    admit_seat_victim(0, 12);          /* build a real hot victim first */
+    REQUIRE(ngx_http_cache_turbo_shm_admit(&g_zone, 0xdeadbeefu) == 0,
+            "fixture: this input must refuse WITH a sketch, or the NULL arm "
+            "proves nothing");
+
+    g_sh.sketch = NULL;                /* now take the evidence away */
+    CHECK(ngx_http_cache_turbo_shm_admit(&g_zone, 0xdeadbeefu) == 1,
+          "P4-1b: a NULL sketch must ADMIT -- no evidence is never a refusal");
+
+    /* ⚠ HONEST SCOPE OF THIS ARM. It asserts the COMPOSED contract (a
+     * sketchless zone admits), not the explicit `sketch == NULL` early-out in
+     * shm_admit(). The two are not the same claim: sketch_estimate() already
+     * returns 0 for a NULL sketch, so with the early-out compiled out both
+     * sides read 0, `0 < 0` is false, and this arm still passes -- verified,
+     * it SURVIVES that mutation. The early-out is kept as defence in depth
+     * against a future estimate() that answers a NULL sketch differently, and
+     * the thing that actually pins its presence is the P4-1b-FAIL-OPEN canary
+     * in extract_shm.sh (deleting the guard fails the build). Do not read
+     * this arm as coverage of the guard itself. */
+    g_sh.sketch = g_test_sketch;       /* restore for zone_reset()'s drain */
+
+    /* (2) Empty probation queue. Policy ON, sketch present, candidate stone
+     * cold -- but there is no victim to be colder than. A cold zone must be
+     * able to fill itself. */
+    zone_reset();
+    sketch_attach();
+    g_sh.admission = 1;
+    {   /* Make the arm ABLE TO FAIL. Without the guard, ngx_queue_data() on
+         * the empty head yields a bogus "node" overlapping shctx_t, and its
+         * node.key is whatever bytes sit there. Bump the sketch for exactly
+         * that derived key so the phantom victim reads HOT while the
+         * candidate stays cold -- then a missing guard refuses and this arm
+         * goes red. With no such priming the phantom estimate is 0 too, `0 <
+         * 0` admits by accident, and the arm proves nothing. */
+        ngx_http_cache_turbo_node_t  *phantom =
+            ngx_queue_data(ngx_queue_last(&g_sh.lru),
+                           ngx_http_cache_turbo_node_t, lru);
+        ngx_uint_t  b;
+
+        for (b = 0; b < NGX_HTTP_CACHE_TURBO_SKETCH_MAX; b++) {
+            ngx_http_cache_turbo_shm_sketch_bump(&g_zone,
+                (uint32_t) phantom->node.key);
+        }
+    }
+    CHECK(ngx_queue_empty(&g_sh.lru), "fixture: probation should be empty");
+    CHECK(ngx_http_cache_turbo_shm_admit(&g_zone, 0xdeadbeefu) == 1,
+          "P4-1b: an empty probation queue must admit -- no victim exists");
+
+    /* (2') And specifically NOT by falling through to the PROTECTED tail: an
+     * all-protected zone must stay fillable. Same shape as the (b') arm of
+     * test_s8_evict_terminates_on_empty_queues(). */
+    zone_reset();
+    sketch_attach();
+    g_sh.admission = 1;
+    admit_seat_victim(0, 12);
+    find(0)->seg = NGX_HTTP_CACHE_TURBO_SEG_PROTECTED;
+    ngx_queue_remove(&find(0)->lru);
+    ngx_queue_insert_head(&g_sh.lru_protected, &find(0)->lru);
+    g_sh.n_protected = 1;
+    CHECK(ngx_queue_empty(&g_sh.lru), "fixture: probation should be empty");
+    CHECK(ngx_http_cache_turbo_shm_admit(&g_zone, 0xdeadbeefu) == 1,
+          "P4-1b: a hot PROTECTED tail must not refuse a candidate");
+    CHECK(g_sh.admission_refused == 0,
+          "P4-1b: no fail-open direction may count a refusal");
+
+    /* (3) Policy off is arm (1) of test_p4_1b_admission_off_by_default(). */
+}
+
+
+/* ⚠ THE TERMINATION PROPERTY. A policy that can REJECT must never make
+ * alloc_evict() spin (shm.c's evict_one() contract).
+ *
+ * Two things are asserted here, under the same SIGALRM watchdog the S8 hang
+ * test uses, so a regression fails in bounded time instead of hanging CI:
+ *
+ *   (a) shm_admit() itself terminates and is side-effect-free on the LRU. It
+ *       walks nothing -- it reads ONE tail node -- so a loop appearing inside
+ *       it would be a new construct, and the watchdog catches it.
+ *
+ *   (b) The real hazard: even in the state where the policy refuses
+ *       EVERYTHING (every candidate colder than a saturated victim), an
+ *       alloc_evict() driven on the same zone still terminates. It must,
+ *       because shm_admit() is not in that loop -- but asserting it here is
+ *       what makes the coupling explicit rather than an argument in a comment.
+ *       Repeated calls to the pair, in the order store_locked() makes them,
+ *       must all return in bounded time.
+ *
+ * The structural half of the argument (admit runs BEFORE alloc_evict, never
+ * inside it) cannot be observed at runtime and is pinned by the
+ * P4-1b-ADMIT-ORDER canary in extract_shm.sh instead. */
+static void
+test_p4_1b_admission_never_spins(void)
+{
+    ngx_uint_t  i;
+    void       *p;
+
+    printf("P4-1b hang hazard: a refusing policy does not make eviction spin\n");
+    zone_reset();
+    sketch_attach();
+    g_sh.admission = 1;
+
+    /* A saturated victim: nothing can be hotter, so every candidate is
+     * refused. This is the most refusal-prone state representable. */
+    admit_seat_victim(0, NGX_HTTP_CACHE_TURBO_SKETCH_MAX + 4);
+    REQUIRE(ngx_http_cache_turbo_shm_sketch_estimate(&g_zone, 0x1000)
+                == NGX_HTTP_CACHE_TURBO_SKETCH_MAX,
+            "fixture: the victim should be saturated");
+
+    /* (a) many refusals in a row, all bounded, none touching the LRU. */
+    watchdog_arm("shm_admit must terminate and never loop");
+    for (i = 0; i < 1000; i++) {
+        CHECK(ngx_http_cache_turbo_shm_admit(&g_zone,
+                  (uint32_t) (0xdead0000u + i)) == 0,
+              "P4-1b: every candidate should be refused in this fixture");
+    }
+    watchdog_disarm();
+
+    CHECK(g_sh.admission_refused == 1000,
+          "P4-1b: every refusal must be counted exactly once");
+    CHECK(g_sh.n_entries == 1,
+          "P4-1b: 1000 refusals must not have changed the zone");
+    CHECK(g_sh.evictions == 0,
+          "P4-1b: a refusal must never evict");
+
+    /* (b) the pair, in store_locked()'s order, under a slab that refuses
+     * everything -- the exact state that wedges a broken evict_one(). The
+     * refusal short-circuits, so alloc_evict() is not even reached; when the
+     * policy admits, alloc_evict() must still terminate by returning NULL. */
+    ngx_test_slab_fail_after(0);
+
+    watchdog_arm("admit+alloc_evict pair must terminate, not spin");
+    for (i = 0; i < 100; i++) {
+        if (ngx_http_cache_turbo_shm_admit(&g_zone,
+                (uint32_t) (0xbeef0000u + i)))
+        {
+            p = ngx_http_cache_turbo_shm_alloc_evict(&g_zone, 128);
+            CHECK(p == NULL, "alloc_evict must fail, not spin");
+        }
+    }
+    watchdog_disarm();
+
+    ngx_test_slab_fail_after(-1);
+}
+
+
+/* The observability the packet asks for: sketch_bumps must be a LIFETIME
+ * tally, not sketch_ops under another name. sketch_ops resets to 0 on every
+ * halving, so an operator reading it cannot tell "the sketch is learning" from
+ * "the sketch just aged" -- which is precisely the question admission_refused
+ * needs context for. Asserted across a halving, since that is the only input
+ * that separates the two. */
+static void
+test_p4_1b_sketch_bumps_survive_halving(void)
+{
+    ngx_uint_t  i;
+
+    printf("P4-1b: sketch_bumps is a lifetime tally, not sketch_ops\n");
+    zone_reset();
+    sketch_attach();
+    g_sh.sketch_reset_at = 10;
+
+    for (i = 0; i < 25; i++) {
+        ngx_http_cache_turbo_shm_sketch_bump(&g_zone, (uint32_t) (0x2000 + i));
+    }
+
+    CHECK(g_sh.sketch_bumps == 25,
+          "P4-1b: sketch_bumps must count every bump for the zone's lifetime");
+    CHECK(g_sh.sketch_gen == 2,
+          "fixture: 25 bumps at reset_at=10 should have aged twice");
+    CHECK(g_sh.sketch_ops < g_sh.sketch_bumps,
+          "P4-1b: sketch_bumps must NOT be sketch_ops -- it must survive the "
+          "halving that resets sketch_ops");
+
+    /* A NULL sketch must not bump the lifetime tally either: the bump returns
+     * before doing anything, so an operator seeing sketch_bumps == 0 on a
+     * live zone is reading a genuine "the sketch was never allocated". */
+    zone_reset();
+    CHECK(g_sh.sketch == NULL, "fixture: zone_reset left a sketch attached");
+    ngx_http_cache_turbo_shm_sketch_bump(&g_zone, 0x1234u);
+    CHECK(g_sh.sketch_bumps == 0,
+          "P4-1b: a NULL-sketch bump must not increment sketch_bumps");
+}
+
+
+
 int
 main(void)
 {
@@ -4621,6 +4970,12 @@ main(void)
     test_p4_1a_halving_ages_the_sketch();
     test_p4_1a_halving_does_not_bleed_across_nibbles();
     test_p4_1a_rows_are_independently_positioned();
+    test_p4_1b_admission_off_by_default();
+    test_p4_1b_refuses_colder_candidate();
+    test_p4_1b_admits_hotter_and_tied_candidate();
+    test_p4_1b_fails_open_three_ways();
+    test_p4_1b_admission_never_spins();
+    test_p4_1b_sketch_bumps_survive_halving();
     test_blob_alloc_starts_unreferenced_and_attached();
 
     test_blob_detach_defers_free_to_the_last_server();
