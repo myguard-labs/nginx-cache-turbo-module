@@ -908,6 +908,60 @@ typedef struct {
     ngx_atomic_t             sie_serves;
     ngx_atomic_t             breaker_serves;
     ngx_atomic_t             origin_failures;
+
+    /* P4-1a: W-TinyLFU frequency sketch (count-min, 4-bit counters).
+     *
+     * STAGE 1 OF 2. This stage only ESTIMATES frequency; nothing reads the
+     * estimate to make a decision, so admission and eviction behaviour is
+     * byte-for-byte what it was before. Stage 2 adds the admission test at
+     * store_locked() against the probation-tail victim.
+     *
+     * Layout: `sketch` is a flat array of `sketch_width * SKETCH_ROWS / 2`
+     * bytes -- two 4-bit counters packed per byte, low nibble first. Row `r`
+     * owns the counter range [r * sketch_width, (r+1) * sketch_width). An
+     * estimate is the MIN across the four rows, which is what makes a
+     * count-min sketch's error one-sided (it can over-count on collision,
+     * never under-count).
+     *
+     * ⚠ `sketch` may be NULL and that is a SUPPORTED state, not an error.
+     * The slab allocation in _shm_init_zone() is best-effort: a zone too
+     * small to spare the sketch, or an allocation that loses a race with
+     * entries, degrades to "estimate unavailable" (sketch_estimate() returns
+     * 0) rather than failing zone init and taking the whole cache down for a
+     * frequency hint. Every reader must tolerate NULL.
+     *
+     * ⚠ RELOAD / INHERITED ZONE. _shm_init_zone() returns early when it
+     * inherits a live `sh` (octx, or shm.exists) -- these fields come with it
+     * and are already valid, which is the desired behaviour: frequency
+     * history survives a config reload. A zone created by an OLDER binary
+     * that predates these fields and then inherited through `shm.exists`
+     * would hand us bytes that were never initialised. That case is covered
+     * by nginx's own shm handling rather than by a magic here: `shm.exists`
+     * is only true for an inherited mapping within one master's lifetime
+     * (a binary upgrade re-execs the master, which re-creates the zones from
+     * the new binary), and a zone whose size or name changed is re-created
+     * outright. Adding a version word would not make the mixed-binary case
+     * safe either, since the OLD binary would still be writing entries into
+     * a struct with a different layout -- that hazard predates this field and
+     * is not one a guard here can close. Concluded: no magic/version guard.
+     *
+     * SIZE. sketch_width counters/row * 4 rows / 2 counters-per-byte. The
+     * width is derived from the zone size in _shm_init_zone() and capped so
+     * the sketch is well under 1% of the zone; see the sizing comment there.
+     *
+     * `sketch_ops` counts bumps since the last halving; when it reaches
+     * `sketch_reset_at` every counter is halved (>>= 1) and it returns to 0.
+     * That is the classic TinyLFU aging step: it keeps the estimates a
+     * measure of RECENT frequency rather than of lifetime totals, so a key
+     * that was hot last week cannot outrank one that is hot now.
+     * `sketch_gen` counts how many halvings have happened, purely for
+     * diagnosis. All three are plain fields, not atomics: every access is
+     * under the shpool mutex. */
+    u_char                  *sketch;
+    ngx_uint_t               sketch_width;      /* counters per row          */
+    ngx_uint_t               sketch_ops;        /* bumps since last halving  */
+    ngx_uint_t               sketch_reset_at;   /* halve when ops reaches it */
+    ngx_uint_t               sketch_gen;        /* halvings so far           */
 #if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
     && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
     /* O4.4-i: lifetime count of breaker-fallback ARMINGS, bumped inside the
@@ -2164,6 +2218,17 @@ void ngx_http_cache_turbo_blob_release(ngx_http_cache_turbo_zone_t *z,
  * Caller holds shpool->mutex. */
 void ngx_http_cache_turbo_shm_touch_lru(ngx_http_cache_turbo_zone_t *z,
     ngx_http_cache_turbo_node_t *ctn, time_t now, ngx_uint_t protected_pct);
+
+/* P4-1a: W-TinyLFU frequency sketch. Both hold the shpool mutex via the
+ * caller, and both tolerate an unallocated sketch (bump is a no-op, estimate
+ * returns 0). See the sketch field block in the shctx above.
+ *
+ * STAGE 1 OF 2 -- nothing in the tree reads the estimate yet; these exist so
+ * stage 2's admission test has data to decide on. */
+void ngx_http_cache_turbo_shm_sketch_bump(ngx_http_cache_turbo_zone_t *z,
+    uint32_t hash);
+ngx_uint_t ngx_http_cache_turbo_shm_sketch_estimate(
+    ngx_http_cache_turbo_zone_t *z, uint32_t hash);
 
 /* Remove a leftover cold-miss STUB (v10): drops the node ONLY if it is still a
  * stub (len == 0), so a real entry stored by someone else is never touched.

@@ -103,6 +103,19 @@ check_define NGX_HTTP_CACHE_TURBO_BRK_ACT_FAIL  2
 # Lives in the .c, not the header, hence the third argument.
 check_define NGX_HTTP_CACHE_TURBO_LRU_CAP_MAX_EVICT 8 "$SRC"
 
+# P4-1a: the W-TinyLFU sketch constants. Also in the .c rather than a header,
+# and also hand-mirrored into test_shm_state.c, so they get the same treatment.
+# SKETCH_MAX == 15 and ROWS == 4 are both asserted on directly by the
+# saturation and min-across-rows tests; MIN_WIDTH is what those tests size
+# their fixture sketch to, so a silent widening would leave the fixture
+# allocating less memory than the sliced code indexes into -- an ASan heap
+# overflow rather than a clean failure, which is worse than a red assert.
+check_define NGX_HTTP_CACHE_TURBO_SKETCH_ROWS      4 "$SRC"
+check_define NGX_HTTP_CACHE_TURBO_SKETCH_MAX       15 "$SRC"
+check_define NGX_HTTP_CACHE_TURBO_SKETCH_SAMPLE    10 "$SRC"
+check_define NGX_HTTP_CACHE_TURBO_SKETCH_MIN_WIDTH 1024 "$SRC"
+check_define NGX_HTTP_CACHE_TURBO_SKETCH_MAX_WIDTH '(1<<20)' "$SRC"
+
 # H-4: the packed-probe layout macros are hand-mirrored into test_shm_state.c
 # (NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_WORD_BITS / _STAMP_BITS / _GEN_BITS /
 # _STAMP_MASK / _GEN_MASK and the pack/unpack macros built from them). Two
@@ -317,10 +330,10 @@ awk '
     /^(static )?(void|ngx_int_t|ngx_uint_t|ngx_flag_t|time_t|u_char|const char|uint32_t|uint64_t|ngx_http_cache_turbo_node_t)[[:space:]]*\**$/ {
         pending = 1; buf = $0 ORS; next
     }
-    /^static ngx_inline (uint32_t|uint64_t)$/ {
+    /^static ngx_inline (uint32_t|uint64_t|ngx_uint_t|void)$/ {
         pending = 1; buf = $0 ORS; next
     }
-    pending && /^ngx_http_cache_turbo_(shm_(lookup|evict_one|alloc_evict|claim_locked|claim|resolve_miss|unstub|owns|count_miss_locked|count_miss|l2_neg_check|l2_neg_set|touch_lru|brk_probe_age|breaker_state|breaker_record|breaker_state_str|get_u32|get_u64|node_sie_live)|lru_(link_head|unlink|insert_new|enforce_cap)|blob_(alloc|node_release|acquire|release))\(/ {
+    pending && /^ngx_http_cache_turbo_(shm_(sketch_bump|sketch_estimate|lookup|evict_one|alloc_evict|claim_locked|claim|resolve_miss|unstub|owns|count_miss_locked|count_miss|l2_neg_check|l2_neg_set|touch_lru|brk_probe_age|breaker_state|breaker_record|breaker_state_str|get_u32|get_u64|node_sie_live)|lru_(link_head|unlink|insert_new|enforce_cap)|sketch_(row_hash|get|inc|halve)|blob_(alloc|node_release|acquire|release))\(/ {
         capture = 1; pending = 0; printf "%s", buf; print; next
     }
     pending { pending = 0; buf = "" }
@@ -508,6 +521,12 @@ for fn in \
     'ngx_http_cache_turbo_lru_insert_new(' \
     'ngx_http_cache_turbo_lru_enforce_cap(' \
     'ngx_http_cache_turbo_shm_touch_lru(' \
+    'ngx_http_cache_turbo_sketch_row_hash(' \
+    'ngx_http_cache_turbo_sketch_get(' \
+    'ngx_http_cache_turbo_sketch_inc(' \
+    'ngx_http_cache_turbo_sketch_halve(' \
+    'ngx_http_cache_turbo_shm_sketch_bump(' \
+    'ngx_http_cache_turbo_shm_sketch_estimate(' \
     'ngx_http_cache_turbo_shm_lookup(' \
     'ngx_http_cache_turbo_shm_evict_one(' \
     'ngx_http_cache_turbo_shm_alloc_evict(' \
@@ -591,6 +610,34 @@ if ! sed -n '/^ngx_http_cache_turbo_shm_unstub(/,/^}/p' "$OUT" \
    | grep -q 'refresh_owner == owner'; then
     echo "✗ CTXRDR-ADOPT-LEASE regression: unstub() no longer compares the" >&2
     echo "  owner token. A stale holder can now clear the live winner's lease." >&2
+    rm -f "$OUT"
+    exit 1
+fi
+
+# ⚠ P4-1a-ORDER: the sketch bump must stay BEFORE touch_lru()'s coarse
+# `now - last_access < 1` gate. The gate returns early for a key touched within
+# the last second, so a bump moved AFTER it counts at most one access per key
+# per second -- undercounting hot keys by exactly the factor that makes them
+# hot, and leaving the estimate unable to separate a key served 500 times a
+# second from one served once.
+#
+# It reads as a natural tidy-up ("do the cheap early-out first"), it changes no
+# observable behaviour in stage 1 at all, and even in stage 2 it degrades the
+# admission decision silently rather than breaking anything. Nothing else in
+# this harness can notice it, so it is pinned structurally here. Comments are
+# stripped first, for the same reason as every canary above: the prose beside
+# the bump names both the call and the gate, so a naive grep would match the
+# explanation rather than the code.
+if ! sed -n '/^ngx_http_cache_turbo_shm_touch_lru(/,/^}/p' "$OUT" \
+   | sed -E 's;/\*.*;;; s;^[[:space:]]*\*.*;;' \
+   | grep -nE 'sketch_bump|last_access < 1' \
+   | head -n2 \
+   | awk -F: 'NR==1 && $2 !~ /sketch_bump/ { bad=1 }
+              NR==2 && $2 !~ /last_access < 1/ { bad=1 }
+              END { exit (bad || NR < 2) }'; then
+    echo "✗ P4-1a-ORDER regression: touch_lru()'s sketch bump is no longer" >&2
+    echo "  the first statement before the last_access early-out gate." >&2
+    echo "  After the gate it undercounts hot keys by their hotness." >&2
     rm -f "$OUT"
     exit 1
 fi
