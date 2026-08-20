@@ -48,6 +48,15 @@
 #            together (`perf record -p pid1,pid2,...`).
 #   OUT      output directory for perf.data/report/results  (default
 #            ci/tools/perf-out, gitignored — see .gitignore)
+#   VARY     opt-in: origin adds `add_header Vary "Accept-Encoding";` and wrk
+#            sends `Accept-Encoding: gzip` on every request, so the profiled
+#            path is the auto-Vary marker/variant-index path (cache_turbo_vary
+#            module) instead of the base-key hit path. Off by default — the
+#            default profile is unchanged (PLAN-optimize.md P2-2's original
+#            tiny/base-key measurement). VARY=1 is a PREREQUISITE for measuring
+#            any variant_hash/Vary-related optimisation; do not compare a
+#            VARY=1 profile against a pre-VARY baseline run with a different
+#            harness version.
 #
 # Requires: /usr/bin/perf (readable perf_event_paranoid, i.e. <=1 as root or
 # <=2 unprivileged with CAP_PERFMON — this host is pinned at 1, do not try to
@@ -64,6 +73,7 @@ THREADS="${THREADS:-$(( CONC < NPROC ? CONC : NPROC ))}"
 FREQ="${FREQ:-999}"
 CALLGRAPH="${CALLGRAPH:-fp}"
 OUT="${OUT:-$PWD/ci/tools/perf-out}"
+VARY="${VARY:-}"
 # 1 worker cannot show shm-mutex CONTENTION at all -- only one process ever
 # holds it, so ngx_shmtx_lock's fast path never blocks. Default keeps the
 # original single-worker/single-pid profile (simplest to attribute), but P4-1
@@ -117,6 +127,15 @@ head -c 200 /dev/urandom | base64 > "$WORK/html/tiny"
 LOAD_MODULE=""
 [ -n "$MODULE" ] && LOAD_MODULE="load_module $(realpath "$MODULE");"
 
+# VARY=1: origin emits Vary: Accept-Encoding so a request carrying
+# Accept-Encoding: gzip (added to the wrk invocation below) drives the
+# auto-Vary marker/variant-index path instead of the base-key hit path.
+# Whole-line splice (not a fragment) so the default render is BYTE-IDENTICAL
+# to the pre-VARY script -- this harness's value is cross-run comparability,
+# and a fragment splice leaves a trailing blank line the default never had.
+LOCATION_BLOCK='location / { add_header Cache-Control "max-age=600"; }'
+[ -n "$VARY" ] && LOCATION_BLOCK='location / { add_header Cache-Control "max-age=600"; add_header Vary "Accept-Encoding"; }'
+
 cat > "$WORK/conf/nginx.conf" <<EOF
 daemon off;
 $LOAD_MODULE
@@ -133,7 +152,7 @@ http {
         listen 127.0.0.1:$ORIGIN;
         root $WORK/html;
         default_type text/plain;
-        location / { add_header Cache-Control "max-age=600"; }
+        $LOCATION_BLOCK
     }
 
     server {
@@ -184,9 +203,14 @@ url="http://127.0.0.1:$C/tiny"
 
 # Prime + verify the key is actually cached before trusting anything measured
 # under perf. A profile of the miss/origin path answers the wrong question.
+# VARY=1: prime with the SAME Accept-Encoding: gzip header the measured wrk
+# pass sends, else priming fills the base-key variant and the measured run
+# (which carries the header) would cold-miss its own auto-Vary variant key.
+curl_vary_args=()
+[ -n "$VARY" ] && curl_vary_args=(-H "Accept-Encoding: gzip")
 hit=0
 for _ in $(seq 1 30); do
-    curl -fsS -D - -o /dev/null "$url" 2>/dev/null > "$WORK/logs/hdr" || true
+    curl -fsS "${curl_vary_args[@]}" -D - -o /dev/null "$url" 2>/dev/null > "$WORK/logs/hdr" || true
     xc=$(grep -i '^X-Cache:' "$WORK/logs/hdr" | tr -d '\r' | awk '{print toupper($2)}' || true)
     if [ "$xc" = "HIT" ]; then hit=1; break; fi
     sleep 0.1
@@ -216,14 +240,16 @@ cg="$CALLGRAPH"
 perf_data="$OUT/perf.data"
 rm -f "$perf_data"
 
-echo "== perf record: pid(s)=$worker_pids freq=${FREQ}Hz callgraph=$CALLGRAPH duration=${DURATION}s workers=$WORKERS ==" >&2
+echo "== perf record: pid(s)=$worker_pids freq=${FREQ}Hz callgraph=$CALLGRAPH duration=${DURATION}s workers=$WORKERS vary=${VARY:-0} ==" >&2
 perf record -p "$worker_pids" -F "$FREQ" --call-graph "$cg" -o "$perf_data" &
 PERF_PID=$!
 # perf record needs a moment to attach before load starts, else the first
 # fraction of the run goes unsampled.
 sleep 0.3
 
-wrk_out=$(wrk -t"$THREADS" -c"$CONC" -d"${DURATION}s" --latency "$url" 2>/dev/null)
+wrk_vary_args=()
+[ -n "$VARY" ] && wrk_vary_args=(-H "Accept-Encoding: gzip")
+wrk_out=$(wrk -t"$THREADS" -c"$CONC" -d"${DURATION}s" --latency "${wrk_vary_args[@]}" "$url" 2>/dev/null)
 
 # perf record only exits when its target exits (or on SIGINT); signal it to
 # stop sampling now that the load pass is done.
