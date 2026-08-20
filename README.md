@@ -1879,6 +1879,34 @@ http {
 > shared counters this location's traffic never contributed to. A zone whose
 > breaker looks OPEN in the stats while one location behaves as if nothing is
 > wrong is both of these rules working as designed.
+>
+> **The circuit breaker's blast radius is per-ZONE, not per-upstream.** Because
+> the breaker failure counter and OPEN state are shared by all locations on the
+> same zone, one dead backend trips the breaker for every other backend that
+> shares that zone. This has two consequences:
+>
+> 1. **One backend failure can block traffic to every other backend on the zone.**
+> If you configure HTTP and HTTPS endpoints to the same origin as separate
+> upstreams but share one `cache_turbo_zone`, a failure in either upstream will
+> trip the breaker and cut off cached responses to both. More broadly, if
+> `server` blocks or locations for different origins all delegate to one zone,
+> a 5xx cascade from one origin (and only responses ≥500 count toward the trip:
+> 403/404/429 are deliberately excluded) opens the breaker for all of them.
+>
+> 2. **Conversely, healthy traffic from one backend can mask a failure in another.**
+> A single upstream with an outage contributes only one or two 5xx responses per
+> window if the breaker threshold is 3. If that backend shares a zone with a busy
+> backend that is healthy, the healthy traffic keeps diluting the failure count
+> below the trip threshold — the breaker may fail to open even when one of the
+> backends is down, because the count is spread across the zone rather than
+> accumulating per backend.
+>
+> **Recommendation: use one `cache_turbo_zone` per upstream.** The zone memory is
+> free — nginx zones scale to hundreds without overhead — and per-upstream zones
+> make the breaker's failure isolation match your actual failure domain. A dead
+> origin then trips its own breaker only, leaving cached responses for other
+> origins intact, and each upstream's failure count is undiluted by healthy
+> traffic from others. This is the most transparent configuration.
 
 
 ### Variables
