@@ -1892,6 +1892,111 @@ def test_cor5_varidx_selfheal_after_dropped_index_write(
     assert "x-cache" not in hf3 and fr3 != fr0, "fr variant survived PURGE"
 
 
+def test_cor5_purge_reports_degraded_enumeration(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    """c-1: `{"purged":N}` must distinguish a COMPLETE SMEMBERS enumeration
+    from a DEGRADED one instead of silently under-reporting while still
+    returning 200.
+
+    This is a REPORTING defect only -- staleness itself is already covered
+    by the marker delete in purge_auto_vary regardless of what SMEMBERS saw,
+    so this test does not re-check post-purge misses (test_cor5_redis_variant_
+    purge and the self-heal test above already do). What it checks is that an
+    operator scripting on `purged` can tell "the index set was short a
+    variant when I enumerated it" from "the index set genuinely held every
+    variant" -- the two cases used to be wire-identical.
+
+    Uses the SAME fault injection as the self-heal test
+    (X-Cache-Turbo-Test-Varidx-Drop on /cor5sh/), but WITHOUT the healing HIT
+    the self-heal test takes afterward -- the dropped variant's
+    varidx_pending bit is still armed and un-reissued at PURGE time, which is
+    exactly the state that leaves SMEMBERS short a variant.
+
+    ORACLE: the reply must carry "complete":false when a drop is
+    outstanding, and must NOT carry "complete":false (a fully-enumerated
+    purge, the normal case) when every variant's index write reached the
+    wire. The mutation that breaks this test: deleting the
+    `tp->is_auto_vary && tp->pending_at_launch != 0` check (or hardcoding it
+    false) in ngx_http_cache_turbo_tag_purge_complete -- every purge would
+    then report unconditionally as if complete, which is precisely the
+    silent-under-report defect this item exists to close.
+    """
+    import json
+    en = {"Accept-Language": "en"}
+    fr = {"Accept-Language": "fr"}
+    fr_drop = {"Accept-Language": "fr", "X-Cache-Turbo-Test-Varidx-Drop": "1"}
+
+    # Use a URI distinct from /cor5sh/p to avoid any state the self-heal test
+    # (which runs earlier against the same location) leaves behind.
+    _, en0, _ = fetch(ng.port, "/cor5sh/degraded?v=al", headers=en)
+    _, en1, he1 = fetch(ng.port, "/cor5sh/degraded?v=al", headers=en)
+    assert he1.get("x-cache") == "HIT" and en1 == en0, "en variant should cache"
+
+    # fr variant primed with the index SADD dropped, and NOT healed before
+    # the purge below (no follow-up HIT without the drop header) -- the
+    # index set is missing this variant when SMEMBERS runs.
+    #
+    # The drops counter is bumped from the BODY filter, which runs after the
+    # header filter has already stamped X-Cache-Turbo-Test-Varidx onto this
+    # SAME response -- so hf0 (the drop request's own response) still reads
+    # the pre-drop count. Read it off a SECOND request instead, same as the
+    # self-heal test's drops0/hf1 pair: any request against this zone (a
+    # plain miss/HIT elsewhere on /cor5sh/) sees the bumped counter because
+    # it is zone-, not response-, scoped.
+    _, _fr0, _ = fetch(ng.port, "/cor5sh/degraded?v=al", headers=fr_drop)
+    _, _, hf_confirm = fetch(ng.port, "/cor5sh/degraded-confirm?v=al",
+                              headers=en)
+    drops0 = _varidx(hf_confirm)["drops"]
+    assert drops0 >= 1, f"fault injection did not record a drop: {hf_confirm}"
+
+    s, b, _ = fetch_raw(ng.port, "/cor5sh/degraded?v=al", method="PURGE")
+    assert s == 200, f"PURGE status {s}"
+    reply = json.loads(b)
+    assert reply["purged"] >= 1, f"purge should still report the seen variant: {b}"
+    assert reply.get("complete") is False, \
+        (f"PURGE with an outstanding, un-healed varidx drop must report "
+         f"complete:false -- got {b}")
+
+    # Heal the drop before the baseline check below: pending_at_launch is a
+    # ZONE-scoped drops/reissues gap (see the purge.c comment), so an
+    # unrelated outstanding drop anywhere in the zone -- including the one
+    # this test itself just made -- would otherwise make every subsequent
+    # purge in this zone read degraded too, which is correct behaviour but
+    # would make the baseline assertion below meaningless (it needs a
+    # genuinely gap-free zone to prove "complete" is not unconditional).
+    # A HIT on the dropped fr variant WITHOUT the drop header is the same
+    # self-heal trigger the COR-5(b) test uses: it finds varidx_pending set,
+    # clears it and re-issues the SADD.
+    # (matches the COR-5(b) test's own step 2->3 shape: the HIT that FINDS
+    # varidx_pending set is the one that consumes it and launches the
+    # re-issue, but the reissues counter this SAME response's header filter
+    # stamps was read before that launch -- so it reports on the NEXT hit.)
+    fetch(ng.port, "/cor5sh/degraded?v=al", headers=fr)
+    _, _, hf_heal = fetch(ng.port, "/cor5sh/degraded?v=al", headers=fr)
+    counts = _varidx(hf_heal)
+    assert counts["reissues"] >= counts["drops"], \
+        f"self-heal did not catch up before the baseline check: {counts}"
+
+    # Baseline (no outstanding drop anywhere in the zone): a fully-enumerated
+    # purge must NOT claim degraded.
+    en_full = {"Accept-Language": "en"}
+    fr_full = {"Accept-Language": "fr"}
+    _, g0, _ = fetch(ng.port, "/cor5sh/full?v=al", headers=en_full)
+    _, g1, hg1 = fetch(ng.port, "/cor5sh/full?v=al", headers=en_full)
+    assert hg1.get("x-cache") == "HIT" and g1 == g0, "en variant should cache"
+    _, h0, _ = fetch(ng.port, "/cor5sh/full?v=al", headers=fr_full)
+    _, h1, hh1 = fetch(ng.port, "/cor5sh/full?v=al", headers=fr_full)
+    assert hh1.get("x-cache") == "HIT" and h1 == h0, "fr variant should cache"
+
+    s2, b2, _ = fetch_raw(ng.port, "/cor5sh/full?v=al", method="PURGE")
+    assert s2 == 200, f"PURGE status {s2}"
+    reply2 = json.loads(b2)
+    assert reply2["purged"] >= 2, f"purge should report both variants: {b2}"
+    assert reply2.get("complete") is not False, \
+        (f"a fully-enumerated purge (no outstanding drop) must not report "
+         f"complete:false -- got {b2}")
+
+
 def _varidx(headers: dict) -> dict:
     """Parse X-Cache-Turbo-Test-Varidx ("drops=<n>,reissues=<n>", TEST_FAULTS
     only) into ints. A MISSING header is a hard failure, never a silent zero --

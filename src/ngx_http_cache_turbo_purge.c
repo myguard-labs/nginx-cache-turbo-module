@@ -125,6 +125,25 @@ ngx_http_cache_turbo_purge_auto_vary(ngx_http_request_t *r,
                                                         vname);
         tp->clcf = clcf;
         tp->zone = z;
+        tp->is_auto_vary = 1;
+
+        /* c-1: snapshot the outstanding-drop gap BEFORE launching SMEMBERS.
+         * varidx_drops counts every index write ever dropped before the
+         * wire in this zone; varidx_reissues counts every one successfully
+         * re-issued. drops > reissues means at least one variant somewhere
+         * in the zone currently has an un-healed varidx_pending bit -- i.e.
+         * the per-base index set this SMEMBERS is about to read can be
+         * short a variant that is still resident in L1 and still serving.
+         * This is zone-scoped, not base-scoped (the index set carries no
+         * per-member pending flag to check directly), so it is a
+         * conservative signal: it can flag a purge "degraded" because some
+         * OTHER base has an outstanding drop, never the reverse. A false
+         * "degraded" costs nothing (the operator re-purges or waits); a
+         * false "complete" is the defect this exists to catch, so the
+         * asymmetry is the safe one. */
+        tp->pending_at_launch =
+            (ngx_uint_t) ngx_atomic_fetch_add(&z->sh->varidx_drops, 0)
+            - (ngx_uint_t) ngx_atomic_fetch_add(&z->sh->varidx_reissues, 0);
         tp->tag.data = ngx_pnalloc(r->pool, vlen);
         if (tp->tag.data == NULL) {
             return NGX_OK;
@@ -387,12 +406,28 @@ ngx_http_cache_turbo_tag_purge_complete(ngx_http_request_t *r, void *data,
 
     ngx_http_cache_turbo_redis_del_many(tp->clcf, delkeys, ndel);
 
-    p = ngx_pnalloc(r->pool, sizeof("{\"purged\":4294967295}\n"));
+    /* c-1: report a DEGRADED enumeration explicitly rather than silently
+     * under-counting. tp->pending_at_launch != 0 means at least one variant
+     * in this zone had an un-healed varidx_pending bit when SMEMBERS was
+     * issued above -- the index set this purge just enumerated may not have
+     * listed every live variant of this base. "complete" is additive and
+     * defaults to true (existing behaviour, existing callers) so it stays
+     * backward-compatible; only the COR-5 auto-Vary caller (is_auto_vary)
+     * ever has a basis to say otherwise. Staleness itself is unaffected --
+     * the marker delete upstream of this callback already covers that; this
+     * is a REPORTING field only. */
+    p = ngx_pnalloc(r->pool,
+                    sizeof("{\"purged\":4294967295,\"complete\":false}\n"));
     if (p == NULL) {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
     body.data = p;
-    body.len = ngx_sprintf(p, "{\"purged\":%ui}\n", purged) - p;
+    if (tp->is_auto_vary && tp->pending_at_launch != 0) {
+        body.len = ngx_sprintf(p, "{\"purged\":%ui,\"complete\":false}\n",
+                                purged) - p;
+    } else {
+        body.len = ngx_sprintf(p, "{\"purged\":%ui}\n", purged) - p;
+    }
 
     return ngx_http_cache_turbo_send_json(r, NGX_HTTP_OK, &body);
 }

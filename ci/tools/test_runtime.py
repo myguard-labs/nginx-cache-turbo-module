@@ -411,6 +411,9 @@ def run_all(ng: Nginx, origin: Origin,
         # on a later hit. Runs AFTER the plain COR-5 test, which is the
         # symptom detector for the same defect and must keep its own fixture.
         test_cor5_varidx_selfheal_after_dropped_index_write(ng, origin, redis)
+        # c-1: the PURGE reply must distinguish a complete enumeration from a
+        # degraded one when a drop is still outstanding at purge time.
+        test_cor5_purge_reports_degraded_enumeration(ng, origin, redis)
         test_l2_vary_marker_cold_node_finds_peer_variant(ng, origin, redis)  # P3-5
         test_multinode_lock(ng, origin, redis)
         test_cross_node_won_stale_body(ng, origin, redis)  # S231-PERF-BGSNAP
