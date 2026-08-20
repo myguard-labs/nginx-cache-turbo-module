@@ -1578,22 +1578,39 @@ def test_rfc1_request_min_fresh(ng: Nginx, origin: Origin) -> None:
 
 def test_rfc1_request_max_stale(ng: Nginx, origin: Origin) -> None:
     """RFC-1 (§5.2.1.2): on a stale entry, a client sending max-age WITHOUT
-    max-stale gets a revalidation; adding max-stale re-permits the stale serve."""
+    max-stale gets a revalidation; adding max-stale re-permits the stale serve.
+
+    TTL-REVAL-RACE (2026-08-17, failed twice on shared CI runners): the entry
+    has a 1s TTL. A fixed `time.sleep(1.5)` measures elapsed time from the
+    TEST's clock, not from when the server actually saw the prime request --
+    on a loaded runner the prime itself can take non-trivial wall-clock time,
+    shrinking the real margin to well under 0.5s. Anchor an ABSOLUTE deadline
+    to the moment the prime response is observed instead, and poll past it
+    with wait_for() so runner slowdown cannot move the test across the TTL
+    boundary. The primary oracle is the ORIGIN HIT COUNT (did the request
+    actually reach the origin to revalidate), not the x-cache header alone --
+    a re-primed entry can also read back as a fresh HIT with age=0, which is
+    indistinguishable from "still fresh" if x-cache is the only signal."""
     fetch_raw(ng.port, "/condst/cond-ms")                          # prime, fresh 1s
-    time.sleep(1.5)                                                # now stale
+    stale_deadline = time.time() + 1.0                             # TTL is 1s
+    assert wait_for(lambda: time.time() >= stale_deadline,
+                     timeout=5.0, interval=0.05), \
+        "harness bug: wait_for did not reach its own deadline"
     before = origin.hits_for("/cond-ms")
     # max-stale present -> accept the stale copy (beta 1, no refresh)
     s0, b0, h0 = fetch_raw(ng.port, "/condst/cond-ms",
                            headers={"Cache-Control": "max-age=1, max-stale=30"})
+    assert origin.hits_for("/cond-ms") == before, \
+        f"max-stale stale serve must not hit origin: {s0} {h0}"
     assert s0 == 200 and b0 and h0.get("x-cache") == "STALE", \
         f"max-stale must permit the stale serve: {s0} {h0}"
-    assert origin.hits_for("/cond-ms") == before, "max-stale stale serve must not hit origin"
     # same tight max-age but NO max-stale -> no stale tolerance -> revalidate
     s1, _, h1 = fetch_raw(ng.port, "/condst/cond-ms",
                           headers={"Cache-Control": "max-age=1"})
+    assert origin.hits_for("/cond-ms") == before + 1, \
+        f"no-max-stale revalidation must hit origin: {s1} {h1}"
     assert s1 == 200 and "x-cache" not in h1, \
         f"max-age without max-stale must revalidate a stale entry: {h1}"
-    assert origin.hits_for("/cond-ms") == before + 1, "no-max-stale revalidation must hit origin"
 
 
 def test_p4_multi_directive_single_resolve(ng: Nginx, origin: Origin) -> None:
