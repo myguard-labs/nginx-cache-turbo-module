@@ -1993,10 +1993,14 @@ ngx_http_cache_turbo_body_filter_store_tail(ngx_http_request_t *r,
             if (varidx_rc != NGX_OK) {
                 ngx_http_cache_turbo_shm_varidx_pending_set(z, store_key,
                                                             hash, 1);
-#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
-    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+                /* c-1: this counter is READ by the PURGE reply's
+                 * "complete":false decision (purge.c), which is a
+                 * production wire-contract feature, not a test-only one --
+                 * it must move on a real dropped write, not only under
+                 * NGX_HTTP_CACHE_TURBO_TEST_FAULTS. Only the FAULT that
+                 * produces varidx_rc != NGX_OK stays test-gated above; the
+                 * accounting for a genuine drop is unconditional. */
                 (void) ngx_atomic_fetch_add(&z->sh->varidx_drops, 1);
-#endif
                 ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
                     "cache_turbo: auto-vary variant index write dropped "
                     "for \"%V\" (L2 unreachable); queued for re-issue on "

@@ -145,6 +145,17 @@ if [ -f "$NGINX_OBJS/ngx_auto_config.h" ]; then
         NGINX_VERSION="$NGINX_VERSION" \
         NGINX_SRC="$NGINX_SRC" \
         NGINX_OBJS="$NGINX_OBJS"
+
+    # --- c-1: varidx drop/reissue accounting is production-reachable -------
+    # The PURGE reply's "complete":false honesty field depends on
+    # z->sh->varidx_drops/varidx_reissues actually moving OUTSIDE a
+    # NGX_HTTP_CACHE_TURBO_TEST_FAULTS build. Every runtime test above
+    # (including this one) builds WITH TEST_FAULTS, so none of them can
+    # catch the increments being wrapped back into that #if -- this
+    # preprocesses the two call sites with TEST_FAULTS undefined instead.
+    echo "--- varidx drop/reissue accounting (non-TEST_FAULTS preprocess) ---"
+    NGINX_VERSION="$NGINX_VERSION" NGINX_SRC="$NGINX_SRC" NGINX_OBJS="$NGINX_OBJS" \
+        bash "$DIR/check_varidx_accounting.sh"
 else
     echo "--- shm node state machine: SKIPPED (no configured nginx tree at" \
          "$NGINX_OBJS) ---"

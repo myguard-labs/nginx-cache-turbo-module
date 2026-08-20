@@ -819,10 +819,11 @@ ngx_http_cache_turbo_varidx_reissue(ngx_http_request_t *r,
         return;
     }
 
-#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
-    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+    /* c-1: unconditional, same as the drops counter in filters.c -- the
+     * PURGE reply's "complete":false decision depends on this counter
+     * catching up to varidx_drops in production, not only under
+     * NGX_HTTP_CACHE_TURBO_TEST_FAULTS. */
     (void) ngx_atomic_fetch_add(&z->sh->varidx_reissues, 1);
-#endif
 
     ngx_log_error(NGX_LOG_NOTICE, r->connection->log, 0,
         "cache_turbo: auto-vary variant index re-issued for \"%V\" "
