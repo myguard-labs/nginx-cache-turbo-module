@@ -1,4 +1,4 @@
-# sync-sha: b32700caf729ee9d48229309f5fc219ba90f61d51cb629ab054d5c300bdf19c9
+# sync-sha: 2521fd796d38ab5abdb97493461f8ea627b1810c2fd09db681746d7e29f53167
 name: CI
 
 # Single entry point for the PR suite. The checks below used to be independent
@@ -158,9 +158,15 @@ jobs:
             echo "fuzz=false" >> "$GITHUB_OUTPUT"
           fi
           # code: detect changes to code, CI workflows, or tests (anything that
-          # isn't docs-only). gates Build&Test and Security Scanners to skip
-          # on docs-only PRs.
-          if printf '%s\n' "$changed" | grep -qvE '^\.(md|gitignore|github/ISSUE_TEMPLATE/)'; then
+          # isn't docs-only). gates Build&Test to skip on docs-only PRs.
+          # NOTE: this must anchor the DOCS-ONLY exclusions at the END of the
+          # path (`\.md$`, not `^\.md`) or the start of the whole relative
+          # path (`^\.gitignore$`, `^\.github/ISSUE_TEMPLATE/`) -- an earlier
+          # version anchored everything at `^\.`, which only matches a path
+          # beginning with a literal dot. `README.md` never matches that, so
+          # `grep -qv` always found a "non-docs" line and `code` was ALWAYS
+          # true. Verified against a fixture path list before landing.
+          if printf '%s\n' "$changed" | grep -qvE '\.md$|^\.gitignore$|^\.github/ISSUE_TEMPLATE/'; then
             echo "code=true" >> "$GITHUB_OUTPUT"
           else
             echo "code=false" >> "$GITHUB_OUTPUT"
@@ -210,15 +216,17 @@ jobs:
       contents: read
     uses: ./.github/workflows/fuzzing.yml
 
-  # Scanners gate on code changes only: on docs-only PRs, skip the security
-  # scanning (expensive). `needs: changes` is kept to inherit that job's
-  # fail-closed behaviour: `changes` exits 1 rather than fail open when it
-  # cannot compute its diff, and the explicit `result == 'success'` test means
-  # a run whose gate never produced a verdict does not silently scan anyway.
+  # Scanners run on EVERY PR -- unlike asan/fuzzing they are not path-gated,
+  # because a scanner finding can come from any file (workflow YAML, scripts,
+  # docs with embedded commands), not only from src/. `needs: changes` is kept
+  # solely to inherit that job's fail-closed behaviour: `changes` exits 1 rather
+  # than fail open when it cannot compute its diff, and the explicit
+  # `result == 'success'` test means a run whose gate never produced a verdict
+  # does not silently scan anyway. A bare `!cancelled()` would lose that.
   security-scanners:
     name: Security Scanners
     needs: changes
-    if: ${{ needs.changes.outputs.code == 'true' && needs.changes.result == 'success' }}
+    if: ${{ needs.changes.result == 'success' }}
     permissions:
       contents: read
     uses: ./.github/workflows/security-scanners.yml
