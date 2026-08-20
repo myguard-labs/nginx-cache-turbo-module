@@ -1,4 +1,4 @@
-# sync-sha: 1bd9ca9647b1ddad6263c08d78640fcef76d8ec005c94880fabb7cae432f099a
+# sync-sha: 306faac81bb7f42bb1a5afae02d3e97f0d27453559515827732598cc1c6aac78
 name: CI Deep
 
 # Exhaustive dynamic analysis — monthly cron + on-demand only, NEVER on PR.
@@ -844,7 +844,11 @@ jobs:
       - name: Install build and runtime dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential ccache curl eatmydata \
+          # dwarves provides pahole, which ci/tests/unit/extract_shm.sh needs
+          # to measure ngx_http_cache_turbo_node_t's size (P2-3 slab-class
+          # assertion). Without it the check has nothing to skip TO but a
+          # silent pass -- so it is a required dependency, not optional.
+          sudo apt-get install -y build-essential ccache curl dwarves eatmydata \
             libpcre2-dev libssl-dev mold python3-venv redis-server memcached zlib1g-dev
           # Ubuntu's gcovr 6 parser rejects GCC 14's `10000-block` records.
           # Keep the report reproducible and new enough to read the compiler's
