@@ -2938,10 +2938,15 @@ ngx_http_cache_turbo_serve(ngx_http_request_t *r, u_char *copy, size_t len,
         ll = &out.next;
         out.buf = NULL;
         b = NULL;
+        off = 0;
 
-        for (off = 0; off < body_len;
-             off += NGX_HTTP_CACHE_TURBO_SERVE_CHUNK)
-        {
+        /* do/while, not for: body_len > 0 in this arm, so the body ALWAYS runs
+         * at least once and `b` is non-NULL at the terminator below. Written
+         * this way so that is structural rather than something a reader (or an
+         * analyzer) has to derive from the loop condition -- cppcheck reads the
+         * `for` form as "condition may be false on entry" and reports the
+         * terminator as a NULL dereference. */
+        do {
             size_t  n = body_len - off;
 
             if (n > NGX_HTTP_CACHE_TURBO_SERVE_CHUNK) {
@@ -2969,13 +2974,15 @@ ngx_http_cache_turbo_serve(ngx_http_request_t *r, u_char *copy, size_t len,
                 *ll = cl;
                 ll = &cl->next;
             }
-        }
+
+            off += NGX_HTTP_CACHE_TURBO_SERVE_CHUNK;
+
+        } while (off < body_len);
 
         *ll = NULL;
 
-        /* Only the FINAL buf terminates the response. `b` is the last one
-         * allocated by the loop above, and body_len > 0 guarantees at least
-         * one iteration ran, so it is never NULL here. */
+        /* Only the FINAL buf terminates the response: `b` is the last buf the
+         * loop allocated. */
         b->last_buf = (r == r->main) ? 1 : 0;
         b->last_in_chain = 1;
 
