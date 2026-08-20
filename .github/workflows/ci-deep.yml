@@ -1,4 +1,4 @@
-# sync-sha: 52355b8be6026fe0b21748fec65ae4d07dbbfc6cd0c159cbba92a776f3d1621c
+# sync-sha: 9b4babe6a7724d36d62ae3918248e4a6769fe182995fdd121ace20ca5328224d
 name: CI Deep
 
 # Exhaustive dynamic analysis — monthly cron + on-demand only, NEVER on PR.
@@ -443,8 +443,18 @@ jobs:
         # start both explicitly and wait for them to accept connections
         # before the soak below ever generates L2 traffic against them.
         run: |
-          sudo service redis-server start
-          sudo service memcached start
+          # The runner image MASKS both units (`Unit redis-server.service is
+          # masked`), so `service ... start` cannot start them -- unmask and
+          # enable first. This is a stronger block than policy-rc.d: masking
+          # symlinks the unit to /dev/null, so nothing short of unmasking
+          # brings it back. (The per-PR runtime job in build-test.yml sidesteps
+          # this entirely by handing test_runtime.py --redis-server /usr/bin/...
+          # so the harness spawns its OWN daemons; the soak wants the ordinary
+          # system services, so it unmasks instead.)
+          sudo systemctl unmask redis-server.service memcached.service || true
+          sudo systemctl enable --now redis-server.service memcached.service || true
+          sudo service redis-server start || true
+          sudo service memcached start || true
           for _ in $(seq 1 50); do
             redis-cli -h 127.0.0.1 -p 6379 ping 2>/dev/null | grep -q PONG && break
             sleep 0.2
@@ -526,8 +536,18 @@ jobs:
         # installing the packages does not put anything on 6379/11211.
         # Start both explicitly and wait for them to accept connections.
         run: |
-          sudo service redis-server start
-          sudo service memcached start
+          # The runner image MASKS both units (`Unit redis-server.service is
+          # masked`), so `service ... start` cannot start them -- unmask and
+          # enable first. This is a stronger block than policy-rc.d: masking
+          # symlinks the unit to /dev/null, so nothing short of unmasking
+          # brings it back. (The per-PR runtime job in build-test.yml sidesteps
+          # this entirely by handing test_runtime.py --redis-server /usr/bin/...
+          # so the harness spawns its OWN daemons; the soak wants the ordinary
+          # system services, so it unmasks instead.)
+          sudo systemctl unmask redis-server.service memcached.service || true
+          sudo systemctl enable --now redis-server.service memcached.service || true
+          sudo service redis-server start || true
+          sudo service memcached start || true
           for _ in $(seq 1 50); do
             redis-cli -h 127.0.0.1 -p 6379 ping 2>/dev/null | grep -q PONG && break
             sleep 0.2
