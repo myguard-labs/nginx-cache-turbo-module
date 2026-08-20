@@ -1130,14 +1130,14 @@ def test_range_hit_matches_miss(ng: Nginx, origin: Origin) -> None:
     s_hit, b_hit, h_hit = fetch_raw(ng.port, "/range/rngsrc-warm",
                                     headers=range_hdr)
     assert h_hit.get("x-cache") == "HIT", f"second fetch should HIT: {h_hit}"
-    assert s_hit == 206, \
-        f"a Range request against a cache-turbo HIT must answer 206 like a " \
-        f"MISS does, got {s_hit} (Accept-Ranges was replayed but the range " \
-        f"was not honoured)"
+    assert s_hit == 206, (
+        f"a Range request against a cache-turbo HIT must answer 206 like a "
+        f"MISS does, got {s_hit} (Accept-Ranges was replayed but the range "
+        f"was not honoured)")
     assert s_hit == s_miss, f"HIT status {s_hit} != MISS status {s_miss}"
-    assert h_hit.get("content-range") == h_miss.get("content-range"), \
-        f"HIT Content-Range {h_hit.get('content-range')!r} != " \
-        f"MISS Content-Range {h_miss.get('content-range')!r}"
+    assert h_hit.get("content-range") == h_miss.get("content-range"), (
+        f"HIT Content-Range {h_hit.get('content-range')!r} != "
+        f"MISS Content-Range {h_miss.get('content-range')!r}")
     assert b_hit == b_miss, \
         f"HIT partial body {b_hit!r} != MISS partial body {b_miss!r}"
     assert len(b_hit) == 100, f"bytes=0-99 should be 100 bytes, got {len(b_hit)}"
@@ -1167,20 +1167,20 @@ def test_range_suffix_hit_matches_miss(ng: Nginx, origin: Origin) -> None:
     s_hit, b_hit, h_hit = fetch_raw(ng.port, "/range/rngsrc-sfxwarm",
                                     headers=range_hdr)
     assert h_hit.get("x-cache") == "HIT", f"second fetch should HIT: {h_hit}"
-    assert s_hit == 206, \
-        f"a suffix Range against a HIT must answer 206 like a MISS does, " \
-        f"got {s_hit}"
-    assert h_hit.get("content-range") == h_miss.get("content-range"), \
-        f"HIT Content-Range {h_hit.get('content-range')!r} != " \
-        f"MISS Content-Range {h_miss.get('content-range')!r}"
+    assert s_hit == 206, (
+        f"a suffix Range against a HIT must answer 206 like a MISS does, "
+        f"got {s_hit}")
+    assert h_hit.get("content-range") == h_miss.get("content-range"), (
+        f"HIT Content-Range {h_hit.get('content-range')!r} != "
+        f"MISS Content-Range {h_miss.get('content-range')!r}")
     assert b_hit == b_miss, \
         f"HIT suffix body {b_hit!r} != MISS suffix body {b_miss!r}"
     # The LAST 50 bytes, not the first 50: a mis-sliced suffix that still
     # returned 50 bytes would pass a length-only assert.
     assert len(b_hit) == 50, f"bytes=-50 should be 50 bytes, got {len(b_hit)}"
-    assert h_hit.get("content-range") == "bytes 150-199/200", \
-        f"bytes=-50 of a 200-byte body is 150-199, got " \
-        f"{h_hit.get('content-range')!r}"
+    assert h_hit.get("content-range") == "bytes 150-199/200", (
+        f"bytes=-50 of a 200-byte body is 150-199, got "
+        f"{h_hit.get('content-range')!r}")
 
 
 def test_range_unsatisfiable_hit_matches_miss(ng: Nginx,
@@ -1215,10 +1215,10 @@ def test_range_unsatisfiable_hit_matches_miss(ng: Nginx,
 
     s_hit, b_hit, _ = fetch_raw(ng.port, "/range/rngsrc-unsatwarm",
                                 headers=range_hdr)
-    assert s_hit == 416, \
-        f"an unsatisfiable Range against a cached entry must answer 416, got " \
-        f"{s_hit} (before the send_header fix this was not a wrong status but " \
-        f"NO RESPONSE -- the connection was closed mid-request)"
+    assert s_hit == 416, (
+        f"an unsatisfiable Range against a cached entry must answer 416, got "
+        f"{s_hit} (before the send_header fix this was not a wrong status but "
+        f"NO RESPONSE -- the connection was closed mid-request)")
     assert "200" not in b_hit[:200] or "416" in b_hit, \
         f"416 body should be the range-not-satisfiable page, got {b_hit[:120]!r}"
 
@@ -1246,9 +1246,9 @@ def test_range_not_offered_on_304(ng: Nginx, origin: Origin) -> None:
     s0, _, h0 = fetch_raw(ng.port, url)
     assert s0 == 200 and "x-cache" not in h0, f"prime should miss: {s0} {h0}"
     etag = h0.get("etag")
-    assert etag == '"rngetag"', \
-        f"fixture is wrong, not the module: rngcond must emit an ETag, got " \
-        f"{etag!r}"
+    assert etag == '"rngetag"', (
+        f"fixture is wrong, not the module: rngcond must emit an ETag, got "
+        f"{etag!r}")
 
     # Positive half first, and it must depend on the PERMIT, not on the blob.
     # Accept-Ranges is replayed from the stored headers (the origin sent it), so
@@ -1258,9 +1258,9 @@ def test_range_not_offered_on_304(ng: Nginx, origin: Origin) -> None:
     s_hit, b_hit, h_hit = fetch_raw(ng.port, url,
                                     headers={"Range": "bytes=0-9"})
     assert h_hit.get("x-cache") == "HIT", f"ranged fetch should HIT: {h_hit}"
-    assert s_hit == 206, \
-        f"a cached 200 must be range-servable (the permit at module.c:6563), " \
-        f"got {s_hit}"
+    assert s_hit == 206, (
+        f"a cached 200 must be range-servable (the permit at module.c:6563), "
+        f"got {s_hit}")
     assert len(b_hit) == 10, f"bytes=0-9 should be 10 bytes, got {len(b_hit)}"
 
     s304, b304, h304 = fetch_raw(ng.port, url,
@@ -1297,16 +1297,16 @@ def test_range_on_sie_serve(ng: Nginx, origin: Origin) -> None:
     origin.fail = True
     try:
         s, b, h = fetch_raw(ng.port, url, headers=range_hdr)
-        assert h.get("x-cache") == "STALE-IF-ERROR", \
-            f"expected a serve-on-error replay, got x-cache={h.get('x-cache')} " \
-            f"status={s} (the fixture, not the Range, is wrong)"
-        assert s == 206, \
-            f"a Range against a STALE-IF-ERROR serve must answer 206 like a " \
-            f"HIT does, got {s} -- the client asked for a slice and got the " \
-            f"whole body"
-        assert h.get("content-range") == "bytes 0-99/200", \
-            f"Content-Range on the SIE serve is {h.get('content-range')!r}, " \
-            f"expected bytes 0-99/200"
+        assert h.get("x-cache") == "STALE-IF-ERROR", (
+            f"expected a serve-on-error replay, got x-cache={h.get('x-cache')} "
+            f"status={s} (the fixture, not the Range, is wrong)")
+        assert s == 206, (
+            f"a Range against a STALE-IF-ERROR serve must answer 206 like a "
+            f"HIT does, got {s} -- the client asked for a slice and got the "
+            f"whole body")
+        assert h.get("content-range") == "bytes 0-99/200", (
+            f"Content-Range on the SIE serve is {h.get('content-range')!r}, "
+            f"expected bytes 0-99/200")
         assert len(b) == 100, f"bytes=0-99 should be 100 bytes, got {len(b)}"
         assert b == "R" * 100, \
             f"the SIE serve returned the wrong 100 bytes: {b!r}"
@@ -1786,9 +1786,9 @@ def test_cor5_l1only_variant_purge_gen_wrap(ng: Nginx, origin: Origin) -> None:
     assert "x-cache" not in he2, \
         (f"AUD-GEN1: variant resolved as a HIT immediately after the 256th "
          f"PURGE (marker generation wrap) -- X-Cache={he2.get('x-cache')}")
-    assert en2 != en0, \
-        "AUD-GEN1: post-wrap body matches the pre-purge #1 body -- purged " \
-        "variant resurrected"
+    assert en2 != en0, (
+        "AUD-GEN1: post-wrap body matches the pre-purge #1 body -- purged "
+        "variant resurrected")
 
 
 def test_cor5_redis_variant_purge(ng: Nginx, origin: Origin,
@@ -2220,9 +2220,9 @@ def test_require_header(ng: Nginx) -> None:
     # "X-GraphQL-Cacheable: "). If a future nginx starts forwarding it, this
     # fails and the "" case becomes worth testing on the gate directly.
     _, _, he = fetch(ng.port, "/nogql/empty", headers={"X-Want-Cacheable": ""})
-    assert he.get("X-GraphQL-Cacheable") is None, \
-        "nginx now forwards an empty-valued header -- add an empty-value case " \
-        "to the refusal loop above, it is no longer just /gql/absent"
+    assert he.get("X-GraphQL-Cacheable") is None, (
+        "nginx now forwards an empty-valued header -- add an empty-value case "
+        "to the refusal loop above, it is no longer just /gql/absent")
 
     # header ABSENT entirely -> refuse (the fail-closed default of the gate)
     _, ba1, _ = fetch(ng.port, "/gql/absent")
