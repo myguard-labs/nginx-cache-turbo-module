@@ -1938,34 +1938,17 @@ http {
 > breaker looks OPEN in the stats while one location behaves as if nothing is
 > wrong is both of these rules working as designed.
 >
-> **The circuit breaker's blast radius is per-ZONE, not per-upstream.** Because
-> the breaker failure counter and OPEN state are shared by all locations on the
-> same zone, one dead backend trips the breaker for every other backend that
-> shares that zone. This has two consequences:
->
-> 1. **One backend failure can block traffic to every other backend on the zone.**
-> If you configure HTTP and HTTPS endpoints to the same origin as separate
-> upstreams but share one `cache_turbo_zone`, a failure in either upstream will
-> trip the breaker and cut off cached responses to both. More broadly, if
-> `server` blocks or locations for different origins all delegate to one zone,
-> a 5xx cascade from one origin (and only responses ≥500 count toward the trip:
-> 403/404/429 are deliberately excluded) opens the breaker for all of them.
->
-> 2. **Conversely, healthy traffic from one backend can mask a failure in another.**
-> The trip test is *consecutive* failures within the rolling
-> `cache_turbo_breaker_window` (default `5` failures over `10s`). When a failing
-> upstream shares a zone with a busy healthy one, the healthy responses are
-> interleaved into the same shared counter and keep resetting the run, so the
-> failing backend may never accumulate an unbroken sequence long enough to trip
-> — the breaker can fail to open even though one backend is down, because the
-> count is spread across the zone rather than accumulating per backend.
->
-> **Recommendation: use one `cache_turbo_zone` per upstream.** The zone memory is
-> free — nginx zones scale to hundreds without overhead — and per-upstream zones
-> make the breaker's failure isolation match your actual failure domain. A dead
-> origin then trips its own breaker only, leaving cached responses for other
-> origins intact, and each upstream's failure count is undiluted by healthy
-> traffic from others. This is the most transparent configuration.
+> Sharing a zone also cuts the other way, and this direction is the easier one
+> to miss: **healthy traffic from one backend can mask a failure in another.**
+> The trip test is a run of *consecutive* failures inside the rolling
+> `cache_turbo_breaker_window` (default `5` failures over `10s`), and a success
+> clears the run. When a failing upstream shares a zone with a busy healthy one,
+> the healthy responses are interleaved into the same shared counter and keep
+> resetting it, so the failing backend may never accumulate an unbroken sequence
+> long enough to trip — the breaker can stay CLOSED against a genuinely dead
+> backend. See [Circuit breaker isolation: per-zone, not per-upstream](#circuit-breaker-isolation-per-zone-not-per-upstream)
+> for the opposite direction (one dead backend tripping healthy ones) and the
+> one-zone-per-upstream remedy.
 
 
 ### Variables
