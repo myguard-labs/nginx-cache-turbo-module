@@ -16,6 +16,36 @@
 #include "ngx_http_cache_turbo_internal.h"
 
 
+/* --- P4-1a W-TinyLFU sketch constants. Declared here rather than beside the
+ * helpers below because _shm_init_zone() sizes and allocates the sketch and
+ * sits above them. --- */
+
+/* Four rows is the standard count-min depth for this use: the estimate is the
+ * min of four independent hashes, so a single unlucky collision is masked by
+ * the other three. More rows buy little at 4-bit precision and cost a linear
+ * multiple of the memory and of the halving pass. */
+#define NGX_HTTP_CACHE_TURBO_SKETCH_ROWS        4
+
+/* 4-bit counters saturate here. Small on purpose: TinyLFU only needs to RANK
+ * a candidate against a victim, not to count exactly, and 15 with periodic
+ * halving distinguishes "never seen" from "hot" perfectly well. */
+#define NGX_HTTP_CACHE_TURBO_SKETCH_MAX         15
+
+/* Reset (halve every counter) after width * this many bumps. 10 is the classic
+ * W-TinyLFU sample factor: the sample period scales with the sketch, so a
+ * bigger zone ages more slowly in absolute terms and each key gets a
+ * comparable number of chances to register before its history decays. */
+#define NGX_HTTP_CACHE_TURBO_SKETCH_SAMPLE      10
+
+/* Width bounds. The floor keeps a tiny zone's sketch from being so narrow
+ * that every key collides (which would make every estimate equal and the
+ * stage-2 test useless); the ceiling stops a very large zone from spending
+ * more than the byte budget below on a frequency hint. Both are counters per
+ * row, and both are powers of two so the row index is a mask, not a modulo. */
+#define NGX_HTTP_CACHE_TURBO_SKETCH_MIN_WIDTH   1024
+#define NGX_HTTP_CACHE_TURBO_SKETCH_MAX_WIDTH   (1 << 20)
+
+
 static void
 ngx_http_cache_turbo_rbtree_insert_value(ngx_rbtree_node_t *temp,
     ngx_rbtree_node_t *node, ngx_rbtree_node_t *sentinel)
@@ -154,6 +184,65 @@ ngx_http_cache_turbo_shm_init_zone(ngx_shm_zone_t *shm_zone, void *data)
     ctx->sh->breaker_serves = 0;
     ctx->sh->origin_failures = 0;
 
+    /* P4-1a: allocate the W-TinyLFU frequency sketch.
+     *
+     * SIZING. The sketch is a FIXED overhead taken out of the same slab that
+     * holds entries, so it is budgeted as a fraction of the zone rather than
+     * from an entry count (there is no entry cap in this module -- the zone
+     * fills until the slab is exhausted). One counter per row per ~4 KB of
+     * zone, which for a 4-row sketch of 4-bit counters works out at
+     *
+     *     bytes = width * 4 rows / 2 counters-per-byte = width * 2
+     *           = (zone / 4096) * 2 = zone / 2048
+     *
+     * i.e. 0.049% of the zone -- comfortably under the 1% target. A 64 MB
+     * zone gets width 16384 and spends 32 KB; a 1 MB zone is below the
+     * MIN_WIDTH floor and spends the floor's 2 KB (0.2%, still well under).
+     * The width is rounded DOWN to a power of two so the row index is a mask.
+     *
+     * DEGRADES GRACEFULLY. On allocation failure `sketch` stays NULL and the
+     * zone comes up normally: the estimate is unavailable, which stage 2 must
+     * read as "no evidence", never as a reason to refuse an admission. A
+     * frequency hint is not worth failing zone init over. */
+    ctx->sh->sketch = NULL;
+    ctx->sh->sketch_width = 0;
+    ctx->sh->sketch_ops = 0;
+    ctx->sh->sketch_reset_at = 0;
+    ctx->sh->sketch_gen = 0;
+
+    {
+        ngx_uint_t  width, w, bytes;
+
+        width = shm_zone->shm.size / 4096;
+
+        if (width < NGX_HTTP_CACHE_TURBO_SKETCH_MIN_WIDTH) {
+            width = NGX_HTTP_CACHE_TURBO_SKETCH_MIN_WIDTH;
+
+        } else if (width > NGX_HTTP_CACHE_TURBO_SKETCH_MAX_WIDTH) {
+            width = NGX_HTTP_CACHE_TURBO_SKETCH_MAX_WIDTH;
+        }
+
+        /* Round down to a power of two: the row index is `hash & (width - 1)`,
+         * which is only a valid modulo for a power-of-two width. */
+        for (w = NGX_HTTP_CACHE_TURBO_SKETCH_MIN_WIDTH;
+             w <= width / 2;
+             w <<= 1)
+        {
+            /* void */
+        }
+        width = w;
+
+        bytes = width * NGX_HTTP_CACHE_TURBO_SKETCH_ROWS / 2;
+
+        ctx->sh->sketch = ngx_slab_calloc(ctx->shpool, bytes);
+
+        if (ctx->sh->sketch != NULL) {
+            ctx->sh->sketch_width = width;
+            ctx->sh->sketch_reset_at =
+                width * NGX_HTTP_CACHE_TURBO_SKETCH_SAMPLE;
+        }
+    }
+
     ctx->shpool->log_nomem = 0;
 
     return NGX_OK;
@@ -267,6 +356,164 @@ ngx_http_cache_turbo_blob_release(ngx_http_cache_turbo_zone_t *z, u_char *data)
         ngx_slab_free_locked(z->shpool, ref);
     }
     ngx_shmtx_unlock(&z->shpool->mutex);
+}
+
+
+/* --- P4-1a W-TinyLFU frequency sketch --------------------------------------
+ *
+ * STAGE 1 OF 2: estimation machinery only. Nothing in this stage READS an
+ * estimate to decide anything, so admission and eviction are byte-for-byte
+ * unchanged; the sketch is pure bookkeeping until stage 2 adds the admission
+ * test. See the field block in module.h for the layout and the reload note.
+ *
+ * Caller holds the shpool mutex for every function here. The counters are
+ * plain memory, not atomics, precisely because of that.
+ */
+
+/* Per-row hash. The caller passes ONE key hash; each row needs its own
+ * position or the four rows would collide identically and the min would carry
+ * no more information than a single row. Mixing the row index into the hash
+ * with a 32-bit finalizer (the MurmurHash3 fmix32 avalanche) is the cheap
+ * standard way to get four independent-enough positions out of one hash. */
+static ngx_inline uint32_t
+ngx_http_cache_turbo_sketch_row_hash(uint32_t hash, ngx_uint_t row)
+{
+    uint32_t  h = hash ^ (uint32_t) (0x9e3779b9u * (row + 1));
+
+    h ^= h >> 16;
+    h *= 0x85ebca6bu;
+    h ^= h >> 13;
+    h *= 0xc2b2ae35u;
+    h ^= h >> 16;
+
+    return h;
+}
+
+
+/* Read one 4-bit counter. `idx` is a counter index across the whole flat
+ * array (row offset already applied), NOT a byte index: two counters share a
+ * byte, the even index in the LOW nibble and the odd index in the HIGH one. */
+static ngx_inline ngx_uint_t
+ngx_http_cache_turbo_sketch_get(u_char *sketch, ngx_uint_t idx)
+{
+    u_char  b = sketch[idx >> 1];
+
+    return (idx & 1) ? (ngx_uint_t) (b >> 4) : (ngx_uint_t) (b & 0x0f);
+}
+
+
+/* Saturating 4-bit increment of one counter. Returns nothing: a caller that
+ * wants the value reads it back. */
+static ngx_inline void
+ngx_http_cache_turbo_sketch_inc(u_char *sketch, ngx_uint_t idx)
+{
+    ngx_uint_t  byte = idx >> 1;
+
+    if (idx & 1) {
+        if ((sketch[byte] >> 4) < NGX_HTTP_CACHE_TURBO_SKETCH_MAX) {
+            sketch[byte] = (u_char) (sketch[byte] + 0x10);
+        }
+
+    } else {
+        if ((sketch[byte] & 0x0f) < NGX_HTTP_CACHE_TURBO_SKETCH_MAX) {
+            sketch[byte] = (u_char) (sketch[byte] + 0x01);
+        }
+    }
+}
+
+
+/* Halve every counter (the TinyLFU aging step), then bump the generation.
+ *
+ * BOUNDED BY CONSTRUCTION: exactly sketch_width * ROWS / 2 byte writes, with
+ * the width capped at SKETCH_MAX_WIDTH above, so the worst case is a fixed
+ * 2 MB memset-like pass and cannot grow with traffic or entry count. Both
+ * nibbles of a byte halve in one masked shift -- shifting the byte would
+ * bleed the high counter's low bit into the low counter's top bit. */
+static void
+ngx_http_cache_turbo_sketch_halve(ngx_http_cache_turbo_zone_t *z)
+{
+    ngx_uint_t  i, bytes;
+    u_char     *sketch = z->sh->sketch;
+
+    bytes = z->sh->sketch_width * NGX_HTTP_CACHE_TURBO_SKETCH_ROWS / 2;
+
+    for (i = 0; i < bytes; i++) {
+        sketch[i] = (u_char) ((sketch[i] >> 1) & 0x77);
+    }
+
+    z->sh->sketch_ops = 0;
+    z->sh->sketch_gen++;
+}
+
+
+/* Record one access to `hash`.
+ *
+ * A no-op when the sketch could not be allocated -- see the module.h field
+ * block: NULL means "estimate unavailable", never an error.
+ *
+ * Caller holds the shpool mutex.
+ */
+void
+ngx_http_cache_turbo_shm_sketch_bump(ngx_http_cache_turbo_zone_t *z,
+    uint32_t hash)
+{
+    ngx_uint_t  row, idx, width;
+
+    if (z->sh->sketch == NULL) {
+        return;
+    }
+
+    width = z->sh->sketch_width;
+
+    for (row = 0; row < NGX_HTTP_CACHE_TURBO_SKETCH_ROWS; row++) {
+        idx = row * width
+              + (ngx_http_cache_turbo_sketch_row_hash(hash, row) & (width - 1));
+
+        ngx_http_cache_turbo_sketch_inc(z->sh->sketch, idx);
+    }
+
+    /* Age on the BUMP count, not on wall-clock time: a quiet zone should not
+     * forget what it learned just because an hour passed with no traffic. */
+    if (++z->sh->sketch_ops >= z->sh->sketch_reset_at) {
+        ngx_http_cache_turbo_sketch_halve(z);
+    }
+}
+
+
+/* Estimated access frequency of `hash`, 0..SKETCH_MAX.
+ *
+ * The MIN across the rows: a count-min sketch's error is one-sided, so this
+ * can over-estimate on a collision but never under-estimate. Returns 0 when
+ * the sketch is unavailable, which is the conservative answer -- stage 2 must
+ * read that as "no evidence this key is hot", never as a reason to reject.
+ *
+ * Caller holds the shpool mutex.
+ */
+ngx_uint_t
+ngx_http_cache_turbo_shm_sketch_estimate(ngx_http_cache_turbo_zone_t *z,
+    uint32_t hash)
+{
+    ngx_uint_t  row, idx, v, min, width;
+
+    if (z->sh->sketch == NULL) {
+        return 0;
+    }
+
+    width = z->sh->sketch_width;
+    min = NGX_HTTP_CACHE_TURBO_SKETCH_MAX;
+
+    for (row = 0; row < NGX_HTTP_CACHE_TURBO_SKETCH_ROWS; row++) {
+        idx = row * width
+              + (ngx_http_cache_turbo_sketch_row_hash(hash, row) & (width - 1));
+
+        v = ngx_http_cache_turbo_sketch_get(z->sh->sketch, idx);
+
+        if (v < min) {
+            min = v;
+        }
+    }
+
+    return min;
 }
 
 
@@ -413,6 +660,26 @@ void
 ngx_http_cache_turbo_shm_touch_lru(ngx_http_cache_turbo_zone_t *z,
     ngx_http_cache_turbo_node_t *ctn, time_t now, ngx_uint_t protected_pct)
 {
+    /* P4-1a: record the access in the frequency sketch BEFORE the coarse gate
+     * below.
+     *
+     * ⚠ The order is load-bearing, not stylistic. The gate returns early when
+     * this node was touched within the last second, so a bump placed AFTER it
+     * would count at most one access per key per second -- which undercounts
+     * hot keys by exactly the factor that makes them hot, and would leave the
+     * sketch unable to distinguish a key served 500 times a second from one
+     * served once. The whole point of the estimate is that ratio.
+     *
+     * ⚠ COST, accepted deliberately. This reintroduces a shared-cacheline
+     * write on the hot path, which is what the P1 gate was added to remove
+     * (see the rationale in module.h's last_access field block). The write is
+     * to the SKETCH ARRAY, not to the node -- so it does not dirty the node
+     * cacheline readers are walking, and it lands in one of `sketch_width`
+     * slots rather than on a single hot word. It is still a real write under
+     * the shpool mutex the caller already holds, and it is taken on purpose:
+     * stage 2's admission test is worth nothing on undercounted data. */
+    ngx_http_cache_turbo_shm_sketch_bump(z, ctn->node.key);
+
     /* P1 coarse gate: at most one LRU write per node per second. Deliberately
      * the SAME gate that governed the flat re-splice -- S8 adds no second
      * clock, so a hot key still serializes readers at most once/second. */

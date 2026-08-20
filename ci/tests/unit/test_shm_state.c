@@ -208,6 +208,13 @@ typedef struct {
     ngx_atomic_t        breaker_state, breaker_fails, breaker_window_start;
     ngx_atomic_t        breaker_opened_at, breaker_probe, breaker_opens;
     ngx_atomic_t        breaker_epoch;
+    /* P4-1a W-TinyLFU sketch. Plain (non-atomic) in production too -- every
+     * access is under the shpool mutex. */
+    u_char             *sketch;
+    ngx_uint_t          sketch_width;
+    ngx_uint_t          sketch_ops;
+    ngx_uint_t          sketch_reset_at;
+    ngx_uint_t          sketch_gen;
     ngx_atomic_t        breaker_wedge_observed; /* H-2/O4.4-j, TEST_FAULTS-gated
                                                  * in the real header; mirrored
                                                  * unconditionally here since
@@ -252,6 +259,17 @@ typedef struct {
     ngx_uint_t   breaker_threshold;
     time_t       breaker_window;
 } ngx_http_cache_turbo_loc_conf_t;
+
+/* P4-1a: the sketch constants live in ngx_http_cache_turbo_shm.c, not a
+ * header, so they are mirrored here like LRU_CAP_MAX_EVICT is. extract_shm.sh
+ * pins each of them against the .c for the usual reason: an unpinned mirror
+ * drifts silently and the tests then measure a shape production does not have
+ * (the H-1/H-4 lesson). */
+#define NGX_HTTP_CACHE_TURBO_SKETCH_ROWS        4
+#define NGX_HTTP_CACHE_TURBO_SKETCH_MAX         15
+#define NGX_HTTP_CACHE_TURBO_SKETCH_SAMPLE      10
+#define NGX_HTTP_CACHE_TURBO_SKETCH_MIN_WIDTH   1024
+#define NGX_HTTP_CACHE_TURBO_SKETCH_MAX_WIDTH   (1 << 20)
 
 /* claim() verdicts -- values are not asserted on, only distinctness matters. */
 #define NGX_HTTP_CACHE_TURBO_CLAIM_FRESH    0
@@ -4182,6 +4200,367 @@ run_negative_controls(void)
     }
 }
 
+/* --- P4-1a: W-TinyLFU count-min sketch ------------------------------------
+ *
+ * STAGE 1 OF 2. The sketch only ESTIMATES; nothing reads the estimate to make
+ * a decision yet, so these tests are the ONLY coverage this machinery has --
+ * there is no end-to-end behaviour to observe, by design (the item's whole
+ * point is that runtime behaviour is byte-for-byte unchanged). That makes the
+ * direct unit test the honest oracle here rather than a fallback.
+ *
+ * The fixture attaches a real sketch to the mirrored g_sh at the production
+ * MIN_WIDTH, so the sliced code indexes exactly the range it would in
+ * production and an off-by-one row offset is an ASan heap overflow, not a
+ * quietly wrong number.
+ */
+
+#define TEST_SKETCH_WIDTH  NGX_HTTP_CACHE_TURBO_SKETCH_MIN_WIDTH
+#define TEST_SKETCH_BYTES  (TEST_SKETCH_WIDTH * NGX_HTTP_CACHE_TURBO_SKETCH_ROWS / 2)
+
+static u_char  g_test_sketch[TEST_SKETCH_BYTES];
+
+/* Attach a zeroed sketch of the production minimum width. Deliberately NOT
+ * part of zone_reset(): the NULL sketch is the DEFAULT there, so every
+ * pre-existing test in this file keeps exercising the degraded path for free
+ * and the graceful-NULL contract is covered by ~200 call sites, not just by
+ * the one test named for it. */
+static void
+sketch_attach(void)
+{
+    memset(g_test_sketch, 0, sizeof(g_test_sketch));
+    g_sh.sketch          = g_test_sketch;
+    g_sh.sketch_width    = TEST_SKETCH_WIDTH;
+    g_sh.sketch_ops      = 0;
+    g_sh.sketch_gen      = 0;
+    /* Large enough that no test trips aging by accident; the halving test
+     * lowers it explicitly. */
+    g_sh.sketch_reset_at = (ngx_uint_t) -1;
+}
+
+
+/* A NULL sketch must be a supported state end-to-end: bump is a silent no-op
+ * and estimate answers 0 ("no evidence"), never a crash and never a nonzero
+ * that stage 2 could mistake for a real observation. */
+static void
+test_p4_1a_null_sketch_degrades_gracefully(void)
+{
+    zone_reset();
+
+    CHECK(g_sh.sketch == NULL, "fixture: zone_reset left a sketch attached");
+
+    /* Would segfault on a NULL deref if the guard were missing -- that IS the
+     * assertion; reaching the next line at all is the pass. */
+    ngx_http_cache_turbo_shm_sketch_bump(&g_zone, 0x1234abcdu);
+    ngx_http_cache_turbo_shm_sketch_bump(&g_zone, 0x1234abcdu);
+
+    CHECK(ngx_http_cache_turbo_shm_sketch_estimate(&g_zone, 0x1234abcdu) == 0,
+          "P4-1a: estimate on an unallocated sketch must be 0, not a "
+          "fabricated count");
+
+    /* And the bookkeeping must not have moved either -- a bump that returns
+     * early but still counts an op would age a sketch that does not exist. */
+    CHECK(g_sh.sketch_ops == 0,
+          "P4-1a: a no-op bump still advanced the aging counter");
+    CHECK(g_sh.sketch_gen == 0,
+          "P4-1a: a no-op bump advanced the aging generation");
+}
+
+
+/* The estimate must track the bump count exactly up to saturation, then STOP
+ * at 15 rather than wrapping to 0. Wrapping is the failure that matters: a
+ * counter that rolls over turns the hottest key in the zone into the coldest,
+ * which in stage 2 would evict precisely what should be kept. */
+static void
+test_p4_1a_saturates_at_fifteen(void)
+{
+    ngx_uint_t  i;
+    uint32_t    h = 0xdeadbeefu;
+
+    zone_reset();
+    sketch_attach();
+
+    CHECK(ngx_http_cache_turbo_shm_sketch_estimate(&g_zone, h) == 0,
+          "P4-1a: a fresh sketch reported a nonzero estimate");
+
+    /* Exact tracking below the ceiling. Not merely "it went up": an increment
+     * that added 2, or that bumped only one row, would still be monotonic. */
+    for (i = 1; i <= NGX_HTTP_CACHE_TURBO_SKETCH_MAX; i++) {
+        ngx_http_cache_turbo_shm_sketch_bump(&g_zone, h);
+
+        if (ngx_http_cache_turbo_shm_sketch_estimate(&g_zone, h) != i) {
+            CHECK(0, "P4-1a: estimate does not track the bump count exactly");
+            break;
+        }
+    }
+
+    CHECK(ngx_http_cache_turbo_shm_sketch_estimate(&g_zone, h)
+              == NGX_HTTP_CACHE_TURBO_SKETCH_MAX,
+          "P4-1a: did not reach the 4-bit ceiling after MAX bumps");
+
+    /* Well past the ceiling: 4 bits wrap after 16, so a non-saturating
+     * increment shows up here as a small number, most damagingly as 0. */
+    for (i = 0; i < 64; i++) {
+        ngx_http_cache_turbo_shm_sketch_bump(&g_zone, h);
+    }
+
+    CHECK(ngx_http_cache_turbo_shm_sketch_estimate(&g_zone, h)
+              == NGX_HTTP_CACHE_TURBO_SKETCH_MAX,
+          "P4-1a: 4-bit counter wrapped instead of saturating -- the hottest "
+          "key in the zone now reads as the coldest");
+}
+
+
+/* Nibble packing: the two counters sharing a byte must be independent.
+ *
+ * Tested against the packing helpers directly rather than through hashes,
+ * because a hash pair that lands on adjacent indices is not something a test
+ * can arrange honestly. Saturating the LOW nibble must leave the HIGH one at
+ * 0 and vice versa -- a byte-wide increment, or a shift that bleeds across
+ * the boundary, fails here and nowhere else. */
+static void
+test_p4_1a_nibbles_are_independent_counters(void)
+{
+    u_char      byte[1];
+    ngx_uint_t  i;
+
+    /* index 0 = low nibble of byte 0, index 1 = high nibble of byte 0. */
+    byte[0] = 0;
+
+    for (i = 0; i < NGX_HTTP_CACHE_TURBO_SKETCH_MAX; i++) {
+        ngx_http_cache_turbo_sketch_inc(byte, 0);
+    }
+
+    CHECK(ngx_http_cache_turbo_sketch_get(byte, 0)
+              == NGX_HTTP_CACHE_TURBO_SKETCH_MAX,
+          "P4-1a: the low nibble did not reach the ceiling");
+    CHECK(ngx_http_cache_turbo_sketch_get(byte, 1) == 0,
+          "P4-1a: saturating the low nibble leaked into the high nibble");
+
+    /* And the low nibble must survive its neighbour saturating. */
+    for (i = 0; i < NGX_HTTP_CACHE_TURBO_SKETCH_MAX; i++) {
+        ngx_http_cache_turbo_sketch_inc(byte, 1);
+    }
+
+    CHECK(ngx_http_cache_turbo_sketch_get(byte, 1)
+              == NGX_HTTP_CACHE_TURBO_SKETCH_MAX,
+          "P4-1a: the high nibble did not reach the ceiling");
+    CHECK(ngx_http_cache_turbo_sketch_get(byte, 0)
+              == NGX_HTTP_CACHE_TURBO_SKETCH_MAX,
+          "P4-1a: saturating the high nibble clobbered the low nibble");
+
+    /* Saturation must not carry out of the byte either. */
+    ngx_http_cache_turbo_sketch_inc(byte, 1);
+    ngx_http_cache_turbo_sketch_inc(byte, 0);
+    CHECK(byte[0] == 0xff, "P4-1a: a saturated byte changed on further bumps");
+
+    /* The reverse direction: high-only must leave low at 0. */
+    byte[0] = 0;
+    ngx_http_cache_turbo_sketch_inc(byte, 1);
+    CHECK(ngx_http_cache_turbo_sketch_get(byte, 1) == 1
+              && ngx_http_cache_turbo_sketch_get(byte, 0) == 0,
+          "P4-1a: bumping the high nibble also moved the low one");
+}
+
+
+/* estimate() must be the MIN across the four rows, not the max, the sum or
+ * row 0. Forced by hand-poisoning one row's counter for a known key: the min
+ * is what makes the sketch's error one-sided (over-count on collision, never
+ * under-count), and a max/sum would let one unlucky collision promote a key
+ * that was never actually requested. */
+static void
+test_p4_1a_estimate_is_min_across_rows(void)
+{
+    uint32_t    h = 0xc0ffee01u;
+    ngx_uint_t  row, idx, poisoned;
+
+    zone_reset();
+    sketch_attach();
+
+    ngx_http_cache_turbo_shm_sketch_bump(&g_zone, h);
+    ngx_http_cache_turbo_shm_sketch_bump(&g_zone, h);
+    ngx_http_cache_turbo_shm_sketch_bump(&g_zone, h);
+
+    CHECK(ngx_http_cache_turbo_shm_sketch_estimate(&g_zone, h) == 3,
+          "P4-1a: fixture did not reach 3 before poisoning");
+
+    /* Raise EVERY row except one to the ceiling. If estimate() were max or
+     * sum it would now read 15 (or far more); the min still reads 3. */
+    poisoned = 0;
+    for (row = 1; row < NGX_HTTP_CACHE_TURBO_SKETCH_ROWS; row++) {
+        idx = row * g_sh.sketch_width
+              + (ngx_http_cache_turbo_sketch_row_hash(h, row)
+                 & (g_sh.sketch_width - 1));
+
+        while (ngx_http_cache_turbo_sketch_get(g_sh.sketch, idx)
+                   < NGX_HTTP_CACHE_TURBO_SKETCH_MAX)
+        {
+            ngx_http_cache_turbo_sketch_inc(g_sh.sketch, idx);
+        }
+        poisoned++;
+    }
+
+    CHECK(poisoned == NGX_HTTP_CACHE_TURBO_SKETCH_ROWS - 1,
+          "P4-1a: fixture poisoned the wrong number of rows");
+
+    CHECK(ngx_http_cache_turbo_shm_sketch_estimate(&g_zone, h) == 3,
+          "P4-1a: estimate is not the MIN across rows -- one collided row "
+          "now dominates the answer");
+
+    /* Lower the ONE un-poisoned row and the min must follow it down, proving
+     * the min is genuinely re-scanned rather than cached from the first call. */
+    idx = 0 * g_sh.sketch_width
+          + (ngx_http_cache_turbo_sketch_row_hash(h, 0)
+             & (g_sh.sketch_width - 1));
+    g_sh.sketch[idx >> 1] = (u_char) (g_sh.sketch[idx >> 1]
+                                      & ((idx & 1) ? 0x0f : 0xf0));
+
+    CHECK(ngx_http_cache_turbo_shm_sketch_estimate(&g_zone, h) == 0,
+          "P4-1a: zeroing the minimum row did not lower the estimate");
+}
+
+
+/* Aging: once sketch_ops reaches sketch_reset_at every counter halves and the
+ * generation advances. Without it the counters saturate permanently and the
+ * sketch measures lifetime totals instead of RECENT frequency -- a key that
+ * was hot last week would outrank one that is hot now, forever. */
+static void
+test_p4_1a_halving_ages_the_sketch(void)
+{
+    uint32_t    hot  = 0xaaaa0001u;
+    uint32_t    warm = 0xbbbb0002u;
+    ngx_uint_t  i, before_hot, before_warm;
+
+    zone_reset();
+    sketch_attach();
+
+    /* Age after exactly 32 bumps so the fixture stays small and the arithmetic
+     * below is checkable by hand. */
+    g_sh.sketch_reset_at = 32;
+
+    /* 10 bumps for `hot`, 2 for `warm` = 12 ops, below the threshold. */
+    for (i = 0; i < 10; i++) {
+        ngx_http_cache_turbo_shm_sketch_bump(&g_zone, hot);
+    }
+    for (i = 0; i < 2; i++) {
+        ngx_http_cache_turbo_shm_sketch_bump(&g_zone, warm);
+    }
+
+    before_hot  = ngx_http_cache_turbo_shm_sketch_estimate(&g_zone, hot);
+    before_warm = ngx_http_cache_turbo_shm_sketch_estimate(&g_zone, warm);
+
+    CHECK(before_hot == 10 && before_warm == 2,
+          "P4-1a: fixture did not reach the expected pre-aging counts");
+    CHECK(g_sh.sketch_ops == 12,
+          "P4-1a: sketch_ops does not count one op per bump");
+    CHECK(g_sh.sketch_gen == 0,
+          "P4-1a: aged before reaching the threshold");
+
+    /* Drive ops to exactly the threshold with a third, unrelated key. The
+     * 20th of these is the bump that trips the halving. */
+    for (i = 0; i < 20; i++) {
+        ngx_http_cache_turbo_shm_sketch_bump(&g_zone, 0xcccc0000u + i);
+    }
+
+    CHECK(g_sh.sketch_gen == 1,
+          "P4-1a: reaching sketch_reset_at did not trigger a halving");
+    CHECK(g_sh.sketch_ops == 0,
+          "P4-1a: the aging counter was not reset after halving");
+
+    /* Every counter >>= 1, so both keys halve (10 -> 5, 2 -> 1) and, crucially,
+     * their ORDER survives: aging must decay history, not scramble it. */
+    CHECK(ngx_http_cache_turbo_shm_sketch_estimate(&g_zone, hot) == 5,
+          "P4-1a: the hot key's estimate did not halve");
+    CHECK(ngx_http_cache_turbo_shm_sketch_estimate(&g_zone, warm) == 1,
+          "P4-1a: the warm key's estimate did not halve");
+    CHECK(ngx_http_cache_turbo_shm_sketch_estimate(&g_zone, hot)
+              > ngx_http_cache_turbo_shm_sketch_estimate(&g_zone, warm),
+          "P4-1a: halving inverted or flattened the frequency ordering");
+}
+
+
+/* The halving must halve BOTH nibbles of a byte independently. A naive
+ * `byte >>= 1` bleeds the high counter's low bit into the high counter's top
+ * bit is fine, but bleeds nothing into the LOW counter's top bit -- except it
+ * does: the high nibble's bit 4 shifts down into the low nibble's bit 3. The
+ * & 0x77 mask is what stops that, and this is the only test that can see it. */
+static void
+test_p4_1a_halving_does_not_bleed_across_nibbles(void)
+{
+    ngx_uint_t  i;
+
+    zone_reset();
+    sketch_attach();
+    g_sh.sketch_reset_at = (ngx_uint_t) -1;   /* age only when we say so */
+
+    /* Low nibble 0, high nibble saturated: byte == 0xf0. A shift without the
+     * mask gives 0x78 -- low nibble 8, conjured out of nothing. */
+    g_sh.sketch[0] = 0xf0;
+
+    /* Trip the halving deterministically. */
+    g_sh.sketch_reset_at = 1;
+    ngx_http_cache_turbo_shm_sketch_bump(&g_zone, 0x5eed0001u);
+
+    CHECK(g_sh.sketch_gen == 1, "P4-1a: fixture failed to trigger a halving");
+
+    /* byte[0]'s two counters are 0 and 15 before, so 0 and 7 after -- unless
+     * a bump happened to land on byte 0, which would add at most 1 to one of
+     * them. Assert the bound that no bleed can satisfy: the low counter
+     * cannot reach 8. */
+    CHECK(ngx_http_cache_turbo_sketch_get(g_sh.sketch, 0) <= 1,
+          "P4-1a: halving bled the high nibble's low bit into the low "
+          "counter -- a never-requested key now reads as warm");
+    CHECK(ngx_http_cache_turbo_sketch_get(g_sh.sketch, 1) >= 7,
+          "P4-1a: halving lost the high nibble's value");
+
+    /* The pass is bounded: no byte anywhere may have a nibble above 7 right
+     * after a halving (bar the at-most-one bump the trip itself performed). */
+    for (i = 0; i < TEST_SKETCH_BYTES; i++) {
+        if ((g_sh.sketch[i] & 0x0f) > 8 || (g_sh.sketch[i] >> 4) > 8) {
+            CHECK(0, "P4-1a: a counter survived halving above the half-ceiling "
+                  "-- the halving pass did not cover the whole array");
+            break;
+        }
+    }
+}
+
+
+/* Independent keys must not shadow each other. A single-row sketch, or a row
+ * hash that ignores the row index (so all four rows collide identically),
+ * would still pass every test above -- this is the one that separates a real
+ * 4-row count-min from four copies of one row. */
+static void
+test_p4_1a_rows_are_independently_positioned(void)
+{
+    uint32_t    h = 0x13579bdfu;
+    ngx_uint_t  row, idx, seen[NGX_HTTP_CACHE_TURBO_SKETCH_ROWS];
+    ngx_uint_t  i, distinct = 0;
+
+    zone_reset();
+    sketch_attach();
+
+    for (row = 0; row < NGX_HTTP_CACHE_TURBO_SKETCH_ROWS; row++) {
+        idx = ngx_http_cache_turbo_sketch_row_hash(h, row)
+              & (g_sh.sketch_width - 1);
+        seen[row] = idx;
+    }
+
+    for (row = 0; row < NGX_HTTP_CACHE_TURBO_SKETCH_ROWS; row++) {
+        for (i = 0; i < row; i++) {
+            if (seen[i] == seen[row]) {
+                break;
+            }
+        }
+        if (i == row) {
+            distinct++;
+        }
+    }
+
+    CHECK(distinct == NGX_HTTP_CACHE_TURBO_SKETCH_ROWS,
+          "P4-1a: the four rows hash one key to the same in-row offset -- "
+          "the min across rows carries no more information than one row");
+}
+
+
 int
 main(void)
 {
@@ -4235,7 +4614,15 @@ main(void)
     test_breaker_second_consult_loses_the_probe();
     test_breaker_only_the_probe_token_closes();
     test_breaker_probe_token_reopens();
+    test_p4_1a_null_sketch_degrades_gracefully();
+    test_p4_1a_saturates_at_fifteen();
+    test_p4_1a_nibbles_are_independent_counters();
+    test_p4_1a_estimate_is_min_across_rows();
+    test_p4_1a_halving_ages_the_sketch();
+    test_p4_1a_halving_does_not_bleed_across_nibbles();
+    test_p4_1a_rows_are_independently_positioned();
     test_blob_alloc_starts_unreferenced_and_attached();
+
     test_blob_detach_defers_free_to_the_last_server();
     test_blob_release_does_not_free_while_still_attached();
     test_blob_multiple_servers_free_exactly_once();
