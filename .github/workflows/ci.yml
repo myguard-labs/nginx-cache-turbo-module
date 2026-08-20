@@ -1,4 +1,4 @@
-# sync-sha: 4aa396dc1051aeb2a184176b4bcadb29135ae609f5b71e7fbad4ba4b7cd4203f
+# sync-sha: b32700caf729ee9d48229309f5fc219ba90f61d51cb629ab054d5c300bdf19c9
 name: CI
 
 # Single entry point for the PR suite. The checks below used to be independent
@@ -111,6 +111,7 @@ jobs:
     outputs:
       asan: ${{ steps.filter.outputs.asan }}
       fuzz: ${{ steps.filter.outputs.fuzz }}
+      code: ${{ steps.filter.outputs.code }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
@@ -129,6 +130,7 @@ jobs:
           if [ -z "${BASE_SHA:-}" ]; then
             echo "asan=true" >> "$GITHUB_OUTPUT"
             echo "fuzz=true" >> "$GITHUB_OUTPUT"
+            echo "code=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           # Fail loudly rather than fail open. A gate that cannot compute its
@@ -155,6 +157,14 @@ jobs:
           else
             echo "fuzz=false" >> "$GITHUB_OUTPUT"
           fi
+          # code: detect changes to code, CI workflows, or tests (anything that
+          # isn't docs-only). gates Build&Test and Security Scanners to skip
+          # on docs-only PRs.
+          if printf '%s\n' "$changed" | grep -qvE '^\.(md|gitignore|github/ISSUE_TEMPLATE/)'; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          fi
 
   # --- lane A: the budget-setting workflow, alone --------------------------
   # A/UBSan's 715s terminal follows its mandatory 185s build. Nothing is
@@ -170,11 +180,18 @@ jobs:
   # --- lane B: Build&Test, alone -------------------------------------------
   # Its 141s build fans out to 703s Runtime and 107s Presets: 844s total, with
   # only 56s headroom against the budget. Nothing independent follows it.
+  #
+  # On docs-only PRs, skip the expensive build/validation/runtime suite via
+  # skip-expensive-jobs=true. The required checks (runtime and prove jobs)
+  # still run but are quick no-ops, so branch protection is satisfied.
   build-test:
     name: Build&Test
+    needs: changes
     permissions:
       contents: read
     uses: ./.github/workflows/build-test.yml
+    with:
+      skip-expensive-jobs: ${{ needs.changes.outputs.code == 'false' }}
 
   # --- lane C: Fuzzing, and Security Scanners BESIDE it, not behind it -----
   # Current measurements are 671s and 210s. Chaining them would take 881s and
@@ -193,17 +210,15 @@ jobs:
       contents: read
     uses: ./.github/workflows/fuzzing.yml
 
-  # Scanners run on EVERY PR -- unlike asan/fuzzing they are not path-gated,
-  # because a scanner finding can come from any file (workflow YAML, scripts,
-  # docs with embedded commands), not only from src/. `needs: changes` is kept
-  # solely to inherit that job's fail-closed behaviour: `changes` exits 1 rather
-  # than fail open when it cannot compute its diff, and the explicit
-  # `result == 'success'` test means a run whose gate never produced a verdict
-  # does not silently scan anyway. A bare `!cancelled()` would lose that.
+  # Scanners gate on code changes only: on docs-only PRs, skip the security
+  # scanning (expensive). `needs: changes` is kept to inherit that job's
+  # fail-closed behaviour: `changes` exits 1 rather than fail open when it
+  # cannot compute its diff, and the explicit `result == 'success'` test means
+  # a run whose gate never produced a verdict does not silently scan anyway.
   security-scanners:
     name: Security Scanners
     needs: changes
-    if: ${{ !cancelled() && needs.changes.result == 'success' }}
+    if: ${{ needs.changes.outputs.code == 'true' && needs.changes.result == 'success' }}
     permissions:
       contents: read
     uses: ./.github/workflows/security-scanners.yml

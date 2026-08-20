@@ -1,4 +1,4 @@
-# sync-sha: 902cf3dabcfdae72783345f4a6cdde6aa8eafd314d8680746fdc61c095b67139
+# sync-sha: 82f1538b5995ca566dc14e94d6e01e6cdf47307a876a23a44c8f9960e96cc561
 name: Build & Test
 
 # Runner labels live in the POOL repository variable. Every checked-in selector
@@ -8,7 +8,13 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 on:
-  workflow_call: {}
+  workflow_call:
+    inputs:
+      skip-expensive-jobs:
+        description: "Skip expensive jobs (validation, build) on docs-only changes; required checks (runtime, prove) still run as quick no-ops"
+        required: false
+        type: boolean
+        default: false
   workflow_dispatch: {}
 
 concurrency:
@@ -21,6 +27,7 @@ permissions:
 jobs:
   validation:
     name: Validation
+    if: ${{ !inputs.skip-expensive-jobs }}
     runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 15
     steps:
@@ -169,6 +176,7 @@ jobs:
 
   build:
     name: Build
+    if: ${{ !inputs.skip-expensive-jobs }}
     runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 30
     steps:
@@ -282,7 +290,11 @@ jobs:
     name: Runtime
     runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 20
+    # REQUIRED CHECK: always report this check, but run full suite only when
+    # code changed. When docs-only, skip and report quick success.
+    # Always needs build, but build will be skipped if skip-expensive-jobs=true.
     needs: build
+    if: ${{ !cancelled() }}
     # AUD-CIPORT1: own 64-wide port band so this job's fixtures cannot be
     # swept/collided by another runtime-bearing job on the same self-hosted
     # runner (asan.yml / ci-deep.yml). Every job below carries a DISTINCT
@@ -296,18 +308,25 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: "Docs-only skip: report success"
+        if: ${{ inputs.skip-expensive-jobs }}
+        run: echo "Skipped on docs-only changes; required check reports success"
+
       - name: Download nginx artifact
+        if: ${{ !inputs.skip-expensive-jobs }}
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           name: nginx-mainline
           path: nginx-bin
 
       - name: Install runtime dependencies
+        if: ${{ !inputs.skip-expensive-jobs }}
         run: |
           sudo apt-get update
           sudo apt-get install -y redis-server memcached
 
       - name: Sweep stale test listeners
+        if: ${{ !inputs.skip-expensive-jobs }}
         run: |
           # Kill leftovers from earlier crashed runs still holding test
           # ports in THIS job's own band (cross-repo collisions on shared
@@ -320,9 +339,11 @@ jobs:
           sleep 1
 
       - name: Verify runtime port band
+        if: ${{ !inputs.skip-expensive-jobs }}
         run: ci/tools/max-port.sh "$TEST_BASE_PORT"
 
       - name: Run runtime suite
+        if: ${{ !inputs.skip-expensive-jobs }}
         # Wrapped in ci-hang-guard.sh, same pattern as asan.yml: 749s worst-observed
         # on a runner shared with 4 sibling jobs leaves too little headroom to trust
         # a bare job timeout, and this job is not the critical path (A/UBSan is), so
@@ -354,13 +375,18 @@ jobs:
             '
 
       - name: Assert the requested fixture set actually came up (AUD-TESTFIX1)
+        if: ${{ !inputs.skip-expensive-jobs }}
         run: bash ci/tools/assert-fixtures.sh runtime-suite.log
 
   prove:
     name: Preset suite (Test::Nginx)
     runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 15
+    # REQUIRED CHECK: always report this check, but run full suite only when
+    # code changed. When docs-only, skip and report quick success.
+    # Always needs build, but build will be skipped if skip-expensive-jobs=true.
     needs: build
+    if: ${{ !cancelled() }}
     # AUD-CIPORT1: own 64-wide band, same rule as the runtime job above -- the
     # band is what the sweep step below clears, and what keeps this job off a
     # sibling job's ports.
@@ -378,13 +404,19 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: "Docs-only skip: report success"
+        if: ${{ inputs.skip-expensive-jobs }}
+        run: echo "Skipped on docs-only changes; required check reports success"
+
       - name: Download nginx artifact
+        if: ${{ !inputs.skip-expensive-jobs }}
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           name: nginx-mainline
           path: nginx-bin
 
       - name: Install Test::Nginx
+        if: ${{ !inputs.skip-expensive-jobs }}
         run: |
           # Test::Nginx::Socket is the openresty harness (NOT nginx.org's
           # Test::Nginx). cpanminus pulls its dependency tree; the runner may
@@ -395,6 +427,7 @@ jobs:
           perl -MTest::Nginx::Socket -e1 2>/dev/null || sudo cpanm --notest Test::Nginx
 
       - name: Sweep stale test listeners
+        if: ${{ !inputs.skip-expensive-jobs }}
         run: |
           # Same band-scoped sweep as the runtime job -- never widen past the
           # band edge or it kills a sibling job's live fixtures (AUD-CIPORT1).
@@ -433,6 +466,7 @@ jobs:
       # before changing either half. Observed as run 32075040354: 278 preset
       # assertions passed and the job still failed on bind(0.0.0.0:34782).
       - name: Fence sibling port bands off from RANDOMIZE
+        if: ${{ !inputs.skip-expensive-jobs }}
         run: |
           python3 - <<'PY' &
           import socket, time
@@ -461,6 +495,7 @@ jobs:
           sleep 2
 
       - name: Run the preset suite
+        if: ${{ !inputs.skip-expensive-jobs }}
         env:
           TEST_NGINX_BINARY: ${{ github.workspace }}/nginx-bin/nginx
           TEST_NGINX_LOAD_MODULES: ${{ github.workspace }}/nginx-bin/ngx_http_cache_turbo_module.so
