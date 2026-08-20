@@ -45,6 +45,45 @@ static ngx_http_output_header_filter_pt  ngx_http_next_header_filter;
 static ngx_http_output_body_filter_pt    ngx_http_next_body_filter;
 
 
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+/* COR-5(b): does this request ask for its variant-index write to be dropped?
+ * Only consulted when cache_turbo_test_varidx_fail is on, so an unarmed
+ * location ignores the header entirely. */
+static ngx_uint_t
+ngx_http_cache_turbo_test_varidx_drop_requested(ngx_http_request_t *r)
+{
+    ngx_list_part_t  *part = &r->headers_in.headers.part;
+    ngx_table_elt_t  *h = part->elts;
+    ngx_uint_t        i;
+
+    for (i = 0; /* void */; i++) {
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            h = part->elts;
+            i = 0;
+        }
+
+        if (h[i].key.len == sizeof("X-Cache-Turbo-Test-Varidx-Drop") - 1
+            && ngx_strncasecmp(h[i].key.data,
+                   (u_char *) "X-Cache-Turbo-Test-Varidx-Drop",
+                   sizeof("X-Cache-Turbo-Test-Varidx-Drop") - 1) == 0
+            && h[i].value.len == 1 && h[i].value.data[0] == '1')
+        {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+
+#endif
+
+
 /* Stamp the TEST_FAULTS-only observability headers onto this response.
  *
  * `has_ctx` distinguishes the two call sites: the ctx==NULL/served early-return
@@ -66,6 +105,7 @@ ngx_http_cache_turbo_header_filter_test_headers(ngx_http_request_t *r,
     (void) ngx_http_cache_turbo_test_backoff_header(r);
     (void) ngx_http_cache_turbo_test_arg_scan_header(r);
     (void) ngx_http_cache_turbo_test_cookie_scan_header(r);
+    (void) ngx_http_cache_turbo_test_varidx_header(r);
 #else
     (void) r;
     (void) has_ctx;
@@ -1908,13 +1948,60 @@ ngx_http_cache_turbo_body_filter_store_tail(ngx_http_request_t *r,
          * (memcached has no sets => tag_add NULL; its variants are
          * invalidated by the L1-only generation bump + TTL instead). */
         if (clcf->backend && clcf->backend->tag_add) {
-            u_char  vname[1 + 64];
-            size_t  vlen;
+            u_char     vname[1 + 64];
+            size_t     vlen;
+            ngx_int_t  varidx_rc;
 
             vlen = ngx_http_cache_turbo_variant_index_name(
                        &ctx->cache_key, vname);
-            clcf->backend->tag_add(clcf, store_key, vname, vlen,
-                                   retain_ttl);
+
+            /* COR-5(b): the SADD is fire-and-forget, but "handed to the
+             * transport" and "dropped before the wire" are NOT the same
+             * outcome and used to be indistinguishable here. A drop (armed
+             * S231 connect-backoff, failed connect, alloc failure) leaves the
+             * object in L1 while the per-base index set does not list it, so
+             * a later PURGE of the base -- which enumerates that set with
+             * SMEMBERS -- reports success and keeps serving this variant
+             * stale until its own TTL.
+             *
+             * Arm the node's self-heal bit instead: the next L1 hit on this
+             * variant re-issues the SADD (access_l1). Still no blocking
+             * round trip on the store path -- tag_add returns the moment the
+             * op reaches, or fails to reach, the transport. */
+
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+            /* COR-5(b) fault injection: stand in for redis_launch() refusing
+             * this write. The call is SKIPPED, not called-then-overridden --
+             * issuing the SADD and merely reporting failure would leave the
+             * index already correct and make the self-heal assertion vacuous
+             * (the purge would enumerate both variants with the re-issue
+             * compiled out). This is the arm the mutation test flips.
+             * Armed per REQUEST via X-Cache-Turbo-Test-Varidx-Drop: 1 so the
+             * 4-worker runner cannot smear the fault across variants. */
+            if (clcf->test_varidx_fail
+                && ngx_http_cache_turbo_test_varidx_drop_requested(r))
+            {
+                varidx_rc = NGX_ERROR;
+            } else
+#endif
+            {
+                varidx_rc = clcf->backend->tag_add(clcf, store_key, vname,
+                                                   vlen, retain_ttl);
+            }
+
+            if (varidx_rc != NGX_OK) {
+                ngx_http_cache_turbo_shm_varidx_pending_set(z, store_key,
+                                                            hash, 1);
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+                (void) ngx_atomic_fetch_add(&z->sh->varidx_drops, 1);
+#endif
+                ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                    "cache_turbo: auto-vary variant index write dropped "
+                    "for \"%V\" (L2 unreachable); queued for re-issue on "
+                    "the next hit", &r->uri);
+            }
         }
     }
 

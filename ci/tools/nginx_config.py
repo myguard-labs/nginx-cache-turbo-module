@@ -609,6 +609,33 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # COR-5(b) variant-index self-heal. Same shape as /cor5/ above, with
+        # one difference: cache_turbo_test_varidx_fail arms a PER-REQUEST
+        # fault -- a request carrying X-Cache-Turbo-Test-Varidx-Drop: 1 has
+        # its variant-index SADD skipped, and the store site sees the
+        # redis_launch() NGX_ERROR an armed S231 connect-backoff window
+        # produces. Per-request rather than a per-worker countdown because the
+        # runner uses 4 workers with no affinity, so a countdown could not say
+        # WHICH variant lost its index entry. Redis itself stays UP, so the
+        # object and the base marker are both written normally -- only the
+        # index entry for that one variant is missing, which is exactly the
+        # PR #379 CI signature. The node is marked varidx_pending; a
+        # subsequent HIT on that variant re-issues the SADD, after which a
+        # PURGE of the base must enumerate BOTH variants.
+        #
+        # Its own redis prefix (cv:) so the injected drop cannot perturb the
+        # ct:tag:* sets other L2 tests assert exact counts on.
+        location /cor5sh/ {{
+            cache_turbo          main;
+            cache_turbo_key      $request_uri;
+            cache_turbo_valid    30s;
+            cache_turbo_auto_vary on;
+            cache_turbo_purge    on;
+            cache_turbo_redis    127.0.0.1:{redis_port} prefix=cv: timeout=250ms;
+            cache_turbo_test_varidx_fail on;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # cross-node dogpile (v4-2): fresh TTL 2s -> stale_until = valid*4 = 8s,
         # a wide window so both lock tests have timing slack; aggressive beta so
         # a stale read reliably rolls a refresh; lock_ttl 5s = the Redis SET NX

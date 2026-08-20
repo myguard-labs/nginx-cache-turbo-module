@@ -512,6 +512,16 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       offsetof(ngx_http_cache_turbo_loc_conf_t, test_force_file_buf),
       NULL },
 
+    /* COR-5(b): arm the per-request variant-index drop. See the
+     * test_varidx_fail field comment for why the trigger is a request header
+     * and not "take Redis down". */
+    { ngx_string("cache_turbo_test_varidx_fail"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_turbo_loc_conf_t, test_varidx_fail),
+      NULL },
+
     { ngx_string("cache_turbo_test_store_fail"),
       NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_FLAG,
       ngx_conf_set_flag_slot,
@@ -1864,6 +1874,66 @@ ngx_http_cache_turbo_test_backoff_header(ngx_http_request_t *r)
 #endif
 
     return NGX_OK;
+}
+
+
+/* COR-5(b): report the zone's auto-Vary variant-index self-heal counters as
+ * "drops=<n>,reissues=<n>". See the sh->varidx_drops field comment for why
+ * these are two ZONE-scoped counters rather than one process-global one.
+ * Compiles to a no-op returning NGX_OK outside a TEST_FAULTS build. */
+ngx_int_t
+ngx_http_cache_turbo_test_varidx_header(ngx_http_request_t *r)
+{
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+    ngx_http_cache_turbo_loc_conf_t  *clcf;
+    ngx_http_cache_turbo_zone_t      *z;
+    ngx_table_elt_t                  *h;
+    u_char                           *v;
+    size_t                            vlen;
+
+    static u_char  name[] = "X-Cache-Turbo-Test-Varidx";
+
+    clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
+
+    if (clcf->shm_zone == NULL) {
+        return NGX_DECLINED;
+    }
+
+    z = clcf->shm_zone->data;
+    if (z == NULL || z->sh == NULL) {
+        return NGX_DECLINED;
+    }
+
+    v = ngx_pnalloc(r->pool,
+                    sizeof("drops=,reissues=") - 1 + 2 * NGX_ATOMIC_T_LEN);
+    if (v == NULL) {
+        return NGX_ERROR;
+    }
+
+    vlen = ngx_sprintf(v, "drops=%uA,reissues=%uA",
+                       ngx_atomic_fetch_add(&z->sh->varidx_drops, 0),
+                       ngx_atomic_fetch_add(&z->sh->varidx_reissues, 0)) - v;
+
+    h = ngx_list_push(&r->headers_out.headers);
+    if (h == NULL) {
+        return NGX_ERROR;
+    }
+
+    h->hash = 1;
+    h->key.len = sizeof("X-Cache-Turbo-Test-Varidx") - 1;
+    h->key.data = name;
+    h->value.len = vlen;
+    h->value.data = v;
+#if (nginx_version >= 1023000)
+    h->next = NULL;
+#endif
+
+    return NGX_OK;
+#else
+    (void) r;
+    return NGX_OK;
+#endif
 }
 
 
@@ -3669,6 +3739,7 @@ ngx_http_cache_turbo_sie_rewrite(ngx_http_request_t *r,
     (void) ngx_http_cache_turbo_test_backoff_header(r);
     (void) ngx_http_cache_turbo_test_arg_scan_header(r);
     (void) ngx_http_cache_turbo_test_cookie_scan_header(r);
+    (void) ngx_http_cache_turbo_test_varidx_header(r);
 #endif
 
     ctx->sie_body = body;
@@ -4876,6 +4947,7 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->test_restore_alloc_fail = NGX_CONF_UNSET;
     conf->test_force_file_buf = NGX_CONF_UNSET;
     conf->test_store_fail = NGX_CONF_UNSET;
+    conf->test_varidx_fail = NGX_CONF_UNSET;
     conf->test_scan_max_pages = NGX_CONF_UNSET;
     conf->test_scan_page_hold_ms = NGX_CONF_UNSET;
     conf->test_l2_promote_hold_ms = NGX_CONF_UNSET;

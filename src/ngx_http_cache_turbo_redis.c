@@ -1468,7 +1468,7 @@ ngx_http_cache_turbo_redis_tagkey(ngx_str_t *prefix, u_char *name,
  * Fire-and-forget (read_drain, no request parked on the reply), so a batched
  * failure degrades exactly as a single-tag failure did: the tag index misses
  * this object and a later purge of that tag does not invalidate it. */
-void
+ngx_int_t
 ngx_http_cache_turbo_redis_tag_add_many(ngx_http_cache_turbo_loc_conf_t *clcf,
     u_char *key_hash, ngx_str_t *names, ngx_uint_t nnames, time_t ttl)
 {
@@ -1481,7 +1481,9 @@ ngx_http_cache_turbo_redis_tag_add_many(ngx_http_cache_turbo_loc_conf_t *clcf,
     ngx_buf_t                        *cmds[NGX_HTTP_CACHE_TURBO_MAX_TAGS * 3];
 
     if (!clcf->redis_enable || ttl <= 0 || nnames == 0) {
-        return;
+        /* Nothing to index and nothing dropped -- an L2-less or empty call is
+         * not a lost index write, so it must NOT arm the COR-5 self-heal. */
+        return NGX_OK;
     }
 
     /* Defensive: the caller's dedup array is MAX_TAGS-bound, and cmds[] above
@@ -1493,7 +1495,7 @@ ngx_http_cache_turbo_redis_tag_add_many(ngx_http_cache_turbo_loc_conf_t *clcf,
 
     op = ngx_http_cache_turbo_redis_op_create(clcf);
     if (op == NULL) {
-        return;
+        return NGX_ERROR;
     }
 
     /* The object's L2 key and the TTL text are identical for every tag in the
@@ -1502,7 +1504,7 @@ ngx_http_cache_turbo_redis_tag_add_many(ngx_http_cache_turbo_loc_conf_t *clcf,
     ttlbuf = ngx_pnalloc(op->pool, NGX_INT64_LEN);
     if (member == NULL || ttlbuf == NULL) {
         ngx_destroy_pool(op->pool);
-        return;
+        return NGX_ERROR;
     }
 
     argv[2].data = member;
@@ -1521,7 +1523,7 @@ ngx_http_cache_turbo_redis_tag_add_many(ngx_http_cache_turbo_loc_conf_t *clcf,
                              + sizeof("tag:") - 1 + names[i].len);
         if (tagkey == NULL) {
             ngx_destroy_pool(op->pool);
-            return;
+            return NGX_ERROR;
         }
 
         klen = ngx_http_cache_turbo_redis_tagkey(&clcf->redis_prefix,
@@ -1566,7 +1568,7 @@ ngx_http_cache_turbo_redis_tag_add_many(ngx_http_cache_turbo_loc_conf_t *clcf,
 
         if (sadd == NULL || exp_nx == NULL || exp_gt == NULL) {
             ngx_destroy_pool(op->pool);
-            return;
+            return NGX_ERROR;
         }
 
         /* argv[2] is reused as the TTL text by the EXPIREs above, so restore
@@ -1585,14 +1587,14 @@ ngx_http_cache_turbo_redis_tag_add_many(ngx_http_cache_turbo_loc_conf_t *clcf,
 
     if (nqueued == 0) {                    /* every name was empty */
         ngx_destroy_pool(op->pool);
-        return;
+        return NGX_OK;                     /* nothing to send, nothing lost */
     }
 
     /* Pipeline every queued command into one buffer (one round trip). */
     op->send = ngx_create_temp_buf(op->pool, total);
     if (op->send == NULL) {
         ngx_destroy_pool(op->pool);
-        return;
+        return NGX_ERROR;
     }
     for (i = 0; i < nqueued; i++) {
         size_t  n = (size_t) (cmds[i]->last - cmds[i]->pos);
@@ -1606,26 +1608,30 @@ ngx_http_cache_turbo_redis_tag_add_many(ngx_http_cache_turbo_loc_conf_t *clcf,
             ngx_http_cache_turbo_redis_read_drain) != NGX_OK)
     {
         ngx_destroy_pool(op->pool);
+        return NGX_ERROR;
     }
+
+    return NGX_OK;
 }
 
 
 /* Single-tag entry point, preserved for the auto-vary variant-index store
  * (one tag, nothing to batch) and any other one-shot caller. */
-void
+ngx_int_t
 ngx_http_cache_turbo_redis_tag_add(ngx_http_cache_turbo_loc_conf_t *clcf,
     u_char *key_hash, u_char *name, size_t name_len, time_t ttl)
 {
     ngx_str_t  one;
 
     if (name_len == 0) {
-        return;
+        return NGX_OK;                     /* nothing asked for, nothing lost */
     }
 
     one.data = name;
     one.len = name_len;
 
-    ngx_http_cache_turbo_redis_tag_add_many(clcf, key_hash, &one, 1, ttl);
+    return ngx_http_cache_turbo_redis_tag_add_many(clcf, key_hash, &one, 1,
+                                                   ttl);
 }
 
 

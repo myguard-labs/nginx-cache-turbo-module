@@ -756,6 +756,80 @@ ngx_http_cache_turbo_access_l1_req_bounds(ngx_http_request_t *r,
 
 
 
+/* COR-5(b): re-issue an auto-Vary variant-index SADD that was dropped before
+ * the wire at store time (see ngx_http_cache_turbo_node_t.varidx_pending).
+ *
+ * ⚠ MUST be called with z->shpool->mutex NOT held. access_l1() only CONSUMES
+ * the node bit under the mutex and records it in ctx->varidx_reissue; the
+ * actual re-issue allocates a pool and may connect(), so every terminal arm
+ * calls this after its own unlock.
+ *
+ * Still fire-and-forget and still off the blocking path: tag_add() returns as
+ * soon as the op is handed to (or refused by) the transport, so a HIT never
+ * waits on Redis. If the re-issue is dropped AGAIN the bit is put back, and
+ * the next hit retries -- during an outage the S231 backoff check short-
+ * circuits before any connect(), so a retry costs a function call.
+ *
+ * ctx->cache_key is the BASE key on every path that reaches here (build_key()
+ * resets it each entry and only key_hash is ever rewritten to the variant),
+ * which is exactly what variant_index_name() must digest, and ctx->key_hash
+ * is the variant's L2 key -- the same pair the store site used. */
+static void
+ngx_http_cache_turbo_varidx_reissue(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx,
+    ngx_http_cache_turbo_zone_t *z, uint32_t hash)
+{
+    u_char  vname[1 + 64];
+    size_t  vlen;
+    time_t  ttl;
+
+    if (!ctx->varidx_reissue) {
+        return;
+    }
+
+    ctx->varidx_reissue = 0;               /* consume: one detection, one try */
+
+    if (clcf->backend == NULL || clcf->backend->tag_add == NULL) {
+        return;
+    }
+
+    /* TTL = the node's OWN remaining physical retention, captured with the
+     * pending bit under the mutex (ctx->varidx_reissue_ttl). The index entry
+     * must outlive the body it names -- an index that expires first re-opens
+     * the exact hole this heals -- and the set's TTL only ever GROWS
+     * (EXPIRE NX/GT, COR-8), so this can never shorten a set seeded by some
+     * other variant. A node with no expiry (stale_until == 0) falls back to
+     * the location's stale-window default, since an unbounded index set is
+     * not an option. */
+    ttl = ctx->varidx_reissue_ttl;
+    if (ttl <= 0) {
+        ttl = ngx_http_cache_turbo_stale_ttl(clcf->valid, clcf->stale_mult);
+    }
+    if (ttl <= 0) {
+        ttl = 1;
+    }
+
+    vlen = ngx_http_cache_turbo_variant_index_name(&ctx->cache_key, vname);
+
+    if (clcf->backend->tag_add(clcf, ctx->key_hash, vname, vlen, ttl)
+        != NGX_OK)
+    {
+        /* Dropped again -- re-arm so a later hit retries. */
+        ngx_http_cache_turbo_shm_varidx_pending_set(z, ctx->key_hash, hash, 1);
+        return;
+    }
+
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+    (void) ngx_atomic_fetch_add(&z->sh->varidx_reissues, 1);
+#endif
+
+    ngx_log_error(NGX_LOG_NOTICE, r->connection->log, 0,
+        "cache_turbo: auto-vary variant index re-issued for \"%V\" "
+        "after an earlier dropped write", &r->uri);
+}
+
+
 /* MAINT-H4d phase helper for ngx_http_cache_turbo_access_l1().
  * PHASE -- the fresh-HIT serve arm (S232-BYPASS-STALE already routed
  * ctx->brk_only away before the caller reaches here).
@@ -769,9 +843,9 @@ ngx_http_cache_turbo_access_l1_req_bounds(ngx_http_request_t *r,
  * touch the mutex or `ctn` again after this returns. */
 static ngx_int_t
 ngx_http_cache_turbo_access_l1_serve_fresh(ngx_http_request_t *r,
-    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_zone_t *z,
-    ngx_http_cache_turbo_node_t *ctn, time_t now, uint32_t hash,
-    ngx_int_t *out_rc)
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx,
+    ngx_http_cache_turbo_zone_t *z, ngx_http_cache_turbo_node_t *ctn,
+    time_t now, uint32_t hash, ngx_int_t *out_rc)
 {
     /* PERF-7 fresh hit: serve the blob DIRECTLY out of shm (zero-copy).
      * Pin it with a reference under the mutex we already hold; the serve
@@ -791,6 +865,15 @@ ngx_http_cache_turbo_access_l1_serve_fresh(ngx_http_request_t *r,
     ngx_http_cache_turbo_shm_touch_lru(z, ctn, now,
                                        clcf->scan_resistant_pct);
     ngx_shmtx_unlock(&z->shpool->mutex);
+
+    /* COR-5(b): re-issue a dropped variant-index write here -- mutex just
+     * released, and still BEFORE serve(). Must not be deferred past serve():
+     * serve() finalizes the request, and an op launched after that races the
+     * request teardown that closes the connection its posted write event
+     * belongs to, so the SADD is queued and then dropped on the floor
+     * (observed: reissues counter moved, SMEMBERS still had one member). */
+    ngx_http_cache_turbo_varidx_reissue(r, clcf, ctx, z, hash);
+
     (void) ngx_atomic_fetch_add(&z->sh->hits, 1);
     ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "cache_turbo: L1 HIT (fresh) \"%V\" key=%ui len=%uz",
@@ -1280,6 +1363,20 @@ ngx_http_cache_turbo_access_l1(ngx_http_request_t *r,
 
     ctn = clcf->l1->lookup(z, ctx->key_hash, hash);
 
+    /* COR-5(b): consume this node's dropped-index flag while we already hold
+     * the mutex for the lookup above -- no extra acquisition, and the clear is
+     * atomic with the read so two concurrent hits cannot both re-issue. The
+     * re-issue itself happens AFTER each arm's unlock (see
+     * ngx_http_cache_turbo_varidx_reissue); the retention is copied out by
+     * value here because `ctn` must not be touched once the lock is gone. */
+    if (ctn != NULL && ctn->varidx_pending) {
+        ctn->varidx_pending = 0;
+        ctx->varidx_reissue = 1;
+        ctx->varidx_reissue_ttl = ctn->stale_until > 0
+                                  ? ctn->stale_until - ngx_time()
+                                  : 0;
+    }
+
     if (ctn != NULL) {
         time_t     now = ngx_time();
         time_t     fresh_until = ctn->fresh_until;
@@ -1319,16 +1416,30 @@ ngx_http_cache_turbo_access_l1(ngx_http_request_t *r,
                            "never a hit", &r->uri);
 
         } else if (now < fresh_until && fresh_ok) {
-            return ngx_http_cache_turbo_access_l1_serve_fresh(r, clcf, z,
-                ctn, now, hash, out_rc);
+            /* serve_fresh() runs the COR-5(b) re-issue itself, immediately
+             * after its own unlock and before it serves. */
+            return ngx_http_cache_turbo_access_l1_serve_fresh(r, clcf, ctx,
+                z, ctn, now, hash, out_rc);
         }
 
         if (!ctx->brk_only
             && (stale_until == 0 || now < stale_until) && ctn->len > 0
             && stale_ok)
         {
-            return ngx_http_cache_turbo_access_l1_serve_stale(r, clcf, ctx,
-                z, ctn, now, fresh_until, hash, out_rc);
+            /* COR-5(b): the stale arm is NOT a re-issue site. It has many
+             * unlock paths and one of them PARKS the request on an L2 lock,
+             * so there is no single point that is both past the unlock and
+             * before the serve/park. Put the bit back instead (still under
+             * this arm's lock -- serve_stale() has not unlocked yet) and let
+             * the next fresh hit, or the next fall-through to L2, heal it.
+             * Never dropping the bit is what makes deferring safe. */
+            if (ctx->varidx_reissue) {
+                ctx->varidx_reissue = 0;
+                ctn->varidx_pending = 1;
+            }
+
+            return ngx_http_cache_turbo_access_l1_serve_stale(r, clcf,
+                ctx, z, ctn, now, fresh_until, hash, out_rc);
         }
 
         /* expired: the L1 copy is past its stale window. Fall through to the
@@ -1359,6 +1470,12 @@ ngx_http_cache_turbo_access_l1(ngx_http_request_t *r,
      * async but logically synchronous — it parks the request and resumes it
      * when the reply lands (see ngx_http_cache_turbo_redis_get). */
     ngx_shmtx_unlock(&z->shpool->mutex);
+
+    /* COR-5(b): the expired-entry arm falls through to L2 rather than
+     * serving, but the node it just passed over is still resident and still
+     * missing from the index set -- heal it here too, now that the mutex is
+     * released. A no-op when nothing was pending. */
+    ngx_http_cache_turbo_varidx_reissue(r, clcf, ctx, z, hash);
 
     *hashp = hash;
     return NGX_DECLINED;

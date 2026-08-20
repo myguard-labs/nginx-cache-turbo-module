@@ -407,6 +407,10 @@ def run_all(ng: Nginx, origin: Origin,
         test_l2_tag_cap_and_dedup(ng, origin, redis)  # PERF-2 tag cap/dedup
         test_l2_tag_add_batched_one_op(ng, origin, redis)  # L9 one op for N tags
         test_cor5_redis_variant_purge(ng, origin, redis)  # COR-5 variant index
+        # COR-5(b): a variant-index write dropped before the wire self-heals
+        # on a later hit. Runs AFTER the plain COR-5 test, which is the
+        # symptom detector for the same defect and must keep its own fixture.
+        test_cor5_varidx_selfheal_after_dropped_index_write(ng, origin, redis)
         test_l2_vary_marker_cold_node_finds_peer_variant(ng, origin, redis)  # P3-5
         test_multinode_lock(ng, origin, redis)
         test_cross_node_won_stale_body(ng, origin, redis)  # S231-PERF-BGSNAP

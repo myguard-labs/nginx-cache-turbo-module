@@ -907,6 +907,8 @@ ngx_http_cache_turbo_merge_cc_and_bypass(
                          prev->test_force_file_buf, 0);
     ngx_conf_merge_value(conf->test_store_fail,
                          prev->test_store_fail, 0);
+    ngx_conf_merge_value(conf->test_varidx_fail,
+                         prev->test_varidx_fail, 0);
     ngx_conf_merge_value(conf->test_scan_max_pages,
                          prev->test_scan_max_pages, 0);
     ngx_conf_merge_value(conf->test_scan_page_hold_ms,
