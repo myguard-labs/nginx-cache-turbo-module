@@ -1894,12 +1894,13 @@ http {
 > 403/404/429 are deliberately excluded) opens the breaker for all of them.
 >
 > 2. **Conversely, healthy traffic from one backend can mask a failure in another.**
-> A single upstream with an outage contributes only one or two 5xx responses per
-> window if the breaker threshold is 3. If that backend shares a zone with a busy
-> backend that is healthy, the healthy traffic keeps diluting the failure count
-> below the trip threshold — the breaker may fail to open even when one of the
-> backends is down, because the count is spread across the zone rather than
-> accumulating per backend.
+> The trip test is *consecutive* failures within the rolling
+> `cache_turbo_breaker_window` (default `5` failures over `10s`). When a failing
+> upstream shares a zone with a busy healthy one, the healthy responses are
+> interleaved into the same shared counter and keep resetting the run, so the
+> failing backend may never accumulate an unbroken sequence long enough to trip
+> — the breaker can fail to open even though one backend is down, because the
+> count is spread across the zone rather than accumulating per backend.
 >
 > **Recommendation: use one `cache_turbo_zone` per upstream.** The zone memory is
 > free — nginx zones scale to hundreds without overhead — and per-upstream zones
