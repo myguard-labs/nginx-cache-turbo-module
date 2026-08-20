@@ -1584,18 +1584,24 @@ def test_rfc1_request_max_stale(ng: Nginx, origin: Origin) -> None:
     has a 1s TTL. A fixed `time.sleep(1.5)` measures elapsed time from the
     TEST's clock, not from when the server actually saw the prime request --
     on a loaded runner the prime itself can take non-trivial wall-clock time,
-    shrinking the real margin to well under 0.5s. Anchor an ABSOLUTE deadline
-    to the moment the prime response is observed instead, and poll past it
-    with wait_for() so runner slowdown cannot move the test across the TTL
-    boundary. The primary oracle is the ORIGIN HIT COUNT (did the request
-    actually reach the origin to revalidate), not the x-cache header alone --
-    a re-primed entry can also read back as a fresh HIT with age=0, which is
-    indistinguishable from "still fresh" if x-cache is the only signal."""
+    shrinking the real margin to well under 0.5s. Anchor the wait to the
+    moment the prime response is OBSERVED, and wait past the TTL by a
+    generous fixed SLACK on top of it -- not just past the TTL itself -- so
+    that skew between "server started the TTL clock" and "client observed
+    the response" cannot eat the whole margin the way it did before. This is
+    a plain sleep (there is no system state to poll here: staleness is not
+    independently observable from outside except by making the very request
+    that then IS the assertion), so it is written as one rather than dressed
+    up as wait_for(). The primary oracle is the ORIGIN HIT COUNT (did the
+    request actually reach the origin to revalidate), not the x-cache header
+    alone -- a re-primed entry can also read back as a fresh HIT with age=0,
+    which is indistinguishable from "still fresh" if x-cache is the only
+    signal."""
     fetch_raw(ng.port, "/condst/cond-ms")                          # prime, fresh 1s
-    stale_deadline = time.time() + 1.0                             # TTL is 1s
-    assert wait_for(lambda: time.time() >= stale_deadline,
-                     timeout=5.0, interval=0.05), \
-        "harness bug: wait_for did not reach its own deadline"
+    ttl = 1.0
+    slack = 0.75                    # generous margin: a long wait is cheap,
+                                     # a flake is not -- see TTL-REVAL-RACE
+    time.sleep((ttl + slack) * sanitizer_time_scale())
     before = origin.hits_for("/cond-ms")
     # max-stale present -> accept the stale copy (beta 1, no refresh)
     s0, b0, h0 = fetch_raw(ng.port, "/condst/cond-ms",
