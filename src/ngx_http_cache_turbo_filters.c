@@ -177,6 +177,57 @@ ngx_http_cache_turbo_header_filter_record_breaker(ngx_http_request_t *r,
             (void) ngx_atomic_fetch_add(&bz->sh->origin_failures, 1);
         }
 
+        /* P5-5r: OPT-IN (cache_turbo_breaker_count_retries, default off --
+         * see the field comment on breaker_count_retries in the .h). Off,
+         * only the single shm_breaker_record() call below the loop ever
+         * runs, exactly as before this change. On, every
+         * proxy_next_upstream peer attempt that failed before this final
+         * one ALSO counts as a failure, one shm_breaker_record() call each,
+         * BEFORE this response's own final outcome is recorded.
+         *
+         * ⚠ ORDER IS LOAD-BEARING, and the reach of this feature is bounded
+         * by it: shm_breaker_record()'s success branch (shm.c) zeroes
+         * breaker_fails UNCONDITIONALLY on any success, not only while
+         * CLOSED -- "a success clears the failure run" is the breaker's
+         * own, pre-existing, protected invariant, not something this item
+         * may change. That means retry failures recorded here can only
+         * ever survive to reach threshold WITHIN this same request's own
+         * calls, before this response's own final-outcome record() call
+         * (below) runs and, if the final attempt succeeded, wipes them.
+         * They do NOT accumulate across separate requests that each
+         * individually succeed: request N's own trailing success always
+         * clears whatever request N-1's retries added. Recording retries
+         * FIRST is what lets THIS SINGLE request's own retry chain --
+         * enough failed peer attempts before its own final success -- push
+         * the counter to threshold and trip CLOSED -> OPEN mid-call; once
+         * OPEN, the trailing final-outcome call's success branch no longer
+         * has a CLOSED-state or matching-probe HALF_OPEN edge to act on, so
+         * it only re-zeroes breaker_fails (state stays OPEN, harmless).
+         * Recording them AFTER the final call instead would have that
+         * SAME final call's own success wipe every retry failure before it
+         * could ever be counted, defeating the feature outright -- see
+         * ci/t/core/breaker-retry-count.t for the empirical trace that
+         * found this. A half-dead group that spreads its failures across
+         * many separately-successful requests rather than one request's
+         * own retry chain is a known, accepted limit of this scope: fixing
+         * it would require loosening shm_breaker_record()'s reset
+         * semantics, which this item is explicitly scoped not to touch. */
+        if (clcf->breaker_count_retries) {
+            ngx_uint_t  retry_fails =
+                ngx_http_cache_turbo_breaker_retry_failures(r);
+            ngx_uint_t  j;
+
+            for (j = 0; j < retry_fails; j++) {
+                (void) ngx_atomic_fetch_add(&bz->sh->origin_failures, 1);
+                ngx_http_cache_turbo_shm_breaker_record(
+                    clcf->shm_zone->data,
+                    0,                      /* prior attempt: always a failure */
+                    clcf->breaker_threshold,
+                    clcf->breaker_window,
+                    NGX_HTTP_CACHE_TURBO_BREAKER_NO_PROBE);
+            }
+        }
+
         ngx_http_cache_turbo_shm_breaker_record(
             clcf->shm_zone->data,
             !is_failure,
