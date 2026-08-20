@@ -1968,7 +1968,6 @@ ngx_http_cache_turbo_body_filter_store_tail(ngx_http_request_t *r,
              * variant re-issues the SADD (access_l1). Still no blocking
              * round trip on the store path -- tag_add returns the moment the
              * op reaches, or fails to reach, the transport. */
-            varidx_rc = NGX_OK;
 
 #if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
     && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
@@ -1991,8 +1990,7 @@ ngx_http_cache_turbo_body_filter_store_tail(ngx_http_request_t *r,
                                                    vlen, retain_ttl);
             }
 
-            if (varidx_rc != NGX_OK)
-            {
+            if (varidx_rc != NGX_OK) {
                 ngx_http_cache_turbo_shm_varidx_pending_set(z, store_key,
                                                             hash, 1);
 #if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
