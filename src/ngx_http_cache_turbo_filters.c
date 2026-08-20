@@ -210,7 +210,8 @@ ngx_http_cache_turbo_header_filter_try_sie(ngx_http_request_t *r,
 
     if (ctx->sie_armed && !ctx->sie_serving
         && ngx_http_cache_turbo_use_stale_triggers(clcf->use_stale,
-                                                   r->headers_out.status))
+                                     r->headers_out.status,
+                                     ngx_http_cache_turbo_transport_failure(r)))
     {
         rc = ngx_http_cache_turbo_sie_rewrite(r, ctx);
         if (rc == NGX_ERROR) {
@@ -769,16 +770,21 @@ ngx_http_cache_turbo_body_filter_midbody_rescue(ngx_http_request_t *r,
      * successful header phase, so calling it with the real status can never
      * match. What we need instead is "does this location's use_stale policy
      * treat a representative connection failure as stale-eligible at all" --
-     * the same question the breaker's ERROR/TIMEOUT fold (S4.2 comment above
-     * use_stale_triggers()) answers by treating a refused/dropped connection
-     * as equivalent to 502/504. NGX_HTTP_BAD_GATEWAY is that representative:
-     * it is what nginx itself synthesises for a transport failure, and its
-     * bit (HTTP_502 | ERROR) is set by the same USE_STALE_DEFAULT every other
-     * SIE fixture in this suite relies on. */
+     * the same question the breaker's ERROR/TIMEOUT fold (P5-5 comment above
+     * ngx_http_cache_turbo_transport_failure(), module.c) answers for a real
+     * request by reading r->upstream->state->header_time. There is no real
+     * r->upstream attempt to read here -- this whole path is the TEST_FAULTS
+     * fault injector standing in for a connection-level death mid-body -- so
+     * transport_failure is passed hardcoded 1: NGX_HTTP_BAD_GATEWAY is the
+     * representative status nginx itself synthesises for a transport
+     * failure, and passing transport_failure=1 alongside it sets the SAME
+     * ERROR bit a real transport failure would set, matching the
+     * USE_STALE_DEFAULT every other SIE fixture in this suite relies on
+     * (HTTP_502 always matches the status alone; ERROR now needs this 1). */
     if (ctx == NULL || !clcf->test_midbody_abort
         || !ctx->sie_armed || ctx->sie_serving || ctx->sie_flushed
         || !ngx_http_cache_turbo_use_stale_triggers(clcf->use_stale,
-                                                    NGX_HTTP_BAD_GATEWAY))
+                                                    NGX_HTTP_BAD_GATEWAY, 1))
     {
         return NGX_OK;
     }
