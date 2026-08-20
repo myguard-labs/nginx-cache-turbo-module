@@ -1,4 +1,4 @@
-# sync-sha: 306faac81bb7f42bb1a5afae02d3e97f0d27453559515827732598cc1c6aac78
+# sync-sha: 52355b8be6026fe0b21748fec65ae4d07dbbfc6cd0c159cbba92a776f3d1621c
 name: CI Deep
 
 # Exhaustive dynamic analysis — monthly cron + on-demand only, NEVER on PR.
@@ -433,6 +433,30 @@ jobs:
           sudo apt-get install -y \
             build-essential ccache curl eatmydata libpcre2-dev libssl-dev mold pkg-config \
             redis-server memcached valgrind zlib1g-dev
+      - name: Start L2 backends (redis, memcached)
+        # apt's postinst calls deb-systemd-invoke/invoke-rc.d to start the
+        # service, but GitHub-hosted runner images ship a policy-rc.d that
+        # blocks automatic service starts on package install (it exists to
+        # stop random daemons from booting on a build image) -- so the
+        # packages land in /usr/bin with nothing listening on 6379/11211.
+        # `apt-get install` succeeding is not evidence either port is up;
+        # start both explicitly and wait for them to accept connections
+        # before the soak below ever generates L2 traffic against them.
+        run: |
+          sudo service redis-server start
+          sudo service memcached start
+          for _ in $(seq 1 50); do
+            redis-cli -h 127.0.0.1 -p 6379 ping 2>/dev/null | grep -q PONG && break
+            sleep 0.2
+          done
+          redis-cli -h 127.0.0.1 -p 6379 ping | grep -q PONG || {
+            echo "::error::redis-server did not come up on 127.0.0.1:6379"; exit 1; }
+          for _ in $(seq 1 50); do
+            printf 'version\r\nquit\r\n' | timeout 2 nc 127.0.0.1 11211 2>/dev/null | grep -q VERSION && break
+            sleep 0.2
+          done
+          printf 'version\r\nquit\r\n' | timeout 2 nc 127.0.0.1 11211 | grep -q VERSION || {
+            echo "::error::memcached did not come up on 127.0.0.1:11211"; exit 1; }
       - name: Restore build caches
         uses: ./.github/actions/build-cache
         with:
@@ -443,12 +467,12 @@ jobs:
       - name: Memcheck soak (600s @ 4 conc, WITH suppressions, L1+L2)
         env:
           USE_VALGRIND: "1"
-          # apt's redis-server/memcached start as systemd services on their
-          # package defaults (127.0.0.1:6379, 127.0.0.1:11211) -- same
-          # binaries the runtime-suite jobs above already install. Setting
-          # both here is what makes soak.sh build the L2 vhost instead of
-          # its L1-only default; see soak.sh's own header for the gate this
-          # trips if either tier never actually gets hit.
+          # redis-server/memcached are explicitly started (and verified
+          # ready) by the "Start L2 backends" step above, on their package
+          # defaults (127.0.0.1:6379, 127.0.0.1:11211). Setting both here is
+          # what makes soak.sh build the L2 vhost instead of its L1-only
+          # default; see soak.sh's own header for the gate this trips if
+          # either tier never actually gets hit.
           REDIS: "127.0.0.1:6379"
           MEMCACHED: "127.0.0.1:11211"
         run: |
@@ -496,6 +520,26 @@ jobs:
           sudo apt-get install -y \
             build-essential ccache curl eatmydata libpcre2-dev libssl-dev mold pkg-config \
             redis-server memcached valgrind zlib1g-dev
+      - name: Start L2 backends (redis, memcached)
+        # See the memcheck job above: GitHub-hosted runner images ship a
+        # policy-rc.d that blocks apt postinst's automatic service start, so
+        # installing the packages does not put anything on 6379/11211.
+        # Start both explicitly and wait for them to accept connections.
+        run: |
+          sudo service redis-server start
+          sudo service memcached start
+          for _ in $(seq 1 50); do
+            redis-cli -h 127.0.0.1 -p 6379 ping 2>/dev/null | grep -q PONG && break
+            sleep 0.2
+          done
+          redis-cli -h 127.0.0.1 -p 6379 ping | grep -q PONG || {
+            echo "::error::redis-server did not come up on 127.0.0.1:6379"; exit 1; }
+          for _ in $(seq 1 50); do
+            printf 'version\r\nquit\r\n' | timeout 2 nc 127.0.0.1 11211 2>/dev/null | grep -q VERSION && break
+            sleep 0.2
+          done
+          printf 'version\r\nquit\r\n' | timeout 2 nc 127.0.0.1 11211 | grep -q VERSION || {
+            echo "::error::memcached did not come up on 127.0.0.1:11211"; exit 1; }
       - name: Restore build caches
         uses: ./.github/actions/build-cache
         with:
@@ -506,9 +550,10 @@ jobs:
       - name: Helgrind soak (600s @ 4 conc, --error-exitcode=99, WITH suppressions, L1+L2)
         env:
           USE_HELGRIND: "1"
-          # See the memcheck job above: same apt packages, same defaults,
-          # same reason -- without these two, soak.sh silently builds the
-          # L1-only vhost and the L2 drivers never run under helgrind.
+          # redis-server/memcached are explicitly started (and verified
+          # ready) by the "Start L2 backends" step above. See the memcheck
+          # job above: without these two env vars, soak.sh silently builds
+          # the L1-only vhost and the L2 drivers never run under helgrind.
           REDIS: "127.0.0.1:6379"
           MEMCACHED: "127.0.0.1:11211"
         run: |
