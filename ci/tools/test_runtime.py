@@ -100,6 +100,10 @@ def run_all(ng: Nginx, origin: Origin,
     test_double_partition_encoding_warns(ng)                  # P1-7
     test_double_partition_device_warns(ng)                    # P1-7
     test_double_partition_both_warns(ng)                      # P1-7
+    test_p4_5_chained_serve_bytes_identical(ng, origin)       # P4-5 multi-buf zero-copy serve
+    test_p4_5_chained_serve_terminates_on_keepalive(ng, origin)  # P4-5 last_buf termination
+    test_p4_5_chained_serve_head_and_empty_body(ng, origin)   # P4-5 non-chained arms
+    test_p4_5_chained_serve_slow_client_drain(ng, origin)     # P4-5 blob refcount across a slow drain
     test_breaker_arming_sites_gated_white_box(ng, origin)    # O4.4-i (L1)
     test_bypass_stale_serves_fallback_when_breaker_open(ng, origin)  # S232-BYPASS-STALE
     test_bypass_stale_never_serves_on_normal_path(ng, origin)        # S232 safety control

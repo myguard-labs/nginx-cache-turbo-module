@@ -2879,25 +2879,115 @@ ngx_http_cache_turbo_serve(ngx_http_request_t *r, u_char *copy, size_t len,
      * filter, even when the body is empty (a cached 301/302/308/204, v6): just
      * finalizing without a last buffer leaves the response chain unterminated
      * and the client hangs. An empty memory buffer with last_buf set is the
-     * standard end-of-response signal. */
-    b = ngx_calloc_buf(r->pool);
-    if (b == NULL) {
-        return NGX_ERROR;
-    }
-
-    b->pos = body;
-    b->last = body + body_len;
-    b->memory = (body_len > 0) ? 1 : 0;
-    b->last_buf = (r == r->main) ? 1 : 0;
-    b->last_in_chain = 1;
+     * standard end-of-response signal.
+     *
+     * P4-5: a large body is emitted as a CHAIN of bufs rather than one buf
+     * spanning the whole thing. All of them point INTO THE SAME buffer
+     * (`body`) -- there is no copy and the serve stays zero-copy -- they just
+     * slice it so the writer has natural yield points instead of one
+     * monolithic writev of the entire body.
+     *
+     * Why this matters at 4 MB: a single buf makes ngx_http_write_filter hand
+     * the kernel the whole body in one shot and, more importantly, gives the
+     * downstream filters and the event loop exactly one unit of work with no
+     * intermediate progress. Slicing it lets a partial write retire whole
+     * bufs, so a slow consumer no longer forces the whole body to be
+     * re-offered as one indivisible piece on every write event.
+     *
+     * ⚠ REFCOUNT LIFETIME. On the PERF-7 zero-copy path `body` lives inside
+     * the shm slab and is kept alive by exactly ONE reference, taken by the
+     * caller under the zone mutex and dropped by the single
+     * ngx_http_cache_turbo_blob_cleanup registered on r->pool at the top of
+     * this function. Chaining does NOT change that: the cleanup is
+     * POOL-lifetime, not buf-lifetime, and nginx destroys the request pool in
+     * ngx_http_free_request() only after the writer has drained every buffer
+     * of the response. So one acquire and one release still cover the whole
+     * chain, no matter how many bufs slice it, and no buf can outlive the
+     * cleanup. Taking a reference per buf (or dropping one per buf) would be
+     * a refcount bug -- do not "balance" this per buf.
+     *
+     * Chunk size: nginx has no per-location `output_buffers` directive
+     * (`output_buffers` is a field of ngx_http_upstream_conf_t, not of
+     * ngx_http_core_loc_conf_t, so it is not reachable from a plain content
+     * serve like this one), and inventing a new directive for a purely
+     * internal slicing decision is not worth the config surface. We therefore
+     * use a fixed 32 KB, which is nginx's own conventional output buffer size
+     * (the `proxy_buffers`/`output_buffers` default is 32 KB pages) and keeps
+     * the buf count bounded: even a 64 MB entry stays at 2048 bufs, and
+     * ngx_writev_chain caps each writev at IOV_MAX and loops, so a long chain
+     * is correct as well as cheap. */
     if (body_len == 0) {
+        b = ngx_calloc_buf(r->pool);
+        if (b == NULL) {
+            return NGX_ERROR;
+        }
+
+        b->memory = 0;
+        b->last_buf = (r == r->main) ? 1 : 0;
+        b->last_in_chain = 1;
         b->sync = 1;                 /* zero-size control buffer */
+
+        out.buf = b;
+        out.next = NULL;
+        rc = ngx_http_output_filter(r, &out);
+
+    } else {
+        ngx_chain_t  *cl, **ll;
+        size_t        off;
+
+        ll = &out.next;
+        out.buf = NULL;
+        b = NULL;
+        off = 0;
+
+        /* do/while, not for: body_len > 0 in this arm, so the body ALWAYS runs
+         * at least once and `b` is non-NULL at the terminator below. Written
+         * this way so that is structural rather than something a reader (or an
+         * analyzer) has to derive from the loop condition -- cppcheck reads the
+         * `for` form as "condition may be false on entry" and reports the
+         * terminator as a NULL dereference. */
+        do {
+            size_t  n = body_len - off;
+
+            if (n > NGX_HTTP_CACHE_TURBO_SERVE_CHUNK) {
+                n = NGX_HTTP_CACHE_TURBO_SERVE_CHUNK;
+            }
+
+            b = ngx_calloc_buf(r->pool);
+            if (b == NULL) {
+                return NGX_ERROR;
+            }
+
+            b->pos = body + off;
+            b->last = body + off + n;
+            b->memory = 1;
+
+            if (out.buf == NULL) {
+                out.buf = b;
+
+            } else {
+                cl = ngx_alloc_chain_link(r->pool);
+                if (cl == NULL) {
+                    return NGX_ERROR;
+                }
+                cl->buf = b;
+                *ll = cl;
+                ll = &cl->next;
+            }
+
+            off += NGX_HTTP_CACHE_TURBO_SERVE_CHUNK;
+
+        } while (off < body_len);
+
+        *ll = NULL;
+
+        /* Only the FINAL buf terminates the response: `b` is the last buf the
+         * loop allocated. */
+        b->last_buf = (r == r->main) ? 1 : 0;
+        b->last_in_chain = 1;
+
+        rc = ngx_http_output_filter(r, &out);
     }
-
-    out.buf = b;
-    out.next = NULL;
-
-    rc = ngx_http_output_filter(r, &out);
 
     /* Finalize and return NGX_DONE so the ACCESS phase engine stops here and
      * does NOT fall through to the location's content handler (proxy_pass).

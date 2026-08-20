@@ -774,6 +774,15 @@ ngx_int_t ngx_http_cache_turbo_blob_validate(const u_char *blob, size_t len,
  * native padding). All blob offsets derive from this constant. */
 #define NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE 44
 
+/* P4-5: slice size for the zero-copy body chain built by
+ * ngx_http_cache_turbo_serve(). All bufs point into the SAME refcounted blob,
+ * so this is purely how finely the body is presented to the output filters --
+ * it costs one ngx_buf_t + one ngx_chain_t per 32 KB of body and no data copy.
+ * 32 KB is nginx's own conventional output-buffer size; see the long comment
+ * at the construction site for why `output_buffers` itself is not reachable
+ * here and why the buf count stays bounded. */
+#define NGX_HTTP_CACHE_TURBO_SERVE_CHUNK  32768
+
 /* Bounds on the blob's `created` field (AUD-BLOB-CREATED). It is stored as a
  * signed int64 wire field but is always written as `(int64_t) ngx_time()` at
  * store time (module.c) — a real store timestamp. Every consumer computes age
