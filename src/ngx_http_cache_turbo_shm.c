@@ -2061,6 +2061,30 @@ ngx_http_cache_turbo_shm_l2_neg_check(ngx_http_cache_turbo_zone_t *z,
 }
 
 
+/* COR-5(b): arm/disarm the variant-index self-heal flag on one ENTRY node.
+ *
+ * Gated on kind == ENTRY on purpose. The flag means "the SADD naming THIS
+ * body's L2 key never reached the wire"; a COUNTER or an in-flight stub holds
+ * no body, so there is nothing for a purge to miss and nothing to re-index --
+ * arming it there would just make a later hit fire a pointless op. */
+void
+ngx_http_cache_turbo_shm_varidx_pending_set(ngx_http_cache_turbo_zone_t *z,
+    u_char *key_hash, uint32_t hash, ngx_uint_t pending)
+{
+    ngx_http_cache_turbo_node_t  *ctn;
+
+    ngx_shmtx_lock(&z->shpool->mutex);
+
+    ctn = ngx_http_cache_turbo_shm_lookup(z, key_hash, hash);
+
+    if (ctn != NULL && ctn->kind == NGX_HTTP_CACHE_TURBO_NODE_ENTRY) {
+        ctn->varidx_pending = pending ? 1 : 0;
+    }
+
+    ngx_shmtx_unlock(&z->shpool->mutex);
+}
+
+
 /* L2 negative memo (L13). Record that an L2 GET just missed this key, so the
  * next cold request skips the round-trip for `ttl` seconds. Best-effort: a full
  * slab simply means no memo (one extra RTT, never a correctness problem).

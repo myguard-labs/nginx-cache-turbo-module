@@ -1819,6 +1819,94 @@ def test_cor5_redis_variant_purge(ng: Nginx, origin: Origin,
         f"fr variant survived PURGE: X-Cache={hf2.get('x-cache')} body={fr2!r}"
 
 
+def test_cor5_varidx_selfheal_after_dropped_index_write(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    """COR-5(b): a variant-index write DROPPED before the wire must self-heal.
+
+    The defect (PR #379 run 32379308752, job 96459248737: `ERROR: purge should
+    report >=2 variants: {"purged":1}`): the store path called tag_add() and
+    threw the return value away, so a SADD refused by redis_launch() -- an
+    armed S231 connect-backoff window, a failed connect -- left the object in
+    L1 and L2 while the per-base variant-index set never learned about it. A
+    later PURGE of the base enumerates that set with SMEMBERS, cannot see the
+    variant, and reports success while the variant keeps serving a stale
+    representation until its own TTL. Nothing anywhere said the write was lost.
+
+    Scenario, on /cor5sh/ (cache_turbo_test_varidx_fail on):
+
+      1. prime the `en` variant normally -- its index entry lands;
+      2. prime the `fr` variant with X-Cache-Turbo-Test-Varidx-Drop: 1, so its
+         SADD is skipped and the node is marked varidx_pending. The response
+         still HITs from L1 -- nothing observable says the index is short;
+      3. HIT the `fr` variant again with the drop header OFF. access_l1 finds
+         varidx_pending, clears it and re-issues the SADD after unlocking;
+      4. PURGE the base. It must now enumerate BOTH variants.
+
+    ORACLE. The assertion is `purged >= 2` PLUS the reissues counter, not just
+    the two post-purge misses: with the self-heal removed the base marker is
+    still purged, so BOTH variants re-miss to origin anyway on a single-node
+    box and the miss assertions alone stay green. `{"purged":N}` counts the
+    SMEMBERS enumeration itself, which is the only thing the dropped write
+    actually changes, and X-Cache-Turbo-Test-Varidx (drops/reissues) is the
+    marker only this path emits.
+    """
+    import json
+    en = {"Accept-Language": "en"}
+    fr = {"Accept-Language": "fr"}
+    fr_drop = {"Accept-Language": "fr", "X-Cache-Turbo-Test-Varidx-Drop": "1"}
+
+    # 1. en variant, index write allowed through.
+    _, en0, _ = fetch(ng.port, "/cor5sh/p?v=al", headers=en)
+    _, en1, he1 = fetch(ng.port, "/cor5sh/p?v=al", headers=en)
+    assert he1.get("x-cache") == "HIT" and en1 == en0, "en variant should cache"
+
+    # 2. fr variant, index write DROPPED. The object still caches -- that is
+    #    the whole problem: the drop is invisible to the client.
+    _, fr0, hf0 = fetch(ng.port, "/cor5sh/p?v=al", headers=fr_drop)
+    drops0 = _varidx(hf0)["drops"]
+    _, fr1, hf1 = fetch(ng.port, "/cor5sh/p?v=al", headers=fr)
+    assert hf1.get("x-cache") == "HIT" and fr1 == fr0, \
+        "fr variant should cache even though its index write was dropped"
+    assert fr0 != en0, "en and fr must be distinct variant slots"
+    assert _varidx(hf1)["drops"] > drops0, \
+        f"the dropped index write was not detected: {hf0.get('x-cache-turbo-test-varidx')!r}"
+
+    # 3. the HIT at step 2 (drop header absent) is itself the self-heal
+    #    trigger: it found varidx_pending set. Take one more HIT so the
+    #    re-issue counter is readable on a response we have in hand.
+    _, _, hf2 = fetch(ng.port, "/cor5sh/p?v=al", headers=fr)
+    assert _varidx(hf2)["reissues"] >= 1, \
+        ("self-heal never re-issued the dropped index write: "
+         f"{hf2.get('x-cache-turbo-test-varidx')!r}")
+
+    # 4. the index must now list BOTH variants.
+    s, b, _ = fetch_raw(ng.port, "/cor5sh/p?v=al", method="PURGE")
+    assert s == 200, f"PURGE status {s}"
+    assert json.loads(b)["purged"] >= 2, \
+        (f"self-heal did not restore the fr variant to the index: {b} "
+         "(purged==1 means SMEMBERS saw only the en variant)")
+
+    _, en2, he2 = fetch(ng.port, "/cor5sh/p?v=al", headers=en)
+    assert "x-cache" not in he2 and en2 != en0, "en variant survived PURGE"
+    _, fr3, hf3 = fetch(ng.port, "/cor5sh/p?v=al", headers=fr)
+    assert "x-cache" not in hf3 and fr3 != fr0, "fr variant survived PURGE"
+
+
+def _varidx(headers: dict) -> dict:
+    """Parse X-Cache-Turbo-Test-Varidx ("drops=<n>,reissues=<n>", TEST_FAULTS
+    only) into ints. A MISSING header is a hard failure, never a silent zero --
+    a test-only counter that vanished would otherwise read as "nothing
+    happened" and turn every assertion above into a tautology."""
+    raw = headers.get("x-cache-turbo-test-varidx")
+    assert raw, "X-Cache-Turbo-Test-Varidx header absent (non-TEST_FAULTS build?)"
+    out = {}
+    for field in raw.split(","):
+        k, _, v = field.partition("=")
+        out[k.strip()] = int(v)
+    assert "drops" in out and "reissues" in out, f"malformed varidx header: {raw!r}"
+    return out
+
+
 def test_cache_and_purge_respect_access_control(ng: Nginx) -> None:
     """A cached GET and PURGE must run after allow/deny. Both locations share
     one cache key, proving the denied request cannot serve or delete the entry

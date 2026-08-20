@@ -665,6 +665,29 @@ typedef struct {
      * consumed by a prior eviction pass and the node re-inserted since). */
     unsigned                 sie_spared:1;
 
+    /* COR-5(b): the auto-Vary variant-index SADD for THIS variant was DROPPED
+     * before the wire (armed S231 connect-backoff, failed connect, or an
+     * alloc failure) at store time. The object is in L1 and serves normally,
+     * but the per-base index set does not list it -- so a later PURGE of the
+     * base enumerates the set via SMEMBERS, does not see this variant, and
+     * reports success while this node keeps serving a stale representation
+     * until its own TTL.
+     *
+     * Self-heal: the next L1 hit on this node re-issues the SADD (still
+     * fire-and-forget, still off the blocking path -- see access_l1) and
+     * clears this bit once the op reaches the transport. A re-issue that is
+     * dropped again leaves the bit set, so the next hit retries; during a
+     * long L2 outage every attempt short-circuits on the backoff check
+     * without a connect(), so the retry costs a function call.
+     *
+     * MEMORY BOUND: one bit inside an already-allocated node. There is no
+     * pending list and no per-key allocation, so a multi-hour L2 outage adds
+     * exactly zero bytes to the zone -- the pending set can never exceed the
+     * number of resident nodes, and a node's pending state is freed with the
+     * node on eviction or expiry. That bound is the reason this lives here
+     * rather than in a retry queue. */
+    unsigned                 varidx_pending:1;
+
     ngx_queue_t              lru;           /* LRU list linkage             */
 } ngx_http_cache_turbo_node_t;
 
@@ -908,6 +931,23 @@ typedef struct {
     ngx_atomic_t             sie_serves;
     ngx_atomic_t             breaker_serves;
     ngx_atomic_t             origin_failures;
+
+    /* COR-5(b) variant-index self-heal observables. `varidx_drops` counts
+     * index writes that never reached the transport at store time (each one
+     * arms a node's varidx_pending bit); `varidx_reissues` counts re-issues a
+     * later hit successfully handed to the transport. Two counters, not one:
+     * the test's oracle must distinguish "the drop was detected" from "the
+     * self-heal actually fired", and a combined counter would let a test pass
+     * on detection alone with the index still short a variant.
+     *
+     * ⚠ ZONE-scoped, not process-global like the S231 backoff counters. The
+     * runtime suite runs 4 workers with no request affinity, so the store and
+     * the response that reports the counter routinely land in DIFFERENT
+     * workers -- a per-worker counter reads 0 on the reporting worker and the
+     * assertion goes vacuous. The state being observed (a node's pending bit)
+     * is itself zone-scoped, so this is also the honest scope. */
+    ngx_atomic_t             varidx_drops;
+    ngx_atomic_t             varidx_reissues;
 
     /* P4-1a: W-TinyLFU frequency sketch (count-min, 4-bit counters).
      *
@@ -1735,6 +1775,23 @@ typedef struct {
      * store did NOT succeed) is reachable without depending on real slab
      * exhaustion timing. */
     ngx_flag_t               test_store_fail;
+    /* COR-5(b): when on, a request carrying the header
+     * X-Cache-Turbo-Test-Varidx-Drop: 1 has its auto-Vary variant-index write
+     * SKIPPED at the store site, and the store site sees the same NGX_ERROR
+     * redis_launch() returns inside an armed S231 connect-backoff window or
+     * on a failed connect.
+     *
+     * ⚠ Driven by a REQUEST HEADER, not by a per-store countdown. The runtime
+     * suite runs 4 workers with no request affinity, so a "drop the first N
+     * stores" budget would live per-worker and the test could not say WHICH
+     * variant lost its index entry. The header makes the fault a property of
+     * the request, so it is deterministic whatever worker serves it.
+     *
+     * Real Redis stays UP on purpose: the test needs the object and the base
+     * marker written normally and ONLY the index SADD lost, which is the
+     * PR #379 signature. Taking the peer down would drop all three and the
+     * purge would miss the variant for a different reason. */
+    ngx_flag_t               test_varidx_fail;
     /* AUD-SCAN1: lower the SCAN-del page cap so the cap branch is reachable in
      * a test without materialising a 268M-key keyspace. 0 / unset keeps the
      * compile-time ceiling. Test-only for the same reason the cap itself is a
@@ -1957,6 +2014,24 @@ typedef struct {
      * park/resume re-entry. Left 0 (no-op downstream) whenever auto_vary is
      * off or the L1 marker DID resolve bits -- the marker-warm path must
      * never pay this extra round trip. */
+    /* COR-5(b): access_l1() found this request's L1 node carrying
+     * varidx_pending (a variant-index SADD that never reached the wire at
+     * store time) and consumed the bit under the zone mutex. The re-issue
+     * itself is deliberately NOT done there: it allocates a pool and calls
+     * connect(), neither of which belongs inside the shm critical section.
+     * Each terminal arm of access_l1() instead calls
+     * ngx_http_cache_turbo_varidx_reissue() immediately AFTER its own
+     * unlock. Consumed exactly once (the helper clears it), so a parked-and-
+     * resumed request cannot fire twice for one detection. */
+    unsigned                 varidx_reissue:1;
+
+    /* COR-5(b): the pending node's remaining physical retention
+     * (stale_until - now), captured in the SAME critical section that
+     * consumed varidx_reissue. Read outside the lock, so it must be a
+     * by-value copy -- never re-read from the node, which may have been
+     * evicted by then. */
+    time_t                   varidx_reissue_ttl;
+
     unsigned                 vary_marker_l1_miss:1;
     /* P3-5: vary_marker_l2_tried is the park/consume in-flight flag for the
      * marker GET (set when launched, cleared once its result is consumed --
@@ -2582,11 +2657,20 @@ struct ngx_cache_turbo_backend_s {
         size_t key_len);
     size_t     (*tagkey)(ngx_str_t *prefix, u_char *name, size_t name_len,
         u_char *buf);
-    void       (*tag_add)(ngx_http_cache_turbo_loc_conf_t *clcf,
+    /* COR-5(b): returns NGX_OK once the op is HANDED TO the transport (the
+     * write is still fire-and-forget -- NGX_OK is NOT an acknowledgement from
+     * the server) and NGX_ERROR when it was DROPPED before the wire: an armed
+     * S231 connect-backoff window, a failed connect, or an alloc failure. The
+     * distinction exists so the auto-Vary variant-index caller can mark the
+     * L1 node varidx_pending and re-issue on a later hit, instead of silently
+     * losing the index entry and leaving a purged base serving a stale
+     * variant until its own TTL. */
+    ngx_int_t  (*tag_add)(ngx_http_cache_turbo_loc_conf_t *clcf,
         u_char *key_hash, u_char *name, size_t name_len, time_t ttl);
     /* L9: batched tag_add (one op for N tags). NULL on a backend without tag
-     * support, exactly like tag_add -- callers must check it before use. */
-    void       (*tag_add_many)(ngx_http_cache_turbo_loc_conf_t *clcf,
+     * support, exactly like tag_add -- callers must check it before use.
+     * Same NGX_OK/NGX_ERROR launch contract as tag_add. */
+    ngx_int_t  (*tag_add_many)(ngx_http_cache_turbo_loc_conf_t *clcf,
         u_char *key_hash, ngx_str_t *names, ngx_uint_t nnames, time_t ttl);
     ngx_int_t  (*purge_tag)(ngx_http_request_t *r,
         ngx_http_cache_turbo_loc_conf_t *clcf, u_char *name, size_t name_len,

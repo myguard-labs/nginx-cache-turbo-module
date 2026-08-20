@@ -1,5 +1,28 @@
 Changes with the nginx-cache-turbo-module (unreleased)
 
+    *) Bugfix: a dropped auto-Vary variant-index write no longer leaves a
+       variant permanently invisible to PURGE. The store path called the L2
+       backend's tag_add() and discarded its return value, so an index SADD
+       refused before the wire -- an armed connect-backoff window, a failed
+       connect, an allocation failure -- silently lost the entry while the
+       object itself was cached normally. A later PURGE of the base URI
+       enumerates that per-base index set with SMEMBERS, could not see the
+       variant, and reported success while the variant kept serving a stale
+       representation until its own TTL expired. Nothing logged, nothing
+       counted.
+       tag_add()/tag_add_many() now report whether the op reached the
+       transport (NGX_OK) or was dropped (NGX_ERROR). A drop logs a warning
+       and marks the variant's L1 node pending; the next hit on that node
+       re-issues the write, and a re-issue that is dropped again leaves the
+       node pending so a later hit retries. The store path is unchanged in
+       shape: still fire-and-forget, still no blocking Redis round trip, since
+       tag_add() returns as soon as the op is handed to or refused by the
+       transport. The pending state is one bit inside an already-allocated
+       node, so an L2 outage of any length adds no memory: the pending set can
+       never exceed the number of resident nodes and is freed with them.
+       NGX_OK is a launch acknowledgement, not a server acknowledgement -- a
+       write the server rejects after the wire is not covered here.
+
     *) Feature: W-TinyLFU admission control, opt-in per zone via
        cache_turbo_zone name=NAME SIZE admission=on. When a NEW key would be
        stored, its estimated access frequency (from the count-min sketch added

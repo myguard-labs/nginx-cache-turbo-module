@@ -213,6 +213,15 @@ ngx_int_t ngx_http_cache_turbo_shm_l2_neg_check(ngx_http_cache_turbo_zone_t *z,
 void ngx_http_cache_turbo_shm_l2_neg_set(ngx_http_cache_turbo_zone_t *z,
     u_char *key_hash, uint32_t hash, time_t ttl);
 
+/* COR-5(b) variant-index self-heal. Set or clear the varidx_pending bit on the
+ * ENTRY node for key_hash (see the field comment on
+ * ngx_http_cache_turbo_node_t). Best-effort: a missing node or a non-ENTRY node
+ * is a no-op, because a pending re-issue only makes sense while the variant
+ * body it indexes is still resident. Takes the zone mutex itself. */
+void ngx_http_cache_turbo_shm_varidx_pending_set(
+    ngx_http_cache_turbo_zone_t *z, u_char *key_hash, uint32_t hash,
+    ngx_uint_t pending);
+
 
 /* ---- redis.c (used only within ngx_http_cache_turbo_redis.c) ---- */
 
@@ -246,14 +255,15 @@ void ngx_http_cache_turbo_redis_del_raw(ngx_http_cache_turbo_loc_conf_t *clcf,
 /* Tag index store: SADD "<prefix>tag:<name>" "<object L2 key>" + EXPIRE the tag
  * set to ttl seconds (refreshed each store). Async fire-and-forget. No-op when
  * L2 is disabled. */
-void ngx_http_cache_turbo_redis_tag_add(ngx_http_cache_turbo_loc_conf_t *clcf,
-    u_char *key_hash, u_char *name, size_t name_len, time_t ttl);
+ngx_int_t ngx_http_cache_turbo_redis_tag_add(
+    ngx_http_cache_turbo_loc_conf_t *clcf, u_char *key_hash, u_char *name,
+    size_t name_len, time_t ttl);
 
 /* L9: as tag_add, but indexes up to MAX_TAGS names for one object in a SINGLE
  * pipelined op (one pool, one connection, one round trip) instead of one op per
  * tag. names[] must already be deduped and MAX_TAGS-bound by the caller; empty
  * entries are skipped. Same fire-and-forget semantics as tag_add. */
-void ngx_http_cache_turbo_redis_tag_add_many(
+ngx_int_t ngx_http_cache_turbo_redis_tag_add_many(
     ngx_http_cache_turbo_loc_conf_t *clcf, u_char *key_hash, ngx_str_t *names,
     ngx_uint_t nnames, time_t ttl);
 
@@ -1027,6 +1037,11 @@ time_t ngx_http_cache_turbo_status_ttl(ngx_http_cache_turbo_loc_conf_t *clcf,
 ngx_int_t ngx_http_cache_turbo_test_arg_scan_header(ngx_http_request_t *r);
 ngx_int_t ngx_http_cache_turbo_test_armings_header(ngx_http_request_t *r);
 ngx_int_t ngx_http_cache_turbo_test_backoff_header(ngx_http_request_t *r);
+/* COR-5(b): "drops=<n>,reissues=<n>" for the auto-Vary variant-index
+ * self-heal. Compiles to a no-op returning NGX_OK outside a TEST_FAULTS
+ * build; the counters themselves only exist in one. */
+ngx_int_t ngx_http_cache_turbo_test_varidx_header(ngx_http_request_t *r);
+
 ngx_int_t ngx_http_cache_turbo_test_cookie_scan_header(ngx_http_request_t *r);
 time_t ngx_http_cache_turbo_upstream_ttl(ngx_http_request_t *r);
 ngx_uint_t ngx_http_cache_turbo_use_stale_triggers(ngx_uint_t mask,
