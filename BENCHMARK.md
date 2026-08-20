@@ -34,9 +34,16 @@ absolute number.**
 |                  | p99   | 12.35 ms | 2.18 ms | **1.46 ms** | 1.53 ms |
 | **large** 4 MB   | req/s | 1.0k | 2.51k | **2.75k** | 2.86k |
 |                  | p50   | 27.0 ms | 11.85 ms | **10.04 ms** | 9.90 ms |
-|                  | p99   | 216.7 ms | 25.52 ms | 37.38 ms | 31.09 ms |
+|                  | p99   | 216.7 ms | 25.52 ms | 37.38 ms&nbsp;[^l] | 31.09 ms |
 
-**cache_turbo vs proxy_cache:** tiny **+23 %**, medium **+37 %**, large **+10 %**.
+[^l]: **Do not quote the `large` p99 row.** These two cells are a single 2026-06-13
+pass and do not survive repetition. Re-measured 2026-08-20 on the same box with
+`PASSES=5`, across four runs: cache_turbo 29.8–34.3 ms, proxy_cache 23.4–32.3 ms
+— parity, with a run-to-run spread wider than the apparent gap. The other rows
+were not re-measured. See "On `large` p99 specifically" below.
+
+**cache_turbo vs proxy_cache:** tiny **+23 %**, medium **+37 %**, large **+10 %**
+(throughput; the `large` p99 column is a wash — see the footnote).
 
 ---
 
