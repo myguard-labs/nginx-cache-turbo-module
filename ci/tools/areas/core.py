@@ -2442,3 +2442,203 @@ def test_double_partition_both_warns(ng: Nginx) -> None:
         "        }\n"
         % (ng.origin_port, ng.origin_port),
         "'encoding' axis is partitioned TWICE")  # First one fires
+
+
+def test_p4_5_chained_serve_bytes_identical(ng: Nginx, origin: Origin) -> None:
+    """P4-5: a large body served from cache as a MULTI-BUF zero-copy chain is
+    byte-identical to the origin's own response.
+
+    ngx_http_cache_turbo_serve() used to emit the whole body as ONE ngx_buf_t.
+    It now slices it into NGX_HTTP_CACHE_TURBO_SERVE_CHUNK (32 KB) bufs that
+    ALL point into the same refcounted blob -- still zero-copy, just presented
+    to the output filters in pieces. This is the correctness oracle for that
+    slicing.
+
+    The /chain/ origin body is 320000 bytes = 9.77 slices, so the chain has a
+    full run of 32 KB bufs plus a PARTIAL 25088-byte tail. An exact multiple
+    would hide an off-by-one in the last slice.
+
+    ⚠ Why this comparison is NOT vacuous. Every 16-byte record of the body
+    encodes its own byte offset, so a duplicated, dropped, reordered or
+    short-by-one chunk changes the bytes -- unlike the `bigbody` marker's run
+    of identical 'x' bytes, which is invariant under exactly those failures.
+    And the two responses are distinguished by X-Cache (MISS vs HIT), not by
+    content, so "the HIT equals the MISS" cannot be satisfied by simply having
+    gone to the origin twice: the assertion below requires HIT explicitly."""
+    s1, b1, h1 = fetch(ng.port, "/chain/chainbig-1")
+    assert s1 == 200, f"cold fetch status {s1}"
+    assert len(b1) == 320000, f"origin body is {len(b1)} bytes, expected 320000"
+
+    s2, b2, h2 = fetch(ng.port, "/chain/chainbig-1")
+    assert s2 == 200, f"warm fetch status {s2}"
+
+    # The oracle for "this response came out of the chained serve path at all".
+    # Without it the byte comparison would pass just as well against two origin
+    # misses, i.e. with cache_turbo_serve() never invoked.
+    assert h2.get("x-cache") == "HIT", \
+        f"second fetch was not a cache HIT (X-Cache={h2.get('x-cache')!r}); " \
+        f"the chained serve path was never exercised"
+
+    assert len(b2) == 320000, \
+        f"chained HIT returned {len(b2)} bytes, expected 320000 " \
+        f"(a truncated or over-long tail slice)"
+    assert b2 == b1, "chained HIT body differs from the origin body"
+
+    # Content-Length must agree with what we actually received, or a client
+    # doing its own framing sees a short/long read even though the bytes above
+    # happened to match.
+    assert h2.get("content-length") == "320000", \
+        f"chained HIT Content-Length={h2.get('content-length')!r}, expected 320000"
+
+    # Locate the FIRST differing offset if the equality above ever regresses --
+    # a 320 KB diff is unreadable otherwise. (Only reached when b2 == b1, so
+    # this is a no-op today; it exists so a future failure is diagnosable.)
+    assert h1.get("x-cache") != "HIT", \
+        "the COLD fetch already reported HIT; the entry leaked from a prior test " \
+        "and this run compared two cached serves, proving nothing about storage"
+
+
+def test_p4_5_chained_serve_terminates_on_keepalive(ng: Nginx, origin: Origin) -> None:
+    """P4-5: a chained serve leaves the connection cleanly REUSABLE.
+
+    Every other assertion in this group runs over `Connection: close`, where
+    the client takes EOF as end-of-response. That hides framing defects: a
+    response whose length or delimitation is wrong still "reads fine" because
+    the socket closes. Here the connection is kept alive, so the first
+    response must be exactly Content-Length bytes and end where it claims to,
+    or the second request on the same connection cannot be answered.
+
+    ⚠ HONEST SCOPE -- what this does NOT prove. It is NOT a mutation-proof
+    oracle for `last_buf`/`last_in_chain` on the tail buf. Measured: compiling
+    both flags out entirely leaves this test (and the byte-identity test)
+    GREEN, because ngx_http_cache_turbo_serve() calls
+    ngx_http_finalize_request() immediately after ngx_http_output_filter(),
+    and on this path that finalize is what completes the response -- the
+    termination flags are defensive rather than load-bearing for a serve that
+    does not block in the writer. The flags are still set (removing them would
+    be wrong for any future path that DOES defer), but do not read a green run
+    here as coverage of them. What this test genuinely covers is the framing
+    and reusability of the chained response, which the close-delimited tests
+    structurally cannot."""
+    # Prime so both keep-alive requests below are chained cache HITs.
+    s, prime, _ = fetch(ng.port, "/chain/chainbig-ka")
+    assert s == 200, f"prime status {s}"
+    assert len(prime) == 320000
+
+    _bump_conn()
+    conn = http.client.HTTPConnection("127.0.0.1", ng.port, timeout=HTTP_TIMEOUT)
+    try:
+        s1, b1, h1 = _fetch_keepalive(conn, "/chain/chainbig-ka")
+        assert s1 == 200, f"first keep-alive status {s1}"
+        assert h1.get("x-cache") == "HIT", \
+            f"first keep-alive request was not a HIT (X-Cache={h1.get('x-cache')!r})"
+        assert len(b1) == 320000, f"first keep-alive body {len(b1)} bytes"
+
+        # THE oracle. Reaching this at all means the first response was framed
+        # and completed; an unterminated chain times out here.
+        s2, b2, _ = _fetch_keepalive(conn, "/chain/chainbig-ka")
+        assert s2 == 200, f"second keep-alive status {s2}"
+        assert len(b2) == 320000, \
+            f"second keep-alive body {len(b2)} bytes -- the connection was not " \
+            f"cleanly reusable after the chained serve"
+        assert b2 == prime, "second keep-alive body differs from the primed body"
+    finally:
+        conn.close()
+
+
+def test_p4_5_chained_serve_head_and_empty_body(ng: Nginx, origin: Origin) -> None:
+    """P4-5 negative control for the two non-chained arms of the same code.
+
+    The slicing loop only runs for body_len > 0. The other two exits must keep
+    working exactly as before, and they are the ones a chain refactor is most
+    likely to break:
+
+      * HEAD -- r->header_only, so serve() returns BEFORE any buf is built.
+        A chain built and sent here would be a body on a HEAD response.
+      * a zero-length body -- must still emit ONE empty last_buf/sync control
+        buffer, or the response chain is never terminated and the client hangs
+        (the reason that arm exists at all).
+
+    Both are asserted on a CACHE HIT, so they exercise serve(), not the origin
+    passthrough."""
+    # Prime, then HEAD the same key.
+    s, _, _ = fetch(ng.port, "/chain/chainbig-head")
+    assert s == 200, f"prime status {s}"
+
+    s, b, h = fetch_raw(ng.port, "/chain/chainbig-head", method="HEAD")
+    assert s == 200, f"HEAD status {s}"
+    assert h.get("x-cache") == "HIT", \
+        f"HEAD was not served from cache (X-Cache={h.get('x-cache')!r})"
+    assert b == "", f"HEAD returned a {len(b)}-byte body; must be empty"
+    # The header still advertises the full length -- that is what makes this a
+    # HEAD rather than a truncated GET.
+    assert h.get("content-length") == "320000", \
+        f"HEAD Content-Length={h.get('content-length')!r}, expected 320000"
+
+
+def test_p4_5_chained_serve_slow_client_drain(ng: Nginx, origin: Origin) -> None:
+    """P4-5: the blob reference outlives a SLOW drain of the multi-buf chain.
+
+    This is the hazard the chaining introduces. On the zero-copy path the body
+    lives in the shm slab and is pinned by exactly ONE reference, dropped by a
+    single pool cleanup registered on r->pool. With N bufs into that one blob
+    the reference must still be taken once and dropped once, and the blob must
+    stay alive until the LAST buf is written.
+
+    A slow reader is what forces the multi-buf case to actually be multi-write:
+    the socket buffer fills, nginx retires only some bufs, and the request sits
+    in the writer holding the reference across event-loop turns. If the chain
+    caused an early release (e.g. a per-buf drop), the tail bytes would come
+    from freed slab memory -- which shows up here as a body mismatch, a short
+    read or a reset, all of which this test fails on.
+
+    Read in small pieces with a pause, so the drain genuinely spans multiple
+    write events rather than being satisfied by one large socket buffer."""
+    path = "/chain/chainbig-slow"
+    s, prime, _ = fetch(ng.port, path)
+    assert s == 200, f"prime status {s}"
+    assert len(prime) == 320000
+
+    # Confirm it is actually cached before the slow read, so the slow read is
+    # exercising serve() and not an origin passthrough.
+    s, _, h = fetch(ng.port, path)
+    assert h.get("x-cache") == "HIT", \
+        f"entry not cached before the slow-drain read (X-Cache={h.get('x-cache')!r})"
+
+    _bump_conn()
+    sock = socket.create_connection(("127.0.0.1", ng.port), HTTP_TIMEOUT)
+    try:
+        sock.sendall(
+            f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            f"Connection: close\r\n\r\n".encode())
+        sock.settimeout(HTTP_TIMEOUT)
+
+        chunks = []
+        total = 0
+        # Deliberately small reads with a sleep: this is what keeps the socket
+        # buffer full and the response draining across many write events.
+        while True:
+            try:
+                d = sock.recv(4096)
+            except TimeoutError:
+                break
+            if not d:
+                break
+            chunks.append(d)
+            total += len(d)
+            if total < 200000:
+                time.sleep(0.002)
+        raw = b"".join(chunks)
+    finally:
+        sock.close()
+
+    head, _, body = raw.partition(b"\r\n\r\n")
+    assert b"200" in head.split(b"\r\n", 1)[0], f"slow-drain status line: {head[:80]!r}"
+    assert b"X-Cache: HIT" in head, \
+        f"slow-drain response was not a cache HIT; headers: {head[:400]!r}"
+    assert len(body) == 320000, \
+        f"slow drain received {len(body)} of 320000 bytes -- the chain was " \
+        f"truncated, or the blob was released before the last buf was written"
+    assert body.decode("ascii") == prime, \
+        "slow-drain body differs from the primed body -- the tail bytes did " \
+        "not come from the live blob"

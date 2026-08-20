@@ -3565,6 +3565,19 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # P4-5 multi-buf zero-copy serve: a body ~10x the 32 KB serve slice,
+        # cached whole (max_size well above it, unlike /qbig/ which caps at 1k
+        # to force the oversize abort). X-Cache distinguishes the origin MISS
+        # from the chained HIT, which is what lets the test compare the two
+        # bodies for byte equality without the comparison being vacuous.
+        location /chain/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    60s;
+            cache_turbo_max_size 4m;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # Q1: a location WITHOUT cache_turbo -> $cache_turbo_active must be "0"
         # (no ctx / disabled), proving the variable's defensive default.
         location /plain/ {{

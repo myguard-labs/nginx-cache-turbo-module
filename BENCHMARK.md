@@ -9,7 +9,9 @@ question from the one here.
 
 > **TL;DR.** On a stock-defaults nginx build, cache-turbo serves cached pages
 > **23–37 % faster than nginx's own `proxy_cache`** for small/medium bodies and
-> **~10 % faster** for multi-megabyte bodies, at lower median and tail latency.
+> **~10 % faster** for multi-megabyte bodies, at lower median latency. Tail
+> (p99) is lower for small/medium bodies; on `large` it is at parity with
+> proxy_cache — see "On `large` p99 specifically" below before quoting it.
 > Versus going to the origin every time, any cache (turbo or proxy_cache) is
 > **20–25× faster** — caching is the big win; beating proxy_cache is the
 > incremental one.
@@ -104,7 +106,9 @@ For each `(size, run)` cell the harness:
 
 - **Payloads:** random base64 of 200 B (`tiny`), 200 KB (`medium`), 4 MB
   (`large`) — same generator as `tools/soak.sh`, so the two tools exercise the
-  same single-/multi-buffer serve paths.
+  same capture and serve paths. Note this exercises the multi-buf serve chain
+  (P4-5): a 4 MB body is emitted as ~128 zero-copy 32 KB bufs into one
+  refcounted blob, not as one buffer.
 - **Steady state, not churn:** big zones (64 MB) + long TTL (60 s) so the run is
   a **pure-hit** measurement — no eviction, no revalidation. That isolates raw
   serve cost. (Eviction/SWR/single-flight under churn are what `soak.sh`
@@ -151,11 +155,31 @@ over proxy_cache* (B → C) is the incremental win this module exists for.
 **Why the edge over proxy_cache shrinks as bodies grow** — tiny +23 %, medium
 +37 %, large +10 %. For small bodies the wall-clock is dominated by cache
 bookkeeping (lookup, header assembly), where cache-turbo's RAM path is leaner
-than proxy_cache's disk-cache machinery. For a 4 MB body the time is dominated by
-*copying the bytes out the socket*, which every contender pays equally — the
-cache layer is noise next to the memcpy, so the gap collapses. (The `large` p99
-also goes slightly the other way: multi-buffer serves have more scheduling
-variance.)
+than proxy_cache's disk-cache machinery.
+
+For a 4 MB body the cache layer is a small share of the total, so the gap
+narrows — but **not** because "every contender pays the same memcpy". An
+earlier revision of this page said exactly that and it was wrong in
+cache-turbo's favour: a cache-turbo hit does **not** pay proxy_cache's copy.
+The body is served straight out of the shm slab, pinned by a refcount for the
+life of the response (`ngx_http_cache_turbo_serve()`), so there is no
+cache→request copy at all, while proxy_cache reads the body through its own
+file/buffer machinery. What actually dominates at 4 MB is the kernel-side cost
+of pushing the bytes out the socket plus the client's own read, which is
+common to both — and that common floor, not a shared memcpy, is what compresses
+the relative gap.
+
+**On `large` p99 specifically.** Throughput and p50 are clearly ahead
+(~3.1–3.3k vs ~2.4–2.5k rps; ~8.6 ms vs ~12.7 ms p50), but p99 is roughly at
+**parity** with proxy_cache and jitters to either side between runs — measured
+across four 5-pass runs, cache-turbo landed anywhere in 29.8–34.3 ms against
+proxy_cache's 23.4–32.3 ms. Treat the `large` p99 column as "no reliable
+difference", not as a win or a loss; the run-to-run spread on a loopback
+single-box bench is larger than the gap. An earlier note here attributed the
+`large` p99 to "multi-buffer serves have more scheduling variance", which was
+doubly wrong: the serve was a *single* buffer at the time, and when it was
+later split into a 32 KB multi-buf chain (P4-5) the p99 did not measurably
+move in either direction.
 
 **Redis ≈ shm, by design.** An L1 (RAM) hit **never touches Redis** — Redis is
 read only on an L1 *miss* and written through on store. So on a 100 %-hit bench

@@ -324,7 +324,7 @@ class Origin:
             def _get_handle_special_cases(self, n: int) -> tuple[bool, bytes | None]:
                 """Marker-driven special-case responses (ctxrdr-missing,
                 precompressed, partial, rngsrc, redir, notfound, bigbody,
-                unbuf-stream, unbuf-big, ckecho) plus the midbody-mismatch body
+                chainbig, unbuf-stream, unbuf-big, ckecho) plus the midbody-mismatch body
                 computation.
                 Returns (True, None) if a complete response was written
                 (caller must stop), or (False, body) with the body for the
@@ -437,6 +437,47 @@ class Origin:
                             + b"x" * 200000)
                     self.send_response(200)
                     self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    try:
+                        self.wfile.write(body)
+                    except BrokenPipeError:
+                        pass
+                    return True, None
+                if "chainbig" in self.path:
+                    # P4-5: a LARGE, CACHEABLE, deterministic body used to
+                    # exercise the multi-buf zero-copy serve chain in
+                    # ngx_http_cache_turbo_serve(). Three properties are all
+                    # load-bearing:
+                    #
+                    #   * SIZE -- 320000 bytes is ~9.8 x the 32 KB slice size,
+                    #     so the served chain is ~10 bufs and the body crosses
+                    #     many chunk boundaries including a final PARTIAL one
+                    #     (320000 % 32768 = 6656). An exact multiple would hide
+                    #     an off-by-one in the tail slice.
+                    #
+                    #   * POSITION-DEPENDENT CONTENT -- every 16-byte record
+                    #     encodes its own offset. A run of identical bytes
+                    #     (like the `bigbody` marker above) is byte-identical
+                    #     under a duplicated, dropped or reordered chunk, so it
+                    #     could not detect the exact failure modes chaining
+                    #     introduces. This body can.
+                    #
+                    #   * CACHEABLE -- an explicit max-age, because the whole
+                    #     point is to compare a stored HIT against the origin
+                    #     MISS. `bigbody` sends no Cache-Control and is used
+                    #     for the oversize-abort path instead.
+                    #
+                    # The body is IDENTICAL on every origin contact (no gen-N
+                    # prefix) precisely so a HIT and a MISS can be compared for
+                    # byte equality; the test distinguishes them by X-Cache,
+                    # not by content.
+                    body = b"".join(
+                        b"%015d\n" % off
+                        for off in range(0, 320000, 16))
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header("Cache-Control", "public, max-age=60")
                     self.send_header("Content-Length", str(len(body)))
                     self.end_headers()
                     try:
