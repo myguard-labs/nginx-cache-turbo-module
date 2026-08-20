@@ -2739,6 +2739,15 @@ typedef struct {
     ngx_http_cache_turbo_loc_conf_t  *clcf;
     ngx_http_cache_turbo_zone_t      *zone;
     ngx_str_t                         tag;    /* copied into r->pool */
+
+    /* c-1: set only by the COR-5 auto-Vary caller (purge_auto_vary), never by
+     * admin.c's ?tag= handler -- a user-named tag has no "expected variant
+     * count" to fall short of, so "complete" has no meaning there. When set,
+     * the completion snapshots the zone's varidx_drops/varidx_reissues gap
+     * BEFORE launching SMEMBERS (auto_vary_pending_at_launch) so the reply
+     * can tell a full enumeration from one that raced an unhealed drop. */
+    unsigned                           is_auto_vary:1;
+    ngx_uint_t                         pending_at_launch;
 } ngx_http_cache_turbo_tagpurge_t;
 
 ngx_int_t ngx_http_cache_turbo_tag_purge_complete(ngx_http_request_t *r,
