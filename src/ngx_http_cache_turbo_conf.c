@@ -3096,14 +3096,10 @@ ngx_http_cache_turbo_ignore_set_cookie_conf(ngx_conf_t *cf, ngx_command_t *cmd,
          * configured a relax that is in fact inert. Fail at config time instead.
          */
         for (j = 0; j < value[i].len; j++) {
-            u_char  c = value[i].data[j];
-
-            if (c <= 0x20 || c >= 0x7f
-                || c == '=' || c == ';' || c == ',' || c == '"'
-                || c == '(' || c == ')' || c == '<' || c == '>'
-                || c == '@' || c == ':' || c == '\\' || c == '/'
-                || c == '[' || c == ']' || c == '?' || c == '{' || c == '}')
-            {
+            /* SAME predicate the runtime Set-Cookie parser applies, so a name
+             * accepted here can never be one the parser silently refuses to
+             * match (an inert relax the operator believes is active). */
+            if (!ngx_http_cache_turbo_is_cookie_name_byte(value[i].data[j])) {
                 return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
                     "cache_turbo_ignore_set_cookie name \"%V\" is not a valid "
                     "cookie name (RFC 6265 token)", &value[i]);

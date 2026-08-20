@@ -2954,14 +2954,7 @@ ngx_http_cache_turbo_set_cookie_name(u_char *data, size_t len,
     name_out->len = (size_t) (eq - p);
 
     for (i = 0; i < name_out->len; i++) {
-        u_char  c = name_out->data[i];
-
-        if (c <= 0x20 || c >= 0x7f
-            || c == '=' || c == ';' || c == ',' || c == '"'
-            || c == '(' || c == ')' || c == '<' || c == '>'
-            || c == '@' || c == ':' || c == '\\' || c == '/'
-            || c == '[' || c == ']' || c == '?' || c == '{' || c == '}')
-        {
+        if (!ngx_http_cache_turbo_is_cookie_name_byte(name_out->data[i])) {
             return 0;
         }
     }
