@@ -1,4 +1,4 @@
-# sync-sha: 2521fd796d38ab5abdb97493461f8ea627b1810c2fd09db681746d7e29f53167
+# sync-sha: a7d779d189450a19110d75e355465b4a4f769e7536c63c7fdac76f25c8a8a203
 name: CI
 
 # Single entry point for the PR suite. The checks below used to be independent
@@ -128,9 +128,11 @@ jobs:
           set -euo pipefail
           # workflow_dispatch has no PR base; treat that as "run everything".
           if [ -z "${BASE_SHA:-}" ]; then
-            echo "asan=true" >> "$GITHUB_OUTPUT"
-            echo "fuzz=true" >> "$GITHUB_OUTPUT"
-            echo "code=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "asan=true"
+              echo "fuzz=true"
+              echo "code=true"
+            } >> "$GITHUB_OUTPUT"
             exit 0
           fi
           # Fail loudly rather than fail open. A gate that cannot compute its
