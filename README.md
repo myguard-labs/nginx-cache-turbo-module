@@ -74,6 +74,7 @@ a no-op prints exactly the same clean line as one that passes.
 - [Microcaching (1-second TTL for APIs and PHP-FPM)](#microcaching-1-second-ttl-for-apis-and-php-fpm)
 - [Long-tail URLs: reach for `cache_turbo_min_uses` first](#long-tail-urls-reach-for-cache_turbo_min_uses-first)
 - [Scan-resistant eviction: `cache_turbo_scan_resistant`](#scan-resistant-eviction-cache_turbo_scan_resistant)
+- [Admission control: `cache_turbo_zone ... admission=on`](#admission-control-cache_turbo_zone--admissionon)
 - [Zone sizing under LRU pressure](#zone-sizing-under-lru-pressure)
 - [What autotune actually tunes](#what-autotune-actually-tunes)
 - [Full example (the works)](#full-example-the-works)
@@ -1626,6 +1627,58 @@ are never accessed again are drained by eviction once probation empties, so the
 zone converges on the flat LRU rather than keeping a permanently privileged set.
 The convergence is gradual, not instantaneous; restart (rather than reload) if
 you need the flat LRU immediately.
+
+## Admission control: `cache_turbo_zone ... admission=on`
+
+**Off by default, and unlike `cache_turbo_scan_resistant` it stays off.**
+Scan-resistant eviction only changes *which* resident entry is given up;
+admission control changes whether a response is cached **at all**. A wrongly
+refused store is a silent, permanent extra origin hit for that key, so the flip
+is an operator decision made per zone after watching the counters.
+
+```nginx
+http {
+    cache_turbo_zone name=ct 256m admission=on;   # opt in, per zone
+    # cache_turbo_zone name=ct 256m;              # default: admission off
+}
+```
+
+It is a **zone** parameter, not a location directive: the decision is made
+inside the shared-memory store path, which sees the zone and no location
+config.
+
+**What it decides.** The module keeps a small W-TinyLFU frequency sketch (a
+4-row count-min sketch of 4-bit counters, ~0.05% of the zone) bumped on every
+access. When a **new** key would be stored and there is a resident entry on the
+probation tail, the candidate's estimated frequency is compared against that
+victim's. If the candidate is **strictly colder**, the store is refused and the
+resident entry keeps its slot. Without this, eviction is 100% recency and a
+one-hit wonder *always* displaces a resident entry.
+
+It **fails open** in every ambiguous direction — a refused store is the
+expensive mistake, an admitted one merely costs a slot:
+
+- the policy is off (the default) → admit;
+- the sketch could not be allocated → admit (no evidence is never a refusal);
+- probation is empty → admit (there is no victim to be colder than, and a cold
+  zone must be able to fill itself);
+- the estimates **tie** → admit (a count-min estimate over-counts on collision
+  and never under-counts, so equality is the ambiguous case).
+
+Refreshes of an already-resident entry are never subject to it: they displace
+nobody.
+
+**Watch these before and after.** `admission_refused` climbing while the hit
+ratio does not improve means the policy is refusing work it should be caching;
+turn it back off. `sketch_bumps` at 0 on a live zone means the sketch was never
+allocated and the policy is inert. `sketch_gen` counts the sketch's aging
+halvings.
+
+| JSON field | Prometheus |
+|---|---|
+| `admission_refused` | `cache_turbo_admission_refused_total` |
+| `sketch_bumps` | `cache_turbo_sketch_bumps_total` |
+| `sketch_gen` | `cache_turbo_sketch_gen` |
 
 ## What autotune actually tunes
 

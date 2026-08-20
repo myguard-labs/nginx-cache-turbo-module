@@ -962,6 +962,22 @@ typedef struct {
     ngx_uint_t               sketch_ops;        /* bumps since last halving  */
     ngx_uint_t               sketch_reset_at;   /* halve when ops reaches it */
     ngx_uint_t               sketch_gen;        /* halvings so far           */
+
+    /* P4-1b: W-TinyLFU ADMISSION. `admission` mirrors the zone's
+     * `cache_turbo_zone ... admission=on` parameter into shared memory so
+     * ngx_http_cache_turbo_shm_store_locked(), which only ever receives the
+     * zone (its L1-vtable signature carries no loc conf), can read the policy
+     * without a signature change. Zero == OFF, which is the shipped default,
+     * so an inherited or zeroed zone is inert.
+     *
+     * `sketch_bumps` is the lifetime bump tally (sketch_ops resets on every
+     * halving, so it cannot answer "is the sketch learning anything at all?").
+     * `admission_refused` counts candidates this policy turned away.
+     * Both are plain fields, like every other sketch field: every access is
+     * under the shpool mutex. */
+    ngx_uint_t               admission;         /* 0 = off (default)         */
+    ngx_uint_t               sketch_bumps;      /* lifetime bumps            */
+    ngx_uint_t               admission_refused; /* candidates refused        */
 #if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
     && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
     /* O4.4-i: lifetime count of breaker-fallback ARMINGS, bumped inside the
@@ -1037,6 +1053,11 @@ typedef struct {
     time_t                   policy_window;
     time_t                   policy_open;
     time_t                   policy_retry_after;
+
+    /* P4-1b: the zone's parsed `admission=on|off` parameter. Config-time,
+     * cf->pool-resident, copied into shctx_t.admission by init_zone(). 0 =
+     * off, the shipped default. */
+    ngx_uint_t               admission;
 } ngx_http_cache_turbo_zone_t;
 
 
@@ -1055,6 +1076,15 @@ typedef struct {
     ngx_atomic_uint_t   min_uses_skips; /* v15 cold misses below min_uses     */
     ngx_atomic_uint_t   l2_neg_skips;   /* L13 L2 GETs skipped by a memo      */
     ngx_atomic_uint_t   bypasses;     /* bypass / auto-classify skips to origin */
+    /* P4-1b: W-TinyLFU admission introspection. sketch_gen = halvings so far
+     * (0 means the sketch has never aged, i.e. either brand new or absent);
+     * sketch_bumps = lifetime bumps (0 with a live zone means the sketch was
+     * never allocated); admission_refused = candidates the policy turned
+     * away. Together they let an operator tell "admission is off" from
+     * "admission is on and refusing nothing". */
+    ngx_atomic_uint_t   sketch_gen;
+    ngx_atomic_uint_t   sketch_bumps;
+    ngx_atomic_uint_t   admission_refused;
     /* P0-1: per-reason store-refusal counters, mirrors shctx_t. */
     ngx_atomic_uint_t   refuse_set_cookie;
     ngx_atomic_uint_t   refuse_encoded;

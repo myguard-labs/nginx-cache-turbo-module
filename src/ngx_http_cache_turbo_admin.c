@@ -381,8 +381,11 @@ ngx_http_cache_turbo_admin_stats_prometheus(ngx_http_request_t *r,
      * value itself is deliberately NOT a label, see the emit call
      * below; P0-1 added eight refuse_*_total counters, prose term
      * bumped by ~1050 bytes for their HELP/TYPE lines; P3-7 added
-     * bg_inflight (gauge), prose term bumped by ~180 bytes). */
-    len = 5130 + 28 * zname.len + 28 * NGX_ATOMIC_T_LEN;
+     * bg_inflight (gauge), prose term bumped by ~180 bytes; P4-1b added
+     * sketch_gen (gauge), sketch_bumps_total (counter) and
+     * admission_refused_total (counter), prose term bumped by ~530 bytes
+     * for their HELP/TYPE lines and the count 28 -> 31). */
+    len = 5660 + 31 * zname.len + 31 * NGX_ATOMIC_T_LEN;
     p = ngx_pnalloc(r->pool, len);
     if (p == NULL) {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -472,7 +475,16 @@ ngx_http_cache_turbo_admin_stats_prometheus(ngx_http_request_t *r,
         "cache_turbo_breaker_state{zone=\"%V\"} %uA\n"
         "# HELP cache_turbo_bg_inflight Background-refresh subrequests currently in flight for this zone (cache_turbo_background_update_max cap).\n"
         "# TYPE cache_turbo_bg_inflight gauge\n"
-        "cache_turbo_bg_inflight{zone=\"%V\"} %uA\n",
+        "cache_turbo_bg_inflight{zone=\"%V\"} %uA\n"
+        "# HELP cache_turbo_sketch_gen W-TinyLFU sketch aging generation (halvings so far; 0 = never aged or no sketch).\n"
+        "# TYPE cache_turbo_sketch_gen gauge\n"
+        "cache_turbo_sketch_gen{zone=\"%V\"} %uA\n"
+        "# HELP cache_turbo_sketch_bumps_total Lifetime W-TinyLFU sketch increments (0 on a live zone means the sketch was never allocated).\n"
+        "# TYPE cache_turbo_sketch_bumps_total counter\n"
+        "cache_turbo_sketch_bumps_total{zone=\"%V\"} %uA\n"
+        "# HELP cache_turbo_admission_refused_total New entries refused by W-TinyLFU admission control (cache_turbo_zone ... admission=on).\n"
+        "# TYPE cache_turbo_admission_refused_total counter\n"
+        "cache_turbo_admission_refused_total{zone=\"%V\"} %uA\n",
         &zname, st->hits, &zname, st->misses, &zname, st->stale_serves,
         &zname, st->refreshes, &zname, st->evictions,
         &zname, st->l2_hits, &zname, st->l2_misses, &zname, st->lock_waits,
@@ -489,7 +501,9 @@ ngx_http_cache_turbo_admin_stats_prometheus(ngx_http_request_t *r,
         &zname, st->breaker_opens,
         &zname, (ngx_atomic_uint_t) ngx_http_cache_turbo_brk_state(
             (ngx_uint_t) st->breaker_state),
-        &zname, st->bg_inflight) - p;
+        &zname, st->bg_inflight,
+        &zname, st->sketch_gen, &zname, st->sketch_bumps,
+        &zname, st->admission_refused) - p;
 
     return ngx_http_cache_turbo_send_body(r, NGX_HTTP_OK, &body,
         "text/plain; version=0.0.4; charset=utf-8",
@@ -518,8 +532,10 @@ ngx_http_cache_turbo_admin_stats_json(ngx_http_request_t *r,
                  "\"autotuned_beta\":,\"autotuned_load\":,"
                  "\"breaker_state\":\"\",\"breaker_opens\":,"
                  "\"sie_serves\":,\"breaker_serves\":,"
-                 "\"origin_failures\":,\"bg_inflight\":}\n")
-          + 27 * NGX_ATOMIC_T_LEN
+                 "\"origin_failures\":,\"bg_inflight\":,"
+                 "\"sketch_gen\":,\"sketch_bumps\":,"
+                 "\"admission_refused\":}\n")
+          + 30 * NGX_ATOMIC_T_LEN
           + sizeof("half-open") - 1;   /* longest _breaker_state_str value */
     p = ngx_pnalloc(r->pool, len);
     if (p == NULL) {
@@ -540,7 +556,9 @@ ngx_http_cache_turbo_admin_stats_json(ngx_http_request_t *r,
         "\"autotuned_load\":%uA,"
         "\"breaker_state\":\"%s\",\"breaker_opens\":%uA,"
         "\"sie_serves\":%uA,\"breaker_serves\":%uA,"
-        "\"origin_failures\":%uA,\"bg_inflight\":%uA}\n",
+        "\"origin_failures\":%uA,\"bg_inflight\":%uA,"
+        "\"sketch_gen\":%uA,\"sketch_bumps\":%uA,"
+        "\"admission_refused\":%uA}\n",
         st->hits, st->misses, st->stale_serves,
         st->refreshes, st->evictions, st->l2_hits, st->l2_misses,
         st->lock_waits, st->min_uses_skips, st->l2_neg_skips,
@@ -554,7 +572,8 @@ ngx_http_cache_turbo_admin_stats_json(ngx_http_request_t *r,
             (ngx_uint_t) st->breaker_state),
         st->breaker_opens,
         st->sie_serves, st->breaker_serves, st->origin_failures,
-        st->bg_inflight) - p;
+        st->bg_inflight,
+        st->sketch_gen, st->sketch_bumps, st->admission_refused) - p;
 
     return ngx_http_cache_turbo_send_json(r, NGX_HTTP_OK, &body);
 }

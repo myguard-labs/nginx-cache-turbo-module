@@ -210,6 +210,13 @@ ngx_http_cache_turbo_shm_init_zone(ngx_shm_zone_t *shm_zone, void *data)
     ctx->sh->sketch_reset_at = 0;
     ctx->sh->sketch_gen = 0;
 
+    /* P4-1b: admission policy mirror + observability counters. The policy is
+     * OFF unless the zone directive asked for it; ctx->admission was parsed
+     * at config time (cache_turbo_zone ... admission=on). */
+    ctx->sh->admission = ctx->admission;
+    ctx->sh->sketch_bumps = 0;
+    ctx->sh->admission_refused = 0;
+
     {
         ngx_uint_t  width, w, bytes;
 
@@ -471,6 +478,8 @@ ngx_http_cache_turbo_shm_sketch_bump(ngx_http_cache_turbo_zone_t *z,
 
         ngx_http_cache_turbo_sketch_inc(z->sh->sketch, idx);
     }
+
+    z->sh->sketch_bumps++;   /* P4-1b: lifetime tally, never reset by halving */
 
     /* Age on the BUMP count, not on wall-clock time: a quiet zone should not
      * forget what it learned just because an hour passed with no traffic. */
@@ -784,6 +793,90 @@ ngx_http_cache_turbo_shm_node_sie_live(ngx_http_cache_turbo_node_t *ctn,
     sie_ttl  = ngx_http_cache_turbo_shm_get_u32(ctn->data + 40);
 
     return sie_ttl > 0 && now < created + (time_t) sie_ttl;
+}
+
+
+/* P4-1b: W-TinyLFU ADMISSION. Answer "should this NEW key be admitted?".
+ * Returns 1 = admit, 0 = refuse. Caller holds the shpool mutex.
+ *
+ * The decision, and only this: a candidate is refused when the frequency
+ * sketch says it is STRICTLY COLDER than the entry the zone would have to
+ * give up to make room for it -- the probation tail, which is exactly the
+ * node ngx_http_cache_turbo_shm_evict_one() takes first. Without this, a
+ * one-hit wonder ALWAYS displaces a resident entry: eviction here is 100%
+ * recency and there is no other place that says no.
+ *
+ * ⚠ THE TERMINATION ARGUMENT -- why a policy that can REJECT cannot make
+ *   ngx_http_cache_turbo_shm_alloc_evict() spin.
+ *
+ *   alloc_evict()'s loop is `while (p == NULL && evict_one(z))`. It spins
+ *   forever only if evict_one() keeps claiming progress without freeing
+ *   anything. This function is NOT in that loop and never will be: it is
+ *   called ONCE, by store_locked(), strictly BEFORE alloc_evict() is entered,
+ *   and its answer is a plain early `return NGX_DECLINED` from store_locked().
+ *   A refusal therefore REMOVES an alloc_evict() call rather than adding an
+ *   iteration to one, and cannot alter evict_one()'s per-call progress
+ *   guarantee (which is what the contract at the head of evict_one() states).
+ *
+ *   The inverse hazard -- a refusal LOOP, where the caller retries the store
+ *   hoping for a different answer -- is closed by the same shape: store_locked
+ *   returns to its caller, which propagates the refusal up as a
+ *   store-declined, and nothing in this module re-drives a store on
+ *   NGX_DECLINED. There is no retry to bound.
+ *
+ *   Both properties are pinned by test_p4_1b_admission_never_spins().
+ *
+ * FAIL-OPEN, in three independent directions, because a wrongly refused
+ * store is a silent permanent cache miss:
+ *   - policy off (the shipped default)            -> admit
+ *   - sketch unavailable (NULL / never allocated) -> admit; estimate() returns
+ *     0 for BOTH sides there, and 0 < 0 is false, but the explicit test says
+ *     so rather than relying on that arithmetic
+ *   - nothing resident to displace (probation empty) -> admit. Refusing here
+ *     would let a cold zone refuse to fill itself, and there is no victim to
+ *     be colder than.
+ *
+ * Ties ADMIT (strict <). A sketch estimate is one-sided (it over-counts on a
+ * collision, never under-counts), so equality is the ambiguous case and the
+ * ambiguous answer is the fail-open one.
+ */
+static ngx_int_t
+ngx_http_cache_turbo_shm_admit(ngx_http_cache_turbo_zone_t *z, uint32_t hash)
+{
+    ngx_queue_t                  *q;
+    ngx_http_cache_turbo_node_t  *victim;
+    ngx_uint_t                    cand_freq, victim_freq;
+
+    if (!z->sh->admission) {
+        return 1;                    /* policy off: the shipped default */
+    }
+
+    if (z->sh->sketch == NULL) {
+        return 1;                    /* no evidence is never a reason to refuse */
+    }
+
+    if (ngx_queue_empty(&z->sh->lru)) {
+        /* No probation victim. Deliberately NOT falling through to the
+         * protected tail: refusing a candidate on behalf of an entry that has
+         * already proven itself twice would make an all-protected zone
+         * un-fillable, and the protected tail is not what evict_one() would
+         * take first anyway. */
+        return 1;
+    }
+
+    q = ngx_queue_last(&z->sh->lru);
+    victim = ngx_queue_data(q, ngx_http_cache_turbo_node_t, lru);
+
+    cand_freq   = ngx_http_cache_turbo_shm_sketch_estimate(z, hash);
+    victim_freq = ngx_http_cache_turbo_shm_sketch_estimate(z,
+                      (uint32_t) victim->node.key);
+
+    if (cand_freq < victim_freq) {
+        z->sh->admission_refused++;
+        return 0;
+    }
+
+    return 1;
 }
 
 
@@ -1122,7 +1215,25 @@ ngx_http_cache_turbo_shm_store_locked(ngx_http_cache_turbo_zone_t *z,
         return NGX_OK;
     }
 
-    /* New entry. */
+    /* New entry.
+     *
+     * P4-1b: the admission decision, and the ONLY place in this module that
+     * can refuse a storable response on frequency grounds. It sits here --
+     * new-entry path only, before alloc_evict() -- for two reasons. (1) The
+     * refresh path above updates an entry that is ALREADY resident and
+     * displaces nobody; refusing there would evict-by-omission, which is a
+     * different policy nobody asked for. (2) Being strictly before
+     * alloc_evict() is what makes the termination argument in shm_admit()
+     * hold: a refusal removes an alloc_evict() call, it never adds an
+     * iteration to one.
+     *
+     * NGX_DECLINED, not NGX_ERROR: this is a policy answer, not a failure.
+     * The store-declined path is already what a store_if() predicate refusal
+     * returns, so callers handle it. */
+    if (!ngx_http_cache_turbo_shm_admit(z, hash)) {
+        return NGX_DECLINED;
+    }
+
     ctn = ngx_http_cache_turbo_shm_alloc_evict(z,
               sizeof(ngx_http_cache_turbo_node_t));
     if (ctn == NULL) {
@@ -1363,6 +1474,12 @@ ngx_http_cache_turbo_shm_stats(ngx_http_cache_turbo_zone_t *z,
     /* P3-7: live gauge, not a lifetime tally -- read the same as every other
      * counter here (plain, unlocked; the atomic itself is the sync point). */
     out->bg_inflight = z->sh->bg_inflight;
+
+    /* P4-1b: admission introspection. Plain reads under no lock, exactly like
+     * every counter above -- these are diagnostics, not a decision input. */
+    out->sketch_gen        = (ngx_atomic_uint_t) z->sh->sketch_gen;
+    out->sketch_bumps      = (ngx_atomic_uint_t) z->sh->sketch_bumps;
+    out->admission_refused = (ngx_atomic_uint_t) z->sh->admission_refused;
 }
 
 
