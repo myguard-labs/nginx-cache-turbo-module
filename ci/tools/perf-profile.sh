@@ -130,10 +130,11 @@ LOAD_MODULE=""
 # VARY=1: origin emits Vary: Accept-Encoding so a request carrying
 # Accept-Encoding: gzip (added to the wrk invocation below) drives the
 # auto-Vary marker/variant-index path instead of the base-key hit path.
-# Empty (default) splices in nothing -- origin server block is byte-for-byte
-# what it was before this option existed.
-VARY_HEADER=""
-[ -n "$VARY" ] && VARY_HEADER='add_header Vary "Accept-Encoding";'
+# Whole-line splice (not a fragment) so the default render is BYTE-IDENTICAL
+# to the pre-VARY script -- this harness's value is cross-run comparability,
+# and a fragment splice leaves a trailing blank line the default never had.
+LOCATION_BLOCK='location / { add_header Cache-Control "max-age=600"; }'
+[ -n "$VARY" ] && LOCATION_BLOCK='location / { add_header Cache-Control "max-age=600"; add_header Vary "Accept-Encoding"; }'
 
 cat > "$WORK/conf/nginx.conf" <<EOF
 daemon off;
@@ -151,10 +152,7 @@ http {
         listen 127.0.0.1:$ORIGIN;
         root $WORK/html;
         default_type text/plain;
-        location / {
-            add_header Cache-Control "max-age=600";
-            $VARY_HEADER
-        }
+        $LOCATION_BLOCK
     }
 
     server {
