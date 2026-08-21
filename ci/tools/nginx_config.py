@@ -783,6 +783,22 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             deny all;
         }}
 
+        # SILENT-INDEX-DROP(c): purge-by-tag endpoint for /tagidxdrop/.
+        # A tag purge resolves the tag SET through the admin location's OWN
+        # cache_turbo_redis, so it MUST carry the same prefix the objects were
+        # stored under -- /tagidxdrop/ uses prefix=tvd: (to keep its injected
+        # drops away from the ct:tag:* counts other L2 tests assert exact
+        # values on), so purging it via /_cache_l2 (prefix=ct:) would look up
+        # ct:tag:tagidxdrop-t1, find nothing, and report {"purged":0}.
+        # Same zone (`main`) as /tagidxdrop/, so the admin JSON counters
+        # (tag_index_drops) still read that zone.
+        location = /_cache_l2tvd {{
+            cache_turbo_admin    main;
+            cache_turbo_redis    127.0.0.1:{redis_port} prefix=tvd: timeout=250ms;
+            allow 127.0.0.1;
+            deny all;
+        }}
+
         # SUITE-1: stats endpoint for the /l2neg/ zone. l2_neg_skips is per-zone
         # and the admin handler emits exactly ONE zone's stats, so a test that
         # isolates /l2neg/ into `l2negz` must read the counter HERE -- reading
