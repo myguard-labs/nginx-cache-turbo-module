@@ -973,6 +973,8 @@ char *ngx_http_cache_turbo_vary_marker_revalidate(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 char *ngx_http_cache_turbo_keep_stale(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
+char *ngx_http_cache_turbo_warm_max(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
 char *ngx_http_cache_turbo_use_stale(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 char *ngx_http_cache_turbo_preset(ngx_conf_t *cf, ngx_command_t *cmd,

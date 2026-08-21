@@ -279,6 +279,18 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       offsetof(ngx_http_cache_turbo_loc_conf_t, background_update_max),
       NULL },
 
+    /* P5-2-p0: ceiling on URLs warmed per admin warm request (?url=... or
+     * ?url_file=...). Default 32 (unchanged behaviour); range-checked by
+     * hand in ngx_http_cache_turbo_warm_max() -- a bare ngx_conf_set_num_slot
+     * would accept 0 or a negative value and silently disable warming rather
+     * than erroring, the same H5/scan_resistant_pct lesson. */
+    { ngx_string("cache_turbo_warm_max"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
+      ngx_http_cache_turbo_warm_max,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+
     { ngx_string("cache_turbo_lock"),
       NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_FLAG,
       ngx_conf_set_flag_slot,
@@ -4903,6 +4915,7 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->purge = NGX_CONF_UNSET;
     conf->background_update = NGX_CONF_UNSET;
     conf->background_update_max = NGX_CONF_UNSET;  /* P3-7; merges to 0 = unlimited */
+    conf->warm_max = NGX_CONF_UNSET;  /* P5-2-p0; merges to WARM_MAX_DEFAULT (32) */
     conf->surrogate_key = NGX_CONF_UNSET;
     conf->lock = NGX_CONF_UNSET;
     conf->lock_timeout = NGX_CONF_UNSET_MSEC;

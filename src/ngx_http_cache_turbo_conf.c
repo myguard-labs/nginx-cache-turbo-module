@@ -967,6 +967,13 @@ ngx_http_cache_turbo_merge_zone_and_lock(
     ngx_conf_merge_value(conf->background_update_max,
                          prev->background_update_max, 0);
 
+    /* P5-2-p0: cache_turbo_warm_max defaults to the previous hardcoded cap
+     * (32), so behaviour is unchanged unless an operator opts in. The
+     * directive handler already rejects 0/negative/duplicate, so merge only
+     * ever fills the "never set" (NGX_CONF_UNSET) case. */
+    ngx_conf_merge_value(conf->warm_max, prev->warm_max,
+                         NGX_HTTP_CACHE_TURBO_WARM_MAX_DEFAULT);
+
     /* v10: cold-miss single-flight defaults ON — concurrent first-hits for one
      * cold key collapse to a single origin fetch; the rest wait up to
      * lock_timeout (default 5s) and serve the filled entry. */
@@ -2481,6 +2488,48 @@ ngx_http_cache_turbo_scan_resistant(ngx_conf_t *cf, ngx_command_t *cmd,
     }
 
     clcf->scan_resistant_pct = on ? (ngx_uint_t) pct : 0;
+
+    return NGX_CONF_OK;
+}
+
+
+/* cache_turbo_warm_max N (P5-2-p0). Ceiling on URLs warmed per admin warm
+ * request (?url=... or ?url_file=...).
+ *
+ * Range-checked by hand rather than via ngx_conf_set_num_slot for the same
+ * H5/scan_resistant_pct reason: a bare num_slot would accept 0 or a negative
+ * value and either silently disable warming or store a cap that lets the
+ * `warmed <` loop condition never terminate the way the caller expects. An
+ * out-of-band value is a config ERROR, not a coerced default. Also rejects
+ * anything above NGX_HTTP_CACHE_TURBO_WARM_MAX_CEILING: the value gates an
+ * operator-supplied fan-out of origin subrequests, so there is a hard upper
+ * bound an operator cannot configure past. */
+char *
+ngx_http_cache_turbo_warm_max(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_cache_turbo_loc_conf_t  *clcf = conf;
+
+    ngx_str_t   *value = cf->args->elts;
+    ngx_int_t    n;
+
+    if (clcf->warm_max != NGX_CONF_UNSET) {
+        return "is duplicate";
+    }
+
+    n = ngx_atoi(value[1].data, value[1].len);
+    if (n == NGX_ERROR || n < 1) {
+        return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
+            "cache_turbo_warm_max: bad value \"%V\": expected a positive "
+            "integer", &value[1]);
+    }
+
+    if (n > NGX_HTTP_CACHE_TURBO_WARM_MAX_CEILING) {
+        return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
+            "cache_turbo_warm_max: \"%V\" exceeds the maximum of %d",
+            &value[1], NGX_HTTP_CACHE_TURBO_WARM_MAX_CEILING);
+    }
+
+    clcf->warm_max = n;
 
     return NGX_CONF_OK;
 }
