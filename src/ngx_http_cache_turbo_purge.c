@@ -406,23 +406,29 @@ ngx_http_cache_turbo_tag_purge_complete(ngx_http_request_t *r, void *data,
 
     ngx_http_cache_turbo_redis_del_many(tp->clcf, delkeys, ndel);
 
-    /* c-1: report a DEGRADED enumeration explicitly rather than silently
-     * under-counting. tp->pending_at_launch != 0 means at least one variant
-     * in this zone had an un-healed varidx_pending bit when SMEMBERS was
-     * issued above -- the index set this purge just enumerated may not have
-     * listed every live variant of this base. "complete" is additive and
-     * defaults to true (existing behaviour, existing callers) so it stays
-     * backward-compatible; only the COR-5 auto-Vary caller (is_auto_vary)
-     * ever has a basis to say otherwise. Staleness itself is unaffected --
-     * the marker delete upstream of this callback already covers that; this
-     * is a REPORTING field only. */
+    /* c-1 / SILENT-INDEX-DROP(c): report a DEGRADED enumeration explicitly
+     * rather than silently under-counting. tp->pending_at_launch != 0 means
+     * this zone had an outstanding index drop when SMEMBERS was issued above,
+     * so the set this purge just enumerated may not have listed every live
+     * entry -- an object can be resident in L1 and still serving while absent
+     * from the index. Both callers now populate it (auto-Vary from the
+     * unhealed varidx gap, admin ?tag= from tag_index_drops); the snapshot
+     * itself encodes which counter is meaningful, so no caller check here.
+     *
+     * "complete" is additive and defaults to true, so a healthy purge's reply
+     * is byte-identical to before and existing consumers are unaffected.
+     * Staleness itself is unaffected -- this is a REPORTING field only. For
+     * the auto-Vary path the marker delete upstream already covers staleness;
+     * for the by-tag path nothing does, which is precisely why the report
+     * matters: it is the operator's only signal that the purge they just
+     * issued did not reach everything it claimed. */
     p = ngx_pnalloc(r->pool,
                     sizeof("{\"purged\":4294967295,\"complete\":false}\n"));
     if (p == NULL) {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
     body.data = p;
-    if (tp->is_auto_vary && tp->pending_at_launch != 0) {
+    if (tp->pending_at_launch != 0) {
         body.len = ngx_sprintf(p, "{\"purged\":%ui,\"complete\":false}\n",
                                 purged) - p;
     } else {

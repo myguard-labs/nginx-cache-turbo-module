@@ -2344,6 +2344,105 @@ def test_l9_tag_index_drop_is_observable(ng: Nginx, origin: Origin,
          f"{before2} -> {after2}")
 
 
+def test_tagidx_purge_reports_degraded_after_dropped_index_write(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    """SILENT-INDEX-DROP option (c) for the L9 tag index: a purge-by-tag must
+    report "complete":false once this zone has an outstanding tag-index drop,
+    instead of reporting plain success while a still-resident object keeps
+    serving stale.
+
+    Option (a) (test_l9_tag_index_drop_is_observable above) made the drop
+    OBSERVABLE in the admin counter. It did not change the purge REPLY, so the
+    live defect stayed: an operator issues a purge-by-tag, gets
+    {"purged":N} with no error, and a variant that was never indexed keeps
+    being served until its TTL. The wire could not distinguish "I enumerated
+    everything" from "I enumerated what the index happened to list".
+
+    Option (b) (re-issue on a later hit, as COR-5(b) does for the variant
+    index) is deliberately NOT implemented for tags and this test does not
+    assume it: the tag set comes from a cache_turbo_tag COMPLEX VALUE
+    evaluated against the ORIGIN RESPONSE in the body filter, so a later cache
+    hit has no upstream to re-derive it from and a re-issue would index the
+    object under the WRONG tags. Hence there is no tag_index_reissues counter
+    and the gap never closes on its own -- once this zone drops a tag-index
+    write, every subsequent purge-by-tag in it honestly reports degraded.
+
+    ORDERING IS LOAD-BEARING: tag_index_drops only ever increases and is
+    ZONE-scoped, so the clean "complete absent" leg MUST run BEFORE the fault
+    is injected. Reversing the two legs would make the clean leg unsatisfiable
+    and is not a flake but a permanent red.
+
+    MUTATION THIS CATCHES: restoring the `tp->is_auto_vary &&` conjunct in
+    ngx_http_cache_turbo_tag_purge_complete (purge.c), or dropping the
+    pending_at_launch snapshot in ngx_http_cache_turbo_admin_purge_tag
+    (admin.c), makes the degraded leg report a bare {"purged":N} and this test
+    goes red there while the clean leg stays green.
+    """
+    import json
+    drop_hdr = {"X-Cache-Turbo-Test-Varidx-Drop": "1"}
+    tag = "tagidxdrop-t1"
+    # Mirrors areas/l2.py's tag_key(name, prefix): <prefix>tag:<name>. Inlined
+    # rather than imported -- areas are siblings loaded as `areas.*` by
+    # test_runtime.py and do not import each other. /tagidxdrop/ is configured
+    # with its own redis prefix (tvd:) so this cannot collide with ct:tag:*.
+    tag_set_key = f"tvd:tag:{tag}"
+
+    # ---- Leg 1 (MUST come first): healthy purge does NOT claim degraded.
+    # No fault armed anywhere in this zone yet, so tag_index_drops is still 0
+    # and the reply must be byte-compatible with the pre-change contract.
+    assert _admin_stat(ng, "tag_index_drops") == 0, \
+        ("this test must observe a zone with no prior tag-index drop; a "
+         "non-zero count here means an earlier test in this zone injected "
+         "one and leg 1 can no longer be satisfied (see ORDERING above)")
+
+    s, b, _ = fetch(ng.port, "/tagidxdrop/clean1")
+    assert s == 200 and b, f"clean prime failed: {s} {b!r}"
+    assert wait_for(lambda: redis.cli("SCARD", tag_set_key) == "1"), \
+        "cleanly-stored object should be listed in its tag set"
+
+    s, b, _ = fetch(ng.port, f"/_cache_l2tvd?tag={tag}", method="POST")
+    assert s == 200, f"clean tag purge status {s}"
+    reply = json.loads(b)
+    assert reply["purged"] == 1, f"clean purge should report 1: {b}"
+    assert "complete" not in reply, \
+        (f"a fully-enumerated purge must not carry the additive 'complete' "
+         f"field at all (backward compatibility): {b}")
+
+    # ---- Leg 2: inject a real dropped tag-index write, then purge.
+    s, b0, _ = fetch(ng.port, "/tagidxdrop/dropped", headers=drop_hdr)
+    assert s == 200 and b0, f"dropped-index prime failed: {s} {b0!r}"
+    # The object caches anyway -- that IS the defect being reported on.
+    s, b1, h1 = fetch(ng.port, "/tagidxdrop/dropped", headers=drop_hdr)
+    assert s == 200 and h1.get("x-cache") == "HIT" and b1 == b0, \
+        "object should still cache even though its tag-index write was dropped"
+    assert _admin_stat(ng, "tag_index_drops") >= 1, \
+        "fault injection did not record a tag-index drop"
+
+    # Also store a cleanly-indexed object under the same tag, so the purge has
+    # something to enumerate and "purged" stays meaningful -- the point is that
+    # the count is SHORT, not that it is zero.
+    s, b2, _ = fetch(ng.port, "/tagidxdrop/alsotagged")
+    assert s == 200 and b2, f"second clean prime failed: {s} {b2!r}"
+    assert wait_for(lambda: redis.cli("SCARD", tag_set_key) == "1"), \
+        "only the cleanly-stored object should be in the tag set"
+
+    s, b, _ = fetch(ng.port, f"/_cache_l2tvd?tag={tag}", method="POST")
+    assert s == 200, f"degraded tag purge status {s}"
+    reply = json.loads(b)
+    assert reply.get("complete") is False, \
+        (f"purge-by-tag must report 'complete':false while a tag-index drop "
+         f"is outstanding in this zone -- otherwise it claims success while "
+         f"/tagidxdrop/dropped keeps serving stale: {b}")
+
+    # The unindexed object is exactly what the degraded report is warning
+    # about: the purge could not reach it, and it is STILL SERVING.
+    s, b3, h3 = fetch(ng.port, "/tagidxdrop/dropped")
+    assert s == 200 and h3.get("x-cache") == "HIT" and b3 == b0, \
+        ("the dropped-index object should have survived the purge -- if it "
+         "did not, the tag index was not actually short and this test is no "
+         "longer exercising the degraded case")
+
+
 def test_cache_and_purge_respect_access_control(ng: Nginx) -> None:
     """A cached GET and PURGE must run after allow/deny. Both locations share
     one cache key, proving the denied request cannot serve or delete the entry

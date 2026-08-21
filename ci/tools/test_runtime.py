@@ -427,6 +427,18 @@ def run_all(ng: Nginx, origin: Origin,
         # c-1: the PURGE reply must distinguish a complete enumeration from a
         # degraded one when a drop is still outstanding at purge time.
         test_cor5_purge_reports_degraded_enumeration(ng, origin, redis)
+        # SILENT-INDEX-DROP option (c): a purge-by-tag must REPORT a degraded
+        # enumeration once a tag-index drop is outstanding, rather than
+        # claiming success while an unindexed object keeps serving stale.
+        #
+        # ⚠ ORDER IS LOAD-BEARING: this runs BEFORE the option (a) test below.
+        # tag_index_drops is zone-scoped and only ever increases (tags have no
+        # re-issue, by design -- see the test docstring), so its clean
+        # "complete absent" leg is only satisfiable while the zone has taken
+        # no drop yet. Moving it after option (a) makes it a permanent red,
+        # not a flake.
+        test_tagidx_purge_reports_degraded_after_dropped_index_write(
+            ng, origin, redis)
         # SILENT-INDEX-DROP option (a): the L9 tag-index write's own drop
         # must be observable via the admin tag_index_drops counter.
         test_l9_tag_index_drop_is_observable(ng, origin, redis)

@@ -71,5 +71,13 @@ check_site() {
 
 check_site ngx_http_cache_turbo_filters.c varidx_drops 'varidx_drops'
 check_site ngx_http_cache_turbo_access.c varidx_reissues 'varidx_reissues'
+# SILENT-INDEX-DROP(c): tag_index_drops is now READ by the purge-by-tag reply
+# (admin.c snapshots it into tp->pending_at_launch; purge.c reports
+# "complete":false while it is non-zero), so it carries exactly the same
+# production-reachability requirement as the two varidx counters above -- if
+# it only incremented under TEST_FAULTS, a real operator's degraded purge
+# would always report as complete. There is deliberately no
+# tag_index_reissues counterpart: tags have no self-heal (see shctx_t).
+check_site ngx_http_cache_turbo_filters.c tag_index_drops 'tag_index_drops'
 
-echo "OK: varidx drop/reissue accounting is unconditional (production-reachable)"
+echo "OK: varidx + tag index drop/reissue accounting is unconditional (production-reachable)"

@@ -980,7 +980,18 @@ typedef struct {
      * a purge-by-tag is silently missing an object) without changing when
      * or whether the write itself happens. ZONE-scoped for the same
      * reason as varidx_drops -- the runtime suite has no request affinity
-     * across its 4 workers. */
+     * across its 4 workers.
+     *
+     * SILENT-INDEX-DROP(c): this counter is now READ by the purge-by-tag
+     * reply, which reports "complete":false while it is non-zero. There is
+     * deliberately NO tag_index_reissues companion: a re-issue is not
+     * possible for tags (the tag set is a cache_turbo_tag complex value
+     * evaluated against the ORIGIN RESPONSE in the body filter, so a later
+     * cache hit has no upstream to re-derive it from and would index the
+     * WRONG tags). The gap therefore never closes on its own, which is
+     * exactly what the reply is reporting: once a tag write has been
+     * dropped in this zone, no purge-by-tag in it can claim a complete
+     * enumeration until the zone is reloaded. */
     ngx_atomic_t             tag_index_drops;
 
     /* P4-1a: W-TinyLFU frequency sketch (count-min, 4-bit counters).
@@ -2993,13 +3004,38 @@ typedef struct {
     ngx_http_cache_turbo_zone_t      *zone;
     ngx_str_t                         tag;    /* copied into r->pool */
 
-    /* c-1: set only by the COR-5 auto-Vary caller (purge_auto_vary), never by
-     * admin.c's ?tag= handler -- a user-named tag has no "expected variant
-     * count" to fall short of, so "complete" has no meaning there. When set,
-     * the completion snapshots the zone's varidx_drops/varidx_reissues gap
-     * BEFORE launching SMEMBERS (auto_vary_pending_at_launch) so the reply
-     * can tell a full enumeration from one that raced an unhealed drop. */
+    /* c-1: set by the COR-5 auto-Vary caller (purge_auto_vary), clear on the
+     * admin ?tag= path.
+     *
+     * ⚠ Currently WRITE-ONLY: it used to gate the "complete":false reply, but
+     * SILENT-INDEX-DROP(c) extended that report to the by-tag path too, and
+     * which counter feeds pending_at_launch is now decided at the CALL SITE
+     * (each caller snapshots its own), so the completion needs no caller
+     * check. Kept because it is the only thing distinguishing the two callers
+     * in the completion's context, and the next path-specific behaviour will
+     * want it -- not because anything reads it today. Delete it, rather than
+     * inventing a use, if that stays true. */
     unsigned                           is_auto_vary:1;
+
+    /* SILENT-INDEX-DROP(c): snapshot of this zone's outstanding index-drop
+     * gap, taken BEFORE the SMEMBERS this purge is about to launch, so the
+     * reply can tell a full enumeration from one that raced a drop. Non-zero
+     * => the index set may be short an entry that is still resident in L1 and
+     * still serving, and the reply says "complete":false.
+     *
+     * Set on BOTH purge paths, from different counters:
+     *   - auto-Vary (is_auto_vary): varidx_drops - varidx_reissues, i.e. the
+     *     UNHEALED drops only, because that index self-heals on a later hit.
+     *   - by-tag (admin.c ?tag=): tag_index_drops alone. There is no tag
+     *     re-issue and no tag_index_reissues counter (see shctx_t), so every
+     *     drop this zone has ever taken stays outstanding.
+     *
+     * Zone-scoped, not base- or tag-scoped: the index set carries no
+     * per-member pending flag to check directly. Deliberately conservative
+     * in one direction -- it can call a purge degraded because some OTHER
+     * base or tag in the zone has an outstanding drop, never the reverse. A
+     * false "degraded" costs an operator a re-purge; a false "complete" is
+     * the defect this exists to catch. */
     ngx_uint_t                         pending_at_launch;
 } ngx_http_cache_turbo_tagpurge_t;
 

@@ -280,12 +280,39 @@ ngx_http_cache_turbo_admin_purge_tag(ngx_http_request_t *r,
         }
     }
 
-    tp = ngx_palloc(r->pool, sizeof(ngx_http_cache_turbo_tagpurge_t));
+    /* pcalloc, not palloc: pending_at_launch is read by the completion and
+     * was never assigned on this path (it only mattered while the read was
+     * gated on is_auto_vary, which this path leaves clear -- SILENT-INDEX-
+     * DROP(c) removes that gate, so the field is now load-bearing here and
+     * an indeterminate value would make the reply report at random). Both
+     * fields are still assigned explicitly below; the pcalloc is the belt to
+     * that braces for any field added to the struct later. */
+    tp = ngx_pcalloc(r->pool, sizeof(ngx_http_cache_turbo_tagpurge_t));
     if (tp == NULL) {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
     tp->clcf = clcf;
     tp->zone = z;
+    tp->is_auto_vary = 0;
+
+    /* SILENT-INDEX-DROP(c): snapshot the zone's outstanding tag-index drops
+     * BEFORE launching SMEMBERS below, so the reply can report a degraded
+     * enumeration instead of silently under-counting. A dropped tag-index
+     * write leaves an object resident in L1 and serving but ABSENT from the
+     * tag set this purge is about to read, so the purge would otherwise
+     * report success while that object keeps serving stale until its TTL.
+     *
+     * Unlike the auto-Vary path there is no reissues counter to subtract:
+     * tags cannot self-heal (the tag set is a response-derived complex
+     * value), so the raw drop count IS the outstanding gap. Consequence,
+     * intended: once this zone has dropped a tag-index write, every later
+     * purge-by-tag in it reports "complete":false until reload. That is
+     * honest -- nothing has repaired the index -- and it is the signal an
+     * operator needs to know a re-purge or an origin-side purge is required. */
+    tp->pending_at_launch = (ngx_uint_t)
+        ngx_atomic_fetch_add(
+            &ngx_http_cache_turbo_zone_sh(z)->tag_index_drops, 0);
+
     tp->tag.len = arg->len;
     tp->tag.data = ngx_pnalloc(r->pool, arg->len);
     if (tp->tag.data == NULL) {
