@@ -68,6 +68,20 @@ nginx_pids_under() {
     done
 }
 
+# Is $1 an nginx master? The master's cmdline carries the "-p"/"-c" arguments it
+# was exec'd with; a worker is forked, never exec'd, so it inherits that same
+# cmdline. Distinguish by PPID instead: a worker's parent is the master, which is
+# itself in the nginx set. Prints "master"/"worker".
+nginx_role() {
+    _pid=$1; _set=$2
+    _ppid=$(sed -e 's/^[0-9]* (.*) [A-Za-z] //' "/proc/$_pid/stat" 2>/dev/null \
+            | cut -d' ' -f1)
+    for _q in $_set; do
+        [ "$_q" = "$_ppid" ] && { echo worker; return; }
+    done
+    echo master
+}
+
 # Run the real command in the background; watch its wall time.
 "$@" &
 CMD_PID=$!
@@ -89,14 +103,46 @@ while kill -0 "$CMD_PID" 2>/dev/null; do
         fi
         pids=$(nginx_pids_under "$CMD_PID")
         [ -z "$pids" ] && echo "ci-hang-guard: no nginx under pid $CMD_PID" >&2
-        roots=""
+
+        # Split master from workers. The WORKER backtraces are the evidence: a
+        # master sits in sigsuspend() and never holds an epoll_wait frame, so a
+        # capture of the master alone cannot answer the event-loop question and
+        # reads as a false negative to any epoll_wait-based oracle.
+        masters=""; workers=""
         for pid in $pids; do
-            echo "ci-hang-guard: gdb + SIGQUIT pid=$pid" >&2
-            # Record the -p prefix WHILE the proc is alive (SIGQUIT below may reap it;
-            # cwd is unreliable — nginx may chdir to /). error.log = <prefix>/logs.
+            case "$(nginx_role "$pid" "$pids")" in
+                worker) workers="$workers $pid" ;;
+                *)      masters="$masters $pid" ;;
+            esac
+        done
+        echo "ci-hang-guard: masters=[$masters] workers=[$workers]" >&2
+
+        # Record the -p prefix from the MASTER, which is the process actually
+        # exec'd with the argument vector, and which outlives the workers here.
+        # (cwd is unreliable — nginx may chdir to /.) error.log = <prefix>/logs.
+        roots=""
+        for pid in $masters; do
             root=$(tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null \
                    | awk 'p{print;exit} $0=="-p"{p=1}')
             [ -n "$root" ] && [ -d "$root" ] && roots="$roots $root"
+        done
+        # Fall back to a worker's inherited cmdline if the master vanished.
+        if [ -z "$roots" ]; then
+            for pid in $workers; do
+                root=$(tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null \
+                       | awk 'p{print;exit} $0=="-p"{p=1}')
+                [ -n "$root" ] && [ -d "$root" ] && { roots="$roots $root"; break; }
+            done
+        fi
+        echo "ci-hang-guard: prefix roots=[$roots]" >&2
+
+        # PHASE 1 — attach to every process BEFORE signalling anything. SIGQUIT on
+        # the master is a GRACEFUL SHUTDOWN: it terminates the workers too. The
+        # previous interleaved loop QUIT the master first (lowest PID) and then
+        # found every worker already reaped, capturing "ptrace: No such process"
+        # instead of the backtraces. Workers first, master last, no signals yet.
+        for pid in $workers $masters; do
+            echo "ci-hang-guard: gdb pid=$pid" >&2
             # -batch (NOT -batch-silent): -batch-silent suppresses the command output
             # (info threads / bt / print) that is the whole point of the capture.
             $GDB -batch -p "$pid" \
@@ -107,7 +153,13 @@ while kill -0 "$CMD_PID" 2>/dev/null; do
                 -ex "print ngx_cycle->connection_n" \
                 -ex "detach" -ex "quit" \
                 > "$ARTDIR/gdb-nginx-$pid.txt" 2>&1 || true
-            # SIGQUIT makes a --with-debug nginx log posted-request / connection state.
+        done
+
+        # PHASE 2 — only now signal. SIGQUIT makes a --with-debug nginx log its
+        # posted-request / connection state. Workers first so each dumps its own
+        # state before the master's graceful shutdown can reap it.
+        for pid in $workers $masters; do
+            echo "ci-hang-guard: SIGQUIT pid=$pid" >&2
             kill -QUIT "$pid" 2>/dev/null || true
         done
         sleep 5
