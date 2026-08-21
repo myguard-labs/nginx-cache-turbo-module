@@ -489,18 +489,19 @@ def test_origin_method_hits_falsifiable(ng: Nginx, origin: Origin) -> None:
     #    could never catch this regardless of what actually happened. We
     #    don't re-run the literal `assert ... == 0` (that would just fail the
     #    whole test); instead capture the value and assert on IT going
-    #    nonzero, printing the exact text the earlier assertion would emit if
-    #    it were re-run.
+    #    nonzero. NOTE: in the failing branch below (post_get_count == 0),
+    #    the step-1 assertion would still wrongly PASS -- that IS the bug
+    #    this row exists to remove, so the failure message must say so
+    #    plainly instead of claiming a contradiction ("now False" while the
+    #    value is 0).
     fetch(ng.port, url, method="GET")
     post_get_count = origin.hits_for_method("GET", tag)
-    would_be_assertion = (
-        f"assert origin.hits_for_method('GET', {tag!r}) == 0  "
-        f"# now False: value is {post_get_count}"
-    )
     assert post_get_count > 0, (
-        "EXPECTED-RED PROOF FAILED: a GET landed on the HEAD-only URL but "
-        "hits_for_method('GET', ...) is still 0 -- the accessor did not "
-        f"observe it. {would_be_assertion}"
+        f"EXPECTED-RED PROOF FAILED: a GET was issued against the HEAD-only "
+        f"URL {url!r}, but hits_for_method('GET', {tag!r}) still reports 0 "
+        "-- the accessor did not observe the GET, so the 'no GET here' "
+        "assertion in step 1 would wrongly keep passing. That is the "
+        "method-blindness this row exists to remove."
     )
     assert post_get_count == 1, \
         f"expected exactly one GET recorded, got {post_get_count}"
