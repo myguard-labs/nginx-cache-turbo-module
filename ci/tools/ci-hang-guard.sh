@@ -3,11 +3,13 @@
 # gdb all-thread backtrace + a SIGQUIT debug dump of the nginx process(es) THIS run
 # spawned, before the outer job timeout kills the runner with no evidence.
 #
-# Motivation: test_shm_refresh_under_pressure (R6b) intermittently wedges the
-# single-process ASan nginx event loop on CI only (never reproduced locally in 46
-# clean runs — see memory issues.md). A plain job timeout leaves NO backtrace, so
-# the refcount-leak-vs-loop-saturation question can never be answered. This guard
-# turns the next occurrence into an uploaded artifact.
+# Motivation: the full ASan single-process suite intermittently wedges the event
+# loop (originally suspected as test_shm_refresh_under_pressure/R6b-specific;
+# 2026-08-21 showed it is suite-cumulative and lands wherever call ~150 happens
+# to fall, not bound to R6b's own pool.map — see memory issues.md). It is rare
+# but does reproduce locally, not only on CI. A plain job timeout leaves NO
+# backtrace, so the refcount-leak-vs-loop-saturation question can never be
+# answered. This guard turns the next occurrence into an uploaded artifact.
 #
 # Scope: the PID scan and the log snapshot are restricted to the process tree rooted
 # at the wrapped command, so a NEIGHBOURING job on a shared self-hosted runner never

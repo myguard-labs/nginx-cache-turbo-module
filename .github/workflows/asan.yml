@@ -133,7 +133,8 @@ jobs:
           # it to hanging-test.txt so the backtrace is labelled with the culprit.
           CT_TEST_BREADCRUMB: ${{ github.workspace }}/ci-hang-artifacts/current-test.txt
         # Wrapped in ci-hang-guard.sh: the single-process suite intermittently wedges
-        # the nginx event loop on CI (R6b, never reproduced locally — memory issues.md).
+        # the nginx event loop (rare, suite-cumulative, not bound to any one test —
+        # reproduces locally too, not CI-only; see memory issues.md, 2026-08-21).
         # If the suite runs past the soft timeout the guard captures a gdb all-thread
         # backtrace + SIGQUIT debug dump into ci-hang-artifacts/ (uploaded below) so the
         # next occurrence yields evidence instead of a mute job timeout. 1200s soft <
