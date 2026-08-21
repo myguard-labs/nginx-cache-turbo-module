@@ -1513,6 +1513,36 @@ def test_warm_url_file_bound_enforced(ng: Nginx, origin: Origin) -> None:
         f"origin saw {origin.hits_for(tag) - base} hits, expected exactly 3"
 
 
+def test_warm_url_file_empty(ng: Nginx, origin: Origin) -> None:
+    """P5-2-p0: a zero-byte url_file is a legitimate "warm nothing" list, not
+    an error -- must return a clean {"warmed":0}, HTTP 200, and never crash
+    the worker. warm_read_file() must hand back a non-NULL 1-byte placeholder
+    for the empty case rather than ngx_str_null()'s NULL data pointer: every
+    downstream `data + len` computation (the line-length scan in warm_file,
+    then `last = p + urls->len` in warm()) is `NULL + 0` if it does not,
+    which is undefined behaviour in C (gcc UBSan passes it, clang UBSan
+    aborts) -- exactly the kind of defect a 200-status assertion alone would
+    miss, so this also checks the error log and a follow-up request."""
+    tag = f"wcf-empty-{time.time()}"
+    (ng.root / "warm-lists").mkdir(exist_ok=True)
+    list_path = ng.root / "warm-lists" / "warm-list-empty.txt"
+    list_path.write_bytes(b"")
+    assert list_path.stat().st_size == 0
+
+    base = origin.hits_for(tag)
+    s, b, h = fetch(ng.port, f"/_cache_wc?url_file={list_path}", method="POST")
+    assert s == 200, f"empty url_file status {s}: {b!r}"
+    assert "application/json" in h.get("content-type", ""), h.get("content-type")
+    assert json.loads(b)["warmed"] == 0, f"empty url_file warmed something: {b}"
+    time.sleep(0.2)
+    assert origin.hits_for(tag) == base, "empty url_file reached the origin"
+
+    # the worker must still be answering afterwards -- the actual
+    # "did not crash/abort" oracle, not just this request's own status.
+    s2, _, _ = fetch(ng.port, "/_cache_wc")
+    assert s2 == 200, f"worker unresponsive after empty url_file (status {s2})"
+
+
 def test_warm_url_file_missing(ng: Nginx) -> None:
     """P5-2-p0: a nonexistent url_file path is a clean 500 with a JSON error,
     never a crash and never a silently-empty warm (which would misreport

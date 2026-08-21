@@ -866,8 +866,20 @@ ngx_http_cache_turbo_warm_read_file(ngx_http_request_t *r, ngx_str_t *path,
     out->len = (size_t) ngx_file_size(&fi);
 
     if (out->len == 0) {
+        /* An empty file is a legitimate "warm nothing" list, not an error --
+         * but out->data must stay non-NULL: ngx_str_null() would set it to
+         * NULL, and every downstream caller (warm_file's own line-length
+         * scan, then ngx_http_cache_turbo_warm()'s `last = p + urls->len`)
+         * computes `data + len`. `NULL + 0` is undefined behaviour in C: gcc
+         * UBSan passes it, clang UBSan aborts (the exact
+         * feedback-null-plus-zero-ub-splits-by-compiler trap). A 1-byte
+         * pool-allocated placeholder keeps every `data + 0` well-defined
+         * without adding a NULL special case to any caller. */
         ngx_close_file(fd);
-        ngx_str_null(out);
+        out->data = ngx_pnalloc(r->pool, 1);
+        if (out->data == NULL) {
+            return NGX_ERROR;
+        }
         return NGX_OK;
     }
 

@@ -280,6 +280,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_warm_url_file_populates(ng, origin)
     test_warm_url_file_bound_enforced(ng, origin)
     test_warm_url_file_missing(ng)
+    test_warm_url_file_empty(ng, origin)
     test_warm_url_file_oversize_rejected(ng)
     test_warm_url_file_overlong_line_rejected(ng)
     test_warm_url_file_binary_no_crash(ng, origin)
