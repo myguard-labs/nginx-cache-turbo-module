@@ -80,7 +80,7 @@ EOC
 ["GET /adm/on", "GET /adm/on", "GET /_cache_admon"]
 --- response_body_like eval
 [qr/./, qr/./,
- qr/"sketch_gen":\d+,"sketch_bumps":[1-9]\d*,"admission_refused":\d+\}/]
+ qr/"sketch_gen":\d+,"sketch_bumps":[1-9]\d*,"admission_refused":\d+[,}]/]
 --- error_code eval
 [200, 200, 200]
 

@@ -47,6 +47,10 @@ time_t      ngx_test_now        = 1000000;
 ngx_atomic_t      *ct_cas_steal_addr  = NULL;
 ngx_atomic_uint_t  ct_cas_steal_value = 0;
 int                ct_cas_steal_fired = 0;
+ngx_uint_t        ngx_test_alerts = 0;
+static ngx_test_cycle_t  g_cycle = { NULL };
+ngx_test_cycle_t  *ngx_cycle = &g_cycle;
+
 long        ngx_test_slab_budget = -1;
 ngx_uint_t  ngx_test_slab_live   = 0;
 ngx_uint_t  ngx_test_lock_depth  = 0;
@@ -219,6 +223,8 @@ typedef struct {
     ngx_uint_t          admission;
     ngx_uint_t          sketch_bumps;
     ngx_uint_t          admission_refused;
+    /* P4-2-s3a used-bytes gauge. Plain in production too -- mutex-held. */
+    ngx_uint_t          used_bytes;
     ngx_atomic_t        breaker_wedge_observed; /* H-2/O4.4-j, TEST_FAULTS-gated
                                                  * in the real header; mirrored
                                                  * unconditionally here since
@@ -242,6 +248,7 @@ typedef struct {
 typedef struct {
     ngx_uint_t               refs;       /* in-flight zero-copy servers      */
     ngx_uint_t               detached;   /* owning node dropped this buffer  */
+    ngx_uint_t               bytes;      /* charged slab bytes (hdr + blob)  */
 } ngx_http_cache_turbo_blobref_t;
 
 #define CT_BLOBREF(data)                                                       \
@@ -301,6 +308,8 @@ static ngx_int_t ngx_http_cache_turbo_shm_evict_one(
     ngx_http_cache_turbo_zone_t *z);
 static void *ngx_http_cache_turbo_shm_alloc_evict(
     ngx_http_cache_turbo_zone_t *z, size_t size);
+static void ngx_http_cache_turbo_shm_free_locked(
+    ngx_http_cache_turbo_zone_t *z, void *p, size_t size);
 static void ngx_http_cache_turbo_lru_link_head(
     ngx_http_cache_turbo_zone_t *z, ngx_http_cache_turbo_node_t *ctn);
 static void ngx_http_cache_turbo_lru_unlink(
@@ -422,6 +431,7 @@ zone_reset(void)
     ngx_test_slab_budget = -1;
     ngx_test_lock_depth  = 0;
     ngx_test_lock_count  = 0;
+    ngx_test_alerts      = 0;   /* P4-2-s3a: per-test used_bytes ALERT tally */
 }
 
 /* Distinct 32-byte key material per logical key; hash is the rbtree key. */
@@ -4910,6 +4920,191 @@ test_p4_1b_sketch_bumps_survive_halving(void)
 
 
 
+/* --- P4-2-s3a: the used-bytes gauge -------------------------------------- */
+
+/* Build an ENTRY the way the production store path does -- node through
+ * alloc_evict(), body through blob_alloc() -- so BOTH allocations are charged
+ * to the used-bytes gauge exactly as a real store charges them. Deliberately
+ * NOT mk_live_sie_entry(): that fixture allocates its node with a raw
+ * ngx_slab_alloc_locked(), which bypasses the charge and would leave the gauge
+ * under-counting by one node per entry, making every assertion below wrong in
+ * a direction that still looked plausible. */
+static ngx_http_cache_turbo_node_t *
+mk_charged_entry(int keyn, size_t body_len)
+{
+    ngx_http_cache_turbo_node_t  *ctn;
+    u_char                       *blob;
+
+    ctn = ngx_http_cache_turbo_shm_alloc_evict(&g_zone, sizeof(*ctn));
+    if (ctn == NULL) {
+        return NULL;
+    }
+    memset(ctn, 0, sizeof(*ctn));
+
+    memcpy(ctn->key, mkkey(keyn), 32);
+    ctn->node.key = (uint32_t) (0x1000 + keyn);
+    ngx_rbtree_insert(&g_sh.rbtree, &ctn->node);
+
+    ctn->kind = NGX_HTTP_CACHE_TURBO_NODE_ENTRY;
+    ctn->seg  = NGX_HTTP_CACHE_TURBO_SEG_PROBATION;
+
+    blob = ngx_http_cache_turbo_blob_alloc(&g_zone, body_len);
+    if (blob == NULL) {
+        return NULL;
+    }
+
+    /* Far-past creation + a 1s SIE window: evict_one() must read this node as
+     * NOT sie-live, so the breaker-open sparing path never defers it. */
+    put_u64_le(blob + 24, (uint64_t) ((int64_t) ngx_test_now - 10000));
+    put_u32_le(blob + 40, 1);
+
+    ctn->data = blob;
+    ctn->len  = body_len;
+
+    ngx_queue_insert_head(&g_sh.lru, &ctn->lru);
+    g_sh.n_entries++;
+
+    return ctn;
+}
+
+
+/* P4-2-s3a. The gauge must be an EXACT byte tally, not a "something is in
+ * there" flag: P4-2-s3 wants to compare it against ngx_slab's own free-page
+ * accounting and call the difference fragmentation, which is meaningless
+ * unless the demand side is exact.
+ *
+ * So this asserts the arithmetic in both directions rather than `> 0`:
+ *   - after each store the gauge equals the EXACT predicted sum of the node
+ *     and blob charges (a wrong-by-one-node or wrong-by-the-blobref-header
+ *     implementation fails here, where `> 0` would pass);
+ *   - the gauge GROWS monotonically across the stores, and by the exact
+ *     per-entry delta each time;
+ *   - a store with a LARGER body charges proportionally more (so an
+ *     implementation charging only sizeof(node) -- constant per entry -- is
+ *     refuted);
+ *   - after every entry is evicted the gauge is back at EXACTLY its baseline
+ *     of 0, not merely smaller.
+ *
+ * The zero-return leg is what makes this falsifiable against a missing
+ * DISCHARGE, and the exact-sum leg against a missing or mis-sized CHARGE. */
+static void
+test_p4_2_s3a_used_bytes_tracks_growth_and_returns_to_baseline(void)
+{
+    const size_t   node_sz = sizeof(ngx_http_cache_turbo_node_t);
+    const size_t   hdr_sz  = sizeof(ngx_http_cache_turbo_blobref_t);
+    const size_t   small   = 128;
+    const size_t   large   = 4096;
+    ngx_uint_t     expect, prev, small_delta, large_delta;
+    int            i, n;
+
+    printf("P4-2-s3a: used_bytes tracks stored bytes and returns to baseline\n");
+    zone_reset();
+
+    CHECK(g_sh.used_bytes == 0,
+          "P4-2-s3a: a fresh zone must start with a zero used-bytes gauge");
+
+    /* --- growth: four equal-sized stores, exact tally checked every time. */
+    n = 4;
+    expect = 0;
+    prev = 0;
+
+    for (i = 0; i < n; i++) {
+        REQUIRE(mk_charged_entry(i, small) != NULL,
+                "fixture: charged-entry store failed on an unlimited pool");
+
+        expect += (ngx_uint_t) (node_sz + hdr_sz + small);
+
+        CHECK(g_sh.used_bytes == expect,
+              "P4-2-s3a: used_bytes must equal the exact node+blobref+body "
+              "sum charged so far");
+        CHECK(g_sh.used_bytes > prev,
+              "P4-2-s3a: used_bytes must GROW on every store");
+        prev = g_sh.used_bytes;
+    }
+
+    small_delta = (ngx_uint_t) (node_sz + hdr_sz + small);
+
+    /* --- body size matters: a bigger body must charge proportionally more.
+     * An implementation that charged only the fixed node size would produce
+     * an identical delta here and fail. */
+    REQUIRE(mk_charged_entry(n, large) != NULL,
+            "fixture: large-body store failed on an unlimited pool");
+    large_delta = g_sh.used_bytes - prev;
+
+    CHECK(large_delta == (ngx_uint_t) (node_sz + hdr_sz + large),
+          "P4-2-s3a: a larger body must charge exactly its own extra bytes");
+    CHECK(large_delta > small_delta,
+          "P4-2-s3a: used_bytes must scale with body size, not just entry "
+          "count");
+
+    /* --- return to baseline: evict everything through the production
+     * eviction path, which discharges node and blob through shm_free_locked. */
+    for (i = 0; i <= n; i++) {
+        CHECK(ngx_http_cache_turbo_shm_evict_one(&g_zone) == 1,
+              "fixture: evict_one must reclaim each stored entry");
+    }
+
+    CHECK(g_sh.n_entries == 0, "fixture: every entry should be evicted");
+    CHECK(g_sh.used_bytes == 0,
+          "P4-2-s3a: used_bytes must return to EXACTLY its baseline once "
+          "every charged entry is gone -- a residue means a discharge is "
+          "missing or mis-sized");
+
+    /* --- the discharge must never have taken the underflow branch. That
+     * branch clamps to 0, which would otherwise let a mis-paired discharge
+     * produce the SAME zero this test just asserted. */
+    CHECK(ngx_test_alerts == 0,
+          "P4-2-s3a: no used_bytes underflow ALERT may be emitted -- a clamp "
+          "would forge the return-to-baseline above");
+}
+
+
+/* P4-2-s3a, deferred-free leg. A blob with an in-flight zero-copy serve is NOT
+ * freed when its owning node drops it: blob_node_release() only marks it
+ * detached, and the last server's cleanup (blob_release) frees it later. The
+ * charge must survive that whole window and be discharged by whichever side is
+ * last -- otherwise the gauge under-reports live memory for exactly as long as
+ * a serve is in flight, which is precisely when it matters. */
+static void
+test_p4_2_s3a_used_bytes_survives_deferred_blob_free(void)
+{
+    ngx_uint_t   after_store, node_and_hdr;
+    u_char      *blob;
+
+    printf("P4-2-s3a: used_bytes survives a detached blob's deferred free\n");
+    zone_reset();
+
+    REQUIRE(mk_charged_entry(0, 256) != NULL,
+            "fixture: charged-entry store failed on an unlimited pool");
+    after_store = g_sh.used_bytes;
+    blob = find(0)->data;
+    REQUIRE(blob != NULL, "fixture: entry has no blob");
+
+    /* A serve takes a reference, then the owning node is evicted underneath it. */
+    ngx_http_cache_turbo_blob_acquire(blob);
+    CHECK(ngx_http_cache_turbo_shm_evict_one(&g_zone) == 1,
+          "fixture: evict_one must reclaim the entry");
+
+    node_and_hdr = (ngx_uint_t) (sizeof(ngx_http_cache_turbo_node_t));
+
+    CHECK(g_sh.used_bytes == after_store - node_and_hdr,
+          "P4-2-s3a: evicting a node whose blob is still being served must "
+          "discharge the NODE only -- the blob is still resident");
+    CHECK(g_sh.used_bytes > 0,
+          "P4-2-s3a: a detached-but-referenced blob must still be counted");
+
+    /* The last server finishes: now the blob is really freed. */
+    ngx_http_cache_turbo_blob_release(&g_zone, blob);
+
+    CHECK(g_sh.used_bytes == 0,
+          "P4-2-s3a: the deferred blob free must discharge the blob's charge, "
+          "returning the gauge to baseline");
+    CHECK(ngx_test_alerts == 0,
+          "P4-2-s3a: the deferred free must not underflow the gauge");
+}
+
+
+
 int
 main(void)
 {
@@ -4976,6 +5171,8 @@ main(void)
     test_p4_1b_fails_open_three_ways();
     test_p4_1b_admission_never_spins();
     test_p4_1b_sketch_bumps_survive_halving();
+    test_p4_2_s3a_used_bytes_tracks_growth_and_returns_to_baseline();
+    test_p4_2_s3a_used_bytes_survives_deferred_blob_free();
     test_blob_alloc_starts_unreferenced_and_attached();
 
     test_blob_detach_defers_free_to_the_last_server();

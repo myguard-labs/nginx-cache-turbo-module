@@ -1679,6 +1679,7 @@ halvings.
 | `admission_refused` | `cache_turbo_admission_refused_total` |
 | `sketch_bumps` | `cache_turbo_sketch_bumps_total` |
 | `sketch_gen` | `cache_turbo_sketch_gen` |
+| `used_bytes` | `cache_turbo_used_bytes` |
 
 ## What autotune actually tunes
 
@@ -2095,6 +2096,7 @@ Every sample is labelled by `zone`, so one job can scrape many zones. Metrics:
 | `cache_turbo_origin_failures_total` | counter | Origin responses recorded as a failure by the circuit breaker. |
 | `cache_turbo_breaker_opens_total` | counter | Lifetime count of CLOSED->OPEN circuit breaker trips. |
 | `cache_turbo_breaker_state` | gauge | Circuit breaker state (0=closed, 1=open, 2=half-open). |
+| `cache_turbo_used_bytes` | gauge | Slab bytes currently charged for cached payload and metadata in this zone. Excludes fixed per-zone init overhead (the zone's own control block and the W-TinyLFU sketch), which is allocated once and never freed. This is the **demand** side of the zone's memory: the gap between it and the zone's configured size is slab fragmentation plus allocator bin rounding, so watching the two together tells you whether a zone that is evicting is genuinely full or merely fragmented. |
 
 `prometheus.yml`:
 

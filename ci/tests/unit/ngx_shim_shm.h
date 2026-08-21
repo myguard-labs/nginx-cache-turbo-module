@@ -337,6 +337,25 @@ typedef struct {
     ngx_shmtx_t  mutex;
 } ngx_slab_pool_t;
 
+/* P4-2-s3a: the used-bytes discharge (shm_free_locked) logs at ALERT if a
+ * discharge would underflow the gauge -- a charge/discharge pairing bug. The
+ * harness has no nginx log, so the call is shimmed into a COUNTER: the branch
+ * stays real production code, and a test can assert the ALERT was never
+ * emitted. A shim that discarded the call would let a pairing bug hide behind
+ * the clamp, which is exactly the condition the ALERT exists to expose. */
+extern ngx_uint_t  ngx_test_alerts;        /* ALERT-level logs emitted */
+
+#ifndef NGX_LOG_ALERT
+#define NGX_LOG_ALERT  1
+#endif
+typedef struct { void *log; } ngx_test_cycle_t;
+extern ngx_test_cycle_t  *ngx_cycle;
+#ifndef ngx_log_error
+#define ngx_log_error(level, log, err, ...)                                   \
+    do { (void) (log); (void) (err); if ((level) == NGX_LOG_ALERT) {          \
+             ngx_test_alerts++; } } while (0)
+#endif
+
 extern long        ngx_test_slab_budget;   /* -1 = unlimited */
 extern ngx_uint_t  ngx_test_slab_live;     /* outstanding allocations */
 extern ngx_uint_t  ngx_test_lock_depth;    /* must be 0 between entry points */
