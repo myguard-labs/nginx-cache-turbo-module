@@ -1534,8 +1534,8 @@ def test_redis_connect_backoff_config_parse(ng: Nginx) -> None:
     if ng.redis_port is not None:
         def mutate_ok(c):
             return c.replace(
-                f"cache_turbo_redis  127.0.0.1:{ng.redis_port} prefix=ct: timeout=250ms;",
-                f"cache_turbo_redis  127.0.0.1:{ng.redis_port} prefix=ct: "
+                f"cache_turbo_redis    127.0.0.1:{ng.redis_port} prefix=ct: timeout=250ms;",
+                f"cache_turbo_redis    127.0.0.1:{ng.redis_port} prefix=ct: "
                 f"timeout=250ms connect_backoff=500ms;", 1)
         r_ok = _config_test_result(ng, mutate_ok)
         assert r_ok.returncode == 0, \
@@ -1543,8 +1543,8 @@ def test_redis_connect_backoff_config_parse(ng: Nginx) -> None:
 
         def mutate_bad(c):
             return c.replace(
-                f"cache_turbo_redis  127.0.0.1:{ng.redis_port} prefix=ct: timeout=250ms;",
-                f"cache_turbo_redis  127.0.0.1:{ng.redis_port} prefix=ct: "
+                f"cache_turbo_redis    127.0.0.1:{ng.redis_port} prefix=ct: timeout=250ms;",
+                f"cache_turbo_redis    127.0.0.1:{ng.redis_port} prefix=ct: "
                 f"timeout=250ms connect_backoff=notatime;", 1)
         r_bad = _config_test_result(ng, mutate_bad)
         assert r_bad.returncode != 0, \

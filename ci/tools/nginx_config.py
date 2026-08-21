@@ -668,6 +668,26 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # SILENT-INDEX-DROP option (a): the L9 purge-by-tag index write
+        # (tag_add/tag_add_many for cache_turbo_tag) shares the exact same
+        # fire-and-forget failure mode as the COR-5(b) variant-index SADD
+        # above -- redis_launch() refuses silently, but until now the
+        # store site did not even LOOK at the return value. Reuses the same
+        # per-request fault-injection directive/header
+        # (cache_turbo_test_varidx_fail / X-Cache-Turbo-Test-Varidx-Drop)
+        # rather than adding a second identical knob. Own redis prefix
+        # (tvd:) so the injected drop cannot perturb ct:tag:* counts other
+        # L2 tests assert exact values on.
+        location /tagidxdrop/ {{
+            cache_turbo          main;
+            cache_turbo_key      $request_uri;
+            cache_turbo_valid    30s;
+            cache_turbo_tag      "tagidxdrop-t1";
+            cache_turbo_redis    127.0.0.1:{redis_port} prefix=tvd: timeout=250ms;
+            cache_turbo_test_varidx_fail on;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # cross-node dogpile (v4-2): fresh TTL 2s -> stale_until = valid*4 = 8s,
         # a wide window so both lock tests have timing slack; aggressive beta so
         # a stale read reliably rolls a refresh; lock_ttl 5s = the Redis SET NX

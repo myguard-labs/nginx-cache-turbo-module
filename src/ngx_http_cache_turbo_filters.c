@@ -1767,11 +1767,13 @@ ngx_http_cache_turbo_body_filter_tag_split(ngx_http_request_t *r, u_char **sp,
  * next_header_filter, not here. */
 static void
 ngx_http_cache_turbo_body_filter_tag_index(ngx_http_request_t *r,
-    ngx_http_cache_turbo_loc_conf_t *clcf, u_char *store_key, time_t retain_ttl)
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_zone_t *z,
+    u_char *store_key, time_t retain_ttl)
 {
     ngx_str_t  tagval;
     u_char    *s, *e;
     ngx_uint_t ntags, k;
+    ngx_int_t  tagidx_rc;
     /* Bounded and deduped by _tag_split(); see that helper for the PERF-2
      * rationale behind the count and length caps. */
     ngx_str_t  seen[NGX_HTTP_CACHE_TURBO_MAX_TAGS];
@@ -1793,17 +1795,60 @@ ngx_http_cache_turbo_body_filter_tag_index(ngx_http_request_t *r,
      * seen[] is already deduped and cap-bound by the loop
      * above, which is exactly tag_add_many's contract. Fall
      * back to per-tag calls on a backend that predates the
-     * batched slot. */
+     * batched slot.
+     *
+     * SILENT-INDEX-DROP option (a): this write is fire-and-forget the same
+     * way the COR-5 variant-index SADD is (see _body_filter_varidx_store
+     * above) -- "handed to the transport" and "dropped before the wire"
+     * (armed S231 connect-backoff, failed connect, alloc failure) used to
+     * be indistinguishable here: the return value was discarded outright.
+     * A drop leaves the object in L1/L2 while the tag set does not list
+     * it, so a later purge-by-tag enumerates the set with SMEMBERS and
+     * reports success while this object survives, stale, until its own
+     * TTL. Unlike varidx_drops there is no self-heal for this write (no
+     * per-node pending bit to arm and no natural re-issue point --
+     * purge-by-tag has no per-object hit path to piggyback on), so this
+     * is deliberately observability only: count it and log it. */
     if (ntags > 0) {
-        if (clcf->backend->tag_add_many) {
-            clcf->backend->tag_add_many(clcf, store_key, seen,
-                                        ntags, retain_ttl);
-        } else {
-            for (k = 0; k < ntags; k++) {
-                clcf->backend->tag_add(clcf, store_key,
-                                       seen[k].data,
-                                       seen[k].len, retain_ttl);
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+        /* COR-5(b) fault-injection hook reused verbatim for the L9 tag
+         * index: same store-tail phase, same "drop before the wire"
+         * failure mode, same per-request header arming
+         * (X-Cache-Turbo-Test-Varidx-Drop: 1) so the 4-worker runner
+         * cannot smear the fault across requests. A second directive and
+         * header for an identical fault class would be pure duplication. */
+        if (clcf->test_varidx_fail
+            && ngx_http_cache_turbo_test_varidx_drop_requested(r))
+        {
+            tagidx_rc = NGX_ERROR;
+        } else
+#endif
+        {
+            if (clcf->backend->tag_add_many) {
+                tagidx_rc = clcf->backend->tag_add_many(clcf, store_key,
+                                                        seen, ntags,
+                                                        retain_ttl);
+            } else {
+                tagidx_rc = NGX_OK;
+                for (k = 0; k < ntags; k++) {
+                    if (clcf->backend->tag_add(clcf, store_key,
+                                               seen[k].data,
+                                               seen[k].len,
+                                               retain_ttl) != NGX_OK)
+                    {
+                        tagidx_rc = NGX_ERROR;
+                    }
+                }
             }
+        }
+
+        if (tagidx_rc != NGX_OK) {
+            (void) ngx_atomic_fetch_add(&z->sh->tag_index_drops, 1);
+            ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                "cache_turbo: tag index write dropped for \"%V\" "
+                "(L2 unreachable) -- a purge of its tag(s) will NOT "
+                "invalidate this entry", &r->uri);
         }
     }
 
@@ -2082,7 +2127,7 @@ ngx_http_cache_turbo_body_filter_store_tail(ngx_http_request_t *r,
     }
 
     if (clcf->backend && clcf->backend->tag_add && clcf->tag) {
-        ngx_http_cache_turbo_body_filter_tag_index(r, clcf, store_key,
+        ngx_http_cache_turbo_body_filter_tag_index(r, clcf, z, store_key,
                                                    retain_ttl);
     }
 

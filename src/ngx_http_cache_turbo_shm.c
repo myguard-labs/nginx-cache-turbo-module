@@ -184,6 +184,11 @@ ngx_http_cache_turbo_shm_init_zone(ngx_shm_zone_t *shm_zone, void *data)
     ctx->sh->breaker_serves = 0;
     ctx->sh->origin_failures = 0;
 
+    /* COR-5(b)/L9: store-time index-drop counters. */
+    ctx->sh->varidx_drops = 0;
+    ctx->sh->varidx_reissues = 0;
+    ctx->sh->tag_index_drops = 0;
+
     /* P4-1a: allocate the W-TinyLFU frequency sketch.
      *
      * SIZING. The sketch is a FIXED overhead taken out of the same slab that
@@ -1522,6 +1527,11 @@ ngx_http_cache_turbo_shm_stats(ngx_http_cache_turbo_zone_t *z,
     out->sie_serves      = z->sh->sie_serves;
     out->breaker_serves  = z->sh->breaker_serves;
     out->origin_failures = z->sh->origin_failures;
+
+    /* COR-5(b)/L9: store-time index-drop counters. Plain reads, same as
+     * every other lifetime tally above. */
+    out->varidx_drops     = z->sh->varidx_drops;
+    out->tag_index_drops  = z->sh->tag_index_drops;
 
     /* P3-7: live gauge, not a lifetime tally -- read the same as every other
      * counter here (plain, unlocked; the atomic itself is the sync point). */

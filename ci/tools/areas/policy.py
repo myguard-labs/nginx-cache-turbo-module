@@ -2286,6 +2286,64 @@ def _varidx(headers: dict) -> dict:
     return out
 
 
+def test_l9_tag_index_drop_is_observable(ng: Nginx, origin: Origin,
+                                         redis: RedisServer) -> None:
+    """SILENT-INDEX-DROP option (a): the L9 purge-by-tag index write
+    (tag_add/tag_add_many for cache_turbo_tag) is fire-and-forget the same
+    way the COR-5(b) variant-index SADD is (see
+    test_cor5_varidx_selfheal_after_dropped_index_write above), but until now
+    the store site did not even inspect the return value -- a write dropped
+    before the wire (armed S231 connect-backoff, failed connect, alloc
+    failure) left the object cached while the tag set silently never learned
+    about it, and a later purge-by-tag would report success while leaving
+    that object stale until its own TTL. Nothing counted it and nothing
+    logged it.
+
+    This item is observability ONLY -- unlike COR-5(b) there is no self-heal
+    (no per-node pending bit, no natural re-issue point for a tag write), so
+    the oracle here is the zone's tag_index_drops admin counter, not a
+    "purged" enumeration count. /tagidxdrop/ reuses the COR-5(b) fault
+    injection (cache_turbo_test_varidx_fail / X-Cache-Turbo-Test-Varidx-Drop)
+    against a cache_turbo_tag location instead of an auto-Vary one -- own
+    redis prefix (tvd:) so the injected drop cannot perturb ct:tag:* counts
+    other L2 tests assert exact values on. Reads land on /_cache (zone
+    `main`), the same admin endpoint test_sie_serves_counter etc. use.
+
+    MUTATION THIS CATCHES: reverting the filters.c change back to discarding
+    tag_add()/tag_add_many()'s return value (or dropping the counter bump)
+    makes tag_index_drops never move and this test goes red on the positive
+    leg while the clean-store negative control stays green -- proving the
+    delta is pinned to an actual dropped write, not to every tagged store."""
+    drop_hdr = {"X-Cache-Turbo-Test-Varidx-Drop": "1"}
+
+    # Positive leg: the tag-index write is dropped before the wire.
+    before = _admin_stat(ng, "tag_index_drops")
+    s0, b0, _h0 = fetch(ng.port, "/tagidxdrop/p1", headers=drop_hdr)
+    assert s0 == 200 and b0, f"prime (dropped) failed: {s0} {b0!r}"
+    # Object still caches -- that is the whole defect: the drop is invisible
+    # to the client. The counter is zone-scoped, so read it off a second
+    # request against the same zone rather than this response's own headers
+    # (see the drops0/hf1 pattern in the COR-5(b) self-heal test above).
+    s1, b1, h1 = fetch(ng.port, "/tagidxdrop/p1", headers=drop_hdr)
+    assert s1 == 200 and h1.get("x-cache") == "HIT" and b1 == b0, \
+        "tagged object should still cache even though its index write was dropped"
+    after = _admin_stat(ng, "tag_index_drops")
+    assert after - before >= 1, \
+        (f"tag_index_drops did not move for a dropped L9 index write: "
+         f"{before} -> {after}")
+
+    # Negative control: a clean store (drop header absent) on a DIFFERENT
+    # key/tag must NOT move the counter. Distinct key from the positive leg
+    # so this fetch cannot itself hit the already-primed dropped entry.
+    before2 = _admin_stat(ng, "tag_index_drops")
+    s2, b2, _ = fetch(ng.port, "/tagidxdrop/p2")
+    assert s2 == 200 and b2, f"clean prime failed: {s2} {b2!r}"
+    after2 = _admin_stat(ng, "tag_index_drops")
+    assert after2 == before2, \
+        (f"tag_index_drops moved on a clean store with no fault armed: "
+         f"{before2} -> {after2}")
+
+
 def test_cache_and_purge_respect_access_control(ng: Nginx) -> None:
     """A cached GET and PURGE must run after allow/deny. Both locations share
     one cache key, proving the denied request cannot serve or delete the entry
