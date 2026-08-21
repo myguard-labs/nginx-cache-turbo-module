@@ -1,4 +1,4 @@
-# sync-sha: fba37c1008f3af57f30f3ae8997527236b67aeec151457167e4d8f92b119e64c
+# sync-sha: 21a1d7fe2d6397d225e8810fa72906ce14df270427b3d5a2d8cebceaef60292b
 name: Build & Test
 
 # Runner labels live in the POOL repository variable. Every checked-in selector
@@ -376,6 +376,11 @@ jobs:
         # python3 and tee, so nginx (python3's descendant) stays inside the tracked
         # tree. `set -o pipefail` inside that inner bash makes the wrapper's exit
         # status the suite's, not tee's, so a failing suite still fails this step.
+        env:
+          # Breadcrumb: the harness writes the running test here (see
+          # test_runtime.py _write_breadcrumb). On an R6b hang the guard copies
+          # it to hanging-test.txt so the backtrace is labelled with the culprit.
+          CT_TEST_BREADCRUMB: ${{ github.workspace }}/ci-hang-artifacts/current-test.txt
         run: |
           chmod +x nginx-bin/nginx
           bash ci/tools/ci-hang-guard.sh 900 "$GITHUB_WORKSPACE/ci-hang-artifacts" -- \
