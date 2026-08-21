@@ -1394,6 +1394,12 @@ http {{
     # some other widening (e.g. keep_stale). Own zone so its origin hit count
     # is never polluted by o45z's traffic.
     cache_turbo_zone name=o45offz 16m;
+    # P5-2-p0: own zone for the cache_turbo_warm_max bound coverage. A low
+    # explicit cap (3, well under the 32 default) makes the enforcement
+    # assertion ("N URLs requested, only warm_max fired") reachable without a
+    # 32+ URL fixture. Own zone so its origin hit counter is never polluted
+    # by another test's warming.
+    cache_turbo_zone name=warmcapz 16m;
     # O4.5 / O4.2-f: private zone for the header-filter recording-block pins
     # (success/failure sense of the argument; a cache-turbo HIT records
     # nothing). Own zone so its origin_failures counter cannot be moved by
@@ -4233,6 +4239,21 @@ http {{
         # uncached passthrough, lets us read the raw origin
         location /raw/ {{
             proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # P5-2-p0: cache_turbo_warm_max bound coverage. warm_max 3 well under
+        # the 32 default so an over-the-cap request (N > 3) is cheap to build.
+        location /wc/ {{
+            cache_turbo                    warmcapz;
+            cache_turbo_key                $uri;
+            cache_turbo_valid              1s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        location = /_cache_wc {{
+            cache_turbo_admin    warmcapz;
+            cache_turbo_warm_max 3;
+            allow 127.0.0.1;
+            deny all;
         }}
 
         # admin endpoint for the "main" zone, localhost-only

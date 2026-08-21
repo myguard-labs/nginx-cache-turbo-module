@@ -1,5 +1,16 @@
 Changes with the nginx-cache-turbo-module (unreleased)
 
+    *) Feature: the admin warm endpoint's per-request URL cap is now
+       configurable via cache_turbo_warm_max N (default 32, matching the
+       previous hardcoded ceiling; max 4096), and warming can be driven from
+       an external list with POST /_cache?url_file=<path> (one path per
+       line) in addition to the existing ?url=<path[,path,...]> query
+       string. Both sources fire at most cache_turbo_warm_max subrequests.
+       The file read is itself bounded -- max 64 KiB, max 2048 bytes per
+       line -- and any violation (missing file, not a regular file, over
+       size, an overlong line) is a clean 500 with a JSON error body rather
+       than a truncated read or an unbounded allocation.
+
     *) Bugfix: a dropped auto-Vary variant-index write no longer leaves a
        variant permanently invisible to PURGE. The store path called the L2
        backend's tag_add() and discarded its return value, so an index SADD

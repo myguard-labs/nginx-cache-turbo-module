@@ -549,6 +549,15 @@ typedef char ngx_http_cache_turbo_brk_probe_layout_assert
 #define NGX_HTTP_CACHE_TURBO_PROTECTED_PCT_MAX     99
 #define NGX_HTTP_CACHE_TURBO_PROTECTED_PCT_DEFAULT 80
 
+/* cache_turbo_warm_max bounds (P5-2-p0). DEFAULT matches the previous
+ * hardcoded NGX_HTTP_CACHE_TURBO_WARM_MAX cap byte-for-byte, so behaviour is
+ * unchanged unless an operator opts in. CEILING keeps a single admin warm
+ * request well under nginx's subrequest-depth limit even when an operator
+ * dials the cap all the way up -- see the directive handler for why this is
+ * a hand range-check rather than a bare ngx_conf_set_num_slot. */
+#define NGX_HTTP_CACHE_TURBO_WARM_MAX_DEFAULT   32
+#define NGX_HTTP_CACHE_TURBO_WARM_MAX_CEILING  4096
+
 typedef struct {
     ngx_rbtree_node_t        node;       /* node.key = crc32 of cache key  */
     u_char                   key[32];    /* full key hash, collision guard */
@@ -1410,6 +1419,14 @@ typedef struct {
      * directive handler for why 0 was chosen over a nonzero default). Only
      * meaningful with background_update on; ignored otherwise. */
     ngx_int_t                background_update_max;
+
+    /* cache_turbo_warm_max N (P5-2-p0). Ceiling on how many URLs a single
+     * admin warm request (?url=... or ?url_file=...) may fire subrequests
+     * for. Bounds one operator-triggered call's origin fan-out. Default 32
+     * (NGX_HTTP_CACHE_TURBO_WARM_MAX_DEFAULT), matching the previous
+     * hardcoded cap byte-for-byte unless an operator opts in; clamped at
+     * config time to NGX_HTTP_CACHE_TURBO_WARM_MAX_CEILING. */
+    ngx_int_t                warm_max;
 
     /* Cold-miss single-flight (v10). When on (default), the FIRST request to
      * cold-miss a key (no L1 node, L2 also misses) becomes the single

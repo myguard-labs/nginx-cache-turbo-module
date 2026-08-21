@@ -11,14 +11,33 @@
 #include "ngx_http_cache_turbo_module.h"
 
 
-/* Cap on URLs warmed per request. Keeps a single call well under nginx's
- * subrequest-depth limit and bounds the work one admin POST can schedule. */
-#define NGX_HTTP_CACHE_TURBO_WARM_MAX  32
+/* P5-2-p0: bounds on the ?url_file= list-driven warm source. The file itself
+ * is read in one pnalloc'd buffer at admin-request time (no startup hook, no
+ * on-disk cache format -- explicitly out of scope), so every dimension of
+ * that read must be bounded or an operator-supplied path becomes an
+ * unbounded allocation / unbounded origin fan-out:
+ *   - FILE_MAX_SIZE   caps the read (and thus the allocation) regardless of
+ *     the real file size on disk.
+ *   - LINE_MAX_LEN    caps how much of one unterminated line is scanned
+ *     before it is rejected, so a file with no newline at all cannot make
+ *     the parser treat the whole capped buffer as a single giant entry
+ *     silently -- it errors instead.
+ *   - warm_max (cache_turbo_warm_max, config directive, default 32 below)
+ *     caps how many of the parsed entries are actually fired as warm
+ *     subrequests, same as the inline ?url= list.
+ */
+#define NGX_HTTP_CACHE_TURBO_WARM_FILE_MAX_SIZE  (64 * 1024)
+#define NGX_HTTP_CACHE_TURBO_WARM_LINE_MAX_LEN   2048
 
-/* Forward decls: admin_handler dispatches to the ?url= warm endpoint, which is
- * defined below it (kept next to warm_uri_is_safe, its own helper). */
+/* Forward decls: admin_handler dispatches to the ?url=/?url_file= warm
+ * endpoints, defined below it (kept next to warm_uri_is_safe, its own
+ * helper). */
 static ngx_int_t ngx_http_cache_turbo_warm(ngx_http_request_t *r,
-    ngx_str_t *urls);
+    ngx_str_t *urls, ngx_int_t warm_max);
+static ngx_int_t ngx_http_cache_turbo_warm_file(ngx_http_request_t *r,
+    ngx_str_t *path, ngx_int_t warm_max);
+static ngx_int_t ngx_http_cache_turbo_warm_read_file(ngx_http_request_t *r,
+    ngx_str_t *path, ngx_str_t *out);
 
 /* State carried through an async all-purge (?all=1) from the admin handler to
  * the SCAN-del completion callback. Holds the L1 count purged synchronously so
@@ -334,12 +353,22 @@ ngx_http_cache_turbo_admin_purge_dispatch(ngx_http_request_t *r,
          * origin and store the result. Best-effort/async — the reply reports
          * how many warm subrequests were fired, not how many actually
          * stored. Sends its own JSON, so return its rc directly. */
-        return ngx_http_cache_turbo_warm(r, &arg);
+        return ngx_http_cache_turbo_warm(r, &arg, clcf->warm_max);
+
+    } else if (r->args.len
+               && ngx_http_arg(r, (u_char *) "url_file", 8, &arg) == NGX_OK)
+    {
+        /* P5-2-p0: same warm path, but the URL list comes from a file on
+         * disk (one path per line) instead of the query string -- lets an
+         * operator drive cold-start warming from an external list without a
+         * query string long enough to hit URL-length limits. Bounded read;
+         * see the FILE_MAX_SIZE/LINE_MAX_LEN comment above. */
+        return ngx_http_cache_turbo_warm_file(r, &arg, clcf->warm_max);
 
     } else {
         ngx_str_set(&body,
-            "{\"error\":\"specify ?all=1, ?key=<string>, ?tag=<name> "
-            "or ?url=<path[,path...]>\"}\n");
+            "{\"error\":\"specify ?all=1, ?key=<string>, ?tag=<name>, "
+            "?url=<path[,path...]> or ?url_file=<path>\"}\n");
         return ngx_http_cache_turbo_send_json(r, NGX_HTTP_BAD_REQUEST,
                    &body);
     }
@@ -677,34 +706,53 @@ ngx_http_cache_turbo_warm_uri_is_safe(ngx_str_t *uri)
 
 
 /*
- * POST /_cache?url=<path[,path,...]> — warm each comma-separated path. Each path
- * is percent-decoded (so an encoded URL still resolves) and an optional "?query"
- * suffix is passed through as the subrequest args. Only absolute paths ('/'...)
- * are accepted; anything else is skipped. Replies {"warmed":N} with N = number
- * of warm subrequests actually fired. The bg subrequests outlive this reply:
- * each bumped r->main->count, so the connection survives admin finalize until
- * they complete.
+ * POST /_cache?url=<path[,path,...]> — warm each comma- (or newline-, so the
+ * same parser also drives ?url_file=) separated path. Each path is percent-
+ * decoded (so an encoded URL still resolves) and an optional "?query" suffix
+ * is passed through as the subrequest args. Only absolute paths ('/'...) are
+ * accepted; anything else is skipped. Fires at most warm_max subrequests
+ * (cache_turbo_warm_max, config directive, default 32) regardless of how
+ * many entries the list contains -- P5-2-p0: this is the bound on the
+ * operator-supplied origin fan-out one admin call can trigger, so it is
+ * enforced here whether the list came from the query string or a file.
+ * Replies {"warmed":N} with N = number of warm subrequests actually fired.
+ * The bg subrequests outlive this reply: each bumped r->main->count, so the
+ * connection survives admin finalize until they complete.
  */
 static ngx_int_t
-ngx_http_cache_turbo_warm(ngx_http_request_t *r, ngx_str_t *urls)
+ngx_http_cache_turbo_warm(ngx_http_request_t *r, ngx_str_t *urls,
+    ngx_int_t warm_max)
 {
-    u_char     *p, *last, *comma, *q, *dst, *s;
+    u_char     *p, *last, *sep, *q, *dst, *s;
     ngx_uint_t  warmed = 0;
+
     ngx_str_t   uri, args, body;
     u_char     *out;
 
     p = urls->data;
     last = p + urls->len;
 
-    while (p < last && warmed < NGX_HTTP_CACHE_TURBO_WARM_MAX) {
-        comma = ngx_strlchr(p, last, ',');
-        if (comma == NULL) {
-            comma = last;
+    while (p < last && warmed < (ngx_uint_t) warm_max) {
+        sep = ngx_strlchr(p, last, ',');
+        q = ngx_strlchr(p, last, '\n');
+        if (q != NULL && (sep == NULL || q < sep)) {
+            sep = q;
+        }
+        if (sep == NULL) {
+            sep = last;
         }
 
-        if (comma > p) {
+        if (sep > p) {
             uri.data = p;
-            uri.len = comma - p;
+            uri.len = sep - p;
+
+            /* Tolerate a CRLF line ending from a file-driven list (Windows-
+             * edited operator lists are common) by trimming a trailing '\r'
+             * before it can be mistaken for part of the path. */
+            if (uri.len > 0 && uri.data[uri.len - 1] == '\r') {
+                uri.len--;
+            }
+
             ngx_str_null(&args);
 
             /* split off a "?query" suffix; keep it as the subrequest args */
@@ -740,7 +788,7 @@ ngx_http_cache_turbo_warm(ngx_http_request_t *r, ngx_str_t *urls)
             }
         }
 
-        p = comma + 1;
+        p = sep + 1;
     }
 
     out = ngx_pnalloc(r->pool, sizeof("{\"warmed\":4294967295}\n"));
@@ -750,4 +798,151 @@ ngx_http_cache_turbo_warm(ngx_http_request_t *r, ngx_str_t *urls)
     body.data = out;
     body.len = ngx_sprintf(out, "{\"warmed\":%ui}\n", warmed) - out;
     return ngx_http_cache_turbo_send_json(r, NGX_HTTP_OK, &body);
+}
+
+
+/*
+ * Bounded read of the file at *path into a freshly r->pool-allocated buffer
+ * in *out. Every failure mode errors cleanly rather than truncating the list
+ * silently or allocating unboundedly:
+ *   - missing/unopenable file, stat failure, not a regular file -> NGX_ERROR
+ *   - file bigger than WARM_FILE_MAX_SIZE                       -> NGX_ERROR
+ *   - short read (file changed under us)                        -> NGX_ERROR
+ * A file within budget is read in exactly one ngx_read_file() call sized off
+ * the stat()'d length, so the allocation is always <= WARM_FILE_MAX_SIZE.
+ */
+static ngx_int_t
+ngx_http_cache_turbo_warm_read_file(ngx_http_request_t *r, ngx_str_t *path,
+    ngx_str_t *out)
+{
+    ngx_fd_t         fd;
+    ngx_file_info_t  fi;
+    ngx_file_t        file;
+    ssize_t           n;
+    u_char           *buf, *nul;
+
+    /* ngx_open_file/ngx_file_info both want a NUL-terminated C string; the
+     * arg came out of the query string via ngx_http_arg(), which points into
+     * the request line buffer and is not NUL-terminated there. Copy+NUL it
+     * rather than assume. */
+    nul = ngx_pnalloc(r->pool, path->len + 1);
+    if (nul == NULL) {
+        return NGX_ERROR;
+    }
+    ngx_memcpy(nul, path->data, path->len);
+    nul[path->len] = '\0';
+
+    fd = ngx_open_file(nul, NGX_FILE_RDONLY, NGX_FILE_OPEN, 0);
+    if (fd == NGX_INVALID_FILE) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
+            "cache_turbo: warm url_file open(\"%s\") failed", nul);
+        return NGX_ERROR;
+    }
+
+    if (ngx_fd_info(fd, &fi) == NGX_FILE_ERROR) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
+            "cache_turbo: warm url_file stat(\"%s\") failed", nul);
+        ngx_close_file(fd);
+        return NGX_ERROR;
+    }
+
+    if (!ngx_is_file(&fi)) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+            "cache_turbo: warm url_file \"%s\" is not a regular file", nul);
+        ngx_close_file(fd);
+        return NGX_ERROR;
+    }
+
+    if (ngx_file_size(&fi) < 0
+        || ngx_file_size(&fi) > NGX_HTTP_CACHE_TURBO_WARM_FILE_MAX_SIZE)
+    {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+            "cache_turbo: warm url_file \"%s\" exceeds the %d byte limit",
+            nul, NGX_HTTP_CACHE_TURBO_WARM_FILE_MAX_SIZE);
+        ngx_close_file(fd);
+        return NGX_ERROR;
+    }
+
+    out->len = (size_t) ngx_file_size(&fi);
+
+    if (out->len == 0) {
+        ngx_close_file(fd);
+        ngx_str_null(out);
+        return NGX_OK;
+    }
+
+    buf = ngx_pnalloc(r->pool, out->len);
+    if (buf == NULL) {
+        ngx_close_file(fd);
+        return NGX_ERROR;
+    }
+
+    ngx_memzero(&file, sizeof(ngx_file_t));
+    file.fd = fd;
+    file.name = *path;
+    file.log = r->connection->log;
+
+    n = ngx_read_file(&file, buf, out->len, 0);
+    ngx_close_file(fd);
+
+    if (n == NGX_ERROR || (size_t) n != out->len) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
+            "cache_turbo: warm url_file \"%s\" short read", nul);
+        return NGX_ERROR;
+    }
+
+    out->data = buf;
+
+    return NGX_OK;
+}
+
+
+/*
+ * POST /_cache?url_file=<path> — list-driven warming (P5-2-p0): reads *path
+ * (one URL per line, same "path[?query]" grammar as ?url=) bounded by
+ * WARM_FILE_MAX_SIZE/WARM_LINE_MAX_LEN, then hands the buffer to the same
+ * ngx_http_cache_turbo_warm() parser/fan-out used by the inline ?url= list,
+ * so the warm_max cap and safety checks apply identically. Any read failure
+ * (missing file, oversize, short read, not-a-regular-file) is a clean 500
+ * with no partial warming and no crash -- never a silent truncation.
+ */
+static ngx_int_t
+ngx_http_cache_turbo_warm_file(ngx_http_request_t *r, ngx_str_t *path,
+    ngx_int_t warm_max)
+{
+    ngx_str_t   list, body;
+    u_char     *p, *last, *line_start;
+
+    if (ngx_http_cache_turbo_warm_read_file(r, path, &list) != NGX_OK) {
+        ngx_str_set(&body,
+            "{\"error\":\"warm url_file: unreadable, not a regular file, "
+            "or over the size limit\"}\n");
+        return ngx_http_cache_turbo_send_json(r, NGX_HTTP_INTERNAL_SERVER_ERROR,
+                   &body);
+    }
+
+    /* Reject any single line (delimited by '\n', or the buffer end for the
+     * last/only line) longer than WARM_LINE_MAX_LEN before it ever reaches
+     * the warm parser -- a file with no newline at all must not be treated
+     * as one giant entry silently; it errors instead of being scanned. */
+    p = list.data;
+    last = list.data + list.len;
+    line_start = p;
+    while (p <= last) {
+        if (p == last || *p == '\n') {
+            if ((ngx_uint_t) (p - line_start)
+                > NGX_HTTP_CACHE_TURBO_WARM_LINE_MAX_LEN)
+            {
+                ngx_str_set(&body,
+                    "{\"error\":\"warm url_file: a line exceeds the "
+                    "length limit\"}\n");
+                return ngx_http_cache_turbo_send_json(r,
+                           NGX_HTTP_INTERNAL_SERVER_ERROR, &body);
+            }
+            line_start = p + 1;
+        }
+        p++;
+    }
+
+    return ngx_http_cache_turbo_warm(r, &list, warm_max);
 }

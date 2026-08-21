@@ -1452,6 +1452,135 @@ def test_warm_no_url(ng: Nginx) -> None:
     assert "error" in json.loads(b), f"expected an error body, got {b!r}"
 
 
+def test_warm_max_bound_enforced(ng: Nginx, origin: Origin) -> None:
+    """P5-2-p0: /_cache_wc sets cache_turbo_warm_max 3 on zone warmcapz. A
+    request listing MORE than 3 URLs (?url=a,b,c,d,e) must report warmed=3,
+    not 5, and the origin must see EXACTLY 3 hits, not 5 -- proving the cap
+    is enforced on the actual fan-out, not just the reported count (a bug
+    that fired every subrequest but capped only the JSON number would pass
+    an assertion on `warmed` alone)."""
+    tag = f"wc-{time.time()}"
+    uris = [f"/wc/{tag}-{i}" for i in range(5)]
+    base = origin.hits_for(tag)
+    s, body, _ = fetch(ng.port, f"/_cache_wc?url={','.join(uris)}", method="POST")
+    assert s == 200, f"warm-max status {s}: {body!r}"
+    assert json.loads(body)["warmed"] == 3, f"warmed count: {body}"
+    time.sleep(0.5)                     # let any (wrongly) extra subrequests land
+    assert origin.hits_for(tag) == base + 3, \
+        f"origin saw {origin.hits_for(tag) - base} hits, expected exactly 3"
+
+
+def test_warm_url_file_populates(ng: Nginx, origin: Origin) -> None:
+    """P5-2-p0: ?url_file=<path> drives warming from a file (one URL per
+    line) instead of the inline query string, through the same parser/cap as
+    ?url=. A well-formed 2-line file warms both entries exactly once."""
+    tag = f"wcf-{time.time()}"
+    a, b_uri = f"/wc/{tag}-a", f"/wc/{tag}-b"
+    (ng.root / "warm-lists").mkdir(exist_ok=True)
+    list_path = ng.root / "warm-lists" / "warm-list.txt"
+    list_path.write_text(f"{a}\n{b_uri}\n")
+
+    base = origin.hits_for(tag)
+    s, body, _ = fetch(ng.port, f"/_cache_wc?url_file={list_path}", method="POST")
+    assert s == 200, f"warm url_file status {s}: {body!r}"
+    assert json.loads(body)["warmed"] == 2, f"warmed count: {body}"
+    assert wait_for(lambda: origin.hits_for(tag) == base + 2), \
+        "url_file warm subrequests never reached origin"
+    time.sleep(0.2)
+    after = origin.hits_for(tag)
+    for u in (a, b_uri):
+        _, _, h = fetch(ng.port, u)
+        assert h.get("x-cache") == "HIT", f"{u} not warmed (X-Cache={h.get('x-cache')})"
+    assert origin.hits_for(tag) == after, "a url_file-warmed GET still hit origin"
+
+
+def test_warm_url_file_bound_enforced(ng: Nginx, origin: Origin) -> None:
+    """P5-2-p0: the warm_max cap applies identically when the list comes
+    from a file -- a 5-line file against warm_max 3 fires only 3 subrequests,
+    same enforcement as the inline ?url= case."""
+    tag = f"wcf-cap-{time.time()}"
+    uris = [f"/wc/{tag}-{i}" for i in range(5)]
+    (ng.root / "warm-lists").mkdir(exist_ok=True)
+    list_path = ng.root / "warm-lists" / "warm-list-cap.txt"
+    list_path.write_text("\n".join(uris) + "\n")
+
+    base = origin.hits_for(tag)
+    s, body, _ = fetch(ng.port, f"/_cache_wc?url_file={list_path}", method="POST")
+    assert s == 200, f"warm url_file status {s}: {body!r}"
+    assert json.loads(body)["warmed"] == 3, f"warmed count: {body}"
+    time.sleep(0.5)
+    assert origin.hits_for(tag) == base + 3, \
+        f"origin saw {origin.hits_for(tag) - base} hits, expected exactly 3"
+
+
+def test_warm_url_file_missing(ng: Nginx) -> None:
+    """P5-2-p0: a nonexistent url_file path is a clean 500 with a JSON error,
+    never a crash and never a silently-empty warm (which would misreport
+    success)."""
+    s, b, h = fetch(ng.port, "/_cache_wc?url_file=/nonexistent/path/does-not-exist",
+                     method="POST")
+    assert s == 500, f"missing url_file returned {s}, expected 500: {b!r}"
+    assert "application/json" in h.get("content-type", ""), h.get("content-type")
+    assert "error" in json.loads(b), f"expected an error body, got {b!r}"
+
+
+def test_warm_url_file_oversize_rejected(ng: Nginx) -> None:
+    """P5-2-p0: a url_file bigger than the WARM_FILE_MAX_SIZE bound (64 KiB)
+    is rejected cleanly (500 + JSON error) rather than read into an unbounded
+    allocation. One line's worth of garbage repeated well past the limit."""
+    (ng.root / "warm-lists").mkdir(exist_ok=True)
+    list_path = ng.root / "warm-lists" / "warm-list-oversize.txt"
+    list_path.write_text(("/wc/oversize-line\n") * 6000)   # ~108 KB > 64 KiB cap
+    assert list_path.stat().st_size > 64 * 1024
+
+    s, b, h = fetch(ng.port, f"/_cache_wc?url_file={list_path}", method="POST")
+    assert s == 500, f"oversize url_file returned {s}, expected 500: {b!r}"
+    assert "application/json" in h.get("content-type", ""), h.get("content-type")
+    assert "error" in json.loads(b), f"expected an error body, got {b!r}"
+
+
+def test_warm_url_file_overlong_line_rejected(ng: Nginx) -> None:
+    """P5-2-p0: a single line (no embedded newline) longer than
+    WARM_LINE_MAX_LEN (2048) is rejected cleanly rather than the whole
+    (within-file-size-budget) buffer being scanned as one giant entry. Also
+    covers the "no trailing newline at all" shape -- the file is one line
+    with no terminator."""
+    (ng.root / "warm-lists").mkdir(exist_ok=True)
+    list_path = ng.root / "warm-lists" / "warm-list-longline.txt"
+    list_path.write_text("/wc/" + "a" * 3000)   # no newline; single overlong line
+
+    s, b, h = fetch(ng.port, f"/_cache_wc?url_file={list_path}", method="POST")
+    assert s == 500, f"overlong-line url_file returned {s}, expected 500: {b!r}"
+    assert "application/json" in h.get("content-type", ""), h.get("content-type")
+    assert "error" in json.loads(b), f"expected an error body, got {b!r}"
+
+
+def test_warm_url_file_binary_no_crash(ng: Nginx, origin: Origin) -> None:
+    """P5-2-p0: a binary blob (embedded NULs, no valid path structure) as
+    url_file must not crash the worker and must not warm anything bogus --
+    either a clean error, or a 200 with warmed=0 (every "line" fails the
+    absolute-path/traversal checks the inline ?url= parser already applies,
+    since url_file reuses that same parser)."""
+    tag = f"wcf-bin-{time.time()}"
+    (ng.root / "warm-lists").mkdir(exist_ok=True)
+    list_path = ng.root / "warm-lists" / "warm-list-binary.dat"
+    list_path.write_bytes(bytes(range(256)) * 4)   # includes NUL, no newline
+
+    base = origin.hits_for(tag)
+    s, b, h = fetch(ng.port, f"/_cache_wc?url_file={list_path}", method="POST")
+    assert s in (200, 500), f"binary url_file returned {s}: {b!r}"
+    assert "application/json" in h.get("content-type", ""), h.get("content-type")
+    if s == 200:
+        assert json.loads(b)["warmed"] == 0, f"binary garbage warmed something: {b}"
+    time.sleep(0.2)
+    assert origin.hits_for(tag) == base, "binary url_file reached the origin"
+
+    # the worker must still be answering ordinary requests afterwards --
+    # this is the actual "did not crash" oracle.
+    s2, _, _ = fetch(ng.port, "/_cache_wc")
+    assert s2 == 200, f"worker unresponsive after binary url_file (status {s2})"
+
+
 def test_warm_strips_key_cookie(ng: Nginx, origin: Origin) -> None:
     """B-S4: a warm subrequest fetches ANONYMOUSLY even when the admin POST
     carries a segment/key cookie.

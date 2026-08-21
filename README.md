@@ -1777,10 +1777,17 @@ $ curl -X POST 'localhost/_cache?all=1'               # nuke the whole zone
 
 $ curl -X POST 'localhost/_cache?url=/,/blog/,/about' # pre-warm cold pages
 {"warmed":3}
+
+$ curl -X POST 'localhost/_cache?url_file=/etc/myapp/warm-list.txt' # or from a file, one path per line
+{"warmed":3}
 ```
 
-> The admin location purges the cache and `?url=` fires server-side fetches
-> to local paths. Always gate it with `allow`/`deny` (or auth). Never public.
+> The admin location purges the cache and `?url=`/`?url_file=` fire server-side
+> fetches to local paths. Always gate it with `allow`/`deny` (or auth). Never
+> public. Both warm sources are capped at `cache_turbo_warm_max` URLs per
+> request (default `32`); `?url_file=` additionally bounds the file read
+> itself (64 KiB max size, 2048-byte max line length) so an operator-supplied
+> list cannot become an unbounded allocation or an unbounded origin fan-out.
 
 ## Every directive in one place (full syntax)
 
@@ -1935,6 +1942,7 @@ http {
 | `cache_turbo_tag EXPR` | `server`, `location` | — | Tag stored pages (whitespace/comma list) so they can be purged as a group. Needs `cache_turbo_redis`. |
 | `cache_turbo_surrogate_key on\|off` | `server`, `location` | `off` | Emit the `cache_turbo_tag` list downstream as a `Surrogate-Key` header on the MISS/store response **and on every HIT/STALE serve** (a CDN POP can refill from a hit), so a fronting CDN (Fastly, …) can purge-by-tag in sync. No `cache_turbo_redis` required. See [Purge-syncing the CDN](#purge-syncing-the-cdn-cache_turbo_surrogate_key). |
 | `cache_turbo_admin NAME` | `location` | — | Make this location a control endpoint for zone `NAME` (stats/purge/warm). Gate with `allow`/`deny`. |
+| `cache_turbo_warm_max N` | `server`, `location` | `32` | Ceiling on how many URLs one `POST /_cache?url=...` or `?url_file=...` request may fire warm subrequests for — bounds the operator-supplied origin fan-out a single admin call can trigger. `N` must be a positive integer up to `4096`; `0`, negatives and non-numeric values are rejected at config time rather than silently coerced. |
 | `cache_turbo_normalize_strip NAME...` | `server`, `location` | — | Extra query args to drop from `$cache_turbo_normalized_args` (trailing `*` = prefix; a bare `*` matches every name = drop all), on top of the built-ins. |
 | `cache_turbo_normalize_vary TOKEN...` | `server`, `location` | off | Append a variant bucket to `$cache_turbo_normalized_args`: `encoding` (br/gzip/identity) and/or `device` (mobile/desktop). |
 | `cache_turbo_auto_vary on\|off` | `server`, `location` | `on` | Read the response's own `Vary` header and split the cache by the named request header automatically. Safe whitelist: `Accept-Encoding`, `User-Agent` (device class), `Accept-Language` (primary-subtag class), `Origin` (raw — CORS boundary, never folded). `Vary: *`/`Cookie`/`Authorization` — **or any other header not on the whitelist** — ⇒ uncacheable (so an un-split Vary axis can never serve the wrong representation). Two-level, node-local keying. See [Auto-Vary](#auto-vary-read-the-response-vary). |
@@ -2023,7 +2031,8 @@ http {
 | `POST /_cache?all=1` | Purge the whole zone (and the L2 keyspace, if Redis is on). The L2 side is a `SCAN MATCH <prefix>*` walk; if that walk does **not** finish — read timeout, malformed reply, or the internal page cap — the response is `500` with `{"purged":N,"l2":"incomplete","reason":"…"}` and part of L2 still holds entries. If the walk cannot even start — L2 unreachable, connect refused — the response is `500` with `{"purged":N,"l2":"unavailable"}` and L2 is untouched. A `200` means the walk reached the end of the keyspace. |
 | `POST /_cache?key=<string>` | Purge one entry. `<string>` is hashed **verbatim**, so it must equal the entry's full cache-key value — for the built-in default key that is `<host><uri><raw-query-string>` (e.g. `example.com/blog/post-42?id=1`), **not** just the path. Use a `PURGE` request to that URL (above) if you don't want to reconstruct the key. Drops L1 + L2. |
 | `POST /_cache?tag=<name>` | Purge every page tagged `<name>` across L1 + L2. |
-| `POST /_cache?url=<path[,path,...]>` | Warm those paths (background prefetch). Each warm subrequest fetches **anonymously** — the admin request's `Cookie` header is stripped, so the entry is stored under the cookieless anonymous key a visitor looks up (and no per-visitor/segment body is pulled from the origin), even if you trigger the warm from a logged-in browser. |
+| `POST /_cache?url=<path[,path,...]>` | Warm those paths (background prefetch). Each warm subrequest fetches **anonymously** — the admin request's `Cookie` header is stripped, so the entry is stored under the cookieless anonymous key a visitor looks up (and no per-visitor/segment body is pulled from the origin), even if you trigger the warm from a logged-in browser. Fires at most `cache_turbo_warm_max` subrequests (default `32`) regardless of list length. |
+| `POST /_cache?url_file=<path>` | Same as `?url=`, but the list of paths comes from a file on disk (one `path[?query]` per line, CRLF tolerated) instead of the query string — useful when the list is longer than comfortably fits in a URL. Subject to the same `cache_turbo_warm_max` cap, plus its own bounded read: the file must be a regular file no larger than 64 KiB, and no single line may exceed 2048 bytes; either limit, or a missing/unreadable file, is a clean `500` with a JSON error body, never a crash or a silent partial warm. |
 
 ## Monitoring (Prometheus + Grafana)
 
