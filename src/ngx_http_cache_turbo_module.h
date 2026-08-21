@@ -971,6 +971,18 @@ typedef struct {
     ngx_atomic_t             varidx_drops;
     ngx_atomic_t             varidx_reissues;
 
+    /* L9: counts tag-index writes (tag_add / tag_add_many for
+     * cache_turbo_tag) that never reached the transport at store time --
+     * the same drop class as varidx_drops above, but for the purge-by-tag
+     * index rather than the auto-Vary variant index. No self-heal exists
+     * for this write yet (unlike varidx_pending), so there is only one
+     * counter: this makes the drop OBSERVABLE (an operator/alert can see
+     * a purge-by-tag is silently missing an object) without changing when
+     * or whether the write itself happens. ZONE-scoped for the same
+     * reason as varidx_drops -- the runtime suite has no request affinity
+     * across its 4 workers. */
+    ngx_atomic_t             tag_index_drops;
+
     /* P4-1a: W-TinyLFU frequency sketch (count-min, 4-bit counters).
      *
      * STAGE 1 OF 2. This stage only ESTIMATES frequency; nothing reads the
@@ -1189,6 +1201,15 @@ typedef struct {
     ngx_atomic_uint_t   sie_serves;
     ngx_atomic_uint_t   breaker_serves;
     ngx_atomic_uint_t   origin_failures;
+    /* COR-5(b)/L9: store-time index writes dropped before reaching the
+     * transport (S231 backoff armed, connect failure, alloc failure).
+     * varidx_drops is the auto-Vary variant index (self-heals on the next
+     * hit -- see varidx_reissues in shctx_t); tag_index_drops is the
+     * purge-by-tag index, which has no self-heal. Neither counter changes
+     * production behaviour; both exist so a dropped write is OBSERVABLE
+     * instead of silent. */
+    ngx_atomic_uint_t   varidx_drops;
+    ngx_atomic_uint_t   tag_index_drops;
     /* P3-7: live count of background-refresh subrequests in flight right
      * now (a gauge, not a counter -- goes up on fire, down on completion).
      * Answers exactly the "invisible to the module's own metrics" gap the

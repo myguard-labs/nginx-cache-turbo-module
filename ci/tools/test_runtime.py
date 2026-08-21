@@ -426,6 +426,9 @@ def run_all(ng: Nginx, origin: Origin,
         # c-1: the PURGE reply must distinguish a complete enumeration from a
         # degraded one when a drop is still outstanding at purge time.
         test_cor5_purge_reports_degraded_enumeration(ng, origin, redis)
+        # SILENT-INDEX-DROP option (a): the L9 tag-index write's own drop
+        # must be observable via the admin tag_index_drops counter.
+        test_l9_tag_index_drop_is_observable(ng, origin, redis)
         test_l2_vary_marker_cold_node_finds_peer_variant(ng, origin, redis)  # P3-5
         # c-2: a peer's PURGE must stop a warm-marker node from serving the
         # old variant within cache_turbo_vary_marker_revalidate's window; the

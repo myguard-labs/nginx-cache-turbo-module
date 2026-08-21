@@ -426,7 +426,7 @@ ngx_http_cache_turbo_admin_stats_prometheus(ngx_http_request_t *r,
      * accident. The term below is the MEASURED fixed prose (sum of the
      * literal bytes, less 2 per %V and 3 per %uA) plus a 256-byte margin.
      * When adding a metric, re-measure rather than adding an estimate. */
-    len = 6400 + 32 * zname.len + 32 * NGX_ATOMIC_T_LEN;
+    len = 6789 + 34 * zname.len + 34 * NGX_ATOMIC_T_LEN;
     p = ngx_pnalloc(r->pool, len);
     if (p == NULL) {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -508,6 +508,15 @@ ngx_http_cache_turbo_admin_stats_prometheus(ngx_http_request_t *r,
         "# HELP cache_turbo_origin_failures_total Origin responses recorded as a failure by the circuit breaker.\n"
         "# TYPE cache_turbo_origin_failures_total counter\n"
         "cache_turbo_origin_failures_total{zone=\"%V\"} %uA\n"
+        "# HELP cache_turbo_varidx_drops_total Auto-Vary variant-index writes dropped before reaching the transport at store time (self-heals on the next hit).\n"
+        "# TYPE cache_turbo_varidx_drops_total counter\n"
+        "cache_turbo_varidx_drops_total{zone=\"%V\"} %uA\n"
+        "# HELP cache_turbo_tag_index_drops_total Purge-by-tag index "
+        "writes dropped before reaching the transport at store time "
+        "(no self-heal; a later purge of the tag will not invalidate "
+        "the affected object until its own TTL).\n"
+        "# TYPE cache_turbo_tag_index_drops_total counter\n"
+        "cache_turbo_tag_index_drops_total{zone=\"%V\"} %uA\n"
         "# HELP cache_turbo_breaker_opens_total Lifetime count of CLOSED->OPEN circuit breaker trips.\n"
         "# TYPE cache_turbo_breaker_opens_total counter\n"
         "cache_turbo_breaker_opens_total{zone=\"%V\"} %uA\n"
@@ -542,6 +551,7 @@ ngx_http_cache_turbo_admin_stats_prometheus(ngx_http_request_t *r,
         &zname, st->autotuned_load,
         &zname, st->sie_serves, &zname, st->breaker_serves,
         &zname, st->origin_failures,
+        &zname, st->varidx_drops, &zname, st->tag_index_drops,
         &zname, st->breaker_opens,
         &zname, (ngx_atomic_uint_t) ngx_http_cache_turbo_brk_state(
             (ngx_uint_t) st->breaker_state),
@@ -577,10 +587,11 @@ ngx_http_cache_turbo_admin_stats_json(ngx_http_request_t *r,
                  "\"autotuned_beta\":,\"autotuned_load\":,"
                  "\"breaker_state\":\"\",\"breaker_opens\":,"
                  "\"sie_serves\":,\"breaker_serves\":,"
-                 "\"origin_failures\":,\"bg_inflight\":,"
+                 "\"origin_failures\":,\"varidx_drops\":,"
+                 "\"tag_index_drops\":,\"bg_inflight\":,"
                  "\"sketch_gen\":,\"sketch_bumps\":,"
                  "\"admission_refused\":,\"used_bytes\":}\n")
-          + 31 * NGX_ATOMIC_T_LEN
+          + 33 * NGX_ATOMIC_T_LEN
           + sizeof("half-open") - 1;   /* longest _breaker_state_str value */
     p = ngx_pnalloc(r->pool, len);
     if (p == NULL) {
@@ -601,7 +612,8 @@ ngx_http_cache_turbo_admin_stats_json(ngx_http_request_t *r,
         "\"autotuned_load\":%uA,"
         "\"breaker_state\":\"%s\",\"breaker_opens\":%uA,"
         "\"sie_serves\":%uA,\"breaker_serves\":%uA,"
-        "\"origin_failures\":%uA,\"bg_inflight\":%uA,"
+        "\"origin_failures\":%uA,\"varidx_drops\":%uA,"
+        "\"tag_index_drops\":%uA,\"bg_inflight\":%uA,"
         "\"sketch_gen\":%uA,\"sketch_bumps\":%uA,"
         "\"admission_refused\":%uA,\"used_bytes\":%uA}\n",
         st->hits, st->misses, st->stale_serves,
@@ -617,6 +629,7 @@ ngx_http_cache_turbo_admin_stats_json(ngx_http_request_t *r,
             (ngx_uint_t) st->breaker_state),
         st->breaker_opens,
         st->sie_serves, st->breaker_serves, st->origin_failures,
+        st->varidx_drops, st->tag_index_drops,
         st->bg_inflight,
         st->sketch_gen, st->sketch_bumps, st->admission_refused,
         st->used_bytes) - p;
