@@ -4246,7 +4246,18 @@ http {{
         location /wc/ {{
             cache_turbo                    warmcapz;
             cache_turbo_key                $uri;
-            cache_turbo_valid              1s;
+            # 60s, NOT 1s. test_warm_url_file_populates warms, then waits for
+            # the warm subrequests to reach the origin (wait_for's timeout is
+            # 3.0s, scaled up further under sanitizers) before asserting the
+            # entry serves X-Cache: HIT. With a 1s TTL that assert races the
+            # freshness window: on a runner where warming takes >1s the entry
+            # is CORRECTLY already STALE and the test reds -- which is what it
+            # did on CI while passing locally. The window must outlast the
+            # wait, so the oracle tests "did the warm store a fresh entry"
+            # rather than "was the runner fast". Nothing in this location
+            # asserts expiry, so a long TTL costs no coverage; the sibling
+            # /wc/ tests assert origin hit COUNTS, which a TTL cannot move.
+            cache_turbo_valid              60s;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
         location = /_cache_wc {{

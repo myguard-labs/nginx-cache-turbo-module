@@ -1488,10 +1488,24 @@ def test_warm_url_file_populates(ng: Nginx, origin: Origin) -> None:
         "url_file warm subrequests never reached origin"
     time.sleep(0.2)
     after = origin.hits_for(tag)
+    # /wc/ is cache_turbo_valid 60s deliberately: this assert must fail only
+    # when the warm did not STORE, never because the runner took longer than
+    # the freshness window to get here (a 1s TTL made this red on CI while
+    # green locally -- the entry was correctly STALE, not missing).
     for u in (a, b_uri):
         _, _, h = fetch(ng.port, u)
         assert h.get("x-cache") == "HIT", f"{u} not warmed (X-Cache={h.get('x-cache')})"
     assert origin.hits_for(tag) == after, "a url_file-warmed GET still hit origin"
+
+    # A URL NOT in the list must be untouched -- otherwise every assertion
+    # above is also satisfied by a warm that ignored the file and warmed
+    # something broader (or by /wc/ serving hits it never stored). This is
+    # what makes the HIT assertions above discriminate the file-driven path
+    # rather than merely observing that /wc/ caches at all.
+    absent = f"/wc/{tag}-never-listed"
+    _, _, h_absent = fetch(ng.port, absent)
+    assert h_absent.get("x-cache") != "HIT", \
+        f"{absent} was never in the url_file yet served X-Cache=HIT"
 
 
 def test_warm_url_file_bound_enforced(ng: Nginx, origin: Origin) -> None:
