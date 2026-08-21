@@ -77,6 +77,37 @@ class TestBreadcrumbExportedByWorkflows(unittest.TestCase):
             f"_write_breadcrumb() no-ops and a wedge yields no hanging-test.txt.",
         )
 
+    def test_every_hang_guarded_workflow_uploads_the_artifacts(self):
+        """A capture nobody retrieves is as useless as one never written.
+
+        ci-hang-guard.sh writes hanging-test.txt, the gdb backtrace and the
+        nginx error.log into ARTDIR. If the job never uploads that directory the
+        evidence dies with the runner -- which is how earlier wedges produced a
+        job timeout and nothing else.
+        """
+        missing = []
+        for wf in sorted((REPO / ".github" / "workflows").glob("*.yml")):
+            text = wf.read_text(encoding="utf-8")
+            if "ci-hang-guard.sh" not in text:
+                continue
+            artdirs = set(re.findall(r"([\w./-]*ci-hang-artifacts)/?", text))
+            for artdir in artdirs:
+                base = artdir.rsplit("/", 1)[-1]
+                if not re.search(
+                    r"upload-artifact.*?path:\s*[^\n]*" + re.escape(base),
+                    text,
+                    re.DOTALL,
+                ):
+                    missing.append(f"{wf.name}:{base}")
+
+        missing = sorted(set(missing))
+        self.assertEqual(
+            missing,
+            [],
+            f"hang-guard artifact dirs never uploaded: {missing}. The capture "
+            f"would be written and then discarded with the runner.",
+        )
+
 
 class TestBreadcrumbWrapper(unittest.TestCase):
     """The enter/DONE pair through the real _instrument() wrapper."""

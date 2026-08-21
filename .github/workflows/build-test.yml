@@ -1,4 +1,4 @@
-# sync-sha: 21a1d7fe2d6397d225e8810fa72906ce14df270427b3d5a2d8cebceaef60292b
+# sync-sha: e8080fea51f33cf2f83ba27d0e5301f18b4601666cd77b8da5996001d6d71b5a
 name: Build & Test
 
 # Runner labels live in the POOL repository variable. Every checked-in selector
@@ -399,6 +399,18 @@ jobs:
       - name: Assert the requested fixture set actually came up (AUD-TESTFIX1)
         if: ${{ !inputs.skip-expensive-jobs }}
         run: bash ci/tools/assert-fixtures.sh runtime-suite.log
+
+      # Without this the guard writes hanging-test.txt, the gdb backtrace and the
+      # nginx error.log into ci-hang-artifacts/ and the job then discards them,
+      # which is how earlier wedges produced no evidence. Mirrors asan.yml.
+      - name: Upload hang-capture artifacts
+        if: always()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: runtime-hang-capture
+          path: ci-hang-artifacts/
+          if-no-files-found: ignore
+          retention-days: 14
 
   prove:
     name: Preset suite (Test::Nginx)
