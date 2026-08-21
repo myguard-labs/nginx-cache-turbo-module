@@ -1040,6 +1040,20 @@ typedef struct {
     ngx_uint_t               admission;         /* 0 = off (default)         */
     ngx_uint_t               sketch_bumps;      /* lifetime bumps            */
     ngx_uint_t               admission_refused; /* candidates refused        */
+
+    /* P4-2-s3a: LIVE gauge of slab bytes currently charged for cached
+     * payload+metadata -- every node allocation plus every response blob
+     * (blobref header included). Charged in shm_alloc_evict(), the sole
+     * allocation funnel, and discharged in shm_free_locked(), the sole free
+     * funnel, both under this same shpool mutex, so a charge without a matching
+     * discharge is a structural impossibility rather than a per-site promise.
+     * Excludes fixed per-zone init overhead (the shctx itself, the W-TinyLFU
+     * sketch), which is never freed and would otherwise be an unreachable
+     * floor. Against ngx_slab's own free-page accounting this is the DEMAND
+     * side: the delta between the two is slab fragmentation + bin rounding,
+     * which is precisely what P4-2-s3 needs a number for. Plain field, not an
+     * atomic: every access is under the shpool mutex. */
+    ngx_uint_t               used_bytes;
 #if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
     && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
     /* O4.4-i: lifetime count of breaker-fallback ARMINGS, bumped inside the
@@ -1147,6 +1161,8 @@ typedef struct {
     ngx_atomic_uint_t   sketch_gen;
     ngx_atomic_uint_t   sketch_bumps;
     ngx_atomic_uint_t   admission_refused;
+    /* P4-2-s3a: live used-bytes gauge, see the shctx_t field. */
+    ngx_atomic_uint_t   used_bytes;
     /* P0-1: per-reason store-refusal counters, mirrors shctx_t. */
     ngx_atomic_uint_t   refuse_set_cookie;
     ngx_atomic_uint_t   refuse_encoded;

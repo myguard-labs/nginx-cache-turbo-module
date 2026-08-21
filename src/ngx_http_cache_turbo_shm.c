@@ -217,6 +217,13 @@ ngx_http_cache_turbo_shm_init_zone(ngx_shm_zone_t *shm_zone, void *data)
     ctx->sh->sketch_bumps = 0;
     ctx->sh->admission_refused = 0;
 
+    /* P4-2-s3a: live used-bytes gauge. Starts at 0 -- the sketch allocation
+     * below is deliberately NOT charged: it is a fixed per-zone overhead
+     * allocated once at init and never freed, not cached payload+metadata, and
+     * including it would put a constant floor under the gauge that no eviction
+     * or purge can ever return to baseline. */
+    ctx->sh->used_bytes = 0;
+
     {
         ngx_uint_t  width, w, bytes;
 
@@ -295,6 +302,8 @@ ngx_http_cache_turbo_shm_lookup(ngx_http_cache_turbo_zone_t *z,
 }
 
 
+static void ngx_http_cache_turbo_shm_free_locked(
+    ngx_http_cache_turbo_zone_t *z, void *p, size_t size);
 static void *ngx_http_cache_turbo_shm_alloc_evict(
     ngx_http_cache_turbo_zone_t *z, size_t size);
 
@@ -319,6 +328,9 @@ ngx_http_cache_turbo_blob_alloc(ngx_http_cache_turbo_zone_t *z, size_t len)
     ref = (ngx_http_cache_turbo_blobref_t *) base;
     ref->refs = 0;
     ref->detached = 0;
+    /* P4-2-s3a: remember what alloc_evict() charged, so both free paths
+     * (immediate here, deferred in blob_release) discharge exactly that. */
+    ref->bytes = sizeof(ngx_http_cache_turbo_blobref_t) + len;
 
     return base + sizeof(ngx_http_cache_turbo_blobref_t);
 }
@@ -336,7 +348,7 @@ ngx_http_cache_turbo_blob_node_release(ngx_http_cache_turbo_zone_t *z,
     ngx_http_cache_turbo_blobref_t  *ref = CT_BLOBREF(data);
 
     if (ref->refs == 0) {
-        ngx_slab_free_locked(z->shpool, ref);
+        ngx_http_cache_turbo_shm_free_locked(z, ref, ref->bytes);
         return;
     }
     ref->detached = 1;
@@ -360,7 +372,7 @@ ngx_http_cache_turbo_blob_release(ngx_http_cache_turbo_zone_t *z, u_char *data)
     ngx_shmtx_lock(&z->shpool->mutex);
     ref->refs--;
     if (ref->refs == 0 && ref->detached) {
-        ngx_slab_free_locked(z->shpool, ref);
+        ngx_http_cache_turbo_shm_free_locked(z, ref, ref->bytes);
     }
     ngx_shmtx_unlock(&z->shpool->mutex);
 }
@@ -984,7 +996,8 @@ ngx_http_cache_turbo_shm_evict_one(ngx_http_cache_turbo_zone_t *z)
             if (ctn->data) {
                 ngx_http_cache_turbo_blob_node_release(z, ctn->data);
             }
-            ngx_slab_free_locked(z->shpool, ctn);
+            ngx_http_cache_turbo_shm_free_locked(z, ctn,
+                sizeof(ngx_http_cache_turbo_node_t));
 
             (void) ngx_atomic_fetch_add(&z->sh->evictions, 1);
             return 1;
@@ -1002,7 +1015,8 @@ ngx_http_cache_turbo_shm_evict_one(ngx_http_cache_turbo_zone_t *z)
         if (ctn->data) {
             ngx_http_cache_turbo_blob_node_release(z, ctn->data);
         }
-        ngx_slab_free_locked(z->shpool, ctn);
+        ngx_http_cache_turbo_shm_free_locked(z, ctn,
+            sizeof(ngx_http_cache_turbo_node_t));
 
         (void) ngx_atomic_fetch_add(&z->sh->evictions, 1);
         return 1;
@@ -1026,7 +1040,43 @@ ngx_http_cache_turbo_shm_alloc_evict(ngx_http_cache_turbo_zone_t *z, size_t size
     while (p == NULL && ngx_http_cache_turbo_shm_evict_one(z)) {
         p = ngx_slab_alloc_locked(z->shpool, size);
     }
+
+    /* P4-2-s3a: this is the SOLE allocation funnel for cached payload+metadata
+     * (every node alloc and, via blob_alloc(), every body alloc goes through
+     * here), so charging the used-bytes gauge here -- and discharging it in
+     * shm_free_locked(), the matching sole free funnel -- makes the pairing
+     * structural rather than a per-site audit. Caller holds the shpool mutex,
+     * same as every other z->sh field that is not an atomic. */
+    if (p != NULL) {
+        z->sh->used_bytes += size;
+    }
+
     return p;
+}
+
+
+/* P4-2-s3a: discharge counterpart of shm_alloc_evict(). `size` MUST be the
+ * exact value passed to the alloc that produced `p`. Caller holds the shpool
+ * mutex. The assert-shaped guard is not a silent clamp: an underflow here means
+ * a charge/discharge pair is mismatched, which is a bug in the pairing -- the
+ * gauge is pinned to 0 so it cannot wrap into a nonsense multi-exabyte reading,
+ * and the condition is logged at ALERT so it is not swallowed. */
+static void
+ngx_http_cache_turbo_shm_free_locked(ngx_http_cache_turbo_zone_t *z, void *p,
+    size_t size)
+{
+    if (z->sh->used_bytes >= size) {
+        z->sh->used_bytes -= size;
+
+    } else {
+        ngx_log_error(NGX_LOG_ALERT, ngx_cycle->log, 0,
+                      "cache_turbo: used_bytes underflow "
+                      "(have %uz, discharging %uz) -- charge/discharge pairing "
+                      "bug", (size_t) z->sh->used_bytes, size);
+        z->sh->used_bytes = 0;
+    }
+
+    ngx_slab_free_locked(z->shpool, p);
 }
 
 
@@ -1042,7 +1092,8 @@ ngx_http_cache_turbo_shm_drop_locked(ngx_http_cache_turbo_zone_t *z,
     if (ctn->data) {
         ngx_http_cache_turbo_blob_node_release(z, ctn->data);
     }
-    ngx_slab_free_locked(z->shpool, ctn);
+    ngx_http_cache_turbo_shm_free_locked(z, ctn,
+        sizeof(ngx_http_cache_turbo_node_t));
 }
 
 
@@ -1242,7 +1293,8 @@ ngx_http_cache_turbo_shm_store_locked(ngx_http_cache_turbo_zone_t *z,
 
     body = ngx_http_cache_turbo_blob_alloc(z, len);
     if (body == NULL) {
-        ngx_slab_free_locked(z->shpool, ctn);
+        ngx_http_cache_turbo_shm_free_locked(z, ctn,
+            sizeof(ngx_http_cache_turbo_node_t));
         return NGX_ERROR;
     }
 
@@ -1480,6 +1532,11 @@ ngx_http_cache_turbo_shm_stats(ngx_http_cache_turbo_zone_t *z,
     out->sketch_gen        = (ngx_atomic_uint_t) z->sh->sketch_gen;
     out->sketch_bumps      = (ngx_atomic_uint_t) z->sh->sketch_bumps;
     out->admission_refused = (ngx_atomic_uint_t) z->sh->admission_refused;
+
+    /* P4-2-s3a: live used-bytes gauge (cached payload+metadata charged by
+     * shm_alloc_evict / discharged by shm_free_locked). Plain read like the
+     * sketch fields above -- diagnostics, not a decision input. */
+    out->used_bytes = (ngx_atomic_uint_t) z->sh->used_bytes;
 }
 
 
@@ -1878,7 +1935,8 @@ ngx_http_cache_turbo_shm_unstub(ngx_http_cache_turbo_zone_t *z,
             ngx_http_cache_turbo_lru_unlink(z, ctn);
             z->sh->n_entries--;
             ngx_rbtree_delete(&z->sh->rbtree, &ctn->node);
-            ngx_slab_free_locked(z->shpool, ctn);
+            ngx_http_cache_turbo_shm_free_locked(z, ctn,
+                sizeof(ngx_http_cache_turbo_node_t));
         }
     }
 

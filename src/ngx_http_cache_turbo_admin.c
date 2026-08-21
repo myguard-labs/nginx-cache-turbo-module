@@ -413,8 +413,10 @@ ngx_http_cache_turbo_admin_stats_prometheus(ngx_http_request_t *r,
      * bg_inflight (gauge), prose term bumped by ~180 bytes; P4-1b added
      * sketch_gen (gauge), sketch_bumps_total (counter) and
      * admission_refused_total (counter), prose term bumped by ~530 bytes
-     * for their HELP/TYPE lines and the count 28 -> 31). */
-    len = 5660 + 31 * zname.len + 31 * NGX_ATOMIC_T_LEN;
+     * for their HELP/TYPE lines and the count 28 -> 31; P4-2-s3a added
+     * used_bytes (gauge), prose term bumped by ~200 bytes for its
+     * HELP/TYPE lines and the count 31 -> 32). */
+    len = 5860 + 32 * zname.len + 32 * NGX_ATOMIC_T_LEN;
     p = ngx_pnalloc(r->pool, len);
     if (p == NULL) {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -513,7 +515,10 @@ ngx_http_cache_turbo_admin_stats_prometheus(ngx_http_request_t *r,
         "cache_turbo_sketch_bumps_total{zone=\"%V\"} %uA\n"
         "# HELP cache_turbo_admission_refused_total New entries refused by W-TinyLFU admission control (cache_turbo_zone ... admission=on).\n"
         "# TYPE cache_turbo_admission_refused_total counter\n"
-        "cache_turbo_admission_refused_total{zone=\"%V\"} %uA\n",
+        "cache_turbo_admission_refused_total{zone=\"%V\"} %uA\n"
+        "# HELP cache_turbo_used_bytes Slab bytes currently charged for cached payload and metadata in this zone (excludes fixed per-zone init overhead).\n"
+        "# TYPE cache_turbo_used_bytes gauge\n"
+        "cache_turbo_used_bytes{zone=\"%V\"} %uA\n",
         &zname, st->hits, &zname, st->misses, &zname, st->stale_serves,
         &zname, st->refreshes, &zname, st->evictions,
         &zname, st->l2_hits, &zname, st->l2_misses, &zname, st->lock_waits,
@@ -532,7 +537,8 @@ ngx_http_cache_turbo_admin_stats_prometheus(ngx_http_request_t *r,
             (ngx_uint_t) st->breaker_state),
         &zname, st->bg_inflight,
         &zname, st->sketch_gen, &zname, st->sketch_bumps,
-        &zname, st->admission_refused) - p;
+        &zname, st->admission_refused,
+        &zname, st->used_bytes) - p;
 
     return ngx_http_cache_turbo_send_body(r, NGX_HTTP_OK, &body,
         "text/plain; version=0.0.4; charset=utf-8",
@@ -563,8 +569,8 @@ ngx_http_cache_turbo_admin_stats_json(ngx_http_request_t *r,
                  "\"sie_serves\":,\"breaker_serves\":,"
                  "\"origin_failures\":,\"bg_inflight\":,"
                  "\"sketch_gen\":,\"sketch_bumps\":,"
-                 "\"admission_refused\":}\n")
-          + 30 * NGX_ATOMIC_T_LEN
+                 "\"admission_refused\":,\"used_bytes\":}\n")
+          + 31 * NGX_ATOMIC_T_LEN
           + sizeof("half-open") - 1;   /* longest _breaker_state_str value */
     p = ngx_pnalloc(r->pool, len);
     if (p == NULL) {
@@ -587,7 +593,7 @@ ngx_http_cache_turbo_admin_stats_json(ngx_http_request_t *r,
         "\"sie_serves\":%uA,\"breaker_serves\":%uA,"
         "\"origin_failures\":%uA,\"bg_inflight\":%uA,"
         "\"sketch_gen\":%uA,\"sketch_bumps\":%uA,"
-        "\"admission_refused\":%uA}\n",
+        "\"admission_refused\":%uA,\"used_bytes\":%uA}\n",
         st->hits, st->misses, st->stale_serves,
         st->refreshes, st->evictions, st->l2_hits, st->l2_misses,
         st->lock_waits, st->min_uses_skips, st->l2_neg_skips,
@@ -602,7 +608,8 @@ ngx_http_cache_turbo_admin_stats_json(ngx_http_request_t *r,
         st->breaker_opens,
         st->sie_serves, st->breaker_serves, st->origin_failures,
         st->bg_inflight,
-        st->sketch_gen, st->sketch_bumps, st->admission_refused) - p;
+        st->sketch_gen, st->sketch_bumps, st->admission_refused,
+        st->used_bytes) - p;
 
     return ngx_http_cache_turbo_send_json(r, NGX_HTTP_OK, &body);
 }

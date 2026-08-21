@@ -9,6 +9,7 @@
 #   ngx_http_cache_turbo_shm_admit()         - P4-1b W-TinyLFU admission test
 #   ngx_http_cache_turbo_shm_evict_one()     - LRU tail reclaim
 #   ngx_http_cache_turbo_shm_alloc_evict()   - alloc, evicting until it fits
+#   ngx_http_cache_turbo_shm_free_locked()   - P4-2-s3a used-bytes discharge
 #   ngx_http_cache_turbo_shm_claim()         - single-flight winner/loser/fresh
 #   ngx_http_cache_turbo_shm_unstub()        - release stub, reclaim if empty
 #   ngx_http_cache_turbo_shm_owns()          - is this token the live lease holder
@@ -334,7 +335,7 @@ awk '
     /^static ngx_inline (uint32_t|uint64_t|ngx_uint_t|void)$/ {
         pending = 1; buf = $0 ORS; next
     }
-    pending && /^ngx_http_cache_turbo_(shm_(sketch_bump|sketch_estimate|admit|lookup|evict_one|alloc_evict|claim_locked|claim|resolve_miss|unstub|owns|count_miss_locked|count_miss|l2_neg_check|l2_neg_set|touch_lru|brk_probe_age|breaker_state|breaker_record|breaker_state_str|get_u32|get_u64|node_sie_live)|lru_(link_head|unlink|insert_new|enforce_cap)|sketch_(row_hash|get|inc|halve)|blob_(alloc|node_release|acquire|release))\(/ {
+    pending && /^ngx_http_cache_turbo_(shm_(sketch_bump|sketch_estimate|admit|lookup|evict_one|alloc_evict|free_locked|claim_locked|claim|resolve_miss|unstub|owns|count_miss_locked|count_miss|l2_neg_check|l2_neg_set|touch_lru|brk_probe_age|breaker_state|breaker_record|breaker_state_str|get_u32|get_u64|node_sie_live)|lru_(link_head|unlink|insert_new|enforce_cap)|sketch_(row_hash|get|inc|halve)|blob_(alloc|node_release|acquire|release))\(/ {
         capture = 1; pending = 0; printf "%s", buf; print; next
     }
     pending { pending = 0; buf = "" }
@@ -532,6 +533,7 @@ for fn in \
     'ngx_http_cache_turbo_shm_admit(' \
     'ngx_http_cache_turbo_shm_evict_one(' \
     'ngx_http_cache_turbo_shm_alloc_evict(' \
+    'ngx_http_cache_turbo_shm_free_locked(' \
     'ngx_http_cache_turbo_shm_claim_locked(' \
     'ngx_http_cache_turbo_shm_claim(' \
     'ngx_http_cache_turbo_shm_resolve_miss(' \

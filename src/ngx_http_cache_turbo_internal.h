@@ -533,6 +533,12 @@ ngx_int_t ngx_http_cache_turbo_redis_scan_del(ngx_http_request_t *r,
 typedef struct {
     ngx_uint_t               refs;       /* in-flight zero-copy servers      */
     ngx_uint_t               detached;   /* owning node dropped this buffer  */
+    /* P4-2-s3a: total slab bytes charged for this allocation (header + blob),
+     * recorded at alloc so the DEFERRED free path (blob_release, running from a
+     * request-pool cleanup long after the owning node is gone) can discharge the
+     * exact amount it charged. Deriving it from the node's `len` is not an
+     * option there: the node may already have been freed. */
+    ngx_uint_t               bytes;      /* charged slab bytes (hdr + blob)  */
 } ngx_http_cache_turbo_blobref_t;
 
 #define CT_BLOBREF(data)                                                       \
