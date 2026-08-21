@@ -278,6 +278,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_admin_purge_key(ng)
     test_admin_gating(ng)
     test_warm_populates(ng, origin)
+    test_warm_admin_no_uri_proxy_pass_no_ubsan_abort(ng, origin)
     test_warm_multi(ng, origin)
     test_warm_no_url(ng)
     test_warm_max_bound_enforced(ng, origin)

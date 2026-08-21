@@ -793,27 +793,44 @@ ngx_http_cache_turbo_warm(ngx_http_request_t *r, ngx_str_t *urls,
                 uri.len = q - uri.data;
             }
 
-            /* percent-decode the path into a fresh buffer (subrequest expects an
-             * unescaped uri); decoding never grows the string. */
-            if (uri.len > 0 && uri.data[0] == '/') {
-                dst = ngx_pnalloc(r->pool, uri.len);
-                if (dst == NULL) {
-                    return NGX_HTTP_INTERNAL_SERVER_ERROR;
-                }
-                s = uri.data;
-                {
-                    u_char  *d = dst;
-                    ngx_unescape_uri(&d, &s, uri.len, 0);
-                    uri.data = dst;
-                    uri.len = d - dst;
-                }
+            /* Snapshot the RAW (still percent-escaped) "uri?args" span exactly
+             * as it appeared in the operator's warm list, BEFORE decoding --
+             * this is what warm_one() needs as unparsed_uri_src (see
+             * UB-PROXYNULLURI in module.c): sr->unparsed_uri is copied
+             * verbatim onto the wire, so it must stay escaped, unlike `uri`
+             * below which the subrequest wants decoded. `sep` is the original
+             * end of this list entry (before the '\r' trim), so
+             * [uri.data, sep) covers uri+'?'+args contiguously in the source
+             * buffer whether or not a '?' was present. */
+            {
+                ngx_str_t  raw;
 
-                if (uri.len > 0 && uri.data[0] == '/'
-                    && ngx_http_cache_turbo_warm_uri_is_safe(&uri)
-                    && ngx_http_cache_turbo_warm_one(r, &uri, &args, NULL, 0, NULL)
-                       == NGX_OK)
-                {
-                    warmed++;
+                raw.data = uri.data;
+                raw.len = (size_t) (sep - uri.data);
+
+                /* percent-decode the path into a fresh buffer (subrequest expects
+                 * an unescaped uri); decoding never grows the string. */
+                if (uri.len > 0 && uri.data[0] == '/') {
+                    dst = ngx_pnalloc(r->pool, uri.len);
+                    if (dst == NULL) {
+                        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                    }
+                    s = uri.data;
+                    {
+                        u_char  *d = dst;
+                        ngx_unescape_uri(&d, &s, uri.len, 0);
+                        uri.data = dst;
+                        uri.len = d - dst;
+                    }
+
+                    if (uri.len > 0 && uri.data[0] == '/'
+                        && ngx_http_cache_turbo_warm_uri_is_safe(&uri)
+                        && ngx_http_cache_turbo_warm_one(r, &uri, &args, NULL, 0,
+                                                         NULL, &raw)
+                           == NGX_OK)
+                    {
+                        warmed++;
+                    }
                 }
             }
         }

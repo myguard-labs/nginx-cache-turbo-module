@@ -4443,7 +4443,7 @@ ngx_http_cache_turbo_warm_inject_validators(ngx_http_request_t *sr,
 ngx_int_t
 ngx_http_cache_turbo_warm_one(ngx_http_request_t *r, ngx_str_t *uri,
     ngx_str_t *args, u_char *snap, size_t snap_len,
-    ngx_http_cache_turbo_ctx_t **ctx_out)
+    ngx_http_cache_turbo_ctx_t **ctx_out, ngx_str_t *unparsed_uri_src)
 {
     ngx_http_request_t                     *sr;
     ngx_http_cache_turbo_ctx_t             *wctx;
@@ -4646,7 +4646,19 @@ ngx_http_cache_turbo_warm_one(ngx_http_request_t *r, ngx_str_t *uri,
      * has nothing to do with r->unparsed_uri, so the bit stays 0 there -- the
      * upstream request line must be built from OUR uri, never from the admin
      * POST's. Fail safe: the comparison below is the whole gate.
-     */
+     *
+     * When the inherit gate does not apply, the admin path still needs SOME
+     * valid_unparsed_uri=1 text to avoid the same UB, so it hands us
+     * `unparsed_uri_src` -- the still-percent-escaped request-target text as
+     * it appeared in the operator's warm list, taken BEFORE admin.c's own
+     * ngx_unescape_uri() decoded `uri` into r->pool. That text is exactly
+     * what belongs on the wire (unparsed_uri is copied verbatim into the
+     * upstream request line, so it must already be escaped -- passing the
+     * decoded `uri` here would send an unescaped path upstream). Synthesise
+     * a private copy in the SUBREQUEST's own pool (never the parent's, and
+     * never reused across warms) so its lifetime matches sr and it cannot be
+     * mutated out from under a concurrent warm sharing the same admin
+     * request. */
     if (r->valid_unparsed_uri
         && uri->len == r->uri.len
         && (uri->len == 0
@@ -4655,6 +4667,19 @@ ngx_http_cache_turbo_warm_one(ngx_http_request_t *r, ngx_str_t *uri,
         && (args->len == 0
             || ngx_memcmp(args->data, r->args.data, args->len) == 0))
     {
+        sr->valid_unparsed_uri = 1;
+
+    } else if (unparsed_uri_src != NULL) {
+        u_char  *up;
+
+        up = ngx_pnalloc(sr->pool, unparsed_uri_src->len);
+        if (up == NULL) {
+            return NGX_ERROR;
+        }
+        ngx_memcpy(up, unparsed_uri_src->data, unparsed_uri_src->len);
+
+        sr->unparsed_uri.data = up;
+        sr->unparsed_uri.len = unparsed_uri_src->len;
         sr->valid_unparsed_uri = 1;
     }
 
