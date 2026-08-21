@@ -446,6 +446,67 @@ def test_head_not_stored(ng: Nginx) -> None:
     assert h2.get("x-cache") == "HIT", "GET should cache normally after the HEAD"
 
 
+def test_origin_method_hits_falsifiable(ng: Nginx, origin: Origin) -> None:
+    """P5-6-r1a: `hits_for()` sums a Counter keyed on path ONLY, so it cannot
+    distinguish a HEAD from a GET to the same path -- any test asserting "this
+    HEAD-only URL was never touched by a GET" via `hits_for` would silently
+    pass no matter what. This test proves the new `hits_for_method()` accessor
+    (method, path)-keyed and does NOT share that blind spot: it demonstrates
+    the assertion it exists to make CAN go red.
+
+    It also verifies distinctness AT THE ORIGIN, not just in the client-side
+    URL: /c/ and /st/ both `proxy_pass http://.../;` (trailing slash) to the
+    SAME origin root, which strips each location's prefix -- so two distinct
+    client paths can collapse onto the same origin path. A unique marker
+    embedded in the URL tail (surviving the prefix strip either way) is what
+    actually proves the origin-side path used by this test is unique."""
+    tag = "p56r1a-headonly-marker"
+    url = f"/c/{tag}"
+
+    # 1. A HEAD-only fetch must be visible to hits_for_method("HEAD", ...)
+    #    and invisible to hits_for_method("GET", ...) -- the assertion this
+    #    row exists to make possible.
+    s0, _, _ = fetch(ng.port, url, method="HEAD")
+    assert s0 == 200, f"HEAD should reach the origin cleanly, got {s0}"
+    assert origin.hits_for_method("HEAD", tag) > 0, \
+        "hits_for_method('HEAD', ...) must see the HEAD that just landed"
+    assert origin.hits_for_method("GET", tag) == 0, \
+        "no GET has been issued yet -- hits_for_method('GET', ...) must be 0"
+
+    # 2. Confirm distinctness is established AT THE ORIGIN (not merely in the
+    #    client-side URL): the origin must have recorded a path that still
+    #    carries the unique tag after nginx's proxy_pass prefix-strip, i.e.
+    #    hits_for(tag) (path-only, pre-existing accessor) agrees.
+    assert origin.hits_for(tag) == 1, \
+        ("origin-side path must carry the unique marker post proxy_pass "
+         f"rewrite; hits_for(tag)={origin.hits_for(tag)}")
+
+    # 3. THE FALSIFIABILITY PROOF: point an ordinary GET at the exact same
+    #    URL, then re-check the SAME "no GET here" assertion from step 1. A
+    #    structurally sound accessor must now flip to a NONZERO count and
+    #    fail that assertion -- this is what distinguishes hits_for_method
+    #    from the method-blind hits_for, which cannot see a GET at all and so
+    #    could never catch this regardless of what actually happened. We
+    #    don't re-run the literal `assert ... == 0` (that would just fail the
+    #    whole test); instead capture the value and assert on IT going
+    #    nonzero. NOTE: in the failing branch below (post_get_count == 0),
+    #    the step-1 assertion would still wrongly PASS -- that IS the bug
+    #    this row exists to remove, so the failure message must say so
+    #    plainly instead of claiming a contradiction ("now False" while the
+    #    value is 0).
+    fetch(ng.port, url, method="GET")
+    post_get_count = origin.hits_for_method("GET", tag)
+    assert post_get_count > 0, (
+        f"EXPECTED-RED PROOF FAILED: a GET was issued against the HEAD-only "
+        f"URL {url!r}, but hits_for_method('GET', {tag!r}) still reports 0 "
+        "-- the accessor did not observe the GET, so the 'no GET here' "
+        "assertion in step 1 would wrongly keep passing. That is the "
+        "method-blindness this row exists to remove."
+    )
+    assert post_get_count == 1, \
+        f"expected exactly one GET recorded, got {post_get_count}"
+
+
 def test_honor_cache_control(ng: Nginx) -> None:
     """v7: with cache_turbo_cache_control honor, the origin's max-age=1 shortens
     the fresh TTL below the configured 60s — so the entry is stale at ~2s."""

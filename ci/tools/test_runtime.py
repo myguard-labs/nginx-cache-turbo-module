@@ -178,6 +178,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_cache_redirect(ng)
     test_cache_negative_404(ng)
     test_head_not_stored(ng)
+    test_origin_method_hits_falsifiable(ng, origin)  # P5-6-r1a
     test_honor_cache_control(ng)
     test_honor_expires_absolute_ttl(ng)                    # upstream_ttl Expires arm
     test_cdn_cache_control_ttl_outranks_cache_control(ng)   # RFC 9213

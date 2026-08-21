@@ -72,6 +72,12 @@ class Origin:
         # source of truth for hits_for(), which reads _path_hits below.
         self._paths: list[tuple[float, str]] = []
         self._path_hits: collections.Counter[str] = collections.Counter()
+        # (method, path)-keyed companion to _path_hits -- hits_for() stays
+        # method-blind (391 existing tests depend on that), this is purely
+        # additive for tests that need to prove a specific METHOD reached a
+        # specific path. Incremented under the same _lock, in the same three
+        # places as _path_hits, so it is exact.
+        self._method_hits: collections.Counter[tuple[str, str]] = collections.Counter()
         self._lock = threading.Lock()
         self._server: http.server.ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
@@ -115,6 +121,18 @@ class Origin:
         with self._lock:
             return sum(c for p, c in self._path_hits.items() if needle in p)
 
+    def hits_for_method(self, method: str, needle: str) -> int:
+        """Like hits_for(), but scoped to one HTTP method -- backed by
+        `_method_hits`, a (method, path)-keyed Counter incremented under
+        `_lock` beside `_path_hits` in do_GET/do_HEAD/do_POST. Additive only:
+        hits_for()'s existing method-blind semantics and callers are
+        untouched. Use this when a test must prove a specific method (not
+        just "some request") reached a path -- e.g. that a HEAD-only URL was
+        never subsequently fetched with GET."""
+        with self._lock:
+            return sum(c for (m, p), c in self._method_hits.items()
+                       if m == method and needle in p)
+
     def start(self) -> None:
         origin = self
 
@@ -125,6 +143,7 @@ class Origin:
                 with origin._lock:
                     origin._n += 1
                     origin._path_hits[self.path] += 1
+                    origin._method_hits[("HEAD", self.path)] += 1
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", "0")
@@ -154,6 +173,7 @@ class Origin:
                     if len(origin._paths) > 64:        # ring: diagnostics only
                         del origin._paths[:-64]
                     origin._path_hits[self.path] += 1
+                    origin._method_hits[("POST", self.path)] += 1
                 if origin.drop:
                     self.close_connection = True
                     return
@@ -926,6 +946,7 @@ class Origin:
                     if len(origin._paths) > 64:        # ring: diagnostics only
                         del origin._paths[:-64]
                     origin._path_hits[self.path] += 1
+                    origin._method_hits[("GET", self.path)] += 1
                 if self._get_handle_hard_failure(n):
                     return
                 handled, body = self._get_handle_special_cases(n)
