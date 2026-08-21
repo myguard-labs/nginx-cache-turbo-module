@@ -414,9 +414,19 @@ ngx_http_cache_turbo_admin_stats_prometheus(ngx_http_request_t *r,
      * sketch_gen (gauge), sketch_bumps_total (counter) and
      * admission_refused_total (counter), prose term bumped by ~530 bytes
      * for their HELP/TYPE lines and the count 28 -> 31; P4-2-s3a added
-     * used_bytes (gauge), prose term bumped by ~200 bytes for its
-     * HELP/TYPE lines and the count 31 -> 32). */
-    len = 5860 + 32 * zname.len + 32 * NGX_ATOMIC_T_LEN;
+     * used_bytes (gauge) and the count 31 -> 32).
+     *
+     * ⚠ P4-2-s3a: the fixed term is no longer eyeballed. Every previous bump
+     * was an estimate ("~180 bytes", "~530 bytes") and they had drifted
+     * BELOW the truth: measured against the format string, the fixed prose
+     * was 5897 bytes while the term still said 5660. That 237-byte shortfall
+     * never truncated only because NGX_ATOMIC_T_LEN reserves 20 bytes per
+     * value and real counters render far shorter, so the per-value slack
+     * silently absorbed it -- i.e. the budget was already relying on an
+     * accident. The term below is the MEASURED fixed prose (sum of the
+     * literal bytes, less 2 per %V and 3 per %uA) plus a 256-byte margin.
+     * When adding a metric, re-measure rather than adding an estimate. */
+    len = 6400 + 32 * zname.len + 32 * NGX_ATOMIC_T_LEN;
     p = ngx_pnalloc(r->pool, len);
     if (p == NULL) {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;

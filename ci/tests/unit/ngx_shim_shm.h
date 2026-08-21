@@ -345,12 +345,16 @@ typedef struct {
  * the clamp, which is exactly the condition the ALERT exists to expose. */
 extern ngx_uint_t  ngx_test_alerts;        /* ALERT-level logs emitted */
 
+#ifndef NGX_LOG_ALERT
 #define NGX_LOG_ALERT  1
+#endif
 typedef struct { void *log; } ngx_test_cycle_t;
 extern ngx_test_cycle_t  *ngx_cycle;
+#ifndef ngx_log_error
 #define ngx_log_error(level, log, err, ...)                                   \
     do { (void) (log); (void) (err); if ((level) == NGX_LOG_ALERT) {          \
              ngx_test_alerts++; } } while (0)
+#endif
 
 extern long        ngx_test_slab_budget;   /* -1 = unlimited */
 extern ngx_uint_t  ngx_test_slab_live;     /* outstanding allocations */

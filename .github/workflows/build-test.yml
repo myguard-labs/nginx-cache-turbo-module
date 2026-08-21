@@ -1,4 +1,4 @@
-# sync-sha: bf5a82118173979b5050bf6d825c72258fdbe62bbc088d6fe453e56c2ec4e392
+# sync-sha: b7de0a783c541146643686115c68176deeef8f3fec3c7709caaee165cd16dee1
 name: Build & Test
 
 # Runner labels live in the POOL repository variable. Every checked-in selector
@@ -105,6 +105,10 @@ jobs:
           bash ci/tools/lint-ci-ports.sh
           python3 ci/tools/lint-orphan-tests.py
           python3 ci/tools/lint-doc-preset-count.py
+          # P4-2-s3a: the admin reply buffers size themselves from a
+          # hand-maintained fixed term that had drifted 237 bytes BELOW the
+          # prose it must render. Measures it against the format string instead.
+          python3 ci/tools/lint-admin-buffer-budget.py
           python3 ci/tools/test-tls-fixture-cleanup.py
           # Each stamped .github/ file carries a `# sync-sha:` of its own
           # content, so a `--list` diff against nginx-skeleton-module names
