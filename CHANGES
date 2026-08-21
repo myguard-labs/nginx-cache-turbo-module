@@ -1,5 +1,47 @@
 Changes with the nginx-cache-turbo-module (unreleased)
 
+    *) Bugfix: a background warm subrequest -- the stale-while-revalidate
+       refresh and the new cache_turbo_store_head HEAD warm -- hit undefined
+       behaviour in nginx's proxy module when the location's proxy_pass
+       carried no URI component ("proxy_pass http://backend;", with no
+       trailing slash and no path).
+       nginx copies valid_unparsed_uri onto a subrequest only for cloned
+       subrequests, so the warm took a different branch of
+       ngx_http_proxy_create_request() than the client request it was spawned
+       from -- one whose copy of the location's empty URI is guarded by
+       r->valid_location alone and so passes a null pointer to memcpy. On a
+       build with UndefinedBehaviorSanitizer and halt_on_error that aborts the
+       worker mid-request, and the client sees a closed connection with no
+       response; on an ordinary build the behaviour is undefined.
+       The warm now inherits the bit whenever its URI and args are identical
+       to the parent request's -- which is the case for every internal warm --
+       so it takes the same branch the client request takes. The admin warm
+       endpoint is unaffected either way: it supplies its own URI, unrelated
+       to the triggering request's, and continues to build the upstream
+       request line from that.
+
+    *) Feature: cache_turbo_store_head on|off (default off) makes a HEAD that
+       misses the cache fire one internal background subrequest -- a real GET,
+       the same mechanism the stale-while-revalidate background refresh uses --
+       so a URL that only ever receives HEAD stops being a permanent 100%
+       miss. A HEAD may read the cache but can never populate it (nginx sets
+       header_only for a HEAD once headers are sent, so the body chain where
+       every store in this module lives never runs), which made every uptime
+       monitor, link checker and HEAD-issuing crawler pay a full origin round
+       trip forever.
+       The subrequest flows through the ordinary capture gate and the ordinary
+       store path -- no second store path is added -- and is subject to the
+       same zone-wide cache_turbo_background_update_max cap as SWR.
+       The resulting entry is marked HEAD-derived on the blob and is REFUSED
+       to every non-HEAD request at the same serve chokepoint that enforces
+       the breaker-only, encoding-class and RFC 9111 3.5 marks: a HEAD-derived
+       entry must never answer a GET. Such a GET falls through to the origin
+       as on a miss and its own response replaces the entry with an ordinary
+       one, so the guard costs at most one extra fetch per URL rather than
+       pinning it into permanent misses. Off by default because it spends one
+       wasted origin body per HEAD-miss, which only pays for itself on a
+       genuinely HEAD-dominated workload.
+
     *) Feature: the admin warm endpoint's per-request URL cap is now
        configurable via cache_turbo_warm_max N (default 32, matching the
        previous hardcoded ceiling; max 4096), and warming can be driven from

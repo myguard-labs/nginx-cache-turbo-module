@@ -1545,6 +1545,44 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # P5-6: cache_turbo_store_head ON. A HEAD that misses fires an
+        # internal warm subrequest (a real GET) so the URL gets an entry
+        # instead of being a permanent 100% miss; the entry is stamped
+        # BLOBF_HEAD_DERIVED and the serve chokepoint refuses it to any
+        # non-HEAD request.
+        #
+        # !! proxy_pass DELIBERATELY HAS NO TRAILING SLASH, unlike every
+        # other location here. With a trailing slash nginx strips the
+        # location prefix, so /sh/<tag> and /c/<tag> both arrive at the
+        # origin as /<tag> -- and that exact collapse is what produced the
+        # cycle-6 FALSE GREEN on this feature: a test asserting "this
+        # HEAD-only URL was never GET'd" passed while an unrelated GET was
+        # in fact hitting the same origin path. Without the slash the origin
+        # receives "/sh/<tag>" verbatim, so a HEAD-only URL under /sh/ is
+        # distinguishable at the origin from anything under /c/, and
+        # origin.hits_for_method("GET", "/sh/<tag>") is a real oracle rather
+        # than a vacuous one. Do NOT "tidy" the slash back in.
+        location /sh/ {{
+            cache_turbo            main;
+            cache_turbo_key        $uri;
+            cache_turbo_valid      30s;
+            cache_turbo_store_head on;
+            proxy_pass http://127.0.0.1:{origin_port};
+        }}
+
+        # P5-6 control: the SAME shape with cache_turbo_store_head left at its
+        # default (off). Proves the HEAD-store is the directive's doing and not
+        # something that happens anyway -- without this, a test showing an
+        # entry appear after a HEAD could not tell the feature from a
+        # pre-existing behaviour. Same no-trailing-slash proxy_pass, for the
+        # same anti-collapse reason.
+        location /shoff/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    30s;
+            proxy_pass http://127.0.0.1:{origin_port};
+        }}
+
         # compressed-edge regression (2026-06-13 incident): a real nginx gzip
         # filter sits in front of cache_turbo. gzip_proxied any + gzip_min_length
         # 1 force compression even on the tiny origin body. With the dh_nginx

@@ -733,7 +733,8 @@ typedef struct {
  *
  * Bit choice: 0x0020. 0x0001 = BLOBF_BREAKER_ONLY, 0x0002 =
  * BLOBF_ORIGIN_ENCODED, 0x000C = the 2-bit ae-class, 0x0010 =
- * BLOBF_AUTH_SHAREABLE (P3-4). Next free bit is 0x0040.
+ * BLOBF_AUTH_SHAREABLE (P3-4), 0x0040 = BLOBF_HEAD_DERIVED (P5-6).
+ * Next free bit is 0x0080.
  *
  * Fail-safe direction: an OLD blob (or any blob whose bit is 0) simply gets
  * the full gate, which is today's behaviour. The bit can only ever REMOVE
@@ -741,6 +742,52 @@ typedef struct {
  * spurious one is what the clearing above exists to make impossible.
  */
 #define NGX_HTTP_CACHE_TURBO_BLOBF_HDRS_VETTED  0x0020
+
+/*
+ * P5-6: this blob was produced by a HEAD-triggered internal warm subrequest,
+ * not by a client GET -- the origin was asked for the representation because a
+ * HEAD arrived for a URL nothing had ever GET'd. cache_turbo_store_head is
+ * what opts a location in; with the directive off (the default) no blob is
+ * ever stamped and nothing below changes behaviour.
+ *
+ * ⚠⚠ THIS BIT IS THE ENTIRE SAFETY ARGUMENT FOR cache_turbo_store_head, and
+ * it is enforced NEGATIVELY: a stamped blob may answer a HEAD and MUST NEVER
+ * answer a GET. The subrequest is a real GET at the origin, so the stored
+ * bytes are a genuine full representation -- but the request that CAUSED the
+ * fetch was a HEAD, and a HEAD-only URL is by construction one nothing has
+ * validated as a GET-serveable body in this deployment. Serving it to a GET
+ * would publish a body no client on this path ever asked the origin for, on a
+ * URL an operator only ever saw HEAD traffic against.
+ *
+ * Enforced at the SAME chokepoint as BLOBF_BREAKER_ONLY / BLOBF_AUTH_SHAREABLE
+ * / BLOBF_ORIGIN_ENCODED -- ngx_http_cache_turbo_serve() -- and for the same
+ * reason: the serve call sites are numerous (L1 hit, L2 fill, SWR stale, SIE,
+ * cold wait, the breaker fallback) and a per-site check fails open the day the
+ * next one is added. Fail CLOSED: a stamped blob reaching serve() on a
+ * non-HEAD request is refused with NGX_DECLINED and the caller proceeds to the
+ * origin exactly as on a miss, so the worst case is the pre-feature behaviour.
+ *
+ * ⚠ A GET that misses because of this guard OVERWRITES the head-derived entry
+ * with an ordinary (unstamped) one on its own store, so the guard costs at
+ * most one extra origin fetch per URL over the entry's lifetime -- it does not
+ * pin a URL into permanent misses.
+ *
+ * The bit travels to L2 like every other flag bit and is honoured off the wire
+ * on the way back. That is SAFE in the direction that matters: an L2 writer
+ * can only ever make an entry LESS serveable by setting it (the opposite
+ * direction from BLOBF_HDRS_VETTED, which is a gate's off-switch and is
+ * therefore stripped at L2 ingress). Clearing it would be the dangerous
+ * mutation, and no code clears it.
+ *
+ * Bit choice: 0x0040 -- the next free bit after BLOBF_HDRS_VETTED (0x0020);
+ * 0x0001, 0x0002, 0x000C, 0x0010 and 0x0020 are taken. Next free is 0x0080.
+ *
+ * Fail-safe direction: a blob whose bit is 0 (every blob written before this
+ * feature, and every blob written with the directive off) gets exactly
+ * today's behaviour -- serveable to GET and HEAD alike. The bit can only ever
+ * REMOVE reachability, never add it.
+ */
+#define NGX_HTTP_CACHE_TURBO_BLOBF_HEAD_DERIVED  0x0040
 
 /*
  * S231-PERF-HDRWALK: one parsed TLV header entry, as produced by the single

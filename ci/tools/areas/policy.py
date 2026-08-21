@@ -507,6 +507,219 @@ def test_origin_method_hits_falsifiable(ng: Nginx, origin: Origin) -> None:
         f"expected exactly one GET recorded, got {post_get_count}"
 
 
+def test_store_head_populates_head_only_url(ng: Nginx, origin: Origin) -> None:
+    """P5-6: with cache_turbo_store_head on, a URL that only ever receives HEAD
+    stops being a permanent 100% miss. The first HEAD misses and fires an
+    internal warm subrequest (a real GET at the origin); a later HEAD is a HIT.
+
+    The /shoff/ half is the gate-off control: the SAME request sequence against
+    the SAME location shape with the directive at its default must NOT produce
+    an entry. Without it, a HIT on the second HEAD could not be attributed to
+    the directive rather than to some pre-existing behaviour."""
+    tag = "p56r2-store-head"
+
+    # --- directive ON ---
+    s0, _, h0 = fetch(ng.port, f"/sh/{tag}", method="HEAD")
+    assert s0 == 200, f"first HEAD status {s0}"
+    assert "x-cache" not in h0, f"first HEAD must miss, got {h0.get('x-cache')}"
+
+    # The warm subrequest is a BACKGROUND subrequest: it completes
+    # asynchronously, so poll rather than assuming it has landed.
+    assert wait_for(
+        lambda: origin.hits_for_method("GET", f"/sh/{tag}") > 0
+    ), ("the HEAD miss must have fired a warm subrequest that reaches the "
+        "origin as a GET; hits_for_method('GET', ...) stayed 0")
+
+    assert wait_for(
+        lambda: fetch(ng.port, f"/sh/{tag}", method="HEAD")[2].get("x-cache")
+        == "HIT"
+    ), "a later HEAD on the same URL must be served from cache"
+
+    # --- directive OFF (control) ---
+    off = "p56r2-store-head-off"
+    s1, _, h1 = fetch(ng.port, f"/shoff/{off}", method="HEAD")
+    assert s1 == 200, f"control HEAD status {s1}"
+    assert "x-cache" not in h1, "control first HEAD must miss"
+    time.sleep(0.3)
+    assert origin.hits_for_method("GET", f"/shoff/{off}") == 0, (
+        "with cache_turbo_store_head off no warm GET may be fired; "
+        f"got {origin.hits_for_method('GET', f'/shoff/{off}')}"
+    )
+    _s2, _, h2 = fetch(ng.port, f"/shoff/{off}", method="HEAD")
+    assert h2.get("x-cache") != "HIT", (
+        "with the directive off a HEAD-only URL must stay a miss -- a HIT "
+        "here means the store happened without the directive"
+    )
+
+
+def test_store_head_fixture_no_method_collapse(
+    ng: Nginx, origin: Origin
+) -> None:
+    """P5-6-r1, HALF TWO: prove the /sh/ fixture does NOT collapse HEAD and GET
+    onto the same origin path.
+
+    This is the half that actually failed in cycle 6. The implementation and
+    its assertions were not what produced the false green -- the FIXTURE was:
+    `/c/` proxy_passes with a TRAILING SLASH, nginx strips the location prefix,
+    and so a HEAD to /c/<tag> and a GET to /c2/<tag> (or any other stripping
+    location) both arrive at the origin as /<tag>. An entry the test believed
+    was HEAD-derived had in fact been stored by a real GET, and every assertion
+    downstream was measuring the wrong object.
+
+    DONE CRITERION: a HEAD-only URL is verified NEVER touched by a GET. The
+    oracle MUST be hits_for_method() (P5-6-r1a, PR #391); hits_for() is
+    method-blind and structurally cannot make this statement -- asserting on it
+    would reproduce the false green rather than detect it."""
+    tag = "p56r1-no-collapse"
+    url = f"/shoff/{tag}"
+
+    # /shoff/ has cache_turbo_store_head OFF, so NOTHING this module does can
+    # issue a GET on this path -- no warm subrequest is fired. Any GET the
+    # origin records here therefore comes from path collapse, which is exactly
+    # what this test is looking for.
+    for _ in range(3):
+        s0, _, _ = fetch(ng.port, url, method="HEAD")
+        assert s0 == 200, f"HEAD status {s0}"
+
+    # 1. The origin saw the HEADs on this exact path -- so the path really is
+    #    the one under test and the assertion below is not vacuous on an
+    #    empty counter.
+    assert origin.hits_for_method("HEAD", url) == 3, (
+        f"expected 3 origin HEADs on {url!r}, got "
+        f"{origin.hits_for_method('HEAD', url)} -- if this is 0 the origin "
+        "never saw this path verbatim and the no-collapse assertion below "
+        "would pass vacuously"
+    )
+
+    # 2. THE DONE CRITERION: no GET has ever touched this HEAD-only path.
+    assert origin.hits_for_method("GET", url) == 0, (
+        f"FIXTURE COLLAPSE: a GET reached the HEAD-only origin path {url!r} "
+        f"({origin.hits_for_method('GET', url)} recorded). HEAD and GET are "
+        "not distinguishable at this origin, so any HEAD-vs-GET assertion "
+        "built on this fixture is false green -- the cycle-6 defect."
+    )
+
+    # 3. NEGATIVE CONTROL ON THE ORACLE ITSELF: issue a real GET on the same
+    #    path and require the counter to move. Without this, assertion 2
+    #    proves only that the counter is stuck at zero -- a broken accessor,
+    #    a wrong path spelling or a typo'd method string would all satisfy it.
+    fetch(ng.port, url, method="GET")
+    assert origin.hits_for_method("GET", url) == 1, (
+        "ORACLE PROOF FAILED: a GET was issued against "
+        f"{url!r} and hits_for_method('GET', ...) still reports "
+        f"{origin.hits_for_method('GET', url)} -- assertion 2 above cannot be "
+        "trusted, since the counter it reads does not move when the thing it "
+        "watches for actually happens."
+    )
+
+    # 4. And the HEAD counter did NOT move, confirming the two methods are
+    #    accounted separately at the origin rather than summed.
+    assert origin.hits_for_method("HEAD", url) == 3, (
+        "the GET must not have been recorded as a HEAD; "
+        f"hits_for_method('HEAD', {url!r}) = "
+        f"{origin.hits_for_method('HEAD', url)}, expected 3"
+    )
+
+
+def test_head_derived_entry_never_served_to_get(
+    ng: Nginx, origin: Origin
+) -> None:
+    """P5-6-r1 -- THE MANDATORY NEGATIVE CONTROL for the serve-side guard.
+
+    THE INVARIANT: a HEAD-derived entry (BLOBF_HEAD_DERIVED, 0x0040) must NEVER
+    be served to a GET. The guard lives at the serve chokepoint,
+    ngx_http_cache_turbo_serve() in module.c, beside the BLOBF_BREAKER_ONLY /
+    BLOBF_AUTH_SHAREABLE / BLOBF_ORIGIN_ENCODED guards.
+
+    ⚠⚠ WHY THIS TEST IS SHAPED THE WAY IT IS. Cycle 6 shipped a full
+    implementation of this feature whose serve-side guard was DEAD CODE, and
+    both of its tests were FALSE GREEN -- they still passed with the guard
+    mutated to `if (0 && ...)`. The root cause was the FIXTURE, not the
+    assertions: `/c/` proxy_passes with a TRAILING SLASH, which strips the
+    location prefix, so the HEAD-only URL and an ordinary GET collapsed onto
+    the same origin path and the entry under test was actually stored by a real
+    GET. Two structural properties defend against a repeat:
+
+      1. `/sh/` proxy_passes WITHOUT a trailing slash (see nginx_config.py), so
+         the origin sees "/sh/<tag>" verbatim and cannot be reached by any
+         other location's traffic.
+      2. The oracle is `hits_for_method()` (P5-6-r1a, PR #391), which is keyed
+         on (method, path). The older `hits_for()` is METHOD-BLIND and cannot
+         distinguish a HEAD from a GET to the same path -- an assertion built
+         on it would pass no matter what happened, which is precisely the
+         false-green shape.
+
+    The assertion that must go red under the mutation is the x-cache one: with
+    the guard compiled out, the stamped entry IS served and the GET reports
+    HIT."""
+    tag = "p56r1-never-to-get"
+    url = f"/sh/{tag}"
+
+    # 1. Establish a head-derived entry, and prove it is head-derived by
+    #    construction: the ONLY client request against this URL is a HEAD.
+    s0, _, h0 = fetch(ng.port, url, method="HEAD")
+    assert s0 == 200, f"HEAD status {s0}"
+    assert "x-cache" not in h0, "first HEAD must miss"
+
+    assert wait_for(lambda: fetch(ng.port, url, method="HEAD")[2].get("x-cache")
+                    == "HIT"), \
+        "the head-derived entry must exist before the GET is issued -- " \
+        "without it this test would prove nothing (nothing to refuse)"
+
+    # 2. FIXTURE PROOF, part one: the origin has seen exactly ONE GET on this
+    #    path (the warm subrequest), and no GET from any client. Recorded here,
+    #    BEFORE the client GET, so step 4 can attribute the increment.
+    warm_gets = origin.hits_for_method("GET", url)
+    assert warm_gets >= 1, (
+        f"expected at least one origin GET on {url!r} (the warm subrequest), "
+        f"got {warm_gets}"
+    )
+    #    Every GET the origin has seen on this path so far is a WARM
+    #    subrequest -- no client GET has been issued yet. (More than one is
+    #    normal and not a fixture collapse: the HEAD poll above can re-miss
+    #    while the first warm is still in flight and fire its own.) Step 4
+    #    asserts on the DELTA from this baseline, so the exact number here
+    #    does not matter; what matters is that it is fixed before the GET.
+    head_hits = origin.hits_for_method("HEAD", url)
+    assert head_hits >= 1, (
+        f"the origin must have seen the client HEAD on {url!r}; "
+        f"hits_for_method('HEAD', ...) = {head_hits}"
+    )
+
+    # 3. THE GUARDED ASSERTION. A GET against the head-derived entry must be
+    #    REFUSED by the serve chokepoint and go to the origin as a miss.
+    #    ⚠ This is the line that must go RED when the guard is mutated to
+    #    `if (0 && ...)`: with the guard compiled out the entry is served and
+    #    x-cache reads HIT.
+    sg, _, hg = fetch(ng.port, url, method="GET")
+    assert sg == 200, f"GET status {sg}"
+    assert hg.get("x-cache") != "HIT", (
+        "INVARIANT VIOLATED: a GET was served from a HEAD-derived entry "
+        f"(x-cache={hg.get('x-cache')!r}). BLOBF_HEAD_DERIVED must be refused "
+        "at the serve chokepoint for every non-HEAD request."
+    )
+
+    # 4. FIXTURE PROOF, part two: the refusal really did reach the origin --
+    #    a SECOND GET is now recorded on this exact path. This is what makes
+    #    step 3 an observable behaviour rather than merely a missing header:
+    #    a response could lack x-cache for other reasons, but only a genuine
+    #    pass-through to the origin bumps this counter.
+    assert wait_for(
+        lambda: origin.hits_for_method("GET", url) > warm_gets
+    ), (
+        "the refused GET must have gone to the origin; "
+        f"hits_for_method('GET', {url!r}) = "
+        f"{origin.hits_for_method('GET', url)}, expected > {warm_gets}"
+    )
+
+    # 5. And the store performed by that GET replaces the stamped entry with
+    #    an ordinary one, so the guard costs at most one extra fetch per URL
+    #    rather than pinning it into permanent misses.
+    assert wait_for(lambda: fetch(ng.port, url, method="GET")[2].get("x-cache")
+                    == "HIT"), \
+        "after the refused GET repopulated the entry, a further GET must HIT"
+
+
 def test_honor_cache_control(ng: Nginx) -> None:
     """v7: with cache_turbo_cache_control honor, the origin's max-age=1 shortens
     the fresh TTL below the configured 60s — so the entry is stale at ~2s."""

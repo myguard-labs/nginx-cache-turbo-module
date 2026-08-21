@@ -1813,6 +1813,23 @@ typedef struct {
      * principal. */
     ngx_flag_t               serve_authorized;
 
+    /* cache_turbo_store_head on|off (P5-6, default off). When on, a HEAD
+     * that misses the cache fires ONE internal background warm subrequest --
+     * a real GET, header_only = 0, the same mechanism the SWR background
+     * refresh uses -- so the URL gets an entry instead of being a permanent
+     * 100%% miss. Monitors, link checkers and some crawlers issue HEAD and
+     * nothing else, and such a URL is never populated otherwise (the capture
+     * gate refuses HEAD outright, filters.c, because nginx core forces
+     * r->header_only = 1 for HEAD once headers are sent and the body chain --
+     * where every store in this module lives -- never runs).
+     *
+     * The resulting entry is stamped BLOBF_HEAD_DERIVED and the serve
+     * chokepoint refuses it to any non-HEAD request; see that flag's comment
+     * for the invariant and why it is enforced there. Default off because it
+     * spends one extra origin body per HEAD-miss, which only pays for itself
+     * on a workload that really is HEAD-dominated. */
+    ngx_flag_t               store_head;
+
     /* cache_turbo_vary_ignore <header>... (P3-3). Header names (case-
      * insensitive match against tokens in a response Vary header) to drop
      * BEFORE classify_vary()'s whitelist/unsafe-axis check, i.e. treated as
@@ -1953,6 +1970,19 @@ typedef struct {
      * of whether serve_authorized is on anywhere: the bit is recorded on
      * every stored blob so an operator can enable the directive later
      * without invalidating the cache. */
+    /* P5-6: this response is being captured by a HEAD-triggered warm
+     * subrequest (cache_turbo_store_head) -- the body filter must stamp
+     * BLOBF_HEAD_DERIVED on the stored blob so the serve chokepoint can
+     * refuse the entry to every non-HEAD request. Set on the SUBREQUEST's
+     * ctx by warm_head_one(), never on a client request's ctx. */
+    unsigned                 head_derived:1;
+    /* P5-6: this request has already fired its cache_turbo_store_head warm
+     * subrequest. The access handler re-runs from the top on every park/resume
+     * (the L2 GET, the cross-node NX lock, each cold-wait re-poll), so without
+     * this a single parked HEAD would fire one warm per re-entry. Set on the
+     * CLIENT request's ctx, unlike head_derived which lives on the
+     * subrequest's. */
+    unsigned                 head_warm_fired:1;
     unsigned                 auth_shareable:1;
     unsigned                 captured:1;  /* response captured for store    */
     unsigned                 served:1;    /* we served from cache           */
@@ -2865,7 +2895,8 @@ ngx_int_t ngx_http_cache_turbo_tag_purge_complete(ngx_http_request_t *r,
  * be answered 304 by the origin instead of always paying a full body. Pass
  * NULL/0 (the admin warm path) for the old unconditional-GET behaviour. */
 ngx_int_t ngx_http_cache_turbo_warm_one(ngx_http_request_t *r,
-    ngx_str_t *uri, ngx_str_t *args, u_char *snap, size_t snap_len);
+    ngx_str_t *uri, ngx_str_t *args, u_char *snap, size_t snap_len,
+    ngx_http_cache_turbo_ctx_t **ctx_out);
 
 
 /* ---- admin.c (admin request handler) ---- */

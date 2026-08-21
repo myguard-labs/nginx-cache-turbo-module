@@ -797,7 +797,7 @@ ngx_http_cache_turbo_warm(ngx_http_request_t *r, ngx_str_t *urls,
 
                 if (uri.len > 0 && uri.data[0] == '/'
                     && ngx_http_cache_turbo_warm_uri_is_safe(&uri)
-                    && ngx_http_cache_turbo_warm_one(r, &uri, &args, NULL, 0)
+                    && ngx_http_cache_turbo_warm_one(r, &uri, &args, NULL, 0, NULL)
                        == NGX_OK)
                 {
                     warmed++;

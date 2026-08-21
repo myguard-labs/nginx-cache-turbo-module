@@ -911,6 +911,7 @@ ngx_http_cache_turbo_merge_cc_and_bypass(
      * operator must assert that the endpoint's public representation is
      * identical for every principal. */
     ngx_conf_merge_value(conf->serve_authorized, prev->serve_authorized, 0);
+    ngx_conf_merge_value(conf->store_head, prev->store_head, 0);
 #if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
     && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
     ngx_conf_merge_value(conf->test_restore_alloc_fail,
