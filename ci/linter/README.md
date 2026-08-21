@@ -22,6 +22,7 @@ finding shellcheck could have named in two seconds. Every script is standalone;
 | `lint-sync-stamp.sh` | `.github/workflows/`, `.github/scripts/`, `.github/actions/` | every skeleton-shared file carries a current `# sync-sha:` stamp, so an adopter can diff two repos' `--list` output and see exactly what drifted |
 | `lint-docs-drift.sh` | `.github/workflows/`, `README.md` | every workflow documented, every documented workflow exists |
 | `lint-shm-lock.sh` | `src/*.[ch]` | **this module's own** (no skeleton counterpart): the shm-mutex hold invariant, issue R7 — the zone mutex is never held across anything that yields to the event loop, parks the request or registers a timer |
+| `lint-stripe-seam.sh` | `src/*.[ch]` | **this module's own** (no skeleton counterpart): the stripe seam, P4-2-s3b — no site reaches a zone's slab pool except through `ngx_http_cache_turbo_zone_sh()` / `_zone_pool()` / `_zone_mutex()` or the key-directed `stripe_of()`. A stray bare `z->shpool` is invisible at today's N == 1 and becomes a cross-pool free once N > 1 |
 | `lint-suite-docs.sh` | `ci/t/`, `ci/tools/`, `docs/`, `src/`, `README.md` | **this module's own**: orphan `.t` files no suite runs, the documented preset count against the presets that exist, and TLS-fixture teardown |
 | `lint-spelling.sh` | all tracked files | codespell over prose, comments and log strings; vendored trees excluded via `lib.sh` |
 | `run-all.sh` | all of the above | runs every check, reports once |

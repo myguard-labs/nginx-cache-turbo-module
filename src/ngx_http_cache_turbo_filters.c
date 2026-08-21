@@ -214,7 +214,7 @@ ngx_http_cache_turbo_header_filter_record_breaker(ngx_http_request_t *r,
          * there is no early-return between the two, so the order is not
          * load-bearing. */
         if (is_failure) {
-            (void) ngx_atomic_fetch_add(&bz->sh->origin_failures, 1);
+            (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(bz)->origin_failures, 1);
         }
 
         /* P5-5r: OPT-IN (cache_turbo_breaker_count_retries, default off --
@@ -258,7 +258,7 @@ ngx_http_cache_turbo_header_filter_record_breaker(ngx_http_request_t *r,
             ngx_uint_t  j;
 
             for (j = 0; j < retry_fails; j++) {
-                (void) ngx_atomic_fetch_add(&bz->sh->origin_failures, 1);
+                (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(bz)->origin_failures, 1);
                 ngx_http_cache_turbo_shm_breaker_record(
                     clcf->shm_zone->data,
                     0,                      /* prior attempt: always a failure */
@@ -319,7 +319,7 @@ ngx_http_cache_turbo_header_filter_try_sie(ngx_http_request_t *r,
              * the other "this response is now the SIE snapshot" flag. */
             if (clcf->shm_zone != NULL) {
                 ngx_http_cache_turbo_zone_t  *sz = clcf->shm_zone->data;
-                (void) ngx_atomic_fetch_add(&sz->sh->sie_serves, 1);
+                (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(sz)->sie_serves, 1);
             }
 
             if (ctx->cold_winner && !ctx->cold_stored
@@ -369,10 +369,10 @@ ngx_http_cache_turbo_capture_count_head_partial(ngx_http_request_t *r,
     rz = clcf->shm_zone->data;
 
     if (r->method & NGX_HTTP_HEAD) {
-        (void) ngx_atomic_fetch_add(&rz->sh->refuse_head, 1);
+        (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(rz)->refuse_head, 1);
     }
     if (r->headers_out.status == NGX_HTTP_PARTIAL_CONTENT) {
-        (void) ngx_atomic_fetch_add(&rz->sh->refuse_partial, 1);
+        (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(rz)->refuse_partial, 1);
     }
 }
 
@@ -401,22 +401,22 @@ ngx_http_cache_turbo_capture_count_refusal(ngx_http_request_t *r,
 
     switch (cacheable_reason) {
     case NGX_HTTP_CACHE_TURBO_REFUSE_SET_COOKIE:
-        (void) ngx_atomic_fetch_add(&rz->sh->refuse_set_cookie, 1);
+        (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(rz)->refuse_set_cookie, 1);
         return;
     case NGX_HTTP_CACHE_TURBO_REFUSE_AUTHORIZATION:
-        (void) ngx_atomic_fetch_add(&rz->sh->refuse_authorization, 1);
+        (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(rz)->refuse_authorization, 1);
         return;
     case NGX_HTTP_CACHE_TURBO_REFUSE_CACHE_CONTROL:
-        (void) ngx_atomic_fetch_add(&rz->sh->refuse_cache_control, 1);
+        (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(rz)->refuse_cache_control, 1);
         return;
     default:
         break;
     }
 
     if (!ngx_http_cache_turbo_require_hdr_ok(r, clcf)) {
-        (void) ngx_atomic_fetch_add(&rz->sh->refuse_require_header, 1);
+        (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(rz)->refuse_require_header, 1);
     } else if (ngx_http_cache_turbo_response_encoded(r)) {
-        (void) ngx_atomic_fetch_add(&rz->sh->refuse_encoded, 1);
+        (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(rz)->refuse_encoded, 1);
     }
 }
 
@@ -492,7 +492,7 @@ ngx_http_cache_turbo_header_filter_capture(ngx_http_request_t *r,
         if (unsafe_axis && clcf->shm_zone != NULL) {
             ngx_http_cache_turbo_zone_t  *rz = clcf->shm_zone->data;
 
-            (void) ngx_atomic_fetch_add(&rz->sh->refuse_vary_unsafe, 1);
+            (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(rz)->refuse_vary_unsafe, 1);
         }
     }
 
@@ -638,7 +638,7 @@ ngx_http_cache_turbo_header_filter_capture(ngx_http_request_t *r,
                 ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                                "cache_turbo: 304 freshened \"%V\" "
                                "fresh_ttl=%T", &r->uri, fresh_ttl);
-                (void) ngx_atomic_fetch_add(&z->sh->refreshes, 1);
+                (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->refreshes, 1);
             } else {
                 /* No resident entry to freshen (evicted/never stored/not
                  * yet this key) -- nothing to extend, and nothing to store
@@ -906,7 +906,7 @@ ngx_http_cache_turbo_body_filter_midbody_rescue(ngx_http_request_t *r,
 
         if (clcf->shm_zone != NULL) {
             ngx_http_cache_turbo_zone_t  *sz = clcf->shm_zone->data;
-            (void) ngx_atomic_fetch_add(&sz->sh->sie_serves, 1);
+            (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(sz)->sie_serves, 1);
         }
 
         /* S231-SIE-MIDBODY / lease: mirror the header-filter SIE
@@ -1844,7 +1844,7 @@ ngx_http_cache_turbo_body_filter_tag_index(ngx_http_request_t *r,
         }
 
         if (tagidx_rc != NGX_OK) {
-            (void) ngx_atomic_fetch_add(&z->sh->tag_index_drops, 1);
+            (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->tag_index_drops, 1);
             ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
                 "cache_turbo: tag index write dropped for \"%V\" "
                 "(L2 unreachable) -- a purge of its tag(s) will NOT "
@@ -1961,7 +1961,7 @@ ngx_http_cache_turbo_body_filter_varidx_store(ngx_http_request_t *r,
              * NGX_HTTP_CACHE_TURBO_TEST_FAULTS. Only the FAULT that
              * produces varidx_rc != NGX_OK stays test-gated above; the
              * accounting for a genuine drop is unconditional. */
-            (void) ngx_atomic_fetch_add(&z->sh->varidx_drops, 1);
+            (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->varidx_drops, 1);
             ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
                 "cache_turbo: auto-vary variant index write dropped "
                 "for \"%V\" (L2 unreachable); queued for re-issue on "

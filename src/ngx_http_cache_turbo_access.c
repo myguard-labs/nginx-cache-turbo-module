@@ -179,7 +179,7 @@ ngx_http_cache_turbo_access_eligible(ngx_http_request_t *r,
         if (clcf->shm_zone != NULL) {
             ngx_http_cache_turbo_zone_t  *rz = clcf->shm_zone->data;
 
-            (void) ngx_atomic_fetch_add(&rz->sh->refuse_authorization, 1);
+            (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(rz)->refuse_authorization, 1);
         }
         return NGX_DECLINED;
     }
@@ -276,7 +276,7 @@ ngx_http_cache_turbo_access_prologue(ngx_http_request_t *r,
          * these URLs and what the CLOSED-breaker negative control pins.
          */
         if (ngx_http_cache_turbo_breaker_should_consult(clcf)
-            && ngx_http_cache_turbo_brk_state(z->sh->breaker_state)
+            && ngx_http_cache_turbo_brk_state(ngx_http_cache_turbo_zone_sh(z)->breaker_state)
                    == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN)
         {
             ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
@@ -287,8 +287,8 @@ ngx_http_cache_turbo_access_prologue(ngx_http_request_t *r,
             /* Engaged: unlike the auto_skip arm we DO store, so a stacked
              * native cache must keep deferring to us on this URL. */
             ctx->status = NGX_HTTP_CACHE_TURBO_ST_BYPASS;
-            (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
-            (void) ngx_atomic_fetch_add(&z->sh->bypasses, 1);
+            (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->misses, 1);
+            (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->bypasses, 1);
             ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                            "cache_turbo: bypass-stale \"%V\" -> origin "
                            "(breaker-only store)", &r->uri);
@@ -306,8 +306,8 @@ ngx_http_cache_turbo_access_prologue(ngx_http_request_t *r,
          * stacked native cache is free to handle the URL itself. */
         ctx->ct_active = 0;
         ctx->status = NGX_HTTP_CACHE_TURBO_ST_BYPASS;
-        (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
-        (void) ngx_atomic_fetch_add(&z->sh->bypasses, 1);
+        (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->misses, 1);
+        (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->bypasses, 1);
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "cache_turbo: auto-classify dynamic \"%V\" -> origin",
                        &r->uri);
@@ -362,7 +362,7 @@ ngx_http_cache_turbo_access_prologue(ngx_http_request_t *r,
         ngx_uint_t  brk_open_now;
 
         brk_open_now = ngx_http_cache_turbo_breaker_should_consult(clcf)
-            && ngx_http_cache_turbo_brk_state(z->sh->breaker_state)
+            && ngx_http_cache_turbo_brk_state(ngx_http_cache_turbo_zone_sh(z)->breaker_state)
                    == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN;
 
         if (ctx->req_only_if_cached) {
@@ -370,7 +370,7 @@ ngx_http_cache_turbo_access_prologue(ngx_http_request_t *r,
              * a cache miss from the client's view ($cache_turbo_status MISS,
              * the pcalloc default). EXPIRED is reserved for the case where we
              * DID find a cached entry but it was past its serveable window. */
-            (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
+            (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->misses, 1);
             ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                            "cache_turbo: request revalidate + only-if-cached "
                            "\"%V\" -> 504", &r->uri);
@@ -382,7 +382,7 @@ ngx_http_cache_turbo_access_prologue(ngx_http_request_t *r,
                            "cache_turbo: request no-cache + breaker OPEN "
                            "\"%V\" -> honour cache", &r->uri);
         } else {
-            (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
+            (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->misses, 1);
             ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                            "cache_turbo: request no-cache \"%V\" -> origin "
                            "(revalidate)", &r->uri);
@@ -411,8 +411,8 @@ ngx_http_cache_turbo_access_prologue(ngx_http_request_t *r,
         ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "cache_turbo: bypass \"%V\" key=%ui -> origin",
                        &r->uri, (ngx_uint_t) hash);
-        (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
-        (void) ngx_atomic_fetch_add(&z->sh->bypasses, 1);
+        (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->misses, 1);
+        (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->bypasses, 1);
         ctx->status = NGX_HTTP_CACHE_TURBO_ST_BYPASS;
         return NGX_DECLINED;
     }
@@ -823,7 +823,7 @@ ngx_http_cache_turbo_varidx_reissue(ngx_http_request_t *r,
      * PURGE reply's "complete":false decision depends on this counter
      * catching up to varidx_drops in production, not only under
      * NGX_HTTP_CACHE_TURBO_TEST_FAULTS. */
-    (void) ngx_atomic_fetch_add(&z->sh->varidx_reissues, 1);
+    (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->varidx_reissues, 1);
 
     ngx_log_error(NGX_LOG_NOTICE, r->connection->log, 0,
         "cache_turbo: auto-vary variant index re-issued for \"%V\" "
@@ -865,7 +865,7 @@ ngx_http_cache_turbo_access_l1_serve_fresh(ngx_http_request_t *r,
      * default) makes this a plain probation re-head. */
     ngx_http_cache_turbo_shm_touch_lru(z, ctn, now,
                                        clcf->scan_resistant_pct);
-    ngx_shmtx_unlock(&z->shpool->mutex);
+    ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
 
     /* COR-5(b): re-issue a dropped variant-index write here -- mutex just
      * released, and still BEFORE serve(). Must not be deferred past serve():
@@ -875,7 +875,7 @@ ngx_http_cache_turbo_access_l1_serve_fresh(ngx_http_request_t *r,
      * (observed: reissues counter moved, SMEMBERS still had one member). */
     ngx_http_cache_turbo_varidx_reissue(r, clcf, ctx, z, hash);
 
-    (void) ngx_atomic_fetch_add(&z->sh->hits, 1);
+    (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->hits, 1);
     ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "cache_turbo: L1 HIT (fresh) \"%V\" key=%ui len=%uz",
                    &r->uri, (ngx_uint_t) hash, body_len);
@@ -967,7 +967,7 @@ ngx_http_cache_turbo_access_l1_serve_stale(ngx_http_request_t *r,
             if (ngx_http_cache_turbo_blob_ref_cleanup(r, z, ctn->data,
                     NULL) != NGX_OK)
             {
-                ngx_shmtx_unlock(&z->shpool->mutex);
+                ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
 
                 *out_rc = NGX_ERROR;
                 return NGX_DONE;
@@ -976,11 +976,11 @@ ngx_http_cache_turbo_access_l1_serve_stale(ngx_http_request_t *r,
             ngx_http_cache_turbo_blob_acquire(ctn->data);
             snap = ctn->data;
             snap_len = ctn->len;
-            ngx_shmtx_unlock(&z->shpool->mutex);
+            ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
             (void) ngx_http_cache_turbo_warm_one(r, &r->uri, &r->args,
                                                  snap, snap_len,
                                                  NULL);
-            (void) ngx_atomic_fetch_add(&z->sh->stale_serves, 1);
+            (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->stale_serves, 1);
             ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                            "cache_turbo: cross-node WON bg-refresh + STALE "
                            "serve \"%V\" key=%ui len=%uz",
@@ -995,7 +995,7 @@ ngx_http_cache_turbo_access_l1_serve_stale(ngx_http_request_t *r,
             return NGX_DONE;
 
         }
-        ngx_shmtx_unlock(&z->shpool->mutex);
+        ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
         ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "cache_turbo: cross-node lock WON \"%V\" key=%ui "
                        "-> regenerate", &r->uri, (ngx_uint_t) hash);
@@ -1089,7 +1089,7 @@ ngx_http_cache_turbo_access_l1_serve_stale(ngx_http_request_t *r,
         if (ngx_http_cache_turbo_blob_ref_cleanup(r, z, ctn->data,
                 NULL) != NGX_OK)
         {
-            ngx_shmtx_unlock(&z->shpool->mutex);
+            ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
 
             *out_rc = NGX_ERROR;
             return NGX_DONE;
@@ -1108,8 +1108,8 @@ ngx_http_cache_turbo_access_l1_serve_stale(ngx_http_request_t *r,
          * the `refreshing` flag and nothing else. */
         ctn->refreshing = 1;
         ctn->refresh_lock_until = now + lock_ttl;
-        ngx_shmtx_unlock(&z->shpool->mutex);
-        (void) ngx_atomic_fetch_add(&z->sh->refreshes, 1);
+        ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
+        (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->refreshes, 1);
         ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "cache_turbo: stale, refresh dice WON \"%V\" "
                        "key=%ui", &r->uri, (ngx_uint_t) hash);
@@ -1139,7 +1139,7 @@ ngx_http_cache_turbo_access_l1_serve_stale(ngx_http_request_t *r,
             (void) ngx_http_cache_turbo_warm_one(r, &r->uri, &r->args,
                                                  snap, snap_len,
                                                  NULL);
-            (void) ngx_atomic_fetch_add(&z->sh->stale_serves, 1);
+            (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->stale_serves, 1);
             ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                            "cache_turbo: bg-refresh + STALE serve \"%V\" "
                            "key=%ui len=%uz", &r->uri, (ngx_uint_t) hash,
@@ -1163,8 +1163,8 @@ ngx_http_cache_turbo_access_l1_serve_stale(ngx_http_request_t *r,
         u_char *body = ctn->data;
         size_t  body_len = ctn->len;
         ngx_http_cache_turbo_blob_acquire(body);
-        ngx_shmtx_unlock(&z->shpool->mutex);
-        (void) ngx_atomic_fetch_add(&z->sh->stale_serves, 1);
+        ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
+        (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->stale_serves, 1);
         ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "cache_turbo: STALE serve \"%V\" key=%ui len=%uz",
                        &r->uri, (ngx_uint_t) hash, body_len);
@@ -1251,7 +1251,7 @@ ngx_http_cache_turbo_access_l1_breaker_arm(ngx_http_request_t *r,
              * should_consult() branch on purpose -- see the field comment.
              * Bumps the L1 field only: a shared counter would let an L2
              * assertion pass on this site's bump. */
-            (void) ngx_atomic_fetch_add(&z->sh->test_brk_armings_l1, 1);
+            (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->test_brk_armings_l1, 1);
 #endif
 
             ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
@@ -1333,7 +1333,7 @@ ngx_http_cache_turbo_access_l1(ngx_http_request_t *r,
     uint32_t                      hash = *hashp;
     ngx_http_cache_turbo_node_t  *ctn;
 
-    ngx_shmtx_lock(&z->shpool->mutex);
+    ngx_shmtx_lock(ngx_http_cache_turbo_zone_mutex(z));
 
     /* S231-PERF-VARYLOCK: the marker lookup + key_hash recompute is folded
      * into THIS critical section (was a standalone lock/unlock pair in the
@@ -1525,7 +1525,7 @@ ngx_http_cache_turbo_access_l1(ngx_http_request_t *r,
      * may already hold this object. The L2 GET is
      * async but logically synchronous — it parks the request and resumes it
      * when the reply lands (see ngx_http_cache_turbo_redis_get). */
-    ngx_shmtx_unlock(&z->shpool->mutex);
+    ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
 
     /* COR-5(b): the expired-entry arm falls through to L2 rather than
      * serving, but the node it just passed over is still resident and still
@@ -1655,7 +1655,7 @@ ngx_http_cache_turbo_access_l2_marker_get(ngx_http_request_t *r,
     {
         ctx->vary_marker_l1_miss = 0;
         ctx->vary_marker_l2_done = 1;
-        (void) ngx_atomic_fetch_add(&z->sh->l2_neg_skips, 1);
+        (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->l2_neg_skips, 1);
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "cache_turbo: L2 vary-marker GET skipped by negative "
                        "memo \"%V\"", &r->uri);
@@ -2024,7 +2024,7 @@ ngx_http_cache_turbo_access_l2_neg_memo(ngx_http_request_t *r,
          * l2_neg_skipped on the next line is what stops this from re-arming. */
         ctx->l2_result = NGX_DECLINED;
         ctx->l2_neg_skipped = 1;
-        (void) ngx_atomic_fetch_add(&z->sh->l2_neg_skips, 1);
+        (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->l2_neg_skips, 1);
         ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "cache_turbo: L2 GET skipped by negative memo \"%V\" "
                        "key=%ui", &r->uri, (ngx_uint_t) hash);
@@ -2147,7 +2147,7 @@ ngx_http_cache_turbo_access_l2_expired_arm(ngx_http_request_t *r,
          * should_consult() branch on purpose -- see field comment.
          * Bumps the L2 field only, so a delta here cannot have come
          * from the L1 site above. */
-        (void) ngx_atomic_fetch_add(&z->sh->test_brk_armings_l2, 1);
+        (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->test_brk_armings_l2, 1);
 #endif
         ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "cache_turbo: breaker fallback armed from "
@@ -2300,8 +2300,8 @@ ngx_http_cache_turbo_access_l2_promote_serve(ngx_http_request_t *r,
                        &r->uri, (ngx_uint_t) hash);
     }
 
-    (void) ngx_atomic_fetch_add(&z->sh->hits, 1);
-    (void) ngx_atomic_fetch_add(&z->sh->l2_hits, 1);
+    (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->hits, 1);
+    (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->l2_hits, 1);
     ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "cache_turbo: L2 HIT \"%V\" key=%ui len=%uz "
                    "(filled L1)", &r->uri, (ngx_uint_t) hash,
@@ -2423,7 +2423,7 @@ ngx_http_cache_turbo_access_l2_miss_account(ngx_http_request_t *r,
      * the top each resume — l2_miss_counted guards the double/triple count. */
     if (clcf->backend && ctx->l2_done && !ctx->l2_miss_counted) {
         ctx->l2_miss_counted = 1;
-        (void) ngx_atomic_fetch_add(&z->sh->l2_misses, 1);
+        (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->l2_misses, 1);
 
         /* L13: remember this miss so the next cold request skips the GET.
          *
@@ -2487,14 +2487,14 @@ ngx_http_cache_turbo_access_only_if_cached(ngx_http_request_t *r,
          * window is the operator's outage policy, not this client's to invoke. */
         if (ngx_http_cache_turbo_breaker_should_consult(clcf)
             && ctx->brk_armed
-            && ngx_http_cache_turbo_brk_state(z->sh->breaker_state)
+            && ngx_http_cache_turbo_brk_state(ngx_http_cache_turbo_zone_sh(z)->breaker_state)
                    == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN)
         {
-            (void) ngx_atomic_fetch_add(&z->sh->stale_serves, 1);
+            (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->stale_serves, 1);
             /* S7.1: a genuine breaker-fallback SERVE (this is the
              * only-if-cached twin of the pre-origin-gate ACT_SERVE site
              * below; both deliver a STALE-BREAKER response). */
-            (void) ngx_atomic_fetch_add(&z->sh->breaker_serves, 1);
+            (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->breaker_serves, 1);
             ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                            "cache_turbo: only-if-cached + breaker OPEN -> "
                            "STALE-BREAKER serve \"%V\" key=%ui len=%uz",
@@ -2672,12 +2672,12 @@ ngx_http_cache_turbo_access_breaker_gate(ngx_http_request_t *r,
                  * copy is past its window and has NOT been revalidated, so a
                  * 304 would tell the client its cached copy is still good on
                  * the authority of an origin we cannot reach. */
-                (void) ngx_atomic_fetch_add(&z->sh->stale_serves, 1);
+                (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->stale_serves, 1);
                 /* S7.1: the pre-origin-gate breaker-fallback SERVE. Bumped
                  * here (the delivery site), not at breaker_action()/
                  * ACT_SERVE classification, so this counts responses actually
                  * served, matching sie_serves/origin_failures discipline. */
-                (void) ngx_atomic_fetch_add(&z->sh->breaker_serves, 1);
+                (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->breaker_serves, 1);
                 ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                                "cache_turbo: breaker OPEN -> STALE-BREAKER serve "
                                "\"%V\" key=%ui len=%uz",
@@ -2710,7 +2710,7 @@ ngx_http_cache_turbo_access_breaker_gate(ngx_http_request_t *r,
              * served from cache. This is the ACT_FAIL branch (no body armed),
              * so it does not touch breaker_serves (S7.1) -- that counter is
              * bumped only at the two ACT_SERVE delivery sites above. */
-            (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
+            (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->misses, 1);
             ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                            "cache_turbo: breaker OPEN, no body \"%V\" key=%ui "
                            "-> 503", &r->uri, (ngx_uint_t) hash);
@@ -2763,8 +2763,8 @@ ngx_http_cache_turbo_access_min_uses(ngx_http_request_t *r,
             /* Still below the threshold: run to the origin but do NOT store (the
              * header filter checks min_uses_skip before capturing). */
             ctx->min_uses_skip = 1;
-            (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
-            (void) ngx_atomic_fetch_add(&z->sh->min_uses_skips, 1);
+            (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->misses, 1);
+            (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->min_uses_skips, 1);
             ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                            "cache_turbo: below min_uses \"%V\" key=%ui -> origin "
                            "(no store)", &r->uri, (ngx_uint_t) hash);
@@ -2808,7 +2808,7 @@ ngx_http_cache_turbo_cold_resume_locked(ngx_http_request_t *r,
      * already hold still single-flights this box, so degrade to per-box
      * single-flight and regenerate now (codex). */
     if (ctx->lock_result == NGX_OK || ctx->lock_result == NGX_ERROR) {
-        (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
+        (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->misses, 1);
         ngx_http_cache_turbo_cold_mark_winner(r, ctx, z,
                                               ctx->pending_l1_owner);
         ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
@@ -2909,8 +2909,8 @@ ngx_http_cache_turbo_access_cold(ngx_http_request_t *r,
                  * threshold, run to origin without storing. claim() did not
                  * run (see resolve_miss()'s contract). */
                 ctx->min_uses_skip = 1;
-                (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
-                (void) ngx_atomic_fetch_add(&z->sh->min_uses_skips, 1);
+                (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->misses, 1);
+                (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->min_uses_skips, 1);
                 ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                                "cache_turbo: below min_uses \"%V\" key=%ui -> "
                                "origin (no store)", &r->uri, (ngx_uint_t) hash);
@@ -2943,7 +2943,7 @@ ngx_http_cache_turbo_access_cold(ngx_http_request_t *r,
                  * rather than re-serve -- but it must also release the
                  * reference it already owns instead of leaking it. */
                 if (fresh_data != NULL && !ctx->req_reval) {
-                    (void) ngx_atomic_fetch_add(&z->sh->hits, 1);
+                    (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->hits, 1);
                     ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                                    "cache_turbo: cold-miss raced to FRESH \"%V\" "
                                    "key=%ui -> serve", &r->uri, (ngx_uint_t) hash);
@@ -2961,7 +2961,7 @@ ngx_http_cache_turbo_access_cold(ngx_http_request_t *r,
                 }
                 /* vanished again (fresh_data NULL -- claim_locked() found no
                  * fresh entry this pass), or blocked by RFC-1: go to origin */
-                (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
+                (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->misses, 1);
 
                 *out_rc = NGX_DECLINED;
                 return NGX_DONE;
@@ -2982,7 +2982,7 @@ ngx_http_cache_turbo_access_cold(ngx_http_request_t *r,
             ngx_http_cache_turbo_node_t  *fresh;
             size_t                        snap_len;
 
-            ngx_shmtx_lock(&z->shpool->mutex);
+            ngx_shmtx_lock(ngx_http_cache_turbo_zone_mutex(z));
             fresh = clcf->l1->lookup(z, ctx->key_hash, hash);
             /* RFC-1: do NOT re-serve the raced-in fresh entry when this request
              * is a revalidation forced by its own freshness bounds (max-age /
@@ -2996,8 +2996,8 @@ ngx_http_cache_turbo_access_cold(ngx_http_request_t *r,
                 u_char *body = fresh->data;
                 snap_len = fresh->len;
                 ngx_http_cache_turbo_blob_acquire(body);
-                ngx_shmtx_unlock(&z->shpool->mutex);
-                (void) ngx_atomic_fetch_add(&z->sh->hits, 1);
+                ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
+                (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->hits, 1);
                 ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                                "cache_turbo: cold-miss raced to FRESH \"%V\" "
                                "key=%ui -> serve", &r->uri, (ngx_uint_t) hash);
@@ -3007,9 +3007,9 @@ ngx_http_cache_turbo_access_cold(ngx_http_request_t *r,
                 return NGX_DONE;
 
             }
-            ngx_shmtx_unlock(&z->shpool->mutex);
+            ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
             /* vanished again (evicted/expired in the race): go to origin */
-            (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
+            (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->misses, 1);
 
             *out_rc = NGX_DECLINED;
             return NGX_DONE;
@@ -3057,7 +3057,7 @@ ngx_http_cache_turbo_access_cold(ngx_http_request_t *r,
             }
         }
 
-        (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
+        (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->misses, 1);
         ngx_http_cache_turbo_cold_mark_winner(r, ctx, z, claim_owner);
         ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "cache_turbo: cold-miss single-box WON \"%V\" key=%ui "
@@ -3240,7 +3240,7 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
     }
 
     /* true miss (cache_turbo_lock off): mark for capture, run to the origin */
-    (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
+    (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->misses, 1);
     ngx_http_cache_turbo_head_store_warm(r, clcf, ctx);
 
     ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
@@ -3268,7 +3268,7 @@ ngx_http_cache_turbo_cold_wait(ngx_http_request_t *r,
     if (!ctx->waiting) {
         ctx->waiting = 1;
         ctx->wait_deadline = now + clcf->lock_timeout;
-        (void) ngx_atomic_fetch_add(&z->sh->lock_waits, 1);
+        (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->lock_waits, 1);
     }
 
     /* V-HANG-2: a previous re-poll already found the key PRESENT in L2 but past
@@ -3296,7 +3296,7 @@ ngx_http_cache_turbo_cold_wait(ngx_http_request_t *r,
      * loser. Do not relax this back to ctx->waiting. */
     if (ctx->wait_polled && ctx->l2_present_unserveable) {
         ctx->waiting = 0;
-        (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
+        (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->misses, 1);
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "cache_turbo: cold-wait sees L2 filled-but-unserveable "
                        "\"%V\" -> origin", &r->uri);
@@ -3325,7 +3325,7 @@ ngx_http_cache_turbo_cold_wait(ngx_http_request_t *r,
          * this exact snapshot on its other serve path (module.c:3080). */
         if (ctx->sie_armed && ctx->sie_snap != NULL) {
             ctx->waiting = 0;
-            (void) ngx_atomic_fetch_add(&z->sh->stale_serves, 1);
+            (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->stale_serves, 1);
             /* S7.1: dedicated SIE counter, bumped alongside stale_serves at
              * the delivery site -- same "generic + reason-specific, both at
              * the actual serve" discipline the breaker-fallback stale serve
@@ -3333,7 +3333,7 @@ ngx_http_cache_turbo_cold_wait(ngx_http_request_t *r,
              * this, sie_serves silently undercounts whenever delivery comes
              * from a cold-wait timeout rather than an upstream error
              * rewrite. */
-            (void) ngx_atomic_fetch_add(&z->sh->sie_serves, 1);
+            (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->sie_serves, 1);
             ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                            "cache_turbo: cold-miss wait timeout \"%V\" -> "
                            "serving armed SIE snapshot", &r->uri);
@@ -3344,7 +3344,7 @@ ngx_http_cache_turbo_cold_wait(ngx_http_request_t *r,
         /* Waited long enough: give up and regenerate ourselves. Our store ends
          * the wait for any remaining readers. Bounded by lock_timeout. */
         ctx->waiting = 0;
-        (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
+        (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->misses, 1);
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "cache_turbo: cold-miss wait timeout \"%V\" -> origin",
                        &r->uri);

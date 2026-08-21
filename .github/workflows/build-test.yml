@@ -1,4 +1,4 @@
-# sync-sha: b7de0a783c541146643686115c68176deeef8f3fec3c7709caaee165cd16dee1
+# sync-sha: fba37c1008f3af57f30f3ae8997527236b67aeec151457167e4d8f92b119e64c
 name: Build & Test
 
 # Runner labels live in the POOL repository variable. Every checked-in selector
@@ -127,9 +127,14 @@ jobs:
             exit 1
           fi
 
-      - name: Static analysis (R7 shm-lock invariant + cppcheck + whitespace)
+      - name: Static analysis (R7 shm-lock + P4-2-s3b stripe seam + cppcheck + whitespace)
         run: |
           bash ci/tools/lint-shm-lock.sh
+          # P4-2-s3b: no site may reach a stripe's slab pool outside the
+          # resolver. At N == 1 a stray bare `z->shpool` behaves identically to
+          # the resolver, so no runtime test can see it -- this is the only
+          # gate that can.
+          bash ci/tools/lint-stripe-seam.sh
           # Scan every source (CI-4): the explicit list previously omitted
           # src/ngx_http_cache_turbo_autotune.c. A glob keeps new sources covered.
           # -DNGX_PTR_SIZE=8: the breaker probe-word layout selects on it and

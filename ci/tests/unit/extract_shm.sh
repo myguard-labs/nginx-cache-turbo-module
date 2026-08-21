@@ -506,7 +506,7 @@ fi
 # the explanation rather than the code.
 if ! sed -n '/^ngx_http_cache_turbo_shm_breaker_record(/,/^}/p' "$OUT" \
    | sed -E 's;/\*.*;;; s;^[[:space:]]*\*.*;;' \
-   | grep -q 'ngx_atomic_cmp_set(&z->sh->breaker_window_start'; then
+   | grep -q 'ngx_atomic_cmp_set(&ngx_http_cache_turbo_zone_sh(z)->breaker_window_start'; then
     echo "✗ O4.5 regression: the rolling-window re-anchor is no longer a CAS" >&2
     echo "  on breaker_window_start. Concurrent failures then clear each" >&2
     echo "  other's count and the breaker cannot trip during a real burst." >&2
@@ -684,8 +684,11 @@ fi
 # is exactly why they are pinned here rather than left to review.
 admit_body=$(sed -n '/^ngx_http_cache_turbo_shm_admit(/,/^}/p' "$OUT" \
    | sed -E 's;/\*.*;;; s;^[[:space:]]*\*.*;;')
-for guard in '!z->sh->admission' 'z->sh->sketch == NULL' \
-             'ngx_queue_empty(&z->sh->lru)'; do
+# P4-2-s3b: `z->sh` is now spelled ngx_http_cache_turbo_zone_sh(z) -- the
+# stripe resolver. Same three guards, same strength; only the accessor changed.
+for guard in '!ngx_http_cache_turbo_zone_sh(z)->admission' \
+             'ngx_http_cache_turbo_zone_sh(z)->sketch == NULL' \
+             'ngx_queue_empty(&ngx_http_cache_turbo_zone_sh(z)->lru)'; do
     if ! printf '%s\n' "$admit_body" | grep -qF "$guard"; then
         echo "✗ P4-1b-FAIL-OPEN regression: shm_admit() no longer guards on" >&2
         echo "  '$guard' -- admission can now refuse on no evidence." >&2

@@ -232,10 +232,44 @@ typedef struct {
                                                  * as if TEST_FAULTS */
 } ngx_http_cache_turbo_shctx_t;
 
+/* P4-2-s3b: the stripe seam, hand-mirrored from module.h like every other
+ * struct in this file. The sliced production bodies now reach shm state only
+ * through ngx_http_cache_turbo_zone_sh() / _zone_pool(), so the mirror has to
+ * carry the same array-plus-resolver shape or nothing compiles. N is pinned at
+ * 1 here for the same reason it is in production: stripe_of() is a provable
+ * identity at N == 1, so every test still exercises exactly one pool and one
+ * mutex, and this harness stays behaviour-identical to the pre-seam one. */
 typedef struct {
     ngx_http_cache_turbo_shctx_t  *sh;
     ngx_slab_pool_t               *shpool;
+} ngx_http_cache_turbo_stripe_t;
+
+#define NGX_HTTP_CACHE_TURBO_STRIPES  1
+
+typedef struct {
+    ngx_http_cache_turbo_stripe_t  stripes[NGX_HTTP_CACHE_TURBO_STRIPES];
+    ngx_uint_t                     nstripes;
 } ngx_http_cache_turbo_zone_t;
+
+static ngx_inline ngx_http_cache_turbo_stripe_t *
+ngx_http_cache_turbo_stripe_of(ngx_http_cache_turbo_zone_t *z, uint32_t key)
+{
+    if (z->nstripes <= 1) {
+        return &z->stripes[0];
+    }
+
+    return &z->stripes[key % (uint32_t) z->nstripes];
+}
+
+static ngx_inline ngx_http_cache_turbo_stripe_t *
+ngx_http_cache_turbo_zone_stripe(ngx_http_cache_turbo_zone_t *z)
+{
+    return &z->stripes[0];
+}
+
+#define ngx_http_cache_turbo_zone_pool(z)  (ngx_http_cache_turbo_zone_stripe(z)->shpool)
+#define ngx_http_cache_turbo_zone_sh(z)    (ngx_http_cache_turbo_zone_stripe(z)->sh)
+#define ngx_http_cache_turbo_zone_mutex(z) (&ngx_http_cache_turbo_zone_pool(z)->mutex)
 
 /* PERF-7: the blob refcount header, hand-mirrored from module.h like every
  * other struct in this file. Field ORDER and the header SIZE are load-bearing:
@@ -413,8 +447,14 @@ zone_reset(void)
     ngx_queue_init(&g_sh.lru_protected);
     g_zone_live = 1;
 
-    g_zone.sh     = &g_sh;
-    g_zone.shpool = &g_pool;
+    /* P4-2-s3b: publish nstripes BEFORE wiring the stripe, so stripe_of()
+     * takes its modulo branch on a live count rather than falling into the
+     * nstripes == 0 fail-safe. Then write the pool/sh pair through the
+     * resolver, exactly as shm_init_zone() does in production. */
+    g_zone.nstripes = NGX_HTTP_CACHE_TURBO_STRIPES;
+
+    ngx_http_cache_turbo_zone_sh(&g_zone)   = &g_sh;
+    ngx_http_cache_turbo_zone_pool(&g_zone) = &g_pool;
 
     ngx_test_now         = 1000000;
 
@@ -3269,7 +3309,7 @@ test_breaker_only_the_probe_token_closes(void)
     /* A non-probe success -- an older in-flight request, or one served from a
      * peer's fill -- must NOT close the breaker. */
     brk_record(1, 3, 60);
-    CHECK(ngx_http_cache_turbo_brk_state(g_zone.sh->breaker_state)
+    CHECK(ngx_http_cache_turbo_brk_state(ngx_http_cache_turbo_zone_sh(&g_zone)->breaker_state)
               == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN,
           "a success WITHOUT the lease token closed the breaker — an outcome "
           "from a request that never probed would release the herd onto a "
@@ -3277,20 +3317,20 @@ test_breaker_only_the_probe_token_closes(void)
 
     /* A non-probe FAILURE must not re-stamp the window either. */
     brk_record(0, 3, 60);
-    CHECK(ngx_http_cache_turbo_brk_state(g_zone.sh->breaker_state)
+    CHECK(ngx_http_cache_turbo_brk_state(ngx_http_cache_turbo_zone_sh(&g_zone)->breaker_state)
               == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN,
           "a failure WITHOUT the lease token resolved the lease");
 
     /* A stale token from no lease at all is still refused. */
     other = probe + 12345;
     ngx_http_cache_turbo_shm_breaker_record(&g_zone, 1, 3, 60, other);
-    CHECK(ngx_http_cache_turbo_brk_state(g_zone.sh->breaker_state)
+    CHECK(ngx_http_cache_turbo_brk_state(ngx_http_cache_turbo_zone_sh(&g_zone)->breaker_state)
               == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN,
           "a WRONG lease token closed the breaker");
 
     /* The real owner closes it. */
     ngx_http_cache_turbo_shm_breaker_record(&g_zone, 1, 3, 60, probe);
-    CHECK(ngx_http_cache_turbo_brk_state(g_zone.sh->breaker_state)
+    CHECK(ngx_http_cache_turbo_brk_state(ngx_http_cache_turbo_zone_sh(&g_zone)->breaker_state)
               == NGX_HTTP_CACHE_TURBO_BREAKER_CLOSED,
           "the lease owner's success did not close the breaker");
 }
@@ -3318,7 +3358,7 @@ test_breaker_probe_token_reopens(void)
     ngx_http_cache_turbo_shm_breaker_record(
         &g_zone, !ngx_http_cache_turbo_breaker_is_origin_failure(502), 3, 60,
         probe);
-    CHECK(ngx_http_cache_turbo_brk_state(g_zone.sh->breaker_state)
+    CHECK(ngx_http_cache_turbo_brk_state(ngx_http_cache_turbo_zone_sh(&g_zone)->breaker_state)
               == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN,
           "the probe's failure did not re-open the breaker");
 
@@ -3379,7 +3419,7 @@ test_breaker_second_consult_loses_the_probe(void)
           "ever recorded and the breaker cannot close");
 
     /* Nothing closed the breaker, because the probe never reported. */
-    CHECK(ngx_http_cache_turbo_brk_state(g_zone.sh->breaker_state)
+    CHECK(ngx_http_cache_turbo_brk_state(ngx_http_cache_turbo_zone_sh(&g_zone)->breaker_state)
               == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN,
           "the breaker left the half-open lease unexpectedly");
 }

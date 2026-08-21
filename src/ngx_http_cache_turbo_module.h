@@ -1121,9 +1121,55 @@ typedef struct {
 } ngx_http_cache_turbo_shctx_t;
 
 
+/*
+ * P4-2-s3b: the STRIPE SEAM.
+ *
+ * Historically a zone held exactly ONE (sh, shpool) pair, and every one of the
+ * 64 code sites in the module dereferenced `z->shpool` / `z->sh` directly.
+ * That single pair is the chokepoint that makes the zone mutex zone-wide: one
+ * `ngx_slab_pool_t`, therefore one `ngx_shmtx`, therefore every key in the zone
+ * serializes against every other key.
+ *
+ * This struct turns that pair into an ARRAY ELEMENT, and the resolvers below
+ * turn every dereference into a lookup. Nothing about the runtime changes yet:
+ * `nstripes` is hard-wired to 1 (NGX_HTTP_CACHE_TURBO_STRIPES == 1), so
+ * `ngx_http_cache_turbo_stripe_of()` provably returns `&z->stripes[0]` for
+ * EVERY input, and `ngx_http_cache_turbo_zone_stripe()` is that same element.
+ * The seam is behaviour-identical by construction: one pool, one mutex, one
+ * `used_bytes` gauge, exactly as before.
+ *
+ * s3c makes N configurable and carves N real pools. Only then does the
+ * resolver start returning something other than element 0 -- and by then every
+ * call site already asks it, rather than assuming.
+ *
+ * ⚠ INVARIANT: NO code outside the two resolvers below may name `->shpool` or
+ * `->sh` on a zone. `ci/tools/lint-stripe-seam.sh` enforces this; a bare
+ * `z->shpool` reintroduces the ability to lock pool A while freeing into pool
+ * B, which is heap corruption under the wrong mutex.
+ */
 typedef struct {
     ngx_http_cache_turbo_shctx_t  *sh;
     ngx_slab_pool_t               *shpool;
+} ngx_http_cache_turbo_stripe_t;
+
+
+/* Compile-time stripe count. s3b pins this at 1; s3c turns it into a
+ * per-zone runtime value with 1 as the default. Anything that depends on the
+ * count reads z->nstripes, never this macro, so s3c is a value change and not
+ * another site sweep. */
+#define NGX_HTTP_CACHE_TURBO_STRIPES  1
+
+
+typedef struct {
+    /* P4-2-s3b: the stripe array. Exactly NGX_HTTP_CACHE_TURBO_STRIPES (== 1)
+     * elements today. Reach it ONLY through ngx_http_cache_turbo_stripe_of()
+     * or ngx_http_cache_turbo_zone_stripe(). */
+    ngx_http_cache_turbo_stripe_t  stripes[NGX_HTTP_CACHE_TURBO_STRIPES];
+
+    /* Live stripe count. Set to NGX_HTTP_CACHE_TURBO_STRIPES at zone init and
+     * never changed while N == 1. Held as a field rather than read from the
+     * macro so s3c only has to change where it is ASSIGNED. */
+    ngx_uint_t                     nstripes;
 
     /* O4.4-d: config-time-only "first policy seen" accumulator for the
      * breaker tuple this zone is bound to. NOT shm state -- this struct is
@@ -1147,6 +1193,60 @@ typedef struct {
      * off, the shipped default. */
     ngx_uint_t               admission;
 } ngx_http_cache_turbo_zone_t;
+
+
+/*
+ * P4-2-s3b: THE STRIPE RESOLVERS. The only two places in the module allowed to
+ * name `->stripes`, and therefore the only places that can produce a
+ * `ngx_slab_pool_t *` or a `ngx_http_cache_turbo_shctx_t *`.
+ *
+ * ngx_http_cache_turbo_stripe_of() is the KEY-directed resolver: it answers
+ * "which stripe owns this key". While z->nstripes == 1 the modulo is a
+ * provable identity -- `anything % 1 == 0` for every unsigned input, including
+ * 0 and NGX_MAX_UINT32_VALUE -- so it returns &z->stripes[0] unconditionally
+ * and the seam is behaviour-identical. The `nstripes <= 1` short-circuit is not
+ * an optimisation dodging that proof; it is the fail-safe for a zone whose
+ * init has not run (nstripes == 0), where the modulo would be a division by
+ * zero.
+ *
+ * ngx_http_cache_turbo_zone_stripe() is the ZONE-WIDE resolver, for state that
+ * is not per-key: init/teardown, the zone-global counters, the autotune
+ * recompute, the breaker. Under N == 1 it is the same element the key resolver
+ * returns; under s3c's N > 1 each of its call sites becomes a decision (fan out
+ * over all stripes, or pin stripe 0), which is exactly the review that s3c
+ * owes and s3b deliberately does not preempt.
+ *
+ * Both are inline and const-free on purpose: they must compile to the same
+ * load a bare `z->shpool` did, so this port costs nothing at N == 1.
+ */
+static ngx_inline ngx_http_cache_turbo_stripe_t *
+ngx_http_cache_turbo_stripe_of(ngx_http_cache_turbo_zone_t *z, uint32_t key)
+{
+    if (z->nstripes <= 1) {
+        return &z->stripes[0];
+    }
+
+    return &z->stripes[key % (uint32_t) z->nstripes];
+}
+
+
+static ngx_inline ngx_http_cache_turbo_stripe_t *
+ngx_http_cache_turbo_zone_stripe(ngx_http_cache_turbo_zone_t *z)
+{
+    return &z->stripes[0];
+}
+
+
+/* Sugar over ngx_http_cache_turbo_zone_stripe(). Every former `z->shpool` /
+ * `z->sh` site reads as one of these, so the diff is a rename at the call site
+ * and the seam is still the only path to a pool. */
+#define ngx_http_cache_turbo_zone_pool(z)  (ngx_http_cache_turbo_zone_stripe(z)->shpool)
+#define ngx_http_cache_turbo_zone_sh(z)    (ngx_http_cache_turbo_zone_stripe(z)->sh)
+
+/* Zone-wide mutex, i.e. the mutex of the stripe that owns zone-global state.
+ * Kept as a distinct spelling from zone_pool()->mutex so s3c can find every
+ * lock site without re-deriving it from the pool expression. */
+#define ngx_http_cache_turbo_zone_mutex(z) (&ngx_http_cache_turbo_zone_pool(z)->mutex)
 
 
 /* Snapshot of the L1 zone's atomic counters. Filled by the l1 backend's stats
