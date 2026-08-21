@@ -1453,6 +1453,21 @@ ngx_http_cache_turbo_body_filter_blob_write(ngx_http_request_t *r,
         bhw.flags |= NGX_HTTP_CACHE_TURBO_BLOBF_AUTH_SHAREABLE;
     }
 
+    /* P5-6: stamp head-derived on a blob written by a HEAD-triggered warm
+     * subrequest (cache_turbo_store_head). Same "the store path is the only
+     * place this can be known" reasoning as the flags above: the serve
+     * chokepoint has only the stored bytes and cannot re-derive that the
+     * fetch was caused by a HEAD.
+     *
+     * ⚠ A MISSING bit here publishes the entry to ordinary GET traffic --
+     * the exact invariant BLOBF_HEAD_DERIVED exists to hold. ctx->head_derived
+     * is set on the subrequest's own ctx by warm_head_one() before the
+     * subrequest runs, and this function runs on that same ctx, so the two
+     * cannot drift apart the way a request-side re-derivation could. */
+    if (ctx->head_derived) {
+        bhw.flags |= NGX_HTTP_CACHE_TURBO_BLOBF_HEAD_DERIVED;
+    }
+
     /* P4-3: every pair this function emits below passed
      * ngx_http_cache_turbo_header_admissible() first -- the Content-Type
      * branch and the headers-list loop both gate on it, and the measure pass

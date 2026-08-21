@@ -255,6 +255,13 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       offsetof(ngx_http_cache_turbo_loc_conf_t, serve_authorized),
       NULL },
 
+    { ngx_string("cache_turbo_store_head"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_turbo_loc_conf_t, store_head),
+      NULL },
+
     { ngx_string("cache_turbo_purge"),
       NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_FLAG,
       ngx_conf_set_flag_slot,
@@ -2878,6 +2885,48 @@ ngx_http_cache_turbo_serve(ngx_http_request_t *r, u_char *copy, size_t len,
         }
 
         /*
+         * P5-6: enforce BLOBF_HEAD_DERIVED at this SAME chokepoint, beside
+         * BLOBF_BREAKER_ONLY / BLOBF_AUTH_SHAREABLE / BLOBF_ORIGIN_ENCODED,
+         * and for the identical reason -- every live serve (L1 hit, L2 fill,
+         * SWR stale, SIE, cold wait, the breaker's own fallback) passes
+         * through here, and a per-call-site check would fail open on the
+         * next site added.
+         *
+         * THE INVARIANT: a HEAD-derived entry may answer a HEAD and MUST
+         * NEVER answer a GET (or any other method that reached a lookup).
+         * The blob's body is a real origin representation -- the warm
+         * subrequest that produced it was a genuine GET -- but the traffic
+         * that caused the fetch was HEAD-only, so nothing on this path has
+         * ever established that a GET client here should receive it from
+         * cache. Fail CLOSED: NGX_DECLINED, caller proceeds to the origin
+         * exactly as on a miss, and the store it performs then replaces the
+         * stamped entry with an ordinary one.
+         *
+         * Keyed on the REQUEST'S OWN METHOD rather than on r->header_only:
+         * header_only is also set by the 304-conditional path
+         * (module.c, the NOT_MODIFIED arm) and by core once headers are
+         * sent, so it is true for requests that are NOT HEAD and would let a
+         * conditional GET read a head-derived entry.
+         *
+         * Reads the SAME already-bounds-checked u16 the guards above read;
+         * `len >= NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE` from the outer `if`
+         * covers this offset.
+         */
+        if ((ngx_http_cache_turbo_get_u16(copy + 6)
+             & NGX_HTTP_CACHE_TURBO_BLOBF_HEAD_DERIVED)
+            && !(r->method & NGX_HTTP_HEAD))
+        {
+            if (ref_data != NULL && cc != NULL) {
+                cc->data = NULL;
+                ngx_http_cache_turbo_blob_release(z, ref_data);
+            }
+            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                           "cache_turbo: head-derived entry \"%V\" refused "
+                           "for a non-HEAD request -> origin", &r->uri);
+            return NGX_DECLINED;
+        }
+
+        /*
          * P3-2: enforce BLOBF_ORIGIN_ENCODED at this SAME chokepoint, right
          * beside BLOBF_BREAKER_ONLY, for the same reason -- every live serve
          * (L1 hit, L2 fill, stale-while-revalidate, cold wait, the breaker's
@@ -3695,6 +3744,23 @@ ngx_http_cache_turbo_sie_rewrite(ngx_http_request_t *r,
             return NGX_DECLINED;
         }
 
+        /* P5-6: the same HEAD-derived gate serve() applies, for the same
+         * reason -- SIE is the other path a stored body can reach a client
+         * on, so leaving it out would let a GET read a head-derived entry
+         * for the whole stale-if-error window, which is precisely the
+         * "serve site added without the flag check" failure the chokepoint
+         * discipline exists to prevent. Fail closed on the bit being set for
+         * a non-HEAD request, exactly as serve() does. */
+        if ((snap_flags & NGX_HTTP_CACHE_TURBO_BLOBF_HEAD_DERIVED)
+            && !(r->method & NGX_HTTP_HEAD))
+        {
+            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                           "cache_turbo: head-derived SIE snapshot \"%V\" "
+                           "refused for a non-HEAD request -> origin error "
+                           "stands", &r->uri);
+            return NGX_DECLINED;
+        }
+
         if (snap_flags & NGX_HTTP_CACHE_TURBO_BLOBF_ORIGIN_ENCODED) {
             ngx_uint_t  class = (snap_flags
                                   & NGX_HTTP_CACHE_TURBO_BLOBF_AE_CLASS_MASK)
@@ -4376,7 +4442,8 @@ ngx_http_cache_turbo_warm_inject_validators(ngx_http_request_t *sr,
 /* Non-static: called from admin.c's warm dispatch too. */
 ngx_int_t
 ngx_http_cache_turbo_warm_one(ngx_http_request_t *r, ngx_str_t *uri,
-    ngx_str_t *args, u_char *snap, size_t snap_len)
+    ngx_str_t *args, u_char *snap, size_t snap_len,
+    ngx_http_cache_turbo_ctx_t **ctx_out)
 {
     ngx_http_request_t                     *sr;
     ngx_http_cache_turbo_ctx_t             *wctx;
@@ -4477,6 +4544,19 @@ ngx_http_cache_turbo_warm_one(ngx_http_request_t *r, ngx_str_t *uri,
     }
     wctx->warm = 1;
     ngx_http_set_ctx(sr, wctx, ngx_http_cache_turbo_module);
+
+    /* P5-6: hand the caller the subrequest's ctx so a specialised warm (the
+     * HEAD-triggered store) can stamp its own capture flags on it. Published
+     * HERE -- immediately after the ctx exists and BEFORE the failure arms
+     * below -- because a subrequest that has been posted cannot be unwound:
+     * an arm returning NGX_ERROR below still leaves `sr` live and still
+     * running through our body filter, so a caller that only learns the ctx
+     * on NGX_OK would miss exactly those cases and the blob would be stored
+     * WITHOUT its flag. Publishing early makes the stamp unconditional on
+     * the subrequest's existence rather than on warm_one()'s return value. */
+    if (ctx_out != NULL) {
+        *ctx_out = wctx;
+    }
 
     /* Warm anonymously: strip inherited cookies so both the cache key and the
      * upstream request are the cookieless anonymous variant a visitor gets.
@@ -4912,6 +4992,7 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->auto_vary = NGX_CONF_UNSET;
     conf->key_encoded_origin = NGX_CONF_UNSET;
     conf->serve_authorized = NGX_CONF_UNSET;
+    conf->store_head = NGX_CONF_UNSET;
     conf->purge = NGX_CONF_UNSET;
     conf->background_update = NGX_CONF_UNSET;
     conf->background_update_max = NGX_CONF_UNSET;  /* P3-7; merges to 0 = unlimited */

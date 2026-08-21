@@ -1,5 +1,27 @@
 Changes with the nginx-cache-turbo-module (unreleased)
 
+    *) Feature: cache_turbo_store_head on|off (default off) makes a HEAD that
+       misses the cache fire one internal background subrequest -- a real GET,
+       the same mechanism the stale-while-revalidate background refresh uses --
+       so a URL that only ever receives HEAD stops being a permanent 100%
+       miss. A HEAD may read the cache but can never populate it (nginx sets
+       header_only for a HEAD once headers are sent, so the body chain where
+       every store in this module lives never runs), which made every uptime
+       monitor, link checker and HEAD-issuing crawler pay a full origin round
+       trip forever.
+       The subrequest flows through the ordinary capture gate and the ordinary
+       store path -- no second store path is added -- and is subject to the
+       same zone-wide cache_turbo_background_update_max cap as SWR.
+       The resulting entry is marked HEAD-derived on the blob and is REFUSED
+       to every non-HEAD request at the same serve chokepoint that enforces
+       the breaker-only, encoding-class and RFC 9111 3.5 marks: a HEAD-derived
+       entry must never answer a GET. Such a GET falls through to the origin
+       as on a miss and its own response replaces the entry with an ordinary
+       one, so the guard costs at most one extra fetch per URL rather than
+       pinning it into permanent misses. Off by default because it spends one
+       wasted origin body per HEAD-miss, which only pays for itself on a
+       genuinely HEAD-dominated workload.
+
     *) Feature: the admin warm endpoint's per-request URL cap is now
        configurable via cache_turbo_warm_max N (default 32, matching the
        previous hardcoded ceiling; max 4096), and warming can be driven from

@@ -978,7 +978,8 @@ ngx_http_cache_turbo_access_l1_serve_stale(ngx_http_request_t *r,
             snap_len = ctn->len;
             ngx_shmtx_unlock(&z->shpool->mutex);
             (void) ngx_http_cache_turbo_warm_one(r, &r->uri, &r->args,
-                                                 snap, snap_len);
+                                                 snap, snap_len,
+                                                 NULL);
             (void) ngx_atomic_fetch_add(&z->sh->stale_serves, 1);
             ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                            "cache_turbo: cross-node WON bg-refresh + STALE "
@@ -1136,7 +1137,8 @@ ngx_http_cache_turbo_access_l1_serve_stale(ngx_http_request_t *r,
         if (clcf->background_update) {
             /* v8: fire a background refresh of this URI, serve stale. */
             (void) ngx_http_cache_turbo_warm_one(r, &r->uri, &r->args,
-                                                 snap, snap_len);
+                                                 snap, snap_len,
+                                                 NULL);
             (void) ngx_atomic_fetch_add(&z->sh->stale_serves, 1);
             ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                            "cache_turbo: bg-refresh + STALE serve \"%V\" "
@@ -3070,6 +3072,83 @@ ngx_http_cache_turbo_access_cold(ngx_http_request_t *r,
 
 
 
+/*
+ * P5-6: cache_turbo_store_head. A HEAD is eligible for LOOKUP (see
+ * ngx_http_cache_turbo_access_eligible() above) but can never be STORED: the
+ * capture gate in filters.c refuses HEAD outright, because nginx core sets
+ * r->header_only = 1 for a HEAD once headers are sent
+ * (ngx_http_header_filter_module.c) and the body chain -- where every store in
+ * this module lives -- then never runs. So a URL that only ever receives HEAD
+ * (monitors, link checkers, some crawlers) is a permanent 100%% miss.
+ *
+ * Fix it with the mechanism the SWR background refresh already uses: one
+ * internal background subrequest with header_only = 0. That subrequest is a
+ * REAL GET, so it flows through the ordinary capture gate and the ordinary
+ * body-filter store -- this feature adds NO second store path, and every gate,
+ * invariant and index write happens exactly once, in code that already ships.
+ * The cost is one wasted origin body per HEAD-miss, paid rarely by
+ * construction on the workload the directive exists for.
+ *
+ * The stored entry is stamped BLOBF_HEAD_DERIVED (via ctx->head_derived on the
+ * SUBREQUEST's ctx) and the serve chokepoint refuses it to every non-HEAD
+ * request -- a HEAD-derived entry must NEVER answer a GET.
+ *
+ * ⚠ CALLED FROM EVERY GO-TO-ORIGIN RETURN of the access handler, not just the
+ * one at the bottom. cache_turbo_lock is ON by default, so a cold HEAD miss
+ * leaves through the cold-miss phase's own NGX_DECLINED and never reaches the
+ * tail of the handler at all -- placing this there made the feature dead code
+ * under the shipped default, which is exactly the cycle-6 failure shape. Every
+ * arm that hands the request to the origin routes through here instead.
+ *
+ * Idempotent per request: ctx->head_warm_fired makes a re-entry (the cold-wait
+ * re-poll and the L2/lock park both re-run this handler) fire at most one
+ * subrequest, so a parked HEAD cannot multiply warms.
+ *
+ * A HIT/STALE returns long before any of these call sites, so a URL that
+ * already has an entry never pays the extra fetch; the subrequest is subject
+ * to the SAME zone-wide cache_turbo_background_update_max cap as SWR
+ * (warm_one() checks it first); and the return value is deliberately
+ * discarded, exactly as the SWR callers discard it -- a refused or failed warm
+ * must never change what THIS request does, which is proceed to the origin as
+ * an ordinary miss.
+ */
+static void
+ngx_http_cache_turbo_head_store_warm(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx)
+{
+    ngx_http_cache_turbo_ctx_t  *wctx = NULL;
+
+    if (!clcf->store_head
+        || !(r->method & NGX_HTTP_HEAD)
+        || ctx == NULL
+        || ctx->head_warm_fired)
+    {
+        return;
+    }
+
+    ctx->head_warm_fired = 1;
+
+    (void) ngx_http_cache_turbo_warm_one(r, &r->uri, &r->args, NULL, 0, &wctx);
+
+    /* Stamp on the ctx's EXISTENCE, not on warm_one()'s return value. A posted
+     * subrequest cannot be unwound, so a failure arm AFTER the ctx was
+     * published still leaves `sr` live, still recognisably ours to the body
+     * filter, and still able to reach the store. An unstamped head-derived
+     * blob is the one outcome the invariant cannot tolerate, so stamp whenever
+     * there is a ctx at all. wctx stays NULL when warm_one() refused before
+     * creating the subrequest (bg cap reached, ngx_http_subrequest() failed,
+     * ctx alloc failed) -- nothing was posted then and there is nothing to
+     * stamp. */
+    if (wctx != NULL) {
+        wctx->head_derived = 1;
+    }
+
+    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "cache_turbo: HEAD miss \"%V\" -> warm subrequest",
+                   &r->uri);
+}
+
+
 /* MAINT-H2: the access handler is a fixed SEQUENCE of phases, each extracted
  * above into a named helper and each able to terminate the request. The parent
  * is a straight-line driver: it evaluates the phases in the original order and
@@ -3107,12 +3186,18 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
     if (ngx_http_cache_turbo_access_l1(r, clcf, ctx, z, &hash, &rc)
         == NGX_DONE)
     {
+        if (rc == NGX_DECLINED) {
+            ngx_http_cache_turbo_head_store_warm(r, clcf, ctx);
+        }
         return rc;
     }
 
     if (ngx_http_cache_turbo_access_l2(r, clcf, ctx, z, hash, &rc)
         == NGX_DONE)
     {
+        if (rc == NGX_DECLINED) {
+            ngx_http_cache_turbo_head_store_warm(r, clcf, ctx);
+        }
         return rc;
     }
 
@@ -3121,29 +3206,43 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
     if (ngx_http_cache_turbo_access_only_if_cached(r, clcf, ctx, z, hash, &rc)
         == NGX_DONE)
     {
+        /* only-if-cached answers 504 itself and never reaches the origin --
+         * warming here would fetch a body the client explicitly refused to
+         * let us fetch (RFC 9111 5.2.1.7). Deliberately NOT warmed. */
         return rc;
     }
 
     if (ngx_http_cache_turbo_access_breaker_gate(r, clcf, ctx, z, hash, &rc)
         == NGX_DONE)
     {
+        if (rc == NGX_DECLINED) {
+            ngx_http_cache_turbo_head_store_warm(r, clcf, ctx);
+        }
         return rc;
     }
 
     if (ngx_http_cache_turbo_access_min_uses(r, clcf, ctx, z, hash, &rc)
         == NGX_DONE)
     {
+        if (rc == NGX_DECLINED) {
+            ngx_http_cache_turbo_head_store_warm(r, clcf, ctx);
+        }
         return rc;
     }
 
     if (ngx_http_cache_turbo_access_cold(r, clcf, ctx, z, hash, &rc)
         == NGX_DONE)
     {
+        if (rc == NGX_DECLINED) {
+            ngx_http_cache_turbo_head_store_warm(r, clcf, ctx);
+        }
         return rc;
     }
 
     /* true miss (cache_turbo_lock off): mark for capture, run to the origin */
     (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
+    ngx_http_cache_turbo_head_store_warm(r, clcf, ctx);
+
     ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "cache_turbo: MISS \"%V\" key=%ui -> origin",
                    &r->uri, (ngx_uint_t) hash);

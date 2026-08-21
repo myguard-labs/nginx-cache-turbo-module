@@ -749,6 +749,46 @@ Nothing about the `Vary` machinery changes: a response carrying
 `Vary: Authorization` still makes the entry uncacheable, and
 `cache_turbo_vary_ignore` still refuses to ignore that axis.
 
+#### `cache_turbo_store_head` — stop HEAD-only URLs being a permanent 100% miss
+
+**Off by default.** A `HEAD` may *read* the cache, but it can never *populate*
+it: nginx sets `header_only` on a HEAD once headers are sent, so the response
+body chain — where this module's store lives — never runs. A URL that only ever
+receives HEAD is therefore a **permanent 100% miss**: every uptime monitor,
+link checker and HEAD-issuing crawler pays a full origin round trip, forever,
+and the origin never gets to amortise them.
+
+`cache_turbo_store_head on;` makes a HEAD *miss* fire one internal background
+subrequest — a real GET — so the URL gets an entry:
+
+```nginx
+location /status/ {
+    cache_turbo            main;
+    cache_turbo_valid      30s;
+    cache_turbo_store_head on;
+    proxy_pass http://backend;
+}
+```
+
+The subrequest goes through the ordinary capture gate and the ordinary store
+path; this feature adds no second way for an entry to be created. It is also
+subject to the same zone-wide `cache_turbo_background_update_max` cap as the
+stale-while-revalidate background refresh, so HEAD traffic against many cold
+URLs cannot fan out without bound.
+
+**The entry is HEAD-only, and that is enforced.** A cached entry produced this
+way is marked at store time and **refused to every non-HEAD request** at the
+same chokepoint that enforces the breaker-only, encoding-class and RFC 9111
+§3.5 marks. A `GET` against such a URL falls through to the origin exactly as
+on a miss, and the response it fetches then replaces the HEAD-derived entry
+with an ordinary one — so the guard costs at most one extra fetch over a URL's
+lifetime rather than pinning it into permanent misses.
+
+**Cost.** One wasted origin body per HEAD-miss. That is only worth paying on a
+workload that really is HEAD-dominated, which is why the directive is off by
+default: on ordinary traffic the GET that follows would have populated the entry
+anyway, and the extra fetch buys nothing.
+
 ### What each preset skips
 
 A request is sent to the origin uncached if it matches **any** of three checks
