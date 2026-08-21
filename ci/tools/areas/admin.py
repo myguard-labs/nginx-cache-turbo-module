@@ -1454,7 +1454,17 @@ def test_warm_admin_no_uri_proxy_pass_no_ubsan_abort(ng: Nginx, origin: Origin) 
     expected and uninformative; it earns its keep on the asan CI lane. The
     positive half (warm still actually reaches the origin and populates the
     entry) is asserted too, so a fix that merely swallows the crash without
-    completing the warm would still fail this test."""
+    completing the warm would still fail this test.
+
+    ng.worker_pids() is documented to return an empty set in single-process
+    mode (there is no master/worker split to diff), so the PID-set assertion
+    is skipped there -- same guard every other worker-crash oracle in this
+    suite uses (see tune.py's keepalive-reuse and dirty-memcached tests). In
+    single-process mode a sanitizer abort kills the one nginx process the
+    harness is talking to, so the functional assertions around this block
+    (the warm POST's own 200/warmed==1, the origin hit, and the HIT re-fetch
+    below) are what would fail instead -- they remain the load-bearing
+    oracle for that mode."""
     import json
 
     uri = "/shoff/warm-nouri-admin"
@@ -1470,14 +1480,15 @@ def test_warm_admin_no_uri_proxy_pass_no_ubsan_abort(ng: Nginx, origin: Origin) 
         "warm subrequest never hit the origin (admin warm into a URI-less " \
         "proxy_pass did not complete)"
 
-    # give a crashed worker time to actually exit and the master time to
-    # respawn its replacement before reading the PID set
-    time.sleep(0.3)
-    after_workers = ng.worker_pids()
-    assert after_workers and after_workers == before_workers, (
-        "worker process set changed across the admin warm into a URI-less "
-        "proxy_pass -- UB-PROXYNULLURI-admin: the worker ABORTED "
-        f"(before={sorted(before_workers)}, after={sorted(after_workers)})")
+    if not ng.single_process:
+        # give a crashed worker time to actually exit and the master time to
+        # respawn its replacement before reading the PID set
+        time.sleep(0.3)
+        after_workers = ng.worker_pids()
+        assert after_workers == before_workers, (
+            "worker process set changed across the admin warm into a URI-less "
+            "proxy_pass -- UB-PROXYNULLURI-admin: the worker ABORTED "
+            f"(before={sorted(before_workers)}, after={sorted(after_workers)})")
 
     time.sleep(0.2)                     # let the store settle
     s2, _, h2 = fetch(ng.port, uri)
