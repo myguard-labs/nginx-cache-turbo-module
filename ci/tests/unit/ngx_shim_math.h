@@ -16,8 +16,9 @@
  * so the dice and clocks are deterministic.
  *
  * The struct layout here only needs to satisfy the field ACCESSES autotune.c
- * makes (z->sh->{hits,misses,...}, z->shpool); it is not the real shctx and is
- * never shared with a running nginx — unit scope only.
+ * makes through the P4-2-s3b stripe resolvers (ngx_http_cache_turbo_zone_sh(z)
+ * -> {hits,misses,...}, ngx_http_cache_turbo_zone_pool(z)); it is not the real
+ * shctx and is never shared with a running nginx — unit scope only.
  */
 
 #ifndef NGX_CACHE_TURBO_UNIT_SHIM_MATH_H
@@ -70,14 +71,38 @@ typedef struct {
 } ngx_http_cache_turbo_shctx_t;
 
 /* ngx_shmtx / slab pool: the unit test is single-threaded, so the mutex is a
- * no-op. Only the address is needed (&z->shpool->mutex). */
+ * no-op. Only the address is needed (&ngx_http_cache_turbo_zone_pool(z)->mutex). */
 typedef struct { int _unused; } ngx_shmtx_t;
 typedef struct { ngx_shmtx_t mutex; } ngx_slab_pool_t;
 
+/* P4-2-s3b: mirror of the stripe seam. autotune.c reaches sh/shpool only
+ * through ngx_http_cache_turbo_zone_sh()/_zone_pool(), so the shim has to
+ * carry the same stripes[]/nstripes shape those resolvers dereference, not a
+ * bare {sh, shpool} pair. nstripes is pinned at 1 here for the same reason it
+ * is in production: stripe_of()/zone_stripe() provably return &z->stripes[0]
+ * while NGX_HTTP_CACHE_TURBO_STRIPES == 1, so this is behaviour-identical to
+ * the pre-seam shim, not a new surface to keep in sync. */
 typedef struct {
     ngx_http_cache_turbo_shctx_t  *sh;
     ngx_slab_pool_t               *shpool;
+} ngx_http_cache_turbo_stripe_t;
+
+#define NGX_HTTP_CACHE_TURBO_STRIPES  1
+
+typedef struct {
+    ngx_http_cache_turbo_stripe_t  stripes[NGX_HTTP_CACHE_TURBO_STRIPES];
+    ngx_uint_t                     nstripes;
 } ngx_http_cache_turbo_zone_t;
+
+static inline ngx_http_cache_turbo_stripe_t *
+ngx_http_cache_turbo_zone_stripe(ngx_http_cache_turbo_zone_t *z)
+{
+    return &z->stripes[0];
+}
+
+#define ngx_http_cache_turbo_zone_pool(z)  (ngx_http_cache_turbo_zone_stripe(z)->shpool)
+#define ngx_http_cache_turbo_zone_sh(z)    (ngx_http_cache_turbo_zone_stripe(z)->sh)
+#define ngx_http_cache_turbo_zone_mutex(z) (&ngx_http_cache_turbo_zone_pool(z)->mutex)
 
 static inline void ngx_shmtx_lock(ngx_shmtx_t *m)   { (void) m; }
 static inline void ngx_shmtx_unlock(ngx_shmtx_t *m) { (void) m; }

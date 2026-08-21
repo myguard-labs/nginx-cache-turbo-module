@@ -73,7 +73,7 @@ ngx_http_cache_turbo_purge_auto_vary(ngx_http_request_t *r,
     ngx_http_cache_turbo_node_t  *m;
 
     ngx_http_cache_turbo_marker_hash(&ctx->cache_key, mk);
-    ngx_shmtx_lock(&z->shpool->mutex);
+    ngx_shmtx_lock(ngx_http_cache_turbo_zone_mutex(z));
     m = clcf->l1->lookup(z, mk, ngx_crc32_short(mk, 32));
     if (m != NULL && m->data != NULL
         && m->len >= NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE + 1)
@@ -90,7 +90,7 @@ ngx_http_cache_turbo_purge_auto_vary(ngx_http_request_t *r,
             mttl = (time_t) mh.fresh_ttl;
         }
     }
-    ngx_shmtx_unlock(&z->shpool->mutex);
+    ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
 
     if (clcf->backend && clcf->backend->purge_tag) {
         u_char                            vname[1 + 64];
@@ -142,8 +142,8 @@ ngx_http_cache_turbo_purge_auto_vary(ngx_http_request_t *r,
          * false "complete" is the defect this exists to catch, so the
          * asymmetry is the safe one. */
         tp->pending_at_launch =
-            (ngx_uint_t) ngx_atomic_fetch_add(&z->sh->varidx_drops, 0)
-            - (ngx_uint_t) ngx_atomic_fetch_add(&z->sh->varidx_reissues, 0);
+            (ngx_uint_t) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->varidx_drops, 0)
+            - (ngx_uint_t) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->varidx_reissues, 0);
         tp->tag.data = ngx_pnalloc(r->pool, vlen);
         if (tp->tag.data == NULL) {
             return NGX_OK;

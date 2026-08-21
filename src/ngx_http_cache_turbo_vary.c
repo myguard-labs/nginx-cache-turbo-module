@@ -828,7 +828,7 @@ ngx_http_cache_turbo_vary_apply(ngx_http_request_t *r,
          * breaker state machine at all. */
         if (clcf->vary_marker_revalidate > 0 && !ctx->vary_marker_l2_done
             && !(ngx_http_cache_turbo_breaker_should_consult(clcf)
-                 && ngx_http_cache_turbo_brk_state(z->sh->breaker_state)
+                 && ngx_http_cache_turbo_brk_state(ngx_http_cache_turbo_zone_sh(z)->breaker_state)
                         == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN))
         {
             time_t  age = ngx_time() - resolve_created;

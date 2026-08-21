@@ -28,8 +28,8 @@ ngx_http_cache_turbo_autotune_record_cost(ngx_http_cache_turbo_zone_t *z,
         ms = 0;
     }
 
-    (void) ngx_atomic_fetch_add(&z->sh->cost_sum_ms, (ngx_atomic_int_t) ms);
-    (void) ngx_atomic_fetch_add(&z->sh->cost_count, 1);
+    (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->cost_sum_ms, (ngx_atomic_int_t) ms);
+    (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->cost_count, 1);
 }
 
 
@@ -150,33 +150,33 @@ ngx_http_cache_turbo_autotune_recompute_locked(ngx_http_cache_turbo_zone_t *z)
     ngx_uint_t  hits, misses, refreshes, cost_sum, cost_count;
     ngx_int_t   verdict, load;
 
-    hits       = (ngx_uint_t) z->sh->hits;
-    misses     = (ngx_uint_t) z->sh->misses;
-    refreshes  = (ngx_uint_t) z->sh->refreshes;
-    cost_sum   = (ngx_uint_t) z->sh->cost_sum_ms;
-    cost_count = (ngx_uint_t) z->sh->cost_count;
+    hits       = (ngx_uint_t) ngx_http_cache_turbo_zone_sh(z)->hits;
+    misses     = (ngx_uint_t) ngx_http_cache_turbo_zone_sh(z)->misses;
+    refreshes  = (ngx_uint_t) ngx_http_cache_turbo_zone_sh(z)->refreshes;
+    cost_sum   = (ngx_uint_t) ngx_http_cache_turbo_zone_sh(z)->cost_sum_ms;
+    cost_count = (ngx_uint_t) ngx_http_cache_turbo_zone_sh(z)->cost_count;
 
     verdict = ngx_http_cache_turbo_autotune_verdict(
-                  hits       - (ngx_uint_t) z->sh->snap_hits,
-                  misses     - (ngx_uint_t) z->sh->snap_misses,
-                  refreshes  - (ngx_uint_t) z->sh->snap_refreshes,
-                  cost_sum   - (ngx_uint_t) z->sh->snap_cost_sum,
-                  cost_count - (ngx_uint_t) z->sh->snap_cost_count,
+                  hits       - (ngx_uint_t) ngx_http_cache_turbo_zone_sh(z)->snap_hits,
+                  misses     - (ngx_uint_t) ngx_http_cache_turbo_zone_sh(z)->snap_misses,
+                  refreshes  - (ngx_uint_t) ngx_http_cache_turbo_zone_sh(z)->snap_refreshes,
+                  cost_sum   - (ngx_uint_t) ngx_http_cache_turbo_zone_sh(z)->snap_cost_sum,
+                  cost_count - (ngx_uint_t) ngx_http_cache_turbo_zone_sh(z)->snap_cost_count,
                   &load);
 
-    z->sh->snap_hits       = hits;
-    z->sh->snap_misses     = misses;
-    z->sh->snap_refreshes  = refreshes;
-    z->sh->snap_cost_sum   = cost_sum;
-    z->sh->snap_cost_count = cost_count;
+    ngx_http_cache_turbo_zone_sh(z)->snap_hits       = hits;
+    ngx_http_cache_turbo_zone_sh(z)->snap_misses     = misses;
+    ngx_http_cache_turbo_zone_sh(z)->snap_refreshes  = refreshes;
+    ngx_http_cache_turbo_zone_sh(z)->snap_cost_sum   = cost_sum;
+    ngx_http_cache_turbo_zone_sh(z)->snap_cost_count = cost_count;
 
     /* >=0 publishes (0 = clear / fall back to preset); -1 keeps the last good
      * verdict (too little data this window to re-decide). beta and the v4-4 load
      * factor share that contract and are set together by the verdict, so the one
      * guard covers both. */
     if (verdict >= 0) {
-        z->sh->autotuned_beta = (ngx_atomic_t) verdict;
-        z->sh->autotuned_load = (ngx_atomic_t) load;
+        ngx_http_cache_turbo_zone_sh(z)->autotuned_beta = (ngx_atomic_t) verdict;
+        ngx_http_cache_turbo_zone_sh(z)->autotuned_load = (ngx_atomic_t) load;
     }
 }
 
@@ -195,30 +195,30 @@ ngx_http_cache_turbo_autotune_maybe(ngx_http_cache_turbo_zone_t *z,
 
     /* Fast path: not due yet. Unlocked read of autotune_next — a benign race only
      * risks two workers recomputing on the same tick, which is idempotent. */
-    if ((time_t) z->sh->autotune_next > now) {
+    if ((time_t) ngx_http_cache_turbo_zone_sh(z)->autotune_next > now) {
         return;
     }
 
-    ngx_shmtx_lock(&z->shpool->mutex);
+    ngx_shmtx_lock(ngx_http_cache_turbo_zone_mutex(z));
 
     /* Re-check under the lock and claim the slot, so one worker recomputes per
      * interval rather than every worker that raced past the unlocked check. */
-    if ((time_t) z->sh->autotune_next > now) {
-        ngx_shmtx_unlock(&z->shpool->mutex);
+    if ((time_t) ngx_http_cache_turbo_zone_sh(z)->autotune_next > now) {
+        ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
         return;
     }
-    z->sh->autotune_next = (ngx_atomic_t) (now + interval);
+    ngx_http_cache_turbo_zone_sh(z)->autotune_next = (ngx_atomic_t) (now + interval);
 
     ngx_http_cache_turbo_autotune_recompute_locked(z);
 
-    ngx_shmtx_unlock(&z->shpool->mutex);
+    ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
 }
 
 
 void
 ngx_http_cache_turbo_autotune_force(ngx_http_cache_turbo_zone_t *z)
 {
-    ngx_shmtx_lock(&z->shpool->mutex);
+    ngx_shmtx_lock(ngx_http_cache_turbo_zone_mutex(z));
     ngx_http_cache_turbo_autotune_recompute_locked(z);
-    ngx_shmtx_unlock(&z->shpool->mutex);
+    ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
 }

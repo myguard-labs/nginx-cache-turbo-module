@@ -1,4 +1,4 @@
-# sync-sha: 83f50441ef7ba902405ecf76651362b01eeb6dc5e07ee30b74178557c9bcc315
+# sync-sha: 1eeed00e72697232723a179e39ab6a18b24a54de71ea5a705441cbdbce43fd86
 name: Lint
 
 # The same ci/linter/ scripts a developer runs locally, run again on the PR --
@@ -87,5 +87,5 @@ jobs:
           # `sed -n 's/^ *LINT_ONLY: *//p'`, so wrapping it in a folded scalar
           # (`>-`) makes that parser read the literal ">-" and report EVERY
           # checker as missing. Rewrap only by teaching selftest.sh to parse YAML.
-          LINT_ONLY: nginx astgrep sh python perl yaml spelling ci-runners ci-ports ci-cadence ci-secrets sync-stamp docs-drift shm-lock suite-docs
+          LINT_ONLY: nginx astgrep sh python perl yaml spelling ci-runners ci-ports ci-cadence ci-secrets sync-stamp docs-drift shm-lock stripe-seam suite-docs
         run: ci/linter/run-all.sh

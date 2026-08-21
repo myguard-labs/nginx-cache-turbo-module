@@ -87,107 +87,117 @@ ngx_http_cache_turbo_rbtree_insert_value(ngx_rbtree_node_t *temp,
 ngx_int_t
 ngx_http_cache_turbo_shm_init_zone(ngx_shm_zone_t *shm_zone, void *data)
 {
-    ngx_http_cache_turbo_zone_t  *octx = data;
-    ngx_http_cache_turbo_zone_t  *ctx;
+    ngx_http_cache_turbo_zone_t    *octx = data;
+    ngx_http_cache_turbo_zone_t    *ctx;
+    ngx_http_cache_turbo_stripe_t  *st;
 
     ctx = shm_zone->data;
 
+    /* P4-2-s3b: publish the live stripe count BEFORE anything resolves a
+     * stripe. ngx_http_cache_turbo_stripe_of() reads this field, and a zone
+     * left at 0 would take its `nstripes <= 1` fail-safe branch rather than
+     * the modulo -- correct, but only by accident. Set on the reload path too:
+     * ctx is a FRESH cf->pool allocation on every cycle (only the shm contents
+     * are inherited), so a reused zone arrives here with a zeroed array. */
+    ctx->nstripes = NGX_HTTP_CACHE_TURBO_STRIPES;
+
+    st = ngx_http_cache_turbo_zone_stripe(ctx);
+
     if (octx) {
         /* reused zone after reload: inherit the live shm */
-        ctx->sh = octx->sh;
-        ctx->shpool = octx->shpool;
+        *st = *ngx_http_cache_turbo_zone_stripe(octx);
         return NGX_OK;
     }
 
-    ctx->shpool = (ngx_slab_pool_t *) shm_zone->shm.addr;
+    st->shpool = (ngx_slab_pool_t *) shm_zone->shm.addr;
 
     if (shm_zone->shm.exists) {
-        ctx->sh = ctx->shpool->data;
+        st->sh = st->shpool->data;
         return NGX_OK;
     }
 
-    ctx->sh = ngx_slab_alloc(ctx->shpool,
-                             sizeof(ngx_http_cache_turbo_shctx_t));
-    if (ctx->sh == NULL) {
+    st->sh = ngx_slab_alloc(st->shpool,
+                            sizeof(ngx_http_cache_turbo_shctx_t));
+    if (st->sh == NULL) {
         return NGX_ERROR;
     }
 
-    ctx->shpool->data = ctx->sh;
+    st->shpool->data = st->sh;
 
-    ngx_rbtree_init(&ctx->sh->rbtree, &ctx->sh->sentinel,
+    ngx_rbtree_init(&st->sh->rbtree, &st->sh->sentinel,
                     ngx_http_cache_turbo_rbtree_insert_value);
-    ngx_queue_init(&ctx->sh->lru);
+    ngx_queue_init(&st->sh->lru);
 
     /* S8: the protected queue MUST be initialised even when scan resistance is
      * off. ngx_queue_empty() on a zeroed head reads h == h->prev as false
      * against NULL, so an uninitialised head would make evict_one() believe it
      * had a protected victim and walk a null sentinel. */
-    ngx_queue_init(&ctx->sh->lru_protected);
-    ctx->sh->n_protected = 0;
-    ctx->sh->n_entries = 0;
+    ngx_queue_init(&st->sh->lru_protected);
+    st->sh->n_protected = 0;
+    st->sh->n_entries = 0;
 
-    ctx->sh->hits = 0;
-    ctx->sh->misses = 0;
-    ctx->sh->stale_serves = 0;
-    ctx->sh->refreshes = 0;
-    ctx->sh->evictions = 0;
-    ctx->sh->l2_hits = 0;
-    ctx->sh->l2_misses = 0;
-    ctx->sh->lock_waits = 0;
-    ctx->sh->min_uses_skips = 0;
-    ctx->sh->l2_neg_skips = 0;
-    ctx->sh->bypasses = 0;
-    ctx->sh->refuse_set_cookie = 0;
-    ctx->sh->refuse_encoded = 0;
-    ctx->sh->refuse_vary_unsafe = 0;
-    ctx->sh->refuse_authorization = 0;
-    ctx->sh->refuse_cache_control = 0;
-    ctx->sh->refuse_require_header = 0;
-    ctx->sh->refuse_partial = 0;
-    ctx->sh->refuse_head = 0;
+    st->sh->hits = 0;
+    st->sh->misses = 0;
+    st->sh->stale_serves = 0;
+    st->sh->refreshes = 0;
+    st->sh->evictions = 0;
+    st->sh->l2_hits = 0;
+    st->sh->l2_misses = 0;
+    st->sh->lock_waits = 0;
+    st->sh->min_uses_skips = 0;
+    st->sh->l2_neg_skips = 0;
+    st->sh->bypasses = 0;
+    st->sh->refuse_set_cookie = 0;
+    st->sh->refuse_encoded = 0;
+    st->sh->refuse_vary_unsafe = 0;
+    st->sh->refuse_authorization = 0;
+    st->sh->refuse_cache_control = 0;
+    st->sh->refuse_require_header = 0;
+    st->sh->refuse_partial = 0;
+    st->sh->refuse_head = 0;
 
     /* Autotune state (v4-3): everything zeroed. autotune_next = 0 makes the first
      * recompute fire immediately; the snapshots being 0 means the first window is
      * "since worker start". autotuned_beta = 0 means "no verdict → use preset". */
-    ctx->sh->cost_sum_ms = 0;
-    ctx->sh->cost_count = 0;
-    ctx->sh->autotuned_beta = 0;
-    ctx->sh->autotuned_load = 0;   /* v4-4: 0 = baseline (no stale/lock widen) */
-    ctx->sh->autotune_next = 0;
-    ctx->sh->snap_hits = 0;
-    ctx->sh->snap_misses = 0;
-    ctx->sh->snap_refreshes = 0;
-    ctx->sh->snap_cost_sum = 0;
-    ctx->sh->snap_cost_count = 0;
+    st->sh->cost_sum_ms = 0;
+    st->sh->cost_count = 0;
+    st->sh->autotuned_beta = 0;
+    st->sh->autotuned_load = 0;   /* v4-4: 0 = baseline (no stale/lock widen) */
+    st->sh->autotune_next = 0;
+    st->sh->snap_hits = 0;
+    st->sh->snap_misses = 0;
+    st->sh->snap_refreshes = 0;
+    st->sh->snap_cost_sum = 0;
+    st->sh->snap_cost_count = 0;
 
     /* P6/O4.1 breaker: a fresh zone starts CLOSED, i.e. NOT tripped, so traffic
      * flows to the origin exactly as if the feature were off. Explicit rather
      * than relying on CLOSED == 0, because this is the fail-safe direction and
      * a reader should not have to know the constant's value to see that. */
-    ctx->sh->breaker_state = NGX_HTTP_CACHE_TURBO_BREAKER_CLOSED;
-    ctx->sh->breaker_fails = 0;
-    ctx->sh->breaker_window_start = 0;
-    ctx->sh->breaker_opened_at = 0;
+    st->sh->breaker_state = NGX_HTTP_CACHE_TURBO_BREAKER_CLOSED;
+    st->sh->breaker_fails = 0;
+    st->sh->breaker_window_start = 0;
+    st->sh->breaker_opened_at = 0;
     /* O4.4-h: the packed probe word. Generation 0 is NO_PROBE, so a zeroed word
      * reads "no lease held" whatever the stamp bits say -- the fail-safe
      * direction, and the reason the old `stamp != 0` guard is gone. */
-    ctx->sh->breaker_probe = 0;
+    st->sh->breaker_probe = 0;
 
     /* O4.4-h: anchor for the probe word's RELATIVE stamp. Set once here; a
      * reload deliberately inherits the live shm (see the field block), so it
      * keeps the anchor an in-flight lease was stamped against. */
-    ctx->sh->breaker_epoch = (ngx_atomic_t) ngx_time();
-    ctx->sh->breaker_opens = 0;
+    st->sh->breaker_epoch = (ngx_atomic_t) ngx_time();
+    st->sh->breaker_opens = 0;
 
     /* S7.1: production observability counters. */
-    ctx->sh->sie_serves = 0;
-    ctx->sh->breaker_serves = 0;
-    ctx->sh->origin_failures = 0;
+    st->sh->sie_serves = 0;
+    st->sh->breaker_serves = 0;
+    st->sh->origin_failures = 0;
 
     /* COR-5(b)/L9: store-time index-drop counters. */
-    ctx->sh->varidx_drops = 0;
-    ctx->sh->varidx_reissues = 0;
-    ctx->sh->tag_index_drops = 0;
+    st->sh->varidx_drops = 0;
+    st->sh->varidx_reissues = 0;
+    st->sh->tag_index_drops = 0;
 
     /* P4-1a: allocate the W-TinyLFU frequency sketch.
      *
@@ -209,25 +219,25 @@ ngx_http_cache_turbo_shm_init_zone(ngx_shm_zone_t *shm_zone, void *data)
      * zone comes up normally: the estimate is unavailable, which stage 2 must
      * read as "no evidence", never as a reason to refuse an admission. A
      * frequency hint is not worth failing zone init over. */
-    ctx->sh->sketch = NULL;
-    ctx->sh->sketch_width = 0;
-    ctx->sh->sketch_ops = 0;
-    ctx->sh->sketch_reset_at = 0;
-    ctx->sh->sketch_gen = 0;
+    st->sh->sketch = NULL;
+    st->sh->sketch_width = 0;
+    st->sh->sketch_ops = 0;
+    st->sh->sketch_reset_at = 0;
+    st->sh->sketch_gen = 0;
 
     /* P4-1b: admission policy mirror + observability counters. The policy is
      * OFF unless the zone directive asked for it; ctx->admission was parsed
      * at config time (cache_turbo_zone ... admission=on). */
-    ctx->sh->admission = ctx->admission;
-    ctx->sh->sketch_bumps = 0;
-    ctx->sh->admission_refused = 0;
+    st->sh->admission = ctx->admission;
+    st->sh->sketch_bumps = 0;
+    st->sh->admission_refused = 0;
 
     /* P4-2-s3a: live used-bytes gauge. Starts at 0 -- the sketch allocation
      * below is deliberately NOT charged: it is a fixed per-zone overhead
      * allocated once at init and never freed, not cached payload+metadata, and
      * including it would put a constant floor under the gauge that no eviction
      * or purge can ever return to baseline. */
-    ctx->sh->used_bytes = 0;
+    st->sh->used_bytes = 0;
 
     {
         ngx_uint_t  width, w, bytes;
@@ -253,16 +263,16 @@ ngx_http_cache_turbo_shm_init_zone(ngx_shm_zone_t *shm_zone, void *data)
 
         bytes = width * NGX_HTTP_CACHE_TURBO_SKETCH_ROWS / 2;
 
-        ctx->sh->sketch = ngx_slab_calloc(ctx->shpool, bytes);
+        st->sh->sketch = ngx_slab_calloc(st->shpool, bytes);
 
-        if (ctx->sh->sketch != NULL) {
-            ctx->sh->sketch_width = width;
-            ctx->sh->sketch_reset_at =
+        if (st->sh->sketch != NULL) {
+            st->sh->sketch_width = width;
+            st->sh->sketch_reset_at =
                 width * NGX_HTTP_CACHE_TURBO_SKETCH_SAMPLE;
         }
     }
 
-    ctx->shpool->log_nomem = 0;
+    st->shpool->log_nomem = 0;
 
     return NGX_OK;
 }
@@ -276,8 +286,8 @@ ngx_http_cache_turbo_shm_lookup(ngx_http_cache_turbo_zone_t *z,
     ngx_rbtree_node_t            *node, *sentinel;
     ngx_http_cache_turbo_node_t  *ctn;
 
-    node = z->sh->rbtree.root;
-    sentinel = z->sh->rbtree.sentinel;
+    node = ngx_http_cache_turbo_zone_sh(z)->rbtree.root;
+    sentinel = ngx_http_cache_turbo_zone_sh(z)->rbtree.sentinel;
 
     while (node != sentinel) {
 
@@ -374,12 +384,12 @@ ngx_http_cache_turbo_blob_release(ngx_http_cache_turbo_zone_t *z, u_char *data)
 {
     ngx_http_cache_turbo_blobref_t  *ref = CT_BLOBREF(data);
 
-    ngx_shmtx_lock(&z->shpool->mutex);
+    ngx_shmtx_lock(ngx_http_cache_turbo_zone_mutex(z));
     ref->refs--;
     if (ref->refs == 0 && ref->detached) {
         ngx_http_cache_turbo_shm_free_locked(z, ref, ref->bytes);
     }
-    ngx_shmtx_unlock(&z->shpool->mutex);
+    ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
 }
 
 
@@ -457,16 +467,16 @@ static void
 ngx_http_cache_turbo_sketch_halve(ngx_http_cache_turbo_zone_t *z)
 {
     ngx_uint_t  i, bytes;
-    u_char     *sketch = z->sh->sketch;
+    u_char     *sketch = ngx_http_cache_turbo_zone_sh(z)->sketch;
 
-    bytes = z->sh->sketch_width * NGX_HTTP_CACHE_TURBO_SKETCH_ROWS / 2;
+    bytes = ngx_http_cache_turbo_zone_sh(z)->sketch_width * NGX_HTTP_CACHE_TURBO_SKETCH_ROWS / 2;
 
     for (i = 0; i < bytes; i++) {
         sketch[i] = (u_char) ((sketch[i] >> 1) & 0x77);
     }
 
-    z->sh->sketch_ops = 0;
-    z->sh->sketch_gen++;
+    ngx_http_cache_turbo_zone_sh(z)->sketch_ops = 0;
+    ngx_http_cache_turbo_zone_sh(z)->sketch_gen++;
 }
 
 
@@ -483,24 +493,24 @@ ngx_http_cache_turbo_shm_sketch_bump(ngx_http_cache_turbo_zone_t *z,
 {
     ngx_uint_t  row, idx, width;
 
-    if (z->sh->sketch == NULL) {
+    if (ngx_http_cache_turbo_zone_sh(z)->sketch == NULL) {
         return;
     }
 
-    width = z->sh->sketch_width;
+    width = ngx_http_cache_turbo_zone_sh(z)->sketch_width;
 
     for (row = 0; row < NGX_HTTP_CACHE_TURBO_SKETCH_ROWS; row++) {
         idx = row * width
               + (ngx_http_cache_turbo_sketch_row_hash(hash, row) & (width - 1));
 
-        ngx_http_cache_turbo_sketch_inc(z->sh->sketch, idx);
+        ngx_http_cache_turbo_sketch_inc(ngx_http_cache_turbo_zone_sh(z)->sketch, idx);
     }
 
-    z->sh->sketch_bumps++;   /* P4-1b: lifetime tally, never reset by halving */
+    ngx_http_cache_turbo_zone_sh(z)->sketch_bumps++;   /* P4-1b: lifetime tally, never reset by halving */
 
     /* Age on the BUMP count, not on wall-clock time: a quiet zone should not
      * forget what it learned just because an hour passed with no traffic. */
-    if (++z->sh->sketch_ops >= z->sh->sketch_reset_at) {
+    if (++ngx_http_cache_turbo_zone_sh(z)->sketch_ops >= ngx_http_cache_turbo_zone_sh(z)->sketch_reset_at) {
         ngx_http_cache_turbo_sketch_halve(z);
     }
 }
@@ -521,18 +531,18 @@ ngx_http_cache_turbo_shm_sketch_estimate(ngx_http_cache_turbo_zone_t *z,
 {
     ngx_uint_t  row, idx, v, min, width;
 
-    if (z->sh->sketch == NULL) {
+    if (ngx_http_cache_turbo_zone_sh(z)->sketch == NULL) {
         return 0;
     }
 
-    width = z->sh->sketch_width;
+    width = ngx_http_cache_turbo_zone_sh(z)->sketch_width;
     min = NGX_HTTP_CACHE_TURBO_SKETCH_MAX;
 
     for (row = 0; row < NGX_HTTP_CACHE_TURBO_SKETCH_ROWS; row++) {
         idx = row * width
               + (ngx_http_cache_turbo_sketch_row_hash(hash, row) & (width - 1));
 
-        v = ngx_http_cache_turbo_sketch_get(z->sh->sketch, idx);
+        v = ngx_http_cache_turbo_sketch_get(ngx_http_cache_turbo_zone_sh(z)->sketch, idx);
 
         if (v < min) {
             min = v;
@@ -560,11 +570,11 @@ ngx_http_cache_turbo_lru_link_head(ngx_http_cache_turbo_zone_t *z,
     ngx_http_cache_turbo_node_t *ctn)
 {
     if (ctn->seg == NGX_HTTP_CACHE_TURBO_SEG_PROTECTED) {
-        ngx_queue_insert_head(&z->sh->lru_protected, &ctn->lru);
-        z->sh->n_protected++;
+        ngx_queue_insert_head(&ngx_http_cache_turbo_zone_sh(z)->lru_protected, &ctn->lru);
+        ngx_http_cache_turbo_zone_sh(z)->n_protected++;
 
     } else {
-        ngx_queue_insert_head(&z->sh->lru, &ctn->lru);
+        ngx_queue_insert_head(&ngx_http_cache_turbo_zone_sh(z)->lru, &ctn->lru);
     }
 }
 
@@ -578,7 +588,7 @@ ngx_http_cache_turbo_lru_unlink(ngx_http_cache_turbo_zone_t *z,
     ngx_queue_remove(&ctn->lru);
 
     if (ctn->seg == NGX_HTTP_CACHE_TURBO_SEG_PROTECTED) {
-        z->sh->n_protected--;
+        ngx_http_cache_turbo_zone_sh(z)->n_protected--;
     }
 }
 
@@ -602,8 +612,8 @@ ngx_http_cache_turbo_lru_insert_new(ngx_http_cache_turbo_zone_t *z,
      * four funnel through this function, exactly like `seg` above. */
     ctn->sie_spared = 0;
 
-    ngx_queue_insert_head(&z->sh->lru, &ctn->lru);
-    z->sh->n_entries++;
+    ngx_queue_insert_head(&ngx_http_cache_turbo_zone_sh(z)->lru, &ctn->lru);
+    ngx_http_cache_turbo_zone_sh(z)->n_entries++;
 }
 
 
@@ -646,7 +656,7 @@ ngx_http_cache_turbo_lru_enforce_cap(ngx_http_cache_turbo_zone_t *z,
      * churning the queues forever and never actually protecting anything. The
      * floor guarantees a non-empty zone can always protect at least one entry,
      * which is what makes the segment meaningful on small zones. */
-    cap = (z->sh->n_entries * protected_pct + 99) / 100;
+    cap = (ngx_http_cache_turbo_zone_sh(z)->n_entries * protected_pct + 99) / 100;
 
     if (cap == 0) {
         cap = 1;
@@ -654,13 +664,13 @@ ngx_http_cache_turbo_lru_enforce_cap(ngx_http_cache_turbo_zone_t *z,
 
     demoted = 0;
 
-    while (z->sh->n_protected > cap
-           && !ngx_queue_empty(&z->sh->lru_protected)
+    while (ngx_http_cache_turbo_zone_sh(z)->n_protected > cap
+           && !ngx_queue_empty(&ngx_http_cache_turbo_zone_sh(z)->lru_protected)
            && demoted < NGX_HTTP_CACHE_TURBO_LRU_CAP_MAX_EVICT)
     {
         demoted++;
 
-        q = ngx_queue_last(&z->sh->lru_protected);
+        q = ngx_queue_last(&ngx_http_cache_turbo_zone_sh(z)->lru_protected);
         victim = ngx_queue_data(q, ngx_http_cache_turbo_node_t, lru);
 
         ngx_http_cache_turbo_lru_unlink(z, victim);
@@ -864,15 +874,15 @@ ngx_http_cache_turbo_shm_admit(ngx_http_cache_turbo_zone_t *z, uint32_t hash)
     ngx_http_cache_turbo_node_t  *victim;
     ngx_uint_t                    cand_freq, victim_freq;
 
-    if (!z->sh->admission) {
+    if (!ngx_http_cache_turbo_zone_sh(z)->admission) {
         return 1;                    /* policy off: the shipped default */
     }
 
-    if (z->sh->sketch == NULL) {
+    if (ngx_http_cache_turbo_zone_sh(z)->sketch == NULL) {
         return 1;                    /* no evidence is never a reason to refuse */
     }
 
-    if (ngx_queue_empty(&z->sh->lru)) {
+    if (ngx_queue_empty(&ngx_http_cache_turbo_zone_sh(z)->lru)) {
         /* No probation victim. Deliberately NOT falling through to the
          * protected tail: refusing a candidate on behalf of an entry that has
          * already proven itself twice would make an all-protected zone
@@ -881,7 +891,7 @@ ngx_http_cache_turbo_shm_admit(ngx_http_cache_turbo_zone_t *z, uint32_t hash)
         return 1;
     }
 
-    q = ngx_queue_last(&z->sh->lru);
+    q = ngx_queue_last(&ngx_http_cache_turbo_zone_sh(z)->lru);
     victim = ngx_queue_data(q, ngx_http_cache_turbo_node_t, lru);
 
     cand_freq   = ngx_http_cache_turbo_shm_sketch_estimate(z, hash);
@@ -889,7 +899,7 @@ ngx_http_cache_turbo_shm_admit(ngx_http_cache_turbo_zone_t *z, uint32_t hash)
                       (uint32_t) victim->node.key);
 
     if (cand_freq < victim_freq) {
-        z->sh->admission_refused++;
+        ngx_http_cache_turbo_zone_sh(z)->admission_refused++;
         return 0;
     }
 
@@ -945,7 +955,7 @@ ngx_http_cache_turbo_shm_evict_one(ngx_http_cache_turbo_zone_t *z)
     time_t                        now;
     ngx_uint_t                    i;
 
-    breaker_open = ngx_http_cache_turbo_brk_state(z->sh->breaker_state)
+    breaker_open = ngx_http_cache_turbo_brk_state(ngx_http_cache_turbo_zone_sh(z)->breaker_state)
                    == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN;
     now = ngx_time();
 
@@ -956,8 +966,8 @@ ngx_http_cache_turbo_shm_evict_one(ngx_http_cache_turbo_zone_t *z)
      * visited at most twice total across the whole function (once to spare
      * it, once more to take it on a LATER call) -- so this always
      * terminates, satisfying the same contract the caller relies on. */
-    queues[0] = &z->sh->lru;
-    queues[1] = &z->sh->lru_protected;
+    queues[0] = &ngx_http_cache_turbo_zone_sh(z)->lru;
+    queues[1] = &ngx_http_cache_turbo_zone_sh(z)->lru_protected;
 
     for (i = 0; i < 2; i++) {
         head = queues[i];
@@ -995,8 +1005,8 @@ ngx_http_cache_turbo_shm_evict_one(ngx_http_cache_turbo_zone_t *z)
             /* Evictable: not SIE-live, breaker CLOSED/HALF_OPEN, or already
              * spared once before. */
             ngx_http_cache_turbo_lru_unlink(z, ctn);
-            z->sh->n_entries--;
-            ngx_rbtree_delete(&z->sh->rbtree, &ctn->node);
+            ngx_http_cache_turbo_zone_sh(z)->n_entries--;
+            ngx_rbtree_delete(&ngx_http_cache_turbo_zone_sh(z)->rbtree, &ctn->node);
 
             if (ctn->data) {
                 ngx_http_cache_turbo_blob_node_release(z, ctn->data);
@@ -1004,7 +1014,7 @@ ngx_http_cache_turbo_shm_evict_one(ngx_http_cache_turbo_zone_t *z)
             ngx_http_cache_turbo_shm_free_locked(z, ctn,
                 sizeof(ngx_http_cache_turbo_node_t));
 
-            (void) ngx_atomic_fetch_add(&z->sh->evictions, 1);
+            (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->evictions, 1);
             return 1;
         }
 
@@ -1014,8 +1024,8 @@ ngx_http_cache_turbo_shm_evict_one(ngx_http_cache_turbo_zone_t *z)
         ctn = ngx_queue_data(fallback, ngx_http_cache_turbo_node_t, lru);
 
         ngx_http_cache_turbo_lru_unlink(z, ctn);
-        z->sh->n_entries--;
-        ngx_rbtree_delete(&z->sh->rbtree, &ctn->node);
+        ngx_http_cache_turbo_zone_sh(z)->n_entries--;
+        ngx_rbtree_delete(&ngx_http_cache_turbo_zone_sh(z)->rbtree, &ctn->node);
 
         if (ctn->data) {
             ngx_http_cache_turbo_blob_node_release(z, ctn->data);
@@ -1023,7 +1033,7 @@ ngx_http_cache_turbo_shm_evict_one(ngx_http_cache_turbo_zone_t *z)
         ngx_http_cache_turbo_shm_free_locked(z, ctn,
             sizeof(ngx_http_cache_turbo_node_t));
 
-        (void) ngx_atomic_fetch_add(&z->sh->evictions, 1);
+        (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->evictions, 1);
         return 1;
     }
 
@@ -1040,10 +1050,10 @@ ngx_http_cache_turbo_shm_evict_one(ngx_http_cache_turbo_zone_t *z)
 static void *
 ngx_http_cache_turbo_shm_alloc_evict(ngx_http_cache_turbo_zone_t *z, size_t size)
 {
-    void  *p = ngx_slab_alloc_locked(z->shpool, size);
+    void  *p = ngx_slab_alloc_locked(ngx_http_cache_turbo_zone_pool(z), size);
 
     while (p == NULL && ngx_http_cache_turbo_shm_evict_one(z)) {
-        p = ngx_slab_alloc_locked(z->shpool, size);
+        p = ngx_slab_alloc_locked(ngx_http_cache_turbo_zone_pool(z), size);
     }
 
     /* P4-2-s3a: this is the SOLE allocation funnel for cached payload+metadata
@@ -1053,7 +1063,7 @@ ngx_http_cache_turbo_shm_alloc_evict(ngx_http_cache_turbo_zone_t *z, size_t size
      * structural rather than a per-site audit. Caller holds the shpool mutex,
      * same as every other z->sh field that is not an atomic. */
     if (p != NULL) {
-        z->sh->used_bytes += size;
+        ngx_http_cache_turbo_zone_sh(z)->used_bytes += size;
     }
 
     return p;
@@ -1070,18 +1080,18 @@ static void
 ngx_http_cache_turbo_shm_free_locked(ngx_http_cache_turbo_zone_t *z, void *p,
     size_t size)
 {
-    if (z->sh->used_bytes >= size) {
-        z->sh->used_bytes -= size;
+    if (ngx_http_cache_turbo_zone_sh(z)->used_bytes >= size) {
+        ngx_http_cache_turbo_zone_sh(z)->used_bytes -= size;
 
     } else {
         ngx_log_error(NGX_LOG_ALERT, ngx_cycle->log, 0,
                       "cache_turbo: used_bytes underflow "
                       "(have %uz, discharging %uz) -- charge/discharge pairing "
-                      "bug", (size_t) z->sh->used_bytes, size);
-        z->sh->used_bytes = 0;
+                      "bug", (size_t) ngx_http_cache_turbo_zone_sh(z)->used_bytes, size);
+        ngx_http_cache_turbo_zone_sh(z)->used_bytes = 0;
     }
 
-    ngx_slab_free_locked(z->shpool, p);
+    ngx_slab_free_locked(ngx_http_cache_turbo_zone_pool(z), p);
 }
 
 
@@ -1092,8 +1102,8 @@ ngx_http_cache_turbo_shm_drop_locked(ngx_http_cache_turbo_zone_t *z,
     ngx_http_cache_turbo_node_t *ctn)
 {
     ngx_http_cache_turbo_lru_unlink(z, ctn);
-    z->sh->n_entries--;
-    ngx_rbtree_delete(&z->sh->rbtree, &ctn->node);
+    ngx_http_cache_turbo_zone_sh(z)->n_entries--;
+    ngx_rbtree_delete(&ngx_http_cache_turbo_zone_sh(z)->rbtree, &ctn->node);
     if (ctn->data) {
         ngx_http_cache_turbo_blob_node_release(z, ctn->data);
     }
@@ -1108,14 +1118,14 @@ ngx_http_cache_turbo_shm_purge_key(ngx_http_cache_turbo_zone_t *z,
 {
     ngx_http_cache_turbo_node_t  *ctn;
 
-    ngx_shmtx_lock(&z->shpool->mutex);
+    ngx_shmtx_lock(ngx_http_cache_turbo_zone_mutex(z));
     ctn = ngx_http_cache_turbo_shm_lookup(z, key_hash, hash);
     if (ctn == NULL) {
-        ngx_shmtx_unlock(&z->shpool->mutex);
+        ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
         return 0;
     }
     ngx_http_cache_turbo_shm_drop_locked(z, ctn);
-    ngx_shmtx_unlock(&z->shpool->mutex);
+    ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
     return 1;
 }
 
@@ -1136,7 +1146,7 @@ ngx_http_cache_turbo_shm_purge_all(ngx_http_cache_turbo_zone_t *z)
     ngx_http_cache_turbo_node_t  *ctn;
 
     for ( ;; ) {
-        ngx_shmtx_lock(&z->shpool->mutex);
+        ngx_shmtx_lock(ngx_http_cache_turbo_zone_mutex(z));
 
         batch = 0;
 
@@ -1147,25 +1157,25 @@ ngx_http_cache_turbo_shm_purge_all(ngx_http_cache_turbo_zone_t *z)
          * so the mutex is still released every PURGE_BATCH drops however the
          * entries are distributed. */
         while (batch < NGX_HTTP_CACHE_TURBO_PURGE_BATCH
-               && !ngx_queue_empty(&z->sh->lru))
+               && !ngx_queue_empty(&ngx_http_cache_turbo_zone_sh(z)->lru))
         {
-            q = ngx_queue_head(&z->sh->lru);
+            q = ngx_queue_head(&ngx_http_cache_turbo_zone_sh(z)->lru);
             ctn = ngx_queue_data(q, ngx_http_cache_turbo_node_t, lru);
             ngx_http_cache_turbo_shm_drop_locked(z, ctn);
             batch++;
         }
 
         while (batch < NGX_HTTP_CACHE_TURBO_PURGE_BATCH
-               && !ngx_queue_empty(&z->sh->lru_protected))
+               && !ngx_queue_empty(&ngx_http_cache_turbo_zone_sh(z)->lru_protected))
         {
-            q = ngx_queue_head(&z->sh->lru_protected);
+            q = ngx_queue_head(&ngx_http_cache_turbo_zone_sh(z)->lru_protected);
             ctn = ngx_queue_data(q, ngx_http_cache_turbo_node_t, lru);
             ngx_http_cache_turbo_shm_drop_locked(z, ctn);
             batch++;
         }
 
         n += batch;
-        ngx_shmtx_unlock(&z->shpool->mutex);
+        ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
 
         /* Drained, or this batch hit the cap with more to go: loop and let any
          * waiter take the mutex before we grab the next batch. */
@@ -1320,7 +1330,7 @@ ngx_http_cache_turbo_shm_store_locked(ngx_http_cache_turbo_zone_t *z,
     ctn->last_access = now;      /* P1: fresh at LRU head */
     ctn->promotable = 0;         /* S8: unproven; second touch promotes */
 
-    ngx_rbtree_insert(&z->sh->rbtree, &ctn->node);
+    ngx_rbtree_insert(&ngx_http_cache_turbo_zone_sh(z)->rbtree, &ctn->node);
     /* S8: every new node enters PROBATION (see lru_insert_new). */
     ngx_http_cache_turbo_lru_insert_new(z, ctn);
 
@@ -1335,10 +1345,10 @@ ngx_http_cache_turbo_shm_store(ngx_http_cache_turbo_zone_t *z,
 {
     ngx_int_t  rc;
 
-    ngx_shmtx_lock(&z->shpool->mutex);
+    ngx_shmtx_lock(ngx_http_cache_turbo_zone_mutex(z));
     rc = ngx_http_cache_turbo_shm_store_locked(z, key_hash, hash, data, len,
                                                 fresh_ttl, stale_ttl);
-    ngx_shmtx_unlock(&z->shpool->mutex);
+    ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
 
     return rc;
 }
@@ -1358,7 +1368,7 @@ ngx_http_cache_turbo_shm_store_if(ngx_http_cache_turbo_zone_t *z,
     ngx_uint_t                    refuse;
     ngx_http_cache_turbo_node_t  *ctn;
 
-    ngx_shmtx_lock(&z->shpool->mutex);
+    ngx_shmtx_lock(ngx_http_cache_turbo_zone_mutex(z));
 
     now = ngx_time();
     ctn = ngx_http_cache_turbo_shm_lookup(z, key_hash, hash);
@@ -1403,13 +1413,13 @@ ngx_http_cache_turbo_shm_store_if(ngx_http_cache_turbo_zone_t *z,
     }
 
     if (refuse) {
-        ngx_shmtx_unlock(&z->shpool->mutex);
+        ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
         return NGX_DECLINED;
     }
 
     rc = ngx_http_cache_turbo_shm_store_locked(z, key_hash, hash, data, len,
                                                 fresh_ttl, stale_ttl);
-    ngx_shmtx_unlock(&z->shpool->mutex);
+    ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
 
     return rc;
 }
@@ -1454,7 +1464,7 @@ ngx_http_cache_turbo_shm_freshen(ngx_http_cache_turbo_zone_t *z,
     time_t                        now;
     ngx_http_cache_turbo_node_t  *ctn;
 
-    ngx_shmtx_lock(&z->shpool->mutex);
+    ngx_shmtx_lock(ngx_http_cache_turbo_zone_mutex(z));
 
     ctn = ngx_http_cache_turbo_shm_lookup(z, key_hash, hash);
 
@@ -1462,7 +1472,7 @@ ngx_http_cache_turbo_shm_freshen(ngx_http_cache_turbo_zone_t *z,
         || ctn->kind != NGX_HTTP_CACHE_TURBO_NODE_ENTRY
         || ctn->len == 0)
     {
-        ngx_shmtx_unlock(&z->shpool->mutex);
+        ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
         return NGX_DECLINED;
     }
 
@@ -1475,7 +1485,7 @@ ngx_http_cache_turbo_shm_freshen(ngx_http_cache_turbo_zone_t *z,
     ctn->refresh_owner = 0;
     ctn->last_access = now;
 
-    ngx_shmtx_unlock(&z->shpool->mutex);
+    ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
 
     return NGX_OK;
 }
@@ -1487,66 +1497,66 @@ ngx_http_cache_turbo_shm_stats(ngx_http_cache_turbo_zone_t *z,
 {
     ngx_atomic_uint_t  cnt;
 
-    out->hits         = z->sh->hits;
-    out->misses       = z->sh->misses;
-    out->stale_serves = z->sh->stale_serves;
-    out->refreshes    = z->sh->refreshes;
-    out->evictions    = z->sh->evictions;
-    out->l2_hits      = z->sh->l2_hits;
-    out->l2_misses    = z->sh->l2_misses;
-    out->lock_waits   = z->sh->lock_waits;
-    out->min_uses_skips = z->sh->min_uses_skips;
-    out->l2_neg_skips = z->sh->l2_neg_skips;
-    out->bypasses     = z->sh->bypasses;
+    out->hits         = ngx_http_cache_turbo_zone_sh(z)->hits;
+    out->misses       = ngx_http_cache_turbo_zone_sh(z)->misses;
+    out->stale_serves = ngx_http_cache_turbo_zone_sh(z)->stale_serves;
+    out->refreshes    = ngx_http_cache_turbo_zone_sh(z)->refreshes;
+    out->evictions    = ngx_http_cache_turbo_zone_sh(z)->evictions;
+    out->l2_hits      = ngx_http_cache_turbo_zone_sh(z)->l2_hits;
+    out->l2_misses    = ngx_http_cache_turbo_zone_sh(z)->l2_misses;
+    out->lock_waits   = ngx_http_cache_turbo_zone_sh(z)->lock_waits;
+    out->min_uses_skips = ngx_http_cache_turbo_zone_sh(z)->min_uses_skips;
+    out->l2_neg_skips = ngx_http_cache_turbo_zone_sh(z)->l2_neg_skips;
+    out->bypasses     = ngx_http_cache_turbo_zone_sh(z)->bypasses;
 
-    out->refuse_set_cookie    = z->sh->refuse_set_cookie;
-    out->refuse_encoded       = z->sh->refuse_encoded;
-    out->refuse_vary_unsafe   = z->sh->refuse_vary_unsafe;
-    out->refuse_authorization = z->sh->refuse_authorization;
-    out->refuse_cache_control = z->sh->refuse_cache_control;
-    out->refuse_require_header = z->sh->refuse_require_header;
-    out->refuse_partial       = z->sh->refuse_partial;
-    out->refuse_head          = z->sh->refuse_head;
+    out->refuse_set_cookie    = ngx_http_cache_turbo_zone_sh(z)->refuse_set_cookie;
+    out->refuse_encoded       = ngx_http_cache_turbo_zone_sh(z)->refuse_encoded;
+    out->refuse_vary_unsafe   = ngx_http_cache_turbo_zone_sh(z)->refuse_vary_unsafe;
+    out->refuse_authorization = ngx_http_cache_turbo_zone_sh(z)->refuse_authorization;
+    out->refuse_cache_control = ngx_http_cache_turbo_zone_sh(z)->refuse_cache_control;
+    out->refuse_require_header = ngx_http_cache_turbo_zone_sh(z)->refuse_require_header;
+    out->refuse_partial       = ngx_http_cache_turbo_zone_sh(z)->refuse_partial;
+    out->refuse_head          = ngx_http_cache_turbo_zone_sh(z)->refuse_head;
 
     /* Autotune introspection (v4-3): average origin-regen cost and the live beta
      * verdict, so the admin GET can render the tuning without an internal probe. */
-    cnt = z->sh->cost_count;
-    out->cost_ms        = cnt ? (z->sh->cost_sum_ms / cnt) : 0;
-    out->autotuned_beta = z->sh->autotuned_beta;
-    out->autotuned_load = z->sh->autotuned_load;   /* v4-4 load factor ×1000 */
+    cnt = ngx_http_cache_turbo_zone_sh(z)->cost_count;
+    out->cost_ms        = cnt ? (ngx_http_cache_turbo_zone_sh(z)->cost_sum_ms / cnt) : 0;
+    out->autotuned_beta = ngx_http_cache_turbo_zone_sh(z)->autotuned_beta;
+    out->autotuned_load = ngx_http_cache_turbo_zone_sh(z)->autotuned_load;   /* v4-4 load factor ×1000 */
 
     /* P6/O4.1 breaker introspection. Read raw -- do NOT call breaker_state()
      * here: that function performs the OPEN -> HALF_OPEN transition, and an
      * admin GET must observe the breaker, never drive it. */
-    out->breaker_state = z->sh->breaker_state;
-    out->breaker_opens = z->sh->breaker_opens;
+    out->breaker_state = ngx_http_cache_turbo_zone_sh(z)->breaker_state;
+    out->breaker_opens = ngx_http_cache_turbo_zone_sh(z)->breaker_opens;
 
     /* S7.1: production serve/failure counters. Plain reads, same as every
      * other counter above -- these are simple lifetime tallies, not the
      * breaker's transitioning state. */
-    out->sie_serves      = z->sh->sie_serves;
-    out->breaker_serves  = z->sh->breaker_serves;
-    out->origin_failures = z->sh->origin_failures;
+    out->sie_serves      = ngx_http_cache_turbo_zone_sh(z)->sie_serves;
+    out->breaker_serves  = ngx_http_cache_turbo_zone_sh(z)->breaker_serves;
+    out->origin_failures = ngx_http_cache_turbo_zone_sh(z)->origin_failures;
 
     /* COR-5(b)/L9: store-time index-drop counters. Plain reads, same as
      * every other lifetime tally above. */
-    out->varidx_drops     = z->sh->varidx_drops;
-    out->tag_index_drops  = z->sh->tag_index_drops;
+    out->varidx_drops     = ngx_http_cache_turbo_zone_sh(z)->varidx_drops;
+    out->tag_index_drops  = ngx_http_cache_turbo_zone_sh(z)->tag_index_drops;
 
     /* P3-7: live gauge, not a lifetime tally -- read the same as every other
      * counter here (plain, unlocked; the atomic itself is the sync point). */
-    out->bg_inflight = z->sh->bg_inflight;
+    out->bg_inflight = ngx_http_cache_turbo_zone_sh(z)->bg_inflight;
 
     /* P4-1b: admission introspection. Plain reads under no lock, exactly like
      * every counter above -- these are diagnostics, not a decision input. */
-    out->sketch_gen        = (ngx_atomic_uint_t) z->sh->sketch_gen;
-    out->sketch_bumps      = (ngx_atomic_uint_t) z->sh->sketch_bumps;
-    out->admission_refused = (ngx_atomic_uint_t) z->sh->admission_refused;
+    out->sketch_gen        = (ngx_atomic_uint_t) ngx_http_cache_turbo_zone_sh(z)->sketch_gen;
+    out->sketch_bumps      = (ngx_atomic_uint_t) ngx_http_cache_turbo_zone_sh(z)->sketch_bumps;
+    out->admission_refused = (ngx_atomic_uint_t) ngx_http_cache_turbo_zone_sh(z)->admission_refused;
 
     /* P4-2-s3a: live used-bytes gauge (cached payload+metadata charged by
      * shm_alloc_evict / discharged by shm_free_locked). Plain read like the
      * sketch fields above -- diagnostics, not a decision input. */
-    out->used_bytes = (ngx_atomic_uint_t) z->sh->used_bytes;
+    out->used_bytes = (ngx_atomic_uint_t) ngx_http_cache_turbo_zone_sh(z)->used_bytes;
 }
 
 
@@ -1648,7 +1658,7 @@ ngx_http_cache_turbo_shm_claim_locked(ngx_http_cache_turbo_zone_t *z,
          * one. This is precisely the rollover the token exists for -- the
          * previous holder's token is now stale, so its unstub() and any adoption
          * it attempts will (correctly) no longer match. */
-        ctn->refresh_owner = ++z->sh->owner_seq;
+        ctn->refresh_owner = ++ngx_http_cache_turbo_zone_sh(z)->owner_seq;
         *owner = ctn->refresh_owner;
         return NGX_HTTP_CACHE_TURBO_CLAIM_WINNER;
     }
@@ -1678,13 +1688,13 @@ ngx_http_cache_turbo_shm_claim_locked(ngx_http_cache_turbo_zone_t *z,
     ctn->stale_until = 0;
     ctn->refreshing = 1;
     ctn->refresh_lock_until = now + lock_ttl;
-    ctn->refresh_owner = ++z->sh->owner_seq;   /* CTXRDR-ADOPT-LEASE */
+    ctn->refresh_owner = ++ngx_http_cache_turbo_zone_sh(z)->owner_seq;   /* CTXRDR-ADOPT-LEASE */
     ctn->miss_count = 0;
     ctn->l2_neg_until = 0;       /* brand-new node: no memo to preserve */
     ctn->last_access = now;      /* P1: init the coarse LRU stamp */
     ctn->promotable = 0;         /* S8: unproven; second touch promotes */
 
-    ngx_rbtree_insert(&z->sh->rbtree, &ctn->node);
+    ngx_rbtree_insert(&ngx_http_cache_turbo_zone_sh(z)->rbtree, &ctn->node);
     /* S8: every new node enters PROBATION (see lru_insert_new). */
     ngx_http_cache_turbo_lru_insert_new(z, ctn);
 
@@ -1709,11 +1719,11 @@ ngx_http_cache_turbo_shm_claim(ngx_http_cache_turbo_zone_t *z,
 
     now = ngx_time();
 
-    ngx_shmtx_lock(&z->shpool->mutex);
+    ngx_shmtx_lock(ngx_http_cache_turbo_zone_mutex(z));
     ctn = ngx_http_cache_turbo_shm_lookup(z, key_hash, hash);
     rc = ngx_http_cache_turbo_shm_claim_locked(z, hash, key_hash, lock_ttl,
              owner, ctn, now, NULL, NULL);
-    ngx_shmtx_unlock(&z->shpool->mutex);
+    ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
 
     return rc;
 }
@@ -1800,7 +1810,7 @@ ngx_http_cache_turbo_shm_resolve_miss(ngx_http_cache_turbo_zone_t *z,
     now = ngx_time();
     *owner = 0;
 
-    ngx_shmtx_lock(&z->shpool->mutex);
+    ngx_shmtx_lock(ngx_http_cache_turbo_zone_mutex(z));
 
     ctn = ngx_http_cache_turbo_shm_lookup(z, key_hash, hash);
 
@@ -1810,7 +1820,7 @@ ngx_http_cache_turbo_shm_resolve_miss(ngx_http_cache_turbo_zone_t *z,
     if (*count_miss_rc == NGX_DECLINED) {
         /* Matches the standalone caller's own short-circuit: claim() never
          * ran when count_miss() declined. Nothing further to report. */
-        ngx_shmtx_unlock(&z->shpool->mutex);
+        ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
         return NGX_HTTP_CACHE_TURBO_CLAIM_WINNER;   /* caller must not use this */
     }
 
@@ -1827,7 +1837,7 @@ ngx_http_cache_turbo_shm_resolve_miss(ngx_http_cache_turbo_zone_t *z,
     rc = ngx_http_cache_turbo_shm_claim_locked(z, hash, key_hash, lock_ttl,
              owner, ctn, now, fresh_data, fresh_len);
 
-    ngx_shmtx_unlock(&z->shpool->mutex);
+    ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
 
     return rc;
 }
@@ -1848,7 +1858,7 @@ ngx_http_cache_turbo_shm_owns(ngx_http_cache_turbo_zone_t *z,
         return NGX_DECLINED;
     }
 
-    ngx_shmtx_lock(&z->shpool->mutex);
+    ngx_shmtx_lock(ngx_http_cache_turbo_zone_mutex(z));
 
     ctn = ngx_http_cache_turbo_shm_lookup(z, key_hash, hash);
 
@@ -1868,7 +1878,7 @@ ngx_http_cache_turbo_shm_owns(ngx_http_cache_turbo_zone_t *z,
           && ctn->refresh_owner == owner)
          ? NGX_OK : NGX_DECLINED;
 
-    ngx_shmtx_unlock(&z->shpool->mutex);
+    ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
 
     return rc;
 }
@@ -1891,7 +1901,7 @@ ngx_http_cache_turbo_shm_unstub(ngx_http_cache_turbo_zone_t *z,
         return;
     }
 
-    ngx_shmtx_lock(&z->shpool->mutex);
+    ngx_shmtx_lock(ngx_http_cache_turbo_zone_mutex(z));
 
     ctn = ngx_http_cache_turbo_shm_lookup(z, key_hash, hash);
 
@@ -1943,14 +1953,14 @@ ngx_http_cache_turbo_shm_unstub(ngx_http_cache_turbo_zone_t *z,
          * COUNTER and expires on its own terms. */
         if (ctn->miss_count == 0 && ctn->l2_neg_until <= ngx_time()) {
             ngx_http_cache_turbo_lru_unlink(z, ctn);
-            z->sh->n_entries--;
-            ngx_rbtree_delete(&z->sh->rbtree, &ctn->node);
+            ngx_http_cache_turbo_zone_sh(z)->n_entries--;
+            ngx_rbtree_delete(&ngx_http_cache_turbo_zone_sh(z)->rbtree, &ctn->node);
             ngx_http_cache_turbo_shm_free_locked(z, ctn,
                 sizeof(ngx_http_cache_turbo_node_t));
         }
     }
 
-    ngx_shmtx_unlock(&z->shpool->mutex);
+    ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
 }
 
 
@@ -2031,7 +2041,7 @@ ngx_http_cache_turbo_shm_count_miss_locked(ngx_http_cache_turbo_zone_t *z,
     ctn->last_access = now;      /* P1: init the coarse LRU stamp */
     ctn->promotable = 0;         /* S8: unproven; second touch promotes */
 
-    ngx_rbtree_insert(&z->sh->rbtree, &ctn->node);
+    ngx_rbtree_insert(&ngx_http_cache_turbo_zone_sh(z)->rbtree, &ctn->node);
     /* S8: every new node enters PROBATION (see lru_insert_new). */
     ngx_http_cache_turbo_lru_insert_new(z, ctn);
 
@@ -2057,11 +2067,11 @@ ngx_http_cache_turbo_shm_count_miss(ngx_http_cache_turbo_zone_t *z,
 
     now = ngx_time();
 
-    ngx_shmtx_lock(&z->shpool->mutex);
+    ngx_shmtx_lock(ngx_http_cache_turbo_zone_mutex(z));
     ctn = ngx_http_cache_turbo_shm_lookup(z, key_hash, hash);
     rc = ngx_http_cache_turbo_shm_count_miss_locked(z, key_hash, hash,
              min_uses, min_uses_window, ctn, now);
-    ngx_shmtx_unlock(&z->shpool->mutex);
+    ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
 
     return rc;
 }
@@ -2082,7 +2092,7 @@ ngx_http_cache_turbo_shm_l2_neg_check(ngx_http_cache_turbo_zone_t *z,
     now = ngx_time();
     rc = NGX_OK;
 
-    ngx_shmtx_lock(&z->shpool->mutex);
+    ngx_shmtx_lock(ngx_http_cache_turbo_zone_mutex(z));
 
     ctn = ngx_http_cache_turbo_shm_lookup(z, key_hash, hash);
 
@@ -2123,7 +2133,7 @@ ngx_http_cache_turbo_shm_l2_neg_check(ngx_http_cache_turbo_zone_t *z,
         ngx_http_cache_turbo_shm_touch_lru(z, ctn, now, 0);
     }
 
-    ngx_shmtx_unlock(&z->shpool->mutex);
+    ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
 
     return rc;
 }
@@ -2141,7 +2151,7 @@ ngx_http_cache_turbo_shm_varidx_pending_set(ngx_http_cache_turbo_zone_t *z,
 {
     ngx_http_cache_turbo_node_t  *ctn;
 
-    ngx_shmtx_lock(&z->shpool->mutex);
+    ngx_shmtx_lock(ngx_http_cache_turbo_zone_mutex(z));
 
     ctn = ngx_http_cache_turbo_shm_lookup(z, key_hash, hash);
 
@@ -2149,7 +2159,7 @@ ngx_http_cache_turbo_shm_varidx_pending_set(ngx_http_cache_turbo_zone_t *z,
         ctn->varidx_pending = pending ? 1 : 0;
     }
 
-    ngx_shmtx_unlock(&z->shpool->mutex);
+    ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
 }
 
 
@@ -2166,7 +2176,7 @@ ngx_http_cache_turbo_shm_l2_neg_set(ngx_http_cache_turbo_zone_t *z,
 
     now = ngx_time();
 
-    ngx_shmtx_lock(&z->shpool->mutex);
+    ngx_shmtx_lock(ngx_http_cache_turbo_zone_mutex(z));
 
     ctn = ngx_http_cache_turbo_shm_lookup(z, key_hash, hash);
 
@@ -2183,12 +2193,12 @@ ngx_http_cache_turbo_shm_l2_neg_set(ngx_http_cache_turbo_zone_t *z,
          * other side, since a cold request's own claim() marks the node before the
          * miss is recorded on some paths. */
         if (ctn->kind == NGX_HTTP_CACHE_TURBO_NODE_ENTRY) {
-            ngx_shmtx_unlock(&z->shpool->mutex);
+            ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
             return;
         }
 
         ctn->l2_neg_until = now + ttl;
-        ngx_shmtx_unlock(&z->shpool->mutex);
+        ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
         return;
     }
 
@@ -2199,7 +2209,7 @@ ngx_http_cache_turbo_shm_l2_neg_set(ngx_http_cache_turbo_zone_t *z,
     ctn = ngx_http_cache_turbo_shm_alloc_evict(z,
               sizeof(ngx_http_cache_turbo_node_t));
     if (ctn == NULL) {
-        ngx_shmtx_unlock(&z->shpool->mutex);   /* out of slab: no memo */
+        ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));   /* out of slab: no memo */
         return;
     }
 
@@ -2218,11 +2228,11 @@ ngx_http_cache_turbo_shm_l2_neg_set(ngx_http_cache_turbo_zone_t *z,
     ctn->last_access = now;      /* P1: init the coarse LRU stamp */
     ctn->promotable = 0;         /* S8: unproven; second touch promotes */
 
-    ngx_rbtree_insert(&z->sh->rbtree, &ctn->node);
+    ngx_rbtree_insert(&ngx_http_cache_turbo_zone_sh(z)->rbtree, &ctn->node);
     /* S8: every new node enters PROBATION (see lru_insert_new). */
     ngx_http_cache_turbo_lru_insert_new(z, ctn);
 
-    ngx_shmtx_unlock(&z->shpool->mutex);
+    ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
 }
 
 
@@ -2323,11 +2333,11 @@ ngx_http_cache_turbo_shm_brk_probe_age(ngx_http_cache_turbo_zone_t *z,
 {
     ngx_uint_t  rel, stamp;
 
-    if (now < (time_t) z->sh->breaker_epoch) {
+    if (now < (time_t) ngx_http_cache_turbo_zone_sh(z)->breaker_epoch) {
         return (time_t) 0;
     }
 
-    rel   = ((ngx_uint_t) (now - (time_t) z->sh->breaker_epoch))
+    rel   = ((ngx_uint_t) (now - (time_t) ngx_http_cache_turbo_zone_sh(z)->breaker_epoch))
             & NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_STAMP_MASK;
     stamp = ngx_http_cache_turbo_brk_probe_stamp(probe_word);
 
@@ -2358,14 +2368,14 @@ ngx_http_cache_turbo_shm_breaker_state(ngx_http_cache_turbo_zone_t *z,
      * come from the same load, so every CAS below is tested against the exact
      * word this caller decided on -- that is what makes the transitions
      * generation-safe rather than merely state-safe. */
-    word  = (ngx_uint_t) z->sh->breaker_state;
+    word  = (ngx_uint_t) ngx_http_cache_turbo_zone_sh(z)->breaker_state;
     state = ngx_http_cache_turbo_brk_state(word);
 
     /* O4.4-h: one load of the probe word, reused for BOTH the reclaim test
      * below and, as the expected value, for the publication CAS on the
      * promotion path. Re-reading it at either site would reintroduce a
      * mispairing window. */
-    probe_word = (ngx_uint_t) z->sh->breaker_probe;
+    probe_word = (ngx_uint_t) ngx_http_cache_turbo_zone_sh(z)->breaker_probe;
 
     now = ngx_time();
 
@@ -2469,7 +2479,7 @@ ngx_http_cache_turbo_shm_breaker_state(ngx_http_cache_turbo_zone_t *z,
                        & NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_GEN_MASK)
             && ngx_http_cache_turbo_shm_brk_probe_age(z, probe_word, now)
                    >= (time_t) NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_LEASE
-            && ngx_atomic_cmp_set(&z->sh->breaker_state, (ngx_atomic_uint_t) word,
+            && ngx_atomic_cmp_set(&ngx_http_cache_turbo_zone_sh(z)->breaker_state, (ngx_atomic_uint_t) word,
                                   (ngx_atomic_uint_t)
                                       ngx_http_cache_turbo_brk_pack(
                                           ngx_http_cache_turbo_brk_gen(word),
@@ -2492,7 +2502,7 @@ ngx_http_cache_turbo_shm_breaker_state(ngx_http_cache_turbo_zone_t *z,
              * and the ordering silently becomes the window-skip bug the
              * failed-probe path warns about. Move the write above the CAS if
              * you ever change the value. */
-            z->sh->breaker_opened_at = (ngx_atomic_t) (now - open_for);
+            ngx_http_cache_turbo_zone_sh(z)->breaker_opened_at = (ngx_atomic_t) (now - open_for);
 
             /* O4.3-c: we own the demotion, so we know the word we installed --
              * same generation, state now OPEN. Fall through to the promotion
@@ -2528,7 +2538,7 @@ ngx_http_cache_turbo_shm_breaker_state(ngx_http_cache_turbo_zone_t *z,
                        != (ngx_http_cache_turbo_brk_gen(word)
                            & NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_GEN_MASK))
             {
-                (void) ngx_atomic_fetch_add(&z->sh->breaker_wedge_observed, 1);
+                (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->breaker_wedge_observed, 1);
             }
 #endif
             return NGX_HTTP_CACHE_TURBO_BREAKER_OPEN;
@@ -2539,7 +2549,7 @@ ngx_http_cache_turbo_shm_breaker_state(ngx_http_cache_turbo_zone_t *z,
         return state;
     }
 
-    if (now - (time_t) z->sh->breaker_opened_at < open_for) {
+    if (now - (time_t) ngx_http_cache_turbo_zone_sh(z)->breaker_opened_at < open_for) {
         return NGX_HTTP_CACHE_TURBO_BREAKER_OPEN;
     }
 
@@ -2614,18 +2624,18 @@ ngx_http_cache_turbo_shm_breaker_state(ngx_http_cache_turbo_zone_t *z,
          * ⚠ The stamp is RELATIVE to breaker_epoch -- see the packed-probe block
          * in the header for why an absolute epoch stamp cannot sit beside a
          * generation on a 32-bit ngx_atomic_t. */
-        if (!ngx_atomic_cmp_set(&z->sh->breaker_probe,
+        if (!ngx_atomic_cmp_set(&ngx_http_cache_turbo_zone_sh(z)->breaker_probe,
                                 (ngx_atomic_uint_t) probe_word,
                                 (ngx_atomic_uint_t)
                                     ngx_http_cache_turbo_brk_probe_pack(
                                         gen,
                                         (ngx_uint_t) (now
-                                            - (time_t) z->sh->breaker_epoch))))
+                                            - (time_t) ngx_http_cache_turbo_zone_sh(z)->breaker_epoch))))
         {
             return NGX_HTTP_CACHE_TURBO_BREAKER_OPEN;
         }
 
-        if (ngx_atomic_cmp_set(&z->sh->breaker_state, (ngx_atomic_uint_t) word,
+        if (ngx_atomic_cmp_set(&ngx_http_cache_turbo_zone_sh(z)->breaker_state, (ngx_atomic_uint_t) word,
                                (ngx_atomic_uint_t) next))
         {
             /* O4.4-h: the lease deadline was already published above, together
@@ -2668,12 +2678,12 @@ ngx_http_cache_turbo_shm_breaker_record(ngx_http_cache_turbo_zone_t *z,
     now   = ngx_time();
     /* O4.3-c: one read of the packed word; state and generation are decided
      * together, and every CAS below is tested against this exact value. */
-    word  = (ngx_uint_t) z->sh->breaker_state;   /* plain read, see above */
+    word  = (ngx_uint_t) ngx_http_cache_turbo_zone_sh(z)->breaker_state;   /* plain read, see above */
     state = ngx_http_cache_turbo_brk_state(word);
 
     if (success) {
         /* A success clears the failure run. */
-        z->sh->breaker_fails = 0;
+        ngx_http_cache_turbo_zone_sh(z)->breaker_fails = 0;
 
         /* ⚠ ONLY a HALF_OPEN -> CLOSED edge exists, matching the state diagram.
          * An earlier revision closed from ANY non-CLOSED state, which let a
@@ -2712,7 +2722,7 @@ ngx_http_cache_turbo_shm_breaker_record(ngx_http_cache_turbo_zone_t *z,
             && probe != NGX_HTTP_CACHE_TURBO_BREAKER_NO_PROBE
             && probe == ngx_http_cache_turbo_brk_gen(word))
         {
-            (void) ngx_atomic_cmp_set(&z->sh->breaker_state,
+            (void) ngx_atomic_cmp_set(&ngx_http_cache_turbo_zone_sh(z)->breaker_state,
                                       (ngx_atomic_uint_t) word,
                                       (ngx_atomic_uint_t)
                                           ngx_http_cache_turbo_brk_pack(
@@ -2739,9 +2749,9 @@ ngx_http_cache_turbo_shm_breaker_record(ngx_http_cache_turbo_zone_t *z,
          * promote a probe immediately -- skipping the entire window. Writing
          * first means any worker that can see OPEN can already see a deadline
          * that is at least as new. */
-        z->sh->breaker_opened_at = (ngx_atomic_t) now;
+        ngx_http_cache_turbo_zone_sh(z)->breaker_opened_at = (ngx_atomic_t) now;
 
-        (void) ngx_atomic_cmp_set(&z->sh->breaker_state,
+        (void) ngx_atomic_cmp_set(&ngx_http_cache_turbo_zone_sh(z)->breaker_state,
                                   (ngx_atomic_uint_t) word,
                                   (ngx_atomic_uint_t)
                                       ngx_http_cache_turbo_brk_pack(
@@ -2800,16 +2810,16 @@ ngx_http_cache_turbo_shm_breaker_record(ngx_http_cache_turbo_zone_t *z,
      * residual is BOUNDED: at most the failures racing one re-anchor, once per
      * window, and it can only DELAY a trip, never cause a spurious one. The
      * STATE transitions below are the part that must be exact; those are CAS. */
-    window_start = (ngx_atomic_uint_t) z->sh->breaker_window_start;
+    window_start = (ngx_atomic_uint_t) ngx_http_cache_turbo_zone_sh(z)->breaker_window_start;
 
     if (now - (time_t) window_start >= window
-        && ngx_atomic_cmp_set(&z->sh->breaker_window_start,
+        && ngx_atomic_cmp_set(&ngx_http_cache_turbo_zone_sh(z)->breaker_window_start,
                               window_start, (ngx_atomic_uint_t) now))
     {
-        z->sh->breaker_fails = 0;
+        ngx_http_cache_turbo_zone_sh(z)->breaker_fails = 0;
     }
 
-    fails = (ngx_atomic_uint_t) ngx_atomic_fetch_add(&z->sh->breaker_fails, 1) + 1;
+    fails = (ngx_atomic_uint_t) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->breaker_fails, 1) + 1;
 
     if (fails < threshold) {
         return;
@@ -2818,7 +2828,7 @@ ngx_http_cache_turbo_shm_breaker_record(ngx_http_cache_turbo_zone_t *z,
     /* Same publish-before-CAS ordering as the failed-probe path above: a worker
      * must never be able to see OPEN alongside a stale opened_at and conclude
      * the open window has already expired. */
-    z->sh->breaker_opened_at = (ngx_atomic_t) now;
+    ngx_http_cache_turbo_zone_sh(z)->breaker_opened_at = (ngx_atomic_t) now;
 
     /* ⚠ O4.3-c: CAS the whole packed word, carrying the CURRENT generation
      * forward. Expecting a bare CLOSED here would compare against generation 0
@@ -2827,7 +2837,7 @@ ngx_http_cache_turbo_shm_breaker_record(ngx_http_cache_turbo_zone_t *z,
      * The trip does not open a new LEASE (no probe is promoted yet), so the
      * generation is preserved rather than bumped; the promotion that follows
      * open_for seconds later is what opens the next one. */
-    if (ngx_atomic_cmp_set(&z->sh->breaker_state,
+    if (ngx_atomic_cmp_set(&ngx_http_cache_turbo_zone_sh(z)->breaker_state,
                            (ngx_atomic_uint_t)
                                ngx_http_cache_turbo_brk_pack(
                                    ngx_http_cache_turbo_brk_gen(word),
@@ -2837,8 +2847,8 @@ ngx_http_cache_turbo_shm_breaker_record(ngx_http_cache_turbo_zone_t *z,
                                    ngx_http_cache_turbo_brk_gen(word),
                                    NGX_HTTP_CACHE_TURBO_BREAKER_OPEN)))
     {
-        z->sh->breaker_fails = 0;
-        (void) ngx_atomic_fetch_add(&z->sh->breaker_opens, 1);
+        ngx_http_cache_turbo_zone_sh(z)->breaker_fails = 0;
+        (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->breaker_opens, 1);
     }
 }
 

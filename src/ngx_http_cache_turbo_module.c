@@ -1033,7 +1033,7 @@ ngx_http_cache_turbo_effective_beta(ngx_http_cache_turbo_loc_conf_t *clcf,
         return clcf->beta;
     }
 
-    ab = (ngx_int_t) z->sh->autotuned_beta;
+    ab = (ngx_int_t) ngx_http_cache_turbo_zone_sh(z)->autotuned_beta;
     if (ab <= 0) {
         return clcf->beta;
     }
@@ -1072,7 +1072,7 @@ ngx_http_cache_turbo_effective_load(ngx_http_cache_turbo_loc_conf_t *clcf,
         return NGX_HTTP_CACHE_TURBO_AT_LOAD_BASE;
     }
 
-    ld = (ngx_int_t) z->sh->autotuned_load;
+    ld = (ngx_int_t) ngx_http_cache_turbo_zone_sh(z)->autotuned_load;
     if (ld <= NGX_HTTP_CACHE_TURBO_AT_LOAD_BASE) {
         return NGX_HTTP_CACHE_TURBO_AT_LOAD_BASE;
     }
@@ -1814,7 +1814,7 @@ ngx_http_cache_turbo_test_armings_header(ngx_http_request_t *r)
     }
 
     z = clcf->shm_zone->data;
-    if (z == NULL || z->sh == NULL) {
+    if (z == NULL || ngx_http_cache_turbo_zone_sh(z) == NULL) {
         return NGX_DECLINED;
     }
 
@@ -1829,8 +1829,8 @@ ngx_http_cache_turbo_test_armings_header(ngx_http_request_t *r)
     }
 
     vlen = ngx_sprintf(v, "l1=%uA,l2=%uA",
-                       ngx_atomic_fetch_add(&z->sh->test_brk_armings_l1, 0),
-                       ngx_atomic_fetch_add(&z->sh->test_brk_armings_l2, 0)) - v;
+                       ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->test_brk_armings_l1, 0),
+                       ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->test_brk_armings_l2, 0)) - v;
 
     h = ngx_list_push(&r->headers_out.headers);
     if (h == NULL) {
@@ -1927,7 +1927,7 @@ ngx_http_cache_turbo_test_varidx_header(ngx_http_request_t *r)
     }
 
     z = clcf->shm_zone->data;
-    if (z == NULL || z->sh == NULL) {
+    if (z == NULL || ngx_http_cache_turbo_zone_sh(z) == NULL) {
         return NGX_DECLINED;
     }
 
@@ -1938,8 +1938,8 @@ ngx_http_cache_turbo_test_varidx_header(ngx_http_request_t *r)
     }
 
     vlen = ngx_sprintf(v, "drops=%uA,reissues=%uA",
-                       ngx_atomic_fetch_add(&z->sh->varidx_drops, 0),
-                       ngx_atomic_fetch_add(&z->sh->varidx_reissues, 0)) - v;
+                       ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->varidx_drops, 0),
+                       ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->varidx_reissues, 0)) - v;
 
     h = ngx_list_push(&r->headers_out.headers);
     if (h == NULL) {
@@ -4331,7 +4331,7 @@ ngx_http_cache_turbo_bginflight_cleanup(void *data)
 {
     ngx_http_cache_turbo_bginflight_cln_t  *c = data;
 
-    (void) ngx_atomic_fetch_add(&c->z->sh->bg_inflight, -1);
+    (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(c->z)->bg_inflight, -1);
 }
 
 /*
@@ -4481,12 +4481,12 @@ ngx_http_cache_turbo_warm_one(ngx_http_request_t *r, ngx_str_t *uri,
     if (z != NULL && clcf->background_update_max != 0) {
         for ( ;; ) {
             ngx_atomic_uint_t  cur = *(volatile ngx_atomic_uint_t *)
-                                          &z->sh->bg_inflight;
+                                          &ngx_http_cache_turbo_zone_sh(z)->bg_inflight;
 
             if (cur >= (ngx_atomic_uint_t) clcf->background_update_max) {
                 return NGX_DECLINED;
             }
-            if (ngx_atomic_cmp_set(&z->sh->bg_inflight, cur, cur + 1)) {
+            if (ngx_atomic_cmp_set(&ngx_http_cache_turbo_zone_sh(z)->bg_inflight, cur, cur + 1)) {
                 break;
             }
         }
@@ -4497,7 +4497,7 @@ ngx_http_cache_turbo_warm_one(ngx_http_request_t *r, ngx_str_t *uri,
         != NGX_OK)
     {
         if (z != NULL && clcf->background_update_max != 0) {
-            (void) ngx_atomic_fetch_add(&z->sh->bg_inflight, -1);
+            (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->bg_inflight, -1);
         }
         return NGX_ERROR;
     }
@@ -4517,7 +4517,7 @@ ngx_http_cache_turbo_warm_one(ngx_http_request_t *r, ngx_str_t *uri,
              * down -- ngx_http_subrequest() has already posted it and it
              * cannot be unwound, same rationale as the ctx-alloc failure
              * below. */
-            (void) ngx_atomic_fetch_add(&z->sh->bg_inflight, -1);
+            (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->bg_inflight, -1);
         } else {
             cln->handler = ngx_http_cache_turbo_bginflight_cleanup;
             cc = cln->data;
