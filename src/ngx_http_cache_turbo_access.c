@@ -979,7 +979,7 @@ ngx_http_cache_turbo_access_l1_serve_stale(ngx_http_request_t *r,
             ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
             (void) ngx_http_cache_turbo_warm_one(r, &r->uri, &r->args,
                                                  snap, snap_len,
-                                                 NULL);
+                                                 NULL, NULL);
             (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->stale_serves, 1);
             ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                            "cache_turbo: cross-node WON bg-refresh + STALE "
@@ -1138,7 +1138,7 @@ ngx_http_cache_turbo_access_l1_serve_stale(ngx_http_request_t *r,
             /* v8: fire a background refresh of this URI, serve stale. */
             (void) ngx_http_cache_turbo_warm_one(r, &r->uri, &r->args,
                                                  snap, snap_len,
-                                                 NULL);
+                                                 NULL, NULL);
             (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->stale_serves, 1);
             ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                            "cache_turbo: bg-refresh + STALE serve \"%V\" "
@@ -3128,7 +3128,7 @@ ngx_http_cache_turbo_head_store_warm(ngx_http_request_t *r,
 
     ctx->head_warm_fired = 1;
 
-    (void) ngx_http_cache_turbo_warm_one(r, &r->uri, &r->args, NULL, 0, &wctx);
+    (void) ngx_http_cache_turbo_warm_one(r, &r->uri, &r->args, NULL, 0, &wctx, NULL);
 
     /* Stamp on the ctx's EXISTENCE, not on warm_one()'s return value. A posted
      * subrequest cannot be unwound, so a failure arm AFTER the ctx was

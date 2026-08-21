@@ -1425,6 +1425,67 @@ def test_warm_populates(ng: Nginx, origin: Origin) -> None:
         f"GET after warm hit the origin ({origin.hits_for('warm-pop')} vs {after})"
 
 
+def test_warm_admin_no_uri_proxy_pass_no_ubsan_abort(ng: Nginx, origin: Origin) -> None:
+    """UB-PROXYNULLURI-admin: the admin warm path (admin.c) hands warm_one()
+    an OPERATOR-SUPPLIED uri that is never byte-identical to the admin
+    request's own r->uri/r->args, so it cannot take the r->valid_unparsed_uri
+    INHERIT gate module.c already has for the internal warm paths (SWR
+    background refresh, cache_turbo_store_head) -- see the UB-PROXYNULLURI
+    comment in ngx_http_cache_turbo_module.c. Left unfixed, the warm
+    subrequest keeps sr->valid_unparsed_uri == 0, and if that subrequest's
+    proxy_pass has NO URI component (`proxy_pass http://host;`, no trailing
+    slash/path -- exactly /shoff/'s shape, see nginx_config.py), nginx core's
+    ngx_http_proxy_create_request() (ngx_http_proxy_module.c:1383) takes the
+    else branch guarded ONLY by r->valid_location (always 1 for a subrequest)
+    and reaches ngx_copy(dst, NULL, 0) == memcpy(NULL, ...) -- UB that a
+    sanitizer build with halt_on_error=1 turns into a worker ABORT.
+
+    /shoff/ is on zone `main`, the same zone /_cache administers, and already
+    has a no-trailing-slash proxy_pass for an unrelated reason (P5-6 control,
+    see its own comment) -- reused here rather than adding a new location,
+    since its shape is exactly what this bug needs.
+
+    Oracle: capture the worker PID set before the warm POST. A crash-and-
+    respawn is the ONLY way this set changes here (nginx does not otherwise
+    recycle workers mid-suite), so an unfixed build fails this assertion
+    under the sanitizer job specifically -- a non-sanitizer build cannot
+    detect the UB at all (it's silently well-defined memcpy(NULL, x, 0) in
+    practice on glibc), so this test's own passing on a non-UBSan run is
+    expected and uninformative; it earns its keep on the asan CI lane. The
+    positive half (warm still actually reaches the origin and populates the
+    entry) is asserted too, so a fix that merely swallows the crash without
+    completing the warm would still fail this test."""
+    import json
+
+    uri = "/shoff/warm-nouri-admin"
+    tag = "warm-nouri-admin"
+    before_workers = ng.worker_pids()
+    base = origin.hits_for(tag)
+
+    s, b, _ = fetch(ng.port, f"/_cache?url={uri}", method="POST")
+    assert s == 200, f"warm status {s}"
+    assert json.loads(b)["warmed"] == 1, f"warmed count: {b}"
+
+    assert wait_for(lambda: origin.hits_for(tag) == base + 1), \
+        "warm subrequest never hit the origin (admin warm into a URI-less " \
+        "proxy_pass did not complete)"
+
+    # give a crashed worker time to actually exit and the master time to
+    # respawn its replacement before reading the PID set
+    time.sleep(0.3)
+    after_workers = ng.worker_pids()
+    assert after_workers and after_workers == before_workers, (
+        "worker process set changed across the admin warm into a URI-less "
+        "proxy_pass -- UB-PROXYNULLURI-admin: the worker ABORTED "
+        f"(before={sorted(before_workers)}, after={sorted(after_workers)})")
+
+    time.sleep(0.2)                     # let the store settle
+    s2, _, h2 = fetch(ng.port, uri)
+    assert s2 == 200
+    assert h2.get("x-cache") == "HIT", \
+        f"admin warm did not populate the cache (X-Cache={h2.get('x-cache')})"
+
+
 def test_warm_multi(ng: Nginx, origin: Origin) -> None:
     """v3-3: a comma-separated ?url=a,b warms both; both HIT afterwards."""
     import json

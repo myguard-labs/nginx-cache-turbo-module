@@ -3014,10 +3014,21 @@ ngx_int_t ngx_http_cache_turbo_tag_purge_complete(ngx_http_request_t *r,
  * ETag / Last-Modified (if any) are injected as If-None-Match /
  * If-Modified-Since on the subrequest so a stale-while-revalidate refresh can
  * be answered 304 by the origin instead of always paying a full body. Pass
- * NULL/0 (the admin warm path) for the old unconditional-GET behaviour. */
+ * NULL/0 (the admin warm path) for the old unconditional-GET behaviour.
+ *
+ * `unparsed_uri_src`: the operator-supplied uri text in its ORIGINAL
+ * (still percent-escaped) form, as it appeared on the wire/in the warm list --
+ * NOT `uri`, which by this point may already be percent-decoded. When `uri`/
+ * `args` are not byte-identical to r->uri/r->args (the admin warm path; see
+ * UB-PROXYNULLURI in module.c), warm_one() cannot inherit r->valid_unparsed_uri
+ * and needs its own escaped request-target text to synthesise a private
+ * sr->unparsed_uri so ngx_http_proxy_create_request() never falls into the
+ * memcpy(dst, NULL, 0) UB at ngx_http_proxy_module.c:1383. Pass NULL when the
+ * caller has no such raw text (internal warms always pass byte-identical
+ * uri/args and take the inherit path instead). */
 ngx_int_t ngx_http_cache_turbo_warm_one(ngx_http_request_t *r,
     ngx_str_t *uri, ngx_str_t *args, u_char *snap, size_t snap_len,
-    ngx_http_cache_turbo_ctx_t **ctx_out);
+    ngx_http_cache_turbo_ctx_t **ctx_out, ngx_str_t *unparsed_uri_src);
 
 
 /* ---- admin.c (admin request handler) ---- */
