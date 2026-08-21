@@ -321,6 +321,51 @@ mis-tuned run cannot be mistaken for a real result further down the pipeline.
 
 ---
 
+## Allocation-churn harness (slab-pool contention)
+
+`bench.sh` and `zipfbench.sh` both spend most of their traffic on hits (or a
+Zipf hot head) — neither can validate anything that depends on *allocation*
+itself, because hits never call `ngx_slab_alloc_locked`/`ngx_slab_free_locked`.
+[`tools/allocbench.sh`](ci/tools/allocbench.sh) fills that gap: a uniform
+random one-shot key stream, deliberately far larger than the request volume
+and deliberately NOT Zipf-skewed, against a zone sized to force sustained
+eviction, so nearly every request is a cold miss that allocates and every
+eviction frees behind it.
+
+```console
+$ eval "$(ci/tools/ci-build.sh nginx 1.31.3 profile)"
+$ WORKERS=16 CONC=64 DURATION=20 ci/tools/allocbench.sh "$binary" "$module"
+Allocation-churn workload: ZONE=8m BODY=512 KEYS=2000000 WORKERS=16 ...
+== RESULT ==
+hit_ratio_pct=0.18  (hits=7250 miss=4011139 evictions=4007524 total=4018389)
+...
+```
+
+| var | meaning | default |
+| --- | --- | --- |
+| `ZONE` | `cache_turbo_zone` size | `8m` |
+| `BODY` | body bytes per key | `512` |
+| `KEYS` | size of the uniform-random key-space | `2000000` |
+| `WORKERS` | nginx `worker_processes`, concurrency on the shared pool | `8` |
+| `CONC` | concurrent client connections (`wrk -c`) | `WORKERS*4` |
+| `DURATION` | wrk load duration (seconds) | `20` |
+| `PROFILE` | wrap the load pass in `perf record`, self-time by symbol | `1` |
+
+It reports HIT ratio (should read near-zero — a high reading means the run
+drifted out of the allocation-dominated regime; the script warns above 15%),
+alloc/free event counts (derived from the `misses`/`evictions` Prometheus
+counters — every miss stores, every eviction frees), per-stripe occupancy
+skew for `crc32(key) % N` (matching the module's own stripe-selector hash),
+and, with `PROFILE=1`, a `perf report` breakdown with `ngx_shmtx_*` and
+`ngx_slab_alloc/free_*` self-time percentages called out explicitly. A full
+measured run, plus two workload-development pitfalls this harness hit while
+being written (PRNG lockstep across wrk threads; origin connection churn
+burying the module symbols in the profile), is recorded in the module's
+memory mirror — `PLAN-optimize.md` § P4-2-s2, outside this repo, not linked
+here since it is not a published path.
+
+---
+
 ## See also
 
 - [README.md](README.md) — what the module is, every directive, configuration.
@@ -329,6 +374,8 @@ mis-tuned run cannot be mistaken for a real result further down the pipeline.
   one-shot crawl against a hot set.
 - [`tools/zipfbench.sh`](ci/tools/zipfbench.sh) — Zipf multi-key hit-ratio,
   throughput and origin-offload harness (this section).
+- [`tools/allocbench.sh`](ci/tools/allocbench.sh) — allocation-churn / slab-pool
+  contention harness (this section).
 - [`tools/soak.sh`](ci/tools/soak.sh) — correctness/stability soak under ASAN/valgrind.
 - [Monitoring (Prometheus + Grafana)](README.md#monitoring-prometheus--grafana)
   — the same counters bench.sh reads for its HIT % column.
