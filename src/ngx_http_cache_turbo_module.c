@@ -4595,6 +4595,69 @@ ngx_http_cache_turbo_warm_one(ngx_http_request_t *r, ngx_str_t *uri,
      * (test_warm_populates). */
     sr->header_only = 0;
 
+    /*
+     * ⚠ UB-PROXYNULLURI. A subrequest is `internal` and, unlike the client
+     * request it was spawned from, ngx_http_subrequest() leaves
+     * sr->valid_unparsed_uri at 0 (it is only copied under
+     * NGX_HTTP_SUBREQUEST_CLONE). That single bit decides which branch
+     * ngx_http_proxy_create_request() takes for a `proxy_pass` whose URL has
+     * NO URI component (`proxy_pass http://host;` -- no trailing slash, no
+     * path), where ctx->vars.uri is the zeroed {0, NULL}:
+     *
+     *   valid_unparsed_uri=1 -> the unparsed_uri branch; 1383 never runs.
+     *   valid_unparsed_uri=0 -> the else branch, whose copy is guarded ONLY by
+     *                           r->valid_location (1 for every subrequest)
+     *                           and NOT by ctx->vars.uri.len -- unlike the
+     *                           length pass a hundred lines above, which does
+     *                           test both. So it reaches
+     *                           ngx_copy(dst, NULL, 0) == memcpy(dst, NULL, 0),
+     *                           which is undefined behaviour: passing NULL for
+     *                           a parameter declared __attribute__((nonnull))
+     *                           even with n == 0.
+     *
+     * Under -fsanitize=undefined with halt_on_error=1 that ABORTS THE WORKER
+     * mid-request, so the client sees a connection closed with no response.
+     * Reproduced deterministically (nginx 1.31.3, gcc 14.2.0):
+     *
+     *   src/http/modules/ngx_http_proxy_module.c:1383:23: runtime error:
+     *   null pointer passed as argument 2, which is declared to never be null
+     *       #0 ngx_http_proxy_create_request  ngx_http_proxy_module.c:1383
+     *       #1 ngx_http_upstream_init_request ngx_http_upstream.c:669
+     *       ...
+     *       #8 ngx_http_run_posted_requests   ngx_http_request.c:2648
+     *
+     * frame #8 being this very subrequest running off the posted-request
+     * queue. It is latent nginx-core UB -- an ordinary internal redirect into
+     * the same location shape reaches it too -- but a warm subrequest is one
+     * of the ways to get there, so fix it where we control the code.
+     *
+     * THE FIX, and why it is safe rather than a workaround: this subrequest's
+     * URI is `uri`/`args` as handed to us. When those are byte-identical to
+     * the parent's own r->uri/r->args -- which is the case for EVERY internal
+     * warm (SWR background refresh, the cache_turbo_store_head HEAD warm):
+     * they pass &r->uri and &r->args verbatim -- then r->unparsed_uri is by
+     * construction the raw form of this exact request target, and the
+     * unparsed_uri branch emits precisely what the parent's own proxy_pass
+     * would emit for the same location. Inheriting the bit is therefore not a
+     * behaviour change; it restores the branch the client request already
+     * takes.
+     *
+     * The admin warm endpoint (admin.c) passes an OPERATOR-SUPPLIED uri that
+     * has nothing to do with r->unparsed_uri, so the bit stays 0 there -- the
+     * upstream request line must be built from OUR uri, never from the admin
+     * POST's. Fail safe: the comparison below is the whole gate.
+     */
+    if (r->valid_unparsed_uri
+        && uri->len == r->uri.len
+        && (uri->len == 0
+            || ngx_memcmp(uri->data, r->uri.data, uri->len) == 0)
+        && args->len == r->args.len
+        && (args->len == 0
+            || ngx_memcmp(args->data, r->args.data, args->len) == 0))
+    {
+        sr->valid_unparsed_uri = 1;
+    }
+
     return NGX_OK;
 }
 
