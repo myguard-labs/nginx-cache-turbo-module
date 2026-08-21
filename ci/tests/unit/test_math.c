@@ -176,8 +176,10 @@ zone_reset(void)
 {
     memset(&g_sh, 0, sizeof(g_sh));
     memset(&g_pool, 0, sizeof(g_pool));
-    g_zone.sh = &g_sh;
-    g_zone.shpool = &g_pool;
+    memset(&g_zone, 0, sizeof(g_zone));
+    g_zone.nstripes = 1;
+    g_zone.stripes[0].sh = &g_sh;
+    g_zone.stripes[0].shpool = &g_pool;
 }
 
 /* set the window deltas by loading current counters (snapshot stays 0) */
