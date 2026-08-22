@@ -452,6 +452,19 @@ ngx_http_cache_turbo_redis_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             "configured in this block; the two are mutually exclusive");
     }
 
+    /* A second cache_turbo_redis in the same block is an ERROR, not an
+     * override. Re-entering would only overwrite the fields the NEW DSN
+     * happens to carry: userinfo, db and the tls flag are set by
+     * split_dsn/param ONLY when present, so the first directive's user,
+     * password and db survive under the second one's host, and a rediss://
+     * first line cannot be downgraded by a redis:// second one (redis_tls
+     * is never cleared on any path). The result is a config that silently
+     * means something other than what it says -- the first directive's
+     * credentials sent to the second directive's host. */
+    if (clcf->redis_enable == 1) {
+        return "is duplicate";
+    }
+
     /* --- 1. split the DSN (scheme / userinfo / host:port / db) ------------- */
     rc = ngx_http_cache_turbo_redis_split_dsn(cf, clcf, &arg1, &hostport);
     if (rc != NGX_CONF_OK) {
@@ -594,6 +607,15 @@ ngx_http_cache_turbo_memcached_conf(ngx_conf_t *cf, ngx_command_t *cmd,
         return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
             "cache_turbo_memcached: an L2 backend (cache_turbo_redis) is already "
             "configured in this block; the two are mutually exclusive");
+    }
+
+    /* Same rule as redis_conf above: a second cache_turbo_memcached in one
+     * block is an error rather than an override. The guard above excludes
+     * memcached==1 because that is this directive's own mark, so without
+     * this a repeat fell through and re-entered on the first one's prefix
+     * and timeout. */
+    if (clcf->memcached == 1) {
+        return "is duplicate";
     }
 
     ngx_memzero(&u, sizeof(ngx_url_t));

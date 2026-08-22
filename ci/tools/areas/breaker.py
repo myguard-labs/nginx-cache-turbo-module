@@ -955,6 +955,61 @@ def test_empty_l2_prefix_rejected(ng: Nginx) -> None:
             f"missing empty-prefix diagnostic for {name}:\n{r.stdout}"
 
 
+def test_duplicate_l2_directive_rejected(ng: Nginx) -> None:
+    """A second cache_turbo_redis / cache_turbo_memcached in ONE block must
+    fail nginx -t rather than partially override the first.
+
+    Re-entering the setter only overwrites what the NEW DSN carries: userinfo,
+    db and the tls flag are written only when present, so the first line's
+    user/password/db survived under the second line's host, and a rediss://
+    first line could not be downgraded by a redis:// second one -- redis_tls
+    is never cleared on any path. That sends the first directive's credentials
+    to the second directive's host, which is why a silent accept is the
+    failure mode this guards.
+
+    The memcached arm is not a copy for symmetry: its exclusivity guard reads
+    `redis_enable == 1 && memcached != 1`, and memcached==1 is its OWN mark, so
+    a repeat fell straight through that check onto the first line's prefix and
+    timeout.
+    """
+    cases = []
+    if ng.redis_port is not None:
+        cases.append(
+            ("redis", f"cache_turbo_redis 127.0.0.1:{ng.redis_port} db=1;"))
+    if ng.memcached_port is not None:
+        # NOTE the DOUBLE space after the directive name -- that is how
+        # nginx_config.py emits it, and a single space silently fails the
+        # `old in cfg` fixture assert below rather than testing anything.
+        cases.append(
+            ("memcached",
+             (f"cache_turbo_memcached  127.0.0.1:{ng.memcached_port} "
+              f"prefix=mc: timeout=250ms;")))
+
+    if not cases:
+        return
+
+    for name, old in cases:
+        bad = ng.root.parent / f"bad-dup-{name}"
+        (bad / "conf").mkdir(parents=True, exist_ok=True)
+        (bad / "logs").mkdir(parents=True, exist_ok=True)
+        cfg = nginx_config(
+            bad, ng.port, ng.module, ng.origin_port, 1, ng.redis_port,
+            ng.redis_auth_port, ng.redis_password, ng.redis_tls_port,
+            ng.redis_tls_ca, ng.memcached_port)
+        assert old in cfg, f"test fixture missing {old!r}"
+        # Duplicate the directive in place, so the pair lands in ONE block --
+        # two lines in two different blocks is legal and would prove nothing.
+        idx = cfg.index(old)
+        cfg = cfg[:idx] + old + "\n            " + cfg[idx:]
+        (bad / "conf" / "nginx.conf").write_text(cfg, encoding="ascii")
+        cmd = ng.runner + [str(ng.binary), "-p", str(bad),
+                           "-c", str(bad / "conf" / "nginx.conf"), "-t"]
+        r = subprocess.run(cmd, text=True, stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, timeout=20)
+        assert r.returncode != 0, \
+            f"duplicate {name} directive was accepted by nginx -t:\n{r.stdout}"
+        assert "is duplicate" in r.stdout, \
+            f"missing/odd duplicate diagnostic for {name}:\n{r.stdout}"
 
 
 def test_backend_prefix_rejected(ng: Nginx) -> None:

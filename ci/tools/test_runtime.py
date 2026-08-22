@@ -125,6 +125,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_backend_none_overrides_inherited(ng, origin)
     test_valid_status_rejects_304(ng)
     test_empty_l2_prefix_rejected(ng)
+    test_duplicate_l2_directive_rejected(ng)
     test_backend_prefix_rejected(ng)
     test_keepalive_cap_rejected(ng)
     test_s8_scan_resistant_config_rejects(ng)
