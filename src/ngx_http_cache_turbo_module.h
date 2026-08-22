@@ -994,6 +994,26 @@ typedef struct {
      * enumeration until the zone is reloaded. */
     ngx_atomic_t             tag_index_drops;
 
+    /* TAG-CAP-SILENT-DROP: counts tags silently dropped from the tag INDEX
+     * because a response named more than NGX_HTTP_CACHE_TURBO_MAX_TAGS
+     * distinct tags (_body_filter_tag_split's cap, filters.c). This is a
+     * DIFFERENT fault class from tag_index_drops above: tag_index_drops is
+     * a transport failure (SADD never reached L2) for tags that WERE
+     * selected; tag_cap_drops is tags that never got a chance to be
+     * selected at all because the cap truncated the value first. Distinct
+     * counter, not folded into tag_index_drops, so an operator can tell
+     * "L2 was unreachable" (transient, fixed by retry/reload) from
+     * "raise the cap or emit fewer tags" (a config/origin problem) apart
+     * on the same admin/Prometheus surface.
+     *
+     * Same no-self-heal reasoning as tag_index_drops: the dropped tag is
+     * never re-derived by a later cache hit, so once a response has hit
+     * the cap, purge-by-tag on the truncated tag(s) can never claim a
+     * complete enumeration for this zone until reload. Feeds the SAME
+     * purge-by-tag "complete":false decision as tag_index_drops (see
+     * admin.c's ?tag= handler and tag_purge_complete in purge.c). */
+    ngx_atomic_t             tag_cap_drops;
+
     /* P4-1a: W-TinyLFU frequency sketch (count-min, 4-bit counters).
      *
      * STAGE 1 OF 2. This stage only ESTIMATES frequency; nothing reads the
@@ -1321,6 +1341,10 @@ typedef struct {
      * instead of silent. */
     ngx_atomic_uint_t   varidx_drops;
     ngx_atomic_uint_t   tag_index_drops;
+    /* TAG-CAP-SILENT-DROP: tags truncated by the MAX_TAGS cap before they
+     * could ever be indexed -- see the shctx field comment above for how
+     * this differs from tag_index_drops. */
+    ngx_atomic_uint_t   tag_cap_drops;
     /* P3-7: live count of background-refresh subrequests in flight right
      * now (a gauge, not a counter -- goes up on fire, down on completion).
      * Answers exactly the "invisible to the module's own metrics" gap the
@@ -3026,9 +3050,10 @@ typedef struct {
      * Set on BOTH purge paths, from different counters:
      *   - auto-Vary (is_auto_vary): varidx_drops - varidx_reissues, i.e. the
      *     UNHEALED drops only, because that index self-heals on a later hit.
-     *   - by-tag (admin.c ?tag=): tag_index_drops alone. There is no tag
-     *     re-issue and no tag_index_reissues counter (see shctx_t), so every
-     *     drop this zone has ever taken stays outstanding.
+     *   - by-tag (admin.c ?tag=): tag_index_drops + tag_cap_drops. Neither
+     *     fault class self-heals -- there is no tag_index_reissues counter
+     *     and no cap-drop reissue path either (see shctx_t) -- so every
+     *     drop of EITHER class this zone has ever taken stays outstanding.
      *
      * Zone-scoped, not base- or tag-scoped: the index set carries no
      * per-member pending flag to check directly. Deliberately conservative

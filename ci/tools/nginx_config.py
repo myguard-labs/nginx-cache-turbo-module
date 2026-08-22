@@ -567,12 +567,31 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
         }}
 
         # PERF-2: tag value taken from a query arg (upstream-controlled stand-in)
-        # so the cap/dedup on cache_turbo_tag can be exercised.
+        # so the cap/dedup on cache_turbo_tag can be exercised. Own zone
+        # (tcapz, NOT main) -- several tests here deliberately overflow the
+        # MAX_TAGS cap, and a cap-drop is now ZONE-scoped and observable
+        # (tag_cap_drops); see the tcapz declaration above for why that must
+        # stay off `main`.
         location /l2tcap/ {{
-            cache_turbo          main;
+            cache_turbo          tcapz;
             cache_turbo_key      $uri;
             cache_turbo_valid    30s;
             cache_turbo_redis    127.0.0.1:{redis_port} prefix=ct: timeout=250ms;
+            cache_turbo_tag      $arg_t;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # TAG-CAP-SILENT-DROP: same zone (tcapz) as /l2tcap/, separate redis
+        # prefix so its objects/tag sets stay distinct in Redis. Zone sharing
+        # with /l2tcap/ is fine here (unlike the reasoning above) because
+        # nothing needs to isolate FROM /l2tcap/'s own cap-drops -- both
+        # locations are already the cap-overflow tests, so seeing each
+        # other's tag_cap_drops changes nothing either asserts on.
+        location /l2tcapdrop/ {{
+            cache_turbo          tcapz;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    30s;
+            cache_turbo_redis    127.0.0.1:{redis_port} prefix=tcd: timeout=250ms;
             cache_turbo_tag      $arg_t;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
@@ -795,6 +814,16 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
         location = /_cache_l2tvd {{
             cache_turbo_admin    main;
             cache_turbo_redis    127.0.0.1:{redis_port} prefix=tvd: timeout=250ms;
+            allow 127.0.0.1;
+            deny all;
+        }}
+
+        # TAG-CAP-SILENT-DROP: purge-by-tag + stats endpoint for /l2tcapdrop/'s
+        # own zone (tcapz), so this test's tag_cap_drops reads and purge-by-tag
+        # calls never touch `main`'s tag_index_drops/tag_cap_drops baseline.
+        location = /_cache_l2tcapdrop {{
+            cache_turbo_admin    tcapz;
+            cache_turbo_redis    127.0.0.1:{redis_port} prefix=tcd: timeout=250ms;
             allow 127.0.0.1;
             deny all;
         }}
@@ -1485,6 +1514,20 @@ http {{
     # and store essentially nothing, so the zone only ever holds counter nodes.
     # Sizing them at 16m each cost 32m of shared memory for no coverage, which
     # matters under ASan where the redzone overhead per allocation is large.
+    # TAG-CAP-SILENT-DROP: private zone for /l2tcap/ and /l2tcapdrop/ (the
+    # MAX_TAGS cap tests). tag_cap_drops/tag_index_drops are ZONE-scoped and,
+    # like tag_index_drops (see /tagidxdrop/ above), never self-heal, so once
+    # a zone takes a cap-drop every later purge-by-tag in it degrades
+    # permanently. This MUST NOT be `main`: the SILENT-INDEX-DROP option
+    # (a)/(c) tests (areas/policy.py) assert an exact zero baseline for
+    # their own clean leg, and several pre-existing tag-cap tests
+    # (test_l2_tag_truncation_warns's "over-cap" leg, test_l2_tag_cap_and_
+    # dedup) deliberately overflow the cap -- on `main` that would poison
+    # those baselines even though a cap-drop is a different fault class from
+    # a tag-index transport drop. Isolating every cap-overflowing location
+    # into its own zone keeps the two fault classes from cross-contaminating
+    # each other's tests.
+    cache_turbo_zone name=tcapz 1m;
     cache_turbo_zone name=l2negz 1m;
     # SUITE-1: private zone for the long-memo outage location (/l2negout/), kept
     # separate from l2negz so the 60s memo cannot bleed into the short-window

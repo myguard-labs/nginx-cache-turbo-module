@@ -14,6 +14,7 @@ from __future__ import annotations
 from test_runtime_base import *
 from test_runtime_base import (
     _admin_lock_waits,
+    _admin_stat,
     _backoff_skips,
     _bump_conn,
     _config_test_result,
@@ -1743,6 +1744,96 @@ def test_l2_tag_cap_and_dedup(ng: Nginx, origin: Origin,
         "deduped tag was not indexed"
     assert redis.cli("SCARD", tag_key("dup")) == "1", \
         "duplicate tag produced more than one membership"
+
+
+def test_l2_tag_cap_purge_reports_degraded(ng: Nginx, origin: Origin,
+                                            redis: RedisServer) -> None:
+    """TAG-CAP-SILENT-DROP: a purge-by-tag must report "complete":false when
+    the purged tag was one that got silently truncated by the MAX_TAGS cap
+    (filters.c's _body_filter_tag_index), exactly as it already does for a
+    tag-index write dropped at the transport (tag_index_drops,
+    test_tagidx_purge_reports_degraded_after_dropped_index_write in
+    areas/policy.py).
+
+    Before this fix, tag_cap_drops did not exist and the by-tag purge reply
+    read ONLY tag_index_drops (a different fault class: a transport failure
+    for a tag that WAS selected). A tag past the cap was never selected in
+    the first place, so its purge went through the ordinary clean-enumeration
+    path and reported plain {"purged":N} while the over-cap object stayed
+    resident and stale in L1 -- clean success reported over a known-incomplete
+    index. This test stores an object with 30 distinct tags on /l2tcapdrop/
+    (cap is 16, per test_l2_tag_cap_and_dedup's /l2tcap/ above -- same cap,
+    separate zone/prefix, see below) and purges by the LAST tag in the list
+    (cap29), which is guaranteed to be one of the 14 dropped past the cap.
+
+    OWN ZONE (tcapz), not /l2tcap/'s `main`: tag_cap_drops/tag_index_drops
+    are ZONE-scoped and neither self-heals, so a cap-drop landing in `main`
+    would permanently poison the SILENT-INDEX-DROP option (a)/(c) tests'
+    "zone starts clean" baseline in areas/policy.py (test_l9_tag_index_drop_
+    is_observable, test_tagidx_purge_reports_degraded_after_dropped_index_
+    write) even though a cap-drop is a different fault class from a
+    tag-index transport drop. Own zone keeps the two fault classes from
+    cross-contaminating each other's tests, mirroring why /tagidxdrop/ above
+    uses its own redis prefix for the SAME reason at the prefix level.
+
+    MUTATION THIS CATCHES: reverting the tag_cap_drops increment in
+    filters.c, or reverting the tag_index_drops + tag_cap_drops sum in
+    admin.c's ngx_http_cache_turbo_admin_purge_tag, makes this purge report a
+    bare {"purged":N} (or "purged":0, since cap29 was never indexed at all)
+    with no "complete" field, and this test goes red."""
+    import json
+
+    tag = "capdrop"
+    tags = ",".join(f"{tag}{i}" for i in range(30))  # cap0..cap29, 30 > 16
+    for i in range(30):
+        redis.cli("DEL", tag_key(f"{tag}{i}", prefix="tcd:"))
+
+    # tcapz is shared with /l2tcap/'s own cap-overflow tests (they run
+    # earlier in run_all() and legitimately bump tag_cap_drops too), so this
+    # asserts the counter MOVES by this store rather than starting at zero
+    # -- same convention as test_l9_tag_index_drop_is_observable's delta
+    # check for tag_index_drops.
+    before = _admin_stat(ng, "tag_cap_drops", "/_cache_l2tcapdrop")
+
+    obj = l2_key("/l2tcapdrop/capdrop-obj", prefix="tcd:")
+    s, b0, _ = fetch(ng.port, f"/l2tcapdrop/capdrop-obj?t={tags}")
+    assert s == 200 and b0, f"cap-drop prime failed: {s} {b0!r}"
+    assert wait_for(lambda: redis.cli(
+        "SISMEMBER", tag_key(f"{tag}0", prefix="tcd:"), obj) == "1"), \
+        "first tag should have been indexed"
+
+    after = _admin_stat(ng, "tag_cap_drops", "/_cache_l2tcapdrop")
+    assert after - before >= 1, \
+        (f"tag_cap_drops did not move for a response naming 30 tags against "
+         f"a MAX_TAGS=16 cap: before={before} after={after}")
+
+    # cap29 is past the cap (only cap0..cap15 make it in) -- confirm it was
+    # never indexed, so the purge below can only find it via the degraded
+    # report, not by actually enumerating it.
+    last_tag = f"{tag}29"
+    assert redis.cli("SISMEMBER", tag_key(last_tag, prefix="tcd:"), obj) \
+        != "1", "cap29 should NOT be indexed -- it is past the 16-tag cap"
+
+    s, b, _ = fetch(ng.port, f"/_cache_l2tcapdrop?tag={last_tag}",
+                     method="POST")
+    assert s == 200, f"cap-drop tag purge status {s}: {b}"
+    reply = json.loads(b)
+    assert reply["purged"] == 0, \
+        (f"cap29 was never indexed, so the tag set purge must enumerate "
+         f"nothing: {b}")
+    assert reply.get("complete") is False, \
+        (f"purge-by-tag must report 'complete':false when this zone has an "
+         f"outstanding cap-drop -- otherwise it claims a complete "
+         f"enumeration of a tag it never had a chance to index, while "
+         f"/l2tcapdrop/capdrop-obj keeps serving stale under cap29: {b}")
+
+    # The object is exactly what the degraded report is warning about: the
+    # purge could not reach it (it was never indexed), and it is STILL
+    # SERVING from L1.
+    s, b1, h1 = fetch(ng.port, "/l2tcapdrop/capdrop-obj")
+    assert s == 200 and h1.get("x-cache") == "HIT" and b1 == b0, \
+        ("the over-cap object should have survived the purge -- if it did "
+         "not, this test is no longer exercising the cap-drop case")
 
 
 def test_l2_tag_purge_arg_validation(ng: Nginx, origin: Origin,

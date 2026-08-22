@@ -308,10 +308,21 @@ ngx_http_cache_turbo_admin_purge_tag(ngx_http_request_t *r,
      * intended: once this zone has dropped a tag-index write, every later
      * purge-by-tag in it reports "complete":false until reload. That is
      * honest -- nothing has repaired the index -- and it is the signal an
-     * operator needs to know a re-purge or an origin-side purge is required. */
+     * operator needs to know a re-purge or an origin-side purge is required.
+     *
+     * TAG-CAP-SILENT-DROP: sum in tag_cap_drops too. It is a distinct fault
+     * class (a tag that never got selected because the cap truncated the
+     * value, versus a selected tag whose SADD never reached L2) but it is
+     * the SAME user-visible defect -- an object the enumeration below
+     * cannot see stays resident and stale -- so it must gate the same
+     * "complete":false reply. Neither counter self-heals, so the sum is
+     * exactly as outstanding as either half. */
     tp->pending_at_launch = (ngx_uint_t)
         ngx_atomic_fetch_add(
-            &ngx_http_cache_turbo_zone_sh(z)->tag_index_drops, 0);
+            &ngx_http_cache_turbo_zone_sh(z)->tag_index_drops, 0)
+        + (ngx_uint_t)
+          ngx_atomic_fetch_add(
+              &ngx_http_cache_turbo_zone_sh(z)->tag_cap_drops, 0);
 
     tp->tag.len = arg->len;
     tp->tag.data = ngx_pnalloc(r->pool, arg->len);
@@ -544,6 +555,13 @@ ngx_http_cache_turbo_admin_stats_prometheus(ngx_http_request_t *r,
         "the affected object until its own TTL).\n"
         "# TYPE cache_turbo_tag_index_drops_total counter\n"
         "cache_turbo_tag_index_drops_total{zone=\"%V\"} %uA\n"
+        "# HELP cache_turbo_tag_cap_drops_total Tags silently dropped from "
+        "the purge-by-tag index because a response named more than "
+        "NGX_HTTP_CACHE_TURBO_MAX_TAGS distinct tags (no self-heal; a later "
+        "purge of a dropped tag will not invalidate the affected object "
+        "until its own TTL).\n"
+        "# TYPE cache_turbo_tag_cap_drops_total counter\n"
+        "cache_turbo_tag_cap_drops_total{zone=\"%V\"} %uA\n"
         "# HELP cache_turbo_breaker_opens_total Lifetime count of CLOSED->OPEN circuit breaker trips.\n"
         "# TYPE cache_turbo_breaker_opens_total counter\n"
         "cache_turbo_breaker_opens_total{zone=\"%V\"} %uA\n"
@@ -579,6 +597,7 @@ ngx_http_cache_turbo_admin_stats_prometheus(ngx_http_request_t *r,
         &zname, st->sie_serves, &zname, st->breaker_serves,
         &zname, st->origin_failures,
         &zname, st->varidx_drops, &zname, st->tag_index_drops,
+        &zname, st->tag_cap_drops,
         &zname, st->breaker_opens,
         &zname, (ngx_atomic_uint_t) ngx_http_cache_turbo_brk_state(
             (ngx_uint_t) st->breaker_state),
@@ -615,10 +634,10 @@ ngx_http_cache_turbo_admin_stats_json(ngx_http_request_t *r,
                  "\"breaker_state\":\"\",\"breaker_opens\":,"
                  "\"sie_serves\":,\"breaker_serves\":,"
                  "\"origin_failures\":,\"varidx_drops\":,"
-                 "\"tag_index_drops\":,\"bg_inflight\":,"
+                 "\"tag_index_drops\":,\"tag_cap_drops\":,\"bg_inflight\":,"
                  "\"sketch_gen\":,\"sketch_bumps\":,"
                  "\"admission_refused\":,\"used_bytes\":}\n")
-          + 33 * NGX_ATOMIC_T_LEN
+          + 34 * NGX_ATOMIC_T_LEN
           + sizeof("half-open") - 1;   /* longest _breaker_state_str value */
     p = ngx_pnalloc(r->pool, len);
     if (p == NULL) {
@@ -640,7 +659,7 @@ ngx_http_cache_turbo_admin_stats_json(ngx_http_request_t *r,
         "\"breaker_state\":\"%s\",\"breaker_opens\":%uA,"
         "\"sie_serves\":%uA,\"breaker_serves\":%uA,"
         "\"origin_failures\":%uA,\"varidx_drops\":%uA,"
-        "\"tag_index_drops\":%uA,\"bg_inflight\":%uA,"
+        "\"tag_index_drops\":%uA,\"tag_cap_drops\":%uA,\"bg_inflight\":%uA,"
         "\"sketch_gen\":%uA,\"sketch_bumps\":%uA,"
         "\"admission_refused\":%uA,\"used_bytes\":%uA}\n",
         st->hits, st->misses, st->stale_serves,
@@ -656,7 +675,7 @@ ngx_http_cache_turbo_admin_stats_json(ngx_http_request_t *r,
             (ngx_uint_t) st->breaker_state),
         st->breaker_opens,
         st->sie_serves, st->breaker_serves, st->origin_failures,
-        st->varidx_drops, st->tag_index_drops,
+        st->varidx_drops, st->tag_index_drops, st->tag_cap_drops,
         st->bg_inflight,
         st->sketch_gen, st->sketch_bumps, st->admission_refused,
         st->used_bytes) - p;

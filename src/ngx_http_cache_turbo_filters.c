@@ -1872,6 +1872,15 @@ ngx_http_cache_turbo_body_filter_tag_index(ngx_http_request_t *r,
         s++;
     }
     if (s < e) {
+        /* TAG-CAP-SILENT-DROP: this WARN alone left the drop invisible to
+         * every counter the degraded purge report (SILENT-INDEX-DROP(c),
+         * purge.c) reads -- a purge of a tag past the cap reported clean
+         * success while a stale representation kept serving. Count it into
+         * its own counter (tag_cap_drops, distinct from tag_index_drops:
+         * this is a cap truncation, not a transport failure) so the by-tag
+         * purge reply can report "complete":false for this fault class too. */
+        (void) ngx_atomic_fetch_add(
+            &ngx_http_cache_turbo_zone_sh(z)->tag_cap_drops, 1);
         ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
             "cache_turbo: tag list truncated at %ui tags for "
             "\"%V\" -- the remaining tags are NOT indexed and a "
