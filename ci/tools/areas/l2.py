@@ -1996,9 +1996,9 @@ def test_l2_vary_marker_cold_node_finds_peer_variant(
 
         assert sb == 200, f"B's fetch failed: {sb}"
         assert body_b == body_a, \
-            ("B served a DIFFERENT body than A's stored variant -- either "
-             "it went to origin for a fresh gen, or (far worse) it resolved "
-             "the WRONG variant", body_a, body_b)
+            (("B served a DIFFERENT body than A's stored variant -- either "
+              "it went to origin for a fresh gen, or (far worse) it resolved "
+              "the WRONG variant"), body_a, body_b)
         assert origin.hits_for(l2_uri) - origin_before_b == 0, (
             "B went to the ORIGIN instead of finding A's variant in L2 -- "
             "the L2-backed marker consult on B's cold L1 either did not "
@@ -2107,21 +2107,21 @@ def _c2_purge_stops_peer(ng: Nginx, origin: Origin, redis: RedisServer,
 
         if require_healed:
             assert body_b2 != body_a, (
-                "B (peer node) served the OLD variant body AFTER A's PURGE "
-                "and past the revalidation window -- cross-node marker "
-                "staleness was not closed",
+                ("B (peer node) served the OLD variant body AFTER A's PURGE "
+                 "and past the revalidation window -- cross-node marker "
+                 "staleness was not closed"),
                 body_a, body_b2)
             assert "x-cache" not in hb2 or hb2.get("x-cache") != "HIT", (
                 "B's post-PURGE, post-window read must not be a stale L1 "
                 f"HIT, got X-Cache={hb2.get('x-cache')!r}")
         else:
             assert body_b2 == body_a, (
-                "NEGATIVE CONTROL FAILED: with "
-                "cache_turbo_vary_marker_revalidate 0, B (peer node) is "
-                "EXPECTED to keep serving the stale pre-PURGE variant "
-                "(today's unbounded behaviour) -- it did not, so this test "
-                "shape does not actually discriminate the fix from the "
-                "no-fix baseline",
+                ("NEGATIVE CONTROL FAILED: with "
+                 "cache_turbo_vary_marker_revalidate 0, B (peer node) is "
+                 "EXPECTED to keep serving the stale pre-PURGE variant "
+                 "(today's unbounded behaviour) -- it did not, so this test "
+                 "shape does not actually discriminate the fix from the "
+                 "no-fix baseline"),
                 body_a, body_b2)
             assert hb2.get("x-cache") == "HIT", (
                 "negative control: B should still be resolving the stale "

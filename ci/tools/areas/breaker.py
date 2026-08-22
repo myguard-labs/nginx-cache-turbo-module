@@ -812,8 +812,8 @@ def test_backend_separators(ng: Nginx) -> None:
         "wordpress|woocommerce joomla",
         "mediawiki|drupal",
         "none",
-        "wordpress|woocommerce|joomla|xenforo|discourse|phpbb|drupal|mediawiki"
-        "|magento|ghost|wagtail|kirby|shopware6|typo3",
+        ("wordpress|woocommerce|joomla|xenforo|discourse|phpbb|drupal|mediawiki"
+         "|magento|ghost|wagtail|kirby|shopware6|typo3"),
         "magento|ghost",
         "wagtail|kirby",
         "shopware6|typo3",

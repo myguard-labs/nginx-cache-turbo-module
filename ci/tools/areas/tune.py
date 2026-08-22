@@ -392,16 +392,16 @@ def test_key_encoded_origin_serve_guard_refuses_wrong_ae_class(
 
     _, b_br, h_br = fetch(ng.port, p, {"Accept-Encoding": "br"})
     assert h_br.get("x-ct-status") != "HIT", (
-        "a br-only client got X-CT-Status=HIT against a gzip-class stored "
-        "blob -- the serve-side ae-class guard did not refuse it",
+        ("a br-only client got X-CT-Status=HIT against a gzip-class stored "
+         "blob -- the serve-side ae-class guard did not refuse it"),
         h_br.get("x-ct-status"))
     assert b_br != b_gzip, (
-        "a br-only client received the gzip-class stored body -- the "
-        "serve-side ae-class guard did not refuse a cross-coding serve",
+        ("a br-only client received the gzip-class stored body -- the "
+         "serve-side ae-class guard did not refuse a cross-coding serve"),
         b_gzip, b_br)
     assert origin.hits_for("/precompressed") - base == 2, (
-        "a br-only client must cause a fresh origin contact, never be "
-        "served the gzip-class blob (guard failed open)",
+        ("a br-only client must cause a fresh origin contact, never be "
+         "served the gzip-class blob (guard failed open)"),
         origin.hits_for("/precompressed") - base)
 
 
@@ -650,12 +650,12 @@ def test_auto_vary_origin_not_class_folded(ng: Nginx, origin: Origin) -> None:
     assert s1 == 200 and s2 == 200 and s3 == 200, (s1, s2, s3)
     assert b1 == b2, ("same Origin should share a slot", b1, b2)
     assert b1 != b3, (
-        "ORIGIN got class-folded -- two distinct origins sharing an 8-byte "
-        "prefix collapsed onto one slot; this is a CORS cross-origin leak",
+        ("ORIGIN got class-folded -- two distinct origins sharing an 8-byte "
+         "prefix collapsed onto one slot; this is a CORS cross-origin leak"),
         b1, b3)
     assert origin.hits_for("/orgnofold?v=or") - base == 2, (
-        "ORIGIN must stay raw: two distinct origins => two origin hits, "
-        "not one folded class", origin.hits_for("/orgnofold?v=or") - base)
+        ("ORIGIN must stay raw: two distinct origins => two origin hits, "
+         "not one folded class"), origin.hits_for("/orgnofold?v=or") - base)
 
 
 def test_auto_vary_star_uncacheable(ng: Nginx, origin: Origin) -> None:
