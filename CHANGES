@@ -29,6 +29,26 @@ Changes with the nginx-cache-turbo-module (unreleased)
        Mitigation without upgrading: ensure the L2 peer is trusted and the
        link to it is authenticated.
 
+    *) Security: a second cache_turbo_redis (or cache_turbo_memcached) in the
+       same block was silently accepted and partially merged into the first
+       instead of being rejected. The setter only overwrites what the new DSN
+       actually carries -- userinfo, db and the TLS flag are written only when
+       present -- so the first directive's username, password and database
+       survived under the second directive's host, and a rediss:// first line
+       could not be downgraded by a redis:// second one because redis_tls is
+       never cleared on any path. An operator editing a config by adding a
+       replacement line rather than changing the existing one therefore sent
+       the original credentials to the new host, with no diagnostic. Both
+       directives now reject a duplicate, as every other single-value
+       directive already did.
+       Affects: all versions through 1.1.0, only where an L2 backend is
+       configured. Exposure: requires the ability to write the nginx config;
+       the result is credentials disclosed to whichever host the second line
+       names, and a TLS requirement that cannot be turned off once set.
+       Mitigation without upgrading: ensure each block declares its L2
+       backend exactly once, and check nginx -t output against the config as
+       written rather than as intended.
+
     *) Bugfix: the variant-index self-heal bit (varidx_pending) was never
        initialised on a newly allocated cache node. Shared-memory slab
        allocations are not zeroed, so a node landing on a recycled slot could
