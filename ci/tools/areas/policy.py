@@ -2390,10 +2390,25 @@ def test_tagidx_purge_reports_degraded_after_dropped_index_write(
     # ---- Leg 1 (MUST come first): healthy purge does NOT claim degraded.
     # No fault armed anywhere in this zone yet, so tag_index_drops is still 0
     # and the reply must be byte-compatible with the pre-change contract.
+    # TAG-CAP-SILENT-DROP: pending_at_launch now sums tag_index_drops AND
+    # tag_cap_drops (both feed the same "complete":false decision -- see
+    # admin.c's ngx_http_cache_turbo_admin_purge_tag), so leg 1 needs BOTH
+    # at zero. tag_cap_drops is expected to be 0 here: the cap-overflowing
+    # L2 tests (test_l2_tag_truncation_warns, test_l2_tag_cap_and_dedup,
+    # test_l2_tag_cap_purge_reports_degraded) all still run before this one
+    # in run_all() -- the first two overflow /l2tcap/'s cap on `main` itself.
+    # If a future test moves the cap onto `main` before this point, THAT
+    # is the bug this assertion is designed to catch, not something to
+    # relax by dropping this check.
     assert _admin_stat(ng, "tag_index_drops") == 0, \
         ("this test must observe a zone with no prior tag-index drop; a "
          "non-zero count here means an earlier test in this zone injected "
          "one and leg 1 can no longer be satisfied (see ORDERING above)")
+    assert _admin_stat(ng, "tag_cap_drops") == 0, \
+        ("this test must observe a zone with no prior tag-cap drop; a "
+         "non-zero count here means an earlier test overflowed cache_turbo_"
+         "tag's MAX_TAGS cap on THIS zone (`main`) and leg 1 can no longer "
+         "be satisfied (see ORDERING above)")
 
     s, b, _ = fetch(ng.port, "/tagidxdrop/clean1")
     assert s == 200 and b, f"clean prime failed: {s} {b!r}"

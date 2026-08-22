@@ -308,10 +308,21 @@ ngx_http_cache_turbo_admin_purge_tag(ngx_http_request_t *r,
      * intended: once this zone has dropped a tag-index write, every later
      * purge-by-tag in it reports "complete":false until reload. That is
      * honest -- nothing has repaired the index -- and it is the signal an
-     * operator needs to know a re-purge or an origin-side purge is required. */
+     * operator needs to know a re-purge or an origin-side purge is required.
+     *
+     * TAG-CAP-SILENT-DROP: sum in tag_cap_drops too. It is a distinct fault
+     * class (a tag that never got selected because the cap truncated the
+     * value, versus a selected tag whose SADD never reached L2) but it is
+     * the SAME user-visible defect -- an object the enumeration below
+     * cannot see stays resident and stale -- so it must gate the same
+     * "complete":false reply. Neither counter self-heals, so the sum is
+     * exactly as outstanding as either half. */
     tp->pending_at_launch = (ngx_uint_t)
         ngx_atomic_fetch_add(
-            &ngx_http_cache_turbo_zone_sh(z)->tag_index_drops, 0);
+            &ngx_http_cache_turbo_zone_sh(z)->tag_index_drops, 0)
+        + (ngx_uint_t)
+          ngx_atomic_fetch_add(
+              &ngx_http_cache_turbo_zone_sh(z)->tag_cap_drops, 0);
 
     tp->tag.len = arg->len;
     tp->tag.data = ngx_pnalloc(r->pool, arg->len);
@@ -421,9 +432,9 @@ ngx_http_cache_turbo_admin_stats_prometheus(ngx_http_request_t *r,
     u_char     *p;
     size_t      len;
 
-    /* Twenty-three counters (*_total) + five gauges, each labelled by zone
+    /* Twenty-eight counters (*_total) + seven gauges, each labelled by zone
      * so one Prometheus job can scrape many zones. Exposition format
-     * 0.0.4. The per-metric budget must track the emitted count (28):
+     * 0.0.4. The per-metric budget must track the emitted count (35):
      * every metric line renders one %V (zone) + one %uA (value), so a
      * short multiplier could truncate the last line under a long zone
      * name. The fixed term covers the HELP/TYPE prose, which grows
@@ -441,7 +452,12 @@ ngx_http_cache_turbo_admin_stats_prometheus(ngx_http_request_t *r,
      * sketch_gen (gauge), sketch_bumps_total (counter) and
      * admission_refused_total (counter), prose term bumped by ~530 bytes
      * for their HELP/TYPE lines and the count 28 -> 31; P4-2-s3a added
-     * used_bytes (gauge) and the count 31 -> 32).
+     * used_bytes (gauge) and the count 31 -> 32; TAG-CAP-SILENT-DROP added
+     * tag_cap_drops_total (counter), prose term re-measured and the count
+     * 32 -> 35 -- ci/tools/lint-admin-buffer-budget.py caught the earlier
+     * miscount at CI time (the multiplier and term must track %V/%uA
+     * occurrences, not the metric-name comment above, which had already
+     * drifted before this bump)).
      *
      * ⚠ P4-2-s3a: the fixed term is no longer eyeballed. Every previous bump
      * was an estimate ("~180 bytes", "~530 bytes") and they had drifted
@@ -451,9 +467,11 @@ ngx_http_cache_turbo_admin_stats_prometheus(ngx_http_request_t *r,
      * value and real counters render far shorter, so the per-value slack
      * silently absorbed it -- i.e. the budget was already relying on an
      * accident. The term below is the MEASURED fixed prose (sum of the
-     * literal bytes, less 2 per %V and 3 per %uA) plus a 256-byte margin.
-     * When adding a metric, re-measure rather than adding an estimate. */
-    len = 6789 + 34 * zname.len + 34 * NGX_ATOMIC_T_LEN;
+     * literal bytes, less 2 per %V and 3 per %uA) plus lint-admin-buffer-
+     * budget.py's 128-byte margin. When adding a metric, re-measure rather
+     * than adding an estimate -- run the lint locally, it prints the exact
+     * required value. */
+    len = 7152 + 35 * zname.len + 35 * NGX_ATOMIC_T_LEN;
     p = ngx_pnalloc(r->pool, len);
     if (p == NULL) {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -544,6 +562,13 @@ ngx_http_cache_turbo_admin_stats_prometheus(ngx_http_request_t *r,
         "the affected object until its own TTL).\n"
         "# TYPE cache_turbo_tag_index_drops_total counter\n"
         "cache_turbo_tag_index_drops_total{zone=\"%V\"} %uA\n"
+        "# HELP cache_turbo_tag_cap_drops_total Tags silently dropped from "
+        "the purge-by-tag index because a response named more than "
+        "NGX_HTTP_CACHE_TURBO_MAX_TAGS distinct tags (no self-heal; a later "
+        "purge of a dropped tag will not invalidate the affected object "
+        "until its own TTL).\n"
+        "# TYPE cache_turbo_tag_cap_drops_total counter\n"
+        "cache_turbo_tag_cap_drops_total{zone=\"%V\"} %uA\n"
         "# HELP cache_turbo_breaker_opens_total Lifetime count of CLOSED->OPEN circuit breaker trips.\n"
         "# TYPE cache_turbo_breaker_opens_total counter\n"
         "cache_turbo_breaker_opens_total{zone=\"%V\"} %uA\n"
@@ -579,6 +604,7 @@ ngx_http_cache_turbo_admin_stats_prometheus(ngx_http_request_t *r,
         &zname, st->sie_serves, &zname, st->breaker_serves,
         &zname, st->origin_failures,
         &zname, st->varidx_drops, &zname, st->tag_index_drops,
+        &zname, st->tag_cap_drops,
         &zname, st->breaker_opens,
         &zname, (ngx_atomic_uint_t) ngx_http_cache_turbo_brk_state(
             (ngx_uint_t) st->breaker_state),
@@ -615,10 +641,10 @@ ngx_http_cache_turbo_admin_stats_json(ngx_http_request_t *r,
                  "\"breaker_state\":\"\",\"breaker_opens\":,"
                  "\"sie_serves\":,\"breaker_serves\":,"
                  "\"origin_failures\":,\"varidx_drops\":,"
-                 "\"tag_index_drops\":,\"bg_inflight\":,"
+                 "\"tag_index_drops\":,\"tag_cap_drops\":,\"bg_inflight\":,"
                  "\"sketch_gen\":,\"sketch_bumps\":,"
                  "\"admission_refused\":,\"used_bytes\":}\n")
-          + 33 * NGX_ATOMIC_T_LEN
+          + 34 * NGX_ATOMIC_T_LEN
           + sizeof("half-open") - 1;   /* longest _breaker_state_str value */
     p = ngx_pnalloc(r->pool, len);
     if (p == NULL) {
@@ -640,7 +666,7 @@ ngx_http_cache_turbo_admin_stats_json(ngx_http_request_t *r,
         "\"breaker_state\":\"%s\",\"breaker_opens\":%uA,"
         "\"sie_serves\":%uA,\"breaker_serves\":%uA,"
         "\"origin_failures\":%uA,\"varidx_drops\":%uA,"
-        "\"tag_index_drops\":%uA,\"bg_inflight\":%uA,"
+        "\"tag_index_drops\":%uA,\"tag_cap_drops\":%uA,\"bg_inflight\":%uA,"
         "\"sketch_gen\":%uA,\"sketch_bumps\":%uA,"
         "\"admission_refused\":%uA,\"used_bytes\":%uA}\n",
         st->hits, st->misses, st->stale_serves,
@@ -656,7 +682,7 @@ ngx_http_cache_turbo_admin_stats_json(ngx_http_request_t *r,
             (ngx_uint_t) st->breaker_state),
         st->breaker_opens,
         st->sie_serves, st->breaker_serves, st->origin_failures,
-        st->varidx_drops, st->tag_index_drops,
+        st->varidx_drops, st->tag_index_drops, st->tag_cap_drops,
         st->bg_inflight,
         st->sketch_gen, st->sketch_bumps, st->admission_refused,
         st->used_bytes) - p;

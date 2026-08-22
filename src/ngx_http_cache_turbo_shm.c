@@ -198,6 +198,7 @@ ngx_http_cache_turbo_shm_init_zone(ngx_shm_zone_t *shm_zone, void *data)
     st->sh->varidx_drops = 0;
     st->sh->varidx_reissues = 0;
     st->sh->tag_index_drops = 0;
+    st->sh->tag_cap_drops = 0;
 
     /* P4-1a: allocate the W-TinyLFU frequency sketch.
      *
@@ -1542,6 +1543,7 @@ ngx_http_cache_turbo_shm_stats(ngx_http_cache_turbo_zone_t *z,
      * every other lifetime tally above. */
     out->varidx_drops     = ngx_http_cache_turbo_zone_sh(z)->varidx_drops;
     out->tag_index_drops  = ngx_http_cache_turbo_zone_sh(z)->tag_index_drops;
+    out->tag_cap_drops    = ngx_http_cache_turbo_zone_sh(z)->tag_cap_drops;
 
     /* P3-7: live gauge, not a lifetime tally -- read the same as every other
      * counter here (plain, unlocked; the atomic itself is the sync point). */

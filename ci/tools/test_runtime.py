@@ -418,6 +418,7 @@ def run_all(ng: Nginx, origin: Origin,
         test_l2_tag_purge_large(ng, origin, redis)  # STAB-3 + PERF-1/2 pipeline
         test_l2_tag_purge_arg_validation(ng, origin, redis)  # AUD-TAG1
         test_l2_tag_cap_and_dedup(ng, origin, redis)  # PERF-2 tag cap/dedup
+        test_l2_tag_cap_purge_reports_degraded(ng, origin, redis)  # TAG-CAP-SILENT-DROP
         test_l2_tag_add_batched_one_op(ng, origin, redis)  # L9 one op for N tags
         test_cor5_redis_variant_purge(ng, origin, redis)  # COR-5 variant index
         # COR-5(b): a variant-index write dropped before the wire self-heals
