@@ -79,6 +79,7 @@ typedef struct {
     ngx_uint_t          seg;
     ngx_uint_t          promotable;
     unsigned            sie_spared:1;  /* S231-EVICT-BLIND second-chance bit */
+    unsigned            varidx_pending:1; /* COR-5(b) variant-index self-heal */
     ngx_queue_t         lru;
 } ngx_http_cache_turbo_node_t;
 
@@ -723,6 +724,69 @@ mk_live_sie_entry(int keyn, int live)
     return ctn;
 }
 
+/* COR-5(b): lru_insert_new() must clear varidx_pending, like sie_spared.
+ *
+ * This calls the REAL funnel on a node holding the shim's 0xA5 slab poison --
+ * deliberately NOT via mk_live_sie_entry(), which memsets the node to zero and
+ * would make the assertion pass whether or not the code clears the bit (a test
+ * that holds in both states proves nothing). Both bits are checked from the
+ * same poisoned node so the control is symmetric: sie_spared is the bit that
+ * was already fixed, varidx_pending the one that inherited the hole.
+ *
+ * Reverting either assignment in lru_insert_new() must fail this test. */
+static void
+test_lru_insert_new_clears_bitfield_unit(void)
+{
+    ngx_http_cache_turbo_node_t  *ctn;
+
+    printf("COR-5(b): lru_insert_new() clears the whole bitfield, not just sie_spared\n");
+    zone_reset();
+
+    ctn = ngx_slab_alloc_locked(&g_pool, sizeof(*ctn));
+    REQUIRE(ctn != NULL, "fixture: poisoned node alloc failed");
+
+    /* Zero the node first: lru_insert_new() links it into the zone LRU, and a
+     * node still full of 0xA5 makes that a misaligned-pointer deref (UBSan
+     * traps it). The poison is not what this test needs -- a DIRTY BITFIELD is,
+     * and that is set explicitly two lines down. Zeroing here does not weaken
+     * the test the way mk_live_sie_entry()'s memset would, because the bits
+     * under test are re-dirtied afterwards.
+     *
+     * Set both bits by hand rather than trusting the poison pattern: 0xA5 is
+     * 10100101, so which bits land set depends on where the compiler places
+     * each :1 field in the storage unit -- a detail no test should encode.
+     * Forcing them to 1 makes the assertions below unambiguous, and means a
+     * cleared bit can only come from lru_insert_new() itself. */
+    memset(ctn, 0, sizeof(*ctn));
+    ctn->varidx_pending = 1;
+    ctn->sie_spared = 1;
+    REQUIRE(ctn->varidx_pending == 1 && ctn->sie_spared == 1,
+            "fixture: both bits must read back as set before the funnel runs, "
+            "else this test cannot distinguish a cleared bit from a zeroed "
+            "allocation");
+
+    /* Insert into the rbtree as every real creation site does: zone_reset()
+     * drains the LRU and ngx_rbtree_delete()s each node it finds, so a node
+     * linked into the LRU but never into the tree makes cleanup deref a null
+     * child pointer. */
+    ctn->node.key = 0x5EED;
+    ngx_rbtree_insert(&g_sh.rbtree, &ctn->node);
+
+    ngx_queue_init(&ctn->lru);
+    ngx_http_cache_turbo_lru_insert_new(&g_zone, ctn);
+
+    CHECK(ctn->varidx_pending == 0,
+          "COR-5(b): lru_insert_new() left varidx_pending set on a fresh node "
+          "-- slab memory is not zeroed, so the first lookup (access.c:1375) "
+          "reads a dropped variant-index SADD that never happened and "
+          "re-issues a Redis write for a cold key");
+    CHECK(ctn->sie_spared == 0,
+          "S231-EVICT-BLIND: lru_insert_new() left sie_spared set");
+    CHECK(ctn->seg == NGX_HTTP_CACHE_TURBO_SEG_PROBATION,
+          "S8: lru_insert_new() must place a new node in PROBATION");
+}
+
+
 static void
 test_evict_blind_second_chance_unit(void)
 {
@@ -738,6 +802,7 @@ test_evict_blind_second_chance_unit(void)
     tracked = mk_live_sie_entry(0, /* live */ 1);
     REQUIRE(tracked != NULL, "fixture: tracked live-SIE entry not created");
     CHECK(tracked->sie_spared == 0, "fixture: fresh node started pre-spared");
+
 
     /* --- CLOSED breaker: no second chance at all, even though the entry IS
      * live-SIE. Isolates that the spare is conditioned on breaker state, not
@@ -5152,6 +5217,7 @@ main(void)
     zone_reset();
 
     test_s8_evict_terminates_on_empty_queues();
+    test_lru_insert_new_clears_bitfield_unit();
     test_evict_blind_second_chance_unit();
     test_evict_blind_expired_sie_no_spare();
     test_evict_blind_insert_new_zeroes_spared_bit();

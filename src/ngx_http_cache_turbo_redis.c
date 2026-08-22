@@ -2933,6 +2933,17 @@ ngx_http_cache_turbo_redis_parse_array(ngx_http_cache_turbo_redis_op_t *op,
         return NGX_OK;
     }
 
+    /* A declared element count must be backed by bytes actually on the wire.
+     * The shortest possible element is an empty bulk string, "$0\r\n" = 4
+     * bytes, so a count needing more than (end - p) / 4 elements cannot be
+     * honest. Without this, a hostile or MITM'd L2 turns a 12-byte reply
+     * ("*1048576\r\n$0") into a 16MB allocation -- ~1.4M:1 amplification, once
+     * per SCAN page. Checked BEFORE the alloc, because the per-element parse
+     * loop below only rejects the lie after the memory is already committed. */
+    if ((size_t) count > (size_t) (end - (crlf + 2)) / 4) {
+        return NGX_DECLINED;
+    }
+
     /* ngx_palloc (not ngx_pnalloc): the ngx_str_t array needs pointer
      * alignment; an unaligned base is UB (trapped by UBSan). */
     list = ngx_palloc(op->pool, count * sizeof(ngx_str_t));
@@ -3079,6 +3090,17 @@ ngx_http_cache_turbo_redis_parse_scan(ngx_http_cache_turbo_redis_op_t *op,
         return NGX_DECLINED;
     }
     p = crlf + 2;
+
+    /* A declared element count must be backed by bytes actually on the wire.
+     * The shortest possible element is an empty bulk string, "$0\r\n" = 4
+     * bytes, so a count needing more than (end - p) / 4 elements cannot be
+     * honest. Without this, a hostile or MITM'd L2 turns a 12-byte reply
+     * ("*1048576\r\n$0") into a 16MB allocation -- ~1.4M:1 amplification, once
+     * per SCAN page. Checked BEFORE the alloc, because the per-element parse
+     * loop below only rejects the lie after the memory is already committed. */
+    if ((size_t) count > (size_t) (end - p) / 4) {
+        return NGX_DECLINED;
+    }
 
     list = NULL;
     if (count > 0) {

@@ -1,5 +1,53 @@
 Changes with the nginx-cache-turbo-module (unreleased)
 
+    *) Security: an admin warm list supplied as a CRLF-terminated file
+       (POST /_cache?url_file=...) could place a bare CR into the upstream
+       request line. The "\r" trim moved the decoded URI's length but not the
+       end of the RAW span, and it is the raw span -- still percent-escaped --
+       that becomes the warm subrequest's unparsed_uri and is written to the
+       origin verbatim. The safety check ran only on the decoded URI, so the
+       bytes actually sent were never validated at all. The raw span is now
+       trimmed with its own cursor (the list parser's own advance cursor must
+       not move) and screened for control bytes before use.
+       Affects: all versions through 1.1.0, on the admin endpoint only.
+       Exposure: reaching it requires access to the admin endpoint, which is
+       expected to be restricted; the result is a malformed origin request
+       line, upstream-dependent 400s or desync on a lenient origin. No fix is
+       available by configuration -- restrict the admin endpoint, or upgrade.
+
+    *) Security: a hostile, compromised or MITM'd L2 (Redis) peer could turn a
+       ~12-byte reply into a 16MB allocation, once per SCAN page, by declaring
+       an element count the reply does not contain. The SMEMBERS and SCAN
+       parsers sized their array from the declared count -- bounded only by
+       the 1M element ceiling -- before validating a single element, giving
+       roughly 1.4M:1 memory amplification. Both parsers now require the
+       declared count to be backed by bytes actually on the wire (the
+       shortest element being "$0\r\n", four bytes) before allocating.
+       Affects: all versions through 1.1.0, only where an L2 backend is
+       configured. Exposure: denial of service against the worker; the memory
+       is pool-freed at request teardown, and no corruption is possible.
+       Mitigation without upgrading: ensure the L2 peer is trusted and the
+       link to it is authenticated.
+
+    *) Bugfix: the variant-index self-heal bit (varidx_pending) was never
+       initialised on a newly allocated cache node. Shared-memory slab
+       allocations are not zeroed, so a node landing on a recycled slot could
+       be born with the bit set; the first lookup then read it as a
+       variant-index write that had been dropped and re-issued a Redis SADD
+       for a key that never had one. This inflated the varidx_reissues
+       counter past varidx_drops and produced spurious L2 writes on
+       cold-miss traffic. The bit is now cleared in the same funnel that
+       already clears the neighbouring second-chance bit.
+
+    *) Bugfix: the cache_turbo_zone "admission=on|off" policy was ignored on
+       reload. The only assignment to the shared-memory copy of the policy
+       ran on the fresh-zone path, after both zone-inheritance paths had
+       already returned, so a changed value took effect only on a full
+       restart -- and silently, since nginx reported the reload as
+       successful. The neighbouring protected_pct setting is re-read per
+       request and did follow a reload, so an operator changing both saw one
+       apply and had no indication the other had not.
+
     *) Bugfix: a background warm subrequest -- the stale-while-revalidate
        refresh and the new cache_turbo_store_head HEAD warm -- hit undefined
        behaviour in nginx's proxy module when the location's proxy_pass

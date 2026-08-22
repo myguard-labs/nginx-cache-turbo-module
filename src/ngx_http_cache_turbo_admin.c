@@ -788,6 +788,27 @@ ngx_http_cache_turbo_warm_uri_is_safe(ngx_str_t *uri)
 }
 
 
+/* The RAW (still-escaped) span is what warm_one() puts on the wire verbatim as
+ * sr->unparsed_uri, so it needs its own gate: warm_uri_is_safe() above runs on
+ * the DECODED path and therefore says nothing about the bytes actually sent.
+ * Any control byte here would be spliced straight into the upstream request
+ * line -- reject the whole entry rather than sanitising it, because a warm
+ * list entry that needs sanitising is an operator error worth surfacing. */
+static ngx_uint_t
+ngx_http_cache_turbo_warm_raw_is_safe(ngx_str_t *raw)
+{
+    u_char  *p, *last;
+
+    for (p = raw->data, last = p + raw->len; p < last; p++) {
+        if (*p < 0x21 || *p == 0x7f) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+
 /*
  * POST /_cache?url=<path[,path,...]> — warm each comma- (or newline-, so the
  * same parser also drives ?url_file=) separated path. Each path is percent-
@@ -806,7 +827,7 @@ static ngx_int_t
 ngx_http_cache_turbo_warm(ngx_http_request_t *r, ngx_str_t *urls,
     ngx_int_t warm_max)
 {
-    u_char     *p, *last, *sep, *q, *dst, *s;
+    u_char     *p, *last, *sep, *raw_end, *q, *dst, *s;
     ngx_uint_t  warmed = 0;
 
     ngx_str_t   uri, args, body;
@@ -832,8 +853,17 @@ ngx_http_cache_turbo_warm(ngx_http_request_t *r, ngx_str_t *urls,
             /* Tolerate a CRLF line ending from a file-driven list (Windows-
              * edited operator lists are common) by trimming a trailing '\r'
              * before it can be mistaken for part of the path. */
+            raw_end = sep;
+
             if (uri.len > 0 && uri.data[uri.len - 1] == '\r') {
                 uri.len--;
+                /* Trim the raw end too. `sep` itself must NOT move: it is the
+                 * loop's advance cursor (`p = sep + 1` below), so backing it
+                 * up would restart the next entry on the '\r'. The raw span is
+                 * measured from raw_end instead, because it lands on the wire
+                 * verbatim as sr->unparsed_uri and a bare CR there would go
+                 * into the upstream request line. */
+                raw_end--;
             }
 
             ngx_str_null(&args);
@@ -859,7 +889,7 @@ ngx_http_cache_turbo_warm(ngx_http_request_t *r, ngx_str_t *urls,
                 ngx_str_t  raw;
 
                 raw.data = uri.data;
-                raw.len = (size_t) (sep - uri.data);
+                raw.len = (size_t) (raw_end - uri.data);
 
                 /* percent-decode the path into a fresh buffer (subrequest expects
                  * an unescaped uri); decoding never grows the string. */
@@ -878,6 +908,7 @@ ngx_http_cache_turbo_warm(ngx_http_request_t *r, ngx_str_t *urls,
 
                     if (uri.len > 0 && uri.data[0] == '/'
                         && ngx_http_cache_turbo_warm_uri_is_safe(&uri)
+                        && ngx_http_cache_turbo_warm_raw_is_safe(&raw)
                         && ngx_http_cache_turbo_warm_one(r, &uri, &args, NULL, 0,
                                                          NULL, &raw)
                            == NGX_OK)

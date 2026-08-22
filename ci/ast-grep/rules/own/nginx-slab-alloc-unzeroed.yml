@@ -1,0 +1,20 @@
+id: nginx-slab-alloc-unzeroed
+language: c
+severity: warning
+message: >-
+  ngx_slab_alloc/ngx_slab_alloc_locked result used without ngx_memzero — slab
+  memory is NOT zeroed. Every field of the allocated struct must be initialised
+  explicitly, and a :1 bitfield added later is the field that gets forgotten:
+  it shares a storage unit with bits that ARE initialised, so the omission is
+  invisible at the call site and reads as garbage on a recycled slot.
+note: >-
+  Candidate only — the reviewer confirms whether an ngx_memzero, an explicit
+  per-field init, or a shared init funnel follows. Dismiss when one does.
+  Prefer ngx_slab_calloc where the struct has no reason to stay uninitialised.
+  Real instance: COR-5(b) varidx_pending, release audit 2026-08-22 — the funnel
+  initialised seg and sie_spared and missed the bit added into the same unit.
+rule:
+  kind: call_expression
+  has:
+    field: function
+    regex: ^ngx_slab_alloc(_locked)?$

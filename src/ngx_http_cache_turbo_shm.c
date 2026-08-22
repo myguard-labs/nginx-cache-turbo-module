@@ -106,6 +106,14 @@ ngx_http_cache_turbo_shm_init_zone(ngx_shm_zone_t *shm_zone, void *data)
     if (octx) {
         /* reused zone after reload: inherit the live shm */
         *st = *ngx_http_cache_turbo_zone_stripe(octx);
+        /* ...but NOT the admission policy: it is the one field here that a
+         * reload is expected to change. The fresh-zone tail below is the only
+         * other writer, so without this a `cache_turbo_zone ... admission=`
+         * flip was silently ignored until a full restart -- and silently, in
+         * the worst way: the neighbouring protected_pct IS re-read per request
+         * from clcf and does follow a reload, so an operator flipping both saw
+         * one take effect and had no cue the other had not. */
+        st->sh->admission = ctx->admission;
         return NGX_OK;
     }
 
@@ -113,6 +121,7 @@ ngx_http_cache_turbo_shm_init_zone(ngx_shm_zone_t *shm_zone, void *data)
 
     if (shm_zone->shm.exists) {
         st->sh = st->shpool->data;
+        st->sh->admission = ctx->admission;    /* same as above */
         return NGX_OK;
     }
 
@@ -612,6 +621,17 @@ ngx_http_cache_turbo_lru_insert_new(ngx_http_cache_turbo_zone_t *z,
      * lock_ttl. Initialised here rather than at each creation site because all
      * four funnel through this function, exactly like `seg` above. */
     ctn->sie_spared = 0;
+
+    /* Same rule, same reason: varidx_pending shares the bitfield storage unit
+     * above and was added after the sie_spared fix, so it inherited the hole
+     * rather than the lesson. Every one of its five writes is a conditional
+     * mutation on a node already resident (access.c:818/1376/1472,
+     * shm.c:2161, filters.c:1964) -- none of them initialises. A node born on
+     * a recycled slab slot with a garbage 1 makes the first lookup
+     * (access.c:1375) read it as a dropped variant-index SADD and re-issue a
+     * Redis write for a key that never had one, so cold-miss traffic turns
+     * into spurious L2 writes and varidx_reissues climbs past varidx_drops. */
+    ctn->varidx_pending = 0;
 
     ngx_queue_insert_head(&ngx_http_cache_turbo_zone_sh(z)->lru, &ctn->lru);
     ngx_http_cache_turbo_zone_sh(z)->n_entries++;

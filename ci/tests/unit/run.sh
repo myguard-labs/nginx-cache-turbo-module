@@ -128,7 +128,17 @@ fi
 # If the only caller were a tree-less job this would silently test nothing,
 # which is the exact failure mode these tests exist to prevent. Keep the
 # build-test "Runtime" job (which has the configured tree) calling run.sh.
-NGINX_VERSION="${NGINX_VERSION:-1.31.1}"
+# Default to the CENTRAL pin, never a literal. A hardcoded fallback here silently
+# drifts from .github/versions.env every time the pin moves, and the drift is
+# invisible: a LOCAL run then looks for a tree that does not exist, SKIPS, and
+# still exits 0 -- the precise "green that proves nothing" this file warns about
+# two paragraphs up. (CI was unaffected: build-test.yml passes NGINX_VERSION
+# explicitly. It was local runs that quietly tested nothing.)
+if [ -z "${NGINX_VERSION:-}" ] && [ -f "$DIR/../../../.github/versions.env" ]; then
+    NGINX_VERSION=$(sed -n 's/^NGINX_VERSION=//p' \
+                        "$DIR/../../../.github/versions.env" | head -1)
+fi
+NGINX_VERSION="${NGINX_VERSION:-1.31.3}"
 NGX_SRC="${NGX_SRC:-$DIR/../../../.build/nginx-$NGINX_VERSION}"
 
 # Honour the Makefile's own variable names if the caller set them. These are
