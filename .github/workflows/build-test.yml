@@ -1,4 +1,4 @@
-# sync-sha: e8080fea51f33cf2f83ba27d0e5301f18b4601666cd77b8da5996001d6d71b5a
+# sync-sha: b9c1beb9b02a0b9cc054d7902ae3fb217c106c1f8aab6964a9b1fe1b0d66dd49
 name: Build & Test
 
 # Runner labels live in the POOL repository variable. Every checked-in selector
@@ -383,7 +383,16 @@ jobs:
           CT_TEST_BREADCRUMB: ${{ github.workspace }}/ci-hang-artifacts/current-test.txt
         run: |
           chmod +x nginx-bin/nginx
-          bash ci/tools/ci-hang-guard.sh 900 "$GITHUB_WORKSPACE/ci-hang-artifacts" -- \
+          # Guard bound: measured 15 runs of THIS step on main
+          # (2026-08-08, gh api .../jobs, "Run runtime suite" step
+          # started_at/completed_at) gave min=709s median=724s max=749s.
+          # That left only 151s of margin against the old 900s bound
+          # (max within ~1.2x) -- a slower/contended runner risks the
+          # guard firing mid-test and reading as an R6b hang (SUITE-
+          # TIMEOUT-MARGIN, memory/labs/nginx-cache-turbo-module/TODO.md).
+          # Raised to 1200s to match asan.yml's bound and restore real
+          # headroom (900s -> 1200s, +451s over observed max).
+          bash ci/tools/ci-hang-guard.sh 1200 "$GITHUB_WORKSPACE/ci-hang-artifacts" -- \
             bash -c '
               set -o pipefail
               python3 ci/tools/test_runtime.py \
