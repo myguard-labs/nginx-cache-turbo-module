@@ -376,10 +376,37 @@ ngx_http_cache_turbo_redis_param_tls(ngx_conf_t *cf,
         }
 
     } else if (ngx_strncmp(value->data, "tls_ca=", 7) == 0) {
+        /* An empty tls_ca= is not "no override", it is "trust the system CA
+         * store instead of the pinned one" -- ngx_ssl_trusted_certificate()
+         * is only called when redis_tls_ca.len is non-zero (see the SSL
+         * build site below), so a blank value silently WIDENS an intentional
+         * certificate pin to any CA the system trusts. Same failure shape as
+         * an empty L2 key prefix= (ngx_http_cache_turbo_check_l2_prefix
+         * above): a typo that used to degrade a hardening control instead of
+         * failing loudly. */
+        if (value->len == 7) {
+            return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
+                "cache_turbo_redis: empty tls_ca= is not allowed "
+                "(it would fall through to the system CA store instead of "
+                "the pinned certificate)");
+        }
         clcf->redis_tls_ca.data = value->data + 7;
         clcf->redis_tls_ca.len = value->len - 7;
 
     } else if (ngx_strncmp(value->data, "tls_name=", 9) == 0) {
+        /* An empty tls_name= is indistinguishable, downstream, from never
+         * having written the parameter at all: both the SNI send site and
+         * the post-handshake verify site in ngx_http_cache_turbo_redis.c
+         * fall back to the DSN host (redis_tls_name.len == 0 selects
+         * redis_host) whenever tls_name is blank. An operator who wrote
+         * tls_name= expecting to PIN a specific certificate name -- e.g.
+         * verifying against a stable service name behind an IP the DSN
+         * host does not carry -- gets the DSN host silently substituted
+         * instead, the same silent-widening failure as an empty tls_ca=. */
+        if (value->len == 9) {
+            return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
+                "cache_turbo_redis: empty tls_name= is not allowed");
+        }
         clcf->redis_tls_name.data = value->data + 9;
         clcf->redis_tls_name.len = value->len - 9;
 
@@ -2417,6 +2444,68 @@ ngx_http_cache_turbo_breaker_open_conf(ngx_conf_t *cf, ngx_command_t *cmd,
 }
 
 
+/* cache_turbo_lock_ttl T (O4.4-b). Hand-rolled rather than ngx_conf_set_sec_slot
+ * for two reasons, one rejecting and one clamping:
+ *
+ *  - 0 is rejected outright, not accepted-and-coerced. The two runtime sites
+ *    that read lock_ttl (ngx_http_cache_turbo_access.c, the single-flight
+ *    claim path) both do `if (lock_ttl <= 0) lock_ttl = 5;` as a defence-in-
+ *    depth self-heal against an UNSET effective value reaching them -- but an
+ *    EXPLICIT `cache_turbo_lock_ttl 0` should not silently become "5s" any
+ *    more than an explicit cache_turbo_min_uses 0 or cache_turbo_stale_mult 0
+ *    should (H3c/H5). "cache_turbo_lock off" is the directive that actually
+ *    disables single-flight; a config that writes lock_ttl 0 while lock stays
+ *    on almost certainly meant "no wait", not "silently wait 5s anyway", so
+ *    it is refused with a pointer to the directive that says what it means.
+ *    The two runtime coercions themselves are left in place as defence in
+ *    depth for the case merge_loc_conf ever produces an UNSET/0 effective
+ *    value some other way; they are not deleted by this change.
+ *
+ *  - the value is clamped rather than rejected once it parses to something
+ *    positive: ngx_http_cache_turbo_access.c multiplies lock_ttl by
+ *    ngx_http_cache_turbo_effective_load() (up to AT_LOAD_BASE-scaled) and
+ *    then adds it to `now` to compute refresh_lock_until -- an ADDITIVE
+ *    overflow of a time_t, the exact shape shm.c's O4.4-b note forbids.
+ *    Clamping to NGX_HTTP_CACHE_TURBO_TTL_MAX at parse time (same ceiling,
+ *    same clamp-not-reject rationale as cache_turbo_keep_stale immediately
+ *    below) keeps every downstream arithmetic site bounded without an
+ *    operator-hostile hard rejection of "as long as possible". */
+char *
+ngx_http_cache_turbo_lock_ttl_conf(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf)
+{
+    ngx_http_cache_turbo_loc_conf_t  *clcf = conf;
+
+    ngx_str_t  *value = cf->args->elts;
+    time_t      t;
+
+    if (clcf->lock_ttl_raw != NGX_CONF_UNSET) {
+        return "is duplicate";
+    }
+
+    t = ngx_parse_time(&value[1], 1);
+    if (t == (time_t) NGX_ERROR) {
+        return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
+            "cache_turbo_lock_ttl: bad value \"%V\"", &value[1]);
+    }
+
+    if (t == 0) {
+        return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
+            "cache_turbo_lock_ttl \"%V\" must be greater than 0 -- to "
+            "disable single-flight locking use \"cache_turbo_lock off\" "
+            "instead", &value[1]);
+    }
+
+    if (t > NGX_HTTP_CACHE_TURBO_TTL_MAX) {
+        t = NGX_HTTP_CACHE_TURBO_TTL_MAX;
+    }
+
+    clcf->lock_ttl_raw = t;
+
+    return NGX_CONF_OK;
+}
+
+
 /* cache_turbo_scan_resistant on|off [protected_pct=N]   (S8, default flipped P3-1)
  *
  * Segmented (probation/protected) LRU. ON BY DEFAULT since P3-1 (protected_pct
@@ -2598,6 +2687,55 @@ ngx_http_cache_turbo_l2_negative_ttl(ngx_conf_t *cf, ngx_command_t *cmd,
     }
 
     clcf->l2_negative_ttl = (time_t) n;
+
+    return NGX_CONF_OK;
+}
+
+
+/* cache_turbo_min_uses_window N (P3-6). Seconds to retain a counter node's
+ * miss_count before the window resets it. Range-checked by hand rather than
+ * via ngx_conf_set_sec_slot -- the field comment on min_uses_window in the
+ * header claims it is "Bounded by NGX_HTTP_CACHE_TURBO_MIN_USES_WINDOW_MAX",
+ * but NGX_HTTP_CACHE_TURBO_MIN_USES_WINDOW_MIN/_MAX had zero references
+ * anywhere in this module until this directive: a documented invariant with
+ * no code enforcing it.
+ *
+ * Same shape as cache_turbo_l2_negative_ttl above: 0 is ACCEPTED and means
+ * OFF (the default, today's unwindowed behaviour -- miss_count never resets
+ * until the counter node is evicted). Anything else must fall in
+ * MIN_USES_WINDOW_MIN..MIN_USES_WINDOW_MAX. A negative fails as NGX_ERROR out
+ * of ngx_atoi (no sign handling) and surfaces as "bad value". */
+char *
+ngx_http_cache_turbo_min_uses_window(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf)
+{
+    ngx_http_cache_turbo_loc_conf_t  *clcf = conf;
+
+    ngx_str_t  *value = cf->args->elts;
+    ngx_int_t   n;
+
+    if (clcf->min_uses_window != NGX_CONF_UNSET) {
+        return "is duplicate";
+    }
+
+    n = ngx_atoi(value[1].data, value[1].len);
+    if (n == NGX_ERROR) {
+        return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
+            "cache_turbo_min_uses_window: bad value \"%V\"", &value[1]);
+    }
+
+    if (n != 0
+        && (n < NGX_HTTP_CACHE_TURBO_MIN_USES_WINDOW_MIN
+            || n > NGX_HTTP_CACHE_TURBO_MIN_USES_WINDOW_MAX))
+    {
+        return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
+            "cache_turbo_min_uses_window \"%V\" is out of range: expected 0 "
+            "(off) or %d..%d",
+            &value[1], NGX_HTTP_CACHE_TURBO_MIN_USES_WINDOW_MIN,
+            NGX_HTTP_CACHE_TURBO_MIN_USES_WINDOW_MAX);
+    }
+
+    clcf->min_uses_window = (time_t) n;
 
     return NGX_CONF_OK;
 }
