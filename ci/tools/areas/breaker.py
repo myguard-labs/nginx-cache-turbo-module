@@ -1948,14 +1948,32 @@ def test_lock_ttl_zero_rejected(ng: Nginx) -> None:
 
 
 def test_lock_ttl_oversized_clamped_not_rejected(ng: Nginx) -> None:
-    """O4.4-b: an oversized-but-well-formed cache_turbo_lock_ttl is CLAMPED
-    to NGX_HTTP_CACHE_TURBO_TTL_MAX at parse time, same clamp-not-reject
-    contract as cache_turbo_keep_stale -- there is no bounded-blindness cost
-    to a large value here, only the wire-format ceiling, so nginx -t must
-    still accept it (a hard rejection would be operator-hostile for "as long
-    as possible"). The clamp is what keeps `now + lock_ttl` in
-    ngx_http_cache_turbo_access.c from overflowing a time_t; this test proves
-    only that config parsing accepts the value, not the runtime arithmetic."""
+    """O4.4-b: an oversized-but-well-formed cache_turbo_lock_ttl must still
+    PARSE (clamp-not-reject, same contract as cache_turbo_keep_stale). The
+    clamp to NGX_HTTP_CACHE_TURBO_TTL_MAX is what keeps
+    `now + lock_ttl * effective_load()` in ngx_http_cache_turbo_access.c from
+    overflowing a time_t.
+
+    ⚠ THIS TEST IS A GUARD, NOT A PROOF OF THE CLAMP, and deliberately says so
+    rather than implying coverage it does not have:
+
+      * lock_ttl_raw is never surfaced through a variable or the admin
+        endpoint, so the clamped VALUE cannot be read back at config level.
+      * `returncode == 0` does NOT distinguish fixed from pre-fix code: the
+        generic ngx_conf_set_sec_slot this replaced also accepted the value.
+      * duplicate-rejection cannot distinguish them either -- ngx_conf_set_sec_slot
+        returns "is duplicate" itself (nginx src/core/ngx_conf_file.c), so the
+        custom setter's own duplicate guard is matching pre-existing behaviour,
+        not adding it.
+
+    What it DOES hold: the clamp branch is reachable (900000000000s parses
+    cleanly under NGX_MAX_INT_T_VALUE, so ngx_parse_time does not short-circuit
+    it), and a future change that turns this into a hard rejection -- the
+    operator-hostile outcome the row explicitly rejected -- fails here.
+
+    The clamp arithmetic itself is UNCOVERED at runtime. Closing that needs a
+    read-back path for lock_ttl_raw (a variable or an admin field), which is a
+    separate row, not something this test should pretend to do."""
     def mutate(c: str) -> str:
         pattern = re.compile(
             r"cache_turbo_lock_ttl\s+5s;", re.MULTILINE)
