@@ -194,9 +194,9 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
 
     { ngx_string("cache_turbo_lock_ttl"),
       NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
-      ngx_conf_set_sec_slot,
+      ngx_http_cache_turbo_lock_ttl_conf,
       NGX_HTTP_LOC_CONF_OFFSET,
-      offsetof(ngx_http_cache_turbo_loc_conf_t, lock_ttl_raw),
+      0,
       NULL },
 
     { ngx_string("cache_turbo_stale_mult"),
@@ -321,9 +321,9 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
 
     { ngx_string("cache_turbo_min_uses_window"),
       NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
-      ngx_conf_set_sec_slot,
+      ngx_http_cache_turbo_min_uses_window,
       NGX_HTTP_LOC_CONF_OFFSET,
-      offsetof(ngx_http_cache_turbo_loc_conf_t, min_uses_window),
+      0,
       NULL },
 
     { ngx_string("cache_turbo_scan_resistant"),

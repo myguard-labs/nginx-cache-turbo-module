@@ -1022,6 +1022,10 @@ char *ngx_http_cache_turbo_scan_resistant(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 char *ngx_http_cache_turbo_l2_negative_ttl(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
+char *ngx_http_cache_turbo_min_uses_window(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
+char *ngx_http_cache_turbo_lock_ttl_conf(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
 char *ngx_http_cache_turbo_vary_marker_revalidate(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 char *ngx_http_cache_turbo_keep_stale(ngx_conf_t *cf, ngx_command_t *cmd,

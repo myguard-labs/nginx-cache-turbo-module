@@ -1950,7 +1950,7 @@ http {
 | `cache_turbo_preset NAME` | `server`, `location` | `balanced` | `micro` / `conservative` / `balanced` / `aggressive` — sets the five knobs below at once (`valid`, `beta`, `lock_ttl`, `stale_mult`, `min_uses`). `micro` = 1s microcaching (valid 1s, lock_ttl 1s, ×2 stale). |
 | `cache_turbo_valid [CODE...] TIME` | `server`, `location` | preset (`60s`) | How long a copy stays *fresh* (then *stale*, still served). Bare `TIME` = the default/200 TTL. `TIME` of `0` = cache forever (stays fresh, never expires). With leading status codes (`cache_turbo_valid 301 404 1m;`) it makes those statuses cacheable too — redirects + negative caching. Repeatable. |
 | `cache_turbo_beta N` | `server`, `location` | preset (`1000`) | Refresh eagerness, ×1000 (1000 = 1.0). Higher = refresh sooner/more often. |
-| `cache_turbo_lock_ttl TIME` | `server`, `location` | preset (`5s`) | Single-flight window: once one refresh is claimed, others serve stale until it finishes. Caps backend regens to ~one per cycle. |
+| `cache_turbo_lock_ttl TIME` | `server`, `location` | preset (`5s`) | Single-flight window: once one refresh is claimed, others serve stale until it finishes. Caps backend regens to ~one per cycle. `0` is rejected at config time (use `cache_turbo_lock off` to disable single-flight instead); an oversized value is clamped rather than rejected. |
 | `cache_turbo_stale_mult N` | `server`, `location` | preset (`4` balanced) | Stale window as a multiple of the fresh TTL: an entry stays serveable as `STALE` until `cache_turbo_valid * N`. `1` = no stale window (hard-expire at the fresh TTL); the maximum is `8`. An explicit value overrides the preset's band, like `cache_turbo_valid`/`_beta`/`_lock_ttl`. `0` is rejected rather than silently meaning `4`. |
 | `cache_turbo_lock on` / `off` | `server`, `location` | `on` | Cold-miss single-flight: when an *uncached* key is hit by many requests at once, the first goes to the origin and the rest **wait** for it to fill the cache (per box via a stub, cluster-wide via the Redis lock) rather than all stampeding the origin. **Off** = every cold miss goes straight to the origin. |
 | `cache_turbo_lock_timeout TIME` | `server`, `location` | `5s` | How long a waiting cold-miss request waits for the winner's fill before giving up and going to the origin itself. |
@@ -2221,8 +2221,8 @@ trailing option, which **overrides** the DSN:
 | `db=` | `0` | `SELECT` this db number. Must be `0`–`15`, matching Redis's default `databases 16`; a larger index is rejected at config time rather than failing every L2 op at runtime. Same bound applies to the `/N` suffix of a DSN. |
 | `tls=on\|off` | from scheme | Force TLS on/off regardless of `redis://`/`rediss://`. |
 | `tls_verify=on\|off` | `on` | Verify the server cert + hostname. **Leave on** unless you know why. |
-| `tls_ca=<file>` | system CAs | CA bundle to trust (for a private CA). |
-| `tls_name=<host>` | DSN host | Name used for SNI + cert verification. |
+| `tls_ca=<file>` | system CAs | CA bundle to trust (for a private CA). If given, must be non-empty -- an empty `tls_ca=` is rejected at config time rather than silently falling back to the system CA store. |
+| `tls_name=<host>` | DSN host | Name used for SNI + cert verification. If given, must be non-empty -- an empty `tls_name=` is rejected at config time rather than silently falling back to the DSN host. |
 | `prefix=` | `ct:` | Key prefix in Redis. Must be non-empty, printable ASCII with no spaces or control characters, and at most 186 bytes (the module appends up to 64 bytes of key, and an L2 key may not exceed 250). Rejected at config time on both L2 backends. |
 | `timeout=` | `250ms` | Connect/read timeout. |
 | `keepalive=N` | `0` (off) | Idle connections pooled per worker for reuse. A pooled conn is reused only within the same db/credentials/TLS context. `0` opens a fresh connection per op. **Sized per connection profile — see the note below.** |

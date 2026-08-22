@@ -1924,6 +1924,155 @@ def test_l2_prefix_charset_rejected(ng: Nginx) -> None:
         f"a 186-byte prefix (the longest legal one) was rejected:\n{r.stdout}"
 
 
+def test_lock_ttl_zero_rejected(ng: Nginx) -> None:
+    """O4.4-b / lock_ttl config-validation: an explicit `cache_turbo_lock_ttl
+    0` must fail nginx -t rather than being silently coerced to 5s by the two
+    `if (lock_ttl <= 0) lock_ttl = 5;` self-heal sites in
+    ngx_http_cache_turbo_access.c. Same H3c/H5 shape as min_uses/stale_mult:
+    an operator-written 0 must mean what it says, or refuse to parse."""
+    def mutate(c: str) -> str:
+        pattern = re.compile(
+            r"cache_turbo_lock_ttl\s+5s;", re.MULTILINE)
+        new_cfg, sub_count = pattern.subn("cache_turbo_lock_ttl 0s;", c, count=1)
+        assert sub_count == 1, \
+            f"expected exactly one cache_turbo_lock_ttl 5s; anchor, got {sub_count}"
+        return new_cfg
+
+    r = _config_test_result(ng, mutate)
+    assert r.returncode != 0, \
+        f"cache_turbo_lock_ttl 0s was accepted by nginx -t:\n{r.stdout}"
+    assert "must be greater than 0" in r.stdout, \
+        f"missing lock_ttl-must-be-positive diagnostic:\n{r.stdout}"
+    assert "cache_turbo_lock off" in r.stdout, \
+        f"diagnostic does not point at cache_turbo_lock off:\n{r.stdout}"
+
+
+def test_lock_ttl_oversized_clamped_not_rejected(ng: Nginx) -> None:
+    """O4.4-b: an oversized-but-well-formed cache_turbo_lock_ttl must still
+    PARSE (clamp-not-reject, same contract as cache_turbo_keep_stale). The
+    clamp to NGX_HTTP_CACHE_TURBO_TTL_MAX is what keeps
+    `now + lock_ttl * effective_load()` in ngx_http_cache_turbo_access.c from
+    overflowing a time_t.
+
+    ⚠ THIS TEST IS A GUARD, NOT A PROOF OF THE CLAMP, and deliberately says so
+    rather than implying coverage it does not have:
+
+      * lock_ttl_raw is never surfaced through a variable or the admin
+        endpoint, so the clamped VALUE cannot be read back at config level.
+      * `returncode == 0` does NOT distinguish fixed from pre-fix code: the
+        generic ngx_conf_set_sec_slot this replaced also accepted the value.
+      * duplicate-rejection cannot distinguish them either -- ngx_conf_set_sec_slot
+        returns "is duplicate" itself (nginx src/core/ngx_conf_file.c), so the
+        custom setter's own duplicate guard is matching pre-existing behaviour,
+        not adding it.
+
+    What it DOES hold: the clamp branch is reachable (900000000000s parses
+    cleanly under NGX_MAX_INT_T_VALUE, so ngx_parse_time does not short-circuit
+    it), and a future change that turns this into a hard rejection -- the
+    operator-hostile outcome the row explicitly rejected -- fails here.
+
+    The clamp arithmetic itself is UNCOVERED at runtime. Closing that needs a
+    read-back path for lock_ttl_raw (a variable or an admin field), which is a
+    separate row, not something this test should pretend to do."""
+    def mutate(c: str) -> str:
+        pattern = re.compile(
+            r"cache_turbo_lock_ttl\s+5s;", re.MULTILINE)
+        new_cfg, sub_count = pattern.subn(
+            "cache_turbo_lock_ttl 900000000000s;", c, count=1)
+        assert sub_count == 1, \
+            f"expected exactly one cache_turbo_lock_ttl 5s; anchor, got {sub_count}"
+        return new_cfg
+
+    r = _config_test_result(ng, mutate)
+    assert r.returncode == 0, \
+        f"an oversized cache_turbo_lock_ttl was rejected instead of clamped:\n{r.stdout}"
+
+
+def test_min_uses_window_range_rejected(ng: Nginx) -> None:
+    """P3-6: cache_turbo_min_uses_window must be range-checked against
+    NGX_HTTP_CACHE_TURBO_MIN_USES_WINDOW_MIN/_MAX (1..86400) rather than
+    accepted as an arbitrary ngx_conf_set_sec_slot value -- the field
+    comment in the header claims this bound, but nothing enforced it before
+    this directive. 0 stays ACCEPTED (means OFF, same shape as
+    cache_turbo_l2_negative_ttl)."""
+    anchor = "cache_turbo_min_uses 3;"
+
+    # out of range (too large)
+    r = _config_test_result(
+        ng, lambda c: c.replace(
+            anchor, anchor + "\n            cache_turbo_min_uses_window 999999;",
+            1))
+    assert r.returncode != 0, \
+        f"min_uses_window=999999 was accepted by nginx -t:\n{r.stdout}"
+    assert "out of range" in r.stdout, \
+        f"missing min_uses_window range diagnostic:\n{r.stdout}"
+
+    # non-numeric
+    r = _config_test_result(
+        ng, lambda c: c.replace(
+            anchor, anchor + "\n            cache_turbo_min_uses_window abc;",
+            1))
+    assert r.returncode != 0, \
+        f"non-numeric min_uses_window was accepted by nginx -t:\n{r.stdout}"
+    assert "bad value" in r.stdout, \
+        f"missing min_uses_window bad-value diagnostic:\n{r.stdout}"
+
+    # 0 is accepted (OFF), not rejected -- must not regress
+    r = _config_test_result(
+        ng, lambda c: c.replace(
+            anchor, anchor + "\n            cache_turbo_min_uses_window 0;",
+            1))
+    assert r.returncode == 0, \
+        f"min_uses_window=0 (OFF) was rejected but must be accepted:\n{r.stdout}"
+
+    # in-range value is accepted
+    r = _config_test_result(
+        ng, lambda c: c.replace(
+            anchor, anchor + "\n            cache_turbo_min_uses_window 60;",
+            1))
+    assert r.returncode == 0, \
+        f"an in-range min_uses_window was rejected:\n{r.stdout}"
+
+
+def test_redis_tls_empty_ca_and_name_rejected(ng: Nginx) -> None:
+    """An empty tls_ca= silently widens an intentional certificate pin to the
+    system CA store (ngx_ssl_trusted_certificate is only called when
+    redis_tls_ca.len is non-zero), and an empty tls_name= silently falls back
+    to the DSN host at both the SNI-send and post-handshake-verify sites in
+    ngx_http_cache_turbo_redis.c. Same failure shape as an empty L2 key
+    prefix= (see test_empty_l2_prefix_rejected above): both must fail
+    nginx -t rather than degrade a hardening control."""
+    if ng.redis_tls_port is None:
+        return
+
+    anchor = (
+        f"cache_turbo_redis rediss://127.0.0.1:{ng.redis_tls_port}/0 "
+        f"tls_ca={ng.redis_tls_ca} tls_name=localhost;"
+    )
+
+    r = _config_test_result(
+        ng, lambda c: (
+            c.replace(anchor,
+                      f"cache_turbo_redis rediss://127.0.0.1:{ng.redis_tls_port}/0 "
+                      f"tls_ca= tls_name=localhost;", 1)
+            if anchor in c else c))
+    assert r.returncode != 0, \
+        f"empty tls_ca= was accepted by nginx -t:\n{r.stdout}"
+    assert "empty tls_ca=" in r.stdout, \
+        f"missing empty-tls_ca diagnostic:\n{r.stdout}"
+
+    r = _config_test_result(
+        ng, lambda c: (
+            c.replace(anchor,
+                      f"cache_turbo_redis rediss://127.0.0.1:{ng.redis_tls_port}/0 "
+                      f"tls_ca={ng.redis_tls_ca} tls_name=;", 1)
+            if anchor in c else c))
+    assert r.returncode != 0, \
+        f"empty tls_name= was accepted by nginx -t:\n{r.stdout}"
+    assert "empty tls_name=" in r.stdout, \
+        f"missing empty-tls_name diagnostic:\n{r.stdout}"
+
+
 def test_max_size_not_cached(ng: Nginx) -> None:
     """Responses larger than cache_turbo_max_size are never cached (Q2: the
     body filter early-aborts capture the moment body_len crosses max_size, so

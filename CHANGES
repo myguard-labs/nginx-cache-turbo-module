@@ -1,5 +1,53 @@
 Changes with the nginx-cache-turbo-module (unreleased)
 
+    *) Security: cache_turbo_lock_ttl accepted an arbitrary, unbounded time
+       value. The single-flight refresh path multiplies it by the live load
+       factor and adds the result to the current time (now + lock_ttl) to
+       compute refresh_lock_until -- an additive time_t overflow if an
+       operator (or a templated config driven by an external value) supplied
+       a large-enough lock_ttl. cache_turbo_lock_ttl is now clamped to
+       NGX_HTTP_CACHE_TURBO_TTL_MAX at parse time, the same ceiling and
+       clamp-not-reject contract cache_turbo_keep_stale already uses.
+       Affects: all versions through 1.1.0.
+       Exposure: config-write access only; no request can influence
+       lock_ttl. Mitigation without upgrading: keep cache_turbo_lock_ttl
+       within a sane range (seconds to low hours) in every location.
+
+    *) Bugfix: cache_turbo_lock_ttl 0 was accepted by nginx -t and then
+       silently coerced to 5s by two independent runtime self-heal sites in
+       the single-flight refresh path, so the running config quietly meant
+       something other than what the operator wrote. cache_turbo_lock_ttl 0
+       is now rejected at parse time with a diagnostic pointing at
+       "cache_turbo_lock off", the directive that actually disables
+       single-flight locking. The runtime coercions themselves are left in
+       place as defence in depth.
+
+    *) Bugfix: cache_turbo_min_uses_window accepted any value
+       ngx_conf_set_sec_slot would parse, with no range check, even though
+       the field's own comment documents it as bounded by
+       NGX_HTTP_CACHE_TURBO_MIN_USES_WINDOW_MAX (86400, one day) --
+       an invariant nothing in the module enforced. The directive now has a
+       hand-rolled setter that range-checks against
+       NGX_HTTP_CACHE_TURBO_MIN_USES_WINDOW_MIN/_MAX (1..86400 seconds),
+       matching cache_turbo_l2_negative_ttl's contract: 0 remains accepted
+       and means OFF (today's default, unchanged).
+
+    *) Security: cache_turbo_redis accepted an empty tls_ca= or tls_name=
+       value. An empty tls_ca= silently widens an intentional certificate
+       pin to the system CA store, since ngx_ssl_trusted_certificate() is
+       only invoked when the configured CA path is non-empty; an empty
+       tls_name= silently falls back to verifying against the DSN host
+       instead of an operator-pinned name, at both the SNI-send and
+       post-handshake-verify sites. Both are now rejected at config-parse
+       time, the same treatment an empty L2 key prefix= already receives.
+       Affects: all versions through 1.1.0, only where cache_turbo_redis
+       tls=on is configured with tls_ca= or tls_name= present but blank.
+       Exposure: config-write access only; the result of the prior behaviour
+       was a silently weaker TLS trust configuration than the operator
+       intended, not a request-reachable bypass. Mitigation without
+       upgrading: audit any cache_turbo_redis line for tls_ca= or tls_name=
+       with nothing after the "=".
+
     *) Security: an admin warm list supplied as a CRLF-terminated file
        (POST /_cache?url_file=...) could place a bare CR into the upstream
        request line. The "\r" trim moved the decoded URI's length but not the
