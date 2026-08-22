@@ -432,9 +432,9 @@ ngx_http_cache_turbo_admin_stats_prometheus(ngx_http_request_t *r,
     u_char     *p;
     size_t      len;
 
-    /* Twenty-three counters (*_total) + five gauges, each labelled by zone
+    /* Twenty-eight counters (*_total) + seven gauges, each labelled by zone
      * so one Prometheus job can scrape many zones. Exposition format
-     * 0.0.4. The per-metric budget must track the emitted count (28):
+     * 0.0.4. The per-metric budget must track the emitted count (35):
      * every metric line renders one %V (zone) + one %uA (value), so a
      * short multiplier could truncate the last line under a long zone
      * name. The fixed term covers the HELP/TYPE prose, which grows
@@ -452,7 +452,12 @@ ngx_http_cache_turbo_admin_stats_prometheus(ngx_http_request_t *r,
      * sketch_gen (gauge), sketch_bumps_total (counter) and
      * admission_refused_total (counter), prose term bumped by ~530 bytes
      * for their HELP/TYPE lines and the count 28 -> 31; P4-2-s3a added
-     * used_bytes (gauge) and the count 31 -> 32).
+     * used_bytes (gauge) and the count 31 -> 32; TAG-CAP-SILENT-DROP added
+     * tag_cap_drops_total (counter), prose term re-measured and the count
+     * 32 -> 35 -- ci/tools/lint-admin-buffer-budget.py caught the earlier
+     * miscount at CI time (the multiplier and term must track %V/%uA
+     * occurrences, not the metric-name comment above, which had already
+     * drifted before this bump)).
      *
      * ⚠ P4-2-s3a: the fixed term is no longer eyeballed. Every previous bump
      * was an estimate ("~180 bytes", "~530 bytes") and they had drifted
@@ -462,9 +467,11 @@ ngx_http_cache_turbo_admin_stats_prometheus(ngx_http_request_t *r,
      * value and real counters render far shorter, so the per-value slack
      * silently absorbed it -- i.e. the budget was already relying on an
      * accident. The term below is the MEASURED fixed prose (sum of the
-     * literal bytes, less 2 per %V and 3 per %uA) plus a 256-byte margin.
-     * When adding a metric, re-measure rather than adding an estimate. */
-    len = 6789 + 34 * zname.len + 34 * NGX_ATOMIC_T_LEN;
+     * literal bytes, less 2 per %V and 3 per %uA) plus lint-admin-buffer-
+     * budget.py's 128-byte margin. When adding a metric, re-measure rather
+     * than adding an estimate -- run the lint locally, it prints the exact
+     * required value. */
+    len = 7152 + 35 * zname.len + 35 * NGX_ATOMIC_T_LEN;
     p = ngx_pnalloc(r->pool, len);
     if (p == NULL) {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
