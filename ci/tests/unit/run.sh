@@ -88,8 +88,8 @@ bash "$DIR/extract_key_fold.sh"
 # _final/_digest (sliced verbatim by extract_digest.sh) against independently
 # computed SHA-256 vectors, and against each other via the
 # ngx_http_cache_turbo_test_fetch_md_fail fault knob.
-# shellcheck disable=SC2086
 bash "$DIR/extract_digest.sh"
+# shellcheck disable=SC2086
 "$CC" $CFLAGS "$DIR/test_digest.c" -o "$DIR/test_digest" -lssl -lcrypto
 "$DIR/test_digest"
 
