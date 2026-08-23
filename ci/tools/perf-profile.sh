@@ -81,7 +81,7 @@ DURATION="${2:-20}"
 CONC="${3:-8}"
 MODULE="${MODULE:-}"
 NPROC="$(nproc 2>/dev/null || echo 4)"
-THREADS="${THREADS:-$(( CONC < NPROC ? CONC : NPROC ))}"
+THREADS="${THREADS:-$((CONC < NPROC ? CONC : NPROC))}"
 FREQ="${FREQ:-999}"
 CALLGRAPH="${CALLGRAPH:-fp}"
 OUT="${OUT:-$PWD/ci/tools/perf-out}"
@@ -99,41 +99,51 @@ AE_CLASS_B="br"
 # ("lock contention on the shm mutex") can only be confirmed or refuted with
 # WORKERS>1 driving real cross-worker pressure on the SAME zone mutex.
 WORKERS="${WORKERS:-1}"
-case "$WORKERS" in ''|*[!0-9]*) echo "FATAL: WORKERS must be a positive integer" >&2; exit 2;; esac
+case "$WORKERS" in '' | *[!0-9]*)
+  echo "FATAL: WORKERS must be a positive integer" >&2
+  exit 2
+  ;;
+esac
 WORKERS=$((10#$WORKERS))
-[ "$WORKERS" -ge 1 ] || { echo "FATAL: WORKERS must be >= 1" >&2; exit 2; }
+[ "$WORKERS" -ge 1 ] || {
+  echo "FATAL: WORKERS must be >= 1" >&2
+  exit 2
+}
 
 case "$CALLGRAPH" in
-    fp|dwarf) ;;
-    *) echo "FATAL: CALLGRAPH must be 'fp' or 'dwarf', got '$CALLGRAPH'" >&2; exit 2;;
+  fp | dwarf) ;;
+  *)
+    echo "FATAL: CALLGRAPH must be 'fp' or 'dwarf', got '$CALLGRAPH'" >&2
+    exit 2
+    ;;
 esac
 
 command -v perf >/dev/null 2>&1 || {
-    echo "FATAL: perf not found. This harness measures nothing without it —" >&2
-    echo "  install linux-perf / linux-tools-\$(uname -r), do not skip the run." >&2
-    exit 2
+  echo "FATAL: perf not found. This harness measures nothing without it —" >&2
+  echo "  install linux-perf / linux-tools-\$(uname -r), do not skip the run." >&2
+  exit 2
 }
 command -v wrk >/dev/null 2>&1 || {
-    echo "FATAL: wrk not found. apt-get install wrk (or build from github.com/wg/wrk)." >&2
-    exit 2
+  echo "FATAL: wrk not found. apt-get install wrk (or build from github.com/wg/wrk)." >&2
+  exit 2
 }
 command -v gawk >/dev/null 2>&1 || {
-    echo "FATAL: gawk not found; required for hit-ratio arithmetic." >&2
-    exit 2
+  echo "FATAL: gawk not found; required for hit-ratio arithmetic." >&2
+  exit 2
 }
 
 paranoid="$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo 3)"
 if [ "$paranoid" -gt 2 ] && [ "$(id -u)" -ne 0 ]; then
-    echo "FATAL: /proc/sys/kernel/perf_event_paranoid=$paranoid blocks unprivileged" >&2
-    echo "  perf_event_open. Run as root, or lower it (host policy permitting)." >&2
-    echo "  Do NOT silently fall back to an unmeasured run." >&2
-    exit 2
+  echo "FATAL: /proc/sys/kernel/perf_event_paranoid=$paranoid blocks unprivileged" >&2
+  echo "  perf_event_open. Run as root, or lower it (host policy permitting)." >&2
+  echo "  Do NOT silently fall back to an unmeasured run." >&2
+  exit 2
 fi
 
 mkdir -p "$OUT"
 
-ORIGIN=18350   # backend
-C=18352        # cache_turbo L1 shm (mirrors bench.sh's C port block, own range)
+ORIGIN=18350 # backend
+C=18352      # cache_turbo L1 shm (mirrors bench.sh's C port block, own range)
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
@@ -141,7 +151,7 @@ mkdir -p "$WORK/conf" "$WORK/logs" "$WORK/html"
 
 # tiny only — see header comment: this is the size PLAN-optimize.md P2-2
 # asks for, where fixed per-hit cost dominates.
-head -c 200 /dev/urandom | base64 > "$WORK/html/tiny"
+head -c 200 /dev/urandom | base64 >"$WORK/html/tiny"
 
 LOAD_MODULE=""
 [ -n "$MODULE" ] && LOAD_MODULE="load_module $(realpath "$MODULE");"
@@ -175,18 +185,18 @@ LOCATION_BLOCK='location / { add_header Cache-Control "max-age=600"; }'
 KEY_ENCODED_DIRECTIVE=''
 MAP_BLOCK=''
 if [ -n "$VARY" ]; then
-    # shellcheck disable=SC2016  # $ct_ae_class is an nginx map variable, resolved by nginx at request time, not by the shell
-    LOCATION_BLOCK='location / { add_header Cache-Control "max-age=600"; add_header Vary "Accept-Encoding"; add_header Content-Encoding $ct_ae_class; }'
-    KEY_ENCODED_DIRECTIVE='
+  # shellcheck disable=SC2016  # $ct_ae_class is an nginx map variable, resolved by nginx at request time, not by the shell
+  LOCATION_BLOCK='location / { add_header Cache-Control "max-age=600"; add_header Vary "Accept-Encoding"; add_header Content-Encoding $ct_ae_class; }'
+  KEY_ENCODED_DIRECTIVE='
             cache_turbo_key_encoded_origin on;'
-    MAP_BLOCK="    map \$http_accept_encoding \$ct_ae_class {
+  MAP_BLOCK="    map \$http_accept_encoding \$ct_ae_class {
         default          \"$AE_CLASS_A\";
         \"~*\\b$AE_CLASS_B\\b\"  \"$AE_CLASS_B\";
     }
 "
 fi
 
-cat > "$WORK/conf/nginx.conf" <<EOF
+cat >"$WORK/conf/nginx.conf" <<EOF
 daemon off;
 $LOAD_MODULE
 master_process on;
@@ -229,31 +239,34 @@ MASTER_PID=$!
 trap 'kill -QUIT "$MASTER_PID" 2>/dev/null || true; rm -rf "$WORK"' EXIT
 
 for _ in $(seq 1 100); do
-    curl -fsS -o /dev/null "http://127.0.0.1:$ORIGIN/tiny" 2>/dev/null && break
-    sleep 0.1
+  curl -fsS -o /dev/null "http://127.0.0.1:$ORIGIN/tiny" 2>/dev/null && break
+  sleep 0.1
 done
 
 # Find the WORKER pid(s) (not master) — those are the processes actually
 # serving requests and holding the shm mutex.
 worker_pids=""
 for _ in $(seq 1 50); do
-    worker_pids="$(pgrep -P "$MASTER_PID" -f nginx 2>/dev/null | tr '\n' ',' | sed 's/,$//')"
-    n_found="$(tr ',' '\n' <<<"$worker_pids" | sed '/^$/d' | wc -l)"
-    [ "$n_found" -ge "$WORKERS" ] && break
-    sleep 0.1
+  worker_pids="$(pgrep -P "$MASTER_PID" -f nginx 2>/dev/null | tr '\n' ',' | sed 's/,$//')"
+  n_found="$(tr ',' '\n' <<<"$worker_pids" | sed '/^$/d' | wc -l)"
+  [ "$n_found" -ge "$WORKERS" ] && break
+  sleep 0.1
 done
-[ -n "$worker_pids" ] || { echo "FATAL: could not find nginx worker pid(s) under master $MASTER_PID" >&2; exit 3; }
+[ -n "$worker_pids" ] || {
+  echo "FATAL: could not find nginx worker pid(s) under master $MASTER_PID" >&2
+  exit 3
+}
 n_found="$(tr ',' '\n' <<<"$worker_pids" | sed '/^$/d' | wc -l)"
 [ "$n_found" -ge "$WORKERS" ] || {
-    echo "FATAL: expected $WORKERS worker(s), only found $n_found ($worker_pids)" >&2
-    exit 3
+  echo "FATAL: expected $WORKERS worker(s), only found $n_found ($worker_pids)" >&2
+  exit 3
 }
 
 url="http://127.0.0.1:$C/tiny"
 
 scrape() {
-    curl -fsS "http://127.0.0.1:$C/_cache_c?format=prometheus" 2>/dev/null \
-        | awk -v m="$1" '$1 ~ "^"m"\\{" {print $2; found=1} END { if (!found) print 0 }' | head -1
+  curl -fsS "http://127.0.0.1:$C/_cache_c?format=prometheus" 2>/dev/null \
+    | awk -v m="$1" '$1 ~ "^"m"\\{" {print $2; found=1} END { if (!found) print 0 }' | head -1
 }
 
 # Prime + verify the key is actually cached before trusting anything measured
@@ -262,51 +275,54 @@ scrape() {
 # reports HIT, so the LATER measured pass (which carries the same headers)
 # does not cold-miss its own key.
 prime_class() {
-    ae="$1"
-    args=()
-    [ -n "$ae" ] && args=(-H "Accept-Encoding: $ae")
-    hit=0
-    for _ in $(seq 1 30); do
-        curl -fsS "${args[@]}" -D - -o /dev/null "$url" 2>/dev/null > "$WORK/logs/hdr" || true
-        xc=$(grep -i '^X-Cache:' "$WORK/logs/hdr" | tr -d '\r' | awk '{print toupper($2)}' || true)
-        if [ "$xc" = "HIT" ]; then hit=1; break; fi
-        sleep 0.1
-    done
-    [ "$hit" -eq 1 ]
+  ae="$1"
+  args=()
+  [ -n "$ae" ] && args=(-H "Accept-Encoding: $ae")
+  hit=0
+  for _ in $(seq 1 30); do
+    curl -fsS "${args[@]}" -D - -o /dev/null "$url" 2>/dev/null >"$WORK/logs/hdr" || true
+    xc=$(grep -i '^X-Cache:' "$WORK/logs/hdr" | tr -d '\r' | awk '{print toupper($2)}' || true)
+    if [ "$xc" = "HIT" ]; then
+      hit=1
+      break
+    fi
+    sleep 0.1
+  done
+  [ "$hit" -eq 1 ]
 }
 
 mi_pre=$(scrape cache_turbo_misses_total)
 
 if [ -n "$VARY" ]; then
-    # Prime BOTH classes before measuring. Class A's priming is an ordinary
-    # cold-miss-then-hit on the base/first-variant key -- unremarkable. Class
-    # B's priming is the evidence: it can ONLY produce another miss if the
-    # marker stored by class A's store (bits>0, ENCODING axis armed) routed
-    # this differently-encoded request to a genuinely different, not-yet-warm
-    # variant key. If VARY were not actually engaging the marker (e.g. a
-    # config regression), class B would just re-hit class A's already-cached
-    # entry -- zero delta -- since a single unvaried key is blind to the
-    # request's Accept-Encoding.
-    prime_class "$AE_CLASS_A" || {
-        echo "FATAL: $url (Accept-Encoding: $AE_CLASS_A) never reported X-Cache: HIT after 30 priming requests." >&2
-        echo "  -> perf would profile the MISS/origin path, not the L1 hit path. Aborting." >&2
-        exit 3
-    }
-    mi_after_a=$(scrape cache_turbo_misses_total)
+  # Prime BOTH classes before measuring. Class A's priming is an ordinary
+  # cold-miss-then-hit on the base/first-variant key -- unremarkable. Class
+  # B's priming is the evidence: it can ONLY produce another miss if the
+  # marker stored by class A's store (bits>0, ENCODING axis armed) routed
+  # this differently-encoded request to a genuinely different, not-yet-warm
+  # variant key. If VARY were not actually engaging the marker (e.g. a
+  # config regression), class B would just re-hit class A's already-cached
+  # entry -- zero delta -- since a single unvaried key is blind to the
+  # request's Accept-Encoding.
+  prime_class "$AE_CLASS_A" || {
+    echo "FATAL: $url (Accept-Encoding: $AE_CLASS_A) never reported X-Cache: HIT after 30 priming requests." >&2
+    echo "  -> perf would profile the MISS/origin path, not the L1 hit path. Aborting." >&2
+    exit 3
+  }
+  mi_after_a=$(scrape cache_turbo_misses_total)
 
-    prime_class "$AE_CLASS_B" || {
-        echo "FATAL: $url (Accept-Encoding: $AE_CLASS_B) never reported X-Cache: HIT after 30 priming requests." >&2
-        echo "  -> perf would profile the MISS/origin path, not the L1 hit path. Aborting." >&2
-        exit 3
-    }
-    mi_after_b=$(scrape cache_turbo_misses_total)
-    marker_prime_delta=$(( mi_after_b - mi_after_a ))
+  prime_class "$AE_CLASS_B" || {
+    echo "FATAL: $url (Accept-Encoding: $AE_CLASS_B) never reported X-Cache: HIT after 30 priming requests." >&2
+    echo "  -> perf would profile the MISS/origin path, not the L1 hit path. Aborting." >&2
+    exit 3
+  }
+  mi_after_b=$(scrape cache_turbo_misses_total)
+  marker_prime_delta=$((mi_after_b - mi_after_a))
 else
-    prime_class "" || {
-        echo "FATAL: $url never reported X-Cache: HIT after 30 priming requests." >&2
-        echo "  -> perf would profile the MISS/origin path, not the L1 hit path. Aborting." >&2
-        exit 3
-    }
+  prime_class "" || {
+    echo "FATAL: $url never reported X-Cache: HIT after 30 priming requests." >&2
+    echo "  -> perf would profile the MISS/origin path, not the L1 hit path. Aborting." >&2
+    exit 3
+  }
 fi
 
 h0=$(scrape cache_turbo_hits_total)
@@ -332,12 +348,12 @@ sleep 0.3
 
 wrk_extra_args=()
 if [ -n "$VARY" ]; then
-    # wrk's -H is static for the whole run; alternating two Accept-Encoding
-    # classes per request needs a script. Each thread gets its own Lua state
-    # (wrk copies the script per-thread), so the per-thread counter only
-    # needs to alternate within that thread -- combined across threads the
-    # measured pass still visits both classes throughout.
-    cat > "$WORK/vary.lua" <<LUA
+  # wrk's -H is static for the whole run; alternating two Accept-Encoding
+  # classes per request needs a script. Each thread gets its own Lua state
+  # (wrk copies the script per-thread), so the per-thread counter only
+  # needs to alternate within that thread -- combined across threads the
+  # measured pass still visits both classes throughout.
+  cat >"$WORK/vary.lua" <<LUA
 local classes = { "$AE_CLASS_A", "$AE_CLASS_B" }
 local i = 0
 request = function()
@@ -346,7 +362,7 @@ request = function()
     return wrk.format(nil, nil, nil, nil)
 end
 LUA
-    wrk_extra_args=(-s "$WORK/vary.lua")
+  wrk_extra_args=(-s "$WORK/vary.lua")
 fi
 wrk_out=$(wrk -t"$THREADS" -c"$CONC" -d"${DURATION}s" --latency "${wrk_extra_args[@]}" "$url" 2>/dev/null)
 
@@ -358,8 +374,10 @@ wait "$PERF_PID" 2>/dev/null || true
 h1=$(scrape cache_turbo_hits_total)
 mi1=$(scrape cache_turbo_misses_total)
 st1=$(scrape cache_turbo_stale_serves_total)
-dh=$(( h1 - h0 )); dm=$(( mi1 - mi0 )); ds=$(( st1 - st0 ))
-tot=$(( dh + dm + ds ))
+dh=$((h1 - h0))
+dm=$((mi1 - mi0))
+ds=$((st1 - st0))
+tot=$((dh + dm + ds))
 hit_pct="n/a"
 [ "$tot" -gt 0 ] && hit_pct=$(awk "BEGIN{printf \"%.2f\", 100*($dh+$ds)/$tot}")
 
@@ -368,9 +386,9 @@ p50=$(awk '$1=="50%"{print $2}' <<<"$wrk_out")
 p99=$(awk '$1=="99%"{print $2}' <<<"$wrk_out")
 
 [ -s "$perf_data" ] || {
-    echo "FATAL: $perf_data is empty/missing — perf never sampled the worker." >&2
-    echo "  Check perf_event_paranoid and that the worker pid stayed alive." >&2
-    exit 3
+  echo "FATAL: $perf_data is empty/missing — perf never sampled the worker." >&2
+  echo "  Check perf_event_paranoid and that the worker pid stayed alive." >&2
+  exit 3
 }
 
 # --no-children (self time, no callers/callees folded in) + -g none is the
@@ -380,9 +398,9 @@ p99=$(awk '$1=="99%"{print $2}' <<<"$wrk_out")
 # with call-tree roots instead of hot leaves.
 report_txt="$OUT/perf-report.txt"
 perf report -i "$perf_data" --stdio --sort=overhead,symbol -g none --no-children \
-    > "$report_txt" 2>/dev/null || {
-    echo "FATAL: perf report failed to read $perf_data" >&2
-    exit 3
+  >"$report_txt" 2>/dev/null || {
+  echo "FATAL: perf report failed to read $perf_data" >&2
+  exit 3
 }
 
 top_syms="$(awk '
@@ -432,9 +450,9 @@ echo "$top_syms"
 echo
 echo "== VARY marker evidence (cache_turbo_misses_total deltas, priming phase) =="
 if [ -n "$VARY" ]; then
-    echo "class_A=$AE_CLASS_A misses_pre=$mi_pre misses_after_A=$mi_after_a (delta=$(( mi_after_a - mi_pre )))"
-    echo "class_B=$AE_CLASS_B misses_after_B=$mi_after_b (delta=$marker_prime_delta)"
-    echo "marker_prime_delta=$marker_prime_delta  # nonzero => class B's priming took a genuine bits>0 miss into a NEW variant key, not a re-hit of class A's key"
+  echo "class_A=$AE_CLASS_A misses_pre=$mi_pre misses_after_A=$mi_after_a (delta=$((mi_after_a - mi_pre)))"
+  echo "class_B=$AE_CLASS_B misses_after_B=$mi_after_b (delta=$marker_prime_delta)"
+  echo "marker_prime_delta=$marker_prime_delta  # nonzero => class B's priming took a genuine bits>0 miss into a NEW variant key, not a re-hit of class A's key"
 else
-    echo "VARY unset -- single key, no second class primed, no marker delta possible by construction (negative control: see a VARY=1 run for the positive case)"
+  echo "VARY unset -- single key, no second class primed, no marker delta possible by construction (negative control: see a VARY=1 run for the positive case)"
 fi
