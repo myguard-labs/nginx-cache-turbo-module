@@ -45,6 +45,14 @@ typedef struct {
  * argument). Defined and freed in blob.c's exit_process(); extern only so a
  * future second TU could inspect it, same visibility it had pre-split. */
 extern EVP_MD_CTX  *ngx_http_cache_turbo_worker_md;
+
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L && !defined(LIBRESSL_VERSION_NUMBER)
+/* C0: worker-persistent fetched EVP_MD* for SHA2-256, same lazy-create/
+ * exit_process-free lifecycle and single-threaded-worker safety argument as
+ * ngx_http_cache_turbo_worker_md above (see blob.c digest_init). Guarded out
+ * on pre-3.0 OpenSSL and on LibreSSL, neither of which has EVP_MD_fetch(). */
+extern EVP_MD  *ngx_http_cache_turbo_worker_sha256;
+#endif
 #endif
 
 /* Registered in module.c's ngx_module_t (ngx_http_cache_turbo_module), which
