@@ -722,11 +722,24 @@ def test_head_derived_entry_never_served_to_get(
 
 def test_honor_cache_control(ng: Nginx) -> None:
     """v7: with cache_turbo_cache_control honor, the origin's max-age=1 shortens
-    the fresh TTL below the configured 60s — so the entry is stale at ~2s."""
+    the fresh TTL below the configured 60s — so the entry is stale at ~2s.
+
+    TEST-MICROTTL-ORACLE (2026-08-23): the immediate re-read below only proves
+    the entry was STORED (accepting HIT or STALE), not that it is still inside
+    the 1s fresh window -- the module never promised the two live HTTP round
+    trips complete in under 1s, and under ASan multi-worker load they sometimes
+    don't (PR #414's run 32620522765). The fresh-vs-stale distinction this test
+    exists to make is the deterministic STALE-at-2s check below, which has a
+    full 1s of margin over the max-age=1 boundary and needs no race. The same
+    relaxation is applied to every sibling TTL-precedence test in this file
+    (test_honor_expires_absolute_ttl and the CDN-Cache-Control / Surrogate-
+    Control precedence and split-header tests immediately below) since they
+    share this exact shape against the same /cc7/ honor location."""
     _, _, h0 = fetch(ng.port, "/cc7/ttl1")
     assert "x-cache" not in h0, "first should miss"
     _, _, h1 = fetch(ng.port, "/cc7/ttl1")
-    assert h1.get("x-cache") == "HIT", "second should be a fresh HIT (<1s)"
+    assert h1.get("x-cache") in ("HIT", "STALE"), \
+        f"second should be served from cache (HIT or a raced STALE), got {h1.get('x-cache')}"
     time.sleep(2.0)                               # past max-age=1, within stale
     _, _, h2 = fetch(ng.port, "/cc7/ttl1")
     assert h2.get("x-cache") == "STALE", \
@@ -744,7 +757,10 @@ def test_honor_expires_absolute_ttl(ng: Nginx) -> None:
     _, _, h0 = fetch(ng.port, "/cc7/expabs")
     assert "x-cache" not in h0, "first should miss"
     _, _, h1 = fetch(ng.port, "/cc7/expabs")
-    assert h1.get("x-cache") == "HIT", "second should be a fresh HIT (<2s)"
+    # TEST-MICROTTL-ORACLE: HIT or a raced STALE both prove storage; see
+    # test_honor_cache_control.
+    assert h1.get("x-cache") in ("HIT", "STALE"), \
+        f"second should be served from cache, got {h1.get('x-cache')}"
     time.sleep(3.5)                               # past the 2s Expires, staleness >=1s
     _, _, h2 = fetch(ng.port, "/cc7/expabs")
     assert h2.get("x-cache") == "STALE", \
@@ -760,7 +776,10 @@ def test_cdn_cache_control_ttl_outranks_cache_control(ng: Nginx) -> None:
     _, _, h0 = fetch(ng.port, "/cc7/cdnttl")
     assert "x-cache" not in h0, "first should miss"
     _, _, h1 = fetch(ng.port, "/cc7/cdnttl")
-    assert h1.get("x-cache") == "HIT", "second should be a fresh HIT (<1s)"
+    # TEST-MICROTTL-ORACLE: HIT or a raced STALE both prove storage; see
+    # test_honor_cache_control.
+    assert h1.get("x-cache") in ("HIT", "STALE"), \
+        f"second should be served from cache, got {h1.get('x-cache')}"
     time.sleep(2.0)                               # past CDN max-age=1, within stale
     _, _, h2 = fetch(ng.port, "/cc7/cdnttl")
     assert h2.get("x-cache") == "STALE", \
@@ -775,7 +794,10 @@ def test_surrogate_control_ttl_outranks_cdn_and_cache_control(ng: Nginx) -> None
     _, _, h0 = fetch(ng.port, "/cc7/scttl")
     assert "x-cache" not in h0, "first should miss"
     _, _, h1 = fetch(ng.port, "/cc7/scttl")
-    assert h1.get("x-cache") == "HIT", "second should be a fresh HIT (<1s)"
+    # TEST-MICROTTL-ORACLE: HIT or a raced STALE both prove storage; see
+    # test_honor_cache_control.
+    assert h1.get("x-cache") in ("HIT", "STALE"), \
+        f"second should be served from cache, got {h1.get('x-cache')}"
     time.sleep(2.0)
     _, _, h2 = fetch(ng.port, "/cc7/scttl")
     assert h2.get("x-cache") == "STALE", \
@@ -793,7 +815,10 @@ def test_surrogate_control_split_header_ttl(ng: Nginx) -> None:
     _, _, h0 = fetch(ng.port, "/cc7/scsplit")
     assert "x-cache" not in h0, "first should miss"
     _, _, h1 = fetch(ng.port, "/cc7/scsplit")
-    assert h1.get("x-cache") == "HIT", "second should be a fresh HIT (<1s)"
+    # TEST-MICROTTL-ORACLE: HIT or a raced STALE both prove storage; see
+    # test_honor_cache_control.
+    assert h1.get("x-cache") in ("HIT", "STALE"), \
+        f"second should be served from cache, got {h1.get('x-cache')}"
     time.sleep(2.0)                               # past SC max-age=1 (2nd line)
     _, _, h2 = fetch(ng.port, "/cc7/scsplit")
     assert h2.get("x-cache") == "STALE", \
@@ -810,7 +835,10 @@ def test_cdn_cache_control_split_header_ttl(ng: Nginx) -> None:
     _, _, h0 = fetch(ng.port, "/cc7/cdnsplit")
     assert "x-cache" not in h0, "first should miss"
     _, _, h1 = fetch(ng.port, "/cc7/cdnsplit")
-    assert h1.get("x-cache") == "HIT", "second should be a fresh HIT (<1s)"
+    # TEST-MICROTTL-ORACLE: HIT or a raced STALE both prove storage; see
+    # test_honor_cache_control.
+    assert h1.get("x-cache") in ("HIT", "STALE"), \
+        f"second should be served from cache, got {h1.get('x-cache')}"
     time.sleep(2.0)                               # past CDN-CC max-age=1 (2nd line)
     _, _, h2 = fetch(ng.port, "/cc7/cdnsplit")
     assert h2.get("x-cache") == "STALE", \
@@ -867,12 +895,20 @@ def test_must_revalidate_split_header(ng: Nginx) -> None:
     field to repeat across field-lines (RFC 9110 SS5.3), equivalent to one
     comma-joined line -- a reader that only inspects the first Cache-Control
     line would miss the must-revalidate token on the second and wrongly
-    stale-serve past freshness."""
+    stale-serve past freshness.
+
+    TEST-MICROTTL-ORACLE (2026-08-23): unlike the /cc7/ honor-mode TTL tests,
+    a must-revalidate entry never shows an intermediate STALE state, so
+    "accept HIT or STALE" cannot make the immediate re-read race-tolerant here
+    -- past the deadline it collapses straight to a revalidate that looks
+    identical to "never stored". origin.py widened this marker's max-age from
+    1s to 4s so the live round trip has real margin; see test_must_revalidate
+    for the full rationale."""
     _, _, h0 = fetch(ng.port, "/ccsplit/splitmrev")
     assert "x-cache" not in h0, "first should miss"
     _, _, h1 = fetch(ng.port, "/ccsplit/splitmrev")
     assert h1.get("x-cache") == "HIT", f"second should be a fresh HIT, got {h1}"
-    time.sleep(2.0)                               # past max-age=1
+    time.sleep(6.0)                               # past max-age=4, generous margin
     _, _, h2 = fetch(ng.port, "/ccsplit/splitmrev")
     assert h2.get("x-cache") != "STALE", \
         ("must-revalidate on a later Cache-Control field-line must NOT be "
@@ -903,12 +939,27 @@ def test_request_no_cache(ng: Nginx, origin: Origin) -> None:
 def test_must_revalidate(ng: Nginx) -> None:
     """RFC 9111: a must-revalidate response is served fresh until its deadline
     then re-fetched — never stale-served. Same setup as /cc7/ (which DOES stale-
-    serve), proving the must-revalidate token collapses the stale window."""
+    serve), proving the must-revalidate token collapses the stale window.
+
+    TEST-MICROTTL-ORACLE (2026-08-23): the immediate re-read still asserts a
+    strict fresh HIT (not "HIT or STALE" like the /cc7/ tests) because a
+    must-revalidate entry has no observable STALE state to fall back to --
+    past the deadline it collapses straight to an origin revalidate, which is
+    indistinguishable from "was never stored" by X-Cache alone. That makes the
+    live round trip's own margin the only lever: origin.py widened this
+    marker's Cache-Control from max-age=1 to max-age=4 (was flagged racing the
+    1s window under ASan multi-worker, e.g. PR #414's run 32620522765 on the
+    sibling test_honor_cache_control), giving two quick HTTP round trips ample
+    slack to complete before the deadline even under a slow sanitizer build.
+    The post-deadline sleep below is widened to match (was 2.0 past max-age=1,
+    now 6.0 past max-age=4 -- 2s of margin, and there is no upper-bound risk to
+    overshoot since must-revalidate has no stale window to fall out of the far
+    side of)."""
     _, _, h0 = fetch(ng.port, "/mrev/mustrev")
     assert "x-cache" not in h0, "first should miss"
     _, _, h1 = fetch(ng.port, "/mrev/mustrev")
     assert h1.get("x-cache") == "HIT", f"second should be a fresh HIT, got {h1}"
-    time.sleep(2.0)                               # past max-age=1
+    time.sleep(6.0)                               # past max-age=4, generous margin
     _, _, h2 = fetch(ng.port, "/mrev/mustrev")
     assert h2.get("x-cache") != "STALE", \
         f"must-revalidate must NOT stale-serve past freshness, got {h2.get('x-cache')}"
@@ -921,12 +972,14 @@ def test_proxy_revalidate(ng: Nginx) -> None:
     and MUST collapse the stale window identically. Exercises the OR-arm of
     response_must_revalidate (module.c:1142) that must-revalidate alone leaves
     uncovered. Same /mrev/ location, "proxyrev" origin arm emits
-    "max-age=1, proxy-revalidate"."""
+    "max-age=4, proxy-revalidate" (widened from 1s; see test_must_revalidate's
+    TEST-MICROTTL-ORACLE note for why the immediate HIT check needs the extra
+    margin here and cannot fall back to accepting STALE)."""
     _, _, h0 = fetch(ng.port, "/mrev/proxyrev")
     assert "x-cache" not in h0, "first should miss"
     _, _, h1 = fetch(ng.port, "/mrev/proxyrev")
     assert h1.get("x-cache") == "HIT", f"second should be a fresh HIT, got {h1}"
-    time.sleep(2.0)                               # past max-age=1
+    time.sleep(6.0)                               # past max-age=4, generous margin
     _, _, h2 = fetch(ng.port, "/mrev/proxyrev")
     assert h2.get("x-cache") != "STALE", \
         f"proxy-revalidate must NOT stale-serve past freshness, got {h2.get('x-cache')}"
@@ -967,7 +1020,10 @@ def test_ignore_cc_must_revalidate_keeps_stale_window(ng: Nginx,
     """cache_turbo_cache_control ignore must neutralise the WHOLE response
     Cache-Control, including the must-revalidate token that would otherwise
     collapse the stale window at store. The origin emits
-    "max-age=1, must-revalidate"; under /ccignmr/ (ignore_cc on, valid 2s, default
+    "max-age=4, must-revalidate" (the shared "mustrev" marker, widened from
+    max-age=1 by TEST-MICROTTL-ORACLE for /mrev/'s sake -- irrelevant here
+    precisely BECAUSE ignore_cc neutralises the whole header, which is the
+    property under test); under /ccignmr/ (ignore_cc on, valid 2s, default
     stale_mult 4 => 8s total serve life = 2s fresh + 6s stale) the entry must
     still be STALE-served at ~4s. Without the fix (must-revalidate parsed despite
     ignore_cc) the serve deadline collapses to the 2s fresh deadline and the 4s
@@ -1209,7 +1265,13 @@ def test_auto_vary_stale_marker_reachable(ng: Nginx, origin: Origin) -> None:
     _, _, h0 = fetch(ng.port, "/avs/m?v=ae", headers=ae)
     assert "x-cache" not in h0, "first should miss"
     _, _, h1 = fetch(ng.port, "/avs/m?v=ae", headers=ae)
-    assert h1.get("x-cache") == "HIT", f"second should HIT, got {h1.get('x-cache')}"
+    # TEST-MICROTTL-ORACLE (2026-08-23): HIT or a raced STALE both prove the
+    # variant was stored, without racing the 2s fresh window over two live
+    # HTTP round trips under a slow sanitizer build; see test_honor_cache_control
+    # (policy.py) for the full rationale. The stale-marker-reachability property
+    # this test exists to prove is the deterministic post-sleep check below.
+    assert h1.get("x-cache") in ("HIT", "STALE"), \
+        f"second should be served from cache, got {h1.get('x-cache')}"
     time.sleep(2.5)                          # past the 2s fresh TTL, inside stale
     _, _, h2 = fetch(ng.port, "/avs/m?v=ae", headers=ae)
     assert "x-cache" in h2, \

@@ -2543,7 +2543,13 @@ http {{
         location /bstalec/ {{
             cache_turbo             bstalecz;
             cache_turbo_key         $uri;
-            cache_turbo_valid       1s;
+            # TEST-MICROTTL-ORACLE (2026-08-23): was 1s. test_bypass_stale_scoped_
+            # not_blanket's non-matching-URI check does an immediate re-read with
+            # zero explicit wait; keep_stale off below means there is no
+            # intermediate STALE state to fall back to (same shape as must-
+            # revalidate), so the live round trip needs real margin instead. 4s
+            # is unused by any other test against this dedicated location.
+            cache_turbo_valid       4s;
             cache_turbo_stale_mult  1;
             cache_turbo_keep_stale  off;
             cache_turbo_bypass_stale_uri  /bstalec/api;
