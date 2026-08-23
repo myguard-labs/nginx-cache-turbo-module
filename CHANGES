@@ -1,4 +1,4 @@
-Changes with the nginx-cache-turbo-module 1.2.0                 23 Aug 2026
+Changes with the nginx-cache-turbo-module (unreleased)
 
     *) Performance: the L1 shared-memory rbtree ordered nodes on the caller's
        32-bit crc32 short hash instead of the full 64-bit key, so two keys
