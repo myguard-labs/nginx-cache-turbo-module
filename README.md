@@ -1605,6 +1605,49 @@ The zone minimum is enforced at `8 × ngx_pagesize` (~32 KB on most systems); yo
 
 See also: [Auto-Vary marker/variant scheme](#auto-vary-read-the-response-vary) (two-level keying on a single zone).
 
+## Request pool sizing for module performance
+
+The module works within nginx's per-request memory pool, allocated via
+`request_pool_size` (nginx default: **4 KB**). On a fresh cache HIT, the
+module consumes approximately:
+
+- **~590 bytes** for response bodies up to 32 KB (header reconstruction + one
+  `ngx_buf_t`).
+- **~96 additional bytes** per extra 32 KB output chunk for larger bodies (one
+  `ngx_buf_t` + one `ngx_chain_t` per chunk).
+
+**But here's the key:** nginx's default `request_pool_size 4096` already chains
+a **second pool block** from core per-request overhead alone — verified with a
+bare `Host + Connection: close` header set, which measured 5094 bytes across 2
+blocks on a fresh request. The module does not cause that first spill; it
+inherits it.
+
+The module forces a **third block only for bodies exceeding 65,536 bytes**,
+during buffer construction. For typical small/medium cached responses (under 32
+KB), you may avoid the third block entirely by raising `request_pool_size` to
+8 KB:
+
+```nginx
+server {
+    # default: request_pool_size 4k;
+    request_pool_size 8k;         # eliminates malloc for typical responses
+
+    location / {
+        cache_turbo       ct;
+        cache_turbo_valid 10s;
+        proxy_pass http://backend;
+    }
+}
+```
+
+That single tuning saves **one `malloc` per request, cached or not**, which is
+meaningful at scale. The tradeoff is baseline request-memory growth (nginx
+itself grows 4 KB → 8 KB); measure whether it pays off on your header set and
+body distribution. Figures above are measured on nginx 1.31.3 at the
+compiled-in default, and are host- and header-set dependent — yours may differ.
+For details and full allocation breakdown, see
+[Benchmarking](BENCHMARK.md#pool-consumption-per-request).
+
 ## Scan-resistant eviction: `cache_turbo_scan_resistant`
 
 **On by default since v-P3-1** (`protected_pct=80`). With the flat LRU a

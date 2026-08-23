@@ -366,9 +366,75 @@ here since it is not a published path.
 
 ---
 
+## Pool consumption per-request
+
+nginx allocates a per-request memory pool at startup via the `request_pool_size`
+directive (default: 4 KB). The module works within this pool and consumes a
+predictable amount on a cache HIT, allowing operators to size `request_pool_size`
+to avoid per-request malloc churn.
+
+### Measurement
+
+Measured on nginx 1.31.3 debug build, single worker, L1-only zone, cold MISS
+primed then measured on the following HIT:
+
+| Body size | Module footprint | Total request consumption | Details |
+| --- | --- | --- | --- |
+| **≤32 KB** | ~590 bytes | varies by header set | header rebuild + one buf |
+| **32–65 KB** | ~686 bytes | varies by header set | ~96 B per 32 KB |
+| **70 KB** | ~810 bytes | varies by header set | third block allocated |
+
+**What this does NOT measure:**
+
+- The module's consumption is only the *additive* cost; the baseline request
+  pool is already partially filled by nginx core overhead (Host header
+  validation, connection bookkeeping, etc.).
+- Actual pool allocation depends on the slab allocator's rounding — the figures
+  above are the module's own footprint, not the malloc'd block size.
+- Header set size affects total consumption but not the *module's* additive
+  cost (690 bytes is module-only; a larger header set grows the core part, not
+  the cache-turbo part).
+
+### Context
+
+At nginx's default `request_pool_size 4096`, a fresh request already chains a
+second pool block from core overhead — verified with a minimal `Host +
+Connection: close` header set, which measured 5094 bytes across 2 blocks. The
+module **does not cause the first pool block spill**; that is nginx's own
+per-request infrastructure.
+
+The module forces a **third block only for bodies exceeding 65,536 bytes**,
+during the module's own multi-buffer chain construction
+(`NGX_HTTP_CACHE_TURBO_SERVE_CHUNK = 32 KB`). For bodies below 32 KB (the
+common case), the module stays within ~590 bytes and can avoid the third
+allocation by raising `request_pool_size` to 8 KB:
+
+```nginx
+server {
+    request_pool_size 8k;   # saves one malloc per request
+
+    location / {
+        cache_turbo       ct;
+        cache_turbo_valid 10s;
+        proxy_pass http://backend;
+    }
+}
+```
+
+**Cost-benefit:** The tradeoff is a baseline 4 KB → 8 KB growth in every
+request's pool (even non-cached requests and misses). Measure whether this pays
+off on your traffic mix (header set, typical body sizes, requests-per-second)
+before deploying. The saving is one allocation per request, which is
+measurable in high-throughput scenarios but depends on your allocator, OS, and
+concurrent request count.
+
+---
+
 ## See also
 
 - [README.md](README.md) — what the module is, every directive, configuration.
+- [Request pool sizing](README.md#request-pool-sizing-for-module-performance) —
+  tuning `request_pool_size` for cache-turbo hits.
 - [`tools/bench.sh`](ci/tools/bench.sh) — pure-hit throughput/latency harness.
 - [`tools/scanbench.sh`](ci/tools/scanbench.sh) — scan-resistance under a
   one-shot crawl against a hot set.
