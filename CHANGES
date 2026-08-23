@@ -1,4 +1,40 @@
-Changes with the nginx-cache-turbo-module (unreleased)
+Changes with the nginx-cache-turbo-module 1.2.0                 23 Aug 2026
+
+    *) Performance: the L1 shared-memory rbtree ordered nodes on the caller's
+       32-bit crc32 short hash instead of the full 64-bit key, so two keys
+       colliding in the low 32 bits fell back to the memcmp identity tiebreak
+       on every descent instead of separating on the primary compare. The
+       rbtree key is now derived from a fixed-byte-order load of the first 8
+       bytes of the existing 32-byte key hash; the memcmp tiebreak is
+       unchanged, it is just reached less often. Measured with
+       ci/tools/allocbench.sh at 2M keys: +6.4% rps, p99 482us -> 440us.
+
+    *) Performance: access_l1() now skips vary_apply()'s lock-held auto-Vary
+       marker lookup whenever a zone-wide marker-presence counter reads zero,
+       instead of probing L1 on every hit regardless of whether the zone holds
+       any markers. vary_apply() self-time went from 1.12-1.35% of profile
+       samples to absent from the profile; that removed probe is the win.
+       End-to-end throughput on the VARY=1 shape moved -0.55%, within
+       run-to-run noise.
+
+    *) Performance: blobref.refs, the zero-copy HIT reference count, is now
+       ngx_atomic_t, and blob_release() decrements it without holding the zone
+       mutex, taking the mutex only on the terminal 1->0 transition that frees
+       the slab. Previously every completed HIT re-took the mutex purely to
+       decrement a refcount, and at WORKERS=16 that made ngx_shmtx_lock the
+       hottest symbol in the L1 hit-path profile. Measured with
+       ci/tools/perf-profile.sh: ngx_shmtx self-time WORKERS=8 10.29% -> 4.50%,
+       WORKERS=16 50.53% -> 10.95%; ngx_shmtx_lock's own share at WORKERS=16
+       18.23% -> 4.07%.
+
+    *) Performance: each worker process now fetches its SHA-256 EVP_MD once,
+       via EVP_MD_fetch(), and reuses it for every cache-key digest, instead of
+       handing OpenSSL 3.x's legacy EVP_sha256() handle to EVP_DigestInit_ex(),
+       which implicitly re-fetched the provider -- a property-string parse plus
+       hashtable lookup -- on every call. Falls back to EVP_sha256() on pre-3.0
+       OpenSSL, LibreSSL, or a failed fetch. Measured with
+       ci/tools/perf-profile.sh: EVP_DigestInit_ex self-time 5.55% -> 0.03%,
+       and ossl_fnv1a_hash no longer appears in the profile.
 
     *) Security: cache_turbo_lock_ttl accepted an arbitrary, unbounded time
        value. The single-flight refresh path multiplies it by the live load
@@ -191,6 +227,18 @@ Changes with the nginx-cache-turbo-module (unreleased)
        never exceed the number of resident nodes and is freed with them.
        NGX_OK is a launch acknowledgement, not a server acknowledgement -- a
        write the server rejects after the wire is not covered here.
+
+    *) Performance: ngx_http_cache_turbo_serve() now emits a large cached body
+       as a chain of 32 KB ngx_buf_t's that all point into the same refcounted
+       shm blob, instead of one buf spanning the whole body; nothing is copied,
+       so the serve stays zero-copy, and the existing blob reference is
+       acquired and released exactly once per response regardless of chunk
+       count. The change bounds how long a single response pins the slab and
+       lets a slow reader's writer retire whole bufs instead of holding one
+       indivisible allocation. Measured with ci/tools/bench.sh (SIZES=large, 5
+       passes): p99 is unchanged -- single-buf and chained runs fall within
+       each other's run-to-run spread -- so no latency win is claimed; the
+       change is kept for the bounded pinning, not for a measured gain.
 
     *) Feature: W-TinyLFU admission control, opt-in per zone via
        cache_turbo_zone name=NAME SIZE admission=on. When a NEW key would be
