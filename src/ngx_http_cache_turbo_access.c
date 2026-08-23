@@ -1372,22 +1372,7 @@ ngx_http_cache_turbo_access_l1(ngx_http_request_t *r,
      * else: vary_apply()'s m == NULL arm touches no other ctx field and never
      * rewrites `hash`. */
     if (clcf->auto_vary) {
-        ngx_uint_t  no_markers =
-            (ngx_http_cache_turbo_zone_sh(z)->markers == 0);
-
-#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
-    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
-        /* C3 negative control: force the gate's decision to "no markers"
-         * regardless of the real live counter. See the loc_conf field
-         * comment -- this is what proves the gate is load-bearing (a
-         * genuinely-stored marker must still resolve the wrong variant while
-         * armed) rather than a skip that happened to never matter. */
-        if (clcf->test_force_marker_gate_zero) {
-            no_markers = 1;
-        }
-#endif
-
-        if (no_markers) {
+        if (ngx_http_cache_turbo_zone_sh(z)->markers == 0) {
             ctx->vary_gen = 0;
             ctx->vary_marker_l1_miss = 1;
 

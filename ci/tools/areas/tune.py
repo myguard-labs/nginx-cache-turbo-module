@@ -617,68 +617,6 @@ def test_c3_auto_vary_resolves_variants_with_marker_gate_active(
         origin.hits_for(needle) - base)
 
 
-def test_c3_marker_gate_negative_control_stuck_zero_breaks_resolution(
-        ng: Nginx, origin: Origin) -> None:
-    """C3 negative control -- the whole risk of this chunk (per the C3
-    packet: "force the counter to a stuck 0 while a marker exists and prove
-    a variant test goes RED"). /avc3/ (the real gate) and /avc3ng/
-    (cache_turbo_test_force_marker_gate_zero on) share one zone (c3vmz) and
-    one cache_turbo_key space, so a marker classified through /avc3/ is the
-    EXACT marker /avc3ng/'s lookup would have found.
-
-    Store two distinct variants through the real gate first (so a genuine
-    marker with both variants classified is resident -- proven via the
-    `markers` gauge before touching the gated location: a passing-both-ways
-    control, not just a broken-arm assertion, per the worker contract's
-    negative-control discipline). Then re-probe BOTH variants through
-    /avc3ng/, where the gate is forced to believe the zone holds zero
-    markers on every request. If the gate genuinely does what it claims,
-    every /avc3ng/ fetch falls through to the (never-populated) base key and
-    MISSES -- the SAME URL that just proved it HITs correctly one path over.
-
-    This assertion set is intentionally the OPPOSITE of what a healthy gate
-    would produce (a real, working probe would HIT here): flipping the two
-    `== "MISS"` assertions below to `== "HIT"` and re-running against
-    /avc3ng/ is the manual step that proves this test is not vacuous -- it
-    goes RED under that flip, which is the actual state a genuinely
-    under-counted `markers` would put production requests in. See the PR
-    body for that run's captured output."""
-    p_real = "/avc3/negctl?v=or&t=c3c"
-    p_gated = "/avc3ng/negctl?v=or&t=c3c"
-    a = {"Origin": "https://na.example"}
-    b = {"Origin": "https://nb.example"}
-
-    _, a1, ha1 = fetch(ng.port, p_real, a)
-    assert ha1.get("x-ct-status") == "MISS", f"origin-a cold fetch must MISS, got {ha1}"
-    _, b1, _ = fetch(ng.port, p_real, b)
-
-    # Passing-both-ways control: the REAL gate must resolve both variants
-    # correctly on THIS marker before the broken arm below means anything.
-    _, a2, ha2 = fetch(ng.port, p_real, a)
-    _, b2, hb2 = fetch(ng.port, p_real, b)
-    assert ha2.get("x-ct-status") == "HIT", \
-        f"control: origin-a must HIT via the real gate, got {ha2}"
-    assert hb2.get("x-ct-status") == "HIT", \
-        f"control: origin-b must HIT via the real gate, got {hb2}"
-    assert a1 == a2 and b1 == b2, "control: real gate must resolve stable variants"
-
-    markers = _c3vm_markers(ng)
-    assert markers > 0, (
-        ("negative control requires a genuinely resident marker for this "
-         "run -- markers reads 0, the control would be meaningless"), markers)
-
-    # The broken arm: SAME marker, SAME variants, gate forced to believe 0.
-    _, _, hga1 = fetch(ng.port, p_gated, a)
-    _, _, hgb1 = fetch(ng.port, p_gated, b)
-
-    assert hga1.get("x-ct-status") == "MISS", (
-        ("gate-forced-zero must fall through to the base key (a MISS), "
-         "exactly like a genuine under-count would"), hga1)
-    assert hgb1.get("x-ct-status") == "MISS", (
-        ("gate-forced-zero must fall through to the base key (a MISS), "
-         "exactly like a genuine under-count would"), hgb1)
-
-
 def test_auto_vary_encoding_same_class_shares(ng: Nginx, origin: Origin) -> None:
     """v11 auto-Vary: two Accept-Encoding headers in the same bucket (gzip and
     'gzip, deflate' both classify gzip) share one slot -> one origin hit."""

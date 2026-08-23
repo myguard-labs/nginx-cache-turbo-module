@@ -19,12 +19,18 @@
 #           has populated the zone. The zero-then-nonzero pair is the point:
 #           a hardcoded constant, or a field wired to the wrong shctx member,
 #           fails one leg or the other.
-#   TEST 2: the Prometheus rendering. used_bytes is now the LAST metric
-#           emitted, and admin_stats_prometheus() carries a hand-maintained
-#           length budget that has truncated its final metric twice before
-#           (see the len= comment in admin.c). Asserting the final line
-#           renders in FULL -- name, label and value, terminated by a newline
-#           -- is what catches a stale budget.
+#   TEST 2: the Prometheus rendering. admin_stats_prometheus() carries a
+#           hand-maintained length budget that has truncated its final
+#           metric twice before (see the len= comment in admin.c).
+#           Asserting used_bytes's own HELP/TYPE/line block renders in FULL
+#           -- name, label and value, terminated by a newline -- catches a
+#           stale budget that truncates AT OR BEFORE this block. used_bytes
+#           is no longer necessarily the last metric emitted (C3 appended
+#           `markers` after it) -- ci/tools/lint-admin-buffer-budget.py is
+#           the budget's real, position-independent guard; re-measures the
+#           format string's exact byte length rather than sampling one
+#           field's line, so it catches a stale budget regardless of which
+#           metric ends up last.
 use lib 'ci/t/lib';
 use CacheTurbo qw( ct_http_config ct_config ct_origin_port );
 use Test::Nginx::Socket 'no_plan';
@@ -47,9 +53,9 @@ EOC
 --- request eval
 ["GET /_cache_ubjson", "GET /ub/json", "GET /ub/json", "GET /_cache_ubjson"]
 --- response_body_like eval
-[qr/"used_bytes":0\}/,
+[qr/"used_bytes":0[,}]/,
  qr/./, qr/./,
- qr/"used_bytes":[1-9]\d*\}/]
+ qr/"used_bytes":[1-9]\d*[,}]/]
 --- error_code eval
 [200, 200, 200, 200]
 

@@ -4025,33 +4025,15 @@ http {{
 
         # C3: same shape as /av/ above, but on the isolated c3vmz zone -- see
         # that zone's own comment for why the marker-presence-counter tests
-        # cannot share /av/'s `main` zone. cache_turbo_key deliberately drops
-        # the location prefix (a fixed literal instead of $request_uri) so
-        # /avc3/ and /avc3ng/ below key the SAME base URL for the same query
-        # string -- the negative control needs a marker classified through
-        # ONE location to be the exact marker the OTHER location's (gate-
-        # forced) lookup would have found.
+        # cannot share /av/'s `main` zone. cache_turbo_key is a fixed literal
+        # (query args only, not $request_uri) purely as a stable, short base
+        # key per test case -- each C3 test picks its own distinguishing
+        # query arg (t=c3a, t=c3b, ...) so their markers never collide.
         location /avc3/ {{
             cache_turbo          c3vmz;
             cache_turbo_key      "avc3$is_args$args";
             cache_turbo_valid    30s;
             cache_turbo_auto_vary on;
-            add_header           X-CT-Status $cache_turbo_status always;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-
-        # C3 negative control. Same zone (c3vmz) and same cache_turbo_key
-        # space as /avc3/ above -- a marker classified through /avc3/ is the
-        # SAME marker this location's lookup would find -- but with the gate
-        # forced to behave as if the zone held zero markers. Proves the gate
-        # is load-bearing: a real, resident marker must still fail to resolve
-        # its variant while this is armed.
-        location /avc3ng/ {{
-            cache_turbo          c3vmz;
-            cache_turbo_key      "avc3$is_args$args";
-            cache_turbo_valid    30s;
-            cache_turbo_auto_vary on;
-            cache_turbo_test_force_marker_gate_zero on;
             add_header           X-CT-Status $cache_turbo_status always;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}

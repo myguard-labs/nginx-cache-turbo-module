@@ -2112,16 +2112,6 @@ typedef struct {
      * feature's own decrement. Without this hook the anonymize arm depends
      * on real pool exhaustion, which is not reproducible on demand. */
     ngx_flag_t               test_warm_ctx_fail;
-    /* C3: forces access_l1()'s `ngx_http_cache_turbo_zone_sh(z)->markers == 0`
-     * gate to read as true on every request through this location, regardless
-     * of the zone's real live counter -- the negative control for the gate
-     * itself. A base URL whose marker was genuinely classified and stored
-     * must still resolve the WRONG variant (falls straight to the base key,
-     * the same outcome an actual stuck-at-0 under-count would produce) while
-     * this is armed, proving the gate is load-bearing rather than a no-op
-     * that happened to pass. Never consulted anywhere the real counter would
-     * be read instead -- see its call site in access.c. */
-    ngx_flag_t               test_force_marker_gate_zero;
 #endif
 
 

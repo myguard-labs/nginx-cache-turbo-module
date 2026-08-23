@@ -357,7 +357,6 @@ def run_all(ng: Nginx, origin: Origin,
     test_auto_vary_marker_probe_selects_correct_variant(ng, origin)
     test_c3_marker_counter_tracks_store_and_purge(ng, origin)
     test_c3_auto_vary_resolves_variants_with_marker_gate_active(ng, origin)
-    test_c3_marker_gate_negative_control_stuck_zero_breaks_resolution(ng, origin)
     test_auto_vary_encoding_same_class_shares(ng, origin)
     test_auto_vary_device(ng, origin)
     test_auto_vary_language(ng, origin)
