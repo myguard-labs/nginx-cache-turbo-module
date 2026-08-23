@@ -2453,7 +2453,17 @@ ngx_http_cache_turbo_restore_response_headers(ngx_http_request_t *r,
             continue;
         }
 
+        /* PERF: each of the three name tests below is gated on the length AND
+         * on a case-folded first byte before the ngx_strncasecmp call, so an
+         * ordinary stored header (Cache-Control, Server, Vary, ...) is rejected
+         * by two integer compares instead of entering a string comparison. This
+         * loop runs once per stored header on EVERY hit, and the header count
+         * is bounded only by the blob size. The folding mask 0x20 is applied to
+         * the byte, not to a range test, so the check stays exactly as
+         * case-insensitive as the strncasecmp it guards -- a header stored as
+         * "content-type" or "cOntent-type" still matches. */
         if (nl == sizeof("Content-Type") - 1
+            && (nm[0] | 0x20) == 'c'
             && ngx_strncasecmp(nm, (u_char *) "Content-Type", nl) == 0)
         {
             r->headers_out.content_type.len = vl;
@@ -2465,12 +2475,14 @@ ngx_http_cache_turbo_restore_response_headers(ngx_http_request_t *r,
         /* v11: remember the stored validators so we can answer a conditional
          * request with 304 below. They are still emitted as normal headers. */
         if (nl == sizeof("ETag") - 1
+            && (nm[0] | 0x20) == 'e'
             && ngx_strncasecmp(nm, (u_char *) "ETag", nl) == 0)
         {
             *etagp = vv;
             *etag_lenp = vl;
 
         } else if (nl == sizeof("Last-Modified") - 1
+                   && (nm[0] | 0x20) == 'l'
                    && ngx_strncasecmp(nm, (u_char *) "Last-Modified", nl) == 0)
         {
             *lastmodp = vv;

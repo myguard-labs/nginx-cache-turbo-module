@@ -244,6 +244,18 @@ ngx_http_cache_turbo_ae_class(ngx_http_request_t *r)
         if (clen > 0 && ngx_http_cache_turbo_ae_q_ok(semi, end)) {
             ngx_http_cache_turbo_ae_class_match_coding(tok, clen, &zstd, &br,
                 &gzip);
+
+            /* zstd is the top of the dispatch order below, so once it is set
+             * no remaining token can change the answer -- stop parsing. Only
+             * zstd allows this: seeing `br` first does NOT settle it, because
+             * a later `zstd` would still outrank it. Accept-Encoding is
+             * client-supplied and unbounded in token count, so this bounds the
+             * common browser case (`gzip, deflate, br, zstd` -- zstd last, no
+             * saving) as well as a deliberately long list that ends in, or
+             * merely contains, zstd. */
+            if (zstd) {
+                break;
+            }
         }
 
         p = (end < last) ? end + 1 : end;

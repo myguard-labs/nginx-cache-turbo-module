@@ -2231,10 +2231,11 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
     ngx_uint_t                        last = 0;
 
     ctx = ngx_http_get_module_ctx(r, ngx_http_cache_turbo_module);
-    clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
 
 #if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
     && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+    clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
+
     if (ngx_http_cache_turbo_body_filter_midbody_rescue(r, clcf, ctx)
         == NGX_ERROR)
     {
@@ -2256,6 +2257,18 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
     if (ctx == NULL || !ctx->captured || ctx->served) {
         return ngx_http_cache_turbo_forward_body(r, in);
     }
+
+    /* Fetched HERE, below the bail above -- which is the common path for every
+     * response this filter sees but does not capture (no ctx, not captured, or
+     * already served from cache) -- rather than at the top of the function. The
+     * header filter's own bail already had this shape; the body filter did not.
+     * Neither the SIE-emit arm nor forward_body() takes clcf, so nothing above
+     * needs it. Under TEST_FAULTS it is already assigned at the top for the
+     * mid-body rescue hook, so this re-fetch is skipped in that build. */
+#if !defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    || !NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+    clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
+#endif
 
 #if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
     && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
