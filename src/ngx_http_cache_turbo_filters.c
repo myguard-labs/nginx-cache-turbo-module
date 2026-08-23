@@ -459,6 +459,161 @@ ngx_http_cache_turbo_capture_encoded_ok(ngx_http_request_t *r,
 }
 
 
+/* Shared prefix of every capture-adjacent gate: cache_turbo enabled, either
+ * the main request or an explicit warm subrequest, never a HEAD (its empty
+ * body must not overwrite the GET entry), and the request itself did not opt
+ * out of storage. req_no_store sits next to these three rather than at its
+ * original position later in the storable chain -- all four legs here are
+ * side-effect-free field reads with no ordering dependency between them, so
+ * moving it does not change which requests pass. */
+static ngx_uint_t
+ngx_http_cache_turbo_capture_gate_common(ngx_http_request_t *r,
+    ngx_http_cache_turbo_ctx_t *ctx, ngx_http_cache_turbo_loc_conf_t *clcf)
+{
+    return clcf->enable && (r == r->main || ctx->warm)
+           && !(r->method & NGX_HTTP_HEAD) && !ctx->req_no_store;
+}
+
+
+/* capture_gate_common() plus the legs that decide whether THIS status is
+ * storable at all: no Vary-vetoed axis, not below min_uses, not
+ * auto-skipped, and status_ttl() names a non-negative TTL for
+ * r->headers_out.status. Leg order after the common prefix is unchanged
+ * from the original chain-1/chain-2 order (vary_nocache, min_uses_skip,
+ * auto_skip, status_ttl). */
+static ngx_uint_t
+ngx_http_cache_turbo_capture_gate_storable(ngx_http_request_t *r,
+    ngx_http_cache_turbo_ctx_t *ctx, ngx_http_cache_turbo_loc_conf_t *clcf)
+{
+    return ngx_http_cache_turbo_capture_gate_common(r, ctx, clcf)
+           && !ctx->vary_nocache && !ctx->min_uses_skip && !ctx->auto_skip
+           && ngx_http_cache_turbo_status_ttl(clcf, r->headers_out.status) >= 0;
+}
+
+
+/* The last two legs of the chain-1 capture gate, past capture_gate_storable()
+ * and response_cacheable(): the response is either not encoded or an
+ * encoded-origin capture was allowed for it (P3-2), and cache_turbo_no_store
+ * (if configured) does not veto this specific response. Same leg order and
+ * short-circuit as the original inline `&& (A || B) && (C || D)` tail --
+ * this only names it, it does not reorder or add a leg. */
+static ngx_uint_t
+ngx_http_cache_turbo_capture_gate_response_ok(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_uint_t encoded_ok)
+{
+    return (!ngx_http_cache_turbo_response_encoded(r) || encoded_ok)
+           && (clcf->no_store == NULL
+               || ngx_http_test_predicates(r, clcf->no_store) == NGX_OK);
+}
+
+
+/* Body of the capture branch: flag an encoded-origin capture, resolve the
+ * RFC 9111 SS3.5 reuse authorisation, build the key for a warm subrequest,
+ * flag the capture, and emit the Surrogate-Key header. Returns NGX_ERROR
+ * when a warm subrequest's build_key() fails -- the caller must `return;`
+ * from ngx_http_cache_turbo_header_filter_capture() in that case, exactly
+ * as the inline body used to, skipping the cold-winner cleanup below it. */
+static ngx_int_t
+ngx_http_cache_turbo_header_filter_do_capture(ngx_http_request_t *r,
+    ngx_http_cache_turbo_ctx_t *ctx, ngx_http_cache_turbo_loc_conf_t *clcf,
+    ngx_uint_t encoded_ok, ngx_uint_t encoded_class)
+{
+    if (encoded_ok) {
+        ctx->origin_encoded_capture = 1;
+        ctx->origin_encoded_class = encoded_class;
+    }
+
+    /* P3-4: resolve the RFC 9111 SS3.5 reuse authorisation NOW, while the
+     * response headers still exist. The body filter stamps it onto the
+     * blob; it cannot re-derive it after headers are sent. Recorded on
+     * every capture regardless of clcf->serve_authorized, so enabling the
+     * directive later does not require flushing entries stored before. */
+    ctx->auth_shareable =
+        ngx_http_cache_turbo_response_auth_shareable(r) ? 1 : 0;
+
+    /* A warm subrequest is deliberately excluded from lookup, so its key
+     * was never built. Build it here from the subrequest URI before flagging
+     * capture, so the body filter stores under the same key a later real
+     * request will look up. */
+    if (ctx->warm
+        && ngx_http_cache_turbo_build_key(r, clcf, ctx) != NGX_OK)
+    {
+        return NGX_ERROR;
+    }
+    ctx->captured = 1;
+
+    /* cache_turbo_surrogate_key: this response is a MISS being stored, so
+     * emit the tag list downstream as a Surrogate-Key header for a fronting
+     * CDN NOW, while headers are still mutable (the body-filter store runs
+     * after headers are sent). Capture-path only -- a HIT returns earlier via
+     * ctx->served and never re-emits. */
+    if (clcf->surrogate_key) {
+        ngx_http_cache_turbo_emit_surrogate_key(r, clcf);
+    }
+
+    return NGX_OK;
+}
+
+
+/* Body of the 304-freshening branch (P5-4): derive fresh_ttl from
+ * Cache-Control (if honoured) or fall back to the static clcf->valid, clamp
+ * it, build the key for a warm subrequest, and extend the resident entry's
+ * life. Returns NGX_ERROR when a warm subrequest's build_key() fails -- same
+ * contract as ngx_http_cache_turbo_header_filter_do_capture() above: the
+ * caller must `return;` immediately, skipping the cold-winner cleanup. */
+static ngx_int_t
+ngx_http_cache_turbo_header_filter_freshen_304(ngx_http_request_t *r,
+    ngx_http_cache_turbo_ctx_t *ctx, ngx_http_cache_turbo_loc_conf_t *clcf)
+{
+    time_t  fresh_ttl = clcf->valid;
+
+    if (clcf->honor_cc && !clcf->ignore_cc) {
+        time_t  up = ngx_http_cache_turbo_upstream_ttl(r);
+        if (up >= 0) {
+            fresh_ttl = up;
+        }
+    }
+
+    if (fresh_ttl > NGX_HTTP_CACHE_TURBO_TTL_MAX) {
+        fresh_ttl = NGX_HTTP_CACHE_TURBO_TTL_MAX;
+    }
+
+    if (ctx->warm && ngx_http_cache_turbo_build_key(r, clcf, ctx) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    {
+        ngx_http_cache_turbo_zone_t  *z = clcf->shm_zone->data;
+        uint32_t                      hash =
+            ngx_crc32_short(ctx->key_hash, 32);
+        time_t                        stale_window =
+            ngx_http_cache_turbo_stale_ttl(fresh_ttl, clcf->stale_mult);
+        ngx_int_t                     rc;
+
+        rc = clcf->l1->freshen(z, ctx->key_hash, hash, fresh_ttl,
+                                stale_window);
+
+        if (rc == NGX_OK) {
+            ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                           "cache_turbo: 304 freshened \"%V\" "
+                           "fresh_ttl=%T", &r->uri, fresh_ttl);
+            (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->refreshes, 1);
+        } else {
+            /* No resident entry to freshen (evicted/never stored/not
+             * yet this key) -- nothing to extend, and nothing to store
+             * either (a 304 still has no body). The revalidation was
+             * not wasted from the origin's point of view, but this zone
+             * has no record of it. */
+            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                           "cache_turbo: 304 with nothing to freshen "
+                           "\"%V\"", &r->uri);
+        }
+    }
+
+    return NGX_OK;
+}
+
+
 static void
 ngx_http_cache_turbo_header_filter_capture(ngx_http_request_t *r,
     ngx_http_cache_turbo_ctx_t *ctx, ngx_http_cache_turbo_loc_conf_t *clcf)
@@ -527,66 +682,27 @@ ngx_http_cache_turbo_header_filter_capture(ngx_http_request_t *r,
      * cache_turbo_key_encoded_origin is off (the directive's default), so
      * this collapses back to the original `!response_encoded(r)` test in
      * every existing deployment; nothing changes unless an operator opts
-     * in. */
-    if (clcf->enable && (r == r->main || ctx->warm)
-        && !(r->method & NGX_HTTP_HEAD)
-        && !ctx->vary_nocache
-        && !ctx->min_uses_skip
-        && !ctx->auto_skip
-        && !ctx->req_no_store
-        && ngx_http_cache_turbo_status_ttl(clcf, r->headers_out.status) >= 0
+     * in.
+     *
+     * MAINT-SPLIT: the gate itself is capture_gate_storable() (below), the
+     * shared prefix with the refusal-attribution `else if`. The trailing
+     * encoded/no_store pair is capture_gate_response_ok(). */
+    if (ngx_http_cache_turbo_capture_gate_storable(r, ctx, clcf)
         && ngx_http_cache_turbo_response_cacheable(r, &cacheable_reason)
         && ngx_http_cache_turbo_require_hdr_ok(r, clcf)
-        && (!ngx_http_cache_turbo_response_encoded(r) || encoded_ok)
-        && (clcf->no_store == NULL
-            || ngx_http_test_predicates(r, clcf->no_store) == NGX_OK))
+        && ngx_http_cache_turbo_capture_gate_response_ok(r, clcf, encoded_ok))
     {
-        if (encoded_ok) {
-            ctx->origin_encoded_capture = 1;
-            ctx->origin_encoded_class = encoded_class;
-        }
-
-        /* P3-4: resolve the RFC 9111 SS3.5 reuse authorisation NOW, while the
-         * response headers still exist. The body filter stamps it onto the
-         * blob; it cannot re-derive it after headers are sent. Recorded on
-         * every capture regardless of clcf->serve_authorized, so enabling the
-         * directive later does not require flushing entries stored before. */
-        ctx->auth_shareable =
-            ngx_http_cache_turbo_response_auth_shareable(r) ? 1 : 0;
-
-        /* A warm subrequest is deliberately excluded from lookup, so its key
-         * was never built. Build it here from the subrequest URI before flagging
-         * capture, so the body filter stores under the same key a later real
-         * request will look up. */
-        if (ctx->warm
-            && ngx_http_cache_turbo_build_key(r, clcf, ctx) != NGX_OK)
+        if (ngx_http_cache_turbo_header_filter_do_capture(r, ctx, clcf,
+                encoded_ok, encoded_class) != NGX_OK)
         {
             return;
         }
-        ctx->captured = 1;
-
-        /* cache_turbo_surrogate_key: this response is a MISS being stored, so
-         * emit the tag list downstream as a Surrogate-Key header for a fronting
-         * CDN NOW, while headers are still mutable (the body-filter store runs
-         * after headers are sent). Capture-path only -- a HIT returns earlier via
-         * ctx->served and never re-emits. */
-        if (clcf->surrogate_key) {
-            ngx_http_cache_turbo_emit_surrogate_key(r, clcf);
-        }
-    } else if (clcf->enable && (r == r->main || ctx->warm)
-               && !(r->method & NGX_HTTP_HEAD) && !ctx->vary_nocache
-               && !ctx->min_uses_skip && !ctx->auto_skip
-               && !ctx->req_no_store
-               && ngx_http_cache_turbo_status_ttl(clcf,
-                      r->headers_out.status) >= 0)
-    {
+    } else if (ngx_http_cache_turbo_capture_gate_storable(r, ctx, clcf)) {
         /* Every shared leg up to response_cacheable() passed and the
          * response still was not captured -- attribute the refusal. */
         ngx_http_cache_turbo_capture_count_refusal(r, clcf, cacheable_reason);
-    } else if (clcf->enable && clcf->shm_zone != NULL
-               && (r == r->main || ctx->warm)
-               && !(r->method & NGX_HTTP_HEAD)
-               && !ctx->req_no_store
+    } else if (ngx_http_cache_turbo_capture_gate_common(r, ctx, clcf)
+               && clcf->shm_zone != NULL
                && r->headers_out.status == NGX_HTTP_NOT_MODIFIED)
     {
         /* P5-4: 304 freshening. This is an ORIGIN-sent 304 answering a
@@ -606,49 +722,10 @@ ngx_http_cache_turbo_header_filter_capture(ngx_http_request_t *r,
          * extends the life of one already resident from an earlier 200.
          * req_no_store is still honoured: a request that opted this
          * response out of caching gets no side effect from it either. */
-        time_t  fresh_ttl = clcf->valid;
-
-        if (clcf->honor_cc && !clcf->ignore_cc) {
-            time_t  up = ngx_http_cache_turbo_upstream_ttl(r);
-            if (up >= 0) {
-                fresh_ttl = up;
-            }
-        }
-
-        if (fresh_ttl > NGX_HTTP_CACHE_TURBO_TTL_MAX) {
-            fresh_ttl = NGX_HTTP_CACHE_TURBO_TTL_MAX;
-        }
-
-        if (ctx->warm && ngx_http_cache_turbo_build_key(r, clcf, ctx) != NGX_OK) {
-            return;
-        }
-
+        if (ngx_http_cache_turbo_header_filter_freshen_304(r, ctx, clcf)
+            != NGX_OK)
         {
-            ngx_http_cache_turbo_zone_t  *z = clcf->shm_zone->data;
-            uint32_t                      hash =
-                ngx_crc32_short(ctx->key_hash, 32);
-            time_t                        stale_window =
-                ngx_http_cache_turbo_stale_ttl(fresh_ttl, clcf->stale_mult);
-            ngx_int_t                     rc;
-
-            rc = clcf->l1->freshen(z, ctx->key_hash, hash, fresh_ttl,
-                                    stale_window);
-
-            if (rc == NGX_OK) {
-                ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                               "cache_turbo: 304 freshened \"%V\" "
-                               "fresh_ttl=%T", &r->uri, fresh_ttl);
-                (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->refreshes, 1);
-            } else {
-                /* No resident entry to freshen (evicted/never stored/not
-                 * yet this key) -- nothing to extend, and nothing to store
-                 * either (a 304 still has no body). The revalidation was
-                 * not wasted from the origin's point of view, but this zone
-                 * has no record of it. */
-                ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                               "cache_turbo: 304 with nothing to freshen "
-                               "\"%V\"", &r->uri);
-            }
+            return;
         }
     }
 
