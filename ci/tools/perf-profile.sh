@@ -57,6 +57,14 @@
 #            any variant_hash/Vary-related optimisation; do not compare a
 #            VARY=1 profile against a pre-VARY baseline run with a different
 #            harness version.
+#   COPY_THRESHOLD  cache_turbo_copy_threshold value for the profiled L1 shm
+#            server (default: unset, directive omitted -- the shipped 0/off
+#            default applies). Mirrors bench.sh's COPY_THRESHOLD knob (C2):
+#            set it above the profiled body size (200B here, see `tiny`
+#            above) to route the hit path through the copy-into-r->pool arm
+#            instead of the shm-pin arm, so the two symbol sets
+#            (blob_acquire/blob_release/ngx_pool_cleanup_add vs their
+#            absence) can be diffed directly out of the perf report.
 #
 # Requires: /usr/bin/perf (readable perf_event_paranoid, i.e. <=1 as root or
 # <=2 unprivileged with CAP_PERFMON — this host is pinned at 1, do not try to
@@ -83,6 +91,15 @@ WORKERS="${WORKERS:-1}"
 case "$WORKERS" in ''|*[!0-9]*) echo "FATAL: WORKERS must be a positive integer" >&2; exit 2;; esac
 WORKERS=$((10#$WORKERS))
 [ "$WORKERS" -ge 1 ] || { echo "FATAL: WORKERS must be >= 1" >&2; exit 2; }
+# C2: cache_turbo_copy_threshold on the profiled server only. Unset (the
+# default) omits the directive entirely so a build without the directive
+# still runs; set e.g. COPY_THRESHOLD=65536 to route the tiny 200B body
+# through the copy-into-r->pool arm for this profile.
+COPY_THRESHOLD="${COPY_THRESHOLD:-}"
+case "$COPY_THRESHOLD" in
+    '') ;;
+    *[!0-9]*) echo "FATAL: COPY_THRESHOLD must be a non-negative integer" >&2; exit 2;;
+esac
 
 case "$CALLGRAPH" in
     fp|dwarf) ;;
@@ -136,6 +153,10 @@ LOAD_MODULE=""
 LOCATION_BLOCK='location / { add_header Cache-Control "max-age=600"; }'
 [ -n "$VARY" ] && LOCATION_BLOCK='location / { add_header Cache-Control "max-age=600"; add_header Vary "Accept-Encoding"; }'
 
+COPY_THRESHOLD_DIRECTIVE=""
+[ -n "$COPY_THRESHOLD" ] && \
+    COPY_THRESHOLD_DIRECTIVE="cache_turbo_copy_threshold $COPY_THRESHOLD;"
+
 cat > "$WORK/conf/nginx.conf" <<EOF
 daemon off;
 $LOAD_MODULE
@@ -160,6 +181,7 @@ http {
         location / {
             cache_turbo        ct;
             cache_turbo_valid  60s;
+            $COPY_THRESHOLD_DIRECTIVE
             proxy_pass http://127.0.0.1:$ORIGIN;
         }
         location = /_cache_c { cache_turbo_admin ct; allow 127.0.0.1; deny all; }
@@ -240,7 +262,7 @@ cg="$CALLGRAPH"
 perf_data="$OUT/perf.data"
 rm -f "$perf_data"
 
-echo "== perf record: pid(s)=$worker_pids freq=${FREQ}Hz callgraph=$CALLGRAPH duration=${DURATION}s workers=$WORKERS vary=${VARY:-0} ==" >&2
+echo "== perf record: pid(s)=$worker_pids freq=${FREQ}Hz callgraph=$CALLGRAPH duration=${DURATION}s workers=$WORKERS vary=${VARY:-0} copy_threshold=${COPY_THRESHOLD:-0} ==" >&2
 perf record -p "$worker_pids" -F "$FREQ" --call-graph "$cg" -o "$perf_data" &
 PERF_PID=$!
 # perf record needs a moment to attach before load starts, else the first
