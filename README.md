@@ -86,7 +86,7 @@ a no-op prints exactly the same clean line as one that passes.
   - [Admin endpoint verbs](#admin-endpoint-verbs)
 - [Monitoring (Prometheus + Grafana)](#monitoring-prometheus--grafana)
 - [Redis L2 (shared cache)](#redis-l2-shared-cache)
-  - [What `keepalive=` buys — and what it does not](#what-keepalive-buys--and-what-it-does-not)
+  - [What `keepalive=` buys — and what is not established](#what-keepalive-buys--and-what-is-not-established)
   - [memcached L2 (alternative backend)](#memcached-l2-alternative-backend)
 - [Building & the stack](#building--the-stack)
 - [Benchmarking](#benchmarking)
@@ -1805,8 +1805,8 @@ http {
     cache_turbo_zone name=ct 512m;
 
     # cluster-shared L2 in Redis (optional). Inherited by everything below.
-    # keepalive= pools idle Redis conns per worker: fewer connections on the
-    # Redis side, not more throughput. See "Redis L2 (shared cache)".
+    # keepalive= pools idle Redis conns per worker, removing one TCP connect
+    # per L2 lookup. See "Redis L2 (shared cache)".
     cache_turbo_redis 127.0.0.1:6379 prefix=ct: timeout=250ms
                       keepalive=32 keepalive_timeout=60s;
 
@@ -2319,27 +2319,44 @@ trailing option, which **overrides** the DSN:
 > package is). Without it, a `rediss://` / `tls=on` config is rejected at start.
 > Passwords sit in your nginx config — keep it `chmod 600` / out of git.
 
-### What `keepalive=` buys — and what it does not
+### What `keepalive=` buys — and what is not established
 
-`keepalive=` is a **connection-churn knob, not a speed knob.** The default is
-`0` (off), which opens and closes a Redis connection for every L1 miss.
+The default is `0` (off), which opens **and closes** a Redis connection for
+every L1 miss that consults L2. Whether turning the pool on shows up as more
+requests per second depends entirely on whether your L2 path is what limits the
+workload.
 
-- **What it does:** measured over a 9-point sweep with 3 interleaved repeats,
-  Redis-side `total_connections_received` per run fell from roughly **21-27k**
-  with `keepalive=0` to roughly **6-12k** at `keepalive=32`-`64`, with the
-  `GET` count flat. The reduction is monotone and reproducible. On a busy fleet
-  that is meaningfully less accept/close work and fewer sockets in `TIME_WAIT`
-  on the Redis host.
-- **What it does not do:** it does **not** raise end-to-end throughput. In the
-  same sweep the `keepalive=0` and `keepalive=64` request-rate ranges overlapped
-  completely, and `keepalive=0` was the faster arm in two of three repeat
-  rounds. Do not set it expecting more requests per second.
+- **It always removes connection churn.** Measured over a 9-point sweep with 3
+  interleaved repeats, Redis-side `total_connections_received` per run fell from
+  roughly **21-27k** with `keepalive=0` to roughly **6-12k** at
+  `keepalive=32`-`64`, with the `GET` count flat. The reduction is monotone and
+  reproducible. On a busy fleet that is meaningfully less accept/close work and
+  fewer sockets in `TIME_WAIT` on the Redis host.
+- **The churn it removes is real work, not just tidiness.** With `keepalive=0`
+  the connection count tracks the L2 `GET` count almost exactly (measured ratio
+  1.003) — one full TCP connect plus one `TIME_WAIT` slot per L2 lookup. In a
+  profile of that configuration the kernel connect path
+  (`__inet_hash_connect`, `__inet_check_established`, `tcp_twsk_unique`) is the
+  largest single block of miss-path kernel time; enabling the pool removes those
+  symbols from the profile entirely. So the cost being eliminated is a genuine
+  per-miss cost on the request path, not merely bookkeeping on the Redis host.
+- **Whether that converts to throughput depends on your bottleneck, and we have
+  not measured the conversion cleanly.** On a rig whose miss path was limited by
+  the origin rather than by L2, sweeping `keepalive=` moved churn monotonically
+  while the request-rate ranges overlapped completely — a cost that only bites
+  above a cap cannot show up in a workload already capped below it. On a rig
+  where L2 was hot, throughput moved by a large factor, but that arm exercised
+  the L2 path about 11x harder and so is not a like-for-like measurement of the
+  knob alone. **Treat the size of any throughput gain as unquantified.** What is
+  established is the mechanism, not the magnitude.
 
-Pools are per worker **and** per connection profile, so the connections a box
-can hold open is `workers x profiles x keepalive`. Size that product against the
-Redis server's `maxclients` rather than raising `keepalive=` speculatively —
-there is no throughput reward for a larger pool. The per-profile accounting is
-detailed in the per-profile options note above.
+Practically: set `keepalive=` if your deployment takes L2 lookups at any rate —
+you are removing a per-lookup connect either way. Do not budget a specific
+requests-per-second improvement from it, and do not raise the pool size chasing
+one. Pools are per worker **and** per connection profile, so the connections a
+box can hold open is `workers x profiles x keepalive`; size that product against
+the Redis server's `maxclients`. The per-profile accounting is detailed in the
+per-profile options note above.
 
 ### memcached L2 (alternative backend)
 
