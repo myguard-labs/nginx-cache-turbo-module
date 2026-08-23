@@ -511,6 +511,112 @@ def test_auto_vary_marker_probe_selects_correct_variant(ng: Nginx,
         origin.hits_for("/vlock?v=or") - base)
 
 
+def _c3vm_markers(ng: Nginx) -> int:
+    """C3: read the live `markers` gauge for the isolated c3vmz zone (see
+    nginx_config.py's c3vmz comment for why this needs its own admin
+    endpoint rather than reading /_cache, which reports `main` -- shared by
+    every other auto-Vary test in this suite, so it is not a clean
+    baseline)."""
+    import json
+    _, b, _ = fetch(ng.port, "/_cache_c3vm")
+    return int(json.loads(b)["markers"])
+
+
+def test_c3_marker_counter_tracks_store_and_purge(ng: Nginx, origin: Origin) -> None:
+    """C3: `markers` (the zone-wide L1 auto-Vary marker presence gauge that
+    gates vary_apply()'s lock-held probe, see access_l1()) goes up by exactly
+    one on a genuine first-time marker classification, does NOT double-count
+    a REFRESH of that same marker (a second variant on the same base --
+    marker_store()'s own comment: "the marker is refreshed on every variant
+    store"), and returns to its pre-test baseline once purge-all has dropped
+    every node in the zone -- exercising ngx_http_cache_turbo_shm_drop_
+    locked(), one of the three node-free sites the decrement is gated on
+    (the other two are ngx_http_cache_turbo_shm_evict_one()'s two take
+    sites, covered by the C unit harness's existing LRU-eviction coverage
+    instead -- this suite has no reliable way to force an eviction on demand
+    without flaking on box load).
+
+    Delta-based against whatever `markers` already reads, not an assumed 0:
+    run_named.py / a redis+mc sweep can invoke run_all() more than once
+    against the same nginx process, and c3vmz is a real cache_turbo_zone
+    that persists across those calls."""
+    before = _c3vm_markers(ng)
+
+    _, _, h1 = fetch(ng.port, "/avc3/store1?v=or&t=c3a",
+                      {"Origin": "https://a.example"})
+    assert h1.get("x-ct-status") == "MISS", f"cold fetch must MISS, got {h1}"
+
+    after_store = _c3vm_markers(ng)
+    assert after_store == before + 1, (
+        ("a genuine first-time marker classification must bump `markers` by "
+         "exactly one"), before, after_store)
+
+    _, _, h2 = fetch(ng.port, "/avc3/store1?v=or&t=c3a",
+                      {"Origin": "https://b.example"})
+    assert h2.get("x-ct-status") == "MISS", f"second variant must MISS, got {h2}"
+    after_refresh = _c3vm_markers(ng)
+    assert after_refresh == after_store, (
+        ("a marker REFRESH (second variant classified on the SAME base URL) "
+         "must not bump `markers` again -- only a genuine new node may"),
+        after_store, after_refresh)
+
+    s, _, _ = fetch(ng.port, "/_cache_c3vm?all=1", method="POST")
+    assert s == 200, f"purge-all status {s}"
+
+    after_purge = _c3vm_markers(ng)
+    assert after_purge == before, (
+        ("`markers` must return to its pre-test baseline once purge-all has "
+         "dropped every node in the zone, the marker included"),
+        before, after_purge)
+
+
+def test_c3_auto_vary_resolves_variants_with_marker_gate_active(
+        ng: Nginx, origin: Origin) -> None:
+    """C3 correctness re-proof of test_auto_vary_marker_probe_selects_
+    correct_variant, run through /avc3/ (the counter-gated path) instead of
+    /av/. The first fetch of each variant runs while this exact base key's
+    marker does not exist yet (a genuine cold classification -- `markers`
+    for the ZONE may already be > 0 from other tests, but not for THIS base
+    key), so vary_apply() itself does the classifying; every fetch after
+    that has a real marker resident, so the gate takes the `markers != 0`
+    branch and the real lock-held probe must select the correct variant
+    every time -- interleaved (not sequential re-hits of the same one) so a
+    wrong fold could not hide behind "always the last one resolved"."""
+    needle = "gatevariant?v=or&t=c3b"
+    base = origin.hits_for(needle)
+    p = "/avc3/gatevariant?v=or&t=c3b"
+    a = {"Origin": "https://a2.example"}
+    b = {"Origin": "https://b2.example"}
+    c = {"Origin": "https://c2.example"}
+
+    _, a1, ha1 = fetch(ng.port, p, a)
+    assert ha1.get("x-ct-status") == "MISS", \
+        f"origin-a cold fetch must MISS, got {ha1.get('x-ct-status')}"
+    _, b1, _ = fetch(ng.port, p, b)
+    _, c1, _ = fetch(ng.port, p, c)
+    assert origin.hits_for(needle) - base == 3, \
+        origin.hits_for(needle) - base
+
+    _, a2, ha2 = fetch(ng.port, p, a)
+    _, c2, hc2 = fetch(ng.port, p, c)
+    _, b2, hb2 = fetch(ng.port, p, b)
+
+    assert ha2.get("x-ct-status") == "HIT", f"origin-a re-fetch must HIT, got {ha2}"
+    assert hb2.get("x-ct-status") == "HIT", f"origin-b re-fetch must HIT, got {hb2}"
+    assert hc2.get("x-ct-status") == "HIT", f"origin-c re-fetch must HIT, got {hc2}"
+
+    assert a1 == a2, ("origin-a slot changed body across HIT", a1, a2)
+    assert b1 == b2, ("origin-b slot changed body across HIT", b1, b2)
+    assert c1 == c2, ("origin-c slot changed body across HIT", c1, c2)
+    assert a1 != b1 and a1 != c1 and b1 != c1, \
+        ("two variants shared a slot", a1, b1, c1)
+
+    assert origin.hits_for(needle) - base == 3, (
+        ("a marker-gate/probe interaction sent a HIT-eligible variant back "
+         "to origin"),
+        origin.hits_for(needle) - base)
+
+
 def test_auto_vary_encoding_same_class_shares(ng: Nginx, origin: Origin) -> None:
     """v11 auto-Vary: two Accept-Encoding headers in the same bucket (gzip and
     'gzip, deflate' both classify gzip) share one slot -> one origin hit."""

@@ -747,6 +747,36 @@ typedef struct {
     ngx_atomic_t             refreshes;
     ngx_atomic_t             evictions;
 
+    /* C3: live count of L1 auto-Vary marker nodes (kind ==
+     * NGX_HTTP_CACHE_TURBO_NODE_MARKER) currently resident in THIS zone's
+     * stripe -- a presence gauge, not a lifetime counter. Bumped once, under
+     * the zone mutex, by ngx_http_cache_turbo_shm_store_marker() the moment it
+     * creates a brand-new marker node (never on a refresh of an existing one).
+     * Dropped, also lock-held, by every site that can free a node regardless
+     * of kind (ngx_http_cache_turbo_shm_evict_one()'s two take sites,
+     * ngx_http_cache_turbo_shm_drop_locked() shared by purge_key/purge_all) --
+     * each checks `ctn->kind == NGX_HTTP_CACHE_TURBO_NODE_MARKER` before
+     * freeing and decrements only then. The fourth and last node-free site in
+     * the module (the COUNTER-stub unstub reclaim in
+     * ngx_http_cache_turbo_shm_resolve_miss()) is gated on
+     * `kind == NGX_HTTP_CACHE_TURBO_NODE_COUNTER`, which provably excludes a
+     * MARKER node, so it needs no decrement. Read (unlocked, plain load like
+     * every other atomic in this block) by the auto-Vary probe gate in
+     * access.c: `markers == 0` proves the zone holds no marker anywhere, so
+     * ngx_http_cache_turbo_vary_apply()'s lock-held L1 lookup is guaranteed to
+     * find nothing and can be skipped -- see access_l1()'s call site for the
+     * exact side effects that skip must still replicate.
+     *
+     * Deliberately conservative in one direction only: over-count is the safe
+     * failure (the gate simply stops firing, falling back to the pre-C3
+     * always-probe behaviour) and this field can never under-count, because
+     * every increment and every decrement runs under the SAME zone-mutex hold
+     * as the node mutation it accounts for -- see _shm_store_marker()'s single
+     * lock/unlock pair, which checks-then-creates-then-tags atomically rather
+     * than across two separate lock acquisitions (a node evicted and
+     * recreated between two such acquisitions would otherwise be missed). */
+    ngx_atomic_t             markers;
+
     /* P3-7: zone-wide count of background-refresh (SWR bg-update) subrequests
      * currently in flight, gated by cache_turbo_background_update_max. Per-key
      * single-flight (refreshing/refresh_lock_until above) caps regens for ONE
@@ -1306,6 +1336,8 @@ typedef struct {
     ngx_atomic_uint_t   admission_refused;
     /* P4-2-s3a: live used-bytes gauge, see the shctx_t field. */
     ngx_atomic_uint_t   used_bytes;
+    /* C3: live L1 auto-Vary marker presence gauge, see the shctx_t field. */
+    ngx_atomic_uint_t   markers;
     /* P0-1: per-reason store-refusal counters, mirrors shctx_t. */
     ngx_atomic_uint_t   refuse_set_cookie;
     ngx_atomic_uint_t   refuse_encoded;

@@ -63,6 +63,7 @@ pthread_mutex_t  ngx_test_shmtx = PTHREAD_MUTEX_INITIALIZER;
  * see extract_shm.sh, which also pins the two NODE_* constants. */
 #define NGX_HTTP_CACHE_TURBO_NODE_ENTRY    0
 #define NGX_HTTP_CACHE_TURBO_NODE_COUNTER  1
+#define NGX_HTTP_CACHE_TURBO_NODE_MARKER   2
 
 typedef struct {
     ngx_rbtree_node_t   node;
@@ -209,6 +210,8 @@ typedef struct {
     ngx_uint_t          n_protected;
     ngx_uint_t          n_entries;
     ngx_atomic_t        hits, misses, stale_serves, refreshes, evictions;
+    /* C3: read/written by the sliced evict_one()'s two take sites. */
+    ngx_atomic_t        markers;
     ngx_atomic_t        l2_hits, l2_misses, lock_waits;
     uint64_t            owner_seq;       /* CTXRDR-ADOPT-LEASE token source */
     ngx_atomic_t        min_uses_skips, l2_neg_skips, bypasses;

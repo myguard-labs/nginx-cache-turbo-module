@@ -395,7 +395,21 @@ ngx_http_cache_turbo_access_prologue(ngx_http_request_t *r,
      * marker LOOKUP + key_hash recompute now happens in access_handler,
      * folded into the same critical section as the main L1 lookup, so it no
      * longer pays a separate zone-mutex acquisition here. No marker (or
-     * auto_vary off) => key_hash stays the base key, same as before. */
+     * auto_vary off) => key_hash stays the base key, same as before.
+     *
+     * C3: deliberately NOT gated on the zone's `markers` presence counter,
+     * unlike the lock-held lookup in access_l1() below. ctx->vary_marker_key
+     * is not just an input to that lookup -- ngx_http_cache_turbo_access_l2_
+     * marker_get() (P3-5's L2-backed marker consult) reads it directly to
+     * build the L2 GET key, and that consult is exactly what a zone with ZERO
+     * locally-resident L1 markers (cold node: fresh boot, or every marker
+     * LRU-evicted) needs to fall back to -- a peer node may have classified
+     * and stored this base URL's marker in L2 independently of what THIS
+     * node's L1 currently holds. Gating this call the same way would leave
+     * vary_marker_key zeroed, silently defeating that cross-node fallback for
+     * as long as `markers` reads 0 on this node. This call is cheap (a single
+     * digest over already-computed key bytes, no lock, no shm read), so
+     * nothing is bought by gating it. */
     if (clcf->auto_vary) {
         ngx_http_cache_turbo_vary_prepare(ctx);
     }
@@ -1340,9 +1354,31 @@ ngx_http_cache_turbo_access_l1(ngx_http_request_t *r,
      * prologue) so a request pays one zone-mutex acquisition for both the
      * vary-marker probe and the main lookup below, not two. Must run before
      * the main lookup: it may rewrite ctx->key_hash/hash to the variant key
-     * that lookup below needs to use. */
+     * that lookup below needs to use.
+     *
+     * C3: `markers == 0` proves the zone holds no L1 marker node anywhere (see
+     * the field comment in module.h -- the counter cannot under-count), so
+     * vary_apply()'s own lock-held rbtree lookup on ctx->vary_marker_key is
+     * guaranteed to find nothing. Skip it and replicate exactly the terminal
+     * state its m == NULL branch leaves: ctx->vary_gen unconditionally 0
+     * (vary_apply()'s own field comment: "ctx->vary_gen is set unconditionally
+     * ... bits==0 => gen==0" -- and ctx is pcalloc'd/reset each pass, so 0 is
+     * also vary_gen's own initialised value, making this assignment a
+     * provable no-op whenever this is the first pass to touch it) and
+     * ctx->vary_marker_l1_miss = 1, which is what arms the L2-backed marker
+     * consult a few phases later (access_l2_marker_get()) -- that consult
+     * must still fire on a counter-proven-empty L1, exactly as it would on an
+     * ordinary miss, so a peer's L2-visible marker is still found. Nothing
+     * else: vary_apply()'s m == NULL arm touches no other ctx field and never
+     * rewrites `hash`. */
     if (clcf->auto_vary) {
-        ngx_http_cache_turbo_vary_apply(r, clcf, z, ctx, &hash);
+        if (ngx_http_cache_turbo_zone_sh(z)->markers == 0) {
+            ctx->vary_gen = 0;
+            ctx->vary_marker_l1_miss = 1;
+
+        } else {
+            ngx_http_cache_turbo_vary_apply(r, clcf, z, ctx, &hash);
+        }
     }
 
     /* P3-5: re-derive an L2-resolved variant on EVERY entry, exactly the way

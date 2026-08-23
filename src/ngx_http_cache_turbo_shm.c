@@ -1074,6 +1074,13 @@ ngx_http_cache_turbo_shm_evict_one(ngx_http_cache_turbo_zone_t *z)
             ngx_http_cache_turbo_zone_sh(z)->n_entries--;
             ngx_rbtree_delete(&ngx_http_cache_turbo_zone_sh(z)->rbtree, &ctn->node);
 
+            /* C3: this generic LRU walk evicts ANY kind, markers included --
+             * see the `markers` field comment in module.h. */
+            if (ctn->kind == NGX_HTTP_CACHE_TURBO_NODE_MARKER) {
+                (void) ngx_atomic_fetch_add(
+                    &ngx_http_cache_turbo_zone_sh(z)->markers, -1);
+            }
+
             if (ctn->data) {
                 ngx_http_cache_turbo_blob_node_release(z, ctn->data);
             }
@@ -1092,6 +1099,13 @@ ngx_http_cache_turbo_shm_evict_one(ngx_http_cache_turbo_zone_t *z)
         ngx_http_cache_turbo_lru_unlink(z, ctn);
         ngx_http_cache_turbo_zone_sh(z)->n_entries--;
         ngx_rbtree_delete(&ngx_http_cache_turbo_zone_sh(z)->rbtree, &ctn->node);
+
+        /* C3: fallback-take arm of the same generic walk -- see the sibling
+         * comment on the probation-tail take above. */
+        if (ctn->kind == NGX_HTTP_CACHE_TURBO_NODE_MARKER) {
+            (void) ngx_atomic_fetch_add(
+                &ngx_http_cache_turbo_zone_sh(z)->markers, -1);
+        }
 
         if (ctn->data) {
             ngx_http_cache_turbo_blob_node_release(z, ctn->data);
@@ -1170,6 +1184,14 @@ ngx_http_cache_turbo_shm_drop_locked(ngx_http_cache_turbo_zone_t *z,
     ngx_http_cache_turbo_lru_unlink(z, ctn);
     ngx_http_cache_turbo_zone_sh(z)->n_entries--;
     ngx_rbtree_delete(&ngx_http_cache_turbo_zone_sh(z)->rbtree, &ctn->node);
+    /* C3: the shared drop path for purge_key() (a single explicit key,
+     * including the vary-marker purge at access.c's PURGE self-heal site) and
+     * purge_all() (every node, unconditionally) -- either can drop a marker,
+     * so this is one of the four node-free sites the `markers` counter must
+     * cover. See the field comment in module.h. */
+    if (ctn->kind == NGX_HTTP_CACHE_TURBO_NODE_MARKER) {
+        (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->markers, -1);
+    }
     if (ctn->data) {
         ngx_http_cache_turbo_blob_node_release(z, ctn->data);
     }
@@ -1420,6 +1442,62 @@ ngx_http_cache_turbo_shm_store(ngx_http_cache_turbo_zone_t *z,
 }
 
 
+/* C3: marker store. Same wire contract as _shm_store() above, plus the
+ * `markers` presence-counter bookkeeping, all under ONE lock/unlock pair so
+ * the "was this key already a marker" read, the write itself, and the
+ * conditional increment are atomic with respect to every other zone-mutex
+ * holder -- in particular ngx_http_cache_turbo_shm_evict_one(), which could
+ * otherwise reclaim this exact node (decrementing `markers`) in the window
+ * between a separate pre-check and a separate post-check, leaving the counter
+ * one short of the node store_locked() goes on to (re)create.
+ *
+ * `was_marker` is read from `ctn->kind` BEFORE the store, not from any
+ * property that survives it: store_locked()'s refresh branch unconditionally
+ * resets kind to NGX_HTTP_CACHE_TURBO_NODE_ENTRY (it has no notion of a
+ * marker), so kind cannot double as its own "already counted" signal across
+ * the call the way it can for a plain read. Retagging to MARKER after every
+ * single call (new-entry AND refresh alike) is what keeps kind accurate for
+ * the NEXT free site's decrement check, no matter how many refreshes happen
+ * in between -- markers are refreshed on every variant store (see
+ * ngx_http_cache_turbo_marker_store()'s own comment), so that is the common
+ * case, not the exception. */
+ngx_int_t
+ngx_http_cache_turbo_shm_store_marker(ngx_http_cache_turbo_zone_t *z,
+    u_char *key_hash, uint32_t hash, u_char *data, size_t len,
+    time_t fresh_ttl, time_t stale_ttl)
+{
+    ngx_int_t                     rc;
+    ngx_uint_t                    was_marker;
+    ngx_http_cache_turbo_node_t  *ctn;
+
+    ngx_shmtx_lock(ngx_http_cache_turbo_zone_mutex(z));
+
+    ctn = ngx_http_cache_turbo_shm_lookup(z, key_hash, hash);
+    was_marker = (ctn != NULL
+                  && ctn->kind == NGX_HTTP_CACHE_TURBO_NODE_MARKER);
+
+    rc = ngx_http_cache_turbo_shm_store_locked(z, key_hash, hash, data, len,
+                                                fresh_ttl, stale_ttl);
+
+    if (rc == NGX_OK) {
+        ctn = ngx_http_cache_turbo_shm_lookup(z, key_hash, hash);
+
+        if (ctn != NULL) {
+            ctn->kind = NGX_HTTP_CACHE_TURBO_NODE_MARKER;
+
+            if (!was_marker) {
+                (void) ngx_atomic_fetch_add(
+                    &ngx_http_cache_turbo_zone_sh(z)->markers, 1);
+            }
+        }
+    }
+
+    ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
+
+    return rc;
+}
+
+
 /* AUD-L2-PROMOTE-RACE / AUD-5XX-CTA: decide-then-write, one lock acquisition.
  * See the L1 vtable `store_if` comment in the header for the return contract
  * and the exact refusal rule each predicate applies. `now` is taken ONCE
@@ -1624,6 +1702,7 @@ ngx_http_cache_turbo_shm_stats(ngx_http_cache_turbo_zone_t *z,
      * shm_alloc_evict / discharged by shm_free_locked). Plain read like the
      * sketch fields above -- diagnostics, not a decision input. */
     out->used_bytes = (ngx_atomic_uint_t) ngx_http_cache_turbo_zone_sh(z)->used_bytes;
+    out->markers    = ngx_http_cache_turbo_zone_sh(z)->markers;
 }
 
 
@@ -2258,8 +2337,22 @@ ngx_http_cache_turbo_shm_l2_neg_set(ngx_http_cache_turbo_zone_t *z,
          * the memo describes L2's contents and a local regen does not change them.
          * Keeping the guard would also re-create the ~1-request window from the
          * other side, since a cold request's own claim() marks the node before the
-         * miss is recorded on some paths. */
-        if (ctn->kind == NGX_HTTP_CACHE_TURBO_NODE_ENTRY) {
+         * miss is recorded on some paths.
+         *
+         * C3: MARKER joins this guard for the identical reason. This function is
+         * called with the marker key too (access.c's marker-consult "definitive
+         * miss" arm, ctx->vary_marker_key) -- and a MARKER, exactly like an
+         * ENTRY, holds real content (the [bits][gen] pair): if a peer request
+         * concurrently landed a fresh marker at this exact key between this
+         * call's own L1 miss a moment earlier and this memo write, stamping a
+         * memo over it would be pure pollution (the field would never again be
+         * read, since any later request finds the live marker straight from L1
+         * and never reaches this memo check at all) -- but skipping it here,
+         * the same way an ENTRY always has, costs nothing and keeps this
+         * function's contract uniform across both kinds that "hold content". */
+        if (ctn->kind == NGX_HTTP_CACHE_TURBO_NODE_ENTRY
+            || ctn->kind == NGX_HTTP_CACHE_TURBO_NODE_MARKER)
+        {
             ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
             return;
         }

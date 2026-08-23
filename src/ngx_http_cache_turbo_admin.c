@@ -470,8 +470,9 @@ ngx_http_cache_turbo_admin_stats_prometheus(ngx_http_request_t *r,
      * literal bytes, less 2 per %V and 3 per %uA) plus lint-admin-buffer-
      * budget.py's 128-byte margin. When adding a metric, re-measure rather
      * than adding an estimate -- run the lint locally, it prints the exact
-     * required value. */
-    len = 7152 + 35 * zname.len + 35 * NGX_ATOMIC_T_LEN;
+     * required value. C3 added cache_turbo_markers (gauge), count 35 -> 36,
+     * fixed term re-measured 7152 -> 7345. */
+    len = 7345 + 36 * zname.len + 36 * NGX_ATOMIC_T_LEN;
     p = ngx_pnalloc(r->pool, len);
     if (p == NULL) {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -589,7 +590,10 @@ ngx_http_cache_turbo_admin_stats_prometheus(ngx_http_request_t *r,
         "cache_turbo_admission_refused_total{zone=\"%V\"} %uA\n"
         "# HELP cache_turbo_used_bytes Slab bytes currently charged for cached payload and metadata in this zone (excludes fixed per-zone init overhead).\n"
         "# TYPE cache_turbo_used_bytes gauge\n"
-        "cache_turbo_used_bytes{zone=\"%V\"} %uA\n",
+        "cache_turbo_used_bytes{zone=\"%V\"} %uA\n"
+        "# HELP cache_turbo_markers Live count of L1 auto-Vary marker nodes resident in this zone (0 gates the vary-marker probe off, C3).\n"
+        "# TYPE cache_turbo_markers gauge\n"
+        "cache_turbo_markers{zone=\"%V\"} %uA\n",
         &zname, st->hits, &zname, st->misses, &zname, st->stale_serves,
         &zname, st->refreshes, &zname, st->evictions,
         &zname, st->l2_hits, &zname, st->l2_misses, &zname, st->lock_waits,
@@ -611,7 +615,8 @@ ngx_http_cache_turbo_admin_stats_prometheus(ngx_http_request_t *r,
         &zname, st->bg_inflight,
         &zname, st->sketch_gen, &zname, st->sketch_bumps,
         &zname, st->admission_refused,
-        &zname, st->used_bytes) - p;
+        &zname, st->used_bytes,
+        &zname, st->markers) - p;
 
     return ngx_http_cache_turbo_send_body(r, NGX_HTTP_OK, &body,
         "text/plain; version=0.0.4; charset=utf-8",
@@ -643,8 +648,8 @@ ngx_http_cache_turbo_admin_stats_json(ngx_http_request_t *r,
                  "\"origin_failures\":,\"varidx_drops\":,"
                  "\"tag_index_drops\":,\"tag_cap_drops\":,\"bg_inflight\":,"
                  "\"sketch_gen\":,\"sketch_bumps\":,"
-                 "\"admission_refused\":,\"used_bytes\":}\n")
-          + 34 * NGX_ATOMIC_T_LEN
+                 "\"admission_refused\":,\"used_bytes\":,\"markers\":}\n")
+          + 35 * NGX_ATOMIC_T_LEN
           + sizeof("half-open") - 1;   /* longest _breaker_state_str value */
     p = ngx_pnalloc(r->pool, len);
     if (p == NULL) {
@@ -668,7 +673,7 @@ ngx_http_cache_turbo_admin_stats_json(ngx_http_request_t *r,
         "\"origin_failures\":%uA,\"varidx_drops\":%uA,"
         "\"tag_index_drops\":%uA,\"tag_cap_drops\":%uA,\"bg_inflight\":%uA,"
         "\"sketch_gen\":%uA,\"sketch_bumps\":%uA,"
-        "\"admission_refused\":%uA,\"used_bytes\":%uA}\n",
+        "\"admission_refused\":%uA,\"used_bytes\":%uA,\"markers\":%uA}\n",
         st->hits, st->misses, st->stale_serves,
         st->refreshes, st->evictions, st->l2_hits, st->l2_misses,
         st->lock_waits, st->min_uses_skips, st->l2_neg_skips,
@@ -685,7 +690,7 @@ ngx_http_cache_turbo_admin_stats_json(ngx_http_request_t *r,
         st->varidx_drops, st->tag_index_drops, st->tag_cap_drops,
         st->bg_inflight,
         st->sketch_gen, st->sketch_bumps, st->admission_refused,
-        st->used_bytes) - p;
+        st->used_bytes, st->markers) - p;
 
     return ngx_http_cache_turbo_send_json(r, NGX_HTTP_OK, &body);
 }

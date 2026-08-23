@@ -146,6 +146,18 @@ ngx_int_t ngx_http_cache_turbo_shm_store(ngx_http_cache_turbo_zone_t *z,
     u_char *key_hash, uint32_t hash, u_char *data, size_t len,
     time_t fresh_ttl, time_t stale_ttl);
 
+/* C3: marker-specific store. Identical wire contract to _shm_store() above,
+ * plus (atomically, under the SAME lock hold as the write): tag the resulting
+ * node NGX_HTTP_CACHE_TURBO_NODE_MARKER and bump the zone's `markers` presence
+ * counter iff this call just created the node fresh (a refresh of an already-
+ * tagged marker does not bump it again). Called directly by
+ * ngx_http_cache_turbo_marker_store() (vary.c), bypassing the l1 vtable on
+ * purpose -- this bookkeeping is zone-shm-specific, not something a
+ * hypothetical alternate L1 backend is asked to implement. */
+ngx_int_t ngx_http_cache_turbo_shm_store_marker(ngx_http_cache_turbo_zone_t *z,
+    u_char *key_hash, uint32_t hash, u_char *data, size_t len,
+    time_t fresh_ttl, time_t stale_ttl);
+
 /* Atomic decide-then-write store. See the L1 vtable `store_if` comment for
  * the return contract (NGX_OK / NGX_DECLINED / NGX_ERROR) and predicate
  * semantics. */
@@ -597,6 +609,36 @@ typedef struct {
                                                * and/or L13 negative memo, and
                                                * (when refreshing) the v10
                                                * cold-miss stub               */
+#define NGX_HTTP_CACHE_TURBO_NODE_MARKER   2  /* C3: an auto-Vary L1 marker
+                                               * (ngx_http_cache_turbo_marker_store()).
+                                               * Stored through the SAME l1
+                                               * store path as an ENTRY and
+                                               * carries a tiny body (the
+                                               * [bits][gen] pair), but is
+                                               * retagged from ENTRY to MARKER
+                                               * by ngx_http_cache_turbo_shm_
+                                               * store_marker() right after
+                                               * every create/refresh so free
+                                               * sites can gate the zone-wide
+                                               * `markers` presence counter on
+                                               * kind alone, matching the
+                                               * disambiguation this field
+                                               * exists for -- see its own
+                                               * comment above. A guard whose
+                                               * pre-C3 intent was "this node
+                                               * holds real content" (l2_neg_set)
+                                               * must treat MARKER the same as
+                                               * ENTRY; a guard whose intent was
+                                               * "this is a genuinely servable
+                                               * HTTP response" (touch_lru's
+                                               * promotion, sie_live, freshen,
+                                               * store_if, count_miss,
+                                               * varidx_pending_set) is correctly
+                                               * ENTRY-only and MUST NOT widen --
+                                               * none of those are ever called
+                                               * with a marker's key_hash (see
+                                               * PR body for the callsite audit).
+                                               */
 
 /* S8 segmented-LRU segment ids. See the `seg` field below for why PROBATION
  * must stay 0. ci/tests/unit/extract_shm.sh pins both values. */
