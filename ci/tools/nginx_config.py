@@ -1962,6 +1962,12 @@ http {{
         # satisfy valid < sleep < valid*(stale_mult-1) -- the lower slack absorbs
         # the prime, and the upper one the elapsed time before the sleep starts.
         # Here that is 2 < 4 < 6.
+        #
+        # TEST-MICROTTL-ORACLE (2026-08-23): the consumer test anchors its
+        # sleep to a t_store captured right after the prime fetch, not to a
+        # flat sleep(4.0) after its own immediate re-read -- see
+        # test_ignore_cc_must_revalidate_keeps_stale_window in
+        # ci/tools/areas/policy.py for why that anchor is load-bearing here.
         location /ccignmr/ {{
             cache_turbo               main;
             cache_turbo_key           $uri;
