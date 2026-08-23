@@ -3707,6 +3707,138 @@ test_blob_alloc_propagates_slab_exhaustion(void)
 
 
 /* =====================================================================
+ * C2 -- small-body copy vs shm pin, refcount observable
+ *
+ * The HTTP-level call sites (ngx_http_cache_turbo_access_l1_serve_fresh, and
+ * the plain "serve stale, no regeneration" tail inside
+ * ngx_http_cache_turbo_access_l1_serve_stale, both in
+ * ngx_http_cache_turbo_access.c) decide -- under the same zone mutex the
+ * lookup already holds -- whether to ngx_pnalloc+ngx_memcpy a private
+ * r->pool copy (body_len <= clcf->copy_threshold, copy_threshold != 0: NO
+ * shm reference taken at all) or ngx_http_cache_turbo_blob_acquire() the
+ * shm blob (the pre-C2 pin path, unchanged above the threshold, or when the
+ * directive is off at 0). Same reason as CR-A/CR-B and the blob tests above
+ * for why this is exercised directly rather than through the HTTP surface:
+ * from C the decision is one comparison plus (at most) one call. These
+ * tests drive that identical `len <= threshold` gate against the REAL
+ * blob_acquire()/refs the production call sites use, so the oracle is the
+ * production refcount, not a value this test invents.
+ * ===================================================================== */
+
+/* body_len <= threshold: the copy path takes NO shm reference. refs must
+ * stay 0 all the way through node_release, exactly as an unreferenced blob
+ * that was never served zero-copy at all. */
+static void
+test_copy_threshold_small_body_takes_no_reference(void)
+{
+    u_char      *blob;
+    ngx_uint_t   live_before;
+    size_t       threshold = 4096;
+    size_t       body_len  = 512;          /* <= threshold: copy path */
+
+    zone_reset();
+    live_before = ngx_test_slab_live;
+
+    blob = ngx_http_cache_turbo_blob_alloc(&g_zone, body_len);
+    REQUIRE(blob != NULL, "blob_alloc returned NULL on an unlimited pool");
+
+    /* Mirrors the production gate verbatim (access.c: `if
+     * (clcf->copy_threshold != 0 && body_len <= clcf->copy_threshold)`).
+     * At body_len <= threshold the copy arm runs instead -- an ngx_memcpy
+     * into r->pool, which never touches CT_BLOBREF(blob)->refs -- so no
+     * blob_acquire() call belongs on this branch. */
+    if (threshold != 0 && body_len <= threshold) {
+        /* copy path: intentionally no blob_acquire() call here. */
+    } else {
+        ngx_http_cache_turbo_blob_acquire(blob);
+    }
+
+    CHECK(CT_BLOBREF(blob)->refs == 0,
+          "a body at/under copy_threshold took a shm reference");
+
+    ngx_http_cache_turbo_blob_node_release(&g_zone, blob);
+    CHECK(ngx_test_slab_live == live_before,
+          "node_release with refs == 0 did not free the slab -- the copy "
+          "path must behave exactly like a blob nobody ever pinned");
+    CHECK(ngx_test_lock_balanced(),
+          "the copy-path decision left the zone mutex held");
+}
+
+
+/* body_len > threshold: the pin path DOES take a reference -- the
+ * pre-C2 PERF-7 behaviour, unchanged above the threshold. Paired with the
+ * test above so a broken `<=` (e.g. `<`) fails one side or the other. */
+static void
+test_copy_threshold_large_body_still_takes_a_reference(void)
+{
+    u_char      *blob;
+    ngx_uint_t   live_before;
+    size_t       threshold = 4096;
+    size_t       body_len  = 8192;         /* > threshold: pin path */
+
+    zone_reset();
+    live_before = ngx_test_slab_live;
+
+    blob = ngx_http_cache_turbo_blob_alloc(&g_zone, body_len);
+    REQUIRE(blob != NULL, "blob_alloc returned NULL on an unlimited pool");
+
+    if (threshold != 0 && body_len <= threshold) {
+        /* not exercised in this test */
+    } else {
+        ngx_http_cache_turbo_blob_acquire(blob);
+    }
+
+    CHECK(CT_BLOBREF(blob)->refs == 1,
+          "a body over copy_threshold did not take a shm reference");
+
+    ngx_http_cache_turbo_blob_node_release(&g_zone, blob);
+    CHECK(ngx_test_slab_live == live_before + 1,
+          "node_release freed a blob that still had a server in flight");
+
+    ngx_http_cache_turbo_blob_release(&g_zone, blob);
+    CHECK(ngx_test_slab_live == live_before,
+          "the last server did not free the detached blob");
+    CHECK(ngx_test_lock_balanced(),
+          "the pin-path decision left the zone mutex held");
+}
+
+
+/* copy_threshold == 0 (the shipped off/pre-C2 default): the pin path runs
+ * regardless of how small body_len is. Proves "0 disables the copy path"
+ * is not merely "0 raises the threshold to a small number" -- a body of
+ * ONE byte must still be pinned. */
+static void
+test_copy_threshold_zero_always_pins(void)
+{
+    u_char      *blob;
+    ngx_uint_t   live_before;
+    size_t       threshold = 0;            /* off */
+    size_t       body_len  = 1;            /* smallest possible body */
+
+    zone_reset();
+    live_before = ngx_test_slab_live;
+
+    blob = ngx_http_cache_turbo_blob_alloc(&g_zone, body_len);
+    REQUIRE(blob != NULL, "blob_alloc returned NULL on an unlimited pool");
+
+    if (threshold != 0 && body_len <= threshold) {
+        /* not exercised in this test */
+    } else {
+        ngx_http_cache_turbo_blob_acquire(blob);
+    }
+
+    CHECK(CT_BLOBREF(blob)->refs == 1,
+          "copy_threshold == 0 (off) did not take a shm reference for a "
+          "1-byte body -- 0 must mean \"always pin\", not \"tiny threshold\"");
+
+    ngx_http_cache_turbo_blob_node_release(&g_zone, blob);
+    ngx_http_cache_turbo_blob_release(&g_zone, blob);
+    CHECK(ngx_test_slab_live == live_before,
+          "the last server did not free the detached blob");
+}
+
+
+/* =====================================================================
  * NEGATIVE CONTROL
  *
  * Re-implements each bug against the same fixture and asserts the test's own
@@ -5285,6 +5417,10 @@ main(void)
     test_blob_release_does_not_free_while_still_attached();
     test_blob_multiple_servers_free_exactly_once();
     test_blob_alloc_propagates_slab_exhaustion();
+
+    test_copy_threshold_small_body_takes_no_reference();
+    test_copy_threshold_large_body_still_takes_a_reference();
+    test_copy_threshold_zero_always_pins();
     run_negative_controls();
 
     /* Every node this run allocated must be accounted for. Under ASan a real

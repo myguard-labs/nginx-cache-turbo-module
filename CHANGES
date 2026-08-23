@@ -1,5 +1,22 @@
 Changes with the nginx-cache-turbo-module (unreleased)
 
+    *) Feature: cache_turbo_copy_threshold SIZE (default 0, off) copies a
+       body at/under SIZE into r->pool (ngx_pnalloc+ngx_memcpy, under the
+       zone mutex already held) instead of pinning it with a shm reference
+       for the L1 HIT and plain-STALE serve paths. The pin path
+       (ngx_http_cache_turbo_blob_acquire + a pool cleanup that drops the
+       reference once the response drains) exists to keep a zero-copy
+       pointer valid across eviction/refresh by another worker; for a small
+       body the atomic refcount and cleanup registration cost more than a
+       single memcpy already inside the critical section, though a
+       ci/tools/bench.sh sweep (0/512/4k/16k/64k) could not measure that
+       difference above this box's own run-to-run noise for either of
+       bench.sh's fixed body sizes -- a null result, not a measured win, so
+       it ships opt-in. Off by default (every body pinned, byte-for-byte the
+       pre-existing behaviour); above the threshold, or with the directive
+       unset, behaviour is unchanged. See the Directive synopsis for the
+       sweep detail.
+
     *) Security: cache_turbo_lock_ttl accepted an arbitrary, unbounded time
        value. The single-flight refresh path multiplies it by the live load
        factor and adds the result to the current time (now + lock_ttl) to

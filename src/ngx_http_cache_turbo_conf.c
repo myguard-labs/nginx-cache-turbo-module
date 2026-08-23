@@ -695,9 +695,15 @@ ngx_http_cache_turbo_merge_basic(ngx_http_cache_turbo_loc_conf_t *conf,
 {
     ngx_conf_merge_value(conf->enable, prev->enable, 0);
     ngx_conf_merge_size_value(conf->max_size, prev->max_size, 1024 * 1024);
-    /* C2: placeholder default, replaced with the measured crossover once
-     * the bench.sh sweep (0/512/4k/16k/64k, tiny+medium) reports it -- see
-     * the PR body for the sweep table. 0 = off (always pin). */
+    /* C2: default OFF (0 = always pin). The bench.sh sweep (0/512/4k/16k/64k,
+     * tiny+medium, PASSES=3 -- see the PR body for the full table) could not
+     * resolve a copy-vs-pin rps difference above this box's own run-to-run
+     * spread for either fixed body size: every threshold's [min-max] band
+     * overlaps its neighbours'. A shipped-ON default needs a measured win to
+     * justify moving every operator onto a new code path; a null result does
+     * not clear that bar, however sound the pin path's per-op cost argument
+     * is in theory. The directive is available for an operator who wants to
+     * opt in for a small-body workload. */
     ngx_conf_merge_size_value(conf->copy_threshold, prev->copy_threshold, 0);
     ngx_conf_merge_value(conf->suppress_native, prev->suppress_native, 0);
 

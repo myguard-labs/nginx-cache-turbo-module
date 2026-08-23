@@ -51,6 +51,12 @@
 #           before). KEYS=1 shows +-25% run-to-run spread on a busy box;
 #           PASSES>1 reports median plus min/max spread so a modest
 #           contention win isn't lost in the noise of a single sample.
+#   COPY_THRESHOLD  cache_turbo_copy_threshold value for run C (L1 shm) only
+#           (default: unset, directive omitted -- the shipped 0/off default
+#           applies). Sweep it across runs to find the copy-vs-pin crossover
+#           for a given body size (C2): 0, 512, 4k, 16k, 64k... Run D (L2
+#           Redis) is unaffected -- the copy/pin decision lives on the L1
+#           HIT and plain-STALE paths only.
 #
 # Release binary + dynamic module, the shipped artifact:
 #   eval "$(ci/tools/ci-build.sh nginx 1.31.1 nginx)"   # sets binary= module=
@@ -75,6 +81,14 @@ PASSES="${PASSES:-1}"        # measured passes per size/mode; report median + mi
 case "$PASSES" in ''|*[!0-9]*) echo "FATAL: PASSES must be a positive integer" >&2; exit 2;; esac
 PASSES=$((10#$PASSES))
 [ "$PASSES" -ge 1 ] || { echo "FATAL: PASSES must be >= 1" >&2; exit 2; }
+# C2: cache_turbo_copy_threshold on run C's location only (L1 shm). Unset (the
+# default) omits the directive entirely so a build without the directive still
+# runs; set e.g. COPY_THRESHOLD=4096 to sweep a specific crossover candidate.
+COPY_THRESHOLD="${COPY_THRESHOLD:-}"
+case "$COPY_THRESHOLD" in
+    '') ;;
+    *[!0-9]*) echo "FATAL: COPY_THRESHOLD must be a non-negative integer" >&2; exit 2;;
+esac
 
 command -v wrk >/dev/null 2>&1 || {
     echo "FATAL: wrk not found. apt-get install wrk (or build from github.com/wg/wrk)." >&2
@@ -122,6 +136,10 @@ if [ -n "$REDIS" ]; then
         location = /_cache_d { cache_turbo_admin ctr; allow 127.0.0.1; deny all; }
     }"
 fi
+
+COPY_THRESHOLD_DIRECTIVE=""
+[ -n "$COPY_THRESHOLD" ] && \
+    COPY_THRESHOLD_DIRECTIVE="cache_turbo_copy_threshold $COPY_THRESHOLD;"
 
 LOAD_MODULE=""
 # nginx resolves load_module relative to its prefix (-p $WORK), so the .so
@@ -175,6 +193,7 @@ http {
             cache_turbo        ct;
             cache_turbo_valid  60s;
             cache_turbo_max_size 16m;   # default 1m would refuse the 4M 'large' body
+            $COPY_THRESHOLD_DIRECTIVE
             proxy_pass http://127.0.0.1:$ORIGIN;
         }
         location = /_cache_c { cache_turbo_admin ct; allow 127.0.0.1; deny all; }
