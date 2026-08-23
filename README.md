@@ -86,6 +86,7 @@ a no-op prints exactly the same clean line as one that passes.
   - [Admin endpoint verbs](#admin-endpoint-verbs)
 - [Monitoring (Prometheus + Grafana)](#monitoring-prometheus--grafana)
 - [Redis L2 (shared cache)](#redis-l2-shared-cache)
+  - [What `keepalive=` buys — and what it does not](#what-keepalive-buys--and-what-it-does-not)
   - [memcached L2 (alternative backend)](#memcached-l2-alternative-backend)
 - [Building & the stack](#building--the-stack)
 - [Benchmarking](#benchmarking)
@@ -1804,7 +1805,10 @@ http {
     cache_turbo_zone name=ct 512m;
 
     # cluster-shared L2 in Redis (optional). Inherited by everything below.
-    cache_turbo_redis 127.0.0.1:6379 prefix=ct: timeout=250ms;
+    # keepalive= pools idle Redis conns per worker: fewer connections on the
+    # Redis side, not more throughput. See "Redis L2 (shared cache)".
+    cache_turbo_redis 127.0.0.1:6379 prefix=ct: timeout=250ms
+                      keepalive=32 keepalive_timeout=60s;
 
     server {
         listen 80;
@@ -2243,16 +2247,17 @@ so a whole fleet of nginx boxes share one cache: write-through on store, and one
 
 ```nginx
 # plain
-cache_turbo_redis redis://10.0.0.5:6379/0;
+cache_turbo_redis redis://10.0.0.5:6379/0 keepalive=32 keepalive_timeout=60s;
 
 # with ACL user + password + db 2
-cache_turbo_redis redis://cache:s3cret@10.0.0.5:6379/2;
+cache_turbo_redis redis://cache:s3cret@10.0.0.5:6379/2 keepalive=32 keepalive_timeout=60s;
 
 # TLS (rediss://) — verifies the server cert against the system CA by default
-cache_turbo_redis rediss://redis.internal:6380/0;
+cache_turbo_redis rediss://redis.internal:6380/0 keepalive=32 keepalive_timeout=60s;
 
 # TLS with a private CA, and override the verified name
-cache_turbo_redis rediss://10.0.0.5:6380/0 tls_ca=/etc/ssl/redis-ca.pem tls_name=redis.internal;
+cache_turbo_redis rediss://10.0.0.5:6380/0 tls_ca=/etc/ssl/redis-ca.pem tls_name=redis.internal
+                  keepalive=32 keepalive_timeout=60s;
 ```
 
 The driver pipelines `AUTH` (+ ACL user) and `SELECT <db>` before each command;
@@ -2291,6 +2296,28 @@ trailing option, which **overrides** the DSN:
 > TLS needs nginx built with `--with-http_ssl_module` (the stock `nginx`
 > package is). Without it, a `rediss://` / `tls=on` config is rejected at start.
 > Passwords sit in your nginx config — keep it `chmod 600` / out of git.
+
+### What `keepalive=` buys — and what it does not
+
+`keepalive=` is a **connection-churn knob, not a speed knob.** The default is
+`0` (off), which opens and closes a Redis connection for every L1 miss.
+
+- **What it does:** measured over a 9-point sweep with 3 interleaved repeats,
+  Redis-side `total_connections_received` per run fell from roughly **21-27k**
+  with `keepalive=0` to roughly **6-12k** at `keepalive=32`-`64`, with the
+  `GET` count flat. The reduction is monotone and reproducible. On a busy fleet
+  that is meaningfully less accept/close work and fewer sockets in `TIME_WAIT`
+  on the Redis host.
+- **What it does not do:** it does **not** raise end-to-end throughput. In the
+  same sweep the `keepalive=0` and `keepalive=64` request-rate ranges overlapped
+  completely, and `keepalive=0` was the faster arm in two of three repeat
+  rounds. Do not set it expecting more requests per second.
+
+Pools are per worker **and** per connection profile, so the connections a box
+can hold open is `workers x profiles x keepalive`. Size that product against the
+Redis server's `maxclients` rather than raising `keepalive=` speculatively —
+there is no throughput reward for a larger pool. The per-profile accounting is
+detailed in the per-profile options note above.
 
 ### memcached L2 (alternative backend)
 

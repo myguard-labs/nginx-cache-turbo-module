@@ -292,7 +292,8 @@ http {
                       keepalive=32 keepalive_timeout=60s;
 
     # TLS to a managed Redis instead:
-  # cache_turbo_redis rediss://redis.internal:6380/0;
+  # cache_turbo_redis rediss://redis.internal:6380/0
+  #                   keepalive=32 keepalive_timeout=60s;
     ...
 }
 ```
