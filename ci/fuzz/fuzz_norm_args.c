@@ -52,6 +52,29 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     clcf.normalize_strip     = NGX_CONF_UNSET_PTR;
     g_fuzz_clcf = &clcf;
 
+    /*
+     * R3-1: the arg cap (cache_turbo_normalize_max_args) added a SECOND exit
+     * from this function -- above the cap it skips the sort/strip entirely and
+     * keys the raw arg string through a different allocation and copy. Pinning
+     * the cap to one value would leave one of those two buffer builders
+     * unfuzzed, which is precisely the half a length-driven input is best at
+     * breaking. So the first input byte selects the regime, and the rest is the
+     * query string:
+     *   low bit clear -> 0, unlimited: always normalize (pre-R3-1 behaviour)
+     *   low bit set   -> a small cap (1..8), so ordinary inputs go OVER it and
+     *                    take the raw-args path
+     * The selector byte is consumed, not left in the query string, so a corpus
+     * entry means the same thing on every run.
+     */
+    uint8_t regime = 0;
+    if (size > 0) {
+        regime = data[0];
+        data++;
+        size--;
+    }
+    clcf.normalize_max_args = (regime & 1) ? (ngx_int_t) ((regime >> 1) % 8 + 1)
+                                           : 0;
+
     const uint8_t *args = (size > 0) ? data : NULL;
     size_t         alen = size;
 
