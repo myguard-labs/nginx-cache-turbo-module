@@ -1030,19 +1030,49 @@ def test_ignore_cc_must_revalidate_keeps_stale_window(ng: Nginx,
     read is a hard miss to origin. Inverse of test_must_revalidate (the /mrev/
     honor_cc case).
 
-    !! The 2s fresh TTL is deliberate and paired with the 4s sleep below; see
-    the /ccignmr/ fixture comment. Do not shrink either one independently."""
+    TEST-MICROTTL-ORACLE (2026-08-23), 13th family member (PR #417 missed
+    this one): the immediate re-read below only proves storage, so it accepts
+    HIT or a raced STALE like every other sibling in this file. But plain
+    relaxation is UNSAFE here on its own -- /ccignmr/ has an 8s ABSOLUTE serve
+    life (valid*stale_mult = 2s*4, not fresh + stale on top; see the
+    /ccignmr/ fixture comment), and a slow immediate re-read that lands STALE
+    eats into that 8s budget before the post-sleep read even starts. A flat
+    `sleep(4.0)` after a slow immediate round trip would push the post-sleep
+    read toward the far (8s) side of the deadline, trading a near-side flake
+    (the old bug) for a far-side one (this read becomes a MISS instead of
+    STALE). The fix anchors the sleep to when the entry was actually stored
+    (t_store, captured right after the prime fetch returns) instead of to
+    when the immediate re-read happens to finish, so the post-sleep read
+    always lands at t_store+4s regardless of how long the immediate re-read
+    took. elapsed is then asserted to fall strictly inside the documented
+    (valid, valid*(stale_mult-1)) band -- 2 < elapsed < 6 -- so a box too slow
+    to honor the anchored sleep fails with an explicit timing-precondition
+    message instead of masquerading as "window was collapsed"."""
     uri = "/ccignmr/mustrev"
     fetch(ng.port, uri)                                    # prime (miss, stores)
+    t_store = time.monotonic()                             # TTL clock starts here
     _, _, h1 = fetch(ng.port, uri)
-    assert h1.get("x-cache") == "HIT", \
-        f"ignore_cc must store the must-revalidate response; got {h1.get('x-cache')}"
-    time.sleep(4.0)                                        # past 2s fresh, < 8s deadline
+    assert h1.get("x-cache") in ("HIT", "STALE"), \
+        ("ignore_cc must store the must-revalidate response (HIT or a raced "
+         f"STALE both prove storage); got {h1.get('x-cache')}")
+    # Anchor to t_store, not to when this immediate read finishes: makes the
+    # HIT-or-STALE relaxation above safe against the far (8s) edge -- see the
+    # docstring's TEST-MICROTTL-ORACLE note.
+    time.sleep(max(0.0, t_store + 4.0 - time.monotonic()))
+    elapsed = time.monotonic() - t_store
+    valid, stale_mult = 2.0, 4.0
+    assert valid < elapsed < valid * (stale_mult - 1), \
+        ("TIMING PRECONDITION violated: box too slow to land the anchored "
+         f"read inside the documented ({valid}, {valid * (stale_mult - 1)}) "
+         f"band -- elapsed={elapsed:.3f}s since store. This is an environment "
+         "speed problem, not a module-behaviour failure; do not read the "
+         "assertion below as evidence the stale window collapsed.")
     before = origin.hits
     _, _, h2 = fetch(ng.port, uri)
     assert h2.get("x-cache") == "STALE", \
         ("ignore_cc must keep the stale window (must-revalidate ignored): expected "
-         f"STALE at 4s, got X-Cache={h2.get('x-cache')} — window was collapsed")
+         f"STALE at {elapsed:.3f}s, got X-Cache={h2.get('x-cache')} — window was "
+         "collapsed")
     assert origin.hits == before, \
         "stale serve under ignore_cc unexpectedly hit origin (window collapsed?)"
 
