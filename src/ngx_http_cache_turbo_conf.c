@@ -1411,6 +1411,11 @@ ngx_http_cache_turbo_merge_normalize(ngx_http_cache_turbo_loc_conf_t *conf,
      * bound off by default, which is the point of the directive. */
     ngx_conf_merge_value(conf->normalize_max_args, prev->normalize_max_args,
                          NGX_HTTP_CACHE_TURBO_NORMALIZE_MAX_ARGS_DEFAULT);
+
+    /* R3-3: normalize_strip has its final (inherited or location-overridden)
+     * value as of the assignment above -- build the first-byte bitmap now so
+     * every request through this loc_conf uses the precomputed fast path. */
+    ngx_http_cache_turbo_build_strip_bitmap(conf);
 }
 
 

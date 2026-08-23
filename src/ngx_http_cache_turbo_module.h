@@ -1940,6 +1940,21 @@ typedef struct {
                                                    * defaults; trailing '*' is a
                                                    * prefix match. NULL = none. */
 
+    /* R3-3: first-byte bitmap over the combined denylist (built-in defaults +
+     * normalize_strip), built once at config merge time so the per-request,
+     * per-param fast path in ngx_http_cache_turbo_name_denied can reject a
+     * non-matching first byte with one bit test instead of walking every
+     * pattern. Two 128-bit (16-byte) halves so a byte and its opposite case
+     * both hit -- matching is case-insensitive and names arrive unlowercased.
+     * strip_bitmap_all is set when any pattern in the combined list is the
+     * zero-length prefix "*" (cache_turbo_normalize_strip *), which must match
+     * every name regardless of first byte -- the bitmap is not consulted then.
+     * Built by ngx_http_cache_turbo_build_strip_bitmap(), called once from
+     * merge_loc_conf after normalize_strip has its final (inherited or
+     * overridden) value. */
+    u_char                   strip_bitmap[32];
+    unsigned                 strip_bitmap_all:1;
+
     /* Vary-aware suffix (v3-4). Bitmask of NGX_HTTP_CACHE_TURBO_VARY_* selecting
      * which buckets are appended to $cache_turbo_normalized_args so responses
      * that legitimately differ by encoding (br/gzip/identity) or device

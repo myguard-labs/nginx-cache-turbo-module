@@ -1031,6 +1031,10 @@ ngx_int_t ngx_http_cache_turbo_var_set(ngx_http_request_t *r,
 ngx_int_t ngx_http_cache_turbo_name_denied(ngx_http_cache_turbo_loc_conf_t *clcf,
     u_char *name, size_t nlen);
 ngx_int_t ngx_http_cache_turbo_tok_cmp(const void *one, const void *two);
+/* R3-3: build clcf->strip_bitmap[]/strip_bitmap_all from the combined
+ * built-in + normalize_strip denylist. Config-time only; called once from
+ * ngx_http_cache_turbo_merge_normalize() after normalize_strip is final. */
+void ngx_http_cache_turbo_build_strip_bitmap(ngx_http_cache_turbo_loc_conf_t *clcf);
 
 /* ---- match.c (cookie / query-arg / URI matching group, MAINT-SPLIT) ----
  *
