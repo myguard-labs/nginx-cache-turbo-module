@@ -21,6 +21,39 @@
 #include <ngx_md5.h>
 
 
+/* R5-1 (perf-microtier-hitpath): the module build has no per-addon CFLAGS hook
+ * anywhere in nginx's `auto/module`/`auto/make` — every module object is
+ * compiled with the SAME global $(CFLAGS) as nginx core, in both the
+ * DYNAMIC (.so) and static --add-module arms (verified against the generated
+ * objs/Makefile: our objects and core's use one shared $(CFLAGS) variable).
+ * Appending -fvisibility=hidden to that global CFLAGS in `config` would also
+ * hide nginx core's own symbols in the static-build arm, which is out of
+ * scope and unsafe. Each ngx_http_cache_turbo_*.c wraps ITS OWN body in a
+ * `#pragma GCC visibility push(hidden)` / `pop` instead (see those files) —
+ * that hides every definition in the TU regardless of whether it has a
+ * header prototype, which a header-only pragma does NOT (verified: a pragma
+ * around a declaration hides only definitions whose defining declaration is
+ * textually inside the pushed region; most of this module's internal
+ * functions are declared only by their own definition, with no header
+ * prototype, so a header-level pragma left them exported). Only the nginx
+ * module struct is opted back to default visibility below. nginx's
+ * dynamic-module loader (ngx_load_module in nginx's src/core/nginx.c)
+ * resolves exactly three symbols by name via dlsym(): `ngx_modules`,
+ * `ngx_module_names`, `ngx_module_order`. All three live in the
+ * auto-generated ngx_http_cache_turbo_module_modules.c (nginx's own build
+ * glue, not one of our TUs, so unaffected by any of these pragmas), which
+ * takes `&ngx_http_cache_turbo_module`'s address into that ngx_modules[]
+ * array — a reference resolved by the LINKER at .so-build time, not by a
+ * second dlsym. Empirically (2026-08-24 negative control on this branch),
+ * hiding the struct itself did NOT stop nginx from dlopen()ing and serving
+ * through the module: an intra-DSO, link-time address-of still works when
+ * the referencing TU (_modules.c) and the referenced symbol are linked into
+ * the same .so, regardless of the symbol's own visibility. The attribute
+ * below is kept anyway as defense-in-depth against a future refactor that
+ * moves the struct's only reference behind an actual dlsym() (or into a
+ * different .so), where hidden visibility would silently break loading. */
+
+
 /* Stale window = fresh TTL * (STALE_MULTIPLIER - 1), matching wp-redis. This is
  * the BALANCED-preset stale multiplier; presets override it per-band (v3-2) via
  * the runtime ngx_http_cache_turbo_loc_conf_t.stale_mult field. */
@@ -2644,7 +2677,13 @@ typedef struct {
 } ngx_http_cache_turbo_ctx_t;
 
 
-extern ngx_module_t  ngx_http_cache_turbo_module;
+/* Must stay default-visibility: the auto-generated
+ * ngx_http_cache_turbo_module_modules.c (nginx's own build glue, not one of
+ * our TUs) takes this struct's address into the ngx_modules[] array that
+ * nginx's dynamic-module loader resolves by dlsym() name. See the pragma
+ * block at the top of this header for the visibility-scoping rationale. */
+extern ngx_module_t  ngx_http_cache_turbo_module
+    __attribute__((visibility("default")));
 
 
 /* ---- shm.c ---- */

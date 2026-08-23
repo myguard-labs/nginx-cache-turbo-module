@@ -10,6 +10,16 @@
 
 #include "ngx_http_cache_turbo_module.h"
 
+/* R5-1 (perf-microtier-hitpath): default-hide every symbol this TU defines
+ * so a module-internal call becomes a direct call instead of a PLT-indirect
+ * one (see ngx_http_cache_turbo_module.h for why this is a per-file pragma
+ * rather than a global -fvisibility=hidden CFLAGS addition, and why a
+ * header-only pragma does not work). Anything in this file that nginx's
+ * dynamic-module loader must resolve by name gets an explicit
+ * __attribute__((visibility("default"))) at its definition, overriding this
+ * pragma (GCC: an explicit attribute always wins over the pragma). */
+#pragma GCC visibility push(hidden)
+
 
 /*
  * Compute the stale-TTL given a fresh-TTL and the (preset-resolved) stale
@@ -142,3 +152,5 @@ ngx_http_cache_turbo_should_refresh(u_char *key_hash, time_t fresh_until,
 
     return (dice < threshold) ? NGX_OK : NGX_DECLINED;
 }
+
+#pragma GCC visibility pop

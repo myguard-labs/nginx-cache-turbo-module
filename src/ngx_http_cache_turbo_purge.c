@@ -42,6 +42,16 @@
 #include "ngx_http_cache_turbo_module.h"
 #include "ngx_http_cache_turbo_internal.h"
 
+/* R5-1 (perf-microtier-hitpath): default-hide every symbol this TU defines
+ * so a module-internal call becomes a direct call instead of a PLT-indirect
+ * one (see ngx_http_cache_turbo_module.h for why this is a per-file pragma
+ * rather than a global -fvisibility=hidden CFLAGS addition, and why a
+ * header-only pragma does not work). Anything in this file that nginx's
+ * dynamic-module loader must resolve by name gets an explicit
+ * __attribute__((visibility("default"))) at its definition, overriding this
+ * pragma (GCC: an explicit attribute always wins over the pragma). */
+#pragma GCC visibility push(hidden)
+
 
 /* COR-5 helper: invalidate every auto-Vary variant of the base URI just
  * purged. Variants are stored under variant keys (base material + the
@@ -437,3 +447,5 @@ ngx_http_cache_turbo_tag_purge_complete(ngx_http_request_t *r, void *data,
 
     return ngx_http_cache_turbo_send_json(r, NGX_HTTP_OK, &body);
 }
+
+#pragma GCC visibility pop

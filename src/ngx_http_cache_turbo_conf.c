@@ -16,6 +16,16 @@
 #include "ngx_http_cache_turbo_module.h"
 #include "ngx_http_cache_turbo_internal.h"
 
+/* R5-1 (perf-microtier-hitpath): default-hide every symbol this TU defines
+ * so a module-internal call becomes a direct call instead of a PLT-indirect
+ * one (see ngx_http_cache_turbo_module.h for why this is a per-file pragma
+ * rather than a global -fvisibility=hidden CFLAGS addition, and why a
+ * header-only pragma does not work). Anything in this file that nginx's
+ * dynamic-module loader must resolve by name gets an explicit
+ * __attribute__((visibility("default"))) at its definition, overriding this
+ * pragma (GCC: an explicit attribute always wins over the pragma). */
+#pragma GCC visibility push(hidden)
+
 /* Log config error and return NGX_CONF_ERROR. Replaces the idiomatic
  * ngx_conf_log_error(...); return NGX_CONF_ERROR; pattern to reduce noise
  * at call sites. Defined here, above every use: a macro has no forward
@@ -3454,3 +3464,5 @@ ngx_http_cache_turbo_ignore_set_cookie_conf(ngx_conf_t *cf, ngx_command_t *cmd,
 
     return NGX_CONF_OK;
 }
+
+#pragma GCC visibility pop

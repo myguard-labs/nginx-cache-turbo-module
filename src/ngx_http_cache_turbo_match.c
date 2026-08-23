@@ -35,6 +35,16 @@
 #include "ngx_http_cache_turbo_module.h"
 #include "ngx_http_cache_turbo_internal.h"
 
+/* R5-1 (perf-microtier-hitpath): default-hide every symbol this TU defines
+ * so a module-internal call becomes a direct call instead of a PLT-indirect
+ * one (see ngx_http_cache_turbo_module.h for why this is a per-file pragma
+ * rather than a global -fvisibility=hidden CFLAGS addition, and why a
+ * header-only pragma does not work). Anything in this file that nginx's
+ * dynamic-module loader must resolve by name gets an explicit
+ * __attribute__((visibility("default"))) at its definition, overriding this
+ * pragma (GCC: an explicit attribute always wins over the pragma). */
+#pragma GCC visibility push(hidden)
+
 
 /* >>> FUZZ-EXTRACT auto-classify BEGIN (ci/fuzz/extract_auto_classify.sh) <<< */
 /*
@@ -1494,3 +1504,5 @@ ngx_http_cache_turbo_cookie_lookup(ngx_http_request_t *r, ngx_str_t *name,
 
     return 0;
 }
+
+#pragma GCC visibility pop
