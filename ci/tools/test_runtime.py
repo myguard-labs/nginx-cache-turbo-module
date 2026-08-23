@@ -270,6 +270,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_cc_mode_inheritance_child_preset_overrides_parent_ignore(ng, origin)
     test_no_store(ng)
     test_native_cache_headers_stripped(ng)
+    test_many_headers_survive_list_part_spill(ng)
     test_admin_purge_post_with_body(ng)
     test_concurrent_hits_no_deadlock(ng)
     test_lru_eviction(ng)

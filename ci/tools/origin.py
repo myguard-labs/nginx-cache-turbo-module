@@ -760,6 +760,23 @@ class Origin:
                     # still comes from cache_turbo_valid and this marker only
                     # exercises the SS3.5 permission, nothing else.
                     self.send_header("Cache-Control", "public")
+                if "manyhdr" in self.path:
+                    # R4-1: nginx sizes r->headers_out.headers at 20 entries
+                    # per ngx_list_t part, so >20 stored headers force the list
+                    # to SPILL into a second part. The store path's admissibility
+                    # verdict cache indexes its bitmap positionally across that
+                    # part boundary, and an off-by-one in the part transition
+                    # would misalign the measure and emit walks -- silently
+                    # dropping or admitting the wrong header. Emit enough to
+                    # cross the boundary twice, each with a distinct value so a
+                    # shifted verdict shows up as a wrong/missing value, not
+                    # just a wrong count. One skip-listed header (Age) is mixed
+                    # in so the bitmap is not uniformly 1s: a broken index that
+                    # happened to read a neighbouring set bit would still pass
+                    # an all-admissible fixture.
+                    for _i in range(45):
+                        self.send_header(f"X-Many-{_i:02d}", f"v-{_i:02d}")
+                    self.send_header("Age", "123")
                 if "nativecache" in self.path:
                     # mimic a native nginx cache (proxy_cache) sitting behind us
                     self.send_header("Age", "123")
