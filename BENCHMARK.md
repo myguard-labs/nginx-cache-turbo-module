@@ -422,12 +422,12 @@ Separately, the module forces **additional blocks only for bodies exceeding
 (`NGX_HTTP_CACHE_TURBO_SERVE_CHUNK = 32 KB`). Those consume ~96 bytes per
 extra 32 KB chunk and are unaffected by the 8 KB tuning above.
 
-**Cost-benefit:** The tradeoff is a baseline 4 KB → 8 KB growth in every
-request's pool (even non-cached requests and misses). Measure whether this pays
-off on your traffic mix (header set, typical body sizes, requests-per-second)
-before deploying. The saving is one allocation per request, which is
-measurable in high-throughput scenarios but depends on your allocator, OS, and
-concurrent request count.
+**Cost-benefit:** The tuning applies to all requests — cached or not — making
+it measurable in high-throughput scenarios. The tradeoff is a baseline 4 KB →
+8 KB growth in every request's pool (even non-cached requests and misses).
+Measure whether this pays off on your traffic mix (header set, typical body
+sizes, requests-per-second) before deploying. The outcome depends on your
+allocator, OS, and concurrent request count.
 
 ---
 

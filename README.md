@@ -1642,12 +1642,12 @@ bodies exceeding 65,536 bytes (a third 32 KB output chunk). Those cost ~96
 bytes per extra 32 KB chunk and are unaffected by the 8 KB tuning above — size
 the pool for your typical response, then budget additional chunks for outliers.
 
-That single tuning saves **one `malloc` per request, cached or not**, which is
-meaningful at scale. The tradeoff is baseline request-memory growth (nginx
-itself grows 4 KB → 8 KB); measure whether it pays off on your header set and
-body distribution. Figures above are measured on nginx 1.31.3 at the
-compiled-in default, and are host- and header-set dependent — yours may differ.
-For details and full allocation breakdown, see
+This tuning applies to all requests — cached or not — making it meaningful at
+scale. The tradeoff is baseline request-memory growth (nginx itself grows 4 KB
+→ 8 KB); measure whether it pays off on your header set and body distribution.
+Figures above are measured on nginx 1.31.3 at the compiled-in default, and are
+host- and header-set dependent — yours may differ. For details and full
+allocation breakdown, see
 [Benchmarking](BENCHMARK.md#pool-consumption-per-request).
 
 ## Scan-resistant eviction: `cache_turbo_scan_resistant`
