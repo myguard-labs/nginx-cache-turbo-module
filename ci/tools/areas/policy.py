@@ -1020,7 +1020,10 @@ def test_ignore_cc_must_revalidate_keeps_stale_window(ng: Nginx,
     """cache_turbo_cache_control ignore must neutralise the WHOLE response
     Cache-Control, including the must-revalidate token that would otherwise
     collapse the stale window at store. The origin emits
-    "max-age=1, must-revalidate"; under /ccignmr/ (ignore_cc on, valid 2s, default
+    "max-age=4, must-revalidate" (the shared "mustrev" marker, widened from
+    max-age=1 by TEST-MICROTTL-ORACLE for /mrev/'s sake -- irrelevant here
+    precisely BECAUSE ignore_cc neutralises the whole header, which is the
+    property under test); under /ccignmr/ (ignore_cc on, valid 2s, default
     stale_mult 4 => 8s total serve life = 2s fresh + 6s stale) the entry must
     still be STALE-served at ~4s. Without the fix (must-revalidate parsed despite
     ignore_cc) the serve deadline collapses to the 2s fresh deadline and the 4s
