@@ -175,6 +175,7 @@ LOCATION_BLOCK='location / { add_header Cache-Control "max-age=600"; }'
 KEY_ENCODED_DIRECTIVE=''
 MAP_BLOCK=''
 if [ -n "$VARY" ]; then
+    # shellcheck disable=SC2016  # $ct_ae_class is an nginx map variable, resolved by nginx at request time, not by the shell
     LOCATION_BLOCK='location / { add_header Cache-Control "max-age=600"; add_header Vary "Accept-Encoding"; add_header Content-Encoding $ct_ae_class; }'
     KEY_ENCODED_DIRECTIVE='
             cache_turbo_key_encoded_origin on;'
