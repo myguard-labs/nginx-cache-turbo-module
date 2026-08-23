@@ -81,6 +81,18 @@ bash "$DIR/extract_key_fold.sh"
 "$CC" $CFLAGS "$DIR/test_digest_fail.c" -o "$DIR/test_digest_fail" -lssl -lcrypto
 "$DIR/test_digest_fail"
 
+# --- cached EVP_MD_fetch() byte-identity (C0, PLAN-hitpath-2026-08-23.md) --
+# The digest is the cache key (including the L2 wire key), so the new
+# worker-persistent EVP_MD_fetch() path must be byte-identical to the old
+# per-call EVP_sha256() path. Pins the REAL production digest_init/_update/
+# _final/_digest (sliced verbatim by extract_digest.sh) against independently
+# computed SHA-256 vectors, and against each other via the
+# ngx_http_cache_turbo_test_fetch_md_fail fault knob.
+# shellcheck disable=SC2086
+bash "$DIR/extract_digest.sh"
+"$CC" $CFLAGS "$DIR/test_digest.c" -o "$DIR/test_digest" -lssl -lcrypto
+"$DIR/test_digest"
+
 FUZZ_DIR="$DIR/../../fuzz"
 BLOB_CC="${BLOB_CC:-clang}"
 if command -v "$BLOB_CC" >/dev/null 2>&1; then

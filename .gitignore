@@ -26,6 +26,8 @@ ci/tests/unit/test_shm_state.san
 ci/tests/unit/test_frame_scan
 ci/tests/unit/test_frame_scan.san
 ci/tests/unit/test_digest_fail
+ci/tests/unit/test_digest
+ci/tests/unit/generated_digest.inc
 ci/tests/unit/test_key_fold
 ci/tests/unit/generated_key_fold.inc
 ci/tests/unit/test_vary_marker_fastpath

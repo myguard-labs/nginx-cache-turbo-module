@@ -68,13 +68,41 @@
  *
  * Non-static (declared `extern` in the internal header): module.c's
  * exit_process previously freed it directly; now exit_process itself lives
- * here too, but the symbol stays external in case another TU needs it. */
+ * here too, but the symbol stays external in case another TU needs it.
+ *
+ * C0: the SAME lazy-not-init_process reasoning above governs
+ * ngx_http_cache_turbo_worker_sha256 just below. EVP_sha256() returns a
+ * legacy EVP_ORIG_GLOBAL handle, so on OpenSSL 3.x every EVP_DigestInit_ex()
+ * call implicitly does a provider FETCH (property-string parse + hashtable
+ * lookup) even though the algorithm never changes. Fetching the EVP_MD*
+ * ONCE per worker and reusing it removes that repeated lookup from the hit
+ * path. It is worker-persistent and lazily created for the identical
+ * reason as the ctx: a digest can be issued before worker fork (config-time
+ * key derivation), so an init_process hook would miss that call. Freed
+ * alongside the ctx in exit_process. */
 EVP_MD_CTX  *ngx_http_cache_turbo_worker_md;
+
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L && !defined(LIBRESSL_VERSION_NUMBER)
+/* EVP_MD_fetch() does not exist before OpenSSL 3.0 and LibreSSL does not
+ * implement the 3.0 provider API at all, so this whole cached-fetch path is
+ * compiled out on both -- digest_init() below falls back to today's
+ * EVP_sha256() call unconditionally in that case, byte-identical to the
+ * pre-C0 code. */
+EVP_MD  *ngx_http_cache_turbo_worker_sha256;
+#endif
 #endif
 
 #if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
     && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
 static ngx_uint_t  ngx_http_cache_turbo_test_digest_fail = 0;
+#if (NGX_SSL) && OPENSSL_VERSION_NUMBER >= 0x30000000L \
+    && !defined(LIBRESSL_VERSION_NUMBER)
+/* C0 negative control: make digest_init() behave as though the worker's
+ * cached EVP_MD_fetch() had returned NULL, without needing to fake OpenSSL
+ * itself -- proves the fallback to EVP_sha256() takes over and still
+ * produces the identical digest. */
+static ngx_uint_t  ngx_http_cache_turbo_test_fetch_md_fail = 0;
+#endif
 #endif
 
 
@@ -86,13 +114,46 @@ void
 ngx_http_cache_turbo_digest_init(ngx_http_cache_turbo_digest_t *d)
 {
 #if (NGX_SSL)
+    const EVP_MD  *md_type;
+
     if (ngx_http_cache_turbo_worker_md == NULL) {
         ngx_http_cache_turbo_worker_md = EVP_MD_CTX_new();
     }
 
     d->md = ngx_http_cache_turbo_worker_md;
+
+    /* Default / no-guard / failed-fetch fallback: today's call, unchanged. */
+    md_type = EVP_sha256();
+
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L && !defined(LIBRESSL_VERSION_NUMBER)
+    {
+        EVP_MD  *fetched;
+
+        if (ngx_http_cache_turbo_worker_sha256 == NULL) {
+            ngx_http_cache_turbo_worker_sha256 = EVP_MD_fetch(NULL, "SHA2-256",
+                                                                NULL);
+        }
+
+        fetched = ngx_http_cache_turbo_worker_sha256;
+
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+        if (ngx_http_cache_turbo_test_fetch_md_fail) {
+            fetched = NULL;
+        }
+#endif
+
+        /* A NULL fetch (real OOM/provider-load failure, or the test knob
+         * above) is a degraded-but-correct path, not an error: md_type
+         * stays EVP_sha256() and the request is served exactly as before. */
+        if (fetched != NULL) {
+            md_type = fetched;
+        }
+    }
+#endif
+
     d->ok = (d->md != NULL
-             && EVP_DigestInit_ex(d->md, EVP_sha256(), NULL) == 1) ? 1 : 0;
+             && EVP_DigestInit_ex(d->md, md_type, NULL) == 1) ? 1 : 0;
 #else
     static const u_char  tag[] = "ngx_http_cache_turbo\x1Fhi";
 
@@ -178,6 +239,13 @@ ngx_http_cache_turbo_exit_process(ngx_cycle_t *cycle)
         EVP_MD_CTX_free(ngx_http_cache_turbo_worker_md);
         ngx_http_cache_turbo_worker_md = NULL;
     }
+
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L && !defined(LIBRESSL_VERSION_NUMBER)
+    if (ngx_http_cache_turbo_worker_sha256 != NULL) {
+        EVP_MD_free(ngx_http_cache_turbo_worker_sha256);
+        ngx_http_cache_turbo_worker_sha256 = NULL;
+    }
+#endif
 #endif
 }
 
