@@ -4829,8 +4829,35 @@ ngx_http_cache_turbo_normalized_args_variable(ngx_http_request_t *r,
         return NGX_OK;
     }
 
-    /* Stable alpha sort so ?b=2&a=1 and ?a=1&b=2 normalize identically. */
-    ngx_sort(toks, kept, sizeof(ngx_str_t), ngx_http_cache_turbo_tok_cmp);
+    /* Stable alpha sort so ?b=2&a=1 and ?a=1&b=2 normalize identically.
+     *
+     * R3-2: open-coded rather than ngx_sort(). ngx_sort() (nginx
+     * src/core/ngx_string.c) is exactly this insertion sort, but it ngx_alloc()s
+     * and ngx_free()s a `size`-byte scratch slot -- here 16 bytes,
+     * sizeof(ngx_str_t) -- on EVERY call, i.e. a real malloc/free pair per
+     * request on a key path nginx otherwise keeps allocation-free. A stack temp
+     * removes the pair. Two further consequences of dropping ngx_sort():
+     *   - ngx_sort() silently returns the array UNSORTED if that ngx_alloc()
+     *     fails, which would have produced an order-dependent (i.e. inconsistent)
+     *     cache key under memory pressure. This cannot fail.
+     *   - it no longer needs ngx_cycle->log to be valid.
+     * The loop shape and the comparison (`cmp(prev, tmp) > 0`, strictly greater,
+     * so equal elements keep their relative order) are ngx_sort()'s verbatim, so
+     * the resulting order -- and therefore the cache key -- is byte-identical
+     * for every input. */
+    for (i = 1; i < kept; i++) {
+        ngx_str_t  tmp = toks[i];
+        ngx_uint_t j = i;
+
+        while (j > 0
+               && ngx_http_cache_turbo_tok_cmp(&toks[j - 1], &tmp) > 0)
+        {
+            toks[j] = toks[j - 1];
+            j--;
+        }
+
+        toks[j] = tmp;
+    }
 
     total += 1 + (kept - 1);                  /* leading '?' + '&' separators  */
     total += vlen;                            /* Vary suffix (v3-4)            */

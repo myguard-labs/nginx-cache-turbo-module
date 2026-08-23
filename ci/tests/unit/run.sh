@@ -63,6 +63,19 @@ bash "$DIR/extract_key_fold.sh"
 "$CC" $CFLAGS "$DIR/test_key_fold.c" -o "$DIR/test_key_fold" -lssl -lcrypto
 "$DIR/test_key_fold"
 
+# --- open-coded query-token sort, byte-identity vs ngx_sort (R3-2) --------
+# The sort's output IS the cache key, so replacing ngx_sort() (which
+# malloc/free'd a 16-byte scratch slot per request on the key path) with an
+# open-coded insertion sort using a stack temp must not move a single element.
+# Differentially compares the REAL loop, sliced verbatim out of src/ by
+# extract_tok_sort.sh, against a verbatim ngx_sort() replica on adversarial and
+# randomized inputs -- comparing ngx_str_t FIELDS, so a stability regression
+# (same bytes, different source offset) is caught too.
+bash "$DIR/extract_tok_sort.sh"
+# shellcheck disable=SC2086
+"$CC" $CFLAGS "$DIR/test_tok_sort.c" -o "$DIR/test_tok_sort"
+"$DIR/test_tok_sort"
+
 # --- auto-Vary marker fast-path magic/version gate (P1-6) ------------------
 # Mirror of the old blob_validate()-gated read vs. the new cheap
 # magic+version+length gate in ngx_http_cache_turbo_vary_apply() -- proves
