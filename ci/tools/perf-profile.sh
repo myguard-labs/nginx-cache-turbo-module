@@ -291,11 +291,18 @@ top_syms="$(awk '
     NF >= 4 && $1 ~ /^[0-9.]+%$/ { print; n++; if (n>=15) exit }
 ' "$report_txt")"
 
+# Counts BOTH forms perf uses for "could not resolve": a `[unknown]` row (no
+# DSO mapping covers the sample IP at all) AND a bare `0x...` symbol column
+# (perf DID find the owning DSO but that DSO's own symtab has no entry
+# there -- e.g. a stripped local/static symbol only debuginfod-fetched debug
+# info can name). Before the `$3 ~ /^0x/` arm was added here, the latter case
+# undercounted this metric to 0.00% while such a row sat in the top-15 self-
+# time list -- see PERF-PROFILE.md's "unresolved_symbol_pct" note.
 unresolved_pct="$(awk '
     /^#/ {next}
     NF >= 4 && $1 ~ /^[0-9.]+%$/ {
         sym=$0
-        if (sym ~ /\[unknown\]/ || sym ~ /unknown/) { sub("%","",$1); s+=$1 }
+        if (sym ~ /\[unknown\]/ || sym ~ /unknown/ || $3 ~ /^0x[0-9a-fA-F]+$/) { sub("%","",$1); s+=$1 }
     }
     END { printf "%.2f", s+0 }
 ' "$report_txt")"

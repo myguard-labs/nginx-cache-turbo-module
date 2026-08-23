@@ -42,9 +42,32 @@ Hit ratio verified from `cache_turbo_hits_total` /
 `cache_turbo_misses_total` / `cache_turbo_stale_serves_total` deltas around
 each `wrk` pass — 100.00 % in all three, i.e. every sampled request really was
 an L1 hit and this is genuinely the hit path, not a miss/origin path in
-disguise. `perf report`'s own `unresolved_symbol_pct` (`[unknown]` frames) was
-0.00 % in every run — symbols fully resolved, the `-g -fno-omit-frame-pointer`
-profile build did its job.
+disguise.
+
+**`unresolved_symbol_pct` 0.00 % was measuring something narrower than its
+name implies, not "symbols fully resolved".** The metric
+(`ci/tools/perf-profile.sh:294-301` as of 2026-08-19) only summed rows whose
+symbol column literally contained `[unknown]` or the substring `unknown` —
+the case where a sample's IP falls in NO mapped DSO at all. It never matched
+a row like `0x000000000026368a`: `perf` DID resolve that address to a DSO
+(`libcrypto.so.3`, confirmed below), it just had no name for it because the
+installed `.so` ships stripped of that local symbol — `perf`'s own
+convention for "DSO known, symbol unknown" is a bare hex address, which
+contains neither `[unknown]` nor `unknown` and was invisible to the old
+filter. So the genuinely-unresolved 13.53%-self-time row below (2026-08-19
+run A) sat in the top 15 while the script reported 0.00% unresolved for that
+same run — the metric was correct for what it checks (no-DSO-mapping
+frames) but that check is a strict subset of "unresolved symbol", and the
+name promised the wider claim. Fixed in this PR
+(`ci/tools/perf-profile.sh` now also matches a bare `0x[0-9a-f]+` symbol
+column). Confirmed on an unrelated **2026-08-23 M1 re-run** (fresh `perf
+record`, same profile build shape, box-condition-dependent so not
+numerically comparable to 2026-08-19 — see "13.53% is box-condition
+dependent" in PLAN-hitpath-2026-08-23.md): the same address still appears,
+now at 1.62% self-time, and the fixed metric reports
+`unresolved_symbol_pct=11.32` (283 unresolved rows that run, all mapping
+into `libcrypto.so.3`; see below), correctly nonzero where the old formula
+said 0.00%.
 
 Run A (`WORKERS=1`) is the baseline: with a single worker nothing else can
 ever hold the zone mutex, so it can only show the LOCK'S OWN UNCONTENDED
@@ -58,7 +81,7 @@ genuinely race for the same shared-memory zone mutex — the only way P4-1's
 Run A (`WORKERS=1`, uncontended — for reference only, no lock signal to read):
 
 ```text
-13.53%  0x000000000026368a           (unresolved-but-mapped; see note below)
+13.53%  ossl_fnv1a_hash [libcrypto.so.3]   (was: 0x...26368a, see note below)
  7.79%  ngx_http_parse_header_line
  7.22%  _int_malloc
  6.66%  ngx_http_cache_turbo_add_header
@@ -71,6 +94,47 @@ Run A (`WORKERS=1`, uncontended — for reference only, no lock signal to read):
  ...
  (ngx_shmtx_lock/unlock/wakeup combined: 0.73%, not in top 15)
 ```
+
+**Resolved (M1, 2026-08-23):** `0x000000000026368a` is `ossl_fnv1a_hash`,
+`crypto/hashtable/hashfunc.c:20` in `libcrypto.so.3` (Debian
+`libssl3t64` 3.5.6-1~deb13u2, build ID `b3fddf655e166a9e68483b6a9125ce717013e7c0`
+— matches the box's installed `/usr/lib/x86_64-linux-gnu/libcrypto.so.3`
+byte for byte). `nm -D` on that `.so` has no entry for the address or the
+name — it is a local/static symbol, stripped from the shared object's
+dynamic symbol table, which is why `perf`'s own resolver (which only reads
+a DSO's own symtab) could map the sample to the DSO but not to a name.
+Proved via `debuginfod.debian.net` with no package install:
+
+```console
+$ DEBUGINFOD_URLS=https://debuginfod.debian.net \
+    eu-addr2line -f -e /usr/lib/x86_64-linux-gnu/libcrypto.so.3 0x26368a
+ossl_fnv1a_hash
+./build_shared/../crypto/hashtable/hashfunc.c:20:14
+```
+
+Cross-checked against `perf report -i perf.data --sort=dso,symbol -g none
+--no-children`, which places the same address under the `libcrypto.so.3` DSO
+group — confirming `perf` had the DSO mapping all along and only lacked the
+name. `debuginfod-find` itself is not installed on this box; `eu-addr2line`
+(elfutils, already present) speaks the debuginfod protocol directly via
+`DEBUGINFOD_URLS`, so no `apt-get` was needed.
+
+**Is this the cache-key digest? NO.** `ossl_fnv1a_hash` is OpenSSL 3.x's
+internal hashtable hash function (`crypto/property/property.c`'s
+`lh_QUERY_hfn_thunk` and friends use the same table implementation), used by
+libcrypto's property/provider-fetch machinery to look up an algorithm
+implementation by name — not the SHA-256 compression itself
+(`sha256_block_data_order`, a *separate* unresolved-hex row in the same
+run, 1.21% self-time on the 2026-08-23 re-run). `cache_turbo`'s cache-key
+digest calls `EVP_sha256()` + `EVP_DigestInit_ex()` on every request
+(`src/ngx_http_cache_turbo_blob.c:95`, `ngx_http_cache_turbo_digest_init()`,
+on the hit path via `ngx_http_cache_turbo_digest()`); in OpenSSL 3.x that
+convenience path re-resolves the SHA-256 provider implementation through a
+libctx hashtable lookup on *every call* rather than caching a
+once-fetched `EVP_MD *`, and `ossl_fnv1a_hash` is that lookup's hash
+function — so the cost is real and is downstream of the digest call site,
+but it is OpenSSL 3's per-call provider-fetch tax, not digest computation.
+Left as a D3 design-fork input, not actioned here (M1 is resolve-only).
 
 Run B (`WORKERS=8`, wrk `-c32`):
 
