@@ -185,6 +185,14 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       offsetof(ngx_http_cache_turbo_loc_conf_t, max_size),
       NULL },
 
+    /* C2: 0 = off (always pin, the pre-C2 behaviour). */
+    { ngx_string("cache_turbo_copy_threshold"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_size_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_turbo_loc_conf_t, copy_threshold),
+      NULL },
+
     { ngx_string("cache_turbo_suppress_native"),
       NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_FLAG,
       ngx_conf_set_flag_slot,
@@ -5109,6 +5117,7 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
                                                      * resolved lazily at
                                                      * request time */
     conf->max_size = NGX_CONF_UNSET_SIZE;
+    conf->copy_threshold = NGX_CONF_UNSET_SIZE;  /* C2; merges below */
     conf->suppress_native = NGX_CONF_UNSET;
     conf->redis_enable = NGX_CONF_UNSET;
     conf->memcached = NGX_CONF_UNSET;

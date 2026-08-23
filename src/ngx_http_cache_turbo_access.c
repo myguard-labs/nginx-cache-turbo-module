@@ -836,25 +836,49 @@ ngx_http_cache_turbo_varidx_reissue(ngx_http_request_t *r,
  * ctx->brk_only away before the caller reaches here).
  *
  * ⚠ LOCK WINDOW: entered with z->shpool->mutex HELD (the caller's lock from
- * the lookup above); this helper is the one that unlocks it, then pins the
- * blob with a refcount BEFORE unlocking (ngx_http_cache_turbo_blob_acquire),
- * so the pointer handed to serve() stays valid across the unlock -- eviction
- * or refresh by any other worker after the unlock only drops the shared
- * slab slot, never this ref. Always terminal (NGX_DONE): the caller must not
- * touch the mutex or `ctn` again after this returns. */
+ * the lookup above); this helper is the one that unlocks it. C2: at/under
+ * cache_turbo_copy_threshold, it memcpy's the body into r->pool BEFORE
+ * unlocking and takes no reference at all; above the threshold (the
+ * pre-C2 default), it pins the blob with a refcount BEFORE unlocking
+ * (ngx_http_cache_turbo_blob_acquire), so the pointer handed to serve()
+ * stays valid across the unlock -- eviction or refresh by any other worker
+ * after the unlock only drops the shared slab slot, never this ref. Always
+ * terminal (NGX_DONE): the caller must not touch the mutex or `ctn` again
+ * after this returns. */
 static ngx_int_t
 ngx_http_cache_turbo_access_l1_serve_fresh(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx,
     ngx_http_cache_turbo_zone_t *z, ngx_http_cache_turbo_node_t *ctn,
     time_t now, uint32_t hash, ngx_int_t *out_rc)
 {
-    /* PERF-7 fresh hit: serve the blob DIRECTLY out of shm (zero-copy).
-     * Pin it with a reference under the mutex we already hold; the serve
-     * path registers a pool cleanup that drops the ref once the response
-     * has drained, so eviction/refresh by any worker is safe meanwhile. */
     u_char *body = ctn->data;
     size_t  body_len = ctn->len;
-    ngx_http_cache_turbo_blob_acquire(body);
+    u_char *ref_data = body;
+
+    /* C2: a body at/under cache_turbo_copy_threshold is cheaper to copy
+     * into r->pool now -- one ngx_memcpy, already inside the critical
+     * section -- than to pin: no blob_acquire, no ngx_pool_cleanup_add,
+     * no second mutex acquisition on release. Above the threshold (or
+     * copy_threshold == 0, the off/pre-C2 default), PERF-7 zero-copy pin:
+     * acquire a reference under the mutex we already hold; the serve path
+     * registers a pool cleanup that drops it once the response has
+     * drained, so eviction/refresh by any worker is safe meanwhile. */
+    if (clcf->copy_threshold != 0 && body_len <= clcf->copy_threshold) {
+        u_char *copy = ngx_pnalloc(r->pool, body_len);
+
+        if (copy == NULL) {
+            ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
+            *out_rc = NGX_ERROR;
+            return NGX_DONE;
+        }
+        ngx_memcpy(copy, body, body_len);
+        body = copy;
+        ref_data = NULL;
+
+    } else {
+        ngx_http_cache_turbo_blob_acquire(body);
+    }
+
     /* True LRU: promote this node to the head on access, so eviction
      * targets the genuinely least-recently-used entry (not the oldest by
      * insertion/refresh). P1: coarse-gate the splice — skip the LRU WRITE
@@ -880,7 +904,7 @@ ngx_http_cache_turbo_access_l1_serve_fresh(ngx_http_request_t *r,
                    "cache_turbo: L1 HIT (fresh) \"%V\" key=%ui len=%uz",
                    &r->uri, (ngx_uint_t) hash, body_len);
 
-    *out_rc = ngx_http_cache_turbo_serve(r, body, body_len, 0, z, body,
+    *out_rc = ngx_http_cache_turbo_serve(r, body, body_len, 0, z, ref_data,
               NULL);
     return NGX_DONE;
 }
@@ -1159,18 +1183,38 @@ ngx_http_cache_turbo_access_l1_serve_stale(ngx_http_request_t *r,
 
     /* serve stale, no regeneration on this request */
     {
-        /* PERF-7: zero-copy stale serve (see the fresh-hit path). */
+        /* PERF-7: zero-copy stale serve (see the fresh-hit path). C2: same
+         * copy-vs-pin decision as the fresh-hit path -- at/under
+         * cache_turbo_copy_threshold, memcpy into r->pool and take no
+         * reference; above it (or the off/pre-C2 default), pin as before. */
         u_char *body = ctn->data;
         size_t  body_len = ctn->len;
-        ngx_http_cache_turbo_blob_acquire(body);
+        u_char *ref_data = body;
+
+        if (clcf->copy_threshold != 0 && body_len <= clcf->copy_threshold) {
+            u_char *copy = ngx_pnalloc(r->pool, body_len);
+
+            if (copy == NULL) {
+                ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
+                *out_rc = NGX_ERROR;
+                return NGX_DONE;
+            }
+            ngx_memcpy(copy, body, body_len);
+            body = copy;
+            ref_data = NULL;
+
+        } else {
+            ngx_http_cache_turbo_blob_acquire(body);
+        }
+
         ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
         (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->stale_serves, 1);
         ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "cache_turbo: STALE serve \"%V\" key=%ui len=%uz",
                        &r->uri, (ngx_uint_t) hash, body_len);
 
-        *out_rc = ngx_http_cache_turbo_serve(r, body, body_len, 1, z, body,
-                  NULL);
+        *out_rc = ngx_http_cache_turbo_serve(r, body, body_len, 1, z,
+                  ref_data, NULL);
         return NGX_DONE;
 
     }

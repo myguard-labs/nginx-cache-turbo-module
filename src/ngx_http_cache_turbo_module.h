@@ -1558,6 +1558,14 @@ typedef struct {
     ngx_flag_t               ignore_cc;   /* derived: cc_mode == CT_CC_IGNORE */
     size_t                   max_size;    /* max single response to cache   */
 
+    /* C2: bodies at/under this size are ngx_pnalloc+ngx_memcpy'd into
+     * r->pool under the zone mutex already held and served with
+     * ref_data = NULL (no blob_acquire, no pool cleanup, no second mutex
+     * acquisition) instead of pinned with a shm reference. 0 = always pin
+     * (byte-for-byte the pre-C2 behaviour); see the directive's doc in
+     * README.md for the measured default. */
+    size_t                   copy_threshold;
+
     /* Suppress native cache when stacked (Q1). When on, the $cache_turbo_active
      * variable reads "1" for a request cache-turbo is handling (enabled,
      * cacheable method, not bypassed/no_store), else "0". The operator wires

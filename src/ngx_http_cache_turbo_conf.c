@@ -695,6 +695,10 @@ ngx_http_cache_turbo_merge_basic(ngx_http_cache_turbo_loc_conf_t *conf,
 {
     ngx_conf_merge_value(conf->enable, prev->enable, 0);
     ngx_conf_merge_size_value(conf->max_size, prev->max_size, 1024 * 1024);
+    /* C2: placeholder default, replaced with the measured crossover once
+     * the bench.sh sweep (0/512/4k/16k/64k, tiny+medium) reports it -- see
+     * the PR body for the sweep table. 0 = off (always pin). */
+    ngx_conf_merge_size_value(conf->copy_threshold, prev->copy_threshold, 0);
     ngx_conf_merge_value(conf->suppress_native, prev->suppress_native, 0);
 
     /* backend_presets is an accumulated bitmask (0 = unset), so the standard
