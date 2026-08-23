@@ -2590,10 +2590,11 @@ ngx_int_t ngx_http_cache_turbo_shm_init_zone(ngx_shm_zone_t *zone, void *data);
 
 /* PERF-7 zero-copy serve refcount. acquire() pins a blob for an in-flight serve
  * and MUST be called with shpool->mutex held (same critical section as the
- * lookup that produced `data`). release() is the request-pool cleanup: it takes
- * the mutex itself, drops the ref, and frees the slab if the owning node has
- * already detached it. `data` is ngx_http_cache_turbo_node_t.data (the blob ptr,
- * never NULL). */
+ * lookup that produced `data`). release() is the request-pool cleanup: it drops
+ * the ref LOCK-FREE (C1) and, only when that was the very last reference — the
+ * owning node having already detached the blob — takes the mutex itself to
+ * return the slab. It must therefore still never be called with the zone mutex
+ * held. `data` is ngx_http_cache_turbo_node_t.data (the blob ptr, never NULL). */
 void ngx_http_cache_turbo_blob_acquire(u_char *data);
 void ngx_http_cache_turbo_blob_release(ngx_http_cache_turbo_zone_t *z,
     u_char *data);

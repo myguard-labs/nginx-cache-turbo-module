@@ -531,15 +531,38 @@ ngx_int_t ngx_http_cache_turbo_redis_scan_del(ngx_http_request_t *r,
  * blob bytes that follow this header; the header is recovered with CT_BLOBREF().
  *
  * Lifetime: while a request serves a blob its output buffer points into the
- * slab, so the buffer must outlive eviction/refresh by another worker. `refs`
- * counts the in-flight zero-copy servers; `detached` is set when the owning node
- * has dropped this buffer (evict / refresh / purge). The slab is freed only when
- * refs == 0 AND detached — i.e. by whichever side is last (the evicting worker if
- * no serve is in flight, otherwise the last server's request-pool cleanup).
- * ALL fields are mutated only under shpool->mutex, so plain ints suffice (the
- * mutex is the barrier); no atomics. */
+ * slab, so the buffer must outlive eviction/refresh by another worker.
+ *
+ * C1: `refs` counts EVERY owner, and the owning node is one of them — a fresh
+ * blob starts at refs == 1 (the node's own reference, taken by blob_alloc) and
+ * each in-flight zero-copy server adds one on top (blob_acquire). The slab is
+ * freed by whoever takes refs from 1 to 0, and by nobody else. That single
+ * atomic transition is the WHOLE arbitration: exactly one decrementer can
+ * observe it, so there is no second party to agree with and no window in which
+ * a freed header must be re-read.
+ *
+ * That biasing is what lets blob_release() run WITHOUT the zone mutex. The
+ * obvious two-field alternative — drop the count, then consult `detached` to
+ * decide whether to free — cannot be made safe at any memory ordering: the
+ * consult must happen after the decrement (by then a concurrent evictor that
+ * saw refs == 0 may already have freed the header: use-after-free) or before it
+ * (and then an evictor that detaches in between leaves nobody to free it: leak).
+ * Both parties would have to agree on a decision spread over two words; one
+ * biased counter removes the disagreement instead of ordering it.
+ *
+ * `detached` is no longer part of that decision. It is the human- and
+ * test-readable marker that the owning node has dropped this buffer (evict /
+ * refresh / purge), written under shpool->mutex by blob_node_release() BEFORE
+ * it drops the node's reference — after that decrement the header may be freed
+ * by a concurrent last server, so nothing may touch it again on that arm.
+ *
+ * `refs` is therefore the only field mutated outside shpool->mutex, and every
+ * mutation of it is an ngx_atomic_fetch_add(). `detached` and `bytes` are
+ * written under the mutex while the writer still holds a reference, and read
+ * only by an owner (which pins the header) or by the thread that just won the
+ * 1 -> 0 transition (which owns it outright). */
 typedef struct {
-    ngx_uint_t               refs;       /* in-flight zero-copy servers      */
+    ngx_atomic_t             refs;       /* owners: node + in-flight servers */
     ngx_uint_t               detached;   /* owning node dropped this buffer  */
     /* P4-2-s3a: total slab bytes charged for this allocation (header + blob),
      * recorded at alloc so the DEFERRED free path (blob_release, running from a

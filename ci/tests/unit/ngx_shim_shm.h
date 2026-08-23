@@ -45,8 +45,11 @@
  *   FAKE (this file):
  *     ngx_slab_*  -- malloc/free with an optional forced-failure budget, so the
  *                    out-of-slab branches are reachable on demand.
- *     ngx_shmtx_* -- single-threaded no-ops that COUNT lock/unlock, so a missed
- *                    unlock (the bug class that hangs a worker) is assertable.
+ *     ngx_shmtx_* -- one process-wide pthread mutex that also COUNTS lock/unlock,
+ *                    so a missed unlock (the bug class that hangs a worker) is
+ *                    assertable. The harness only ever drives ONE zone, so a
+ *                    single global mutex is exactly (not merely conservatively)
+ *                    the zone mutex the code under test believes it is taking.
  *     ngx_time()  -- settable clock. Real time would make TTL expiry tests
  *                    either sleep or flake; here it is a variable we advance.
  *
@@ -58,6 +61,8 @@
 
 #ifndef NGX_CACHE_TURBO_UNIT_SHM_SHIM_H
 #define NGX_CACHE_TURBO_UNIT_SHM_SHIM_H
+
+#include <pthread.h>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -116,9 +121,16 @@ typedef volatile ngx_atomic_uint_t ngx_atomic_t;
 #define ngx_memcmp(a, b, n)       memcmp(a, b, n)
 #define ngx_memzero(buf, n)       (void) memset(buf, 0, n)
 
-/* Single-threaded harness: a plain read-modify-write is sufficient and keeps
- * the counters observable. */
-#define ngx_atomic_fetch_add(p, n)  ((*(p)) += (n), (*(p)) - (n))
+/* C1: NOT a plain read-modify-write. The blob refcount is mutated outside the
+ * zone mutex in production, and test_blob_concurrent_release_vs_lookup() drives
+ * the sliced production functions from real threads, so this has to be a real
+ * atomic: a `*p += n` here would lose counts under contention (turning a genuine
+ * double free into a flaky one) and would make ThreadSanitizer report the SHIM
+ * rather than the code under test. Returns the PREVIOUS value, exactly as
+ * nginx's ngx_atomic_fetch_add() does -- and exactly as the old macro did, so
+ * every single-threaded caller is unaffected. */
+#define ngx_atomic_fetch_add(p, n)                                            \
+    __atomic_fetch_add((p), (ngx_atomic_uint_t) (n), __ATOMIC_SEQ_CST)
 
 /* Compare-and-set, matching nginx's contract: set *p to `set` and return 1 iff
  * *p currently equals `old`, else return 0 and leave *p alone.
@@ -361,6 +373,10 @@ extern ngx_uint_t  ngx_test_slab_live;     /* outstanding allocations */
 extern ngx_uint_t  ngx_test_lock_depth;    /* must be 0 between entry points */
 extern ngx_uint_t  ngx_test_lock_count;
 
+/* The one real mutex behind every ngx_shmtx_lock() below. Defined in
+ * test_shm_state.c, the sole TU that includes this shim. */
+extern pthread_mutex_t  ngx_test_shmtx;
+
 static inline void
 ngx_test_slab_fail_after(long n) { ngx_test_slab_budget = n; }
 
@@ -407,16 +423,25 @@ ngx_slab_free_locked(ngx_slab_pool_t *pool, void *p)
 }
 
 /* --- fake shared-memory mutex -------------------------------------------
- * Single-threaded, so these cannot deadlock -- but they COUNT. An entry point
- * that returns while still holding the lock is the bug that wedges a whole
- * worker (exactly the failure mode the in-tree unstub() comment describes as
- * "a hang, not a slowdown"), so every test asserts the depth is back to 0
- * afterwards via ngx_test_lock_balanced(). ngx_shmtx_t itself is declared above,
- * next to ngx_slab_pool_t, which embeds one. */
+ * These COUNT: an entry point that returns while still holding the lock is the
+ * bug that wedges a whole worker (exactly the failure mode the in-tree unstub()
+ * comment describes as "a hang, not a slowdown"), so every test asserts the
+ * depth is back to 0 afterwards via ngx_test_lock_balanced(). ngx_shmtx_t itself
+ * is declared above, next to ngx_slab_pool_t, which embeds one.
+ *
+ * C1 made them REAL: the lock now wraps one process-wide pthread mutex so the
+ * threaded blob-lifetime test gets genuine mutual exclusion over the fake slab
+ * and the used-bytes gauge, the same way the zone mutex serialises them in
+ * production. The counters are mutated INSIDE the critical section, so they stay
+ * race-free without becoming atomics. Nothing in the harness takes the zone
+ * mutex recursively (the tests call the *_locked bodies directly), so a plain
+ * mutex is enough -- and a future edit that did nest would deadlock loudly here
+ * rather than pass while pretending to be exclusive. */
 static inline void
 ngx_shmtx_lock(ngx_shmtx_t *mtx)
 {
     (void) mtx;
+    (void) pthread_mutex_lock(&ngx_test_shmtx);
     ngx_test_lock_depth++;
     ngx_test_lock_count++;
 }
@@ -426,6 +451,7 @@ ngx_shmtx_unlock(ngx_shmtx_t *mtx)
 {
     (void) mtx;
     ngx_test_lock_depth--;
+    (void) pthread_mutex_unlock(&ngx_test_shmtx);
 }
 
 static inline int
