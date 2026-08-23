@@ -32,6 +32,13 @@ CC      ?= cc
 CFLAGS  ?= -O1 -g -std=c99 -Wall -Wextra -Werror -Wno-unused-parameter
 SAN      = -fsanitize=address,undefined -fno-omit-frame-pointer \
            -fno-sanitize-recover=all
+# C1: test_shm_state.c drives the blob refcount from real threads, and the shim's
+# ngx_shmtx_* are a real pthread mutex, so this TU needs -pthread at compile AND
+# link. TSAN is the second sanitizer axis it unlocked: ASan proves the blob is
+# freed exactly once, TSan proves the refcount that decides so is race-free.
+# They cannot be combined in one binary, hence a separate target.
+PTHREAD  = -pthread
+TSAN     = -fsanitize=thread -fno-omit-frame-pointer -g
 
 # The test TU uses ONLY the mirrored declarations in ngx_shim_shm.h (-I.), while
 # ngx_rbtree.c and layout_check.c compile against the genuine nginx headers
@@ -53,14 +60,14 @@ GEN = $(HERE)/generated_shm.inc
 FUZZ_DIR    = $(HERE)/../../fuzz
 FRAME_GEN   = $(FUZZ_DIR)/generated_parser.inc
 
-.PHONY: check run extract layout-check extract-frame-scan clean
+.PHONY: check run tsan extract layout-check extract-frame-scan clean
 
 check: extract layout-check extract-frame-scan
 	@$(CC) $(CFLAGS) $(SAN) $(INCS_NGX) -c $(NGINX_SRC)/core/ngx_rbtree.c \
 	    -o $(HERE)/ngx_rbtree.san.o
-	@$(CC) $(CFLAGS) $(SAN) $(INCS_TEST) -c $(HERE)/test_shm_state.c \
+	@$(CC) $(CFLAGS) $(SAN) $(PTHREAD) $(INCS_TEST) -c $(HERE)/test_shm_state.c \
 	    -o $(HERE)/test_shm_state.san.o
-	@$(CC) $(SAN) $(HERE)/test_shm_state.san.o $(HERE)/ngx_rbtree.san.o -o $(HERE)/test_shm_state.san
+	@$(CC) $(SAN) $(PTHREAD) $(HERE)/test_shm_state.san.o $(HERE)/ngx_rbtree.san.o -o $(HERE)/test_shm_state.san
 	@ASAN_OPTIONS=detect_leaks=1 $(HERE)/test_shm_state.san
 	@$(CC) $(CFLAGS) -Wno-unused-function $(SAN) -I$(FUZZ_DIR) \
 	    -o $(HERE)/test_frame_scan.san $(HERE)/test_frame_scan.c
@@ -71,14 +78,28 @@ check: extract layout-check extract-frame-scan
 
 run: extract layout-check extract-frame-scan
 	@$(CC) $(CFLAGS) $(INCS_NGX) -c $(NGINX_SRC)/core/ngx_rbtree.c -o $(HERE)/ngx_rbtree.o
-	@$(CC) $(CFLAGS) $(INCS_TEST) -c $(HERE)/test_shm_state.c -o $(HERE)/test_shm_state.o
-	@$(CC) $(HERE)/test_shm_state.o $(HERE)/ngx_rbtree.o -o $(HERE)/test_shm_state
+	@$(CC) $(CFLAGS) $(PTHREAD) $(INCS_TEST) -c $(HERE)/test_shm_state.c -o $(HERE)/test_shm_state.o
+	@$(CC) $(PTHREAD) $(HERE)/test_shm_state.o $(HERE)/ngx_rbtree.o -o $(HERE)/test_shm_state
 	@$(HERE)/test_shm_state
 	@$(CC) $(CFLAGS) -Wno-unused-function -I$(FUZZ_DIR) \
 	    -o $(HERE)/test_frame_scan $(HERE)/test_frame_scan.c
 	@$(HERE)/test_frame_scan
 	@$(CC) $(CFLAGS) -o $(HERE)/test_ae_class_guard $(HERE)/test_ae_class_guard.c
 	@$(HERE)/test_ae_class_guard
+
+# C1: the same suite under ThreadSanitizer. The blob refcount is the one piece
+# of shm state mutated OUTSIDE the zone mutex, so a lost `ngx_atomic_` on it is
+# invisible to ASan (the free still happens once per run on an unloaded box) and
+# obvious to TSan. halt_on_error=1 so the first race fails the build instead of
+# scrolling past; TSan's own exit code is non-zero on a report either way.
+tsan: extract layout-check
+	@$(CC) $(CFLAGS) $(TSAN) $(INCS_NGX) -c $(NGINX_SRC)/core/ngx_rbtree.c \
+	    -o $(HERE)/ngx_rbtree.tsan.o
+	@$(CC) $(CFLAGS) $(TSAN) $(PTHREAD) $(INCS_TEST) -c $(HERE)/test_shm_state.c \
+	    -o $(HERE)/test_shm_state.tsan.o
+	@$(CC) $(TSAN) $(PTHREAD) $(HERE)/test_shm_state.tsan.o $(HERE)/ngx_rbtree.tsan.o \
+	    -o $(HERE)/test_shm_state.tsan
+	@TSAN_OPTIONS=halt_on_error=1 $(HERE)/test_shm_state.tsan
 
 extract-frame-scan: $(FRAME_GEN)
 
@@ -107,4 +128,5 @@ $(GEN): $(REPO)/src/ngx_http_cache_turbo_shm.c $(REPO)/src/ngx_http_cache_turbo_
 
 clean:
 	@rm -f $(HERE)/test_shm_state $(HERE)/test_shm_state.san $(HERE)/*.o $(GEN)
+	@rm -f $(HERE)/test_shm_state.tsan
 	@rm -f $(HERE)/test_frame_scan $(HERE)/test_frame_scan.san

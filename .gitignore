@@ -23,6 +23,7 @@ ci/tests/unit/test_variant_gen
 ci/tests/unit/generated_variant.inc
 ci/tests/unit/test_shm_state
 ci/tests/unit/test_shm_state.san
+ci/tests/unit/test_shm_state.tsan
 ci/tests/unit/test_frame_scan
 ci/tests/unit/test_frame_scan.san
 ci/tests/unit/test_digest_fail

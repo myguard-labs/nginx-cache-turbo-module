@@ -55,6 +55,8 @@ long        ngx_test_slab_budget = -1;
 ngx_uint_t  ngx_test_slab_live   = 0;
 ngx_uint_t  ngx_test_lock_depth  = 0;
 ngx_uint_t  ngx_test_lock_count  = 0;
+/* C1: the one real mutex every ngx_shmtx_lock() in the shim takes. */
+pthread_mutex_t  ngx_test_shmtx = PTHREAD_MUTEX_INITIALIZER;
 
 /* --- the node/zone types under test.
  * Sliced from the shipped header so the layout cannot drift from production;
@@ -281,7 +283,7 @@ ngx_http_cache_turbo_zone_stripe(ngx_http_cache_turbo_zone_t *z)
  * two field names and the CT_BLOBREF definition against the real header for
  * exactly that reason (the H-1/H-4 lesson: an unpinned mirror drifts silently). */
 typedef struct {
-    ngx_uint_t               refs;       /* in-flight zero-copy servers      */
+    ngx_atomic_t             refs;       /* owners: node + in-flight servers */
     ngx_uint_t               detached;   /* owning node dropped this buffer  */
     ngx_uint_t               bytes;      /* charged slab bytes (hdr + blob)  */
 } ngx_http_cache_turbo_blobref_t;
@@ -412,9 +414,11 @@ zone_reset(void)
      * this file to leave a live blob on the node instead of a bare `len`
      * proxy, so without this a genuinely correct test still "leaks" one slab
      * allocation per node it created, permanently poisoning the end-of-run
-     * leak check for every test that runs after it. refs == 0 always here
-     * (no test in this file ever calls blob_acquire()), so this frees the
-     * slab immediately, same as evict_one()'s own release. */
+     * leak check for every test that runs after it. The node's own reference
+     * (C1: refs == 1 on a fresh blob) is the only one outstanding here, so
+     * node_release() frees the slab immediately, same as evict_one()'s own
+     * release. A fixture that left a serve pinned would defer instead, and the
+     * end-of-run leak check would catch the missing release. */
     while (g_zone_live && !ngx_queue_empty(&g_sh.lru)) {
         ngx_queue_t                  *q   = ngx_queue_last(&g_sh.lru);
         ngx_http_cache_turbo_node_t  *ctn =
@@ -1679,8 +1683,9 @@ test_resolve_miss_merged(void)
         live_before = ngx_test_slab_live;
         blob = ngx_http_cache_turbo_blob_alloc(&g_zone, 64);
         REQUIRE(blob != NULL, "CLAIM_FRESH fixture: blob_alloc failed");
-        CHECK(CT_BLOBREF(blob)->refs == 0,
-              "CLAIM_FRESH fixture: blob started already referenced");
+        CHECK(CT_BLOBREF(blob)->refs == 1,
+              "CLAIM_FRESH fixture: a fresh blob must carry exactly the "
+              "owning node's reference and no serve's");
 
         ctn3->data        = blob;
         ctn3->len         = 64;
@@ -1701,9 +1706,10 @@ test_resolve_miss_merged(void)
 
         /* The regression canary: resolve_miss() already unlocked by this
          * point (single-threaded, so no real race is needed to prove the
-         * ordering) -- refs must already read 1, not 0, because acquire()
-         * ran INSIDE claim_locked(), before resolve_miss()'s unlock. */
-        CHECK(CT_BLOBREF(blob)->refs == 1,
+         * ordering) -- refs must already read 2 (the node's own reference plus
+         * this serve's), not 1, because acquire() ran INSIDE claim_locked(),
+         * before resolve_miss()'s unlock. */
+        CHECK(CT_BLOBREF(blob)->refs == 2,
               "UAF regression: claim_locked() did not acquire the blob "
               "before resolve_miss() unlocked -- a concurrent evict between "
               "the unlock and any caller-side acquire() would free this "
@@ -3549,8 +3555,10 @@ test_breaker_record_driven_by_predicate(void)
  * tests never do the pointer arithmetic themselves.
  * ===================================================================== */
 
-/* Allocate a blob and assert the header starts neutral: refs == 0 (nobody is
- * serving it) and detached == 0 (the owning node still holds it). Poisoned
+/* Allocate a blob and assert the header starts neutral: refs == 1 (C1: the
+ * owning node's own reference and nobody else's) and detached == 0 (the owning
+ * node still holds it). A fresh blob at refs == 0 would be freed by the very
+ * first release() and never reach node_release(). Poisoned
  * slab memory (0xA5) makes an unset field read as garbage, so this also pins
  * that blob_alloc() initialises BOTH fields rather than inheriting them. */
 static void
@@ -3567,7 +3575,8 @@ test_blob_alloc_starts_unreferenced_and_attached(void)
     REQUIRE(blob != NULL, "blob_alloc returned NULL on an unlimited pool");
 
     ref = CT_BLOBREF(blob);
-    CHECK(ref->refs == 0, "a fresh blob started with a non-zero refcount");
+    CHECK(ref->refs == 1,
+          "a fresh blob did not start at exactly the owning node's reference");
     CHECK(ref->detached == 0, "a fresh blob started already detached");
     CHECK(ngx_test_slab_live == live_before + 1,
           "blob_alloc did not account for exactly one slab allocation");
@@ -3575,7 +3584,8 @@ test_blob_alloc_starts_unreferenced_and_attached(void)
     /* The owning node drops it with no serve in flight: freed immediately. */
     ngx_http_cache_turbo_blob_node_release(&g_zone, blob);
     CHECK(ngx_test_slab_live == live_before,
-          "node_release with refs == 0 did not free the slab");
+          "node_release did not free the slab when the node's was the last "
+          "reference");
 }
 
 
@@ -3596,7 +3606,8 @@ test_blob_detach_defers_free_to_the_last_server(void)
     REQUIRE(blob != NULL, "blob_alloc returned NULL on an unlimited pool");
 
     ngx_http_cache_turbo_blob_acquire(blob);          /* a serve starts */
-    CHECK(CT_BLOBREF(blob)->refs == 1, "acquire did not take a reference");
+    CHECK(CT_BLOBREF(blob)->refs == 2,
+          "acquire did not add a reference on top of the node's own");
 
     ngx_http_cache_turbo_blob_node_release(&g_zone, blob);  /* owner evicts */
     CHECK(ngx_test_slab_live == live_before + 1,
@@ -3633,7 +3644,8 @@ test_blob_release_does_not_free_while_still_attached(void)
 
     CHECK(ngx_test_slab_live == live_before + 1,
           "release freed a blob the owning node still holds");
-    CHECK(CT_BLOBREF(blob)->refs == 0, "release did not drop the reference");
+    CHECK(CT_BLOBREF(blob)->refs == 1,
+          "release did not drop the serve's reference back to the node's own");
 
     /* Owner drops it last -> freed now. */
     ngx_http_cache_turbo_blob_node_release(&g_zone, blob);
@@ -3661,7 +3673,8 @@ test_blob_multiple_servers_free_exactly_once(void)
     for (i = 0; i < 3; i++) {
         ngx_http_cache_turbo_blob_acquire(blob);
     }
-    CHECK(CT_BLOBREF(blob)->refs == 3, "three acquires did not count three refs");
+    CHECK(CT_BLOBREF(blob)->refs == 4,
+          "three acquires did not count three refs on top of the node's own");
 
     ngx_http_cache_turbo_blob_node_release(&g_zone, blob);   /* owner evicts */
 
@@ -3704,6 +3717,227 @@ test_blob_alloc_propagates_slab_exhaustion(void)
     CHECK(ngx_test_lock_balanced(),
           "a failed blob_alloc left the zone mutex held");
 }
+
+/* =====================================================================
+ * C1: the lock-free release protocol, driven from real threads.
+ *
+ * Every other blob test above drives one deterministic interleaving. This one
+ * drives the interleaving that CANNOT be written down: several servers looking
+ * a blob up and releasing it while an evictor drops the owning node's reference
+ * underneath them, with release() running outside the zone mutex.
+ *
+ * It calls the SLICED PRODUCTION bodies (blob_alloc / blob_acquire /
+ * blob_node_release / blob_release, extracted verbatim from
+ * src/ngx_http_cache_turbo_shm.c) and asserts on state only those bodies
+ * mutate. There is no branch in this test that decides its own outcome:
+ *
+ *   - the slab either comes back to its baseline count for the round or it does
+ *     not (a leaked blob leaves it high, a double free leaves it low -- and the
+ *     ASan build traps the double free outright, before any assertion runs);
+ *   - each server READS the blob after unlocking, so a blob freed one
+ *     reference too early is a use-after-free ASan reports at the read;
+ *   - refs is mutated concurrently by design, so a non-atomic refcount is a
+ *     data race ThreadSanitizer reports on the production line that does it.
+ *
+ * Non-vacuity is asserted, not assumed: the evictor records, under the zone
+ * mutex, whether its node_release() actually deferred the free (i.e. a serve
+ * really was in flight at that instant). If not one round out of
+ * CT_CONC_ROUNDS managed that, the threads never overlapped and the test is
+ * reported as failed rather than passing on an empty race.
+ * ===================================================================== */
+
+#define CT_CONC_ROUNDS   256      /* rounds; each allocates and frees one blob */
+#define CT_CONC_SERVERS  4        /* concurrent zero-copy servers per round    */
+#define CT_CONC_SERVES   16       /* lookup/serve/release cycles per server    */
+
+static u_char     *ct_conc_node;          /* the "node's" blob ptr, or NULL   */
+static ngx_uint_t  ct_conc_live_before;   /* slab count at the round's start  */
+static int         ct_conc_go;            /* start latch (atomic)             */
+static int         ct_conc_evicted;       /* evictor has detached (atomic)    */
+static ngx_uint_t  ct_conc_inflight;      /* serves between acquire & release */
+static ngx_uint_t  ct_conc_acquires;      /* successful acquires (atomic)     */
+static ngx_uint_t  ct_conc_deferred;      /* rounds whose free was deferred   */
+static unsigned    ct_conc_sink;          /* keeps the blob read observable   */
+
+/* Bounded spins. Both sides of the handshake below give up rather than wait
+ * forever, so a descheduled thread on a loaded box turns into a round that
+ * merely fails to overlap -- never into a hung suite. The assertions treat a
+ * round that did not overlap as uninteresting, and the test as a whole fails if
+ * NO round overlapped. */
+#define CT_CONC_SPINS  2000000
+
+static void
+ct_conc_wait_go(void)
+{
+    while (__atomic_load_n(&ct_conc_go, __ATOMIC_ACQUIRE) == 0) {
+        /* spin: the round is microseconds long, so parking the thread would
+         * cost more than it saves and would blunt the overlap we are after. */
+    }
+}
+
+/* One zero-copy server: resolve the node under the zone mutex, pin the blob in
+ * that same hold (exactly as claim_locked() does), then read it and release --
+ * both AFTER unlocking, which is the whole point of the change under test. */
+static void *
+ct_conc_server(void *arg)
+{
+    int         i, j;
+    long        spins;
+    u_char     *d;
+    unsigned    sum = 0;
+
+    (void) arg;
+    ct_conc_wait_go();
+
+    for (i = 0; i < CT_CONC_SERVES; i++) {
+        ngx_shmtx_lock(ngx_http_cache_turbo_zone_mutex(&g_zone));
+        d = ct_conc_node;                       /* the lookup */
+        if (d != NULL) {
+            ngx_http_cache_turbo_blob_acquire(d);
+        }
+        ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(&g_zone));
+
+        if (d == NULL) {
+            continue;                           /* already evicted */
+        }
+        (void) __atomic_fetch_add(&ct_conc_acquires, 1, __ATOMIC_RELAXED);
+        (void) __atomic_fetch_add(&ct_conc_inflight, 1, __ATOMIC_ACQ_REL);
+
+        /* Hold the reference across the eviction. Without this the acquire and
+         * the release are adjacent instructions and the evictor essentially
+         * never lands between them -- the first version of this test raced 256
+         * rounds and deferred the free in NOT ONE of them, which the
+         * ct_conc_deferred assertion caught. Waiting for the evictor's own flag
+         * (bounded) is what makes the deferred free the common case instead of
+         * a lottery, while every other server in this round keeps hammering
+         * acquire/release completely unsynchronised. */
+        for (spins = 0; spins < CT_CONC_SPINS; spins++) {
+            if (__atomic_load_n(&ct_conc_evicted, __ATOMIC_ACQUIRE)) {
+                break;
+            }
+        }
+
+        /* Serve it: a real read of the slab bytes, unlocked, AFTER the owning
+         * node has dropped it. This is the load that ASan reports if the blob
+         * was freed while our reference was still outstanding. */
+        for (j = 0; j < 64; j++) {
+            sum += d[j];
+        }
+
+        (void) __atomic_fetch_sub(&ct_conc_inflight, 1, __ATOMIC_ACQ_REL);
+        ngx_http_cache_turbo_blob_release(&g_zone, d);
+    }
+
+    (void) __atomic_fetch_add(&ct_conc_sink, sum, __ATOMIC_RELAXED);
+    return NULL;
+}
+
+/* The evicting worker: drops the node's own reference while the servers are
+ * mid-flight, holding the zone mutex exactly as evict_one() does. */
+static void *
+ct_conc_evictor(void *arg)
+{
+    long     spins;
+    u_char  *d;
+
+    (void) arg;
+    ct_conc_wait_go();
+
+    /* Wait (bounded) until at least one server is inside its serve window, so
+     * the detach below really does land on a blob somebody is reading. */
+    for (spins = 0; spins < CT_CONC_SPINS; spins++) {
+        if (__atomic_load_n(&ct_conc_inflight, __ATOMIC_ACQUIRE) > 0) {
+            break;
+        }
+    }
+
+    ngx_shmtx_lock(ngx_http_cache_turbo_zone_mutex(&g_zone));
+    d = ct_conc_node;
+    ct_conc_node = NULL;                        /* unreachable from now on */
+    if (d != NULL) {
+        ngx_http_cache_turbo_blob_node_release(&g_zone, d);
+        /* Still inside the critical section, so this read is exact: if the
+         * slab is still accounted live, a serve held a reference and the free
+         * was handed to it. That is the branch this whole test exists for. */
+        if (ngx_test_slab_live == ct_conc_live_before + 1) {
+            ct_conc_deferred++;
+        }
+    }
+    ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(&g_zone));
+
+    /* Releases the servers waiting on the handshake above. Set AFTER the
+     * unlock so the detach is genuinely concurrent with their release(). */
+    __atomic_store_n(&ct_conc_evicted, 1, __ATOMIC_RELEASE);
+
+    return NULL;
+}
+
+static void
+test_blob_concurrent_release_vs_lookup(void)
+{
+    pthread_t   servers[CT_CONC_SERVERS], evictor;
+    int         round, i, rc;
+    u_char     *blob;
+    ngx_uint_t  live_baseline;
+
+    printf("C1: concurrent release vs lookup frees every blob exactly once\n");
+    zone_reset();
+    live_baseline = ngx_test_slab_live;
+
+    ct_conc_acquires = 0;
+    ct_conc_deferred = 0;
+
+    for (round = 0; round < CT_CONC_ROUNDS; round++) {
+        ct_conc_live_before = ngx_test_slab_live;
+
+        blob = ngx_http_cache_turbo_blob_alloc(&g_zone, 64);
+        REQUIRE(blob != NULL, "C1 fixture: blob_alloc failed on an unlimited pool");
+
+        ct_conc_node = blob;
+        ct_conc_inflight = 0;
+        __atomic_store_n(&ct_conc_evicted, 0, __ATOMIC_RELEASE);
+        __atomic_store_n(&ct_conc_go, 0, __ATOMIC_RELEASE);
+
+        for (i = 0; i < CT_CONC_SERVERS; i++) {
+            rc = pthread_create(&servers[i], NULL, ct_conc_server, NULL);
+            REQUIRE(rc == 0, "C1 fixture: pthread_create(server) failed");
+        }
+        rc = pthread_create(&evictor, NULL, ct_conc_evictor, NULL);
+        REQUIRE(rc == 0, "C1 fixture: pthread_create(evictor) failed");
+
+        __atomic_store_n(&ct_conc_go, 1, __ATOMIC_RELEASE);
+
+        for (i = 0; i < CT_CONC_SERVERS; i++) {
+            (void) pthread_join(servers[i], NULL);
+        }
+        (void) pthread_join(evictor, NULL);
+
+        /* Exactly one free, by whichever side turned out to be last. High =
+         * the blob leaked (nobody owned the terminal transition); low = it was
+         * freed twice (and the ASan build has already aborted by now). */
+        if (ngx_test_slab_live != ct_conc_live_before) {
+            CHECK(ngx_test_slab_live == ct_conc_live_before,
+                  "C1: a blob raced by concurrent servers and an evictor was "
+                  "not freed exactly once");
+            break;                       /* one report, not 256 */
+        }
+    }
+
+    CHECK(ngx_test_slab_live == live_baseline,
+          "C1: the concurrent rounds left the slab off its baseline");
+    CHECK(ngx_test_lock_balanced(),
+          "C1: the concurrent rounds left the zone mutex held");
+    CHECK(ct_conc_acquires > 0,
+          "C1: no server ever acquired a blob -- the race never happened and "
+          "the assertions above are vacuous");
+    CHECK(ct_conc_deferred > 0,
+          "C1: no round evicted a blob while a serve held it -- the deferred "
+          "free (the whole point of the refcount) was never exercised");
+    printf("     (%d rounds, %lu acquires, %lu deferred frees)\n",
+           CT_CONC_ROUNDS, (unsigned long) ct_conc_acquires,
+           (unsigned long) ct_conc_deferred);
+}
+
 
 
 /* =====================================================================
@@ -4188,28 +4422,34 @@ run_negative_controls(void)
                             "guards nothing\n");
         }
 
-        /* PERF-7-b restored: release() frees as soon as refs hits 0, without
-         * requiring detached. test_blob_release_does_not_free_while_still_attached
-         * asserts the slab SURVIVES, because the owning node still points at it. */
+        /* PERF-7-b restored, in its C1 form: an unbiased refcount, i.e. a
+         * blob_alloc() that does NOT take the owning node's reference. That is
+         * the single line the whole lock-free protocol rests on -- without it
+         * the first server's release() takes refs 1 -> 0 and frees a blob the
+         * node still points at, which is
+         * test_blob_release_does_not_free_while_still_attached's assertion
+         * inverted.
+         *
+         * The bug is modelled where it originates (the initial count) and then
+         * the REAL production release() runs on top of it, so the control
+         * exercises the same sliced body the test does rather than restating
+         * its condition. */
         zone_reset();
         live_before = ngx_test_slab_live;
         blob = ngx_http_cache_turbo_blob_alloc(&g_zone, 64);
         REQUIRE(blob != NULL, "PERF-7-b control fixture: blob_alloc failed");
-        ngx_http_cache_turbo_blob_acquire(blob);
         ref = CT_BLOBREF(blob);
-        ref->refs--;
-        if (ref->refs == 0) {                          /* <-- the bug: no
-                                                        * detached conjunct */
-            ngx_slab_free_locked(&g_pool, ref);
-        }
+        ref->refs = 0;                                 /* <-- the bug: alloc
+                                                        * took no node ref */
+        ngx_http_cache_turbo_blob_acquire(blob);       /* a serve starts */
+        ngx_http_cache_turbo_blob_release(&g_zone, blob);  /* and finishes */
 
         caught = (ngx_test_slab_live == live_before);
         tests_run++;
         if (!caught) {
             tests_failed++;
-            fprintf(stderr, "  ✗ CONTROL PERF-7-b: dropping the `detached` "
-                            "conjunct freed a blob the owning node still "
-                            "holds — "
+            fprintf(stderr, "  ✗ CONTROL PERF-7-b: an unbiased refcount did "
+                            "NOT free a blob the owning node still holds — "
                             "test_blob_release_does_not_free_while_still_attached"
                             " guards nothing\n");
         }
@@ -4240,21 +4480,24 @@ run_negative_controls(void)
         blob = ngx_http_cache_turbo_blob_alloc(&g_zone, 64);
         REQUIRE(blob != NULL, "PERF-7-c control fixture: blob_alloc failed");
 
-        /* Three servers start. With a counting acquire refs would be 3; with
-         * the bug it stays 0. */
+        /* Three servers start. With a counting acquire refs would be 4 (the
+         * node's own reference plus three serves); with the bug it stays 1. */
         ref = CT_BLOBREF(blob);
-        REQUIRE(ref->refs == 0, "PERF-7-c fixture: fresh blob had refs != 0");
+        REQUIRE(ref->refs == 1,
+                "PERF-7-c fixture: fresh blob did not carry exactly the "
+                "owning node's reference");
 
         /* The owner evicts while all three are still in flight. With the bug
-         * (refs == 0) this frees immediately instead of detaching. */
+         * the node's is the only reference, so this frees immediately instead
+         * of leaving the blob to the last server. */
         ngx_http_cache_turbo_blob_node_release(&g_zone, blob);
 
         /* The test asserts the blob survives node_release AND the first two of
          * three releases. Under the bug it is gone at the first step, so the
          * live count is already back to baseline -- that is the discrepancy
          * this control reports. A correct build keeps it live here because
-         * acquire() would have made refs == 3 and node_release() would only
-         * have set detached. */
+         * acquire() would have made refs == 4 and node_release() would only
+         * have taken it down to 3. */
         caught = (ngx_test_slab_live == live_before);
         tests_run++;
         if (!caught) {
@@ -5285,6 +5528,7 @@ main(void)
     test_blob_release_does_not_free_while_still_attached();
     test_blob_multiple_servers_free_exactly_once();
     test_blob_alloc_propagates_slab_exhaustion();
+    test_blob_concurrent_release_vs_lookup();
     run_negative_controls();
 
     /* Every node this run allocated must be accounted for. Under ASan a real

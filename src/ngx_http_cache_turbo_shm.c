@@ -336,8 +336,14 @@ static void *ngx_http_cache_turbo_shm_alloc_evict(
 /* PERF-7: allocate a response blob with an ngx_http_cache_turbo_blobref_t header
  * prefixed, so a HIT can be served zero-copy out of shm under refcount. Returns
  * the BLOB pointer (== node->data; the header sits immediately before it), or
- * NULL on slab exhaustion. Caller holds the shpool mutex. The header starts at
- * refs == 0 / detached == 0 (only the owning node references it). */
+ * NULL on slab exhaustion. Caller holds the shpool mutex.
+ *
+ * C1: the header starts at refs == 1 / detached == 0 — that one reference IS
+ * the owning node's, handed to the caller along with the pointer it is about to
+ * store in node->data. It is released by blob_node_release(); see the protocol
+ * note on ngx_http_cache_turbo_blobref_t. A caller that abandons the blob
+ * without calling blob_node_release() leaks it, exactly as it would leak any
+ * other slab allocation it dropped on the floor. */
 static u_char *
 ngx_http_cache_turbo_blob_alloc(ngx_http_cache_turbo_zone_t *z, size_t len)
 {
@@ -351,7 +357,7 @@ ngx_http_cache_turbo_blob_alloc(ngx_http_cache_turbo_zone_t *z, size_t len)
     }
 
     ref = (ngx_http_cache_turbo_blobref_t *) base;
-    ref->refs = 0;
+    ref->refs = 1;                       /* C1: the owning node's reference */
     ref->detached = 0;
     /* P4-2-s3a: remember what alloc_evict() charged, so both free paths
      * (immediate here, deferred in blob_release) discharge exactly that. */
@@ -363,42 +369,81 @@ ngx_http_cache_turbo_blob_alloc(ngx_http_cache_turbo_zone_t *z, size_t len)
 
 /* PERF-7: the owning node drops its reference to a blob (evict / refresh / purge).
  * Caller holds the shpool mutex and `data` is non-NULL (node->data of a real
- * entry). If no serve is in flight (refs == 0) the slab is freed now; otherwise
- * it is marked detached and the last in-flight server frees it in its request-
- * pool cleanup (ngx_http_cache_turbo_blob_release). */
+ * entry). Exactly once per blob: after this returns, the node no longer owns the
+ * buffer and must not hand it out again.
+ *
+ * If no serve is in flight the node's was the last reference and the slab is
+ * freed right here, under the mutex the caller already holds; otherwise the last
+ * in-flight server frees it from its request-pool cleanup
+ * (ngx_http_cache_turbo_blob_release).
+ *
+ * C1 ORDERING: `detached` is written BEFORE the decrement, while this thread
+ * still holds the node's reference and the header is therefore guaranteed alive.
+ * Once the decrement has run, a concurrent last server may already have freed
+ * the header, so `ref` is not dereferenced again on either arm — `bytes` is
+ * read up front, and the winner of the 1 -> 0 transition passes the address to
+ * the slab without reading through it. */
 static void
 ngx_http_cache_turbo_blob_node_release(ngx_http_cache_turbo_zone_t *z,
     u_char *data)
 {
     ngx_http_cache_turbo_blobref_t  *ref = CT_BLOBREF(data);
+    size_t                           bytes = ref->bytes;
 
-    if (ref->refs == 0) {
-        ngx_http_cache_turbo_shm_free_locked(z, ref, ref->bytes);
-        return;
-    }
     ref->detached = 1;
+
+    if (ngx_atomic_fetch_add(&ref->refs, -1) == 1) {
+        ngx_http_cache_turbo_shm_free_locked(z, ref, bytes);
+    }
 }
 
 
-/* PERF-7 exported helpers (see header). acquire under the caller's held mutex;
- * release takes the mutex itself from a request-pool cleanup. */
+/* PERF-7 exported helpers (see header).
+ *
+ * acquire() runs under the caller's ALREADY-HELD zone mutex and stays that way —
+ * C1 does not widen it. It needs no failable compare-and-set (unlike the P4-2
+ * lease CAS, which arbitrates between two workers racing for one slot) because
+ * it never races the 1 -> 0 transition: it is reached only through a node the
+ * caller resolved under that same mutex hold, and a node that still points at
+ * this blob still holds its own reference, so refs >= 1 throughout. A DETACHED
+ * blob is unreachable from every node by construction — blob_node_release() is
+ * what detaches, and the caller drops the pointer in the same hold — so no
+ * lookup can ever produce one to acquire. The count cannot resurrect from 0, and
+ * an unconditional increment is therefore exact rather than optimistic. */
 void
 ngx_http_cache_turbo_blob_acquire(u_char *data)
 {
-    CT_BLOBREF(data)->refs++;
+    (void) ngx_atomic_fetch_add(&CT_BLOBREF(data)->refs, 1);
 }
 
 
+/* C1: release runs from a request-pool cleanup, on the request's own thread,
+ * with NO lock held. The common case — a served blob whose node still owns it —
+ * is now a single atomic decrement and a return, where it used to take the zone
+ * mutex on every completed zero-copy HIT.
+ *
+ * The mutex is taken only on the terminal transition: refs 1 -> 0, which in the
+ * biased scheme can only mean the owning node ALREADY released its reference
+ * (i.e. the blob is detached) and this is the last server standing. That thread
+ * is the sole owner of the header at that point — no other decrementer can
+ * observe the same transition and no acquire can reach a detached blob — so
+ * there is nothing left to re-check under the lock, and nothing the lock could
+ * usefully arbitrate. It is held purely for the slab free list and the
+ * used-bytes gauge that shm_free_locked() touches, never for the refcount. */
 void
 ngx_http_cache_turbo_blob_release(ngx_http_cache_turbo_zone_t *z, u_char *data)
 {
     ngx_http_cache_turbo_blobref_t  *ref = CT_BLOBREF(data);
+    /* Read while we still hold OUR reference, so both release paths obey one
+     * flat rule: after your own decrement, never dereference `ref` again. */
+    size_t                           bytes = ref->bytes;
+
+    if (ngx_atomic_fetch_add(&ref->refs, -1) != 1) {
+        return;                  /* another owner remains: nothing to free */
+    }
 
     ngx_shmtx_lock(ngx_http_cache_turbo_zone_mutex(z));
-    ref->refs--;
-    if (ref->refs == 0 && ref->detached) {
-        ngx_http_cache_turbo_shm_free_locked(z, ref, ref->bytes);
-    }
+    ngx_http_cache_turbo_shm_free_locked(z, ref, bytes);
     ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
 }
 

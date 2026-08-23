@@ -1,4 +1,4 @@
-# sync-sha: b9c1beb9b02a0b9cc054d7902ae3fb217c106c1f8aab6964a9b1fe1b0d66dd49
+# sync-sha: c50a138adf80644ed5ddbe0213f20e41869e2a4f2dc1d7526dd238d8987b82dc
 name: Build & Test
 
 # Runner labels live in the POOL repository variable. Every checked-in selector
@@ -251,6 +251,24 @@ jobs:
         # bug into the shipped source.
         run: |
           make -C ci/tests/unit --no-print-directory check \
+            NGINX_VERSION="$NGINX_VERSION" \
+            NGINX_SRC=".build/nginx-${NGINX_VERSION}/src" \
+            NGINX_OBJS=".build/nginx-${NGINX_VERSION}/objs"
+
+      - name: Unit tests — shm node state machine (TSan)
+        # C1 made the PERF-7 blob refcount lock-free: blob_release() decrements
+        # it OUTSIDE the zone mutex, so `refs` is the one piece of shm state
+        # whose correctness rests on an atomic rather than on the mutex. ASan
+        # proves each blob is freed exactly once; only TSan proves the counter
+        # that decides so is race-free — a plain `refs--` there still frees once
+        # per run on an unloaded box and sails through the ASan job.
+        #
+        # Control-verified: replacing that decrement with a non-atomic one makes
+        # this step report a data race in blob_release and exit 66. Same binary,
+        # same suite as the step above, second sanitizer (they cannot be linked
+        # into one image).
+        run: |
+          make -C ci/tests/unit --no-print-directory tsan \
             NGINX_VERSION="$NGINX_VERSION" \
             NGINX_SRC=".build/nginx-${NGINX_VERSION}/src" \
             NGINX_OBJS=".build/nginx-${NGINX_VERSION}/objs"
