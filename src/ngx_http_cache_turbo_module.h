@@ -559,7 +559,11 @@ typedef char ngx_http_cache_turbo_brk_probe_layout_assert
 #define NGX_HTTP_CACHE_TURBO_WARM_MAX_CEILING  4096
 
 typedef struct {
-    ngx_rbtree_node_t        node;       /* node.key = crc32 of cache key  */
+    ngx_rbtree_node_t        node;       /* node.key = first 8 bytes of the
+                                          * 32-byte key hash (C4); NOT the
+                                          * 32-bit crc32 short hash -- see
+                                          * ngx_http_cache_turbo_shm_key64()
+                                          * in shm.c                       */
     u_char                   key[32];    /* full key hash, collision guard */
 
     /* What this node holds; see NGX_HTTP_CACHE_TURBO_NODE_* above. ENTRY is 0 so
@@ -2643,7 +2647,8 @@ void ngx_http_cache_turbo_blob_release(ngx_http_cache_turbo_zone_t *z,
  *
  * Caller holds shpool->mutex. */
 void ngx_http_cache_turbo_shm_touch_lru(ngx_http_cache_turbo_zone_t *z,
-    ngx_http_cache_turbo_node_t *ctn, time_t now, ngx_uint_t protected_pct);
+    ngx_http_cache_turbo_node_t *ctn, time_t now, ngx_uint_t protected_pct,
+    uint32_t hash);
 
 /* P4-1a: W-TinyLFU frequency sketch. Both hold the shpool mutex via the
  * caller, and both tolerate an unallocated sketch (bump is a no-op, estimate

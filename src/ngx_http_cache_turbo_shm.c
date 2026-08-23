@@ -288,6 +288,49 @@ ngx_http_cache_turbo_shm_init_zone(ngx_shm_zone_t *shm_zone, void *data)
 }
 
 
+/* C4: derive the rbtree ordering key from the first 8 bytes of the full
+ * 32-byte key hash, instead of the caller's 32-bit crc32 short hash.
+ * ngx_rbtree_key_t is ngx_uint_t -- 64 bits on every platform this module
+ * ships for (nginx src/core/ngx_rbtree.h) -- so a bare crc32 wastes the top
+ * half of every comparison. Two keys whose crc32 happens to collide
+ * (1-in-2^32) now still separate on the primary rbtree compare almost every
+ * time, so the ngx_memcmp() identity tiebreak in
+ * ngx_http_cache_turbo_rbtree_insert_value() and shm_lookup() below is
+ * reached far less often. It is NOT removed: 8 bytes still collide at a
+ * real (if astronomically rarer) rate, and the tiebreak is the only thing
+ * that actually proves two keys are the same key, not just 8 bytes of one.
+ *
+ * Returns ngx_uint_t, not ngx_rbtree_key_t -- the two are the same type
+ * (see above) and this return type is what lets extract_shm.sh's function
+ * slicer (ci/tests/unit/extract_shm.sh) recognise this as one of the
+ * already-whitelisted return types instead of needing a new one.
+ *
+ * Explicit fixed-byte-order (big-endian) load, not a cast through a
+ * (const ngx_uint_t *) -- a cast bakes host endianness into the tree's
+ * iteration order, which would make node ordering (and anything that walks
+ * the tree in key order) differ between a little- and a big-endian build of
+ * byte-for-byte identical key material. */
+static ngx_uint_t
+ngx_http_cache_turbo_shm_key64(const u_char *key_hash)
+{
+    return ((ngx_uint_t) key_hash[0] << 56)
+         | ((ngx_uint_t) key_hash[1] << 48)
+         | ((ngx_uint_t) key_hash[2] << 40)
+         | ((ngx_uint_t) key_hash[3] << 32)
+         | ((ngx_uint_t) key_hash[4] << 24)
+         | ((ngx_uint_t) key_hash[5] << 16)
+         | ((ngx_uint_t) key_hash[6] << 8)
+         |  (ngx_uint_t) key_hash[7];
+}
+
+/* Compile-time guard: the shift widths above assume ngx_rbtree_key_t is at
+ * least 64 bits wide. It is on every platform this module ships for (see the
+ * comment above), but if that ever stopped being true this must fail the
+ * build, not silently shift UB into a truncated key. */
+typedef char ngx_http_cache_turbo_key64_width_check
+    [(sizeof(ngx_rbtree_key_t) >= 8) ? 1 : -1];
+
+
 ngx_http_cache_turbo_node_t *
 ngx_http_cache_turbo_shm_lookup(ngx_http_cache_turbo_zone_t *z,
     u_char *key_hash, uint32_t hash)
@@ -295,23 +338,32 @@ ngx_http_cache_turbo_shm_lookup(ngx_http_cache_turbo_zone_t *z,
     ngx_int_t                     rc;
     ngx_rbtree_node_t            *node, *sentinel;
     ngx_http_cache_turbo_node_t  *ctn;
+    ngx_rbtree_key_t              key;
+
+    /* C4: descent now orders on the widened key derived from key_hash, not
+     * on the caller's 32-bit crc32 short hash -- `hash` stays a parameter
+     * (every one of this function's 16 call sites already has it in scope
+     * for other purposes, e.g. the admission/sketch path) but is no longer
+     * what decides tree position. */
+    (void) hash;
+    key = ngx_http_cache_turbo_shm_key64(key_hash);
 
     node = ngx_http_cache_turbo_zone_sh(z)->rbtree.root;
     sentinel = ngx_http_cache_turbo_zone_sh(z)->rbtree.sentinel;
 
     while (node != sentinel) {
 
-        if (hash < node->key) {
+        if (key < node->key) {
             node = node->left;
             continue;
         }
 
-        if (hash > node->key) {
+        if (key > node->key) {
             node = node->right;
             continue;
         }
 
-        /* hash == node->key */
+        /* key == node->key */
         ctn = (ngx_http_cache_turbo_node_t *) node;
 
         rc = ngx_memcmp(key_hash, ctn->key, 32);
@@ -760,7 +812,8 @@ ngx_http_cache_turbo_lru_enforce_cap(ngx_http_cache_turbo_zone_t *z,
  */
 void
 ngx_http_cache_turbo_shm_touch_lru(ngx_http_cache_turbo_zone_t *z,
-    ngx_http_cache_turbo_node_t *ctn, time_t now, ngx_uint_t protected_pct)
+    ngx_http_cache_turbo_node_t *ctn, time_t now, ngx_uint_t protected_pct,
+    uint32_t hash)
 {
     /* P4-1a: record the access in the frequency sketch BEFORE the coarse gate
      * below.
@@ -779,8 +832,15 @@ ngx_http_cache_turbo_shm_touch_lru(ngx_http_cache_turbo_zone_t *z,
      * cacheline readers are walking, and it lands in one of `sketch_width`
      * slots rather than on a single hot word. It is still a real write under
      * the shpool mutex the caller already holds, and it is taken on purpose:
-     * stage 2's admission test is worth nothing on undercounted data. */
-    ngx_http_cache_turbo_shm_sketch_bump(z, ctn->node.key);
+     * stage 2's admission test is worth nothing on undercounted data.
+     *
+     * C4: the sketch is (deliberately, see shm_admit) keyed on the real
+     * 32-bit crc32 short hash, not on the node's widened rbtree key --
+     * `ctn->node.key` no longer equals crc32(key) once the rbtree key is
+     * derived from key_hash instead. Every caller of this function already
+     * has the real hash in scope (it is how it found `ctn` in the first
+     * place), so it is threaded straight through rather than recomputed. */
+    ngx_http_cache_turbo_shm_sketch_bump(z, hash);
 
     /* P1 coarse gate: at most one LRU write per node per second. Deliberately
      * the SAME gate that governed the flat re-splice -- S8 adds no second
@@ -961,8 +1021,19 @@ ngx_http_cache_turbo_shm_admit(ngx_http_cache_turbo_zone_t *z, uint32_t hash)
     victim = ngx_queue_data(q, ngx_http_cache_turbo_node_t, lru);
 
     cand_freq   = ngx_http_cache_turbo_shm_sketch_estimate(z, hash);
+    /* C4: the sketch is populated (touch_lru's sketch_bump) and queried
+     * (`hash` just above) in real-crc32 space, never in the widened rbtree
+     * key's space -- `victim->node.key` stopped being that crc32 once the
+     * rbtree key was derived from key_hash instead (see
+     * ngx_http_cache_turbo_shm_key64()). A bare cast here would silently
+     * requery the sketch at an unrelated 32-bit value: not a truncation of
+     * the SAME number, a DIFFERENT one, drawn from the low 32 bits of an
+     * 8-byte prefix of key_hash rather than from the candidate's hash space
+     * at all. The node's full 32-byte key is right here on `victim`, so
+     * recompute the real crc32 from it rather than reuse a stale/foreign
+     * value nobody has in scope. */
     victim_freq = ngx_http_cache_turbo_shm_sketch_estimate(z,
-                      (uint32_t) victim->node.key);
+                      ngx_crc32_short(victim->key, 32));
 
     if (cand_freq < victim_freq) {
         ngx_http_cache_turbo_zone_sh(z)->admission_refused++;
@@ -1403,7 +1474,7 @@ ngx_http_cache_turbo_shm_store_locked(ngx_http_cache_turbo_zone_t *z,
 
     ngx_memcpy(body, data, len);
 
-    ctn->node.key = hash;
+    ctn->node.key = ngx_http_cache_turbo_shm_key64(key_hash);
     ngx_memcpy(ctn->key, key_hash, 32);
     ctn->kind = NGX_HTTP_CACHE_TURBO_NODE_ENTRY;
     ctn->data = body;
@@ -1825,7 +1896,7 @@ ngx_http_cache_turbo_shm_claim_locked(ngx_http_cache_turbo_zone_t *z,
         return NGX_HTTP_CACHE_TURBO_CLAIM_WINNER;
     }
 
-    ctn->node.key = hash;
+    ctn->node.key = ngx_http_cache_turbo_shm_key64(key_hash);
     ngx_memcpy(ctn->key, key_hash, 32);
     ctn->kind = NGX_HTTP_CACHE_TURBO_NODE_COUNTER;  /* + refreshing = a stub */
     ctn->data = NULL;
@@ -2172,7 +2243,7 @@ ngx_http_cache_turbo_shm_count_miss_locked(ngx_http_cache_turbo_zone_t *z,
         return NGX_OK;
     }
 
-    ctn->node.key = hash;
+    ctn->node.key = ngx_http_cache_turbo_shm_key64(key_hash);
     ngx_memcpy(ctn->key, key_hash, 32);
     ctn->kind = NGX_HTTP_CACHE_TURBO_NODE_COUNTER;
     ctn->data = NULL;
@@ -2276,7 +2347,7 @@ ngx_http_cache_turbo_shm_l2_neg_check(ngx_http_cache_turbo_zone_t *z,
          * needs no access to the location config. If the kind gate were ever
          * dropped, the promote-on-second-hit test asserts BOTH this path and
          * the gate, so the regression is caught either way. */
-        ngx_http_cache_turbo_shm_touch_lru(z, ctn, now, 0);
+        ngx_http_cache_turbo_shm_touch_lru(z, ctn, now, 0, hash);
     }
 
     ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
@@ -2373,7 +2444,7 @@ ngx_http_cache_turbo_shm_l2_neg_set(ngx_http_cache_turbo_zone_t *z,
         return;
     }
 
-    ctn->node.key = hash;
+    ctn->node.key = ngx_http_cache_turbo_shm_key64(key_hash);
     ngx_memcpy(ctn->key, key_hash, 32);
     ctn->kind = NGX_HTTP_CACHE_TURBO_NODE_COUNTER;
     ctn->data = NULL;

@@ -878,7 +878,7 @@ ngx_http_cache_turbo_access_l1_serve_fresh(ngx_http_request_t *r,
      * 1s coarse gate internally. clcf->scan_resistant_pct == 0 (the
      * default) makes this a plain probation re-head. */
     ngx_http_cache_turbo_shm_touch_lru(z, ctn, now,
-                                       clcf->scan_resistant_pct);
+                                       clcf->scan_resistant_pct, hash);
     ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
 
     /* COR-5(b): re-issue a dropped variant-index write here -- mutex just
@@ -937,7 +937,7 @@ ngx_http_cache_turbo_access_l1_serve_stale(ngx_http_request_t *r,
      * 1s coarse gate internally. clcf->scan_resistant_pct == 0 (the
      * default) makes this a plain probation re-head. */
     ngx_http_cache_turbo_shm_touch_lru(z, ctn, now,
-                                       clcf->scan_resistant_pct);
+                                       clcf->scan_resistant_pct, hash);
 
     /* Cross-node single-flight resolved (v4-2): we parked for the Redis
      * NX and the phase engine re-entered. If we won (NGX_OK), we own the
