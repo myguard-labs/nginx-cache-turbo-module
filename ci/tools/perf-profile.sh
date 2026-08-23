@@ -48,15 +48,27 @@
 #            together (`perf record -p pid1,pid2,...`).
 #   OUT      output directory for perf.data/report/results  (default
 #            ci/tools/perf-out, gitignored — see .gitignore)
-#   VARY     opt-in: origin adds `add_header Vary "Accept-Encoding";` and wrk
-#            sends `Accept-Encoding: gzip` on every request, so the profiled
-#            path is the auto-Vary marker/variant-index path (cache_turbo_vary
-#            module) instead of the base-key hit path. Off by default — the
-#            default profile is unchanged (PLAN-optimize.md P2-2's original
-#            tiny/base-key measurement). VARY=1 is a PREREQUISITE for measuring
-#            any variant_hash/Vary-related optimisation; do not compare a
-#            VARY=1 profile against a pre-VARY baseline run with a different
-#            harness version.
+#   VARY     opt-in: origin adds `Vary: Accept-Encoding` AND reflects the
+#            request's own Accept-Encoding class back as `Content-Encoding`
+#            (negotiated per request, like a real pre-compressing origin);
+#            the cache_turbo location gets `cache_turbo_key_encoded_origin on`
+#            so that encoded response is actually captured. The measured wrk
+#            pass alternates the request Accept-Encoding between TWO distinct
+#            classes (gzip/br — see ngx_http_cache_turbo_ae_class(),
+#            priority zstd > br > gzip > identity), so the profiled path is the
+#            auto-Vary marker/variant-index path (cache_turbo_vary module,
+#            `bits > 0`) genuinely serving two different variant keys, not one
+#            repeated header. A single class cannot distinguish "the marker
+#            engaged" from an ordinary base-key hit — both read
+#            hit_ratio_pct=100% identically; a second, distinct, not-yet-primed
+#            class is the only thing that makes the marker's bits>0 branch
+#            observable via the module's own counters (see "VARY marker
+#            evidence" in the script output). Off by default — the default
+#            profile is unchanged (PLAN-optimize.md P2-2's original tiny/base-
+#            key measurement). VARY=1 is a PREREQUISITE for measuring any
+#            variant_hash/Vary-related optimisation; do not compare a VARY=1
+#            profile against a pre-VARY baseline run with a different harness
+#            version.
 #
 # Requires: /usr/bin/perf (readable perf_event_paranoid, i.e. <=1 as root or
 # <=2 unprivileged with CAP_PERFMON — this host is pinned at 1, do not try to
@@ -74,6 +86,13 @@ FREQ="${FREQ:-999}"
 CALLGRAPH="${CALLGRAPH:-fp}"
 OUT="${OUT:-$PWD/ci/tools/perf-out}"
 VARY="${VARY:-}"
+# Two distinct ae_class() buckets (see ngx_http_cache_turbo_vary.c), NOT the
+# same header repeated: a single class round-trips through the marker once
+# and then just re-hits the same variant key indefinitely, indistinguishable
+# from a base-key hit in the counters. Two classes is what forces the SECOND
+# class through its own bits>0 lookup against a not-yet-warm key.
+AE_CLASS_A="gzip"
+AE_CLASS_B="br"
 # 1 worker cannot show shm-mutex CONTENTION at all -- only one process ever
 # holds it, so ngx_shmtx_lock's fast path never blocks. Default keeps the
 # original single-worker/single-pid profile (simplest to attribute), but P4-1
@@ -127,14 +146,44 @@ head -c 200 /dev/urandom | base64 > "$WORK/html/tiny"
 LOAD_MODULE=""
 [ -n "$MODULE" ] && LOAD_MODULE="load_module $(realpath "$MODULE");"
 
-# VARY=1: origin emits Vary: Accept-Encoding so a request carrying
-# Accept-Encoding: gzip (added to the wrk invocation below) drives the
-# auto-Vary marker/variant-index path instead of the base-key hit path.
+# VARY=1: origin emits Vary: Accept-Encoding AND reflects the request's own
+# Accept-Encoding class back as a (fake, but typed-field-real) Content-Encoding
+# via $ct_ae_class -- mimicking a real pre-compressing origin that negotiates
+# per request. This is NOT cosmetic: ngx_http_cache_turbo_classify_vary() only
+# arms the ENCODING axis bit when ngx_http_cache_turbo_response_encoded(r) is
+# true (vary.c: "the encoding axis is inert for this response" otherwise --
+# a response with identical bytes for every Accept-Encoding is correctly never
+# partitioned), and capturing an encoded response at all requires
+# `cache_turbo_key_encoded_origin on` on the cache_turbo location (filters.c's
+# capture gate: `!response_encoded(r) || encoded_ok`, encoded_ok gated on that
+# directive) -- without both, the origin's `Vary: Accept-Encoding` header alone
+# never flips `bits > 0` and the marker/variant-index path stays cold
+# regardless of what the client sends. Reflecting the class (not a fixed
+# "gzip") matters too: the STORE key differentiates by the REQUEST's ae_class,
+# but the SERVE-time BLOBF_ORIGIN_ENCODED guard (module.c) checks the stored
+# class against the request, so a mismatched fixed class would make the
+# second-class request round-trip through refuse/mismatch instead of a clean
+# miss-then-hit.
 # Whole-line splice (not a fragment) so the default render is BYTE-IDENTICAL
 # to the pre-VARY script -- this harness's value is cross-run comparability,
 # and a fragment splice leaves a trailing blank line the default never had.
+# Each of these three is '' by default, appended inline at the END of an
+# existing line (never placed alone on its own line) so an unset VARY leaves
+# that line — and the whole rendered config — BYTE-IDENTICAL to the pre-VARY
+# script; only a set var contributes its own leading newline + indented line.
 LOCATION_BLOCK='location / { add_header Cache-Control "max-age=600"; }'
-[ -n "$VARY" ] && LOCATION_BLOCK='location / { add_header Cache-Control "max-age=600"; add_header Vary "Accept-Encoding"; }'
+KEY_ENCODED_DIRECTIVE=''
+MAP_BLOCK=''
+if [ -n "$VARY" ]; then
+    LOCATION_BLOCK='location / { add_header Cache-Control "max-age=600"; add_header Vary "Accept-Encoding"; add_header Content-Encoding $ct_ae_class; }'
+    KEY_ENCODED_DIRECTIVE='
+            cache_turbo_key_encoded_origin on;'
+    MAP_BLOCK="    map \$http_accept_encoding \$ct_ae_class {
+        default          \"$AE_CLASS_A\";
+        \"~*\\b$AE_CLASS_B\\b\"  \"$AE_CLASS_B\";
+    }
+"
+fi
 
 cat > "$WORK/conf/nginx.conf" <<EOF
 daemon off;
@@ -146,7 +195,7 @@ pid $WORK/logs/nginx.pid;
 events { worker_connections 4096; }
 http {
     access_log off;
-    cache_turbo_zone name=ct 64m;
+${MAP_BLOCK}    cache_turbo_zone name=ct 64m;
 
     server {
         listen 127.0.0.1:$ORIGIN;
@@ -159,7 +208,7 @@ http {
         listen 127.0.0.1:$C;
         location / {
             cache_turbo        ct;
-            cache_turbo_valid  60s;
+            cache_turbo_valid  60s;${KEY_ENCODED_DIRECTIVE}
             proxy_pass http://127.0.0.1:$ORIGIN;
         }
         location = /_cache_c { cache_turbo_admin ct; allow 127.0.0.1; deny all; }
@@ -201,30 +250,63 @@ n_found="$(tr ',' '\n' <<<"$worker_pids" | sed '/^$/d' | wc -l)"
 
 url="http://127.0.0.1:$C/tiny"
 
-# Prime + verify the key is actually cached before trusting anything measured
-# under perf. A profile of the miss/origin path answers the wrong question.
-# VARY=1: prime with the SAME Accept-Encoding: gzip header the measured wrk
-# pass sends, else priming fills the base-key variant and the measured run
-# (which carries the header) would cold-miss its own auto-Vary variant key.
-curl_vary_args=()
-[ -n "$VARY" ] && curl_vary_args=(-H "Accept-Encoding: gzip")
-hit=0
-for _ in $(seq 1 30); do
-    curl -fsS "${curl_vary_args[@]}" -D - -o /dev/null "$url" 2>/dev/null > "$WORK/logs/hdr" || true
-    xc=$(grep -i '^X-Cache:' "$WORK/logs/hdr" | tr -d '\r' | awk '{print toupper($2)}' || true)
-    if [ "$xc" = "HIT" ]; then hit=1; break; fi
-    sleep 0.1
-done
-[ "$hit" -eq 1 ] || {
-    echo "FATAL: $url never reported X-Cache: HIT after 30 priming requests." >&2
-    echo "  -> perf would profile the MISS/origin path, not the L1 hit path. Aborting." >&2
-    exit 3
-}
-
 scrape() {
     curl -fsS "http://127.0.0.1:$C/_cache_c?format=prometheus" 2>/dev/null \
         | awk -v m="$1" '$1 ~ "^"m"\\{" {print $2; found=1} END { if (!found) print 0 }' | head -1
 }
+
+# Prime + verify the key is actually cached before trusting anything measured
+# under perf. A profile of the miss/origin path answers the wrong question.
+# prime_class() sends the given Accept-Encoding value (or none) until X-Cache
+# reports HIT, so the LATER measured pass (which carries the same headers)
+# does not cold-miss its own key.
+prime_class() {
+    ae="$1"
+    args=()
+    [ -n "$ae" ] && args=(-H "Accept-Encoding: $ae")
+    hit=0
+    for _ in $(seq 1 30); do
+        curl -fsS "${args[@]}" -D - -o /dev/null "$url" 2>/dev/null > "$WORK/logs/hdr" || true
+        xc=$(grep -i '^X-Cache:' "$WORK/logs/hdr" | tr -d '\r' | awk '{print toupper($2)}' || true)
+        if [ "$xc" = "HIT" ]; then hit=1; break; fi
+        sleep 0.1
+    done
+    [ "$hit" -eq 1 ]
+}
+
+mi_pre=$(scrape cache_turbo_misses_total)
+
+if [ -n "$VARY" ]; then
+    # Prime BOTH classes before measuring. Class A's priming is an ordinary
+    # cold-miss-then-hit on the base/first-variant key -- unremarkable. Class
+    # B's priming is the evidence: it can ONLY produce another miss if the
+    # marker stored by class A's store (bits>0, ENCODING axis armed) routed
+    # this differently-encoded request to a genuinely different, not-yet-warm
+    # variant key. If VARY were not actually engaging the marker (e.g. a
+    # config regression), class B would just re-hit class A's already-cached
+    # entry -- zero delta -- since a single unvaried key is blind to the
+    # request's Accept-Encoding.
+    prime_class "$AE_CLASS_A" || {
+        echo "FATAL: $url (Accept-Encoding: $AE_CLASS_A) never reported X-Cache: HIT after 30 priming requests." >&2
+        echo "  -> perf would profile the MISS/origin path, not the L1 hit path. Aborting." >&2
+        exit 3
+    }
+    mi_after_a=$(scrape cache_turbo_misses_total)
+
+    prime_class "$AE_CLASS_B" || {
+        echo "FATAL: $url (Accept-Encoding: $AE_CLASS_B) never reported X-Cache: HIT after 30 priming requests." >&2
+        echo "  -> perf would profile the MISS/origin path, not the L1 hit path. Aborting." >&2
+        exit 3
+    }
+    mi_after_b=$(scrape cache_turbo_misses_total)
+    marker_prime_delta=$(( mi_after_b - mi_after_a ))
+else
+    prime_class "" || {
+        echo "FATAL: $url never reported X-Cache: HIT after 30 priming requests." >&2
+        echo "  -> perf would profile the MISS/origin path, not the L1 hit path. Aborting." >&2
+        exit 3
+    }
+fi
 
 h0=$(scrape cache_turbo_hits_total)
 mi0=$(scrape cache_turbo_misses_total)
@@ -247,9 +329,25 @@ PERF_PID=$!
 # fraction of the run goes unsampled.
 sleep 0.3
 
-wrk_vary_args=()
-[ -n "$VARY" ] && wrk_vary_args=(-H "Accept-Encoding: gzip")
-wrk_out=$(wrk -t"$THREADS" -c"$CONC" -d"${DURATION}s" --latency "${wrk_vary_args[@]}" "$url" 2>/dev/null)
+wrk_extra_args=()
+if [ -n "$VARY" ]; then
+    # wrk's -H is static for the whole run; alternating two Accept-Encoding
+    # classes per request needs a script. Each thread gets its own Lua state
+    # (wrk copies the script per-thread), so the per-thread counter only
+    # needs to alternate within that thread -- combined across threads the
+    # measured pass still visits both classes throughout.
+    cat > "$WORK/vary.lua" <<LUA
+local classes = { "$AE_CLASS_A", "$AE_CLASS_B" }
+local i = 0
+request = function()
+    i = i + 1
+    wrk.headers["Accept-Encoding"] = classes[(i % 2) + 1]
+    return wrk.format(nil, nil, nil, nil)
+end
+LUA
+    wrk_extra_args=(-s "$WORK/vary.lua")
+fi
+wrk_out=$(wrk -t"$THREADS" -c"$CONC" -d"${DURATION}s" --latency "${wrk_extra_args[@]}" "$url" 2>/dev/null)
 
 # perf record only exits when its target exits (or on SIGINT); signal it to
 # stop sampling now that the load pass is done.
@@ -329,3 +427,13 @@ echo "ngx_shmtx_self_time_pct=$shmtx_pct"
 echo
 echo "-- top symbols (self time, flat) --"
 echo "$top_syms"
+
+echo
+echo "== VARY marker evidence (cache_turbo_misses_total deltas, priming phase) =="
+if [ -n "$VARY" ]; then
+    echo "class_A=$AE_CLASS_A misses_pre=$mi_pre misses_after_A=$mi_after_a (delta=$(( mi_after_a - mi_pre )))"
+    echo "class_B=$AE_CLASS_B misses_after_B=$mi_after_b (delta=$marker_prime_delta)"
+    echo "marker_prime_delta=$marker_prime_delta  # nonzero => class B's priming took a genuine bits>0 miss into a NEW variant key, not a re-hit of class A's key"
+else
+    echo "VARY unset -- single key, no second class primed, no marker delta possible by construction (negative control: see a VARY=1 run for the positive case)"
+fi
