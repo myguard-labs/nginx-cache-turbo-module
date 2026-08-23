@@ -983,19 +983,36 @@ def test_stale_mult_rejects_out_of_range(ng: Nginx) -> None:
 
 def test_preset_micro_default_ttl(ng: Nginx, origin: Origin) -> None:
     """micro preset: with NO explicit cache_turbo_valid the band's own 1s fresh
-    TTL takes effect (stale_mult=2 -> entry hard-expires at ~2s). An immediate
-    re-read is a fresh HIT; by t=3s the entry is gone and the next read MISSes.
-    A >=30s default (any other preset's band) would still HIT at t=3s, so this
-    proves micro's 1s default-valid band reaches the runtime freshness math
-    without an explicit knob."""
+    TTL takes effect (stale_mult=2 -> entry hard-expires at ~2s). By t=3s the
+    entry is gone and the read MISSes; a >=30s default (any other preset's band)
+    would still HIT/STALE at t=3s, so that hard-expire is what proves micro's 1s
+    default-valid band reaches the runtime freshness math without an explicit
+    knob -- it is a deterministic post-deadline read, not a race.
+
+    TEST-MICROTTL-ORACLE (2026-08-23): the ORIGINAL assertion here additionally
+    required the immediate re-read (t~0) to land inside the 1s fresh window and
+    come back exactly HIT. That is a wall-clock contract the module never
+    promised: two live HTTP round trips plus nginx's own request handling can
+    exceed 1s under ASan multi-worker load, and the immediate read then lands
+    just past the fresh boundary and reads STALE instead of HIT -- observed on
+    PR #272 (2b75442) and PR #413's ASan single-process run. The re-read below
+    only needs to prove the entry was actually STORED (distinguishing this from
+    a storage failure, which the hard-expire check alone cannot do -- both a
+    correctly-stored 1s entry raced past freshness and a never-stored entry
+    would otherwise look identical at t=3s); it accepts HIT or STALE, either of
+    which proves storage happened, and leaves the fresh-vs-stale distinction to
+    the deterministic t=3s check below. The plain "store then immediate fresh
+    HIT" property (with real margin) is already covered by test_miss_then_hit
+    at a >=30s band."""
     sc, _, hc = fetch(ng.port, "/pm/win")              # prime (MISS, no X-Cache)
     assert sc == 200 and "x-cache" not in hc, \
         f"micro prime should be a MISS, got {sc} X-Cache={hc.get('x-cache')}"
 
-    sc, _, hc = fetch(ng.port, "/pm/win")              # immediate -> fresh HIT
-    assert sc == 200 and hc.get("x-cache") == "HIT", \
-        ("micro within its 1s fresh window should HIT, got "
-         f"{sc} X-Cache={hc.get('x-cache')}")
+    sc, _, hc = fetch(ng.port, "/pm/win")              # immediate -> stored
+    assert sc == 200 and hc.get("x-cache") in ("HIT", "STALE"), \
+        ("micro re-read should be served from cache (HIT while fresh, or STALE "
+         "if the round trip raced past the 1s window under a slow sanitizer "
+         f"build), got {sc} X-Cache={hc.get('x-cache')}")
 
     time.sleep(3.0)                                     # past fresh+stale (~2s)
     sc, _, hc = fetch(ng.port, "/pm/win")

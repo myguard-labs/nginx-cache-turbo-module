@@ -768,15 +768,36 @@ class Origin:
                     # upstream-declared 1s freshness (v7 honor_cache_control)
                     self.send_header("Cache-Control", "public, max-age=1")
                 if "mustrev" in self.path:
-                    # RFC 9111 must-revalidate: 1s fresh, then NO stale serving.
+                    # RFC 9111 must-revalidate: fresh, then NO stale serving.
+                    # TEST-MICROTTL-ORACLE (2026-08-23): was max-age=1. A
+                    # must-revalidate entry never shows an intermediate STALE
+                    # state (unlike ordinary stale-serving) -- past the
+                    # deadline it collapses straight back to an origin
+                    # revalidate, which is observationally IDENTICAL to "was
+                    # never stored". So (unlike the /cc7/ honor tests) there is
+                    # no HIT-or-STALE relaxation available here: proving
+                    # "stored and still fresh" genuinely requires the
+                    # immediate re-read to land inside the fresh window, with
+                    # zero explicit wait. 4s (instead of 1s) gives that live
+                    # round trip real margin under a slow sanitizer build; see
+                    # test_must_revalidate. This marker is ALSO reached by
+                    # /ccignmr/mustrev (both /mrev/ and /ccignmr/ proxy_pass
+                    # with a trailing "/", which strips the location prefix,
+                    # so the origin sees the same "/mustrev" path either way
+                    # and cannot distinguish the two consumers by path) --
+                    # that is harmless because /ccignmr/ uses
+                    # cache_turbo_cache_control ignore and derives its window
+                    # from cache_turbo_valid, never from this header's value.
                     self.send_header("Cache-Control",
-                                     "max-age=1, must-revalidate")
+                                     "max-age=4, must-revalidate")
                 if "proxyrev" in self.path:
                     # RFC 9111 proxy-revalidate: the shared-cache synonym of
                     # must-revalidate. Same window collapse (response_must_revalidate
-                    # OR-arm), 1s fresh then NO stale serving.
+                    # OR-arm) and same TEST-MICROTTL-ORACLE widening as "mustrev"
+                    # above (proxyrev has no /ccignmr/-style second consumer, so
+                    # no path scoping is needed here).
                     self.send_header("Cache-Control",
-                                     "max-age=1, proxy-revalidate")
+                                     "max-age=4, proxy-revalidate")
                 if "splitmrev" in self.path:
                     # AUD-CC-FIRST-LINE: HTTP allows a header field to be split
                     # across multiple field-lines (RFC 9110 SS5.3), equivalent to
@@ -784,8 +805,9 @@ class Origin:
                     # separate Cache-Control lines -- max-age on the first,
                     # must-revalidate on the SECOND -- so a reader that only
                     # inspects the first occurrence would miss must-revalidate
-                    # entirely and stale-serve past freshness.
-                    self.send_header("Cache-Control", "max-age=1")
+                    # entirely and stale-serve past freshness. TEST-MICROTTL-ORACLE:
+                    # max-age widened 1 -> 4 for the same reason as "mustrev" above.
+                    self.send_header("Cache-Control", "max-age=4")
                     self.send_header("Cache-Control", "must-revalidate")
                 if "expabs" in self.path:
                     # Expires-only freshness (upstream_ttl ladder step 4): NO
