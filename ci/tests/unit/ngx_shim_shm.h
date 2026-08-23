@@ -121,6 +121,52 @@ typedef volatile ngx_atomic_uint_t ngx_atomic_t;
 #define ngx_memcmp(a, b, n)       memcmp(a, b, n)
 #define ngx_memzero(buf, n)       (void) memset(buf, 0, n)
 
+/* C4: ngx_crc32_short(), mirrored verbatim from nginx's src/core/ngx_crc32.h
+ * (a `static ngx_inline` function there too -- it was never a linked symbol
+ * to begin with). shm_admit() (sliced below) needs it to recover the real
+ * crc32 of the LRU-tail eviction victim's key, since the victim's rbtree key
+ * is no longer that crc32 once the rbtree key is widened (see
+ * ngx_http_cache_turbo_shm_key64() in shm.c).
+ *
+ * `ngx_crc32_table16` below is the CRC-32/PNG polynomial's standard 16-entry
+ * table, copied verbatim from src/core/ngx_crc32.c -- a mathematical
+ * constant nginx has shipped byte-for-byte unchanged since crc32 support was
+ * added, not project logic that can drift. Linking the real ngx_crc32.c
+ * instead (matching how ngx_rbtree.c is compiled from source below) was
+ * tried first and rejected: its ngx_crc32_table_init() pulls in
+ * ngx_cacheline_size/ngx_alloc/ngx_cycle, none of which this harness
+ * provides, purely to produce a cache-aligned COPY of the identical values
+ * this table already holds -- see ngx_crc32_table_init()'s own body, which
+ * ngx_memcpy()s FROM this exact table. Production never calls that
+ * initialiser before this table is used either (it runs during cycle init,
+ * same as here: never), so this is not a divergence from what a fresh
+ * production zone actually computes with. */
+static uint32_t  ngx_crc32_table16[] = {
+    0x00000000, 0x1db71064, 0x3b6e20c8, 0x26d930ac,
+    0x76dc4190, 0x6b6b51f4, 0x4db26158, 0x5005713c,
+    0xedb88320, 0xf00f9344, 0xd6d6a3e8, 0xcb61b38c,
+    0x9b64c2b0, 0x86d3d2d4, 0xa00ae278, 0xbdbdf21c
+};
+
+static uint32_t  *ngx_crc32_table_short = ngx_crc32_table16;
+
+static ngx_inline uint32_t
+ngx_crc32_short(u_char *p, size_t len)
+{
+    u_char    c;
+    uint32_t  crc;
+
+    crc = 0xffffffff;
+
+    while (len--) {
+        c = *p++;
+        crc = ngx_crc32_table_short[(crc ^ (c & 0xf)) & 0xf] ^ (crc >> 4);
+        crc = ngx_crc32_table_short[(crc ^ (c >> 4)) & 0xf] ^ (crc >> 4);
+    }
+
+    return crc ^ 0xffffffff;
+}
+
 /* C1: NOT a plain read-modify-write. The blob refcount is mutated outside the
  * zone mutex in production, and test_blob_concurrent_release_vs_lookup() drives
  * the sliced production functions from real threads, so this has to be a real

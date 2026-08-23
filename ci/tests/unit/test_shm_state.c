@@ -492,6 +492,10 @@ mkkey(int n)
     return buf[n];
 }
 #define KEY(n)  mkkey(n), (uint32_t) (0x1000 + (n))
+/* Same synthetic hash KEY(n) uses, standalone -- for call sites (like
+ * touch_lru()) that take a bare `hash` rather than the (key_hash, hash)
+ * pair. */
+#define HASH(n) ((uint32_t) (0x1000 + (n)))
 
 static ngx_http_cache_turbo_node_t *
 find(int n)
@@ -697,7 +701,12 @@ mk_live_sie_entry(int keyn, int live)
     memset(ctn, 0, sizeof(*ctn));
 
     memcpy(ctn->key, mkkey(keyn), 32);
-    ctn->node.key = (uint32_t) (0x1000 + keyn);
+    /* C4: the rbtree key is derived from key_hash, not from KEY(n)'s
+     * fabricated (uint32_t)(0x1000+n) -- this fixture bypasses the real
+     * insert path (shm_store et al.) and must derive it the same way
+     * ngx_http_cache_turbo_shm_key64() does, or shm_lookup()/find() will
+     * never find the node this creates. */
+    ctn->node.key = ngx_http_cache_turbo_shm_key64(mkkey(keyn));
     ngx_rbtree_insert(&g_sh.rbtree, &ctn->node);
 
     ctn->kind = NGX_HTTP_CACHE_TURBO_NODE_ENTRY;
@@ -1024,14 +1033,14 @@ test_s8_promote_on_second_hit(void)
      * happen at all, so advance past it. A first touch re-heads within
      * probation but must NOT promote. */
     ngx_test_advance_time(2);
-    ngx_http_cache_turbo_shm_touch_lru(&g_zone, ctn, ngx_test_now, PCT_ON);
+    ngx_http_cache_turbo_shm_touch_lru(&g_zone, ctn, ngx_test_now, PCT_ON, HASH(0));
     CHECK(ctn->seg == NGX_HTTP_CACHE_TURBO_SEG_PROBATION,
           "S8: a FIRST hit must not promote (one-hit keys stay evictable)");
     CHECK(g_sh.n_protected == 0, "protected count moved on a first hit");
 
     /* (2) Second hit -> PROTECTED. This is the actual promotion rule. */
     ngx_test_advance_time(2);
-    ngx_http_cache_turbo_shm_touch_lru(&g_zone, ctn, ngx_test_now, PCT_ON);
+    ngx_http_cache_turbo_shm_touch_lru(&g_zone, ctn, ngx_test_now, PCT_ON, HASH(0));
     CHECK(ctn->seg == NGX_HTTP_CACHE_TURBO_SEG_PROTECTED,
           "S8: a SECOND hit must promote the node to PROTECTED");
     CHECK(g_sh.n_protected == 1, "protected count not maintained on promote");
@@ -1046,7 +1055,7 @@ test_s8_promote_on_second_hit(void)
      * an immediate re-touch does not run the promote/cap machinery again --
      * n_protected must not move. (No manual demote is involved; an earlier
      * version of this comment claimed one. CodeRabbit, PR #81.) */
-    ngx_http_cache_turbo_shm_touch_lru(&g_zone, ctn, ngx_test_now, PCT_ON);
+    ngx_http_cache_turbo_shm_touch_lru(&g_zone, ctn, ngx_test_now, PCT_ON, HASH(0));
     CHECK(g_sh.n_protected == 1,
           "a within-1s touch must be a no-op, not a second promotion");
 
@@ -1061,11 +1070,11 @@ test_s8_promote_on_second_hit(void)
     CHECK(ctn->kind == NGX_HTTP_CACHE_TURBO_NODE_COUNTER, "fixture: COUNTER");
 
     ngx_test_advance_time(2);
-    ngx_http_cache_turbo_shm_touch_lru(&g_zone, ctn, ngx_test_now, PCT_ON);
+    ngx_http_cache_turbo_shm_touch_lru(&g_zone, ctn, ngx_test_now, PCT_ON, HASH(1));
     ngx_test_advance_time(2);
-    ngx_http_cache_turbo_shm_touch_lru(&g_zone, ctn, ngx_test_now, PCT_ON);
+    ngx_http_cache_turbo_shm_touch_lru(&g_zone, ctn, ngx_test_now, PCT_ON, HASH(1));
     ngx_test_advance_time(2);
-    ngx_http_cache_turbo_shm_touch_lru(&g_zone, ctn, ngx_test_now, PCT_ON);
+    ngx_http_cache_turbo_shm_touch_lru(&g_zone, ctn, ngx_test_now, PCT_ON, HASH(1));
 
     CHECK(ctn->seg == NGX_HTTP_CACHE_TURBO_SEG_PROBATION,
           "S8: a COUNTER promoted -- a miss storm can now pin the protected "
@@ -1210,16 +1219,16 @@ test_s8_off_demotes_inherited_protected_nodes(void)
     ctn->last_access = ngx_test_now;
 
     ngx_test_advance_time(2);
-    ngx_http_cache_turbo_shm_touch_lru(&g_zone, ctn, ngx_test_now, PCT_ON);
+    ngx_http_cache_turbo_shm_touch_lru(&g_zone, ctn, ngx_test_now, PCT_ON, HASH(0));
     ngx_test_advance_time(2);
-    ngx_http_cache_turbo_shm_touch_lru(&g_zone, ctn, ngx_test_now, PCT_ON);
+    ngx_http_cache_turbo_shm_touch_lru(&g_zone, ctn, ngx_test_now, PCT_ON, HASH(0));
     CHECK(ctn->seg == NGX_HTTP_CACHE_TURBO_SEG_PROTECTED,
           "fixture: node should be PROTECTED before the reload");
     CHECK(g_sh.n_protected == 1, "fixture: n_protected should be 1");
 
     /* Config reloaded with the directive removed/off => pct 0 from here on. */
     ngx_test_advance_time(2);
-    ngx_http_cache_turbo_shm_touch_lru(&g_zone, ctn, ngx_test_now, 0);
+    ngx_http_cache_turbo_shm_touch_lru(&g_zone, ctn, ngx_test_now, 0, HASH(0));
 
     CHECK(ctn->seg == NGX_HTTP_CACHE_TURBO_SEG_PROBATION,
           "S8: `off` left an inherited node PROTECTED -- the zone never "
@@ -1235,9 +1244,9 @@ test_s8_off_demotes_inherited_protected_nodes(void)
     /* And it must not creep back: with the feature off, further touches keep
      * it in probation however many times it is hit. */
     ngx_test_advance_time(2);
-    ngx_http_cache_turbo_shm_touch_lru(&g_zone, ctn, ngx_test_now, 0);
+    ngx_http_cache_turbo_shm_touch_lru(&g_zone, ctn, ngx_test_now, 0, HASH(0));
     ngx_test_advance_time(2);
-    ngx_http_cache_turbo_shm_touch_lru(&g_zone, ctn, ngx_test_now, 0);
+    ngx_http_cache_turbo_shm_touch_lru(&g_zone, ctn, ngx_test_now, 0, HASH(0));
     CHECK(ctn->seg == NGX_HTTP_CACHE_TURBO_SEG_PROBATION,
           "S8: a node re-promoted itself while the feature was off");
     CHECK(g_sh.n_protected == 0, "S8: n_protected rose while off");
@@ -1678,7 +1687,10 @@ test_resolve_miss_merged(void)
         REQUIRE(ctn3 != NULL, "CLAIM_FRESH fixture: node alloc failed");
         memset(ctn3, 0, sizeof(*ctn3));
         memcpy(ctn3->key, mkkey(5), 32);
-        ctn3->node.key = (uint32_t) (0x1000 + 5);
+        /* C4: derive like shm_store()'s insert sites do -- resolve_miss()
+         * below looks this node up via key_hash, not via the fabricated
+         * KEY(5) hash. */
+        ctn3->node.key = ngx_http_cache_turbo_shm_key64(mkkey(5));
         ngx_rbtree_insert(&g_sh.rbtree, &ctn3->node);
         ctn3->kind = NGX_HTTP_CACHE_TURBO_NODE_ENTRY;
         ctn3->seg  = NGX_HTTP_CACHE_TURBO_SEG_PROBATION;
@@ -1754,6 +1766,155 @@ test_resolve_miss_merged(void)
         ngx_slab_free_locked(&g_pool, ctn3);
     }
 }
+
+
+/* =====================================================================
+ * C4: the rbtree key is now the first 8 bytes of the full 32-byte key hash,
+ * not the caller's 32-bit crc32 short hash -- ngx_rbtree_key_t is
+ * ngx_uint_t, 64 bits on every platform this module ships for, so a bare
+ * crc32 wasted the top half of every rbtree comparison. Two DIFFERENT keys
+ * whose crc32 happens to collide (1-in-2^32) used to land at the exact same
+ * primary rbtree key on every descent, falling through to the ngx_memcmp()
+ * identity tiebreak (ngx_http_cache_turbo_rbtree_insert_value() /
+ * shm_lookup()) every single time. Widening does not remove that tiebreak
+ * -- it is still the only thing that proves two keys are the SAME key, not
+ * just 8 bytes of one -- but it should now be reached far less often for a
+ * genuine crc32 collision, since the wider key usually still separates them.
+ *
+ * This test finds a REAL ngx_crc32_short() collision at runtime (the
+ * 32-bit output space's birthday bound puts one within roughly 2^16 tries,
+ * comfortably inside the search cap below -- typically well under a
+ * millisecond) and inserts both keys through a real production insert path
+ * (l2_neg_set(), one of the four ctn->node.key assignment sites). Both must
+ * still be found (correctness is unchanged by the widening), AND -- the
+ * point of THIS item -- their rbtree keys must now differ, which is only
+ * possible if the derivation is reading more of key_hash than the crc32
+ * collision shares.
+ * ===================================================================== */
+
+#define C4_COLL_TABLE_BITS  20
+#define C4_COLL_TABLE_SIZE  (1 << C4_COLL_TABLE_BITS)
+#define C4_COLL_TABLE_MASK  (C4_COLL_TABLE_SIZE - 1)
+#define C4_COLL_SEARCH_CAP  1000000
+
+/* Distinct 32-byte key material per search index i, independent of mkkey()'s
+ * 8-slot array (the search needs up to C4_COLL_SEARCH_CAP distinct keys).
+ * 'Y' keeps it visibly out of mkkey()'s 'A'..'H' range.
+ *
+ * ⚠ NOT a bare little-endian counter in bytes 1..4. crc32 is GF(2)-linear
+ * (up to the fixed initial/final XOR), so with every OTHER byte held fixed
+ * across all i, `i -> crc32(key(i))` is itself an affine GF(2) map -- and an
+ * affine map from a 32-bit domain onto a 32-bit codomain is a BIJECTION
+ * whenever it is injective on any two points, which a real crc32 is. A
+ * first version of this fixture did exactly that and searched the entire
+ * 1,000,000-index cap without a single collision: not a flaky search, a
+ * proof search that could structurally never succeed. Multiplying by a
+ * fixed odd 64-bit constant (Fibonacci hashing) first breaks that linearity
+ * -- integer multiplication mod 2^64 carries bits across positions in a way
+ * XOR-linear crc32 does not undo -- so distinct i produce crc32 outputs that
+ * behave like an ordinary pseudorandom sample of 2^32, and the birthday
+ * bound (collision expected within roughly 2^16 draws) applies again.
+ * Verified: this construction finds a collision around i≈42000 in a
+ * standalone reproduction of this exact function, not near the cap. */
+static void
+c4_collkey(int i, u_char *out)
+{
+    uint64_t  x;
+    int       k;
+
+    x = (uint64_t) (unsigned) i * 0x9E3779B97F4A7C15ULL;
+
+    memset(out, 0, 32);
+    out[0] = 'Y';
+    for (k = 0; k < 8; k++) {
+        out[1 + k] = (u_char) (x >> (8 * k));
+    }
+}
+
+/* Linear-probing hash set over ngx_crc32_short() outputs, scanned in index
+ * order so the first collision found is the first one that actually occurs
+ * -- returns the two colliding indices and their shared crc32, or 0 if
+ * nothing collided inside the cap (would indicate a broken crc32, not a
+ * flaky test: the birthday bound guarantees a collision by ~2^16 with
+ * overwhelming probability, and the cap is >10x that). */
+static int
+c4_find_crc32_collision(int *idx_a, int *idx_b, uint32_t *out_crc)
+{
+    static uint32_t  table_crc[C4_COLL_TABLE_SIZE];
+    static int       table_idx[C4_COLL_TABLE_SIZE];
+    int       i, slot;
+    u_char    buf[32];
+    uint32_t  crc;
+
+    for (slot = 0; slot < C4_COLL_TABLE_SIZE; slot++) {
+        table_idx[slot] = -1;
+    }
+
+    for (i = 0; i < C4_COLL_SEARCH_CAP; i++) {
+        c4_collkey(i, buf);
+        crc = ngx_crc32_short(buf, 32);
+        slot = (int) (crc & C4_COLL_TABLE_MASK);
+
+        while (table_idx[slot] != -1) {
+            if (table_crc[slot] == crc) {
+                *idx_a = table_idx[slot];
+                *idx_b = i;
+                *out_crc = crc;
+                return 1;
+            }
+            slot = (slot + 1) & C4_COLL_TABLE_MASK;
+        }
+        table_idx[slot] = i;
+        table_crc[slot] = crc;
+    }
+
+    return 0;
+}
+
+static void
+test_c4_crc32_collision_separates_on_widened_key(void)
+{
+    int       idx_a, idx_b;
+    uint32_t  crc;
+    u_char    key_a[32], key_b[32];
+    ngx_http_cache_turbo_node_t  *ctn_a, *ctn_b;
+
+    printf("C4: a real crc32 collision still separates on the widened "
+           "rbtree key\n");
+
+    REQUIRE(c4_find_crc32_collision(&idx_a, &idx_b, &crc),
+            "fixture: no crc32 collision found inside the search cap -- "
+            "ngx_crc32_short() itself is suspect, not this test");
+
+    c4_collkey(idx_a, key_a);
+    c4_collkey(idx_b, key_b);
+    REQUIRE(memcmp(key_a, key_b, 32) != 0,
+            "fixture: the two colliding keys must be genuinely different");
+
+    zone_reset();
+
+    /* l2_neg_set() is one of the four production ctn->node.key = ... sites
+     * (shm.c); both calls go through the real insert path, not a hand-built
+     * node. */
+    ngx_http_cache_turbo_shm_l2_neg_set(&g_zone, key_a, crc, 60);
+    ngx_http_cache_turbo_shm_l2_neg_set(&g_zone, key_b, crc, 60);
+
+    ctn_a = ngx_http_cache_turbo_shm_lookup(&g_zone, key_a, crc);
+    ctn_b = ngx_http_cache_turbo_shm_lookup(&g_zone, key_b, crc);
+
+    REQUIRE(ctn_a != NULL, "C4: colliding key A was not found");
+    REQUIRE(ctn_b != NULL, "C4: colliding key B was not found");
+    CHECK(ctn_a != ctn_b,
+          "C4: two distinct colliding keys resolved to the same node");
+    CHECK(ctn_a->node.key != ctn_b->node.key,
+          "C4: widened rbtree keys still collide for a real crc32 collision "
+          "-- the derivation is not reading enough of key_hash to separate "
+          "them, so every descent for this pair still falls through to the "
+          "memcmp tiebreak exactly as before the widening");
+
+    CHECK(ngx_test_lock_balanced(), "C4 test left the zone mutex held");
+}
+
 
 static void
 test_l2_neg_never_on_entry(void)
@@ -4948,12 +5109,22 @@ static void
 admit_seat_victim(int n, ngx_uint_t freq)
 {
     ngx_uint_t  i;
+    uint32_t    real_hash;
 
     ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(n), 4, 0);
     REQUIRE(find(n) != NULL, "fixture: count_miss did not create the victim");
 
+    /* C4: shm_admit() recomputes the victim's real crc32 from its full
+     * 32-byte key (ngx_crc32_short(victim->key, 32)), not from node.key --
+     * node.key is no longer that crc32 once the rbtree key is derived from
+     * key_hash instead (ngx_http_cache_turbo_shm_key64()). Bump the sketch
+     * at that same real crc32, not at KEY(n)'s fabricated
+     * (uint32_t)(0x1000+n): the two used to be identical by construction
+     * (node.key WAS the caller's hash argument, verbatim), but that
+     * coincidence is gone now that node.key is derived from key_hash. */
+    real_hash = ngx_crc32_short(mkkey(n), 32);
     for (i = 0; i < freq; i++) {
-        ngx_http_cache_turbo_shm_sketch_bump(&g_zone, (uint32_t) (0x1000 + n));
+        ngx_http_cache_turbo_shm_sketch_bump(&g_zone, real_hash);
     }
 }
 
@@ -4981,7 +5152,7 @@ test_p4_1b_admission_off_by_default(void)
 
     CHECK(ngx_http_cache_turbo_shm_sketch_estimate(&g_zone, 0xdeadbeefu) == 0,
           "fixture: the candidate should be cold");
-    CHECK(ngx_http_cache_turbo_shm_sketch_estimate(&g_zone, 0x1000) == 10,
+    CHECK(ngx_http_cache_turbo_shm_sketch_estimate(&g_zone, ngx_crc32_short(mkkey(0), 32)) == 10,
           "fixture: the victim should be hot");
 
     CHECK(ngx_http_cache_turbo_shm_admit(&g_zone, 0xdeadbeefu) == 1,
@@ -5059,7 +5230,7 @@ test_p4_1b_admits_hotter_and_tied_candidate(void)
     ngx_http_cache_turbo_shm_sketch_bump(&g_zone, cand);
 
     REQUIRE(ngx_http_cache_turbo_shm_sketch_estimate(&g_zone, cand)
-                == ngx_http_cache_turbo_shm_sketch_estimate(&g_zone, 0x1000),
+                == ngx_http_cache_turbo_shm_sketch_estimate(&g_zone, ngx_crc32_short(mkkey(0), 32)),
             "fixture: candidate and victim estimates should tie");
     CHECK(ngx_http_cache_turbo_shm_admit(&g_zone, cand) == 1,
           "P4-1b: a TIE must admit (strict <, not <=)");
@@ -5119,7 +5290,21 @@ test_p4_1b_fails_open_three_ways(void)
          * that derived key so the phantom victim reads HOT while the
          * candidate stays cold -- then a missing guard refuses and this arm
          * goes red. With no such priming the phantom estimate is 0 too, `0 <
-         * 0` admits by accident, and the arm proves nothing. */
+         * 0` admits by accident, and the arm proves nothing.
+         *
+         * C4: deliberately still `phantom->node.key`, NOT the
+         * ngx_crc32_short(victim->key, 32) a guard-removed shm_admit() would
+         * actually compute post-widening. `phantom` is sentinel-arithmetic,
+         * not a real allocation -- node.key sits at a small, in-bounds
+         * offset from it (this arm already relies on that landing inside
+         * g_sh/g_zone/g_pool's global storage), but `key[32]` sits far
+         * enough past it that reading it here is a genuine ASan
+         * global-buffer-overflow, proven experimentally. This arm's job is
+         * only to prove the EMPTY-QUEUE GUARD ITSELF is load-bearing (any
+         * consistent nonzero priming does that); it is not required to
+         * mirror shm_admit()'s post-widening victim_freq computation
+         * exactly, and the P4-1b-FAIL-OPEN canary in extract_shm.sh (not
+         * this priming) is what actually pins the guard's presence. */
         ngx_http_cache_turbo_node_t  *phantom =
             ngx_queue_data(ngx_queue_last(&g_sh.lru),
                            ngx_http_cache_turbo_node_t, lru);
@@ -5190,7 +5375,7 @@ test_p4_1b_admission_never_spins(void)
     /* A saturated victim: nothing can be hotter, so every candidate is
      * refused. This is the most refusal-prone state representable. */
     admit_seat_victim(0, NGX_HTTP_CACHE_TURBO_SKETCH_MAX + 4);
-    REQUIRE(ngx_http_cache_turbo_shm_sketch_estimate(&g_zone, 0x1000)
+    REQUIRE(ngx_http_cache_turbo_shm_sketch_estimate(&g_zone, ngx_crc32_short(mkkey(0), 32))
                 == NGX_HTTP_CACHE_TURBO_SKETCH_MAX,
             "fixture: the victim should be saturated");
 
@@ -5293,7 +5478,12 @@ mk_charged_entry(int keyn, size_t body_len)
     memset(ctn, 0, sizeof(*ctn));
 
     memcpy(ctn->key, mkkey(keyn), 32);
-    ctn->node.key = (uint32_t) (0x1000 + keyn);
+    /* C4: the rbtree key is derived from key_hash, not from KEY(n)'s
+     * fabricated (uint32_t)(0x1000+n) -- this fixture bypasses the real
+     * insert path (shm_store et al.) and must derive it the same way
+     * ngx_http_cache_turbo_shm_key64() does, or shm_lookup()/find() will
+     * never find the node this creates. */
+    ctn->node.key = ngx_http_cache_turbo_shm_key64(mkkey(keyn));
     ngx_rbtree_insert(&g_sh.rbtree, &ctn->node);
 
     ctn->kind = NGX_HTTP_CACHE_TURBO_NODE_ENTRY;
@@ -5476,6 +5666,7 @@ main(void)
     test_lease_owner_identity();
     test_count_miss_semantics();
     test_resolve_miss_merged();
+    test_c4_crc32_collision_separates_on_widened_key();
     test_l2_neg_never_on_entry();
     test_out_of_slab_fails_open();
     test_breaker_zeroed_zone_is_closed();
