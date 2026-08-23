@@ -2425,6 +2425,17 @@ ngx_http_cache_turbo_restore_response_headers(ngx_http_request_t *r,
      */
     vetted = (bh->flags & NGX_HTTP_CACHE_TURBO_BLOBF_HDRS_VETTED) ? 1 : 0;
 
+    /* C5: pre-size the list to avoid mid-restore allocations. Each
+     * ngx_list_push() call will add an element to the pre-allocated part, and
+     * no new parts will be allocated during the restore loop. If nheaders is 0,
+     * allocate at least 1 element to avoid degenerate list state. */
+    if (ngx_list_init(&r->headers_out.headers, r->pool,
+                      bh->nheaders ? bh->nheaders : 1,
+                      sizeof(ngx_table_elt_t)) != NGX_OK)
+    {
+        return NGX_ERROR;
+    }
+
     /* Restore each stored header. Content-Type is mapped to the typed field;
      * the rest go onto the headers list. */
     for (i = 0; i < bh->nheaders; i++) {
