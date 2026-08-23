@@ -1616,21 +1616,18 @@ module consumes approximately:
 - **~96 additional bytes** per extra 32 KB output chunk for larger bodies (one
   `ngx_buf_t` + one `ngx_chain_t` per chunk).
 
-**But here's the key:** nginx's default `request_pool_size 4096` already chains
-a **second pool block** from core per-request overhead alone — verified with a
+**Here's the key:** nginx's default `request_pool_size 4096` already chains a
+**second pool block** from core per-request overhead alone — verified with a
 bare `Host + Connection: close` header set, which measured 5094 bytes across 2
-blocks on a fresh request. The module does not cause that first spill; it
-inherits it.
+blocks on a fresh request. The module does not cause this; it inherits it.
 
-The module forces a **third block only for bodies exceeding 65,536 bytes**,
-during buffer construction. For typical small/medium cached responses (under 32
-KB), you may avoid the third block entirely by raising `request_pool_size` to
-8 KB:
+Raising `request_pool_size` to 8 KB makes a typical cached response (core ~5.1
+KB + module ~590 B) fit in a single 8 KB block, saving one malloc per request:
 
 ```nginx
 server {
     # default: request_pool_size 4k;
-    request_pool_size 8k;         # eliminates malloc for typical responses
+    request_pool_size 8k;         # saves one malloc per request
 
     location / {
         cache_turbo       ct;
@@ -1639,6 +1636,11 @@ server {
     }
 }
 ```
+
+For large bodies, separately: the module forces additional blocks only for
+bodies exceeding 65,536 bytes (a third 32 KB output chunk). Those cost ~96
+bytes per extra 32 KB chunk and are unaffected by the 8 KB tuning above — size
+the pool for your typical response, then budget additional chunks for outliers.
 
 That single tuning saves **one `malloc` per request, cached or not**, which is
 meaningful at scale. The tradeoff is baseline request-memory growth (nginx

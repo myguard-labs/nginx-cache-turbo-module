@@ -400,14 +400,10 @@ primed then measured on the following HIT:
 At nginx's default `request_pool_size 4096`, a fresh request already chains a
 second pool block from core overhead — verified with a minimal `Host +
 Connection: close` header set, which measured 5094 bytes across 2 blocks. The
-module **does not cause the first pool block spill**; that is nginx's own
-per-request infrastructure.
+module **does not cause this**; it is nginx's own per-request infrastructure.
 
-The module forces a **third block only for bodies exceeding 65,536 bytes**,
-during the module's own multi-buffer chain construction
-(`NGX_HTTP_CACHE_TURBO_SERVE_CHUNK = 32 KB`). For bodies below 32 KB (the
-common case), the module stays within ~590 bytes and can avoid the third
-allocation by raising `request_pool_size` to 8 KB:
+Raising `request_pool_size` to 8 KB fits a typical cached response (core ~5.1
+KB + module ~590 B) in a single 8 KB block, saving one malloc per request:
 
 ```nginx
 server {
@@ -420,6 +416,11 @@ server {
     }
 }
 ```
+
+Separately, the module forces **additional blocks only for bodies exceeding
+65,536 bytes**, during the module's own multi-buffer chain construction
+(`NGX_HTTP_CACHE_TURBO_SERVE_CHUNK = 32 KB`). Those consume ~96 bytes per
+extra 32 KB chunk and are unaffected by the 8 KB tuning above.
 
 **Cost-benefit:** The tradeoff is a baseline 4 KB → 8 KB growth in every
 request's pool (even non-cached requests and misses). Measure whether this pays
