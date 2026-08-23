@@ -70,6 +70,7 @@ check_define() {
 }
 check_define NGX_HTTP_CACHE_TURBO_NODE_ENTRY   0 "$HDR_INT"
 check_define NGX_HTTP_CACHE_TURBO_NODE_COUNTER 1 "$HDR_INT"
+check_define NGX_HTTP_CACHE_TURBO_NODE_MARKER  2 "$HDR_INT"
 # S8: PROBATION == 0 is load-bearing for the same reason ENTRY == 0 is -- a node
 # zeroed by accident must read as the EVICTABLE segment. A silent flip would
 # invert the promotion assertions while leaving them green.

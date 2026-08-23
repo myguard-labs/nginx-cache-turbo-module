@@ -618,7 +618,12 @@ ngx_http_cache_turbo_marker_store(ngx_http_request_t *r,
 
     ngx_http_cache_turbo_marker_hash(base, mk);
 
-    (void) clcf->l1->store(z, mk, ngx_crc32_short(mk, 32),
+    /* C3: not clcf->l1->store() -- markers are shm/zone-local by design (see
+     * this function's own header comment), and _shm_store_marker() folds the
+     * `markers` presence-counter bookkeeping into the SAME lock hold as the
+     * write itself (see its own comment in shm.c for why that atomicity is
+     * required, not just tidy). */
+    (void) ngx_http_cache_turbo_shm_store_marker(z, mk, ngx_crc32_short(mk, 32),
                blob, sizeof(blob), ttl, retain_ttl);
 
     /* P3-5: write the marker through to L2 too, keyed by marker_hash (the

@@ -1337,6 +1337,12 @@ http {{
     access_log off;
 
     cache_turbo_zone name=main 16m;
+    cache_turbo_zone name=c3vmz 4m;  # C3: isolated zone for the vary-marker
+                                      # presence-counter tests -- `markers` is
+                                      # per-zone, and `main` is shared by every
+                                      # other auto-Vary test in this suite, so a
+                                      # before/after delta read against it would
+                                      # not be a clean "returns to baseline".
 
     # DOC-A2: the front-controller redirect replaces r->uri, so preset URI rules
     # and cache_turbo_bypass_uri (both compare r->uri) stop seeing the real
@@ -4017,6 +4023,39 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # C3: same shape as /av/ above, but on the isolated c3vmz zone -- see
+        # that zone's own comment for why the marker-presence-counter tests
+        # cannot share /av/'s `main` zone. cache_turbo_key deliberately drops
+        # the location prefix (a fixed literal instead of $request_uri) so
+        # /avc3/ and /avc3ng/ below key the SAME base URL for the same query
+        # string -- the negative control needs a marker classified through
+        # ONE location to be the exact marker the OTHER location's (gate-
+        # forced) lookup would have found.
+        location /avc3/ {{
+            cache_turbo          c3vmz;
+            cache_turbo_key      "avc3$is_args$args";
+            cache_turbo_valid    30s;
+            cache_turbo_auto_vary on;
+            add_header           X-CT-Status $cache_turbo_status always;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # C3 negative control. Same zone (c3vmz) and same cache_turbo_key
+        # space as /avc3/ above -- a marker classified through /avc3/ is the
+        # SAME marker this location's lookup would find -- but with the gate
+        # forced to behave as if the zone held zero markers. Proves the gate
+        # is load-bearing: a real, resident marker must still fail to resolve
+        # its variant while this is armed.
+        location /avc3ng/ {{
+            cache_turbo          c3vmz;
+            cache_turbo_key      "avc3$is_args$args";
+            cache_turbo_valid    30s;
+            cache_turbo_auto_vary on;
+            cache_turbo_test_force_marker_gate_zero on;
+            add_header           X-CT-Status $cache_turbo_status always;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # cache_turbo_key_encoded_origin (P3-2): an origin that ALWAYS sends a
         # non-identity Content-Encoding (no Vary: Accept-Encoding at all --
         # the /precompressed marker) is otherwise 100% uncacheable, silently
@@ -4394,6 +4433,17 @@ http {{
         # can't be, to prove the deny path returns 403
         location = /_cache_denied {{
             cache_turbo_admin main;
+            deny all;
+        }}
+
+        # C3: stats + purge endpoint for c3vmz, so the marker-presence-counter
+        # tests read `markers` for the zone they actually store into, not
+        # `main`'s (shared by every other auto-Vary test in this suite).
+        # Unconditional (no cache_turbo_redis) on purpose -- these tests run
+        # in every lane, not only the redis one.
+        location = /_cache_c3vm {{
+            cache_turbo_admin    c3vmz;
+            allow 127.0.0.1;
             deny all;
         }}
     }}

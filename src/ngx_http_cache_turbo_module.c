@@ -615,6 +615,18 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_cache_turbo_loc_conf_t, test_midbody_abort),
       NULL },
+
+    /* C3: negative control for the marker-presence-counter gate -- force
+     * access_l1() to treat the zone as having zero L1 markers on every
+     * request through this location, so a genuinely-stored marker's variant
+     * resolution can be proven to break exactly like a stuck-at-0 under-count
+     * would. See the loc_conf field comment. */
+    { ngx_string("cache_turbo_test_force_marker_gate_zero"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_turbo_loc_conf_t, test_force_marker_gate_zero),
+      NULL },
 #endif
 
       ngx_null_command
@@ -5143,6 +5155,7 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->test_l2_promote_hold_ms = NGX_CONF_UNSET;
     conf->test_midbody_abort = NGX_CONF_UNSET;
     conf->test_warm_ctx_fail = NGX_CONF_UNSET;
+    conf->test_force_marker_gate_zero = NGX_CONF_UNSET;
 #endif
     /* shm_zone, key, redis_addr, redis_prefix default NULL via pcalloc */
 
