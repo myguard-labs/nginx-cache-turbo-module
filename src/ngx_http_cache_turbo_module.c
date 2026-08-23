@@ -41,7 +41,7 @@
 ngx_uint_t ngx_http_cache_turbo_breaker_should_consult(
     ngx_http_cache_turbo_loc_conf_t *clcf);
 static ngx_int_t ngx_http_cache_turbo_restore_response(ngx_http_request_t *r,
-    u_char *copy, size_t len, ngx_uint_t stale, const char *xcache,
+    u_char *copy, size_t len, ngx_uint_t stale, ngx_uint_t xcache,
     u_char **bodyp, size_t *body_lenp);
 static ngx_int_t ngx_http_cache_turbo_restore_response_prologue(
     ngx_http_request_t *r, u_char *copy, size_t len, ngx_uint_t stale,
@@ -57,8 +57,12 @@ static ngx_int_t ngx_http_cache_turbo_restore_response_headers(
 static ngx_int_t ngx_http_cache_turbo_restore_response_finalize(
     ngx_http_request_t *r, ngx_http_cache_turbo_loc_conf_t *clcf,
     ngx_http_cache_turbo_blob_hdr_t *bh, ngx_uint_t stale,
-    const char *xcache, u_char *etag, size_t etag_len,
+    ngx_uint_t xcache, u_char *etag, size_t etag_len,
     u_char *lastmod, size_t lastmod_len, size_t *body_lenp);
+/* Defined near serve_reason_str() at the tail of this file, beside the other
+ * serve-reason vocabulary, but consumed by restore_response_finalize() above
+ * it. */
+static const char *ngx_http_cache_turbo_xcache_str(ngx_uint_t sr, size_t *len);
 static ngx_uint_t ngx_http_cache_turbo_restore_alloc_fails(
     ngx_http_request_t *r);
 /* ngx_http_cache_turbo_send_json declared non-static in
@@ -2507,7 +2511,7 @@ static ngx_int_t
 ngx_http_cache_turbo_restore_response_finalize(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf,
     ngx_http_cache_turbo_blob_hdr_t *bh,
-    ngx_uint_t stale, const char *xcache,
+    ngx_uint_t stale, ngx_uint_t xcache,
     u_char *etag, size_t etag_len,
     u_char *lastmod, size_t lastmod_len,
     size_t *body_lenp)
@@ -2649,42 +2653,35 @@ ngx_http_cache_turbo_restore_response_finalize(ngx_http_request_t *r,
      * clear it downstream with the standard nginx header tooling. */
     {
         ngx_http_cache_turbo_ctx_t  *sctx;
+        const char                  *xcv;
+        size_t                       xcvlen;
         static u_char  xc_name[] = "X-Cache";
+
+        xcv = ngx_http_cache_turbo_xcache_str(xcache, &xcvlen);
+
         if (ngx_http_cache_turbo_add_header(r, xc_name,
-                sizeof("X-Cache") - 1, (u_char *) xcache,
-                ngx_strlen(xcache)) != NGX_OK)
+                sizeof("X-Cache") - 1, (u_char *) xcv, xcvlen) != NGX_OK)
         {
             return NGX_ERROR;
         }
 
-        /* Record the served outcome for $cache_turbo_status. Match the reason
-         * EXACTLY rather than switching on xcache[0]: O4.3 made this parameter
-         * caller-supplied ("STALE-BREAKER"), so a first-byte test silently
-         * turns every future reason beginning with 'H' into a fresh HIT. Any
-         * non-HIT reason -- "STALE", "STALE-IF-ERROR", "STALE-BREAKER" -- folds
-         * to STALE, which is what $upstream_cache_status compatibility wants. */
+        /* Record the served outcome for $cache_turbo_status. The reason
+         * arrives as its SR_* code, so this is a plain integer test -- no
+         * string comparison, and no way for a future reason to be misread the
+         * way a first-byte test on the old `const char *` could have been.
+         * Any non-FRESH reason -- STALE, STALE_IF_ERROR, STALE_BREAKER --
+         * folds to ST_STALE, which is what $upstream_cache_status
+         * compatibility wants. */
         sctx = ngx_http_get_module_ctx(r, ngx_http_cache_turbo_module);
         if (sctx != NULL) {
-            sctx->status = (ngx_strcmp(xcache, "HIT") == 0)
+            sctx->status = (xcache == NGX_HTTP_CACHE_TURBO_SR_FRESH)
                 ? NGX_HTTP_CACHE_TURBO_ST_HIT
                 : NGX_HTTP_CACHE_TURBO_ST_STALE;
 
-            /* S7.2: unfolded reason for $cache_turbo_serve_reason. Same
-             * exact-match discipline as the fold above -- never switch on
-             * xcache[0]. FRESH is the S7.2 spec's name for what `status`
-             * calls HIT; the other three values pass through as-is. */
-            if (ngx_strcmp(xcache, "HIT") == 0) {
-                sctx->serve_reason = NGX_HTTP_CACHE_TURBO_SR_FRESH;
-
-            } else if (ngx_strcmp(xcache, "STALE") == 0) {
-                sctx->serve_reason = NGX_HTTP_CACHE_TURBO_SR_STALE;
-
-            } else if (ngx_strcmp(xcache, "STALE-IF-ERROR") == 0) {
-                sctx->serve_reason = NGX_HTTP_CACHE_TURBO_SR_STALE_IF_ERROR;
-
-            } else if (ngx_strcmp(xcache, "STALE-BREAKER") == 0) {
-                sctx->serve_reason = NGX_HTTP_CACHE_TURBO_SR_STALE_BREAKER;
-            }
+            /* S7.2: unfolded reason for $cache_turbo_serve_reason. The caller
+             * already supplies exactly this enum, so it is stored as-is.
+             * FRESH is the S7.2 spec's name for what `status` calls HIT. */
+            sctx->serve_reason = xcache;
         }
     }
 
@@ -2706,7 +2703,7 @@ ngx_http_cache_turbo_restore_response_finalize(ngx_http_request_t *r,
  * before the split. */
 static ngx_int_t
 ngx_http_cache_turbo_restore_response(ngx_http_request_t *r, u_char *copy,
-    size_t len, ngx_uint_t stale, const char *xcache,
+    size_t len, ngx_uint_t stale, ngx_uint_t xcache,
     u_char **bodyp, size_t *body_lenp)
 {
     u_char                            *body;
@@ -2767,7 +2764,7 @@ ngx_http_cache_turbo_restore_response(ngx_http_request_t *r, u_char *copy,
 ngx_int_t
 ngx_http_cache_turbo_serve(ngx_http_request_t *r, u_char *copy, size_t len,
     ngx_uint_t stale, ngx_http_cache_turbo_zone_t *z, u_char *ref_data,
-    const char *xcache)
+    ngx_uint_t xcache)
 {
     u_char                           *body;
     size_t                            body_len;
@@ -2827,7 +2824,7 @@ ngx_http_cache_turbo_serve(ngx_http_request_t *r, u_char *copy, size_t len,
     if (copy != NULL && len >= NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE) {
         if ((ngx_http_cache_turbo_get_u16(copy + 6)
              & NGX_HTTP_CACHE_TURBO_BLOBF_BREAKER_ONLY)
-            && (xcache == NULL || ngx_strcmp(xcache, "STALE-BREAKER") != 0))
+            && xcache != NGX_HTTP_CACHE_TURBO_SR_STALE_BREAKER)
         {
             if (ref_data != NULL && cc != NULL) {
                 /* The cleanup registered above owns the ref; disarm it and drop
@@ -2975,15 +2972,19 @@ ngx_http_cache_turbo_serve(ngx_http_request_t *r, u_char *copy, size_t len,
     }
 
     /* P6/O4.3: `xcache` lets a caller name the serve reason (the breaker's
-     * STALE-BREAKER). NULL keeps the original HIT/STALE choice, which is what
-     * every pre-O4.3 call site passes.
+     * SR_STALE_BREAKER). SR_NONE keeps the original FRESH/STALE choice derived
+     * from `stale`, which is what every pre-O4.3 call site passes -- the same
+     * contract the NULL `const char *` used to express, now in the enum's own
+     * "not specified" value.
      *
-     * The $cache_turbo_status mapping in restore_response() compares the
-     * reason EXACTLY against "HIT", so any override is safe -- including one
-     * that starts with 'H'. An earlier revision folded on the first byte, which
-     * would have logged such a value as a fresh HIT. */
+     * The $cache_turbo_status mapping in restore_response() dispatches on the
+     * SR_* code, so any override is safe by construction; no spelling of a
+     * reason can be confused for another. */
     if (ngx_http_cache_turbo_restore_response(r, copy, len, stale,
-            xcache != NULL ? xcache : (stale ? "STALE" : "HIT"),
+            xcache != NGX_HTTP_CACHE_TURBO_SR_NONE
+                ? xcache
+                : (stale ? NGX_HTTP_CACHE_TURBO_SR_STALE
+                         : NGX_HTTP_CACHE_TURBO_SR_FRESH),
             &body, &body_len) != NGX_OK)
     {
         return NGX_ERROR;
@@ -3797,7 +3798,8 @@ ngx_http_cache_turbo_sie_rewrite(ngx_http_request_t *r,
     /* stale = 1: never answer 304 from a serve-on-error copy (it has not been
      * revalidated), and the X-Cache value flags the replacement. */
     if (ngx_http_cache_turbo_restore_response(r, ctx->sie_snap,
-            ctx->sie_snap_len, 1, "STALE-IF-ERROR", &body, &body_len) != NGX_OK)
+            ctx->sie_snap_len, 1, NGX_HTTP_CACHE_TURBO_SR_STALE_IF_ERROR,
+            &body, &body_len) != NGX_OK)
     {
         return NGX_ERROR;
     }
@@ -4975,6 +4977,50 @@ ngx_http_cache_turbo_serve_reason_str(ngx_uint_t sr)
     case NGX_HTTP_CACHE_TURBO_SR_STALE_BREAKER:   return "STALE-BREAKER";
     case NGX_HTTP_CACHE_TURBO_SR_BREAKER_503:     return "BREAKER-503";
     default:                                      return NULL;
+    }
+}
+
+
+/*
+ * The X-Cache WIRE vocabulary for a serve reason, with its length -- the value
+ * emitted on the response header, which is NOT the same vocabulary as
+ * $cache_turbo_serve_reason above: SR_FRESH is "HIT" on the wire and "FRESH" in
+ * the variable, and that difference is deliberate (S7.2 names the reason;
+ * X-Cache keeps the conventional HIT spelling). Both mappings live next to each
+ * other so a new reason cannot be added to one and forgotten in the other.
+ *
+ * PERF: the serve path used to carry the reason as a `const char *` and recover
+ * its meaning with up to five ngx_strcmp() calls plus an ngx_strlen() per
+ * served response. The reason is now carried as the SR_* code it always was
+ * semantically, so those become integer compares and the wire length is a
+ * compile-time constant.
+ *
+ * This also removes a documented fail-open: the old code could not switch on
+ * xcache[0] because a future reason beginning with 'H' would silently log as a
+ * fresh HIT. Dispatching on the enum makes that class of mistake impossible
+ * rather than merely commented against.
+ *
+ * SR_NONE / SR_BREAKER_503 never reach a serve (the 503 path does not call
+ * serve()), so they map to the HIT spelling only as an unreachable default;
+ * every real caller passes one of the four serve reasons.
+ */
+static const char *
+ngx_http_cache_turbo_xcache_str(ngx_uint_t sr, size_t *len)
+{
+    switch (sr) {
+    case NGX_HTTP_CACHE_TURBO_SR_STALE:
+        *len = sizeof("STALE") - 1;
+        return "STALE";
+    case NGX_HTTP_CACHE_TURBO_SR_STALE_IF_ERROR:
+        *len = sizeof("STALE-IF-ERROR") - 1;
+        return "STALE-IF-ERROR";
+    case NGX_HTTP_CACHE_TURBO_SR_STALE_BREAKER:
+        *len = sizeof("STALE-BREAKER") - 1;
+        return "STALE-BREAKER";
+    case NGX_HTTP_CACHE_TURBO_SR_FRESH:
+    default:
+        *len = sizeof("HIT") - 1;
+        return "HIT";
     }
 }
 

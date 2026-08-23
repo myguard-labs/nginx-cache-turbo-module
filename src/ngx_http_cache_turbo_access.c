@@ -176,11 +176,12 @@ ngx_http_cache_turbo_access_eligible(ngx_http_request_t *r,
      * capture_count_refusal() attributes it instead, and counting it in both
      * places would double-count a single request. */
     if (r->headers_in.authorization != NULL && !clcf->serve_authorized) {
-        if (clcf->shm_zone != NULL) {
-            ngx_http_cache_turbo_zone_t  *rz = clcf->shm_zone->data;
+        /* shm_zone is provably non-NULL here: the first gate of this function
+         * returns NGX_DECLINED when it is NULL, so the re-test this block used
+         * to carry was a dead branch on a per-request path. */
+        ngx_http_cache_turbo_zone_t  *rz = clcf->shm_zone->data;
 
-            (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(rz)->refuse_authorization, 1);
-        }
+        (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(rz)->refuse_authorization, 1);
         return NGX_DECLINED;
     }
 
@@ -361,10 +362,6 @@ ngx_http_cache_turbo_access_prologue(ngx_http_request_t *r,
     if (ngx_http_cache_turbo_request_revalidate(r, ctx)) {
         ngx_uint_t  brk_open_now;
 
-        brk_open_now = ngx_http_cache_turbo_breaker_should_consult(clcf)
-            && ngx_http_cache_turbo_brk_state(ngx_http_cache_turbo_zone_sh(z)->breaker_state)
-                   == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN;
-
         if (ctx->req_only_if_cached) {
             /* Nothing serveable without origin contact the client forbids:
              * a cache miss from the client's view ($cache_turbo_status MISS,
@@ -376,6 +373,17 @@ ngx_http_cache_turbo_access_prologue(ngx_http_request_t *r,
                            "\"%V\" -> 504", &r->uri);
             return NGX_HTTP_GATEWAY_TIME_OUT;
         }
+
+        /* Computed HERE, not above the only-if-cached arm: that arm returns 504
+         * without ever consulting the breaker, so hoisting this spent a config
+         * check plus a shared-memory breaker_state read for nothing on that
+         * path. The read stays RAW (brk_state on the shm word, never
+         * _breaker_state(), which would perform the due OPEN -> HALF_OPEN
+         * promotion) -- see the comment above for why that promotion must not
+         * be spent at this early exit. */
+        brk_open_now = ngx_http_cache_turbo_breaker_should_consult(clcf)
+            && ngx_http_cache_turbo_brk_state(ngx_http_cache_turbo_zone_sh(z)->breaker_state)
+                   == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN;
 
         if (brk_open_now) {
             ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
@@ -898,7 +906,7 @@ ngx_http_cache_turbo_access_l1_serve_fresh(ngx_http_request_t *r,
                    &r->uri, (ngx_uint_t) hash, body_len);
 
     *out_rc = ngx_http_cache_turbo_serve(r, body, body_len, 0, z, body,
-              NULL);
+              NGX_HTTP_CACHE_TURBO_SR_NONE);
     return NGX_DONE;
 }
 
@@ -1010,7 +1018,7 @@ ngx_http_cache_turbo_access_l1_serve_stale(ngx_http_request_t *r,
              * warning on blob_ref_cleanup()'s comment. */
 
             *out_rc = ngx_http_cache_turbo_serve(r, snap, snap_len, 1,
-                      z, NULL, NULL);
+                      z, NULL, NGX_HTTP_CACHE_TURBO_SR_NONE);
             return NGX_DONE;
 
         }
@@ -1166,7 +1174,7 @@ ngx_http_cache_turbo_access_l1_serve_stale(ngx_http_request_t *r,
                            snap_len);
 
             *out_rc = ngx_http_cache_turbo_serve(r, snap, snap_len, 1,
-                      z, NULL, NULL);
+                      z, NULL, NGX_HTTP_CACHE_TURBO_SR_NONE);
             return NGX_DONE;
 
         }
@@ -1190,7 +1198,7 @@ ngx_http_cache_turbo_access_l1_serve_stale(ngx_http_request_t *r,
                        &r->uri, (ngx_uint_t) hash, body_len);
 
         *out_rc = ngx_http_cache_turbo_serve(r, body, body_len, 1, z, body,
-                  NULL);
+                  NGX_HTTP_CACHE_TURBO_SR_NONE);
         return NGX_DONE;
 
     }
@@ -1355,6 +1363,7 @@ ngx_http_cache_turbo_access_l1(ngx_http_request_t *r,
      * exactly as the inline code left its own `hash` local behind. */
     uint32_t                      hash = *hashp;
     ngx_http_cache_turbo_node_t  *ctn;
+    time_t                        now;
 
     ngx_shmtx_lock(ngx_http_cache_turbo_zone_mutex(z));
 
@@ -1411,6 +1420,15 @@ ngx_http_cache_turbo_access_l1(ngx_http_request_t *r,
 
     ctn = clcf->l1->lookup(z, ctx->key_hash, hash);
 
+    /* Read the cached clock ONCE for the whole lock-held region below. Both
+     * consumers (the varidx retention and the freshness decisions) ran their
+     * own ngx_time() inside the zone mutex; it is only a cached volatile read,
+     * but this critical section is the module's documented throughput cap
+     * (ngx_shmtx_lock outweighs the rbtree descent in the D2 profile), so it is
+     * not the place to do the same work twice. One value also means the two
+     * cannot straddle a clock tick and disagree about `now`. */
+    now = ngx_time();
+
     /* COR-5(b): consume this node's dropped-index flag while we already hold
      * the mutex for the lookup above -- no extra acquisition, and the clear is
      * atomic with the read so two concurrent hits cannot both re-issue. The
@@ -1421,12 +1439,11 @@ ngx_http_cache_turbo_access_l1(ngx_http_request_t *r,
         ctn->varidx_pending = 0;
         ctx->varidx_reissue = 1;
         ctx->varidx_reissue_ttl = ctn->stale_until > 0
-                                  ? ctn->stale_until - ngx_time()
+                                  ? ctn->stale_until - now
                                   : 0;
     }
 
     if (ctn != NULL) {
-        time_t     now = ngx_time();
         time_t     fresh_until = ctn->fresh_until;
         time_t     stale_until = ctn->stale_until;
         ngx_int_t  fresh_ok = 1, stale_ok = 1;
@@ -2354,7 +2371,7 @@ ngx_http_cache_turbo_access_l2_promote_serve(ngx_http_request_t *r,
 
     *out_rc = ngx_http_cache_turbo_serve(r, ctx->l2_blob,
               ctx->l2_blob_len, rem_fresh <= 0 ? 1 : 0,
-              z, NULL, NULL);
+              z, NULL, NGX_HTTP_CACHE_TURBO_SR_NONE);
     return NGX_DONE;
 
                           /* L2 blob lives in r->pool, no ref */
@@ -2547,7 +2564,8 @@ ngx_http_cache_turbo_access_only_if_cached(ngx_http_request_t *r,
             /* ref_data = NULL: the arming site owns the reference drop. */
 
             *out_rc = ngx_http_cache_turbo_serve(r, ctx->brk_snap,
-                      ctx->brk_snap_len, 1, z, NULL, "STALE-BREAKER");
+                      ctx->brk_snap_len, 1, z, NULL,
+                      NGX_HTTP_CACHE_TURBO_SR_STALE_BREAKER);
             return NGX_DONE;
 
         }
@@ -2737,7 +2755,8 @@ ngx_http_cache_turbo_access_breaker_gate(ngx_http_request_t *r,
                  * to this call. */
 
                 *out_rc = ngx_http_cache_turbo_serve(r, ctx->brk_snap,
-                          ctx->brk_snap_len, 1, z, NULL, "STALE-BREAKER");
+                          ctx->brk_snap_len, 1, z, NULL,
+                          NGX_HTTP_CACHE_TURBO_SR_STALE_BREAKER);
                 return NGX_DONE;
 
             }
@@ -2994,7 +3013,8 @@ ngx_http_cache_turbo_access_cold(ngx_http_request_t *r,
                                    "key=%ui -> serve", &r->uri, (ngx_uint_t) hash);
 
                     *out_rc = ngx_http_cache_turbo_serve(r, fresh_data,
-                              fresh_len_out, 0, z, fresh_data, NULL);
+                              fresh_len_out, 0, z, fresh_data,
+                              NGX_HTTP_CACHE_TURBO_SR_NONE);
                     return NGX_DONE;
 
                 }
@@ -3048,7 +3068,7 @@ ngx_http_cache_turbo_access_cold(ngx_http_request_t *r,
                                "key=%ui -> serve", &r->uri, (ngx_uint_t) hash);
 
                 *out_rc = ngx_http_cache_turbo_serve(r, body, snap_len, 0, z, body,
-                          NULL);
+                          NGX_HTTP_CACHE_TURBO_SR_NONE);
                 return NGX_DONE;
 
             }
@@ -3383,7 +3403,8 @@ ngx_http_cache_turbo_cold_wait(ngx_http_request_t *r,
                            "cache_turbo: cold-miss wait timeout \"%V\" -> "
                            "serving armed SIE snapshot", &r->uri);
             return ngx_http_cache_turbo_serve(r, ctx->sie_snap,
-                       ctx->sie_snap_len, 1, z, NULL, "STALE-IF-ERROR");
+                       ctx->sie_snap_len, 1, z, NULL,
+                       NGX_HTTP_CACHE_TURBO_SR_STALE_IF_ERROR);
         }
 
         /* Waited long enough: give up and regenerate ourselves. Our store ends

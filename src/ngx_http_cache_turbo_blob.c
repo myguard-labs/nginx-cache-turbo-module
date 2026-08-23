@@ -122,9 +122,6 @@ ngx_http_cache_turbo_digest_init(ngx_http_cache_turbo_digest_t *d)
 
     d->md = ngx_http_cache_turbo_worker_md;
 
-    /* Default / no-guard / failed-fetch fallback: today's call, unchanged. */
-    md_type = EVP_sha256();
-
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L && !defined(LIBRESSL_VERSION_NUMBER)
     {
         EVP_MD  *fetched;
@@ -143,13 +140,24 @@ ngx_http_cache_turbo_digest_init(ngx_http_cache_turbo_digest_t *d)
         }
 #endif
 
-        /* A NULL fetch (real OOM/provider-load failure, or the test knob
-         * above) is a degraded-but-correct path, not an error: md_type
-         * stays EVP_sha256() and the request is served exactly as before. */
-        if (fetched != NULL) {
-            md_type = fetched;
-        }
+        /* PERF: EVP_sha256() is evaluated ONLY on the fallback arm, never when
+         * the worker-cached fetch is available. It returns a legacy
+         * EVP_ORIG_GLOBAL handle, so OpenSSL 3 answers it with an implicit
+         * EVP_MD_fetch -- a property query + provider hashtable lookup. That
+         * is the very call PR #409 removed from EVP_DigestInit_ex's argument
+         * (ossl_fnv1a_hash, 5.55% self-time); computing it here and then
+         * discarding it on the common path paid the same cost again, 1-4x per
+         * request (build_key + up to three vary sites).
+         *
+         * A NULL fetch (real OOM/provider-load failure, or the test knob
+         * above) is a degraded-but-correct path, not an error: md_type falls
+         * back to EVP_sha256() and the request is served exactly as before,
+         * producing a byte-identical digest. */
+        md_type = (fetched != NULL) ? (const EVP_MD *) fetched : EVP_sha256();
     }
+#else
+    /* No-guard fallback (pre-3.0 / LibreSSL): today's call, unchanged. */
+    md_type = EVP_sha256();
 #endif
 
     d->ok = (d->md != NULL

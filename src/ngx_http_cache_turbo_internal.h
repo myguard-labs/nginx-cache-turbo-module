@@ -1256,7 +1256,7 @@ void ngx_http_cache_turbo_blob_cleanup(void *data);
  * and slice identically; ci/tests/unit/extract_shm.sh is unaffected. */
 ngx_int_t ngx_http_cache_turbo_serve(ngx_http_request_t *r, u_char *copy,
     size_t len, ngx_uint_t stale, ngx_http_cache_turbo_zone_t *z,
-    u_char *ref_data, const char *xcache);
+    u_char *ref_data, ngx_uint_t xcache);
 ngx_int_t ngx_http_cache_turbo_add_header(ngx_http_request_t *r, u_char *name,
     size_t nlen, u_char *val, size_t vlen);
 ngx_uint_t ngx_http_cache_turbo_breaker_action(ngx_uint_t state,
