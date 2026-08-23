@@ -625,10 +625,29 @@ ngx_http_cache_turbo_admin_stats_prometheus(ngx_http_request_t *r,
 
 
 /* GET/HEAD default JSON stats reply (the ?format=prometheus branch is handled
- * separately by admin_stats_prometheus before this runs). */
+ * separately by admin_stats_prometheus before this runs).
+ *
+ * "lock_ttl" is the one EFFECTIVE-CONFIG field on this object; everything else
+ * is a zone counter. It reports clcf->lock_ttl -- the post-merge, post-clamp
+ * single-flight lock TTL in seconds, i.e. what the runtime claim path in
+ * ngx_http_cache_turbo_access.c actually multiplies by effective_load(). It is
+ * read off THIS ADMIN LOCATION's own loc_conf, not the cached location's:
+ * lock_ttl is per-location while the counters are per-zone, so an operator
+ * reading it back must set cache_turbo_lock_ttl on the admin location whose
+ * value they mean to inspect (the fixture's /_cache_lockttl does exactly this).
+ *
+ * Only the effective value is exposed, not the raw configured one: the clamp in
+ * ngx_http_cache_turbo_lock_ttl_conf() overwrites its local before storing into
+ * lock_ttl_raw, so an out-of-range configured value is not retained anywhere
+ * and there is no pre-clamp number left to report. Adding a field purely to
+ * carry it would be a test-only knob on a shipped surface, which this module
+ * deliberately does not do (C3 removed exactly that shape). The clamp is
+ * observable as "an oversized value reads back as 4294967295", which is the
+ * operator-facing question ("why does my 999999999s behave as a ceiling?")
+ * answered by the value itself. */
 static ngx_int_t
 ngx_http_cache_turbo_admin_stats_json(ngx_http_request_t *r,
-    ngx_http_cache_turbo_stats_t *st)
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_stats_t *st)
 {
     ngx_str_t   body;
     u_char     *p;
@@ -648,9 +667,18 @@ ngx_http_cache_turbo_admin_stats_json(ngx_http_request_t *r,
                  "\"origin_failures\":,\"varidx_drops\":,"
                  "\"tag_index_drops\":,\"tag_cap_drops\":,\"bg_inflight\":,"
                  "\"sketch_gen\":,\"sketch_bumps\":,"
-                 "\"admission_refused\":,\"used_bytes\":,\"markers\":}\n")
+                 "\"admission_refused\":,\"used_bytes\":,\"markers\":,"
+                 "\"lock_ttl\":}\n")
           + 35 * NGX_ATOMIC_T_LEN
-          + sizeof("half-open") - 1;   /* longest _breaker_state_str value */
+          + sizeof("half-open") - 1    /* longest _breaker_state_str value */
+          /* lock_ttl renders as %T, a signed time_t, NOT an ngx_atomic_uint_t,
+           * so it is budgeted on its own rather than by bumping the 35 above:
+           * NGX_TIME_T_LEN is the width ngx_sprintf can emit for that type,
+           * sign included. It is capped at NGX_HTTP_CACHE_TURBO_TTL_MAX
+           * (4294967295, 10 digits) in practice, but budget the type's full
+           * width -- sizing to the value's practical range is exactly the
+           * estimate ci/tools/lint-admin-buffer-budget.py exists to forbid. */
+          + NGX_TIME_T_LEN;
     p = ngx_pnalloc(r->pool, len);
     if (p == NULL) {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -673,7 +701,8 @@ ngx_http_cache_turbo_admin_stats_json(ngx_http_request_t *r,
         "\"origin_failures\":%uA,\"varidx_drops\":%uA,"
         "\"tag_index_drops\":%uA,\"tag_cap_drops\":%uA,\"bg_inflight\":%uA,"
         "\"sketch_gen\":%uA,\"sketch_bumps\":%uA,"
-        "\"admission_refused\":%uA,\"used_bytes\":%uA,\"markers\":%uA}\n",
+        "\"admission_refused\":%uA,\"used_bytes\":%uA,\"markers\":%uA,"
+        "\"lock_ttl\":%T}\n",
         st->hits, st->misses, st->stale_serves,
         st->refreshes, st->evictions, st->l2_hits, st->l2_misses,
         st->lock_waits, st->min_uses_skips, st->l2_neg_skips,
@@ -690,7 +719,8 @@ ngx_http_cache_turbo_admin_stats_json(ngx_http_request_t *r,
         st->varidx_drops, st->tag_index_drops, st->tag_cap_drops,
         st->bg_inflight,
         st->sketch_gen, st->sketch_bumps, st->admission_refused,
-        st->used_bytes, st->markers) - p;
+        st->used_bytes, st->markers,
+        clcf->lock_ttl) - p;
 
     return ngx_http_cache_turbo_send_json(r, NGX_HTTP_OK, &body);
 }
@@ -725,7 +755,7 @@ ngx_http_cache_turbo_admin_stats_dispatch(ngx_http_request_t *r,
         return ngx_http_cache_turbo_admin_stats_prometheus(r, clcf, &st);
     }
 
-    return ngx_http_cache_turbo_admin_stats_json(r, &st);
+    return ngx_http_cache_turbo_admin_stats_json(r, clcf, &st);
 }
 
 

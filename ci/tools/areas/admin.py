@@ -15,6 +15,7 @@ from test_runtime_base import *
 from test_runtime_base import (
     _admin_lock_waits,
     _admin_min_uses_skips,
+    _admin_stat,
     _config_test_result,
     _errlog_level,
     _redis_conns_received,
@@ -1996,3 +1997,52 @@ def test_l2_tls(ng: Nginx, origin: Origin,
         "object not in TLS redis (handshake/verify failed?)"
     _, _, h = fetch(ng.port, "/l2tls/k1")
     assert h.get("x-cache") == "HIT", "second read should be an L1 hit"
+
+
+def test_admin_lock_ttl_oversized_reads_back_clamped(ng: Nginx) -> None:
+    """O4.4-b, the read-back half: an oversized cache_turbo_lock_ttl must read
+    back off the admin JSON as NGX_HTTP_CACHE_TURBO_TTL_MAX (4294967295).
+
+    This is the assertion the clamp never had. Its sibling in areas/breaker.py,
+    test_lock_ttl_oversized_clamped_not_rejected, can only show that an
+    oversized value still PARSES -- it is a clamp-not-reject guard, and it says
+    so, because before the admin "lock_ttl" field existed there was no path by
+    which the clamped VALUE could be observed: lock_ttl_raw is not a variable,
+    the setter overwrites its local before storing, and neither returncode nor
+    duplicate-rejection distinguishes the custom setter from the
+    ngx_conf_set_sec_slot it replaced. Every candidate oracle tried in
+    2026-08-23 held pre-fix too, which is why the row stayed open for a month.
+
+    NEGATIVE CONTROL (run 2026-08-23, both directions, recorded in the PR):
+    against a binary built from the parent commit -- which emits no "lock_ttl"
+    key at all -- _admin_stat's `.get(name, 0)` default returns 0, so the
+    equality below fails with `0 != 4294967295`. It is not a presence check
+    dressed up as a value check: it fails on the pre-change build for the right
+    reason, and only the clamped value satisfies it.
+
+    Two locations, not one, so the field is shown to TRACK config rather than
+    be a constant: /_cache_lockttl configures 900000000000s (far above the
+    ceiling) and must report the ceiling; /_cache_lockttl_ok configures a
+    plain 7s and must report 7. A build that hardcoded TTL_MAX, or that
+    reported the ceiling for every location, passes the first arm and fails the
+    second.
+
+    Takes only `ng` -- no redis/TLS fixture -- so it cannot early-return into a
+    silent skip the way the L2 tests above can."""
+    ttl_max = 0xFFFFFFFF
+
+    clamped = _admin_stat(ng, "lock_ttl", "/_cache_lockttl")
+    assert clamped == ttl_max, (
+        f"cache_turbo_lock_ttl 900000000000s read back as {clamped}, expected "
+        f"the NGX_HTTP_CACHE_TURBO_TTL_MAX clamp {ttl_max}. A 0 here means the "
+        f"admin JSON carries no \"lock_ttl\" field at all (the pre-clamp-readback "
+        f"build); any other non-zero value means the parse-time clamp in "
+        f"ngx_http_cache_turbo_lock_ttl_conf() did not apply."
+    )
+
+    plain = _admin_stat(ng, "lock_ttl", "/_cache_lockttl_ok")
+    assert plain == 7, (
+        f"cache_turbo_lock_ttl 7s read back as {plain}, expected 7 -- the admin "
+        f"lock_ttl field must report this location's effective value, not a "
+        f"constant ceiling."
+    )

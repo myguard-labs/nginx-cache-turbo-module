@@ -4423,6 +4423,32 @@ http {{
             allow 127.0.0.1;
             deny all;
         }}
+        # O4.4-b read-back lever: the admin JSON's "lock_ttl" reports THIS
+        # location's own effective (post-merge, post-clamp) lock TTL, so the
+        # clamp to NGX_HTTP_CACHE_TURBO_TTL_MAX becomes observable at config
+        # level for the first time. 900000000000s is far above the ceiling and
+        # still parses cleanly (it is under NGX_MAX_INT_T_VALUE, so
+        # ngx_parse_time does not short-circuit it), which is what makes the
+        # clamp -- rather than a parse failure -- the thing being measured.
+        # Counters here read zone `main` and are ignored; only lock_ttl is
+        # asserted, so this location contends with nothing.
+        location = /_cache_lockttl {{
+            cache_turbo_admin main;
+            cache_turbo_lock_ttl 900000000000s;
+            allow 127.0.0.1;
+            deny all;
+        }}
+        # Control arm for the above: an ordinary in-range value on an otherwise
+        # identical location. Without it, "lock_ttl reads 4294967295" is also
+        # what a build that hardcoded the ceiling, or that reported TTL_MAX for
+        # every location, would print -- this proves the field tracks the
+        # configured value instead of being a constant.
+        location = /_cache_lockttl_ok {{
+            cache_turbo_admin main;
+            cache_turbo_lock_ttl 7s;
+            allow 127.0.0.1;
+            deny all;
+        }}
         # same endpoint but reachable only from a (non-loopback) address we
         # can't be, to prove the deny path returns 403
         location = /_cache_denied {{
