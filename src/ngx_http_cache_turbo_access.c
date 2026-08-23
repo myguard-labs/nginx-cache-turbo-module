@@ -491,8 +491,11 @@ ngx_http_cache_turbo_blob_cleanup(void *data)
  * this BEFORE ngx_http_cache_turbo_blob_acquire() precisely so that failure
  * path owns nothing: no reference has been taken yet, so the caller arms
  * nothing and releases nothing. A future caller that acquires first would have
- * to release here -- and could not, because blob_release() takes the zone mutex
- * the arming sites already hold. Keep the order.
+ * to release here -- and could not, because blob_release() may take the zone
+ * mutex (on the terminal refcount transition) that the arming sites already
+ * hold. A may-acquire is as fatal as a does-acquire here: ngx_shmtx is not
+ * recursive, and the caller cannot know which arm it will land on. Keep the
+ * order.
  */
 static ngx_int_t
 ngx_http_cache_turbo_blob_ref_cleanup(ngx_http_request_t *r,
@@ -973,8 +976,10 @@ ngx_http_cache_turbo_access_l1_serve_stale(ngx_http_request_t *r,
              * failing call here is ngx_pool_cleanup_add(), which
              * touches r->pool only, so failing first costs nothing to
              * undo. Acquiring first would force the failure arm to
-             * call blob_release(), which takes the zone mutex we are
-             * still holding here (ngx_shmtx is not recursive). */
+             * call blob_release(), which may take the zone mutex we
+             * are still holding here -- on the terminal refcount
+             * transition (ngx_shmtx is not recursive, and the arm is
+             * not knowable in advance). */
             u_char *snap;
             size_t  snap_len;
 
@@ -1098,7 +1103,8 @@ ngx_http_cache_turbo_access_l1_serve_stale(ngx_http_request_t *r,
          * is ngx_pool_cleanup_add() (r->pool only), so failing first
          * costs nothing to undo, whereas acquiring first would force
          * the failure arm to call blob_release() while still holding
-         * this same zone mutex (ngx_shmtx is not recursive). */
+         * this same zone mutex, which its terminal refcount arm may
+         * take (ngx_shmtx is not recursive). */
         snap_len = ctn->len;
         if (ngx_http_cache_turbo_blob_ref_cleanup(r, z, ctn->data,
                 NULL) != NGX_OK)
@@ -1240,8 +1246,9 @@ ngx_http_cache_turbo_access_l1_breaker_arm(ngx_http_request_t *r,
          * the only thing here that can fail, and it touches r->pool only
          * -- no slab, no zone mutex -- so failing first costs nothing to
          * undo. Acquiring first would force the failure arm to call
-         * blob_release(), which takes the zone mutex itself (shm.c) and so
-         * requires unlocking here; ngx_shmtx is not recursive. That unlock
+         * blob_release(), whose terminal refcount arm may take the zone
+         * mutex itself (shm.c) and so requires unlocking here; ngx_shmtx
+         * is not recursive and the arm is not knowable here. That unlock
          * would invalidate `ctn` -- it was resolved at the lookup and is
          * only valid while the mutex is held -- letting a concurrent
          * evict/refresh/purge detach the blob and our own release then free
@@ -1303,9 +1310,11 @@ ngx_http_cache_turbo_access_l1_sie_arm(ngx_http_request_t *r,
              * is the only thing here that can fail, and it touches
              * r->pool only -- no slab, no zone mutex -- so failing first
              * costs nothing to undo. Acquiring first would force the
-             * failure arm to call blob_release(), which takes the zone
-             * mutex itself (shm.c) and so requires unlocking here;
-             * ngx_shmtx is not recursive. That unlock would invalidate
+             * failure arm to call blob_release(), whose terminal
+             * refcount arm may take the zone mutex itself (shm.c) and
+             * so requires unlocking here; ngx_shmtx is not recursive
+             * and the arm is not knowable here. That unlock would
+             * invalidate
              * `ctn` -- it was resolved at the lookup and is only valid
              * while the mutex is held -- letting a concurrent
              * evict/refresh/purge detach the blob and our own release

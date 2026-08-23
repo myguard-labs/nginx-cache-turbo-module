@@ -553,7 +553,12 @@ ngx_int_t ngx_http_cache_turbo_redis_scan_del(ngx_http_request_t *r,
  * observe it, so there is no second party to agree with and no window in which
  * a freed header must be re-read.
  *
- * That biasing is what lets blob_release() run WITHOUT the zone mutex. The
+ * That biasing is what keeps blob_release()'s ARBITRATION off the zone mutex:
+ * the decrement that decides the outcome is a lone atomic, and every caller but
+ * the last returns without touching the lock. Only the terminal refs 1 -> 0 arm
+ * takes it, to free the slab and discharge used_bytes -- so blob_release() MAY
+ * take the zone mutex, and a caller already holding it must never call it
+ * (ngx_shmtx is not recursive; see blob_ref_cleanup()'s ordering rule). The
  * obvious two-field alternative — drop the count, then consult `detached` to
  * decide whether to free — cannot be made safe at any memory ordering: the
  * consult must happen after the decrement (by then a concurrent evictor that
