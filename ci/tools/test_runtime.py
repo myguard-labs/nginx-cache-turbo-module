@@ -131,6 +131,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_s8_scan_resistant_config_rejects(ng)
     test_lock_ttl_zero_rejected(ng)                          # O4.4-b
     test_lock_ttl_oversized_clamped_not_rejected(ng)          # O4.4-b
+    test_admin_lock_ttl_oversized_reads_back_clamped(ng)      # O4.4-b read-back
     test_min_uses_window_range_rejected(ng)                   # P3-6
     test_redis_tls_empty_ca_and_name_rejected(ng)
     test_keep_stale_config_parse(ng)                        # S2.1

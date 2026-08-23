@@ -1854,7 +1854,7 @@ http {
 ```console
 # stats (JSON)
 $ curl localhost/_cache
-{"hits":1240,"misses":83,"stale_serves":12,"refreshes":11,"evictions":0,"l2_hits":61,"l2_misses":22,"bypasses":5,"cost_ms":34,"autotuned_beta":1700,"autotuned_load":1000}
+{"hits":1240,"misses":83,"stale_serves":12,"refreshes":11,"evictions":0,"l2_hits":61,"l2_misses":22,"bypasses":5,"cost_ms":34,"autotuned_beta":1700,"autotuned_load":1000,"lock_ttl":5}
 
 $ curl -X POST 'localhost/_cache?key=/blog/post-42'   # drop one page
 {"purged":1}
@@ -2123,6 +2123,28 @@ http {
 | `POST /_cache?tag=<name>` | Purge every page tagged `<name>` across L1 + L2. |
 | `POST /_cache?url=<path[,path,...]>` | Warm those paths (background prefetch). Each warm subrequest fetches **anonymously** — the admin request's `Cookie` header is stripped, so the entry is stored under the cookieless anonymous key a visitor looks up (and no per-visitor/segment body is pulled from the origin), even if you trigger the warm from a logged-in browser. Fires at most `cache_turbo_warm_max` subrequests (default `32`) regardless of list length. |
 | `POST /_cache?url_file=<path>` | Same as `?url=`, but the list of paths comes from a file on disk (one `path[?query]` per line, CRLF tolerated) instead of the query string — useful when the list is longer than comfortably fits in a URL. Subject to the same `cache_turbo_warm_max` cap, plus its own bounded read: the file must be a regular file no larger than 64 KiB, and no single line may exceed 2048 bytes; either limit, or a missing/unreadable file, is a clean `500` with a JSON error body, never a crash or a silent partial warm. |
+
+**`lock_ttl` is the one effective-config field on the JSON object** — every other
+key is a zone counter or gauge. It reports the single-flight lock TTL in seconds
+*as the runtime actually uses it*: after preset-band resolution, after
+inheritance, and after the parse-time clamp to `4294967295` (the `time_t`
+ceiling that keeps `now + lock_ttl × load_factor` from overflowing). That last
+part is the reason it exists — `cache_turbo_lock_ttl 999999999s` is accepted, not
+rejected, and reading `lock_ttl` back is how you see that it is behaving as the
+ceiling rather than as the number you wrote.
+
+Two things to know before reading it:
+
+- **It is per-location, while the counters are per-zone.** The value reported is
+  the *admin location's own* effective `lock_ttl`, not that of the cached
+  locations sharing the zone. To inspect a particular location's value, set
+  `cache_turbo_lock_ttl` on the admin location to match it, or give that
+  location its own admin endpoint.
+- **Only the effective value is exposed, not the raw configured one.** The clamp
+  happens at parse time and does not keep the original, so an out-of-range
+  configured value is not retained anywhere in the running config. If you need
+  to know what was *written*, read the config file; `lock_ttl` tells you what is
+  in force.
 
 ## Monitoring (Prometheus + Grafana)
 

@@ -1,5 +1,18 @@
 Changes with the nginx-cache-turbo-module (unreleased)
 
+    *) Feature: the admin JSON endpoint now reports "lock_ttl", the effective
+       single-flight lock TTL in seconds for the admin location -- after
+       preset-band resolution, inheritance, and the parse-time clamp to the
+       time_t ceiling (4294967295). It is the object's only effective-config
+       field; every other key remains a zone counter or gauge. This makes an
+       oversized cache_turbo_lock_ttl observable: the directive clamps rather
+       than rejects, and until now nothing could distinguish a clamped value
+       from the one the operator wrote. The Prometheus rendering is unchanged.
+       ci/tools/lint-admin-buffer-budget.py now measures the JSON reply's
+       buffer budget as well as the Prometheus one, so a field added to the
+       format string but not to the sizeof() skeleton fails the build instead
+       of silently truncating the last field.
+
     *) Performance: the L1 shared-memory rbtree ordered nodes on the caller's
        32-bit crc32 short hash instead of the full 64-bit key, so two keys
        colliding in the low 32 bits fell back to the memcmp identity tiebreak

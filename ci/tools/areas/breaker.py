@@ -1957,8 +1957,6 @@ def test_lock_ttl_oversized_clamped_not_rejected(ng: Nginx) -> None:
     ⚠ THIS TEST IS A GUARD, NOT A PROOF OF THE CLAMP, and deliberately says so
     rather than implying coverage it does not have:
 
-      * lock_ttl_raw is never surfaced through a variable or the admin
-        endpoint, so the clamped VALUE cannot be read back at config level.
       * `returncode == 0` does NOT distinguish fixed from pre-fix code: the
         generic ngx_conf_set_sec_slot this replaced also accepted the value.
       * duplicate-rejection cannot distinguish them either -- ngx_conf_set_sec_slot
@@ -1971,9 +1969,12 @@ def test_lock_ttl_oversized_clamped_not_rejected(ng: Nginx) -> None:
     it), and a future change that turns this into a hard rejection -- the
     operator-hostile outcome the row explicitly rejected -- fails here.
 
-    The clamp arithmetic itself is UNCOVERED at runtime. Closing that needs a
-    read-back path for lock_ttl_raw (a variable or an admin field), which is a
-    separate row, not something this test should pretend to do."""
+    THE CLAMPED VALUE ITSELF is proved by its sibling in areas/admin.py,
+    test_admin_lock_ttl_oversized_reads_back_clamped, which reads the admin
+    JSON's "lock_ttl" effective-config field back and requires 4294967295. That
+    field is the read-back lever this docstring used to say did not exist; it
+    landed 2026-08-23 and carries a negative control against the pre-change
+    binary. Keep both: this one pins clamp-not-REJECT, that one pins the VALUE."""
     def mutate(c: str) -> str:
         pattern = re.compile(
             r"cache_turbo_lock_ttl\s+5s;", re.MULTILINE)
