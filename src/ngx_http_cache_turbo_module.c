@@ -491,6 +491,19 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       0,
       NULL },
 
+    /* R3-1: cap on how many kept (post-strip) query params
+     * $cache_turbo_normalized_args will sort. Above the cap normalization is
+     * skipped and the raw arg string is keyed instead -- bounding the O(n^2)
+     * insertion sort an unauthenticated request can trigger on the key path.
+     * 0 = unlimited. ngx_conf_set_num_slot rejects non-numeric and negative
+     * values ("invalid number") at config time. */
+    { ngx_string("cache_turbo_normalize_max_args"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_num_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_turbo_loc_conf_t, normalize_max_args),
+      NULL },
+
     { ngx_string("cache_turbo_bypass_uri"),
       NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_1MORE,
       ngx_http_cache_turbo_bypass_uri,
@@ -4784,6 +4797,38 @@ ngx_http_cache_turbo_normalized_args_variable(ngx_http_request_t *r,
         return ngx_http_cache_turbo_var_set(r, v, vbuf, vlen);
     }
 
+    /* R3-1 DoS bound. The sort below is an insertion sort (ngx_sort, nginx
+     * src/core/ngx_string.c) -- O(n^2) -- and this variable is the DEFAULT
+     * cache key's args component, evaluated BEFORE the cache lookup, so a hit
+     * cannot absorb the cost. `kept` is bounded only by r->args.len (~8k), i.e.
+     * thousands of params from one unauthenticated request: 4000 params cost
+     * ~23 ms of worker CPU. Above the cap, skip normalization entirely and key
+     * on the RAW arg string: the request is still served correctly and two
+     * identical over-cap requests still produce the same key -- the query is
+     * just not order-/junk-normalized. 0 = unlimited (pre-R3-1 behaviour). */
+    if (clcf->normalize_max_args > 0
+        && kept > (ngx_uint_t) clcf->normalize_max_args)
+    {
+        total = 1 + r->args.len + vlen;
+
+        out = ngx_pnalloc(r->pool, total);
+        if (out == NULL) {
+            return NGX_ERROR;
+        }
+
+        w = out;
+        *w++ = '?';
+        w = ngx_cpymem(w, r->args.data, r->args.len);
+        if (vlen) {
+            w = ngx_cpymem(w, vbuf, vlen);
+        }
+
+        v->len = w - out;
+        v->data = out;
+
+        return NGX_OK;
+    }
+
     /* Stable alpha sort so ?b=2&a=1 and ?a=1&b=2 normalize identically. */
     ngx_sort(toks, kept, sizeof(ngx_str_t), ngx_http_cache_turbo_tok_cmp);
 
@@ -5182,6 +5227,7 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->redis_tls_verify = NGX_CONF_UNSET;
     conf->normalize_strip = NGX_CONF_UNSET_PTR;
     conf->normalize_vary = NGX_CONF_UNSET;
+    conf->normalize_max_args = NGX_CONF_UNSET;  /* R3-1; merges to 64 */
     conf->bypass = NGX_CONF_UNSET_PTR;
     conf->no_store = NGX_CONF_UNSET_PTR;
     conf->bypass_uri = NGX_CONF_UNSET_PTR;

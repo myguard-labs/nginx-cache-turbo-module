@@ -1947,6 +1947,17 @@ typedef struct {
      * v3-1 keys are unchanged unless cache_turbo_normalize_vary opts in. */
     ngx_int_t                normalize_vary;
 
+    /* R3-1 DoS bound. $cache_turbo_normalized_args sorts the kept params with
+     * an insertion sort (O(n^2)); `kept` is bounded only by r->args.len (~8k by
+     * default), so an unauthenticated request with thousands of params burns
+     * tens of ms of worker CPU BEFORE the cache lookup -- a hit cannot absorb
+     * it. When the kept (post-strip) count exceeds this cap, normalization is
+     * SKIPPED entirely and the RAW r->args string is used for the key: the
+     * request is still served correctly and still keys consistently, it just is
+     * not normalized. 0 = unlimited (no cap, pre-R3-1 behaviour).
+     * NGX_CONF_UNSET merges to 64, the measured knee (~0.011 ms). */
+    ngx_int_t                normalize_max_args;
+
     /* auto-Vary (v11 other half). When on, the response `Vary:` header is read
      * at store time and the named request headers (safe whitelist only:
      * Accept-Encoding, User-Agent->device, Accept-Language, Origin) are folded

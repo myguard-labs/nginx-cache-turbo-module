@@ -1404,6 +1404,13 @@ ngx_http_cache_turbo_merge_normalize(ngx_http_cache_turbo_loc_conf_t *conf,
     if (conf->normalize_vary == NGX_CONF_UNSET) {
         conf->normalize_vary = prev->normalize_vary;
     }
+    /* R3-1: inherit-then-default to 64, the measured knee of the O(n^2)
+     * insertion sort on the key path. Unlike the neighbours above this one has
+     * a non-zero compiled-in default, so it is a merge_value, not a bare
+     * UNSET-inherit: leaving it at 0 would mean "unlimited" and keep the DoS
+     * bound off by default, which is the point of the directive. */
+    ngx_conf_merge_value(conf->normalize_max_args, prev->normalize_max_args,
+                         NGX_HTTP_CACHE_TURBO_NORMALIZE_MAX_ARGS_DEFAULT);
 }
 
 

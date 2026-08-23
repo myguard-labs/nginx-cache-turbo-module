@@ -15,6 +15,8 @@ from test_runtime_base import *
 from test_runtime_base import (
     _admin_stat,
     _bump_conn,
+    _config_accepts,
+    _config_rejects,
 )
 
 
@@ -411,6 +413,108 @@ def test_default_key_normalizes(ng: Nginx) -> None:
     _, b2, h2 = fetch(ng.port, "/dk/norm")
     assert h2.get("x-cache") == "HIT" and b2 == b1, \
         "default key should strip tracking + sid/sessionid to one slot"
+
+
+def test_r31_normalize_max_args_over_cap_serves_and_keys_consistently(
+        ng: Nginx) -> None:
+    """R3-1. $cache_turbo_normalized_args sorts kept params with ngx_sort, an
+    O(n^2) insertion sort, on the DEFAULT cache key, BEFORE the cache lookup --
+    so a hit cannot absorb it and `kept` was bounded only by r->args.len (~8k):
+    4000 params cost ~23 ms of worker CPU per unauthenticated request.
+    cache_turbo_normalize_max_args caps it (default 64): above the cap
+    normalization is SKIPPED and the RAW arg string is keyed instead.
+
+    /dk/ carries NO cache_turbo_normalize_max_args directive, so this exercises
+    the COMPILED-IN default -- a location that opted in explicitly would pass
+    even if the merge default never landed.
+
+    ORACLE. "Serves correctly and keys consistently" is true on BOTH the capped
+    and the uncapped path, so it is not an oracle: with the cap compiled out
+    this test still passed. What only the SKIP path produces is UN-normalized
+    keying -- the raw arg string, tracking params and original order intact. So
+    the assertions are, at the same over-cap param count:
+
+      * two requests differing ONLY in param ORDER must land in DIFFERENT
+        entries (the sort did not run);
+      * a request with a built-in-stripped tracking param (utm_source) must
+        land in a DIFFERENT entry from the same request without it (the strip
+        did not run) -- note the strip happens before the count, so the
+        tracking param is present in the raw key but never in `kept`;
+
+    and, below the cap, the mirror-image control: the SAME two comparisons
+    collapse onto ONE entry, proving the normalization the skip path drops is
+    genuinely there and that these assertions are about the cap, not about
+    normalization being broken everywhere.
+
+    Each comparison is a MISS-then-HIT pair, because a single fetch cannot
+    distinguish "correctly separate" from "never cached".
+    """
+    # ---- above the cap (400 kept params, default cap 64): NOT normalized ----
+    asc = "&".join(f"p{i:04d}=v{i}" for i in range(1, 401))
+    desc = "&".join(f"p{i:04d}=v{i}" for i in range(400, 0, -1))
+
+    s1, b1, h1 = fetch(ng.port, f"/dk/r31asc?{asc}")
+    assert s1 == 200, f"over-cap request must still be served, got {s1}"
+    assert "x-cache" not in h1, "first over-cap request should MISS"
+    # keys consistently: the identical request repeats onto the same entry
+    _, b1b, h1b = fetch(ng.port, f"/dk/r31asc?{asc}")
+    assert h1b.get("x-cache") == "HIT" and b1b == b1, \
+        "two identical over-cap requests must key the same entry"
+
+    # order-only difference: above the cap the sort is skipped, so this is a
+    # DIFFERENT key -> a MISS, and it then caches under its own entry.
+    _, b2, h2 = fetch(ng.port, f"/dk/r31asc?{desc}")
+    assert "x-cache" not in h2, \
+        "above the cap the sort is skipped: reordered args must NOT collide"
+    assert b2 != b1, "reordered over-cap request served the other entry's body"
+
+    # tracking param above the cap: strip is skipped -> different key.
+    _, _, h3 = fetch(ng.port, f"/dk/r31asc?utm_source=x&{asc}")
+    assert "x-cache" not in h3, \
+        "above the cap the strip is skipped: utm_source must NOT collide"
+
+    # ---- below the cap (8 kept params): normalization IS applied ----
+    lo_asc = "&".join(f"q{i}=v{i}" for i in range(1, 9))
+    lo_desc = "&".join(f"q{i}=v{i}" for i in range(8, 0, -1))
+
+    _, b4, h4 = fetch(ng.port, f"/dk/r31lo?{lo_asc}")
+    assert "x-cache" not in h4, "first under-cap request should MISS"
+    _, b5, h5 = fetch(ng.port, f"/dk/r31lo?{lo_desc}")
+    assert h5.get("x-cache") == "HIT" and b5 == b4, \
+        "under the cap the sort runs: reordered args must share one entry"
+    _, b6, h6 = fetch(ng.port, f"/dk/r31lo?utm_source=x&{lo_asc}")
+    assert h6.get("x-cache") == "HIT" and b6 == b4, \
+        "under the cap the strip runs: utm_source must share one entry"
+
+
+def test_r31_normalize_max_args_config_bounds(ng: Nginx) -> None:
+    """R3-1 config-time bound. cache_turbo_normalize_max_args takes exactly one
+    numeric argument; ngx_conf_set_num_slot rejects garbage and negatives with
+    "invalid number", and the missing/extra-argument arity is rejected by the
+    NGX_CONF_TAKE1 mask. 0 (= unlimited) and a plain integer are accepted."""
+    # _config_rejects/_config_accepts assert this substring is present in the
+    # generated config, so a config reshuffle breaks these loudly.
+    anchor = "location /dk/ {"
+
+    # Accepted: an explicit cap, and 0 meaning unlimited.
+    _config_accepts(ng, "r31-num-ok", anchor,
+                    anchor + "\n            cache_turbo_normalize_max_args 8;")
+    _config_accepts(ng, "r31-zero-ok", anchor,
+                    anchor + "\n            cache_turbo_normalize_max_args 0;")
+
+    # Rejected: non-numeric, negative, no argument, two arguments.
+    _config_rejects(ng, "r31-garbage", anchor,
+                    anchor + "\n            cache_turbo_normalize_max_args abc;",
+                    "invalid number")
+    _config_rejects(ng, "r31-negative", anchor,
+                    anchor + "\n            cache_turbo_normalize_max_args -1;",
+                    "invalid number")
+    _config_rejects(ng, "r31-noarg", anchor,
+                    anchor + "\n            cache_turbo_normalize_max_args;",
+                    "invalid number of arguments")
+    _config_rejects(ng, "r31-twoargs", anchor,
+                    anchor + "\n            cache_turbo_normalize_max_args 8 9;",
+                    "invalid number of arguments")
 
 
 def test_cache_redirect(ng: Nginx) -> None:

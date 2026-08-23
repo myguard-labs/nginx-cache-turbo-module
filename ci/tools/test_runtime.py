@@ -181,6 +181,8 @@ def run_all(ng: Nginx, origin: Origin,
     test_serve_authorized_off_by_default_still_refuses_lookup(ng, origin)
     test_default_key_varies_by_host(ng)
     test_default_key_normalizes(ng)
+    test_r31_normalize_max_args_over_cap_serves_and_keys_consistently(ng)
+    test_r31_normalize_max_args_config_bounds(ng)
     test_cache_redirect(ng)
     test_cache_negative_404(ng)
     test_head_not_stored(ng)
