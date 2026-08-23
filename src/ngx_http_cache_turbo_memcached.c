@@ -889,6 +889,7 @@ ngx_http_cache_turbo_mc_read_drain(ngx_event_t *rev)
 {
     ssize_t                        n;
     size_t                         line;
+    ngx_uint_t                     ack;
     u_char                        *lf;
     ngx_connection_t              *c;
     ngx_http_cache_turbo_mc_op_t  *op;
@@ -963,11 +964,31 @@ ngx_http_cache_turbo_mc_read_drain(ngx_event_t *rev)
         /* Poolable only when the reply is a recognized single-line ack AND the
          * server sent nothing past its CRLF (extra bytes => stream desync on the
          * next reuse). Any error/unknown reply keeps clean=0 -> conn closed. */
-        if (line == op->recv_len
-            && (ngx_strncmp(op->recv, "STORED", 6) == 0
-                || ngx_strncmp(op->recv, "DELETED", 7) == 0
-                || ngx_strncmp(op->recv, "NOT_FOUND", 9) == 0))
-        {
+        /* R4-3: dispatch on recv[0] before comparing. The three ack strings
+         * have distinct first bytes (S/D/N), so at most one ngx_strncmp runs
+         * instead of up to three. recv[0] is in bounds: the `lf == op->recv`
+         * guard above proves at least one byte precedes the LF.
+         * ⚠ The if/else shape is deliberate -- `ack` is the branch OUTCOME, not
+         * op->clean. Keying the log arm off op->clean would make this gate
+         * depend on the field being 0 on entry, and op->clean is also set on
+         * another path (:1210). This stays a pure function of THIS reply. */
+        ack = 0;
+
+        if (line == op->recv_len) {
+            switch (op->recv[0]) {
+            case 'S':
+                ack = (ngx_strncmp(op->recv, "STORED", 6) == 0);
+                break;
+            case 'D':
+                ack = (ngx_strncmp(op->recv, "DELETED", 7) == 0);
+                break;
+            case 'N':
+                ack = (ngx_strncmp(op->recv, "NOT_FOUND", 9) == 0);
+                break;
+            }
+        }
+
+        if (ack) {
             op->clean = 1;
         } else {
             ngx_log_error(NGX_LOG_INFO, c->log, 0,

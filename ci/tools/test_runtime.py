@@ -516,6 +516,7 @@ def run_all(ng: Nginx, origin: Origin,
         test_mc_keepalive_zero_does_not_drain_pool(ng, origin, mc)  # MC-A2
         test_mc_keepalive_idle_timeout_drops(ng, origin, mc)  # D-O1 timedout br
         test_mc_dirty_reply_not_pooled(ng, origin)         # D-O2 clean-gate
+        test_mc_set_ack_is_recognized_and_pools(ng, origin)  # R4-3 ack match
         # D-O1 idle-pool close: MUST be last mc test — it stops the mc server.
         test_mc_keepalive_server_close_survives(ng, origin, mc)
     # PERF-7 zero-copy serve stress: run LAST among L1 tests — its 48-thread /

@@ -1150,6 +1150,17 @@ class DirtyMemcached:
     def stop(self) -> None:
         self._running = False
         if self._sock is not None:
+            # shutdown() BEFORE close(): the accept thread is parked in
+            # accept() holding its own reference to this socket, and on Linux
+            # close() alone does not reliably wake it -- the listening fd then
+            # stays open in the kernel until that thread happens to exit, so
+            # the port keeps showing LISTEN and the next bind() gets
+            # EADDRINUSE no matter how long it retries. shutdown() forces the
+            # blocked accept() to return immediately.
+            try:
+                self._sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
             try:
                 self._sock.close()
             except OSError:

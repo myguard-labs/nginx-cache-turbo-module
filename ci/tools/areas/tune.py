@@ -1685,6 +1685,62 @@ def test_mc_dirty_reply_not_pooled(ng: Nginx, origin: Origin) -> None:
         dirty.stop()
 
 
+def test_mc_set_ack_is_recognized_and_pools(ng: Nginx, origin: Origin) -> None:
+    """R4-3: the SET/DELETE ack strings must still be RECOGNIZED after the
+    first-byte dispatch in mc_read_drain(), or the write-through connection is
+    never pooled.
+
+    This is the negative control the ack-matching code otherwise has none for.
+    test_mc_keepalive_reuse() does NOT cover it: pooling there is dominated by
+    the GET path, which sets op->clean in a DIFFERENT function
+    (mc_get_read, memcached.c:~1210). Breaking the SET ack match in
+    mc_read_drain() leaves the GET half pooling happily, and that test's
+    `on * 2 < off` margin absorbs the loss -- verified by mutating the 'S' arm
+    to compare "STORAGE": test_mc_keepalive_reuse still PASSED.
+
+    So this test isolates the ack path. It reuses DirtyMemcached with
+    `trailer=b""`, which makes it a CLEAN memcached: every reply ends exactly at
+    its CRLF, so `line == op->recv_len` holds and the ONLY thing standing
+    between the reply and a pooled connection is the STORED/DELETED/NOT_FOUND
+    match itself. /mcdirty/ carries keepalive=4.
+
+    Each distinct cold key drives GET (miss) -> origin -> L1 store +
+    write-through SET, i.e. two ops. With the ack recognized, connections are
+    returned to the pool and the fake sees far fewer accepts than ops. With the
+    ack match broken, every SET reply is judged unpoolable, its connection is
+    closed, and accepts climb to roughly one per op.
+
+    Negative control (OBSERVED, not assumed): mutating the 'S' arm to
+    ngx_strncmp(op->recv, "STORAGE", 7) and rebuilding reds this assertion."""
+    clean = DirtyMemcached(ng.port + PORT_OFFSETS["mc_dirty_reply"],
+                           trailer=b"")
+    clean.start()
+    try:
+        n = 20
+        stamp = time.time()
+
+        def one(i: int) -> int:
+            s, _, _ = fetch(ng.port, f"/mcdirty/ack-{stamp}-{i}")
+            return s
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+            statuses = list(ex.map(one, range(n)))
+        time.sleep(0.6)   # let the fire-and-forget SETs land
+
+        assert all(s == 200 for s in statuses), \
+            f"a /mcdirty/ request failed against a CLEAN fake memcached: {statuses}"
+
+        # ~2N ops. Pooling works => well under N accepts. Ack match broken =>
+        # every SET closes its conn, pushing accepts toward ~2N. n is the
+        # midpoint and leaves generous slack for scheduling on both sides.
+        assert clean.accepts < n, (
+            f"a clean memcached reply was NOT pooled ({clean.accepts} accepts "
+            f"for {n} cold keys / ~{2 * n} ops) -- the SET/DELETE ack in "
+            f"mc_read_drain() is no longer recognized (R4-3)")
+    finally:
+        clean.stop()
+
+
 def test_redis_dirty_reply_not_pooled(ng: Nginx) -> None:
     """Redis GET and write-drain keepalive require one exact RESP boundary.
 
