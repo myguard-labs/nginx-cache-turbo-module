@@ -4,6 +4,10 @@ Per-application guides. The [main README](../README.md) is the reference for
 every directive; these pages are the *applied* version — a working vhost, the
 cookie/key decisions, and the specific ways each application can bite you.
 
+The cross-preset [review and deployment checklist](preset-review.md) compares
+all rule types, records the registry-wide verification result, and identifies
+which assumptions still have to be checked on a live installation.
+
 ## CMS / application presets
 
 One page per `cache_turbo_backend` preset:
