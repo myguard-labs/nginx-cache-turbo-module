@@ -107,6 +107,7 @@ static size_t  ngx_http_cache_turbo_cookie_work = 0;
 ngx_atomic_uint_t  ngx_http_cache_turbo_test_cookie_scans = 0;
 #endif
 
+#if defined(NGX_HTTP_CACHE_TURBO_FUZZ_SHIM_AUTO)
 /* Union the bytes of every request Cookie header value into *bs. Must be
  * called once per request before any cookie_has() call in the same request.
  * Returns NGX_ERROR before inspecting an over-budget/null-backed value; the
@@ -293,6 +294,100 @@ ngx_http_cache_turbo_cookie_has(ngx_http_request_t *r,
 
     return 0;
 }
+#endif /* NGX_HTTP_CACHE_TURBO_FUZZ_SHIM_AUTO */
+
+
+#if !defined(NGX_HTTP_CACHE_TURBO_FUZZ_SHIM_AUTO)
+static ngx_int_t
+ngx_http_cache_turbo_cookie_ac_scan_one(ngx_http_cache_turbo_cookie_ac_t *ac,
+    u_char *data, size_t len)
+{
+    ngx_http_cache_turbo_cookie_ac_node_t  *n;
+    ngx_uint_t                              state;
+    u_char                                 *p, *end;
+
+    if (ac->nodes == NULL || ac->nnodes == 0 || data == NULL || len == 0) {
+        return 0;
+    }
+
+    n = ac->nodes;
+    if (n[0].match) {
+        return 1;
+    }
+
+    state = 0;
+    end = data + len;
+
+    for (p = data; p < end; p++) {
+        if (*p == '\0') {
+            return 0;
+        }
+
+        state = (ngx_uint_t) n[state].next[*p];
+        ngx_http_cache_turbo_cookie_work_add(1);
+
+        if (n[state].match) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+#endif /* !NGX_HTTP_CACHE_TURBO_FUZZ_SHIM_AUTO */
+
+
+#if !defined(NGX_HTTP_CACHE_TURBO_FUZZ_SHIM_AUTO)
+static ngx_int_t
+ngx_http_cache_turbo_cookie_ac_match(ngx_http_request_t *r,
+    ngx_http_cache_turbo_cookie_ac_t *ac)
+{
+#if (nginx_version >= 1023000)
+    ngx_table_elt_t  *ck;
+#else
+    ngx_table_elt_t **ckp;
+    ngx_uint_t        i;
+#endif
+
+    if (ac->nodes == NULL || ac->nnodes == 0) {
+        return 0;
+    }
+
+#if (nginx_version >= 1023000)
+    for (ck = r->headers_in.cookie; ck; ck = ck->next) {
+        if (ck->value.len == 0) {
+            continue;
+        }
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+        ngx_atomic_fetch_add(&ngx_http_cache_turbo_test_cookie_scans, 1);
+#endif
+        if (ngx_http_cache_turbo_cookie_ac_scan_one(ac, ck->value.data,
+                                                    ck->value.len))
+        {
+            return 1;
+        }
+    }
+#else
+    ckp = r->headers_in.cookies.elts;
+    for (i = 0; i < r->headers_in.cookies.nelts; i++) {
+        if (ckp[i]->value.len == 0) {
+            continue;
+        }
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+        ngx_atomic_fetch_add(&ngx_http_cache_turbo_test_cookie_scans, 1);
+#endif
+        if (ngx_http_cache_turbo_cookie_ac_scan_one(ac, ckp[i]->value.data,
+                                                    ckp[i]->value.len))
+        {
+            return 1;
+        }
+    }
+#endif
+
+    return 0;
+}
+#endif /* !NGX_HTTP_CACHE_TURBO_FUZZ_SHIM_AUTO */
 
 
 /*
@@ -340,6 +435,7 @@ ngx_http_cache_turbo_cookie_has(ngx_http_request_t *r,
  */
 
 
+#if defined(NGX_HTTP_CACHE_TURBO_FUZZ_SHIM_AUTO)
 /* True if the cookie name [n, n+nlen) ends with the NUL-terminated suffix. */
 static ngx_int_t
 ngx_http_cache_turbo_name_has_suffix(u_char *n, size_t nlen, const char *suffix)
@@ -616,8 +712,10 @@ ngx_http_cache_turbo_cookie_pred(ngx_http_request_t *r,
 #endif
     return 0;
 }
+#endif /* NGX_HTTP_CACHE_TURBO_FUZZ_SHIM_AUTO */
 
 
+#if defined(NGX_HTTP_CACHE_TURBO_FUZZ_SHIM_AUTO)
 /*
  * Extract the VALUE of one cookie from one Cookie header value, by EXACT name.
  * Returns 1 and fills *val when the cookie is present, 0 otherwise. A present
@@ -705,6 +803,288 @@ ngx_http_cache_turbo_cookie_value(u_char *data, size_t len, const char *name,
 
     return 0;
 }
+#endif /* NGX_HTTP_CACHE_TURBO_FUZZ_SHIM_AUTO */
+
+
+#if !defined(NGX_HTTP_CACHE_TURBO_FUZZ_SHIM_AUTO)
+static ngx_int_t
+ngx_http_cache_turbo_cookie_index_add(ngx_http_request_t *r,
+    ngx_http_cache_turbo_cookie_index_t *idx, u_char *name, size_t nlen,
+    u_char *value, size_t vlen, ngx_uint_t bare)
+{
+    ngx_http_cache_turbo_cookie_pair_t  *p, *expanded;
+    ngx_uint_t                           i;
+
+    for (i = 0; i < idx->npairs; i++) {
+        p = &idx->pairs[i];
+        if (p->name.len == nlen
+            && ngx_strncmp(p->name.data, name, nlen) == 0)
+        {
+            return NGX_OK;              /* first occurrence wins */
+        }
+    }
+
+    if (idx->npairs == idx->cap) {
+        if (idx->cap > NGX_MAX_SIZE_T_VALUE
+                       / (2 * sizeof(ngx_http_cache_turbo_cookie_pair_t)))
+        {
+            return NGX_ERROR;
+        }
+
+        expanded = ngx_palloc(r->pool,
+                              idx->cap * 2
+                              * sizeof(ngx_http_cache_turbo_cookie_pair_t));
+        if (expanded == NULL) {
+            return NGX_ERROR;
+        }
+
+        ngx_memcpy(expanded, idx->pairs,
+                   idx->npairs
+                   * sizeof(ngx_http_cache_turbo_cookie_pair_t));
+        idx->pairs = expanded;
+        idx->cap *= 2;
+    }
+
+    p = &idx->pairs[idx->npairs++];
+    p->name.data = name;
+    p->name.len = nlen;
+    p->value.data = value;
+    p->value.len = vlen;
+    p->bare = bare ? 1 : 0;
+
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_http_cache_turbo_cookie_index_parse_one(ngx_http_request_t *r,
+    ngx_http_cache_turbo_cookie_index_t *idx, u_char *data, size_t len)
+{
+    u_char  *p, *end, *pair, *eq, *v;
+    size_t   plen, nlen;
+
+    if (data == NULL || len == 0) {
+        return NGX_OK;
+    }
+
+    p = data;
+    end = data + len;
+
+    while (p < end) {
+        while (p < end && (*p == ' ' || *p == '\t' || *p == ';')) {
+            p++;
+        }
+        if (p >= end) {
+            break;
+        }
+
+        pair = p;
+        while (p < end && *p != ';') {
+            p++;
+        }
+        plen = (size_t) (p - pair);
+
+        while (plen > 0 && (pair[plen - 1] == ' ' || pair[plen - 1] == '\t')) {
+            plen--;
+        }
+        if (plen == 0) {
+            continue;
+        }
+
+        eq = ngx_strlchr(pair, pair + plen, '=');
+
+        if (eq == NULL) {
+            nlen = plen;
+            while (nlen > 0
+                   && (pair[nlen - 1] == ' ' || pair[nlen - 1] == '\t'))
+            {
+                nlen--;
+            }
+
+            if (ngx_http_cache_turbo_cookie_index_add(r, idx, pair, nlen,
+                                                      pair, 0, 1)
+                != NGX_OK)
+            {
+                return NGX_ERROR;
+            }
+            continue;
+        }
+
+        nlen = (size_t) (eq - pair);
+        while (nlen > 0 && (pair[nlen - 1] == ' ' || pair[nlen - 1] == '\t')) {
+            nlen--;
+        }
+
+        v = eq + 1;
+        while (v < pair + plen && (*v == ' ' || *v == '\t')) {
+            v++;
+        }
+
+        if (ngx_http_cache_turbo_cookie_index_add(r, idx, pair, nlen, v,
+                                                  (size_t) ((pair + plen) - v),
+                                                  0)
+            != NGX_OK)
+        {
+            return NGX_ERROR;
+        }
+    }
+
+    return NGX_OK;
+}
+
+
+static ngx_http_cache_turbo_cookie_index_t *
+ngx_http_cache_turbo_cookie_index(ngx_http_request_t *r)
+{
+    ngx_http_cache_turbo_ctx_t          *ctx;
+    ngx_http_cache_turbo_cookie_index_t *idx;
+#if (nginx_version >= 1023000)
+    ngx_table_elt_t                     *ck;
+#else
+    ngx_table_elt_t                    **ckp;
+    ngx_uint_t                           i;
+#endif
+
+    ctx = ngx_http_get_module_ctx(r, ngx_http_cache_turbo_module);
+    if (ctx == NULL) {
+        return NULL;
+    }
+
+    idx = &ctx->cookie_index;
+    if (ctx->cookie_index_built) {
+        return idx;
+    }
+
+    idx->pairs = idx->inline_pairs;
+    idx->npairs = 0;
+    idx->cap = sizeof(idx->inline_pairs) / sizeof(idx->inline_pairs[0]);
+
+#if (nginx_version >= 1023000)
+    for (ck = r->headers_in.cookie; ck; ck = ck->next) {
+        if (ngx_http_cache_turbo_cookie_index_parse_one(r, idx,
+                                                        ck->value.data,
+                                                        ck->value.len)
+            != NGX_OK)
+        {
+            return NULL;
+        }
+    }
+#else
+    ckp = r->headers_in.cookies.elts;
+    for (i = 0; i < r->headers_in.cookies.nelts; i++) {
+        if (ngx_http_cache_turbo_cookie_index_parse_one(r, idx,
+                                                        ckp[i]->value.data,
+                                                        ckp[i]->value.len)
+            != NGX_OK)
+        {
+            return NULL;
+        }
+    }
+#endif
+
+    ctx->cookie_index_built = 1;
+    return idx;
+}
+
+
+static ngx_int_t
+ngx_http_cache_turbo_cookie_index_lookup(ngx_http_request_t *r,
+    ngx_str_t *name, ngx_str_t *val_out)
+{
+    ngx_http_cache_turbo_cookie_index_t *idx;
+    ngx_http_cache_turbo_cookie_pair_t  *p;
+    ngx_uint_t                           i;
+
+    idx = ngx_http_cache_turbo_cookie_index(r);
+    if (idx == NULL) {
+        return 0;
+    }
+
+    p = idx->pairs;
+    for (i = 0; i < idx->npairs; i++) {
+        if (p[i].name.len == name->len
+            && ngx_strncmp(p[i].name.data, name->data, name->len) == 0)
+        {
+            *val_out = p[i].value;
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+
+static ngx_int_t
+ngx_http_cache_turbo_cookie_pred_index_match(ngx_http_request_t *r,
+    ngx_array_t *preds)
+{
+    ngx_http_cache_turbo_cookie_index_t       *idx;
+    ngx_http_cache_turbo_cookie_pair_t        *p;
+    ngx_http_cache_turbo_auto_cookie_pred_t   *pr;
+    ngx_uint_t                                 i, j;
+
+    if (preds == NULL || preds->nelts == 0) {
+        return 0;
+    }
+
+    idx = ngx_http_cache_turbo_cookie_index(r);
+    if (idx == NULL) {
+        return 1;                       /* fail closed */
+    }
+
+    p = idx->pairs;
+    pr = preds->elts;
+
+    for (i = 0; i < idx->npairs; i++) {
+        for (j = 0; j < preds->nelts; j++) {
+            if (pr[j].name_suffix.len == 0
+                || p[i].name.len < pr[j].name_suffix.len
+                || ngx_strncmp(p[i].name.data
+                               + (p[i].name.len - pr[j].name_suffix.len),
+                               pr[j].name_suffix.data,
+                               pr[j].name_suffix.len) != 0)
+            {
+                continue;
+            }
+
+            if (p[i].bare) {
+                return 1;               /* matched name with no value */
+            }
+
+            switch (pr[j].op) {
+            case NGX_HTTP_CACHE_TURBO_CVOP_NONEMPTY:
+                if (p[i].value.len > 0) {
+                    return 1;
+                }
+                break;
+
+            case NGX_HTTP_CACHE_TURBO_CVOP_EQ:
+                if (pr[j].has_value
+                    && p[i].value.len == pr[j].value.len
+                    && ngx_strncmp(p[i].value.data, pr[j].value.data,
+                                   pr[j].value.len) == 0)
+                {
+                    return 1;
+                }
+                break;
+
+            case NGX_HTTP_CACHE_TURBO_CVOP_NE:
+            default:
+                if (!pr[j].has_value
+                    || p[i].value.len != pr[j].value.len
+                    || ngx_strncmp(p[i].value.data, pr[j].value.data,
+                                   pr[j].value.len) != 0)
+                {
+                    return 1;
+                }
+                break;
+            }
+        }
+    }
+
+    return 0;
+}
+#endif /* !NGX_HTTP_CACHE_TURBO_FUZZ_SHIM_AUTO */
 
 
 /*
@@ -751,6 +1131,65 @@ ngx_http_cache_turbo_uri_prefix(ngx_str_t *uri, const char *pfx, size_t l)
     next = uri->data[l];
     return (next == '/' || next == '.');
 }
+
+
+#if !defined(NGX_HTTP_CACHE_TURBO_FUZZ_SHIM_AUTO)
+static ngx_http_cache_turbo_uri_edge_t *
+ngx_http_cache_turbo_uri_edge_find(ngx_http_cache_turbo_uri_node_t *node,
+    u_char ch)
+{
+    ngx_http_cache_turbo_uri_edge_t  *e;
+
+    for (e = node->edges; e != NULL; e = e->sibling) {
+        if (e->ch == ch) {
+            return e;
+        }
+    }
+
+    return NULL;
+}
+
+
+static ngx_int_t
+ngx_http_cache_turbo_uri_trie_match(ngx_http_cache_turbo_uri_node_t *root,
+    ngx_str_t *uri)
+{
+    ngx_http_cache_turbo_uri_node_t  *node;
+    ngx_http_cache_turbo_uri_edge_t  *edge;
+    ngx_uint_t                        i;
+    u_char                            next;
+
+    if (root == NULL) {
+        return 0;
+    }
+
+    node = root;
+
+    for (i = 0; i < uri->len; i++) {
+        edge = ngx_http_cache_turbo_uri_edge_find(node, uri->data[i]);
+        if (edge == NULL) {
+            return 0;
+        }
+
+        node = edge->next;
+
+        if (!node->terminal) {
+            continue;
+        }
+
+        if (node->slash_terminal || i + 1 == uri->len) {
+            return 1;
+        }
+
+        next = uri->data[i + 1];
+        if (next == '/' || next == '.') {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+#endif /* !NGX_HTTP_CACHE_TURBO_FUZZ_SHIM_AUTO */
 
 
 /* One hex nibble -> 0..15, or -1 on a non-hex char. Lives inside the
@@ -1134,6 +1573,7 @@ ngx_http_cache_turbo_argparse_build(ngx_http_request_t *r,
  * absent from ap->name_first[] -- see the byteset builder's proof for why that
  * cannot skip a needle qs_eq() would have matched.
  */
+#if defined(NGX_HTTP_CACHE_TURBO_FUZZ_SHIM_AUTO)
 static ngx_int_t
 ngx_http_cache_turbo_arg_match(const ngx_http_cache_turbo_argparse_t *ap,
     const char *name, size_t nlen, const char *value, size_t vlen)
@@ -1180,6 +1620,66 @@ ngx_http_cache_turbo_arg_match(const ngx_http_cache_turbo_argparse_t *ap,
 
     return 0;
 }
+#endif /* NGX_HTTP_CACHE_TURBO_FUZZ_SHIM_AUTO */
+
+
+#if !defined(NGX_HTTP_CACHE_TURBO_FUZZ_SHIM_AUTO)
+static ngx_int_t
+ngx_http_cache_turbo_arg_rules_match(const ngx_http_cache_turbo_argparse_t *ap,
+    ngx_array_t *rules)
+{
+    ngx_http_cache_turbo_auto_arg_rule_t  *ar;
+    const ngx_http_cache_turbo_argspan_t  *sp;
+    ngx_uint_t                             i, j;
+
+    if (rules == NULL || rules->nelts == 0) {
+        return 0;
+    }
+
+    ar = rules->elts;
+
+    for (i = 0; i < ap->nspans; i++) {
+        sp = &ap->spans[i];
+
+        for (j = 0; j < rules->nelts; j++) {
+            if (ar[j].name.len > 0
+                && !ap->name_first[(u_char) ar[j].name.data[0]])
+            {
+                continue;
+            }
+
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+            ngx_atomic_fetch_add(&ngx_http_cache_turbo_test_arg_scans, 1);
+#endif
+
+            if (!ngx_http_cache_turbo_qs_eq(sp->name_start, sp->name_end,
+                                            (char *) ar[j].name.data,
+                                            ar[j].name.len, 1))
+            {
+                continue;
+            }
+
+            if (!ar[j].has_value) {
+                return 1;
+            }
+
+            if (sp->value_start == NULL) {
+                continue;
+            }
+
+            if (ngx_http_cache_turbo_qs_eq(sp->value_start, sp->value_end,
+                                           (char *) ar[j].value.data,
+                                           ar[j].value.len, 0))
+            {
+                return 1;
+            }
+        }
+    }
+
+    return 0;
+}
+#endif /* !NGX_HTTP_CACHE_TURBO_FUZZ_SHIM_AUTO */
 
 
 /*
@@ -1193,13 +1693,19 @@ ngx_int_t
 ngx_http_cache_turbo_auto_skip(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf)
 {
+#if defined(NGX_HTTP_CACHE_TURBO_FUZZ_SHIM_AUTO)
     const ngx_http_cache_turbo_preset_t  *ps;
     const char *const                    *pp;
     const char                           *eq;
     size_t                                l, nlen, vlen;
+#else
+    size_t                                l;
+#endif
     ngx_str_t                             uri;
     ngx_http_cache_turbo_argparse_t       argparse;
+#if defined(NGX_HTTP_CACHE_TURBO_FUZZ_SHIM_AUTO)
     ngx_http_cache_turbo_byteset_t        cookie_bytes;
+#endif
 
     /* S231-PERF-AUTOCLASSIFY (args half): parsed ONCE per request, reused by
      * arg_match() for every preset's args[] row below -- see the builder's
@@ -1212,6 +1718,7 @@ ngx_http_cache_turbo_auto_skip(ngx_http_request_t *r,
         return 1;                       /* fail closed: private / bypass */
     }
 
+#if defined(NGX_HTTP_CACHE_TURBO_FUZZ_SHIM_AUTO)
     /* S231-PERF-AUTOCLASSIFY (cookie half): built ONCE per request, unioned
      * over every Cookie header, and reused by cookie_has() for every preset
      * below -- see the byteset builder's correctness/bounded-work proof. An
@@ -1221,6 +1728,7 @@ ngx_http_cache_turbo_auto_skip(ngx_http_request_t *r,
     if (ngx_http_cache_turbo_cookie_byteset_build(r, &cookie_bytes) != NGX_OK) {
         return 1;                       /* fail closed: private / bypass */
     }
+#endif
 
     /* Preset uris[] are literals anchored at byte 0 ("/wp-admin/"), so a
      * subdirectory install matches nothing unless we rebase the URI onto the
@@ -1246,6 +1754,29 @@ ngx_http_cache_turbo_auto_skip(ngx_http_request_t *r,
         }
     }
 
+#if !defined(NGX_HTTP_CACHE_TURBO_FUZZ_SHIM_AUTO)
+    if (ngx_http_cache_turbo_uri_trie_match(clcf->auto_uri_root, &uri)) {
+        return 1;
+    }
+
+    if (r->args.len
+        && ngx_http_cache_turbo_arg_rules_match(&argparse,
+                                                clcf->auto_arg_rules))
+    {
+        return 1;
+    }
+
+    if (ngx_http_cache_turbo_cookie_ac_match(r, &clcf->auto_cookie_ac)) {
+        return 1;
+    }
+
+    if (ngx_http_cache_turbo_cookie_pred_index_match(r,
+                                                     clcf->auto_cookie_preds))
+    {
+        return 1;
+    }
+
+#else
     for (ps = ngx_http_cache_turbo_presets; ps->bit; ps++) {
         if (!(clcf->backend_presets & ps->bit)) {
             continue;
@@ -1303,8 +1834,449 @@ ngx_http_cache_turbo_auto_skip(ngx_http_request_t *r,
             return 1;
         }
     }
+#endif
 
     return 0;
+}
+
+#if defined(NGX_HTTP_CACHE_TURBO_FUZZ_SHIM_AUTO)
+ngx_int_t
+ngx_http_cache_turbo_key_cookie(ngx_http_request_t *r,
+    ngx_uint_t backend_presets, ngx_uint_t *cursor, ngx_str_t *name_out,
+    ngx_str_t *val_out)
+{
+    const ngx_http_cache_turbo_preset_t  *ps;
+    const char *const                    *pp;
+    size_t                                nmlen;
+    ngx_uint_t                            idx = 0;
+    ngx_table_elt_t                      *ck;
+
+    for (ps = ngx_http_cache_turbo_presets; ps->bit; ps++) {
+        if (!(backend_presets & ps->bit) || ps->key_cookies == NULL) {
+            continue;
+        }
+
+        for (pp = ps->key_cookies; *pp; pp++, idx++) {
+            if (idx < *cursor) {
+                continue;
+            }
+
+            nmlen = ngx_strlen(*pp);
+
+            for (ck = r->headers_in.cookie; ck; ck = ck->next) {
+                if (ngx_http_cache_turbo_cookie_value(ck->value.data,
+                                                      ck->value.len,
+                                                      *pp, nmlen, val_out))
+                {
+                    name_out->data = (u_char *) *pp;
+                    name_out->len = nmlen;
+                    *cursor = idx + 1;
+                    return 1;
+                }
+            }
+        }
+    }
+
+    *cursor = idx;
+    return 0;
+}
+#endif /* NGX_HTTP_CACHE_TURBO_FUZZ_SHIM_AUTO */
+
+/* >>> FUZZ-EXTRACT auto-classify END (match.c portion) <<< */
+
+static ngx_int_t
+ngx_http_cache_turbo_uri_trie_add(ngx_pool_t *pool,
+    ngx_http_cache_turbo_uri_node_t *root, u_char *data, size_t len)
+{
+    ngx_http_cache_turbo_uri_node_t  *node, *next;
+    ngx_http_cache_turbo_uri_edge_t  *edge;
+    size_t                            i;
+
+    node = root;
+
+    for (i = 0; i < len; i++) {
+        edge = ngx_http_cache_turbo_uri_edge_find(node, data[i]);
+        if (edge == NULL) {
+            edge = ngx_pcalloc(pool, sizeof(ngx_http_cache_turbo_uri_edge_t));
+            if (edge == NULL) {
+                return NGX_ERROR;
+            }
+
+            next = ngx_pcalloc(pool, sizeof(ngx_http_cache_turbo_uri_node_t));
+            if (next == NULL) {
+                return NGX_ERROR;
+            }
+
+            edge->ch = data[i];
+            edge->next = next;
+            edge->sibling = node->edges;
+            node->edges = edge;
+        }
+
+        node = edge->next;
+    }
+
+    node->terminal = 1;
+    if (len > 0 && data[len - 1] == '/') {
+        node->slash_terminal = 1;
+    }
+
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_http_cache_turbo_auto_arg_rule_add(ngx_conf_t *cf,
+    ngx_http_cache_turbo_loc_conf_t *clcf, const char *literal)
+{
+    ngx_http_cache_turbo_auto_arg_rule_t  *ar;
+    u_char                                *p, *eq, *end;
+
+    if (clcf->auto_arg_rules == NULL) {
+        clcf->auto_arg_rules = ngx_array_create(cf->pool, 16,
+                        sizeof(ngx_http_cache_turbo_auto_arg_rule_t));
+        if (clcf->auto_arg_rules == NULL) {
+            return NGX_ERROR;
+        }
+    }
+
+    p = (u_char *) literal;
+    end = p + ngx_strlen(literal);
+    eq = ngx_strlchr(p, end, '=');
+
+    ar = ngx_array_push(clcf->auto_arg_rules);
+    if (ar == NULL) {
+        return NGX_ERROR;
+    }
+
+    ar->name.data = p;
+    ar->name.len = (eq == NULL) ? (size_t) (end - p) : (size_t) (eq - p);
+
+    if (eq == NULL) {
+        ngx_str_null(&ar->value);
+        ar->has_value = 0;
+    } else {
+        ar->value.data = eq + 1;
+        ar->value.len = (size_t) (end - (eq + 1));
+        ar->has_value = 1;
+    }
+
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_http_cache_turbo_auto_str_array_add(ngx_conf_t *cf, ngx_array_t **array,
+    const char *literal)
+{
+    ngx_str_t  *s;
+
+    if (*array == NULL) {
+        *array = ngx_array_create(cf->pool, 8, sizeof(ngx_str_t));
+        if (*array == NULL) {
+            return NGX_ERROR;
+        }
+    }
+
+    s = ngx_array_push(*array);
+    if (s == NULL) {
+        return NGX_ERROR;
+    }
+
+    s->data = (u_char *) literal;
+    s->len = ngx_strlen(literal);
+
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_http_cache_turbo_auto_pred_add(ngx_conf_t *cf,
+    ngx_http_cache_turbo_loc_conf_t *clcf,
+    const ngx_http_cache_turbo_cookie_pred_t *pred)
+{
+    ngx_http_cache_turbo_auto_cookie_pred_t  *dst;
+
+    if (clcf->auto_cookie_preds == NULL) {
+        clcf->auto_cookie_preds = ngx_array_create(cf->pool, 4,
+                        sizeof(ngx_http_cache_turbo_auto_cookie_pred_t));
+        if (clcf->auto_cookie_preds == NULL) {
+            return NGX_ERROR;
+        }
+    }
+
+    dst = ngx_array_push(clcf->auto_cookie_preds);
+    if (dst == NULL) {
+        return NGX_ERROR;
+    }
+
+    dst->name_suffix.data = (u_char *) pred->name_suffix;
+    dst->name_suffix.len = ngx_strlen(pred->name_suffix);
+    dst->op = pred->op;
+
+    if (pred->value == NULL) {
+        ngx_str_null(&dst->value);
+        dst->has_value = 0;
+    } else {
+        dst->value.data = (u_char *) pred->value;
+        dst->value.len = ngx_strlen(pred->value);
+        dst->has_value = 1;
+    }
+
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_http_cache_turbo_cookie_ac_prepare(ngx_http_cache_turbo_cookie_ac_t *ac,
+    ngx_pool_t *pool, ngx_uint_t max_nodes)
+{
+    ngx_uint_t  i, j;
+
+    if (max_nodes == 0) {
+        ac->nodes = NULL;
+        ac->nnodes = 0;
+        ac->cap = 0;
+        return NGX_OK;
+    }
+
+    if (max_nodes > NGX_MAX_SIZE_T_VALUE
+                    / sizeof(ngx_http_cache_turbo_cookie_ac_node_t))
+    {
+        return NGX_ERROR;
+    }
+
+    ac->nodes = ngx_palloc(pool, max_nodes
+                           * sizeof(ngx_http_cache_turbo_cookie_ac_node_t));
+    if (ac->nodes == NULL) {
+        return NGX_ERROR;
+    }
+
+    for (i = 0; i < max_nodes; i++) {
+        for (j = 0; j < 256; j++) {
+            ac->nodes[i].next[j] = -1;
+        }
+        ac->nodes[i].fail = 0;
+        ac->nodes[i].match = 0;
+    }
+
+    ac->nnodes = 1;
+    ac->cap = max_nodes;
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_http_cache_turbo_cookie_ac_insert(ngx_http_cache_turbo_cookie_ac_t *ac,
+    u_char *data, size_t len)
+{
+    ngx_uint_t  state, next, i;
+    u_char      c;
+
+    if (ac->nodes == NULL || ac->nnodes == 0) {
+        return NGX_ERROR;
+    }
+
+    if (len == 0) {
+        ac->nodes[0].match = 1;
+        return NGX_OK;
+    }
+
+    state = 0;
+
+    for (i = 0; i < len; i++) {
+        c = data[i];
+        next = (ngx_uint_t) ac->nodes[state].next[c];
+
+        if (ac->nodes[state].next[c] < 0) {
+            if (ac->nnodes == ac->cap) {
+                return NGX_ERROR;
+            }
+            next = ac->nnodes++;
+            ac->nodes[state].next[c] = (ngx_int_t) next;
+        }
+
+        state = next;
+    }
+
+    ac->nodes[state].match = 1;
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_http_cache_turbo_cookie_ac_finish(ngx_http_cache_turbo_cookie_ac_t *ac,
+    ngx_pool_t *pool)
+{
+    ngx_uint_t  *queue, head, tail, state, fail, next, c;
+
+    if (ac->nodes == NULL || ac->nnodes == 0) {
+        return NGX_OK;
+    }
+
+    if (ac->nnodes > NGX_MAX_SIZE_T_VALUE / sizeof(ngx_uint_t)) {
+        return NGX_ERROR;
+    }
+
+    queue = ngx_palloc(pool, ac->nnodes * sizeof(ngx_uint_t));
+    if (queue == NULL) {
+        return NGX_ERROR;
+    }
+
+    head = 0;
+    tail = 0;
+
+    for (c = 0; c < 256; c++) {
+        next = (ngx_uint_t) ac->nodes[0].next[c];
+        if (ac->nodes[0].next[c] < 0) {
+            ac->nodes[0].next[c] = 0;
+            continue;
+        }
+
+        ac->nodes[next].fail = 0;
+        queue[tail++] = next;
+    }
+
+    while (head < tail) {
+        state = queue[head++];
+
+        for (c = 0; c < 256; c++) {
+            if (ac->nodes[state].next[c] < 0) {
+                ac->nodes[state].next[c] =
+                    ac->nodes[ac->nodes[state].fail].next[c];
+                continue;
+            }
+
+            next = (ngx_uint_t) ac->nodes[state].next[c];
+            fail = (ngx_uint_t) ac->nodes[ac->nodes[state].fail].next[c];
+            ac->nodes[next].fail = (ngx_int_t) fail;
+            if (ac->nodes[fail].match) {
+                ac->nodes[next].match = 1;
+            }
+            queue[tail++] = next;
+        }
+    }
+
+    return NGX_OK;
+}
+
+
+char *
+ngx_http_cache_turbo_compile_auto_presets(ngx_conf_t *cf,
+    ngx_http_cache_turbo_loc_conf_t *clcf)
+{
+    const ngx_http_cache_turbo_preset_t       *ps;
+    const ngx_http_cache_turbo_cookie_pred_t  *pr;
+    const char *const                         *pp;
+    ngx_uint_t                                 max_cookie_nodes;
+    size_t                                     len;
+
+    clcf->auto_uri_root = NULL;
+    clcf->auto_arg_rules = NULL;
+    clcf->auto_cookie_preds = NULL;
+    clcf->auto_key_cookies = NULL;
+    clcf->auto_cookie_ac.nodes = NULL;
+    clcf->auto_cookie_ac.nnodes = 0;
+    clcf->auto_cookie_ac.cap = 0;
+    clcf->backend_key_cookies = 0;
+
+    if (!NGX_HTTP_CACHE_TURBO_HAS_BACKEND(clcf->backend_presets)) {
+        return NGX_CONF_OK;
+    }
+
+    max_cookie_nodes = 1;
+
+    for (ps = ngx_http_cache_turbo_presets; ps->bit; ps++) {
+        if (!(clcf->backend_presets & ps->bit)) {
+            continue;
+        }
+
+        for (pp = ps->cookies; *pp; pp++) {
+            len = ngx_strlen(*pp);
+            if (len > (ngx_uint_t) -1 - max_cookie_nodes) {
+                return NGX_CONF_ERROR;
+            }
+            max_cookie_nodes += (ngx_uint_t) len;
+        }
+    }
+
+    if (ngx_http_cache_turbo_cookie_ac_prepare(&clcf->auto_cookie_ac, cf->pool,
+                                               max_cookie_nodes)
+        != NGX_OK)
+    {
+        return NGX_CONF_ERROR;
+    }
+
+    clcf->auto_uri_root = ngx_pcalloc(cf->pool,
+                                      sizeof(ngx_http_cache_turbo_uri_node_t));
+    if (clcf->auto_uri_root == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    for (ps = ngx_http_cache_turbo_presets; ps->bit; ps++) {
+        if (!(clcf->backend_presets & ps->bit)) {
+            continue;
+        }
+
+        for (pp = ps->uris; *pp; pp++) {
+            len = ngx_strlen(*pp);
+            if (ngx_http_cache_turbo_uri_trie_add(cf->pool,
+                                                  clcf->auto_uri_root,
+                                                  (u_char *) *pp, len)
+                != NGX_OK)
+            {
+                return NGX_CONF_ERROR;
+            }
+        }
+
+        for (pp = ps->args; *pp; pp++) {
+            if (ngx_http_cache_turbo_auto_arg_rule_add(cf, clcf, *pp)
+                != NGX_OK)
+            {
+                return NGX_CONF_ERROR;
+            }
+        }
+
+        for (pp = ps->cookies; *pp; pp++) {
+            len = ngx_strlen(*pp);
+            if (ngx_http_cache_turbo_cookie_ac_insert(&clcf->auto_cookie_ac,
+                                                      (u_char *) *pp, len)
+                != NGX_OK)
+            {
+                return NGX_CONF_ERROR;
+            }
+        }
+
+        if (ps->cookie_preds != NULL) {
+            for (pr = ps->cookie_preds; pr->name_suffix != NULL; pr++) {
+                if (ngx_http_cache_turbo_auto_pred_add(cf, clcf, pr)
+                    != NGX_OK)
+                {
+                    return NGX_CONF_ERROR;
+                }
+            }
+        }
+
+        if (ps->key_cookies != NULL) {
+            for (pp = ps->key_cookies; *pp; pp++) {
+                if (ngx_http_cache_turbo_auto_str_array_add(cf,
+                        &clcf->auto_key_cookies, *pp)
+                    != NGX_OK)
+                {
+                    return NGX_CONF_ERROR;
+                }
+                clcf->backend_key_cookies++;
+            }
+        }
+    }
+
+    if (ngx_http_cache_turbo_cookie_ac_finish(&clcf->auto_cookie_ac, cf->pool)
+        != NGX_OK)
+    {
+        return NGX_CONF_ERROR;
+    }
+
+    return NGX_CONF_OK;
 }
 
 
@@ -1336,87 +2308,30 @@ ngx_http_cache_turbo_auto_skip(ngx_http_request_t *r,
  */
 ngx_int_t
 ngx_http_cache_turbo_key_cookie(ngx_http_request_t *r,
-    ngx_uint_t backend_presets, ngx_uint_t *cursor, ngx_str_t *name_out,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_uint_t *cursor, ngx_str_t *name_out,
     ngx_str_t *val_out)
 {
-    const ngx_http_cache_turbo_preset_t  *ps;
-    const char *const                    *pp;
-    size_t                                nmlen;
-    ngx_uint_t                            idx = 0;
-#if (nginx_version >= 1023000)
-    ngx_table_elt_t                      *ck;
-#else
-    ngx_table_elt_t                     **ckp;
-    ngx_uint_t                            i;
-#endif
+    ngx_str_t   *names;
+    ngx_uint_t   i;
 
-    for (ps = ngx_http_cache_turbo_presets; ps->bit; ps++) {
-        if (!(backend_presets & ps->bit) || ps->key_cookies == NULL) {
-            continue;
-        }
+    if (clcf->auto_key_cookies == NULL || clcf->auto_key_cookies->nelts == 0) {
+        *cursor = 0;
+        return 0;
+    }
 
-        for (pp = ps->key_cookies; *pp; pp++, idx++) {
+    names = clcf->auto_key_cookies->elts;
 
-            if (idx < *cursor) {         /* already returned by an earlier call */
-                continue;
-            }
-
-            nmlen = ngx_strlen(*pp);
-
-#if (nginx_version >= 1023000)
-            for (ck = r->headers_in.cookie; ck; ck = ck->next) {
-                if (ngx_http_cache_turbo_cookie_value(ck->value.data,
-                                                      ck->value.len,
-                                                      *pp, nmlen, val_out))
-                {
-                    name_out->data = (u_char *) *pp;
-                    name_out->len = nmlen;
-                    *cursor = idx + 1;
-                    return 1;
-                }
-            }
-#else
-            ckp = r->headers_in.cookies.elts;
-            for (i = 0; i < r->headers_in.cookies.nelts; i++) {
-                if (ngx_http_cache_turbo_cookie_value(ckp[i]->value.data,
-                                                      ckp[i]->value.len,
-                                                      *pp, nmlen, val_out))
-                {
-                    name_out->data = (u_char *) *pp;
-                    name_out->len = nmlen;
-                    *cursor = idx + 1;
-                    return 1;
-                }
-            }
-#endif
+    for (i = *cursor; i < clcf->auto_key_cookies->nelts; i++) {
+        if (ngx_http_cache_turbo_cookie_index_lookup(r, &names[i], val_out)) {
+            *name_out = names[i];
+            *cursor = i + 1;
+            return 1;
         }
     }
 
-    *cursor = idx;                       /* sequence exhausted */
+    *cursor = clcf->auto_key_cookies->nelts;
     return 0;
 }
-
-
-ngx_uint_t
-ngx_http_cache_turbo_backend_key_cookie_count(ngx_uint_t backend_presets)
-{
-    const ngx_http_cache_turbo_preset_t  *ps;
-    const char *const                    *pp;
-    ngx_uint_t                            n = 0;
-
-    for (ps = ngx_http_cache_turbo_presets; ps->bit; ps++) {
-        if (!(backend_presets & ps->bit) || ps->key_cookies == NULL) {
-            continue;
-        }
-
-        for (pp = ps->key_cookies; *pp; pp++) {
-            n++;
-        }
-    }
-
-    return n;
-}
-/* >>> FUZZ-EXTRACT auto-classify END (match.c portion) <<< */
 
 
 /*
@@ -1496,34 +2411,7 @@ ngx_int_t
 ngx_http_cache_turbo_cookie_lookup(ngx_http_request_t *r, ngx_str_t *name,
     ngx_str_t *val_out)
 {
-#if (nginx_version >= 1023000)
-    ngx_table_elt_t  *ck;
-
-    for (ck = r->headers_in.cookie; ck; ck = ck->next) {
-        if (ngx_http_cache_turbo_cookie_value(ck->value.data, ck->value.len,
-                                              (char *) name->data, name->len,
-                                              val_out))
-        {
-            return 1;
-        }
-    }
-#else
-    ngx_table_elt_t  **ckp;
-    ngx_uint_t          i;
-
-    ckp = r->headers_in.cookies.elts;
-    for (i = 0; i < r->headers_in.cookies.nelts; i++) {
-        if (ngx_http_cache_turbo_cookie_value(ckp[i]->value.data,
-                                              ckp[i]->value.len,
-                                              (char *) name->data, name->len,
-                                              val_out))
-        {
-            return 1;
-        }
-    }
-#endif
-
-    return 0;
+    return ngx_http_cache_turbo_cookie_index_lookup(r, name, val_out);
 }
 
 #pragma GCC visibility pop

@@ -1046,9 +1046,10 @@ void ngx_http_cache_turbo_build_strip_bitmap(ngx_http_cache_turbo_loc_conf_t *cl
 ngx_int_t ngx_http_cache_turbo_auto_skip(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf);
 ngx_int_t ngx_http_cache_turbo_key_cookie(ngx_http_request_t *r,
-    ngx_uint_t backend_presets, ngx_uint_t *cursor, ngx_str_t *name_out,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_uint_t *cursor, ngx_str_t *name_out,
     ngx_str_t *val_out);
-ngx_uint_t ngx_http_cache_turbo_backend_key_cookie_count(ngx_uint_t backend_presets);
+char *ngx_http_cache_turbo_compile_auto_presets(ngx_conf_t *cf,
+    ngx_http_cache_turbo_loc_conf_t *clcf);
 ngx_int_t ngx_http_cache_turbo_cookie_lookup(ngx_http_request_t *r,
     ngx_str_t *name, ngx_str_t *val_out);
 ngx_int_t ngx_http_cache_turbo_bypass_uri_match(ngx_http_request_t *r,
@@ -1179,6 +1180,9 @@ ngx_http_cache_turbo_is_cookie_name_byte(u_char c)
  * do not need the breakdown. */
 ngx_int_t ngx_http_cache_turbo_response_cacheable(ngx_http_request_t *r,
     ngx_uint_t *reason_out);
+void ngx_http_cache_turbo_response_policy(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf,
+    ngx_http_cache_turbo_response_policy_t *out);
 ngx_int_t ngx_http_cache_turbo_response_must_revalidate(ngx_http_request_t *r);
 ngx_int_t ngx_http_cache_turbo_response_auth_shareable(ngx_http_request_t *r);
 time_t ngx_http_cache_turbo_response_sie(ngx_http_request_t *r);

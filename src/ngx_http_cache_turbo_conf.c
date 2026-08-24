@@ -721,8 +721,7 @@ ngx_http_cache_turbo_merge_basic(ngx_http_cache_turbo_loc_conf_t *conf,
         conf->backend_presets = prev->backend_presets;
     }
 
-    conf->backend_key_cookies =
-        ngx_http_cache_turbo_backend_key_cookie_count(conf->backend_presets);
+    conf->backend_key_cookies = 0;
 }
 
 
@@ -1550,6 +1549,9 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_http_cache_turbo_loc_conf_t  *conf = child;
 
     ngx_http_cache_turbo_merge_basic(conf, prev);
+    if (ngx_http_cache_turbo_compile_auto_presets(cf, conf) != NGX_CONF_OK) {
+        return NGX_CONF_ERROR;
+    }
     ngx_http_cache_turbo_merge_presets(conf, prev);
     ngx_http_cache_turbo_merge_breaker(conf, prev);
     ngx_http_cache_turbo_merge_cc_and_bypass(conf, prev);

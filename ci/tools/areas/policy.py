@@ -2872,6 +2872,18 @@ def test_require_header(ng: Nginx) -> None:
     assert ha2.get("x-ct-status") == "MISS" and ba2 != ba1, \
         "no opt-in header at all must refuse the store"
 
+    # The configured opt-in header can legally be named "Expires". The response
+    # policy walker must still evaluate it as a require_header candidate even
+    # though Expires is also a TTL-bearing response header.
+    _, be1, he1 = fetch(ng.port, "/reqexp/ok",
+                        headers={"X-Want-Expires": "yes"})
+    assert he1.get("x-ct-status") == "MISS", \
+        f"cold Expires opt-in should be MISS, got {he1.get('x-ct-status')}"
+    _, be2, he2 = fetch(ng.port, "/reqexp/ok",
+                        headers={"X-Want-Expires": "yes"})
+    assert he2.get("x-ct-status") == "HIT" and be2 == be1, \
+        "Expires used as cache_turbo_require_header must still permit storage"
+
     # DUPLICATED + conflicting ("yes" and "no") -> ambiguous -> refuse, in BOTH
     # orders: the gate scans the whole headers_out list, so a first-match-wins
     # implementation would store the yes-first case and leak an uncacheable body.

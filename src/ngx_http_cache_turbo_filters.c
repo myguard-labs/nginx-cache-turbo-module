@@ -553,7 +553,7 @@ ngx_http_cache_turbo_capture_gate_response_ok(ngx_http_request_t *r,
 static ngx_int_t
 ngx_http_cache_turbo_header_filter_do_capture(ngx_http_request_t *r,
     ngx_http_cache_turbo_ctx_t *ctx, ngx_http_cache_turbo_loc_conf_t *clcf,
-    ngx_uint_t encoded_ok, ngx_uint_t encoded_class)
+    ngx_uint_t encoded_ok, ngx_uint_t encoded_class, ngx_uint_t auth_shareable)
 {
     if (encoded_ok) {
         ctx->origin_encoded_capture = 1;
@@ -565,8 +565,7 @@ ngx_http_cache_turbo_header_filter_do_capture(ngx_http_request_t *r,
      * blob; it cannot re-derive it after headers are sent. Recorded on
      * every capture regardless of clcf->serve_authorized, so enabling the
      * directive later does not require flushing entries stored before. */
-    ctx->auth_shareable =
-        ngx_http_cache_turbo_response_auth_shareable(r) ? 1 : 0;
+    ctx->auth_shareable = auth_shareable ? 1 : 0;
 
     /* A warm subrequest is deliberately excluded from lookup, so its key
      * was never built. Build it here from the subrequest URI before flagging
@@ -659,6 +658,7 @@ ngx_http_cache_turbo_header_filter_capture(ngx_http_request_t *r,
     ngx_uint_t  encoded_ok = 0;
     ngx_uint_t  encoded_class = NGX_HTTP_CACHE_TURBO_AE_CLASS_IDENTITY;
     ngx_uint_t  gate_common, gate_storable, captured;
+    ngx_http_cache_turbo_response_policy_t policy;
     /* PERF-AUD-01 leg verdicts: -1 = the short-circuit never reached this
      * leg, so capture_count_refusal() must evaluate it itself. */
     ngx_int_t   req_hdr_ok = -1;
@@ -748,13 +748,16 @@ ngx_http_cache_turbo_header_filter_capture(ngx_http_request_t *r,
     gate_storable = gate_common
                     && ngx_http_cache_turbo_capture_gate_storable_tail(r, ctx,
                                                                       clcf);
+    if (gate_storable) {
+        ngx_http_cache_turbo_response_policy(r, clcf, &policy);
+        cacheable_reason = policy.cacheable_reason;
+    }
 
     captured = 0;
 
-    if (gate_storable
-        && ngx_http_cache_turbo_response_cacheable(r, &cacheable_reason))
+    if (gate_storable && policy.cacheable)
     {
-        req_hdr_ok = ngx_http_cache_turbo_require_hdr_ok(r, clcf) ? 1 : 0;
+        req_hdr_ok = policy.require_hdr_ok ? 1 : 0;
 
         if (req_hdr_ok) {
             resp_encoded = ngx_http_cache_turbo_response_encoded(r) ? 1 : 0;
@@ -768,7 +771,7 @@ ngx_http_cache_turbo_header_filter_capture(ngx_http_request_t *r,
     if (captured)
     {
         if (ngx_http_cache_turbo_header_filter_do_capture(r, ctx, clcf,
-                encoded_ok, encoded_class) != NGX_OK)
+                encoded_ok, encoded_class, policy.auth_shareable) != NGX_OK)
         {
             return;
         }
@@ -1368,6 +1371,7 @@ ngx_http_cache_turbo_body_filter_windows(ngx_http_request_t *r,
     time_t *out_stale_window, time_t *out_sie_window)
 {
     time_t  ttl, stale_window, sie_window = 0;
+    ngx_http_cache_turbo_response_policy_t policy;
 
     ttl = ngx_http_cache_turbo_status_ttl(clcf, r->headers_out.status);
     if (ttl < 0) {
@@ -1389,10 +1393,18 @@ ngx_http_cache_turbo_body_filter_windows(ngx_http_request_t *r,
      * Cache-Control/Expires set the fresh TTL when enabled. ignore_cc wins:
      * if the operator told us to ignore Cache-Control, the TTL is the static
      * cache_turbo_valid, never the (ignored) upstream max-age/Expires. */
+    ngx_memzero(&policy, sizeof(policy));
+    policy.upstream_ttl = -1;
+    policy.swr = -1;
+    policy.sie = -1;
+
+    if (!clcf->ignore_cc) {
+        ngx_http_cache_turbo_response_policy(r, clcf, &policy);
+    }
+
     if (clcf->honor_cc && !clcf->ignore_cc) {
-        time_t  up = ngx_http_cache_turbo_upstream_ttl(r);
-        if (up >= 0) {
-            ttl = up;
+        if (policy.upstream_ttl >= 0) {
+            ttl = policy.upstream_ttl;
         }
     }
 
@@ -1421,7 +1433,7 @@ ngx_http_cache_turbo_body_filter_windows(ngx_http_request_t *r,
      * proxy_ignore_headers Cache-Control contract (the whole header is
      * inert), not just the cacheability floor. */
     if (ttl > 0 && !clcf->ignore_cc) {
-        time_t  swr = ngx_http_cache_turbo_response_swr(r);
+        time_t  swr = policy.swr;
         if (swr >= 0) {
             /* AUD-CC-DELTA-OVF: swr is parsed straight off the wire and can
              * be up to NGX_MAX_INT_T_VALUE (e.g. stale-while-revalidate=
@@ -1442,8 +1454,7 @@ ngx_http_cache_turbo_body_filter_windows(ngx_http_request_t *r,
      * ignore_cc (see the swr block above — the whole upstream Cache-Control
      * is inert, so an upstream must-revalidate must not collapse the
      * operator-configured stale window). */
-    if (ttl > 0 && !clcf->ignore_cc
-        && ngx_http_cache_turbo_response_must_revalidate(r))
+    if (ttl > 0 && !clcf->ignore_cc && policy.must_revalidate)
     {
         stale_window = ttl;
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
@@ -1459,7 +1470,7 @@ ngx_http_cache_turbo_body_filter_windows(ngx_http_request_t *r,
          * stale serve, stale-if-error included). The serve-on-error path that
          * consumes sie_ttl lands in a follow-up; the field is carried now so
          * the wire format turns over once (single cold-cache event). */
-        time_t  sie = ngx_http_cache_turbo_response_sie(r);
+        time_t  sie = policy.sie;
         if (sie >= 0) {
             /* AUD-CC-DELTA-OVF: same wire-controlled overflow as the swr
              * clamp above -- clamp the delta before the add. */

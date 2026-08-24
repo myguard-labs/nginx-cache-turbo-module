@@ -28,6 +28,7 @@ typedef ngx_int_t  ngx_flag_t;
 
 /* Select the linked-list cookie path (nginx >= 1.23) in cookie_has. */
 #define nginx_version  1031001
+#define NGX_HTTP_CACHE_TURBO_FUZZ_SHIM_AUTO  1
 
 /* String primitives the block uses, faithful to nginx's ngx_string.h. */
 #define ngx_strncmp(s1, s2, n)  strncmp((char *) (s1), (char *) (s2), n)
