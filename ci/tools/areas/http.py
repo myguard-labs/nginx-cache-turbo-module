@@ -1807,35 +1807,44 @@ def test_swr_refresh_injects_stored_validators(ng: Nginx,
 
 def test_swr_refresh_304_keeps_entry_and_serves_it(ng: Nginx,
                                                    origin: Origin) -> None:
-    """P1-4 BLOCKER PROBE -- currently EXPECTED TO FAIL. Do not "fix" this by
-    weakening it; it is the gate that keeps P1-4 from shipping ahead of P5-4.
+    """P1-4 + P5-4 liveness assertion: a 304-answered background refresh must
+    keep the entry serveable, exactly as a 200-answered one does.
 
     /swr304/'s origin behaves like a real conditional origin: it answers 304
-    to the If-None-Match this change injects, and 200 otherwise. That is what
-    a background refresh meets in production once P1-4 injects validators.
+    to the If-None-Match that P1-4 injects, and 200 otherwise. That is what a
+    background refresh meets in production.
 
-    A 304 stores nothing, and `refreshing` / `refresh_lock_until` are cleared
-    on STORE (shm.c) -- so a 304-answered refresh never extends the entry's
-    freshness. The stale-while-revalidate loop therefore stops revalidating:
-    the entry decays until it is dropped and a client eats a full BLOCKING
-    inline regeneration.
+    Why this pairing is load-bearing. A 304 stores nothing, and `refreshing` /
+    `refresh_lock_until` are cleared on STORE (shm.c) -- so before P5-4, a
+    304-answered refresh never extended the entry's freshness: the SWR loop
+    stopped revalidating, the entry decayed until dropped, and a client ate a
+    full BLOCKING inline regeneration. Injection WITHOUT 304-freshening
+    inverts the lever it was meant to pull, trading a background body for a
+    foreground full fetch. P5-4 (PR #362, `b7846bd`) closed that by bumping a
+    resident node's fresh_until/stale_until in place on an origin 304; P1-4
+    (PR #350, `b396e8d`) then landed the injection on top.
+
+    This test was originally written red-by-design to hold that gate shut.
+    Both rows have shipped, so it is now a POSITIVE assertion and must stay
+    green. Do not "fix" a failure here by weakening it -- a red means the
+    freshening path regressed.
+
+    Oracle (mutation-verified): putting `0 &&` on the 304-freshening gate in
+    the header-filter capture branch turns this red. Contrast
+    test_swr_refresh_no_validator_stays_unconditional, which pins the
+    nothing-to-inject path.
 
     Measured on these fixtures (nginx 1.31.3, debug build, 25 reads at 200ms):
       * /swrval/  (origin answers 200): 0 client-blocking regenerations, the
         entry cycles HIT -> STALE -> HIT and every refresh carries the stored
         ETag.
-      * /swr304/  (origin answers 304): the entry never returns to HIT after
-        the first refresh, then the client sees x-cache absent and a ~3s stall.
-
-    So injecting validators without 304-freshening INVERTS the lever it was
-    meant to pull: it trades a background body for a foreground full fetch.
-    P1-4 (injection) cannot ship without P5-4 (reuse the stored body on a 304
-    to extend the TTL).
+      * /swr304/  (origin answers 304): pre-P5-4, the entry never returned to
+        HIT after the first refresh and the client saw x-cache absent plus a
+        ~3s stall. Post-P5-4 it matches /swrval/.
 
     The assertion below is the liveness property: once the entry is primed and
     its refresh has been answered 304, the client must still be served from
-    cache and must never pay a synchronous regeneration -- exactly as it does
-    against a 200-answering origin."""
+    cache and must never pay a synchronous regeneration."""
     uri = "/swr304/vld304-a"
     s0, b0, _ = fetch(ng.port, uri)                  # prime: 200 + ETag
     assert s0 == 200 and b0, f"prime failed: {s0} {b0!r}"
@@ -1864,11 +1873,12 @@ def test_swr_refresh_304_keeps_entry_and_serves_it(ng: Nginx,
         time.sleep(0.2)
 
     assert blocking == 0 and saw_fresh_hit, (
-        "P1-4 BLOCKER: a 304-answered background refresh does not extend the "
-        "entry's TTL, so stale-while-revalidate stops revalidating -- "
-        f"saw_fresh_hit={saw_fresh_hit} client-blocking regenerations="
+        "304-freshening REGRESSED: a 304-answered background refresh no longer "
+        "extends the entry's TTL, so stale-while-revalidate stops revalidating "
+        f"-- saw_fresh_hit={saw_fresh_hit} client-blocking regenerations="
         f"{blocking} (expected True and 0, as on the 200-answering /swrval/ "
-        "fixture). Injection (P1-4) requires 304-freshening (P5-4) to ship."
+        "fixture). Check the 304 branch of the header-filter capture gate "
+        "(P5-4, filters.c) and shm_freshen()."
     )
 
 
