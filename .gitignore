@@ -5,6 +5,10 @@
 # Ignored for the same reason .build/ is: it is an unpacked nginx source
 # tree, so a stray `git add -A` commits thousands of upstream files.
 .build-proof/
+# Debug (non-sanitizer) build tree for the valgrind/helgrind soak path --
+# ci/tools/soak.sh needs a plain build plus MODULE=<.so>. Same reason as above:
+# an unpacked nginx source tree that a stray `git add -A` would commit.
+.build-dbg/
 __pycache__/
 build/
 objs/
