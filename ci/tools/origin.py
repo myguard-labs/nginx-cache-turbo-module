@@ -671,6 +671,9 @@ class Origin:
                 if want_c is not None:
                     for v in want_c.split("|"):
                         self.send_header("X-GraphQL-Cacheable", v)
+                want_expires = self.headers.get("X-Want-Expires")
+                if want_expires is not None:
+                    self.send_header("Expires", want_expires)
                 # Path-marker-driven response headers, so a test can drive the
                 # RFC 9111 shared-cache floor (these responses must NOT be
                 # stored). The marker is matched in the path so $uri keying still

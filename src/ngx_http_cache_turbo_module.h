@@ -1443,6 +1443,77 @@ typedef struct {
     time_t       valid;      /* fresh TTL in seconds (0 = forever) */
 } ngx_http_cache_turbo_valid_t;
 
+typedef struct {
+    time_t      upstream_ttl;
+    time_t      swr;
+    time_t      sie;
+    unsigned    must_revalidate:1;
+    unsigned    auth_shareable:1;
+    unsigned    require_hdr_ok:1;
+    unsigned    cacheable:1;
+    ngx_uint_t  cacheable_reason;
+} ngx_http_cache_turbo_response_policy_t;
+
+
+typedef struct {
+    ngx_str_t   name;
+    ngx_str_t   value;
+    unsigned    has_value:1;
+} ngx_http_cache_turbo_auto_arg_rule_t;
+
+typedef struct {
+    ngx_str_t   name_suffix;
+    ngx_str_t   value;
+    ngx_uint_t  op;
+    unsigned    has_value:1;
+} ngx_http_cache_turbo_auto_cookie_pred_t;
+
+
+typedef struct ngx_http_cache_turbo_uri_edge_s
+               ngx_http_cache_turbo_uri_edge_t;
+
+typedef struct ngx_http_cache_turbo_uri_node_s
+               ngx_http_cache_turbo_uri_node_t;
+
+struct ngx_http_cache_turbo_uri_edge_s {
+    u_char                          ch;
+    ngx_http_cache_turbo_uri_node_t *next;
+    ngx_http_cache_turbo_uri_edge_t *sibling;
+};
+
+struct ngx_http_cache_turbo_uri_node_s {
+    ngx_http_cache_turbo_uri_edge_t *edges;
+    unsigned                        terminal:1;
+    unsigned                        slash_terminal:1;
+};
+
+
+typedef struct {
+    ngx_int_t    next[256];
+    ngx_int_t    fail;
+    unsigned     match:1;
+} ngx_http_cache_turbo_cookie_ac_node_t;
+
+typedef struct {
+    ngx_http_cache_turbo_cookie_ac_node_t *nodes;
+    ngx_uint_t                             nnodes;
+    ngx_uint_t                             cap;
+} ngx_http_cache_turbo_cookie_ac_t;
+
+
+typedef struct {
+    ngx_str_t   name;
+    ngx_str_t   value;
+    unsigned    bare:1;
+} ngx_http_cache_turbo_cookie_pair_t;
+
+typedef struct {
+    ngx_http_cache_turbo_cookie_pair_t  inline_pairs[16];
+    ngx_http_cache_turbo_cookie_pair_t *pairs;
+    ngx_uint_t                          npairs;
+    ngx_uint_t                          cap;
+} ngx_http_cache_turbo_cookie_index_t;
+
 
 /* location-level configuration */
 typedef struct {
@@ -1597,6 +1668,12 @@ typedef struct {
      * those. Sits UNDER manual bypass/no_store overrides. See the preset
      * registry and ngx_http_cache_turbo_auto_skip() in the .c. */
     ngx_uint_t               backend_presets;
+    ngx_uint_t               backend_key_cookies;
+    ngx_http_cache_turbo_uri_node_t *auto_uri_root;
+    ngx_array_t             *auto_arg_rules;      /* auto_arg_rule_t */
+    ngx_http_cache_turbo_cookie_ac_t auto_cookie_ac;
+    ngx_array_t             *auto_cookie_preds;   /* auto_cookie_pred_t */
+    ngx_array_t             *auto_key_cookies;    /* ngx_str_t */
 
     /* Live autotune (v4-3). When on, the request path uses the zone's live
      * autotuned beta (clamped to this location's preset band) in place of the
@@ -2494,6 +2571,8 @@ typedef struct {
     ngx_str_t                req_cc;
     ngx_str_t                req_pragma;
     unsigned                 req_cc_resolved:1;
+    unsigned                 cookie_index_built:1;
+    ngx_http_cache_turbo_cookie_index_t cookie_index;
     /* RFC-1 request freshness bounds (parsed once in the prologue). max_age /
      * min_fresh = -1 when absent (§5.2.1.1/§5.2.1.3). max_stale: max_stale_set
      * marks presence, max_stale_any a bare "max-stale" (accept any staleness),

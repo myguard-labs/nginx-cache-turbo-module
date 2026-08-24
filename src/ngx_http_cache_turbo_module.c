@@ -708,6 +708,8 @@ ngx_module_t  ngx_http_cache_turbo_module __attribute__((visibility("default")))
 typedef struct {
     ngx_str_t   name;
     ngx_str_t   val;
+    uint32_t    vlen;
+    uint32_t    vfield;
 } ngx_http_cache_turbo_key_cookie_slot_t;
 
 
@@ -777,14 +779,11 @@ ngx_http_cache_turbo_key_cookie_queue(ngx_array_t *slots, ngx_str_t *name,
  */
 static size_t
 ngx_http_cache_turbo_key_fold_size(ngx_http_request_t *r, ngx_str_t *name,
-    ngx_str_t *val, size_t *vlen_out, uint32_t *vfield_out)
+    ngx_str_t *val, ngx_http_cache_turbo_key_cookie_slot_t *slot)
 {
-    size_t     vlen;
-    uint32_t   vfield;
-
     if (val->len > NGX_HTTP_CACHE_TURBO_KEY_COOKIE_MAX) {
-        vlen = 0;
-        vfield = NGX_HTTP_CACHE_TURBO_KEY_COOKIE_OVERSIZE;
+        slot->vlen = 0;
+        slot->vfield = NGX_HTTP_CACHE_TURBO_KEY_COOKIE_OVERSIZE;
 
         ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
                       "cache_turbo: key cookie \"%V\" value of %uz bytes "
@@ -793,14 +792,11 @@ ngx_http_cache_turbo_key_fold_size(ngx_http_request_t *r, ngx_str_t *name,
                       NGX_HTTP_CACHE_TURBO_KEY_COOKIE_MAX);
 
     } else {
-        vlen = val->len;
-        vfield = (uint32_t) val->len;
+        slot->vlen = (uint32_t) val->len;
+        slot->vfield = (uint32_t) val->len;
     }
 
-    *vlen_out = vlen;
-    *vfield_out = vfield;
-
-    return 1 + 4 + 4 + name->len + vlen;
+    return 1 + 4 + 4 + name->len + slot->vlen;
 }
 
 
@@ -838,8 +834,6 @@ ngx_http_cache_turbo_key_fold_all(ngx_http_request_t *r,
 {
     ngx_http_cache_turbo_key_cookie_slot_t  *s = slots->elts;
     size_t                                   klen = ctx->cache_key.len;
-    size_t                                  *vlen;
-    uint32_t                                *vfield;
     u_char                                  *k, *p;
     ngx_uint_t                               i;
 
@@ -847,19 +841,9 @@ ngx_http_cache_turbo_key_fold_all(ngx_http_request_t *r,
         return NGX_OK;
     }
 
-    vlen = ngx_palloc(r->pool, slots->nelts * sizeof(size_t));
-    if (vlen == NULL) {
-        return NGX_ERROR;
-    }
-
-    vfield = ngx_palloc(r->pool, slots->nelts * sizeof(uint32_t));
-    if (vfield == NULL) {
-        return NGX_ERROR;
-    }
-
     for (i = 0; i < slots->nelts; i++) {
         klen += ngx_http_cache_turbo_key_fold_size(r, &s[i].name, &s[i].val,
-                                                    &vlen[i], &vfield[i]);
+                                                    &s[i]);
     }
 
     k = ngx_pnalloc(r->pool, klen);
@@ -870,8 +854,8 @@ ngx_http_cache_turbo_key_fold_all(ngx_http_request_t *r,
     p = ngx_cpymem(k, ctx->cache_key.data, ctx->cache_key.len);
 
     for (i = 0; i < slots->nelts; i++) {
-        p = ngx_http_cache_turbo_key_fold_append(p, &s[i].name, vlen[i],
-                                                  vfield[i], &s[i].val);
+        p = ngx_http_cache_turbo_key_fold_append(p, &s[i].name, s[i].vlen,
+                                                  s[i].vfield, &s[i].val);
     }
 
     ctx->cache_key.data = k;
@@ -943,7 +927,7 @@ ngx_http_cache_turbo_build_key(ngx_http_request_t *r,
      * returns early. */
     ngx_memzero(&slots, sizeof(slots));
 
-    if (NGX_HTTP_CACHE_TURBO_HAS_BACKEND(clcf->backend_presets) ||
+    if (clcf->backend_key_cookies != 0 ||
         (clcf->key_cookies != NULL && clcf->key_cookies != NGX_CONF_UNSET_PTR))
     {
         /* Small typical case (0-2 folded cookies): a 4-element inline pool
@@ -956,15 +940,15 @@ ngx_http_cache_turbo_build_key(ngx_http_request_t *r,
         }
     }
 
-    if (NGX_HTTP_CACHE_TURBO_HAS_BACKEND(clcf->backend_presets)) {
+    if (clcf->backend_key_cookies != 0) {
         ngx_str_t   kcname, kcval;
         ngx_uint_t  cursor = 0;
 
         /* EVERY present key cookie is folded, not just the first: a preset may
          * declare several, and a cookie the key ignores is one two different
          * users can differ in while sharing an entry. */
-        while (ngx_http_cache_turbo_key_cookie(r, clcf->backend_presets,
-                                               &cursor, &kcname, &kcval))
+        while (ngx_http_cache_turbo_key_cookie(r, clcf, &cursor, &kcname,
+                                               &kcval))
         {
             if (ngx_http_cache_turbo_key_cookie_queue(&slots, &kcname, &kcval)
                 != NGX_OK)
@@ -1122,7 +1106,7 @@ ngx_http_cache_turbo_status_ttl(ngx_http_cache_turbo_loc_conf_t *clcf,
     ngx_uint_t status)
 {
     ngx_http_cache_turbo_valid_t  *v;
-    ngx_uint_t                     i;
+    ngx_uint_t                     lo, hi, mid;
 
     /* Never cache 206 Partial Content: the cache key does not include the Range,
      * so a stored partial would be served for a different (or full) range. Refuse
@@ -1137,9 +1121,21 @@ ngx_http_cache_turbo_status_ttl(ngx_http_cache_turbo_loc_conf_t *clcf,
 
     if (clcf->valid_status != NULL) {
         v = clcf->valid_status->elts;
-        for (i = 0; i < clcf->valid_status->nelts; i++) {
-            if (v[i].status == status) {
-                return v[i].valid;
+        lo = 0;
+        hi = clcf->valid_status->nelts;
+
+        while (lo < hi) {
+            mid = lo + (hi - lo) / 2;
+
+            if (v[mid].status == status) {
+                return v[mid].valid;
+            }
+
+            if (v[mid].status < status) {
+                lo = mid + 1;
+
+            } else {
+                hi = mid;
             }
         }
     }
@@ -3106,31 +3102,45 @@ ngx_http_cache_turbo_serve(ngx_http_request_t *r, u_char *copy, size_t len,
         rc = ngx_http_output_filter(r, &out);
 
     } else {
-        ngx_chain_t  *cl, **ll;
-        size_t        off;
+        ngx_chain_t  *links, *cl, **ll;
+        ngx_buf_t    *bufs;
+        size_t        off, nbufs, idx;
+
+        nbufs = (body_len + NGX_HTTP_CACHE_TURBO_SERVE_CHUNK - 1)
+                / NGX_HTTP_CACHE_TURBO_SERVE_CHUNK;
+
+        if (nbufs > NGX_MAX_SIZE_T_VALUE / sizeof(ngx_buf_t)
+            || nbufs - 1 > NGX_MAX_SIZE_T_VALUE / sizeof(ngx_chain_t))
+        {
+            return NGX_ERROR;
+        }
+
+        bufs = ngx_pcalloc(r->pool, nbufs * sizeof(ngx_buf_t));
+        if (bufs == NULL) {
+            return NGX_ERROR;
+        }
+
+        links = NULL;
+        if (nbufs > 1) {
+            links = ngx_palloc(r->pool, (nbufs - 1) * sizeof(ngx_chain_t));
+            if (links == NULL) {
+                return NGX_ERROR;
+            }
+        }
 
         ll = &out.next;
         out.buf = NULL;
-        b = NULL;
         off = 0;
+        idx = 0;
 
-        /* do/while, not for: body_len > 0 in this arm, so the body ALWAYS runs
-         * at least once and `b` is non-NULL at the terminator below. Written
-         * this way so that is structural rather than something a reader (or an
-         * analyzer) has to derive from the loop condition -- cppcheck reads the
-         * `for` form as "condition may be false on entry" and reports the
-         * terminator as a NULL dereference. */
-        do {
+        while (idx < nbufs) {
             size_t  n = body_len - off;
 
             if (n > NGX_HTTP_CACHE_TURBO_SERVE_CHUNK) {
                 n = NGX_HTTP_CACHE_TURBO_SERVE_CHUNK;
             }
 
-            b = ngx_calloc_buf(r->pool);
-            if (b == NULL) {
-                return NGX_ERROR;
-            }
+            b = &bufs[idx];
 
             b->pos = body + off;
             b->last = body + off + n;
@@ -3140,18 +3150,16 @@ ngx_http_cache_turbo_serve(ngx_http_request_t *r, u_char *copy, size_t len,
                 out.buf = b;
 
             } else {
-                cl = ngx_alloc_chain_link(r->pool);
-                if (cl == NULL) {
-                    return NGX_ERROR;
-                }
+                cl = &links[idx - 1];
                 cl->buf = b;
                 *ll = cl;
                 ll = &cl->next;
             }
 
             off += NGX_HTTP_CACHE_TURBO_SERVE_CHUNK;
+            idx++;
 
-        } while (off < body_len);
+        }
 
         *ll = NULL;
 
@@ -3497,6 +3505,241 @@ ngx_http_cache_turbo_response_cacheable(ngx_http_request_t *r,
     }
 
     return 1;
+}
+
+
+void
+ngx_http_cache_turbo_response_policy(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf,
+    ngx_http_cache_turbo_response_policy_t *out)
+{
+    ngx_list_part_t  *part;
+    ngx_table_elt_t  *h;
+    ngx_uint_t        i, require_found = 0;
+    time_t            sc_max = -1, cdn_smax = -1, cdn_max = -1;
+    time_t            cc_smax = -1, cc_max = -1;
+    ngx_str_t         expires = ngx_null_string;
+
+    out->upstream_ttl = -1;
+    out->swr = -1;
+    out->sie = -1;
+    out->must_revalidate = 0;
+    out->auth_shareable = 0;
+    out->require_hdr_ok = (clcf->require_header.len == 0) ? 1 : 0;
+    out->cacheable = 1;
+    out->cacheable_reason = NGX_HTTP_CACHE_TURBO_REFUSE_NONE;
+
+    if (r->headers_in.authorization != NULL) {
+        out->cacheable = 0;
+        out->cacheable_reason = NGX_HTTP_CACHE_TURBO_REFUSE_AUTHORIZATION;
+    }
+
+    part = &r->headers_out.headers.part;
+    h = part->elts;
+
+    for (i = 0; /* void */ ; i++) {
+        u_char  *v, *e;
+
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            h = part->elts;
+            i = 0;
+        }
+        if (h[i].hash == 0 || h[i].key.len == 0) {
+            continue;
+        }
+
+        if (h[i].key.len == sizeof("Expires") - 1
+            && expires.len == 0
+            && ngx_strncasecmp(h[i].key.data, (u_char *) "Expires",
+                               sizeof("Expires") - 1) == 0)
+        {
+            expires = h[i].value;
+        }
+
+        if (clcf->require_header.len != 0
+            && h[i].key.len == clcf->require_header.len
+            && ngx_strncasecmp(h[i].key.data, clcf->require_header.data,
+                               clcf->require_header.len) == 0)
+        {
+            if (!((h[i].value.len == 3
+                   && ngx_strncasecmp(h[i].value.data, (u_char *) "yes", 3)
+                      == 0)
+                  || (h[i].value.len == 2
+                      && ngx_strncasecmp(h[i].value.data, (u_char *) "on", 2)
+                         == 0)
+                  || (h[i].value.len == 1 && h[i].value.data[0] == '1')))
+            {
+                out->require_hdr_ok = 0;
+            } else if (!require_found) {
+                out->require_hdr_ok = 1;
+            }
+            require_found = 1;
+            continue;
+        }
+
+        if (h[i].key.len == sizeof("Set-Cookie") - 1
+            && ngx_strncasecmp(h[i].key.data, (u_char *) "Set-Cookie",
+                               sizeof("Set-Cookie") - 1) == 0)
+        {
+            if (out->cacheable
+                && !(ngx_http_cache_turbo_set_cookie_relax_allowed(clcf)
+                     && ngx_http_cache_turbo_set_cookie_ignorable(clcf, &h[i])))
+            {
+                out->cacheable = 0;
+                out->cacheable_reason = NGX_HTTP_CACHE_TURBO_REFUSE_SET_COOKIE;
+            }
+            continue;
+        }
+
+        if (clcf->ignore_cc) {
+            continue;
+        }
+
+        v = h[i].value.data;
+        e = v + h[i].value.len;
+
+        if (h[i].key.len == sizeof("Surrogate-Control") - 1
+            && ngx_strncasecmp(h[i].key.data, (u_char *) "Surrogate-Control",
+                               sizeof("Surrogate-Control") - 1) == 0)
+        {
+            if (out->cacheable
+                && (ngx_http_cache_turbo_cc_has(v, e, "no-store",
+                        sizeof("no-store") - 1)
+                    || ngx_http_cache_turbo_cc_has(v, e, "no-cache",
+                        sizeof("no-cache") - 1)
+                    || ngx_http_cache_turbo_cc_has(v, e, "private",
+                        sizeof("private") - 1)
+                    || ngx_http_cache_turbo_cc_delta(v, e, "max-age",
+                        sizeof("max-age") - 1) == 0
+                    || ngx_http_cache_turbo_cc_delta(v, e, "s-maxage",
+                        sizeof("s-maxage") - 1) == 0))
+            {
+                out->cacheable = 0;
+                out->cacheable_reason =
+                    NGX_HTTP_CACHE_TURBO_REFUSE_CACHE_CONTROL;
+            }
+
+            if (sc_max < 0) {
+                sc_max = ngx_http_cache_turbo_cc_delta(v, e, "max-age",
+                                                       sizeof("max-age") - 1);
+            }
+            continue;
+        }
+
+        if (h[i].key.len == sizeof("CDN-Cache-Control") - 1
+            && ngx_strncasecmp(h[i].key.data, (u_char *) "CDN-Cache-Control",
+                               sizeof("CDN-Cache-Control") - 1) == 0)
+        {
+            if (out->cacheable
+                && (ngx_http_cache_turbo_cc_has(v, e, "no-store",
+                        sizeof("no-store") - 1)
+                    || ngx_http_cache_turbo_cc_has(v, e, "no-cache",
+                        sizeof("no-cache") - 1)
+                    || ngx_http_cache_turbo_cc_has(v, e, "private",
+                        sizeof("private") - 1)
+                    || ngx_http_cache_turbo_cc_delta(v, e, "max-age",
+                        sizeof("max-age") - 1) == 0
+                    || ngx_http_cache_turbo_cc_delta(v, e, "s-maxage",
+                        sizeof("s-maxage") - 1) == 0))
+            {
+                out->cacheable = 0;
+                out->cacheable_reason =
+                    NGX_HTTP_CACHE_TURBO_REFUSE_CACHE_CONTROL;
+            }
+
+            if (cdn_smax < 0) {
+                cdn_smax = ngx_http_cache_turbo_cc_delta(v, e, "s-maxage",
+                                                       sizeof("s-maxage") - 1);
+            }
+            if (cdn_max < 0) {
+                cdn_max = ngx_http_cache_turbo_cc_delta(v, e, "max-age",
+                                                       sizeof("max-age") - 1);
+            }
+            continue;
+        }
+
+        if (h[i].key.len == sizeof("Cache-Control") - 1
+            && ngx_strncasecmp(h[i].key.data, (u_char *) "Cache-Control",
+                               sizeof("Cache-Control") - 1) == 0)
+        {
+            if (out->cacheable
+                && (ngx_http_cache_turbo_cc_has(v, e, "no-store",
+                        sizeof("no-store") - 1)
+                    || ngx_http_cache_turbo_cc_has(v, e, "no-cache",
+                        sizeof("no-cache") - 1)
+                    || ngx_http_cache_turbo_cc_has(v, e, "private",
+                        sizeof("private") - 1)
+                    || ngx_http_cache_turbo_cc_delta(v, e, "max-age",
+                        sizeof("max-age") - 1) == 0
+                    || ngx_http_cache_turbo_cc_delta(v, e, "s-maxage",
+                        sizeof("s-maxage") - 1) == 0))
+            {
+                out->cacheable = 0;
+                out->cacheable_reason =
+                    NGX_HTTP_CACHE_TURBO_REFUSE_CACHE_CONTROL;
+            }
+
+            if (cc_smax < 0) {
+                cc_smax = ngx_http_cache_turbo_cc_delta(v, e, "s-maxage",
+                                                       sizeof("s-maxage") - 1);
+            }
+            if (cc_max < 0) {
+                cc_max = ngx_http_cache_turbo_cc_delta(v, e, "max-age",
+                                                       sizeof("max-age") - 1);
+            }
+            if (out->swr < 0) {
+                out->swr = ngx_http_cache_turbo_cc_delta(v, e,
+                    "stale-while-revalidate",
+                    sizeof("stale-while-revalidate") - 1);
+            }
+            if (out->sie < 0) {
+                out->sie = ngx_http_cache_turbo_cc_delta(v, e,
+                    "stale-if-error", sizeof("stale-if-error") - 1);
+            }
+
+            if (ngx_http_cache_turbo_cc_has(v, e, "must-revalidate",
+                    sizeof("must-revalidate") - 1)
+                || ngx_http_cache_turbo_cc_has(v, e, "proxy-revalidate",
+                    sizeof("proxy-revalidate") - 1))
+            {
+                out->must_revalidate = 1;
+                out->auth_shareable = 1;
+            }
+
+            if (ngx_http_cache_turbo_cc_has(v, e, "public",
+                    sizeof("public") - 1)
+                || cc_smax >= 0)
+            {
+                out->auth_shareable = 1;
+            }
+        }
+    }
+
+    if (clcf->require_header.len != 0 && !require_found) {
+        out->require_hdr_ok = 0;
+    }
+
+    if (sc_max >= 0) {
+        out->upstream_ttl = sc_max;
+    } else if (cdn_smax >= 0) {
+        out->upstream_ttl = cdn_smax;
+    } else if (cdn_max >= 0) {
+        out->upstream_ttl = cdn_max;
+    } else if (cc_smax >= 0) {
+        out->upstream_ttl = cc_smax;
+    } else if (cc_max >= 0) {
+        out->upstream_ttl = cc_max;
+    } else if (expires.len) {
+        time_t  exp = ngx_parse_http_time(expires.data, expires.len);
+        if (exp != NGX_ERROR) {
+            exp -= ngx_time();
+            out->upstream_ttl = (exp > 0) ? exp : 0;
+        }
+    }
 }
 
 
@@ -5022,15 +5265,21 @@ ngx_http_cache_turbo_active_variable(ngx_http_request_t *r,
 
 
 /* Keep in sync with the NGX_HTTP_CACHE_TURBO_ST_* macros in the .h. */
-static const char *
+static ngx_str_t
 ngx_http_cache_turbo_status_str(ngx_uint_t st)
 {
+    static ngx_str_t  hit = ngx_string("HIT");
+    static ngx_str_t  stale = ngx_string("STALE");
+    static ngx_str_t  bypass = ngx_string("BYPASS");
+    static ngx_str_t  expired = ngx_string("EXPIRED");
+    static ngx_str_t  miss = ngx_string("MISS");
+
     switch (st) {
-    case NGX_HTTP_CACHE_TURBO_ST_HIT:     return "HIT";
-    case NGX_HTTP_CACHE_TURBO_ST_STALE:   return "STALE";
-    case NGX_HTTP_CACHE_TURBO_ST_BYPASS:  return "BYPASS";
-    case NGX_HTTP_CACHE_TURBO_ST_EXPIRED: return "EXPIRED";
-    default:                              return "MISS";
+    case NGX_HTTP_CACHE_TURBO_ST_HIT:     return hit;
+    case NGX_HTTP_CACHE_TURBO_ST_STALE:   return stale;
+    case NGX_HTTP_CACHE_TURBO_ST_BYPASS:  return bypass;
+    case NGX_HTTP_CACHE_TURBO_ST_EXPIRED: return expired;
+    default:                              return miss;
     }
 }
 
@@ -5040,7 +5289,7 @@ ngx_http_cache_turbo_status_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data)
 {
     ngx_http_cache_turbo_ctx_t  *ctx;
-    const char                  *s;
+    ngx_str_t                    s;
 
     ctx = ngx_http_get_module_ctx(r, ngx_http_cache_turbo_module);
     if (ctx == NULL) {
@@ -5050,8 +5299,8 @@ ngx_http_cache_turbo_status_variable(ngx_http_request_t *r,
     }
 
     s = ngx_http_cache_turbo_status_str(ctx->status);
-    v->data = (u_char *) s;
-    v->len = ngx_strlen(s);
+    v->data = s.data;
+    v->len = s.len;
     v->valid = 1;
     v->no_cacheable = 1;
     v->not_found = 0;
@@ -5061,16 +5310,23 @@ ngx_http_cache_turbo_status_variable(ngx_http_request_t *r,
 
 
 /* Keep in sync with the NGX_HTTP_CACHE_TURBO_SR_* macros in the .h. */
-static const char *
+static ngx_str_t
 ngx_http_cache_turbo_serve_reason_str(ngx_uint_t sr)
 {
+    static ngx_str_t  none = ngx_null_string;
+    static ngx_str_t  fresh = ngx_string("FRESH");
+    static ngx_str_t  stale = ngx_string("STALE");
+    static ngx_str_t  sie = ngx_string("STALE-IF-ERROR");
+    static ngx_str_t  breaker = ngx_string("STALE-BREAKER");
+    static ngx_str_t  b503 = ngx_string("BREAKER-503");
+
     switch (sr) {
-    case NGX_HTTP_CACHE_TURBO_SR_FRESH:           return "FRESH";
-    case NGX_HTTP_CACHE_TURBO_SR_STALE:           return "STALE";
-    case NGX_HTTP_CACHE_TURBO_SR_STALE_IF_ERROR:  return "STALE-IF-ERROR";
-    case NGX_HTTP_CACHE_TURBO_SR_STALE_BREAKER:   return "STALE-BREAKER";
-    case NGX_HTTP_CACHE_TURBO_SR_BREAKER_503:     return "BREAKER-503";
-    default:                                      return NULL;
+    case NGX_HTTP_CACHE_TURBO_SR_FRESH:           return fresh;
+    case NGX_HTTP_CACHE_TURBO_SR_STALE:           return stale;
+    case NGX_HTTP_CACHE_TURBO_SR_STALE_IF_ERROR:  return sie;
+    case NGX_HTTP_CACHE_TURBO_SR_STALE_BREAKER:   return breaker;
+    case NGX_HTTP_CACHE_TURBO_SR_BREAKER_503:     return b503;
+    default:                                      return none;
     }
 }
 
@@ -5124,7 +5380,7 @@ ngx_http_cache_turbo_serve_reason_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data)
 {
     ngx_http_cache_turbo_ctx_t  *ctx;
-    const char                  *s;
+    ngx_str_t                    s;
 
     ctx = ngx_http_get_module_ctx(r, ngx_http_cache_turbo_module);
     if (ctx == NULL) {
@@ -5134,7 +5390,7 @@ ngx_http_cache_turbo_serve_reason_variable(ngx_http_request_t *r,
     }
 
     s = ngx_http_cache_turbo_serve_reason_str(ctx->serve_reason);
-    if (s == NULL) {
+    if (s.len == 0) {
         /* SR_NONE: engaged but no serve/503 decision recorded yet (e.g. a
          * MISS/BYPASS/EXPIRED path that $cache_turbo_status covers but S7.2
          * has no unfolded reason for) -> "-", same convention as above. */
@@ -5142,8 +5398,8 @@ ngx_http_cache_turbo_serve_reason_variable(ngx_http_request_t *r,
         return NGX_OK;
     }
 
-    v->data = (u_char *) s;
-    v->len = ngx_strlen(s);
+    v->data = s.data;
+    v->len = s.len;
     v->valid = 1;
     v->no_cacheable = 1;
     v->not_found = 0;

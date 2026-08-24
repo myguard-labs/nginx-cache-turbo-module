@@ -930,19 +930,9 @@ def test_cookie_prefilter_counter_oracle(ng: Nginx, origin: Origin) -> None:
                                          headers={"Cookie": "unrelated=1"})
         n_before = _cookie_scans(hbase1, "baseline request")
 
-        # A large Cookie header matching NOTHING: every byte is drawn from a
-        # set that appears in no preset's cookie needles (digits + a few
-        # separators), so the prefilter should skip every unreachable
-        # needle's substring scan on this request, and the number of
-        # calls counted for THIS request must be far smaller than the needle
-        # count -- not the wall-clock time.
+        # A large Cookie header matching NOTHING. The compiled automaton should
+        # scan the Cookie header once, not once per active literal needle.
         big_cookie = "n" + "0123456789" * 800  # ~8KB, no needle first byte here
-        # every preset needle in the table starts with an uppercase/lowercase
-        # letter or '.'; the digit-only body plus a leading 'n' (shared with
-        # none of them at position 0 of a *name*, since needles are matched
-        # as substrings anywhere in the cookie -- so avoid 'n' collisions
-        # with none of the needles either) keeps this cookie byte-disjoint
-        # from every needle's first byte except by construction below.
         headers = {"Cookie": f"harmless={big_cookie}"}
         status, body1, h1 = _fetch_keepalive(conn, "/auto/miss1", headers=headers)
         assert status == 200
@@ -963,40 +953,28 @@ def test_cookie_prefilter_counter_oracle(ng: Nginx, origin: Origin) -> None:
             f"classification is the whole point of the prefilter proof)")
         assert body1 == body2, "cached body must be byte-identical"
 
-        # Counter oracle: each of the two /auto/miss1 requests independently
-        # runs cookie_has() over wordpress+woocommerce+joomla's needle union
-        # (7 needles). Every one of those needles' first byte (w, c, j) is
-        # checked against the 256-byte set built from "harmless=" + digits +
-        # the leading 'n' -- none of which contains w/c/j -- so EVERY
-        # substring scan on this request must be skipped: the delta this
-        # request contributes is 0.
+        # Counter oracle: each of the two /auto/miss1 requests should add one
+        # Cookie-header scan. This is intentionally no longer the old
+        # first-byte prefilter's "zero substring helper calls" oracle; PERF-AUD-05
+        # replaced per-needle substring attempts with one multi-pattern pass.
         delta_first = n_after_first - n_before
         delta_second = n_after_second - n_after_first
-        assert delta_first == 0, (
-            f"large non-matching cookie should trigger ZERO substring "
-            f"scans (every needle's first byte is absent from the header), "
-            f"got a delta of {delta_first} -- the first-byte prefilter is "
-            f"not cutting scans")
-        assert delta_second == 0, (
-            f"second request (same cookie) should also trigger ZERO "
-            f"scans, got a delta of {delta_second}")
+        assert delta_first == 1, (
+            f"large non-matching cookie should trigger one automaton scan, "
+            f"got a delta of {delta_first}")
+        assert delta_second == 1, (
+            f"second request (same cookie) should also trigger one automaton "
+            f"scan, got a delta of {delta_second}")
 
-        # Contrast: a request whose cookie DOES contain a needle's first byte
-        # (but not the needle itself) must NOT be skipped by the byte test
-        # alone -- only the bounded substring helper decides a real match, and
-        # byte set only gates whether that call happens. This proves the
-        # filter is not simply returning "no scans, ever": a 'w'-containing
-        # miss still counts calls.
+        # Contrast: a request whose cookie contains bytes that would have forced
+        # an old substring helper call should still be just one automaton pass.
         _, _, h3 = _fetch_keepalive(conn, "/auto/normal",
                                      headers={"Cookie": "walnut=1"})
         n_after_w = _cookie_scans(h3, "byte-colliding but non-matching cookie")
         delta_w = n_after_w - n_after_second
-        assert delta_w > 0, (
-            f"a cookie containing 'w' (wordpress_logged_in_'s first byte) "
-            f"must still trigger the wordpress needle's substring scan "
-            f"even though it does not match -- got a delta of {delta_w}, "
-            f"meaning the prefilter is skipping scans it has no right to "
-            f"skip")
+        assert delta_w == 1, (
+            f"a byte-colliding non-match should still be one automaton scan, "
+            f"got a delta of {delta_w}")
     finally:
         conn.close()
     drain_origin(origin)

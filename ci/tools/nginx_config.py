@@ -3459,6 +3459,16 @@ http {{
             add_header               X-CT-Status $cache_turbo_status always;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
+        # Legal but awkward: the opt-in header name can be "Expires". This pins
+        # the fused response-policy walk, where Expires is also parsed as a TTL.
+        location /reqexp/ {{
+            cache_turbo              main;
+            cache_turbo_key          $uri;
+            cache_turbo_valid        30s;
+            cache_turbo_require_header Expires;
+            add_header               X-CT-Status $cache_turbo_status always;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
         # Same origin, NO gate: proves the refusals above come from the directive
         # and not from something else in the response (an unset gate must leave
         # the module's normal "cacheable unless vetoed" path untouched).

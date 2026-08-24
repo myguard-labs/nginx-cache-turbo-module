@@ -394,13 +394,18 @@ ngx_http_cache_turbo_capture_count_head_partial(ngx_http_request_t *r,
  * passed and the response still was not captured, so cacheable_reason is
  * meaningful exactly when it is non-NONE (the short-circuit chain stops AT
  * the first false leg, so a later leg failing means every earlier one,
- * including response_cacheable(), passed). require_hdr_ok()/
- * response_encoded() are re-evaluated here (small, bounded header-list
- * scans, same cost class as their gate call) rather than threaded through
- * as extra out-params -- this path never runs on a HIT. */
+ * including response_cacheable(), passed).
+ *
+ * PERF-AUD-01: require_hdr_ok()/response_encoded() are no longer re-evaluated
+ * here. The caller's decision record already holds both verdicts from the one
+ * evaluation the gate performed, so they arrive as tri-state parameters:
+ * >= 0 is that recorded verdict, < 0 means the gate short-circuited before
+ * reaching that leg and this function must evaluate it itself. The counter
+ * precedence (require_header before encoded) is unchanged. */
 static void
 ngx_http_cache_turbo_capture_count_refusal(ngx_http_request_t *r,
-    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_uint_t cacheable_reason)
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_uint_t cacheable_reason,
+    ngx_int_t require_hdr_ok, ngx_int_t response_encoded)
 {
     ngx_http_cache_turbo_zone_t  *rz;
 
@@ -423,9 +428,20 @@ ngx_http_cache_turbo_capture_count_refusal(ngx_http_request_t *r,
         break;
     }
 
-    if (!ngx_http_cache_turbo_require_hdr_ok(r, clcf)) {
+    if (require_hdr_ok < 0) {
+        require_hdr_ok = ngx_http_cache_turbo_require_hdr_ok(r, clcf) ? 1 : 0;
+    }
+
+    if (!require_hdr_ok) {
         (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(rz)->refuse_require_header, 1);
-    } else if (ngx_http_cache_turbo_response_encoded(r)) {
+        return;
+    }
+
+    if (response_encoded < 0) {
+        response_encoded = ngx_http_cache_turbo_response_encoded(r) ? 1 : 0;
+    }
+
+    if (response_encoded) {
         (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(rz)->refuse_encoded, 1);
     }
 }
@@ -485,18 +501,22 @@ ngx_http_cache_turbo_capture_gate_common(ngx_http_request_t *r,
 }
 
 
-/* capture_gate_common() plus the legs that decide whether THIS status is
+/* The legs PAST capture_gate_common() that decide whether THIS status is
  * storable at all: no Vary-vetoed axis, not below min_uses, not
  * auto-skipped, and status_ttl() names a non-negative TTL for
- * r->headers_out.status. Leg order after the common prefix is unchanged
- * from the original chain-1/chain-2 order (vary_nocache, min_uses_skip,
- * auto_skip, status_ttl). */
+ * r->headers_out.status. Leg order is unchanged from the original
+ * chain-1/chain-2 order (vary_nocache, min_uses_skip, auto_skip, status_ttl).
+ *
+ * PERF-AUD-01: this is the TAIL only -- the caller evaluates the shared
+ * capture_gate_common() prefix once and combines the two, so neither the
+ * prefix nor the status_ttl() search below runs more than once per capture.
+ * The full storable predicate is exactly `gate_common && gate_storable_tail`,
+ * with the same short-circuit as the previous single function. */
 static ngx_uint_t
-ngx_http_cache_turbo_capture_gate_storable(ngx_http_request_t *r,
+ngx_http_cache_turbo_capture_gate_storable_tail(ngx_http_request_t *r,
     ngx_http_cache_turbo_ctx_t *ctx, ngx_http_cache_turbo_loc_conf_t *clcf)
 {
-    return ngx_http_cache_turbo_capture_gate_common(r, ctx, clcf)
-           && !ctx->vary_nocache && !ctx->min_uses_skip && !ctx->auto_skip
+    return !ctx->vary_nocache && !ctx->min_uses_skip && !ctx->auto_skip
            && ngx_http_cache_turbo_status_ttl(clcf, r->headers_out.status) >= 0;
 }
 
@@ -506,12 +526,19 @@ ngx_http_cache_turbo_capture_gate_storable(ngx_http_request_t *r,
  * encoded-origin capture was allowed for it (P3-2), and cache_turbo_no_store
  * (if configured) does not veto this specific response. Same leg order and
  * short-circuit as the original inline `&& (A || B) && (C || D)` tail --
- * this only names it, it does not reorder or add a leg. */
+ * this only names it, it does not reorder or add a leg.
+ *
+ * PERF-AUD-01: response_encoded() is no longer called here. The caller
+ * evaluates it once (it needs the verdict for the refusal counters too) and
+ * passes it in as resp_encoded, so an encoded response is classified by a
+ * single header read per capture rather than one here and one in
+ * capture_count_refusal(). */
 static ngx_uint_t
 ngx_http_cache_turbo_capture_gate_response_ok(ngx_http_request_t *r,
-    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_uint_t encoded_ok)
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_uint_t encoded_ok,
+    ngx_uint_t resp_encoded)
 {
-    return (!ngx_http_cache_turbo_response_encoded(r) || encoded_ok)
+    return (!resp_encoded || encoded_ok)
            && (clcf->no_store == NULL
                || ngx_http_test_predicates(r, clcf->no_store) == NGX_OK);
 }
@@ -526,7 +553,7 @@ ngx_http_cache_turbo_capture_gate_response_ok(ngx_http_request_t *r,
 static ngx_int_t
 ngx_http_cache_turbo_header_filter_do_capture(ngx_http_request_t *r,
     ngx_http_cache_turbo_ctx_t *ctx, ngx_http_cache_turbo_loc_conf_t *clcf,
-    ngx_uint_t encoded_ok, ngx_uint_t encoded_class)
+    ngx_uint_t encoded_ok, ngx_uint_t encoded_class, ngx_uint_t auth_shareable)
 {
     if (encoded_ok) {
         ctx->origin_encoded_capture = 1;
@@ -538,8 +565,7 @@ ngx_http_cache_turbo_header_filter_do_capture(ngx_http_request_t *r,
      * blob; it cannot re-derive it after headers are sent. Recorded on
      * every capture regardless of clcf->serve_authorized, so enabling the
      * directive later does not require flushing entries stored before. */
-    ctx->auth_shareable =
-        ngx_http_cache_turbo_response_auth_shareable(r) ? 1 : 0;
+    ctx->auth_shareable = auth_shareable ? 1 : 0;
 
     /* A warm subrequest is deliberately excluded from lookup, so its key
      * was never built. Build it here from the subrequest URI before flagging
@@ -631,6 +657,12 @@ ngx_http_cache_turbo_header_filter_capture(ngx_http_request_t *r,
     ngx_uint_t  cacheable_reason = NGX_HTTP_CACHE_TURBO_REFUSE_NONE;
     ngx_uint_t  encoded_ok = 0;
     ngx_uint_t  encoded_class = NGX_HTTP_CACHE_TURBO_AE_CLASS_IDENTITY;
+    ngx_uint_t  gate_common, gate_storable, captured;
+    ngx_http_cache_turbo_response_policy_t policy;
+    /* PERF-AUD-01 leg verdicts: -1 = the short-circuit never reached this
+     * leg, so capture_count_refusal() must evaluate it itself. */
+    ngx_int_t   req_hdr_ok = -1;
+    ngx_int_t   resp_encoded = -1;
 
     /* auto-Vary (v11 other half): classify the response Vary header once. bits =
      * the safe-axis bitmask the body filter folds into the variant key + marker;
@@ -694,24 +726,61 @@ ngx_http_cache_turbo_header_filter_capture(ngx_http_request_t *r,
      * every existing deployment; nothing changes unless an operator opts
      * in.
      *
-     * MAINT-SPLIT: the gate itself is capture_gate_storable() (below), the
-     * shared prefix with the refusal-attribution `else if`. The trailing
-     * encoded/no_store pair is capture_gate_response_ok(). */
-    if (ngx_http_cache_turbo_capture_gate_storable(r, ctx, clcf)
-        && ngx_http_cache_turbo_response_cacheable(r, &cacheable_reason)
-        && ngx_http_cache_turbo_require_hdr_ok(r, clcf)
-        && ngx_http_cache_turbo_capture_gate_response_ok(r, clcf, encoded_ok))
+     * MAINT-SPLIT: the gate is capture_gate_common() plus
+     * capture_gate_storable_tail() (below) -- together the shared prefix with
+     * the refusal-attribution `else if`. The trailing encoded/no_store pair is
+     * capture_gate_response_ok().
+     *
+     * PERF-AUD-01: each gate leg is evaluated EXACTLY ONCE and its verdict
+     * recorded, instead of re-running the whole storable gate (and through it
+     * capture_gate_common() and the status_ttl() search) in the refusal
+     * `else if`, and capture_gate_common() a third time in the 304 arm.
+     * `gate_common`/`gate_storable` are those single evaluations;
+     * `req_hdr_ok`/`resp_encoded` are the recorded leg verdicts, left at -1
+     * when the short-circuit never reached that leg (capture_count_refusal()
+     * then evaluates it itself). Leg order, short-circuiting and
+     * refusal-counter precedence are byte-for-byte the previous behavior:
+     * each leg is still only evaluated if every earlier leg passed, which is
+     * why the chain is written as nested ifs rather than one `&&` run --
+     * recording a verdict mid-`&&` needs an assignment the short-circuit can
+     * skip, and that reads as a bug even when it is not. */
+    gate_common = ngx_http_cache_turbo_capture_gate_common(r, ctx, clcf);
+    gate_storable = gate_common
+                    && ngx_http_cache_turbo_capture_gate_storable_tail(r, ctx,
+                                                                      clcf);
+    if (gate_storable) {
+        ngx_http_cache_turbo_response_policy(r, clcf, &policy);
+        cacheable_reason = policy.cacheable_reason;
+    }
+
+    captured = 0;
+
+    if (gate_storable && policy.cacheable)
+    {
+        req_hdr_ok = policy.require_hdr_ok ? 1 : 0;
+
+        if (req_hdr_ok) {
+            resp_encoded = ngx_http_cache_turbo_response_encoded(r) ? 1 : 0;
+
+            captured = ngx_http_cache_turbo_capture_gate_response_ok(r, clcf,
+                                                encoded_ok,
+                                                (ngx_uint_t) resp_encoded);
+        }
+    }
+
+    if (captured)
     {
         if (ngx_http_cache_turbo_header_filter_do_capture(r, ctx, clcf,
-                encoded_ok, encoded_class) != NGX_OK)
+                encoded_ok, encoded_class, policy.auth_shareable) != NGX_OK)
         {
             return;
         }
-    } else if (ngx_http_cache_turbo_capture_gate_storable(r, ctx, clcf)) {
+    } else if (gate_storable) {
         /* Every shared leg up to response_cacheable() passed and the
          * response still was not captured -- attribute the refusal. */
-        ngx_http_cache_turbo_capture_count_refusal(r, clcf, cacheable_reason);
-    } else if (ngx_http_cache_turbo_capture_gate_common(r, ctx, clcf)
+        ngx_http_cache_turbo_capture_count_refusal(r, clcf, cacheable_reason,
+                                                   req_hdr_ok, resp_encoded);
+    } else if (gate_common
                && clcf->shm_zone != NULL
                && r->headers_out.status == NGX_HTTP_NOT_MODIFIED)
     {
@@ -1167,17 +1236,20 @@ ngx_http_cache_turbo_body_filter_capture(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx,
     ngx_chain_t *in, ngx_uint_t *last)
 {
-    u_char        *p;
-    size_t         n;
+    u_char        *block, *payload, *p, *meta;
+    size_t         n, total, nbufs, meta_len;
     ngx_buf_t     *b;
+    ngx_buf_t     *bufs;
     ngx_chain_t   *cl, **ll;
+    ngx_chain_t   *links;
+    ngx_uint_t     i;
 
     ll = ctx->body_last ? &ctx->body_last->next : &ctx->body;
 
-    for (cl = in; cl; cl = cl->next) {
-        ngx_buf_t    *nb;
-        ngx_chain_t  *ncl;
+    total = 0;
+    nbufs = 0;
 
+    for (cl = in; cl; cl = cl->next) {
         b = cl->buf;
 
         /* Only in-memory bytes are capturable. A file-backed buffer (sendfile
@@ -1199,16 +1271,11 @@ ngx_http_cache_turbo_body_filter_capture(ngx_http_request_t *r,
         n = ngx_buf_in_memory(b) ? (size_t) (b->last - b->pos) : 0;
 
         if (n > 0) {
-            /* Q2: oversize early-abort, BEFORE the alloc+memcpy. Once the body
-             * would cross max_size we will never store this response (the store
-             * gate below refuses it), so a single huge buffer must not be fully
-             * copied into the request pool just to be discarded at last_buf.
-             * Drop the partial capture, mark the request non-capturing, and
-             * forward downstream untouched. A stacked native proxy_cache (README
-             * pattern B) keeps the object on disk; cache-turbo delegates oversize
-             * media with ~zero shm/pool overhead. Any cold-miss stub is cleared
-             * by the pool-cleanup backstop at request end. */
-            if (clcf->max_size > 0 && ctx->body_len + n > clcf->max_size) {
+            if (clcf->max_size > 0
+                && (total > (size_t) clcf->max_size
+                    || n > (size_t) clcf->max_size - total
+                    || ctx->body_len > (size_t) clcf->max_size - total - n))
+            {
                 ctx->captured = 0;
                 ctx->body = NULL;
                 ctx->body_last = NULL;
@@ -1219,38 +1286,73 @@ ngx_http_cache_turbo_body_filter_capture(ngx_http_request_t *r,
                 return NGX_DECLINED;
             }
 
-            p = ngx_pnalloc(r->pool, n);
-            if (p == NULL) {
-                return NGX_ERROR;
-            }
-            ngx_memcpy(p, b->pos, n);
-
-            nb = ngx_calloc_buf(r->pool);
-            if (nb == NULL) {
-                return NGX_ERROR;
-            }
-            nb->pos = p;
-            nb->last = p + n;
-            nb->memory = 1;
-
-            ncl = ngx_alloc_chain_link(r->pool);
-            if (ncl == NULL) {
-                return NGX_ERROR;
-            }
-            ncl->buf = nb;
-            ncl->next = NULL;
-
-            *ll = ncl;
-            ll = &ncl->next;
-            ctx->body_last = ncl;
-
-            ctx->body_len += n;
+            total += n;
+            nbufs++;
         }
 
         if (b->last_buf || b->last_in_chain) {
             *last = 1;
         }
     }
+
+    if (nbufs == 0) {
+        return NGX_OK;
+    }
+
+    if (nbufs > NGX_MAX_SIZE_T_VALUE / sizeof(ngx_buf_t)
+        || nbufs > NGX_MAX_SIZE_T_VALUE / sizeof(ngx_chain_t))
+    {
+        return NGX_ERROR;
+    }
+
+    meta_len = nbufs * (sizeof(ngx_buf_t) + sizeof(ngx_chain_t));
+    if (meta_len < nbufs * sizeof(ngx_buf_t)
+        || total > NGX_MAX_SIZE_T_VALUE - NGX_ALIGNMENT
+        || total + NGX_ALIGNMENT > NGX_MAX_SIZE_T_VALUE - meta_len)
+    {
+        return NGX_ERROR;
+    }
+
+    block = ngx_pnalloc(r->pool, total + NGX_ALIGNMENT + meta_len);
+    if (block == NULL) {
+        return NGX_ERROR;
+    }
+
+    payload = block;
+    meta = ngx_align_ptr(block + total, NGX_ALIGNMENT);
+    bufs = (ngx_buf_t *) meta;
+    links = (ngx_chain_t *) (meta + nbufs * sizeof(ngx_buf_t));
+    ngx_memzero(bufs, nbufs * sizeof(ngx_buf_t));
+
+    p = payload;
+    i = 0;
+
+    for (cl = in; cl; cl = cl->next) {
+        b = cl->buf;
+        n = ngx_buf_in_memory(b) ? (size_t) (b->last - b->pos) : 0;
+
+        if (n == 0) {
+            continue;
+        }
+
+        ngx_memcpy(p, b->pos, n);
+
+        bufs[i].pos = p;
+        bufs[i].last = p + n;
+        bufs[i].memory = 1;
+
+        links[i].buf = &bufs[i];
+        links[i].next = NULL;
+
+        *ll = &links[i];
+        ll = &links[i].next;
+        ctx->body_last = &links[i];
+
+        p += n;
+        i++;
+    }
+
+    ctx->body_len += total;
 
     return NGX_OK;
 }
@@ -1269,6 +1371,7 @@ ngx_http_cache_turbo_body_filter_windows(ngx_http_request_t *r,
     time_t *out_stale_window, time_t *out_sie_window)
 {
     time_t  ttl, stale_window, sie_window = 0;
+    ngx_http_cache_turbo_response_policy_t policy;
 
     ttl = ngx_http_cache_turbo_status_ttl(clcf, r->headers_out.status);
     if (ttl < 0) {
@@ -1290,10 +1393,18 @@ ngx_http_cache_turbo_body_filter_windows(ngx_http_request_t *r,
      * Cache-Control/Expires set the fresh TTL when enabled. ignore_cc wins:
      * if the operator told us to ignore Cache-Control, the TTL is the static
      * cache_turbo_valid, never the (ignored) upstream max-age/Expires. */
+    ngx_memzero(&policy, sizeof(policy));
+    policy.upstream_ttl = -1;
+    policy.swr = -1;
+    policy.sie = -1;
+
+    if (!clcf->ignore_cc) {
+        ngx_http_cache_turbo_response_policy(r, clcf, &policy);
+    }
+
     if (clcf->honor_cc && !clcf->ignore_cc) {
-        time_t  up = ngx_http_cache_turbo_upstream_ttl(r);
-        if (up >= 0) {
-            ttl = up;
+        if (policy.upstream_ttl >= 0) {
+            ttl = policy.upstream_ttl;
         }
     }
 
@@ -1322,7 +1433,7 @@ ngx_http_cache_turbo_body_filter_windows(ngx_http_request_t *r,
      * proxy_ignore_headers Cache-Control contract (the whole header is
      * inert), not just the cacheability floor. */
     if (ttl > 0 && !clcf->ignore_cc) {
-        time_t  swr = ngx_http_cache_turbo_response_swr(r);
+        time_t  swr = policy.swr;
         if (swr >= 0) {
             /* AUD-CC-DELTA-OVF: swr is parsed straight off the wire and can
              * be up to NGX_MAX_INT_T_VALUE (e.g. stale-while-revalidate=
@@ -1343,8 +1454,7 @@ ngx_http_cache_turbo_body_filter_windows(ngx_http_request_t *r,
      * ignore_cc (see the swr block above — the whole upstream Cache-Control
      * is inert, so an upstream must-revalidate must not collapse the
      * operator-configured stale window). */
-    if (ttl > 0 && !clcf->ignore_cc
-        && ngx_http_cache_turbo_response_must_revalidate(r))
+    if (ttl > 0 && !clcf->ignore_cc && policy.must_revalidate)
     {
         stale_window = ttl;
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
@@ -1360,7 +1470,7 @@ ngx_http_cache_turbo_body_filter_windows(ngx_http_request_t *r,
          * stale serve, stale-if-error included). The serve-on-error path that
          * consumes sie_ttl lands in a follow-up; the field is carried now so
          * the wire format turns over once (single cold-cache event). */
-        time_t  sie = ngx_http_cache_turbo_response_sie(r);
+        time_t  sie = policy.sie;
         if (sie >= 0) {
             /* AUD-CC-DELTA-OVF: same wire-controlled overflow as the swr
              * clamp above -- clamp the delta before the add. */
