@@ -420,6 +420,34 @@ no key cookie keys to the anonymous entry, and if the response *establishes* the
 segment (`Set-Cookie: X-Segment=...`) that response is never stored, so it can
 never poison the anonymous entry.
 
+**Keep the name list short — the cost is multiplicative, and it is paid on every
+keyed request including a cache HIT.** Each configured name drives its own scan
+of **every** `Cookie:` header on the request, so the work is
+`names x cookie-headers`, not `names`. Ten names against a browser sending ten
+cookie headers is a hundred header scans on the hit path, where the rest of the
+lookup is a hash and a tree descent.
+
+There is deliberately **no cap** on the list. Both factors are already bounded by
+someone other than an attacker: the name count is yours, chosen once in the
+config, and the header count is bounded by nginx's `large_client_header_buffers`
+before this module ever runs. A limit here would only turn a working config into
+a startup failure, so this is a **budget you keep, not a limit enforced on you**
+— unlike `cache_turbo_normalize_max_args`, which bounds a count the *client*
+picks and therefore has to be a hard cap.
+
+Two ways the list gets longer than the config appears to say, both worth a look
+before you assume it is short:
+
+- The directive **appends**. Repeating it adds names, it does not replace them:
+  `cache_turbo_key_cookie a b;` followed by `cache_turbo_key_cookie c;` keys on
+  all three.
+- It **inherits** into nested locations, and a `cache_turbo_backend` preset
+  contributes its own key cookies on top of yours -- so the effective list at a
+  given location can be longer than any single line you wrote.
+
+Every name you add also multiplies cardinality: entries are one per distinct
+*combination* of values. That usually bites before the scan cost does.
+
 ## Origin failure: stale-if-error
 
 By default this module serves a stale cached copy when the origin returns 5xx; nginx turns a refused connection into a 502 and a hung one into a 504, so a dead origin is covered. Once the cached copy's TTL has expired, `cache_turbo_keep_stale` supplies the grace window — it defaults to `24h`, and `cache_turbo_keep_stale off` removes it so errors surface normally. Most CMS/app stacks emit no `stale-if-error` of their own. `cache_turbo_use_stale` selects which statuses count as "down" (default: every 5xx); naming tokens replaces the default rather than extending it. Nothing was ever cached for a URL ⇒ nothing to serve; `error_page 502 503 504 /maintenance.html` is the nicer failure.
