@@ -1004,6 +1004,35 @@ extern ngx_http_cache_turbo_memcached_ka_t ngx_http_cache_turbo_memcached_ka;
  * single-TU -- a cross-TU call cannot stay inline. */
 
 void ngx_http_cache_turbo_vary_prepare(ngx_http_cache_turbo_ctx_t *ctx);
+
+
+/* PERF-AUD2-01: deferred form of vary_prepare(). The prologue used to call
+ * vary_prepare() unconditionally whenever clcf->auto_vary was on (the shipped
+ * default), spending a full SHA-256 on EVERY request; a fresh L1 hit returns
+ * NGX_DONE from access_l1_serve_fresh() without reaching a single reader of
+ * ctx->vary_marker_key, so that digest was computed and discarded.
+ *
+ * The fix is deferral, NOT gating: gating the prepare on the zone's `markers`
+ * counter would leave vary_marker_key zeroed on a cold node and silently
+ * defeat the cross-node L2 marker fallback (see the C3 comment in
+ * access_prologue()). Instead every reader calls this first, and it computes
+ * the key at most once per prologue pass. The reachability set of the digest
+ * is therefore a strict subset of the old one, and the BYTES it produces are
+ * identical -- marker_hash() is a pure function of ctx->cache_key, which the
+ * prologue has already built before any reader runs.
+ *
+ * ctx->vary_marker_key_ready is cleared at the top of every access_prologue()
+ * pass, right after build_key() may have rewritten cache_key, so a
+ * park/resume re-entry recomputes exactly as the old code did. */
+static ngx_inline void
+ngx_http_cache_turbo_vary_prepare_lazy(ngx_http_cache_turbo_ctx_t *ctx)
+{
+    if (!ctx->vary_marker_key_ready) {
+        ngx_http_cache_turbo_vary_prepare(ctx);
+        ctx->vary_marker_key_ready = 1;
+    }
+}
+
 void ngx_http_cache_turbo_vary_apply(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_zone_t *z,
     ngx_http_cache_turbo_ctx_t *ctx, uint32_t *hash);

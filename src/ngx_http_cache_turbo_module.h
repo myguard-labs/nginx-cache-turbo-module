@@ -2428,8 +2428,20 @@ typedef struct {
      * prologue (marker_hash() only touches ctx->cache_key and local stack
      * memory) so the marker lookup itself can run inside the SAME critical
      * section as the main L1 lookup in access_handler, instead of its own
-     * separate lock/unlock pair. Only meaningful when clcf->auto_vary. */
+     * separate lock/unlock pair. Only meaningful when clcf->auto_vary.
+     *
+     * PERF-AUD2-01: no longer filled in unconditionally by the prologue.
+     * Every reader calls ngx_http_cache_turbo_vary_prepare_lazy() first,
+     * which fills it on demand and sets vary_marker_key_ready. A fresh L1
+     * hit reaches no reader and therefore never pays the digest. */
     u_char                   vary_marker_key[32];
+    /* PERF-AUD2-01 idempotence latch for vary_marker_key: 1 => the 32 bytes
+     * above were computed from the CURRENT ctx->cache_key by
+     * ngx_http_cache_turbo_vary_prepare_lazy(). Cleared at the top of every
+     * access_prologue() pass, immediately after build_key() may have
+     * rewritten cache_key, so a park/resume re-entry with a different key
+     * recomputes exactly as the old unconditional prologue call did. */
+    unsigned                 vary_marker_key_ready:1;
     /* P3-5: set by vary_apply() when the L1 marker probe MISSED (no marker
      * node, expired-with-no-grace, or a corrupt/collided blob) while
      * clcf->auto_vary is on -- i.e. key_hash is still the BASE key, not a
