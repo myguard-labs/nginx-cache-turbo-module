@@ -21,3 +21,20 @@
    fun:ngx_alloc
    fun:ngx_event_process_init
 }
+
+# Helgrind cannot track nginx's PROCESS-shared shm mutex (ngx_shmtx uses a
+# sem_t in shared memory, posted by a different PROCESS), so it reports
+# "Bug in libpthread: sem_wait succeeded on semaphore without prior sem_post"
+# on every ngx_shmtx_lock. Single-threaded (Thread #1) and not a data race:
+# helgrind is a THREAD tool being shown cross-process synchronization.
+#
+# ⚠ Pinned to sem_wait_WRK -> ngx_shmtx_lock ONLY. Do NOT widen it to the
+# cache_turbo frames above it in the stack: a genuine race inside the module
+# must still be reported. Added 2026-08-24, after fixing the gate bug that had
+# been hiding every valgrind/helgrind finding.
+{
+   nginx-shmtx-process-shared-sem-helgrind-cannot-track
+   Helgrind:Misc
+   fun:sem_wait_WRK
+   fun:ngx_shmtx_lock
+}

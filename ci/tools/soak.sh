@@ -293,24 +293,95 @@ fi
 
 # Clean shutdown so all pool/shm cleanups run.
 kill -QUIT "$NGINX_PID" 2>/dev/null || true
-wait "$NGINX_PID" 2>/dev/null; rc=$?
+# ⚠ `|| true` is load-bearing. Under `set -e` a bare `wait "$PID"` ABORTS the
+# script when the child exits non-zero -- and valgrind exits 99
+# (--error-exitcode) exactly when it has found something. Without the guard the
+# soak died right here on every real finding: no FAIL message, no leak stacks,
+# no engagement assertions, just a bare non-zero exit that reads like a crash
+# rather than a verdict. The failing case must reach the gates below and be
+# REPORTED. (Same trap the L2 probes above are guarded against; observed
+# 2026-08-24 as an unexplained rc=99 with completely empty output.)
+wait "$NGINX_PID" 2>/dev/null && rc=0 || rc=$?
+
+# ⚠ `wait` above returns when the process we backgrounded exits -- under
+# valgrind that is the tool instance tracing nginx's MASTER. Each forked worker
+# is traced by its OWN valgrind, which writes its --log-file=%p report when that
+# WORKER exits, and that can happen after the wait returns. The log FILE is
+# created early (it carries the header), so an `ls`-based check finds a file
+# that does not hold the findings yet: the greps below would then read a
+# half-written log and report a clean soak over real errors.
+#
+# Verified 2026-08-24: a child outliving its parent under `--log-file=%p` has
+# its "definitely lost" record appear only AFTER `wait` returned, in a file that
+# already existed. So drain the tool processes before reading anything.
+#
+# Bounded so a wedged valgrind cannot hang the soak forever; if the drain times
+# out we say so and let the greps run on what exists rather than exiting clean.
+if [ "${USE_VALGRIND:-0}" = "1" ] || [ "${USE_HELGRIND:-0}" = "1" ]; then
+    # The running process is the TOOL binary (memcheck-amd64-linux /
+    # helgrind-amd64-linux), never "valgrind" -- pgrep -x on "valgrind" matches
+    # nothing and the drain would silently no-op. Only the tool prefix is
+    # matched so the arch suffix is not hardcoded.
+    #
+    # ⚠ Do NOT scope this by process group. With job control the backgrounded
+    # valgrind lands in its OWN pgid, so a pgid-scoped pgrep matches nothing,
+    # returns 0 immediately and restores the very race this drains (observed
+    # 2026-08-24: the soak printed "✓ clean" while two worker logs held
+    # `ERROR SUMMARY: 1 errors`).
+    # ⚠ Do NOT switch to `pgrep -f` either: it matches this script's own wrapper
+    # shell, so the count never reaches 0.
+    #
+    # Scope by the tool processes' session instead: every valgrind we spawned is
+    # in our session, and a parallel soak run from a different shell is not.
+    _vg_sid="$(ps -o sess= -p $$ 2>/dev/null | tr -d ' ')"
+    _vg_deadline=$(( $(date +%s) + 60 ))
+    while :; do
+        # `|| true` is load-bearing: pgrep exits 1 when nothing matches, which
+        # under `set -euo pipefail` is the DRAIN-COMPLETE case and would
+        # otherwise kill the script before any gate below runs.
+        _vg_left="$( { pgrep -s "${_vg_sid:-0}" '^(memcheck|helgrind|drd)-' || true; } 2>/dev/null | wc -l)"
+        [ "$_vg_left" -eq 0 ] && break
+        [ "$(date +%s)" -ge "$_vg_deadline" ] && {
+            echo "WARN: valgrind still running after 60s drain;" \
+                 "log-based checks below may be incomplete"
+            break
+        }
+        sleep 0.5
+    done
+fi
 
 problems=0
 if ls "$WORK"/logs/asan* >/dev/null 2>&1; then
     echo "FAIL: ASAN/UBSAN report:"; cat "$WORK"/logs/asan*; problems=1
 fi
-if ls "$WORK"/logs/valgrind.* "$WORK"/logs/helgrind.* >/dev/null 2>&1; then
+# ⚠ Collect the logs that EXIST into an array first. Passing both
+# `valgrind.*` and `helgrind.*` to grep directly is a silent-pass bug: only one
+# of the two ever exists (memcheck writes valgrind.*, helgrind writes
+# helgrind.*), and grep exits 2 on the unmatched glob EVEN WHEN THE PATTERN
+# MATCHED in the other file. `if grep -q ...` then reads that 2 as false and the
+# gate passes over real errors. Verified 2026-08-24: two worker logs holding
+# `ERROR SUMMARY: 1 errors` while the soak printed "✓ soak clean".
+# The `for` loop below was always correct -- it guards each path with `[ -f ]`.
+# ⚠ if/fi, not `[ -f ] && ...`: a trailing test that fails is the loop body's
+# exit status, and under `set -e` an unmatched glob (the normal case -- only one
+# tool's logs exist) would abort the script right here, before any gate runs.
+_vglogs=()
+for _f in "$WORK"/logs/valgrind.* "$WORK"/logs/helgrind.*; do
+    if [ -f "$_f" ]; then
+        _vglogs+=("$_f")
+    fi
+done
+if [ "${#_vglogs[@]}" -gt 0 ]; then
     if grep -qE 'ERROR SUMMARY: [1-9]|definitely lost: [1-9]' \
-            "$WORK"/logs/valgrind.* "$WORK"/logs/helgrind.* 2>/dev/null; then
+            "${_vglogs[@]}" 2>/dev/null; then
         echo "FAIL: valgrind/helgrind errors:"
         grep -E 'ERROR SUMMARY|definitely lost' \
-            "$WORK"/logs/valgrind.* "$WORK"/logs/helgrind.* 2>/dev/null
+            "${_vglogs[@]}" 2>/dev/null
         # Dump every log holding errors in full: the WORK dir is wiped on
         # exit, so this is the only place the stacks (and the exact
         # suppression blocks from --gen-suppressions=all) survive, e.g.
         # in a CI job log.
-        for _vglog in "$WORK"/logs/valgrind.* "$WORK"/logs/helgrind.*; do
-            [ -f "$_vglog" ] || continue
+        for _vglog in "${_vglogs[@]}"; do
             grep -qE 'ERROR SUMMARY: [1-9]|definitely lost: [1-9]' "$_vglog" || continue
             echo "---- $_vglog ----"
             cat "$_vglog"
