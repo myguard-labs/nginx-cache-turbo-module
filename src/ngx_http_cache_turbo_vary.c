@@ -291,20 +291,25 @@ ngx_http_cache_turbo_ae_class_match_coding(u_char *tok, size_t clen,
  * PHASE 2 -- dispatch to the highest-priority accepted encoding.
  * Returns the encoding string for the first (highest-priority) algorithm that is set:
  * zstd > br > gzip > identity. Priority order matches what our stack serves. */
-static const char *
+static ngx_str_t
 ngx_http_cache_turbo_ae_class_dispatch(ngx_uint_t zstd, ngx_uint_t br,
     ngx_uint_t gzip)
 {
+    static ngx_str_t  zstd_s = ngx_string("zstd");
+    static ngx_str_t  br_s = ngx_string("br");
+    static ngx_str_t  gzip_s = ngx_string("gzip");
+    static ngx_str_t  identity_s = ngx_string("identity");
+
     if (zstd) {
-        return "zstd";
+        return zstd_s;
     }
     if (br) {
-        return "br";
+        return br_s;
     }
     if (gzip) {
-        return "gzip";
+        return gzip_s;
     }
-    return "identity";
+    return identity_s;
 }
 
 
@@ -322,7 +327,7 @@ ngx_http_cache_turbo_ae_class_dispatch(ngx_uint_t zstd, ngx_uint_t br,
  * `x-gzip` no longer aliases `gzip`, and a `;q=0` parameter de-selects the coding
  * (codex follow-up: token boundaries + q-values). Coding names are matched
  * case-insensitively at exact length. */
-static const char *
+static ngx_str_t
 ngx_http_cache_turbo_ae_class(ngx_http_request_t *r)
 {
     ngx_table_elt_t  *ae = r->headers_in.accept_encoding;
@@ -331,7 +336,7 @@ ngx_http_cache_turbo_ae_class(ngx_http_request_t *r)
     ngx_uint_t        zstd = 0, br = 0, gzip = 0;
 
     if (ae == NULL || ae->value.len == 0) {
-        return "identity";
+        return ngx_http_cache_turbo_ae_class_dispatch(0, 0, 0);
     }
 
     p = ae->value.data;
@@ -387,26 +392,71 @@ ngx_http_cache_turbo_ae_class(ngx_http_request_t *r)
  * --without-http_rewrite_module, no PCRE). Case-insensitive — core only ships a
  * bounded case-insensitive search (ngx_strlcasestrn); case-folding mobile tokens
  * is harmless. Tablets fall in desktop by design. */
-static const char *
+static ngx_inline u_char
+ngx_http_cache_turbo_lc_ascii(u_char c)
+{
+    return (u_char) ((c >= 'A' && c <= 'Z') ? (c | 0x20) : c);
+}
+
+
+static ngx_uint_t
+ngx_http_cache_turbo_match_lc(u_char *p, u_char *last, const char *needle,
+    size_t nlen)
+{
+    size_t  i;
+
+    if ((size_t) (last - p) < nlen) {
+        return 0;
+    }
+
+    for (i = 1; i < nlen; i++) {
+        if (ngx_http_cache_turbo_lc_ascii(p[i]) != (u_char) needle[i]) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+
+static ngx_str_t
 ngx_http_cache_turbo_device_class(ngx_http_request_t *r)
 {
+    static ngx_str_t  desktop_s = ngx_string("desktop");
+    static ngx_str_t  mobile_s = ngx_string("mobile");
     ngx_table_elt_t  *ua = r->headers_in.user_agent;
-    u_char           *s, *last;
+    u_char           *p, *last;
 
     if (ua == NULL || ua->value.len == 0) {
-        return "desktop";
+        return desktop_s;
     }
 
-    s = ua->value.data;
-    last = s + ua->value.len;
+    p = ua->value.data;
+    last = p + ua->value.len;
 
-    if (ngx_strlcasestrn(s, last, (u_char *) "mobi", 4 - 1) != NULL
-        || ngx_strlcasestrn(s, last, (u_char *) "android", 7 - 1) != NULL
-        || ngx_strlcasestrn(s, last, (u_char *) "iphone", 6 - 1) != NULL)
-    {
-        return "mobile";
+    for (; p < last; p++) {
+        switch (ngx_http_cache_turbo_lc_ascii(*p)) {
+        case 'm':
+            if (ngx_http_cache_turbo_match_lc(p, last, "mobi", 4)) {
+                return mobile_s;
+            }
+            break;
+        case 'a':
+            if (ngx_http_cache_turbo_match_lc(p, last, "android", 7)) {
+                return mobile_s;
+            }
+            break;
+        case 'i':
+            if (ngx_http_cache_turbo_match_lc(p, last, "iphone", 6)) {
+                return mobile_s;
+            }
+            break;
+        default:
+            break;
+        }
     }
-    return "desktop";
+
+    return desktop_s;
 }
 
 
@@ -419,7 +469,7 @@ size_t
 ngx_http_cache_turbo_vary_suffix(ngx_http_request_t *r, ngx_int_t vary,
     u_char *buf)
 {
-    const char  *cls;
+    ngx_str_t    cls;
     u_char      *w = buf;
 
     if (vary == NGX_CONF_UNSET || vary == 0) {
@@ -430,14 +480,14 @@ ngx_http_cache_turbo_vary_suffix(ngx_http_request_t *r, ngx_int_t vary,
         cls = ngx_http_cache_turbo_ae_class(r);
         *w++ = 0x1F;
         w = ngx_cpymem(w, "ae=", 3);
-        w = ngx_cpymem(w, cls, ngx_strlen(cls));
+        w = ngx_cpymem(w, cls.data, cls.len);
     }
 
     if (vary & NGX_HTTP_CACHE_TURBO_VARY_DEVICE) {
         cls = ngx_http_cache_turbo_device_class(r);
         *w++ = 0x1F;
         w = ngx_cpymem(w, "dev=", 4);
-        w = ngx_cpymem(w, cls, ngx_strlen(cls));
+        w = ngx_cpymem(w, cls.data, cls.len);
     }
 
     return w - buf;
@@ -586,7 +636,7 @@ ngx_http_cache_turbo_variant_hash(ngx_http_request_t *r, ngx_str_t *base,
     ngx_int_t bits, ngx_uint_t gen, u_char out[32])
 {
     ngx_http_cache_turbo_digest_t  d;
-    const char                    *cls;
+    ngx_str_t                      cls;
     ngx_str_t                      v;
     static const u_char            us = 0x1F;
 
@@ -623,13 +673,13 @@ ngx_http_cache_turbo_variant_hash(ngx_http_request_t *r, ngx_str_t *base,
         cls = ngx_http_cache_turbo_ae_class(r);
         ngx_http_cache_turbo_digest_update(&d, &us, 1);
         ngx_http_cache_turbo_digest_update(&d, "ae=", 3);
-        ngx_http_cache_turbo_digest_update(&d, cls, ngx_strlen(cls));
+        ngx_http_cache_turbo_digest_update(&d, cls.data, cls.len);
     }
     if (bits & NGX_HTTP_CACHE_TURBO_VARY_DEVICE) {
         cls = ngx_http_cache_turbo_device_class(r);
         ngx_http_cache_turbo_digest_update(&d, &us, 1);
         ngx_http_cache_turbo_digest_update(&d, "dev=", 4);
-        ngx_http_cache_turbo_digest_update(&d, cls, ngx_strlen(cls));
+        ngx_http_cache_turbo_digest_update(&d, cls.data, cls.len);
     }
     if (bits & NGX_HTTP_CACHE_TURBO_VARY_LANG) {
         u_char  lbuf[NGX_HTTP_CACHE_TURBO_LANG_CLASS_MAX];

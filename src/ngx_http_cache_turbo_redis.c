@@ -684,6 +684,38 @@ ngx_http_cache_turbo_redis_encode(ngx_pool_t *pool, ngx_str_t *argv,
 }
 
 
+static size_t
+ngx_http_cache_turbo_redis_encode_len(ngx_str_t *argv, ngx_uint_t argc)
+{
+    size_t      len;
+    ngx_uint_t  i;
+
+    len = 1 + NGX_INT_T_LEN + 2;
+    for (i = 0; i < argc; i++) {
+        len += 1 + NGX_SIZE_T_LEN + 2 + argv[i].len + 2;
+    }
+
+    return len;
+}
+
+
+static u_char *
+ngx_http_cache_turbo_redis_encode_into(u_char *p, ngx_str_t *argv,
+    ngx_uint_t argc)
+{
+    ngx_uint_t  i;
+
+    p = ngx_sprintf(p, "*%ui\r\n", argc);
+    for (i = 0; i < argc; i++) {
+        p = ngx_sprintf(p, "$%uz\r\n", argv[i].len);
+        p = ngx_cpymem(p, argv[i].data, argv[i].len);
+        *p++ = CR; *p++ = LF;
+    }
+
+    return p;
+}
+
+
 /* S231: per-worker L2 connect backoff, redis side.
  *
  * After a connect FAILURE (ngx_event_connect_peer returning ERROR/BUSY/
@@ -1376,10 +1408,9 @@ void
 ngx_http_cache_turbo_redis_del_many(ngx_http_cache_turbo_loc_conf_t *clcf,
     ngx_str_t *keys, ngx_uint_t nkeys)
 {
-    ngx_uint_t                        i, m, nchunks, emitted;
+    ngx_uint_t                        i, m, emitted;
     size_t                            total;
     ngx_str_t                        *argv;
-    ngx_buf_t                       **bufs, *cmd;
     ngx_http_cache_turbo_redis_op_t  *op;
 
     if (!clcf->redis_enable || nkeys == 0) {
@@ -1394,10 +1425,7 @@ ngx_http_cache_turbo_redis_del_many(ngx_http_cache_turbo_loc_conf_t *clcf,
     /* "UNLINK" + up to CHUNK keys per command. */
     argv = ngx_palloc(op->pool,
                (1 + NGX_HTTP_CACHE_TURBO_REDIS_DEL_CHUNK) * sizeof(ngx_str_t));
-    nchunks = (nkeys + NGX_HTTP_CACHE_TURBO_REDIS_DEL_CHUNK - 1)
-              / NGX_HTTP_CACHE_TURBO_REDIS_DEL_CHUNK;
-    bufs = ngx_palloc(op->pool, nchunks * sizeof(ngx_buf_t *));
-    if (argv == NULL || bufs == NULL) {
+    if (argv == NULL) {
         ngx_destroy_pool(op->pool);
         return;
     }
@@ -1419,13 +1447,8 @@ ngx_http_cache_turbo_redis_del_many(ngx_http_cache_turbo_loc_conf_t *clcf,
         if (m == 0) {
             continue;                     /* chunk held only empty keys */
         }
-        cmd = ngx_http_cache_turbo_redis_encode(op->pool, argv, 1 + m);
-        if (cmd == NULL) {
-            ngx_destroy_pool(op->pool);
-            return;
-        }
-        bufs[emitted++] = cmd;
-        total += (size_t) (cmd->last - cmd->pos);
+        emitted++;
+        total += ngx_http_cache_turbo_redis_encode_len(argv, 1 + m);
     }
 
     if (emitted == 0) {                   /* nothing to delete */
@@ -1438,9 +1461,21 @@ ngx_http_cache_turbo_redis_del_many(ngx_http_cache_turbo_loc_conf_t *clcf,
         ngx_destroy_pool(op->pool);
         return;
     }
-    for (i = 0; i < emitted; i++) {
-        op->send->last = ngx_cpymem(op->send->last, bufs[i]->pos,
-                                    (size_t) (bufs[i]->last - bufs[i]->pos));
+
+    i = 0;
+    while (i < nkeys) {
+        m = 0;
+        while (m < NGX_HTTP_CACHE_TURBO_REDIS_DEL_CHUNK && i < nkeys) {
+            if (keys[i].len) {
+                argv[1 + m] = keys[i];
+                m++;
+            }
+            i++;
+        }
+        if (m != 0) {
+            op->send->last = ngx_http_cache_turbo_redis_encode_into(
+                                  op->send->last, argv, 1 + m);
+        }
     }
 
     op->expected_replies = emitted;       /* one integer reply per UNLINK */
@@ -1483,12 +1518,12 @@ ngx_http_cache_turbo_redis_tag_add_many(ngx_http_cache_turbo_loc_conf_t *clcf,
     u_char *key_hash, ngx_str_t *names, ngx_uint_t nnames, time_t ttl)
 {
     ngx_str_t                         argv[4];
-    ngx_buf_t                        *sadd, *exp_nx, *exp_gt;
+    ngx_str_t                         tagkeys[NGX_HTTP_CACHE_TURBO_MAX_TAGS];
+    ngx_str_t                         member_arg, ttl_arg;
     size_t                            total = 0;
     ngx_uint_t                        i, nqueued = 0;
     ngx_http_cache_turbo_redis_op_t  *op;
     u_char                           *member, *ttlbuf;
-    ngx_buf_t                        *cmds[NGX_HTTP_CACHE_TURBO_MAX_TAGS * 3];
 
     if (!clcf->redis_enable || ttl <= 0 || nnames == 0) {
         /* Nothing to index and nothing dropped -- an L2-less or empty call is
@@ -1520,6 +1555,9 @@ ngx_http_cache_turbo_redis_tag_add_many(ngx_http_cache_turbo_loc_conf_t *clcf,
     argv[2].data = member;
     argv[2].len = ngx_http_cache_turbo_redis_key(&clcf->redis_prefix, key_hash,
                                                  member);
+    member_arg = argv[2];
+    ttl_arg.data = ttlbuf;
+    ttl_arg.len = (size_t) (ngx_sprintf(ttlbuf, "%T", ttl) - ttlbuf);
 
     for (i = 0; i < nnames; i++) {
         u_char  *tagkey;
@@ -1539,14 +1577,16 @@ ngx_http_cache_turbo_redis_tag_add_many(ngx_http_cache_turbo_loc_conf_t *clcf,
         klen = ngx_http_cache_turbo_redis_tagkey(&clcf->redis_prefix,
                                                  names[i].data, names[i].len,
                                                  tagkey);
+        tagkeys[nqueued].data = tagkey;
+        tagkeys[nqueued].len = klen;
 
         /* SADD <prefix>tag:<name> <object L2 key> */
         argv[0].data = (u_char *) "SADD";
         argv[0].len = sizeof("SADD") - 1;
         argv[1].data = tagkey;
         argv[1].len = klen;
-        /* argv[2] (member) encoded once above */
-        sadd = ngx_http_cache_turbo_redis_encode(op->pool, argv, 3);
+        argv[2] = member_arg;
+        total += ngx_http_cache_turbo_redis_encode_len(argv, 3);
 
     /* Bound the tag set's lifetime so dead members can't accumulate forever,
      * but NEVER below the longest-lived member's TTL (COR-8). A tag set holds
@@ -1567,32 +1607,15 @@ ngx_http_cache_turbo_redis_tag_add_many(ngx_http_cache_turbo_loc_conf_t *clcf,
         argv[0].data = (u_char *) "EXPIRE";
         argv[0].len = sizeof("EXPIRE") - 1;
         /* argv[1] (tagkey) unchanged */
-        argv[2].data = ttlbuf;
-        argv[2].len = (size_t) (ngx_sprintf(ttlbuf, "%T", ttl) - ttlbuf);
+        argv[2] = ttl_arg;
         argv[3].data = (u_char *) "NX";
         argv[3].len = sizeof("NX") - 1;
-        exp_nx = ngx_http_cache_turbo_redis_encode(op->pool, argv, 4);
+        total += ngx_http_cache_turbo_redis_encode_len(argv, 4);
         argv[3].data = (u_char *) "GT";
         argv[3].len = sizeof("GT") - 1;
-        exp_gt = ngx_http_cache_turbo_redis_encode(op->pool, argv, 4);
+        total += ngx_http_cache_turbo_redis_encode_len(argv, 4);
 
-        if (sadd == NULL || exp_nx == NULL || exp_gt == NULL) {
-            ngx_destroy_pool(op->pool);
-            return NGX_ERROR;
-        }
-
-        /* argv[2] is reused as the TTL text by the EXPIREs above, so restore
-         * the member for the next tag's SADD. */
-        argv[2].data = member;
-        argv[2].len = ngx_http_cache_turbo_redis_key(&clcf->redis_prefix,
-                                                     key_hash, member);
-
-        cmds[nqueued++] = sadd;
-        cmds[nqueued++] = exp_nx;
-        cmds[nqueued++] = exp_gt;
-        total += (size_t) (sadd->last - sadd->pos)
-                 + (size_t) (exp_nx->last - exp_nx->pos)
-                 + (size_t) (exp_gt->last - exp_gt->pos);
+        nqueued++;
     }
 
     if (nqueued == 0) {                    /* every name was empty */
@@ -1607,12 +1630,29 @@ ngx_http_cache_turbo_redis_tag_add_many(ngx_http_cache_turbo_loc_conf_t *clcf,
         return NGX_ERROR;
     }
     for (i = 0; i < nqueued; i++) {
-        size_t  n = (size_t) (cmds[i]->last - cmds[i]->pos);
-        op->send->last = ngx_cpymem(op->send->last, cmds[i]->pos, n);
+        argv[0].data = (u_char *) "SADD";
+        argv[0].len = sizeof("SADD") - 1;
+        argv[1] = tagkeys[i];
+        argv[2] = member_arg;
+        op->send->last = ngx_http_cache_turbo_redis_encode_into(op->send->last,
+                                                                argv, 3);
+
+        argv[0].data = (u_char *) "EXPIRE";
+        argv[0].len = sizeof("EXPIRE") - 1;
+        argv[2] = ttl_arg;
+        argv[3].data = (u_char *) "NX";
+        argv[3].len = sizeof("NX") - 1;
+        op->send->last = ngx_http_cache_turbo_redis_encode_into(op->send->last,
+                                                                argv, 4);
+
+        argv[3].data = (u_char *) "GT";
+        argv[3].len = sizeof("GT") - 1;
+        op->send->last = ngx_http_cache_turbo_redis_encode_into(op->send->last,
+                                                                argv, 4);
     }
 
     /* 3 replies per tag: SADD + EXPIRE NX + EXPIRE GT */
-    op->expected_replies = (ngx_uint_t) nqueued;
+    op->expected_replies = (ngx_uint_t) (nqueued * 3);
 
     if (ngx_http_cache_turbo_redis_launch(op, clcf,
             ngx_http_cache_turbo_redis_read_drain) != NGX_OK)

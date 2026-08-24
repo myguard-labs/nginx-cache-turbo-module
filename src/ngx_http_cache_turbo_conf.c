@@ -720,6 +720,27 @@ ngx_http_cache_turbo_merge_basic(ngx_http_cache_turbo_loc_conf_t *conf,
     if (conf->backend_presets == 0) {
         conf->backend_presets = prev->backend_presets;
     }
+
+    conf->backend_key_cookies =
+        ngx_http_cache_turbo_backend_key_cookie_count(conf->backend_presets);
+}
+
+
+static ngx_int_t
+ngx_http_cache_turbo_valid_cmp(const void *one, const void *two)
+{
+    const ngx_http_cache_turbo_valid_t  *a = one;
+    const ngx_http_cache_turbo_valid_t  *b = two;
+
+    if (a->status < b->status) {
+        return -1;
+    }
+
+    if (a->status > b->status) {
+        return 1;
+    }
+
+    return 0;
 }
 
 /* Group 2: presets + band-resolved knobs (valid/beta/lock_ttl/stale_mult/
@@ -935,6 +956,12 @@ ngx_http_cache_turbo_merge_cc_and_bypass(
     /* Per-status TTLs (v6): inherit the rule list if this level set none. */
     if (conf->valid_status == NULL) {
         conf->valid_status = prev->valid_status;
+    }
+
+    if (conf->valid_status != NULL && conf->valid_status->nelts > 1) {
+        ngx_sort(conf->valid_status->elts, (size_t) conf->valid_status->nelts,
+                 sizeof(ngx_http_cache_turbo_valid_t),
+                 ngx_http_cache_turbo_valid_cmp);
     }
 
     /* Bypass / no-store predicates (v9). */
@@ -2174,7 +2201,7 @@ ngx_http_cache_turbo_valid_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                     ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
                         "cache_turbo_valid: duplicate rule for status %V "
                         "ignored (the first rule for a code wins)", &value[i]);
-                    break;
+                    goto next_status;
                 }
             }
         }
@@ -2185,6 +2212,9 @@ ngx_http_cache_turbo_valid_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         }
         v->status = (ngx_uint_t) code;
         v->valid = valid;
+
+    next_status:
+        continue;
     }
 
     return NGX_CONF_OK;

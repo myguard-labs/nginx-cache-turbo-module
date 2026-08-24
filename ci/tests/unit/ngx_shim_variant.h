@@ -137,13 +137,13 @@ ngx_http_cache_turbo_digest_final(ngx_http_cache_turbo_digest_t *d,
  * accidentally sets a vary bit fails loudly instead of silently asserting on
  * shimmed behaviour (rejected-test item 2). */
 
-static const char *
+static ngx_str_t
 ngx_http_cache_turbo_ae_class(ngx_http_request_t *r)
 {
     (void) r; fprintf(stderr, "ae_class reached with bits == 0\n"); abort();
 }
 
-static const char *
+static ngx_str_t
 ngx_http_cache_turbo_device_class(ngx_http_request_t *r)
 {
     (void) r; fprintf(stderr, "device_class reached with bits == 0\n"); abort();

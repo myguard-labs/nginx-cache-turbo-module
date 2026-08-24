@@ -241,6 +241,8 @@ ngx_http_cache_turbo_digest(const void *data, size_t len, u_char out[32])
 typedef struct {
     ngx_str_t   name;
     ngx_str_t   val;
+    uint32_t    vlen;
+    uint32_t    vfield;
 } ngx_http_cache_turbo_key_cookie_slot_t;
 
 typedef struct {

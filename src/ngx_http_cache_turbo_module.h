@@ -1597,6 +1597,7 @@ typedef struct {
      * those. Sits UNDER manual bypass/no_store overrides. See the preset
      * registry and ngx_http_cache_turbo_auto_skip() in the .c. */
     ngx_uint_t               backend_presets;
+    ngx_uint_t               backend_key_cookies;
 
     /* Live autotune (v4-3). When on, the request path uses the zone's live
      * autotuned beta (clamped to this location's preset band) in place of the

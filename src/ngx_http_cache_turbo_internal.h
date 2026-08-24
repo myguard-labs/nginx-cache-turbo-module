@@ -1048,6 +1048,7 @@ ngx_int_t ngx_http_cache_turbo_auto_skip(ngx_http_request_t *r,
 ngx_int_t ngx_http_cache_turbo_key_cookie(ngx_http_request_t *r,
     ngx_uint_t backend_presets, ngx_uint_t *cursor, ngx_str_t *name_out,
     ngx_str_t *val_out);
+ngx_uint_t ngx_http_cache_turbo_backend_key_cookie_count(ngx_uint_t backend_presets);
 ngx_int_t ngx_http_cache_turbo_cookie_lookup(ngx_http_request_t *r,
     ngx_str_t *name, ngx_str_t *val_out);
 ngx_int_t ngx_http_cache_turbo_bypass_uri_match(ngx_http_request_t *r,

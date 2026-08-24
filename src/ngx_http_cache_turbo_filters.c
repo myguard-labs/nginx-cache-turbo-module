@@ -1233,17 +1233,20 @@ ngx_http_cache_turbo_body_filter_capture(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx,
     ngx_chain_t *in, ngx_uint_t *last)
 {
-    u_char        *p;
-    size_t         n;
+    u_char        *block, *payload, *p, *meta;
+    size_t         n, total, nbufs, meta_len;
     ngx_buf_t     *b;
+    ngx_buf_t     *bufs;
     ngx_chain_t   *cl, **ll;
+    ngx_chain_t   *links;
+    ngx_uint_t     i;
 
     ll = ctx->body_last ? &ctx->body_last->next : &ctx->body;
 
-    for (cl = in; cl; cl = cl->next) {
-        ngx_buf_t    *nb;
-        ngx_chain_t  *ncl;
+    total = 0;
+    nbufs = 0;
 
+    for (cl = in; cl; cl = cl->next) {
         b = cl->buf;
 
         /* Only in-memory bytes are capturable. A file-backed buffer (sendfile
@@ -1265,16 +1268,11 @@ ngx_http_cache_turbo_body_filter_capture(ngx_http_request_t *r,
         n = ngx_buf_in_memory(b) ? (size_t) (b->last - b->pos) : 0;
 
         if (n > 0) {
-            /* Q2: oversize early-abort, BEFORE the alloc+memcpy. Once the body
-             * would cross max_size we will never store this response (the store
-             * gate below refuses it), so a single huge buffer must not be fully
-             * copied into the request pool just to be discarded at last_buf.
-             * Drop the partial capture, mark the request non-capturing, and
-             * forward downstream untouched. A stacked native proxy_cache (README
-             * pattern B) keeps the object on disk; cache-turbo delegates oversize
-             * media with ~zero shm/pool overhead. Any cold-miss stub is cleared
-             * by the pool-cleanup backstop at request end. */
-            if (clcf->max_size > 0 && ctx->body_len + n > clcf->max_size) {
+            if (clcf->max_size > 0
+                && (total > (size_t) clcf->max_size
+                    || n > (size_t) clcf->max_size - total
+                    || ctx->body_len > (size_t) clcf->max_size - total - n))
+            {
                 ctx->captured = 0;
                 ctx->body = NULL;
                 ctx->body_last = NULL;
@@ -1285,38 +1283,73 @@ ngx_http_cache_turbo_body_filter_capture(ngx_http_request_t *r,
                 return NGX_DECLINED;
             }
 
-            p = ngx_pnalloc(r->pool, n);
-            if (p == NULL) {
-                return NGX_ERROR;
-            }
-            ngx_memcpy(p, b->pos, n);
-
-            nb = ngx_calloc_buf(r->pool);
-            if (nb == NULL) {
-                return NGX_ERROR;
-            }
-            nb->pos = p;
-            nb->last = p + n;
-            nb->memory = 1;
-
-            ncl = ngx_alloc_chain_link(r->pool);
-            if (ncl == NULL) {
-                return NGX_ERROR;
-            }
-            ncl->buf = nb;
-            ncl->next = NULL;
-
-            *ll = ncl;
-            ll = &ncl->next;
-            ctx->body_last = ncl;
-
-            ctx->body_len += n;
+            total += n;
+            nbufs++;
         }
 
         if (b->last_buf || b->last_in_chain) {
             *last = 1;
         }
     }
+
+    if (nbufs == 0) {
+        return NGX_OK;
+    }
+
+    if (nbufs > NGX_MAX_SIZE_T_VALUE / sizeof(ngx_buf_t)
+        || nbufs > NGX_MAX_SIZE_T_VALUE / sizeof(ngx_chain_t))
+    {
+        return NGX_ERROR;
+    }
+
+    meta_len = nbufs * (sizeof(ngx_buf_t) + sizeof(ngx_chain_t));
+    if (meta_len < nbufs * sizeof(ngx_buf_t)
+        || total > NGX_MAX_SIZE_T_VALUE - NGX_ALIGNMENT
+        || total + NGX_ALIGNMENT > NGX_MAX_SIZE_T_VALUE - meta_len)
+    {
+        return NGX_ERROR;
+    }
+
+    block = ngx_pnalloc(r->pool, total + NGX_ALIGNMENT + meta_len);
+    if (block == NULL) {
+        return NGX_ERROR;
+    }
+
+    payload = block;
+    meta = ngx_align_ptr(block + total, NGX_ALIGNMENT);
+    bufs = (ngx_buf_t *) meta;
+    links = (ngx_chain_t *) (meta + nbufs * sizeof(ngx_buf_t));
+    ngx_memzero(bufs, nbufs * sizeof(ngx_buf_t));
+
+    p = payload;
+    i = 0;
+
+    for (cl = in; cl; cl = cl->next) {
+        b = cl->buf;
+        n = ngx_buf_in_memory(b) ? (size_t) (b->last - b->pos) : 0;
+
+        if (n == 0) {
+            continue;
+        }
+
+        ngx_memcpy(p, b->pos, n);
+
+        bufs[i].pos = p;
+        bufs[i].last = p + n;
+        bufs[i].memory = 1;
+
+        links[i].buf = &bufs[i];
+        links[i].next = NULL;
+
+        *ll = &links[i];
+        ll = &links[i].next;
+        ctx->body_last = &links[i];
+
+        p += n;
+        i++;
+    }
+
+    ctx->body_len += total;
 
     return NGX_OK;
 }

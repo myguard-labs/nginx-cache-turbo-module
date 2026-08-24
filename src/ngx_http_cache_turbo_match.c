@@ -1395,6 +1395,27 @@ ngx_http_cache_turbo_key_cookie(ngx_http_request_t *r,
     *cursor = idx;                       /* sequence exhausted */
     return 0;
 }
+
+
+ngx_uint_t
+ngx_http_cache_turbo_backend_key_cookie_count(ngx_uint_t backend_presets)
+{
+    const ngx_http_cache_turbo_preset_t  *ps;
+    const char *const                    *pp;
+    ngx_uint_t                            n = 0;
+
+    for (ps = ngx_http_cache_turbo_presets; ps->bit; ps++) {
+        if (!(backend_presets & ps->bit) || ps->key_cookies == NULL) {
+            continue;
+        }
+
+        for (pp = ps->key_cookies; *pp; pp++) {
+            n++;
+        }
+    }
+
+    return n;
+}
 /* >>> FUZZ-EXTRACT auto-classify END (match.c portion) <<< */
 
 
