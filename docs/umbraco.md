@@ -1,6 +1,6 @@
 # Umbraco + cache-turbo
 
-_Last researched: 2026-07-26 (Umbraco CMS `main`, current v17+ token-cookie code)._
+_Last researched: 2026-08-17 (Umbraco CMS `main`, v17+ token-cookie code)._
 
 Umbraco serves shared published content, but it also has back-office, preview,
 member and optional ASP.NET session identities. The stock defaults are
@@ -20,6 +20,19 @@ cache_turbo_backend umbraco;
 | URI prefixes | `/umbraco` |
 | Cookie substrings | `UMB_UCONTEXT`, `UMB_EXTLOGIN`, `UMB_PREVIEW`, `UMB-WEBSITE-PREVIEW-ACCEPT`, `UMB-XSRF-V`, `UMB_SESSION`, `umbAccessToken`, `umbRefreshToken`, `umbPkceCode`, `.AspNetCore.Identity.Application` |
 | Query args | — |
+
+Umbraco 17 stores back-office access, refresh and PKCE material in secure
+HTTP-only cookies whose deployed names can carry a `__Host-` prefix. The preset
+uses the stable `umbAccessToken`, `umbRefreshToken` and `umbPkceCode` substrings,
+so both the prefixed and unprefixed forms match. Do not replace these with exact
+cookie-name checks unless the configured prefix is folded into the rule.
+
+The `.AspNetCore.Identity.Application=` row protects the stock member-login
+scheme. ASP.NET Core authentication scheme names are configurable: a custom
+member scheme can emit a different cookie and therefore needs matching
+`cache_turbo_bypass` and `cache_turbo_no_store` rules. `/umbraco` covers the
+back office and management API; the public Delivery API is intentionally left
+cacheable and still relies on origin `Cache-Control` for personalized output.
 
 <!-- markdownlint-enable MD013 -->
 
@@ -78,7 +91,7 @@ http {
 
 ## Origin failure: stale-if-error
 
-By default this module serves a stale cached copy when the origin returns 5xx; nginx turns a refused connection into a 502 and a hung one into a 504, so a dead origin is covered. Once the cached copy's TTL has expired, `cache_turbo_keep_stale` supplies the grace window — it defaults to `24h`, and `cache_turbo_keep_stale off` removes it so errors surface normally. Most CMS/app stacks emit no `stale-if-error` of their own. `cache_turbo_use_stale` selects which statuses count as "down" (default: every 5xx); naming tokens replaces the default rather than extending it. Nothing was ever cached for a URL ⇒ nothing to serve; `error_page 502 503 504 /maintenance.html` is the nicer failure.
+By default this module can serve a stale cached copy when the origin returns 5xx; nginx turns a refused connection into a 502 and a hung one into a 504, so a dead origin is covered. If the response supplies no `stale-if-error`, `cache_turbo_keep_stale` provides the fallback window — it defaults to `24h`, and `cache_turbo_keep_stale off` removes that fallback. An honored response `stale-if-error` takes precedence, while an honored `must-revalidate` forbids stale serving. `cache_turbo_use_stale` selects which statuses count as "down" (default: every 5xx); listing any tokens replaces the default rather than extending it. Nothing was ever cached for a URL ⇒ nothing to serve; `error_page 502 503 504 /maintenance.html` is the final fallback.
 
 ```nginx
 cache_turbo_keep_stale   2h;
