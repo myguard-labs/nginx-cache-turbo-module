@@ -425,12 +425,27 @@ ngx_http_cache_turbo_access_prologue(ngx_http_request_t *r,
      * and stored this base URL's marker in L2 independently of what THIS
      * node's L1 currently holds. Gating this call the same way would leave
      * vary_marker_key zeroed, silently defeating that cross-node fallback for
-     * as long as `markers` reads 0 on this node. This call is cheap (a single
-     * digest over already-computed key bytes, no lock, no shm read), so
-     * nothing is bought by gating it. */
-    if (clcf->auto_vary) {
-        ngx_http_cache_turbo_vary_prepare(ctx);
-    }
+     * as long as `markers` reads 0 on this node.
+     *
+     * PERF-AUD2-01: the call is no longer made HERE. Gating it on `markers`
+     * would break exactly the cross-node L2 fallback described above, so it
+     * is DEFERRED instead: every reader of ctx->vary_marker_key now calls
+     * ngx_http_cache_turbo_vary_prepare_lazy() first (vary_apply()'s arm in
+     * access_l1(), and access_l2_marker_get()/access_l2_marker_consume() on
+     * the L2 marker path), which computes the digest at most once per
+     * prologue pass. The reachability set is unchanged -- the L2 consult
+     * still runs on a `markers == 0` node and still sees the same bytes --
+     * but a fresh L1 hit (access_l1_serve_fresh() returns NGX_DONE before
+     * any of those readers) no longer pays a full SHA-256 whose result it
+     * then discards. auto_vary is the shipped default, so that is every
+     * fresh hit on a default configuration.
+     *
+     * The flag is cleared here, not at ctx allocation: build_key() runs at
+     * the top of every prologue pass and may produce a DIFFERENT cache_key
+     * on a park/resume re-entry (variable-based keys), and the old code
+     * recomputed the marker key unconditionally on every such pass. Clearing
+     * per pass reproduces that exactly. */
+    ctx->vary_marker_key_ready = 0;
 
     /* Bypass (v9): when a cache_turbo_bypass predicate trips, skip the cache
      * lookup entirely and go to the origin — but still let the filters store the
@@ -1375,6 +1390,27 @@ ngx_http_cache_turbo_access_l1(ngx_http_request_t *r,
     ngx_http_cache_turbo_node_t  *ctn;
     time_t                        now;
 
+    /* PERF-AUD2-01: materialise the deferred marker key BEFORE taking the
+     * zone mutex, on exactly the requests whose lock-held path will read it
+     * (the `markers != 0` arm below calls vary_apply(), whose first act is an
+     * rbtree lookup on ctx->vary_marker_key). Doing it here rather than
+     * inside the critical section keeps the digest lock-free, exactly as the
+     * prologue call it replaces was -- the module's documented throughput cap
+     * is this mutex, and this row is a performance row; widening the critical
+     * section by a SHA-256 to save one on the fresh-hit path would trade one
+     * cost for a worse one.
+     *
+     * The `markers` read is racy by construction and that is fine: it is a
+     * scheduling HINT for when to spend the digest, never a gate on whether
+     * the bytes are available to a reader. Both arms below, and the L2 marker
+     * path in access_l2(), call vary_prepare_lazy() themselves, so a marker
+     * appearing between this read and the lock still finds the key populated
+     * (the lazy call inside the arm computes it) and a marker vanishing just
+     * costs one unused digest. No reader can observe a zeroed key. */
+    if (clcf->auto_vary && ngx_http_cache_turbo_zone_sh(z)->markers != 0) {
+        ngx_http_cache_turbo_vary_prepare_lazy(ctx);
+    }
+
     ngx_shmtx_lock(ngx_http_cache_turbo_zone_mutex(z));
 
     /* S231-PERF-VARYLOCK: the marker lookup + key_hash recompute is folded
@@ -1405,6 +1441,16 @@ ngx_http_cache_turbo_access_l1(ngx_http_request_t *r,
             ctx->vary_marker_l1_miss = 1;
 
         } else {
+            /* PERF-AUD2-01 correctness backstop, NOT the normal cost site.
+             * vary_apply() is the first reader of ctx->vary_marker_key here,
+             * and `markers` may have gone 0 -> nonzero between the pre-lock
+             * hint above and this lock-held re-read, so the key is not
+             * guaranteed ready by that hint alone. In the overwhelmingly
+             * common case the hint already fired and this is a single
+             * predictable bit test; only the narrow race pays the digest
+             * inside the critical section, which is strictly better than the
+             * old code's unconditional digest on every request. */
+            ngx_http_cache_turbo_vary_prepare_lazy(ctx);
             ngx_http_cache_turbo_vary_apply(r, clcf, z, ctx, &hash);
         }
     }
@@ -1684,6 +1730,15 @@ ngx_http_cache_turbo_access_l2_marker_get(ngx_http_request_t *r,
         return NGX_DECLINED;
     }
 
+    /* PERF-AUD2-01: this consult is the cross-node L2 marker fallback the C3
+     * comment in access_prologue() protects -- it must work on a node whose
+     * L1 holds ZERO markers, i.e. exactly where the pre-lock hint in
+     * access_l1() deliberately does NOT fire. Materialising the deferred key
+     * here is what preserves that fallback under the deferral. Runs outside
+     * any zone lock (access_l2()'s contract), same as the prologue call it
+     * replaces. */
+    ngx_http_cache_turbo_vary_prepare_lazy(ctx);
+
     marker_hash = ngx_crc32_short(ctx->vary_marker_key, 32);
 
     /* L13, extended to the marker key (admin.py CI regression): the marker
@@ -1792,6 +1847,19 @@ ngx_http_cache_turbo_access_l2_marker_consume(ngx_http_request_t *r,
     if (!ctx->vary_marker_l2_tried || !ctx->l2_done) {
         return;
     }
+
+    /* PERF-AUD2-01: MANDATORY, not an optimisation. This function reads
+     * ctx->vary_marker_key twice below (the peer-PURGE purge_key() and the
+     * l2_neg_set() arm), and it runs on the RESUME of a parked marker GET --
+     * a fresh access_prologue() pass, which cleared vary_marker_key_ready.
+     * Without this call those two reads would use bytes carrying no
+     * ready-flag guarantee for the current cache_key. marker_hash() is a pure
+     * function of ctx->cache_key, so on the ordinary resume (same key) this
+     * recomputes the identical 32 bytes the pre-park pass used; the flag is
+     * what makes that explicit rather than incidental. Past the early return
+     * above, so the warm path (l2_tried == 0 on every request that never
+     * launched a marker GET) still pays nothing. */
+    ngx_http_cache_turbo_vary_prepare_lazy(ctx);
 
     ctx->vary_marker_l2_tried = 0;
 
