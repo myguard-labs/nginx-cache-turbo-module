@@ -1,4 +1,4 @@
-# sync-sha: 9b4babe6a7724d36d62ae3918248e4a6769fe182995fdd121ace20ca5328224d
+# sync-sha: e3534c5044b9ee64b63f6290c5237cebc9ac029b0a52a29aa2adc0e19e723b45
 name: CI Deep
 
 # Exhaustive dynamic analysis — monthly cron + on-demand only, NEVER on PR.
@@ -377,14 +377,34 @@ jobs:
           build=".build/nginx-${NGINX_VERSION}"
           incs=$(awk '/^ALL_INCS[[:space:]]*=/{found=1} found{line=$0; sub(/^ALL_INCS[[:space:]]*=[[:space:]]*/,"",line); continued=(line ~ /\\$/); gsub(/\\$/, "", line); printf "%s ", line; if (!continued) exit}' "$build/objs/Makefile")
           rc=0
-          for src in ngx_http_cache_turbo_module ngx_http_cache_turbo_shm ngx_http_cache_turbo_swr ngx_http_cache_turbo_autotune ngx_http_cache_turbo_redis ngx_http_cache_turbo_memcached; do
+          # Derive the list from the tree. It was hardcoded to six names while
+          # src/ grew to fifteen, so access.c, filters.c, blob.c, conf.c,
+          # purge.c, presets.c, match.c, vary.c and admin.c -- the hit path,
+          # the store path, the blob (de)serialiser and the whole config
+          # surface -- were never analysed and the lane still reported green.
+          srcs=$(find "$GITHUB_WORKSPACE/src" -maxdepth 1 -name '*.c' -printf '%f\n' | sed 's/\.c$//' | sort)
+          if [ -z "$srcs" ]; then
+            echo "::error::no sources found under src/ -- refusing to report a vacuous pass"
+            exit 1
+          fi
+          echo "analysing $(printf '%s\n' "$srcs" | wc -l) translation unit(s)"
+          for src in $srcs; do
             # incs is a flag list and must word-split.
             # shellcheck disable=SC2086
             ( cd "$build" && clang --analyze -Xanalyzer -analyzer-output=text \
                 -DNGX_DEBUG_PALLOC=1 $incs \
-                "$GITHUB_WORKSPACE/src/${src}.c" 2>"/tmp/analyze-${src}.log" ) || rc=1
-            if [ -s "/tmp/analyze-${src}.log" ]; then
-              echo "::error file=src/${src}.c::clang analyzer reported issues"
+                "$GITHUB_WORKSPACE/src/${src}.c" 2>"/tmp/analyze-${src}.log" ) || {
+              echo "::error file=src/${src}.c::clang failed to analyse this translation unit"
+              cat "/tmp/analyze-${src}.log"
+              rc=1
+              continue
+            }
+            # Gate on parsed diagnostics, not on file size: clang writes notes
+            # and incidental chatter to the same stream, so `[ -s ]` fails the
+            # job on output that carries no finding at all.
+            warns=$(grep -c 'warning:' "/tmp/analyze-${src}.log" 2>/dev/null) || warns=0
+            if [ "$warns" -gt 0 ]; then
+              echo "::error file=src/${src}.c::clang analyzer reported ${warns} warning(s)"
               cat "/tmp/analyze-${src}.log"
               rc=1
             fi
