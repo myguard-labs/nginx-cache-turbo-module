@@ -147,6 +147,11 @@ typedef struct {
 typedef struct {
     ngx_int_t    normalize_vary;
     void        *normalize_strip;
+    /* R3-1 cap (cache_turbo_normalize_max_args). The sliced body reads this
+     * to decide whether to skip normalization and key the raw arg string, so
+     * it must exist here or the extraction stops compiling. The harness
+     * drives BOTH sides of it -- see fuzz_norm_args.c. */
+    ngx_int_t    normalize_max_args;
 } ngx_http_cache_turbo_loc_conf_t;
 
 /* The handler fetches its loc-conf via this macro; route it to the global

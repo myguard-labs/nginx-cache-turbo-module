@@ -29,6 +29,16 @@
 #include "ngx_http_cache_turbo_module.h"
 #include "ngx_http_cache_turbo_internal.h"
 
+/* R5-1 (perf-microtier-hitpath): default-hide every symbol this TU defines
+ * so a module-internal call becomes a direct call instead of a PLT-indirect
+ * one (see ngx_http_cache_turbo_module.h for why this is a per-file pragma
+ * rather than a global -fvisibility=hidden CFLAGS addition, and why a
+ * header-only pragma does not work). Anything in this file that nginx's
+ * dynamic-module loader must resolve by name gets an explicit
+ * __attribute__((visibility("default"))) at its definition, overriding this
+ * pragma (GCC: an explicit attribute always wins over the pragma). */
+#pragma GCC visibility push(hidden)
+
 
 /* ----- key normalize (v3-1) ------------------------------------------------ */
 
@@ -65,13 +75,120 @@ ngx_http_cache_turbo_pat_match(ngx_str_t *pat, u_char *name, size_t nlen)
 }
 
 
-/* Is this arg name on the denylist (built-in defaults + configured extras)? */
+/* Set bit for byte `b` in a 256-bit (32-byte) bitmap. */
+static ngx_inline void
+ngx_http_cache_turbo_bitmap_set(u_char *bm, u_char b)
+{
+    bm[b >> 3] |= (u_char) (1 << (b & 7));
+}
+
+
+static ngx_inline ngx_int_t
+ngx_http_cache_turbo_bitmap_get(const u_char *bm, u_char b)
+{
+    return (bm[b >> 3] & (1 << (b & 7))) != 0;
+}
+
+
+/* R3-3: precompute, at config-merge time, a 256-bit first-byte bitmap over
+ * the combined denylist (built-in ngx_http_cache_turbo_default_strip[] plus
+ * clcf->normalize_strip), so the per-request fast path in _name_denied can
+ * reject a name whose first byte is on neither table with one bit test
+ * instead of walking up to 10+N patterns and calling ngx_strncasecmp on each.
+ *
+ * Both cases of every pattern's first byte are set -- matching is
+ * case-insensitive (see the comment on _pat_match) and names reach here
+ * unlowercased. _pat_match treats a pattern as a match-everything wildcard
+ * whenever its EFFECTIVE prefix length is 0: that is a genuinely
+ * zero-length pattern (pat->len == 0), or the bare '*' produced by
+ * `cache_turbo_normalize_strip *` (pat->len == 1, pat->data[0] == '*',
+ * which _pat_match strips its trailing '*' from down to a zero-length
+ * prefix). Either form matches nlen == 0 too, via `nlen >= plen`. Such a
+ * pattern has no first byte of its own to gate on, so it sets
+ * strip_bitmap_all instead of touching the bitmap; _name_denied must then
+ * skip the bitmap short-circuit entirely and fall through to the full walk
+ * (which _pat_match still resolves correctly), or every single-byte bitmap
+ * check downstream would look wrong for a table that is not really
+ * byte-selective any more. */
+static ngx_inline ngx_int_t
+ngx_http_cache_turbo_pat_is_wildcard_all(ngx_str_t *pat)
+{
+    return pat->len == 0
+           || (pat->len == 1 && pat->data[0] == '*');
+}
+
+
+void
+ngx_http_cache_turbo_build_strip_bitmap(ngx_http_cache_turbo_loc_conf_t *clcf)
+{
+    ngx_str_t   *pat;
+    ngx_uint_t   i, n;
+    u_char       b;
+
+    ngx_memzero(clcf->strip_bitmap, sizeof(clcf->strip_bitmap));
+    clcf->strip_bitmap_all = 0;
+
+    n = sizeof(ngx_http_cache_turbo_default_strip) / sizeof(ngx_str_t);
+    for (i = 0; i < n; i++) {
+        pat = &ngx_http_cache_turbo_default_strip[i];
+
+        if (ngx_http_cache_turbo_pat_is_wildcard_all(pat)) {
+            clcf->strip_bitmap_all = 1;
+            continue;
+        }
+
+        b = pat->data[0];
+        ngx_http_cache_turbo_bitmap_set(clcf->strip_bitmap, ngx_tolower(b));
+        ngx_http_cache_turbo_bitmap_set(clcf->strip_bitmap, ngx_toupper(b));
+    }
+
+    if (clcf->normalize_strip != NULL
+        && clcf->normalize_strip != NGX_CONF_UNSET_PTR)
+    {
+        pat = clcf->normalize_strip->elts;
+        for (i = 0; i < clcf->normalize_strip->nelts; i++) {
+            if (ngx_http_cache_turbo_pat_is_wildcard_all(&pat[i])) {
+                clcf->strip_bitmap_all = 1;
+                continue;
+            }
+
+            b = pat[i].data[0];
+            ngx_http_cache_turbo_bitmap_set(clcf->strip_bitmap,
+                                             ngx_tolower(b));
+            ngx_http_cache_turbo_bitmap_set(clcf->strip_bitmap,
+                                             ngx_toupper(b));
+        }
+    }
+}
+
+
+/* Is this arg name on the denylist (built-in defaults + configured extras)?
+ *
+ * R3-3 fast path: clcf->strip_bitmap is a 256-bit first-byte bitmap over the
+ * combined table, precomputed once at config-merge time by
+ * ngx_http_cache_turbo_build_strip_bitmap(). nlen == 0 has no first byte to
+ * gate on and falls straight through to the walk (it will only ever match a
+ * zero-length wildcard pattern, which the walk still handles). Unless a
+ * zero-length ("*") pattern is present -- strip_bitmap_all -- a name whose
+ * first byte is not set in either case can match no pattern in the table
+ * (every non-wildcard exact/prefix pattern requires nlen >= 1 and compares
+ * byte 0 case-insensitively), so it is safe to reject before touching the
+ * table at all. This does not change behaviour for any input: it only skips
+ * calling _pat_match on entries that were always going to fail their own
+ * first-byte comparison. */
 ngx_int_t
 ngx_http_cache_turbo_name_denied(ngx_http_cache_turbo_loc_conf_t *clcf,
     u_char *name, size_t nlen)
 {
     ngx_str_t   *pat;
     ngx_uint_t   i;
+
+    if (!clcf->strip_bitmap_all
+        && nlen > 0
+        && !ngx_http_cache_turbo_bitmap_get(clcf->strip_bitmap, name[0]))
+    {
+        return 0;
+    }
 
     for (i = 0;
          i < sizeof(ngx_http_cache_turbo_default_strip) / sizeof(ngx_str_t);
@@ -244,6 +361,18 @@ ngx_http_cache_turbo_ae_class(ngx_http_request_t *r)
         if (clen > 0 && ngx_http_cache_turbo_ae_q_ok(semi, end)) {
             ngx_http_cache_turbo_ae_class_match_coding(tok, clen, &zstd, &br,
                 &gzip);
+
+            /* zstd is the top of the dispatch order below, so once it is set
+             * no remaining token can change the answer -- stop parsing. Only
+             * zstd allows this: seeing `br` first does NOT settle it, because
+             * a later `zstd` would still outrank it. Accept-Encoding is
+             * client-supplied and unbounded in token count, so this bounds the
+             * common browser case (`gzip, deflate, br, zstd` -- zstd last, no
+             * saving) as well as a deliberately long list that ends in, or
+             * merely contains, zstd. */
+            if (zstd) {
+                break;
+            }
         }
 
         p = (end < last) ? end + 1 : end;
@@ -1257,3 +1386,5 @@ ngx_http_cache_turbo_classify_vary(ngx_http_request_t *r,
     *bits_out = bits;
     *nocache_out = nocache;
 }
+
+#pragma GCC visibility pop

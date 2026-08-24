@@ -1213,6 +1213,38 @@ cache_turbo_normalize_strip sid sessionid "tmp_*";
 cache_turbo_normalize_vary  encoding device;   # keep gzip≠brotli, mobile≠desktop
 ```
 
+### Sort bound (`cache_turbo_normalize_max_args`)
+
+Normalizing means sorting the surviving params, and that sort is nginx's
+`ngx_sort()` — an insertion sort, O(n²). It runs on the *default* cache key,
+*before* the cache lookup, so a hit cannot absorb it, and the param count is
+bounded only by the size of the request line (~8k by default). At -O2 the
+worst case costs:
+
+| kept params | worker CPU per request |
+| --- | --- |
+| 32 | 0.003 ms |
+| **64 (default cap)** | **0.011 ms** |
+| 128 | 0.041 ms |
+| 1000 | 2.06 ms |
+| 4000 | 23 ms |
+
+An unauthenticated client could therefore spend tens of milliseconds of a
+worker's single-threaded CPU per request. `cache_turbo_normalize_max_args`
+caps it at **64** kept (post-strip) params by default. Above the cap the
+module **skips normalization entirely** and keys on the raw query string:
+the request is still served correctly and two identical requests still land
+in the same slot — the query is simply not sorted or stripped, so junk-laden
+and reordered variants of an over-cap URL get their own slots.
+
+Raise it if you genuinely serve URLs with hundreds of meaningful params, or
+set `0` for unlimited (the pre-cap behaviour, and no bound on the sort):
+
+```nginx
+cache_turbo_normalize_max_args 256;   # sort up to 256 params
+cache_turbo_normalize_max_args 0;     # unlimited -- removes the DoS bound
+```
+
 ## Presets (pick a vibe, skip the knobs)
 
 Don't want to tune five numbers? Pick a preset:
@@ -2034,6 +2066,7 @@ http {
 | `cache_turbo_admin NAME` | `location` | — | Make this location a control endpoint for zone `NAME` (stats/purge/warm). Gate with `allow`/`deny`. |
 | `cache_turbo_warm_max N` | `server`, `location` | `32` | Ceiling on how many URLs one `POST /_cache?url=...` or `?url_file=...` request may fire warm subrequests for — bounds the operator-supplied origin fan-out a single admin call can trigger. `N` must be a positive integer up to `4096`; `0`, negatives and non-numeric values are rejected at config time rather than silently coerced. |
 | `cache_turbo_normalize_strip NAME...` | `server`, `location` | — | Extra query args to drop from `$cache_turbo_normalized_args` (trailing `*` = prefix; a bare `*` matches every name = drop all), on top of the built-ins. |
+| `cache_turbo_normalize_max_args N` | `server`, `location` | `64` | Cap on how many kept (post-strip) query params `$cache_turbo_normalized_args` will sort. Above the cap normalization is **skipped** and the raw query string is keyed instead — the request is still served and still keys consistently, it just is not order-/junk-normalized. Bounds the O(n²) sort an unauthenticated request can trigger *before* the cache lookup. `0` = unlimited (no cap). |
 | `cache_turbo_normalize_vary TOKEN...` | `server`, `location` | off | Append a variant bucket to `$cache_turbo_normalized_args`: `encoding` (br/gzip/identity) and/or `device` (mobile/desktop). |
 | `cache_turbo_auto_vary on\|off` | `server`, `location` | `on` | Read the response's own `Vary` header and split the cache by the named request header automatically. Safe whitelist: `Accept-Encoding`, `User-Agent` (device class), `Accept-Language` (primary-subtag class), `Origin` (raw — CORS boundary, never folded). `Vary: *`/`Cookie`/`Authorization` — **or any other header not on the whitelist** — ⇒ uncacheable (so an un-split Vary axis can never serve the wrong representation). Two-level, node-local keying. See [Auto-Vary](#auto-vary-read-the-response-vary). |
 | `cache_turbo_vary_ignore HEADER...` | `server`, `location` | off (empty) | Drop the named header(s) from a response's `Vary` line **before** `cache_turbo_auto_vary`'s whitelist/unknown-axis check — the ignored token is treated as if the origin never listed it: it does not contribute to the variant key and is **not** promoted into the safe whitelist. Case-insensitive. Only takes effect when `cache_turbo_auto_vary` is also on. **Cache-correctness override, not a free win** — only ignore an axis you have verified does not select a different body for your traffic; see the warning in [Auto-Vary](#cache_turbo_vary_ignore--opt-out-of-one-axiss-refusal). `*`, `Cookie` and `Authorization` are rejected at config time — their veto cannot be disabled this way. |

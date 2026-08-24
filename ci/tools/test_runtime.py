@@ -181,6 +181,8 @@ def run_all(ng: Nginx, origin: Origin,
     test_serve_authorized_off_by_default_still_refuses_lookup(ng, origin)
     test_default_key_varies_by_host(ng)
     test_default_key_normalizes(ng)
+    test_r31_normalize_max_args_over_cap_serves_and_keys_consistently(ng)
+    test_r31_normalize_max_args_config_bounds(ng)
     test_cache_redirect(ng)
     test_cache_negative_404(ng)
     test_head_not_stored(ng)
@@ -268,6 +270,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_cc_mode_inheritance_child_preset_overrides_parent_ignore(ng, origin)
     test_no_store(ng)
     test_native_cache_headers_stripped(ng)
+    test_many_headers_survive_list_part_spill(ng)
     test_admin_purge_post_with_body(ng)
     test_concurrent_hits_no_deadlock(ng)
     test_lru_eviction(ng)
@@ -339,6 +342,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_swr_refresh_no_validator_stays_unconditional(ng, origin)  # P1-4
     test_swr_refresh_304_keeps_entry_and_serves_it(ng, origin)  # P1-4 safety
     test_normalize_arg_order(ng, origin)
+    test_normalize_arg_order_many_permutations(ng, origin)
     test_normalize_strips_tracking(ng, origin)
     test_normalize_strip_custom(ng, origin)
     test_normalize_strip_all(ng, origin)
@@ -512,6 +516,7 @@ def run_all(ng: Nginx, origin: Origin,
         test_mc_keepalive_zero_does_not_drain_pool(ng, origin, mc)  # MC-A2
         test_mc_keepalive_idle_timeout_drops(ng, origin, mc)  # D-O1 timedout br
         test_mc_dirty_reply_not_pooled(ng, origin)         # D-O2 clean-gate
+        test_mc_set_ack_is_recognized_and_pools(ng, origin)  # R4-3 ack match
         # D-O1 idle-pool close: MUST be last mc test — it stops the mc server.
         test_mc_keepalive_server_close_survives(ng, origin, mc)
     # PERF-7 zero-copy serve stress: run LAST among L1 tests — its 48-thread /

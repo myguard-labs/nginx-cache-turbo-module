@@ -38,6 +38,16 @@
 #include "ngx_http_cache_turbo_module.h"
 #include "ngx_http_cache_turbo_internal.h"
 
+/* R5-1 (perf-microtier-hitpath): default-hide every symbol this TU defines
+ * so a module-internal call becomes a direct call instead of a PLT-indirect
+ * one (see ngx_http_cache_turbo_module.h for why this is a per-file pragma
+ * rather than a global -fvisibility=hidden CFLAGS addition, and why a
+ * header-only pragma does not work). Anything in this file that nginx's
+ * dynamic-module loader must resolve by name gets an explicit
+ * __attribute__((visibility("default"))) at its definition, overriding this
+ * pragma (GCC: an explicit attribute always wins over the pragma). */
+#pragma GCC visibility push(hidden)
+
 
 /* memcached's default single-item ceiling is 1 MiB (-I default). A value at or
  * above this would be rejected by the server, so skip an oversized SET locally
@@ -889,6 +899,7 @@ ngx_http_cache_turbo_mc_read_drain(ngx_event_t *rev)
 {
     ssize_t                        n;
     size_t                         line;
+    ngx_uint_t                     ack;
     u_char                        *lf;
     ngx_connection_t              *c;
     ngx_http_cache_turbo_mc_op_t  *op;
@@ -963,11 +974,31 @@ ngx_http_cache_turbo_mc_read_drain(ngx_event_t *rev)
         /* Poolable only when the reply is a recognized single-line ack AND the
          * server sent nothing past its CRLF (extra bytes => stream desync on the
          * next reuse). Any error/unknown reply keeps clean=0 -> conn closed. */
-        if (line == op->recv_len
-            && (ngx_strncmp(op->recv, "STORED", 6) == 0
-                || ngx_strncmp(op->recv, "DELETED", 7) == 0
-                || ngx_strncmp(op->recv, "NOT_FOUND", 9) == 0))
-        {
+        /* R4-3: dispatch on recv[0] before comparing. The three ack strings
+         * have distinct first bytes (S/D/N), so at most one ngx_strncmp runs
+         * instead of up to three. recv[0] is in bounds: the `lf == op->recv`
+         * guard above proves at least one byte precedes the LF.
+         * ⚠ The if/else shape is deliberate -- `ack` is the branch OUTCOME, not
+         * op->clean. Keying the log arm off op->clean would make this gate
+         * depend on the field being 0 on entry, and op->clean is also set on
+         * another path (:1210). This stays a pure function of THIS reply. */
+        ack = 0;
+
+        if (line == op->recv_len) {
+            switch (op->recv[0]) {
+            case 'S':
+                ack = (ngx_strncmp(op->recv, "STORED", 6) == 0);
+                break;
+            case 'D':
+                ack = (ngx_strncmp(op->recv, "DELETED", 7) == 0);
+                break;
+            case 'N':
+                ack = (ngx_strncmp(op->recv, "NOT_FOUND", 9) == 0);
+                break;
+            }
+        }
+
+        if (ack) {
             op->clean = 1;
         } else {
             ngx_log_error(NGX_LOG_INFO, c->log, 0,
@@ -1335,3 +1366,5 @@ ngx_cache_turbo_backend_t  ngx_http_cache_turbo_memcached_backend = {
     NULL,   /* lock      — no atomic NX  */
     NULL,   /* unlock                    */
 };
+
+#pragma GCC visibility pop

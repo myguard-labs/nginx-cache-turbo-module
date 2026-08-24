@@ -311,6 +311,40 @@ def test_no_store(ng: Nginx) -> None:
     assert h4.get("x-cache") == "HIT", "un-flagged response should cache"
 
 
+def test_many_headers_survive_list_part_spill(ng: Nginx) -> None:
+    """R4-1: the store path measures the header block and then emits it in two
+    separate walks, and the emit walk reads a per-header admissibility verdict
+    recorded positionally by the measure walk. r->headers_out.headers is an
+    ngx_list_t with 20 entries per part, so a response with 45 custom headers
+    SPILLS across three parts -- the case where a mis-stepped index in the part
+    transition would desynchronise the two walks.
+
+    A desync is a cache-poisoning class bug: the emit pass would read the bit
+    belonging to a DIFFERENT header, either dropping an admissible one or
+    writing one the gate rejected. Both show up here -- every X-Many-NN must
+    come back on the HIT with its own matching value (a shifted verdict gives a
+    wrong value or a missing header), and the skip-listed Age mixed in at the
+    end must still be stripped and replaced by our own computed Age."""
+    fetch(ng.port, "/c/manyhdr")                    # prime
+    _, _, h = fetch(ng.port, "/c/manyhdr")          # HIT
+    assert h.get("x-cache") == "HIT", "should be an L1 hit"
+
+    missing = [i for i in range(45) if h.get(f"x-many-{i:02d}") is None]
+    assert not missing, f"headers lost across the list-part spill: {missing}"
+
+    wrong = {
+        f"x-many-{i:02d}": h.get(f"x-many-{i:02d}")
+        for i in range(45)
+        if h.get(f"x-many-{i:02d}") != f"v-{i:02d}"
+    }
+    assert not wrong, f"verdict/value desync across the part boundary: {wrong}"
+
+    # The skip-listed header emitted AFTER the spill must still be stripped,
+    # proving the gate still applies at a high index and not just in part 0.
+    assert int(h["age"]) < 100, \
+        f"upstream Age=123 leaked from beyond the part boundary: {h.get('age')}"
+
+
 def test_native_cache_headers_stripped(ng: Nginx) -> None:
     """When a native nginx cache (proxy_cache) sits behind us, its per-response
     Age / X-Cache-Status must NOT be frozen into our blob and replayed on every

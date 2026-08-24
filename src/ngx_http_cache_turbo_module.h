@@ -21,6 +21,39 @@
 #include <ngx_md5.h>
 
 
+/* R5-1 (perf-microtier-hitpath): the module build has no per-addon CFLAGS hook
+ * anywhere in nginx's `auto/module`/`auto/make` — every module object is
+ * compiled with the SAME global $(CFLAGS) as nginx core, in both the
+ * DYNAMIC (.so) and static --add-module arms (verified against the generated
+ * objs/Makefile: our objects and core's use one shared $(CFLAGS) variable).
+ * Appending -fvisibility=hidden to that global CFLAGS in `config` would also
+ * hide nginx core's own symbols in the static-build arm, which is out of
+ * scope and unsafe. Each ngx_http_cache_turbo_*.c wraps ITS OWN body in a
+ * `#pragma GCC visibility push(hidden)` / `pop` instead (see those files) —
+ * that hides every definition in the TU regardless of whether it has a
+ * header prototype, which a header-only pragma does NOT (verified: a pragma
+ * around a declaration hides only definitions whose defining declaration is
+ * textually inside the pushed region; most of this module's internal
+ * functions are declared only by their own definition, with no header
+ * prototype, so a header-level pragma left them exported). Only the nginx
+ * module struct is opted back to default visibility below. nginx's
+ * dynamic-module loader (ngx_load_module in nginx's src/core/nginx.c)
+ * resolves exactly three symbols by name via dlsym(): `ngx_modules`,
+ * `ngx_module_names`, `ngx_module_order`. All three live in the
+ * auto-generated ngx_http_cache_turbo_module_modules.c (nginx's own build
+ * glue, not one of our TUs, so unaffected by any of these pragmas), which
+ * takes `&ngx_http_cache_turbo_module`'s address into that ngx_modules[]
+ * array — a reference resolved by the LINKER at .so-build time, not by a
+ * second dlsym. Empirically (2026-08-24 negative control on this branch),
+ * hiding the struct itself did NOT stop nginx from dlopen()ing and serving
+ * through the module: an intra-DSO, link-time address-of still works when
+ * the referencing TU (_modules.c) and the referenced symbol are linked into
+ * the same .so, regardless of the symbol's own visibility. The attribute
+ * below is kept anyway as defense-in-depth against a future refactor that
+ * moves the struct's only reference behind an actual dlsym() (or into a
+ * different .so), where hidden visibility would silently break loading. */
+
+
 /* Stale window = fresh TTL * (STALE_MULTIPLIER - 1), matching wp-redis. This is
  * the BALANCED-preset stale multiplier; presets override it per-band (v3-2) via
  * the runtime ngx_http_cache_turbo_loc_conf_t.stale_mult field. */
@@ -1940,12 +1973,38 @@ typedef struct {
                                                    * defaults; trailing '*' is a
                                                    * prefix match. NULL = none. */
 
+    /* R3-3: first-byte bitmap over the combined denylist (built-in defaults +
+     * normalize_strip), built once at config merge time so the per-request,
+     * per-param fast path in ngx_http_cache_turbo_name_denied can reject a
+     * non-matching first byte with one bit test instead of walking every
+     * pattern. Two 128-bit (16-byte) halves so a byte and its opposite case
+     * both hit -- matching is case-insensitive and names arrive unlowercased.
+     * strip_bitmap_all is set when any pattern in the combined list is the
+     * zero-length prefix "*" (cache_turbo_normalize_strip *), which must match
+     * every name regardless of first byte -- the bitmap is not consulted then.
+     * Built by ngx_http_cache_turbo_build_strip_bitmap(), called once from
+     * merge_loc_conf after normalize_strip has its final (inherited or
+     * overridden) value. */
+    u_char                   strip_bitmap[32];
+    unsigned                 strip_bitmap_all:1;
+
     /* Vary-aware suffix (v3-4). Bitmask of NGX_HTTP_CACHE_TURBO_VARY_* selecting
      * which buckets are appended to $cache_turbo_normalized_args so responses
      * that legitimately differ by encoding (br/gzip/identity) or device
      * (mobile/desktop) get separate cache slots. NGX_CONF_UNSET / 0 = off, so
      * v3-1 keys are unchanged unless cache_turbo_normalize_vary opts in. */
     ngx_int_t                normalize_vary;
+
+    /* R3-1 DoS bound. $cache_turbo_normalized_args sorts the kept params with
+     * an insertion sort (O(n^2)); `kept` is bounded only by r->args.len (~8k by
+     * default), so an unauthenticated request with thousands of params burns
+     * tens of ms of worker CPU BEFORE the cache lookup -- a hit cannot absorb
+     * it. When the kept (post-strip) count exceeds this cap, normalization is
+     * SKIPPED entirely and the RAW r->args string is used for the key: the
+     * request is still served correctly and still keys consistently, it just is
+     * not normalized. 0 = unlimited (no cap, pre-R3-1 behaviour).
+     * NGX_CONF_UNSET merges to 64, the measured knee (~0.011 ms). */
+    ngx_int_t                normalize_max_args;
 
     /* auto-Vary (v11 other half). When on, the response `Vary:` header is read
      * at store time and the named request headers (safe whitelist only:
@@ -2618,7 +2677,13 @@ typedef struct {
 } ngx_http_cache_turbo_ctx_t;
 
 
-extern ngx_module_t  ngx_http_cache_turbo_module;
+/* Must stay default-visibility: the auto-generated
+ * ngx_http_cache_turbo_module_modules.c (nginx's own build glue, not one of
+ * our TUs) takes this struct's address into the ngx_modules[] array that
+ * nginx's dynamic-module loader resolves by dlsym() name. See the pragma
+ * block at the top of this header for the visibility-scoping rationale. */
+extern ngx_module_t  ngx_http_cache_turbo_module
+    __attribute__((visibility("default")));
 
 
 /* ---- shm.c ---- */

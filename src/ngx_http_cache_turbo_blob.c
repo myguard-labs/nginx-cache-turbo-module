@@ -21,6 +21,16 @@
 #include "ngx_http_cache_turbo_module.h"
 #include "ngx_http_cache_turbo_internal.h"
 
+/* R5-1 (perf-microtier-hitpath): default-hide every symbol this TU defines
+ * so a module-internal call becomes a direct call instead of a PLT-indirect
+ * one (see ngx_http_cache_turbo_module.h for why this is a per-file pragma
+ * rather than a global -fvisibility=hidden CFLAGS addition, and why a
+ * header-only pragma does not work). Anything in this file that nginx's
+ * dynamic-module loader must resolve by name gets an explicit
+ * __attribute__((visibility("default"))) at its definition, overriding this
+ * pragma (GCC: an explicit attribute always wins over the pragma). */
+#pragma GCC visibility push(hidden)
+
 #if (NGX_SSL)
 #include <ngx_event_openssl.h>
 #endif
@@ -122,9 +132,6 @@ ngx_http_cache_turbo_digest_init(ngx_http_cache_turbo_digest_t *d)
 
     d->md = ngx_http_cache_turbo_worker_md;
 
-    /* Default / no-guard / failed-fetch fallback: today's call, unchanged. */
-    md_type = EVP_sha256();
-
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L && !defined(LIBRESSL_VERSION_NUMBER)
     {
         EVP_MD  *fetched;
@@ -143,13 +150,24 @@ ngx_http_cache_turbo_digest_init(ngx_http_cache_turbo_digest_t *d)
         }
 #endif
 
-        /* A NULL fetch (real OOM/provider-load failure, or the test knob
-         * above) is a degraded-but-correct path, not an error: md_type
-         * stays EVP_sha256() and the request is served exactly as before. */
-        if (fetched != NULL) {
-            md_type = fetched;
-        }
+        /* PERF: EVP_sha256() is evaluated ONLY on the fallback arm, never when
+         * the worker-cached fetch is available. It returns a legacy
+         * EVP_ORIG_GLOBAL handle, so OpenSSL 3 answers it with an implicit
+         * EVP_MD_fetch -- a property query + provider hashtable lookup. That
+         * is the very call PR #409 removed from EVP_DigestInit_ex's argument
+         * (ossl_fnv1a_hash, 5.55% self-time); computing it here and then
+         * discarding it on the common path paid the same cost again, 1-4x per
+         * request (build_key + up to three vary sites).
+         *
+         * A NULL fetch (real OOM/provider-load failure, or the test knob
+         * above) is a degraded-but-correct path, not an error: md_type falls
+         * back to EVP_sha256() and the request is served exactly as before,
+         * producing a byte-identical digest. */
+        md_type = (fetched != NULL) ? (const EVP_MD *) fetched : EVP_sha256();
     }
+#else
+    /* No-guard fallback (pre-3.0 / LibreSSL): today's call, unchanged. */
+    md_type = EVP_sha256();
 #endif
 
     d->ok = (d->md != NULL
@@ -603,3 +621,5 @@ ngx_http_cache_turbo_blob_next_header(const u_char **pp, const u_char *end,
     *pp = p;
     return NGX_OK;
 }
+
+#pragma GCC visibility pop

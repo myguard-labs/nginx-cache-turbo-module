@@ -37,6 +37,57 @@ def test_normalize_arg_order(ng: Nginx, origin: Origin) -> None:
         f"origin hit {origin.hits_for('/order') - base} times (args not normalized to one key)"
 
 
+def test_normalize_arg_order_many_permutations(ng: Nginx, origin: Origin) -> None:
+    """R3-2 ordering equivalence. The sort is open-coded (a stack temp) instead
+    of ngx_sort(), which malloc/free'd a 16-byte scratch slot per request on the
+    key path. The order it produces -- and therefore the cache key -- must be
+    byte-identical to ngx_sort()'s for every input.
+
+    Two params in two orders (test_normalize_arg_order above) cannot see an
+    ordering divergence: almost any comparison-based sort agrees on a pair. This
+    keys the SAME set of params in several genuinely different permutations and
+    requires ONE entry and exactly ONE origin hit -- if any permutation produced
+    a different order, that permutation would key a different slot and hit the
+    origin a second time, which the hits_for() count catches even though the
+    bodies would look interchangeable.
+
+    The token set is chosen to exercise the parts of the comparator a random
+    set would not:
+      * `a`, `a=1`, `aa=1`, `a=10` share a prefix, so ordering is decided by the
+        comparator's `a->len - b->len` length tiebreak after ngx_memcmp ties;
+      * `d=2` and `d=2` cannot appear twice, but `c=1`/`c=2` tie on the first
+        two bytes, exercising the equal-prefix path;
+      * mixed-length names make the memcmp min(len) truncation matter.
+    """
+    toks = ["a", "a=1", "aa=1", "a=10", "b=2", "c=1", "c=2", "dd", "d=9", "e=0"]
+    perms = [
+        toks,                       # already sorted-ish input order
+        list(reversed(toks)),       # worst case for insertion sort
+        [toks[i] for i in (4, 0, 7, 2, 9, 1, 5, 3, 8, 6)],
+        [toks[i] for i in (9, 8, 0, 6, 1, 7, 2, 5, 3, 4)],
+        toks[5:] + toks[:5],        # rotation
+    ]
+
+    base = origin.hits_for("/permorder")
+    bodies = []
+    for i, perm in enumerate(perms):
+        _, b, h = fetch(ng.port, "/n/permorder?" + "&".join(perm))
+        if i == 0:
+            assert "x-cache" not in h, "first permutation should miss to origin"
+        else:
+            assert h.get("x-cache") == "HIT", \
+                f"permutation {i} keyed a DIFFERENT slot (X-Cache={h.get('x-cache')}): " \
+                f"the sort order is not stable across input orders"
+        bodies.append(b)
+
+    assert len(set(bodies)) == 1, \
+        "permutations served different bodies -- they did not share one entry"
+    hits = origin.hits_for("/permorder") - base
+    assert hits == 1, \
+        f"origin hit {hits} times for {len(perms)} permutations of one param set; " \
+        f"every permutation must normalize to one key"
+
+
 def test_normalize_strips_tracking(ng: Nginx, origin: Origin) -> None:
     """Built-in denylist: utm_* and fbclid are dropped, so ?p=1&utm_source=x&
     fbclid=y collapses onto the same slot as a bare ?p=1."""
@@ -1632,6 +1683,62 @@ def test_mc_dirty_reply_not_pooled(ng: Nginx, origin: Origin) -> None:
             f"{n} cold keys / ~{2 * n} ops) -- an unclean reply was pooled (D-O2)")
     finally:
         dirty.stop()
+
+
+def test_mc_set_ack_is_recognized_and_pools(ng: Nginx, origin: Origin) -> None:
+    """R4-3: the SET/DELETE ack strings must still be RECOGNIZED after the
+    first-byte dispatch in mc_read_drain(), or the write-through connection is
+    never pooled.
+
+    This is the negative control the ack-matching code otherwise has none for.
+    test_mc_keepalive_reuse() does NOT cover it: pooling there is dominated by
+    the GET path, which sets op->clean in a DIFFERENT function
+    (mc_get_read, memcached.c:~1210). Breaking the SET ack match in
+    mc_read_drain() leaves the GET half pooling happily, and that test's
+    `on * 2 < off` margin absorbs the loss -- verified by mutating the 'S' arm
+    to compare "STORAGE": test_mc_keepalive_reuse still PASSED.
+
+    So this test isolates the ack path. It reuses DirtyMemcached with
+    `trailer=b""`, which makes it a CLEAN memcached: every reply ends exactly at
+    its CRLF, so `line == op->recv_len` holds and the ONLY thing standing
+    between the reply and a pooled connection is the STORED/DELETED/NOT_FOUND
+    match itself. /mcdirty/ carries keepalive=4.
+
+    Each distinct cold key drives GET (miss) -> origin -> L1 store +
+    write-through SET, i.e. two ops. With the ack recognized, connections are
+    returned to the pool and the fake sees far fewer accepts than ops. With the
+    ack match broken, every SET reply is judged unpoolable, its connection is
+    closed, and accepts climb to roughly one per op.
+
+    Negative control (OBSERVED, not assumed): mutating the 'S' arm to
+    ngx_strncmp(op->recv, "STORAGE", 7) and rebuilding reds this assertion."""
+    clean = DirtyMemcached(ng.port + PORT_OFFSETS["mc_dirty_reply"],
+                           trailer=b"")
+    clean.start()
+    try:
+        n = 20
+        stamp = time.time()
+
+        def one(i: int) -> int:
+            s, _, _ = fetch(ng.port, f"/mcdirty/ack-{stamp}-{i}")
+            return s
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+            statuses = list(ex.map(one, range(n)))
+        time.sleep(0.6)   # let the fire-and-forget SETs land
+
+        assert all(s == 200 for s in statuses), \
+            f"a /mcdirty/ request failed against a CLEAN fake memcached: {statuses}"
+
+        # ~2N ops. Pooling works => well under N accepts. Ack match broken =>
+        # every SET closes its conn, pushing accepts toward ~2N. n is the
+        # midpoint and leaves generous slack for scheduling on both sides.
+        assert clean.accepts < n, (
+            f"a clean memcached reply was NOT pooled ({clean.accepts} accepts "
+            f"for {n} cold keys / ~{2 * n} ops) -- the SET/DELETE ack in "
+            f"mc_read_drain() is no longer recognized (R4-3)")
+    finally:
+        clean.stop()
 
 
 def test_redis_dirty_reply_not_pooled(ng: Nginx) -> None:

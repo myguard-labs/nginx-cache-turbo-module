@@ -536,6 +536,17 @@ ngx_int_t ngx_http_cache_turbo_redis_scan_del(ngx_http_request_t *r,
  * real arg value. */
 #define NGX_HTTP_CACHE_TURBO_VARY_SUFFIX_MAX  32
 
+/* R3-1: default cap on the number of kept (post-strip) query params
+ * $cache_turbo_normalized_args will sort. ngx_sort() is an insertion sort
+ * (nginx src/core/ngx_string.c), so the cost is O(n^2) on a path that runs
+ * BEFORE the cache lookup -- a hit cannot absorb it -- and `kept` is bounded
+ * only by r->args.len (~8k via large_client_header_buffers). Measured on this
+ * shape at -O2, reverse-sorted worst case: 32 params 0.003 ms, 64 0.011 ms,
+ * 128 0.041 ms, 1000 2.06 ms, 4000 23 ms of single-threaded worker CPU per
+ * unauthenticated request. 64 is the knee. Overridable per location with
+ * `cache_turbo_normalize_max_args N`; 0 = unlimited. */
+#define NGX_HTTP_CACHE_TURBO_NORMALIZE_MAX_ARGS_DEFAULT  64
+
 /* blobref_t + CT_BLOBREF (shm.c only, layout pair kept together) */
 /* PERF-7: reference header prefixed to every slab-allocated response body so a
  * cache HIT can serve the blob DIRECTLY out of shm (zero-copy) instead of
@@ -1020,6 +1031,10 @@ ngx_int_t ngx_http_cache_turbo_var_set(ngx_http_request_t *r,
 ngx_int_t ngx_http_cache_turbo_name_denied(ngx_http_cache_turbo_loc_conf_t *clcf,
     u_char *name, size_t nlen);
 ngx_int_t ngx_http_cache_turbo_tok_cmp(const void *one, const void *two);
+/* R3-3: build clcf->strip_bitmap[]/strip_bitmap_all from the combined
+ * built-in + normalize_strip denylist. Config-time only; called once from
+ * ngx_http_cache_turbo_merge_normalize() after normalize_strip is final. */
+void ngx_http_cache_turbo_build_strip_bitmap(ngx_http_cache_turbo_loc_conf_t *clcf);
 
 /* ---- match.c (cookie / query-arg / URI matching group, MAINT-SPLIT) ----
  *
@@ -1256,7 +1271,7 @@ void ngx_http_cache_turbo_blob_cleanup(void *data);
  * and slice identically; ci/tests/unit/extract_shm.sh is unaffected. */
 ngx_int_t ngx_http_cache_turbo_serve(ngx_http_request_t *r, u_char *copy,
     size_t len, ngx_uint_t stale, ngx_http_cache_turbo_zone_t *z,
-    u_char *ref_data, const char *xcache);
+    u_char *ref_data, ngx_uint_t xcache);
 ngx_int_t ngx_http_cache_turbo_add_header(ngx_http_request_t *r, u_char *name,
     size_t nlen, u_char *val, size_t vlen);
 ngx_uint_t ngx_http_cache_turbo_breaker_action(ngx_uint_t state,

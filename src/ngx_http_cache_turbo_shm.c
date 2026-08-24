@@ -15,6 +15,16 @@
 #include "ngx_http_cache_turbo_module.h"
 #include "ngx_http_cache_turbo_internal.h"
 
+/* R5-1 (perf-microtier-hitpath): default-hide every symbol this TU defines
+ * so a module-internal call becomes a direct call instead of a PLT-indirect
+ * one (see ngx_http_cache_turbo_module.h for why this is a per-file pragma
+ * rather than a global -fvisibility=hidden CFLAGS addition, and why a
+ * header-only pragma does not work). Anything in this file that nginx's
+ * dynamic-module loader must resolve by name gets an explicit
+ * __attribute__((visibility("default"))) at its definition, overriding this
+ * pragma (GCC: an explicit attribute always wins over the pragma). */
+#pragma GCC visibility push(hidden)
+
 
 /* --- P4-1a W-TinyLFU sketch constants. Declared here rather than beside the
  * helpers below because _shm_init_zone() sizes and allocates the sketch and
@@ -3125,3 +3135,5 @@ ngx_cache_turbo_l1_backend_t  ngx_http_cache_turbo_shm_backend = {
     ngx_http_cache_turbo_shm_l2_neg_set,
     ngx_http_cache_turbo_shm_freshen,
 };
+
+#pragma GCC visibility pop

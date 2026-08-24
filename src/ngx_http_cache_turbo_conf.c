@@ -16,6 +16,16 @@
 #include "ngx_http_cache_turbo_module.h"
 #include "ngx_http_cache_turbo_internal.h"
 
+/* R5-1 (perf-microtier-hitpath): default-hide every symbol this TU defines
+ * so a module-internal call becomes a direct call instead of a PLT-indirect
+ * one (see ngx_http_cache_turbo_module.h for why this is a per-file pragma
+ * rather than a global -fvisibility=hidden CFLAGS addition, and why a
+ * header-only pragma does not work). Anything in this file that nginx's
+ * dynamic-module loader must resolve by name gets an explicit
+ * __attribute__((visibility("default"))) at its definition, overriding this
+ * pragma (GCC: an explicit attribute always wins over the pragma). */
+#pragma GCC visibility push(hidden)
+
 /* Log config error and return NGX_CONF_ERROR. Replaces the idiomatic
  * ngx_conf_log_error(...); return NGX_CONF_ERROR; pattern to reduce noise
  * at call sites. Defined here, above every use: a macro has no forward
@@ -1404,6 +1414,18 @@ ngx_http_cache_turbo_merge_normalize(ngx_http_cache_turbo_loc_conf_t *conf,
     if (conf->normalize_vary == NGX_CONF_UNSET) {
         conf->normalize_vary = prev->normalize_vary;
     }
+    /* R3-1: inherit-then-default to 64, the measured knee of the O(n^2)
+     * insertion sort on the key path. Unlike the neighbours above this one has
+     * a non-zero compiled-in default, so it is a merge_value, not a bare
+     * UNSET-inherit: leaving it at 0 would mean "unlimited" and keep the DoS
+     * bound off by default, which is the point of the directive. */
+    ngx_conf_merge_value(conf->normalize_max_args, prev->normalize_max_args,
+                         NGX_HTTP_CACHE_TURBO_NORMALIZE_MAX_ARGS_DEFAULT);
+
+    /* R3-3: normalize_strip has its final (inherited or location-overridden)
+     * value as of the assignment above -- build the first-byte bitmap now so
+     * every request through this loc_conf uses the precomputed fast path. */
+    ngx_http_cache_turbo_build_strip_bitmap(conf);
 }
 
 
@@ -3442,3 +3464,5 @@ ngx_http_cache_turbo_ignore_set_cookie_conf(ngx_conf_t *cf, ngx_command_t *cmd,
 
     return NGX_CONF_OK;
 }
+
+#pragma GCC visibility pop

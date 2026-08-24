@@ -40,6 +40,16 @@
 #include "ngx_http_cache_turbo_module.h"
 #include "ngx_http_cache_turbo_internal.h"
 
+/* R5-1 (perf-microtier-hitpath): default-hide every symbol this TU defines
+ * so a module-internal call becomes a direct call instead of a PLT-indirect
+ * one (see ngx_http_cache_turbo_module.h for why this is a per-file pragma
+ * rather than a global -fvisibility=hidden CFLAGS addition, and why a
+ * header-only pragma does not work). Anything in this file that nginx's
+ * dynamic-module loader must resolve by name gets an explicit
+ * __attribute__((visibility("default"))) at its definition, overriding this
+ * pragma (GCC: an explicit attribute always wins over the pragma). */
+#pragma GCC visibility push(hidden)
+
 
 static ngx_http_output_header_filter_pt  ngx_http_next_header_filter;
 static ngx_http_output_body_filter_pt    ngx_http_next_body_filter;
@@ -1407,6 +1417,83 @@ ngx_http_cache_turbo_body_filter_windows(ngx_http_request_t *r,
 }
 
 
+/* R4-1 header admissibility verdict cache.
+ *
+ * ngx_http_cache_turbo_header_admissible() is not cheap: per header it walks
+ * the whole NAME validating tchar, walks the whole VALUE scanning for CR/LF/
+ * NUL (the expensive half -- values are the long ones), then runs up to 18
+ * length+strncasecmp tests in header_skip(). Running it twice per header per
+ * store -- once to size the block, once to emit it -- doubles that for no new
+ * information: the second pass asks a question the first already answered.
+ *
+ * So the measure pass records one bit per header here and the emit pass reads
+ * the bit instead of re-scanning the bytes.
+ *
+ * ⚠ AUD-HDR1 is STRENGTHENED, not weakened, by this. The invariant that gate
+ * requires is that the two passes make identical decisions, or headers_len
+ * lies about the block that follows. Two independent calls to one predicate
+ * satisfy that only as long as nothing about the header changes between them;
+ * a recorded verdict makes the emit pass literally unable to disagree, because
+ * it no longer has its own opinion to drift.
+ *
+ * ⚠ The bit index is POSITIONAL over the ngx_list_t walk, so it is only sound
+ * while both passes visit the same headers in the same order. That is true
+ * today -- the two calls are adjacent inside store_tail() with only an
+ * ngx_pnalloc() on r->pool between them, and that allocation cannot touch
+ * r->headers_out.headers -- but "true today" is exactly the assumption whose
+ * silent breakage would be a cache-poisoning bug: a desynchronised bit would
+ * let the emit pass write a header the measure pass rejected (or vice versa),
+ * either corrupting the blob framing or smuggling a header past the gate.
+ *
+ * It is therefore made safe BY CONSTRUCTION rather than by comment: the
+ * measure pass records how many headers it visited, and the emit pass falls
+ * back to recomputing ngx_http_cache_turbo_header_admissible() for any header
+ * beyond that count. A list that grew between the passes loses the optimization
+ * for the new tail and stays CORRECT; it cannot read a bit that describes a
+ * different header. (A list that shrank simply leaves trailing bits unread.)
+ *
+ * Content-Type is not in the header list -- it is synthesised from the typed
+ * field -- so it gets its OWN slot (ct_admissible) rather than a position in
+ * the bitmap, and cannot shift the loop's indexing.
+ *
+ * Allocation failure is not an error path: verdicts.bits == NULL simply means
+ * every lookup recomputes, i.e. exactly the old two-pass behaviour. */
+typedef struct {
+    u_char      *bits;      /* NULL => recompute everything (still correct) */
+    ngx_uint_t   nvisited;  /* headers the measure pass actually walked */
+    /* verdict for the synthesised Content-Type (not in the header list) */
+    unsigned     ct_admissible:1;
+} ngx_http_cache_turbo_hdr_verdicts_t;
+
+
+static ngx_inline void
+ngx_http_cache_turbo_verdict_set(ngx_http_cache_turbo_hdr_verdicts_t *v,
+    ngx_uint_t idx)
+{
+    if (v->bits != NULL) {
+        v->bits[idx >> 3] |= (u_char) (1u << (idx & 7));
+    }
+}
+
+
+/* Read back the verdict for header `idx`. Falls back to recomputing when the
+ * bitmap is absent (alloc failure) or when idx is beyond what the measure pass
+ * recorded (the list grew between the passes) -- see the desync note above. */
+static ngx_inline ngx_int_t
+ngx_http_cache_turbo_verdict_get(ngx_http_cache_turbo_hdr_verdicts_t *v,
+    ngx_uint_t idx, ngx_http_cache_turbo_loc_conf_t *clcf, ngx_table_elt_t *h)
+{
+    if (v->bits == NULL || idx >= v->nvisited) {
+        return h->hash != 0
+               && ngx_http_cache_turbo_header_admissible(clcf,
+                      h->key.data, h->key.len,
+                      h->value.data, h->value.len);
+    }
+
+    return (v->bits[idx >> 3] >> (idx & 7)) & 1u;
+}
+
+
 /* First pass: measure the header block that _blob_write() will emit.
  *
  * ⚠ AUD-HDR1: this walk and the emit walk in _blob_write() MUST make
@@ -1419,13 +1506,32 @@ ngx_http_cache_turbo_body_filter_windows(ngx_http_request_t *r,
 static void
 ngx_http_cache_turbo_body_filter_measure_headers(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, ngx_str_t *ct, size_t *out_hdr_bytes,
-    uint32_t *out_nheaders)
+    uint32_t *out_nheaders, ngx_http_cache_turbo_hdr_verdicts_t *verdicts)
 {
     ngx_list_part_t  *part;
     ngx_table_elt_t  *h;
     size_t            hdr_bytes = 0;
     uint32_t          nheaders = 0;
-    ngx_uint_t        i;
+    ngx_uint_t        i, idx, total;
+
+    /* Size the bitmap from the WHOLE list (all parts), not part->nelts of the
+     * first part -- an ngx_list_t spills into further parts once the first is
+     * full, and sizing off one part would under-allocate and let the walk
+     * below write past the end. */
+    total = 0;
+    for (part = &r->headers_out.headers.part; part; part = part->next) {
+        total += part->nelts;
+    }
+
+    verdicts->bits = NULL;
+    verdicts->nvisited = 0;
+    verdicts->ct_admissible = 0;
+
+    if (total > 0) {
+        /* ngx_pcalloc: unset bits must read as "not admissible" so a partially
+         * filled map can never promote a header the walk never judged. */
+        verdicts->bits = ngx_pcalloc(r->pool, (total + 7) / 8);
+    }
 
     /* P4-3: Content-Type goes through the SAME admissibility gate as every
      * other pair. It used to be emitted unconditionally, so a CR/LF in an
@@ -1443,6 +1549,7 @@ ngx_http_cache_turbo_body_filter_measure_headers(ngx_http_request_t *r,
                (u_char *) "Content-Type", sizeof("Content-Type") - 1,
                ct->data, ct->len))
     {
+        verdicts->ct_admissible = 1;
         hdr_bytes += sizeof(uint32_t) + sizeof("Content-Type") - 1
                      + sizeof(uint32_t) + ct->len;
         nheaders++;
@@ -1450,7 +1557,7 @@ ngx_http_cache_turbo_body_filter_measure_headers(ngx_http_request_t *r,
 
     part = &r->headers_out.headers.part;
     h = part->elts;
-    for (i = 0; /* void */ ; i++) {
+    for (i = 0, idx = 0; /* void */ ; i++, idx++) {
         if (i >= part->nelts) {
             if (part->next == NULL) {
                 break;
@@ -1459,6 +1566,17 @@ ngx_http_cache_turbo_body_filter_measure_headers(ngx_http_request_t *r,
             h = part->elts;
             i = 0;
         }
+
+        /* idx counts every header VISITED, admissible or not, so it stays in
+         * lockstep with the emit pass's identical walk. `continue` below must
+         * therefore not skip the increment -- it is in the for-header. */
+        if (idx >= total) {
+            /* Cannot happen while the list is stable across the two passes
+             * (total was just summed from it). Bail rather than write past the
+             * bitmap if it ever does. */
+            break;
+        }
+
         if (h[i].hash == 0
             || !ngx_http_cache_turbo_header_admissible(clcf,
                     h[i].key.data, h[i].key.len,
@@ -1466,10 +1584,14 @@ ngx_http_cache_turbo_body_filter_measure_headers(ngx_http_request_t *r,
         {
             continue;
         }
+
+        ngx_http_cache_turbo_verdict_set(verdicts, idx);
         hdr_bytes += sizeof(uint32_t) + h[i].key.len
                      + sizeof(uint32_t) + h[i].value.len;
         nheaders++;
     }
+
+    verdicts->nvisited = idx;
 
     *out_hdr_bytes = hdr_bytes;
     *out_nheaders = nheaders;
@@ -1485,14 +1607,15 @@ static void
 ngx_http_cache_turbo_body_filter_blob_write(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx,
     u_char *blob, ngx_str_t *ct, size_t hdr_bytes, uint32_t nheaders,
-    time_t ttl, time_t stale_window, time_t sie_window)
+    time_t ttl, time_t stale_window, time_t sie_window,
+    ngx_http_cache_turbo_hdr_verdicts_t *verdicts)
 {
     ngx_http_cache_turbo_blob_hdr_t   bhw;
     ngx_list_part_t                  *part;
     ngx_table_elt_t                  *h;
     ngx_chain_t                      *cl;
     u_char                           *w;
-    ngx_uint_t                        i;
+    ngx_uint_t                        i, idx;
 
     ngx_memzero(&bhw, sizeof(bhw));
     bhw.nheaders = nheaders;
@@ -1578,19 +1701,22 @@ ngx_http_cache_turbo_body_filter_blob_write(ngx_http_request_t *r,
             ngx_memcpy(w, (vp), (vl)); w += (vl);                     \
         } while (0)
 
-    /* P4-3: mirror of the measure pass's gate -- see the comment there. */
-    if (ct->len
-        && ngx_http_cache_turbo_header_admissible(clcf,
-               (u_char *) "Content-Type", sizeof("Content-Type") - 1,
-               ct->data, ct->len))
-    {
+    /* P4-3: mirror of the measure pass's gate -- see the comment there.
+     * R4-1: the verdict is READ back from the measure pass rather than
+     * recomputed. Content-Type has its own slot, so it cannot perturb the
+     * header loop's positional indexing below. */
+    if (ct->len && verdicts->ct_admissible) {
         CT_PUT("Content-Type", sizeof("Content-Type") - 1,
                ct->data, ct->len);
     }
 
+    /* R4-1: same walk as the measure pass, same order, same idx numbering --
+     * the verdict is read from the bitmap instead of re-running both byte
+     * scans. _verdict_get() recomputes for any idx the measure pass did not
+     * record, so a list that grew between the passes stays correct. */
     part = &r->headers_out.headers.part;
     h = part->elts;
-    for (i = 0; /* void */ ; i++) {
+    for (i = 0, idx = 0; /* void */ ; i++, idx++) {
         if (i >= part->nelts) {
             if (part->next == NULL) {
                 break;
@@ -1599,11 +1725,7 @@ ngx_http_cache_turbo_body_filter_blob_write(ngx_http_request_t *r,
             h = part->elts;
             i = 0;
         }
-        if (h[i].hash == 0
-            || !ngx_http_cache_turbo_header_admissible(clcf,
-                    h[i].key.data, h[i].key.len,
-                    h[i].value.data, h[i].value.len))
-        {
+        if (!ngx_http_cache_turbo_verdict_get(verdicts, idx, clcf, &h[i])) {
             continue;
         }
         CT_PUT(h[i].key.data, h[i].key.len,
@@ -2077,6 +2199,7 @@ ngx_http_cache_turbo_body_filter_store_tail(ngx_http_request_t *r,
     time_t                        ttl, stale_window, sie_window;
     time_t                        retain_ttl;
     ngx_http_cache_turbo_zone_t  *z;
+    ngx_http_cache_turbo_hdr_verdicts_t  verdicts;
 
     if (ngx_http_cache_turbo_body_filter_windows(r, clcf, &ttl, &stale_window,
                                                  &sie_window) == NGX_DECLINED)
@@ -2089,7 +2212,7 @@ ngx_http_cache_turbo_body_filter_store_tail(ngx_http_request_t *r,
     ct = r->headers_out.content_type;
 
     ngx_http_cache_turbo_body_filter_measure_headers(r, clcf, &ct, &hdr_bytes,
-                                                     &nheaders);
+                                                     &nheaders, &verdicts);
 
     /* STAB-5: headers_len and body_len are uint32 in the blob header. Refuse
      * to store (rather than write a header that lies about the layout) if a
@@ -2114,7 +2237,8 @@ ngx_http_cache_turbo_body_filter_store_tail(ngx_http_request_t *r,
 
     ngx_http_cache_turbo_body_filter_blob_write(r, clcf, ctx, blob, &ct,
                                                 hdr_bytes, nheaders, ttl,
-                                                stale_window, sie_window);
+                                                stale_window, sie_window,
+                                                &verdicts);
 
     /* The L2 retention window, used for the object key AND for every L2
      * index that points at it (variant index, tag index). stale_window
@@ -2231,10 +2355,11 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
     ngx_uint_t                        last = 0;
 
     ctx = ngx_http_get_module_ctx(r, ngx_http_cache_turbo_module);
-    clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
 
 #if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
     && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+    clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
+
     if (ngx_http_cache_turbo_body_filter_midbody_rescue(r, clcf, ctx)
         == NGX_ERROR)
     {
@@ -2256,6 +2381,18 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
     if (ctx == NULL || !ctx->captured || ctx->served) {
         return ngx_http_cache_turbo_forward_body(r, in);
     }
+
+    /* Fetched HERE, below the bail above -- which is the common path for every
+     * response this filter sees but does not capture (no ctx, not captured, or
+     * already served from cache) -- rather than at the top of the function. The
+     * header filter's own bail already had this shape; the body filter did not.
+     * Neither the SIE-emit arm nor forward_body() takes clcf, so nothing above
+     * needs it. Under TEST_FAULTS it is already assigned at the top for the
+     * mid-body rescue hook, so this re-fetch is skipped in that build. */
+#if !defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    || !NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+    clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
+#endif
 
 #if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
     && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
@@ -2302,3 +2439,5 @@ ngx_http_cache_turbo_filter_chain_init(void)
 
     return NGX_OK;
 }
+
+#pragma GCC visibility pop
