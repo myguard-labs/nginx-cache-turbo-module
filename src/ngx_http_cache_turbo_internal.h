@@ -665,8 +665,8 @@ typedef struct {
 /*
  * Serialised cache blob layout (one contiguous slab allocation):
  *
- *   [ 44-byte fixed wire header (see ngx_http_cache_turbo_blob_hdr_write) ]
- *   [ nheaders * { u32 name_len, name, u32 val_len, value } ]   (all u32 LE)
+ *   [ 76-byte fixed wire header (see ngx_http_cache_turbo_blob_hdr_write) ]
+ *   [ nheaders * { u8 role, u32 name_len, name, u32 val_len, value } ] (u32 LE)
  *   [ body bytes ]
  *
  * The header block lets us restore Content-Type and any other response
@@ -680,31 +680,63 @@ typedef struct {
  * absolute serve-on-origin-error window from creation (fresh + stale-if-error N);
  * 0 = no serve-on-error past the normal stale window.
  *
- * STAB-4: the wire header is a FIXED little-endian, 44-byte, padding-free layout
- * (NOT this struct's native ABI) written/read only via the blob_hdr_write/
- * blob_validate helpers in module.c — so the on-disk format is independent of
- * compiler struct padding and host endianness. This struct is the in-memory
- * PARSED form; its field order/size is irrelevant to the wire. A single
- * ngx_http_cache_turbo_blob_validate() fully validates magic+version+all length
- * fields+the TLV header walk in one place, so a malformed L2 blob is rejected
- * BEFORE it is inserted into L1 (the old inline parse stored first, then serve()
- * failed = a poisoned L1 slot).
+ * STAB-4: the wire header is a FIXED little-endian, 76-byte, padding-free
+ * layout (NOT this struct's native ABI) written/read only via the
+ * blob_hdr_write/blob_validate helpers in module.c — so the on-disk format is
+ * independent of compiler struct padding and host endianness. This struct is
+ * the in-memory PARSED form; its field order/size is irrelevant to the wire. A
+ * single ngx_http_cache_turbo_blob_validate() fully validates
+ * magic+version+all length fields+the TLV header walk in one place, so a
+ * malformed L2 blob is rejected BEFORE it is inserted into L1 (the old inline
+ * parse stored first, then serve() failed = a poisoned L1 slot).
  *
  * Wire offsets (little-endian):
- *   0  u32 magic     ("CTB4")    16  u32 headers_len   32  u32 fresh_ttl
- *   4  u16 version   (= 4)       20  u32 body_len      36  u32 stale_ttl
+ *   0  u32 magic     ("CTB5")    16  u32 headers_len   32  u32 fresh_ttl
+ *   4  u16 version   (= 5)       20  u32 body_len      36  u32 stale_ttl
  *   6  u16 flags     (BLOBF_*)   24  i64 created       40  u32 sie_ttl
- *   8  u32 status    12 u32 nheaders                   44  = header size
+ *   8  u32 status    12 u32 nheaders
+ *  44  u8  date_len  (== 29)     45  u8[29] date       74  u8[2] reserved (0)
+ *                                                      76  = header size
+ *
+ * CTB5 / PERF-AUD2-02: `date` holds the RFC-1123 rendering of `created`, as
+ * ngx_http_time() would produce it -- the exact 29 bytes
+ * ngx_http_cache_turbo_restore_response_finalize() emits as the response's
+ * Date header. `created` is fixed for the blob's life, so those bytes are
+ * byte-identical on every hit of that entry; rendering them once at store
+ * time turns a per-hit ngx_http_time() + ngx_pnalloc(29) into a memcpy of a
+ * field that is already in the cache line the validator just read.
+ *
+ * ⚠ NOT TRUSTED OFF THE WIRE. An L2 writer we do not control can put any 29
+ * bytes here, and the restore path emits them verbatim as a response header
+ * value -- i.e. the same response-splitting primitive AUD-HDR1 exists to
+ * close. ngx_http_cache_turbo_blob_validate() therefore checks date_len == 29
+ * AND that every one of the 29 bytes is a printable non-CTL ASCII character
+ * (0x20..0x7E, excluding CR/LF/NUL by construction) before the blob is
+ * accepted at all. A blob failing either check is a MISS, exactly like a bad
+ * magic. The `reserved` two bytes are written as 0 and never read; they exist
+ * so the header stays a multiple of 4 and a future fixed field costs no
+ * further turnover.
+ *
+ * CTB5 / PERF-AUD2-03: each TLV entry is prefixed by a one-byte ROLE tag
+ * (NGX_HTTP_CACHE_TURBO_HROLE_*) recording what the store path already knew
+ * about that header's identity. restore_response_headers() switches on the
+ * tag instead of running up to three ngx_strncasecmp (Content-Type / ETag /
+ * Last-Modified) per stored header per hit. The tag is a HINT about a name
+ * the blob also carries verbatim: an out-of-range tag is rejected by the
+ * validator, and an in-range but WRONG tag can only mis-file a header the
+ * blob already contains -- it cannot inject one, and the name bytes still
+ * travel and are still emitted. Minimum TLV entry size is therefore 9 bytes
+ * (role + two u32 lengths), not 8.
  *
  * S232-BYPASS-STALE: the u16 at offset 6 was reserved-and-always-0; it now
- * carries BLOBF_* bits. This is NOT a wire-layout change (the field was already
- * in the 44-byte header, already written as 0 and already skipped by every
- * reader), so magic/version are deliberately NOT bumped and no keyspace
- * turnover happens -- see the NOTE on BLOB_VERSION below for that rule. An old
- * CTB4 blob reads back flags = 0, which is exactly "no bits set".
+ * carries BLOBF_* bits. This is NOT a wire-layout change (the field was
+ * already in the (then 44-byte) header, already written as 0 and already
+ * skipped by every reader), so magic/version are deliberately NOT bumped and
+ * no keyspace turnover happens -- see the NOTE on BLOB_VERSION below for that
+ * rule. An old CTB4 blob reads back flags = 0, which is exactly "no bits set".
  */
 typedef struct {
-    uint32_t                 magic;       /* 0x43544234 = "CTB4"            */
+    uint32_t                 magic;       /* 0x43544235 = "CTB5"            */
     uint32_t                 version;
     uint32_t                 nheaders;
     uint32_t                 headers_len; /* bytes of the header block      */
@@ -715,6 +747,13 @@ typedef struct {
     uint32_t                 stale_ttl;   /* total serveable window (>=fresh) */
     uint32_t                 sie_ttl;     /* abs serve-on-error window; 0=none */
     uint32_t                 flags;       /* BLOBF_* bits (wire u16 at off 6) */
+    /* CTB5 / PERF-AUD2-02: points INTO the caller's blob buffer at the
+     * validated 29-byte rendered Date field (same lifetime as the blob, no
+     * copy -- exactly like blob_href_t's name/val). Never NULL on a blob
+     * blob_validate() accepted: the field is mandatory in CTB5 and its length
+     * and charset are checked there. NOT part of the wire layout; this is the
+     * parsed form. */
+    const u_char            *date;
 } ngx_http_cache_turbo_blob_hdr_t;
 
 /*
@@ -890,6 +929,9 @@ typedef struct {
     uint32_t                  nlen;
     const u_char              *val;
     uint32_t                   vlen;
+    /* CTB5 / PERF-AUD2-03: the stored NGX_HTTP_CACHE_TURBO_HROLE_* tag for
+     * this entry, already range-checked by blob_validate(). */
+    uint32_t                  role;
 } ngx_http_cache_turbo_blob_href_t;
 
 /* ---- blob.c: helpers whose signature needs the two structs just above ----
@@ -915,21 +957,63 @@ ngx_int_t ngx_http_cache_turbo_blob_validate(const u_char *blob, size_t len,
     ngx_http_cache_turbo_blob_href_t *refs_buf, ngx_uint_t refs_buf_cap);
 
 
-/* CTB4 (RFC-2 stale-if-error): fixed-endian versioned wire format. CTB4 adds the
- * sie_ttl u32 after stale_ttl (44-byte header). Old CTB1/CTB2/CTB3 blobs in L2
- * fail the magic/version check and are treated as a miss (cache self-heals), so
- * no migration is needed — the keyspace turns over once on upgrade.
+/* CTB5 (PERF-AUD2-02 + PERF-AUD2-03): fixed-endian versioned wire format. CTB5
+ * adds the u8 date_len + 29-byte rendered Date + 2 reserved bytes after sie_ttl
+ * (76-byte header) and a one-byte role tag in front of every TLV header entry.
+ * Old CTB1..CTB4 blobs in L2 fail the magic/version check and are treated as a
+ * miss (cache self-heals), so no migration is needed — the keyspace turns over
+ * once on upgrade.
+ *
+ * ⚠ Because the version bump makes an old blob a MISS, there is no "the field
+ * is absent" state to fall back from: every blob that reaches a consumer has
+ * already been proven to carry BOTH new fields. Do not add a formatting
+ * fallback for the Date or a name-compare fallback for the role tag — neither
+ * arm is reachable, and an unreachable arm is untestable dead weight.
  *
  * NOTE: the magic/version are bumped ONLY for an actual wire-LAYOUT change. A
  * purely semantic shift in already-laid-out bytes (e.g. the 2bcb914 switch from
  * storing a compressed body to an identity one) does NOT bump it — a reload
  * clears L1 shm and short TTLs age out any L2 copy, so a global keyspace
  * turnover would be unwarranted churn for a not-yet-in-production module. */
-#define NGX_HTTP_CACHE_TURBO_BLOB_MAGIC    0x43544234
-#define NGX_HTTP_CACHE_TURBO_BLOB_VERSION  4
+#define NGX_HTTP_CACHE_TURBO_BLOB_MAGIC    0x43544235
+#define NGX_HTTP_CACHE_TURBO_BLOB_VERSION  5
 /* Fixed wire size of the blob header (NOT sizeof the struct — that carries
  * native padding). All blob offsets derive from this constant. */
-#define NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE 44
+#define NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE 76
+
+/*
+ * CTB5 / PERF-AUD2-03: per-TLV-entry header ROLE tag.
+ *
+ * The store path already knows which of the three specially-handled response
+ * headers each pair is -- Content-Type gets its own emit slot, and ETag /
+ * Last-Modified are recognisable at capture time. Recording that as one byte
+ * lets restore_response_headers() replace up to three
+ * length+folded-first-byte-guarded ngx_strncasecmp per stored header per hit
+ * with a single switch on an integer already loaded by the header walk.
+ *
+ * ⚠ The tag is a HINT, never an authority. The entry still carries its name
+ * bytes verbatim and restore still emits them; a wrong-but-in-range tag from a
+ * hostile L2 writer can only make restore file a header it already holds into
+ * the wrong slot (e.g. treat an "X-Foo" pair as the ETag for the conditional
+ * -request comparison). It cannot conjure a header, change a name, or bypass
+ * ngx_http_cache_turbo_header_admissible(), which runs on the name/value bytes
+ * regardless of the tag. An OUT-OF-RANGE tag is rejected outright by
+ * blob_validate() -- a blob carrying one was not written by this module.
+ *
+ * Values are a dense 0..3 enum so the validator's bound is a single compare
+ * and the restore switch compiles to a jump table.
+ */
+#define NGX_HTTP_CACHE_TURBO_HROLE_OTHER          0
+#define NGX_HTTP_CACHE_TURBO_HROLE_CONTENT_TYPE   1
+#define NGX_HTTP_CACHE_TURBO_HROLE_ETAG           2
+#define NGX_HTTP_CACHE_TURBO_HROLE_LAST_MODIFIED  3
+#define NGX_HTTP_CACHE_TURBO_HROLE_MAX            3
+
+/* CTB5 / PERF-AUD2-02: fixed width of the rendered RFC-1123 Date field, and
+ * its wire offsets inside the blob header. 29 = strlen("Mon, 28 Sep 1970
+ * 06:00:00 GMT"), which is what ngx_http_time() always produces. */
+#define NGX_HTTP_CACHE_TURBO_BLOB_DATE_LEN  29
+#define NGX_HTTP_CACHE_TURBO_BLOB_DATE_OFF  45
 
 /* P4-5: slice size for the zero-copy body chain built by
  * ngx_http_cache_turbo_serve(). All bufs point into the SAME refcounted blob,

@@ -66,7 +66,14 @@ emit_defines() {
                 NGX_HTTP_CACHE_TURBO_TTL_MAX \
                 NGX_HTTP_CACHE_TURBO_FOREVER_TTL \
                 NGX_HTTP_CACHE_TURBO_BLOB_CREATED_MIN \
-                NGX_HTTP_CACHE_TURBO_BLOBF_HDRS_VETTED
+                NGX_HTTP_CACHE_TURBO_BLOBF_HDRS_VETTED \
+                NGX_HTTP_CACHE_TURBO_BLOB_DATE_LEN \
+                NGX_HTTP_CACHE_TURBO_BLOB_DATE_OFF \
+                NGX_HTTP_CACHE_TURBO_HROLE_OTHER \
+                NGX_HTTP_CACHE_TURBO_HROLE_CONTENT_TYPE \
+                NGX_HTTP_CACHE_TURBO_HROLE_ETAG \
+                NGX_HTTP_CACHE_TURBO_HROLE_LAST_MODIFIED \
+                NGX_HTTP_CACHE_TURBO_HROLE_MAX
     do
         # A name defined in more than one header is itself drift: the harness
         # would silently take whichever came first. Collect every hit.
@@ -114,7 +121,7 @@ emit_defines() {
     # same forward declaration module.c carries.
     echo "static ngx_int_t ngx_http_cache_turbo_blob_next_header(const u_char **pp,"
     echo "    const u_char *end, const u_char **name, uint32_t *nlen,"
-    echo "    const u_char **val, uint32_t *vlen);"
+    echo "    const u_char **val, uint32_t *vlen, uint32_t *role);"
     echo ""
 } > "$OUT"
 

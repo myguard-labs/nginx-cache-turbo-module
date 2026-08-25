@@ -280,9 +280,10 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 
     for (;;) {
         const u_char  *nm, *vv;
-        uint32_t       nl, vl;
+        uint32_t       nl, vl, role;
 
-        if (ngx_http_cache_turbo_blob_next_header(&p, end, &nm, &nl, &vv, &vl)
+        if (ngx_http_cache_turbo_blob_next_header(&p, end, &nm, &nl, &vv, &vl,
+                                                  &role)
             != NGX_OK)
         {
             break;
@@ -290,6 +291,15 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 
         ct_in_bounds(nm, nl, buf, size, "header NAME outside the blob");
         ct_in_bounds(vv, vl, buf, size, "header VALUE outside the blob");
+
+        /* CTB5 / PERF-AUD2-03: restore_response_headers() switches on this tag
+         * with NO validating default arm, so an accepted entry must always
+         * carry an in-range role. The walk is the only place that bound is
+         * enforced. */
+        if (role > NGX_HTTP_CACHE_TURBO_HROLE_MAX) {
+            ct_fail("the header walk ACCEPTED an out-of-range role tag -- "
+                    "restore switches on it without a validating default arm");
+        }
 
         if (!ct_would_emit(&clcf, nm, nl, vv, vl)) {
             continue;                      /* dropped before add_header() */
@@ -367,7 +377,7 @@ static u_char  ct_blob[8192];
 static size_t  ct_blob_len;
 
 /*
- * Build a CTB4 blob exactly as the store path does. Mirrors
+ * Build a CTB5 blob exactly as the store path does. Mirrors
  * ngx_http_cache_turbo_blob_hdr_write() + CT_PUT() in module.c; the wire
  * offsets are the ones documented on ngx_http_cache_turbo_blob_hdr_t and
  * guarded against drift by extract_blob.sh's HDR_WIRE check.
@@ -385,6 +395,11 @@ ct_build_created(uint32_t status, uint32_t fresh_ttl, uint32_t stale_ttl,
     w = ct_blob + CT_HDR_WIRE;
     for (i = 0; i < nkv; i++) {
         size_t nl = strlen(kv[i].name), vl = strlen(kv[i].value);
+        /* CTB5: the leading role tag. HROLE_OTHER for every seed pair -- the
+         * tag is a hint restore switches on, and the seeds exist to exercise
+         * the NAME/VALUE contract, so the conservative tag is the right one
+         * here; the fuzzer reaches the other three by mutating this byte. */
+        *w++ = (u_char) NGX_HTTP_CACHE_TURBO_HROLE_OTHER;
         ct_put_u32(w, (uint32_t) nl); w += 4;
         memcpy(w, kv[i].name, nl);    w += nl;
         ct_put_u32(w, (uint32_t) vl); w += 4;
@@ -402,6 +417,14 @@ ct_build_created(uint32_t status, uint32_t fresh_ttl, uint32_t stale_ttl,
     ct_put_u32(ct_blob + 32, fresh_ttl);
     ct_put_u32(ct_blob + 36, stale_ttl);
     ct_put_u32(ct_blob + 40, sie_ttl);
+    /* CTB5: the mandatory rendered-Date field. blob_validate() rejects a blob
+     * whose date_len != 29 or whose 29 bytes are not printable ASCII, so a
+     * seed without it would be rejected on framing and fuzz nothing past the
+     * header. */
+    ct_blob[44] = (u_char) NGX_HTTP_CACHE_TURBO_BLOB_DATE_LEN;
+    memcpy(ct_blob + NGX_HTTP_CACHE_TURBO_BLOB_DATE_OFF,
+           "Thu, 01 Jan 2026 00:00:00 GMT",
+           NGX_HTTP_CACHE_TURBO_BLOB_DATE_LEN);
 
     memcpy(w, bodytext, blen); w += blen;
     ct_blob_len = (size_t) (w - ct_blob);

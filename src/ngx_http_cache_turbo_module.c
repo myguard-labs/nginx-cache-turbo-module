@@ -2477,40 +2477,46 @@ ngx_http_cache_turbo_restore_response_headers(ngx_http_request_t *r,
             continue;
         }
 
-        /* PERF: each of the three name tests below is gated on the length AND
-         * on a case-folded first byte before the ngx_strncasecmp call, so an
-         * ordinary stored header (Cache-Control, Server, Vary, ...) is rejected
-         * by two integer compares instead of entering a string comparison. This
-         * loop runs once per stored header on EVERY hit, and the header count
-         * is bounded only by the blob size. The folding mask 0x20 is applied to
-         * the byte, not to a range test, so the check stays exactly as
-         * case-insensitive as the strncasecmp it guards -- a header stored as
-         * "content-type" or "cOntent-type" still matches. */
-        if (nl == sizeof("Content-Type") - 1
-            && (nm[0] | 0x20) == 'c'
-            && ngx_strncasecmp(nm, (u_char *) "Content-Type", nl) == 0)
-        {
+        /*
+         * CTB5 / PERF-AUD2-03: switch on the role tag the STORE path recorded
+         * instead of re-deriving each header's identity here. This loop runs
+         * once per stored header on EVERY hit, and the header count is bounded
+         * only by the blob size; the three name tests it replaces each cost a
+         * length compare plus a case-folded first-byte compare, and a real
+         * ngx_strncasecmp on a match. The tag is already range-checked to
+         * 0..HROLE_MAX by blob_validate()'s walk, so no default arm can fire.
+         *
+         * ⚠ The tag never gates SAFETY. header_admissible() above has already
+         * run over these exact name/value bytes (or the blob is one this
+         * process vetted at store time), and every branch below still emits the
+         * stored NAME verbatim. A hostile L2 writer choosing a wrong-but-in-
+         * range tag can therefore only mis-file a header the blob already
+         * carries -- e.g. offer some other pair's value to the conditional-
+         * request comparison below -- which is a cache-correctness nuisance on
+         * a copy the attacker already controls end to end, not a new primitive.
+         */
+        switch (refs[i].role) {
+
+        case NGX_HTTP_CACHE_TURBO_HROLE_CONTENT_TYPE:
             r->headers_out.content_type.len = vl;
             r->headers_out.content_type.data = vv;
             r->headers_out.content_type_len = vl;
             continue;
-        }
 
         /* v11: remember the stored validators so we can answer a conditional
          * request with 304 below. They are still emitted as normal headers. */
-        if (nl == sizeof("ETag") - 1
-            && (nm[0] | 0x20) == 'e'
-            && ngx_strncasecmp(nm, (u_char *) "ETag", nl) == 0)
-        {
+        case NGX_HTTP_CACHE_TURBO_HROLE_ETAG:
             *etagp = vv;
             *etag_lenp = vl;
+            break;
 
-        } else if (nl == sizeof("Last-Modified") - 1
-                   && (nm[0] | 0x20) == 'l'
-                   && ngx_strncasecmp(nm, (u_char *) "Last-Modified", nl) == 0)
-        {
+        case NGX_HTTP_CACHE_TURBO_HROLE_LAST_MODIFIED:
             *lastmodp = vv;
             *lastmod_lenp = vl;
+            break;
+
+        default:                       /* NGX_HTTP_CACHE_TURBO_HROLE_OTHER */
+            break;
         }
 
         if (ngx_http_cache_turbo_add_header(r, nm, nl, vv, vl) != NGX_OK) {
@@ -2623,14 +2629,31 @@ ngx_http_cache_turbo_restore_response_finalize(ngx_http_request_t *r,
      * timestamp; Age = now - created below is then exactly consistent with it.
      * NOTE: created is our store time, not the upstream's original Date (which
      * is stripped at store and has no blob field yet); true origin-Date
-     * preservation rides the deferred RFC-2 blob-format bump. */
+     * preservation rides the deferred RFC-2 blob-format bump.
+     *
+     * CTB5 / PERF-AUD2-02: the 29 rendered bytes come STRAIGHT OFF THE BLOB.
+     * `created` is fixed for the entry's life, so ngx_http_time() produced the
+     * same 29 bytes on every hit; the store path now renders them once
+     * (blob.c blob_hdr_write) and this path memcpy's them. What is removed per
+     * hit is the ngx_http_time() call itself (an ngx_gmtime() plus an
+     * ngx_sprintf()/ngx_vslprintf() format run), not just an allocation.
+     *
+     * The r->pool copy is still made rather than pointing at the blob: the
+     * response header list outlives the point at which the blob reference can
+     * be released, and 29 bytes of ngx_pnalloc is the same allocation the old
+     * code already paid.
+     *
+     * ⚠ The bytes are NOT trusted because they are in the blob. They were
+     * proven to be exactly 29 printable, CR/LF/NUL-free ASCII characters by
+     * ngx_http_cache_turbo_blob_validate(), which every path reaching here has
+     * already passed -- see the validator's own comment for why an L2 writer
+     * makes that check mandatory rather than defensive. */
     {
         u_char           *db;
         ngx_table_elt_t  *dh;
 
         db = ngx_http_cache_turbo_restore_alloc_fails(r) ? NULL
-             : ngx_pnalloc(r->pool,
-                           sizeof("Mon, 28 Sep 1970 06:00:00 GMT") - 1);
+             : ngx_pnalloc(r->pool, NGX_HTTP_CACHE_TURBO_BLOB_DATE_LEN);
         if (db == NULL) {
             return NGX_ERROR;
         }
@@ -2640,13 +2663,14 @@ ngx_http_cache_turbo_restore_response_finalize(ngx_http_request_t *r,
             return NGX_ERROR;
         }
 
+        ngx_memcpy(db, bh->date, NGX_HTTP_CACHE_TURBO_BLOB_DATE_LEN);
+
         {
             static u_char  date_name[] = "Date";
             dh->hash = 1;
             dh->key.len = sizeof("Date") - 1;
             dh->key.data = date_name;
-            dh->value.len = (size_t) (ngx_http_time(db,
-                                (time_t) bh->created) - db);
+            dh->value.len = NGX_HTTP_CACHE_TURBO_BLOB_DATE_LEN;
             dh->value.data = db;
 #if (nginx_version >= 1023000)
             dh->next = NULL;
@@ -2864,7 +2888,7 @@ ngx_http_cache_turbo_serve(ngx_http_request_t *r, u_char *copy, size_t len,
      * Fail CLOSED: the allowance is the narrow, explicit "STALE-BREAKER"
      * reason, so a new call site is refused until it opts in on purpose.
      *
-     * The read is bounded by the same 44-byte header check blob_validate()
+     * The read is bounded by the same fixed-header-size check blob_validate()
      * applies; a buffer too short to hold the header cannot be served at all,
      * so treat it as not-permitted rather than reading past it. The NULL check
      * is load-bearing, not defensive noise: this runs BEFORE restore_response()

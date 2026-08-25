@@ -269,7 +269,7 @@ ngx_http_cache_turbo_exit_process(ngx_cycle_t *cycle)
 
 
 /* ------------------------------------------------------------------------- *
- * STAB-4: fixed little-endian, padding-free blob wire header (44 bytes, CTB4).
+ * STAB-4: fixed little-endian, padding-free blob wire header (76 bytes, CTB5).
  * Written/read only through these helpers so the on-disk format is independent
  * of struct padding and host endianness. See the layout comment on
  * ngx_http_cache_turbo_blob_hdr_t in the header.
@@ -343,6 +343,34 @@ ngx_http_cache_turbo_blob_hdr_write(u_char *dst,
     ngx_http_cache_turbo_put_u32(dst + 32, h->fresh_ttl);
     ngx_http_cache_turbo_put_u32(dst + 36, h->stale_ttl);
     ngx_http_cache_turbo_put_u32(dst + 40, h->sie_ttl);   /* CTB4 (RFC-2 SIE) */
+
+    /*
+     * CTB5 / PERF-AUD2-02: render `created` to its RFC-1123 form ONCE, here,
+     * instead of on every hit in restore_response_finalize(). ngx_http_time()
+     * always writes exactly 29 bytes ("Mon, 28 Sep 1970 06:00:00 GMT") and
+     * returns the end pointer; we pin the length rather than trusting it, so a
+     * hypothetical upstream change in that rendering is caught by the
+     * assertion below rather than silently writing a short field that the
+     * validator would then reject on read-back.
+     *
+     * Deliberately unconditional -- EVERY blob this module writes carries the
+     * field, markers included (vary.c's marker_store() memzero's its
+     * blob_hdr_t but sets `created`, so the marker's Date renders from the
+     * same real timestamp). A uniform header means blob_validate() can require
+     * the field on every blob, which is what makes the restore path's memcpy
+     * safe without a second "is it there?" branch.
+     */
+    {
+        u_char  *e;
+
+        e = ngx_http_time(dst + NGX_HTTP_CACHE_TURBO_BLOB_DATE_OFF,
+                          (time_t) h->created);
+        dst[44] = (u_char) (e - (dst + NGX_HTTP_CACHE_TURBO_BLOB_DATE_OFF));
+    }
+
+    /* reserved, always 0 -- see the layout comment in _internal.h */
+    dst[74] = 0;
+    dst[75] = 0;
 }
 
 
@@ -361,7 +389,7 @@ ngx_http_cache_turbo_blob_hdr_write(u_char *dst,
  *
  * Deliberately unconditional and total: it rewrites the u16 rather than
  * testing first, so there is no "was it set?" branch whose inverse could be
- * got wrong, and it is a no-op on a buffer too short to hold the 44-byte wire
+ * got wrong, and it is a no-op on a buffer too short to hold the 76-byte wire
  * header (such a blob is rejected by blob_validate() anyway, but the bounds
  * check must not depend on that ordering).
  *
@@ -390,7 +418,7 @@ ngx_http_cache_turbo_blob_clear_vetted(u_char *blob, size_t len)
  * ngx_http_cache_turbo_blob_next_header()'s definition further down. */
 static ngx_int_t ngx_http_cache_turbo_blob_next_header(const u_char **pp,
     const u_char *end, const u_char **name, uint32_t *nlen,
-    const u_char **val, uint32_t *vlen);
+    const u_char **val, uint32_t *vlen, uint32_t *role);
 
 
 /*
@@ -503,6 +531,43 @@ ngx_http_cache_turbo_blob_validate(const u_char *blob, size_t len,
         return NGX_ERROR;
     }
 
+    /*
+     * CTB5 / PERF-AUD2-02: the stored Date field is ATTACKER-INFLUENCEABLE --
+     * an L2 writer we do not control chooses these bytes, and
+     * restore_response_finalize() emits them verbatim as the value of a
+     * response header. That is precisely the AUD-HDR1 response-splitting
+     * primitive, so the field is validated here, at the one chokepoint every
+     * consumer goes through, and never replayed on trust.
+     *
+     * Two checks, both exact rather than lenient:
+     *   - the length byte must be EXACTLY the fixed width. A short field would
+     *     leave the tail of the fixed slot (uninitialised or attacker-chosen)
+     *     unexamined by the charset scan below while still sitting inside the
+     *     blob; a longer one cannot fit the slot at all.
+     *   - every byte must be printable ASCII (0x20..0x7E). This excludes CR,
+     *     LF and NUL by construction -- the three bytes that turn a header
+     *     value into extra headers or truncate the name -- without needing a
+     *     separate NUL-safety pass, and it also rejects the all-zero field a
+     *     pre-CTB5 writer or a memzero'd struct would leave behind.
+     * A blob failing either check is rejected outright (a MISS), exactly like
+     * a bad magic: it was not written by this module's store path.
+     */
+    if (blob[44] != NGX_HTTP_CACHE_TURBO_BLOB_DATE_LEN) {
+        return NGX_ERROR;
+    }
+    {
+        uint32_t  di;
+
+        for (di = 0; di < NGX_HTTP_CACHE_TURBO_BLOB_DATE_LEN; di++) {
+            u_char  c = blob[NGX_HTTP_CACHE_TURBO_BLOB_DATE_OFF + di];
+
+            if (c < 0x20 || c > 0x7E) {
+                return NGX_ERROR;
+            }
+        }
+    }
+    out->date = blob + NGX_HTTP_CACHE_TURBO_BLOB_DATE_OFF;
+
     /* header block + body must fit (subtract on the remaining len — no overflow) */
     if (out->headers_len > len - NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE
         || out->body_len
@@ -513,7 +578,8 @@ ngx_http_cache_turbo_blob_validate(const u_char *blob, size_t len,
 
     /* S231-PERF-HDRWALK: reject an nheaders that cannot possibly fit BEFORE
      * sizing the refs allocation below on it. Every TLV entry costs at least
-     * 8 bytes (u32 name_len + u32 val_len, both possibly zero-length), so a
+     * 9 bytes (CTB5: u8 role + u32 name_len + u32 val_len, the two lengths
+     * both possibly zero), so a
      * genuine blob never claims more than headers_len/8 entries; the walk
      * below would reject such a blob anyway (the first `end - p < 4/8` check
      * fails), but that rejection happens AFTER the allocation this bound now
@@ -522,7 +588,7 @@ ngx_http_cache_turbo_blob_validate(const u_char *blob, size_t len,
      * field -- not a size_t overflow (nheaders is u32, sizeof(href) is small,
      * the product fits in 64-bit size_t), but a self-inflicted allocation-size
      * DoS this validator exists to prevent. */
-    if (out->nheaders > out->headers_len / 8) {
+    if (out->nheaders > out->headers_len / 9) {
         return NGX_ERROR;
     }
 
@@ -571,7 +637,7 @@ ngx_http_cache_turbo_blob_validate(const u_char *blob, size_t len,
     }
 
     for (i = 0; i < out->nheaders; i++) {
-        uint32_t       nl, vl;
+        uint32_t       nl, vl, role;
         const u_char  *name, *val;
 
         /* AUD-FUZZ1 / S231-PERF-HDRWALK: drive the SAME iterator restore used
@@ -580,7 +646,7 @@ ngx_http_cache_turbo_blob_validate(const u_char *blob, size_t len,
          * implementation of "where does a TLV entry end", called from the
          * one place that walks the block. */
         if (ngx_http_cache_turbo_blob_next_header(&p, end, &name, &nl,
-                                                   &val, &vl) != NGX_OK)
+                                                   &val, &vl, &role) != NGX_OK)
         {
             return NGX_ERROR;
         }
@@ -590,6 +656,7 @@ ngx_http_cache_turbo_blob_validate(const u_char *blob, size_t len,
             refs[i].nlen = nl;
             refs[i].val  = val;
             refs[i].vlen = vl;
+            refs[i].role = role;
         }
     }
 
@@ -618,12 +685,22 @@ ngx_http_cache_turbo_blob_validate(const u_char *blob, size_t len,
  */
 static ngx_int_t
 ngx_http_cache_turbo_blob_next_header(const u_char **pp, const u_char *end,
-    const u_char **name, uint32_t *nlen, const u_char **val, uint32_t *vlen)
+    const u_char **name, uint32_t *nlen, const u_char **val, uint32_t *vlen,
+    uint32_t *role)
 {
     const u_char  *p = *pp;
-    uint32_t       nl, vl;
+    uint32_t       nl, vl, rl;
 
-    if ((size_t) (end - p) < 8) { return NGX_DONE; }
+    /* CTB5: 9, not 8 -- the role byte precedes the two u32 lengths. */
+    if ((size_t) (end - p) < 9) { return NGX_DONE; }
+
+    /* CTB5 / PERF-AUD2-03: the role tag. Range-checked HERE, in the one walk
+     * every consumer drives, so restore's switch can rely on the value being
+     * one of the four defined roles and needs no default-case fallback of its
+     * own. An out-of-range tag is malformed framing, treated exactly like a
+     * length that runs off the end. */
+    rl = *p; p += 1;
+    if (rl > NGX_HTTP_CACHE_TURBO_HROLE_MAX) { return NGX_DONE; }
 
     nl = ngx_http_cache_turbo_get_u32(p); p += 4;
     if ((size_t) (end - p) < nl) { return NGX_DONE; }
@@ -636,6 +713,7 @@ ngx_http_cache_turbo_blob_next_header(const u_char **pp, const u_char *end,
 
     *nlen = nl;
     *vlen = vl;
+    *role = rl;
     *pp = p;
     return NGX_OK;
 }

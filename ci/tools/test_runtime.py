@@ -408,6 +408,8 @@ def run_all(ng: Nginx, origin: Origin,
             ng, origin, redis)                          # AUD-L2-PROMOTE-RACE
         test_l2_preserves_original_freshness(ng, origin, redis)
         test_l2_malformed_blob_rejected(ng, origin, redis)  # STAB-4 validate
+        test_ctb5_date_replayed_from_blob(ng, origin, redis)   # PERF-AUD2-02
+        test_ctb5_role_tag_restores_typed_headers(ng, origin, redis)  # AUD2-03
         # P4-3 positive control: the store path really does stamp the bit,
         # so the fast path is not silently a no-op.
         test_l2_store_stamps_hdrs_vetted_bit(ng, origin, redis)        # P4-3

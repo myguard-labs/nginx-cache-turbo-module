@@ -900,7 +900,7 @@ ngx_http_cache_turbo_vary_apply(ngx_http_request_t *r,
          * ngx_memzero'd and never sets it), so there is no TLV block to walk,
          * and the two body bytes this function reads sit at the FIXED offsets
          * NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE / +1, immediately after the
-         * fixed-size (44-byte) wire header -- independent of headers_len,
+         * fixed-size (76-byte, CTB5) wire header -- independent of headers_len,
          * nheaders or anything the TLV walk computes. Reading them safely
          * requires exactly three things, all proven here: the magic matches
          * (blob_validate's own first check), the version matches (ditto), and
