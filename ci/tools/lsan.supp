@@ -45,5 +45,17 @@
 # A leak in module code that is NOT reachable from the config pool -- anything
 # allocated per-request, per-connection, or from the shared zone -- still has a
 # stack without ngx_init_cycle in it and still fails the build.
+#
+# NOT SOLVED HERE: the short-lived `nginx -s reload` / `nginx -t` signaller
+# leaks its own 1024-byte init_cycle pool (src/core/nginx.c:254), on a stack
+# whose only frames are ngx_memalign <- ngx_create_pool <- main. No entry was
+# added for it, because all three frames were MEASURED too broad to key on:
+# LSan matches a suppression against ANY frame on the allocation stack, so
+# `leak:ngx_create_pool` also hides a pool the module itself leaks, and
+# `leak:main` hides everything in a single-process build. That one is handled
+# by scoping detect_leaks=0 to the throwaway process instead -- see
+# _throwaway_nginx_env() in ci/tools/test_runtime_base.py. Keep it there: doing
+# it here would blind the server's own leak check, which is what this file
+# exists to preserve.
 
 leak:ngx_init_cycle

@@ -444,7 +444,7 @@ class Nginx:
     def config_test(self) -> None:
         r = subprocess.run(self.command(test=True), text=True,
                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                           timeout=20)
+                           timeout=20, env=_throwaway_nginx_env())
         if r.returncode != 0:
             raise RuntimeError(f"nginx -t failed:\n{r.stdout}")
 
@@ -511,7 +511,7 @@ class Nginx:
                            "-c", str(self.root / "conf" / "nginx.conf"),
                            "-s", "reload"],
             text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            timeout=20)
+            timeout=20, env=_throwaway_nginx_env())
         if r.returncode != 0:
             raise RuntimeError(f"nginx -s reload failed:\n{r.stdout}")
 
@@ -1289,6 +1289,46 @@ def sanitizer_time_scale() -> float:
     1.0 when ASAN_OPTIONS is unset, so `timeout * sanitizer_time_scale() ==
     timeout`."""
     return ASAN_TIME_SCALE if "ASAN_OPTIONS" in os.environ else 1.0
+
+
+def _throwaway_nginx_env() -> dict[str, str]:
+    """Environment for a SHORT-LIVED nginx invocation (`-t`, `-s reload`), with
+    LeakSanitizer's exit check turned off for that process only.
+
+    `nginx -s reload` is not a signal sent by the shell: it is a whole new nginx
+    process that starts, reads the configuration, sends SIGHUP to the running
+    master, and exits through an early `return ngx_signal_process(...)` in
+    main() (src/core/nginx.c:329-330) that skips every teardown path. It leaks
+    its own 1024-byte init_cycle pool, created at src/core/nginx.c:254 --
+    upstream nginx calls ngx_destroy_pool() nowhere in nginx.c, for any exit
+    path, so this is a deliberate process-lifetime allocation reclaimed by
+    process exit rather than a defect.
+
+    Under detect_leaks=1 + abort_on_error=1 that signaller aborts (exit 134),
+    and the harness reports `nginx -s reload failed` for a reload that in fact
+    signalled the master correctly. Measured on run 32901823527, ASan
+    multi-worker leg: the same 1024-byte Direct leak from two signaller pids,
+    stack ngx_memalign <- ngx_create_pool <- main, ZERO module frames.
+
+    ⚠ This is deliberately NOT fixed with an entry in ci/tools/lsan.supp. That
+    stack's only usable frames are ngx_memalign, ngx_create_pool and main, and
+    all three were MEASURED too broad to key on -- LSan matches a suppression
+    against ANY frame on the allocation stack, so `leak:ngx_create_pool`
+    silently hides a pool the module itself leaks, and `leak:main` hides
+    everything in a single-process build. Scoping the option to the throwaway
+    process keeps the SERVER's leak detection fully armed, which is the whole
+    point of the lsan.supp change this accompanies.
+
+    Only detect_leaks is cleared; halt_on_error/abort_on_error stay, so a real
+    ASan fault (a use-after-free, an overflow) in the signaller still fails."""
+    env = dict(os.environ)
+    opts = env.get("ASAN_OPTIONS")
+    if opts:
+        kept = [o for o in opts.split(":")
+                if o and not o.startswith("detect_leaks")]
+        kept.append("detect_leaks=0")
+        env["ASAN_OPTIONS"] = ":".join(kept)
+    return env
 
 
 def wait_for(predicate, timeout: float = 3.0, interval: float = 0.05) -> bool:
