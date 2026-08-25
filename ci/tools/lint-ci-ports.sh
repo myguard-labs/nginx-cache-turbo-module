@@ -192,7 +192,24 @@ for f in "${files[@]}"; do
             # makes '#' start a comment mid-token here, and a '#' inside a
             # quoted scalar would only ever cost us a match (fail closed).
             code="${line%%#*}"
+
+            # ⚠ THIS ALLOWLIST IS THE CHECK'S KNOWN WEAK SPOT (AUD-CIPORT3).
+            # It names runtime entry points by SPELLING, so a job that boots a
+            # real server through any OTHER script matches nothing here, gets
+            # no job_starts_suite entry, and sails past check 3 -- while also
+            # being invisible to checks 1 and 2 (no sweep line, no band). It
+            # then takes test_runtime.py's default --port 18880 and collides
+            # with the build-test runtime job. That is the same failure this
+            # file's header describes, arriving through the one door the header
+            # did not name.
+            #
+            # testkit-run.sh was the fourth such entry point and the first to
+            # actually hit it. Every future one must be added HERE, in the same
+            # commit that adds the job. The durable fix is to stop keying on
+            # script names at all -- see the AUD-CIPORT3 row in
+            # memory/labs/nginx-cache-turbo-module/issues.md.
             if [[ "$code" == *test_runtime.py* || "$code" == *coverage.sh* \
+                  || "$code" == *testkit-run.sh* \
                   || "$code" =~ (^|[[:space:]])prove([[:space:]]|$) ]]; then
                 # py_compile checks syntax; it starts no suite and binds no port.
                 if [[ "$code" != *py_compile* ]]; then
@@ -202,6 +219,9 @@ for f in "${files[@]}"; do
                     # no --port of its own. Requiring one here would be a lint
                     # demanding a bug.
                     [[ "$code" == *coverage.sh* ]] && job_passes_port[$key]=1
+                    # testkit-run.sh does the same: its --port defaults to
+                    # $TEST_BASE_PORT, so declaring the band IS passing it.
+                    [[ "$code" == *testkit-run.sh* ]] && job_passes_port[$key]=1
                 fi
             fi
             if [[ "$code" == *--port*TEST_BASE_PORT* ]]; then

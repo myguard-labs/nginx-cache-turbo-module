@@ -7,6 +7,7 @@
 [![Valgrind](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/valgrind.yml/badge.svg)](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/valgrind.yml)
 [![CodeQL](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/codeql.yml/badge.svg)](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/codeql.yml)
 [![A/UBSan](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/asan.yml/badge.svg)](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/asan.yml)
+[![Testkit](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/testkit.yml/badge.svg)](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/testkit.yml)
 [![CI Deep](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/ci-deep.yml/badge.svg)](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/ci-deep.yml)
 
 A built-in page cache for nginx. Think of it as a tiny Varnish that lives
@@ -33,8 +34,52 @@ durations and the command to re-derive them live in `ci.yml`'s header comment.
 | [Valgrind](.github/workflows/valgrind.yml) | 60s memcheck soak on the merge path |
 | [CodeQL](.github/workflows/codeql.yml) | CodeQL over the module TU; keeps its own monthly `schedule:` |
 | [A/UBSan](.github/workflows/asan.yml) | ASan+UBSan single-process and multi-worker soaks, static `--add-module` build |
+| [Testkit](.github/workflows/testkit.yml) | the [nginx-module-testkit](https://github.com/myguard-labs/nginx-module-testkit) prober leg: per-request allocation neutrality read out of the cycle pool, asserted in both directions (a staged tree must assert, an unstaged one must SKIP cleanly) |
 | [CI Deep](.github/workflows/ci-deep.yml) | monthly: long fuzz campaigns, memcheck and helgrind soaks, the nginx/angie compatibility matrix |
 | [Bump versions](.github/workflows/bump.yml) | weekly refresh of the pinned nginx/angie versions and verified archive digests |
+
+### The testkit prober leg
+
+[nginx-module-testkit](https://github.com/myguard-labs/nginx-module-testkit) is
+a separate harness repo. Its `consumer-cache-turbo` scenario boots a real nginx
+with this module and testkit's reference probe loaded side by side, then reads
+the probe's JSON to assert **per-request allocation neutrality**: two post-drain
+quiescent snapshots taken around one extra served request must show identical
+cycle-pool counters (`cycle_used`, `cycle_blocks`, `cycle_large`), worker fd
+count and master fd count.
+
+Run it locally against a sibling checkout of the harness:
+
+```sh
+git clone https://github.com/myguard-labs/nginx-module-testkit ../nginx-module-testkit
+ci/tools/testkit-stage.sh          # one configure binding BOTH modules
+ci/tools/testkit-run.sh            # the scenario, expecting real assertions
+ci/tools/testkit-run.sh --expect-skip --version 1.30.4   # the negative control
+```
+
+`testkit-stage.sh` autodetects `../nginx-module-testkit`; override with
+`--testkit DIR` or `$TESTKIT_ROOT`. It refuses to report success if a staged
+`.so` is older than the sources it was built from — a scenario loading a stale
+object would report its oracles green against code that was never built.
+
+**What it proves.** That the HIT path frees everything it allocates per
+request: no cache-entry-ref, header-copy or connection leak surviving repeated
+serves. The claim is non-vacuous by construction — the scenario first asserts a
+genuine `X-Cache: HIT`, so a pass-through filter that allocates nothing cannot
+score as "allocation-neutral".
+
+**What it does not prove.** Nothing about concurrency (the scenario runs
+`worker_processes 1`), nothing about the L2/Redis path (it configures an
+in-memory zone only), and nothing about allocations that are correctly
+per-*connection* or per-*cycle* rather than per-request. It is a leak lens, not
+a correctness lens; response-content correctness stays with the runtime suite.
+
+**Why both directions are checked.** The scenario's `requires` gate SKIPs when
+no module `.so` is staged, and `1..0 # SKIP` is a *passing* TAP plan. A
+permanently-skipping leg and a green leg are indistinguishable in a job summary
+— which is exactly why this scenario existed, finished, for a month without
+ever running. So CI asserts both that a staged tree produces real assertions
+and that an unstaged one still skips cleanly.
 
 ### Linting
 

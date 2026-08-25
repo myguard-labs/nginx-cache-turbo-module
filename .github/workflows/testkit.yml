@@ -1,0 +1,190 @@
+# sync-sha: b1dff0c3e7c45fae91594f7afb1c7997e47218be593f1525f2342d53a7f63672
+name: Testkit
+
+# The nginx-module-testkit prober leg.
+#
+# WHAT IT PROVES THAT NOTHING ELSE HERE DOES
+#   labs/nginx-module-testkit ships a finished per-request allocation-
+#   neutrality oracle for this module (scenarios/consumer-cache-turbo): two
+#   post-drain QUIESCENT probe snapshots taken around one extra served request,
+#   comparing cycle-pool counters (cycle_used, cycle_blocks, cycle_large),
+#   worker fd count and MASTER fd count. Equal across the pair means the HIT
+#   path frees everything it allocates per request -- no cache-entry-ref,
+#   header-copy or connection leak surviving repeated serves.
+#
+#   Our own runtime suite cannot make that assertion: it has no probe into the
+#   cycle pool. This is a genuinely new lens, not a second copy of an existing
+#   one -- which is the bar ci.yml's header sets for anything that consumes a
+#   pool slot.
+#
+#   The scenario is also non-vacuous by construction: oracle 2 asserts a real
+#   `X-Cache: HIT` occurred before the measured pair, so a pass-through filter
+#   allocating nothing cannot score "allocation-neutral".
+#
+# THE SKIP TRAP THIS JOB EXISTS TO CLOSE
+#   That scenario had never run once. Its ./requires gate demands a staged
+#   ngx_http_cache_turbo_module.so; nobody staged one, so it emitted
+#   `1..0 # SKIP` on every testkit CI run since it was written.
+#
+#   `1..0 # SKIP` is a PASSING TAP plan. A permanently-skipping leg and a green
+#   leg are indistinguishable in a job summary, which is exactly how a finished
+#   integration stayed disconnected for a month. So this job checks BOTH
+#   directions: the staged tree must produce real assertions (`testkit-run.sh`),
+#   AND an unstaged tree must still SKIP cleanly rather than fail
+#   (`--expect-skip`). Neither half is sufficient alone.
+#
+# COST -- measured, against ci.yml's work-bound budget
+#   ci.yml is WORK-bound, not latency-bound (its header: total work / 4 slots
+#   binds at 1001s vs a 921s critical path), and it has a documented policy of
+#   REMOVING PR-gate jobs that duplicate ci-deep.yml. So a new job must justify
+#   its slot.
+#
+#   Measured locally on the builder-class box:
+#     scenario run, tree already staged .......... 0.40s
+#     re-stage, warm ccache + reused src ......... 3.51s
+#     first cold build (fetch+configure+make) .... ~3 min, ccache-dominated
+#
+#   The oracle itself is nearly free; the cost is one nginx build that CANNOT
+#   reuse Build&Test's tree, because the prober needs testkit's ref probe
+#   compiled into the SAME objs/ (nginx binds its dynamic-module list at
+#   configure time -- there is no adding a module to a built tree). With the
+#   shared persistent ccache that build is mostly cache hits, which is why this
+#   is a PR-gate job rather than a ci-deep one. If the cold cost ever dominates
+#   a lane, demote it to ci-deep.yml rather than weakening the oracle.
+#
+# Path-gated: this leg only reads src/ and its two driver scripts. It is NOT
+# run on docs-only PRs.
+
+on:
+  workflow_call:
+    inputs:
+      skip-expensive-jobs:
+        description: "true on docs-only PRs -- the job becomes a quick no-op."
+        required: false
+        default: false
+        type: boolean
+  workflow_dispatch: {}
+
+# Distinct prefix, same shape as asan.yml/fuzzing.yml. A called workflow
+# inherits the caller's github.workflow/github.ref, so an identical group
+# string across members would make one member cancel another -- and a group
+# matching ci.yml's own would let a member cancel its caller. This also stops
+# two runs of this leg overlapping on the shared runner, which matters here
+# because both would sweep and bind the same 19392 band.
+concurrency:
+  group: testkit-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  prober:
+    name: Prober scenarios
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
+    timeout-minutes: 30
+    env:
+      # This job's port band under ci/tools/lint-ci-ports.sh. 18880/18944/19008/
+      # 19072/19136/19200/19264/19328 are taken by the eight existing
+      # runtime-bearing jobs; 19392 is the next 64-wide band and is verified
+      # below against the kernel ephemeral floor by max-port.sh.
+      #
+      # testkit-run.sh reads TEST_BASE_PORT from the environment and defaults
+      # its --port to it, so declaring the band here IS passing it -- the same
+      # arrangement coverage.sh has, and the lint knows about both.
+      TEST_BASE_PORT: 19392
+      NGINX_VERSION: "1.31.3"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      # The harness is a SIBLING REPO, not a submodule and not vendored.
+      #
+      # Vendoring was rejected: testkit's t/module/config compiles sources by
+      # relative climb out of its own tree (../../src/ngx_test_probe.c), so a
+      # partial copy does not build; and a vendored copy drifts from upstream
+      # while the port-back never happens -- which is precisely how testkit's
+      # own untracked consumers/ snapshot of THIS repo rotted a month stale.
+      #
+      # A submodule was rejected too: this repo has no .gitmodules today, and
+      # adding one changes clone/CI semantics repo-wide for a single test leg.
+      # A pinned checkout keeps the coupling local to this job.
+      - name: Check out nginx-module-testkit
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          repository: myguard-labs/nginx-module-testkit
+          # Pinned, not a floating branch: an unpinned harness means a red leg
+          # whose cause is a commit in another repo that this PR never touched.
+          # Bump deliberately, in its own PR, so the bump is what gets blamed.
+          ref: f8e09995744c4fbb3b928d14c59f99c5b9af2f7e
+          path: .testkit
+          persist-credentials: false
+
+      - name: Install build dependencies
+        if: ${{ !inputs.skip-expensive-jobs }}
+        run: |
+          sudo apt-get update
+          # openssl + zlib headers are for the PROBER CLIENT itself (its
+          # body_sha256 oracle links OpenSSL, its gunzip oracle links zlib),
+          # not for this module -- cache-turbo's Redis driver is native nginx.
+          sudo apt-get install -y build-essential ccache curl eatmydata libpcre2-dev libssl-dev zlib1g-dev
+
+      - name: Restore build caches
+        if: ${{ !inputs.skip-expensive-jobs }}
+        uses: ./.github/actions/build-cache
+        with:
+          # A distinct ccache namespace. This tree's configure differs from
+          # every other mode's (it binds two dynamic modules and carries
+          # testkit's -DNGX_TEST_HARNESS in the global CFLAGS), so sharing a
+          # namespace with `debug` would trade hits for pointless misses.
+          mode: testkit
+          nginx-version: ${{ env.NGINX_VERSION }}
+
+      - name: Sweep stale test listeners
+        if: ${{ !inputs.skip-expensive-jobs }}
+        run: |
+          # Kill leftovers from earlier crashed runs still holding test ports in
+          # THIS job's own band. Must never widen beyond it -- a wider sweep
+          # kills a SIBLING job's live fixtures on the shared runner, which is
+          # the defect AUD-CIPORT1 fixed.
+          command -v fuser >/dev/null || sudo apt-get install -y psmisc
+          for p in $(seq "$TEST_BASE_PORT" $((TEST_BASE_PORT + 63))); do
+            fuser -k -TERM "${p}/tcp" 2>/dev/null || true
+          done
+          sleep 1
+
+      - name: Verify runtime port band
+        if: ${{ !inputs.skip-expensive-jobs }}
+        run: ci/tools/max-port.sh "$TEST_BASE_PORT"
+
+      - name: Stage cache-turbo + testkit ref probe into one tree
+        if: ${{ !inputs.skip-expensive-jobs }}
+        env:
+          TESTKIT_ROOT: ${{ github.workspace }}/.testkit
+        run: ci/tools/testkit-stage.sh --version "$NGINX_VERSION"
+
+      - name: Report compiler-cache effectiveness
+        if: ${{ !inputs.skip-expensive-jobs }}
+        run: ccache --show-stats
+
+      # --- the two directions -------------------------------------------------
+      # Both are required. The pass direction alone cannot detect a regression
+      # to permanent-SKIP (that exits 0 and reads green); the skip direction
+      # alone cannot detect a broken oracle.
+      - name: Scenario asserts on a staged tree
+        if: ${{ !inputs.skip-expensive-jobs }}
+        env:
+          TESTKIT_ROOT: ${{ github.workspace }}/.testkit
+        run: ci/tools/testkit-run.sh --version "$NGINX_VERSION"
+
+      - name: Scenario SKIPs cleanly on an unstaged tree
+        if: ${{ !inputs.skip-expensive-jobs }}
+        env:
+          TESTKIT_ROOT: ${{ github.workspace }}/.testkit
+        run: |
+          # A version nothing stages. The gate must SKIP -- not fail: a missing
+          # consumer .so is an environment fact, and a red here would train
+          # people to ignore this leg.
+          ci/tools/testkit-run.sh --expect-skip --version "${NGINX_STABLE:-1.30.4}"
