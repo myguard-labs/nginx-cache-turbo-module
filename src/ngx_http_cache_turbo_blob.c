@@ -403,14 +403,18 @@ static ngx_int_t ngx_http_cache_turbo_blob_next_header(const u_char **pp,
  * the old code stored first and only failed later in serve(), poisoning the L1
  * slot with a node that could never be served.
  *
- * S231-PERF-HDRWALK: when `pool` and `refs_out` are both non-NULL, the SAME
- * walk that validates each TLV entry's framing also records its four decoded
- * fields (name/nlen/val/vlen) into a pool-allocated array of *out->nheaders
- * ngx_http_cache_turbo_blob_href_t, written to *refs_out. A caller that only
- * needs framing validation (the L2-fill decide-and-store path, the fuzz
- * harness) passes pool == NULL and gets the original walk with no allocation.
- * ngx_http_cache_turbo_restore_response() passes r->pool and consumes the
- * array directly instead of re-walking the same bytes with
+ * S231-PERF-HDRWALK: when `refs_out` is non-NULL, the SAME walk that
+ * validates each TLV entry's framing also records its four decoded fields
+ * (name/nlen/val/vlen) into an array of *out->nheaders
+ * ngx_http_cache_turbo_blob_href_t, written to *refs_out. PERF-AUD2-06: that
+ * array is the caller's `refs_buf` when non-NULL and `out->nheaders <=
+ * refs_buf_cap` (the common case -- no allocation at all), otherwise a
+ * pool-allocated array sized from `pool` (unchanged from before). A caller
+ * that only needs framing validation (the L2-fill decide-and-store path, the
+ * fuzz harness) passes pool == NULL, refs_out == NULL and gets the original
+ * walk with no allocation. ngx_http_cache_turbo_restore_response() passes a
+ * stack refs_buf plus r->pool as the fallback and consumes the array
+ * directly instead of re-walking the same bytes with
  * ngx_http_cache_turbo_blob_next_header() a second time — one walk, one set
  * of bounds checks, for every HIT. The array is bounded by nheaders, which is
  * itself bounded by headers_len <= len (each TLV entry costs >= 8 bytes), so

@@ -2357,8 +2357,10 @@ ngx_http_cache_turbo_not_modified(ngx_http_request_t *r,
  * envelope (status, Content-Length) before any per-header work starts.
  * Out-params: *bhp receives the decoded header (copied into the caller's own
  * ngx_http_cache_turbo_blob_hdr_t, so it stays valid once this stack frame
- * returns), *refsp the r->pool-owned per-header ref array from the single
- * validated walk, *bodyp / *body_lenp the body slice. Returns NGX_ERROR on a
+ * returns), *refsp the per-header ref array from the single validated walk
+ * (the caller's refs_buf when it fits, else r->pool-owned -- see
+ * blob_validate()'s refs_buf comment), *bodyp / *body_lenp the body slice.
+ * Returns NGX_ERROR on a
  * NULL blob/loc-conf or a failed blob_validate(); the caller must not use any
  * out-param when this happens. */
 static ngx_int_t
@@ -2765,7 +2767,8 @@ ngx_http_cache_turbo_restore_response(ngx_http_request_t *r, u_char *copy,
     if (ngx_http_cache_turbo_restore_response_prologue(r, copy, len, stale,
                                                         &hdr, &refs,
                                                         stack_refs,
-                                                        24,
+                                                        (sizeof(stack_refs)
+                                                         / sizeof(stack_refs[0])),
                                                         &body, &body_len)
         != NGX_OK)
     {
