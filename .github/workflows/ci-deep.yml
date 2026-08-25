@@ -690,7 +690,8 @@ jobs:
 
       - name: Run multi-worker fault-injection suite N times (fail-fast)
         env:
-          ASAN_OPTIONS: detect_leaks=0:halt_on_error=1:abort_on_error=1
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1:abort_on_error=1
+          LSAN_OPTIONS: suppressions=${{ github.workspace }}/ci/tools/lsan.supp
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
           # Instrumented latency is not a signal -- see asan.yml. An 8-iteration
           # soak multiplies the odds of a spurious per-request TimeoutError.

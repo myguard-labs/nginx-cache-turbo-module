@@ -121,7 +121,8 @@ jobs:
 
       - name: Run runtime suite under ASan and UBSan (single-process)
         env:
-          ASAN_OPTIONS: detect_leaks=0:halt_on_error=1:abort_on_error=1
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1:abort_on_error=1
+          LSAN_OPTIONS: suppressions=${{ github.workspace }}/ci/tools/lsan.supp
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
           # An instrumented build is several times slower than a plain one; the
           # default 5s per-request budget is not a real signal here, it just
@@ -224,10 +225,12 @@ jobs:
         # the SAME sanitized binary under nginx's real master + 4-worker model (no
         # --single-process), so a cross-worker shm-zone UAF / race / use of a slab
         # freed by another worker surfaces here that the 1-worker run cannot.
-        # detect_leaks=0 deliberately keeps LSan OFF: nginx frees its pools at exit,
-        # not per-request, so LSan over the worker pool is false-positive-prone with
-        # no real signal — ASan's UAF/overflow checks are the high-value part and
-        # run fully multi-worker here.
+        # LSan runs with detect_leaks=1 and ci/tools/lsan.supp, which suppresses
+        # ONLY allocations reachable from ngx_init_cycle -- nginx's config-time
+        # pool population, which `nginx -t` never tears down before exit. A leak
+        # from a request pool, a connection pool or the shared zone has no
+        # ngx_init_cycle frame and still fails this job. See the header of
+        # lsan.supp for the measurement behind that scoping.
         #
         # Wrapped in ci-hang-guard.sh for the same reason as the single-process job:
         # if the suite fails a diagnostics capture preserves nginx logs (error.log)
@@ -235,7 +238,8 @@ jobs:
         # assertion string. 1200s soft < 30-min job timeout, well above ~7 min
         # healthy run.
         env:
-          ASAN_OPTIONS: detect_leaks=0:halt_on_error=1:abort_on_error=1
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1:abort_on_error=1
+          LSAN_OPTIONS: suppressions=${{ github.workspace }}/ci/tools/lsan.supp
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
           # See the single-process job: instrumented latency is not a signal.
           TEST_CT_TIMEOUT: "30"

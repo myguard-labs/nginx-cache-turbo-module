@@ -1,0 +1,49 @@
+# LeakSanitizer suppressions for cache-turbo's ASan legs.
+#
+# WHAT IS SUPPRESSED, AND WHY IT IS NOT A LEAK
+#
+# nginx allocates its configuration out of the cycle pool (cf->pool) and frees
+# it by destroying that pool, not by freeing individual blocks. On the
+# `nginx -t` path the process exits after the config check without tearing the
+# cycle pool down, so at exit LeakSanitizer sees every config-time allocation
+# still reachable from a pool that was never destroyed.
+#
+# Every one of those reports is an INDIRECT leak -- the block is reachable from
+# the pool block, which is itself unfreed. None of them is a block whose last
+# pointer was dropped, which is what a real leak looks like.
+#
+# Measured on nginx 1.31.3, ASan build, 2026-08-25:
+#
+#   config WITHOUT any cache_turbo_backend preset:
+#     12 allocations / 120968 bytes, ZERO cache-turbo frames -- pure core
+#     (ngx_http_variables_add_core_vars, ngx_http_proxy_init_headers, ...)
+#
+#   config WITH `cache_turbo_backend wordpress`:
+#     13 allocations / 220040 bytes -- the same 12, plus one 99072-byte node
+#     array from ngx_http_cache_turbo_cookie_ac_prepare()
+#
+# That extra block is ngx_palloc(cf->pool, ...) in cookie_ac_prepare(), holding
+# the Aho-Corasick node table for the auto-Vary cookie matcher. It is owned by
+# cf->pool for the life of the configuration and is correctly never freed by
+# hand; adding a cleanup handler to release it would mean hand-managing memory
+# the pool already owns, and would still leave the 12 core reports standing.
+#
+# WHY THE KEY IS ngx_init_cycle
+#
+# ngx_init_cycle appears in all 13 stacks and in no runtime allocation -- it is
+# the config-parse entry point, called once from main() before any request is
+# served. Keying on it suppresses exactly the config-time pool population and
+# nothing else.
+#
+# This is deliberately NOT keyed on ngx_palloc / ngx_pcalloc / ngx_alloc. Those
+# are the leaf allocators for the whole server, request pools included, so
+# suppressing them would blind the ASan legs to every real leak the module
+# could introduce on the hot path. The point of this file is to keep
+# detect_leaks=1 meaningful, not to switch leak detection off -- the blunt
+# ASAN_OPTIONS=detect_leaks=0 it replaces did the latter.
+#
+# A leak in module code that is NOT reachable from the config pool -- anything
+# allocated per-request, per-connection, or from the shared zone -- still has a
+# stack without ngx_init_cycle in it and still fails the build.
+
+leak:ngx_init_cycle
