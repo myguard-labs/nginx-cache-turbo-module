@@ -90,7 +90,7 @@ ngx_http_cache_turbo_purge_auto_vary(ngx_http_request_t *r,
     {
         ngx_http_cache_turbo_blob_hdr_t  mh;
         if (ngx_http_cache_turbo_blob_validate(m->data, m->len, &mh,
-                NULL, NULL, NULL, NULL) == NGX_OK)
+                NULL, NULL, NULL, NULL, NULL, 0) == NGX_OK)
         {
             have_marker = 1;
             bits = m->data[NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE];

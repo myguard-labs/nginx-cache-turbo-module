@@ -424,7 +424,8 @@ ngx_int_t
 ngx_http_cache_turbo_blob_validate(const u_char *blob, size_t len,
     ngx_http_cache_turbo_blob_hdr_t *out, const u_char **hdr_block,
     const u_char **body, ngx_pool_t *pool,
-    ngx_http_cache_turbo_blob_href_t **refs_out)
+    ngx_http_cache_turbo_blob_href_t **refs_out,
+    ngx_http_cache_turbo_blob_href_t *refs_buf, ngx_uint_t refs_buf_cap)
 {
     const u_char                      *p, *end;
     uint32_t                           i;
@@ -544,11 +545,24 @@ ngx_http_cache_turbo_blob_validate(const u_char *blob, size_t len,
      * platforms. ngx_palloc() rounds up to NGX_ALIGNMENT before handing back
      * memory, exactly like any other pointer-bearing struct allocated from
      * this pool. */
-    if (pool != NULL && refs_out != NULL && out->nheaders > 0) {
-        refs = ngx_palloc(pool,
-                   out->nheaders * sizeof(ngx_http_cache_turbo_blob_href_t));
-        if (refs == NULL) {
-            return NGX_ERROR;
+    if (refs_out != NULL && out->nheaders > 0) {
+        /* PERF-AUD2-06: prefer the caller's stack array when it is big
+         * enough -- refs never outlives this validate+restore call (see the
+         * refs_buf caller for the lifetime argument), so a pool allocation
+         * is pure overhead for the common case. Same NGX_ALIGNMENT
+         * reasoning as the ngx_palloc() path below: refs_buf must be an
+         * actual ngx_http_cache_turbo_blob_href_t array (never a
+         * u_char/ngx_pnalloc buffer cast to this type), which every caller
+         * satisfies by declaring it as a typed local. */
+        if (refs_buf != NULL && out->nheaders <= refs_buf_cap) {
+            refs = refs_buf;
+
+        } else if (pool != NULL) {
+            refs = ngx_palloc(pool,
+                       out->nheaders * sizeof(ngx_http_cache_turbo_blob_href_t));
+            if (refs == NULL) {
+                return NGX_ERROR;
+            }
         }
     }
 
@@ -577,7 +591,7 @@ ngx_http_cache_turbo_blob_validate(const u_char *blob, size_t len,
 
     if (hdr_block) { *hdr_block = blob + NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE; }
     if (body)      { *body = end; }
-    if (pool != NULL && refs_out != NULL) { *refs_out = refs; }
+    if (refs_out != NULL) { *refs_out = refs; }
     return NGX_OK;
 }
 

@@ -1942,7 +1942,7 @@ ngx_http_cache_turbo_access_l2_marker_consume(ngx_http_request_t *r,
     if (ctx->l2_result == NGX_OK && ctx->l2_blob != NULL
         && ctx->l2_blob_len >= NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE + 1
         && ngx_http_cache_turbo_blob_validate(ctx->l2_blob, ctx->l2_blob_len,
-               &bh, NULL, NULL, NULL, NULL) == NGX_OK
+               &bh, NULL, NULL, NULL, NULL, NULL, 0) == NGX_OK
         /* P3-5 (codex-review MINOR): blob_validate() proves generic object
          * framing (magic/version/status/TTL ordering), NOT that this blob IS
          * a marker -- an ordinary captured response happens to satisfy every
@@ -2513,7 +2513,7 @@ ngx_http_cache_turbo_access_l2(ngx_http_request_t *r,
 
         if (ngx_http_cache_turbo_blob_validate(ctx->l2_blob, ctx->l2_blob_len,
                                                &bh, NULL, NULL,
-                                               NULL, NULL) == NGX_OK)
+                                               NULL, NULL, NULL, 0) == NGX_OK)
         {
             time_t  age, rem_fresh, rem_stale;
 
