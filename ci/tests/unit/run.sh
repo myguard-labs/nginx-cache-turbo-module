@@ -143,6 +143,19 @@ else
     echo "::warning::clang not found — auto-classify/L2 fixtures NOT run"
 fi
 
+# --- stripe resolver arithmetic at a FORCED N > 1 (P4-2-s3b/s3c) ----------
+# NGX_HTTP_CACHE_TURBO_STRIPES is pinned at 1, and at N == 1 `anything % 1 == 0`
+# -- so on the shipped module a resolver that ignores its key, inverts its
+# modulo, or is a copy of the zone-wide one is INDISTINGUISHABLE from a correct
+# one, and every runtime test stays green. This compiles the PRODUCTION
+# resolver bodies (sliced by extract_stripe_resolver.sh, never mirrored) at a
+# forced N of 8 and 7, where the arithmetic is finally observable. Hermetic:
+# no nginx tree, so it runs in the Validation job too.
+bash "$DIR/extract_stripe_resolver.sh"
+# shellcheck disable=SC2086
+"$CC" $CFLAGS "$DIR/test_stripe_resolver.c" -o "$DIR/test_stripe_resolver"
+"$DIR/test_stripe_resolver"
+
 # --- shm node state machine (CR-A / CR-B guards) --------------------------
 # Unlike the pure-math tests these link nginx's real ngx_rbtree.c, so they need
 # a CONFIGURED nginx source tree (objs/ngx_auto_config.h exists only after

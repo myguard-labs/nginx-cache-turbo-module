@@ -41,6 +41,8 @@ ci/tests/unit/test_vary_marker_fastpath
 ci/tests/unit/test_ae_class_guard
 ci/tests/unit/test_ae_class_guard.san
 ci/tests/unit/test_vary_encoding_collapse
+ci/tests/unit/test_stripe_resolver
+ci/tests/unit/generated_stripe_resolver.inc
 
 # Fuzzing build artifacts (seed corpus IS tracked; everything else is not)
 ci/fuzz/fuzz_resp_parser

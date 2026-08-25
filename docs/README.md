@@ -8,6 +8,10 @@ The cross-preset [review and deployment checklist](preset-review.md) compares
 all rule types, records the registry-wide verification result, and identifies
 which assumptions still have to be checked on a live installation.
 
+Internals: [stripe-seam.md](stripe-seam.md) classifies every shared-memory call
+site as key-directed or zone-wide, and records what the per-stripe pool carving
+(s3c) still owes before `NGX_HTTP_CACHE_TURBO_STRIPES` can exceed 1.
+
 ## CMS / application presets
 
 One page per `cache_turbo_backend` preset:
