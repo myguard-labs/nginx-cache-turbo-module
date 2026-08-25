@@ -28,13 +28,16 @@
 
 /* --- P4-1a W-TinyLFU sketch constants. Declared here rather than beside the
  * helpers below because _shm_init_zone() sizes and allocates the sketch and
- * sits above them. --- */
-
-/* Four rows is the standard count-min depth for this use: the estimate is the
- * min of four independent hashes, so a single unlucky collision is masked by
- * the other three. More rows buy little at 4-bit precision and cost a linear
- * multiple of the memory and of the halving pass. */
-#define NGX_HTTP_CACHE_TURBO_SKETCH_ROWS        4
+ * sits above them. ---
+ *
+ * NGX_HTTP_CACHE_TURBO_SKETCH_ROWS itself now lives in module.h (PERF-AUD2-11:
+ * callers outside this TU need it to size the row-hash array they pass into
+ * sketch_bump()/sketch_estimate()); the constant here is the same one, just
+ * no longer redeclared -- four rows is still the standard count-min depth for
+ * this use: the estimate is the min of four independent hashes, so a single
+ * unlucky collision is masked by the other three. More rows buy little at
+ * 4-bit precision and cost a linear multiple of the memory and of the
+ * halving pass. */
 
 /* 4-bit counters saturate here. Small on purpose: TinyLFU only needs to RANK
  * a candidate against a victim, not to count exactly, and 15 with periodic
@@ -541,6 +544,27 @@ ngx_http_cache_turbo_sketch_row_hash(uint32_t hash, ngx_uint_t row)
 }
 
 
+/* PERF-AUD2-11: compute all NGX_HTTP_CACHE_TURBO_SKETCH_ROWS row-hashes for
+ * one `hash` in a single pass. sketch_bump()/sketch_estimate() each used to
+ * call ngx_http_cache_turbo_sketch_row_hash() fresh, per row, INSIDE the
+ * zone-mutex critical section they run in -- 4 rounds of fmix32 (3 multiplies
+ * + 3 shifts per round) that depend only on `hash` and `row`, both known to
+ * the caller before this call. Computing the array once and threading it
+ * through removes the recompute from the two hot per-row loops below; the
+ * fmix32 avalanche work itself is unavoidable (it is what makes the four
+ * rows independent-enough), only the redundant re-derivation is removed. */
+static ngx_inline void
+ngx_http_cache_turbo_sketch_rows(uint32_t hash,
+    uint32_t rows[NGX_HTTP_CACHE_TURBO_SKETCH_ROWS])
+{
+    ngx_uint_t  row;
+
+    for (row = 0; row < NGX_HTTP_CACHE_TURBO_SKETCH_ROWS; row++) {
+        rows[row] = ngx_http_cache_turbo_sketch_row_hash(hash, row);
+    }
+}
+
+
 /* Read one 4-bit counter. `idx` is a counter index across the whole flat
  * array (row offset already applied), NOT a byte index: two counters share a
  * byte, the even index in the LOW nibble and the odd index in the HIGH one. */
@@ -597,7 +621,10 @@ ngx_http_cache_turbo_sketch_halve(ngx_http_cache_turbo_zone_t *z)
 }
 
 
-/* Record one access to `hash`.
+/* Record one access to the key whose row-hashes are `rows` (see
+ * ngx_http_cache_turbo_sketch_rows() above -- PERF-AUD2-11: the caller
+ * computes this array once, before/outside this call, instead of the four
+ * fmix32 avalanches happening fresh inside this critical section).
  *
  * A no-op when the sketch could not be allocated -- see the module.h field
  * block: NULL means "estimate unavailable", never an error.
@@ -606,7 +633,7 @@ ngx_http_cache_turbo_sketch_halve(ngx_http_cache_turbo_zone_t *z)
  */
 void
 ngx_http_cache_turbo_shm_sketch_bump(ngx_http_cache_turbo_zone_t *z,
-    uint32_t hash)
+    const uint32_t rows[NGX_HTTP_CACHE_TURBO_SKETCH_ROWS])
 {
     ngx_uint_t  row, idx, width;
 
@@ -617,8 +644,7 @@ ngx_http_cache_turbo_shm_sketch_bump(ngx_http_cache_turbo_zone_t *z,
     width = ngx_http_cache_turbo_zone_sh(z)->sketch_width;
 
     for (row = 0; row < NGX_HTTP_CACHE_TURBO_SKETCH_ROWS; row++) {
-        idx = row * width
-              + (ngx_http_cache_turbo_sketch_row_hash(hash, row) & (width - 1));
+        idx = row * width + (rows[row] & (width - 1));
 
         ngx_http_cache_turbo_sketch_inc(ngx_http_cache_turbo_zone_sh(z)->sketch, idx);
     }
@@ -633,7 +659,9 @@ ngx_http_cache_turbo_shm_sketch_bump(ngx_http_cache_turbo_zone_t *z,
 }
 
 
-/* Estimated access frequency of `hash`, 0..SKETCH_MAX.
+/* Estimated access frequency of the key whose row-hashes are `rows`,
+ * 0..SKETCH_MAX. See ngx_http_cache_turbo_sketch_rows() -- PERF-AUD2-11,
+ * same rationale as sketch_bump() above.
  *
  * The MIN across the rows: a count-min sketch's error is one-sided, so this
  * can over-estimate on a collision but never under-estimate. Returns 0 when
@@ -644,7 +672,7 @@ ngx_http_cache_turbo_shm_sketch_bump(ngx_http_cache_turbo_zone_t *z,
  */
 ngx_uint_t
 ngx_http_cache_turbo_shm_sketch_estimate(ngx_http_cache_turbo_zone_t *z,
-    uint32_t hash)
+    const uint32_t rows[NGX_HTTP_CACHE_TURBO_SKETCH_ROWS])
 {
     ngx_uint_t  row, idx, v, min, width;
 
@@ -656,8 +684,7 @@ ngx_http_cache_turbo_shm_sketch_estimate(ngx_http_cache_turbo_zone_t *z,
     min = NGX_HTTP_CACHE_TURBO_SKETCH_MAX;
 
     for (row = 0; row < NGX_HTTP_CACHE_TURBO_SKETCH_ROWS; row++) {
-        idx = row * width
-              + (ngx_http_cache_turbo_sketch_row_hash(hash, row) & (width - 1));
+        idx = row * width + (rows[row] & (width - 1));
 
         v = ngx_http_cache_turbo_sketch_get(ngx_http_cache_turbo_zone_sh(z)->sketch, idx);
 
@@ -849,8 +876,16 @@ ngx_http_cache_turbo_shm_touch_lru(ngx_http_cache_turbo_zone_t *z,
      * `ctn->node.key` no longer equals crc32(key) once the rbtree key is
      * derived from key_hash instead. Every caller of this function already
      * has the real hash in scope (it is how it found `ctn` in the first
-     * place), so it is threaded straight through rather than recomputed. */
-    ngx_http_cache_turbo_shm_sketch_bump(z, hash);
+     * place), so it is threaded straight through rather than recomputed.
+     *
+     * PERF-AUD2-11: derive the 4 row-hashes once here rather than letting
+     * sketch_bump() recompute them internally from `hash`. */
+    {
+        uint32_t  rows[NGX_HTTP_CACHE_TURBO_SKETCH_ROWS];
+
+        ngx_http_cache_turbo_sketch_rows(hash, rows);
+        ngx_http_cache_turbo_shm_sketch_bump(z, rows);
+    }
 
     /* P1 coarse gate: at most one LRU write per node per second. Deliberately
      * the SAME gate that governed the flat re-splice -- S8 adds no second
@@ -1009,6 +1044,7 @@ ngx_http_cache_turbo_shm_admit(ngx_http_cache_turbo_zone_t *z, uint32_t hash)
     ngx_queue_t                  *q;
     ngx_http_cache_turbo_node_t  *victim;
     ngx_uint_t                    cand_freq, victim_freq;
+    uint32_t                      rows[NGX_HTTP_CACHE_TURBO_SKETCH_ROWS];
 
     if (!ngx_http_cache_turbo_zone_sh(z)->admission) {
         return 1;                    /* policy off: the shipped default */
@@ -1030,7 +1066,14 @@ ngx_http_cache_turbo_shm_admit(ngx_http_cache_turbo_zone_t *z, uint32_t hash)
     q = ngx_queue_last(&ngx_http_cache_turbo_zone_sh(z)->lru);
     victim = ngx_queue_data(q, ngx_http_cache_turbo_node_t, lru);
 
-    cand_freq   = ngx_http_cache_turbo_shm_sketch_estimate(z, hash);
+    /* PERF-AUD2-11: derive each hash's 4 row-hashes once and pass the array
+     * in, rather than letting sketch_estimate() recompute them internally --
+     * the candidate's `hash` and the victim's `hash_crc32` are two distinct
+     * values, so this is two separate row-hash derivations, each now
+     * computed exactly once instead of once per row inside the estimate
+     * call. */
+    ngx_http_cache_turbo_sketch_rows(hash, rows);
+    cand_freq   = ngx_http_cache_turbo_shm_sketch_estimate(z, rows);
     /* C4: the sketch is populated (touch_lru's sketch_bump) and queried
      * (`hash` just above) in real-crc32 space, never in the widened rbtree
      * key's space -- `victim->node.key` stopped being that crc32 once the
@@ -1039,11 +1082,21 @@ ngx_http_cache_turbo_shm_admit(ngx_http_cache_turbo_zone_t *z, uint32_t hash)
      * requery the sketch at an unrelated 32-bit value: not a truncation of
      * the SAME number, a DIFFERENT one, drawn from the low 32 bits of an
      * 8-byte prefix of key_hash rather than from the candidate's hash space
-     * at all. The node's full 32-byte key is right here on `victim`, so
-     * recompute the real crc32 from it rather than reuse a stale/foreign
-     * value nobody has in scope. */
-    victim_freq = ngx_http_cache_turbo_shm_sketch_estimate(z,
-                      ngx_crc32_short(victim->key, 32));
+     * at all.
+     *
+     * PERF-AUD2-10: every node-init site (store_locked/claim_locked/
+     * count_miss_locked/l2_neg_set) now stamps ctn->hash_crc32 with exactly
+     * this value at creation time -- the same `hash` parameter each of them
+     * already received and previously discarded, which by construction
+     * equals ngx_crc32_short(key, 32) for that node's own `key` (every
+     * caller of the public store/claim/count_miss/l2_neg_set entry points
+     * derives `hash` from the same key_hash via ngx_crc32_short() before
+     * calling; see shm_touch_lru()'s C4 comment for the same invariant used
+     * on the candidate side). Reading it back here is therefore
+     * byte-identical to the recompute it replaces, without the 32-byte
+     * ngx_memcmp-per-level rbtree-adjacent crc32 pass under the lock. */
+    ngx_http_cache_turbo_sketch_rows(victim->hash_crc32, rows);
+    victim_freq = ngx_http_cache_turbo_shm_sketch_estimate(z, rows);
 
     if (cand_freq < victim_freq) {
         ngx_http_cache_turbo_zone_sh(z)->admission_refused++;
@@ -1364,23 +1417,48 @@ ngx_http_cache_turbo_shm_purge_all(ngx_http_cache_turbo_zone_t *z)
  * acquisition that performs the write, closing the check-then-act window a
  * separate lookup-then-store pair leaves open. Behaviour is byte-identical
  * to the pre-refactor store(): every `unlock; return X` below is exactly
- * where store()'s used to be, now just `return X`. */
+ * where store()'s used to be, now just `return X`.
+ *
+ * PERF-AUD2-09: `ctn` is a caller-resolved lookup result, exactly the same
+ * shape S231-PERF-MISSLOCKS gave count_miss_locked()/claim_locked() --
+ * see those functions' own comments for the pattern this follows. A caller
+ * that already did its own ngx_http_cache_turbo_shm_lookup() under the SAME
+ * lock hold (store_marker(), store_if()) passes that result straight
+ * through instead of this function repeating the rbtree descent for a key
+ * it already resolved a moment earlier. A caller with no prior lookup
+ * (store()) passes NULL and this function does its own, exactly as before
+ * -- the NULL branch below is byte-identical to the old unconditional
+ * lookup.
+ *
+ * `out_ctn`, if non-NULL, receives the node this call wrote on NGX_OK (the
+ * refreshed resident node, or the freshly allocated one) -- unset on every
+ * other return. store_marker() uses this to retag `kind` on the node it
+ * just wrote without a THIRD lookup: the refresh path reuses the same `ctn`
+ * the caller passed in, and the new-entry path allocates one the caller had
+ * no way to already hold. Pass NULL to skip (store()/store_if() have no use
+ * for it -- neither retags the node after the write). Every read/mutate/
+ * return past this point is otherwise untouched: only where `ctn` comes
+ * from, and this one extra out-write on the OK paths, changed. */
 static ngx_int_t
 ngx_http_cache_turbo_shm_store_locked(ngx_http_cache_turbo_zone_t *z,
     u_char *key_hash, uint32_t hash, u_char *data, size_t len,
-    time_t fresh_ttl, time_t stale_ttl)
+    time_t fresh_ttl, time_t stale_ttl, ngx_http_cache_turbo_node_t *ctn,
+    ngx_http_cache_turbo_node_t **out_ctn)
 {
     u_char                       *body;
     time_t                        now;
-    ngx_http_cache_turbo_node_t  *ctn;
 
     /* fresh_ttl may be <= 0 (object already stale on an L2 fill) — fresh_until
      * then lands in the past and the node is served via the stale path. stale_ttl
      * is the absolute serveable window from now (0 = no stale serving). */
     now = ngx_time();
 
-    /* Already present? Update in place (refresh path). */
-    ctn = ngx_http_cache_turbo_shm_lookup(z, key_hash, hash);
+    /* Already present? Update in place (refresh path). PERF-AUD2-09: only
+     * look it up ourselves when the caller did not already hand us the
+     * result of one under this same lock hold. */
+    if (ctn == NULL) {
+        ctn = ngx_http_cache_turbo_shm_lookup(z, key_hash, hash);
+    }
 
     if (ctn) {
         /* Detach ctn from the LRU *before* any eviction. shm_evict_one() frees
@@ -1447,6 +1525,10 @@ ngx_http_cache_turbo_shm_store_locked(ngx_http_cache_turbo_zone_t *z,
 
         ngx_http_cache_turbo_lru_link_head(z, ctn);
 
+        if (out_ctn != NULL) {
+            *out_ctn = ctn;
+        }
+
         return NGX_OK;
     }
 
@@ -1498,10 +1580,15 @@ ngx_http_cache_turbo_shm_store_locked(ngx_http_cache_turbo_zone_t *z,
     ctn->l2_neg_until = 0;       /* L13: no memo on an ENTRY */
     ctn->last_access = now;      /* P1: fresh at LRU head */
     ctn->promotable = 0;         /* S8: unproven; second touch promotes */
+    ctn->hash_crc32 = hash;      /* PERF-AUD2-10: save the recompute */
 
     ngx_rbtree_insert(&ngx_http_cache_turbo_zone_sh(z)->rbtree, &ctn->node);
     /* S8: every new node enters PROBATION (see lru_insert_new). */
     ngx_http_cache_turbo_lru_insert_new(z, ctn);
+
+    if (out_ctn != NULL) {
+        *out_ctn = ctn;
+    }
 
     return NGX_OK;
 }
@@ -1516,7 +1603,8 @@ ngx_http_cache_turbo_shm_store(ngx_http_cache_turbo_zone_t *z,
 
     ngx_shmtx_lock(ngx_http_cache_turbo_zone_mutex(z));
     rc = ngx_http_cache_turbo_shm_store_locked(z, key_hash, hash, data, len,
-                                                fresh_ttl, stale_ttl);
+                                                fresh_ttl, stale_ttl, NULL,
+                                                NULL);
     ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
 
     return rc;
@@ -1550,6 +1638,7 @@ ngx_http_cache_turbo_shm_store_marker(ngx_http_cache_turbo_zone_t *z,
     ngx_int_t                     rc;
     ngx_uint_t                    was_marker;
     ngx_http_cache_turbo_node_t  *ctn;
+    ngx_http_cache_turbo_node_t  *written;
 
     ngx_shmtx_lock(ngx_http_cache_turbo_zone_mutex(z));
 
@@ -1557,11 +1646,20 @@ ngx_http_cache_turbo_shm_store_marker(ngx_http_cache_turbo_zone_t *z,
     was_marker = (ctn != NULL
                   && ctn->kind == NGX_HTTP_CACHE_TURBO_NODE_MARKER);
 
+    /* PERF-AUD2-09: pass this same lookup straight into store_locked() (its
+     * refresh path reuses the identical node, its new-entry path ignores a
+     * non-NULL `ctn` argument since `ctn` here is NULL on that path anyway --
+     * see store_locked()'s own comment) and take back a pointer to whatever
+     * node it wrote via `written`, closing the second rbtree descent that
+     * used to sit here as a THIRD post-store lookup for the exact key this
+     * function already resolved (or is about to create) under the same
+     * lock hold. */
     rc = ngx_http_cache_turbo_shm_store_locked(z, key_hash, hash, data, len,
-                                                fresh_ttl, stale_ttl);
+                                                fresh_ttl, stale_ttl, ctn,
+                                                &written);
 
     if (rc == NGX_OK) {
-        ctn = ngx_http_cache_turbo_shm_lookup(z, key_hash, hash);
+        ctn = written;
 
         if (ctn != NULL) {
             ctn->kind = NGX_HTTP_CACHE_TURBO_NODE_MARKER;
@@ -1642,8 +1740,12 @@ ngx_http_cache_turbo_shm_store_if(ngx_http_cache_turbo_zone_t *z,
         return NGX_DECLINED;
     }
 
+    /* PERF-AUD2-09: reuse this function's own predicate-check lookup instead
+     * of store_locked() repeating the rbtree descent for the same key under
+     * the same lock hold. */
     rc = ngx_http_cache_turbo_shm_store_locked(z, key_hash, hash, data, len,
-                                                fresh_ttl, stale_ttl);
+                                                fresh_ttl, stale_ttl, ctn,
+                                                NULL);
     ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
 
     return rc;
@@ -1920,6 +2022,7 @@ ngx_http_cache_turbo_shm_claim_locked(ngx_http_cache_turbo_zone_t *z,
     ctn->l2_neg_until = 0;       /* brand-new node: no memo to preserve */
     ctn->last_access = now;      /* P1: init the coarse LRU stamp */
     ctn->promotable = 0;         /* S8: unproven; second touch promotes */
+    ctn->hash_crc32 = hash;      /* PERF-AUD2-10: save the recompute */
 
     ngx_rbtree_insert(&ngx_http_cache_turbo_zone_sh(z)->rbtree, &ctn->node);
     /* S8: every new node enters PROBATION (see lru_insert_new). */
@@ -2267,6 +2370,7 @@ ngx_http_cache_turbo_shm_count_miss_locked(ngx_http_cache_turbo_zone_t *z,
     ctn->l2_neg_until = 0;       /* L13: no memo yet; l2_neg_set stamps it */
     ctn->last_access = now;      /* P1: init the coarse LRU stamp */
     ctn->promotable = 0;         /* S8: unproven; second touch promotes */
+    ctn->hash_crc32 = hash;      /* PERF-AUD2-10: save the recompute */
 
     ngx_rbtree_insert(&ngx_http_cache_turbo_zone_sh(z)->rbtree, &ctn->node);
     /* S8: every new node enters PROBATION (see lru_insert_new). */
@@ -2468,6 +2572,7 @@ ngx_http_cache_turbo_shm_l2_neg_set(ngx_http_cache_turbo_zone_t *z,
     ctn->l2_neg_until = now + ttl;
     ctn->last_access = now;      /* P1: init the coarse LRU stamp */
     ctn->promotable = 0;         /* S8: unproven; second touch promotes */
+    ctn->hash_crc32 = hash;      /* PERF-AUD2-10: save the recompute */
 
     ngx_rbtree_insert(&ngx_http_cache_turbo_zone_sh(z)->rbtree, &ctn->node);
     /* S8: every new node enters PROBATION (see lru_insert_new). */

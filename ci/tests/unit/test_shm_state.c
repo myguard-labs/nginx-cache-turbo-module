@@ -83,6 +83,7 @@ typedef struct {
     ngx_uint_t          promotable;
     unsigned            sie_spared:1;  /* S231-EVICT-BLIND second-chance bit */
     unsigned            varidx_pending:1; /* COR-5(b) variant-index self-heal */
+    uint32_t            hash_crc32;    /* PERF-AUD2-10: cached crc32(key, 32) */
     ngx_queue_t         lru;
 } ngx_http_cache_turbo_node_t;
 
@@ -4764,6 +4765,37 @@ sketch_attach(void)
 }
 
 
+/* PERF-AUD2-11: production sketch_bump()/sketch_estimate() now take a
+ * caller-precomputed row-hash array (ngx_http_cache_turbo_sketch_rows(),
+ * extracted verbatim above) instead of a raw `hash` -- the row-hash
+ * derivation moved to the two hot call sites (touch_lru, admit) so it is
+ * not redone inside the critical section. Every test below still reasons in
+ * terms of a single `uint32_t hash` (that is the honest oracle for a
+ * count-min sketch: two different hashes only collide if fmix32 actually
+ * collides them, which these thin wrappers still exercise end-to-end via
+ * the real ngx_http_cache_turbo_sketch_rows()), so wrap the new two-call
+ * shape here rather than rewrite ~40 call sites to each carry their own
+ * local array. */
+static void
+test_sketch_bump(uint32_t hash)
+{
+    uint32_t  rows[NGX_HTTP_CACHE_TURBO_SKETCH_ROWS];
+
+    ngx_http_cache_turbo_sketch_rows(hash, rows);
+    ngx_http_cache_turbo_shm_sketch_bump(&g_zone, rows);
+}
+
+
+static ngx_uint_t
+test_sketch_estimate(uint32_t hash)
+{
+    uint32_t  rows[NGX_HTTP_CACHE_TURBO_SKETCH_ROWS];
+
+    ngx_http_cache_turbo_sketch_rows(hash, rows);
+    return ngx_http_cache_turbo_shm_sketch_estimate(&g_zone, rows);
+}
+
+
 /* A NULL sketch must be a supported state end-to-end: bump is a silent no-op
  * and estimate answers 0 ("no evidence"), never a crash and never a nonzero
  * that stage 2 could mistake for a real observation. */
@@ -4776,10 +4808,10 @@ test_p4_1a_null_sketch_degrades_gracefully(void)
 
     /* Would segfault on a NULL deref if the guard were missing -- that IS the
      * assertion; reaching the next line at all is the pass. */
-    ngx_http_cache_turbo_shm_sketch_bump(&g_zone, 0x1234abcdu);
-    ngx_http_cache_turbo_shm_sketch_bump(&g_zone, 0x1234abcdu);
+    test_sketch_bump(0x1234abcdu);
+    test_sketch_bump(0x1234abcdu);
 
-    CHECK(ngx_http_cache_turbo_shm_sketch_estimate(&g_zone, 0x1234abcdu) == 0,
+    CHECK(test_sketch_estimate(0x1234abcdu) == 0,
           "P4-1a: estimate on an unallocated sketch must be 0, not a "
           "fabricated count");
 
@@ -4805,31 +4837,31 @@ test_p4_1a_saturates_at_fifteen(void)
     zone_reset();
     sketch_attach();
 
-    CHECK(ngx_http_cache_turbo_shm_sketch_estimate(&g_zone, h) == 0,
+    CHECK(test_sketch_estimate(h) == 0,
           "P4-1a: a fresh sketch reported a nonzero estimate");
 
     /* Exact tracking below the ceiling. Not merely "it went up": an increment
      * that added 2, or that bumped only one row, would still be monotonic. */
     for (i = 1; i <= NGX_HTTP_CACHE_TURBO_SKETCH_MAX; i++) {
-        ngx_http_cache_turbo_shm_sketch_bump(&g_zone, h);
+        test_sketch_bump(h);
 
-        if (ngx_http_cache_turbo_shm_sketch_estimate(&g_zone, h) != i) {
+        if (test_sketch_estimate(h) != i) {
             CHECK(0, "P4-1a: estimate does not track the bump count exactly");
             break;
         }
     }
 
-    CHECK(ngx_http_cache_turbo_shm_sketch_estimate(&g_zone, h)
+    CHECK(test_sketch_estimate(h)
               == NGX_HTTP_CACHE_TURBO_SKETCH_MAX,
           "P4-1a: did not reach the 4-bit ceiling after MAX bumps");
 
     /* Well past the ceiling: 4 bits wrap after 16, so a non-saturating
      * increment shows up here as a small number, most damagingly as 0. */
     for (i = 0; i < 64; i++) {
-        ngx_http_cache_turbo_shm_sketch_bump(&g_zone, h);
+        test_sketch_bump(h);
     }
 
-    CHECK(ngx_http_cache_turbo_shm_sketch_estimate(&g_zone, h)
+    CHECK(test_sketch_estimate(h)
               == NGX_HTTP_CACHE_TURBO_SKETCH_MAX,
           "P4-1a: 4-bit counter wrapped instead of saturating -- the hottest "
           "key in the zone now reads as the coldest");
@@ -4902,11 +4934,11 @@ test_p4_1a_estimate_is_min_across_rows(void)
     zone_reset();
     sketch_attach();
 
-    ngx_http_cache_turbo_shm_sketch_bump(&g_zone, h);
-    ngx_http_cache_turbo_shm_sketch_bump(&g_zone, h);
-    ngx_http_cache_turbo_shm_sketch_bump(&g_zone, h);
+    test_sketch_bump(h);
+    test_sketch_bump(h);
+    test_sketch_bump(h);
 
-    CHECK(ngx_http_cache_turbo_shm_sketch_estimate(&g_zone, h) == 3,
+    CHECK(test_sketch_estimate(h) == 3,
           "P4-1a: fixture did not reach 3 before poisoning");
 
     /* Raise EVERY row except one to the ceiling. If estimate() were max or
@@ -4928,7 +4960,7 @@ test_p4_1a_estimate_is_min_across_rows(void)
     CHECK(poisoned == NGX_HTTP_CACHE_TURBO_SKETCH_ROWS - 1,
           "P4-1a: fixture poisoned the wrong number of rows");
 
-    CHECK(ngx_http_cache_turbo_shm_sketch_estimate(&g_zone, h) == 3,
+    CHECK(test_sketch_estimate(h) == 3,
           "P4-1a: estimate is not the MIN across rows -- one collided row "
           "now dominates the answer");
 
@@ -4940,7 +4972,7 @@ test_p4_1a_estimate_is_min_across_rows(void)
     g_sh.sketch[idx >> 1] = (u_char) (g_sh.sketch[idx >> 1]
                                       & ((idx & 1) ? 0x0f : 0xf0));
 
-    CHECK(ngx_http_cache_turbo_shm_sketch_estimate(&g_zone, h) == 0,
+    CHECK(test_sketch_estimate(h) == 0,
           "P4-1a: zeroing the minimum row did not lower the estimate");
 }
 
@@ -4965,14 +4997,14 @@ test_p4_1a_halving_ages_the_sketch(void)
 
     /* 10 bumps for `hot`, 2 for `warm` = 12 ops, below the threshold. */
     for (i = 0; i < 10; i++) {
-        ngx_http_cache_turbo_shm_sketch_bump(&g_zone, hot);
+        test_sketch_bump(hot);
     }
     for (i = 0; i < 2; i++) {
-        ngx_http_cache_turbo_shm_sketch_bump(&g_zone, warm);
+        test_sketch_bump(warm);
     }
 
-    before_hot  = ngx_http_cache_turbo_shm_sketch_estimate(&g_zone, hot);
-    before_warm = ngx_http_cache_turbo_shm_sketch_estimate(&g_zone, warm);
+    before_hot  = test_sketch_estimate(hot);
+    before_warm = test_sketch_estimate(warm);
 
     CHECK(before_hot == 10 && before_warm == 2,
           "P4-1a: fixture did not reach the expected pre-aging counts");
@@ -4984,7 +5016,7 @@ test_p4_1a_halving_ages_the_sketch(void)
     /* Drive ops to exactly the threshold with a third, unrelated key. The
      * 20th of these is the bump that trips the halving. */
     for (i = 0; i < 20; i++) {
-        ngx_http_cache_turbo_shm_sketch_bump(&g_zone, 0xcccc0000u + i);
+        test_sketch_bump(0xcccc0000u + i);
     }
 
     CHECK(g_sh.sketch_gen == 1,
@@ -4994,12 +5026,12 @@ test_p4_1a_halving_ages_the_sketch(void)
 
     /* Every counter >>= 1, so both keys halve (10 -> 5, 2 -> 1) and, crucially,
      * their ORDER survives: aging must decay history, not scramble it. */
-    CHECK(ngx_http_cache_turbo_shm_sketch_estimate(&g_zone, hot) == 5,
+    CHECK(test_sketch_estimate(hot) == 5,
           "P4-1a: the hot key's estimate did not halve");
-    CHECK(ngx_http_cache_turbo_shm_sketch_estimate(&g_zone, warm) == 1,
+    CHECK(test_sketch_estimate(warm) == 1,
           "P4-1a: the warm key's estimate did not halve");
-    CHECK(ngx_http_cache_turbo_shm_sketch_estimate(&g_zone, hot)
-              > ngx_http_cache_turbo_shm_sketch_estimate(&g_zone, warm),
+    CHECK(test_sketch_estimate(hot)
+              > test_sketch_estimate(warm),
           "P4-1a: halving inverted or flattened the frequency ordering");
 }
 
@@ -5024,7 +5056,7 @@ test_p4_1a_halving_does_not_bleed_across_nibbles(void)
 
     /* Trip the halving deterministically. */
     g_sh.sketch_reset_at = 1;
-    ngx_http_cache_turbo_shm_sketch_bump(&g_zone, 0x5eed0001u);
+    test_sketch_bump(0x5eed0001u);
 
     CHECK(g_sh.sketch_gen == 1, "P4-1a: fixture failed to trigger a halving");
 
@@ -5111,9 +5143,6 @@ admit_seat_victim(int n, ngx_uint_t freq)
     ngx_uint_t  i;
     uint32_t    real_hash;
 
-    ngx_http_cache_turbo_shm_count_miss(&g_zone, KEY(n), 4, 0);
-    REQUIRE(find(n) != NULL, "fixture: count_miss did not create the victim");
-
     /* C4: shm_admit() recomputes the victim's real crc32 from its full
      * 32-byte key (ngx_crc32_short(victim->key, 32)), not from node.key --
      * node.key is no longer that crc32 once the rbtree key is derived from
@@ -5121,10 +5150,26 @@ admit_seat_victim(int n, ngx_uint_t freq)
      * at that same real crc32, not at KEY(n)'s fabricated
      * (uint32_t)(0x1000+n): the two used to be identical by construction
      * (node.key WAS the caller's hash argument, verbatim), but that
-     * coincidence is gone now that node.key is derived from key_hash. */
+     * coincidence is gone now that node.key is derived from key_hash.
+     *
+     * PERF-AUD2-10: count_miss_locked() now stamps ctn->hash_crc32 with
+     * whatever `hash` argument the caller passes, on the (production-wide,
+     * every real caller derives `hash` from key_hash via
+     * ngx_crc32_short()) assumption that it equals crc32(key_hash, 32).
+     * KEY(n)'s fabricated (0x1000+n) breaks that assumption -- production
+     * code never does this, only this fixture's macro does, for readable
+     * deterministic keys -- so seed the victim with the REAL crc32 as its
+     * `hash` argument instead of KEY(n)'s, exactly as this function already
+     * had to do for the sketch bumps below. shm_lookup()'s own `hash`
+     * parameter is unused ((void) hash there), so find(n) below, which
+     * still looks up via KEY(n), is unaffected by which hash was used here. */
     real_hash = ngx_crc32_short(mkkey(n), 32);
+
+    ngx_http_cache_turbo_shm_count_miss(&g_zone, mkkey(n), real_hash, 4, 0);
+    REQUIRE(find(n) != NULL, "fixture: count_miss did not create the victim");
+
     for (i = 0; i < freq; i++) {
-        ngx_http_cache_turbo_shm_sketch_bump(&g_zone, real_hash);
+        test_sketch_bump(real_hash);
     }
 }
 
@@ -5150,9 +5195,9 @@ test_p4_1b_admission_off_by_default(void)
     /* Hot victim (10 bumps), stone-cold candidate (0 bumps). */
     admit_seat_victim(0, 10);
 
-    CHECK(ngx_http_cache_turbo_shm_sketch_estimate(&g_zone, 0xdeadbeefu) == 0,
+    CHECK(test_sketch_estimate(0xdeadbeefu) == 0,
           "fixture: the candidate should be cold");
-    CHECK(ngx_http_cache_turbo_shm_sketch_estimate(&g_zone, ngx_crc32_short(mkkey(0), 32)) == 10,
+    CHECK(test_sketch_estimate(ngx_crc32_short(mkkey(0), 32)) == 10,
           "fixture: the victim should be hot");
 
     CHECK(ngx_http_cache_turbo_shm_admit(&g_zone, 0xdeadbeefu) == 1,
@@ -5208,13 +5253,13 @@ test_p4_1b_admits_hotter_and_tied_candidate(void)
     admit_seat_victim(0, 3);
 
     /* Strictly hotter: 5 > 3. */
-    ngx_http_cache_turbo_shm_sketch_bump(&g_zone, cand);
-    ngx_http_cache_turbo_shm_sketch_bump(&g_zone, cand);
-    ngx_http_cache_turbo_shm_sketch_bump(&g_zone, cand);
-    ngx_http_cache_turbo_shm_sketch_bump(&g_zone, cand);
-    ngx_http_cache_turbo_shm_sketch_bump(&g_zone, cand);
+    test_sketch_bump(cand);
+    test_sketch_bump(cand);
+    test_sketch_bump(cand);
+    test_sketch_bump(cand);
+    test_sketch_bump(cand);
 
-    REQUIRE(ngx_http_cache_turbo_shm_sketch_estimate(&g_zone, cand) == 5,
+    REQUIRE(test_sketch_estimate(cand) == 5,
             "fixture: candidate estimate should be 5");
     CHECK(ngx_http_cache_turbo_shm_admit(&g_zone, cand) == 1,
           "P4-1b: a strictly hotter candidate must be admitted");
@@ -5224,13 +5269,13 @@ test_p4_1b_admits_hotter_and_tied_candidate(void)
     sketch_attach();
     g_sh.admission = 1;
     admit_seat_victim(0, 4);
-    ngx_http_cache_turbo_shm_sketch_bump(&g_zone, cand);
-    ngx_http_cache_turbo_shm_sketch_bump(&g_zone, cand);
-    ngx_http_cache_turbo_shm_sketch_bump(&g_zone, cand);
-    ngx_http_cache_turbo_shm_sketch_bump(&g_zone, cand);
+    test_sketch_bump(cand);
+    test_sketch_bump(cand);
+    test_sketch_bump(cand);
+    test_sketch_bump(cand);
 
-    REQUIRE(ngx_http_cache_turbo_shm_sketch_estimate(&g_zone, cand)
-                == ngx_http_cache_turbo_shm_sketch_estimate(&g_zone, ngx_crc32_short(mkkey(0), 32)),
+    REQUIRE(test_sketch_estimate(cand)
+                == test_sketch_estimate(ngx_crc32_short(mkkey(0), 32)),
             "fixture: candidate and victim estimates should tie");
     CHECK(ngx_http_cache_turbo_shm_admit(&g_zone, cand) == 1,
           "P4-1b: a TIE must admit (strict <, not <=)");
@@ -5311,8 +5356,7 @@ test_p4_1b_fails_open_three_ways(void)
         ngx_uint_t  b;
 
         for (b = 0; b < NGX_HTTP_CACHE_TURBO_SKETCH_MAX; b++) {
-            ngx_http_cache_turbo_shm_sketch_bump(&g_zone,
-                (uint32_t) phantom->node.key);
+            test_sketch_bump((uint32_t) phantom->node.key);
         }
     }
     CHECK(ngx_queue_empty(&g_sh.lru), "fixture: probation should be empty");
@@ -5375,7 +5419,7 @@ test_p4_1b_admission_never_spins(void)
     /* A saturated victim: nothing can be hotter, so every candidate is
      * refused. This is the most refusal-prone state representable. */
     admit_seat_victim(0, NGX_HTTP_CACHE_TURBO_SKETCH_MAX + 4);
-    REQUIRE(ngx_http_cache_turbo_shm_sketch_estimate(&g_zone, ngx_crc32_short(mkkey(0), 32))
+    REQUIRE(test_sketch_estimate(ngx_crc32_short(mkkey(0), 32))
                 == NGX_HTTP_CACHE_TURBO_SKETCH_MAX,
             "fixture: the victim should be saturated");
 
@@ -5433,7 +5477,7 @@ test_p4_1b_sketch_bumps_survive_halving(void)
     g_sh.sketch_reset_at = 10;
 
     for (i = 0; i < 25; i++) {
-        ngx_http_cache_turbo_shm_sketch_bump(&g_zone, (uint32_t) (0x2000 + i));
+        test_sketch_bump((uint32_t) (0x2000 + i));
     }
 
     CHECK(g_sh.sketch_bumps == 25,
@@ -5449,7 +5493,7 @@ test_p4_1b_sketch_bumps_survive_halving(void)
      * live zone is reading a genuine "the sketch was never allocated". */
     zone_reset();
     CHECK(g_sh.sketch == NULL, "fixture: zone_reset left a sketch attached");
-    ngx_http_cache_turbo_shm_sketch_bump(&g_zone, 0x1234u);
+    test_sketch_bump(0x1234u);
     CHECK(g_sh.sketch_bumps == 0,
           "P4-1b: a NULL-sketch bump must not increment sketch_bumps");
 }

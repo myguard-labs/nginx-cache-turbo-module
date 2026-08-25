@@ -747,6 +747,18 @@ typedef struct {
      * rather than in a retry queue. */
     unsigned                 varidx_pending:1;
 
+    /* PERF-AUD2-10: the real 32-bit crc32 short hash of `key` (the same value
+     * every caller already computes and hands in as the `hash` parameter to
+     * store_locked()/claim_locked()/count_miss_locked()/l2_neg_set() at node
+     * creation -- see the C4 comment on shm_touch_lru() for why this differs
+     * from node.key, the widened rbtree key). shm_admit() needs exactly this
+     * value for its eviction VICTIM (ngx_crc32_short(victim->key, 32)) on
+     * every new-entry store when admission is on; storing it here at the one
+     * point each node is created turns that into a 4-byte field read instead
+     * of a 32-byte recompute under the zone mutex. All four node-init sites
+     * already receive `hash` as a parameter and previously discarded it. */
+    uint32_t                 hash_crc32;
+
     ngx_queue_t              lru;           /* LRU list linkage             */
 } ngx_http_cache_turbo_node_t;
 
@@ -2806,16 +2818,30 @@ void ngx_http_cache_turbo_shm_touch_lru(ngx_http_cache_turbo_zone_t *z,
     ngx_http_cache_turbo_node_t *ctn, time_t now, ngx_uint_t protected_pct,
     uint32_t hash);
 
+/* Row count for the W-TinyLFU sketch below -- must match shm.c's own
+ * NGX_HTTP_CACHE_TURBO_SKETCH_ROWS (kept in shm.c as the value that actually
+ * sizes/walks the sketch array; this copy exists only so callers outside
+ * shm.c can size the `uint32_t[NGX_HTTP_CACHE_TURBO_SKETCH_ROWS]` PERF-AUD2-11
+ * hands to sketch_bump()/sketch_estimate()). */
+#define NGX_HTTP_CACHE_TURBO_SKETCH_ROWS  4
+
 /* P4-1a: W-TinyLFU frequency sketch. Both hold the shpool mutex via the
  * caller, and both tolerate an unallocated sketch (bump is a no-op, estimate
  * returns 0). See the sketch field block in the shctx above.
  *
  * STAGE 1 OF 2 -- nothing in the tree reads the estimate yet; these exist so
- * stage 2's admission test has data to decide on. */
+ * stage 2's admission test has data to decide on.
+ *
+ * PERF-AUD2-11: `rows` is the caller-computed row-hash array (shm.c's
+ * file-local ngx_http_cache_turbo_sketch_rows() helper) rather than a raw
+ * `hash` -- both functions used to derive it fresh, per row, inside the
+ * critical section from a value the caller already had before taking the
+ * lock. */
 void ngx_http_cache_turbo_shm_sketch_bump(ngx_http_cache_turbo_zone_t *z,
-    uint32_t hash);
+    const uint32_t rows[NGX_HTTP_CACHE_TURBO_SKETCH_ROWS]);
 ngx_uint_t ngx_http_cache_turbo_shm_sketch_estimate(
-    ngx_http_cache_turbo_zone_t *z, uint32_t hash);
+    ngx_http_cache_turbo_zone_t *z,
+    const uint32_t rows[NGX_HTTP_CACHE_TURBO_SKETCH_ROWS]);
 
 /* Remove a leftover cold-miss STUB (v10): drops the node ONLY if it is still a
  * stub (len == 0), so a real entry stored by someone else is never touched.
