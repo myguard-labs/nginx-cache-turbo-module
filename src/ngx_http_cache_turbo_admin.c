@@ -481,8 +481,10 @@ ngx_http_cache_turbo_admin_stats_prometheus(ngx_http_request_t *r,
      * budget.py's 128-byte margin. When adding a metric, re-measure rather
      * than adding an estimate -- run the lint locally, it prints the exact
      * required value. C3 added cache_turbo_markers (gauge), count 35 -> 36,
-     * fixed term re-measured 7152 -> 7345. */
-    len = 7345 + 36 * zname.len + 36 * NGX_ATOMIC_T_LEN;
+     * fixed term re-measured 7152 -> 7345. PERF-AUD2-08's sketch_gen HELP
+     * text change re-measured 7345 -> 7376 (prose 7248 + 128 margin, no
+     * metric count change). */
+    len = 7376 + 36 * zname.len + 36 * NGX_ATOMIC_T_LEN;
     p = ngx_pnalloc(r->pool, len);
     if (p == NULL) {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
