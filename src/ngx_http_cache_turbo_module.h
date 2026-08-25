@@ -1085,6 +1085,34 @@ typedef struct ngx_http_cache_turbo_shctx_s {
     ngx_atomic_t             varidx_drops;
     ngx_atomic_t             varidx_reissues;
 
+    /* COR5-PURGE-VARIDX-RACE: index writes HANDED to the transport but not yet
+     * acknowledged by L2. Distinct from varidx_drops above, which counts writes
+     * that never reached the transport at all -- this counts the ones that did,
+     * and are still in flight.
+     *
+     * Why it has to exist: tag_add() returns NGX_OK the moment redis_launch()
+     * hands the op over, which on the keepalive path is an ngx_post_event() --
+     * the SADD bytes have not been written to the socket yet, let alone acked.
+     * The response is finalized and sent to the client on THAT event-loop turn;
+     * the SADD goes out on a later one. A PURGE issued by a client that just
+     * saw its HIT can therefore run SMEMBERS before the SADD lands, enumerate
+     * one variant of two, drop it, and report {"purged":1} as a success while
+     * the just-stored variant keeps serving until its own TTL.
+     *
+     * varidx_pending is NOT the right home for this state: that bit means "the
+     * write was dropped, re-issue it on the next hit", and access_l1's
+     * self-heal acts on it. Marking a healthy in-flight write pending would
+     * re-issue a SADD that is already on its way and inflate varidx_reissues,
+     * corrupting the very (drops - reissues) subtraction purge.c depends on.
+     *
+     * ZONE-scoped for the same reason as the two counters above -- the store
+     * and the purge routinely land in different workers under the 4-worker
+     * runtime suite. Incremented in redis_tag_add_many() immediately before
+     * launch, decremented in redis_op_done(), which every completion and every
+     * failure path funnels through (op_fail's tag_add ops carry no members_cb,
+     * no is_lock and no request, so they always reach its op_done else-arm). */
+    ngx_atomic_t             varidx_inflight;
+
     /* L9: counts tag-index writes (tag_add / tag_add_many for
      * cache_turbo_tag) that never reached the transport at store time --
      * the same drop class as varidx_drops above, but for the purge-by-tag

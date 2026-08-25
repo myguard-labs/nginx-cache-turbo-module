@@ -112,6 +112,12 @@ typedef struct {
      * once ALL of them are fully framed (STAB-1). DEL = 1, tag_add = 3. */
     ngx_uint_t                   expected_replies;
 
+    /* COR5-PURGE-VARIDX-RACE: this op incremented the zone's varidx_inflight
+     * counter before launch and owes it a decrement in op_done. Only the
+     * auto-Vary variant-index tag_add sets it; every other op leaves it 0 so
+     * op_done's decrement is skipped. */
+    unsigned                     counts_inflight:1;
+
     u_char                      *rbuf;     /* GET/SMEMBERS: growable reply buf */
     size_t                       rcap;
     size_t                       rlen;
@@ -1513,9 +1519,37 @@ ngx_http_cache_turbo_redis_tagkey(ngx_str_t *prefix, u_char *name,
  * Fire-and-forget (read_drain, no request parked on the reply), so a batched
  * failure degrades exactly as a single-tag failure did: the tag index misses
  * this object and a later purge of that tag does not invalidate it. */
-ngx_int_t
-ngx_http_cache_turbo_redis_tag_add_many(ngx_http_cache_turbo_loc_conf_t *clcf,
-    u_char *key_hash, ngx_str_t *names, ngx_uint_t nnames, time_t ttl)
+/* COR5-PURGE-VARIDX-RACE: adjust this zone's in-flight index-write count.
+ * Folded into a helper so the two call sites in tag_add_impl (arm before
+ * launch, unwind on a launch that never reached the transport) and the one in
+ * op_done stay single statements -- the accounting is incidental to each of
+ * those functions and should not add branches to their bodies. */
+static void
+ngx_http_cache_turbo_redis_varidx_inflight_add(
+    ngx_http_cache_turbo_redis_op_t *op, ngx_atomic_int_t delta)
+{
+    ngx_http_cache_turbo_zone_t  *z;
+
+    if (!op->counts_inflight || op->clcf == NULL
+        || op->clcf->shm_zone == NULL)
+    {
+        return;
+    }
+
+    z = op->clcf->shm_zone->data;
+    if (z == NULL || ngx_http_cache_turbo_zone_sh(z) == NULL) {
+        return;
+    }
+
+    (void) ngx_atomic_fetch_add(
+               &ngx_http_cache_turbo_zone_sh(z)->varidx_inflight, delta);
+}
+
+
+static ngx_int_t
+ngx_http_cache_turbo_redis_tag_add_impl(ngx_http_cache_turbo_loc_conf_t *clcf,
+    u_char *key_hash, ngx_str_t *names, ngx_uint_t nnames, time_t ttl,
+    ngx_uint_t count_inflight)
 {
     ngx_str_t                         argv[4];
     ngx_str_t                         tagkeys[NGX_HTTP_CACHE_TURBO_MAX_TAGS];
@@ -1654,9 +1688,31 @@ ngx_http_cache_turbo_redis_tag_add_many(ngx_http_cache_turbo_loc_conf_t *clcf,
     /* 3 replies per tag: SADD + EXPIRE NX + EXPIRE GT */
     op->expected_replies = (ngx_uint_t) (nqueued * 3);
 
+    /* COR5-PURGE-VARIDX-RACE: account this write as in-flight BEFORE handing it
+     * to the transport, so a PURGE whose SMEMBERS races it sees a non-zero gap
+     * and reports "complete":false instead of a false success. Paired with the
+     * decrement in op_done(); the increment has to happen before launch because
+     * the keepalive path can post the write event and complete the op without
+     * ever returning here. Ordering is safe on a single-threaded worker: a
+     * posted event only runs after the current handler returns, so this
+     * increment cannot be preempted by its own decrement. */
+    /* op->clcf is what the in-flight helper resolves the zone through, and
+     * redis_launch() below does not set it until after this point -- bind it
+     * here so the arm cannot silently no-op and leave op_done's decrement
+     * unpaired (which drifts the counter negative and wraps, pinning every
+     * later purge in the zone at "complete":false). */
+    op->clcf = clcf;
+    op->counts_inflight = (unsigned) (count_inflight != 0);
+    ngx_http_cache_turbo_redis_varidx_inflight_add(op, 1);
+
     if (ngx_http_cache_turbo_redis_launch(op, clcf,
             ngx_http_cache_turbo_redis_read_drain) != NGX_OK)
     {
+        /* Never reached the transport: undo the in-flight account here rather
+         * than in op_done, which this path deliberately bypasses. The caller
+         * turns this NGX_ERROR into a varidx_drops bump + a pending bit, which
+         * is the correct accounting for a genuine drop. */
+        ngx_http_cache_turbo_redis_varidx_inflight_add(op, -1);
         ngx_destroy_pool(op->pool);
         return NGX_ERROR;
     }
@@ -1665,8 +1721,26 @@ ngx_http_cache_turbo_redis_tag_add_many(ngx_http_cache_turbo_loc_conf_t *clcf,
 }
 
 
+/* L9 batch entry point (cache_turbo_tag). Does NOT participate in the COR-5
+ * in-flight accounting: that counter exists for the auto-Vary variant index,
+ * whose absence a PURGE of the base URI silently under-reports. The tag index
+ * has its own drop counter (tag_index_drops) and its own "complete":false
+ * reporting on the by-tag purge path. */
+ngx_int_t
+ngx_http_cache_turbo_redis_tag_add_many(ngx_http_cache_turbo_loc_conf_t *clcf,
+    u_char *key_hash, ngx_str_t *names, ngx_uint_t nnames, time_t ttl)
+{
+    return ngx_http_cache_turbo_redis_tag_add_impl(clcf, key_hash, names,
+                                                   nnames, ttl, 0);
+}
+
+
 /* Single-tag entry point, preserved for the auto-vary variant-index store
- * (one tag, nothing to batch) and any other one-shot caller. */
+ * (one tag, nothing to batch) and any other one-shot caller.
+ *
+ * COR5-PURGE-VARIDX-RACE: this is the variant-index write, so it counts itself
+ * as in-flight until L2 acknowledges. See the varidx_inflight comment in
+ * module.h for why the store path cannot simply wait for the ack instead. */
 ngx_int_t
 ngx_http_cache_turbo_redis_tag_add(ngx_http_cache_turbo_loc_conf_t *clcf,
     u_char *key_hash, u_char *name, size_t name_len, time_t ttl)
@@ -1680,8 +1754,8 @@ ngx_http_cache_turbo_redis_tag_add(ngx_http_cache_turbo_loc_conf_t *clcf,
     one.data = name;
     one.len = name_len;
 
-    return ngx_http_cache_turbo_redis_tag_add_many(clcf, key_hash, &one, 1,
-                                                   ttl);
+    return ngx_http_cache_turbo_redis_tag_add_impl(clcf, key_hash, &one, 1,
+                                                   ttl, 1);
 }
 
 
@@ -3428,6 +3502,18 @@ ngx_http_cache_turbo_redis_op_done(ngx_http_cache_turbo_redis_op_t *op)
 {
     ngx_pool_t        *pool = op->pool;
     ngx_connection_t  *c = op->peer.connection;
+
+    /* COR5-PURGE-VARIDX-RACE: release this op's in-flight account. Every
+     * completion AND every failure funnels through here -- read_drain's six
+     * early returns all call op_done directly, and op_fail reaches its
+     * op_done else-arm for a tag_add op (no members_cb, not is_lock, no parked
+     * request). Decrementing here rather than in read_drain is what makes the
+     * counter leak-proof: a timeout, a malformed reply or a peer close cannot
+     * strand it non-zero and pin every later purge in this zone at
+     * "complete":false. The one path that does NOT reach op_done -- a failed
+     * launch -- undoes its own increment at the call site. */
+    ngx_http_cache_turbo_redis_varidx_inflight_add(op, -1);
+    op->counts_inflight = 0;
 
     /* AUD-SCAN1: the SCAN walk's current page pool is independent of op->pool
      * (it is rotated per page), so it has to be released explicitly. Every

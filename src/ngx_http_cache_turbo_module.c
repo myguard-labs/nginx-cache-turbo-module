@@ -1956,14 +1956,21 @@ ngx_http_cache_turbo_test_varidx_header(ngx_http_request_t *r)
     }
 
     v = ngx_pnalloc(r->pool,
-                    sizeof("drops=,reissues=") - 1 + 2 * NGX_ATOMIC_T_LEN);
+                    sizeof("drops=,reissues=,inflight=") - 1
+                        + 3 * NGX_ATOMIC_T_LEN);
     if (v == NULL) {
         return NGX_ERROR;
     }
 
-    vlen = ngx_sprintf(v, "drops=%uA,reissues=%uA",
+    /* COR5-PURGE-VARIDX-RACE: `inflight` is the third observable -- index
+     * writes handed to the transport but not yet acknowledged by L2. A test
+     * cannot otherwise distinguish "the SADD landed" from "the SADD is still
+     * on its way", which is exactly the state that makes a racing PURGE
+     * under-enumerate. */
+    vlen = ngx_sprintf(v, "drops=%uA,reissues=%uA,inflight=%uA",
                        ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->varidx_drops, 0),
-                       ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->varidx_reissues, 0)) - v;
+                       ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->varidx_reissues, 0),
+                       ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->varidx_inflight, 0)) - v;
 
     h = ngx_list_push(&r->headers_out.headers);
     if (h == NULL) {
