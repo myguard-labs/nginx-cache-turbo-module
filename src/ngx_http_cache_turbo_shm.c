@@ -58,6 +58,17 @@
 #define NGX_HTTP_CACHE_TURBO_SKETCH_MIN_WIDTH   1024
 #define NGX_HTTP_CACHE_TURBO_SKETCH_MAX_WIDTH   (1 << 20)
 
+/* PERF-AUD2-08: the full halving pass is split into this many stripes, so a
+ * single crossing halves at most 1/STRIPES of the array instead of the whole
+ * thing. See ngx_http_cache_turbo_sketch_halve() for the bound this
+ * buys. 16 keeps the worst-case single-crossing pass at SKETCH_MAX_WIDTH's
+ * 2 MB / 16 = 128 KB -- comfortably under a millisecond of memset-equivalent
+ * work even on a slow core -- while still completing a full lap (and thus
+ * incrementing sketch_gen) within 16 crossings, i.e. 16 * sketch_reset_at
+ * bumps, which stays well inside "recent" for any zone busy enough for the
+ * stall to matter. */
+#define NGX_HTTP_CACHE_TURBO_SKETCH_HALVE_STRIPES  16
+
 
 static void
 ngx_http_cache_turbo_rbtree_insert_value(ngx_rbtree_node_t *temp,
@@ -247,6 +258,7 @@ ngx_http_cache_turbo_shm_init_zone(ngx_shm_zone_t *shm_zone, void *data)
     st->sh->sketch_ops = 0;
     st->sh->sketch_reset_at = 0;
     st->sh->sketch_gen = 0;
+    st->sh->sketch_cursor = 0;
 
     /* P4-1b: admission policy mirror + observability counters. The policy is
      * OFF unless the zone directive asked for it; ctx->admission was parsed
@@ -597,27 +609,66 @@ ngx_http_cache_turbo_sketch_inc(u_char *sketch, ngx_uint_t idx)
 }
 
 
-/* Halve every counter (the TinyLFU aging step), then bump the generation.
+/* PERF-AUD2-08: halve ONE STRIPE of the array (the TinyLFU aging step made
+ * incremental), starting at sketch_cursor, then advance the cursor. Only when
+ * the cursor WRAPS -- this stripe reached or passed the end of the array --
+ * has a full lap completed, and only then does sketch_gen advance. A gen
+ * bump on every stripe would tell a reader "history just decayed" up to
+ * HALVE_STRIPES times more often than it actually did; readers (admin/metrics
+ * only -- see the module.h field comment) are documented as counting full
+ * laps, not stripes.
  *
- * BOUNDED BY CONSTRUCTION: exactly sketch_width * ROWS / 2 byte writes, with
- * the width capped at SKETCH_MAX_WIDTH above, so the worst case is a fixed
- * 2 MB memset-like pass and cannot grow with traffic or entry count. Both
- * nibbles of a byte halve in one masked shift -- shifting the byte would
- * bleed the high counter's low bit into the low counter's top bit. */
+ * BOUNDED BY CONSTRUCTION: exactly
+ * ceil(sketch_width * ROWS / 2 / HALVE_STRIPES) byte writes per call, with
+ * sketch_width capped at SKETCH_MAX_WIDTH, so the worst case per call is a
+ * fixed 2 MB / HALVE_STRIPES pass and cannot grow with traffic or entry
+ * count -- same bound class as the original whole-array pass, just paid in
+ * HALVE_STRIPES smaller instalments instead of one. Both nibbles of a byte
+ * halve in one masked shift -- shifting the byte would bleed the high
+ * counter's low bit into the low counter's top bit.
+ *
+ * The last stripe of a lap absorbs any remainder (bytes not evenly divisible
+ * by HALVE_STRIPES): it runs to the true end of the array rather than a
+ * fixed stripe width, so no byte is ever skipped and no lap runs long. */
 static void
 ngx_http_cache_turbo_sketch_halve(ngx_http_cache_turbo_zone_t *z)
 {
-    ngx_uint_t  i, bytes;
+    ngx_uint_t  i, bytes, stripe, start, end;
     u_char     *sketch = ngx_http_cache_turbo_zone_sh(z)->sketch;
 
-    bytes = ngx_http_cache_turbo_zone_sh(z)->sketch_width * NGX_HTTP_CACHE_TURBO_SKETCH_ROWS / 2;
+    bytes  = ngx_http_cache_turbo_zone_sh(z)->sketch_width
+             * NGX_HTTP_CACHE_TURBO_SKETCH_ROWS / 2;
+    stripe = (bytes + NGX_HTTP_CACHE_TURBO_SKETCH_HALVE_STRIPES - 1)
+             / NGX_HTTP_CACHE_TURBO_SKETCH_HALVE_STRIPES;
 
-    for (i = 0; i < bytes; i++) {
+    start = ngx_http_cache_turbo_zone_sh(z)->sketch_cursor;
+
+    /* A cursor at or past `bytes` (only possible if sketch_width shrank
+     * under us, which it never does post-init, but this is the cheap
+     * defensive read) restarts the lap rather than reading out of bounds. */
+    if (start >= bytes) {
+        start = 0;
+    }
+
+    end = start + stripe;
+
+    if (end >= bytes) {
+        end = bytes;                 /* last stripe: absorb the remainder */
+    }
+
+    for (i = start; i < end; i++) {
         sketch[i] = (u_char) ((sketch[i] >> 1) & 0x77);
     }
 
     ngx_http_cache_turbo_zone_sh(z)->sketch_ops = 0;
-    ngx_http_cache_turbo_zone_sh(z)->sketch_gen++;
+
+    if (end >= bytes) {
+        ngx_http_cache_turbo_zone_sh(z)->sketch_cursor = 0;
+        ngx_http_cache_turbo_zone_sh(z)->sketch_gen++;
+
+    } else {
+        ngx_http_cache_turbo_zone_sh(z)->sketch_cursor = end;
+    }
 }
 
 
