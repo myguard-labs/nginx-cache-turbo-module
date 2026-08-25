@@ -113,7 +113,7 @@ check_define NGX_HTTP_CACHE_TURBO_LRU_CAP_MAX_EVICT 8 "$SRC"
 # their fixture sketch to, so a silent widening would leave the fixture
 # allocating less memory than the sliced code indexes into -- an ASan heap
 # overflow rather than a clean failure, which is worse than a red assert.
-check_define NGX_HTTP_CACHE_TURBO_SKETCH_ROWS      4 "$SRC"
+check_define NGX_HTTP_CACHE_TURBO_SKETCH_ROWS      4 "$HDR"
 check_define NGX_HTTP_CACHE_TURBO_SKETCH_MAX       15 "$SRC"
 check_define NGX_HTTP_CACHE_TURBO_SKETCH_SAMPLE    10 "$SRC"
 check_define NGX_HTTP_CACHE_TURBO_SKETCH_MIN_WIDTH 1024 "$SRC"
@@ -336,7 +336,7 @@ awk '
     /^static ngx_inline (uint32_t|uint64_t|ngx_uint_t|void)$/ {
         pending = 1; buf = $0 ORS; next
     }
-    pending && /^ngx_http_cache_turbo_(shm_(key64|sketch_bump|sketch_estimate|admit|lookup|evict_one|alloc_evict|free_locked|claim_locked|claim|resolve_miss|unstub|owns|count_miss_locked|count_miss|l2_neg_check|l2_neg_set|touch_lru|brk_probe_age|breaker_state|breaker_record|breaker_state_str|get_u32|get_u64|node_sie_live)|lru_(link_head|unlink|insert_new|enforce_cap)|sketch_(row_hash|get|inc|halve)|blob_(alloc|node_release|acquire|release))\(/ {
+    pending && /^ngx_http_cache_turbo_(shm_(key64|sketch_bump|sketch_estimate|admit|lookup|evict_one|alloc_evict|free_locked|claim_locked|claim|resolve_miss|unstub|owns|count_miss_locked|count_miss|l2_neg_check|l2_neg_set|touch_lru|brk_probe_age|breaker_state|breaker_record|breaker_state_str|get_u32|get_u64|node_sie_live)|lru_(link_head|unlink|insert_new|enforce_cap)|sketch_(row_hash|rows|get|inc|halve)|blob_(alloc|node_release|acquire|release))\(/ {
         capture = 1; pending = 0; printf "%s", buf; print; next
     }
     pending { pending = 0; buf = "" }
@@ -526,6 +526,7 @@ for fn in \
     'ngx_http_cache_turbo_lru_enforce_cap(' \
     'ngx_http_cache_turbo_shm_touch_lru(' \
     'ngx_http_cache_turbo_sketch_row_hash(' \
+    'ngx_http_cache_turbo_sketch_rows(' \
     'ngx_http_cache_turbo_sketch_get(' \
     'ngx_http_cache_turbo_sketch_inc(' \
     'ngx_http_cache_turbo_sketch_halve(' \
