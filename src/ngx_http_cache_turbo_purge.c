@@ -150,9 +150,24 @@ ngx_http_cache_turbo_purge_auto_vary(ngx_http_request_t *r,
          * OTHER base has an outstanding drop, never the reverse. A false
          * "degraded" costs nothing (the operator re-purges or waits); a
          * false "complete" is the defect this exists to catch, so the
-         * asymmetry is the safe one. */
+         * asymmetry is the safe one.
+         *
+         * COR5-PURGE-VARIDX-RACE: varidx_inflight is the second term, and it
+         * covers the case the drops/reissues pair structurally cannot see. A
+         * SADD that redis_launch() accepted is NOT a drop -- it never bumps
+         * varidx_drops -- yet until L2 acknowledges it the index set this
+         * SMEMBERS is about to read may still be short that variant. Without
+         * this term a PURGE racing a just-completed store enumerates one
+         * variant of two and reports {"purged":1} as an unqualified success
+         * while the other keeps serving.
+         *
+         * Read inflight FIRST so the snapshot errs the safe way: a store that
+         * completes midway through these three reads can only inflate the gap
+         * (counted here, its decrement not yet reflected in the pair below),
+         * never hide it. */
         tp->pending_at_launch =
-            (ngx_uint_t) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->varidx_drops, 0)
+            (ngx_uint_t) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->varidx_inflight, 0)
+            + (ngx_uint_t) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->varidx_drops, 0)
             - (ngx_uint_t) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->varidx_reissues, 0);
         tp->tag.data = ngx_pnalloc(r->pool, vlen);
         if (tp->tag.data == NULL) {

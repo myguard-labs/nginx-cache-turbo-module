@@ -2279,8 +2279,26 @@ def test_cor5_redis_variant_purge(ng: Nginx, origin: Origin,
     assert fr0 != en0, "en and fr must be distinct variant slots"
     s, b, _ = fetch_raw(ng.port, "/cor5/p?v=al", method="PURGE")
     assert s == 200, f"PURGE status {s}"
-    # the index held 2 variant members
-    assert json.loads(b)["purged"] >= 2, f"purge should report >=2 variants: {b}"
+    # The index held 2 variant members, so a purge that enumerated a complete
+    # index must report both. COR5-PURGE-VARIDX-RACE: the variant-index SADD is
+    # handed to the transport without waiting for the ack, so a PURGE issued
+    # immediately after the HIT above can legitimately run SMEMBERS before the
+    # second SADD lands. That is allowed to under-count ONLY if the reply says
+    # so -- "complete":false is the module's wire contract for a degraded
+    # enumeration. What must never happen is a short count reported as an
+    # unqualified success, which is the silent-staleness defect: the operator
+    # is told the purge succeeded while a variant keeps serving.
+    #
+    # Do NOT weaken this to `purged >= 1`. That deletes the oracle for the
+    # invariant this test exists to prove (SADD at store, SMEMBERS+DEL at
+    # purge) and would pass even with the index write removed entirely.
+    reply = json.loads(b)
+    if reply.get("complete", True):
+        assert reply["purged"] >= 2, \
+            f"purge reported complete but enumerated <2 variants: {b}"
+    else:
+        assert reply["purged"] >= 1, \
+            f"degraded purge should still drop what it did enumerate: {b}"
     _, en2, he2 = fetch(ng.port, "/cor5/p?v=al", headers=en)
     assert "x-cache" not in he2 and en2 != en0, \
         f"en variant survived PURGE: X-Cache={he2.get('x-cache')} body={en2!r}"
@@ -2465,6 +2483,70 @@ def test_cor5_purge_reports_degraded_enumeration(
     assert reply2.get("complete") is not False, \
         (f"a fully-enumerated purge (no outstanding drop) must not report "
          f"complete:false -- got {b2}")
+
+
+def test_cor5_purge_reports_inflight_index_write(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    """COR5-PURGE-VARIDX-RACE: a PURGE racing an UNACKNOWLEDGED variant-index
+    write must not report an unqualified success.
+
+    The defect (ci-deep run 32872819700, asan-soak iteration 5/8:
+    `AssertionError: purge should report >=2 variants: {"purged":1}`): the
+    store path calls tag_add(), which returns NGX_OK the moment
+    redis_launch() hands the op to the transport -- on the keepalive path
+    that is an ngx_post_event(), so the SADD bytes have not reached the
+    socket yet, let alone been acked. The response is finalized and sent on
+    THAT event-loop turn; the SADD goes out on a later one. A client that
+    issues a PURGE immediately after seeing its HIT can therefore run
+    SMEMBERS before the second variant's SADD lands, drop one variant of
+    two, and be told {"purged":1} as a success while the other keeps
+    serving until its own TTL.
+
+    varidx_drops cannot see this: the write was NOT dropped. It reached the
+    transport. That is why varidx_inflight exists as a third counter, and
+    why this test is distinct from
+    test_cor5_purge_reports_degraded_enumeration above (which injects a real
+    drop and exercises the drops/reissues gap).
+
+    ORACLE: with an index write outstanding, the reply must carry
+    "complete":false. The mutation that breaks this test: removing the
+    varidx_inflight term from pending_at_launch in purge.c -- the purge then
+    reports as if complete while the index set is demonstrably short a
+    variant, which is precisely the silent-staleness defect.
+
+    Runs LAST among the /cor5sh/ purge assertions on purpose: the hold fault
+    models a write that is never acknowledged, so the zone-scoped gap it
+    opens is permanent and would make any later "complete" baseline in this
+    zone unprovable.
+    """
+    import json
+    en = {"Accept-Language": "en"}
+    fr_hold = {"Accept-Language": "fr", "X-Cache-Turbo-Test-Varidx-Hold": "1"}
+
+    _, en0, _ = fetch(ng.port, "/cor5sh/inflight?v=al", headers=en)
+    _, en1, he1 = fetch(ng.port, "/cor5sh/inflight?v=al", headers=en)
+    assert he1.get("x-cache") == "HIT" and en1 == en0, "en variant should cache"
+
+    # Prime the fr variant with its index SADD held in flight: the object is
+    # resident and serving, the index set does not list it.
+    _, fr0, _ = fetch(ng.port, "/cor5sh/inflight?v=al", headers=fr_hold)
+    assert fr0 != en0, "en and fr must be distinct variant slots"
+
+    # Same reason as the degraded test: the counter is bumped from the BODY
+    # filter, after the header filter already stamped this response's own
+    # counts -- read it off a SECOND request against the same zone.
+    _, _, h_confirm = fetch(ng.port, "/cor5sh/inflight-confirm?v=al",
+                            headers=en)
+    counts = _varidx(h_confirm)
+    assert counts.get("inflight", 0) >= 1, \
+        f"fault injection did not record an in-flight index write: {counts}"
+
+    s, b, _ = fetch_raw(ng.port, "/cor5sh/inflight?v=al", method="PURGE")
+    assert s == 200, f"PURGE status {s}"
+    reply = json.loads(b)
+    assert reply.get("complete") is False, \
+        (f"PURGE racing an unacknowledged variant-index write must report "
+         f"complete:false rather than a silent short count -- got {b}")
 
 
 def _varidx(headers: dict) -> dict:

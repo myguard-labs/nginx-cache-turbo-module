@@ -442,6 +442,15 @@ def run_all(ng: Nginx, origin: Origin,
         # c-1: the PURGE reply must distinguish a complete enumeration from a
         # degraded one when a drop is still outstanding at purge time.
         test_cor5_purge_reports_degraded_enumeration(ng, origin, redis)
+        # COR5-PURGE-VARIDX-RACE: a purge racing an UNACKNOWLEDGED index write
+        # (handed to the transport, never acked -- not a drop) must likewise
+        # report complete:false instead of a silent short count.
+        #
+        # ⚠ ORDER IS LOAD-BEARING: runs AFTER the degraded test above. Its hold
+        # fault models a write that is never acknowledged, so the zone-scoped
+        # varidx_inflight gap it opens is permanent -- any later test in this
+        # zone asserting an unqualified "complete" would fail against it.
+        test_cor5_purge_reports_inflight_index_write(ng, origin, redis)
         # SILENT-INDEX-DROP option (c): a purge-by-tag must REPORT a degraded
         # enumeration once a tag-index drop is outstanding, rather than
         # claiming success while an unindexed object keeps serving stale.

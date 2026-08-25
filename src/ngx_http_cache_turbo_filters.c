@@ -57,11 +57,12 @@ static ngx_http_output_body_filter_pt    ngx_http_next_body_filter;
 
 #if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
     && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
-/* COR-5(b): does this request ask for its variant-index write to be dropped?
- * Only consulted when cache_turbo_test_varidx_fail is on, so an unarmed
- * location ignores the header entirely. */
+/* Does this request carry `<name>: 1`? Shared by the COR-5 fault-injection
+ * triggers below; only consulted when cache_turbo_test_varidx_fail is on, so
+ * an unarmed location ignores the headers entirely. */
 static ngx_uint_t
-ngx_http_cache_turbo_test_varidx_drop_requested(ngx_http_request_t *r)
+ngx_http_cache_turbo_test_hdr_set(ngx_http_request_t *r, const char *name,
+    size_t nlen)
 {
     ngx_list_part_t  *part = &r->headers_in.headers.part;
     ngx_table_elt_t  *h = part->elts;
@@ -77,10 +78,8 @@ ngx_http_cache_turbo_test_varidx_drop_requested(ngx_http_request_t *r)
             i = 0;
         }
 
-        if (h[i].key.len == sizeof("X-Cache-Turbo-Test-Varidx-Drop") - 1
-            && ngx_strncasecmp(h[i].key.data,
-                   (u_char *) "X-Cache-Turbo-Test-Varidx-Drop",
-                   sizeof("X-Cache-Turbo-Test-Varidx-Drop") - 1) == 0
+        if (h[i].key.len == nlen
+            && ngx_strncasecmp(h[i].key.data, (u_char *) name, nlen) == 0
             && h[i].value.len == 1 && h[i].value.data[0] == '1')
         {
             return 1;
@@ -88,6 +87,34 @@ ngx_http_cache_turbo_test_varidx_drop_requested(ngx_http_request_t *r)
     }
 
     return 0;
+}
+
+
+/* COR-5(b): does this request ask for its variant-index write to be dropped? */
+static ngx_uint_t
+ngx_http_cache_turbo_test_varidx_drop_requested(ngx_http_request_t *r)
+{
+    return ngx_http_cache_turbo_test_hdr_set(r,
+               "X-Cache-Turbo-Test-Varidx-Drop",
+               sizeof("X-Cache-Turbo-Test-Varidx-Drop") - 1);
+}
+
+
+/* COR5-PURGE-VARIDX-RACE: does this request ask for its variant-index write to
+ * be left IN FLIGHT -- handed to the transport, never acknowledged?
+ *
+ * This is a different fault from the drop above, and the distinction is the
+ * whole point of the defect: a drop is detected (tag_add returns NGX_ERROR,
+ * varidx_drops moves, the pending bit arms), whereas an unacknowledged write
+ * reports success at every layer while the index set is still short a variant.
+ * Reproducing it deterministically is what turns a rare timing race into a
+ * test. */
+static ngx_uint_t
+ngx_http_cache_turbo_test_varidx_hold_requested(ngx_http_request_t *r)
+{
+    return ngx_http_cache_turbo_test_hdr_set(r,
+               "X-Cache-Turbo-Test-Varidx-Hold",
+               sizeof("X-Cache-Turbo-Test-Varidx-Hold") - 1);
 }
 
 
@@ -2317,6 +2344,26 @@ ngx_http_cache_turbo_body_filter_varidx_store(ngx_http_request_t *r,
             && ngx_http_cache_turbo_test_varidx_drop_requested(r))
         {
             varidx_rc = NGX_ERROR;
+        } else if (clcf->test_varidx_fail
+                   && ngx_http_cache_turbo_test_varidx_hold_requested(r))
+        {
+            /* COR5-PURGE-VARIDX-RACE: stand in for a SADD that reached the
+             * transport and has not been acknowledged yet. Account it as
+             * in-flight and SKIP the call, so the index set genuinely does
+             * not list this variant while every layer reports success --
+             * the exact state a PURGE racing a fresh store observes.
+             *
+             * Skipped rather than called-then-held for the same reason the
+             * drop arm above skips: issuing the SADD would leave the index
+             * already correct and make the assertion vacuous.
+             *
+             * This increment is deliberately never decremented -- the fault
+             * models a write that is never acknowledged. Zone-scoped, so the
+             * test that arms it must be the last purge assertion against its
+             * zone, or heal the gap the way the drop test does. */
+            (void) ngx_atomic_fetch_add(
+                       &ngx_http_cache_turbo_zone_sh(z)->varidx_inflight, 1);
+            varidx_rc = NGX_OK;
         } else
 #endif
         {
