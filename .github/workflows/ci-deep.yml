@@ -1,4 +1,4 @@
-# sync-sha: e3534c5044b9ee64b63f6290c5237cebc9ac029b0a52a29aa2adc0e19e723b45
+# sync-sha: b9faa8c39b9b09ba2e1dd0faaa0e96547d5f84ac2704064782380f19c7f7d51f
 name: CI Deep
 
 # Exhaustive dynamic analysis — monthly cron + on-demand only, NEVER on PR.
@@ -634,7 +634,16 @@ jobs:
     # self-contained; no cross-workflow artifact reuse).
     name: ASan multi-worker soak (flake repetition)
     runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
-    timeout-minutes: 60
+    # 180, not 60: one iteration of the fault-injection suite costs ~13 min
+    # under ASan, so the default 8 iterations is ~104 min of soak plus ~6 min
+    # of build -- the old 60 could not fit its OWN default and was cancelled
+    # around iteration 4 every time it got far enough to try (run
+    # 32841340162, cancelled at exactly 60m00s with every build step green).
+    # Earlier runs failed on a test flake before reaching the wall, which hid
+    # this; the 58-min "supersede" noted in the concurrency block above may be
+    # the same defect misattributed. Sized at ~60% headroom over the measured
+    # ~110 min, still below the 240 the two Valgrind soaks get for less work.
+    timeout-minutes: 180
     # AUD-CIPORT1: own 64-wide port band, distinct from every other
     # runtime-bearing job on this shared runner. The nested per-iteration
     # sweep below shares this SAME band -- it is not a separate job. See
