@@ -138,7 +138,21 @@ case "$MODE" in
         # poisoning and no --with-debug logging. This is not the distro's
         # hardened -O2 set — it is a neutral upstream baseline. The module stays
         # a dynamic .so; bench it with MODULE=<.so> ci/tools/bench.sh.
-        CC_OPT="$TEST_OPT"
+        #
+        # -flto=auto -ffat-lto-objects: the module's 15 src/*.c are compiled
+        # as separate TUs, so every cross-TU accessor (get_u16/u32/u64, put_*,
+        # blob_acquire, digest_update — 2-3 instructions each) is a real call
+        # on the hit path instead of inlining. Measured on 59d30b5f: .text
+        # 113535 -> 112116 bytes, intra-module calls 451 -> 325 (-28%), and all
+        # 48 cross-TU accessor call sites inline to zero. -ffat-lto-objects
+        # keeps a non-LTO fallback object alongside the IR in each .o (a real
+        # compile-time cost) but nginx's ./configure probe-compiles a handful
+        # of throwaway .c files outside the LTO link graph, and the shared
+        # dynamic module link mixes module objects with nginx core objects
+        # built by the same --with-cc-opt/--with-ld-opt — fat objects keep
+        # those non-LTO consumers linkable without a second build mode.
+        CC_OPT="$TEST_OPT -flto=auto -ffat-lto-objects"
+        LD_OPT="-flto=auto"
         WITH_DEBUG=""
         ;;
     profile)
@@ -148,7 +162,12 @@ case "$MODE" in
         # instead of dropping into '[unknown]'. No NGX_DEBUG_PALLOC / --with-debug
         # so nothing extra runs on the profiled path. The module stays a
         # dynamic .so; profile it with MODULE=<.so> ci/tools/perf-profile.sh.
-        CC_OPT="$TEST_OPT -g -O2 -fno-omit-frame-pointer"
+        #
+        # -flto=auto -ffat-lto-objects: same cross-TU inlining as `nginx`
+        # mode above (see that comment) — the profiled build should reflect
+        # the shipped code path, not a slower non-LTO one.
+        CC_OPT="$TEST_OPT -g -O2 -fno-omit-frame-pointer -flto=auto -ffat-lto-objects"
+        LD_OPT="-flto=auto"
         WITH_DEBUG=""
         ;;
 esac
