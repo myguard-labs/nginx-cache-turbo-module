@@ -44,8 +44,8 @@ typedef unsigned long  ngx_uint_t;
  * not ship. 8 is a power of two (so a modulo bug that is really a mask still
  * has to distribute) and 7 is co-prime with it (so the odd-N path is covered
  * too, where mask-vs-modulo genuinely differ). */
-#define TEST_STRIPES  8
-#define TEST_STRIPES_ODD  7
+#define TEST_STRIPES      8u
+#define TEST_STRIPES_ODD  7u
 
 typedef struct {
     void  *sh;
