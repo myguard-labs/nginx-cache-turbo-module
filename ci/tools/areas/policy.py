@@ -2986,7 +2986,27 @@ def test_serve_reason_variable(ng: Nginx, origin: Origin) -> None:
     fetch(ng.port, "/sr72/k1")                    # prime: MISS (SR_NONE, no
                                                     # unfolded reason for a cold
                                                     # miss -- not asserted here)
+    t_store = time.monotonic()                    # 1s fresh clock starts here
     _, _, h_fresh = fetch(ng.port, "/sr72/k1")
+    # TTL-FRESH-RACE (2026-08-24, asan-soak iteration 2/8): /sr72/ has a 1s
+    # fresh window and this read must land INSIDE it. Under ASan +
+    # fault-injection the prime and this re-read together can exceed 1s, and
+    # the entry is then legitimately STALE -- a slow box, not a broken
+    # $cache_turbo_serve_reason. Same near-edge class as the TTL-REVAL-RACE
+    # note on test_rfc1_request_max_stale, but this arm cannot be fixed by
+    # sleeping longer (it needs to be EARLY, not late), so the elapsed time is
+    # asserted as an explicit timing precondition instead. NOT scaled through
+    # sanitizer_time_scale(): that helper stretches how long the TEST waits,
+    # but this budget is a deadline the SERVER enforces -- cache_turbo_valid
+    # 1s is real wall-clock under every build, so widening it here would just
+    # let a genuinely-stale read through to fail the assertion below instead.
+    elapsed = time.monotonic() - t_store
+    assert elapsed < 1.0, \
+        ("TIMING PRECONDITION violated: box too slow to read back inside the "
+         f"1s fresh window -- elapsed={elapsed:.3f}s since store. This is an "
+         "environment speed problem, not a "
+         "module-behaviour failure; do not read the assertion below as "
+         "evidence $cache_turbo_serve_reason mis-reports FRESH.")
     assert h_fresh.get("x-ct-reason") == "FRESH", \
         f"fresh serve should report FRESH, got {h_fresh.get('x-ct-reason')}"
 
