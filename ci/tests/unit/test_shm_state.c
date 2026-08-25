@@ -650,7 +650,7 @@ test_s8_evict_terminates_on_empty_queues(void)
  * n_entries and a store can never wedge behind it.
  *
  * mk_live_sie_entry() fabricates a real ENTRY node with a real blob (via
- * blob_alloc(), same as the blob-lifecycle tests below) whose CTB4 wire
+ * blob_alloc(), same as the blob-lifecycle tests below) whose CTB5 wire
  * header carries `created`/`sie_ttl` at the production offsets (24/40) --
  * the exact bytes ngx_http_cache_turbo_shm_node_sie_live() reads. No writer
  * helper exists in this harness (module.c's blob_hdr_write is not sliced),
@@ -658,7 +658,7 @@ test_s8_evict_terminates_on_empty_queues(void)
  * ngx_http_cache_turbo_blob_hdr_t.
  * ===================================================================== */
 
-#define CTB4_HDR_LEN  44
+#define CTB5_HDR_LEN  76
 
 static void
 put_u32_le(u_char *p, uint32_t v)
@@ -712,7 +712,7 @@ mk_live_sie_entry(int keyn, int live)
     ctn->kind = NGX_HTTP_CACHE_TURBO_NODE_ENTRY;
     ctn->seg  = NGX_HTTP_CACHE_TURBO_SEG_PROBATION;
 
-    blob = ngx_http_cache_turbo_blob_alloc(&g_zone, CTB4_HDR_LEN);
+    blob = ngx_http_cache_turbo_blob_alloc(&g_zone, CTB5_HDR_LEN);
     if (blob == NULL) {
         tests_run++;
         tests_failed++;
@@ -732,7 +732,7 @@ mk_live_sie_entry(int keyn, int live)
     put_u32_le(blob + 40, sie_ttl);
 
     ctn->data = blob;
-    ctn->len  = CTB4_HDR_LEN;
+    ctn->len  = CTB5_HDR_LEN;
 
     ngx_queue_insert_head(&g_sh.lru, &ctn->lru);
     g_sh.n_entries++;

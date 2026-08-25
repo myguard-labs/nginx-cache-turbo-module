@@ -1658,34 +1658,70 @@ def _redis_conns_received(redis: RedisServer) -> int:
     raise RuntimeError("total_connections_received absent from INFO stats")
 
 
-def make_ctb4_blob(body: bytes, status: int = 200,
+#: CTB5 role tags (src/ngx_http_cache_turbo_internal.h NGX_HTTP_CACHE_TURBO_HROLE_*).
+CTB5_HROLE = {
+    "content-type": 1,
+    "etag": 2,
+    "last-modified": 3,
+}
+CTB5_DATE_LEN = 29
+
+
+def ctb5_date(created: int) -> bytes:
+    """The exact 29 bytes ngx_http_time() renders for `created` -- what
+    blob_hdr_write() now stores and restore memcpy's out as the Date header."""
+    return time.strftime("%a, %d %b %Y %H:%M:%S GMT",
+                         time.gmtime(created)).encode("ascii")
+
+
+def make_ctb5_blob(body: bytes, status: int = 200,
                    headers: dict[str, str] | None = None,
                    created: int | None = None, fresh_ttl: int = 60,
                    stale_ttl: int = 240, sie_ttl: int = 0,
-                   magic: int = 0x43544234,
-                   version: int = 4, flags: int = 0) -> bytes:
-    """Hand-build a CTB4 cache blob exactly as the module serialises it (STAB-4 +
-    RFC-2: fixed 44-byte little-endian, padding-free header). Pass a wrong
-    magic/version to exercise the validator's reject path. Wire layout (LE):
+                   magic: int = 0x43544235,
+                   version: int = 5, flags: int = 0,
+                   date_field: bytes | None = None,
+                   date_len: int | None = None,
+                   role_of: "dict[str, int] | None" = None) -> bytes:
+    """Hand-build a CTB5 cache blob exactly as the module serialises it (STAB-4 +
+    RFC-2 + PERF-AUD2-02/03: fixed 76-byte little-endian, padding-free header).
+    Pass a wrong magic/version to exercise the validator's reject path. Wire
+    layout (LE):
       u32 magic, u16 version, u16 flags, u32 status, u32 nheaders, u32 headers_len,
-      u32 body_len, i64 created, u32 fresh_ttl, u32 stale_ttl, u32 sie_ttl.
+      u32 body_len, i64 created, u32 fresh_ttl, u32 stale_ttl, u32 sie_ttl,
+      u8 date_len, u8[29] date, u8[2] reserved
+    followed by nheaders TLV entries of { u8 role, u32 nlen, name, u32 vlen, value }.
 
     `flags` writes the BLOBF_* u16 at offset 6. It defaults to 0 (no bits),
     which is what every pre-P4-3 caller assumed. Pass BLOBF_HDRS_VETTED
     (0x0020) to FORGE the "these headers were already vetted" claim an L2
     writer would most want to make -- the module must strip it at L2 ingress
-    and re-run header_admissible() anyway."""
+    and re-run header_admissible() anyway.
+
+    `date_field` / `date_len` override the rendered Date field and its length
+    byte independently, so a test can forge exactly the shapes the validator
+    must reject (short field, over-long length byte, CR/LF or NUL in the
+    value). `role_of` overrides a header's role tag by lower-cased name, for
+    the out-of-range-tag rejection test."""
     headers = headers or {"Content-Type": "text/plain"}
     created = int(time.time()) if created is None else created
+    role_of = role_of or {}
     hdr_block = b""
     nheaders = 0
     for name, value in headers.items():
         nb = name.encode()
         vb = value.encode()
+        role = role_of.get(name.lower(),
+                           CTB5_HROLE.get(name.lower(), 0))
+        hdr_block += bytes([role & 0xFF])
         hdr_block += struct.pack("<I", len(nb)) + nb
         hdr_block += struct.pack("<I", len(vb)) + vb
         nheaders += 1
+    dfield = ctb5_date(created) if date_field is None else date_field
+    dfield = dfield[:CTB5_DATE_LEN].ljust(CTB5_DATE_LEN, b"\x00")
+    dlen = CTB5_DATE_LEN if date_len is None else date_len
     head = struct.pack("<IHHIIIIqIII", magic, version, flags, status, nheaders,
                        len(hdr_block), len(body), created, fresh_ttl, stale_ttl,
                        sie_ttl)
+    head += bytes([dlen & 0xFF]) + dfield + b"\x00\x00"
     return head + hdr_block + body

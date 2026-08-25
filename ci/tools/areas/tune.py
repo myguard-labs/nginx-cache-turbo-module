@@ -1378,7 +1378,7 @@ def test_l2_memcached_forged_vetted_bit_does_not_bypass_header_gate(
     mc.command(b"delete " + key.encode() + b"\r\n")
 
     seeded = b"mc-forged-vetted-body\n"
-    blob = make_ctb4_blob(seeded, headers={
+    blob = make_ctb5_blob(seeded, headers={
         # positive control: must survive, else the clean assertions are vacuous.
         "Content-Type":       "text/plain",
         "X-Split":            "ok\r\nInjected: yes",

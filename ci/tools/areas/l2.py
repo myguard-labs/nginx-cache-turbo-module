@@ -359,7 +359,7 @@ def test_l2_expired_consults_l2(ng: Nginx, origin: Origin,
     time.sleep(1.3)                                # past stale_until (stale_mult 1 -> 1s)
     # both L1 and L2 are expired now; reseed ONLY L2 with a fresh, valid blob
     seeded = b"l2-seeded\n"
-    blob = make_ctb4_blob(seeded, headers={"Content-Type": "text/plain"})
+    blob = make_ctb5_blob(seeded, headers={"Content-Type": "text/plain"})
     redis.set_raw(l2_key(uri), blob, 60_000)       # binary-safe raw RESP SET
     assert redis.cli("EXISTS", l2_key(uri)) == "1", "failed to seed L2"
 
@@ -382,7 +382,7 @@ def test_l2_preserves_original_freshness(ng: Nginx, origin: Origin,
     key = l2_key(uri)
     redis.cli("DEL", key, lock_key(uri))
     seeded = b"l2-aged\n"
-    blob = make_ctb4_blob(
+    blob = make_ctb5_blob(
         seeded, created=int(time.time()) - 2, fresh_ttl=1, stale_ttl=4)
     redis.set_raw(key, blob, 60_000)
 
@@ -450,7 +450,7 @@ def test_l2_forged_blob_cannot_inject_headers(ng: Nginx, origin: Origin,
     redis.cli("DEL", key, lock_key(uri))
 
     seeded = b"forged-l2-body\n"
-    blob = make_ctb4_blob(seeded, headers={
+    blob = make_ctb5_blob(seeded, headers={
         # benign, and the POSITIVE CONTROL: it must SURVIVE. Without it a gate
         # that dropped every stored header -- or a serve that quietly fell
         # through to the origin -- would satisfy every assertion below.
@@ -601,7 +601,7 @@ def test_l2_forged_vetted_bit_does_not_bypass_header_gate(
     redis.cli("DEL", key, lock_key(uri))
 
     seeded = b"forged-vetted-body\n"
-    blob = make_ctb4_blob(seeded, headers={
+    blob = make_ctb5_blob(seeded, headers={
         # positive control -- must SURVIVE, or a gate that dropped everything
         # (or a silent fall-through to origin) would satisfy the rest vacuously.
         "Content-Type":       "text/plain",
@@ -612,7 +612,7 @@ def test_l2_forged_vetted_bit_does_not_bypass_header_gate(
     }, flags=BLOBF_HDRS_VETTED)
 
     # Prove the fixture really carries the bit before asserting the module
-    # ignores it. Without this, a make_ctb4_blob() that silently dropped the
+    # ignores it. Without this, a make_ctb5_blob() that silently dropped the
     # flags argument would leave every assertion below passing for the wrong
     # reason -- it would just be re-running the unforged test.
     assert struct.unpack_from("<H", blob, 6)[0] & BLOBF_HDRS_VETTED, \
@@ -701,7 +701,7 @@ def test_l2_restore_href_array_alignment_ubsan(ng: Nginx, origin: Origin,
     # the bug. Values are distinct so a misaligned/garbage read is visible as
     # wrong bytes even if the worker does not outright crash.
     seeded = b"href-align-body\n"
-    blob = make_ctb4_blob(seeded, headers={
+    blob = make_ctb5_blob(seeded, headers={
         "Content-Type": "text/plain",
         "X-Align-A":    "alpha",
         "X-Align-B":    "bravo-bravo",
@@ -772,7 +772,7 @@ def test_sie_forged_blob_cannot_inject_headers(ng: Nginx, origin: Origin,
 
     seeded = b"forged-sie-body\n"
     now = int(time.time())
-    blob = make_ctb4_blob(
+    blob = make_ctb5_blob(
         seeded,
         headers={
             # benign positive control -- must SURVIVE, see the L2 test for why.
@@ -833,6 +833,88 @@ def test_sie_forged_blob_cannot_inject_headers(ng: Nginx, origin: Origin,
         drain_origin(origin)
 
 
+def test_ctb5_date_replayed_from_blob(ng: Nginx, origin: Origin,
+                                      redis: RedisServer) -> None:
+    """CTB5 / PERF-AUD2-02: the Date header on a hit is the 29 bytes STORED in
+    the blob, not a per-hit ngx_http_time() render of `created`.
+
+    The oracle has to distinguish those two, and simply asserting
+    Date == render(created) cannot -- the old formatting path produced exactly
+    that. So the seeded blob's stored Date field is deliberately set to a
+    DIFFERENT (but well-formed) timestamp than its `created` field, and the
+    test asserts the served Date is the STORED bytes. Only a restore that
+    memcpy's the field can pass; a restore that formats `created` returns the
+    other value.
+
+    Age still derives from `created`, so the two fields stay independently
+    observable and the assertion cannot be satisfied by accident."""
+    uri = "/l2e/ctb5-date"
+    key = l2_key(uri)
+    redis.cli("DEL", key, lock_key(uri))
+
+    created = int(time.time())
+    stored_date = b"Wed, 07 Feb 2018 11:22:33 GMT"
+    assert len(stored_date) == CTB5_DATE_LEN
+    assert stored_date != ctb5_date(created), \
+        "fixture is vacuous: the stored Date matches what created would render"
+
+    seeded = b"ctb5-date-body\n"
+    redis.set_raw(key, make_ctb5_blob(seeded, created=created,
+                                      date_field=stored_date), 60_000)
+
+    origin_before = origin.hits
+    s, body, h = fetch(ng.port, uri)
+    assert s == 200 and body == seeded.decode(), f"{s} {body!r}"
+    assert h.get("x-cache") == "HIT", \
+        f"seeded L2 blob should serve as HIT, got {h.get('x-cache')}"
+    assert origin.hits == origin_before, "origin consulted despite a fresh L2 copy"
+    assert h.get("date") == stored_date.decode(), \
+        f"Date {h.get('date')!r} is not the blob's stored field " \
+        f"{stored_date.decode()!r} -- restore re-formatted created instead " \
+        "of replaying the precomputed field"
+
+
+def test_ctb5_role_tag_restores_typed_headers(ng: Nginx, origin: Origin,
+                                              redis: RedisServer) -> None:
+    """CTB5 / PERF-AUD2-03: restore_response_headers() files Content-Type,
+    ETag and Last-Modified off the stored role tag instead of re-comparing
+    names. All three must still land in exactly the places they landed before:
+    Content-Type on the typed field (so it comes back as the response's
+    Content-Type, not a duplicate list header), ETag/Last-Modified emitted AND
+    captured for the conditional-request comparison.
+
+    The conditional leg is what proves the ETag was captured rather than
+    merely echoed: a matching If-None-Match must produce a 304, which only
+    happens if the role switch stored *etagp."""
+    uri = "/l2e/ctb5-roles"
+    key = l2_key(uri)
+    redis.cli("DEL", key, lock_key(uri))
+
+    seeded = b"ctb5-roles-body\n"
+    redis.set_raw(key, make_ctb5_blob(seeded, headers={
+        "Content-Type": "application/x-ctb5",
+        "ETag": '"ctb5tag"',
+        "Last-Modified": "Wed, 07 Feb 2018 11:22:33 GMT",
+        "X-Plain": "other-role",
+    }), 60_000)
+
+    s, body, h = fetch(ng.port, uri)
+    assert s == 200 and body == seeded.decode(), f"{s} {body!r}"
+    assert h.get("x-cache") == "HIT", f"expected HIT, got {h.get('x-cache')}"
+    assert h.get("content-type") == "application/x-ctb5", \
+        f"Content-Type not restored onto the typed field: {h.get('content-type')}"
+    assert h.get("etag") == '"ctb5tag"', f"ETag not emitted: {h.get('etag')}"
+    assert h.get("last-modified") == "Wed, 07 Feb 2018 11:22:33 GMT", \
+        f"Last-Modified not emitted: {h.get('last-modified')}"
+    assert h.get("x-plain") == "other-role", \
+        f"an HROLE_OTHER header was lost: {h.get('x-plain')}"
+
+    s2, b2, _ = fetch_raw(ng.port, uri,
+                          headers={"If-None-Match": '"ctb5tag"'})
+    assert s2 == 304 and b2 == "", \
+        f"role-tagged ETag was not captured for the conditional: {s2} {b2!r}"
+
+
 def test_l2_malformed_blob_rejected(ng: Nginx, origin: Origin,
                                     redis: RedisServer) -> None:
     """STAB-4: a malformed L2 blob must be fully validated and REJECTED before it
@@ -841,20 +923,73 @@ def test_l2_malformed_blob_rejected(ng: Nginx, origin: Origin,
     and a subsequent request that is a legitimate HIT (no poisoned L1, no crash).
     The origin serves a dynamic gen-<n> body."""
     cases = {
-        "wrong-magic":   make_ctb4_blob(b"x", magic=0x43544232),     # CTB2
-        "wrong-version": make_ctb4_blob(b"x", version=2),
+        "wrong-magic":   make_ctb5_blob(b"x", magic=0x43544232),     # CTB2
+        "wrong-version": make_ctb5_blob(b"x", version=2),
         # CTB3 (prior wire format): a stale on-disk blob from the pre-RFC-2 build
         # must miss-to-origin once (self-heal), not be parsed at a shifted layout.
-        "old-ctb3":      make_ctb4_blob(b"x", magic=0x43544233, version=3),
-        # valid magic+version but headers_len lies past the buffer end
-        "hdrlen-overflow": (
+        "old-ctb3":      make_ctb5_blob(b"x", magic=0x43544233, version=3),
+        # CTB5 (PERF-AUD2-02/03): the IMMEDIATELY PRIOR format. This is the L2
+        # ingress case the version bump exists for -- a CTB4 blob written by a
+        # peer node still running the old build lands in a shared Redis and
+        # must be rejected as a clean MISS, with no partial parse at the old
+        # 44-byte header offsets and no OOB read off the shorter header. Built
+        # verbatim at the CTB4 layout (44-byte header, 8-byte-minimum TLV
+        # entries with NO role byte), not by asking make_ctb5_blob() to lie
+        # about its version, so the bytes really are the old wire format.
+        "old-ctb4": (
             struct.pack("<IHHIIIIqIII", 0x43544234, 4, 0, 200, 1,
-                        0xFFFF, 1, int(time.time()), 60, 240, 0) + b"\x01"),
-        # body_len lies past the buffer end
-        "bodylen-overflow": (
-            struct.pack("<IHHIIIIqIII", 0x43544234, 4, 0, 200, 0,
-                        0, 0xFFFF, int(time.time()), 60, 240, 0)),
+                        4 + 12 + 4 + 10, 1, int(time.time()), 60, 240, 0)
+            + struct.pack("<I", 12) + b"Content-Type"
+            + struct.pack("<I", 10) + b"text/plain"
+            + b"x"),
     }
+
+    # The two length-overflow cases are built directly on the CTB5 header so
+    # the forged length is the ONLY thing wrong with them (a wrong header size
+    # would be caught by the magic/version check first and prove nothing).
+    def _ctb5_head(nheaders: int, headers_len: int, body_len: int) -> bytes:
+        created = int(time.time())
+        head = struct.pack("<IHHIIIIqIII", 0x43544235, 5, 0, 200, nheaders,
+                           headers_len, body_len, created, 60, 240, 0)
+        return head + bytes([29]) + ctb5_date(created) + b"\x00\x00"
+
+    cases["hdrlen-overflow"] = _ctb5_head(1, 0xFFFF, 1) + b"\x01"
+    cases["bodylen-overflow"] = _ctb5_head(0, 0, 0xFFFF)
+
+    # --- CTB5 (PERF-AUD2-02/03) field-level rejects. -----------------------
+    # The stored Date field is chosen by whoever wrote the L2 entry, and
+    # restore emits it VERBATIM as a response header value -- the AUD-HDR1
+    # response-splitting primitive. It must be validated, never replayed on
+    # trust, so each of these must be a clean MISS rather than a served
+    # response carrying the forged bytes.
+    #
+    # A blob one byte short of the fixed header: the validator's very first
+    # length check must reject it before ANY field read, or the date/role
+    # reads below run off the end of the buffer.
+    cases["truncated-header"] = _ctb5_head(0, 0, 0)[:75]
+    # date_len != 29. Both directions: a short field would leave the tail of
+    # the fixed slot unexamined by the charset scan, a long one cannot fit.
+    cases["date-len-short"] = make_ctb5_blob(b"x", date_len=28)
+    cases["date-len-long"] = make_ctb5_blob(b"x", date_len=200)
+    cases["date-len-zero"] = make_ctb5_blob(b"x", date_len=0)
+    # CR / LF in the Date value: response splitting if it were ever emitted.
+    cases["date-crlf"] = make_ctb5_blob(
+        b"x", date_field=b"Thu, 01 Jan 2026 00:00:00\r\nX: y")
+    # NUL in the Date value: truncates the header on the wire.
+    cases["date-nul"] = make_ctb5_blob(
+        b"x", date_field=b"Thu, 01 Jan 2026 00:00:0\x00 GMT")
+    # A high-bit byte is outside the printable-ASCII range the check requires.
+    cases["date-high-byte"] = make_ctb5_blob(
+        b"x", date_field=b"Thu, 01 Jan 2026 00:00:00 GM\xff")
+    # Out-of-range role tag (HROLE_MAX is 3). restore_response_headers()
+    # switches on this value with no validating default arm, so the walk is
+    # the only thing standing between a forged tag and that switch.
+    cases["role-out-of-range"] = make_ctb5_blob(
+        b"x", headers={"Content-Type": "text/plain"},
+        role_of={"content-type": 9})
+    cases["role-255"] = make_ctb5_blob(
+        b"x", headers={"Content-Type": "text/plain"},
+        role_of={"content-type": 255})
 
     for name, blob in cases.items():
         uri = f"/l2/bad-{name}"
@@ -899,10 +1034,10 @@ def test_sie_ttl_stored_in_blob(ng: Nginx, origin: Origin,
         "object never written to L2"
 
     blob = redis.get_raw(key)
-    assert blob is not None and len(blob) >= 44, f"short/absent blob: {blob!r}"
+    assert blob is not None and len(blob) >= 76, f"short/absent blob: {blob!r}"
     magic, version = struct.unpack("<IH", blob[:6])
-    assert magic == 0x43544234, f"blob magic {magic:#x} != CTB4 (0x43544234)"
-    assert version == 4, f"blob version {version} != 4"
+    assert magic == 0x43544235, f"blob magic {magic:#x} != CTB5 (0x43544235)"
+    assert version == 5, f"blob version {version} != 5"
     fresh_ttl, stale_ttl, sie_ttl = struct.unpack("<III", blob[32:44])
     assert fresh_ttl == 60, f"fresh_ttl {fresh_ttl} != 60 (location valid)"
     assert sie_ttl == 90, f"sie_ttl {sie_ttl} != fresh_ttl+30 (90)"

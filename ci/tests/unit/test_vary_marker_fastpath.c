@@ -54,9 +54,12 @@
 
 typedef unsigned char u_char;
 
-#define BLOB_MAGIC    0x43544234u
-#define BLOB_VERSION  4u
-#define HDR_WIRE      44u
+#define BLOB_MAGIC    0x43544235u
+#define BLOB_VERSION  5u
+#define HDR_WIRE      76u
+/* CTB5: the fixed rendered-Date field every blob (markers included) carries. */
+#define DATE_LEN      29u
+#define DATE_OFF      45u
 #define CREATED_MIN   ((int64_t) 0)
 #define FOREVER_TTL   ((int64_t) 315360000)
 
@@ -121,6 +124,15 @@ build_marker(u_char *blob, size_t bloblen, uint32_t magic, uint16_t version,
     put_u32(blob + 32, fresh_ttl);
     put_u32(blob + 36, stale_ttl);
     put_u32(blob + 40, 0);             /* sie_ttl */
+    /* CTB5: marker_store() goes through blob_hdr_write(), which renders
+     * `created` into the fixed 29-byte Date field on EVERY blob. A marker with
+     * a zeroed field would be rejected by the charset check, so the corpus
+     * must carry a real one -- exactly the property this mirror is here to
+     * keep honest. */
+    if (bloblen >= HDR_WIRE) {
+        memcpy(blob + DATE_OFF, "Thu, 01 Jan 1970 00:00:00 GMT", DATE_LEN);
+        blob[44] = (u_char) DATE_LEN;
+    }
     if (bloblen > HDR_WIRE) {
         blob[HDR_WIRE] = bits;
     }
@@ -172,10 +184,24 @@ mirror_old_gate(const u_char *blob, size_t len, u_char *bits_out,
          * moving wall clock. */
         return 0;
     }
+    /* CTB5: the rendered-Date field is validated BEFORE the framing checks,
+     * mirroring blob.c's order. */
+    if (blob[44] != DATE_LEN) {
+        return 0;
+    }
+    {
+        uint32_t  di;
+        for (di = 0; di < DATE_LEN; di++) {
+            u_char c = blob[DATE_OFF + di];
+            if (c < 0x20 || c > 0x7E) {
+                return 0;
+            }
+        }
+    }
     if (headers_len > len - HDR_WIRE || body_len > len - HDR_WIRE - headers_len) {
         return 0;
     }
-    if (nheaders > headers_len / 8) {
+    if (nheaders > headers_len / 9) {
         return 0;
     }
     /* headers_len == 0 for every marker in this corpus => the TLV walk body

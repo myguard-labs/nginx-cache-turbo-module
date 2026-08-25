@@ -1604,6 +1604,55 @@ ngx_http_cache_turbo_verdict_get(ngx_http_cache_turbo_hdr_verdicts_t *v,
 }
 
 
+/*
+ * CTB5 / PERF-AUD2-03: classify one stored header name into its
+ * NGX_HTTP_CACHE_TURBO_HROLE_* tag, at STORE time. This is the ONLY place the
+ * three name compares restore_response_headers() used to run on every hit are
+ * still performed -- once per header per STORE instead of once per header per
+ * HIT.
+ *
+ * ⚠ The measure pass and the emit pass must agree on the tag as strictly as
+ * they agree on admissibility (AUD-HDR1): the role byte is part of the block
+ * they size and write. They agree by construction because both call THIS
+ * helper -- one implementation, called twice, exactly like
+ * ngx_http_cache_turbo_header_admissible(). The tag never changes the number
+ * of bytes an entry costs (it is a fixed one byte on every entry), so a
+ * hypothetical disagreement could not desynchronise headers_len; it is still
+ * routed through one helper so the two blocks cannot describe different
+ * headers.
+ *
+ * The same length + case-folded-first-byte guard the restore path used to
+ * carry is kept here, for the same reason it existed there: it turns an
+ * ordinary header into two integer compares instead of a string comparison.
+ */
+static ngx_uint_t
+ngx_http_cache_turbo_header_role(const u_char *nm, size_t nl)
+{
+    if (nl == sizeof("Content-Type") - 1
+        && (nm[0] | 0x20) == 'c'
+        && ngx_strncasecmp((u_char *) nm, (u_char *) "Content-Type", nl) == 0)
+    {
+        return NGX_HTTP_CACHE_TURBO_HROLE_CONTENT_TYPE;
+    }
+
+    if (nl == sizeof("ETag") - 1
+        && (nm[0] | 0x20) == 'e'
+        && ngx_strncasecmp((u_char *) nm, (u_char *) "ETag", nl) == 0)
+    {
+        return NGX_HTTP_CACHE_TURBO_HROLE_ETAG;
+    }
+
+    if (nl == sizeof("Last-Modified") - 1
+        && (nm[0] | 0x20) == 'l'
+        && ngx_strncasecmp((u_char *) nm, (u_char *) "Last-Modified", nl) == 0)
+    {
+        return NGX_HTTP_CACHE_TURBO_HROLE_LAST_MODIFIED;
+    }
+
+    return NGX_HTTP_CACHE_TURBO_HROLE_OTHER;
+}
+
+
 /* First pass: measure the header block that _blob_write() will emit.
  *
  * ⚠ AUD-HDR1: this walk and the emit walk in _blob_write() MUST make
@@ -1660,7 +1709,8 @@ ngx_http_cache_turbo_body_filter_measure_headers(ngx_http_request_t *r,
                ct->data, ct->len))
     {
         verdicts->ct_admissible = 1;
-        hdr_bytes += sizeof(uint32_t) + sizeof("Content-Type") - 1
+        /* CTB5: +1 for the leading role byte on every TLV entry. */
+        hdr_bytes += 1 + sizeof(uint32_t) + sizeof("Content-Type") - 1
                      + sizeof(uint32_t) + ct->len;
         nheaders++;
     }
@@ -1696,7 +1746,8 @@ ngx_http_cache_turbo_body_filter_measure_headers(ngx_http_request_t *r,
         }
 
         ngx_http_cache_turbo_verdict_set(verdicts, idx);
-        hdr_bytes += sizeof(uint32_t) + h[i].key.len
+        /* CTB5: +1 for the leading role byte on every TLV entry. */
+        hdr_bytes += 1 + sizeof(uint32_t) + h[i].key.len
                      + sizeof(uint32_t) + h[i].value.len;
         nheaders++;
     }
@@ -1708,7 +1759,7 @@ ngx_http_cache_turbo_body_filter_measure_headers(ngx_http_request_t *r,
 }
 
 
-/* Serialise the blob: the fixed 44-byte LE wire header (STAB-4), then the
+/* Serialise the blob: the fixed 76-byte LE wire header (STAB-4/CTB5), then the
  * header block, then the captured body. `blob` must be at least
  * NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE + hdr_bytes + ctx->body_len bytes, as
  * measured by _measure_headers(). The header emit walk here is the second
@@ -1802,9 +1853,13 @@ ngx_http_cache_turbo_body_filter_blob_write(ngx_http_request_t *r,
 
     w = blob + NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE;
 
-    /* write a single name/value pair (lengths fixed-endian, STAB-4) */
+    /* write a single name/value pair (lengths fixed-endian, STAB-4).
+     * CTB5: prefixed by the one-byte role tag, derived from the name by the
+     * SAME helper the measure pass used -- see its comment. */
     #define CT_PUT(np, nl, vp, vl)                                     \
         do {                                                          \
+            *w++ = (u_char) ngx_http_cache_turbo_header_role(          \
+                       (const u_char *) (np), (size_t) (nl));         \
             ngx_http_cache_turbo_put_u32(w, (uint32_t) (nl)); w += 4; \
             ngx_memcpy(w, (np), (nl)); w += (nl);                     \
             ngx_http_cache_turbo_put_u32(w, (uint32_t) (vl)); w += 4; \

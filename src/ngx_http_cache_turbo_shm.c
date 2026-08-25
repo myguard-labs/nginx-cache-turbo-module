@@ -910,10 +910,10 @@ ngx_http_cache_turbo_shm_touch_lru(ngx_http_cache_turbo_zone_t *z,
 
 /* Little-endian u32/u64 readers, duplicated from the `static` helpers of the
  * same name in ngx_http_cache_turbo_module.c (not visible across TUs) so this
- * file can read the CTB4 wire header's `created`/`sie_ttl` fields without
+ * file can read the CTB5 wire header's `created`/`sie_ttl` fields without
  * threading a request ctx through -- see ngx_http_cache_turbo_shm_node_sie_live()
  * just below for why. Same wire offsets, same byte order; keep in sync with
- * the CTB4 layout comment in ngx_http_cache_turbo_module.h. */
+ * the CTB5 layout comment in ngx_http_cache_turbo_module.h. */
 static ngx_inline uint32_t
 ngx_http_cache_turbo_shm_get_u32(const u_char *p)
 {
@@ -932,7 +932,7 @@ ngx_http_cache_turbo_shm_get_u64(const u_char *p)
 
 
 /* S231-EVICT-BLIND: is `ctn` a live stale-if-error entry right now? Only an
- * ENTRY carries a blob (a COUNTER's `data` is NULL / not a CTB4 blob), and
+ * ENTRY carries a blob (a COUNTER's `data` is NULL / not a CTB5 blob), and
  * only while `now` is still inside the absolute (created + sie_ttl) window --
  * the identical test the request path uses to decide whether to arm an SIE
  * snapshot (ngx_http_cache_turbo_module.c, the `ctx->sie_armed` arm site).
