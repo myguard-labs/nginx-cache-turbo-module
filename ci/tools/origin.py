@@ -47,6 +47,17 @@ def wait_port(port: int, timeout: float = 15.0) -> None:
 # Counting origin: every GET returns a unique body and bumps a hit counter.
 # --------------------------------------------------------------------------- #
 
+
+class _OriginHTTPServer(http.server.ThreadingHTTPServer):
+    """ThreadingHTTPServer with enlarged listen backlog for stress tests.
+
+    Default backlog (5) overflows under 48-thread tests with ~30% cold misses
+    that each open a new connection, surfacing as upstream 502s in the harness.
+    Raise request_queue_size to 128 to accommodate concurrent connection bursts.
+    """
+    request_queue_size = 128
+
+
 class Origin:
     def __init__(self, port: int, delay: float = 0.0) -> None:
         self.port = port
@@ -1010,7 +1021,7 @@ class Origin:
             def log_message(self, *a):  # silence
                 pass
 
-        self._server = http.server.ThreadingHTTPServer(
+        self._server = _OriginHTTPServer(
             ("127.0.0.1", self.port), Handler)
         self._thread = threading.Thread(target=self._server.serve_forever,
                                         daemon=True)
