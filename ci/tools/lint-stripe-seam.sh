@@ -182,30 +182,38 @@ pending:ngx_http_cache_turbo_shm_touch_lru
 
 # Does function $1 (definition through its column-0 closing brace) call
 # stripe_of()? Comments are stripped so the prose about the resolver in these
-# functions' headers cannot be mistaken for a call. Prints "yes"/"no"; exits 2
-# if the function cannot be found at all, which is a moved/renamed function and
-# a stale ledger, not a pass.
+# functions' headers -- which discusses stripe_of() at length -- cannot be
+# mistaken for a call.
+#
+# A definition is a line STARTING with `<name>(` at column 1, which is this
+# tree's house style for a function definition and cannot prefix-match a longer
+# sibling (`..._shm_store(` does not match `..._shm_store_locked(`, because the
+# open paren is part of the pattern).
+#
+# Prints "yes"/"no". Two failure exits, neither of which is a pass:
+#   2  the function was not found -- moved or renamed, so the ledger is stale;
+#   3  more than one definition matched -- the answer would depend on which one
+#      won, and this file already contains one genuinely duplicated symbol name
+#      (shm_count_miss_locked), so ambiguity is a real shape here, not a
+#      hypothetical.
 fn_calls_stripe_of() {
     awk -v fn="$1" '
         { line = $0; sub(/\/\/.*/, "", line) }
         line ~ /^[[:space:]]*\*/   { next }
         line ~ /^[[:space:]]*\/\*/ { next }
 
-        !on && index(line, fn "(") == 1 { on = 1; found = 1 }
+        index(line, fn "(") == 1 { on = 1; ndef++ }
         on && index(line, "ngx_http_cache_turbo_stripe_of(") > 0 { calls = 1 }
         on && line ~ /^}/ { on = 0 }
 
         END {
-            if (!found) { exit 2 }
+            if (ndef == 0) { exit 2 }
+            if (ndef > 1)  { exit 3 }
             print calls ? "yes" : "no"
         }
     ' src/*.c
 }
 
-# A whole-tree floor, independent of the per-function rows: if ANY row claims
-# `converted`, the module must contain at least one real stripe_of() call site.
-# grep -c over the sources with comments left in would count the prose, so the
-# count is derived from the per-function answers below instead.
 ledger_status=0
 pending=0
 converted=0
@@ -215,9 +223,20 @@ while IFS= read -r row; do
     state="${row%%:*}"
     fn="${row#*:}"
 
-    if ! answer="$(fn_calls_stripe_of "$fn")"; then
+    answer="$(fn_calls_stripe_of "$fn")" && rc=0 || rc=$?
+
+    if [ "$rc" -eq 2 ]; then
         echo "$fn: listed in the key-directed ledger but not found in src/*.c" >&2
         echo "    -- it was moved or renamed; update KEY_DIRECTED in $0." >&2
+        ledger_status=1
+        continue
+    fi
+
+    if [ "$rc" -ne 0 ]; then
+        echo "$fn: more than one definition matched in src/*.c" >&2
+        echo "    -- the ledger answer would depend on which one won; give the" >&2
+        echo "       duplicated symbol a distinct name, or teach $0 which TU" >&2
+        echo "       owns it." >&2
         ledger_status=1
         continue
     fi
