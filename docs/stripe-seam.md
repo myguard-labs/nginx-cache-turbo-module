@@ -112,6 +112,32 @@ cosmetic one:
 | `shm_purge_all` | `shm.c:1415` | Walks one LRU under one mutex in batches. Must iterate every stripe. |
 | the stats snapshot | `shm.c:1873`, `:1938` | Must sum across stripes; it currently reads stripe 0 alone. |
 
+### The shm-layout question, which precedes all of the above
+
+Carving the pools is itself unsettled, and it is not a coding detail. nginx
+hands the module exactly ONE `ngx_slab_pool_t`, at `shm_zone->shm.addr`, for the
+whole zone (`ngx_shared_memory_add` + `shm_zone->init`, `conf.c:1579-1590`).
+N independent pools means sub-dividing that single mapping by hand and running
+`ngx_slab_init()` on each sub-range with its own mutex. That is a real
+technique, but it drags in three decisions this repo has not made:
+
+- **the reload / inheritance path.** `shm_init_zone()` re-attaches on
+  `shm.exists` (`shm.c:110`) and the `octx` branch copies ONE stripe struct,
+  not an array. Both become array-aware, and a zone whose N changed across a
+  reload has to be rejected or migrated.
+- **a minimum viable zone size.** Each sub-range needs room for its own slab
+  bookkeeping, so a zone that is fine at N=1 can be too small at N=8. An N
+  whose per-stripe carve does not fit must be rejected at config time with a
+  real diagnostic, not silently clamped.
+- **operator-visible honesty.** Any admin surface that reports per-stripe
+  numbers must not ship before the numbers are real; an aggregate that is
+  identically stripe 0's value, with N-1 stripes reporting a constant zero, is
+  a misleading field rather than an incomplete one.
+
+One sub-question does resolve cleanly: `stripe_of()` indexes with
+`key % nstripes`, a modulo rather than a mask, so **no power-of-2 restriction
+on N is required** as long as the modulo is kept.
+
 The zone-global atomic counters (`hits`, `misses`, `breaker_*`, `refuse_*`,
 autotune's `snap_*`) are deliberately **not** in this table: they are atomics on
 the zone's single `sh`, not slab-allocated per-key state, and pinning them to
