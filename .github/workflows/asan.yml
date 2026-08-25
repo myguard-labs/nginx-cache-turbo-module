@@ -1,4 +1,4 @@
-# sync-sha: 8eab00b10dd3a5ebfd705fb9e06b3afe8f3d10902f8779497e385294d6a4338e
+# sync-sha: 77acf678bac245712155e7fbf7280cdd5c7f263213755025275d90066b97798f
 name: ASan and UBSan
 
 # Dedicated ASan+UBSan workflow, PATH-GATED: only runs when a PR/push touches
@@ -228,22 +228,44 @@ jobs:
         # not per-request, so LSan over the worker pool is false-positive-prone with
         # no real signal — ASan's UAF/overflow checks are the high-value part and
         # run fully multi-worker here.
+        #
+        # Wrapped in ci-hang-guard.sh for the same reason as the single-process job:
+        # if the suite fails a diagnostics capture preserves nginx logs (error.log)
+        # so the upstream 502 reason is recoverable after the fact, not just the
+        # assertion string. 1200s soft < 30-min job timeout, well above ~7 min
+        # healthy run.
         env:
           ASAN_OPTIONS: detect_leaks=0:halt_on_error=1:abort_on_error=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
           # See the single-process job: instrumented latency is not a signal.
           TEST_CT_TIMEOUT: "30"
+          # Breadcrumb: the harness writes the running test here (see
+          # test_runtime.py _write_breadcrumb). On an R6b hang the guard copies
+          # it to hanging-test.txt so the backtrace is labelled with the culprit.
+          CT_TEST_BREADCRUMB: ${{ github.workspace }}/ci-hang-artifacts/current-test.txt
         run: |
           chmod +x nginx-bin/nginx
-          set -o pipefail
-          python3 ci/tools/test_runtime.py \
-            --fault-injection \
-            --sanitizer \
-            --port "$TEST_BASE_PORT" \
-            --redis-server /usr/bin/redis-server \
-            --memcached-server /usr/bin/memcached \
-            --nginx-binary "$GITHUB_WORKSPACE/nginx-bin/nginx" \
-            | tee runtime-suite-multiworker.log
+          bash ci/tools/ci-hang-guard.sh 1200 "$GITHUB_WORKSPACE/ci-hang-artifacts" -- \
+            bash -c '
+              set -o pipefail
+              python3 ci/tools/test_runtime.py \
+                --fault-injection \
+                --sanitizer \
+                --port "$TEST_BASE_PORT" \
+                --redis-server /usr/bin/redis-server \
+                --memcached-server /usr/bin/memcached \
+                --nginx-binary "$GITHUB_WORKSPACE/nginx-bin/nginx" \
+                | tee runtime-suite-multiworker.log
+            '
 
       - name: Assert the requested fixture set actually came up (AUD-TESTFIX1)
         run: bash ci/tools/assert-fixtures.sh runtime-suite-multiworker.log
+
+      - name: Upload hang-capture artifacts (multi-worker)
+        if: always()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: asan-hang-capture-multiworker
+          path: ci-hang-artifacts/
+          if-no-files-found: ignore
+          retention-days: 14
