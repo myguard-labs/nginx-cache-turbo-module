@@ -764,7 +764,7 @@ typedef struct {
 
 
 /* Shared-memory zone state: rbtree of cached objects + LRU + stats. */
-typedef struct {
+typedef struct ngx_http_cache_turbo_shctx_s {
     ngx_rbtree_t             rbtree;
     ngx_rbtree_node_t        sentinel;
 
@@ -790,11 +790,26 @@ typedef struct {
     ngx_uint_t               n_protected;
     ngx_uint_t               n_entries;     /* nodes on BOTH queues combined */
 
-    ngx_atomic_t             hits;
+    /* PERF-AUD2-12: hits/misses/stale_serves/refreshes/evictions are the
+     * per-request counter quintet bumped on EVERY hit/miss by EVERY worker
+     * (fetch_add, unlocked). pahole -F dwarf on the pre-fix layout showed
+     * hits/misses sharing a line with n_protected/n_entries above, and
+     * stale_serves/refreshes/evictions sharing the NEXT line with markers/
+     * bg_inflight/l2_hits/l2_misses/lock_waits -- so a hit on one worker's
+     * `fetch_add(&hits)` invalidated the cache line every other worker was
+     * reading `misses` or `evictions` off. __attribute__((aligned(64))) pins
+     * this group to its own line; the 24-byte pad after the 5 atomics
+     * (5*8=40B of 64) keeps `markers` (cold: only bumped on marker-node
+     * create/evict, see the C3 comment below) from spilling back onto it.
+     * Adds 24B + up to 63B of pre-padding to the shm zone header -- see the
+     * struct-size note before the closing brace for why that is safe even
+     * at the smallest configured keys_zone. */
+    ngx_atomic_t             hits __attribute__((aligned(64)));
     ngx_atomic_t             misses;
     ngx_atomic_t             stale_serves;
     ngx_atomic_t             refreshes;
     ngx_atomic_t             evictions;
+    u_char                   _pad_hits[24];
 
     /* C3: live count of L1 auto-Vary marker nodes (kind ==
      * NGX_HTTP_CACHE_TURBO_NODE_MARKER) currently resident in THIS zone's
@@ -913,7 +928,14 @@ typedef struct {
      * one reason in principle (e.g. Set-Cookie AND pre-encoded); each arm
      * that observes its own condition bumps independently, so these do NOT
      * sum to (misses - hits) and must not be read as mutually exclusive. */
-    ngx_atomic_t             refuse_set_cookie;    /* response sets Set-Cookie */
+    /* PERF-AUD2-12: the eight refuse_* counters are 8*8=64B -- exactly one
+     * line -- so aligning just the first field gives the whole group its
+     * own cache line with no trailing pad needed; the next field starts a
+     * fresh line on its own. Isolates this group from `bypasses` above and
+     * `cost_sum_ms` below (pahole showed both sharing a line with part of
+     * this group pre-fix). */
+    ngx_atomic_t             refuse_set_cookie __attribute__((aligned(64)));
+                                                   /* response sets Set-Cookie */
     ngx_atomic_t             refuse_encoded;       /* response pre-encoded (Content-Encoding) */
     ngx_atomic_t             refuse_vary_unsafe;   /* unknown/non-whitelisted Vary axis, or Vary: * */
     ngx_atomic_t             refuse_authorization; /* request carried Authorization */
@@ -996,8 +1018,21 @@ typedef struct {
      * accumulated under the previous one. Treat the zone, not the location, as
      * the failure domain.
      */
-    ngx_atomic_t             breaker_state;        /* BREAKER_* above          */
-    ngx_atomic_t             breaker_fails;        /* failures this window     */
+    /* PERF-AUD2-12: breaker_state is, per the comment above, "the hottest
+     * possible read site" -- consulted on every request before the origin
+     * connect. pahole -F dwarf pre-fix showed it sharing a line with
+     * autotune_next/snap_* (cold) AND with breaker_fails, which is
+     * fetch_add-ed on every origin failure -- i.e. contended precisely
+     * during an outage, the worst possible moment for false sharing on the
+     * state every worker is about to read. Each gets its own line; the
+     * window_start/opened_at/probe/epoch/opens quintet below stays packed
+     * (advisory per the comment, not on the hot read path). */
+    ngx_atomic_t             breaker_state __attribute__((aligned(64)));
+                                                   /* BREAKER_* above          */
+    u_char                   _pad_breaker_state[56];
+    ngx_atomic_t             breaker_fails __attribute__((aligned(64)));
+                                                   /* failures this window     */
+    u_char                   _pad_breaker_fails[56];
     ngx_atomic_t             breaker_window_start; /* epoch s, window anchor   */
     ngx_atomic_t             breaker_opened_at;    /* epoch s the OPEN began   */
     ngx_atomic_t             breaker_probe;        /* O4.4-h packed
@@ -1271,6 +1306,23 @@ typedef struct {
      * this mirrors. */
     ngx_atomic_t             breaker_wedge_observed;
 #endif
+
+    /* PERF-AUD2-12: this struct is allocated ONCE per zone by a single
+     * ngx_slab_alloc() in _shm_init_zone() (never persisted across a
+     * version boundary -- reload keeps the live shm as-is via `ctx->sh =
+     * octx->sh`, and it does not survive a binary restart, so this is not a
+     * wire/blob format and carries no version-compat obligation). The
+     * cache-line padding added above grows it by <= 3*64 = 192 bytes
+     * worst case (pre-padding for 3 aligned(64) fields) plus 24+56+56=136
+     * bytes of explicit trailing pad, well under 1 KiB total -- negligible
+     * against the module's own enforced minimum keys_zone size, checked in
+     * cache_turbo_zone's own parser: `size < 8 * ngx_pagesize` is rejected
+     * at config time (ngx_http_cache_turbo_conf.c:1639, i.e. 32 KiB on 4K
+     * pages), well before _shm_init_zone() ever runs. Several runtime
+     * tests already exercise a real zone at 64k (twice that floor) via
+     * ngx_http_cache_turbo_shm_init_zone(). The multi-KB slab-pool
+     * bookkeeping every zone already pays dwarfs the <1 KiB this struct
+     * grew by. */
 } ngx_http_cache_turbo_shctx_t;
 
 
