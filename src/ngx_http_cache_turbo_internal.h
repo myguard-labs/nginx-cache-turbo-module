@@ -904,10 +904,15 @@ void ngx_http_cache_turbo_blob_hdr_write(u_char *dst,
  * is the whole security argument. Safe on a buffer too short to hold the wire
  * header (no-op) and on a blob that never had the bit. */
 void ngx_http_cache_turbo_blob_clear_vetted(u_char *blob, size_t len);
+/* refs_buf/refs_buf_cap (PERF-AUD2-06): an optional caller-owned array to
+ * record decoded header refs into instead of pool-allocating one. Used when
+ * refs_out != NULL and out->nheaders <= refs_buf_cap; refs_buf may be NULL
+ * (or the cap 0) to always fall back to the pool path exactly as before. */
 ngx_int_t ngx_http_cache_turbo_blob_validate(const u_char *blob, size_t len,
     ngx_http_cache_turbo_blob_hdr_t *out, const u_char **hdr_block,
     const u_char **body, ngx_pool_t *pool,
-    ngx_http_cache_turbo_blob_href_t **refs_out);
+    ngx_http_cache_turbo_blob_href_t **refs_out,
+    ngx_http_cache_turbo_blob_href_t *refs_buf, ngx_uint_t refs_buf_cap);
 
 
 /* CTB4 (RFC-2 stale-if-error): fixed-endian versioned wire format. CTB4 adds the

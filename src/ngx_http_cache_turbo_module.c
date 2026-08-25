@@ -57,6 +57,7 @@ static ngx_int_t ngx_http_cache_turbo_restore_response_prologue(
     ngx_http_request_t *r, u_char *copy, size_t len, ngx_uint_t stale,
     ngx_http_cache_turbo_blob_hdr_t *bhp,
     ngx_http_cache_turbo_blob_href_t **refsp,
+    ngx_http_cache_turbo_blob_href_t *refs_buf, ngx_uint_t refs_buf_cap,
     u_char **bodyp, size_t *body_lenp);
 static ngx_int_t ngx_http_cache_turbo_restore_response_headers(
     ngx_http_request_t *r, ngx_http_cache_turbo_loc_conf_t *clcf,
@@ -2356,8 +2357,10 @@ ngx_http_cache_turbo_not_modified(ngx_http_request_t *r,
  * envelope (status, Content-Length) before any per-header work starts.
  * Out-params: *bhp receives the decoded header (copied into the caller's own
  * ngx_http_cache_turbo_blob_hdr_t, so it stays valid once this stack frame
- * returns), *refsp the r->pool-owned per-header ref array from the single
- * validated walk, *bodyp / *body_lenp the body slice. Returns NGX_ERROR on a
+ * returns), *refsp the per-header ref array from the single validated walk
+ * (the caller's refs_buf when it fits, else r->pool-owned -- see
+ * blob_validate()'s refs_buf comment), *bodyp / *body_lenp the body slice.
+ * Returns NGX_ERROR on a
  * NULL blob/loc-conf or a failed blob_validate(); the caller must not use any
  * out-param when this happens. */
 static ngx_int_t
@@ -2365,6 +2368,7 @@ ngx_http_cache_turbo_restore_response_prologue(ngx_http_request_t *r,
     u_char *copy, size_t len, ngx_uint_t stale,
     ngx_http_cache_turbo_blob_hdr_t *bhp,
     ngx_http_cache_turbo_blob_href_t **refsp,
+    ngx_http_cache_turbo_blob_href_t *refs_buf, ngx_uint_t refs_buf_cap,
     u_char **bodyp, size_t *body_lenp)
 {
     const u_char                      *body_start;
@@ -2389,7 +2393,8 @@ ngx_http_cache_turbo_restore_response_prologue(ngx_http_request_t *r,
      * (ngx_pnalloc); the validator reads the wire header with fixed-endian
      * getters, no misaligned struct cast. */
     if (ngx_http_cache_turbo_blob_validate(copy, len, bhp, NULL, &body_start,
-                                           r->pool, refsp)
+                                           r->pool, refsp,
+                                           refs_buf, refs_buf_cap)
         != NGX_OK)
     {
         return NGX_ERROR;
@@ -2744,11 +2749,26 @@ ngx_http_cache_turbo_restore_response(ngx_http_request_t *r, u_char *copy,
     size_t                             etag_len = 0, lastmod_len = 0;
     ngx_http_cache_turbo_loc_conf_t   *clcf;
     ngx_http_cache_turbo_blob_href_t  *refs;
+    /* PERF-AUD2-06: stack storage for the common case, so blob_validate()
+     * skips its per-hit ngx_palloc() for essentially every real response.
+     * `refs` is a local here, handed only to restore_response_headers()
+     * below and never stored into ctx, the blob, or a cleanup handler, so
+     * it cannot outlive this frame -- see blob_validate()'s refs_buf
+     * comment for the alignment argument (an ngx_http_cache_turbo_blob_
+     * href_t array is naturally aligned, same as any other typed local).
+     * 24 covers the response-header count of essentially any real HTTP
+     * response (a handful of standard headers plus a modest number of
+     * custom ones); blob_validate() falls back to r->pool for the rare
+     * blob with more, so correctness never depends on the cap. */
+    ngx_http_cache_turbo_blob_href_t   stack_refs[24];
 
     clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
 
     if (ngx_http_cache_turbo_restore_response_prologue(r, copy, len, stale,
                                                         &hdr, &refs,
+                                                        stack_refs,
+                                                        (sizeof(stack_refs)
+                                                         / sizeof(stack_refs[0])),
                                                         &body, &body_len)
         != NGX_OK)
     {
@@ -2853,8 +2873,15 @@ ngx_http_cache_turbo_serve(ngx_http_request_t *r, u_char *copy, size_t len,
      * core.NullDereference flagged exactly that path.
      */
     if (copy != NULL && len >= NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE) {
-        if ((ngx_http_cache_turbo_get_u16(copy + 6)
-             & NGX_HTTP_CACHE_TURBO_BLOBF_BREAKER_ONLY)
+        /* Read the blob flags word ONCE; the four guards below all test bits
+         * of the same already-bounds-checked u16 at copy + 6 (see the
+         * per-guard comments this replaces). `copy` is non-const and there
+         * are ngx_log_debug*() calls between the guards, so re-reading it
+         * each time relied on the compiler proving no intervening write --
+         * probable but not guaranteed. bflags removes that dependency. */
+        uint16_t  bflags = ngx_http_cache_turbo_get_u16(copy + 6);
+
+        if ((bflags & NGX_HTTP_CACHE_TURBO_BLOBF_BREAKER_ONLY)
             && xcache != NGX_HTTP_CACHE_TURBO_SR_STALE_BREAKER)
         {
             if (ref_data != NULL && cc != NULL) {
@@ -2894,12 +2921,11 @@ ngx_http_cache_turbo_serve(ngx_http_request_t *r, u_char *copy, size_t len,
          * SIE, cold wait) and cannot be bypassed by a call site that forgot
          * to thread the state through.
          *
-         * Reads the SAME already-bounds-checked u16 the breaker check read;
-         * `len >= BLOB_HDR_WIRE` from the outer `if` covers this offset.
+         * Reuses bflags, read once above from the same already-bounds-checked
+         * offset; `len >= BLOB_HDR_WIRE` from the outer `if` covers it.
          */
         if (r->headers_in.authorization != NULL
-            && !(ngx_http_cache_turbo_get_u16(copy + 6)
-                 & NGX_HTTP_CACHE_TURBO_BLOBF_AUTH_SHAREABLE))
+            && !(bflags & NGX_HTTP_CACHE_TURBO_BLOBF_AUTH_SHAREABLE))
         {
             if (ref_data != NULL && cc != NULL) {
                 cc->data = NULL;
@@ -2936,12 +2962,11 @@ ngx_http_cache_turbo_serve(ngx_http_request_t *r, u_char *copy, size_t len,
          * sent, so it is true for requests that are NOT HEAD and would let a
          * conditional GET read a head-derived entry.
          *
-         * Reads the SAME already-bounds-checked u16 the guards above read;
-         * `len >= NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE` from the outer `if`
-         * covers this offset.
+         * Reuses bflags, read once above from the same already-bounds-checked
+         * offset; `len >= NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE` from the outer
+         * `if` covers it.
          */
-        if ((ngx_http_cache_turbo_get_u16(copy + 6)
-             & NGX_HTTP_CACHE_TURBO_BLOBF_HEAD_DERIVED)
+        if ((bflags & NGX_HTTP_CACHE_TURBO_BLOBF_HEAD_DERIVED)
             && !(r->method & NGX_HTTP_HEAD))
         {
             if (ref_data != NULL && cc != NULL) {
@@ -2971,15 +2996,12 @@ ngx_http_cache_turbo_serve(ngx_http_request_t *r, u_char *copy, size_t len,
          * origin exactly as on a miss) on any mismatch, including a
          * malformed/absent Accept-Encoding.
          *
-         * (ngx_http_cache_turbo_get_u16(copy + 6) & BLOBF_ORIGIN_ENCODED)
-         * reads the SAME already-bounds-checked u16 the breaker check above
-         * just read -- no second length check needed, `len >=
-         * NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE` from the outer `if` already
-         * covers this offset. */
-        if (ngx_http_cache_turbo_get_u16(copy + 6)
-            & NGX_HTTP_CACHE_TURBO_BLOBF_ORIGIN_ENCODED)
-        {
-            ngx_uint_t  class = (ngx_http_cache_turbo_get_u16(copy + 6)
+         * (bflags & BLOBF_ORIGIN_ENCODED) reuses the same bflags read once
+         * above from the breaker check's offset -- no second length check
+         * needed, `len >= NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE` from the outer
+         * `if` already covers this offset. */
+        if (bflags & NGX_HTTP_CACHE_TURBO_BLOBF_ORIGIN_ENCODED) {
+            ngx_uint_t  class = (bflags
                                   & NGX_HTTP_CACHE_TURBO_BLOBF_AE_CLASS_MASK)
                                  >> NGX_HTTP_CACHE_TURBO_BLOBF_AE_CLASS_SHIFT;
 
@@ -3953,7 +3975,8 @@ ngx_http_cache_turbo_sie_snap_body_len(ngx_http_cache_turbo_ctx_t *ctx,
 
     if (ctx->sie_snap == NULL
         || ngx_http_cache_turbo_blob_validate(ctx->sie_snap, ctx->sie_snap_len,
-                                              &hdr, NULL, NULL, NULL, NULL)
+                                              &hdr, NULL, NULL, NULL, NULL,
+                                              NULL, 0)
            != NGX_OK)
     {
         return NGX_ERROR;
@@ -4679,7 +4702,8 @@ ngx_http_cache_turbo_warm_inject_validators(ngx_http_request_t *sr,
     }
 
     if (ngx_http_cache_turbo_blob_validate(snap, snap_len, &bh, NULL,
-                                           &body_start, sr->pool, &refs)
+                                           &body_start, sr->pool, &refs,
+                                           NULL, 0)
         != NGX_OK)
     {
         return;

@@ -403,14 +403,18 @@ static ngx_int_t ngx_http_cache_turbo_blob_next_header(const u_char **pp,
  * the old code stored first and only failed later in serve(), poisoning the L1
  * slot with a node that could never be served.
  *
- * S231-PERF-HDRWALK: when `pool` and `refs_out` are both non-NULL, the SAME
- * walk that validates each TLV entry's framing also records its four decoded
- * fields (name/nlen/val/vlen) into a pool-allocated array of *out->nheaders
- * ngx_http_cache_turbo_blob_href_t, written to *refs_out. A caller that only
- * needs framing validation (the L2-fill decide-and-store path, the fuzz
- * harness) passes pool == NULL and gets the original walk with no allocation.
- * ngx_http_cache_turbo_restore_response() passes r->pool and consumes the
- * array directly instead of re-walking the same bytes with
+ * S231-PERF-HDRWALK: when `refs_out` is non-NULL, the SAME walk that
+ * validates each TLV entry's framing also records its four decoded fields
+ * (name/nlen/val/vlen) into an array of *out->nheaders
+ * ngx_http_cache_turbo_blob_href_t, written to *refs_out. PERF-AUD2-06: that
+ * array is the caller's `refs_buf` when non-NULL and `out->nheaders <=
+ * refs_buf_cap` (the common case -- no allocation at all), otherwise a
+ * pool-allocated array sized from `pool` (unchanged from before). A caller
+ * that only needs framing validation (the L2-fill decide-and-store path, the
+ * fuzz harness) passes pool == NULL, refs_out == NULL and gets the original
+ * walk with no allocation. ngx_http_cache_turbo_restore_response() passes a
+ * stack refs_buf plus r->pool as the fallback and consumes the array
+ * directly instead of re-walking the same bytes with
  * ngx_http_cache_turbo_blob_next_header() a second time — one walk, one set
  * of bounds checks, for every HIT. The array is bounded by nheaders, which is
  * itself bounded by headers_len <= len (each TLV entry costs >= 8 bytes), so
@@ -424,7 +428,8 @@ ngx_int_t
 ngx_http_cache_turbo_blob_validate(const u_char *blob, size_t len,
     ngx_http_cache_turbo_blob_hdr_t *out, const u_char **hdr_block,
     const u_char **body, ngx_pool_t *pool,
-    ngx_http_cache_turbo_blob_href_t **refs_out)
+    ngx_http_cache_turbo_blob_href_t **refs_out,
+    ngx_http_cache_turbo_blob_href_t *refs_buf, ngx_uint_t refs_buf_cap)
 {
     const u_char                      *p, *end;
     uint32_t                           i;
@@ -544,11 +549,24 @@ ngx_http_cache_turbo_blob_validate(const u_char *blob, size_t len,
      * platforms. ngx_palloc() rounds up to NGX_ALIGNMENT before handing back
      * memory, exactly like any other pointer-bearing struct allocated from
      * this pool. */
-    if (pool != NULL && refs_out != NULL && out->nheaders > 0) {
-        refs = ngx_palloc(pool,
-                   out->nheaders * sizeof(ngx_http_cache_turbo_blob_href_t));
-        if (refs == NULL) {
-            return NGX_ERROR;
+    if (refs_out != NULL && out->nheaders > 0) {
+        /* PERF-AUD2-06: prefer the caller's stack array when it is big
+         * enough -- refs never outlives this validate+restore call (see the
+         * refs_buf caller for the lifetime argument), so a pool allocation
+         * is pure overhead for the common case. Same NGX_ALIGNMENT
+         * reasoning as the ngx_palloc() path below: refs_buf must be an
+         * actual ngx_http_cache_turbo_blob_href_t array (never a
+         * u_char/ngx_pnalloc buffer cast to this type), which every caller
+         * satisfies by declaring it as a typed local. */
+        if (refs_buf != NULL && out->nheaders <= refs_buf_cap) {
+            refs = refs_buf;
+
+        } else if (pool != NULL) {
+            refs = ngx_palloc(pool,
+                       out->nheaders * sizeof(ngx_http_cache_turbo_blob_href_t));
+            if (refs == NULL) {
+                return NGX_ERROR;
+            }
         }
     }
 
@@ -577,7 +595,7 @@ ngx_http_cache_turbo_blob_validate(const u_char *blob, size_t len,
 
     if (hdr_block) { *hdr_block = blob + NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE; }
     if (body)      { *body = end; }
-    if (pool != NULL && refs_out != NULL) { *refs_out = refs; }
+    if (refs_out != NULL) { *refs_out = refs; }
     return NGX_OK;
 }
 
