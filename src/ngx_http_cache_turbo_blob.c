@@ -347,11 +347,19 @@ ngx_http_cache_turbo_blob_hdr_write(u_char *dst,
     /*
      * CTB5 / PERF-AUD2-02: render `created` to its RFC-1123 form ONCE, here,
      * instead of on every hit in restore_response_finalize(). ngx_http_time()
-     * always writes exactly 29 bytes ("Mon, 28 Sep 1970 06:00:00 GMT") and
-     * returns the end pointer; we pin the length rather than trusting it, so a
-     * hypothetical upstream change in that rendering is caught by the
-     * assertion below rather than silently writing a short field that the
-     * validator would then reject on read-back.
+     * always writes exactly 29 bytes ("Mon, 28 Sep 1970 06:00:00 GMT"), which
+     * is what NGX_HTTP_CACHE_TURBO_BLOB_DATE_LEN and the fixed slot are sized
+     * for, and it returns the end pointer.
+     *
+     * ⚠ The length byte is written from the CONSTANT, and the rendered length
+     * is checked against it rather than assumed. Writing back whatever
+     * ngx_http_time() returned would mean that if some future nginx ever
+     * rendered a different width, every blob this worker stored would be
+     * REJECTED by its own validator on read-back -- a silent, total, 100% miss
+     * rate with no diagnostic anywhere. On that mismatch we instead leave the
+     * length byte at a value the validator rejects AND log it, so the failure
+     * names itself. The `else` arm is not dead code for a bounds reason; it is
+     * the tripwire for an upstream behaviour change.
      *
      * Deliberately unconditional -- EVERY blob this module writes carries the
      * field, markers included (vary.c's marker_store() memzero's its
@@ -361,11 +369,23 @@ ngx_http_cache_turbo_blob_hdr_write(u_char *dst,
      * safe without a second "is it there?" branch.
      */
     {
-        u_char  *e;
+        u_char  *d = dst + NGX_HTTP_CACHE_TURBO_BLOB_DATE_OFF;
+        size_t   n = (size_t) (ngx_http_time(d, (time_t) h->created) - d);
 
-        e = ngx_http_time(dst + NGX_HTTP_CACHE_TURBO_BLOB_DATE_OFF,
-                          (time_t) h->created);
-        dst[44] = (u_char) (e - (dst + NGX_HTTP_CACHE_TURBO_BLOB_DATE_OFF));
+        if (n == NGX_HTTP_CACHE_TURBO_BLOB_DATE_LEN) {
+            dst[44] = (u_char) NGX_HTTP_CACHE_TURBO_BLOB_DATE_LEN;
+
+        } else {
+            /* Cannot happen with any nginx that ships ngx_http_time(); if it
+             * ever does, fail LOUD and CLOSED rather than storing blobs this
+             * build can no longer read. 0 is rejected by the validator. */
+            dst[44] = 0;
+            ngx_log_error(NGX_LOG_ALERT, ngx_cycle->log, 0,
+                          "cache_turbo: ngx_http_time() rendered %uz bytes, "
+                          "expected %d -- CTB5 Date field not written; "
+                          "nothing will be cacheable until this is fixed",
+                          n, NGX_HTTP_CACHE_TURBO_BLOB_DATE_LEN);
+        }
     }
 
     /* reserved, always 0 -- see the layout comment in _internal.h */
