@@ -226,6 +226,7 @@ typedef struct {
     ngx_uint_t          sketch_ops;
     ngx_uint_t          sketch_reset_at;
     ngx_uint_t          sketch_gen;
+    ngx_uint_t          sketch_cursor;
     /* P4-1b admission. Same plain-field / mutex-held discipline. */
     ngx_uint_t          admission;
     ngx_uint_t          sketch_bumps;
@@ -322,6 +323,7 @@ typedef struct {
 #define NGX_HTTP_CACHE_TURBO_SKETCH_SAMPLE      10
 #define NGX_HTTP_CACHE_TURBO_SKETCH_MIN_WIDTH   1024
 #define NGX_HTTP_CACHE_TURBO_SKETCH_MAX_WIDTH   (1 << 20)
+#define NGX_HTTP_CACHE_TURBO_SKETCH_HALVE_STRIPES  16
 
 /* claim() verdicts -- values are not asserted on, only distinctness matters. */
 #define NGX_HTTP_CACHE_TURBO_CLAIM_FRESH    0
@@ -4759,6 +4761,7 @@ sketch_attach(void)
     g_sh.sketch_width    = TEST_SKETCH_WIDTH;
     g_sh.sketch_ops      = 0;
     g_sh.sketch_gen      = 0;
+    g_sh.sketch_cursor   = 0;
     /* Large enough that no test trips aging by accident; the halving test
      * lowers it explicitly. */
     g_sh.sketch_reset_at = (ngx_uint_t) -1;
@@ -4977,25 +4980,30 @@ test_p4_1a_estimate_is_min_across_rows(void)
 }
 
 
-/* Aging: once sketch_ops reaches sketch_reset_at every counter halves and the
- * generation advances. Without it the counters saturate permanently and the
- * sketch measures lifetime totals instead of RECENT frequency -- a key that
- * was hot last week would outrank one that is hot now, forever. */
+/* Aging: once sketch_ops reaches sketch_reset_at, ONE STRIPE halves
+ * (PERF-AUD2-08). Drive a FULL LAP -- HALVE_STRIPES crossings -- and every
+ * counter must have halved and sketch_gen must have advanced exactly once.
+ * Without this the counters saturate permanently and the sketch measures
+ * lifetime totals instead of RECENT frequency -- a key that was hot last week
+ * would outrank one that is hot now, forever. */
 static void
 test_p4_1a_halving_ages_the_sketch(void)
 {
     uint32_t    hot  = 0xaaaa0001u;
     uint32_t    warm = 0xbbbb0002u;
     ngx_uint_t  i, before_hot, before_warm;
+    ngx_uint_t  crossing;
 
     zone_reset();
     sketch_attach();
 
-    /* Age after exactly 32 bumps so the fixture stays small and the arithmetic
-     * below is checkable by hand. */
+    /* Age one stripe after exactly 32 bumps so the fixture stays small and
+     * the arithmetic below is checkable by hand. A full lap is then
+     * HALVE_STRIPES * 32 bumps. */
     g_sh.sketch_reset_at = 32;
 
-    /* 10 bumps for `hot`, 2 for `warm` = 12 ops, below the threshold. */
+    /* 10 bumps for `hot`, 2 for `warm` = 12 ops, below the first stripe's
+     * threshold. */
     for (i = 0; i < 10; i++) {
         test_sketch_bump(hot);
     }
@@ -5013,26 +5021,85 @@ test_p4_1a_halving_ages_the_sketch(void)
     CHECK(g_sh.sketch_gen == 0,
           "P4-1a: aged before reaching the threshold");
 
-    /* Drive ops to exactly the threshold with a third, unrelated key. The
-     * 20th of these is the bump that trips the halving. */
+    /* Drive ops to exactly HALVE_STRIPES full crossings (a full lap) with an
+     * unrelated key each time, so every stripe -- and therefore every
+     * counter in the array, including hot's and warm's -- gets halved
+     * exactly once. The first crossing needs only 20 more bumps (32 - 12);
+     * every crossing after that needs a full 32. */
     for (i = 0; i < 20; i++) {
         test_sketch_bump(0xcccc0000u + i);
     }
 
-    CHECK(g_sh.sketch_gen == 1,
-          "P4-1a: reaching sketch_reset_at did not trigger a halving");
+    CHECK(g_sh.sketch_gen == 0,
+          "P4-1a: gen must not advance until the whole array has been swept, "
+          "not after the first stripe");
     CHECK(g_sh.sketch_ops == 0,
-          "P4-1a: the aging counter was not reset after halving");
+          "P4-1a: the aging counter was not reset after the stripe");
+    CHECK(g_sh.sketch_cursor > 0,
+          "P4-1a: the first crossing must advance the cursor past 0");
 
-    /* Every counter >>= 1, so both keys halve (10 -> 5, 2 -> 1) and, crucially,
-     * their ORDER survives: aging must decay history, not scramble it. */
+    for (crossing = 1;
+         crossing < NGX_HTTP_CACHE_TURBO_SKETCH_HALVE_STRIPES;
+         crossing++)
+    {
+        for (i = 0; i < 32; i++) {
+            test_sketch_bump(0xdddd0000u + crossing * 1000 + i);
+        }
+    }
+
+    CHECK(g_sh.sketch_gen == 1,
+          "P4-1a: completing a full lap (HALVE_STRIPES crossings) did not "
+          "advance the generation");
+    CHECK(g_sh.sketch_cursor == 0,
+          "P4-1a: the cursor must wrap to 0 when a lap completes");
+
+    /* Every counter >>= 1 exactly once over the lap, so both keys halve
+     * (10 -> 5, 2 -> 1) and, crucially, their ORDER survives: aging must
+     * decay history, not scramble it. */
     CHECK(test_sketch_estimate(hot) == 5,
-          "P4-1a: the hot key's estimate did not halve");
+          "P4-1a: the hot key's estimate did not halve over the full lap");
     CHECK(test_sketch_estimate(warm) == 1,
-          "P4-1a: the warm key's estimate did not halve");
+          "P4-1a: the warm key's estimate did not halve over the full lap");
     CHECK(test_sketch_estimate(hot)
               > test_sketch_estimate(warm),
           "P4-1a: halving inverted or flattened the frequency ordering");
+}
+
+
+/* PERF-AUD2-08: sketch_gen is the FULL-LAP counter, not the stripe counter.
+ * After exactly one crossing (one stripe), gen must still read 0 -- only a
+ * cursor wrap (HALVE_STRIPES crossings) may advance it. This is the direct
+ * regression test for "readers of sketch_gen must not observe a generation
+ * change that implies a completed pass when only part of the array has been
+ * aged" from the packet. */
+static void
+test_p4_1a_halving_gen_advances_only_on_full_lap(void)
+{
+    ngx_uint_t  crossing;
+
+    zone_reset();
+    sketch_attach();
+    g_sh.sketch_reset_at = 1;   /* every single bump is its own crossing */
+
+    for (crossing = 0;
+         crossing < NGX_HTTP_CACHE_TURBO_SKETCH_HALVE_STRIPES - 1;
+         crossing++)
+    {
+        test_sketch_bump(0xe000u + (uint32_t) crossing);
+
+        CHECK(g_sh.sketch_gen == 0,
+              "P4-1a: sketch_gen advanced before the array's last stripe was "
+              "swept -- a reader would see a completed-pass signal while "
+              "part of the array is still stale, unbounded-stale data");
+    }
+
+    /* The HALVE_STRIPESth crossing is the one that wraps the cursor. */
+    test_sketch_bump(0xefffu);
+
+    CHECK(g_sh.sketch_gen == 1,
+          "P4-1a: the final stripe of the lap did not advance sketch_gen");
+    CHECK(g_sh.sketch_cursor == 0,
+          "P4-1a: the final stripe of the lap did not wrap the cursor");
 }
 
 
@@ -5040,11 +5107,16 @@ test_p4_1a_halving_ages_the_sketch(void)
  * `byte >>= 1` bleeds the high counter's low bit into the high counter's top
  * bit is fine, but bleeds nothing into the LOW counter's top bit -- except it
  * does: the high nibble's bit 4 shifts down into the low nibble's bit 3. The
- * & 0x77 mask is what stops that, and this is the only test that can see it. */
+ * & 0x77 mask is what stops that, and this is the only test that can see it.
+ *
+ * PERF-AUD2-08: byte[0] is deliberately used -- the cursor starts at 0 (see
+ * sketch_attach()), so byte[0] is guaranteed to fall in the FIRST stripe and
+ * a single crossing (reset_at=1) is enough to age it, without needing a full
+ * lap. */
 static void
 test_p4_1a_halving_does_not_bleed_across_nibbles(void)
 {
-    ngx_uint_t  i;
+    ngx_uint_t  i, stripe_bytes;
 
     zone_reset();
     sketch_attach();
@@ -5054,11 +5126,13 @@ test_p4_1a_halving_does_not_bleed_across_nibbles(void)
      * mask gives 0x78 -- low nibble 8, conjured out of nothing. */
     g_sh.sketch[0] = 0xf0;
 
-    /* Trip the halving deterministically. */
+    /* Trip one stripe deterministically; byte[0] is in stripe 0 since the
+     * cursor starts at 0. */
     g_sh.sketch_reset_at = 1;
     test_sketch_bump(0x5eed0001u);
 
-    CHECK(g_sh.sketch_gen == 1, "P4-1a: fixture failed to trigger a halving");
+    CHECK(g_sh.sketch_cursor > 0,
+          "P4-1a: fixture failed to trigger a stripe crossing");
 
     /* byte[0]'s two counters are 0 and 15 before, so 0 and 7 after -- unless
      * a bump happened to land on byte 0, which would add at most 1 to one of
@@ -5070,12 +5144,17 @@ test_p4_1a_halving_does_not_bleed_across_nibbles(void)
     CHECK(ngx_http_cache_turbo_sketch_get(g_sh.sketch, 1) >= 7,
           "P4-1a: halving lost the high nibble's value");
 
-    /* The pass is bounded: no byte anywhere may have a nibble above 7 right
-     * after a halving (bar the at-most-one bump the trip itself performed). */
-    for (i = 0; i < TEST_SKETCH_BYTES; i++) {
+    /* The pass is bounded to the stripe: no byte inside stripe 0 may have a
+     * nibble above 7 right after the crossing (bar the at-most-one bump the
+     * trip itself performed). */
+    stripe_bytes = (TEST_SKETCH_BYTES
+                    + NGX_HTTP_CACHE_TURBO_SKETCH_HALVE_STRIPES - 1)
+                   / NGX_HTTP_CACHE_TURBO_SKETCH_HALVE_STRIPES;
+
+    for (i = 0; i < stripe_bytes; i++) {
         if ((g_sh.sketch[i] & 0x0f) > 8 || (g_sh.sketch[i] >> 4) > 8) {
             CHECK(0, "P4-1a: a counter survived halving above the half-ceiling "
-                  "-- the halving pass did not cover the whole array");
+                  "-- the stripe did not cover its own byte range");
             break;
         }
     }
@@ -5116,6 +5195,122 @@ test_p4_1a_rows_are_independently_positioned(void)
     CHECK(distinct == NGX_HTTP_CACHE_TURBO_SKETCH_ROWS,
           "P4-1a: the four rows hash one key to the same in-row offset -- "
           "the min across rows carries no more information than one row");
+}
+
+
+/* PERF-AUD2-08 boundary: the very FIRST bump into a fresh sketch can itself
+ * be the crossing (reset_at == 1). Nothing about "first bump" is special-
+ * cased in sketch_halve(), but a cursor/width edge case (start == 0, an
+ * empty array so far) is exactly where an off-by-one would live. */
+static void
+test_p4_1a_first_bump_can_be_the_crossing(void)
+{
+    zone_reset();
+    sketch_attach();
+    g_sh.sketch_reset_at = 1;
+
+    test_sketch_bump(0xf0f0u);
+
+    CHECK(g_sh.sketch_ops == 0,
+          "P4-1a: the very first bump did not trip and reset ops when "
+          "reset_at == 1");
+    CHECK(g_sh.sketch_cursor > 0,
+          "P4-1a: the first-bump crossing did not advance the cursor");
+    CHECK(test_sketch_estimate(0xf0f0u) <= 1,
+          "P4-1a: the key that caused the first crossing must read as "
+          "recently-bumped-then-immediately-aged, not saturated");
+}
+
+
+/* PERF-AUD2-08 boundary: many crossings in rapid succession (reset_at == 1,
+ * so every bump is a crossing) must never skip a stripe, never write past
+ * the array, and must still land on a clean full-lap wrap arithmetic-wise --
+ * this is the same invariant test_p4_1a_halving_gen_advances_only_on_full_lap
+ * checks with reset_at == 1, but driven for THREE full laps back to back to
+ * catch a cursor that fails to re-wrap correctly on the second lap. */
+static void
+test_p4_1a_rapid_crossings_stay_bounded(void)
+{
+    ngx_uint_t  i, laps;
+
+    zone_reset();
+    sketch_attach();
+    g_sh.sketch_reset_at = 1;
+
+    for (i = 0, laps = 0;
+         i < NGX_HTTP_CACHE_TURBO_SKETCH_HALVE_STRIPES * 3;
+         i++)
+    {
+        test_sketch_bump(0xa0a00000u + (uint32_t) i);
+
+        if (g_sh.sketch_cursor == 0) {
+            laps++;
+        }
+    }
+
+    CHECK(laps == 3,
+          "P4-1a: three full laps of rapid crossings did not wrap the "
+          "cursor exactly three times");
+    CHECK(g_sh.sketch_gen == 3,
+          "P4-1a: sketch_gen did not advance once per completed lap under "
+          "rapid crossings");
+    CHECK(g_sh.sketch_cursor == 0,
+          "P4-1a: cursor did not end the third lap back at 0");
+}
+
+
+/* PERF-AUD2-08 boundary: width at its floor and at its ceiling must both
+ * produce a valid stripe (never 0 bytes, never reading/writing past the
+ * array) -- the stripe size is bytes/HALVE_STRIPES and MIN_WIDTH is small
+ * enough that a naive integer division could round to 0. */
+static void
+test_p4_1a_halve_stripe_bounded_at_width_extremes(void)
+{
+    ngx_uint_t  bytes;
+
+    /* Floor: MIN_WIDTH. sketch_attach() already uses this width; just
+     * confirm a full lap still lands cleanly on gen==1, cursor==0. */
+    zone_reset();
+    sketch_attach();
+    g_sh.sketch_reset_at = 1;
+
+    {
+        ngx_uint_t  i;
+
+        for (i = 0; i < NGX_HTTP_CACHE_TURBO_SKETCH_HALVE_STRIPES; i++) {
+            test_sketch_bump(0xb0000000u + (uint32_t) i);
+        }
+    }
+
+    CHECK(g_sh.sketch_gen == 1 && g_sh.sketch_cursor == 0,
+          "P4-1a: MIN_WIDTH sketch did not complete a clean lap");
+
+    /* Ceiling: SKETCH_MAX_WIDTH. Too large to size a static test fixture
+     * array for (2 MB), so exercise the stripe-size arithmetic directly
+     * instead of through a real bump/halve cycle -- this is the same
+     * ceil-division shm.c's sketch_halve() performs, checked for the
+     * documented worst-case bound (2 MB / HALVE_STRIPES == 128 KB) rather
+     * than re-run through the full bump path. */
+    bytes = NGX_HTTP_CACHE_TURBO_SKETCH_MAX_WIDTH
+            * NGX_HTTP_CACHE_TURBO_SKETCH_ROWS / 2;
+
+    CHECK(bytes == 2u * 1024 * 1024,
+          "fixture: SKETCH_MAX_WIDTH's byte budget is no longer 2 MB -- the "
+          "128 KB worst-case-stripe bound in the module.h comment needs "
+          "re-deriving");
+
+    {
+        ngx_uint_t  stripe = (bytes
+                               + NGX_HTTP_CACHE_TURBO_SKETCH_HALVE_STRIPES - 1)
+                              / NGX_HTTP_CACHE_TURBO_SKETCH_HALVE_STRIPES;
+
+        CHECK(stripe == 128u * 1024,
+              "P4-1a: SKETCH_MAX_WIDTH's per-crossing stripe is no longer "
+              "bounded at 128 KB -- the worst-case-stall claim is now false");
+        CHECK(stripe > 0,
+              "P4-1a: a stripe of 0 bytes would spin sketch_ops without ever "
+              "aging anything");
+    }
 }
 
 
@@ -5281,6 +5476,130 @@ test_p4_1b_admits_hotter_and_tied_candidate(void)
           "P4-1b: a TIE must admit (strict <, not <=)");
     CHECK(g_sh.admission_refused == 0,
           "P4-1b: neither the hotter nor the tied arm may count a refusal");
+}
+
+
+/* PERF-AUD2-08: admission decisions must stay SOUND across a stripe crossing
+ * -- the whole point of making the halve incremental is that nothing reading
+ * the sketch during a partial pass gets a wrong-direction answer. Seat a
+ * victim and a candidate, force a stripe crossing between seating them, and
+ * assert admit() still ranks them the same way plain frequency says it
+ * should: the hotter key (more bumps) is never refused in favour of the
+ * colder one just because a stripe happened to land between their bumps. */
+static void
+test_p4_1b_admission_sound_across_halve_boundary(void)
+{
+    uint32_t    cand = 0xc0ffeeu;
+    ngx_uint_t  i;
+
+    printf("P4-1b: admission stays sound across a stripe-halve boundary\n");
+    zone_reset();
+    sketch_attach();
+    g_sh.admission = 1;
+
+    /* Seat a victim with a modest frequency. */
+    admit_seat_victim(0, 4);
+
+    /* Force exactly one stripe crossing with unrelated traffic -- this is
+     * the partial-pass window the module.h PERF-AUD2-08 comment reasons
+     * about: some counters (whichever fall in stripe 0) are now halved,
+     * others are not. */
+    g_sh.sketch_reset_at = 8;
+
+    for (i = 0; i < 8; i++) {
+        test_sketch_bump(0xd0000000u + (uint32_t) i);
+    }
+
+    CHECK(g_sh.sketch_cursor > 0 && g_sh.sketch_gen == 0,
+          "fixture: expected exactly one stripe crossing, mid-lap");
+
+    /* Candidate is bumped AFTER the crossing, well above the victim's
+     * current (possibly-halved) estimate. */
+    for (i = 0; i < 6; i++) {
+        test_sketch_bump(cand);
+    }
+
+    CHECK(ngx_http_cache_turbo_shm_admit(&g_zone, cand) == 1,
+          "P4-1b: a candidate bumped well above the victim's mid-lap "
+          "estimate must still be admitted across a stripe boundary");
+
+    /* And the reverse: a candidate with a single bump against a victim seated
+     * with many bumps (and therefore, if anything, advantaged by the partial
+     * halve landing on the victim's row) must still be refused -- the skew
+     * a partial pass introduces is bounded to 2x and must never flip a
+     * clearly-colder candidate into an admit. */
+    zone_reset();
+    sketch_attach();
+    g_sh.admission = 1;
+    admit_seat_victim(1, 12);
+
+    g_sh.sketch_reset_at = 8;
+    for (i = 0; i < 8; i++) {
+        test_sketch_bump(0xd1000000u + (uint32_t) i);
+    }
+
+    CHECK(g_sh.sketch_cursor > 0 && g_sh.sketch_gen == 0,
+          "fixture: expected exactly one stripe crossing, mid-lap (arm 2)");
+
+    test_sketch_bump(cand);
+
+    CHECK(ngx_http_cache_turbo_shm_admit(&g_zone, cand) == 0,
+          "P4-1b: a clearly-colder candidate must still be refused across a "
+          "stripe boundary, even with the bounded partial-halve skew");
+}
+
+
+/* PERF-AUD2-08: the same soundness property, but spanning a FULL cursor
+ * wrap -- every counter in the array has been halved exactly once by the
+ * time this returns, which is the one case that must reproduce the OLD
+ * (whole-array) halve's guarantee exactly: relative order across the entire
+ * array is restored once a lap completes. */
+static void
+test_p4_1b_admission_sound_across_full_wrap(void)
+{
+    uint32_t    cand = 0xfeedfaceu;
+    ngx_uint_t  i, crossing;
+
+    printf("P4-1b: admission stays sound across a full cursor wrap\n");
+    zone_reset();
+    sketch_attach();
+    g_sh.admission = 1;
+
+    admit_seat_victim(0, 6);
+
+    /* Drive a FULL lap (HALVE_STRIPES crossings) with unrelated traffic. */
+    g_sh.sketch_reset_at = 4;
+
+    for (crossing = 0;
+         crossing < NGX_HTTP_CACHE_TURBO_SKETCH_HALVE_STRIPES;
+         crossing++)
+    {
+        for (i = 0; i < 4; i++) {
+            test_sketch_bump(0xe2000000u + crossing * 100 + i);
+        }
+    }
+
+    CHECK(g_sh.sketch_gen == 1 && g_sh.sketch_cursor == 0,
+          "fixture: expected exactly one full lap to have completed");
+
+    /* The victim's own counter has now been halved exactly once by the lap:
+     * 6 -> 3. A candidate bumped to 4 after the wrap is strictly hotter and
+     * must be admitted -- the same answer the pre-incremental whole-array
+     * halve would have given. */
+    CHECK(test_sketch_estimate(ngx_crc32_short(mkkey(0), 32)) == 3,
+          "P4-1b: the victim's counter did not halve exactly once over the "
+          "full wrap");
+
+    for (i = 0; i < 4; i++) {
+        test_sketch_bump(cand);
+    }
+
+    REQUIRE(test_sketch_estimate(cand) == 4,
+            "fixture: candidate estimate should be 4 after the wrap");
+    CHECK(ngx_http_cache_turbo_shm_admit(&g_zone, cand) == 1,
+          "P4-1b: a candidate hotter than the post-wrap victim must be "
+          "admitted -- the full-wrap halve must match the old whole-array "
+          "halve's outcome exactly");
 }
 
 
@@ -5462,10 +5781,17 @@ test_p4_1b_admission_never_spins(void)
 
 /* The observability the packet asks for: sketch_bumps must be a LIFETIME
  * tally, not sketch_ops under another name. sketch_ops resets to 0 on every
- * halving, so an operator reading it cannot tell "the sketch is learning" from
- * "the sketch just aged" -- which is precisely the question admission_refused
- * needs context for. Asserted across a halving, since that is the only input
- * that separates the two. */
+ * STRIPE now (PERF-AUD2-08), same as it used to reset on every full halving,
+ * so an operator reading it cannot tell "the sketch is learning" from "the
+ * sketch just aged a stripe" -- which is precisely the question
+ * admission_refused needs context for. Asserted across several stripe
+ * crossings, since that is the only input that separates the two.
+ *
+ * sketch_gen now counts full LAPS (HALVE_STRIPES crossings each), not single
+ * crossings -- 25 bumps at reset_at=10 is 2 crossings, nowhere near a full
+ * 16-stripe lap, so gen must still read 0 here. The lap-completion half of
+ * this contract is covered separately by
+ * test_p4_1a_halving_gen_advances_only_on_full_lap(). */
 static void
 test_p4_1b_sketch_bumps_survive_halving(void)
 {
@@ -5482,11 +5808,14 @@ test_p4_1b_sketch_bumps_survive_halving(void)
 
     CHECK(g_sh.sketch_bumps == 25,
           "P4-1b: sketch_bumps must count every bump for the zone's lifetime");
-    CHECK(g_sh.sketch_gen == 2,
-          "fixture: 25 bumps at reset_at=10 should have aged twice");
+    CHECK(g_sh.sketch_gen == 0,
+          "P4-1b: 25 bumps at reset_at=10 is only 2 of 16 stripes -- gen must "
+          "not advance before a full lap completes");
+    CHECK(g_sh.sketch_cursor > 0,
+          "P4-1b: two stripe crossings should have advanced the cursor");
     CHECK(g_sh.sketch_ops < g_sh.sketch_bumps,
           "P4-1b: sketch_bumps must NOT be sketch_ops -- it must survive the "
-          "halving that resets sketch_ops");
+          "stripe halving that resets sketch_ops");
 
     /* A NULL sketch must not bump the lifetime tally either: the bump returns
      * before doing anything, so an operator seeing sketch_bumps == 0 on a
@@ -5750,11 +6079,17 @@ main(void)
     test_p4_1a_nibbles_are_independent_counters();
     test_p4_1a_estimate_is_min_across_rows();
     test_p4_1a_halving_ages_the_sketch();
+    test_p4_1a_halving_gen_advances_only_on_full_lap();
     test_p4_1a_halving_does_not_bleed_across_nibbles();
     test_p4_1a_rows_are_independently_positioned();
+    test_p4_1a_first_bump_can_be_the_crossing();
+    test_p4_1a_rapid_crossings_stay_bounded();
+    test_p4_1a_halve_stripe_bounded_at_width_extremes();
     test_p4_1b_admission_off_by_default();
     test_p4_1b_refuses_colder_candidate();
     test_p4_1b_admits_hotter_and_tied_candidate();
+    test_p4_1b_admission_sound_across_halve_boundary();
+    test_p4_1b_admission_sound_across_full_wrap();
     test_p4_1b_fails_open_three_ways();
     test_p4_1b_admission_never_spins();
     test_p4_1b_sketch_bumps_survive_halving();

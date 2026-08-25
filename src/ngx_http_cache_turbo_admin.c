@@ -589,7 +589,7 @@ ngx_http_cache_turbo_admin_stats_prometheus(ngx_http_request_t *r,
         "# HELP cache_turbo_bg_inflight Background-refresh subrequests currently in flight for this zone (cache_turbo_background_update_max cap).\n"
         "# TYPE cache_turbo_bg_inflight gauge\n"
         "cache_turbo_bg_inflight{zone=\"%V\"} %uA\n"
-        "# HELP cache_turbo_sketch_gen W-TinyLFU sketch aging generation (halvings so far; 0 = never aged or no sketch).\n"
+        "# HELP cache_turbo_sketch_gen W-TinyLFU sketch aging generation (full incremental halving laps completed so far; 0 = never aged or no sketch).\n"
         "# TYPE cache_turbo_sketch_gen gauge\n"
         "cache_turbo_sketch_gen{zone=\"%V\"} %uA\n"
         "# HELP cache_turbo_sketch_bumps_total Lifetime W-TinyLFU sketch increments (0 on a live zone means the sketch was never allocated).\n"

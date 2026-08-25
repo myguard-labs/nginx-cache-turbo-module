@@ -1133,19 +1133,62 @@ typedef struct {
      * width is derived from the zone size in _shm_init_zone() and capped so
      * the sketch is well under 1% of the zone; see the sizing comment there.
      *
-     * `sketch_ops` counts bumps since the last halving; when it reaches
-     * `sketch_reset_at` every counter is halved (>>= 1) and it returns to 0.
-     * That is the classic TinyLFU aging step: it keeps the estimates a
+     * `sketch_ops` counts bumps since the last STRIPE (not the last full
+     * halving -- see PERF-AUD2-08 below); when it reaches `sketch_reset_at`
+     * one stripe of the array is halved and it returns to 0. That is the
+     * classic TinyLFU aging step, made incremental: it keeps the estimates a
      * measure of RECENT frequency rather than of lifetime totals, so a key
-     * that was hot last week cannot outrank one that is hot now.
-     * `sketch_gen` counts how many halvings have happened, purely for
-     * diagnosis. All three are plain fields, not atomics: every access is
-     * under the shpool mutex. */
+     * that was hot last week cannot outrank one that is hot now, without
+     * doing the whole pass under the zone mutex in one request.
+     *
+     * PERF-AUD2-08: a full halving pass (every counter >>= 1) used to run
+     * inline, entirely under the shpool mutex, on whichever bump crossed
+     * `sketch_reset_at` -- up to ~2 MB (SKETCH_MAX_WIDTH) of memset-like work
+     * stalling every other worker for that one request, with no benchmark
+     * attributing the cost. It is now STRIPED: each crossing halves
+     * `1/NGX_HTTP_CACHE_TURBO_SKETCH_HALVE_STRIPES` of the array, starting at
+     * `sketch_cursor`, and advances the cursor by that stripe's width.
+     * `sketch_cursor` is the byte offset (into the flat `sketch` array) where
+     * the NEXT stripe starts; it wraps to 0, and only THEN does `sketch_gen`
+     * advance -- see ngx_http_cache_turbo_sketch_halve_stripe() for why a
+     * generation bump mid-lap would be a lie to its readers.
+     *
+     * SOUNDNESS OF A PARTIAL LAP. shm_admit() reads two estimates (candidate,
+     * victim) at the SAME instant against whatever state the array is in,
+     * partially-aged or not. Within one lap some counters have been
+     * stripe-halved already (this lap) and some have not, so two counters
+     * that would read equal at lap start or lap end can differ by at most a
+     * factor of 2 while the lap is in progress -- never more, because each
+     * counter is touched exactly once per lap. That skew is symmetric (it can
+     * make EITHER side of a comparison read lower, depending only on which
+     * stripe each key's row-positions fall in, not on which key is actually
+     * hotter) and self-corrects: by the time the lap completes every counter
+     * has been halved exactly once, so relative order across the whole array
+     * is restored. Count-min's own error is already one-sided (over-count on
+     * a row collision, never under-count) and TinyLFU is a heuristic ranking,
+     * not an exact one; a bounded, symmetric, self-correcting 2x skew during
+     * an aging pass is within that existing tolerance and changes no
+     * documented guarantee (fail-open paths, tie-admits, one-sided
+     * count-min error are all untouched -- see shm_admit()).
+     *
+     * BOUNDED BY CONSTRUCTION, preserved: a stripe is exactly
+     * `sketch_width * SKETCH_ROWS / (2 * HALVE_STRIPES)` byte writes, capped
+     * by the same SKETCH_MAX_WIDTH as before, so the worst case per crossing
+     * is a fixed 2 MB / 16 = 128 KB pass -- independent of traffic or entry
+     * count, same as the original bound, just paid in smaller instalments.
+     *
+     * `sketch_gen` counts how many FULL laps have happened (cursor wraps),
+     * purely for diagnosis -- nothing reads it to gate a decision, so an
+     * observer seeing it advance mid-lap was never a hazard the field itself
+     * needed to avoid; it simply never happens because the increment lives on
+     * the wrap branch. All fields here are plain, not atomics: every access
+     * is under the shpool mutex. */
     u_char                  *sketch;
     ngx_uint_t               sketch_width;      /* counters per row          */
-    ngx_uint_t               sketch_ops;        /* bumps since last halving  */
-    ngx_uint_t               sketch_reset_at;   /* halve when ops reaches it */
-    ngx_uint_t               sketch_gen;        /* halvings so far           */
+    ngx_uint_t               sketch_ops;        /* bumps since last stripe   */
+    ngx_uint_t               sketch_reset_at;   /* stripe when ops reaches it*/
+    ngx_uint_t               sketch_gen;        /* full laps completed       */
+    ngx_uint_t               sketch_cursor;     /* next stripe's byte offset */
 
     /* P4-1b: W-TinyLFU ADMISSION. `admission` mirrors the zone's
      * `cache_turbo_zone ... admission=on` parameter into shared memory so

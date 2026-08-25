@@ -118,6 +118,11 @@ check_define NGX_HTTP_CACHE_TURBO_SKETCH_MAX       15 "$SRC"
 check_define NGX_HTTP_CACHE_TURBO_SKETCH_SAMPLE    10 "$SRC"
 check_define NGX_HTTP_CACHE_TURBO_SKETCH_MIN_WIDTH 1024 "$SRC"
 check_define NGX_HTTP_CACHE_TURBO_SKETCH_MAX_WIDTH '(1<<20)' "$SRC"
+# PERF-AUD2-08: the incremental-halve stripe count. Pinned the same way as its
+# siblings above -- the test file's boundary/wrap arithmetic (a full lap is
+# exactly this many crossings) hard-codes the mirrored value, so a drift here
+# would silently test a lap length production does not have.
+check_define NGX_HTTP_CACHE_TURBO_SKETCH_HALVE_STRIPES 16 "$SRC"
 
 # H-4: the packed-probe layout macros are hand-mirrored into test_shm_state.c
 # (NGX_HTTP_CACHE_TURBO_BREAKER_PROBE_WORD_BITS / _STAMP_BITS / _GEN_BITS /
