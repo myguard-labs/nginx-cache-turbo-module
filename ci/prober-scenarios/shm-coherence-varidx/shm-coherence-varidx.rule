@@ -1,0 +1,198 @@
+# shm-coherence-varidx: real, falsifiable coverage of all three
+# `zone_invariant` forms against cache_turbo's own shared counters.
+#
+# WHY THIS FILE EXISTS
+# --------------------
+# testkit's own ci/prober/scenarios/shm-coherence is the live-worker leg of the
+# `fanout` / `quiesce` / `zone_invariant` lens, and it DELIBERATELY asserts no
+# zone_invariant at all. Its rule file says why: the reference module never
+# mutates its shm zone on a request path, so against a constant field
+#
+#   - `coherent  <f>`        is satisfied by any constant;
+#   - `at_rest   <f> == N`   is satisfied by a field that was never anything
+#                            but N;
+#   - `monotonic <f>`        is satisfied because a constant never decreases.
+#
+# All three would be green there for reasons unrelated to whether their
+# comparisons work. That file names cache-turbo's `varidx_inflight` as the
+# intended home of the real coverage. This is that home.
+#
+#
+# THE FIELDS, AND WHY EACH FORM READS THE ONE IT DOES
+# ---------------------------------------------------
+# All five are rendered by src/ngx_http_cache_turbo_probe.c's zone_render hook
+# into the probe's "zone" object, straight off the zone's shared struct.
+#
+#   zone.varidx_inflight -> at_rest
+#     Incremented in redis_tag_add_many() immediately before a variant-index
+#     write is launched (redis.c:1706), decremented in redis_op_done(), which
+#     every completion and every failure path funnels through (redis.c:1715,
+#     :3515). Its resting value is 0 and ONLY 0. A launch whose completion
+#     never decremented strands it above 0 permanently -- that is COR-5's
+#     defect class (PR #443), which had no automated guard before this file.
+#
+#     It is NOT the monotonic field, and that is not an oversight: it goes both
+#     up and down by design, so `monotonic zone.varidx_inflight` would assert a
+#     falsehood and fire on correct behaviour. A form that reddens on healthy
+#     code is worse than no form.
+#
+#   zone.lookups -> monotonic
+#     hits + misses, summed in the hook because zone_invariant takes ONE field
+#     path and cannot compute over two. Both addends are lifetime tallies,
+#     only ever ngx_atomic_fetch_add(+1) on the request path, zeroed exactly
+#     once when a fresh zone is carved (shm.c:172-173) and never reset
+#     thereafter -- a reload inherits the live shm rather than re-initialising
+#     it. So the sum is genuinely non-decreasing, and it genuinely MOVES across
+#     this scenario's traffic, which is what makes the form falsifiable rather
+#     than trivially true.
+#
+#   zone.ct_digest -> coherent
+#     A fold of all four counters. The generic `zone.digest` already exists but
+#     is derived from SLAB bookkeeping, so it attests to nginx's allocator, not
+#     to this module's counters: a worker whose view of the module's shared
+#     struct had diverged would still agree with its siblings on zone.digest
+#     while disagreeing about every field above. Folding the module fields into
+#     one value makes that disagreement one rule line wide -- the same argument
+#     testkit's header makes for zone.digest itself.
+#
+#
+# WHY `quiesce` PRECEDES EVERY `at_rest`
+# --------------------------------------
+# varidx_inflight is bumped before the SADD reaches the transport and dropped
+# when the op completes, and the response is finalized to the client on an
+# EARLIER event-loop turn than the one the write completes on -- that
+# separation is the entire subject of the counter's own header comment. So the
+# counter is provably NOT at rest the instant the last byte reaches the client,
+# and an at_rest oracle judged at that moment is timing-dependent: green on an
+# idle box, red on a loaded one, and the usual repair is to loosen the bound
+# until it stops firing, at which point it asserts nothing. `quiesce` polls for
+# two consecutive equal readings and FAILS on expiry rather than degrading to a
+# sleep or a skip.
+#
+#
+# WHY `fanout 24` AND NOT LESS
+# ----------------------------
+# Nothing lets a client choose which worker accepts its connection, so worker
+# sampling is probabilistic and a run CAN legitimately land every request on
+# one worker. testkit's shm-coherence measured this on the same class of box,
+# four workers, sequential fresh connections: `fanout 8` reached 2 distinct
+# workers in 7 runs of 8 and never 4; `fanout 24` reached >= 3 in 7 of 7. The
+# WIDTH, not the bound, is what buys reliability.
+#
+# min_workers stays at the meaningful 2. Lowering it to 1 is the tempting fix
+# when this flakes and it is a disarmed oracle -- the parser refuses it at load
+# time for that reason. If a box cannot reach 2 distinct workers at this width,
+# widen the fanout or investigate the accept path; the bound is not the
+# adjustable part.
+
+
+# ---------------------------------------------------------------------------
+# 1. Prime the variant index. This case's job is to MOVE the counters, so the
+#    forms below are judged against a zone that actually did work rather than
+#    one that sat idle. A Vary-carrying origin response through
+#    cache_turbo_auto_vary is what issues the variant-index write.
+# ---------------------------------------------------------------------------
+name    priming traffic drives real variant-index writes through the zone
+from    127.0.0.1
+send    GET /varidx/a HTTP/1.1\r\n
+send    Host: prober\r\nAccept-Language: en\r\nConnection: close\r\n\r\n
+expect  status=200
+expect  body~ct-varidx-payload
+pid_may_change
+fanout  24 2
+
+
+# ---------------------------------------------------------------------------
+# 2. A second variant of the same base URI. Two variants rather than one
+#    because a single variant can be indexed by a write that raced nothing;
+#    two make the index set genuinely multi-membered, which is the shape a
+#    PURGE's SMEMBERS enumerates and therefore the shape COR-5 is about.
+# ---------------------------------------------------------------------------
+name    a second variant of the same base URI is indexed too
+from    127.0.0.1
+send    GET /varidx/a HTTP/1.1\r\n
+send    Host: prober\r\nAccept-Language: fr\r\nConnection: close\r\n\r\n
+expect  status=200
+expect  body~ct-varidx-payload
+pid_may_change
+fanout  24 2
+
+
+# ---------------------------------------------------------------------------
+# 3. at_rest -- the COR-5 regression guard, and the reason this file exists.
+#
+#    `probe zone.varidx_inflight >= 0` above the quiesce is NOT decoration. A
+#    field the probe could not render is reported as the -1 unavailable
+#    sentinel, and a quiesce would happily settle on two consecutive -1s and
+#    then hand at_rest a reading it never actually read. The probe line fails
+#    closed on that, so a renamed field or a hook that stopped being called
+#    reddens here rather than passing quietly.
+# ---------------------------------------------------------------------------
+name    the variant-index in-flight counter returns to zero in every worker
+from    127.0.0.1
+send    GET /varidx/a HTTP/1.1\r\n
+send    Host: prober\r\nAccept-Language: en\r\nConnection: close\r\n\r\n
+expect  status=200
+expect  body~ct-varidx-payload
+pid_may_change
+probe   zone.varidx_inflight >= 0
+quiesce zone.varidx_inflight 8000
+fanout  24 2
+zone_invariant at_rest zone.varidx_inflight == 0
+
+
+# ---------------------------------------------------------------------------
+# 4. coherent -- every answering worker read the SAME module state.
+#
+#    The zone is one mmap shared by every worker, so at rest they cannot
+#    honestly disagree about a field of it. A divergence is a torn read, a
+#    per-worker copy that drifted, or a write that never reached the shared
+#    page. Quiesced on the same counter as case 3 so the digest is folded from
+#    a settled zone rather than one mid-write -- an unquiesced coherent would
+#    redden on nothing worse than two probes landing either side of a healthy
+#    increment.
+# ---------------------------------------------------------------------------
+name    every answering worker reads the same module counter state
+from    127.0.0.1
+send    GET /varidx/a HTTP/1.1\r\n
+send    Host: prober\r\nAccept-Language: en\r\nConnection: close\r\n\r\n
+expect  status=200
+expect  body~ct-varidx-payload
+pid_may_change
+probe   zone.ct_digest >= 0
+quiesce zone.varidx_inflight 8000
+fanout  24 2
+zone_invariant coherent zone.ct_digest
+
+
+# ---------------------------------------------------------------------------
+# 5. monotonic -- the lifetime lookup tally never decreased across the fan.
+#
+#    ⚠ COVERAGE STATUS: this case is asserted and passes, but unlike the two
+#    above it has NO gated negative control -- nothing has been observed making
+#    it go red. That is a harness limitation, not an oversight here:
+#    collect_zone_readings (prober.c:634) takes its readings AFTER the fan has
+#    drained, as sequential idle probe GETs, and by then no field in the
+#    document decreases between two readings by construction. Four candidates
+#    were measured live and are recorded in
+#    negative-control-monotonic.rule.fixture. Until that is fixed upstream,
+#    treat a green here as weaker evidence than a green on cases 3 and 4.
+#    Filed as ZONEINV-MONOTONIC-NO-DETERMINISTIC-FALL.
+#
+#    No quiesce here, deliberately. monotonic asserts a property of the
+#    SEQUENCE of readings, and the readings this fan takes while traffic is
+#    flowing are the interesting ones: a settled zone would make the sequence
+#    constant, and a constant sequence never decreases, which is the tautology
+#    this whole file exists to avoid. Judged live, `lookups` climbs across the
+#    24 legs and a decrease is a real finding.
+# ---------------------------------------------------------------------------
+name    the lifetime lookup tally never decreases across the fan
+from    127.0.0.1
+send    GET /varidx/a HTTP/1.1\r\n
+send    Host: prober\r\nAccept-Language: en\r\nConnection: close\r\n\r\n
+expect  status=200
+expect  body~ct-varidx-payload
+pid_may_change
+probe   zone.lookups >= 1
+fanout  24 2
+zone_invariant monotonic zone.lookups

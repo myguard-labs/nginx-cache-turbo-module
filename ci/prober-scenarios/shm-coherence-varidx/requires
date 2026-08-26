@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+#
+# Copyright (C) 2026 Thijs Eilander
+# SPDX-License-Identifier: BSD-2-Clause
+#
+# Gate for shm-coherence-varidx.
+#
+# Three hard requirements. Each one is a SKIP rather than a failure because
+# each is an environment fact, not a defect -- but every one of them is also a
+# way this scenario could otherwise pass while measuring nothing, so none of
+# them is checked loosely.
+#
+#   1. the cache_turbo .so in the tree that will ACTUALLY be booted. Globbing
+#      .build/*/objs finds the .so in ANY staged tree, so with it present in
+#      one tree and absent from the booted one the gate passes and nginx dies
+#      at `nginx -t` on a dlopen failure -- a hard FAIL where the point of a
+#      gate is a clean SKIP.
+#
+#   2. THE .so MUST BE A HARNESS BUILD. This is the requirement unique to this
+#      scenario and the one that matters most. ngx_http_cache_turbo_probe.c is
+#      entirely inside #ifdef NGX_TEST_HARNESS, so a .so built without the
+#      macro exports no cache_turbo_probe directive at all. Without this check
+#      the failure mode is a config-test death on an unknown directive, which
+#      reads like a broken conf; with it, an unstaged tree SKIPs cleanly and
+#      says how to stage one. The detection is a symbol lookup rather than a
+#      build-flag guess: it asks the artifact itself.
+#
+#   3. a redis-server binary. varidx_inflight moves only on the Redis-backed
+#      variant-index write path (redis.c:1706/1715). Without Redis the counter
+#      is a constant 0 and all three zone_invariant forms below degrade into
+#      the tautologies this scenario was written to eliminate -- it would still
+#      report green, which is strictly worse than skipping.
+#
+# nonzero exit => run-scenario.sh emits "1..0 # SKIP <stdout of this gate>"
+#
+# run-scenario.sh runs this BEFORE prober_resolve, so PROBER_RESOLVED_BUILD
+# does not exist yet; recompute the same path lib.sh will, taking flavor and
+# version from argv ($2/$3) with the same defaults, as the sibling gate does.
+FLAVOR="${2:-nginx}"
+VERSION="${3:-1.31.3}"
+BUILD="${PROBER_BUILD:-${PROBER_ROOT:-.}/.build/${FLAVOR}-${VERSION}}"
+
+SO="$BUILD/objs/ngx_http_cache_turbo_module.so"
+
+if [ ! -f "$SO" ]; then
+    echo "cache_turbo module .so not found in $BUILD/objs -- this scenario's conf load_modules it unconditionally, so this tree cannot run it (stage with ci/tools/testkit-stage.sh)"
+    exit 1
+fi
+
+# nm over readelf: the symbol may be local (it is not, but a future refactor
+# could make it so) and nm reports both. `-C` is harmless on C symbols and
+# keeps the check readable. A missing nm is itself a SKIP -- guessing that the
+# .so is a harness build would defeat the purpose of asking.
+if ! command -v nm >/dev/null 2>&1; then
+    echo "no nm on PATH -- cannot verify that $SO is an NGX_TEST_HARNESS build, and guessing would let a non-harness .so reach a conf whose cache_turbo_probe directive it does not implement"
+    exit 1
+fi
+
+if ! nm "$SO" 2>/dev/null | grep -q 'ngx_http_cache_turbo_probe_hooks_register'; then
+    echo "$SO carries no ngx_http_cache_turbo_probe_hooks_register -- it was built WITHOUT NGX_TEST_HARNESS, so it exports no cache_turbo_probe directive and this scenario's conf would fail nginx's config test (stage with ci/tools/testkit-stage.sh, which configures testkit's t/module into the same tree and that is what defines the macro)"
+    exit 1
+fi
+
+if ! command -v redis-server >/dev/null 2>&1; then
+    echo "no redis-server on PATH -- varidx_inflight moves only on the Redis-backed variant-index write path, so without a Redis backend the counter is a constant 0 and every zone_invariant form below would pass tautologically"
+    exit 1
+fi
+
+if ! command -v redis-cli >/dev/null 2>&1; then
+    echo "no redis-cli on PATH -- the driver uses it to confirm the variant index was actually written, which is the anti-vacuity check for the at_rest oracle"
+    exit 1
+fi
+
+exit 0

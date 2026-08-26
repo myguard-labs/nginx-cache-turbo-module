@@ -16,7 +16,35 @@ CACHE_TURBO_SRCS="                                                       \
                   $ngx_addon_dir/src/ngx_http_cache_turbo_filters.c     \
                   $ngx_addon_dir/src/ngx_http_cache_turbo_access.c      \
                   $ngx_addon_dir/src/ngx_http_cache_turbo_purge.c       \
+                  $ngx_addon_dir/src/ngx_http_cache_turbo_probe.c       \
                   "
+
+# nginx-module-testkit probe integration.
+#
+# ngx_http_cache_turbo_probe.c is listed UNCONDITIONALLY above: the whole file
+# is inside #ifdef NGX_TEST_HARNESS, so in every build this repo ships it
+# compiles to an empty translation unit and testkit's header is never opened.
+# Listing it unconditionally is what keeps the shipping source list and the
+# harness source list identical -- a conditionally-compiled FILE would mean the
+# .so under test was built from a different set of objects than the .so that
+# ships, which is exactly the divergence a harness exists to rule out.
+#
+# The include path is the conditional part, and it is additive only: it is
+# added when $TESTKIT_ROOT (or the superrepo's sibling checkout) actually holds
+# an nginx-module-testkit tree. Without one, no -I is added, nothing needs it,
+# and the build is byte-identical to one that never knew testkit existed.
+#
+# NGX_TEST_HARNESS itself is deliberately NOT defined here. It is appended to
+# the tree's global CFLAGS by testkit's own t/module/config, whose sole caller
+# in this repo is ci/tools/testkit-stage.sh -- the one script that configures
+# both modules into a single tree. A second way to switch the probe on would be
+# a second way to switch it on by accident, in a package build.
+CACHE_TURBO_TESTKIT="${TESTKIT_ROOT:-$ngx_addon_dir/../nginx-module-testkit}"
+if [ -f "$CACHE_TURBO_TESTKIT/src/ngx_test_probe.h" ]; then
+    CACHE_TURBO_INCS="$CACHE_TURBO_TESTKIT/src"
+else
+    CACHE_TURBO_INCS=""
+fi
 
 CACHE_TURBO_DEPS="                                                      \
                   $ngx_addon_dir/src/ngx_http_cache_turbo_module.h      \
@@ -41,6 +69,7 @@ if [ -n "$ngx_module_link" ]; then
     ngx_module_name=$ngx_addon_name
     ngx_module_srcs="$CACHE_TURBO_SRCS"
     ngx_module_deps="$CACHE_TURBO_DEPS"
+    ngx_module_incs="$CACHE_TURBO_INCS"
     # NO ngx_module_order: a lone --add-dynamic-module filter is appended last
     # at ./configure and registers at the TOP of the output chain, so our body
     # filter captures the IDENTITY response body BEFORE gzip/zstd/brotli compress
@@ -56,4 +85,5 @@ else
     HTTP_AUX_FILTER_MODULES="$HTTP_AUX_FILTER_MODULES $ngx_addon_name"
     NGX_ADDON_SRCS="$NGX_ADDON_SRCS $CACHE_TURBO_SRCS"
     NGX_ADDON_DEPS="$NGX_ADDON_DEPS $CACHE_TURBO_DEPS"
+    CORE_INCS="$CORE_INCS $CACHE_TURBO_INCS"
 fi

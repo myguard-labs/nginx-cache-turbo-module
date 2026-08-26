@@ -1,0 +1,76 @@
+# NEGATIVE CONTROL for `zone_invariant monotonic`. NOT a test of the module.
+#
+# ⚠ THIS FIXTURE IS NOT GATED BY driver.sh, AND THAT IS DELIBERATE.
+#   It fires roughly 11 runs in 12 and a control that misses one run in twelve
+#   is worse than no control: it teaches a reader to re-run until green, which
+#   is precisely how a broken oracle survives. It is checked in because it is
+#   the closest thing to a live monotonic control that exists on this harness
+#   and it is runnable by hand; it is not asserted because it is not reliable.
+#   The gap is filed as ZONEINV-MONOTONIC-NO-DETERMINISTIC-FALL.
+#
+# The `.fixture` suffix keeps it out of any *.rule glob: it is REQUIRED to
+# fail, and a runner that picked it up as an ordinary rule file would report a
+# permanent red.
+#
+# HOW IT IS RIGGED
+#   `monotonic` asserts that the field never DECREASED across the readings the
+#   fan collected. zone.lookups is non-decreasing by construction (both addends
+#   are lifetime fetch_add(+1) tallies), which is what case 5 of
+#   shm-coherence-varidx.rule asserts.
+#
+#   This fixture points it at `smaps.pss` instead -- the answering worker's
+#   proportional set size in KB, rendered by the generic probe from /proc.
+#   It is PER-WORKER, and the fan deliberately spreads its 24 legs across four
+#   of them, so consecutive readings routinely come from different processes
+#   with different resident footprints. Measured directly against a live server
+#   (four workers, sequential identical requests): 421, 502, 504, 504, 504,
+#   504, 504, 504, 504, 420, 444, 444 -- the 504 -> 420 step at the worker
+#   rotation is the decrease this control needs, and it is produced by the
+#   fan's own worker spread rather than by anything the first request did.
+#
+#   `zone_invariant` takes any probe field path, not only a `zone.*` one --
+#   assert.c's eval_zone_monotonic() compares the values it was handed and
+#   never inspects the path. So a control is free to pick the field with the
+#   most reliable failure, which is the whole job of a control.
+#
+# THREE FIELDS THAT WERE TRIED FIRST AND DO NOT WORK -- recorded so the next
+# reader does not spend the same time rediscovering them.
+#
+#   zone.varidx_inflight. It is the other field that legitimately goes both up
+#   and down, but only BETWEEN a variant-index write being launched and that
+#   write completing -- one event-loop turn. The fan's legs are sequential and
+#   each leg's probe read follows its completed response, so every reading
+#   samples a settled 0. Run for real: 24 readings of 0, a constant never
+#   decreases, THE CONTROL PASSED.
+#
+#   zone.slab_pages_free. It falls as the zone fills, but only once per NEW
+#   cache entry, and all 24 legs send the identical request -- so the single
+#   drop happens on leg 1, before reading 1, and readings 1..24 are constant.
+#   Measured directly against a live server: constant at 2032 across six
+#   identical requests, and constant at 12 with the zone shrunk to 64k. THE
+#   CONTROL PASSED. There is no per-leg substitution in the rule language, so
+#   no constant request can make this field fall repeatedly.
+#
+#   connections.free. The obvious "it must go up and down" field, and it does
+#   not: each fan leg closes its connection before the next opens, so the
+#   worker's free-slot count returns to the same number every time. Measured:
+#   constant at 125 across twelve requests, and the control PASSED.
+#
+#   The lesson all three share: a control must fail because of something the FAN
+#   itself does, not because of something the first request did.
+#
+# EXPECTED FAILURE MESSAGE (the driver greps for its stable prefix):
+#   zone_invariant monotonic smaps.pss: reading N is X but reading M was Y
+#
+# The driver greps for `zone_invariant monotonic smaps.pss:` -- keep the
+# field below in step with it.
+name    NEGATIVE CONTROL: monotonic must reject a field that legitimately falls
+from    127.0.0.1
+send    GET /varidx/a HTTP/1.1\r\n
+send    Host: prober\r\nAccept-Language: en\r\nConnection: close\r\n\r\n
+expect  status=200
+expect  body~ct-varidx-payload
+pid_may_change
+probe   smaps.pss >= 0
+fanout  64 2
+zone_invariant monotonic smaps.pss
