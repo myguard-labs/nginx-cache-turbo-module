@@ -1,4 +1,4 @@
-# sync-sha: 56481058f509ec6a616f7d91559755b35ed13879b90c58e2ae39d9ff4a2958f6
+# sync-sha: 6c72d6b1d5a57b3225e8b38571c6a98933521a4f1a02b4e302b5b209a2c7d8bd
 name: Build & Test
 
 # Runner labels live in the POOL repository variable. Every checked-in selector
@@ -590,6 +590,10 @@ jobs:
       - name: Fence sibling port bands off from RANDOMIZE
         if: ${{ !inputs.skip-expensive-jobs }}
         run: |
+          # A leftover marker from an earlier attempt on the same runner would
+          # satisfy the wait below instantly and hand the suite a fence that is
+          # not built yet -- the exact failure this handshake exists to stop.
+          rm -f fence-ready
           python3 - <<'PY' &
           import socket, time
 
@@ -614,12 +618,39 @@ jobs:
                       # must not pick it, and the suite's own wildcard probe
                       # will now decline it too.
                       s.close()
-          print(f"fenced {len(bases)} sibling bands: {bases}")
+          print(f"fenced {len(holders)} ports across {len(bases)} sibling bands: {bases}", flush=True)
+          # READINESS HANDSHAKE, not a sleep. Every socket above is bound
+          # before this file appears, and the step below blocks on it.
+          #
+          # This replaced `sleep 2`, which was a real defect the moment the
+          # band list stopped being hand-maintained: 2s was sized for the
+          # 6-band literal tuple (384 sockets) and the derive correctly grew
+          # the fence to 8 bands (512 sockets). The suite then started while
+          # the binder was still working, probed 19433 (band 19392) as free,
+          # and nginx lost the race to the fence a moment later --
+          # "bind() to 127.0.0.1:19433 failed (98: Address already in use)",
+          # 41 preset files dead. The scaffold's probe is NOT blind here
+          # (a 0.0.0.0 holder does refuse a later 127.0.0.1 bind, verified);
+          # it simply probed before the fence existed. A bigger sleep would
+          # only move the race, so the fence reports done instead.
+          with open("fence-ready", "w", encoding="utf-8") as fh:
+              fh.write(f"{len(holders)}\n")
           # Outlive the prove step; the runner reaps us at job teardown.
           time.sleep(3600)
           PY
-          echo "fenced sibling bands (pid $!)"
-          sleep 2
+          echo "fence binder started (pid $!)"
+          # Bounded wait: the binder is backgrounded, so its failure cannot
+          # reach this step's exit code any other way. 60s is far above the
+          # observed bind time and still fails fast if the binder died.
+          for _ in $(seq 1 600); do
+              [ -f fence-ready ] && break
+              sleep 0.1
+          done
+          if [ ! -f fence-ready ]; then
+              echo "fence binder never reported ready -- refusing to run the suite against a half-built fence" >&2
+              exit 1
+          fi
+          echo "fence ready: $(cat fence-ready) ports held"
 
       - name: Run the preset suite
         if: ${{ !inputs.skip-expensive-jobs }}
