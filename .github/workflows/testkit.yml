@@ -1,4 +1,4 @@
-# sync-sha: b1dff0c3e7c45fae91594f7afb1c7997e47218be593f1525f2342d53a7f63672
+# sync-sha: 6434e62e88be0decd1e76795377779dffab854740e1153bc8a7268b24590c02b
 name: Testkit
 
 # The nginx-module-testkit prober leg.
@@ -70,7 +70,7 @@ on:
 # string across members would make one member cancel another -- and a group
 # matching ci.yml's own would let a member cancel its caller. This also stops
 # two runs of this leg overlapping on the shared runner, which matters here
-# because both would sweep and bind the same 19392 band.
+# because both would sweep and bind the same 19456 band.
 concurrency:
   group: testkit-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -86,13 +86,24 @@ jobs:
     env:
       # This job's port band under ci/tools/lint-ci-ports.sh. 18880/18944/19008/
       # 19072/19136/19200/19264/19328 are taken by the eight existing
-      # runtime-bearing jobs; 19392 is the next 64-wide band and is verified
-      # below against the kernel ephemeral floor by max-port.sh.
+      # runtime-bearing jobs, and the next 64-wide band, 19392-19455, is NOT
+      # free: ci/t/core/breaker-retry-count.t reserves 19420-19490 for the
+      # fixed multi-peer upstream ports it needs (dead peers that must stay
+      # unlistened, plus a specific alive peer -- ct_origin_port() cannot
+      # express that for a multi-peer group), and 19392-19455 overlaps it.
+      # That reservation lived only in a comment inside the .t file, so
+      # nothing caught the clash when this lane was added; the fence in
+      # build-test.yml still held only a stale hand-typed 6-band tuple that
+      # omitted 19392, which is the sole reason it never fired. Deriving the
+      # fence correctly (AUD-CIPORT4) exposed it immediately -- the fence
+      # bound 19421/19433 and 41 preset files died on
+      # "bind() to 127.0.0.1:19421 failed (98)". 19456 is the first band
+      # clear of the reservation; lint-ci-ports.sh check 4 now enforces it.
       #
       # testkit-run.sh reads TEST_BASE_PORT from the environment and defaults
       # its --port to it, so declaring the band here IS passing it -- the same
       # arrangement coverage.sh has, and the lint knows about both.
-      TEST_BASE_PORT: 19392
+      TEST_BASE_PORT: 19456
       NGINX_VERSION: "1.31.3"
     steps:
       - name: Checkout

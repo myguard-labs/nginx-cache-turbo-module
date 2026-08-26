@@ -1,4 +1,4 @@
-# sync-sha: c50a138adf80644ed5ddbe0213f20e41869e2a4f2dc1d7526dd238d8987b82dc
+# sync-sha: 6c72d6b1d5a57b3225e8b38571c6a98933521a4f1a02b4e302b5b209a2c7d8bd
 name: Build & Test
 
 # Runner labels live in the POOL repository variable. Every checked-in selector
@@ -529,15 +529,81 @@ jobs:
       # re-probes on the wildcard address and re-draws. Read that header
       # before changing either half. Observed as run 32075040354: 278 preset
       # assertions passed and the job still failed on bind(0.0.0.0:34782).
+      # AUD-CIPORT4: the sibling-band tuple below used to be a hand-maintained
+      # literal list. It was already stale when found (missing 19328) and
+      # gained a second miss (19392) the next time a band was added, because
+      # nothing checked it against the workflow files it was transcribed from.
+      # ci/tools/lint-ci-ports.sh derives its own band list from a repo-wide
+      # scan already (`TEST_BASE_PORT:` across every .github/workflows/*.yml,
+      # AUD-CIPORT2's overlap check) -- this step now performs the SAME derive
+      # at run time instead of hand-listing, so a new band never needs a
+      # second edit here to stay correct. TEST_BASE_PORT is exported by this
+      # job's own `env:` block, so it is simply excluded rather than needing a
+      # literal to subtract.
+      # Derive the sibling bands SYNCHRONOUSLY, in a step of its own, and let
+      # a derivation failure fail the JOB -- not silently disappear inside a
+      # backgrounded process. The binder below runs `&` so it can outlive
+      # this run step and stay alive through the suite; a `raise` inside a
+      # backgrounded python is reaped along with the process and never
+      # touches this step's exit code, so the empty-scan guard has to live
+      # here, before anything is backgrounded, to actually gate the job.
+      - name: Derive sibling port bands from the workflow files
+        if: ${{ !inputs.skip-expensive-jobs }}
+        run: |
+          python3 - <<'PY' > sibling-bands.txt
+          import glob, os, re
+
+          own_base = int(os.environ["TEST_BASE_PORT"])
+
+          # Derive every OTHER job's band from the workflow files themselves,
+          # the same source ci/tools/lint-ci-ports.sh's AUD-CIPORT2 overlap
+          # check reads -- not a hand-maintained tuple that can drift from it
+          # (AUD-CIPORT4: the old tuple was already missing 19328 when found,
+          # and gained a second miss, 19392, the next time a band was added).
+          pattern = re.compile(r'TEST_BASE_PORT:\s*"?([0-9]+)"?')
+          bases = set()
+          for path in glob.glob(".github/workflows/*.yml") + glob.glob(".github/workflows/*.yaml"):
+              with open(path, encoding="utf-8") as f:
+                  for line in f:
+                      m = pattern.search(line)
+                      if m:
+                          bases.add(int(m.group(1)))
+          bases.discard(own_base)
+
+          if not bases:
+              # A repo-wide scan that finds NO sibling bands at all is not a
+              # quiet success -- it means the glob or the regex broke, and a
+              # silent empty fence is worse than the hand-maintained list it
+              # replaced (it would report "fenced" while fencing nothing).
+              # This step is NOT backgrounded, so this exit code is the job's.
+              raise SystemExit(
+                  "AUD-CIPORT4 fence: derived ZERO sibling TEST_BASE_PORT "
+                  "bands from .github/workflows/*.yml -- refusing to report "
+                  "a fence that holds no ports"
+              )
+
+          for base in sorted(bases):
+              print(base)
+          PY
+          echo "derived $(wc -l < sibling-bands.txt) sibling bands: $(paste -sd, sibling-bands.txt)"
+
       - name: Fence sibling port bands off from RANDOMIZE
         if: ${{ !inputs.skip-expensive-jobs }}
         run: |
+          # A leftover marker from an earlier attempt on the same runner would
+          # satisfy the wait below instantly and hand the suite a fence that is
+          # not built yet -- the exact failure this handshake exists to stop.
+          rm -f fence-ready
           python3 - <<'PY' &
           import socket, time
-          # Every TEST_BASE_PORT in this repo except this job's own 19264.
+
+          band_width = 64
+          with open("sibling-bands.txt", encoding="utf-8") as f:
+              bases = [int(line) for line in f if line.strip()]
+
           holders = []
-          for base in (18880, 18944, 19008, 19072, 19136, 19200):
-              for p in range(base, base + 64):
+          for base in bases:
+              for p in range(base, base + band_width):
                   s = socket.socket()
                   # No SO_REUSEADDR: holding the port is the entire point, and
                   # sharing it would make the fence a no-op against a wildcard
@@ -552,11 +618,39 @@ jobs:
                       # must not pick it, and the suite's own wildcard probe
                       # will now decline it too.
                       s.close()
+          print(f"fenced {len(holders)} ports across {len(bases)} sibling bands: {bases}", flush=True)
+          # READINESS HANDSHAKE, not a sleep. Every socket above is bound
+          # before this file appears, and the step below blocks on it.
+          #
+          # This replaced `sleep 2`, which was a real defect the moment the
+          # band list stopped being hand-maintained: 2s was sized for the
+          # 6-band literal tuple (384 sockets) and the derive correctly grew
+          # the fence to 8 bands (512 sockets). The suite then started while
+          # the binder was still working, probed 19433 (band 19392) as free,
+          # and nginx lost the race to the fence a moment later --
+          # "bind() to 127.0.0.1:19433 failed (98: Address already in use)",
+          # 41 preset files dead. The scaffold's probe is NOT blind here
+          # (a 0.0.0.0 holder does refuse a later 127.0.0.1 bind, verified);
+          # it simply probed before the fence existed. A bigger sleep would
+          # only move the race, so the fence reports done instead.
+          with open("fence-ready", "w", encoding="utf-8") as fh:
+              fh.write(f"{len(holders)}\n")
           # Outlive the prove step; the runner reaps us at job teardown.
           time.sleep(3600)
           PY
-          echo "fenced 6 sibling bands (pid $!)"
-          sleep 2
+          echo "fence binder started (pid $!)"
+          # Bounded wait: the binder is backgrounded, so its failure cannot
+          # reach this step's exit code any other way. 60s is far above the
+          # observed bind time and still fails fast if the binder died.
+          for _ in $(seq 1 600); do
+              [ -f fence-ready ] && break
+              sleep 0.1
+          done
+          if [ ! -f fence-ready ]; then
+              echo "fence binder never reported ready -- refusing to run the suite against a half-built fence" >&2
+              exit 1
+          fi
+          echo "fence ready: $(cat fence-ready) ports held"
 
       - name: Run the preset suite
         if: ${{ !inputs.skip-expensive-jobs }}
