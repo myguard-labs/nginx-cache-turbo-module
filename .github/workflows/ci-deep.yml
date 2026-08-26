@@ -1,4 +1,4 @@
-# sync-sha: b9faa8c39b9b09ba2e1dd0faaa0e96547d5f84ac2704064782380f19c7f7d51f
+# sync-sha: 78ad288d0d63e49d9558d19a4e0979eceec155ddc79d19ef7bc1970ffa6006a8
 name: CI Deep
 
 # Exhaustive dynamic analysis — monthly cron + on-demand only, NEVER on PR.
@@ -739,6 +739,124 @@ jobs:
             -H "Content-Type: application/json" \
             "https://discord.com/api/v10/channels/$DISCORD_CHANNEL_BUILDS/messages" \
             -d "{\"content\":\"🔴 $GH_REPO — CI Deep / asan-soak FAILED. $GH_SERVER_URL/$GH_REPO/actions/runs/$GH_RUN_ID\"}" || true
+
+  testkit-sanitizer:
+    # The nginx-module-testkit prober leg, under ASan/UBSan -- deliberately
+    # NOT in testkit.yml. The sanitized tree is a SECOND full cold nginx build
+    # (ref probe + cache-turbo, configured with -DNGX_TEST_HARNESS), and
+    # testkit.yml's own header sets the rule this job exists to honour: "if
+    # the cold cost ever dominates a lane, demote it to ci-deep.yml rather
+    # than weakening the oracle." A PR gate cannot absorb two cold nginx
+    # builds; a monthly/dispatch lane can.
+    #
+    # Runs BOTH scenarios testkit-run.sh knows about for this module:
+    #   consumer-cache-turbo    -- the per-request allocation-neutrality
+    #                              oracle testkit.yml already runs unsanitized
+    #   l2-cross-instance-fill  -- this repo's own L2 (Redis-backed)
+    #                              cross-instance scenario. Its ./requires
+    #                              gate SKIPs cleanly without redis-server on
+    #                              PATH, so it is installed explicitly below
+    #                              rather than relying on some other job's
+    #                              dependency list.
+    #
+    # detect_leaks stays OFF here, same as testkit-run.sh's unsanitized run --
+    # see the script's own header for why (nginx never frees its config pool,
+    # so LSan aborts on `nginx -t` before a single oracle runs; the LSan
+    # suppressions this repo tried, leak:ngx_create_pool and leak:main, were
+    # DISPROVEN by negative control -- they hide real module leaks). Do not
+    # set LSAN_OPTIONS here.
+    name: Testkit prober (sanitized)
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
+    timeout-minutes: 60
+    # AUD-CIPORT1/2: own 64-wide port band, distinct from every other
+    # runtime-bearing job across every workflow (see ci/tools/lint-ci-ports.sh
+    # § check 2). 19456 is testkit.yml's own band; the next band clear of
+    # both the existing set and ci/t/core/breaker-retry-count.t's
+    # 19420-19490 reservation is 19520.
+    env:
+      TEST_BASE_PORT: 19520
+      NGINX_VERSION: "1.31.3"
+    steps:
+      - name: Checkout module
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      # Sibling repo, pinned -- same rationale and same pin as testkit.yml:
+      # not vendored (t/module/config compiles by relative climb out of its
+      # own tree) and not a submodule (this repo has no .gitmodules; adding
+      # one for a single test leg changes clone semantics repo-wide).
+      - name: Check out nginx-module-testkit
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          repository: myguard-labs/nginx-module-testkit
+          ref: f8e09995744c4fbb3b928d14c59f99c5b9af2f7e
+          path: .testkit
+          persist-credentials: false
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          # openssl + zlib headers are for the PROBER CLIENT (body_sha256
+          # links OpenSSL, gunzip links zlib), not for this module. redis-server
+          # is for l2-cross-instance-fill's ./requires gate -- without it the
+          # scenario SKIPs cleanly, which is correct behaviour but zero
+          # coverage of the L2 cross-instance path.
+          sudo apt-get install -y build-essential ccache curl eatmydata libpcre2-dev libssl-dev redis-server zlib1g-dev
+
+      - name: Restore build caches
+        uses: ./.github/actions/build-cache
+        with:
+          # Distinct namespace from testkit.yml's own "testkit" mode: this
+          # tree is built under ci-build.sh's asan flags on top of the
+          # ref-probe + cache-turbo dual-module configure, so it shares
+          # neither the plain testkit tree nor the plain asan tree's cache.
+          mode: testkit-asan
+          nginx-version: ${{ env.NGINX_VERSION }}
+
+      - name: Sweep stale test listeners
+        run: |
+          # This job's own band only -- widening it would kill a sibling
+          # job's live fixtures on the shared runner (AUD-CIPORT1).
+          command -v fuser >/dev/null || sudo apt-get install -y psmisc
+          for p in $(seq "$TEST_BASE_PORT" $((TEST_BASE_PORT + 63))); do
+            fuser -k -TERM "${p}/tcp" 2>/dev/null || true
+          done
+          sleep 1
+
+      - name: Verify runtime port band
+        run: ci/tools/max-port.sh "$TEST_BASE_PORT"
+
+      - name: Stage cache-turbo + testkit ref probe under ASan/UBSan
+        env:
+          TESTKIT_ROOT: ${{ github.workspace }}/.testkit
+        run: ci/tools/testkit-stage.sh --version "$NGINX_VERSION" --sanitizer
+
+      - name: Report compiler-cache effectiveness
+        run: ccache --show-stats
+
+      - name: Prober scenarios on the sanitized tree
+        env:
+          TESTKIT_ROOT: ${{ github.workspace }}/.testkit
+        run: |
+          ci/tools/testkit-run.sh --version "$NGINX_VERSION" --sanitizer \
+            --port "$TEST_BASE_PORT" \
+            -- consumer-cache-turbo l2-cross-instance-fill
+
+      - name: Notify Discord on failure
+        if: failure() && github.event_name == 'schedule'
+        env:
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_CHANNEL_BUILDS: ${{ secrets.DISCORD_CHANNEL_BUILDS }}
+          GH_REPO: ${{ github.repository }}
+          GH_SERVER_URL: ${{ github.server_url }}
+          GH_RUN_ID: ${{ github.run_id }}
+        run: |
+          [ -n "$DISCORD_BOT_TOKEN" ] || exit 0
+          curl -fsS -X POST -H "Authorization: Bot $DISCORD_BOT_TOKEN" \
+            -H "Content-Type: application/json" \
+            "https://discord.com/api/v10/channels/$DISCORD_CHANNEL_BUILDS/messages" \
+            -d "{\"content\":\"🔴 $GH_REPO — CI Deep / testkit-sanitizer FAILED. $GH_SERVER_URL/$GH_REPO/actions/runs/$GH_RUN_ID\"}" || true
 
   scanbench:
     name: Zipf hit-ratio benchmark
