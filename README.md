@@ -69,10 +69,54 @@ genuine `X-Cache: HIT`, so a pass-through filter that allocates nothing cannot
 score as "allocation-neutral".
 
 **What it does not prove.** Nothing about concurrency (the scenario runs
-`worker_processes 1`), nothing about the L2/Redis path (it configures an
-in-memory zone only), and nothing about allocations that are correctly
+`worker_processes 1`), and nothing about allocations that are correctly
 per-*connection* or per-*cycle* rather than per-request. It is a leak lens, not
 a correctness lens; response-content correctness stays with the runtime suite.
+
+#### Under sanitizers
+
+`--sanitizer` stages and runs a second tree built with
+`-fsanitize=address,undefined -fno-sanitize-recover=undefined`, applied to the
+nginx binary and both modules:
+
+```sh
+ci/tools/testkit-stage.sh --sanitizer   # .build/nginx-<ver>-testkit-asan
+ci/tools/testkit-run.sh   --sanitizer
+```
+
+The sanitized and plain trees are separate directories, so both legs can be
+staged at once and neither stage destroys the other. Neither script trusts the
+flag: both grep the built objects for the sanitizer runtime and refuse to report
+success on a tree that does not carry it — a leg that silently ran unsanitized
+would pass while observing nothing. The plain leg is guarded in the other
+direction too, since ASan moves the very allocation counters the oracles read.
+
+`detect_leaks` is deliberately **off** (testkit's default). nginx never frees its
+configuration pool, so LeakSanitizer reports the whole config parse as leaked and
+turns `nginx -t` into a bail-out before any oracle runs. The workaround people
+reach for — an LSan suppression file — is rejected here: `leak:ngx_create_pool`
+and `leak:main` were both disproven by negative control, and they suppress real
+module leaks along with the noise. This leg targets what ASan and UBSan catch at
+the moment it happens.
+
+#### Scenarios authored in this repo
+
+`ci/prober-scenarios/` holds scenarios that encode cache-turbo-specific
+knowledge and have no place in a generic harness. `testkit-run.sh` looks there
+first, then in testkit's own directory, so a local scenario needs no change to
+the harness repo:
+
+```sh
+ci/tools/testkit-run.sh --sanitizer -- l2-cross-instance-fill
+```
+
+`l2-cross-instance-fill` boots a **second** nginx with a cold L1 against the
+same Redis and asserts it serves an object the first instance cached, without a
+second origin visit — then stops it and checks its logs for a sanitizer report.
+It starts its own Redis, refuses to run if that port is already occupied (a
+leftover fixture would serve stale keys and make a "cold" cache silently warm),
+and reaps both the Redis and the second instance on the way out. It SKIPs
+cleanly where `redis-server` is absent.
 
 **Why both directions are checked.** The scenario's `requires` gate SKIPs when
 no module `.so` is staged, and `1..0 # SKIP` is a *passing* TAP plan. A

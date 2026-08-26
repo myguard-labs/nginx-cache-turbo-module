@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+#
+# Gate for the L2 cross-instance-fill scenario.
+#
+# Two hard requirements beyond the usual consumer .so:
+#
+#   1. the cache_turbo .so in the tree that will ACTUALLY be booted. Same rule
+#      and same rationale as testkit's consumer-cache-turbo/requires: globbing
+#      .build/*/objs finds the .so in ANY staged tree, so with it present in
+#      one tree and absent from the booted one the gate passes and nginx then
+#      dies at `nginx -t` on a dlopen failure -- a hard FAIL where the whole
+#      point of a gate is a clean SKIP.
+#
+#   2. a redis-server binary. This scenario's entire subject is the L2
+#      (Redis-backed) tier: instance A writes an object through to Redis and
+#      instance B, with a cold L1, fills from it. Without Redis there is no L2
+#      and the scenario would degrade into an ordinary two-instance origin
+#      test that asserts nothing about the code path under investigation.
+#      SKIP, never fail -- a runner without redis-server is an environment
+#      fact, exactly like a tree without the consumer .so.
+#
+# nonzero exit => run-scenario.sh emits "1..0 # SKIP <stdout of this gate>"
+#
+# run-scenario.sh runs this BEFORE prober_resolve, so PROBER_RESOLVED_BUILD
+# does not exist yet; recompute the same path lib.sh will, taking flavor and
+# version from argv ($2/$3) with the same defaults, as the sibling gate does.
+FLAVOR="${2:-nginx}"
+VERSION="${3:-1.31.3}"
+BUILD="${PROBER_BUILD:-${PROBER_ROOT:-.}/.build/${FLAVOR}-${VERSION}}"
+
+if [ ! -f "$BUILD/objs/ngx_http_cache_turbo_module.so" ]; then
+    echo "cache_turbo module .so not found in $BUILD/objs -- this scenario's nginx.conf load_modules it unconditionally, so this tree cannot run it (stage with ci/tools/testkit-stage.sh)"
+    exit 1
+fi
+
+if ! command -v redis-server >/dev/null 2>&1; then
+    echo "no redis-server on PATH -- this scenario's subject is the L2 cross-instance fill, which has no meaning without a Redis backend"
+    exit 1
+fi
+
+exit 0

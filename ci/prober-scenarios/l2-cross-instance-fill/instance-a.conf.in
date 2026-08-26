@@ -1,0 +1,65 @@
+@LOAD@
+# INSTANCE A of the L2 cross-instance-fill exercise. @LOAD@ above load_modules
+# the harness ref probe; this line loads the module under test out of the same
+# objs/ dir (@BUILD_OBJS@), exactly as testkit's consumer-cache-turbo does.
+# ./requires has already SKIPped the scenario on a tree lacking the .so, so
+# this line is only ever reached where it exists.
+load_module @BUILD_OBJS@/ngx_http_cache_turbo_module.so;
+daemon off;
+pid @PREFIX@/nginx.pid;
+error_log @PREFIX@/logs/error.log info;
+worker_processes 1;
+events { worker_connections 32; }
+http {
+    @PROBE_ZONE@
+
+    # A's L1. Instance B gets its own, separate zone in its own process -- the
+    # whole point of the exercise is that B's L1 is COLD and the object can
+    # only reach it through the shared L2.
+    cache_turbo_zone name=ct 8m;
+
+    # Off by default; the /origin location turns its own log back on. Keeps
+    # the counter file free of /l2/ and /__probe traffic.
+    access_log off;
+
+    server {
+        listen 127.0.0.1:@PORT@;
+
+        # The shared origin. Both instances proxy_pass here, so a hit on this
+        # location by B is exactly the failure the oracle looks for: it would
+        # mean B did NOT fill from L2. A's own fill request is the only
+        # legitimate visit.
+        #
+        # A distinct body per instance is impossible (there is one origin), so
+        # the oracle distinguishes "B filled from L2" from "B refetched" by the
+        # ORIGIN HIT COUNTER below, not by the body -- a body compare between a
+        # genuine L2 fill and a plain origin refetch is byte-identical and
+        # would be a vacuous assertion.
+        location /origin {
+            # THE ORIGIN HIT COUNTER. nginx has no counter primitive, so the
+            # count is the LINE COUNT of an access_log scoped to this location
+            # alone -- one line per visit, exact, and needing no extra
+            # process (unlike the python suite's in-process Origin object).
+            #
+            # Scoped INSIDE the location rather than at server level with an
+            # `if=$some_map`: a server-level conditional log silently produced
+            # an always-empty file here, which made the origin-visit half of
+            # oracle 5 a conjunct that could never fail. A location-scoped
+            # access_log has no such ambiguity -- it logs exactly the requests
+            # this location served.
+            access_log @PREFIX@/logs/origin.log combined;
+            default_type text/plain;
+            return 200 "ct-l2-xfill-payload\n";
+        }
+
+        location /l2/ {
+            cache_turbo       ct;
+            cache_turbo_key   $uri;
+            cache_turbo_valid 60s;
+            cache_turbo_redis 127.0.0.1:@REDIS_PORT@ db=0;
+            proxy_pass        http://127.0.0.1:@PORT@/origin;
+        }
+
+        location /__probe { @PROBE@ }
+    }
+}
