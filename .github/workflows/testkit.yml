@@ -1,4 +1,4 @@
-# sync-sha: 7f299f1f2af3104617964c123a791d36c752589a1947463df308e337ca8affa2
+# sync-sha: 5eac24e9540f2b2702d0977ae07e6abfca7e4a512d21f4606a932cd5680350c4
 name: Testkit
 
 # The nginx-module-testkit prober leg.
@@ -129,7 +129,16 @@ jobs:
           # Pinned, not a floating branch: an unpinned harness means a red leg
           # whose cause is a commit in another repo that this PR never touched.
           # Bump deliberately, in its own PR, so the bump is what gets blamed.
-          ref: f8e09995744c4fbb3b928d14c59f99c5b9af2f7e
+          #
+          # This pin moved f8e09995 -> 27f7240 (testkit PR #220) IN the S11 PR
+          # rather than ahead of it, and that is the one case the rule above
+          # yields to: 27f7240 is the commit that ADDS the fanout/quiesce/
+          # zone_invariant directives, so shm-coherence-varidx cannot parse --
+          # let alone assert -- on any earlier pin. Splitting the bump into its
+          # own PR would land a pin bump that changes no behaviour, followed by
+          # a scenario PR that is red until it merges. The bump and the only
+          # consumer of what it adds are one change.
+          ref: 27f724082e16f6d9bd8a2a0ee944ef9dd551ab7e
           path: .testkit
           persist-credentials: false
 

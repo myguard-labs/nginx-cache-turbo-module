@@ -1,4 +1,4 @@
-# sync-sha: adb971f3c82f7a1f81a0352f78e7a8884d9f80fa318d09e3828cdaf7efda2092
+# sync-sha: 7b3de3b8b2f41865e37247f09795a2741beb2b17389c76a61ad833e4a37691cd
 name: CI Deep
 
 # Exhaustive dynamic analysis — monthly cron + on-demand only, NEVER on PR.
@@ -799,7 +799,7 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           repository: myguard-labs/nginx-module-testkit
-          ref: f8e09995744c4fbb3b928d14c59f99c5b9af2f7e
+          ref: 27f724082e16f6d9bd8a2a0ee944ef9dd551ab7e
           path: .testkit
           persist-credentials: false
 
