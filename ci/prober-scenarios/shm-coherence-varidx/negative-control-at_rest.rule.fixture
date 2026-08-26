@@ -28,7 +28,7 @@
 name    NEGATIVE CONTROL: at_rest must reject a settled counter that misses its bound
 from    127.0.0.1
 send    GET /varidx/a HTTP/1.1\r\n
-send    Host: prober\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n
+send    Host: prober\r\nAccept-Language: en\r\nConnection: close\r\n\r\n
 expect  status=200
 expect  body~ct-varidx-payload
 pid_may_change

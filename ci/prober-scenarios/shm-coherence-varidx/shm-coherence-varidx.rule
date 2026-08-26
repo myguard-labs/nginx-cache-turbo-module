@@ -95,7 +95,7 @@
 name    priming traffic drives real variant-index writes through the zone
 from    127.0.0.1
 send    GET /varidx/a HTTP/1.1\r\n
-send    Host: prober\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n
+send    Host: prober\r\nAccept-Language: en\r\nConnection: close\r\n\r\n
 expect  status=200
 expect  body~ct-varidx-payload
 pid_may_change
@@ -111,7 +111,7 @@ fanout  24 2
 name    a second variant of the same base URI is indexed too
 from    127.0.0.1
 send    GET /varidx/a HTTP/1.1\r\n
-send    Host: prober\r\nAccept-Encoding: br\r\nConnection: close\r\n\r\n
+send    Host: prober\r\nAccept-Language: fr\r\nConnection: close\r\n\r\n
 expect  status=200
 expect  body~ct-varidx-payload
 pid_may_change
@@ -131,7 +131,7 @@ fanout  24 2
 name    the variant-index in-flight counter returns to zero in every worker
 from    127.0.0.1
 send    GET /varidx/a HTTP/1.1\r\n
-send    Host: prober\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n
+send    Host: prober\r\nAccept-Language: en\r\nConnection: close\r\n\r\n
 expect  status=200
 expect  body~ct-varidx-payload
 pid_may_change
@@ -155,7 +155,7 @@ zone_invariant at_rest zone.varidx_inflight == 0
 name    every answering worker reads the same module counter state
 from    127.0.0.1
 send    GET /varidx/a HTTP/1.1\r\n
-send    Host: prober\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n
+send    Host: prober\r\nAccept-Language: en\r\nConnection: close\r\n\r\n
 expect  status=200
 expect  body~ct-varidx-payload
 pid_may_change
@@ -168,6 +168,17 @@ zone_invariant coherent zone.ct_digest
 # ---------------------------------------------------------------------------
 # 5. monotonic -- the lifetime lookup tally never decreased across the fan.
 #
+#    ⚠ COVERAGE STATUS: this case is asserted and passes, but unlike the two
+#    above it has NO gated negative control -- nothing has been observed making
+#    it go red. That is a harness limitation, not an oversight here:
+#    collect_zone_readings (prober.c:634) takes its readings AFTER the fan has
+#    drained, as sequential idle probe GETs, and by then no field in the
+#    document decreases between two readings by construction. Four candidates
+#    were measured live and are recorded in
+#    negative-control-monotonic.rule.fixture. Until that is fixed upstream,
+#    treat a green here as weaker evidence than a green on cases 3 and 4.
+#    Filed as ZONEINV-MONOTONIC-NO-DETERMINISTIC-FALL.
+#
 #    No quiesce here, deliberately. monotonic asserts a property of the
 #    SEQUENCE of readings, and the readings this fan takes while traffic is
 #    flowing are the interesting ones: a settled zone would make the sequence
@@ -178,7 +189,7 @@ zone_invariant coherent zone.ct_digest
 name    the lifetime lookup tally never decreases across the fan
 from    127.0.0.1
 send    GET /varidx/a HTTP/1.1\r\n
-send    Host: prober\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n
+send    Host: prober\r\nAccept-Language: en\r\nConnection: close\r\n\r\n
 expect  status=200
 expect  body~ct-varidx-payload
 pid_may_change

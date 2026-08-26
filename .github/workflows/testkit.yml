@@ -1,4 +1,4 @@
-# sync-sha: 6434e62e88be0decd1e76795377779dffab854740e1153bc8a7268b24590c02b
+# sync-sha: 7f299f1f2af3104617964c123a791d36c752589a1947463df308e337ca8affa2
 name: Testkit
 
 # The nginx-module-testkit prober leg.
@@ -140,7 +140,15 @@ jobs:
           # openssl + zlib headers are for the PROBER CLIENT itself (its
           # body_sha256 oracle links OpenSSL, its gunzip oracle links zlib),
           # not for this module -- cache-turbo's Redis driver is native nginx.
-          sudo apt-get install -y build-essential ccache curl eatmydata libpcre2-dev libssl-dev zlib1g-dev
+          # redis-server + redis-tools are for shm-coherence-varidx: the
+          # varidx_inflight counter it asserts on moves ONLY on the
+          # Redis-backed variant-index write path, and redis-cli is that
+          # scenario's anti-vacuity oracle (it reads the variant-index set's
+          # cardinality out of Redis). Without them the scenario SKIPs
+          # cleanly -- correct behaviour, and zero coverage of the only
+          # automated COR-5 guard there is.
+          sudo apt-get install -y build-essential ccache curl eatmydata \
+            libpcre2-dev libssl-dev redis-server redis-tools zlib1g-dev
 
       - name: Restore build caches
         if: ${{ !inputs.skip-expensive-jobs }}
@@ -188,7 +196,20 @@ jobs:
         if: ${{ !inputs.skip-expensive-jobs }}
         env:
           TESTKIT_ROOT: ${{ github.workspace }}/.testkit
-        run: ci/tools/testkit-run.sh --version "$NGINX_VERSION"
+        run: |
+          # consumer-cache-turbo is testkit-run.sh's default; shm-coherence-varidx
+          # is named explicitly because naming ANY scenario replaces that
+          # default rather than adding to it.
+          #
+          # shm-coherence-varidx is the cross-process shm invariant lens against
+          # this module's own shared counters, and the only automated guard on
+          # COR-5 (the varidx_inflight strand, PR #443). It boots four workers
+          # and needs redis-server + redis-cli; its ./requires gate SKIPs
+          # cleanly without them, which is correct but zero coverage -- so if
+          # this leg ever starts reporting `1..0 # SKIP`, that is a finding,
+          # not a pass.
+          ci/tools/testkit-run.sh --version "$NGINX_VERSION" \
+            -- consumer-cache-turbo shm-coherence-varidx
 
       - name: Scenario SKIPs cleanly on an unstaged tree
         if: ${{ !inputs.skip-expensive-jobs }}

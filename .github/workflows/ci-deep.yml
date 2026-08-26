@@ -1,4 +1,4 @@
-# sync-sha: 78ad288d0d63e49d9558d19a4e0979eceec155ddc79d19ef7bc1970ffa6006a8
+# sync-sha: adb971f3c82f7a1f81a0352f78e7a8884d9f80fa318d09e3828cdaf7efda2092
 name: CI Deep
 
 # Exhaustive dynamic analysis — monthly cron + on-demand only, NEVER on PR.
@@ -758,6 +758,15 @@ jobs:
     #                              PATH, so it is installed explicitly below
     #                              rather than relying on some other job's
     #                              dependency list.
+    #   shm-coherence-varidx    -- the cross-process shm invariant lens
+    #                              (`fanout`/`quiesce`/`zone_invariant`) against
+    #                              this module's own shared counters. It is the
+    #                              only automated guard on COR-5 (the
+    #                              varidx_inflight strand, PR #443). Four
+    #                              workers, and it needs redis-server AND
+    #                              redis-cli -- the latter is its anti-vacuity
+    #                              oracle, which reads the variant-index set's
+    #                              cardinality straight out of Redis.
     #
     # detect_leaks stays OFF here, same as testkit-run.sh's unsanitized run --
     # see the script's own header for why (nginx never frees its config pool,
@@ -802,7 +811,13 @@ jobs:
           # is for l2-cross-instance-fill's ./requires gate -- without it the
           # scenario SKIPs cleanly, which is correct behaviour but zero
           # coverage of the L2 cross-instance path.
-          sudo apt-get install -y build-essential ccache curl eatmydata libpcre2-dev libssl-dev redis-server zlib1g-dev
+          # redis-tools carries redis-cli, which shm-coherence-varidx's
+          # anti-vacuity leg uses as its oracle. On ubuntu-latest redis-server
+          # already pulls it in, but naming it is what keeps the requirement
+          # visible: without redis-cli that scenario SKIPs, and a SKIP here is
+          # zero coverage of the only COR-5 guard there is.
+          sudo apt-get install -y build-essential ccache curl eatmydata \
+            libpcre2-dev libssl-dev redis-server redis-tools zlib1g-dev
 
       - name: Restore build caches
         uses: ./.github/actions/build-cache
@@ -841,7 +856,8 @@ jobs:
         run: |
           ci/tools/testkit-run.sh --version "$NGINX_VERSION" --sanitizer \
             --port "$TEST_BASE_PORT" \
-            -- consumer-cache-turbo l2-cross-instance-fill
+            -- consumer-cache-turbo l2-cross-instance-fill \
+               shm-coherence-varidx
 
       - name: Notify Discord on failure
         if: failure() && github.event_name == 'schedule'

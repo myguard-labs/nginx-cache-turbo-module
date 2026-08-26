@@ -119,7 +119,7 @@ get_varidx() {
     out="$PROBER_PREFIX/get-$ae.out"
     (
         exec 3<>"/dev/tcp/$HOST/$PORT" || exit 1
-        printf 'GET /varidx/a HTTP/1.1\r\nHost: prober\r\nAccept-Encoding: %s\r\nConnection: close\r\n\r\n' "$ae" >&3
+        printf 'GET /varidx/a HTTP/1.1\r\nHost: prober\r\nAccept-Language: %s\r\nConnection: close\r\n\r\n' "$ae" >&3
         cat <&3 2>/dev/null || true
     ) >"$out" 2>/dev/null || true
     grep -q '^HTTP/1.1 200' "$out"
@@ -152,20 +152,72 @@ else
     sed 's/^/# /' "$PROBER_PREFIX/probe-lookups.out" 2>/dev/null || true
 fi
 
-# --- 3: the counters actually MOVE ------------------------------------------
-# THE ANTI-VACUITY LEG. Drive two distinct variants through the auto-Vary path
-# and require the lifetime lookup tally to advance. A field that does not move
-# makes `monotonic` trivially true and `coherent` trivially true, and this is
-# the only leg that can tell that apart from a healthy run.
+# --- 3: the counters actually MOVE, AND THE VARIANT-INDEX PATH IS REACHED ----
+#
+# THE ANTI-VACUITY LEG, and the most important one in this file. Everything
+# below it is satisfied by a zone nothing ever touched: against a field that
+# never moves, `coherent` is satisfied by any constant, `monotonic` by a
+# constant sequence, and `at_rest <f> == 0` by a field that was never anything
+# but 0. This leg is the only thing standing between a green run and a green
+# run that asserted nothing.
+#
+# ⚠ WHY IT CHECKS THE VARIANT INDEX SPECIFICALLY AND NOT JUST `lookups`.
+#   The first version of this scenario checked only that zone.lookups advanced,
+#   and it PASSED while varidx_inflight was never touched once -- the conf's
+#   origin emitted `Vary: Accept-Encoding` on an identity body, which
+#   classify_vary() (vary.c:1280-1293) deliberately treats as inert, so
+#   ctx->vary_bits stayed 0, the `auto_vary && vary_bits > 0` gate at
+#   filters.c:2511 never fired, and no variant-index write was ever issued. The
+#   at_rest oracle was reading a field that had never been anything but 0. It
+#   was caught only by MUTATING the module: with the increment inflated from
+#   +1 to +5 the whole scenario still reported green, which is what proved the
+#   counter was untouched.
+#
+#   `lookups` advancing does NOT imply the variant path ran -- a plain cached
+#   GET bumps hits/misses without ever reaching it. So this leg asserts the
+#   variant index directly: after driving two distinct Accept-Language
+#   variants of one base URI, the module must report that it wrote a variant
+#   index for them. redis-cli is the oracle because the write is a Redis SADD
+#   and the key is observable from outside the process.
 if [ "$FAILED" -eq 0 ]; then
-    get_varidx gzip >/dev/null 2>&1 || true
-    get_varidx br   >/dev/null 2>&1 || true
+    get_varidx en >/dev/null 2>&1 || true
+    get_varidx fr >/dev/null 2>&1 || true
     AFTER_LOOKUPS="$(probe_field lookups || true)"
 
-    if [ -n "$AFTER_LOOKUPS" ] && [ "$AFTER_LOOKUPS" -gt "$BASE_LOOKUPS" ]; then
-        echo "ok 3 - the shared counters move under traffic: zone.lookups $BASE_LOOKUPS -> $AFTER_LOOKUPS"
-    else
+    # The variant-index SET the auto-Vary path SADDs into. Its key is
+    # `ct:tag:<hash>` -- the `ct:` is the module's redis_prefix and `tag:` is
+    # the index namespace; the hash comes from
+    # ngx_http_cache_turbo_variant_index_name(), so it is matched by PREFIX and
+    # never by an exact key.
+    #
+    # The CARDINALITY, not the key count, is what is asserted. One key would
+    # exist even if only a single variant had ever been indexed, and a single
+    # variant is exactly the state a broken auto-Vary produces (it stores the
+    # object but never partitions it). Two members means two distinct variants
+    # of one base URI genuinely reached the index -- which is the multi-membered
+    # set a PURGE's SMEMBERS enumerates, and therefore the shape COR-5 is about.
+    VIDX_CARD=0
+    while IFS= read -r _k; do
+        [ -n "$_k" ] || continue
+        _c="$(redis-cli -h "$HOST" -p "${CT_REDIS_PORT:-0}" scard "$_k" 2>/dev/null || echo 0)"
+        case "$_c" in ''|*[!0-9]*) _c=0 ;; esac
+        # if/fi, NOT `[ ] && x`. Under `set -e` a trailing test that is the
+        # LAST statement of a loop body aborts the whole script when it is
+        # false -- and here false is the normal case for every key after the
+        # largest. shellcheck does not flag this shape.
+        if [ "$_c" -gt "$VIDX_CARD" ]; then
+            VIDX_CARD="$_c"
+        fi
+    done <<EOF
+$(redis-cli -h "$HOST" -p "${CT_REDIS_PORT:-0}" --scan --pattern 'ct:tag:*' 2>/dev/null)
+EOF
+
+    if [ -z "$AFTER_LOOKUPS" ] || [ "$AFTER_LOOKUPS" -le "$BASE_LOOKUPS" ]; then
         fail 3 "zone.lookups did not advance under traffic ($BASE_LOOKUPS -> ${AFTER_LOOKUPS:-absent}) -- against a field that never moves, coherent and monotonic are satisfied by any constant and this scenario would report green while asserting nothing"
+    elif [ "${VIDX_CARD:-0}" -lt 2 ]; then
+        fail 3 "zone.lookups advanced ($BASE_LOOKUPS -> $AFTER_LOOKUPS) but the largest ct:tag:* variant-index set holds ${VIDX_CARD:-0} member(s), not the 2 this leg drove -- so the auto-Vary variant path was not taken for both variants and varidx_inflight was never properly incremented. The at_rest oracle below would be reading a field that has only ever been 0. Check that the origin's Vary axis is one classify_vary() actually keys on: Accept-Encoding on an IDENTITY body is deliberately inert (vary.c:1280-1293) and was the original cause of exactly this vacuity"
+    else
+        echo "ok 3 - the shared counters move and the variant-index path is reached: zone.lookups $BASE_LOOKUPS -> $AFTER_LOOKUPS, variant-index set holds $VIDX_CARD members"
     fi
 else
     fail 3 "skipped: an earlier leg already failed, so this measurement would be meaningless"
@@ -243,15 +295,49 @@ control negative-control-at_rest.rule.fixture \
 control negative-control-coherent.rule.fixture \
         'zone_invariant coherent pid:' \
         coherent   || CTL_RC=1
-control negative-control-monotonic.rule.fixture \
-        'zone_invariant monotonic smaps\.pss:' \
-        monotonic  || CTL_RC=1
 
 if [ "$CTL_RC" -eq 0 ]; then
-    echo "ok 5 - all three zone_invariant forms fired on their negative control"
+    echo "ok 5 - the at_rest and coherent forms fired on their negative controls"
 else
-    fail 5 "all three zone_invariant forms fired on their negative control"
+    fail 5 "the at_rest and coherent forms fired on their negative controls"
 fi
+
+# THE MONOTONIC FORM HAS NO DETERMINISTIC CONTROL ON THIS HARNESS, AND IS
+# THEREFORE NOT GATED HERE. Its fixture is checked in beside the other two and
+# is runnable by hand, but it is NOT asserted, because it does not fire
+# reliably and a flaky control is worse than an absent one -- it teaches a
+# reader to re-run until green, which is how a broken oracle survives.
+#
+# The cause is structural, not a fixture bug, and it is worth stating here so
+# the next person does not spend the afternoon this cost. collect_zone_readings
+# (prober.c:634) takes its N readings AFTER the fan has fully drained, as N
+# sequential idle probe GETs, each on its own `Connection: close` socket. By
+# that point every counter in the document has settled, so there is no field
+# left that DECREASES between two readings by construction:
+#
+#   zone.varidx_inflight  settled 0 at every reading (its high window is one
+#                         event-loop turn, and the fan's legs are sequential)
+#   zone.slab_pages_free  falls once, on the first store, before reading 1 --
+#                         measured constant at 2032 (8m zone) and at 12 (64k)
+#   connections.free      constant at 125; each read closes before the next
+#   fds / timers / config_generation / pool.cycle_* / connections.total
+#                         all constant across 24 reads
+#   smaps.pss             DOES fall, but only when the probe reads rotate
+#                         across workers -- measured firing 11 of 12 runs at
+#                         fanout 64, and only ~1 of 3 at fanout 24
+#
+# Full evidence and the options considered are in the memory mirror as
+# ZONEINV-MONOTONIC-NO-DETERMINISTIC-FALL. The honest fixes all live in
+# TESTKIT, not here (a per-leg reading captured during the fan, or a
+# consumer-supplied traffic hook between collect reads), which is why this
+# scenario records the gap rather than papering it with an ~80% control.
+echo "# monotonic: NOT GATED -- no field in this harness decreases"
+echo "#   deterministically across collect_zone_readings' post-drain idle"
+echo "#   probe reads. negative-control-monotonic.rule.fixture is checked in"
+echo "#   and runnable by hand (it fires ~11 of 12 runs on smaps.pss at"
+echo "#   fanout 64) but is deliberately not asserted: a flaky control"
+echo "#   teaches re-running until green. See issues.md"
+echo "#   ZONEINV-MONOTONIC-NO-DETERMINISTIC-FALL."
 
 # --- 6: the controls failed for the INVARIANT, not for the traffic ----------
 # Every fixture drives the same request the honest cases drive and carries the
@@ -260,7 +346,7 @@ fi
 # Requiring the absence of one is what separates "the oracle fired" from "the
 # run fell over and the oracle was never reached".
 STRAY=0
-for label in at_rest coherent monotonic; do
+for label in at_rest coherent; do
     out="$PROBER_PREFIX/negctl-$label.out"
     [ -f "$out" ] || continue
     if grep -qE 'status=|body~|Bail out!' "$out"; then

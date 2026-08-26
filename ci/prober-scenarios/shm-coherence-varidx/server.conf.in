@@ -47,37 +47,51 @@ http {
         # combined with `block`.
         keepalive_timeout 0;
 
-        # THE ORIGIN. It emits `Vary: Accept-Encoding`, and that header is what
+        # THE ORIGIN. It emits `Vary: Accept-Language`, and that header is what
         # makes this scenario move varidx_inflight at all: cache_turbo_auto_vary
         # below turns a Vary-carrying response into a variant, and storing a
         # variant issues the variant-index write (a Redis SADD) whose launch
         # increments varidx_inflight and whose completion decrements it.
         #
-        # Without the Vary header there is no variant, no index write, and the
-        # counter is a constant 0 -- at which point all three zone_invariant
-        # forms are satisfied by a field that was never anything but 0, i.e.
-        # exactly the tautology testkit's own shm-coherence scenario documents
-        # and refuses to assert.
+        # ⚠ ACCEPT-LANGUAGE, NOT ACCEPT-ENCODING, AND THE DIFFERENCE IS THE
+        # WHOLE SCENARIO. `Vary: Accept-Encoding` on an IDENTITY response is
+        # deliberately INERT in this module: classify_vary() (vary.c:1280-1293)
+        # sets VARY_ENCODING only when response_encoded() is true, because for
+        # an identity body every Accept-Encoding value maps to the same stored
+        # bytes and partitioning on it would be pure waste. This origin returns
+        # an identity body, so an Accept-Encoding axis leaves vary_bits at 0,
+        # the `clcf->auto_vary && ctx->vary_bits > 0` gate at filters.c:2511
+        # never fires, no variant-index write is ever issued, and
+        # varidx_inflight stays a constant 0.
+        #
+        # That was the FIRST version of this conf, and it was caught only by
+        # mutating the module: with the varidx increment inflated from +1 to +5
+        # the scenario still reported every case green, which proved the
+        # counter was never touched and the at_rest oracle was asserting a
+        # field that had never been anything but 0 -- the exact tautology this
+        # scenario exists to eliminate. Accept-Language (VARY_LANG,
+        # vary.c:1297-1299) partitions unconditionally, so the variant path is
+        # genuinely reached. Do not "simplify" this back to Accept-Encoding.
         location /origin {
             access_log @PREFIX@/logs/origin.log combined;
             default_type text/plain;
-            add_header Vary "Accept-Encoding" always;
+            add_header Vary "Accept-Language" always;
             return 200 "ct-varidx-payload\n";
         }
 
         location /varidx/ {
             cache_turbo            ct;
-            cache_turbo_key        $uri$http_accept_encoding;
+            cache_turbo_key        $uri;
             cache_turbo_valid      60s;
 
             # The variant-index write path. auto_vary turns the origin's
-            # `Vary: Accept-Encoding` into a stored variant; the Redis backend
+            # `Vary: Accept-Language` into a stored variant; the Redis backend
             # is what the resulting index write is issued against.
             cache_turbo_auto_vary  on;
             cache_turbo_redis      127.0.0.1:@REDIS_PORT@ db=0;
 
             proxy_pass             http://127.0.0.1:@PORT@/origin;
-            proxy_set_header       Accept-Encoding $http_accept_encoding;
+            proxy_set_header       Accept-Language $http_accept_language;
         }
 
         # Served by cache_turbo's OWN probe directive, not testkit's
