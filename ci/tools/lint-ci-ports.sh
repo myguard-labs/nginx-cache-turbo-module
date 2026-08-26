@@ -272,7 +272,7 @@ for f in "${files[@]}"; do
             # entry point that does none -- no band, no sweep, just a bare
             # `--port 18880` or `TEST_NGINX_PORT: 18880` -- stayed invisible to
             # every one of them. That is precisely AUD-CIPORT3's "entry point
-            # five" case, so gating on a port LITERAL in the 18880-19455 CI
+            # five" case, so gating on a port LITERAL in the CI band
             # range is what actually closes it. A literal outside that range is
             # somebody's unrelated service and is not our business.
             if [[ "$code" =~ (--port|TEST_NGINX_PORT|PORT=)[[:space:]:=]*\"?(1[89][0-9][0-9][0-9])\"? ]]; then
@@ -365,8 +365,43 @@ for key in "${all_keys[@]}"; do
     fi
 done
 
+# --- Check 4: no CI band may overlap a port a test file pins as a LITERAL. ---
+#
+# ci/t/core/breaker-retry-count.t pins fixed upstream ports (dead peers that
+# must stay unlistened, plus a specific alive peer) because ct_origin_port()
+# cannot express that for a multi-peer upstream group. Those ports are real
+# reservations, but they lived ONLY in a comment inside the .t file, so
+# nothing stopped a new CI lane being handed a band on top of them -- which
+# is exactly what happened: band 19392-19455 was assigned while
+# 19420-19490 was already claimed, and it stayed invisible only because
+# build-test.yml's port fence was a stale hand-typed tuple that omitted the
+# new band. Deriving that fence correctly (AUD-CIPORT4) turned a latent
+# clash into 41 dead preset files in one run.
+#
+# Reading the literals out of the test files is what makes the reservation
+# checkable instead of merely documented. A test file that stops pinning
+# ports simply contributes nothing here.
+pinned_ports=()
+while IFS= read -r pinned; do
+    [ -n "$pinned" ] && pinned_ports+=("$pinned")
+done < <(grep -rhoE '^our \$[A-Za-z0-9_]+[[:space:]]*=[[:space:]]*[0-9]{4,5};' ci/t 2>/dev/null \
+         | grep -oE '[0-9]{4,5}' | sort -un)
+
+if [ "${#pinned_ports[@]}" -gt 0 ]; then
+    for i in "${!interval_starts[@]}"; do
+        b_start="${interval_starts[$i]}"
+        b_end="${interval_ends[$i]}"
+        for pinned in "${pinned_ports[@]}"; do
+            if [[ "$pinned" -ge "$b_start" && "$pinned" -le "$b_end" ]]; then
+                echo "lint-ci-ports: CI band [$b_start-$b_end] (${interval_labels[$i]}) contains port $pinned, which a test file under ci/t pins as a fixed literal -- the port fence will bind it and the test's nginx will fail with 'Address already in use'" >&2
+                status=1
+            fi
+        done
+    done
+fi
+
 if [ "$status" -eq 0 ]; then
-    echo "lint-ci-ports: OK (${#interval_starts[@]} distinct port bands, ${#all_keys[@]} runtime-bearing jobs, ${#files[@]} workflow files scanned)"
+    echo "lint-ci-ports: OK (${#interval_starts[@]} distinct port bands, ${#all_keys[@]} runtime-bearing jobs, ${#files[@]} workflow files scanned, ${#pinned_ports[@]} test-pinned port(s) clear of every band)"
 fi
 
 exit "$status"
