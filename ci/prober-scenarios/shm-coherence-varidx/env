@@ -1,0 +1,100 @@
+# Copyright (C) 2026 Thijs Eilander
+# SPDX-License-Identifier: BSD-2-Clause
+#
+# Sourced (not executed) by run-scenario.sh AFTER prober_resolve and BEFORE the
+# conf is rendered -- the same window ci/prober-scenarios/l2-cross-instance-fill
+# uses, and for the same reason: this scenario must start a Redis, learn the
+# port it bound, and get that port into the conf before nginx ever parses it.
+#
+# WHY THIS SCENARIO NEEDS REDIS AT ALL
+#   The counter under test is `varidx_inflight`, and it moves only on the
+#   auto-Vary variant-index write path, which is a REDIS op: incremented in
+#   redis_tag_add_many() immediately before launch (redis.c:1706), decremented
+#   in redis_op_done() (redis.c:1715, :3515). With no Redis configured the
+#   module never launches a varidx op, the counter is a constant 0, and all
+#   three zone_invariant forms below go back to being the tautologies testkit's
+#   own shm-coherence scenario refuses to assert. Redis is what makes this
+#   scenario falsifiable rather than decorative, which is why ./requires treats
+#   its absence as a SKIP and never as a quiet pass.
+
+# worker_processes 4 in nginx.conf is half of this scenario's premise; the
+# fanout directive counts DISTINCT answering worker pids and a one-worker
+# server can never produce more than one. prober_check_conf bails on
+# worker_processes != 1 by default (its strict pid oracle would read a healthy
+# worker rotation as a crash); PROBER_ALLOW_MULTIWORKER=1 lifts exactly that
+# bail. THE TWO MUST STAY TOGETHER -- dropping either silently turns this
+# scenario into a single-worker run in which `coherent` is satisfied by one
+# worker agreeing with itself.
+PROBER_ALLOW_MULTIWORKER=1
+
+# The probe directive and the zone it is pointed at.
+#
+# NOT testkit's `test_ref_probe`. That directive aims ngx_test_probe_json() at
+# the REF module's own zone, which is NULL in every scenario but one -- the
+# probe then renders "zone":{"present":false} and the zone_render dispatch is
+# never reached at all. The hook would be registered, linked, and never called
+# once, and every field this scenario asserts on would be absent. So the probe
+# location is served by cache_turbo's own `cache_turbo_probe <zone>;`, which
+# passes OUR ngx_shm_zone_t and therefore reaches our zone_render.
+#
+# PROBER_PROBE_ZONE is empty: the zone is declared by `cache_turbo_zone` in the
+# conf template (it needs a size and a name the /varidx/ location also
+# references), not by a probe-side directive. lib.sh documents empty as
+# legitimate for a module whose probe needs no zone directive of its own.
+PROBER_PROBE='cache_turbo_probe ct;'
+
+prober_make_prefix
+
+# Redis on a port derived from this scenario's own resolved port, mirroring the
+# +21 offset l2-cross-instance-fill and the Python suite both use, so a human
+# reading any of the three sees the same arithmetic.
+CT_REDIS_PORT=$(( PROBER_RESOLVED_PORT + 21 ))
+CT_REDIS_LOG="$PROBER_PREFIX/logs/redis.log"
+
+# REFUSE A SQUATTED PORT. A redis-server that cannot bind dies, and the
+# scenario then talks to the SQUATTER -- typically a Redis left over from an
+# earlier run, still holding that run's keys. The visible symptom is a warm
+# cache on what is supposed to be a cold request, and every varidx assertion
+# silently measures a state this run did not create. Bail rather than SKIP: a
+# SKIP hides a leaked process that goes on corrupting every future run on this
+# box, and it is trivially fixable.
+if (exec 3<>"/dev/tcp/127.0.0.1/$CT_REDIS_PORT") 2>/dev/null; then
+    echo "Bail out! port $CT_REDIS_PORT is already in use -- a leftover redis-server would serve this scenario keys from an earlier run and the varidx counters would measure a state this run never created; kill it and re-run"
+    exit 1
+fi
+
+redis-server --port "$CT_REDIS_PORT" \
+             --bind 127.0.0.1 \
+             --save '' \
+             --appendonly no \
+             --dbfilename '' \
+             --daemonize no \
+             --logfile "$CT_REDIS_LOG" \
+             --dir "$PROBER_PREFIX" &
+CT_REDIS_PID=$!
+export CT_REDIS_PORT CT_REDIS_PID CT_REDIS_LOG
+
+# Bounded wait for it to actually accept. A scenario that races ahead of its
+# own fixture reports a module bug where the truth is a fixture that was not up
+# yet.
+_ct_redis_up=0
+for _i in $(seq 1 100); do
+    if (exec 3<>"/dev/tcp/127.0.0.1/$CT_REDIS_PORT") 2>/dev/null; then
+        _ct_redis_up=1
+        break
+    fi
+    sleep 0.05
+done
+export CT_REDIS_UP="$_ct_redis_up"
+
+# Render the Redis port into a private copy and point the harness at it.
+# prober_render_conf substitutes a FIXED placeholder set with no consumer-
+# extensible member, so an unsubstituted @REDIS_PORT@ would reach nginx
+# verbatim and kill the config test. $SCENARIO is run-scenario.sh's own
+# absolute scenario dir; PROBER_SCENARIO is exported later and only to
+# driver.sh. The template is deliberately NOT named nginx.conf, which
+# run-scenario.sh would prefer over $PROBER_CONF and pick up unrendered.
+sed -e "s#@REDIS_PORT@#${CT_REDIS_PORT}#g" \
+    "$SCENARIO/server.conf.in" \
+    > "$PROBER_PREFIX/server.conf"
+export PROBER_CONF="$PROBER_PREFIX/server.conf"

@@ -645,6 +645,24 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       NULL },
 #endif
 
+/* testkit probe. Guarded by the same macro as its implementation file: in a
+ * shipping build ngx_http_cache_turbo_probe.c compiles to nothing, the symbol
+ * does not exist, and neither does this entry -- so the directive is not merely
+ * inert but unknown, and a conf naming it fails nginx's config test rather than
+ * silently doing nothing. The macro is set only by nginx-module-testkit's
+ * t/module/config (which appends -DNGX_TEST_HARNESS to the tree's global
+ * CFLAGS), and ci/tools/testkit-stage.sh is that config's only caller here. */
+#ifdef NGX_TEST_HARNESS
+
+    { ngx_string("cache_turbo_probe"),
+      NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_http_cache_turbo_probe,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+
+#endif
+
       ngx_null_command
 };
 
@@ -5628,6 +5646,17 @@ ngx_http_cache_turbo_init(ngx_conf_t *cf)
     if (ngx_http_cache_turbo_filter_chain_init() != NGX_OK) {
         return NGX_ERROR;
     }
+
+#ifdef NGX_TEST_HARNESS
+    /* Register the zone_render hook with the testkit probe. Done here rather
+     * than from the directive handler so the hook is present even in a harness
+     * build whose conf declares no cache_turbo_probe location: registration is
+     * what the probe dispatches on, the directive only decides which zone the
+     * probe is pointed at. Idempotent -- the probe keeps one hooks pointer and
+     * the last registration wins, so a reload simply re-registers the same
+     * struct. */
+    ngx_http_cache_turbo_probe_hooks_register();
+#endif
 
     return NGX_OK;
 }

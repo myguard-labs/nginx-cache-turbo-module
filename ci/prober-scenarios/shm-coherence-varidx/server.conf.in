@@ -1,0 +1,89 @@
+@LOAD@
+# Copyright (C) 2026 Thijs Eilander
+# SPDX-License-Identifier: BSD-2-Clause
+#
+# @LOAD@ above load_modules the testkit ref probe (which carries
+# ngx_test_probe.o -- the generic renderer and the hook dispatch). This line
+# loads the module under test out of the SAME objs/ dir, exactly as
+# l2-cross-instance-fill does. ./requires has already SKIPped the scenario on a
+# tree lacking the .so, so this line is only reached where it exists.
+load_module @BUILD_OBJS@/ngx_http_cache_turbo_module.so;
+daemon off;
+pid @PREFIX@/nginx.pid;
+error_log @PREFIX@/logs/error.log info;
+
+# FOUR WORKERS, and that is half the scenario. `fanout` counts DISTINCT
+# answering worker pids and `coherent` asks whether those workers agree about
+# the shared zone; a one-worker server makes `coherent` a statement about one
+# process agreeing with itself, which is the tautology this scenario exists to
+# replace. The opt-in that lets worker_processes != 1 past prober_check_conf's
+# bail is PROBER_ALLOW_MULTIWORKER=1 in ./env -- the two must stay together.
+worker_processes 4;
+
+# Comfortably above the fanout width. A fanout leg is one connection at a time
+# (the executor is sequential by design), so the ceiling only has to cover the
+# probe read that follows each leg -- but a tight limit here would turn a
+# coverage shortfall into a connection error and hide which one happened.
+events { worker_connections 128; }
+
+http {
+    @PROBE_ZONE@
+
+    # The zone every assertion in this scenario reads. Its counters live in
+    # shared memory, which is the whole premise: four workers, one mmap.
+    cache_turbo_zone name=ct 8m;
+
+    # Off by default; /origin turns its own log back on so the counter file
+    # stays free of /__probe and /varidx/ traffic.
+    access_log off;
+
+    server {
+        listen 127.0.0.1:@PORT@;
+
+        # No keepalive across legs. Each fanout leg is a fresh connection,
+        # which is precisely what gives the accept path a chance to hand the
+        # request to a different worker; a reused connection stays pinned to
+        # the worker that accepted it, which is why `fanout` refuses to be
+        # combined with `block`.
+        keepalive_timeout 0;
+
+        # THE ORIGIN. It emits `Vary: Accept-Encoding`, and that header is what
+        # makes this scenario move varidx_inflight at all: cache_turbo_auto_vary
+        # below turns a Vary-carrying response into a variant, and storing a
+        # variant issues the variant-index write (a Redis SADD) whose launch
+        # increments varidx_inflight and whose completion decrements it.
+        #
+        # Without the Vary header there is no variant, no index write, and the
+        # counter is a constant 0 -- at which point all three zone_invariant
+        # forms are satisfied by a field that was never anything but 0, i.e.
+        # exactly the tautology testkit's own shm-coherence scenario documents
+        # and refuses to assert.
+        location /origin {
+            access_log @PREFIX@/logs/origin.log combined;
+            default_type text/plain;
+            add_header Vary "Accept-Encoding" always;
+            return 200 "ct-varidx-payload\n";
+        }
+
+        location /varidx/ {
+            cache_turbo            ct;
+            cache_turbo_key        $uri$http_accept_encoding;
+            cache_turbo_valid      60s;
+
+            # The variant-index write path. auto_vary turns the origin's
+            # `Vary: Accept-Encoding` into a stored variant; the Redis backend
+            # is what the resulting index write is issued against.
+            cache_turbo_auto_vary  on;
+            cache_turbo_redis      127.0.0.1:@REDIS_PORT@ db=0;
+
+            proxy_pass             http://127.0.0.1:@PORT@/origin;
+            proxy_set_header       Accept-Encoding $http_accept_encoding;
+        }
+
+        # Served by cache_turbo's OWN probe directive, not testkit's
+        # test_ref_probe -- see ./env for why that distinction is load-bearing
+        # (test_ref_probe points the probe at the ref module's zone, which
+        # never reaches our zone_render hook).
+        location /__probe { @PROBE@ }
+    }
+}

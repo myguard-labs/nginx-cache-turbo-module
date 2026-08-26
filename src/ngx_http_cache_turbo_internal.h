@@ -1430,4 +1430,18 @@ ngx_int_t ngx_http_cache_turbo_request_only_if_cached(ngx_http_request_t *r,
 ngx_int_t ngx_http_cache_turbo_request_revalidate(ngx_http_request_t *r,
     ngx_http_cache_turbo_ctx_t *ctx);
 
+
+/* testkit probe integration, defined in ngx_http_cache_turbo_probe.c.
+ *
+ * Both are inside NGX_TEST_HARNESS because their definitions are: that whole
+ * file compiles to nothing without the macro, so declaring them
+ * unconditionally would let module.c reference symbols that do not exist in a
+ * shipping build. The macro is defined only by nginx-module-testkit's
+ * t/module/config, which ci/tools/testkit-stage.sh is the sole caller of. */
+#ifdef NGX_TEST_HARNESS
+char *ngx_http_cache_turbo_probe(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
+void ngx_http_cache_turbo_probe_hooks_register(void);
+#endif
+
 #endif /* NGX_HTTP_CACHE_TURBO_INTERNAL_H_INCLUDED_ */

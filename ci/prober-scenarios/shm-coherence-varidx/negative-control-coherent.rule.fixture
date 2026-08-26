@@ -1,0 +1,39 @@
+# NEGATIVE CONTROL for `zone_invariant coherent`. NOT a test of the module.
+#
+# HOW IT IS RIGGED
+#   `coherent` asserts that every answering worker read the SAME value. Pointed
+#   at a genuinely shared field it holds, which is what case 4 of
+#   shm-coherence-varidx.rule asserts about zone.ct_digest.
+#
+#   This fixture points it at `pid` instead -- the answering worker's process
+#   id, which is rendered by the generic probe and is the ONE field in the
+#   document that is per-worker by definition. The scenario's whole premise is
+#   that a fanout of this width reaches several distinct workers (the coverage
+#   oracle FAILS the case otherwise, so a run that somehow reached one worker
+#   reddens here too, just with a different message). Several distinct workers
+#   mean several distinct pids, so `coherent pid` is unsatisfiable exactly when
+#   the fanout did its job.
+#
+#   That is a stronger control than folding a fake divergence into the module
+#   would be: it needs no code change, it reddens against the SHIPPING binary,
+#   and it fails for the one reason `coherent` exists to detect -- two workers
+#   disagreeing about a value the rule claimed they should share.
+#
+# EXPECTED FAILURE MESSAGE (the driver greps for its stable prefix):
+#   zone_invariant coherent pid: worker <pid> read <x>, worker <pid> read <y>
+#
+# NOTE ON THE FIELD NAME IN THE GREP: the driver matches on
+# `zone_invariant coherent pid:` because that is the assertion this
+# fixture writes below. Keep the two in step -- a fixture asserting one field
+# while the driver greps for another would report "the control ran and proved
+# nothing", which is the correct answer to that mistake and not a bug.
+name    NEGATIVE CONTROL: coherent must reject a field the workers genuinely disagree about
+from    127.0.0.1
+send    GET /varidx/a HTTP/1.1\r\n
+send    Host: prober\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n
+expect  status=200
+expect  body~ct-varidx-payload
+pid_may_change
+probe   pid >= 1
+fanout  24 2
+zone_invariant coherent pid
