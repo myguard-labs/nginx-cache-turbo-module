@@ -120,8 +120,9 @@ done
 # LEGACY_NGINX_VERSION's sibling lines -- so match on the key name, not on
 # indentation depth, to stay robust to reindentation.
 declare -A job_declares_band     # "file:job" -> port
-declare -A job_starts_suite      # "file:job" -> the invoking line, trimmed
+declare -A job_starts_suite      # "file:job" -> the invoking line, trimmed (best-effort, for messages only)
 declare -A job_passes_port       # "file:job" -> 1
+declare -A job_has_sweep         # "file:job" -> 1 -- PROPERTY signal, not name-based (AUD-CIPORT3)
 interval_starts=()
 interval_ends=()
 interval_labels=()
@@ -130,7 +131,9 @@ for f in "${files[@]}"; do
     [ -f "$f" ] || continue
     current_job=""
     in_jobs=0
+    lineno=0
     while IFS= read -r line; do
+        lineno=$((lineno + 1))
         # Only treat 2-space keys as job names AFTER the top-level `jobs:` key.
         # Before it, `on:` has 2-space children too, and mistaking one for a job
         # misattributes every finding that follows it.
@@ -146,6 +149,18 @@ for f in "${files[@]}"; do
 
         job="${current_job:-<unknown>}"
         key="$f:$job"
+
+        # PROPERTY signal, not a name allowlist (AUD-CIPORT3): a job that
+        # sweeps stale listeners off its own band (the same `$(seq
+        # ...TEST_BASE_PORT...` + nearby `fuser` shape check 1 already
+        # verifies) is, by its own structure, asserting it is about to bind
+        # ports in that band -- regardless of what script it later invokes to
+        # do the actual binding. This is what lets check 3 (below) catch a
+        # NEW runtime entry point without anyone having to name it here.
+        if [[ "$in_jobs" -eq 1 && -n "$current_job" && "$line" == *"$SEQ_LITERAL"* ]]; then
+            sweep_body="$(sed -n "${lineno},$((lineno + 3))p" "$f")"
+            [[ "$sweep_body" == *fuser* ]] && job_has_sweep[$key]=1
+        fi
 
         if [[ "$line" =~ TEST_BASE_PORT:[[:space:]]*\"?([0-9]+)\"? ]]; then
             port="${BASH_REMATCH[1]}"
@@ -193,35 +208,24 @@ for f in "${files[@]}"; do
             # quoted scalar would only ever cost us a match (fail closed).
             code="${line%%#*}"
 
-            # ⚠ THIS ALLOWLIST IS THE CHECK'S KNOWN WEAK SPOT (AUD-CIPORT3).
-            # It names runtime entry points by SPELLING, so a job that boots a
-            # real server through any OTHER script matches nothing here, gets
-            # no job_starts_suite entry, and sails past check 3 -- while also
-            # being invisible to checks 1 and 2 (no sweep line, no band). It
-            # then takes test_runtime.py's default --port 18880 and collides
-            # with the build-test runtime job. That is the same failure this
-            # file's header describes, arriving through the one door the header
-            # did not name.
-            #
-            # testkit-run.sh was the fourth such entry point and the first to
-            # actually hit it. Every future one must be added HERE, in the same
-            # commit that adds the job. The durable fix is to stop keying on
-            # script names at all -- see the AUD-CIPORT3 row in
-            # memory/labs/nginx-cache-turbo-module/issues.md.
+            # BEST-EFFORT ONLY, for error-message context -- NOT what gates
+            # check 3 (AUD-CIPORT3). This used to be the check's sole
+            # detector, keyed on exact script spelling: a runtime job through
+            # any other entry point matched nothing here and sailed past
+            # check 3 invisibly. Check 3 below now gates on the PROPERTY
+            # signals (`job_declares_band`, `job_has_sweep`, `job_passes_port`)
+            # recorded above and in the sweep scan, which do not name a
+            # script and so cannot go stale the way this list did. This match
+            # only supplies a human-readable "what line looked like the
+            # runtime invocation" for the diagnostic text; a job that starts
+            # a suite through some fifth script style still gets caught by
+            # check 3 even though it matches nothing here.
             if [[ "$code" == *test_runtime.py* || "$code" == *coverage.sh* \
                   || "$code" == *testkit-run.sh* \
                   || "$code" =~ (^|[[:space:]])prove([[:space:]]|$) ]]; then
                 # py_compile checks syntax; it starts no suite and binds no port.
                 if [[ "$code" != *py_compile* ]]; then
                     job_starts_suite[$key]="${code#"${code%%[![:space:]]*}"}"
-                    # coverage.sh reads TEST_BASE_PORT from the environment and
-                    # passes --port itself, so the workflow line correctly has
-                    # no --port of its own. Requiring one here would be a lint
-                    # demanding a bug.
-                    [[ "$code" == *coverage.sh* ]] && job_passes_port[$key]=1
-                    # testkit-run.sh does the same: its --port defaults to
-                    # $TEST_BASE_PORT, so declaring the band IS passing it.
-                    [[ "$code" == *testkit-run.sh* ]] && job_passes_port[$key]=1
                 fi
             fi
             if [[ "$code" == *--port*TEST_BASE_PORT* ]]; then
@@ -253,19 +257,49 @@ for f in "${files[@]}"; do
     done < "$f"
 done
 
-# --- Check 3: a runtime-bearing job must declare a band AND pass it. ---
-for key in "${!job_starts_suite[@]}"; do
+# --- Check 3: a job that binds ports must declare a band AND pass it. ---
+#
+# AUD-CIPORT3 durable fix: the job set this check gates is the UNION of every
+# PROPERTY signal recorded above -- job_declares_band (declares
+# TEST_BASE_PORT), job_has_sweep (clears a band of stale listeners before
+# running), job_passes_port (an explicit --port/TEST_NGINX_PORT/
+# TEST_NGINX_RANDOMIZE marker referencing TEST_BASE_PORT). None of the three
+# names a script. A job showing ANY ONE of these signals is asserting, by its
+# own structure, that it is runtime-bearing -- the check's job is to catch it
+# missing one of the other two, i.e. the "declares TEST_BASE_PORT xor binds a
+# port" defect the packet described, not to first recognise the script that
+# does the binding.
+#
+# The one legitimate case where job_declares_band + job_has_sweep is present
+# without an explicit port marker is a script that reads TEST_BASE_PORT from
+# its own environment and defaults its own --port to it (coverage.sh,
+# testkit-run.sh document this in their own headers) -- for that job,
+# declaring the band via env IS passing it, by construction: it swept that
+# band for itself and every runtime script in this repo enforces "PORT must be
+# numeric" before doing anything with it, so a job that both declares a band
+# AND sweeps it is never a job that quietly runs on some OTHER port. A job
+# that declares a band but does NOT sweep it, and has no explicit marker
+# either, gets no free pass -- that is exactly the "band declared, never
+# passed" defect check 3 exists to catch.
+all_keys=()
+for key in "${!job_declares_band[@]}" "${!job_has_sweep[@]}" "${!job_passes_port[@]}"; do
+    all_keys+=("$key")
+done
+mapfile -t all_keys < <(printf '%s\n' "${all_keys[@]}" | sort -u)
+
+for key in "${all_keys[@]}"; do
+    label="${job_starts_suite[$key]:-<no matching invocation line found -- see job_declares_band/job_has_sweep/job_passes_port>}"
     if [[ -z "${job_declares_band[$key]:-}" ]]; then
-        echo "lint-ci-ports: ${key%%:*}: job '${key#*:}' starts the runtime suite but declares no TEST_BASE_PORT -- it would silently take test_runtime.py's default --port 18880 and collide with the build-test runtime job: ${job_starts_suite[$key]}" >&2
+        echo "lint-ci-ports: ${key%%:*}: job '${key#*:}' binds a port (sweeps and/or passes --port/TEST_NGINX_PORT/TEST_NGINX_RANDOMIZE) but declares no TEST_BASE_PORT -- it would silently take a default port and collide with a banded runtime job: $label" >&2
         status=1
-    elif [[ -z "${job_passes_port[$key]:-}" ]]; then
-        echo "lint-ci-ports: ${key%%:*}: job '${key#*:}' declares TEST_BASE_PORT=${job_declares_band[$key]} but never passes it as --port -- it sweeps one band and runs on another, which is worse than not banding at all: ${job_starts_suite[$key]}" >&2
+    elif [[ -z "${job_passes_port[$key]:-}" && -z "${job_has_sweep[$key]:-}" ]]; then
+        echo "lint-ci-ports: ${key%%:*}: job '${key#*:}' declares TEST_BASE_PORT=${job_declares_band[$key]} but never sweeps it and never passes it as --port/TEST_NGINX_PORT/TEST_NGINX_RANDOMIZE -- it declares a band it neither clears nor runs on, which is worse than not banding at all: $label" >&2
         status=1
     fi
 done
 
 if [ "$status" -eq 0 ]; then
-    echo "lint-ci-ports: OK (${#interval_starts[@]} distinct port bands, ${#job_starts_suite[@]} runtime-bearing jobs, ${#files[@]} workflow files scanned)"
+    echo "lint-ci-ports: OK (${#interval_starts[@]} distinct port bands, ${#all_keys[@]} runtime-bearing jobs, ${#files[@]} workflow files scanned)"
 fi
 
 exit "$status"
