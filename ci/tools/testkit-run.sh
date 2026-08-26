@@ -64,6 +64,11 @@
 #     --testkit DIR     testkit checkout   (default: autodetected)
 #     --port N          base listen port   (default: $TEST_BASE_PORT, else 19392)
 #     --stage           run testkit-stage.sh first
+#     --sanitizer       select (and with --stage, build) the ASan/UBSan tree
+#                       .build/<flavor>-<version>-testkit-asan. The tree is
+#                       verified to actually carry the sanitizer runtime, not
+#                       trusted from the flag. detect_leaks stays OFF -- see
+#                       the block by the check for why that is deliberate.
 #     --expect-skip     invert the verdict: PASS only if the scenario SKIPs.
 #                       The negative control for the whole adoption -- see below.
 #     --list            print the scenarios that would run, exit
@@ -109,6 +114,7 @@ TESTKIT="${TESTKIT_ROOT:-}"
 PORT="${TEST_BASE_PORT:-19392}"
 DO_STAGE=0
 EXPECT_SKIP=0
+SANITIZE=0
 LIST=0
 SCENARIOS=()
 
@@ -122,6 +128,7 @@ while [ $# -gt 0 ]; do
         --testkit)     TESTKIT="${2:?--testkit needs a value}"; shift 2 ;;
         --port)        PORT="${2:?--port needs a value}"; shift 2 ;;
         --stage)       DO_STAGE=1; shift ;;
+        --sanitizer)   SANITIZE=1; shift ;;
         --expect-skip) EXPECT_SKIP=1; shift ;;
         --list)        LIST=1; shift ;;
         -h|--help)     sed -n '2,/^set -euo/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -149,12 +156,65 @@ if [ "$LIST" -eq 1 ]; then
     exit 0
 fi
 
-STAGE_DIR="${BUILD_ROOT:-$ROOT/.build}/${FLAVOR}-${VERSION}-testkit"
+STAGE_SUFFIX=testkit
+[ "$SANITIZE" -eq 1 ] && STAGE_SUFFIX=testkit-asan
+STAGE_DIR="${BUILD_ROOT:-$ROOT/.build}/${FLAVOR}-${VERSION}-${STAGE_SUFFIX}"
 
 if [ "$DO_STAGE" -eq 1 ]; then
-    ci/tools/testkit-stage.sh --flavor "$FLAVOR" --version "$VERSION" --testkit "$TESTKIT" \
-        || die "staging failed"
+    stage_args=(--flavor "$FLAVOR" --version "$VERSION" --testkit "$TESTKIT")
+    [ "$SANITIZE" -eq 1 ] && stage_args+=(--sanitizer)
+    ci/tools/testkit-stage.sh "${stage_args[@]}" || die "staging failed"
 fi
+
+# ---- the sanitizer contract -------------------------------------------------
+# --sanitizer is a claim about the tree, so it is VERIFIED here rather than
+# assumed from the flag. Selecting a different directory name is what makes an
+# unsanitized tree impossible to pick up by accident; this grep is what makes a
+# tree that merely LIVES under the -asan name and was built without the flags
+# impossible to run silently. Both are needed: the name is chosen by the
+# caller, the runtime is a property of the bytes.
+#
+# Same detection as testkit's lib.sh:244 (PROBER_SANITIZED) and as
+# testkit-stage.sh's own gate. Three places agreeing is deliberate -- the one
+# that must never be the odd one out is the harness, because it decides at
+# RUNTIME which oracles apply.
+if [ "$SANITIZE" -eq 1 ] && [ "$EXPECT_SKIP" -eq 0 ]; then
+    if [ ! -f "$STAGE_DIR/objs/nginx" ] && [ ! -f "$STAGE_DIR/objs/angie" ]; then
+        die "no sanitized tree at $STAGE_DIR/objs -- run ci/tools/testkit-stage.sh --sanitizer (or pass --stage)"
+    fi
+    for _obj in "$STAGE_DIR/objs/nginx" "$STAGE_DIR/objs/angie" \
+                "$STAGE_DIR/objs/ngx_http_cache_turbo_module.so"; do
+        [ -f "$_obj" ] || continue
+        grep -qa '__asan_\|__ubsan_' "$_obj" || \
+            die "--sanitizer given but $_obj carries no ASan/UBSan runtime -- restage with --sanitizer"
+    done
+fi
+
+# ---- detect_leaks: a deliberate decision, not an omission -------------------
+# LEFT OFF. testkit's prober_heap_env (lib.sh:242) sets detect_leaks=0 and this
+# leg does not override it. The reasoning, so nobody "fixes" it later:
+#
+#   * nginx NEVER frees its configuration pool. LSan therefore reports the
+#     entire config parse as leaked on `nginx -t` and on every clean shutdown.
+#     That is upstream process-lifetime allocation, not a module defect.
+#   * With detect_leaks=1 the FIRST thing that aborts is `nginx -t`, before a
+#     single oracle runs -- so the leg would turn into a Bail out! and observe
+#     strictly less than it does today, not more.
+#   * The obvious workaround -- an LSan suppression file -- is BANNED here.
+#     This repo carried `leak:ngx_create_pool` and `leak:main`, and cycle 8
+#     DISPROVED both by negative control: they suppress REAL module leaks, not
+#     just the config pool. A suppression that hides the class you are hunting
+#     is worse than no leak detection at all, because it reports green.
+#   * What this leg IS for is the class LSan cannot see anyway: the SERVER-side
+#     use-after-free / overflow / UB that ASan and UBSan catch at the moment it
+#     happens, with a stack, in a log the harness is structurally unable to
+#     delete (lib.sh:1225-1314 keeps both the redirected error_log and the
+#     pre-redirect server.err; lib.sh:1424 treats a sanitizer report as fatal
+#     and never exemptable).
+#
+# Leak hunting is a separate instrument and needs a suppression story that
+# survives a negative control. It is not this leg's job, and pretending
+# otherwise by flipping one env var would cost the leg its actual coverage.
 
 # The prober CLIENT is a compiled C binary, separate from the staged modules,
 # and run-scenario.sh invokes ./prober directly rather than building it. Build
@@ -175,8 +235,23 @@ fi
 status=0
 
 for name in "${SCENARIOS[@]}"; do
-    dir="$TESTKIT/ci/prober/scenarios/$name"
-    [ -d "$dir" ] || die "no such scenario: $name (looked in $TESTKIT/ci/prober/scenarios/)"
+    # A scenario may live in EITHER repo. testkit ships the generic ones and
+    # the consumer-cache-turbo oracle; this repo authors the ones that encode
+    # cache-turbo-specific knowledge (an L2 topology, a Redis fixture, a
+    # second instance) and have no place in a generic harness. run-scenario.sh
+    # takes an absolute scenario DIRECTORY, so a locally-authored scenario
+    # needs no testkit change whatsoever -- which is the point: this repo can
+    # add oracles without a cross-repo PR.
+    #
+    # Local FIRST. If a name exists in both, the local one wins, and that is
+    # the safe precedence: a consumer overriding a harness scenario is
+    # deliberate, whereas a harness upgrade silently shadowing a local oracle
+    # would remove coverage without a diff in this repo.
+    dir=""
+    for cand in "$ROOT/ci/prober-scenarios/$name" "$TESTKIT/ci/prober/scenarios/$name"; do
+        if [ -d "$cand" ]; then dir="$cand"; break; fi
+    done
+    [ -n "$dir" ] || die "no such scenario: $name (looked in $ROOT/ci/prober-scenarios/ and $TESTKIT/ci/prober/scenarios/)"
 
     echo "== scenario: $name (port $PORT, expect $([ "$EXPECT_SKIP" -eq 1 ] && echo SKIP || echo ASSERTIONS))"
 

@@ -1,0 +1,87 @@
+# Sourced (not executed) by run-scenario.sh AFTER prober_resolve and BEFORE the
+# conf is rendered. That window is exactly what this scenario needs: it must
+# start a Redis, learn the port it bound, and get that port into instance A's
+# conf before nginx ever parses it.
+#
+# WHY A PRE-RENDERED CONF RATHER THAN A NEW @PLACEHOLDER@
+#   prober_render_conf substitutes a FIXED set of placeholders (@LOAD@,
+#   @BUILD_OBJS@, @PORT@, @PREFIX@, @PROBE@, @PROBE_ZONE@, @BACKEND_PORT@).
+#   There is no consumer-extensible one, and an unsubstituted @REDIS_PORT@
+#   would reach nginx verbatim and kill the config test. Adding a placeholder
+#   is a TESTKIT change; this scenario lives in the consumer repo and must not
+#   require one. So the Redis port is substituted HERE, into a copy under the
+#   run prefix, and PROBER_CONF points the renderer at that copy -- the
+#   remaining placeholders are still rendered normally by the harness.
+#
+#   (run-scenario.sh prefers $SCENARIO/nginx.conf over $PROBER_CONF, so the
+#   template is deliberately NOT named nginx.conf. It is instance-a.conf.in,
+#   which the harness will never pick up by accident.)
+
+# prober_make_prefix is idempotent and prober_render_conf reuses what it finds,
+# so calling it here to get a place to write fixtures is the documented
+# pattern, not a workaround (run-scenario.sh:96-99).
+prober_make_prefix
+
+# Redis on a port derived from the scenario's own resolved port, in the same
+# spirit as the Python suite's PORT_OFFSETS: deterministic, inside this run's
+# band, and never the listen port itself. +21 mirrors the suite's "redis"
+# offset so a human reading both sees the same arithmetic.
+CT_REDIS_PORT=$(( PROBER_RESOLVED_PORT + 21 ))
+CT_REDIS_LOG="$PROBER_PREFIX/logs/redis.log"
+
+# ⚠ REFUSE A SQUATTED PORT. If something is ALREADY listening here, the
+# redis-server started below fails to bind and dies -- but the scenario then
+# talks to the SQUATTER, which is typically a Redis left behind by an earlier
+# run and still holding that run's keys. The visible symptom is an `Age:` and
+# an `X-Cache: STALE` on what is supposed to be instance A's COLD first
+# request, i.e. the scenario silently measures a warm cache and every L2
+# oracle becomes meaningless. Observed during development, and it is the same
+# class this repo has already been bitten by (a stale Redis squatting a test
+# port read as a module outage).
+#
+# Bail rather than SKIP: a SKIP would hide a leaked process that will go on
+# corrupting every future run on this box, and it is trivially fixable.
+if (exec 3<>"/dev/tcp/127.0.0.1/$CT_REDIS_PORT") 2>/dev/null; then
+    echo "Bail out! port $CT_REDIS_PORT is already in use -- a leftover redis-server from an earlier run would serve this scenario STALE keys and every L2 oracle would silently measure a warm cache; kill it and re-run"
+    exit 1
+fi
+
+redis-server --port "$CT_REDIS_PORT" \
+             --bind 127.0.0.1 \
+             --save '' \
+             --appendonly no \
+             --dbfilename '' \
+             --daemonize no \
+             --logfile "$CT_REDIS_LOG" \
+             --dir "$PROBER_PREFIX" &
+CT_REDIS_PID=$!
+export CT_REDIS_PORT CT_REDIS_PID CT_REDIS_LOG
+
+# Wait for it to actually accept, bounded. A scenario that races ahead of its
+# own fixture reports a module bug where the truth is a fixture that was not
+# up yet -- the "dead Redis reads as a module outage" failure this repo has
+# already paid for once.
+_ct_redis_up=0
+for _i in $(seq 1 100); do
+    if (exec 3<>"/dev/tcp/127.0.0.1/$CT_REDIS_PORT") 2>/dev/null; then
+        _ct_redis_up=1
+        break
+    fi
+    sleep 0.05
+done
+export CT_REDIS_UP="$_ct_redis_up"
+
+# Render the Redis port into a private copy and point the harness at it.
+# $SCENARIO is run-scenario.sh's own absolute scenario dir (set at :59, long
+# before this file is sourced). PROBER_SCENARIO is NOT usable here -- it is
+# exported at :146, only for driver.sh.
+sed -e "s#@REDIS_PORT@#${CT_REDIS_PORT}#g" \
+    "$SCENARIO/instance-a.conf.in" \
+    > "$PROBER_PREFIX/instance-a.conf"
+export PROBER_CONF="$PROBER_PREFIX/instance-a.conf"
+
+# The driver needs the template too, to render instance B's conf with B's own
+# port. Exported rather than recomputed so both instances demonstrably come
+# from ONE template -- a second, drifting copy of the conf is how two
+# "identical" instances stop being identical.
+export CT_SCENARIO_DIR="$SCENARIO"

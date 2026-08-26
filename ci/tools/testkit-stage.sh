@@ -67,6 +67,7 @@
 #                                             .github/versions.env)
 #     --testkit DIR     testkit checkout     (default: autodetected, see below)
 #     --jobs N          make -j N            (default: nproc)
+#     --sanitizer       build the server + both modules under ASan/UBSan
 #     --src DIR         reuse an unpacked source tree instead of fetching
 #     --keep-src        do not delete a fetched source tree on success
 #     --dry-run         print the configure/make it WOULD run, touch nothing
@@ -93,6 +94,14 @@
 #   required because this script wipes objs/ before building, and that plain
 #   name is the tree ci-build.sh produces for the runtime suite. Sharing it
 #   would silently destroy the suite's tree on every stage.
+#
+#   --sanitizer stages into <version>-testkit-asan, a SEPARATE tree. It is not
+#   a variant of the same directory: this script wipes objs/ before building,
+#   so one name for both would mean each stage destroys the other leg's tree,
+#   and whichever ran last would silently decide whether "the testkit leg"
+#   was sanitized. Two names means both legs can be staged and run in one
+#   session, and `testkit-run.sh --sanitizer` selects a tree that is either
+#   present and sanitized or absent -- never present and quietly unsanitized.
 #
 #   ⚠ THE STAGE LIVES UNDER THIS REPO'S .build/, NOT TESTKIT'S. testkit's
 #   prober_resolve (lib.sh:81-82) defaults its search root to the TESTKIT repo
@@ -129,6 +138,7 @@ JOBS=""
 SRC=""
 KEEP_SRC=0
 DRY=0
+SANITIZE=0
 
 die()   { echo "testkit-stage: $*" >&2; exit 1; }
 usage() { echo "testkit-stage: $*" >&2; exit 2; }
@@ -140,6 +150,7 @@ while [ $# -gt 0 ]; do
         --testkit)  TESTKIT="${2:?--testkit needs a value}"; shift 2 ;;
         --jobs)     JOBS="${2:?--jobs needs a value}"; shift 2 ;;
         --src)      SRC="${2:?--src needs a value}"; shift 2 ;;
+        --sanitizer) SANITIZE=1; shift ;;
         --keep-src) KEEP_SRC=1; shift ;;
         --dry-run)  DRY=1; shift ;;
         -h|--help)  sed -n '2,/^set -euo/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -204,6 +215,7 @@ esac
 [ -n "$EXPECTED_SHA256" ] || die "empty sha256 pin for ${FLAVOR} ${VERSION}"
 
 STAGE="${FLAVOR}-${VERSION}-testkit"
+[ "$SANITIZE" -eq 1 ] && STAGE="${STAGE}-asan"
 BUILD_ROOT="${BUILD_ROOT:-$ROOT/.build}"
 STAGE_DIR="$BUILD_ROOT/$STAGE"
 
@@ -238,12 +250,47 @@ CONFIGURE_ARGS=(
     "--add-dynamic-module=$ROOT"
 )
 
+# ---- the sanitizer argv ----------------------------------------------------
+# Flag derivation is DELIBERATELY the same spelling ci-build.sh's `asan` mode
+# uses (ci-build.sh:96-113), not a second one invented here. Two spellings of
+# "the ASan build" in one repo is how a leg ends up sanitized differently from
+# the leg it is supposed to corroborate, and the difference is invisible until
+# one of them fails to reproduce what the other saw.
+#
+# WHY THE FLAGS MUST GO ON THE *SERVER*, NOT ONLY THE PROBER
+#   testkit's ci/prober/build.sh SAN=1 sanitizes the PROBER CLIENT -- a
+#   separate process that speaks HTTP to nginx. It cannot observe anything
+#   inside the server's address space. The finding this leg exists to read is
+#   a SERVER-side abort, so the sanitizer has to be compiled into nginx and
+#   both modules. nginx applies --with-cc-opt to every object including the
+#   addon sources and --with-ld-opt to the final link, so one pair of flags
+#   covers core, the ref probe and cache_turbo alike.
+#
+# -fno-sanitize-recover=undefined is what makes a UBSan finding FATAL, and it
+# is a compile-time property: it survives a caller that runs the binary
+# without carrying UBSAN_OPTIONS through. Without it every UBSan report is
+# advisory and the scenario still exits 0 -- a green leg over a real defect.
+if [ "$SANITIZE" -eq 1 ]; then
+    SAN_FLAGS="-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g3 -O1"
+    # clang trips three known false positives on nginx core that gcc does not;
+    # ci-build.sh:108-110 makes exactly this distinction and the reasons are
+    # documented there. Mirrored rather than re-litigated.
+    if "${CC:-cc}" --version 2>/dev/null | grep -qi clang; then
+        SAN_FLAGS="-fsanitize=address,undefined -fno-sanitize=function,nonnull-attribute,pointer-overflow -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g3 -O1"
+    fi
+    CONFIGURE_ARGS+=(
+        "--with-cc-opt=$SAN_FLAGS"
+        "--with-ld-opt=$SAN_FLAGS"
+    )
+fi
+
 if [ "$DRY" -eq 1 ]; then
     echo "would fetch    : $URL"
     echo "would verify   : $EXPECTED_SHA256"
     echo "would stage    : $STAGE_DIR/objs"
     echo "would configure: ./configure ${CONFIGURE_ARGS[*]}"
     echo "would build    : make -j$JOBS   (server binary + both modules)"
+    [ "$SANITIZE" -eq 1 ] && echo "would require  : __asan_ present in objs/nginx and both .so"
     echo "would require  : objs/$TK_SO newer than $TESTKIT/src"
     echo "                 objs/$CT_SO newer than $ROOT/src"
     echo "                 objs/nginx executable"
@@ -413,6 +460,62 @@ check_so() {   # check_so SO_NAME REF_MTIME REF_PATH
 
 check_so "$TK_SO" "$TK_MTIME" "$TK_NEWEST"
 check_so "$CT_SO" "$CT_MTIME" "$CT_NEWEST"
+
+# ---- the sanitizer gate -----------------------------------------------------
+# A staged tree that was ASKED for a sanitizer and did not get one is the
+# worst outcome this script can produce, and it is SILENT by construction:
+# every oracle still runs, the scenario still passes, and the leg reports
+# green while observing nothing a plain build would not have observed. That is
+# indistinguishable in a job summary from a sanitizer leg that found no
+# defect -- exactly the `1..0 # SKIP` shape this whole integration was built
+# to eliminate, one level deeper.
+#
+# It is not hypothetical. The flags travel through --with-cc-opt, which nginx
+# will happily accept and pass to a compiler that does not support them (the
+# failure then lands in the MAKE, which is caught) -- but also through a
+# ./configure that silently drops them if a future auto/ script rewrites
+# CC_OPT, and through a --src reuse where a previously-configured tree's
+# objs/Makefile is regenerated but a stale binary survives a partial make.
+#
+# The check is the SAME detection testkit's lib.sh:244 uses to decide
+# PROBER_SANITIZED, deliberately: if this gate and the harness disagree, the
+# harness wins at runtime and this script's verdict was a lie. Matching it
+# means a tree that passes here is a tree the harness will also call
+# sanitized. All three objects are checked, not just the server -- nginx core
+# and the two dynamic modules are separate link units, and a .so built
+# without the flags loads into a sanitized server without complaint while
+# leaving this module's own code entirely uninstrumented.
+if [ "$SANITIZE" -eq 1 ]; then
+    for obj in "$SERVER_BIN" "$TK_SO" "$CT_SO"; do
+        path="$STAGE_DIR/objs/$obj"
+        [ -f "$path" ] || continue   # already reported MISSING above
+        if ! grep -qa '__asan_\|__ubsan_' "$path"; then
+            echo "testkit-stage: NOT SANITIZED $obj" >&2
+            echo "  --sanitizer was requested but $path carries no ASan/UBSan runtime" >&2
+            echo "  (same detection testkit's lib.sh:244 uses for PROBER_SANITIZED)" >&2
+            echo "  a scenario run against this tree would report green while observing nothing" >&2
+            status=3
+        fi
+    done
+fi
+
+# The converse also matters, and costs one grep: an UNsanitized stage that
+# picked up the runtime anyway means CFLAGS leaked in from the environment,
+# and the "unsanitized leg" is quietly measuring a sanitized process. The
+# consumer-cache-turbo oracles are allocation-neutrality assertions; ASan's
+# quarantine and shadow bookkeeping move exactly the numbers they read (the
+# harness documents a master that grows 21 pages unsanitized and 402 under
+# ASan). A leg mislabelled in this direction does not fail -- it reports
+# different numbers and invites someone to "fix" the oracle.
+if [ "$SANITIZE" -eq 0 ] && [ -f "$STAGE_DIR/objs/$SERVER_BIN" ]; then
+    if grep -qa '__asan_\|__ubsan_' "$STAGE_DIR/objs/$SERVER_BIN"; then
+        echo "testkit-stage: UNEXPECTEDLY SANITIZED $SERVER_BIN" >&2
+        echo "  --sanitizer was NOT requested, but the binary carries an ASan/UBSan runtime" >&2
+        echo "  a sanitizer almost certainly leaked in via CFLAGS/CC in the environment" >&2
+        echo "  the allocation-neutrality oracles read numbers the sanitizer itself moves" >&2
+        status=3
+    fi
+fi
 
 if [ "$status" -ne 0 ]; then
     exit "$status"
