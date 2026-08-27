@@ -8,6 +8,7 @@
 [![CodeQL](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/codeql.yml/badge.svg)](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/codeql.yml)
 [![A/UBSan](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/asan.yml/badge.svg)](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/asan.yml)
 [![Testkit](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/testkit.yml/badge.svg)](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/testkit.yml)
+[![Testkit Valgrind](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/testkit-valgrind.yml/badge.svg)](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/testkit-valgrind.yml)
 [![CI Deep](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/ci-deep.yml/badge.svg)](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/ci-deep.yml)
 
 A built-in page cache for nginx. Think of it as a tiny Varnish that lives
@@ -35,6 +36,7 @@ durations and the command to re-derive them live in `ci.yml`'s header comment.
 | [CodeQL](.github/workflows/codeql.yml) | CodeQL over the module TU; keeps its own monthly `schedule:` |
 | [A/UBSan](.github/workflows/asan.yml) | ASan+UBSan single-process and multi-worker soaks, static `--add-module` build |
 | [Testkit](.github/workflows/testkit.yml) | the [nginx-module-testkit](https://github.com/myguard-labs/nginx-module-testkit) prober leg: per-request allocation neutrality read out of the cycle pool, asserted in both directions (a staged tree must assert, an unstaged one must SKIP cleanly) |
+| [Testkit Valgrind](.github/workflows/testkit-valgrind.yml) | weekly: the same prober scenarios as Testkit, staged as a plain DEBUG build and run under valgrind memcheck instead of the probe's own fd/pool-delta accounting, asserted in both directions the same way |
 | [CI Deep](.github/workflows/ci-deep.yml) | monthly: long fuzz campaigns, memcheck and helgrind soaks, the nginx/angie compatibility matrix |
 | [Bump versions](.github/workflows/bump.yml) | weekly refresh of the pinned nginx/angie versions and verified archive digests |
 
@@ -98,6 +100,32 @@ reach for — an LSan suppression file — is rejected here: `leak:ngx_create_po
 and `leak:main` were both disproven by negative control, and they suppress real
 module leaks along with the noise. This leg targets what ASan and UBSan catch at
 the moment it happens.
+
+#### Under valgrind (weekly)
+
+`--valgrind` stages and runs a third tree: a plain `--with-debug` build with
+nginx's own pool poisoner on (`NGX_DEBUG_PALLOC=1`), and **no** sanitizer
+flags — valgrind memcheck and ASan both intercept the allocator, and running
+one under the other is unsupported and produces noise, not signal:
+
+```sh
+ci/tools/testkit-stage.sh --valgrind   # .build/nginx-<ver>-testkit-valgrind
+ci/tools/testkit-run.sh   --valgrind
+```
+
+Same separate-directory, same-two-directions discipline as `--sanitizer`
+above: a distinct `-testkit-valgrind` stage tree, verified by grepping the
+built objects to confirm they carry **no** ASan/UBSan runtime, run in both
+directions (a staged tree must assert under memcheck, an unstaged one must
+still SKIP cleanly under the same flags). The flag set exported around each
+scenario — `PROBER_VALGRIND`'s exact memcheck invocation and
+`PROBER_TIMEOUT_SCALE=40` — is copied verbatim from testkit's own
+`ci/prober/valgrind-scenarios.sh`, not re-derived; see that script's header
+in the [nginx-module-testkit](https://github.com/myguard-labs/nginx-module-testkit)
+repo for why each flag is there. This leg runs weekly
+([Testkit Valgrind](.github/workflows/testkit-valgrind.yml)), not on every
+PR: memcheck is 20-50x slower than native, so the whole scenario tree under
+it is minutes, not seconds.
 
 #### Scenarios authored in this repo
 
