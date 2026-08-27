@@ -1,4 +1,4 @@
-# sync-sha: aa5ed120871b6769ebebc221f5e46caf964552e9359a88f0de6a04dda3cf3f2d
+# sync-sha: fca183532239244ef9c5624dfad57db6284101c61bb969ac9426c4f865fdd4cd
 name: CI Deep
 
 # Exhaustive dynamic analysis — monthly cron + on-demand only, NEVER on PR.
@@ -898,14 +898,21 @@ jobs:
           # rss-slope uses cache_turbo_probe (like shm-coherence-varidx);
           # reload-mid-upload deliberately stays on the default test_ref_probe
           # (see its nginx.conf header) because cache_turbo_probe's zone
-          # pointer is a process-lifetime static that cannot survive a SECOND
-          # config parse -- CTPROBE-STATIC-ZONE-NO-RELOAD, memory/labs/
-          # nginx-cache-turbo-module/issues.md -- and reload-mid-upload's one
-          # SIGHUP is exactly that second parse.
+          # pointer used to be a process-lifetime static that could not
+          # survive a SECOND config parse -- CTPROBE-STATIC-ZONE-NO-RELOAD,
+          # memory/labs/nginx-cache-turbo-module/issues.md -- and
+          # reload-mid-upload's one SIGHUP is exactly that second parse.
+          #
+          # reload-cycle (S26) is the fix for that finding, ported here for
+          # the same reason as rss-slope/reload-mid-upload: it is an 8-SIGHUP
+          # series, not single-shot. It is the first scenario to route
+          # @PROBE@ at cache_turbo_probe ACROSS a reload -- see its own
+          # header comment for the RED-before/GREEN-after proof against
+          # CTPROBE-STATIC-ZONE-NO-RELOAD.
           ci/tools/testkit-run.sh --version "$NGINX_VERSION" --sanitizer \
             --port "$TEST_BASE_PORT" \
             -- consumer-cache-turbo l2-cross-instance-fill \
-               shm-coherence-varidx rss-slope reload-mid-upload
+               shm-coherence-varidx rss-slope reload-mid-upload reload-cycle
 
       - name: Notify Discord on failure
         if: failure() && github.event_name == 'schedule'

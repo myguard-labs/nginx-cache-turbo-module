@@ -113,6 +113,58 @@ ngx_http_cache_turbo_probe_hooks_register(void)
 
 
 /*
+ * Clear the zone pointer at the start of every config parse, so the
+ * directive handler's duplicate guard (below) tests THIS parse rather than
+ * the module's own registration from a previous one.
+ *
+ * WHY THIS IS THE RIGHT RESET POINT
+ *   ngx_http_cache_turbo_probe_zone is process-lifetime storage, but nginx's
+ *   config lifecycle is not process-lifetime: ngx_http_block() runs every
+ *   NGX_HTTP_MODULE's preconfiguration hook, THEN calls ngx_conf_parse(),
+ *   THEN runs postconfiguration -- for every parse, including a SIGHUP
+ *   reload, which builds a brand-new cycle from scratch. A static cleared
+ *   only once (e.g. at module load) or never at all stays set forever, so
+ *   the SECOND parse's directive handler finds it already non-NULL and
+ *   refuses with "is duplicate" -- rejecting every reload, not just a
+ *   conf that actually names the directive twice.
+ *
+ *   Calling this from preconfiguration -- which runs before ngx_conf_parse
+ *   on EVERY parse, the first one included -- means the guard in
+ *   ngx_http_cache_turbo_probe() still sees NULL exactly once per parse and
+ *   non-NULL on a genuine second `cache_turbo_probe` line in the same conf.
+ *   That is the behaviour the duplicate guard exists for; only the "which
+ *   parse" scope was wrong, not the guard itself.
+ *
+ * WHY THIS IS SAFE ACROSS A FAILED RELOAD
+ *   A SIGHUP builds the new cycle inside ngx_init_cycle(), which runs this
+ *   reset (via preconfiguration) against the NEW cycle's ngx_conf_t before
+ *   anything else. If parsing or init then fails, ngx_init_cycle() returns
+ *   NULL and the master reverts to running the OLD ngx_cycle_t unchanged --
+ *   it never signals the old workers to exit or re-fork. Each running
+ *   worker is a fork() of an ancestor master from the LAST SUCCESSFUL parse,
+ *   so its own copy of this static (in its own address space) was set
+ *   correctly then and was never touched by the failed attempt: the reset
+ *   above only ever runs in whichever process is currently executing
+ *   ngx_init_cycle(), and a failed reload's version of that process is
+ *   discarded, never forked from. The request-time reader
+ *   (ngx_http_cache_turbo_probe_handler()) therefore always sees a valid
+ *   pointer to the zone actually backing its own process's config -- old
+ *   zone in workers that kept running an old config, new zone in workers
+ *   started after a successful reload -- never a dangling one.
+ *
+ *   The master process's own copy is left cleared (or pointing at a
+ *   half-parsed new cycle) after a failed attempt, but the master never
+ *   serves probe requests, and the next reload attempt clears it again via
+ *   this same hook before its directive handler runs.
+ */
+void
+ngx_http_cache_turbo_probe_zone_reset(void)
+{
+    ngx_http_cache_turbo_probe_zone = NULL;
+}
+
+
+/*
  * Append this module's shared counters to the probe's "zone" object.
  *
  * CONTRACT (ngx_test_probe_hooks_t): the generic members are already rendered

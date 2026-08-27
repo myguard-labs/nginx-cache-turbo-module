@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Copyright (C) 2026 Thijs Eilander
+# SPDX-License-Identifier: BSD-2-Clause
+#
+# Same two-part gate as fault-slab-store/requires: this scenario's conf
+# loads cache_turbo unconditionally AND its whole point is exercising
+# cache_turbo_probe, which only exists in an NGX_TEST_HARNESS build. A
+# non-harness .so would either fail `nginx -t` outright (no such directive)
+# or, worse, silently degrade -- neither is what this gate should let
+# through as a pass.
+#
+# nonzero exit => run-scenario.sh emits "1..0 # SKIP <stdout of this gate>"
+#
+# run-scenario.sh runs this BEFORE prober_resolve, so PROBER_RESOLVED_BUILD
+# does not exist yet; recompute the same path lib.sh will, taking
+# flavor/version from argv ($2/$3) with the same defaults as the sibling
+# gates.
+FLAVOR="${2:-nginx}"
+VERSION="${3:-1.31.3}"
+BUILD="${PROBER_BUILD:-${PROBER_ROOT:-.}/.build/${FLAVOR}-${VERSION}}"
+
+SO="$BUILD/objs/ngx_http_cache_turbo_module.so"
+
+if [ ! -f "$SO" ]; then
+    echo "cache_turbo module .so not found in $BUILD/objs -- this scenario's conf load_modules it unconditionally, so this tree cannot run it (stage with ci/tools/testkit-stage.sh)"
+    exit 1
+fi
+
+if ! command -v nm >/dev/null 2>&1; then
+    echo "no nm on PATH -- cannot verify that $SO is an NGX_TEST_HARNESS build, and guessing would let a non-harness .so reach a conf whose cache_turbo_probe directive it does not implement"
+    exit 1
+fi
+
+if ! nm "$SO" 2>/dev/null | grep -q 'ngx_http_cache_turbo_probe_hooks_register'; then
+    echo "$SO carries no ngx_http_cache_turbo_probe_hooks_register -- it was built WITHOUT NGX_TEST_HARNESS, so it exports no cache_turbo_probe directive (stage with ci/tools/testkit-stage.sh, which configures testkit's t/module into the same tree and that is what defines the macro)"
+    exit 1
+fi
+
+exit 0

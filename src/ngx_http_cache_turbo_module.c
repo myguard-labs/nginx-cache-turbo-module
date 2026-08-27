@@ -5486,6 +5486,20 @@ ngx_http_cache_turbo_add_variables(ngx_conf_t *cf)
 {
     ngx_http_variable_t  *var;
 
+#ifdef NGX_TEST_HARNESS
+    /* Clear the probe's zone static before this parse's directives run, so
+     * the `cache_turbo_probe` duplicate guard tests THIS parse rather than
+     * a prior one (e.g. the config generation before a SIGHUP reload) --
+     * see ngx_http_cache_turbo_probe_zone_reset()'s comment in
+     * ngx_http_cache_turbo_probe.c for why preconfiguration is the correct
+     * reset point and why this is safe across a failed reload. Placed here,
+     * in the module's existing preconfiguration hook, rather than adding a
+     * dedicated one: nginx runs exactly one preconfiguration callback per
+     * NGX_HTTP_MODULE, and this slot already runs unconditionally, once per
+     * parse, before ngx_conf_parse(). */
+    ngx_http_cache_turbo_probe_zone_reset();
+#endif
+
     var = ngx_http_add_variable(cf, &ngx_http_cache_turbo_normalized_args_name,
                                 0);
     if (var == NULL) {

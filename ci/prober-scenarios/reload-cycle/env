@@ -1,0 +1,16 @@
+# Copyright (C) 2026 Thijs Eilander
+# SPDX-License-Identifier: BSD-2-Clause
+#
+# S26 port of testkit's scenarios/reload-cycle. UNLIKE reload-mid-upload
+# next door, this one DOES use cache_turbo's own probe: proving that
+# cache_turbo_probe survives a live SIGHUP series is the entire point of this
+# scenario. Before S26 (CTPROBE-STATIC-ZONE-NO-RELOAD,
+# memory/labs/nginx-cache-turbo-module/issues.md) the probe zone pointer was
+# a process-lifetime static that the directive handler's duplicate guard
+# rejected on the SECOND config parse -- every reload here would have died
+# at `nginx -t`-equivalent with "cache_turbo_probe is duplicate" before a
+# single HUP was even sent. This scenario is the reload-spanning proof that
+# fix works: it reads cache_turbo's own zone counters (hits/misses/lookups)
+# across a live reload series, which only compiles into a working request at
+# all once the second-parse rejection is gone.
+PROBER_PROBE='cache_turbo_probe ct;'
