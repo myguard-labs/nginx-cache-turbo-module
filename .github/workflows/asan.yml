@@ -1,4 +1,4 @@
-# sync-sha: 77acf678bac245712155e7fbf7280cdd5c7f263213755025275d90066b97798f
+# sync-sha: 495e4e97aef3b3d124e608fac0bb02a066124ac10aadcbd67cf32f8f37dbb77b
 name: ASan and UBSan
 
 # Dedicated ASan+UBSan workflow, PATH-GATED: only runs when a PR/push touches
@@ -121,7 +121,19 @@ jobs:
 
       - name: Run runtime suite under ASan and UBSan (single-process)
         env:
-          ASAN_OPTIONS: detect_leaks=0:halt_on_error=1:abort_on_error=1
+          # detect_leaks=1: leak detection is ON for the long-running server.
+          # The harness (ci/tools/test_runtime_base.py config_check_env())
+          # scopes detect_leaks=0 back down for the handful of short-lived
+          # `nginx -t` / `-s reload` subprocesses it spawns, which exit
+          # without destroying the config-parse pool nginx never frees on
+          # that path -- see that function's docstring and
+          # memory/labs/nginx-cache-turbo-module/issues.md,
+          # SRV-ASAN-ABORT-L2-XFILL, for the root-caused, 0-Direct-leak
+          # verdict that makes this safe. Do NOT add an LSAN_OPTIONS
+          # suppression file here: leak:ngx_create_pool and leak:main were
+          # both tried and DISPROVEN by negative control (issues.md, same
+          # row) -- they are broad enough to also hide a real module leak.
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1:abort_on_error=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
           # An instrumented build is several times slower than a plain one; the
           # default 5s per-request budget is not a real signal here, it just
@@ -224,10 +236,35 @@ jobs:
         # the SAME sanitized binary under nginx's real master + 4-worker model (no
         # --single-process), so a cross-worker shm-zone UAF / race / use of a slab
         # freed by another worker surfaces here that the 1-worker run cannot.
-        # detect_leaks=0 deliberately keeps LSan OFF: nginx frees its pools at exit,
-        # not per-request, so LSan over the worker pool is false-positive-prone with
-        # no real signal — ASan's UAF/overflow checks are the high-value part and
-        # run fully multi-worker here.
+        #
+        # detect_leaks STAYS 0 HERE, unlike the single-process job. That job's
+        # sole process only ever exits once (at the harness's own final
+        # teardown) and was VERIFIED clean under detect_leaks=1. This job is
+        # different in kind, not degree: EVERY worker exit -- a `-s reload`
+        # retiring an old generation, or this job's own final shutdown of all
+        # 4 live workers -- aborts with a NEW LSan false positive, deterministic
+        # and 100% of retiring workers, unrelated to the config-pool one above.
+        # Root cause (verified, not inferred): ngx_event_process_init()
+        # (src/event/ngx_event.c) allocates cycle->connections/read_events/
+        # write_events with raw ngx_alloc() once per worker at startup; no
+        # nginx exit path (ngx_worker_process_exit, ngx_process_cycle.c) ever
+        # frees them -- same "process is about to exit(), OS reclaims it
+        # anyway" pattern as the config pool, just for the per-WORKER tables
+        # instead of the per-CONFIG pool, and with no equivalent to
+        # config_check_env()'s per-invocation env override available: this is
+        # the one long-running Popen'd process the harness starts once and
+        # never re-execs, so its ASAN_OPTIONS is fixed for its whole life.
+        # 0 Direct leaks, every stack rooted in main -> ...
+        # -> ngx_worker_process_init -> ngx_event_process_init -> ngx_alloc.
+        # Full stacks and the options considered (a manual
+        # __lsan_do_recoverable_leak_check() hook + leak_check_at_exit=0; an
+        # nginx-core patch via a new build-time patch step neither this repo
+        # nor its build script has today) are in
+        # memory/labs/nginx-cache-turbo-module/issues.md,
+        # LSAN-WORKER-EXIT-FALSE-POSITIVE. Left OPEN and PARKED rather than
+        # decided solo: per this repo's rule, an nginx-core leak on clean
+        # shutdown that blocks green gets recorded and escalated, not a new
+        # suppression mechanism invented to route around it, however narrow.
         #
         # Wrapped in ci-hang-guard.sh for the same reason as the single-process job:
         # if the suite fails a diagnostics capture preserves nginx logs (error.log)

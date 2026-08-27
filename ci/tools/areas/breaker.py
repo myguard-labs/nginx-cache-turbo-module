@@ -918,7 +918,8 @@ def test_valid_status_rejects_304(ng: Nginx) -> None:
     cmd = ng.runner + [str(ng.binary), "-p", str(bad),
                        "-c", str(bad / "conf" / "nginx.conf"), "-t"]
     r = subprocess.run(cmd, text=True, stdout=subprocess.PIPE,
-                       stderr=subprocess.STDOUT, timeout=20)
+                       stderr=subprocess.STDOUT, timeout=20,
+                       env=config_check_env())
     assert r.returncode != 0, \
         f"standalone 304 was accepted by nginx -t:\n{r.stdout}"
     assert "cannot be cached standalone" in r.stdout, \
@@ -948,7 +949,8 @@ def test_empty_l2_prefix_rejected(ng: Nginx) -> None:
         cmd = ng.runner + [str(ng.binary), "-p", str(bad),
                            "-c", str(bad / "conf" / "nginx.conf"), "-t"]
         r = subprocess.run(cmd, text=True, stdout=subprocess.PIPE,
-                           stderr=subprocess.STDOUT, timeout=20)
+                           stderr=subprocess.STDOUT, timeout=20,
+                           env=config_check_env())
         assert r.returncode != 0, \
             f"empty {name} prefix was accepted by nginx -t:\n{r.stdout}"
         assert "empty prefix" in r.stdout.lower(), \
@@ -1005,7 +1007,8 @@ def test_duplicate_l2_directive_rejected(ng: Nginx) -> None:
         cmd = ng.runner + [str(ng.binary), "-p", str(bad),
                            "-c", str(bad / "conf" / "nginx.conf"), "-t"]
         r = subprocess.run(cmd, text=True, stdout=subprocess.PIPE,
-                           stderr=subprocess.STDOUT, timeout=20)
+                           stderr=subprocess.STDOUT, timeout=20,
+                           env=config_check_env())
         assert r.returncode != 0, \
             f"duplicate {name} directive was accepted by nginx -t:\n{r.stdout}"
         assert "is duplicate" in r.stdout, \

@@ -146,6 +146,44 @@ SANITIZER_MARKERS = (
 )
 
 
+def config_check_env() -> dict[str, str]:
+    """Environment for a short-lived `nginx -t` (or the config-parse phase of
+    `-s reload`) subprocess -- everywhere this module invokes nginx WITHOUT
+    starting the long-running server under test.
+
+    nginx's main() always calls ngx_init_cycle() to parse the config before
+    branching on ngx_test_config / ngx_signal, and BOTH of those branches
+    return straight out of main() (src/core/nginx.c) without ever calling
+    ngx_destroy_pool() on the cycle it just built -- unlike a master/worker
+    exit, which does (ngx_process_cycle.c). LeakSanitizer therefore reports
+    the ENTIRE config parse -- nginx core, OpenSSL's one-time init, and this
+    module's own config-time allocations (e.g. cookie_ac_prepare's
+    Aho-Corasick table) -- as leaked on every single `-t`/`-s` invocation.
+    Root-caused and confirmed (0 Direct / all Indirect, every stack rooted in
+    main -> ngx_init_cycle -> ngx_conf_parse) in
+    memory/labs/nginx-cache-turbo-module/issues.md, SRV-ASAN-ABORT-L2-XFILL:
+    that is upstream shutdown behaviour on this one code path, not a leak a
+    module can fix or a bug to chase.
+
+    Scoping detect_leaks=0 to just these short-lived processes -- instead of
+    for the whole suite -- is what lets the actual long-running server (which
+    DOES destroy its pools on exit) run with real leak detection ON. Do not
+    "fix" this with an LSan suppression file: leak:ngx_create_pool and
+    leak:main were both tried and DISPROVEN by negative control -- LSan
+    matches a suppression against ANY frame on the allocation stack, and both
+    entries are broad enough to also hide a genuine leak in this module's own
+    long-running allocations.
+
+    detect_leaks=0 is appended LAST: ASan's flag parser takes the last
+    occurrence of a repeated key, so this always wins over whatever
+    detect_leaks the caller's environment (a workflow env: block, this
+    process's own ASAN_OPTIONS) set for the real server run."""
+    env = dict(os.environ)
+    opts = env.get("ASAN_OPTIONS", "")
+    env["ASAN_OPTIONS"] = f"{opts}:detect_leaks=0" if opts else "detect_leaks=0"
+    return env
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--nginx-binary", required=True)
@@ -442,9 +480,12 @@ class Nginx:
         return self.runner + cmd
 
     def config_test(self) -> None:
+        # config_check_env(): a bare `-t` exits without destroying the cycle
+        # pool it just built, so under detect_leaks=1 this reports the entire
+        # config parse as leaked -- see the function's docstring.
         r = subprocess.run(self.command(test=True), text=True,
                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                           timeout=20)
+                           timeout=20, env=config_check_env())
         if r.returncode != 0:
             raise RuntimeError(f"nginx -t failed:\n{r.stdout}")
 
@@ -506,12 +547,16 @@ class Nginx:
         # config error.
         self.config_test()
 
+        # This client-side `-s reload` invocation re-parses the whole config
+        # via its own ngx_init_cycle() (to locate the running master) and then
+        # exits via ngx_signal_process() -- the same exit-without-destroying-
+        # the-cycle-pool path as `-t`, so it needs the same scoped env.
         r = subprocess.run(
             self.runner + [str(self.binary), "-p", str(self.root),
                            "-c", str(self.root / "conf" / "nginx.conf"),
                            "-s", "reload"],
             text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            timeout=20)
+            timeout=20, env=config_check_env())
         if r.returncode != 0:
             raise RuntimeError(f"nginx -s reload failed:\n{r.stdout}")
 
@@ -1458,7 +1503,8 @@ def _config_test_result(ng: Nginx, mutate, *, expect_unchanged: bool = False) ->
     cmd = ng.runner + [str(ng.binary), "-p", str(bad),
                        "-c", str(bad / "conf" / "nginx.conf"), "-t"]
     return subprocess.run(cmd, text=True, stdout=subprocess.PIPE,
-                          stderr=subprocess.STDOUT, timeout=20)
+                          stderr=subprocess.STDOUT, timeout=20,
+                          env=config_check_env())
 
 
 def _fetch_keepalive(conn: http.client.HTTPConnection, path: str,
@@ -1561,7 +1607,8 @@ def _config_rejects(ng: Nginx, tag: str, old: str, new: str, want: str) -> None:
     cmd = ng.runner + [str(ng.binary), "-p", str(bad),
                        "-c", str(bad / "conf" / "nginx.conf"), "-t"]
     r = subprocess.run(cmd, text=True, stdout=subprocess.PIPE,
-                       stderr=subprocess.STDOUT, timeout=20)
+                       stderr=subprocess.STDOUT, timeout=20,
+                       env=config_check_env())
     assert r.returncode != 0, \
         f"{tag}: config was ACCEPTED by nginx -t but must be rejected:\n{r.stdout}"
     assert want in r.stdout, \
@@ -1580,7 +1627,8 @@ def _config_accepts(ng: Nginx, tag: str, old: str, new: str) -> None:
     cmd = ng.runner + [str(ng.binary), "-p", str(good),
                        "-c", str(good / "conf" / "nginx.conf"), "-t"]
     r = subprocess.run(cmd, text=True, stdout=subprocess.PIPE,
-                       stderr=subprocess.STDOUT, timeout=20)
+                       stderr=subprocess.STDOUT, timeout=20,
+                       env=config_check_env())
     assert r.returncode == 0, \
         f"{tag}: config was REJECTED by nginx -t but must be accepted:\n{r.stdout}"
 

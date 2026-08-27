@@ -1818,7 +1818,8 @@ def test_invalid_backend_name(ng: Nginx) -> None:
     cmd = ng.runner + [str(ng.binary), "-p", str(bad),
                        "-c", str(bad / "conf" / "nginx.conf"), "-t"]
     r = subprocess.run(cmd, text=True, stdout=subprocess.PIPE,
-                       stderr=subprocess.STDOUT, timeout=20)
+                       stderr=subprocess.STDOUT, timeout=20,
+                       env=config_check_env())
     assert r.returncode != 0, \
         f"invalid backend 'bogus' was accepted by nginx -t:\n{r.stdout}"
     assert "unknown cache_turbo_backend" in r.stdout, \
@@ -1876,7 +1877,8 @@ def _config_warns(ng: Nginx, tag: str, old: str, new: str, want: str) -> None:
     cmd = ng.runner + [str(ng.binary), "-p", str(warn),
                        "-c", str(warn / "conf" / "nginx.conf"), "-t"]
     r = subprocess.run(cmd, text=True, stdout=subprocess.PIPE,
-                       stderr=subprocess.STDOUT, timeout=20)
+                       stderr=subprocess.STDOUT, timeout=20,
+                       env=config_check_env())
     assert r.returncode == 0, \
         f"{tag}: config was REJECTED by nginx -t but must still load:\n{r.stdout}"
     assert want in r.stdout, \
@@ -1976,7 +1978,8 @@ def test_breaker_policy_identical_no_warning(ng: Nginx) -> None:
     cmd = ng.runner + [str(ng.binary), "-p", str(good),
                        "-c", str(good / "conf" / "nginx.conf"), "-t"]
     r = subprocess.run(cmd, text=True, stdout=subprocess.PIPE,
-                       stderr=subprocess.STDOUT, timeout=20)
+                       stderr=subprocess.STDOUT, timeout=20,
+                       env=config_check_env())
     assert r.returncode == 0, \
         f"identical breaker tuples: config was REJECTED:\n{r.stdout}"
     assert "circuit breaker" not in r.stdout, \
