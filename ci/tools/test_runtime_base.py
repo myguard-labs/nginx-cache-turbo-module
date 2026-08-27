@@ -166,10 +166,20 @@ def config_check_env() -> dict[str, str]:
     module can fix or a bug to chase.
 
     Scoping detect_leaks=0 to just these short-lived processes -- instead of
-    for the whole suite -- is what lets the actual long-running server (which
-    DOES destroy its pools on exit) run with real leak detection ON. Do not
-    "fix" this with an LSan suppression file: leak:ngx_create_pool and
-    leak:main were both tried and DISPROVEN by negative control -- LSan
+    for the whole suite -- is one half of what lets the actual long-running
+    server run with real leak detection ON. The OTHER half is in the module:
+    the server's own exit path leaks nginx core's per-process event tables
+    (ngx_event_process_init(), never freed on ANY nginx exit path), which
+    ngx_http_cache_turbo_exit_process() exempts by pointer with
+    __lsan_ignore_object() -- see the LSAN-CORE-EVENT-TABLES block in
+    src/ngx_http_cache_turbo_blob.c. Note the server's exit is NOT clean of
+    its own accord: an earlier version of this comment claimed it "DOES
+    destroy its pools on exit" and therefore needed nothing, which is true of
+    the cycle POOL and false of those three raw ngx_alloc() tables that live
+    outside it. That mistake is what made the single-process leak leg red.
+
+    Do not "fix" this with an LSan suppression file: leak:ngx_create_pool
+    and leak:main were both tried and DISPROVEN by negative control -- LSan
     matches a suppression against ANY frame on the allocation stack, and both
     entries are broad enough to also hide a genuine leak in this module's own
     long-running allocations.
@@ -471,6 +481,9 @@ class Nginx:
         self.redis_tls_expired_port = redis_tls_expired_port
         self.process: subprocess.Popen | None = None
         self.output_path = root / "nginx-output.log"
+        # AUD-LSANLOG: prefix for ASan/LSan's own log_path (see server_env()).
+        # The runtime appends ".<pid>", so this is a PREFIX, not a file.
+        self.asan_log_prefix = root / "asan-report"
 
     def write_config(self, sr_off: bool = False) -> None:
         workers = 1 if self.single_process else 4
@@ -508,12 +521,59 @@ class Nginx:
         if r.returncode != 0:
             raise RuntimeError(f"nginx -t failed:\n{r.stdout}")
 
+    def server_env(self) -> dict[str, str]:
+        """Environment for the LONG-RUNNING server (the opposite end of
+        config_check_env(), which is for the short-lived `nginx -t`/`-s` calls).
+
+        Adds log_path so an ASan/UBSan/LSan report is still readable after
+        nginx takes fd 2 away from us. nginx calls ngx_log_redirect_stderr()
+        during startup (src/core/ngx_log.c:439), which dup2()s the error_log's
+        fd over STDERR_FILENO. The sanitizer runtime writes its report to fd 2,
+        so from that moment on the report goes wherever error_log points -- and
+        an abort during shutdown lands there, or nowhere the harness looks.
+
+        This is not theoretical: the CI abort this exists for
+        (SRV-ASAN-ABORT-L2-XFILL) surfaced as a bare `nginx exited with -6` with
+        the LSan text in NEITHER nginx-output.log NOR logs/error.log, which is
+        what made it undiagnosable from the job log. Reproduced locally, and
+        setting log_path is what made the report appear.
+
+        log_path takes a PREFIX; the runtime writes "<prefix>.<pid>". Appended
+        LAST so it wins over any log_path in the caller's environment."""
+        env = dict(os.environ)
+        opts = env.get("ASAN_OPTIONS", "")
+        setting = f"log_path={self.asan_log_prefix}"
+        env["ASAN_OPTIONS"] = f"{opts}:{setting}" if opts else setting
+        return env
+
+    def sanitizer_reports(self) -> list[pathlib.Path]:
+        """Every "<asan_log_prefix>.<pid>" file this server's runtime wrote."""
+        parent = self.asan_log_prefix.parent
+        if not parent.is_dir():
+            return []
+        return sorted(parent.glob(self.asan_log_prefix.name + ".*"))
+
+    def diagnostics(self) -> str:
+        """All three places a failure can leave text, concatenated: our own
+        stdout/stderr capture, nginx's error_log (which nginx dup2()s fd 2 to),
+        and the sanitizer's own log_path files. stop() and assert_clean_logs()
+        both read this, so neither can miss a report for lack of looking."""
+        parts = []
+        for p in [self.output_path, self.root / "logs" / "error.log",
+                  *self.sanitizer_reports()]:
+            if p.exists():
+                text = p.read_text(encoding="utf-8", errors="replace")
+                if text:
+                    parts.append(f"--- {p} ---\n{text}")
+        return "\n".join(parts)
+
     def start(self) -> None:
         self.write_config()
         out = self.output_path.open("a", encoding="utf-8")
         self.process = _track(subprocess.Popen(self.command(), text=True,
                                         stdout=out,
-                                        stderr=subprocess.STDOUT))
+                                        stderr=subprocess.STDOUT,
+                                        env=self.server_env()))
         out.close()
         try:
             wait_port(self.port)
@@ -606,15 +666,13 @@ class Nginx:
         rc = self.process.returncode
         self.process = None
         if rc not in (0, -signal.SIGTERM):
-            out = (self.output_path.read_text(encoding="utf-8", errors="replace")
-                   if self.output_path.exists() else "")
-            raise RuntimeError(f"nginx exited with {rc}:\n{out}")
+            # diagnostics(), not output_path alone: a sanitizer abort writes to
+            # its own log_path file and/or nginx's error_log, never necessarily
+            # to our stdout capture -- see server_env().
+            raise RuntimeError(f"nginx exited with {rc}:\n{self.diagnostics()}")
 
     def assert_clean_logs(self) -> None:
-        paths = [self.output_path, self.root / "logs" / "error.log"]
-        combined = "\n".join(
-            p.read_text(encoding="utf-8", errors="replace")
-            for p in paths if p.exists())
+        combined = self.diagnostics()
         for marker in SANITIZER_MARKERS:
             if marker == "ERROR SUMMARY:" and "ERROR SUMMARY: 0 errors" in combined:
                 continue

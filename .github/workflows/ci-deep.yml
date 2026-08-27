@@ -1,4 +1,4 @@
-# sync-sha: f0390de0018787ee17e57cd4b32406a4bb8b6b4c2d6430e834aeb539396055de
+# sync-sha: dc0bcd0510b0423c2410b41e534e75d44bd00c13c8873c169e6b05b6c182e94c
 name: CI Deep
 
 # Exhaustive dynamic analysis — monthly cron + on-demand only, NEVER on PR.
@@ -690,20 +690,17 @@ jobs:
 
       - name: Run multi-worker fault-injection suite N times (fail-fast)
         env:
-          # detect_leaks STAYS 0 HERE: this job runs the SAME multi-worker
-          # topology as asan.yml's CI-3 job (no --single-process), which
-          # deterministically aborts a retiring worker under detect_leaks=1
-          # -- a nginx-core false positive unrelated to the config-pool one,
-          # NOT fixed by config_check_env() (that scopes the harness's own
-          # short-lived `nginx -t` / `-s reload` calls; this fires inside the
-          # long-running server's own worker exit, which has no equivalent
-          # per-invocation env hook). See asan.yml's CI-3 job for the full
-          # root cause and memory/labs/nginx-cache-turbo-module/issues.md,
-          # LSAN-WORKER-EXIT-FALSE-POSITIVE, for stacks and options -- parked
-          # pending a decision, not solved with a new suppression mechanism.
-          # asan.yml's single-process job (no worker exits until the very
-          # end, verified clean) is the one leg that runs detect_leaks=1
-          # today.
+          # detect_leaks STAYS 0 HERE, tracking asan.yml's CI-3 job, which
+          # runs the SAME multi-worker topology (no --single-process). The
+          # nginx-core false positive both hit -- ngx_event_process_init()'s
+          # three never-freed per-process tables -- is now exempted by
+          # pointer in the module's exit_process hook
+          # (LSAN-CORE-EVENT-TABLES, src/ngx_http_cache_turbo_blob.c), which
+          # nginx also calls on the worker exit path. Turning the flag on for
+          # the multi-worker topology is nevertheless a separate, not-yet-run
+          # change; see asan.yml's CI-3 comment for why it is not being
+          # flipped as a side effect, and TODO.md for the item. asan.yml's
+          # single-process job is the one leg running detect_leaks=1 today.
           ASAN_OPTIONS: detect_leaks=0:halt_on_error=1:abort_on_error=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
           # Instrumented latency is not a signal -- see asan.yml. An 8-iteration

@@ -208,9 +208,15 @@ fi
 # stayed off" to "aborts on testkit's own nginx -t before a single oracle
 # runs" -- strictly worse. The reasoning, so nobody "fixes" it later:
 #
-#   * nginx NEVER frees its configuration pool. LSan therefore reports the
-#     entire config parse as leaked on `nginx -t` and on every clean shutdown.
-#     That is upstream process-lifetime allocation, not a module defect.
+#   * nginx NEVER frees its configuration pool on the `nginx -t` / `-s`
+#     paths, so LSan reports the entire config parse as leaked there. (On a
+#     real server shutdown the cycle pool IS destroyed; what leaks there
+#     instead is ngx_event_process_init()'s three raw ngx_alloc() tables,
+#     which the module now exempts by pointer -- LSAN-CORE-EVENT-TABLES in
+#     src/ngx_http_cache_turbo_blob.c. That fix does NOT rescue this leg:
+#     the abort here is on testkit's internal `nginx -t`, i.e. the config
+#     pool, which is a different allocation on a different path.) Either way
+#     it is upstream process-lifetime allocation, not a module defect.
 #   * The obvious workaround -- an LSan suppression file -- is BANNED here.
 #     This repo carried `leak:ngx_create_pool` and `leak:main`, and cycle 8
 #     DISPROVED both by negative control: they suppress REAL module leaks, not
