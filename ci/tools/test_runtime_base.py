@@ -174,13 +174,32 @@ def config_check_env() -> dict[str, str]:
     entries are broad enough to also hide a genuine leak in this module's own
     long-running allocations.
 
-    detect_leaks=0 is appended LAST: ASan's flag parser takes the last
-    occurrence of a repeated key, so this always wins over whatever
-    detect_leaks the caller's environment (a workflow env: block, this
-    process's own ASAN_OPTIONS) set for the real server run."""
+    detect_leaks=0 is appended LAST to BOTH ASAN_OPTIONS and LSAN_OPTIONS.
+    Within one variable, the flag parser takes the last occurrence of a
+    repeated key, so appending always wins over whatever detect_leaks the
+    caller's environment (a workflow env: block, this process's own
+    ASAN_OPTIONS) set for the real server run.
+
+    LSAN_OPTIONS has to be overridden too, and it is not redundant: with the
+    integrated ASan+LSan runtime, InitializeFlags() parses LSAN_OPTIONS AFTER
+    ASAN_OPTIONS, so detect_leaks in LSAN_OPTIONS beats detect_leaks in
+    ASAN_OPTIONS no matter what order we write them in. Verified against the
+    real runtime rather than the documentation:
+
+        ASAN_OPTIONS=detect_leaks=0 LSAN_OPTIONS=detect_leaks=1 ./leaky
+            -> LeakSanitizer report (LSAN_OPTIONS wins)
+        ASAN_OPTIONS=detect_leaks=0 ./leaky
+            -> no report
+
+    Nothing in this repo sets LSAN_OPTIONS today, so touching only
+    ASAN_OPTIONS would be correct right now and would silently stop being
+    correct the moment someone exported one -- and the failure mode is the
+    whole suite aborting on `nginx -t` again, which is exactly the trap this
+    function exists to close."""
     env = dict(os.environ)
-    opts = env.get("ASAN_OPTIONS", "")
-    env["ASAN_OPTIONS"] = f"{opts}:detect_leaks=0" if opts else "detect_leaks=0"
+    for var in ("ASAN_OPTIONS", "LSAN_OPTIONS"):
+        opts = env.get(var, "")
+        env[var] = f"{opts}:detect_leaks=0" if opts else "detect_leaks=0"
     return env
 
 

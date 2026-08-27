@@ -191,10 +191,12 @@ if [ "$SANITIZE" -eq 1 ] && [ "$EXPECT_SKIP" -eq 0 ]; then
 fi
 
 # ---- detect_leaks: a deliberate decision, not an omission -------------------
-# LEFT OFF, unlike this repo's own asan.yml/ci-deep.yml runtime legs (see
-# ci/tools/test_runtime_base.py config_check_env()), which turned leak
-# detection ON by scoping detect_leaks=0 to just their short-lived `nginx -t`
-# / `-s reload` subprocesses while leaving it on for the real server. That
+# LEFT OFF, unlike asan.yml's single-process runtime job -- the ONE job in
+# this repo that runs detect_leaks=1 (see ci/tools/test_runtime_base.py
+# config_check_env()), by scoping detect_leaks=0 down to just its short-lived
+# `nginx -t` / `-s reload` subprocesses while leaving it on for the real
+# server. Every other sanitized leg, including ci-deep.yml's asan-soak and
+# this one, is still detect_leaks=0. That
 # trick needs a per-invocation env override, which this leg CANNOT make:
 # testkit's prober_heap_env (nginx-module-testkit ci/prober/lib.sh:241 -- NOT
 # this repo, out of scope for this change) exports ONE ASAN_OPTIONS for the
