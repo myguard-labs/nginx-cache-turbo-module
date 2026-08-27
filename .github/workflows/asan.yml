@@ -1,4 +1,4 @@
-# sync-sha: 699dfeb58d9140d4eeb98a61325d06982747702ffa4c83d5990a6ac37ebf01d0
+# sync-sha: 7b5c95f1f07d6dcec0ee4041dbc6c4a16ca75bf3aca4f4b9a22686378b2c974a
 name: ASan and UBSan
 
 # Dedicated ASan+UBSan workflow, PATH-GATED: only runs when a PR/push touches
@@ -259,37 +259,49 @@ jobs:
         # --single-process), so a cross-worker shm-zone UAF / race / use of a slab
         # freed by another worker surfaces here that the 1-worker run cannot.
         #
-        # detect_leaks STAYS 0 HERE, unlike the single-process job. That job's
-        # sole process only ever exits once (at the harness's own final
-        # teardown) and was VERIFIED clean under detect_leaks=1. This job is
-        # different in kind, not degree: EVERY worker exit -- a `-s reload`
-        # retiring an old generation, or this job's own final shutdown of all
-        # 4 live workers -- aborts with a NEW LSan false positive, deterministic
-        # and 100% of retiring workers, unrelated to the config-pool one above.
-        # Root cause (verified, not inferred): ngx_event_process_init()
+        # detect_leaks=1 HERE TOO, same as the single-process job. It was 0
+        # for one cycle while the multi-worker topology went unverified; it has
+        # now been measured and the flag is on.
+        #
+        # WHAT MADE IT SAFE: ngx_event_process_init()
         # (src/event/ngx_event.c:755/762/774) allocates cycle->connections/
-        # read_events/write_events with raw ngx_alloc() once per worker at
-        # startup; no nginx exit path ever frees them -- same "process is
-        # about to exit(), OS reclaims it anyway" pattern as the config pool,
-        # for the per-WORKER tables instead of the per-CONFIG pool.
+        # read_events/write_events with raw ngx_alloc() once per worker, and no
+        # nginx exit path frees them -- they live outside the cycle pool, so
+        # ngx_destroy_pool never reaches them. The module's exit_process hook
+        # exempts exactly those three POINTERS with __lsan_ignore_object()
+        # (LSAN-CORE-EVENT-TABLES in src/ngx_http_cache_turbo_blob.c), and nginx
+        # calls exit_process on the worker path too (ngx_worker_process_exit,
+        # ngx_process_cycle.c:947) -- not just the single-process one.
         #
-        # That specific false positive is NO LONGER unaddressed: the module's
-        # exit_process hook now exempts exactly those three pointers with
-        # __lsan_ignore_object() (LSAN-CORE-EVENT-TABLES in
-        # src/ngx_http_cache_turbo_blob.c), and nginx calls exit_process on
-        # the worker path too (ngx_worker_process_exit, ngx_process_cycle.c
-        # :946) -- not just the single-process one. So the mechanism that
-        # unblocked the single-process leg applies here in principle.
+        # THE OPEN QUESTION IS ANSWERED (VERIFIED, not inferred): a RETIRING
+        # worker -- the `-s reload` generation handover the single-process leg
+        # structurally cannot exercise -- holds NO other unfreed core
+        # allocation. Measured 2026-08-27 on nginx 1.31.3, gcc 14.2.0, this
+        # binary: the full multi-worker fault-injection suite runs clean under
+        # detect_leaks=1, including test_s8_reload_on_to_off_drains_protected,
+        # which drives a real `nginx -s reload`.
         #
-        # detect_leaks nonetheless STAYS 0 in this job for now, deliberately:
-        # turning it on here is a SEPARATE change that has not been run
-        # green under this job's 4-worker topology, which also exercises
-        # reload-driven worker retirement that the single-process leg never
-        # does. Flipping it as a side effect of the single-process fix would
-        # ship an unverified gate. Tracked as its own item in
-        # memory/labs/nginx-cache-turbo-module/TODO.md; the residual question
-        # there is only whether a retiring worker has any OTHER unfreed core
-        # allocation, not whether the exemption mechanism works.
+        # NEGATIVE CONTROL (run, not reasoned): a deliberate malloc() leaked in
+        # exit_process makes this leg RED -- 12 leaking processes across three
+        # worker generations, each reporting that allocation and NOTHING else,
+        # stack rooted at ngx_worker_process_exit (ngx_process_cycle.c:947).
+        # So a genuine module leak on the worker-exit path still fails the job;
+        # the exemption hides the three core tables by pointer identity and
+        # nothing more. (First attempt at that control was VACUOUS: at -O1 gcc
+        # elided an unused malloc, so the leak never reached the binary. It has
+        # to escape through a volatile sink -- verify with objdump that the
+        # call is actually in exit_process before believing a red or a green.)
+        #
+        # Do NOT replace this with an LSan suppression file: leak:ngx_create_pool
+        # and leak:main were both DISPROVEN by negative control -- a suppression
+        # matches ANY frame on the allocation stack, so each also hides genuine
+        # module leaks. __lsan_ignore_object() (pointer identity) is the tool.
+        #
+        # Short-lived `nginx -t` / `-s reload` subprocesses are still scoped to
+        # detect_leaks=0 by config_check_env() (ci/tools/test_runtime_base.py),
+        # which sets it on BOTH ASAN_OPTIONS and LSAN_OPTIONS -- the integrated
+        # runtime parses LSAN_OPTIONS after ASAN_OPTIONS, so setting only one
+        # is silently overridden.
         #
         # Wrapped in ci-hang-guard.sh for the same reason as the single-process job:
         # if the suite fails a diagnostics capture preserves nginx logs (error.log)
@@ -297,7 +309,7 @@ jobs:
         # assertion string. 1200s soft < 30-min job timeout, well above ~7 min
         # healthy run.
         env:
-          ASAN_OPTIONS: detect_leaks=0:halt_on_error=1:abort_on_error=1
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1:abort_on_error=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
           # See the single-process job: instrumented latency is not a signal.
           TEST_CT_TIMEOUT: "30"
