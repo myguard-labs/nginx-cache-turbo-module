@@ -69,6 +69,11 @@
 #                       verified to actually carry the sanitizer runtime, not
 #                       trusted from the flag. detect_leaks stays OFF -- see
 #                       the block by the check for why that is deliberate.
+#     --coverage        select (and with --stage, build) the gcov tree
+#                       .build/<flavor>-<version>-testkit-coverage. Verified to
+#                       actually carry .gcno, same reasoning as --sanitizer.
+#                       Mutually exclusive with --sanitizer (testkit-stage.sh
+#                       enforces it too; caught here before a wasted build).
 #     --expect-skip     invert the verdict: PASS only if the scenario SKIPs.
 #                       The negative control for the whole adoption -- see below.
 #     --list            print the scenarios that would run, exit
@@ -115,6 +120,7 @@ PORT="${TEST_BASE_PORT:-19392}"
 DO_STAGE=0
 EXPECT_SKIP=0
 SANITIZE=0
+COVERAGE=0
 LIST=0
 SCENARIOS=()
 
@@ -129,6 +135,7 @@ while [ $# -gt 0 ]; do
         --port)        PORT="${2:?--port needs a value}"; shift 2 ;;
         --stage)       DO_STAGE=1; shift ;;
         --sanitizer)   SANITIZE=1; shift ;;
+        --coverage)    COVERAGE=1; shift ;;
         --expect-skip) EXPECT_SKIP=1; shift ;;
         --list)        LIST=1; shift ;;
         -h|--help)     sed -n '2,/^set -euo/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -136,6 +143,9 @@ while [ $# -gt 0 ]; do
         *)             usage "unknown option: $1 (try --help)" ;;
     esac
 done
+
+[ "$SANITIZE" -eq 1 ] && [ "$COVERAGE" -eq 1 ] && \
+    usage "--sanitizer and --coverage are mutually exclusive (separate stage trees)"
 
 case "$PORT" in
     ''|*[!0-9]*) usage "--port must be numeric, got '$PORT'" ;;
@@ -158,11 +168,13 @@ fi
 
 STAGE_SUFFIX=testkit
 [ "$SANITIZE" -eq 1 ] && STAGE_SUFFIX=testkit-asan
+[ "$COVERAGE" -eq 1 ] && STAGE_SUFFIX=testkit-coverage
 STAGE_DIR="${BUILD_ROOT:-$ROOT/.build}/${FLAVOR}-${VERSION}-${STAGE_SUFFIX}"
 
 if [ "$DO_STAGE" -eq 1 ]; then
     stage_args=(--flavor "$FLAVOR" --version "$VERSION" --testkit "$TESTKIT")
     [ "$SANITIZE" -eq 1 ] && stage_args+=(--sanitizer)
+    [ "$COVERAGE" -eq 1 ] && stage_args+=(--coverage)
     ci/tools/testkit-stage.sh "${stage_args[@]}" || die "staging failed"
 fi
 
@@ -188,6 +200,19 @@ if [ "$SANITIZE" -eq 1 ] && [ "$EXPECT_SKIP" -eq 0 ]; then
         grep -qa '__asan_\|__ubsan_' "$_obj" || \
             die "--sanitizer given but $_obj carries no ASan/UBSan runtime -- restage with --sanitizer"
     done
+fi
+
+# ---- the coverage contract --------------------------------------------------
+# Same reasoning as the sanitizer contract above, checked the way
+# testkit-stage.sh's own coverage gate checks it: gcov instrumentation has no
+# runtime symbol, so the proof is a .gcno next to the module's own objects,
+# not a grep on the binary.
+if [ "$COVERAGE" -eq 1 ] && [ "$EXPECT_SKIP" -eq 0 ]; then
+    if [ ! -d "$STAGE_DIR/objs/addon/src" ]; then
+        die "no coverage tree at $STAGE_DIR/objs -- run ci/tools/testkit-stage.sh --coverage (or pass --stage)"
+    fi
+    find "$STAGE_DIR/objs/addon/src" -maxdepth 1 -name '*.gcno' -print -quit | grep -q . || \
+        die "--coverage given but $STAGE_DIR/objs/addon/src carries no .gcno -- restage with --coverage"
 fi
 
 # ---- detect_leaks: a deliberate decision, not an omission -------------------

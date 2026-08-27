@@ -68,6 +68,13 @@
 #     --testkit DIR     testkit checkout     (default: autodetected, see below)
 #     --jobs N          make -j N            (default: nproc)
 #     --sanitizer       build the server + both modules under ASan/UBSan
+#     --coverage        build the server + both modules under gcov
+#                       instrumentation (mutually exclusive with --sanitizer;
+#                       the two modes are separate purposes and a build cannot
+#                       usefully be both -- ASan's shadow bookkeeping moves the
+#                       allocation counters gcov timing does not care about,
+#                       and gcov's -O0 defeats nothing ASan needs, so stacking
+#                       them would only spend build time proving neither number)
 #     --src DIR         reuse an unpacked source tree instead of fetching
 #     --keep-src        do not delete a fetched source tree on success
 #     --dry-run         print the configure/make it WOULD run, touch nothing
@@ -102,6 +109,11 @@
 #   was sanitized. Two names means both legs can be staged and run in one
 #   session, and `testkit-run.sh --sanitizer` selects a tree that is either
 #   present and sanitized or absent -- never present and quietly unsanitized.
+#
+#   --coverage stages into <version>-testkit-coverage, same reasoning: a
+#   coverage build's .gcno/.gcda live inside objs/, so sharing a directory with
+#   the plain or sanitized stage would mean the LAST stage run silently decides
+#   whether "the testkit leg" carries instrumentation data at all.
 #
 #   ⚠ THE STAGE LIVES UNDER THIS REPO'S .build/, NOT TESTKIT'S. testkit's
 #   prober_resolve (lib.sh:81-82) defaults its search root to the TESTKIT repo
@@ -139,6 +151,7 @@ SRC=""
 KEEP_SRC=0
 DRY=0
 SANITIZE=0
+COVERAGE=0
 
 die()   { echo "testkit-stage: $*" >&2; exit 1; }
 usage() { echo "testkit-stage: $*" >&2; exit 2; }
@@ -151,12 +164,16 @@ while [ $# -gt 0 ]; do
         --jobs)     JOBS="${2:?--jobs needs a value}"; shift 2 ;;
         --src)      SRC="${2:?--src needs a value}"; shift 2 ;;
         --sanitizer) SANITIZE=1; shift ;;
+        --coverage) COVERAGE=1; shift ;;
         --keep-src) KEEP_SRC=1; shift ;;
         --dry-run)  DRY=1; shift ;;
         -h|--help)  sed -n '2,/^set -euo/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *)          usage "unknown option: $1 (try --help)" ;;
     esac
 done
+
+[ "$SANITIZE" -eq 1 ] && [ "$COVERAGE" -eq 1 ] && \
+    usage "--sanitizer and --coverage are mutually exclusive (separate purposes, separate stage trees)"
 
 case "$JOBS" in
     '')            JOBS="$(nproc 2>/dev/null || echo 4)" ;;
@@ -216,6 +233,7 @@ esac
 
 STAGE="${FLAVOR}-${VERSION}-testkit"
 [ "$SANITIZE" -eq 1 ] && STAGE="${STAGE}-asan"
+[ "$COVERAGE" -eq 1 ] && STAGE="${STAGE}-coverage"
 BUILD_ROOT="${BUILD_ROOT:-$ROOT/.build}"
 STAGE_DIR="$BUILD_ROOT/$STAGE"
 
@@ -284,6 +302,28 @@ if [ "$SANITIZE" -eq 1 ]; then
     )
 fi
 
+# ---- the coverage argv ------------------------------------------------------
+# Flag derivation is DELIBERATELY the same spelling ci-build.sh's `coverage`
+# mode uses (ci-build.sh:117-131), not a second one invented here -- the same
+# reason the sanitizer block above mirrors ci-build.sh's `asan` mode instead of
+# re-deriving it: two spellings of "the coverage build" in one repo is how a
+# leg ends up instrumented differently from the one it is supposed to
+# corroborate, and gcov is exactly the tool where that difference is invisible
+# until someone diffs two .gcda files that do not agree on line/branch mapping.
+#
+# -O0 keeps arcs mapped 1:1 to source lines (ci-build.sh's own comment: any
+# optimization folds branches and gcov starts lying). --coverage must reach
+# BOTH the compile (-ftest-coverage emits .gcno) and the link (-fprofile-arcs
+# needs libgcov linked into the .so) -- nginx's --with-cc-opt/--with-ld-opt
+# split covers exactly that, same as the plain coverage.sh path.
+if [ "$COVERAGE" -eq 1 ]; then
+    COV_FLAGS="--coverage -g -O0 -fno-omit-frame-pointer"
+    CONFIGURE_ARGS+=(
+        "--with-cc-opt=$COV_FLAGS"
+        "--with-ld-opt=--coverage"
+    )
+fi
+
 if [ "$DRY" -eq 1 ]; then
     echo "would fetch    : $URL"
     echo "would verify   : $EXPECTED_SHA256"
@@ -291,6 +331,7 @@ if [ "$DRY" -eq 1 ]; then
     echo "would configure: ./configure ${CONFIGURE_ARGS[*]}"
     echo "would build    : make -j$JOBS   (server binary + both modules)"
     [ "$SANITIZE" -eq 1 ] && echo "would require  : __asan_ present in objs/nginx and both .so"
+    [ "$COVERAGE" -eq 1 ] && echo "would require  : .gcno present next to both modules' objects"
     echo "would require  : objs/$TK_SO newer than $TESTKIT/src"
     echo "                 objs/$CT_SO newer than $ROOT/src"
     echo "                 objs/nginx executable"
@@ -318,6 +359,58 @@ if [ -n "$SRC" ]; then
     [ -f "$SRC/configure" ] || die "--src '$SRC' has no ./configure"
     BUILDDIR="$(cd "$SRC" && pwd)"
     echo "==> reusing source tree $BUILDDIR"
+elif [ "$COVERAGE" -eq 1 ]; then
+    # Coverage CANNOT use the mktemp-then-cp-r path below. gcc's --coverage
+    # bakes the OBJECT file's compile-time cwd + relative path into the
+    # .gcno (verified with gcov-dump -p: a `cwd:` line plus each FUNCTION
+    # record's source path) -- not a portable path resolved from the
+    # binary's own location, and not one `cp -r`ing objs/ afterward can fix.
+    # gcov looks for that exact path at runtime to write the matching
+    # .gcda; a `cp -r "$BUILDDIR/objs" "$STAGE_DIR/objs"` into a directory
+    # that then gets `rm -rf`'d by the `cleanup` trap leaves gcov trying to
+    # create .gcda under a deleted /tmp path, which fails silently -- gcov
+    # has no error message for this, gcda counters just never appear (and
+    # nginx exits 0, the scenario TAP passes, so a run against a tree bad
+    # this way reads as "the prober legs add nothing", not as broken
+    # instrumentation).
+    #
+    # The fix: build coverage mode IN PLACE under STAGE_DIR itself, the same
+    # arrangement ci-build.sh's `coverage` mode already relies on (it builds
+    # in $ROOT/$DIR, never a scratch dir) -- so the cwd gcc records at
+    # compile time is the same path the staged tree lives at forever after,
+    # and the stage step below becomes a no-op (BUILDDIR IS STAGE_DIR/src,
+    # objs/ is already where it needs to be).
+    BUILDDIR="$STAGE_DIR/src"
+    if [ -f "$BUILDDIR/configure" ]; then
+        echo "==> reusing in-place coverage source tree $BUILDDIR"
+    else
+        rm -rf "$BUILDDIR"
+        mkdir -p "$BUILDDIR"
+        echo "==> fetching $URL"
+        # TMP, not a separate FETCH_TMP -- TMP is the variable `cleanup`'s
+        # EXIT trap already tracks (declared above, before this fetch could
+        # possibly run), so an interrupt mid-fetch still reaps this scratch
+        # dir instead of leaking it under /tmp the way a second untracked
+        # variable would. KEEP_SRC does not apply to it: that flag means
+        # "keep the tree actually being built" (already $STAGE_DIR/src for
+        # coverage, permanent regardless), not "keep this fetch scratch
+        # space too" -- so it is removed unconditionally on every path below,
+        # matching the plain (non-coverage) fetch further down which has no
+        # KEEP_SRC-conditional scratch step of its own either.
+        TMP="$(mktemp -d "${TMPDIR:-/tmp}/testkit-stage-fetch.XXXXXX")"
+        bash "$ROOT/.github/scripts/fetch-verify.sh" \
+            "$URL" "$EXPECTED_SHA256" "$TMP/${DIR}.tar.gz" \
+            || die "fetch/verify failed for $URL"
+        tar -xzf "$TMP/${DIR}.tar.gz" -C "$TMP"
+        [ -d "$TMP/$DIR" ] || die "tarball did not unpack to expected dir $DIR"
+        # rsync/cp the unpacked tree's CONTENTS into BUILDDIR rather than
+        # renaming $TMP/$DIR itself -- BUILDDIR's path (under STAGE_DIR) is
+        # what must be stable across runs, not the fetch tmpdir's randomized
+        # name.
+        cp -r "$TMP/$DIR/." "$BUILDDIR/"
+        rm -rf "$TMP" 2>/dev/null || true
+        TMP=""
+    fi
 else
     TMP="$(mktemp -d "${TMPDIR:-/tmp}/testkit-stage.XXXXXX")"
     BUILDDIR="$TMP/$DIR"
@@ -377,9 +470,24 @@ echo "==> building server + modules (-j$JOBS)"
 ) || die "make failed"
 
 # ---- stage ------------------------------------------------------------------
-rm -rf "$STAGE_DIR"
-mkdir -p "$STAGE_DIR"
-cp -r "$BUILDDIR/objs" "$STAGE_DIR/objs"
+# Coverage built IN PLACE (see above) -- objs/ already lives under $BUILDDIR,
+# which is normally $STAGE_DIR/src but can also be an external --src tree, so
+# `rm -rf "$STAGE_DIR"` here would delete the source tree (and the objs/ this
+# build just produced) before the copy below ever ran, and a symlink target
+# hardcoded to the STAGE_DIR/src layout would dangle under --src. Wipe and
+# relink just objs/, pointed at $BUILDDIR/objs directly (absolute, so it is
+# correct in both layouts): everything downstream (the staleness gate, the
+# coverage gate, testkit-run.sh) only ever reads $STAGE_DIR/objs, so a symlink
+# is exactly as good as a copy and avoids doubling disk use for a tree gcov
+# needs to keep matching its .gcno forever.
+if [ "$COVERAGE" -eq 1 ]; then
+    rm -rf "$STAGE_DIR/objs"
+    ln -s "$BUILDDIR/objs" "$STAGE_DIR/objs"
+else
+    rm -rf "$STAGE_DIR"
+    mkdir -p "$STAGE_DIR"
+    cp -r "$BUILDDIR/objs" "$STAGE_DIR/objs"
+fi
 
 # ---- the staleness gate -- the reason this script is trustworthy ------------
 # Both .so must EXIST and must be newer than the newest module source. A
@@ -515,6 +623,35 @@ if [ "$SANITIZE" -eq 0 ] && [ -f "$STAGE_DIR/objs/$SERVER_BIN" ]; then
         echo "  the allocation-neutrality oracles read numbers the sanitizer itself moves" >&2
         status=3
     fi
+fi
+
+# ---- the coverage gate ------------------------------------------------------
+# Same failure shape as the sanitizer gate above, one level removed: a staged
+# tree that was ASKED for coverage and did not get it runs every scenario,
+# reports every oracle result correctly, and produces zero .gcda -- which
+# reads exactly like "the prober legs add nothing" instead of "instrumentation
+# never happened". gcov instrumentation has no runtime symbol to grep for the
+# way __asan_/__ubsan_ mark a sanitized binary; the proof is that the COMPILER
+# emitted a .gcno next to each object, one per translation unit, at compile
+# time -- so that is what is checked. Both --add-dynamic-module trees share
+# ONE objs/addon/ (nginx namespaces by each module's own source directory
+# basename, not by module): cache_turbo's objects (and, because t/module's
+# config reaches them by relative climb, the ref probe's ngx_test_probe*.o
+# support files) land under objs/addon/src, while the ref module's own single
+# translation unit lands under objs/addon/module (named after testkit's
+# t/module dir). Verified against an actual staged tree -- there is no
+# "addon2"-shaped second path. nginx core's own .gcno are not this script's
+# concern; coverage.sh already filters to src/ downstream.
+if [ "$COVERAGE" -eq 1 ]; then
+    for addon in "$STAGE_DIR/objs/addon/src" "$STAGE_DIR/objs/addon/module"; do
+        [ -d "$addon" ] || continue
+        if ! find "$addon" -maxdepth 1 -name '*.gcno' -print -quit | grep -q .; then
+            echo "testkit-stage: NO .gcno UNDER $addon" >&2
+            echo "  --coverage was requested but no gcov notes file was emitted there" >&2
+            echo "  a scenario run against this tree would report green while measuring nothing" >&2
+            status=3
+        fi
+    done
 fi
 
 if [ "$status" -ne 0 ]; then
