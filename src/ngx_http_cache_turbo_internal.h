@@ -1442,6 +1442,7 @@ ngx_int_t ngx_http_cache_turbo_request_revalidate(ngx_http_request_t *r,
 char *ngx_http_cache_turbo_probe(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 void ngx_http_cache_turbo_probe_hooks_register(void);
+void ngx_http_cache_turbo_probe_zone_reset(void);
 #endif
 
 #endif /* NGX_HTTP_CACHE_TURBO_INTERNAL_H_INCLUDED_ */
