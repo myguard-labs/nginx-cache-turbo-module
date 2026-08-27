@@ -9,6 +9,12 @@ hit-path lock residency", `[NEEDS-PROFILE]`) in
 path actually goes*, which BENCHMARK.md's aggregate rps/p50/p99 numbers cannot
 show.
 
+> **Superseded rankings — read [Re-profile 2026-08-27](#re-profile-2026-08-27-main--8a4e367) first.**
+> The 2026-08-19 runs A/B/C below are kept as the historical record, but their
+> `ngx_shmtx_*` shares predate PERF-AUD-01..17, PERF-AUD2-01/04/05/06 and CTB5.
+> On current `main` the aggregate fell 28.85% -> 8.00% at `WORKERS=16`. Do not
+> quote a number from this section as current.
+
 Measured 2026-08-19 on a 32-core `Intel(R) Core(TM) i9-14900HX`, Debian 13
 (trixie), kernel 7.1.3, loopback, `perf_event_paranoid=1`. Build:
 `ci-build.sh nginx 1.31.3 profile` (`-O2 -g -fno-omit-frame-pointer`, dynamic
@@ -175,7 +181,113 @@ Full `perf.data` + `perf-report.txt` for all three runs are not committed
 was 3–61 MB per pass); the table and symbol excerpts above are the durable
 record. Re-run with `ci/tools/perf-profile.sh` to regenerate.
 
+## Re-profile 2026-08-27 (`main` @ `8a4e367`)
+
+Re-run per the cycle-4 handoff: the standing run B/C numbers came from an older
+base, and PERF-AUD-01..17, PERF-AUD2-01/04/05/06 and CTB5 have merged since.
+Same box, same harness, same `tiny`/base-key workload; build
+`BUILD_ROOT=$PWD/.build-perf ci/tools/ci-build.sh nginx 1.31.3 profile`
+(verified: nginx/1.31.3, `with debug_info`, `not stripped`, 0 sanitizer symbols
+in the `.so` — the exit code alone was not trusted). Hit ratio verified 100.00%
+from the module's own counters on both passes.
+
+| Run | workers | wrk -c | hit ratio | rps | p50 | p99 | shmtx self-time | unresolved |
+| --- | --: | --: | --: | --: | --: | --: | --: | --: |
+| W1 | 1 | 8 | 100.00% | 191717 | 39us | 115us | **0.90%** | 2.51% |
+| W16 | 16 | 64 | 100.00% | 498485 | 106us | 2.48ms | **8.00%** | 0.93% |
+
+Against the 2026-08-19 baseline, holding worker count fixed:
+
+| metric | 2026-08-19 | 2026-08-27 | delta |
+| --- | --: | --: | --- |
+| `ngx_shmtx_lock` self, W=16 | 11.50% | **3.10%** | -8.40pp |
+| `ngx_shmtx_*` aggregate, W=16 | 28.85% | **8.00%** | -20.85pp |
+| `ngx_shmtx_*` aggregate, W=1 | 0.73% | 0.90% | +0.17pp (noise) |
+| rps, W=16 | 450557 | 498485 | +10.6% |
+
+W1 (`WORKERS=1`, wrk `-c8`) — uncontended, no lock signal to read:
+
+```text
+ 2.94%  nft_do_chain                              [kernel, netfilter]
+ 2.71%  ngx_http_cache_turbo_access_handler       <- #1 user-space symbol
+ 2.40%  ngx_http_header_filter
+ 2.27%  __memmove_avx_unaligned_erms
+ 1.86%  entry_SYSRETQ_unsafe_stack                [kernel]
+ 1.37%  net_rx_action                             [kernel]
+ 1.21%  ngx_vslprintf
+ 1.16%  __tcp_transmit_skb                        [kernel]
+ 1.04%  nf_conntrack_tcp_packet                   [kernel]
+ 0.98%  ngx_http_parse_request_line
+ ...
+ (ngx_shmtx_* combined: 0.90%; ngx_slab_*_locked: absent from the report)
+```
+
+W16 (`WORKERS=16`, wrk `-c64`) — contended:
+
+```text
+ 3.10%  ngx_shmtx_lock                            <- still #1 user-space, but see below
+ 2.48%  ngx_http_cache_turbo_access_handler
+ 2.34%  available_idle_cpu                        [kernel, scheduler]
+ 1.92%  _raw_spin_lock_irqsave                    [kernel]
+ 1.66%  skb_release_data                          [kernel]
+ 1.57%  nft_do_chain                              [kernel, netfilter]
+ 1.52%  __memmove_avx_unaligned_erms
+ 1.44%  net_rx_action                             [kernel]
+ 1.40%  tcp_ack                                   [kernel]
+ 1.31%  tcp_sendmsg_locked                        [kernel]
+ 1.20%  entry_SYSRETQ_unsafe_stack                [kernel]
+ 1.20%  tcp_recvmsg_locked                        [kernel]
+ 1.19%  ngx_http_cache_turbo_blob_cleanup
+ 1.14%  _copy_from_iter                           [kernel]
+ 1.08%  native_queued_spin_lock_slowpath          [kernel]
+ ...
+ (ngx_shmtx_* combined: 8.00%; ngx_slab_*_locked: absent from the report)
+```
+
+### What changed in the ranking
+
+- **`ngx_shmtx_lock` is still the #1 user-space symbol under contention, but it
+  no longer dominates.** The 2026-08-19 note "more than 2nd+3rd combined" is no
+  longer true: 3.10% against 2.48% + 1.19%. Most of the W16 top-15 is now kernel
+  network/scheduler work, not module work — the profile has shifted from
+  lock-bound toward network-bound.
+- **`ngx_http_cache_turbo_access_handler` is the highest-value module-owned
+  target now** — #2 at W16 (2.48%) and the #1 user-space symbol at W1 (2.71%),
+  i.e. above `ngx_shmtx_*` in the uncontended case, so its cost is real work on
+  the hit path rather than a contention artifact.
+- **`ngx_http_cache_turbo_blob_cleanup`** appears at 1.19% at W16 and is absent
+  from W1's top-15 — contention-scaled, worth a look alongside lock residency.
+- **`ngx_http_cache_turbo_header_admissible`** (P4-3's target, 2.21%/1.53% in the
+  old runs) has dropped out of both top-15s.
+- **`ngx_http_header_filter` at 2.40% (W1)** is up from run B's 1.11%, but this
+  does **not** reopen D4. D4 was closed on its correctness clause — the header
+  block is not constant across hits (`Age`, `X-Cache`, `Surrogate-Key`, the 304
+  and 206 branches) — which a profile cannot overturn. It is absent from W16's
+  top-15.
+
+### Routing decision
+
+Per the cycle-4 handoff's own rule ("shmtx materially reduced -> re-rank; the
+2026-08-25 ruling simply stands"): **the stripe carve stays CLOSED.** This
+re-profile is the "real profile" that ruling named as the bar for reconsidering,
+and it moves the number in the direction that keeps the row shut, not open. The
+untried lock angle remains RESIDENCY / acquisition COUNT (shorter critical
+sections, batching, fewer acquisitions) — never sharding the pool.
+
+Raw `perf.data` + `perf-report.txt` under `ci/tools/perf-out/w1/` and
+`ci/tools/perf-out/w16/` (gitignored, not committed); the excerpts above are the
+durable record.
+
 ## Verdict
+
+> **P4-2's verdict below is the 2026-08-19 reading and is now PARTLY
+> SUPERSEDED.** The direction still holds — `ngx_shmtx_lock` still scales with
+> worker pressure and is still the #1 user-space symbol at `WORKERS=16` — but
+> the magnitude does not: as of 2026-08-27 on `main` @ `8a4e367` the figures are
+> 0.90% / — / 3.10% (aggregate 8.00%), not 0.73% / 3.54% / 11.50% (aggregate
+> 28.85%). "Ahead of every other cache_turbo function" is also no longer a
+> comfortable margin: `access_handler` sits 0.62pp behind it. See
+> [Re-profile 2026-08-27](#re-profile-2026-08-27-main--8a4e367).
 
 - **P4-2 ("reduce hit-path lock residency") — CONFIRMED.**
   `ngx_shmtx_lock` alone rises from 0.73 % → 3.54 % → 11.50 % self-time as
