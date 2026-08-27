@@ -1,0 +1,17 @@
+# Copyright (C) 2026 Thijs Eilander
+# SPDX-License-Identifier: BSD-2-Clause
+#
+# S25 port of testkit's reload-mid-upload/post-reload.rule. @PROBE@ is
+# test_ref_probe (see nginx.conf), so "fds" is a generic reading independent
+# of cache_turbo's zone -- exactly what this case needs, since its job is only
+# "did the post-reload worker come back healthy", not a cache_turbo assertion
+# (the module-specific claim is the driver's: the upload survived the reload
+# while flowing through cache_turbo's own /upload location).
+
+name    the reloaded worker serves cleanly after the in-flight upload reload
+from    127.0.0.1
+send    GET / HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+delta   fds == 0
+no_error_log  \[error\]

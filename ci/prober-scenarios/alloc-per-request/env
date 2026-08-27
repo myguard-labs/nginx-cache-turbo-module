@@ -1,0 +1,14 @@
+# Copyright (C) 2026 Thijs Eilander
+# SPDX-License-Identifier: BSD-2-Clause
+#
+# S25 port of testkit's alloc-per-request. Same override reasoning as
+# ../fault-slab-store/env and shm-coherence-varidx/env: this scenario's
+# nginx.conf needs cache_turbo's OWN probe directive, not testkit's
+# test_ref_probe -- test_ref_probe aims ngx_test_probe_json() at the ref
+# module's zone (NULL here), the zone_render dispatch is never reached, and
+# every zone.* field below would be absent, not zero.
+#
+# PROBER_PROBE_ZONE is empty: the zone is declared by `cache_turbo_zone` in
+# nginx.conf itself (it needs a size the /cached/ location also references),
+# not by a probe-side directive -- same as fault-slab-store.
+PROBER_PROBE='cache_turbo_probe ct;'

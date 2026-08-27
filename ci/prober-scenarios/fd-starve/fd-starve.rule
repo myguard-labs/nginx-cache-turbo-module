@@ -1,0 +1,60 @@
+# Copyright (C) 2026 Thijs Eilander
+# SPDX-License-Identifier: BSD-2-Clause
+#
+# S25 port of testkit's scenarios/fd-starve against a real cache_turbo HIT
+# path (../nginx.conf) under a small worker_connections limit, instead of
+# testkit's own `return 200`. A per-request descriptor a HIT forgets to
+# close (a cache-entry fd, an unreleased upstream connection) would exhaust
+# the worker's small connection table far sooner than under a roomy conf --
+# `delta fds == 0` is the same oracle upstream uses, now measured across
+# genuine cache_turbo HIT traffic rather than a passthrough.
+#
+# HONEST SCOPE, verified while building this file: cache_turbo's L1 is
+# purely shm-backed (grep confirms no ngx_open_file/ngx_socket/
+# ngx_open_tempfile/ngx_close_file anywhere in src/*.c) and a HIT touches no
+# upstream connection at all, so there is no known code path in THIS module
+# that can fail this oracle on a HIT today. What it DOES catch: a future
+# module change that opens any descriptor on the HIT path and forgets to
+# release it (the failure class the fd count exists to catch at all), and it
+# is a real backstop rather than a no-op -- upstream's own ref-module form
+# carries the identical caveat for the same structural reason. Wired as
+# backstop coverage, not because a mutation was found to red it.
+
+name    baseline: warm-up MISS under a tight connection table
+from    127.0.0.1
+send    GET /cached/item HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+expect_not header~X-Cache:
+
+name    under fd pressure -- request 1, must HIT
+from    127.0.0.1
+send    GET /cached/item HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+expect  header~X-Cache: HIT
+delta   fds == 0
+
+name    under fd pressure -- request 2
+from    127.0.0.1
+send    GET /cached/item HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+expect  header~X-Cache: HIT
+delta   fds == 0
+
+name    under fd pressure -- request 3
+from    127.0.0.1
+send    GET /cached/item HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+expect  header~X-Cache: HIT
+delta   fds == 0
+
+name    server graceful under fd exhaustion
+from    127.0.0.1
+send    GET /cached/item HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+expect  header~X-Cache: HIT
+delta   fds == 0

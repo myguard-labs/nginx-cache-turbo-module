@@ -1,0 +1,21 @@
+# Copyright (C) 2026 Thijs Eilander
+# SPDX-License-Identifier: BSD-2-Clause
+#
+# Same override as testkit's own multi-worker/env: worker_processes 4 needs
+# PROBER_ALLOW_MULTIWORKER=1 to lift prober_check_conf's default worker!=1
+# bail (which assumes a single-worker conf and would misread healthy worker
+# rotation as a crash). Every case in multi-worker.rule below carries
+# `pid_may_change` to match.
+#
+# PROBER_PROBE is left at testkit's default (test_ref_probe), NOT
+# cache_turbo_probe: this scenario's claim is cross-worker MASTER coherence
+# (pid_may_change) plus a cache_turbo HIT on whichever worker answers, and
+# neither needs cache_turbo's own zone probe fields. The generic probe is
+# also the simpler choice here on its own merits -- see
+# CTPROBE-STATIC-ZONE-NO-RELOAD (memory/labs/nginx-cache-turbo-module/
+# issues.md) for why cache_turbo_probe is a hard requirement, not a style
+# choice, on any scenario that reparses its conf more than once (reload-*);
+# this scenario has no reload, so that specific hazard is not why the
+# generic probe was picked, but there is still no reason to take on that
+# directive's extra registration state for a claim it does not need.
+PROBER_ALLOW_MULTIWORKER=1
