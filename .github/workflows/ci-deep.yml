@@ -1,4 +1,4 @@
-# sync-sha: dc0bcd0510b0423c2410b41e534e75d44bd00c13c8873c169e6b05b6c182e94c
+# sync-sha: db492fbd3d4f8eeb15a81d709c3e8922d24af36bcc5ddadfb9415ba2d10a15fc
 name: CI Deep
 
 # Exhaustive dynamic analysis — monthly cron + on-demand only, NEVER on PR.
@@ -690,18 +690,26 @@ jobs:
 
       - name: Run multi-worker fault-injection suite N times (fail-fast)
         env:
-          # detect_leaks STAYS 0 HERE, tracking asan.yml's CI-3 job, which
-          # runs the SAME multi-worker topology (no --single-process). The
-          # nginx-core false positive both hit -- ngx_event_process_init()'s
-          # three never-freed per-process tables -- is now exempted by
-          # pointer in the module's exit_process hook
-          # (LSAN-CORE-EVENT-TABLES, src/ngx_http_cache_turbo_blob.c), which
-          # nginx also calls on the worker exit path. Turning the flag on for
-          # the multi-worker topology is nevertheless a separate, not-yet-run
-          # change; see asan.yml's CI-3 comment for why it is not being
-          # flipped as a side effect, and TODO.md for the item. asan.yml's
-          # single-process job is the one leg running detect_leaks=1 today.
-          ASAN_OPTIONS: detect_leaks=0:halt_on_error=1:abort_on_error=1
+          # detect_leaks=1 HERE, tracking asan.yml's CI-3 job, which runs the
+          # SAME multi-worker topology (no --single-process). The nginx-core
+          # false positive both hit -- ngx_event_process_init()'s three
+          # never-freed per-process tables -- is exempted by POINTER in the
+          # module's exit_process hook (LSAN-CORE-EVENT-TABLES,
+          # src/ngx_http_cache_turbo_blob.c), which nginx also calls on the
+          # worker exit path (ngx_worker_process_exit, ngx_process_cycle.c:947).
+          #
+          # The residual question -- whether a RETIRING worker (`-s reload`
+          # generation handover) holds any OTHER unfreed core allocation -- was
+          # measured on 2026-08-27 and answered NO: the full multi-worker
+          # fault-injection suite runs clean under detect_leaks=1, and a
+          # deliberately leaked malloc() in exit_process still turns the run RED.
+          # Full rationale and the negative control live in asan.yml's CI-3
+          # comment; this job intentionally carries the same setting.
+          #
+          # This soak runs the SAME suite N times, so it is the leg most likely
+          # to surface a leak that only appears after repeated worker
+          # generations -- which is precisely why it should not stay at 0.
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1:abort_on_error=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
           # Instrumented latency is not a signal -- see asan.yml. An 8-iteration
           # soak multiplies the odds of a spurious per-request TimeoutError.
