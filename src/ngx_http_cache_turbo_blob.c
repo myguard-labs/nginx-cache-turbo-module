@@ -21,6 +21,60 @@
 #include "ngx_http_cache_turbo_module.h"
 #include "ngx_http_cache_turbo_internal.h"
 
+/* LSAN-CORE-EVENT-TABLES: under a LeakSanitizer-enabled build ONLY, teach LSan
+ * that nginx core's per-process event tables are not leaks, so the CI leak leg
+ * can run with detect_leaks=1 and still fail on a real leak in THIS module.
+ *
+ * ngx_event_process_init() (src/event/ngx_event.c:755/762/774) allocates
+ * cycle->connections, ->read_events and ->write_events with raw ngx_alloc()
+ * once per process, and NO nginx exit path frees them -- not
+ * ngx_single_process_cycle()'s ngx_master_process_exit(), not
+ * ngx_worker_process_exit(). ngx_destroy_pool(cycle->pool) does run on both
+ * paths, but these three live OUTSIDE the cycle pool, so it does not reach
+ * them. The process is about to exit() and the OS reclaims the pages, so
+ * upstream has no reason to free them; LSan cannot know that.
+ *
+ * Verified, not inferred: with ASAN_OPTIONS=detect_leaks=1 a plain
+ * start-then-SIGTERM of the sanitized binary in single-process mode aborts
+ * with SIGABRT and exactly these three Indirect-leak stacks, all rooted in
+ * main -> ngx_single_process_cycle -> ngx_event_process_init -> ngx_alloc,
+ * and nothing else.
+ *
+ * WHY __lsan_ignore_object AND NOT AN LSAN SUPPRESSION FILE: a suppression
+ * matches a source/symbol pattern against ANY frame on the allocation stack,
+ * so leak:ngx_create_pool and leak:main -- both tried here and both DISPROVEN
+ * by negative control -- also swallow genuine module leaks that happen to be
+ * rooted in the same frames. __lsan_ignore_object() takes a POINTER: it
+ * exempts these three specific allocations by identity and nothing else. Any
+ * other unfreed allocation, in this module or elsewhere, still fails the job.
+ *
+ * Placed in exit_process (rather than init_process) so the pointers are the
+ * ones the process actually ends up with, and so this costs nothing until
+ * shutdown. exit_process runs on BOTH shutdown paths, before
+ * ngx_master_process_exit()/ngx_worker_process_exit(), i.e. before LSan's
+ * atexit check -- see ngx_process_cycle.c:172-177 (single) and its worker
+ * equivalent.
+ *
+ * Compiled out entirely unless the build is sanitized, so no shipping build
+ * contains it or links against the LSan interface. */
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define NGX_HTTP_CACHE_TURBO_LSAN  1
+#endif
+#endif
+#if !defined(NGX_HTTP_CACHE_TURBO_LSAN) && defined(__SANITIZE_ADDRESS__)
+#define NGX_HTTP_CACHE_TURBO_LSAN  1
+#endif
+/* Always define it, so the #if sites below are never testing an undefined
+ * macro (which -Wundef flags, and which silently reads as 0). */
+#if !defined(NGX_HTTP_CACHE_TURBO_LSAN)
+#define NGX_HTTP_CACHE_TURBO_LSAN  0
+#endif
+
+#if (NGX_HTTP_CACHE_TURBO_LSAN)
+#include <sanitizer/lsan_interface.h>
+#endif
+
 /* R5-1 (perf-microtier-hitpath): default-hide every symbol this TU defines
  * so a module-internal call becomes a direct call instead of a PLT-indirect
  * one (see ngx_http_cache_turbo_module.h for why this is a per-file pragma
@@ -251,6 +305,18 @@ void
 ngx_http_cache_turbo_exit_process(ngx_cycle_t *cycle)
 {
     (void) cycle;
+
+#if (NGX_HTTP_CACHE_TURBO_LSAN)
+    /* LSAN-CORE-EVENT-TABLES (see the block at the top of this file): exempt
+     * nginx core's three never-freed per-process event tables by POINTER, so
+     * detect_leaks=1 can stay on for the real server without hiding anything
+     * else. NULL is safe to pass and simply ignored. */
+    if (cycle != NULL) {
+        __lsan_ignore_object(cycle->connections);
+        __lsan_ignore_object(cycle->read_events);
+        __lsan_ignore_object(cycle->write_events);
+    }
+#endif
 
 #if (NGX_SSL)
     if (ngx_http_cache_turbo_worker_md != NULL) {

@@ -1,4 +1,4 @@
-# sync-sha: 7b3de3b8b2f41865e37247f09795a2741beb2b17389c76a61ad833e4a37691cd
+# sync-sha: dc0bcd0510b0423c2410b41e534e75d44bd00c13c8873c169e6b05b6c182e94c
 name: CI Deep
 
 # Exhaustive dynamic analysis — monthly cron + on-demand only, NEVER on PR.
@@ -690,6 +690,17 @@ jobs:
 
       - name: Run multi-worker fault-injection suite N times (fail-fast)
         env:
+          # detect_leaks STAYS 0 HERE, tracking asan.yml's CI-3 job, which
+          # runs the SAME multi-worker topology (no --single-process). The
+          # nginx-core false positive both hit -- ngx_event_process_init()'s
+          # three never-freed per-process tables -- is now exempted by
+          # pointer in the module's exit_process hook
+          # (LSAN-CORE-EVENT-TABLES, src/ngx_http_cache_turbo_blob.c), which
+          # nginx also calls on the worker exit path. Turning the flag on for
+          # the multi-worker topology is nevertheless a separate, not-yet-run
+          # change; see asan.yml's CI-3 comment for why it is not being
+          # flipped as a side effect, and TODO.md for the item. asan.yml's
+          # single-process job is the one leg running detect_leaks=1 today.
           ASAN_OPTIONS: detect_leaks=0:halt_on_error=1:abort_on_error=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
           # Instrumented latency is not a signal -- see asan.yml. An 8-iteration
@@ -768,12 +779,22 @@ jobs:
     #                              oracle, which reads the variant-index set's
     #                              cardinality straight out of Redis.
     #
-    # detect_leaks stays OFF here, same as testkit-run.sh's unsanitized run --
-    # see the script's own header for why (nginx never frees its config pool,
-    # so LSan aborts on `nginx -t` before a single oracle runs; the LSan
-    # suppressions this repo tried, leak:ngx_create_pool and leak:main, were
-    # DISPROVEN by negative control -- they hide real module leaks). Do not
-    # set LSAN_OPTIONS here.
+    # detect_leaks stays OFF here, UNLIKE asan.yml/ci-deep.yml's own runtime
+    # legs, which turned it on by scoping detect_leaks=0 to just their
+    # short-lived `nginx -t` / `-s reload` subprocesses (see
+    # ci/tools/test_runtime_base.py config_check_env()). That trick needs a
+    # process-level distinction this leg cannot make: testkit's own
+    # prober_heap_env (nginx-module-testkit ci/prober/lib.sh, NOT this repo)
+    # exports ONE ASAN_OPTIONS for its whole run, and prober_boot then reuses
+    # that SAME inherited environment for both its internal `nginx -t` and the
+    # real server it backgrounds right after -- there is no per-invocation
+    # hook this repo can drive without editing testkit itself, which is out of
+    # scope here. So: nginx never frees its config pool, LSan would abort on
+    # that internal `nginx -t` before a single oracle runs, and the fix lives
+    # in testkit, not here (tracked as a testkit-side TODO, not this repo's to
+    # implement). The LSan suppressions this repo tried, leak:ngx_create_pool
+    # and leak:main, were DISPROVEN by negative control -- they hide real
+    # module leaks. Do not set LSAN_OPTIONS here.
     name: Testkit prober (sanitized)
     runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 60

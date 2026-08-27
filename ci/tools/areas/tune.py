@@ -270,7 +270,8 @@ def test_invalid_normalize_vary_token(ng: Nginx) -> None:
     cmd = ng.runner + [str(ng.binary), "-p", str(bad),
                        "-c", str(bad / "conf" / "nginx.conf"), "-t"]
     r = subprocess.run(cmd, text=True, stdout=subprocess.PIPE,
-                       stderr=subprocess.STDOUT, timeout=20)
+                       stderr=subprocess.STDOUT, timeout=20,
+                       env=config_check_env())
     assert r.returncode != 0, \
         f"invalid vary token 'bogus' was accepted by nginx -t:\n{r.stdout}"
     assert "invalid cache_turbo_normalize_vary" in r.stdout, \
@@ -1087,7 +1088,8 @@ def test_invalid_preset_name(ng: Nginx) -> None:
     cmd = ng.runner + [str(ng.binary), "-p", str(bad),
                        "-c", str(bad / "conf" / "nginx.conf"), "-t"]
     r = subprocess.run(cmd, text=True, stdout=subprocess.PIPE,
-                       stderr=subprocess.STDOUT, timeout=20)
+                       stderr=subprocess.STDOUT, timeout=20,
+                       env=config_check_env())
     assert r.returncode != 0, \
         f"invalid preset 'bogus' was accepted by nginx -t:\n{r.stdout}"
     assert "invalid cache_turbo_preset" in r.stdout, \

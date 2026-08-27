@@ -191,15 +191,32 @@ if [ "$SANITIZE" -eq 1 ] && [ "$EXPECT_SKIP" -eq 0 ]; then
 fi
 
 # ---- detect_leaks: a deliberate decision, not an omission -------------------
-# LEFT OFF. testkit's prober_heap_env (lib.sh:242) sets detect_leaks=0 and this
-# leg does not override it. The reasoning, so nobody "fixes" it later:
+# LEFT OFF, unlike asan.yml's single-process runtime job -- the ONE job in
+# this repo that runs detect_leaks=1 (see ci/tools/test_runtime_base.py
+# config_check_env()), by scoping detect_leaks=0 down to just its short-lived
+# `nginx -t` / `-s reload` subprocesses while leaving it on for the real
+# server. Every other sanitized leg, including ci-deep.yml's asan-soak and
+# this one, is still detect_leaks=0. That
+# trick needs a per-invocation env override, which this leg CANNOT make:
+# testkit's prober_heap_env (nginx-module-testkit ci/prober/lib.sh:241 -- NOT
+# this repo, out of scope for this change) exports ONE ASAN_OPTIONS for the
+# whole run, and prober_boot (lib.sh:1217) reuses that SAME inherited
+# environment for both its own internal `nginx -t` and the real server it
+# backgrounds immediately after. There is no hook exposed to a caller of
+# run-scenario.sh to give those two processes different options, so setting
+# ASAN_OPTIONS=detect_leaks=1 here would just move the abort from "silently
+# stayed off" to "aborts on testkit's own nginx -t before a single oracle
+# runs" -- strictly worse. The reasoning, so nobody "fixes" it later:
 #
-#   * nginx NEVER frees its configuration pool. LSan therefore reports the
-#     entire config parse as leaked on `nginx -t` and on every clean shutdown.
-#     That is upstream process-lifetime allocation, not a module defect.
-#   * With detect_leaks=1 the FIRST thing that aborts is `nginx -t`, before a
-#     single oracle runs -- so the leg would turn into a Bail out! and observe
-#     strictly less than it does today, not more.
+#   * nginx NEVER frees its configuration pool on the `nginx -t` / `-s`
+#     paths, so LSan reports the entire config parse as leaked there. (On a
+#     real server shutdown the cycle pool IS destroyed; what leaks there
+#     instead is ngx_event_process_init()'s three raw ngx_alloc() tables,
+#     which the module now exempts by pointer -- LSAN-CORE-EVENT-TABLES in
+#     src/ngx_http_cache_turbo_blob.c. That fix does NOT rescue this leg:
+#     the abort here is on testkit's internal `nginx -t`, i.e. the config
+#     pool, which is a different allocation on a different path.) Either way
+#     it is upstream process-lifetime allocation, not a module defect.
 #   * The obvious workaround -- an LSan suppression file -- is BANNED here.
 #     This repo carried `leak:ngx_create_pool` and `leak:main`, and cycle 8
 #     DISPROVED both by negative control: they suppress REAL module leaks, not
@@ -212,9 +229,11 @@ fi
 #     pre-redirect server.err; lib.sh:1424 treats a sanitizer report as fatal
 #     and never exemptable).
 #
-# Leak hunting is a separate instrument and needs a suppression story that
-# survives a negative control. It is not this leg's job, and pretending
-# otherwise by flipping one env var would cost the leg its actual coverage.
+# The real fix is a per-invocation ASAN_OPTIONS hook in testkit's own
+# prober_boot/prober_heap_env (or a documented way for a caller to override
+# just the server-launch environment) -- tracked in this repo's TODO.md as a
+# testkit-side follow-up, not something to build here by copying testkit code
+# into this repo or reaching into its lib.sh.
 
 # The prober CLIENT is a compiled C binary, separate from the staged modules,
 # and run-scenario.sh invokes ./prober directly rather than building it. Build

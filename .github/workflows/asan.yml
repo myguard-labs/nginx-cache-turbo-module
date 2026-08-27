@@ -1,4 +1,4 @@
-# sync-sha: 77acf678bac245712155e7fbf7280cdd5c7f263213755025275d90066b97798f
+# sync-sha: 699dfeb58d9140d4eeb98a61325d06982747702ffa4c83d5990a6ac37ebf01d0
 name: ASan and UBSan
 
 # Dedicated ASan+UBSan workflow, PATH-GATED: only runs when a PR/push touches
@@ -121,7 +121,41 @@ jobs:
 
       - name: Run runtime suite under ASan and UBSan (single-process)
         env:
-          ASAN_OPTIONS: detect_leaks=0:halt_on_error=1:abort_on_error=1
+          # detect_leaks=1: leak detection is ON for the long-running server.
+          # TWO separate nginx-core allocations have to be accounted for
+          # first, on two different code paths -- both are "the process is
+          # about to exit(), the OS reclaims it" upstream behaviour, neither
+          # is a leak a module can fix:
+          #
+          #   1. the config-parse pool, on the short-lived `nginx -t` /
+          #      `-s reload` subprocesses the harness spawns. Handled in the
+          #      harness by ci/tools/test_runtime_base.py config_check_env(),
+          #      which scopes detect_leaks=0 down to just those processes.
+          #   2. cycle->connections / ->read_events / ->write_events, raw
+          #      ngx_alloc()s made once per process by
+          #      ngx_event_process_init() and freed by NO nginx exit path
+          #      (they live outside the cycle pool, so ngx_destroy_pool()
+          #      does not reach them). This one fires on the REAL SERVER's
+          #      own shutdown, which no per-invocation env hook can reach --
+          #      it is one long-lived process whose ASAN_OPTIONS is fixed for
+          #      its whole life. Handled in the module instead:
+          #      ngx_http_cache_turbo_exit_process() calls
+          #      __lsan_ignore_object() on those three POINTERS, under a
+          #      sanitizer-only #if. See the LSAN-CORE-EVENT-TABLES block in
+          #      src/ngx_http_cache_turbo_blob.c.
+          #
+          # (2) is why this job was red when detect_leaks=1 first landed: the
+          # premise then was that the server exit was already clean, which is
+          # true of the cycle pool and false of those three tables.
+          #
+          # Do NOT replace either with an LSAN_OPTIONS suppression file:
+          # leak:ngx_create_pool and leak:main were both tried and DISPROVEN
+          # by negative control (issues.md, SRV-ASAN-ABORT-L2-XFILL) -- a
+          # suppression matches ANY frame on the allocation stack, so both
+          # also hide real module leaks. __lsan_ignore_object() exempts three
+          # specific allocations by identity; a deliberate leak planted in
+          # the very same function still aborts the run (verified).
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1:abort_on_error=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
           # An instrumented build is several times slower than a plain one; the
           # default 5s per-request budget is not a real signal here, it just
@@ -224,10 +258,38 @@ jobs:
         # the SAME sanitized binary under nginx's real master + 4-worker model (no
         # --single-process), so a cross-worker shm-zone UAF / race / use of a slab
         # freed by another worker surfaces here that the 1-worker run cannot.
-        # detect_leaks=0 deliberately keeps LSan OFF: nginx frees its pools at exit,
-        # not per-request, so LSan over the worker pool is false-positive-prone with
-        # no real signal — ASan's UAF/overflow checks are the high-value part and
-        # run fully multi-worker here.
+        #
+        # detect_leaks STAYS 0 HERE, unlike the single-process job. That job's
+        # sole process only ever exits once (at the harness's own final
+        # teardown) and was VERIFIED clean under detect_leaks=1. This job is
+        # different in kind, not degree: EVERY worker exit -- a `-s reload`
+        # retiring an old generation, or this job's own final shutdown of all
+        # 4 live workers -- aborts with a NEW LSan false positive, deterministic
+        # and 100% of retiring workers, unrelated to the config-pool one above.
+        # Root cause (verified, not inferred): ngx_event_process_init()
+        # (src/event/ngx_event.c:755/762/774) allocates cycle->connections/
+        # read_events/write_events with raw ngx_alloc() once per worker at
+        # startup; no nginx exit path ever frees them -- same "process is
+        # about to exit(), OS reclaims it anyway" pattern as the config pool,
+        # for the per-WORKER tables instead of the per-CONFIG pool.
+        #
+        # That specific false positive is NO LONGER unaddressed: the module's
+        # exit_process hook now exempts exactly those three pointers with
+        # __lsan_ignore_object() (LSAN-CORE-EVENT-TABLES in
+        # src/ngx_http_cache_turbo_blob.c), and nginx calls exit_process on
+        # the worker path too (ngx_worker_process_exit, ngx_process_cycle.c
+        # :946) -- not just the single-process one. So the mechanism that
+        # unblocked the single-process leg applies here in principle.
+        #
+        # detect_leaks nonetheless STAYS 0 in this job for now, deliberately:
+        # turning it on here is a SEPARATE change that has not been run
+        # green under this job's 4-worker topology, which also exercises
+        # reload-driven worker retirement that the single-process leg never
+        # does. Flipping it as a side effect of the single-process fix would
+        # ship an unverified gate. Tracked as its own item in
+        # memory/labs/nginx-cache-turbo-module/TODO.md; the residual question
+        # there is only whether a retiring worker has any OTHER unfreed core
+        # allocation, not whether the exemption mechanism works.
         #
         # Wrapped in ci-hang-guard.sh for the same reason as the single-process job:
         # if the suite fails a diagnostics capture preserves nginx logs (error.log)
