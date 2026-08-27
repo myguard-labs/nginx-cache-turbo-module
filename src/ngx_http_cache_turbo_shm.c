@@ -1632,6 +1632,24 @@ ngx_http_cache_turbo_shm_store_locked(ngx_http_cache_turbo_zone_t *z,
     ctn->last_access = now;      /* P1: fresh at LRU head */
     ctn->promotable = 0;         /* S8: unproven; second touch promotes */
     ctn->hash_crc32 = hash;      /* PERF-AUD2-10: save the recompute */
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+    /* PERF-AUD2-10 invariant check: the documented contract (struct
+     * field comment above, shm_admit() comment) is that `hash` equals
+     * ngx_crc32_short(key_hash, 32) for this node's own key. Bounded
+     * blast radius, not a correctness bug -- shm_lookup() discards its
+     * `hash` parameter and descends on the widened key64 instead, so a
+     * mismatch here can never mis-route a lookup or cross-serve
+     * another key's object; the only consequence is shm_admit()
+     * consulting the wrong W-TinyLFU sketch rows for this node as a
+     * future eviction victim, degrading admission accuracy. Same
+     * TEST_FAULTS diagnostic-counter convention as
+     * breaker_wedge_observed (O4.4-i/H-2). */
+    if (ngx_crc32_short(key_hash, 32) != hash) {
+        (void) ngx_atomic_fetch_add(
+            &ngx_http_cache_turbo_zone_sh(z)->test_hash_crc32_mismatch, 1);
+    }
+#endif
 
     ngx_rbtree_insert(&ngx_http_cache_turbo_zone_sh(z)->rbtree, &ctn->node);
     /* S8: every new node enters PROBATION (see lru_insert_new). */
@@ -2074,6 +2092,24 @@ ngx_http_cache_turbo_shm_claim_locked(ngx_http_cache_turbo_zone_t *z,
     ctn->last_access = now;      /* P1: init the coarse LRU stamp */
     ctn->promotable = 0;         /* S8: unproven; second touch promotes */
     ctn->hash_crc32 = hash;      /* PERF-AUD2-10: save the recompute */
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+    /* PERF-AUD2-10 invariant check: the documented contract (struct
+     * field comment above, shm_admit() comment) is that `hash` equals
+     * ngx_crc32_short(key_hash, 32) for this node's own key. Bounded
+     * blast radius, not a correctness bug -- shm_lookup() discards its
+     * `hash` parameter and descends on the widened key64 instead, so a
+     * mismatch here can never mis-route a lookup or cross-serve
+     * another key's object; the only consequence is shm_admit()
+     * consulting the wrong W-TinyLFU sketch rows for this node as a
+     * future eviction victim, degrading admission accuracy. Same
+     * TEST_FAULTS diagnostic-counter convention as
+     * breaker_wedge_observed (O4.4-i/H-2). */
+    if (ngx_crc32_short(key_hash, 32) != hash) {
+        (void) ngx_atomic_fetch_add(
+            &ngx_http_cache_turbo_zone_sh(z)->test_hash_crc32_mismatch, 1);
+    }
+#endif
 
     ngx_rbtree_insert(&ngx_http_cache_turbo_zone_sh(z)->rbtree, &ctn->node);
     /* S8: every new node enters PROBATION (see lru_insert_new). */
@@ -2422,6 +2458,24 @@ ngx_http_cache_turbo_shm_count_miss_locked(ngx_http_cache_turbo_zone_t *z,
     ctn->last_access = now;      /* P1: init the coarse LRU stamp */
     ctn->promotable = 0;         /* S8: unproven; second touch promotes */
     ctn->hash_crc32 = hash;      /* PERF-AUD2-10: save the recompute */
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+    /* PERF-AUD2-10 invariant check: the documented contract (struct
+     * field comment above, shm_admit() comment) is that `hash` equals
+     * ngx_crc32_short(key_hash, 32) for this node's own key. Bounded
+     * blast radius, not a correctness bug -- shm_lookup() discards its
+     * `hash` parameter and descends on the widened key64 instead, so a
+     * mismatch here can never mis-route a lookup or cross-serve
+     * another key's object; the only consequence is shm_admit()
+     * consulting the wrong W-TinyLFU sketch rows for this node as a
+     * future eviction victim, degrading admission accuracy. Same
+     * TEST_FAULTS diagnostic-counter convention as
+     * breaker_wedge_observed (O4.4-i/H-2). */
+    if (ngx_crc32_short(key_hash, 32) != hash) {
+        (void) ngx_atomic_fetch_add(
+            &ngx_http_cache_turbo_zone_sh(z)->test_hash_crc32_mismatch, 1);
+    }
+#endif
 
     ngx_rbtree_insert(&ngx_http_cache_turbo_zone_sh(z)->rbtree, &ctn->node);
     /* S8: every new node enters PROBATION (see lru_insert_new). */
@@ -2624,6 +2678,24 @@ ngx_http_cache_turbo_shm_l2_neg_set(ngx_http_cache_turbo_zone_t *z,
     ctn->last_access = now;      /* P1: init the coarse LRU stamp */
     ctn->promotable = 0;         /* S8: unproven; second touch promotes */
     ctn->hash_crc32 = hash;      /* PERF-AUD2-10: save the recompute */
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+    /* PERF-AUD2-10 invariant check: the documented contract (struct
+     * field comment above, shm_admit() comment) is that `hash` equals
+     * ngx_crc32_short(key_hash, 32) for this node's own key. Bounded
+     * blast radius, not a correctness bug -- shm_lookup() discards its
+     * `hash` parameter and descends on the widened key64 instead, so a
+     * mismatch here can never mis-route a lookup or cross-serve
+     * another key's object; the only consequence is shm_admit()
+     * consulting the wrong W-TinyLFU sketch rows for this node as a
+     * future eviction victim, degrading admission accuracy. Same
+     * TEST_FAULTS diagnostic-counter convention as
+     * breaker_wedge_observed (O4.4-i/H-2). */
+    if (ngx_crc32_short(key_hash, 32) != hash) {
+        (void) ngx_atomic_fetch_add(
+            &ngx_http_cache_turbo_zone_sh(z)->test_hash_crc32_mismatch, 1);
+    }
+#endif
 
     ngx_rbtree_insert(&ngx_http_cache_turbo_zone_sh(z)->rbtree, &ctn->node);
     /* S8: every new node enters PROBATION (see lru_insert_new). */
