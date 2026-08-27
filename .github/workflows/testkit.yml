@@ -1,4 +1,4 @@
-# sync-sha: 5eac24e9540f2b2702d0977ae07e6abfca7e4a512d21f4606a932cd5680350c4
+# sync-sha: 095df72afb5e39405e311b2d7b02dd5ab4be19315a9d29911e1abde99e747d9e
 name: Testkit
 
 # The nginx-module-testkit prober leg.
@@ -217,8 +217,20 @@ jobs:
           # cleanly without them, which is correct but zero coverage -- so if
           # this leg ever starts reporting `1..0 # SKIP`, that is a finding,
           # not a pass.
+          #
+          # fault-slab-store (S24) is the probe-armed slab-allocation fault: it
+          # arms `fault_slab=` through the probe, forces store_locked()'s node
+          # allocation to fail, and asserts the error path is resource-neutral
+          # (cycle_used / cycle_blocks / cycle_large / fds flat across the
+          # faulting request). It belongs in the PR gate rather than in
+          # ci-deep's sanitizer job because it is CHEAP -- one worker, no
+          # reload, no soak, ~10 bounded requests total and no external
+          # fixture, so it needs no service container and adds seconds. The
+          # error paths it reaches are reachable no other way in this repo:
+          # exhausting a zone for real is slow AND perturbs the very counters
+          # the oracle reads.
           ci/tools/testkit-run.sh --version "$NGINX_VERSION" \
-            -- consumer-cache-turbo shm-coherence-varidx
+            -- consumer-cache-turbo shm-coherence-varidx fault-slab-store
 
       - name: Scenario SKIPs cleanly on an unstaged tree
         if: ${{ !inputs.skip-expensive-jobs }}
@@ -228,4 +240,13 @@ jobs:
           # A version nothing stages. The gate must SKIP -- not fail: a missing
           # consumer .so is an environment fact, and a red here would train
           # people to ignore this leg.
-          ci/tools/testkit-run.sh --expect-skip --version "${NGINX_STABLE:-1.30.4}"
+          #
+          # fault-slab-store is named explicitly for the same reason it is
+          # named in the pass direction: naming any scenario REPLACES
+          # testkit-run.sh's default rather than adding to it, so a scenario
+          # absent from this list has its ./requires gate untested in the skip
+          # direction. That gate is the one that refuses a non-harness .so, and
+          # a gate nothing exercises is how a scenario silently degrades to
+          # permanent-SKIP in the direction that reads green.
+          ci/tools/testkit-run.sh --expect-skip --version "${NGINX_STABLE:-1.30.4}" \
+            -- consumer-cache-turbo fault-slab-store

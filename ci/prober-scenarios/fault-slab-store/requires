@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+#
+# Copyright (C) 2026 Thijs Eilander
+# SPDX-License-Identifier: BSD-2-Clause
+#
+# Gate for fault-slab-store.
+#
+# Two requirements, both SKIP rather than FAIL because both are environment
+# facts rather than defects -- and both are also ways this scenario could
+# otherwise pass while measuring nothing, so neither is checked loosely.
+#
+#   1. the cache_turbo .so in the tree that will ACTUALLY be booted. Globbing
+#      .build/*/objs would find the .so in ANY staged tree, so with it present
+#      in one and absent from the booted one the gate passes and nginx dies at
+#      `nginx -t` on a dlopen failure -- a hard FAIL where a gate should give a
+#      clean SKIP.
+#
+#   2. THE .so MUST BE A HARNESS BUILD. This is the one that matters here.
+#      Both halves of what this scenario tests -- the cache_turbo_probe
+#      directive AND the fault-injection branch in shm_alloc_evict() -- are
+#      inside #ifdef NGX_TEST_HARNESS. A .so built without the macro exports no
+#      probe directive at all, so the conf would die at config test; and even
+#      if it somehow loaded, `fault_slab=` would arm a field nothing reads and
+#      every oracle below would pass while injecting nothing. The detection is
+#      a symbol lookup rather than a build-flag guess: it asks the artifact.
+#
+# nonzero exit => run-scenario.sh emits "1..0 # SKIP <stdout of this gate>"
+#
+# run-scenario.sh runs this BEFORE prober_resolve, so PROBER_RESOLVED_BUILD
+# does not exist yet; recompute the same path lib.sh will, taking flavor and
+# version from argv ($2/$3) with the same defaults, as the sibling gates do.
+FLAVOR="${2:-nginx}"
+VERSION="${3:-1.31.3}"
+BUILD="${PROBER_BUILD:-${PROBER_ROOT:-.}/.build/${FLAVOR}-${VERSION}}"
+
+SO="$BUILD/objs/ngx_http_cache_turbo_module.so"
+
+if [ ! -f "$SO" ]; then
+    echo "cache_turbo module .so not found in $BUILD/objs -- this scenario's conf load_modules it unconditionally, so this tree cannot run it (stage with ci/tools/testkit-stage.sh)"
+    exit 1
+fi
+
+if ! command -v nm >/dev/null 2>&1; then
+    echo "no nm on PATH -- cannot verify that $SO is an NGX_TEST_HARNESS build, and guessing would let a non-harness .so reach a conf whose cache_turbo_probe directive it does not implement"
+    exit 1
+fi
+
+if ! nm "$SO" 2>/dev/null | grep -q 'ngx_http_cache_turbo_probe_hooks_register'; then
+    echo "$SO carries no ngx_http_cache_turbo_probe_hooks_register -- it was built WITHOUT NGX_TEST_HARNESS, so it exports no cache_turbo_probe directive and carries no fault-injection branch; every oracle here would pass having injected nothing (stage with ci/tools/testkit-stage.sh, which configures testkit's t/module into the same tree and that is what defines the macro)"
+    exit 1
+fi
+
+exit 0

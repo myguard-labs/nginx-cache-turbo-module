@@ -763,6 +763,24 @@ typedef struct {
 } ngx_http_cache_turbo_node_t;
 
 
+/* S24: the DISARMED sentinel for shctx.fault_slab_countdown (see the field's
+ * own comment for the full encoding and locking story).
+ *
+ * ngx_atomic_t is ngx_atomic_uint_t -- UNSIGNED -- so "disarmed" cannot be a
+ * negative value and is instead the all-ones word. The cast route via
+ * ngx_atomic_int_t is what makes that portable across the ngx_atomic.h
+ * variants (long / int64_t / int32_t depending on platform and whether
+ * NGX_HAVE_ATOMIC_OPS is set), rather than hard-coding a width here.
+ *
+ * A probe-supplied nth cannot collide with it: ngx_test_probe_arm() caps the
+ * value at NGX_TEST_PROBE_FAULT_MAX_DIGITS digits before it ever reaches
+ * fault_set, and anything negative is the DISARM request rather than a
+ * countdown. Defined unconditionally alongside the unconditional field so the
+ * carve path in shm.c can initialise it without a second #if. */
+#define NGX_HTTP_CACHE_TURBO_FAULT_DISARMED \
+    ((ngx_atomic_uint_t) (ngx_atomic_int_t) -1)
+
+
 /* Shared-memory zone state: rbtree of cached objects + LRU + stats. */
 typedef struct ngx_http_cache_turbo_shctx_s {
     ngx_rbtree_t             rbtree;
@@ -1112,6 +1130,66 @@ typedef struct ngx_http_cache_turbo_shctx_s {
      * failure path funnels through (op_fail's tag_add ops carry no members_cb,
      * no is_lock and no request, so they always reach its op_done else-arm). */
     ngx_atomic_t             varidx_inflight;
+
+    /* S24: probe-armed slab-allocation fault countdown, for testkit's
+     * `fault_slab=N` arm query (ngx_test_probe_hooks_t.fault_set).
+     *
+     * ENCODING. NGX_HTTP_CACHE_TURBO_FAULT_DISARMED -- the initial value, and
+     * what a negative nth restores -- is DISARMED. Any other value is a
+     * SINCE-ARMED countdown of allocation attempts through
+     * shm_alloc_evict(): the arm stores N, each subsequent attempt decrements,
+     * and the attempt that finds it at 0 is the one forced to fail, disarming
+     * the field as it goes. `fault_slab=0` therefore fails the very next
+     * allocation. Since-ARMED and not since-start is the whole point: a
+     * since-start ordinal would name an attempt number no test can predict,
+     * because the zone has already served the prober's own warm-up traffic by
+     * the time the arm query arrives.
+     *
+     * DISARMED is spelled as an out-of-band sentinel rather than as a separate
+     * boolean so that arming is one store and the trip is one compare --
+     * ngx_atomic_t is UNSIGNED (ngx_atomic_uint_t), so there is no negative
+     * range to borrow and the sentinel is the all-ones value, which no
+     * legitimate countdown can reach from a probe-supplied nth.
+     *
+     * WHY IT LIVES IN SHM AND NOT IN A PROCESS GLOBAL.
+     *   The arm arrives as an HTTP request, and nginx hands that request to
+     *   whichever worker wins the accept; the request that must then TRIP the
+     *   fault is a separate connection and lands wherever accept sends it. A
+     *   per-worker global would be armed in worker A and never consulted by
+     *   worker B, so the fault would silently not fire and the test would go
+     *   green having injected nothing -- exactly the hazard testkit's
+     *   fault_set contract calls out. In the zone, the arm is visible to
+     *   whichever worker reaches the funnel first, which is also what a
+     *   multi-worker delta oracle needs.
+     *
+     * LOCKING IS ASYMMETRIC AND DELIBERATELY SO. The TRIP side runs inside
+     * shm_alloc_evict() with the shpool mutex held, so it is a plain
+     * read-modify-write under that mutex, exactly like used_bytes. The ARM
+     * side runs on a probe request and does NOT take the mutex, for the same
+     * reason the zone_render hook does not: serialising the probe against the
+     * request traffic it is meant to observe would perturb the measurement.
+     * The type is ngx_atomic_t so that unsynchronised store is a single
+     * word-sized write rather than something the compiler may tear or sink.
+     *
+     * WHY IT IS UNCONDITIONAL WHILE THE INJECTION BRANCH IS NOT.
+     *   A #if-gated member would change ngx_http_cache_turbo_shctx_t's LAYOUT
+     *   between a harness build and a shipping build -- the same conditional-
+     *   ABI divergence ngx_http_cache_turbo_probe.c refused for loc_conf (see
+     *   its file comment). A harness build would then stop being a faithful
+     *   proxy for the real one, and every offset past this point would differ
+     *   between the .so under test and the .so that ships.
+     *
+     *   The cost of keeping it unconditional turns out to be NOTHING: this
+     *   struct already carries ~120 bytes of padding from the deliberate
+     *   cache-line alignment PERF-AUD2-12 documents, and the field lands
+     *   inside it. sizeof(ngx_http_cache_turbo_shctx_t) is 832 with the field
+     *   and 832 without it, measured 2026-08-27. Even had it cost a word, one
+     *   word of shm per zone once is the right price for layout identity.
+     *
+     *   Only the branch that READS it, in shm_alloc_evict(), is compiled out
+     *   of a shipping build, so production carries neither the test nor any
+     *   way to reach it. */
+    ngx_atomic_t             fault_slab_countdown;
 
     /* L9: counts tag-index writes (tag_add / tag_add_many for
      * cache_turbo_tag) that never reached the transport at store time --

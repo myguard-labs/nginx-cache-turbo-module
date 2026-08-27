@@ -1,0 +1,20 @@
+# Copyright (C) 2026 Thijs Eilander
+# SPDX-License-Identifier: BSD-2-Clause
+#
+# Sourced by run-scenario.sh after prober_resolve and before the conf is
+# rendered.
+#
+# The probe directive and the zone it is pointed at. NOT testkit's
+# `test_ref_probe`: that aims ngx_test_probe_json() at the ref module's own
+# zone, which is NULL in this scenario. A NULL zone matters twice here --
+# zone_render is skipped (so none of our fields render) AND, decisively,
+# ngx_test_probe_arm() only dispatches to fault_set when a zone is present, so
+# every `fault_slab=` query would fall through to the (unregistered)
+# fault_set_global and be refused. The scenario would then run green against a
+# server that was never armed. cache_turbo's own directive passes OUR
+# ngx_shm_zone_t and is what makes the arm reach the hook.
+#
+# PROBER_PROBE_ZONE is empty: the zone is declared by `cache_turbo_zone` in the
+# conf (it needs a name the /cached/ location also references), not by a
+# probe-side directive. lib.sh documents empty as legitimate for exactly this.
+PROBER_PROBE='cache_turbo_probe ct;'

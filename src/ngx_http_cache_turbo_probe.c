@@ -61,6 +61,8 @@
 
 static u_char *ngx_http_cache_turbo_probe_zone_render(u_char *buf,
     u_char *last, ngx_shm_zone_t *zone);
+static ngx_int_t ngx_http_cache_turbo_probe_fault_set(ngx_shm_zone_t *zone,
+    ngx_test_probe_fault_e fault, ngx_int_t nth);
 static ngx_int_t ngx_http_cache_turbo_probe_handler(ngx_http_request_t *r);
 
 
@@ -91,13 +93,15 @@ static ngx_shm_zone_t  *ngx_http_cache_turbo_probe_zone;
  * file in the same shape as the other consumers, so a future member addition
  * breaks here the same way it breaks there -- loudly, at compile time.
  *
- * fault_set is NULL: this module has no probe-armed fault sites. The probe
- * treats that exactly as "no such site" and refuses a fault_* query rather
- * than reporting one applied.
+ * The second member is fault_set. This module implements exactly ONE site,
+ * NGX_TEST_PROBE_FAULT_SLAB, and returns NGX_DECLINED for every other value
+ * of the enum -- which is the same answer the probe gives for a module with
+ * no fault hook at all, so `fault_palloc=`, `fault_tempfile=`, `fault_accept=`
+ * and both codec sites are refused rather than reported applied.
  */
 static const ngx_test_probe_hooks_t  ngx_http_cache_turbo_probe_hooks = {
     ngx_http_cache_turbo_probe_zone_render,
-    NULL
+    ngx_http_cache_turbo_probe_fault_set
 };
 
 
@@ -218,6 +222,97 @@ ngx_http_cache_turbo_probe_zone_render(u_char *buf, u_char *last,
 
 
 /*
+ * Arm or disarm this module's ONE probe-addressable fault site.
+ *
+ * CONTRACT (ngx_test_probe_hooks_t.fault_set): the probe has already parsed
+ * and validated the query argument, decided which site it named and bounded
+ * the digit run, so everything arriving here is well-formed. All this hook
+ * does is store the result for a site it actually has, and refuse everything
+ * else. NGX_OK means applied; NGX_DECLINED means "no such fault site here" --
+ * deliberately the SAME answer as a module that registered no hook at all, so
+ * a rule naming an unimplemented site is refused rather than reported armed.
+ *
+ * WHY ONLY FAULT_SLAB.
+ *   It is the only site this module has a single honest chokepoint for.
+ *   ngx_http_cache_turbo_shm_alloc_evict() is the SOLE allocation funnel for
+ *   cached payload and metadata -- every node allocation, and via blob_alloc()
+ *   every body allocation, passes through it, and it is one of only two
+ *   ngx_slab_alloc* call sites in the whole module (the other carves the shctx
+ *   once at zone init, before any request exists). One gate there covers the
+ *   entire class.
+ *
+ *   The other enum values have no such point. FAULT_PALLOC would need every
+ *   ngx_palloc site in the request path, FAULT_TEMPFILE and FAULT_ACCEPT name
+ *   machinery this module does not own at all, and the two codec sites belong
+ *   to compression filters. Registering them would mean claiming an arm the
+ *   module cannot honour -- a query answered "applied" that injects nothing,
+ *   which is strictly worse than a refusal because it reads as coverage.
+ *
+ * THE STORE IS NOT UNDER THE ZONE MUTEX, ON PURPOSE.
+ *   Same reasoning as zone_render above: this runs on a probe request, and
+ *   taking the shpool mutex here would serialise the probe against the very
+ *   request traffic the arm is about to be measured against. The trip side, in
+ *   shm_alloc_evict(), DOES hold that mutex (it is the same critical section
+ *   as the allocation), so the countdown is only ever decremented under it.
+ *   The one unsynchronised operation is this single word-sized store, which is
+ *   why the field is ngx_atomic_t rather than a plain ngx_uint_t.
+ *
+ *   The store is also idempotent in the direction that matters: an arm that
+ *   lands while another worker is mid-decrement either wins or loses the race
+ *   for that one attempt, and either way the field ends holding a valid
+ *   countdown or the disarmed sentinel. There is no torn intermediate state to
+ *   observe, because there is no multi-word invariant here.
+ */
+static ngx_int_t
+ngx_http_cache_turbo_probe_fault_set(ngx_shm_zone_t *zone,
+    ngx_test_probe_fault_e fault, ngx_int_t nth)
+{
+    ngx_http_cache_turbo_zone_t  *z;
+
+    if (fault != NGX_TEST_PROBE_FAULT_SLAB) {
+        return NGX_DECLINED;
+    }
+
+    /*
+     * "Zone not ready" is an explicit NGX_DECLINED in the contract, and the
+     * checks are the same three zone_render makes: the probe reaches this hook
+     * off shm.addr alone, so it can be called for a zone whose init() never
+     * ran, and after a FAILED init z->sh is NULL while shm.addr is not.
+     * Storing into that would be a NULL dereference; reporting NGX_OK without
+     * storing would be worse -- the rule would believe it armed a fault that
+     * can never fire.
+     */
+    if (zone == NULL || zone->data == NULL) {
+        return NGX_DECLINED;
+    }
+
+    z = zone->data;
+
+    if (z->nstripes == 0 || ngx_http_cache_turbo_zone_sh(z) == NULL) {
+        return NGX_DECLINED;
+    }
+
+    /*
+     * A negative nth is the documented DISARM. Restoring the sentinel rather
+     * than storing the negative value is what keeps the encoding closed: the
+     * field is unsigned, so a stored -1 and the sentinel are the same word,
+     * but -2 would land as a colossal countdown that never trips and never
+     * clears.
+     */
+    if (nth < 0) {
+        ngx_http_cache_turbo_zone_sh(z)->fault_slab_countdown =
+            NGX_HTTP_CACHE_TURBO_FAULT_DISARMED;
+        return NGX_OK;
+    }
+
+    ngx_http_cache_turbo_zone_sh(z)->fault_slab_countdown =
+        (ngx_atomic_uint_t) nth;
+
+    return NGX_OK;
+}
+
+
+/*
  * `cache_turbo_probe <zone>;` -- location level, harness builds only.
  *
  * Binds the probe location to a cache_turbo zone and installs the handler.
@@ -293,6 +388,28 @@ ngx_http_cache_turbo_probe_handler(ngx_http_request_t *r)
     if (rc != NGX_OK) {
         return rc;
     }
+
+    /*
+     * S24: process any fault-injection arm in the query string BEFORE
+     * rendering, so the document reflects the state after arming -- the order
+     * testkit's PROBE_HTTP_TEMPLATE.c documents and its ref module follows.
+     *
+     * ⚠ THIS CALL IS WHAT MAKES fault_set REACHABLE AT ALL. Registering the
+     * hook is not enough: ngx_test_probe_json() never consults it, and
+     * ngx_test_probe_arm() is called by the CONSUMER's probe handler, never by
+     * the renderer. A handler that registers the hook and omits this line
+     * compiles, links, loads, answers every probe read correctly, and declines
+     * every fault_slab= query while looking fully instrumented.
+     *
+     * The return value is discarded deliberately. NGX_DECLINED here means "no
+     * arm in this query", which is the ordinary case for the plain reads every
+     * other oracle makes, and it is not an error for the probe document. A
+     * rule that armed a site this module does not implement learns so by
+     * observing that the fault never fired, which is the failure it wants --
+     * not by a 500 on the probe endpoint that would take every other reading
+     * down with it.
+     */
+    (void) ngx_test_probe_arm(ngx_http_cache_turbo_probe_zone, &r->args);
 
     size = NGX_TEST_PROBE_JSON_MAX + 256;
     if (ngx_http_cache_turbo_probe_zone != NULL) {

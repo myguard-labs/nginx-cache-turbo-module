@@ -233,6 +233,19 @@ ngx_http_cache_turbo_shm_init_zone(ngx_shm_zone_t *shm_zone, void *data)
     st->sh->tag_index_drops = 0;
     st->sh->tag_cap_drops = 0;
 
+    /* S24: DISARMED, explicitly and unconditionally, and the explicitness is
+     * not cosmetic. st->sh comes from ngx_slab_alloc(), which does NOT zero
+     * (see the S231-EVICT-BLIND note at evict_one()), so an uninitialised
+     * member here holds whatever the slab last had at that offset. In this
+     * field's encoding 0 means ARMED-FOR-THE-NEXT-ALLOCATION, so omitting
+     * this line would let a recycled byte pattern fail a genuine allocation
+     * in any build carrying the injection branch. The field is unconditional
+     * (see its declaration in module.h, which explains why) and so is this
+     * initialisation -- one store on the once-per-zone carve path is not worth
+     * a second #if, and keeping it unconditional means the shipping build
+     * cannot drift into leaving the field undefined. */
+    st->sh->fault_slab_countdown = NGX_HTTP_CACHE_TURBO_FAULT_DISARMED;
+
     /* P4-1a: allocate the W-TinyLFU frequency sketch.
      *
      * SIZING. The sketch is a FIXED overhead taken out of the same slab that
@@ -1315,7 +1328,64 @@ ngx_http_cache_turbo_shm_evict_one(ngx_http_cache_turbo_zone_t *z)
 static void *
 ngx_http_cache_turbo_shm_alloc_evict(ngx_http_cache_turbo_zone_t *z, size_t size)
 {
-    void  *p = ngx_slab_alloc_locked(ngx_http_cache_turbo_zone_pool(z), size);
+    void  *p;
+
+#ifdef NGX_TEST_HARNESS
+    /* S24: probe-armed slab-allocation fault, for testkit's `fault_slab=N`
+     * arm query. See ngx_http_cache_turbo_probe.c's fault_set hook for the
+     * arming side and module.h's fault_slab_countdown for the encoding
+     * (NGX_HTTP_CACHE_TURBO_FAULT_DISARMED == disarmed; a non-negative value
+     * is a since-armed countdown of attempts through this funnel).
+     *
+     * WHY THE INJECTION IS *HERE* AND NOT AT THE ngx_slab_alloc_locked() CALL.
+     *   Forcing the first ngx_slab_alloc_locked() to return NULL injects
+     *   NOTHING. This function's entire job is to survive that: on NULL it
+     *   evicts an LRU victim and retries, and against a zone holding anything
+     *   evictable the retry succeeds. The caller would then see a perfectly
+     *   ordinary non-NULL return, the error path under test would never be
+     *   entered, and the scenario would report green having exercised the
+     *   happy path -- with the added insult of a real cache entry destroyed to
+     *   make room. A fault the code under test routinely recovers from is not
+     *   a fault; it is a slow allocation.
+     *
+     *   The honest injection is the one that makes the WHOLE funnel answer
+     *   NULL, which is the only answer any caller of this function has an
+     *   error path for. Returning before the allocator is consulted at all
+     *   also leaves the zone exactly as it was found: nothing evicted,
+     *   used_bytes unmoved, no slab state perturbed. That matters for the
+     *   oracle this exists to feed -- a resource-delta comparison across the
+     *   faulting request cannot tell a leak from collateral eviction if the
+     *   fault path is allowed to mutate the zone on its way out.
+     *
+     * PLAIN READ-MODIFY-WRITE, NOT AN ATOMIC, AND THAT IS NOT AN OVERSIGHT.
+     *   Every caller of this function holds the shpool mutex (stated in the
+     *   contract comment above, and structurally true: the function calls
+     *   ngx_slab_alloc_LOCKED). The field is therefore mutex-protected here
+     *   exactly like used_bytes two lines below, and a cmp-set loop would buy
+     *   nothing but the false impression that this path is lock-free. The
+     *   field is still declared ngx_atomic_t because the ARMING side --
+     *   fault_set, called from a probe request -- deliberately does not take
+     *   the zone mutex, for the same reason the zone_render hook does not.
+     *
+     * ONE ARM, EXACTLY ONE INJECTED FAILURE. The attempt that finds the
+     * countdown at 0 fails and disarms in the same critical section, so no
+     * follow-up disarm request is needed and no second worker can trip the
+     * same arm. Attempts made while disarmed touch nothing. */
+    {
+        ngx_atomic_t  *fc =
+            &ngx_http_cache_turbo_zone_sh(z)->fault_slab_countdown;
+
+        if (*fc != NGX_HTTP_CACHE_TURBO_FAULT_DISARMED) {
+            if (*fc == 0) {
+                *fc = NGX_HTTP_CACHE_TURBO_FAULT_DISARMED;
+                return NULL;
+            }
+            (*fc)--;
+        }
+    }
+#endif
+
+    p = ngx_slab_alloc_locked(ngx_http_cache_turbo_zone_pool(z), size);
 
     while (p == NULL && ngx_http_cache_turbo_shm_evict_one(z)) {
         p = ngx_slab_alloc_locked(ngx_http_cache_turbo_zone_pool(z), size);
