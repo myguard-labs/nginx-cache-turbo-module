@@ -74,12 +74,64 @@
 #                       actually carry .gcno, same reasoning as --sanitizer.
 #                       Mutually exclusive with --sanitizer (testkit-stage.sh
 #                       enforces it too; caught here before a wasted build).
+#     --valgrind        select (and with --stage, build) the DEBUG tree
+#                       .build/<flavor>-<version>-testkit-valgrind, and run
+#                       every scenario under valgrind memcheck by exporting
+#                       the SAME PROBER_VALGRIND / PROBER_TIMEOUT_SCALE=40
+#                       testkit's own ci/prober/valgrind-scenarios.sh exports
+#                       -- copied from that entry point's proven flag set, not
+#                       re-derived (S21: "consumers copy the template, not the
+#                       script; the flag set is fixed and proven, not a
+#                       tunable surface"). Verified to actually be a
+#                       non-sanitized build, same reasoning as --sanitizer.
+#                       Mutually exclusive with --sanitizer and --coverage
+#                       (testkit-stage.sh enforces it too; caught here before
+#                       a wasted build). WEEKLY, not nightly -- memcheck is
+#                       20-50x slower, see the cron in .github/workflows.
 #     --expect-skip     invert the verdict: PASS only if the scenario SKIPs.
 #                       The negative control for the whole adoption -- see below.
 #     --list            print the scenarios that would run, exit
 #     -h, --help        this header
 #
 #   With no `-- scenario` list, runs consumer-cache-turbo.
+#
+# --valgrind, AND WHY IT DOES NOT CALL testkit's valgrind-scenarios.sh
+#   testkit ships ci/prober/valgrind-scenarios.sh as its OWN weekly entry
+#   point, but that script `exec`s test-scenarios.sh, which globs testkit's
+#   OWN ci/prober/scenarios/*/ tree relative to testkit's checkout. This
+#   repo's consumer-cache-turbo, and every S25/S26 real-HIT-path scenario
+#   under ci/prober-scenarios/, would never be reached that way --
+#   skip-allowlist.sh even hardcodes consumer-cache-turbo as an
+#   ALWAYS-expected skip for every flavor, because testkit's own generic
+#   harness never stages a consumer .so. Running the stock entry point here
+#   would produce a weekly job that looks wired but exercises nothing of
+#   THIS module -- the exact `1..0 # SKIP`-reads-as-green trap S1-S20 exist to
+#   close, one level up.
+#
+#   So --valgrind does what the S21 plan row's own text prescribes: copy the
+#   PROVEN FLAG SET (PROBER_VALGRIND, PROBER_TIMEOUT_SCALE=40), not the
+#   script, and drive it through THIS repo's own staging/scenario-selection
+#   (testkit-stage.sh + the scenario search this script already does) --
+#   because that is the only path that ever reaches cache_turbo's .so or its
+#   local ci/prober-scenarios/ ports. PROBER_VALGRIND is a plain env var
+#   lib.sh's prober_boot reads at the moment it execs the server
+#   (lib.sh:1437), regardless of which caller set it, so exporting it around
+#   run-scenario.sh here is equivalent to testkit's own script setting it
+#   before its own exec -- same mechanism, different scenario source.
+#
+#   The suppression file is testkit's own ci/prober/valgrind.supp -- the pair
+#   is only meaningful against the process boundaries testkit's harness
+#   creates (master/worker via prober_boot), which is what these flags were
+#   proven against; this repo's ci/tools/valgrind.supp suppresses the SAME
+#   nginx-core-never-freed-at-exit arenas but is tuned for ci/tools/soak.sh's
+#   own process shape, not testkit's.
+#
+#   --error-exitcode=99 is the belt; run-scenario.sh's own
+#   prober_scrape_valgrind is the suspenders (greps every
+#   $PROBER_PREFIX/logs/valgrind.* log for a definite leak or a nonzero
+#   ERROR SUMMARY regardless of exit code) -- called unconditionally by
+#   run-scenario.sh for every scenario, so no extra step is needed here to
+#   wire the suspenders half in.
 #
 # --expect-skip, AND WHY IT EXISTS
 #   The entire value of this integration is that the scenario stopped SKIPping.
@@ -121,6 +173,7 @@ DO_STAGE=0
 EXPECT_SKIP=0
 SANITIZE=0
 COVERAGE=0
+VALGRIND=0
 LIST=0
 SCENARIOS=()
 
@@ -136,6 +189,7 @@ while [ $# -gt 0 ]; do
         --stage)       DO_STAGE=1; shift ;;
         --sanitizer)   SANITIZE=1; shift ;;
         --coverage)    COVERAGE=1; shift ;;
+        --valgrind)    VALGRIND=1; shift ;;
         --expect-skip) EXPECT_SKIP=1; shift ;;
         --list)        LIST=1; shift ;;
         -h|--help)     sed -n '2,/^set -euo/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -144,8 +198,9 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-[ "$SANITIZE" -eq 1 ] && [ "$COVERAGE" -eq 1 ] && \
-    usage "--sanitizer and --coverage are mutually exclusive (separate stage trees)"
+_run_modes=$((SANITIZE + COVERAGE + VALGRIND))
+[ "$_run_modes" -gt 1 ] && \
+    usage "--sanitizer, --coverage and --valgrind are mutually exclusive (separate stage trees)"
 
 case "$PORT" in
     ''|*[!0-9]*) usage "--port must be numeric, got '$PORT'" ;;
@@ -169,12 +224,14 @@ fi
 STAGE_SUFFIX=testkit
 [ "$SANITIZE" -eq 1 ] && STAGE_SUFFIX=testkit-asan
 [ "$COVERAGE" -eq 1 ] && STAGE_SUFFIX=testkit-coverage
+[ "$VALGRIND" -eq 1 ] && STAGE_SUFFIX=testkit-valgrind
 STAGE_DIR="${BUILD_ROOT:-$ROOT/.build}/${FLAVOR}-${VERSION}-${STAGE_SUFFIX}"
 
 if [ "$DO_STAGE" -eq 1 ]; then
     stage_args=(--flavor "$FLAVOR" --version "$VERSION" --testkit "$TESTKIT")
     [ "$SANITIZE" -eq 1 ] && stage_args+=(--sanitizer)
     [ "$COVERAGE" -eq 1 ] && stage_args+=(--coverage)
+    [ "$VALGRIND" -eq 1 ] && stage_args+=(--valgrind)
     ci/tools/testkit-stage.sh "${stage_args[@]}" || die "staging failed"
 fi
 
@@ -213,6 +270,30 @@ if [ "$COVERAGE" -eq 1 ] && [ "$EXPECT_SKIP" -eq 0 ]; then
     fi
     find "$STAGE_DIR/objs/addon/src" -maxdepth 1 -name '*.gcno' -print -quit | grep -q . || \
         die "--coverage given but $STAGE_DIR/objs/addon/src carries no .gcno -- restage with --coverage"
+fi
+
+# ---- the valgrind contract ---------------------------------------------------
+# Valgrind memcheck and ASan both intercept the allocator and neither tolerates
+# the other, so a tree that was asked to be a plain DEBUG valgrind build and
+# came out sanitized instead would run the whole soak measuring the WRONG
+# thing (or aborting outright) while still reporting a verdict -- the same
+# silent-miswiring shape the sanitizer/coverage contracts above exist to
+# catch, just inverted: there the flag demands instrumentation and its absence
+# is the defect, here the flag demands its ABSENCE and its presence is the
+# defect. Same detection (`__asan_\|__ubsan_`) as the sanitizer contract and
+# as testkit-stage.sh's own converse "UNEXPECTEDLY SANITIZED" gate -- three
+# places agreeing, same reasoning as the sanitizer contract's own comment.
+if [ "$VALGRIND" -eq 1 ] && [ "$EXPECT_SKIP" -eq 0 ]; then
+    if [ ! -f "$STAGE_DIR/objs/nginx" ] && [ ! -f "$STAGE_DIR/objs/angie" ]; then
+        die "no valgrind tree at $STAGE_DIR/objs -- run ci/tools/testkit-stage.sh --valgrind (or pass --stage)"
+    fi
+    for _obj in "$STAGE_DIR/objs/nginx" "$STAGE_DIR/objs/angie" \
+                "$STAGE_DIR/objs/ngx_http_cache_turbo_module.so"; do
+        [ -f "$_obj" ] || continue
+        if grep -qa '__asan_\|__ubsan_' "$_obj"; then
+            die "--valgrind tree at $_obj carries an ASan/UBSan runtime -- valgrind and ASan do not mix, restage with --valgrind (never --sanitizer)"
+        fi
+    done
 fi
 
 # ---- detect_leaks: a deliberate decision, not an omission -------------------
@@ -276,6 +357,22 @@ if [ "$EXPECT_SKIP" -eq 0 ] && [ ! -d "$STAGE_DIR/objs" ]; then
     die "no staged tree at $STAGE_DIR/objs -- run ci/tools/testkit-stage.sh (or pass --stage)"
 fi
 
+# PROBER_VALGRIND / PROBER_TIMEOUT_SCALE=40 -- copied verbatim from testkit's
+# ci/prober/valgrind-scenarios.sh, which documents each flag at length (see
+# this script's own --valgrind header above for why that script itself is not
+# called). --log-file is deliberately absent here: lib.sh's prober_boot
+# appends it once $PROBER_PREFIX is known (only known at boot time), so a
+# caller-supplied PROBER_VALGRIND must never include it. Suppressions come
+# from TESTKIT's own valgrind.supp -- these flags were proven against
+# testkit's harness process shape, not against ci/tools/soak.sh's.
+VG_ENV=()
+if [ "$VALGRIND" -eq 1 ]; then
+    VG_ENV=(
+        "PROBER_VALGRIND=valgrind --error-exitcode=99 --leak-check=full --errors-for-leak-kinds=definite --track-origins=yes --track-fds=all --gen-suppressions=all --suppressions=$TESTKIT/ci/prober/valgrind.supp"
+        "PROBER_TIMEOUT_SCALE=${PROBER_TIMEOUT_SCALE:-40}"
+    )
+fi
+
 status=0
 
 for name in "${SCENARIOS[@]}"; do
@@ -303,6 +400,10 @@ for name in "${SCENARIOS[@]}"; do
     rc=0
     # PROBER_BUILD absolute -- see the header. PROBER_PROBE carries its own
     # trailing ';' because it is substituted directly into a conf location body.
+    # VG_ENV is empty unless --valgrind was given; `env` with a possibly-empty
+    # array is the portable way to prepend zero-or-more VAR=val pairs to one
+    # command without a second, near-duplicate invocation for the plain path.
+    env "${VG_ENV[@]}" \
     PROBER_BUILD="$STAGE_DIR" \
     PROBER_ROOT="$ROOT" \
     PROBER_PORT="$PORT" \

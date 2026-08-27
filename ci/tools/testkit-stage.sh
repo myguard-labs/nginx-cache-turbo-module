@@ -75,6 +75,18 @@
 #                       allocation counters gcov timing does not care about,
 #                       and gcov's -O0 defeats nothing ASan needs, so stacking
 #                       them would only spend build time proving neither number)
+#     --valgrind        build the server + both modules DEBUG, explicitly
+#                       WITHOUT a sanitizer (mutually exclusive with both
+#                       --sanitizer and --coverage). Valgrind memcheck and
+#                       ASan both intercept malloc/free and both instrument
+#                       the same shadow-adjacent bookkeeping; running one
+#                       inside the other is unsupported upstream and produces
+#                       noise, not signal (this is the same reason the S21
+#                       weekly job's own consumer template insists on "DEBUG,
+#                       not ASan"). Flags mirror ci-build.sh's `debug` mode
+#                       (-DNGX_DEBUG_PALLOC=1 -g3 -O0), not re-derived here,
+#                       for the same one-spelling-per-mode reason the
+#                       --sanitizer and --coverage blocks below already give.
 #     --src DIR         reuse an unpacked source tree instead of fetching
 #     --keep-src        do not delete a fetched source tree on success
 #     --dry-run         print the configure/make it WOULD run, touch nothing
@@ -115,6 +127,16 @@
 #   the plain or sanitized stage would mean the LAST stage run silently decides
 #   whether "the testkit leg" carries instrumentation data at all.
 #
+#   --valgrind stages into <version>-testkit-valgrind, same reasoning again,
+#   plus a second one specific to this mode: sharing the plain tree would mean
+#   an ordinary `testkit-stage.sh` run (no flags) silently overwrites a
+#   DEBUG-built valgrind tree with an optimized one, or vice versa, and
+#   sharing the `-asan` tree would produce a build that is BOTH DEBUG and
+#   sanitized -- exactly the "unsupported, noise not signal" combination the
+#   flag's help text above warns about. A dedicated name makes "the valgrind
+#   leg's tree" either present-and-plain-debug or absent, never silently
+#   co-opted by whichever other mode staged last.
+#
 #   ⚠ THE STAGE LIVES UNDER THIS REPO'S .build/, NOT TESTKIT'S. testkit's
 #   prober_resolve (lib.sh:81-82) defaults its search root to the TESTKIT repo
 #   root, derived from lib.sh's own BASH_SOURCE -- not to cwd. So a tree staged
@@ -152,6 +174,7 @@ KEEP_SRC=0
 DRY=0
 SANITIZE=0
 COVERAGE=0
+VALGRIND=0
 
 die()   { echo "testkit-stage: $*" >&2; exit 1; }
 usage() { echo "testkit-stage: $*" >&2; exit 2; }
@@ -165,6 +188,7 @@ while [ $# -gt 0 ]; do
         --src)      SRC="${2:?--src needs a value}"; shift 2 ;;
         --sanitizer) SANITIZE=1; shift ;;
         --coverage) COVERAGE=1; shift ;;
+        --valgrind) VALGRIND=1; shift ;;
         --keep-src) KEEP_SRC=1; shift ;;
         --dry-run)  DRY=1; shift ;;
         -h|--help)  sed -n '2,/^set -euo/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -172,8 +196,9 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-[ "$SANITIZE" -eq 1 ] && [ "$COVERAGE" -eq 1 ] && \
-    usage "--sanitizer and --coverage are mutually exclusive (separate purposes, separate stage trees)"
+_modes=$((SANITIZE + COVERAGE + VALGRIND))
+[ "$_modes" -gt 1 ] && \
+    usage "--sanitizer, --coverage and --valgrind are mutually exclusive (separate purposes, separate stage trees)"
 
 case "$JOBS" in
     '')            JOBS="$(nproc 2>/dev/null || echo 4)" ;;
@@ -234,6 +259,7 @@ esac
 STAGE="${FLAVOR}-${VERSION}-testkit"
 [ "$SANITIZE" -eq 1 ] && STAGE="${STAGE}-asan"
 [ "$COVERAGE" -eq 1 ] && STAGE="${STAGE}-coverage"
+[ "$VALGRIND" -eq 1 ] && STAGE="${STAGE}-valgrind"
 BUILD_ROOT="${BUILD_ROOT:-$ROOT/.build}"
 STAGE_DIR="$BUILD_ROOT/$STAGE"
 
@@ -324,6 +350,32 @@ if [ "$COVERAGE" -eq 1 ]; then
     )
 fi
 
+# ---- the valgrind argv ------------------------------------------------------
+# Flag derivation is DELIBERATELY the same spelling ci-build.sh's `debug` mode
+# uses (ci-build.sh:91, the MODE default), not a second one invented here --
+# same one-spelling-per-mode reason as the sanitizer and coverage blocks
+# above. This is also the exact build ci-deep.yml's existing memcheck/helgrind
+# soaks already run under valgrind (`ci-build.sh nginx "$NGINX_VERSION"
+# debug`), so a finding here and a finding there are the same build, not two
+# builds that merely sound alike.
+#
+# NGX_DEBUG_PALLOC=1 turns on nginx's own pool poisoner/logging, which is
+# orthogonal to valgrind's own instrumentation and stays on for the same
+# reason the existing memcheck soak keeps it on: a module bug that corrupts
+# pool bookkeeping is easier to place with both signals than with either
+# alone. -O0 -g3 -fno-omit-frame-pointer keeps valgrind's stack unwinder
+# accurate -- the same reasoning ci-build.sh's own debug-mode comment gives.
+# Explicitly NO --with-cc-opt/--with-ld-opt sanitizer flags: see the
+# --valgrind help text above for why stacking ASan under memcheck is
+# unsupported and produces noise, not signal.
+if [ "$VALGRIND" -eq 1 ]; then
+    DBG_FLAGS="-DNGX_DEBUG_PALLOC=1 -g3 -O0 -fno-omit-frame-pointer -funwind-tables"
+    CONFIGURE_ARGS+=(
+        --with-debug
+        "--with-cc-opt=$DBG_FLAGS"
+    )
+fi
+
 if [ "$DRY" -eq 1 ]; then
     echo "would fetch    : $URL"
     echo "would verify   : $EXPECTED_SHA256"
@@ -332,6 +384,7 @@ if [ "$DRY" -eq 1 ]; then
     echo "would build    : make -j$JOBS   (server binary + both modules)"
     [ "$SANITIZE" -eq 1 ] && echo "would require  : __asan_ present in objs/nginx and both .so"
     [ "$COVERAGE" -eq 1 ] && echo "would require  : .gcno present next to both modules' objects"
+    [ "$VALGRIND" -eq 1 ] && echo "would require  : a DEBUG build with NO ASan/UBSan runtime present"
     echo "would require  : objs/$TK_SO newer than $TESTKIT/src"
     echo "                 objs/$CT_SO newer than $ROOT/src"
     echo "                 objs/nginx executable"

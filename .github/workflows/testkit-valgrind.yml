@@ -1,0 +1,236 @@
+# sync-sha: 1ecc104508d1f93d160d5b5cc4177002d8cd0ce238d3eb2c2b2d3009629ab7ea
+name: Testkit Valgrind
+
+# Weekly memcheck soak of the testkit prober scenarios -- S21.
+#
+# WHAT THIS IS, AND WHY IT IS NOT testkit.yml WITH A FLAG
+#   testkit.yml runs the same consumer-cache-turbo/shm-coherence-varidx/
+#   fault-slab-store/alloc-per-request/fd-starve/multi-worker scenarios NATIVE,
+#   on every PR: each scenario's own fd/pool-delta accounting is a real but
+#   NARROW oracle -- it is blind to a leaked malloc the probe never counted, a
+#   one-time startup leak no delta catches, or a read of freed memory that
+#   happens not to corrupt anything the deltas look at. valgrind memcheck
+#   catches that class directly, at the cost of running the whole worker
+#   20-50x slower -- fine for a weekly job, ruinous on every PR.
+#
+# WHY THIS DOES NOT CALL testkit's ci/prober/valgrind-scenarios.sh DIRECTLY
+#   That script is testkit's own weekly entry point, but it `exec`s
+#   test-scenarios.sh, which globs testkit's OWN ci/prober/scenarios/*/ tree
+#   relative to testkit's checkout -- never this repo's staged cache_turbo
+#   .so, and never ci/prober-scenarios/ (this repo's S25/S26 ports that drive
+#   a REAL cache_turbo HIT path rather than testkit's bare `return 200`).
+#   testkit's own skip-allowlist.sh hardcodes consumer-cache-turbo as an
+#   ALWAYS-expected skip for every flavor, precisely because its generic
+#   harness never stages a consumer module. Calling that script here would
+#   produce a job that LOOKS wired -- it runs, it's green -- while exercising
+#   nothing of this module: the exact "1..0 # SKIP reads as green" trap
+#   testkit.yml's own header exists to close, one level up, wearing a
+#   different mask (a real scenario run against the WRONG tree instead of a
+#   skipped scenario).
+#
+#   So this job copies the PROVEN FLAG SET valgrind-scenarios.sh exports
+#   (PROBER_VALGRIND's exact memcheck invocation, PROBER_TIMEOUT_SCALE=40) --
+#   not the script -- via `ci/tools/testkit-run.sh --valgrind`, which drives
+#   those flags through THIS repo's own staging (testkit-stage.sh) and
+#   scenario search (local ci/prober-scenarios/ first, testkit's generic
+#   scenarios second). That is the only path that ever reaches cache_turbo's
+#   .so. See testkit-run.sh's own --valgrind header for the full mechanism.
+#
+# WHY A SEPARATE DEBUG STAGE TREE, NOT --sanitizer's
+#   Valgrind memcheck and ASan both intercept the allocator; running one
+#   under the other is unsupported upstream and produces noise, not signal
+#   (this is why the upstream template insists on "DEBUG, not ASan"). A
+#   `--valgrind` stage tree (`.build/<flavor>-<version>-testkit-valgrind`) is
+#   a plain `--with-debug` build with nginx's own pool poisoner on
+#   (NGX_DEBUG_PALLOC=1) and no sanitizer flags at all -- verified NOT to
+#   carry an ASan/UBSan runtime by testkit-run.sh's own valgrind contract
+#   check, the same way the sanitizer leg verifies the converse.
+#
+# NON-VACUITY -- WHAT THIS JOB CANNOT PASS WITHOUT
+#   Both directions are checked, same shape as testkit.yml:
+#     - a staged tree must produce real assertions under valgrind (this job's
+#       first scenario step) -- a module that leaked, corrupted memory, or
+#       read past a freed block trips memcheck's --error-exitcode=99 belt,
+#       and prober_scrape_valgrind's log-grep suspenders catch it even if a
+#       future valgrind version stops honouring the exit code for some
+#       finding class (testkit's valgrind_scrape_test.sh proves that pairing
+#       load-bearing, not decorative);
+#     - an UNSTAGED tree must still SKIP cleanly under the same valgrind flags
+#       (this job's second step, --expect-skip) -- proving the pass direction
+#       is not just "valgrind never got a chance to find anything" because
+#       the scenario silently degraded to permanent-SKIP.
+#   Locally verified (this PR, not in CI) that the flag string itself is
+#   load-bearing: pointing --suppressions= at a nonexistent path made the
+#   staged server fail to start and testkit-run.sh --valgrind report FAIL,
+#   confirming PROBER_VALGRIND's contents are actually consumed by the launch
+#   rather than a no-op string. What remains unproven without a longer run:
+#   whether this specific module build has any REAL memcheck finding on the
+#   scenarios below -- that is what the scheduled run itself exists to answer,
+#   repeatedly, and is explicitly out of scope for this PR to demonstrate (see
+#   the S21 grind item: wiring the job is the deliverable, a full soak is not).
+#
+# WEEKLY, NOT NIGHTLY, NOT IN ci-deep.yml
+#   memcheck is 20-50x slower than native (valgrind-scenarios.sh's own
+#   header), so the whole scenario tree under it is minutes, not seconds --
+#   too slow for a nightly cron on the shared self-hosted runner pool, and
+#   ci-deep.yml's own cron is MONTHLY (day 5, 03:30 UTC), not weekly, so a
+#   weekly job does not belong folded into it. Cron slot: Wednesday 03:41 UTC
+#   -- deliberately NOT testkit's own suggested "Monday 03:17" (bump.yml
+#   already runs Monday 04:00 UTC on this shared runner, and a `git fetch` +
+#   dependency bump racing a cold nginx build + memcheck soak is exactly the
+#   kind of pile-up the existing crons stagger against, EVERY week).
+#
+#   Wednesday is clear of bump.yml (every Monday, no exception) and clear of
+#   ci-deep.yml/codeql.yml on MOST weeks, but not year-round: both of those
+#   are "day 5 of the month", and day-5 rotates through all seven weekdays
+#   over time -- 2026-08-05 (this cycle), 2027-05-05, 2028-01/04/07-05 all
+#   land on a Wednesday, and on exactly those mornings ci-deep.yml's
+#   03:30 UTC start is 11 minutes ahead of this job's 03:41 UTC. Accepted
+#   rather than chased: each collision is at most a few times a year, both
+#   jobs bind disjoint port bands (19328 vs 19584) so a live run cannot break
+#   the other's fixtures, and the cost is shared-runner CPU/IO contention for
+#   the overlap window, not a failure -- the same class of cost ci-deep.yml's
+#   OWN header already accepts by running fuzz/memcheck/helgrind/asan-soak/
+#   coverage sequentially in one monthly window rather than staggering each
+#   to its own day. A slot with zero possible overlap, ever, would need to
+#   dodge every day-of-month rather than every day-of-week, which is not a
+#   cron expression this schedule can express without giving up "weekly".
+#
+# Action pins (keep in sync with build-test.yml header):
+# actions/checkout@v5 -> 93cb6efe18208431cddfb8368fd83d5badbf9bfd
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+on:
+  schedule:
+    # Wednesday 03:41 UTC -- see the header for why this slot and not
+    # testkit's own suggested Monday 03:17 (collides with bump.yml's Monday
+    # 04:00 on the shared runner).
+    - cron: "41 3 * * 3"
+  workflow_dispatch: {}
+
+concurrency:
+  group: testkit-valgrind-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  prober-memcheck:
+    name: Prober scenarios under valgrind memcheck
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
+    timeout-minutes: 90
+    env:
+      # This job's own 64-wide port band under ci/tools/lint-ci-ports.sh.
+      # 18880/18944/19008/19072/19136/19200/19264/19328/19456/19520 are taken
+      # by the ten existing runtime-bearing jobs (build-test.yml x2, asan.yml
+      # x2, ci-deep.yml x4, testkit.yml, and this repo's varidx-inflight
+      # multi-peer reservation at 19392-19455 that build-test.yml's own fence
+      # now derives) -- 19584 is the first band clear of all of them.
+      TEST_BASE_PORT: 19584
+      NGINX_VERSION: "1.31.3"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      # Sibling repo, not a submodule -- same reasoning as testkit.yml: a
+      # partial vendor copy cannot build (t/module/config compiles by
+      # relative climb out of testkit's own tree), and a vendored copy drifts
+      # from upstream silently. Pinned, not floating, so a red run here is
+      # blamed on a commit in THIS repo, never on an unannounced testkit move.
+      - name: Check out nginx-module-testkit
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          repository: myguard-labs/nginx-module-testkit
+          ref: 27f724082e16f6d9bd8a2a0ee944ef9dd551ab7e
+          path: .testkit
+          persist-credentials: false
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          # valgrind for the memcheck soak itself; openssl/zlib headers are
+          # for the PROBER CLIENT (its body_sha256 oracle links OpenSSL, its
+          # gunzip oracle links zlib), not for this module. redis-server/
+          # redis-tools are for shm-coherence-varidx -- see testkit.yml's own
+          # comment on that scenario's SKIP-without-Redis behaviour, which
+          # applies here identically.
+          sudo apt-get install -y build-essential ccache curl eatmydata \
+            libpcre2-dev libssl-dev redis-server redis-tools valgrind zlib1g-dev
+
+      - name: Restore build caches
+        uses: ./.github/actions/build-cache
+        with:
+          # A distinct ccache namespace from `testkit` (plain) and
+          # `testkit-asan`: this build's CFLAGS differ from both (DEBUG
+          # pool-poisoning flags, no sanitizer), so sharing either namespace
+          # would trade hits for misses for no benefit.
+          mode: testkit-valgrind
+          nginx-version: ${{ env.NGINX_VERSION }}
+
+      - name: Sweep stale test listeners
+        run: |
+          command -v fuser >/dev/null || sudo apt-get install -y psmisc
+          for p in $(seq "$TEST_BASE_PORT" $((TEST_BASE_PORT + 63))); do
+            fuser -k -TERM "${p}/tcp" 2>/dev/null || true
+          done
+          sleep 1
+
+      - name: Verify runtime port band
+        run: ci/tools/max-port.sh "$TEST_BASE_PORT"
+
+      - name: Stage cache-turbo + testkit ref probe (DEBUG, no sanitizer)
+        env:
+          TESTKIT_ROOT: ${{ github.workspace }}/.testkit
+        run: ci/tools/testkit-stage.sh --valgrind --version "$NGINX_VERSION"
+
+      - name: Report compiler-cache effectiveness
+        run: ccache --show-stats
+
+      # --- the two directions -------------------------------------------------
+      # Both required, same reasoning as testkit.yml: the pass direction alone
+      # cannot detect a regression to permanent-SKIP under valgrind (that
+      # exits 0 and reads green); the skip direction alone cannot detect a
+      # broken oracle. PROBER_TIMEOUT_SCALE is left at testkit-run.sh's own
+      # default (40) rather than overridden here -- this runner is shared and
+      # serial, not a fast dedicated box, so the generous default is the safe
+      # choice; lower it only if this job starts timing out for harness
+      # reasons rather than a genuine hang.
+      - name: Scenarios assert on a staged tree, under valgrind memcheck
+        env:
+          TESTKIT_ROOT: ${{ github.workspace }}/.testkit
+        run: |
+          ci/tools/testkit-run.sh --valgrind --version "$NGINX_VERSION" \
+            -- consumer-cache-turbo shm-coherence-varidx fault-slab-store \
+               alloc-per-request fd-starve multi-worker
+
+      - name: Scenarios SKIP cleanly on an unstaged tree, under the same flags
+        env:
+          TESTKIT_ROOT: ${{ github.workspace }}/.testkit
+        run: |
+          ci/tools/testkit-run.sh --valgrind --expect-skip \
+            --version "${NGINX_STABLE:-1.30.4}" \
+            -- consumer-cache-turbo fault-slab-store \
+               alloc-per-request fd-starve multi-worker
+
+      - name: Notify Discord on failure
+        if: failure() && github.event_name == 'schedule'
+        env:
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_CHANNEL_BUILDS: ${{ secrets.DISCORD_CHANNEL_BUILDS }}
+          # Passed as env, never interpolated into the run: block -- see
+          # ci-deep.yml's identical comment for why (hardening, not a live
+          # injection fix, but keeps this file free of the pattern too).
+          GH_REPO: ${{ github.repository }}
+          GH_SERVER_URL: ${{ github.server_url }}
+          GH_RUN_ID: ${{ github.run_id }}
+        run: |
+          [ -n "$DISCORD_BOT_TOKEN" ] || exit 0
+          curl -fsS -X POST -H "Authorization: Bot $DISCORD_BOT_TOKEN" \
+            -H "Content-Type: application/json" \
+            "https://discord.com/api/v10/channels/$DISCORD_CHANNEL_BUILDS/messages" \
+            -d "{\"content\":\"🔴 $GH_REPO — Testkit Valgrind FAILED. $GH_SERVER_URL/$GH_REPO/actions/runs/$GH_RUN_ID\"}" || true
