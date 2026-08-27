@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Copyright (C) 2026 Thijs Eilander
+# SPDX-License-Identifier: BSD-2-Clause
+#
+# Two independent gates, both SKIP rather than FAIL (both are environment
+# facts, not defects):
+#
+#   1. THE .so, same gate as testkit's own consumer-cache-turbo/requires.
+#      nginx.conf loads @BUILD_OBJS@/ngx_http_cache_turbo_module.so
+#      unconditionally, so a tree that staged only the ref probe (CI's
+#      unstaged/skip-direction leg) must SKIP here rather than fail hard at
+#      `nginx -t`. run-scenario.sh runs this BEFORE prober_resolve, so
+#      PROBER_RESOLVED_BUILD does not exist yet; recompute the same path
+#      lib.sh will, taking flavor/version from argv ($2/$3) with the same
+#      defaults.
+#
+#   2. /proc/self/smaps_rollup (Linux >= 4.14), same gate as testkit's own
+#      rss-slope/requires: the RSS oracle needs it. The cycle-pool slope
+#      oracle needs no /proc at all, but both oracles live in one driver so
+#      one SKIP covers the file.
+FLAVOR="${2:-nginx}"
+VERSION="${3:-1.31.3}"
+BUILD="${PROBER_BUILD:-${PROBER_ROOT:-.}/.build/${FLAVOR}-${VERSION}}"
+
+if [ ! -f "$BUILD/objs/ngx_http_cache_turbo_module.so" ]; then
+    echo "cache_turbo module .so not found in $BUILD/objs -- nginx.conf load_modules ngx_http_cache_turbo_module.so unconditionally, so this tree cannot run the scenario; build it as a dynamic module (ci/tools/testkit-stage.sh) to run this scenario"
+    exit 1
+fi
+
+test -r /proc/self/smaps_rollup

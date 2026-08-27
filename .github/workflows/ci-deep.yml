@@ -1,4 +1,4 @@
-# sync-sha: db492fbd3d4f8eeb15a81d709c3e8922d24af36bcc5ddadfb9415ba2d10a15fc
+# sync-sha: aa5ed120871b6769ebebc221f5e46caf964552e9359a88f0de6a04dda3cf3f2d
 name: CI Deep
 
 # Exhaustive dynamic analysis — monthly cron + on-demand only, NEVER on PR.
@@ -883,10 +883,29 @@ jobs:
         env:
           TESTKIT_ROOT: ${{ github.workspace }}/.testkit
         run: |
+          # rss-slope (S25) and reload-mid-upload (S25) are CT-authored ports
+          # of testkit's generic scenarios of the same name, rebuilt against a
+          # real cache_turbo HIT path rather than testkit's own `return 200`
+          # -- see each scenario's own header comment for the non-vacuity
+          # argument and the planted-mutation proof. Both belong HERE, not in
+          # testkit.yml's PR gate, because both are loop/reload-shaped rather
+          # than single-shot: rss-slope runs 70 sequential requests per
+          # oracle (10 warmup + 60 sampled) and reload-mid-upload spans one
+          # live SIGHUP -- the same PR-gate-cost reasoning that already keeps
+          # l2-cross-instance-fill and shm-coherence-varidx's four-worker
+          # Redis fixture out of testkit.yml.
+          #
+          # rss-slope uses cache_turbo_probe (like shm-coherence-varidx);
+          # reload-mid-upload deliberately stays on the default test_ref_probe
+          # (see its nginx.conf header) because cache_turbo_probe's zone
+          # pointer is a process-lifetime static that cannot survive a SECOND
+          # config parse -- CTPROBE-STATIC-ZONE-NO-RELOAD, memory/labs/
+          # nginx-cache-turbo-module/issues.md -- and reload-mid-upload's one
+          # SIGHUP is exactly that second parse.
           ci/tools/testkit-run.sh --version "$NGINX_VERSION" --sanitizer \
             --port "$TEST_BASE_PORT" \
             -- consumer-cache-turbo l2-cross-instance-fill \
-               shm-coherence-varidx
+               shm-coherence-varidx rss-slope reload-mid-upload
 
       - name: Notify Discord on failure
         if: failure() && github.event_name == 'schedule'

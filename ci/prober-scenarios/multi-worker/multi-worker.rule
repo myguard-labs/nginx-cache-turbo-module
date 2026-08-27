@@ -1,0 +1,74 @@
+# Copyright (C) 2026 Thijs Eilander
+# SPDX-License-Identifier: BSD-2-Clause
+#
+# S25 port of testkit's scenarios/multi-worker against a real cache_turbo
+# HIT path (../nginx.conf), not the bare `return 200` the generic conf ships.
+#
+# THE MODULE-SPECIFIC CLAIM THIS ADDS OVER UPSTREAM'S FORM: with
+# worker_processes 4, a cold GET /cached/item is served by WHICHEVER worker
+# the kernel's accept-queue balancing happens to hand the connection to, and
+# every request after it is load-balanced independently. cache_turbo's shm
+# zone is the ONE piece of state shared across all four -- so if the entry
+# genuinely lives in the zone (not in a per-worker cache) then a MISS served
+# by worker A and a HIT served by worker B (a DIFFERENT worker, almost
+# certainly, across four cases) is proof the cache is real shared state, not
+# an artifact of one worker happening to answer every request. Every case
+# still carries `pid_may_change`, exactly as upstream: the oracle is "same
+# master", never "same worker" -- see ../env.
+
+name    baseline: warm-up MISS across the worker set
+from    127.0.0.1
+send    GET /cached/item HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+expect_not header~X-Cache:
+pid_may_change
+
+name    concurrent request 1: must now HIT, whichever worker answers
+from    127.0.0.1
+send    GET /cached/item HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+expect  header~X-Cache: HIT
+pid_may_change
+
+name    concurrent request 2
+from    127.0.0.1
+send    GET /cached/item HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+expect  header~X-Cache: HIT
+pid_may_change
+
+name    concurrent request 3
+from    127.0.0.1
+send    GET /cached/item HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+expect  header~X-Cache: HIT
+pid_may_change
+
+name    concurrent request 4
+from    127.0.0.1
+send    GET /cached/item HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+expect  header~X-Cache: HIT
+pid_may_change
+
+name    concurrent request 5
+from    127.0.0.1
+send    GET /cached/item HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+expect  header~X-Cache: HIT
+pid_may_change
+
+name    server graceful under the worker set: no signal deaths, no [emerg]/[crit]
+from    127.0.0.1
+send    GET /cached/item HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+expect  header~X-Cache: HIT
+pid_may_change
+no_error_log  \[error\]

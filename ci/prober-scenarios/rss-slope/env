@@ -1,0 +1,8 @@
+# Copyright (C) 2026 Thijs Eilander
+# SPDX-License-Identifier: BSD-2-Clause
+#
+# S25 port of testkit's rss-slope. Same override reasoning as
+# ../alloc-per-request/env and ../fault-slab-store/env: nginx.conf needs
+# cache_turbo's OWN probe directive so the probe's zone_render dispatch is
+# reached at all (test_ref_probe aims at the ref module's NULL zone).
+PROBER_PROBE='cache_turbo_probe ct;'

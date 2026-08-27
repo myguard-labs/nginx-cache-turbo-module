@@ -1,0 +1,6 @@
+# Copyright (C) 2026 Thijs Eilander
+# SPDX-License-Identifier: BSD-2-Clause
+#
+# Same override reasoning as ../alloc-per-request/env: cache_turbo's OWN
+# probe directive is what reaches its zone_render.
+PROBER_PROBE='cache_turbo_probe ct;'

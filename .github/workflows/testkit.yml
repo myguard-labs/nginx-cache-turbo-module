@@ -1,4 +1,4 @@
-# sync-sha: 095df72afb5e39405e311b2d7b02dd5ab4be19315a9d29911e1abde99e747d9e
+# sync-sha: 3aa33c6e43b4b3288f296e8b7016d588c5d9964977abf777dde0d7b65ba066cb
 name: Testkit
 
 # The nginx-module-testkit prober leg.
@@ -229,8 +229,23 @@ jobs:
           # error paths it reaches are reachable no other way in this repo:
           # exhausting a zone for real is slow AND perturbs the very counters
           # the oracle reads.
+          # alloc-per-request / fd-starve / multi-worker (S25) are CT-authored
+          # ports of testkit's generic prober scenarios of the same name,
+          # rebuilt against a REAL cache_turbo HIT path
+          # (ci/prober-scenarios/<name>/nginx.conf) rather than testkit's own
+          # bare `return 200`: each conf's traffic goes through a `cache_turbo`
+          # location and every case that claims to measure a HIT asserts
+          # `X-Cache: HIT` on the wire first, so a pass-through conf (the
+          # vacuous-green class this job's own header warns about) cannot pass
+          # them. All three are single-shot -- no reload, no soak loop -- so
+          # they stay in the PR gate rather than ci-deep.yml's sanitizer job;
+          # the reload- and loop-shaped ports (reload-mid-upload, rss-slope)
+          # are in ci-deep.yml instead. Non-vacuity for each was proven by a
+          # planted mutation (see the scenario's own header comment) observed
+          # red, then reverted to green.
           ci/tools/testkit-run.sh --version "$NGINX_VERSION" \
-            -- consumer-cache-turbo shm-coherence-varidx fault-slab-store
+            -- consumer-cache-turbo shm-coherence-varidx fault-slab-store \
+               alloc-per-request fd-starve multi-worker
 
       - name: Scenario SKIPs cleanly on an unstaged tree
         if: ${{ !inputs.skip-expensive-jobs }}
@@ -241,12 +256,14 @@ jobs:
           # consumer .so is an environment fact, and a red here would train
           # people to ignore this leg.
           #
-          # fault-slab-store is named explicitly for the same reason it is
-          # named in the pass direction: naming any scenario REPLACES
-          # testkit-run.sh's default rather than adding to it, so a scenario
-          # absent from this list has its ./requires gate untested in the skip
-          # direction. That gate is the one that refuses a non-harness .so, and
-          # a gate nothing exercises is how a scenario silently degrades to
-          # permanent-SKIP in the direction that reads green.
+          # fault-slab-store, alloc-per-request, fd-starve and multi-worker
+          # are all named explicitly for the same reason: naming
+          # any scenario REPLACES testkit-run.sh's default rather than adding
+          # to it, so a scenario absent from this list has its own ./requires
+          # gate untested in the skip direction -- exactly the gate that
+          # refuses a non-harness .so, and a gate nothing exercises is how a
+          # scenario silently degrades to permanent-SKIP in the direction
+          # that reads green.
           ci/tools/testkit-run.sh --expect-skip --version "${NGINX_STABLE:-1.30.4}" \
-            -- consumer-cache-turbo fault-slab-store
+            -- consumer-cache-turbo fault-slab-store \
+               alloc-per-request fd-starve multi-worker

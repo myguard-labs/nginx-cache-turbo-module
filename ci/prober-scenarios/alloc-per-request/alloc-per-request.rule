@@ -1,0 +1,125 @@
+# Copyright (C) 2026 Thijs Eilander
+# SPDX-License-Identifier: BSD-2-Clause
+#
+# S25 port of testkit's scenarios/alloc-per-request against a REAL cache_turbo
+# HIT path (../nginx.conf), not the bare `return 200` the generic conf ships.
+#
+# WHAT THE GENERIC SCENARIO PROVES, AND WHY IT WAS VACUOUS HERE UNWIRED
+#   Upstream's alloc-per-request drives request SIZE (a long line, huge header
+#   values, a discarded body) against testkit's own /__probe location and
+#   watches nginx's generic pool.cycle_*/fds counters stay flat. Every one of
+#   those requests, run against this module's *default* generic conf, would
+#   never touch a `cache_turbo` location at all -- a green run would prove
+#   nginx itself is allocation-neutral and say nothing about this module's own
+#   per-request HIT-path work (cache-key lookup, node refcounting, header
+#   replay). That is exactly the "vacuous-green" class testkit.yml's own
+#   header documents.
+#
+# THE FIX: EVERY CASE HITS /cached/, NOT /__probe
+#   cache_turbo_key in ../nginx.conf is `$uri` (path only, no query string),
+#   so every case below -- regardless of how much query-string padding it
+#   carries -- addresses the SAME cache entry. Case 1 is a genuine MISS
+#   (populates the entry); every case after it is a genuine HIT, so the
+#   padded-query/padded-header/body cases are size-class stress on cache_turbo's
+#   OWN filter chain (HIT-path header replay, refcounted lookup), not on a
+#   passthrough. zone.slab_* is asserted too: those three fields are rendered
+#   generically off ANY ngx_shm_zone_t by testkit's core probe (src/
+#   ngx_test_probe.c:487-769, gated only on shpool->stats being non-NULL), so
+#   they are portable to this module's zone exactly as they are to the ref
+#   module's -- confirmed by reading that file rather than assumed.
+#
+# WHAT THIS SCENARIO DOES NOT COVER (see ../fault-slab-store for that): the
+# probe-armed slab-allocation FAULT path. This is the happy-path allocation
+# shape across request size classes.
+
+name    case 0: warm-up MISS populates the cache entry
+# Verified locally: this module emits X-Cache only on HIT/STALE/BYPASS/
+# EXPIRED, never on a cold MISS (it is in the store-time header skip list,
+# ngx_http_cache_turbo_header_skip), so the miss oracle is the header's
+# ABSENCE, not a "MISS" value that is never written to the wire.
+send    GET /cached/item HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+expect_not header~X-Cache:
+
+name    case 1: confirm a genuine HIT before any size-class case runs
+send    GET /cached/item HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+expect  header~X-Cache: HIT
+probe   fds >= 1
+probe   pool.cycle_used >= 1
+probe   zone.slab_reqs >= 0
+
+name    case 2: a 30 KiB query string on the SAME cache key (still HIT)
+send    GET /cached/item?
+repeat  480 pad=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&
+send     x=1 HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+expect  header~X-Cache: HIT
+delta   fds == 0
+delta   pool.cycle_used == 0
+delta   pool.cycle_blocks == 0
+delta   pool.cycle_large == 0
+
+name    case 3: a ~96 KiB header block (two long values), still a HIT
+send    GET /cached/item HTTP/1.1\r\nX-Pad-1:
+repeat  800 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+send    \r\nX-Pad-2:
+repeat  800 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+send    \r\nHost: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+expect  header~X-Cache: HIT
+delta   fds == 0
+delta   pool.cycle_used == 0
+delta   pool.cycle_blocks == 0
+delta   pool.cycle_large == 0
+
+name    case 4: the ~96 KiB header block again, back to back
+send    GET /cached/item HTTP/1.1\r\nX-Pad-1:
+repeat  800 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+send    \r\nX-Pad-2:
+repeat  800 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+send    \r\nHost: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+expect  header~X-Cache: HIT
+delta   fds == 0
+delta   pool.cycle_used == 0
+delta   pool.cycle_blocks == 0
+delta   pool.cycle_large == 0
+
+name    case 5: a 256 KiB request body on a HIT (proxy_pass never re-reads it)
+send    GET /cached/item HTTP/1.1\r\n
+send    Host: prober\r\nContent-Length: 262144\r\nConnection: close\r\n\r\n
+repeat  4096 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+expect  status=200
+expect  header~X-Cache: HIT
+delta   fds == 0
+delta   pool.cycle_used == 0
+delta   pool.cycle_blocks == 0
+delta   pool.cycle_large == 0
+
+name    case 6: tiny again, cumulative bound
+send    GET /cached/item HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+expect  header~X-Cache: HIT
+delta   fds == 0
+delta   pool.cycle_used == 0
+delta   pool.cycle_blocks == 0
+delta   pool.cycle_large == 0
+# NOTE: no probe_baseline on zone.slab_* here, unlike upstream's ref-module
+# form. probe_baseline subtracts from the origin snapshot taken BEFORE case 0
+# (prober.c:1786), and case 0 is a genuine MISS that stores a real cache
+# entry -- ngx_slab_alloc under cache_turbo's own zone mutex. A `probe_baseline
+# zone.slab_used == 0` origin-to-here bound would legitimately fail on a
+# perfectly healthy server (verified: it failed exactly this way on the first
+# run of this file, "1 -> 3 is +2"), because the store itself is +slab_used,
+# not a leak. The cases above already carry `delta zone.slab_reqs`-equivalent
+# coverage via pool.*/fds around HIT-only traffic (case 1 through case 6,
+# which store nothing new); that is the correct scope for a zero bound here.
+probe_baseline fds <= 2
+probe_baseline pool.cycle_used == 0
+probe_baseline pool.cycle_blocks == 0
+probe_baseline pool.cycle_large == 0

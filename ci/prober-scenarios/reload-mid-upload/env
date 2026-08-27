@@ -1,0 +1,6 @@
+# Copyright (C) 2026 Thijs Eilander
+# SPDX-License-Identifier: BSD-2-Clause
+#
+# Deliberately EMPTY of a PROBER_PROBE override -- see nginx.conf's header for
+# why this scenario stays on testkit's default test_ref_probe rather than
+# cache_turbo_probe.
