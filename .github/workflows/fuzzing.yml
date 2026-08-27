@@ -1,4 +1,4 @@
-# sync-sha: 7eca610296200def80c9032c670a3977222d0b858e047f2305d6bb4ebff88207
+# sync-sha: c834f76579388cf4aeb095f972639372df76d657cf6bcc9d8755bdc583bf6024
 name: Fuzzing
 
 # Fast fuzz regression gate on every PR/push — 60s/target on all five parser
@@ -117,7 +117,17 @@ jobs:
             fi
           done
           [ "$failed" -eq 0 ] || { echo "❌ $failed recorded regression(s) reproduce"; exit 1; }
-          echo "replayed $total recorded regression(s) across all targets, all clean"
+          if [ "$total" -eq 0 ]; then
+            # Loud, not a failure: an empty regressions/ tree is the documented
+            # normal state for targets that have never crashed (see
+            # regressions/README.md). But a step that silently replays nothing
+            # reads exactly like a step that replayed something and passed —
+            # make the no-op explicit so this gate cannot go vacuous unnoticed.
+            echo "⚠ replayed 0 recorded regression(s) across all targets — this step is"
+            echo "  currently a no-op (no crash has ever been recorded; see regressions/README.md)"
+          else
+            echo "replayed $total recorded regression(s) across all targets, all clean"
+          fi
 
       # Name carries the literal, not ${{ env.FUZZ_SECONDS }}: the run: block
       # below is the single consumer of that value, and a step name is not
