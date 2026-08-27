@@ -1,4 +1,4 @@
-# sync-sha: 1ecc104508d1f93d160d5b5cc4177002d8cd0ce238d3eb2c2b2d3009629ab7ea
+# sync-sha: 9cfbcb027d4f1eaa20854704b3adc7266a0489fde35af1eb6244567884a302c1
 name: Testkit Valgrind
 
 # Weekly memcheck soak of the testkit prober scenarios -- S21.
@@ -90,7 +90,7 @@ name: Testkit Valgrind
 #   jobs bind disjoint port bands (19328 vs 19584) so a live run cannot break
 #   the other's fixtures, and the cost is shared-runner CPU/IO contention for
 #   the overlap window, not a failure -- the same class of cost ci-deep.yml's
-#   OWN header already accepts by running fuzz/memcheck/helgrind/asan-soak/
+#   OWN header already accepts by running fuzz/memcheck/asan-soak/
 #   coverage sequentially in one monthly window rather than staggering each
 #   to its own day. A slot with zero possible overlap, ever, would need to
 #   dodge every day-of-month rather than every day-of-week, which is not a

@@ -37,7 +37,7 @@ durations and the command to re-derive them live in `ci.yml`'s header comment.
 | [A/UBSan](.github/workflows/asan.yml) | ASan+UBSan single-process and multi-worker soaks, static `--add-module` build |
 | [Testkit](.github/workflows/testkit.yml) | the [nginx-module-testkit](https://github.com/myguard-labs/nginx-module-testkit) prober leg: per-request allocation neutrality read out of the cycle pool, asserted in both directions (a staged tree must assert, an unstaged one must SKIP cleanly) |
 | [Testkit Valgrind](.github/workflows/testkit-valgrind.yml) | weekly: the same prober scenarios as Testkit, staged as a plain DEBUG build and run under valgrind memcheck instead of the probe's own fd/pool-delta accounting, asserted in both directions the same way |
-| [CI Deep](.github/workflows/ci-deep.yml) | monthly: long fuzz campaigns, memcheck and helgrind soaks, the nginx/angie compatibility matrix |
+| [CI Deep](.github/workflows/ci-deep.yml) | monthly: long fuzz campaigns, memcheck soak, the nginx/angie compatibility matrix |
 | [Bump versions](.github/workflows/bump.yml) | weekly refresh of the pinned nginx/angie versions and verified archive digests |
 
 ### The testkit prober leg

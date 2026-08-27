@@ -1,4 +1,4 @@
-# sync-sha: 34bd01f0ae5b18e3f6d84a591e31f9ca29eaefb21a815aef130c671049e0bc70
+# sync-sha: c82648b9c2f107e04ec7ed44e3fd3f8ec068a1945f171db9317c04c2c64b5836
 name: CI
 
 # Single entry point for the PR suite. The checks below used to be independent
@@ -50,9 +50,9 @@ name: CI
 # paying for a weaker duplicate:
 #
 #   Valgrind memcheck lite (60s soak, 158s job)
-#       -> ci-deep.yml `memcheck` (600s soak, + `helgrind`). ASan already
-#          covers memory errors on this leg, so the lite soak was the single
-#          cheapest cut: dropping it alone recovers 6-slot makespan at 4 slots.
+#       -> ci-deep.yml `memcheck` (600s soak). ASan already covers memory
+#          errors on this leg, so the lite soak was the single cheapest cut:
+#          dropping it alone recovers 6-slot makespan at 4 slots.
 #   CodeQL (185s job)
 #       -> codeql.yml's OWN monthly cron ("47 4 5 * *") -- it was never
 #          exclusive to this gate, so nothing needed to move. Its findings
