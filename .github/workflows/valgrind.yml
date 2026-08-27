@@ -1,4 +1,4 @@
-# sync-sha: aa4d54fc3f5ce13c5128637d500b6c6a8c392249e0e745ef1a36c5c45f56a79f
+# sync-sha: 9338d1fbb62d08ea7eee8b7f3cfae49cfe0891cf903ef7c6bfdc8b531bc437ac
 name: Valgrind
 
 # Valgrind memcheck lite soak (60s @ 4 conc) — ON-DEMAND ONLY.
@@ -11,7 +11,7 @@ name: Valgrind
 # subset of coverage that runs elsewhere:
 #
 #   - ASan/UBSan still runs on every PR and covers memory errors on that leg;
-#   - ci-deep.yml runs the full 600s `memcheck` AND `helgrind` soaks monthly.
+#   - ci-deep.yml runs the full 600s `memcheck` soak monthly.
 #
 # Kept (rather than deleted) as a workflow_dispatch entry point: a 60s soak is
 # the right tool for a quick manual check on a suspect branch without waiting

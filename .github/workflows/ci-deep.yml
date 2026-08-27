@@ -1,4 +1,4 @@
-# sync-sha: fca183532239244ef9c5624dfad57db6284101c61bb969ac9426c4f865fdd4cd
+# sync-sha: 9b7ef19551d10e8fa0b7cee3506f06e6ebbbe9341bcb79cb9de04deca0707b90
 name: CI Deep
 
 # Exhaustive dynamic analysis — monthly cron + on-demand only, NEVER on PR.
@@ -8,14 +8,26 @@ name: CI Deep
 # workflow complements it with long dynamic-analysis and scanner jobs.
 #
 # Jobs: fuzz (up to 14400s/target × 5) · legacy-runtime (pre-1.23 ABI) ·
-#       clang-analyze (full-source path-flow) · memcheck soak · helgrind soak ·
+#       clang-analyze (full-source path-flow) · memcheck soak ·
 #       asan-soak (ASan multi-worker fault-injection ×N — flake repetition) ·
 #       scanners · coverage (gcov report — a REPORT, never a gate).
-#   * memcheck AND helgrind run under ci/tools/soak.sh, which passes
-#     --suppressions=ci/tools/valgrind.supp for BOTH, and --error-exitcode=99 for
-#     helgrind — the drift-fix baseline for every module.
+#   * memcheck runs under ci/tools/soak.sh, which passes
+#     --suppressions=ci/tools/valgrind.supp and --error-exitcode=99 — the
+#     drift-fix baseline for every module.
 #   * cache-turbo is a memory-heavy module (shm slab + LRU + SWR + L2 clients),
-#     so both soaks run 600s (longer than the 300s baseline) to churn eviction.
+#     so the soak runs 600s (longer than the 300s baseline) to churn eviction.
+#
+# Retired: the Helgrind soak (S22). All shared state in this module is
+# cross-PROCESS POSIX shm under ngx_shmtx (atomic-CAS based), never a
+# pthread_mutex, and there are zero threads in src/ — Helgrind's
+# happens-before engine is built on pthread sync primitives within one
+# process, so it structurally cannot see this module's race class (the
+# job's green was vacuous; TSan would be equally blind for the same reason).
+# The replacement oracle is ci/prober-scenarios/shm-coherence-varidx, which
+# asserts `at_rest varidx_inflight == 0` and was verified red by mutation
+# (S16b). ci/tools/soak.sh still supports USE_HELGRIND as a manual/dispatch
+# tool; see the comment at its helgrind branch before re-wiring a CI job to
+# it.
 #
 # Action pins (keep in sync with build-test.yml header):
 # actions/checkout@v5        -> 93cb6efe18208431cddfb8368fd83d5badbf9bfd
@@ -530,97 +542,6 @@ jobs:
             -H "Content-Type: application/json" \
             "https://discord.com/api/v10/channels/$DISCORD_CHANNEL_BUILDS/messages" \
             -d "{\"content\":\"🔴 $GH_REPO — CI Deep / memcheck FAILED. $GH_SERVER_URL/$GH_REPO/actions/runs/$GH_RUN_ID\"}" || true
-
-  helgrind:
-    name: Valgrind Helgrind soak
-    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
-    timeout-minutes: 240
-    steps:
-      - name: Checkout module
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-        with:
-          persist-credentials: false
-
-      - name: Load version pins
-        run: bash .github/scripts/load-versions.sh
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential ccache curl eatmydata libpcre2-dev libssl-dev mold pkg-config \
-            redis-server memcached valgrind zlib1g-dev
-      - name: Start L2 backends (redis, memcached)
-        # See the memcheck job above: GitHub-hosted runner images ship a
-        # policy-rc.d that blocks apt postinst's automatic service start, so
-        # installing the packages does not put anything on 6379/11211.
-        # Start both explicitly and wait for them to accept connections.
-        run: |
-          # The runner image MASKS both units (`Unit redis-server.service is
-          # masked`), so `service ... start` cannot start them -- unmask and
-          # enable first. This is a stronger block than policy-rc.d: masking
-          # symlinks the unit to /dev/null, so nothing short of unmasking
-          # brings it back. (The per-PR runtime job in build-test.yml sidesteps
-          # this entirely by handing test_runtime.py --redis-server /usr/bin/...
-          # so the harness spawns its OWN daemons; the soak wants the ordinary
-          # system services, so it unmasks instead.)
-          sudo systemctl unmask redis-server.service memcached.service || true
-          sudo systemctl enable --now redis-server.service memcached.service || true
-          sudo service redis-server start || true
-          sudo service memcached start || true
-          for _ in $(seq 1 50); do
-            redis-cli -h 127.0.0.1 -p 6379 ping 2>/dev/null | grep -q PONG && break
-            sleep 0.2
-          done
-          redis-cli -h 127.0.0.1 -p 6379 ping | grep -q PONG || {
-            echo "::error::redis-server did not come up on 127.0.0.1:6379"; exit 1; }
-          for _ in $(seq 1 50); do
-            printf 'version\r\nquit\r\n' | timeout 2 nc 127.0.0.1 11211 2>/dev/null | grep -q VERSION && break
-            sleep 0.2
-          done
-          printf 'version\r\nquit\r\n' | timeout 2 nc 127.0.0.1 11211 | grep -q VERSION || {
-            echo "::error::memcached did not come up on 127.0.0.1:11211"; exit 1; }
-      - name: Restore build caches
-        uses: ./.github/actions/build-cache
-        with:
-          mode: debug
-          nginx-version: ${{ env.NGINX_VERSION }}
-      - name: Build debug nginx + cache-turbo module
-        run: bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" debug
-      - name: Helgrind soak (600s @ 4 conc, --error-exitcode=99, WITH suppressions, L1+L2)
-        env:
-          USE_HELGRIND: "1"
-          # redis-server/memcached are explicitly started (and verified
-          # ready) by the "Start L2 backends" step above. See the memcheck
-          # job above: without these two env vars, soak.sh silently builds
-          # the L1-only vhost and the L2 drivers never run under helgrind.
-          REDIS: "127.0.0.1:6379"
-          MEMCACHED: "127.0.0.1:11211"
-        run: |
-          B="$GITHUB_WORKSPACE/.build/nginx-${NGINX_VERSION}/objs"
-          MODULE="$B/ngx_http_cache_turbo_module.so" \
-            bash ci/tools/soak.sh "$B/nginx" 600 4
-      - name: Notify Discord on failure
-        if: failure() && github.event_name == 'schedule'
-        env:
-          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
-          DISCORD_CHANNEL_BUILDS: ${{ secrets.DISCORD_CHANNEL_BUILDS }}
-          # Passed as env, never interpolated into the run: block below.
-          # A ${{ }} inside `run:` is pasted into the shell command by the
-          # runner before bash sees it; via env: the value arrives as data.
-          # These three are GitHub-controlled, so this is hardening, not a
-          # live injection fix -- but it keeps the whole file free of the
-          # pattern, so a future edit cannot quietly add an
-          # attacker-controlled context beside a safe one.
-          GH_REPO: ${{ github.repository }}
-          GH_SERVER_URL: ${{ github.server_url }}
-          GH_RUN_ID: ${{ github.run_id }}
-        run: |
-          [ -n "$DISCORD_BOT_TOKEN" ] || exit 0
-          curl -fsS -X POST -H "Authorization: Bot $DISCORD_BOT_TOKEN" \
-            -H "Content-Type: application/json" \
-            "https://discord.com/api/v10/channels/$DISCORD_CHANNEL_BUILDS/messages" \
-            -d "{\"content\":\"🔴 $GH_REPO — CI Deep / helgrind FAILED. $GH_SERVER_URL/$GH_REPO/actions/runs/$GH_RUN_ID\"}" || true
 
   asan-soak:
     # Flake-repetition soak. The per-PR asan.yml runs the fault-injection suite

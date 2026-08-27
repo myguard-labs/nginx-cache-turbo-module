@@ -101,9 +101,9 @@ every PR. Both were strict subsets of coverage that still runs:
   keeps its own monthly `schedule:` and is no longer called from `ci.yml`,
   where it overlapped the security-scanners job.
 
-The expensive versions of these — hours-long fuzzing per target, full
-Memcheck **and** Helgrind (thread-race detection) soaks, and the
-nginx/angie compatibility matrix — run monthly and on manual dispatch in
+The expensive versions of these — hours-long fuzzing per target, a full
+600s Memcheck soak, and the nginx/angie compatibility matrix — run monthly
+and on manual dispatch in
 `ci-deep.yml`, not on your PR. The badge row and the `## CI` table at the top
 of the README list the full set, and `ci/linter/lint-docs-drift.sh` fails the
 build if that table and `.github/workflows/` ever disagree.

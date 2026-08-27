@@ -190,6 +190,17 @@ if [ "${USE_VALGRIND:-0}" = "1" ]; then
 elif [ "${USE_HELGRIND:-0}" = "1" ]; then
     # Data-race / lock-order checking under helgrind (shm locks + shared state).
     # error-exitcode=99 so a detected race fails the job, not just log grep.
+    #
+    # RETIRED FROM CI (S22): no workflow drives USE_HELGRIND any more. This
+    # module has zero threads in src/ -- all shared state is cross-PROCESS
+    # POSIX shm under ngx_shmtx (atomic-CAS), never a pthread_mutex -- and
+    # helgrind's happens-before engine only models pthread sync primitives
+    # within one process, so it structurally cannot see this module's race
+    # class (green here was vacuous; TSan is equally blind for the same
+    # reason). Kept as a manual/dispatch entry point only -- do not re-wire a
+    # CI job to this branch without a different tool that can actually reach
+    # cross-process shm races. The real oracle for that race class is
+    # ci/prober-scenarios/shm-coherence-varidx (`at_rest varidx_inflight == 0`).
     VG=(valgrind --tool=helgrind --error-exitcode=99
         --gen-suppressions=all --log-file="$WORK/logs/helgrind.%p")
     [ -f "$SUPP" ] && VG+=(--suppressions="$SUPP")
