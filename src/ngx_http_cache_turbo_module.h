@@ -1333,6 +1333,24 @@ typedef struct ngx_http_cache_turbo_shctx_s {
      * ledger for the "permanent public field" vs "TEST_FAULTS-gated" choice
      * this mirrors. */
     ngx_atomic_t             breaker_wedge_observed;
+
+    /* PERF-AUD2-10 invariant check: lifetime count of times one of the four
+     * node-init sites in ngx_http_cache_turbo_shm.c (store_locked/
+     * claim_locked/count_miss_locked/l2_neg_set) found the `hash` it was
+     * about to stamp into ctn->hash_crc32 did NOT equal
+     * ngx_crc32_short(key_hash, 32) -- i.e. the documented contract (shm.c
+     * PERF-AUD2-10 field comment, shm_admit() comment) was violated for that
+     * node. Should read 0 in any real deployment, since every caller of
+     * store/claim/count_miss/l2_neg_set derives `hash` from the same
+     * key_hash it passes. Bounded blast radius:
+     * shm_lookup() discards `hash` entirely `(void) hash;` and descends on
+     * the widened key64, so a mismatch here can never mis-route a lookup or
+     * cross-serve another key's object -- it only means shm_admit() would
+     * consult the wrong W-TinyLFU sketch rows for that victim, degrading
+     * admission accuracy. TEST_FAULTS-gated for the same reason
+     * breaker_wedge_observed is: diagnostic, not a permanent operator-facing
+     * field, so it costs nothing in a production build. */
+    ngx_atomic_t             test_hash_crc32_mismatch;
 #endif
 
     /* PERF-AUD2-12: this struct is allocated ONCE per zone by a single

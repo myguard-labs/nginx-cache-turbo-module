@@ -278,6 +278,16 @@ Raw `perf.data` + `perf-report.txt` under `ci/tools/perf-out/w1/` and
 `ci/tools/perf-out/w16/` (gitignored, not committed); the excerpts above are the
 durable record.
 
+**Only the aggregate symbol-level tables above (`perf report`, function-level)
+were committed for this run — no `--sort srcline` per-line breakdown was
+captured or preserved.** A prior scoping pass cited specific per-line numbers
+(e.g. an `ngx_crc32.h` line range at ~1% self-time) as if they were measured
+here; they were not, and cost a full worker cycle chasing a change that
+measurement later showed removes zero work. Any future srcline-level claim
+must be re-measured with `perf report --sort srcline` (or equivalent) and
+committed to this file before it is used to scope work — do not reconstruct
+or estimate one from the aggregate numbers above.
+
 ## Verdict
 
 > **P4-2's verdict below is the 2026-08-19 reading and is now PARTLY

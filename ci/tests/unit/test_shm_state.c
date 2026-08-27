@@ -238,6 +238,12 @@ typedef struct {
                                                  * unconditionally here since
                                                  * this harness always builds
                                                  * as if TEST_FAULTS */
+    ngx_atomic_t        test_hash_crc32_mismatch; /* PERF-AUD2-10 invariant
+                                                 * check, TEST_FAULTS-gated in
+                                                 * the real header; mirrored
+                                                 * unconditionally here since
+                                                 * this harness always builds
+                                                 * as if TEST_FAULTS */
 } ngx_http_cache_turbo_shctx_t;
 
 /* P4-2-s3b: the stripe seam, hand-mirrored from module.h like every other
@@ -1560,6 +1566,77 @@ test_count_miss_semantics(void)
     CHECK(ctn->miss_count == 1, "an ENTRY's counter must not be touched");
     ctn->len = 0;   /* keep zone_reset()'s drain off the blob path */
     ctn->kind = NGX_HTTP_CACHE_TURBO_NODE_COUNTER;
+}
+
+/* PERF-AUD2-10 invariant: ctn->hash_crc32 is stamped at every node-init site
+ * (store_locked/claim_locked/count_miss_locked/l2_neg_set) from the caller's
+ * `hash` parameter, on the documented contract that this equals
+ * ngx_crc32_short(key_hash, 32) for the node's own key. Nothing previously
+ * verified that on the way in. This negative control deliberately breaks the
+ * contract -- passes a `hash` that does NOT match ngx_crc32_short(key_hash,
+ * 32) into count_miss()'s fresh-node path -- and asserts the TEST_FAULTS
+ * diagnostic counter (test_hash_crc32_mismatch) observes it.
+ *
+ * Also documents the bounded blast radius directly: shm_lookup() discards its
+ * `hash` parameter (`(void) hash;`) and descends on the widened key64
+ * instead, so the mismatched stamp constructed here must NOT prevent the
+ * node from being found by its real key, and must NOT be usable to find it
+ * under the wrong (bogus) hash either -- there is no alternate route to the
+ * node via `hash` at all. */
+static void
+test_hash_crc32_invariant_check(void)
+{
+    ngx_http_cache_turbo_node_t  *ctn;
+    uint32_t                      real_hash, bogus_hash;
+
+    printf("PERF-AUD2-10: hash_crc32 mismatch is observable, and bounded\n");
+    zone_reset();
+
+    REQUIRE(g_sh.test_hash_crc32_mismatch == 0,
+            "fixture: mismatch counter not zero at zone_reset()");
+
+    real_hash  = (uint32_t) (0x1000 + 0);
+    bogus_hash = real_hash ^ 0xFFFFFFFFu;   /* deliberately wrong */
+    REQUIRE(ngx_crc32_short(mkkey(0), 32) != bogus_hash,
+            "fixture: bogus_hash accidentally matches the real crc32 -- "
+            "the control proves nothing");
+
+    /* min_uses 1: count_miss() creates a fresh COUNTER node and returns
+     * NGX_OK on the same call, taking the count_miss_locked() stamp site. */
+    CHECK(ngx_http_cache_turbo_shm_count_miss(&g_zone, mkkey(0), bogus_hash,
+              1, 0) == NGX_OK,
+          "min_uses 1 must still be store-eligible on the first miss");
+    CHECK(g_sh.test_hash_crc32_mismatch == 1,
+          "a hash not matching ngx_crc32_short(key_hash, 32) did not "
+          "increment test_hash_crc32_mismatch");
+
+    /* Bounded blast radius: the node is still found by its REAL key/hash --
+     * shm_lookup() discards `hash` entirely and descends on key64, so the
+     * mismatched stamp cannot have mis-routed anything. */
+    ctn = find(0);
+    REQUIRE(ctn != NULL,
+            "a wrong hash_crc32 stamp must not prevent the node being found "
+            "by its real key -- lookup does not use hash_crc32 at all");
+    CHECK(ctn->hash_crc32 == bogus_hash,
+          "the node must still carry the wrong stamp verbatim -- the "
+          "invariant check observes the mismatch, it does not correct it");
+
+    /* A second, correctly-hashed miss on a different key must NOT bump the
+     * counter -- this is a targeted control, not a counter that free-runs.
+     * ⚠ Deliberately NOT the KEY(n) fixture macro: KEY(n) pairs mkkey(n)
+     * with an arbitrary synthetic token (0x1000+n), which by construction
+     * does not equal ngx_crc32_short(mkkey(n), 32) either -- shm_lookup()
+     * never checks that pairing, so every other test in this file gets away
+     * with it. This control needs the ACTUAL real-world-shaped pairing every
+     * production caller sends (hash always derived from key_hash via
+     * ngx_crc32_short() -- see the C4 comment on shm_touch_lru()), so it
+     * computes the real crc32 explicitly instead. */
+    CHECK(ngx_http_cache_turbo_shm_count_miss(&g_zone, mkkey(1),
+              ngx_crc32_short(mkkey(1), 32), 1, 0) == NGX_OK,
+          "min_uses 1 must still be store-eligible on a distinct key");
+    CHECK(g_sh.test_hash_crc32_mismatch == 1,
+          "a correctly-hashed stamp must not increment "
+          "test_hash_crc32_mismatch");
 }
 
 /* S231-PERF-MISSLOCKS: resolve_miss() merges count_miss()+claim() into one
@@ -6038,6 +6115,7 @@ main(void)
     test_claim_single_flight();
     test_lease_owner_identity();
     test_count_miss_semantics();
+    test_hash_crc32_invariant_check();
     test_resolve_miss_merged();
     test_c4_crc32_collision_separates_on_widened_key();
     test_l2_neg_never_on_entry();
