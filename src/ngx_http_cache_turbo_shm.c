@@ -169,14 +169,33 @@ ngx_http_cache_turbo_shm_init_zone(ngx_shm_zone_t *shm_zone, void *data)
     st->sh->n_protected = 0;
     st->sh->n_entries = 0;
 
+    /* CARVE-INIT: EVERY shctx member is initialised in this block, without
+     * exception -- ngx_slab_alloc() does not zero (the S24 note below spells
+     * out the consequence). Today the fresh-carve path happens to receive
+     * zeroed anonymous mmap pages, so an omission is latent rather than live;
+     * that is a property of the allocator, not of this code, and one
+     * ngx_slab_calloc free-list reuse away from ceasing to hold. The set is
+     * kept complete mechanically by ci/tools/lint-carve-init.sh, which fails
+     * the build when a member is declared without an initialiser here. */
     st->sh->hits = 0;
     st->sh->misses = 0;
     st->sh->stale_serves = 0;
     st->sh->refreshes = 0;
     st->sh->evictions = 0;
+    st->sh->markers = 0;
+    st->sh->bg_inflight = 0;
     st->sh->l2_hits = 0;
     st->sh->l2_misses = 0;
     st->sh->lock_waits = 0;
+
+    /* CARVE-INIT: owner_seq is the single-flight token source, and 0 here is
+     * load-bearing rather than incidental: claim() hands out ++owner_seq, so
+     * starting at 0 is what makes the first token 1 and keeps 0 permanently
+     * reserved for "no owner". A garbage start would issue tokens from an
+     * arbitrary point, and a value that collided with a recycled node's stale
+     * refresh_owner would resurrect exactly the ABA the token was added to
+     * close (see its declaration in module.h). */
+    st->sh->owner_seq = 0;
     st->sh->min_uses_skips = 0;
     st->sh->l2_neg_skips = 0;
     st->sh->bypasses = 0;
@@ -230,6 +249,7 @@ ngx_http_cache_turbo_shm_init_zone(ngx_shm_zone_t *shm_zone, void *data)
     /* COR-5(b)/L9: store-time index-drop counters. */
     st->sh->varidx_drops = 0;
     st->sh->varidx_reissues = 0;
+    st->sh->varidx_inflight = 0;
     st->sh->tag_index_drops = 0;
     st->sh->tag_cap_drops = 0;
 
@@ -286,6 +306,22 @@ ngx_http_cache_turbo_shm_init_zone(ngx_shm_zone_t *shm_zone, void *data)
      * including it would put a constant floor under the gauge that no eviction
      * or purge can ever return to baseline. */
     st->sh->used_bytes = 0;
+
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+    /* CARVE-INIT: the TEST_FAULTS diagnostics are zeroed here for the same
+     * reason as every field above -- they are only ever ngx_atomic_fetch_add'ed
+     * afterwards, so the carve is their sole opportunity to have a defined
+     * start. They are assertion baselines: a test reads a delta across a
+     * fixture, and a garbage start makes that delta meaningless in the
+     * direction that reads as a PASS. The guard mirrors the one on their
+     * declaration in module.h -- a production build has neither the fields nor
+     * these stores. */
+    st->sh->test_brk_armings_l1 = 0;
+    st->sh->test_brk_armings_l2 = 0;
+    st->sh->breaker_wedge_observed = 0;
+    st->sh->test_hash_crc32_mismatch = 0;
+#endif
 
     {
         ngx_uint_t  width, w, bytes;
