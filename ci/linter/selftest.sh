@@ -376,7 +376,7 @@ cat > "$listroot/bin/git" <<'GITEOF'
 #!/usr/bin/env bash
 if [ "${1:-}" = "ls-files" ]; then
     if [ -n "${GIT_LS_FILES_OK:-}" ]; then
-        printf '%s\n' src/ngx_http_cache_turbo_module.c
+        printf '%s\0' src/ngx_http_cache_turbo_module.c
         exit 0
     fi
     if [ -n "${GIT_FAIL_SECOND_STATE:-}" ]; then
@@ -384,11 +384,11 @@ if [ "${1:-}" = "ls-files" ]; then
         [ ! -f "$GIT_FAIL_SECOND_STATE" ] \
             || read -r call < "$GIT_FAIL_SECOND_STATE"
         printf '%s\n' "$((call + 1))" > "$GIT_FAIL_SECOND_STATE"
-        printf '%s\n' config
+        printf '%s\0' config
         [ "$call" -eq 0 ] && exit 0
         exit 1
     fi
-    printf '%s\n' src/ngx_http_cache_turbo_shm.c
+    printf '%s\0' src/ngx_http_cache_turbo_shm.c
     exit 1
 fi
 exec "${REAL_GIT:?}" "$@"
@@ -442,6 +442,7 @@ done
 lint_file_wrappers=(
     ci/linter/lint-astgrep.sh
     ci/linter/lint-c.sh
+    ci/linter/lint-carve-init.sh
     ci/linter/lint-ci-cadence.sh
     ci/linter/lint-ci-ports.sh
     ci/linter/lint-ci-runners.sh
@@ -553,6 +554,59 @@ case_ 1 "lint-yaml.sh: subset grep failure cannot become empty-clean" \
     REAL_GREP="$(command -v grep)" GREP_FAIL_YAML_SUBSET=1 \
     YAML_REJECT_WORKFLOW_TOOLS=1 \
     ci/linter/lint-yaml.sh .github/workflows/lint.yml
+
+# NUL transport controls. One actual tracked path carries both a space and a
+# newline byte; explicit, all-tracked, and staged selection must each return it
+# as exactly one array element rather than splitting or concatenating it.
+nulrepo="$listroot/nulrepo"
+mkdir -p "$nulrepo/src"
+git -C "$nulrepo" init -q
+nul_name=$'src/space and\nnewline.c'
+: > "$nulrepo/$nul_name"
+git -C "$nulrepo" add -- "$nul_name"
+
+# shellcheck disable=SC2016  # array/path expand in the inner bash
+case_ 0 "lint_files_into: explicit newline filename is one element" \
+    env -C "$nulrepo" LINT_LIB="$ROOT/ci/linter/lib.sh" bash -c \
+    '. "$LINT_LIB"; files=(stale); lint_files_into files "^src/.*\\.c$" "$1"; [ "${#files[@]}" -eq 1 ] && [ "${files[0]}" = "$1" ]' \
+    _ "$nul_name"
+# shellcheck disable=SC2016  # array/path expand in the inner bash
+case_ 0 "lint_files_into: git ls-files preserves a newline filename" \
+    env -C "$nulrepo" LINT_LIB="$ROOT/ci/linter/lib.sh" LINT_MODE=all \
+    bash -c '. "$LINT_LIB"; files=(stale); lint_files_into files "^src/.*\\.c$"; [ "${#files[@]}" -eq 1 ] && [ "${files[0]}" = "$1" ]' \
+    _ "$nul_name"
+# shellcheck disable=SC2016  # array/path expand in the inner bash
+case_ 0 "lint_files_into: staged Git selection preserves a newline filename" \
+    env -C "$nulrepo" LINT_LIB="$ROOT/ci/linter/lib.sh" LINT_MODE=staged \
+    bash -c '. "$LINT_LIB"; files=(stale); lint_files_into files "^src/.*\\.c$"; [ "${#files[@]}" -eq 1 ] && [ "${files[0]}" = "$1" ]' \
+    _ "$nul_name"
+
+# A named coprocess descriptor can disappear when a fast child exits. Repeated
+# immediate multi-record producers exercise that lifecycle edge; the loader
+# must retain every record through its ordinary duplicated descriptor.
+# shellcheck disable=SC2016  # functions/arrays expand in the inner bash
+case_ 0 "lint_files_into: fast producer FD lifecycle preserves every record" \
+    bash -c '. ci/linter/lib.sh
+        lint_files() {
+            local i
+            for ((i = 0; i < 32; i++)); do printf "item %s\0" "$i"; done
+        }
+        for ((run = 0; run < 100; run++)); do
+            files=(stale)
+            lint_files_into files "."
+            [ "${#files[@]}" -eq 32 ]
+            [ "${files[0]}" = "item 0" ]
+            [ "${files[31]}" = "item 31" ]
+        done'
+
+# EOF after bytes but before a NUL is a corrupt transport, not clean EOF. A
+# complete prefix must not make the unterminated tail or partially loaded list
+# acceptable.
+case_ 2 "lint_files_into: a non-NUL-terminated tail is exit 2" \
+    bash -c '. ci/linter/lib.sh
+        lint_files() { printf "complete\0unterminated"; }
+        files=(stale)
+        lint_files_into files "."'
 
 # ----------------------------------------------------------------------------
 # The shm-checker mutation controls.
@@ -948,7 +1002,7 @@ mkdir -p "$mutroot/fakebin"
 cat > "$mutroot/fakebin/git" <<'GITEOF'
 #!/usr/bin/env bash
 if [ "${1:-}" = "ls-files" ]; then
-    printf '%s\n' src/ngx_http_cache_turbo_shm.c
+    printf '%s\0' src/ngx_http_cache_turbo_shm.c
     exit 1
 fi
 exec "${REAL_GIT:?}" "$@"
