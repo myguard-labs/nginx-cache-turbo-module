@@ -335,6 +335,7 @@ fi
 # be unsupported. Fixture is generated: a committed broken-YAML file would trip
 # yamllint on the real tree.
 badroot="$(mktemp -d)"
+trap 'rm -rf "$badroot"' EXIT
 mkdir -p "$badroot/.github/workflows"
 printf 'on: [pull_request\njobs: {\n' > "$badroot/.github/workflows/broken.yml"
 case_ 2 "policy runners: unparsable YAML is exit 2, not clean" \
@@ -441,6 +442,27 @@ case_ 1 "carve-init: address-of harvest is scoped to the call, not the line" \
 emit_fixture "    ngx_queue_t              lru;" \
              "    ngx_queue_init(&st->sh->lru);"
 case_ 0 "carve-init: an allowlisted initialiser still counts" \
+    env -C "$mutroot" ./ci/tools/lint-carve-init.sh
+
+# A wrapped initialiser call must still count. The harvest is line-oriented,
+# so a call whose &sh->NAME args land on a continuation line is the form that
+# breaks a per-line scope -- a FALSE FAIL on correct code.
+emit_fixture "    ngx_queue_t              lru;" \
+             "    ngx_queue_init(
+        &st->sh->lru);"
+case_ 0 "carve-init: a wrapped initialiser call still counts" \
+    env -C "$mutroot" ./ci/tools/lint-carve-init.sh
+
+# A pointer-to-array _pad is an 8-byte pointer, not filler, bracket regardless.
+emit_fixture "    u_char                   (*_pad_pa)[8];" ""
+case_ 1 "carve-init: pointer-to-array _pad is not layout filler" \
+    env -C "$mutroot" ./ci/tools/lint-carve-init.sh
+
+# INIT_HELPERS is word-bounded: a helper merely CONTAINING an allowlisted
+# name must not inherit its credit.
+emit_fixture "    ngx_uint_t               tag_cap_drops;" \
+             "    my_ngx_queue_init(&st->sh->tag_cap_drops);"
+case_ 1 "carve-init: INIT_HELPERS match is word-bounded" \
     env -C "$mutroot" ./ci/tools/lint-carve-init.sh
 
 # A structurally broken header is "could not run" (2), never clean.

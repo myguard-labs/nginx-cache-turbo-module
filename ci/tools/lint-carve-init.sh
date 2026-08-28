@@ -104,13 +104,22 @@ members="$(awk '
         ndecl = split(line, decls, /,/)
         for (d = 1; d <= ndecl; d++) {
             piece = decls[d]
-            had_bracket = (piece ~ /\[[^]]*\]/)
+            # A parenthesised or pointer declarator is not layout filler even
+            # with a bracket: `u_char (*_pad_pa)[8];` is an 8-byte POINTER.
+            had_bracket = (piece ~ /\[[^]]*\]/ && piece !~ /[(*]/)
             sub(/\[[^]]*\]/, "", piece)      # per-declarator array bound
             gsub(/^[[:space:]]+|[[:space:]]+$/, "", piece)
             if (piece == "") continue
             n = split(piece, parts, /[[:space:]*]+/)
             if (n == 0) continue
             name = parts[n]
+            # A parenthesised declarator -- `u_char (*_pad_pa)[8];`, a function
+            # pointer -- leaves parens on the token, which fails the identifier
+            # test below. Dropping it silently would remove the member from the
+            # world of the gate entirely, which is worse than mis-tagging it:
+            # nothing would ever demand an initialiser. Strip the parens so it
+            # is accounted for, and let had_bracket refuse it the pad exemption.
+            gsub(/[()]/, "", name)
             if (name ~ /^[A-Za-z_][A-Za-z0-9_]*$/) {
                 # Tag pad-eligibility onto the name so the exemption is a
                 # TYPE decision, not a name-prefix one.
@@ -167,7 +176,7 @@ member_names="$(printf '%s\n' "$members" | cut -f1)"
 # Calls that genuinely initialise what they are handed. A member set up by a
 # helper NOT named here reads as uninitialised, so adding a new initialiser
 # helper to the carve block means adding it here too -- the FAIL message says so.
-INIT_HELPERS='(ngx_rbtree_init|ngx_queue_init|ngx_memzero|ngx_rbtree_sentinel_init)[[:space:]]*[(]'
+INIT_HELPERS='(^|[^A-Za-z0-9_])(ngx_rbtree_init|ngx_queue_init|ngx_memzero|ngx_rbtree_sentinel_init)[[:space:]]*[(]'
 
 inits="$(awk -v INIT_HELPERS="$INIT_HELPERS" '
     # the carve block starts at the slab alloc, NOT at the function opener --
@@ -203,19 +212,30 @@ inits="$(awk -v INIT_HELPERS="$INIT_HELPERS" '
         # one line, and a line-level test would count `foo`. Each statement is
         # split out, then only the text from an allowlisted call name to the
         # end of that statement is harvested.
-        nstmt = split(line, stmts, /;/)
+        # The window is STICKY across lines. A call whose argument list wraps
+        # puts its `&sh->NAME` args on a continuation line that contains no
+        # allowlisted name; a per-line test skips that line and reports the
+        # members forgotten -- a false FAIL on correct code, which is worse
+        # than the read it was closing. `in_helper` stays set from the call
+        # name until the statement-terminating `;`.
+        nstmt = split(line, stmts, /;/, seps)
         for (q = 1; q <= nstmt; q++) {
             stmt = stmts[q]
-            if (stmt !~ INIT_HELPERS) continue
-            # harvest only from the allowlisted call name onward
-            match(stmt, INIT_HELPERS)
-            rest = substr(stmt, RSTART)
-            while (match(rest, /&[A-Za-z_][A-Za-z0-9_.>-]*sh->[A-Za-z_][A-Za-z0-9_]*/)) {
-                s = substr(rest, RSTART, RLENGTH)
-                sub(/.*sh->/, "", s)
-                print s
-                rest = substr(rest, RSTART + RLENGTH)
+            if (match(stmt, INIT_HELPERS)) {
+                in_helper = 1
+                stmt = substr(stmt, RSTART)
             }
+            if (in_helper) {
+                rest = stmt
+                while (match(rest, /&[A-Za-z_][A-Za-z0-9_.>-]*sh->[A-Za-z_][A-Za-z0-9_]*/)) {
+                    s = substr(rest, RSTART, RLENGTH)
+                    sub(/.*sh->/, "", s)
+                    print s
+                    rest = substr(rest, RSTART + RLENGTH)
+                }
+            }
+            # a `;` closed this statement -- the helper window ends with it
+            if (seps[q] == ";") in_helper = 0
         }
     }
 ' "$SRC" | sort -u)"
@@ -253,27 +273,38 @@ done <<EOF
 $members
 EOF
 
+# Both lists are reported before exiting. Bailing on the first one makes a
+# header with a mistyped pad AND a forgotten member take two round-trips: fix
+# the pad, re-run, discover an unrelated second failure.
+fail=0
+
 if [ -n "$mistyped_pad" ]; then
+    fail=1
     echo "FAIL: member(s) named _pad* but NOT declared 'u_char NAME[...]':" >&2
     for m in $mistyped_pad; do
         echo "        $m" >&2
     done
-    echo "      The _pad* exemption covers layout filler only. Either declare it" >&2
-    echo "      as a u_char array, or rename it and initialise it at the carve." >&2
-    exit 1
+    echo "      The _pad* exemption covers layout filler only. It requires the" >&2
+    echo "      literal spelling 'u_char NAME[...]'; a pointer or a parenthesised" >&2
+    echo "      declarator is not filler. Either declare it as a u_char array, or" >&2
+    echo "      rename it and initialise it at the carve." >&2
 fi
 
 if [ -n "$missing" ]; then
+    fail=1
     echo "FAIL: ngx_http_cache_turbo_shctx_t member(s) never initialised at zone carve:" >&2
     for m in $missing; do
         echo "        $m" >&2
     done
     echo "      ngx_slab_alloc() does not zero. Add an 'st->sh->NAME = ...;' to the" >&2
-    echo "      carve block -- or, if NAME is set up by an initialiser helper" >&2
-    echo "      taking its address, add that helper to INIT_HELPERS in this script." >&2
     echo "      carve block in ngx_http_cache_turbo_shm_init_zone() ($SRC)." >&2
+    echo "      If NAME is instead set up by an initialiser helper taking its" >&2
+    echo "      address, add that helper to INIT_HELPERS in this script." >&2
     echo "      Do NOT add it to the shm.exists reload branch: that path deliberately" >&2
     echo "      inherits live state across a SIGHUP and zeroing there would wipe it." >&2
+fi
+
+if [ "$fail" -eq 1 ]; then
     exit 1
 fi
 
