@@ -13,7 +13,12 @@
 # Usage:  ci/linter/selftest.sh
 # Exit:   0 all controls held, 1 one or more did not.
 #
-# Runs in about a second. Every case but the carve-init block at the end is
+# Runs in about two seconds (90 controls). The budget is stated as a ceiling
+# on the whole suite, not per case: this is a commit-hook and CI gate, where a
+# couple of seconds is immaterial next to the cost of a silent-green linter
+# shipping. Controls are added when a class of malformed input is found
+# unmodelled; the budget line moves with them rather than the suite being
+# trimmed to fit it. Every case but the carve-init block at the end is
 # dispatcher-level (LINT_ONLY values are either bogus or rejected before
 # dispatch), so no linter needs to be installed for those. The carve-init cases
 # DO invoke that one checker for real, against a generated two-file fixture
@@ -352,7 +357,7 @@ case_ 2 "policy runners: unparsable YAML is exit 2, not clean" \
 # catch, applied to the checkers rather than to the dispatcher.
 #
 # These cases DO invoke a real checker, unlike every case above. They stay
-# within the one-second budget by running against a generated fixture tree of
+# within the suite budget by running against a generated fixture tree of
 # two small files rather than the real src/, so no build and no scan of the
 # 34k-line source is involved.
 mutroot="$(mktemp -d)"
@@ -628,6 +633,82 @@ carve_row 1 "a member declared across a line continuation is harvested" \
 # A parenthesised declarator is accounted for rather than dropped.
 carve_row 1 "a parenthesised pointer declarator is harvested" \
     "    u_char                   (*_pad_pa)[8];" ""
+
+# --- class: translation phase 2 -- line continuation ------------------------
+# A trailing backslash splices the next physical line onto this one BEFORE
+# comments and tokens are formed, so it applies in EVERY lexical state. The
+# stripper terminated a line comment at end-of-line and fed the second
+# physical line to both passes as live code; because the INIT_HELPERS window
+# is sticky until a `;`, one continued comment could credit an arbitrary RUN
+# of members. These rows sweep the construct across every state the stripper
+# tracks, in both directions.
+carve_row 1 "a continued LINE COMMENT does not expose its tail as code" \
+    "    ngx_queue_t              lru;" \
+    '    // set up by \%    ngx_queue_init(&st->sh->lru);'
+
+carve_row 1 "a continued STRING LITERAL does not expose its tail as code" \
+    "    ngx_queue_t              lru;" \
+    '    log("x \%        ngx_queue_init(&st->sh->lru); ");'
+
+carve_row 0 "a continued BLOCK COMMENT still closes, and does not eat code" \
+    "    ngx_uint_t               tag_cap_drops;" \
+    '    /* note \%       still comment */%    st->sh->tag_cap_drops = 0;'
+
+carve_row 0 "a continued DECLARATION/CALL is one statement, not two" \
+    "    ngx_queue_t              lru;" \
+    '    ngx_queue_init( \%        &st->sh->lru);'
+
+# An EVEN number of trailing backslashes does NOT continue -- the last one is
+# itself escaped. Blanking the next line there would be a FALSE FAIL on
+# correct code, the mirror-image defect of the one above.
+carve_row 0 "an EVEN backslash run does not continue the line" \
+    "    ngx_queue_t              lru;" \
+    '    // harmless \\%    ngx_queue_init(&st->sh->lru);'
+
+# --- class: declarator forms the header does not use yet, but may -----------
+# The catch-all must fire on what it genuinely cannot parse, and NOT on
+# ordinary C. A false exit 2 is CI red on correct code.
+carve_row 1 "a function-pointer member is harvested, not a loud error" \
+    "    void (*cb)(void *);" ""
+
+carve_row 0 "an initialised function-pointer member satisfies the gate" \
+    "    void (*cb)(void *);" \
+    "    st->sh->cb = 0;"
+
+# The parameter list carries a comma, which a naive declarator split cuts in
+# half, leaving two halves that neither parse.
+carve_row 1 "a function-pointer parameter list is not split on its comma" \
+    "    void (*cb)(void *, int);" ""
+
+carve_row 1 "an array-of-arrays member is harvested, not a loud error" \
+    "    ngx_uint_t               m[2][3];" ""
+
+carve_row 0 "an initialised array-of-arrays member satisfies the gate" \
+    "    ngx_uint_t               m[2][3];" \
+    "    st->sh->m[0][1] = 0;"
+
+# An attribute macro sits BETWEEN the type and the name; truncating at its
+# parens harvests the MACRO as the member name.
+carve_row 1 "an attribute-macro member yields the member name, not the macro" \
+    "    ngx_uint_t NGX_ALIGNED(64) slot;" ""
+
+carve_row 0 "an initialised attribute-macro member satisfies the gate" \
+    "    ngx_uint_t NGX_ALIGNED(64) slot;" \
+    "    st->sh->slot = 0;"
+
+# A macro-spelled TYPE needs no special handling -- it is one more leading
+# token -- but nothing asserted that until now.
+carve_row 1 "a macro-typed member is harvested" \
+    "    NGX_ATOMIC_T             mt;" ""
+
+# Comma-separated bitfields: every name, not only the last.
+carve_row 1 "comma-separated bitfields hide no member" \
+    "    unsigned                 x:1, y:2;" \
+    "    st->sh->x = 0;"
+
+# Confirmed-correct forms that must STAY correct.
+carve_row 1 "a const volatile member is harvested" \
+    "    const volatile ngx_uint_t cv;" ""
 
 if [ "$rc" -eq 0 ]; then
     echo "== lint gate selftest: all controls held =="

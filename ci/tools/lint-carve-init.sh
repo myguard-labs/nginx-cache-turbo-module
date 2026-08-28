@@ -82,11 +82,61 @@ fi
 # (state carries across lines), line comments, "strings" and char literals,
 # backslash escapes inside both, and never treats a quote inside a comment or a
 # comment marker inside a string as its own thing.
+#
+# TRANSLATION PHASE 2 IS DONE FIRST, AND SEPARATELY. A physical line ending in
+# a backslash is spliced onto the next one BEFORE any lexing happens, which is
+# what the C standard actually specifies (phase 2 runs before phase 3 forms
+# comments and tokens). Handling the carry inside the lexer instead means
+# handling it once per state -- line comment, block comment, string, char
+# literal, plain code -- and the bug that forced this rewrite was exactly one
+# of those states being missed:
+#
+#     // note \
+#     ngx_queue_init(&st->sh->misses)
+#
+# is ONE line comment in C. Lexing line-at-a-time terminated it at the first
+# end-of-line and fed the second physical line to both passes as live code,
+# which -- because the INIT_HELPERS window is sticky until a `;` -- could
+# credit an arbitrary RUN of members from a single comment. Splicing first
+# closes that for every state at once, including the ones nobody has written
+# an exploit for yet: continued string literals, continued macro bodies and
+# ordinary declarations wrapped across physical lines.
+#
+# An EVEN number of trailing backslashes does NOT continue: the last one is
+# itself escaped. The count is taken on the RAW physical line, before lexing,
+# because phase 2 precedes phase 3 -- a trailing backslash splices even inside
+# a comment or a string, which is the whole point.
+#
+# Line count is preserved by emitting the spliced group's stripped text on the
+# LAST physical line of the group and blanks for the ones before it. The
+# alternative -- redistributing the text back across the original column
+# offsets -- would let a construct be cut in half again at exactly the
+# boundaries phase 2 exists to erase. Keeping the logical line whole is what
+# lets a wrapped declaration or a wrapped helper call parse as the single
+# statement it is; the diagnostics depend only on line NUMBERS remaining
+# aligned, which they do.
 strip_code() {
     "$AWK" '
-        BEGIN { inblock = 0 }
+        # --- phase 2: splice line continuations -----------------------------
+        # `pend` holds the spliced logical line so far; `held` counts the
+        # physical lines already folded into it, each of which owes a blank.
+        function trailing_backslashes(s,   k) {
+            k = 0
+            while (k < length(s) && substr(s, length(s) - k, 1) == "\\") k++
+            return k
+        }
+        BEGIN { inblock = 0; pend = ""; held = 0 }
         {
-            line = $0
+            raw = $0
+            if (trailing_backslashes(raw) % 2 == 1) {
+                # drop the splicing backslash itself, exactly as phase 2 does
+                pend = pend substr(raw, 1, length(raw) - 1)
+                held++
+                next
+            }
+            line = pend raw
+            pend = ""
+            # --- phase 3: comments and literals -----------------------------
             out = ""
             i = 1
             n = length(line)
@@ -117,7 +167,19 @@ strip_code() {
                 out = out c
                 i++
             }
+            # one blank per physical line folded in, then the logical line
+            while (held > 0) { print ""; held-- }
             print out
+        }
+        END {
+            # A file whose LAST line ends in a backslash has an unterminated
+            # splice. Emitting nothing would silently swallow the line; emit
+            # what was accumulated so the member or store on it is still seen,
+            # and keep the line count exact.
+            if (held > 0 || pend != "") {
+                while (held > 1) { print ""; held-- }
+                print pend
+            }
         }
     ' "$1"
 }
@@ -145,6 +207,21 @@ done
 # parse (exit 2). Caught by mutation: renaming the closing typedef produced a
 # 190-name failure list naming fields of unrelated structs.
 members="$(strip_code "$HDR" | "$AWK" '
+    # Split a declaration into declarators on TOP-LEVEL commas only. A comma
+    # inside parens (a function-pointer parameter list) or brackets is part of
+    # one declarator, not a separator between two.
+    function split_declarators(s, arr,   i, ch, depth, cur, k) {
+        depth = 0; cur = ""; k = 0
+        for (i = 1; i <= length(s); i++) {
+            ch = substr(s, i, 1)
+            if (ch == "(" || ch == "[") depth++
+            else if (ch == ")" || ch == "]") { if (depth > 0) depth-- }
+            if (ch == "," && depth == 0) { arr[++k] = cur; cur = ""; continue }
+            cur = cur ch
+        }
+        arr[++k] = cur
+        return k
+    }
     /^typedef struct ngx_http_cache_turbo_shctx_s \{/ { inside = 1; opened = 1; next }
     inside && /^\} ngx_http_cache_turbo_shctx_t;/     { inside = 0; closed = 1 }
     /^\}/ && inside && !closed                        { unterminated = 1 }
@@ -188,18 +265,29 @@ members="$(strip_code "$HDR" | "$AWK" '
         # EACH declarator. Latent when written (the struct has no comma
         # declarators today); fixed so adding one cannot silently open a hole.
         #
+        # The split is DEPTH-AWARE. A plain split on "," cuts a function
+        # pointer parameter list in half -- `void (*cb)(void *, int);` becomes
+        # `void (*cb)(void *` and ` int)` and neither half parses -- so commas
+        # nested inside parens or brackets are not declarator separators.
+        #
         # The array-bound test is PER-DECLARATOR, not per-line. `u_char
         # _pad_a[8], _pad_b;` has an array base type and a scalar second
         # declarator; testing the line as a whole would stamp "padok" onto
         # _pad_b and silently exempt a member nothing proves is filler --
         # reopening, along this axis, the exact hole the type check closes.
-        ndecl = split(line, decls, /,/)
+        ndecl = split_declarators(line, decls)
         for (d = 1; d <= ndecl; d++) {
             piece = decls[d]
             # A parenthesised or pointer declarator is not layout filler even
             # with a bracket: `u_char (*_pad_pa)[8];` is an 8-byte POINTER.
             had_bracket = (piece ~ /\[[^]]*\]/ && piece !~ /[(*]/)
-            sub(/\[[^]]*\]/, "", piece)      # per-declarator array bound
+            # Array bounds are stripped in a LOOP. A single sub() removes one
+            # bound only, so `ngx_uint_t m[2][3];` kept a `[3]` on the token,
+            # failed the identifier test and hit the catch-all -- exit 2, CI
+            # red, on ordinary C the header does not use today but plausibly
+            # will. A false FAIL on correct code is the second-worst outcome
+            # this checker has.
+            while (piece ~ /\[[^]]*\]/) sub(/\[[^]]*\]/, "", piece)
             # Bitfield width. `unsigned degraded:1` otherwise leaves the token
             # as `degraded:1`, which fails the identifier test below and used
             # to be DISCARDED -- the member vanished from the gate entirely and
@@ -210,16 +298,47 @@ members="$(strip_code "$HDR" | "$AWK" '
             sub(/:[[:space:]]*[0-9]+[[:space:]]*$/, "", piece)
             gsub(/^[[:space:]]+|[[:space:]]+$/, "", piece)
             if (piece == "") continue
+            # A PARENTHESISED DECLARATOR holds the name inside the parens, and
+            # everything after the closing paren is a suffix -- a function
+            # pointer parameter list, an array bound -- not part of the name.
+            # `void (*cb)(void *);` flattened with gsub(/[()]/) produced
+            # `void *cb void`, whose last token is `void`: the catch-all fired
+            # and turned CI red. Parse the parenthesised group FIRST and keep
+            # only what is inside it, so the name is read from where C puts it.
+            # Repeat, because the group can nest: `void (*(*f)(int))(void);`.
+            while (match(piece, /\([^()]*\)/)) {
+                inner = substr(piece, RSTART + 1, RLENGTH - 2)
+                # A parameter list -- the group that FOLLOWS the declarator --
+                # contributes no name. The declarator group is the one holding
+                # a `*` or a bare identifier that is not itself a type list;
+                # taking the group only when the text before it is not already
+                # a complete declarator keeps the two apart.
+                if (inner ~ /\*/ || RSTART == 1) {
+                    piece = inner
+                } else {
+                    # Not a declarator group. Excise the group and KEEP BOTH
+                    # SIDES: a trailing parameter list leaves the name on the
+                    # left, but an ATTRIBUTE MACRO sits BETWEEN the type and
+                    # the name -- `ngx_uint_t NGX_ALIGNED(64) slot;` -- and
+                    # truncating to the left there throws the name away and
+                    # harvests `NGX_ALIGNED` instead. Excision handles both:
+                    # the parameter list leaves trailing whitespace that the
+                    # name parse ignores, and the attribute macro leaves the
+                    # macro name as one more leading token before `slot`.
+                    piece = substr(piece, 1, RSTART - 1) " " \
+                            substr(piece, RSTART + RLENGTH)
+                }
+                while (piece ~ /\[[^]]*\]/) sub(/\[[^]]*\]/, "", piece)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", piece)
+            }
             n = split(piece, parts, /[[:space:]*]+/)
             if (n == 0) continue
             name = parts[n]
-            # A parenthesised declarator -- `u_char (*_pad_pa)[8];`, a function
-            # pointer -- leaves parens on the token, which fails the identifier
-            # test below. Dropping it silently would remove the member from the
-            # world of the gate entirely, which is worse than mis-tagging it:
-            # nothing would ever demand an initialiser. Strip the parens so it
-            # is accounted for, and let had_bracket refuse it the pad exemption.
-            gsub(/[()]/, "", name)
+            # An ATTRIBUTE MACRO between the type and the name -- `ngx_uint_t
+            # NGX_ALIGNED(64) slot;` -- is removed by the parameter-list branch
+            # above, so the name is still the last token. A macro-TYPED member
+            # (`NGX_ATOMIC_T counter;`) needs nothing special: the type is just
+            # another leading token.
             if (name ~ /^[A-Za-z_][A-Za-z0-9_]*$/) {
                 # Tag pad-eligibility onto the name so the exemption is a
                 # TYPE decision, not a name-prefix one.
