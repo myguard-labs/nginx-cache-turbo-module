@@ -2266,7 +2266,8 @@ http {
 
 | Request | Effect |
 |---|---|
-| `GET /_cache` | JSON stats (`?autotune=1` also forces an autotune recompute first). |
+| `GET /_cache` | JSON stats. Read-only: legacy `?autotune=1` is ignored on safe methods. |
+| `POST /_cache?action=autotune&value=1` | Force an immediate autotune recompute, then return the same JSON stats body a `GET /_cache` would. |
 | `GET /_cache?format=prometheus` | Same stats in Prometheus text format — scrape this. |
 | `POST /_cache?all=1` | Purge the whole zone (and the L2 keyspace, if Redis is on). The L2 side is a `SCAN MATCH <prefix>*` walk; if that walk does **not** finish — read timeout, malformed reply, or the internal page cap — the response is `500` with `{"purged":N,"l2":"incomplete","reason":"…"}` and part of L2 still holds entries. If the walk cannot even start — L2 unreachable, connect refused — the response is `500` with `{"purged":N,"l2":"unavailable"}` and L2 is untouched. A `200` means the walk reached the end of the keyspace. |
 | `POST /_cache?key=<string>` | Purge one entry. `<string>` is hashed **verbatim**, so it must equal the entry's full cache-key value — for the built-in default key that is `<host><uri><raw-query-string>` (e.g. `example.com/blog/post-42?id=1`), **not** just the path. Use a `PURGE` request to that URL (above) if you don't want to reconstruct the key. Drops L1 + L2. |

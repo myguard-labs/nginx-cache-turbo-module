@@ -1108,17 +1108,55 @@ def _fire_misses(ng: Nginx, prefix: str, n: int) -> None:
         list(ex.map(lambda i: fetch(ng.port, f"{prefix}{i}"), range(n)))
 
 
-# A forced recompute (admin ?autotune=1) windows over everything since the last
-# recompute and returns the stats incl. the fresh verdict. The autotune locations
-# use a huge interval so the throttled per-request recompute fires only on the
-# seed (snapshotting ~0) and never splits the measured window — the force does the
-# real measurement, making these tests independent of wall-clock timing.
+# A forced recompute (admin POST ?action=autotune&value=1) windows over
+# everything since the last recompute and returns the stats incl. the fresh
+# verdict. The autotune locations use a huge interval so the throttled
+# per-request recompute fires only on the seed (snapshotting ~0) and never
+# splits the measured window — the force does the real measurement, making
+# these tests independent of wall-clock timing.
 
 def _autotune_force(ng: Nginx, admin: str) -> dict:
     import json
-    s, b, _ = fetch(ng.port, f"{admin}?autotune=1")
-    assert s == 200, f"{admin}?autotune=1 status {s}"
+    s, b, _ = fetch(ng.port, f"{admin}?action=autotune&value=1",
+                    method="POST")
+    assert s == 200, f"{admin}?action=autotune&value=1 status {s}"
     return json.loads(b)
+
+
+def test_autotune_force_requires_post_action(ng: Nginx, origin: Origin) -> None:
+    """ADMIN-AUTOTUNE-SAFE-METHOD: GET/HEAD on the stats endpoint stay read-only
+    even if they carry the legacy ?autotune=1 query; only POST with the exact
+    action=value pair may force a recompute."""
+    import json
+
+    origin.delay = 0.04
+    try:
+        fetch(ng.port, "/at/safe-seed")
+        _fire_misses(ng, "/at/safe-k", 110)
+
+        s_get, b_get, _ = fetch(ng.port, "/_cache_at?autotune=1")
+        assert s_get == 200, f"safe GET status {s_get}"
+        st_get = json.loads(b_get)
+        assert st_get["autotuned_beta"] == 0, \
+            f"GET stats must stay read-only even with ?autotune=1: {st_get}"
+
+        s_head, _, h_head = fetch(ng.port, "/_cache_at?autotune=1",
+                                  method="HEAD")
+        assert s_head == 200, f"safe HEAD status {s_head}"
+        assert "application/json" in h_head.get("content-type", ""), h_head
+
+        s_plain, b_plain, _ = fetch(ng.port, "/_cache_at")
+        assert s_plain == 200, f"plain stats status {s_plain}"
+        st_plain = json.loads(b_plain)
+        assert st_plain["autotuned_beta"] == 0, \
+            f"HEAD stats must stay read-only: {st_plain}"
+
+        st_post = _autotune_force(ng, "/_cache_at")
+        assert st_post["autotuned_beta"] > 0, \
+            f"POST force did not publish a verdict: {st_post}"
+    finally:
+        origin.reset_delay()
+        drain_origin(origin)
 
 
 def test_autotune_raises_beta_within_band(ng: Nginx, origin: Origin) -> None:

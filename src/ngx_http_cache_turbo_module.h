@@ -3143,8 +3143,9 @@ void ngx_http_cache_turbo_autotune_maybe(ngx_http_cache_turbo_zone_t *z,
 
 /* Force an immediate recompute over the window since the last snapshot, ignoring
  * the interval throttle (does not disturb the throttle schedule). Backs the admin
- * "recompute now" command (`?autotune=1`) — an operator escape hatch, and what
- * makes the autotune tests deterministic without waiting on the interval. */
+ * "recompute now" command (`POST ?action=autotune&value=1`) — an operator
+ * escape hatch, and what makes the autotune tests deterministic without waiting
+ * on the interval. */
 void ngx_http_cache_turbo_autotune_force(ngx_http_cache_turbo_zone_t *z);
 
 
