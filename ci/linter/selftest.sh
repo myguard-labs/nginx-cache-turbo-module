@@ -395,7 +395,10 @@ typedef unsigned long uint64_t;
 #define NGX_ALIGNED(n) __attribute__((aligned(n)))
 typedef struct ngx_queue_s { struct ngx_queue_s *prev, *next; } ngx_queue_t;
 #define ngx_queue_init(q) (q)->prev = q; (q)->next = q
+#define ngx_memzero(buf, n) __builtin_memset((buf), 0, (n))
 typedef struct { ngx_uint_t x; } ngx_http_cache_turbo_stripe_t;
+typedef u_char ct_u_char_pad_t[8];
+typedef ngx_uint_t ct_uint_pad_t[8];
 typedef struct ngx_http_cache_turbo_shctx_s {
     ngx_atomic_t             hits;
     u_char                   _pad_hits[24];
@@ -433,6 +436,7 @@ carve_lint() {
     # "$@". shellcheck cannot see an indirect invocation.
     # shellcheck disable=SC2317
     env -C "$mutroot" NGX_SRC_TREE=- CARVE_INIT_CONFIGS=default \
+        CARVE_INIT_PIN_COUNT=0 \
         ./ci/tools/lint-carve-init.sh
 }
 
@@ -482,6 +486,61 @@ PREEOF
 case_ 1 "carve-init: a store BEFORE the slab alloc is not carve initialisation" \
     carve_lint
 
+# An unrelated allocator call cannot open the carve window. Only the assignment
+# of ngx_slab_alloc() to st->sh identifies the fresh object being initialised.
+emit_fixture "    ngx_uint_t               tag_cap_drops;" ""
+cat > "$mutroot/src/ngx_http_cache_turbo_shm.c" <<'ANCHOREOF'
+#include "ngx_http_cache_turbo_module.h"
+typedef struct { ngx_http_cache_turbo_shctx_t *sh; } ngx_ht_st_t;
+static ngx_ht_st_t *st;
+static void *pool;
+void *ngx_slab_alloc(void *, unsigned long);
+int ngx_http_cache_turbo_shm_init_zone(void *shm_zone, void *data)
+{
+    (void) ngx_slab_alloc(pool, 1);
+    st->sh->tag_cap_drops = 0;
+    st->sh = ngx_slab_alloc(pool, sizeof(ngx_http_cache_turbo_shctx_t));
+    st->sh->hits = 0;
+    return 0;
+}
+ANCHOREOF
+case_ 1 "carve-init: an unrelated slab allocation cannot widen the window" \
+    carve_lint
+
+# Flattening the AST used to credit stores that did not execute on every carve.
+emit_fixture "    ngx_uint_t               tag_cap_drops;" \
+             "    if (data != shm_zone) { st->sh->tag_cap_drops = 0; }"
+case_ 1 "carve-init: a conditional-only store is not initialisation" carve_lint
+
+# A direct store after an early successful return does not dominate every
+# successful path. Nonzero error returns (such as the real NULL-allocation
+# guard) are safe; a zero or non-constant return is refused loudly.
+emit_fixture "    ngx_uint_t               tag_cap_drops;" \
+             "    if (data != shm_zone) { return 0; }
+    st->sh->tag_cap_drops = 0;"
+case_ 2 "carve-init: an early successful return cannot bypass initialisation" \
+    carve_lint
+
+# The top-level return closes the carve window; dead statements after it cannot
+# satisfy the invariant.
+emit_fixture "    ngx_uint_t               tag_cap_drops;" ""
+cat > "$mutroot/src/ngx_http_cache_turbo_shm.c" <<'DEADEOF'
+#include "ngx_http_cache_turbo_module.h"
+typedef struct { ngx_http_cache_turbo_shctx_t *sh; } ngx_ht_st_t;
+static ngx_ht_st_t *st;
+static void *pool;
+void *ngx_slab_alloc(void *, unsigned long);
+int ngx_http_cache_turbo_shm_init_zone(void *shm_zone, void *data)
+{
+    st->sh = ngx_slab_alloc(pool, sizeof(ngx_http_cache_turbo_shctx_t));
+    st->sh->hits = 0;
+    return 0;
+    st->sh->tag_cap_drops = 0;
+}
+DEADEOF
+case_ 1 "carve-init: an unreachable store after return is not initialisation" \
+    carve_lint
+
 # Compound assignment must not read as initialisation.
 emit_fixture "    ngx_uint_t               tag_cap_drops;" \
              "    st->sh->tag_cap_drops += 0;"
@@ -506,6 +565,18 @@ case_ 1 "carve-init: _pad* exemption requires a u_char array type" carve_lint
 emit_fixture "    u_char                   _pad_legit[8];" ""
 case_ 0 "carve-init: a genuine u_char pad stays exempt" carve_lint
 
+# clang preserves a typedef-backed array's source spelling in qualType and
+# records its semantic element type in desugaredQualType. The exemption must
+# follow that semantic type so a genuine byte-array alias remains valid.
+emit_fixture "    ct_u_char_pad_t           _pad_typedef;" ""
+case_ 0 "carve-init: a typedef-backed u_char pad stays exempt" carve_lint
+
+# The desugared fallback must not turn every typedef-backed array into padding:
+# an alias whose real element type is ngx_uint_t is ordinary state and still
+# requires explicit carve initialisation.
+emit_fixture "    ct_uint_pad_t             _pad_typedef;" ""
+case_ 1 "carve-init: a typedef-backed non-u_char pad is rejected" carve_lint
+
 # Per-declarator, not per-line: an array pad and a SCALAR pad on one
 # declaration line. The scalar must not inherit the array's exemption.
 emit_fixture "    u_char                   _pad_a[8], _pad_b;" ""
@@ -523,6 +594,23 @@ case_ 1 "carve-init: address-of harvest is scoped to the call, not the line" car
 emit_fixture "    ngx_queue_t              lru;" \
              "    ngx_queue_init(&st->sh->lru);"
 case_ 0 "carve-init: an allowlisted initialiser still counts" carve_lint
+
+# Only the destination argument counts, and a byte-zero helper must cover the
+# complete declared member rather than merely mention it in another argument.
+emit_fixture "    ngx_uint_t               tag_cap_drops;" \
+             "    ngx_memzero(pool, sizeof(st->sh->tag_cap_drops));"
+case_ 1 "carve-init: a member in ngx_memzero's size argument is not credited" \
+    carve_lint
+
+emit_fixture "    ngx_uint_t               tag_cap_drops;" \
+             "    ngx_memzero(&st->sh->tag_cap_drops, 1);"
+case_ 1 "carve-init: a partial ngx_memzero is not whole-member initialisation" \
+    carve_lint
+
+emit_fixture "    ngx_uint_t               tag_cap_drops;" \
+             "    ngx_memzero(&st->sh->tag_cap_drops, sizeof(st->sh->tag_cap_drops));"
+case_ 0 "carve-init: a full-size ngx_memzero initialises its destination" \
+    carve_lint
 
 # A wrapped initialiser call must still count.
 emit_fixture "    ngx_queue_t              lru;" \
@@ -572,6 +660,30 @@ emit_fixture "" ""
 case_ 2 "carve-init: a missing clang is exit 2, not a text-scan fallback" \
     env -C "$mutroot" NGX_SRC_TREE=- CARVE_INIT_CLANG=no-such-clang \
     ./ci/tools/lint-carve-init.sh
+
+# The configuration selector is a fail-closed enum. A typo must not silently
+# degrade the real two-configuration gate to production-only.
+emit_fixture "" ""
+case_ 2 "carve-init: an invalid configuration selector is exit 2" \
+    env -C "$mutroot" NGX_SRC_TREE=- CARVE_INIT_CONFIGS=typo \
+    ./ci/tools/lint-carve-init.sh
+
+# The wrapper must observe a work-list producer that fails after emitting a
+# plausible prefix. Process substitution used to discard that exit status and
+# turn the truncated list into a clean skip.
+mkdir -p "$mutroot/fakebin"
+cat > "$mutroot/fakebin/git" <<'GITEOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "ls-files" ]; then
+    printf '%s\n' src/ngx_http_cache_turbo_shm.c
+    exit 1
+fi
+exec "${REAL_GIT:?}" "$@"
+GITEOF
+chmod +x "$mutroot/fakebin/git"
+case_ 2 "carve-init wrapper: a failing file-list producer is exit 2" \
+    env PATH="$mutroot/fakebin:$PATH" REAL_GIT="$(command -v git)" LINT_MODE=all \
+    ci/linter/lint-carve-init.sh
 
 # ----------------------------------------------------------------------------
 # carve-init: the MALFORMED-INPUT TABLE.
@@ -685,9 +797,13 @@ carve_row 2 "a declarator that is not valid C is a loud error, not a silent drop
 carve_row 1 "an array-of-struct member is harvested" \
     "    ngx_http_cache_turbo_stripe_t  stripes[8];" ""
 
-carve_row 0 "an initialised array-of-struct member satisfies the gate" \
+carve_row 1 "one array element does not initialise the whole member" \
     "    ngx_http_cache_turbo_stripe_t  stripes[8];" \
     "    st->sh->stripes[0].x = 0;"
+
+carve_row 0 "a full-size helper initialises an array-of-struct member" \
+    "    ngx_http_cache_turbo_stripe_t  stripes[8];" \
+    "    ngx_memzero(&st->sh->stripes, sizeof(st->sh->stripes));"
 
 # A trailing comment on a member declaration must not disturb the name parse.
 carve_row 1 "a trailing comment on a member does not hide the member" \
@@ -701,9 +817,13 @@ carve_row 1 "a trailing comment on a member does not hide the member" \
 carve_row 1 "a NAMED nested union is an ordinary member, not a refusal" \
     "    union {%        ngx_uint_t           inner_a;%        ngx_uint_t           inner_b;%    } u;" ""
 
-carve_row 0 "an initialised named nested union satisfies the gate" \
+carve_row 1 "one union field does not initialise the whole member" \
     "    union {%        ngx_uint_t           inner_a;%    } u;" \
     "    st->sh->u.inner_a = 0;"
+
+carve_row 0 "a full-size helper initialises a named nested union" \
+    "    union {%        ngx_uint_t           inner_a;%    } u;" \
+    "    ngx_memzero(&st->sh->u, sizeof(st->sh->u));"
 
 # The ANONYMOUS case is the unsatisfiable one -- its members are reachable as
 # `st->sh->inner_a` but the aggregate itself has no name to demand a store for.
@@ -811,9 +931,13 @@ carve_row 1 "a function-pointer parameter list is not split on its comma" \
 carve_row 1 "an array-of-arrays member is harvested, not a loud error" \
     "    ngx_uint_t               m[2][3];" ""
 
-carve_row 0 "an initialised array-of-arrays member satisfies the gate" \
+carve_row 1 "one nested-array element does not initialise the whole member" \
     "    ngx_uint_t               m[2][3];" \
     "    st->sh->m[0][1] = 0;"
+
+carve_row 0 "a full-size helper initialises an array-of-arrays member" \
+    "    ngx_uint_t               m[2][3];" \
+    "    ngx_memzero(&st->sh->m, sizeof(st->sh->m));"
 
 # An attribute macro sits BETWEEN the type and the name; truncating at its
 # parens harvests the MACRO as the member name.

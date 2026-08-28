@@ -27,23 +27,30 @@ gate is run once per configuration and each must be self-consistent. That is
 strictly stronger: it would catch a member added under the guard whose store
 was added outside it, which the lexer could not see at all.
 
-WHAT COUNTS AS AN INITIALISER, preserved verbatim from the previous checker:
+WHAT COUNTS AS AN INITIALISER:
 
-  * an assignment whose LHS is `st->sh->NAME` (or an element/field of it, so an
-    aggregate member may be initialised element-wise: `st->sh->stripes[0].x=0`
-    credits `stripes`);
-  * `&st->sh->NAME` passed to an initialiser named in INIT_HELPERS.
+  * an unconditional top-level assignment whose complete LHS is
+    `st->sh->NAME`;
+  * the complete `&st->sh->NAME` destination argument of an initialiser named
+    in INIT_HELPERS. ngx_memzero additionally requires
+    `sizeof(st->sh->NAME)` as its length.
 
-INIT_HELPERS ARE MACROS, NOT FUNCTIONS. ngx_queue_init, ngx_rbtree_init and
-ngx_memzero all expand before the AST exists, so there is no CallExpr left to
-match on -- a naive AST port silently finds zero of them and reports the four
-members they set up as forgotten (verified: rbtree, sentinel, lru,
-lru_protected all went red). clang records where each node was expanded from,
-so the macro is identified by its EXPANSION OFFSET and token length read back
-out of the source bytes. That is an exact identification of the macro name, not
-a text search of the line: `ngx_queue_empty(&st->sh->lru)` a few lines away
-resolves to `ngx_queue_empty` and is correctly NOT credited, which is the same
-pure-read distinction the allowlist has always drawn.
+An element or subfield store does NOT initialise its containing aggregate. A
+control-flow-nested or unreachable store does not initialise the fresh carve
+on every successful path either. Both shapes are deliberately rejected rather
+than credited optimistically.
+
+INIT_HELPERS ARE MACROS IN NGINX. ngx_queue_init and ngx_rbtree_init expand to
+assignments, while ngx_memzero expands to a builtin CallExpr; none retains the
+helper as its AST callee. A naive AST port therefore finds zero queue/rbtree
+calls and reports the four members they set up as forgotten (verified: rbtree,
+sentinel, lru, lru_protected all went red). clang records where each node was
+expanded from, so the macro is identified by its EXPANSION OFFSET and token
+length read back out of the source bytes. That is an exact identification of
+the macro name, not a text search of the line:
+`ngx_queue_empty(&st->sh->lru)` a few lines away resolves to ngx_queue_empty and
+is correctly NOT credited, which is the same pure-read distinction the
+allowlist has always drawn.
 
 A compound assignment (`+=`) is NOT initialisation: it mutates a value that
 must already exist. An address-of in a call NOT named in INIT_HELPERS is not
@@ -105,6 +112,13 @@ INIT_HELPERS = frozenset(
         "ngx_rbtree_sentinel_init",
     }
 )
+
+HELPER_DESTINATIONS = {
+    "ngx_queue_init": (0,),
+    "ngx_rbtree_init": (0, 1),
+    "ngx_memzero": (0,),
+    "ngx_rbtree_sentinel_init": (0,),
+}
 
 
 class CouldNotRun(Exception):
@@ -211,14 +225,17 @@ def find_struct_fields(ast):
                 "this script the nesting."
             )
         # The pad exemption is a TYPE decision, not a name-prefix one: the
-        # member must genuinely be `u_char NAME[...]` layout filler. Only
-        # `qualType` is read here -- clang's AST-dump JSON never emits a
-        # `desugaredQualType` key for an array FieldDecl (verified: a
-        # typedef'd `ct_filler_t[8]` array yields only `qualType`), so a
-        # typedef'd `u_char` pad is already exempt and a typedef hiding a
-        # non-`u_char` type already FAILs, both off the raw spelling alone.
-        qual = child.get("type", {}).get("qualType", "")
-        fields.append((name, _is_uchar_array(qual)))
+        # member must genuinely be `u_char NAME[...]` layout filler. clang
+        # preserves a typedef-backed array's source spelling in `qualType` and
+        # exposes its semantic element type through `desugaredQualType`, so use
+        # the semantic type whenever present. Falling back to the source
+        # spelling is only for AST nodes where clang omits the desugared key;
+        # accepting both would let a misleading `u_char` typedef hide a
+        # non-byte array.
+        type_info = child.get("type", {})
+        qual = type_info.get("qualType", "")
+        semantic = type_info.get("desugaredQualType") or qual
+        fields.append((name, _is_uchar_array(semantic)))
     return fields
 
 
@@ -261,52 +278,123 @@ def find_carve_body(ast):
     return bodies[0]
 
 
-def carve_start_offset(body):
-    """Byte offset of the `ngx_slab_alloc(` call that opens the carve block.
+def _strip_expr(node):
+    """Remove AST wrappers that do not change an expression's value."""
+    while node.get("kind") in (
+        "CStyleCastExpr",
+        "ImplicitCastExpr",
+        "ParenExpr",
+    ):
+        inner = node.get("inner") or ()
+        if len(inner) != 1:
+            break
+        node = inner[0]
+    return node
 
-    The window opens at the slab alloc, NOT at the function opener.
+
+def _is_carve_allocation(stmt):
+    """Whether `stmt` assigns ngx_slab_alloc() directly to `st->sh`."""
+    if stmt.get("kind") != "BinaryOperator" or stmt.get("opcode") != "=":
+        return False
+    inner = stmt.get("inner") or ()
+    if len(inner) != 2 or _base_member_chain(inner[0]) != ["st", "sh"]:
+        return False
+    rhs = _strip_expr(inner[1])
+    return rhs.get("kind") == "CallExpr" and _callee_name(rhs) == SLAB_ALLOC
+
+
+def _integer_constant(node):
+    """Integer value of a simple constant expression, else None."""
+    node = _strip_expr(node)
+    if node.get("kind") == "IntegerLiteral":
+        try:
+            return int(node.get("value", ""), 0)
+        except ValueError:
+            return None
+    if node.get("kind") == "UnaryOperator" and node.get("opcode") in ("+", "-"):
+        inner = node.get("inner") or ()
+        if len(inner) != 1:
+            return None
+        value = _integer_constant(inner[0])
+        if value is None:
+            return None
+        return value if node.get("opcode") == "+" else -value
+    return None
+
+
+def _early_return_is_error(node):
+    """Whether a ReturnStmt provably returns a nonzero error code."""
+    inner = node.get("inner") or ()
+    if len(inner) != 1:
+        return False
+    value = _integer_constant(inner[0])
+    return value is not None and value != 0
+
+
+def carve_statements(body):
+    """Top-level statements on the successful fresh-carve path.
+
+    The window opens at the assignment of the slab allocation to `st->sh`, NOT
+    at the first allocator call or the function opener.
     shm_init_zone() has two early-return branches ABOVE the alloc -- the octx
     reload inherit and the shm.exists branch -- each of which legitimately
     stores `st->sh->admission`. A window starting at the function opener
     swallows both, so a member initialised ONLY in a reload branch would
     satisfy the gate. That placement is exactly what the FAIL message tells
     the developer not to use: it never runs on a fresh carve, and on reload it
-    overwrites inherited live state.
+    overwrites inherited live state. Requiring exactly one matching top-level
+    assignment also prevents an unrelated earlier allocation from widening the
+    window.
+
+    Only direct children of the function body are returned. A store nested in
+    control flow is not guaranteed to run, and scanning the flattened AST would
+    silently treat it as unconditional. The first top-level return closes the
+    window so unreachable statements after it never count.
     """
-    offsets = [
-        _offset(node)
-        for node in walk(body)
-        if node.get("kind") == "CallExpr" and _callee_name(node) == SLAB_ALLOC
-    ]
-    offsets = [o for o in offsets if o is not None]
-    if not offsets:
+    statements = body.get("inner") or ()
+    allocations = [i for i, stmt in enumerate(statements) if _is_carve_allocation(stmt)]
+    if not allocations:
         raise CouldNotRun(
-            f"no {SLAB_ALLOC}() call inside {CARVE_FN}(); the carve block "
-            "cannot be located, so this checker cannot report ok."
+            f"no top-level `st->sh = {SLAB_ALLOC}(...)` assignment inside "
+            f"{CARVE_FN}(); the carve block cannot be located, so this checker "
+            "cannot report ok."
         )
-    return min(offsets)
+    if len(allocations) != 1:
+        raise CouldNotRun(
+            f"{len(allocations)} top-level `st->sh = {SLAB_ALLOC}(...)` "
+            "assignments; refusing to guess which one opens the carve block."
+        )
+
+    carve = []
+    for stmt in statements[allocations[0] + 1 :]:
+        if stmt.get("kind") == "ReturnStmt":
+            return carve
+        if any(
+            node.get("kind") in ("GotoStmt", "IndirectGotoStmt", "LabelStmt")
+            for node in walk(stmt)
+        ):
+            raise CouldNotRun(
+                "a goto/label appears inside the carve block; this "
+                "checker cannot prove which initialisers it bypasses."
+            )
+        early_returns = [
+            node for node in walk(stmt) if node.get("kind") == "ReturnStmt"
+        ]
+        if any(not _early_return_is_error(node) for node in early_returns):
+            raise CouldNotRun(
+                "a control-flow-nested return inside the carve block is not a "
+                "provably nonzero error return; it may bypass initialisation "
+                "and still publish a successful zone."
+            )
+        carve.append(stmt)
+    raise CouldNotRun(
+        f"no top-level return after the carve allocation in {CARVE_FN}(); "
+        "refusing to scan an unbounded initialiser window."
+    )
 
 
 def _begin(node):
     return node.get("range", {}).get("begin", {}) or {}
-
-
-def _offset(node):
-    """Source offset of a node, following a macro expansion to its use site.
-
-    A node produced by a macro carries a `spellingLoc` inside the macro
-    DEFINITION (in ngx_queue.h, offsets from a different file entirely) and an
-    `expansionLoc` at the use site. Only the expansion offset is comparable
-    with the carve-block window, so it wins where present -- comparing a
-    spelling offset from another file against this file's offsets is
-    meaningless and would place the node arbitrarily inside or outside the
-    window.
-    """
-    begin = _begin(node)
-    exp = begin.get("expansionLoc")
-    if exp and "offset" in exp:
-        return exp["offset"]
-    return begin.get("offset")
 
 
 def _expanded_from(node, source_bytes):
@@ -377,26 +465,26 @@ def _base_member_chain(node):
     return chain
 
 
-def _shctx_member(node):
-    """Member of the carved shctx that `node` designates, else None.
+def _whole_shctx_member(node):
+    """Whole `st->sh->NAME` designated by `node`, else None.
 
-    Accepts `st->sh->NAME` and any element or field selected from it, so an
-    aggregate member initialised element-wise (`st->sh->stripes[0].x = 0`)
-    credits `stripes` -- the member the header actually declares. Without that
-    an array or nested-struct member would be unsatisfiable: no spelling of an
-    element-wise store would ever satisfy the gate and correct code would turn
-    CI red.
+    A longer chain designates only an element or subfield. Crediting its
+    top-level prefix would claim the rest of the aggregate was initialised when
+    it was not.
     """
+    node = _strip_expr(node)
+    if node.get("kind") != "MemberExpr":
+        return None
     chain = _base_member_chain(node)
-    if not chain or len(chain) < 3:
+    if not chain or len(chain) != 3:
         return None
     if chain[0] != "st" or chain[1] != "sh":
         return None
     return chain[2]
 
 
-def _assigned_member(node, source_bytes):
-    """Member initialised by a plain assignment at `node`, else None.
+def _assigned_member(stmt, source_bytes):
+    """Member initialised by a direct top-level assignment, else None.
 
     `opcode == "="` only. A compound assignment (`+=`, `|=`, ...) is not carve
     initialisation: it mutates a value that must already exist.
@@ -405,71 +493,124 @@ def _assigned_member(node, source_bytes):
     ngx_queue_init() contains internal `q->prev = q` stores, and crediting
     those would let ANY queue macro -- ngx_queue_remove(), which also assigns
     -- read as initialisation. Macro-borne stores are judged by which macro
-    they came from, in _macro_member().
+    they came from, in _macro_assignment_members().
     """
-    if node.get("kind") != "BinaryOperator" or node.get("opcode") != "=":
+    if stmt.get("kind") != "BinaryOperator" or stmt.get("opcode") != "=":
         return None
-    if _expanded_from(node, source_bytes) is not None:
+    if _expanded_from(stmt, source_bytes) is not None:
         return None
-    inner = node.get("inner") or ()
+    inner = stmt.get("inner") or ()
     if not inner:
         return None
-    return _shctx_member(inner[0])
+    return _whole_shctx_member(inner[0])
 
 
-def _helper_call_members(node):
-    """Members initialised by an INIT_HELPERS *function* call at `node`.
+def _addressed_whole_member(node):
+    """Whole member addressed directly by an expression, else None."""
+    node = _strip_expr(node)
+    if node.get("kind") != "UnaryOperator" or node.get("opcode") != "&":
+        return None
+    inner = node.get("inner") or ()
+    if len(inner) != 1:
+        return None
+    return _whole_shctx_member(_strip_expr(inner[0]))
 
-    Scoped to the call's ARGUMENTS: taking a member's address proves nothing on
-    its own -- `memcmp(&st->sh->x, ...)` is a pure read and used to satisfy
-    this gate.
+
+def _sizeof_whole_member(node):
+    """Whole member named by a direct sizeof expression, else None."""
+    node = _strip_expr(node)
+    if node.get("kind") != "UnaryExprOrTypeTraitExpr" or node.get("name") != "sizeof":
+        return None
+    inner = node.get("inner") or ()
+    if len(inner) != 1:
+        return None
+    return _whole_shctx_member(_strip_expr(inner[0]))
+
+
+def _helper_call_members(node, source_bytes):
+    """Members initialised by an INIT_HELPERS call at `node`.
+
+    Function helpers keep their own callee name; ngx_memzero expands to a
+    builtin CallExpr whose expansion location retains the macro name. In both
+    cases only declared destination positions count. Taking a member's address
+    elsewhere proves nothing, and ngx_memzero must cover exactly the complete
+    destination object.
     """
-    if node.get("kind") != "CallExpr" or _callee_name(node) not in INIT_HELPERS:
+    if node.get("kind") != "CallExpr":
         return
-    for arg in (node.get("inner") or ())[1:]:
-        for sub in walk(arg):
-            if sub.get("kind") != "UnaryOperator" or sub.get("opcode") != "&":
-                continue
-            operand = sub.get("inner") or ()
-            if not operand:
-                continue
-            member = _shctx_member(operand[0])
+    helper = _expanded_from(node, source_bytes) or _callee_name(node)
+    if helper not in INIT_HELPERS:
+        return
+    args = (node.get("inner") or ())[1:]
+    destinations = HELPER_DESTINATIONS[helper]
+    if any(position >= len(args) for position in destinations):
+        return
+
+    members = [_addressed_whole_member(args[position]) for position in destinations]
+    if helper == "ngx_memzero" and (
+        len(args) < 2 or members[0] != _sizeof_whole_member(args[-1])
+    ):
+        return
+    for member in members:
+        if member:
+            yield member
+
+
+def _macro_assignment_members(stmt, source_bytes):
+    """Whole members written by an INIT_HELPERS macro expansion.
+
+    queue/rbtree helpers expand into assignments, not CallExpr nodes. Only the
+    generated assignment LHS is inspected; a member mentioned by a read-only
+    argument cannot count. The exact whole-member requirement also prevents a
+    helper invoked on one subfield from crediting its containing aggregate.
+    """
+    for node in walk(stmt):
+        helper = _expanded_from(node, source_bytes)
+        if (
+            node.get("kind") != "BinaryOperator"
+            or node.get("opcode") != "="
+            or helper not in INIT_HELPERS
+            or helper == "ngx_memzero"
+        ):
+            continue
+        inner = node.get("inner") or ()
+        if not inner:
+            continue
+        for sub in walk(inner[0]):
+            member = _whole_shctx_member(sub)
             if member:
                 yield member
 
 
-def _macro_member(node, source_bytes):
-    """Member initialised by an INIT_HELPERS *macro* at `node`, else None.
-
-    This is how every helper the module actually uses is spelled: the macro is
-    gone by the time the AST exists, so the member reference's own expansion
-    record is what identifies it. `ngx_queue_empty(&st->sh->lru)` resolves to
-    ngx_queue_empty and is correctly not credited.
-    """
-    if node.get("kind") != "MemberExpr":
-        return None
-    if _expanded_from(node, source_bytes) not in INIT_HELPERS:
-        return None
-    return _shctx_member(node)
-
-
-def collect_initialised(body, start, source_bytes):
-    """Return the set of shctx members the carve block initialises."""
+def collect_initialised(statements, source_bytes):
+    """Return members unconditionally initialised by top-level statements."""
     found = set()
-    for node in walk(body):
-        offset = _offset(node)
-        if offset is None or offset < start:
+    for stmt in statements:
+        # A bare compound executes unconditionally and can be traversed. Real
+        # control-flow constructs are skipped wholesale: this local checker
+        # does not prove that every branch assigns, so it accepts only the
+        # structurally-unconditional form.
+        if stmt.get("kind") == "CompoundStmt":
+            found.update(collect_initialised(stmt.get("inner") or (), source_bytes))
             continue
-
-        member = _assigned_member(node, source_bytes)
+        if stmt.get("kind") in (
+            "DoStmt",
+            "ForStmt",
+            "IfStmt",
+            "SwitchStmt",
+            "WhileStmt",
+        ):
+            continue
+        if stmt.get("kind") == "ReturnStmt":
+            break
+        member = _assigned_member(stmt, source_bytes)
         if member:
             found.add(member)
 
-        found.update(_helper_call_members(node))
+        expression = _strip_expr(stmt)
+        found.update(_helper_call_members(expression, source_bytes))
 
-        member = _macro_member(node, source_bytes)
-        if member:
-            found.add(member)
+        found.update(_macro_assignment_members(stmt, source_bytes))
     return found
 
 
@@ -506,7 +647,7 @@ def check(clang, source, args, pin_count=False):
     body = find_carve_body(ast)
     with open(source, "rb") as handle:
         source_bytes = handle.read()
-    initialised = collect_initialised(body, carve_start_offset(body), source_bytes)
+    initialised = collect_initialised(carve_statements(body), source_bytes)
     if not initialised:
         raise CouldNotRun(
             f"parsed ZERO initialisers from the carve block of {CARVE_FN}() "

@@ -95,6 +95,16 @@ command -v "$CLANG" >/dev/null 2>&1 || {
     exit 2
 }
 
+CONFIGS="${CARVE_INIT_CONFIGS:-both}"
+case "$CONFIGS" in
+    both|default) ;;
+    *)
+        echo "lint-carve-init: invalid CARVE_INIT_CONFIGS=$CONFIGS" >&2
+        echo "      Expected 'both' or 'default'; refusing to skip a configuration." >&2
+        exit 2
+        ;;
+esac
+
 # --- locate a configured nginx tree ------------------------------------------
 #
 # A usable tree needs BOTH objs/Makefile (written by `configure`, and what
@@ -244,7 +254,7 @@ run_config "default" || merge_rc $?
 # second parse is duplicated work -- 75 rows x an extra clang invocation, which
 # is most of the suite's runtime. It is NOT a way to skip a configuration on
 # the real tree, where both must be checked and the default runs both.
-if [ "${CARVE_INIT_CONFIGS:-both}" = "both" ]; then
+if [ "$CONFIGS" = "both" ]; then
     run_config "test-faults" -DNGX_HTTP_CACHE_TURBO_TEST_FAULTS=1 || merge_rc $?
 fi
 

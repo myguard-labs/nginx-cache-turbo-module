@@ -22,11 +22,14 @@
 #
 # NEEDS A CONFIGURED NGINX TREE. The implementation parses the module with
 # clang rather than lexing it, so it requires a tree where ./configure has run
-# (it reads ALL_INCS from objs/Makefile). `bash ci/tools/ci-build.sh nginx ""
-# configure` produces one in seconds without compiling anything, and any tree
-# under .build/ is found automatically. With no tree the gate exits 2 -- "could
-# not run" -- and never reports clean: a parser that cannot parse must not look
-# like a passing gate.
+# (it reads ALL_INCS from objs/Makefile). Keep a configure-only tree away from
+# .build/, which the unit suite treats as compiled:
+#
+#   BUILD_ROOT="$PWD/.carve-tree" bash ci/tools/ci-build.sh nginx "" configure
+#   NGX_SRC_TREE="$PWD/.carve-tree/nginx-<version>" ci/linter/lint-carve-init.sh
+#
+# With no tree the gate exits 2 -- "could not run" -- and never reports clean:
+# a parser that cannot parse must not look like a passing gate.
 #
 # Usage: ci/linter/lint-carve-init.sh [files...]   Env: LINT_MODE=staged|all
 #        NGX_SRC_TREE=<dir> to pick the tree explicitly.
@@ -36,16 +39,15 @@
 # shellcheck source=ci/linter/lib.sh
 . "$(git rev-parse --show-toplevel)/ci/linter/lib.sh"
 
-# The mapfile-over-process-substitution below drops lint_files' exit status
-# (semgrep pipeline-status-swallowed-by-substitution). It is the shared idiom of
-# every ci/linter/ wrapper, and here it is not load-bearing: FILES only decides
-# whether this checker is RELEVANT to the change. It never selects what gets
-# read -- the implementation re-derives its inputs from two fixed paths and
-# exits 2 rather than ok if either parse comes back empty. So a truncated FILES
-# can only make this wrapper skip on a change it did not need to inspect; it can
-# never produce a pass over a subset. Fixing the idiom belongs in lib.sh for all
-# wrappers at once, not in one of three.
-mapfile -t FILES < <(lint_files '^src/.*\.[ch]$' "$@")
+# Materialise before mapfile so a failing producer cannot leave a truncated
+# prefix that looks like a complete, clean work list.
+files_tmp="$(mktemp)"
+trap 'rm -f "$files_tmp"' EXIT
+lint_files '^src/.*\.[ch]$' "$@" > "$files_tmp" \
+    || die "lint_files failed while selecting carve-init inputs"
+mapfile -t FILES < "$files_tmp"
+rm -f "$files_tmp"
+trap - EXIT
 [ "${#FILES[@]}" -gt 0 ] || { echo "lint-carve-init: no C files to check"; exit 0; }
 
 echo "lint-carve-init: ${#FILES[@]} file(s)"
