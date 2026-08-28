@@ -15,7 +15,7 @@
 
 # .githooks/* has no extension but is bash; an unchecked commit hook is the
 # one script whose bug silently disables every other check here.
-mapfile -t FILES < <(lint_files '\.(sh|bash)$|^\.githooks/' "$@")
+lint_files_into FILES '\.(sh|bash)$|^\.githooks/' "$@"
 
 # The nginx addon `config` decides which src/*.c are compiled into the module, so
 # a typo there silently drops a translation unit from the build -- exactly the
@@ -35,7 +35,7 @@ mapfile -t FILES < <(lint_files '\.(sh|bash)$|^\.githooks/' "$@")
 # SC2164, typos in real logic -- is still enforced. Adding it WITHOUT -e would
 # land the gate red on arrival for findings wrong by inspection, which is how a
 # checker teaches everyone --no-verify.
-mapfile -t CONFIG_FILES < <(lint_files '(^|/)config$' "$@")
+lint_files_into CONFIG_FILES '(^|/)config$' "$@"
 
 if [ "${#FILES[@]}" -eq 0 ] && [ "${#CONFIG_FILES[@]}" -eq 0 ]; then
     echo "lint-sh: no shell files to check"

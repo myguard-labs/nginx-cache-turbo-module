@@ -29,7 +29,7 @@
 # shellcheck source=ci/linter/lib.sh
 . "$(git rev-parse --show-toplevel)/ci/linter/lib.sh"
 
-mapfile -t FILES < <(lint_files '^src/.*\.[ch]$' "$@")
+lint_files_into FILES '^src/.*\.[ch]$' "$@"
 [ "${#FILES[@]}" -gt 0 ] || { echo "lint-stripe-seam: no C files to check"; exit 0; }
 
 echo "lint-stripe-seam: ${#FILES[@]} file(s)"

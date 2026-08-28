@@ -39,15 +39,7 @@
 # shellcheck source=ci/linter/lib.sh
 . "$(git rev-parse --show-toplevel)/ci/linter/lib.sh"
 
-# Materialise before mapfile so a failing producer cannot leave a truncated
-# prefix that looks like a complete, clean work list.
-files_tmp="$(mktemp)"
-trap 'rm -f "$files_tmp"' EXIT
-lint_files '^src/.*\.[ch]$' "$@" > "$files_tmp" \
-    || die "lint_files failed while selecting carve-init inputs"
-mapfile -t FILES < "$files_tmp"
-rm -f "$files_tmp"
-trap - EXIT
+lint_files_into FILES '^src/.*\.[ch]$' "$@"
 [ "${#FILES[@]}" -gt 0 ] || { echo "lint-carve-init: no C files to check"; exit 0; }
 
 echo "lint-carve-init: ${#FILES[@]} file(s)"

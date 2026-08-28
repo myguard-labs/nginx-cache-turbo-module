@@ -94,7 +94,7 @@ PROMOTED=(
     c-shell-exec
 )
 
-mapfile -t FILES < <(lint_files '^src/.*\.[ch]$' "$@")
+lint_files_into FILES '^src/.*\.[ch]$' "$@"
 [ "${#FILES[@]}" -gt 0 ] || { echo "lint-astgrep: no C files to check"; exit 0; }
 
 echo "lint-astgrep: ${#FILES[@]} file(s)"
@@ -112,8 +112,19 @@ CONFIG="ci/ast-grep/sgconfig.yml"
 # no-op that reads as a gate (see the header note). Rule ids are the `id:` field
 # of the vendored YAML; the ruleset is generated, so this stays a plain scan of
 # ci/ast-grep/rules/ rather than anything that needs ast-grep to cooperate.
-mapfile -t KNOWN < <(grep -rhE '^id:[[:space:]]*' ci/ast-grep/rules/ \
-                     | sed -E 's/^id:[[:space:]]*//; s/[[:space:]]*$//' | sort -u)
+# Capture before loading: mapfile over process substitution would discard a
+# traversal/read failure after grep had already emitted plausible rule ids.
+if known_lines="$(grep -rhE '^id:[[:space:]]*' ci/ast-grep/rules/ \
+                   | sed -E 's/^id:[[:space:]]*//; s/[[:space:]]*$//' \
+                   | sort -u)"; then
+    :
+else
+    die "could not read rule ids under ci/ast-grep/rules/"
+fi
+KNOWN=()
+if [ -n "$known_lines" ]; then
+    mapfile -t KNOWN <<< "$known_lines"
+fi
 [ "${#KNOWN[@]}" -gt 0 ] || die "no rule ids under ci/ast-grep/rules/ -- ruleset empty or unported"
 
 # Membership is tested in-process, NOT via `printf ... | grep -qx`.
