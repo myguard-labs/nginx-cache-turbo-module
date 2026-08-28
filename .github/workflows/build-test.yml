@@ -1,4 +1,4 @@
-# sync-sha: ebb15194eca3b6f33d9a51c20484e4c25426589ac55685c2511aeac06ba04597
+# sync-sha: 0ecfa73d9e82f449dd54dd7ee006df8ec5e0eaaf7be3fac14b39e3d43193865d
 name: Build & Test
 
 # Runner labels live in the POOL repository variable. Every checked-in selector
@@ -154,7 +154,13 @@ jobs:
           # in two places, and a drift between them would point NGX_SRC_TREE at
           # a directory that does not exist -- which this gate reports as
           # exit 2, correctly but confusingly.
-          tree="$(bash ci/tools/ci-build.sh nginx "" configure | sed -n 's/^tree=//p')"
+          # BUILD_ROOT keeps this tree OUT of .build/, which ci/tests/unit/run.sh
+          # auto-discovers. That suite gates on objs/ngx_auto_config.h and is
+          # meant to SKIP in this job -- the Runtime job, which has a COMPILED
+          # tree, is the one that runs it. `configure` mode stops before make,
+          # so a tree at the default path would satisfy that gate with no .o
+          # files behind it and the suite would die measuring the shm node.
+          tree="$(BUILD_ROOT="$PWD/.carve-tree" bash ci/tools/ci-build.sh nginx "" configure | sed -n 's/^tree=//p')"
           [ -n "$tree" ] || { echo "ci-build.sh printed no tree= line" >&2; exit 1; }
           NGX_SRC_TREE="$tree" bash ci/tools/lint-carve-init.sh
           # P4-2-s3b: no site may reach a stripe's slab pool outside the
