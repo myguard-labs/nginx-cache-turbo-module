@@ -1,4 +1,4 @@
-# sync-sha: 3aa33c6e43b4b3288f296e8b7016d588c5d9964977abf777dde0d7b65ba066cb
+# sync-sha: 6a07741fbd436e27b61ca9459e6918687a81e147527065fbbc58b2f7db6af6c9
 name: Testkit
 
 # The nginx-module-testkit prober leg.
@@ -229,6 +229,11 @@ jobs:
           # error paths it reaches are reachable no other way in this repo:
           # exhausting a zone for real is slow AND perturbs the very counters
           # the oracle reads.
+          # redis-connect-backoff (S17/S18) adds the missing Redis topology:
+          # a closed peer must arm the window and one immediate retry must
+          # increment the fail-fast counter exactly once. Two cold L1 zones
+          # sharing a healthy Redis provide the negative control and must
+          # produce an L2 HIT without either failure oracle.
           # alloc-per-request / fd-starve / multi-worker (S25) are CT-authored
           # ports of testkit's generic prober scenarios of the same name,
           # rebuilt against a REAL cache_turbo HIT path
@@ -245,7 +250,7 @@ jobs:
           # red, then reverted to green.
           ci/tools/testkit-run.sh --version "$NGINX_VERSION" \
             -- consumer-cache-turbo shm-coherence-varidx fault-slab-store \
-               alloc-per-request fd-starve multi-worker
+               redis-connect-backoff alloc-per-request fd-starve multi-worker
 
       - name: Scenario SKIPs cleanly on an unstaged tree
         if: ${{ !inputs.skip-expensive-jobs }}
@@ -256,7 +261,8 @@ jobs:
           # consumer .so is an environment fact, and a red here would train
           # people to ignore this leg.
           #
-          # fault-slab-store, alloc-per-request, fd-starve and multi-worker
+          # fault-slab-store, redis-connect-backoff, alloc-per-request,
+          # fd-starve and multi-worker
           # are all named explicitly for the same reason: naming
           # any scenario REPLACES testkit-run.sh's default rather than adding
           # to it, so a scenario absent from this list has its own ./requires
@@ -265,5 +271,5 @@ jobs:
           # scenario silently degrades to permanent-SKIP in the direction
           # that reads green.
           ci/tools/testkit-run.sh --expect-skip --version "${NGINX_STABLE:-1.30.4}" \
-            -- consumer-cache-turbo fault-slab-store \
+            -- consumer-cache-turbo fault-slab-store redis-connect-backoff \
                alloc-per-request fd-starve multi-worker

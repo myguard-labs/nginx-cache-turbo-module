@@ -275,12 +275,16 @@ TK_SO=ngx_http_test_ref_module.so
 # probe (whose absence makes every oracle SKIP -- a silent pass).
 #
 # Deliberately NOT passed, unlike testkit's own tools/build-consumers.sh:
-#   --with-http_ssl_module --with-stream --with-stream_ssl_module
-# Those exist there for OTHER consumers (autocert needs ngx_ssl_t; label-
-# autoconf has a STREAM half). The consumer-cache-turbo scenario's nginx.conf
-# speaks plain HTTP on 127.0.0.1 with no `ssl` on its listen and no stream
-# block, and this module needs none of them. Adding them would only lengthen
-# an already-expensive build.
+#   --with-stream --with-stream_ssl_module
+# Those exist there for OTHER consumers.  http_ssl IS compiled because the
+# TEST_FAULTS build's digest-failure seam lives in the SSL implementation;
+# without it the guarded test variable has no reader and nginx's -Werror build
+# correctly rejects the staged artifact as internally inconsistent.
+#
+# Every staged tree is a test artifact, so it carries the same TEST_FAULTS
+# define as ci-build.sh.  Several prober scenarios use the module's guarded
+# observability headers as their non-vacuous oracle; NGX_TEST_HARNESS alone
+# only registers probe hooks and does not compile those counters in.
 #
 # Equally deliberate: nothing here DISABLES a default module. The scenario's
 # conf needs http_proxy (its `location /` proxy_pass'es to /origin on its own
@@ -290,6 +294,8 @@ TK_SO=ngx_http_test_ref_module.so
 # scenario bug. Stated here so it is not discovered the hard way.
 CONFIGURE_ARGS=(
     --with-compat
+    --with-http_ssl_module
+    "--with-cc-opt=-DNGX_HTTP_CACHE_TURBO_TEST_FAULTS=1"
     "--add-dynamic-module=$TESTKIT/t/module"
     "--add-dynamic-module=$ROOT"
 )
@@ -323,7 +329,7 @@ if [ "$SANITIZE" -eq 1 ]; then
         SAN_FLAGS="-fsanitize=address,undefined -fno-sanitize=function,nonnull-attribute,pointer-overflow -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g3 -O1"
     fi
     CONFIGURE_ARGS+=(
-        "--with-cc-opt=$SAN_FLAGS"
+        "--with-cc-opt=-DNGX_HTTP_CACHE_TURBO_TEST_FAULTS=1 $SAN_FLAGS"
         "--with-ld-opt=$SAN_FLAGS"
     )
 fi
@@ -345,7 +351,7 @@ fi
 if [ "$COVERAGE" -eq 1 ]; then
     COV_FLAGS="--coverage -g -O0 -fno-omit-frame-pointer"
     CONFIGURE_ARGS+=(
-        "--with-cc-opt=$COV_FLAGS"
+        "--with-cc-opt=-DNGX_HTTP_CACHE_TURBO_TEST_FAULTS=1 $COV_FLAGS"
         "--with-ld-opt=--coverage"
     )
 fi
@@ -372,7 +378,7 @@ if [ "$VALGRIND" -eq 1 ]; then
     DBG_FLAGS="-DNGX_DEBUG_PALLOC=1 -g3 -O0 -fno-omit-frame-pointer -funwind-tables"
     CONFIGURE_ARGS+=(
         --with-debug
-        "--with-cc-opt=$DBG_FLAGS"
+        "--with-cc-opt=-DNGX_HTTP_CACHE_TURBO_TEST_FAULTS=1 $DBG_FLAGS"
     )
 fi
 
