@@ -45,6 +45,83 @@ cd "$(dirname "$0")/../.."
 HDR=src/ngx_http_cache_turbo_module.h
 SRC=src/ngx_http_cache_turbo_shm.c
 
+# Debian /usr/bin/awk is mawk (ci/tools/install-requirements.sh documents this),
+# and mawk has no 4-argument split() -- it dies at PARSE time, before a single
+# line is read, so the failure is a syntax error rather than a wrong answer.
+# ubuntu-latest ships gawk, but lint.yml allows a self-hosted POOL and the
+# commit hook runs on developer machines, so neither can be assumed. The
+# separator tracking that needed the 4th argument is gone (statements are split
+# by hand below), but pin gawk when it exists anyway: this script relies on
+# nothing else gawk-only, and the pin costs nothing.
+if command -v gawk >/dev/null 2>&1; then
+    AWK="gawk"
+else
+    # shellcheck disable=SC2209  # a program NAME, not a command substitution
+    AWK="awk"
+fi
+
+# --- 0. strip comments and literals ------------------------------------------
+#
+# EVERY pass below parses the output of this function, never a raw file.
+#
+# A comment or a string is not code, and any pass that reads it as code can be
+# steered by ordinary prose. The bug that forced this: a block comment naming an
+# initialiser helper and carrying no `;` --
+#
+#     /* the LRU is set up by ngx_queue_init( further down */
+#
+# -- opened the INIT_HELPERS window and never closed it, crediting every pure
+# read for the rest of the carve block as an initialisation. A `;` or a `{`
+# inside a string literal misleads the statement splitter and the brace-depth
+# tracker the same way. Rather than patch the one pass that was exploited, both
+# passes now consume stripped text only, so the whole class is closed at once.
+#
+# Replacement is BLANK-PRESERVING at line granularity: comment bodies become
+# spaces and string bodies become a single-space placeholder, so line numbers,
+# line count and statement structure survive. Handles multi-line block comments
+# (state carries across lines), line comments, "strings" and char literals,
+# backslash escapes inside both, and never treats a quote inside a comment or a
+# comment marker inside a string as its own thing.
+strip_code() {
+    "$AWK" '
+        BEGIN { inblock = 0 }
+        {
+            line = $0
+            out = ""
+            i = 1
+            n = length(line)
+            while (i <= n) {
+                c = substr(line, i, 1)
+                d = substr(line, i, 2)
+                if (inblock) {
+                    if (d == "*/") { inblock = 0; out = out "  "; i += 2 }
+                    else           { out = out " "; i++ }
+                    continue
+                }
+                if (d == "/*") { inblock = 1; out = out "  "; i += 2; continue }
+                if (d == "//") { break }
+                if (c == "\"" || c == "'"'"'") {
+                    q = c
+                    i++
+                    while (i <= n) {
+                        e = substr(line, i, 1)
+                        if (e == "\\") { i += 2; continue }
+                        if (e == q) { i++; break }
+                        i++
+                    }
+                    # one placeholder space: the literal is gone, the token
+                    # separation it provided is not.
+                    out = out " "
+                    continue
+                }
+                out = out c
+                i++
+            }
+            print out
+        }
+    ' "$1"
+}
+
 for f in "$HDR" "$SRC"; do
     [ -f "$f" ] || {
         echo "lint-carve-init: $f missing -- refusing to report ok on an empty scan" >&2
@@ -67,18 +144,33 @@ done
 # bogus names as "uninitialised" (exit 1) instead of admitting it could not
 # parse (exit 2). Caught by mutation: renaming the closing typedef produced a
 # 190-name failure list naming fields of unrelated structs.
-members="$(awk '
+members="$(strip_code "$HDR" | "$AWK" '
     /^typedef struct ngx_http_cache_turbo_shctx_s \{/ { inside = 1; opened = 1; next }
     inside && /^\} ngx_http_cache_turbo_shctx_t;/     { inside = 0; closed = 1 }
     /^\}/ && inside && !closed                        { unterminated = 1 }
     !inside { next }
-    /^[[:space:]]*\*/  { next }        # block-comment continuation
-    /^[[:space:]]*\/\*/ { next }       # block-comment opener
     /^[[:space:]]*#/   { next }        # preprocessor
     {
         line = $0
-        sub(/\/\*.*/, "", line)        # trailing comment
-        sub(/\/\/.*/, "", line)
+        # Comments and literals are already gone (strip_code), so no comment
+        # handling belongs here -- a second, weaker stripper at this level is
+        # exactly how the block-comment hole got in.
+        #
+        # Brace depth. The header comment claims one level of nesting, but
+        # nothing enforced it: the members of a nested anonymous union or
+        # struct were harvested as if they were top-level, demanding
+        # `sh->inner = ...` stores for names that are not reachable that way.
+        # That is an UNSATISFIABLE gate -- CI red on correct code, the worst
+        # failure mode a linter has. Depth is now tracked, and any nesting is
+        # refused LOUDLY rather than answered wrongly.
+        opens = gsub(/\{/, "{", line)
+        closes = gsub(/\}/, "}", line)
+        if (depth > 0 || opens > closes) {
+            nested = 1
+        }
+        depth += opens - closes
+        if (depth < 0) depth = 0
+        if (nested) next
         if (line !~ /;/) next
         sub(/;.*/, "", line)
         sub(/__attribute__.*/, "", line)
@@ -108,6 +200,14 @@ members="$(awk '
             # with a bracket: `u_char (*_pad_pa)[8];` is an 8-byte POINTER.
             had_bracket = (piece ~ /\[[^]]*\]/ && piece !~ /[(*]/)
             sub(/\[[^]]*\]/, "", piece)      # per-declarator array bound
+            # Bitfield width. `unsigned degraded:1` otherwise leaves the token
+            # as `degraded:1`, which fails the identifier test below and used
+            # to be DISCARDED -- the member vanished from the gate entirely and
+            # no initialiser was ever demanded for it. The width is not part of
+            # the name, so strip it; the catch-all below then guarantees that
+            # any OTHER unparsed declarator form fails loudly instead of
+            # disappearing the same way.
+            sub(/:[[:space:]]*[0-9]+[[:space:]]*$/, "", piece)
             gsub(/^[[:space:]]+|[[:space:]]+$/, "", piece)
             if (piece == "") continue
             n = split(piece, parts, /[[:space:]*]+/)
@@ -125,6 +225,17 @@ members="$(awk '
                 # TYPE decision, not a name-prefix one.
                 if (is_uchar_base && had_bracket) print name "\tpadok"
                 else                             print name "\t-"
+            } else {
+                # CATCH-ALL. A declarator this pass cannot parse is never
+                # dropped. Silently discarding one removes the member from the
+                # world of the gate -- nothing demands an initialiser, the
+                # count still looks plausible, and the report reads exactly
+                # like a passing gate. That is the whole failure class this
+                # checker exists to catch, so an unrecognised form is a hard
+                # error naming the text it could not parse. Every future
+                # declarator shape lands here loudly rather than invisibly.
+                print "ERR:unparsed-declarator:" piece > "/dev/stderr"
+                bad_declarator = 1
             }
         }
     }
@@ -132,11 +243,28 @@ members="$(awk '
         if (!opened) { print "ERR:no-opening-line" > "/dev/stderr"; exit 3 }
         if (!closed) { print "ERR:no-closing-line" > "/dev/stderr"; exit 3 }
         if (unterminated) { print "ERR:unterminated" > "/dev/stderr"; exit 3 }
+        if (nested) { print "ERR:nested-aggregate" > "/dev/stderr"; exit 4 }
+        if (bad_declarator) { print "ERR:unparsed-declarator" > "/dev/stderr"; exit 5 }
     }
-' "$HDR" | sort -u)" || {
-    echo "lint-carve-init: could not delimit ngx_http_cache_turbo_shctx_t in $HDR -- its opening 'typedef struct ngx_http_cache_turbo_shctx_s {' or closing '} ngx_http_cache_turbo_shctx_t;' line has changed. Refusing to guess at the member set." >&2
-    exit 2
-}
+' | sort -u)" || harvest_rc=$?
+# The awk END block distinguishes its refusals by exit status so each one can
+# name its own cause. Without this they collapse into one "could not delimit"
+# message that sends the reader to the wrong place entirely.
+case "${harvest_rc:-0}" in
+    0) ;;
+    4)
+        echo "lint-carve-init: ngx_http_cache_turbo_shctx_t contains a NESTED struct/union. This checker harvests top-level members only, and harvesting a nested member as if it were top-level would demand an 'sh->NAME =' store that cannot exist -- an unsatisfiable gate. Teach this script the nesting, or flatten the declaration." >&2
+        exit 2
+        ;;
+    5)
+        echo "lint-carve-init: a declarator in ngx_http_cache_turbo_shctx_t could not be parsed (see ERR:unparsed-declarator above). It is NOT being skipped: a dropped member is one nothing ever demands an initialiser for, which is the silent-green hole this checker exists to close. Teach this script the form, or spell the member conventionally." >&2
+        exit 2
+        ;;
+    *)
+        echo "lint-carve-init: could not delimit ngx_http_cache_turbo_shctx_t in $HDR -- its opening 'typedef struct ngx_http_cache_turbo_shctx_s {' or closing '} ngx_http_cache_turbo_shctx_t;' line has changed. Refusing to guess at the member set." >&2
+        exit 2
+        ;;
+esac
 
 if [ -z "$members" ]; then
     echo "lint-carve-init: parsed ZERO members from $HDR -- refusing to report ok on an empty scan" >&2
@@ -178,13 +306,37 @@ member_names="$(printf '%s\n' "$members" | cut -f1)"
 # helper to the carve block means adding it here too -- the FAIL message says so.
 INIT_HELPERS='(^|[^A-Za-z0-9_])(ngx_rbtree_init|ngx_queue_init|ngx_memzero|ngx_rbtree_sentinel_init)[[:space:]]*[(]'
 
-inits="$(awk -v INIT_HELPERS="$INIT_HELPERS" '
+# The carve target, spelled once. Every harvest below anchors on this literal
+# text rather than on a bare `sh->` suffix. An unanchored suffix match credits
+# ANY object that happens to end in `sh->` -- `ngx_queue_init(&other->sh->x)`
+# initialises a different struct entirely, and used to satisfy this gate for
+# the shctx member of the same name. Both the assignment harvest and the
+# address-of harvest had that hole; both are anchored now.
+CARVE_OBJ='st->sh->'
+
+inits="$(strip_code "$SRC" | "$AWK" -v INIT_HELPERS="$INIT_HELPERS" -v OBJ="$CARVE_OBJ" '
     # the carve block starts at the slab alloc, NOT at the function opener --
     # see the comment above. Track the function too, so a same-named store in
     # a LATER function cannot reopen the window.
-    /^ngx_http_cache_turbo_shm_init_zone\(/ { infn = 1 }
+    /^ngx_http_cache_turbo_shm_init_zone\(/ { infn = 1; depth = 0 }
     infn && /st->sh[[:space:]]*=[[:space:]]*ngx_slab_alloc\(/ { inside = 1 }
-    /^\}/ { if (inside) { inside = 0 } ; infn = 0 }
+    # The function ends where its braces BALANCE, not at the first column-0 `}`.
+    # A column-0 brace occurs inside the function whenever an #if-gated or
+    # macro-introduced block closes at column 0, and closing the window there
+    # truncated the scan -- every member initialised after that point read as
+    # forgotten. A false FAIL on correct code, and the header already carries
+    # preprocessor lines inside the struct, so the shape is not hypothetical.
+    # Comments and literals are stripped upstream, so no brace counted here can
+    # come from prose or from a string.
+    infn {
+        bl = $0
+        opens = gsub(/\{/, "{", bl)
+        bl2 = $0
+        closes = gsub(/\}/, "}", bl2)
+        depth += opens - closes
+        if (depth <= 0 && seen_open) { inside = 0; infn = 0; next }
+        if (opens > 0) seen_open = 1
+    }
     !inside { next }
     {
         line = $0
@@ -194,10 +346,24 @@ inits="$(awk -v INIT_HELPERS="$INIT_HELPERS" '
         # NOT read as carve initialisation -- it mutates a value that must
         # already exist. Latent when written: zero compound assigns in the
         # carve block today.
-        while (match(rest, /sh->[A-Za-z_][A-Za-z0-9_]*[[:space:]]*[^-+*\/%&|^<>!=[:space:]]?=[^=]/)) {
-            s = substr(rest, RSTART + 4, RLENGTH - 4)
+        # Anchored on the literal carve target (OBJ), not on a bare `sh->`
+        # suffix: `other->sh->hits = 0` must not credit the shctx member.
+        # The trailing `[...]` / `.field` / `->field` run lets an AGGREGATE
+        # member be initialised element-wise: `sh->stripes[0].x = 0` names
+        # `stripes`, which is the member the header declares. Without it an
+        # array or nested-struct member is unsatisfiable -- no spelling of an
+        # element-wise store would ever satisfy the gate, so correct code
+        # turns CI red. Latent today (every array member in the struct is an
+        # exempt u_char pad), fixed so adding one cannot break the build.
+        while (match(rest, OBJ "[A-Za-z_][A-Za-z0-9_]*([[][^]]*[]]|[.][A-Za-z_][A-Za-z0-9_]*|->[A-Za-z_][A-Za-z0-9_]*)*[[:space:]]*[^-+*/%&|^<>!=[:space:]]?=[^=]")) {
+            s = substr(rest, RSTART + length(OBJ), RLENGTH - length(OBJ))
+            # keep only the FIRST identifier -- the member the header declares
+            sub(/[^A-Za-z0-9_].*/, "", s)
             sub(/[[:space:]]*=.*/, "", s)
-            print s
+            # A preceding identifier character means OBJ matched the tail of a
+            # longer name; anchoring is only real if the left edge is checked.
+            pre = (RSTART > 1) ? substr(rest, RSTART - 1, 1) : " "
+            if (pre !~ /[A-Za-z0-9_>.]/) print s
             rest = substr(rest, RSTART + RLENGTH)
         }
         # Address-of form (initialiser call). Taking the address of a member
@@ -218,27 +384,39 @@ inits="$(awk -v INIT_HELPERS="$INIT_HELPERS" '
         # members forgotten -- a false FAIL on correct code, which is worse
         # than the read it was closing. `in_helper` stays set from the call
         # name until the statement-terminating `;`.
-        nstmt = split(line, stmts, /;/, seps)
-        for (q = 1; q <= nstmt; q++) {
-            stmt = stmts[q]
+        # Statements are split by hand rather than with a 4-argument split().
+        # The 4th argument is a gawk extension: on mawk -- which is the Debian
+        # /usr/bin/awk, per ci/tools/install-requirements.sh -- the script dies
+        # at PARSE time, before reading a line, so the checker does not run at
+        # all on a self-hosted runner or a developer machine. Walking the line
+        # needs no extension and tracks the separator exactly the same way.
+        srest = line
+        while (length(srest) > 0) {
+            sc = index(srest, ";")
+            if (sc > 0) { stmt = substr(srest, 1, sc - 1); srest = substr(srest, sc + 1); term = 1 }
+            else        { stmt = srest; srest = ""; term = 0 }
+
             if (match(stmt, INIT_HELPERS)) {
                 in_helper = 1
                 stmt = substr(stmt, RSTART)
             }
             if (in_helper) {
+                # Anchored on OBJ, same reason as the assignment harvest above:
+                # the old pattern matched any `...sh->NAME` and then stripped
+                # everything up to `sh->`, so `&other->sh->owner_seq` was
+                # credited to the carved struct.
                 rest = stmt
-                while (match(rest, /&[A-Za-z_][A-Za-z0-9_.>-]*sh->[A-Za-z_][A-Za-z0-9_]*/)) {
-                    s = substr(rest, RSTART, RLENGTH)
-                    sub(/.*sh->/, "", s)
+                while (match(rest, "&" OBJ "[A-Za-z_][A-Za-z0-9_]*")) {
+                    s = substr(rest, RSTART + 1 + length(OBJ), RLENGTH - 1 - length(OBJ))
                     print s
                     rest = substr(rest, RSTART + RLENGTH)
                 }
             }
             # a `;` closed this statement -- the helper window ends with it
-            if (seps[q] == ";") in_helper = 0
+            if (term) in_helper = 0
         }
     }
-' "$SRC" | sort -u)"
+' | sort -u)"
 
 if [ -z "$inits" ]; then
     echo "lint-carve-init: parsed ZERO initialisers from $SRC -- shm_init_zone's signature or brace style must have changed; this checker cannot report ok on an empty scan" >&2

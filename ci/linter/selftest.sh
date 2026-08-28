@@ -471,6 +471,164 @@ printf 'struct something_else {\n    int x;\n};\n' \
 case_ 2 "carve-init: undelimitable struct is exit 2, not clean" \
     env -C "$mutroot" ./ci/tools/lint-carve-init.sh
 
+# ----------------------------------------------------------------------------
+# carve-init: the MALFORMED-INPUT TABLE.
+#
+# Round-by-round, this checker was fixed by generalising the one input a
+# reviewer happened to name, and the next round found another member of the
+# same class still open. So these controls are organised by CLASS rather than
+# by finding: each row is one shape of hostile or awkward C, and the classes
+# are swept across comments, string and char literals, declarator forms,
+# wrong-object references, brace structure and preprocessor text.
+#
+# Every RED row here was verified against the PRE-FIX script and observed to
+# come back exit 0 (or, for the false-FAIL rows, exit 1 on correct code). A
+# control that passes identically before and after the fix asserts nothing and
+# reads exactly like a passing gate, which is the failure this whole file
+# exists to detect.
+#
+# Columns: expected-exit | description | member line | carve line
+# A `%` in a member/carve field is a literal newline, so a row can carry a
+# multi-line construct without breaking the table shape.
+carve_row() {
+    local want="$1" desc="$2" mem="$3" carve="$4"
+    emit_fixture "${mem//%/$'\n'}" "${carve//%/$'\n'}"
+    case_ "$want" "carve-init: $desc" \
+        env -C "$mutroot" ./ci/tools/lint-carve-init.sh
+}
+
+# --- class: comments must never be parsed as code ---------------------------
+# The exploit that forced the rewrite: a block comment naming a helper and
+# carrying no `;` held the INIT_HELPERS window open for the rest of the block,
+# crediting every later pure read.
+carve_row 1 "block comment naming a helper does not open the helper window" \
+    "    ngx_atomic_t             owner_seq;" \
+    '    /* the LRU is set up by ngx_queue_init( further down */%    (void) memcmp(&st->sh->owner_seq, "x", 8);'
+
+carve_row 1 "MULTI-LINE comment naming a helper does not open the window" \
+    "    ngx_atomic_t             owner_seq;" \
+    '    /* set up by%     * ngx_queue_init( and friends%     */%    (void) memcmp(&st->sh->owner_seq, "x", 8);'
+
+carve_row 1 "line comment naming a helper does not open the window" \
+    "    ngx_atomic_t             owner_seq;" \
+    '    // done later by ngx_queue_init(%    (void) memcmp(&st->sh->owner_seq, "x", 8);'
+
+# A comment carrying a `;` must not be able to TERMINATE a real statement
+# either -- the splitter has to see the code semicolons only.
+carve_row 1 "a semicolon inside a comment does not terminate a statement" \
+    "    ngx_atomic_t             owner_seq;" \
+    '    (void) memcmp(&st->sh->owner_seq /* ; ; ; */, "x", 8);'
+
+# A commented-out initialiser is not an initialiser.
+carve_row 1 "a commented-out assignment does not count as initialisation" \
+    "    ngx_uint_t               tag_cap_drops;" \
+    "    /* st->sh->tag_cap_drops = 0; */"
+
+carve_row 1 "a line-commented assignment does not count as initialisation" \
+    "    ngx_uint_t               tag_cap_drops;" \
+    "    // st->sh->tag_cap_drops = 0;"
+
+# A brace inside a comment must not move the brace depth and truncate the scan.
+carve_row 0 "a brace inside a comment does not close the carve window" \
+    "    ngx_atomic_t             owner_seq;" \
+    "    /* } this brace is prose */%    st->sh->owner_seq = 0;"
+
+# --- class: string and char literals must never be parsed as code -----------
+carve_row 1 "a helper name inside a string does not open the helper window" \
+    "    ngx_atomic_t             owner_seq;" \
+    '    log("ngx_queue_init(");%    (void) memcmp(&st->sh->owner_seq, "x", 8);'
+
+carve_row 0 "a semicolon inside a string does not terminate a statement" \
+    "    ngx_atomic_t             owner_seq;" \
+    '    log("a ; b");%    st->sh->owner_seq = 0;'
+
+carve_row 0 "a brace inside a string does not close the carve window" \
+    "    ngx_atomic_t             owner_seq;" \
+    '    log("}");%    st->sh->owner_seq = 0;'
+
+carve_row 0 "a brace inside a CHAR literal does not close the carve window" \
+    "    ngx_atomic_t             owner_seq;" \
+    "    ch = '}';%    st->sh->owner_seq = 0;"
+
+# An escaped quote must not end the literal early and expose its tail as code.
+carve_row 1 "an escaped quote does not end a string early" \
+    "    ngx_atomic_t             owner_seq;" \
+    '    log("\" ngx_queue_init( \"");%    (void) memcmp(&st->sh->owner_seq, "x", 8);'
+
+# --- class: declarator forms are never silently dropped ---------------------
+# A bitfield used to vanish from the member set entirely: no initialiser was
+# ever demanded for it and the count still looked plausible.
+carve_row 1 "a bitfield member is harvested, not silently dropped" \
+    "    unsigned                 degraded:1;" ""
+
+carve_row 0 "an initialised bitfield member satisfies the gate" \
+    "    unsigned                 degraded:1;" \
+    "    st->sh->degraded = 0;"
+
+carve_row 1 "a spaced bitfield width is still harvested" \
+    "    unsigned                 degraded : 3;" ""
+
+# The catch-all: any declarator the parser cannot read is a LOUD exit 2, never
+# a silent drop. Exit 2 is "could not run", which is the honest answer.
+carve_row 2 "an unparsable declarator is a loud error, not a silent drop" \
+    "    ngx_uint_t               123bad;" ""
+
+# An array-of-struct member is an ordinary member with a bound.
+carve_row 1 "an array-of-struct member is harvested" \
+    "    ngx_http_cache_turbo_stripe_t  stripes[8];" ""
+
+carve_row 0 "an initialised array-of-struct member satisfies the gate" \
+    "    ngx_http_cache_turbo_stripe_t  stripes[8];" \
+    "    st->sh->stripes[0].x = 0;"
+
+# A trailing comment on a member declaration must not disturb the name parse.
+carve_row 1 "a trailing comment on a member does not hide the member" \
+    "    ngx_uint_t               tag_cap_drops;  /* counter ; { */" ""
+
+# --- class: nested aggregates are refused loudly, never answered wrongly ----
+# Harvesting a nested member as top-level demands an `sh->NAME =` store that
+# cannot exist -- an unsatisfiable gate, i.e. CI red on correct code.
+carve_row 2 "a nested anonymous union is a loud error, not a false FAIL" \
+    "    union {%        ngx_uint_t           inner_a;%        ngx_uint_t           inner_b;%    } u;" ""
+
+carve_row 2 "a nested anonymous struct is a loud error, not a false FAIL" \
+    "    struct {%        ngx_uint_t           inner_a;%    } s;" ""
+
+# --- class: every match anchors on the real carve target --------------------
+# An unrelated object whose expression merely ENDS in `sh->` must not be
+# credited to the carved shctx.
+carve_row 1 "a helper call on ANOTHER object does not credit the shctx" \
+    "    ngx_atomic_t             owner_seq;" \
+    "    ngx_queue_init(&other->sh->owner_seq);"
+
+carve_row 1 "an assignment on ANOTHER object does not credit the shctx" \
+    "    ngx_uint_t               tag_cap_drops;" \
+    "    other->sh->tag_cap_drops = 0;"
+
+carve_row 1 "a longer identifier ending in sh-> does not credit the shctx" \
+    "    ngx_uint_t               tag_cap_drops;" \
+    "    octx->sh->tag_cap_drops = 0;"
+
+# --- class: brace structure and preprocessor text ---------------------------
+# The window closes where the braces BALANCE, not at the first column-0 `}`.
+# A macro- or #if-introduced column-0 brace used to truncate the scan and
+# report every later member forgotten -- a false FAIL on correct code.
+carve_row 0 "a column-0 brace inside the function does not truncate the scan" \
+    "    ngx_atomic_t             owner_seq;" \
+    "    if (1) {%}%    st->sh->owner_seq = 0;"
+
+carve_row 0 "an #if-gated block does not truncate the scan" \
+    "    ngx_atomic_t             owner_seq;" \
+    "#if (NGX_DEBUG)%    if (1) {%}%#endif%    st->sh->owner_seq = 0;"
+
+# A multi-line macro member declaration keeps its trailing name visible.
+carve_row 1 "a member declared across a line continuation is harvested" \
+    "    ngx_uint_t \\%                             tag_cap_drops;" ""
+
+# A parenthesised declarator is accounted for rather than dropped.
+carve_row 1 "a parenthesised pointer declarator is harvested" \
+    "    u_char                   (*_pad_pa)[8];" ""
+
 if [ "$rc" -eq 0 ]; then
     echo "== lint gate selftest: all controls held =="
 else
