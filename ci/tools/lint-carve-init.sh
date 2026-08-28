@@ -82,6 +82,13 @@ members="$(awk '
         if (line !~ /;/) next
         sub(/;.*/, "", line)
         sub(/__attribute__.*/, "", line)
+        # Capture the base type of the declaration BEFORE the array bound is
+        # stripped: the _pad* exemption below must be able to prove a member is
+        # genuinely `u_char NAME[...]` layout filler and not merely named like
+        # it. `raw` keeps the array bracket the name-parse discards.
+        raw = line
+        gsub(/^[[:space:]]+/, "", raw)
+        is_uchar_array = (raw ~ /^u_char[[:space:]]/ && raw ~ /\[[^]]*\]/)
         sub(/\[[^]]*\]/, "", line)     # array bound
         gsub(/[[:space:]]+$/, "", line)
         # A declaration may carry several declarators: `ngx_uint_t a, b;`.
@@ -98,7 +105,12 @@ members="$(awk '
             n = split(piece, parts, /[[:space:]*]+/)
             if (n == 0) continue
             name = parts[n]
-            if (name ~ /^[A-Za-z_][A-Za-z0-9_]*$/) print name
+            if (name ~ /^[A-Za-z_][A-Za-z0-9_]*$/) {
+                # Tag pad-eligibility onto the name so the exemption is a
+                # TYPE decision, not a name-prefix one.
+                if (is_uchar_array) print name "\tpadok"
+                else               print name "\t-"
+            }
         }
     }
     END {
@@ -115,6 +127,10 @@ if [ -z "$members" ]; then
     echo "lint-carve-init: parsed ZERO members from $HDR -- refusing to report ok on an empty scan" >&2
     exit 2
 fi
+
+# $members rows are "NAME<TAB>padok|-". Keep the tagged list for the exemption
+# decision below and derive a bare-name list for counting.
+member_names="$(printf '%s\n' "$members" | cut -f1)"
 
 # --- 2. the members the carve block initialises ------------------------------
 #
@@ -164,13 +180,19 @@ inits="$(awk '
             print s
             rest = substr(rest, RSTART + RLENGTH)
         }
-        # address-of form (initialiser call)
+        # Address-of form (initialiser call). Restricted to a KNOWN
+        # INITIALISER allowlist: taking the address of a member proves nothing
+        # on its own -- `memcmp(&st->sh->misses, ...)` is a pure READ and used
+        # to satisfy this gate, which is a silent-green false negative. Only a
+        # call that actually initialises what it is handed counts.
+        if (line ~ /(ngx_rbtree_init|ngx_queue_init|ngx_memzero|ngx_rbtree_sentinel_init)[[:space:]]*\(/) {
         rest = line
         while (match(rest, /&[A-Za-z_][A-Za-z0-9_.>-]*sh->[A-Za-z_][A-Za-z0-9_]*/)) {
             s = substr(rest, RSTART, RLENGTH)
             sub(/.*sh->/, "", s)
             print s
             rest = substr(rest, RSTART + RLENGTH)
+        }
         }
     }
 ' "$SRC" | sort -u)"
@@ -184,13 +206,39 @@ fi
 #
 # _pad* members are explicit layout filler. Nothing reads them, so they are the
 # one class that legitimately needs no store.
+#
+# The exemption is a TYPE decision, not a name-prefix one. A member is exempt
+# only when it is BOTH named _pad* AND declared `u_char NAME[...]` -- the
+# harvest above tags that as "padok". Prefix alone was a silent-green hole: an
+# `ngx_uint_t _pad_but_real` that something actually reads was exempted and the
+# gate reported ok, which is the exact failure class this checker exists to
+# catch. A _pad*-named member of any other type is now a FAIL, not an exemption.
 missing=""
-for m in $members; do
+mistyped_pad=""
+while IFS="$(printf '\t')" read -r m tag; do
+    [ -n "$m" ] || continue
     case "$m" in
-        _pad*) continue ;;
+        _pad*)
+            if [ "$tag" = "padok" ]; then
+                continue
+            fi
+            mistyped_pad="$mistyped_pad $m"
+            ;;
     esac
     printf '%s\n' "$inits" | grep -qx -- "$m" || missing="$missing $m"
-done
+done <<EOF
+$members
+EOF
+
+if [ -n "$mistyped_pad" ]; then
+    echo "FAIL: member(s) named _pad* but NOT declared 'u_char NAME[...]':" >&2
+    for m in $mistyped_pad; do
+        echo "        $m" >&2
+    done
+    echo "      The _pad* exemption covers layout filler only. Either declare it" >&2
+    echo "      as a u_char array, or rename it and initialise it at the carve." >&2
+    exit 1
+fi
 
 if [ -n "$missing" ]; then
     echo "FAIL: ngx_http_cache_turbo_shctx_t member(s) never initialised at zone carve:" >&2
@@ -204,5 +252,5 @@ if [ -n "$missing" ]; then
     exit 1
 fi
 
-n_checked="$(printf '%s\n' "$members" | grep -vc '^_pad' || true)"
+n_checked="$(printf '%s\n' "$member_names" | grep -vc '^_pad' || true)"
 echo "ok: all $n_checked shctx members initialised at zone carve (CARVE-INIT)"

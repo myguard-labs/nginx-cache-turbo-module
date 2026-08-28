@@ -9,7 +9,8 @@
 # gate fires from the commit hook as well as CI, matching lint-shm-lock.sh.
 #
 # What it enforces, in one line: every ngx_http_cache_turbo_shctx_t member is
-# explicitly initialised in shm_init_zone()'s carve block. ngx_slab_alloc()
+# explicitly initialised in the carve block of
+# ngx_http_cache_turbo_shm_init_zone(). ngx_slab_alloc()
 # does not zero, but the fresh-carve path happens to land on kernel-zeroed
 # anonymous pages -- so a forgotten member reads 0 anyway and no runtime test
 # can see the omission. Same shape as lint-stripe-seam.sh: correct today only

@@ -332,11 +332,99 @@ fi
 # be unsupported. Fixture is generated: a committed broken-YAML file would trip
 # yamllint on the real tree.
 badroot="$(mktemp -d)"
-trap 'rm -rf "$badroot"' EXIT
 mkdir -p "$badroot/.github/workflows"
 printf 'on: [pull_request\njobs: {\n' > "$badroot/.github/workflows/broken.yml"
 case_ 2 "policy runners: unparsable YAML is exit 2, not clean" \
     env "WORKFLOW_POLICY_ROOT=$badroot" python3 ci/linter/workflow_policy.py runners
+
+# ----------------------------------------------------------------------------
+# The shm-checker mutation controls.
+#
+# CARVE-INIT-NO-NEGATIVE-CONTROL: the three shm checkers (carve-init, shm-lock,
+# stripe-seam) had every proof of efficacy living in a commit message. Each was
+# hand-mutated once by a reviewer, proved red, and then nothing in the tree kept
+# it red -- so a refactor that silently disarmed one would leave CI green and
+# the disarming invisible. That is precisely the failure this file exists to
+# catch, applied to the checkers rather than to the dispatcher.
+#
+# These cases DO invoke a real checker, unlike every case above. They stay
+# within the one-second budget by running against a generated fixture tree of
+# two small files rather than the real src/, so no build and no scan of the
+# 34k-line source is involved.
+mutroot="$(mktemp -d)"
+trap 'rm -rf "$badroot" "$mutroot"' EXIT
+mkdir -p "$mutroot/src" "$mutroot/ci/tools"
+cp ci/tools/lint-carve-init.sh "$mutroot/ci/tools/"
+
+# A minimal shctx and carve block: the smallest input that exercises the real
+# member-harvest and initialiser-harvest paths.
+emit_fixture() {
+    # $1 = extra member line, $2 = extra carve line
+    cat > "$mutroot/src/ngx_http_cache_turbo_module.h" <<EOF
+typedef struct ngx_http_cache_turbo_shctx_s {
+    ngx_atomic_t             hits;
+    u_char                   _pad_hits[24];
+${1:-}
+} ngx_http_cache_turbo_shctx_t;
+EOF
+    cat > "$mutroot/src/ngx_http_cache_turbo_shm.c" <<EOF
+ngx_http_cache_turbo_shm_init_zone(ngx_shm_zone_t *shm_zone, void *data)
+{
+    st->sh = ngx_slab_alloc(pool, sizeof(ngx_http_cache_turbo_shctx_t));
+    st->sh->hits = 0;
+${2:-}
+    return NGX_OK;
+}
+EOF
+}
+
+# Baseline: the fixture as written must be CLEAN. Without this, every case
+# below could be passing for the wrong reason (a fixture the checker cannot
+# parse at all also "fails").
+emit_fixture "" ""
+case_ 0 "carve-init: well-formed fixture is clean" \
+    env -C "$mutroot" ./ci/tools/lint-carve-init.sh
+
+# The original MAJOR: a member initialised only outside the carve block. This
+# is the mutation that passed before the scan window was narrowed.
+emit_fixture "    ngx_uint_t               tag_cap_drops;" ""
+case_ 1 "carve-init: member never initialised is caught" \
+    env -C "$mutroot" ./ci/tools/lint-carve-init.sh
+
+# Compound assignment must not read as initialisation.
+emit_fixture "    ngx_uint_t               tag_cap_drops;" \
+             "    st->sh->tag_cap_drops += 0;"
+case_ 1 "carve-init: compound assignment is not initialisation" \
+    env -C "$mutroot" ./ci/tools/lint-carve-init.sh
+
+# Multi-declarator lines must register EVERY name, not only the last.
+emit_fixture "    ngx_uint_t               zzz_a, zzz_b;" \
+             "    st->sh->zzz_b = 0;"
+case_ 1 "carve-init: multi-declarator hides no member" \
+    env -C "$mutroot" ./ci/tools/lint-carve-init.sh
+
+# Taking a member address for a pure READ is not initialisation.
+emit_fixture "    ngx_uint_t               tag_cap_drops;" \
+             "    (void) memcmp(&st->sh->tag_cap_drops, \"x\", 8);"
+case_ 1 "carve-init: address-of in a non-initialiser call does not count" \
+    env -C "$mutroot" ./ci/tools/lint-carve-init.sh
+
+# The _pad* exemption is a TYPE decision: a _pad*-named member of a
+# non-u_char-array type must FAIL rather than be silently exempted.
+emit_fixture "    ngx_uint_t               _pad_but_real;" ""
+case_ 1 "carve-init: _pad* exemption requires a u_char array type" \
+    env -C "$mutroot" ./ci/tools/lint-carve-init.sh
+
+# ...and a genuine pad must still be exempt, or the check above is just noise.
+emit_fixture "    u_char                   _pad_legit[8];" ""
+case_ 0 "carve-init: a genuine u_char pad stays exempt" \
+    env -C "$mutroot" ./ci/tools/lint-carve-init.sh
+
+# A structurally broken header is "could not run" (2), never clean.
+printf 'struct something_else {\n    int x;\n};\n' \
+    > "$mutroot/src/ngx_http_cache_turbo_module.h"
+case_ 2 "carve-init: undelimitable struct is exit 2, not clean" \
+    env -C "$mutroot" ./ci/tools/lint-carve-init.sh
 
 if [ "$rc" -eq 0 ]; then
     echo "== lint gate selftest: all controls held =="
