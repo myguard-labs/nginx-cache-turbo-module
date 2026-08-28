@@ -14,6 +14,13 @@
 #                         .gcno files land under objs/addon/src/; the matching
 #                         .gcda are written when the instrumented nginx exits.
 #                         ci/tools/coverage.sh drives build -> run -> report.
+#              configure - run ./configure ONLY and stop. Produces
+#                         objs/Makefile (and so ALL_INCS) without compiling
+#                         anything, which is all ci/tools/lint-carve-init.sh
+#                         needs to parse the module against nginx's real
+#                         include set. Seconds rather than minutes, so the
+#                         validation job can have a parseable tree without
+#                         waiting on a build.
 #              profile  - optimized (-O2) dynamic module + binary with debug
 #                         symbols and frame pointers kept, for `perf record`.
 #                         Same optimization level as a real release build
@@ -208,6 +215,14 @@ cd "$ROOT/$DIR"
     --with-cc-opt="$CC_OPT" \
     --with-ld-opt="$LD_OPT" \
     "$ADD_MODULE"
+
+# configure mode stops here: objs/Makefile now exists, which is everything the
+# carve-init parser needs. Compiling would add minutes and change nothing it
+# reads.
+if [ "$MODE" = "configure" ]; then
+    printf 'tree=%s\n' "$ROOT/$DIR"
+    exit 0
+fi
 
 if [ "$MODE" != "asan" ]; then
     # MAKE may be "eatmydata make" — must word-split.

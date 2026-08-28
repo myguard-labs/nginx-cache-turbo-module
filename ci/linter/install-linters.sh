@@ -43,6 +43,13 @@ APT_TOOLS=(
     "cppcheck:cppcheck"          # C
     "flawfinder:flawfinder"      # C, risky-API scan
     "yamllint:yamllint"          # YAML
+    "clang:clang"                # C, and the PARSER behind
+                                 # ci/tools/lint-carve-init.sh -- that gate
+                                 # reads a real clang AST rather than lexing
+                                 # the header, so without clang it exits 2
+                                 # ("could not run") instead of reporting a
+                                 # verdict. It is a hard requirement of the
+                                 # lint suite, not an optional lens.
     "clang-tidy:clang-tidy"      # C, CI-only (needs a configured nginx tree)
     "bear:bear"                  # records the build's real compiler argv into
                                  # compile_commands.json, so clang-tidy parses
@@ -103,8 +110,20 @@ have() { command -v "$1" >/dev/null 2>&1; }
 step() { printf '\n== %s\n' "$*"; }
 rc=0
 
+# Reports a tool AND fails the check when it is absent. Printing MISSING
+# without touching rc left `--check` exiting 0 with every executable tool gone,
+# which made lint.yml's "verify completeness" step incapable of failing for the
+# thing it verifies -- a green step over an incomplete toolchain. The python
+# module loop below already sets rc this way; this brings the executables in
+# line with it.
 report() {
-    printf '%-14s %s\n' "$1" "$(command -v "$1" 2>/dev/null || echo MISSING)"
+    local path
+    if path="$(command -v "$1" 2>/dev/null)"; then
+        printf '%-14s %s\n' "$1" "$path"
+    else
+        printf '%-14s MISSING\n' "$1"
+        rc=1
+    fi
 }
 
 have_mod() { python3 -c "import $1" >/dev/null 2>&1; }

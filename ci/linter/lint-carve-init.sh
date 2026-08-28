@@ -20,9 +20,18 @@
 # a fixed pair of files, so the staged file list only decides whether this
 # checker is relevant to the change, never which lines it reads.
 #
+# NEEDS A CONFIGURED NGINX TREE. The implementation parses the module with
+# clang rather than lexing it, so it requires a tree where ./configure has run
+# (it reads ALL_INCS from objs/Makefile). `bash ci/tools/ci-build.sh nginx ""
+# configure` produces one in seconds without compiling anything, and any tree
+# under .build/ is found automatically. With no tree the gate exits 2 -- "could
+# not run" -- and never reports clean: a parser that cannot parse must not look
+# like a passing gate.
+#
 # Usage: ci/linter/lint-carve-init.sh [files...]   Env: LINT_MODE=staged|all
+#        NGX_SRC_TREE=<dir> to pick the tree explicitly.
 # Exit:  0 clean, 1 a member has no initialiser, 2 could not run.
-# Extend: the parse and the _pad* exemption live in ci/tools/lint-carve-init.sh.
+# Extend: the parse and the _pad* exemption live in ci/tools/carve_init_ast.py.
 
 # shellcheck source=ci/linter/lib.sh
 . "$(git rev-parse --show-toplevel)/ci/linter/lib.sh"
