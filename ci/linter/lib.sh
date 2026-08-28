@@ -83,15 +83,16 @@ lint_files() {
         git_cmd=(git ls-files -z)
     fi
 
-    # This runs inside lint_files_into's coprocess, so toggling errexit cannot
-    # affect the caller. Capture both pipeline statuses before any other command
-    # overwrites PIPESTATUS: a Git failure after a valid prefix must stay red.
-    set +e
-    "${git_cmd[@]}" | while IFS= read -r -d '' f; do
+    # A pipeline used as an if condition is exempt from errexit. Capture both
+    # statuses as the first command in either branch, without changing the
+    # caller's shell options: lint_files is also a public direct-call helper.
+    if "${git_cmd[@]}" | while IFS= read -r -d '' f; do
         _lint_emit_file "$match_re" "$f"
-    done
-    source_status=("${PIPESTATUS[@]}")
-    set -e
+    done; then
+        source_status=("${PIPESTATUS[@]}")
+    else
+        source_status=("${PIPESTATUS[@]}")
+    fi
 
     [ "${source_status[0]}" -eq 0 ] || die "Git file-list producer failed"
     [ "${source_status[1]}" -eq 0 ] || die "file-list filter failed"
@@ -103,86 +104,91 @@ lint_files() {
 # A failed git command can therefore look exactly like a legitimate empty
 # selection. Keep the NUL stream on a pipe, then wait for its producer.
 lint_files_into() {
-    local array_name="$1" match_re="$2"
-    local coproc_in_fd coproc_out_fd element_ref item load_rc
-    local producer_fd producer_pid producer_rc read_rc
-    local index=0
+    local _lfi_array_name="$1" _lfi_match_re="$2"
+    local _lfi_coproc_in_fd _lfi_coproc_out_fd _lfi_element_ref _lfi_item
+    local _lfi_load_rc _lfi_producer_fd _lfi_producer_pid _lfi_producer_rc
+    local _lfi_read_rc
+    local _lfi_index=0
     shift 2
 
-    [[ "$array_name" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] \
-        || die "invalid lint file-list array name: $array_name"
+    [[ "$_lfi_array_name" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] \
+        || die "invalid lint file-list array name: $_lfi_array_name"
+    [[ "$_lfi_array_name" != _lfi_* ]] \
+        || die "reserved lint file-list array name: $_lfi_array_name"
+    [[ "$_lfi_array_name" != LINT_* ]] \
+        || die "reserved lint file-list array name: $_lfi_array_name"
 
     # The handshake prevents a fast producer from exiting while its Bash-owned
     # coproc FD is still being promoted to an ordinary shell FD. Named coproc
     # descriptors can disappear as soon as the child exits; the duplicate is
     # owned by this shell until explicitly closed below.
     coproc LINT_FILES_SOURCE {
-        IFS= read -r _lint_start || exit 2
-        lint_files "$match_re" "$@"
+        IFS= read -r _lfi_start || exit 2
+        lint_files "$_lfi_match_re" "$@"
     }
-    producer_pid=$!
-    if exec {producer_fd}<&"${LINT_FILES_SOURCE[0]}"; then
+    _lfi_producer_pid=$!
+    if exec {_lfi_producer_fd}<&"${LINT_FILES_SOURCE[0]}"; then
         :
     else
-        coproc_in_fd="${LINT_FILES_SOURCE[1]}"
-        exec {coproc_in_fd}>&-
-        wait "$producer_pid" || true
+        _lfi_coproc_in_fd="${LINT_FILES_SOURCE[1]}"
+        exec {_lfi_coproc_in_fd}>&-
+        wait "$_lfi_producer_pid" || true
         die "could not duplicate lint file-list pipe"
     fi
-    coproc_out_fd="${LINT_FILES_SOURCE[0]}"
-    coproc_in_fd="${LINT_FILES_SOURCE[1]}"
-    exec {coproc_out_fd}<&-
-    if printf '.\n' >&"$coproc_in_fd"; then
+    _lfi_coproc_out_fd="${LINT_FILES_SOURCE[0]}"
+    _lfi_coproc_in_fd="${LINT_FILES_SOURCE[1]}"
+    exec {_lfi_coproc_out_fd}<&-
+    if printf '.\n' >&"$_lfi_coproc_in_fd"; then
         :
     else
-        exec {coproc_in_fd}>&-
-        exec {producer_fd}<&-
-        wait "$producer_pid" || true
+        exec {_lfi_coproc_in_fd}>&-
+        exec {_lfi_producer_fd}<&-
+        wait "$_lfi_producer_pid" || true
         die "could not start lint file-list producer"
     fi
-    exec {coproc_in_fd}>&-
+    exec {_lfi_coproc_in_fd}>&-
 
     # Bash 4.3 has read -d and printf -v array elements, but mapfile did not
     # gain -d until 4.4. Clear through mapfile's older interface, then decode
     # each NUL record without raising run-all.sh's documented Bash floor.
-    mapfile -t "$array_name" < /dev/null
-    load_rc=0
+    mapfile -t "$_lfi_array_name" < /dev/null
+    _lfi_load_rc=0
     while :; do
-        item=""
-        if IFS= read -r -d '' item <&"$producer_fd"; then
-            read_rc=0
+        _lfi_item=""
+        if IFS= read -r -d '' _lfi_item <&"$_lfi_producer_fd"; then
+            _lfi_read_rc=0
         else
             # shellcheck disable=SC2319  # read status distinguishes EOF from a record
-            read_rc=$?
+            _lfi_read_rc=$?
         fi
-        if [ "$read_rc" -ne 0 ]; then
+        if [ "$_lfi_read_rc" -ne 0 ]; then
             # read -d returns nonzero for both clean EOF and an unterminated
             # tail, but assigns the partial tail in the latter case.
-            [ -z "$item" ] || load_rc=2
+            [ -z "$_lfi_item" ] || _lfi_load_rc=2
             break
         fi
-        printf -v element_ref '%s[%s]' "$array_name" "$index"
-        if ! printf -v "$element_ref" '%s' "$item"; then
-            load_rc=2
+        printf -v _lfi_element_ref '%s[%s]' "$_lfi_array_name" "$_lfi_index"
+        if ! printf -v "$_lfi_element_ref" '%s' "$_lfi_item"; then
+            _lfi_load_rc=2
             break
         fi
-        index=$((index + 1))
+        _lfi_index=$((_lfi_index + 1))
     done
-    exec {producer_fd}<&-
+    exec {_lfi_producer_fd}<&-
 
-    if wait "$producer_pid"; then
-        producer_rc=0
+    if wait "$_lfi_producer_pid"; then
+        _lfi_producer_rc=0
     else
         # shellcheck disable=SC2319  # wait status is the lint_files status
-        producer_rc=$?
+        _lfi_producer_rc=$?
     fi
 
-    if [ "$producer_rc" -ne 0 ]; then
-        mapfile -t "$array_name" < /dev/null
-        return "$producer_rc"
+    if [ "$_lfi_producer_rc" -ne 0 ]; then
+        mapfile -t "$_lfi_array_name" < /dev/null
+        return "$_lfi_producer_rc"
     fi
-    if [ "$load_rc" -ne 0 ]; then
-        mapfile -t "$array_name" < /dev/null
+    if [ "$_lfi_load_rc" -ne 0 ]; then
+        mapfile -t "$_lfi_array_name" < /dev/null
         die "could not load lint file list"
     fi
 }

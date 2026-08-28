@@ -513,6 +513,35 @@ case_ 2 "lint_files_into: an invalid filter regex is exit 2" \
 case_ 0 "lint_files_into: a valid no-match clears the target array" \
     bash -c '. ci/linter/lib.sh; files=(stale); lint_files_into files "^src/" ci/linter/lib.sh; [ "${#files[@]}" -eq 0 ]'
 
+# lint_files is public independently of the array loader. Its Git pipeline must
+# preserve both disabled and enabled errexit state in the shell that calls it.
+# shellcheck disable=SC2016  # shell flags expand in the inner bash
+case_ 0 "lint_files: a direct call preserves caller errexit state" \
+    bash -c '. ci/linter/lib.sh
+        set +e
+        lint_files "a^" > /dev/null
+        [[ "$-" != *e* ]]
+        set -e
+        lint_files "a^" > /dev/null
+        [[ "$-" == *e* ]]'
+
+# Bash functions use dynamic scoping. The old loader's local `item` shadowed a
+# caller array with that name, so it silently returned the caller's stale list.
+# Namespaced internals make that formerly colliding public target usable, while
+# the internal namespace and all library-owned LINT_* globals stay private.
+# shellcheck disable=SC2016  # array expands in the inner bash
+case_ 0 "lint_files_into: a former local-name collision loads the caller array" \
+    bash -c '. ci/linter/lib.sh
+        item=(stale)
+        lint_files_into item "^ci/linter/lib\\.sh$" ci/linter/lib.sh
+        [ "${#item[@]}" -eq 1 ] && [ "${item[0]}" = ci/linter/lib.sh ]'
+case_ 2 "lint_files_into: its helper namespace is a reserved target" \
+    bash -c '. ci/linter/lib.sh; _lfi_item=(); lint_files_into _lfi_item "." ci/linter/lib.sh'
+case_ 2 "lint_files_into: LINT_EXCLUDE_RE is a reserved target" \
+    bash -c '. ci/linter/lib.sh; lint_files_into LINT_EXCLUDE_RE "." ci/linter/lib.sh'
+case_ 2 "lint_files_into: LINT_MODE is a reserved target" \
+    bash -c '. ci/linter/lib.sh; lint_files_into LINT_MODE "." ci/linter/lib.sh'
+
 # Exact old-code probe: the former grep filter emitted a plausible source path,
 # then exited 2; its trailing `|| true` masked that failure. The in-process
 # matcher must not invoke the shim at all. If a future refactor restores an
