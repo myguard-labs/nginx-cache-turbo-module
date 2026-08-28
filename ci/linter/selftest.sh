@@ -525,6 +525,24 @@ case_ 0 "lint_files: a direct call preserves caller errexit state" \
         lint_files "a^" > /dev/null
         [[ "$-" == *e* ]]'
 
+# A failed explicit-path emitter after a valid record must invalidate the
+# complete selection. The third item pins the old loop's dangerous behavior:
+# it continued after the failure, emitted a later record, and returned clean.
+# shellcheck disable=SC2016  # function state expands in the inner bash
+case_ 2 "lint_files: explicit emitter failure after a prefix is exit 2" \
+    bash -c '. ci/linter/lib.sh
+        _lint_emit_file() {
+            emit_count=$((emit_count + 1))
+            case "$emit_count" in
+                1) printf "prefix\0" ;;
+                2) return 1 ;;
+                3) printf "later\0" ;;
+            esac
+        }
+        emit_count=0
+        set +e
+        lint_files "." first second third > /dev/null'
+
 # Bash functions use dynamic scoping. The old loader's local `item` shadowed a
 # caller array with that name, so it silently returned the caller's stale list.
 # Namespaced internals make that formerly colliding public target usable, while

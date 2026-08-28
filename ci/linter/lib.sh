@@ -72,7 +72,11 @@ lint_files() {
 
     if [ "$#" -gt 0 ]; then
         for f in "$@"; do
-            _lint_emit_file "$match_re" "$f"
+            if _lint_emit_file "$match_re" "$f"; then
+                :
+            else
+                die "explicit file-list emitter failed"
+            fi
         done
         return 0
     fi
