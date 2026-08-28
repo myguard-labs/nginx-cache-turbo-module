@@ -13,16 +13,14 @@
 # Usage:  ci/linter/selftest.sh
 # Exit:   0 all controls held, 1 one or more did not.
 #
-# Runs in about two seconds (90 controls). The budget is stated as a ceiling
+# Runs in about seven seconds. The budget is stated as a ceiling
 # on the whole suite, not per case: this is a commit-hook and CI gate, where a
 # couple of seconds is immaterial next to the cost of a silent-green linter
 # shipping. Controls are added when a class of malformed input is found
 # unmodelled; the budget line moves with them rather than the suite being
-# trimmed to fit it. Every case but the carve-init block at the end is
-# dispatcher-level (LINT_ONLY values are either bogus or rejected before
-# dispatch), so no linter needs to be installed for those. The carve-init cases
-# DO invoke that one checker for real, against a generated two-file fixture
-# tree rather than the real src/, which is what keeps them inside the budget.
+# trimmed to fit it. The wrapper controls stop before external linters, and the
+# three module-specific checker blocks run against generated fixture trees, so
+# the suite needs no optional linter installation and stays inside the budget.
 #
 # Extend: add a case() line. Keep each case asserting a specific exit status,
 # and prefer a case where the OLD, broken behaviour would have passed.
@@ -45,6 +43,22 @@ case_() {
         echo "FAIL $desc: expected exit $want, got $got" >&2
         # Parameter expansion rather than sed (SC2001): CI validates this
         # file at the default severity, where style findings are fatal.
+        printf '%s\n' "       | ${out//$'\n'/$'\n'       | }" >&2
+        rc=1
+    fi
+}
+
+# finding_case <description> <message-ere> -- command...
+# Assert both the finding exit class and its diagnostic. Exit 1 alone is also
+# how an awk crash or an unrelated invariant violation presents.
+finding_case_() {
+    local desc="$1" want_re="$2" out got
+    shift 2
+    out="$("$@" 2>&1)"; got=$?
+    if [ "$got" -eq 1 ] && grep -qE -- "$want_re" <<< "$out"; then
+        echo "ok   $desc (intended finding, exit $got)"
+    else
+        echo "FAIL $desc: expected exit 1 matching /$want_re/, got $got" >&2
         printf '%s\n' "       | ${out//$'\n'/$'\n'       | }" >&2
         rc=1
     fi
@@ -347,6 +361,200 @@ case_ 2 "policy runners: unparsable YAML is exit 2, not clean" \
     env "WORKFLOW_POLICY_ROOT=$badroot" python3 ci/linter/workflow_policy.py runners
 
 # ----------------------------------------------------------------------------
+# Every lint wrapper must observe failure from its file-list producer.
+#
+# Process substitution returns mapfile's status, not lint_files' status. The
+# fake git below emits a plausible prefix and then fails, reproducing the
+# dangerous case: a truncated/empty selection that used to look clean. Run the
+# control through every wrapper that loads lint_files, including lint-sh.sh's
+# two-list path. The matching empty-selection control preserves the legitimate
+# no-relevant-files behavior.
+listroot="$(mktemp -d)"
+trap 'rm -rf "$badroot" "$listroot"' EXIT
+mkdir -p "$listroot/bin"
+cat > "$listroot/bin/git" <<'GITEOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "ls-files" ]; then
+    if [ -n "${GIT_LS_FILES_OK:-}" ]; then
+        printf '%s\n' src/ngx_http_cache_turbo_module.c
+        exit 0
+    fi
+    if [ -n "${GIT_FAIL_SECOND_STATE:-}" ]; then
+        call=0
+        [ ! -f "$GIT_FAIL_SECOND_STATE" ] \
+            || read -r call < "$GIT_FAIL_SECOND_STATE"
+        printf '%s\n' "$((call + 1))" > "$GIT_FAIL_SECOND_STATE"
+        printf '%s\n' config
+        [ "$call" -eq 0 ] && exit 0
+        exit 1
+    fi
+    printf '%s\n' src/ngx_http_cache_turbo_shm.c
+    exit 1
+fi
+exec "${REAL_GIT:?}" "$@"
+GITEOF
+chmod +x "$listroot/bin/git"
+cat > "$listroot/bin/grep" <<'GREPEOF'
+#!/usr/bin/env bash
+if [ -n "${GREP_FAIL_FILTER:-}" ] && [ "${1:-}" = "-Ev" ]; then
+    printf '%s\n' src/ngx_http_cache_turbo_module.c
+    : > "${GREP_FAIL_FILTER_MARKER:?}"
+    exit 2
+fi
+if [ -n "${GREP_FAIL_YAML_SUBSET:-}" ] && [ "${1:-}" = "-E" ] \
+   && [ "${2:-}" = '^\.github/workflows/' ]; then
+    exit 2
+fi
+if [ -n "${GREP_FAIL_RULE_IDS:-}" ] && [ "${1:-}" = "-rhE" ]; then
+    printf '%s\n' \
+        'id: c-memcpy-sizeof-pointer' \
+        'id: c-sizeof-wrong-operand' \
+        'id: c-unbounded-string-copy' \
+        'id: c-format-string' \
+        'id: c-shell-exec'
+    exit 1
+fi
+exec "${REAL_GREP:?}" "$@"
+GREPEOF
+chmod +x "$listroot/bin/grep"
+cat > "$listroot/bin/ast-grep" <<'ASTEOF'
+#!/usr/bin/env bash
+exit 0
+ASTEOF
+chmod +x "$listroot/bin/ast-grep"
+cat > "$listroot/bin/yamllint" <<'YAMLEOF'
+#!/usr/bin/env bash
+exit 0
+YAMLEOF
+chmod +x "$listroot/bin/yamllint"
+for tool in actionlint zizmor; do
+    cat > "$listroot/bin/$tool" <<'WORKFLOWEOF'
+#!/usr/bin/env bash
+[ -z "${YAML_REJECT_WORKFLOW_TOOLS:-}" ] || exit 99
+for arg in "$@"; do
+    [ "$arg" = "${YAML_EXPECT_WORKFLOW:-}" ] && exit 0
+done
+exit 1
+WORKFLOWEOF
+    chmod +x "$listroot/bin/$tool"
+done
+
+lint_file_wrappers=(
+    ci/linter/lint-astgrep.sh
+    ci/linter/lint-c.sh
+    ci/linter/lint-ci-cadence.sh
+    ci/linter/lint-ci-ports.sh
+    ci/linter/lint-ci-runners.sh
+    ci/linter/lint-ci-secrets.sh
+    ci/linter/lint-docs-drift.sh
+    ci/linter/lint-nginx.sh
+    ci/linter/lint-perl.sh
+    ci/linter/lint-python.sh
+    ci/linter/lint-sh.sh
+    ci/linter/lint-shm-lock.sh
+    ci/linter/lint-spelling.sh
+    ci/linter/lint-stripe-seam.sh
+    ci/linter/lint-suite-docs.sh
+    ci/linter/lint-sync-stamp.sh
+    ci/linter/lint-yaml.sh
+)
+
+# Keep the test inventory equal to the wrappers that actually call the shared
+# loader. Both sets are sorted before comparison; no producer runs behind
+# process substitution, so an inventory-build failure cannot look like a match.
+actual_wrappers=()
+for wrapper in ci/linter/lint-*.sh; do
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^[[:space:]]*lint_files_into[[:space:]] ]]; then
+            actual_wrappers+=("$wrapper")
+            break
+        fi
+    done < "$wrapper"
+done
+if actual_sorted="$(printf '%s\n' "${actual_wrappers[@]}" | LC_ALL=C sort)" \
+   && expected_sorted="$(printf '%s\n' "${lint_file_wrappers[@]}" | LC_ALL=C sort)"; then
+    if [ "$actual_sorted" = "$expected_sorted" ]; then
+        echo "ok   every lint_files_into wrapper has producer and empty controls"
+    else
+        echo "FAIL lint_files_into wrapper-control inventory differs" >&2
+        printf 'actual wrappers:\n%s\nexpected wrappers:\n%s\n' \
+            "$actual_sorted" "$expected_sorted" >&2
+        rc=1
+    fi
+else
+    echo "FAIL could not sort lint_files_into wrapper-control inventory" >&2
+    rc=1
+fi
+
+for wrapper in "${lint_file_wrappers[@]}"; do
+    case_ 2 "${wrapper##*/}: a failing file-list producer is exit 2" \
+        env PATH="$listroot/bin:$PATH" REAL_GIT="$(command -v git)" \
+        REAL_GREP="$(command -v grep)" \
+        LINT_MODE=all "$wrapper"
+    case_ 0 "${wrapper##*/}: a legitimate empty selection stays clean" \
+        "$wrapper" ci/linter/no-such-selection
+done
+
+# lint-sh.sh has two independent selections. Prove the second one is not merely
+# converted in the diff while the first return still determines the verdict.
+rm -f -- "$listroot/second-call"
+case_ 2 "lint-sh.sh: its second file-list producer also propagates failure" \
+    env PATH="$listroot/bin:$PATH" REAL_GIT="$(command -v git)" \
+    REAL_GREP="$(command -v grep)" \
+    GIT_FAIL_SECOND_STATE="$listroot/second-call" LINT_MODE=all \
+    ci/linter/lint-sh.sh
+
+# Regex failure is "could not run", while a valid regex matching no selected
+# file is the legitimate empty case. Both go through the shared helper itself.
+case_ 2 "lint_files_into: an invalid filter regex is exit 2" \
+    bash -c '. ci/linter/lib.sh; files=(); lint_files_into files "[" ci/linter/lib.sh'
+# shellcheck disable=SC2016  # array expands in the inner bash, not this script
+case_ 0 "lint_files_into: a valid no-match clears the target array" \
+    bash -c '. ci/linter/lib.sh; files=(stale); lint_files_into files "^src/" ci/linter/lib.sh; [ "${#files[@]}" -eq 0 ]'
+
+# Exact old-code probe: the former grep filter emitted a plausible source path,
+# then exited 2; its trailing `|| true` masked that failure. The in-process
+# matcher must not invoke the shim at all. If a future refactor restores an
+# external filter, the marker makes the masked status observable.
+rm -f -- "$listroot/filter-grep-ran"
+# shellcheck disable=SC2016  # array/marker expand in the inner bash
+case_ 0 "lint_files_into: a partial-output grep filter cannot be masked" \
+    env PATH="$listroot/bin:$PATH" REAL_GIT="$(command -v git)" \
+    REAL_GREP="$(command -v grep)" GIT_LS_FILES_OK=1 GREP_FAIL_FILTER=1 \
+    GREP_FAIL_FILTER_MARKER="$listroot/filter-grep-ran" bash -c \
+    '. ci/linter/lib.sh; files=(); lint_files_into files "^src/.*\\.[ch]$"; [ "${#files[@]}" -eq 1 ]; [ ! -e "$GREP_FAIL_FILTER_MARKER" ]'
+
+# The ast-grep wrapper builds a second filesystem-backed work list from the
+# vendored rule tree. A complete plausible promoted set must not turn a later
+# traversal/read failure into a KNOWN array that passes the membership guard.
+case_ 2 "lint-astgrep.sh: a failing rule-id producer is exit 2" \
+    env PATH="$listroot/bin:$PATH" REAL_GIT="$(command -v git)" \
+    REAL_GREP="$(command -v grep)" \
+    GREP_FAIL_RULE_IDS=1 ci/linter/lint-astgrep.sh \
+    src/ngx_http_cache_turbo_module.c
+
+# lint-yaml's workflow subset is selected in-process. Pin both directions with
+# real wrapper runs and fake external tools: a workflow path reaches both
+# workflow linters, while an ordinary YAML path must not call either one.
+case_ 0 "lint-yaml.sh: a workflow path reaches the workflow linters" \
+    env PATH="$listroot/bin:$PATH" REAL_GIT="$(command -v git)" \
+    YAML_EXPECT_WORKFLOW=.github/workflows/lint.yml \
+    ci/linter/lint-yaml.sh .github/workflows/lint.yml
+case_ 0 "lint-yaml.sh: a non-workflow YAML path leaves WF empty" \
+    env PATH="$listroot/bin:$PATH" REAL_GIT="$(command -v git)" \
+    YAML_REJECT_WORKFLOW_TOOLS=1 \
+    ci/linter/lint-yaml.sh ci/ast-grep/sgconfig.yml
+
+# Old-code mutation control: the former grep selector normalised grep's exit 2
+# to an empty WF and skipped both workflow tools. The Bash case loop never
+# calls grep, reaches the deliberately rejecting tools, and therefore exits 1.
+case_ 1 "lint-yaml.sh: subset grep failure cannot become empty-clean" \
+    env PATH="$listroot/bin:$PATH" REAL_GIT="$(command -v git)" \
+    REAL_GREP="$(command -v grep)" GREP_FAIL_YAML_SUBSET=1 \
+    YAML_REJECT_WORKFLOW_TOOLS=1 \
+    ci/linter/lint-yaml.sh .github/workflows/lint.yml
+
+# ----------------------------------------------------------------------------
 # The shm-checker mutation controls.
 #
 # CARVE-INIT-NO-NEGATIVE-CONTROL: the three shm checkers (carve-init, shm-lock,
@@ -357,9 +565,74 @@ case_ 2 "policy runners: unparsable YAML is exit 2, not clean" \
 # catch, applied to the checkers rather than to the dispatcher.
 #
 # These cases DO invoke a real checker, unlike every case above. They stay
-# within the suite budget by running against a generated fixture tree of two
-# small files rather than the real src/, so no build and no scan of the
-# 34k-line source is involved.
+# within the suite budget by running against generated fixture trees rather
+# than the real src/, so no build and no scan of the 34k-line source is
+# involved.
+#
+# shm-lock and stripe-seam need no C parser, so one tiny textual fixture can
+# drive both. stripe-seam's key-directed ledger is part of the real checker;
+# define each ledgered function so its clean arm exercises that path too.
+checkerroot="$(mktemp -d)"
+trap 'rm -rf "$badroot" "$listroot" "$checkerroot"' EXIT
+mkdir -p "$checkerroot/src" "$checkerroot/ci/tools"
+cp ci/tools/lint-shm-lock.sh ci/tools/lint-stripe-seam.sh \
+    "$checkerroot/ci/tools/"
+: > "$checkerroot/src/control.c"
+for fn in \
+    ngx_http_cache_turbo_shm_lookup \
+    ngx_http_cache_turbo_shm_store_locked \
+    ngx_http_cache_turbo_shm_store \
+    ngx_http_cache_turbo_shm_store_if \
+    ngx_http_cache_turbo_shm_store_marker \
+    ngx_http_cache_turbo_shm_purge_key \
+    ngx_http_cache_turbo_shm_freshen \
+    ngx_http_cache_turbo_shm_drop_locked \
+    ngx_http_cache_turbo_shm_admit \
+    ngx_http_cache_turbo_shm_claim \
+    ngx_http_cache_turbo_shm_claim_locked \
+    ngx_http_cache_turbo_shm_unstub \
+    ngx_http_cache_turbo_shm_owns \
+    ngx_http_cache_turbo_shm_resolve_miss \
+    ngx_http_cache_turbo_shm_l2_neg_check \
+    ngx_http_cache_turbo_shm_l2_neg_set \
+    ngx_http_cache_turbo_shm_varidx_pending_set \
+    ngx_http_cache_turbo_shm_touch_lru; do
+    printf '%s(void)\n{\n}\n' "$fn" >> "$checkerroot/src/control.c"
+done
+
+# shellcheck disable=SC2329  # invoked indirectly, by name, via case_()
+shm_lock_lint() {
+    # shellcheck disable=SC2317
+    env -C "$checkerroot" bash ci/tools/lint-shm-lock.sh
+}
+
+# shellcheck disable=SC2329  # invoked indirectly, by name, via case_()
+stripe_seam_lint() {
+    # shellcheck disable=SC2317
+    env -C "$checkerroot" bash ci/tools/lint-stripe-seam.sh
+}
+
+case_ 0 "shm-lock: a clean lock discipline fixture passes" shm_lock_lint
+cat >> "$checkerroot/src/control.c" <<'SHMEOF'
+shm_lock_violation(void)
+{
+    ngx_shmtx_lock(&zone->mutex);
+    ngx_http_finalize_request(r, rc);
+    ngx_shmtx_unlock(&zone->mutex);
+}
+SHMEOF
+finding_case_ "shm-lock: a yielding call under the mutex is caught" \
+    'yielding call under shm mutex' shm_lock_lint
+
+case_ 0 "stripe-seam: a resolver-only fixture passes" stripe_seam_lint
+cat >> "$checkerroot/src/control.c" <<'STRIPEEOF'
+stripe_seam_violation(void)
+{
+    zone->shpool = pool;
+}
+STRIPEEOF
+finding_case_ "stripe-seam: a bare zone pool dereference is caught" \
+    'bare zone shm dereference outside the stripe resolver' stripe_seam_lint
 #
 # THE FIXTURES ARE NOW COMPLETE, WELL-TYPED C. carve-init parses with clang
 # rather than lexing with awk, and clang's error recovery replaces the
@@ -372,7 +645,7 @@ case_ 2 "policy runners: unparsable YAML is exit 2, not clean" \
 # on a fixture it cannot parse rather than guessing, so a fixture that drifts
 # out of compiling turns its row red rather than quietly vacuous.
 mutroot="$(mktemp -d)"
-trap 'rm -rf "$badroot" "$mutroot"' EXIT
+trap 'rm -rf "$badroot" "$listroot" "$checkerroot" "$mutroot"' EXIT
 mkdir -p "$mutroot/src" "$mutroot/ci/tools"
 cp ci/tools/lint-carve-init.sh ci/tools/carve_init_ast.py "$mutroot/ci/tools/"
 

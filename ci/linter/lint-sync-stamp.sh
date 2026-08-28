@@ -22,7 +22,7 @@
 # shellcheck source=ci/linter/lib.sh
 . "$(git rev-parse --show-toplevel)/ci/linter/lib.sh"
 
-mapfile -t FILES < <(lint_files '^\.github/(workflows/.*\.ya?ml|scripts/.*\.sh|actions/.*/action\.ya?ml)$' "$@")
+lint_files_into FILES '^\.github/(workflows/.*\.ya?ml|scripts/.*\.sh|actions/.*/action\.ya?ml)$' "$@"
 [ "${#FILES[@]}" -gt 0 ] || { echo "lint-sync-stamp: no stamped files to check"; exit 0; }
 
 # Whole-tree by nature: --check walks its own target set, so the file list only

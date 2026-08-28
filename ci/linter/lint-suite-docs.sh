@@ -37,7 +37,7 @@
 . "$(git rev-parse --show-toplevel)/ci/linter/lib.sh"
 
 # Relevant to a change that touches the suite, its docs, or the module itself.
-mapfile -t FILES < <(lint_files '^(ci/t/|ci/tools/|docs/|src/|README\.md)' "$@")
+lint_files_into FILES '^(ci/t/|ci/tools/|docs/|src/|README\.md)' "$@"
 [ "${#FILES[@]}" -gt 0 ] || { echo "lint-suite-docs: nothing relevant to check"; exit 0; }
 
 echo "lint-suite-docs: ${#FILES[@]} file(s)"
