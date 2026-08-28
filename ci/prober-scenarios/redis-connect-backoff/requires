@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -eu
+
+FLAVOR="${2:-nginx}"
+VERSION="${3:-1.31.3}"
+BUILD="${PROBER_BUILD:-${PROBER_ROOT:-.}/.build/${FLAVOR}-${VERSION}}"
+SO="$BUILD/objs/ngx_http_cache_turbo_module.so"
+
+if [ ! -f "$SO" ]; then
+    echo "cache_turbo module .so not found in $BUILD/objs -- stage the testkit tree first"
+    exit 1
+fi
+if ! command -v nm >/dev/null 2>&1 \
+        || ! nm "$SO" 2>/dev/null | grep -q 'ngx_http_cache_turbo_redis_test_backoff_skips'; then
+    echo "$SO is not a test-harness build -- the backoff counter oracle would be absent"
+    exit 1
+fi
+if ! command -v redis-server >/dev/null 2>&1 \
+        || ! command -v redis-cli >/dev/null 2>&1; then
+    echo "redis-server and redis-cli are required for the healthy L2 negative control"
+    exit 1
+fi

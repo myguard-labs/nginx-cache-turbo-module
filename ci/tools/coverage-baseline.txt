@@ -115,8 +115,20 @@
 #   two measurements share a code surface, not a sign the harness under-ran.
 #
 # STILL-UNCOVERED, 1734 branch-lines, by reachability class (COVERAGE.md's
-# four classes; file-level triage below, not yet line-by-line for every file
-# -- that is the TODO row this baseline exists to seed):
+# four classes).  This classification is of the committed 2026-08-27
+# +prober snapshot above, at f696b13; line numbers come from that snapshot.
+# It is deliberately file-level: every missing line in a named file has the
+# disposition stated for that file.  The exact line sets are the `Missing`
+# columns produced by the regenerate commands above, less the nine lines in
+# THE DIFF.  Counts therefore remain reproducible without copying a second,
+# soon-stale 1,734-number list into this work-scoping artifact.
+#
+# IMPORTANT SCOPE: "defensively unreachable" below means unreachable from the
+# CURRENT SIX PROBER LEGS by their configuration topology.  It does not claim
+# that the production functions are dead or impossible to reach: the ordinary
+# runtime suite reaches both drivers.  This is the useful disposition for this
+# booted-nginx, prober-leg comparison, whose question is which new scenario
+# topology is required.  It must not be quoted as an absolute code invariant.
 #
 #   defensively-unreachable-by-topology (structural, PROVEN not measured):
 #     src/ngx_http_cache_turbo_redis.c      284 lines uncovered
@@ -131,14 +143,72 @@
 #     test_runtime.py suite runs redis+memcached fixtures directly (58%/47%
 #     baseline branch coverage on these two files, non-zero).
 #
-#   everything else (module.c 369, conf.c 247, match.c 139, filters.c 131,
-#   access.c 129, shm.c 115, vary.c 94, memcached.c/redis.c already counted
-#   above, admin.c 44, purge.c 27, blob.c 24, probe.c 14, autotune.c 5,
-#   internal.h 1): NOT triaged into reachable-untested / fault-injection-only
-#   / defensively-unreachable / dead yet. Per-line classification of ~1300
-#   lines across 13 files is out of scope for the run that produced this
-#   baseline (S17/S18) -- see TODO.md rows filed alongside this file. Full
-#   line lists for every file are reproducible from the regenerate command
-#   above; this file intentionally does not inline all 1734 line numbers, to
-#   stay reviewable -- the counts here are the scoping signal, the full lists
-#   live in the regenerated coverage.txt.
+#   reachable-untested by the current prober legs (real configuration, request,
+#   response, admin, lifecycle, or test-probe input drives the file):
+#     src/ngx_http_cache_turbo_module.c      369 lines
+#       Main request/content/filter/lifecycle glue; every current scenario
+#       loads it, but their small request matrix does not select every arm.
+#     src/ngx_http_cache_turbo_conf.c        247 lines
+#       Directive parsers and merge functions; a finite nginx.conf fixture
+#       selects only a subset of valid and invalid configuration inputs.
+#     src/ngx_http_cache_turbo_match.c       139 lines
+#       URI/argument/cookie matchers; the configured rules and request strings
+#       are real controllable inputs, while the six legs exercise few of them.
+#     src/ngx_http_cache_turbo_filters.c     131 lines
+#       Request/response headers, status, body shape, and store outcome select
+#       these arms; all are scenario-controlled surfaces.
+#     src/ngx_http_cache_turbo_access.c      129 lines
+#       HIT/MISS/stale/breaker/L2 request state selects these arms; the six
+#       legs cover only a subset of the state-and-directive product.
+#     src/ngx_http_cache_turbo_shm.c         115 lines
+#       Zone size, object churn, expiry, concurrency and fault_slab select the
+#       paths.  S24 proves the fault seam is live, but does not exhaust it.
+#     src/ngx_http_cache_turbo_vary.c         94 lines
+#       Vary, Accept-Encoding, User-Agent and configured ignore rules are
+#       direct request/config inputs.
+#     src/ngx_http_cache_turbo_admin.c        44 lines
+#       Admin method, selector, payload and warm/purge outcomes are direct
+#       inputs; the present legs do not enumerate the admin API.
+#     src/ngx_http_cache_turbo_purge.c        27 lines
+#       Key/tag/all selectors and backend outcomes drive these paths.
+#     src/ngx_http_cache_turbo_blob.c         24 lines
+#       Stored wire bytes, header tables and digest provider outcomes drive
+#       validation/encoding branches; malformed blobs need adversarial cases.
+#     src/ngx_http_cache_turbo_probe.c        14 lines
+#       The TEST_FAULTS-only probe URI, command and allocation outcomes are
+#       controllable in a probe-enabled scenario; S24 reaches only fault_set.
+#     src/ngx_http_cache_turbo_autotune.c      5 lines
+#       Real sample values and elapsed intervals select these pure-C arms.
+#     src/ngx_http_cache_turbo_internal.h      1 line
+#       The inline helper is called by request code; its alternate operand is
+#       input/state-selectable rather than an invariant guard.
+#     subtotal                              1339 lines
+#
+#   reachable-only-under-fault-injection:      0 lines classified at FILE
+#     granularity.  Several lines in the reachable files are allocation or I/O
+#     failure arms, but this snapshot does not retain branch-arc identity in
+#     its text report.  Re-labelling an entire source line from spelling alone
+#     would invent which untaken arc gcov meant.  Keep those lines in the
+#     conservative reachable-untested work queue until an arc-preserving
+#     report and a failing fault oracle promote them to this narrower class.
+#
+#   dead:                                      0 lines proven.  Every listed
+#     translation unit has a production or TEST_FAULTS caller.  An uncovered
+#     arm is not evidence of a caller-less function, so no deletion is scoped.
+#
+#   accounting: 1339 reachable-untested + 395 defensively unreachable from the
+#   current prober topology + 0 fault-only proven + 0 dead = 1734.
+#
+# TOPOLOGY-CHANGING L2 CASE IMPLEMENTED AFTER THIS SNAPSHOT:
+#   ci/prober-scenarios/redis-connect-backoff targets the Redis connect/backoff
+#   path at
+#   src/ngx_http_cache_turbo_redis.c:888 in the f696b13 snapshot with a new
+#   Redis-configured prober leg.  Use an intentionally closed loopback port:
+#   the first cacheable request must emit the driver's connect-failure log and
+#   arm backoff; an immediate second request must increment the TEST_FAULTS
+#   redis-backoff-skip observable exactly once without emitting a second
+#   connect-failure log.  A healthy Redis fixture is the
+#   negative control: neither oracle may fire, and a second request must be an
+#   L2-backed HIT.  The 1734-line accounting above intentionally remains the
+#   named f696b13 snapshot; the next measured refresh must add this scenario
+#   to the regenerate command and record its actual line delta.

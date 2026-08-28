@@ -1,0 +1,65 @@
+@LOAD@
+load_module @BUILD_OBJS@/ngx_http_cache_turbo_module.so;
+daemon off;
+pid @PREFIX@/nginx.pid;
+error_log @PREFIX@/logs/error.log info;
+worker_processes 1;
+events { worker_connections 64; }
+
+http {
+    cache_turbo_zone name=healthy_a 8m;
+    cache_turbo_zone name=healthy_b 8m;
+    cache_turbo_zone name=dead 8m;
+    access_log off;
+
+    server {
+        listen 127.0.0.1:@PORT@;
+
+        location /origin {
+            access_log @PREFIX@/logs/origin.log combined;
+            default_type text/plain;
+            return 200 "redis-backoff-payload\n";
+        }
+
+        # The dead-backend leg must launch exactly one L2 operation per
+        # request.  no-store prevents the post-origin Redis SET from becoming
+        # a second fail-fast skip, leaving the object GET as the sole oracle.
+        location /dead-origin {
+            default_type text/plain;
+            add_header Cache-Control "no-store" always;
+            return 200 "redis-backoff-dead-payload\n";
+        }
+
+        # Two independent L1 zones with one key and one healthy Redis backend.
+        # The second location can only HIT without an origin visit by filling
+        # its cold L1 from L2; this is the negative control for the dead peer.
+        location /healthy-a/ {
+            cache_turbo healthy_a;
+            cache_turbo_key "redis-backoff-healthy";
+            cache_turbo_valid 60s;
+            cache_turbo_redis 127.0.0.1:@REDIS_PORT@ db=0 prefix=ctbo:;
+            proxy_pass http://127.0.0.1:@PORT@/origin;
+        }
+        location /healthy-b/ {
+            cache_turbo healthy_b;
+            cache_turbo_key "redis-backoff-healthy";
+            cache_turbo_valid 60s;
+            cache_turbo_redis 127.0.0.1:@REDIS_PORT@ db=0 prefix=ctbo:;
+            proxy_pass http://127.0.0.1:@PORT@/origin;
+        }
+
+        # A closed loopback port makes the first request take the real connect
+        # failure and the immediate second request take the fail-fast branch.
+        cache_turbo_lock off;
+        location /dead/ {
+            cache_turbo dead;
+            cache_turbo_key $uri;
+            cache_turbo_valid 60s;
+            cache_turbo_auto_vary off;
+            cache_turbo_redis 127.0.0.1:@DEAD_PORT@ db=0 prefix=ctbo-dead: connect_backoff=5s;
+            proxy_pass http://127.0.0.1:@PORT@/dead-origin;
+        }
+
+        location /__probe { @PROBE@ }
+    }
+}

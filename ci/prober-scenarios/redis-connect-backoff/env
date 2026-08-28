@@ -1,0 +1,45 @@
+# shellcheck shell=bash
+# shellcheck disable=SC2034  # variables are consumed by run-scenario.sh
+# Sourced after prober_resolve and before configuration rendering.
+PROBER_PROBE='cache_turbo_probe healthy_a;'
+prober_make_prefix
+
+CT_REDIS_PORT=$(( PROBER_RESOLVED_PORT + 21 ))
+CT_DEAD_PORT=$(( PROBER_RESOLVED_PORT + 22 ))
+CT_REDIS_LOG="$PROBER_PREFIX/logs/redis.log"
+
+for _ct_port in "$CT_REDIS_PORT" "$CT_DEAD_PORT"; do
+    if (exec 3<>"/dev/tcp/127.0.0.1/$_ct_port") 2>/dev/null; then
+        echo "Bail out! required fixture port $_ct_port is already in use"
+        exit 1
+    fi
+done
+
+redis-server --port "$CT_REDIS_PORT" \
+             --bind 127.0.0.1 \
+             --save '' \
+             --appendonly no \
+             --dbfilename '' \
+             --daemonize no \
+             --logfile "$CT_REDIS_LOG" \
+             --dir "$PROBER_PREFIX" &
+CT_REDIS_PID=$!
+# Let the harness's already-installed EXIT trap own Redis. This closes every
+# path, including a render/config/boot failure before driver.sh is invoked.
+PROBER_BACKEND_PID="$CT_REDIS_PID"
+export CT_REDIS_PORT CT_DEAD_PORT CT_REDIS_PID CT_REDIS_LOG
+
+CT_REDIS_UP=0
+for _i in $(seq 1 100); do
+    if (exec 3<>"/dev/tcp/127.0.0.1/$CT_REDIS_PORT") 2>/dev/null; then
+        CT_REDIS_UP=1
+        break
+    fi
+    sleep 0.05
+done
+export CT_REDIS_UP
+
+sed -e "s#@REDIS_PORT@#${CT_REDIS_PORT}#g" \
+    -e "s#@DEAD_PORT@#${CT_DEAD_PORT}#g" \
+    "$SCENARIO/server.conf.in" > "$PROBER_PREFIX/server.conf"
+export PROBER_CONF="$PROBER_PREFIX/server.conf"
