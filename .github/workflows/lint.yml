@@ -1,4 +1,4 @@
-# sync-sha: e4a7b7590c5d20655a01c3055d1e5212bae6661b63b22129c2bf56fb9ae971f7
+# sync-sha: 09155a7435c4635272c326ee16ff0b27941096204a99bd8530e2e55da8ab333f
 name: Lint
 
 # The same ci/linter/ scripts a developer runs locally, run again on the PR --
@@ -74,6 +74,30 @@ jobs:
         # The step below narrows the run with LINT_ONLY, so a silent selector
         # is exactly the failure that would make this whole job vacuous.
         run: ci/linter/selftest.sh
+
+      - name: Configure an nginx tree for the carve-init parser
+        # lint-carve-init.sh parses the module header with clang against
+        # nginx's real include set, so it needs a tree where ./configure has
+        # run -- ALL_INCS does not exist before that. It does NOT need one that
+        # has been compiled, and `configure` mode stops before make, so this
+        # costs seconds.
+        #
+        # Before that checker used clang it read the header as text and needed
+        # nothing, which is why this job never had a tree. Dropping carve-init
+        # from LINT_ONLY instead would be the cheaper edit and the wrong one:
+        # selftest.sh asserts LINT_ONLY equals the lint-*.sh glob minus "c",
+        # and a checker that runs on the hook but never on a PR is the quieter
+        # half of a gate that is not really a gate.
+        run: |
+          # BUILD_ROOT keeps this tree OUT of .build/, which ci/tests/unit/run.sh
+          # auto-discovers. That suite gates on objs/ngx_auto_config.h and is
+          # meant to SKIP in this job -- the Runtime job, which has a COMPILED
+          # tree, is the one that runs it. `configure` mode stops before make,
+          # so a tree at the default path would satisfy that gate with no .o
+          # files behind it and the suite would die measuring the shm node.
+          tree="$(BUILD_ROOT="$PWD/.carve-tree" bash ci/tools/ci-build.sh nginx "" configure | sed -n 's/^tree=//p')"
+          [ -n "$tree" ] || { echo "ci-build.sh printed no tree= line" >&2; exit 1; }
+          echo "NGX_SRC_TREE=$tree" >> "$GITHUB_ENV"
 
       - name: Run linters
         env:

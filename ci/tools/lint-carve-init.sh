@@ -6,32 +6,66 @@
 # initialised at zone carve (CARVE-INIT).
 #
 # WHY THIS CANNOT BE A RUNTIME TEST. The shctx is carved once per zone by a
-# single ngx_slab_alloc() in ngx_http_cache_turbo_shm_init_zone(), which
-# does NOT zero
-# its return -- but on the fresh-carve path the slab arena is backed by freshly
-# mapped anonymous memory, which the kernel hands over already zeroed. So an
-# omitted initialiser reads 0 anyway, every test passes, and the omission is
-# invisible from the outside. The correctness of ~70 counters, gauges and
-# token sources therefore rests on an allocator property that nothing in the
-# module asserts and that one ngx_slab_calloc free-list reuse would end. That
-# is a structural invariant, so it needs a structural gate -- the same shape of
-# argument as lint-stripe-seam.sh, which is likewise invisible at today's N==1.
+# single ngx_slab_alloc() in ngx_http_cache_turbo_shm_init_zone(), which does
+# NOT zero its return -- but on the fresh-carve path the slab arena is backed
+# by freshly mapped anonymous memory, which the kernel hands over already
+# zeroed. So an omitted initialiser reads 0 anyway, every test passes, and the
+# omission is invisible from the outside. The correctness of ~70 counters,
+# gauges and token sources therefore rests on an allocator property that
+# nothing in the module asserts and that one ngx_slab_calloc free-list reuse
+# would end. That is a structural invariant, so it needs a structural gate --
+# the same shape of argument as lint-stripe-seam.sh, which is likewise
+# invisible at today's N==1.
 #
 # The audit that prompted this (2026-08) was performed by eye and named five
 # missing fields. Re-running it mechanically found EIGHT: markers, bg_inflight
 # and owner_seq had been missed by the same reading that produced the list.
 # owner_seq is the one that would have hurt -- claim() issues ++owner_seq as a
 # never-reused single-flight token, and a garbage start can collide with a
-# recycled node's stale refresh_owner. That miss rate is the case for this
-# file existing: the manual pass is not reliable at this member count.
+# recycled node's stale refresh_owner. That miss rate is the case for this file
+# existing: the manual pass is not reliable at this member count.
 #
-# WHAT IT CHECKS. Every member declared in ngx_http_cache_turbo_shctx_t must
-# appear as an `sh->NAME =` assignment inside the carve block of
-# ngx_http_cache_turbo_shm_init_zone().
-# Explicit padding members (_pad*) are exempt: they are layout, never read.
+# THIS IS A PARSER, NOT A LEXER. The member harvest and the initialiser harvest
+# were previously a hand-written awk lexer over the two files. Five consecutive
+# review rounds each found a Major defect in the fix from the round before, and
+# every one of them lived in the lexical model rather than in the invariant:
+# a block comment that opened an initialiser window and never closed it, a line
+# continuation inside a `//` comment, a bitfield width that made a member
+# vanish from the gate entirely, a parenthesised declarator whose name is not
+# the last token, CRLF records that defeated the phase-2 splice, and a prefix
+# __attribute__ that deleted the member name. Each fix was correct; each grew a
+# new surface, because a lexer approximating C is an open-ended set of shapes
+# and the gate is only as good as the shapes someone thought of.
+#
+# clang is not an approximation. It performs translation phases 1-8 exactly, so
+# line splicing, CRLF, comments, string and char literals, trigraphs, digraphs,
+# attributes in any position, bitfields, macros and every declarator form are
+# handled by the same code that compiles the module. The whole class is closed
+# by construction rather than one shape at a time.
+#
+# THE COST is that this gate now needs a CONFIGURED nginx tree to parse
+# against, because the header only makes sense with nginx's own headers around
+# it. `configure` alone is enough -- no compilation, about three seconds -- and
+# if no tree can be found this script exits 2 LOUDLY. A parser that cannot
+# parse must never look like a clean gate; that is the single property the
+# whole design rests on.
+#
+# BOTH CONFIGURATIONS ARE CHECKED. Four members sit behind
+# `#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS)` and so do their carve stores.
+# The old lexer skipped `#` lines and harvested every member unconditionally;
+# it happened to agree, but only by being blind to both halves at once. A
+# parser sees exactly one configuration per run, so the gate runs once per
+# configuration and each must be self-consistent -- which additionally catches
+# a member added under the guard whose store was added outside it.
 #
 # Usage: ci/tools/lint-carve-init.sh   (no arguments; the invariant spans a
 #                                       fixed pair of files)
+#   Env: NGX_SRC_TREE  a configured nginx tree to parse against; otherwise the
+#                      trees under .build/ are searched.
+#        CARVE_INIT_CLANG  clang to use (default: clang).
+#        CARVE_INIT_CONFIGS  `both` (default) or `default` for the production
+#                      configuration only; the selftest fixtures use the
+#                      latter because none of them is TEST_FAULTS-sensitive.
 # Exit:  0 clean, 1 a member has no initialiser, 2 could not run.
 
 set -euo pipefail
@@ -44,165 +78,184 @@ cd "$(dirname "$0")/../.."
 
 HDR=src/ngx_http_cache_turbo_module.h
 SRC=src/ngx_http_cache_turbo_shm.c
+AST=ci/tools/carve_init_ast.py
 
-for f in "$HDR" "$SRC"; do
+for f in "$HDR" "$SRC" "$AST"; do
     [ -f "$f" ] || {
         echo "lint-carve-init: $f missing -- refusing to report ok on an empty scan" >&2
         exit 2
     }
 done
 
-# --- 1. the declared members -------------------------------------------------
-#
-# Delimited by the struct's own opening and closing lines rather than fixed line
-# numbers, so the check follows the struct as the header is edited. Comment
-# bodies are dropped first (a `*`-prefixed continuation line can otherwise end
-# in `;` and read as a declaration), then any line ending in `;` at one level of
-# brace nesting is a member and its name is the last identifier before the `;`,
-# past any array bound or __attribute__.
-#
-# Both delimiters are REQUIRED to have matched. An awk that only sets `inside`
-# on the opener runs to end-of-file when the closing line changes spelling, and
-# harvests the members of every struct that follows -- reporting a screenful of
-# bogus names as "uninitialised" (exit 1) instead of admitting it could not
-# parse (exit 2). Caught by mutation: renaming the closing typedef produced a
-# 190-name failure list naming fields of unrelated structs.
-members="$(awk '
-    /^typedef struct ngx_http_cache_turbo_shctx_s \{/ { inside = 1; opened = 1; next }
-    inside && /^\} ngx_http_cache_turbo_shctx_t;/     { inside = 0; closed = 1 }
-    /^\}/ && inside && !closed                        { unterminated = 1 }
-    !inside { next }
-    /^[[:space:]]*\*/  { next }        # block-comment continuation
-    /^[[:space:]]*\/\*/ { next }       # block-comment opener
-    /^[[:space:]]*#/   { next }        # preprocessor
-    {
-        line = $0
-        sub(/\/\*.*/, "", line)        # trailing comment
-        sub(/\/\/.*/, "", line)
-        if (line !~ /;/) next
-        sub(/;.*/, "", line)
-        sub(/__attribute__.*/, "", line)
-        sub(/\[[^]]*\]/, "", line)     # array bound
-        gsub(/[[:space:]]+$/, "", line)
-        # A declaration may carry several declarators: `ngx_uint_t a, b;`.
-        # Taking only the last identifier would hide every earlier name from
-        # the gate permanently, so split on ',' and take the last identifier of
-        # EACH declarator. Latent when written (the struct has no comma
-        # declarators today); fixed so adding one cannot silently open a hole.
-        ndecl = split(line, decls, /,/)
-        for (d = 1; d <= ndecl; d++) {
-            piece = decls[d]
-            sub(/\[[^]]*\]/, "", piece)      # per-declarator array bound
-            gsub(/^[[:space:]]+|[[:space:]]+$/, "", piece)
-            if (piece == "") continue
-            n = split(piece, parts, /[[:space:]*]+/)
-            if (n == 0) continue
-            name = parts[n]
-            if (name ~ /^[A-Za-z_][A-Za-z0-9_]*$/) print name
-        }
-    }
-    END {
-        if (!opened) { print "ERR:no-opening-line" > "/dev/stderr"; exit 3 }
-        if (!closed) { print "ERR:no-closing-line" > "/dev/stderr"; exit 3 }
-        if (unterminated) { print "ERR:unterminated" > "/dev/stderr"; exit 3 }
-    }
-' "$HDR" | sort -u)" || {
-    echo "lint-carve-init: could not delimit ngx_http_cache_turbo_shctx_t in $HDR -- its opening 'typedef struct ngx_http_cache_turbo_shctx_s {' or closing '} ngx_http_cache_turbo_shctx_t;' line has changed. Refusing to guess at the member set." >&2
+CLANG="${CARVE_INIT_CLANG:-clang}"
+command -v "$CLANG" >/dev/null 2>&1 || {
+    echo "lint-carve-init: $CLANG not found. This gate parses the real C, so it" >&2
+    echo "      cannot fall back to a text scan -- that is the lexer this check" >&2
+    echo "      was rewritten to retire. Install clang (ci/linter/install-linters.sh)." >&2
     exit 2
 }
 
-if [ -z "$members" ]; then
-    echo "lint-carve-init: parsed ZERO members from $HDR -- refusing to report ok on an empty scan" >&2
-    exit 2
-fi
+CONFIGS="${CARVE_INIT_CONFIGS:-both}"
+case "$CONFIGS" in
+    both|default) ;;
+    *)
+        echo "lint-carve-init: invalid CARVE_INIT_CONFIGS=$CONFIGS" >&2
+        echo "      Expected 'both' or 'default'; refusing to skip a configuration." >&2
+        exit 2
+        ;;
+esac
 
-# --- 2. the members the carve block initialises ------------------------------
+# --- locate a configured nginx tree ------------------------------------------
 #
-# Bounded to the CARVE BLOCK, not the whole function: an `sh->x = ...` store
-# anywhere else in the file -- and, critically, anywhere else in this same
-# function -- must not count as carve initialisation.
+# A usable tree needs BOTH objs/Makefile (written by `configure`, and what
+# carries ALL_INCS) and nginx's own sources, because the include paths in
+# ALL_INCS are relative to the tree root and resolve to src/core and friends.
+# Testing only for the Makefile is not enough: ci-build.sh leaves per-mode
+# variant directories under .build/ that hold an objs/ and nothing else, and
+# one of those is usually the NEWEST match. Selecting it produced a parse that
+# failed on ngx_config.h -- a confusing error a long way from its cause.
 #
-# The window opens at the `st->sh = ngx_slab_alloc(` line and closes at the
-# first column-0 `}`. It deliberately does NOT open at the function's opening
-# line, because ngx_http_cache_turbo_shm_init_zone() has two early-return
-# branches ABOVE the slab alloc -- the `octx` reload inherit and the
-# `shm.exists` branch -- each of which legitimately stores `st->sh->admission`.
-# A window starting at the function opener swallows both, so a member
-# initialised ONLY in a reload branch would satisfy the gate. That placement is
-# exactly what the FAIL message below tells the developer not to do: it never
-# runs on a fresh carve, and on reload it overwrites inherited live state.
-# Caught by the agent review of this commit, reproduced by mutation.
-#
-# TWO accepted forms, because the block legitimately uses both:
-#   assignment       st->sh->hits = 0;
-#   initialiser call ngx_rbtree_init(&st->sh->rbtree, ...) / ngx_queue_init(&st->sh->lru)
-# The second is matched on `&...sh->NAME` -- passing a member's address to an
-# init helper is how the rbtree, its sentinel and the two queue heads are set
-# up, and treating those as uninitialised would make the gate unsatisfiable.
-# Note this deliberately does not try to prove the callee initialises what it
-# is handed; that is beyond a textual gate. It proves the member was not
-# FORGOTTEN, which is the failure class here.
-inits="$(awk '
-    # the carve block starts at the slab alloc, NOT at the function opener --
-    # see the comment above. Track the function too, so a same-named store in
-    # a LATER function cannot reopen the window.
-    /^ngx_http_cache_turbo_shm_init_zone\(/ { infn = 1 }
-    infn && /st->sh[[:space:]]*=[[:space:]]*ngx_slab_alloc\(/ { inside = 1 }
-    /^\}/ { if (inside) { inside = 0 } ; infn = 0 }
-    !inside { next }
-    {
-        line = $0
-        # assignment form
-        rest = line
-        # `[^-+*/%&|^<>!=]=[^=]` so a compound assignment (+=, |=, &=, ...) is
-        # NOT read as carve initialisation -- it mutates a value that must
-        # already exist. Latent when written: zero compound assigns in the
-        # carve block today.
-        while (match(rest, /sh->[A-Za-z_][A-Za-z0-9_]*[[:space:]]*[^-+*\/%&|^<>!=[:space:]]?=[^=]/)) {
-            s = substr(rest, RSTART + 4, RLENGTH - 4)
-            sub(/[[:space:]]*=.*/, "", s)
-            print s
-            rest = substr(rest, RSTART + RLENGTH)
-        }
-        # address-of form (initialiser call)
-        rest = line
-        while (match(rest, /&[A-Za-z_][A-Za-z0-9_.>-]*sh->[A-Za-z_][A-Za-z0-9_]*/)) {
-            s = substr(rest, RSTART, RLENGTH)
-            sub(/.*sh->/, "", s)
-            print s
-            rest = substr(rest, RSTART + RLENGTH)
-        }
-    }
-' "$SRC" | sort -u)"
+# A tree that has been configured but never compiled is entirely sufficient,
+# which is what keeps this affordable in a validation job that does not build.
+tree_usable() {
+    # Explicit if/return rather than an `&&`-list: `set -e` does not apply to a
+    # bare `&&`-list, so the list form leaves the second test's failure
+    # unenforced in some callers and, as the last command of a branch, can
+    # become the enclosing compound's status.
+    if [ ! -f "$1/objs/Makefile" ]; then
+        return 1
+    fi
+    if [ ! -f "$1/src/core/ngx_config.h" ]; then
+        return 1
+    fi
+    return 0
+}
 
-if [ -z "$inits" ]; then
-    echo "lint-carve-init: parsed ZERO initialisers from $SRC -- shm_init_zone's signature or brace style must have changed; this checker cannot report ok on an empty scan" >&2
-    exit 2
-fi
-
-# --- 3. the difference -------------------------------------------------------
-#
-# _pad* members are explicit layout filler. Nothing reads them, so they are the
-# one class that legitimately needs no store.
-missing=""
-for m in $members; do
-    case "$m" in
-        _pad*) continue ;;
-    esac
-    printf '%s\n' "$inits" | grep -qx -- "$m" || missing="$missing $m"
-done
-
-if [ -n "$missing" ]; then
-    echo "FAIL: ngx_http_cache_turbo_shctx_t member(s) never initialised at zone carve:" >&2
-    for m in $missing; do
-        echo "        $m" >&2
+find_tree() {
+    if [ -n "${NGX_SRC_TREE:-}" ]; then
+        tree_usable "$NGX_SRC_TREE" || return 1
+        printf '%s\n' "$NGX_SRC_TREE"
+        return 0
+    fi
+    # Newest first, so a refreshed tree wins over a stale one. A glob cannot
+    # order by mtime, and iterating `ls` output breaks on paths with spaces --
+    # so the candidates come from a glob (safe) and the newest usable one is
+    # chosen by comparing with `-nt` (no parsing at all).
+    local d best=""
+    for d in .build/nginx-*/; do
+        d="${d%/}"
+        [ -d "$d" ] || continue          # no match: the glob stayed literal
+        tree_usable "$d" || continue
+        if [ -z "$best" ] || [ "$d/objs/Makefile" -nt "$best/objs/Makefile" ]; then
+            best="$d"
+        fi
     done
-    echo "      ngx_slab_alloc() does not zero. Add an 'st->sh->NAME = ...;' to the" >&2
-    echo "      carve block in ngx_http_cache_turbo_shm_init_zone() ($SRC)." >&2
-    echo "      Do NOT add it to the shm.exists reload branch: that path deliberately" >&2
-    echo "      inherits live state across a SIGHUP and zeroing there would wipe it." >&2
-    exit 1
+    [ -n "$best" ] || return 1
+    printf '%s\n' "$best"
+}
+
+# NGX_SRC_TREE=- means "this source is self-contained; parse it with no include
+# set at all". That is exactly true of the selftest fixtures, which declare
+# every type and object they use so they can exercise the harvest without a
+# configured nginx anywhere on the machine. It is deliberately an explicit
+# opt-in and never a fallback: silently parsing the REAL header without nginx's
+# headers would fail, and any code path that turned that failure into a pass
+# would be the silent-green this rewrite exists to eliminate.
+SELF_CONTAINED=0
+if [ "${NGX_SRC_TREE:-}" = "-" ]; then
+    SELF_CONTAINED=1
 fi
 
-n_checked="$(printf '%s\n' "$members" | grep -vc '^_pad' || true)"
-echo "ok: all $n_checked shctx members initialised at zone carve (CARVE-INIT)"
+INCS=""
+if [ "$SELF_CONTAINED" -eq 0 ]; then
+    TREE="$(find_tree)" || {
+        echo "lint-carve-init: no CONFIGURED nginx tree found." >&2
+        echo "      This gate parses ${HDR} with clang against nginx's real include" >&2
+        echo "      set, so it needs a tree where ./configure has run. It does NOT" >&2
+        echo "      need one that has been compiled." >&2
+        echo "      Point NGX_SRC_TREE at one, or run: bash ci/tools/ci-build.sh nginx <version>" >&2
+        echo "      Refusing to report ok: a parser that cannot parse is not a clean gate." >&2
+        exit 2
+    }
+
+    # ALL_INCS is MULTI-LINE -- backslash-continued across ten or so lines. A
+    # `head -1` here drops `-I objs`, and the parse then dies on
+    # ngx_auto_headers.h with an error that looks like a broken header rather
+    # than a truncated include path. The sed range runs from the assignment to
+    # the first line NOT ending in a backslash, which is exactly the
+    # continuation the Makefile writes.
+    INCS="$(sed -n '/^ALL_INCS =/,/[^\\]$/p' "$TREE/objs/Makefile" \
+            | sed 's/^ALL_INCS =//; s/\\$//' | tr '\n' ' ')"
+    if [ -z "${INCS// /}" ]; then
+        echo "lint-carve-init: could not read ALL_INCS from $TREE/objs/Makefile --" >&2
+        echo "      refusing to guess at the include set." >&2
+        exit 2
+    fi
+fi
+
+# Everything the command line refers to is resolved to an absolute path FIRST.
+# The include paths in ALL_INCS are relative to the nginx tree ROOT, so the
+# parse has to run from there, and a relative path would silently re-anchor
+# against the tree once the subshell changes directory -- the failure mode that
+# makes `-I objs` land somewhere harmless-looking and the parse die on an
+# unrelated header.
+MODULE_SRC="$PWD/src"
+ABS_SRC="$PWD/$SRC"
+ABS_AST="$PWD/$AST"
+if [ "$SELF_CONTAINED" -eq 1 ]; then
+    RUN_DIR="$PWD"
+else
+    RUN_DIR="$(cd "$TREE" && pwd)"
+fi
+
+run_config() {  # run_config <label> [extra clang args...]
+    local label="$1"; shift
+    local out status
+    if [ "$SELF_CONTAINED" -eq 1 ]; then
+        out="$(cd "$RUN_DIR" && python3 "$ABS_AST" "$CLANG" "$ABS_SRC" "$@" 2>&1)"
+    else
+        # CARVE_INIT_PIN_COUNT=1 only ever runs against the REAL module header
+        # (never the self-contained selftest fixture, which declares a
+        # same-named struct of two or three members on purpose): it asserts
+        # the shctx member count read off the AST matches
+        # EXPECTED_MEMBER_COUNT in carve_init_ast.py exactly, which is the
+        # compensating control for AST-shape drift across clang majors --
+        # collect_initialised() fails closed when a member vanishes from the
+        # INITIALISER harvest, but nothing else catches one vanishing from the
+        # MEMBER harvest itself.
+        # shellcheck disable=SC2086  # INCS is a deliberate word-split arg list
+        out="$(cd "$RUN_DIR" && CARVE_INIT_PIN_COUNT=1 python3 "$ABS_AST" "$CLANG" \
+            "$ABS_SRC" "$@" $INCS -I "$MODULE_SRC" 2>&1)"
+    fi
+    status=$?
+    printf '%s\n' "$out" | sed "s/^/[$label] /"
+    return $status
+}
+
+# The production configuration and the TEST_FAULTS configuration are DIFFERENT
+# translation units with different member sets, and each must be internally
+# consistent. Both run before either verdict is reported, so a header carrying
+# two independent omissions takes one round-trip rather than two.
+#
+# Exit 2 DOMINATES exit 1. "Could not run" and "ran and found a missing
+# initialiser" are different answers and the caller acts on them differently:
+# collapsing every non-zero status into 1 would report a parse failure as a
+# finding, sending the reader to look for a member that was never checked.
+rc=0
+merge_rc() {  # merge_rc <status>
+    [ "$1" -eq 0 ] && return
+    if [ "$1" -eq 2 ] || [ "$rc" -eq 2 ]; then rc=2; else rc=1; fi
+}
+
+run_config "default" || merge_rc $?
+
+# CARVE_INIT_CONFIGS=default runs the production configuration only. The
+# selftest fixtures set it: none of them mentions TEST_FAULTS, so for those the
+# second parse is duplicated work -- 75 rows x an extra clang invocation, which
+# is most of the suite's runtime. It is NOT a way to skip a configuration on
+# the real tree, where both must be checked and the default runs both.
+if [ "$CONFIGS" = "both" ]; then
+    run_config "test-faults" -DNGX_HTTP_CACHE_TURBO_TEST_FAULTS=1 || merge_rc $?
+fi
+
+exit "$rc"

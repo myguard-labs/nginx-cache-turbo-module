@@ -13,6 +13,12 @@
 # (BUILD_ROOT=$PWD/.build-perf ci-build.sh nginx <ver> profile). Same reason as
 # above: an unpacked nginx source tree that a stray `git add -A` would commit.
 .build-perf/
+# Configure-only tree for the carve-init parser gate (BUILD_ROOT=$PWD/.carve-tree
+# ci-build.sh nginx <ver> configure). Deliberately NOT under .build/: that path
+# is auto-discovered by ci/tests/unit/run.sh, which gates on
+# objs/ngx_auto_config.h and would then run a suite needing COMPILED objects
+# against a tree that stops at configure. Same add-everything risk as above.
+.carve-tree/
 __pycache__/
 build/
 objs/

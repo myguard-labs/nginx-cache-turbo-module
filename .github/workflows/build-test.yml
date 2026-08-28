@@ -1,4 +1,4 @@
-# sync-sha: c734a50d22f80f20bced36f5519d2d68d1bd3845e2a09e52be09379cc87f0c11
+# sync-sha: 0ecfa73d9e82f449dd54dd7ee006df8ec5e0eaaf7be3fac14b39e3d43193865d
 name: Build & Test
 
 # Runner labels live in the POOL repository variable. Every checked-in selector
@@ -39,7 +39,13 @@ jobs:
       - name: Install validation tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y cppcheck shellcheck python3-pip pipx
+          # dwarves provides pahole, which ci/tests/unit/extract_shm.sh needs to
+          # measure ngx_http_cache_turbo_node_t (P2-3 slab-class assertion).
+          # The build job below already installs it for the same reason; this
+          # job runs the same unit suite and never did. It passed anyway on a
+          # hosted runner, whose image happens to ship pahole -- on a POOL
+          # runner without it the suite dies at the first measurement.
+          sudo apt-get install -y cppcheck dwarves shellcheck python3-pip pipx
           # ruff is pinned so a new release cannot add a rule to the selected
           # tiers and land this job red on an unrelated PR.
           #
@@ -134,7 +140,29 @@ jobs:
           # ngx_slab_alloc() does not zero, but the fresh-carve path lands on
           # kernel-zeroed pages, so a forgotten member reads 0 anyway and no
           # runtime test can observe the omission -- only this gate can.
-          bash ci/tools/lint-carve-init.sh
+          #
+          # This checker PARSES the module with clang rather than lexing it,
+          # so it needs an nginx tree whose ./configure has run -- that is
+          # where ALL_INCS comes from. `configure` mode stops before make, so
+          # this costs seconds, not a build. It is deliberately NOT reusing the
+          # build job's tree: this job runs first and must stay independent of
+          # it, and a gate that silently skipped when the tree was absent would
+          # be the silent-green this checker exists to prevent (it exits 2).
+          # ci-build.sh sources .github/versions.env itself and prints the
+          # tree it produced, so the path is READ BACK from that line rather
+          # than re-derived here. Re-deriving it would put the pinned version
+          # in two places, and a drift between them would point NGX_SRC_TREE at
+          # a directory that does not exist -- which this gate reports as
+          # exit 2, correctly but confusingly.
+          # BUILD_ROOT keeps this tree OUT of .build/, which ci/tests/unit/run.sh
+          # auto-discovers. That suite gates on objs/ngx_auto_config.h and is
+          # meant to SKIP in this job -- the Runtime job, which has a COMPILED
+          # tree, is the one that runs it. `configure` mode stops before make,
+          # so a tree at the default path would satisfy that gate with no .o
+          # files behind it and the suite would die measuring the shm node.
+          tree="$(BUILD_ROOT="$PWD/.carve-tree" bash ci/tools/ci-build.sh nginx "" configure | sed -n 's/^tree=//p')"
+          [ -n "$tree" ] || { echo "ci-build.sh printed no tree= line" >&2; exit 1; }
+          NGX_SRC_TREE="$tree" bash ci/tools/lint-carve-init.sh
           # P4-2-s3b: no site may reach a stripe's slab pool outside the
           # resolver. At N == 1 a stray bare `z->shpool` behaves identically to
           # the resolver, so no runtime test can see it -- this is the only

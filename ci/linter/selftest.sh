@@ -13,8 +13,16 @@
 # Usage:  ci/linter/selftest.sh
 # Exit:   0 all controls held, 1 one or more did not.
 #
-# Runs in about a second: no case invokes a real checker (LINT_ONLY values are
-# either bogus or rejected before dispatch), so no linter needs to be installed.
+# Runs in about two seconds (90 controls). The budget is stated as a ceiling
+# on the whole suite, not per case: this is a commit-hook and CI gate, where a
+# couple of seconds is immaterial next to the cost of a silent-green linter
+# shipping. Controls are added when a class of malformed input is found
+# unmodelled; the budget line moves with them rather than the suite being
+# trimmed to fit it. Every case but the carve-init block at the end is
+# dispatcher-level (LINT_ONLY values are either bogus or rejected before
+# dispatch), so no linter needs to be installed for those. The carve-init cases
+# DO invoke that one checker for real, against a generated two-file fixture
+# tree rather than the real src/, which is what keeps them inside the budget.
 #
 # Extend: add a case() line. Keep each case asserting a specific exit status,
 # and prefer a case where the OLD, broken behaviour would have passed.
@@ -337,6 +345,781 @@ mkdir -p "$badroot/.github/workflows"
 printf 'on: [pull_request\njobs: {\n' > "$badroot/.github/workflows/broken.yml"
 case_ 2 "policy runners: unparsable YAML is exit 2, not clean" \
     env "WORKFLOW_POLICY_ROOT=$badroot" python3 ci/linter/workflow_policy.py runners
+
+# ----------------------------------------------------------------------------
+# The shm-checker mutation controls.
+#
+# CARVE-INIT-NO-NEGATIVE-CONTROL: the three shm checkers (carve-init, shm-lock,
+# stripe-seam) had every proof of efficacy living in a commit message. Each was
+# hand-mutated once by a reviewer, proved red, and then nothing in the tree kept
+# it red -- so a refactor that silently disarmed one would leave CI green and
+# the disarming invisible. That is precisely the failure this file exists to
+# catch, applied to the checkers rather than to the dispatcher.
+#
+# These cases DO invoke a real checker, unlike every case above. They stay
+# within the suite budget by running against a generated fixture tree of two
+# small files rather than the real src/, so no build and no scan of the
+# 34k-line source is involved.
+#
+# THE FIXTURES ARE NOW COMPLETE, WELL-TYPED C. carve-init parses with clang
+# rather than lexing with awk, and clang's error recovery replaces the
+# statements of a function whose identifiers do not resolve with RecoveryExpr:
+# the field list survives, every member store vanishes, and the harvest would
+# see zero initialisers. A fixture that does not COMPILE therefore cannot test
+# the initialiser half at all, so the header below declares every type and the
+# source declares every object the carve block names. This is a real constraint
+# the awk fixtures did not have, and it is load-bearing -- the checker exits 2
+# on a fixture it cannot parse rather than guessing, so a fixture that drifts
+# out of compiling turns its row red rather than quietly vacuous.
+mutroot="$(mktemp -d)"
+trap 'rm -rf "$badroot" "$mutroot"' EXIT
+mkdir -p "$mutroot/src" "$mutroot/ci/tools"
+cp ci/tools/lint-carve-init.sh ci/tools/carve_init_ast.py "$mutroot/ci/tools/"
+
+# A minimal shctx and carve block: the smallest input that exercises the real
+# member-harvest and initialiser-harvest paths.
+#
+# `ngx_queue_init` is spelled as a MACRO here because that is what it is in
+# nginx. The distinction matters: after preprocessing there is no call left to
+# match, so a checker that only looked for a CallExpr would find none of this
+# module's four real helper-initialised members. The fixture reproduces the
+# real shape rather than an easier one.
+emit_fixture() {
+    # $1 = extra member line, $2 = extra carve line
+    cat > "$mutroot/src/ngx_http_cache_turbo_module.h" <<EOF
+typedef unsigned char u_char;
+typedef unsigned long ngx_uint_t;
+typedef unsigned long ngx_atomic_t;
+typedef unsigned long uint64_t;
+#define NGX_ATOMIC_T ngx_atomic_t
+#define NGX_ALIGNED(n) __attribute__((aligned(n)))
+typedef struct ngx_queue_s { struct ngx_queue_s *prev, *next; } ngx_queue_t;
+#define ngx_queue_init(q) (q)->prev = q; (q)->next = q
+#define ngx_memzero(buf, n) __builtin_memset((buf), 0, (n))
+typedef struct { ngx_uint_t x; } ngx_http_cache_turbo_stripe_t;
+typedef u_char ct_u_char_pad_t[8];
+typedef ngx_uint_t ct_uint_pad_t[8];
+typedef struct ngx_http_cache_turbo_shctx_s {
+    ngx_atomic_t             hits;
+    u_char                   _pad_hits[24];
+${1:-}
+} ngx_http_cache_turbo_shctx_t;
+EOF
+    cat > "$mutroot/src/ngx_http_cache_turbo_shm.c" <<EOF
+#include "ngx_http_cache_turbo_module.h"
+typedef struct { ngx_http_cache_turbo_shctx_t *sh; } ngx_ht_st_t;
+static ngx_ht_st_t *st, *other, *octx;
+static void *pool;
+void *ngx_slab_alloc(void *, unsigned long);
+int memcmp(const void *, const void *, unsigned long);
+void log(const char *);
+void my_ngx_queue_init(void *);
+static char ch;
+int ngx_http_cache_turbo_shm_init_zone(void *shm_zone, void *data)
+{
+    st->sh = ngx_slab_alloc(pool, sizeof(ngx_http_cache_turbo_shctx_t));
+    st->sh->hits = 0;
+${2:-}
+    return 0;
+}
+EOF
+}
+
+# The fixture is self-contained C -- it declares every type and object it uses
+# -- so it is parsed with NO include set at all (NGX_SRC_TREE=-). That keeps
+# these rows independent of whether this machine has a configured nginx
+# checkout; otherwise every row below would report exit 2 on a fresh clone and
+# the suite would be asserting "cannot run" rather than the invariant.
+# shellcheck disable=SC2329  # invoked indirectly, by name, via case_()
+carve_lint() {
+    # SC2317: this IS reached -- every row passes it to case_, which runs it as
+    # "$@". shellcheck cannot see an indirect invocation.
+    # shellcheck disable=SC2317
+    env -C "$mutroot" NGX_SRC_TREE=- CARVE_INIT_CONFIGS=default \
+        CARVE_INIT_PIN_COUNT=0 \
+        ./ci/tools/lint-carve-init.sh
+}
+
+# Baseline: the fixture as written must be CLEAN. Without this, every case
+# below could be passing for the wrong reason (a fixture the checker cannot
+# parse at all also "fails").
+emit_fixture "" ""
+case_ 0 "carve-init: well-formed fixture is clean" carve_lint
+
+# The original MAJOR: a member initialised only outside the carve block. This
+# is the mutation that passed before the scan window was narrowed.
+emit_fixture "    ngx_uint_t               tag_cap_drops;" ""
+case_ 1 "carve-init: member never initialised is caught" carve_lint
+
+# The carve WINDOW itself. shm_init_zone() has early-return branches ABOVE the
+# slab alloc -- the octx reload inherit and the shm.exists branch -- and a store
+# in one of those is NOT carve initialisation: it never runs on a fresh carve,
+# and on reload it overwrites inherited live state. So the window opens at the
+# slab alloc, not at the function opener.
+#
+# This row exists because deleting the window bound entirely was caught by ZERO
+# of the other controls: every one of them puts its store after the alloc, so
+# widening the window leaves them all green. A member initialised only BEFORE
+# the alloc is the input that separates the two, and without it the bound could
+# be removed and CI would stay green -- the exact silent disarming this file
+# exists to detect.
+emit_fixture "    ngx_uint_t               tag_cap_drops;" ""
+cat > "$mutroot/src/ngx_http_cache_turbo_shm.c" <<'PREEOF'
+#include "ngx_http_cache_turbo_module.h"
+typedef struct { ngx_http_cache_turbo_shctx_t *sh; } ngx_ht_st_t;
+static ngx_ht_st_t *st, *other, *octx;
+static void *pool;
+void *ngx_slab_alloc(void *, unsigned long);
+int memcmp(const void *, const void *, unsigned long);
+void log(const char *);
+void my_ngx_queue_init(void *);
+static char ch;
+int ngx_http_cache_turbo_shm_init_zone(void *shm_zone, void *data)
+{
+    /* the shm.exists reload branch, ABOVE the carve */
+    st->sh->tag_cap_drops = 0;
+    st->sh = ngx_slab_alloc(pool, sizeof(ngx_http_cache_turbo_shctx_t));
+    st->sh->hits = 0;
+    return 0;
+}
+PREEOF
+case_ 1 "carve-init: a store BEFORE the slab alloc is not carve initialisation" \
+    carve_lint
+
+# An unrelated allocator call cannot open the carve window. Only the assignment
+# of ngx_slab_alloc() to st->sh identifies the fresh object being initialised.
+emit_fixture "    ngx_uint_t               tag_cap_drops;" ""
+cat > "$mutroot/src/ngx_http_cache_turbo_shm.c" <<'ANCHOREOF'
+#include "ngx_http_cache_turbo_module.h"
+typedef struct { ngx_http_cache_turbo_shctx_t *sh; } ngx_ht_st_t;
+static ngx_ht_st_t *st;
+static void *pool;
+void *ngx_slab_alloc(void *, unsigned long);
+int ngx_http_cache_turbo_shm_init_zone(void *shm_zone, void *data)
+{
+    (void) ngx_slab_alloc(pool, 1);
+    st->sh->tag_cap_drops = 0;
+    st->sh = ngx_slab_alloc(pool, sizeof(ngx_http_cache_turbo_shctx_t));
+    st->sh->hits = 0;
+    return 0;
+}
+ANCHOREOF
+case_ 1 "carve-init: an unrelated slab allocation cannot widen the window" \
+    carve_lint
+
+# Flattening the AST used to credit stores that did not execute on every carve.
+emit_fixture "    ngx_uint_t               tag_cap_drops;" \
+             "    if (data != shm_zone) { st->sh->tag_cap_drops = 0; }"
+case_ 1 "carve-init: a conditional-only store is not initialisation" carve_lint
+
+# A direct store after an early successful return does not dominate every
+# successful path. Nonzero error returns (such as the real NULL-allocation
+# guard) are safe; a zero or non-constant return is refused loudly.
+emit_fixture "    ngx_uint_t               tag_cap_drops;" \
+             "    if (data != shm_zone) { return 0; }
+    st->sh->tag_cap_drops = 0;"
+case_ 2 "carve-init: an early successful return cannot bypass initialisation" \
+    carve_lint
+
+# The top-level return closes the carve window; dead statements after it cannot
+# satisfy the invariant.
+emit_fixture "    ngx_uint_t               tag_cap_drops;" ""
+cat > "$mutroot/src/ngx_http_cache_turbo_shm.c" <<'DEADEOF'
+#include "ngx_http_cache_turbo_module.h"
+typedef struct { ngx_http_cache_turbo_shctx_t *sh; } ngx_ht_st_t;
+static ngx_ht_st_t *st;
+static void *pool;
+void *ngx_slab_alloc(void *, unsigned long);
+int ngx_http_cache_turbo_shm_init_zone(void *shm_zone, void *data)
+{
+    st->sh = ngx_slab_alloc(pool, sizeof(ngx_http_cache_turbo_shctx_t));
+    st->sh->hits = 0;
+    return 0;
+    st->sh->tag_cap_drops = 0;
+}
+DEADEOF
+case_ 1 "carve-init: an unreachable store after return is not initialisation" \
+    carve_lint
+
+# Compound assignment must not read as initialisation.
+emit_fixture "    ngx_uint_t               tag_cap_drops;" \
+             "    st->sh->tag_cap_drops += 0;"
+case_ 1 "carve-init: compound assignment is not initialisation" carve_lint
+
+# Multi-declarator lines must register EVERY name, not only the last.
+emit_fixture "    ngx_uint_t               zzz_a, zzz_b;" \
+             "    st->sh->zzz_b = 0;"
+case_ 1 "carve-init: multi-declarator hides no member" carve_lint
+
+# Taking a member address for a pure READ is not initialisation.
+emit_fixture "    ngx_uint_t               tag_cap_drops;" \
+             "    (void) memcmp(&st->sh->tag_cap_drops, \"x\", 8);"
+case_ 1 "carve-init: address-of in a non-initialiser call does not count" carve_lint
+
+# The _pad* exemption is a TYPE decision: a _pad*-named member of a
+# non-u_char-array type must FAIL rather than be silently exempted.
+emit_fixture "    ngx_uint_t               _pad_but_real;" ""
+case_ 1 "carve-init: _pad* exemption requires a u_char array type" carve_lint
+
+# ...and a genuine pad must still be exempt, or the check above is just noise.
+emit_fixture "    u_char                   _pad_legit[8];" ""
+case_ 0 "carve-init: a genuine u_char pad stays exempt" carve_lint
+
+# clang preserves a typedef-backed array's source spelling in qualType and
+# records its semantic element type in desugaredQualType. The exemption must
+# follow that semantic type so a genuine byte-array alias remains valid.
+emit_fixture "    ct_u_char_pad_t           _pad_typedef;" ""
+case_ 0 "carve-init: a typedef-backed u_char pad stays exempt" carve_lint
+
+# The desugared fallback must not turn every typedef-backed array into padding:
+# an alias whose real element type is ngx_uint_t is ordinary state and still
+# requires explicit carve initialisation.
+emit_fixture "    ct_uint_pad_t             _pad_typedef;" ""
+case_ 1 "carve-init: a typedef-backed non-u_char pad is rejected" carve_lint
+
+# Per-declarator, not per-line: an array pad and a SCALAR pad on one
+# declaration line. The scalar must not inherit the array's exemption.
+emit_fixture "    u_char                   _pad_a[8], _pad_b;" ""
+case_ 1 "carve-init: _pad exemption is per-declarator, not per-line" carve_lint
+
+# An allowlisted initialiser and an unrelated pure read on ONE line: the read
+# must not borrow the initialiser's credit.
+emit_fixture "    ngx_queue_t              lru;
+    ngx_uint_t               tag_cap_drops;" \
+             "    ngx_queue_init(&st->sh->lru); (void) memcmp(&st->sh->tag_cap_drops, \"x\", 8);"
+case_ 1 "carve-init: address-of harvest is scoped to the call, not the line" carve_lint
+
+# ...and an allowlisted initialiser alone must still count, or the scoping
+# above is just a way to break every legitimate helper call.
+emit_fixture "    ngx_queue_t              lru;" \
+             "    ngx_queue_init(&st->sh->lru);"
+case_ 0 "carve-init: an allowlisted initialiser still counts" carve_lint
+
+# Only the destination argument counts, and a byte-zero helper must cover the
+# complete declared member rather than merely mention it in another argument.
+emit_fixture "    ngx_uint_t               tag_cap_drops;" \
+             "    ngx_memzero(pool, sizeof(st->sh->tag_cap_drops));"
+case_ 1 "carve-init: a member in ngx_memzero's size argument is not credited" \
+    carve_lint
+
+emit_fixture "    ngx_uint_t               tag_cap_drops;" \
+             "    ngx_memzero(&st->sh->tag_cap_drops, 1);"
+case_ 1 "carve-init: a partial ngx_memzero is not whole-member initialisation" \
+    carve_lint
+
+emit_fixture "    ngx_uint_t               tag_cap_drops;" \
+             "    ngx_memzero(&st->sh->tag_cap_drops, sizeof(st->sh->tag_cap_drops));"
+case_ 0 "carve-init: a full-size ngx_memzero initialises its destination" \
+    carve_lint
+
+# A wrapped initialiser call must still count.
+emit_fixture "    ngx_queue_t              lru;" \
+             "    ngx_queue_init(
+        &st->sh->lru);"
+case_ 0 "carve-init: a wrapped initialiser call still counts" carve_lint
+
+# A pointer-to-array _pad is an 8-byte pointer, not filler, bracket regardless.
+emit_fixture "    u_char                   (*_pad_pa)[8];" ""
+case_ 1 "carve-init: pointer-to-array _pad is not layout filler" carve_lint
+
+# INIT_HELPERS is name-exact: a helper merely CONTAINING an allowlisted name
+# must not inherit its credit. Under the parser this is identification by the
+# macro's own expansion record rather than a word-boundary regex, so the row
+# now asserts something stronger than it used to.
+emit_fixture "    ngx_uint_t               tag_cap_drops;" \
+             "    my_ngx_queue_init(&st->sh->tag_cap_drops);"
+case_ 1 "carve-init: INIT_HELPERS match is name-exact" carve_lint
+
+# A structurally broken header is "could not run" (2), never clean.
+printf 'struct something_else {\n    int x;\n};\n' \
+    > "$mutroot/src/ngx_http_cache_turbo_module.h"
+printf 'int main(void) { return 0; }\n' \
+    > "$mutroot/src/ngx_http_cache_turbo_shm.c"
+case_ 2 "carve-init: missing struct is exit 2, not clean" carve_lint
+
+# The checker must never report ok when it could not parse at all. This is the
+# single most important property of the parser backend: a gate that cannot run
+# has to be loudly distinguishable from a gate that ran and found nothing.
+emit_fixture "" ""
+case_ 2 "carve-init: no configured nginx tree is exit 2, not clean" \
+    env -C "$mutroot" NGX_SRC_TREE=/nonexistent ./ci/tools/lint-carve-init.sh
+
+# A tree carrying objs/Makefile but no nginx sources is NOT usable. ci-build.sh
+# leaves per-mode variant directories under .build/ that hold an objs/ and
+# nothing else, and one of those is usually the NEWEST match -- selecting one
+# produced a parse that died on ngx_config.h, an error a long way from its
+# cause.
+mkdir -p "$mutroot/objsonly/objs"
+: > "$mutroot/objsonly/objs/Makefile"
+case_ 2 "carve-init: an objs-only tree is rejected, not used" \
+    env -C "$mutroot" NGX_SRC_TREE="$mutroot/objsonly" ./ci/tools/lint-carve-init.sh
+
+# A missing clang is "could not run", never a fall back to a text scan -- the
+# lexer this checker was rewritten to retire.
+emit_fixture "" ""
+case_ 2 "carve-init: a missing clang is exit 2, not a text-scan fallback" \
+    env -C "$mutroot" NGX_SRC_TREE=- CARVE_INIT_CLANG=no-such-clang \
+    ./ci/tools/lint-carve-init.sh
+
+# The configuration selector is a fail-closed enum. A typo must not silently
+# degrade the real two-configuration gate to production-only.
+emit_fixture "" ""
+case_ 2 "carve-init: an invalid configuration selector is exit 2" \
+    env -C "$mutroot" NGX_SRC_TREE=- CARVE_INIT_CONFIGS=typo \
+    ./ci/tools/lint-carve-init.sh
+
+# The wrapper must observe a work-list producer that fails after emitting a
+# plausible prefix. Process substitution used to discard that exit status and
+# turn the truncated list into a clean skip.
+mkdir -p "$mutroot/fakebin"
+cat > "$mutroot/fakebin/git" <<'GITEOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "ls-files" ]; then
+    printf '%s\n' src/ngx_http_cache_turbo_shm.c
+    exit 1
+fi
+exec "${REAL_GIT:?}" "$@"
+GITEOF
+chmod +x "$mutroot/fakebin/git"
+case_ 2 "carve-init wrapper: a failing file-list producer is exit 2" \
+    env PATH="$mutroot/fakebin:$PATH" REAL_GIT="$(command -v git)" LINT_MODE=all \
+    ci/linter/lint-carve-init.sh
+
+# ----------------------------------------------------------------------------
+# carve-init: the MALFORMED-INPUT TABLE.
+#
+# Round-by-round, this checker was fixed by generalising the one input a
+# reviewer happened to name, and the next round found another member of the
+# same class still open. So these controls are organised by CLASS rather than
+# by finding: each row is one shape of hostile or awkward C, and the classes
+# are swept across comments, string and char literals, declarator forms,
+# wrong-object references, brace structure and preprocessor text.
+#
+# WHAT CHANGED WITH THE PARSER. Under the awk lexer each of these rows guarded
+# a hand-written approximation of one C construct, and the row was the only
+# thing standing between that construct and a silent-green gate. clang performs
+# translation phases 1-8 itself, so most of these now pass trivially. They are
+# KEPT anyway, and that is the point: they no longer prove the lexer got this
+# shape right, they prove the class stays closed if anyone ever reaches for a
+# text scan again. A row that passes trivially against a correct backend and
+# red against a broken one is exactly what a regression control should be.
+#
+# Columns: expected-exit | description | member line | carve line
+# A `%` in a member/carve field is a literal newline, so a row can carry a
+# multi-line construct without breaking the table shape.
+carve_row() {
+    local want="$1" desc="$2" mem="$3" carve="$4"
+    emit_fixture "${mem//%/$'\n'}" "${carve//%/$'\n'}"
+    case_ "$want" "carve-init: $desc" carve_lint
+}
+
+# --- class: comments must never be parsed as code ---------------------------
+# The exploit that forced the awk rewrite: a block comment naming a helper and
+# carrying no `;` held the INIT_HELPERS window open for the rest of the block,
+# crediting every later pure read.
+carve_row 1 "block comment naming a helper does not open the helper window" \
+    "    ngx_atomic_t             owner_seq;" \
+    '    /* the LRU is set up by ngx_queue_init( further down */%    (void) memcmp(&st->sh->owner_seq, "x", 8);'
+
+carve_row 1 "MULTI-LINE comment naming a helper does not open the window" \
+    "    ngx_atomic_t             owner_seq;" \
+    '    /* set up by%     * ngx_queue_init( and friends%     */%    (void) memcmp(&st->sh->owner_seq, "x", 8);'
+
+carve_row 1 "line comment naming a helper does not open the window" \
+    "    ngx_atomic_t             owner_seq;" \
+    '    // done later by ngx_queue_init(%    (void) memcmp(&st->sh->owner_seq, "x", 8);'
+
+# A comment carrying a `;` must not be able to TERMINATE a real statement
+# either -- the splitter has to see the code semicolons only.
+carve_row 1 "a semicolon inside a comment does not terminate a statement" \
+    "    ngx_atomic_t             owner_seq;" \
+    '    (void) memcmp(&st->sh->owner_seq /* ; ; ; */, "x", 8);'
+
+# A commented-out initialiser is not an initialiser.
+carve_row 1 "a commented-out assignment does not count as initialisation" \
+    "    ngx_uint_t               tag_cap_drops;" \
+    "    /* st->sh->tag_cap_drops = 0; */"
+
+carve_row 1 "a line-commented assignment does not count as initialisation" \
+    "    ngx_uint_t               tag_cap_drops;" \
+    "    // st->sh->tag_cap_drops = 0;"
+
+# A brace inside a comment must not move the brace depth and truncate the scan.
+carve_row 0 "a brace inside a comment does not close the carve window" \
+    "    ngx_atomic_t             owner_seq;" \
+    "    /* } this brace is prose */%    st->sh->owner_seq = 0;"
+
+# --- class: string and char literals must never be parsed as code -----------
+carve_row 1 "a helper name inside a string does not open the helper window" \
+    "    ngx_atomic_t             owner_seq;" \
+    '    log("ngx_queue_init(");%    (void) memcmp(&st->sh->owner_seq, "x", 8);'
+
+carve_row 0 "a semicolon inside a string does not terminate a statement" \
+    "    ngx_atomic_t             owner_seq;" \
+    '    log("a ; b");%    st->sh->owner_seq = 0;'
+
+carve_row 0 "a brace inside a string does not close the carve window" \
+    "    ngx_atomic_t             owner_seq;" \
+    '    log("}");%    st->sh->owner_seq = 0;'
+
+carve_row 0 "a brace inside a CHAR literal does not close the carve window" \
+    "    ngx_atomic_t             owner_seq;" \
+    "    ch = '}';%    st->sh->owner_seq = 0;"
+
+# An escaped quote must not end the literal early and expose its tail as code.
+carve_row 1 "an escaped quote does not end a string early" \
+    "    ngx_atomic_t             owner_seq;" \
+    '    log("\" ngx_queue_init( \"");%    (void) memcmp(&st->sh->owner_seq, "x", 8);'
+
+# --- class: declarator forms are never silently dropped ---------------------
+# A bitfield used to vanish from the member set entirely: no initialiser was
+# ever demanded for it and the count still looked plausible.
+carve_row 1 "a bitfield member is harvested, not silently dropped" \
+    "    unsigned                 degraded:1;" ""
+
+carve_row 0 "an initialised bitfield member satisfies the gate" \
+    "    unsigned                 degraded:1;" \
+    "    st->sh->degraded = 0;"
+
+carve_row 1 "a spaced bitfield width is still harvested" \
+    "    unsigned                 degraded : 3;" ""
+
+# Input that is not C at all is a LOUD failure, never a silent drop. Under the
+# lexer this was the script's own hand-written catch-all; under the parser it
+# is clang rejecting the syntax error, and the gate refuses to report a verdict
+# over a translation unit it could not read. Both answer exit 2 -- "could not
+# run" -- which is the honest one: the member cannot vanish while the gate
+# reads clean, which is the property the row exists for.
+carve_row 2 "a declarator that is not valid C is a loud error, not a silent drop" \
+    "    ngx_uint_t               123bad;" ""
+
+# An array-of-struct member is an ordinary member with a bound.
+carve_row 1 "an array-of-struct member is harvested" \
+    "    ngx_http_cache_turbo_stripe_t  stripes[8];" ""
+
+carve_row 1 "one array element does not initialise the whole member" \
+    "    ngx_http_cache_turbo_stripe_t  stripes[8];" \
+    "    st->sh->stripes[0].x = 0;"
+
+carve_row 0 "a full-size helper initialises an array-of-struct member" \
+    "    ngx_http_cache_turbo_stripe_t  stripes[8];" \
+    "    ngx_memzero(&st->sh->stripes, sizeof(st->sh->stripes));"
+
+# A trailing comment on a member declaration must not disturb the name parse.
+carve_row 1 "a trailing comment on a member does not hide the member" \
+    "    ngx_uint_t               tag_cap_drops;  /* counter ; { */" ""
+
+# --- class: nested aggregates -----------------------------------------------
+# A NAMED nested aggregate is an ordinary member: `st->sh->u = ...` is a
+# perfectly good store, so the gate demands one. The awk lexer could not tell a
+# named nested aggregate from an anonymous one and refused BOTH with exit 2 --
+# over-broad, since only the anonymous case is genuinely unsatisfiable.
+carve_row 1 "a NAMED nested union is an ordinary member, not a refusal" \
+    "    union {%        ngx_uint_t           inner_a;%        ngx_uint_t           inner_b;%    } u;" ""
+
+carve_row 1 "one union field does not initialise the whole member" \
+    "    union {%        ngx_uint_t           inner_a;%    } u;" \
+    "    st->sh->u.inner_a = 0;"
+
+carve_row 0 "a full-size helper initialises a named nested union" \
+    "    union {%        ngx_uint_t           inner_a;%    } u;" \
+    "    ngx_memzero(&st->sh->u, sizeof(st->sh->u));"
+
+# The ANONYMOUS case is the unsatisfiable one -- its members are reachable as
+# `st->sh->inner_a` but the aggregate itself has no name to demand a store for.
+# Demanding one anyway would be CI red on correct code, so it is refused
+# loudly instead of answered wrongly.
+carve_row 2 "an ANONYMOUS nested union is a loud error, not a false FAIL" \
+    "    union {%        ngx_uint_t           inner_a;%        ngx_uint_t           inner_b;%    };" ""
+
+carve_row 2 "an ANONYMOUS nested struct is a loud error, not a false FAIL" \
+    "    struct {%        ngx_uint_t           inner_a;%    };" ""
+
+# --- class: every match anchors on the real carve target --------------------
+# An unrelated object whose expression merely ENDS in `sh->` must not be
+# credited to the carved shctx.
+carve_row 1 "a helper call on ANOTHER object does not credit the shctx" \
+    "    ngx_queue_t              lru;" \
+    "    ngx_queue_init(&other->sh->lru);"
+
+carve_row 1 "an assignment on ANOTHER object does not credit the shctx" \
+    "    ngx_uint_t               tag_cap_drops;" \
+    "    other->sh->tag_cap_drops = 0;"
+
+carve_row 1 "a longer identifier ending in sh-> does not credit the shctx" \
+    "    ngx_uint_t               tag_cap_drops;" \
+    "    octx->sh->tag_cap_drops = 0;"
+
+# --- class: brace structure and preprocessor text ---------------------------
+# The window closes where the braces BALANCE, not at the first column-0 `}`.
+# A macro- or #if-introduced column-0 brace used to truncate the scan and
+# report every later member forgotten -- a false FAIL on correct code.
+carve_row 0 "a column-0 brace inside the function does not truncate the scan" \
+    "    ngx_atomic_t             owner_seq;" \
+    "    if (1) {%}%    st->sh->owner_seq = 0;"
+
+carve_row 0 "an #if-gated block does not truncate the scan" \
+    "    ngx_atomic_t             owner_seq;" \
+    "#if (NGX_DEBUG)%    if (1) {%}%#endif%    st->sh->owner_seq = 0;"
+
+# A member declared across a line continuation keeps its name visible. Phase 2
+# is the compiler's own now, so this holds for every line ending -- see the
+# CRLF rows at the end of the table.
+carve_row 1 "a member declared across a line continuation is harvested" \
+    "    ngx_uint_t \\%                             tag_cap_drops;" ""
+
+# A parenthesised declarator is accounted for rather than dropped.
+carve_row 1 "a parenthesised pointer declarator is harvested" \
+    "    u_char                   (*_pad_pa)[8];" ""
+
+# --- class: translation phase 2 -- line continuation ------------------------
+# A trailing backslash splices the next physical line onto this one BEFORE
+# comments and tokens are formed, so it applies in EVERY lexical state. The
+# awk stripper terminated a line comment at end-of-line and fed the second
+# physical line to both passes as live code; because the INIT_HELPERS window
+# was sticky until a `;`, one continued comment could credit an arbitrary RUN
+# of members. These rows sweep the construct across every state, in both
+# directions.
+carve_row 1 "a continued LINE COMMENT does not expose its tail as code" \
+    "    ngx_queue_t              lru;" \
+    '    // set up by \%    ngx_queue_init(&st->sh->lru);'
+
+carve_row 0 "a continued BLOCK COMMENT still closes, and does not eat code" \
+    "    ngx_uint_t               tag_cap_drops;" \
+    '    /* note \%       still comment */%    st->sh->tag_cap_drops = 0;'
+
+carve_row 0 "a continued DECLARATION/CALL is one statement, not two" \
+    "    ngx_queue_t              lru;" \
+    '    ngx_queue_init( \%        &st->sh->lru);'
+
+# THE AWK LEXER HAD THIS BACKWARDS, and the parser is what exposed it. The old
+# row asserted that an EVEN run of trailing backslashes does not continue the
+# line, on the reasoning that the last backslash is itself escaped. That rule
+# belongs to STRING literals; it is not translation phase 2. Phase 2 runs
+# before tokens exist, so there is no escape processing to speak of -- it
+# deletes ANY backslash-newline pair, whatever precedes it, and a `//` comment
+# ending in `\\` therefore swallows the next line just as one ending in `\`
+# does. Verified with the compiler directly: for
+#
+#     int main(void){
+#     // a \\
+#     return 1;
+#     }
+#
+# clang warns `multi-line // comment` and `clang -E` shows the `return 1;`
+# gone. The old row asserted exit 0 -- that the helper call on the next line
+# still counted -- which is precisely the silent-green this checker exists to
+# prevent, since in real C that call is commented out. The row now asserts the
+# behaviour C actually has.
+carve_row 1 "an EVEN backslash run STILL continues a line comment" \
+    "    ngx_queue_t              lru;" \
+    '    // harmless \\%    ngx_queue_init(&st->sh->lru);'
+
+# --- class: declarator forms the header does not use yet, but may -----------
+carve_row 1 "a function-pointer member is harvested, not a loud error" \
+    "    void (*cb)(void *);" ""
+
+carve_row 0 "an initialised function-pointer member satisfies the gate" \
+    "    void (*cb)(void *);" \
+    "    st->sh->cb = 0;"
+
+# The parameter list carries a comma, which a naive declarator split cuts in
+# half, leaving two halves that neither parse.
+carve_row 1 "a function-pointer parameter list is not split on its comma" \
+    "    void (*cb)(void *, int);" ""
+
+carve_row 1 "an array-of-arrays member is harvested, not a loud error" \
+    "    ngx_uint_t               m[2][3];" ""
+
+carve_row 1 "one nested-array element does not initialise the whole member" \
+    "    ngx_uint_t               m[2][3];" \
+    "    st->sh->m[0][1] = 0;"
+
+carve_row 0 "a full-size helper initialises an array-of-arrays member" \
+    "    ngx_uint_t               m[2][3];" \
+    "    ngx_memzero(&st->sh->m, sizeof(st->sh->m));"
+
+# An attribute macro sits BETWEEN the type and the name; truncating at its
+# parens harvests the MACRO as the member name.
+carve_row 1 "an attribute-macro member yields the member name, not the macro" \
+    "    ngx_uint_t NGX_ALIGNED(64) slot;" ""
+
+carve_row 0 "an initialised attribute-macro member satisfies the gate" \
+    "    ngx_uint_t NGX_ALIGNED(64) slot;" \
+    "    st->sh->slot = 0;"
+
+# A macro-spelled TYPE needs no special handling -- it is one more leading
+# token -- but nothing asserted that until now.
+carve_row 1 "a macro-typed member is harvested" \
+    "    NGX_ATOMIC_T             mt;" ""
+
+# Comma-separated bitfields: every name, not only the last.
+carve_row 1 "comma-separated bitfields hide no member" \
+    "    unsigned                 x:1, y:2;" \
+    "    st->sh->x = 0;"
+
+# Confirmed-correct forms that must STAY correct.
+carve_row 1 "a const volatile member is harvested" \
+    "    const volatile ngx_uint_t cv;" ""
+
+# --- class: __attribute__ in EVERY position ---------------------------------
+# The round-5 Major. `sub(/__attribute__.*/, "", line)` deleted the whole
+# declaration including the member NAME whenever the attribute came FIRST, so
+# the member vanished from the gate entirely -- nothing ever demanded an
+# initialiser and the count silently dropped by one, which reads exactly like
+# a passing gate. Verified against the pre-rewrite script: it reported
+# `ok: all 67` where the correct answer is 68. The header's own comment names
+# __attribute__((aligned(64))) as the intended pinning mechanism for the
+# hot counters, so this is the shape the struct is documented to grow.
+#
+# All three positions C allows are swept, each in both directions.
+carve_row 1 "a PREFIX __attribute__ member is harvested, not deleted" \
+    "    __attribute__((aligned(64))) ngx_uint_t slotp;" ""
+
+carve_row 0 "an initialised PREFIX __attribute__ member satisfies the gate" \
+    "    __attribute__((aligned(64))) ngx_uint_t slotp;" \
+    "    st->sh->slotp = 0;"
+
+carve_row 1 "an INFIX __attribute__ member is harvested" \
+    "    ngx_uint_t __attribute__((aligned(64))) sloti;" ""
+
+carve_row 0 "an initialised INFIX __attribute__ member satisfies the gate" \
+    "    ngx_uint_t __attribute__((aligned(64))) sloti;" \
+    "    st->sh->sloti = 0;"
+
+carve_row 1 "a SUFFIX __attribute__ member is harvested" \
+    "    ngx_uint_t slots __attribute__((aligned(64)));" ""
+
+carve_row 0 "an initialised SUFFIX __attribute__ member satisfies the gate" \
+    "    ngx_uint_t slots __attribute__((aligned(64)));" \
+    "    st->sh->slots = 0;"
+
+# A prefix attribute must not swallow a LATER member on the same line either.
+carve_row 1 "a prefix __attribute__ does not hide a second declarator" \
+    "    __attribute__((aligned(64))) ngx_uint_t sa, sb;" \
+    "    st->sh->sa = 0;"
+
+# ----------------------------------------------------------------------------
+# carve-init: LINE ENDINGS.
+#
+# The other round-5 Major. The awk phase-2 splice counted trailing backslashes
+# on the RAW record, which under CRLF ends in `\r` -- so the backslash was
+# never the last character, the splice never fired, and a continued line
+# comment left its tail exposed as live code. Verified against the pre-rewrite
+# script on the real tree: a CRLF checkout with a `// swallow \` before
+# `st->sh->owner_seq = 0;` reported `ok: all 68` over a genuinely
+# uninitialised member.
+#
+# This is REACHABLE, not hypothetical: .gitattributes pins *.sh/*.pl/*.py/*.t
+# to eol=lf but leaves *.c/*.h unspecified, and explicitly anticipates
+# core.autocrlf=true checkouts.
+#
+# Every row above runs LF. These re-run the phase-2 rows byte-for-byte with
+# CRLF endings, which is the axis that made the defect invisible: 90 LF-only
+# controls could not move on it.
+crlf_row() {
+    local want="$1" desc="$2" mem="$3" carve="$4"
+    emit_fixture "${mem//%/$'\n'}" "${carve//%/$'\n'}"
+    # Convert both fixture files in place. `printf %s` + parameter expansion
+    # rather than a tool, so no unix2dos/sed dependency enters the suite.
+    local f content
+    for f in "$mutroot/src/ngx_http_cache_turbo_module.h" \
+             "$mutroot/src/ngx_http_cache_turbo_shm.c"; do
+        content="$(cat "$f")"
+        printf '%s\r\n' "${content//$'\n'/$'\r\n'}" > "$f"
+    done
+    case_ "$want" "carve-init: [CRLF] $desc" carve_lint
+}
+
+# The baseline: a correct CRLF fixture must be CLEAN. Without it every red row
+# below is equally consistent with "CRLF breaks the parse outright", which
+# would be a false FAIL on correct code rather than the property being tested.
+crlf_row 0 "a well-formed CRLF fixture is clean" "" ""
+
+crlf_row 1 "an uninitialised member is caught under CRLF" \
+    "    ngx_uint_t               tag_cap_drops;" ""
+
+# THE round-5 defect, in the fixture that reproduces it.
+crlf_row 1 "a continued LINE COMMENT does not expose its tail as code" \
+    "    ngx_queue_t              lru;" \
+    '    // set up by \%    ngx_queue_init(&st->sh->lru);'
+
+crlf_row 0 "a continued DECLARATION/CALL is one statement under CRLF" \
+    "    ngx_queue_t              lru;" \
+    '    ngx_queue_init( \%        &st->sh->lru);'
+
+crlf_row 0 "a continued BLOCK COMMENT still closes under CRLF" \
+    "    ngx_uint_t               tag_cap_drops;" \
+    '    /* note \%       still comment */%    st->sh->tag_cap_drops = 0;'
+
+crlf_row 1 "a commented-out assignment does not count under CRLF" \
+    "    ngx_uint_t               tag_cap_drops;" \
+    "    // st->sh->tag_cap_drops = 0;"
+
+crlf_row 1 "a PREFIX __attribute__ member is harvested under CRLF" \
+    "    __attribute__((aligned(64))) ngx_uint_t slotp;" ""
+
+# ----------------------------------------------------------------------------
+# carve-init: THE MEMBER-COUNT PIN (CARVE_INIT_PIN_COUNT).
+#
+# EXPECTED_MEMBER_COUNT in carve_init_ast.py is the compensating control for
+# AST-shape drift across clang majors: collect_initialised() only ever ADDS to
+# `found`, so a member vanishing from the INITIALISER harvest fails closed
+# (FAIL, or the empty-scan exit 2 if every initialiser vanishes) -- but a
+# member vanishing from find_struct_fields() the same way would silently
+# shrink the set of members DEMANDED, which is indistinguishable from a clean
+# gate. This checks that direction: a member disappearing from the struct
+# must fail the pin even though every remaining member is still, correctly,
+# initialised -- the member-count assertion is what catches it, nothing else
+# in this file does.
+#
+# The pin is gated on CARVE_INIT_PIN_COUNT=1 (set only by
+# ci/tools/lint-carve-init.sh against the real module header) so it cannot
+# fire against carve_lint's tiny same-named fixture struct by accident; these
+# rows turn it on explicitly and patch EXPECTED_MEMBER_COUNT in the COPIED
+# script under $mutroot to match the fixture's own field count, so the
+# assertion is exercised without depending on the real module's 67/71.
+# shellcheck disable=SC2329  # invoked indirectly, by name, via case_()
+pin_lint() {  # pin_lint <expected-count>
+    # SC2317: reached indirectly via case_, see carve_lint above.
+    # shellcheck disable=SC2317
+    env -C "$mutroot" NGX_SRC_TREE=- CARVE_INIT_PIN_COUNT=1 \
+        python3 ci/tools/carve_init_ast.py clang src/ngx_http_cache_turbo_shm.c
+}
+
+patch_expected_count() {  # patch_expected_count <n>
+    python3 - "$mutroot/ci/tools/carve_init_ast.py" "$1" <<'PYEOF'
+import re, sys
+path, n = sys.argv[1], int(sys.argv[2])
+src = open(path).read()
+src = re.sub(
+    r"EXPECTED_MEMBER_COUNT = \{[^}]*\}",
+    f"EXPECTED_MEMBER_COUNT = {{False: {n}, True: {n}}}",
+    src,
+    count=1,
+)
+open(path, "w").write(src)
+PYEOF
+}
+
+# Baseline: `hits` + `_pad_hits` is 2 raw FieldDecls. Pinned to the true count,
+# the well-formed fixture must still be clean.
+emit_fixture "" ""
+patch_expected_count 2
+case_ 0 "carve-init: count pin holds when the count matches" pin_lint
+
+# The control: remove a member from the DEMANDED set by pinning to one MORE
+# than the fixture actually has (as if a member had disappeared from the AST).
+# Every remaining member (hits) is still correctly initialised by
+# `emit_fixture`'s own baseline carve body, so nothing else in this checker
+# would flag this row -- only the count pin can.
+patch_expected_count 3
+case_ 1 "carve-init: a member vanishing from the struct fails the pin even though every remaining member is initialised" pin_lint
+
+# Restore the true count so any row added below this block is not silently
+# exercising a stale pin.
+patch_expected_count 2
+case_ 0 "carve-init: count pin restored to the true count is clean again" pin_lint
 
 if [ "$rc" -eq 0 ]; then
     echo "== lint gate selftest: all controls held =="

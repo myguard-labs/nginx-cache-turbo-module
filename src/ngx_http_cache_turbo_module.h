@@ -1183,8 +1183,14 @@ typedef struct ngx_http_cache_turbo_shctx_s {
      *   struct already carries ~120 bytes of padding from the deliberate
      *   cache-line alignment PERF-AUD2-12 documents, and the field lands
      *   inside it. sizeof(ngx_http_cache_turbo_shctx_t) is 832 with the field
-     *   and 832 without it, measured 2026-08-27. Even had it cost a word, one
-     *   word of shm per zone once is the right price for layout identity.
+     *   and 832 without it, measured 2026-08-27 -- both figures are for the
+     *   PRODUCTION build. A TEST_FAULTS build is 896, the extra 64 bytes being
+     *   the four NGX_HTTP_CACHE_TURBO_TEST_FAULTS-gated test_* counters, not
+     *   this field; re-measured 2026-08-28. Quote the flavour whenever this
+     *   number is cited -- an unqualified "832" reads as a contradiction of
+     *   the harness build and has been mistaken for one. Even had the field
+     *   cost a word, one word of shm per zone once is the right price for
+     *   layout identity.
      *
      *   Only the branch that READS it, in shm_alloc_evict(), is compiled out
      *   of a shipping build, so production carries neither the test nor any
