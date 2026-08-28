@@ -6,7 +6,8 @@
 # initialised at zone carve (CARVE-INIT).
 #
 # WHY THIS CANNOT BE A RUNTIME TEST. The shctx is carved once per zone by a
-# single ngx_slab_alloc() in shm_zone_init(). ngx_slab_alloc() does NOT zero
+# single ngx_slab_alloc() in ngx_http_cache_turbo_shm_init_zone(), which
+# does NOT zero
 # its return -- but on the fresh-carve path the slab arena is backed by freshly
 # mapped anonymous memory, which the kernel hands over already zeroed. So an
 # omitted initialiser reads 0 anyway, every test passes, and the omission is
@@ -25,7 +26,8 @@
 # file existing: the manual pass is not reliable at this member count.
 #
 # WHAT IT CHECKS. Every member declared in ngx_http_cache_turbo_shctx_t must
-# appear as an `sh->NAME =` assignment inside shm_zone_init()'s carve block.
+# appear as an `sh->NAME =` assignment inside the carve block of
+# ngx_http_cache_turbo_shm_init_zone().
 # Explicit padding members (_pad*) are exempt: they are layout, never read.
 #
 # Usage: ci/tools/lint-carve-init.sh   (no arguments; the invariant spans a
@@ -82,10 +84,22 @@ members="$(awk '
         sub(/__attribute__.*/, "", line)
         sub(/\[[^]]*\]/, "", line)     # array bound
         gsub(/[[:space:]]+$/, "", line)
-        n = split(line, parts, /[[:space:]*]+/)
-        if (n == 0) next
-        name = parts[n]
-        if (name ~ /^[A-Za-z_][A-Za-z0-9_]*$/) print name
+        # A declaration may carry several declarators: `ngx_uint_t a, b;`.
+        # Taking only the last identifier would hide every earlier name from
+        # the gate permanently, so split on ',' and take the last identifier of
+        # EACH declarator. Latent when written (the struct has no comma
+        # declarators today); fixed so adding one cannot silently open a hole.
+        ndecl = split(line, decls, /,/)
+        for (d = 1; d <= ndecl; d++) {
+            piece = decls[d]
+            sub(/\[[^]]*\]/, "", piece)      # per-declarator array bound
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", piece)
+            if (piece == "") continue
+            n = split(piece, parts, /[[:space:]*]+/)
+            if (n == 0) continue
+            name = parts[n]
+            if (name ~ /^[A-Za-z_][A-Za-z0-9_]*$/) print name
+        }
     }
     END {
         if (!opened) { print "ERR:no-opening-line" > "/dev/stderr"; exit 3 }
@@ -104,10 +118,20 @@ fi
 
 # --- 2. the members the carve block initialises ------------------------------
 #
-# Bounded to shm_zone_init()'s body: an `sh->x = ...` store anywhere else in the
-# file (the reload branch's admission re-read, the runtime paths) must not count
-# as carve initialisation. The body runs from the function's opening line to the
-# first column-0 `}`.
+# Bounded to the CARVE BLOCK, not the whole function: an `sh->x = ...` store
+# anywhere else in the file -- and, critically, anywhere else in this same
+# function -- must not count as carve initialisation.
+#
+# The window opens at the `st->sh = ngx_slab_alloc(` line and closes at the
+# first column-0 `}`. It deliberately does NOT open at the function's opening
+# line, because ngx_http_cache_turbo_shm_init_zone() has two early-return
+# branches ABOVE the slab alloc -- the `octx` reload inherit and the
+# `shm.exists` branch -- each of which legitimately stores `st->sh->admission`.
+# A window starting at the function opener swallows both, so a member
+# initialised ONLY in a reload branch would satisfy the gate. That placement is
+# exactly what the FAIL message below tells the developer not to do: it never
+# runs on a fresh carve, and on reload it overwrites inherited live state.
+# Caught by the agent review of this commit, reproduced by mutation.
 #
 # TWO accepted forms, because the block legitimately uses both:
 #   assignment       st->sh->hits = 0;
@@ -119,14 +143,22 @@ fi
 # is handed; that is beyond a textual gate. It proves the member was not
 # FORGOTTEN, which is the failure class here.
 inits="$(awk '
-    /^ngx_http_cache_turbo_shm_init_zone\(/ { inside = 1 }
-    inside && /^\}/ { inside = 0 }
+    # the carve block starts at the slab alloc, NOT at the function opener --
+    # see the comment above. Track the function too, so a same-named store in
+    # a LATER function cannot reopen the window.
+    /^ngx_http_cache_turbo_shm_init_zone\(/ { infn = 1 }
+    infn && /st->sh[[:space:]]*=[[:space:]]*ngx_slab_alloc\(/ { inside = 1 }
+    /^\}/ { if (inside) { inside = 0 } ; infn = 0 }
     !inside { next }
     {
         line = $0
         # assignment form
         rest = line
-        while (match(rest, /sh->[A-Za-z_][A-Za-z0-9_]*[[:space:]]*=[^=]/)) {
+        # `[^-+*/%&|^<>!=]=[^=]` so a compound assignment (+=, |=, &=, ...) is
+        # NOT read as carve initialisation -- it mutates a value that must
+        # already exist. Latent when written: zero compound assigns in the
+        # carve block today.
+        while (match(rest, /sh->[A-Za-z_][A-Za-z0-9_]*[[:space:]]*[^-+*\/%&|^<>!=[:space:]]?=[^=]/)) {
             s = substr(rest, RSTART + 4, RLENGTH - 4)
             sub(/[[:space:]]*=.*/, "", s)
             print s
