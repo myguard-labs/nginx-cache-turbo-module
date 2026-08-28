@@ -1,4 +1,4 @@
-# sync-sha: 49341d0b6872812ccdf18993b3365946b7aeb136202d298b9a04b8b1ebe0fc98
+# sync-sha: ebb15194eca3b6f33d9a51c20484e4c25426589ac55685c2511aeac06ba04597
 name: Build & Test
 
 # Runner labels live in the POOL repository variable. Every checked-in selector
@@ -39,7 +39,13 @@ jobs:
       - name: Install validation tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y cppcheck shellcheck python3-pip pipx
+          # dwarves provides pahole, which ci/tests/unit/extract_shm.sh needs to
+          # measure ngx_http_cache_turbo_node_t (P2-3 slab-class assertion).
+          # The build job below already installs it for the same reason; this
+          # job runs the same unit suite and never did. It passed anyway on a
+          # hosted runner, whose image happens to ship pahole -- on a POOL
+          # runner without it the suite dies at the first measurement.
+          sudo apt-get install -y cppcheck dwarves shellcheck python3-pip pipx
           # ruff is pinned so a new release cannot add a rule to the selected
           # tiers and land this job red on an unrelated PR.
           #
