@@ -60,12 +60,38 @@ Exit: 0 clean, 1 a member has no initialiser, 2 could not run.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 
 STRUCT = "ngx_http_cache_turbo_shctx_s"
 CARVE_FN = "ngx_http_cache_turbo_shm_init_zone"
 SLAB_ALLOC = "ngx_slab_alloc"
+TEST_FAULTS_DEFINE = "NGX_HTTP_CACHE_TURBO_TEST_FAULTS"
+
+# The compensating control for AST-shape drift across clang majors: this repo
+# only ever tests one clang (whatever ships on the box), but `ubuntu-latest`
+# may run a different major. collect_initialised() only ever ADDS to `found`,
+# so a member vanishing from the AST under a different clang shrinks the
+# harvest and fails closed (FAIL, or the empty-scan exit 2) -- but a member
+# vanishing from find_struct_fields() the SAME way would silently shrink the
+# set of members demanded, which reads as a clean gate over fewer members than
+# the struct actually has. That is the one direction collect_initialised()'s
+# fail-closed shape does not cover, so the member count is pinned here and
+# checked exactly (not just >=): a member added and never initialised must
+# also fail, not slide through as "one more than the floor".
+#
+# Update this deliberately, in the same commit that adds or removes a shctx
+# member -- the FAIL message below says so, so a drifted pin never reads as a
+# broken gate.
+# Raw FieldDecl count from find_struct_fields(), BEFORE the _pad* filter that
+# produces the smaller "N shctx members" figure in the `ok:` line -- a pad
+# member disappearing is exactly the AST-shape drift this pin exists to catch,
+# so it must count too.
+EXPECTED_MEMBER_COUNT = {
+    False: 67,  # production configuration
+    True: 71,  # NGX_HTTP_CACHE_TURBO_TEST_FAULTS configuration
+}
 
 # Calls that genuinely initialise what they are handed. A member set up by a
 # helper NOT named here reads as uninitialised, so adding a new initialiser
@@ -185,12 +211,14 @@ def find_struct_fields(ast):
                 "this script the nesting."
             )
         # The pad exemption is a TYPE decision, not a name-prefix one: the
-        # member must genuinely be `u_char NAME[...]` layout filler. The
-        # desugared type is used so a typedef for u_char cannot dress a
-        # non-filler member up as one.
+        # member must genuinely be `u_char NAME[...]` layout filler. Only
+        # `qualType` is read here -- clang's AST-dump JSON never emits a
+        # `desugaredQualType` key for an array FieldDecl (verified: a
+        # typedef'd `ct_filler_t[8]` array yields only `qualType`), so a
+        # typedef'd `u_char` pad is already exempt and a typedef hiding a
+        # non-`u_char` type already FAILs, both off the raw spelling alone.
         qual = child.get("type", {}).get("qualType", "")
-        desugared = child.get("type", {}).get("desugaredQualType", qual)
-        fields.append((name, _is_uchar_array(qual) or _is_uchar_array(desugared)))
+        fields.append((name, _is_uchar_array(qual)))
     return fields
 
 
@@ -445,8 +473,29 @@ def collect_initialised(body, start, source_bytes):
     return found
 
 
-def check(clang, source, args):
-    """Run the invariant over one configuration. Returns (ok, n_checked, report)."""
+def _count_drift(fields, args, pin_count):
+    """Return (expected, actual) if the pinned member count moved, else None.
+
+    Split out of check() to keep that function's local count under the
+    pylint too-many-locals threshold; the logic itself is a two-line lookup.
+    """
+    if not pin_count:
+        return None
+    expected = EXPECTED_MEMBER_COUNT[TEST_FAULTS_DEFINE in "".join(args)]
+    return None if len(fields) == expected else (expected, len(fields))
+
+
+def check(clang, source, args, pin_count=False):
+    """Run the invariant over one configuration. Returns (missing, mistyped_pad,
+    checked, count_drift).
+
+    `pin_count` gates EXPECTED_MEMBER_COUNT: it is only meaningful against the
+    real module header, where the count is a known, deliberately-updated
+    constant. The selftest fixtures declare a struct of the same name with
+    two or three members on purpose, to stay small, so they run with the pin
+    OFF -- turning it on unconditionally would fail every fixture row on a
+    mismatched count that has nothing to do with what that row tests.
+    """
     ast = run_clang(clang, source, args)
     fields = find_struct_fields(ast)
     if not fields:
@@ -473,7 +522,8 @@ def check(clang, source, args):
         checked += 1
         if name not in initialised:
             missing.append(name)
-    return missing, mistyped_pad, checked
+
+    return missing, mistyped_pad, checked, _count_drift(fields, args, pin_count)
 
 
 def main(argv):
@@ -481,8 +531,15 @@ def main(argv):
         print(f"usage: {argv[0]} <clang> <source.c> [clang args...]", file=sys.stderr)
         return 2
     clang, source, args = argv[1], argv[2], argv[3:]
+    # CARVE_INIT_PIN_COUNT=1 is set by ci/tools/lint-carve-init.sh, which only
+    # ever points this script at the real module header. The selftest
+    # fixtures invoke this script directly against a small stand-in struct of
+    # the same name and never set it, so the pin cannot fire on a fixture row.
+    pin_count = os.environ.get("CARVE_INIT_PIN_COUNT") == "1"
     try:
-        missing, mistyped_pad, checked = check(clang, source, args)
+        missing, mistyped_pad, checked, count_drift = check(
+            clang, source, args, pin_count=pin_count
+        )
     except CouldNotRun as exc:
         print(f"lint-carve-init: {exc}", file=sys.stderr)
         return 2
@@ -520,6 +577,28 @@ def main(argv):
             "      Do NOT add it to the shm.exists reload branch: that path\n"
             "      deliberately inherits live state across a SIGHUP and\n"
             "      zeroing there would wipe it.",
+            file=sys.stderr,
+        )
+    if count_drift:
+        fail = True
+        expected, actual = count_drift
+        print(
+            f"FAIL: `struct {STRUCT}` has {actual} members, expected exactly "
+            f"{expected}.",
+            file=sys.stderr,
+        )
+        print(
+            "      This is EXPECTED_MEMBER_COUNT in ci/tools/carve_init_ast.py "
+            "drifting\n"
+            "      from the real struct, not a bug in the gate. If this PR "
+            "deliberately\n"
+            "      added or removed a shctx member, update "
+            "EXPECTED_MEMBER_COUNT to match\n"
+            "      in the same commit. If it did not, a member disappeared "
+            "or appeared\n"
+            "      from the AST that this run did not intend -- do not raise "
+            "the pin to\n"
+            "      silence this without finding out why the count moved.",
             file=sys.stderr,
         )
     if fail:

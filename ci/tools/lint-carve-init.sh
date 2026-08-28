@@ -204,8 +204,17 @@ run_config() {  # run_config <label> [extra clang args...]
     if [ "$SELF_CONTAINED" -eq 1 ]; then
         out="$(cd "$RUN_DIR" && python3 "$ABS_AST" "$CLANG" "$ABS_SRC" "$@" 2>&1)"
     else
+        # CARVE_INIT_PIN_COUNT=1 only ever runs against the REAL module header
+        # (never the self-contained selftest fixture, which declares a
+        # same-named struct of two or three members on purpose): it asserts
+        # the shctx member count read off the AST matches
+        # EXPECTED_MEMBER_COUNT in carve_init_ast.py exactly, which is the
+        # compensating control for AST-shape drift across clang majors --
+        # collect_initialised() fails closed when a member vanishes from the
+        # INITIALISER harvest, but nothing else catches one vanishing from the
+        # MEMBER harvest itself.
         # shellcheck disable=SC2086  # INCS is a deliberate word-split arg list
-        out="$(cd "$RUN_DIR" && python3 "$ABS_AST" "$CLANG" \
+        out="$(cd "$RUN_DIR" && CARVE_INIT_PIN_COUNT=1 python3 "$ABS_AST" "$CLANG" \
             "$ABS_SRC" "$@" $INCS -I "$MODULE_SRC" 2>&1)"
     fi
     status=$?

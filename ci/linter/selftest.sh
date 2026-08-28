@@ -934,6 +934,67 @@ crlf_row 1 "a commented-out assignment does not count under CRLF" \
 crlf_row 1 "a PREFIX __attribute__ member is harvested under CRLF" \
     "    __attribute__((aligned(64))) ngx_uint_t slotp;" ""
 
+# ----------------------------------------------------------------------------
+# carve-init: THE MEMBER-COUNT PIN (CARVE_INIT_PIN_COUNT).
+#
+# EXPECTED_MEMBER_COUNT in carve_init_ast.py is the compensating control for
+# AST-shape drift across clang majors: collect_initialised() only ever ADDS to
+# `found`, so a member vanishing from the INITIALISER harvest fails closed
+# (FAIL, or the empty-scan exit 2 if every initialiser vanishes) -- but a
+# member vanishing from find_struct_fields() the same way would silently
+# shrink the set of members DEMANDED, which is indistinguishable from a clean
+# gate. This checks that direction: a member disappearing from the struct
+# must fail the pin even though every remaining member is still, correctly,
+# initialised -- the member-count assertion is what catches it, nothing else
+# in this file does.
+#
+# The pin is gated on CARVE_INIT_PIN_COUNT=1 (set only by
+# ci/tools/lint-carve-init.sh against the real module header) so it cannot
+# fire against carve_lint's tiny same-named fixture struct by accident; these
+# rows turn it on explicitly and patch EXPECTED_MEMBER_COUNT in the COPIED
+# script under $mutroot to match the fixture's own field count, so the
+# assertion is exercised without depending on the real module's 67/71.
+pin_lint() {  # pin_lint <expected-count>
+    # SC2317: reached indirectly via case_, see carve_lint above.
+    # shellcheck disable=SC2317
+    env -C "$mutroot" NGX_SRC_TREE=- CARVE_INIT_PIN_COUNT=1 \
+        python3 ci/tools/carve_init_ast.py clang src/ngx_http_cache_turbo_shm.c
+}
+
+patch_expected_count() {  # patch_expected_count <n>
+    python3 - "$mutroot/ci/tools/carve_init_ast.py" "$1" <<'PYEOF'
+import re, sys
+path, n = sys.argv[1], int(sys.argv[2])
+src = open(path).read()
+src = re.sub(
+    r"EXPECTED_MEMBER_COUNT = \{[^}]*\}",
+    f"EXPECTED_MEMBER_COUNT = {{False: {n}, True: {n}}}",
+    src,
+    count=1,
+)
+open(path, "w").write(src)
+PYEOF
+}
+
+# Baseline: `hits` + `_pad_hits` is 2 raw FieldDecls. Pinned to the true count,
+# the well-formed fixture must still be clean.
+emit_fixture "" ""
+patch_expected_count 2
+case_ 0 "carve-init: count pin holds when the count matches" pin_lint
+
+# The control: remove a member from the DEMANDED set by pinning to one MORE
+# than the fixture actually has (as if a member had disappeared from the AST).
+# Every remaining member (hits) is still correctly initialised by
+# `emit_fixture`'s own baseline carve body, so nothing else in this checker
+# would flag this row -- only the count pin can.
+patch_expected_count 3
+case_ 1 "carve-init: a member vanishing from the struct fails the pin even though every remaining member is initialised" pin_lint
+
+# Restore the true count so any row added below this block is not silently
+# exercising a stale pin.
+patch_expected_count 2
+case_ 0 "carve-init: count pin restored to the true count is clean again" pin_lint
+
 if [ "$rc" -eq 0 ]; then
     echo "== lint gate selftest: all controls held =="
 else
