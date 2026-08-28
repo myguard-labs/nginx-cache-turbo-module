@@ -37,6 +37,17 @@ esac
 SUDO=""
 [ "$(id -u)" -eq 0 ] || SUDO="sudo"
 
+# pipx installs into ~/.local/bin, which is NOT on PATH on a stock GitHub
+# runner -- pipx itself warns about this and carries on. Without it here, a
+# tool this script just installed successfully reports MISSING in --check,
+# which is how `pre-commit` failed the toolchain gate on CI while installing
+# fine. Both the install and the --check path need the same view of PATH, or
+# the gate disagrees with the installer that fed it.
+case ":$PATH:" in
+    *":$HOME/.local/bin:"*) ;;
+    *) PATH="$HOME/.local/bin:$PATH"; export PATH ;;
+esac
+
 # tool<TAB>apt package -- checked with command -v <tool>
 APT_TOOLS=(
     "shellcheck:shellcheck"      # sh/bash

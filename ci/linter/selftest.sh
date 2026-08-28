@@ -427,6 +427,7 @@ EOF
 # these rows independent of whether this machine has a configured nginx
 # checkout; otherwise every row below would report exit 2 on a fresh clone and
 # the suite would be asserting "cannot run" rather than the invariant.
+# shellcheck disable=SC2329  # invoked indirectly, by name, via case_()
 carve_lint() {
     # SC2317: this IS reached -- every row passes it to case_, which runs it as
     # "$@". shellcheck cannot see an indirect invocation.
@@ -954,6 +955,7 @@ crlf_row 1 "a PREFIX __attribute__ member is harvested under CRLF" \
 # rows turn it on explicitly and patch EXPECTED_MEMBER_COUNT in the COPIED
 # script under $mutroot to match the fixture's own field count, so the
 # assertion is exercised without depending on the real module's 67/71.
+# shellcheck disable=SC2329  # invoked indirectly, by name, via case_()
 pin_lint() {  # pin_lint <expected-count>
     # SC2317: reached indirectly via case_, see carve_lint above.
     # shellcheck disable=SC2317
