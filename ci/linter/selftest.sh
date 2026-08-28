@@ -13,8 +13,11 @@
 # Usage:  ci/linter/selftest.sh
 # Exit:   0 all controls held, 1 one or more did not.
 #
-# Runs in about a second: no case invokes a real checker (LINT_ONLY values are
-# either bogus or rejected before dispatch), so no linter needs to be installed.
+# Runs in about a second. Every case but the carve-init block at the end is
+# dispatcher-level (LINT_ONLY values are either bogus or rejected before
+# dispatch), so no linter needs to be installed for those. The carve-init cases
+# DO invoke that one checker for real, against a generated two-file fixture
+# tree rather than the real src/, which is what keeps them inside the budget.
 #
 # Extend: add a case() line. Keep each case asserting a specific exit status,
 # and prefer a case where the OLD, broken behaviour would have passed.
@@ -418,6 +421,26 @@ case_ 1 "carve-init: _pad* exemption requires a u_char array type" \
 # ...and a genuine pad must still be exempt, or the check above is just noise.
 emit_fixture "    u_char                   _pad_legit[8];" ""
 case_ 0 "carve-init: a genuine u_char pad stays exempt" \
+    env -C "$mutroot" ./ci/tools/lint-carve-init.sh
+
+# Per-declarator, not per-line: an array pad and a SCALAR pad on one
+# declaration line. The scalar must not inherit the array's exemption.
+emit_fixture "    u_char                   _pad_a[8], _pad_b;" ""
+case_ 1 "carve-init: _pad exemption is per-declarator, not per-line" \
+    env -C "$mutroot" ./ci/tools/lint-carve-init.sh
+
+# An allowlisted initialiser and an unrelated pure read on ONE line: the read
+# must not borrow the initialiser's credit.
+emit_fixture "    ngx_uint_t               tag_cap_drops;" \
+             "    ngx_queue_init(&st->sh->lru); (void) memcmp(&st->sh->tag_cap_drops, \"x\", 8);"
+case_ 1 "carve-init: address-of harvest is scoped to the call, not the line" \
+    env -C "$mutroot" ./ci/tools/lint-carve-init.sh
+
+# ...and an allowlisted initialiser alone must still count, or the scoping
+# above is just a way to break every legitimate helper call.
+emit_fixture "    ngx_queue_t              lru;" \
+             "    ngx_queue_init(&st->sh->lru);"
+case_ 0 "carve-init: an allowlisted initialiser still counts" \
     env -C "$mutroot" ./ci/tools/lint-carve-init.sh
 
 # A structurally broken header is "could not run" (2), never clean.

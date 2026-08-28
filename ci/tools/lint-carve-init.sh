@@ -88,17 +88,23 @@ members="$(awk '
         # it. `raw` keeps the array bracket the name-parse discards.
         raw = line
         gsub(/^[[:space:]]+/, "", raw)
-        is_uchar_array = (raw ~ /^u_char[[:space:]]/ && raw ~ /\[[^]]*\]/)
-        sub(/\[[^]]*\]/, "", line)     # array bound
+        is_uchar_base = (raw ~ /^u_char[[:space:]]/)
         gsub(/[[:space:]]+$/, "", line)
         # A declaration may carry several declarators: `ngx_uint_t a, b;`.
         # Taking only the last identifier would hide every earlier name from
         # the gate permanently, so split on ',' and take the last identifier of
         # EACH declarator. Latent when written (the struct has no comma
         # declarators today); fixed so adding one cannot silently open a hole.
+        #
+        # The array-bound test is PER-DECLARATOR, not per-line. `u_char
+        # _pad_a[8], _pad_b;` has an array base type and a scalar second
+        # declarator; testing the line as a whole would stamp "padok" onto
+        # _pad_b and silently exempt a member nothing proves is filler --
+        # reopening, along this axis, the exact hole the type check closes.
         ndecl = split(line, decls, /,/)
         for (d = 1; d <= ndecl; d++) {
             piece = decls[d]
+            had_bracket = (piece ~ /\[[^]]*\]/)
             sub(/\[[^]]*\]/, "", piece)      # per-declarator array bound
             gsub(/^[[:space:]]+|[[:space:]]+$/, "", piece)
             if (piece == "") continue
@@ -108,8 +114,8 @@ members="$(awk '
             if (name ~ /^[A-Za-z_][A-Za-z0-9_]*$/) {
                 # Tag pad-eligibility onto the name so the exemption is a
                 # TYPE decision, not a name-prefix one.
-                if (is_uchar_array) print name "\tpadok"
-                else               print name "\t-"
+                if (is_uchar_base && had_bracket) print name "\tpadok"
+                else                             print name "\t-"
             }
         }
     }
@@ -158,7 +164,12 @@ member_names="$(printf '%s\n' "$members" | cut -f1)"
 # Note this deliberately does not try to prove the callee initialises what it
 # is handed; that is beyond a textual gate. It proves the member was not
 # FORGOTTEN, which is the failure class here.
-inits="$(awk '
+# Calls that genuinely initialise what they are handed. A member set up by a
+# helper NOT named here reads as uninitialised, so adding a new initialiser
+# helper to the carve block means adding it here too -- the FAIL message says so.
+INIT_HELPERS='(ngx_rbtree_init|ngx_queue_init|ngx_memzero|ngx_rbtree_sentinel_init)[[:space:]]*[(]'
+
+inits="$(awk -v INIT_HELPERS="$INIT_HELPERS" '
     # the carve block starts at the slab alloc, NOT at the function opener --
     # see the comment above. Track the function too, so a same-named store in
     # a LATER function cannot reopen the window.
@@ -180,19 +191,31 @@ inits="$(awk '
             print s
             rest = substr(rest, RSTART + RLENGTH)
         }
-        # Address-of form (initialiser call). Restricted to a KNOWN
-        # INITIALISER allowlist: taking the address of a member proves nothing
-        # on its own -- `memcmp(&st->sh->misses, ...)` is a pure READ and used
-        # to satisfy this gate, which is a silent-green false negative. Only a
-        # call that actually initialises what it is handed counts.
-        if (line ~ /(ngx_rbtree_init|ngx_queue_init|ngx_memzero|ngx_rbtree_sentinel_init)[[:space:]]*\(/) {
-        rest = line
-        while (match(rest, /&[A-Za-z_][A-Za-z0-9_.>-]*sh->[A-Za-z_][A-Za-z0-9_]*/)) {
-            s = substr(rest, RSTART, RLENGTH)
-            sub(/.*sh->/, "", s)
-            print s
-            rest = substr(rest, RSTART + RLENGTH)
-        }
+        # Address-of form (initialiser call). Taking the address of a member
+        # proves nothing on its own -- `memcmp(&st->sh->misses, ...)` is a pure
+        # READ and used to satisfy this gate, a silent-green false negative.
+        # Only a call that actually initialises what it is handed counts, so
+        # the address-of harvest is scoped to the argument list of a call named
+        # in INIT_HELPERS.
+        #
+        # Scoped to the CALL, not the line: `ngx_queue_init(&sh->lru),
+        # memcmp(&sh->foo, ...)` puts an allowlisted call and a pure read on
+        # one line, and a line-level test would count `foo`. Each statement is
+        # split out, then only the text from an allowlisted call name to the
+        # end of that statement is harvested.
+        nstmt = split(line, stmts, /;/)
+        for (q = 1; q <= nstmt; q++) {
+            stmt = stmts[q]
+            if (stmt !~ INIT_HELPERS) continue
+            # harvest only from the allowlisted call name onward
+            match(stmt, INIT_HELPERS)
+            rest = substr(stmt, RSTART)
+            while (match(rest, /&[A-Za-z_][A-Za-z0-9_.>-]*sh->[A-Za-z_][A-Za-z0-9_]*/)) {
+                s = substr(rest, RSTART, RLENGTH)
+                sub(/.*sh->/, "", s)
+                print s
+                rest = substr(rest, RSTART + RLENGTH)
+            }
         }
     }
 ' "$SRC" | sort -u)"
@@ -246,6 +269,8 @@ if [ -n "$missing" ]; then
         echo "        $m" >&2
     done
     echo "      ngx_slab_alloc() does not zero. Add an 'st->sh->NAME = ...;' to the" >&2
+    echo "      carve block -- or, if NAME is set up by an initialiser helper" >&2
+    echo "      taking its address, add that helper to INIT_HELPERS in this script." >&2
     echo "      carve block in ngx_http_cache_turbo_shm_init_zone() ($SRC)." >&2
     echo "      Do NOT add it to the shm.exists reload branch: that path deliberately" >&2
     echo "      inherits live state across a SIGHUP and zeroing there would wipe it." >&2
