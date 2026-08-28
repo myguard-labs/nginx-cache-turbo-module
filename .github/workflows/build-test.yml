@@ -1,4 +1,4 @@
-# sync-sha: 6c72d6b1d5a57b3225e8b38571c6a98933521a4f1a02b4e302b5b209a2c7d8bd
+# sync-sha: c734a50d22f80f20bced36f5519d2d68d1bd3845e2a09e52be09379cc87f0c11
 name: Build & Test
 
 # Runner labels live in the POOL repository variable. Every checked-in selector
@@ -127,9 +127,14 @@ jobs:
             exit 1
           fi
 
-      - name: Static analysis (R7 shm-lock + P4-2-s3b stripe seam + cppcheck + whitespace)
+      - name: Static analysis (R7 shm-lock + P4-2-s3b stripe seam + CARVE-INIT + cppcheck + whitespace)
         run: |
           bash ci/tools/lint-shm-lock.sh
+          # CARVE-INIT: every shctx member must be initialised at zone carve.
+          # ngx_slab_alloc() does not zero, but the fresh-carve path lands on
+          # kernel-zeroed pages, so a forgotten member reads 0 anyway and no
+          # runtime test can observe the omission -- only this gate can.
+          bash ci/tools/lint-carve-init.sh
           # P4-2-s3b: no site may reach a stripe's slab pool outside the
           # resolver. At N == 1 a stray bare `z->shpool` behaves identically to
           # the resolver, so no runtime test can see it -- this is the only
