@@ -9,6 +9,11 @@ Changes with the nginx-cache-turbo-module (unreleased)
        versions through 1.1.0. Mitigation without upgrading: invoke the warm
        endpoint without credentials or sensitive custom headers.
 
+    *) Bugfix: a malformed valued request Cache-Control max-stale directive,
+       such as max-stale=abc or max-stale=, was treated as the valid bare form
+       and granted unlimited stale tolerance. Invalid valued forms now grant no
+       stale tolerance; bare max-stale and valid numeric bounds are unchanged.
+
     *) Feature: the admin JSON endpoint now reports "lock_ttl", the effective
        single-flight lock TTL in seconds for the admin location -- after
        preset-band resolution, inheritance, and the parse-time clamp to the

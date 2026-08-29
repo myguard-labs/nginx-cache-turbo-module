@@ -266,14 +266,67 @@ def test_request_cc_serve_verdict_stale(ng: Nginx, origin: Origin) -> None:
     assert hp.get("x-ct-status") == "STALE", \
         f"max-stale=100 must permit the stale copy, got {hp.get('x-ct-status')}"
 
-    # max-stale=abc: unparseable value falls back to "accept any staleness"
-    # (req_max_stale_any, module.c:1375) -> STALE served.
+    # The quoted historical form remains a valid delta-seconds value.
+    fetch(ng.port, "/reqccst/cq")
+    time.sleep(1.3)
+    _, _, hq = fetch(ng.port, "/reqccst/cq",
+                     headers={"Cache-Control": 'max-stale="100"'})
+    assert hq.get("x-ct-status") == "STALE", \
+        f"quoted max-stale=100 must permit STALE, got {hq.get('x-ct-status')}"
+
+    # max-stale=abc: a valued directive with an invalid delta does not grant
+    # the unlimited stale tolerance reserved for a valid bare max-stale.
     fetch(ng.port, "/reqccst/d")
     time.sleep(1.3)
+    before = origin.hits_for("/d")
     _, _, hu = fetch(ng.port, "/reqccst/d",
                      headers={"Cache-Control": "max-stale=abc"})
-    assert hu.get("x-ct-status") == "STALE", \
-        f"unparseable max-stale must be lenient (STALE), got {hu.get('x-ct-status')}"
+    assert hu.get("x-ct-status") != "STALE", \
+        f"invalid valued max-stale must refuse STALE, got {hu.get('x-ct-status')}"
+    assert origin.hits_for("/d") == before + 1, \
+        "invalid valued max-stale must revalidate at the origin"
+
+    # max-stale= is valued (the '=' is present) but empty. It must not be
+    # confused with the valid bare directive merely because both have vlen=0.
+    fetch(ng.port, "/reqccst/e")
+    time.sleep(1.3)
+    before = origin.hits_for("/e")
+    _, _, he = fetch(ng.port, "/reqccst/e",
+                     headers={"Cache-Control": "max-stale="})
+    assert he.get("x-ct-status") != "STALE", \
+        f"empty valued max-stale must refuse STALE, got {he.get('x-ct-status')}"
+    assert origin.hits_for("/e") == before + 1, \
+        "empty valued max-stale must revalidate at the origin"
+
+    # A valid bare max-stale still grants unlimited tolerance within the
+    # cache's own serveable stale window.
+    fetch(ng.port, "/reqccst/f")
+    time.sleep(1.3)
+    before = origin.hits_for("/f")
+    _, _, hb = fetch(ng.port, "/reqccst/f",
+                     headers={"Cache-Control": "max-stale"})
+    assert hb.get("x-ct-status") == "STALE", \
+        f"bare max-stale must permit STALE, got {hb.get('x-ct-status')}"
+    assert origin.hits_for("/f") == before, \
+        "bare max-stale stale serve must not reach the origin"
+
+    # Numeric values across field-lines remain restrictive in either order.
+    for order in ("restrictive-last", "restrictive-first"):
+        path = f"/reqccst/split-{order}"
+        origin_path = f"/split-{order}"
+        fetch(ng.port, path)
+        time.sleep(2.3)
+        lines = [("Cache-Control", "max-stale=100"),
+                 ("Cache-Control", "max-stale=0")]
+        if order == "restrictive-first":
+            lines.reverse()
+        before = origin.hits_for(origin_path)
+        _, _, hs = fetch_dup(ng.port, path, lines)
+        assert hs.get("x-ct-status") != "STALE", (
+            f"the tightest max-stale across field-lines must win ({order}), "
+            f"got {hs.get('x-ct-status')}")
+        assert origin.hits_for(origin_path) == before + 1, (
+            f"restrictive max-stale field-lines must revalidate ({order})")
     drain_origin(origin)
 
 

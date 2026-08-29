@@ -1168,13 +1168,15 @@ ngx_http_cache_turbo_status_ttl(ngx_http_cache_turbo_loc_conf_t *clcf,
  * value [v,last). Each token is "<name>" or "<name>=<value>" with optional
  * surrounding LWS. Returns a pointer to the value (after '=') with *vlen set
  * when the directive is present with a value, the token start with *vlen == 0
- * when present bare, or NULL when absent. A full-token match (not a substring)
- * is what keeps `s-maxage` from matching inside `max-age` parsing and
- * `max-age=0` from matching inside `max-age=01000` (see the codex follow-ups).
+ * when present bare, or NULL when absent. When `valued` is non-NULL, it
+ * distinguishes a bare directive from an empty valued one. A full-token match
+ * (not a substring) is what keeps `s-maxage` from matching inside `max-age`
+ * parsing and `max-age=0` from matching inside `max-age=01000` (see the codex
+ * follow-ups).
  */
 static u_char *
 ngx_http_cache_turbo_cc_token(u_char *v, u_char *last, const char *name,
-    size_t nlen, size_t *vlen)
+    size_t nlen, size_t *vlen, ngx_int_t *valued)
 {
     u_char  *s = v, *tok, *e, *eq;
     size_t   tn;
@@ -1197,8 +1199,14 @@ ngx_http_cache_turbo_cc_token(u_char *v, u_char *last, const char *name,
 
         if (tn == nlen && ngx_strncasecmp(tok, (u_char *) name, nlen) == 0) {
             if (eq) {
+                if (valued != NULL) {
+                    *valued = 1;
+                }
                 *vlen = (size_t) (e - (eq + 1));
                 return eq + 1;
+            }
+            if (valued != NULL) {
+                *valued = 0;
             }
             *vlen = 0;
             return tok;
@@ -1217,7 +1225,8 @@ ngx_http_cache_turbo_cc_has(u_char *v, u_char *last, const char *name,
 {
     size_t  vlen;
 
-    return ngx_http_cache_turbo_cc_token(v, last, name, nlen, &vlen) != NULL;
+    return ngx_http_cache_turbo_cc_token(v, last, name, nlen, &vlen, NULL)
+           != NULL;
 }
 
 
@@ -1270,7 +1279,7 @@ ngx_http_cache_turbo_cc_delta(u_char *p, u_char *last, const char *name,
     u_char  *q;
     size_t   vlen;
 
-    q = ngx_http_cache_turbo_cc_token(p, last, name, nlen, &vlen);
+    q = ngx_http_cache_turbo_cc_token(p, last, name, nlen, &vlen, NULL);
     if (q == NULL || vlen == 0) {
         return -1;
     }
@@ -1640,6 +1649,7 @@ ngx_http_cache_turbo_resolve_req_cc(ngx_http_request_t *r,
             u_char  *e = v + h[i].value.len;
             u_char  *q;
             size_t   vlen;
+            ngx_int_t valued;
             time_t   d;
 
             if (ctx->req_cc.data == NULL) {
@@ -1676,21 +1686,27 @@ ngx_http_cache_turbo_resolve_req_cc(ngx_http_request_t *r,
             }
 
             q = ngx_http_cache_turbo_cc_token(v, e, "max-stale",
-                    sizeof("max-stale") - 1, &vlen);
+                    sizeof("max-stale") - 1, &vlen, &valued);
             if (q != NULL) {
                 ctx->req_max_stale_set = 1;
                 ctx->has_req_bounds = 1;
-                d = vlen ? ngx_http_cache_turbo_cc_parse_delta(q, vlen) : -1;
+                if (!valued) {
+                    if (ctx->req_max_stale < 0) {
+                        ctx->req_max_stale_any = 1;
+                    }
+                    continue;
+                }
+                d = ngx_http_cache_turbo_cc_parse_delta(q, vlen);
                 if (d >= 0) {
                     if (ctx->req_max_stale < 0 || d < ctx->req_max_stale) {
                         ctx->req_max_stale = d;
                     }
                     ctx->req_max_stale_any = 0;
-                } else if (ctx->req_max_stale < 0) {
-                    /* Existing lenient invalid/bare policy; the dependent
-                     * REQUEST-MAX-STALE-INVALID row tightens invalid values. */
-                    ctx->req_max_stale_any = 1;
                 }
+                /* A malformed valued directive grants no stale tolerance.
+                 * Keep any valid bare or numeric directive from another
+                 * field-line; otherwise max_stale_set + the -1 sentinel makes
+                 * req_serve_verdict() fail closed for stale content. */
             }
         } else if (ctx->req_pragma.data == NULL
             && h[i].key.len == sizeof("Pragma") - 1

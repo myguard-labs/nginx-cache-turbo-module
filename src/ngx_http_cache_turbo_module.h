@@ -2828,9 +2828,11 @@ typedef struct {
     /* RFC-1 request freshness bounds (parsed once in the prologue). max_age /
      * min_fresh = -1 when absent (§5.2.1.1/§5.2.1.3). max_stale: max_stale_set
      * marks presence, max_stale_any a bare "max-stale" (accept any staleness),
-     * else req_max_stale carries the value (§5.2.1.2). req_reval is set when an
-     * existing entry failed the client's bounds (or no-cache/max-age=0), so the
-     * cold-miss CLAIM_FRESH path must NOT re-serve the raced-in fresh entry. */
+     * else req_max_stale carries the value (§5.2.1.2). An invalid valued form
+     * keeps max_stale_set with both tolerance forms unset, refusing stale.
+     * req_reval is set when an existing entry failed the client's bounds (or
+     * no-cache/max-age=0), so the cold-miss CLAIM_FRESH path must NOT re-serve
+     * the raced-in fresh entry. */
     time_t                   req_max_age;
     time_t                   req_min_fresh;
     time_t                   req_max_stale;
