@@ -697,9 +697,9 @@ typedef struct {
      * this would make a corrupted node un-evictable and leak the zone. Do NOT
      * invert it.
      *
-     * When cache_turbo_scan_resistant is off (the default) nothing ever sets
-     * this to PROTECTED, sh->lru_protected stays empty, and every path degrades
-     * to exactly the flat single-queue LRU that shipped before S8. */
+     * When cache_turbo_scan_resistant is off (an explicit opt-out) nothing ever
+     * sets this to PROTECTED, sh->lru_protected stays empty, and every path
+     * degrades to exactly the flat single-queue LRU that shipped before S8. */
     ngx_uint_t               seg;
 
     /* S8: has this node been touched (accessed) at least once since it was
@@ -1779,9 +1779,9 @@ typedef struct {
     ngx_int_t                min_uses_raw;
                                           /* explicit cache_turbo_min_uses   */
 
-    /* S8 scan-resistant segmented LRU. `cache_turbo_scan_resistant off` (the
-     * default) stores 0 here, which every LRU path reads as "flat LRU, behave
-     * exactly as before S8". `on` stores the protected-segment cap as a
+    /* S8 scan-resistant segmented LRU. `cache_turbo_scan_resistant` is on by
+     * default; explicit `off` stores 0, which every LRU path reads as "flat
+     * LRU, behave exactly as before S8". `on` stores the protected-segment cap as a
      * percentage (1..99, default 80). One field carries both the on/off state
      * and the tuning, so there is no way to be "on with pct 0". */
     ngx_uint_t               scan_resistant_pct;
@@ -2080,9 +2080,9 @@ typedef struct {
 
     /* cache_turbo_breaker on|off (O4.4). Separate on/off switch from the
      * module's own `enable`: a location can have cache_turbo on with the
-     * breaker left off (today's behaviour, and the default), or the breaker
-     * explicitly re-enabled/disabled per-location independently of caching
-     * itself. NGX_CONF_UNSET until merge; merges to off (0) — see
+     * breaker left off, or the breaker explicitly re-enabled/disabled
+     * per-location independently of caching itself. NGX_CONF_UNSET until
+     * merge; merges to on (1) by default — see
      * ngx_http_cache_turbo_breaker_should_consult() for the full admission
      * rule this feeds. This is one of THREE independent ways to express
      * "breaker off": the flag itself, `breaker_threshold 0`, or
@@ -2093,9 +2093,9 @@ typedef struct {
      * ngx_http_cache_turbo_shm_breaker_record() from the request path; the
      * O4.3 serve-path read and the directives that set these are O4.4.
      *
-     * ⚠ Both merge to 0, and 0 is INERT on purpose (see the contract in
-     * _breaker_record(): threshold == 0 disables tripping, window == 0
-     * likewise). O4.4 adds the parsers that can make either non-zero;
+     * ⚠ The shipped defaults are threshold 5 and window 10s; an explicit 0 is
+     * INERT (see the contract in _breaker_record(): threshold == 0 disables
+     * tripping, window == 0 likewise). O4.4 adds the parsers that tune them;
      * whether the breaker is actually consulted is decided by
      * ngx_http_cache_turbo_breaker_should_consult(), which additionally
      * requires breaker_enable and clcf->enable.

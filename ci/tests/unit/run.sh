@@ -17,6 +17,8 @@ CC="${CC:-cc}"
 CFLAGS="-g -O0 -Wall -Wextra -Werror -I$DIR"
 
 bash "$DIR/check_constants.sh"
+bash "$DIR/check_directive_synopsis.sh" "$(cd "$DIR/../../.." && pwd)"
+bash "$DIR/check_default_comments.sh" "$(cd "$DIR/../../.." && pwd)"
 
 if [ "${COVERAGE:-0}" = 1 ]; then
     CFLAGS="$CFLAGS --coverage"

@@ -405,7 +405,7 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       NULL },
 
     /* P5-5r: OPT-IN, default off -- see the field comment on
-     * breaker_count_retries in the .h for why this does not ship on. When
+     * breaker_count_retries in the .h for why this remains opt-in. When
      * on, every proxy_next_upstream peer attempt that failed before the
      * final one also counts toward the breaker's failure run. */
     { ngx_string("cache_turbo_breaker_count_retries"),
