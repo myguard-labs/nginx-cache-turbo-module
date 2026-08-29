@@ -6,16 +6,20 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 typedef intptr_t       ngx_int_t;
 typedef uintptr_t      ngx_uint_t;
+typedef ngx_int_t      ngx_flag_t;
 typedef unsigned char  u_char;
 
 #define NGX_OK                           0
 #define NGX_ERROR                       -1
 #define NGX_AGAIN                       -2
 #define NGX_DONE                        -4
+#define NGX_HTTP_OK                    200
+#define NGX_HTTP_BAD_REQUEST           400
 #define NGX_HTTP_INTERNAL_SERVER_ERROR 500
 
 typedef struct {
@@ -31,6 +35,7 @@ typedef struct {
 typedef struct ngx_http_request_s ngx_http_request_t;
 struct ngx_http_request_s {
     ngx_pool_t  *pool;
+    ngx_str_t    args;
     ngx_uint_t   send_calls;
     ngx_uint_t   sent_status;
     ngx_str_t    sent_body;
@@ -65,7 +70,73 @@ typedef struct {
 struct ngx_http_cache_turbo_loc_conf_s {
     ngx_cache_turbo_l1_backend_t  *l1;
     ngx_cache_turbo_backend_t     *backend;
+    ngx_int_t                      warm_max;
 };
+
+#define ngx_str_set(str, text)                                               \
+    do {                                                                      \
+        (str)->len = sizeof(text) - 1;                                         \
+        (str)->data = (u_char *) (text);                                       \
+    } while (0)
+
+static ngx_int_t
+ngx_http_arg(ngx_http_request_t *r, u_char *name, size_t len, ngx_str_t *value)
+{
+    if (len == 3 && memcmp(name, "all", 3) == 0 && r->args.len == 5
+        && memcmp(r->args.data, "all=1", 5) == 0)
+    {
+        value->data = r->args.data + 4;
+        value->len = 1;
+        return NGX_OK;
+    }
+
+    return NGX_ERROR;
+}
+
+static ngx_int_t
+ngx_http_cache_turbo_admin_purge_key(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_zone_t *z,
+    ngx_str_t *arg, ngx_uint_t *purged)
+{
+    (void) r;
+    (void) clcf;
+    (void) z;
+    (void) arg;
+    (void) purged;
+    abort();
+}
+
+static ngx_int_t
+ngx_http_cache_turbo_admin_purge_tag(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_zone_t *z,
+    ngx_str_t *arg)
+{
+    (void) r;
+    (void) clcf;
+    (void) z;
+    (void) arg;
+    abort();
+}
+
+static ngx_int_t
+ngx_http_cache_turbo_warm(ngx_http_request_t *r, ngx_str_t *urls,
+    ngx_int_t warm_max)
+{
+    (void) r;
+    (void) urls;
+    (void) warm_max;
+    abort();
+}
+
+static ngx_int_t
+ngx_http_cache_turbo_warm_file(ngx_http_request_t *r, ngx_str_t *path,
+    ngx_int_t warm_max)
+{
+    (void) r;
+    (void) path;
+    (void) warm_max;
+    abort();
+}
 
 static void *
 ngx_pnalloc(ngx_pool_t *pool, size_t size)

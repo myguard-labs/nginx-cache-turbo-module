@@ -88,6 +88,14 @@ static int  failures;
         }                                                                     \
     } while (0)
 
+#define REQUIRE_OK(call, msg)                                                 \
+    do {                                                                      \
+        if ((call) != NGX_OK) {                                               \
+            CHECK(0, (msg));                                                  \
+            return;                                                           \
+        }                                                                     \
+    } while (0)
+
 /* The one-byte store marker_store performs, as an explicit step: the tests
  * feed variant_hash what the WIRE would carry, not what the caller intended. */
 static ngx_uint_t
@@ -103,7 +111,7 @@ stored_gen(ngx_uint_t gen)
  *
  * This models the keyspace the old sentinel produced for gen == 0. It is the
  * thing gen 0 must no longer collide with. */
-static void
+static ngx_int_t
 digest_of_untagged(u_char out[32])
 {
     ngx_http_cache_turbo_digest_t  d;
@@ -114,7 +122,7 @@ digest_of_untagged(u_char out[32])
 
     ngx_http_cache_turbo_digest_init(&d);
     ngx_http_cache_turbo_digest_update(&d, base.data, base.len);
-    ngx_http_cache_turbo_digest_final(&d, out);
+    return ngx_http_cache_turbo_digest_final(&d, out);
 }
 
 static ngx_int_t
@@ -168,19 +176,19 @@ successful_vary_keys_match_fixed_vectors(void)
     base.len = strlen(VARIANT_TEST_BASE);
 
     hex_to_bytes(variant_hex, expected);
-    CHECK(ngx_http_cache_turbo_variant_hash(NULL, &base, 0, 7, out) == NGX_OK,
-          "fixed-vector variant hash must succeed");
+    REQUIRE_OK(ngx_http_cache_turbo_variant_hash(NULL, &base, 0, 7, out),
+               "fixed-vector variant hash must succeed");
     CHECK(memcmp(out, expected, 32) == 0,
           "successful variant-key bytes must stay compatible");
 
     hex_to_bytes(marker_hex, expected);
-    CHECK(ngx_http_cache_turbo_marker_hash(&base, out) == NGX_OK,
-          "fixed-vector marker hash must succeed");
+    REQUIRE_OK(ngx_http_cache_turbo_marker_hash(&base, out),
+               "fixed-vector marker hash must succeed");
     CHECK(memcmp(out, expected, 32) == 0,
           "successful marker-key bytes must stay compatible");
 
-    CHECK(ngx_http_cache_turbo_variant_index_name(&base, out, &len) == NGX_OK,
-          "fixed-vector variant-index name must succeed");
+    REQUIRE_OK(ngx_http_cache_turbo_variant_index_name(&base, out, &len),
+               "fixed-vector variant-index name must succeed");
     CHECK(len == 65 && out[0] == ' ',
           "variant-index name framing must stay one space plus 64 hex bytes");
     CHECK(memcmp(out + 1, index_hex, 64) == 0,
@@ -227,6 +235,34 @@ digest_failures_propagate_across_vary_helpers(void)
 }
 
 
+static void
+digest_test_helpers_propagate_failures(void)
+{
+    u_char  tagged[32], variant[32];
+
+    memset(tagged, 0xA5, sizeof(tagged));
+    memset(variant, 0xA5, sizeof(variant));
+
+    ngx_test_digest_update_fail = 1;
+    CHECK(digest_of(7, variant) == NGX_ERROR,
+          "digest_of must report an update failure");
+    CHECK(digest_of_untagged(tagged) == NGX_ERROR,
+          "digest_of_untagged must report an update failure");
+    ngx_test_digest_update_fail = 0;
+
+    ngx_test_digest_final_fail = 1;
+    CHECK(digest_of(7, variant) == NGX_ERROR,
+          "digest_of must report a final failure");
+    CHECK(digest_of_untagged(tagged) == NGX_ERROR,
+          "digest_of_untagged must report a final failure");
+    ngx_test_digest_final_fail = 0;
+
+    CHECK(tagged[0] == 0xA5 && tagged[31] == 0xA5
+              && variant[0] == 0xA5 && variant[31] == 0xA5,
+          "failed test-helper digests must not publish output bytes");
+}
+
+
 /* The collision AUD-GEN1 closed: a base that was never purged must not compute
  * the same variant key as one purged 256 times, even though both store the
  * byte 0.
@@ -255,8 +291,9 @@ never_purged_folds_its_generation(void)
     CHECK(stored_gen(256) == 0,
           "precondition: the 256th generation must truncate to byte 0");
 
-    digest_of(0, never);
-    digest_of_untagged(tagged);
+    REQUIRE_OK(digest_of(0, never), "gen-0 digest must succeed");
+    REQUIRE_OK(digest_of_untagged(tagged),
+               "untagged comparison digest must succeed");
 
     CHECK(memcmp(never, tagged, 32) != 0,
           "gen 0 must fold \"gen=0\" rather than nothing (AUD-GEN1); equal to "
@@ -276,8 +313,10 @@ same_stored_byte_collides_by_design(void)
     CHECK(stored_gen(3) == stored_gen(259),
           "precondition: gen 3 and gen 259 must store the same byte");
 
-    digest_of(stored_gen(3), a);
-    digest_of(stored_gen(259), b);
+    REQUIRE_OK(digest_of(stored_gen(3), a),
+               "first stored-generation digest must succeed");
+    REQUIRE_OK(digest_of(stored_gen(259), b),
+               "second stored-generation digest must succeed");
 
     CHECK(memcmp(a, b, 32) == 0,
           "generations sharing a stored byte collide by design; a DIFFERENCE "
@@ -294,9 +333,9 @@ distinct_generations_differ(void)
 {
     u_char  g1[32], g2[32], g255[32];
 
-    digest_of(1, g1);
-    digest_of(2, g2);
-    digest_of(255, g255);
+    REQUIRE_OK(digest_of(1, g1), "gen-1 digest must succeed");
+    REQUIRE_OK(digest_of(2, g2), "gen-2 digest must succeed");
+    REQUIRE_OK(digest_of(255, g255), "gen-255 digest must succeed");
 
     CHECK(memcmp(g1, g2, 32) != 0, "gen 1 and gen 2 must differ");
     CHECK(memcmp(g2, g255, 32) != 0, "gen 2 and gen 255 must differ");
@@ -314,11 +353,13 @@ base_key_still_folded(void)
 
     base.data = (u_char *) "https://example.test/a";
     base.len  = strlen("https://example.test/a");
-    ngx_http_cache_turbo_variant_hash(NULL, &base, 0, 7, one);
+    REQUIRE_OK(ngx_http_cache_turbo_variant_hash(NULL, &base, 0, 7, one),
+               "first base-key digest must succeed");
 
     base.data = (u_char *) "https://example.test/b";
     base.len  = strlen("https://example.test/b");
-    ngx_http_cache_turbo_variant_hash(NULL, &base, 0, 7, two);
+    REQUIRE_OK(ngx_http_cache_turbo_variant_hash(NULL, &base, 0, 7, two),
+               "second base-key digest must succeed");
 
     CHECK(memcmp(one, two, 32) != 0,
           "different base keys must produce different variant keys");
@@ -330,6 +371,7 @@ main(void)
 {
     successful_vary_keys_match_fixed_vectors();
     digest_failures_propagate_across_vary_helpers();
+    digest_test_helpers_propagate_failures();
     never_purged_folds_its_generation();
     same_stored_byte_collides_by_design();
     distinct_generations_differ();

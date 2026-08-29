@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Extract the real admin whole-zone purge helper so the user-visible
-# L1-incomplete response and L2 short-circuit are executable contracts.
+# Extract the real admin whole-zone purge helper and dispatcher so error
+# responses cannot fall through to the dispatcher's common 200 reply.
 set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -9,13 +9,13 @@ OUT="$DIR/generated_admin_purge_all.inc"
 
 awk '
     /^static ngx_int_t$/ { pending = 1; buf = $0 ORS; next }
-    pending && /^ngx_http_cache_turbo_admin_purge_all\(/ {
+    pending && /^ngx_http_cache_turbo_admin_purge_(all|dispatch)\(/ {
         capture = 1; pending = 0; printf "%s", buf; print; next
     }
     pending { pending = 0; buf = "" }
     capture {
         print
-        if ($0 == "}") { capture = 0; exit }
+        if ($0 == "}") { capture = 0 }
     }
 ' "$SRC" >"$OUT"
 
@@ -25,4 +25,10 @@ if ! grep -qF 'ngx_http_cache_turbo_admin_purge_all(' "$OUT"; then
 	exit 1
 fi
 
-echo "✓ extracted admin purge-all helper → $(basename "$OUT")"
+if ! grep -qF 'ngx_http_cache_turbo_admin_purge_dispatch(' "$OUT"; then
+	echo "✗ failed to extract admin purge dispatcher from $SRC" >&2
+	rm -f "$OUT"
+	exit 1
+fi
+
+echo "✓ extracted admin purge-all helper + dispatcher → $(basename "$OUT")"

@@ -140,16 +140,19 @@ ngx_http_cache_turbo_all_purge_complete(ngx_http_request_t *r, void *data,
 
 /* ?all=1 whole-zone purge (POST/PUT/DELETE). Mirrors the admin_handler dispatch
  * exactly: on success sets *purged and returns NGX_OK so the caller emits the
- * common {"purged":N} reply; on a path that sends its own response (L1
- * incomplete, parked SCAN, or L2 unavailable) returns that rc directly so
- * admin_handler can propagate it unchanged. */
+ * common {"purged":N} reply; on a synchronous path that sends its own response
+ * sets *responded so admin_handler does not mistake send_json()'s NGX_OK for
+ * purge success and emit a second 200. Parked SCAN and send failures propagate
+ * their rc directly. */
 static ngx_int_t
 ngx_http_cache_turbo_admin_purge_all(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_zone_t *z,
-    ngx_uint_t *purged)
+    ngx_uint_t *purged, ngx_flag_t *responded)
 {
     u_char     *p;
     ngx_str_t   body;
+
+    *responded = 0;
 
     if (clcf->l1->purge_all(z, purged) != NGX_OK) {
         p = ngx_pnalloc(r->pool,
@@ -162,6 +165,7 @@ ngx_http_cache_turbo_admin_purge_all(ngx_http_request_t *r,
         body.len = ngx_sprintf(p,
                        "{\"purged\":%ui,\"l1\":\"incomplete\"}\n",
                        *purged) - p;
+        *responded = 1;
         return ngx_http_cache_turbo_send_json(r,
                    NGX_HTTP_INTERNAL_SERVER_ERROR, &body);
     }
@@ -208,6 +212,7 @@ ngx_http_cache_turbo_admin_purge_all(ngx_http_request_t *r,
         body.len = ngx_sprintf(p,
                        "{\"purged\":%ui,\"l2\":\"unavailable\"}\n",
                        *purged) - p;
+        *responded = 1;
         return ngx_http_cache_turbo_send_json(r,
                    NGX_HTTP_INTERNAL_SERVER_ERROR, &body);
     }
@@ -391,10 +396,12 @@ ngx_http_cache_turbo_admin_purge_dispatch(ngx_http_request_t *r,
         && ngx_http_arg(r, (u_char *) "all", 3, &arg) == NGX_OK
         && arg.len == 1 && arg.data[0] == '1')
     {
-        ngx_int_t  rc;
+        ngx_flag_t  responded;
+        ngx_int_t   rc;
 
-        rc = ngx_http_cache_turbo_admin_purge_all(r, clcf, z, &purged);
-        if (rc != NGX_OK) {
+        rc = ngx_http_cache_turbo_admin_purge_all(r, clcf, z, &purged,
+                                                   &responded);
+        if (responded || rc != NGX_OK) {
             return rc;
         }
 
