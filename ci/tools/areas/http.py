@@ -9,6 +9,8 @@ star-imports this module, so every test stays reachable as
 
 from __future__ import annotations
 
+import http.client
+
 # Underscore-prefixed names are NOT re-exported by `import *`, so the
 # private helpers this module actually calls are imported explicitly.
 from test_runtime_base import *
@@ -17,6 +19,7 @@ from test_runtime_base import (
     _admin_stat,
     _admin_str,
     _errlog_window_start,
+    _fetch_keepalive,
 )
 
 
@@ -81,6 +84,73 @@ def test_nocache_breaker_closed_still_revalidates(ng: Nginx, origin: Origin) -> 
         (f"breaker CLOSED + no-cache must consult the origin exactly once, "
          f"got {origin.hits_for('/oc2')} vs before={before}")
     assert b_nc != b0, "no-cache response should be a fresh origin generation"
+
+
+def test_hostile_origin_framing_matrix(ng: Nginx, origin: Origin) -> None:
+    """HOSTILE-ORIGIN-MATRIX: malformed upstream framing must never populate
+    cache state that can later be replayed."""
+    cases = [
+        ("GET", "cl-te"),
+        ("GET", "conflicting-cl"),
+        ("GET", "bad-chunk"),
+        ("GET", "truncated-chunk"),
+        ("GET", "premature-eof"),
+        ("GET", "trailers"),
+        ("GET", "surplus-bytes"),
+        ("GET", "103-sequence"),
+        ("HEAD", "head-body"),
+        ("GET", "204-body"),
+        ("GET", "304-body"),
+    ]
+
+    may_store_complete_body = {"surplus-bytes", "103-sequence"}
+
+    for method, case in cases:
+        path = f"/c/hostile-origin/{case}"
+        try:
+            status, body, headers = fetch_raw(ng.port, path, method=method)
+        except (http.client.HTTPException, OSError, TimeoutError) as exc:
+            status, body, headers = 0, f"{type(exc).__name__}: {exc}", {}
+
+        assert headers.get("x-cache") != "HIT", \
+            f"{case}: first hostile request was served from cache: {headers}"
+        if status == 200:
+            assert "hostile-" not in body and "HELLOJUNK" not in body, \
+                f"{case}: hostile upstream bytes reached client: {body!r}"
+        else:
+            assert status in (0, 204, 304, 502, 504), \
+                f"{case}: unexpected hostile status {status}, body={body!r}"
+
+        try:
+            retry_status, retry_body, retry_headers = fetch_raw(
+                ng.port, path, method=method)
+        except (http.client.HTTPException, OSError, TimeoutError) as exc:
+            retry_status = 0
+            retry_body = f"{type(exc).__name__}: {exc}"
+            retry_headers = {}
+        if case not in may_store_complete_body:
+            assert retry_headers.get("x-cache") != "HIT", \
+                f"{case}: malformed upstream response was stored and replayed"
+        if retry_status == 200:
+            assert "hostile-" not in retry_body and "HELLOJUNK" not in retry_body, \
+                f"{case}: replayed hostile upstream bytes: {retry_body!r}"
+        else:
+            assert retry_status in (0, 204, 304, 502, 504), \
+                f"{case}: unexpected retry status {retry_status}"
+
+        conn = http.client.HTTPConnection(
+            "127.0.0.1", ng.port, timeout=HTTP_TIMEOUT)
+        try:
+            ok, ok_body, ok_headers = _fetch_keepalive(
+                conn, f"/c/hostile-clean-follow-{case}")
+            assert ok == 200 and ok_body, \
+                f"{case}: clean follow-up failed: {ok} {ok_body!r}"
+            assert ok_headers.get("x-cache") != "HIT", \
+                f"{case}: follow-up unexpectedly reused cache state"
+        finally:
+            conn.close()
+
+    drain_origin(origin)
 
 
 def test_nocache_only_if_cached_still_504(ng: Nginx, origin: Origin) -> None:

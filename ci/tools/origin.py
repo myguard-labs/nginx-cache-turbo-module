@@ -360,6 +360,102 @@ class Origin:
                 Returns (True, None) if a complete response was written
                 (caller must stop), or (False, body) with the body for the
                 common 200 path to send."""
+                if "/hostile-origin/" in self.path:
+                    case = self.path.rsplit("/", 1)[-1].split("?", 1)[0]
+                    body = f"hostile-{case}-{n}\n".encode()
+                    responses = {
+                        "cl-te": (
+                            b"HTTP/1.1 200 OK\r\n"
+                            b"Content-Length: 999\r\n"
+                            b"Transfer-Encoding: chunked\r\n"
+                            b"Cache-Control: public, max-age=60\r\n"
+                            b"\r\n"
+                            b"5\r\nHELLO\r\n0\r\n\r\n"
+                        ),
+                        "conflicting-cl": (
+                            b"HTTP/1.1 200 OK\r\n"
+                            b"Content-Length: 5\r\n"
+                            b"Content-Length: 7\r\n"
+                            b"Cache-Control: public, max-age=60\r\n"
+                            b"\r\n"
+                            b"HELLO!!"
+                        ),
+                        "bad-chunk": (
+                            b"HTTP/1.1 200 OK\r\n"
+                            b"Transfer-Encoding: chunked\r\n"
+                            b"Cache-Control: public, max-age=60\r\n"
+                            b"\r\n"
+                            b"ZZ\r\nHELLO\r\n"
+                        ),
+                        "truncated-chunk": (
+                            b"HTTP/1.1 200 OK\r\n"
+                            b"Transfer-Encoding: chunked\r\n"
+                            b"Cache-Control: public, max-age=60\r\n"
+                            b"\r\n"
+                            b"A\r\nHELLO"
+                        ),
+                        "premature-eof": (
+                            b"HTTP/1.1 200 OK\r\n"
+                            b"Content-Length: 32\r\n"
+                            b"Cache-Control: public, max-age=60\r\n"
+                            b"\r\n"
+                            + body[:5]
+                        ),
+                        "trailers": (
+                            b"HTTP/1.1 200 OK\r\n"
+                            b"Transfer-Encoding: chunked\r\n"
+                            b"Trailer: X-After\r\n"
+                            b"Cache-Control: public, max-age=60\r\n"
+                            b"\r\n"
+                            b"5\r\nHELLO\r\n0\r\nX-After: dirty\r\n\r\n"
+                        ),
+                        "surplus-bytes": (
+                            b"HTTP/1.1 200 OK\r\n"
+                            b"Content-Length: 5\r\n"
+                            b"Cache-Control: public, max-age=60\r\n"
+                            b"\r\n"
+                            b"HELLOJUNK"
+                        ),
+                        "103-sequence": (
+                            b"HTTP/1.1 103 Early Hints\r\n"
+                            b"Link: </x.css>; rel=preload\r\n"
+                            b"\r\n"
+                            b"HTTP/1.1 200 OK\r\n"
+                            b"Content-Length: 5\r\n"
+                            b"Cache-Control: public, max-age=60\r\n"
+                            b"\r\n"
+                            b"HELLO"
+                        ),
+                        "head-body": (
+                            b"HTTP/1.1 200 OK\r\n"
+                            b"Content-Length: 5\r\n"
+                            b"Cache-Control: public, max-age=60\r\n"
+                            b"\r\n"
+                            b"HELLO"
+                        ),
+                        "204-body": (
+                            b"HTTP/1.1 204 No Content\r\n"
+                            b"Content-Length: 5\r\n"
+                            b"Cache-Control: public, max-age=60\r\n"
+                            b"\r\n"
+                            b"HELLO"
+                        ),
+                        "304-body": (
+                            b"HTTP/1.1 304 Not Modified\r\n"
+                            b"Content-Length: 5\r\n"
+                            b"ETag: \"hostile304\"\r\n"
+                            b"Cache-Control: public, max-age=60\r\n"
+                            b"\r\n"
+                            b"HELLO"
+                        ),
+                    }
+                    raw = responses.get(case)
+                    if raw is None:
+                        self.send_error(404)
+                    else:
+                        self.connection.sendall(raw)
+                        self.close_connection = True
+                    return True, None
                 # CTXRDR: a 404 the vhost turns into an `error_page` internal
                 # redirect. Unlike try_files (which redirects during the REWRITE
                 # phase, before our PRECONTENT access handler has ever run), an
