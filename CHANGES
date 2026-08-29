@@ -1,9 +1,11 @@
 Changes with the nginx-cache-turbo-module (unreleased)
 
-    *) Breaking change: the circuit breaker now defaults on with a threshold of
-       5 failures in 10s and a 30s open window. A dead or flapping origin can
-       therefore produce local 503 responses once the shared zone trips; use
-       `cache_turbo_breaker off;` to retain the previous disabled behavior.
+    *) Compatibility note (since v1.1.0): the shipped circuit-breaker defaults
+       are on, 5 failures in 10s, and a 30s open window; the shipped
+       keep-stale default is 24h. A dead or flapping origin can therefore
+       produce local 503 responses once the shared zone trips. Use
+       `cache_turbo_breaker off;` and/or `cache_turbo_keep_stale off;` to opt
+       out of those two defaults.
 
     *) Bugfix: an auto-Vary marker-store failure could unconditionally purge
        the variant key after publishing its L1 body. If another request

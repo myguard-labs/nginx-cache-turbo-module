@@ -2112,8 +2112,8 @@ http {
             cache_turbo_no_store          $cookie_session;              # don't store the response
             cache_turbo_bypass_uri         /wp-admin/; # optional URI bypass
             cache_turbo_bypass_stale_uri   /catalog/;  # optional breaker fallback
-            cache_turbo_backend_prefix     /shop/;     # optional mounted-app prefix
-            cache_turbo_key_cookie         locale;     # optional variant cookie
+            cache_turbo_backend_prefix     /shop/;     # opt-in example: mounted-app prefix
+            cache_turbo_key_cookie         locale;     # opt-in example: variant cookie
             # Cookie-ignore is only safe without a backend preset/value keying.
 
             # ── let the origin decide (inverts the store default here) ──
@@ -2286,8 +2286,9 @@ http {
 >
 > Sharing a zone also cuts the other way, and this direction is the easier one
 > to miss: **healthy traffic from one backend can mask a failure in another.**
-> The trip test is a run of *consecutive* failures inside the rolling
-> `cache_turbo_breaker_threshold` (default `5` failures over `10s`), and a success
+> The trip test is a run of *consecutive* failures: the count must reach
+> `cache_turbo_breaker_threshold` (default `5`) within the rolling
+> `cache_turbo_breaker_window` (default `10s`), and a success
 > clears the run. When a failing upstream shares a zone with a busy healthy one,
 > the healthy responses are interleaved into the same shared counter and keep
 > resetting it, so the failing backend may never accumulate an unbroken sequence
