@@ -49,6 +49,8 @@ ci/tests/unit/test_access_marker_resolve
 ci/tests/unit/generated_access_marker_resolve.inc
 ci/tests/unit/test_marker_store_key
 ci/tests/unit/generated_marker_store_key.inc
+ci/tests/unit/test_marker_rollback
+ci/tests/unit/generated_marker_rollback.inc
 ci/tests/unit/test_admin_purge_all
 ci/tests/unit/generated_admin_purge_all.inc
 ci/tests/unit/test_purge_digest_order

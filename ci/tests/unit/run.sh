@@ -149,6 +149,18 @@ bash "$DIR/extract_marker_store_key.sh"
 "$CC" $CFLAGS "$DIR/test_marker_store_key.c" -o "$DIR/test_marker_store_key"
 "$DIR/test_marker_store_key"
 
+# --- marker-failure rollback identity/race -------------------------------
+# A pins the exact blob it stored.  A deterministic two-thread barrier lets B
+# replace the same variant before A rolls back, proving compare-and-delete
+# preserves B while an isolated failed A is removed.  The mutation control
+# drops the identity comparison and must fail the exact survival assertion.
+bash "$DIR/extract_marker_rollback.sh"
+# shellcheck disable=SC2086
+"$CC" $CFLAGS -pthread "$DIR/test_marker_rollback.c" \
+	-o "$DIR/test_marker_rollback"
+"$DIR/test_marker_rollback"
+bash "$DIR/check_marker_rollback_control.sh"
+
 # --- admin ?all=1 incomplete-L1 response contract ------------------------
 # Exercise the real dispatcher and completion callback: NGX_AGAIN must still
 # launch configured L2 cleanup, then retain both tiers' exact outcome in the

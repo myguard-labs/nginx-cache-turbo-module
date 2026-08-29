@@ -3251,9 +3251,17 @@ struct ngx_cache_turbo_l1_backend_s {
 
     ngx_http_cache_turbo_node_t *(*lookup)(ngx_http_cache_turbo_zone_t *z,
         u_char *key_hash, uint32_t hash);
+
+    /* `stored_data` is an optional ownership token for post-store rollback.
+     * On NGX_OK, a non-NULL out-parameter receives the exact shm blob installed
+     * by this call with one reference acquired under the store's zone-mutex
+     * hold.  The caller MUST release it with blob_release().  Pinning the blob
+     * makes pointer identity ABA-safe: a replacement cannot reuse its slab
+     * address while the token is live.  NULL preserves the ordinary store
+     * path with no extra refcount operation. */
     ngx_int_t  (*store)(ngx_http_cache_turbo_zone_t *z, u_char *key_hash,
         uint32_t hash, u_char *data, size_t len,
-        time_t fresh_ttl, time_t stale_ttl);
+        time_t fresh_ttl, time_t stale_ttl, u_char **stored_data);
 
     /* Atomic "decide-then-write" store (AUD-L2-PROMOTE-RACE / AUD-5XX-CTA).
      * Modeled on `claim`, NOT on `store`: the predicate is evaluated and the
@@ -3283,7 +3291,8 @@ struct ngx_cache_turbo_l1_backend_s {
      *     error response overwrite a still-servable good body. */
     ngx_int_t  (*store_if)(ngx_http_cache_turbo_zone_t *z, u_char *key_hash,
         uint32_t hash, u_char *data, size_t len,
-        time_t fresh_ttl, time_t stale_ttl, ngx_uint_t predicate);
+        time_t fresh_ttl, time_t stale_ttl, ngx_uint_t predicate,
+        u_char **stored_data);
 
     ngx_int_t  (*purge_key)(ngx_http_cache_turbo_zone_t *z, u_char *key_hash,
         uint32_t hash);
@@ -3368,6 +3377,16 @@ struct ngx_cache_turbo_l1_backend_s {
      * OLD ttls, which would compound rather than refresh. */
     ngx_int_t  (*freshen)(ngx_http_cache_turbo_zone_t *z, u_char *key_hash,
         uint32_t hash, time_t fresh_ttl, time_t stale_ttl);
+
+    /* Roll back a store only while `stored_data` is still the blob installed
+     * under this key.  The caller holds an acquired blob reference from
+     * store()/store_if(), so pointer comparison cannot suffer slab-address
+     * ABA.  Returns 1 when that exact entry was removed, 0 when the key is
+     * absent or a concurrent store has replaced it.  Does not consume the
+     * caller's reference.  Appended to keep positional backend initialisers
+     * source-compatible. */
+    ngx_int_t  (*purge_if_blob)(ngx_http_cache_turbo_zone_t *z,
+        u_char *key_hash, uint32_t hash, u_char *stored_data);
 };
 
 #define NGX_HTTP_CACHE_TURBO_CLAIM_WINNER  0

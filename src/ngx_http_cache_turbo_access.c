@@ -2476,7 +2476,7 @@ ngx_http_cache_turbo_access_l2_promote_serve(ngx_http_request_t *r,
                ctx->key_hash, hash,
                ctx->l2_blob, ctx->l2_blob_len,
                rem_fresh, rem_stale,
-               NGX_HTTP_CACHE_TURBO_STORE_IF_NEWER);
+               NGX_HTTP_CACHE_TURBO_STORE_IF_NEWER, NULL);
 
 #if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
     && NGX_HTTP_CACHE_TURBO_TEST_FAULTS

@@ -144,7 +144,7 @@ ngx_http_cache_turbo_node_t *
 
 ngx_int_t ngx_http_cache_turbo_shm_store(ngx_http_cache_turbo_zone_t *z,
     u_char *key_hash, uint32_t hash, u_char *data, size_t len,
-    time_t fresh_ttl, time_t stale_ttl);
+    time_t fresh_ttl, time_t stale_ttl, u_char **stored_data);
 
 /* C3: marker-specific store. Identical wire contract to _shm_store() above,
  * plus (atomically, under the SAME lock hold as the write): tag the resulting
@@ -163,7 +163,8 @@ ngx_int_t ngx_http_cache_turbo_shm_store_marker(ngx_http_cache_turbo_zone_t *z,
  * semantics. */
 ngx_int_t ngx_http_cache_turbo_shm_store_if(ngx_http_cache_turbo_zone_t *z,
     u_char *key_hash, uint32_t hash, u_char *data, size_t len,
-    time_t fresh_ttl, time_t stale_ttl, ngx_uint_t predicate);
+    time_t fresh_ttl, time_t stale_ttl, ngx_uint_t predicate,
+    u_char **stored_data);
 
 /* P5-4: 304 freshening. See the L1 vtable `freshen` comment for the return
  * contract. */
@@ -174,6 +175,12 @@ ngx_int_t ngx_http_cache_turbo_shm_freshen(ngx_http_cache_turbo_zone_t *z,
  * not present. */
 ngx_int_t ngx_http_cache_turbo_shm_purge_key(ngx_http_cache_turbo_zone_t *z,
     u_char *key_hash, uint32_t hash);
+
+/* Compare-and-delete counterpart of store()/store_if()'s stored_data token.
+ * See the L1 vtable contract for ownership and return semantics. */
+ngx_int_t ngx_http_cache_turbo_shm_purge_if_blob(
+    ngx_http_cache_turbo_zone_t *z, u_char *key_hash, uint32_t hash,
+    u_char *stored_data);
 
 /* Purge a finite start-of-call entry budget. NGX_OK means the zone was empty
  * at the final lock-held observation; NGX_AGAIN means refill left entries.

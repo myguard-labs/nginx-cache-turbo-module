@@ -1,5 +1,12 @@
 Changes with the nginx-cache-turbo-module (unreleased)
 
+    *) Bugfix: an auto-Vary marker-store failure could unconditionally purge
+       the variant key after publishing its L1 body. If another request
+       replaced that variant during the marker write, the first request's
+       rollback deleted the replacement. Rollback now pins and conditionally
+       deletes only the exact blob written by the failing request; isolated
+       failures still remove their unindexed variant.
+
     *) Bugfix: OpenSSL digest update failures are now sticky, and digest
        failures from auto-Vary key derivation and the admin single-key purge
        are propagated instead of letting callers hash or act on invalid output.

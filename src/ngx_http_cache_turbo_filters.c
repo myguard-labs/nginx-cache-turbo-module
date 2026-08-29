@@ -1994,11 +1994,16 @@ static ngx_int_t
 ngx_http_cache_turbo_body_filter_store(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx,
     ngx_http_cache_turbo_zone_t *z, u_char *store_key, uint32_t hash,
-    u_char *blob, size_t blob_len, time_t ttl, time_t stale_window)
+    u_char *blob, size_t blob_len, time_t ttl, time_t stale_window,
+    u_char **stored_data)
 {
     ngx_int_t  store_rc;
     ngx_uint_t is_5xx = (r->headers_out.status
                           >= NGX_HTTP_INTERNAL_SERVER_ERROR);
+
+    if (stored_data != NULL) {
+        *stored_data = NULL;
+    }
 
 #if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
     && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
@@ -2020,12 +2025,13 @@ ngx_http_cache_turbo_body_filter_store(ngx_http_request_t *r,
     if (is_5xx) {
         store_rc = clcf->l1->store_if(z, store_key, hash,
                    blob, blob_len, ttl, stale_window,
-                   NGX_HTTP_CACHE_TURBO_STORE_IF_ABSENT_OR_DEAD);
+                   NGX_HTTP_CACHE_TURBO_STORE_IF_ABSENT_OR_DEAD,
+                   stored_data);
 
     } else {
         store_rc = clcf->l1->store(z, store_key, hash,
                    blob, blob_len, ttl,
-                   stale_window);
+                   stale_window, stored_data);
     }
 
     /* AUD-5XX-CTA: NGX_DECLINED means store_if() refused the write
@@ -2066,6 +2072,27 @@ ngx_http_cache_turbo_body_filter_store(ngx_http_request_t *r,
     }
 
     return NGX_OK;
+}
+
+
+/* MARKER-ROLLBACK-RACE: a mandatory marker failure must not leave request A's
+ * newly stored variant reachable, but an unconditional purge can delete a
+ * replacement request B installed under the same key while A was storing the
+ * marker.  stored_data is a pinned identity token returned atomically with A's
+ * store; purge_if_blob removes the node only if it still owns that exact blob.
+ * The pin is released after the compare-and-delete lock hold, preventing slab
+ * address reuse from turning pointer identity into an ABA. */
+static void
+ngx_http_cache_turbo_body_filter_rollback_store(
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_zone_t *z,
+    u_char *store_key, uint32_t hash, u_char *stored_data)
+{
+    if (stored_data == NULL) {
+        return;
+    }
+
+    (void) clcf->l1->purge_if_blob(z, store_key, hash, stored_data);
+    ngx_http_cache_turbo_blob_release(z, stored_data);
 }
 
 
@@ -2413,6 +2440,7 @@ ngx_http_cache_turbo_body_filter_store_tail(ngx_http_request_t *r,
     uint32_t                      hash, nheaders = 0;
     u_char                       *blob;
     u_char                        store_key[32];
+    u_char                       *stored_data;
     size_t                        hdr_bytes = 0, blob_len = 0;
     ngx_str_t                     ct;
     time_t                        ttl, stale_window, sie_window;
@@ -2493,6 +2521,7 @@ ngx_http_cache_turbo_body_filter_store_tail(ngx_http_request_t *r,
         }
     }
     hash = ngx_crc32_short(store_key, 32);
+    stored_data = NULL;
 
     /* If we relocated the key away from the base (cold-miss winner that
      * only learned the Vary now), the cold-miss stub the access handler
@@ -2509,7 +2538,11 @@ ngx_http_cache_turbo_body_filter_store_tail(ngx_http_request_t *r,
 
     if (ngx_http_cache_turbo_body_filter_store(r, clcf, ctx, z, store_key,
                                                hash, blob, blob_len, ttl,
-                                               stale_window) == NGX_DECLINED)
+                                               stale_window,
+                                               clcf->auto_vary
+                                               && ctx->vary_bits > 0
+                                               ? &stored_data : NULL)
+        == NGX_DECLINED)
     {
         return NGX_DECLINED;
     }
@@ -2522,8 +2555,13 @@ ngx_http_cache_turbo_body_filter_store_tail(ngx_http_request_t *r,
         if (ngx_http_cache_turbo_body_filter_varidx_store(r, clcf, ctx, z,
                 store_key, hash, ttl, retain_ttl) != NGX_OK)
         {
-            (void) clcf->l1->purge_key(z, store_key, hash);
+            ngx_http_cache_turbo_body_filter_rollback_store(clcf, z,
+                store_key, hash, stored_data);
             return NGX_DECLINED;
+        }
+
+        if (stored_data != NULL) {
+            ngx_http_cache_turbo_blob_release(z, stored_data);
         }
     }
 

@@ -1509,6 +1509,32 @@ ngx_http_cache_turbo_shm_purge_key(ngx_http_cache_turbo_zone_t *z,
 }
 
 
+/* MARKER-ROLLBACK-RACE: remove only the exact blob a caller just stored.
+ * `stored_data` carries a reference acquired inside store()/store_if()'s
+ * lock hold, so a concurrent replacement may detach that blob but cannot
+ * free it or recycle its slab address before this comparison.  Pointer
+ * identity is therefore an ABA-safe store token without changing blob bytes
+ * or the cache-key wire contract. */
+ngx_int_t
+ngx_http_cache_turbo_shm_purge_if_blob(ngx_http_cache_turbo_zone_t *z,
+    u_char *key_hash, uint32_t hash, u_char *stored_data)
+{
+    ngx_http_cache_turbo_node_t  *ctn;
+
+    ngx_shmtx_lock(ngx_http_cache_turbo_zone_mutex(z));
+    ctn = ngx_http_cache_turbo_shm_lookup(z, key_hash, hash);
+
+    if (ctn == NULL || ctn->data != stored_data) {
+        ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
+        return 0;
+    }
+
+    ngx_http_cache_turbo_shm_drop_locked(z, ctn);
+    ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
+    return 1;
+}
+
+
 /* PERF-3: how many nodes to drop per lock acquisition during a purge-all walk.
  * Holding the zone mutex for the ENTIRE LRU (which can be millions of entries)
  * blocks every other worker's cache lookups/stores for the whole walk. Dropping
@@ -1804,14 +1830,27 @@ ngx_http_cache_turbo_shm_store_locked(ngx_http_cache_turbo_zone_t *z,
 ngx_int_t
 ngx_http_cache_turbo_shm_store(ngx_http_cache_turbo_zone_t *z,
     u_char *key_hash, uint32_t hash, u_char *data, size_t len,
-    time_t fresh_ttl, time_t stale_ttl)
+    time_t fresh_ttl, time_t stale_ttl, u_char **stored_data)
 {
-    ngx_int_t  rc;
+    ngx_int_t                     rc;
+    ngx_http_cache_turbo_node_t  *written;
+
+    written = NULL;
+    if (stored_data != NULL) {
+        *stored_data = NULL;
+    }
 
     ngx_shmtx_lock(ngx_http_cache_turbo_zone_mutex(z));
     rc = ngx_http_cache_turbo_shm_store_locked(z, key_hash, hash, data, len,
                                                 fresh_ttl, stale_ttl, NULL,
-                                                NULL);
+                                                stored_data != NULL
+                                                ? &written : NULL);
+
+    if (rc == NGX_OK && stored_data != NULL) {
+        ngx_http_cache_turbo_blob_acquire(written->data);
+        *stored_data = written->data;
+    }
+
     ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
 
     return rc;
@@ -1891,12 +1930,19 @@ ngx_http_cache_turbo_shm_store_marker(ngx_http_cache_turbo_zone_t *z,
 ngx_int_t
 ngx_http_cache_turbo_shm_store_if(ngx_http_cache_turbo_zone_t *z,
     u_char *key_hash, uint32_t hash, u_char *data, size_t len,
-    time_t fresh_ttl, time_t stale_ttl, ngx_uint_t predicate)
+    time_t fresh_ttl, time_t stale_ttl, ngx_uint_t predicate,
+    u_char **stored_data)
 {
     time_t                        now;
     ngx_int_t                     rc;
     ngx_uint_t                    refuse;
     ngx_http_cache_turbo_node_t  *ctn;
+    ngx_http_cache_turbo_node_t  *written;
+
+    written = NULL;
+    if (stored_data != NULL) {
+        *stored_data = NULL;
+    }
 
     ngx_shmtx_lock(ngx_http_cache_turbo_zone_mutex(z));
 
@@ -1952,7 +1998,14 @@ ngx_http_cache_turbo_shm_store_if(ngx_http_cache_turbo_zone_t *z,
      * the same lock hold. */
     rc = ngx_http_cache_turbo_shm_store_locked(z, key_hash, hash, data, len,
                                                 fresh_ttl, stale_ttl, ctn,
-                                                NULL);
+                                                stored_data != NULL
+                                                ? &written : NULL);
+
+    if (rc == NGX_OK && stored_data != NULL) {
+        ngx_http_cache_turbo_blob_acquire(written->data);
+        *stored_data = written->data;
+    }
+
     ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
 
     return rc;
@@ -3500,6 +3553,7 @@ ngx_cache_turbo_l1_backend_t  ngx_http_cache_turbo_shm_backend = {
     ngx_http_cache_turbo_shm_l2_neg_check,
     ngx_http_cache_turbo_shm_l2_neg_set,
     ngx_http_cache_turbo_shm_freshen,
+    ngx_http_cache_turbo_shm_purge_if_blob,
 };
 
 #pragma GCC visibility pop
