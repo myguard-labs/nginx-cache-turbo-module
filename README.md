@@ -2108,6 +2108,8 @@ http {
             # ── per-request opt-outs ────────────────────────────────────
             # Derive bypass/no-store variables from trusted auth state.
             # Raw query, header, and cookie values let clients bypass caching.
+            cache_turbo_bypass            $cookie_session; # skip lookup, still store
+            cache_turbo_no_store          $cookie_session; # pair it: do not store response
             cache_turbo_bypass_uri         /wp-admin/; # optional URI bypass
             cache_turbo_bypass_stale_uri   /catalog/;  # optional breaker fallback
             cache_turbo_backend_prefix     /shop/;     # opt-in example: mounted-app prefix
