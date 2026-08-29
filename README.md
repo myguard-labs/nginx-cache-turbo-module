@@ -2106,15 +2106,12 @@ http {
             cache_turbo_warm_max           32;       # max URLs per warm request
 
             # ── per-request opt-outs ────────────────────────────────────
-            cache_turbo_bypass            $cookie_session;  # skip lookup, still store
-            cache_turbo_no_store          $cookie_session;  # ...so pair it, see below
-            # NOT $arg_nocache -- a client-supplied bypass trigger is a DoS lever
-            cache_turbo_no_store          $cookie_session;              # don't store the response
+            # Derive bypass/no-store variables from trusted auth state.
+            # Raw query, header, and cookie values let clients bypass caching.
             cache_turbo_bypass_uri         /wp-admin/; # optional URI bypass
             cache_turbo_bypass_stale_uri   /catalog/;  # optional breaker fallback
             cache_turbo_backend_prefix     /shop/;     # opt-in example: mounted-app prefix
             cache_turbo_key_cookie         locale;     # opt-in example: variant cookie
-            # Cookie-ignore is only safe without a backend preset/value keying.
 
             # ── let the origin decide (inverts the store default here) ──
             cache_turbo_require_header    X-GraphQL-Cacheable;          # store ONLY if origin affirms
@@ -2146,6 +2143,8 @@ http {
         }
 
         # A compatible opt-in example for named non-identifying cookies.
+        # Cookie-ignore is only safe without a backend preset or cookie-value
+        # keying, so this location selects `cache_turbo_backend none`.
         location /cookie-safe/ {
             cache_turbo ct;
             cache_turbo_backend none;
