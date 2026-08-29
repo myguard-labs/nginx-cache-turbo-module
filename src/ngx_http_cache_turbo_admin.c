@@ -738,22 +738,20 @@ ngx_http_cache_turbo_admin_stats_json(ngx_http_request_t *r,
 }
 
 
-/* GET/HEAD dispatch: `?autotune=1` first forces an immediate autotune
- * recompute over the window since the last tick (operator "recompute now"),
- * so the returned autotuned_beta reflects current stats without waiting on the
- * interval. `?format=prometheus` renders the Prometheus text exposition
- * format (for a scrape) instead of JSON. Snapshot the counters through the L1
- * backend rather than reading the live shctx here. */
+/* Stats dispatch. The only force path is an unsafe-method action=value command
+ * from admin_handler; GET/HEAD stay read-only even if they carry the legacy
+ * ?autotune=1 query. `?format=prometheus` renders the Prometheus text
+ * exposition format (for a scrape) instead of JSON. Snapshot the counters
+ * through the L1 backend rather than reading the live shctx here. */
 static ngx_int_t
 ngx_http_cache_turbo_admin_stats_dispatch(ngx_http_request_t *r,
-    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_zone_t *z)
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_zone_t *z,
+    ngx_uint_t force_autotune)
 {
     ngx_http_cache_turbo_stats_t  st;
     ngx_str_t                     arg;
 
-    if (r->args.len
-        && ngx_http_arg(r, (u_char *) "autotune", 8, &arg) == NGX_OK)
-    {
+    if (force_autotune) {
         ngx_http_cache_turbo_autotune_force(z);
     }
 
@@ -783,6 +781,8 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
     ngx_http_cache_turbo_loc_conf_t  *clcf;
     ngx_http_cache_turbo_zone_t      *z;
     ngx_int_t                         drc;
+    ngx_str_t                         arg;
+    ngx_table_elt_t                  *h;
 
     clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
     if (!clcf->admin || clcf->admin_zone == NULL) {
@@ -798,12 +798,37 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
 
     z = clcf->admin_zone->data;
 
+    if (r->method & (NGX_HTTP_GET|NGX_HTTP_HEAD)) {
+        return ngx_http_cache_turbo_admin_stats_dispatch(r, clcf, z, 0);
+    }
+
+    if ((r->method & NGX_HTTP_POST)
+        && r->args.len
+        && ngx_http_arg(r, (u_char *) "action", 6, &arg) == NGX_OK
+        && arg.len == sizeof("autotune") - 1
+        && ngx_strncmp(arg.data, "autotune", arg.len) == 0
+        && ngx_http_arg(r, (u_char *) "value", 5, &arg) == NGX_OK
+        && arg.len == 1 && arg.data[0] == '1')
+    {
+        return ngx_http_cache_turbo_admin_stats_dispatch(r, clcf, z, 1);
+    }
+
     if (r->method & (NGX_HTTP_POST|NGX_HTTP_PUT|NGX_HTTP_DELETE)) {
         return ngx_http_cache_turbo_admin_purge_dispatch(r, clcf, z);
     }
 
-    /* GET / HEAD -> stats. */
-    return ngx_http_cache_turbo_admin_stats_dispatch(r, clcf, z);
+    h = ngx_list_push(&r->headers_out.headers);
+    if (h == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+    h->hash = 1;
+#if (nginx_version >= 1023000)
+    h->next = NULL;
+#endif
+    ngx_str_set(&h->key, "Allow");
+    ngx_str_set(&h->value, "GET, HEAD, POST, PUT, DELETE");
+
+    return NGX_HTTP_NOT_ALLOWED;
 }
 static ngx_uint_t
 ngx_http_cache_turbo_warm_uri_is_safe(ngx_str_t *uri)
@@ -822,13 +847,17 @@ ngx_http_cache_turbo_warm_uri_is_safe(ngx_str_t *uri)
      * starts right after a '/'. Walk segments delimited by '/' and reject
      * one that is exactly "..". */
     seg = uri->data + 1;
-    for (p = seg; p <= last; p++) {
-        if (p == last || *p == '/') {
+    for (p = seg; p < last; p++) {
+        if (*p == '/') {
             if (p - seg == 2 && seg[0] == '.' && seg[1] == '.') {
                 return 0;
             }
             seg = p + 1;
         }
+    }
+
+    if (last - seg == 2 && seg[0] == '.' && seg[1] == '.') {
+        return 0;
     }
 
     return 1;
@@ -966,6 +995,12 @@ ngx_http_cache_turbo_warm(ngx_http_request_t *r, ngx_str_t *urls,
             }
         }
 
+        /* `sep == last` means this was the final unterminated entry. Do not
+         * form `last + 1`: the scan is complete and that pointer is outside
+         * the buffer's one-past boundary. */
+        if (sep == last) {
+            break;
+        }
         p = sep + 1;
     }
 
@@ -1118,8 +1153,8 @@ ngx_http_cache_turbo_warm_file(ngx_http_request_t *r, ngx_str_t *path,
     p = list.data;
     last = list.data + list.len;
     line_start = p;
-    while (p <= last) {
-        if (p == last || *p == '\n') {
+    while (p < last) {
+        if (*p == '\n') {
             if ((ngx_uint_t) (p - line_start)
                 > NGX_HTTP_CACHE_TURBO_WARM_LINE_MAX_LEN)
             {
@@ -1132,6 +1167,16 @@ ngx_http_cache_turbo_warm_file(ngx_http_request_t *r, ngx_str_t *path,
             line_start = p + 1;
         }
         p++;
+    }
+
+    if ((ngx_uint_t) (last - line_start)
+        > NGX_HTTP_CACHE_TURBO_WARM_LINE_MAX_LEN)
+    {
+        ngx_str_set(&body,
+            "{\"error\":\"warm url_file: a line exceeds the "
+            "length limit\"}\n");
+        return ngx_http_cache_turbo_send_json(r,
+                   NGX_HTTP_INTERNAL_SERVER_ERROR, &body);
     }
 
     return ngx_http_cache_turbo_warm(r, &list, warm_max);

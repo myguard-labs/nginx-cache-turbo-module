@@ -1363,6 +1363,7 @@ http {{
     cache_turbo_zone name=srexpz 64k; # S8 explicit `off` control (pre-P3-1 flat LRU)
     cache_turbo_zone name=shmref 16m; # refresh-under-pressure (R6b)
     cache_turbo_zone name=at 16m;    # autotune raise/clamp/off (v4-3)
+    cache_turbo_zone name=ats 16m;   # autotune safe-method isolation (ADMIN-AUTOTUNE-SAFE-METHOD)
     cache_turbo_zone name=atl 16m;   # autotune load-adaptive stale widen (v4-4)
     cache_turbo_zone name=ati 16m;   # autotune insufficient-data (v4-3)
     cache_turbo_zone name=atch 16m;  # autotune churn-disqualify (v4-3)
@@ -4292,6 +4293,13 @@ http {{
             add_header           X-CT-Beta $cache_turbo_beta always;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
+        location /ats/ {{
+            cache_turbo          ats;
+            cache_turbo_key      $uri;
+            cache_turbo_autotune on;
+            cache_turbo_background_update off;   # autotune test: inline regen (see /atch/)
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
 
         # v4-4 load-adaptive stale widen. conservative (stale_mult 2) + valid 1s =
         # static serveable window 2s. A slow-miss window pumps the zone load factor
@@ -4349,6 +4357,11 @@ http {{
 
         location = /_cache_at {{
             cache_turbo_admin at;
+            allow 127.0.0.1;
+            deny all;
+        }}
+        location = /_cache_ats {{
+            cache_turbo_admin ats;
             allow 127.0.0.1;
             deny all;
         }}

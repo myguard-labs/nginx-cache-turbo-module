@@ -1357,6 +1357,15 @@ def test_admin_prometheus(ng: Nginx) -> None:
     assert int(m.group(1)) >= 1, "hits_total should be >= 1"
 
 
+def test_admin_unsupported_method_405(ng: Nginx) -> None:
+    """ADMIN-AUTOTUNE-SAFE-METHOD: verbs outside stats/purge/warm contract are
+    rejected with 405 and an Allow header naming the supported admin methods."""
+    s, _b, h = fetch(ng.port, "/_cache", method="PATCH")
+    assert s == 405, f"unsupported method status {s}"
+    assert h.get("allow") == "GET, HEAD, POST, PUT, DELETE", \
+        f"bad Allow header: {h}"
+
+
 def test_admin_purge_key(ng: Nginx) -> None:
     """POST /_cache?key=<uri> drops that entry; next read is a MISS again."""
     import json
@@ -1424,6 +1433,32 @@ def test_warm_populates(ng: Nginx, origin: Origin) -> None:
         f"warm did not populate the cache (X-Cache={h2.get('x-cache')})"
     assert origin.hits_for("warm-pop") == after, \
         f"GET after warm hit the origin ({origin.hits_for('warm-pop')} vs {after})"
+
+
+def test_warm_root_and_trailing_slash_still_warm(ng: Nginx, origin: Origin) -> None:
+    """ADMIN-WARM-ONEPAST: the URI-segment scanner must accept both the root
+    path (`/`) and a trailing-slash path without ever walking past the tail
+    sentinel. Both are valid warms and must store normally."""
+    tag = f"warm-tail-{time.time()}"
+    root = f"/wc/{tag}/"
+    base = origin.hits_for(tag)
+
+    s_root, b_root, _ = fetch(ng.port, "/_cache?url=/", method="POST")
+    assert s_root == 200, f"root warm status {s_root}"
+    assert json.loads(b_root)["warmed"] == 1, f"root warmed count: {b_root}"
+
+    s, b, _ = fetch(ng.port, f"/_cache_wc?url={root}", method="POST")
+    assert s == 200, f"trailing-slash warm status {s}"
+    assert json.loads(b)["warmed"] == 1, f"trailing-slash warmed count: {b}"
+    assert wait_for(lambda: origin.hits_for(tag) == base + 1), \
+        "trailing-slash warm subrequest never reached origin"
+    time.sleep(0.2)
+    after = origin.hits_for(tag)
+    _, _, h = fetch(ng.port, root)
+    assert h.get("x-cache") == "HIT", \
+        f"trailing-slash warm did not populate the cache (X-Cache={h.get('x-cache')})"
+    assert origin.hits_for(tag) == after, \
+        "trailing-slash GET hit the origin instead of the warmed entry"
 
 
 def test_warm_admin_no_uri_proxy_pass_no_ubsan_abort(ng: Nginx, origin: Origin) -> None:
@@ -1579,6 +1614,31 @@ def test_warm_url_file_populates(ng: Nginx, origin: Origin) -> None:
     _, _, h_absent = fetch(ng.port, absent)
     assert h_absent.get("x-cache") != "HIT", \
         f"{absent} was never in the url_file yet served X-Cache=HIT"
+
+
+def test_warm_url_file_no_trailing_newline(ng: Nginx, origin: Origin) -> None:
+    """ADMIN-WARM-ONEPAST: the line-length scan must handle a non-empty file
+    whose final line reaches EOF with no trailing newline; the last URL still
+    warms exactly once."""
+    tag = f"wcf-tail-{time.time()}"
+    uri = f"/wc/{tag}"
+    (ng.root / "warm-lists").mkdir(exist_ok=True)
+    list_path = ng.root / "warm-lists" / "warm-list-no-newline.txt"
+    list_path.write_text(uri)
+
+    base = origin.hits_for(tag)
+    s, body, _ = fetch(ng.port, f"/_cache_wc?url_file={list_path}", method="POST")
+    assert s == 200, f"warm url_file(no newline) status {s}: {body!r}"
+    assert json.loads(body)["warmed"] == 1, f"warmed count: {body}"
+    assert wait_for(lambda: origin.hits_for(tag) == base + 1), \
+        "no-newline url_file warm subrequest never reached origin"
+    time.sleep(0.2)
+    after = origin.hits_for(tag)
+    _, _, h = fetch(ng.port, uri)
+    assert h.get("x-cache") == "HIT", \
+        f"{uri} not warmed from a no-newline url_file (X-Cache={h.get('x-cache')})"
+    assert origin.hits_for(tag) == after, \
+        "a no-newline url_file warm still hit the origin on first GET"
 
 
 def test_warm_url_file_bound_enforced(ng: Nginx, origin: Origin) -> None:
