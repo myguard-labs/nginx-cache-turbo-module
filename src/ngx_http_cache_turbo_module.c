@@ -1164,30 +1164,52 @@ ngx_http_cache_turbo_status_ttl(ngx_http_cache_turbo_loc_conf_t *clcf,
 
 
 /*
- * Locate a Cache-Control directive by FULL-TOKEN match in a comma-separated
- * value [v,last). Each token is "<name>" or "<name>=<value>" with optional
- * surrounding LWS. Returns a pointer to the value (after '=') with *vlen set
- * when the directive is present with a value, the token start with *vlen == 0
- * when present bare, or NULL when absent. A full-token match (not a substring)
- * is what keeps `s-maxage` from matching inside `max-age` parsing and
- * `max-age=0` from matching inside `max-age=01000` (see the codex follow-ups).
+ * Locate the next Cache-Control directive matching `name` in [*cursor,last),
+ * advancing *cursor past the inspected token. A comma separates tokens only
+ * outside a quoted-string; quoted-pairs escape the following byte. An
+ * unbalanced quote therefore consumes the rest of the field instead of
+ * activating directive-looking fragments inside malformed quoted text.
+ *
+ * Each token is "<name>" or "<name>=<value>" with optional surrounding LWS.
+ * Returns a pointer to the value (after '=') with *vlen set when the directive
+ * is present with a value, the token start with *vlen == 0 when present bare,
+ * or NULL when absent. When `valued` is non-NULL, it distinguishes a bare
+ * directive from an empty valued one. A full-token match (not a substring) is
+ * what keeps `s-maxage` from matching inside `max-age` parsing.
  */
 static u_char *
-ngx_http_cache_turbo_cc_token(u_char *v, u_char *last, const char *name,
-    size_t nlen, size_t *vlen)
+ngx_http_cache_turbo_cc_token(u_char **cursor, u_char *last, const char *name,
+    size_t nlen, size_t *vlen, ngx_int_t *valued)
 {
-    u_char  *s = v, *tok, *e, *eq;
-    size_t   tn;
+    u_char     *s = *cursor, *tok, *e, *eq;
+    size_t      tn;
+    ngx_uint_t  quoted, escaped;
 
     while (s < last) {
         while (s < last && (*s == ' ' || *s == '\t' || *s == ',')) {
             s++;
         }
         tok = s;
-        while (s < last && *s != ',') {
+        quoted = 0;
+        escaped = 0;
+        while (s < last) {
+            if (quoted) {
+                if (escaped) {
+                    escaped = 0;
+                } else if (*s == '\\') {
+                    escaped = 1;
+                } else if (*s == '"') {
+                    quoted = 0;
+                }
+            } else if (*s == '"') {
+                quoted = 1;
+            } else if (*s == ',') {
+                break;
+            }
             s++;
         }
         e = s;                                  /* [tok, e) is one token */
+        *cursor = s < last ? s + 1 : last;
         while (e > tok && (e[-1] == ' ' || e[-1] == '\t')) {
             e--;                                /* right-trim LWS */
         }
@@ -1197,8 +1219,14 @@ ngx_http_cache_turbo_cc_token(u_char *v, u_char *last, const char *name,
 
         if (tn == nlen && ngx_strncasecmp(tok, (u_char *) name, nlen) == 0) {
             if (eq) {
+                if (valued != NULL) {
+                    *valued = 1;
+                }
                 *vlen = (size_t) (e - (eq + 1));
                 return eq + 1;
+            }
+            if (valued != NULL) {
+                *valued = 0;
             }
             *vlen = 0;
             return tok;
@@ -1215,32 +1243,70 @@ static ngx_int_t
 ngx_http_cache_turbo_cc_has(u_char *v, u_char *last, const char *name,
     size_t nlen)
 {
+    u_char  *cursor = v;
     size_t  vlen;
 
-    return ngx_http_cache_turbo_cc_token(v, last, name, nlen, &vlen) != NULL;
+    return ngx_http_cache_turbo_cc_token(&cursor, last, name, nlen, &vlen,
+                                         NULL) != NULL;
+}
+
+
+/* Parse one delta-seconds value. RFC 9111 permits recipients to accept the
+ * historical quoted form as well as the preferred bare form. The value must be
+ * fully consumed: signs, whitespace, escapes and digit-prefixed junk are not a
+ * delta. The time_t cutoff follows ngx_atotm(); overflow saturates instead of
+ * returning NGX_ERROR (which is also our "absent" sentinel). */
+static time_t
+ngx_http_cache_turbo_cc_parse_delta(u_char *p, size_t len)
+{
+    time_t      n = 0, cutoff, cutlim;
+    ngx_uint_t  d;
+    u_char     *last;
+
+    if (len >= 2 && p[0] == '"' && p[len - 1] == '"') {
+        p++;
+        len -= 2;
+    }
+    if (len == 0) {
+        return -1;
+    }
+
+    cutoff = NGX_MAX_TIME_T_VALUE / 10;
+    cutlim = NGX_MAX_TIME_T_VALUE % 10;
+
+    last = p + len;
+    for (/* void */; p < last; p++) {
+        if (*p < '0' || *p > '9') {
+            return -1;
+        }
+        d = (ngx_uint_t) (*p - '0');
+        if (n >= cutoff && (n > cutoff || (time_t) d > cutlim))
+        {
+            n = NGX_MAX_TIME_T_VALUE;
+            continue;
+        }
+        n = n * 10 + (time_t) d;
+    }
+
+    return n;
 }
 
 
 /* Parse the integer delta-seconds of a Cache-Control "<name>=N" directive in
- * [p,last). Returns -1 if the directive is absent or carries no numeric value.
+ * [p,last). Returns -1 if the directive is absent or carries no valid value.
  * `name` is the bare directive (e.g. "max-age"), NOT including the '='. */
 static time_t
 ngx_http_cache_turbo_cc_delta(u_char *p, u_char *last, const char *name,
     size_t nlen)
 {
-    u_char  *q, *e, *vend;
+    u_char  *q, *cursor = p;
     size_t   vlen;
 
-    q = ngx_http_cache_turbo_cc_token(p, last, name, nlen, &vlen);
+    q = ngx_http_cache_turbo_cc_token(&cursor, last, name, nlen, &vlen, NULL);
     if (q == NULL || vlen == 0) {
         return -1;
     }
-    vend = q + vlen;
-    for (e = q; e < vend && *e >= '0' && *e <= '9'; e++) { /* void */ }
-    if (e == q) {
-        return -1;
-    }
-    return (time_t) ngx_atoi(q, e - q);
+    return ngx_http_cache_turbo_cc_parse_delta(q, vlen);
 }
 
 
@@ -1556,8 +1622,11 @@ ngx_http_cache_turbo_response_sie(ngx_http_request_t *r)
  * NOT pre-parse request Cache-Control into a discrete headers_in field (it does
  * for cookies, not for CC), so the four RFC-1 predicates below used to each call
  * header_find and re-walk the whole list — five full scans per hit. This folds
- * them to one. ctx->req_cc / ctx->req_pragma carry data == NULL when the header
- * is absent. Idempotent via req_cc_resolved.
+ * them to one. Cache-Control is a combinable field (RFC 9110 §5.3), so every
+ * field-line contributes its restrictive boolean and numeric directives;
+ * req_cc retains the first line for compatibility/debugging. ctx->req_cc /
+ * ctx->req_pragma carry data == NULL when absent. Idempotent via
+ * req_cc_resolved.
  */
 static void
 ngx_http_cache_turbo_resolve_req_cc(ngx_http_request_t *r,
@@ -1572,11 +1641,14 @@ ngx_http_cache_turbo_resolve_req_cc(ngx_http_request_t *r,
     }
     ngx_str_null(&ctx->req_cc);
     ngx_str_null(&ctx->req_pragma);
+    ctx->req_max_age = -1;
+    ctx->req_min_fresh = -1;
+    ctx->req_max_stale = -1;
     ctx->req_cc_resolved = 1;
 
-    /* One traversal of the request header list, capturing the first Cache-Control
-     * and first Pragma (first-occurrence-wins, matching the old per-predicate
-     * header_find). Stop early once both are found. */
+    /* One traversal of the request header list. Cache-Control field-lines are
+     * combinable, so merge restrictive directives from every line while
+     * retaining the first raw value for compatibility/debugging. */
     part = &r->headers_in.headers.part;
     h = part->elts;
 
@@ -1592,21 +1664,92 @@ ngx_http_cache_turbo_resolve_req_cc(ngx_http_request_t *r,
         if (h[i].hash == 0) {
             continue;
         }
-        if (ctx->req_cc.data == NULL
-            && h[i].key.len == sizeof("Cache-Control") - 1
+        if (h[i].key.len == sizeof("Cache-Control") - 1
             && ngx_strncasecmp(h[i].key.data, (u_char *) "Cache-Control",
                                sizeof("Cache-Control") - 1) == 0)
         {
-            ctx->req_cc = h[i].value;
+            u_char  *v = h[i].value.data;
+            u_char  *e = v + h[i].value.len;
+            u_char  *q, *cursor;
+            size_t   vlen;
+            ngx_int_t valued;
+            time_t   d;
+
+            if (ctx->req_cc.data == NULL) {
+                ctx->req_cc = h[i].value;
+            }
+            if (ngx_http_cache_turbo_cc_has(v, e, "no-cache",
+                    sizeof("no-cache") - 1))
+            {
+                ctx->req_no_cache = 1;
+            }
+            if (ngx_http_cache_turbo_cc_has(v, e, "no-store",
+                    sizeof("no-store") - 1))
+            {
+                ctx->req_no_store = 1;
+            }
+            if (ngx_http_cache_turbo_cc_has(v, e, "only-if-cached",
+                    sizeof("only-if-cached") - 1))
+            {
+                ctx->req_only_if_cached = 1;
+            }
+
+            cursor = v;
+            while ((q = ngx_http_cache_turbo_cc_token(&cursor, e, "max-age",
+                        sizeof("max-age") - 1, &vlen, &valued)) != NULL)
+            {
+                d = valued
+                    ? ngx_http_cache_turbo_cc_parse_delta(q, vlen) : -1;
+                if (d >= 0
+                    && (ctx->req_max_age < 0 || d < ctx->req_max_age))
+                {
+                    ctx->req_max_age = d;
+                    ctx->has_req_bounds = 1;
+                }
+            }
+
+            cursor = v;
+            while ((q = ngx_http_cache_turbo_cc_token(&cursor, e, "min-fresh",
+                        sizeof("min-fresh") - 1, &vlen, &valued)) != NULL)
+            {
+                d = valued
+                    ? ngx_http_cache_turbo_cc_parse_delta(q, vlen) : -1;
+                if (d >= 0 && d > ctx->req_min_fresh) {
+                    ctx->req_min_fresh = d;
+                    ctx->has_req_bounds = 1;
+                }
+            }
+
+            cursor = v;
+            while ((q = ngx_http_cache_turbo_cc_token(&cursor, e, "max-stale",
+                        sizeof("max-stale") - 1, &vlen, &valued)) != NULL)
+            {
+                ctx->req_max_stale_set = 1;
+                ctx->has_req_bounds = 1;
+                if (!valued) {
+                    if (ctx->req_max_stale < 0) {
+                        ctx->req_max_stale_any = 1;
+                    }
+                    continue;
+                }
+                d = ngx_http_cache_turbo_cc_parse_delta(q, vlen);
+                if (d >= 0) {
+                    if (ctx->req_max_stale < 0 || d < ctx->req_max_stale) {
+                        ctx->req_max_stale = d;
+                    }
+                    ctx->req_max_stale_any = 0;
+                }
+                /* A malformed valued directive grants no stale tolerance.
+                 * Keep any valid bare or numeric directive elsewhere in the
+                 * combined field; otherwise max_stale_set + the -1 sentinel
+                 * makes req_serve_verdict() fail closed for stale content. */
+            }
         } else if (ctx->req_pragma.data == NULL
             && h[i].key.len == sizeof("Pragma") - 1
             && ngx_strncasecmp(h[i].key.data, (u_char *) "Pragma",
                                sizeof("Pragma") - 1) == 0)
         {
             ctx->req_pragma = h[i].value;
-        }
-        if (ctx->req_cc.data != NULL && ctx->req_pragma.data != NULL) {
-            break;
         }
     }
 }
@@ -1631,16 +1774,8 @@ ngx_http_cache_turbo_request_revalidate(ngx_http_request_t *r,
 {
     ngx_http_cache_turbo_resolve_req_cc(r, ctx);
 
-    if (ctx->req_cc.data != NULL) {
-        u_char  *v = ctx->req_cc.data, *e = ctx->req_cc.data + ctx->req_cc.len;
-
-        if (ngx_http_cache_turbo_cc_has(v, e, "no-cache",
-                sizeof("no-cache") - 1)
-            || ngx_http_cache_turbo_cc_delta(v, e, "max-age",
-                sizeof("max-age") - 1) == 0)
-        {
-            return 1;
-        }
+    if (ctx->req_no_cache || ctx->req_max_age == 0) {
+        return 1;
     }
 
     if (ctx->req_pragma.data != NULL
@@ -1664,10 +1799,7 @@ ngx_http_cache_turbo_request_only_if_cached(ngx_http_request_t *r,
     ngx_http_cache_turbo_ctx_t *ctx)
 {
     ngx_http_cache_turbo_resolve_req_cc(r, ctx);
-    return (ctx->req_cc.data != NULL
-            && ngx_http_cache_turbo_cc_has(ctx->req_cc.data,
-                   ctx->req_cc.data + ctx->req_cc.len,
-                   "only-if-cached", sizeof("only-if-cached") - 1)) ? 1 : 0;
+    return ctx->req_only_if_cached ? 1 : 0;
 }
 
 
@@ -1678,10 +1810,7 @@ ngx_http_cache_turbo_request_no_store(ngx_http_request_t *r,
     ngx_http_cache_turbo_ctx_t *ctx)
 {
     ngx_http_cache_turbo_resolve_req_cc(r, ctx);
-    return (ctx->req_cc.data != NULL
-            && ngx_http_cache_turbo_cc_has(ctx->req_cc.data,
-                   ctx->req_cc.data + ctx->req_cc.len,
-                   "no-store", sizeof("no-store") - 1)) ? 1 : 0;
+    return ctx->req_no_store ? 1 : 0;
 }
 
 
@@ -1697,45 +1826,7 @@ void
 ngx_http_cache_turbo_request_freshness_bounds(ngx_http_request_t *r,
     ngx_http_cache_turbo_ctx_t *ctx)
 {
-    u_char    *v, *e, *q;
-    size_t     vlen;
-
-    ctx->req_max_age = -1;
-    ctx->req_min_fresh = -1;
-    ctx->req_max_stale = -1;
-
     ngx_http_cache_turbo_resolve_req_cc(r, ctx);
-    if (ctx->req_cc.data == NULL) {
-        return;
-    }
-    v = ctx->req_cc.data;
-    e = ctx->req_cc.data + ctx->req_cc.len;
-
-    ctx->req_max_age = ngx_http_cache_turbo_cc_delta(v, e, "max-age",
-                           sizeof("max-age") - 1);
-    ctx->req_min_fresh = ngx_http_cache_turbo_cc_delta(v, e, "min-fresh",
-                             sizeof("min-fresh") - 1);
-    if (ctx->req_max_age >= 0 || ctx->req_min_fresh >= 0) {
-        ctx->has_req_bounds = 1;    /* P2: a bound that can change the verdict */
-    }
-
-    q = ngx_http_cache_turbo_cc_token(v, e, "max-stale",
-            sizeof("max-stale") - 1, &vlen);
-    if (q != NULL) {
-        ctx->req_max_stale_set = 1;
-        ctx->has_req_bounds = 1;    /* P2 */
-        if (vlen == 0) {
-            ctx->req_max_stale_any = 1;          /* bare: accept any staleness */
-        } else {
-            time_t  d = ngx_http_cache_turbo_cc_delta(v, e, "max-stale",
-                            sizeof("max-stale") - 1);
-            if (d >= 0) {
-                ctx->req_max_stale = d;
-            } else {
-                ctx->req_max_stale_any = 1;      /* unparseable value: be lenient */
-            }
-        }
-    }
 }
 
 

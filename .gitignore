@@ -47,6 +47,9 @@ ci/tests/unit/test_key_fold
 ci/tests/unit/generated_key_fold.inc
 ci/tests/unit/test_tok_sort
 ci/tests/unit/generated_tok_sort.inc
+ci/tests/unit/test_cc_delta
+ci/tests/unit/test_cc_delta_narrow_time
+ci/tests/unit/generated_cc_delta.inc
 ci/tests/unit/test_vary_marker_fastpath
 ci/tests/unit/test_ae_class_guard
 ci/tests/unit/test_ae_class_guard.san

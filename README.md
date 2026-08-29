@@ -602,7 +602,11 @@ It also honours a few **request** `Cache-Control` directives: `no-cache` /
 `max-age=0` (and `Pragma: no-cache`) force a revalidation against the origin
 (a force-refresh); `no-store` runs the request to the origin and does **not**
 store the response; and `only-if-cached` answers `504 Gateway Timeout` when the
-page is in neither L1 nor L2, instead of contacting the origin.
+page is in neither L1 nor L2, instead of contacting the origin. `max-age=N`
+and `min-fresh=N` bound which cached representation the client will accept;
+`max-stale=N` permits at most N seconds of staleness and bare `max-stale`
+permits any staleness within the cache's own serveable window. A malformed
+valued `max-stale` grants no stale tolerance.
 
 ### Letting the origin decide (`cache_turbo_require_header`)
 
