@@ -123,6 +123,14 @@ bash "$DIR/extract_digest.sh"
 "$CC" $CFLAGS "$DIR/test_digest.c" -o "$DIR/test_digest" -lssl -lcrypto
 "$DIR/test_digest"
 
+# --- admin ?key= digest failure propagation (DIGEST-ERRORS-IGNORED) -------
+# Compile the real helper with a deterministic failing digest.  A mutation
+# that ignores digest()'s return reaches either cache tier and turns this red.
+bash "$DIR/extract_admin_purge_key.sh"
+# shellcheck disable=SC2086
+"$CC" $CFLAGS "$DIR/test_admin_purge_key.c" -o "$DIR/test_admin_purge_key"
+"$DIR/test_admin_purge_key"
+
 FUZZ_DIR="$DIR/../../fuzz"
 BLOB_CC="${BLOB_CC:-clang}"
 if command -v "$BLOB_CC" >/dev/null 2>&1; then

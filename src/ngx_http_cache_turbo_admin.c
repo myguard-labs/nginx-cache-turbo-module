@@ -151,7 +151,20 @@ ngx_http_cache_turbo_admin_purge_all(ngx_http_request_t *r,
     u_char     *p;
     ngx_str_t   body;
 
-    *purged = clcf->l1->purge_all(z);
+    if (clcf->l1->purge_all(z, purged) != NGX_OK) {
+        p = ngx_pnalloc(r->pool,
+                        sizeof("{\"purged\":4294967295,"
+                               "\"l1\":\"incomplete\"}\n"));
+        if (p == NULL) {
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+        body.data = p;
+        body.len = ngx_sprintf(p,
+                       "{\"purged\":%ui,\"l1\":\"incomplete\"}\n",
+                       *purged) - p;
+        return ngx_http_cache_turbo_send_json(r,
+                   NGX_HTTP_INTERNAL_SERVER_ERROR, &body);
+    }
 
     /* L2-aware all-purge (v4-2): also clear the whole L2 keyspace for
      * this prefix via a parked SCAN MATCH <prefix>* + DEL loop, so an
@@ -204,8 +217,9 @@ ngx_http_cache_turbo_admin_purge_all(ngx_http_request_t *r,
 
 
 /* ?key=<string> single-key purge (POST/PUT/DELETE). Always synchronous;
- * always returns NGX_OK with *purged set so the caller emits the common
- * {"purged":N} reply. */
+ * returns NGX_OK with *purged set so the caller emits the common
+ * {"purged":N} reply, or 500 before touching either tier when key derivation
+ * fails. */
 static ngx_int_t
 ngx_http_cache_turbo_admin_purge_key(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_zone_t *z,
@@ -216,7 +230,9 @@ ngx_http_cache_turbo_admin_purge_key(ngx_http_request_t *r,
 
     /* SEC-2: must match build_key's digest so ?key=<rendered key>
      * resolves to the same slot. */
-    ngx_http_cache_turbo_digest(arg->data, arg->len, key_hash);
+    if (ngx_http_cache_turbo_digest(arg->data, arg->len, key_hash) != NGX_OK) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
     hash = ngx_crc32_short(key_hash, 32);
 
     *purged = clcf->l1->purge_key(z, key_hash, hash);
@@ -385,8 +401,13 @@ ngx_http_cache_turbo_admin_purge_dispatch(ngx_http_request_t *r,
     } else if (r->args.len
                && ngx_http_arg(r, (u_char *) "key", 3, &arg) == NGX_OK)
     {
-        (void) ngx_http_cache_turbo_admin_purge_key(r, clcf, z, &arg,
-                                                     &purged);
+        ngx_int_t  rc;
+
+        rc = ngx_http_cache_turbo_admin_purge_key(r, clcf, z, &arg,
+                                                   &purged);
+        if (rc != NGX_OK) {
+            return rc;
+        }
 
     } else if (r->args.len
                && ngx_http_arg(r, (u_char *) "tag", 3, &arg) == NGX_OK)

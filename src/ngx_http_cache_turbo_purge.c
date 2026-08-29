@@ -82,7 +82,9 @@ ngx_http_cache_turbo_purge_auto_vary(ngx_http_request_t *r,
     ngx_uint_t                    have_marker = 0;
     ngx_http_cache_turbo_node_t  *m;
 
-    ngx_http_cache_turbo_marker_hash(&ctx->cache_key, mk);
+    if (ngx_http_cache_turbo_marker_hash(&ctx->cache_key, mk) != NGX_OK) {
+        return NGX_ERROR;
+    }
     ngx_shmtx_lock(ngx_http_cache_turbo_zone_mutex(z));
     m = clcf->l1->lookup(z, mk, ngx_crc32_short(mk, 32));
     if (m != NULL && m->data != NULL
@@ -131,8 +133,11 @@ ngx_http_cache_turbo_purge_auto_vary(ngx_http_request_t *r,
             return NGX_OK;
         }
 
-        vlen = ngx_http_cache_turbo_variant_index_name(&ctx->cache_key,
-                                                        vname);
+        if (ngx_http_cache_turbo_variant_index_name(&ctx->cache_key, vname,
+                                                     &vlen) != NGX_OK)
+        {
+            return NGX_ERROR;
+        }
         tp->clcf = clcf;
         tp->zone = z;
         tp->is_auto_vary = 1;
@@ -243,10 +248,13 @@ ngx_http_cache_turbo_purge_auto_vary(ngx_http_request_t *r,
     if (next_gen == 0) {
         next_gen = 1;
     }
-    ngx_http_cache_turbo_marker_store(r, clcf, z, &ctx->cache_key, bits,
-                                      next_gen, mttl,
-                                      ngx_http_cache_turbo_stale_ttl(mttl,
-                                          clcf->stale_mult));
+    if (ngx_http_cache_turbo_marker_store(r, clcf, z, &ctx->cache_key, bits,
+                                          next_gen, mttl,
+                                          ngx_http_cache_turbo_stale_ttl(mttl,
+                                              clcf->stale_mult)) != NGX_OK)
+    {
+        return NGX_ERROR;
+    }
     (*purged)++;
 
     return NGX_OK;
@@ -300,11 +308,16 @@ ngx_http_cache_turbo_purge_request(ngx_http_request_t *r,
      * variant; see ngx_http_cache_turbo_purge_auto_vary() for the L2
      * strategy split. NGX_DONE means it parked the async completion, which
      * already sent the reply and finalized the request. */
-    if (clcf->auto_vary
-        && ngx_http_cache_turbo_purge_auto_vary(r, clcf, z, ctx, &purged)
-               == NGX_DONE)
-    {
-        return NGX_DONE;
+    if (clcf->auto_vary) {
+        ngx_int_t  rc;
+
+        rc = ngx_http_cache_turbo_purge_auto_vary(r, clcf, z, ctx, &purged);
+        if (rc == NGX_DONE) {
+            return NGX_DONE;
+        }
+        if (rc != NGX_OK) {
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
     }
 
     p = ngx_pnalloc(r->pool, sizeof("{\"purged\":4294967295}\n"));

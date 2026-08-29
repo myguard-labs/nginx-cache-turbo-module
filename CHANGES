@@ -1,5 +1,18 @@
 Changes with the nginx-cache-turbo-module (unreleased)
 
+    *) Bugfix: OpenSSL digest update failures are now sticky, and digest
+       failures from auto-Vary key derivation and the admin single-key purge
+       are propagated instead of letting callers hash or act on invalid output.
+       Successful SHA-256 bytes, cache keys, marker keys, and variant-index
+       names are unchanged.
+
+    *) Bugfix: an L1 all-purge could run forever while other workers refilled
+       the zone between its 512-entry mutex batches. The walk now consumes a
+       finite start-of-call entry budget. If concurrent refill still leaves
+       entries at the final lock-held observation, the admin endpoint returns
+       500 with {"purged":N,"l1":"incomplete"}; an idle purge still drains
+       both LRU queues completely and returns 200.
+
     *) Security: admin-triggered warm subrequests now rebuild their request
        headers from a Host/User-Agent allowlist before contacting the origin.
        Previously they inherited every header from the admin POST, so

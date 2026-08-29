@@ -57,6 +57,10 @@ ngx_uint_t  ngx_test_lock_depth  = 0;
 ngx_uint_t  ngx_test_lock_count  = 0;
 /* C1: the one real mutex every ngx_shmtx_lock() in the shim takes. */
 pthread_mutex_t  ngx_test_shmtx = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t  ngx_test_unlock_barrier_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t   ngx_test_unlock_barrier_cond = PTHREAD_COND_INITIALIZER;
+int              ngx_test_unlock_barrier_phase;
+int              ngx_test_unlock_barrier_armed;
 
 /* --- the node/zone types under test.
  * Sliced from the shipped header so the layout cannot drift from production;
@@ -98,6 +102,7 @@ typedef struct {
  * (not sliced) since it is a single #define, same pattern as the SEG_* ids
  * above; extract_shm.sh only slices function bodies. */
 #define NGX_HTTP_CACHE_TURBO_LRU_CAP_MAX_EVICT  8
+#define NGX_HTTP_CACHE_TURBO_PURGE_BATCH         512
 
 /* P6/O4.1 breaker states. CLOSED == 0 is load-bearing for the same reason
  * NODE_ENTRY == 0 and SEG_PROBATION == 0 are -- a zeroed zone must read as "not
@@ -359,6 +364,8 @@ static void *ngx_http_cache_turbo_shm_alloc_evict(
     ngx_http_cache_turbo_zone_t *z, size_t size);
 static void ngx_http_cache_turbo_shm_free_locked(
     ngx_http_cache_turbo_zone_t *z, void *p, size_t size);
+static ngx_int_t ngx_http_cache_turbo_shm_purge_all(
+    ngx_http_cache_turbo_zone_t *z, ngx_uint_t *purged);
 static void ngx_http_cache_turbo_lru_link_head(
     ngx_http_cache_turbo_zone_t *z, ngx_http_cache_turbo_node_t *ctn);
 static void ngx_http_cache_turbo_lru_unlink(
@@ -510,6 +517,112 @@ static ngx_http_cache_turbo_node_t *
 find(int n)
 {
     return ngx_http_cache_turbo_shm_lookup(&g_zone, KEY(n));
+}
+
+static void watchdog_arm(const char *what);
+static void watchdog_disarm(void);
+
+/* PURGE-ALL-STARVATION fixture: unlike mkkey(), this key space is large enough
+ * to cross the 512-entry production batch boundary and to give the concurrent
+ * refill a disjoint range.  count_miss() is the real production insertion
+ * path, so rbtree/LRU linkage, counters, charges and locks are all exercised. */
+static void
+purge_test_key(ngx_uint_t n, u_char key[32])
+{
+    ngx_uint_t  i;
+
+    memset(key, 0, 32);
+    for (i = 0; i < sizeof(n); i++) {
+        key[i] = (u_char) ((n >> (i * 8)) & 0xff);
+    }
+}
+
+static void
+purge_test_fill(ngx_uint_t first, ngx_uint_t count)
+{
+    ngx_uint_t  i;
+    u_char      key[32];
+
+    for (i = 0; i < count; i++) {
+        purge_test_key(first + i, key);
+        (void) ngx_http_cache_turbo_shm_count_miss(&g_zone, key,
+                    ngx_crc32_short(key, 32), 2, 0);
+    }
+}
+
+typedef struct {
+    ngx_uint_t  first;
+    ngx_uint_t  count;
+} purge_refill_arg_t;
+
+static void *
+purge_test_refill(void *data)
+{
+    purge_refill_arg_t  *arg = data;
+
+    (void) pthread_mutex_lock(&ngx_test_unlock_barrier_mutex);
+    while (ngx_test_unlock_barrier_phase != 1) {
+        (void) pthread_cond_wait(&ngx_test_unlock_barrier_cond,
+                                 &ngx_test_unlock_barrier_mutex);
+    }
+    (void) pthread_mutex_unlock(&ngx_test_unlock_barrier_mutex);
+
+    purge_test_fill(arg->first, arg->count);
+
+    (void) pthread_mutex_lock(&ngx_test_unlock_barrier_mutex);
+    ngx_test_unlock_barrier_phase = 2;
+    (void) pthread_cond_broadcast(&ngx_test_unlock_barrier_cond);
+    (void) pthread_mutex_unlock(&ngx_test_unlock_barrier_mutex);
+    return NULL;
+}
+
+static void
+test_purge_all_snapshot_bounds_concurrent_refill(void)
+{
+    enum { SNAPSHOT = NGX_HTTP_CACHE_TURBO_PURGE_BATCH + 1 };
+    purge_refill_arg_t  arg;
+    pthread_t           refill;
+    ngx_uint_t          purged;
+    ngx_int_t           rc, thread_rc;
+
+    printf("PURGE-ALL-STARVATION: snapshot bounds a concurrent refill\n");
+    zone_reset();
+    purge_test_fill(0, SNAPSHOT);
+    REQUIRE(g_sh.n_entries == SNAPSHOT,
+            "fixture: initial purge snapshot population is incomplete");
+
+    arg.first = SNAPSHOT;
+    arg.count = SNAPSHOT;
+    ngx_test_unlock_barrier_phase = 0;
+    ngx_test_unlock_barrier_armed = 1;
+    thread_rc = pthread_create(&refill, NULL, purge_test_refill, &arg);
+    if (thread_rc != 0) {
+        ngx_test_unlock_barrier_armed = 0;
+    }
+    REQUIRE(thread_rc == 0,
+            "fixture: pthread_create(refill) failed");
+
+    watchdog_arm("purge-all must stop at its start-of-call snapshot");
+    rc = ngx_http_cache_turbo_shm_purge_all(&g_zone, &purged);
+    watchdog_disarm();
+    CHECK(pthread_join(refill, NULL) == 0,
+          "fixture: pthread_join(refill) failed");
+
+    CHECK(rc == NGX_AGAIN,
+          "concurrent refill must report purge-all as incomplete");
+    CHECK(purged == SNAPSHOT,
+          "purge-all must consume exactly its finite start-of-call budget");
+    CHECK(g_sh.n_entries == SNAPSHOT,
+          "the concurrent refill must remain resident after the snapshot ends");
+    CHECK(ngx_test_lock_balanced(),
+          "snapshot-bounded purge-all left the zone mutex held");
+
+    /* Idle completeness is the preserve invariant: with no producer racing,
+     * a second call drains the residual set and reports complete. */
+    rc = ngx_http_cache_turbo_shm_purge_all(&g_zone, &purged);
+    CHECK(rc == NGX_OK, "idle purge-all must report complete");
+    CHECK(purged == SNAPSHOT, "idle purge-all count must stay exact");
+    CHECK(g_sh.n_entries == 0, "idle purge-all must drain both queues");
 }
 
 /* =====================================================================
@@ -6103,6 +6216,7 @@ main(void)
     zone_reset();
 
     test_s8_evict_terminates_on_empty_queues();
+    test_purge_all_snapshot_bounds_concurrent_refill();
     test_lru_insert_new_clears_bitfield_unit();
     test_evict_blind_second_chance_unit();
     test_evict_blind_expired_sie_no_spare();

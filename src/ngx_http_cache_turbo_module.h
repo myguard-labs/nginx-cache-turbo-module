@@ -3275,7 +3275,11 @@ struct ngx_cache_turbo_l1_backend_s {
 
     ngx_int_t  (*purge_key)(ngx_http_cache_turbo_zone_t *z, u_char *key_hash,
         uint32_t hash);
-    ngx_uint_t (*purge_all)(ngx_http_cache_turbo_zone_t *z);
+    /* NGX_OK means both queues were empty at the final lock-held observation.
+     * NGX_AGAIN means the finite start-of-call entry budget was consumed while
+     * concurrent refill left entries resident; *purged is exact in both cases. */
+    ngx_int_t  (*purge_all)(ngx_http_cache_turbo_zone_t *z,
+        ngx_uint_t *purged);
     void       (*stats)(ngx_http_cache_turbo_zone_t *z,
         ngx_http_cache_turbo_stats_t *out);
 

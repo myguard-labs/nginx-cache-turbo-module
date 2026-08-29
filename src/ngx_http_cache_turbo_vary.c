@@ -631,7 +631,7 @@ ngx_http_cache_turbo_lang_class(ngx_http_request_t *r, u_char *buf)
  * collide with the base material. md5 fills the low 16 bytes; the high 16 are
  * zeroed first (the slot layout matches build_key, so a base and a variant
  * only ever differ by the folded bytes). */
-void
+ngx_int_t
 ngx_http_cache_turbo_variant_hash(ngx_http_request_t *r, ngx_str_t *base,
     ngx_int_t bits, ngx_uint_t gen, u_char out[32])
 {
@@ -697,14 +697,14 @@ ngx_http_cache_turbo_variant_hash(ngx_http_request_t *r, ngx_str_t *base,
         ngx_http_cache_turbo_digest_update(&d, v.data, v.len);
     }
 
-    ngx_http_cache_turbo_digest_final(&d, out);
+    return ngx_http_cache_turbo_digest_final(&d, out);
 }
 
 
 /* The dedicated L1 slot key for the vary marker of a base key. Distinct from the
  * object key (it folds a "varymark" tag) so the marker never collides with an
  * object slot or a cold-miss stub. */
-void
+ngx_int_t
 ngx_http_cache_turbo_marker_hash(ngx_str_t *base, u_char out[32])
 {
     ngx_http_cache_turbo_digest_t  d;
@@ -714,7 +714,7 @@ ngx_http_cache_turbo_marker_hash(ngx_str_t *base, u_char out[32])
     ngx_http_cache_turbo_digest_update(&d, base->data, base->len);
     ngx_http_cache_turbo_digest_update(&d, &us, 1);
     ngx_http_cache_turbo_digest_update(&d, "varymark", sizeof("varymark") - 1);
-    ngx_http_cache_turbo_digest_final(&d, out);
+    return ngx_http_cache_turbo_digest_final(&d, out);
 }
 
 
@@ -724,9 +724,11 @@ ngx_http_cache_turbo_marker_hash(ngx_str_t *base, u_char out[32])
  * frames it so no user `cache_turbo_tag` token can ever equal it: tag tokens are
  * split on whitespace, so a token can never contain a space. The body is the
  * 64-hex of a "varidx"-tagged digest of the base key material (deterministic
- * across nodes, like the variant/marker hashes). Returns the byte length. */
-size_t
-ngx_http_cache_turbo_variant_index_name(ngx_str_t *base, u_char *buf)
+ * across nodes, like the variant/marker hashes). Returns NGX_OK with the byte
+ * length in *len, or NGX_ERROR without publishing bytes/length. */
+ngx_int_t
+ngx_http_cache_turbo_variant_index_name(ngx_str_t *base, u_char *buf,
+    size_t *len)
 {
     ngx_http_cache_turbo_digest_t  d;
     u_char                         h[32];
@@ -737,11 +739,14 @@ ngx_http_cache_turbo_variant_index_name(ngx_str_t *base, u_char *buf)
     ngx_http_cache_turbo_digest_update(&d, base->data, base->len);
     ngx_http_cache_turbo_digest_update(&d, &us, 1);
     ngx_http_cache_turbo_digest_update(&d, "varidx", sizeof("varidx") - 1);
-    ngx_http_cache_turbo_digest_final(&d, h);
+    if (ngx_http_cache_turbo_digest_final(&d, h) != NGX_OK) {
+        return NGX_ERROR;
+    }
 
     buf[0] = ' ';
     p = ngx_hex_dump(buf + 1, h, 32);
-    return (size_t) (p - buf);
+    *len = (size_t) (p - buf);
+    return NGX_OK;
 }
 
 
@@ -749,7 +754,7 @@ ngx_http_cache_turbo_variant_index_name(ngx_str_t *base, u_char *buf)
  * active-axis bitmask, wrapped in the standard blob header so a later read can
  * validate the magic before trusting the byte. L1-only and node-local by design
  * (see the loc_conf auto_vary comment); shm store copies the stack blob in. */
-void
+ngx_int_t
 ngx_http_cache_turbo_marker_store(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf,
     ngx_http_cache_turbo_zone_t *z, ngx_str_t *base, ngx_int_t bits,
@@ -795,7 +800,9 @@ ngx_http_cache_turbo_marker_store(ngx_http_request_t *r,
     blob[NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE]     = (u_char) (bits & 0xFF);
     blob[NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE + 1] = (u_char) (gen & 0xFF);
 
-    ngx_http_cache_turbo_marker_hash(base, mk);
+    if (ngx_http_cache_turbo_marker_hash(base, mk) != NGX_OK) {
+        return NGX_ERROR;
+    }
 
     /* C3: not clcf->l1->store() -- markers are shm/zone-local by design (see
      * this function's own header comment), and _shm_store_marker() folds the
@@ -820,6 +827,8 @@ ngx_http_cache_turbo_marker_store(ngx_http_request_t *r,
     if (clcf->backend && clcf->backend->set && r != NULL) {
         clcf->backend->set(r, clcf, mk, blob, sizeof(blob), ttl, retain_ttl);
     }
+
+    return NGX_OK;
 }
 
 
@@ -829,10 +838,11 @@ ngx_http_cache_turbo_marker_store(ngx_http_request_t *r,
  * lock. Split out (S231-PERF-VARYLOCK) so the marker LOOKUP itself can be
  * folded into the caller's existing critical section instead of paying its
  * own separate ngx_shmtx_lock/unlock pair. */
-void
+ngx_int_t
 ngx_http_cache_turbo_vary_prepare(ngx_http_cache_turbo_ctx_t *ctx)
 {
-    ngx_http_cache_turbo_marker_hash(&ctx->cache_key, ctx->vary_marker_key);
+    return ngx_http_cache_turbo_marker_hash(&ctx->cache_key,
+                                             ctx->vary_marker_key);
 }
 
 
@@ -868,7 +878,7 @@ ngx_http_cache_turbo_vary_prepare(ngx_http_cache_turbo_ctx_t *ctx)
  * node in this function or its old counterpart). The only state that outlives
  * the lock is by-value: ctx->vary_gen (ngx_uint_t) and the bytes copied into
  * ctx->key_hash and *hash — plain stack/ctx memory, not shm. */
-void
+ngx_int_t
 ngx_http_cache_turbo_vary_apply(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_zone_t *z,
     ngx_http_cache_turbo_ctx_t *ctx, uint32_t *hash)
@@ -959,8 +969,11 @@ ngx_http_cache_turbo_vary_apply(ngx_http_request_t *r,
     ctx->vary_gen = gen;
 
     if (bits > 0) {
-        ngx_http_cache_turbo_variant_hash(r, &ctx->cache_key, bits, gen,
-                                          ctx->key_hash);
+        if (ngx_http_cache_turbo_variant_hash(r, &ctx->cache_key, bits, gen,
+                                              ctx->key_hash) != NGX_OK)
+        {
+            return NGX_ERROR;
+        }
         *hash = ngx_crc32_short(ctx->key_hash, 32);
         /* P3-5: an L1 hit is authoritative and strictly newer than any
          * earlier-pass L2 marker resolution still pending consumption (a
@@ -1039,6 +1052,8 @@ ngx_http_cache_turbo_vary_apply(ngx_http_request_t *r,
          * varied URL's base slot never populates. */
         ctx->vary_marker_l1_miss = 1;
     }
+
+    return NGX_OK;
 }
 
 

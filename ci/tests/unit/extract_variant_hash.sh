@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 #
-# Slice the verbatim body of the cache-turbo variant-key digest out of the
-# shipped ../../src/ngx_http_cache_turbo_module.c into generated_variant.inc:
+# Slice the verbatim bodies of the cache-turbo Vary-key digests out of the
+# shipped ../../src/ngx_http_cache_turbo_vary.c into generated_variant.inc:
 #
-#   ngx_http_cache_turbo_variant_hash()   the variant cache-key digest, which
-#                                         folds the one-byte PURGE generation
+#   ngx_http_cache_turbo_variant_hash()       variant cache key
+#   ngx_http_cache_turbo_marker_hash()        marker cache key
+#   ngx_http_cache_turbo_variant_index_name() Redis enumeration tag
 #
 # The test that consumes this (test_variant_gen.c) calls the REAL function with
 # bits == 0, which is the only reason this works without an ngx_http_request_t:
@@ -46,8 +47,8 @@ fi
 # non-static in vary.c (module.c calls it cross-TU), so the return-type line
 # has no `static` prefix -- match either form.
 awk '
-    /^static / || /^void$/ { pending = 1; buf = $0 ORS; next }
-    pending && /^ngx_http_cache_turbo_variant_hash\(/ {
+    /^static / || /^(void|ngx_int_t|size_t)$/ { pending = 1; buf = $0 ORS; next }
+    pending && /^ngx_http_cache_turbo_(variant_hash|marker_hash|variant_index_name)\(/ {
         capture = 1; pending = 0; printf "%s", buf; print; next
     }
     pending { pending = 0; buf = "" }
@@ -63,6 +64,13 @@ if ! grep -qF 'ngx_http_cache_turbo_variant_hash(' "$OUT"; then
     rm -f "$OUT"
     exit 1
 fi
+for fn in ngx_http_cache_turbo_marker_hash ngx_http_cache_turbo_variant_index_name; do
+    if ! grep -qF "$fn(" "$OUT"; then
+        echo "✗ failed to extract $fn from $SRC" >&2
+        rm -f "$OUT"
+        exit 1
+    fi
+done
 
 # --- guard: the gen fold must still be REACHED for every gen value.
 # AUD-GEN1 was closed by folding the generation unconditionally; a

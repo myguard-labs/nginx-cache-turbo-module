@@ -423,6 +423,16 @@ extern ngx_uint_t  ngx_test_lock_count;
  * test_shm_state.c, the sole TU that includes this shim. */
 extern pthread_mutex_t  ngx_test_shmtx;
 
+/* PURGE-ALL-STARVATION: one-shot barrier on the next zone-mutex unlock.
+ * The purge test arms it before purge_all() snapshots n_entries; the refill
+ * thread is released exactly after that snapshot lock is dropped, inserts its
+ * competing entries, then releases the purger.  Atomic exchange makes the
+ * hook one-shot, so the refill thread's own unlocks cannot recurse into it. */
+extern pthread_mutex_t  ngx_test_unlock_barrier_mutex;
+extern pthread_cond_t   ngx_test_unlock_barrier_cond;
+extern int              ngx_test_unlock_barrier_phase;
+extern int              ngx_test_unlock_barrier_armed;
+
 static inline void
 ngx_test_slab_fail_after(long n) { ngx_test_slab_budget = n; }
 
@@ -495,9 +505,24 @@ ngx_shmtx_lock(ngx_shmtx_t *mtx)
 static inline void
 ngx_shmtx_unlock(ngx_shmtx_t *mtx)
 {
+    int  wait_at_barrier;
+
     (void) mtx;
     ngx_test_lock_depth--;
     (void) pthread_mutex_unlock(&ngx_test_shmtx);
+
+    wait_at_barrier = __atomic_exchange_n(&ngx_test_unlock_barrier_armed, 0,
+                                           __ATOMIC_SEQ_CST);
+    if (wait_at_barrier) {
+        (void) pthread_mutex_lock(&ngx_test_unlock_barrier_mutex);
+        ngx_test_unlock_barrier_phase = 1;
+        (void) pthread_cond_broadcast(&ngx_test_unlock_barrier_cond);
+        while (ngx_test_unlock_barrier_phase != 2) {
+            (void) pthread_cond_wait(&ngx_test_unlock_barrier_cond,
+                                     &ngx_test_unlock_barrier_mutex);
+        }
+        (void) pthread_mutex_unlock(&ngx_test_unlock_barrier_mutex);
+    }
 }
 
 static inline int

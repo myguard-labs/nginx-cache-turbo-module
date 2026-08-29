@@ -117,7 +117,7 @@ digest_of_untagged(u_char out[32])
     ngx_http_cache_turbo_digest_final(&d, out);
 }
 
-static void
+static ngx_int_t
 digest_of(ngx_uint_t gen, u_char out[32])
 {
     ngx_str_t  base;
@@ -128,7 +128,46 @@ digest_of(ngx_uint_t gen, u_char out[32])
     /* bits == 0: no vary axis, so `r` is never dereferenced. r == NULL is
      * deliberate -- if a future edit reaches a classifier on this path the
      * shim aborts instead of returning a shimmed value. */
-    ngx_http_cache_turbo_variant_hash(NULL, &base, 0, gen, out);
+    return ngx_http_cache_turbo_variant_hash(NULL, &base, 0, gen, out);
+}
+
+static void
+digest_failures_propagate_across_vary_helpers(void)
+{
+    ngx_str_t  base;
+    u_char     out[1 + 64];
+    size_t     len = 123;
+
+    base.data = (u_char *) VARIANT_TEST_BASE;
+    base.len = strlen(VARIANT_TEST_BASE);
+    memset(out, 0xA5, sizeof(out));
+
+    ngx_test_digest_update_fail = 1;
+    CHECK(ngx_http_cache_turbo_variant_hash(NULL, &base, 0, 7, out)
+              == NGX_ERROR,
+          "variant_hash must reject a sticky digest-update failure");
+    CHECK(ngx_http_cache_turbo_marker_hash(&base, out) == NGX_ERROR,
+          "marker_hash must reject a sticky digest-update failure");
+    CHECK(ngx_http_cache_turbo_variant_index_name(&base, out, &len)
+              == NGX_ERROR,
+          "variant_index_name must reject a sticky digest-update failure");
+    ngx_test_digest_update_fail = 0;
+
+    CHECK(out[0] == 0xA5 && out[64] == 0xA5,
+          "failed Vary digests must not publish key or index bytes");
+    CHECK(len == 123,
+          "failed variant-index digest must not publish a name length");
+
+    ngx_test_digest_final_fail = 1;
+    CHECK(ngx_http_cache_turbo_variant_hash(NULL, &base, 0, 7, out)
+              == NGX_ERROR,
+          "variant_hash must reject a digest-final failure");
+    CHECK(ngx_http_cache_turbo_marker_hash(&base, out) == NGX_ERROR,
+          "marker_hash must reject a digest-final failure");
+    CHECK(ngx_http_cache_turbo_variant_index_name(&base, out, &len)
+              == NGX_ERROR,
+          "variant_index_name must reject a digest-final failure");
+    ngx_test_digest_final_fail = 0;
 }
 
 
@@ -233,6 +272,7 @@ base_key_still_folded(void)
 int
 main(void)
 {
+    digest_failures_propagate_across_vary_helpers();
     never_purged_folds_its_generation();
     same_stored_byte_collides_by_design();
     distinct_generations_differ();

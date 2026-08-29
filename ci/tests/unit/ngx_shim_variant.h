@@ -36,6 +36,8 @@ typedef uintptr_t       ngx_uint_t;
 typedef unsigned char   u_char;
 
 #define NGX_SSL          1
+#define NGX_OK           0
+#define NGX_ERROR       -1
 #define NGX_INT_T_LEN    (sizeof("-9223372036854775808") - 1)
 
 typedef struct {
@@ -97,6 +99,8 @@ typedef struct {
 } ngx_http_cache_turbo_digest_t;
 
 static EVP_MD_CTX  *ngx_http_cache_turbo_worker_md;
+static ngx_uint_t    ngx_test_digest_update_fail;
+static ngx_uint_t    ngx_test_digest_final_fail;
 
 static void
 ngx_http_cache_turbo_digest_init(ngx_http_cache_turbo_digest_t *d)
@@ -116,20 +120,38 @@ static void
 ngx_http_cache_turbo_digest_update(ngx_http_cache_turbo_digest_t *d,
     const void *data, size_t len)
 {
-    if (d->ok && EVP_DigestUpdate(d->md, data, len) != 1) {
+    if (d->ok && (ngx_test_digest_update_fail
+                  || EVP_DigestUpdate(d->md, data, len) != 1))
+    {
         d->ok = 0;
     }
 }
 
-static void
+static ngx_int_t
 ngx_http_cache_turbo_digest_final(ngx_http_cache_turbo_digest_t *d,
     u_char out[32])
 {
     unsigned int  n = 0;
 
-    if (!d->ok || EVP_DigestFinal_ex(d->md, out, &n) != 1 || n != 32) {
-        abort();
+    if (!d->ok || ngx_test_digest_final_fail
+        || EVP_DigestFinal_ex(d->md, out, &n) != 1 || n != 32)
+    {
+        return NGX_ERROR;
     }
+
+    return NGX_OK;
+}
+
+static u_char *
+ngx_hex_dump(u_char *dst, const u_char *src, size_t len)
+{
+    static const u_char  hex[] = "0123456789abcdef";
+
+    while (len--) {
+        *dst++ = hex[*src >> 4];
+        *dst++ = hex[*src++ & 0x0f];
+    }
+    return dst;
 }
 
 /* ---- vary-axis classifiers: unreachable when bits == 0 ------------------
