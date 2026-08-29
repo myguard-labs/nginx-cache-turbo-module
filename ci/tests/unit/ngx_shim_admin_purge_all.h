@@ -23,6 +23,13 @@ typedef unsigned char  u_char;
 #define NGX_HTTP_BAD_REQUEST           400
 #define NGX_HTTP_INTERNAL_SERVER_ERROR 500
 
+/* Keep exact response fixtures independent of production fault diagnostics,
+ * even when a caller supplies a target-wide test-faults compile flag. */
+#ifdef NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+#undef NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+#endif
+#define NGX_HTTP_CACHE_TURBO_TEST_FAULTS 0
+
 typedef struct {
     size_t   len;
     u_char  *data;

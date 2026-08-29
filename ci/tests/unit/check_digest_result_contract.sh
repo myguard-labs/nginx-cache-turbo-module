@@ -45,9 +45,23 @@ if ! grep -B1 -F 'ngx_http_cache_turbo_vary_prepare_lazy(' "$INTERNAL_H" |
 	exit 1
 fi
 
-if rg -n -U '\(void\)[[:space:]]+ngx_http_cache_turbo_(digest|digest_final|vary_prepare(_lazy)?|vary_apply|variant_hash|marker_hash|marker_store(_key)?|variant_index_name)\(' \
-	"$REPO/src" --glob '*.[ch]'; then
+if ! command -v rg >/dev/null 2>&1; then
+	echo "✗ rg is required to check for discarded digest results" >&2
+	exit 1
+fi
+
+set +e
+rg -n -U '\(void\)[[:space:]]*ngx_http_cache_turbo_(digest|digest_final|vary_prepare(_lazy)?|vary_apply|variant_hash|marker_hash|marker_store(_key)?|variant_index_name)\(' \
+	"$REPO/src" --glob '*.[ch]'
+rg_rc=$?
+set -e
+
+if [ "$rg_rc" -eq 0 ]; then
 	echo "✗ digest-derived return explicitly discarded; propagate failure" >&2
+	exit 1
+fi
+if [ "$rg_rc" -ne 1 ]; then
+	echo "✗ discarded-result scan failed (rg exit $rg_rc)" >&2
 	exit 1
 fi
 
