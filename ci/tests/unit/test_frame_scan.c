@@ -286,6 +286,66 @@ test_oversize_array_declined_both_ways(void)
     CHECK(rc == NGX_DECLINED, "over MAX_MEMBERS is declined identically when dribbled");
 }
 
+static ngx_int_t
+scan_dribbled(u_char *buf, size_t total, u_char **next)
+{
+    ngx_http_cache_turbo_redis_op_t  op;
+    ngx_pool_t                        pool;
+    size_t                            delivered;
+    ngx_int_t                         rc = NGX_AGAIN;
+
+    memset(&op, 0, sizeof(op));
+    pool.nallocs = 0;
+    op.rbuf = buf;
+    op.pool = &pool;
+    *next = NULL;
+
+    for (delivered = 1; delivered <= total; delivered++) {
+        op.rlen = delivered;
+        rc = ngx_http_cache_turbo_redis_frame_scan(&op, next);
+        if (rc != NGX_AGAIN) {
+            break;
+        }
+    }
+
+    return rc;
+}
+
+static void
+test_malformed_arrays_declined_identically_when_dribbled(void)
+{
+    static const char *cases[] = {
+        "*1\r\n$3\r\nabc\n",
+        "*1\r\n$-2\r\n",
+        "*2\r\n$1\r\na\r\n$2000000\r\n",
+        "*1\r\n*2000000\r\n",
+    };
+    ngx_http_cache_turbo_redis_op_t  op;
+    ngx_pool_t                        pool;
+    u_char                            buf[128];
+    u_char                           *next_one = NULL, *next_split = NULL;
+    ngx_int_t                         rc_one, rc_split;
+    size_t                            i, total;
+
+    for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        total = strlen(cases[i]);
+        memcpy(buf, cases[i], total);
+
+        memset(&op, 0, sizeof(op));
+        pool.nallocs = 0;
+        op.rbuf = buf;
+        op.rlen = total;
+        op.pool = &pool;
+        rc_one = ngx_http_cache_turbo_redis_frame_scan(&op, &next_one);
+
+        rc_split = scan_dribbled(buf, total, &next_split);
+        CHECK(rc_one == rc_split,
+              "malformed RESP array has identical single-shot and dribbled verdict");
+        CHECK(rc_split != NGX_OK,
+              "malformed RESP array is not accepted when split at every byte");
+    }
+}
+
 /* Empty array and nil array, both immediate boundary cases. */
 static void
 test_empty_and_nil_array(void)
@@ -372,6 +432,7 @@ main(void)
     test_split_inside_length_prefix();
     test_split_inside_crlf();
     test_oversize_array_declined_both_ways();
+    test_malformed_arrays_declined_identically_when_dribbled();
     test_empty_and_nil_array();
     test_frame_off_survives_simulated_realloc();
 

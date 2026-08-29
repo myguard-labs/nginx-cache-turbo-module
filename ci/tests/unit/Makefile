@@ -59,31 +59,76 @@ GEN = $(HERE)/generated_shm.inc
 # exercises frame_scan()), hence -Wno-unused-function only for this target.
 FUZZ_DIR    = $(HERE)/../../fuzz
 FRAME_GEN   = $(FUZZ_DIR)/generated_parser.inc
+MC_GEN      = $(FUZZ_DIR)/generated_mc_parser.inc
 
-.PHONY: check run tsan extract layout-check extract-frame-scan clean
+.PHONY: all test check run clean
+.PHONY: check-shm check-shm-rbtree check-shm-obj check-shm-link
+.PHONY: check-frame-scan check-mc-parse check-ae-class-guard
+.PHONY: run-shm run-shm-rbtree run-shm-obj run-shm-link
+.PHONY: run-frame-scan run-mc-parse run-ae-class-guard
+.PHONY: tsan tsan-rbtree tsan-obj tsan-link
+.PHONY: extract layout-check extract-frame-scan extract-mc-parse
 
-check: extract layout-check extract-frame-scan
+all: check
+
+test: check
+
+check: check-shm check-frame-scan check-mc-parse check-ae-class-guard
+
+check-shm: check-shm-rbtree check-shm-obj check-shm-link
+	@ASAN_OPTIONS=detect_leaks=1 $(HERE)/test_shm_state.san
+
+check-shm-rbtree: extract layout-check
 	@$(CC) $(CFLAGS) $(SAN) $(INCS_NGX) -c $(NGINX_SRC)/core/ngx_rbtree.c \
 	    -o $(HERE)/ngx_rbtree.san.o
+
+check-shm-obj: extract
 	@$(CC) $(CFLAGS) $(SAN) $(PTHREAD) $(INCS_TEST) -c $(HERE)/test_shm_state.c \
 	    -o $(HERE)/test_shm_state.san.o
+
+check-shm-link: check-shm-rbtree check-shm-obj
 	@$(CC) $(SAN) $(PTHREAD) $(HERE)/test_shm_state.san.o $(HERE)/ngx_rbtree.san.o -o $(HERE)/test_shm_state.san
-	@ASAN_OPTIONS=detect_leaks=1 $(HERE)/test_shm_state.san
+
+check-frame-scan: extract-frame-scan
 	@$(CC) $(CFLAGS) -Wno-unused-function $(SAN) -I$(FUZZ_DIR) \
 	    -o $(HERE)/test_frame_scan.san $(HERE)/test_frame_scan.c
 	@ASAN_OPTIONS=detect_leaks=1 $(HERE)/test_frame_scan.san
+
+check-mc-parse: extract-mc-parse
+	@$(CC) $(CFLAGS) -Wno-unused-function $(SAN) -I$(FUZZ_DIR) \
+	    -o $(HERE)/test_mc_parse.san $(HERE)/test_mc_parse.c
+	@ASAN_OPTIONS=detect_leaks=1 $(HERE)/test_mc_parse.san
+
+check-ae-class-guard:
 	@$(CC) $(CFLAGS) $(SAN) -o $(HERE)/test_ae_class_guard.san \
 	    $(HERE)/test_ae_class_guard.c
 	@ASAN_OPTIONS=detect_leaks=1 $(HERE)/test_ae_class_guard.san
 
-run: extract layout-check extract-frame-scan
-	@$(CC) $(CFLAGS) $(INCS_NGX) -c $(NGINX_SRC)/core/ngx_rbtree.c -o $(HERE)/ngx_rbtree.o
-	@$(CC) $(CFLAGS) $(PTHREAD) $(INCS_TEST) -c $(HERE)/test_shm_state.c -o $(HERE)/test_shm_state.o
-	@$(CC) $(PTHREAD) $(HERE)/test_shm_state.o $(HERE)/ngx_rbtree.o -o $(HERE)/test_shm_state
+run: run-shm run-frame-scan run-mc-parse run-ae-class-guard
+
+run-shm: run-shm-rbtree run-shm-obj run-shm-link
 	@$(HERE)/test_shm_state
+
+run-shm-rbtree: extract layout-check
+	@$(CC) $(CFLAGS) $(INCS_NGX) -c $(NGINX_SRC)/core/ngx_rbtree.c -o $(HERE)/ngx_rbtree.o
+
+run-shm-obj: extract
+	@$(CC) $(CFLAGS) $(PTHREAD) $(INCS_TEST) -c $(HERE)/test_shm_state.c -o $(HERE)/test_shm_state.o
+
+run-shm-link: run-shm-rbtree run-shm-obj
+	@$(CC) $(PTHREAD) $(HERE)/test_shm_state.o $(HERE)/ngx_rbtree.o -o $(HERE)/test_shm_state
+
+run-frame-scan: extract-frame-scan
 	@$(CC) $(CFLAGS) -Wno-unused-function -I$(FUZZ_DIR) \
 	    -o $(HERE)/test_frame_scan $(HERE)/test_frame_scan.c
 	@$(HERE)/test_frame_scan
+
+run-mc-parse: extract-mc-parse
+	@$(CC) $(CFLAGS) -Wno-unused-function -I$(FUZZ_DIR) \
+	    -o $(HERE)/test_mc_parse $(HERE)/test_mc_parse.c
+	@$(HERE)/test_mc_parse
+
+run-ae-class-guard:
 	@$(CC) $(CFLAGS) -o $(HERE)/test_ae_class_guard $(HERE)/test_ae_class_guard.c
 	@$(HERE)/test_ae_class_guard
 
@@ -92,19 +137,30 @@ run: extract layout-check extract-frame-scan
 # invisible to ASan (the free still happens once per run on an unloaded box) and
 # obvious to TSan. halt_on_error=1 so the first race fails the build instead of
 # scrolling past; TSan's own exit code is non-zero on a report either way.
-tsan: extract layout-check
+tsan: tsan-rbtree tsan-obj tsan-link
+	@TSAN_OPTIONS=halt_on_error=1 $(HERE)/test_shm_state.tsan
+
+tsan-rbtree: extract layout-check
 	@$(CC) $(CFLAGS) $(TSAN) $(INCS_NGX) -c $(NGINX_SRC)/core/ngx_rbtree.c \
 	    -o $(HERE)/ngx_rbtree.tsan.o
+
+tsan-obj: extract
 	@$(CC) $(CFLAGS) $(TSAN) $(PTHREAD) $(INCS_TEST) -c $(HERE)/test_shm_state.c \
 	    -o $(HERE)/test_shm_state.tsan.o
+
+tsan-link: tsan-rbtree tsan-obj
 	@$(CC) $(TSAN) $(PTHREAD) $(HERE)/test_shm_state.tsan.o $(HERE)/ngx_rbtree.tsan.o \
 	    -o $(HERE)/test_shm_state.tsan
-	@TSAN_OPTIONS=halt_on_error=1 $(HERE)/test_shm_state.tsan
 
 extract-frame-scan: $(FRAME_GEN)
 
 $(FRAME_GEN): $(REPO)/src/ngx_http_cache_turbo_redis.c $(FUZZ_DIR)/ngx_shim.h $(FUZZ_DIR)/extract_parser.sh
 	@$(FUZZ_DIR)/extract_parser.sh
+
+extract-mc-parse: $(MC_GEN)
+
+$(MC_GEN): $(REPO)/src/ngx_http_cache_turbo_memcached.c $(FUZZ_DIR)/ngx_shim_mc.h $(FUZZ_DIR)/extract_mc_parser.sh
+	@$(FUZZ_DIR)/extract_mc_parser.sh
 
 # Static-asserts the mirrored structs against the real nginx headers. Drift here
 # would otherwise be silent memory corruption at run time, not a build error.
@@ -130,3 +186,4 @@ clean:
 	@rm -f $(HERE)/test_shm_state $(HERE)/test_shm_state.san $(HERE)/*.o $(GEN)
 	@rm -f $(HERE)/test_shm_state.tsan
 	@rm -f $(HERE)/test_frame_scan $(HERE)/test_frame_scan.san
+	@rm -f $(HERE)/test_mc_parse $(HERE)/test_mc_parse.san
