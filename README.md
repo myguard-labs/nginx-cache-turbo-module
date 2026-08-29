@@ -702,7 +702,8 @@ axis rather than relying on auto-Vary.
 > axis: `normalize_vary` when you know the axis up front, `auto_vary` to learn it
 > from the response.
 
-Keying is two-level and node-local: the first time a URL's response is seen to
+Keying is two-level: the L1 marker copy is node-local, while a configured L2
+marker mirror/recovery path is shared. The first time a URL's response is seen to
 vary, the module records a tiny *vary marker* in L1 and stores the body under a
 secondary *variant* key; later requests read the marker and resolve straight to
 their variant. The base slot stays empty for varied URLs, so a node that hasn't
