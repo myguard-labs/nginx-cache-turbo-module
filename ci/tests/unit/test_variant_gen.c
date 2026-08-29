@@ -4,7 +4,7 @@
  *
  * AUD-GEN1, asserted against the REAL ngx_http_cache_turbo_variant_hash()
  * rather than a mirror of it. The function body is sliced verbatim from
- * src/ngx_http_cache_turbo_module.c by extract_variant_hash.sh into
+ * src/ngx_http_cache_turbo_vary.c by extract_variant_hash.sh into
  * generated_variant.inc; the digest is the real EVP/SHA-256. Only nginx's
  * scalar surface is shimmed (ngx_shim_variant.h).
  *
@@ -129,6 +129,62 @@ digest_of(ngx_uint_t gen, u_char out[32])
      * deliberate -- if a future edit reaches a classifier on this path the
      * shim aborts instead of returning a shimmed value. */
     return ngx_http_cache_turbo_variant_hash(NULL, &base, 0, gen, out);
+}
+
+static u_char
+hex_nibble(char c)
+{
+    return (u_char) (c <= '9' ? c - '0' : c - 'a' + 10);
+}
+
+static void
+hex_to_bytes(const char hex[64], u_char out[32])
+{
+    ngx_uint_t  i;
+
+    for (i = 0; i < 32; i++) {
+        out[i] = (u_char) ((hex_nibble(hex[i * 2]) << 4)
+                           | hex_nibble(hex[i * 2 + 1]));
+    }
+}
+
+static void
+successful_vary_keys_match_fixed_vectors(void)
+{
+    /* Independently generated with sha256sum over the exact framed inputs:
+     * base + 0x1f + {"gen=7", "varymark", "varidx"}. */
+    static const char variant_hex[] =
+        "733ea66ffd5dd65d22905577f4a3f76a9a140a3cda411c16c3d450ced5af1835";
+    static const char marker_hex[] =
+        "1fd56d57a06c9b9633b7b04a49bf673833b803df27ca970ba43fb918b49c8766";
+    static const char index_hex[] =
+        "3d2f6ad5088373d20035cd2cf6febc1e35800f5b41a8f4737a4c0611d5990b13";
+    ngx_str_t  base;
+    u_char     out[1 + 64];
+    u_char     expected[32];
+    size_t     len = 0;
+
+    base.data = (u_char *) VARIANT_TEST_BASE;
+    base.len = strlen(VARIANT_TEST_BASE);
+
+    hex_to_bytes(variant_hex, expected);
+    CHECK(ngx_http_cache_turbo_variant_hash(NULL, &base, 0, 7, out) == NGX_OK,
+          "fixed-vector variant hash must succeed");
+    CHECK(memcmp(out, expected, 32) == 0,
+          "successful variant-key bytes must stay compatible");
+
+    hex_to_bytes(marker_hex, expected);
+    CHECK(ngx_http_cache_turbo_marker_hash(&base, out) == NGX_OK,
+          "fixed-vector marker hash must succeed");
+    CHECK(memcmp(out, expected, 32) == 0,
+          "successful marker-key bytes must stay compatible");
+
+    CHECK(ngx_http_cache_turbo_variant_index_name(&base, out, &len) == NGX_OK,
+          "fixed-vector variant-index name must succeed");
+    CHECK(len == 65 && out[0] == ' ',
+          "variant-index name framing must stay one space plus 64 hex bytes");
+    CHECK(memcmp(out + 1, index_hex, 64) == 0,
+          "successful variant-index name bytes must stay compatible");
 }
 
 static void
@@ -272,6 +328,7 @@ base_key_still_folded(void)
 int
 main(void)
 {
+    successful_vary_keys_match_fixed_vectors();
     digest_failures_propagate_across_vary_helpers();
     never_purged_folds_its_generation();
     same_stored_byte_collides_by_design();

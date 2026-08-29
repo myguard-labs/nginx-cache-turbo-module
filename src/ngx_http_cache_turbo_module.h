@@ -21,6 +21,17 @@
 #include <ngx_md5.h>
 
 
+/* Digest-derived cache keys are an integrity boundary: ignoring a failed
+ * derivation can publish or act on stale/uninitialised output.  Make ordinary
+ * discarded-result mutations compiler errors in every GCC/Clang build; the
+ * unit contract gate separately rejects an explicit (void) bypass. */
+#if defined(__GNUC__) || defined(__clang__)
+#define NGX_HTTP_CACHE_TURBO_MUST_CHECK  __attribute__((warn_unused_result))
+#else
+#define NGX_HTTP_CACHE_TURBO_MUST_CHECK
+#endif
+
+
 /* R5-1 (perf-microtier-hitpath): the module build has no per-addon CFLAGS hook
  * anywhere in nginx's `auto/module`/`auto/make` — every module object is
  * compiled with the SAME global $(CFLAGS) as nginx core, in both the
@@ -3474,7 +3485,7 @@ ngx_int_t ngx_http_cache_turbo_send_json(ngx_http_request_t *r,
 /* One-shot digest convenience for a single contiguous input (module.c).
  * Returns NGX_OK on success, NGX_ERROR on failure. */
 ngx_int_t ngx_http_cache_turbo_digest(const void *data, size_t len,
-    u_char out[32]);
+    u_char out[32]) NGX_HTTP_CACHE_TURBO_MUST_CHECK;
 
 /* State carried through an async tag purge from the admin handler (or the
  * variant-index purge in module.c) to the SMEMBERS completion callback. */

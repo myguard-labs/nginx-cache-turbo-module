@@ -107,6 +107,7 @@ bash "$DIR/extract_tok_sort.sh"
 # --- EVP digest failure path (AUD-DIGEST-ZERO) ----------------------------
 # Unit test for the fail-closed digest handling. Tests that EVP failures are
 # propagated to callers instead of silently producing all-zero keys.
+bash "$DIR/check_digest_result_contract.sh"
 # shellcheck disable=SC2086
 "$CC" $CFLAGS "$DIR/test_digest_fail.c" -o "$DIR/test_digest_fail" -lssl -lcrypto
 "$DIR/test_digest_fail"
@@ -130,6 +131,14 @@ bash "$DIR/extract_admin_purge_key.sh"
 # shellcheck disable=SC2086
 "$CC" $CFLAGS "$DIR/test_admin_purge_key.c" -o "$DIR/test_admin_purge_key"
 "$DIR/test_admin_purge_key"
+
+# --- admin ?all=1 incomplete-L1 response contract ------------------------
+# Exercise the real helper: NGX_AGAIN must send the exact 500 JSON response
+# and stop before a configured L2 SCAN can launch.
+bash "$DIR/extract_admin_purge_all.sh"
+# shellcheck disable=SC2086
+"$CC" $CFLAGS "$DIR/test_admin_purge_all.c" -o "$DIR/test_admin_purge_all"
+"$DIR/test_admin_purge_all"
 
 FUZZ_DIR="$DIR/../../fuzz"
 BLOB_CC="${BLOB_CC:-clang}"

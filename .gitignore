@@ -45,6 +45,8 @@ ci/tests/unit/test_digest
 ci/tests/unit/generated_digest.inc
 ci/tests/unit/test_admin_purge_key
 ci/tests/unit/generated_admin_purge_key.inc
+ci/tests/unit/test_admin_purge_all
+ci/tests/unit/generated_admin_purge_all.inc
 ci/tests/unit/test_key_fold
 ci/tests/unit/generated_key_fold.inc
 ci/tests/unit/test_tok_sort

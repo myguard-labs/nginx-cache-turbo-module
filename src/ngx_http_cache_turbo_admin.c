@@ -140,9 +140,9 @@ ngx_http_cache_turbo_all_purge_complete(ngx_http_request_t *r, void *data,
 
 /* ?all=1 whole-zone purge (POST/PUT/DELETE). Mirrors the admin_handler dispatch
  * exactly: on success sets *purged and returns NGX_OK so the caller emits the
- * common {"purged":N} reply; on a path that sends its own response (parked
- * SCAN, or the L2-unavailable 500) returns that rc directly so admin_handler
- * can propagate it unchanged. */
+ * common {"purged":N} reply; on a path that sends its own response (L1
+ * incomplete, parked SCAN, or L2 unavailable) returns that rc directly so
+ * admin_handler can propagate it unchanged. */
 static ngx_int_t
 ngx_http_cache_turbo_admin_purge_all(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_zone_t *z,
