@@ -17,12 +17,12 @@ awk '
         print
         if ($0 == "}") { capture = 0; exit }
     }
-' "$SRC" > "$OUT"
+' "$SRC" >"$OUT"
 
 if ! grep -qF 'ngx_http_cache_turbo_admin_purge_all(' "$OUT"; then
-    echo "✗ failed to extract admin purge-all helper from $SRC" >&2
-    rm -f "$OUT"
-    exit 1
+	echo "✗ failed to extract admin purge-all helper from $SRC" >&2
+	rm -f "$OUT"
+	exit 1
 fi
 
 echo "✓ extracted admin purge-all helper → $(basename "$OUT")"
