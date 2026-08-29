@@ -2084,14 +2084,20 @@ ngx_http_cache_turbo_body_filter_store(ngx_http_request_t *r,
  * address reuse from turning pointer identity into an ABA. */
 static void
 ngx_http_cache_turbo_body_filter_rollback_store(
-    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_zone_t *z,
-    u_char *store_key, uint32_t hash, u_char *stored_data)
+    ngx_http_request_t *r, ngx_http_cache_turbo_loc_conf_t *clcf,
+    ngx_http_cache_turbo_zone_t *z, u_char *store_key, uint32_t hash,
+    u_char *stored_data)
 {
     if (stored_data == NULL) {
         return;
     }
 
-    (void) clcf->l1->purge_if_blob(z, store_key, hash, stored_data);
+    if (clcf->l1->purge_if_blob(z, store_key, hash, stored_data) > 0) {
+        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                      "cache_turbo: removed unsafe auto-vary variant \"%V\" "
+                      "after mandatory marker store failed",
+                      &r->uri);
+    }
     ngx_http_cache_turbo_blob_release(z, stored_data);
 }
 
@@ -2555,7 +2561,7 @@ ngx_http_cache_turbo_body_filter_store_tail(ngx_http_request_t *r,
         if (ngx_http_cache_turbo_body_filter_varidx_store(r, clcf, ctx, z,
                 store_key, hash, ttl, retain_ttl) != NGX_OK)
         {
-            ngx_http_cache_turbo_body_filter_rollback_store(clcf, z,
+            ngx_http_cache_turbo_body_filter_rollback_store(r, clcf, z,
                 store_key, hash, stored_data);
             return NGX_DECLINED;
         }

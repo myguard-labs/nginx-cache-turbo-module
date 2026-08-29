@@ -1564,12 +1564,24 @@ ngx_http_cache_turbo_shm_purge_all(ngx_http_cache_turbo_zone_t *z,
     ngx_http_cache_turbo_node_t  *ctn;
 
     *purged = 0;
+    rc = NGX_OK;
 
     ngx_shmtx_lock(ngx_http_cache_turbo_zone_mutex(z));
     remaining = ngx_http_cache_turbo_zone_sh(z)->n_entries;
-    ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
 
-    rc = NGX_OK;
+    /* Treat the entry count as the work budget, not as proof that the queues
+     * are empty.  A zero budget still needs one lock-held observation: if a
+     * corrupted/stale counter disagrees with either resident queue, claiming
+     * completion would turn accounting skew into a false successful purge. */
+    if (remaining == 0
+        && (!ngx_queue_empty(&ngx_http_cache_turbo_zone_sh(z)->lru)
+            || !ngx_queue_empty(
+                    &ngx_http_cache_turbo_zone_sh(z)->lru_protected)))
+    {
+        rc = NGX_AGAIN;
+    }
+
+    ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
 
     while (remaining > 0) {
         ngx_shmtx_lock(ngx_http_cache_turbo_zone_mutex(z));

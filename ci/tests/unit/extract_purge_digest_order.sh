@@ -28,4 +28,19 @@ for fn in ngx_http_cache_turbo_purge_auto_vary \
 	fi
 done
 
+# Falsifiable partial-purge diagnostic control: the generation-store failure
+# occurs after the base delete, so suppressing only its warning must trip the
+# exact operator-visible contract assertion.
+if [ "${CTRL_PURGE_NO_PARTIAL_WARN:-0}" = 1 ]; then
+	warn_line='        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,'
+	if [ "$(grep -cF "$warn_line" "$OUT")" -ne 1 ]; then
+		echo "✗ partial-purge warning mutation could not find its production log" >&2
+		rm -f "$OUT"
+		exit 1
+	fi
+	sed -i \
+		's/        ngx_log_error(NGX_LOG_WARN/        if (0) ngx_log_error(NGX_LOG_WARN/' \
+		"$OUT"
+fi
+
 echo "✓ extracted PURGE digest-order path → $(basename "$OUT")"

@@ -19,6 +19,7 @@ typedef unsigned char  u_char;
 #define NGX_DONE                           -4
 #define NGX_HTTP_OK                       200
 #define NGX_HTTP_INTERNAL_SERVER_ERROR    500
+#define NGX_LOG_WARN                        4
 #define NGX_LOG_DEBUG_HTTP                  0
 #define NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE 76
 
@@ -134,7 +135,20 @@ typedef struct {
 static int     ngx_test_digest_call;
 static int     ngx_test_digest_fail_call;
 static int     ngx_test_marker_store_calls;
+static ngx_int_t ngx_test_marker_store_result;
 static u_char  ngx_test_marker_store_key[32];
+static int     ngx_test_warning_calls;
+static ngx_uint_t ngx_test_warning_level;
+static const char *ngx_test_warning_format;
+
+#define ngx_log_error(level, log, err, fmt, ...)                            \
+    do {                                                                     \
+        (void) (log);                                                        \
+        (void) (err);                                                        \
+        ngx_test_warning_calls++;                                            \
+        ngx_test_warning_level = (level);                                    \
+        ngx_test_warning_format = (fmt);                                     \
+    } while (0)
 
 static void *
 ngx_pnalloc(ngx_pool_t *pool, size_t size)
@@ -281,7 +295,7 @@ ngx_http_cache_turbo_marker_store_key(ngx_http_request_t *r,
     (void) retain_ttl;
     ngx_test_marker_store_calls++;
     memcpy(ngx_test_marker_store_key, marker_key, 32);
-    return NGX_OK;
+    return ngx_test_marker_store_result;
 }
 
 static time_t

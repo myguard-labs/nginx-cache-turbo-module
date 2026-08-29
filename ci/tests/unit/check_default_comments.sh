@@ -61,8 +61,31 @@ field_comments = {
 for name, pattern in field_comments.items():
     if not re.search(pattern, header):
         raise SystemExit(f'field comment does not match conf.c merge for {name}')
-if not re.search(r'keep_stale = NGX_CONF_UNSET;\s*/\* S2\.1; merges to 24h \*/', module):
+
+# Derive keep_stale from its actual merge call just like the breaker defaults.
+# A prose-only `24h` regex stayed green if conf.c silently changed the numeric
+# default, which is the opposite of a default-contract gate.
+match = re.search(
+    r'ngx_conf_merge_sec_value\(conf->keep_stale,\s*prev->keep_stale, (\d+)\)',
+    conf)
+if not match:
+    raise SystemExit('merge default missing for keep_stale')
+keep_stale_default = int(match.group(1))
+if keep_stale_default != 86400:
+    raise SystemExit(
+        f'approved keep_stale default drifted: {keep_stale_default}')
+keep_stale_hours = keep_stale_default // 3600
+if keep_stale_default % 3600 != 0:
+    raise SystemExit('keep_stale default is no longer an exact hour value')
+if not re.search(
+        rf'keep_stale = NGX_CONF_UNSET;\s*/\* S2\.1; merges to '
+        rf'{keep_stale_default}s \({keep_stale_hours}h\) \*/', module):
     raise SystemExit('module lifecycle comment does not match keep_stale merge default')
+if not re.search(
+        rf'0 is the\s*(?:\*\s*)?explicit OFF opt-out; the shipped default is '
+        rf'{keep_stale_default}s \({keep_stale_hours}h\).*?\*/\s*'
+        rf'time_t\s+keep_stale;', header, re.S):
+    raise SystemExit('keep_stale field comment does not match merge default')
 if not re.search(r'breaker_enable = NGX_CONF_UNSET;\s*/\* O4\.4; merges to 1 = on \*/', module):
     raise SystemExit('module lifecycle comment does not match breaker_enable merge default')
 if not re.search(r'breaker_threshold = NGX_CONF_UNSET_UINT;\s*/\* O4\.2; merges to 5 \*/', module):

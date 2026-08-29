@@ -10,6 +10,21 @@ typedef intptr_t       ngx_int_t;
 typedef unsigned char  u_char;
 
 #define NGX_OK  0
+#define NGX_LOG_WARN  4
+
+typedef struct {
+    size_t   len;
+    u_char  *data;
+} ngx_str_t;
+
+typedef struct {
+    void  *log;
+} ngx_connection_t;
+
+typedef struct {
+    ngx_connection_t  *connection;
+    ngx_str_t           uri;
+} ngx_http_request_t;
 
 typedef struct ngx_http_cache_turbo_node_s {
     u_char  key[32];
@@ -34,6 +49,18 @@ typedef struct ngx_http_cache_turbo_loc_conf_s {
 
 extern unsigned  ngx_test_release_calls;
 extern u_char   *ngx_test_released_data;
+extern unsigned  ngx_test_warning_calls;
+extern ngx_int_t ngx_test_warning_level;
+extern const char *ngx_test_warning_format;
+
+#define ngx_log_error(level, log, err, fmt, ...)                            \
+    do {                                                                     \
+        (void) (log);                                                        \
+        (void) (err);                                                        \
+        ngx_test_warning_calls++;                                            \
+        ngx_test_warning_level = (level);                                    \
+        ngx_test_warning_format = (fmt);                                     \
+    } while (0)
 
 #define ngx_http_cache_turbo_zone_mutex(z) (&(z)->mutex)
 

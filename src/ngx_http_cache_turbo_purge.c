@@ -254,6 +254,12 @@ ngx_http_cache_turbo_purge_auto_vary(ngx_http_request_t *r,
                                                   mttl, clcf->stale_mult))
         != NGX_OK)
     {
+        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                      "cache_turbo: PURGE partially completed for \"%V\": "
+                      "the base object was deleted but the auto-vary "
+                      "generation marker update failed; old-generation "
+                      "variants may remain resolvable",
+                      &r->uri);
         return NGX_ERROR;
     }
     (*purged)++;

@@ -5758,7 +5758,7 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->min_uses = NGX_CONF_UNSET;
     conf->l2_negative_ttl = NGX_CONF_UNSET;   /* L13; merges to 0 = off */
     conf->vary_marker_revalidate = NGX_CONF_UNSET;  /* c-2; merges to 2s */
-    conf->keep_stale = NGX_CONF_UNSET;   /* S2.1; merges to 24h */
+    conf->keep_stale = NGX_CONF_UNSET;   /* S2.1; merges to 86400s (24h) */
     conf->use_stale = NGX_CONF_UNSET_UINT;   /* S4.1; merges to USE_STALE_DEFAULT */
     conf->breaker_enable = NGX_CONF_UNSET;         /* O4.4; merges to 1 = on */
     conf->breaker_threshold = NGX_CONF_UNSET_UINT; /* O4.2; merges to 5 */

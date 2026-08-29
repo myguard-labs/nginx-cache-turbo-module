@@ -108,6 +108,10 @@ reset_case(ngx_http_request_t *r, ngx_pool_t *pool,
     ngx_test_digest_call = 0;
     ngx_test_digest_fail_call = 0;
     ngx_test_marker_store_calls = 0;
+    ngx_test_marker_store_result = NGX_OK;
+    ngx_test_warning_calls = 0;
+    ngx_test_warning_level = 0;
+    ngx_test_warning_format = NULL;
     l1_lookup_calls = 0;
     l1_purge_calls = 0;
     l2_del_calls = 0;
@@ -235,6 +239,27 @@ main(void)
           "preflighted marker bytes must reach marker_store unchanged");
     CHECK(request.send_calls == 1 && request.sent_status == NGX_HTTP_OK,
           "successful L1-only purge must retain its HTTP 200 response");
+
+    reset_case(&request, &pool, &connection, &clcf, &l1, NULL, &shm_zone);
+    marker_present = 1;
+    ngx_test_marker_store_result = NGX_ERROR;
+    rc = ngx_http_cache_turbo_purge_request(&request, &clcf);
+    CHECK(rc == NGX_HTTP_INTERNAL_SERVER_ERROR,
+          "post-delete marker-store failure must return HTTP 500");
+    CHECK(l1_purge_calls == 1 && l1_lookup_calls == 1,
+          "marker-store failure occurs only after the base was purged");
+    CHECK(ngx_test_marker_store_calls == 1,
+          "marker-store failure fixture must exercise the generation bump");
+    CHECK(request.send_calls == 0,
+          "partial purge failure must not publish a success body");
+    CHECK(ngx_test_warning_calls == 1
+              && ngx_test_warning_level == NGX_LOG_WARN,
+          "partial purge failure must emit exactly one warning");
+    CHECK(ngx_test_warning_format != NULL
+              && strstr(ngx_test_warning_format, "partially completed") != NULL
+              && strstr(ngx_test_warning_format,
+                        "variants may remain resolvable") != NULL,
+          "partial purge warning must name resolvable variant residue");
 
     /* Appended-case control: reset_case() must restore the configured backend
      * after the L1-only fixture above instead of leaking that case's mode. */

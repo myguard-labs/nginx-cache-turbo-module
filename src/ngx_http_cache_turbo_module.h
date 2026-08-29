@@ -2074,8 +2074,9 @@ typedef struct {
     /* cache_turbo_keep_stale <off|time|forever> (S2.1; read side wired in
      * S2.2). Consulted on the store path, where it widens sie_window -- see
      * the `ttl > 0 && clcf->keep_stale > 0` and
-     * `ttl > 0 && clcf->ignore_cc && clcf->keep_stale > 0` gates. 0 = OFF (the
-     * default 24h); NGX_HTTP_CACHE_TURBO_FOREVER_TTL
+     * `ttl > 0 && clcf->ignore_cc && clcf->keep_stale > 0` gates. 0 is the
+     * explicit OFF opt-out; the shipped default is 86400s (24h).
+     * NGX_HTTP_CACHE_TURBO_FOREVER_TTL
      * for the `forever` keyword; otherwise the parsed+clamped seconds value.
      * Deliberately NOT a synonym for cache_turbo_valid's "0 = forever"
      * convention -- see the doc comment on the handler for why a bare 0 here

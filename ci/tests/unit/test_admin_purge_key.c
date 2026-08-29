@@ -46,14 +46,28 @@ main(void)
 {
     static const u_char expected[32] =
         "admin-keyadmin-keyadmin-keyadmin";
-    ngx_cache_turbo_l1_backend_t  l1 = { test_purge_key };
-    ngx_cache_turbo_backend_t     l2 = { test_del };
-    ngx_http_cache_turbo_loc_conf_t clcf = { &l1, &l2 };
+    ngx_cache_turbo_l1_backend_t  l1;
+    ngx_cache_turbo_backend_t     l2;
+    ngx_http_cache_turbo_loc_conf_t clcf;
     ngx_http_cache_turbo_zone_t   zone;
     ngx_http_request_t            request;
     ngx_str_t                     key = { 9, (u_char *) "admin-key" };
     ngx_uint_t                    purged = 99;
     ngx_int_t                     rc;
+
+    /* The extracted helper receives these objects exactly as production does.
+     * Keep every reachable byte deterministic: future helper/backend fields
+     * must start disabled rather than inheriting stack poison, and sanitizer
+     * runs must exercise the successful path without an uninitialised read. */
+    memset(&l1, 0, sizeof(l1));
+    memset(&l2, 0, sizeof(l2));
+    memset(&clcf, 0, sizeof(clcf));
+    memset(&zone, 0, sizeof(zone));
+    memset(&request, 0, sizeof(request));
+    l1.purge_key = test_purge_key;
+    l2.del = test_del;
+    clcf.l1 = &l1;
+    clcf.backend = &l2;
 
     ngx_test_digest_fail = 1;
     rc = ngx_http_cache_turbo_admin_purge_key(&request, &clcf, &zone, &key,

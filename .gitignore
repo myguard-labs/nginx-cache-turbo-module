@@ -44,6 +44,7 @@ ci/tests/unit/test_digest_fail
 ci/tests/unit/test_digest
 ci/tests/unit/generated_digest.inc
 ci/tests/unit/test_admin_purge_key
+ci/tests/unit/test_admin_purge_key.san
 ci/tests/unit/generated_admin_purge_key.inc
 ci/tests/unit/test_access_marker_resolve
 ci/tests/unit/generated_access_marker_resolve.inc

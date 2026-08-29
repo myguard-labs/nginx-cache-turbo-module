@@ -629,6 +629,40 @@ purge_test_disarm_unlock_barrier(void)
 }
 
 static void
+test_purge_all_zero_snapshot_detects_queue_skew(void)
+{
+    ngx_uint_t  purged;
+    ngx_int_t   rc;
+
+    printf("PURGE-ALL-STARVATION: zero snapshot observes resident queues\n");
+    zone_reset();
+    purge_test_fill(0, 1);
+    REQUIRE(g_sh.n_entries == 1,
+            "fixture: skew control requires one resident entry");
+
+    g_sh.n_entries = 0;
+    purged = 99;
+    rc = ngx_http_cache_turbo_shm_purge_all(&g_zone, &purged);
+
+    CHECK(rc == NGX_AGAIN,
+          "zero snapshot with resident queue must report purge-all incomplete");
+    CHECK(purged == 0,
+          "zero snapshot must not exceed its empty work budget");
+    CHECK(!ngx_queue_empty(&g_sh.lru)
+              || !ngx_queue_empty(&g_sh.lru_protected),
+          "zero snapshot skew observation must not mutate resident queues");
+    CHECK(ngx_test_lock_balanced(),
+          "zero snapshot skew observation left the zone mutex held");
+
+    /* Restore the deliberately skewed fixture and prove the ordinary idle
+     * path still drains it once the counter agrees with the queues. */
+    g_sh.n_entries = 1;
+    rc = ngx_http_cache_turbo_shm_purge_all(&g_zone, &purged);
+    CHECK(rc == NGX_OK && purged == 1 && g_sh.n_entries == 0,
+          "reconciled idle purge-all must drain the resident entry");
+}
+
+static void
 test_purge_all_snapshot_bounds_concurrent_refill(void)
 {
     enum { SNAPSHOT = NGX_HTTP_CACHE_TURBO_PURGE_BATCH + 1 };
@@ -6274,6 +6308,7 @@ main(void)
     zone_reset();
 
     test_s8_evict_terminates_on_empty_queues();
+    test_purge_all_zero_snapshot_detects_queue_skew();
     test_purge_all_snapshot_bounds_concurrent_refill();
     test_lru_insert_new_clears_bitfield_unit();
     test_evict_blind_second_chance_unit();

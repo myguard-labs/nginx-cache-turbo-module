@@ -100,6 +100,10 @@ main(void)
                                                         20, 80);
     CHECK(rc == NGX_OK && ngx_test_marker_store_calls == 1,
           "successful marker resolution must retain the ordinary path");
+    CHECK(ngx_test_store_bits == 3 && ngx_test_store_gen == 7
+              && ngx_test_store_ttl == 20
+              && ngx_test_store_retain_ttl == 80,
+          "successful self-heal must forward bits, generation and both TTLs");
     CHECK(ngx_test_warning_calls == 0 && ngx_test_debug_calls == 1,
           "successful self-heal must emit only its success debug log");
 

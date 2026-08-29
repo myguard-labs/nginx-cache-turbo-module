@@ -131,6 +131,15 @@ bash "$DIR/extract_admin_purge_key.sh"
 # shellcheck disable=SC2086
 "$CC" $CFLAGS "$DIR/test_admin_purge_key.c" -o "$DIR/test_admin_purge_key"
 "$DIR/test_admin_purge_key"
+# The helper receives request/zone/config objects and both success-tier
+# callbacks. Run the exact extracted slice under ASan/UBSan so any reachable
+# uninitialised/invalid test fixture state is exercised, not merely zeroed by
+# convention in the ordinary binary.
+# shellcheck disable=SC2086
+"$CC" $CFLAGS -fsanitize=address,undefined -fno-omit-frame-pointer \
+	-fno-sanitize-recover=all "$DIR/test_admin_purge_key.c" \
+	-o "$DIR/test_admin_purge_key.san"
+ASAN_OPTIONS=detect_leaks=1 "$DIR/test_admin_purge_key.san"
 
 # --- L2 marker self-heal failure policy ----------------------------------
 # Once the variant key is resolved, re-storing its marker is best-effort.
@@ -178,6 +187,7 @@ bash "$DIR/extract_purge_digest_order.sh"
 "$CC" $CFLAGS "$DIR/test_purge_digest_order.c" \
 	-o "$DIR/test_purge_digest_order"
 "$DIR/test_purge_digest_order"
+bash "$DIR/check_purge_partial_warn_control.sh"
 
 FUZZ_DIR="$DIR/../../fuzz"
 BLOB_CC="${BLOB_CC:-clang}"
@@ -271,6 +281,11 @@ if [ -f "$NGINX_OBJS/ngx_auto_config.h" ]; then
     NGINX_VERSION="$NGINX_VERSION" NGINX_SRC="$NGINX_SRC" \
         NGINX_OBJS="$NGINX_OBJS" \
         bash "$DIR/check_purge_snapshot_control.sh"
+
+    echo "--- purge-all zero-snapshot skew mutation control ---"
+    NGINX_VERSION="$NGINX_VERSION" NGINX_SRC="$NGINX_SRC" \
+        NGINX_OBJS="$NGINX_OBJS" \
+        bash "$DIR/check_purge_zero_skew_control.sh"
 
     # --- c-1: varidx drop/reissue accounting is production-reachable -------
     # The PURGE reply's "complete":false honesty field depends on

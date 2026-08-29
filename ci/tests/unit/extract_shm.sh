@@ -371,6 +371,19 @@ if [ "${CTRL_PURGE_NO_SNAPSHOT:-0}" = 1 ]; then
     sed -i 's/    remaining = ngx_http_cache_turbo_zone_sh(z)->n_entries;/    remaining = (ngx_uint_t) -1; \/\* CTRL: no finite snapshot \*\//' "$OUT"
 fi
 
+# Falsifiable zero-budget control.  Removing the lock-held queue observation
+# must make the counter/queue-skew fixture falsely report completion while
+# leaving its resident node untouched.
+if [ "${CTRL_PURGE_SKIP_ZERO_CHECK:-0}" = 1 ]; then
+    zero_line='    if (remaining == 0'
+    if [ "$(grep -cxF "$zero_line" "$OUT")" -ne 1 ]; then
+        echo "✗ zero-budget mutation could not find its production check" >&2
+        rm -f "$OUT"
+        exit 1
+    fi
+    sed -i 's/^    if (remaining == 0$/    if (0 \&\& remaining == 0/' "$OUT"
+fi
+
 # --- P6/O4.2: the breaker's origin-failure predicate lives in module.c, not
 # shm.c, because it is about the RESPONSE (a status code) rather than about the
 # zone. Sliced by marker like the fuzz targets do it, for the same no-drift

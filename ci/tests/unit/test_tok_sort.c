@@ -94,13 +94,17 @@ static int failures;
 static int alloc_fail_after = -1;
 static int outstanding_allocs;
 static int expected_alloc_failure;
+static int allocation_attempts;
+static int injected_alloc_failures;
 
 static void *
 test_malloc(size_t size)
 {
     void *p;
 
+    allocation_attempts++;
     if (alloc_fail_after == 0) {
+        injected_alloc_failures++;
         return NULL;
     }
     if (alloc_fail_after > 0) {
@@ -111,6 +115,22 @@ test_malloc(size_t size)
         outstanding_allocs++;
     }
     return p;
+}
+
+static void
+check_fault_injection(const char *what, int expected_attempts)
+{
+    checks++;
+    if (allocation_attempts != expected_attempts
+        || injected_alloc_failures != 1)
+    {
+        failures++;
+        fprintf(stderr,
+                "✗ %s: expected %d allocation attempts and one injected "
+                "failure, got %d attempts/%d failures\n",
+                what, expected_attempts, allocation_attempts,
+                injected_alloc_failures);
+    }
 }
 
 static void
@@ -197,16 +217,22 @@ both(const char *what, ngx_str_t *in, ngx_uint_t n)
 static void
 allocation_fault_checks(ngx_str_t *in)
 {
+    allocation_attempts = 0;
+    injected_alloc_failures = 0;
     alloc_fail_after = 0;
     expected_alloc_failure = 1;
     both("first allocation fault", in, 1);
+    check_fault_injection("first allocation fault", 1);
     if (outstanding_allocs != 0) {
         failures++;
         fprintf(stderr, "✗ first allocation fault leaked comparison storage\n");
     }
 
+    allocation_attempts = 0;
+    injected_alloc_failures = 0;
     alloc_fail_after = 1;
     both("second allocation fault", in, 1);
+    check_fault_injection("second allocation fault", 2);
     if (outstanding_allocs != 0) {
         failures++;
         fprintf(stderr, "✗ second allocation fault leaked comparison storage\n");

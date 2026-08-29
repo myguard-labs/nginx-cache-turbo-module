@@ -101,4 +101,19 @@ if [ "${CTRL_MARKER_ROLLBACK_UNCONDITIONAL:-0}" = 1 ]; then
 		"$OUT"
 fi
 
+# The isolated rollback is an operator-visible partial-store event.  Removing
+# only the warning must fail the exact logging assertion without changing the
+# compare-and-delete behavior.
+if [ "${CTRL_MARKER_ROLLBACK_NO_WARN:-0}" = 1 ]; then
+	line='    if (clcf->l1->purge_if_blob(z, store_key, hash, stored_data) > 0) {'
+	if [ "$(grep -cF "$line" "$OUT")" -ne 1 ]; then
+		echo "✗ rollback-warning mutation could not find its production branch" >&2
+		rm -f "$OUT"
+		exit 1
+	fi
+	sed -i \
+		's/if (clcf->l1->purge_if_blob(z, store_key, hash, stored_data) > 0)/if (0 \&\& clcf->l1->purge_if_blob(z, store_key, hash, stored_data) > 0)/' \
+		"$OUT"
+fi
+
 echo "✓ extracted marker rollback helpers → $(basename "$OUT")"

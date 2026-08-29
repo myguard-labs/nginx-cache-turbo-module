@@ -12,6 +12,9 @@
 static int         failures;
 unsigned           ngx_test_release_calls;
 u_char            *ngx_test_released_data;
+unsigned           ngx_test_warning_calls;
+ngx_int_t          ngx_test_warning_level;
+const char        *ngx_test_warning_format;
 static u_char       blob_a[1];
 static u_char       blob_b[1];
 static u_char       variant_key[32];
@@ -27,6 +30,7 @@ static pthread_barrier_t replacement_done;
     } while (0)
 
 typedef struct {
+    ngx_http_request_t              *request;
     ngx_http_cache_turbo_loc_conf_t *clcf;
     ngx_http_cache_turbo_zone_t     *zone;
 } race_ctx_t;
@@ -71,8 +75,8 @@ request_a_rollback(void *data)
      * installed a replacement under the same variant key. */
     wait_barrier(&marker_failed);
     wait_barrier(&replacement_done);
-    ngx_http_cache_turbo_body_filter_rollback_store(ctx->clcf, ctx->zone,
-        variant_key, 0x12345678, blob_a);
+    ngx_http_cache_turbo_body_filter_rollback_store(ctx->request, ctx->clcf,
+        ctx->zone, variant_key, 0x12345678, blob_a);
     return NULL;
 }
 
@@ -98,6 +102,9 @@ reset_zone(ngx_http_cache_turbo_zone_t *zone, u_char *data)
     zone->node.data = data;
     ngx_test_release_calls = 0;
     ngx_test_released_data = NULL;
+    ngx_test_warning_calls = 0;
+    ngx_test_warning_level = 0;
+    ngx_test_warning_format = NULL;
 }
 
 int
@@ -106,6 +113,8 @@ main(void)
     ngx_cache_turbo_l1_backend_t       l1;
     ngx_http_cache_turbo_loc_conf_t    clcf;
     ngx_http_cache_turbo_zone_t        zone;
+    ngx_http_request_t                 request;
+    ngx_connection_t                   connection;
     race_ctx_t                         race;
     pthread_t                          thread_a;
     pthread_t                          thread_b;
@@ -119,6 +128,12 @@ main(void)
                  "zone mutex must initialise");
     l1.purge_if_blob = ngx_http_cache_turbo_shm_purge_if_blob;
     clcf.l1 = &l1;
+    memset(&request, 0, sizeof(request));
+    memset(&connection, 0, sizeof(connection));
+    request.connection = &connection;
+    request.uri.data = (u_char *) "/asset.css";
+    request.uri.len = sizeof("/asset.css") - 1;
+    race.request = &request;
     race.clcf = &clcf;
     race.zone = &zone;
 
@@ -145,25 +160,38 @@ main(void)
           "A's stale token must not delete B's replacement node");
     CHECK(ngx_test_release_calls == 1 && ngx_test_released_data == blob_a,
           "A's pinned blob token must be released exactly once");
+    CHECK(ngx_test_warning_calls == 0,
+          "replacement-preserving rollback must not claim it deleted A");
 
     (void) pthread_barrier_destroy(&marker_failed);
     (void) pthread_barrier_destroy(&replacement_done);
 
     reset_zone(&zone, blob_a);
-    ngx_http_cache_turbo_body_filter_rollback_store(&clcf, &zone, variant_key,
-                                                     0x12345678, blob_a);
+    ngx_http_cache_turbo_body_filter_rollback_store(&request, &clcf, &zone,
+                                                     variant_key, 0x12345678,
+                                                     blob_a);
     CHECK(!zone.present && zone.drops == 1,
           "isolated failed marker store must remove A's unsafe variant");
     CHECK(ngx_test_release_calls == 1 && ngx_test_released_data == blob_a,
           "isolated rollback must release A's pinned token exactly once");
+    CHECK(ngx_test_warning_calls == 1
+              && ngx_test_warning_level == NGX_LOG_WARN,
+          "successful unsafe-variant rollback must emit exactly one warning");
+    CHECK(ngx_test_warning_format != NULL
+              && strstr(ngx_test_warning_format,
+                        "removed unsafe auto-vary variant") != NULL,
+          "rollback warning must identify removal of the unsafe variant");
 
     reset_zone(&zone, blob_b);
-    ngx_http_cache_turbo_body_filter_rollback_store(&clcf, &zone, variant_key,
-                                                     0x12345678, NULL);
+    ngx_http_cache_turbo_body_filter_rollback_store(&request, &clcf, &zone,
+                                                     variant_key, 0x12345678,
+                                                     NULL);
     CHECK(zone.present && zone.node.data == blob_b && zone.drops == 0,
           "a failed L1 store with no token must not purge an existing entry");
     CHECK(ngx_test_release_calls == 0,
           "a missing store token must not be released");
+    CHECK(ngx_test_warning_calls == 0,
+          "a rollback that deletes nothing must not emit a removal warning");
 
     (void) pthread_mutex_destroy(&zone.mutex);
     fprintf(stderr, "marker rollback race: %d failures\n", failures);
