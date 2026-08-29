@@ -13,10 +13,22 @@ internal = {'cache_turbo_probe', 'cache_turbo_normalized_args', 'cache_turbo_act
 registered = [n for n in registered if not n.startswith('cache_turbo_test_') and n not in internal]
 section = readme.split('## Directive synopsis', 1)[1].split('\n## ', 1)[0]
 rows = {}
+def split_unescaped_pipes(line):
+    cells, start, escaped = [], 0, False
+    for i, char in enumerate(line):
+        if char == '|' and not escaped:
+            cells.append(line[start:i])
+            start = i + 1
+        escaped = (char == '\\' and not escaped)
+        if char != '\\':
+            escaped = False
+    cells.append(line[start:])
+    return cells
+
 for line in section.splitlines():
     if not line.startswith('| `'):
         continue
-    cells = [cell.strip() for cell in line.split('|')]
+    cells = [cell.strip() for cell in split_unescaped_pipes(line)]
     name = cells[1].strip('`').split()[0]
     rows[name] = cells
 missing = [n for n in registered if not any(name == n or name.startswith(n + ' ') for name in rows)]
