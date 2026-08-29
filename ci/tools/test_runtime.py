@@ -310,6 +310,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_warm_rejects_embedded_nul(ng, origin)
     test_warm_normal_url_still_warms(ng, origin)
     test_stale_serves_stale(ng, origin)
+    test_swr_parent_disconnect_refresh_drop_lifecycle(ng, origin)
     test_single_flight(ng, origin)
     test_cold_single_flight(ng, origin)
     test_cold_lock_off_stampedes(ng, origin)

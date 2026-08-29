@@ -1337,6 +1337,13 @@ events {{ worker_connections 512; }}
 http {{
     access_log off;
 
+    # SWR-LIFECYCLE: throttle only the stale-reading parent so nginx cannot
+    # buffer the complete resident body before the test resets that connection.
+    map $http_x_swr_lifecycle_slow $swrlc_limit_rate {{
+        default 0;
+        1       64k;
+    }}
+
     cache_turbo_zone name=main 16m;
     cache_turbo_zone name=c3vmz 4m;  # C3: isolated zone for the vary-marker
                                       # presence-counter tests -- `markers` is
@@ -1363,6 +1370,10 @@ http {{
     cache_turbo_zone name=sroffz 64k; # P3-1 default-on control (directive absent)
     cache_turbo_zone name=srexpz 64k; # S8 explicit `off` control (pre-P3-1 flat LRU)
     cache_turbo_zone name=shmref 16m; # refresh-under-pressure (R6b)
+    # SWR-LIFECYCLE: isolated accounting for parent-disconnect/background-drop
+    # coverage. 4m holds both 320 KB keys plus old/new refresh generations and
+    # slab overhead without turning this lifecycle test into an eviction test.
+    cache_turbo_zone name=swrlcz 4m;
     cache_turbo_zone name=at 16m;    # autotune raise/clamp/off (v4-3)
     cache_turbo_zone name=ats 16m;   # autotune safe-method isolation (ADMIN-AUTOTUNE-SAFE-METHOD)
     cache_turbo_zone name=atl 16m;   # autotune load-adaptive stale widen (v4-4)
@@ -3081,6 +3092,21 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # SWR-LIFECYCLE: the stale reader resets mid-body while its independently
+        # scheduled background refresh is stalled, then dropped. A short lease
+        # makes the later successful refresh bounded.
+        location /swrlc/ {{
+            cache_turbo                       swrlcz;
+            cache_turbo_key                   $uri;
+            cache_turbo_valid                 2s;
+            cache_turbo_stale_mult            8;
+            cache_turbo_beta                  100000;
+            cache_turbo_lock_ttl              3s;
+            cache_turbo_background_update_max 1;
+            limit_rate                        $swrlc_limit_rate;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # background_update OFF (v8): the stale dice-winner regenerates INLINE
         # and serves the fresh body on that request (pre-v8 behaviour).
         location /noswr/ {{
@@ -4472,6 +4498,11 @@ http {{
         location = /_cache {{
             cache_turbo_admin main;
             aio threads=cache_turbo_warm;
+            allow 127.0.0.1;
+            deny all;
+        }}
+        location = /_cache_swrlc {{
+            cache_turbo_admin swrlcz;
             allow 127.0.0.1;
             deny all;
         }}

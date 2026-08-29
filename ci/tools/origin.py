@@ -90,8 +90,51 @@ class Origin:
         # places as _path_hits, so it is exact.
         self._method_hits: collections.Counter[tuple[str, str]] = collections.Counter()
         self._lock = threading.Lock()
+        # SWR-LIFECYCLE: one-shot, path-scoped coordination for a background
+        # refresh that must be in flight when its stale-reading parent is
+        # disconnected. The handler consumes an arm before waiting, so the
+        # next refresh of the same key is a normal successful response.
+        self._swr_drop_lock = threading.Lock()
+        self._swr_drop_path: str | None = None
+        self._swr_drop_phase: str | None = None
+        self._swr_drop_started = threading.Event()
+        self._swr_drop_release = threading.Event()
+        self._swr_drop_complete = threading.Event()
         self._server: http.server.ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
+
+    def arm_swr_drop(self, path: str, phase: str) -> None:
+        """Drop one exact-path response before headers or after a body prefix.
+
+        The explicit release lets the test disconnect nginx's downstream stale
+        reader and observe refresh cleanup while the origin handler is parked.
+        """
+        if phase not in ("before-headers", "mid-body"):
+            raise ValueError(f"unknown SWR drop phase: {phase}")
+        with self._swr_drop_lock:
+            if self._swr_drop_path is not None:
+                raise RuntimeError("an SWR drop is already armed")
+            self._swr_drop_path = path
+            self._swr_drop_phase = phase
+            self._swr_drop_started.clear()
+            self._swr_drop_release.clear()
+            self._swr_drop_complete.clear()
+
+    def wait_swr_drop_started(self, timeout: float) -> bool:
+        return self._swr_drop_started.wait(timeout)
+
+    def release_swr_drop(self) -> None:
+        self._swr_drop_release.set()
+
+    def wait_swr_drop_complete(self, timeout: float) -> bool:
+        return self._swr_drop_complete.wait(timeout)
+
+    def cancel_swr_drop(self) -> None:
+        """Unpark a handler during assertion cleanup and disarm unused arms."""
+        self._swr_drop_release.set()
+        with self._swr_drop_lock:
+            self._swr_drop_path = None
+            self._swr_drop_phase = None
 
     def reset_delay(self) -> None:
         """Restore `delay` to the suite baseline after a test borrowed it.
@@ -268,6 +311,45 @@ class Origin:
                     self.end_headers()
                     return True
                 return False
+
+            def _get_handle_swr_drop(self, n: int) -> bool:
+                """Run the one-shot SWR lifecycle drop, if this path owns it."""
+                with origin._swr_drop_lock:
+                    if origin._swr_drop_path != self.path:
+                        return False
+                    phase = origin._swr_drop_phase
+                    origin._swr_drop_path = None
+                    origin._swr_drop_phase = None
+
+                try:
+                    if phase == "mid-body":
+                        body_len = 320000
+                        prefix = f"partial-gen-{n}\n".encode() + b"P" * 65536
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/octet-stream")
+                        self.send_header("Content-Length", str(body_len))
+                        self.end_headers()
+                        self.wfile.write(prefix)
+                        self.wfile.flush()
+
+                    # For before-headers this is signalled before a status byte;
+                    # for mid-body it is signalled only after a valid 200 header
+                    # block and a substantial prefix reached the socket.
+                    origin._swr_drop_started.set()
+                    # Explicit release normally wins; this deadlock backstop
+                    # must outlast the sanitizer-scaled client/admin waits.
+                    origin._swr_drop_release.wait(60.0)
+                    try:
+                        self.connection.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                    self.close_connection = True
+                    return True
+                except (BrokenPipeError, ConnectionResetError):
+                    self.close_connection = True
+                    return True
+                finally:
+                    origin._swr_drop_complete.set()
 
             def _get_handle_rngsrc(self) -> None:
                 """AUD-RANGE1: a real Range-capable origin (e.g. a static
@@ -562,6 +644,21 @@ class Origin:
                     # serve would be detectable.
                     body = (f"gen-{n}\n".encode()
                             + b"x" * 200000)
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    try:
+                        self.wfile.write(body)
+                    except BrokenPipeError:
+                        pass
+                    return True, None
+                if "swrlifecycle" in self.path:
+                    # SWR-LIFECYCLE: a substantial cached body proves that the
+                    # parent read the resident response intact. The generation
+                    # prefix makes a successful recovery refresh distinguishable
+                    # from the resident pre-drop body.
+                    body = f"gen-{n}\n".encode() + b"L" * 320000
                     self.send_response(200)
                     self.send_header("Content-Type", "application/octet-stream")
                     self.send_header("Content-Length", str(len(body)))
@@ -1123,6 +1220,8 @@ class Origin:
                         del origin._paths[:-64]
                     origin._path_hits[self.path] += 1
                     origin._method_hits[("GET", self.path)] += 1
+                if self._get_handle_swr_drop(n):
+                    return
                 if self._get_handle_hard_failure(n):
                     return
                 handled, body = self._get_handle_special_cases(n)

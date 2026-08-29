@@ -10,6 +10,8 @@ star-imports this module, so every test stays reachable as
 from __future__ import annotations
 
 import http.client
+import socket
+import struct
 
 # Underscore-prefixed names are NOT re-exported by `import *`, so the
 # private helpers this module actually calls are imported explicitly.
@@ -18,6 +20,7 @@ from test_runtime_base import (
     _admin_lock_waits,
     _admin_stat,
     _admin_str,
+    _bump_conn,
     _errlog_window_start,
     _fetch_keepalive,
 )
@@ -649,6 +652,174 @@ def test_stale_serves_stale(ng: Nginx, origin: Origin) -> None:
         time.sleep(0.1)
     assert advanced, "stale entry never refreshed to a new generation"
     drain_origin(origin)       # v8: settle async bg refreshes before the next test
+
+
+def test_swr_parent_disconnect_refresh_drop_lifecycle(
+        ng: Nginx, origin: Origin) -> None:
+    """SWR-LIFECYCLE: a parent reset tears down its background refresh.
+
+    Exercise both upstream teardown points that own different nginx state:
+    before response headers exist, and after a valid 200 plus body prefix. In
+    each arm the downstream starts reading a large stale body and disconnects
+    mid-response while the background upstream is parked at that drop point.
+    The capped zone's bg_inflight gauge must
+    return from exactly one live request to zero, the incomplete response must
+    not replace the resident body, and a later refresh must succeed. Running
+    this under ASan/UBSan turns a parent/subrequest pool UAF or double cleanup
+    into a hard failure rather than a timing-only symptom.
+    """
+    endpoint = "/_cache_swrlc"
+
+    for phase in ("before-headers", "mid-body"):
+        uri = f"/swrlc/swrlifecycle-{phase}"
+        # proxy_pass ends in '/', so nginx replaces the /swrlc/ location
+        # prefix before contacting the origin. Arm and count that exact
+        # upstream path, while requests to nginx continue using `uri`.
+        origin_uri = f"/swrlifecycle-{phase}"
+        s0, b0, h0 = fetch(ng.port, uri)
+        assert s0 == 200 and len(b0) > 300000, \
+            f"{phase}: large-body prime failed: {s0}, {len(b0)} bytes"
+        assert h0.get("x-cache") != "HIT", \
+            f"{phase}: prime unexpectedly came from cache"
+        assert _admin_stat(ng, "bg_inflight", endpoint) == 0, \
+            f"{phase}: bg_inflight was not zero before the lifecycle arm"
+        # nginx's refresh dice uses second-granularity ngx_time(). Sleeping for
+        # only the 2s fresh TTL plus a fraction can land exactly at fresh_until,
+        # where elapsed == 0 and even beta=100000 has a zero threshold. Cross
+        # one full stale second so this arm deterministically wins the dice.
+        time.sleep(3.1)
+        before = origin.hits_for(origin_uri)
+        origin.arm_swr_drop(origin_uri, phase)
+
+        _bump_conn()
+        parent_socket = socket.socket(
+            socket.AF_INET, socket.SOCK_STREAM)
+        parent: socket.socket | None = parent_socket
+        parent_socket.settimeout(HTTP_TIMEOUT)
+        parent_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024)
+        response: http.client.HTTPResponse | None = None
+        try:
+            parent_socket.connect(("127.0.0.1", ng.port))
+            parent_socket.sendall(
+                f"GET {uri} HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                "X-SWR-Lifecycle-Slow: 1\r\n"
+                "Connection: keep-alive\r\n\r\n".encode())
+
+            # Read the headers and exactly one body byte. The byte is the
+            # body-progress oracle; the tiny receive buffer then keeps nginx's
+            # stale-body writer live while the independently posted refresh
+            # reaches the origin and parks there.
+            response = http.client.HTTPResponse(parent_socket)
+            response.begin()
+            assert response.status == 200, \
+                f"{phase}: stale parent returned {response.status}"
+            assert response.getheader("X-Cache") == "STALE", \
+                f"{phase}: parent did not receive STALE"
+            assert response.getheader("Content-Length") == str(len(b0)), \
+                f"{phase}: stale parent advertised the wrong body length"
+            assert response.read(1) == b0[:1].encode(), \
+                f"{phase}: stale parent did not enter the expected body"
+            assert origin.wait_swr_drop_started(
+                5.0 * sanitizer_time_scale()), \
+                (f"{phase}: background refresh never reached its drop point "
+                 f"(origin hits {origin.hits_for(origin_uri)}, "
+                 f"expected {before + 1})")
+            assert origin.hits_for(origin_uri) == before + 1, \
+                f"{phase}: expected exactly one parked background refresh"
+            assert wait_for(
+                lambda: _admin_stat(ng, "bg_inflight", endpoint) == 1,
+                timeout=2.0), \
+                f"{phase}: parked refresh did not own exactly one bg slot"
+
+            # Abortive close after consuming exactly one body byte, while the
+            # stale writer and background origin are independently live.
+            parent_socket.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                                     struct.pack("ii", 1, 0))
+            # HTTPResponse owns a socket.makefile() reference. Close it first,
+            # or parent_socket.close() only marks the wrapper closed and the
+            # actual descriptor stays live instead of sending the RST.
+            response.close()
+            response = None
+            parent_socket.close()
+            parent = None
+            assert wait_for(
+                lambda: _admin_stat(ng, "bg_inflight", endpoint) == 0,
+                timeout=3.0), \
+                f"{phase}: parent abort did not tear down the parked refresh"
+
+            origin.release_swr_drop()
+
+            assert origin.wait_swr_drop_complete(
+                5.0 * sanitizer_time_scale()), \
+                f"{phase}: origin drop did not complete"
+            assert wait_for(
+                lambda: _admin_stat(ng, "bg_inflight", endpoint) == 0,
+                timeout=5.0), \
+                f"{phase}: bg_inflight did not clear after refresh teardown"
+
+            # The failed response (including the mid-body prefix) must never
+            # become an entry. Before the 3s refresh lease expires this read can
+            # only serve the original stale blob; it cannot launch the recovery.
+            s1, b1, h1 = fetch(ng.port, uri)
+            assert s1 == 200 and h1.get("x-cache") == "STALE", \
+                f"{phase}: failed refresh displaced the stale entry: {s1}, {h1}"
+            assert b1 == b0, \
+                f"{phase}: a partial refresh body was stored"
+            # Depending on how long nginx needs to process the rate-limited
+            # parent's RST, the 3s lease may already be expired here. The probe
+            # above can therefore be the recovery trigger, or a later poll can
+            # become it. Both are correct; every response before the completed
+            # refresh must still be the original stale body.
+            recovered = None
+            deadline = time.monotonic() + 5.0 * sanitizer_time_scale()
+            while time.monotonic() < deadline:
+                hits = origin.hits_for(origin_uri)
+                if hits >= before + 2:
+                    break
+                s3, b3, h3 = fetch(ng.port, uri)
+                if s3 == 200 and h3.get("x-cache") == "HIT" and b3 != b0:
+                    recovered = b3
+                    break
+                assert s3 == 200 and h3.get("x-cache") == "STALE", \
+                    f"{phase}: recovery poll returned {s3}, {h3}"
+                assert b3 == b0, \
+                    f"{phase}: recovery poll served a partial refresh body"
+                time.sleep(0.05)
+
+            assert origin.hits_for(origin_uri) == before + 2, \
+                f"{phase}: next background refresh did not reach the origin once"
+
+            if recovered is None:
+                deadline = time.monotonic() + 5.0 * sanitizer_time_scale()
+                while time.monotonic() < deadline:
+                    s3, b3, h3 = fetch(ng.port, uri)
+                    if s3 == 200 and h3.get("x-cache") == "HIT" and b3 != b0:
+                        recovered = b3
+                        break
+                    assert s3 == 200 and h3.get("x-cache") == "STALE", \
+                        f"{phase}: in-flight recovery returned {s3}, {h3}"
+                    assert b3 == b0, \
+                        f"{phase}: in-flight recovery exposed a partial body"
+                    time.sleep(0.05)
+            assert recovered is not None, \
+                f"{phase}: next refresh never stored a complete new response"
+            assert recovered.startswith("gen-") and "partial-gen-" not in recovered, \
+                f"{phase}: recovered entry contains the dropped partial body"
+            assert wait_for(
+                lambda: _admin_stat(ng, "bg_inflight", endpoint) == 0,
+                timeout=3.0), \
+                f"{phase}: successful refresh left bg_inflight nonzero"
+            time.sleep(0.1)
+            assert _admin_stat(ng, "bg_inflight", endpoint) == 0, \
+                f"{phase}: bg_inflight underflowed after its single cleanup"
+        finally:
+            if response is not None:
+                response.close()
+            if parent is not None:
+                parent.close()
+            origin.cancel_swr_drop()
+
+    drain_origin(origin)
 
 
 def test_single_flight(ng: Nginx, origin: Origin) -> None:
