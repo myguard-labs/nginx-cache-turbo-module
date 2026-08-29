@@ -800,11 +800,11 @@ ngx_http_cache_turbo_marker_store_key(ngx_http_request_t *r,
     blob[NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE]     = (u_char) (bits & 0xFF);
     blob[NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE + 1] = (u_char) (gen & 0xFF);
 
-    /* C3: not clcf->l1->store() -- markers are shm/zone-local by design (see
-     * this function's own header comment), and _shm_store_marker() folds the
-     * `markers` presence-counter bookkeeping into the SAME lock hold as the
-     * write itself (see its own comment in shm.c for why that atomicity is
-     * required, not just tidy). */
+    /* C3: not clcf->l1->store() -- this mandatory L1 copy and its `markers`
+     * presence-counter bookkeeping are zone-shm-specific. _shm_store_marker()
+     * folds both into the SAME lock hold (see its own comment in shm.c for why
+     * that atomicity is required, not just tidy). The marker object itself is
+     * not L1-only: a configured L2 receives the write-through below. */
     if (ngx_http_cache_turbo_shm_store_marker(z, marker_key,
             ngx_crc32_short(marker_key, 32), blob, sizeof(blob), ttl,
             retain_ttl) != NGX_OK)
@@ -814,8 +814,8 @@ ngx_http_cache_turbo_marker_store_key(ngx_http_request_t *r,
 
     /* P3-5: write the marker through to L2 too, keyed by marker_hash (the
      * SAME key a marker-cold consult GETs -- see access_l2_marker_get()).
-     * The L1 store above is node-local by design (see the loc_conf
-     * auto_vary comment); this is what lets a DIFFERENT node, cold for this
+     * The L1 store above is node-local by design; this is what lets a
+     * DIFFERENT node, cold for this
      * marker (fresh boot, LRU-evicted marker node), still learn "this base
      * URL has a classified variant" from L2 instead of falling straight
      * through to an unpopulated base-key L2 GET. Fire-and-forget async SET,

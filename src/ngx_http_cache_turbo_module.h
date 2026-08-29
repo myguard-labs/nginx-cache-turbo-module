@@ -2335,13 +2335,14 @@ typedef struct {
      * at store time and the named request headers (safe whitelist only:
      * Accept-Encoding, User-Agent->device, Accept-Language, Origin) are folded
      * into a SECONDARY variant key so distinct representations get distinct
-     * slots automatically — no operator config of the axes. Two-level keying is
-     * node-local: a tiny "vary marker" (the active axis bitmask) is stored in L1
-     * under a dedicated marker key; a request probes the marker (L1 only) and,
-     * if present, recomputes its key to the variant before the normal lookup.
-     * The base slot stays empty for varied URLs, so a missing marker just misses
-     * to origin (never serves the wrong variant). Vary: * / Cookie /
-     * Authorization make the response uncacheable. Off by default. */
+     * slots automatically — no operator config of the axes. A tiny "vary
+     * marker" (the active axis bitmask) is stored in node-local L1 under a
+     * dedicated marker key and mirrored to a configured L2. A request probes
+     * L1 first; an L1 miss can recover the marker from L2 before recomputing its
+     * key to the variant. The base slot stays empty for varied URLs, so a
+     * missing marker just misses to origin (never serves the wrong variant).
+     * Vary: * / Cookie / Authorization make the response uncacheable. Off by
+     * default. */
     ngx_flag_t               auto_vary;
 
     /* cache_turbo_key_encoded_origin (P3-2). An origin that always sends a
