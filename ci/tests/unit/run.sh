@@ -17,6 +17,8 @@ CC="${CC:-cc}"
 CFLAGS="-g -O0 -Wall -Wextra -Werror -I$DIR"
 
 bash "$DIR/check_constants.sh"
+bash "$DIR/check_directive_synopsis.sh" "$(cd "$DIR/../../.." && pwd)"
+bash "$DIR/check_default_comments.sh" "$(cd "$DIR/../../.." && pwd)"
 
 if [ "${COVERAGE:-0}" = 1 ]; then
     CFLAGS="$CFLAGS --coverage"
@@ -66,6 +68,7 @@ bash "$DIR/extract_variant_hash.sh"
 # shellcheck disable=SC2086
 "$CC" $CFLAGS "$DIR/test_variant_gen.c" -o "$DIR/test_variant_gen" -lssl -lcrypto
 "$DIR/test_variant_gen"
+bash "$DIR/check_variant_gen_normalize_control.sh"
 
 # --- cache-key fold, single-allocation (S231-PERF-KEYFOLD) -----------------
 # Pins the digest of known multi-part / empty-value / oversize keys against
@@ -105,6 +108,7 @@ bash "$DIR/extract_tok_sort.sh"
 # --- EVP digest failure path (AUD-DIGEST-ZERO) ----------------------------
 # Unit test for the fail-closed digest handling. Tests that EVP failures are
 # propagated to callers instead of silently producing all-zero keys.
+bash "$DIR/check_digest_result_contract.sh"
 # shellcheck disable=SC2086
 "$CC" $CFLAGS "$DIR/test_digest_fail.c" -o "$DIR/test_digest_fail" -lssl -lcrypto
 "$DIR/test_digest_fail"
@@ -120,6 +124,71 @@ bash "$DIR/extract_digest.sh"
 # shellcheck disable=SC2086
 "$CC" $CFLAGS "$DIR/test_digest.c" -o "$DIR/test_digest" -lssl -lcrypto
 "$DIR/test_digest"
+
+# --- admin ?key= digest failure propagation (DIGEST-ERRORS-IGNORED) -------
+# Compile the real helper with a deterministic failing digest.  A mutation
+# that ignores digest()'s return reaches either cache tier and turns this red.
+bash "$DIR/extract_admin_purge_key.sh"
+# shellcheck disable=SC2086
+"$CC" $CFLAGS "$DIR/test_admin_purge_key.c" -o "$DIR/test_admin_purge_key"
+"$DIR/test_admin_purge_key"
+# The helper receives request/zone/config objects and both success-tier
+# callbacks. Run the exact extracted slice under ASan/UBSan so any reachable
+# uninitialised/invalid test fixture state is exercised, not merely zeroed by
+# convention in the ordinary binary.
+# shellcheck disable=SC2086
+"$CC" $CFLAGS -fsanitize=address,undefined -fno-omit-frame-pointer \
+	-fno-sanitize-recover=all "$DIR/test_admin_purge_key.c" \
+	-o "$DIR/test_admin_purge_key.san"
+ASAN_OPTIONS=detect_leaks=1 "$DIR/test_admin_purge_key.san"
+
+# --- L2 marker self-heal failure policy ----------------------------------
+# Once the variant key is resolved, re-storing its marker is best-effort.
+# Exercise the real helper and keep variant-key digest failures fail-closed.
+bash "$DIR/extract_access_marker_resolve.sh"
+# shellcheck disable=SC2086
+"$CC" $CFLAGS "$DIR/test_access_marker_resolve.c" \
+	-o "$DIR/test_access_marker_resolve"
+"$DIR/test_access_marker_resolve"
+
+# --- marker mandatory-L1 / L2 write-through ordering --------------------
+# Exercise the real helper: an L1 marker write failure must propagate and
+# prevent L2 publication; success retains exact key/body bytes in both tiers.
+bash "$DIR/extract_marker_store_key.sh"
+# shellcheck disable=SC2086
+"$CC" $CFLAGS "$DIR/test_marker_store_key.c" -o "$DIR/test_marker_store_key"
+"$DIR/test_marker_store_key"
+
+# --- marker-failure rollback identity/race -------------------------------
+# A pins the exact blob it stored.  A deterministic two-thread barrier lets B
+# replace the same variant before A rolls back, proving compare-and-delete
+# preserves B while an isolated failed A is removed.  The mutation control
+# drops the identity comparison and must fail the exact survival assertion.
+bash "$DIR/extract_marker_rollback.sh"
+# shellcheck disable=SC2086
+"$CC" $CFLAGS -pthread "$DIR/test_marker_rollback.c" \
+	-o "$DIR/test_marker_rollback"
+"$DIR/test_marker_rollback"
+bash "$DIR/check_marker_rollback_control.sh"
+
+# --- admin ?all=1 incomplete-L1 response contract ------------------------
+# Exercise the real dispatcher and completion callback: NGX_AGAIN must still
+# launch configured L2 cleanup, then retain both tiers' exact outcome in the
+# single synchronous or asynchronous response.
+bash "$DIR/extract_admin_purge_all.sh"
+# shellcheck disable=SC2086
+"$CC" $CFLAGS "$DIR/test_admin_purge_all.c" -o "$DIR/test_admin_purge_all"
+"$DIR/test_admin_purge_all"
+
+# --- PURGE digest preflight ordering --------------------------------------
+# Execute the real request + auto-Vary helper with deterministic marker/index
+# failures. No base/marker/L2 mutation may precede either digest result.
+bash "$DIR/extract_purge_digest_order.sh"
+# shellcheck disable=SC2086
+"$CC" $CFLAGS "$DIR/test_purge_digest_order.c" \
+	-o "$DIR/test_purge_digest_order"
+"$DIR/test_purge_digest_order"
+bash "$DIR/check_purge_partial_warn_control.sh"
 
 FUZZ_DIR="$DIR/../../fuzz"
 BLOB_CC="${BLOB_CC:-clang}"
@@ -208,6 +277,16 @@ if [ -f "$NGINX_OBJS/ngx_auto_config.h" ]; then
         NGINX_VERSION="$NGINX_VERSION" \
         NGINX_SRC="$NGINX_SRC" \
         NGINX_OBJS="$NGINX_OBJS"
+
+    echo "--- purge-all finite-snapshot mutation control ---"
+    NGINX_VERSION="$NGINX_VERSION" NGINX_SRC="$NGINX_SRC" \
+        NGINX_OBJS="$NGINX_OBJS" \
+        bash "$DIR/check_purge_snapshot_control.sh"
+
+    echo "--- purge-all zero-snapshot skew mutation control ---"
+    NGINX_VERSION="$NGINX_VERSION" NGINX_SRC="$NGINX_SRC" \
+        NGINX_OBJS="$NGINX_OBJS" \
+        bash "$DIR/check_purge_zero_skew_control.sh"
 
     # --- c-1: varidx drop/reissue accounting is production-reachable -------
     # The PURGE reply's "complete":false honesty field depends on

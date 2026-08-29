@@ -75,8 +75,8 @@ ngx_http_cache_turbo_digest_update(ngx_http_cache_turbo_digest_t *d,
     const void *data, size_t len)
 {
 #if (NGX_SSL)
-    if (d->ok) {
-        (void) EVP_DigestUpdate(d->md, data, len);
+    if (d->ok && EVP_DigestUpdate(d->md, data, len) != 1) {
+        d->ok = 0;
     }
 #else
     ngx_md5_update(&d->lo, data, len);

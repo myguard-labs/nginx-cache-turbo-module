@@ -63,6 +63,7 @@ EVP_MD  *ngx_http_cache_turbo_worker_sha256 = NULL;
 #if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
     && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
 ngx_uint_t  ngx_http_cache_turbo_test_digest_fail = 0;
+ngx_uint_t  ngx_http_cache_turbo_test_digest_update_fail = 0;
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L && !defined(LIBRESSL_VERSION_NUMBER)
 ngx_uint_t  ngx_http_cache_turbo_test_fetch_md_fail = 0;
 #endif

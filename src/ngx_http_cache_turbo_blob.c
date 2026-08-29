@@ -159,6 +159,7 @@ EVP_MD  *ngx_http_cache_turbo_worker_sha256;
 #if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
     && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
 static ngx_uint_t  ngx_http_cache_turbo_test_digest_fail = 0;
+static ngx_uint_t  ngx_http_cache_turbo_test_digest_update_fail = 0;
 #if (NGX_SSL) && OPENSSL_VERSION_NUMBER >= 0x30000000L \
     && !defined(LIBRESSL_VERSION_NUMBER)
 /* C0 negative control: make digest_init() behave as though the worker's
@@ -242,7 +243,20 @@ ngx_http_cache_turbo_digest_update(ngx_http_cache_turbo_digest_t *d,
 {
 #if (NGX_SSL)
     if (d->ok) {
-        (void) EVP_DigestUpdate(d->md, data, len);
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+        if (ngx_http_cache_turbo_test_digest_update_fail) {
+            d->ok = 0;
+            return;
+        }
+#endif
+
+        /* EVP failures are sticky. Continuing after one failed update and
+         * accepting a later successful final would authenticate only a
+         * prefix of the framed cache key. */
+        if (EVP_DigestUpdate(d->md, data, len) != 1) {
+            d->ok = 0;
+        }
     }
 #else
     ngx_md5_update(&d->lo, data, len);

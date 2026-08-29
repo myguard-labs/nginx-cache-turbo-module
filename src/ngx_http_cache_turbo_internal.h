@@ -66,7 +66,7 @@ void ngx_http_cache_turbo_digest_init(ngx_http_cache_turbo_digest_t *d);
 void ngx_http_cache_turbo_digest_update(ngx_http_cache_turbo_digest_t *d,
     const void *data, size_t len);
 ngx_int_t ngx_http_cache_turbo_digest_final(ngx_http_cache_turbo_digest_t *d,
-    u_char out[32]);
+    u_char out[32]) NGX_HTTP_CACHE_TURBO_MUST_CHECK;
 
 /* Fixed little-endian wire accessors (STAB-4). module.c's key-fold
  * (put_u32) and body-filter/variant (blob_hdr_write, get_u16/32/64 via
@@ -144,7 +144,7 @@ ngx_http_cache_turbo_node_t *
 
 ngx_int_t ngx_http_cache_turbo_shm_store(ngx_http_cache_turbo_zone_t *z,
     u_char *key_hash, uint32_t hash, u_char *data, size_t len,
-    time_t fresh_ttl, time_t stale_ttl);
+    time_t fresh_ttl, time_t stale_ttl, u_char **stored_data);
 
 /* C3: marker-specific store. Identical wire contract to _shm_store() above,
  * plus (atomically, under the SAME lock hold as the write): tag the resulting
@@ -163,7 +163,8 @@ ngx_int_t ngx_http_cache_turbo_shm_store_marker(ngx_http_cache_turbo_zone_t *z,
  * semantics. */
 ngx_int_t ngx_http_cache_turbo_shm_store_if(ngx_http_cache_turbo_zone_t *z,
     u_char *key_hash, uint32_t hash, u_char *data, size_t len,
-    time_t fresh_ttl, time_t stale_ttl, ngx_uint_t predicate);
+    time_t fresh_ttl, time_t stale_ttl, ngx_uint_t predicate,
+    u_char **stored_data);
 
 /* P5-4: 304 freshening. See the L1 vtable `freshen` comment for the return
  * contract. */
@@ -175,8 +176,17 @@ ngx_int_t ngx_http_cache_turbo_shm_freshen(ngx_http_cache_turbo_zone_t *z,
 ngx_int_t ngx_http_cache_turbo_shm_purge_key(ngx_http_cache_turbo_zone_t *z,
     u_char *key_hash, uint32_t hash);
 
-/* Purge every entry in the zone. Returns the number removed. */
-ngx_uint_t ngx_http_cache_turbo_shm_purge_all(ngx_http_cache_turbo_zone_t *z);
+/* Compare-and-delete counterpart of store()/store_if()'s stored_data token.
+ * See the L1 vtable contract for ownership and return semantics. */
+ngx_int_t ngx_http_cache_turbo_shm_purge_if_blob(
+    ngx_http_cache_turbo_zone_t *z, u_char *key_hash, uint32_t hash,
+    u_char *stored_data);
+
+/* Purge a finite start-of-call entry budget. NGX_OK means the zone was empty
+ * at the final lock-held observation; NGX_AGAIN means refill left entries.
+ * *purged receives the exact number removed in either case. */
+ngx_int_t ngx_http_cache_turbo_shm_purge_all(ngx_http_cache_turbo_zone_t *z,
+    ngx_uint_t *purged);
 
 /* Snapshot the zone's atomic stat counters into out (admin stats endpoint). */
 void ngx_http_cache_turbo_shm_stats(ngx_http_cache_turbo_zone_t *z,
@@ -1092,7 +1102,8 @@ extern ngx_http_cache_turbo_memcached_ka_t ngx_http_cache_turbo_memcached_ka;
  * ngx_http_cache_turbo_vary_prepare loses the `ngx_inline` it had while
  * single-TU -- a cross-TU call cannot stay inline. */
 
-void ngx_http_cache_turbo_vary_prepare(ngx_http_cache_turbo_ctx_t *ctx);
+ngx_int_t ngx_http_cache_turbo_vary_prepare(ngx_http_cache_turbo_ctx_t *ctx)
+    NGX_HTTP_CACHE_TURBO_MUST_CHECK;
 
 
 /* PERF-AUD2-01: deferred form of vary_prepare(). The prologue used to call
@@ -1113,26 +1124,40 @@ void ngx_http_cache_turbo_vary_prepare(ngx_http_cache_turbo_ctx_t *ctx);
  * ctx->vary_marker_key_ready is cleared at the top of every access_prologue()
  * pass, right after build_key() may have rewritten cache_key, so a
  * park/resume re-entry recomputes exactly as the old code did. */
-static ngx_inline void
+static ngx_inline ngx_int_t NGX_HTTP_CACHE_TURBO_MUST_CHECK
 ngx_http_cache_turbo_vary_prepare_lazy(ngx_http_cache_turbo_ctx_t *ctx)
 {
     if (!ctx->vary_marker_key_ready) {
-        ngx_http_cache_turbo_vary_prepare(ctx);
+        if (ngx_http_cache_turbo_vary_prepare(ctx) != NGX_OK) {
+            return NGX_ERROR;
+        }
         ctx->vary_marker_key_ready = 1;
     }
+
+    return NGX_OK;
 }
 
-void ngx_http_cache_turbo_vary_apply(ngx_http_request_t *r,
+ngx_int_t ngx_http_cache_turbo_vary_apply(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_zone_t *z,
-    ngx_http_cache_turbo_ctx_t *ctx, uint32_t *hash);
-void ngx_http_cache_turbo_variant_hash(ngx_http_request_t *r,
-    ngx_str_t *base, ngx_int_t bits, ngx_uint_t gen, u_char out[32]);
-void ngx_http_cache_turbo_marker_hash(ngx_str_t *base, u_char out[32]);
-void ngx_http_cache_turbo_marker_store(ngx_http_request_t *r,
+    ngx_http_cache_turbo_ctx_t *ctx, uint32_t *hash)
+    NGX_HTTP_CACHE_TURBO_MUST_CHECK;
+ngx_int_t ngx_http_cache_turbo_variant_hash(ngx_http_request_t *r,
+    ngx_str_t *base, ngx_int_t bits, ngx_uint_t gen, u_char out[32])
+    NGX_HTTP_CACHE_TURBO_MUST_CHECK;
+ngx_int_t ngx_http_cache_turbo_marker_hash(ngx_str_t *base, u_char out[32])
+    NGX_HTTP_CACHE_TURBO_MUST_CHECK;
+ngx_int_t ngx_http_cache_turbo_marker_store_key(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf,
+    ngx_http_cache_turbo_zone_t *z, u_char marker_key[32], ngx_int_t bits,
+    ngx_uint_t gen, time_t ttl, time_t retain_ttl)
+    NGX_HTTP_CACHE_TURBO_MUST_CHECK;
+ngx_int_t ngx_http_cache_turbo_marker_store(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf,
     ngx_http_cache_turbo_zone_t *z, ngx_str_t *base, ngx_int_t bits,
-    ngx_uint_t gen, time_t ttl, time_t retain_ttl);
-size_t ngx_http_cache_turbo_variant_index_name(ngx_str_t *base, u_char *buf);
+    ngx_uint_t gen, time_t ttl, time_t retain_ttl)
+    NGX_HTTP_CACHE_TURBO_MUST_CHECK;
+ngx_int_t ngx_http_cache_turbo_variant_index_name(ngx_str_t *base, u_char *buf,
+    size_t *len) NGX_HTTP_CACHE_TURBO_MUST_CHECK;
 void ngx_http_cache_turbo_classify_vary(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, ngx_int_t *bits_out,
     ngx_uint_t *nocache_out, ngx_uint_t *unsafe_axis_out);

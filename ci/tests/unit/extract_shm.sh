@@ -22,10 +22,10 @@
 # changes upstream is picked up on the next build, and a body that can no
 # longer be found fails the build loudly rather than silently testing nothing.
 #
-# Functions deliberately NOT sliced (they pull in the blob refcount layer,
-# response serialisation and the config surface, none of which this harness is
-# about): _init_zone, _store, _stats, _purge_key, _purge_all, _drop_locked.
-# The two that the sliced set calls into are stubbed in test_shm_state.c.
+# Functions deliberately NOT sliced (they pull in response serialisation and
+# the config surface, none of which this harness is about): _init_zone, _store,
+# _stats and _purge_key.  The blob-ref helpers, _drop_locked and _purge_all are
+# sliced because their ownership and bounded-concurrency contracts are tested.
 
 set -euo pipefail
 
@@ -105,6 +105,11 @@ check_define NGX_HTTP_CACHE_TURBO_BRK_ACT_FAIL  2
 # the test copy were changed to match, passing while measuring nothing.
 # Lives in the .c, not the header, hence the third argument.
 check_define NGX_HTTP_CACHE_TURBO_LRU_CAP_MAX_EVICT 8 "$SRC"
+# PURGE-ALL-STARVATION: purge_all() consumes at most this many entries per
+# mutex hold, and test_shm_state.c mirrors it when choosing a fixture that
+# crosses a batch boundary.  Pin the mirror so the barrier test cannot silently
+# become a one-batch test if production changes the cap.
+check_define NGX_HTTP_CACHE_TURBO_PURGE_BATCH 512 "$SRC"
 
 # P4-1a: the W-TinyLFU sketch constants. Also in the .c rather than a header,
 # and also hand-mirrored into test_shm_state.c, so they get the same treatment.
@@ -341,7 +346,7 @@ awk '
     /^static ngx_inline (uint32_t|uint64_t|ngx_uint_t|void)$/ {
         pending = 1; buf = $0 ORS; next
     }
-    pending && /^ngx_http_cache_turbo_(shm_(key64|sketch_bump|sketch_estimate|admit|lookup|evict_one|alloc_evict|free_locked|claim_locked|claim|resolve_miss|unstub|owns|count_miss_locked|count_miss|l2_neg_check|l2_neg_set|touch_lru|brk_probe_age|breaker_state|breaker_record|breaker_state_str|get_u32|get_u64|node_sie_live)|lru_(link_head|unlink|insert_new|enforce_cap)|sketch_(row_hash|rows|get|inc|halve)|blob_(alloc|node_release|acquire|release))\(/ {
+    pending && /^ngx_http_cache_turbo_(shm_(key64|sketch_bump|sketch_estimate|admit|lookup|evict_one|alloc_evict|free_locked|drop_locked|purge_all|claim_locked|claim|resolve_miss|unstub|owns|count_miss_locked|count_miss|l2_neg_check|l2_neg_set|touch_lru|brk_probe_age|breaker_state|breaker_record|breaker_state_str|get_u32|get_u64|node_sie_live)|lru_(link_head|unlink|insert_new|enforce_cap)|sketch_(row_hash|rows|get|inc|halve)|blob_(alloc|node_release|acquire|release))\(/ {
         capture = 1; pending = 0; printf "%s", buf; print; next
     }
     pending { pending = 0; buf = "" }
@@ -350,6 +355,34 @@ awk '
         if ($0 == "}") { capture = 0 }
     }
 ' "$SRC" > "$OUT"
+
+# Falsifiable PURGE-ALL-STARVATION control.  A practically unbounded work
+# budget reproduces the old "drain until empty" behavior for this finite
+# concurrent-refill fixture: it consumes the refill and reports success.  The
+# control runner requires the exact snapshot assertions to fail without a
+# watchdog/hang, then immediately regenerates the unmodified slice.
+if [ "${CTRL_PURGE_NO_SNAPSHOT:-0}" = 1 ]; then
+    snapshot_line='    remaining = ngx_http_cache_turbo_zone_sh(z)->n_entries;'
+    if [ "$(grep -cF "$snapshot_line" "$OUT")" -ne 1 ]; then
+        echo "✗ purge snapshot mutation could not find its production line" >&2
+        rm -f "$OUT"
+        exit 1
+    fi
+    sed -i 's/    remaining = ngx_http_cache_turbo_zone_sh(z)->n_entries;/    remaining = (ngx_uint_t) -1; \/\* CTRL: no finite snapshot \*\//' "$OUT"
+fi
+
+# Falsifiable zero-budget control.  Removing the lock-held queue observation
+# must make the counter/queue-skew fixture falsely report completion while
+# leaving its resident node untouched.
+if [ "${CTRL_PURGE_SKIP_ZERO_CHECK:-0}" = 1 ]; then
+    zero_line='    if (remaining == 0'
+    if [ "$(grep -cxF "$zero_line" "$OUT")" -ne 1 ]; then
+        echo "✗ zero-budget mutation could not find its production check" >&2
+        rm -f "$OUT"
+        exit 1
+    fi
+    sed -i 's/^    if (remaining == 0$/    if (0 \&\& remaining == 0/' "$OUT"
+fi
 
 # --- P6/O4.2: the breaker's origin-failure predicate lives in module.c, not
 # shm.c, because it is about the RESPONSE (a status code) rather than about the
@@ -542,6 +575,8 @@ for fn in \
     'ngx_http_cache_turbo_shm_evict_one(' \
     'ngx_http_cache_turbo_shm_alloc_evict(' \
     'ngx_http_cache_turbo_shm_free_locked(' \
+    'ngx_http_cache_turbo_shm_drop_locked(' \
+    'ngx_http_cache_turbo_shm_purge_all(' \
     'ngx_http_cache_turbo_shm_claim_locked(' \
     'ngx_http_cache_turbo_shm_claim(' \
     'ngx_http_cache_turbo_shm_resolve_miss(' \

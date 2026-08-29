@@ -1,5 +1,34 @@
 Changes with the nginx-cache-turbo-module (unreleased)
 
+    *) Compatibility note (since v1.1.0): the shipped circuit-breaker defaults
+       are on, 5 failures in 10s, and a 30s open window; the shipped
+       keep-stale default is 24h. A dead or flapping origin can therefore
+       produce local 503 responses once the shared zone trips. Use
+       `cache_turbo_breaker off;` and/or `cache_turbo_keep_stale off;` to opt
+       out of those two defaults.
+
+    *) Bugfix: an auto-Vary marker-store failure could unconditionally purge
+       the variant key after publishing its L1 body. If another request
+       replaced that variant during the marker write, the first request's
+       rollback deleted the replacement. Rollback now pins and conditionally
+       deletes only the exact blob written by the failing request; isolated
+       failures still remove their unindexed variant.
+
+    *) Bugfix: OpenSSL digest update failures are now sticky, and digest
+       failures from auto-Vary key derivation and the admin single-key purge
+       are propagated instead of letting callers hash or act on invalid output.
+       Successful SHA-256 bytes, cache keys, marker keys, and variant-index
+       names are unchanged.
+
+    *) Bugfix: an L1 all-purge could run forever while other workers refilled
+       the zone between its 512-entry mutex batches. The walk now consumes a
+       finite start-of-call entry budget. If concurrent refill still leaves
+       entries at the final lock-held observation, the admin endpoint returns
+       500 with {"purged":N,"l1":"incomplete"}, while still completing a
+       configured Redis L2 purge; if both tiers are incomplete their fields are
+       combined in the response. An idle purge still drains both LRU queues
+       completely and returns 200.
+
     *) Security: admin-triggered warm subrequests now rebuild their request
        headers from a Host/User-Agent allowlist before contacting the origin.
        Previously they inherited every header from the admin POST, so

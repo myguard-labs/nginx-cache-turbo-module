@@ -4,7 +4,7 @@
  *
  * AUD-GEN1, asserted against the REAL ngx_http_cache_turbo_variant_hash()
  * rather than a mirror of it. The function body is sliced verbatim from
- * src/ngx_http_cache_turbo_module.c by extract_variant_hash.sh into
+ * src/ngx_http_cache_turbo_vary.c by extract_variant_hash.sh into
  * generated_variant.inc; the digest is the real EVP/SHA-256. Only nginx's
  * scalar surface is shimmed (ngx_shim_variant.h).
  *
@@ -32,11 +32,10 @@
  *               untagged key. gen 0 now folds "gen=0" instead of nothing, so
  *               the legacy un-generationed keyspace is vacated and a stale
  *               sibling sitting in it can no longer be hit.
- *   - NOT closed: gen N vs gen N+256 on the same base. The read path loads gen
- *               as ONE byte (module.c ~11816), so variant_hash only ever sees
- *               0..255 and the two are literally the same input. AUD-GEN1
- *               records this as an accepted limit with a byte-widening
- *               follow-up left open.
+ *   - NOT closed: gen N vs gen N+256 on the same base. The marker stores one
+ *               byte, and variant_hash now normalizes direct wider inputs to
+ *               that same representation. AUD-GEN1 records this as an
+ *               accepted limit with a byte-widening follow-up left open.
  *
  * Both are asserted. The second is asserted as a COLLISION on purpose: it pins
  * the accepted trade-off, so if the counter is ever widened this test flips to
@@ -45,7 +44,7 @@
  * Mutation (step 24 negative control), verified 2026-08-10
  * -------------------------------------------------------
  * Reintroducing the old sentinel guard around the fold in
- * src/ngx_http_cache_turbo_module.c:
+ * src/ngx_http_cache_turbo_vary.c:
  *
  *     if (gen > 0) {                      <-- the pre-COR-5 behaviour
  *         u_char gbuf[NGX_INT_T_LEN];
@@ -88,6 +87,14 @@ static int  failures;
         }                                                                     \
     } while (0)
 
+#define REQUIRE_OK(call, msg)                                                 \
+    do {                                                                      \
+        if ((call) != NGX_OK) {                                               \
+            CHECK(0, (msg));                                                  \
+            return;                                                           \
+        }                                                                     \
+    } while (0)
+
 /* The one-byte store marker_store performs, as an explicit step: the tests
  * feed variant_hash what the WIRE would carry, not what the caller intended. */
 static ngx_uint_t
@@ -103,7 +110,7 @@ stored_gen(ngx_uint_t gen)
  *
  * This models the keyspace the old sentinel produced for gen == 0. It is the
  * thing gen 0 must no longer collide with. */
-static void
+static ngx_int_t
 digest_of_untagged(u_char out[32])
 {
     ngx_http_cache_turbo_digest_t  d;
@@ -114,10 +121,10 @@ digest_of_untagged(u_char out[32])
 
     ngx_http_cache_turbo_digest_init(&d);
     ngx_http_cache_turbo_digest_update(&d, base.data, base.len);
-    ngx_http_cache_turbo_digest_final(&d, out);
+    return ngx_http_cache_turbo_digest_final(&d, out);
 }
 
-static void
+static ngx_int_t
 digest_of(ngx_uint_t gen, u_char out[32])
 {
     ngx_str_t  base;
@@ -128,25 +135,241 @@ digest_of(ngx_uint_t gen, u_char out[32])
     /* bits == 0: no vary axis, so `r` is never dereferenced. r == NULL is
      * deliberate -- if a future edit reaches a classifier on this path the
      * shim aborts instead of returning a shimmed value. */
-    ngx_http_cache_turbo_variant_hash(NULL, &base, 0, gen, out);
+    return ngx_http_cache_turbo_variant_hash(NULL, &base, 0, gen, out);
+}
+
+/* Independent pre-normalization framing oracle. For an already persisted
+ * generation byte this is the exact historical input contract: base + US +
+ * "gen=" + decimal byte. Fixed vectors below anchor the oracle itself. */
+static ngx_int_t
+digest_of_persisted_framing(ngx_uint_t gen, u_char out[32])
+{
+    ngx_http_cache_turbo_digest_t  d;
+    ngx_str_t                      base;
+    static const u_char            us = 0x1F;
+    u_char                         gbuf[NGX_INT_T_LEN];
+    size_t                         glen;
+
+    base.data = (u_char *) VARIANT_TEST_BASE;
+    base.len = strlen(VARIANT_TEST_BASE);
+    glen = (size_t) (ngx_sprintf(gbuf, "%ui", gen) - gbuf);
+
+    ngx_http_cache_turbo_digest_init(&d);
+    ngx_http_cache_turbo_digest_update(&d, base.data, base.len);
+    ngx_http_cache_turbo_digest_update(&d, &us, 1);
+    ngx_http_cache_turbo_digest_update(&d, "gen=", 4);
+    ngx_http_cache_turbo_digest_update(&d, gbuf, glen);
+    return ngx_http_cache_turbo_digest_final(&d, out);
+}
+
+static u_char
+hex_nibble(char c)
+{
+    return (u_char) (c <= '9' ? c - '0' : c - 'a' + 10);
+}
+
+static void
+hex_to_bytes(const char hex[64], u_char out[32])
+{
+    ngx_uint_t  i;
+
+    for (i = 0; i < 32; i++) {
+        out[i] = (u_char) ((hex_nibble(hex[i * 2]) << 4)
+                           | hex_nibble(hex[i * 2 + 1]));
+    }
+}
+
+static void
+successful_vary_keys_match_fixed_vectors(void)
+{
+    /* Independently generated with sha256sum over the exact framed inputs:
+     * base + 0x1f + {"gen=0", "gen=7", "gen=255", "varymark", "varidx"}. */
+    static const char variant_hex[] =
+        "733ea66ffd5dd65d22905577f4a3f76a9a140a3cda411c16c3d450ced5af1835";
+    static const char variant_zero_hex[] =
+        "6a539acc6fc284068486fc05863ce97a40633119cf47a18f30904c20615c3f3e";
+    static const char variant_255_hex[] =
+        "06dbd91f339296e02ad8aed43fe222bef64ea42d16c4023747aa34bd4544386c";
+    static const char marker_hex[] =
+        "1fd56d57a06c9b9633b7b04a49bf673833b803df27ca970ba43fb918b49c8766";
+    static const char index_hex[] =
+        "3d2f6ad5088373d20035cd2cf6febc1e35800f5b41a8f4737a4c0611d5990b13";
+    ngx_str_t  base;
+    u_char     out[1 + 64];
+    u_char     expected[32];
+    size_t     len = 0;
+
+    base.data = (u_char *) VARIANT_TEST_BASE;
+    base.len = strlen(VARIANT_TEST_BASE);
+
+    hex_to_bytes(variant_hex, expected);
+    REQUIRE_OK(ngx_http_cache_turbo_variant_hash(NULL, &base, 0, 7, out),
+               "fixed-vector variant hash must succeed");
+    CHECK(memcmp(out, expected, 32) == 0,
+          "successful variant-key bytes must stay compatible");
+
+    hex_to_bytes(variant_zero_hex, expected);
+    REQUIRE_OK(ngx_http_cache_turbo_variant_hash(NULL, &base, 0, 0, out),
+               "fixed-vector gen-0 variant hash must succeed");
+    CHECK(memcmp(out, expected, 32) == 0,
+          "generation normalization must preserve existing gen-0 bytes");
+
+    hex_to_bytes(variant_255_hex, expected);
+    REQUIRE_OK(ngx_http_cache_turbo_variant_hash(NULL, &base, 0, 255, out),
+               "fixed-vector gen-255 variant hash must succeed");
+    CHECK(memcmp(out, expected, 32) == 0,
+          "generation normalization must preserve existing gen-255 bytes");
+
+    hex_to_bytes(marker_hex, expected);
+    REQUIRE_OK(ngx_http_cache_turbo_marker_hash(&base, out),
+               "fixed-vector marker hash must succeed");
+    CHECK(memcmp(out, expected, 32) == 0,
+          "successful marker-key bytes must stay compatible");
+
+    REQUIRE_OK(ngx_http_cache_turbo_variant_index_name(&base, out, &len),
+               "fixed-vector variant-index name must succeed");
+    CHECK(len == 65 && out[0] == ' ',
+          "variant-index name framing must stay one space plus 64 hex bytes");
+    CHECK(memcmp(out + 1, index_hex, 64) == 0,
+          "successful variant-index name bytes must stay compatible");
+}
+
+static void
+digest_failures_propagate_across_vary_helpers(void)
+{
+    ngx_str_t  base;
+    u_char     out[1 + 64], unpublished[1 + 64];
+    size_t     len = 123;
+
+    base.data = (u_char *) VARIANT_TEST_BASE;
+    base.len = strlen(VARIANT_TEST_BASE);
+    memset(out, 0xA5, sizeof(out));
+    memset(unpublished, 0xA5, sizeof(unpublished));
+
+    ngx_test_digest_update_fail = 1;
+    CHECK(ngx_http_cache_turbo_variant_hash(NULL, &base, 0, 7, out)
+              == NGX_ERROR,
+          "variant_hash must reject a sticky digest-update failure");
+    CHECK(ngx_http_cache_turbo_marker_hash(&base, out) == NGX_ERROR,
+          "marker_hash must reject a sticky digest-update failure");
+    CHECK(ngx_http_cache_turbo_variant_index_name(&base, out, &len)
+              == NGX_ERROR,
+          "variant_index_name must reject a sticky digest-update failure");
+    ngx_test_digest_update_fail = 0;
+
+    CHECK(memcmp(out, unpublished, sizeof(out)) == 0,
+          "failed Vary updates must not publish any key or index byte");
+    CHECK(len == 123,
+          "failed variant-index digest must not publish a name length");
+
+    memset(out, 0x5A, sizeof(out));
+    memset(unpublished, 0x5A, sizeof(unpublished));
+    len = 321;
+    ngx_test_digest_final_fail = 1;
+    CHECK(ngx_http_cache_turbo_variant_hash(NULL, &base, 0, 7, out)
+              == NGX_ERROR,
+          "variant_hash must reject a digest-final failure");
+    CHECK(ngx_http_cache_turbo_marker_hash(&base, out) == NGX_ERROR,
+          "marker_hash must reject a digest-final failure");
+    CHECK(ngx_http_cache_turbo_variant_index_name(&base, out, &len)
+              == NGX_ERROR,
+          "variant_index_name must reject a digest-final failure");
+    ngx_test_digest_final_fail = 0;
+    CHECK(memcmp(out, unpublished, sizeof(out)) == 0,
+          "failed Vary finals must not publish any key or index byte");
+    CHECK(len == 321,
+          "failed variant-index final must not publish a name length");
 }
 
 
-/* The collision AUD-GEN1 closed: a base that was never purged must not compute
- * the same variant key as one purged 256 times, even though both store the
- * byte 0.
- *
- * This is the assertion the old `if (gen > 0)` sentinel breaks. */
+static void
+digest_test_helpers_propagate_failures(void)
+{
+    u_char  tagged[32], variant[32], unpublished[32];
+
+    memset(tagged, 0xA5, sizeof(tagged));
+    memset(variant, 0xA5, sizeof(variant));
+    memset(unpublished, 0xA5, sizeof(unpublished));
+
+    ngx_test_digest_update_fail = 1;
+    CHECK(digest_of(7, variant) == NGX_ERROR,
+          "digest_of must report an update failure");
+    CHECK(digest_of_untagged(tagged) == NGX_ERROR,
+          "digest_of_untagged must report an update failure");
+    ngx_test_digest_update_fail = 0;
+    CHECK(memcmp(tagged, unpublished, sizeof(tagged)) == 0
+              && memcmp(variant, unpublished, sizeof(variant)) == 0,
+          "failed helper updates must not publish any output byte");
+
+    memset(tagged, 0x5A, sizeof(tagged));
+    memset(variant, 0x5A, sizeof(variant));
+    memset(unpublished, 0x5A, sizeof(unpublished));
+    ngx_test_digest_final_fail = 1;
+    CHECK(digest_of(7, variant) == NGX_ERROR,
+          "digest_of must report a final failure");
+    CHECK(digest_of_untagged(tagged) == NGX_ERROR,
+          "digest_of_untagged must report a final failure");
+    ngx_test_digest_final_fail = 0;
+
+    CHECK(memcmp(tagged, unpublished, sizeof(tagged)) == 0
+              && memcmp(variant, unpublished, sizeof(variant)) == 0,
+          "failed helper finals must not publish any output byte");
+}
+
+
+/* The mask is a no-op for the full persisted-byte domain. Compare all 256
+ * values against the independently framed historical contract. */
+static void
+all_persisted_generation_bytes_stay_compatible(void)
+{
+    u_char      got[32], expected[32];
+    ngx_uint_t  gen;
+
+    for (gen = 0; gen <= 255; gen++) {
+        REQUIRE_OK(digest_of(gen, got),
+                   "persisted-generation production digest must succeed");
+        REQUIRE_OK(digest_of_persisted_framing(gen, expected),
+                   "persisted-generation compatibility oracle must succeed");
+        CHECK(memcmp(got, expected, 32) == 0,
+              "normalization must preserve every existing generation byte");
+    }
+}
+
+
+/* The public/internal helper accepts ngx_uint_t, but the marker stores one
+ * byte. Direct wide inputs must therefore hash exactly like their persisted
+ * form; removing the production mask breaks these boundary assertions. */
+static void
+direct_generation_matches_persisted_byte(void)
+{
+    u_char  zero[32], wrapped_zero[32], max[32], wrapped_max[32];
+
+    REQUIRE_OK(digest_of(0, zero), "direct gen-0 digest must succeed");
+    REQUIRE_OK(digest_of(256, wrapped_zero),
+               "direct gen-256 digest must succeed");
+    CHECK(memcmp(zero, wrapped_zero, 32) == 0,
+          "direct generation 256 must normalize to persisted generation 0");
+
+    REQUIRE_OK(digest_of(255, max), "direct gen-255 digest must succeed");
+    REQUIRE_OK(digest_of(511, wrapped_max),
+               "direct gen-511 digest must succeed");
+    CHECK(memcmp(max, wrapped_max, 32) == 0,
+          "direct generation 511 must normalize to persisted generation 255");
+}
+
+
+/* The collision AUD-GEN1 closed: gen 0 must no longer compute the legacy
+ * untagged key. This is the assertion the old `if (gen > 0)` sentinel breaks. */
 static void
 never_purged_folds_its_generation(void)
 {
     u_char  never[32], tagged[32];
 
-    /* The read path (module.c ~11816) loads `gen` as ONE byte out of the
-     * marker, so variant_hash only ever sees 0..255: the 256th purge arrives
-     * as gen == 0, byte-identical to never-purged. The two states are
-     * therefore NOT separable by the digest, and asserting that they differ
-     * would be asserting something production cannot do.
+    /* The marker persists `gen` as ONE byte, and variant_hash normalizes its
+     * wider API input to the same byte: the 256th purge arrives as gen == 0,
+     * byte-identical to never-purged. The two states are therefore NOT
+     * separable by the digest, and asserting that they differ would be
+     * asserting something the wire format cannot represent.
      *
      * What the fix actually changed is that gen == 0 is folded at all. Before
      * it, gen 0 fed NOTHING to the digest, so the wrapped 256th purge computed
@@ -160,8 +383,9 @@ never_purged_folds_its_generation(void)
     CHECK(stored_gen(256) == 0,
           "precondition: the 256th generation must truncate to byte 0");
 
-    digest_of(0, never);
-    digest_of_untagged(tagged);
+    REQUIRE_OK(digest_of(0, never), "gen-0 digest must succeed");
+    REQUIRE_OK(digest_of_untagged(tagged),
+               "untagged comparison digest must succeed");
 
     CHECK(memcmp(never, tagged, 32) != 0,
           "gen 0 must fold \"gen=0\" rather than nothing (AUD-GEN1); equal to "
@@ -181,8 +405,10 @@ same_stored_byte_collides_by_design(void)
     CHECK(stored_gen(3) == stored_gen(259),
           "precondition: gen 3 and gen 259 must store the same byte");
 
-    digest_of(stored_gen(3), a);
-    digest_of(stored_gen(259), b);
+    REQUIRE_OK(digest_of(stored_gen(3), a),
+               "first stored-generation digest must succeed");
+    REQUIRE_OK(digest_of(stored_gen(259), b),
+               "second stored-generation digest must succeed");
 
     CHECK(memcmp(a, b, 32) == 0,
           "generations sharing a stored byte collide by design; a DIFFERENCE "
@@ -199,9 +425,9 @@ distinct_generations_differ(void)
 {
     u_char  g1[32], g2[32], g255[32];
 
-    digest_of(1, g1);
-    digest_of(2, g2);
-    digest_of(255, g255);
+    REQUIRE_OK(digest_of(1, g1), "gen-1 digest must succeed");
+    REQUIRE_OK(digest_of(2, g2), "gen-2 digest must succeed");
+    REQUIRE_OK(digest_of(255, g255), "gen-255 digest must succeed");
 
     CHECK(memcmp(g1, g2, 32) != 0, "gen 1 and gen 2 must differ");
     CHECK(memcmp(g2, g255, 32) != 0, "gen 2 and gen 255 must differ");
@@ -219,11 +445,13 @@ base_key_still_folded(void)
 
     base.data = (u_char *) "https://example.test/a";
     base.len  = strlen("https://example.test/a");
-    ngx_http_cache_turbo_variant_hash(NULL, &base, 0, 7, one);
+    REQUIRE_OK(ngx_http_cache_turbo_variant_hash(NULL, &base, 0, 7, one),
+               "first base-key digest must succeed");
 
     base.data = (u_char *) "https://example.test/b";
     base.len  = strlen("https://example.test/b");
-    ngx_http_cache_turbo_variant_hash(NULL, &base, 0, 7, two);
+    REQUIRE_OK(ngx_http_cache_turbo_variant_hash(NULL, &base, 0, 7, two),
+               "second base-key digest must succeed");
 
     CHECK(memcmp(one, two, 32) != 0,
           "different base keys must produce different variant keys");
@@ -233,6 +461,11 @@ base_key_still_folded(void)
 int
 main(void)
 {
+    successful_vary_keys_match_fixed_vectors();
+    digest_failures_propagate_across_vary_helpers();
+    digest_test_helpers_propagate_failures();
+    all_persisted_generation_bytes_stay_compatible();
+    direct_generation_matches_persisted_byte();
     never_purged_folds_its_generation();
     same_stored_byte_collides_by_design();
     distinct_generations_differ();

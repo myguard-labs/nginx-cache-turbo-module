@@ -859,7 +859,12 @@ ngx_http_cache_turbo_varidx_reissue(ngx_http_request_t *r,
         ttl = 1;
     }
 
-    vlen = ngx_http_cache_turbo_variant_index_name(&ctx->cache_key, vname);
+    if (ngx_http_cache_turbo_variant_index_name(&ctx->cache_key, vname,
+                                                 &vlen) != NGX_OK)
+    {
+        ngx_http_cache_turbo_shm_varidx_pending_set(z, ctx->key_hash, hash, 1);
+        return;
+    }
 
     if (clcf->backend->tag_add(clcf, ctx->key_hash, vname, vlen, ttl)
         != NGX_OK)
@@ -1408,7 +1413,10 @@ ngx_http_cache_turbo_access_l1(ngx_http_request_t *r,
      * (the lazy call inside the arm computes it) and a marker vanishing just
      * costs one unused digest. No reader can observe a zeroed key. */
     if (clcf->auto_vary && ngx_http_cache_turbo_zone_sh(z)->markers != 0) {
-        ngx_http_cache_turbo_vary_prepare_lazy(ctx);
+        if (ngx_http_cache_turbo_vary_prepare_lazy(ctx) != NGX_OK) {
+            *out_rc = NGX_ERROR;
+            return NGX_DONE;
+        }
     }
 
     ngx_shmtx_lock(ngx_http_cache_turbo_zone_mutex(z));
@@ -1450,8 +1458,14 @@ ngx_http_cache_turbo_access_l1(ngx_http_request_t *r,
              * predictable bit test; only the narrow race pays the digest
              * inside the critical section, which is strictly better than the
              * old code's unconditional digest on every request. */
-            ngx_http_cache_turbo_vary_prepare_lazy(ctx);
-            ngx_http_cache_turbo_vary_apply(r, clcf, z, ctx, &hash);
+            if (ngx_http_cache_turbo_vary_prepare_lazy(ctx) != NGX_OK
+                || ngx_http_cache_turbo_vary_apply(r, clcf, z, ctx, &hash)
+                       != NGX_OK)
+            {
+                ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
+                *out_rc = NGX_ERROR;
+                return NGX_DONE;
+            }
         }
     }
 
@@ -1467,9 +1481,14 @@ ngx_http_cache_turbo_access_l1(ngx_http_request_t *r,
      * never override a marker that has since appeared in L1, e.g. via this
      * very self-heal). */
     if (clcf->auto_vary && ctx->vary_marker_l2_bits > 0 && hash == *hashp) {
-        ngx_http_cache_turbo_variant_hash(r, &ctx->cache_key,
-            ctx->vary_marker_l2_bits, ctx->vary_marker_l2_gen,
-            ctx->key_hash);
+        if (ngx_http_cache_turbo_variant_hash(r, &ctx->cache_key,
+                ctx->vary_marker_l2_bits, ctx->vary_marker_l2_gen,
+                ctx->key_hash) != NGX_OK)
+        {
+            ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
+            *out_rc = NGX_ERROR;
+            return NGX_DONE;
+        }
         hash = ngx_crc32_short(ctx->key_hash, 32);
         ctx->vary_gen = ctx->vary_marker_l2_gen;
     }
@@ -1737,7 +1756,10 @@ ngx_http_cache_turbo_access_l2_marker_get(ngx_http_request_t *r,
      * here is what preserves that fallback under the deferral. Runs outside
      * any zone lock (access_l2()'s contract), same as the prologue call it
      * replaces. */
-    ngx_http_cache_turbo_vary_prepare_lazy(ctx);
+    if (ngx_http_cache_turbo_vary_prepare_lazy(ctx) != NGX_OK) {
+        *out_rc = NGX_ERROR;
+        return NGX_DONE;
+    }
 
     marker_hash = ngx_crc32_short(ctx->vary_marker_key, 32);
 
@@ -1829,12 +1851,58 @@ ngx_http_cache_turbo_access_l2_marker_get(ngx_http_request_t *r,
 }
 
 
+/* Commit a marker resolution obtained from L2.  Deriving the variant key is
+ * request correctness and remains fail-closed.  Replicating the marker back
+ * into L1/L2 is only a best-effort self-heal after that key is resolved: a
+ * digest failure there must not discard an otherwise serveable L2 hit. */
+static ngx_int_t
+ngx_http_cache_turbo_access_l2_marker_resolve(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx,
+    ngx_http_cache_turbo_zone_t *z, uint32_t *hashp, ngx_int_t bits,
+    ngx_uint_t gen, time_t rem_fresh, time_t rem_stale)
+{
+    if (ngx_http_cache_turbo_variant_hash(r, &ctx->cache_key, bits, gen,
+            ctx->key_hash) != NGX_OK)
+    {
+        return NGX_ERROR;
+    }
+
+    *hashp = ngx_crc32_short(ctx->key_hash, 32);
+    ctx->vary_gen = gen;
+
+    /* Persist the resolution -- see the field comment on
+     * vary_marker_l2_bits: a raw ctx->key_hash rewrite does NOT survive the
+     * next access_prologue()'s build_key() call, so
+     * access_l2_marker_apply() re-derives key_hash from these on every
+     * access_l1() entry instead. */
+    ctx->vary_marker_l2_bits = bits;
+    ctx->vary_marker_l2_gen = gen;
+
+    if (ngx_http_cache_turbo_marker_store(r, clcf, z, &ctx->cache_key, bits,
+            gen, rem_fresh > 0 ? rem_fresh : 1, rem_stale) != NGX_OK)
+    {
+        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                      "cache_turbo: L2 vary-marker hit \"%V\" resolved "
+                      "variant key but marker self-heal failed",
+                      &r->uri);
+        return NGX_OK;
+    }
+
+    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "cache_turbo: L2 vary-marker hit \"%V\" "
+                   "bits=0x%xi -> variant key, L1 self-healed",
+                   &r->uri, bits);
+
+    return NGX_OK;
+}
+
+
 /* P3-5 phase helper for ngx_http_cache_turbo_access_l2().
  * PHASE 0b -- consume the result of a completed marker GET (the park/resume half
  * of the phase above). Called at the top of access_l2() on every entry;
  * a no-op unless a marker GET is actually in flight/landed
  * (vary_marker_l2_tried && l2_done). */
-static void
+static ngx_int_t
 ngx_http_cache_turbo_access_l2_marker_consume(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx,
     ngx_http_cache_turbo_zone_t *z, uint32_t *hashp)
@@ -1845,7 +1913,7 @@ ngx_http_cache_turbo_access_l2_marker_consume(ngx_http_request_t *r,
     ngx_http_cache_turbo_blob_hdr_t  bh;
 
     if (!ctx->vary_marker_l2_tried || !ctx->l2_done) {
-        return;
+        return NGX_OK;
     }
 
     /* PERF-AUD2-01: MANDATORY, not an optimisation. This function reads
@@ -1859,7 +1927,9 @@ ngx_http_cache_turbo_access_l2_marker_consume(ngx_http_request_t *r,
      * what makes that explicit rather than incidental. Past the early return
      * above, so the warm path (l2_tried == 0 on every request that never
      * launched a marker GET) still pays nothing. */
-    ngx_http_cache_turbo_vary_prepare_lazy(ctx);
+    if (ngx_http_cache_turbo_vary_prepare_lazy(ctx) != NGX_OK) {
+        return NGX_ERROR;
+    }
 
     ctx->vary_marker_l2_tried = 0;
 
@@ -1936,7 +2006,7 @@ ngx_http_cache_turbo_access_l2_marker_consume(ngx_http_request_t *r,
      * after it: it is simply a no-op tie or the L2 answer confirms what L1
      * already had. */
     if (!ctx->vary_marker_l1_miss && !revalidate) {
-        return;
+        return NGX_OK;
     }
 
     if (ctx->l2_result == NGX_OK && ctx->l2_blob != NULL
@@ -1991,19 +2061,6 @@ ngx_http_cache_turbo_access_l2_marker_consume(ngx_http_request_t *r,
             rem_stale = (time_t) bh.stale_ttl - age;
 
             if (rem_stale > 0) {
-                ngx_http_cache_turbo_variant_hash(r, &ctx->cache_key, bits,
-                                                  gen, ctx->key_hash);
-                *hashp = ngx_crc32_short(ctx->key_hash, 32);
-                ctx->vary_gen = gen;
-
-                /* Persist the resolution -- see the field comment on
-                 * vary_marker_l2_bits: a raw ctx->key_hash rewrite does NOT
-                 * survive the next access_prologue()'s build_key() call, so
-                 * access_l2_marker_apply() re-derives key_hash from these on
-                 * every access_l1() entry instead. */
-                ctx->vary_marker_l2_bits = bits;
-                ctx->vary_marker_l2_gen = gen;
-
                 /* Self-heal L1 (+ refresh L2): the next request on THIS node
                  * resolves from the (node-local, by-design) L1 marker without
                  * paying this L2 GET again. rem_fresh may be <=0 (the marker
@@ -2022,13 +2079,12 @@ ngx_http_cache_turbo_access_l2_marker_consume(ngx_http_request_t *r,
                  * to a handful on every self-heal. rem_stale is already
                  * proven >0 by the `if (rem_stale > 0)` guard this block is
                  * inside. */
-                ngx_http_cache_turbo_marker_store(r, clcf, z, &ctx->cache_key,
-                    bits, gen, rem_fresh > 0 ? rem_fresh : 1, rem_stale);
-
-                ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                               "cache_turbo: L2 vary-marker hit \"%V\" "
-                               "bits=0x%xi -> variant key, L1 self-healed",
-                               &r->uri, bits);
+                if (ngx_http_cache_turbo_access_l2_marker_resolve(r, clcf,
+                        ctx, z, hashp, bits, gen, rem_fresh, rem_stale)
+                    != NGX_OK)
+                {
+                    return NGX_ERROR;
+                }
             }
         }
     }
@@ -2066,10 +2122,11 @@ ngx_http_cache_turbo_access_l2_marker_consume(ngx_http_request_t *r,
      * revalidation every window forever. */
     if (revalidate && bits == 0 && ctx->l2_result == NGX_DECLINED) {
         if (ngx_http_cache_turbo_digest(ctx->cache_key.data,
-                ctx->cache_key.len, ctx->key_hash) == NGX_OK)
+                ctx->cache_key.len, ctx->key_hash) != NGX_OK)
         {
-            *hashp = ngx_crc32_short(ctx->key_hash, 32);
+            return NGX_ERROR;
         }
+        *hashp = ngx_crc32_short(ctx->key_hash, 32);
         ctx->vary_gen = 0;
         ctx->vary_marker_l2_bits = 0;
         ctx->vary_marker_l2_gen = 0;
@@ -2130,6 +2187,8 @@ ngx_http_cache_turbo_access_l2_marker_consume(ngx_http_request_t *r,
     ctx->l2_result = 0;
     ctx->l2_blob = NULL;
     ctx->l2_blob_len = 0;
+
+    return NGX_OK;
 }
 
 
@@ -2417,7 +2476,7 @@ ngx_http_cache_turbo_access_l2_promote_serve(ngx_http_request_t *r,
                ctx->key_hash, hash,
                ctx->l2_blob, ctx->l2_blob_len,
                rem_fresh, rem_stale,
-               NGX_HTTP_CACHE_TURBO_STORE_IF_NEWER);
+               NGX_HTTP_CACHE_TURBO_STORE_IF_NEWER, NULL);
 
 #if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
     && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
@@ -2490,7 +2549,12 @@ ngx_http_cache_turbo_access_l2(ngx_http_request_t *r,
      * marker consult resolves one. Both are no-ops (return immediately) on
      * the warm-marker path: vary_marker_l1_miss is never set there, so this
      * costs the warm path nothing beyond the two flag reads. */
-    ngx_http_cache_turbo_access_l2_marker_consume(r, clcf, ctx, z, &hash);
+    if (ngx_http_cache_turbo_access_l2_marker_consume(r, clcf, ctx, z, &hash)
+        != NGX_OK)
+    {
+        *out_rc = NGX_ERROR;
+        return NGX_DONE;
+    }
 
     if (ngx_http_cache_turbo_access_l2_marker_get(r, clcf, ctx, z, out_rc)
         == NGX_DONE)

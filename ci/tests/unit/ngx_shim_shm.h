@@ -62,7 +62,9 @@
 #ifndef NGX_CACHE_TURBO_UNIT_SHM_SHIM_H
 #define NGX_CACHE_TURBO_UNIT_SHM_SHIM_H
 
+#include <errno.h>
 #include <pthread.h>
+#include <stdio.h>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -423,6 +425,52 @@ extern ngx_uint_t  ngx_test_lock_count;
  * test_shm_state.c, the sole TU that includes this shim. */
 extern pthread_mutex_t  ngx_test_shmtx;
 
+/* PURGE-ALL-STARVATION: one-shot barrier on the expected purger thread's next
+ * zone-mutex unlock.  Ownership matters: a generic "next unlock" can be
+ * consumed by an unrelated worker, which then waits for a refill thread that
+ * is itself blocked behind that worker.  Every condition wait is timed so a
+ * broken production unlock produces a bounded, named failure rather than a CI
+ * hang. */
+extern pthread_mutex_t  ngx_test_unlock_barrier_mutex;
+extern pthread_cond_t   ngx_test_unlock_barrier_cond;
+extern pthread_t        ngx_test_unlock_barrier_expected;
+extern int              ngx_test_unlock_barrier_phase;
+extern int              ngx_test_unlock_barrier_armed;
+extern int              ngx_test_unlock_barrier_expected_set;
+extern int              ngx_test_unlock_barrier_timed_out;
+extern int              ngx_test_unlock_barrier_hits;
+
+static inline int
+ngx_test_unlock_barrier_wait_locked(int phase, const char *participant)
+{
+    struct timespec  deadline;
+    int              rc;
+
+    if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) {
+        ngx_test_unlock_barrier_timed_out = 1;
+        fprintf(stderr, "  ✗ purge barrier %s could not read clock\n",
+                participant);
+        return -1;
+    }
+    deadline.tv_sec += 5;
+
+    while (ngx_test_unlock_barrier_phase != phase) {
+        rc = pthread_cond_timedwait(&ngx_test_unlock_barrier_cond,
+                                    &ngx_test_unlock_barrier_mutex,
+                                    &deadline);
+        if (rc != 0) {
+            ngx_test_unlock_barrier_timed_out = 1;
+            fprintf(stderr,
+                    "  ✗ purge barrier %s timed out waiting for phase %d"
+                    " (pthread rc=%d)\n",
+                    participant, phase, rc);
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
 static inline void
 ngx_test_slab_fail_after(long n) { ngx_test_slab_budget = n; }
 
@@ -495,9 +543,26 @@ ngx_shmtx_lock(ngx_shmtx_t *mtx)
 static inline void
 ngx_shmtx_unlock(ngx_shmtx_t *mtx)
 {
+    int  armed, wait_at_barrier;
+
     (void) mtx;
     ngx_test_lock_depth--;
     (void) pthread_mutex_unlock(&ngx_test_shmtx);
+
+    armed = __atomic_load_n(&ngx_test_unlock_barrier_armed, __ATOMIC_ACQUIRE);
+    wait_at_barrier = armed && ngx_test_unlock_barrier_expected_set
+                      && pthread_equal(pthread_self(),
+                                       ngx_test_unlock_barrier_expected)
+                      && __atomic_exchange_n(&ngx_test_unlock_barrier_armed, 0,
+                                              __ATOMIC_ACQ_REL);
+    if (wait_at_barrier) {
+        (void) pthread_mutex_lock(&ngx_test_unlock_barrier_mutex);
+        ngx_test_unlock_barrier_hits++;
+        ngx_test_unlock_barrier_phase = 1;
+        (void) pthread_cond_broadcast(&ngx_test_unlock_barrier_cond);
+        (void) ngx_test_unlock_barrier_wait_locked(2, "purger");
+        (void) pthread_mutex_unlock(&ngx_test_unlock_barrier_mutex);
+    }
 }
 
 static inline int

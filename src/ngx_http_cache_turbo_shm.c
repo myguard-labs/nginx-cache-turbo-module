@@ -1509,22 +1509,81 @@ ngx_http_cache_turbo_shm_purge_key(ngx_http_cache_turbo_zone_t *z,
 }
 
 
+/* MARKER-ROLLBACK-RACE: remove only the exact blob a caller just stored.
+ * `stored_data` carries a reference acquired inside store()/store_if()'s
+ * lock hold, so a concurrent replacement may detach that blob but cannot
+ * free it or recycle its slab address before this comparison.  Pointer
+ * identity is therefore an ABA-safe store token without changing blob bytes
+ * or the cache-key wire contract. */
+ngx_int_t
+ngx_http_cache_turbo_shm_purge_if_blob(ngx_http_cache_turbo_zone_t *z,
+    u_char *key_hash, uint32_t hash, u_char *stored_data)
+{
+    ngx_http_cache_turbo_node_t  *ctn;
+
+    ngx_shmtx_lock(ngx_http_cache_turbo_zone_mutex(z));
+    ctn = ngx_http_cache_turbo_shm_lookup(z, key_hash, hash);
+
+    if (ctn == NULL || ctn->data != stored_data) {
+        ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
+        return 0;
+    }
+
+    ngx_http_cache_turbo_shm_drop_locked(z, ctn);
+    ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
+    return 1;
+}
+
+
 /* PERF-3: how many nodes to drop per lock acquisition during a purge-all walk.
  * Holding the zone mutex for the ENTIRE LRU (which can be millions of entries)
  * blocks every other worker's cache lookups/stores for the whole walk. Dropping
  * in bounded batches and releasing the mutex between them keeps each critical
  * section short, so a concurrent request waits at most one batch, not the whole
- * purge. The total is still reported. */
+ * purge. The total is still reported.
+ *
+ * PURGE-ALL-STARVATION: the walk is also bounded by the entry count observed
+ * under the mutex at its start.  A producer can refill either queue between
+ * batches; chasing those new nodes until both queues happen to be empty lets a
+ * sustained refill keep this worker in purge_all() forever.  The initial count
+ * is a finite work budget, not a promise that those exact nodes are selected
+ * (new insertions may land at the queue head).  Once the budget is consumed we
+ * inspect both queues under the same final lock hold: empty is a complete
+ * linearisation point, non-empty is reported as NGX_AGAIN so the admin endpoint
+ * cannot claim the whole zone was cleared.  With no concurrent refill the
+ * budget equals the resident population and both queues still drain fully. */
 #define NGX_HTTP_CACHE_TURBO_PURGE_BATCH  512
 
-ngx_uint_t
-ngx_http_cache_turbo_shm_purge_all(ngx_http_cache_turbo_zone_t *z)
+ngx_int_t
+ngx_http_cache_turbo_shm_purge_all(ngx_http_cache_turbo_zone_t *z,
+    ngx_uint_t *purged)
 {
-    ngx_uint_t                    n = 0, batch;
+    ngx_uint_t                    remaining, batch;
+    ngx_int_t                     rc;
     ngx_queue_t                  *q;
     ngx_http_cache_turbo_node_t  *ctn;
 
-    for ( ;; ) {
+    *purged = 0;
+    rc = NGX_OK;
+
+    ngx_shmtx_lock(ngx_http_cache_turbo_zone_mutex(z));
+    remaining = ngx_http_cache_turbo_zone_sh(z)->n_entries;
+
+    /* Treat the entry count as the work budget, not as proof that the queues
+     * are empty.  A zero budget still needs one lock-held observation: if a
+     * corrupted/stale counter disagrees with either resident queue, claiming
+     * completion would turn accounting skew into a false successful purge. */
+    if (remaining == 0
+        && (!ngx_queue_empty(&ngx_http_cache_turbo_zone_sh(z)->lru)
+            || !ngx_queue_empty(
+                    &ngx_http_cache_turbo_zone_sh(z)->lru_protected)))
+    {
+        rc = NGX_AGAIN;
+    }
+
+    ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
+
+    while (remaining > 0) {
         ngx_shmtx_lock(ngx_http_cache_turbo_zone_mutex(z));
 
         batch = 0;
@@ -1535,7 +1594,7 @@ ngx_http_cache_turbo_shm_purge_all(ngx_http_cache_turbo_zone_t *z)
          * miss. Probation first, then protected; the batch cap spans the two
          * so the mutex is still released every PURGE_BATCH drops however the
          * entries are distributed. */
-        while (batch < NGX_HTTP_CACHE_TURBO_PURGE_BATCH
+        while (batch < NGX_HTTP_CACHE_TURBO_PURGE_BATCH && batch < remaining
                && !ngx_queue_empty(&ngx_http_cache_turbo_zone_sh(z)->lru))
         {
             q = ngx_queue_head(&ngx_http_cache_turbo_zone_sh(z)->lru);
@@ -1544,7 +1603,7 @@ ngx_http_cache_turbo_shm_purge_all(ngx_http_cache_turbo_zone_t *z)
             batch++;
         }
 
-        while (batch < NGX_HTTP_CACHE_TURBO_PURGE_BATCH
+        while (batch < NGX_HTTP_CACHE_TURBO_PURGE_BATCH && batch < remaining
                && !ngx_queue_empty(&ngx_http_cache_turbo_zone_sh(z)->lru_protected))
         {
             q = ngx_queue_head(&ngx_http_cache_turbo_zone_sh(z)->lru_protected);
@@ -1553,17 +1612,28 @@ ngx_http_cache_turbo_shm_purge_all(ngx_http_cache_turbo_zone_t *z)
             batch++;
         }
 
-        n += batch;
+        *purged += batch;
+        remaining -= batch;
+
+        if (!ngx_queue_empty(&ngx_http_cache_turbo_zone_sh(z)->lru)
+            || !ngx_queue_empty(&ngx_http_cache_turbo_zone_sh(z)->lru_protected))
+        {
+            if (remaining == 0 || batch == 0) {
+                rc = NGX_AGAIN;
+            }
+        }
+
         ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
 
-        /* Drained, or this batch hit the cap with more to go: loop and let any
-         * waiter take the mutex before we grab the next batch. */
-        if (batch < NGX_HTTP_CACHE_TURBO_PURGE_BATCH) {
+        /* Both queues drained, or the finite snapshot budget was consumed.
+         * In the latter case rc records whether entries remained at the
+         * final lock-held observation above. */
+        if (batch == 0 || rc != NGX_OK) {
             break;
         }
     }
 
-    return n;
+    return rc;
 }
 
 
@@ -1772,14 +1842,27 @@ ngx_http_cache_turbo_shm_store_locked(ngx_http_cache_turbo_zone_t *z,
 ngx_int_t
 ngx_http_cache_turbo_shm_store(ngx_http_cache_turbo_zone_t *z,
     u_char *key_hash, uint32_t hash, u_char *data, size_t len,
-    time_t fresh_ttl, time_t stale_ttl)
+    time_t fresh_ttl, time_t stale_ttl, u_char **stored_data)
 {
-    ngx_int_t  rc;
+    ngx_int_t                     rc;
+    ngx_http_cache_turbo_node_t  *written;
+
+    written = NULL;
+    if (stored_data != NULL) {
+        *stored_data = NULL;
+    }
 
     ngx_shmtx_lock(ngx_http_cache_turbo_zone_mutex(z));
     rc = ngx_http_cache_turbo_shm_store_locked(z, key_hash, hash, data, len,
                                                 fresh_ttl, stale_ttl, NULL,
-                                                NULL);
+                                                stored_data != NULL
+                                                ? &written : NULL);
+
+    if (rc == NGX_OK && stored_data != NULL) {
+        ngx_http_cache_turbo_blob_acquire(written->data);
+        *stored_data = written->data;
+    }
+
     ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
 
     return rc;
@@ -1859,12 +1942,19 @@ ngx_http_cache_turbo_shm_store_marker(ngx_http_cache_turbo_zone_t *z,
 ngx_int_t
 ngx_http_cache_turbo_shm_store_if(ngx_http_cache_turbo_zone_t *z,
     u_char *key_hash, uint32_t hash, u_char *data, size_t len,
-    time_t fresh_ttl, time_t stale_ttl, ngx_uint_t predicate)
+    time_t fresh_ttl, time_t stale_ttl, ngx_uint_t predicate,
+    u_char **stored_data)
 {
     time_t                        now;
     ngx_int_t                     rc;
     ngx_uint_t                    refuse;
     ngx_http_cache_turbo_node_t  *ctn;
+    ngx_http_cache_turbo_node_t  *written;
+
+    written = NULL;
+    if (stored_data != NULL) {
+        *stored_data = NULL;
+    }
 
     ngx_shmtx_lock(ngx_http_cache_turbo_zone_mutex(z));
 
@@ -1920,7 +2010,14 @@ ngx_http_cache_turbo_shm_store_if(ngx_http_cache_turbo_zone_t *z,
      * the same lock hold. */
     rc = ngx_http_cache_turbo_shm_store_locked(z, key_hash, hash, data, len,
                                                 fresh_ttl, stale_ttl, ctn,
-                                                NULL);
+                                                stored_data != NULL
+                                                ? &written : NULL);
+
+    if (rc == NGX_OK && stored_data != NULL) {
+        ngx_http_cache_turbo_blob_acquire(written->data);
+        *stored_data = written->data;
+    }
+
     ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
 
     return rc;
@@ -3468,6 +3565,7 @@ ngx_cache_turbo_l1_backend_t  ngx_http_cache_turbo_shm_backend = {
     ngx_http_cache_turbo_shm_l2_neg_check,
     ngx_http_cache_turbo_shm_l2_neg_set,
     ngx_http_cache_turbo_shm_freshen,
+    ngx_http_cache_turbo_shm_purge_if_blob,
 };
 
 #pragma GCC visibility pop

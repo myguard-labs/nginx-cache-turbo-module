@@ -1994,11 +1994,16 @@ static ngx_int_t
 ngx_http_cache_turbo_body_filter_store(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx,
     ngx_http_cache_turbo_zone_t *z, u_char *store_key, uint32_t hash,
-    u_char *blob, size_t blob_len, time_t ttl, time_t stale_window)
+    u_char *blob, size_t blob_len, time_t ttl, time_t stale_window,
+    u_char **stored_data)
 {
     ngx_int_t  store_rc;
     ngx_uint_t is_5xx = (r->headers_out.status
                           >= NGX_HTTP_INTERNAL_SERVER_ERROR);
+
+    if (stored_data != NULL) {
+        *stored_data = NULL;
+    }
 
 #if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
     && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
@@ -2020,12 +2025,13 @@ ngx_http_cache_turbo_body_filter_store(ngx_http_request_t *r,
     if (is_5xx) {
         store_rc = clcf->l1->store_if(z, store_key, hash,
                    blob, blob_len, ttl, stale_window,
-                   NGX_HTTP_CACHE_TURBO_STORE_IF_ABSENT_OR_DEAD);
+                   NGX_HTTP_CACHE_TURBO_STORE_IF_ABSENT_OR_DEAD,
+                   stored_data);
 
     } else {
         store_rc = clcf->l1->store(z, store_key, hash,
                    blob, blob_len, ttl,
-                   stale_window);
+                   stale_window, stored_data);
     }
 
     /* AUD-5XX-CTA: NGX_DECLINED means store_if() refused the write
@@ -2066,6 +2072,33 @@ ngx_http_cache_turbo_body_filter_store(ngx_http_request_t *r,
     }
 
     return NGX_OK;
+}
+
+
+/* MARKER-ROLLBACK-RACE: a mandatory marker failure must not leave request A's
+ * newly stored variant reachable, but an unconditional purge can delete a
+ * replacement request B installed under the same key while A was storing the
+ * marker.  stored_data is a pinned identity token returned atomically with A's
+ * store; purge_if_blob removes the node only if it still owns that exact blob.
+ * The pin is released after the compare-and-delete lock hold, preventing slab
+ * address reuse from turning pointer identity into an ABA. */
+static void
+ngx_http_cache_turbo_body_filter_rollback_store(
+    ngx_http_request_t *r, ngx_http_cache_turbo_loc_conf_t *clcf,
+    ngx_http_cache_turbo_zone_t *z, u_char *store_key, uint32_t hash,
+    u_char *stored_data)
+{
+    if (stored_data == NULL) {
+        return;
+    }
+
+    if (clcf->l1->purge_if_blob(z, store_key, hash, stored_data) > 0) {
+        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                      "cache_turbo: removed unsafe auto-vary variant \"%V\" "
+                      "after mandatory marker store failed",
+                      &r->uri);
+    }
+    ngx_http_cache_turbo_blob_release(z, stored_data);
 }
 
 
@@ -2290,18 +2323,23 @@ ngx_http_cache_turbo_body_filter_tag_index(ngx_http_request_t *r,
  * _store_tail so that function's CCN stays readable; mirrors how the L9 tag
  * path already sits in _body_filter_tag_split above.
  *
- * No early exit: every path here is a fire-and-forget side effect and falls
- * through to the caller's next statement, so pulling it into its own void
- * function changes no control flow in _store_tail. */
-static void
+ * Returns NGX_ERROR when the marker key digest or the L1 marker write fails;
+ * the caller then removes the just-stored variant rather than leave a cache
+ * entry reachable through an invalid or stale marker. Variant-index
+ * digest/transport failures use the existing pending/reissue accounting and
+ * remain fire-and-forget. */
+static ngx_int_t
 ngx_http_cache_turbo_body_filter_varidx_store(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx,
     ngx_http_cache_turbo_zone_t *z, u_char *store_key, uint32_t hash,
     time_t ttl, time_t retain_ttl)
 {
-    ngx_http_cache_turbo_marker_store(r, clcf, z, &ctx->cache_key,
-                                      ctx->vary_bits, ctx->vary_gen,
-                                      ttl, retain_ttl);
+    if (ngx_http_cache_turbo_marker_store(r, clcf, z, &ctx->cache_key,
+                                          ctx->vary_bits, ctx->vary_gen,
+                                          ttl, retain_ttl) != NGX_OK)
+    {
+        return NGX_ERROR;
+    }
 
     /* COR-5 variant index: SADD this variant's L2 key into the
      * per-base index set so a later PURGE of the base URI can
@@ -2313,8 +2351,8 @@ ngx_http_cache_turbo_body_filter_varidx_store(ngx_http_request_t *r,
         size_t     vlen;
         ngx_int_t  varidx_rc;
 
-        vlen = ngx_http_cache_turbo_variant_index_name(
-                   &ctx->cache_key, vname);
+        varidx_rc = ngx_http_cache_turbo_variant_index_name(
+                        &ctx->cache_key, vname, &vlen);
 
         /* COR-5(b): the SADD is fire-and-forget, but "handed to the
          * transport" and "dropped before the wire" are NOT the same
@@ -2340,11 +2378,11 @@ ngx_http_cache_turbo_body_filter_varidx_store(ngx_http_request_t *r,
          * compiled out). This is the arm the mutation test flips.
          * Armed per REQUEST via X-Cache-Turbo-Test-Varidx-Drop: 1 so the
          * 4-worker runner cannot smear the fault across variants. */
-        if (clcf->test_varidx_fail
+        if (varidx_rc == NGX_OK && clcf->test_varidx_fail
             && ngx_http_cache_turbo_test_varidx_drop_requested(r))
         {
             varidx_rc = NGX_ERROR;
-        } else if (clcf->test_varidx_fail
+        } else if (varidx_rc == NGX_OK && clcf->test_varidx_fail
                    && ngx_http_cache_turbo_test_varidx_hold_requested(r))
         {
             /* COR5-PURGE-VARIDX-RACE: stand in for a SADD that reached the
@@ -2366,7 +2404,7 @@ ngx_http_cache_turbo_body_filter_varidx_store(ngx_http_request_t *r,
             varidx_rc = NGX_OK;
         } else
 #endif
-        {
+        if (varidx_rc == NGX_OK) {
             varidx_rc = clcf->backend->tag_add(clcf, store_key, vname,
                                                vlen, retain_ttl);
         }
@@ -2388,6 +2426,8 @@ ngx_http_cache_turbo_body_filter_varidx_store(ngx_http_request_t *r,
                 "the next hit", &r->uri);
         }
     }
+
+    return NGX_OK;
 }
 
 
@@ -2406,6 +2446,7 @@ ngx_http_cache_turbo_body_filter_store_tail(ngx_http_request_t *r,
     uint32_t                      hash, nheaders = 0;
     u_char                       *blob;
     u_char                        store_key[32];
+    u_char                       *stored_data;
     size_t                        hdr_bytes = 0, blob_len = 0;
     ngx_str_t                     ct;
     time_t                        ttl, stale_window, sie_window;
@@ -2478,11 +2519,15 @@ ngx_http_cache_turbo_body_filter_store_tail(ngx_http_request_t *r,
      * variant via the request-time marker). */
     ngx_memcpy(store_key, ctx->key_hash, 32);
     if (clcf->auto_vary && ctx->vary_bits > 0) {
-        ngx_http_cache_turbo_variant_hash(r, &ctx->cache_key,
-                                          ctx->vary_bits, ctx->vary_gen,
-                                          store_key);
+        if (ngx_http_cache_turbo_variant_hash(r, &ctx->cache_key,
+                                              ctx->vary_bits, ctx->vary_gen,
+                                              store_key) != NGX_OK)
+        {
+            return NGX_DECLINED;
+        }
     }
     hash = ngx_crc32_short(store_key, 32);
+    stored_data = NULL;
 
     /* If we relocated the key away from the base (cold-miss winner that
      * only learned the Vary now), the cold-miss stub the access handler
@@ -2499,7 +2544,11 @@ ngx_http_cache_turbo_body_filter_store_tail(ngx_http_request_t *r,
 
     if (ngx_http_cache_turbo_body_filter_store(r, clcf, ctx, z, store_key,
                                                hash, blob, blob_len, ttl,
-                                               stale_window) == NGX_DECLINED)
+                                               stale_window,
+                                               clcf->auto_vary
+                                               && ctx->vary_bits > 0
+                                               ? &stored_data : NULL)
+        == NGX_DECLINED)
     {
         return NGX_DECLINED;
     }
@@ -2509,9 +2558,17 @@ ngx_http_cache_turbo_body_filter_store_tail(ngx_http_request_t *r,
      * (node-local; self-heals if evicted), and index the variant for
      * base-URI PURGE enumeration. See _body_filter_varidx_store above. */
     if (clcf->auto_vary && ctx->vary_bits > 0) {
-        ngx_http_cache_turbo_body_filter_varidx_store(r, clcf, ctx, z,
-                                                       store_key, hash,
-                                                       ttl, retain_ttl);
+        if (ngx_http_cache_turbo_body_filter_varidx_store(r, clcf, ctx, z,
+                store_key, hash, ttl, retain_ttl) != NGX_OK)
+        {
+            ngx_http_cache_turbo_body_filter_rollback_store(r, clcf, z,
+                store_key, hash, stored_data);
+            return NGX_DECLINED;
+        }
+
+        if (stored_data != NULL) {
+            ngx_http_cache_turbo_blob_release(z, stored_data);
+        }
     }
 
     ngx_log_debug4(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,

@@ -21,6 +21,17 @@
 #include <ngx_md5.h>
 
 
+/* Digest-derived cache keys are an integrity boundary: ignoring a failed
+ * derivation can publish or act on stale/uninitialised output.  Make ordinary
+ * discarded-result mutations compiler errors in every GCC/Clang build; the
+ * unit contract gate separately rejects an explicit (void) bypass. */
+#if defined(__GNUC__) || defined(__clang__)
+#define NGX_HTTP_CACHE_TURBO_MUST_CHECK  __attribute__((warn_unused_result))
+#else
+#define NGX_HTTP_CACHE_TURBO_MUST_CHECK
+#endif
+
+
 /* R5-1 (perf-microtier-hitpath): the module build has no per-addon CFLAGS hook
  * anywhere in nginx's `auto/module`/`auto/make` — every module object is
  * compiled with the SAME global $(CFLAGS) as nginx core, in both the
@@ -143,8 +154,9 @@
  * Origin-independent last-resort stale retention: when a response carries no
  * `stale-if-error` window of its own, this becomes the effective
  * stale-if-error window instead of leaving the object with no fallback at
- * all. `off` (0) is the default and reproduces the pre-S2.1 behaviour
- * exactly -- the store path only widens sie_window when this is > 0.
+ * all. `24h` is the shipped default; `off` (0) explicitly restores the
+ * pre-S2.1 no-retention behaviour -- the store path only widens sie_window
+ * when this is > 0.
  *
  * No separate MIN/MAX pair: this directive shares the module-wide
  * NGX_HTTP_CACHE_TURBO_TTL_MAX ceiling above (the same uint32-wire-format
@@ -697,9 +709,9 @@ typedef struct {
      * this would make a corrupted node un-evictable and leak the zone. Do NOT
      * invert it.
      *
-     * When cache_turbo_scan_resistant is off (the default) nothing ever sets
-     * this to PROTECTED, sh->lru_protected stays empty, and every path degrades
-     * to exactly the flat single-queue LRU that shipped before S8. */
+     * When cache_turbo_scan_resistant is off (an explicit opt-out) nothing ever
+     * sets this to PROTECTED, sh->lru_protected stays empty, and every path
+     * degrades to exactly the flat single-queue LRU that shipped before S8. */
     ngx_uint_t               seg;
 
     /* S8: has this node been touched (accessed) at least once since it was
@@ -1779,9 +1791,9 @@ typedef struct {
     ngx_int_t                min_uses_raw;
                                           /* explicit cache_turbo_min_uses   */
 
-    /* S8 scan-resistant segmented LRU. `cache_turbo_scan_resistant off` (the
-     * default) stores 0 here, which every LRU path reads as "flat LRU, behave
-     * exactly as before S8". `on` stores the protected-segment cap as a
+    /* S8 scan-resistant segmented LRU. `cache_turbo_scan_resistant` is on by
+     * default; explicit `off` stores 0, which every LRU path reads as "flat
+     * LRU, behave exactly as before S8". `on` stores the protected-segment cap as a
      * percentage (1..99, default 80). One field carries both the on/off state
      * and the tuning, so there is no way to be "on with pct 0". */
     ngx_uint_t               scan_resistant_pct;
@@ -2062,8 +2074,9 @@ typedef struct {
     /* cache_turbo_keep_stale <off|time|forever> (S2.1; read side wired in
      * S2.2). Consulted on the store path, where it widens sie_window -- see
      * the `ttl > 0 && clcf->keep_stale > 0` and
-     * `ttl > 0 && clcf->ignore_cc && clcf->keep_stale > 0` gates. 0 = OFF (the
-     * default, today's behaviour unchanged); NGX_HTTP_CACHE_TURBO_FOREVER_TTL
+     * `ttl > 0 && clcf->ignore_cc && clcf->keep_stale > 0` gates. 0 is the
+     * explicit OFF opt-out; the shipped default is 86400s (24h).
+     * NGX_HTTP_CACHE_TURBO_FOREVER_TTL
      * for the `forever` keyword; otherwise the parsed+clamped seconds value.
      * Deliberately NOT a synonym for cache_turbo_valid's "0 = forever"
      * convention -- see the doc comment on the handler for why a bare 0 here
@@ -2080,22 +2093,22 @@ typedef struct {
 
     /* cache_turbo_breaker on|off (O4.4). Separate on/off switch from the
      * module's own `enable`: a location can have cache_turbo on with the
-     * breaker left off (today's behaviour, and the default), or the breaker
-     * explicitly re-enabled/disabled per-location independently of caching
-     * itself. NGX_CONF_UNSET until merge; merges to off (0) — see
+     * breaker left off, or the breaker explicitly re-enabled/disabled
+     * per-location independently of caching itself. NGX_CONF_UNSET until
+     * merge; merges to on (1) by default — see
      * ngx_http_cache_turbo_breaker_should_consult() for the full admission
      * rule this feeds. This is one of THREE independent ways to express
      * "breaker off": the flag itself, `breaker_threshold 0`, or
      * `breaker_window 0`. */
-    ngx_flag_t               breaker_enable;
+    ngx_flag_t               breaker_enable;    /* merge default 1 (on)       */
 
     /* P6/O4.2 circuit-breaker tuning. Fed to
      * ngx_http_cache_turbo_shm_breaker_record() from the request path; the
      * O4.3 serve-path read and the directives that set these are O4.4.
      *
-     * ⚠ Both merge to 0, and 0 is INERT on purpose (see the contract in
-     * _breaker_record(): threshold == 0 disables tripping, window == 0
-     * likewise). O4.4 adds the parsers that can make either non-zero;
+     * ⚠ The shipped defaults are threshold 5 and window 10s; an explicit 0 is
+     * INERT (see the contract in _breaker_record(): threshold == 0 disables
+     * tripping, window == 0 likewise). O4.4 adds the parsers that tune them;
      * whether the breaker is actually consulted is decided by
      * ngx_http_cache_turbo_breaker_should_consult(), which additionally
      * requires breaker_enable and clcf->enable.
@@ -2107,8 +2120,8 @@ typedef struct {
      * 404-heavy site trip its own breaker and 503 everything while the origin
      * was fine. The breaker's failure test is 5xx-only -- see
      * ngx_http_cache_turbo_breaker_is_origin_failure(). */
-    ngx_uint_t               breaker_threshold; /* failures to trip; 0 = off  */
-    time_t                   breaker_window;    /* rolling window s; 0 = off  */
+    ngx_uint_t               breaker_threshold; /* merge default 5; 0 = off   */
+    time_t                   breaker_window;    /* merge default 10s; 0 = off */
 
     /* P5-5r: cache_turbo_breaker_count_retries off|on. OPT-IN, default off,
      * unlike every other breaker knob above (which ship on/pre-tuned by
@@ -2324,13 +2337,14 @@ typedef struct {
      * at store time and the named request headers (safe whitelist only:
      * Accept-Encoding, User-Agent->device, Accept-Language, Origin) are folded
      * into a SECONDARY variant key so distinct representations get distinct
-     * slots automatically — no operator config of the axes. Two-level keying is
-     * node-local: a tiny "vary marker" (the active axis bitmask) is stored in L1
-     * under a dedicated marker key; a request probes the marker (L1 only) and,
-     * if present, recomputes its key to the variant before the normal lookup.
-     * The base slot stays empty for varied URLs, so a missing marker just misses
-     * to origin (never serves the wrong variant). Vary: * / Cookie /
-     * Authorization make the response uncacheable. Off by default. */
+     * slots automatically — no operator config of the axes. A tiny "vary
+     * marker" (the active axis bitmask) is stored in node-local L1 under a
+     * dedicated marker key and mirrored to a configured L2. A request probes
+     * L1 first; an L1 miss can recover the marker from L2 before recomputing its
+     * key to the variant. The base slot stays empty for varied URLs, so a
+     * missing marker just misses to origin (never serves the wrong variant).
+     * Vary: * / Cookie / Authorization make the response uncacheable. Off by
+     * default. */
     ngx_flag_t               auto_vary;
 
     /* cache_turbo_key_encoded_origin (P3-2). An origin that always sends a
@@ -3239,9 +3253,17 @@ struct ngx_cache_turbo_l1_backend_s {
 
     ngx_http_cache_turbo_node_t *(*lookup)(ngx_http_cache_turbo_zone_t *z,
         u_char *key_hash, uint32_t hash);
+
+    /* `stored_data` is an optional ownership token for post-store rollback.
+     * On NGX_OK, a non-NULL out-parameter receives the exact shm blob installed
+     * by this call with one reference acquired under the store's zone-mutex
+     * hold.  The caller MUST release it with blob_release().  Pinning the blob
+     * makes pointer identity ABA-safe: a replacement cannot reuse its slab
+     * address while the token is live.  NULL preserves the ordinary store
+     * path with no extra refcount operation. */
     ngx_int_t  (*store)(ngx_http_cache_turbo_zone_t *z, u_char *key_hash,
         uint32_t hash, u_char *data, size_t len,
-        time_t fresh_ttl, time_t stale_ttl);
+        time_t fresh_ttl, time_t stale_ttl, u_char **stored_data);
 
     /* Atomic "decide-then-write" store (AUD-L2-PROMOTE-RACE / AUD-5XX-CTA).
      * Modeled on `claim`, NOT on `store`: the predicate is evaluated and the
@@ -3271,11 +3293,16 @@ struct ngx_cache_turbo_l1_backend_s {
      *     error response overwrite a still-servable good body. */
     ngx_int_t  (*store_if)(ngx_http_cache_turbo_zone_t *z, u_char *key_hash,
         uint32_t hash, u_char *data, size_t len,
-        time_t fresh_ttl, time_t stale_ttl, ngx_uint_t predicate);
+        time_t fresh_ttl, time_t stale_ttl, ngx_uint_t predicate,
+        u_char **stored_data);
 
     ngx_int_t  (*purge_key)(ngx_http_cache_turbo_zone_t *z, u_char *key_hash,
         uint32_t hash);
-    ngx_uint_t (*purge_all)(ngx_http_cache_turbo_zone_t *z);
+    /* NGX_OK means both queues were empty at the final lock-held observation.
+     * NGX_AGAIN means the finite start-of-call entry budget was consumed while
+     * concurrent refill left entries resident; *purged is exact in both cases. */
+    ngx_int_t  (*purge_all)(ngx_http_cache_turbo_zone_t *z,
+        ngx_uint_t *purged);
     void       (*stats)(ngx_http_cache_turbo_zone_t *z,
         ngx_http_cache_turbo_stats_t *out);
 
@@ -3352,6 +3379,16 @@ struct ngx_cache_turbo_l1_backend_s {
      * OLD ttls, which would compound rather than refresh. */
     ngx_int_t  (*freshen)(ngx_http_cache_turbo_zone_t *z, u_char *key_hash,
         uint32_t hash, time_t fresh_ttl, time_t stale_ttl);
+
+    /* Roll back a store only while `stored_data` is still the blob installed
+     * under this key.  The caller holds an acquired blob reference from
+     * store()/store_if(), so pointer comparison cannot suffer slab-address
+     * ABA.  Returns 1 when that exact entry was removed, 0 when the key is
+     * absent or a concurrent store has replaced it.  Does not consume the
+     * caller's reference.  Appended to keep positional backend initialisers
+     * source-compatible. */
+    ngx_int_t  (*purge_if_blob)(ngx_http_cache_turbo_zone_t *z,
+        u_char *key_hash, uint32_t hash, u_char *stored_data);
 };
 
 #define NGX_HTTP_CACHE_TURBO_CLAIM_WINNER  0
@@ -3470,7 +3507,7 @@ ngx_int_t ngx_http_cache_turbo_send_json(ngx_http_request_t *r,
 /* One-shot digest convenience for a single contiguous input (module.c).
  * Returns NGX_OK on success, NGX_ERROR on failure. */
 ngx_int_t ngx_http_cache_turbo_digest(const void *data, size_t len,
-    u_char out[32]);
+    u_char out[32]) NGX_HTTP_CACHE_TURBO_MUST_CHECK;
 
 /* State carried through an async tag purge from the admin handler (or the
  * variant-index purge in module.c) to the SMEMBERS completion callback. */

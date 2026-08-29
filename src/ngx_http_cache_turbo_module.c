@@ -405,7 +405,7 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       NULL },
 
     /* P5-5r: OPT-IN, default off -- see the field comment on
-     * breaker_count_retries in the .h for why this does not ship on. When
+     * breaker_count_retries in the .h for why this remains opt-in. When
      * on, every proxy_next_upstream peer attempt that failed before the
      * final one also counts toward the breaker's failure run. */
     { ngx_string("cache_turbo_breaker_count_retries"),
@@ -5758,11 +5758,11 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->min_uses = NGX_CONF_UNSET;
     conf->l2_negative_ttl = NGX_CONF_UNSET;   /* L13; merges to 0 = off */
     conf->vary_marker_revalidate = NGX_CONF_UNSET;  /* c-2; merges to 2s */
-    conf->keep_stale = NGX_CONF_UNSET;   /* S2.1; merges to 0 = off */
+    conf->keep_stale = NGX_CONF_UNSET;   /* S2.1; merges to 86400s (24h) */
     conf->use_stale = NGX_CONF_UNSET_UINT;   /* S4.1; merges to USE_STALE_DEFAULT */
-    conf->breaker_enable = NGX_CONF_UNSET;         /* O4.4; merges to 0 = off */
-    conf->breaker_threshold = NGX_CONF_UNSET_UINT; /* O4.2; merges to 0 = off */
-    conf->breaker_window = NGX_CONF_UNSET;         /* O4.2; merges to 0 = off */
+    conf->breaker_enable = NGX_CONF_UNSET;         /* O4.4; merges to 1 = on */
+    conf->breaker_threshold = NGX_CONF_UNSET_UINT; /* O4.2; merges to 5 */
+    conf->breaker_window = NGX_CONF_UNSET;         /* O4.2; merges to 10s */
     conf->breaker_count_retries = NGX_CONF_UNSET;  /* P5-5r; merges to 0=off */
     conf->breaker_open = NGX_CONF_UNSET;           /* O4.3; see the merge note */
     conf->breaker_retry_after = NGX_CONF_UNSET;    /* BRK-RA1; stays UNSET if

@@ -702,12 +702,16 @@ axis rather than relying on auto-Vary.
 > axis: `normalize_vary` when you know the axis up front, `auto_vary` to learn it
 > from the response.
 
-Keying is two-level and node-local: the first time a URL's response is seen to
+Keying is two-level: the L1 marker copy is node-local, while a configured L2
+marker mirror/recovery path is shared. The first time a URL's response is seen to
 vary, the module records a tiny *vary marker* in L1 and stores the body under a
 secondary *variant* key; later requests read the marker and resolve straight to
 their variant. The base slot stays empty for varied URLs, so a node that hasn't
 learned the `Vary` yet simply misses to origin — it never serves the wrong
-variant. On by default.
+variant. With Redis or memcached configured, an L1 marker miss or stale marker
+can consult the shared L2 mirror before going to origin, allowing a cold node
+to recover an already-known variant. Without L2, the cold-node miss is
+intentional and safe. On by default.
 
 > **`Vary: Accept-Encoding` is collapsed automatically.** The module captures
 > the **identity** (uncompressed) body — its body filter runs *above*
@@ -2070,11 +2074,14 @@ http {
 
             # ── what is "the same page" ─────────────────────────────────
             cache_turbo_key               $host$uri$cache_turbo_normalized_args;  # the default
+            cache_turbo_key_encoded_origin off;  # require explicit encoded-origin opt-in
             cache_turbo_normalize_strip   sid sessionid "tmp_*";   # extra args to drop (trailing * = prefix; bare * = all)
+            cache_turbo_normalize_max_args 64;        # cap sorted query args
             cache_turbo_normalize_vary    encoding device;        # add variant buckets to the key
 
             # ── freshness / staleness ───────────────────────────────────
             cache_turbo_preset            balanced;  # micro|conservative|balanced|aggressive — sets the 5 knobs below
+            cache_turbo_stale_mult         4;         # stale window multiplier (balanced)
             cache_turbo_valid             60s;       # 200 TTL; 0 = cache forever
             cache_turbo_valid             301 302 308 1h;   # repeatable: cache redirects
             cache_turbo_valid             404 410 1m;       #            negative caching
@@ -2082,7 +2089,9 @@ http {
             cache_turbo_lock_ttl          5s;        # single-flight refresh window
             cache_turbo_cache_control     respect;   # respect | honor (take TTL from response CC/Expires) | ignore (discard response CC)
             cache_turbo_background_update on;        # SWR + stale-if-error (off = inline regen)
-            cache_turbo_keep_stale        off;       # off | <time> | forever — serve stale when origin is down
+            cache_turbo_background_update_max 0;      # unlimited concurrent background refreshes
+            cache_turbo_keep_stale        24h;       # off | <time> | forever — serve stale when origin is down
+            cache_turbo_l2_negative_ttl   0;         # disabled
           # cache_turbo_use_stale       http_404 http_429;  # which statuses count as "down". Omitted = the default, ANY 5xx.
                                                            # ⚠ naming tokens REPLACES the default, it does not add to it:
                                                            # listing the four 5xx tokens drops 501/505/507/... coverage.
@@ -2092,18 +2101,27 @@ http {
             cache_turbo_lock              on;        # cold-miss single-flight (others wait for the fill)
             cache_turbo_lock_timeout      5s;        # how long a waiter waits before going to origin itself
             cache_turbo_min_uses          1;         # cache only after the key is seen N times (1 = first miss)
+            cache_turbo_min_uses_window   0;         # no counter expiry window
+            cache_turbo_scan_resistant     on;       # protected_pct=80 by default
+            cache_turbo_warm_max           32;       # max URLs per warm request
 
             # ── per-request opt-outs ────────────────────────────────────
-            cache_turbo_bypass            $cookie_session;  # skip lookup, still store
-            cache_turbo_no_store          $cookie_session;  # ...so pair it, see below
-            # NOT $arg_nocache -- a client-supplied bypass trigger is a DoS lever
-            cache_turbo_no_store          $cookie_session;              # don't store the response
+            # Derive bypass/no-store variables from trusted auth state.
+            # Raw query, header, and cookie values let clients bypass caching.
+            cache_turbo_bypass            $cookie_session; # skip lookup, still store
+            cache_turbo_no_store          $cookie_session; # pair it: do not store response
+            cache_turbo_bypass_uri         /wp-admin/; # optional URI bypass
+            cache_turbo_bypass_stale_uri   /catalog/;  # optional breaker fallback
+            cache_turbo_backend_prefix     /shop/;     # opt-in example: mounted-app prefix
+            cache_turbo_key_cookie         locale;     # opt-in example: variant cookie
 
             # ── let the origin decide (inverts the store default here) ──
             cache_turbo_require_header    X-GraphQL-Cacheable;          # store ONLY if origin affirms
 
             # ── Vary handling ───────────────────────────────────────────
             cache_turbo_auto_vary         on;        # off = ignore response Vary (old Vary-blind behavior)
+            cache_turbo_vary_ignore       X-Device;  # optional Vary axis ignore
+            cache_turbo_vary_marker_revalidate 2s;    # L2 marker revalidation interval
 
             # ── tags: local purge-by-tag (Redis) + downstream CDN sync ──
             cache_turbo_tag               $upstream_http_x_cache_tags;  # purge-by-tag index needs cache_turbo_redis
@@ -2114,7 +2132,25 @@ http {
 
             # ── stacking with native proxy_cache ────────────────────────
             cache_turbo_suppress_native   off;       # on = drive $cache_turbo_active for proxy_no_cache
+            cache_turbo_serve_authorized  off;       # do not read shared entries with Authorization
+            cache_turbo_store_head        off;       # HEAD_DERIVED population is opt-in
+            cache_turbo_breaker_count_retries off;   # count only the final upstream attempt
+            cache_turbo_breaker           on;        # outage breaker enabled
+            cache_turbo_breaker_threshold 5;         # failures to trip
+            cache_turbo_breaker_window    10s;       # rolling failure window
+            cache_turbo_breaker_open      30s;       # open duration
+            cache_turbo_breaker_retry_after 30s;     # advisory retry hint
 
+            proxy_pass http://127.0.0.1:8080;
+        }
+
+        # A compatible opt-in example for named non-identifying cookies.
+        # Cookie-ignore is only safe without a backend preset or cookie-value
+        # keying, so this location selects `cache_turbo_backend none`.
+        location /cookie-safe/ {
+            cache_turbo ct;
+            cache_turbo_backend none;
+            cache_turbo_ignore_set_cookie _ga;
             proxy_pass http://127.0.0.1:8080;
         }
 
@@ -2155,6 +2191,9 @@ http {
 | `cache_turbo_lock_ttl TIME` | `server`, `location` | preset (`5s`) | Single-flight window: once one refresh is claimed, others serve stale until it finishes. Caps backend regens to ~one per cycle. `0` is rejected at config time (use `cache_turbo_lock off` to disable single-flight instead); an oversized value is clamped rather than rejected. |
 | `cache_turbo_stale_mult N` | `server`, `location` | preset (`4` balanced) | Stale window as a multiple of the fresh TTL: an entry stays serveable as `STALE` until `cache_turbo_valid * N`. `1` = no stale window (hard-expire at the fresh TTL); the maximum is `8`. An explicit value overrides the preset's band, like `cache_turbo_valid`/`_beta`/`_lock_ttl`. `0` is rejected rather than silently meaning `4`. |
 | `cache_turbo_lock on` / `off` | `server`, `location` | `on` | Cold-miss single-flight: when an *uncached* key is hit by many requests at once, the first goes to the origin and the rest **wait** for it to fill the cache (per box via a stub, cluster-wide via the Redis lock) rather than all stampeding the origin. **Off** = every cold miss goes straight to the origin. |
+| `cache_turbo_key_encoded_origin on\|off` | `server`, `location` | `off` | Mark origin responses as already content-encoded and require automatic Vary keying so an encoded body is never served to an incompatible client. |
+| `cache_turbo_serve_authorized on\|off` | `server`, `location` | `off` | Permit requests carrying `Authorization` to read shared entries; storage remains subject to the authorization safety floor. |
+| `cache_turbo_store_head on\|off` | `server`, `location` | `off` | The original `HEAD` response is never captured. On a `HEAD` miss, issue one internal background **GET**; that GET creates a `HEAD_DERIVED` entry, which is refused to non-`HEAD` requests, so it cannot satisfy an ordinary GET. |
 | `cache_turbo_lock_timeout TIME` | `server`, `location` | `5s` | How long a waiting cold-miss request waits for the winner's fill before giving up and going to the origin itself. |
 | `cache_turbo_min_uses N` | `server`, `location` | preset (`1`, `2` aggressive) | Cache a page only after its key has been requested `N` times — keep one-hit-wonder URLs out of the cache. Below the threshold each request goes to the origin and is **not** stored; the `N`-th miss stores it. A key already present in the L2 (Redis or memcached) tier is served from L2 regardless (it is already proven popular). `1` = store on the first miss (off), which is the band value for every preset except `aggressive` (`2`). An explicit value overrides the preset's band, like `cache_turbo_valid`/`_beta`/`_lock_ttl`/`_stale_mult`. Range `1`..`32`; `0` and negatives are rejected at config time rather than silently meaning `1`. Note each sub-threshold miss still costs a lightweight counter node in the zone — `min_uses` saves the response *body*, not the key slot, so raising it on a site without a long tail is a pure origin-load increase. |
 | `cache_turbo_min_uses_window TIME` | `server`, `location` | `0` (off) | Reset the miss counter when the node has aged past this window, so misses are counted only within a recent time window instead of accumulating for the node's lifetime. Without a window, two misses separated by days count the same as two a second apart — genuine one-hit-wonders that happen to recur between distinct intervals still satisfy `min_uses 2` and are cached; with a window, they are treated as fresh cold counts and must re-cross the `min_uses` threshold. **Only matters when `cache_turbo_min_uses > 1` AND `cache_turbo_min_uses_window > 0`** are both set; at the default `min_uses 1` or default `min_uses_window 0` there is no windowing, and behavior is identical to v15 (lifetime counter). Range `0` (off) or `1`..`86400`; off by default (`0` = no windowing, counter persists until LRU eviction). Negatives are rejected at config time. Misses are tracked per-key in a lightweight counter node; on each miss, if `now - last_access > window` the counter resets to 0 before incrementing, forcing the miss count to start fresh. The window applies per-key and per-access, not globally. **On a site with a long-tail workload, enabling this may increase origin load** by forcing lower-popularity URLs to re-cross `min_uses` more often. **Size it to your cache eviction pressure:** typical value is 3600 (1 hour), or disable it if your zone stays cold between visits (e.g. internal APIs, low-traffic sites). |
@@ -2172,10 +2211,12 @@ http {
 | `cache_turbo_purge on` | `server`, `location` | `off` | Allow a `PURGE <uri>` request to drop that URI's entry from L1 (+L2). Gate the location with `allow`/`deny`. E.g. `curl -X PURGE http://host/blog/post-42`. |
 | `cache_turbo_cache_control respect\|honor\|ignore` | `server`, `location` | `respect` | How the response `Cache-Control` is treated. **respect** (default): it gates storage and reshapes the stale window as written; the fresh TTL comes from `cache_turbo_valid`. **honor**: also take the fresh TTL from the response's own freshness headers, in RFC 9213 precedence order — `Surrogate-Control: max-age` (Fastly/Akamai) > `CDN-Cache-Control: s-maxage`/`max-age` (Cloudflare) > `Cache-Control: s-maxage`/`max-age` > `Expires` — falling back to `cache_turbo_valid` when none is present. The two **targeted** headers let an origin hand this shared cache a different TTL than the browser's `Cache-Control`; a targeted `no-store`/`private`/`max-age=0` also vetoes storage, and both targeted headers are stripped before store so they never replay downstream (see [Behind a CDN / multi-tier caching](#behind-a-cdn--multi-tier-caching)). **ignore**: discard the response `Cache-Control` **entirely** (mirror of nginx's `proxy_ignore_headers Cache-Control`) — `no-store`/`no-cache`/`private`/`max-age=0`/`s-maxage=0` no longer forbid storage, `must-revalidate`/`proxy-revalidate`/`stale-while-revalidate=N`/`stale-if-error=N` no longer reshape the window (it stays `cache_turbo_valid` × `cache_turbo_stale_mult`), and the TTL comes from `cache_turbo_valid`; use it for an origin that blankets shareable pages with `max-age=0, must-revalidate`. The `Set-Cookie` and request-`Authorization` safety floors are **not** affected by any mode — a per-user response is still never cached. A CMS preset (`cache_turbo_backend`) defaults this to `honor`. |
 | `cache_turbo_background_update on` / `off` | `server`, `location` | `on` | The stale-while-revalidate behaviour. **On** (default): a stale page is served *immediately* while one request quietly refreshes it in the background — **nobody waits on the backend**, and if that refresh hits a 5xx/timeout the old copy is left untouched and keeps being served (**stale-if-error**). **Off**: the chosen refresher regenerates inline (it waits for the backend and serves the fresh body), the pre-SWR behaviour. |
+| `cache_turbo_background_update_max N` | `server`, `location` | `0` (unlimited) | Cap concurrent background refresh subrequests per shared zone; `0` leaves the cap unlimited. |
 | `cache_turbo_keep_stale off` \| `<time>` \| `forever` | `server`, `location` | `24h` | Origin-independent last-resort retention. When a cached entry has fully expired and the origin is DOWN, serve the stale copy if the `cache_turbo_keep_stale` window covers the request. Default `24h`: outage resilience out of the box. `off`: no grace window, errors surface normally. `<time>` (e.g. `6h`): serve stale for up to that long, clamped to the module's internal TTL ceiling. `forever`: never give up the stale copy. Argument forms: a bare `0` is also `off` (unlike `cache_turbo_valid 0`, which means cache forever — note this! A bare `0` here is deliberately the OPPOSITE.) **Precedence (decision D-1):** a honored response `stale-if-error` (RFC 5861) **wins outright** over `cache_turbo_keep_stale` — it is not a `max()` of the two. `cache_turbo_cache_control ignore` does **not** disable `cache_turbo_keep_stale`; it makes the *upstream* `Cache-Control` inert, but `keep_stale` is *operator* configuration. A honored `must-revalidate` from the response DOES suppress `keep_stale` — `must-revalidate` forbids any stale serve at all, `stale-if-error` included. |
 | `cache_turbo_use_stale off` \| `error` \| `timeout` \| `http_403` \| `http_404` \| `http_429` \| `http_500` \| `http_502` \| `http_503` \| `http_504` ... | `server`, `location` | every 5xx | Which upstream statuses count as "the origin is down" and so may be answered from a stale cached copy. Multiple tokens may be listed in one directive. The default is every 5xx (including ones no token names, e.g. 501, 505, 507, 508, 510, 511), so omitting the directive keeps the pre-existing behaviour byte-for-byte. ⚠ **Naming any token REPLACES that default rather than extending it** — `cache_turbo_use_stale http_500 http_502 http_503 http_504` reads like the default written out, but it is strictly narrower, because the unnamed 5xx statuses are covered by an internal `ANY_5XX` bit that no token can set. `off` disables serve-on-error entirely and is only accepted on its own — listing it alongside any other token is a config error. This selects the TRIGGER; the retention WINDOW still comes from a response `stale-if-error` or from `cache_turbo_keep_stale`, so a status named here is only served stale while such a window is open. ⚠ **`error` and `timeout` are not nginx-equivalent here.** In `proxy_cache_use_stale` they are communication-failure classes (`error` = the connection failed, as opposed to an upstream that really answered 502). This module triggers in the response header filter, which sees only the final status, so a refused connection and a genuine 502 are indistinguishable at that point: `error` behaves as `http_502` and `timeout` as `http_504`. The tokens exist so the configuration vocabulary matches nginx's, and they carry their own bits so a future trigger site with access to upstream state can honour the distinction without a config break. |
 | `cache_turbo_breaker on` \| `off` | `server`, `location` | `on` | Turn the circuit breaker on for this location, independently of `cache_turbo` itself. The breaker consults `cache_turbo_breaker_threshold`/`cache_turbo_breaker_window` before it can ever trip, and `cache_turbo_breaker_open` for how long an OPEN trip lasts before probing the origin again. Shipped `on` by default for outage resilience. **Three independent ways to express "off"**: this flag, `cache_turbo_breaker_threshold 0`, or `cache_turbo_breaker_window 0` — any one alone disables the breaker. There is no `cache_turbo_breaker_probe` directive: the probe lease is a fixed internal constant, not operator-tunable. ⚠ **Breaker state is PER ZONE**: all locations sharing `cache_turbo_zone` share one breaker. See [Circuit breaker isolation: per-zone, not per-upstream](#circuit-breaker-isolation-per-zone-not-per-upstream) for blast radius and remedy. |
 | `cache_turbo_breaker_threshold N` | `server`, `location` | `5` | Consecutive origin failures (5xx, within the rolling `cache_turbo_breaker_window`) needed to trip the breaker OPEN. `0` disables the breaker — see `cache_turbo_breaker` above for the other two off-switches. |
+| `cache_turbo_breaker_count_retries on\|off` | `server`, `location` | `off` | When enabled, count failed upstream peer attempts that precede the final response toward the per-zone breaker; off preserves final-attempt-only behavior. |
 | `cache_turbo_breaker_window TIME` | `server`, `location` | `10s` | The rolling window failures are counted over. `0` disables the breaker (a threshold with no window is meaningless), same as `cache_turbo_breaker_threshold 0`. |
 | `cache_turbo_breaker_open TIME` | `server`, `location` | `30s` | How long an OPEN breaker lasts before promoting exactly one request to probe the origin. **`0` is a hard config error, not a disable** — `open_for > 0` is what lets an OPEN breaker ever reopen; `0` would wedge it OPEN permanently (no probe promoted, and with no origin contact while OPEN, no success can ever close it either). To disable the breaker use `cache_turbo_breaker off`, `cache_turbo_breaker_threshold 0`, or `cache_turbo_breaker_window 0` instead. |
 | `cache_turbo_breaker_retry_after TIME` | `server`, `location` | `cache_turbo_breaker_open`'s effective value | Advisory `Retry-After` seconds sent with the breaker's `503`. Left unset, it tracks the effective `cache_turbo_breaker_open` so the hint matches the actual next-probe timing; set explicitly to override. |
@@ -2189,7 +2230,8 @@ http {
 | `cache_turbo_normalize_strip NAME...` | `server`, `location` | — | Extra query args to drop from `$cache_turbo_normalized_args` (trailing `*` = prefix; a bare `*` matches every name = drop all), on top of the built-ins. |
 | `cache_turbo_normalize_max_args N` | `server`, `location` | `64` | Cap on how many kept (post-strip) query params `$cache_turbo_normalized_args` will sort. Above the cap normalization is **skipped** and the raw query string is keyed instead — the request is still served and still keys consistently, it just is not order-/junk-normalized. Bounds the O(n²) sort an unauthenticated request can trigger *before* the cache lookup. `0` = unlimited (no cap). |
 | `cache_turbo_normalize_vary TOKEN...` | `server`, `location` | off | Append a variant bucket to `$cache_turbo_normalized_args`: `encoding` (br/gzip/identity) and/or `device` (mobile/desktop). |
-| `cache_turbo_auto_vary on\|off` | `server`, `location` | `on` | Read the response's own `Vary` header and split the cache by the named request header automatically. Safe whitelist: `Accept-Encoding`, `User-Agent` (device class), `Accept-Language` (primary-subtag class), `Origin` (raw — CORS boundary, never folded). `Vary: *`/`Cookie`/`Authorization` — **or any other header not on the whitelist** — ⇒ uncacheable (so an un-split Vary axis can never serve the wrong representation). Two-level, node-local keying. See [Auto-Vary](#auto-vary-read-the-response-vary). |
+| `cache_turbo_auto_vary on\|off` | `server`, `location` | `on` | Read the response's own `Vary` header and split the cache by the named request header automatically. Safe whitelist: `Accept-Encoding`, `User-Agent` (device class), `Accept-Language` (primary-subtag class), `Origin` (raw — CORS boundary, never folded). `Vary: *`/`Cookie`/`Authorization` — **or any other header not on the whitelist** — ⇒ uncacheable (so an un-split Vary axis can never serve the wrong representation). Two-level keying with node-local L1 markers and optional configured L2 marker recovery. See [Auto-Vary](#auto-vary-read-the-response-vary). |
+| `cache_turbo_vary_marker_revalidate TIME` | `server`, `location` | `2s` | Revalidate an auto-Vary marker through L2 at most once per interval; `0` restores unconditional local-marker trust. |
 | `cache_turbo_vary_ignore HEADER...` | `server`, `location` | off (empty) | Drop the named header(s) from a response's `Vary` line **before** `cache_turbo_auto_vary`'s whitelist/unknown-axis check — the ignored token is treated as if the origin never listed it: it does not contribute to the variant key and is **not** promoted into the safe whitelist. Case-insensitive. Only takes effect when `cache_turbo_auto_vary` is also on. **Cache-correctness override, not a free win** — only ignore an axis you have verified does not select a different body for your traffic; see the warning in [Auto-Vary](#cache_turbo_vary_ignore--opt-out-of-one-axiss-refusal). `*`, `Cookie` and `Authorization` are rejected at config time — their veto cannot be disabled this way. |
 
 > **The breaker is per-ZONE state driven by per-LOCATION policy — so its reopen
@@ -2245,8 +2287,9 @@ http {
 >
 > Sharing a zone also cuts the other way, and this direction is the easier one
 > to miss: **healthy traffic from one backend can mask a failure in another.**
-> The trip test is a run of *consecutive* failures inside the rolling
-> `cache_turbo_breaker_window` (default `5` failures over `10s`), and a success
+> The trip test is a run of *consecutive* failures: the count must reach
+> `cache_turbo_breaker_threshold` (default `5`) within the rolling
+> `cache_turbo_breaker_window` (default `10s`), and a success
 > clears the run. When a failing upstream shares a zone with a busy healthy one,
 > the healthy responses are interleaved into the same shared counter and keep
 > resetting it, so the failing backend may never accumulate an unbroken sequence
@@ -2273,7 +2316,7 @@ http {
 | `GET /_cache` | JSON stats. Read-only: legacy `?autotune=1` is ignored on safe methods. |
 | `POST /_cache?action=autotune&value=1` | Force an immediate autotune recompute, then return the same JSON stats body a `GET /_cache` would. |
 | `GET /_cache?format=prometheus` | Same stats in Prometheus text format — scrape this. |
-| `POST /_cache?all=1` | Purge the whole zone (and the L2 keyspace, if Redis is on). The L2 side is a `SCAN MATCH <prefix>*` walk; if that walk does **not** finish — read timeout, malformed reply, or the internal page cap — the response is `500` with `{"purged":N,"l2":"incomplete","reason":"…"}` and part of L2 still holds entries. If the walk cannot even start — L2 unreachable, connect refused — the response is `500` with `{"purged":N,"l2":"unavailable"}` and L2 is untouched. A `200` means the walk reached the end of the keyspace. |
+| `POST /_cache?all=1` | Purge the whole zone (and the L2 keyspace, if Redis is on). L1 walks a finite snapshot-sized budget so concurrent refill cannot starve the worker; if entries remain after that budget, the response is `500` with `{"purged":N,"l1":"incomplete"}` (retry the purge). A configured L2 purge still runs after this L1 outcome. The L2 side is a `SCAN MATCH <prefix>*` walk; if that walk does **not** finish — read timeout, malformed reply, or the internal page cap — the response is `500` with `{"purged":N,"l2":"incomplete","reason":"…"}` and part of L2 still holds entries. If the walk cannot even start — L2 unreachable, connect refused — the response is `500` with `{"purged":N,"l2":"unavailable"}` and L2 is untouched. When both tiers are incomplete, the same object contains both `"l1":"incomplete"` and the applicable `"l2"`/`"reason"` fields. A `200` means L1 was empty at its final lock-held observation and, when Redis is configured, the L2 walk reached the end of the keyspace. |
 | `POST /_cache?key=<string>` | Purge one entry. `<string>` is hashed **verbatim**, so it must equal the entry's full cache-key value — for the built-in default key that is `<host><uri><raw-query-string>` (e.g. `example.com/blog/post-42?id=1`), **not** just the path. Use a `PURGE` request to that URL (above) if you don't want to reconstruct the key. Drops L1 + L2. |
 | `POST /_cache?tag=<name>` | Purge every page tagged `<name>` across L1 + L2. |
 | `POST /_cache?url=<path[,path,...]>` | Warm those paths (background prefetch). Each warm subrequest fetches **anonymously** — the admin request's `Cookie` header is stripped, so the entry is stored under the cookieless anonymous key a visitor looks up (and no per-visitor/segment body is pulled from the origin), even if you trigger the warm from a logged-in browser. Fires at most `cache_turbo_warm_max` subrequests (default `32`) regardless of list length. |

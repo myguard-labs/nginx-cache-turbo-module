@@ -53,6 +53,13 @@
 #pragma GCC visibility push(hidden)
 
 
+typedef struct {
+    u_char  marker[32];
+    u_char  variant_index[1 + 64];
+    size_t  variant_index_len;
+} ngx_http_cache_turbo_purge_vary_keys_t;
+
+
 /* COR-5 helper: invalidate every auto-Vary variant of the base URI just
  * purged. Variants are stored under variant keys (base material + the
  * folded axis values), not the base key, so the base purge in the caller
@@ -72,9 +79,8 @@
 static ngx_int_t
 ngx_http_cache_turbo_purge_auto_vary(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_zone_t *z,
-    ngx_http_cache_turbo_ctx_t *ctx, ngx_uint_t *purged)
+    ngx_http_cache_turbo_purge_vary_keys_t *keys, ngx_uint_t *purged)
 {
-    u_char                        mk[32];
     ngx_int_t                     bits = 0;
     ngx_uint_t                    mgen = 0;
     ngx_uint_t                    next_gen;
@@ -82,9 +88,9 @@ ngx_http_cache_turbo_purge_auto_vary(ngx_http_request_t *r,
     ngx_uint_t                    have_marker = 0;
     ngx_http_cache_turbo_node_t  *m;
 
-    ngx_http_cache_turbo_marker_hash(&ctx->cache_key, mk);
     ngx_shmtx_lock(ngx_http_cache_turbo_zone_mutex(z));
-    m = clcf->l1->lookup(z, mk, ngx_crc32_short(mk, 32));
+    m = clcf->l1->lookup(z, keys->marker,
+                         ngx_crc32_short(keys->marker, 32));
     if (m != NULL && m->data != NULL
         && m->len >= NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE + 1)
     {
@@ -103,12 +109,11 @@ ngx_http_cache_turbo_purge_auto_vary(ngx_http_request_t *r,
     ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
 
     if (clcf->backend && clcf->backend->purge_tag) {
-        u_char                            vname[1 + 64];
-        size_t                            vlen;
         ngx_http_cache_turbo_tagpurge_t  *tp;
         ngx_int_t                         prc;
 
-        (void) clcf->l1->purge_key(z, mk, ngx_crc32_short(mk, 32));
+        (void) clcf->l1->purge_key(z, keys->marker,
+                                   ngx_crc32_short(keys->marker, 32));
 
         /* P3-5 (codex-review MINOR): the marker write-through means an L2
          * copy of THIS base's marker can now exist independently of the L1
@@ -121,7 +126,7 @@ ngx_http_cache_turbo_purge_auto_vary(ngx_http_request_t *r,
          * miss through to origin, not misresolve). Fire-and-forget, same as
          * every other write-through/delete on this path. */
         if (clcf->backend->del) {
-            clcf->backend->del(clcf, mk);
+            clcf->backend->del(clcf, keys->marker);
         }
 
         tp = ngx_pcalloc(r->pool, sizeof(*tp));
@@ -131,8 +136,6 @@ ngx_http_cache_turbo_purge_auto_vary(ngx_http_request_t *r,
             return NGX_OK;
         }
 
-        vlen = ngx_http_cache_turbo_variant_index_name(&ctx->cache_key,
-                                                        vname);
         tp->clcf = clcf;
         tp->zone = z;
         tp->is_auto_vary = 1;
@@ -169,14 +172,16 @@ ngx_http_cache_turbo_purge_auto_vary(ngx_http_request_t *r,
             (ngx_uint_t) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->varidx_inflight, 0)
             + (ngx_uint_t) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->varidx_drops, 0)
             - (ngx_uint_t) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->varidx_reissues, 0);
-        tp->tag.data = ngx_pnalloc(r->pool, vlen);
+        tp->tag.data = ngx_pnalloc(r->pool, keys->variant_index_len);
         if (tp->tag.data == NULL) {
             return NGX_OK;
         }
 
-        ngx_memcpy(tp->tag.data, vname, vlen);
-        tp->tag.len = vlen;
-        prc = clcf->backend->purge_tag(r, clcf, vname, vlen,
+        ngx_memcpy(tp->tag.data, keys->variant_index,
+                   keys->variant_index_len);
+        tp->tag.len = keys->variant_index_len;
+        prc = clcf->backend->purge_tag(r, clcf, keys->variant_index,
+                  keys->variant_index_len,
                   ngx_http_cache_turbo_tag_purge_complete, tp);
         if (prc != NGX_DONE) {
             /* could not launch (L2 down): fall through to the sync
@@ -243,10 +248,20 @@ ngx_http_cache_turbo_purge_auto_vary(ngx_http_request_t *r,
     if (next_gen == 0) {
         next_gen = 1;
     }
-    ngx_http_cache_turbo_marker_store(r, clcf, z, &ctx->cache_key, bits,
-                                      next_gen, mttl,
-                                      ngx_http_cache_turbo_stale_ttl(mttl,
-                                          clcf->stale_mult));
+    if (ngx_http_cache_turbo_marker_store_key(r, clcf, z, keys->marker, bits,
+                                              next_gen, mttl,
+                                              ngx_http_cache_turbo_stale_ttl(
+                                                  mttl, clcf->stale_mult))
+        != NGX_OK)
+    {
+        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                      "cache_turbo: PURGE partially completed for \"%V\": "
+                      "the base object was deleted but the auto-vary "
+                      "generation marker update failed; old-generation "
+                      "variants may remain resolvable",
+                      &r->uri);
+        return NGX_ERROR;
+    }
     (*purged)++;
 
     return NGX_OK;
@@ -261,13 +276,14 @@ ngx_int_t
 ngx_http_cache_turbo_purge_request(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf)
 {
-    uint32_t                      hash;
-    ngx_int_t                     drc;
-    ngx_uint_t                    purged;
-    ngx_str_t                     body;
-    u_char                       *p;
-    ngx_http_cache_turbo_ctx_t   *ctx;
-    ngx_http_cache_turbo_zone_t  *z;
+    uint32_t                                  hash;
+    ngx_int_t                                 drc;
+    ngx_uint_t                                purged;
+    ngx_str_t                                 body;
+    u_char                                   *p;
+    ngx_http_cache_turbo_ctx_t               *ctx;
+    ngx_http_cache_turbo_purge_vary_keys_t    vary_keys;
+    ngx_http_cache_turbo_zone_t              *z;
 
     drc = ngx_http_discard_request_body(r);
     if (drc != NGX_OK) {
@@ -280,6 +296,26 @@ ngx_http_cache_turbo_purge_request(ngx_http_request_t *r,
     }
     if (ngx_http_cache_turbo_build_key(r, clcf, ctx) != NGX_OK) {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    /* Digest-derived purge keys are a transaction precondition. Derive every
+     * key the auto-Vary path can need before deleting the base, marker, or L2
+     * object; an EVP failure must leave the cache completely untouched. */
+    if (clcf->auto_vary) {
+        if (ngx_http_cache_turbo_marker_hash(&ctx->cache_key,
+                                             vary_keys.marker) != NGX_OK)
+        {
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+
+        vary_keys.variant_index_len = 0;
+        if (clcf->backend && clcf->backend->purge_tag
+            && ngx_http_cache_turbo_variant_index_name(
+                   &ctx->cache_key, vary_keys.variant_index,
+                   &vary_keys.variant_index_len) != NGX_OK)
+        {
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
     }
 
     z = clcf->shm_zone->data;
@@ -300,11 +336,17 @@ ngx_http_cache_turbo_purge_request(ngx_http_request_t *r,
      * variant; see ngx_http_cache_turbo_purge_auto_vary() for the L2
      * strategy split. NGX_DONE means it parked the async completion, which
      * already sent the reply and finalized the request. */
-    if (clcf->auto_vary
-        && ngx_http_cache_turbo_purge_auto_vary(r, clcf, z, ctx, &purged)
-               == NGX_DONE)
-    {
-        return NGX_DONE;
+    if (clcf->auto_vary) {
+        ngx_int_t  rc;
+
+        rc = ngx_http_cache_turbo_purge_auto_vary(r, clcf, z, &vary_keys,
+                                                   &purged);
+        if (rc == NGX_DONE) {
+            return NGX_DONE;
+        }
+        if (rc != NGX_OK) {
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
     }
 
     p = ngx_pnalloc(r->pool, sizeof("{\"purged\":4294967295}\n"));

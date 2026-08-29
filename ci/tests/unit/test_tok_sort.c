@@ -91,6 +91,56 @@ ref_ngx_sort(void *base, size_t n, size_t size,
 
 static int checks;
 static int failures;
+static int alloc_fail_after = -1;
+static int outstanding_allocs;
+static int expected_alloc_failure;
+static int allocation_attempts;
+static int injected_alloc_failures;
+
+static void *
+test_malloc(size_t size)
+{
+    void *p;
+
+    allocation_attempts++;
+    if (alloc_fail_after == 0) {
+        injected_alloc_failures++;
+        return NULL;
+    }
+    if (alloc_fail_after > 0) {
+        alloc_fail_after--;
+    }
+    p = malloc(size);
+    if (p != NULL) {
+        outstanding_allocs++;
+    }
+    return p;
+}
+
+static void
+check_fault_injection(const char *what, int expected_attempts)
+{
+    checks++;
+    if (allocation_attempts != expected_attempts
+        || injected_alloc_failures != 1)
+    {
+        failures++;
+        fprintf(stderr,
+                "✗ %s: expected %d allocation attempts and one injected "
+                "failure, got %d attempts/%d failures\n",
+                what, expected_attempts, allocation_attempts,
+                injected_alloc_failures);
+    }
+}
+
+static void
+test_free(void *p)
+{
+    if (p != NULL) {
+        outstanding_allocs--;
+        free(p);
+    }
+}
 
 static void
 check_identical(const char *what, ngx_str_t *got, ngx_str_t *want, ngx_uint_t n)
@@ -123,8 +173,34 @@ check_identical(const char *what, ngx_str_t *got, ngx_str_t *want, ngx_uint_t n)
 static void
 both(const char *what, ngx_str_t *in, ngx_uint_t n)
 {
-    ngx_str_t  *a = malloc(n * sizeof(ngx_str_t) + 1);
-    ngx_str_t  *b = malloc(n * sizeof(ngx_str_t) + 1);
+    ngx_str_t  *a = test_malloc(n * sizeof(ngx_str_t) + 1);
+    ngx_str_t  *b;
+
+    if (a == NULL) {
+        if (expected_alloc_failure) {
+            fprintf(stderr, "✓ %s: first comparison allocation handled\n",
+                    what);
+        } else {
+            failures++;
+            fprintf(stderr, "✗ %s: unexpected first comparison allocation "
+                    "failure\n", what);
+        }
+        return;
+    }
+
+    b = test_malloc(n * sizeof(ngx_str_t) + 1);
+    if (b == NULL) {
+        if (expected_alloc_failure) {
+            fprintf(stderr, "✓ %s: second comparison allocation handled\n",
+                    what);
+        } else {
+            failures++;
+            fprintf(stderr, "✗ %s: unexpected second comparison allocation "
+                    "failure\n", what);
+        }
+        test_free(a);
+        return;
+    }
 
     memcpy(a, in, n * sizeof(ngx_str_t));
     memcpy(b, in, n * sizeof(ngx_str_t));
@@ -134,8 +210,35 @@ both(const char *what, ngx_str_t *in, ngx_uint_t n)
 
     check_identical(what, a, b, n);
 
-    free(a);
-    free(b);
+    test_free(a);
+    test_free(b);
+}
+
+static void
+allocation_fault_checks(ngx_str_t *in)
+{
+    allocation_attempts = 0;
+    injected_alloc_failures = 0;
+    alloc_fail_after = 0;
+    expected_alloc_failure = 1;
+    both("first allocation fault", in, 1);
+    check_fault_injection("first allocation fault", 1);
+    if (outstanding_allocs != 0) {
+        failures++;
+        fprintf(stderr, "✗ first allocation fault leaked comparison storage\n");
+    }
+
+    allocation_attempts = 0;
+    injected_alloc_failures = 0;
+    alloc_fail_after = 1;
+    both("second allocation fault", in, 1);
+    check_fault_injection("second allocation fault", 2);
+    if (outstanding_allocs != 0) {
+        failures++;
+        fprintf(stderr, "✗ second allocation fault leaked comparison storage\n");
+    }
+    alloc_fail_after = -1;
+    expected_alloc_failure = 0;
 }
 
 /* Deterministic PRNG so a failure is reproducible from the printed seed. */
@@ -160,6 +263,7 @@ main(void)
     {
         ngx_str_t  one[1] = { { 3, (u_char *) "a=1" } };
 
+        allocation_fault_checks(one);
         both("n=0", one, 0);
         both("n=1", one, 1);
     }
