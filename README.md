@@ -2070,11 +2070,14 @@ http {
 
             # ── what is "the same page" ─────────────────────────────────
             cache_turbo_key               $host$uri$cache_turbo_normalized_args;  # the default
+            cache_turbo_key_encoded_origin off;  # require explicit encoded-origin opt-in
             cache_turbo_normalize_strip   sid sessionid "tmp_*";   # extra args to drop (trailing * = prefix; bare * = all)
+            cache_turbo_normalize_max_args 64;        # cap sorted query args
             cache_turbo_normalize_vary    encoding device;        # add variant buckets to the key
 
             # ── freshness / staleness ───────────────────────────────────
             cache_turbo_preset            balanced;  # micro|conservative|balanced|aggressive — sets the 5 knobs below
+            cache_turbo_stale_mult         4;         # stale window multiplier (balanced)
             cache_turbo_valid             60s;       # 200 TTL; 0 = cache forever
             cache_turbo_valid             301 302 308 1h;   # repeatable: cache redirects
             cache_turbo_valid             404 410 1m;       #            negative caching
@@ -2082,7 +2085,9 @@ http {
             cache_turbo_lock_ttl          5s;        # single-flight refresh window
             cache_turbo_cache_control     respect;   # respect | honor (take TTL from response CC/Expires) | ignore (discard response CC)
             cache_turbo_background_update on;        # SWR + stale-if-error (off = inline regen)
+            cache_turbo_background_update_max 0;      # unlimited concurrent background refreshes
             cache_turbo_keep_stale        off;       # off | <time> | forever — serve stale when origin is down
+            cache_turbo_l2_negative_ttl   0;         # disabled
           # cache_turbo_use_stale       http_404 http_429;  # which statuses count as "down". Omitted = the default, ANY 5xx.
                                                            # ⚠ naming tokens REPLACES the default, it does not add to it:
                                                            # listing the four 5xx tokens drops 501/505/507/... coverage.
@@ -2092,18 +2097,28 @@ http {
             cache_turbo_lock              on;        # cold-miss single-flight (others wait for the fill)
             cache_turbo_lock_timeout      5s;        # how long a waiter waits before going to origin itself
             cache_turbo_min_uses          1;         # cache only after the key is seen N times (1 = first miss)
+            cache_turbo_min_uses_window   0;         # no counter expiry window
+            cache_turbo_scan_resistant     on;       # protected_pct=80 by default
+            cache_turbo_warm_max           32;       # max URLs per warm request
 
             # ── per-request opt-outs ────────────────────────────────────
             cache_turbo_bypass            $cookie_session;  # skip lookup, still store
             cache_turbo_no_store          $cookie_session;  # ...so pair it, see below
             # NOT $arg_nocache -- a client-supplied bypass trigger is a DoS lever
             cache_turbo_no_store          $cookie_session;              # don't store the response
+            cache_turbo_bypass_uri         /wp-admin/; # optional URI bypass
+            cache_turbo_bypass_stale_uri   /catalog/;  # optional breaker fallback
+            cache_turbo_backend_prefix     /shop/;     # optional mounted-app prefix
+            cache_turbo_key_cookie         locale;     # optional variant cookie
+            cache_turbo_ignore_set_cookie  _ga;        # optional safe cookie ignore
 
             # ── let the origin decide (inverts the store default here) ──
             cache_turbo_require_header    X-GraphQL-Cacheable;          # store ONLY if origin affirms
 
             # ── Vary handling ───────────────────────────────────────────
             cache_turbo_auto_vary         on;        # off = ignore response Vary (old Vary-blind behavior)
+            cache_turbo_vary_ignore       X-Device;  # optional Vary axis ignore
+            cache_turbo_vary_marker_revalidate 2s;    # L2 marker revalidation interval
 
             # ── tags: local purge-by-tag (Redis) + downstream CDN sync ──
             cache_turbo_tag               $upstream_http_x_cache_tags;  # purge-by-tag index needs cache_turbo_redis
@@ -2114,6 +2129,14 @@ http {
 
             # ── stacking with native proxy_cache ────────────────────────
             cache_turbo_suppress_native   off;       # on = drive $cache_turbo_active for proxy_no_cache
+            cache_turbo_serve_authorized  off;       # do not read shared entries with Authorization
+            cache_turbo_store_head        off;       # HEAD_DERIVED population is opt-in
+            cache_turbo_breaker_count_retries off;   # count only the final upstream attempt
+            cache_turbo_breaker           on;        # outage breaker enabled
+            cache_turbo_breaker_threshold 5;         # failures to trip
+            cache_turbo_breaker_window    10s;       # rolling failure window
+            cache_turbo_breaker_open      30s;       # open duration
+            cache_turbo_breaker_retry_after 30s;     # advisory retry hint
 
             proxy_pass http://127.0.0.1:8080;
         }
