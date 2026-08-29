@@ -2818,8 +2818,8 @@ typedef struct {
      * (the old path did that 5x per hit). data == NULL means the header is absent.
      * req_cc_resolved guards against double-resolve. nginx does NOT pre-parse a
      * request Cache-Control field (unlike cookies), so this fold is the win.
-     * Boolean directives are merged across every Cache-Control field-line;
-     * req_cc retains the first line for the numeric freshness parser. */
+     * Boolean and numeric directives are merged across every Cache-Control
+     * field-line; req_cc retains the first line for compatibility/debugging. */
     ngx_str_t                req_cc;
     ngx_str_t                req_pragma;
     unsigned                 req_cc_resolved:1;

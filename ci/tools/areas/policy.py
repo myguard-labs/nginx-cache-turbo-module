@@ -2044,6 +2044,42 @@ def test_request_cache_control_multifield_restrictive(
             f"headers={next_headers}, hits={before}->{origin.hits}")
 
 
+def test_cache_control_delta_grammar(ng: Nginx, origin: Origin) -> None:
+    """CACHE-CONTROL-DELTA-GRAMMAR: quoted delta-seconds are accepted, while a
+    digit prefix followed by junk is rejected rather than treated as the
+    prefix. Numeric bounds on repeated field-lines combine restrictively in
+    either order."""
+    for label, value, revalidates in (
+            ("quoted", 'max-age="0"', True),
+            ("junk", "max-age=0junk", False)):
+        key = f"/cond/delta-{label}"
+        fetch_raw(ng.port, key)                                   # prime
+        before = origin.hits
+        status, _, headers = fetch_raw(
+            ng.port, key, headers={"Cache-Control": value})
+        assert status == 200
+        assert (origin.hits == before + 1) == revalidates, (
+            f"{value!r} revalidation={origin.hits > before}, "
+            f"expected {revalidates}: headers={headers}")
+        assert ("x-cache" not in headers) == revalidates, (
+            f"{value!r} cache verdict disagrees with grammar: {headers}")
+
+    for order in ("restrictive-last", "restrictive-first"):
+        key = f"/cond/delta-split-{order}"
+        fetch_raw(ng.port, key)                                   # prime
+        lines = [("Cache-Control", "max-age=600"),
+                 ("Cache-Control", "max-age=0")]
+        if order == "restrictive-first":
+            lines.reverse()
+        before = origin.hits
+        status, _, headers = fetch_dup(ng.port, key, lines)
+        assert status == 200 and "x-cache" not in headers \
+            and origin.hits == before + 1, (
+                f"the tightest max-age across field-lines must win ({order}): "
+                f"status={status}, headers={headers}, "
+                f"hits={before}->{origin.hits}")
+
+
 def test_rfc1_request_max_age_zero_revalidates(ng: Nginx, origin: Origin) -> None:
     """RFC-1 (§5.2.1.1): a request max-age=0 (browser force-refresh) forces a
     revalidation — the cached entry is bypassed to the origin and refreshed."""

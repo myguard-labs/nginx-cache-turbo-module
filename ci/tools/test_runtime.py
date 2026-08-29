@@ -242,6 +242,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_rfc1_only_if_cached_hit(ng, origin)
     test_rfc1_request_no_store(ng, origin)
     test_request_cache_control_multifield_restrictive(ng, origin)
+    test_cache_control_delta_grammar(ng, origin)
     test_rfc1_request_max_age_zero_revalidates(ng, origin)
     test_rfc1_request_max_age_n(ng, origin)
     test_rfc1_request_min_fresh(ng, origin)

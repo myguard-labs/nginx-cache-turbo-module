@@ -26,6 +26,14 @@ fi
 "$CC" $CFLAGS "$DIR/test_math.c" -o "$DIR/test_math"
 "$DIR/test_math"
 
+# --- Cache-Control delta-seconds exact grammar ----------------------------
+# Exercise the REAL request/response parser: quoted and bare forms, the signed
+# boundary, saturating overflow, and malformed values that must be rejected.
+bash "$DIR/extract_cc_delta.sh"
+# shellcheck disable=SC2086
+"$CC" $CFLAGS "$DIR/test_cc_delta.c" -o "$DIR/test_cc_delta"
+"$DIR/test_cc_delta"
+
 # --- auto-Vary purge generation wrap (AUD-GEN1) ----------------------------
 # Pure-math mirror of marker_store/variant_hash's gen write/truncate/fold --
 # see the header comment in test_vary_gen.c for why a mirror, not a #include.
