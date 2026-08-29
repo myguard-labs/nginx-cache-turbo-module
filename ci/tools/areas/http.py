@@ -330,6 +330,87 @@ def test_request_cc_serve_verdict_stale(ng: Nginx, origin: Origin) -> None:
     drain_origin(origin)
 
 
+def test_request_cache_control_same_line_and_quotes(
+        ng: Nginx, origin: Origin) -> None:
+    """REQUEST-CACHE-CONTROL-SAME-LINE: combined Cache-Control values merge
+    repeated request bounds restrictively, without treating commas or
+    directive-looking text inside quoted extension values as separators."""
+    for directive, loose, tight in (
+            ("max-age", "600", "0"),
+            ("min-fresh", "5", "999")):
+        for order in ("restrictive-last", "restrictive-first"):
+            path = f"/reqcc/same-{directive}-{order}"
+            origin_path = f"/same-{directive}-{order}"
+            fetch(ng.port, path)
+            if directive == "max-age":
+                time.sleep(1.1)
+            bounds = [f"{directive}={loose}", f"{directive}={tight}"]
+            if order == "restrictive-first":
+                bounds.reverse()
+            before = origin.hits_for(origin_path)
+            _, _, headers = fetch(
+                ng.port, path,
+                headers={"Cache-Control": ", ".join(bounds)})
+            assert headers.get("x-ct-status") != "HIT", (
+                f"tightest same-line {directive} must win ({order}), got "
+                f"{headers.get('x-ct-status')}")
+            assert origin.hits_for(origin_path) == before + 1, (
+                f"restrictive same-line {directive} must reach origin "
+                f"({order})")
+
+    for label, value in (
+            ("quoted", 'ext="inert, max-age=0, tail"'),
+            ("unbalanced", 'ext="inert, max-age=0, tail')):
+        path = f"/reqcc/quote-{label}"
+        origin_path = f"/quote-{label}"
+        fetch(ng.port, path)
+        before = origin.hits_for(origin_path)
+        _, _, headers = fetch(
+            ng.port, path, headers={"Cache-Control": value})
+        assert headers.get("x-ct-status") == "HIT", (
+            f"{label} extension text must not activate max-age=0: {headers}")
+        assert origin.hits_for(origin_path) == before, (
+            f"{label} extension text must not reach origin")
+
+    # A real directive after a balanced quoted value remains visible.
+    fetch(ng.port, "/reqcc/quote-followed")
+    before = origin.hits_for("/quote-followed")
+    _, _, followed = fetch(
+        ng.port, "/reqcc/quote-followed",
+        headers={"Cache-Control": 'ext="a,b", max-age=0'})
+    assert followed.get("x-ct-status") != "HIT", (
+        f"max-age=0 after a balanced quote must stay active: {followed}")
+    assert origin.hits_for("/quote-followed") == before + 1, (
+        "max-age=0 after a balanced quote must reach origin")
+
+    stale_cases = []
+    for family, directives in (
+            ("numeric", ("max-stale=100", "max-stale=0")),
+            ("bare", ("max-stale", "max-stale=0"))):
+        for order in ("restrictive-last", "restrictive-first"):
+            path = f"/reqccst/same-{family}-{order}"
+            origin_path = f"/same-{family}-{order}"
+            ordered = list(directives)
+            if order == "restrictive-first":
+                ordered.reverse()
+            fetch(ng.port, path)
+            stale_cases.append((path, origin_path, family, order, ordered))
+
+    time.sleep(2.3)
+    for path, origin_path, family, order, values in stale_cases:
+        before = origin.hits_for(origin_path)
+        _, _, headers = fetch(
+            ng.port, path,
+            headers={"Cache-Control": ", ".join(values)})
+        assert headers.get("x-ct-status") != "STALE", (
+            f"same-line {family} max-stale=0 must win ({order}), got "
+            f"{headers.get('x-ct-status')}")
+        assert origin.hits_for(origin_path) == before + 1, (
+            f"restrictive same-line {family} max-stale must revalidate "
+            f"({order})")
+    drain_origin(origin)
+
+
 def test_cc_mode_inheritance_child_preset_overrides_parent_ignore(
         ng: Nginx, origin: Origin) -> None:
     """cc_mode (cache_turbo_cache_control) merge precedence: a child with a CMS

@@ -13,6 +13,9 @@ Changes with the nginx-cache-turbo-module (unreleased)
        such as max-stale=abc or max-stale=, was treated as the valid bare form
        and granted unlimited stale tolerance. Invalid valued forms now grant no
        stale tolerance; bare max-stale and valid numeric bounds are unchanged.
+       Repeated request bounds in one combined field now merge restrictively,
+       matching split field-lines, while commas and directive-looking text in
+       quoted extension values remain inert.
 
     *) Feature: the admin JSON endpoint now reports "lock_ttl", the effective
        single-flight lock TTL in seconds for the admin location -- after

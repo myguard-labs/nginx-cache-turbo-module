@@ -27,8 +27,9 @@ fi
 "$DIR/test_math"
 
 # --- Cache-Control delta-seconds exact grammar ----------------------------
-# Exercise the REAL request/response parser: quoted and bare forms, the signed
-# boundary, saturating overflow, and malformed values that must be rejected.
+# Exercise the REAL request/response parser: quote-aware token iteration,
+# quoted and bare deltas, the signed boundary, saturating overflow, and
+# malformed values that must be rejected.
 bash "$DIR/extract_cc_delta.sh"
 # shellcheck disable=SC2086
 "$CC" $CFLAGS "$DIR/test_cc_delta.c" -o "$DIR/test_cc_delta"

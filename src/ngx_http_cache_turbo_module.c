@@ -1164,32 +1164,52 @@ ngx_http_cache_turbo_status_ttl(ngx_http_cache_turbo_loc_conf_t *clcf,
 
 
 /*
- * Locate a Cache-Control directive by FULL-TOKEN match in a comma-separated
- * value [v,last). Each token is "<name>" or "<name>=<value>" with optional
- * surrounding LWS. Returns a pointer to the value (after '=') with *vlen set
- * when the directive is present with a value, the token start with *vlen == 0
- * when present bare, or NULL when absent. When `valued` is non-NULL, it
- * distinguishes a bare directive from an empty valued one. A full-token match
- * (not a substring) is what keeps `s-maxage` from matching inside `max-age`
- * parsing and `max-age=0` from matching inside `max-age=01000` (see the codex
- * follow-ups).
+ * Locate the next Cache-Control directive matching `name` in [*cursor,last),
+ * advancing *cursor past the inspected token. A comma separates tokens only
+ * outside a quoted-string; quoted-pairs escape the following byte. An
+ * unbalanced quote therefore consumes the rest of the field instead of
+ * activating directive-looking fragments inside malformed quoted text.
+ *
+ * Each token is "<name>" or "<name>=<value>" with optional surrounding LWS.
+ * Returns a pointer to the value (after '=') with *vlen set when the directive
+ * is present with a value, the token start with *vlen == 0 when present bare,
+ * or NULL when absent. When `valued` is non-NULL, it distinguishes a bare
+ * directive from an empty valued one. A full-token match (not a substring) is
+ * what keeps `s-maxage` from matching inside `max-age` parsing.
  */
 static u_char *
-ngx_http_cache_turbo_cc_token(u_char *v, u_char *last, const char *name,
+ngx_http_cache_turbo_cc_token(u_char **cursor, u_char *last, const char *name,
     size_t nlen, size_t *vlen, ngx_int_t *valued)
 {
-    u_char  *s = v, *tok, *e, *eq;
-    size_t   tn;
+    u_char     *s = *cursor, *tok, *e, *eq;
+    size_t      tn;
+    ngx_uint_t  quoted, escaped;
 
     while (s < last) {
         while (s < last && (*s == ' ' || *s == '\t' || *s == ',')) {
             s++;
         }
         tok = s;
-        while (s < last && *s != ',') {
+        quoted = 0;
+        escaped = 0;
+        while (s < last) {
+            if (quoted) {
+                if (escaped) {
+                    escaped = 0;
+                } else if (*s == '\\') {
+                    escaped = 1;
+                } else if (*s == '"') {
+                    quoted = 0;
+                }
+            } else if (*s == '"') {
+                quoted = 1;
+            } else if (*s == ',') {
+                break;
+            }
             s++;
         }
         e = s;                                  /* [tok, e) is one token */
+        *cursor = s < last ? s + 1 : last;
         while (e > tok && (e[-1] == ' ' || e[-1] == '\t')) {
             e--;                                /* right-trim LWS */
         }
@@ -1223,10 +1243,11 @@ static ngx_int_t
 ngx_http_cache_turbo_cc_has(u_char *v, u_char *last, const char *name,
     size_t nlen)
 {
+    u_char  *cursor = v;
     size_t  vlen;
 
-    return ngx_http_cache_turbo_cc_token(v, last, name, nlen, &vlen, NULL)
-           != NULL;
+    return ngx_http_cache_turbo_cc_token(&cursor, last, name, nlen, &vlen,
+                                         NULL) != NULL;
 }
 
 
@@ -1276,10 +1297,10 @@ static time_t
 ngx_http_cache_turbo_cc_delta(u_char *p, u_char *last, const char *name,
     size_t nlen)
 {
-    u_char  *q;
+    u_char  *q, *cursor = p;
     size_t   vlen;
 
-    q = ngx_http_cache_turbo_cc_token(p, last, name, nlen, &vlen, NULL);
+    q = ngx_http_cache_turbo_cc_token(&cursor, last, name, nlen, &vlen, NULL);
     if (q == NULL || vlen == 0) {
         return -1;
     }
@@ -1647,7 +1668,7 @@ ngx_http_cache_turbo_resolve_req_cc(ngx_http_request_t *r,
         {
             u_char  *v = h[i].value.data;
             u_char  *e = v + h[i].value.len;
-            u_char  *q;
+            u_char  *q, *cursor;
             size_t   vlen;
             ngx_int_t valued;
             time_t   d;
@@ -1671,23 +1692,36 @@ ngx_http_cache_turbo_resolve_req_cc(ngx_http_request_t *r,
                 ctx->req_only_if_cached = 1;
             }
 
-            d = ngx_http_cache_turbo_cc_delta(v, e, "max-age",
-                    sizeof("max-age") - 1);
-            if (d >= 0 && (ctx->req_max_age < 0 || d < ctx->req_max_age)) {
-                ctx->req_max_age = d;
-                ctx->has_req_bounds = 1;
+            cursor = v;
+            while ((q = ngx_http_cache_turbo_cc_token(&cursor, e, "max-age",
+                        sizeof("max-age") - 1, &vlen, &valued)) != NULL)
+            {
+                d = valued
+                    ? ngx_http_cache_turbo_cc_parse_delta(q, vlen) : -1;
+                if (d >= 0
+                    && (ctx->req_max_age < 0 || d < ctx->req_max_age))
+                {
+                    ctx->req_max_age = d;
+                    ctx->has_req_bounds = 1;
+                }
             }
 
-            d = ngx_http_cache_turbo_cc_delta(v, e, "min-fresh",
-                    sizeof("min-fresh") - 1);
-            if (d >= 0 && d > ctx->req_min_fresh) {
-                ctx->req_min_fresh = d;
-                ctx->has_req_bounds = 1;
+            cursor = v;
+            while ((q = ngx_http_cache_turbo_cc_token(&cursor, e, "min-fresh",
+                        sizeof("min-fresh") - 1, &vlen, &valued)) != NULL)
+            {
+                d = valued
+                    ? ngx_http_cache_turbo_cc_parse_delta(q, vlen) : -1;
+                if (d >= 0 && d > ctx->req_min_fresh) {
+                    ctx->req_min_fresh = d;
+                    ctx->has_req_bounds = 1;
+                }
             }
 
-            q = ngx_http_cache_turbo_cc_token(v, e, "max-stale",
-                    sizeof("max-stale") - 1, &vlen, &valued);
-            if (q != NULL) {
+            cursor = v;
+            while ((q = ngx_http_cache_turbo_cc_token(&cursor, e, "max-stale",
+                        sizeof("max-stale") - 1, &vlen, &valued)) != NULL)
+            {
                 ctx->req_max_stale_set = 1;
                 ctx->has_req_bounds = 1;
                 if (!valued) {
@@ -1704,9 +1738,9 @@ ngx_http_cache_turbo_resolve_req_cc(ngx_http_request_t *r,
                     ctx->req_max_stale_any = 0;
                 }
                 /* A malformed valued directive grants no stale tolerance.
-                 * Keep any valid bare or numeric directive from another
-                 * field-line; otherwise max_stale_set + the -1 sentinel makes
-                 * req_serve_verdict() fail closed for stale content. */
+                 * Keep any valid bare or numeric directive elsewhere in the
+                 * combined field; otherwise max_stale_set + the -1 sentinel
+                 * makes req_serve_verdict() fail closed for stale content. */
             }
         } else if (ctx->req_pragma.data == NULL
             && h[i].key.len == sizeof("Pragma") - 1

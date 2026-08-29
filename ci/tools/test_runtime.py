@@ -269,6 +269,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_nocache_breaker_open_varying_url_serves_correct_variant(ng, origin)  # S231-NOCACHE-OUTAGE ordering
     test_request_cc_serve_verdict_fresh(ng, origin)
     test_request_cc_serve_verdict_stale(ng, origin)
+    test_request_cache_control_same_line_and_quotes(ng, origin)
     test_cc_mode_inheritance_child_preset_overrides_parent_ignore(ng, origin)
     test_no_store(ng)
     test_native_cache_headers_stripped(ng)
@@ -714,7 +715,8 @@ def main() -> int:
           "RFC-1 request Cache-Control serve verdict (fresh: max-age=0/min-fresh "
           "refuse fresh HIT + revalidate, bare max-stale still serves fresh; "
           "stale: default and bare serve STALE, max-stale=N applies its bound, "
-          "invalid valued max-stale refuses), "
+          "invalid valued max-stale refuses; same-line repeated bounds merge "
+          "restrictively and quoted extension fragments stay inert), "
           "cc_mode inheritance (child preset honor "
           "overrides parent ignore), "
           "native-cache headers stripped, "
