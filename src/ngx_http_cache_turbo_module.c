@@ -4620,18 +4620,13 @@ ngx_http_cache_turbo_send_body(ngx_http_request_t *r, ngx_uint_t status,
 {
     ngx_int_t     rc;
     ngx_buf_t    *b;
-    ngx_chain_t   out;
+    ngx_chain_t  *out;
 
     r->headers_out.status = status;
     r->headers_out.content_type.data = (u_char *) ctype;
     r->headers_out.content_type.len = ctype_len;
     r->headers_out.content_type_len = ctype_len;
     r->headers_out.content_length_n = body->len;
-
-    rc = ngx_http_send_header(r);
-    if (rc == NGX_ERROR || rc > NGX_OK || r->header_only) {
-        return rc;
-    }
 
     b = ngx_create_temp_buf(r->pool, body->len);
     if (b == NULL) {
@@ -4642,9 +4637,20 @@ ngx_http_cache_turbo_send_body(ngx_http_request_t *r, ngx_uint_t status,
     b->last_buf = 1;
     b->last_in_chain = 1;
 
-    out.buf = b;
-    out.next = NULL;
-    return ngx_http_output_filter(r, &out);
+    out = ngx_alloc_chain_link(r->pool);
+    if (out == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    out->buf = b;
+    out->next = NULL;
+
+    rc = ngx_http_send_header(r);
+    if (rc == NGX_ERROR || rc > NGX_OK || r->header_only) {
+        return rc;
+    }
+
+    return ngx_http_output_filter(r, out);
 }
 
 

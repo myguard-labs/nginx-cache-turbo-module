@@ -46,8 +46,26 @@ static ngx_int_t ngx_http_cache_turbo_warm(ngx_http_request_t *r,
     ngx_str_t *urls, ngx_int_t warm_max);
 static ngx_int_t ngx_http_cache_turbo_warm_file(ngx_http_request_t *r,
     ngx_str_t *path, ngx_int_t warm_max);
-static ngx_int_t ngx_http_cache_turbo_warm_read_file(ngx_http_request_t *r,
-    ngx_str_t *path, ngx_str_t *out);
+
+typedef struct {
+    ngx_http_request_t  *r;
+    ngx_file_t          file;
+    ngx_str_t           path;
+    ngx_str_t           list;
+    ngx_uint_t          warm_max;
+    ngx_uint_t          prereq_error;
+    u_char             *nul;
+} ngx_http_cache_turbo_warm_file_ctx_t;
+
+static ngx_int_t ngx_http_cache_turbo_warm_file_start(ngx_http_request_t *r,
+    ngx_str_t *path, ngx_int_t warm_max);
+static ngx_int_t ngx_http_cache_turbo_warm_file_finish(ngx_http_request_t *r,
+    ngx_str_t *list, ngx_int_t warm_max);
+#if (NGX_THREADS)
+static ngx_int_t ngx_http_cache_turbo_warm_file_thread_handler(
+    ngx_thread_task_t *task, ngx_file_t *file);
+static void ngx_http_cache_turbo_warm_file_thread_event(ngx_event_t *ev);
+#endif
 
 /* State carried through an async all-purge (?all=1) from the admin handler to
  * the SCAN-del completion callback. Holds the synchronous L1 count and its
@@ -1056,144 +1074,19 @@ ngx_http_cache_turbo_warm(ngx_http_request_t *r, ngx_str_t *urls,
 }
 
 
-/*
- * Bounded read of the file at *path into a freshly r->pool-allocated buffer
- * in *out. Every failure mode errors cleanly rather than truncating the list
- * silently or allocating unboundedly:
- *   - missing/unopenable file, stat failure, not a regular file -> NGX_ERROR
- *   - file bigger than WARM_FILE_MAX_SIZE                       -> NGX_ERROR
- *   - short read (file changed under us)                        -> NGX_ERROR
- * A file within budget is read in exactly one ngx_read_file() call sized off
- * the stat()'d length, so the allocation is always <= WARM_FILE_MAX_SIZE.
- */
 static ngx_int_t
-ngx_http_cache_turbo_warm_read_file(ngx_http_request_t *r, ngx_str_t *path,
-    ngx_str_t *out)
-{
-    ngx_fd_t         fd;
-    ngx_file_info_t  fi;
-    ngx_file_t        file;
-    ssize_t           n;
-    u_char           *buf, *nul;
-
-    /* ngx_open_file/ngx_file_info both want a NUL-terminated C string; the
-     * arg came out of the query string via ngx_http_arg(), which points into
-     * the request line buffer and is not NUL-terminated there. Copy+NUL it
-     * rather than assume. */
-    nul = ngx_pnalloc(r->pool, path->len + 1);
-    if (nul == NULL) {
-        return NGX_ERROR;
-    }
-    ngx_memcpy(nul, path->data, path->len);
-    nul[path->len] = '\0';
-
-    fd = ngx_open_file(nul, NGX_FILE_RDONLY, NGX_FILE_OPEN, 0);
-    if (fd == NGX_INVALID_FILE) {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
-            "cache_turbo: warm url_file open(\"%s\") failed", nul);
-        return NGX_ERROR;
-    }
-
-    if (ngx_fd_info(fd, &fi) == NGX_FILE_ERROR) {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
-            "cache_turbo: warm url_file stat(\"%s\") failed", nul);
-        ngx_close_file(fd);
-        return NGX_ERROR;
-    }
-
-    if (!ngx_is_file(&fi)) {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-            "cache_turbo: warm url_file \"%s\" is not a regular file", nul);
-        ngx_close_file(fd);
-        return NGX_ERROR;
-    }
-
-    if (ngx_file_size(&fi) < 0
-        || ngx_file_size(&fi) > NGX_HTTP_CACHE_TURBO_WARM_FILE_MAX_SIZE)
-    {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-            "cache_turbo: warm url_file \"%s\" exceeds the %d byte limit",
-            nul, NGX_HTTP_CACHE_TURBO_WARM_FILE_MAX_SIZE);
-        ngx_close_file(fd);
-        return NGX_ERROR;
-    }
-
-    out->len = (size_t) ngx_file_size(&fi);
-
-    if (out->len == 0) {
-        /* An empty file is a legitimate "warm nothing" list, not an error --
-         * but out->data must stay non-NULL: ngx_str_null() would set it to
-         * NULL, and every downstream caller (warm_file's own line-length
-         * scan, then ngx_http_cache_turbo_warm()'s `last = p + urls->len`)
-         * computes `data + len`. `NULL + 0` is undefined behaviour in C: gcc
-         * UBSan passes it, clang UBSan aborts (the exact
-         * feedback-null-plus-zero-ub-splits-by-compiler trap). A 1-byte
-         * pool-allocated placeholder keeps every `data + 0` well-defined
-         * without adding a NULL special case to any caller. */
-        ngx_close_file(fd);
-        out->data = ngx_pnalloc(r->pool, 1);
-        if (out->data == NULL) {
-            return NGX_ERROR;
-        }
-        return NGX_OK;
-    }
-
-    buf = ngx_pnalloc(r->pool, out->len);
-    if (buf == NULL) {
-        ngx_close_file(fd);
-        return NGX_ERROR;
-    }
-
-    ngx_memzero(&file, sizeof(ngx_file_t));
-    file.fd = fd;
-    file.name = *path;
-    file.log = r->connection->log;
-
-    n = ngx_read_file(&file, buf, out->len, 0);
-    ngx_close_file(fd);
-
-    if (n == NGX_ERROR || (size_t) n != out->len) {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
-            "cache_turbo: warm url_file \"%s\" short read", nul);
-        return NGX_ERROR;
-    }
-
-    out->data = buf;
-
-    return NGX_OK;
-}
-
-
-/*
- * POST /_cache?url_file=<path> — list-driven warming (P5-2-p0): reads *path
- * (one URL per line, same "path[?query]" grammar as ?url=) bounded by
- * WARM_FILE_MAX_SIZE/WARM_LINE_MAX_LEN, then hands the buffer to the same
- * ngx_http_cache_turbo_warm() parser/fan-out used by the inline ?url= list,
- * so the warm_max cap and safety checks apply identically. Any read failure
- * (missing file, oversize, short read, not-a-regular-file) is a clean 500
- * with no partial warming and no crash -- never a silent truncation.
- */
-static ngx_int_t
-ngx_http_cache_turbo_warm_file(ngx_http_request_t *r, ngx_str_t *path,
+ngx_http_cache_turbo_warm_file_finish(ngx_http_request_t *r, ngx_str_t *list,
     ngx_int_t warm_max)
 {
-    ngx_str_t   list, body;
+    ngx_str_t   body;
     u_char     *p, *last, *line_start;
-
-    if (ngx_http_cache_turbo_warm_read_file(r, path, &list) != NGX_OK) {
-        ngx_str_set(&body,
-            "{\"error\":\"warm url_file: unreadable, not a regular file, "
-            "or over the size limit\"}\n");
-        return ngx_http_cache_turbo_send_json(r, NGX_HTTP_INTERNAL_SERVER_ERROR,
-                   &body);
-    }
 
     /* Reject any single line (delimited by '\n', or the buffer end for the
      * last/only line) longer than WARM_LINE_MAX_LEN before it ever reaches
      * the warm parser -- a file with no newline at all must not be treated
      * as one giant entry silently; it errors instead of being scanned. */
-    p = list.data;
-    last = list.data + list.len;
+    p = list->data;
+    last = list->data + list->len;
     line_start = p;
     while (p < last) {
         if (*p == '\n') {
@@ -1221,7 +1114,269 @@ ngx_http_cache_turbo_warm_file(ngx_http_request_t *r, ngx_str_t *path,
                    NGX_HTTP_INTERNAL_SERVER_ERROR, &body);
     }
 
-    return ngx_http_cache_turbo_warm(r, &list, warm_max);
+    return ngx_http_cache_turbo_warm(r, list, warm_max);
 }
+
+
+static ngx_int_t
+ngx_http_cache_turbo_warm_file_prereq_error(ngx_http_request_t *r)
+{
+    ngx_str_t  body;
+
+    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+        "cache_turbo: warm url_file requires nginx built with --with-threads "
+        "and an available/default thread pool");
+    ngx_str_set(&body,
+        "{\"error\":\"warm url_file: nginx must be built with --with-threads "
+        "and have an available/default thread pool\"}\n");
+    return ngx_http_cache_turbo_send_json(r, NGX_HTTP_INTERNAL_SERVER_ERROR,
+               &body);
+}
+
+
+static ngx_int_t
+ngx_http_cache_turbo_warm_file_read_error(ngx_http_request_t *r)
+{
+    ngx_str_t  body;
+
+    ngx_str_set(&body,
+        "{\"error\":\"warm url_file: unreadable, not a regular file, "
+        "or over the size limit\"}\n");
+    return ngx_http_cache_turbo_send_json(r, NGX_HTTP_INTERNAL_SERVER_ERROR,
+               &body);
+}
+
+
+static ngx_int_t
+ngx_http_cache_turbo_warm_file_start(ngx_http_request_t *r, ngx_str_t *path,
+    ngx_int_t warm_max)
+{
+    ngx_fd_t         fd;
+    ngx_file_info_t  fi;
+    ssize_t           n;
+    u_char           *buf, *nul;
+    ngx_http_cache_turbo_warm_file_ctx_t  *ctx;
+
+    nul = ngx_pnalloc(r->pool, path->len + 1);
+    if (nul == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+    ngx_memcpy(nul, path->data, path->len);
+    nul[path->len] = '\0';
+
+    fd = ngx_open_file(nul, NGX_FILE_RDONLY, NGX_FILE_OPEN, 0);
+    if (fd == NGX_INVALID_FILE) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
+            "cache_turbo: warm url_file open(\"%s\") failed", nul);
+        return ngx_http_cache_turbo_warm_file_read_error(r);
+    }
+
+    if (ngx_fd_info(fd, &fi) == NGX_FILE_ERROR) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
+            "cache_turbo: warm url_file stat(\"%s\") failed", nul);
+        ngx_close_file(fd);
+        return ngx_http_cache_turbo_warm_file_read_error(r);
+    }
+
+    if (!ngx_is_file(&fi)) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+            "cache_turbo: warm url_file \"%s\" is not a regular file", nul);
+        ngx_close_file(fd);
+        return ngx_http_cache_turbo_warm_file_read_error(r);
+    }
+
+    if (ngx_file_size(&fi) < 0
+        || ngx_file_size(&fi) > NGX_HTTP_CACHE_TURBO_WARM_FILE_MAX_SIZE)
+    {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+            "cache_turbo: warm url_file \"%s\" exceeds the %d byte limit",
+            nul, NGX_HTTP_CACHE_TURBO_WARM_FILE_MAX_SIZE);
+        ngx_close_file(fd);
+        return ngx_http_cache_turbo_warm_file_read_error(r);
+    }
+
+    ctx = ngx_pcalloc(r->pool, sizeof(ngx_http_cache_turbo_warm_file_ctx_t));
+    if (ctx == NULL) {
+        ngx_close_file(fd);
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    ctx->r = r;
+    ctx->warm_max = warm_max;
+    ctx->nul = nul;
+    ctx->path = *path;
+    ctx->list.len = (size_t) ngx_file_size(&fi);
+
+    if (ctx->list.len == 0) {
+        ngx_close_file(fd);
+        ctx->list.data = ngx_pnalloc(r->pool, 1);
+        if (ctx->list.data == NULL) {
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+        return ngx_http_cache_turbo_warm_file_finish(r, &ctx->list, warm_max);
+    }
+
+    buf = ngx_pnalloc(r->pool, ctx->list.len);
+    if (buf == NULL) {
+        ngx_close_file(fd);
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    ngx_memzero(&ctx->file, sizeof(ngx_file_t));
+    ctx->file.fd = fd;
+    ctx->file.name = ctx->path;
+    ctx->file.log = r->connection->log;
+    ctx->list.data = buf;
+
+#if (NGX_THREADS)
+    ctx->file.thread_handler = ngx_http_cache_turbo_warm_file_thread_handler;
+    ctx->file.thread_ctx = ctx;
+
+    n = ngx_thread_read(&ctx->file, buf, ctx->list.len, 0, r->pool);
+    if (n == NGX_AGAIN) {
+        r->main->count++;
+        return NGX_DONE;
+    }
+
+    ngx_close_file(fd);
+
+    if (ctx->prereq_error) {
+        return ngx_http_cache_turbo_warm_file_prereq_error(r);
+    }
+
+    if (n == NGX_ERROR || (size_t) n != ctx->list.len) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
+            "cache_turbo: warm url_file \"%s\" short read", nul);
+        return ngx_http_cache_turbo_warm_file_read_error(r);
+    }
+
+    return ngx_http_cache_turbo_warm_file_finish(r, &ctx->list, warm_max);
+#else
+    ngx_close_file(fd);
+    return ngx_http_cache_turbo_warm_file_prereq_error(r);
+#endif
+}
+
+
+static ngx_int_t
+ngx_http_cache_turbo_warm_file(ngx_http_request_t *r, ngx_str_t *path,
+    ngx_int_t warm_max)
+{
+    return ngx_http_cache_turbo_warm_file_start(r, path, warm_max);
+}
+
+
+#if (NGX_THREADS)
+
+static ngx_int_t
+ngx_http_cache_turbo_warm_file_thread_handler(ngx_thread_task_t *task,
+    ngx_file_t *file)
+{
+    ngx_str_t                  name;
+    ngx_thread_pool_t         *tp;
+    ngx_http_request_t        *r;
+    ngx_http_core_loc_conf_t  *clcf;
+    ngx_http_cache_turbo_warm_file_ctx_t  *ctx;
+
+    ctx = file->thread_ctx;
+    r = ctx->r;
+    clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
+    tp = clcf->thread_pool;
+
+    if (tp == NULL) {
+        if (clcf->thread_pool_value == NULL) {
+            ctx->prereq_error = 1;
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                "cache_turbo: warm url_file requires an available/default "
+                "thread pool");
+            return NGX_ERROR;
+        }
+
+        if (ngx_http_complex_value(r, clcf->thread_pool_value, &name)
+            != NGX_OK)
+        {
+            return NGX_ERROR;
+        }
+
+        tp = ngx_thread_pool_get((ngx_cycle_t *) ngx_cycle, &name);
+
+        if (tp == NULL) {
+            ctx->prereq_error = 1;
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                "cache_turbo: warm url_file requires an available/default "
+                "thread pool; thread pool \"%V\" not found", &name);
+            return NGX_ERROR;
+        }
+    }
+
+    task->event.data = ctx;
+    task->event.handler = ngx_http_cache_turbo_warm_file_thread_event;
+
+    if (ngx_thread_task_post(tp, task) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    ngx_add_timer(&task->event, 60000);
+    r->main->blocked++;
+    r->aio = 1;
+
+    return NGX_OK;
+}
+
+
+static void
+ngx_http_cache_turbo_warm_file_thread_event(ngx_event_t *ev)
+{
+    ngx_int_t                                rc;
+    ngx_connection_t                       *c;
+    ngx_http_request_t                     *r;
+    ngx_http_cache_turbo_warm_file_ctx_t   *ctx;
+    ssize_t                                 n;
+
+    ctx = ev->data;
+    r = ctx->r;
+    c = r->connection;
+
+    ngx_http_set_log_request(c->log, r);
+
+    if (ev->timedout) {
+        ngx_log_error(NGX_LOG_ALERT, c->log, 0,
+            "cache_turbo: warm url_file thread operation took too long");
+        ev->timedout = 0;
+        return;
+    }
+
+    if (ev->timer_set) {
+        ngx_del_timer(ev);
+    }
+
+    r->main->blocked--;
+    r->aio = 0;
+
+    if (r->main->terminated) {
+        ngx_close_file(ctx->file.fd);
+        c->write->handler(c->write);
+        return;
+    }
+
+    n = ngx_thread_read(&ctx->file, ctx->list.data, ctx->list.len, 0, r->pool);
+    ngx_close_file(ctx->file.fd);
+
+    if (ctx->prereq_error) {
+        rc = ngx_http_cache_turbo_warm_file_prereq_error(r);
+    } else if (n == NGX_ERROR || (size_t) n != ctx->list.len) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
+            "cache_turbo: warm url_file \"%s\" short read", ctx->nul);
+        rc = ngx_http_cache_turbo_warm_file_read_error(r);
+    } else {
+        rc = ngx_http_cache_turbo_warm_file_finish(r, &ctx->list,
+                 ctx->warm_max);
+    }
+
+    ngx_http_finalize_request(r, rc);
+    ngx_http_run_posted_requests(c);
+}
+
+#endif
 
 #pragma GCC visibility pop

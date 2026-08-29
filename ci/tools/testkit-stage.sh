@@ -294,6 +294,7 @@ TK_SO=ngx_http_test_ref_module.so
 # scenario bug. Stated here so it is not discovered the hard way.
 CONFIGURE_ARGS=(
     --with-compat
+    --with-threads
     --with-http_ssl_module
     "--with-cc-opt=-DNGX_HTTP_CACHE_TURBO_TEST_FAULTS=1"
     "--add-dynamic-module=$TESTKIT/t/module"

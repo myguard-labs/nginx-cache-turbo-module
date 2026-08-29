@@ -1,5 +1,11 @@
 Changes with the nginx-cache-turbo-module (unreleased)
 
+    *) Bugfix: admin warm `url_file` reads now require nginx `--with-threads`
+       and an available/default thread pool, and the file contents are read via
+       nginx's thread pool instead of a synchronous worker read. Missing thread
+       support or pool setup returns a diagnosable 500 JSON response and logs
+       the missing prerequisite.
+
     *) Compatibility note (since v1.1.0): the shipped circuit-breaker defaults
        are on, 5 failures in 10s, and a 30s open window; the shipped
        keep-stale default is 24h. A dead or flapping origin can therefore

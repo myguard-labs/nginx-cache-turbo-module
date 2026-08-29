@@ -1330,6 +1330,7 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
     return f"""{load}worker_processes {workers};
 pid {root}/nginx.pid;
 error_log {root}/logs/error.log {_errlog_level()};
+thread_pool cache_turbo_warm threads=1 max_queue=64;
 
 events {{ worker_connections 512; }}
 
@@ -4462,6 +4463,7 @@ http {{
         location = /_cache_wc {{
             cache_turbo_admin    warmcapz;
             cache_turbo_warm_max 3;
+            aio threads=cache_turbo_warm;
             allow 127.0.0.1;
             deny all;
         }}
@@ -4469,6 +4471,7 @@ http {{
         # admin endpoint for the "main" zone, localhost-only
         location = /_cache {{
             cache_turbo_admin main;
+            aio threads=cache_turbo_warm;
             allow 127.0.0.1;
             deny all;
         }}
