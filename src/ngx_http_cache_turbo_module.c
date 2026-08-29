@@ -583,7 +583,7 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       offsetof(ngx_http_cache_turbo_loc_conf_t, test_store_fail),
       NULL },
 
-    /* P3-7: force warm_one()'s warm_anonymize() call to fail (posted
+    /* P3-7: force warm_one()'s post-rebuild setup to fail (posted
      * subrequest, ctx already seeded, early NGX_ERROR return) so the
      * bg_inflight leak scenario is testable on demand. */
     { ngx_string("cache_turbo_test_warm_ctx_fail"),
@@ -4588,81 +4588,126 @@ ngx_http_cache_turbo_send_json(ngx_http_request_t *r, ngx_uint_t status,
  */
 
 /*
- * Make a warm subrequest fetch ANONYMOUSLY. ngx_http_subrequest sets
- * sr->headers_in = r->headers_in (a SHALLOW copy), so the warm sr inherits the
- * admin POST's Cookie header. If the operator's browser carried a segment/key
- * cookie (Magento's X-Magento-Vary, Shopware's sw-cache-hash, a configured
- * cache_turbo_key_cookie, ...), that inherited cookie would be wrong on BOTH
- * axes: (a) build_key folds every present preset/configured key cookie into the
- * key, so the warmed body lands under a SEGMENTED key no cookieless visitor ever
- * looks up -- wasted warm; and (b) the proxy forwards the headers_in list to the
- * origin verbatim, so the origin returns that segment's PRIVATE body -- which,
- * once (a) is corrected to the anonymous key, would be stored under the anon key
- * = a cross-visitor leak. Warm as a cookieless anonymous visitor: give the sr a
- * PRIVATE headers list with every Cookie header dropped, and clear the derived
- * cookie fields. The parent request's list and header elements are never mutated
- * (its own key/upstream handling is unaffected).
+ * Rebuild a warm subrequest's inherited headers into private storage.
+ * ngx_http_subrequest() shallow-copies the parent's headers_in, which means an
+ * admin warm would otherwise forward the control request's credentials to the
+ * origin: Authorization, Proxy-Authorization, Cookie, and private deployment
+ * headers are all in the inherited generic list. Dropping only known credential
+ * names is not safe because applications invent new ones.
+ *
+ * Admin warms preserve only Host and User-Agent. Host (including
+ * headers_in.server) keeps the selected virtual host and the default
+ * $host$request_uri cache key stable; User-Agent preserves the existing warm
+ * request identity. Everything else is absent both from the generic list and
+ * from the parsed pointer/scalar fields, so a credential cannot survive through
+ * a second representation.
+ *
+ * SWR and HEAD warms are ordinary representation refreshes, not admin control
+ * requests. They retain their inherited representation/key headers (for
+ * example Accept-Language, Accept-Encoding, and Origin), while continuing to
+ * drop every Cookie header as the old warm_anonymize() contract required.
+ * Validators required by background refresh are added explicitly afterward.
+ * The parent request and its header elements are never mutated.
  */
-static ngx_int_t
-ngx_http_cache_turbo_warm_anonymize(ngx_http_request_t *sr)
+#define NGX_HTTP_CACHE_TURBO_WARM_HEADER_CAP  4
+
+static void
+ngx_http_cache_turbo_warm_rebuild_headers(ngx_http_request_t *sr,
+    ngx_table_elt_t *storage, ngx_uint_t capacity, ngx_flag_t admin)
 {
-    ngx_list_t        shared;
-    ngx_list_part_t  *part;
-    ngx_table_elt_t  *h, *nh;
-    ngx_uint_t        i;
+    ngx_http_headers_in_t  inherited;
+    ngx_list_part_t       *part;
+    ngx_table_elt_t       *allowed[2], *nh;
+    ngx_table_elt_t       *h;
+    ngx_uint_t             i;
 
-    /* Read from a COPY of the inherited (parent-shared) list header, then build
-     * a fresh private list IN PLACE in sr->headers_in.headers. Initialising in
-     * place (not into a local we assign out of) keeps the list's `last` pointer
-     * self-referential: a local ngx_list_t copied into the struct would leave
-     * `last` dangling at the out-of-scope local's embedded first part. The
-     * parent's list data is only read; its elements are never mutated. */
-    shared = sr->headers_in.headers;
+    inherited = sr->headers_in;
 
-    if (ngx_list_init(&sr->headers_in.headers, sr->pool, 8,
-                      sizeof(ngx_table_elt_t)) != NGX_OK)
-    {
-        sr->headers_in.headers = shared;      /* restore on failure */
-        return NGX_ERROR;
+    /* storage was reserved BEFORE ngx_http_subrequest() posted sr. Building
+     * this private list therefore cannot fail after the subrequest becomes
+     * live, and no failure path ever restores an inherited list. */
+    if (admin) {
+        /* Zero the WHOLE parsed-header representation. Clearing only the list
+         * would leave e.g. authorization, proxy_authorization (new nginx),
+         * user/pass (Basic auth), or Cookie's version-specific parsed field
+         * pointing into the admin request. */
+        ngx_memzero(&sr->headers_in, sizeof(ngx_http_headers_in_t));
     }
 
-    part = &shared.part;
-    h = part->elts;
+    sr->headers_in.headers.part.elts = storage;
+    sr->headers_in.headers.part.nelts = 0;
+    sr->headers_in.headers.part.next = NULL;
+    sr->headers_in.headers.last = &sr->headers_in.headers.part;
+    sr->headers_in.headers.size = sizeof(ngx_table_elt_t);
+    sr->headers_in.headers.nalloc = capacity;
+    sr->headers_in.headers.pool = sr->pool;
 
-    for (i = 0; /* void */; i++) {
-        if (i >= part->nelts) {
-            if (part->next == NULL) {
-                break;
+    if (!admin) {
+        part = &inherited.headers.part;
+        h = part->elts;
+
+        for (i = 0; /* void */; i++) {
+            if (i >= part->nelts) {
+                if (part->next == NULL) {
+                    break;
+                }
+                part = part->next;
+                h = part->elts;
+                i = 0;
             }
-            part = part->next;
-            h = part->elts;
-            i = 0;
+
+            if (h[i].key.len == sizeof("Cookie") - 1
+                && ngx_strncasecmp(h[i].key.data, (u_char *) "Cookie",
+                                   sizeof("Cookie") - 1) == 0)
+            {
+                continue;
+            }
+
+            nh = &storage[sr->headers_in.headers.part.nelts++];
+            *nh = h[i];
         }
 
-        /* Drop every Cookie header; copy every other elt BY VALUE into the
-         * private list (the parent's list/elts stay untouched). */
-        if (h[i].key.len == sizeof("Cookie") - 1
-            && ngx_strncasecmp(h[i].key.data, (u_char *) "Cookie",
-                               sizeof("Cookie") - 1) == 0)
-        {
+#if (nginx_version >= 1023000)
+        sr->headers_in.cookie = NULL;
+#else
+        sr->headers_in.cookies.nelts = 0;
+#endif
+
+        return;
+    }
+
+    allowed[0] = inherited.host;
+    allowed[1] = inherited.user_agent;
+
+    sr->headers_in.server = inherited.server;
+    sr->headers_in.content_length_n = -1;
+    sr->headers_in.keep_alive_n = -1;
+    sr->headers_in.msie = inherited.msie;
+    sr->headers_in.msie6 = inherited.msie6;
+    sr->headers_in.opera = inherited.opera;
+    sr->headers_in.gecko = inherited.gecko;
+    sr->headers_in.chrome = inherited.chrome;
+    sr->headers_in.safari = inherited.safari;
+    sr->headers_in.konqueror = inherited.konqueror;
+
+    for (i = 0; i < 2; i++) {
+        if (allowed[i] == NULL) {
             continue;
         }
 
-        nh = ngx_list_push(&sr->headers_in.headers);
-        if (nh == NULL) {
-            sr->headers_in.headers = shared;  /* restore on failure */
-            return NGX_ERROR;
-        }
-        *nh = h[i];
-    }
+        nh = &storage[sr->headers_in.headers.part.nelts++];
+        *nh = *allowed[i];
 
 #if (nginx_version >= 1023000)
-    sr->headers_in.cookie = NULL;
-#else
-    sr->headers_in.cookies.nelts = 0;
+        sr->headers_in.count++;
 #endif
 
-    return NGX_OK;
+        if (i == 0) {
+            sr->headers_in.host = nh;
+        } else {
+            sr->headers_in.user_agent = nh;
+        }
+    }
 }
 
 /* P3-7: cleanup record for the zone-wide bg_inflight decrement. Lives in
@@ -4689,10 +4734,10 @@ ngx_http_cache_turbo_bginflight_cleanup(void *data)
 /*
  * P1-4: push one validator header (If-None-Match from a stored ETag, or
  * If-Modified-Since from a stored Last-Modified) onto a warm/refresh
- * subrequest's private headers_in list, the same list warm_anonymize()
+ * subrequest's private headers_in list, the same list warm_rebuild_headers()
  * already builds in place. name/value are copied by VALUE (ngx_list_push +
- * struct assignment), matching warm_anonymize()'s existing elements -- no new
- * copy semantics introduced here.
+ * struct assignment), matching warm_rebuild_headers()'s existing elements --
+ * no new copy semantics introduced here.
  */
 static ngx_int_t
 ngx_http_cache_turbo_warm_add_validator(ngx_http_request_t *sr,
@@ -4804,6 +4849,9 @@ ngx_http_cache_turbo_warm_one(ngx_http_request_t *r, ngx_str_t *uri,
     ngx_http_cache_turbo_zone_t            *z;
     ngx_pool_cleanup_t                     *cln;
     ngx_http_cache_turbo_bginflight_cln_t  *cc;
+    ngx_list_part_t                        *part;
+    ngx_table_elt_t                        *warm_headers;
+    ngx_uint_t                              warm_header_cap;
 
     /* P3-7: `r` here is whichever request CALLED warm_one() -- the SWR
      * dice-winner itself (access.c, r is the caching location) OR the admin
@@ -4845,6 +4893,42 @@ ngx_http_cache_turbo_warm_one(ngx_http_request_t *r, ngx_str_t *uri,
         }
     }
 
+    /* Reserve the complete private warm-header list BEFORE posting the
+     * subrequest. Once ngx_http_subrequest() succeeds it cannot be cancelled;
+     * an allocation failure after that point must never leave the live sr with
+     * the admin request's inherited credentials. */
+    warm_header_cap = clcf->admin ? NGX_HTTP_CACHE_TURBO_WARM_HEADER_CAP : 1;
+
+    if (!clcf->admin) {
+        for (part = &r->headers_in.headers.part; part != NULL;
+             part = part->next)
+        {
+            if (warm_header_cap
+                > NGX_MAX_SIZE_T_VALUE / sizeof(ngx_table_elt_t)
+                  - part->nelts)
+            {
+                if (z != NULL && clcf->background_update_max != 0) {
+                    (void) ngx_atomic_fetch_add(
+                               &ngx_http_cache_turbo_zone_sh(z)->bg_inflight,
+                               -1);
+                }
+                return NGX_ERROR;
+            }
+
+            warm_header_cap += part->nelts;
+        }
+    }
+
+    warm_headers = ngx_palloc(r->pool,
+                       warm_header_cap * sizeof(ngx_table_elt_t));
+    if (warm_headers == NULL) {
+        if (z != NULL && clcf->background_update_max != 0) {
+            (void) ngx_atomic_fetch_add(
+                       &ngx_http_cache_turbo_zone_sh(z)->bg_inflight, -1);
+        }
+        return NGX_ERROR;
+    }
+
     if (ngx_http_subrequest(r, uri, args->len ? args : NULL, &sr, NULL,
                             NGX_HTTP_SUBREQUEST_BACKGROUND)
         != NGX_OK)
@@ -4854,6 +4938,13 @@ ngx_http_cache_turbo_warm_one(ngx_http_request_t *r, ngx_str_t *uri,
         }
         return NGX_ERROR;
     }
+
+    /* Sanitise immediately: every operation below can fail while the posted
+     * subrequest remains live, so none may run while sr still owns the admin
+     * request's shallow-copied credential headers. This rebuild cannot fail;
+     * its storage was reserved before ngx_http_subrequest(). */
+    ngx_http_cache_turbo_warm_rebuild_headers(sr, warm_headers,
+                                               warm_header_cap, clcf->admin);
 
     /* Arm the bg_inflight decrement on the SUBREQUEST's pool, immediately
      * after the subrequest is posted and before anything else that can fail.
@@ -4887,7 +4978,7 @@ ngx_http_cache_turbo_warm_one(ngx_http_request_t *r, ngx_str_t *uri,
      * shutdown-hang condition. Allocating the ctx up front means every failure
      * arm below leaves a subrequest that is still recognisably ours.
      *
-     * P3-7: NOTE this and the anonymize failure below are exactly the "return
+     * P3-7: NOTE this and the injected failure below are exactly the "return
      * before the subrequest completes" arms the bg_inflight decrement must
      * survive -- the cleanup armed above already covers them; nothing here
      * touches the counter. */
@@ -4911,8 +5002,8 @@ ngx_http_cache_turbo_warm_one(ngx_http_request_t *r, ngx_str_t *uri,
         *ctx_out = wctx;
     }
 
-    /* Warm anonymously: strip inherited cookies so both the cache key and the
-     * upstream request are the cookieless anonymous variant a visitor gets.
+    /* Admin warms are already anonymous by strict rebuild; ordinary refreshes
+     * retain representation headers but have had Cookie removed.
      *
      * P3-7: this is the fault-injectable arm for the bg_inflight leak test,
      * deliberately NOT the ctx-alloc arm just above. ctx is already seeded by
@@ -4922,21 +5013,17 @@ ngx_http_cache_turbo_warm_one(ngx_http_request_t *r, ngx_str_t *uri,
      * main->count never dropped" condition s84 already fixed (see the
      * comment on the ctx alloc above). Injecting THAT would test a
      * known-fixed hang, not this feature's own decrement. */
-    if (ngx_http_cache_turbo_warm_anonymize(sr) != NGX_OK
 #if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
     && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
-        || clcf->test_warm_ctx_fail
-#endif
-       )
-    {
+    if (clcf->test_warm_ctx_fail) {
         return NGX_ERROR;
     }
+#endif
 
     /* P1-4: inject a conditional validator from the currently stored blob (if
-     * any) AFTER anonymize has rebuilt the private headers list -- anonymize
-     * allocates that list, so an injection before it would land in the OLD
-     * (still shared-with-parent) list and be discarded when anonymize swaps
-     * it out from under us. */
+     * any) AFTER the private headers list has been rebuilt. An injection before
+     * it would land in the OLD (still shared-with-parent) list and be discarded
+     * when the rebuild replaces it. */
     ngx_http_cache_turbo_warm_inject_validators(sr, snap, snap_len);
 
     /* Force a clean GET to the origin regardless of the admin request's method

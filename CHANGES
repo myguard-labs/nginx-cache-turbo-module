@@ -1,5 +1,14 @@
 Changes with the nginx-cache-turbo-module (unreleased)
 
+    *) Security: admin-triggered warm subrequests now rebuild their request
+       headers from a Host/User-Agent allowlist before contacting the origin.
+       Previously they inherited every header from the admin POST, so
+       Authorization, Proxy-Authorization, cookies, and application-specific
+       admin tokens could reach the warmed origin. Background-refresh
+       validators are still added explicitly after the rebuild. Affects: all
+       versions through 1.1.0. Mitigation without upgrading: invoke the warm
+       endpoint without credentials or sensitive custom headers.
+
     *) Feature: the admin JSON endpoint now reports "lock_ttl", the effective
        single-flight lock TTL in seconds for the admin location -- after
        preset-band resolution, inheritance, and the parse-time clamp to the

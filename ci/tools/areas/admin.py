@@ -1801,6 +1801,75 @@ def test_warm_strips_key_cookie(ng: Nginx, origin: Origin) -> None:
         f"warm leaked the segment cookie into the anonymous entry: {body2!r}"
 
 
+def test_admin_warm_rebuilds_headers_from_allowlist(
+        ng: Nginx, origin: Origin) -> None:
+    """ADMIN-WARM-AUTH-FORWARD: an authenticated admin POST must create a
+    credential-free warm GET. Host and User-Agent are the only inherited
+    request headers allowed through; Host remains part of the default key.
+
+    Named negative control: change warm_rebuild_headers() to copy the parent's
+    complete headers list. This test must fail at ``admin warm forwarded
+    Authorization`` (and the other credential assertions), while the unmutated
+    build passes and serves the anonymous follow-up as a HIT.
+    """
+    import json
+
+    tag = f"hdrecho-warm-{time.time()}"
+    uri = f"/warmhdr/{tag}"
+    allowed_host = "warm-admin.example"
+    allowed_ua = "cache-turbo-warm-test/1.0"
+    admin_headers = {
+        "Host": allowed_host,
+        "User-Agent": allowed_ua,
+        "Authorization": "Bearer test-admin-credential",
+        "Proxy-Authorization": "Basic dGVzdDp0ZXN0",
+        "Cookie": "admin_session=test-only",
+        "X-Admin-Token": "test-only-token",
+    }
+
+    base = origin.hits_for(tag)
+    s, body, _ = fetch(ng.port, f"/_cache?url={uri}", method="POST",
+                       headers=admin_headers)
+    assert s == 200, f"warm status: {s} {body!r}"
+    assert json.loads(body)["warmed"] == 1, f"warm body: {body!r}"
+    assert wait_for(lambda: origin.hits_for(tag) == base + 1), \
+        "credential-bearing admin warm never reached origin"
+    time.sleep(0.2)
+
+    s2, cached, h2 = fetch(
+        ng.port, uri, headers={"Host": allowed_host, "User-Agent": allowed_ua})
+    assert s2 == 200
+    assert h2.get("x-cache") == "HIT", \
+        f"anonymous follow-up was not a HIT (X-Cache={h2.get('x-cache')})"
+    assert origin.hits_for(tag) == base + 1, \
+        "anonymous follow-up reached origin instead of the warm entry"
+
+    assert f"host=[{allowed_host}]" in cached, \
+        f"admin warm did not preserve Host: {cached!r}"
+    assert f"ua=[{allowed_ua}]" in cached, \
+        f"admin warm did not preserve User-Agent: {cached!r}"
+    assert "auth=[none]" in cached, \
+        f"admin warm forwarded Authorization: {cached!r}"
+    assert "proxy-auth=[none]" in cached, \
+        f"admin warm forwarded Proxy-Authorization: {cached!r}"
+    assert "cookie=[none]" in cached, \
+        f"admin warm forwarded Cookie: {cached!r}"
+    assert "admin-token=[none]" in cached, \
+        f"admin warm forwarded an application credential: {cached!r}"
+
+    # Host is a boundary, not decorative forwarding: the same URI under a
+    # different virtual host must not reach the warmed host's cache entry.
+    s3, body3, other = fetch(
+        ng.port, uri, headers={"Host": "other.example"})
+    assert s3 == 200, f"alternate host request failed: {s3} {body3!r}"
+    assert other.get("x-cache") != "HIT", \
+        "warm entry crossed the default cache key's Host boundary"
+    assert origin.hits_for(tag) == base + 2, \
+        "alternate host did not fetch its own cache-key entry"
+    assert "host=[other.example]" in body3, \
+        f"alternate Host was not forwarded to origin: {body3!r}"
+
+
 def test_l2_write_through(ng: Nginx, origin: Origin, redis: RedisServer) -> None:
     """P4: a store writes through to L2. After caching /l2/<k>, the blob is
     present in Redis under the expected key, carries a PX TTL, and contains the

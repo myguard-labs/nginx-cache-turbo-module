@@ -1812,6 +1812,17 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # ADMIN-WARM-AUTH-FORWARD: default-key location with an explicit Host
+        # pass-through. The runtime test can therefore prove both that the warm
+        # retained the selected virtual host and that it discarded every admin
+        # credential before reaching the origin.
+        location /warmhdr/ {{
+            cache_turbo          main;
+            cache_turbo_valid    30s;
+            proxy_set_header     Host $http_host;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # conditional requests (v11): origin emits ETag + Last-Modified; a HIT
         # whose stored validators satisfy If-None-Match / If-Modified-Since is
         # answered 304 (no body) straight from cache.
@@ -4042,6 +4053,21 @@ http {{
             # on: "b1 == b2" alone is equally satisfied by two independent
             # origin misses that happen to return byte-identical bodies, so
             # the HIT status is what distinguishes a real shared slot.
+            add_header           X-CT-Status $cache_turbo_status always;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # ADMIN-WARM-AUTH-FORWARD regression guard: non-admin SWR refreshes
+        # must keep the representation headers that select their auto-Vary
+        # slot. A strict admin-style allowlist here drops Accept-Language and
+        # refreshes the empty-language variant instead of the stale `en` slot.
+        location /avswr/ {{
+            cache_turbo          main;
+            cache_turbo_key      $request_uri;
+            cache_turbo_valid    1s;
+            cache_turbo_beta     5000;
+            cache_turbo_background_update on;
+            cache_turbo_auto_vary on;
             add_header           X-CT-Status $cache_turbo_status always;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
