@@ -1131,27 +1131,27 @@ def test_autotune_force_requires_post_action(ng: Nginx, origin: Origin) -> None:
 
     origin.delay = 0.04
     try:
-        fetch(ng.port, "/at/safe-seed")
-        _fire_misses(ng, "/at/safe-k", 110)
+        fetch(ng.port, "/ats/safe-seed")
+        _fire_misses(ng, "/ats/safe-k", 110)
 
-        s_get, b_get, _ = fetch(ng.port, "/_cache_at?autotune=1")
+        s_get, b_get, _ = fetch(ng.port, "/_cache_ats?autotune=1")
         assert s_get == 200, f"safe GET status {s_get}"
         st_get = json.loads(b_get)
         assert st_get["autotuned_beta"] == 0, \
             f"GET stats must stay read-only even with ?autotune=1: {st_get}"
 
-        s_head, _, h_head = fetch(ng.port, "/_cache_at?autotune=1",
+        s_head, _, h_head = fetch(ng.port, "/_cache_ats?autotune=1",
                                   method="HEAD")
         assert s_head == 200, f"safe HEAD status {s_head}"
         assert "application/json" in h_head.get("content-type", ""), h_head
 
-        s_plain, b_plain, _ = fetch(ng.port, "/_cache_at")
+        s_plain, b_plain, _ = fetch(ng.port, "/_cache_ats")
         assert s_plain == 200, f"plain stats status {s_plain}"
         st_plain = json.loads(b_plain)
         assert st_plain["autotuned_beta"] == 0, \
             f"HEAD stats must stay read-only: {st_plain}"
 
-        st_post = _autotune_force(ng, "/_cache_at")
+        st_post = _autotune_force(ng, "/_cache_ats")
         assert st_post["autotuned_beta"] > 0, \
             f"POST force did not publish a verdict: {st_post}"
     finally:
