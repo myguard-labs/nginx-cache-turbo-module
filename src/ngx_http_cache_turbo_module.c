@@ -4640,6 +4640,7 @@ ngx_http_cache_turbo_warm_rebuild_headers(ngx_http_request_t *sr,
     sr->headers_in.headers.last = &sr->headers_in.headers.part;
     sr->headers_in.headers.size = sizeof(ngx_table_elt_t);
     sr->headers_in.headers.nalloc = capacity;
+    sr->headers_in.headers.pool = sr->pool;
 
     if (!admin) {
         part = &inherited.headers.part;
