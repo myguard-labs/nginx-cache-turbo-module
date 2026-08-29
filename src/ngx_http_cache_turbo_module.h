@@ -2476,7 +2476,7 @@ typedef struct {
      * so the pre-flush rescue path is reachable in a test without depending on
      * upstream connection-teardown timing. */
     ngx_flag_t               test_midbody_abort;
-    /* P3-7: force ngx_http_cache_turbo_warm_one()'s warm_anonymize() call to
+    /* P3-7: force ngx_http_cache_turbo_warm_one()'s post-rebuild setup to
      * fail deterministically (module.c), so a test can exercise the
      * "subrequest posted, ctx already seeded, then an early NGX_ERROR
      * return before the subrequest completes" hazard that makes the

@@ -708,6 +708,41 @@ def test_auto_vary_language(ng: Nginx, origin: Origin) -> None:
     assert origin.hits_for("/lang?v=al") - base == 2, origin.hits_for("/lang?v=al") - base
 
 
+def test_swr_preserves_auto_vary_language(ng: Nginx, origin: Origin) -> None:
+    """ADMIN-WARM-AUTH-FORWARD boundary: the strict header allowlist is for
+    admin warms only. An SWR refresh must retain Accept-Language so its response
+    replaces the stale `en` variant rather than populating the absent-language
+    slot. A later `en` read must become a fresh HIT of the new generation."""
+    path = "/langswr?v=al"
+    uri = "/avswr" + path
+    headers = {"Accept-Language": "en"}
+    base = origin.hits_for(path)
+
+    s0, body0, h0 = fetch(ng.port, uri, headers)
+    assert s0 == 200 and h0.get("x-ct-status") == "MISS", (s0, h0)
+    _s1, body1, h1 = fetch(ng.port, uri, headers)
+    assert h1.get("x-ct-status") == "HIT" and body1 == body0, (h1, body1, body0)
+    time.sleep(1.3)
+
+    def _refresh_fired() -> bool:
+        if origin.hits_for(path) > base + 1:
+            return True
+        fetch(ng.port, uri, headers)
+        return origin.hits_for(path) > base + 1
+
+    assert wait_for(_refresh_fired, timeout=2.0, interval=0.1), \
+        "Accept-Language SWR refresh never reached the origin"
+
+    def _fresh_language_hit() -> bool:
+        _status, body, response_headers = fetch(ng.port, uri, headers)
+        return (response_headers.get("x-ct-status") == "HIT"
+                and body != body0)
+
+    assert wait_for(_fresh_language_hit, timeout=2.0, interval=0.1), \
+        ("SWR refreshed a different auto-Vary slot; the `en` variant never "
+         "became a fresh HIT")
+
+
 def test_auto_vary_language_primary_subtag_shares(ng: Nginx,
                                                     origin: Origin) -> None:
     """S7: LANG folds to the primary-subtag CLASS, so `en-US,en;q=0.9` and

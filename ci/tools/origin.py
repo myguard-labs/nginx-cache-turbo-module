@@ -580,6 +580,33 @@ class Origin:
                     except BrokenPipeError:
                         pass
                     return True, None
+                if "hdrecho" in self.path:
+                    # ADMIN-WARM-AUTH-FORWARD: echo every header whose presence
+                    # distinguishes an allowlist rebuild from inherited admin
+                    # headers. Fake credential values stay test-local; the
+                    # response is later served from cache so the follow-up also
+                    # proves the warm was eligible for anonymous storage.
+                    def header(name):
+                        return self.headers.get(name) or "none"
+
+                    body = (
+                        f"gen-{n} "
+                        f"host=[{header('Host')}] "
+                        f"ua=[{header('User-Agent')}] "
+                        f"auth=[{header('Authorization')}] "
+                        f"proxy-auth=[{header('Proxy-Authorization')}] "
+                        f"cookie=[{header('Cookie')}] "
+                        f"admin-token=[{header('X-Admin-Token')}]\n"
+                    ).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    try:
+                        self.wfile.write(body)
+                    except BrokenPipeError:
+                        pass
+                    return True, None
                 if "vldechonone" in self.path:
                     # P1-4 negative control: echo received If-None-Match /
                     # If-Modified-Since like "vldecho" below, but emit NO
