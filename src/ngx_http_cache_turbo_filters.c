@@ -571,6 +571,37 @@ ngx_http_cache_turbo_capture_gate_response_ok(ngx_http_request_t *r,
 }
 
 
+static ngx_uint_t
+ngx_http_cache_turbo_response_declares_trailers(ngx_http_request_t *r)
+{
+    ngx_uint_t        i;
+    ngx_list_part_t  *part;
+    ngx_table_elt_t  *h;
+
+    part = &r->headers_out.headers.part;
+    h = part->elts;
+
+    for ( ;; ) {
+        for (i = 0; i < part->nelts; i++) {
+            if (h[i].hash
+                && h[i].key.len == sizeof("Trailer") - 1
+                && ngx_strncasecmp(h[i].key.data, (u_char *) "Trailer",
+                                   sizeof("Trailer") - 1) == 0)
+            {
+                return 1;
+            }
+        }
+
+        if (part->next == NULL) {
+            return 0;
+        }
+
+        part = part->next;
+        h = part->elts;
+    }
+}
+
+
 /* Body of the capture branch: flag an encoded-origin capture, resolve the
  * RFC 9111 SS3.5 reuse authorisation, build the key for a warm subrequest,
  * flag the capture, and emit the Surrogate-Key header. Returns NGX_ERROR
@@ -793,6 +824,13 @@ ngx_http_cache_turbo_header_filter_capture(ngx_http_request_t *r,
                                                 encoded_ok,
                                                 (ngx_uint_t) resp_encoded);
         }
+    }
+
+    if (captured && ngx_http_cache_turbo_response_declares_trailers(r)) {
+        captured = 0;
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "cache_turbo: \"%V\" not cached: upstream response "
+                       "declares trailers", &r->uri);
     }
 
     if (captured)
