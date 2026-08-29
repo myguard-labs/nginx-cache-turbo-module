@@ -44,7 +44,7 @@ test_del(ngx_http_cache_turbo_loc_conf_t *clcf, u_char *key_hash)
 int
 main(void)
 {
-    static const u_char expected[32] =
+    static const u_char expected[] =
         "admin-keyadmin-keyadmin-keyadmin";
     ngx_cache_turbo_l1_backend_t  l1;
     ngx_cache_turbo_backend_t     l2;
@@ -54,6 +54,9 @@ main(void)
     ngx_str_t                     key = { 9, (u_char *) "admin-key" };
     ngx_uint_t                    purged = 99;
     ngx_int_t                     rc;
+
+    _Static_assert(sizeof(expected) - 1 == sizeof(l1_key),
+                   "admin digest fixture must remain exactly 32 bytes");
 
     /* The extracted helper receives these objects exactly as production does.
      * Keep every reachable byte deterministic: future helper/backend fields
@@ -84,9 +87,9 @@ main(void)
     CHECK(rc == NGX_OK, "successful admin digest must preserve the old status");
     CHECK(l1_calls == 1 && l2_calls == 1,
           "successful admin purge must still reach both cache tiers once");
-    CHECK(memcmp(l1_key, expected, sizeof(expected)) == 0,
+    CHECK(memcmp(l1_key, expected, sizeof(l1_key)) == 0,
           "successful admin purge must deliver exact digest bytes to L1");
-    CHECK(memcmp(l2_key, expected, sizeof(expected)) == 0,
+    CHECK(memcmp(l2_key, expected, sizeof(l2_key)) == 0,
           "successful admin purge must deliver exact digest bytes to L2");
     CHECK(memcmp(l1_key, l2_key, sizeof(l1_key)) == 0,
           "successful admin purge must use identical bytes for both tiers");
