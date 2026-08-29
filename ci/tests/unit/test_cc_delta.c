@@ -12,11 +12,23 @@
 #include <string.h>
 #include <time.h>
 
+#ifdef NGX_CC_TEST_NARROW_TIME
+#define time_t  int32_t
+#endif
+
 typedef unsigned char  u_char;
 typedef uintptr_t      ngx_uint_t;
 typedef intptr_t       ngx_int_t;
 
 #define NGX_MAX_INT_T_VALUE  ((intptr_t) (UINTPTR_MAX >> 1))
+#define NGX_TEST_TIME_T_MAX                                                \
+    ((time_t) (((uintmax_t) 1 << (8 * sizeof(time_t) - 1)) - 1))
+#define NGX_TEST_MAX_DURATION                                              \
+    ((time_t) (((uintmax_t) NGX_MAX_INT_T_VALUE                            \
+                    <= (uintmax_t) NGX_TEST_TIME_T_MAX)                    \
+                   ? (time_t) NGX_MAX_INT_T_VALUE                          \
+                   : NGX_TEST_TIME_T_MAX))
+#define NGX_MAX_TIME_T_VALUE  NGX_TEST_MAX_DURATION
 
 static u_char *
 ngx_strlchr(u_char *p, u_char *last, u_char c)
@@ -149,15 +161,27 @@ expect_tokens(const char *name, const char *input, const char *directive,
 int
 main(void)
 {
+    time_t  time32_one_over;
+
+    time32_one_over = (time_t) 2147483647;
+    if (time32_one_over < NGX_TEST_MAX_DURATION) {
+        time32_one_over++;
+    }
+
     expect("zero", "0", 0);
     expect("unquoted", "42", 42);
     expect("quoted", "\"42\"", 42);
-    expect("signed_boundary", "9223372036854775807",
-           (time_t) NGX_MAX_INT_T_VALUE);
+    expect("time32_before_boundary", "2147483646", (time_t) 2147483646);
+    expect("time32_boundary", "2147483647", (time_t) 2147483647);
+    expect("time32_one_over", "2147483648", time32_one_over);
+    expect("time_t_boundary", "9223372036854775807",
+           NGX_TEST_MAX_DURATION);
     expect("overflow_saturates", "9223372036854775808",
-           (time_t) NGX_MAX_INT_T_VALUE);
+           NGX_TEST_MAX_DURATION);
     expect("long_overflow_saturates", "999999999999999999999999999999999",
-           (time_t) NGX_MAX_INT_T_VALUE);
+           NGX_TEST_MAX_DURATION);
+    expect("overflow_junk_suffix", "9223372036854775808x", -1);
+    expect("quoted_overflow_junk_suffix", "\"9223372036854775808x\"", -1);
     expect("junk_suffix", "42x", -1);
     expect("quoted_junk_suffix", "\"42\"x", -1);
     expect("unterminated_quote", "\"42", -1);
@@ -194,6 +218,10 @@ main(void)
     if (failures != 0) {
         return 1;
     }
+#ifdef NGX_CC_TEST_NARROW_TIME
+    puts("PASS test_cc_token_quote_iteration_delta_narrow_time");
+#else
     puts("PASS test_cc_token_quote_iteration_and_delta_grammar");
+#endif
     return 0;
 }

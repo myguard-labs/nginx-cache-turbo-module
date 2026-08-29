@@ -34,6 +34,12 @@ bash "$DIR/extract_cc_delta.sh"
 # shellcheck disable=SC2086
 "$CC" $CFLAGS "$DIR/test_cc_delta.c" -o "$DIR/test_cc_delta"
 "$DIR/test_cc_delta"
+# Recompile the same production slice with a 32-bit time_t carrier. This keeps
+# the saturation boundary falsifiable on the usual 64-bit CI hosts.
+# shellcheck disable=SC2086
+"$CC" $CFLAGS -DNGX_CC_TEST_NARROW_TIME=1 "$DIR/test_cc_delta.c" \
+	-o "$DIR/test_cc_delta_narrow_time"
+"$DIR/test_cc_delta_narrow_time"
 
 # --- auto-Vary purge generation wrap (AUD-GEN1) ----------------------------
 # Pure-math mirror of marker_store/variant_hash's gen write/truncate/fold --

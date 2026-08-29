@@ -1254,12 +1254,12 @@ ngx_http_cache_turbo_cc_has(u_char *v, u_char *last, const char *name,
 /* Parse one delta-seconds value. RFC 9111 permits recipients to accept the
  * historical quoted form as well as the preferred bare form. The value must be
  * fully consumed: signs, whitespace, escapes and digit-prefixed junk are not a
- * delta. Values beyond nginx's signed integer range saturate instead of flowing
- * through ngx_atoi() as NGX_ERROR (which is also our "absent" sentinel). */
+ * delta. The time_t cutoff follows ngx_atotm(); overflow saturates instead of
+ * returning NGX_ERROR (which is also our "absent" sentinel). */
 static time_t
 ngx_http_cache_turbo_cc_parse_delta(u_char *p, size_t len)
 {
-    time_t      n = 0;
+    time_t      n = 0, cutoff, cutlim;
     ngx_uint_t  d;
     u_char     *last;
 
@@ -1271,17 +1271,19 @@ ngx_http_cache_turbo_cc_parse_delta(u_char *p, size_t len)
         return -1;
     }
 
+    cutoff = NGX_MAX_TIME_T_VALUE / 10;
+    cutlim = NGX_MAX_TIME_T_VALUE % 10;
+
     last = p + len;
     for (/* void */; p < last; p++) {
         if (*p < '0' || *p > '9') {
             return -1;
         }
         d = (ngx_uint_t) (*p - '0');
-        if (n > (time_t) (NGX_MAX_INT_T_VALUE / 10)
-            || (n == (time_t) (NGX_MAX_INT_T_VALUE / 10)
-                && d > (ngx_uint_t) (NGX_MAX_INT_T_VALUE % 10)))
+        if (n >= cutoff && (n > cutoff || (time_t) d > cutlim))
         {
-            return (time_t) NGX_MAX_INT_T_VALUE;
+            n = NGX_MAX_TIME_T_VALUE;
+            continue;
         }
         n = n * 10 + (time_t) d;
     }
