@@ -105,14 +105,14 @@ fi
 # only the warning must fail the exact logging assertion without changing the
 # compare-and-delete behavior.
 if [ "${CTRL_MARKER_ROLLBACK_NO_WARN:-0}" = 1 ]; then
-	line='    if (clcf->l1->purge_if_blob(z, store_key, hash, stored_data) > 0) {'
+	line='        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,'
 	if [ "$(grep -cF "$line" "$OUT")" -ne 1 ]; then
-		echo "✗ rollback-warning mutation could not find its production branch" >&2
+		echo "✗ rollback-warning mutation could not find its production log" >&2
 		rm -f "$OUT"
 		exit 1
 	fi
 	sed -i \
-		's/if (clcf->l1->purge_if_blob(z, store_key, hash, stored_data) > 0)/if (0 \&\& clcf->l1->purge_if_blob(z, store_key, hash, stored_data) > 0)/' \
+		's/        ngx_log_error(NGX_LOG_WARN/        if (0) ngx_log_error(NGX_LOG_WARN/' \
 		"$OUT"
 fi
 

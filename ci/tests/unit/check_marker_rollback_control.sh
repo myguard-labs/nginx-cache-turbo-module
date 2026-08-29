@@ -62,5 +62,14 @@ if ! grep -qF \
 	tail -20 "$OUT" >&2
 	exit 1
 fi
+for state_assertion in \
+	"isolated failed marker store must remove A's unsafe variant" \
+	"isolated rollback must release A's pinned token exactly once"; do
+	if grep -qF "$state_assertion" "$OUT"; then
+		echo "✗ warning-only mutation also changed rollback state" >&2
+		tail -20 "$OUT" >&2
+		exit 1
+	fi
+done
 
-echo "✓ missing rollback warning fails its exact logging assertion"
+echo "✓ log-only rollback mutation fails logging while state assertions pass"

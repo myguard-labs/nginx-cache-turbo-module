@@ -68,6 +68,7 @@ bash "$DIR/extract_variant_hash.sh"
 # shellcheck disable=SC2086
 "$CC" $CFLAGS "$DIR/test_variant_gen.c" -o "$DIR/test_variant_gen" -lssl -lcrypto
 "$DIR/test_variant_gen"
+bash "$DIR/check_variant_gen_normalize_control.sh"
 
 # --- cache-key fold, single-allocation (S231-PERF-KEYFOLD) -----------------
 # Pins the digest of known multi-part / empty-value / oversize keys against

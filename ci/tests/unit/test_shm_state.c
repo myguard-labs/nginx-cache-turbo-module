@@ -67,6 +67,7 @@ int              ngx_test_unlock_barrier_timed_out;
 int              ngx_test_unlock_barrier_hits;
 static int       purge_test_refill_started;
 static int       purge_test_refill_completed;
+static int       purge_test_refill_observed_arm;
 
 /* --- the node/zone types under test.
  * Sliced from the shipped header so the layout cannot drift from production;
@@ -567,6 +568,9 @@ purge_test_refill(void *data)
     purge_refill_arg_t  *arg = data;
 
     (void) pthread_mutex_lock(&ngx_test_unlock_barrier_mutex);
+    __atomic_store_n(&purge_test_refill_observed_arm,
+                     ngx_test_unlock_barrier_expected_set ? 1 : -1,
+                     __ATOMIC_RELEASE);
     if (ngx_test_unlock_barrier_wait_locked(1, "refill") != 0) {
         (void) pthread_mutex_unlock(&ngx_test_unlock_barrier_mutex);
         return NULL;
@@ -596,6 +600,7 @@ purge_test_arm_unlock_barrier(pthread_t expected)
     (void) pthread_mutex_unlock(&ngx_test_unlock_barrier_mutex);
     __atomic_store_n(&purge_test_refill_started, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&purge_test_refill_completed, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&purge_test_refill_observed_arm, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&ngx_test_unlock_barrier_armed, 1, __ATOMIC_RELEASE);
 }
 
@@ -665,56 +670,81 @@ test_purge_all_zero_snapshot_detects_queue_skew(void)
 static void
 test_purge_all_snapshot_bounds_concurrent_refill(void)
 {
-    enum { SNAPSHOT = NGX_HTTP_CACHE_TURBO_PURGE_BATCH + 1 };
+    enum {
+        SNAPSHOT = NGX_HTTP_CACHE_TURBO_PURGE_BATCH + 1,
+        ROUNDS = 4
+    };
     purge_refill_arg_t  arg;
     pthread_t           refill;
-    ngx_uint_t          purged;
+    ngx_uint_t          purged, round;
     ngx_int_t           rc, thread_rc;
 
     printf("PURGE-ALL-STARVATION: snapshot bounds a concurrent refill\n");
-    zone_reset();
-    purge_test_fill(0, SNAPSHOT);
-    REQUIRE(g_sh.n_entries == SNAPSHOT,
-            "fixture: initial purge snapshot population is incomplete");
 
-    arg.first = SNAPSHOT;
-    arg.count = SNAPSHOT;
-    thread_rc = pthread_create(&refill, NULL, purge_test_refill, &arg);
-    REQUIRE(thread_rc == 0,
-            "fixture: pthread_create(refill) failed");
-    purge_test_arm_unlock_barrier(pthread_self());
+    for (round = 0; round < ROUNDS; round++) {
+        zone_reset();
+        purge_test_fill(0, SNAPSHOT);
+        REQUIRE(g_sh.n_entries == SNAPSHOT,
+                "fixture: initial purge snapshot population is incomplete");
 
-    watchdog_arm("purge-all must stop at its start-of-call snapshot");
-    rc = ngx_http_cache_turbo_shm_purge_all(&g_zone, &purged);
-    purge_test_force_release_refill();
-    CHECK(pthread_join(refill, NULL) == 0,
-          "fixture: pthread_join(refill) failed");
-    watchdog_disarm();
-    purge_test_disarm_unlock_barrier();
+        arg.first = SNAPSHOT;
+        arg.count = SNAPSHOT;
 
-    CHECK(ngx_test_unlock_barrier_timed_out == 0,
-          "purge/refill barrier must complete without a timed wait failure");
-    CHECK(ngx_test_unlock_barrier_hits == 1,
-          "only the expected purger unlock may consume the one-shot barrier");
-    CHECK(__atomic_load_n(&purge_test_refill_started, __ATOMIC_ACQUIRE) == 1
-          && __atomic_load_n(&purge_test_refill_completed,
-                             __ATOMIC_ACQUIRE) == 1,
-          "refill must truly overlap the purger between snapshot and drain");
-    CHECK(rc == NGX_AGAIN,
-          "concurrent refill must report purge-all as incomplete");
-    CHECK(purged == SNAPSHOT,
-          "purge-all must consume exactly its finite start-of-call budget");
-    CHECK(g_sh.n_entries == SNAPSHOT,
-          "the concurrent refill must remain resident after the snapshot ends");
-    CHECK(ngx_test_lock_balanced(),
-          "snapshot-bounded purge-all left the zone mutex held");
+        /* Arm and reset every observation before the refill thread exists.
+         * Four controlled repetitions make scheduler luck unable to hide a
+         * future create-before-arm regression. */
+        purge_test_arm_unlock_barrier(pthread_self());
+        CHECK(__atomic_load_n(&purge_test_refill_started,
+                              __ATOMIC_ACQUIRE) == 0
+                  && __atomic_load_n(&purge_test_refill_completed,
+                                     __ATOMIC_ACQUIRE) == 0
+                  && __atomic_load_n(&purge_test_refill_observed_arm,
+                                     __ATOMIC_ACQUIRE) == 0,
+              "barrier arm must precede all refill-thread observations");
 
-    /* Idle completeness is the preserve invariant: with no producer racing,
-     * a second call drains the residual set and reports complete. */
-    rc = ngx_http_cache_turbo_shm_purge_all(&g_zone, &purged);
-    CHECK(rc == NGX_OK, "idle purge-all must report complete");
-    CHECK(purged == SNAPSHOT, "idle purge-all count must stay exact");
-    CHECK(g_sh.n_entries == 0, "idle purge-all must drain both queues");
+        thread_rc = pthread_create(&refill, NULL, purge_test_refill, &arg);
+        if (thread_rc != 0) {
+            purge_test_disarm_unlock_barrier();
+            CHECK(0, "fixture: pthread_create(refill) failed");
+            return;
+        }
+
+        watchdog_arm("purge-all must stop at its start-of-call snapshot");
+        rc = ngx_http_cache_turbo_shm_purge_all(&g_zone, &purged);
+        purge_test_force_release_refill();
+        CHECK(pthread_join(refill, NULL) == 0,
+              "fixture: pthread_join(refill) failed");
+        watchdog_disarm();
+        purge_test_disarm_unlock_barrier();
+
+        CHECK(ngx_test_unlock_barrier_timed_out == 0,
+              "purge/refill barrier must complete without a timed wait failure");
+        CHECK(ngx_test_unlock_barrier_hits == 1,
+              "only the expected purger unlock may consume the one-shot barrier");
+        CHECK(__atomic_load_n(&purge_test_refill_observed_arm,
+                              __ATOMIC_ACQUIRE) == 1,
+              "refill must observe an armed expected purger before progress");
+        CHECK(__atomic_load_n(&purge_test_refill_started,
+                              __ATOMIC_ACQUIRE) == 1
+                  && __atomic_load_n(&purge_test_refill_completed,
+                                     __ATOMIC_ACQUIRE) == 1,
+              "refill must truly overlap the purger between snapshot and drain");
+        CHECK(rc == NGX_AGAIN,
+              "concurrent refill must report purge-all as incomplete");
+        CHECK(purged == SNAPSHOT,
+              "purge-all must consume exactly its finite start-of-call budget");
+        CHECK(g_sh.n_entries == SNAPSHOT,
+              "the concurrent refill must remain resident after the snapshot ends");
+        CHECK(ngx_test_lock_balanced(),
+              "snapshot-bounded purge-all left the zone mutex held");
+
+        /* Idle completeness is the preserve invariant: with no producer
+         * racing, a second call drains the residual set and reports complete. */
+        rc = ngx_http_cache_turbo_shm_purge_all(&g_zone, &purged);
+        CHECK(rc == NGX_OK, "idle purge-all must report complete");
+        CHECK(purged == SNAPSHOT, "idle purge-all count must stay exact");
+        CHECK(g_sh.n_entries == 0, "idle purge-all must drain both queues");
+    }
 }
 
 /* =====================================================================

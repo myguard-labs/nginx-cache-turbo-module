@@ -640,12 +640,18 @@ ngx_http_cache_turbo_variant_hash(ngx_http_request_t *r, ngx_str_t *base,
     ngx_str_t                      v;
     static const u_char            us = 0x1F;
 
+    /* The marker wire format persists exactly one generation byte.  Keep the
+     * digest contract tied to that representation even when an internal or
+     * direct caller supplies a wider ngx_uint_t: 256 must frame as gen=0, not
+     * as a key that no stored marker can ever reproduce. */
+    gen &= 0xff;
+
     ngx_http_cache_turbo_digest_init(&d);
     ngx_http_cache_turbo_digest_update(&d, base->data, base->len);
 
     /* PURGE generation (COR-5 / AUD-GEN1): folded UNCONDITIONALLY, including
-     * gen == 0. The generation lives in one marker byte (marker_store truncates
-     * to gen & 0xFF), so the 256th purge on a base wraps back to the SAME byte
+     * gen == 0. The generation lives in one marker byte; the normalization
+     * above mirrors marker_store's gen & 0xFF, so the 256th purge wraps to the
      * value as a base that was never purged. Folding was previously skipped
      * for gen == 0 (treated as a "never purged" sentinel, kept for pre-COR-5
      * upgrade compatibility) -- that made the wrap land EXACTLY on the

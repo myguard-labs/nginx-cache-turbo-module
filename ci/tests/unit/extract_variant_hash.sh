@@ -93,4 +93,17 @@ if ! printf '%s' "$fold" | grep -qF '"gen="'; then
     exit 1
 fi
 
+# Falsifiable wire-normalization control. Remove only the production mask;
+# direct gen=256 must then diverge from the persisted/read-back gen=0 key.
+if [ "${CTRL_VARIANT_NO_GEN_NORMALIZE:-0}" = 1 ]; then
+    normalize_line='    gen &= 0xff;'
+    if [ "$(grep -cxF "$normalize_line" "$OUT")" -ne 1 ]; then
+        echo "✗ generation-normalization mutation could not find its line" >&2
+        rm -f "$OUT"
+        exit 1
+    fi
+    sed -i 's/^    gen &= 0xff;$/    \/\* CTRL: generation mask removed \*\//' \
+        "$OUT"
+fi
+
 echo "✓ extracted ngx_http_cache_turbo_variant_hash → $(basename "$OUT")"
