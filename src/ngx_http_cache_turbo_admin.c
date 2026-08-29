@@ -822,7 +822,9 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
     h->hash = 1;
+#if (nginx_version >= 1023000)
     h->next = NULL;
+#endif
     ngx_str_set(&h->key, "Allow");
     ngx_str_set(&h->value, "GET, HEAD, POST, PUT, DELETE");
 
