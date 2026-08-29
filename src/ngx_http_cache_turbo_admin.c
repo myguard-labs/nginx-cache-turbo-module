@@ -50,16 +50,76 @@ static ngx_int_t ngx_http_cache_turbo_warm_read_file(ngx_http_request_t *r,
     ngx_str_t *path, ngx_str_t *out);
 
 /* State carried through an async all-purge (?all=1) from the admin handler to
- * the SCAN-del completion callback. Holds the L1 count purged synchronously so
- * the reply can report it after the parked L2 SCAN finishes. */
+ * the SCAN-del completion callback. Holds the synchronous L1 count and its
+ * finite-snapshot outcome so the reply can combine them with the parked L2
+ * result. */
 typedef struct {
-    ngx_uint_t  purged;        /* L1 entries dropped (reported as "purged") */
+    ngx_uint_t  purged;          /* L1 entries dropped (reported as purged) */
+    ngx_flag_t  l1_incomplete;   /* finite snapshot left concurrent residue */
 } ngx_http_cache_turbo_allpurge_t;
 
 
-/* SCAN-del completion (?all=1): the L2 keyspace walk has ended; emit
- * {"purged":N} where N is the L1 count (L2 deletions are fire-and-forget and not
- * separately counted). members/nmembers are unused (always 0 here).
+/* Emit the combined L1/L2 outcome for ?all=1.  L1 incompleteness and an L2
+ * failure are independent: both fields are retained when both tiers were
+ * incomplete, so a caller never mistakes a partial purge for success. */
+static ngx_int_t
+ngx_http_cache_turbo_all_purge_reply(ngx_http_request_t *r,
+    ngx_http_cache_turbo_allpurge_t *ap, const char *l2_state,
+    const char *reason, const ngx_http_cache_turbo_redis_walk_t *walk)
+{
+    u_char      *p;
+    ngx_str_t    body;
+    ngx_uint_t   status;
+
+    status = (ap->l1_incomplete || l2_state != NULL)
+             ? NGX_HTTP_INTERNAL_SERVER_ERROR : NGX_HTTP_OK;
+
+    p = ngx_pnalloc(r->pool,
+                    sizeof("{\"purged\":4294967295,"
+                           "\"l1\":\"incomplete\","
+                           "\"l2\":\"unavailable\",\"reason\":\"page-cap\","
+                           "\"scan_pages\":4294967295,"
+                           "\"scan_pool_blocks\":4294967295}\n"));
+    if (p == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+    body.data = p;
+    p = ngx_sprintf(p, "{\"purged\":%ui", ap->purged);
+    if (ap->l1_incomplete) {
+        p = ngx_sprintf(p, ",\"l1\":\"incomplete\"");
+    }
+    if (l2_state != NULL) {
+        if (reason != NULL) {
+            p = ngx_sprintf(p, ",\"l2\":\"%s\",\"reason\":\"%s\"",
+                            l2_state, reason);
+        } else {
+            p = ngx_sprintf(p, ",\"l2\":\"%s\"", l2_state);
+        }
+    }
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+    /* Walk diagnostics, CI builds only: scan_pool_blocks is the oracle for the
+     * per-page-pool release (constant in scan_pages when the walk is O(1) in
+     * page count, linear in it when the whole walk shares one pool). Not a
+     * permanent operator-facing field — same convention as the TEST_FAULTS
+     * breaker counters. */
+    if (walk != NULL) {
+        p = ngx_sprintf(p, ",\"scan_pages\":%ui,\"scan_pool_blocks\":%ui",
+                        walk->pages, walk->blocks);
+    }
+#else
+    (void) walk;
+#endif
+    p = ngx_sprintf(p, "}\n");
+    body.len = p - body.data;
+
+    return ngx_http_cache_turbo_send_json(r, status, &body);
+}
+
+
+/* SCAN-del completion (?all=1): the L2 keyspace walk has ended. `purged`
+ * remains the exact L1 count; L2 deletions are fire-and-forget and not
+ * separately counted. members/nmembers are unused (always 0 here).
  *
  * AUD-SCAN1: the walk does NOT always finish. It ends early on a read timeout,
  * a malformed reply, an allocation failure, or the SCAN page cap — and in every
@@ -79,9 +139,6 @@ ngx_http_cache_turbo_all_purge_complete(ngx_http_request_t *r, void *data,
     const ngx_http_cache_turbo_redis_walk_t *walk)
 {
     ngx_http_cache_turbo_allpurge_t  *ap = data;
-    u_char                           *p;
-    ngx_str_t                         body;
-    ngx_uint_t                        status;
     const char                       *reason;
     const char                       *state;
 
@@ -89,11 +146,9 @@ ngx_http_cache_turbo_all_purge_complete(ngx_http_request_t *r, void *data,
     (void) nmembers;
 
     if (walk == NULL || walk->status == NGX_OK) {
-        status = NGX_HTTP_OK;
         state = NULL;
         reason = NULL;
     } else {
-        status = NGX_HTTP_INTERNAL_SERVER_ERROR;
         reason = (walk->status != NGX_ABORT) ? "error"
                  : walk->deadline ? "deadline" : "page-cap";
 
@@ -106,35 +161,7 @@ ngx_http_cache_turbo_all_purge_complete(ngx_http_request_t *r, void *data,
         state = (walk->pages == 0) ? "unavailable" : "incomplete";
     }
 
-    p = ngx_pnalloc(r->pool,
-                    sizeof("{\"purged\":4294967295,"
-                           "\"l2\":\"unavailable\",\"reason\":\"page-cap\","
-                           "\"scan_pages\":4294967295,"
-                           "\"scan_pool_blocks\":4294967295}\n"));
-    if (p == NULL) {
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
-    }
-    body.data = p;
-    p = ngx_sprintf(p, "{\"purged\":%ui", ap->purged);
-    if (reason != NULL) {
-        p = ngx_sprintf(p, ",\"l2\":\"%s\",\"reason\":\"%s\"", state, reason);
-    }
-#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
-    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
-    /* Walk diagnostics, CI builds only: scan_pool_blocks is the oracle for the
-     * per-page-pool release (constant in scan_pages when the walk is O(1) in
-     * page count, linear in it when the whole walk shares one pool). Not a
-     * permanent operator-facing field — same convention as the TEST_FAULTS
-     * breaker counters. */
-    if (walk != NULL) {
-        p = ngx_sprintf(p, ",\"scan_pages\":%ui,\"scan_pool_blocks\":%ui",
-                        walk->pages, walk->blocks);
-    }
-#endif
-    p = ngx_sprintf(p, "}\n");
-    body.len = p - body.data;
-
-    return ngx_http_cache_turbo_send_json(r, status, &body);
+    return ngx_http_cache_turbo_all_purge_reply(r, ap, state, reason, walk);
 }
 
 
@@ -149,26 +176,13 @@ ngx_http_cache_turbo_admin_purge_all(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_zone_t *z,
     ngx_uint_t *purged, ngx_flag_t *responded)
 {
-    u_char     *p;
-    ngx_str_t   body;
+    ngx_int_t   l1_rc;
+    ngx_flag_t  l1_incomplete;
 
     *responded = 0;
 
-    if (clcf->l1->purge_all(z, purged) != NGX_OK) {
-        p = ngx_pnalloc(r->pool,
-                        sizeof("{\"purged\":4294967295,"
-                               "\"l1\":\"incomplete\"}\n"));
-        if (p == NULL) {
-            return NGX_HTTP_INTERNAL_SERVER_ERROR;
-        }
-        body.data = p;
-        body.len = ngx_sprintf(p,
-                       "{\"purged\":%ui,\"l1\":\"incomplete\"}\n",
-                       *purged) - p;
-        *responded = 1;
-        return ngx_http_cache_turbo_send_json(r,
-                   NGX_HTTP_INTERNAL_SERVER_ERROR, &body);
-    }
+    l1_rc = clcf->l1->purge_all(z, purged);
+    l1_incomplete = (l1_rc != NGX_OK);
 
     /* L2-aware all-purge (v4-2): also clear the whole L2 keyspace for
      * this prefix via a parked SCAN MATCH <prefix>* + DEL loop, so an
@@ -185,6 +199,7 @@ ngx_http_cache_turbo_admin_purge_all(ngx_http_request_t *r,
             return NGX_HTTP_INTERNAL_SERVER_ERROR;
         }
         ap->purged = *purged;
+        ap->l1_incomplete = l1_incomplete;
 
         rc = clcf->backend->scan_del(r, clcf,
                  ngx_http_cache_turbo_all_purge_complete, ap);
@@ -202,19 +217,18 @@ ngx_http_cache_turbo_admin_purge_all(ngx_http_request_t *r,
          * plus an explicit L2 state. "unavailable" rather than
          * "incomplete" — nothing was walked at all. L1 really was
          * purged and "purged" still reports that count. */
-        p = ngx_pnalloc(r->pool,
-                        sizeof("{\"purged\":4294967295,"
-                               "\"l2\":\"unavailable\"}\n"));
-        if (p == NULL) {
-            return NGX_HTTP_INTERNAL_SERVER_ERROR;
-        }
-        body.data = p;
-        body.len = ngx_sprintf(p,
-                       "{\"purged\":%ui,\"l2\":\"unavailable\"}\n",
-                       *purged) - p;
         *responded = 1;
-        return ngx_http_cache_turbo_send_json(r,
-                   NGX_HTTP_INTERNAL_SERVER_ERROR, &body);
+        return ngx_http_cache_turbo_all_purge_reply(r, ap, "unavailable",
+                                                     NULL, NULL);
+    }
+
+    if (l1_incomplete) {
+        ngx_http_cache_turbo_allpurge_t  ap;
+
+        ap.purged = *purged;
+        ap.l1_incomplete = 1;
+        *responded = 1;
+        return ngx_http_cache_turbo_all_purge_reply(r, &ap, NULL, NULL, NULL);
     }
 
     return NGX_OK;

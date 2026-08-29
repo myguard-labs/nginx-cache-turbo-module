@@ -139,9 +139,10 @@ static void
 test_update_failure_is_sticky(void)
 {
     ngx_http_cache_turbo_digest_t  d;
-    u_char                         out[32];
+    u_char                         out[32], unpublished[32];
 
     memset(out, 0xA5, sizeof(out));
+    memset(unpublished, 0xA5, sizeof(unpublished));
     ngx_http_cache_turbo_digest_init(&d);
     ngx_http_cache_turbo_test_digest_update_fail = 1;
     ngx_http_cache_turbo_digest_update(&d, "discarded", 9);
@@ -149,22 +150,23 @@ test_update_failure_is_sticky(void)
 
     CHECK(ngx_http_cache_turbo_digest_final(&d, out) == NGX_ERROR,
           "a failed EVP_DigestUpdate must stay failed through final");
-    CHECK(out[0] == 0xA5 && out[31] == 0xA5,
-          "failed update/final must not publish digest bytes");
+    CHECK(memcmp(out, unpublished, sizeof(out)) == 0,
+          "failed update/final must not publish any digest byte");
 }
 
 static void
 test_final_failure_propagates(void)
 {
-    u_char  out[32];
+    u_char  out[32], unpublished[32];
 
     memset(out, 0x5A, sizeof(out));
+    memset(unpublished, 0x5A, sizeof(unpublished));
     ngx_http_cache_turbo_test_digest_fail = 1;
     CHECK(ngx_http_cache_turbo_digest("final-fail", 10, out) == NGX_ERROR,
           "a failed EVP_DigestFinal_ex must propagate through digest()");
     ngx_http_cache_turbo_test_digest_fail = 0;
-    CHECK(out[0] == 0x5A && out[31] == 0x5A,
-          "failed final must not publish digest bytes");
+    CHECK(memcmp(out, unpublished, sizeof(out)) == 0,
+          "failed final must not publish any digest byte");
 }
 
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L && !defined(LIBRESSL_VERSION_NUMBER)

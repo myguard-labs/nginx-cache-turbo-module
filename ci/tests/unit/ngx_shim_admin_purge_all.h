@@ -18,6 +18,7 @@ typedef unsigned char  u_char;
 #define NGX_ERROR                       -1
 #define NGX_AGAIN                       -2
 #define NGX_DONE                        -4
+#define NGX_ABORT                       -6
 #define NGX_HTTP_OK                    200
 #define NGX_HTTP_BAD_REQUEST           400
 #define NGX_HTTP_INTERNAL_SERVER_ERROR 500
@@ -41,6 +42,9 @@ struct ngx_http_request_s {
     ngx_str_t    sent_body;
 };
 
+static u_char  *ngx_test_alloc_start;
+static u_char  *ngx_test_alloc_end;
+
 typedef struct ngx_http_cache_turbo_zone_s ngx_http_cache_turbo_zone_t;
 struct ngx_http_cache_turbo_zone_s { int unused; };
 
@@ -48,12 +52,20 @@ typedef struct ngx_http_cache_turbo_loc_conf_s ngx_http_cache_turbo_loc_conf_t;
 typedef struct ngx_http_cache_turbo_redis_walk_s
     ngx_http_cache_turbo_redis_walk_t;
 
+struct ngx_http_cache_turbo_redis_walk_s {
+    ngx_int_t   status;
+    ngx_uint_t  pages;
+    ngx_uint_t  blocks;
+    unsigned    deadline:1;
+};
+
 typedef ngx_int_t (*ngx_http_cache_turbo_walk_pt)(ngx_http_request_t *r,
     void *data, ngx_str_t *members, ngx_uint_t nmembers,
     const ngx_http_cache_turbo_redis_walk_t *walk);
 
 typedef struct {
     ngx_uint_t  purged;
+    ngx_flag_t  l1_incomplete;
 } ngx_http_cache_turbo_allpurge_t;
 
 typedef struct {
@@ -143,11 +155,15 @@ ngx_pnalloc(ngx_pool_t *pool, size_t size)
 {
     void  *p;
 
-    if (size > sizeof(pool->storage) - pool->used) {
+    if (pool->used > sizeof(pool->storage)
+        || size > sizeof(pool->storage) - pool->used)
+    {
         return NULL;
     }
     p = pool->storage + pool->used;
     pool->used += size;
+    ngx_test_alloc_start = p;
+    ngx_test_alloc_end = (u_char *) p + size;
     return p;
 }
 
@@ -160,34 +176,96 @@ ngx_palloc(ngx_pool_t *pool, size_t size)
 static u_char *
 ngx_sprintf(u_char *buf, const char *fmt, ...)
 {
+    enum { CONV_UI, CONV_STRING } conversions[2];
     va_list     ap;
-    ngx_uint_t  purged;
-    char        converted[128];
-    size_t      i, j;
+    char        converted[256];
+    size_t      available, i, j, nconv;
     int         n;
 
     /* nginx's %ui is standard printf's %lu for this uintptr_t-backed shim.
      * Preserve every other source byte so the test observes JSON field/order
-     * mutations instead of regenerating the expected body itself. */
+     * mutations instead of regenerating the expected body itself. Abort on a
+     * conversion the shim does not model instead of consuming the wrong vararg
+     * type and accidentally blessing malformed production output. */
+    nconv = 0;
     for (i = 0, j = 0; fmt[i] != '\0' && j + 1 < sizeof(converted); i++) {
         if (fmt[i] == '%' && fmt[i + 1] == 'u' && fmt[i + 2] == 'i'
             && j + 3 < sizeof(converted))
         {
+            if (nconv == 2) {
+                fprintf(stderr, "shim ngx_sprintf: too many conversions\n");
+                abort();
+            }
+            conversions[nconv++] = CONV_UI;
             converted[j++] = '%';
             converted[j++] = 'l';
             converted[j++] = 'u';
             i += 2;
+        } else if (fmt[i] == '%' && fmt[i + 1] == 's') {
+            if (nconv == 2) {
+                fprintf(stderr, "shim ngx_sprintf: too many conversions\n");
+                abort();
+            }
+            conversions[nconv++] = CONV_STRING;
+            converted[j++] = fmt[i];
+            converted[j++] = fmt[++i];
+        } else if (fmt[i] == '%') {
+            fprintf(stderr, "shim ngx_sprintf: unsupported format \"%s\"\n",
+                    fmt);
+            abort();
         } else {
             converted[j++] = fmt[i];
         }
     }
+    if (fmt[i] != '\0') {
+        fprintf(stderr, "shim ngx_sprintf: converted format overflow\n");
+        abort();
+    }
     converted[j] = '\0';
 
+    if (buf < ngx_test_alloc_start || buf >= ngx_test_alloc_end) {
+        fprintf(stderr, "shim ngx_sprintf: destination outside allocation\n");
+        abort();
+    }
+    available = (size_t) (ngx_test_alloc_end - buf);
+
     va_start(ap, fmt);
-    purged = va_arg(ap, ngx_uint_t);
+    if (nconv == 0) {
+        n = snprintf((char *) buf, available, "%s", converted);
+    } else if (nconv == 1 && conversions[0] == CONV_UI) {
+        ngx_uint_t  value = va_arg(ap, ngx_uint_t);
+
+        n = snprintf((char *) buf, available, converted,
+                     (unsigned long) value);
+    } else if (nconv == 1 && conversions[0] == CONV_STRING) {
+        const char  *value = va_arg(ap, const char *);
+
+        n = snprintf((char *) buf, available, converted, value);
+    } else if (conversions[0] == CONV_UI
+               && conversions[1] == CONV_UI)
+    {
+        ngx_uint_t  first = va_arg(ap, ngx_uint_t);
+        ngx_uint_t  second = va_arg(ap, ngx_uint_t);
+
+        n = snprintf((char *) buf, available, converted,
+                     (unsigned long) first, (unsigned long) second);
+    } else if (conversions[0] == CONV_STRING
+               && conversions[1] == CONV_STRING)
+    {
+        const char  *first = va_arg(ap, const char *);
+        const char  *second = va_arg(ap, const char *);
+
+        n = snprintf((char *) buf, available, converted, first, second);
+    } else {
+        fprintf(stderr, "shim ngx_sprintf: unsupported conversion order\n");
+        abort();
+    }
     va_end(ap);
 
-    n = snprintf((char *) buf, 128, converted, (unsigned long) purged);
+    if (n < 0 || (size_t) n >= available) {
+        fprintf(stderr, "shim ngx_sprintf: destination allocation overflow\n");
+        abort();
+    }
     return buf + n;
 }
 
@@ -198,19 +276,6 @@ ngx_http_cache_turbo_send_json(ngx_http_request_t *r, ngx_uint_t status,
     r->send_calls++;
     r->sent_status = status;
     r->sent_body = *body;
-    return NGX_OK;
-}
-
-static ngx_int_t
-ngx_http_cache_turbo_all_purge_complete(ngx_http_request_t *r, void *data,
-    ngx_str_t *members, ngx_uint_t nmembers,
-    const ngx_http_cache_turbo_redis_walk_t *walk)
-{
-    (void) r;
-    (void) data;
-    (void) members;
-    (void) nmembers;
-    (void) walk;
     return NGX_OK;
 }
 

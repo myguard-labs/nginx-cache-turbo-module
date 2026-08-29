@@ -22,10 +22,10 @@
 # changes upstream is picked up on the next build, and a body that can no
 # longer be found fails the build loudly rather than silently testing nothing.
 #
-# Functions deliberately NOT sliced (they pull in the blob refcount layer,
-# response serialisation and the config surface, none of which this harness is
-# about): _init_zone, _store, _stats, _purge_key, _purge_all, _drop_locked.
-# The two that the sliced set calls into are stubbed in test_shm_state.c.
+# Functions deliberately NOT sliced (they pull in response serialisation and
+# the config surface, none of which this harness is about): _init_zone, _store,
+# _stats and _purge_key.  The blob-ref helpers, _drop_locked and _purge_all are
+# sliced because their ownership and bounded-concurrency contracts are tested.
 
 set -euo pipefail
 
@@ -355,6 +355,21 @@ awk '
         if ($0 == "}") { capture = 0 }
     }
 ' "$SRC" > "$OUT"
+
+# Falsifiable PURGE-ALL-STARVATION control.  A practically unbounded work
+# budget reproduces the old "drain until empty" behavior for this finite
+# concurrent-refill fixture: it consumes the refill and reports success.  The
+# control runner requires the exact snapshot assertions to fail without a
+# watchdog/hang, then immediately regenerates the unmodified slice.
+if [ "${CTRL_PURGE_NO_SNAPSHOT:-0}" = 1 ]; then
+    snapshot_line='    remaining = ngx_http_cache_turbo_zone_sh(z)->n_entries;'
+    if [ "$(grep -cF "$snapshot_line" "$OUT")" -ne 1 ]; then
+        echo "✗ purge snapshot mutation could not find its production line" >&2
+        rm -f "$OUT"
+        exit 1
+    fi
+    sed -i 's/    remaining = ngx_http_cache_turbo_zone_sh(z)->n_entries;/    remaining = (ngx_uint_t) -1; \/\* CTRL: no finite snapshot \*\//' "$OUT"
+fi
 
 # --- P6/O4.2: the breaker's origin-failure predicate lives in module.c, not
 # shm.c, because it is about the RESPONSE (a status code) rather than about the

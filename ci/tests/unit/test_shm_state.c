@@ -59,8 +59,14 @@ ngx_uint_t  ngx_test_lock_count  = 0;
 pthread_mutex_t  ngx_test_shmtx = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t  ngx_test_unlock_barrier_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t   ngx_test_unlock_barrier_cond = PTHREAD_COND_INITIALIZER;
+pthread_t        ngx_test_unlock_barrier_expected;
 int              ngx_test_unlock_barrier_phase;
 int              ngx_test_unlock_barrier_armed;
+int              ngx_test_unlock_barrier_expected_set;
+int              ngx_test_unlock_barrier_timed_out;
+int              ngx_test_unlock_barrier_hits;
+static int       purge_test_refill_started;
+static int       purge_test_refill_completed;
 
 /* --- the node/zone types under test.
  * Sliced from the shipped header so the layout cannot drift from production;
@@ -561,19 +567,36 @@ purge_test_refill(void *data)
     purge_refill_arg_t  *arg = data;
 
     (void) pthread_mutex_lock(&ngx_test_unlock_barrier_mutex);
-    while (ngx_test_unlock_barrier_phase != 1) {
-        (void) pthread_cond_wait(&ngx_test_unlock_barrier_cond,
-                                 &ngx_test_unlock_barrier_mutex);
+    if (ngx_test_unlock_barrier_wait_locked(1, "refill") != 0) {
+        (void) pthread_mutex_unlock(&ngx_test_unlock_barrier_mutex);
+        return NULL;
     }
     (void) pthread_mutex_unlock(&ngx_test_unlock_barrier_mutex);
 
+    __atomic_store_n(&purge_test_refill_started, 1, __ATOMIC_RELEASE);
     purge_test_fill(arg->first, arg->count);
+    __atomic_store_n(&purge_test_refill_completed, 1, __ATOMIC_RELEASE);
 
     (void) pthread_mutex_lock(&ngx_test_unlock_barrier_mutex);
     ngx_test_unlock_barrier_phase = 2;
     (void) pthread_cond_broadcast(&ngx_test_unlock_barrier_cond);
     (void) pthread_mutex_unlock(&ngx_test_unlock_barrier_mutex);
     return NULL;
+}
+
+static void
+purge_test_arm_unlock_barrier(pthread_t expected)
+{
+    (void) pthread_mutex_lock(&ngx_test_unlock_barrier_mutex);
+    ngx_test_unlock_barrier_expected = expected;
+    ngx_test_unlock_barrier_expected_set = 1;
+    ngx_test_unlock_barrier_phase = 0;
+    ngx_test_unlock_barrier_timed_out = 0;
+    ngx_test_unlock_barrier_hits = 0;
+    (void) pthread_mutex_unlock(&ngx_test_unlock_barrier_mutex);
+    __atomic_store_n(&purge_test_refill_started, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&purge_test_refill_completed, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&ngx_test_unlock_barrier_armed, 1, __ATOMIC_RELEASE);
 }
 
 /* Release a refill thread whose production-side unlock never reached the
@@ -587,13 +610,21 @@ purge_test_refill(void *data)
 static void
 purge_test_force_release_refill(void)
 {
-    (void) __atomic_exchange_n(&ngx_test_unlock_barrier_armed, 0,
-                               __ATOMIC_SEQ_CST);
+    __atomic_store_n(&ngx_test_unlock_barrier_armed, 0, __ATOMIC_RELEASE);
     (void) pthread_mutex_lock(&ngx_test_unlock_barrier_mutex);
     if (ngx_test_unlock_barrier_phase == 0) {
         ngx_test_unlock_barrier_phase = 1;
     }
     (void) pthread_cond_broadcast(&ngx_test_unlock_barrier_cond);
+    (void) pthread_mutex_unlock(&ngx_test_unlock_barrier_mutex);
+}
+
+static void
+purge_test_disarm_unlock_barrier(void)
+{
+    __atomic_store_n(&ngx_test_unlock_barrier_armed, 0, __ATOMIC_RELEASE);
+    (void) pthread_mutex_lock(&ngx_test_unlock_barrier_mutex);
+    ngx_test_unlock_barrier_expected_set = 0;
     (void) pthread_mutex_unlock(&ngx_test_unlock_barrier_mutex);
 }
 
@@ -614,14 +645,10 @@ test_purge_all_snapshot_bounds_concurrent_refill(void)
 
     arg.first = SNAPSHOT;
     arg.count = SNAPSHOT;
-    ngx_test_unlock_barrier_phase = 0;
-    ngx_test_unlock_barrier_armed = 1;
     thread_rc = pthread_create(&refill, NULL, purge_test_refill, &arg);
-    if (thread_rc != 0) {
-        ngx_test_unlock_barrier_armed = 0;
-    }
     REQUIRE(thread_rc == 0,
             "fixture: pthread_create(refill) failed");
+    purge_test_arm_unlock_barrier(pthread_self());
 
     watchdog_arm("purge-all must stop at its start-of-call snapshot");
     rc = ngx_http_cache_turbo_shm_purge_all(&g_zone, &purged);
@@ -629,7 +656,16 @@ test_purge_all_snapshot_bounds_concurrent_refill(void)
     CHECK(pthread_join(refill, NULL) == 0,
           "fixture: pthread_join(refill) failed");
     watchdog_disarm();
+    purge_test_disarm_unlock_barrier();
 
+    CHECK(ngx_test_unlock_barrier_timed_out == 0,
+          "purge/refill barrier must complete without a timed wait failure");
+    CHECK(ngx_test_unlock_barrier_hits == 1,
+          "only the expected purger unlock may consume the one-shot barrier");
+    CHECK(__atomic_load_n(&purge_test_refill_started, __ATOMIC_ACQUIRE) == 1
+          && __atomic_load_n(&purge_test_refill_completed,
+                             __ATOMIC_ACQUIRE) == 1,
+          "refill must truly overlap the purger between snapshot and drain");
     CHECK(rc == NGX_AGAIN,
           "concurrent refill must report purge-all as incomplete");
     CHECK(purged == SNAPSHOT,

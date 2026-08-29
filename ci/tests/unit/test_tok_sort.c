@@ -157,15 +157,27 @@ both(const char *what, ngx_str_t *in, ngx_uint_t n)
     ngx_str_t  *b;
 
     if (a == NULL) {
-        if (!expected_alloc_failure) failures++;
-        fprintf(stderr, "✓ %s: first comparison allocation handled\n", what);
+        if (expected_alloc_failure) {
+            fprintf(stderr, "✓ %s: first comparison allocation handled\n",
+                    what);
+        } else {
+            failures++;
+            fprintf(stderr, "✗ %s: unexpected first comparison allocation "
+                    "failure\n", what);
+        }
         return;
     }
 
     b = test_malloc(n * sizeof(ngx_str_t) + 1);
     if (b == NULL) {
-        if (!expected_alloc_failure) failures++;
-        fprintf(stderr, "✓ %s: second comparison allocation handled\n", what);
+        if (expected_alloc_failure) {
+            fprintf(stderr, "✓ %s: second comparison allocation handled\n",
+                    what);
+        } else {
+            failures++;
+            fprintf(stderr, "✗ %s: unexpected second comparison allocation "
+                    "failure\n", what);
+        }
         test_free(a);
         return;
     }
@@ -187,14 +199,14 @@ allocation_fault_checks(ngx_str_t *in)
 {
     alloc_fail_after = 0;
     expected_alloc_failure = 1;
-    both("first allocation fault", in, 2);
+    both("first allocation fault", in, 1);
     if (outstanding_allocs != 0) {
         failures++;
         fprintf(stderr, "✗ first allocation fault leaked comparison storage\n");
     }
 
     alloc_fail_after = 1;
-    both("second allocation fault", in, 2);
+    both("second allocation fault", in, 1);
     if (outstanding_allocs != 0) {
         failures++;
         fprintf(stderr, "✗ second allocation fault leaked comparison storage\n");

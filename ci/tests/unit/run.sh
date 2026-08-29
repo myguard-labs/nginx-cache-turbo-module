@@ -141,9 +141,18 @@ bash "$DIR/extract_access_marker_resolve.sh"
 	-o "$DIR/test_access_marker_resolve"
 "$DIR/test_access_marker_resolve"
 
+# --- marker mandatory-L1 / L2 write-through ordering --------------------
+# Exercise the real helper: an L1 marker write failure must propagate and
+# prevent L2 publication; success retains exact key/body bytes in both tiers.
+bash "$DIR/extract_marker_store_key.sh"
+# shellcheck disable=SC2086
+"$CC" $CFLAGS "$DIR/test_marker_store_key.c" -o "$DIR/test_marker_store_key"
+"$DIR/test_marker_store_key"
+
 # --- admin ?all=1 incomplete-L1 response contract ------------------------
-# Exercise the real helper: NGX_AGAIN must send the exact 500 JSON response
-# and stop before a configured L2 SCAN can launch.
+# Exercise the real dispatcher and completion callback: NGX_AGAIN must still
+# launch configured L2 cleanup, then retain both tiers' exact outcome in the
+# single synchronous or asynchronous response.
 bash "$DIR/extract_admin_purge_all.sh"
 # shellcheck disable=SC2086
 "$CC" $CFLAGS "$DIR/test_admin_purge_all.c" -o "$DIR/test_admin_purge_all"
@@ -245,6 +254,11 @@ if [ -f "$NGINX_OBJS/ngx_auto_config.h" ]; then
         NGINX_VERSION="$NGINX_VERSION" \
         NGINX_SRC="$NGINX_SRC" \
         NGINX_OBJS="$NGINX_OBJS"
+
+    echo "--- purge-all finite-snapshot mutation control ---"
+    NGINX_VERSION="$NGINX_VERSION" NGINX_SRC="$NGINX_SRC" \
+        NGINX_OBJS="$NGINX_OBJS" \
+        bash "$DIR/check_purge_snapshot_control.sh"
 
     # --- c-1: varidx drop/reissue accounting is production-reachable -------
     # The PURGE reply's "complete":false honesty field depends on

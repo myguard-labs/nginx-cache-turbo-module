@@ -750,9 +750,10 @@ ngx_http_cache_turbo_variant_index_name(ngx_str_t *base, u_char *buf,
 }
 
 
-/* Store/refresh an L1 vary marker using its already-derived slot key. The purge
- * path uses this entry point after preflighting every digest-derived key, so an
- * EVP failure cannot occur after it has deleted the base object. */
+/* Store/refresh a vary marker using its already-derived slot key. The L1 write
+ * is mandatory and precedes the optional L2 write-through. The purge path uses
+ * this entry point after preflighting every digest-derived key, so an EVP
+ * failure cannot occur after it has deleted the base object. */
 ngx_int_t
 ngx_http_cache_turbo_marker_store_key(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf,
@@ -804,9 +805,12 @@ ngx_http_cache_turbo_marker_store_key(ngx_http_request_t *r,
      * `markers` presence-counter bookkeeping into the SAME lock hold as the
      * write itself (see its own comment in shm.c for why that atomicity is
      * required, not just tidy). */
-    (void) ngx_http_cache_turbo_shm_store_marker(z, marker_key,
-               ngx_crc32_short(marker_key, 32), blob, sizeof(blob), ttl,
-               retain_ttl);
+    if (ngx_http_cache_turbo_shm_store_marker(z, marker_key,
+            ngx_crc32_short(marker_key, 32), blob, sizeof(blob), ttl,
+            retain_ttl) != NGX_OK)
+    {
+        return NGX_ERROR;
+    }
 
     /* P3-5: write the marker through to L2 too, keyed by marker_hash (the
      * SAME key a marker-cold consult GETs -- see access_l2_marker_get()).

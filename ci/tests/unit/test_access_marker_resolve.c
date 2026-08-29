@@ -56,7 +56,7 @@ main(void)
     ngx_http_cache_turbo_zone_t      zone;
     ngx_http_cache_turbo_ctx_t       ctx;
     uint32_t                         hash, expected_hash;
-    u_char                           expected_key[32];
+    u_char                           expected_key[32], key_before_failure[32];
     ngx_uint_t                       i;
     ngx_int_t                        rc;
 
@@ -108,6 +108,9 @@ main(void)
      * must not attempt marker replication with invalid key state. */
     reset_faults();
     ngx_test_variant_hash_result = NGX_ERROR;
+    memset(ctx.key_hash, 0xC3, sizeof(ctx.key_hash));
+    memcpy(key_before_failure, ctx.key_hash, sizeof(key_before_failure));
+    hash = 0xdecafbadU;
     rc = ngx_http_cache_turbo_access_l2_marker_resolve(&request, &clcf, &ctx,
                                                         &zone, &hash, 1, 2,
                                                         10, 40);
@@ -115,6 +118,10 @@ main(void)
           "variant-key digest failure must remain fail-closed");
     CHECK(ngx_test_marker_store_calls == 0 && ngx_test_warning_calls == 0,
           "variant-key failure must stop before marker self-heal");
+    CHECK(memcmp(ctx.key_hash, key_before_failure,
+                 sizeof(key_before_failure)) == 0
+              && hash == 0xdecafbadU,
+          "variant-key failure must not publish key bytes or hash");
 
     fprintf(stderr, "access marker resolve policy: %d failures\n", failures);
     return failures ? 1 : 0;

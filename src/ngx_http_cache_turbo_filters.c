@@ -2290,10 +2290,11 @@ ngx_http_cache_turbo_body_filter_tag_index(ngx_http_request_t *r,
  * _store_tail so that function's CCN stays readable; mirrors how the L9 tag
  * path already sits in _body_filter_tag_split above.
  *
- * Returns NGX_ERROR only when the marker key digest fails; the caller then
- * removes the just-stored variant rather than leave a cache entry reachable
- * through an invalid marker key. Variant-index digest/transport failures use
- * the existing pending/reissue accounting and remain fire-and-forget. */
+ * Returns NGX_ERROR when the marker key digest or the L1 marker write fails;
+ * the caller then removes the just-stored variant rather than leave a cache
+ * entry reachable through an invalid or stale marker. Variant-index
+ * digest/transport failures use the existing pending/reissue accounting and
+ * remain fire-and-forget. */
 static ngx_int_t
 ngx_http_cache_turbo_body_filter_varidx_store(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx,

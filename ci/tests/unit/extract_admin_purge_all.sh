@@ -9,7 +9,7 @@ OUT="$DIR/generated_admin_purge_all.inc"
 
 awk '
     /^static ngx_int_t$/ { pending = 1; buf = $0 ORS; next }
-    pending && /^ngx_http_cache_turbo_admin_purge_(all|dispatch)\(/ {
+    pending && /^ngx_http_cache_turbo_(all_purge_(reply|complete)|admin_purge_(all|dispatch))\(/ {
         capture = 1; pending = 0; printf "%s", buf; print; next
     }
     pending { pending = 0; buf = "" }
@@ -19,16 +19,16 @@ awk '
     }
 ' "$SRC" >"$OUT"
 
-if ! grep -qF 'ngx_http_cache_turbo_admin_purge_all(' "$OUT"; then
-	echo "✗ failed to extract admin purge-all helper from $SRC" >&2
-	rm -f "$OUT"
-	exit 1
-fi
+for fn in \
+	ngx_http_cache_turbo_all_purge_reply \
+	ngx_http_cache_turbo_all_purge_complete \
+	ngx_http_cache_turbo_admin_purge_all \
+	ngx_http_cache_turbo_admin_purge_dispatch; do
+	if ! grep -qF "$fn(" "$OUT"; then
+		echo "✗ failed to extract $fn from $SRC" >&2
+		rm -f "$OUT"
+		exit 1
+	fi
+done
 
-if ! grep -qF 'ngx_http_cache_turbo_admin_purge_dispatch(' "$OUT"; then
-	echo "✗ failed to extract admin purge dispatcher from $SRC" >&2
-	rm -f "$OUT"
-	exit 1
-fi
-
-echo "✓ extracted admin purge-all helper + dispatcher → $(basename "$OUT")"
+echo "✓ extracted admin purge-all reply/callback/helper/dispatcher → $(basename "$OUT")"

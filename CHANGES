@@ -10,8 +10,10 @@ Changes with the nginx-cache-turbo-module (unreleased)
        the zone between its 512-entry mutex batches. The walk now consumes a
        finite start-of-call entry budget. If concurrent refill still leaves
        entries at the final lock-held observation, the admin endpoint returns
-       500 with {"purged":N,"l1":"incomplete"}; an idle purge still drains
-       both LRU queues completely and returns 200.
+       500 with {"purged":N,"l1":"incomplete"}, while still completing a
+       configured L2 purge; if both tiers are incomplete their fields are
+       combined in the response. An idle purge still drains both LRU queues
+       completely and returns 200.
 
     *) Security: admin-triggered warm subrequests now rebuild their request
        headers from a Host/User-Agent allowlist before contacting the origin.

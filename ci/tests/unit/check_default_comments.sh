@@ -9,9 +9,6 @@ header = open(root + '/src/ngx_http_cache_turbo_module.h').read()
 contracts = {
     'scan_resistant_pct': r'conf->scan_resistant_pct = NGX_HTTP_CACHE_TURBO_PROTECTED_PCT_DEFAULT',
     'vary_marker_revalidate': r'ngx_conf_merge_sec_value\(conf->vary_marker_revalidate,\s*prev->vary_marker_revalidate, 2\)',
-    'breaker_enable': r'ngx_conf_merge_value\(conf->breaker_enable, prev->breaker_enable, 1\)',
-    'breaker_threshold': r'ngx_conf_merge_uint_value\(conf->breaker_threshold,\s*prev->breaker_threshold, 5\)',
-    'breaker_window': r'ngx_conf_merge_sec_value\(conf->breaker_window, prev->breaker_window, 10\)',
 }
 for name, pattern in contracts.items():
     if not re.search(pattern, conf):
@@ -21,12 +18,47 @@ if not re.search(r'#define NGX_HTTP_CACHE_TURBO_PROTECTED_PCT_DEFAULT\s+80\b', h
 comments = {
     'scan_resistant_pct': r'on by\s+default.*default 80',
     'vary_marker_revalidate': r'Shipped ON by default at 2s',
-    'breaker_enable': r'Shipped ON by default',
-    'breaker_threshold': r'5 failures within a 10s window',
-    'breaker_window': r'5 failures within a 10s window',
 }
 for name, pattern in comments.items():
     if not re.search(pattern, header + conf, re.S):
         raise SystemExit(f'default comment missing for {name}')
+
+# Keep the breaker field comments mechanically tied to the values used by the
+# real merge calls.  Searching header+conf for generic prose allowed all three
+# comments to disappear from the declarations while conf.c satisfied its own
+# documentation gate.
+breaker_merges = {
+    'breaker_enable':
+        r'ngx_conf_merge_value\(conf->breaker_enable, prev->breaker_enable, (\d+)\)',
+    'breaker_threshold':
+        r'ngx_conf_merge_uint_value\(conf->breaker_threshold,\s*prev->breaker_threshold, (\d+)\)',
+    'breaker_window':
+        r'ngx_conf_merge_sec_value\(conf->breaker_window, prev->breaker_window, (\d+)\)',
+}
+defaults = {}
+for name, pattern in breaker_merges.items():
+    match = re.search(pattern, conf)
+    if not match:
+        raise SystemExit(f'merge default missing for {name}')
+    defaults[name] = match.group(1)
+
+if defaults != {
+    'breaker_enable': '1',
+    'breaker_threshold': '5',
+    'breaker_window': '10',
+}:
+    raise SystemExit(f'approved breaker defaults drifted: {defaults}')
+
+field_comments = {
+    'breaker_enable':
+        rf'breaker_enable;\s*/\*\s*merge default {defaults["breaker_enable"]} \(on\)',
+    'breaker_threshold':
+        rf'breaker_threshold;\s*/\*\s*merge default {defaults["breaker_threshold"]}; 0 = off',
+    'breaker_window':
+        rf'breaker_window;\s*/\*\s*merge default {defaults["breaker_window"]}s; 0 = off',
+}
+for name, pattern in field_comments.items():
+    if not re.search(pattern, header):
+        raise SystemExit(f'field comment does not match conf.c merge for {name}')
 print('OK: default comments match extracted merge-time contracts')
 PY

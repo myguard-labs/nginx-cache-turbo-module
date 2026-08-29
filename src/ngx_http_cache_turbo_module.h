@@ -2098,7 +2098,7 @@ typedef struct {
      * rule this feeds. This is one of THREE independent ways to express
      * "breaker off": the flag itself, `breaker_threshold 0`, or
      * `breaker_window 0`. */
-    ngx_flag_t               breaker_enable;
+    ngx_flag_t               breaker_enable;    /* merge default 1 (on)       */
 
     /* P6/O4.2 circuit-breaker tuning. Fed to
      * ngx_http_cache_turbo_shm_breaker_record() from the request path; the
@@ -2118,8 +2118,8 @@ typedef struct {
      * 404-heavy site trip its own breaker and 503 everything while the origin
      * was fine. The breaker's failure test is 5xx-only -- see
      * ngx_http_cache_turbo_breaker_is_origin_failure(). */
-    ngx_uint_t               breaker_threshold; /* failures to trip; 0 = off  */
-    time_t                   breaker_window;    /* rolling window s; 0 = off  */
+    ngx_uint_t               breaker_threshold; /* merge default 5; 0 = off   */
+    time_t                   breaker_window;    /* merge default 10s; 0 = off */
 
     /* P5-5r: cache_turbo_breaker_count_retries off|on. OPT-IN, default off,
      * unlike every other breaker knob above (which ship on/pre-tuned by

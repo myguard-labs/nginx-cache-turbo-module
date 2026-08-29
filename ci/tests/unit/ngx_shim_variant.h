@@ -143,7 +143,7 @@ ngx_http_cache_turbo_digest_final(ngx_http_cache_turbo_digest_t *d,
 }
 
 static u_char *
-ngx_hex_dump(u_char *dst, const u_char *src, size_t len)
+ngx_hex_dump(u_char *dst, u_char *src, size_t len)
 {
     static const u_char  hex[] = "0123456789abcdef";
 

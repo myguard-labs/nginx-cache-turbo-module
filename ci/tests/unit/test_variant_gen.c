@@ -199,12 +199,13 @@ static void
 digest_failures_propagate_across_vary_helpers(void)
 {
     ngx_str_t  base;
-    u_char     out[1 + 64];
+    u_char     out[1 + 64], unpublished[1 + 64];
     size_t     len = 123;
 
     base.data = (u_char *) VARIANT_TEST_BASE;
     base.len = strlen(VARIANT_TEST_BASE);
     memset(out, 0xA5, sizeof(out));
+    memset(unpublished, 0xA5, sizeof(unpublished));
 
     ngx_test_digest_update_fail = 1;
     CHECK(ngx_http_cache_turbo_variant_hash(NULL, &base, 0, 7, out)
@@ -217,11 +218,14 @@ digest_failures_propagate_across_vary_helpers(void)
           "variant_index_name must reject a sticky digest-update failure");
     ngx_test_digest_update_fail = 0;
 
-    CHECK(out[0] == 0xA5 && out[64] == 0xA5,
-          "failed Vary digests must not publish key or index bytes");
+    CHECK(memcmp(out, unpublished, sizeof(out)) == 0,
+          "failed Vary updates must not publish any key or index byte");
     CHECK(len == 123,
           "failed variant-index digest must not publish a name length");
 
+    memset(out, 0x5A, sizeof(out));
+    memset(unpublished, 0x5A, sizeof(unpublished));
+    len = 321;
     ngx_test_digest_final_fail = 1;
     CHECK(ngx_http_cache_turbo_variant_hash(NULL, &base, 0, 7, out)
               == NGX_ERROR,
@@ -232,16 +236,21 @@ digest_failures_propagate_across_vary_helpers(void)
               == NGX_ERROR,
           "variant_index_name must reject a digest-final failure");
     ngx_test_digest_final_fail = 0;
+    CHECK(memcmp(out, unpublished, sizeof(out)) == 0,
+          "failed Vary finals must not publish any key or index byte");
+    CHECK(len == 321,
+          "failed variant-index final must not publish a name length");
 }
 
 
 static void
 digest_test_helpers_propagate_failures(void)
 {
-    u_char  tagged[32], variant[32];
+    u_char  tagged[32], variant[32], unpublished[32];
 
     memset(tagged, 0xA5, sizeof(tagged));
     memset(variant, 0xA5, sizeof(variant));
+    memset(unpublished, 0xA5, sizeof(unpublished));
 
     ngx_test_digest_update_fail = 1;
     CHECK(digest_of(7, variant) == NGX_ERROR,
@@ -249,7 +258,13 @@ digest_test_helpers_propagate_failures(void)
     CHECK(digest_of_untagged(tagged) == NGX_ERROR,
           "digest_of_untagged must report an update failure");
     ngx_test_digest_update_fail = 0;
+    CHECK(memcmp(tagged, unpublished, sizeof(tagged)) == 0
+              && memcmp(variant, unpublished, sizeof(variant)) == 0,
+          "failed helper updates must not publish any output byte");
 
+    memset(tagged, 0x5A, sizeof(tagged));
+    memset(variant, 0x5A, sizeof(variant));
+    memset(unpublished, 0x5A, sizeof(unpublished));
     ngx_test_digest_final_fail = 1;
     CHECK(digest_of(7, variant) == NGX_ERROR,
           "digest_of must report a final failure");
@@ -257,9 +272,9 @@ digest_test_helpers_propagate_failures(void)
           "digest_of_untagged must report a final failure");
     ngx_test_digest_final_fail = 0;
 
-    CHECK(tagged[0] == 0xA5 && tagged[31] == 0xA5
-              && variant[0] == 0xA5 && variant[31] == 0xA5,
-          "failed test-helper digests must not publish output bytes");
+    CHECK(memcmp(tagged, unpublished, sizeof(tagged)) == 0
+              && memcmp(variant, unpublished, sizeof(variant)) == 0,
+          "failed helper finals must not publish any output byte");
 }
 
 
