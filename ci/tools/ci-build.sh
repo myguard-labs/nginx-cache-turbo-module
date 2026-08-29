@@ -208,6 +208,7 @@ fi
 cd "$ROOT/$DIR"
 ./configure \
     --with-compat \
+    --with-threads \
     $WITH_DEBUG \
     --with-cc="$WITH_CC" \
     --with-http_realip_module \
