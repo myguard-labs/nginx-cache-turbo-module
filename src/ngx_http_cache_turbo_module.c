@@ -1556,8 +1556,10 @@ ngx_http_cache_turbo_response_sie(ngx_http_request_t *r)
  * NOT pre-parse request Cache-Control into a discrete headers_in field (it does
  * for cookies, not for CC), so the four RFC-1 predicates below used to each call
  * header_find and re-walk the whole list — five full scans per hit. This folds
- * them to one. ctx->req_cc / ctx->req_pragma carry data == NULL when the header
- * is absent. Idempotent via req_cc_resolved.
+ * them to one. Cache-Control is a combinable field (RFC 9110 §5.3), so every
+ * field-line contributes its restrictive boolean directives; req_cc retains
+ * the first line for the numeric freshness parser. ctx->req_cc / ctx->req_pragma
+ * carry data == NULL when the header is absent. Idempotent via req_cc_resolved.
  */
 static void
 ngx_http_cache_turbo_resolve_req_cc(ngx_http_request_t *r,
@@ -1574,9 +1576,9 @@ ngx_http_cache_turbo_resolve_req_cc(ngx_http_request_t *r,
     ngx_str_null(&ctx->req_pragma);
     ctx->req_cc_resolved = 1;
 
-    /* One traversal of the request header list, capturing the first Cache-Control
-     * and first Pragma (first-occurrence-wins, matching the old per-predicate
-     * header_find). Stop early once both are found. */
+    /* One traversal of the request header list. Cache-Control field-lines are
+     * combinable, so merge the restrictive boolean directives from every line
+     * while retaining the first value for the numeric freshness parser. */
     part = &r->headers_in.headers.part;
     h = part->elts;
 
@@ -1592,21 +1594,37 @@ ngx_http_cache_turbo_resolve_req_cc(ngx_http_request_t *r,
         if (h[i].hash == 0) {
             continue;
         }
-        if (ctx->req_cc.data == NULL
-            && h[i].key.len == sizeof("Cache-Control") - 1
+        if (h[i].key.len == sizeof("Cache-Control") - 1
             && ngx_strncasecmp(h[i].key.data, (u_char *) "Cache-Control",
                                sizeof("Cache-Control") - 1) == 0)
         {
-            ctx->req_cc = h[i].value;
+            u_char  *v = h[i].value.data;
+            u_char  *e = v + h[i].value.len;
+
+            if (ctx->req_cc.data == NULL) {
+                ctx->req_cc = h[i].value;
+            }
+            if (ngx_http_cache_turbo_cc_has(v, e, "no-cache",
+                    sizeof("no-cache") - 1))
+            {
+                ctx->req_no_cache = 1;
+            }
+            if (ngx_http_cache_turbo_cc_has(v, e, "no-store",
+                    sizeof("no-store") - 1))
+            {
+                ctx->req_no_store = 1;
+            }
+            if (ngx_http_cache_turbo_cc_has(v, e, "only-if-cached",
+                    sizeof("only-if-cached") - 1))
+            {
+                ctx->req_only_if_cached = 1;
+            }
         } else if (ctx->req_pragma.data == NULL
             && h[i].key.len == sizeof("Pragma") - 1
             && ngx_strncasecmp(h[i].key.data, (u_char *) "Pragma",
                                sizeof("Pragma") - 1) == 0)
         {
             ctx->req_pragma = h[i].value;
-        }
-        if (ctx->req_cc.data != NULL && ctx->req_pragma.data != NULL) {
-            break;
         }
     }
 }
@@ -1631,12 +1649,14 @@ ngx_http_cache_turbo_request_revalidate(ngx_http_request_t *r,
 {
     ngx_http_cache_turbo_resolve_req_cc(r, ctx);
 
+    if (ctx->req_no_cache) {
+        return 1;
+    }
+
     if (ctx->req_cc.data != NULL) {
         u_char  *v = ctx->req_cc.data, *e = ctx->req_cc.data + ctx->req_cc.len;
 
-        if (ngx_http_cache_turbo_cc_has(v, e, "no-cache",
-                sizeof("no-cache") - 1)
-            || ngx_http_cache_turbo_cc_delta(v, e, "max-age",
+        if (ngx_http_cache_turbo_cc_delta(v, e, "max-age",
                 sizeof("max-age") - 1) == 0)
         {
             return 1;
@@ -1664,10 +1684,7 @@ ngx_http_cache_turbo_request_only_if_cached(ngx_http_request_t *r,
     ngx_http_cache_turbo_ctx_t *ctx)
 {
     ngx_http_cache_turbo_resolve_req_cc(r, ctx);
-    return (ctx->req_cc.data != NULL
-            && ngx_http_cache_turbo_cc_has(ctx->req_cc.data,
-                   ctx->req_cc.data + ctx->req_cc.len,
-                   "only-if-cached", sizeof("only-if-cached") - 1)) ? 1 : 0;
+    return ctx->req_only_if_cached ? 1 : 0;
 }
 
 
@@ -1678,10 +1695,7 @@ ngx_http_cache_turbo_request_no_store(ngx_http_request_t *r,
     ngx_http_cache_turbo_ctx_t *ctx)
 {
     ngx_http_cache_turbo_resolve_req_cc(r, ctx);
-    return (ctx->req_cc.data != NULL
-            && ngx_http_cache_turbo_cc_has(ctx->req_cc.data,
-                   ctx->req_cc.data + ctx->req_cc.len,
-                   "no-store", sizeof("no-store") - 1)) ? 1 : 0;
+    return ctx->req_no_store ? 1 : 0;
 }
 
 

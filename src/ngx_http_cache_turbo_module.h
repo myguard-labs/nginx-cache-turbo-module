@@ -2810,13 +2810,16 @@ typedef struct {
      * ngx_http_cache_turbo_request_revalidate() and handled inline. */
     unsigned                 req_only_if_cached:1;
     unsigned                 req_no_store:1;
+    unsigned                 req_no_cache:1;
     /* P4: request Cache-Control + Pragma header values, resolved ONCE by
      * ngx_http_cache_turbo_resolve_req_cc() with a single walk of the request
      * header list, then read by each RFC-1 predicate (revalidate / only-if-cached
      * / no-store / freshness-bounds) instead of each re-walking the whole list
      * (the old path did that 5x per hit). data == NULL means the header is absent.
      * req_cc_resolved guards against double-resolve. nginx does NOT pre-parse a
-     * request Cache-Control field (unlike cookies), so this fold is the win. */
+     * request Cache-Control field (unlike cookies), so this fold is the win.
+     * Boolean directives are merged across every Cache-Control field-line;
+     * req_cc retains the first line for the numeric freshness parser. */
     ngx_str_t                req_cc;
     ngx_str_t                req_pragma;
     unsigned                 req_cc_resolved:1;

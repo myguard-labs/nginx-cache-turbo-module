@@ -2001,6 +2001,49 @@ def test_rfc1_request_no_store(ng: Nginx, origin: Origin) -> None:
         f"no-store response must not have been cached: {h2}"
 
 
+def test_request_cache_control_multifield_restrictive(
+        ng: Nginx, origin: Origin) -> None:
+    """REQUEST-CACHE-CONTROL-MULTIFIELD: every request Cache-Control
+    field-line contributes to the combined value. Pin each restrictive boolean
+    directive on the second line and then the first, so neither wire order can
+    hide it behind an otherwise harmless field-line."""
+    for order in ("restrictive-last", "restrictive-first"):
+        def split(value: str, restrictive_last: bool =
+                  order == "restrictive-last") -> list[tuple[str, str]]:
+            lines = [("Cache-Control", "max-age=600"),
+                     ("Cache-Control", value)]
+            return lines if restrictive_last else list(reversed(lines))
+
+        oic_key = f"/cond/oic-split-{order}"
+        before = origin.hits
+        status, _, _ = fetch_dup(ng.port, oic_key, split("only-if-cached"))
+        assert status == 504 and origin.hits == before, (
+            f"only-if-cached on either field-line must block origin contact "
+            f"({order}): status={status}, hits={before}->{origin.hits}")
+
+        nc_key = f"/cond/nocache-split-{order}"
+        fetch_raw(ng.port, nc_key)                                 # prime
+        before = origin.hits
+        status, _, headers = fetch_dup(ng.port, nc_key, split("no-cache"))
+        assert status == 200 and "x-cache" not in headers \
+            and origin.hits == before + 1, (
+                f"no-cache on either field-line must revalidate ({order}): "
+                f"status={status}, headers={headers}, "
+                f"hits={before}->{origin.hits}")
+
+        ns_key = f"/cond/nostore-split-{order}"
+        before = origin.hits
+        status, _, headers = fetch_dup(ng.port, ns_key, split("no-store"))
+        assert status == 200 and "x-cache" not in headers \
+            and origin.hits == before + 1, (
+                f"no-store split request must reach origin ({order}): "
+                f"status={status}, headers={headers}")
+        _, _, next_headers = fetch_raw(ng.port, ns_key)
+        assert "x-cache" not in next_headers and origin.hits == before + 2, (
+            f"no-store on either field-line must suppress storage ({order}): "
+            f"headers={next_headers}, hits={before}->{origin.hits}")
+
+
 def test_rfc1_request_max_age_zero_revalidates(ng: Nginx, origin: Origin) -> None:
     """RFC-1 (§5.2.1.1): a request max-age=0 (browser force-refresh) forces a
     revalidation — the cached entry is bypassed to the origin and refreshed."""
