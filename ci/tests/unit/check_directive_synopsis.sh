@@ -45,5 +45,7 @@ missing_reference = [n for n in registered
                                      reference, re.M)]
 if missing_reference:
     raise SystemExit('full-reference config missing: ' + ', '.join(missing_reference))
+if not re.search(r'^\s*cache_turbo_keep_stale\s+24h\s*;', reference, re.M):
+    raise SystemExit('full-reference default drift: cache_turbo_keep_stale must be 24h')
 print(f'OK: {len(registered)} registered production directives have synopsis rows and defaults')
 PY

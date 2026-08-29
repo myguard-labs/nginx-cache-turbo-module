@@ -2086,7 +2086,7 @@ http {
             cache_turbo_cache_control     respect;   # respect | honor (take TTL from response CC/Expires) | ignore (discard response CC)
             cache_turbo_background_update on;        # SWR + stale-if-error (off = inline regen)
             cache_turbo_background_update_max 0;      # unlimited concurrent background refreshes
-            cache_turbo_keep_stale        off;       # off | <time> | forever — serve stale when origin is down
+            cache_turbo_keep_stale        24h;       # off | <time> | forever — serve stale when origin is down
             cache_turbo_l2_negative_ttl   0;         # disabled
           # cache_turbo_use_stale       http_404 http_429;  # which statuses count as "down". Omitted = the default, ANY 5xx.
                                                            # ⚠ naming tokens REPLACES the default, it does not add to it:
@@ -2110,7 +2110,7 @@ http {
             cache_turbo_bypass_stale_uri   /catalog/;  # optional breaker fallback
             cache_turbo_backend_prefix     /shop/;     # optional mounted-app prefix
             cache_turbo_key_cookie         locale;     # optional variant cookie
-            cache_turbo_ignore_set_cookie  _ga;        # optional safe cookie ignore
+            # Cookie-ignore is only safe without a backend preset/value keying.
 
             # ── let the origin decide (inverts the store default here) ──
             cache_turbo_require_header    X-GraphQL-Cacheable;          # store ONLY if origin affirms
@@ -2139,6 +2139,12 @@ http {
             cache_turbo_breaker_retry_after 30s;     # advisory retry hint
 
             proxy_pass http://127.0.0.1:8080;
+        }
+
+        # A compatible opt-in example for named non-identifying cookies.
+        location /cookie-safe/ {
+            cache_turbo_backend none;
+            cache_turbo_ignore_set_cookie _ga;
         }
 
         # ── location context only ───────────────────────────────────────
@@ -2275,7 +2281,7 @@ http {
 > Sharing a zone also cuts the other way, and this direction is the easier one
 > to miss: **healthy traffic from one backend can mask a failure in another.**
 > The trip test is a run of *consecutive* failures inside the rolling
-> `cache_turbo_breaker_window` (default `5` failures over `10s`), and a success
+> `cache_turbo_breaker_threshold` (default `5` failures over `10s`), and a success
 > clears the run. When a failing upstream shares a zone with a busy healthy one,
 > the healthy responses are interleaved into the same shared counter and keep
 > resetting it, so the failing backend may never accumulate an unbroken sequence
