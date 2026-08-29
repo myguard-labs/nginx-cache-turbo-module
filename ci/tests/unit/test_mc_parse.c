@@ -99,6 +99,10 @@ main(void)
 {
     check_split_parity("VALUE ct:k 0 5\r\nhello\r\nEND\r\n", NGX_OK,
                        "complete VALUE reply parses as a hit");
+    check_split_parity("VALUE ct:k 0 0\r\n\r\nEND\r\n", NGX_OK,
+                       "empty VALUE reply parses as a hit");
+    check_split_parity("VALUE ct:k 0 5 99\r\nhello\r\nEND\r\n", NGX_OK,
+                       "VALUE reply with CAS parses as a hit");
     check_split_parity("END\r\n", NGX_DECLINED,
                        "complete END reply parses as a miss");
     check_split_parity("VALUE ct:k 0 5\r\nhello\r\nJUNK\r\n", NGX_ERROR,
@@ -107,6 +111,10 @@ main(void)
                        "negative VALUE length is rejected");
     check_split_parity("CLIENT_ERROR bad\r\n", NGX_ERROR,
                        "memcached error line is not mistaken for a miss");
+    check_split_parity("SERVER_ERROR busy\r\n", NGX_ERROR,
+                       "memcached server error is not mistaken for a miss");
+    check_split_parity("STORED\r\n", NGX_ERROR,
+                       "SET ack is not accepted as a GET reply");
 
     fprintf(stderr, "%d checks, %d failed\n", checks, failures);
     if (failures == 0) {
