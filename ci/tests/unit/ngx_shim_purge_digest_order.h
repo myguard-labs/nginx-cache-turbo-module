@@ -150,9 +150,25 @@ ngx_pnalloc(ngx_pool_t *pool, size_t size)
 }
 
 static void *
+ngx_palloc(ngx_pool_t *pool, size_t size)
+{
+    size_t  aligned;
+
+    aligned = (pool->used + sizeof(uintptr_t) - 1)
+              & ~(sizeof(uintptr_t) - 1);
+    if (aligned > sizeof(pool->storage)
+        || size > sizeof(pool->storage) - aligned)
+    {
+        return NULL;
+    }
+    pool->used = aligned + size;
+    return pool->storage + aligned;
+}
+
+static void *
 ngx_pcalloc(ngx_pool_t *pool, size_t size)
 {
-    void  *p = ngx_pnalloc(pool, size);
+    void  *p = ngx_palloc(pool, size);
 
     if (p != NULL) {
         memset(p, 0, size);

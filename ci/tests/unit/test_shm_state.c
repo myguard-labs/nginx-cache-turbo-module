@@ -576,6 +576,27 @@ purge_test_refill(void *data)
     return NULL;
 }
 
+/* Release a refill thread whose production-side unlock never reached the
+ * one-shot barrier.  This runs only after purge_all() has returned, so a
+ * correct call has already completed phase 2 and disarmed the barrier.  With
+ * the no-unlock mutation, clearing `armed` and publishing phase 1 gets the
+ * refill as far as the real zone mutex; pthread_join() then remains protected
+ * by the watchdog and reports the leaked lock as a bounded test failure.
+ * With an early return before taking the lock, the refill completes and the
+ * exact purge/count assertions below fail instead. */
+static void
+purge_test_force_release_refill(void)
+{
+    (void) __atomic_exchange_n(&ngx_test_unlock_barrier_armed, 0,
+                               __ATOMIC_SEQ_CST);
+    (void) pthread_mutex_lock(&ngx_test_unlock_barrier_mutex);
+    if (ngx_test_unlock_barrier_phase == 0) {
+        ngx_test_unlock_barrier_phase = 1;
+    }
+    (void) pthread_cond_broadcast(&ngx_test_unlock_barrier_cond);
+    (void) pthread_mutex_unlock(&ngx_test_unlock_barrier_mutex);
+}
+
 static void
 test_purge_all_snapshot_bounds_concurrent_refill(void)
 {
@@ -604,9 +625,10 @@ test_purge_all_snapshot_bounds_concurrent_refill(void)
 
     watchdog_arm("purge-all must stop at its start-of-call snapshot");
     rc = ngx_http_cache_turbo_shm_purge_all(&g_zone, &purged);
-    watchdog_disarm();
+    purge_test_force_release_refill();
     CHECK(pthread_join(refill, NULL) == 0,
           "fixture: pthread_join(refill) failed");
+    watchdog_disarm();
 
     CHECK(rc == NGX_AGAIN,
           "concurrent refill must report purge-all as incomplete");

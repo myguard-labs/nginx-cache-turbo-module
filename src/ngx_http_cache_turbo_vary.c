@@ -768,9 +768,10 @@ ngx_http_cache_turbo_marker_store_key(ngx_http_request_t *r,
      * blob_validate() rejects a status outside 100..599, a memzero'd status 0
      * would make every marker unreadable. 200 is the only honest choice (the
      * marker records a successful classification); the body is still the 2-byte
-     * [bits][gen] pair, which is what the readers actually consume. Markers are
-     * L1-only and node-local, so any warm pre-AUD-HDR1 marker simply fails
-     * validation once and is re-stored. */
+     * [bits][gen] pair, which is what the readers actually consume. The shm
+     * copy is node-local; a configured L2 receives the same validated marker
+     * below. Any warm pre-AUD-HDR1 marker simply fails validation once and is
+     * re-stored. */
     bh.status = NGX_HTTP_OK;
     bh.body_len = 2;
     bh.created = (int64_t) ngx_time();
@@ -828,11 +829,11 @@ ngx_http_cache_turbo_marker_store_key(ngx_http_request_t *r,
 }
 
 
-/* Store/refresh the L1 vary marker for a base key: a two-byte body carrying the
+/* Store/refresh a vary marker for a base key: a two-byte body carrying the
  * active-axis bitmask and purge generation, wrapped in the standard blob
- * header so a later read can validate the magic before trusting it. L1-only
- * and node-local by design (see the loc_conf auto_vary comment); shm store
- * copies the stack blob in. */
+ * header so a later read can validate the magic before trusting it. The shm
+ * store copies the stack blob into node-local L1; marker_store_key() also
+ * mirrors it to a configured L2 backend. */
 ngx_int_t
 ngx_http_cache_turbo_marker_store(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf,

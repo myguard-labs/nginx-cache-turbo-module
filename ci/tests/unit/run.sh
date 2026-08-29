@@ -132,6 +132,15 @@ bash "$DIR/extract_admin_purge_key.sh"
 "$CC" $CFLAGS "$DIR/test_admin_purge_key.c" -o "$DIR/test_admin_purge_key"
 "$DIR/test_admin_purge_key"
 
+# --- L2 marker self-heal failure policy ----------------------------------
+# Once the variant key is resolved, re-storing its marker is best-effort.
+# Exercise the real helper and keep variant-key digest failures fail-closed.
+bash "$DIR/extract_access_marker_resolve.sh"
+# shellcheck disable=SC2086
+"$CC" $CFLAGS "$DIR/test_access_marker_resolve.c" \
+	-o "$DIR/test_access_marker_resolve"
+"$DIR/test_access_marker_resolve"
+
 # --- admin ?all=1 incomplete-L1 response contract ------------------------
 # Exercise the real helper: NGX_AGAIN must send the exact 500 JSON response
 # and stop before a configured L2 SCAN can launch.

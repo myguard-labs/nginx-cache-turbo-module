@@ -79,11 +79,19 @@ test_purge_tag(ngx_http_request_t *r,
 
 static void
 reset_case(ngx_http_request_t *r, ngx_pool_t *pool,
-    ngx_connection_t *connection)
+    ngx_connection_t *connection, ngx_http_cache_turbo_loc_conf_t *clcf,
+    ngx_cache_turbo_l1_backend_t *l1, ngx_cache_turbo_backend_t *backend,
+    ngx_shm_zone_t *shm_zone)
 {
     memset(pool, 0, sizeof(*pool));
     memset(r, 0, sizeof(*r));
     memset(connection, 0, sizeof(*connection));
+    memset(clcf, 0, sizeof(*clcf));
+    clcf->l1 = l1;
+    clcf->backend = backend;
+    clcf->shm_zone = shm_zone;
+    clcf->auto_vary = 1;
+    clcf->stale_mult = 4;
     memset(purged_keys, 0, sizeof(purged_keys));
     memset(deleted_keys, 0, sizeof(deleted_keys));
     memset(purged_tag, 0, sizeof(purged_tag));
@@ -152,10 +160,11 @@ main(void)
     ngx_cache_turbo_backend_t       redis = { test_del, test_purge_tag };
     ngx_http_cache_turbo_zone_t     zone;
     ngx_shm_zone_t                  shm_zone = { &zone };
-    ngx_http_cache_turbo_loc_conf_t clcf = { &l1, &redis, &shm_zone, 1, 4 };
+    ngx_http_cache_turbo_loc_conf_t clcf;
     ngx_http_request_t              request;
     ngx_connection_t                connection;
     ngx_pool_t                      pool;
+    void                           *aligned_ptr;
     ngx_int_t                       rc;
     u_char                          marker[32], index[65];
 
@@ -163,7 +172,19 @@ main(void)
     expected_marker(marker);
     expected_index(index);
 
-    reset_case(&request, &pool, &connection);
+    /* Faithfulness guard: ngx_pcalloc() uses nginx's aligned ngx_palloc(),
+     * while byte buffers may use unaligned ngx_pnalloc().  Beginning at an
+     * odd offset makes a collapsed implementation fail deterministically. */
+    memset(&pool, 0, sizeof(pool));
+    pool.used = 1;
+    aligned_ptr = ngx_pcalloc(&pool, sizeof(ngx_http_cache_turbo_ctx_t));
+    CHECK(aligned_ptr != NULL,
+          "shim alignment fixture must fit in the test pool");
+    CHECK(aligned_ptr != NULL
+              && (uintptr_t) aligned_ptr % sizeof(uintptr_t) == 0,
+          "shim struct allocations must preserve nginx pool alignment");
+
+    reset_case(&request, &pool, &connection, &clcf, &l1, &redis, &shm_zone);
     ngx_test_digest_fail_call = 1;
     rc = ngx_http_cache_turbo_purge_request(&request, &clcf);
     CHECK(rc == NGX_HTTP_INTERNAL_SERVER_ERROR,
@@ -173,7 +194,7 @@ main(void)
     check_no_mutation(&request,
                       "marker digest failure must not enter auto-Vary lookup");
 
-    reset_case(&request, &pool, &connection);
+    reset_case(&request, &pool, &connection, &clcf, &l1, &redis, &shm_zone);
     ngx_test_digest_fail_call = 2;
     rc = ngx_http_cache_turbo_purge_request(&request, &clcf);
     CHECK(rc == NGX_HTTP_INTERNAL_SERVER_ERROR,
@@ -183,7 +204,7 @@ main(void)
     check_no_mutation(&request,
                       "index digest failure must not enter auto-Vary lookup");
 
-    reset_case(&request, &pool, &connection);
+    reset_case(&request, &pool, &connection, &clcf, &l1, &redis, &shm_zone);
     rc = ngx_http_cache_turbo_purge_request(&request, &clcf);
     CHECK(rc == NGX_DONE, "successful Redis variant purge must park");
     CHECK(ngx_test_digest_call == 2,
@@ -200,8 +221,7 @@ main(void)
     CHECK(request.count == 1,
           "parked precontent purge must preserve request-count balancing");
 
-    reset_case(&request, &pool, &connection);
-    clcf.backend = NULL;
+    reset_case(&request, &pool, &connection, &clcf, &l1, NULL, &shm_zone);
     marker_present = 1;
     rc = ngx_http_cache_turbo_purge_request(&request, &clcf);
     CHECK(rc == NGX_DONE, "successful L1-only purge must send synchronously");
@@ -215,6 +235,12 @@ main(void)
           "preflighted marker bytes must reach marker_store unchanged");
     CHECK(request.send_calls == 1 && request.sent_status == NGX_HTTP_OK,
           "successful L1-only purge must retain its HTTP 200 response");
+
+    /* Appended-case control: reset_case() must restore the configured backend
+     * after the L1-only fixture above instead of leaking that case's mode. */
+    reset_case(&request, &pool, &connection, &clcf, &l1, &redis, &shm_zone);
+    CHECK(clcf.backend == &redis,
+          "case reset must reseed the configured L2 backend");
 
     fprintf(stderr, "PURGE digest ordering: %d failures\n", failures);
     return failures ? 1 : 0;
