@@ -750,17 +750,15 @@ ngx_http_cache_turbo_variant_index_name(ngx_str_t *base, u_char *buf,
 }
 
 
-/* Store/refresh the L1 vary marker for a base key: a one-byte body carrying the
- * active-axis bitmask, wrapped in the standard blob header so a later read can
- * validate the magic before trusting the byte. L1-only and node-local by design
- * (see the loc_conf auto_vary comment); shm store copies the stack blob in. */
+/* Store/refresh an L1 vary marker using its already-derived slot key. The purge
+ * path uses this entry point after preflighting every digest-derived key, so an
+ * EVP failure cannot occur after it has deleted the base object. */
 ngx_int_t
-ngx_http_cache_turbo_marker_store(ngx_http_request_t *r,
+ngx_http_cache_turbo_marker_store_key(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf,
-    ngx_http_cache_turbo_zone_t *z, ngx_str_t *base, ngx_int_t bits,
+    ngx_http_cache_turbo_zone_t *z, u_char marker_key[32], ngx_int_t bits,
     ngx_uint_t gen, time_t ttl, time_t retain_ttl)
 {
-    u_char                           mk[32];
     u_char                           blob[NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE
                                           + 2];
     ngx_http_cache_turbo_blob_hdr_t  bh;
@@ -800,17 +798,14 @@ ngx_http_cache_turbo_marker_store(ngx_http_request_t *r,
     blob[NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE]     = (u_char) (bits & 0xFF);
     blob[NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE + 1] = (u_char) (gen & 0xFF);
 
-    if (ngx_http_cache_turbo_marker_hash(base, mk) != NGX_OK) {
-        return NGX_ERROR;
-    }
-
     /* C3: not clcf->l1->store() -- markers are shm/zone-local by design (see
      * this function's own header comment), and _shm_store_marker() folds the
      * `markers` presence-counter bookkeeping into the SAME lock hold as the
      * write itself (see its own comment in shm.c for why that atomicity is
      * required, not just tidy). */
-    (void) ngx_http_cache_turbo_shm_store_marker(z, mk, ngx_crc32_short(mk, 32),
-               blob, sizeof(blob), ttl, retain_ttl);
+    (void) ngx_http_cache_turbo_shm_store_marker(z, marker_key,
+               ngx_crc32_short(marker_key, 32), blob, sizeof(blob), ttl,
+               retain_ttl);
 
     /* P3-5: write the marker through to L2 too, keyed by marker_hash (the
      * SAME key a marker-cold consult GETs -- see access_l2_marker_get()).
@@ -825,10 +820,33 @@ ngx_http_cache_turbo_marker_store(ngx_http_request_t *r,
      * index, but `set` IS implemented on both backends, so this write-through
      * is not gated on backend->tag_add the way the variant index is). */
     if (clcf->backend && clcf->backend->set && r != NULL) {
-        clcf->backend->set(r, clcf, mk, blob, sizeof(blob), ttl, retain_ttl);
+        clcf->backend->set(r, clcf, marker_key, blob, sizeof(blob), ttl,
+                           retain_ttl);
     }
 
     return NGX_OK;
+}
+
+
+/* Store/refresh the L1 vary marker for a base key: a two-byte body carrying the
+ * active-axis bitmask and purge generation, wrapped in the standard blob
+ * header so a later read can validate the magic before trusting it. L1-only
+ * and node-local by design (see the loc_conf auto_vary comment); shm store
+ * copies the stack blob in. */
+ngx_int_t
+ngx_http_cache_turbo_marker_store(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf,
+    ngx_http_cache_turbo_zone_t *z, ngx_str_t *base, ngx_int_t bits,
+    ngx_uint_t gen, time_t ttl, time_t retain_ttl)
+{
+    u_char  marker_key[32];
+
+    if (ngx_http_cache_turbo_marker_hash(base, marker_key) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    return ngx_http_cache_turbo_marker_store_key(r, clcf, z, marker_key, bits,
+                                                  gen, ttl, retain_ttl);
 }
 
 

@@ -1139,6 +1139,11 @@ ngx_int_t ngx_http_cache_turbo_variant_hash(ngx_http_request_t *r,
     NGX_HTTP_CACHE_TURBO_MUST_CHECK;
 ngx_int_t ngx_http_cache_turbo_marker_hash(ngx_str_t *base, u_char out[32])
     NGX_HTTP_CACHE_TURBO_MUST_CHECK;
+ngx_int_t ngx_http_cache_turbo_marker_store_key(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf,
+    ngx_http_cache_turbo_zone_t *z, u_char marker_key[32], ngx_int_t bits,
+    ngx_uint_t gen, time_t ttl, time_t retain_ttl)
+    NGX_HTTP_CACHE_TURBO_MUST_CHECK;
 ngx_int_t ngx_http_cache_turbo_marker_store(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf,
     ngx_http_cache_turbo_zone_t *z, ngx_str_t *base, ngx_int_t bits,

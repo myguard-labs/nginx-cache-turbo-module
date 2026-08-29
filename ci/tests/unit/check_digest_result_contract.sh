@@ -33,6 +33,7 @@ for fn in \
 	ngx_http_cache_turbo_vary_apply \
 	ngx_http_cache_turbo_variant_hash \
 	ngx_http_cache_turbo_marker_hash \
+	ngx_http_cache_turbo_marker_store_key \
 	ngx_http_cache_turbo_marker_store \
 	ngx_http_cache_turbo_variant_index_name; do
 	check_decl "$fn" "$INTERNAL_H"
@@ -44,7 +45,7 @@ if ! grep -B1 -F 'ngx_http_cache_turbo_vary_prepare_lazy(' "$INTERNAL_H" |
 	exit 1
 fi
 
-if rg -n -U '\(void\)[[:space:]]+ngx_http_cache_turbo_(digest|digest_final|vary_prepare(_lazy)?|vary_apply|variant_hash|marker_hash|marker_store|variant_index_name)\(' \
+if rg -n -U '\(void\)[[:space:]]+ngx_http_cache_turbo_(digest|digest_final|vary_prepare(_lazy)?|vary_apply|variant_hash|marker_hash|marker_store(_key)?|variant_index_name)\(' \
 	"$REPO/src" --glob '*.[ch]'; then
 	echo "✗ digest-derived return explicitly discarded; propagate failure" >&2
 	exit 1

@@ -140,6 +140,15 @@ bash "$DIR/extract_admin_purge_all.sh"
 "$CC" $CFLAGS "$DIR/test_admin_purge_all.c" -o "$DIR/test_admin_purge_all"
 "$DIR/test_admin_purge_all"
 
+# --- PURGE digest preflight ordering --------------------------------------
+# Execute the real request + auto-Vary helper with deterministic marker/index
+# failures. No base/marker/L2 mutation may precede either digest result.
+bash "$DIR/extract_purge_digest_order.sh"
+# shellcheck disable=SC2086
+"$CC" $CFLAGS "$DIR/test_purge_digest_order.c" \
+	-o "$DIR/test_purge_digest_order"
+"$DIR/test_purge_digest_order"
+
 FUZZ_DIR="$DIR/../../fuzz"
 BLOB_CC="${BLOB_CC:-clang}"
 if command -v "$BLOB_CC" >/dev/null 2>&1; then
