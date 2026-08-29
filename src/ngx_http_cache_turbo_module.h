@@ -154,8 +154,9 @@
  * Origin-independent last-resort stale retention: when a response carries no
  * `stale-if-error` window of its own, this becomes the effective
  * stale-if-error window instead of leaving the object with no fallback at
- * all. `off` (0) is the default and reproduces the pre-S2.1 behaviour
- * exactly -- the store path only widens sie_window when this is > 0.
+ * all. `24h` is the shipped default; `off` (0) explicitly restores the
+ * pre-S2.1 no-retention behaviour -- the store path only widens sie_window
+ * when this is > 0.
  *
  * No separate MIN/MAX pair: this directive shares the module-wide
  * NGX_HTTP_CACHE_TURBO_TTL_MAX ceiling above (the same uint32-wire-format
@@ -2074,7 +2075,7 @@ typedef struct {
      * S2.2). Consulted on the store path, where it widens sie_window -- see
      * the `ttl > 0 && clcf->keep_stale > 0` and
      * `ttl > 0 && clcf->ignore_cc && clcf->keep_stale > 0` gates. 0 = OFF (the
-     * default, today's behaviour unchanged); NGX_HTTP_CACHE_TURBO_FOREVER_TTL
+     * default 24h); NGX_HTTP_CACHE_TURBO_FOREVER_TTL
      * for the `forever` keyword; otherwise the parsed+clamped seconds value.
      * Deliberately NOT a synonym for cache_turbo_valid's "0 = forever"
      * convention -- see the doc comment on the handler for why a bare 0 here

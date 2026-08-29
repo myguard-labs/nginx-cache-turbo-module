@@ -707,7 +707,10 @@ vary, the module records a tiny *vary marker* in L1 and stores the body under a
 secondary *variant* key; later requests read the marker and resolve straight to
 their variant. The base slot stays empty for varied URLs, so a node that hasn't
 learned the `Vary` yet simply misses to origin — it never serves the wrong
-variant. On by default.
+variant. With Redis or memcached configured, an L1 marker miss or stale marker
+can consult the shared L2 mirror before going to origin, allowing a cold node
+to recover an already-known variant. Without L2, the cold-node miss is
+intentional and safe. On by default.
 
 > **`Vary: Accept-Encoding` is collapsed automatically.** The module captures
 > the **identity** (uncompressed) body — its body filter runs *above*
@@ -2143,8 +2146,10 @@ http {
 
         # A compatible opt-in example for named non-identifying cookies.
         location /cookie-safe/ {
+            cache_turbo ct;
             cache_turbo_backend none;
             cache_turbo_ignore_set_cookie _ga;
+            proxy_pass http://127.0.0.1:8080;
         }
 
         # ── location context only ───────────────────────────────────────
@@ -2223,7 +2228,7 @@ http {
 | `cache_turbo_normalize_strip NAME...` | `server`, `location` | — | Extra query args to drop from `$cache_turbo_normalized_args` (trailing `*` = prefix; a bare `*` matches every name = drop all), on top of the built-ins. |
 | `cache_turbo_normalize_max_args N` | `server`, `location` | `64` | Cap on how many kept (post-strip) query params `$cache_turbo_normalized_args` will sort. Above the cap normalization is **skipped** and the raw query string is keyed instead — the request is still served and still keys consistently, it just is not order-/junk-normalized. Bounds the O(n²) sort an unauthenticated request can trigger *before* the cache lookup. `0` = unlimited (no cap). |
 | `cache_turbo_normalize_vary TOKEN...` | `server`, `location` | off | Append a variant bucket to `$cache_turbo_normalized_args`: `encoding` (br/gzip/identity) and/or `device` (mobile/desktop). |
-| `cache_turbo_auto_vary on\|off` | `server`, `location` | `on` | Read the response's own `Vary` header and split the cache by the named request header automatically. Safe whitelist: `Accept-Encoding`, `User-Agent` (device class), `Accept-Language` (primary-subtag class), `Origin` (raw — CORS boundary, never folded). `Vary: *`/`Cookie`/`Authorization` — **or any other header not on the whitelist** — ⇒ uncacheable (so an un-split Vary axis can never serve the wrong representation). Two-level, node-local keying. See [Auto-Vary](#auto-vary-read-the-response-vary). |
+| `cache_turbo_auto_vary on\|off` | `server`, `location` | `on` | Read the response's own `Vary` header and split the cache by the named request header automatically. Safe whitelist: `Accept-Encoding`, `User-Agent` (device class), `Accept-Language` (primary-subtag class), `Origin` (raw — CORS boundary, never folded). `Vary: *`/`Cookie`/`Authorization` — **or any other header not on the whitelist** — ⇒ uncacheable (so an un-split Vary axis can never serve the wrong representation). Two-level keying with node-local L1 markers and optional configured L2 marker recovery. See [Auto-Vary](#auto-vary-read-the-response-vary). |
 | `cache_turbo_vary_marker_revalidate TIME` | `server`, `location` | `2s` | Revalidate an auto-Vary marker through L2 at most once per interval; `0` restores unconditional local-marker trust. |
 | `cache_turbo_vary_ignore HEADER...` | `server`, `location` | off (empty) | Drop the named header(s) from a response's `Vary` line **before** `cache_turbo_auto_vary`'s whitelist/unknown-axis check — the ignored token is treated as if the origin never listed it: it does not contribute to the variant key and is **not** promoted into the safe whitelist. Case-insensitive. Only takes effect when `cache_turbo_auto_vary` is also on. **Cache-correctness override, not a free win** — only ignore an axis you have verified does not select a different body for your traffic; see the warning in [Auto-Vary](#cache_turbo_vary_ignore--opt-out-of-one-axiss-refusal). `*`, `Cookie` and `Authorization` are rejected at config time — their veto cannot be disabled this way. |
 
