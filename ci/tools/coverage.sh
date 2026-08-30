@@ -35,6 +35,11 @@
 #
 set -euo pipefail
 
+MODULE_DIR="$PWD"
+# shellcheck source=ci/tools/versions-env.sh
+. "$MODULE_DIR/ci/tools/versions-env.sh"
+load_versions_env "$MODULE_DIR/.github/versions.env"
+
 if ! command -v gcovr >/dev/null 2>&1; then
     echo "coverage: gcovr is required" >&2
     exit 2
@@ -46,12 +51,7 @@ if [ -z "$GCOVR_MAJOR" ] || [ "$GCOVR_MAJOR" -lt 7 ]; then
 fi
 
 FLAVOR="${1:-nginx}"
-if [ -f .github/versions.env ]; then
-    # shellcheck disable=SC1091
-    source .github/versions.env
-fi
 VERSION="${2:-${NGINX_VERSION:-1.31.1}}"
-MODULE_DIR="$PWD"
 ROOT="${BUILD_ROOT:-$PWD/.build}"
 DIR="${FLAVOR}-${VERSION}"
 OBJDIR="$ROOT/$DIR/objs"
@@ -104,9 +104,8 @@ COVERAGE=1 bash "$UNIT_DIR/run.sh"
 #   addon/src as a positional path    restricts the object scan to those,
 #   --object-directory addon/src      resolves their notes/data files,
 #       spelled the portable way ON PURPOSE: the --gcov-object-directory alias
-#       only exists on gcovr >= 7.0, and ci-deep.yml installs gcovr unpinned
-#       from apt. On an older runner the long spelling is an unknown flag and
-#       the report dies; --object-directory is accepted by both.
+#       only exists on gcovr >= 7.0. CI pins gcovr 7.2, while the portable
+#       spelling also keeps local supported releases working.
 #   --filter src/                      restricts the report to our sources,
 #   --gcov-ignore-errors=all           tolerates gcov's "cannot open source"
 #       on the nginx HEADERS the module includes (ngx_string.h, etc. — pulled

@@ -39,6 +39,9 @@ typedef unsigned char   u_char;
 
 #include <time.h>       /* real time_t for the swr/autotune time math */
 
+#define NGX_MAX_TIME_T_VALUE                                               \
+    ((time_t) ((((uint64_t) 1) << (sizeof(time_t) * 8 - 1)) - 1))
+
 #define NGX_OK           0
 #define NGX_ERROR       -1
 #define NGX_DECLINED    -5
@@ -119,7 +122,7 @@ ngx_atomic_fetch_add(ngx_atomic_t *value, ngx_atomic_int_t add)
  * Kept byte-identical to src/ngx_http_cache_turbo_module.h. A drift here is
  * caught by ci/tests/unit/check_constants.sh (grep-compares the two).         */
 #define NGX_HTTP_CACHE_TURBO_STALE_MULTIPLIER   4
-#define NGX_HTTP_CACHE_TURBO_TTL_MAX            ((time_t) 0xFFFFFFFF)
+#define NGX_HTTP_CACHE_TURBO_TTL_MAX  ((time_t) (sizeof(time_t) < 8 ? 0x7FFFFFFFLL : 0xFFFFFFFFLL))
 
 #define NGX_HTTP_CACHE_TURBO_BETA_MIN           500
 #define NGX_HTTP_CACHE_TURBO_BETA_MAX           3000

@@ -70,11 +70,13 @@ test_stale_ttl(void)
              "stale_ttl mult <0 -> default 4");
 
     /* STAB-5 overflow clamp: fresh_ttl * mult would exceed TTL_MAX (swr.c:34) */
-    CHECK_EQ(ngx_http_cache_turbo_stale_ttl((time_t) 0xFFFFFFFF, 8),
-             (time_t) 0xFFFFFFFF, "stale_ttl overflow clamps to TTL_MAX");
+    CHECK_EQ(ngx_http_cache_turbo_stale_ttl(NGX_HTTP_CACHE_TURBO_TTL_MAX, 8),
+             NGX_HTTP_CACHE_TURBO_TTL_MAX,
+             "stale_ttl overflow clamps to TTL_MAX");
     /* exactly on the boundary (TTL_MAX / mult) must NOT clamp */
-    CHECK_EQ(ngx_http_cache_turbo_stale_ttl((time_t) (0xFFFFFFFF / 4), 4),
-             (time_t) ((0xFFFFFFFF / 4) * 4),
+    CHECK_EQ(ngx_http_cache_turbo_stale_ttl(
+                 NGX_HTTP_CACHE_TURBO_TTL_MAX / 4, 4),
+             (NGX_HTTP_CACHE_TURBO_TTL_MAX / 4) * 4,
              "stale_ttl at boundary does not clamp");
 }
 
@@ -88,26 +90,32 @@ test_add_ttl_clamped(void)
 
     /* AUD-CC-DELTA-OVF: origin sends a Cache-Control delta of INT64_MAX
      * (e.g. stale-while-revalidate=9223372036854775807, which ngx_atoi
-     * accepts verbatim -- it sits exactly at NGX_MAX_INT_T_VALUE, not past
-     * it). The delta must be clamped to TTL_MAX before the add, not after,
+     * accepts up to the platform time_t ceiling). The delta must be clamped to
+     * TTL_MAX before the add, not after,
      * or ttl + delta overflows signed time_t (UB, traps under UBSan on the
      * unfixed code). */
     CHECK_EQ(ngx_http_cache_turbo_add_ttl_clamped(60,
-                 (time_t) 9223372036854775807LL),
-             (time_t) 0xFFFFFFFF,
-             "add_ttl_clamped INT64_MAX delta -> TTL_MAX, no overflow");
+                 NGX_MAX_TIME_T_VALUE),
+             NGX_HTTP_CACHE_TURBO_TTL_MAX,
+             "add_ttl_clamped time_t max delta -> TTL_MAX, no overflow");
 
     /* base already at TTL_MAX plus any positive delta stays at TTL_MAX */
-    CHECK_EQ(ngx_http_cache_turbo_add_ttl_clamped((time_t) 0xFFFFFFFF, 100),
-             (time_t) 0xFFFFFFFF, "add_ttl_clamped base at ceiling");
+    CHECK_EQ(ngx_http_cache_turbo_add_ttl_clamped(
+                 NGX_HTTP_CACHE_TURBO_TTL_MAX, 100),
+             NGX_HTTP_CACHE_TURBO_TTL_MAX,
+             "add_ttl_clamped base at ceiling");
 
     /* sum lands exactly on TTL_MAX -> must NOT clamp (boundary, no off-by-one) */
-    CHECK_EQ(ngx_http_cache_turbo_add_ttl_clamped(100, (time_t) 0xFFFFFFFF - 100),
-             (time_t) 0xFFFFFFFF, "add_ttl_clamped exact boundary");
+    CHECK_EQ(ngx_http_cache_turbo_add_ttl_clamped(
+                 100, NGX_HTTP_CACHE_TURBO_TTL_MAX - 100),
+             NGX_HTTP_CACHE_TURBO_TTL_MAX,
+             "add_ttl_clamped exact boundary");
 
     /* one under the boundary -> must NOT clamp */
-    CHECK_EQ(ngx_http_cache_turbo_add_ttl_clamped(100, (time_t) 0xFFFFFFFF - 101),
-             (time_t) 0xFFFFFFFF - 1, "add_ttl_clamped just under boundary");
+    CHECK_EQ(ngx_http_cache_turbo_add_ttl_clamped(
+                 100, NGX_HTTP_CACHE_TURBO_TTL_MAX - 101),
+             NGX_HTTP_CACHE_TURBO_TTL_MAX - 1,
+             "add_ttl_clamped just under boundary");
 
     /* negative delta (should not occur from the parser, but the helper must
      * not underflow or subtract) treated as 0 */

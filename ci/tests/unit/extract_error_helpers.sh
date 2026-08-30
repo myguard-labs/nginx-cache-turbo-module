@@ -198,4 +198,10 @@ if [ "${CTRL_ERROR_HELPERS_REDIS_DRAIN_CLEAR:-0}" = 1 ]; then
 		'Redis drain first-byte clear'
 fi
 
+if [ "${CTRL_ERROR_HELPERS_REDIS_EXACT_FRAME:-0}" = 1 ]; then
+	mutate_function_exact ngx_http_cache_turbo_redis_read_smembers \
+		'next != op->rbuf + op->rlen' '0' \
+		'Redis SMEMBERS exact-frame gate'
+fi
+
 echo "✓ extracted terminal error compositions → $(basename "$OUT")"

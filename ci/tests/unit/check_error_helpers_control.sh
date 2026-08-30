@@ -69,3 +69,6 @@ run_mutant CTRL_ERROR_HELPERS_REDIS_SMEMBERS_FAIL \
 run_mutant CTRL_ERROR_HELPERS_REDIS_DRAIN_CLEAR \
 	'Redis drain first reply byte must clear, never arm, backoff state' \
 	'Redis drain first-byte clear'
+run_mutant CTRL_ERROR_HELPERS_REDIS_EXACT_FRAME \
+	'SMEMBERS must reject trailing RESP bytes before parsing' \
+	'Redis SMEMBERS exact-frame gate'

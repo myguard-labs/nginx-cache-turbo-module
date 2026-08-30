@@ -160,10 +160,9 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 ROOT="$PWD"
 
-if [ -f .github/versions.env ]; then
-    # shellcheck disable=SC1091
-    source .github/versions.env
-fi
+# shellcheck source=ci/tools/versions-env.sh
+. "$ROOT/ci/tools/versions-env.sh"
+load_versions_env "$ROOT/.github/versions.env"
 
 FLAVOR=nginx
 VERSION="${NGINX_VERSION:-1.31.3}"

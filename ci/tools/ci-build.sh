@@ -33,15 +33,14 @@
 
 set -euo pipefail
 
-if [ -f .github/versions.env ]; then
-    # shellcheck disable=SC1091
-    source .github/versions.env
-fi
+MODULE_DIR="$PWD"
+# shellcheck source=ci/tools/versions-env.sh
+. "$MODULE_DIR/ci/tools/versions-env.sh"
+load_versions_env "$MODULE_DIR/.github/versions.env"
 FLAVOR="${1:-nginx}"
 VERSION="${2:-${NGINX_VERSION:-1.31.1}}"
 MODE="${3:-debug}"
 ROOT="${BUILD_ROOT:-$PWD/.build}"
-MODULE_DIR="$PWD"
 TEST_OPT="-DNGX_HTTP_CACHE_TURBO_TEST_FAULTS=1"
 
 case "$FLAVOR" in

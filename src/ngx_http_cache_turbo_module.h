@@ -138,11 +138,14 @@
 /* Hard ceiling for any fresh/stale TTL that reaches the wire (STAB-5). The blob
  * fresh_ttl/stale_ttl are uint32 and the redis PX is `<ttl> * 1000`; an
  * unbounded honor_cc max-age or `cache_turbo_valid <huge>` could overflow the
- * uint32 cast or the *1000. Clamp every TTL to UINT32_MAX seconds (~136 yr,
- * itself well past FOREVER): the cast is lossless and `<= 4.29e9 * 1000` (4.29e12)
- * stays inside int64 %T. ngx_http_cache_turbo_stale_ttl clamps its product here;
- * the store path clamps the fresh TTL before the uint32 cast. */
-#define NGX_HTTP_CACHE_TURBO_TTL_MAX  ((time_t) 0xFFFFFFFF)
+ * uint32 cast or the *1000. Clamp every TTL to the smaller of UINT32_MAX
+ * seconds (~136 yr) and the platform's signed time_t ceiling.  The latter is
+ * required on 32-bit builds: casting UINT32_MAX to a 32-bit time_t yields -1
+ * and turns every positive TTL into an expired value.  The cast is lossless
+ * and `<= 4.29e9 * 1000` (4.29e12) stays inside int64 %T.
+ * ngx_http_cache_turbo_stale_ttl clamps its product here; the store path
+ * clamps the fresh TTL before the uint32 cast. */
+#define NGX_HTTP_CACHE_TURBO_TTL_MAX  ((time_t) (sizeof(time_t) < 8 ? 0x7FFFFFFFLL : 0xFFFFFFFFLL))
 
 /* Upper bound on cache_turbo_redis keepalive=N (STAB-5). The per-worker pool is
  * `ngx_palloc(N * sizeof(item))`; an unbounded N overflows the size_t multiply

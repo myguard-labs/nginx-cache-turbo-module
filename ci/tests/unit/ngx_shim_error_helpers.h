@@ -121,6 +121,8 @@ typedef struct {
     ngx_int_t                              scan_status;
     ngx_uint_t                             scan_pages;
     ngx_uint_t                             scan_deadline_hit;
+    u_char                                *rbuf;
+    size_t                                 rlen;
     u_char                                 recv[128];
     size_t                                 recv_len;
     unsigned                               clean:1;
@@ -163,7 +165,9 @@ extern ngx_uint_t  ngx_test_del_timer_calls;
 extern ngx_int_t   ngx_test_redis_frame_result;
 extern ngx_int_t   ngx_test_redis_fill_result;
 extern ngx_int_t   ngx_test_redis_frame_scan_result;
+extern size_t      ngx_test_redis_frame_scan_next;
 extern ngx_int_t   ngx_test_redis_parse_array_result;
+extern ngx_uint_t  ngx_test_redis_parse_array_calls;
 extern ngx_uint_t  ngx_test_members_calls;
 extern ngx_str_t  *ngx_test_members;
 extern ngx_uint_t  ngx_test_nmembers;
@@ -360,8 +364,7 @@ static ngx_int_t
 ngx_http_cache_turbo_redis_frame_scan(ngx_http_cache_turbo_redis_op_t *op,
     u_char **next)
 {
-    (void) op;
-    *next = NULL;
+    *next = op->rbuf + ngx_test_redis_frame_scan_next;
     return ngx_test_redis_frame_scan_result;
 }
 
@@ -371,6 +374,7 @@ ngx_http_cache_turbo_redis_parse_array(
     ngx_uint_t *nmembers)
 {
     (void) op;
+    ngx_test_redis_parse_array_calls++;
     *members = NULL;
     *nmembers = 0;
     return ngx_test_redis_parse_array_result;

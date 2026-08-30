@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
-# sync-sha: acade99127605db55abae2e0f5a579b910bd25c8b8ab93e6a816204204ca45cb
+# sync-sha: ac8d25c0fb45535f7c1660ac47ab6fe7a9f247f0071de17de059851adf6a171b
 # Resolve current upstream server releases and rewrite .github/versions.env.
 set -euo pipefail
+
+# Preserve the legacy/compatibility pins from the current file only after
+# validating that every sourced line is inert KEY=value data.
+# shellcheck source=ci/tools/versions-env.sh
+. ci/tools/versions-env.sh
+load_versions_env .github/versions.env
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
@@ -24,9 +30,6 @@ hash_url() {
 main_sha="$(hash_url "https://nginx.org/download/nginx-$mainline.tar.gz" mainline)"
 stable_sha="$(hash_url "https://nginx.org/download/nginx-$stable.tar.gz" stable)"
 angie_sha="$(hash_url "https://download.angie.software/files/angie-$angie.tar.gz" angie)"
-# shellcheck disable=SC1091
-source .github/versions.env
-
 printf '%s\n' \
     '# Central upstream pins. Keep version and digest together; CI sources this file' \
     '# and refuses any archive whose digest is not listed here.' \
