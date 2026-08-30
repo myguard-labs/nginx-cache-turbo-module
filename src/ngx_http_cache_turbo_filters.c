@@ -179,7 +179,7 @@ ngx_http_cache_turbo_header_filter_test_headers(ngx_http_request_t *r,
  *
  * ⚠ NOT recorded at the autotune_record_cost() site the plan first named.
  * That call lives inside the store block, behind ~10 cacheability gates
- * (enable, not-HEAD, status_ttl >= 0, response_cacheable, require_hdr_ok,
+ * (enable, not-HEAD, status_ttl >= 0, response_policy, require_hdr_ok,
  * not-encoded, no_store predicates, ...). A healthy origin serving an
  * uncacheable 200 would never record a success there, so a breaker tripped
  * by a transient outage could never close. Success recording has to be at
@@ -415,22 +415,20 @@ ngx_http_cache_turbo_capture_count_head_partial(ngx_http_request_t *r,
 
 
 /* P0-1 phase helper: attribute a NOT-captured response to whichever of
- * response_cacheable()/require_hdr_ok()/response_encoded() actually vetoed
+ * response_policy()/require_hdr_ok()/response_encoded() actually vetoed
  * it. Called only when the capture gate's shared legs (enable, method,
  * vary_nocache, min_uses_skip, auto_skip, req_no_store, status_ttl) already
  * passed and the response still was not captured, so cacheable_reason is
  * meaningful exactly when it is non-NONE (the short-circuit chain stops AT
  * the first false leg, so a later leg failing means every earlier one,
- * including response_cacheable(), passed).
+ * including response_policy(), passed).
  *
- * PERF-AUD-01: require_hdr_ok()/response_encoded() are no longer re-evaluated
- * here. The caller's decision record already holds both verdicts from the one
- * evaluation the gate performed, so they arrive as tri-state parameters:
- * >= 0 is that recorded verdict, < 0 means the gate short-circuited before
- * reaching that leg and this function must evaluate it itself. The counter
- * precedence (require_header before encoded) is unchanged. */
+ * PERF-AUD-01: require-header and response-encoding policy are not re-evaluated
+ * here. The caller's decision record already holds the verdicts from the one
+ * gate evaluation. The counter precedence (require_header before encoded) is
+ * unchanged. */
 static void
-ngx_http_cache_turbo_capture_count_refusal(ngx_http_request_t *r,
+ngx_http_cache_turbo_capture_count_refusal(
     ngx_http_cache_turbo_loc_conf_t *clcf, ngx_uint_t cacheable_reason,
     ngx_int_t require_hdr_ok, ngx_int_t response_encoded)
 {
@@ -455,17 +453,9 @@ ngx_http_cache_turbo_capture_count_refusal(ngx_http_request_t *r,
         break;
     }
 
-    if (require_hdr_ok < 0) {
-        require_hdr_ok = ngx_http_cache_turbo_require_hdr_ok(r, clcf) ? 1 : 0;
-    }
-
     if (!require_hdr_ok) {
         (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(rz)->refuse_require_header, 1);
         return;
-    }
-
-    if (response_encoded < 0) {
-        response_encoded = ngx_http_cache_turbo_response_encoded(r) ? 1 : 0;
     }
 
     if (response_encoded) {
@@ -549,7 +539,7 @@ ngx_http_cache_turbo_capture_gate_storable_tail(ngx_http_request_t *r,
 
 
 /* The last two legs of the chain-1 capture gate, past capture_gate_storable()
- * and response_cacheable(): the response is either not encoded or an
+ * and response_policy(): the response is either not encoded or an
  * encoded-origin capture was allowed for it (P3-2), and cache_turbo_no_store
  * (if configured) does not veto this specific response. Same leg order and
  * short-circuit as the original inline `&& (A || B) && (C || D)` tail --
@@ -718,7 +708,7 @@ ngx_http_cache_turbo_header_filter_capture(ngx_http_request_t *r,
     ngx_uint_t  gate_common, gate_storable, captured;
     ngx_http_cache_turbo_response_policy_t policy;
     /* PERF-AUD-01 leg verdicts: -1 = the short-circuit never reached this
-     * leg, so capture_count_refusal() must evaluate it itself. */
+     * leg. The preceding recorded refusal then owns attribution. */
     ngx_int_t   req_hdr_ok = -1;
     ngx_int_t   resp_encoded = -1;
 
@@ -772,7 +762,7 @@ ngx_http_cache_turbo_header_filter_capture(ngx_http_request_t *r,
      * HEAD — its empty body must not overwrite the GET entry. Normally the main
      * request only; a warm subrequest (ctx->warm) is the deliberate exception.
      *
-     * P0-1: response_cacheable() reports its own refusal reason via an
+     * P0-1: response_policy() reports its own refusal reason via an
      * out-param (no extra header-list walk; see its definition). The boolean
      * short-circuit chain and evaluation order below are otherwise
      * byte-for-byte unchanged from before P0-1.
@@ -795,8 +785,7 @@ ngx_http_cache_turbo_header_filter_capture(ngx_http_request_t *r,
      * `else if`, and capture_gate_common() a third time in the 304 arm.
      * `gate_common`/`gate_storable` are those single evaluations;
      * `req_hdr_ok`/`resp_encoded` are the recorded leg verdicts, left at -1
-     * when the short-circuit never reached that leg (capture_count_refusal()
-     * then evaluates it itself). Leg order, short-circuiting and
+     * when the short-circuit never reached that leg. Leg order, short-circuiting and
      * refusal-counter precedence are byte-for-byte the previous behavior:
      * each leg is still only evaluated if every earlier leg passed, which is
      * why the chain is written as nested ifs rather than one `&&` run --
@@ -841,9 +830,9 @@ ngx_http_cache_turbo_header_filter_capture(ngx_http_request_t *r,
             return;
         }
     } else if (gate_storable) {
-        /* Every shared leg up to response_cacheable() passed and the
+        /* Every shared leg up to response_policy() passed and the
          * response still was not captured -- attribute the refusal. */
-        ngx_http_cache_turbo_capture_count_refusal(r, clcf, cacheable_reason,
+        ngx_http_cache_turbo_capture_count_refusal(clcf, cacheable_reason,
                                                    req_hdr_ok, resp_encoded);
     } else if (gate_common
                && clcf->shm_zone != NULL

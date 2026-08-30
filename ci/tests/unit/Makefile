@@ -32,12 +32,13 @@ CC      ?= cc
 CFLAGS  ?= -O1 -g -std=c99 -Wall -Wextra -Werror -Wno-unused-parameter
 SAN      = -fsanitize=address,undefined -fno-omit-frame-pointer \
            -fno-sanitize-recover=all
+COVERAGE_FLAGS ?=
 # C1: test_shm_state.c drives the blob refcount from real threads, and the shim's
 # ngx_shmtx_* are a real pthread mutex, so this TU needs -pthread at compile AND
 # link. TSAN is the second sanitizer axis it unlocked: ASan proves the blob is
 # freed exactly once, TSan proves the refcount that decides so is race-free.
 # They cannot be combined in one binary, hence a separate target.
-PTHREAD  = -pthread
+PTHREAD  = -pthread $(COVERAGE_FLAGS)
 TSAN     = -fsanitize=thread -fno-omit-frame-pointer -g
 
 # The test TU uses ONLY the mirrored declarations in ngx_shim_shm.h (-I.), while

@@ -117,7 +117,7 @@ typedef struct {
      * store view), who has no private data at all.
      *
      * A preset that lists a key cookie DEPENDS on the Set-Cookie floor in
-     * ngx_http_cache_turbo_response_cacheable(): a request with no key cookie
+     * ngx_http_cache_turbo_response_policy(): a request with no key cookie
      * hashes to the ANONYMOUS entry, and if the response ESTABLISHES the segment
      * (Set-Cookie: <keycookie>=...) then storing that body under the anonymous
      * key poisons it for every anonymous visitor. The floor refuses to store ANY
@@ -687,7 +687,7 @@ static const char *const  ct_mw_args[] = {
  * poisons it for everyone. Upstream refuses to cache exactly this
  * (vcl_backend_response: beresp.uncacheable when the request had no vary cookie
  * and the response sets one). We inherit the identical refusal from the
- * Set-Cookie floor in ngx_http_cache_turbo_response_cacheable(): the response
+ * Set-Cookie floor in ngx_http_cache_turbo_response_policy(): the response
  * that establishes the segment carries a Set-Cookie, so it is never stored,
  * under any key. This preset DEPENDS on that floor, and the floor says so.
  * The floor's only relax (P5-8's cache_turbo_ignore_set_cookie) is hard-vetoed

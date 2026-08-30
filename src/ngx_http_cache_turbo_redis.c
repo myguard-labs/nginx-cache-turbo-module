@@ -81,16 +81,11 @@ typedef struct {
                                             * connection is reusable (v15)     */
 
     /* S231: 1 from a fresh (non-reused, non-TLS-handshake) connect() attempt
-     * until the FIRST byte is actually written on the wire. A write-path
-     * failure (op_fail) that fires while this is still 1 means nothing ever
-     * left the socket -- the async ECONNREFUSED/RST/connect-timeout case,
-     * which on this platform is how a closed-port connect actually surfaces
-     * (ngx_event_connect_peer's own non-blocking connect() returns EINPROGRESS
-     * -> NGX_AGAIN on loopback even for a port nothing listens on; the refusal
-     * is only observable later, on the write event). Cleared to 0 the moment
-     * any data is sent, so a later send()/timeout error (a real transport
-     * failure mid-command, or a protocol error after the reply starts) is
-     * correctly NOT treated as a connect failure and does not arm backoff. */
+     * until the first genuine reply byte proves the peer, or a terminal
+     * no-reply path consumes the classification. A successful send is not
+     * proof: an asynchronous ECONNREFUSED/RST can surface only on the later
+     * read. The consume-once failure helper arms backoff at most once even
+     * when shared write failure dispatch nests an op-specific finish. */
     unsigned                     unconnected:1;
 
     /* AUTH/SELECT preamble (v5 DSN). When the backend needs auth or a non-zero
@@ -863,6 +858,25 @@ ngx_http_cache_turbo_redis_backoff_clear(ngx_addr_t *addr)
     s = ngx_http_cache_turbo_redis_backoff_find(addr, 0);
     if (s != NULL) {
         s->until = 0;
+    }
+}
+
+
+/* Consume a fresh connection's terminal no-reply classification exactly once.
+ * Shared write/TLS failures dispatch through op_fail() into an op-specific
+ * finish helper, while direct readers call those finishes themselves. Clearing
+ * here gives both call shapes one owner and prevents a nested finish re-arm. */
+static void
+ngx_http_cache_turbo_redis_backoff_fail(ngx_http_cache_turbo_redis_op_t *op)
+{
+    if (!op->unconnected) {
+        return;
+    }
+
+    op->unconnected = 0;
+    if (op->clcf != NULL) {
+        ngx_http_cache_turbo_redis_backoff_arm(&op->clcf->redis_addr,
+            op->clcf->redis_connect_backoff);
     }
 }
 
@@ -2267,6 +2281,7 @@ ngx_http_cache_turbo_redis_read_drain(ngx_event_t *rev)
     if (rev->timedout) {
         ngx_log_error(NGX_LOG_INFO, c->log, NGX_ETIMEDOUT,
                       "cache_turbo: redis read timed out");
+        ngx_http_cache_turbo_redis_backoff_fail(op);
         ngx_http_cache_turbo_redis_op_done(op);   /* clean stays 0: not pooled */
         return;
     }
@@ -2276,6 +2291,7 @@ ngx_http_cache_turbo_redis_read_drain(ngx_event_t *rev)
             /* Replies to our fire-and-forget commands (integers, +OK, a short
              * -ERR) never fill the scratch buffer; if one somehow does, just
              * don't pool the connection rather than grow it unbounded. */
+            ngx_http_cache_turbo_redis_backoff_fail(op);
             ngx_http_cache_turbo_redis_op_done(op);
             return;
         }
@@ -2285,14 +2301,27 @@ ngx_http_cache_turbo_redis_read_drain(ngx_event_t *rev)
 
         if (n == NGX_AGAIN) {
             if (ngx_handle_read_event(rev, 0) != NGX_OK) {
+                ngx_http_cache_turbo_redis_backoff_fail(op);
                 ngx_http_cache_turbo_redis_op_done(op);
             }
             return;
         }
         if (n == NGX_ERROR || n == 0) {
             /* Peer closed/errored before all replies framed: don't pool. */
+            ngx_http_cache_turbo_redis_backoff_fail(op);
             ngx_http_cache_turbo_redis_op_done(op);
             return;
+        }
+
+        /* A genuine reply byte proves this fresh connection reached Redis.
+         * The direct drain does not pass through redis_fill(), so it owns the
+         * same clear performed there by GET/SMEMBERS/SCAN. */
+        if (op->unconnected) {
+            op->unconnected = 0;
+            if (op->clcf != NULL) {
+                ngx_http_cache_turbo_redis_backoff_clear(
+                    &op->clcf->redis_addr);
+            }
         }
 
         op->recv_len += (size_t) n;
@@ -2309,6 +2338,7 @@ ngx_http_cache_turbo_redis_read_drain(ngx_event_t *rev)
             }
             if (rc == NGX_DECLINED) {
                 /* Malformed reply: drain is best-effort, don't pool. */
+                ngx_http_cache_turbo_redis_backoff_fail(op);
                 ngx_http_cache_turbo_redis_op_done(op);
                 return;
             }
@@ -2328,6 +2358,7 @@ ngx_http_cache_turbo_redis_read_drain(ngx_event_t *rev)
         if (p != last) {
             /* Extra buffered bytes are an unexpected partial/additional reply.
              * Closing is the only safe boundary; pooling would discard them. */
+            ngx_http_cache_turbo_redis_backoff_fail(op);
             ngx_http_cache_turbo_redis_op_done(op);
             return;
         }
@@ -3474,6 +3505,11 @@ ngx_http_cache_turbo_redis_smembers_finish(
     ngx_http_cache_turbo_redis_walk_t       walk;
     ngx_int_t                               rc;
 
+    /* Every successful/malformed reply passes through redis_fill(), which
+     * clears unconnected on its first byte. A still-set flag here therefore
+     * means the direct SMEMBERS/SCAN reader ended without any peer reply. */
+    ngx_http_cache_turbo_redis_backoff_fail(op);
+
     /* AUD-SCAN1: on the SCAN path, tell the callback HOW the walk ended.
      * op->scan_status is NGX_OK only where the server returned cursor "0";
      * every other terminal path (timeout, malformed reply, alloc failure, page
@@ -3579,9 +3615,8 @@ ngx_http_cache_turbo_redis_get_finish(ngx_http_cache_turbo_redis_op_t *op,
      * clear sites in _fill()/read_preamble()), so a malformed/error REPLY
      * (which requires bytes to have arrived) can never hit this branch --
      * only a genuine connect-phase failure can. */
-    if (result == NGX_ERROR && op->unconnected && op->clcf != NULL) {
-        ngx_http_cache_turbo_redis_backoff_arm(&op->clcf->redis_addr,
-            op->clcf->redis_connect_backoff);
+    if (result == NGX_ERROR) {
+        ngx_http_cache_turbo_redis_backoff_fail(op);
     }
 
     if (result == NGX_OK && blob_len > 0) {
@@ -3734,9 +3769,8 @@ ngx_http_cache_turbo_redis_lock_finish(ngx_http_cache_turbo_redis_op_t *op,
 
     /* S231: same "still unconnected" arm as get_finish() -- the lock reader
      * calls this directly instead of through op_fail(). */
-    if (result == NGX_ERROR && op->unconnected && op->clcf != NULL) {
-        ngx_http_cache_turbo_redis_backoff_arm(&op->clcf->redis_addr,
-            op->clcf->redis_connect_backoff);
+    if (result == NGX_ERROR) {
+        ngx_http_cache_turbo_redis_backoff_fail(op);
     }
 
     ctx->lock_result = result;
@@ -3754,25 +3788,20 @@ ngx_http_cache_turbo_redis_lock_finish(ngx_http_cache_turbo_redis_op_t *op,
  * set for both SMEMBERS and SCAN (both finish through smembers_finish); is_lock
  * distinguishes a lock from a GET (both pin op->request + op->ctx).
  *
- * S231: single choke point for the connect-failure classification. Every
- * write/read/protocol failure on this op funnels through here (write timeout,
- * send() error, read timeout, recv() error, a malformed/error reply), and
- * op->unconnected is true iff no reply byte has EVER been read on this
- * connection since a fresh (non-reused) connect() -- see the field comment.
- * That is exactly "this op never got a real answer from the peer", which for
- * a freshly opened connection means the peer was never actually reachable:
+ * S231: shared write failures consume the connect-failure classification here;
+ * direct readers consume it through their op-specific finish. In either case,
+ * op->unconnected is true iff no reply byte has ever been read on this
+ * connection and no earlier terminal path has consumed it -- see the field
+ * comment.
+ * That is exactly "this fresh op never got a real answer from the peer", so
  * arm the backoff window. A reused (keepalive) connection is never
  * "unconnected" (op_create zeroes it, only _connect's fresh-connect branch
- * sets it), so its failures never arm backoff, matching "connect failure
- * only, not protocol/reply errors" precisely -- a reused connection failing
- * mid-protocol is definitionally not a connect failure. */
+ * sets it), so its failures never arm backoff. Reply/protocol errors after a
+ * first byte likewise cannot arm because that byte already cleared the flag. */
 static void
 ngx_http_cache_turbo_redis_op_fail(ngx_http_cache_turbo_redis_op_t *op)
 {
-    if (op->unconnected && op->clcf != NULL) {
-        ngx_http_cache_turbo_redis_backoff_arm(&op->clcf->redis_addr,
-            op->clcf->redis_connect_backoff);
-    }
+    ngx_http_cache_turbo_redis_backoff_fail(op);
 
     if (op->members_cb) {
         ngx_http_cache_turbo_redis_smembers_finish(op, NULL, 0);
