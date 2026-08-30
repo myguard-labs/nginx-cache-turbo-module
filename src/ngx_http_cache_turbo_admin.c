@@ -53,7 +53,7 @@ typedef struct {
     ngx_str_t           path;
     ngx_str_t           list;
     ngx_uint_t          warm_max;
-    ngx_uint_t          file_error;
+    const char         *file_error;
     ngx_err_t           file_errno;
     ssize_t             nread;
     u_char             *nul;
@@ -1168,9 +1168,10 @@ static ngx_int_t
 ngx_http_cache_turbo_warm_file_start(ngx_http_request_t *r, ngx_str_t *path,
     ngx_int_t warm_max)
 {
-    u_char           *buf, *nul;
+    u_char           *nul;
     ngx_http_cache_turbo_warm_file_ctx_t  *ctx;
 #if (NGX_THREADS)
+    u_char                    *buf;
     ngx_str_t                  name;
     ngx_thread_pool_t         *tp;
     ngx_thread_task_t         *task;
@@ -1193,12 +1194,6 @@ ngx_http_cache_turbo_warm_file_start(ngx_http_request_t *r, ngx_str_t *path,
     ctx->warm_max = warm_max;
     ctx->nul = nul;
     ctx->path = *path;
-    buf = ngx_pnalloc(r->pool, NGX_HTTP_CACHE_TURBO_WARM_FILE_MAX_SIZE);
-    if (buf == NULL) {
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
-    }
-    ctx->list.data = buf;
-
 #if (NGX_THREADS)
     clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
     tp = clcf->thread_pool;
@@ -1219,6 +1214,12 @@ ngx_http_cache_turbo_warm_file_start(ngx_http_request_t *r, ngx_str_t *path,
             return ngx_http_cache_turbo_warm_file_prereq_error(r);
         }
     }
+
+    buf = ngx_pnalloc(r->pool, NGX_HTTP_CACHE_TURBO_WARM_FILE_MAX_SIZE);
+    if (buf == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+    ctx->list.data = buf;
 
     task = ngx_thread_task_alloc(r->pool, 0);
     if (task == NULL) {
@@ -1271,7 +1272,7 @@ ngx_http_cache_turbo_warm_file_test_delay(
 
     ngx_snprintf(marker, sizeof(marker), ".delay-%s%Z", stage);
     if (ngx_strstr(ctx->nul, marker) != NULL) {
-        ngx_msleep(1500);
+        ngx_msleep(5000);
     }
 }
 #else
@@ -1291,20 +1292,20 @@ ngx_http_cache_turbo_warm_file_thread_handler(void *data, ngx_log_t *log)
                        NGX_FILE_OPEN, 0);
     if (fd == NGX_INVALID_FILE) {
         ctx->file_errno = ngx_errno;
-        ctx->file_error = 1;
+        ctx->file_error = "open";
         return;
     }
 
     ngx_http_cache_turbo_warm_file_test_delay(ctx, "fstat");
     if (ngx_fd_info(fd, &fi) == NGX_FILE_ERROR) {
         ctx->file_errno = ngx_errno;
-        ctx->file_error = 2;
+        ctx->file_error = "fstat";
         ngx_close_file(fd);
         return;
     }
 
     if (!ngx_is_file(&fi)) {
-        ctx->file_error = 3;
+        ctx->file_error = "not a regular file";
         ngx_close_file(fd);
         return;
     }
@@ -1312,7 +1313,7 @@ ngx_http_cache_turbo_warm_file_thread_handler(void *data, ngx_log_t *log)
     if (ngx_file_size(&fi) < 0
         || ngx_file_size(&fi) > NGX_HTTP_CACHE_TURBO_WARM_FILE_MAX_SIZE)
     {
-        ctx->file_error = 4;
+        ctx->file_error = "over the size limit";
         ngx_close_file(fd);
         return;
     }
@@ -1322,9 +1323,9 @@ ngx_http_cache_turbo_warm_file_thread_handler(void *data, ngx_log_t *log)
     ctx->nread = ngx_read_fd(fd, ctx->list.data, ctx->list.len);
     if (ctx->nread == NGX_ERROR) {
         ctx->file_errno = ngx_errno;
-        ctx->file_error = 5;
+        ctx->file_error = "read";
     } else if ((size_t) ctx->nread != ctx->list.len) {
-        ctx->file_error = 5;
+        ctx->file_error = "short read";
     }
     ngx_close_file(fd);
     (void) log;
@@ -1370,7 +1371,7 @@ ngx_http_cache_turbo_warm_file_thread_event(ngx_event_t *ev)
 
     if (ctx->file_error) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, ctx->file_errno,
-            "cache_turbo: warm url_file \"%s\" open/stat/read failed (%ui)",
+            "cache_turbo: warm url_file \"%s\" failed at %s",
             ctx->nul, ctx->file_error);
         rc = ngx_http_cache_turbo_warm_file_read_error(r);
     } else {

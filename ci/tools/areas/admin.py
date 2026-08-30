@@ -1709,10 +1709,11 @@ def test_warm_url_file_fifo_does_not_block_worker(ng: Nginx) -> None:
     non-regular file immediately and keeps an ordinary admin request live."""
     (ng.root / "warm-lists").mkdir(exist_ok=True)
     fifo_path = ng.root / "warm-lists" / "warm-list.fifo"
+    fifo_path.unlink(missing_ok=True)
     os.mkfifo(fifo_path)
 
     def _delayed_fifo_peer() -> None:
-        time.sleep(2.0)
+        time.sleep(2.0 * sanitizer_time_scale())
         fd = os.open(fifo_path, os.O_RDWR | os.O_NONBLOCK)
         os.close(fd)
 
@@ -1730,13 +1731,15 @@ def test_warm_url_file_fifo_does_not_block_worker(ng: Nginx) -> None:
         started = time.monotonic()
         s2, _, _ = fetch(ng.port, "/_cache_wc")
         elapsed = time.monotonic() - started
+        band = 1.0 * sanitizer_time_scale()
         assert s2 == 200, f"worker unresponsive during FIFO validation (status {s2})"
-        assert elapsed < 1.0, \
+        assert elapsed < band, \
             f"FIFO path open blocked nginx's event loop for {elapsed:.2f}s"
-        (s, b, h), fifo_elapsed = fifo_request.result(timeout=3.0)
+        (s, b, h), fifo_elapsed = fifo_request.result(
+            timeout=3.0 * sanitizer_time_scale())
 
     assert s == 500, f"FIFO url_file returned {s}, expected 500: {b!r}"
-    assert fifo_elapsed < 1.0, \
+    assert fifo_elapsed < band, \
         f"FIFO validation blocked a thread-pool worker for {fifo_elapsed:.2f}s"
     assert "application/json" in h.get("content-type", ""), h.get("content-type")
     assert "error" in json.loads(b), f"expected an error body, got {b!r}"
@@ -1766,9 +1769,12 @@ def test_warm_url_file_io_stages_run_off_event_loop(ng: Nginx) -> None:
             elapsed = time.monotonic() - started
             assert s2 == 200, \
                 f"worker unresponsive during delayed {stage} (status {s2})"
-            assert elapsed < 1.0, \
+            assert not delayed.done(), \
+                f"delayed {stage} completed before the control request"
+            assert elapsed < 1.0 * sanitizer_time_scale(), \
                 f"delayed {stage} blocked nginx's event loop for {elapsed:.2f}s"
-            s, b, _ = delayed.result(timeout=3.0)
+            s, b, _ = delayed.result(
+                timeout=7.0 * sanitizer_time_scale())
 
         assert s == 200, f"delayed {stage} url_file returned {s}: {b!r}"
         assert json.loads(b)["warmed"] == 0, \

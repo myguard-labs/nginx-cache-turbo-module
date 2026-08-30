@@ -226,6 +226,7 @@ test_warm_schedule_error(void)
     CHECK(rc == NGX_DONE,
           "warm schedule helper must propagate the JSON callback result");
     CHECK(ngx_test_send_json_calls == 1
+              && ngx_test_send_json_request == &request
               && ngx_test_send_json_status == NGX_HTTP_INTERNAL_SERVER_ERROR,
           "warm schedule failure must send exactly one HTTP 500 response");
     CHECK(ngx_test_send_json_body.len == sizeof(body) - 1
