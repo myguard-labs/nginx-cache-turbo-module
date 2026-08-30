@@ -1,8 +1,8 @@
-# sync-sha: c9d730850140bdae59ce44fc6694d93dc1dce980e49a136f6446d915b6348620
+# sync-sha: 23feaea2c086f248aaeeb2b6a6d2c22d0b057f88c38887456770de4b15b62a97
 name: Security scanners
 
 # Static/security scanners gate (flawfinder, clang-tidy cert-*/security.*,
-# semgrep) on every PR/push. Same job as the ci-deep.yml scanners job.
+# semgrep) on every PR/push. GCC -fanalyzer runs as a separate advisory lens.
 #
 # Action pins (keep in sync with build-test.yml header):
 # actions/checkout@v5        -> 93cb6efe18208431cddfb8368fd83d5badbf9bfd
@@ -38,7 +38,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential ccache curl eatmydata flawfinder clang-tidy \
+          sudo apt-get install -y bear build-essential ccache curl eatmydata flawfinder clang-tidy \
             libpcre2-dev libssl-dev mold python3 python3-pip pipx zlib1g-dev
           # semgrep: isolate via pipx (PEP 668 blocks a bare pip3 install into the
           # system Python on the Ubuntu 24.04 self-hosted runner). Fall back to a
@@ -51,6 +51,8 @@ jobs:
             echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           fi
           test "$(semgrep --version)" = 1.169.0
+      - name: Static-analysis negative controls
+        run: bash ci/tools/test-analysis-controls.sh
       - name: gitleaks (full history scan)
         run: |
           set -euo pipefail
@@ -66,12 +68,35 @@ jobs:
         with:
           mode: module
           nginx-version: ${{ env.NGINX_VERSION }}
-      - name: Configure nginx src tree (clang-tidy headers)
+      - name: Build module and capture the real compile flags
         run: |
           set -euo pipefail
-          bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" module
-          echo "NGINX_SRC_TREE=$GITHUB_WORKSPACE/.build/nginx-${NGINX_VERSION}" \
-            >> "$GITHUB_ENV"
+          tree="$GITHUB_WORKSPACE/.build/nginx-${NGINX_VERSION}"
+          # bear only records compiles that execute. Force just this module's
+          # objects cold so a warm build cache cannot yield a valid empty db.
+          rm -rf "$tree/objs/addon" "$tree"/objs/*.so
+          bear --output compile_commands.json -- \
+            bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" module
+
+      - name: Verify compilation database covers src/
+        env:
+          WS: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, pathlib, sys
+          ws = pathlib.Path(os.environ["WS"])
+          want = {p.resolve() for p in (ws / "src").glob("*.c")}
+          db = json.loads((ws / "compile_commands.json").read_text())
+          got = {pathlib.Path(e["file"]).resolve() for e in db}
+          missing = want - got
+          if not want:
+              sys.exit("no src/*.c found")
+          if missing:
+              sys.exit("compile_commands.json missing: "
+                       + ", ".join(sorted(p.name for p in missing)))
+          print(f"compilation database covers all {len(want)} module sources")
+          PY
       - name: flawfinder (gate on >=4)
         run: |
           set -euo pipefail
@@ -93,18 +118,17 @@ jobs:
       - name: clang-tidy (cert-*, security.*)
         run: |
           set -euo pipefail
-          N="$NGINX_SRC_TREE"
-          INCLUDES="-I$N/src/core -I$N/src/event -I$N/src/event/modules -I$N/src/event/quic \
-            -I$N/src/os/unix -I$N/objs -I$N/src/http -I$N/src/http/modules -I$N/src/http/v2 -I/usr/include"
           status=0
           for f in "$GITHUB_WORKSPACE"/src/*.c; do
-            # shellcheck disable=SC2086
-            clang-tidy "$f" \
-              --checks='-*,cert-*,clang-analyzer-security.*,-clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling' \
-              --warnings-as-errors='*' \
-              -- $INCLUDES 2>&1 | tee -a clang-tidy.log || status=1
+            # Checks and warning promotion live in the tracked .clang-tidy;
+            # command-line copies would silently override that policy.
+            clang-tidy "$f" -p "$GITHUB_WORKSPACE" \
+              2>&1 | tee -a clang-tidy.log || status=1
           done
           exit "$status"
+      - name: gcc -fanalyzer (advisory)
+        continue-on-error: true
+        run: bash ci/tools/fanalyzer.sh "$GITHUB_WORKSPACE"
       - name: semgrep (gate on >=WARNING)
         run: |
           set -euo pipefail
@@ -134,5 +158,6 @@ jobs:
           path: |
             ${{ github.workspace }}/flawfinder.log
             ${{ github.workspace }}/clang-tidy.log
+            ${{ github.workspace }}/fanalyzer.log
             ${{ github.workspace }}/semgrep.log
           retention-days: 14

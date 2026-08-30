@@ -1,4 +1,4 @@
-# sync-sha: a4fdb21ae7486ac06250a80a8070dda6972985693efc4a9ee9367b92b78615e5
+# sync-sha: 98ddb73ca344d14f58a5ae29e910ce3ac01fa3029f4b1144ef79fb081454181b
 name: CI
 
 # Single entry point for the PR suite. The checks below used to be independent
@@ -188,8 +188,8 @@ jobs:
           fi
 
   # --- lane A: the budget-setting workflow, alone --------------------------
-  # A/UBSan's 715s terminal follows its mandatory 185s build. Nothing is
-  # chained behind either terminal, so this stays at the 900s floor.
+  # A/UBSan's measured 154s build fans into 725s/738s terminals: 892s total.
+  # Nothing is chained behind either terminal.
   asan:
     name: A/UBSan
     needs: changes
@@ -199,8 +199,8 @@ jobs:
     uses: ./.github/workflows/asan.yml
 
   # --- lane B: Build&Test, alone -------------------------------------------
-  # Its 141s build fans out to 703s Runtime and 107s Presets: 844s total, with
-  # only 56s headroom against the budget. Nothing independent follows it.
+  # Its measured 157s build fans out to a 764s Runtime and 182s Presets:
+  # 921s total. Nothing independent follows it.
   #
   # On docs-only PRs, skip the expensive build/validation/runtime suite via
   # skip-expensive-jobs=true. The required checks (runtime and prove jobs)
@@ -215,9 +215,8 @@ jobs:
       skip-expensive-jobs: ${{ needs.changes.outputs.code == 'false' }}
 
   # --- lane C: Fuzzing, and Security Scanners BESIDE it, not behind it -----
-  # Current measurements are 671s and 210s. Chaining them would take 881s and
-  # consume almost the entire 900s budget; keeping them side by side leaves
-  # lane C at 671s and preserves headroom for normal variance.
+  # Current measurements are about 370s and 174s. Keeping them side by side
+  # leaves lane C at about 370s and preserves headroom for normal variance.
   #
   # `needs: changes` is kept, and so is the `needs.changes.result == 'success'`
   # guard: that job exits 1 rather than fail open when it cannot compute its
