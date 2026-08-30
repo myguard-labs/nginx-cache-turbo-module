@@ -1755,6 +1755,71 @@ ngx_http_cache_turbo_add_header(ngx_http_request_t *r,
 }
 
 
+/* AUD30-ENCODED-ORIGIN-CONTENT-ENCODING-LOSS: Content-Encoding is never
+ * stored as a free-form header because ordinary cache entries hold identity
+ * bytes and downstream compression filters must choose their coding per
+ * client. An origin-encoded entry is the deliberate exception: its body is
+ * already coding-specific, and the validated ae-class stamp is the canonical
+ * coding. Rebuild both the list entry and nginx's typed pointer so downstream
+ * compressors see the response as already encoded and do not encode twice. */
+static ngx_int_t
+ngx_http_cache_turbo_restore_content_encoding(ngx_http_request_t *r,
+    ngx_http_cache_turbo_blob_hdr_t *bh)
+{
+    ngx_table_elt_t  *h;
+    ngx_uint_t        ae_class;
+    u_char           *value;
+    size_t            value_len;
+
+    static u_char  name[] = "Content-Encoding";
+    static u_char  gzip[] = "gzip";
+    static u_char  br[] = "br";
+    static u_char  zstd[] = "zstd";
+
+    if (!(bh->flags & NGX_HTTP_CACHE_TURBO_BLOBF_ORIGIN_ENCODED)) {
+        return NGX_OK;
+    }
+
+    ae_class = (bh->flags & NGX_HTTP_CACHE_TURBO_BLOBF_AE_CLASS_MASK)
+               >> NGX_HTTP_CACHE_TURBO_BLOBF_AE_CLASS_SHIFT;
+
+    switch (ae_class) {
+    case NGX_HTTP_CACHE_TURBO_AE_CLASS_GZIP:
+        value = gzip;
+        value_len = sizeof("gzip") - 1;
+        break;
+    case NGX_HTTP_CACHE_TURBO_AE_CLASS_BR:
+        value = br;
+        value_len = sizeof("br") - 1;
+        break;
+    case NGX_HTTP_CACHE_TURBO_AE_CLASS_ZSTD:
+        value = zstd;
+        value_len = sizeof("zstd") - 1;
+        break;
+    default:
+        return NGX_ERROR;               /* validator should have rejected it */
+    }
+
+    h = ngx_http_cache_turbo_restore_alloc_fails(r)
+            ? NULL : ngx_list_push(&r->headers_out.headers);
+    if (h == NULL) {
+        return NGX_ERROR;
+    }
+
+    h->hash = 1;
+    h->key.len = sizeof("Content-Encoding") - 1;
+    h->key.data = name;
+    h->value.len = value_len;
+    h->value.data = value;
+#if (nginx_version >= 1023000)
+    h->next = NULL;
+#endif
+    r->headers_out.content_encoding = h;
+
+    return NGX_OK;
+}
+
+
 #if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
     && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
 /*
@@ -2720,8 +2785,9 @@ ngx_http_cache_turbo_restore_response_finalize(ngx_http_request_t *r,
 
 /* Rebuild r->headers_out from a validated, pool-owned cache blob (caller already
  * copied it out of shm and released the zone lock): set status / Content-Type /
- * Content-Length, replay the stored headers, answer a conditional 200 with 304
- * (live serves only), and stamp Date / Age / X-Cache. Returns the body slice via
+ * Content-Length, replay stored headers, restore a stamped origin coding,
+ * answer a conditional 200 with 304 (live serves only), and stamp Date / Age /
+ * X-Cache. Returns the body slice via
  * *bodyp / *body_lenp. Does NOT send the header or body — ngx_http_cache_turbo_
  * serve() does that for a live HIT, while the RFC-2 serve-on-error path calls
  * this from the header filter and lets the filter chain carry the response.
@@ -2773,6 +2839,10 @@ ngx_http_cache_turbo_restore_response(ngx_http_request_t *r, u_char *copy,
                                                        &lastmod, &lastmod_len)
         != NGX_OK)
     {
+        return NGX_ERROR;
+    }
+
+    if (ngx_http_cache_turbo_restore_content_encoding(r, &hdr) != NGX_OK) {
         return NGX_ERROR;
     }
 
@@ -2998,14 +3068,16 @@ ngx_http_cache_turbo_serve(ngx_http_request_t *r, u_char *copy, size_t len,
                                   & NGX_HTTP_CACHE_TURBO_BLOBF_AE_CLASS_MASK)
                                  >> NGX_HTTP_CACHE_TURBO_BLOBF_AE_CLASS_SHIFT;
 
-            if (!ngx_http_cache_turbo_ae_class_accepted(r, class)) {
+            if (class == NGX_HTTP_CACHE_TURBO_AE_CLASS_IDENTITY
+                || !ngx_http_cache_turbo_ae_class_accepted(r, class))
+            {
                 if (ref_data != NULL && cc != NULL) {
                     cc->data = NULL;
                     ngx_http_cache_turbo_blob_release(z, ref_data);
                 }
                 ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                                "cache_turbo: origin-encoded entry \"%V\" "
-                               "class=%ui not accepted by request "
+                               "class=%ui invalid or not accepted by request "
                                "Accept-Encoding -> origin", &r->uri, class);
                 return NGX_DECLINED;
             }
@@ -3621,17 +3693,15 @@ ngx_http_cache_turbo_response_policy(ngx_http_request_t *r,
  * cache) sits behind us, we don't freeze and replay its per-response age/status
  * on every L1 hit (see "Mixing with nginx's native cache" in the README).
  *
- * Content-Encoding is dropped because we are the TOP-most output filter: our
- * body filter captures the IDENTITY body, BEFORE gzip/zstd/brotli compress it,
- * but the compression filter's header filter runs downstream of ours and has
- * already stamped Content-Encoding on r->headers_out by the time we serialise
- * the headers at store. Storing that coding against an uncompressed body would
- * replay e.g. "Content-Encoding: gzip" with a plain body (browser "Content
- * Encoding Error"). Dropping it lets the downstream compression filter re-add
- * the correct coding per client on every MISS and HIT (the proxy_cache model).
- * A genuinely origin-pre-compressed response is refused earlier by the
- * response_encoded() guard (its Content-Encoding is set BEFORE our header
- * filter runs), so it never reaches this serialiser.
+ * Content-Encoding is dropped because ordinary entries hold the IDENTITY body:
+ * our body filter captures before gzip/zstd/brotli compress it, while a local
+ * compression filter may already have stamped Content-Encoding by the time we
+ * serialise. Replaying that header with the identity body would be a browser
+ * "Content Encoding Error"; downstream compression filters instead choose the
+ * coding per client on every MISS and HIT. The explicit encoded-origin opt-in
+ * is different: it stamps the validated coding class in BLOBF_* and restore
+ * reconstructs the exact gzip/br/zstd Content-Encoding from that stamp. The
+ * free-form origin header remains skipped so unsupported codings cannot enter.
  */
 static ngx_int_t
 ngx_http_cache_turbo_header_skip(ngx_http_cache_turbo_loc_conf_t *clcf,
@@ -3912,10 +3982,13 @@ ngx_http_cache_turbo_sie_rewrite(ngx_http_request_t *r,
                                   & NGX_HTTP_CACHE_TURBO_BLOBF_AE_CLASS_MASK)
                                  >> NGX_HTTP_CACHE_TURBO_BLOBF_AE_CLASS_SHIFT;
 
-            if (!ngx_http_cache_turbo_ae_class_accepted(r, class)) {
+            if (class == NGX_HTTP_CACHE_TURBO_AE_CLASS_IDENTITY
+                || !ngx_http_cache_turbo_ae_class_accepted(r, class))
+            {
                 ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                                "cache_turbo: origin-encoded SIE snapshot "
-                               "\"%V\" class=%ui not accepted by request "
+                               "\"%V\" class=%ui invalid or not accepted by "
+                               "request "
                                "Accept-Encoding -> origin error stands",
                                &r->uri, class);
                 return NGX_DECLINED;
@@ -3924,8 +3997,10 @@ ngx_http_cache_turbo_sie_rewrite(ngx_http_request_t *r,
     }
 
     /* Drop the error response's headers and the typed fields it set (Content-Type
-     * / Content-Length) so the snapshot's own headers are authoritative. The
-     * special-response path has already cleared ETag/Last-Modified/Accept-Ranges,
+     * / Content-Length) so the snapshot's own headers are authoritative. An
+     * encoded snapshot overwrites content_encoding with its validated stamp.
+     * The special-response path has already cleared ETag/Last-Modified/
+     * Accept-Ranges,
      * so a fresh list + these two typed fields is a clean slate; restore_response
      * sets status / Content-Type / Content-Length / status_line from the blob. */
     if (ngx_list_init(&r->headers_out.headers, r->pool, 8,

@@ -803,8 +803,10 @@ typedef struct {
  */
 #define NGX_HTTP_CACHE_TURBO_BLOBF_ORIGIN_ENCODED  0x0002
 
-/* 2-bit ae-class enum packed into the blob flags u16, valid only when
- * BLOBF_ORIGIN_ENCODED is set. Bits 2-3 of the u16 (mask 0x000C, shift 2).
+/* 2-bit ae-class enum packed into the blob flags u16. A non-identity class is
+ * valid iff BLOBF_ORIGIN_ENCODED is set; blob_validate() rejects either
+ * half-state because restore reconstructs Content-Encoding from this stamp.
+ * Bits 2-3 of the u16 (mask 0x000C, shift 2).
  * Mirrors the same zstd > br > gzip priority ngx_http_cache_turbo_ae_class()
  * uses for the request-side variant key, so the class the object was stored
  * under and the class checked on serve are the same enum. */

@@ -4131,6 +4131,20 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # Encoded-origin SIE contract: isolate the short lifetime needed to
+        # drive a fully expired snapshot from the ordinary /avenc/ variants.
+        location /avencsie/ {{
+            cache_turbo          main;
+            cache_turbo_key      $request_uri;
+            cache_turbo_valid    1s;
+            cache_turbo_stale_mult 1;
+            cache_turbo_keep_stale off;
+            cache_turbo_auto_vary on;
+            cache_turbo_key_encoded_origin on;
+            add_header            X-CT-Status $cache_turbo_status always;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # cache_turbo_serve_authorized (P3-4): the LOOKUP-side Authorization
         # refusal is lifted here, so a credentialed request may READ an
         # anonymously-stored entry. The STORE floor is untouched and ungated,

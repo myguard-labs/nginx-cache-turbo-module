@@ -583,10 +583,12 @@ ngx_http_cache_turbo_blob_validate(const u_char *blob, size_t len,
     out->fresh_ttl   = ngx_http_cache_turbo_get_u32(blob + 32);
     out->stale_ttl   = ngx_http_cache_turbo_get_u32(blob + 36);
     out->sie_ttl     = ngx_http_cache_turbo_get_u32(blob + 40);   /* CTB4 */
-    /* S232-BYPASS-STALE: BLOBF_* bits from the formerly-reserved u16. No range
-     * check -- unknown bits are ignored by every consumer (each tests its own
-     * bit), and an old blob reads 0 = no bits set. Rejecting on an unknown bit
-     * would make a future bit a keyspace-turnover event for no safety gain. */
+    /* S232-BYPASS-STALE: BLOBF_* bits from the formerly-reserved u16. Unknown
+     * bits are ignored by every consumer (each tests its own bit), and an old
+     * blob reads 0 = no bits set. Rejecting unknown bits would make a future
+     * bit a keyspace-turnover event for no safety gain. The known encoded-
+     * origin/class relationship is validated below because restore uses that
+     * class to reconstruct Content-Encoding. */
     out->flags       = ngx_http_cache_turbo_get_u16(blob + 6);
 
     /*
@@ -612,6 +614,25 @@ ngx_http_cache_turbo_blob_validate(const u_char *blob, size_t len,
     }
     if (out->stale_ttl < out->fresh_ttl) {
         return NGX_ERROR;
+    }
+
+    /* AUD30-ENCODED-ORIGIN-CONTENT-ENCODING-LOSS: the packed ae-class is a
+     * producer stamp, not an independent hint. Every local store writes a
+     * non-identity class iff it also sets BLOBF_ORIGIN_ENCODED. Reject either
+     * impossible half-state at the shared blob validator so a forged/corrupt
+     * L2 entry cannot make restore emit a coding that does not describe its
+     * body, or mark encoded bytes as identity and omit Content-Encoding. */
+    {
+        ngx_uint_t  ae_class;
+
+        ae_class = (out->flags & NGX_HTTP_CACHE_TURBO_BLOBF_AE_CLASS_MASK)
+                   >> NGX_HTTP_CACHE_TURBO_BLOBF_AE_CLASS_SHIFT;
+
+        if (((out->flags & NGX_HTTP_CACHE_TURBO_BLOBF_ORIGIN_ENCODED) != 0)
+            != (ae_class != NGX_HTTP_CACHE_TURBO_AE_CLASS_IDENTITY))
+        {
+            return NGX_ERROR;
+        }
     }
 
     /*

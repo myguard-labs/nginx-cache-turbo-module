@@ -13,6 +13,7 @@ from __future__ import annotations
 # private helpers this module actually calls are imported explicitly.
 from test_runtime_base import *
 from test_runtime_base import (
+    _bump_conn,
     _config_test_result,
 )
 
@@ -21,6 +22,21 @@ from test_runtime_base import (
 # would normalise the split away, so the memcached twin below must use the
 # SAME instrument rather than a second, subtly weaker one.
 from areas.l2 import _wire_response
+
+
+def _fetch_encoded_origin_raw(port: int, path: str, ae: str):
+    """Return the encoded representation bytes without client decoding."""
+    _bump_conn()
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=HTTP_TIMEOUT)
+    try:
+        conn.request("GET", path,
+                     headers={"Accept-Encoding": ae, "Connection": "close"})
+        response = conn.getresponse()
+        body = response.read()
+        return (response.status, body,
+                {k.lower(): v for k, v in response.getheaders()})
+    finally:
+        conn.close()
 
 
 def test_normalize_arg_order(ng: Nginx, origin: Origin) -> None:
@@ -363,13 +379,17 @@ def test_auto_vary_encoding_precompressed_still_never_cached(
     genuinely would key on the response's own Vary header."""
     base = origin.hits
     p = "/av/precompressed-vary"
-    _, b1, h1 = fetch(ng.port, p, {"Accept-Encoding": "gzip"})
+    _, b1, h1 = _fetch_encoded_origin_raw(ng.port, p, "gzip")
     assert h1.get("x-ct-status") == "MISS", \
         f"pre-encoded response must MISS (never captured), got {h1.get('x-ct-status')}"
-    _, b2, h2 = fetch(ng.port, p, {"Accept-Encoding": "gzip"})  # SAME class, re-fetched
+    assert h1.get("content-encoding") == "gzip", h1
+    assert b1.startswith(b"\x1f\x8b"), b1
+    _, b2, h2 = _fetch_encoded_origin_raw(ng.port, p, "gzip")  # SAME class, re-fetched
     assert h2.get("x-ct-status") == "MISS", (
         "pre-encoded response became a HIT -- the response_encoded() capture "
         f"refusal was bypassed, got X-CT-Status={h2.get('x-ct-status')}")
+    assert h2.get("content-encoding") == "gzip", h2
+    assert b2.startswith(b"\x1f\x8b"), b2
     assert b1 != b2, ("pre-encoded response was served from a stale slot", b1, b2)
     assert origin.hits - base == 2, (
         ("pre-encoded response should hit the origin on every request "
@@ -382,32 +402,71 @@ def test_key_encoded_origin_caches_and_keys_by_ae_class(ng: Nginx,
     """P3-2: cache_turbo_key_encoded_origin on (/avenc/) flips the all-or-
     nothing refusal test_auto_vary_encoding_precompressed_still_never_cached
     pins for the DEFAULT-OFF case -- an origin that always sends
-    Content-Encoding: gzip with NO Vary header at all (the `/precompressed`
-    marker: gzip magic bytes, no Vary: Accept-Encoding) is captured instead
-    of refused, and the object is reachable as a HIT to a gzip-accepting
-    client on the SAME ae-class.
+    Content-Encoding: gzip/br/zstd with NO Vary header at all is captured
+    instead of refused, and the object is reachable as a HIT to a client that
+    accepts the same ae-class.
 
-    Two requests, same Accept-Encoding (gzip): first MISSes (nothing cached
-    yet), second HITs the now-stored slot with the identical body -- proving
-    this is a real HIT (the same origin body would never repeat verbatim
-    across two independent /precompressed MISSes, since the origin marker
-    embeds its own monotonic counter into the body on every real contact,
-    exactly like test_auto_vary_encoding_precompressed_still_never_cached's
-    `b1 != b2` proves for the refused case)."""
-    base = origin.hits_for("/precompressed")
-    p = "/avenc/precompressed?t=basic"
-    _, b1, h1 = fetch(ng.port, p, {"Accept-Encoding": "gzip"})
-    assert h1.get("x-ct-status") == "MISS", \
-        f"first request should MISS, got {h1.get('x-ct-status')}"
-    _, b2, h2 = fetch(ng.port, p, {"Accept-Encoding": "gzip"})
-    assert h2.get("x-ct-status") == "HIT", (
-        "cache_turbo_key_encoded_origin on must capture and re-serve an "
-        f"always-gzip origin, got X-CT-Status={h2.get('x-ct-status')}")
-    assert b1 == b2, ("HIT served a different body than the captured MISS",
-                       b1, b2)
-    assert origin.hits_for("/precompressed") - base == 1, (
-        "origin should be hit exactly once (second request served from cache)",
-        origin.hits_for("/precompressed") - base)
+    Per coding, the first request MISSes and the second HITs the now-stored
+    slot with the identical raw body and exact Content-Encoding. The origin
+    marker embeds its monotonic counter into every fresh response, so equality
+    also proves the second response really came from cache."""
+    cases = (
+        ("gzip", b"\x1f\x8b"),
+        ("br", b"br:"),
+        ("zstd", b"\x28\xb5\x2f\xfd"),
+    )
+    for coding, marker in cases:
+        needle = f"/precompressed-{coding}?t=basic-{coding}"
+        base = origin.hits_for(needle)
+        p = f"/avenc{needle}"
+        _, b1, h1 = _fetch_encoded_origin_raw(ng.port, p, coding)
+        assert h1.get("x-ct-status") == "MISS", \
+            f"{coding} first request should MISS, got {h1.get('x-ct-status')}"
+        assert h1.get("content-encoding") == coding, h1
+        assert b1.startswith(marker), (coding, b1)
+
+        _, b2, h2 = _fetch_encoded_origin_raw(ng.port, p, coding)
+        assert h2.get("x-ct-status") == "HIT", (
+            "cache_turbo_key_encoded_origin on must capture and re-serve an "
+            f"always-{coding} origin, got X-CT-Status={h2.get('x-ct-status')}")
+        assert h2.get("content-encoding") == coding, (
+            f"{coding} HIT lost or changed Content-Encoding", h2)
+        assert b2.startswith(marker), (coding, b2)
+        assert b1 == b2, (
+            f"{coding} HIT served a different body than the captured MISS",
+            b1, b2)
+        assert origin.hits_for(needle) - base == 1, (
+            f"{coding} origin should be hit exactly once",
+            origin.hits_for(needle) - base)
+
+
+def test_key_encoded_origin_sie_restores_content_encoding(
+        ng: Nginx, origin: Origin) -> None:
+    """AUD30-ENCODED-ORIGIN-CONTENT-ENCODING-LOSS: SIE restores the
+    stamped coding together with the raw encoded body, and an incompatible
+    request cannot consume that snapshot."""
+    p = "/avencsie/precompressed-sieserve?t=encoded-sie"
+    s0, b0, h0 = _fetch_encoded_origin_raw(ng.port, p, "gzip")
+    assert s0 == 200 and h0.get("content-encoding") == "gzip", (s0, h0)
+    assert b0.startswith(b"\x1f\x8b"), b0
+
+    time.sleep(1.3)
+    origin.fail = True
+    try:
+        s1, b1, h1 = _fetch_encoded_origin_raw(ng.port, p, "gzip")
+        assert s1 == 200, s1
+        assert h1.get("x-cache") == "STALE-IF-ERROR", h1
+        assert h1.get("content-encoding") == "gzip", h1
+        assert b1 == b0 and b1.startswith(b"\x1f\x8b"), (b0, b1)
+
+        sn, bn, hn = _fetch_encoded_origin_raw(ng.port, p, "br")
+        assert sn == 503, (sn, hn)
+        assert hn.get("x-cache") != "STALE-IF-ERROR", hn
+        assert hn.get("content-encoding") is None, hn
+        assert bn == b"", bn
+    finally:
+        origin.fail = False
+        drain_origin(origin)
 
 
 def test_key_encoded_origin_serve_guard_refuses_wrong_ae_class(
