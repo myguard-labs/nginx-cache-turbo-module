@@ -573,11 +573,14 @@ accidentally serve Alice's logged-in page to Bob:
   partial could be served for a different/whole range)
 - a response that arrives **already compressed from the origin** (a non-identity
   `Content-Encoding` set *before* our header filter, i.e. the upstream itself
-  compressed it) → not cached. The module caches the **identity** body and lets
-  the local gzip/zstd/brotli filter re-encode per client; it holds no identity
-  copy of an origin-pre-compressed body, so replaying it encoding-blind would
-  break clients that negotiated a different coding. (Locally-compressed responses
-  are fine — our body filter runs *above* the compressors and captures identity.)
+  compressed it) → not cached **by default**. Set
+  `cache_turbo_key_encoded_origin on` to opt in: supported encoding classes are
+  keyed separately and the serve-side guard checks that the client accepts the
+  stored coding. Without that opt-in, the module caches the **identity** body
+  and lets the local gzip/zstd/brotli filter re-encode per client; replaying an
+  origin-pre-compressed body encoding-blind would break clients that negotiated
+  a different coding. (Locally-compressed responses are fine — our body filter
+  runs *above* the compressors and captures identity.)
 
 Hop-by-hop / framing headers (`Connection`, `Transfer-Encoding`,
 `Content-Length`, `Content-Encoding`, `Set-Cookie`, `Date`, `Server`, …) are
@@ -721,10 +724,11 @@ intentional and safe. On by default.
 > response it captured is unencoded: `gzip`, `br`, `zstd` and no header at all
 > all resolve to the **same** slot instead of stacking up to four
 > byte-identical copies of the same URL. (An origin that *pre-compresses* its
-> own response is refused outright — see
-> [What it will and won't cache](#what-it-will-and-wont-cache) — so this never
-> trades away correctness: a response the module actually stores is always
-> encoding-agnostic, and encoding-keyed caching was never actually needed.)
+> own response is refused by default — see
+> [What it will and won't cache](#what-it-will-and-wont-cache). The explicit
+> `cache_turbo_key_encoded_origin on` opt-in stores supported encoding classes
+> separately and retains the serve-side `Accept-Encoding` guard; `auto_vary`
+> remains the safety net for response-driven variation.)
 
 > **Don't turn `cache_turbo_auto_vary off` on a varied origin.** It is on by
 > default precisely because, with it **off**, the cache keys on the
