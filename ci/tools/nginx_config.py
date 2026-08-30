@@ -1360,6 +1360,17 @@ http {{
         default 0;
         ~^/ctir-fixed/(?:api|login|account)(?:[/?]|$) 1;
     }}
+    # AUD30 typed-header preservation: enough of windows-1251 for the
+    # non-ASCII charset conversion fixture. A HIT must rebuild the source
+    # charset state from the stored Content-Type and run this map again.
+    charset_map windows-1251 utf-8 {{
+        CF D09F;
+        F0 D180;
+        E8 D0B8;
+        E2 D0B2;
+        E5 D0B5;
+        F2 D182;
+    }}
     cache_turbo_zone name=tiny 8m;   # small zone for eviction test (R6)
     # S8: 32k == the enforced minimum (8 * pagesize). Deliberately the SMALLEST
     # legal zone so a few hundred unique keys genuinely overflow it and force
@@ -1640,6 +1651,18 @@ http {{
             cache_turbo_key      $uri;
             cache_turbo_valid    30s;
             cache_turbo_max_size 1m;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # AUD30: cache-turbo snapshots the origin's windows-1251 representation
+        # before the downstream charset filter converts it. Both MISS and HIT
+        # must rebuild the typed source charset and convert independently.
+        location /charset/ {{
+            cache_turbo       main;
+            cache_turbo_key   $uri;
+            cache_turbo_valid 30s;
+            charset           utf-8;
+            override_charset  on;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
@@ -2111,12 +2134,16 @@ http {{
 
         # $cache_turbo_status access-log variable: echoed into a header so the
         # test can read MISS -> HIT, and BYPASS when ?nocache=1 trips bypass.
+        # Carry the documented X-Cache-Turbo spelling too: AUD30's raw-wire
+        # regression asserts downstream add_header values are never captured
+        # into the stored response and replayed beside their live HIT value.
         location /ctstatus/ {{
             cache_turbo        main;
             cache_turbo_key    $uri;
             cache_turbo_valid  30s;
             cache_turbo_bypass $arg_nocache;
             add_header         X-CT-Status $cache_turbo_status always;
+            add_header         X-Cache-Turbo $cache_turbo_status always;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 

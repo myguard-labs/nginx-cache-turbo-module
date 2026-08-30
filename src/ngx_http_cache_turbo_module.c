@@ -2383,6 +2383,65 @@ ngx_http_cache_turbo_restore_response_prologue(ngx_http_request_t *r,
 }
 
 
+/* Restore nginx's typed Content-Type fields from the wire representation in a
+ * cache blob. This is the bounded equivalent of upstream.c's
+ * ngx_http_upstream_copy_content_type(): content_type_len names the media type
+ * and charset names an explicit charset parameter. Downstream charset filters
+ * need both fields to make the same conversion decision on MISS and HIT. */
+static void
+ngx_http_cache_turbo_restore_content_type(ngx_http_request_t *r,
+    u_char *value, size_t len)
+{
+    u_char  *last, *p, *type_last;
+
+    r->headers_out.content_type.len = len;
+    r->headers_out.content_type.data = value;
+    r->headers_out.content_type_len = len;
+    r->headers_out.content_type_lowcase = NULL;
+    r->headers_out.charset.len = 0;
+    r->headers_out.charset.data = NULL;
+
+    last = value + len;
+
+    for (p = value; p < last; p++) {
+        if (*p != ';') {
+            continue;
+        }
+
+        type_last = p;
+        p++;
+        while (p < last && *p == ' ') {
+            p++;
+        }
+
+        if ((size_t) (last - p) < sizeof("charset=") - 1
+            || ngx_strncasecmp(p, (u_char *) "charset=",
+                               sizeof("charset=") - 1) != 0)
+        {
+            if (p == last) {
+                return;
+            }
+            p--;
+            continue;
+        }
+
+        p += sizeof("charset=") - 1;
+        r->headers_out.content_type_len = type_last - value;
+
+        if (p < last && *p == '"') {
+            p++;
+        }
+        if (last > p && *(last - 1) == '"') {
+            last--;
+        }
+
+        r->headers_out.charset.len = last - p;
+        r->headers_out.charset.data = p;
+        return;
+    }
+}
+
+
 /* Phase 2 of ngx_http_cache_turbo_restore_response(): replay every stored
  * header off the ref array the prologue's single validated walk already
  * built. Content-Type is mapped onto the typed field; ETag / Last-Modified
@@ -2467,9 +2526,7 @@ ngx_http_cache_turbo_restore_response_headers(ngx_http_request_t *r,
         switch (refs[i].role) {
 
         case NGX_HTTP_CACHE_TURBO_HROLE_CONTENT_TYPE:
-            r->headers_out.content_type.len = vl;
-            r->headers_out.content_type.data = vv;
-            r->headers_out.content_type_len = vl;
+            ngx_http_cache_turbo_restore_content_type(r, vv, vl);
             continue;
 
         /* v11: remember the stored validators so we can answer a conditional
@@ -3377,6 +3434,7 @@ ngx_http_cache_turbo_set_cookie_relax_allowed(
 void
 ngx_http_cache_turbo_response_policy(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf,
+    ngx_list_t *headers,
     ngx_http_cache_turbo_response_policy_t *out)
 {
     ngx_list_part_t  *part;
@@ -3400,7 +3458,7 @@ ngx_http_cache_turbo_response_policy(ngx_http_request_t *r,
         out->cacheable_reason = NGX_HTTP_CACHE_TURBO_REFUSE_AUTHORIZATION;
     }
 
-    part = &r->headers_out.headers.part;
+    part = &headers->part;
     h = part->elts;
 
     for (i = 0; /* void */ ; i++) {

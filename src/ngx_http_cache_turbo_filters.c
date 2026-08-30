@@ -592,16 +592,155 @@ ngx_http_cache_turbo_response_declares_trailers(ngx_http_request_t *r)
 }
 
 
+/* Deep-copy the active upstream response headers while this module's top-most
+ * header filter still owns the unmodified list. The body filter runs only
+ * after ngx_http_next_header_filter() has synchronously appended downstream
+ * generated fields, so retaining the live list would cache configuration-local
+ * values such as `add_header X-Cache-Turbo $cache_turbo_status` as origin
+ * metadata. Copies rather than table-element aliases also keep a downstream
+ * typed-header update from changing the captured key/value descriptors. */
+static ngx_int_t
+ngx_http_cache_turbo_header_filter_snapshot(ngx_http_request_t *r,
+    ngx_http_cache_turbo_ctx_t *ctx)
+{
+    ngx_list_part_t  *part;
+    ngx_table_elt_t  *dst, *h;
+    u_char           *block, *empty, *p;
+    size_t            bytes, ct_extra;
+    ngx_uint_t        i, nheaders;
+
+    ct_extra = 0;
+    if (r->headers_out.content_type.len != 0
+        && r->headers_out.content_type_len
+           == r->headers_out.content_type.len
+        && r->headers_out.charset.len != 0)
+    {
+        if (r->headers_out.charset.len
+            > NGX_MAX_SIZE_T_VALUE - (sizeof("; charset=") - 1))
+        {
+            return NGX_ERROR;
+        }
+        ct_extra = sizeof("; charset=") - 1 + r->headers_out.charset.len;
+    }
+
+    if (r->headers_out.content_type.len > NGX_MAX_SIZE_T_VALUE - ct_extra) {
+        return NGX_ERROR;
+    }
+    bytes = r->headers_out.content_type.len + ct_extra;
+    nheaders = 0;
+
+    for (part = &r->headers_out.headers.part; part; part = part->next) {
+        h = part->elts;
+        for (i = 0; i < part->nelts; i++) {
+            if (h[i].hash == 0) {
+                continue;
+            }
+            if (h[i].key.len > NGX_MAX_SIZE_T_VALUE - bytes) {
+                return NGX_ERROR;
+            }
+            bytes += h[i].key.len;
+            if (h[i].value.len > NGX_MAX_SIZE_T_VALUE - bytes) {
+                return NGX_ERROR;
+            }
+            bytes += h[i].value.len;
+            nheaders++;
+        }
+    }
+
+    if (ngx_list_init(&ctx->capture_headers, r->pool,
+                      nheaders != 0 ? nheaders : 1,
+                      sizeof(ngx_table_elt_t)) != NGX_OK)
+    {
+        return NGX_ERROR;
+    }
+
+    /* Keep one real byte outside the copied payload as the data pointer for
+     * legal zero-length fields. C still requires both memcpy operands and
+     * pointer arithmetic bases to be valid when the requested length is 0. */
+    if (bytes == NGX_MAX_SIZE_T_VALUE) {
+        return NGX_ERROR;
+    }
+    block = ngx_pnalloc(r->pool, bytes + 1);
+    if (block == NULL) {
+        return NGX_ERROR;
+    }
+    p = block;
+    empty = block + bytes;
+    *empty = '\0';
+
+    part = &r->headers_out.headers.part;
+    h = part->elts;
+
+    for (i = 0; /* void */ ; i++) {
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            h = part->elts;
+            i = 0;
+        }
+
+        if (h[i].hash == 0) {
+            continue;
+        }
+
+        dst = ngx_list_push(&ctx->capture_headers);
+        if (dst == NULL) {
+            return NGX_ERROR;
+        }
+
+        ngx_memzero(dst, sizeof(*dst));
+        dst->hash = h[i].hash;
+        dst->key.len = h[i].key.len;
+        dst->value.len = h[i].value.len;
+
+        dst->key.data = dst->key.len != 0 ? p : empty;
+        if (dst->key.len != 0) {
+            ngx_memcpy(dst->key.data, h[i].key.data, dst->key.len);
+            p += dst->key.len;
+        }
+
+        dst->value.data = dst->value.len != 0 ? p : empty;
+        if (dst->value.len != 0) {
+            ngx_memcpy(dst->value.data, h[i].value.data, dst->value.len);
+            p += dst->value.len;
+        }
+    }
+
+    ctx->capture_content_type.len = r->headers_out.content_type.len + ct_extra;
+    ctx->capture_content_type.data = ctx->capture_content_type.len != 0
+                                     ? p : empty;
+    if (r->headers_out.content_type.len != 0) {
+        ngx_memcpy(ctx->capture_content_type.data,
+                   r->headers_out.content_type.data,
+                   r->headers_out.content_type.len);
+        p += r->headers_out.content_type.len;
+    }
+    if (ct_extra != 0) {
+        p = ngx_cpymem(p, "; charset=", sizeof("; charset=") - 1);
+        ngx_memcpy(p, r->headers_out.charset.data,
+                   r->headers_out.charset.len);
+    }
+
+    ctx->capture_status = r->headers_out.status;
+
+    return NGX_OK;
+}
+
+
 /* Body of the capture branch: flag an encoded-origin capture, resolve the
  * RFC 9111 SS3.5 reuse authorisation, build the key for a warm subrequest,
- * flag the capture, and emit the Surrogate-Key header. Returns NGX_ERROR
- * when a warm subrequest's build_key() fails -- the caller must `return;`
- * from ngx_http_cache_turbo_header_filter_capture() in that case, exactly
- * as the inline body used to, skipping the cold-winner cleanup below it. */
+ * snapshot the upstream response, flag the capture, and emit Surrogate-Key.
+ * Returns NGX_ERROR when a required allocation or a warm subrequest's
+ * build_key() fails -- the caller must `return;` from
+ * ngx_http_cache_turbo_header_filter_capture(), skipping the cold-winner
+ * cleanup below it exactly like the pre-snapshot build_key failure. */
 static ngx_int_t
 ngx_http_cache_turbo_header_filter_do_capture(ngx_http_request_t *r,
     ngx_http_cache_turbo_ctx_t *ctx, ngx_http_cache_turbo_loc_conf_t *clcf,
-    ngx_uint_t encoded_ok, ngx_uint_t encoded_class, ngx_uint_t auth_shareable)
+    ngx_uint_t encoded_ok, ngx_uint_t encoded_class,
+    ngx_http_cache_turbo_response_policy_t *policy)
 {
     if (encoded_ok) {
         ctx->origin_encoded_capture = 1;
@@ -613,7 +752,7 @@ ngx_http_cache_turbo_header_filter_do_capture(ngx_http_request_t *r,
      * blob; it cannot re-derive it after headers are sent. Recorded on
      * every capture regardless of clcf->serve_authorized, so enabling the
      * directive later does not require flushing entries stored before. */
-    ctx->auth_shareable = auth_shareable ? 1 : 0;
+    ctx->auth_shareable = policy->auth_shareable ? 1 : 0;
 
     /* A warm subrequest is deliberately excluded from lookup, so its key
      * was never built. Build it here from the subrequest URI before flagging
@@ -624,6 +763,15 @@ ngx_http_cache_turbo_header_filter_do_capture(ngx_http_request_t *r,
     {
         return NGX_ERROR;
     }
+    /* Snapshot before this module emits Surrogate-Key and before the caller
+     * hands r->headers_out to downstream output filters. nginx's add_header
+     * filter appends evaluated values synchronously in that hand-off; reading
+     * the live list later from the body filter would cache the MISS value and
+     * replay it beside the freshly evaluated HIT value on the next response. */
+    if (ngx_http_cache_turbo_header_filter_snapshot(r, ctx) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
     ctx->captured = 1;
 
     /* cache_turbo_surrogate_key: this response is a MISS being stored, so
@@ -796,7 +944,8 @@ ngx_http_cache_turbo_header_filter_capture(ngx_http_request_t *r,
                     && ngx_http_cache_turbo_capture_gate_storable_tail(r, ctx,
                                                                       clcf);
     if (gate_storable) {
-        ngx_http_cache_turbo_response_policy(r, clcf, &policy);
+        ngx_http_cache_turbo_response_policy(r, clcf,
+                                             &r->headers_out.headers, &policy);
         cacheable_reason = policy.cacheable_reason;
     }
 
@@ -825,7 +974,7 @@ ngx_http_cache_turbo_header_filter_capture(ngx_http_request_t *r,
     if (captured)
     {
         if (ngx_http_cache_turbo_header_filter_do_capture(r, ctx, clcf,
-                encoded_ok, encoded_class, policy.auth_shareable) != NGX_OK)
+                encoded_ok, encoded_class, &policy) != NGX_OK)
         {
             return;
         }
@@ -899,8 +1048,6 @@ ngx_http_cache_turbo_header_filter(ngx_http_request_t *r)
 
     clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
 
-    ngx_http_cache_turbo_header_filter_test_headers(r, 1);
-
     ngx_http_cache_turbo_header_filter_record_breaker(r, ctx, clcf);
 
     switch (ngx_http_cache_turbo_header_filter_try_sie(r, ctx, clcf)) {
@@ -913,6 +1060,11 @@ ngx_http_cache_turbo_header_filter(ngx_http_request_t *r)
     }
 
     ngx_http_cache_turbo_header_filter_capture(r, ctx, clcf);
+
+    /* TEST_FAULTS diagnostics are local generated headers, so stamp them only
+     * after the upstream snapshot above. They remain live on this response but
+     * cannot be frozen into the cache and duplicated on the next HIT. */
+    ngx_http_cache_turbo_header_filter_test_headers(r, 1);
 
     return ngx_http_next_header_filter(r);
 }
@@ -1414,24 +1566,26 @@ ngx_http_cache_turbo_body_filter_capture(ngx_http_request_t *r,
 
 /* Compute this response's freshness windows: the fresh TTL, the absolute
  * serveable window (fresh + stale) and the RFC-2 stale-if-error deadline.
- * Pure computation off clcf + r->headers_out; no shared state is touched, so
- * this takes no lock and holds none.
+ * Pure computation off clcf + the upstream status/policy captured by the
+ * header filter; no shared state is touched, so this takes no lock and holds
+ * none. Downstream headers cannot retroactively change the stored lifetime.
  *
  * Returns NGX_DECLINED when the status is not cacheable at all (the caller
  * must delegate downstream); NGX_OK with the three out-params set. */
 static ngx_int_t
 ngx_http_cache_turbo_body_filter_windows(ngx_http_request_t *r,
-    ngx_http_cache_turbo_loc_conf_t *clcf, time_t *out_ttl,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx,
+    time_t *out_ttl,
     time_t *out_stale_window, time_t *out_sie_window)
 {
     time_t  ttl, stale_window, sie_window = 0;
     ngx_http_cache_turbo_response_policy_t policy;
 
-    ttl = ngx_http_cache_turbo_status_ttl(clcf, r->headers_out.status);
+    ttl = ngx_http_cache_turbo_status_ttl(clcf, ctx->capture_status);
     if (ttl < 0) {
         ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "cache_turbo: not cacheable \"%V\" status=%ui",
-                       &r->uri, r->headers_out.status);
+                       &r->uri, ctx->capture_status);
         return NGX_DECLINED;                            /* not cacheable */
     }
 
@@ -1453,7 +1607,8 @@ ngx_http_cache_turbo_body_filter_windows(ngx_http_request_t *r,
     policy.sie = -1;
 
     if (!clcf->ignore_cc) {
-        ngx_http_cache_turbo_response_policy(r, clcf, &policy);
+        ngx_http_cache_turbo_response_policy(r, clcf,
+                                             &ctx->capture_headers, &policy);
     }
 
     if (clcf->honor_cc && !clcf->ignore_cc) {
@@ -1718,7 +1873,8 @@ ngx_http_cache_turbo_header_role(const u_char *nm, size_t nl)
  * the two passes agree -- one helper, called twice. */
 static void
 ngx_http_cache_turbo_body_filter_measure_headers(ngx_http_request_t *r,
-    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_str_t *ct, size_t *out_hdr_bytes,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_list_t *headers, ngx_str_t *ct,
+    size_t *out_hdr_bytes,
     uint32_t *out_nheaders, ngx_http_cache_turbo_hdr_verdicts_t *verdicts)
 {
     ngx_list_part_t  *part;
@@ -1732,7 +1888,7 @@ ngx_http_cache_turbo_body_filter_measure_headers(ngx_http_request_t *r,
      * full, and sizing off one part would under-allocate and let the walk
      * below write past the end. */
     total = 0;
-    for (part = &r->headers_out.headers.part; part; part = part->next) {
+    for (part = &headers->part; part; part = part->next) {
         total += part->nelts;
     }
 
@@ -1769,7 +1925,7 @@ ngx_http_cache_turbo_body_filter_measure_headers(ngx_http_request_t *r,
         nheaders++;
     }
 
-    part = &r->headers_out.headers.part;
+    part = &headers->part;
     h = part->elts;
     for (i = 0, idx = 0; /* void */ ; i++, idx++) {
         if (i >= part->nelts) {
@@ -1821,7 +1977,8 @@ ngx_http_cache_turbo_body_filter_measure_headers(ngx_http_request_t *r,
 static void
 ngx_http_cache_turbo_body_filter_blob_write(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx,
-    u_char *blob, ngx_str_t *ct, size_t hdr_bytes, uint32_t nheaders,
+    ngx_list_t *headers, u_char *blob, ngx_str_t *ct, size_t hdr_bytes,
+    uint32_t nheaders,
     time_t ttl, time_t stale_window, time_t sie_window,
     ngx_http_cache_turbo_hdr_verdicts_t *verdicts)
 {
@@ -1836,7 +1993,7 @@ ngx_http_cache_turbo_body_filter_blob_write(ngx_http_request_t *r,
     bhw.nheaders = nheaders;
     bhw.headers_len = (uint32_t) hdr_bytes;
     bhw.body_len = (uint32_t) ctx->body_len;
-    bhw.status = (uint32_t) r->headers_out.status;
+    bhw.status = (uint32_t) ctx->capture_status;
     /* Freshness metadata so an L2 hit restores the remaining lifetime
      * (not the location default). stale_ttl is the absolute serveable
      * window from creation (fresh + stale), matching shm_store. */
@@ -1933,7 +2090,7 @@ ngx_http_cache_turbo_body_filter_blob_write(ngx_http_request_t *r,
      * the verdict is read from the bitmap instead of re-running both byte
      * scans. _verdict_get() recomputes for any idx the measure pass did not
      * record, so a list that grew between the passes stays correct. */
-    part = &r->headers_out.headers.part;
+    part = &headers->part;
     h = part->elts;
     for (i = 0, idx = 0; /* void */ ; i++, idx++) {
         if (i >= part->nelts) {
@@ -2025,7 +2182,7 @@ ngx_http_cache_turbo_body_filter_store(ngx_http_request_t *r,
     u_char **stored_data)
 {
     ngx_int_t  store_rc;
-    ngx_uint_t is_5xx = (r->headers_out.status
+    ngx_uint_t is_5xx = (ctx->capture_status
                           >= NGX_HTTP_INTERNAL_SERVER_ERROR);
 
     if (stored_data != NULL) {
@@ -2071,7 +2228,7 @@ ngx_http_cache_turbo_body_filter_store(ngx_http_request_t *r,
         ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "cache_turbo: refusing to overwrite cached "
                        "body \"%V\" with error status=%ui",
-                       &r->uri, r->headers_out.status);
+                       &r->uri, ctx->capture_status);
         return NGX_DECLINED;
     }
 
@@ -2481,17 +2638,21 @@ ngx_http_cache_turbo_body_filter_store_tail(ngx_http_request_t *r,
     ngx_http_cache_turbo_zone_t  *z;
     ngx_http_cache_turbo_hdr_verdicts_t  verdicts;
 
-    if (ngx_http_cache_turbo_body_filter_windows(r, clcf, &ttl, &stale_window,
-                                                 &sie_window) == NGX_DECLINED)
+    if (ngx_http_cache_turbo_body_filter_windows(r, clcf, ctx, &ttl,
+                                                 &stale_window, &sie_window)
+        == NGX_DECLINED)
     {
         return NGX_DECLINED;
     }
 
-    /* Synthesise a Content-Type entry from the typed field (it is not in
-     * the headers list). Everything else comes from headers_out.headers. */
-    ct = r->headers_out.content_type;
+    /* Synthesise a Content-Type entry from the captured typed field (it is not
+     * in the header list). Everything else comes from the upstream snapshot;
+     * r->headers_out now also contains downstream generated response headers. */
+    ct = ctx->capture_content_type;
 
-    ngx_http_cache_turbo_body_filter_measure_headers(r, clcf, &ct, &hdr_bytes,
+    ngx_http_cache_turbo_body_filter_measure_headers(r, clcf,
+                                                     &ctx->capture_headers,
+                                                     &ct, &hdr_bytes,
                                                      &nheaders, &verdicts);
 
     /* STAB-5: headers_len and body_len are uint32 in the blob header. Refuse
@@ -2515,8 +2676,9 @@ ngx_http_cache_turbo_body_filter_store_tail(ngx_http_request_t *r,
         return NGX_OK;
     }
 
-    ngx_http_cache_turbo_body_filter_blob_write(r, clcf, ctx, blob, &ct,
-                                                hdr_bytes, nheaders, ttl,
+    ngx_http_cache_turbo_body_filter_blob_write(r, clcf, ctx,
+                                                &ctx->capture_headers, blob,
+                                                &ct, hdr_bytes, nheaders, ttl,
                                                 stale_window, sie_window,
                                                 &verdicts);
 

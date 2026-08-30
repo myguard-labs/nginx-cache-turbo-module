@@ -1227,9 +1227,19 @@ class Origin:
                 handled, body = self._get_handle_special_cases(n)
                 if handled:
                     return
+                if "charsetconvert" in self.path:
+                    # "Привет\n" encoded as windows-1251. The nginx charset
+                    # filter must convert these bytes to UTF-8 independently
+                    # on MISS and HIT; replaying the stored source bytes is a
+                    # visible failure even if the header looks plausible.
+                    body = b"\xcf\xf0\xe8\xe2\xe5\xf2\n"
                 self.send_response(200)
-                self.send_header("Content-Type",
-                                 "application/json; charset=utf-8")
+                if "charsetconvert" in self.path:
+                    self.send_header(
+                        "Content-Type", "text/plain; charset=windows-1251")
+                else:
+                    self.send_header("Content-Type",
+                                     "application/json; charset=utf-8")
                 self._get_send_common_status_headers(n)
                 self._get_send_cache_control_headers()
                 self._get_send_vary_headers()
