@@ -1701,6 +1701,80 @@ def test_warm_url_file_missing(ng: Nginx) -> None:
     assert "error" in json.loads(b), f"expected an error body, got {b!r}"
 
 
+def test_warm_url_file_fifo_does_not_block_worker(ng: Nginx) -> None:
+    """AUD30-ADMIN-OPEN-BLOCK: opening an operator-supplied FIFO must happen
+    away from nginx's event loop and must itself be nonblocking.  Keep a
+    delayed FIFO peer as a cleanup safety net: the pre-fix blocking open stalls
+    the worker until that peer arrives, while the fixed path rejects the
+    non-regular file immediately and keeps an ordinary admin request live."""
+    (ng.root / "warm-lists").mkdir(exist_ok=True)
+    fifo_path = ng.root / "warm-lists" / "warm-list.fifo"
+    os.mkfifo(fifo_path)
+
+    def _delayed_fifo_peer() -> None:
+        time.sleep(2.0)
+        fd = os.open(fifo_path, os.O_RDWR | os.O_NONBLOCK)
+        os.close(fd)
+
+    def _timed_fifo_fetch():
+        started = time.monotonic()
+        result = fetch(
+            ng.port, f"/_cache_wc?url_file={fifo_path}", None, "POST")
+        return result, time.monotonic() - started
+
+    peer = threading.Thread(target=_delayed_fifo_peer, daemon=True)
+    peer.start()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        fifo_request = pool.submit(_timed_fifo_fetch)
+        time.sleep(0.1)
+        started = time.monotonic()
+        s2, _, _ = fetch(ng.port, "/_cache_wc")
+        elapsed = time.monotonic() - started
+        assert s2 == 200, f"worker unresponsive during FIFO validation (status {s2})"
+        assert elapsed < 1.0, \
+            f"FIFO path open blocked nginx's event loop for {elapsed:.2f}s"
+        (s, b, h), fifo_elapsed = fifo_request.result(timeout=3.0)
+
+    assert s == 500, f"FIFO url_file returned {s}, expected 500: {b!r}"
+    assert fifo_elapsed < 1.0, \
+        f"FIFO validation blocked a thread-pool worker for {fifo_elapsed:.2f}s"
+    assert "application/json" in h.get("content-type", ""), h.get("content-type")
+    assert "error" in json.loads(b), f"expected an error body, got {b!r}"
+
+
+def test_warm_url_file_io_stages_run_off_event_loop(ng: Nginx) -> None:
+    """AUD30-ADMIN-OPEN-BLOCK: TEST_FAULTS delays the wrappers immediately
+    before open, fstat and read independently.  Each admin request must remain
+    pending for the injected delay while an unrelated request is served.  The
+    focused negative control runs this fixture with ``--single-process``: an
+    inline syscall then delays that second request by the full 1.5 seconds."""
+    (ng.root / "warm-lists").mkdir(exist_ok=True)
+
+    for stage in ("open", "fstat", "read"):
+        list_path = ng.root / "warm-lists" / f"warm-list.delay-{stage}"
+        list_path.write_bytes(b"")
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            delayed = pool.submit(
+                fetch, ng.port, f"/_cache_wc?url_file={list_path}", None, "POST")
+            time.sleep(0.2)
+            assert not delayed.done(), \
+                f"TEST_FAULTS {stage} delay was not reached"
+
+            started = time.monotonic()
+            s2, _, _ = fetch(ng.port, "/_cache_wc")
+            elapsed = time.monotonic() - started
+            assert s2 == 200, \
+                f"worker unresponsive during delayed {stage} (status {s2})"
+            assert elapsed < 1.0, \
+                f"delayed {stage} blocked nginx's event loop for {elapsed:.2f}s"
+            s, b, _ = delayed.result(timeout=3.0)
+
+        assert s == 200, f"delayed {stage} url_file returned {s}: {b!r}"
+        assert json.loads(b)["warmed"] == 0, \
+            f"empty delayed {stage} url_file warmed something: {b!r}"
+
+
 def test_warm_url_file_oversize_rejected(ng: Nginx) -> None:
     """P5-2-p0: a url_file bigger than the WARM_FILE_MAX_SIZE bound (64 KiB)
     is rejected cleanly (500 + JSON error) rather than read into an unbounded

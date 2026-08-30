@@ -204,6 +204,43 @@ test_warm_prerequisite_error(void)
 }
 
 static void
+test_warm_schedule_error(void)
+{
+    static const char body[] =
+        "{\"error\":\"warm url_file: thread-pool task could not be "
+        "scheduled\"}\n";
+    static const char log_format[] =
+        "cache_turbo: warm url_file thread-pool task could not be scheduled";
+    ngx_connection_t   connection;
+    ngx_http_request_t request;
+    ngx_int_t          rc;
+    int                log_token;
+
+    memset(&connection, 0, sizeof(connection));
+    memset(&request, 0, sizeof(request));
+    connection.log = &log_token;
+    request.connection = &connection;
+    reset_observations();
+
+    rc = ngx_http_cache_turbo_warm_file_schedule_error(&request);
+    CHECK(rc == NGX_DONE,
+          "warm schedule helper must propagate the JSON callback result");
+    CHECK(ngx_test_send_json_calls == 1
+              && ngx_test_send_json_status == NGX_HTTP_INTERNAL_SERVER_ERROR,
+          "warm schedule failure must send exactly one HTTP 500 response");
+    CHECK(ngx_test_send_json_body.len == sizeof(body) - 1
+              && memcmp(ngx_test_send_json_body.data, body,
+                        sizeof(body) - 1) == 0,
+          "warm schedule failure must not masquerade as a prerequisite error");
+    CHECK(ngx_test_log_calls == 1 && ngx_test_log_level == NGX_LOG_ERR
+              && ngx_test_log_errno == 0 && ngx_test_log == &log_token,
+          "warm schedule failure must emit one request-scoped error log");
+    CHECK(ngx_test_log_format != NULL
+              && strcmp(ngx_test_log_format, log_format) == 0,
+          "warm schedule error log must retain its exact operator message");
+}
+
+static void
 init_mc_get(ngx_http_cache_turbo_mc_op_t *op,
     ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx,
     ngx_http_request_t *r)
@@ -487,6 +524,7 @@ int
 main(void)
 {
     test_warm_prerequisite_error();
+    test_warm_schedule_error();
     test_memcached_compositions();
     test_memcached_drain_ownership();
     test_redis_get_and_lock_compositions();
