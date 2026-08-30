@@ -134,7 +134,7 @@ mutate_function_block_exact() {
 }
 
 if [ "${CTRL_ERROR_HELPERS_WARM_STATUS:-0}" = 1 ]; then
-	mutate_exact \
+	mutate_function_exact ngx_http_cache_turbo_warm_file_prereq_error \
 		'ngx_http_cache_turbo_send_json(r, NGX_HTTP_INTERNAL_SERVER_ERROR,' \
 		'ngx_http_cache_turbo_send_json(r, NGX_HTTP_OK,' 'warm status'
 fi
