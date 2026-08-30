@@ -1,4 +1,4 @@
-# sync-sha: 98ddb73ca344d14f58a5ae29e910ce3ac01fa3029f4b1144ef79fb081454181b
+# sync-sha: 2b1468fb23be14d6416768334c7b97456ec9ed9a69ba35987ea19c1443109068
 name: CI
 
 # Single entry point for the PR suite. The checks below used to be independent
@@ -246,7 +246,7 @@ jobs:
     uses: ./.github/workflows/security-scanners.yml
 
   # The testkit prober leg rides in lane C, beside Fuzzing rather than behind
-  # it. Lane C is the shortest lane (~671s against a 900s budget), and this job
+  # it. Lane C is the shortest lane (~370s against a 900s budget), and this job
   # is dominated by one ccache-warm nginx build plus a 0.4s scenario -- so it
   # lands in the lane with the most headroom instead of extending the two that
   # set the makespan. It asserts a lens nothing else in this gate has: per-

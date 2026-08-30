@@ -44,6 +44,16 @@ load_versions_env() {
             echo "FATAL: malformed line in $file: $line" >&2
             return 1
         fi
+        case "${line%%=*}" in
+            NGINX_MAINLINE|NGINX_MAINLINE_SHA256|NGINX_STABLE|\
+            NGINX_STABLE_SHA256|NGINX_VERSION|NGINX_VERSION_SHA256|\
+            LEGACY_NGINX_VERSION|LEGACY_NGINX_VERSION_SHA256|\
+            ANGIE_VERSION|ANGIE_SHA256) ;;
+            *)
+                echo "FATAL: unsupported pin name in $file: ${line%%=*}" >&2
+                return 1
+                ;;
+        esac
     done < "$file"
 
     # shellcheck source=/dev/null

@@ -47,6 +47,8 @@ command -v python3 >/dev/null || { echo "fanalyzer: python3 missing from PATH" >
 
 : >fanalyzer.log
 status=0
+SCRATCH="$(mktemp -d)"
+trap 'rm -rf "$SCRATCH"' EXIT
 
 for src in "$SOURCE_ROOT"/src/*.c; do
     [ -e "$src" ] || continue
@@ -87,7 +89,7 @@ for src in "$SOURCE_ROOT"/src/*.c; do
     # error, which is a broken replay and must not read as clean.
     out=""
     out="$( ( cd "$dir" && gcc -fanalyzer -c "${args[@]}" \
-               -o /tmp/fanalyzer.o ) 2>&1 )" || status=1
+               -o "$SCRATCH/fanalyzer.o" ) 2>&1 )" || status=1
     printf '%s\n' "$out" | tee -a fanalyzer.log
     case "$out" in
         *'[-Wanalyzer-'*) status=1 ;;

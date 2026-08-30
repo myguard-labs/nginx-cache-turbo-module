@@ -1,4 +1,4 @@
-# sync-sha: 5a823d676be46accd5f932e4cbfc2743dda170df8ccb9865a4fd71fd491beb92
+# sync-sha: 85e4ff5421b8172d1ddcc6dc759c960f06f2ac150f1fc67304cd82e24ddce9ac
 name: Build & Test
 
 # Runner labels live in the POOL repository variable. Every checked-in selector
@@ -220,7 +220,8 @@ jobs:
             echo "32-bit negative control unexpectedly compiled" >&2
             exit 1
           fi
-          UNIT_CFLAGS=-m32 UNIT_WIDTH_ONLY=1 bash ci/tests/unit/run.sh
+          EXPECT_TIME_T_BYTES=4 UNIT_CFLAGS=-m32 UNIT_WIDTH_ONLY=1 \
+            bash ci/tests/unit/run.sh
 
       - name: Lint workflows
         run: |

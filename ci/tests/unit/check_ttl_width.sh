@@ -10,6 +10,7 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$DIR/../../.." && pwd)"
 CC="${CC:-cc}"
 FLAGS="${UNIT_CFLAGS:-}"
+EXPECT_TIME_T_BYTES="${EXPECT_TIME_T_BYTES:-}"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
@@ -25,8 +26,34 @@ definition="$(grep -E '^#define[[:space:]]+NGX_HTTP_CACHE_TURBO_TTL_MAX[[:space:
     printf '_Static_assert(NGX_HTTP_CACHE_TURBO_TTL_MAX > 0, "TTL_MAX must be positive");\n'
     printf '_Static_assert(NGX_HTTP_CACHE_TURBO_TTL_MAX == (sizeof(time_t) < 8 ? 0x7FFFFFFFLL : 0xFFFFFFFFLL), "TTL_MAX width drift");\n'
 } > "$TMP/positive.c"
+case "$EXPECT_TIME_T_BYTES" in
+    '') ;;
+    4 | 8)
+        printf '_Static_assert(sizeof(time_t) == %s, "unexpected time_t width");\n' \
+            "$EXPECT_TIME_T_BYTES" >> "$TMP/positive.c"
+        ;;
+    *)
+        echo "TTL width: EXPECT_TIME_T_BYTES must be 4 or 8" >&2
+        exit 1
+        ;;
+esac
 # shellcheck disable=SC2086
 "$CC" $FLAGS -Wall -Wextra -Werror -fsyntax-only "$TMP/positive.c"
+
+if [ -n "$EXPECT_TIME_T_BYTES" ]; then
+    if [ "$EXPECT_TIME_T_BYTES" -eq 4 ]; then
+        wrong_time_t_bytes=8
+    else
+        wrong_time_t_bytes=4
+    fi
+    printf '#include <time.h>\n_Static_assert(sizeof(time_t) == %s, "width mutant");\n' \
+        "$wrong_time_t_bytes" > "$TMP/width_mutant.c"
+    # shellcheck disable=SC2086
+    if "$CC" $FLAGS -fsyntax-only "$TMP/width_mutant.c" >/dev/null 2>&1; then
+        echo "TTL width: opposite time_t-width mutant survived" >&2
+        exit 1
+    fi
+fi
 
 printf '#include <time.h>\nint main(void) { return sizeof(time_t) < 8 ? 0 : 1; }\n' \
     > "$TMP/time_width.c"

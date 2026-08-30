@@ -83,7 +83,8 @@ Changes with the nginx-cache-turbo-module (unreleased)
     *) Feature: the admin JSON endpoint now reports "lock_ttl", the effective
        single-flight lock TTL in seconds for the admin location -- after
        preset-band resolution, inheritance, and the parse-time clamp to the
-       time_t ceiling (4294967295). It is the object's only effective-config
+       time_t ceiling (2147483647 with 32-bit time_t; 4294967295 with 64-bit
+       time_t). It is the object's only effective-config
        field; every other key remains a zone counter or gauge. This makes an
        oversized cache_turbo_lock_ttl observable: the directive clamps rather
        than rejects, and until now nothing could distinguish a clamped value
