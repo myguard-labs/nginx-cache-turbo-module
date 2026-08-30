@@ -20,6 +20,8 @@ bash "$DIR/check_constants.sh"
 bash "$DIR/check_directive_synopsis.sh" "$(cd "$DIR/../../.." && pwd)"
 bash "$DIR/check_default_comments.sh" "$(cd "$DIR/../../.." && pwd)"
 bash "$DIR/check_testkit_contract.sh" "$(cd "$DIR/../../.." && pwd)"
+bash "$DIR/check_stage_inventory_control.sh" "$(cd "$DIR/../../.." && pwd)"
+bash "$DIR/check_producer_status_controls.sh" "$(cd "$DIR/../../.." && pwd)"
 
 SHM_COVERAGE_FLAGS=""
 if [ "${COVERAGE:-0}" = 1 ]; then
@@ -327,6 +329,11 @@ if [ -f "$NGINX_OBJS/ngx_auto_config.h" ]; then
     NGINX_VERSION="$NGINX_VERSION" NGINX_SRC="$NGINX_SRC" \
         NGINX_OBJS="$NGINX_OBJS" \
         bash "$DIR/check_purge_zero_skew_control.sh"
+
+    echo "--- hash diagnostic constructor mutation controls ---"
+    NGINX_VERSION="$NGINX_VERSION" NGINX_SRC="$NGINX_SRC" \
+        NGINX_OBJS="$NGINX_OBJS" \
+        bash "$DIR/check_hash_diagnostic_controls.sh"
 
     # --- c-1: varidx drop/reissue accounting is production-reachable -------
     # The PURGE reply's "complete":false honesty field depends on

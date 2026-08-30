@@ -8,7 +8,7 @@ finding shellcheck could have named in two seconds. Every script is standalone;
 
 | Script | Covers | Gate |
 |---|---|---|
-| `lint-c.sh` | `src/*.[ch]` | flawfinder ≥4, cppcheck (warning/performance/portability), semgrep ≥WARNING (`p/c`, `p/security-audit`) |
+| `lint-c.sh` | `src/*.[ch]` | flawfinder ≥4, cppcheck (warning/performance/portability), semgrep ≥WARNING (immutable C-rule URLs) |
 | `lint-nginx.sh` | `src/*.[ch]` | nginx conventions: libc alloc/str/num/io instead of `ngx_*`, hard tabs, trailing whitespace, `ngx_config.h` include order (followed through a leading local header). Line width is **advisory over 80** with a hard ceiling at 167 — 928 lines here exceed 80, 711 of them comments, and 15 of the 16 over 100 are Prometheus `# HELP` strings that cannot be split without changing the emitted text |
 | `lint-astgrep.sh` | `src/*.[ch]` | ast-grep over `ci/ast-grep/` (own C/nginx rules + CodeRabbit's C/C++ `essentials` pack). Five promoted rules block; the rest print advisory. `c-alloc-mul-overflow` is deliberately NOT promoted here — all nine hits are config- or constant-bounded `count * sizeof(T)` (see the header of `lint-astgrep.sh`) — ast-grep has no severity threshold and exits non-zero only on `error` |
 | `lint-sh.sh` | `*.sh`, `*.bash`, `.githooks/*` | shellcheck `-S warning` |
@@ -26,6 +26,7 @@ finding shellcheck could have named in two seconds. Every script is standalone;
 | `lint-carve-init.sh` | `src/*.[ch]` | **this module's own** (no skeleton counterpart): the shctx carve-init invariant, CARVE-INIT — every `ngx_http_cache_turbo_shctx_t` member is explicitly initialised in `shm_init_zone()`'s carve block. `ngx_slab_alloc()` does not zero, but the fresh-carve path lands on kernel-zeroed pages, so an omitted member reads 0 anyway and is invisible to every runtime test |
 | `lint-suite-docs.sh` | `ci/t/`, `ci/tools/`, `docs/`, `src/`, `README.md` | **this module's own**: orphan `.t` files no suite runs, the documented preset count against the presets that exist, and TLS-fixture teardown |
 | `lint-spelling.sh` | all tracked files | codespell over prose, comments and log strings; vendored trees excluded via `lib.sh` |
+| `lint-semgrep-pin.sh` | local and CI scanner definitions | exact Semgrep engine, rule commit, every rule URL, and every consumer match |
 | `run-all.sh` | all of the above | runs every check, reports once |
 
 **No markdown checker, on purpose** (adoption step 51). 84 tracked `.md` files
@@ -54,6 +55,17 @@ Both carry the reason for every relaxation; read them before adding another.
 Thresholds deliberately match `.github/workflows/security-scanners.yml`. Move
 one there and move it here **in the same commit**, or local-green stops
 predicting remote-green — the only reason this directory exists.
+
+## Semgrep rule provenance
+
+`run-semgrep.sh` uses the nine C rules that the previously approved
+`p/c` + `p/security-audit` scan actually applied to `src/*.[ch]`, fetched from
+immutable raw GitHub URLs at Semgrep Rules commit
+`40b8c63f75dc7c22c8a77482d73bfb864b146f7e`. This preserves the pre-existing
+network fetch while removing registry-alias drift. The upstream content is
+covered by [Semgrep Rules License v1.0](https://semgrep.dev/legal/rules-license);
+it is not vendored here. `lint-semgrep-pin.sh` makes each URL, the commit, the
+engine version, and all four consumers fail closed on drift.
 
 The `ci-*`, `docs-drift` and `sync-stamp` rows are **repo-policy** checks, not
 general linters, and that is why they are here rather than left to actionlint or

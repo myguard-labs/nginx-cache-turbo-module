@@ -4,7 +4,7 @@
 # Mirrors .github/workflows/security-scanners.yml exactly:
 #   flawfinder  gate at >=4   (below 4 is risky-API grep noise; gating on it
 #                              trains everyone to --no-verify)
-#   semgrep     gate at >=WARNING with p/c + p/security-audit
+#   semgrep     gate at >=WARNING with immutable pinned C rule URLs
 # plus cppcheck, which CI does not run and which is cheap enough locally.
 #
 # If a threshold moves in that workflow, move it here in the SAME commit --
@@ -116,9 +116,7 @@ else
     #
     # --metrics=off: no scan-summary POST to semgrep.dev. Measured 2.76s -> 1.27s
     # on this tree, i.e. more than half the wall clock was that upload.
-    semgrep scan --config p/c --config p/security-audit \
-        --severity=WARNING --severity=ERROR --error \
-        --jobs=1 --metrics=off "${FILES[@]}" || rc=1
+    ci/linter/run-semgrep.sh "${FILES[@]}" || rc=1
 fi
 
 exit "$rc"

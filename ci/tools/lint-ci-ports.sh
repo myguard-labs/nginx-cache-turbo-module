@@ -36,7 +36,27 @@ cd "$(dirname "$0")/../.."
 if [ "$#" -gt 0 ]; then
     files=("$@")
 else
-    mapfile -t files < <(find .github/workflows -maxdepth 1 -name '*.yml' -o -maxdepth 1 -name '*.yaml' | sort)
+    # Do not feed discovery through process substitution: mapfile reports its
+    # own status, so a find that wrote a plausible prefix and then failed used
+    # to turn that prefix into a clean, partial inventory. Keep the transport
+    # NUL-delimited so a valid workflow pathname cannot split into two rows.
+    inventory_dir="$(mktemp -d)" || {
+        echo "lint-ci-ports: cannot create workflow inventory directory" >&2
+        exit 2
+    }
+    trap 'rm -rf "$inventory_dir"' EXIT
+    inventory_raw="$inventory_dir/workflows.raw"
+    inventory_sorted="$inventory_dir/workflows.sorted"
+    if ! find .github/workflows -maxdepth 1 -type f \
+        \( -name '*.yml' -o -name '*.yaml' \) -print0 >"$inventory_raw"; then
+        echo "lint-ci-ports: workflow inventory failed -- refusing partial scan" >&2
+        exit 2
+    fi
+    if ! LC_ALL=C sort -z "$inventory_raw" >"$inventory_sorted"; then
+        echo "lint-ci-ports: workflow inventory sort failed -- refusing partial scan" >&2
+        exit 2
+    fi
+    mapfile -t -d '' files <"$inventory_sorted"
 fi
 
 if [ "${#files[@]}" -eq 0 ]; then
@@ -340,11 +360,11 @@ for _p in "${job_declares_band[@]}"; do
 done
 [[ -n "$BAND_MAX" ]] && BAND_MAX=$((BAND_MAX + BAND_WIDTH - 1))
 
-all_keys=()
+declare -A all_key_seen
 for key in "${!job_declares_band[@]}" "${!job_has_sweep[@]}" "${!job_passes_port[@]}" "${!job_binds_literal[@]}"; do
-    all_keys+=("$key")
+    [ -n "$key" ] && all_key_seen["$key"]=1
 done
-mapfile -t all_keys < <(printf '%s\n' "${all_keys[@]}" | sort -u)
+all_keys=("${!all_key_seen[@]}")
 
 for key in "${all_keys[@]}"; do
     label="${job_starts_suite[$key]:-<no matching invocation line found -- see job_declares_band/job_has_sweep/job_passes_port>}"

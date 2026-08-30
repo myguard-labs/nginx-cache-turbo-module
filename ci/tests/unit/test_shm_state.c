@@ -360,6 +360,10 @@ static u_char *ngx_http_cache_turbo_blob_alloc(
     ngx_http_cache_turbo_zone_t *z, size_t len);
 static void ngx_http_cache_turbo_blob_node_release(
     ngx_http_cache_turbo_zone_t *z, u_char *data);
+static ngx_int_t ngx_http_cache_turbo_shm_store_locked(
+    ngx_http_cache_turbo_zone_t *z, u_char *key_hash, uint32_t hash,
+    u_char *data, size_t len, time_t fresh_ttl, time_t stale_ttl,
+    ngx_http_cache_turbo_node_t *ctn, ngx_http_cache_turbo_node_t **out_ctn);
 
 /* evict_one/alloc_evict are `static` in the sliced production source. Forward-
  * declare them so the S8 hang test can drive the eviction path directly --
@@ -1823,6 +1827,7 @@ test_hash_crc32_invariant_check(void)
 {
     ngx_http_cache_turbo_node_t  *ctn;
     uint32_t                      real_hash, bogus_hash;
+    uint64_t                      owner;
 
     printf("PERF-AUD2-10: hash_crc32 mismatch is observable, and bounded\n");
     zone_reset();
@@ -1872,6 +1877,37 @@ test_hash_crc32_invariant_check(void)
     CHECK(g_sh.test_hash_crc32_mismatch == 1,
           "a correctly-hashed stamp must not increment "
           "test_hash_crc32_mismatch");
+
+    /* Each constructor has its own real-path control. Keep these independent
+     * so deleting any one TEST_FAULTS diagnostic makes its assertion red. */
+    zone_reset();
+    owner = 0;
+    CHECK(ngx_http_cache_turbo_shm_claim(&g_zone, mkkey(3), bogus_hash,
+              5, &owner) == NGX_HTTP_CACHE_TURBO_CLAIM_WINNER,
+          "claim() must win on a fresh diagnostic fixture");
+    CHECK(g_sh.test_hash_crc32_mismatch == 1,
+          "claim() constructor did not report hash mismatch");
+
+    /* The store constructor used to have only an identifier-presence grep.
+     * Drive its real new-entry path: allocation, body copy and rbtree insertion
+     * must all complete before this diagnostic can be observed. */
+    zone_reset();
+    {
+        u_char body[] = "hash-diagnostic-store";
+        CHECK(ngx_http_cache_turbo_shm_store_locked(&g_zone, mkkey(4),
+                  bogus_hash, body, sizeof(body), 60, 0, NULL, NULL) == NGX_OK,
+              "store_locked() must construct a fresh diagnostic fixture");
+    }
+    CHECK(g_sh.test_hash_crc32_mismatch == 1,
+          "store_locked() constructor did not report hash mismatch");
+    ctn = find(4);
+    REQUIRE(ctn != NULL && ctn->len > 0,
+            "store_locked() diagnostic control did not construct an ENTRY");
+
+    zone_reset();
+    ngx_http_cache_turbo_shm_l2_neg_set(&g_zone, mkkey(4), bogus_hash, 60);
+    CHECK(g_sh.test_hash_crc32_mismatch == 1,
+          "l2_neg_set() constructor did not report hash mismatch");
 }
 
 /* S231-PERF-MISSLOCKS: resolve_miss() merges count_miss()+claim() into one

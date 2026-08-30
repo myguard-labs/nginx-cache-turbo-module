@@ -256,6 +256,9 @@ policy_ 0 schedule-only-runner-labels-ok runners
 case_ 0 "the commit hook invokes the pre-commit-config hooks" \
     grep -q '^ *pre-commit run' .githooks/pre-commit
 
+case_ 0 "Semgrep engine/rule/consumer mutations are all red" \
+    bash ci/linter/check_semgrep_pin_controls.sh
+
 # run-all.sh dispatches by glob, so a checker that is not executable, or is
 # named outside the lint-*.sh pattern, is silently not run.
 # Every glob-discovered checker is named in lint.yml's LINT_ONLY.
