@@ -327,6 +327,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_stale_if_error(ng, origin)
     test_stale_serves_stale_origin_hard_dead(ng, origin)
     test_sie_serve_on_error(ng, origin)                     # RFC-2 CTB4 serve-on-error
+    test_sie_identity_snapshot_clears_error_content_encoding(ng, origin)  # AUD30
     test_cold_wait_loser_serves_stale_on_lock_timeout(ng, origin)  # P1-8 timed-out loser serves SIE snapshot
     test_cold_wait_loser_no_snapshot_goes_to_origin(ng, origin)    # P1-8 control: no snapshot -> origin unchanged
     test_sie_serve_on_error_unbuffered(ng, origin)          # AUD-SIE-BODY proxy_buffering off
@@ -369,6 +370,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_auto_vary_encoding_collapses_when_body_unencoded(ng, origin)      # P1-1
     test_auto_vary_encoding_precompressed_still_never_cached(ng, origin)  # P1-1
     test_key_encoded_origin_caches_and_keys_by_ae_class(ng, origin)        # P3-2
+    test_key_encoded_origin_sie_restores_content_encoding(ng, origin)      # AUD30
     test_key_encoded_origin_serve_guard_refuses_wrong_ae_class(ng, origin)  # P3-2
     test_key_encoded_origin_requires_auto_vary(ng)                         # P3-2
     test_auto_vary_marker_probe_selects_correct_variant(ng, origin)

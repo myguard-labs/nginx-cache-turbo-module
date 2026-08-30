@@ -576,7 +576,9 @@ accidentally serve Alice's logged-in page to Bob:
   compressed it) → not cached **by default**. Set
   `cache_turbo_key_encoded_origin on` to opt in: supported encoding classes are
   keyed separately and the serve-side guard checks that the client accepts the
-  stored coding. Without that opt-in, the module caches the **identity** body
+  stored coding; HIT and stale-if-error responses restore the exact `gzip`,
+  `br`, or `zstd` `Content-Encoding` from the validated cache stamp. Without
+  that opt-in, the module caches the **identity** body
   and lets the local gzip/zstd/brotli filter re-encode per client; replaying an
   origin-pre-compressed body encoding-blind would break clients that negotiated
   a different coding. (Locally-compressed responses are fine — our body filter

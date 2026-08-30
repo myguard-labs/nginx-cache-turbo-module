@@ -307,6 +307,11 @@ class Origin:
                             pass
                         return True
                     self.send_response(origin.fail_status)
+                    if "error-encoded" in self.path:
+                        # AUD30 SIE regression: the upstream error carries a
+                        # typed coding that an identity snapshot must not
+                        # inherit when it replaces this response.
+                        self.send_header("Content-Encoding", "gzip")
                     self.send_header("Content-Length", "0")
                     self.end_headers()
                     return True
@@ -558,11 +563,12 @@ class Origin:
                 # P0-1: a response that arrives ALREADY Content-Encoding'd (the
                 # origin pre-compressed it, or -- defense-in-depth -- cache_turbo
                 # somehow ended up below a compressor). The module's body filter
-                # only ever captures the IDENTITY body, so a coding-specific one
-                # must never be stored (see response_encoded()'s own comment in
-                # ngx_http_cache_turbo_vary.c). The gzip magic bytes are enough to
-                # exercise the gate; the module never inflates or validates the
-                # body, it only reads the header.
+                # normally captures the IDENTITY body, so a coding-specific one
+                # is stored only by the explicit encoded-origin opt-in (see
+                # response_encoded() in ngx_http_cache_turbo_vary.c). The
+                # coding-specific marker bytes are enough to exercise the gate;
+                # the module never inflates or validates the body, it only reads
+                # the header.
                 # P1-1: the negative control for the Accept-Encoding vary-axis
                 # collapse. Same pre-encoded body as "precompressed" above, but
                 # ALSO advertises `Vary: Accept-Encoding` so a test can prove the
@@ -583,10 +589,21 @@ class Origin:
                         pass
                     return True, None
                 if "precompressed" in self.path:
-                    body = b"\x1f\x8b" + f"pre-{n}\n".encode()
+                    if "precompressed-zstd" in self.path:
+                        coding = "zstd"
+                        marker = b"\x28\xb5\x2f\xfd"
+                    elif "precompressed-br" in self.path:
+                        coding = "br"
+                        marker = b"br:"
+                    else:
+                        coding = "gzip"
+                        marker = b"\x1f\x8b"
+                    body = marker + f"pre-{coding}-{n}\n".encode()
                     self.send_response(200)
                     self.send_header("Content-Type", "text/plain")
-                    self.send_header("Content-Encoding", "gzip")
+                    self.send_header("Content-Encoding", coding)
+                    if "sieserve" in self.path:
+                        self.send_header("Cache-Control", "stale-if-error=30")
                     self.send_header("Content-Length", str(len(body)))
                     self.end_headers()
                     try:

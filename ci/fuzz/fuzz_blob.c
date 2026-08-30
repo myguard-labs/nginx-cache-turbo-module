@@ -240,6 +240,26 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
                 "Set-Cookie)");
     }
 
+    /* AUD30-ENCODED-ORIGIN-CONTENT-ENCODING-LOSS: restore reconstructs
+     * Content-Encoding from this stamp. The producer invariant is exact: a
+     * non-identity class is present iff ORIGIN_ENCODED is set. Keeping this
+     * independent assertion after validation makes each malformed fixture
+     * below mutation-sensitive: removing the production rejection reaches
+     * this oracle and aborts instead of turning the fixture vacuously green. */
+    {
+        ngx_uint_t  ae_class;
+
+        ae_class = (hdr.flags & NGX_HTTP_CACHE_TURBO_BLOBF_AE_CLASS_MASK)
+                   >> NGX_HTTP_CACHE_TURBO_BLOBF_AE_CLASS_SHIFT;
+        if (((hdr.flags & NGX_HTTP_CACHE_TURBO_BLOBF_ORIGIN_ENCODED) != 0)
+            != (ae_class != NGX_HTTP_CACHE_TURBO_AE_CLASS_IDENTITY))
+        {
+            ct_fail("blob_validate accepted an inconsistent encoded-origin / "
+                    "ae-class stamp — restore would emit a Content-Encoding "
+                    "that does not describe the stored body");
+        }
+    }
+
     /* --- header-field contract the L1 fill and the serve path both inherit. */
     if (hdr.status < 100 || hdr.status > 599) {
         ct_fail("blob_validate accepted a blob whose status is outside "
@@ -569,6 +589,36 @@ main(int argc, char **argv)
      *    Without this a fix that rejected EVERYTHING would look green. */
     ct_build_real();
     ct_run("real stored blob (200, 5 headers, body) survives");
+
+    /* 0a-0b. The encoded-origin bit and coding class are one stamp. Either
+     * impossible half-state must be rejected before an L2 fill or restore. */
+    ct_build_real();
+    ct_stamp_flags(NGX_HTTP_CACHE_TURBO_BLOBF_ORIGIN_ENCODED);
+    ct_run("origin-encoded with identity class is rejected");
+
+    ct_build_real();
+    ct_stamp_flags((uint16_t) (NGX_HTTP_CACHE_TURBO_AE_CLASS_GZIP
+                               << NGX_HTTP_CACHE_TURBO_BLOBF_AE_CLASS_SHIFT));
+    ct_run("non-identity class without origin-encoded is rejected");
+
+    /* 0c-0e. Positive controls: all three supported exact stamps survive. */
+    ct_build_real();
+    ct_stamp_flags(NGX_HTTP_CACHE_TURBO_BLOBF_ORIGIN_ENCODED
+                   | (NGX_HTTP_CACHE_TURBO_AE_CLASS_GZIP
+                      << NGX_HTTP_CACHE_TURBO_BLOBF_AE_CLASS_SHIFT));
+    ct_run("valid gzip origin-encoded stamp survives");
+
+    ct_build_real();
+    ct_stamp_flags(NGX_HTTP_CACHE_TURBO_BLOBF_ORIGIN_ENCODED
+                   | (NGX_HTTP_CACHE_TURBO_AE_CLASS_BR
+                      << NGX_HTTP_CACHE_TURBO_BLOBF_AE_CLASS_SHIFT));
+    ct_run("valid br origin-encoded stamp survives");
+
+    ct_build_real();
+    ct_stamp_flags(NGX_HTTP_CACHE_TURBO_BLOBF_ORIGIN_ENCODED
+                   | (NGX_HTTP_CACHE_TURBO_AE_CLASS_ZSTD
+                      << NGX_HTTP_CACHE_TURBO_BLOBF_AE_CLASS_SHIFT));
+    ct_run("valid zstd origin-encoded stamp survives");
 
     /* 1. CR/LF in a value -> response splitting. */
     ct_build(200, 60, 600, 0, kv_crlf, 2, "body");
