@@ -366,7 +366,7 @@ awk -v source_name="$SRC_CANON" '
 # Keep the later module.c predicate slice out of the shm.c line map. The
 # extracted shm functions above retain production-source coverage, while the
 # unrelated slice below remains attributed to this generated include.
-printf '#line 1 "%s"\n' "$OUT_CANON" >> "$OUT"
+printf '#line %d "%s"\n' "$(( $(wc -l < "$OUT") + 2 ))" "$OUT_CANON" >> "$OUT"
 
 # Falsifiable PURGE-ALL-STARVATION control.  A practically unbounded work
 # budget reproduces the old "drain until empty" behavior for this finite

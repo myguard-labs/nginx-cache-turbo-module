@@ -38,7 +38,7 @@ COVERAGE_FLAGS ?=
 # link. TSAN is the second sanitizer axis it unlocked: ASan proves the blob is
 # freed exactly once, TSan proves the refcount that decides so is race-free.
 # They cannot be combined in one binary, hence a separate target.
-PTHREAD  = -pthread $(COVERAGE_FLAGS)
+PTHREAD  = -pthread
 TSAN     = -fsanitize=thread -fno-omit-frame-pointer -g
 
 # The test TU uses ONLY the mirrored declarations in ngx_shim_shm.h (-I.), while
@@ -84,11 +84,11 @@ check-shm-rbtree: extract layout-check
 	    -o $(HERE)/ngx_rbtree.san.o
 
 check-shm-obj: extract
-	@$(CC) $(CFLAGS) $(SAN) $(PTHREAD) $(INCS_TEST) -c $(HERE)/test_shm_state.c \
+	@$(CC) $(CFLAGS) $(SAN) $(PTHREAD) $(COVERAGE_FLAGS) $(INCS_TEST) -c $(HERE)/test_shm_state.c \
 	    -o $(HERE)/test_shm_state.san.o
 
 check-shm-link: check-shm-rbtree check-shm-obj
-	@$(CC) $(SAN) $(PTHREAD) $(HERE)/test_shm_state.san.o $(HERE)/ngx_rbtree.san.o -o $(HERE)/test_shm_state.san
+	@$(CC) $(SAN) $(PTHREAD) $(COVERAGE_FLAGS) $(HERE)/test_shm_state.san.o $(HERE)/ngx_rbtree.san.o -o $(HERE)/test_shm_state.san
 
 check-frame-scan: extract-frame-scan
 	@$(CC) $(CFLAGS) -Wno-unused-function $(SAN) -I$(FUZZ_DIR) \

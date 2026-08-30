@@ -26,7 +26,8 @@ typedef unsigned char  u_char;
 #define LF                              '\n'
 
 #define ngx_memcpy  memcpy
-#define ngx_strncmp memcmp
+#define ngx_strncmp(s1, s2, n) \
+    strncmp((const char *) (s1), (const char *) (s2), (n))
 
 typedef struct {
     size_t   len;

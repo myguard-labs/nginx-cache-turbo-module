@@ -8,7 +8,8 @@ testkit_package_build_running() {
     [ -d "$proc_root" ] || return 2
 
     for cmdline in "$proc_root"/[0-9]*/cmdline; do
-        [ -r "$cmdline" ] || continue
+        [ -e "$cmdline" ] || continue
+        [ -r "$cmdline" ] || return 2
         argv0=""
         argv1=""
         {
