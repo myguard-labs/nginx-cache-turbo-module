@@ -132,6 +132,25 @@ for line in emitted:
     if parts[0] == "band": actual_bands[parts[1]] = tuple(map(int, parts[2:]))
     elif parts[0] == "default": actual_default = tuple(map(int, parts[1:]))
 
+def emit(candidate, control):
+    """Compile a mutation with the same isolated default-emission semantics."""
+    with tempfile.TemporaryDirectory(prefix="cache-turbo-defaults-") as tmp:
+        source = pathlib.Path(tmp) / "defaults.c"; binary = pathlib.Path(tmp) / "defaults"
+        source.write_text(candidate)
+        built = subprocess.run([*shlex.split(cc), "-std=c99", "-Wall", "-Wextra", "-Werror",
+                                str(source), "-o", str(binary)],
+                               text=True, capture_output=True, check=False)
+        if built.returncode:
+            sys.stderr.write(built.stdout + built.stderr)
+            raise SystemExit(f"directive synopsis mutation is not compile-safe: {control}")
+        lines = subprocess.check_output([str(binary)], text=True).splitlines()
+    bands, default = {}, None
+    for line in lines:
+        parts = line.split()
+        if parts[0] == "band": bands[parts[1]] = tuple(map(int, parts[2:]))
+        elif parts[0] == "default": default = tuple(map(int, parts[1:]))
+    return bands, default
+
 preset_section = readme.split("## Presets (pick a vibe, skip the knobs)", 1)[1]
 table_lines = [line for line in preset_section.splitlines() if line.startswith("|")][:7]
 matrix = [split_pipes(line) for line in table_lines]
@@ -166,6 +185,57 @@ for name, expected in expected_cells.items():
 if tuple(effective) != documented[default_name]:
     raise SystemExit(f"effective preset fallback drift: compiled={tuple(effective)} "
                      f"README={documented[default_name]}")
+
+def reject(candidate, control):
+    bands, default = emit(candidate, control)
+    if bands != documented:
+        print(f"directive synopsis mutation red: {control}: preset matrix drift")
+        return
+    if default is None:
+        raise SystemExit(f"directive synopsis mutation survived: {control}")
+    index, *values = default
+    name = next((candidate for candidate, value in indexes.items() if value == index), None)
+    if name != "balanced":
+        print(f"directive synopsis mutation red: {control}: cache_turbo_preset default drift")
+        return
+    if tuple(values) != documented[name]:
+        print(f"directive synopsis mutation red: {control}: effective preset fallback drift")
+        return
+    raise SystemExit(f"directive synopsis mutation survived: {control}")
+
+def replace_once(text, old, new, control):
+    if text.count(old) != 1:
+        raise SystemExit(f"directive synopsis mutation fixture missing: {control}")
+    return text.replace(old, new, 1)
+
+# These controls keep README untouched and recompile the extracted production
+# path. They prove the gate observes physical data/order and effective wiring,
+# not comments or a source-label convention.
+physical_rows = list(re.finditer(r"(\{)([^{}]*)(\})", band_array))
+if len(physical_rows) != 5:
+    raise SystemExit("directive synopsis mutation fixture missing: preset rows")
+balanced, aggressive = physical_rows[2], physical_rows[3]
+swapped_array = (band_array[:balanced.start(2)] + aggressive.group(2)
+                 + band_array[balanced.end(2):aggressive.start(2)]
+                 + balanced.group(2) + band_array[aggressive.end(2):])
+reject(replace_once(program, band_array, swapped_array, "physical preset row order"),
+       "physical preset row order")
+
+aggressive_default = replace_once(
+    preset_defines,
+    "NGX_HTTP_CACHE_TURBO_PRESET_DEFAULT  NGX_HTTP_CACHE_TURBO_PRESET_BALANCED",
+    "NGX_HTTP_CACHE_TURBO_PRESET_DEFAULT  NGX_HTTP_CACHE_TURBO_PRESET_AGGRESSIVE",
+    "default preset selector")
+reject(replace_once(program, preset_defines, aggressive_default, "default preset selector"),
+       "default preset selector")
+
+fallback_fields = ("valid", "beta", "lock_ttl", "stale_mult", "min_uses")
+for field, replacement, fallback in zip(
+        fallback_fields, fallback_fields[1:] + fallback_fields[:1], fallbacks):
+    rewired = replace_once(fallback, f"band->{field}", f"band->{replacement}",
+                           f"{field} band fallback")
+    reject(replace_once(program, fallback, rewired, f"{field} band fallback"),
+           f"{field} band fallback")
 print(f"OK: {len(registered)} registered production directives have synopsis rows; "
       "compiled preset defaults match the exact README cells")
 PY
