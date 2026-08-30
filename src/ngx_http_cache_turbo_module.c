@@ -3910,11 +3910,11 @@ ngx_http_cache_turbo_sie_snap_body_len(ngx_http_cache_turbo_ctx_t *ctx,
  * path we are already inside ngx_http_special_response_handler; a second
  * finalize is a double-finalize / use-after-free. Instead we rewrite
  * r->headers_out in place and let the filter chain carry the response: drop the
- * error's header list + typed Content-Type/Length, then replay the snapshot via
- * the shared restore step (X-Cache: STALE-IF-ERROR), stashing the body slice for
- * the body filter. Returns NGX_OK on a successful rewrite and NGX_ERROR on any
- * allocation failure: once list reconstruction starts, falling through would
- * emit a partially rebuilt response.
+ * error's header list + typed Content-Type/Length/Encoding, then replay the
+ * snapshot via the shared restore step (X-Cache: STALE-IF-ERROR), stashing the
+ * body slice for the body filter. Returns NGX_OK on a successful rewrite and
+ * NGX_ERROR on any allocation failure: once list reconstruction starts,
+ * falling through would emit a partially rebuilt response.
  */
 ngx_int_t
 ngx_http_cache_turbo_sie_rewrite(ngx_http_request_t *r,
@@ -3922,6 +3922,10 @@ ngx_http_cache_turbo_sie_rewrite(ngx_http_request_t *r,
 {
     u_char  *body;
     size_t   body_len;
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+    ngx_uint_t  error_had_content_encoding;
+#endif
 
     /*
      * P3-2: this is the SECOND (and only other) call site of
@@ -3997,12 +4001,19 @@ ngx_http_cache_turbo_sie_rewrite(ngx_http_request_t *r,
     }
 
     /* Drop the error response's headers and the typed fields it set (Content-Type
-     * / Content-Length) so the snapshot's own headers are authoritative. An
-     * encoded snapshot overwrites content_encoding with its validated stamp.
+     * / Content-Length / Content-Encoding) so the snapshot's own headers are
+     * authoritative. An encoded snapshot restores content_encoding from its
+     * validated stamp; an identity snapshot must not inherit the error's coding.
      * The special-response path has already cleared ETag/Last-Modified/
-     * Accept-Ranges,
-     * so a fresh list + these two typed fields is a clean slate; restore_response
-     * sets status / Content-Type / Content-Length / status_line from the blob. */
+     * Accept-Ranges, so a fresh list + these typed fields is a clean slate;
+     * restore_response sets status / Content-Type / Content-Length / status_line
+     * from the blob. */
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+    error_had_content_encoding = r->headers_out.content_encoding != NULL
+                                 && r->headers_out.content_encoding->value.len;
+#endif
+
     if (ngx_list_init(&r->headers_out.headers, r->pool, 8,
                       sizeof(ngx_table_elt_t)) != NGX_OK)
     {
@@ -4013,7 +4024,30 @@ ngx_http_cache_turbo_sie_rewrite(ngx_http_request_t *r,
     r->headers_out.content_type_len = 0;
     r->headers_out.content_length_n = -1;
     r->headers_out.content_length = NULL;
+    r->headers_out.content_encoding = NULL;
     r->headers_out.status_line.len = 0;
+
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+    /* Direct oracle for the typed-field half of the replacement. Resetting the
+     * list alone makes the stale pointer invisible to a plain HTTP client, so
+     * stamp that an encoded upstream error really reached this path and the
+     * pointer was cleared before an identity snapshot is restored. */
+    if (error_had_content_encoding
+        && r->headers_out.content_encoding == NULL)
+    {
+        static u_char  name[] =
+            "X-Cache-Turbo-Test-SIE-Encoding-Reset";
+        static u_char  value[] = "1";
+
+        if (ngx_http_cache_turbo_add_header(r, name, sizeof(name) - 1,
+                                             value, sizeof(value) - 1)
+            != NGX_OK)
+        {
+            return NGX_ERROR;
+        }
+    }
+#endif
 
     /* stale = 1: never answer 304 from a serve-on-error copy (it has not been
      * revalidated), and the X-Cache value flags the replacement. */

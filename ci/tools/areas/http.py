@@ -1121,6 +1121,59 @@ def test_sie_serve_on_error(ng: Nginx, origin: Origin) -> None:
         drain_origin(origin)
 
 
+def test_sie_identity_snapshot_clears_error_content_encoding(
+        ng: Nginx, origin: Origin) -> None:
+    """AUD30: an identity SIE snapshot must not inherit Content-Encoding
+    from the upstream error response it replaces."""
+    def raw(path: str, ae: str):
+        _bump_conn()
+        conn = http.client.HTTPConnection(
+            "127.0.0.1", ng.port, timeout=HTTP_TIMEOUT)
+        try:
+            conn.request("GET", path, headers={
+                "Accept-Encoding": ae,
+                "Connection": "close",
+            })
+            response = conn.getresponse()
+            body = response.read()
+            headers = {k.lower(): v for k, v in response.getheaders()}
+            return response.status, body, headers
+        finally:
+            conn.close()
+
+    key = "/sieserve/sieserve-error-encoded"
+    control = "/sieserve/plain-error-encoded"
+    s0, b0, h0 = raw(key, "identity")
+    assert s0 == 200 and b0, (s0, b0)
+    assert h0.get("content-encoding") is None, h0
+
+    sc0, bc0, hc0 = raw(control, "identity")
+    assert sc0 == 200 and bc0, (sc0, bc0)
+    assert hc0.get("content-encoding") is None, hc0
+
+    time.sleep(1.3)
+    origin.fail = True
+    try:
+        s1, b1, h1 = raw(key, "identity")
+        assert s1 == 200 and b1 == b0, (s1, b1, b0)
+        assert h1.get("x-cache") == "STALE-IF-ERROR", h1
+        assert h1.get("content-encoding") is None, (
+            "identity SIE snapshot inherited the error response's coding", h1)
+        assert h1.get("x-cache-turbo-test-sie-encoding-reset") == "1", (
+            "typed Content-Encoding was not cleared before identity restore",
+            h1)
+
+        sc1, bc1, hc1 = raw(control, "identity")
+        assert sc1 == 503, (sc1, hc1)
+        assert hc1.get("x-cache") != "STALE-IF-ERROR", hc1
+        assert hc1.get("content-encoding") == "gzip", (
+            "control did not prove the upstream error carried a coding", hc1)
+        assert bc1 == b"", bc1
+    finally:
+        origin.fail = False
+        drain_origin(origin)
+
+
 
 
 def _errlog_sie_unconsumed_in_window(ng: Nginx, start: int) -> list[int]:

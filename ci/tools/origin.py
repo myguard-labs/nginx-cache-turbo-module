@@ -307,6 +307,11 @@ class Origin:
                             pass
                         return True
                     self.send_response(origin.fail_status)
+                    if "error-encoded" in self.path:
+                        # AUD30 SIE regression: the upstream error carries a
+                        # typed coding that an identity snapshot must not
+                        # inherit when it replaces this response.
+                        self.send_header("Content-Encoding", "gzip")
                     self.send_header("Content-Length", "0")
                     self.end_headers()
                     return True

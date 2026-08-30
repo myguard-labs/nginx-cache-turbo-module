@@ -327,6 +327,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_stale_if_error(ng, origin)
     test_stale_serves_stale_origin_hard_dead(ng, origin)
     test_sie_serve_on_error(ng, origin)                     # RFC-2 CTB4 serve-on-error
+    test_sie_identity_snapshot_clears_error_content_encoding(ng, origin)  # AUD30
     test_cold_wait_loser_serves_stale_on_lock_timeout(ng, origin)  # P1-8 timed-out loser serves SIE snapshot
     test_cold_wait_loser_no_snapshot_goes_to_origin(ng, origin)    # P1-8 control: no snapshot -> origin unchanged
     test_sie_serve_on_error_unbuffered(ng, origin)          # AUD-SIE-BODY proxy_buffering off
