@@ -941,9 +941,8 @@ typedef struct ngx_http_cache_turbo_shctx_s {
      * subset for $cache_turbo_status / Prometheus. */
     ngx_atomic_t             bypasses;
 
-    /* P0-1: ngx_http_cache_turbo_response_cacheable()'s reason_out. NONE (0)
-     * only when the function itself returns 1 -- a caller must not read a
-     * stale/uninitialised reason after a 1 return. */
+    /* P0-1: ngx_http_cache_turbo_response_policy()'s cacheable_reason.
+     * NONE (0) means no response-policy veto fired. */
 #define NGX_HTTP_CACHE_TURBO_REFUSE_NONE            0
 #define NGX_HTTP_CACHE_TURBO_REFUSE_SET_COOKIE      1
 #define NGX_HTTP_CACHE_TURBO_REFUSE_AUTHORIZATION   2
@@ -953,7 +952,7 @@ typedef struct ngx_http_cache_turbo_shctx_s {
      * capture (store) decision path in the header filter -- never on a HIT,
      * so they add no work to the serve path. Each isolates one arm of the
      * "do not store" gate chain (filters.c capture condition +
-     * response_cacheable() + classify_vary()) so an operator sees WHY the
+     * response_policy() + classify_vary()) so an operator sees WHY the
      * hit ratio is low instead of a bare 0%. A response can trip more than
      * one reason in principle (e.g. Set-Cookie AND pre-encoded); each arm
      * that observes its own condition bumps independently, so these do NOT
@@ -2374,7 +2373,7 @@ typedef struct {
      *
      * When ON, an Authorization-bearing request is allowed to PROCEED to the
      * lookup and may be served an already-stored entry. The STORE floor in
-     * ngx_http_cache_turbo_response_cacheable() is deliberately untouched:
+     * ngx_http_cache_turbo_response_policy() is deliberately untouched:
      * its `r->headers_in.authorization != NULL` arm is the FIRST test in the
      * function, ungated by any directive, and ctx->captured (the sole gate on
      * the body filter's store, filters.c) is only set when it returns true.

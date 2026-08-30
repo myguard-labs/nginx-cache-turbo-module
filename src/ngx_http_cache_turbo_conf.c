@@ -2300,77 +2300,6 @@ ngx_http_cache_turbo_require_header(ngx_conf_t *cf, ngx_command_t *cmd,
 }
 
 
-/*
- * The store gate itself. Unset (len == 0) => 1, so every existing config keeps
- * the module's normal "cacheable unless vetoed" behaviour untouched.
- *
- * Set => the named response header must be present AND affirmative. Scans the
- * whole headers_out list rather than stopping at the first match: an upstream
- * that emits the header twice ("yes" and "no") is ambiguous, and the only safe
- * reading of an ambiguous store signal is "do not store" -- so ANY
- * non-affirmative occurrence vetoes, whatever order they arrive in.
- */
-ngx_int_t
-ngx_http_cache_turbo_require_hdr_ok(ngx_http_request_t *r,
-    ngx_http_cache_turbo_loc_conf_t *clcf)
-{
-    ngx_list_part_t  *part;
-    ngx_table_elt_t  *h;
-    ngx_uint_t        i, found = 0;
-
-    if (clcf->require_header.len == 0) {
-        return 1;
-    }
-
-    part = &r->headers_out.headers.part;
-    h = part->elts;
-
-    for (i = 0; /* void */ ; i++) {
-        if (i >= part->nelts) {
-            if (part->next == NULL) {
-                break;
-            }
-            part = part->next;
-            h = part->elts;
-            i = 0;
-        }
-        if (h[i].hash == 0 || h[i].key.len != clcf->require_header.len) {
-            continue;
-        }
-        if (ngx_strncasecmp(h[i].key.data, clcf->require_header.data,
-                            clcf->require_header.len) != 0)
-        {
-            continue;
-        }
-
-        /* Affirmative values only, matched whole: "yes" / "1" / "on". A prefix
-         * compare would read "note" as "no"-negative and, worse, "yes-but-not-
-         * really" as affirmative. */
-        if (!((h[i].value.len == 3
-               && ngx_strncasecmp(h[i].value.data, (u_char *) "yes", 3) == 0)
-              || (h[i].value.len == 2
-                  && ngx_strncasecmp(h[i].value.data, (u_char *) "on", 2) == 0)
-              || (h[i].value.len == 1 && h[i].value.data[0] == '1')))
-        {
-            ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                           "cache_turbo: \"%V\" not cached: %V is not "
-                           "affirmative", &r->uri, &clcf->require_header);
-            return 0;
-        }
-
-        found = 1;
-    }
-
-    if (!found) {
-        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                       "cache_turbo: \"%V\" not cached: no %V header",
-                       &r->uri, &clcf->require_header);
-    }
-
-    return found ? 1 : 0;
-}
-
-
 /* cache_turbo_stale_mult N (H5). Range-checked rather than a bare
  * ngx_conf_set_num_slot: ngx_http_cache_turbo_stale_ttl() coerces <= 0 back to
  * the BALANCED default, so an explicit `0` would silently behave as `4` instead
@@ -3432,7 +3361,7 @@ ngx_http_cache_turbo_key_cookie_conf(ngx_conf_t *cf, ngx_command_t *cmd,
  * equivalent of nginx `proxy_ignore_headers Set-Cookie`.
  *
  * The unconditional Set-Cookie store floor in
- * ngx_http_cache_turbo_response_cacheable() exists because a per-client cookie
+ * ngx_http_cache_turbo_response_policy() exists because a per-client cookie
  * on a shared body is a cross-user leak. But CMS/analytics stacks staple an
  * ANONYMOUS, non-identifying cookie (_ga, an A/B bucket, a consent flag) onto
  * perfectly shareable HTML, making it uncacheable on every request. This

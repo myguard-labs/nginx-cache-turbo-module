@@ -1,0 +1,14 @@
+# Copyright (C) 2026 Thijs Eilander
+# SPDX-License-Identifier: BSD-2-Clause
+#
+# Deliberately red: this four-worker server cannot satisfy a requirement for
+# five distinct workers. driver.sh requires the fanout coverage diagnostic, so
+# a parse, transport, or cache failure cannot impersonate the negative control.
+name    NEGATIVE CONTROL: impossible worker coverage must fail
+from    127.0.0.1
+send    GET /cached/item HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+expect  header~X-Cache: HIT
+pid_may_change
+fanout  8 5

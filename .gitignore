@@ -46,6 +46,12 @@ ci/tests/unit/generated_digest.inc
 ci/tests/unit/test_admin_purge_key
 ci/tests/unit/test_admin_purge_key.san
 ci/tests/unit/generated_admin_purge_key.inc
+ci/tests/unit/test_error_helpers
+ci/tests/unit/test_error_helpers.san
+ci/tests/unit/generated_error_helpers.inc
+ci/tests/unit/test_breaker_retry
+ci/tests/unit/test_breaker_retry.san
+ci/tests/unit/generated_breaker_retry.inc
 ci/tests/unit/test_access_marker_resolve
 ci/tests/unit/generated_access_marker_resolve.inc
 ci/tests/unit/test_marker_store_key
@@ -69,6 +75,8 @@ ci/tests/unit/test_ae_class_guard.san
 ci/tests/unit/test_vary_encoding_collapse
 ci/tests/unit/test_stripe_resolver
 ci/tests/unit/generated_stripe_resolver.inc
+ci/tests/unit/test_mc_parse
+ci/tests/unit/test_mc_parse.san
 
 # Fuzzing build artifacts (seed corpus IS tracked; everything else is not)
 ci/fuzz/fuzz_resp_parser

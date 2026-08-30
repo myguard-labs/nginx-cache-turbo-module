@@ -32,6 +32,7 @@ CC      ?= cc
 CFLAGS  ?= -O1 -g -std=c99 -Wall -Wextra -Werror -Wno-unused-parameter
 SAN      = -fsanitize=address,undefined -fno-omit-frame-pointer \
            -fno-sanitize-recover=all
+COVERAGE_FLAGS ?=
 # C1: test_shm_state.c drives the blob refcount from real threads, and the shim's
 # ngx_shmtx_* are a real pthread mutex, so this TU needs -pthread at compile AND
 # link. TSAN is the second sanitizer axis it unlocked: ASan proves the blob is
@@ -83,11 +84,11 @@ check-shm-rbtree: extract layout-check
 	    -o $(HERE)/ngx_rbtree.san.o
 
 check-shm-obj: extract
-	@$(CC) $(CFLAGS) $(SAN) $(PTHREAD) $(INCS_TEST) -c $(HERE)/test_shm_state.c \
+	@$(CC) $(CFLAGS) $(SAN) $(PTHREAD) $(COVERAGE_FLAGS) $(INCS_TEST) -c $(HERE)/test_shm_state.c \
 	    -o $(HERE)/test_shm_state.san.o
 
 check-shm-link: check-shm-rbtree check-shm-obj
-	@$(CC) $(SAN) $(PTHREAD) $(HERE)/test_shm_state.san.o $(HERE)/ngx_rbtree.san.o -o $(HERE)/test_shm_state.san
+	@$(CC) $(SAN) $(PTHREAD) $(COVERAGE_FLAGS) $(HERE)/test_shm_state.san.o $(HERE)/ngx_rbtree.san.o -o $(HERE)/test_shm_state.san
 
 check-frame-scan: extract-frame-scan
 	@$(CC) $(CFLAGS) -Wno-unused-function $(SAN) -I$(FUZZ_DIR) \

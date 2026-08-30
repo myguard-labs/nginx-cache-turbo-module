@@ -19,9 +19,12 @@ CFLAGS="-g -O0 -Wall -Wextra -Werror -I$DIR"
 bash "$DIR/check_constants.sh"
 bash "$DIR/check_directive_synopsis.sh" "$(cd "$DIR/../../.." && pwd)"
 bash "$DIR/check_default_comments.sh" "$(cd "$DIR/../../.." && pwd)"
+bash "$DIR/check_testkit_contract.sh" "$(cd "$DIR/../../.." && pwd)"
 
+SHM_COVERAGE_FLAGS=""
 if [ "${COVERAGE:-0}" = 1 ]; then
     CFLAGS="$CFLAGS --coverage"
+    SHM_COVERAGE_FLAGS="--coverage"
 fi
 
 # shellcheck disable=SC2086
@@ -141,6 +144,36 @@ bash "$DIR/extract_admin_purge_key.sh"
 	-fno-sanitize-recover=all "$DIR/test_admin_purge_key.c" \
 	-o "$DIR/test_admin_purge_key.san"
 ASAN_OPTIONS=detect_leaks=1 "$DIR/test_admin_purge_key.san"
+
+# --- terminal admin/memcached error contracts ----------------------------
+# Exercise the two real helpers that require environmental failures too
+# nondeterministic for the runtime suite: no nginx thread support/pool, and a
+# transport failure before memcached proves a fresh connection. Pin the exact
+# JSON status/body/log and the GET-vs-fire-and-forget backoff/cleanup split.
+bash "$DIR/extract_error_helpers.sh"
+# shellcheck disable=SC2086
+"$CC" $CFLAGS "$DIR/test_error_helpers.c" -o "$DIR/test_error_helpers"
+"$DIR/test_error_helpers"
+# shellcheck disable=SC2086
+"$CC" $CFLAGS -fsanitize=address,undefined -fno-omit-frame-pointer \
+	-fno-sanitize-recover=all "$DIR/test_error_helpers.c" \
+	-o "$DIR/test_error_helpers.san"
+ASAN_OPTIONS=detect_leaks=1 "$DIR/test_error_helpers.san"
+bash "$DIR/check_error_helpers_control.sh"
+
+# --- breaker retry-attempt accounting ------------------------------------
+# Exercise the production request-state walker directly. The current/final
+# attempt is handled by the filter caller and must never be counted twice.
+bash "$DIR/extract_breaker_retry.sh"
+# shellcheck disable=SC2086
+"$CC" $CFLAGS "$DIR/test_breaker_retry.c" -o "$DIR/test_breaker_retry"
+"$DIR/test_breaker_retry"
+# shellcheck disable=SC2086
+"$CC" $CFLAGS -fsanitize=address,undefined -fno-omit-frame-pointer \
+	-fno-sanitize-recover=all "$DIR/test_breaker_retry.c" \
+	-o "$DIR/test_breaker_retry.san"
+ASAN_OPTIONS=detect_leaks=1 "$DIR/test_breaker_retry.san"
+bash "$DIR/check_breaker_retry_control.sh"
 
 # --- L2 marker self-heal failure policy ----------------------------------
 # Once the variant key is resolved, re-storing its marker is best-effort.
@@ -273,10 +306,17 @@ NGINX_OBJS="${NGINX_OBJS:-$NGX_SRC/objs}"
 
 if [ -f "$NGINX_OBJS/ngx_auto_config.h" ]; then
     echo "--- shm node state machine (ASan/UBSan) ---"
+    if [ "${COVERAGE:-0}" = 1 ]; then
+        # The ordinary and instrumented builds intentionally share target
+        # names. Force fresh objects so a prior non-coverage run cannot make
+        # this coverage pass silently reuse uninstrumented shm objects.
+        make -C "$DIR" --no-print-directory clean
+    fi
     make -C "$DIR" --no-print-directory check \
         NGINX_VERSION="$NGINX_VERSION" \
         NGINX_SRC="$NGINX_SRC" \
-        NGINX_OBJS="$NGINX_OBJS"
+        NGINX_OBJS="$NGINX_OBJS" \
+        COVERAGE_FLAGS="$SHM_COVERAGE_FLAGS"
 
     echo "--- purge-all finite-snapshot mutation control ---"
     NGINX_VERSION="$NGINX_VERSION" NGINX_SRC="$NGINX_SRC" \

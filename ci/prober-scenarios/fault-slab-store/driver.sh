@@ -151,6 +151,16 @@ x_cache() {
         | head -1 | tr '[:lower:]' '[:upper:]'
 }
 
+# A missing half of the snapshot pair makes every neutrality comparison
+# meaningless. Keep the decision in one function so the live assertions and
+# the focused negative control below exercise the same fail-closed predicate.
+snapshot_pair_ready() {
+    if [ "$1" -ne 1 ]; then
+        return 1
+    fi
+    [ "$2" -eq 1 ]
+}
+
 # TAP plan:
 #  1 the probe answers and renders this module's own zone fields (hook is live)
 #  2 UNARMED CONTROL: a cold URI caches, so its second GET is a HIT
@@ -160,7 +170,8 @@ x_cache() {
 #  6 cycle_blocks + cycle_large flat across the faulting request
 #  7 worker fds flat across the faulting request
 #  8 the arm is single-shot: after it fires, storing works again
-echo "1..8"
+#  9 a deliberately unavailable probe snapshot is rejected, not SKIPped
+echo "1..9"
 
 # --- 1: the probe is live and it is OUR zone --------------------------------
 # Asserted on a field only this module's zone_render emits. The generic
@@ -330,8 +341,9 @@ fi
 # request pool and returns without releasing shows up here and nowhere else in
 # this repo. Equality is asserted, not a bound: the request pool is reset per
 # request, so a healthy error path leaves the cycle pool exactly where it was.
-if [ "$BASE_OK" -eq 0 ] || [ "$FINAL_OK" -eq 0 ]; then
-    echo "ok 5 - cycle_used neutrality across the faulting request # SKIP a quiescent snapshot did not answer"
+if ! snapshot_pair_ready "$BASE_OK" "$FINAL_OK"; then
+    echo "not ok 5 - cycle_used neutrality cannot be evaluated because a quiescent snapshot did not answer"
+    FAILED=$((FAILED + 1))
 elif [ "$BASE_USED" = "$FINAL_USED" ]; then
     echo "ok 5 - cycle_used was flat across the faulting request ($BASE_USED)"
 else
@@ -340,8 +352,9 @@ else
 fi
 
 # --- 6: cycle_blocks + cycle_large flat -------------------------------------
-if [ "$BASE_OK" -eq 0 ] || [ "$FINAL_OK" -eq 0 ]; then
-    echo "ok 6 - cycle_blocks/cycle_large neutrality # SKIP a quiescent snapshot did not answer"
+if ! snapshot_pair_ready "$BASE_OK" "$FINAL_OK"; then
+    echo "not ok 6 - cycle_blocks/cycle_large neutrality cannot be evaluated because a quiescent snapshot did not answer"
+    FAILED=$((FAILED + 1))
 elif [ "$BASE_BLOCKS" = "$FINAL_BLOCKS" ] && [ "$BASE_LARGE" = "$FINAL_LARGE" ]; then
     echo "ok 6 - cycle_blocks ($BASE_BLOCKS) and cycle_large ($BASE_LARGE) were flat across the faulting request"
 else
@@ -352,8 +365,9 @@ fi
 # --- 7: worker fds flat ------------------------------------------------------
 # The store path's failure happens after the upstream connection is
 # established, so a fd leaked on that path is a real and reachable defect.
-if [ "$BASE_OK" -eq 0 ] || [ "$FINAL_OK" -eq 0 ]; then
-    echo "ok 7 - worker fd neutrality # SKIP a quiescent snapshot did not answer"
+if ! snapshot_pair_ready "$BASE_OK" "$FINAL_OK"; then
+    echo "not ok 7 - worker fd neutrality cannot be evaluated because a quiescent snapshot did not answer"
+    FAILED=$((FAILED + 1))
 elif [ "$BASE_FDS" = "$FINAL_FDS" ]; then
     echo "ok 7 - worker fd count was flat across the faulting request ($BASE_FDS)"
 else
@@ -388,6 +402,25 @@ else
     echo "not ok 8 - storing is still broken after the fault fired (GET2 X-Cache='$(x_cache "$POST2" 2>/dev/null)') -- the countdown did not disarm itself and the zone is wedged"
     head -12 "$POST2" 2>/dev/null | sed 's/^/# /' || true
     FAILED=$((FAILED + 1))
+fi
+
+# --- 9: negative control for the snapshot availability guard ----------------
+# PROBER_PROBE_ATTEMPTS is the bounded-read helper's existing deterministic
+# seam. Zero attempts issues no request and must make snapshot() fail; feed that
+# result through the SAME predicate assertions 5-7 use. If a future edit turns
+# missing evidence back into agreement, this control becomes red even while the
+# live probe happens to remain healthy.
+SNAPSHOT_CONTROL_OK=1
+if PROBER_PROBE_ATTEMPTS=0 snapshot; then
+    SNAPSHOT_CONTROL_OK=1
+else
+    SNAPSHOT_CONTROL_OK=0
+fi
+if snapshot_pair_ready "$SNAPSHOT_CONTROL_OK" 1; then
+    echo "not ok 9 - the neutrality guard accepted a deliberately unavailable pre-fault snapshot"
+    FAILED=$((FAILED + 1))
+else
+    echo "ok 9 - the neutrality guard rejects a deliberately unavailable snapshot"
 fi
 
 if [ "$FAILED" -ne 0 ]; then

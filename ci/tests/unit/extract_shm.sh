@@ -48,6 +48,8 @@ if [ ! -f "$SRC" ]; then
     echo "✗ cannot find $SRC" >&2
     exit 1
 fi
+SRC_CANON="$(realpath "$SRC")"
+OUT_CANON="$(realpath -m "$OUT")"
 
 # --- guard: the node-kind constants the tests assert on must still mean what
 # the tests think they mean. ENTRY == 0 is load-bearing (a node zeroed by
@@ -339,15 +341,20 @@ check_blobref_mirror
 # `static void *`, `ngx_http_cache_turbo_node_t *`, ...) immediately followed
 # by the `name(` line, and the body closes on a bare `}` in column 0. Matching
 # the type line + the name regex picks out exactly the wanted set.
-awk '
+awk -v source_name="$SRC_CANON" '
     /^(static )?(void|ngx_int_t|ngx_uint_t|ngx_flag_t|time_t|u_char|const char|uint32_t|uint64_t|ngx_http_cache_turbo_node_t)[[:space:]]*\**$/ {
-        pending = 1; buf = $0 ORS; next
+        pending = 1; start = NR; buf = $0 ORS; next
     }
     /^static ngx_inline (uint32_t|uint64_t|ngx_uint_t|void)$/ {
-        pending = 1; buf = $0 ORS; next
+        pending = 1; start = NR; buf = $0 ORS; next
     }
     pending && /^ngx_http_cache_turbo_(shm_(key64|sketch_bump|sketch_estimate|admit|lookup|evict_one|alloc_evict|free_locked|drop_locked|purge_all|claim_locked|claim|resolve_miss|unstub|owns|count_miss_locked|count_miss|l2_neg_check|l2_neg_set|touch_lru|brk_probe_age|breaker_state|breaker_record|breaker_state_str|get_u32|get_u64|node_sie_live)|lru_(link_head|unlink|insert_new|enforce_cap)|sketch_(row_hash|rows|get|inc|halve)|blob_(alloc|node_release|acquire|release))\(/ {
-        capture = 1; pending = 0; printf "%s", buf; print; next
+        capture = 1
+        pending = 0
+        printf "#line %d \"%s\"\n", start, source_name
+        printf "%s", buf
+        print
+        next
     }
     pending { pending = 0; buf = "" }
     capture {
@@ -355,6 +362,11 @@ awk '
         if ($0 == "}") { capture = 0 }
     }
 ' "$SRC" > "$OUT"
+
+# Keep the later module.c predicate slice out of the shm.c line map. The
+# extracted shm functions above retain production-source coverage, while the
+# unrelated slice below remains attributed to this generated include.
+printf '#line %d "%s"\n' "$(( $(wc -l < "$OUT") + 2 ))" "$OUT_CANON" >> "$OUT"
 
 # Falsifiable PURGE-ALL-STARVATION control.  A practically unbounded work
 # budget reproduces the old "drain until empty" behavior for this finite

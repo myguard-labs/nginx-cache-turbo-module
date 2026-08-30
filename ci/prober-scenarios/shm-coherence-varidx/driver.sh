@@ -98,19 +98,17 @@ FAILED=0
 fail() { echo "not ok $1 - $2"; FAILED=1; }
 
 # probe_field NAME -> the integer the probe currently renders for zone.<NAME>,
-# or the empty string when the field is absent. A bounded raw GET rather than
-# curl: the prober's own client speaks the rule language, not ad-hoc reads, and
-# adding a curl dependency to a scenario that already gates on four binaries is
-# not worth it.
+# or a nonzero status when the complete probe response or field is absent.
+# Delegate both the bounded/retried read and numeric field parsing to testkit's
+# public helpers. Open-coding /dev/tcp + an unbounded cat here let a stalled
+# probe hang the entire CI job and made this driver's parser disagree with the
+# assertion engine's unavailable-field contract.
 probe_field() {
-    local name="$1" out
+    local name="$1" out body
     out="$PROBER_PREFIX/probe-$name.out"
-    (
-        exec 3<>"/dev/tcp/$HOST/$PORT" || exit 1
-        printf 'GET /__probe HTTP/1.1\r\nHost: prober\r\nConnection: close\r\n\r\n' >&3
-        cat <&3 2>/dev/null || true
-    ) >"$out" 2>/dev/null || true
-    sed -n "s/.*\"$name\":\([0-9][0-9]*\).*/\1/p" "$out" | head -1
+    body="$(prober_probe_body "$HOST" "$PORT")" || return 1
+    printf '%s\n' "$body" >"$out"
+    prober_probe_field "$body" "$name"
 }
 
 # one_get URI ACCEPT_ENCODING -- drive one request through the varidx path.

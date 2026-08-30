@@ -990,7 +990,7 @@ ngx_http_cache_turbo_build_key(ngx_http_request_t *r,
      * (the anonymous entry), matching the preset semantics.
      *
      * SAFETY: like the presets, this DEPENDS on the Set-Cookie store floor in
-     * ngx_http_cache_turbo_response_cacheable() to refuse the transition race
+     * ngx_http_cache_turbo_response_policy() to refuse the transition race
      * (request without the cookie keys to the anon entry, the response then
      * SETS the cookie -> storing under the anon key would poison it). The floor
      * is unconditional for THIS location by construction: P5-8's
@@ -1348,62 +1348,10 @@ ngx_http_cache_turbo_header_find(ngx_list_t *headers, const char *name,
 
 
 /*
- * HTTP allows a field to be split across multiple field-lines with the same
- * name (RFC 9110 §5.3), semantically equivalent to one line with the values
- * comma-joined in order. header_find() above only returns the FIRST
- * occurrence, which is fine for headers we treat as singular, but
- * Cache-Control is combinable: a directive on a LATER line is just as
- * binding as one on the first. ngx_http_cache_turbo_response_cacheable()
- * already walks every line explicitly (it needs the raw ngx_table_elt_t to
- * also check the header name and Set-Cookie); these two helpers give the
- * same guarantee to callers that only need a directive lookup on the
- * response Cache-Control header, folding the list walk in once instead of
- * being copy-pasted per caller.
- *
- * cc_has_all: true if the named directive appears on ANY Cache-Control line.
- * cc_delta_all: numeric value of the named directive from the FIRST line
- * that carries it (document order), matching the precedence a single
- * comma-joined line would give under cc_delta's existing first-match rule.
- */
-static ngx_int_t
-ngx_http_cache_turbo_cc_has_all(ngx_list_t *headers, const char *hname,
-    size_t hnlen, const char *name, size_t nlen)
-{
-    ngx_list_part_t  *part = &headers->part;
-    ngx_table_elt_t  *h = part->elts;
-    ngx_uint_t         i;
-
-    for (i = 0; /* void */ ; i++) {
-        if (i >= part->nelts) {
-            if (part->next == NULL) {
-                break;
-            }
-            part = part->next;
-            h = part->elts;
-            i = 0;
-        }
-        if (h[i].hash == 0 || h[i].key.len != hnlen) {
-            continue;
-        }
-        if (ngx_strncasecmp(h[i].key.data, (u_char *) hname, hnlen) != 0) {
-            continue;
-        }
-        if (ngx_http_cache_turbo_cc_has(h[i].value.data,
-                h[i].value.data + h[i].value.len, name, nlen))
-        {
-            return 1;
-        }
-    }
-
-    return 0;
-}
-
-
-/*
  * Generalized over the header NAME (CQ-3 follow-up, AUD2-CC-TARGETED): the
  * targeted freshness headers Surrogate-Control / CDN-Cache-Control share the
  * same combinable-field-line semantics as Cache-Control (RFC 9110 §5.3), so
- * their TTL selection needs the same every-line walk that response_cacheable()
+ * their TTL selection needs the same every-line walk that response_policy()
  * already applies to all three names on the veto path. Single-line lookup via
  * header_find() only sees the FIRST field-line; a later line carrying the
  * authoritative max-age/s-maxage was silently ignored.
@@ -1456,7 +1404,7 @@ ngx_http_cache_turbo_cc_delta_all(ngx_list_t *headers, const char *hname,
  * "<token>=<delta>" grammar as Cache-Control, so cc_delta parses them directly.
  * A past Expires / a parse miss clamps to 0 (store but immediately stale).
  * no-store/private/max-age=0 (incl. the targeted variants) are already refused
- * upstream by response_cacheable, so they never reach here. Only called under
+ * upstream by response_policy, so they never reach here. Only called under
  * honor_cc && !ignore_cc, so honouring the targeted variants needs no new knob.
  */
 time_t
@@ -1518,101 +1466,6 @@ ngx_http_cache_turbo_upstream_ttl(ngx_http_request_t *r)
     }
 
     return -1;
-}
-
-
-/*
- * True when the response forbids serving stale once expired (RFC 9111 §5.2.2.2 /
- * §5.2.2.8): Cache-Control: must-revalidate or proxy-revalidate. We honour it by
- * collapsing the stale window to zero at store, so the object is served fresh
- * until its deadline and then re-fetched rather than stale-served. Walks the
- * (small) response header list once on the store path only.
- */
-ngx_int_t
-ngx_http_cache_turbo_response_must_revalidate(ngx_http_request_t *r)
-{
-    return (ngx_http_cache_turbo_cc_has_all(&r->headers_out.headers,
-                "Cache-Control", sizeof("Cache-Control") - 1,
-                "must-revalidate", sizeof("must-revalidate") - 1)
-            || ngx_http_cache_turbo_cc_has_all(&r->headers_out.headers,
-                "Cache-Control", sizeof("Cache-Control") - 1,
-                "proxy-revalidate", sizeof("proxy-revalidate") - 1)) ? 1 : 0;
-}
-
-
-/*
- * P3-4 / RFC 9111 §3.5: may a stored response be REUSED for a request that
- * carried Authorization? A shared cache MUST NOT do so unless the response
- * explicitly authorises it, which §3.5 spells out as one of:
- *
- *   - Cache-Control: public
- *   - Cache-Control: s-maxage=<delta>   (any value; presence is the signal)
- *   - Cache-Control: must-revalidate    (proxy-revalidate is its shared-cache
- *                                        synonym, already folded into
- *                                        response_must_revalidate())
- *
- * Evaluated at STORE time and recorded as a blob flag bit, exactly like
- * BLOBF_ORIGIN_ENCODED: the serve path must not have to re-derive it from a
- * response it no longer has. Note s-maxage=0 still counts as "authorised" here
- * -- it is a freshness lifetime, not a permission, and response_cacheable()
- * has already refused to store an s-maxage=0 response at all, so no blob can
- * reach the serve path carrying it.
- *
- * ⚠ This is ONLY the §3.5 reuse authorisation. It says nothing about whether
- * the entry was stored anonymously; that is guaranteed separately and
- * unconditionally by response_cacheable()'s Authorization arm. Both hold.
- */
-ngx_int_t
-ngx_http_cache_turbo_response_auth_shareable(ngx_http_request_t *r)
-{
-    if (ngx_http_cache_turbo_cc_has_all(&r->headers_out.headers,
-            "Cache-Control", sizeof("Cache-Control") - 1,
-            "public", sizeof("public") - 1))
-    {
-        return 1;
-    }
-
-    if (ngx_http_cache_turbo_cc_delta_all(&r->headers_out.headers,
-            "Cache-Control", sizeof("Cache-Control") - 1,
-            "s-maxage", sizeof("s-maxage") - 1) >= 0)
-    {
-        return 1;
-    }
-
-    return ngx_http_cache_turbo_response_must_revalidate(r);
-}
-
-
-/*
- * RFC 5861 §3 / RFC 9111: response Cache-Control: stale-while-revalidate=N — the
- * origin tells the cache how long past freshness it may serve a stale copy while
- * a refresh runs. Returns N (>=0) or -1 when absent / no numeric value. Honoured
- * at store by sizing the stale window to N instead of the cache_turbo_stale_mult
- * default (RFC-2). Walks the (small) response header list once on the store path.
- */
-time_t
-ngx_http_cache_turbo_response_swr(ngx_http_request_t *r)
-{
-    return ngx_http_cache_turbo_cc_delta_all(&r->headers_out.headers,
-               "Cache-Control", sizeof("Cache-Control") - 1,
-               "stale-while-revalidate", sizeof("stale-while-revalidate") - 1);
-}
-
-
-/*
- * RFC 5861 §4 / RFC 9111: response Cache-Control: stale-if-error=N — the origin
- * tells the cache how long past freshness it may serve a stale copy when a
- * revalidation to the origin fails (5xx / timeout / connect error). Returns N
- * (>=0) or -1 when absent / no numeric value. Honoured at store by recording the
- * absolute serve-on-error window (fresh + N) in the blob's sie_ttl (CTB4); the
- * serve-on-error path consumes it. Walks the (small) response header list once.
- */
-time_t
-ngx_http_cache_turbo_response_sie(ngx_http_request_t *r)
-{
-    return ngx_http_cache_turbo_cc_delta_all(&r->headers_out.headers,
-               "Cache-Control", sizeof("Cache-Control") - 1,
-               "stale-if-error", sizeof("stale-if-error") - 1);
 }
 
 
@@ -3046,7 +2899,7 @@ ngx_http_cache_turbo_serve(ngx_http_request_t *r, u_char *copy, size_t len,
          * P3-4 / RFC 9111 SS3.5: this request carries Authorization. It only
          * got past access_eligible() because cache_turbo_serve_authorized is
          * on for its location. Anonymity of the stored copy is already
-         * guaranteed (response_cacheable()'s unconditional Authorization arm
+         * guaranteed (response_policy()'s unconditional Authorization arm
          * gates ctx->captured, the sole store trigger), but SS3.5 also
          * requires the RESPONSE to have authorised reuse for an authenticated
          * request. Enforce that here, at the same chokepoint and with the same
@@ -3521,155 +3374,6 @@ ngx_http_cache_turbo_set_cookie_relax_allowed(
  * can attribute a refusal to a Prometheus counter without a second header
  * walk. Purely observational -- does not change which responses are refused.
  */
-ngx_int_t
-ngx_http_cache_turbo_response_cacheable(ngx_http_request_t *r,
-    ngx_uint_t *reason_out)
-{
-    ngx_list_part_t                  *part;
-    ngx_table_elt_t                  *h;
-    ngx_uint_t                        i;
-    ngx_http_cache_turbo_loc_conf_t  *clcf;
-
-    if (reason_out != NULL) {
-        *reason_out = NGX_HTTP_CACHE_TURBO_REFUSE_NONE;
-    }
-
-    if (r->headers_in.authorization != NULL) {
-        if (reason_out != NULL) {
-            *reason_out = NGX_HTTP_CACHE_TURBO_REFUSE_AUTHORIZATION;
-        }
-        return 0;
-    }
-
-    clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
-
-    part = &r->headers_out.headers.part;
-    h = part->elts;
-    for (i = 0; /* void */ ; i++) {
-        if (i >= part->nelts) {
-            if (part->next == NULL) {
-                break;
-            }
-            part = part->next;
-            h = part->elts;
-            i = 0;
-        }
-        if (h[i].hash == 0 || h[i].key.len == 0) {
-            continue;
-        }
-
-        /*
-         * The Set-Cookie floor. NOT gated by ignore_cc, because relaxing it
-         * does more than staple one visitor's session cookie into a shared
-         * body. The ONE way to relax it is P5-8's
-         * cache_turbo_ignore_set_cookie, off by default and carrying the
-         * preset-level veto the paragraph below demands.
-         *
-         * PRESET KEY COOKIES DEPEND ON THIS. A request that carries no key
-         * cookie (Magento's X-Magento-Vary) hashes to the ANONYMOUS entry, and
-         * the response that FIRST establishes the segment arrives with exactly
-         * one distinguishing mark: a Set-Cookie. Store it and the anonymous
-         * entry now serves segmented content to every anonymous visitor —
-         * upstream Magento's own VCL refuses the identical case
-         * (vcl_backend_response: beresp.uncacheable). Anyone adding a knob that
-         * caches Set-Cookie responses must add a preset-level veto FIRST
-         * (request had no key cookie && response sets one => do not capture),
-         * or reintroduce a cross-user leak.
-         *
-         * P5-8 SATISFIES THAT PRECONDITION, and more strictly than the
-         * paragraph asks: instead of deciding per response whether a key cookie
-         * was involved, ngx_http_cache_turbo_set_cookie_relax_allowed() vetoes
-         * on the CONFIGURATION -- any active backend preset, or any
-         * cache_turbo_key_cookie, disables the relax for the whole location
-         * whatever the ignore list says. A per-response test would depend on
-         * the operator having listed every key cookie, and a list that omits
-         * one silently reopens the race; a per-location veto cannot.
-         */
-        if (h[i].key.len == sizeof("Set-Cookie") - 1
-            && ngx_strncasecmp(h[i].key.data, (u_char *) "Set-Cookie",
-                               sizeof("Set-Cookie") - 1) == 0)
-        {
-            /*
-             * P5-8: the named relax. This `continue` is reached ONLY when the
-             * operator listed this exact cookie name AND the location has no
-             * key-cookie machinery at all -- the preset-level veto the comment
-             * above demands, implemented in
-             * ngx_http_cache_turbo_set_cookie_relax_allowed().
-             *
-             * It is a `continue`, NOT a `return 1`: the loop must keep walking,
-             * because a response may carry SEVERAL Set-Cookie fields (nginx
-             * hands them to us as separate entries in this very list) and ONE
-             * unlisted or unparseable name among them must still refuse the
-             * whole store. Every other veto arm below still applies too.
-             *
-             * What gets STORED is unaffected: "Set-Cookie" is on the
-             * unconditional header_skip[] list, so no Set-Cookie is ever
-             * serialised into a blob and none can replay to another client.
-             */
-            if (ngx_http_cache_turbo_set_cookie_relax_allowed(clcf)
-                && ngx_http_cache_turbo_set_cookie_ignorable(clcf, &h[i]))
-            {
-                continue;
-            }
-
-            if (reason_out != NULL) {
-                *reason_out = NGX_HTTP_CACHE_TURBO_REFUSE_SET_COOKIE;
-            }
-            return 0;
-        }
-
-        /* Cache-Control plus the RFC 9213 targeted variants (CDN-Cache-Control,
-         * Surrogate-Control): all three carry the same no-store/private/max-age=0
-         * grammar, so a targeted directive must veto the shared store the same way
-         * plain Cache-Control does — otherwise an origin that says
-         * "CDN-Cache-Control: no-store" (edge must not cache) would still be
-         * stored by us. Gated by honor_cc (via ignore_cc): if the operator ignores
-         * Cache-Control, we ignore the targeted variants too. Surrogate-Control
-         * has no "private" token (Fastly uses "no-store"/"private" loosely, so we
-         * still honour both). */
-        if (!clcf->ignore_cc
-            && ((h[i].key.len == sizeof("Cache-Control") - 1
-                 && ngx_strncasecmp(h[i].key.data, (u_char *) "Cache-Control",
-                                    sizeof("Cache-Control") - 1) == 0)
-                || (h[i].key.len == sizeof("CDN-Cache-Control") - 1
-                    && ngx_strncasecmp(h[i].key.data,
-                                       (u_char *) "CDN-Cache-Control",
-                                       sizeof("CDN-Cache-Control") - 1) == 0)
-                || (h[i].key.len == sizeof("Surrogate-Control") - 1
-                    && ngx_strncasecmp(h[i].key.data,
-                                       (u_char *) "Surrogate-Control",
-                                       sizeof("Surrogate-Control") - 1) == 0)))
-        {
-            u_char  *v = h[i].value.data;
-            u_char  *e = v + h[i].value.len;
-
-            /* Full-token match (not substring): no-store / no-cache / private
-             * forbid shared storage; max-age=0 / s-maxage=0 mean already-stale,
-             * not cacheable. cc_delta returns 0 only for an exact "=0" value, so
-             * "max-age=01000" no longer trips this (it is a 1000s freshness). */
-            if (ngx_http_cache_turbo_cc_has(v, e, "no-store",
-                    sizeof("no-store") - 1)
-                || ngx_http_cache_turbo_cc_has(v, e, "no-cache",
-                    sizeof("no-cache") - 1)
-                || ngx_http_cache_turbo_cc_has(v, e, "private",
-                    sizeof("private") - 1)
-                || ngx_http_cache_turbo_cc_delta(v, e, "max-age",
-                    sizeof("max-age") - 1) == 0
-                || ngx_http_cache_turbo_cc_delta(v, e, "s-maxage",
-                    sizeof("s-maxage") - 1) == 0)
-            {
-                if (reason_out != NULL) {
-                    *reason_out = NGX_HTTP_CACHE_TURBO_REFUSE_CACHE_CONTROL;
-                }
-                return 0;
-            }
-        }
-    }
-
-    return 1;
-}
-
-
 void
 ngx_http_cache_turbo_response_policy(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf,
@@ -3911,7 +3615,7 @@ ngx_http_cache_turbo_response_policy(ngx_http_request_t *r,
  * Content-Length is re-derived from the stored body, Date/Server are re-emitted
  * by the header filter, so replaying any of these would duplicate or conflict
  * (e.g. two Content-Length lines, or chunked framing against a fixed length).
- * Set-Cookie is dropped defensively too, though response_cacheable already
+ * Set-Cookie is dropped defensively too, though response_policy already
  * refuses to store a Set-Cookie response at all. Age and the X-Cache* status
  * headers are dropped so that when a NATIVE nginx cache (proxy_cache / fastcgi_
  * cache) sits behind us, we don't freeze and replay its per-response age/status

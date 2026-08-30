@@ -31,6 +31,12 @@ export PROBER_ERROR_LOG="$ELOG"
 
 FAILED=0
 
+# run-scenario.sh normalizes this to 1..1000 before invoking a driver. Scale
+# tool/readiness deadlines under valgrind without stretching the one-second
+# mid-upload discriminator below: that window must remain shorter than the
+# fixed ~4.5 second drip or it would stop proving the upload is still active.
+TIMEOUT_SCALE="${PROBER_TIMEOUT_SCALE:-1}"
+
 echo "1..6"
 
 BODY="0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWX"   # 60 bytes
@@ -106,14 +112,15 @@ else
     FAILED=$((FAILED + 1))
 fi
 
-if prober_signal_wait HUP "$PROBER_SERVER_PID" "$HOST" "$PORT" 5000; then
+if prober_signal_wait HUP "$PROBER_SERVER_PID" "$HOST" "$PORT" \
+    "$((5000 * TIMEOUT_SCALE))"; then
     echo "ok 3 - the reload was absorbed while the upload was in flight"
 else
     echo "not ok 3 - the reload never landed (no new worker answered)"
     FAILED=$((FAILED + 1))
 fi
 
-join_deadline=$(( SECONDS + 15 ))
+join_deadline=$(( SECONDS + 15 * TIMEOUT_SCALE ))
 while kill -0 "$UPLOAD_PID" 2>/dev/null; do
     if [ "$SECONDS" -ge "$join_deadline" ]; then
         pkill -P "$UPLOAD_PID" 2>/dev/null || true
@@ -123,6 +130,20 @@ while kill -0 "$UPLOAD_PID" 2>/dev/null; do
     sleep 0.1
 done
 wait "$UPLOAD_PID" 2>/dev/null || true
+
+# A new worker answering does not mean the old upload-serving worker has
+# exited. Wait until the old cycle drains before the post-reload rule measures
+# descriptors/pool state; otherwise it can sample transient handover state and
+# report either false drift or false agreement depending on which worker wins.
+DRAIN_RC=0
+prober_drain_wait "$PROBER_SERVER_PID" 1 "$((10000 * TIMEOUT_SCALE))" \
+    || DRAIN_RC=$?
+case "$DRAIN_RC" in
+    0) ;;
+    2) echo "# old-worker drain check unavailable: pgrep is not installed" ;;
+    *) echo "# old upload-serving worker did not drain before post-reload checks"
+       FAILED=$((FAILED + 1)) ;;
+esac
 
 if grep -q '^HTTP/1.1 200' "$UPLOAD_OUT" \
    && grep -q 'UPLOADED' "$UPLOAD_OUT"; then
@@ -141,7 +162,9 @@ else
     echo "ok 5 - no worker died by signal across the reload"
 fi
 
-./prober -H "$HOST" -p "$PORT" "$PROBER_SCENARIO/post-reload.rule" | sed 's/^/# prober: /'
+"$PROBER_CLIENT" -H "$HOST" -p "$PORT" \
+    -t "$((8000 * TIMEOUT_SCALE))" \
+    "$PROBER_SCENARIO/post-reload.rule" | sed 's/^/# prober: /'
 STATUS=${PIPESTATUS[0]}
 if [ "$STATUS" -eq 0 ]; then
     echo "ok 6 - the post-reload worker serves cleanly"

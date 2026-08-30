@@ -265,6 +265,8 @@ STAGE_DIR="$BUILD_ROOT/$STAGE"
 
 CT_SO=ngx_http_cache_turbo_module.so
 TK_SO=ngx_http_test_ref_module.so
+SERVER_BIN=nginx
+[ "$FLAVOR" = "angie" ] && SERVER_BIN=angie
 
 # ---- the configure argv ----------------------------------------------------
 # --with-compat: required for dynamic modules generally, and already what
@@ -394,16 +396,25 @@ if [ "$DRY" -eq 1 ]; then
     [ "$VALGRIND" -eq 1 ] && echo "would require  : a DEBUG build with NO ASan/UBSan runtime present"
     echo "would require  : objs/$TK_SO newer than $TESTKIT/src"
     echo "                 objs/$CT_SO newer than $ROOT/src"
-    echo "                 objs/nginx executable"
+    echo "                 objs/$SERVER_BIN executable"
     exit 0
 fi
 
 # ---- host rule: one build at a time ----------------------------------------
 # A concurrent nginx/pbuilder build on this box thrashes and has produced stale
 # artifacts before. Refuse rather than race.
-if pgrep -f 'pbuilder|dpkg-buildpackage' >/dev/null 2>&1; then
-    die "another package build is running on this host -- refusing to start (one build at a time)"
-fi
+# Match the executable identity (or a shebang interpreter's script argv), not
+# arbitrary command-line prose. A watcher or shell command that merely names
+# pbuilder must not block every testkit build on the host.
+# shellcheck disable=SC1091
+source "$ROOT/ci/tools/testkit-host-guard.sh"
+BUILD_GUARD_RC=0
+testkit_package_build_running || BUILD_GUARD_RC=$?
+case "$BUILD_GUARD_RC" in
+    0) die "another package build is running on this host -- refusing to start (one build at a time)" ;;
+    1) ;;
+    *) die "cannot inspect host processes for concurrent package builds -- refusing to fail open" ;;
+esac
 
 mkdir -p "$BUILD_ROOT"
 
@@ -600,8 +611,6 @@ TK_MTIME="${tk_ref%% *}"; TK_NEWEST="${tk_ref#* }"
 # not rebuild when only src/*.c here changes, and demanding it would fail every
 # incremental stage for no safety gain. prober_resolve makes the same
 # distinction (lib.sh:96 tests -x, not mtime).
-SERVER_BIN=nginx
-[ "$FLAVOR" = "angie" ] && SERVER_BIN=angie
 if [ ! -x "$STAGE_DIR/objs/$SERVER_BIN" ]; then
     echo "testkit-stage: MISSING or non-executable $STAGE_DIR/objs/$SERVER_BIN" >&2
     echo "  the prober bails without it (lib.sh 'Bail out! no server binary')" >&2

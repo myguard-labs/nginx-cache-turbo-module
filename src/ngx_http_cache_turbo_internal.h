@@ -827,7 +827,7 @@ typedef struct {
  *
  * ⚠ Like BLOBF_BREAKER_ONLY and BLOBF_ORIGIN_ENCODED, this bit is checked at
  * the serve chokepoint every hit path shares. It is NOT the anonymity
- * guarantee -- that comes from response_cacheable()'s unconditional
+ * guarantee -- that comes from response_policy()'s unconditional
  * Authorization arm, which is what makes every stored blob anonymous in the
  * first place. This bit only adds the SS3.5 reuse permission on top.
  */
@@ -1226,8 +1226,6 @@ void ngx_http_cache_turbo_emit_surrogate_key(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf);
 ngx_int_t ngx_http_cache_turbo_header_admissible(ngx_http_cache_turbo_loc_conf_t *clcf,
     u_char *name, size_t nlen, u_char *val, size_t vlen);
-ngx_int_t ngx_http_cache_turbo_require_hdr_ok(ngx_http_request_t *r,
-    ngx_http_cache_turbo_loc_conf_t *clcf);
 
 /* Directive setters + the ngx_http_cache_turbo(...) top-level directive, now
  * defined in ngx_http_cache_turbo_conf.c (MAINT-SPLIT step H). Non-static:
@@ -1317,19 +1315,12 @@ ngx_http_cache_turbo_is_cookie_name_byte(u_char c)
     return ngx_strchr(seps, (int) c) == NULL;
 }
 
-/* P0-1: reason_out receives which arm vetoed (see the
- * NGX_HTTP_CACHE_TURBO_REFUSE_* enum in module.h), or _NONE (0) when the
- * function returns 1 (cacheable) -- reason_out may be NULL for callers that
- * do not need the breakdown. */
-ngx_int_t ngx_http_cache_turbo_response_cacheable(ngx_http_request_t *r,
-    ngx_uint_t *reason_out);
+/* Evaluate the response once and populate every cacheability decision field.
+ * cacheable_reason names the first response-policy veto, or _NONE when none
+ * fired; callers must provide out. */
 void ngx_http_cache_turbo_response_policy(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf,
     ngx_http_cache_turbo_response_policy_t *out);
-ngx_int_t ngx_http_cache_turbo_response_must_revalidate(ngx_http_request_t *r);
-ngx_int_t ngx_http_cache_turbo_response_auth_shareable(ngx_http_request_t *r);
-time_t ngx_http_cache_turbo_response_sie(ngx_http_request_t *r);
-time_t ngx_http_cache_turbo_response_swr(ngx_http_request_t *r);
 ngx_int_t ngx_http_cache_turbo_sie_rewrite(ngx_http_request_t *r,
     ngx_http_cache_turbo_ctx_t *ctx);
 ngx_int_t ngx_http_cache_turbo_sie_snap_body_len(ngx_http_cache_turbo_ctx_t *ctx,

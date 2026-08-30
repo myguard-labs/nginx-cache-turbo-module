@@ -87,8 +87,8 @@ typedef struct {
 
     /* S231: mirrors ngx_http_cache_turbo_redis_op_t.unconnected in the redis
      * driver -- see that field's comment for the full rationale. 1 from a
-     * fresh (non-reused) connect() until the first byte is actually written;
-     * a write-path failure while still 1 is the connect failure itself. */
+     * fresh (non-reused) connect() until the first reply byte proves the peer
+     * or a terminal no-reply path consumes the classification. */
     unsigned                          unconnected:1;
 } ngx_http_cache_turbo_mc_op_t;
 
@@ -482,6 +482,25 @@ ngx_http_cache_turbo_mc_backoff_clear(ngx_addr_t *addr)
 }
 
 
+/* Consume a fresh connection's terminal no-reply classification exactly once.
+ * Several write paths dispatch through mc_op_fail() into an op-specific finish
+ * helper; clearing the flag here makes that composition idempotent while direct
+ * read-side finishes still own their own classification. */
+static void
+ngx_http_cache_turbo_mc_backoff_fail(ngx_http_cache_turbo_mc_op_t *op)
+{
+    if (!op->unconnected) {
+        return;
+    }
+
+    op->unconnected = 0;
+    if (op->clcf != NULL) {
+        ngx_http_cache_turbo_mc_backoff_arm(&op->clcf->redis_addr,
+            op->clcf->redis_connect_backoff);
+    }
+}
+
+
 /* Open a connection for op and arm the shared write handler. Returns NGX_OK on
  * success (op now owns the connection), NGX_ERROR if it could not start (caller
  * still owns op->pool and must destroy it). */
@@ -562,8 +581,7 @@ ngx_http_cache_turbo_mc_connect(ngx_http_cache_turbo_mc_op_t *op,
 
     /* Same "not actually connected yet" reasoning as the redis driver: rc
      * OK/AGAIN only means connect() started without a SYNCHRONOUS error.
-     * Backoff is cleared only once the write handler confirms a byte
-     * actually left the socket. */
+     * Backoff is cleared only once a genuine reply byte proves the peer. */
     c = op->peer.connection;
     c->data = op;
     op->unconnected = 1;
@@ -831,16 +849,12 @@ ngx_http_cache_turbo_mc_write(ngx_event_t *wev)
     c = wev->data;
     op = c->data;
 
-    /* S231: see the identical comment in the redis driver's write handler --
-     * a write-path failure before any byte of a FRESH connection went out is
-     * the connect failure itself, surfacing asynchronously. */
+    /* S231: see the identical contract in the Redis write handler. A fresh
+     * connection stays unproven until a reply byte arrives, so every terminal
+     * write failure consumes its no-reply classification exactly once. */
     if (wev->timedout) {
         ngx_log_error(NGX_LOG_INFO, c->log, NGX_ETIMEDOUT,
                       "cache_turbo: memcached write timed out");
-        if (op->unconnected && op->clcf != NULL) {
-            ngx_http_cache_turbo_mc_backoff_arm(&op->clcf->redis_addr,
-                op->clcf->redis_connect_backoff);
-        }
         ngx_http_cache_turbo_mc_op_fail(op);
         return;
     }
@@ -857,10 +871,6 @@ ngx_http_cache_turbo_mc_write(ngx_event_t *wev)
             return;
         }
         if (n == NGX_ERROR || n == 0) {
-            if (op->unconnected && op->clcf != NULL) {
-                ngx_http_cache_turbo_mc_backoff_arm(&op->clcf->redis_addr,
-                    op->clcf->redis_connect_backoff);
-            }
             ngx_http_cache_turbo_mc_op_fail(op);
             return;
         }
@@ -910,13 +920,9 @@ ngx_http_cache_turbo_mc_read_drain(ngx_event_t *rev)
     if (rev->timedout) {
         ngx_log_error(NGX_LOG_INFO, c->log, NGX_ETIMEDOUT,
                       "cache_turbo: memcached read timed out");
-        /* S231: fire-and-forget SET/DELETE bypasses mc_op_fail() (no parked
-         * request to resume), so repeat the same "still unconnected" arm
-         * here directly. */
-        if (op->unconnected && op->clcf != NULL) {
-            ngx_http_cache_turbo_mc_backoff_arm(&op->clcf->redis_addr,
-                op->clcf->redis_connect_backoff);
-        }
+        /* Fire-and-forget SET/DELETE bypasses mc_op_fail(); consume the
+         * no-reply classification here before teardown. */
+        ngx_http_cache_turbo_mc_backoff_fail(op);
         ngx_http_cache_turbo_mc_op_done(op);   /* clean stays 0: not pooled */
         return;
     }
@@ -934,16 +940,14 @@ ngx_http_cache_turbo_mc_read_drain(ngx_event_t *rev)
 
         if (n == NGX_AGAIN) {
             if (ngx_handle_read_event(rev, 0) != NGX_OK) {
+                ngx_http_cache_turbo_mc_backoff_fail(op);
                 ngx_http_cache_turbo_mc_op_done(op);
             }
             return;
         }
         if (n == NGX_ERROR || n == 0) {
             /* Peer closed/errored before the ack framed: don't pool. */
-            if (op->unconnected && op->clcf != NULL) {
-                ngx_http_cache_turbo_mc_backoff_arm(&op->clcf->redis_addr,
-                    op->clcf->redis_connect_backoff);
-            }
+            ngx_http_cache_turbo_mc_backoff_fail(op);
             ngx_http_cache_turbo_mc_op_done(op);
             return;
         }
@@ -1276,15 +1280,10 @@ ngx_http_cache_turbo_mc_get_finish(ngx_http_cache_turbo_mc_op_t *op,
     ngx_http_cache_turbo_ctx_t  *ctx = op->ctx;
     u_char                      *copy;
 
-    /* S231: the read handler calls this directly on a read timeout/error,
-     * bypassing mc_op_fail() -- repeat the same "still unconnected" arm
-     * here. Arming twice (once via mc_op_fail on a write failure, once here
-     * on a read failure) for the SAME op is impossible: a given op fails on
-     * exactly one path. Harmless even if it were -- arming just resets the
-     * same deadline. */
-    if (result == NGX_ERROR && op->unconnected && op->clcf != NULL) {
-        ngx_http_cache_turbo_mc_backoff_arm(&op->clcf->redis_addr,
-            op->clcf->redis_connect_backoff);
+    /* Read handlers call this directly; write failures arrive through
+     * mc_op_fail(), whose consume makes this second call a no-op. */
+    if (result == NGX_ERROR) {
+        ngx_http_cache_turbo_mc_backoff_fail(op);
     }
 
     if (result == NGX_OK && blob_len > 0) {
@@ -1333,10 +1332,7 @@ ngx_http_cache_turbo_mc_get_finish(ngx_http_cache_turbo_mc_op_t *op,
 static void
 ngx_http_cache_turbo_mc_op_fail(ngx_http_cache_turbo_mc_op_t *op)
 {
-    if (op->unconnected && op->clcf != NULL) {
-        ngx_http_cache_turbo_mc_backoff_arm(&op->clcf->redis_addr,
-            op->clcf->redis_connect_backoff);
-    }
+    ngx_http_cache_turbo_mc_backoff_fail(op);
 
     if (op->request) {
         /* Terminal transport failure: not an answer about the key, so NGX_ERROR

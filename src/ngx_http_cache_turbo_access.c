@@ -150,24 +150,24 @@ ngx_http_cache_turbo_access_eligible(ngx_http_request_t *r,
     }
 
     /* RFC 9111 shared-cache safety: do not reuse a public representation for a
-     * request carrying credentials. response_cacheable() already prevents the
+     * request carrying credentials. response_policy() already prevents the
      * resulting response from being stored; this is the matching lookup gate.
      *
      * P0-1: this early return means ctx is NEVER allocated for an
      * Authorization request (see access_prologue() below), so the header
-     * filter bails on `ctx == NULL` before response_cacheable()'s own
+     * filter bails on `ctx == NULL` before response_policy()'s own
      * AUTHORIZATION reason can ever fire on the ordinary capture path --
      * that arm only protects an unusual caller that reaches
-     * response_cacheable() with a ctx already in hand (a warm subrequest,
+     * response_policy() with a ctx already in hand (a warm subrequest,
      * say). This IS the reachable site for the request-side refusal, so the
      * counter is bumped HERE, not in the header filter.
      *
      * P3-4: cache_turbo_serve_authorized (off by default) lifts THIS gate
      * only -- the credentialed request proceeds to the lookup and may be
      * served an existing entry. It does NOT touch the store floor: the
-     * Authorization arm of response_cacheable() is that function's first
+     * Authorization arm of response_policy() is that function's first
      * test, ungated by any directive, and ctx->captured (the sole gate on the
-     * body filter's store) is only set when response_cacheable() returns
+     * body filter's store) is only set when response_policy() returns
      * true. So every blob that exists was written by a request carrying NO
      * credentials, and relaxing the read side cannot expose one principal's
      * response to another -- no such response is ever stored.
@@ -180,7 +180,7 @@ ngx_http_cache_turbo_access_eligible(ngx_http_request_t *r,
      *
      * With the directive ON, ctx now IS allocated for an Authorization
      * request, so the header filter no longer bails on ctx == NULL and
-     * response_cacheable()'s AUTHORIZATION arm becomes the reachable
+     * response_policy()'s AUTHORIZATION arm becomes the reachable
      * refusal site for the STORE -- which is exactly why the counter bump
      * stays behind the !serve_authorized guard here: filters.c's
      * capture_count_refusal() attributes it instead, and counting it in both

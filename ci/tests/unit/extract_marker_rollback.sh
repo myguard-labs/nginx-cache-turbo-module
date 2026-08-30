@@ -6,16 +6,25 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SHM_SRC="$DIR/../../../src/ngx_http_cache_turbo_shm.c"
 FILTER_SRC="$DIR/../../../src/ngx_http_cache_turbo_filters.c"
 OUT="$DIR/generated_marker_rollback.inc"
+SHM_SRC_CANON="$(realpath "$SHM_SRC")"
+FILTER_SRC_CANON="$(realpath "$FILTER_SRC")"
 
 extract_function() {
 	file="$1"
 	type="$2"
 	name="$3"
 
-	awk -v type="$type" -v name="$name" '
-        $0 == type { pending = 1; buf = $0 ORS; next }
+	source_name="$4"
+
+	awk -v source_name="$source_name" -v type="$type" -v name="$name" '
+        $0 == type { pending = 1; start = NR; buf = $0 ORS; next }
         pending && $0 ~ "^" name "\\(" {
-            capture = 1; pending = 0; printf "%s", buf; print; next
+            capture = 1
+            pending = 0
+            printf "#line %d \"%s\"\n", start, source_name
+            printf "%s", buf
+            print
+            next
         }
         pending { pending = 0; buf = "" }
         capture {
@@ -26,10 +35,10 @@ extract_function() {
 }
 
 extract_function "$SHM_SRC" 'ngx_int_t' \
-	'ngx_http_cache_turbo_shm_purge_if_blob' >"$OUT"
+	'ngx_http_cache_turbo_shm_purge_if_blob' "$SHM_SRC_CANON" >"$OUT"
 printf '\n' >>"$OUT"
 extract_function "$FILTER_SRC" 'static void' \
-	'ngx_http_cache_turbo_body_filter_rollback_store' >>"$OUT"
+	'ngx_http_cache_turbo_body_filter_rollback_store' "$FILTER_SRC_CANON" >>"$OUT"
 
 for symbol in \
 	ngx_http_cache_turbo_shm_purge_if_blob \
@@ -77,7 +86,8 @@ fi
 for store_name in \
 	ngx_http_cache_turbo_shm_store \
 	ngx_http_cache_turbo_shm_store_if; do
-	store_body=$(extract_function "$SHM_SRC" 'ngx_int_t' "$store_name")
+	store_body=$(extract_function "$SHM_SRC" 'ngx_int_t' "$store_name" \
+		"$SHM_SRC_CANON")
 	if ! grep -qF 'ngx_http_cache_turbo_blob_acquire(written->data);' \
 		<<<"$store_body" \
 		|| ! grep -qF '*stored_data = written->data;' <<<"$store_body"; then
