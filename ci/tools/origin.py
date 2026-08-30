@@ -1043,7 +1043,7 @@ class Origin:
                                      "max-age=4, must-revalidate")
                 if "proxyrev" in self.path:
                     # RFC 9111 proxy-revalidate: the shared-cache synonym of
-                    # must-revalidate. Same window collapse (response_must_revalidate
+                    # must-revalidate. Same window collapse (response_policy()
                     # OR-arm) and same TEST-MICROTTL-ORACLE widening as "mustrev"
                     # above (proxyrev has no /ccignmr/-style second consumer, so
                     # no path scoping is needed here).

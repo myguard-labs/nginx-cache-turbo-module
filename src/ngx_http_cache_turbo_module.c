@@ -88,8 +88,8 @@ static void *ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf);
  * _bypass_stale_uri/_key_cookie_conf, moved to ngx_http_cache_turbo_conf.c
  * (MAINT-SPLIT step H). All are non-static now: ngx_http_cache_turbo_commands[]
  * below still references them as function pointers, so they are declared in
- * ngx_http_cache_turbo_internal.h. ngx_http_cache_turbo_require_hdr_ok was
- * already non-static (called from filters.c) and moved with the group. */
+ * ngx_http_cache_turbo_internal.h. The response-policy boundary was moved
+ * with the group and remains shared with filters.c. */
 /* ngx_http_cache_turbo_admin_handler now lives in admin.c; declared in
  * ngx_http_cache_turbo_module.h (non-static, core->handler assigns it below). */
 /* ngx_http_cache_turbo_warm_one declared non-static in

@@ -150,7 +150,7 @@ Magento's own VCL refuses this explicitly, in `vcl_backend_response`:
 backend response sets one.
 
 cache-turbo gets the identical refusal for free, with no magento-specific code:
-`ngx_http_cache_turbo_response_cacheable()` has an **unconditional** floor that
+`ngx_http_cache_turbo_response_policy()` has an **unconditional** floor that
 never stores any response carrying `Set-Cookie` — and the response that
 establishes a new vary segment necessarily carries one. This preset **depends**
 on that floor; there is nothing else guarding the transition.

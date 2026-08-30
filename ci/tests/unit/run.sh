@@ -330,6 +330,11 @@ if [ -f "$NGINX_OBJS/ngx_auto_config.h" ]; then
         NGINX_OBJS="$NGINX_OBJS" \
         bash "$DIR/check_purge_zero_skew_control.sh"
 
+    echo "--- hash diagnostic constructor mutation controls ---"
+    NGINX_VERSION="$NGINX_VERSION" NGINX_SRC="$NGINX_SRC" \
+        NGINX_OBJS="$NGINX_OBJS" \
+        bash "$DIR/check_hash_diagnostic_controls.sh"
+
     # --- c-1: varidx drop/reissue accounting is production-reachable -------
     # The PURGE reply's "complete":false honesty field depends on
     # z->sh->varidx_drops/varidx_reissues actually moving OUTSIDE a

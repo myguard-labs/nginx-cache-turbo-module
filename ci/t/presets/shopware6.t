@@ -304,7 +304,7 @@ Cookie: sw-cache-hash=b1946ac92492d2347c6235b4d2611184
 # this.
 #
 # This module inherits the refusal from the UNCONDITIONAL Set-Cookie floor in
-# ngx_http_cache_turbo_response_cacheable(): ANY Set-Cookie response is never
+# ngx_http_cache_turbo_response_policy(): ANY Set-Cookie response is never
 # stored, shopware6-specific or not. This test therefore pins the BEHAVIOUR
 # the preset's key-cookie leg depends on, not a shopware6-only code path -- if
 # the floor is ever made optional, this is the assertion that must fail first.

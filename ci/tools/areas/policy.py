@@ -302,7 +302,7 @@ def test_serve_authorized_never_stores_under_credentials(
 
     This pins the guarantee the whole relaxation rests on: serve_authorized
     lifts only the LOOKUP gate in access_eligible(). The STORE floor
-    (response_cacheable()'s Authorization arm) is the function's first test,
+    (response_policy()'s Authorization arm) is the function's first test,
     ungated by any directive, and ctx->captured -- the sole trigger for the
     body filter's store -- is only set when it returns true.
 
@@ -1074,7 +1074,7 @@ def test_must_revalidate(ng: Nginx) -> None:
 def test_proxy_revalidate(ng: Nginx) -> None:
     """RFC 9111: proxy-revalidate is the shared-cache synonym of must-revalidate
     and MUST collapse the stale window identically. Exercises the OR-arm of
-    response_must_revalidate (module.c:1142) that must-revalidate alone leaves
+    response_policy() (the must-revalidate arm) that must-revalidate alone leaves
     uncovered. Same /mrev/ location, "proxyrev" origin arm emits
     "max-age=4, proxy-revalidate" (widened from 1s; see test_must_revalidate's
     TEST-MICROTTL-ORACLE note for why the immediate HIT check needs the extra
@@ -1497,9 +1497,9 @@ def test_refuse_authorization_counter(ng: Nginx, origin: Origin) -> None:
     """P0-1: cache_turbo_refuse_authorization_total rises once per request
     that carried Authorization -- same fixture as test_no_cache_authorization.
     Bumped in access_eligible()'s LOOKUP-side gate (access.c), not the header
-    filter's response_cacheable() call: an Authorization request never
+    filter's response_policy() call: an Authorization request never
     allocates ctx (access_eligible() declines before ctx exists), so the
-    header filter bails on ctx==NULL before response_cacheable()'s own
+    header filter bails on ctx==NULL before response_policy()'s own
     AUTHORIZATION reason could ever fire on this path."""
     r0 = _admin_stat(ng, "refuse_authorization")
     fetch(ng.port, "/c/authreq-ctr", headers={"Authorization": "Bearer x"})

@@ -24,7 +24,8 @@
 #
 # Functions deliberately NOT sliced (they pull in response serialisation and
 # the config surface, none of which this harness is about): _init_zone, _store,
-# _stats and _purge_key.  The blob-ref helpers, _drop_locked and _purge_all are
+# _stats and _purge_key. store_locked is sliced solely for its new-node
+# diagnostic constructor; the blob-ref helpers, _drop_locked and _purge_all are
 # sliced because their ownership and bounded-concurrency contracts are tested.
 
 set -euo pipefail
@@ -348,7 +349,7 @@ awk -v source_name="$SRC_CANON" '
     /^static ngx_inline (uint32_t|uint64_t|ngx_uint_t|void)$/ {
         pending = 1; start = NR; buf = $0 ORS; next
     }
-    pending && /^ngx_http_cache_turbo_(shm_(key64|sketch_bump|sketch_estimate|admit|lookup|evict_one|alloc_evict|free_locked|drop_locked|purge_all|claim_locked|claim|resolve_miss|unstub|owns|count_miss_locked|count_miss|l2_neg_check|l2_neg_set|touch_lru|brk_probe_age|breaker_state|breaker_record|breaker_state_str|get_u32|get_u64|node_sie_live)|lru_(link_head|unlink|insert_new|enforce_cap)|sketch_(row_hash|rows|get|inc|halve)|blob_(alloc|node_release|acquire|release))\(/ {
+    pending && /^ngx_http_cache_turbo_(shm_(key64|sketch_bump|sketch_estimate|admit|lookup|evict_one|alloc_evict|free_locked|drop_locked|purge_all|store_locked|claim_locked|claim|resolve_miss|unstub|owns|count_miss_locked|count_miss|l2_neg_check|l2_neg_set|touch_lru|brk_probe_age|breaker_state|breaker_record|breaker_state_str|get_u32|get_u64|node_sie_live)|lru_(link_head|unlink|insert_new|enforce_cap)|sketch_(row_hash|rows|get|inc|halve)|blob_(alloc|node_release|acquire|release))\(/ {
         capture = 1
         pending = 0
         printf "#line %d \"%s\"\n", start, source_name
@@ -394,6 +395,27 @@ if [ "${CTRL_PURGE_SKIP_ZERO_CHECK:-0}" = 1 ]; then
         exit 1
     fi
     sed -i 's/^    if (remaining == 0$/    if (0 \&\& remaining == 0/' "$OUT"
+fi
+
+# PERF-AUD2-10 mutation seam.  Each constructor owns both the mismatch guard
+# and its diagnostic increment; mutating one owner must fail that owner's
+# runnable assertion, not merely a source-text identifier check.
+if [ -n "${CTRL_HASH_DIAG_MUTATION:-}" ]; then
+    owner="${CTRL_HASH_DIAG_MUTATION%%:*}"
+    kind="${CTRL_HASH_DIAG_MUTATION#*:}"
+    case "$owner" in
+        ngx_http_cache_turbo_shm_store_locked|ngx_http_cache_turbo_shm_claim_locked|\
+        ngx_http_cache_turbo_shm_count_miss_locked|ngx_http_cache_turbo_shm_l2_neg_set) ;;
+        *) echo "✗ unknown hash diagnostic owner: $owner" >&2; exit 1 ;;
+    esac
+    case "$kind" in guard|increment) ;; *)
+        echo "✗ unknown hash diagnostic mutation: $kind" >&2; exit 1 ;;
+    esac
+    if [ "$kind" = guard ]; then
+        sed -i "/^${owner}(/,/^}/s/if (ngx_crc32_short(key_hash, 32) != hash)/if (0)/" "$OUT"
+    else
+        sed -i "/^${owner}(/,/^}/s/, 1);/, 0);/" "$OUT"
+    fi
 fi
 
 # --- P6/O4.2: the breaker's origin-failure predicate lives in module.c, not
@@ -589,6 +611,7 @@ for fn in \
     'ngx_http_cache_turbo_shm_free_locked(' \
     'ngx_http_cache_turbo_shm_drop_locked(' \
     'ngx_http_cache_turbo_shm_purge_all(' \
+    'ngx_http_cache_turbo_shm_store_locked(' \
     'ngx_http_cache_turbo_shm_claim_locked(' \
     'ngx_http_cache_turbo_shm_claim(' \
     'ngx_http_cache_turbo_shm_resolve_miss(' \
@@ -609,6 +632,19 @@ do
     if ! grep -qF "$fn" "$OUT"; then
         echo "✗ failed to extract $fn from $SRC" >&2
         echo "  (source layout changed? update extract_shm.sh)" >&2
+        rm -f "$OUT"
+        exit 1
+    fi
+done
+
+# PERF-AUD2-10: store_locked() is in this slice for its new-entry constructor;
+# keep this source-level owner check as a fast failure that names every owner.
+for fn in ngx_http_cache_turbo_shm_store_locked ngx_http_cache_turbo_shm_claim_locked \
+          ngx_http_cache_turbo_shm_count_miss_locked ngx_http_cache_turbo_shm_l2_neg_set
+do
+    body="$(sed -n "/^${fn}(/,/^}/p" "$SRC")"
+    if ! printf '%s\n' "$body" | grep -q 'test_hash_crc32_mismatch'; then
+        echo "✗ PERF-AUD2-10: $fn lost its hash mismatch diagnostic" >&2
         rm -f "$OUT"
         exit 1
     fi
@@ -709,10 +745,9 @@ fi
 # a policy that can burn victims for a candidate it then rejects, and a caller
 # that retried would drive evict_one() repeatedly on the same decision.
 #
-# store_locked() is deliberately NOT sliced (it pulls in the blob refcount
-# layer), so this is checked against the SOURCE, scoped to that one function.
-# Comments stripped first, exactly as above: the prose beside the call names
-# both alloc_evict and shm_admit.
+# This remains a source-order check because it pins the relative placement of
+# two calls, while the sliced runtime tests exercise the resulting behaviour.
+# Comments are stripped first: the prose beside the calls names both functions.
 admit_order=$(sed -n '/^ngx_http_cache_turbo_shm_store_locked(/,/^}/p' "$SRC" \
    | sed -E 's;/\*.*;;; s;^[[:space:]]*\*.*;;' \
    | grep -nE 'ngx_http_cache_turbo_shm_admit\(|ngx_http_cache_turbo_shm_alloc_evict\(' \

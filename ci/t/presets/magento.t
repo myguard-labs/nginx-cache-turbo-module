@@ -329,7 +329,7 @@ Cookie: X-Magento-Vary=9f2a4c1e8b7d6f5a4c3b2a1908070605
 # (beresp.uncacheable).
 #
 # This module inherits the refusal from the UNCONDITIONAL Set-Cookie floor in
-# ngx_http_cache_turbo_response_cacheable(): ANY Set-Cookie response is never
+# ngx_http_cache_turbo_response_policy(): ANY Set-Cookie response is never
 # stored, magento-specific or not. This test therefore pins the BEHAVIOUR the
 # preset's key-cookie leg depends on, not a magento-only code path -- if the
 # floor is ever made optional, this is the assertion that must fail first.
