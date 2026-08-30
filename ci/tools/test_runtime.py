@@ -300,6 +300,9 @@ def run_all(ng: Nginx, origin: Origin,
     test_warm_url_file_no_trailing_newline(ng, origin)
     test_warm_url_file_bound_enforced(ng, origin)
     test_warm_url_file_missing(ng)
+    test_warm_url_file_fifo_does_not_block_worker(ng)
+    if ng.fault_injection:
+        test_warm_url_file_io_stages_run_off_event_loop(ng)
     test_warm_url_file_empty(ng, origin)
     test_warm_url_file_oversize_rejected(ng)
     test_warm_url_file_overlong_line_rejected(ng)

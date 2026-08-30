@@ -36,6 +36,9 @@ extract_function() {
 	extract_function "$ADMIN_SRC" 'static ngx_int_t' \
 		'ngx_http_cache_turbo_warm_file_prereq_error'
 	printf '\n'
+	extract_function "$ADMIN_SRC" 'static ngx_int_t' \
+		'ngx_http_cache_turbo_warm_file_schedule_error'
+	printf '\n'
 	for fn in \
 		ngx_http_cache_turbo_mc_backoff_fail \
 		ngx_http_cache_turbo_mc_write \
@@ -61,6 +64,7 @@ extract_function() {
 
 for symbol in \
 	ngx_http_cache_turbo_warm_file_prereq_error \
+	ngx_http_cache_turbo_warm_file_schedule_error \
 	ngx_http_cache_turbo_mc_backoff_fail \
 	ngx_http_cache_turbo_mc_write \
 	ngx_http_cache_turbo_mc_read_drain \
@@ -130,7 +134,7 @@ mutate_function_block_exact() {
 }
 
 if [ "${CTRL_ERROR_HELPERS_WARM_STATUS:-0}" = 1 ]; then
-	mutate_exact \
+	mutate_function_exact ngx_http_cache_turbo_warm_file_prereq_error \
 		'ngx_http_cache_turbo_send_json(r, NGX_HTTP_INTERNAL_SERVER_ERROR,' \
 		'ngx_http_cache_turbo_send_json(r, NGX_HTTP_OK,' 'warm status'
 fi
