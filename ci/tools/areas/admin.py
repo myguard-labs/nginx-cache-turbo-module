@@ -1750,16 +1750,18 @@ def test_warm_url_file_io_stages_run_off_event_loop(ng: Nginx) -> None:
     before open, fstat and read independently.  Each admin request must remain
     pending for the injected delay while an unrelated request is served.  The
     focused negative control runs this fixture with ``--single-process``: an
-    inline syscall then delays that second request by the full 1.5 seconds."""
+    inline syscall then delays that second request by the full five seconds."""
     (ng.root / "warm-lists").mkdir(exist_ok=True)
 
     for stage in ("open", "fstat", "read"):
         list_path = ng.root / "warm-lists" / f"warm-list.delay-{stage}"
         list_path.write_bytes(b"")
+        completion_timeout = 10.0 * sanitizer_time_scale()
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
             delayed = pool.submit(
-                fetch, ng.port, f"/_cache_wc?url_file={list_path}", None, "POST")
+                fetch, ng.port, f"/_cache_wc?url_file={list_path}",
+                method="POST", timeout=completion_timeout)
             time.sleep(0.2)
             assert not delayed.done(), \
                 f"TEST_FAULTS {stage} delay was not reached"
@@ -1773,8 +1775,7 @@ def test_warm_url_file_io_stages_run_off_event_loop(ng: Nginx) -> None:
                 f"delayed {stage} completed before the control request"
             assert elapsed < 1.0 * sanitizer_time_scale(), \
                 f"delayed {stage} blocked nginx's event loop for {elapsed:.2f}s"
-            s, b, _ = delayed.result(
-                timeout=7.0 * sanitizer_time_scale())
+            s, b, _ = delayed.result(timeout=completion_timeout)
 
         assert s == 200, f"delayed {stage} url_file returned {s}: {b!r}"
         assert json.loads(b)["warmed"] == 0, \
