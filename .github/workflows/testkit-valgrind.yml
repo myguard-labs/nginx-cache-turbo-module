@@ -1,4 +1,4 @@
-# sync-sha: 9cfbcb027d4f1eaa20854704b3adc7266a0489fde35af1eb6244567884a302c1
+# sync-sha: 73e9c49003ff6434fc0ce4c9b8be3f3165bac3763804dd2ec6519a76abdf750d
 name: Testkit Valgrind
 
 # Weekly memcheck soak of the testkit prober scenarios -- S21.
@@ -204,18 +204,18 @@ jobs:
         env:
           TESTKIT_ROOT: ${{ github.workspace }}/.testkit
         run: |
+          source ci/tools/testkit-scenarios.sh
           ci/tools/testkit-run.sh --valgrind --version "$NGINX_VERSION" \
-            -- consumer-cache-turbo shm-coherence-varidx fault-slab-store \
-               alloc-per-request fd-starve multi-worker
+            -- "${TESTKIT_SCENARIOS_VALGRIND[@]}"
 
       - name: Scenarios SKIP cleanly on an unstaged tree, under the same flags
         env:
           TESTKIT_ROOT: ${{ github.workspace }}/.testkit
         run: |
+          source ci/tools/testkit-scenarios.sh
           ci/tools/testkit-run.sh --valgrind --expect-skip \
             --version "${NGINX_STABLE:-1.30.4}" \
-            -- consumer-cache-turbo fault-slab-store \
-               alloc-per-request fd-starve multi-worker
+            -- "${TESTKIT_SCENARIOS_ALL[@]}"
 
       - name: Notify Discord on failure
         if: failure() && github.event_name == 'schedule'

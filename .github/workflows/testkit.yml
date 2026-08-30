@@ -1,4 +1,4 @@
-# sync-sha: 6a07741fbd436e27b61ca9459e6918687a81e147527065fbbc58b2f7db6af6c9
+# sync-sha: ec86c96a4a878580e64aba8e4998eb87e22ea37e0b57fafead0ba81ca5265c1a
 name: Testkit
 
 # The nginx-module-testkit prober leg.
@@ -248,9 +248,9 @@ jobs:
           # are in ci-deep.yml instead. Non-vacuity for each was proven by a
           # planted mutation (see the scenario's own header comment) observed
           # red, then reverted to green.
+          source ci/tools/testkit-scenarios.sh
           ci/tools/testkit-run.sh --version "$NGINX_VERSION" \
-            -- consumer-cache-turbo shm-coherence-varidx fault-slab-store \
-               redis-connect-backoff alloc-per-request fd-starve multi-worker
+            -- "${TESTKIT_SCENARIOS_PLAIN[@]}"
 
       - name: Scenario SKIPs cleanly on an unstaged tree
         if: ${{ !inputs.skip-expensive-jobs }}
@@ -270,6 +270,6 @@ jobs:
           # refuses a non-harness .so, and a gate nothing exercises is how a
           # scenario silently degrades to permanent-SKIP in the direction
           # that reads green.
+          source ci/tools/testkit-scenarios.sh
           ci/tools/testkit-run.sh --expect-skip --version "${NGINX_STABLE:-1.30.4}" \
-            -- consumer-cache-turbo fault-slab-store redis-connect-backoff \
-               alloc-per-request fd-starve multi-worker
+            -- "${TESTKIT_SCENARIOS_ALL[@]}"

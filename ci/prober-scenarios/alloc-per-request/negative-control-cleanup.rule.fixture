@@ -1,0 +1,6 @@
+name    negative control: a zero cleanup delta must not equal one
+send    GET /cached/item HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+expect  header~X-Cache: HIT
+delta   pool.cycle_cleanup == 1

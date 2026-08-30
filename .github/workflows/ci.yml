@@ -1,4 +1,4 @@
-# sync-sha: c82648b9c2f107e04ec7ed44e3fd3f8ec068a1945f171db9317c04c2c64b5836
+# sync-sha: a4fdb21ae7486ac06250a80a8070dda6972985693efc4a9ee9367b92b78615e5
 name: CI
 
 # Single entry point for the PR suite. The checks below used to be independent
@@ -148,7 +148,7 @@ jobs:
           # the demotion. Keep in sync with what each job actually consumes.
           # ci/tools/areas/ holds the split-out runtime tests (MAINT-T1). It
           # MUST stay in this alternation: the suite used to be one file, and a
-          # filter naming only test_runtime.py would stop triggering ASan the
+          # filter naming only the former monolithic runtime driver would stop triggering ASan the
           # moment a test moved into an area module -- coverage lost silently,
           # on every later PR, with nothing red to notice.
           if printf '%s\n' "$changed" | grep -qE '^(src/|ci/tools/(ci-build\.sh|test_runtime\.py|areas/|ci-hang-guard\.sh|assert-fixtures\.sh)|\.github/actions/build-cache/|\.github/workflows/(asan|ci)\.yml)'; then
@@ -161,11 +161,13 @@ jobs:
           else
             echo "fuzz=false" >> "$GITHUB_OUTPUT"
           fi
-          # testkit: the prober leg reads src/ and its own two driver scripts.
-          # It does NOT depend on ci/tools/test_runtime.py or ci/tools/areas/ --
+          # testkit: the prober leg reads src/, its local scenarios and its
+          # driver/manifest scripts. Keep the matcher in one tested script so
+          # a scenario-only oracle change cannot silently skip this job.
+          # It does NOT depend on the runtime-suite driver or its area modules --
           # it drives testkit's scenario, not our runtime suite -- so this
           # alternation is deliberately narrower than asan's above.
-          if printf '%s\n' "$changed" | grep -qE '^(src/|ci/tools/testkit-(stage|run)\.sh|\.github/actions/build-cache/|\.github/workflows/(testkit|ci)\.yml)'; then
+          if ci/tools/testkit-impact-filter.sh <<<"$changed"; then
             echo "testkit=true" >> "$GITHUB_OUTPUT"
           else
             echo "testkit=false" >> "$GITHUB_OUTPUT"

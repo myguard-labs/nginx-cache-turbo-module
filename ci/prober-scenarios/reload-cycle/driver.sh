@@ -50,6 +50,11 @@ WORKERS=1
 
 FAILED=0
 
+# run-scenario.sh validates and normalizes this before invoking a driver. Keep
+# every harness deadline proportional to the same scale used by rules-mode so
+# valgrind/sanitizer runs do not retain one hidden native-speed timeout.
+TIMEOUT_SCALE="${PROBER_TIMEOUT_SCALE:-1}"
+
 echo "1..11"
 
 # --- helpers -----------------------------------------------------------
@@ -145,19 +150,21 @@ FDS_REF=; USED_REF=; BLOCKS_REF=; LARGE_REF=
 DRIFT=""
 
 for ((r = 1; r <= RELOADS; r++)); do
-    if prober_signal_wait HUP "$MASTER" "$HOST" "$PORT" 5000; then
+    if prober_signal_wait HUP "$MASTER" "$HOST" "$PORT" \
+        "$((5000 * TIMEOUT_SCALE))"; then
         ABSORBED=$((ABSORBED + 1))
     else
-        echo "# reload $r was not absorbed within 5 s (no new worker answered)"
+        echo "# reload $r was not absorbed within the scaled deadline (no new worker answered)"
         continue
     fi
 
     DRC=0
-    prober_drain_wait "$MASTER" "$WORKERS" 10000 || DRC=$?
+    prober_drain_wait "$MASTER" "$WORKERS" \
+        "$((10000 * TIMEOUT_SCALE))" || DRC=$?
     case "$DRC" in
         0) ;;
         2) DRAIN_OBSERVABLE=0 ;;
-        *) echo "# reload $r: the previous cycle's workers had not drained after 10 s"
+        *) echo "# reload $r: the previous cycle's workers missed the scaled drain deadline"
            DRAINED=0 ;;
     esac
 
@@ -320,9 +327,11 @@ else
 fi
 
 # --- post-reload coherence (prober, folded in as diagnostics) --------------
-# PIPESTATUS, not $?: a bare `./prober | sed` reports sed's status, which is
-# always 0, silently discarding a red prober leg.
-./prober -H "$HOST" -p "$PORT" "$PROBER_SCENARIO/post-reload.rule" | sed 's/^/# prober: /'
+# PIPESTATUS, not $?: the client pipeline would otherwise report sed's status,
+# silently discarding a red prober leg.
+"$PROBER_CLIENT" -H "$HOST" -p "$PORT" \
+    -t "$((8000 * TIMEOUT_SCALE))" \
+    "$PROBER_SCENARIO/post-reload.rule" | sed 's/^/# prober: /'
 STATUS=${PIPESTATUS[0]}
 
 if [ "$STATUS" -eq 0 ]; then

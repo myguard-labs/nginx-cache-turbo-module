@@ -1,4 +1,4 @@
-# sync-sha: 9b7ef19551d10e8fa0b7cee3506f06e6ebbbe9341bcb79cb9de04deca0707b90
+# sync-sha: ec611e7d86dea4d2c117bdc5cecaa6b28d2db7608cc0ddeb3622958f7d344e37
 name: CI Deep
 
 # Exhaustive dynamic analysis — monthly cron + on-demand only, NEVER on PR.
@@ -830,10 +830,10 @@ jobs:
           # @PROBE@ at cache_turbo_probe ACROSS a reload -- see its own
           # header comment for the RED-before/GREEN-after proof against
           # CTPROBE-STATIC-ZONE-NO-RELOAD.
+          source ci/tools/testkit-scenarios.sh
           ci/tools/testkit-run.sh --version "$NGINX_VERSION" --sanitizer \
             --port "$TEST_BASE_PORT" \
-            -- consumer-cache-turbo l2-cross-instance-fill \
-               shm-coherence-varidx rss-slope reload-mid-upload reload-cycle
+            -- "${TESTKIT_SCENARIOS_SANITIZED[@]}"
 
       - name: Notify Discord on failure
         if: failure() && github.event_name == 'schedule'
@@ -849,6 +849,84 @@ jobs:
             -H "Content-Type: application/json" \
             "https://discord.com/api/v10/channels/$DISCORD_CHANNEL_BUILDS/messages" \
             -d "{\"content\":\"🔴 $GH_REPO — CI Deep / testkit-sanitizer FAILED. $GH_SERVER_URL/$GH_REPO/actions/runs/$GH_RUN_ID\"}" || true
+
+  testkit-angie:
+    # The normal testkit gate exercises nginx. This scheduled compatibility
+    # witness proves the same dual-module stage and a real cache_turbo HIT
+    # scenario also work with the currently pinned Angie release.
+    name: Testkit prober (Angie, plain)
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
+    timeout-minutes: 45
+    env:
+      # Own 64-wide band, adjacent to but disjoint from testkit-valgrind.
+      TEST_BASE_PORT: 19648
+    steps:
+      - name: Checkout module
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - name: Check out nginx-module-testkit
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          repository: myguard-labs/nginx-module-testkit
+          ref: 27f724082e16f6d9bd8a2a0ee944ef9dd551ab7e
+          path: .testkit
+          persist-credentials: false
+
+      - name: Load version pins
+        run: bash .github/scripts/load-versions.sh
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential ccache curl eatmydata \
+            libpcre2-dev libssl-dev zlib1g-dev
+
+      - name: Restore build caches
+        uses: ./.github/actions/build-cache
+        with:
+          mode: testkit-angie
+          flavor: angie
+          nginx-version: ${{ env.ANGIE_VERSION }}
+
+      - name: Sweep stale test listeners
+        run: |
+          command -v fuser >/dev/null || sudo apt-get install -y psmisc
+          for p in $(seq "$TEST_BASE_PORT" $((TEST_BASE_PORT + 63))); do
+            fuser -k -TERM "${p}/tcp" 2>/dev/null || true
+          done
+          sleep 1
+
+      - name: Verify runtime port band
+        run: ci/tools/max-port.sh "$TEST_BASE_PORT"
+
+      - name: Stage cache-turbo + testkit ref probe for Angie
+        env:
+          TESTKIT_ROOT: ${{ github.workspace }}/.testkit
+        run: >-
+          ci/tools/testkit-stage.sh --flavor angie
+          --version "$ANGIE_VERSION"
+
+      - name: Report compiler-cache effectiveness
+        run: ccache --show-stats
+
+      - name: Representative scenario asserts on Angie
+        env:
+          TESTKIT_ROOT: ${{ github.workspace }}/.testkit
+        run: |
+          source ci/tools/testkit-scenarios.sh
+          ci/tools/testkit-run.sh --flavor angie --version "$ANGIE_VERSION" \
+            --port "$TEST_BASE_PORT" -- "${TESTKIT_SCENARIOS_ANGIE[@]}"
+
+      - name: Representative scenario SKIPs on an unstaged Angie tree
+        env:
+          TESTKIT_ROOT: ${{ github.workspace }}/.testkit
+        run: |
+          source ci/tools/testkit-scenarios.sh
+          ci/tools/testkit-run.sh --flavor angie --expect-skip \
+            --version "${ANGIE_VERSION}-unstaged" \
+            --port "$TEST_BASE_PORT" -- "${TESTKIT_SCENARIOS_ANGIE[@]}"
 
   scanbench:
     name: Zipf hit-ratio benchmark
@@ -1042,6 +1120,14 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Check out nginx-module-testkit
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          repository: myguard-labs/nginx-module-testkit
+          ref: 27f724082e16f6d9bd8a2a0ee944ef9dd551ab7e
+          path: .testkit
+          persist-credentials: false
+
       - name: Load version pins
         run: bash .github/scripts/load-versions.sh
 
@@ -1053,7 +1139,7 @@ jobs:
           # assertion). Without it the check has nothing to skip TO but a
           # silent pass -- so it is a required dependency, not optional.
           sudo apt-get install -y build-essential ccache curl dwarves eatmydata \
-            libpcre2-dev libssl-dev mold python3-venv redis-server memcached zlib1g-dev
+            libpcre2-dev libssl-dev mold python3-venv redis-server redis-tools memcached zlib1g-dev
           # Ubuntu's gcovr 6 parser rejects GCC 14's `10000-block` records.
           # Keep the report reproducible and new enough to read the compiler's
           # gcov output instead of relying on the runner image's apt version.
@@ -1090,6 +1176,7 @@ jobs:
         # read by coverage.sh itself (AUD-CIPORT1).
         env:
           TEST_NGINX_TIMEOUT: "30"
+          TESTKIT_ROOT: ${{ github.workspace }}/.testkit
         run: bash ci/tools/coverage.sh nginx "$NGINX_VERSION"
 
       - name: Coverage summary to job log
@@ -1110,6 +1197,22 @@ jobs:
               echo '### swr/autotune unit coverage'
               echo '```'
               tail -n 20 coverage-report/unit/coverage.txt
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ -f coverage-report/testkit/coverage.txt ]; then
+            {
+              echo '### Testkit scenario coverage'
+              echo '```'
+              tail -n 20 coverage-report/testkit/coverage.txt
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ -f coverage-report/combined/coverage.txt ]; then
+            {
+              echo '### Combined runtime + testkit coverage'
+              echo '```'
+              tail -n 20 coverage-report/combined/coverage.txt
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
           fi

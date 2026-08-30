@@ -1,0 +1,6 @@
+name    negative control: a zero slab delta must not satisfy a negative ceiling
+send    GET /cached/item HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+expect  header~X-Cache: HIT
+delta   zone.slab_reqs <= -1

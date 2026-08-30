@@ -24,6 +24,9 @@
 #                          uploads the HTML/summary; it does not fail on a number.
 #   REDIS_SERVER / MEMCACHED_SERVER - binary paths (default /usr/bin/...).
 #   COVERAGE_OUT         - output dir (default coverage-report under the module).
+#   TESTKIT_ROOT         - when set, also stage nginx-module-testkit coverage,
+#                          run the canonical scenario matrix, and publish
+#                          prober-only plus merged runtime+prober reports.
 #   TEST_BASE_PORT       - base port handed to test_runtime.py --port (default
 #                          18880, the suite's own default). CI sets this to a
 #                          band exclusive to the coverage job so it cannot
@@ -82,14 +85,9 @@ python3 "$MODULE_DIR/ci/tools/test_runtime.py" \
     --port "$TEST_BASE_PORT" \
     --fault-injection
 
-# 2b. pure-math unit tests. They cover the SWR/autotune boundary branches the
-# HTTP suite structurally cannot reach (TTL overflow clamp, forever-TTL, band
-# fallback, beta/load clamps, data-sufficiency floor, refresh-dice both ways).
-# The driver #includes swr.c + autotune.c verbatim, compiles as a single TU
-# under ci/tests/unit, and (COVERAGE=1) emits its own instrumented objects there —
-# so its arcs are NOT in the addon/src datafiles the main report scans below.
-# We therefore publish a SEPARATE unit report for those two sources (2c) so the
-# swr/autotune gains show up in the uploaded artifact, not just in the gate.
+# 2b. extracted production-slice unit tests cover boundary/error paths the HTTP
+# suite cannot drive deterministically. COVERAGE=1 emits their instrumented
+# objects under ci/tests/unit, separate from the booted-nginx object tree.
 UNIT_DIR="$MODULE_DIR/ci/tests/unit"
 # Fresh unit counters: drop any .gcda from a previous run so the unit report
 # reflects THIS run only.
@@ -103,7 +101,8 @@ COVERAGE=1 bash "$UNIT_DIR/run.sh"
 # core sources because they live under the unpacked nginx tree, not our root
 # ("Cannot open source file src/core/ngx_palloc.c"). We only care about the
 # module's six objects under addon/src, so:
-#   --object-directory addon/src      restricts the object scan to those,
+#   addon/src as a positional path    restricts the object scan to those,
+#   --object-directory addon/src      resolves their notes/data files,
 #       spelled the portable way ON PURPOSE: the --gcov-object-directory alias
 #       only exists on gcovr >= 7.0, and ci-deep.yml installs gcovr unpinned
 #       from apt. On an older runner the long spelling is an unknown flag and
@@ -117,16 +116,20 @@ COVERAGE=1 bash "$UNIT_DIR/run.sh"
 #       resolve fine against $MODULE_DIR/src).
 mkdir -p "$OUT"
 GCOVR_ARGS=(
+    "$ADDON"
     --root "$MODULE_DIR"
     --filter "$MODULE_DIR/src/"
     --object-directory "$ADDON"
     --gcov-ignore-errors=all
+    --merge-mode-functions=merge-use-line-min
     --branches
     --decisions
     --print-summary
     --html-details "$OUT/index.html"
     --xml "$OUT/coverage.xml"
     --txt "$OUT/coverage.txt"
+    --json-pretty
+    --json "$OUT/coverage.json"
 )
 if [ -n "${COVERAGE_FAIL_UNDER:-}" ]; then
     GCOVR_ARGS+=(--fail-under-line "$COVERAGE_FAIL_UNDER")
@@ -135,25 +138,100 @@ fi
 gcovr "${GCOVR_ARGS[@]}"
 echo "coverage: suite report written to $OUT (index.html, coverage.xml, coverage.txt)"
 
-# 2c. unit-test report for the swr/autotune math. The unit driver's .gcda live
-# under ci/tests/unit (single-TU #include build), covering the boundary branches
-# the HTTP suite cannot reach. Publish it as a separate report under $OUT/unit
-# so the artifact carries the full swr/autotune numbers, not only the gate pass.
-# Filter to just those two sources; the datafile also holds test_math.c arcs we
-# do not report on. gcov-ignore-errors=all for the same header-resolution reason
-# as the suite report above.
+# 2c. extracted-unit report. The positional search path is intentional:
+# --object-directory helps gcov resolve files but does not restrict its scan.
+# Filtering to src/ excludes the test drivers and shims.
 UNIT_OUT="$OUT/unit"
 mkdir -p "$UNIT_OUT"
 gcovr \
+    "$UNIT_DIR" \
     --root "$MODULE_DIR" \
-    --filter "$MODULE_DIR/src/ngx_http_cache_turbo_swr.c" \
-    --filter "$MODULE_DIR/src/ngx_http_cache_turbo_autotune.c" \
+    --filter "$MODULE_DIR/src/" \
     --object-directory "$UNIT_DIR" \
     --gcov-ignore-errors=all \
+    --merge-mode-functions=merge-use-line-min \
     --branches \
     --decisions \
     --print-summary \
     --html-details "$UNIT_OUT/index.html" \
     --xml "$UNIT_OUT/coverage.xml" \
-    --txt "$UNIT_OUT/coverage.txt"
-echo "coverage: unit (swr/autotune) report written to $UNIT_OUT"
+    --txt "$UNIT_OUT/coverage.txt" \
+    --json-pretty \
+    --json "$UNIT_OUT/coverage.json"
+python3 - "$UNIT_OUT/coverage.json" <<'PY'
+import json
+import sys
+
+required = {
+    "ngx_http_cache_turbo_warm_file_prereq_error",
+    "ngx_http_cache_turbo_mc_op_fail",
+}
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+covered = {
+    function["name"]
+    for source in data["files"]
+    for function in source.get("functions", [])
+    if function.get("execution_count", 0) > 0
+}
+missing = sorted(required - covered)
+if missing:
+    raise SystemExit("coverage: extracted unit functions missing: " + ", ".join(missing))
+PY
+echo "coverage: extracted-unit report written to $UNIT_OUT"
+
+# 4. Optional nginx-module-testkit profile. CI supplies TESTKIT_ROOT from its
+# pinned sibling checkout. Keep the raw profiles separate so a reviewer can
+# tell which harness reaches a function, then merge their tracefiles to expose
+# functions missed by BOTH suites instead of comparing two percentages by eye.
+if [ -n "${TESTKIT_ROOT:-}" ]; then
+    TESTKIT_ROOT="$(cd "$TESTKIT_ROOT" && pwd)"
+    export TESTKIT_ROOT
+
+    bash "$MODULE_DIR/ci/tools/testkit-stage.sh" \
+        --flavor "$FLAVOR" --version "$VERSION" --coverage
+
+    TESTKIT_ADDON="$ROOT/${FLAVOR}-${VERSION}-testkit-coverage/objs/addon/src"
+    find "$TESTKIT_ADDON" -name '*.gcda' -delete 2>/dev/null || true
+
+    # shellcheck disable=SC1091
+    source "$MODULE_DIR/ci/tools/testkit-scenarios.sh"
+    bash "$MODULE_DIR/ci/tools/testkit-run.sh" \
+        --flavor "$FLAVOR" --version "$VERSION" --coverage \
+        --port "$TEST_BASE_PORT" -- "${TESTKIT_SCENARIOS_ALL[@]}"
+
+    TESTKIT_OUT="$OUT/testkit"
+    mkdir -p "$TESTKIT_OUT"
+    gcovr \
+        "$TESTKIT_ADDON" \
+        --root "$MODULE_DIR" \
+        --filter "$MODULE_DIR/src/" \
+        --object-directory "$TESTKIT_ADDON" \
+        --gcov-ignore-errors=all \
+        --merge-mode-functions=merge-use-line-min \
+        --branches \
+        --decisions \
+        --print-summary \
+        --html-details "$TESTKIT_OUT/index.html" \
+        --xml "$TESTKIT_OUT/coverage.xml" \
+        --txt "$TESTKIT_OUT/coverage.txt" \
+        --json-pretty \
+        --json "$TESTKIT_OUT/coverage.json"
+
+    COMBINED_OUT="$OUT/combined"
+    mkdir -p "$COMBINED_OUT"
+    gcovr \
+        --root "$MODULE_DIR" \
+        --add-tracefile "$OUT/coverage.json" \
+        --add-tracefile "$TESTKIT_OUT/coverage.json" \
+        --add-tracefile "$UNIT_OUT/coverage.json" \
+        --merge-mode-functions=merge-use-line-min \
+        --branches \
+        --decisions \
+        --print-summary \
+        --html-details "$COMBINED_OUT/index.html" \
+        --xml "$COMBINED_OUT/coverage.xml" \
+        --txt "$COMBINED_OUT/coverage.txt" \
+        --json-pretty \
+        --json "$COMBINED_OUT/coverage.json"
+    echo "coverage: testkit and runtime + testkit + unit reports written under $TESTKIT_OUT and $COMBINED_OUT"
+fi

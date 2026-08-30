@@ -1,214 +1,36 @@
-# cache_turbo module — gcov branch coverage baseline (committed)
+# cache_turbo coverage baseline (work-scoping artifact; not a percentage gate)
 #
-# Regenerate the raw report with:
-#   bash ci/tools/coverage.sh nginx 1.31.3          -> unit + runtime suite only
-#   ci/tools/testkit-stage.sh --version 1.31.3 --coverage
-#   ci/tools/testkit-run.sh --version 1.31.3 --coverage \
-#       -- consumer-cache-turbo shm-coherence-varidx fault-slab-store \
-#          alloc-per-request fd-starve multi-worker
-#   gcovr --root . --filter "$PWD/src/" \
-#       --object-directory .build/nginx-1.31.3-testkit-coverage/objs/addon/src \
-#       --gcov-ignore-errors=all --branches --decisions --print-summary \
-#       --txt /tmp/prober-coverage.txt
+# Regenerate in CI or with a pinned nginx-module-testkit checkout:
+#   TESTKIT_ROOT=/path/to/nginx-module-testkit \
+#     bash ci/tools/coverage.sh nginx 1.31.3
 #
-# Per repo policy (no COVERAGE_FAIL_UNDER, no % gate -- meaningful tests over
-# a threshold): this file is a WORK-SCOPING ARTIFACT, not a CI gate. Nothing
-# here fails a build. Update it whenever a coverage-adjacent PR changes what
-# is reached; do not let it silently rot -- an uncommitted profile is not
-# scoped to anyone.
+# Reports:
+#   coverage-report/                    full runtime suite
+#   coverage-report/testkit/            canonical 11-scenario prober matrix
+#   coverage-report/combined/           merged runtime + prober + unit traces
+#   coverage-report/unit/               extracted production-unit slices
 #
-# =============================================================================
-# MEASURED 2026-08-27, nginx 1.31.3, gcc 14.2.0, gcovr 7.2, commit f696b13
-# =============================================================================
+# Measured 2026-08-30, nginx 1.31.3, gcc 14.2.0, gcovr 7.2,
+# candidate based on 92eb6ef2e11aaad23982248a3d9edf18c193e2ee,
+# testkit 27f724082e16f6d9bd8a2a0ee944ef9dd551ab7e.
 #
-# Two runs, same gcovr invocation, same 16-file src/ set:
+# Profile                    Functions       Lines            Branches
+# runtime                    447/460 97.2%   7386/8689 85.0%  4400/6273 70.1%
+# testkit (11 scenarios)     239/466 51.3%   2902/8775 33.1%  1415/6319 22.4%
+# extracted units             63/64  98.4%    868/987  87.9%   413/593  69.6%
+# combined                   466/466  100%   7704/8841 87.1%  4623/6440 71.8%
 #
-#   (A) baseline  = ci/tools/coverage.sh only (unit driver + test_runtime.py
-#                   --fault-injection against .build/nginx-1.31.3/)
-#         TOTAL branches 6173, taken 3482, 56%
+# The prober matrix adds lifecycle, cross-worker, resource-delta, reload,
+# pressure and fault assertions. Its harness build also exposes six probe-only
+# functions absent from the ordinary runtime build. These are independent
+# oracles: execution alone cannot prove allocation neutrality, worker
+# diversity, drain completion, bounded RSS, or that a falsifier turns red.
 #
-#   (B) +prober   = (A)'s tree PLUS the six testkit prober-leg scenarios run
-#                   against a SEPARATE gcov-instrumented tree,
-#                   .build/nginx-1.31.3-testkit-coverage/ (built via
-#                   testkit-stage.sh --coverage), gcda from both trees are
-#                   NOT merged -- (B) is the prober legs' OWN report, diffed
-#                   line-by-line against (A) below, not a summed total.
-#         TOTAL branches 6173, taken 3518, 57%
+# The booted runtime leaves 13 source functions at zero. Extracted production
+# slices exercise all 13 deterministically, including rollback, breaker retry,
+# shared-memory state/sketch, warm-file failure, and backend terminal-error
+# composition. The merged profile therefore has zero unexecuted functions.
 #
-# THE DIFF -- 9 branch-lines the six prober scenarios reach that the unit +
-# runtime suite do not (verified line-by-line, not from the two percentages,
-# which round to the same-looking 56%/57% for unrelated reasons: gcovr's %
-# is computed over ALL 6173 branches including ones neither run touches):
-#
-#   src/ngx_http_cache_turbo_access.c:310    -- HAS_BACKEND(clcf->backend_presets)
-#                                                check; real prober confs combine
-#                                                backend_presets differently than
-#                                                the unit/runtime suite's fixtures.
-#                                                Oracle: consumer-cache-turbo /
-#                                                alloc-per-request / multi-worker
-#                                                (real cache_turbo location, real
-#                                                HIT traffic).
-#   src/ngx_http_cache_turbo_conf.c:981      -- ngx_conf_merge_uint_value(cc_mode).
-#                                                Oracle: same as above (a directive
-#                                                combination the prober confs use
-#                                                that the runtime suite's confs do
-#                                                not).
-#   src/ngx_http_cache_turbo_filters.c:1716  -- if (total > 0) in the response-size
-#                                                accounting path.
-#                                                Oracle: alloc-per-request (S25) --
-#                                                the only scenario driving large
-#                                                (30 KiB-256 KiB) bodies/headers
-#                                                through a real HIT.
-#   src/ngx_http_cache_turbo_filters.c:2045  -- if (store_rc == NGX_OK) on the
-#                                                slab-store completion path.
-#                                                Oracle: fault-slab-store (S24) --
-#                                                the only scenario that arms
-#                                                fault_slab= and observes BOTH the
-#                                                failing and the following
-#                                                successful store.
-#   src/ngx_http_cache_turbo_probe.c:324     -- if (fault != NGX_TEST_PROBE_FAULT_SLAB)
-#                                                dispatch guard inside
-#                                                ngx_http_cache_turbo_probe_fault_set().
-#                                                Oracle: fault-slab-store (S24) --
-#                                                the ONLY caller that ever invokes
-#                                                the fault_set hook at all; no unit
-#                                                or runtime-suite path calls it
-#                                                (there is no probe wired into
-#                                                ci/tools/test_runtime.py).
-#   src/ngx_http_cache_turbo_shm.c:445       -- if (base == NULL) guard on a slab
-#                                                alloc result.
-#                                                Oracle: fault-slab-store (S24).
-#   src/ngx_http_cache_turbo_shm.c:1378-1379 -- if (*fc != ...FAULT_DISARMED) /
-#                                                if (*fc == 0): the fault-countdown
-#                                                arm/fire/disarm state machine.
-#                                                Oracle: fault-slab-store (S24) --
-#                                                same reasoning as probe.c:324,
-#                                                this counter has no other writer.
-#   src/ngx_http_cache_turbo_shm.c:1600      -- if (body == NULL) guard.
-#                                                Oracle: alloc-per-request (S25) --
-#                                                the 256 KiB-body case is the only
-#                                                fixture exercising this branch's
-#                                                sibling path from a real request.
-#
-# WHY THE DIFF IS THIS SMALL, PER nginx-module-testkit's docs/COVERAGE.md
-# authority ("Where coverage is measured, and where it is not"):
-#
-#   That policy states coverage is a UNIT-BUILD measurement and explicitly
-#   NOT one taken through a booted nginx, because booting mixes module lines
-#   with nginx core lines and attributes work to whichever request happened
-#   to land -- and it says the prober/scenario suite's actual value (leak
-#   neutrality, lifecycle survival, fault-path behaviour) is DELIBERATELY NOT
-#   a coverage claim.
-#
-#   This module's own ci/tools/coverage.sh already diverges from that: it is
-#   ALSO a booted-nginx gcov measurement (test_runtime.py driving a real
-#   instrumented server), a repo-level decision made before this file existed.
-#   The prober legs measured here extend that same booted-nginx methodology
-#   rather than violating a unit-build-only policy this repo never adopted.
-#   The two measurements are consistent in kind; what they are NOT is
-#   additive with each other in the way a unit-build report would be, because
-#   both are "whichever code the request path happened to touch" -- so a
-#   large chunk of what ci/tools/coverage.sh's OWN suite already exercises on
-#   the same real HTTP paths (config merge, HIT/MISS, vary, filters) is
-#   necessarily already covered before the prober legs run at all. Nine
-#   incremental lines is a small, structurally-expected number given that the
-#   two measurements share a code surface, not a sign the harness under-ran.
-#
-# STILL-UNCOVERED, 1734 branch-lines, by reachability class (COVERAGE.md's
-# four classes).  This classification is of the committed 2026-08-27
-# +prober snapshot above, at f696b13; line numbers come from that snapshot.
-# It is deliberately file-level: every missing line in a named file has the
-# disposition stated for that file.  The exact line sets are the `Missing`
-# columns produced by the regenerate commands above, less the nine lines in
-# THE DIFF.  Counts therefore remain reproducible without copying a second,
-# soon-stale 1,734-number list into this work-scoping artifact.
-#
-# IMPORTANT SCOPE: "defensively unreachable" below means unreachable from the
-# CURRENT SIX PROBER LEGS by their configuration topology.  It does not claim
-# that the production functions are dead or impossible to reach: the ordinary
-# runtime suite reaches both drivers.  This is the useful disposition for this
-# booted-nginx, prober-leg comparison, whose question is which new scenario
-# topology is required.  It must not be quoted as an absolute code invariant.
-#
-#   defensively-unreachable-by-topology (structural, PROVEN not measured):
-#     src/ngx_http_cache_turbo_redis.c      284 lines uncovered
-#     src/ngx_http_cache_turbo_memcached.c  111 lines uncovered
-#     -- ZERO of the nine ci/prober-scenarios/*/nginx.conf configure a redis
-#     or memcached backend (`grep -ln "redis\|memcached"
-#     ci/prober-scenarios/*/nginx.conf` returns nothing, re-verified against
-#     this commit). These 395 lines are not reachable by ANY prober-leg
-#     scenario as currently written -- reaching them needs a NEW scenario
-#     with an L2 backend fixture, not more runs of the existing six. They are
-#     already covered where they ARE reachable: ci/tools/coverage.sh's own
-#     test_runtime.py suite runs redis+memcached fixtures directly (58%/47%
-#     baseline branch coverage on these two files, non-zero).
-#
-#   reachable-untested by the current prober legs (real configuration, request,
-#   response, admin, lifecycle, or test-probe input drives the file):
-#     src/ngx_http_cache_turbo_module.c      369 lines
-#       Main request/content/filter/lifecycle glue; every current scenario
-#       loads it, but their small request matrix does not select every arm.
-#     src/ngx_http_cache_turbo_conf.c        247 lines
-#       Directive parsers and merge functions; a finite nginx.conf fixture
-#       selects only a subset of valid and invalid configuration inputs.
-#     src/ngx_http_cache_turbo_match.c       139 lines
-#       URI/argument/cookie matchers; the configured rules and request strings
-#       are real controllable inputs, while the six legs exercise few of them.
-#     src/ngx_http_cache_turbo_filters.c     131 lines
-#       Request/response headers, status, body shape, and store outcome select
-#       these arms; all are scenario-controlled surfaces.
-#     src/ngx_http_cache_turbo_access.c      129 lines
-#       HIT/MISS/stale/breaker/L2 request state selects these arms; the six
-#       legs cover only a subset of the state-and-directive product.
-#     src/ngx_http_cache_turbo_shm.c         115 lines
-#       Zone size, object churn, expiry, concurrency and fault_slab select the
-#       paths.  S24 proves the fault seam is live, but does not exhaust it.
-#     src/ngx_http_cache_turbo_vary.c         94 lines
-#       Vary, Accept-Encoding, User-Agent and configured ignore rules are
-#       direct request/config inputs.
-#     src/ngx_http_cache_turbo_admin.c        44 lines
-#       Admin method, selector, payload and warm/purge outcomes are direct
-#       inputs; the present legs do not enumerate the admin API.
-#     src/ngx_http_cache_turbo_purge.c        27 lines
-#       Key/tag/all selectors and backend outcomes drive these paths.
-#     src/ngx_http_cache_turbo_blob.c         24 lines
-#       Stored wire bytes, header tables and digest provider outcomes drive
-#       validation/encoding branches; malformed blobs need adversarial cases.
-#     src/ngx_http_cache_turbo_probe.c        14 lines
-#       The TEST_FAULTS-only probe URI, command and allocation outcomes are
-#       controllable in a probe-enabled scenario; S24 reaches only fault_set.
-#     src/ngx_http_cache_turbo_autotune.c      5 lines
-#       Real sample values and elapsed intervals select these pure-C arms.
-#     src/ngx_http_cache_turbo_internal.h      1 line
-#       The inline helper is called by request code; its alternate operand is
-#       input/state-selectable rather than an invariant guard.
-#     subtotal                              1339 lines
-#
-#   reachable-only-under-fault-injection:      0 lines classified at FILE
-#     granularity.  Several lines in the reachable files are allocation or I/O
-#     failure arms, but this snapshot does not retain branch-arc identity in
-#     its text report.  Re-labelling an entire source line from spelling alone
-#     would invent which untaken arc gcov meant.  Keep those lines in the
-#     conservative reachable-untested work queue until an arc-preserving
-#     report and a failing fault oracle promote them to this narrower class.
-#
-#   dead:                                      0 lines proven.  Every listed
-#     translation unit has a production or TEST_FAULTS caller.  An uncovered
-#     arm is not evidence of a caller-less function, so no deletion is scoped.
-#
-#   accounting: 1339 reachable-untested + 395 defensively unreachable from the
-#   current prober topology + 0 fault-only proven + 0 dead = 1734.
-#
-# TOPOLOGY-CHANGING L2 CASE IMPLEMENTED AFTER THIS SNAPSHOT:
-#   ci/prober-scenarios/redis-connect-backoff targets the Redis connect/backoff
-#   path at
-#   src/ngx_http_cache_turbo_redis.c:888 in the f696b13 snapshot with a new
-#   Redis-configured prober leg.  Use an intentionally closed loopback port:
-#   the first cacheable request must emit the driver's connect-failure log and
-#   arm backoff; an immediate second request must increment the TEST_FAULTS
-#   redis-backoff-skip observable exactly once without emitting a second
-#   connect-failure log.  A healthy Redis fixture is the
-#   negative control: neither oracle may fire, and a second request must be an
-#   L2-backed HIT.  The 1734-line accounting above intentionally remains the
-#   named f696b13 snapshot; the next measured refresh must add this scenario
-#   to the regenerate command and record its actual line delta.
+# Refresh this file whenever the canonical scenario matrix, coverage driver,
+# source function set, or pinned testkit changes. JSON tracefiles are published
+# so zero-function classification remains reproducible.
