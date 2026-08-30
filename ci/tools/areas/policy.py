@@ -3092,6 +3092,54 @@ def test_status_variable(ng: Nginx) -> None:
         f"bypasses_total should increment on a bypass: {before} -> {after}"
 
 
+def test_dynamic_response_header_not_cached(ng: Nginx) -> None:
+    """AUD30-DYNAMIC-HEADER-DUPLICATION: a downstream add_header using
+    $cache_turbo_status is evaluated once per response, not stored at MISS time
+    and replayed beside the live HIT value. Inspect http.client's raw header
+    pairs: the ordinary dict helpers collapse duplicates and masked this bug.
+
+    X-Cache-Turbo is the spelling recommended by the public docs; X-CT-Status
+    is retained as the original reproducer. X-Backend is an upstream-header
+    fidelity control, and X-Cache is the module's locally generated HIT header.
+    """
+    path = "/ctstatus/aud30-r2-dup"
+
+    def raw_headers() -> list[tuple[str, str]]:
+        conn = http.client.HTTPConnection("127.0.0.1", ng.port,
+                                          timeout=HTTP_TIMEOUT)
+        try:
+            conn.request("GET", path, headers={"Connection": "close"})
+            resp = conn.getresponse()
+            assert resp.status == 200, f"unexpected status {resp.status}"
+            resp.read()
+            return [(k.lower(), v) for k, v in resp.getheaders()]
+        finally:
+            conn.close()
+
+    miss = raw_headers()
+    hit = raw_headers()
+
+    def values(headers: list[tuple[str, str]], name: str) -> list[str]:
+        return [v for k, v in headers if k == name]
+
+    assert values(miss, "x-cache-turbo") == ["MISS"], \
+        f"MISS must carry one live X-Cache-Turbo value: {miss!r}"
+    assert values(hit, "x-cache-turbo") == ["HIT"], \
+        f"HIT replayed a stored MISS beside its live value: {hit!r}"
+    assert values(miss, "x-ct-status") == ["MISS"], \
+        f"MISS must carry one live X-CT-Status value: {miss!r}"
+    assert values(hit, "x-ct-status") == ["HIT"], \
+        f"HIT replayed the original X-CT-Status reproducer: {hit!r}"
+    assert values(miss, "x-backend") == ["origin-42"], \
+        f"MISS lost or duplicated the upstream header: {miss!r}"
+    assert values(hit, "x-backend") == ["origin-42"], \
+        f"HIT lost or duplicated the cached upstream header: {hit!r}"
+    assert values(miss, "x-cache") == [], \
+        f"MISS unexpectedly carried a module cache-hit header: {miss!r}"
+    assert values(hit, "x-cache") == ["HIT"], \
+        f"HIT must carry exactly one module-generated X-Cache: {hit!r}"
+
+
 def test_status_stale(ng: Nginx, origin: Origin) -> None:
     """$cache_turbo_status = STALE while serving a stale copy. /ctstale/ has
     beta 1 so the refresh dice ~never fires (the read stays a clean STALE serve

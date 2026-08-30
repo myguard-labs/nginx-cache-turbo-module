@@ -1321,7 +1321,7 @@ ngx_http_cache_turbo_is_cookie_name_byte(u_char c)
  * cacheable_reason names the first response-policy veto, or _NONE when none
  * fired; callers must provide out. */
 void ngx_http_cache_turbo_response_policy(ngx_http_request_t *r,
-    ngx_http_cache_turbo_loc_conf_t *clcf,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_list_t *headers,
     ngx_http_cache_turbo_response_policy_t *out);
 ngx_int_t ngx_http_cache_turbo_sie_rewrite(ngx_http_request_t *r,
     ngx_http_cache_turbo_ctx_t *ctx);

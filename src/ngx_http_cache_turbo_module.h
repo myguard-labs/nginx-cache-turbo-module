@@ -2664,6 +2664,19 @@ typedef struct {
     ngx_chain_t             *body;        /* buffered response chain        */
     ngx_chain_t             *body_last;   /* tail of body, O(1) append      */
     size_t                   body_len;
+    /* AUD30-DYNAMIC-HEADER-DUPLICATION: the cache blob must describe the
+     * upstream response as this top-most header filter received it, not the
+     * later r->headers_out after downstream filters have appended dynamic
+     * add_header values. The header filter deep-copies this snapshot before
+     * handing off; the body filter serialises only these fields. The response
+     * A separately held charset is flattened into the same wire form core
+     * would emit, allowing HIT restore to rebuild nginx's typed media-type
+     * and source-charset state. The policy is recomputed from this snapshot, so
+     * downstream Cache-Control/Expires additions cannot change the stored
+     * lifetime and absolute Expires timing retains its original semantics. */
+    ngx_list_t               capture_headers;
+    ngx_str_t                capture_content_type;
+    ngx_uint_t               capture_status;
     ngx_str_t                cache_key;
     u_char                   key_hash[32];
     /* auto-Vary (v11 other half). vary_bits = the safe-axis bitmask classified

@@ -280,6 +280,42 @@ def test_header_fidelity(ng: Nginx) -> None:
         f"custom header lost: {h.get('x-backend')}"
 
 
+def test_downstream_charset_conversion_repeats_on_hit(ng: Nginx) -> None:
+    """AUD30 preservation: cache pre-conversion windows-1251 bytes and typed
+    source-charset metadata, then make nginx convert independently on MISS and
+    HIT. This fails if HIT restore flattens Content-Type, or if the body-time
+    serializer reads the downstream-mutated type instead of the snapshot."""
+    path = "/charset/charsetconvert"
+    expected = "Привет\n".encode()
+
+    def response() -> tuple[bytes, list[str], str | None]:
+        conn = http.client.HTTPConnection("127.0.0.1", ng.port,
+                                          timeout=HTTP_TIMEOUT)
+        try:
+            conn.request("GET", path, headers={"Connection": "close"})
+            resp = conn.getresponse()
+            assert resp.status == 200, f"unexpected status {resp.status}"
+            body = resp.read()
+            pairs = resp.getheaders()
+            return (body,
+                    [v for k, v in pairs if k.lower() == "content-type"],
+                    next((v for k, v in pairs if k.lower() == "x-cache"),
+                         None))
+        finally:
+            conn.close()
+
+    miss_body, miss_ct, miss_cache = response()
+    hit_body, hit_ct, hit_cache = response()
+    assert miss_cache is None and miss_body == expected, \
+        f"MISS charset conversion failed: {miss_body!r}"
+    assert miss_ct == ["text/plain; charset=utf-8"], \
+        f"MISS charset output changed or duplicated: {miss_ct!r}"
+    assert hit_cache == "HIT" and hit_body == expected, \
+        f"HIT replayed unconverted source bytes: {hit_body!r}"
+    assert hit_ct == miss_ct, \
+        f"HIT did not rebuild the downstream charset state: {hit_ct!r}"
+
+
 def test_restore_allocation_failure_fails_closed(ng: Nginx,
                                                  origin: Origin) -> None:
     """Allocation failure while rebuilding a cached response must never emit a

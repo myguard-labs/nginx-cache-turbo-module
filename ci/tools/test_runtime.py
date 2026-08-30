@@ -59,6 +59,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_post_passthrough_uncached(ng, origin)
     test_compressed_edge_identity_capture(ng)
     test_header_fidelity(ng)
+    test_downstream_charset_conversion_repeats_on_hit(ng)
     if ng.fault_injection:
         test_restore_allocation_failure_fails_closed(ng, origin)
         test_file_backed_delegate_never_stores(ng, origin)
@@ -259,6 +260,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_ctx_survives_error_page_internal_redirect(ng, origin)
     test_require_header(ng)
     test_key_cookie(ng)
+    test_dynamic_response_header_not_cached(ng)
     test_status_variable(ng)
     test_status_stale(ng, origin)
     test_status_expired(ng, origin)
