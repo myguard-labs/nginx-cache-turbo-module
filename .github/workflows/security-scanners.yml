@@ -1,4 +1,4 @@
-# sync-sha: 41d4c1928ebbb12b02be6a286b0ff8b295da2bf4a5c3f83175dced2d2863f858
+# sync-sha: c9d730850140bdae59ce44fc6694d93dc1dce980e49a136f6446d915b6348620
 name: Security scanners
 
 # Static/security scanners gate (flawfinder, clang-tidy cert-*/security.*,
@@ -44,12 +44,13 @@ jobs:
           # system Python on the Ubuntu 24.04 self-hosted runner). Fall back to a
           # user pip install with --break-system-packages if pipx is unavailable.
           if command -v pipx >/dev/null; then
-            pipx install --quiet semgrep
+            pipx install --quiet 'semgrep==1.169.0'
             echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           else
-            pip3 install --quiet --user --break-system-packages semgrep
+            pip3 install --quiet --user --break-system-packages 'semgrep==1.169.0'
             echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           fi
+          test "$(semgrep --version)" = 1.169.0
       - name: gitleaks (full history scan)
         run: |
           set -euo pipefail
@@ -124,9 +125,7 @@ jobs:
           # sets require_serial. Do not "speed this up" by dropping it.
           #
           # pipefail likewise: without it `tee` supplies the status.
-          semgrep scan -j 1 --config p/c --config p/security-audit \
-            --severity=WARNING --severity=ERROR --error \
-            "$GITHUB_WORKSPACE/src/" 2>&1 | tee semgrep.log
+          ci/linter/run-semgrep.sh "$GITHUB_WORKSPACE/src/" 2>&1 | tee semgrep.log
       - name: Upload reports
         if: always()
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5

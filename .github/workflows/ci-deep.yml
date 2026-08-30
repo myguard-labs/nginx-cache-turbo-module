@@ -1,4 +1,4 @@
-# sync-sha: ec611e7d86dea4d2c117bdc5cecaa6b28d2db7608cc0ddeb3622958f7d344e37
+# sync-sha: b0342c9f5cbb11a472315e90b64b635ceb8d93113ddb0fb4911016b5d31dba95
 name: CI Deep
 
 # Exhaustive dynamic analysis — monthly cron + on-demand only, NEVER on PR.
@@ -1004,12 +1004,13 @@ jobs:
           # system Python on the Ubuntu 24.04 self-hosted runner). Fall back to a
           # user pip install with --break-system-packages if pipx is unavailable.
           if command -v pipx >/dev/null; then
-            pipx install --quiet semgrep
+            pipx install --quiet 'semgrep==1.169.0'
             echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           else
-            pip3 install --quiet --user --break-system-packages semgrep
+            pip3 install --quiet --user --break-system-packages 'semgrep==1.169.0'
             echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           fi
+          test "$(semgrep --version)" = 1.169.0
       - name: gitleaks (full history scan)
         run: |
           set -euo pipefail
@@ -1073,9 +1074,7 @@ jobs:
           # -j 1 IS LOAD-BEARING: parallel semgrep-core shards exhaust
           # RLIMIT_MEMLOCK on io_uring init and die with EXIT CODE 0, i.e. a
           # crashed scanner that reads as a clean scan. Do not drop it.
-          semgrep scan -j 1 --config p/c --config p/security-audit \
-            --severity=WARNING --severity=ERROR --error \
-            "$GITHUB_WORKSPACE/src/" 2>&1 | tee semgrep.log
+          ci/linter/run-semgrep.sh "$GITHUB_WORKSPACE/src/" 2>&1 | tee semgrep.log
       - name: Upload reports
         if: always()
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5

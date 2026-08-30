@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}"
+tmp=""
 
 # shellcheck disable=SC1091
 source "$ROOT/ci/tools/testkit-scenarios.sh"
@@ -23,10 +24,29 @@ for scenario in "${TESTKIT_SCENARIOS_ALL[@]}"; do
     fi
 done
 
-while IFS= read -r scenario; do
+# Materialise before consuming: the exit status of a process substitution is
+# mapfile/read's, not find's. A directory walk that writes one real scenario
+# and then fails must be a gate error (2), never a partial clean inventory.
+# NUL records preserve a scenario path exactly through discovery and sorting.
+inventory_dir="$(mktemp -d)" || {
+    printf 'testkit contract: cannot create scenario inventory directory\n' >&2
+    exit 2
+}
+trap 'rm -rf "$inventory_dir" "${tmp:-}"' EXIT
+inventory_raw="$inventory_dir/scenarios.raw"
+inventory_sorted="$inventory_dir/scenarios.sorted"
+if ! find "$ROOT/ci/prober-scenarios" -mindepth 1 -maxdepth 1 -type d \
+    -printf '%f\0' >"$inventory_raw"; then
+    printf 'testkit contract: scenario inventory failed -- refusing partial result\n' >&2
+    exit 2
+fi
+if ! LC_ALL=C sort -z "$inventory_raw" >"$inventory_sorted"; then
+    printf 'testkit contract: scenario inventory sort failed -- refusing partial result\n' >&2
+    exit 2
+fi
+while IFS= read -r -d '' scenario; do
     [ -n "${seen[$scenario]:-}" ] || fail "unlisted local scenario: $scenario"
-done < <(find "$ROOT/ci/prober-scenarios" -mindepth 1 -maxdepth 1 -type d \
-    -printf '%f\n' | LC_ALL=C sort)
+done <"$inventory_sorted"
 
 for lane_name in PLAIN SANITIZED VALGRIND ANGIE; do
     lane_var="TESTKIT_SCENARIOS_${lane_name}[@]"
@@ -38,7 +58,6 @@ for lane_name in PLAIN SANITIZED VALGRIND ANGIE; do
 done
 
 tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/1" "$tmp/2" "$tmp/3" "$tmp/4" "$tmp/5"
 printf '/usr/bin/pbuilder\0--build\0' >"$tmp/1/cmdline"
 printf '/usr/bin/perl\0/usr/bin/dpkg-buildpackage\0-b\0' >"$tmp/2/cmdline"

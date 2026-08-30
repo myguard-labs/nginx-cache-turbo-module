@@ -586,24 +586,44 @@ status=0
 # scan returns 1.
 newest_of() {
     local depth="$1"; shift
-    local newest_mtime=0 newest_src="" f m
-    while IFS= read -r f; do
+    local newest_mtime=0 newest_src="" f m inventory
+    inventory="$(mktemp)" || return 2
+    # A process substitution would return read's status and hide find failing
+    # after emitting a real source. Materialise the NUL-delimited discovery
+    # first: a partial source list must never certify a staged object as fresh.
+    if ! find "$@" -maxdepth "$depth" -type f \
+        \( -name '*.c' -o -name '*.h' \) -print0 >"$inventory" 2>/dev/null; then
+        rm -f "$inventory"
+        return 2
+    fi
+    while IFS= read -r -d '' f; do
         m="$(stat -c %Y "$f")"
         if [ "$m" -gt "$newest_mtime" ]; then
             newest_mtime="$m"
             newest_src="$f"
         fi
-    done < <(find "$@" -maxdepth "$depth" -type f \( -name '*.c' -o -name '*.h' \) 2>/dev/null)
+    done <"$inventory"
+    rm -f "$inventory"
     [ -n "$newest_src" ] || return 1
     printf '%s %s\n' "$newest_mtime" "$newest_src"
 }
 
-ct_ref="$(newest_of 1 "$ROOT/src")" \
-    || die "no sources found under $ROOT/src -- refusing to report a fresh build on an empty scan"
+unset newest_rc
+ct_ref="$(newest_of 1 "$ROOT/src")" || newest_rc=$?
+if [ "${newest_rc:-0}" -eq 2 ]; then
+    usage "source inventory failed under $ROOT/src -- refusing partial freshness check"
+elif [ "${newest_rc:-0}" -ne 0 ]; then
+    die "no sources found under $ROOT/src -- refusing to report a fresh build on an empty scan"
+fi
 CT_MTIME="${ct_ref%% *}"; CT_NEWEST="${ct_ref#* }"
 
-tk_ref="$(newest_of 2 "$TESTKIT/src" "$TESTKIT/t/module")" \
-    || die "no sources found under $TESTKIT/src or $TESTKIT/t/module -- refusing to report a fresh build on an empty scan"
+unset newest_rc
+tk_ref="$(newest_of 2 "$TESTKIT/src" "$TESTKIT/t/module")" || newest_rc=$?
+if [ "${newest_rc:-0}" -eq 2 ]; then
+    usage "source inventory failed under $TESTKIT/src or $TESTKIT/t/module -- refusing partial freshness check"
+elif [ "${newest_rc:-0}" -ne 0 ]; then
+    die "no sources found under $TESTKIT/src or $TESTKIT/t/module -- refusing to report a fresh build on an empty scan"
+fi
 TK_MTIME="${tk_ref%% *}"; TK_NEWEST="${tk_ref#* }"
 
 # The server binary is checked for existence and executability only -- its

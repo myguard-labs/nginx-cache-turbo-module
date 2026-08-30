@@ -173,8 +173,7 @@ repos:
       # is exactly when a green-to-red flip reads as a real finding.
       - id: semgrep
         name: semgrep (gate on >=WARNING)
-        entry: semgrep scan --jobs=1 --config p/c --config p/security-audit
-               --severity=WARNING --severity=ERROR --error
+        entry: ci/linter/run-semgrep.sh
         language: system
         files: '^src/.*\.[ch]$'
         pass_filenames: true

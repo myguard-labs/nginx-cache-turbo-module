@@ -20,6 +20,8 @@ bash "$DIR/check_constants.sh"
 bash "$DIR/check_directive_synopsis.sh" "$(cd "$DIR/../../.." && pwd)"
 bash "$DIR/check_default_comments.sh" "$(cd "$DIR/../../.." && pwd)"
 bash "$DIR/check_testkit_contract.sh" "$(cd "$DIR/../../.." && pwd)"
+bash "$DIR/check_stage_inventory_control.sh" "$(cd "$DIR/../../.." && pwd)"
+bash "$DIR/check_producer_status_controls.sh" "$(cd "$DIR/../../.." && pwd)"
 
 SHM_COVERAGE_FLAGS=""
 if [ "${COVERAGE:-0}" = 1 ]; then
