@@ -1349,7 +1349,7 @@ ngx_http_cache_turbo_warm_file_thread_event(ngx_event_t *ev)
     if (ev->timedout) {
         ngx_log_error(NGX_LOG_ALERT, c->log, 0,
             "cache_turbo: warm url_file thread operation still running after "
-            "%Mms", NGX_HTTP_CACHE_TURBO_WARM_FILE_ALERT_MS);
+            "%Mms", (ngx_msec_t) NGX_HTTP_CACHE_TURBO_WARM_FILE_ALERT_MS);
         /* Alert-only watchdog: do not decrement blocked/count, clear aio or
          * finalize here.  The worker still owns ctx and may still own its fd;
          * its eventual completion event is the only safe release point. */
