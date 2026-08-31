@@ -3488,6 +3488,221 @@ ngx_http_cache_turbo_set_cookie_relax_allowed(
 }
 
 
+typedef struct {
+    time_t      sc_max;
+    time_t      cdn_smax;
+    time_t      cdn_max;
+    time_t      cc_smax;
+    time_t      cc_max;
+    ngx_str_t   expires;
+    ngx_uint_t  require_found;
+} ngx_http_cache_turbo_response_policy_ctx_t;
+
+
+static ngx_inline ngx_int_t
+ngx_http_cache_turbo_response_header_is(ngx_table_elt_t *h,
+    const char *name, size_t len)
+{
+    return h->key.len == len
+           && ngx_strncasecmp(h->key.data, (u_char *) name, len) == 0;
+}
+
+
+static ngx_inline void
+ngx_http_cache_turbo_response_policy_init(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf,
+    ngx_http_cache_turbo_response_policy_t *out,
+    ngx_http_cache_turbo_response_policy_ctx_t *ctx)
+{
+    out->upstream_ttl = -1;
+    out->swr = -1;
+    out->sie = -1;
+    out->must_revalidate = 0;
+    out->auth_shareable = 0;
+    out->require_hdr_ok = (clcf->require_header.len == 0) ? 1 : 0;
+    out->cacheable = 1;
+    out->cacheable_reason = NGX_HTTP_CACHE_TURBO_REFUSE_NONE;
+
+    ctx->sc_max = -1;
+    ctx->cdn_smax = -1;
+    ctx->cdn_max = -1;
+    ctx->cc_smax = -1;
+    ctx->cc_max = -1;
+    ctx->expires.len = 0;
+    ctx->expires.data = NULL;
+    ctx->require_found = 0;
+
+    if (r->headers_in.authorization != NULL) {
+        out->cacheable = 0;
+        out->cacheable_reason = NGX_HTTP_CACHE_TURBO_REFUSE_AUTHORIZATION;
+    }
+}
+
+
+/* A configured require_header owns the complete matching field-line.  Keep
+ * this decision ahead of Set-Cookie and freshness parsing: configurations are
+ * allowed to require a header whose name is otherwise policy-significant. */
+static ngx_inline ngx_int_t
+ngx_http_cache_turbo_response_require_header(
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_table_elt_t *h,
+    ngx_http_cache_turbo_response_policy_t *out,
+    ngx_http_cache_turbo_response_policy_ctx_t *ctx)
+{
+    if (clcf->require_header.len == 0
+        || h->key.len != clcf->require_header.len
+        || ngx_strncasecmp(h->key.data, clcf->require_header.data,
+                           clcf->require_header.len) != 0)
+    {
+        return 0;
+    }
+
+    if (!((h->value.len == 3
+           && ngx_strncasecmp(h->value.data, (u_char *) "yes", 3) == 0)
+          || (h->value.len == 2
+              && ngx_strncasecmp(h->value.data, (u_char *) "on", 2) == 0)
+          || (h->value.len == 1 && h->value.data[0] == '1')))
+    {
+        out->require_hdr_ok = 0;
+    } else if (!ctx->require_found) {
+        out->require_hdr_ok = 1;
+    }
+    ctx->require_found = 1;
+
+    return 1;
+}
+
+
+static ngx_inline void
+ngx_http_cache_turbo_response_cc_refuse(u_char *v, u_char *e,
+    ngx_http_cache_turbo_response_policy_t *out)
+{
+    if (out->cacheable
+        && (ngx_http_cache_turbo_cc_has(v, e, "no-store",
+                sizeof("no-store") - 1)
+            || ngx_http_cache_turbo_cc_has(v, e, "no-cache",
+                sizeof("no-cache") - 1)
+            || ngx_http_cache_turbo_cc_has(v, e, "private",
+                sizeof("private") - 1)
+            || ngx_http_cache_turbo_cc_delta(v, e, "max-age",
+                sizeof("max-age") - 1) == 0
+            || ngx_http_cache_turbo_cc_delta(v, e, "s-maxage",
+                sizeof("s-maxage") - 1) == 0))
+    {
+        out->cacheable = 0;
+        out->cacheable_reason = NGX_HTTP_CACHE_TURBO_REFUSE_CACHE_CONTROL;
+    }
+}
+
+
+static ngx_inline void
+ngx_http_cache_turbo_response_surrogate_control(ngx_table_elt_t *h,
+    ngx_http_cache_turbo_response_policy_t *out,
+    ngx_http_cache_turbo_response_policy_ctx_t *ctx)
+{
+    u_char  *v = h->value.data;
+    u_char  *e = v + h->value.len;
+
+    ngx_http_cache_turbo_response_cc_refuse(v, e, out);
+    if (ctx->sc_max < 0) {
+        ctx->sc_max = ngx_http_cache_turbo_cc_delta(v, e, "max-age",
+                                                    sizeof("max-age") - 1);
+    }
+}
+
+
+static ngx_inline void
+ngx_http_cache_turbo_response_cdn_control(ngx_table_elt_t *h,
+    ngx_http_cache_turbo_response_policy_t *out,
+    ngx_http_cache_turbo_response_policy_ctx_t *ctx)
+{
+    u_char  *v = h->value.data;
+    u_char  *e = v + h->value.len;
+
+    ngx_http_cache_turbo_response_cc_refuse(v, e, out);
+    if (ctx->cdn_smax < 0) {
+        ctx->cdn_smax = ngx_http_cache_turbo_cc_delta(v, e, "s-maxage",
+                                                      sizeof("s-maxage") - 1);
+    }
+    if (ctx->cdn_max < 0) {
+        ctx->cdn_max = ngx_http_cache_turbo_cc_delta(v, e, "max-age",
+                                                     sizeof("max-age") - 1);
+    }
+}
+
+
+static ngx_inline void
+ngx_http_cache_turbo_response_cache_control(ngx_table_elt_t *h,
+    ngx_http_cache_turbo_response_policy_t *out,
+    ngx_http_cache_turbo_response_policy_ctx_t *ctx)
+{
+    u_char  *v = h->value.data;
+    u_char  *e = v + h->value.len;
+
+    ngx_http_cache_turbo_response_cc_refuse(v, e, out);
+    if (ctx->cc_smax < 0) {
+        ctx->cc_smax = ngx_http_cache_turbo_cc_delta(v, e, "s-maxage",
+                                                     sizeof("s-maxage") - 1);
+    }
+    if (ctx->cc_max < 0) {
+        ctx->cc_max = ngx_http_cache_turbo_cc_delta(v, e, "max-age",
+                                                    sizeof("max-age") - 1);
+    }
+    if (out->swr < 0) {
+        out->swr = ngx_http_cache_turbo_cc_delta(v, e,
+            "stale-while-revalidate", sizeof("stale-while-revalidate") - 1);
+    }
+    if (out->sie < 0) {
+        out->sie = ngx_http_cache_turbo_cc_delta(v, e, "stale-if-error",
+                                                 sizeof("stale-if-error") - 1);
+    }
+
+    if (ngx_http_cache_turbo_cc_has(v, e, "must-revalidate",
+            sizeof("must-revalidate") - 1)
+        || ngx_http_cache_turbo_cc_has(v, e, "proxy-revalidate",
+            sizeof("proxy-revalidate") - 1))
+    {
+        out->must_revalidate = 1;
+        out->auth_shareable = 1;
+    }
+
+    if (ngx_http_cache_turbo_cc_has(v, e, "public", sizeof("public") - 1)
+        || ctx->cc_smax >= 0)
+    {
+        out->auth_shareable = 1;
+    }
+}
+
+
+static ngx_inline void
+ngx_http_cache_turbo_response_policy_finish(
+    ngx_http_cache_turbo_loc_conf_t *clcf,
+    ngx_http_cache_turbo_response_policy_t *out,
+    ngx_http_cache_turbo_response_policy_ctx_t *ctx)
+{
+    if (clcf->require_header.len != 0 && !ctx->require_found) {
+        out->require_hdr_ok = 0;
+    }
+
+    if (ctx->sc_max >= 0) {
+        out->upstream_ttl = ctx->sc_max;
+    } else if (ctx->cdn_smax >= 0) {
+        out->upstream_ttl = ctx->cdn_smax;
+    } else if (ctx->cdn_max >= 0) {
+        out->upstream_ttl = ctx->cdn_max;
+    } else if (ctx->cc_smax >= 0) {
+        out->upstream_ttl = ctx->cc_smax;
+    } else if (ctx->cc_max >= 0) {
+        out->upstream_ttl = ctx->cc_max;
+    } else if (ctx->expires.len) {
+        time_t  exp = ngx_parse_http_time(ctx->expires.data, ctx->expires.len);
+        if (exp != NGX_ERROR) {
+            exp -= ngx_time();
+            out->upstream_ttl = (exp > 0) ? exp : 0;
+        }
+    }
+}
+
+
 /*
  * RFC 9111 shared-cache safety floor: decide whether THIS response may be stored
  * and replayed to other clients. Refuses when
@@ -3512,31 +3727,15 @@ ngx_http_cache_turbo_response_policy(ngx_http_request_t *r,
 {
     ngx_list_part_t  *part;
     ngx_table_elt_t  *h;
-    ngx_uint_t        i, require_found = 0;
-    time_t            sc_max = -1, cdn_smax = -1, cdn_max = -1;
-    time_t            cc_smax = -1, cc_max = -1;
-    ngx_str_t         expires = ngx_null_string;
+    ngx_uint_t        i;
+    ngx_http_cache_turbo_response_policy_ctx_t  ctx;
 
-    out->upstream_ttl = -1;
-    out->swr = -1;
-    out->sie = -1;
-    out->must_revalidate = 0;
-    out->auth_shareable = 0;
-    out->require_hdr_ok = (clcf->require_header.len == 0) ? 1 : 0;
-    out->cacheable = 1;
-    out->cacheable_reason = NGX_HTTP_CACHE_TURBO_REFUSE_NONE;
-
-    if (r->headers_in.authorization != NULL) {
-        out->cacheable = 0;
-        out->cacheable_reason = NGX_HTTP_CACHE_TURBO_REFUSE_AUTHORIZATION;
-    }
+    ngx_http_cache_turbo_response_policy_init(r, clcf, out, &ctx);
 
     part = &headers->part;
     h = part->elts;
 
     for (i = 0; /* void */ ; i++) {
-        u_char  *v, *e;
-
         if (i >= part->nelts) {
             if (part->next == NULL) {
                 break;
@@ -3549,38 +3748,20 @@ ngx_http_cache_turbo_response_policy(ngx_http_request_t *r,
             continue;
         }
 
-        if (h[i].key.len == sizeof("Expires") - 1
-            && expires.len == 0
-            && ngx_strncasecmp(h[i].key.data, (u_char *) "Expires",
-                               sizeof("Expires") - 1) == 0)
+        if (ctx.expires.len == 0
+            && ngx_http_cache_turbo_response_header_is(&h[i], "Expires",
+                                                       sizeof("Expires") - 1))
         {
-            expires = h[i].value;
+            ctx.expires = h[i].value;
         }
 
-        if (clcf->require_header.len != 0
-            && h[i].key.len == clcf->require_header.len
-            && ngx_strncasecmp(h[i].key.data, clcf->require_header.data,
-                               clcf->require_header.len) == 0)
-        {
-            if (!((h[i].value.len == 3
-                   && ngx_strncasecmp(h[i].value.data, (u_char *) "yes", 3)
-                      == 0)
-                  || (h[i].value.len == 2
-                      && ngx_strncasecmp(h[i].value.data, (u_char *) "on", 2)
-                         == 0)
-                  || (h[i].value.len == 1 && h[i].value.data[0] == '1')))
-            {
-                out->require_hdr_ok = 0;
-            } else if (!require_found) {
-                out->require_hdr_ok = 1;
-            }
-            require_found = 1;
+        if (ngx_http_cache_turbo_response_require_header(clcf, &h[i], out,
+                                                         &ctx)) {
             continue;
         }
 
-        if (h[i].key.len == sizeof("Set-Cookie") - 1
-            && ngx_strncasecmp(h[i].key.data, (u_char *) "Set-Cookie",
-                               sizeof("Set-Cookie") - 1) == 0)
+        if (ngx_http_cache_turbo_response_header_is(&h[i], "Set-Cookie",
+                                                    sizeof("Set-Cookie") - 1))
         {
             if (out->cacheable
                 && !(ngx_http_cache_turbo_set_cookie_relax_allowed(clcf)
@@ -3596,147 +3777,28 @@ ngx_http_cache_turbo_response_policy(ngx_http_request_t *r,
             continue;
         }
 
-        v = h[i].value.data;
-        e = v + h[i].value.len;
-
-        if (h[i].key.len == sizeof("Surrogate-Control") - 1
-            && ngx_strncasecmp(h[i].key.data, (u_char *) "Surrogate-Control",
-                               sizeof("Surrogate-Control") - 1) == 0)
+        if (ngx_http_cache_turbo_response_header_is(&h[i],
+                "Surrogate-Control", sizeof("Surrogate-Control") - 1))
         {
-            if (out->cacheable
-                && (ngx_http_cache_turbo_cc_has(v, e, "no-store",
-                        sizeof("no-store") - 1)
-                    || ngx_http_cache_turbo_cc_has(v, e, "no-cache",
-                        sizeof("no-cache") - 1)
-                    || ngx_http_cache_turbo_cc_has(v, e, "private",
-                        sizeof("private") - 1)
-                    || ngx_http_cache_turbo_cc_delta(v, e, "max-age",
-                        sizeof("max-age") - 1) == 0
-                    || ngx_http_cache_turbo_cc_delta(v, e, "s-maxage",
-                        sizeof("s-maxage") - 1) == 0))
-            {
-                out->cacheable = 0;
-                out->cacheable_reason =
-                    NGX_HTTP_CACHE_TURBO_REFUSE_CACHE_CONTROL;
-            }
-
-            if (sc_max < 0) {
-                sc_max = ngx_http_cache_turbo_cc_delta(v, e, "max-age",
-                                                       sizeof("max-age") - 1);
-            }
+            ngx_http_cache_turbo_response_surrogate_control(&h[i], out, &ctx);
             continue;
         }
 
-        if (h[i].key.len == sizeof("CDN-Cache-Control") - 1
-            && ngx_strncasecmp(h[i].key.data, (u_char *) "CDN-Cache-Control",
-                               sizeof("CDN-Cache-Control") - 1) == 0)
+        if (ngx_http_cache_turbo_response_header_is(&h[i],
+                "CDN-Cache-Control", sizeof("CDN-Cache-Control") - 1))
         {
-            if (out->cacheable
-                && (ngx_http_cache_turbo_cc_has(v, e, "no-store",
-                        sizeof("no-store") - 1)
-                    || ngx_http_cache_turbo_cc_has(v, e, "no-cache",
-                        sizeof("no-cache") - 1)
-                    || ngx_http_cache_turbo_cc_has(v, e, "private",
-                        sizeof("private") - 1)
-                    || ngx_http_cache_turbo_cc_delta(v, e, "max-age",
-                        sizeof("max-age") - 1) == 0
-                    || ngx_http_cache_turbo_cc_delta(v, e, "s-maxage",
-                        sizeof("s-maxage") - 1) == 0))
-            {
-                out->cacheable = 0;
-                out->cacheable_reason =
-                    NGX_HTTP_CACHE_TURBO_REFUSE_CACHE_CONTROL;
-            }
-
-            if (cdn_smax < 0) {
-                cdn_smax = ngx_http_cache_turbo_cc_delta(v, e, "s-maxage",
-                                                       sizeof("s-maxage") - 1);
-            }
-            if (cdn_max < 0) {
-                cdn_max = ngx_http_cache_turbo_cc_delta(v, e, "max-age",
-                                                       sizeof("max-age") - 1);
-            }
+            ngx_http_cache_turbo_response_cdn_control(&h[i], out, &ctx);
             continue;
         }
 
-        if (h[i].key.len == sizeof("Cache-Control") - 1
-            && ngx_strncasecmp(h[i].key.data, (u_char *) "Cache-Control",
-                               sizeof("Cache-Control") - 1) == 0)
+        if (ngx_http_cache_turbo_response_header_is(&h[i], "Cache-Control",
+                                                    sizeof("Cache-Control") - 1))
         {
-            if (out->cacheable
-                && (ngx_http_cache_turbo_cc_has(v, e, "no-store",
-                        sizeof("no-store") - 1)
-                    || ngx_http_cache_turbo_cc_has(v, e, "no-cache",
-                        sizeof("no-cache") - 1)
-                    || ngx_http_cache_turbo_cc_has(v, e, "private",
-                        sizeof("private") - 1)
-                    || ngx_http_cache_turbo_cc_delta(v, e, "max-age",
-                        sizeof("max-age") - 1) == 0
-                    || ngx_http_cache_turbo_cc_delta(v, e, "s-maxage",
-                        sizeof("s-maxage") - 1) == 0))
-            {
-                out->cacheable = 0;
-                out->cacheable_reason =
-                    NGX_HTTP_CACHE_TURBO_REFUSE_CACHE_CONTROL;
-            }
-
-            if (cc_smax < 0) {
-                cc_smax = ngx_http_cache_turbo_cc_delta(v, e, "s-maxage",
-                                                       sizeof("s-maxage") - 1);
-            }
-            if (cc_max < 0) {
-                cc_max = ngx_http_cache_turbo_cc_delta(v, e, "max-age",
-                                                       sizeof("max-age") - 1);
-            }
-            if (out->swr < 0) {
-                out->swr = ngx_http_cache_turbo_cc_delta(v, e,
-                    "stale-while-revalidate",
-                    sizeof("stale-while-revalidate") - 1);
-            }
-            if (out->sie < 0) {
-                out->sie = ngx_http_cache_turbo_cc_delta(v, e,
-                    "stale-if-error", sizeof("stale-if-error") - 1);
-            }
-
-            if (ngx_http_cache_turbo_cc_has(v, e, "must-revalidate",
-                    sizeof("must-revalidate") - 1)
-                || ngx_http_cache_turbo_cc_has(v, e, "proxy-revalidate",
-                    sizeof("proxy-revalidate") - 1))
-            {
-                out->must_revalidate = 1;
-                out->auth_shareable = 1;
-            }
-
-            if (ngx_http_cache_turbo_cc_has(v, e, "public",
-                    sizeof("public") - 1)
-                || cc_smax >= 0)
-            {
-                out->auth_shareable = 1;
-            }
+            ngx_http_cache_turbo_response_cache_control(&h[i], out, &ctx);
         }
     }
 
-    if (clcf->require_header.len != 0 && !require_found) {
-        out->require_hdr_ok = 0;
-    }
-
-    if (sc_max >= 0) {
-        out->upstream_ttl = sc_max;
-    } else if (cdn_smax >= 0) {
-        out->upstream_ttl = cdn_smax;
-    } else if (cdn_max >= 0) {
-        out->upstream_ttl = cdn_max;
-    } else if (cc_smax >= 0) {
-        out->upstream_ttl = cc_smax;
-    } else if (cc_max >= 0) {
-        out->upstream_ttl = cc_max;
-    } else if (expires.len) {
-        time_t  exp = ngx_parse_http_time(expires.data, expires.len);
-        if (exp != NGX_ERROR) {
-            exp -= ngx_time();
-            out->upstream_ttl = (exp > 0) ? exp : 0;
-        }
-    }
+    ngx_http_cache_turbo_response_policy_finish(clcf, out, &ctx);
 }
 
 
