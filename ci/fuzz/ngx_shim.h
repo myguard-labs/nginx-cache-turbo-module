@@ -37,6 +37,18 @@ typedef struct {
     u_char  *data;
 } ngx_str_t;
 
+/* Specialized shims import these common types, then supply their own reduced
+ * loc-conf shapes for the unrelated production fields they exercise. */
+typedef struct ngx_http_cache_turbo_loc_conf_s
+    ngx_http_cache_turbo_loc_conf_t;
+
+#if !defined(NGX_CACHE_TURBO_FUZZ_SHIM_AUTO_H) \
+    && !defined(NGX_CACHE_TURBO_FUZZ_SHIM_BLOB_H)
+struct ngx_http_cache_turbo_loc_conf_s {
+    size_t  max_size;
+};
+#endif
+
 /* nginx ngx_string.h verbatim: both are plain brace-initializer macros
  * (compile-time constants, no function call), safe in static/const array
  * initializers exactly as in the real headers. */
@@ -55,6 +67,8 @@ typedef struct {
 #else
 #define NGX_MAX_INT_T_VALUE  2147483647
 #endif
+#define NGX_MAX_SIZE_T_VALUE  ((size_t) -1)
+#define NGX_INT_T_LEN         20
 
 #define CR  (u_char) '\r'
 #define LF  (u_char) '\n'
@@ -63,7 +77,12 @@ typedef struct {
  * #define ... lines in src/ngx_http_cache_turbo_redis.c — the build-time
  * grep_defines step (extract_parser.sh) FAILS if the shipped values change,
  * so these can never silently drift. */
-#define NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY    (64 * 1024 * 1024)
+#define NGX_HTTP_CACHE_TURBO_REDIS_MAX_VALUE    (64 * 1024 * 1024)
+#define NGX_HTTP_CACHE_TURBO_REDIS_GET_FRAMING_MAX  (NGX_INT_T_LEN + 5)
+#define NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY  \
+    (NGX_HTTP_CACHE_TURBO_REDIS_MAX_VALUE \
+     + NGX_HTTP_CACHE_TURBO_REDIS_GET_FRAMING_MAX)
+#define NGX_HTTP_CACHE_TURBO_REDIS_MAX_ITER_REPLY  (128 * 1024)
 #define NGX_HTTP_CACHE_TURBO_REDIS_MAX_MEMBERS  (1024 * 1024)
 
 /* Recursion bound for the _frame() pre-framer. Same drift guard as above: the
@@ -139,6 +158,7 @@ typedef struct {
     size_t      rlen;
     ngx_pool_t *pool;
     ngx_pool_t *rpool;
+    ngx_http_cache_turbo_loc_conf_t *clcf;
 
     /* S231-L2-FRAMEQUAD resume state for _frame_scan(). See the shipped op
      * struct in src/ngx_http_cache_turbo_redis.c for the field contract. */

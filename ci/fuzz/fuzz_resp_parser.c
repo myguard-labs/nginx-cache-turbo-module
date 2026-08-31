@@ -72,9 +72,10 @@ check_in_bounds(const u_char *blob, size_t blob_len,
 int
 LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
-    ngx_pool_t  pool;
-    u_char     *buf;
-    size_t      alloc;
+    ngx_http_cache_turbo_loc_conf_t  clcf = { 1024 * 1024 };
+    ngx_pool_t                       pool;
+    u_char                          *buf;
+    size_t                           alloc;
 
     pool.nallocs = 0;
 
@@ -94,7 +95,7 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 
     /* 1) GET bulk-string parser. */
     {
-        ngx_http_cache_turbo_redis_op_t  op;
+        ngx_http_cache_turbo_redis_op_t  op = { 0 };
         u_char    *blob = NULL;
         size_t     blob_len = 0;
         ngx_int_t  rc;
@@ -103,6 +104,7 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         op.rlen = size;
         op.pool = &pool;
         op.rpool = &pool;
+        op.clcf = &clcf;
 
         rc = ngx_http_cache_turbo_redis_parse(&op, &blob, &blob_len);
         /* L13-fix: this parser is TRI-state on failure. NGX_DECLINED is now
@@ -128,7 +130,7 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 
     /* 2) SMEMBERS array parser. */
     {
-        ngx_http_cache_turbo_redis_op_t  op;
+        ngx_http_cache_turbo_redis_op_t  op = { 0 };
         ngx_str_t  *members = NULL;
         ngx_uint_t  nmembers = 0;
         ngx_int_t   rc;
@@ -152,7 +154,7 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 
     /* 3) SCAN 2-tuple parser. */
     {
-        ngx_http_cache_turbo_redis_op_t  op;
+        ngx_http_cache_turbo_redis_op_t  op = { 0 };
         ngx_str_t   cursor = { 0, NULL };
         ngx_str_t  *keys = NULL;
         ngx_uint_t  nkeys = 0;
@@ -264,13 +266,14 @@ static void
 check_split_delivery(u_char *buf, size_t size, ngx_pool_t *pool)
 {
     if (size >= 2) {
+        ngx_http_cache_turbo_loc_conf_t  clcf = { 1024 * 1024 };
         u_char    *whole = NULL;
         size_t     whole_len = 0, split;
         ngx_int_t  rc_whole;
 
         /* Reference verdict: the identical bytes parsed in one piece. */
         {
-            ngx_http_cache_turbo_redis_op_t  ref;
+            ngx_http_cache_turbo_redis_op_t  ref = { 0 };
             u_char  *blob = NULL;
             size_t   blob_len = 0;
 
@@ -278,6 +281,7 @@ check_split_delivery(u_char *buf, size_t size, ngx_pool_t *pool)
             ref.rlen = size;
             ref.pool = pool;
             ref.rpool = pool;
+            ref.clcf = &clcf;
 
             rc_whole = ngx_http_cache_turbo_redis_parse(&ref, &blob, &blob_len);
 
@@ -303,7 +307,7 @@ check_split_delivery(u_char *buf, size_t size, ngx_pool_t *pool)
          * bytes, a bulk body cut one short. Sampling would leave the
          * interesting boundaries to chance. */
         for (split = 1; split < size; split++) {
-            ngx_http_cache_turbo_redis_op_t  op;
+            ngx_http_cache_turbo_redis_op_t  op = { 0 };
             u_char    *grow;
             size_t     step;
             ngx_int_t  rc = NGX_AGAIN;
@@ -312,6 +316,7 @@ check_split_delivery(u_char *buf, size_t size, ngx_pool_t *pool)
             op.rlen = 0;
             op.pool = pool;
             op.rpool = pool;
+            op.clcf = &clcf;
 
             for (step = 0; step < 2; step++) {
                 size_t  have = step == 0 ? split : size;
@@ -414,6 +419,7 @@ static int
 check_get_fixture(const char *name, const u_char *wire, size_t wire_len,
     ngx_int_t want, const u_char *want_blob, size_t want_blob_len)
 {
+    ngx_http_cache_turbo_loc_conf_t  clcf = { 1024 * 1024 };
     ngx_pool_t                       pool = { 0 };
     ngx_http_cache_turbo_redis_op_t  op = { 0 };
     u_char                          *blob = NULL;
@@ -424,6 +430,7 @@ check_get_fixture(const char *name, const u_char *wire, size_t wire_len,
     op.rlen = wire_len;
     op.pool = &pool;
     op.rpool = &pool;
+    op.clcf = &clcf;
 
     got = ngx_http_cache_turbo_redis_parse(&op, &blob, &blob_len);
     if (got != want) {
@@ -450,7 +457,7 @@ static ngx_int_t
 parse_array_dribbled(u_char *buf, size_t total, ngx_pool_t *pool,
     ngx_int_t want, ngx_str_t **members, ngx_uint_t *nmembers)
 {
-    ngx_http_cache_turbo_redis_op_t  op;
+    ngx_http_cache_turbo_redis_op_t  op = { 0 };
     size_t                           delivered;
     ngx_int_t                        rc = NGX_AGAIN;
 
@@ -534,7 +541,7 @@ static ngx_int_t
 parse_scan_dribbled(u_char *buf, size_t total, ngx_pool_t *pool,
     ngx_int_t want, ngx_str_t *cursor, ngx_str_t **keys, ngx_uint_t *nkeys)
 {
-    ngx_http_cache_turbo_redis_op_t  op;
+    ngx_http_cache_turbo_redis_op_t  op = { 0 };
     size_t                           delivered;
     ngx_int_t                        rc = NGX_AGAIN;
 

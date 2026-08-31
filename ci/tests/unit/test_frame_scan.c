@@ -82,6 +82,51 @@ build_array(u_char *buf, size_t cap, ngx_uint_t n)
     return off;
 }
 
+/* A legal COUNT-256 SCAN page can exceed 64 KiB when every composed L2 key is
+ * at the documented 250-byte maximum. Keep the bounded iteration ceiling
+ * large enough for that ordinary page shape; COUNT remains a hint, so the
+ * ceiling is still enforced against a hostile oversized reply. */
+static void
+test_max_key_scan_page_fits_iteration_cap(void)
+{
+    ngx_http_cache_turbo_redis_op_t  op = { 0 };
+    ngx_pool_t                       pool = { 0 };
+    ngx_str_t                        cursor = { 0, NULL };
+    ngx_str_t                       *keys = NULL;
+    ngx_uint_t                       nkeys = 0, i;
+    u_char                           buf[128 * 1024];
+    size_t                           off;
+    ngx_int_t                        rc;
+    int                              w;
+
+    off = (size_t) snprintf((char *) buf, sizeof(buf),
+                            "*2\r\n$1\r\n0\r\n*256\r\n");
+    for (i = 0; i < 256; i++) {
+        w = snprintf((char *) buf + off, sizeof(buf) - off, "$250\r\n");
+        off += (size_t) w;
+        memset(buf + off, 'k', 250);
+        off += 250;
+        buf[off++] = CR;
+        buf[off++] = LF;
+    }
+
+    CHECK(off > 64 * 1024,
+          "maximum-key COUNT-256 SCAN page crosses the old 64 KiB cap");
+    CHECK(off < NGX_HTTP_CACHE_TURBO_REDIS_MAX_ITER_REPLY,
+          "maximum-key COUNT-256 SCAN page fits the iteration reply cap");
+
+    op.rbuf = buf;
+    op.rlen = off;
+    op.pool = &pool;
+    op.rpool = &pool;
+    rc = ngx_http_cache_turbo_redis_parse_scan(&op, &cursor, &keys, &nkeys);
+    CHECK(rc == NGX_OK, "maximum-key COUNT-256 SCAN page parses successfully");
+    CHECK(nkeys == 256, "maximum-key SCAN page preserves all 256 keys");
+    CHECK(cursor.len == 1 && cursor.data[0] == '0',
+          "maximum-key SCAN page preserves its completion cursor");
+    ngx_fuzz_pool_reset(&pool);
+}
+
 /* --- oracle: O(n^2) -> O(n) via cumulative element retirements ---------- */
 
 static void
@@ -424,6 +469,86 @@ test_frame_off_survives_simulated_realloc(void)
           "next lands at reply end after resuming across a simulated realloc");
 }
 
+static ngx_int_t
+parse_get_dribbled(ngx_http_cache_turbo_redis_op_t *op, size_t total,
+    u_char **blob, size_t *blob_len)
+{
+    size_t     delivered;
+    ngx_int_t  rc = NGX_AGAIN;
+
+    for (delivered = 1; delivered <= total; delivered++) {
+        op->rlen = delivered;
+        rc = ngx_http_cache_turbo_redis_parse(op, blob, blob_len);
+        if (rc != NGX_AGAIN) {
+            break;
+        }
+    }
+
+    return rc;
+}
+
+/* CT-AUD31-REDIS-RSS: GET accepts the configured serialized-object boundary,
+ * rejects boundary+1 as soon as its length line is complete, and makes the
+ * same decision under one-byte delivery. This is the parser-side guard that
+ * prevents fill() from geometrically growing toward the old shared 64 MiB
+ * ceiling for an object the location could never store. */
+static void
+test_get_serialized_cap_exact_and_dribbled(void)
+{
+    ngx_http_cache_turbo_redis_op_t  op;
+    ngx_http_cache_turbo_loc_conf_t  clcf;
+    ngx_pool_t                       pool;
+    u_char                           buf[128], *blob = NULL;
+    size_t                           blob_len = 0, total;
+    ngx_int_t                        rc;
+
+    clcf.max_size = 32;
+    total = (size_t) snprintf((char *) buf, sizeof(buf),
+                              "$32\r\n01234567890123456789012345678901\r\n");
+    memset(&op, 0, sizeof(op));
+    pool.nallocs = 0;
+    op.rbuf = buf;
+    op.pool = &pool;
+    op.rpool = &pool;
+    op.clcf = &clcf;
+    rc = parse_get_dribbled(&op, total, &blob, &blob_len);
+    CHECK(rc == NGX_OK, "configured GET cap accepts an exact-boundary blob");
+    CHECK(blob_len == 32, "exact-boundary GET preserves the complete payload");
+
+    total = (size_t) snprintf((char *) buf, sizeof(buf),
+                              "$33\r\n012345678901234567890123456789012\r\n");
+    memset(&op, 0, sizeof(op));
+    op.rbuf = buf;
+    op.pool = &pool;
+    op.rpool = &pool;
+    op.clcf = &clcf;
+    rc = parse_get_dribbled(&op, total, &blob, &blob_len);
+    CHECK(rc == NGX_ERROR,
+          "configured GET cap rejects boundary+1 under one-byte delivery");
+    CHECK(op.rlen == 5,
+          "oversize GET is rejected at the completed length line, before payload");
+
+    memcpy(buf, "$999999999999999999999999\r\n", 27);
+    memset(&op, 0, sizeof(op));
+    op.rbuf = buf;
+    op.rlen = 27;
+    op.pool = &pool;
+    op.rpool = &pool;
+    op.clcf = &clcf;
+    rc = ngx_http_cache_turbo_redis_parse(&op, &blob, &blob_len);
+    CHECK(rc == NGX_ERROR,
+          "malformed overflowing GET length is rejected without payload bytes");
+
+    CHECK(ngx_http_cache_turbo_redis_get_reply_max(
+              NGX_HTTP_CACHE_TURBO_REDIS_MAX_VALUE)
+          == NGX_HTTP_CACHE_TURBO_REDIS_MAX_VALUE
+             + NGX_HTTP_CACHE_TURBO_REDIS_GET_FRAMING_MAX,
+          "historical 64 MiB payload boundary includes full RESP framing");
+    CHECK(ngx_http_cache_turbo_redis_get_reply_max(0)
+          == NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY,
+          "incomplete config state retains a bounded 64 MiB payload fallback");
+}
+
 int
 main(void)
 {
@@ -435,6 +560,8 @@ main(void)
     test_malformed_arrays_declined_identically_when_dribbled();
     test_empty_and_nil_array();
     test_frame_off_survives_simulated_realloc();
+    test_max_key_scan_page_fits_iteration_cap();
+    test_get_serialized_cap_exact_and_dribbled();
 
     fprintf(stderr, "%d checks, %d failed\n", checks, failures);
     if (failures == 0) {

@@ -55,6 +55,9 @@ check_define() {
     fi
 }
 check_define NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY
+check_define NGX_HTTP_CACHE_TURBO_REDIS_MAX_VALUE
+check_define NGX_HTTP_CACHE_TURBO_REDIS_GET_FRAMING_MAX
+check_define NGX_HTTP_CACHE_TURBO_REDIS_MAX_ITER_REPLY
 check_define NGX_HTTP_CACHE_TURBO_REDIS_MAX_MEMBERS
 check_define NGX_HTTP_CACHE_TURBO_REDIS_FRAME_MAX_DEPTH
 
@@ -85,8 +88,8 @@ awk '
     /^#define[[:space:]]+NGX_HTTP_CACHE_TURBO_REDIS_FRAME_MAX_DEPTH[[:space:]]/ {
         next
     }
-    /^static ngx_int_t$/ { pending = 1; buf = $0 ORS; next }
-    pending && /^ngx_http_cache_turbo_redis_(parse(_array|_scan|_bulk)?|resp_len|frame|frame_scan|frame_scan_prologue)\(/ {
+    /^static (ngx_int_t|size_t)$/ { pending = 1; buf = $0 ORS; next }
+    pending && /^ngx_http_cache_turbo_redis_(get_reply_max|parse(_array|_scan|_bulk)?|resp_len|frame|frame_scan|frame_scan_prologue)\(/ {
         capture = 1; pending = 0; printf "%s", buf; print; next
     }
     pending { pending = 0; buf = "" }
@@ -99,6 +102,7 @@ awk '
 # --- sanity: all three must be present and the file must end on a closing brace.
 for fn in \
     'ngx_http_cache_turbo_redis_resp_len(' \
+    'ngx_http_cache_turbo_redis_get_reply_max(' \
     'ngx_http_cache_turbo_redis_parse(' \
     'ngx_http_cache_turbo_redis_parse_array(' \
     'ngx_http_cache_turbo_redis_parse_scan(' \

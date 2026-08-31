@@ -1015,6 +1015,83 @@ def test_l2_malformed_blob_rejected(ng: Nginx, origin: Origin,
             f"x-cache={h2.get('x-cache')})"
 
 
+def test_l2_get_serialized_size_cap(ng: Nginx, origin: Origin,
+                                    redis: RedisServer) -> None:
+    """CT-AUD31-REDIS-RSS: GET obeys the configured serialized-object cap.
+
+    Exact 1 MiB remains a valid L2 HIT; boundary+1 falls through to origin.
+    Parser units supply the malformed-length and one-byte-dribble controls.
+    """
+    directive = "cache_turbo_max_size 1m;"
+    for value, accepted in (("0", False), ("65m", False),
+                            ("1", True), ("64m", True)):
+        result = _config_test_result(
+            ng, lambda cfg, value=value: cfg.replace(
+                directive, f"cache_turbo_max_size {value};", 1))
+        assert (result.returncode == 0) is accepted, (
+            f"cache_turbo_max_size {value} acceptance={result.returncode == 0}, "
+            f"expected {accepted}:\n{result.stdout}")
+
+    cap = 1024 * 1024
+    overhead = len(make_ctb5_blob(b""))
+    assert overhead < cap, "CTB5 fixture overhead unexpectedly exceeds cap"
+
+    exact_uri = "/l2/redis-cap-exact"
+    exact_body = b"x" * (cap - overhead)
+    exact_blob = make_ctb5_blob(exact_body)
+    assert len(exact_blob) == cap, "exact-cap fixture is not exactly 1 MiB"
+    redis.set_raw(l2_key(exact_uri), exact_blob, 60_000)
+
+    origin_before = origin.hits
+    s, body, headers = fetch(ng.port, exact_uri)
+    assert s == 200 and headers.get("x-cache") == "HIT", \
+        "a valid serialized object exactly at max_size was not served from L2"
+    assert body.encode() == exact_body, "exact-cap L2 payload changed in transit"
+    assert origin.hits == origin_before, "exact-cap L2 HIT consulted origin"
+
+    over_uri = "/l2/redis-cap-over"
+    over_blob = make_ctb5_blob(b"y" * (cap + 1 - overhead))
+    assert len(over_blob) == cap + 1, "over-cap fixture is not boundary+1"
+    redis.set_raw(l2_key(over_uri), over_blob, 60_000)
+
+    s, _, headers = fetch(ng.port, over_uri)
+    assert s == 200 and "x-cache" not in headers, \
+        "a boundary+1 serialized L2 object bypassed cache_turbo_max_size"
+    assert origin.hits == origin_before + 1, \
+        "oversize L2 object did not fall through to origin"
+
+
+def test_l2_writer_serialized_size_cap(ng: Nginx, origin: Origin,
+                                       redis: RedisServer) -> None:
+    """CT-AUD31: headers count toward the same cap on the writer side."""
+    uri = "/l2serialcap/manyhdr"
+    key = l2_key(uri, prefix="ctsc:")
+    redis.cli("DEL", key)
+    before = origin.hits_for("manyhdr")
+
+    first = fetch(ng.port, uri)
+    settle: dict[str, tuple[int, int] | None] = {"prev": None}
+
+    def serialcap_quiescent() -> bool:
+        current = (_admin_lock_waits(ng, "/_cache_serialcap"),
+                   _admin_stat(ng, "misses", "/_cache_serialcap"))
+        stable = current == settle["prev"]
+        settle["prev"] = current
+        return stable
+
+    assert wait_for(serialcap_quiescent, timeout=5.0, interval=0.05), \
+        "serialized-cap zone did not quiesce after the first request"
+    second = fetch(ng.port, uri)
+    assert first[0] == 200 and second[0] == 200, \
+        f"serialized-cap origin responses failed: {first[0]}, {second[0]}"
+    assert "x-cache" not in first[2] and "x-cache" not in second[2], \
+        "metadata+headers pushed the blob over cap but it was stored in L1"
+    assert origin.hits_for("manyhdr") == before + 2, \
+        "second over-cap request did not return to origin"
+    assert not wait_for(lambda: redis.cli("EXISTS", key) == "1", timeout=1.0), \
+        "metadata+headers pushed the blob over cap but it was stored in L2"
+
+
 def test_sie_ttl_stored_in_blob(ng: Nginx, origin: Origin,
                                 redis: RedisServer) -> None:
     """RFC-2 (CTB4): a response Cache-Control: stale-if-error=N is recorded as an
@@ -1849,6 +1926,44 @@ def test_l2_tag_purge_large(ng: Nginx, origin: Origin,
     assert wait_for(lambda: redis.cli("EXISTS", l2_key("/l2t/big-0")) == "0"
                     and redis.cli("EXISTS", l2_key(f"/l2t/big-{n-1}")) == "0",
                     timeout=10.0), "purged members survived in L2"
+
+
+def test_l2_tag_purge_over_reply_cap_is_retryable(
+        ng: Nginx, redis: RedisServer) -> None:
+    """CT-AUD31-REDIS-RSS large-tag/concurrent negative control.
+
+    A legacy SMEMBERS reply above the distinct 128 KiB iteration cap fails as
+    incomplete without deleting the tag index or member objects. Eight modest
+    concurrent requests cover multiplication of the bounded request shape.
+    """
+    tag = "redis-rss-over-cap"
+    tkey = tag_key(tag)
+    n = 2200
+    members = [f"ct:{i:064x}" for i in range(n)]
+    redis.cli("DEL", tkey, members[0], members[-1])
+    added = redis.cli("SADD", tkey, *members)
+    assert added == str(n), f"large-tag fixture added {added}/{n} members"
+    redis.cli("SET", members[0], "sentinel-first")
+    redis.cli("SET", members[-1], "sentinel-last")
+
+    def purge(_: int) -> tuple[int, str]:
+        status, body, _ = fetch(
+            ng.port, f"/_cache_l2?tag={tag}", method="POST")
+        return status, body
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        replies = list(ex.map(purge, range(8)))
+
+    assert all(status == 500 for status, _ in replies), replies
+    assert all(json.loads(body).get("l2") == "incomplete"
+               for _, body in replies), replies
+    assert redis.cli("SCARD", tkey) == str(n), \
+        "over-cap tag enumeration deleted or truncated its retry index"
+    assert redis.cli("GET", members[0]) == "sentinel-first" \
+        and redis.cli("GET", members[-1]) == "sentinel-last", \
+        "over-cap tag enumeration deleted member objects before completeness"
+
+    redis.cli("DEL", tkey, members[0], members[-1])
 
 
 def test_l2_tag_cap_and_dedup(ng: Nginx, origin: Origin,

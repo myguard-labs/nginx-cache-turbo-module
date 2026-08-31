@@ -82,9 +82,9 @@ ngx_strncasecmp(u_char *s1, u_char *s2, size_t n)
  * declaration, so an added field it starts reading is a compile error here
  * rather than a silent read of uninitialised fuzz state.
  */
-typedef struct {
+struct ngx_http_cache_turbo_loc_conf_s {
     ngx_flag_t  surrogate_key;
     ngx_str_t   require_header;
-} ngx_http_cache_turbo_loc_conf_t;
+};
 
 #endif /* NGX_CACHE_TURBO_FUZZ_SHIM_BLOB_H */

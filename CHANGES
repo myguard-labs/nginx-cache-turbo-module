@@ -8,6 +8,20 @@ Changes with the nginx-cache-turbo-module (unreleased)
        available as an explicit cache_turbo_key opt-in, and all existing
        explicit raw or normalized keys retain their behaviour and inheritance.
 
+    *) Security: Redis GET replies are now rejected from their declared RESP
+       length when the serialized object exceeds cache_turbo_max_size, before
+       geometric receive-buffer growth; SCAN and tag-enumeration replies use a
+       separate 128 KiB ceiling, large enough for a full COUNT-256 SCAN page
+       of maximum-length L2 keys. An over-cap tag reply returns an incomplete
+       500 and retains its index and objects without partial deletion instead
+       of deleting the index as an empty success; retry requires a smaller set
+       or future pagination. cache_turbo_max_size now consistently covers
+       serialized metadata and headers as well as the body, and its accepted
+       range is 1 byte through 64 MiB (`0` is rejected). Affects: all versions
+       through 1.2.0 when Redis is configured; a compromised or faulty Redis peer could
+       otherwise drive roughly 192 MiB of live pool/request allocations per
+       public L1 miss with a near-64 MiB value.
+
     *) Bugfix: TTL_MAX now uses the smaller of the uint32 wire ceiling and the
        platform time_t ceiling. On a 32-bit time_t build, casting UINT32_MAX to
        time_t produced -1, so ordinary positive cache TTLs collapsed to an

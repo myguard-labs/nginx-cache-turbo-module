@@ -153,6 +153,12 @@
  * idle L2 conns/worker is already absurd; reject anything larger at parse. */
 #define NGX_HTTP_CACHE_TURBO_KEEPALIVE_MAX  65535
 
+/* cache_turbo_max_size is a serialized-object contract and the Redis GET
+ * payload budget. A finite upper bound keeps one configured request from
+ * recreating the old 64 MiB-per-buffer amplification; 0 is rejected rather
+ * than ambiguously meaning "unbounded" to writers and "64 MiB" to readers. */
+#define NGX_HTTP_CACHE_TURBO_REDIS_MAX_VALUE  (64 * 1024 * 1024)
+
 /* cache_turbo_keep_stale <off|time|forever> (S2.1; read side wired in S2.2).
  * Origin-independent last-resort stale retention: when a response carries no
  * `stale-if-error` window of its own, this becomes the effective
@@ -3207,7 +3213,8 @@ void ngx_http_cache_turbo_redis_del_many(ngx_http_cache_turbo_loc_conf_t *clcf,
  * callback so it can tell a FINISHED walk from an ABANDONED one. Before this
  * existed every terminal path — cursor 0, read timeout, malformed reply —
  * called the callback identically, so a half-purged L2 was reported as a clean
- * success. NULL for the SMEMBERS path (which walks nothing).
+ * success. The bounded SMEMBERS path also supplies this outcome so an
+ * over-cap/malformed tag reply cannot be mistaken for an empty success.
  *
  *   status  NGX_OK    - cursor returned to 0: the whole keyspace was walked
  *           NGX_ABORT - the page cap or scan_deadline was hit: purge is
@@ -3229,12 +3236,13 @@ typedef struct {
     unsigned    deadline:1;
 } ngx_http_cache_turbo_redis_walk_t;
 
-/* Completion callback for a SMEMBERS fetch: invoked once with the set members
+/* Completion callback for a bounded Redis enumeration: invoked once with the
+ * set members on SMEMBERS, or with no members after a SCAN delete walk.
  * (pointing into transient buffers — copy what must outlive the call) BEFORE
  * the request is finalized. Must produce the HTTP response and return the rc to
  * finalize with. Called with nmembers==0 on an empty/missing set or any error,
- * so the response path is uniform. `walk` is non-NULL only on the SCAN-del
- * path; a callback that ignores it treats an abandoned walk as a success. */
+ * so the response path is uniform. `walk` is non-NULL for SCAN-del and bounded
+ * SMEMBERS; a callback that ignores it treats an abandoned walk as success. */
 typedef ngx_int_t (*ngx_http_cache_turbo_redis_members_pt)(
     ngx_http_request_t *r, void *data, ngx_str_t *members,
     ngx_uint_t nmembers, const ngx_http_cache_turbo_redis_walk_t *walk);

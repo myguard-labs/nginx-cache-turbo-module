@@ -1244,6 +1244,8 @@ char *ngx_http_cache_turbo_key(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 char *ngx_http_cache_turbo_valid_conf(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
+char *ngx_http_cache_turbo_max_size_conf(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
 char *ngx_http_cache_turbo_admin(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 char *ngx_http_cache_turbo_tag(ngx_conf_t *cf, ngx_command_t *cmd,
