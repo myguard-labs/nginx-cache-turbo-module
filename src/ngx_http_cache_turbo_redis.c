@@ -3166,7 +3166,13 @@ ngx_http_cache_turbo_redis_read_smembers(ngx_event_t *rev)
         if (rc == NGX_AGAIN) {
             continue;                      /* read more before parsing */
         }
-        /* NGX_DECLINED falls through: parse_array reports the same miss. */
+        if (rc != NGX_OK || next != op->rbuf + op->rlen) {
+            /* One command owns this connection.  Accepting a valid first
+             * array while ignoring trailing bytes would turn a malformed or
+             * desynchronised reply into a successful purge enumeration. */
+            ngx_http_cache_turbo_redis_smembers_finish(op, NULL, 0);
+            return;
+        }
 
         rc = ngx_http_cache_turbo_redis_parse_array(op, &members, &nmembers);
         if (rc == NGX_OK) {
@@ -3355,7 +3361,12 @@ ngx_http_cache_turbo_redis_read_scan(ngx_event_t *rev)
         if (rc == NGX_AGAIN) {
             continue;                      /* read more before parsing */
         }
-        /* NGX_DECLINED falls through: parse_scan reports the same failure. */
+        if (rc != NGX_OK || next != op->rbuf + op->rlen) {
+            /* SCAN is likewise one request/reply per connection.  Reject a
+             * complete first frame followed by any unconsumed bytes. */
+            ngx_http_cache_turbo_redis_smembers_finish(op, NULL, 0);
+            return;
+        }
 
         rc = ngx_http_cache_turbo_redis_parse_scan(op, &cursor, &keys, &nkeys);
         if (rc != NGX_OK) {

@@ -71,16 +71,17 @@ The gates it calls, and the classes of bug they exist to catch:
   runs, so a clone that never enabled the hook still cannot land a regression.
   The fastest feedback in the suite.
 - **Build & Test** — builds the module against current nginx (and, where
-  applicable, Angie) and runs the unit tests under **ASan/UBSan**.
+  applicable, Angie), runs the extracted-production unit suite natively and
+  as a 32-bit binary, and runs the runtime tests under **ASan/UBSan**.
   AddressSanitizer and UndefinedBehaviorSanitizer are compiler
   instrumentation that make memory bugs (use-after-free, buffer overflows,
   signed overflow) crash loudly at the exact line instead of corrupting
   memory silently. If ASan complains, the bug is real — fix it, don't
   suppress it.
 - **Security scanners** (`security-scanners.yml`) — flawfinder, clang-tidy
-  (`cert-*`, `clang-analyzer-security.*`) and semgrep over the module
-  sources. Static analysis: it reads the code without running it and
-  flags dangerous patterns.
+  (tracked `cert-*`/`clang-analyzer-security.*` policy), advisory GCC
+  `-fanalyzer`, and semgrep over the module sources. Static analysis reads the
+  code without running it and flags dangerous patterns.
 - **Fuzzing** (`fuzzing.yml`) — a libFuzzer regression run over the module's
   input parsers: every recorded past crash is replayed, then each of the five
   targets explores for 60 seconds. Fuzzing feeds a parser millions of mutated
@@ -110,6 +111,24 @@ build if that table and `.github/workflows/` ever disagree.
 
 Your PR merges when **all** checks are green. If a gate fails and you
 believe the gate is wrong, say so in the PR — with evidence, not vibes.
+
+### Dynamic and static coverage map
+
+| Lens | Reachable surface and evidence | Deliberate limit |
+|---|---|---|
+| ASan + UBSan | nginx request/runtime suites plus extracted production units; regression fixtures and mutation controls prove the targeted paths execute | does not model cross-process shared-memory races |
+| 32-bit unit run | the width-sensitive production TTL/SWR math, Cache-Control parser, Vary generation/encoding, and exact shipped TTL macro with 32-bit pointers, `size_t`, `long`, and `time_t`; catches width-only truncation and overflow | no 32-bit live nginx or crypto-linked integration leg |
+| libFuzzer | RESP, memcached, blob, auto-classification, and query-normalization parsers; recorded corpora replay before exploration | PR exploration is time-boxed; monthly CI carries the long campaign |
+| Memcheck | on-demand short soak and monthly 600-second deep soak | slower than sanitizers, so not duplicated on every PR |
+| clang-tidy | every `src/*.c` through the real captured compile database; checks are pinned in `.clang-tidy` | module translation units only, not upstream nginx |
+| GCC `-fanalyzer` | every `src/*.c` through the same captured compile database; diagnostics are retained as an advisory artifact | advisory because nginx pool idioms still produce compiler-version-dependent noise |
+| CodeQL | monthly/manual semantic scan of every module translation unit | not duplicated on the PR lane |
+| TSan / Helgrind / DRD | not applicable to the principal shared-memory race model: nginx workers are separate processes using `ngx_shmtx`, while these tools model pthread-style in-process synchronization | concurrency invariants use focused multiprocess stress, mutation controls, and lock-seam checks instead |
+
+Every active lens above has a reachable source surface. A new parser, source
+file, or synchronization mechanism must either widen the matching row and its
+tests or document why the tool cannot model it; a green tool with zero covered
+translation units is a CI failure.
 
 Before pushing a parser or fuzz-harness change, fuzz locally first:
 `fuzz/build.sh` compiles every `fuzz/fuzz_*.c` with `-Werror`, so a stale

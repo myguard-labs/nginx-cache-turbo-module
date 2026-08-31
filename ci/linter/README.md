@@ -52,6 +52,21 @@ Rule config lives at the repo root so editors and these scripts agree:
 `.yamllint` (workflow-shaped YAML), `.perlcriticrc` (Test::Nginx-shaped Perl).
 Both carry the reason for every relaxation; read them before adding another.
 
+### File and rule profiles
+
+| File profile | Blocking rules | Explicit exclusions |
+|---|---|---|
+| C (`src/*.[ch]`) | nginx conventions, promoted ast-grep rules, cppcheck warning/performance/portability, flawfinder >=4, immutable Semgrep WARNING+, CI clang-tidy CERT/security policy | low-confidence flawfinder and unpromoted ast-grep candidates remain visible but advisory |
+| Shell (`*.sh`, `*.bash`, hooks) | ShellCheck warning+ | generated/vendor scripts are selected through `lib.sh`, never silently skipped by a tool |
+| Python (`*.py`) | Ruff `F,B,I,PLE,RET,RUF059` | formatter policy is intentionally not adopted |
+| Perl (`ci/t/*.t`, `*.pl`, `*.pm`) | syntax plus Perl::Critic severity 4+ | vendored Test::Nginx code is outside the owned profile |
+| YAML (`*.yml`, `*.yaml`) | yamllint, actionlint, zizmor pedantic, repository workflow-policy checks | policy fixtures contain deliberate red cases and are tested by `selftest.sh` |
+| Markdown/prose | codespell plus workflow/documentation set equality | markdown style-only rules are deliberately absent, as quantified above |
+
+Adding a file type without assigning it to a profile is a coverage gap. Adding
+a checker requires the checker-set negative control in `selftest.sh` and a
+matching `LINT_ONLY` entry where the PR workflow uses an allowlist.
+
 Thresholds deliberately match `.github/workflows/security-scanners.yml`. Move
 one there and move it here **in the same commit**, or local-green stops
 predicting remote-green — the only reason this directory exists.

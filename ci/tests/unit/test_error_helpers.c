@@ -39,7 +39,9 @@ ngx_uint_t  ngx_test_del_timer_calls;
 ngx_int_t   ngx_test_redis_frame_result;
 ngx_int_t   ngx_test_redis_fill_result;
 ngx_int_t   ngx_test_redis_frame_scan_result;
+size_t      ngx_test_redis_frame_scan_next;
 ngx_int_t   ngx_test_redis_parse_array_result;
+ngx_uint_t  ngx_test_redis_parse_array_calls;
 ngx_uint_t  ngx_test_members_calls;
 ngx_str_t  *ngx_test_members;
 ngx_uint_t  ngx_test_nmembers;
@@ -135,7 +137,9 @@ reset_observations(void)
     ngx_test_redis_frame_result = NGX_OK;
     ngx_test_redis_fill_result = NGX_ERROR;
     ngx_test_redis_frame_scan_result = NGX_ERROR;
+    ngx_test_redis_frame_scan_next = 0;
     ngx_test_redis_parse_array_result = NGX_ERROR;
+    ngx_test_redis_parse_array_calls = 0;
     ngx_test_members_calls = 0;
     ngx_test_members = (ngx_str_t *) (uintptr_t) 1;
     ngx_test_nmembers = 99;
@@ -481,6 +485,57 @@ test_redis_smembers_zero_byte(void)
 }
 
 static void
+test_redis_smembers_requires_exact_frame(void)
+{
+    static u_char reply[] = "*0\r\nJUNK";
+    ngx_http_cache_turbo_loc_conf_t clcf;
+    ngx_http_cache_turbo_ctx_t      ctx;
+    ngx_http_cache_turbo_redis_op_t op;
+    ngx_http_request_t              request;
+    ngx_connection_t                connection;
+    ngx_pool_t                      pool;
+    ngx_event_t                     read, write;
+
+    init_request(&request, &connection, &pool, &read, &write);
+    init_redis(&op, &clcf, &ctx, &request, &pool);
+    op.members_cb = members_callback;
+    op.members_data = (void *) (uintptr_t) 0x51;
+    op.rbuf = reply;
+    op.rlen = sizeof(reply) - 1;
+    connection.data = &op;
+    reset_observations();
+    ngx_test_redis_fill_result = NGX_OK;
+    ngx_test_redis_frame_scan_result = NGX_OK;
+    ngx_test_redis_frame_scan_next = 4; /* complete *0 frame, then junk */
+    ngx_test_redis_parse_array_result = NGX_OK;
+
+    ngx_http_cache_turbo_redis_read_smembers(&read);
+
+    CHECK(ngx_test_redis_parse_array_calls == 0,
+          "SMEMBERS must reject trailing RESP bytes before parsing");
+    CHECK(ngx_test_members_calls == 1 && ngx_test_members == NULL
+              && ngx_test_nmembers == 0,
+          "SMEMBERS trailing bytes must complete as a failed enumeration");
+
+    init_redis(&op, &clcf, &ctx, &request, &pool);
+    op.members_cb = members_callback;
+    op.members_data = (void *) (uintptr_t) 0x51;
+    op.rbuf = reply;
+    op.rlen = 4;
+    connection.data = &op;
+    reset_observations();
+    ngx_test_redis_fill_result = NGX_OK;
+    ngx_test_redis_frame_scan_result = NGX_OK;
+    ngx_test_redis_frame_scan_next = 4;
+    ngx_test_redis_parse_array_result = NGX_OK;
+
+    ngx_http_cache_turbo_redis_read_smembers(&read);
+
+    CHECK(ngx_test_redis_parse_array_calls == 1,
+          "SMEMBERS must still parse an exactly consumed RESP frame");
+}
+
+static void
 test_redis_drain_ownership(void)
 {
     static const u_char reply[] = "+OK\r\n";
@@ -530,6 +585,7 @@ main(void)
     test_memcached_drain_ownership();
     test_redis_get_and_lock_compositions();
     test_redis_smembers_zero_byte();
+    test_redis_smembers_requires_exact_frame();
     test_redis_drain_ownership();
 
     fprintf(stderr, "terminal error compositions: %d failures\n", failures);

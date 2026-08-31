@@ -9,6 +9,8 @@ star-imports this module, so every test stays reachable as
 
 from __future__ import annotations
 
+import collections
+
 # Underscore-prefixed names are NOT re-exported by `import *`, so the
 # private helpers this module actually calls are imported explicitly.
 from test_runtime_base import *
@@ -1296,20 +1298,26 @@ def test_shm_refresh_under_pressure(ng: Nginx) -> None:
 
 def test_concurrent_hits_no_deadlock(ng: Nginx) -> None:
     """R1: many parallel HITs on one key do not serialise/deadlock."""
-    fetch(ng.port, "/c/conc")                      # prime
+    fetch(ng.port, "/conc/item")                   # prime
     start = time.time()
     with concurrent.futures.ThreadPoolExecutor(max_workers=32) as pool:
-        results = list(pool.map(lambda _: fetch(ng.port, "/c/conc"),
+        results = list(pool.map(lambda _: fetch(ng.port, "/conc/item"),
                                 range(500)))
     elapsed = time.time() - start
     assert all(r[0] == 200 for r in results), "some concurrent HITs failed"
-    assert all(r[2].get("x-cache") == "HIT" for r in results), \
-        "some concurrent reads were not HITs"
+    states = collections.Counter(r[2].get("x-cache") for r in results)
+    assert states == {"HIT": len(results)}, \
+        f"some concurrent reads were not HITs: {dict(states)}"
     # 500 cached HITs should be fast; serialising under a held lock would blow
-    # this. Scaled by ASAN_TIME_SCALE: an ASan build is slow enough on a loaded
-    # runner to make the fixed 10s band marginal even with no lock stall
-    # (FLAKE-ASAN-TIMING-BAND); unscaled (factor 1.0) outside a sanitizer run.
-    budget = 10 * sanitizer_time_scale()
+    # this. Native stays at 10s and single-process ASan at 20s. Four-worker ASan
+    # also pays instrumented process scheduling on a shared runner: run
+    # 33341207046 completed all 500 HITs without a sanitizer finding in 55.1s.
+    # Keep that topology's wall-clock guard for a real hang, but do not treat
+    # host contention as a module lock stall (FLAKE-ASAN-TIMING-BAND).
+    if "ASAN_OPTIONS" in os.environ and not ng.single_process:
+        budget = 90
+    else:
+        budget = 10 * sanitizer_time_scale()
     assert elapsed < budget, \
         f"concurrent HITs took {elapsed:.1f}s (possible lock stall, budget {budget:.1f}s)"
 

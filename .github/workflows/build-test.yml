@@ -1,4 +1,4 @@
-# sync-sha: 0ecfa73d9e82f449dd54dd7ee006df8ec5e0eaaf7be3fac14b39e3d43193865d
+# sync-sha: 85e4ff5421b8172d1ddcc6dc759c960f06f2ac150f1fc67304cd82e24ddce9ac
 name: Build & Test
 
 # Runner labels live in the POOL repository variable. Every checked-in selector
@@ -201,6 +201,27 @@ jobs:
           # against a shim and drives the fixed-point boundary branches the HTTP
           # runtime suite cannot reach. check_constants.sh guards shim drift.
           bash ci/tests/unit/run.sh
+
+      # Re-run the width-sensitive extracted-production subset with 32-bit
+      # pointers, size_t, long and time_t. Crypto-linked controls remain in the
+      # full-width lane because this runner's i386 OpenSSL and amd64 MyGuard
+      # libzstd packages are not co-installable.
+      - name: Install 32-bit unit-test toolchain
+        run: |
+          sudo apt-get -o DPkg::Lock::Timeout=120 install -y \
+            gcc-multilib
+
+      - name: Pure-math unit tests (32-bit)
+        run: |
+          printf '_Static_assert(sizeof(void *) == 4, "not 32-bit");\n' \
+            | gcc -m32 -x c -fsyntax-only -
+          if printf '_Static_assert(sizeof(void *) == 8, "mutant survived");\n' \
+               | gcc -m32 -x c -fsyntax-only - >/dev/null 2>&1; then
+            echo "32-bit negative control unexpectedly compiled" >&2
+            exit 1
+          fi
+          EXPECT_TIME_T_BYTES=4 UNIT_CFLAGS=-m32 UNIT_WIDTH_ONLY=1 \
+            bash ci/tests/unit/run.sh
 
       - name: Lint workflows
         run: |

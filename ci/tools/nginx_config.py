@@ -1654,6 +1654,17 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # Dedicated long-TTL fixture for the 500-request contention probe.
+        # Under ASan on a loaded runner, a 30s entry can expire during the
+        # hammer and turn a valid no-deadlock run into an unrelated MISS.
+        location /conc/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    5m;
+            cache_turbo_max_size 1m;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # AUD30: cache-turbo snapshots the origin's windows-1251 representation
         # before the downstream charset filter converts it. Both MISS and HIT
         # must rebuild the typed source charset and convert independently.

@@ -2,8 +2,10 @@
 #
 # Build + run the cache-turbo pure-math unit tests. Fast, hermetic, no nginx.
 #
-#   ci/tests/unit/run.sh            # build with warnings-as-errors + run
-#   COVERAGE=1 ci/tests/unit/run.sh # also instrument (--coverage) so a caller can
+#   ci/tests/unit/run.sh                   # warnings-as-errors + run
+#   UNIT_CFLAGS=-m32 ci/tests/unit/run.sh  # add flags to every unit compile/link
+#   UNIT_WIDTH_ONLY=1 ...                  # stop before crypto-linked controls
+#   COVERAGE=1 ci/tests/unit/run.sh        # also instrument (--coverage) so a caller can
 #                                # gcov ../../src/ngx_http_cache_turbo_{swr,
 #                                # autotune}.c afterwards
 #
@@ -14,7 +16,7 @@ set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CC="${CC:-cc}"
-CFLAGS="-g -O0 -Wall -Wextra -Werror -I$DIR"
+CFLAGS="-g -O0 -Wall -Wextra -Werror -I$DIR ${UNIT_CFLAGS:-}"
 
 bash "$DIR/check_constants.sh"
 bash "$DIR/check_directive_synopsis.sh" "$(cd "$DIR/../../.." && pwd)"
@@ -22,6 +24,10 @@ bash "$DIR/check_default_comments.sh" "$(cd "$DIR/../../.." && pwd)"
 bash "$DIR/check_testkit_contract.sh" "$(cd "$DIR/../../.." && pwd)"
 bash "$DIR/check_stage_inventory_control.sh" "$(cd "$DIR/../../.." && pwd)"
 bash "$DIR/check_producer_status_controls.sh" "$(cd "$DIR/../../.." && pwd)"
+bash "$DIR/check_norm_args_tail.sh"
+bash "$DIR/check_norm_args_tail_control.sh"
+bash "$DIR/check_versions_env.sh"
+bash "$DIR/check_ttl_width.sh"
 
 SHM_COVERAGE_FLAGS=""
 if [ "${COVERAGE:-0}" = 1 ]; then
@@ -63,6 +69,15 @@ bash "$DIR/extract_cc_delta.sh"
 # shellcheck disable=SC2086
 "$CC" $CFLAGS "$DIR/test_vary_encoding_collapse.c" -o "$DIR/test_vary_encoding_collapse"
 "$DIR/test_vary_encoding_collapse"
+
+# The 32-bit lane targets width-sensitive arithmetic and parser contracts.  It
+# stops here because this host's i386 OpenSSL packages are not co-installable
+# with its amd64 MyGuard libzstd build; the ordinary lane below remains the full
+# crypto/parser/sanitizer suite.
+if [ "${UNIT_WIDTH_ONLY:-0}" = 1 ]; then
+    echo "unit: width-sensitive subset passed"
+    exit 0
+fi
 
 # --- the same claim, against the REAL variant_hash (AUD-GEN1) --------------
 # test_vary_gen.c above mirrors the arithmetic; this one links the production

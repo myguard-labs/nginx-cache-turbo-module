@@ -5170,7 +5170,11 @@ ngx_http_cache_turbo_normalized_args_variable(ngx_http_request_t *r,
             }
         }
 
-        p = amp + 1;
+        /* amp == last is the ordinary final-token case.  `last` is already
+         * the permitted one-past pointer; forming last + 1 is undefined C
+         * even though the next loop condition would reject it before a
+         * dereference.  Advance only when ngx_strlchr() found a real '&'. */
+        p = (amp < last) ? amp + 1 : amp;
     }
 
     if (kept == 0) {

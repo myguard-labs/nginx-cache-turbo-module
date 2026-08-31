@@ -1,4 +1,4 @@
-# sync-sha: 9338d1fbb62d08ea7eee8b7f3cfae49cfe0891cf903ef7c6bfdc8b531bc437ac
+# sync-sha: a323a7b5ab9374789d87684755991a8d4462959182506a081ec657e40eb7e4de
 name: Valgrind
 
 # Valgrind memcheck lite soak (60s @ 4 conc) — ON-DEMAND ONLY.
@@ -15,8 +15,7 @@ name: Valgrind
 #
 # Kept (rather than deleted) as a workflow_dispatch entry point: a 60s soak is
 # the right tool for a quick manual check on a suspect branch without waiting
-# for a full ci-deep run. Retaining workflow_call also means re-adding it to a
-# gate is a one-line change if the pool ever widens.
+# for a full ci-deep run.
 #
 # Action pins (keep in sync with build-test.yml header):
 # actions/checkout@v5        -> 93cb6efe18208431cddfb8368fd83d5badbf9bfd
@@ -25,7 +24,6 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 on:
-  workflow_call: {}
   workflow_dispatch: {}
 
 concurrency:

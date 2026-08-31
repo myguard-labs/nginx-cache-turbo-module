@@ -1,4 +1,4 @@
-# sync-sha: 3ad5c08b17231c03a830a8ec18b5e8e2f4444aecc85346605a66067a60b2fb35
+# sync-sha: efe4cd43891940e2966fe77b67d80259ed39f9107d031fa3595557de264d0a88
 name: CodeQL
 
 env:
@@ -7,7 +7,6 @@ env:
 on:
   schedule:
     - cron: "47 4 5 * *"
-  workflow_call: {}
   workflow_dispatch: {}
 
 concurrency:
