@@ -1309,10 +1309,15 @@ def test_concurrent_hits_no_deadlock(ng: Nginx) -> None:
     assert states == {"HIT": len(results)}, \
         f"some concurrent reads were not HITs: {dict(states)}"
     # 500 cached HITs should be fast; serialising under a held lock would blow
-    # this. Scaled by ASAN_TIME_SCALE: an ASan build is slow enough on a loaded
-    # runner to make the fixed 10s band marginal even with no lock stall
-    # (FLAKE-ASAN-TIMING-BAND); unscaled (factor 1.0) outside a sanitizer run.
-    budget = 10 * sanitizer_time_scale()
+    # this. Native stays at 10s and single-process ASan at 20s. Four-worker ASan
+    # also pays instrumented process scheduling on a shared runner: run
+    # 33341207046 completed all 500 HITs without a sanitizer finding in 55.1s.
+    # Keep that topology's wall-clock guard for a real hang, but do not treat
+    # host contention as a module lock stall (FLAKE-ASAN-TIMING-BAND).
+    if "ASAN_OPTIONS" in os.environ and not ng.single_process:
+        budget = 90
+    else:
+        budget = 10 * sanitizer_time_scale()
     assert elapsed < budget, \
         f"concurrent HITs took {elapsed:.1f}s (possible lock stall, budget {budget:.1f}s)"
 
