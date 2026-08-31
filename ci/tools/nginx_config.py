@@ -259,6 +259,24 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # CT-AUD31: body fits (a few bytes), but the 45 stored X-Many headers
+        # push the serialized object past this cap. Neither tier may store it.
+        location /l2serialcap/ {{
+            cache_turbo          serialcapz;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    30s;
+            cache_turbo_max_size 256;
+            cache_turbo_lock_timeout 250ms;
+            cache_turbo_redis    127.0.0.1:{redis_port} prefix=ctsc: timeout=250ms;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        location = /_cache_serialcap {{
+            cache_turbo_admin    serialcapz;
+            allow 127.0.0.1;
+            deny all;
+        }}
+
         # C-S5-a: RFC-1 request Cache-Control serve verdict evaluated against
         # the L2 (Redis) arm, not L1 (module.c:5296). An L2 entry can be
         # YOUNGER than the L1 copy (a peer refreshed it), so the verdict must
@@ -1558,6 +1576,7 @@ http {{
     # into its own zone keeps the two fault classes from cross-contaminating
     # each other's tests.
     cache_turbo_zone name=tcapz 1m;
+    cache_turbo_zone name=serialcapz 1m;
     cache_turbo_zone name=l2negz 1m;
     # SUITE-1: private zone for the long-memo outage location (/l2negout/), kept
     # separate from l2negz so the 60s memo cannot bleed into the short-window

@@ -2669,7 +2669,12 @@ ngx_http_cache_turbo_body_filter_store_tail(ngx_http_request_t *r,
     } else {
         blob_len = NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE
                    + hdr_bytes + ctx->body_len;
-        blob = ngx_pnalloc(r->pool, blob_len);
+        /* max_size is the serialized-object contract used by both L1/L2
+         * writers and by the Redis GET reply cap. Enforcing it only against
+         * body bytes lets headers push the stored blob beyond the receive
+         * ceiling and makes a legitimate write unreadable on the next miss. */
+        blob = clcf->max_size > 0 && blob_len > clcf->max_size
+               ? NULL : ngx_pnalloc(r->pool, blob_len);
     }
 
     if (blob == NULL) {

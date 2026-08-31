@@ -61,14 +61,14 @@ typedef struct {
  * same value the real ngx_conf.h uses. */
 #define NGX_CONF_UNSET_PTR  ((void *) -1)
 
-typedef struct {
+struct ngx_http_cache_turbo_loc_conf_s {
     ngx_uint_t  backend_presets;
     /* Mirrors src/ngx_http_cache_turbo_module.h. The preset URI tier rebases
      * r->uri onto this mount before comparing, so the sliced auto_skip reads
      * it and the field must exist here too — see the bit-mirroring note below,
      * which applies to conf FIELDS for the same reason. */
     ngx_str_t  *backend_prefix;
-} ngx_http_cache_turbo_loc_conf_t;
+};
 
 /*
  * Application preset bits — MUST mirror src/ngx_http_cache_turbo_module.h.

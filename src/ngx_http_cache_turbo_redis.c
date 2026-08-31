@@ -36,9 +36,20 @@
 #endif
 
 
-/* Hard ceiling on a GET reply, so a bogus/huge value can't grow the recv
- * buffer without bound. Comfortably above any sane cached page. */
-#define NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY  (64 * 1024 * 1024)
+/* Absolute fallback ceiling for incomplete configuration state. Production
+ * config rejects max_size=0 and values above this serialized-object limit;
+ * iteration replies have their own fixed page ceiling. */
+#ifndef NGX_HTTP_CACHE_TURBO_REDIS_MAX_VALUE
+#define NGX_HTTP_CACHE_TURBO_REDIS_MAX_VALUE  (64 * 1024 * 1024)
+#endif
+#define NGX_HTTP_CACHE_TURBO_REDIS_GET_FRAMING_MAX  (NGX_INT_T_LEN + 5)
+#define NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY  \
+    (NGX_HTTP_CACHE_TURBO_REDIS_MAX_VALUE \
+     + NGX_HTTP_CACHE_TURBO_REDIS_GET_FRAMING_MAX)
+
+/* SCAN and tag enumeration are iteration operations, not object transfers.
+ * Bound their replies independently of the GET limit. */
+#define NGX_HTTP_CACHE_TURBO_REDIS_MAX_ITER_REPLY  (128 * 1024)
 
 /* Upper bound on an array reply element count, so a bogus "*<huge>" header
  * can't make us allocate an enormous members array before any data arrives. */
@@ -116,6 +127,7 @@ typedef struct {
     u_char                      *rbuf;     /* GET/SMEMBERS: growable reply buf */
     size_t                       rcap;
     size_t                       rlen;
+    size_t                       reply_max;/* op-specific wire-reply ceiling */
 
     /* S231-L2-FRAMEQUAD: resume state for the iterative
      * ngx_http_cache_turbo_redis_frame_scan() walk, so a dribbled large array
@@ -1773,6 +1785,20 @@ ngx_http_cache_turbo_redis_tag_add(ngx_http_cache_turbo_loc_conf_t *clcf,
 }
 
 
+/* Wire budget for one GET bulk reply. The configured serialized-object limit
+ * is a payload limit; '$', the decimal length, and two CRLF pairs live outside
+ * it. Config validation guarantees 1..MAX_VALUE; the defensive zero fallback
+ * keeps this helper total for fuzz/unit callers and incomplete config state. */
+static size_t
+ngx_http_cache_turbo_redis_get_reply_max(size_t max_size)
+{
+    if (max_size == 0) {
+        return NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY;
+    }
+    return max_size + NGX_HTTP_CACHE_TURBO_REDIS_GET_FRAMING_MAX;
+}
+
+
 ngx_int_t
 ngx_http_cache_turbo_redis_get(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx)
@@ -1794,7 +1820,10 @@ ngx_http_cache_turbo_redis_get(ngx_http_request_t *r,
     op->request = r;
     op->ctx = ctx;
 
-    op->rcap = ngx_pagesize * 4;          /* grows on demand up to MAX_REPLY */
+    /* max_size is the serialized object ceiling. RESP adds '$', decimal
+     * length, two CRLF pairs; NGX_INT_T_LEN bounds the decimal digits. */
+    op->reply_max = ngx_http_cache_turbo_redis_get_reply_max(clcf->max_size);
+    op->rcap = ngx_min(ngx_pagesize * 4, op->reply_max);
     op->rbuf = ngx_pnalloc(pool, op->rcap);
     keybuf = ngx_pnalloc(pool, clcf->redis_prefix.len + 64);
     if (op->rbuf == NULL || keybuf == NULL) {
@@ -1922,8 +1951,15 @@ ngx_http_cache_turbo_redis_smembers(ngx_http_request_t *r,
     op->request = r;
     op->members_cb = cb;
     op->members_data = data;
+    /* Give the monolithic legacy tag enumeration the same explicit walk
+     * outcome contract as SCAN. Hitting the iteration cap must report an
+     * incomplete purge; it must never run the callback as an empty success
+     * and delete the still-populated tag set. */
+    op->is_scan = 1;
+    op->scan_status = NGX_ERROR;
 
-    op->rcap = ngx_pagesize * 4;          /* grows on demand up to MAX_REPLY */
+    op->reply_max = NGX_HTTP_CACHE_TURBO_REDIS_MAX_ITER_REPLY;
+    op->rcap = ngx_min(ngx_pagesize * 4, op->reply_max);
     op->rbuf = ngx_pnalloc(op->pool, op->rcap);
     tagkey = ngx_pnalloc(op->pool,
                          clcf->redis_prefix.len + sizeof("tag:") - 1 + name_len);
@@ -2052,7 +2088,8 @@ ngx_http_cache_turbo_redis_scan_del(ngx_http_request_t *r,
         return NGX_ERROR;
     }
 
-    op->rcap = ngx_pagesize * 4;          /* grows on demand up to MAX_REPLY */
+    op->reply_max = NGX_HTTP_CACHE_TURBO_REDIS_MAX_ITER_REPLY;
+    op->rcap = ngx_min(ngx_pagesize * 4, op->reply_max);
     op->rbuf = ngx_pnalloc(op->rpool, op->rcap);
     if (op->rbuf == NULL) {
         ngx_destroy_pool(op->rpool);
@@ -2431,12 +2468,12 @@ ngx_http_cache_turbo_redis_fill(ngx_http_cache_turbo_redis_op_t *op,
     ngx_connection_t  *c = rev->data;
 
     if (op->rlen == op->rcap) {
-        if (op->rcap >= NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY) {
+        if (op->rcap >= op->reply_max) {
             return NGX_ERROR;
         }
         ncap = op->rcap * 2;
-        if (ncap > NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY) {
-            ncap = NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY;
+        if (ncap > op->reply_max) {
+            ncap = op->reply_max;
         }
         nbuf = ngx_pnalloc(op->rpool, ncap);
         if (nbuf == NULL) {
@@ -2572,7 +2609,10 @@ ngx_http_cache_turbo_redis_parse(ngx_http_cache_turbo_redis_op_t *op,
         return NGX_ERROR;                  /* malformed length line */
     }
 
-    if (len > NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY) {
+    if ((size_t) len > (op->clcf != NULL && op->clcf->max_size > 0
+                         ? op->clcf->max_size
+                         : NGX_HTTP_CACHE_TURBO_REDIS_MAX_VALUE))
+    {
         return NGX_ERROR;                  /* refuse absurd payloads */
     }
 
@@ -2703,7 +2743,7 @@ ngx_http_cache_turbo_redis_frame(u_char *p, u_char *end, ngx_uint_t depth,
             *next = crlf + 2;
             return NGX_OK;
         }
-        if (v > NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY) {
+        if ((size_t) v > NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY) {
             return NGX_DECLINED;
         }
         p = crlf + 2;
@@ -2908,7 +2948,7 @@ ngx_http_cache_turbo_redis_frame_scan(ngx_http_cache_turbo_redis_op_t *op,
                 op->frame_remain[d]--;
                 break;
             }
-            if (v > NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY) {
+            if ((size_t) v > NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY) {
                 return NGX_DECLINED;
             }
             if (end - (crlf + 2) < v + 2) {
@@ -3013,7 +3053,7 @@ ngx_http_cache_turbo_redis_parse_bulk(u_char **p, u_char *end,
         return NGX_OK;
     }
 
-    if (len > NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY) {
+    if ((size_t) len > NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY) {
         return NGX_DECLINED;               /* bound before len + 2 (no overflow) */
     }
 
@@ -3176,6 +3216,8 @@ ngx_http_cache_turbo_redis_read_smembers(ngx_event_t *rev)
 
         rc = ngx_http_cache_turbo_redis_parse_array(op, &members, &nmembers);
         if (rc == NGX_OK) {
+            op->scan_status = NGX_OK;
+            op->scan_pages = 1;
             ngx_http_cache_turbo_redis_smembers_finish(op, members, nmembers);
         } else {
             ngx_http_cache_turbo_redis_smembers_finish(op, NULL, 0);
@@ -3453,7 +3495,8 @@ ngx_http_cache_turbo_redis_read_scan(ngx_event_t *rev)
         }
 
         send = ngx_http_cache_turbo_redis_scan_cmd(np, op->clcf, &cursor);
-        rbuf = send ? ngx_pnalloc(np, ngx_pagesize * 4) : NULL;
+        rbuf = send ? ngx_pnalloc(np,
+                    ngx_min(ngx_pagesize * 4, op->reply_max)) : NULL;
         if (rbuf == NULL) {
             ngx_destroy_pool(np);
             ngx_http_cache_turbo_redis_smembers_finish(op, NULL, 0);
@@ -3465,7 +3508,7 @@ ngx_http_cache_turbo_redis_read_scan(ngx_event_t *rev)
         op->send = send;
         op->command = send;                /* old buffer dies with `old` */
         op->rbuf = rbuf;
-        op->rcap = ngx_pagesize * 4;       /* fresh page: drop any grown cap */
+        op->rcap = ngx_min(ngx_pagesize * 4, op->reply_max);
         op->rlen = 0;
         /* S231-L2-FRAMEQUAD part 4: frame_off/frame_remain/frame_depth are
          * resume state indexed into the OLD op->rbuf being replaced right
@@ -3521,10 +3564,10 @@ ngx_http_cache_turbo_redis_smembers_finish(
      * means the direct SMEMBERS/SCAN reader ended without any peer reply. */
     ngx_http_cache_turbo_redis_backoff_fail(op);
 
-    /* AUD-SCAN1: on the SCAN path, tell the callback HOW the walk ended.
-     * op->scan_status is NGX_OK only where the server returned cursor "0";
-     * every other terminal path (timeout, malformed reply, alloc failure, page
-     * cap) leaves it non-OK and the purge is reported INCOMPLETE. */
+    /* Tell the callback HOW the bounded enumeration ended. For SCAN,
+     * scan_status is NGX_OK only where the server returned cursor "0". For
+     * SMEMBERS it is NGX_OK only after the exact reply parsed within its cap.
+     * Every other terminal path stays non-OK and reports INCOMPLETE. */
     walk.status = op->scan_status;
     walk.pages = op->scan_pages;
     walk.deadline = op->scan_deadline_hit;

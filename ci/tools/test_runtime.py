@@ -430,6 +430,8 @@ def run_all(ng: Nginx, origin: Origin,
             ng, origin, redis)                          # AUD-L2-PROMOTE-RACE
         test_l2_preserves_original_freshness(ng, origin, redis)
         test_l2_malformed_blob_rejected(ng, origin, redis)  # STAB-4 validate
+        test_l2_get_serialized_size_cap(ng, origin, redis)  # CT-AUD31 GET cap
+        test_l2_writer_serialized_size_cap(ng, origin, redis)  # CT-AUD31 writer
         test_ctb5_date_replayed_from_blob(ng, origin, redis)   # PERF-AUD2-02
         test_ctb5_role_tag_restores_typed_headers(ng, origin, redis)  # AUD2-03
         # P4-3 positive control: the store path really does stamp the bit,
@@ -452,6 +454,7 @@ def run_all(ng: Nginx, origin: Origin,
         test_l2_tag_overlong_warns(ng, origin, redis)  # CR297-TAGLEN
         test_l2_tag_purge(ng, origin, redis)
         test_l2_tag_purge_large(ng, origin, redis)  # STAB-3 + PERF-1/2 pipeline
+        test_l2_tag_purge_over_reply_cap_is_retryable(ng, redis)  # CT-AUD31
         test_l2_tag_purge_arg_validation(ng, origin, redis)  # AUD-TAG1
         test_l2_tag_cap_and_dedup(ng, origin, redis)  # PERF-2 tag cap/dedup
         test_l2_tag_cap_purge_reports_degraded(ng, origin, redis)  # TAG-CAP-SILENT-DROP

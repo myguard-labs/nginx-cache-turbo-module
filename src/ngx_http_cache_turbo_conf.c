@@ -39,6 +39,28 @@
 #define NGX_HTTP_CACHE_TURBO_CONF_ERROR(level, cf, err, ...) \
     ((void) (ngx_conf_log_error(level, cf, err, __VA_ARGS__)), NGX_CONF_ERROR)
 
+char *
+ngx_http_cache_turbo_max_size_conf(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf)
+{
+    char                             *rc;
+    ngx_http_cache_turbo_loc_conf_t  *clcf = conf;
+
+    rc = ngx_conf_set_size_slot(cf, cmd, conf);
+    if (rc != NGX_CONF_OK) {
+        return rc;
+    }
+    if (clcf->max_size == 0
+        || clcf->max_size > NGX_HTTP_CACHE_TURBO_REDIS_MAX_VALUE)
+    {
+        return NGX_HTTP_CACHE_TURBO_CONF_ERROR(NGX_LOG_EMERG, cf, 0,
+                    "cache_turbo_max_size must be between 1 and %uz bytes",
+                    (size_t) NGX_HTTP_CACHE_TURBO_REDIS_MAX_VALUE);
+    }
+
+    return NGX_CONF_OK;
+}
+
 #if (NGX_SSL)
 #include <ngx_event_openssl.h>
 

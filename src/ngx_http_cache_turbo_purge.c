@@ -408,7 +408,22 @@ ngx_http_cache_turbo_tag_purge_complete(ngx_http_request_t *r, void *data,
     u_char                           *tagkey, *p;
     ngx_str_t                        *delkeys, body;
 
-    (void) walk;                 /* SMEMBERS walks no keyspace: always NULL */
+    /* A bounded iteration that cannot enumerate the full set is a failed
+     * purge, not an empty successful one. In particular, do not delete the tag
+     * key here: retaining it makes the operation safely retryable and keeps
+     * every unvisited object discoverable. */
+    if (walk != NULL && walk->status != NGX_OK) {
+        p = ngx_pnalloc(r->pool,
+                        sizeof("{\"purged\":0,\"l2\":\"incomplete\"}\n"));
+        if (p == NULL) {
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+        body.data = p;
+        body.len = ngx_sprintf(p,
+                    "{\"purged\":0,\"l2\":\"incomplete\"}\n") - p;
+        return ngx_http_cache_turbo_send_json(
+                    r, NGX_HTTP_INTERNAL_SERVER_ERROR, &body);
+    }
 
     plen = tp->clcf->redis_prefix.len;
 
