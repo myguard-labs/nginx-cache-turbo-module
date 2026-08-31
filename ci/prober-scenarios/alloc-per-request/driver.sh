@@ -4,8 +4,8 @@
 set -euo pipefail
 
 # Warm the cache before the honest run takes its origin snapshot. This makes
-# every measured request a HIT and lets probe_baseline distinguish cumulative
-# HIT-path slab churn from the legitimate allocations that store a cold item.
+# bodyless measured requests HIT and lets probe_baseline distinguish cumulative
+# cache-path slab churn from the legitimate allocations that store a cold item.
 HOST=127.0.0.1
 PORT="$PROBER_RESOLVED_PORT"
 TIMEOUT_SCALE="${PROBER_TIMEOUT_SCALE:-1}"
@@ -50,7 +50,7 @@ echo "1..4"
 run_green 1 warmup.rule.fixture \
 	"a cold MISS stores the item and the next request is a genuine HIT"
 run_green 2 alloc-per-request.rule \
-	"HIT-path request sizes leave slab and cycle-pool resources flat"
+	"cache HIT and request-body bypass sizes leave slab and cycle-pool resources flat"
 run_red 3 negative-control-slab.rule.fixture \
 	'delta zone\.slab_reqs:' \
 	"the slab-allocation comparator fires on its negative control"

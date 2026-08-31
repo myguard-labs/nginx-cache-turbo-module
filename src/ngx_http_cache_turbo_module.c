@@ -1040,6 +1040,7 @@ ngx_http_cache_turbo_build_key(ngx_http_request_t *r,
         return NGX_ERROR;
     }
 
+    ctx->key_ready = 1;
     return NGX_OK;
 }
 

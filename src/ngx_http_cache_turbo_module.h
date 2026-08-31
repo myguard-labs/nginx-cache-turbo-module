@@ -2837,6 +2837,9 @@ typedef struct {
      * re-entry of the access handler (L2/NX-lock/cold-wait wake). */
     unsigned                 min_uses_skip:1;
     unsigned                 min_uses_passed:1;
+    /* Positive precondition for every keyed side effect. Request-semantic
+     * bypasses publish a veto-only ctx without calling build_key(). */
+    unsigned                 key_ready:1;
     /* RFC-1 request Cache-Control (parsed once in the prologue). only_if_cached
      * (RFC 9111 §5.2.1.7): the client refuses origin contact, so a request that
      * cannot be served from L1/L2 returns 504 instead of going to the origin.

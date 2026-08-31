@@ -269,6 +269,315 @@ def test_post_passthrough_uncached(ng: Nginx, origin: Origin) -> None:
         f"GET caching broken next to POSTs: {hg2.get('x-cache')} {bg1!r}/{bg2!r}"
 
 
+def _request_gate_fetch(conn: http.client.HTTPConnection, path: str,
+                        headers: list[tuple[str, str]] | None = None,
+                        body: bytes = b"", chunked: bool = False,
+                        method: str = "GET"):
+    """Send one request without losing duplicate fields or chunk framing."""
+    conn.putrequest(method, path, skip_accept_encoding=True)
+    conn.putheader("Connection", "keep-alive")
+    for name, value in headers or []:
+        conn.putheader(name, value)
+    if chunked:
+        conn.putheader("Transfer-Encoding", "chunked")
+    elif body:
+        conn.putheader("Content-Length", str(len(body)))
+    conn.endheaders()
+    if chunked:
+        midpoint = max(1, len(body) // 2)
+        for piece in (body[:midpoint], body[midpoint:]):
+            if piece:
+                conn.send(f"{len(piece):x}\r\n".encode() + piece + b"\r\n")
+        conn.send(b"0\r\n\r\n")
+    elif body:
+        conn.send(body)
+    response = conn.getresponse()
+    response_body = response.read().decode("utf-8", "replace")
+    return (response.status, response_body,
+            {k.lower(): v for k, v in response.getheaders()})
+
+
+def _assert_chunked_get_body_bypass(ng: Nginx, origin: Origin,
+                                    payload: bytes, payload_sha: str,
+                                    empty_sha: str) -> None:
+    """Exercise non-empty and empty chunked framing on keepalive."""
+    chunked = "/c/request-gate-chunked"
+    conn = http.client.HTTPConnection("127.0.0.1", ng.port,
+                                      timeout=HTTP_TIMEOUT)
+    try:
+        sc, bc, hc = _request_gate_fetch(conn, chunked, body=payload,
+                                         chunked=True)
+        sn, bn, hn = _request_gate_fetch(conn, chunked)
+        _, bch, hch = _request_gate_fetch(conn, chunked)
+    finally:
+        conn.close()
+    assert sc == 200 and "x-cache" not in hc and f"body={payload_sha}" in bc
+    assert sn == 200 and "x-cache" not in hn and bn != bc, \
+        "chunked GET poisoned the following bodyless request"
+    assert hch.get("x-cache") == "HIT" and bch == bn
+
+    # Even an empty chunked stream bypasses: at access time its decoded size is
+    # not yet known, and treating it as bodyless would make eligibility depend
+    # on content read only after cache lookup.
+    empty_chunked = "/c/request-gate-empty-chunked"
+    _, empty_victim, _ = fetch_raw(ng.port, empty_chunked)
+    _, _, empty_hit = fetch_raw(ng.port, empty_chunked)
+    assert empty_hit.get("x-cache") == "HIT"
+    empty_base = origin.hits_for("request-gate-empty-chunked")
+    conn = http.client.HTTPConnection("127.0.0.1", ng.port,
+                                      timeout=HTTP_TIMEOUT)
+    try:
+        se, be, he = _request_gate_fetch(conn, empty_chunked, chunked=True)
+    finally:
+        conn.close()
+    assert se == 200 and "x-cache" not in he and f"body={empty_sha}" in be
+    assert be != empty_victim
+    assert origin.hits_for("request-gate-empty-chunked") == empty_base + 1
+
+
+def _assert_head_body_bypass(ng: Nginx, origin: Origin, payload: bytes,
+                             payload_sha: str) -> None:
+    """Prove bodyless HEAD may HIT while bodyful HEAD reaches the origin."""
+    head_path = "/c/request-gate-head-body"
+    _, _, _ = fetch_raw(ng.port, head_path)
+    hs, _, hh = fetch_raw(ng.port, head_path, method="HEAD")
+    assert hs == 200 and hh.get("x-cache") == "HIT", \
+        "ordinary bodyless HEAD no longer reuses a GET entry"
+    head_base = origin.hits_for_method("HEAD", "request-gate-head-body")
+    conn = http.client.HTTPConnection("127.0.0.1", ng.port,
+                                      timeout=HTTP_TIMEOUT)
+    try:
+        hbs, _, hbh = _request_gate_fetch(conn, head_path, body=payload,
+                                          method="HEAD")
+    finally:
+        conn.close()
+    assert hbs == 200 and "x-cache" not in hbh
+    assert hbh.get("x-origin-request-body-sha") == payload_sha, \
+        "bodyful HEAD body did not reach the origin intact"
+    assert origin.hits_for_method("HEAD", "request-gate-head-body") == head_base + 1
+
+
+def test_get_head_request_body_bypasses_cache(ng: Nginx,
+                                              origin: Origin) -> None:
+    """CT-AUD31-GET-BODY: framed GET/HEAD bodies bypass lookup and storage.
+
+    Covers poison-before-victim, the reverse ordering, chunked framing and a
+    same-client-connection sequence.  The origin digest proves bypass did not
+    consume or discard the application request body.
+    """
+    empty_sha = hashlib.sha256(b"").hexdigest()[:16]
+
+    # Explicit zero length remains an ordinary cacheable bodyless GET.
+    zero = "/c/request-gate-zero-length"
+    s1, b1, h1 = fetch_raw(ng.port, zero, headers={"Content-Length": "0"})
+    s2, b2, h2 = fetch_raw(ng.port, zero, headers={"Content-Length": "0"})
+    assert s1 == s2 == 200 and "x-cache" not in h1
+    assert h2.get("x-cache") == "HIT" and b1 == b2, \
+        "Content-Length: 0 stopped ordinary GET caching"
+    assert f"body={empty_sha}" in b1
+
+    # Poison first, then a bodyless victim, all on one downstream keepalive
+    # connection.  The victim must MISS, then its next request must HIT.
+    payload = b"attacker-specific-get-body"
+    payload_sha = hashlib.sha256(payload).hexdigest()[:16]
+    path = "/c/request-gate-body-poison-victim"
+    conn = http.client.HTTPConnection("127.0.0.1", ng.port,
+                                      timeout=HTTP_TIMEOUT)
+    try:
+        sp, bp, hp = _request_gate_fetch(conn, path, body=payload)
+        sv, bv, hv = _request_gate_fetch(conn, path)
+        sh, bh, hh = _request_gate_fetch(conn, path)
+    finally:
+        conn.close()
+    assert sp == sv == sh == 200
+    assert "x-cache" not in hp and f"body={payload_sha}" in bp, \
+        f"GET body did not bypass intact: {hp.get('x-cache')!r} {bp!r}"
+    assert "x-cache" not in hv and bv != bp, \
+        "bodyful GET poisoned the following bodyless victim"
+    assert hh.get("x-cache") == "HIT" and bh == bv, \
+        "bodyless GET caching broke after the bypassed body request"
+
+    # Reverse ordering: an existing bodyless entry must not answer a bodyful
+    # GET, and the bypassed response must not replace that entry.
+    reverse = "/c/request-gate-body-reverse"
+    _, victim, _ = fetch_raw(ng.port, reverse)
+    _, victim_hit, vh = fetch_raw(ng.port, reverse)
+    assert vh.get("x-cache") == "HIT" and victim_hit == victim
+    base = origin.hits_for("request-gate-body-reverse")
+    conn = http.client.HTTPConnection("127.0.0.1", ng.port,
+                                      timeout=HTTP_TIMEOUT)
+    try:
+        sr, br, hr = _request_gate_fetch(conn, reverse, body=payload)
+    finally:
+        conn.close()
+    assert sr == 200 and "x-cache" not in hr and f"body={payload_sha}" in br
+    assert origin.hits_for("request-gate-body-reverse") == base + 1, \
+        "bodyful GET was answered from the existing bodyless cache entry"
+    _, after, ah = fetch_raw(ng.port, reverse)
+    assert ah.get("x-cache") == "HIT" and after == victim, \
+        "bodyful GET replaced the existing bodyless cache entry"
+
+    _assert_chunked_get_body_bypass(ng, origin, payload, payload_sha,
+                                    empty_sha)
+    _assert_head_body_bypass(ng, origin, payload, payload_sha)
+
+
+def _assert_method_override_spellings(ng: Nginx, origin: Origin) -> None:
+    """Check every recognized spelling against an existing cached entry."""
+    spellings = [
+        ("X-HTTP-Method-Override", "POST"),
+        ("x-method-override", "PATCH"),
+        ("X-http-method", "DELETE"),
+    ]
+    for index, (name, value) in enumerate(spellings):
+        path = f"/c/request-gate-method-reverse-{index}"
+        _, victim, _ = fetch_raw(ng.port, path)
+        _, again, hit = fetch_raw(ng.port, path)
+        assert hit.get("x-cache") == "HIT" and again == victim
+        base = origin.hits_for(f"request-gate-method-reverse-{index}")
+        conn = http.client.HTTPConnection("127.0.0.1", ng.port,
+                                          timeout=HTTP_TIMEOUT)
+        try:
+            status, body, headers = _request_gate_fetch(
+                conn, path, headers=[(name, value)])
+        finally:
+            conn.close()
+        field = name.lower()
+        assert status == 200 and "x-cache" not in headers
+        assert f"{field}=[{value}]" in body, \
+            f"override header {name} was not preserved upstream: {body!r}"
+        assert origin.hits_for(f"request-gate-method-reverse-{index}") == base + 1, \
+            f"{name} request was served from cache"
+        _, after, after_headers = fetch_raw(ng.port, path)
+        assert after_headers.get("x-cache") == "HIT" and after == victim, \
+            f"{name} response replaced the bodyless cache entry"
+
+
+
+def _assert_duplicate_and_lookalike_overrides(ng: Nginx) -> None:
+    """Check duplicate preservation and the exact-name negative control."""
+    path = "/c/request-gate-method-duplicates"
+    conn = http.client.HTTPConnection("127.0.0.1", ng.port,
+                                      timeout=HTTP_TIMEOUT)
+    try:
+        sd, bd, hd = _request_gate_fetch(
+            conn, path,
+            headers=[("X-HTTP-Method-Override", "POST"),
+                     ("x-http-method-override", "DELETE")])
+        sv, bv, hv = _request_gate_fetch(conn, path)
+        _, bh, hh = _request_gate_fetch(conn, path)
+    finally:
+        conn.close()
+    assert sd == 200 and "x-cache" not in hd
+    assert "x-http-method-override=[POST|DELETE]" in bd, \
+        f"duplicate override fields were not preserved upstream: {bd!r}"
+    assert sv == 200 and "x-cache" not in hv and bv != bd, \
+        "override request poisoned the following framework-dispatched victim"
+    assert hh.get("x-cache") == "HIT" and bh == bv
+
+    # Exact-name negative control: a lookalike field is ordinary application
+    # metadata and must not disable otherwise safe bodyless GET caching.
+    near = "/c/request-gate-method-near-miss"
+    near_headers = [("X-HTTP-Method-Overrides", "POST")]
+    conn = http.client.HTTPConnection("127.0.0.1", ng.port,
+                                      timeout=HTTP_TIMEOUT)
+    try:
+        ns1, nb1, nh1 = _request_gate_fetch(conn, near, headers=near_headers)
+        ns2, nb2, nh2 = _request_gate_fetch(conn, near, headers=near_headers)
+    finally:
+        conn.close()
+    assert ns1 == ns2 == 200 and "x-cache" not in nh1
+    assert nh2.get("x-cache") == "HIT" and nb2 == nb1, \
+        "lookalike method-override header disabled ordinary GET caching"
+
+
+
+def _assert_method_override_list_spill(ng: Nginx) -> None:
+    """Force a recognized field past the first ngx_list_t part."""
+    spill_path = "/c/request-gate-method-list-spill"
+    spill_headers = [(f"X-Benign-{i}", str(i)) for i in range(32)]
+    spill_headers.append(("X-HTTP-Method-Override", "POST"))
+    conn = http.client.HTTPConnection("127.0.0.1", ng.port,
+                                      timeout=HTTP_TIMEOUT)
+    try:
+        ss, sb, sh = _request_gate_fetch(conn, spill_path,
+                                         headers=spill_headers)
+        sv, vb, vh = _request_gate_fetch(conn, spill_path)
+        _, va, vhh = _request_gate_fetch(conn, spill_path)
+    finally:
+        conn.close()
+    assert ss == 200 and "x-cache" not in sh
+    assert "x-http-method-override=[POST]" in sb, \
+        f"post-spill override header was not preserved upstream: {sb!r}"
+    assert sv == 200 and "x-cache" not in vh and vb != sb, \
+        "post-spill override header poisoned the bodyless victim"
+    assert vhh.get("x-cache") == "HIT" and va == vb
+
+
+def _assert_stacked_native_request_gate(ng: Nginx, origin: Origin) -> None:
+    """A cache-turbo bypass must not fall through into stacked proxy_cache."""
+    cases = [
+        ("body", [], b"stacked-native-body"),
+        ("override", [("X-HTTP-Method-Override", "POST")], b""),
+    ]
+    for label, headers, body in cases:
+        path = f"/supcache/request-gate-native-{label}"
+        origin_path = f"request-gate-native-{label}"
+        before = origin.hits_for(origin_path)
+        conn = http.client.HTTPConnection("127.0.0.1", ng.port,
+                                          timeout=HTTP_TIMEOUT)
+        try:
+            s1, b1, h1 = _request_gate_fetch(
+                conn, path, headers=headers, body=body)
+            s2, b2, h2 = _request_gate_fetch(
+                conn, path, headers=headers, body=body)
+        finally:
+            conn.close()
+        assert s1 == s2 == 200 and b1 != b2
+        assert h1.get("x-ct-active") == h2.get("x-ct-active") == "1", \
+            f"{label} bypass did not suppress the stacked native cache"
+        assert h1.get("x-native-cache") != "HIT" \
+            and h2.get("x-native-cache") != "HIT", \
+            f"{label} bypass was served by stacked proxy_cache"
+        assert origin.hits_for(origin_path) == before + 2, \
+            f"{label} bypass did not reach the origin twice"
+
+
+def test_method_override_headers_bypass_cache(ng: Nginx,
+                                              origin: Origin) -> None:
+    """CT-AUD31-METHOD-OVERRIDE: every recognized spelling bypasses safely."""
+    _assert_method_override_spellings(ng, origin)
+    _assert_duplicate_and_lookalike_overrides(ng)
+    _assert_method_override_list_spill(ng)
+    _assert_stacked_native_request_gate(ng, origin)
+
+
+def test_malformed_get_body_framing_rejected_before_cache(ng: Nginx,
+                                                          origin: Origin) -> None:
+    """Malformed/ambiguous GET framing never reaches cache-turbo or origin."""
+    path = "/c/request-gate-malformed-framing"
+    before = origin.hits_for("request-gate-malformed-framing")
+    requests = [
+        (b"Content-Length: 4\r\nTransfer-Encoding: chunked\r\n", b"0\r\n\r\n"),
+        (b"Content-Length: 4\r\nContent-Length: 5\r\n", b"abcde"),
+    ]
+    for framing, body in requests:
+        with socket.create_connection(("127.0.0.1", ng.port),
+                                      timeout=HTTP_TIMEOUT) as sock:
+            sock.sendall(b"GET " + path.encode() + b" HTTP/1.1\r\n"
+                         b"Host: localhost\r\n" + framing
+                         + b"Connection: close\r\n\r\n" + body)
+            first_line = b""
+            while b"\r\n" not in first_line:
+                chunk = sock.recv(256)
+                assert chunk, "malformed framing closed without an HTTP status"
+                first_line += chunk
+        assert first_line.startswith(b"HTTP/1.1 400 "), \
+            f"malformed GET framing was not rejected: {first_line!r}"
+    assert origin.hits_for("request-gate-malformed-framing") == before, \
+        "malformed GET framing reached the application"
+
+
 def test_header_fidelity(ng: Nginx) -> None:
     """R2: Content-Type + arbitrary origin header survive a HIT byte-identical."""
     fetch(ng.port, "/c/hdr")                       # prime

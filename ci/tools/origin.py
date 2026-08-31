@@ -191,15 +191,69 @@ class Origin:
         origin = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
+            def _read_request_body(self) -> bytes:
+                """Read a request body for the request-eligibility fixtures.
+
+                nginx normally buffers a chunked client body and forwards it
+                upstream with Content-Length.  Accept chunked framing here too
+                so the fixture still proves application receipt if that proxy
+                detail changes.
+                """
+                content_length = self.headers.get("Content-Length")
+                if content_length is not None:
+                    size = int(content_length)
+                    return self.rfile.read(size) if size else b""
+
+                transfer_encoding = self.headers.get("Transfer-Encoding", "")
+                if "chunked" not in transfer_encoding.lower():
+                    return b""
+
+                chunks: list[bytes] = []
+                while True:
+                    line = self.rfile.readline()
+                    size = int(line.split(b";", 1)[0].strip(), 16)
+                    if size == 0:
+                        while self.rfile.readline() not in (b"\r\n", b"\n", b""):
+                            pass
+                        break
+                    chunks.append(self.rfile.read(size))
+                    assert self.rfile.read(2) == b"\r\n"
+                return b"".join(chunks)
+
+            def _request_gate_digest(self) -> str | None:
+                """Read a request-gate body and return its truncated digest."""
+                if "request-gate" not in self.path:
+                    return None
+
+                req_body = self._read_request_body()
+                return hashlib.sha256(req_body).hexdigest()[:16]
+
+            def _request_gate_observation(self, n: int) -> bytes | None:
+                """Expose the request body and override fields seen upstream."""
+                digest = self._request_gate_digest()
+                if digest is None:
+                    return None
+
+                fields = []
+                for name in ("X-HTTP-Method-Override", "X-Method-Override",
+                             "X-HTTP-Method"):
+                    values = self.headers.get_all(name) or []
+                    fields.append(f"{name.lower()}=[{'|'.join(values)}]")
+                return (f"request-gate-{n} body={digest} "
+                        f"{' '.join(fields)}\n").encode()
+
             def do_HEAD(self):
                 # A HEAD must reach the origin (no body); the module must NOT
                 # store it as the GET entry.
+                digest = self._request_gate_digest()
                 with origin._lock:
                     origin._n += 1
                     origin._path_hits[self.path] += 1
                     origin._method_hits[("HEAD", self.path)] += 1
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
+                if digest is not None:
+                    self.send_header("X-Origin-Request-Body-SHA", digest)
                 self.send_header("Content-Length", "0")
                 self.end_headers()
 
@@ -1241,9 +1295,11 @@ class Origin:
                     return
                 if self._get_handle_hard_failure(n):
                     return
-                handled, body = self._get_handle_special_cases(n)
-                if handled:
-                    return
+                body = self._request_gate_observation(n)
+                if body is None:
+                    handled, body = self._get_handle_special_cases(n)
+                    if handled:
+                        return
                 if "charsetconvert" in self.path:
                     # "Привет\n" encoded as windows-1251. The nginx charset
                     # filter must convert these bytes to UTF-8 independently

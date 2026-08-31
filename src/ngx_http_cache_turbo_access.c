@@ -118,18 +118,157 @@ ngx_http_cache_turbo_precontent_handler(ngx_http_request_t *r)
 
 /*
  * MAINT-SEAM: the request-shape eligibility gates that run before any cache
- * state is touched. Pure predicate over (r, clcf) -- no ctx, no zone, no
- * allocation, no side effects -- so it re-evaluates identically on a parked
- * L2/lock resume, exactly as the inline run of early returns did.
+ * state is touched. The ambiguous-semantics gate creates a veto-only context
+ * so $cache_turbo_active can also suppress a stacked native cache; it never
+ * builds a key or enters a cache lookup.
  *
  * NGX_OK = this request may proceed to the engaged path; NGX_DECLINED = the
  * caller declines. Split out of access_prologue() to keep the prologue's
  * branching about cache state rather than about request shape.
  */
+static ngx_uint_t
+ngx_http_cache_turbo_request_has_method_override(ngx_http_request_t *r)
+{
+    ngx_list_part_t  *part = &r->headers_in.headers.part;
+    ngx_table_elt_t  *h = part->elts;
+    ngx_uint_t        i;
+
+    for (i = 0; /* void */ ; i++) {
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            h = part->elts;
+            i = 0;
+        }
+
+        if (h[i].hash == 0) {
+            continue;
+        }
+
+        if ((h[i].key.len == sizeof("X-HTTP-Method-Override") - 1
+             && ngx_strncasecmp(h[i].key.data,
+                    (u_char *) "X-HTTP-Method-Override",
+                    sizeof("X-HTTP-Method-Override") - 1) == 0)
+            || (h[i].key.len == sizeof("X-Method-Override") - 1
+                && ngx_strncasecmp(h[i].key.data,
+                    (u_char *) "X-Method-Override",
+                    sizeof("X-Method-Override") - 1) == 0)
+            || (h[i].key.len == sizeof("X-HTTP-Method") - 1
+                && ngx_strncasecmp(h[i].key.data,
+                    (u_char *) "X-HTTP-Method",
+                    sizeof("X-HTTP-Method") - 1) == 0))
+        {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+
+static ngx_uint_t
+ngx_http_cache_turbo_request_has_body(ngx_http_request_t *r)
+{
+    if (r->headers_in.content_length_n > 0 || r->headers_in.chunked) {
+        return 1;
+    }
+
+#if (NGX_HTTP_V2)
+    /* HTTP/2 can carry DATA with Content-Length: 0.  nginx does not mark that
+     * request chunked because a Content-Length field exists, and it validates
+     * the mismatch only after a content handler starts reading the body.  A
+     * cache HIT could finish first, so also reject an unfinished stream or
+     * DATA already parked in the HTTP/2 preread buffer. */
+    if (r->http_version == NGX_HTTP_VERSION_20 && r->stream != NULL
+        && (!r->stream->in_closed
+            || (r->stream->preread != NULL
+                && r->stream->preread->pos != r->stream->preread->last)))
+    {
+        return 1;
+    }
+#endif
+
+#if (NGX_HTTP_V3)
+    /* HTTP/3 has the same Content-Length: 0 gap.  Its request stream exposes
+     * FIN through the QUIC receive state, while DATA already received after
+     * HEADERS remains in header_in until the request-body reader consumes it.
+     * read->eof is insufficient here: nginx only sets it after recv() observes
+     * the already-known FIN, and its Content-Length branch does not make that
+     * call while processing the request headers. */
+    if (r->http_version == NGX_HTTP_VERSION_30
+        && (r->connection->quic == NULL
+            || (r->connection->quic->recv_state
+                    != NGX_QUIC_STREAM_RECV_DATA_RECVD
+                && r->connection->quic->recv_state
+                    != NGX_QUIC_STREAM_RECV_DATA_READ)
+            || r->header_in->pos != r->header_in->last))
+    {
+        return 1;
+    }
+#endif
+
+    return 0;
+}
+
+
+static ngx_int_t
+ngx_http_cache_turbo_decline_ambiguous_request(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf)
+{
+    ngx_http_cache_turbo_ctx_t   *ctx;
+    ngx_http_cache_turbo_zone_t  *z;
+    ngx_uint_t                    has_body, has_override;
+
+    has_body = ngx_http_cache_turbo_request_has_body(r);
+    has_override = ngx_http_cache_turbo_request_has_method_override(r);
+
+    if (!has_body && !has_override) {
+        return NGX_OK;
+    }
+
+    ctx = ngx_http_get_module_ctx(r, ngx_http_cache_turbo_module);
+    if (ctx == NULL) {
+        ctx = ngx_pcalloc(r->pool, sizeof(ngx_http_cache_turbo_ctx_t));
+        if (ctx == NULL) {
+            return NGX_ERROR;
+        }
+        ngx_http_set_ctx(r, ctx, ngx_http_cache_turbo_module);
+    }
+
+    /* auto_skip is the filter-chain capture veto.  ct_active deliberately
+     * remains set: when cache_turbo_suppress_native is enabled, the documented
+     * proxy_no_cache/proxy_cache_bypass wiring must refuse this request too,
+     * rather than moving the same poisoning risk into nginx's URI-only cache. */
+    ctx->auto_skip = 1;
+    ctx->ct_active = 1;
+    ctx->status = NGX_HTTP_CACHE_TURBO_ST_BYPASS;
+
+    z = clcf->shm_zone->data;
+    (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->misses, 1);
+    (void) ngx_atomic_fetch_add(&ngx_http_cache_turbo_zone_sh(z)->bypasses, 1);
+
+    if (has_body) {
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "cache_turbo: request body on GET/HEAD \"%V\""
+                       " -> origin (no lookup, no store)", &r->uri);
+    } else {
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "cache_turbo: method-override header \"%V\""
+                       " -> origin (no lookup, no store)", &r->uri);
+    }
+
+    return NGX_DECLINED;
+}
+
+
 static ngx_int_t
 ngx_http_cache_turbo_access_eligible(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf)
 {
+    ngx_int_t  rc;
+
     if (!clcf->enable || clcf->shm_zone == NULL) {
         return NGX_DECLINED;
     }
@@ -147,6 +286,22 @@ ngx_http_cache_turbo_access_eligible(ngx_http_request_t *r,
          * cache, let it hit the origin and repopulate. A warm subrequest (v3-3)
          * builds its key + captures in the header/body filters. */
         return NGX_DECLINED;
+    }
+
+    /* A body-bearing GET/HEAD is application-defined and can select a
+     * representation that the cache key does not describe.  Decline before
+     * key construction so neither lookup nor response capture can run, while
+     * the normal content handler still receives the request body unchanged.
+     * Chunked framing is refused regardless of decoded length: there is no
+     * reliable non-empty verdict until nginx reads the body, which happens
+     * after this access-phase cache lookup. */
+    /* Framework method-override fields can make an apparent GET dispatch as
+     * POST/PATCH/DELETE after nginx has selected this location.  Presence is
+     * enough to bypass, independent of value, case, or duplicates.  The raw
+     * header list is only inspected; the fields remain available upstream. */
+    rc = ngx_http_cache_turbo_decline_ambiguous_request(r, clcf);
+    if (rc != NGX_OK) {
+        return rc;
     }
 
     /* RFC 9111 shared-cache safety: do not reuse a public representation for a
@@ -214,12 +369,14 @@ ngx_http_cache_turbo_access_prologue(ngx_http_request_t *r,
     ngx_http_cache_turbo_ctx_t **ctxp, ngx_http_cache_turbo_zone_t **zp,
     uint32_t *hashp)
 {
+    ngx_int_t                     rc;
     uint32_t                      hash;
     ngx_http_cache_turbo_ctx_t   *ctx;
     ngx_http_cache_turbo_zone_t  *z;
 
-    if (ngx_http_cache_turbo_access_eligible(r, clcf) != NGX_OK) {
-        return NGX_DECLINED;
+    rc = ngx_http_cache_turbo_access_eligible(r, clcf);
+    if (rc != NGX_OK) {
+        return rc;
     }
 
     ctx = ngx_http_get_module_ctx(r, ngx_http_cache_turbo_module);
