@@ -1850,8 +1850,9 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
-        # default cache key (no cache_turbo_key) = $host$request_uri, so two
-        # Host headers on the same path must NOT collide.
+        # CT-AUD31-DEFAULT-KEY: no cache_turbo_key at all. This must exercise
+        # build_key()'s raw Host + unparsed_uri fallback: Host, session IDs,
+        # tracking args, raw query order and escaping all remain in the key.
         location /dk/ {{
             cache_turbo          main;
             cache_turbo_valid    30s;
@@ -4059,6 +4060,20 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # Explicit normalized key inherited by the nested child. The child has
+        # no cache_turbo_key of its own: if null/default handling overwrites the
+        # parent key, distinct session IDs will stop aliasing in the inheritance
+        # regression even though direct /n/ opt-in remains green.
+        location /ninherit/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri$cache_turbo_normalized_args;
+            cache_turbo_valid    30s;
+
+            location /ninherit/child/ {{
+                proxy_pass http://127.0.0.1:{origin_port}/;
+            }}
+        }}
+
         # extra denylist patterns: exact "sid" + prefix "tmp_*", on top of the
         # built-in defaults (utm_*, fbclid, ...)
         location /ns/ {{
@@ -4241,10 +4256,9 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
-        # Raw-key migration (was cache_turbo_safe_key): an explicit
-        # $scheme$host$request_uri key keeps the full raw query (no strip/sort),
-        # so two distinct sessionid values get distinct entries instead of
-        # aliasing onto one normalized key.
+        # Explicit raw-key compatibility: existing operator-supplied keys keep
+        # the full raw query (no strip/sort), independent of the built-in
+        # fallback selected when cache_turbo_key is absent.
         location /safekey/ {{
             cache_turbo          main;
             cache_turbo_key      $scheme$host$request_uri;

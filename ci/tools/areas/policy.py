@@ -374,8 +374,8 @@ def test_serve_authorized_off_by_default_still_refuses_lookup(
 
 
 def test_default_key_varies_by_host(ng: Nginx) -> None:
-    """Default key (no cache_turbo_key) is $host$request_uri: the same path
-    under two Host headers must NOT collide (cross-vhost poisoning guard)."""
+    """The default key (no cache_turbo_key) starts with the validated Host:
+    the same raw request URI under two Host headers must not collide."""
     s1, b1, h1 = fetch(ng.port, "/dk/hostvary", headers={"Host": "a.example"})
     assert s1 == 200 and "x-cache" not in h1, "first read should be a miss"
     _, b2, h2 = fetch(ng.port, "/dk/hostvary", headers={"Host": "a.example"})
@@ -404,29 +404,104 @@ def test_admin_purge_post_with_body(ng: Nginx) -> None:
     assert "x-cache" not in h2, "entry should be gone after purge (a MISS)"
 
 
-def test_default_key_normalizes(ng: Nginx) -> None:
-    """The default key (no cache_turbo_key) is $host$uri$cache_turbo_normalized_args,
-    so tracking params and the built-in sid/sessionid are stripped: a junk-laden
-    URL shares the clean slot."""
-    _, b1, h1 = fetch(ng.port, "/dk/norm?utm_source=x&sid=42&sessionid=abc")
-    assert "x-cache" not in h1, "first should miss"
-    _, b2, h2 = fetch(ng.port, "/dk/norm")
-    assert h2.get("x-cache") == "HIT" and b2 == b1, \
-        "default key should strip tracking + sid/sessionid to one slot"
+def test_default_key_distinguishes_sessionids(ng: Nginx) -> None:
+    """CT-AUD31-DEFAULT-KEY regression: the compiled-in key has no directive
+    and keeps the raw query. An ALICE response selected by sessionid must never
+    be replayed to BOB; each identity still hits its own entry."""
+    _, alice, ha = fetch(ng.port, "/dk/session?sessionid=ALICE")
+    assert "x-cache" not in ha, "ALICE's first request should MISS"
+    _, bob, hb = fetch(ng.port, "/dk/session?sessionid=BOB")
+    assert "x-cache" not in hb, \
+        ("BOB must not HIT ALICE's default-key entry; "
+         f"got X-Cache={hb.get('x-cache')}")
+    assert bob != alice, "BOB received ALICE's cached response"
+    _, alice2, ha2 = fetch(ng.port, "/dk/session?sessionid=ALICE")
+    assert ha2.get("x-cache") == "HIT" and alice2 == alice, \
+        "ALICE should HIT only ALICE's own raw-query entry"
+
+
+def test_default_key_distinguishes_tracking_args(ng: Nginx) -> None:
+    """The raw default does not silently normalize tracking parameters: clean
+    and utm-tagged URLs occupy distinct entries, and both entries are usable."""
+    clean_uri = "/dk/tracking"
+    tagged_uri = "/dk/tracking?utm_source=campaign"
+    _, clean, hc = fetch(ng.port, clean_uri)
+    assert "x-cache" not in hc, "clean URL's first request should MISS"
+    _, tagged, ht = fetch(ng.port, tagged_uri)
+    assert "x-cache" not in ht, \
+        "the default key must not strip utm_source and alias onto the clean URL"
+    assert tagged != clean, "tracking URL received the clean URL's cached body"
+    _, clean2, hc2 = fetch(ng.port, clean_uri)
+    _, tagged2, ht2 = fetch(ng.port, tagged_uri)
+    assert hc2.get("x-cache") == "HIT" and clean2 == clean
+    assert ht2.get("x-cache") == "HIT" and tagged2 == tagged
+
+
+def test_explicit_normalized_key_still_aliases_stripped_args(ng: Nginx) -> None:
+    """Backward-compatibility control: an explicit normalized key keeps its
+    documented strip behaviour for tracking and session-like parameters."""
+    _, tracked, ht = fetch(
+        ng.port, "/n/explicit-track?utm_source=campaign")
+    assert "x-cache" not in ht, "first explicit-normalized request should MISS"
+    _, clean, hc = fetch(ng.port, "/n/explicit-track")
+    assert hc.get("x-cache") == "HIT" and clean == tracked, \
+        "explicit normalized key must still strip tracking arguments"
+
+    _, alice, ha = fetch(ng.port, "/n/explicit-session?sessionid=ALICE")
+    assert "x-cache" not in ha, "ALICE's normalized-key request should MISS"
+    _, bob, hb = fetch(ng.port, "/n/explicit-session?sessionid=BOB")
+    assert hb.get("x-cache") == "HIT" and bob == alice, \
+        "explicit normalized key must retain its sessionid-stripping contract"
+
+
+def test_explicit_normalized_key_is_inherited(ng: Nginx) -> None:
+    """A child with no cache_turbo_key inherits its parent's explicit
+    normalized expression rather than falling back to the raw built-in key."""
+    _, alice, ha = fetch(
+        ng.port, "/ninherit/child/session?sessionid=ALICE")
+    assert "x-cache" not in ha, "first inherited-key request should MISS"
+    _, bob, hb = fetch(
+        ng.port, "/ninherit/child/session?sessionid=BOB")
+    assert hb.get("x-cache") == "HIT" and bob == alice, \
+        "child did not inherit the parent's explicit normalized key"
+
+
+def test_default_key_admin_purge_reconstruction(ng: Nginx) -> None:
+    """Admin ?key= hashes the rendered key verbatim. For the raw built-in
+    default, operators reconstruct it as validated Host + raw request URI."""
+    import json
+
+    host = "purge.example"
+    uri = "/dk/admin-purge?sessionid=ALICE"
+    headers = {"Host": host}
+    fetch(ng.port, uri, headers=headers)
+    _, _, hh = fetch(ng.port, uri, headers=headers)
+    assert hh.get("x-cache") == "HIT", "entry should exist before key purge"
+
+    rendered_key = host + uri
+    status, body, _ = fetch(
+        ng.port, f"/_cache?key={rendered_key}", method="POST")
+    assert status == 200, f"raw-default key purge status {status}"
+    assert json.loads(body)["purged"] == 1, f"purge count: {body}"
+
+    _, _, hm = fetch(ng.port, uri, headers=headers)
+    assert "x-cache" not in hm, \
+        "reconstructed Host + raw request URI key did not purge the entry"
 
 
 def test_r31_normalize_max_args_over_cap_serves_and_keys_consistently(
         ng: Nginx) -> None:
     """R3-1. $cache_turbo_normalized_args sorts kept params with ngx_sort, an
-    O(n^2) insertion sort, on the DEFAULT cache key, BEFORE the cache lookup --
-    so a hit cannot absorb it and `kept` was bounded only by r->args.len (~8k):
+    O(n^2) insertion sort, on an EXPLICIT normalized key, BEFORE the cache
+    lookup -- so a hit cannot absorb it and `kept` was bounded only by
+    r->args.len (~8k):
     4000 params cost ~23 ms of worker CPU per unauthenticated request.
     cache_turbo_normalize_max_args caps it (default 64): above the cap
     normalization is SKIPPED and the RAW arg string is keyed instead.
 
-    /dk/ carries NO cache_turbo_normalize_max_args directive, so this exercises
-    the COMPILED-IN default -- a location that opted in explicitly would pass
-    even if the merge default never landed.
+    /n/ explicitly opts into normalization but carries NO
+    cache_turbo_normalize_max_args directive, so this exercises the cap's
+    COMPILED-IN default without conflating it with the raw cache-key default.
 
     ORACLE. "Serves correctly and keys consistently" is true on BOTH the capped
     and the uncapped path, so it is not an oracle: with the cap compiled out
@@ -453,23 +528,23 @@ def test_r31_normalize_max_args_over_cap_serves_and_keys_consistently(
     asc = "&".join(f"p{i:04d}=v{i}" for i in range(1, 401))
     desc = "&".join(f"p{i:04d}=v{i}" for i in range(400, 0, -1))
 
-    s1, b1, h1 = fetch(ng.port, f"/dk/r31asc?{asc}")
+    s1, b1, h1 = fetch(ng.port, f"/n/r31asc?{asc}")
     assert s1 == 200, f"over-cap request must still be served, got {s1}"
     assert "x-cache" not in h1, "first over-cap request should MISS"
     # keys consistently: the identical request repeats onto the same entry
-    _, b1b, h1b = fetch(ng.port, f"/dk/r31asc?{asc}")
+    _, b1b, h1b = fetch(ng.port, f"/n/r31asc?{asc}")
     assert h1b.get("x-cache") == "HIT" and b1b == b1, \
         "two identical over-cap requests must key the same entry"
 
     # order-only difference: above the cap the sort is skipped, so this is a
     # DIFFERENT key -> a MISS, and it then caches under its own entry.
-    _, b2, h2 = fetch(ng.port, f"/dk/r31asc?{desc}")
+    _, b2, h2 = fetch(ng.port, f"/n/r31asc?{desc}")
     assert "x-cache" not in h2, \
         "above the cap the sort is skipped: reordered args must NOT collide"
     assert b2 != b1, "reordered over-cap request served the other entry's body"
 
     # tracking param above the cap: strip is skipped -> different key.
-    _, _, h3 = fetch(ng.port, f"/dk/r31asc?utm_source=x&{asc}")
+    _, _, h3 = fetch(ng.port, f"/n/r31asc?utm_source=x&{asc}")
     assert "x-cache" not in h3, \
         "above the cap the strip is skipped: utm_source must NOT collide"
 
@@ -477,12 +552,12 @@ def test_r31_normalize_max_args_over_cap_serves_and_keys_consistently(
     lo_asc = "&".join(f"q{i}=v{i}" for i in range(1, 9))
     lo_desc = "&".join(f"q{i}=v{i}" for i in range(8, 0, -1))
 
-    _, b4, h4 = fetch(ng.port, f"/dk/r31lo?{lo_asc}")
+    _, b4, h4 = fetch(ng.port, f"/n/r31lo?{lo_asc}")
     assert "x-cache" not in h4, "first under-cap request should MISS"
-    _, b5, h5 = fetch(ng.port, f"/dk/r31lo?{lo_desc}")
+    _, b5, h5 = fetch(ng.port, f"/n/r31lo?{lo_desc}")
     assert h5.get("x-cache") == "HIT" and b5 == b4, \
         "under the cap the sort runs: reordered args must share one entry"
-    _, b6, h6 = fetch(ng.port, f"/dk/r31lo?utm_source=x&{lo_asc}")
+    _, b6, h6 = fetch(ng.port, f"/n/r31lo?utm_source=x&{lo_asc}")
     assert h6.get("x-cache") == "HIT" and b6 == b4, \
         "under the cap the strip runs: utm_source must share one entry"
 
@@ -494,7 +569,7 @@ def test_r31_normalize_max_args_config_bounds(ng: Nginx) -> None:
     NGX_CONF_TAKE1 mask. 0 (= unlimited) and a plain integer are accepted."""
     # _config_rejects/_config_accepts assert this substring is present in the
     # generated config, so a config reshuffle breaks these loudly.
-    anchor = "location /dk/ {"
+    anchor = "location /n/ {"
 
     # Accepted: an explicit cap, and 0 meaning unlimited.
     _config_accepts(ng, "r31-num-ok", anchor,
@@ -1785,8 +1860,9 @@ def test_range_on_sie_serve(ng: Nginx, origin: Origin) -> None:
         drain_origin(origin)
 
 
-def test_safe_key_distinct_sessionids(ng: Nginx, origin: Origin) -> None:
-    """Raw-key migration (was cache_turbo_safe_key): an explicit
+def test_explicit_raw_key_distinct_sessionids(
+        ng: Nginx, origin: Origin) -> None:
+    """Explicit raw-key compatibility: an operator-supplied
     cache_turbo_key $scheme$host$request_uri keeps the full raw query, so two
     distinct sessionid values get DISTINCT cache entries instead of aliasing onto
     one normalized key (which could serve user A's page to user B). The same

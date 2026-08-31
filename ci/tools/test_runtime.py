@@ -181,7 +181,11 @@ def run_all(ng: Nginx, origin: Origin,
     test_serve_authorized_never_stores_under_credentials(ng, origin)   # P3-4
     test_serve_authorized_off_by_default_still_refuses_lookup(ng, origin)
     test_default_key_varies_by_host(ng)
-    test_default_key_normalizes(ng)
+    test_default_key_distinguishes_sessionids(ng)
+    test_default_key_distinguishes_tracking_args(ng)
+    test_explicit_normalized_key_still_aliases_stripped_args(ng)
+    test_explicit_normalized_key_is_inherited(ng)
+    test_default_key_admin_purge_reconstruction(ng)
     test_r31_normalize_max_args_over_cap_serves_and_keys_consistently(ng)
     test_r31_normalize_max_args_config_bounds(ng)
     test_cache_redirect(ng)
@@ -229,7 +233,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_range_unsatisfiable_hit_matches_miss(ng, origin)
     test_range_not_offered_on_304(ng, origin)
     test_range_on_sie_serve(ng, origin)
-    test_safe_key_distinct_sessionids(ng, origin)
+    test_explicit_raw_key_distinct_sessionids(ng, origin)
     test_conditional_inm_304(ng, origin)
     test_conditional_inm_list_short_first(ng, origin)
     test_conditional_inm_star(ng)
@@ -731,7 +735,7 @@ def main() -> int:
           "native-cache headers stripped, "
           "admin purge w/ body, "
           "concurrency (R1), prometheus metrics (incl L2 hit/miss), "
-          "default-key normalization, "
+          "raw default-key session/tracking isolation + purge reconstruction, "
           "LRU eviction (R6), S8 scan-resistant segmented LRU (protected hot key survives a scan; default-off and explicit-off both still evict it; churn stores+evicts without wedging; config rejects; on->off across a REAL reload drains inherited PROTECTED nodes), refresh-under-pressure (R6b), "
           "stale serve (R3), single-flight (R4), "
           "cold-miss single-flight (v10: per-box collapse + lock-off stampede), "

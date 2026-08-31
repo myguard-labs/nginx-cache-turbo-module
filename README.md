@@ -1348,10 +1348,11 @@ cache_turbo_normalize_vary  encoding device;   # keep gzip≠brotli, mobile≠de
 ### Sort bound (`cache_turbo_normalize_max_args`)
 
 Normalizing means sorting the surviving params, and that sort is nginx's
-`ngx_sort()` — an insertion sort, O(n²). It runs on the *default* cache key,
-*before* the cache lookup, so a hit cannot absorb it, and the param count is
-bounded only by the size of the request line (~8k by default). At -O2 the
-worst case costs:
+`ngx_sort()` — an insertion sort, O(n²). It runs whenever an explicit
+`cache_turbo_key` uses `$cache_turbo_normalized_args`, *before* the cache
+lookup, so a hit cannot absorb it. The raw built-in key does no normalization
+work. For an opted-in normalized key, the param count is bounded only by the
+size of the request line (~8k by default). At -O2 the worst case costs:
 
 | kept params | worker CPU per request |
 | --- | --- |
@@ -2080,7 +2081,7 @@ http {
             cache_turbo_backend           wordpress; # presets stack with '|' or spaces; see the directive table/docs for the full list; 'none' = off; implies cache_control honor
 
             # ── what is "the same page" ─────────────────────────────────
-            cache_turbo_key               $host$uri$cache_turbo_normalized_args;  # the default
+            cache_turbo_key               $host$uri$cache_turbo_normalized_args;  # explicit normalized opt-in
             cache_turbo_key_encoded_origin off;  # require explicit encoded-origin opt-in
             cache_turbo_normalize_strip   sid sessionid "tmp_*";   # extra args to drop (trailing * = prefix; bare * = all)
             cache_turbo_normalize_max_args 64;        # cap sorted query args
@@ -2310,7 +2311,7 @@ http {
 
 | Variable | Value |
 |---|---|
-| `$cache_turbo_normalized_args` | The request's query string with tracking params stripped and the rest sorted, plus the optional Vary bucket (`cache_turbo_normalize_vary`). The default cache key's args component. |
+| `$cache_turbo_normalized_args` | The request's query string with tracking params stripped and the rest sorted, plus the optional Vary bucket (`cache_turbo_normalize_vary`). It affects cache identity only when selected by an explicit `cache_turbo_key`; the built-in key uses the raw request URI. |
 | `$cache_turbo_active` | `1` when cache-turbo is engaged for this request (enabled, cacheable method, main request) **and** `cache_turbo_suppress_native on`; else `0`. Wire it into a stacked `proxy_cache` via `proxy_no_cache`/`proxy_cache_bypass` so the native cache defers. |
 | `$cache_turbo_beta` | The effective refresh `beta` ×1000 in force for this request (preset/explicit/autotuned). Handy for debugging/logging. |
 | `$cache_turbo_status` | The per-request serve outcome, for access logging. Tokens mirror nginx's `$upstream_cache_status` so the two graph together: `HIT` (served fresh), `STALE` (served stale while refreshing, incl. stale-if-error), `EXPIRED` (a cached entry was found past its serveable window and refetched from origin), `MISS` (no serveable entry anywhere → origin, or an only-if-cached request the cache couldn't satisfy → 504), `BYPASS` (`cache_turbo_bypass` or a CMS backend preset skipped to origin). `-` when cache-turbo never engaged. E.g. `log_format ct '$request "$cache_turbo_status" rt=$request_time';`. |
@@ -2324,7 +2325,7 @@ http {
 | `POST /_cache?action=autotune&value=1` | Force an immediate autotune recompute, then return the same JSON stats body a `GET /_cache` would. |
 | `GET /_cache?format=prometheus` | Same stats in Prometheus text format — scrape this. |
 | `POST /_cache?all=1` | Purge the whole zone (and the L2 keyspace, if Redis is on). L1 walks a finite snapshot-sized budget so concurrent refill cannot starve the worker; if entries remain after that budget, the response is `500` with `{"purged":N,"l1":"incomplete"}` (retry the purge). A configured L2 purge still runs after this L1 outcome. The L2 side is a `SCAN MATCH <prefix>*` walk; if that walk does **not** finish — read timeout, malformed reply, or the internal page cap — the response is `500` with `{"purged":N,"l2":"incomplete","reason":"…"}` and part of L2 still holds entries. If the walk cannot even start — L2 unreachable, connect refused — the response is `500` with `{"purged":N,"l2":"unavailable"}` and L2 is untouched. When both tiers are incomplete, the same object contains both `"l1":"incomplete"` and the applicable `"l2"`/`"reason"` fields. A `200` means L1 was empty at its final lock-held observation and, when Redis is configured, the L2 walk reached the end of the keyspace. |
-| `POST /_cache?key=<string>` | Purge one entry. `<string>` is hashed **verbatim**, so it must equal the entry's full cache-key value — for the built-in default key that is `<host><uri><raw-query-string>` (e.g. `example.com/blog/post-42?id=1`), **not** just the path. Use a `PURGE` request to that URL (above) if you don't want to reconstruct the key. Drops L1 + L2. |
+| `POST /_cache?key=<string>` | Purge one entry. `<string>` is hashed **verbatim**, so it must equal the entry's full cache-key value — for the built-in default key that is `<host><uri><raw-query-string>` (e.g. `example.com/blog/post-42?id=1`), **not** just the path. The argument is not URL-decoded: percent escapes become literal key bytes, and a raw `&` terminates the argument. Use a `PURGE` request to the cached URL (above) when its reconstructed key cannot be represented verbatim as one query argument. Drops L1 + L2. |
 | `POST /_cache?tag=<name>` | Purge every page tagged `<name>` across L1 + L2. |
 | `POST /_cache?url=<path[,path,...]>` | Warm those paths (background prefetch). Each warm subrequest fetches **anonymously** — the admin request's `Cookie` header is stripped, so the entry is stored under the cookieless anonymous key a visitor looks up (and no per-visitor/segment body is pulled from the origin), even if you trigger the warm from a logged-in browser. Fires at most `cache_turbo_warm_max` subrequests (default `32`) regardless of list length. |
 | `POST /_cache?url_file=<path>` | Same as `?url=`, but the list of paths comes from a file on disk (one `path[?query]` per line, CRLF tolerated) instead of the query string — useful when the list is longer than comfortably fits in a URL. Requires nginx built with `--with-threads` and an available/default `thread_pool`; opening, validating, and reading the file are posted through nginx's thread pool, and a missing prerequisite is a clean `500` with a JSON error body plus an error-log entry. A 60-second watchdog logs that an operation is still running but does not unsafely cancel the thread or release its request; completion retains sole ownership of cleanup. Subject to the same `cache_turbo_warm_max` cap, plus its own bounded read: the file must be a regular file no larger than 64 KiB, and no single line may exceed 2048 bytes; either limit, or a missing/unreadable file, is a clean `500` with a JSON error body, never a crash or a silent partial warm. A failed thread-pool post or a dynamic `thread_pool` value that cannot be evaluated for the request produces a separate clean `500` scheduling error rather than being reported as a missing prerequisite. A named pool that does not exist remains a prerequisite error. |

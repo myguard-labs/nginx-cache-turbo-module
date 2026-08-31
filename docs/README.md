@@ -223,16 +223,15 @@ Several rows above are load-bearing:
 
 ## Two traps these guides keep pointing at
 
-**A front-controller redirect changes `$uri`.** The module's configured default
-key is `$host$uri$cache_turbo_normalized_args`. In a typical PHP vhost,
-`try_files ... /index.php` performs an internal redirect before the module runs
-in the PHP location, so `$uri` is then `/index.php`. Without an explicit key,
-different clean URLs can collapse onto one cache entry. The PHP examples in
-these guides therefore use `cache_turbo_key $host$request_uri;`, which keeps the
-original path and query string. It trades the default tracking-argument
-normalization for correctness; an advanced configuration can split the original
-path from `$request_uri` with a `map` and append
-`$cache_turbo_normalized_args`.
+**A front-controller redirect changes `$uri`.** The built-in key uses the Host
+plus the raw, unparsed request URI, so leaving `cache_turbo_key` unset preserves
+the original clean path and query across a typical `try_files ... /index.php`
+internal redirect. The PHP examples spell the equivalent intent explicitly as
+`cache_turbo_key $host$request_uri;`. Be careful when opting into
+`$host$uri$cache_turbo_normalized_args`: in the PHP location `$uri` is already
+`/index.php`, so different clean URLs can collapse onto one entry. An advanced
+configuration can classify the original path from `$request_uri` with a `map`
+and append `$cache_turbo_normalized_args`.
 
 The preset URI tier also evaluates the post-redirect `$uri`, **and so does
 `cache_turbo_bypass_uri`** — it matches `r->uri` through the same matcher. That

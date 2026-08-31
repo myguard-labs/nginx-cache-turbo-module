@@ -1,5 +1,13 @@
 Changes with the nginx-cache-turbo-module (unreleased)
 
+    *) Security: the built-in cache key again uses the validated Host plus the
+       raw, unparsed request URI. An undocumented normalized default stripped
+       session-like query parameters including sid and sessionid, so origins
+       that selected a cacheable response by one of those parameters could
+       serve one visitor's stored response to another. Normalization remains
+       available as an explicit cache_turbo_key opt-in, and all existing
+       explicit raw or normalized keys retain their behaviour and inheritance.
+
     *) Bugfix: TTL_MAX now uses the smaller of the uint32 wire ceiling and the
        platform time_t ceiling. On a 32-bit time_t build, casting UINT32_MAX to
        time_t produced -1, so ordinary positive cache TTLs collapsed to an
