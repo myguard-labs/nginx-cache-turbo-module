@@ -984,6 +984,7 @@ ngx_http_cache_turbo_header_filter_capture(ngx_http_request_t *r,
         ngx_http_cache_turbo_capture_count_refusal(clcf, cacheable_reason,
                                                    req_hdr_ok, resp_encoded);
     } else if (gate_common
+               && (ctx->key_ready || ctx->warm)
                && clcf->shm_zone != NULL
                && r->headers_out.status == NGX_HTTP_NOT_MODIFIED)
     {
@@ -998,12 +999,14 @@ ngx_http_cache_turbo_header_filter_capture(ngx_http_request_t *r,
          * this is the distinct path that exists BECAUSE that refusal is
          * correct and permanent, not a bug to route around.
          *
-         * Deliberately its own `else if`, gated on none of vary_nocache /
-         * min_uses_skip / auto_skip / status_ttl: those gate whether a BODY
-         * may be captured, and this never captures a body -- it only
-         * extends the life of one already resident from an earlier 200.
-         * req_no_store is still honoured: a request that opted this
-         * response out of caching gets no side effect from it either. */
+         * Deliberately its own `else if`, gated on neither vary_nocache,
+         * min_uses_skip, auto_skip nor status_ttl: those gate whether a BODY
+         * may be captured, and this never captures a body. key_ready is the
+         * distinct safety precondition: a veto-only request-gate context has
+         * no built key and therefore cannot freshen. A warm subrequest remains
+         * eligible because freshen_304() builds its key before the L1 call.
+         * req_no_store is still honoured by gate_common for its no-side-effect
+         * semantics. */
         if (ngx_http_cache_turbo_header_filter_freshen_304(r, ctx, clcf)
             != NGX_OK)
         {

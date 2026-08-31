@@ -3934,6 +3934,8 @@ http {{
             proxy_cache_key             $uri;
             proxy_no_cache              $cache_turbo_active;
             proxy_cache_bypass          $cache_turbo_active;
+            add_header                  X-CT-Active $cache_turbo_active always;
+            add_header                  X-Native-Cache $upstream_cache_status always;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 

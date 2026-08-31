@@ -540,9 +540,14 @@ runs. No header = it went to the backend (a miss).
 
 ## What it will and won't cache
 
-By default it stores a `200 OK` to a `GET` (never a `HEAD` — that would store an
-empty body). You can also cache **redirects and negative responses** by giving
-their status codes a TTL:
+By default it stores a `200 OK` to a bodyless `GET` (never a `HEAD` — that would
+store an empty body). A `GET` or `HEAD` with a non-empty `Content-Length` or
+chunked request body bypasses both cache lookup and storage, because the body
+can change application dispatch without appearing in the cache key. Requests
+carrying `X-HTTP-Method-Override`, `X-Method-Override`, or `X-HTTP-Method` do the
+same. Request-body bytes and override-header fields are not stripped; they
+remain available to the configured upstream. You can also cache **redirects
+and negative responses** by giving their status codes a TTL:
 
 ```nginx
 cache_turbo_valid 30s;              # the default / 200 TTL

@@ -22,6 +22,15 @@ Changes with the nginx-cache-turbo-module (unreleased)
        otherwise drive roughly 192 MiB of live pool/request allocations per
        public L1 miss with a near-64 MiB value.
 
+    *) Security: GET and HEAD requests with a non-empty or chunked request
+       body now bypass both cache lookup and storage. Requests carrying
+       X-HTTP-Method-Override, X-Method-Override, or X-HTTP-Method also bypass
+       lookup and storage, regardless of header case, value, or duplicates.
+       Request-body bytes and override-header fields remain available to the
+       upstream application. Previously such requests could consume or
+       populate the same cache entry as an ordinary bodyless GET. Affects: all
+       versions through 1.1.0.
+
     *) Bugfix: TTL_MAX now uses the smaller of the uint32 wire ceiling and the
        platform time_t ceiling. On a 32-bit time_t build, casting UINT32_MAX to
        time_t produced -1, so ordinary positive cache TTLs collapsed to an
