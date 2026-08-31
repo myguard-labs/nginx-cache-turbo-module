@@ -1162,45 +1162,22 @@ ngx_http_cache_turbo_merge_breaker_policy_warn(ngx_conf_t *cf,
     }
 }
 
-/* Group 7: default cache key compile, tag inherit, require_header. Needs
- * conf->enable (Group 1) and conf->key (Group 5) already resolved. */
-static char *
-ngx_http_cache_turbo_merge_key_and_tag(ngx_conf_t *cf,
+/* Group 7: tag inherit and require_header. The key was inherited in Group 5;
+ * NULL deliberately remains NULL so build_key() uses its collision-free raw
+ * Host + unparsed_uri fallback. Normalization is an explicit cache_turbo_key
+ * opt-in because its built-in strip list includes origin-semantic names such
+ * as sid and sessionid. */
+static void
+ngx_http_cache_turbo_merge_tag_and_require_header(
     ngx_http_cache_turbo_loc_conf_t *conf,
     ngx_http_cache_turbo_loc_conf_t *prev)
 {
-    /* Default cache key (no explicit cache_turbo_key) for an enabled location:
-     * $host$uri$cache_turbo_normalized_args — tracking params stripped + args
-     * sorted out of the box. Compiled lazily here; the normalized_args variable
-     * was registered in preconfiguration. For a raw, no-strip/sort key (e.g. an
-     * origin that does not reliably mark per-user responses private), set it
-     * explicitly: cache_turbo_key $scheme$host$request_uri; */
-    if (conf->key == NULL && conf->enable) {
-        ngx_str_t                         defkey =
-            ngx_string("$host$uri$cache_turbo_normalized_args");
-        ngx_http_compile_complex_value_t  ccv;
-
-        conf->key = ngx_palloc(cf->pool, sizeof(ngx_http_complex_value_t));
-        if (conf->key == NULL) {
-            return NGX_CONF_ERROR;
-        }
-        ngx_memzero(&ccv, sizeof(ngx_http_compile_complex_value_t));
-        ccv.cf = cf;
-        ccv.value = &defkey;
-        ccv.complex_value = conf->key;
-        if (ngx_http_compile_complex_value(&ccv) != NGX_OK) {
-            return NGX_CONF_ERROR;
-        }
-    }
-
     if (conf->tag == NULL) {
         conf->tag = prev->tag;
     }
 
     ngx_conf_merge_str_value(conf->require_header, prev->require_header,
                              "");
-
-    return NGX_CONF_OK;
 }
 
 /* Merge L2 connection knobs: redis_enable, memcached, timeouts, keepalive.
@@ -1558,9 +1535,7 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_http_cache_turbo_merge_zone_and_lock(conf, prev);
     ngx_http_cache_turbo_merge_breaker_policy_warn(cf, conf);
 
-    if (ngx_http_cache_turbo_merge_key_and_tag(cf, conf, prev) != NGX_CONF_OK) {
-        return NGX_CONF_ERROR;
-    }
+    ngx_http_cache_turbo_merge_tag_and_require_header(conf, prev);
 
     if (ngx_http_cache_turbo_merge_l2_backend(cf, conf, prev) != NGX_CONF_OK) {
         return NGX_CONF_ERROR;
