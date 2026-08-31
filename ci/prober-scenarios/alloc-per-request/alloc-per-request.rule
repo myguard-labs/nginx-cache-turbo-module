@@ -15,14 +15,15 @@
 #   replay). That is exactly the "vacuous-green" class testkit.yml's own
 #   header documents.
 #
-# THE FIX: EVERY MEASURED CASE HITS /cached/, NOT /__probe
+# THE FIX: EVERY MEASURED CASE USES /cached/, NOT /__probe
 #   cache_turbo_key in ../nginx.conf is `$uri` (path only, no query string),
 #   so every case below -- regardless of how much query-string padding it
 #   carries -- addresses the SAME cache entry. driver.sh populates and verifies
-#   that entry BEFORE prober takes this run's origin snapshot, so every case is
-#   a genuine HIT. The padded-query/padded-header/body cases are therefore
-#   size-class stress on cache_turbo's OWN filter chain (HIT-path header replay,
-#   refcounted lookup), not on a passthrough.
+#   that entry BEFORE prober takes this run's origin snapshot. Bodyless cases
+#   are genuine HIT-path size-class stress. The large-body case deliberately
+#   exercises cache_turbo's request-body bypass and the upstream body-reading
+#   path, while keeping the same cycle/slab cleanup assertions. The following
+#   bodyless HIT is the negative control that proves ordinary caching survives.
 #
 #   zone.slab_* is asserted directly. slab_used detects retained shared-memory
 #   allocations, slab_reqs detects matched allocation/free churn that net
@@ -104,12 +105,12 @@ delta   zone.slab_used == 0
 delta   zone.slab_reqs <= 0
 delta   zone.slab_fails == 0
 
-name    case 5: a 256 KiB request body on a HIT (proxy_pass never re-reads it)
+name    case 5: a 256 KiB request body bypasses the warm cache without leaks
 send    GET /cached/item HTTP/1.1\r\n
 send    Host: prober\r\nContent-Length: 262144\r\nConnection: close\r\n\r\n
 repeat  4096 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 expect  status=200
-expect  header~X-Cache: HIT
+expect_not header~X-Cache:
 delta   fds == 0
 delta   pool.cycle_used == 0
 delta   pool.cycle_blocks == 0
@@ -119,7 +120,7 @@ delta   zone.slab_used == 0
 delta   zone.slab_reqs <= 0
 delta   zone.slab_fails == 0
 
-name    case 6: tiny again, cumulative bound
+name    case 6: bodyless negative control still HITs after the body bypass
 send    GET /cached/item HTTP/1.1\r\n
 send    Host: prober\r\nConnection: close\r\n\r\n
 expect  status=200
