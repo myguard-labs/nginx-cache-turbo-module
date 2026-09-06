@@ -95,6 +95,7 @@ def test_hostile_origin_framing_matrix(ng: Nginx, origin: Origin) -> None:
     cases = [
         ("GET", "cl-te"),
         ("GET", "conflicting-cl"),
+        ("GET", "duplicate-te"),
         ("GET", "bad-chunk"),
         ("GET", "truncated-chunk"),
         ("GET", "premature-eof"),
@@ -110,6 +111,11 @@ def test_hostile_origin_framing_matrix(ng: Nginx, origin: Origin) -> None:
 
     for method, case in cases:
         path = f"/c/hostile-origin/{case}"
+        non_200_statuses = {0, 204, 304, 502, 504}
+        if case == "103-sequence":
+            # nginx 1.22 can surface the leading informational response as the
+            # final status; it still must not store or replay the response.
+            non_200_statuses.add(103)
         try:
             status, body, headers = fetch_raw(ng.port, path, method=method)
         except (http.client.HTTPException, OSError, TimeoutError) as exc:
@@ -121,7 +127,7 @@ def test_hostile_origin_framing_matrix(ng: Nginx, origin: Origin) -> None:
             assert "hostile-" not in body and "HELLOJUNK" not in body, \
                 f"{case}: hostile upstream bytes reached client: {body!r}"
         else:
-            assert status in (0, 204, 304, 502, 504), \
+            assert status in non_200_statuses, \
                 f"{case}: unexpected hostile status {status}, body={body!r}"
 
         try:
@@ -138,7 +144,7 @@ def test_hostile_origin_framing_matrix(ng: Nginx, origin: Origin) -> None:
             assert "hostile-" not in retry_body and "HELLOJUNK" not in retry_body, \
                 f"{case}: replayed hostile upstream bytes: {retry_body!r}"
         else:
-            assert retry_status in (0, 204, 304, 502, 504), \
+            assert retry_status in non_200_statuses, \
                 f"{case}: unexpected retry status {retry_status}"
 
         conn = http.client.HTTPConnection(

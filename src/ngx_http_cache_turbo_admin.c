@@ -1364,7 +1364,12 @@ ngx_http_cache_turbo_warm_file_thread_event(ngx_event_t *ev)
     r->main->blocked--;
     r->aio = 0;
 
-    if (r->main->terminated) {
+    if (r->done
+#if (nginx_version >= 1025004)
+        || r->main->terminated
+#endif
+       )
+    {
         c->write->handler(c->write);
         return;
     }
