@@ -1734,8 +1734,9 @@ ngx_http_cache_turbo(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                 "\"cache_turbo %V auto\" is no longer supported: the `auto` / "
                 "`generic` preset union has been removed because it was not a "
                 "safe default (it never covered every backend, and `joomla` in "
-                "it ships no cookie rule at all). Name the backends you actually "
-                "run, e.g. \"cache_turbo %V; cache_turbo_backend wordpress;\"",
+                "it had no complete frontend-session rule). Name the backends "
+                "you actually run, e.g. \"cache_turbo %V; cache_turbo_backend "
+                "wordpress;\"",
                 &value[1], &value[1]);
         }
 
@@ -1773,8 +1774,8 @@ ngx_http_cache_turbo(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
  *   - `woocommerce` inside it leaves /wp-admin/ cacheable unless it is stacked
  *     with `wordpress` — a union whose members you must know how to combine is
  *     not a default;
- *   - `joomla` inside it ships NO cookie rule, so `auto` on a Joomla site LOOKED
- *     like it protected logged-in users and did not.
+ *   - `joomla` inside it had NO complete frontend-session rule, so `auto` on a
+ *     Joomla site LOOKED like it protected every logged-in user and did not.
  *
  * A default that is only correct if you already know which parts of it are wrong
  * is a footgun with a friendly name. Both spellings are now rejected at config
@@ -1974,8 +1975,9 @@ ngx_http_cache_turbo_backend(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                         "union of wordpress+woocommerce+joomla, which was never "
                         "a safe default — it did not cover every backend, "
                         "`woocommerce` in it left /wp-admin/ cacheable unless "
-                        "stacked with `wordpress`, and `joomla` in it ships no "
-                        "cookie rule at all. Name the backends you actually run, "
+                        "stacked with `wordpress`, and `joomla` in it had no "
+                        "complete frontend-session rule. Name the backends "
+                        "you actually run, "
                         "e.g. \"cache_turbo_backend wordpress|woocommerce;\"",
                         &bad);
                 }

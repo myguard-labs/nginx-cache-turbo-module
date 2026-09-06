@@ -1,6 +1,6 @@
 # XenForo + cache-turbo
 
-_Last researched: 2026-07-26_
+_Last researched: 2026-09-01_
 
 Full-page caching a XenForo (XF2) board: what to cache, what to bypass, what to
 put in the key, and a copy-paste vhost with the Redis L2 tier wired up.
@@ -36,8 +36,8 @@ cache key automatically, so a dark-theme visitor gets their own shared entry
 rather than being dropped from the cache. You no longer need to spell those out
 in `cache_turbo_key`; the preset appends them to the explicit base key. Tested
 against the official
-[XenForo 2.3.11 release](https://xenforo.com/community/threads/xenforo-2-3-11-add-ons-released.238509/),
-the current stable line; 2.4 was still unreleased at the time of writing.
+[XenForo 2.3.12 release](https://xenforo.com/community/threads/xenforo-2-3-12-released.239021/),
+the current stable line; its changes do not alter these cookie or route rules.
 
 `xenforo` is opt-in and must be named, like the WordPress, WooCommerce
 and Joomla presets. Its URI prefixes are generic English words (`/login`,

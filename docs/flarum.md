@@ -1,7 +1,7 @@
 # Flarum + cache-turbo
 
-_Last researched: 2026-07-26 (flarum/framework `main` at 2.0.0-rc.5; identical
-cookie mechanics in the 1.8.x stable line)._
+_Last researched: 2026-09-01 (flarum/framework v2.0.0-rc.8; identical cookie
+mechanics in the v1.8.19 stable line)._
 
 Flarum is a single-page forum whose discussion URLs are perfectly cacheable for
 logged-out visitors. The one thing you must get right is **which** cookie means
@@ -27,7 +27,7 @@ cache_turbo_backend flarum;
 
 ## `flarum_session` is not a login signal
 
-[`Http/Middleware/StartSession.php`](https://github.com/flarum/framework/blob/main/framework/core/src/Http/Middleware/StartSession.php)
+[`Http/Middleware/StartSession.php`](https://github.com/flarum/framework/blob/v2.0.0-rc.8/framework/core/src/Http/Middleware/StartSession.php)
 applies the session cookie unconditionally, on every response, before any
 authentication check:
 
@@ -46,11 +46,11 @@ and silently disable the cache** — the responses would still be correct, so no
 correctness test would notice; you would simply observe that cache-turbo "isn't
 very fast". The preset therefore matches only `flarum_remember`, written solely
 by
-[`Http/Rememberer.php`](https://github.com/flarum/framework/blob/main/framework/core/src/Http/Rememberer.php)
+[`Http/Rememberer.php`](https://github.com/flarum/framework/blob/v2.0.0-rc.8/framework/core/src/Http/Rememberer.php)
 (`COOKIE_NAME = 'remember'`) at login.
 
 Both names carry the prefix from
-[`Http/CookieFactory.php`](https://github.com/flarum/framework/blob/main/framework/core/src/Http/CookieFactory.php)
+[`Http/CookieFactory.php`](https://github.com/flarum/framework/blob/v2.0.0-rc.8/framework/core/src/Http/CookieFactory.php)
 — `$prefix = $config['cookie.name'] ?? 'flarum'`, and `getName()` returns
 `"{$prefix}_{$name}"` — so the wire names are exactly `flarum_session` and
 `flarum_remember` at stock configuration.

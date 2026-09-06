@@ -433,8 +433,8 @@ ngx_int_t ngx_http_cache_turbo_redis_scan_del(ngx_http_request_t *r,
  *   - WOOCOMMERCE inside it leaves /wp-admin/ cacheable unless stacked with
  *     WORDPRESS — a union whose members you must know how to combine is not a
  *     default;
- *   - JOOMLA inside it ships no cookie rule, so `auto` on a Joomla site LOOKED
- *     like it protected logged-in users and did not.
+ *   - JOOMLA inside it had no complete frontend-session rule, so `auto` on a
+ *     Joomla site LOOKED like it protected every logged-in user and did not.
  *
  * Both spellings are now rejected at config parse (see cache_turbo_backend).
  *
