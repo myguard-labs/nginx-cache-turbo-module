@@ -521,6 +521,14 @@ class Origin:
                             b"\r\n"
                             b"HELLO!!"
                         ),
+                        "duplicate-te": (
+                            b"HTTP/1.1 200 OK\r\n"
+                            b"Transfer-Encoding: chunked\r\n"
+                            b"Transfer-Encoding: chunked\r\n"
+                            b"Cache-Control: public, max-age=60\r\n"
+                            b"\r\n"
+                            b"5\r\nHELLO\r\n0\r\n\r\n"
+                        ),
                         "bad-chunk": (
                             b"HTTP/1.1 200 OK\r\n"
                             b"Transfer-Encoding: chunked\r\n"

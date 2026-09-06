@@ -592,6 +592,61 @@ ngx_http_cache_turbo_response_declares_trailers(ngx_http_request_t *r)
 }
 
 
+/* nginx before 1.23 accepts duplicate Content-Length, duplicate
+ * Transfer-Encoding, and simultaneous Content-Length/Transfer-Encoding
+ * response headers. Inspect the raw upstream list so those ambiguous responses
+ * cannot become cache entries. */
+static ngx_uint_t
+ngx_http_cache_turbo_response_has_ambiguous_framing(ngx_http_request_t *r)
+{
+    ngx_uint_t            content_length, i, transfer_encoding;
+    ngx_list_part_t      *part;
+    ngx_table_elt_t      *h;
+    ngx_http_upstream_t  *u;
+
+    u = r->upstream;
+
+    if (u == NULL) {
+        return 0;
+    }
+
+    content_length = 0;
+    transfer_encoding = 0;
+    part = &u->headers_in.headers.part;
+    h = part->elts;
+
+    for ( ;; ) {
+        for (i = 0; i < part->nelts; i++) {
+            if (h[i].key.len == sizeof("Content-Length") - 1
+                && ngx_strncasecmp(h[i].key.data,
+                                   (u_char *) "Content-Length",
+                                   sizeof("Content-Length") - 1) == 0)
+            {
+                if (++content_length > 1) {
+                    return 1;
+                }
+            } else if (h[i].key.len == sizeof("Transfer-Encoding") - 1
+                       && ngx_strncasecmp(h[i].key.data,
+                                          (u_char *) "Transfer-Encoding",
+                                          sizeof("Transfer-Encoding") - 1)
+                          == 0)
+            {
+                if (++transfer_encoding > 1) {
+                    return 1;
+                }
+            }
+        }
+
+        if (part->next == NULL) {
+            return content_length != 0 && transfer_encoding != 0;
+        }
+
+        part = part->next;
+        h = part->elts;
+    }
+}
+
+
 /* Deep-copy the active upstream response headers while this module's top-most
  * header filter still owns the unmodified list. The body filter runs only
  * after ngx_http_next_header_filter() has synchronously appended downstream
@@ -969,6 +1024,13 @@ ngx_http_cache_turbo_header_filter_capture(ngx_http_request_t *r,
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "cache_turbo: \"%V\" not cached: upstream response "
                        "declares trailers", &r->uri);
+    }
+
+    if (captured && ngx_http_cache_turbo_response_has_ambiguous_framing(r)) {
+        captured = 0;
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "cache_turbo: \"%V\" not cached: upstream response "
+                       "has ambiguous framing headers", &r->uri);
     }
 
     if (captured)
