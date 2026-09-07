@@ -1460,7 +1460,7 @@ ngx_http_cache_turbo_redis_del(ngx_http_cache_turbo_loc_conf_t *clcf,
  * other string -- and dropping it would leave it in the set forever, so the set
  * would never reach empty and Redis would never retire the set key.
  */
-static void
+static ngx_int_t
 ngx_http_cache_turbo_redis_cmd_many(ngx_http_cache_turbo_loc_conf_t *clcf,
     ngx_str_t *lead, ngx_uint_t nlead, ngx_str_t *keys, ngx_uint_t nkeys,
     ngx_uint_t keep_empty)
@@ -1471,12 +1471,12 @@ ngx_http_cache_turbo_redis_cmd_many(ngx_http_cache_turbo_loc_conf_t *clcf,
     ngx_http_cache_turbo_redis_op_t  *op;
 
     if (!clcf->redis_enable || nkeys == 0 || nlead == 0) {
-        return;
+        return NGX_OK;                    /* nothing asked for is not a failure */
     }
 
     op = ngx_http_cache_turbo_redis_op_create(clcf);
     if (op == NULL) {
-        return;
+        return NGX_ERROR;
     }
 
     /* lead + up to CHUNK keys per command. */
@@ -1485,7 +1485,7 @@ ngx_http_cache_turbo_redis_cmd_many(ngx_http_cache_turbo_loc_conf_t *clcf,
                    * sizeof(ngx_str_t));
     if (argv == NULL) {
         ngx_destroy_pool(op->pool);
-        return;
+        return NGX_ERROR;
     }
     for (j = 0; j < nlead; j++) {
         argv[j] = lead[j];
@@ -1512,13 +1512,13 @@ ngx_http_cache_turbo_redis_cmd_many(ngx_http_cache_turbo_loc_conf_t *clcf,
 
     if (emitted == 0) {                   /* nothing to send */
         ngx_destroy_pool(op->pool);
-        return;
+        return NGX_OK;
     }
 
     op->send = ngx_create_temp_buf(op->pool, total);
     if (op->send == NULL) {
         ngx_destroy_pool(op->pool);
-        return;
+        return NGX_ERROR;
     }
 
     i = 0;
@@ -1543,11 +1543,14 @@ ngx_http_cache_turbo_redis_cmd_many(ngx_http_cache_turbo_loc_conf_t *clcf,
             ngx_http_cache_turbo_redis_read_drain) != NGX_OK)
     {
         ngx_destroy_pool(op->pool);
+        return NGX_ERROR;
     }
+
+    return NGX_OK;
 }
 
 
-void
+ngx_int_t
 ngx_http_cache_turbo_redis_del_many(ngx_http_cache_turbo_loc_conf_t *clcf,
     ngx_str_t *keys, ngx_uint_t nkeys)
 {
@@ -1556,7 +1559,7 @@ ngx_http_cache_turbo_redis_del_many(ngx_http_cache_turbo_loc_conf_t *clcf,
     lead[0].data = (u_char *) "UNLINK";
     lead[0].len = sizeof("UNLINK") - 1;
 
-    ngx_http_cache_turbo_redis_cmd_many(clcf, lead, 1, keys, nkeys, 0);
+    return ngx_http_cache_turbo_redis_cmd_many(clcf, lead, 1, keys, nkeys, 0);
 }
 
 
@@ -1579,21 +1582,22 @@ ngx_http_cache_turbo_redis_del_many(ngx_http_cache_turbo_loc_conf_t *clcf,
  * Every visited member is passed, zero-length ones included (keep_empty), or
  * the set would never reach empty and the key would outlive a complete purge.
  */
-void
+ngx_int_t
 ngx_http_cache_turbo_redis_srem_many(ngx_http_cache_turbo_loc_conf_t *clcf,
     ngx_str_t *setkey, ngx_str_t *members, ngx_uint_t nmembers)
 {
     ngx_str_t  lead[2];
 
     if (setkey == NULL || setkey->len == 0) {
-        return;
+        return NGX_ERROR;
     }
 
     lead[0].data = (u_char *) "SREM";
     lead[0].len = sizeof("SREM") - 1;
     lead[1] = *setkey;
 
-    ngx_http_cache_turbo_redis_cmd_many(clcf, lead, 2, members, nmembers, 1);
+    return ngx_http_cache_turbo_redis_cmd_many(clcf, lead, 2, members,
+                                              nmembers, 1);
 }
 
 

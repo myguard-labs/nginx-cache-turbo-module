@@ -3209,7 +3209,7 @@ size_t ngx_http_cache_turbo_redis_key(ngx_str_t *prefix, u_char *key_hash,
  * large tag/all purge can no longer open thousands of sockets at once. Key
  * bytes are copied into the op pool, so the caller's array need not outlive the
  * call. No-op when L2 is disabled or nkeys == 0. */
-void ngx_http_cache_turbo_redis_del_many(ngx_http_cache_turbo_loc_conf_t *clcf,
+ngx_int_t ngx_http_cache_turbo_redis_del_many(ngx_http_cache_turbo_loc_conf_t *clcf,
     ngx_str_t *keys, ngx_uint_t nkeys);
 
 /* TODO-REDIS-PAGINATION: SREM `members` from the set `setkey`, pipelined and
@@ -3221,7 +3221,7 @@ void ngx_http_cache_turbo_redis_del_many(ngx_http_cache_turbo_loc_conf_t *clcf,
  * of the tag key; pass EVERY visited member, zero-length ones included, or the
  * set never reaches empty and Redis never retires the key.
  * No-op when L2 is disabled, nmembers == 0, or setkey is empty. */
-void ngx_http_cache_turbo_redis_srem_many(
+ngx_int_t ngx_http_cache_turbo_redis_srem_many(
     ngx_http_cache_turbo_loc_conf_t *clcf, ngx_str_t *setkey,
     ngx_str_t *members, ngx_uint_t nmembers);
 

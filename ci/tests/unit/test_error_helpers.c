@@ -533,6 +533,11 @@ test_redis_sscan_requires_exact_frame(void)
 
     CHECK(ngx_test_redis_parse_array_calls == 1,
           "SSCAN must still parse an exactly consumed RESP frame");
+    /* The stub yields cursor "0", so completion -- not the rotate path -- is
+     * the branch taken. Without this a reader that parsed the page and never
+     * ran its terminal callback would pass. */
+    CHECK(ngx_test_members_calls == 1,
+          "SSCAN must complete the walk exactly once on a cursor-0 page");
 }
 
 static void

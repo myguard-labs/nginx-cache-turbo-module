@@ -335,7 +335,11 @@ ngx_int_t ngx_http_cache_turbo_redis_lock(ngx_http_request_t *r,
 
 /* Clear the whole L2 keyspace for this prefix (v4-2): parked SCAN MATCH
  * <prefix>* cursor loop, DEL each match, then cb(r, data, NULL, 0) emits the
- * response. Returns NGX_DONE (parked) or NGX_ERROR (L2 off / could not start). */
+ * response. Unlike redis_sscan this walk deletes each page ITSELF, so cb is
+ * TERMINAL-ONLY: it is invoked exactly once, when the cursor reaches 0 or the
+ * walk fails, never per page. An empty page with a non-zero cursor simply
+ * continues the loop.
+ * Returns NGX_DONE (parked) or NGX_ERROR (L2 off / could not start). */
 ngx_int_t ngx_http_cache_turbo_redis_scan_del(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf,
     ngx_http_cache_turbo_redis_members_pt cb, void *data);

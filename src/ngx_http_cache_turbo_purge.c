@@ -424,10 +424,10 @@ ngx_http_cache_turbo_tag_purge_complete(ngx_http_request_t *r, void *data,
     const ngx_http_cache_turbo_redis_walk_t *walk)
 {
     ngx_http_cache_turbo_tagpurge_t  *tp = data;
-    ngx_uint_t                        i, ndel = 0, nsrem;
+    ngx_uint_t                        i, ndel = 0;
     size_t                            plen;
     u_char                           *tagkey, *p;
-    ngx_str_t                        *delkeys, *srem, body;
+    ngx_str_t                        *delkeys, body;
 
     plen = tp->clcf->redis_prefix.len;
 
@@ -517,7 +517,21 @@ ngx_http_cache_turbo_tag_purge_complete(ngx_http_request_t *r, void *data,
             tp->purged++;
         }
 
-        ngx_http_cache_turbo_redis_del_many(tp->clcf, delkeys, ndel);
+        if (ngx_http_cache_turbo_redis_del_many(tp->clcf, delkeys, ndel)
+                != NGX_OK)
+        {
+            ngx_destroy_pool(tmp);
+            /* The page's UNLINK never left the box (no connection, no memory,
+             * backoff armed). Do NOT SREM: tag membership is the only pointer
+             * to those objects, so removing it while the objects are still in
+             * L2 would strand them -- serving until their own TTL, invisible
+             * to every later purge of this tag, and behind a reply that said
+             * the purge succeeded. Leaving the members in the set keeps them
+             * discoverable, which is the safety net the pre-pagination
+             * terminal-DEL design had for free. Abandon the walk so the
+             * response says INCOMPLETE rather than claiming a clean purge. */
+            return NGX_ERROR;
+        }
 
         /* Drop this page's members from the tag set itself, so an ABANDONED
          * walk leaves behind a set holding only what it never reached. The
@@ -526,36 +540,30 @@ ngx_http_cache_turbo_tag_purge_complete(ngx_http_request_t *r, void *data,
          * dropped are still in it: a retry would restart at cursor 0, re-walk
          * the same pages, hit the same cap or deadline and make no progress,
          * leaving the tag permanently unpurgeable. This is what makes "re-issue
-         * the purge" converge. Redundant on a complete walk (the set key is
-         * deleted at the end) and deliberately unconditional: a page cannot
-         * know whether it is the last one. */
-        srem = ngx_palloc(tmp, nmembers * sizeof(ngx_str_t));
-        tagkey = srem == NULL ? NULL
-                 : ngx_pnalloc(tmp, plen + sizeof("tag:") - 1 + tp->tag.len);
+         * the purge" converge. On a COMPLETE walk it is also what EMPTIES the
+         * set -- there is no terminal DEL any more -- so it is unconditional: a
+         * page cannot know whether it is the last one.
+         *
+         * `members` is passed straight through, so EVERY member this page
+         * visited is removed, including a zero-length one. The delkeys loop
+         * above skips an empty member because it is not a usable L2 key, but it
+         * IS a real member of the set and SREM removes it perfectly well.
+         * Filtering it out would leave it behind forever: the set would never
+         * reach empty, Redis would never retire the set key, and the tag would
+         * keep reporting as present after a complete purge. Pinned by
+         * test_l2_tag_purge_sscan_malformed_member_is_skipped, whose fixture
+         * SADDs "" precisely to hold this honest. */
+        tagkey = ngx_pnalloc(tmp, plen + sizeof("tag:") - 1 + tp->tag.len);
         if (tagkey == NULL) {
             ngx_destroy_pool(tmp);
             /* This page's object keys are already UNLINKed but its members
-             * would stay in the tag set. Continuing would let the terminal
-             * call delete the key over a page whose SREM never ran, and an
-             * abandoned walk would re-visit those already-dropped members on
-             * every retry and never converge -- the same silently-unpurgeable
-             * failure the delkeys allocation above refuses to risk. Abandon
-             * the walk instead, exactly as that path does. */
+             * would stay in the tag set. Continuing would let an abandoned
+             * walk re-visit those already-dropped members on every retry and
+             * never converge -- the same silently-unpurgeable failure the
+             * delkeys allocation above refuses to risk. Abandon the walk
+             * instead, exactly as that path does. */
             return NGX_ERROR;
         }
-
-        /* EVERY member this page visited, including a zero-length one. The
-         * delkeys loop above skips an empty member because it is not a usable
-         * L2 key, but it IS a real member of the set and SREM removes it
-         * perfectly well. Filtering it out here would leave it behind forever:
-         * the set would never reach empty, so Redis would never drop the set
-         * key, and the tag would keep reporting as present after a complete
-         * purge. Pinned by test_l2_tag_purge_sscan_malformed_member_is_skipped,
-         * whose fixture SADDs "" precisely to hold this line honest. */
-        for (i = 0; i < nmembers; i++) {
-            srem[i] = members[i];
-        }
-        nsrem = nmembers;
 
         {
             ngx_str_t  tk;
@@ -563,7 +571,8 @@ ngx_http_cache_turbo_tag_purge_complete(ngx_http_request_t *r, void *data,
             tk.data = tagkey;
             tk.len = tp->clcf->backend->tagkey(&tp->clcf->redis_prefix,
                          tp->tag.data, tp->tag.len, tagkey);
-            ngx_http_cache_turbo_redis_srem_many(tp->clcf, &tk, srem, nsrem);
+            ngx_http_cache_turbo_redis_srem_many(tp->clcf, &tk, members,
+                                                 nmembers);
         }
 
         ngx_destroy_pool(tmp);

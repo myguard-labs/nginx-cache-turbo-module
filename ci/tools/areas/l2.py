@@ -2409,8 +2409,13 @@ def test_l2_tag_purge_sscan_duplicate_member_is_idempotent(
         (f"the second purge did not re-visit the re-added members, so nothing "
          f"was re-dropped and idempotency is untested: {second}")
 
+    # Poll, like every other member-existence check here: the per-page UNLINK is
+    # fire-and-forget on its own connection, so the HTTP reply can beat it to
+    # Redis. The tag-key wait below only proves the SREMs landed, not the object
+    # UNLINKs, so a bare read here reds on a loaded or ASan runner.
     for probe in (members[0], members[-1]):
-        assert _sscan_db(redis, "EXISTS", probe) == "0", \
+        assert wait_for(lambda p=probe: _sscan_db(redis, "EXISTS", p) == "0",
+                        timeout=10.0), \
             f"member {probe} came back after a repeated purge"
     assert wait_for(
         lambda: _sscan_db(redis, "EXISTS", _sscan_tag_key(tag)) == "0",
