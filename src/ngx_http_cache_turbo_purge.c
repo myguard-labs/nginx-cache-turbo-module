@@ -567,12 +567,24 @@ ngx_http_cache_turbo_tag_purge_complete(ngx_http_request_t *r, void *data,
 
         {
             ngx_str_t  tk;
+            ngx_int_t  src;
 
             tk.data = tagkey;
             tk.len = tp->clcf->backend->tagkey(&tp->clcf->redis_prefix,
                          tp->tag.data, tp->tag.len, tagkey);
-            ngx_http_cache_turbo_redis_srem_many(tp->clcf, &tk, members,
-                                                 nmembers);
+            src = ngx_http_cache_turbo_redis_srem_many(tp->clcf, &tk, members,
+                                                       nmembers);
+            if (src != NGX_OK) {
+                ngx_destroy_pool(tmp);
+                /* The SREM never launched, so this page's members are gone
+                 * from both tiers but still listed in the tag set. Reporting
+                 * the page handled would let a complete walk answer 200 over a
+                 * set that never emptied -- the key survives and the tag reads
+                 * as present -- and would let a capped walk re-visit the same
+                 * dead members on every retry without converging. Abandon the
+                 * walk, exactly as the allocation failures above do. */
+                return NGX_ERROR;
+            }
         }
 
         ngx_destroy_pool(tmp);
