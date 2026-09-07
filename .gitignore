@@ -130,3 +130,8 @@ ci/t/servroot/
 # perf-profile.sh output (ci/tools/perf-profile.sh) -- perf.data + report,
 # regenerated per run, not source.
 ci/tools/perf-out/
+
+# Stray root-level scratch binary from manually compiling a RESP-parser
+# reproducer (e.g. `cc -g ci/fuzz/fuzz_resp_parser.c -o resp ...`) outside the
+# tracked build trees above.
+/resp
