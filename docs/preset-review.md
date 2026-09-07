@@ -72,7 +72,7 @@ deliberately has no rule of that kind; it is not an unchecked blank.
 | `wikijs` | 3 | 14 | — | — | — | Covers Wiki.js 2.x; treat 3.x as a fresh preset review. |
 | `redmine` | 2 | 12 | 1 | — | — | Cookie login and cookieless `?key=` authentication are covered. |
 | `flarum` | 1 | 10 | — | — | — | Partial: login without remember-me is indistinguishable from a guest session; rechecked at 2.0.0-rc.8/1.8.19. |
-| `opencart` | — | — | 34 | — | — | Partial: base controller routes only. OpenCart 4.1.0.4 method-qualified routes rely on its global `no-store`; overriding it needs a fail-closed local map. |
+| `opencart` | — | — | 34 | — | — | Partial: base controller routes only. `OCSESSID` is identical for guests and members, so retain the application `no-store` policy; overriding it needs an application-exposed login boundary, then a fail-closed local map. |
 
 <!-- markdownlint-enable MD013 -->
 
