@@ -527,23 +527,34 @@ ngx_http_cache_turbo_tag_purge_complete(ngx_http_request_t *r, void *data,
          * deleted at the end) and deliberately unconditional: a page cannot
          * know whether it is the last one. */
         srem = ngx_palloc(tmp, nmembers * sizeof(ngx_str_t));
-        if (srem != NULL) {
-            nsrem = 0;
-            for (i = 0; i < nmembers; i++) {
-                if (members[i].len != 0) {
-                    srem[nsrem++] = members[i];
-                }
-            }
-            tagkey = ngx_pnalloc(tmp, plen + sizeof("tag:") - 1 + tp->tag.len);
-            if (tagkey != NULL) {
-                ngx_str_t  tk;
+        tagkey = srem == NULL ? NULL
+                 : ngx_pnalloc(tmp, plen + sizeof("tag:") - 1 + tp->tag.len);
+        if (tagkey == NULL) {
+            ngx_destroy_pool(tmp);
+            /* This page's object keys are already UNLINKed but its members
+             * would stay in the tag set. Continuing would let the terminal
+             * call delete the key over a page whose SREM never ran, and an
+             * abandoned walk would re-visit those already-dropped members on
+             * every retry and never converge -- the same silently-unpurgeable
+             * failure the delkeys allocation above refuses to risk. Abandon
+             * the walk instead, exactly as that path does. */
+            return NGX_ERROR;
+        }
 
-                tk.data = tagkey;
-                tk.len = tp->clcf->backend->tagkey(&tp->clcf->redis_prefix,
-                             tp->tag.data, tp->tag.len, tagkey);
-                ngx_http_cache_turbo_redis_srem_many(tp->clcf, &tk, srem,
-                                                     nsrem);
+        nsrem = 0;
+        for (i = 0; i < nmembers; i++) {
+            if (members[i].len != 0) {
+                srem[nsrem++] = members[i];
             }
+        }
+
+        {
+            ngx_str_t  tk;
+
+            tk.data = tagkey;
+            tk.len = tp->clcf->backend->tagkey(&tp->clcf->redis_prefix,
+                         tp->tag.data, tp->tag.len, tagkey);
+            ngx_http_cache_turbo_redis_srem_many(tp->clcf, &tk, srem, nsrem);
         }
 
         ngx_destroy_pool(tmp);

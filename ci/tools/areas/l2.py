@@ -2178,9 +2178,17 @@ def test_l2_tag_purge_sscan_page_cap_keeps_tag_key(
     # just as unpurgeable as it was before this change, only with a different
     # failure mode. So drive the retry loop to completion and pin both that
     # each attempt SHRINKS the set and that the purge eventually succeeds.
-    remaining = int(_sscan_db(redis, "SCARD", _sscan_tag_key(tag)))
-    assert remaining < n, \
-        f"the abandoned walk removed nothing from the tag set: {remaining}/{n}"
+    # The per-page SREM is fire-and-forget on a separate connection: the walk
+    # emits its HTTP reply as soon as the last page callback returns, which can
+    # precede the SREM actually reaching Redis. Poll rather than read once, or
+    # the assertion races the write and accuses the feature of the exact defect
+    # it does not have.
+    tkey = _sscan_tag_key(tag)
+    assert wait_for(lambda: int(_sscan_db(redis, "SCARD", tkey)) < n,
+                    timeout=10.0), \
+        (f"the abandoned walk removed nothing from the tag set: "
+         f"{_sscan_db(redis, 'SCARD', tkey)}/{n}")
+    remaining = int(_sscan_db(redis, "SCARD", tkey))
 
     attempts = 0
     while True:
@@ -2194,7 +2202,16 @@ def test_l2_tag_purge_sscan_page_cap_keeps_tag_key(
             break
         assert st == 500 and body.get("l2") == "incomplete", \
             f"unexpected retry outcome: {st} {body}"
-        now = int(_sscan_db(redis, "SCARD", _sscan_tag_key(tag)))
+        # Same fire-and-forget race as the first SCARD above. `remaining` is
+        # bound as a default so the lambda reads this iteration's value, not
+        # whatever the loop variable holds when the predicate finally runs.
+        assert wait_for(lambda prev=remaining:
+                            int(_sscan_db(redis, "SCARD", tkey)) < prev,
+                        timeout=10.0), \
+            (f"a retry made NO progress ({_sscan_db(redis, 'SCARD', tkey)} "
+             f"members before and after): the capped walk re-visits the same "
+             f"members forever and the tag is permanently unpurgeable")
+        now = int(_sscan_db(redis, "SCARD", tkey))
         assert now < remaining, \
             (f"a retry made NO progress ({now} members before and after): the "
              f"capped walk re-visits the same members forever and the tag is "
@@ -2348,8 +2365,9 @@ def test_l2_tag_purge_sscan_duplicate_member_is_idempotent(
     surface (a 500, a crash, or a wedged walk).
 
     Also pins the documented counting contract: `purged` counts members
-    VISITED, not distinct members. The second purge sees an empty set and
-    reports 0 -- not a negative number, not an error."""
+    VISITED, not distinct members: the members are re-SADDed before the second
+    purge so it re-visits them and reports the full count again, rather than
+    scanning a missing set and proving only the empty-set path."""
     _sscan_db(redis, "FLUSHDB")
     tag = "sscan-dup"
     members = _sscan_fill(redis, tag, 300)
