@@ -967,6 +967,54 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             deny all;
         }}
 
+        # TODO-REDIS-PAGINATION: purge-by-tag endpoints for the SSCAN walk.
+        # Their own prefix (ctsscan:) and their own redis db (8) so the
+        # thousands of members these tests SADD never touch the ct:tag:* counts
+        # the other L2 tag tests assert exact values on, and so a FLUSHDB here
+        # cannot disturb the SCAN-walk tests' db 7.
+        #
+        # /_cache_sscan has production bounds: it is the endpoint that must
+        # PURGE a tag of any size, including one whose old SMEMBERS reply would
+        # have exceeded the 128 KiB iteration cap.
+        # /_cache_sscancap lowers the page cap to 2 (TEST_FAULTS-only) so the
+        # "abandon the walk, keep the tag key, report INCOMPLETE" branch is
+        # reachable without materialising a 268M-member set.
+        # /_cache_sscandeadline / ...off are the wall-clock pair, shaped exactly
+        # like the SCAN pair above (5ms deadline vs disabled, both with the same
+        # 40ms per-page hold, so the control isolates the DEADLINE and not the
+        # hold). See the SCAN comment above for why the hold is what makes the
+        # abort deterministic rather than a race against runner speed.
+        location = /_cache_sscan {{
+            cache_turbo_admin    main;
+            cache_turbo_redis    127.0.0.1:{redis_port} db=8 prefix=ctsscan: timeout=2s;
+            allow 127.0.0.1;
+            deny all;
+        }}
+
+        location = /_cache_sscancap {{
+            cache_turbo_admin    main;
+            cache_turbo_redis    127.0.0.1:{redis_port} db=8 prefix=ctsscan: timeout=2s;
+            cache_turbo_test_scan_max_pages 2;
+            allow 127.0.0.1;
+            deny all;
+        }}
+
+        location = /_cache_sscandeadline {{
+            cache_turbo_admin    main;
+            cache_turbo_redis    127.0.0.1:{redis_port} db=8 prefix=ctsscan: timeout=2s scan_deadline=5ms;
+            cache_turbo_test_scan_page_hold_ms 40;
+            allow 127.0.0.1;
+            deny all;
+        }}
+
+        location = /_cache_sscandeadlineoff {{
+            cache_turbo_admin    main;
+            cache_turbo_redis    127.0.0.1:{redis_port} db=8 prefix=ctsscan: timeout=2s scan_deadline=0;
+            cache_turbo_test_scan_page_hold_ms 40;
+            allow 127.0.0.1;
+            deny all;
+        }}
+
         # AUD-PURGE-HONESTY1: admin endpoint whose L2 is DOWN -- the registry's
         # redis_dead offset is reserved and never bound, so the connect is
         # refused and scan_del returns NGX_ERROR without ever walking a page.

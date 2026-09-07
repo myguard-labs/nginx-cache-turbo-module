@@ -1,6 +1,6 @@
 /*
  * Minimal nginx surface for fuzzing the cache-turbo RESP reply parsers
- * (ngx_http_cache_turbo_redis_parse / _parse_array / _parse_scan).
+ * (ngx_http_cache_turbo_redis_parse / _parse_scan).
  *
  * Those three functions read attacker-influenceable bytes — a Redis reply
  * from a shared, possibly-compromised or buggy L2 — out of op->rbuf doing

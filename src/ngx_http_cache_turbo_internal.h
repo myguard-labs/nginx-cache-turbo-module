@@ -297,13 +297,34 @@ ngx_int_t ngx_http_cache_turbo_redis_tag_add_many(
     ngx_http_cache_turbo_loc_conf_t *clcf, u_char *key_hash, ngx_str_t *names,
     ngx_uint_t nnames, time_t ttl);
 
-/* Sync-park SMEMBERS "<prefix>tag:<name>": parks the request (count++) and,
- * when the array reply lands, invokes cb(r, data, members, n) then finalizes
- * with the rc cb returned. Returns:
+/* TODO-REDIS-PAGINATION: paginated SSCAN "<prefix>tag:<name>" cursor walk
+ * (was a single SMEMBERS, which failed the whole purge once the set's reply
+ * exceeded the 128 KiB bounded-iteration cap). Parks the request (count++) and
+ * invokes cb ONCE PER PAGE with that page's members and walk == NULL, then
+ * exactly once with no members to produce the response; finalizes with the rc
+ * of that terminal call.
+ *
+ * An EMPTY page with a non-zero cursor never reaches cb at all -- read_sscan
+ * invokes it only for nmembers > 0 -- so `nmembers == 0` unambiguously denotes
+ * the terminal call.
+ *
+ * ⚠ On the TERMINAL call, walk is non-NULL only when the walk actually ran
+ * (it carries status/pages/deadline/blocks). A transport failure before any
+ * page landed also invokes cb exactly once, with no members AND walk == NULL --
+ * pinned by the zero-byte fill test in ci/tests/unit/test_error_helpers.c. A
+ * consumer MUST therefore NULL-check walk before dereferencing it, and treat a
+ * NULL walk on the terminal call as "the enumeration failed outright".
+ *
+ * ⚠ SSCAN's completeness is weaker than SMEMBERS': a member present for the
+ * whole walk is returned at least once, but a member SADDed mid-walk may be
+ * MISSED and any member may be returned MORE THAN ONCE. The per-page callback
+ * must therefore be idempotent. Rationale in redis.c's redis_sscan().
+ *
+ * Returns:
  *   NGX_DONE  - parked; caller must return NGX_DONE
  *   NGX_ERROR - could not start (L2 disabled or connect failed); caller
  *               produces its own response. */
-ngx_int_t ngx_http_cache_turbo_redis_smembers(ngx_http_request_t *r,
+ngx_int_t ngx_http_cache_turbo_redis_sscan(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, u_char *name, size_t name_len,
     ngx_http_cache_turbo_redis_members_pt cb, void *data);
 
@@ -318,7 +339,11 @@ ngx_int_t ngx_http_cache_turbo_redis_lock(ngx_http_request_t *r,
 
 /* Clear the whole L2 keyspace for this prefix (v4-2): parked SCAN MATCH
  * <prefix>* cursor loop, DEL each match, then cb(r, data, NULL, 0) emits the
- * response. Returns NGX_DONE (parked) or NGX_ERROR (L2 off / could not start). */
+ * response. Unlike redis_sscan this walk deletes each page ITSELF, so cb is
+ * TERMINAL-ONLY: it is invoked exactly once, when the cursor reaches 0 or the
+ * walk fails, never per page. An empty page with a non-zero cursor simply
+ * continues the loop.
+ * Returns NGX_DONE (parked) or NGX_ERROR (L2 off / could not start). */
 ngx_int_t ngx_http_cache_turbo_redis_scan_del(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf,
     ngx_http_cache_turbo_redis_members_pt cb, void *data);

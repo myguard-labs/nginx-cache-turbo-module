@@ -156,7 +156,7 @@ typedef struct {
     ngx_pool_t                  *rpool;
 
     /* SCAN walk bookkeeping (AUD-SCAN1). is_scan distinguishes the SCAN-del op
-     * from the SMEMBERS op, which shares smembers_finish; scan_status is the
+     * from the SSCAN tag walk, which shares walk_finish; scan_status is the
      * outcome handed to the completion callback (NGX_OK only when the server
      * returned cursor "0"), and starts as NGX_ERROR so every path that reaches
      * finish WITHOUT setting it reports INCOMPLETE rather than success. */
@@ -166,6 +166,12 @@ typedef struct {
     ngx_msec_t                   scan_start; /* S231-L2-SCANTIME: walk start
                                               * (ngx_current_msec), set once when
                                               * the SCAN op is launched          */
+    /* TODO-REDIS-PAGINATION: the SSCAN walk's set key ("<prefix>tag:<name>"),
+     * rebuilt into every page's command. Allocated from op->pool, NOT the
+     * per-page op->rpool, because it must outlive every page. Empty for the
+     * SCAN-del walk, which needs no key argument. */
+    ngx_str_t                    sscan_key;
+
     unsigned                     scan_deadline_hit:1; /* S231-L2-SCANTIME: walk
                                               * abandoned by the wall-clock
                                               * deadline, not the page cap —
@@ -181,7 +187,7 @@ static void ngx_http_cache_turbo_redis_write(ngx_event_t *wev);
 static void ngx_http_cache_turbo_redis_read_preamble(ngx_event_t *rev);
 static void ngx_http_cache_turbo_redis_read_drain(ngx_event_t *rev);
 static void ngx_http_cache_turbo_redis_read_get(ngx_event_t *rev);
-static void ngx_http_cache_turbo_redis_read_smembers(ngx_event_t *rev);
+static void ngx_http_cache_turbo_redis_read_sscan(ngx_event_t *rev);
 static void ngx_http_cache_turbo_redis_read_lock(ngx_event_t *rev);
 static void ngx_http_cache_turbo_redis_read_scan(ngx_event_t *rev);
 static void ngx_http_cache_turbo_redis_lock_finish(
@@ -191,7 +197,7 @@ static void ngx_http_cache_turbo_redis_op_done(
 static void ngx_http_cache_turbo_redis_get_finish(
     ngx_http_cache_turbo_redis_op_t *op, ngx_int_t result,
     u_char *blob, size_t blob_len);
-static void ngx_http_cache_turbo_redis_smembers_finish(
+static void ngx_http_cache_turbo_redis_walk_finish(
     ngx_http_cache_turbo_redis_op_t *op, ngx_str_t *members,
     ngx_uint_t nmembers);
 static void ngx_http_cache_turbo_redis_op_fail(
@@ -1436,33 +1442,54 @@ ngx_http_cache_turbo_redis_del(ngx_http_cache_turbo_loc_conf_t *clcf,
 #define NGX_HTTP_CACHE_TURBO_REDIS_DEL_CHUNK  256
 
 
-void
-ngx_http_cache_turbo_redis_del_many(ngx_http_cache_turbo_loc_conf_t *clcf,
-    ngx_str_t *keys, ngx_uint_t nkeys)
+/*
+ * Emit one pipelined, chunked variadic command over `keys` in a single
+ * fire-and-forget connection: `<lead[0..nlead-1]> <up to CHUNK keys>`, repeated
+ * until every key is covered. Each chunk is one command producing one reply, so
+ * read_drain frames `emitted` of them (STAB-1 expected_replies).
+ *
+ * Factored out of del_many (TODO-REDIS-PAGINATION) so the SSCAN tag walk can
+ * also emit `SREM <tagkey> <members...>` per page without a second copy of the
+ * chunking, sizing and launch dance. `lead` is the fixed prefix ("UNLINK", or
+ * "SREM" + the set key); keys are appended after it. Key bytes are copied by
+ * encode_into, so the caller's arrays need not outlive the call.
+ *
+ * `keep_empty` decides what a zero-length element means. For UNLINK it is
+ * garbage and is dropped, because "" is not a key anything could have stored.
+ * For SREM it is a legitimate member -- a Redis set holds "" as happily as any
+ * other string -- and dropping it would leave it in the set forever, so the set
+ * would never reach empty and Redis would never retire the set key.
+ */
+static ngx_int_t
+ngx_http_cache_turbo_redis_cmd_many(ngx_http_cache_turbo_loc_conf_t *clcf,
+    ngx_str_t *lead, ngx_uint_t nlead, ngx_str_t *keys, ngx_uint_t nkeys,
+    ngx_uint_t keep_empty)
 {
-    ngx_uint_t                        i, m, emitted;
+    ngx_uint_t                        i, m, emitted, j;
     size_t                            total;
     ngx_str_t                        *argv;
     ngx_http_cache_turbo_redis_op_t  *op;
 
-    if (!clcf->redis_enable || nkeys == 0) {
-        return;
+    if (!clcf->redis_enable || nkeys == 0 || nlead == 0) {
+        return NGX_OK;                    /* nothing asked for is not a failure */
     }
 
     op = ngx_http_cache_turbo_redis_op_create(clcf);
     if (op == NULL) {
-        return;
+        return NGX_ERROR;
     }
 
-    /* "UNLINK" + up to CHUNK keys per command. */
+    /* lead + up to CHUNK keys per command. */
     argv = ngx_palloc(op->pool,
-               (1 + NGX_HTTP_CACHE_TURBO_REDIS_DEL_CHUNK) * sizeof(ngx_str_t));
+               (nlead + NGX_HTTP_CACHE_TURBO_REDIS_DEL_CHUNK)
+                   * sizeof(ngx_str_t));
     if (argv == NULL) {
         ngx_destroy_pool(op->pool);
-        return;
+        return NGX_ERROR;
     }
-    argv[0].data = (u_char *) "UNLINK";
-    argv[0].len = sizeof("UNLINK") - 1;
+    for (j = 0; j < nlead; j++) {
+        argv[j] = lead[j];
+    }
 
     total = 0;
     emitted = 0;
@@ -1470,8 +1497,8 @@ ngx_http_cache_turbo_redis_del_many(ngx_http_cache_turbo_loc_conf_t *clcf,
     while (i < nkeys) {
         m = 0;
         while (m < NGX_HTTP_CACHE_TURBO_REDIS_DEL_CHUNK && i < nkeys) {
-            if (keys[i].len) {            /* skip empty keys defensively */
-                argv[1 + m] = keys[i];    /* shallow; encode copies the bytes */
+            if (keep_empty || keys[i].len) {
+                argv[nlead + m] = keys[i];/* shallow; encode copies the bytes */
                 m++;
             }
             i++;
@@ -1480,43 +1507,97 @@ ngx_http_cache_turbo_redis_del_many(ngx_http_cache_turbo_loc_conf_t *clcf,
             continue;                     /* chunk held only empty keys */
         }
         emitted++;
-        total += ngx_http_cache_turbo_redis_encode_len(argv, 1 + m);
+        total += ngx_http_cache_turbo_redis_encode_len(argv, nlead + m);
     }
 
-    if (emitted == 0) {                   /* nothing to delete */
+    if (emitted == 0) {                   /* nothing to send */
         ngx_destroy_pool(op->pool);
-        return;
+        return NGX_OK;
     }
 
     op->send = ngx_create_temp_buf(op->pool, total);
     if (op->send == NULL) {
         ngx_destroy_pool(op->pool);
-        return;
+        return NGX_ERROR;
     }
 
     i = 0;
     while (i < nkeys) {
         m = 0;
         while (m < NGX_HTTP_CACHE_TURBO_REDIS_DEL_CHUNK && i < nkeys) {
-            if (keys[i].len) {
-                argv[1 + m] = keys[i];
+            if (keep_empty || keys[i].len) {
+                argv[nlead + m] = keys[i];
                 m++;
             }
             i++;
         }
         if (m != 0) {
             op->send->last = ngx_http_cache_turbo_redis_encode_into(
-                                  op->send->last, argv, 1 + m);
+                                  op->send->last, argv, nlead + m);
         }
     }
 
-    op->expected_replies = emitted;       /* one integer reply per UNLINK */
+    op->expected_replies = emitted;       /* one integer reply per command */
 
     if (ngx_http_cache_turbo_redis_launch(op, clcf,
             ngx_http_cache_turbo_redis_read_drain) != NGX_OK)
     {
         ngx_destroy_pool(op->pool);
+        return NGX_ERROR;
     }
+
+    return NGX_OK;
+}
+
+
+ngx_int_t
+ngx_http_cache_turbo_redis_del_many(ngx_http_cache_turbo_loc_conf_t *clcf,
+    ngx_str_t *keys, ngx_uint_t nkeys)
+{
+    ngx_str_t  lead[1];
+
+    lead[0].data = (u_char *) "UNLINK";
+    lead[0].len = sizeof("UNLINK") - 1;
+
+    return ngx_http_cache_turbo_redis_cmd_many(clcf, lead, 1, keys, nkeys, 0);
+}
+
+
+/*
+ * TODO-REDIS-PAGINATION: drop `members` from the set `setkey`, pipelined and
+ * chunked exactly like del_many.
+ *
+ * The SSCAN tag walk needs this for one reason: an ABANDONED walk keeps the tag
+ * set key so the purge stays retryable, but retaining the key is worthless if
+ * the members it already dropped are still IN it. A retry restarts at cursor 0,
+ * re-walks the same first pages, hits the same page cap or deadline, and makes
+ * no progress -- the tag is permanently unpurgeable, which is a worse failure
+ * than the over-cap SMEMBERS bug this change fixed. SREMing each page as it is
+ * dropped is what makes "retry the purge" actually converge.
+ *
+ * On a COMPLETE walk it is also what EMPTIES the set: there is no terminal DEL
+ * of the tag key, because deleting it unconditionally would destroy a member
+ * SADDed mid-walk that SSCAN never returned. Emptying the set page by page and
+ * letting Redis retire the emptied key itself preserves that survivor instead.
+ * Every visited member is passed, zero-length ones included (keep_empty), or
+ * the set would never reach empty and the key would outlive a complete purge.
+ */
+ngx_int_t
+ngx_http_cache_turbo_redis_srem_many(ngx_http_cache_turbo_loc_conf_t *clcf,
+    ngx_str_t *setkey, ngx_str_t *members, ngx_uint_t nmembers)
+{
+    ngx_str_t  lead[2];
+
+    if (setkey == NULL || setkey->len == 0) {
+        return NGX_ERROR;
+    }
+
+    lead[0].data = (u_char *) "SREM";
+    lead[0].len = sizeof("SREM") - 1;
+    lead[1] = *setkey;
+
+    return ngx_http_cache_turbo_redis_cmd_many(clcf, lead, 2, members,
+                                              nmembers, 1);
 }
 
 
@@ -1931,70 +2012,6 @@ ngx_http_cache_turbo_redis_lock(ngx_http_request_t *r,
 }
 
 
-ngx_int_t
-ngx_http_cache_turbo_redis_smembers(ngx_http_request_t *r,
-    ngx_http_cache_turbo_loc_conf_t *clcf, u_char *name, size_t name_len,
-    ngx_http_cache_turbo_redis_members_pt cb, void *data)
-{
-    ngx_str_t                         argv[2];
-    ngx_http_cache_turbo_redis_op_t  *op;
-    u_char                           *tagkey;
-
-    if (!clcf->redis_enable) {
-        return NGX_ERROR;
-    }
-
-    op = ngx_http_cache_turbo_redis_op_create(clcf);
-    if (op == NULL) {
-        return NGX_ERROR;
-    }
-    op->request = r;
-    op->members_cb = cb;
-    op->members_data = data;
-    /* Give the monolithic legacy tag enumeration the same explicit walk
-     * outcome contract as SCAN. Hitting the iteration cap must report an
-     * incomplete purge; it must never run the callback as an empty success
-     * and delete the still-populated tag set. */
-    op->is_scan = 1;
-    op->scan_status = NGX_ERROR;
-
-    op->reply_max = NGX_HTTP_CACHE_TURBO_REDIS_MAX_ITER_REPLY;
-    op->rcap = ngx_min(ngx_pagesize * 4, op->reply_max);
-    op->rbuf = ngx_pnalloc(op->pool, op->rcap);
-    tagkey = ngx_pnalloc(op->pool,
-                         clcf->redis_prefix.len + sizeof("tag:") - 1 + name_len);
-    if (op->rbuf == NULL || tagkey == NULL) {
-        ngx_destroy_pool(op->pool);
-        return NGX_ERROR;
-    }
-
-    argv[0].data = (u_char *) "SMEMBERS";
-    argv[0].len = sizeof("SMEMBERS") - 1;
-    argv[1].data = tagkey;
-    argv[1].len = ngx_http_cache_turbo_redis_tagkey(&clcf->redis_prefix, name,
-                                                    name_len, tagkey);
-
-    op->send = ngx_http_cache_turbo_redis_encode(op->pool, argv, 2);
-    if (op->send == NULL) {
-        ngx_destroy_pool(op->pool);
-        return NGX_ERROR;
-    }
-
-    if (ngx_http_cache_turbo_redis_launch(op, clcf,
-            ngx_http_cache_turbo_redis_read_smembers) != NGX_OK)
-    {
-        ngx_destroy_pool(op->pool);
-        return NGX_ERROR;
-    }
-
-    /* Parked: hold a reference until the reply resumes the request (released by
-     * ngx_http_finalize_request in smembers_finish). */
-    r->main->count++;
-
-    return NGX_DONE;
-}
-
-
 /* How many keys SCAN returns per round trip. A hint, not a hard limit; the
  * cursor loop iterates until the cursor returns to "0". */
 #define NGX_HTTP_CACHE_TURBO_REDIS_SCAN_COUNT  "256"
@@ -2113,8 +2130,157 @@ ngx_http_cache_turbo_redis_scan_del(ngx_http_request_t *r,
         return NGX_ERROR;
     }
 
-    /* Parked: released by ngx_http_finalize_request in smembers_finish (reused
+    /* Parked: released by ngx_http_finalize_request in walk_finish (reused
      * as the scan completion: cb(r, data, NULL, 0)). */
+    r->main->count++;
+
+    return NGX_DONE;
+}
+
+
+/* How many members SSCAN returns per round trip. Same hint as the SCAN walk
+ * (they share the page-cap, deadline and framing plumbing, so a shared page
+ * size keeps the two walks' page accounting comparable). */
+#define NGX_HTTP_CACHE_TURBO_REDIS_SSCAN_COUNT \
+    NGX_HTTP_CACHE_TURBO_REDIS_SCAN_COUNT
+
+
+/* Encode one `SSCAN <tagkey> <cursor> COUNT <n>` command into pool.
+ *
+ * Deliberately MATCH-less: every member of a tag set is an object key this
+ * purge must drop, so there is nothing to filter, and adding a pattern would
+ * only import scan_cmd's glob-escaping hazard for no gain.
+ */
+static ngx_buf_t *
+ngx_http_cache_turbo_redis_sscan_cmd(ngx_pool_t *pool, ngx_str_t *tagkey,
+    ngx_str_t *cursor)
+{
+    ngx_str_t  argv[5];
+
+    argv[0].data = (u_char *) "SSCAN";
+    argv[0].len = sizeof("SSCAN") - 1;
+    argv[1] = *tagkey;
+    argv[2] = *cursor;
+    argv[3].data = (u_char *) "COUNT";
+    argv[3].len = sizeof("COUNT") - 1;
+    argv[4].data = (u_char *) NGX_HTTP_CACHE_TURBO_REDIS_SSCAN_COUNT;
+    argv[4].len = sizeof(NGX_HTTP_CACHE_TURBO_REDIS_SSCAN_COUNT) - 1;
+
+    return ngx_http_cache_turbo_redis_encode(pool, argv, 5);
+}
+
+
+/*
+ * Paginated tag-set enumeration: `SSCAN <prefix>tag:<name>` cursor walk.
+ *
+ * TODO-REDIS-PAGINATION. This replaces a single SMEMBERS. SMEMBERS returns the
+ * WHOLE set in one reply, so a tag set whose reply exceeded the 128 KiB
+ * bounded-iteration cap (MAX_ITER_REPLY) failed the purge outright — 500, no
+ * partial deletion, and permanently so until the set shrank on its own. SSCAN
+ * bounds each REPLY instead of the set, so a tag of any size is purgeable.
+ *
+ * ⚠ COMPLETENESS IS WEAKER THAN SMEMBERS', DELIBERATELY (decision 2026-09-07).
+ * SMEMBERS is an atomic snapshot: every member present when it ran is in the
+ * reply, exactly once. SSCAN guarantees only that a member present for the
+ * ENTIRE duration of the walk is returned at least once. Two consequences the
+ * callers must live with, both documented for operators in README.md:
+ *
+ *   - A member SADDed midway through the walk MAY BE MISSED. A page tagged and
+ *     stored while a purge of that tag is running can therefore survive it.
+ *     Re-issue the purge if that matters. There is no way to close this without
+ *     a key-format change (rejected) or server-side scripting (none in this
+ *     tree, and none may be added).
+ *   - A member MAY BE RETURNED MORE THAN ONCE (rehash during the walk). The
+ *     per-page purge is therefore required to be IDEMPOTENT: dropping an
+ *     already-dropped object key, lock key or L1 entry is a no-op, so a
+ *     duplicate costs one redundant UNLINK argument and nothing else. The
+ *     reported `purged` count is members VISITED, not distinct members —
+ *     de-duplicating would need a set of every member seen so far, i.e. exactly
+ *     the unbounded buffer this change exists to remove.
+ *
+ * Structurally this IS the scan_del walk (per-page rpool rotation, the
+ * SCAN_MAX_PAGES cap, the scan_deadline wall-clock ceiling with the
+ * signed-difference msec-wrap idiom, resumable frame_scan/parse_scan framing)
+ * with two differences: the command is SSCAN over one key rather than SCAN over
+ * the keyspace, and the per-page action is the CALLER'S, not del_many. The
+ * callback is therefore invoked once PER PAGE with that page's members and
+ * walk==NULL, then exactly once at the end with no members and walk!=NULL:
+ * accumulating every page's members to hand over in one final call would
+ * reintroduce the unbounded buffer.
+ */
+ngx_int_t
+ngx_http_cache_turbo_redis_sscan(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf, u_char *name, size_t name_len,
+    ngx_http_cache_turbo_redis_members_pt cb, void *data)
+{
+    ngx_str_t                         cursor0 = ngx_string("0");
+    ngx_http_cache_turbo_redis_op_t  *op;
+
+    if (!clcf->redis_enable) {
+        return NGX_ERROR;
+    }
+
+    op = ngx_http_cache_turbo_redis_op_create(clcf);
+    if (op == NULL) {
+        return NGX_ERROR;
+    }
+    op->request = r;
+    op->clcf = clcf;
+    op->members_cb = cb;
+    op->members_data = data;
+    op->is_scan = 1;
+    op->scan_status = NGX_ERROR;           /* until cursor "0" says otherwise */
+    op->scan_start = ngx_current_msec;     /* wall-clock ceiling, as scan_del */
+
+    /* Per-page pool, exactly as scan_del: the reply buffer, the parsed member
+     * array and the rebuilt SSCAN command all die with their page, so the
+     * walk's live allocation is O(1) in page count. Without it a tag of a
+     * million members would accumulate the whole set in op->pool — the very
+     * thing this change removes. */
+    op->rpool = ngx_create_pool(ngx_pagesize, ngx_cycle->log);
+    if (op->rpool == NULL) {
+        op->rpool = op->pool;
+        ngx_destroy_pool(op->pool);
+        return NGX_ERROR;
+    }
+
+    op->reply_max = NGX_HTTP_CACHE_TURBO_REDIS_MAX_ITER_REPLY;
+    op->rcap = ngx_min(ngx_pagesize * 4, op->reply_max);
+    op->rbuf = ngx_pnalloc(op->rpool, op->rcap);
+
+    /* The tag key is rebuilt into every page's command, so it must outlive any
+     * single page: op->pool, never op->rpool. */
+    op->sscan_key.data = ngx_pnalloc(op->pool,
+                             clcf->redis_prefix.len + sizeof("tag:") - 1
+                             + name_len);
+    if (op->rbuf == NULL || op->sscan_key.data == NULL) {
+        ngx_destroy_pool(op->rpool);
+        op->rpool = op->pool;
+        ngx_destroy_pool(op->pool);
+        return NGX_ERROR;
+    }
+    op->sscan_key.len = ngx_http_cache_turbo_redis_tagkey(&clcf->redis_prefix,
+                            name, name_len, op->sscan_key.data);
+
+    op->send = ngx_http_cache_turbo_redis_sscan_cmd(op->rpool, &op->sscan_key,
+                                                    &cursor0);
+    if (op->send == NULL) {
+        ngx_destroy_pool(op->rpool);
+        op->rpool = op->pool;
+        ngx_destroy_pool(op->pool);
+        return NGX_ERROR;
+    }
+
+    if (ngx_http_cache_turbo_redis_launch(op, clcf,
+            ngx_http_cache_turbo_redis_read_sscan) != NGX_OK)
+    {
+        ngx_destroy_pool(op->rpool);
+        op->rpool = op->pool;
+        ngx_destroy_pool(op->pool);
+        return NGX_ERROR;
+    }
+
+    /* Parked: released by ngx_http_finalize_request in walk_finish. */
     r->main->count++;
 
     return NGX_DONE;
@@ -2429,7 +2595,7 @@ ngx_http_cache_turbo_redis_pool_blocks(ngx_pool_t *pool)
     /* The chain walk below already tolerates a NULL pool; the large-list walk
      * dereferenced it unguarded, so the two disagreed about the contract and
      * clang --analyze reported core.NullDereference here. No caller passes NULL
-     * today (both sites in redis_smembers_finish pass op->pool / op->rpool,
+     * today (both sites in redis_walk_finish pass op->pool / op->rpool,
      * and every rpool assignment falls back to op->pool), so this is defensive,
      * not a bug fix -- it makes the function agree with its own first loop. */
     if (pool == NULL) {
@@ -2698,7 +2864,7 @@ ngx_http_cache_turbo_redis_read_get(ngx_event_t *rev)
  * byte past the reply. Lets callers know a reply boundary is fully buffered:
  *   - read_drain pools a keepalive conn only after ALL pipelined replies are in
  *     (STAB-1: a TCP-split +OK or a 3-reply tag_add no longer pools early);
- *   - read_smembers/read_scan confirm the whole array arrived before the single
+ *   - read_sscan/read_scan confirm the whole array arrived before the single
  *     parse+alloc pass (STAB-3: no per-recv re-alloc/re-walk of the members
  *     array).
  * Returns NGX_AGAIN (need more bytes) or NGX_DECLINED (malformed/too deep).
@@ -2816,7 +2982,7 @@ ngx_http_cache_turbo_redis_frame(u_char *p, u_char *end, ngx_uint_t depth,
  *
  * Iterative, not recursive, because a recursive call cannot resume mid-stack
  * without unwinding through frames that no longer exist across separate
- * event-loop re-entries into read_smembers/read_scan. frame_remain[d] holds
+ * event-loop re-entries into read_sscan/read_scan. frame_remain[d] holds
  * the element count still outstanding at nesting depth d (element index, not
  * byte offset); frame_off is the byte offset of the next unconfirmed element.
  * Nested arrays (SCAN's replies are flat; this exists only so a hostile/odd
@@ -3015,9 +3181,8 @@ ngx_http_cache_turbo_redis_frame_scan(ngx_http_cache_turbo_redis_op_t *op,
  * resp_len()'s sign/nil split (rather than a plain ngx_atoi) get it
  * uniformly.
  *
- * parse_array()'s per-element loop is the third caller (MAINT-REDIS), folded
- * in after the decomposition landed. Its *-1 nil-ARRAY and count == 0 cases
- * are a different shape and stay in parse_array above the loop.
+ * (TODO-REDIS-PAGINATION: parse_array(), formerly the third caller, went with
+ * the SMEMBERS reader it existed for -- SSCAN's reply is parse_scan's shape.)
  */
 static ngx_int_t
 ngx_http_cache_turbo_redis_parse_bulk(u_char **p, u_char *end,
@@ -3075,155 +3240,6 @@ ngx_http_cache_turbo_redis_parse_bulk(u_char **p, u_char *end,
     *p += len + 2;
 
     return NGX_OK;
-}
-
-
-/*
- * Parse an accumulated SMEMBERS array reply in op->rbuf[0..op->rlen]:
- *   *<count>\r\n  then count bulk strings  $<len>\r\n<bytes>\r\n
- * On NGX_OK, *members (allocated from op->pool) points at ngx_str_t entries that
- * reference into rbuf; nil array (*-1) and empty (*0) yield NGX_OK with 0.
- * Returns NGX_AGAIN (need more bytes) or NGX_DECLINED (malformed/non-array).
- */
-static ngx_int_t
-ngx_http_cache_turbo_redis_parse_array(ngx_http_cache_turbo_redis_op_t *op,
-    ngx_str_t **members, ngx_uint_t *nmembers)
-{
-    u_char     *p, *crlf, *end;
-    ngx_int_t   count, rc;
-    ngx_uint_t  i;
-    ngx_str_t  *list;
-
-    p = op->rbuf;
-    end = op->rbuf + op->rlen;
-
-    if (p == end) {
-        return NGX_AGAIN;
-    }
-
-    if (*p != '*') {
-        return NGX_DECLINED;               /* not an array reply */
-    }
-
-    crlf = ngx_strlchr(p + 1, end, CR);
-    if (crlf == NULL || crlf + 1 >= end || crlf[1] != LF) {
-        return NGX_AGAIN;
-    }
-
-    rc = ngx_http_cache_turbo_redis_resp_len(p + 1, crlf - (p + 1), &count);
-    if (rc == NGX_ERROR) {
-        return NGX_DECLINED;
-    }
-    if (rc == NGX_DONE) {                  /* *-1 nil array */
-        *members = NULL;
-        *nmembers = 0;
-        return NGX_OK;
-    }
-    if (count > NGX_HTTP_CACHE_TURBO_REDIS_MAX_MEMBERS) {
-        return NGX_DECLINED;
-    }
-    if (count == 0) {
-        *members = NULL;
-        *nmembers = 0;
-        return NGX_OK;
-    }
-
-    /* A declared element count must be backed by bytes actually on the wire.
-     * The shortest possible element is an empty bulk string, "$0\r\n" = 4
-     * bytes, so a count needing more than (end - p) / 4 elements cannot be
-     * honest. Without this, a hostile or MITM'd L2 turns a 12-byte reply
-     * ("*1048576\r\n$0") into a 16MB allocation -- ~1.4M:1 amplification, once
-     * per SCAN page. Checked BEFORE the alloc, because the per-element parse
-     * loop below only rejects the lie after the memory is already committed. */
-    if ((size_t) count > (size_t) (end - (crlf + 2)) / 4) {
-        return NGX_DECLINED;
-    }
-
-    /* ngx_palloc (not ngx_pnalloc): the ngx_str_t array needs pointer
-     * alignment; an unaligned base is UB (trapped by UBSan). */
-    list = ngx_palloc(op->pool, count * sizeof(ngx_str_t));
-    if (list == NULL) {
-        return NGX_DECLINED;
-    }
-
-    p = crlf + 2;
-
-    for (i = 0; i < (ngx_uint_t) count; i++) {
-        /* MAINT-REDIS: the per-element walk was a byte-identical third copy of
-         * parse_bulk(allow_nil=1) -- a nil element yields an empty member here,
-         * exactly as it does for a scan key. The *-1 nil-array and count == 0
-         * early returns above the loop are NOT part of that shape and stay. */
-        rc = ngx_http_cache_turbo_redis_parse_bulk(&p, end, 1, &list[i]);
-        if (rc != NGX_OK) {
-            return rc;                     /* NGX_AGAIN or NGX_DECLINED */
-        }
-    }
-
-    *members = list;
-    *nmembers = (ngx_uint_t) count;
-    return NGX_OK;
-}
-
-
-static void
-ngx_http_cache_turbo_redis_read_smembers(ngx_event_t *rev)
-{
-    ngx_str_t                        *members;
-    ngx_uint_t                        nmembers;
-    ngx_int_t                         rc;
-    ngx_connection_t                 *c;
-    ngx_http_cache_turbo_redis_op_t  *op;
-
-    c = rev->data;
-    op = c->data;
-
-    if (rev->timedout) {
-        ngx_log_error(NGX_LOG_INFO, c->log, NGX_ETIMEDOUT,
-                      "cache_turbo: redis SMEMBERS timed out");
-        ngx_http_cache_turbo_redis_smembers_finish(op, NULL, 0);
-        return;
-    }
-
-    for ( ;; ) {
-        u_char  *next;
-
-        rc = ngx_http_cache_turbo_redis_fill(op, rev);
-        if (rc == NGX_AGAIN) {
-            return;
-        }
-        if (rc == NGX_ERROR) {
-            ngx_http_cache_turbo_redis_smembers_finish(op, NULL, 0);
-            return;
-        }
-
-        /* STAB-3: confirm the ENTIRE array reply is buffered before the single
-         * alloc+parse pass, so a reply split across recvs no longer re-allocs
-         * the members array. S231-L2-FRAMEQUAD: frame_scan() also stops the
-         * FRAMING itself re-walking already-confirmed elements on every
-         * partial fill (STAB-3 only fixed the alloc+parse re-walk) -- it
-         * resumes from op->frame_off/frame_remain instead of op->rbuf. */
-        rc = ngx_http_cache_turbo_redis_frame_scan(op, &next);
-        if (rc == NGX_AGAIN) {
-            continue;                      /* read more before parsing */
-        }
-        if (rc != NGX_OK || next != op->rbuf + op->rlen) {
-            /* One command owns this connection.  Accepting a valid first
-             * array while ignoring trailing bytes would turn a malformed or
-             * desynchronised reply into a successful purge enumeration. */
-            ngx_http_cache_turbo_redis_smembers_finish(op, NULL, 0);
-            return;
-        }
-
-        rc = ngx_http_cache_turbo_redis_parse_array(op, &members, &nmembers);
-        if (rc == NGX_OK) {
-            op->scan_status = NGX_OK;
-            op->scan_pages = 1;
-            ngx_http_cache_turbo_redis_smembers_finish(op, members, nmembers);
-        } else {
-            ngx_http_cache_turbo_redis_smembers_finish(op, NULL, 0);
-        }
-        return;
-    }
 }
 
 
@@ -3377,7 +3393,7 @@ ngx_http_cache_turbo_redis_read_scan(ngx_event_t *rev)
     if (rev->timedout) {
         ngx_log_error(NGX_LOG_INFO, c->log, NGX_ETIMEDOUT,
                       "cache_turbo: redis SCAN timed out");
-        ngx_http_cache_turbo_redis_smembers_finish(op, NULL, 0);
+        ngx_http_cache_turbo_redis_walk_finish(op, NULL, 0);
         return;
     }
 
@@ -3389,7 +3405,7 @@ ngx_http_cache_turbo_redis_read_scan(ngx_event_t *rev)
             return;
         }
         if (rc == NGX_ERROR) {
-            ngx_http_cache_turbo_redis_smembers_finish(op, NULL, 0);
+            ngx_http_cache_turbo_redis_walk_finish(op, NULL, 0);
             return;
         }
 
@@ -3406,13 +3422,13 @@ ngx_http_cache_turbo_redis_read_scan(ngx_event_t *rev)
         if (rc != NGX_OK || next != op->rbuf + op->rlen) {
             /* SCAN is likewise one request/reply per connection.  Reject a
              * complete first frame followed by any unconsumed bytes. */
-            ngx_http_cache_turbo_redis_smembers_finish(op, NULL, 0);
+            ngx_http_cache_turbo_redis_walk_finish(op, NULL, 0);
             return;
         }
 
         rc = ngx_http_cache_turbo_redis_parse_scan(op, &cursor, &keys, &nkeys);
         if (rc != NGX_OK) {
-            ngx_http_cache_turbo_redis_smembers_finish(op, NULL, 0);
+            ngx_http_cache_turbo_redis_walk_finish(op, NULL, 0);
             return;
         }
 
@@ -3442,7 +3458,7 @@ ngx_http_cache_turbo_redis_read_scan(ngx_event_t *rev)
         if (cursor.len == 1 && cursor.data[0] == '0') {
             /* whole keyspace walked: emit the response via the callback */
             op->scan_status = NGX_OK;
-            ngx_http_cache_turbo_redis_smembers_finish(op, NULL, 0);
+            ngx_http_cache_turbo_redis_walk_finish(op, NULL, 0);
             return;
         }
 
@@ -3457,7 +3473,7 @@ ngx_http_cache_turbo_redis_read_scan(ngx_event_t *rev)
                           "pages without the cursor returning to 0; purge is "
                           "INCOMPLETE", op->scan_pages);
             op->scan_status = NGX_ABORT;
-            ngx_http_cache_turbo_redis_smembers_finish(op, NULL, 0);
+            ngx_http_cache_turbo_redis_walk_finish(op, NULL, 0);
             return;
         }
 
@@ -3480,7 +3496,7 @@ ngx_http_cache_turbo_redis_read_scan(ngx_event_t *rev)
                           op->clcf->redis_scan_deadline);
             op->scan_status = NGX_ABORT;
             op->scan_deadline_hit = 1;
-            ngx_http_cache_turbo_redis_smembers_finish(op, NULL, 0);
+            ngx_http_cache_turbo_redis_walk_finish(op, NULL, 0);
             return;
         }
 
@@ -3490,7 +3506,7 @@ ngx_http_cache_turbo_redis_read_scan(ngx_event_t *rev)
          * after — and must be dropped, or the walk grows without bound. */
         np = ngx_create_pool(ngx_pagesize, ngx_cycle->log);
         if (np == NULL) {
-            ngx_http_cache_turbo_redis_smembers_finish(op, NULL, 0);
+            ngx_http_cache_turbo_redis_walk_finish(op, NULL, 0);
             return;
         }
 
@@ -3499,7 +3515,7 @@ ngx_http_cache_turbo_redis_read_scan(ngx_event_t *rev)
                     ngx_min(ngx_pagesize * 4, op->reply_max)) : NULL;
         if (rbuf == NULL) {
             ngx_destroy_pool(np);
-            ngx_http_cache_turbo_redis_smembers_finish(op, NULL, 0);
+            ngx_http_cache_turbo_redis_walk_finish(op, NULL, 0);
             return;
         }
 
@@ -3528,11 +3544,217 @@ ngx_http_cache_turbo_redis_read_scan(ngx_event_t *rev)
 
 
 /*
- * SMEMBERS teardown + resume. Hands the parsed members to the policy callback
- * (which must purge + produce the HTTP response while the members are still
- * valid), tears down the op pool, then finalizes the parked request with the
- * rc the callback returned. On any failure the callback runs with 0 members so
- * the caller always gets a well-formed response.
+ * SSCAN reply reader: accumulate one [cursor, members] page, hand that page's
+ * members to the completion callback (walk == NULL, so the callback purges
+ * them and returns without producing a response), then either finish (cursor
+ * back to "0") or post the write event to issue the next SSCAN.
+ *
+ * TODO-REDIS-PAGINATION. This is read_scan's structure with the per-page action
+ * delegated to the caller instead of being del_many: see redis_sscan() above
+ * for why the members are consumed PER PAGE rather than accumulated (an
+ * accumulating walk is the unbounded buffer this replaced SMEMBERS to remove),
+ * and for the weakened completeness contract that follows from SSCAN.
+ *
+ * Every page-cap / deadline / malformed-reply / timeout path leaves
+ * scan_status non-OK, so the terminal callback reports the purge INCOMPLETE
+ * and — critically — does NOT delete the tag set key. Retaining it is what
+ * keeps an abandoned purge retryable and its unvisited objects discoverable.
+ */
+static void
+ngx_http_cache_turbo_redis_read_sscan(ngx_event_t *rev)
+{
+    ngx_str_t                         cursor, *members;
+    ngx_uint_t                        nmembers, max_pages;
+    ngx_int_t                         rc;
+    ngx_buf_t                        *send;
+    u_char                           *rbuf;
+    ngx_pool_t                       *np, *old;
+    ngx_connection_t                 *c;
+    ngx_http_cache_turbo_redis_op_t  *op;
+
+    c = rev->data;
+    op = c->data;
+
+    max_pages = NGX_HTTP_CACHE_TURBO_REDIS_SCAN_MAX_PAGES;
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+    if (op->clcf->test_scan_max_pages > 0
+        && (ngx_uint_t) op->clcf->test_scan_max_pages < max_pages)
+    {
+        max_pages = (ngx_uint_t) op->clcf->test_scan_max_pages;
+    }
+#endif
+
+    if (rev->timedout) {
+        ngx_log_error(NGX_LOG_INFO, c->log, NGX_ETIMEDOUT,
+                      "cache_turbo: redis SSCAN timed out");
+        ngx_http_cache_turbo_redis_walk_finish(op, NULL, 0);
+        return;
+    }
+
+    for ( ;; ) {
+        u_char  *next;
+
+        rc = ngx_http_cache_turbo_redis_fill(op, rev);
+        if (rc == NGX_AGAIN) {
+            return;
+        }
+        if (rc == NGX_ERROR) {
+            ngx_http_cache_turbo_redis_walk_finish(op, NULL, 0);
+            return;
+        }
+
+        rc = ngx_http_cache_turbo_redis_frame_scan(op, &next);
+        if (rc == NGX_AGAIN) {
+            continue;                      /* read more before parsing */
+        }
+        if (rc != NGX_OK || next != op->rbuf + op->rlen) {
+            /* One command owns this connection. Accepting a valid first frame
+             * while ignoring trailing bytes would turn a desynchronised reply
+             * into a successful purge enumeration. */
+            ngx_http_cache_turbo_redis_walk_finish(op, NULL, 0);
+            return;
+        }
+
+        /* SSCAN's reply shape is byte-for-byte SCAN's: a 2-element array of
+         * [ cursor bulk string, array of bulk strings ]. parse_scan is
+         * therefore reused verbatim rather than duplicated -- it validates the
+         * shape only and knows nothing about what the elements mean. */
+        rc = ngx_http_cache_turbo_redis_parse_scan(op, &cursor, &members,
+                                                   &nmembers);
+        if (rc != NGX_OK) {
+            ngx_http_cache_turbo_redis_walk_finish(op, NULL, 0);
+            return;
+        }
+
+        /* Drop this page NOW. walk == NULL marks it a page delivery: the
+         * callback purges and returns NGX_DONE without touching the response.
+         * Members point into op->rbuf and must not outlive this call, exactly
+         * as del_many's keys must not outlive read_scan's.
+         *
+         * NGX_ERROR means the callback could NOT drop this page (only an
+         * allocation failure can cause that). Abandon the walk rather than
+         * continuing: carrying on would let the terminal call see cursor "0",
+         * report a complete purge and delete the tag set key over members that
+         * were never dropped -- silently unpurgeable, and exactly the
+         * dishonesty the walk-status contract exists to prevent. scan_status
+         * is already NGX_ERROR here (it only becomes NGX_OK at cursor "0"), so
+         * the terminal call reports INCOMPLETE and keeps the key. */
+        if (nmembers > 0
+            && op->members_cb(op->request, op->members_data, members,
+                              nmembers, NULL) == NGX_ERROR)
+        {
+            ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                          "cache_turbo: L2 tag purge abandoned at SSCAN page "
+                          "%ui: could not drop the page; purge is INCOMPLETE",
+                          op->scan_pages + 1);
+            ngx_http_cache_turbo_redis_walk_finish(op, NULL, 0);
+            return;
+        }
+
+        op->scan_pages++;
+
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+        /* Same page-boundary hold as read_scan, and placed BEFORE the
+         * cursor==0 return for the same reason: that return is what makes the
+         * deadline unreachable on a walk that finishes. */
+        if (op->clcf->test_scan_page_hold_ms > 0) {
+            ngx_msleep((ngx_msec_t) op->clcf->test_scan_page_hold_ms);
+            ngx_time_update();
+        }
+#endif
+
+        if (cursor.len == 1 && cursor.data[0] == '0') {
+            /* Whole set walked: the terminal callback deletes the tag key and
+             * emits the reply. */
+            op->scan_status = NGX_OK;
+            ngx_http_cache_turbo_redis_walk_finish(op, NULL, 0);
+            return;
+        }
+
+        if (op->scan_pages >= max_pages) {
+            /* Non-termination guard, as read_scan: a server that never hands
+             * back cursor "0" would otherwise walk forever (each page's write
+             * re-arms the read timeout). Abandon and report INCOMPLETE. */
+            ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                          "cache_turbo: L2 tag purge abandoned after %ui SSCAN "
+                          "pages without the cursor returning to 0; purge is "
+                          "INCOMPLETE", op->scan_pages);
+            op->scan_status = NGX_ABORT;
+            ngx_http_cache_turbo_redis_walk_finish(op, NULL, 0);
+            return;
+        }
+
+        /* Wall-clock ceiling on the WHOLE walk. ngx_current_msec wraps, so
+         * compare with the signed-difference idiom, never a plain '>'.
+         * 0 = disabled (page-cap only). */
+        if (op->clcf->redis_scan_deadline > 0
+            && (ngx_msec_int_t) (ngx_current_msec
+                                  - (op->scan_start
+                                     + op->clcf->redis_scan_deadline)) > 0)
+        {
+            ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                          "cache_turbo: L2 tag purge abandoned after %ui SSCAN "
+                          "pages, wall-clock deadline %Mms exceeded; purge is "
+                          "INCOMPLETE", op->scan_pages,
+                          op->clcf->redis_scan_deadline);
+            op->scan_status = NGX_ABORT;
+            op->scan_deadline_hit = 1;
+            ngx_http_cache_turbo_redis_walk_finish(op, NULL, 0);
+            return;
+        }
+
+        /* Next page out of a FRESH pool. encode copies the cursor bytes (which
+         * point into the old rbuf) into the new send buffer, so the old pool is
+         * safe to drop right after -- and must be, or the walk grows without
+         * bound. op->sscan_key lives in op->pool and survives the rotation. */
+        np = ngx_create_pool(ngx_pagesize, ngx_cycle->log);
+        if (np == NULL) {
+            ngx_http_cache_turbo_redis_walk_finish(op, NULL, 0);
+            return;
+        }
+
+        send = ngx_http_cache_turbo_redis_sscan_cmd(np, &op->sscan_key,
+                                                    &cursor);
+        rbuf = send ? ngx_pnalloc(np,
+                    ngx_min(ngx_pagesize * 4, op->reply_max)) : NULL;
+        if (rbuf == NULL) {
+            ngx_destroy_pool(np);
+            ngx_http_cache_turbo_redis_walk_finish(op, NULL, 0);
+            return;
+        }
+
+        old = op->rpool;
+        op->rpool = np;
+        op->send = send;
+        op->command = send;                /* old buffer dies with `old` */
+        op->rbuf = rbuf;
+        op->rcap = ngx_min(ngx_pagesize * 4, op->reply_max);
+        op->rlen = 0;
+        /* frame_off/frame_remain/frame_depth index into the OLD rbuf being
+         * replaced right here -- reset before the new page's first fill(). */
+        op->frame_off = 0;
+        op->frame_depth = 0;
+        ngx_destroy_pool(old);
+
+        ngx_post_event(c->write, &ngx_posted_events);
+        return;
+    }
+}
+
+
+/*
+ * Walk teardown + resume, shared by the SSCAN tag walk and the SCAN-del
+ * keyspace walk. Runs the policy callback ONE final time with no members and a
+ * non-NULL walk outcome, so it produces the HTTP response; tears down the op
+ * pool; then finalizes the parked request with the rc the callback returned.
+ * Every failure path reaches here too, so the caller always gets a well-formed
+ * response and always learns whether the walk completed.
+ *
+ * TODO-REDIS-PAGINATION: this used to be smembers_finish, the SINGLE call that
+ * delivered the whole member set. The SSCAN walk delivers members per page from
+ * read_sscan instead; this call is now purely terminal for it.
  *
  * S231-VARY-LEAK: this function finalizes the parked request exactly ONCE, and
  * one finalize_request only ever drops ONE reference. Whether that single drop
@@ -3549,7 +3771,7 @@ ngx_http_cache_turbo_redis_read_scan(ngx_event_t *rev)
  * and trip "http request count is zero".
  */
 static void
-ngx_http_cache_turbo_redis_smembers_finish(
+ngx_http_cache_turbo_redis_walk_finish(
     ngx_http_cache_turbo_redis_op_t *op, ngx_str_t *members,
     ngx_uint_t nmembers)
 {
@@ -3839,7 +4061,7 @@ ngx_http_cache_turbo_redis_lock_finish(ngx_http_cache_turbo_redis_op_t *op,
 
 
 /* Terminal failure on the shared write path: dispatch by op kind. members_cb is
- * set for both SMEMBERS and SCAN (both finish through smembers_finish); is_lock
+ * set for both SSCAN and SCAN (both finish through walk_finish); is_lock
  * distinguishes a lock from a GET (both pin op->request + op->ctx).
  *
  * S231: shared write failures consume the connect-failure classification here;
@@ -3858,7 +4080,7 @@ ngx_http_cache_turbo_redis_op_fail(ngx_http_cache_turbo_redis_op_t *op)
     ngx_http_cache_turbo_redis_backoff_fail(op);
 
     if (op->members_cb) {
-        ngx_http_cache_turbo_redis_smembers_finish(op, NULL, 0);
+        ngx_http_cache_turbo_redis_walk_finish(op, NULL, 0);
     } else if (op->is_lock) {
         /* Write-path failure (connect/send/protocol error) is a transport
          * failure, not a peer holding the lock: NGX_ERROR so the caller degrades
@@ -3889,7 +4111,7 @@ ngx_cache_turbo_backend_t  ngx_http_cache_turbo_redis_backend = {
     ngx_http_cache_turbo_redis_tagkey,
     ngx_http_cache_turbo_redis_tag_add,
     ngx_http_cache_turbo_redis_tag_add_many,
-    ngx_http_cache_turbo_redis_smembers,
+    ngx_http_cache_turbo_redis_sscan,
     ngx_http_cache_turbo_redis_scan_del,
     ngx_http_cache_turbo_redis_lock,
     NULL,   /* unlock — PX expiry only */

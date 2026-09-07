@@ -37,7 +37,6 @@ The `fuzz_resp_parser` target covers the three Redis (RESP) reply parsers in
 | function | reply shape |
 |---|---|
 | `ngx_http_cache_turbo_redis_parse`       | bulk string (`GET`) — `$<len>\r\n<bytes>\r\n` |
-| `ngx_http_cache_turbo_redis_parse_array` | array (`SMEMBERS`) — `*<count>\r\n` then N bulk strings |
 | `ngx_http_cache_turbo_redis_parse_scan`  | `SCAN` 2-tuple — `[ cursor, [ keys… ] ]` |
 
 These parse bytes from a shared, possibly buggy or compromised L2, doing

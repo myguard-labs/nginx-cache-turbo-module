@@ -74,6 +74,11 @@ typedef struct {
 typedef struct {
     ngx_addr_t  redis_addr;
     ngx_msec_t  redis_connect_backoff;
+    /* TODO-REDIS-PAGINATION: read_sscan carries the SCAN walk's wall-clock
+     * ceiling. Left 0 by init_redis, which disables it -- these unit tests
+     * exercise the reader's terminal paths, not the deadline (that has its own
+     * runtime test, test_scan_walk_deadline_reports_incomplete). */
+    ngx_msec_t  redis_scan_deadline;
 } ngx_http_cache_turbo_loc_conf_t;
 
 typedef struct {
@@ -129,6 +134,18 @@ typedef struct {
     unsigned                               unconnected:1;
     unsigned                               is_scan:1;
     unsigned                               is_lock:1;
+    /* TODO-REDIS-PAGINATION: read_sscan's per-page rotation state. The stubbed
+     * parse_scan always yields cursor "0", so the rotation branch is never
+     * TAKEN here -- these fields exist so it still COMPILES against the mock
+     * op, exactly as the real reader does against the real one. */
+    ngx_buf_t                             *send;
+    ngx_buf_t                             *command;
+    ngx_str_t                              sscan_key;
+    ngx_msec_t                             scan_start;
+    size_t                                 rcap;
+    size_t                                 reply_max;
+    size_t                                 frame_off;
+    ngx_uint_t                             frame_depth;
 } ngx_http_cache_turbo_redis_op_t;
 
 extern ngx_uint_t  ngx_test_log_calls;
@@ -194,7 +211,7 @@ static void ngx_http_cache_turbo_mc_op_fail(
 static void ngx_http_cache_turbo_mc_get_finish(
     ngx_http_cache_turbo_mc_op_t *op, ngx_int_t result,
     u_char *blob, size_t blob_len);
-static void ngx_http_cache_turbo_redis_smembers_finish(
+static void ngx_http_cache_turbo_redis_walk_finish(
     ngx_http_cache_turbo_redis_op_t *op, ngx_str_t *members,
     ngx_uint_t nmembers);
 static void ngx_http_cache_turbo_redis_get_finish(
@@ -270,6 +287,53 @@ ngx_http_cache_turbo_redis_op_done(ngx_http_cache_turbo_redis_op_t *op)
 {
     ngx_test_redis_done_calls++;
     ngx_test_redis_done_op = op;
+}
+
+/* TODO-REDIS-PAGINATION scaffolding for read_sscan's page rotation. The stubbed
+ * parse_scan always returns cursor "0", so the reader always takes its
+ * completion path and none of this runs -- it exists so the extracted reader
+ * compiles unchanged against the mock. */
+#ifndef ngx_pagesize
+#define ngx_pagesize  4096
+#endif
+#ifndef ngx_min
+#define ngx_min(a, b)  ((a) < (b) ? (a) : (b))
+#endif
+
+typedef ngx_int_t  ngx_msec_int_t;
+
+#define NGX_HTTP_CACHE_TURBO_REDIS_SCAN_MAX_PAGES  (1024 * 1024)
+#ifndef NGX_ABORT
+#define NGX_ABORT  (-6)
+#endif
+
+static ngx_msec_t  ngx_current_msec;
+static int         ngx_posted_events;
+static struct { void *log; }  ngx_cycle_stub;
+#define ngx_cycle  (&ngx_cycle_stub)
+
+#define ngx_post_event(ev, q)  do { (void) (ev); (void) (q); } while (0)
+
+static ngx_buf_t *
+ngx_http_cache_turbo_redis_sscan_cmd(ngx_pool_t *pool, ngx_str_t *tagkey,
+    ngx_str_t *cursor)
+{
+    (void) pool; (void) tagkey; (void) cursor;
+    return NULL;
+}
+
+static void *
+ngx_create_pool(size_t size, void *log)
+{
+    (void) size;
+    (void) log;
+    return NULL;                       /* rotation branch is unreachable here */
+}
+
+static void
+ngx_destroy_pool(ngx_pool_t *pool)
+{
+    (void) pool;
 }
 
 static void *
@@ -368,13 +432,23 @@ ngx_http_cache_turbo_redis_frame_scan(ngx_http_cache_turbo_redis_op_t *op,
     return ngx_test_redis_frame_scan_result;
 }
 
+/* TODO-REDIS-PAGINATION: the tag walk is SSCAN now, whose reply is parse_scan's
+ * [cursor, members] shape -- parse_array went with the SMEMBERS reader. The
+ * stub keeps the same observation counters (the assertions are about WHEN the
+ * reader parses, not which parser), and yields cursor "0" so the stubbed page
+ * is the walk's last: read_sscan then takes its completion path rather than
+ * rotating a page pool this shim does not provide. */
 static ngx_int_t
-ngx_http_cache_turbo_redis_parse_array(
-    ngx_http_cache_turbo_redis_op_t *op, ngx_str_t **members,
-    ngx_uint_t *nmembers)
+ngx_http_cache_turbo_redis_parse_scan(
+    ngx_http_cache_turbo_redis_op_t *op, ngx_str_t *cursor,
+    ngx_str_t **members, ngx_uint_t *nmembers)
 {
+    static u_char  zero[] = "0";
+
     (void) op;
     ngx_test_redis_parse_array_calls++;
+    cursor->data = zero;
+    cursor->len = 1;
     *members = NULL;
     *nmembers = 0;
     return ngx_test_redis_parse_array_result;
