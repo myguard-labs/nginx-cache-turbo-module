@@ -1,7 +1,6 @@
 /*
  * libFuzzer harness for the cache-turbo RESP reply parsers:
  *   ngx_http_cache_turbo_redis_parse()        - bulk-string GET reply
- *   ngx_http_cache_turbo_redis_parse_array()  - SMEMBERS array reply
  *   ngx_http_cache_turbo_redis_parse_scan()   - SCAN [cursor, keys] 2-tuple
  *   ngx_http_cache_turbo_redis_frame()        - STAB-3 pre-framer (recursive)
  *
@@ -128,31 +127,7 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         ngx_fuzz_pool_reset(&pool);
     }
 
-    /* 2) SMEMBERS array parser. */
-    {
-        ngx_http_cache_turbo_redis_op_t  op = { 0 };
-        ngx_str_t  *members = NULL;
-        ngx_uint_t  nmembers = 0;
-        ngx_int_t   rc;
-
-        op.rbuf = buf;
-        op.rlen = size;
-        op.pool = &pool;
-        op.rpool = &pool;
-
-        rc = ngx_http_cache_turbo_redis_parse_array(&op, &members, &nmembers);
-        if (rc != NGX_OK && rc != NGX_AGAIN && rc != NGX_DECLINED) {
-            __builtin_trap();
-        }
-        if (rc == NGX_OK) {
-            for (ngx_uint_t i = 0; i < nmembers; i++) {
-                check_in_bounds(members[i].data, members[i].len, buf, size);
-            }
-        }
-        ngx_fuzz_pool_reset(&pool);
-    }
-
-    /* 3) SCAN 2-tuple parser. */
+    /* 2) SCAN/SSCAN 2-tuple parser. */
     {
         ngx_http_cache_turbo_redis_op_t  op = { 0 };
         ngx_str_t   cursor = { 0, NULL };
@@ -454,90 +429,6 @@ check_get_fixture(const char *name, const u_char *wire, size_t wire_len,
 
 
 static ngx_int_t
-parse_array_dribbled(u_char *buf, size_t total, ngx_pool_t *pool,
-    ngx_int_t want, ngx_str_t **members, ngx_uint_t *nmembers)
-{
-    ngx_http_cache_turbo_redis_op_t  op = { 0 };
-    size_t                           delivered;
-    ngx_int_t                        rc = NGX_AGAIN;
-
-    for (delivered = 1; delivered <= total; delivered++) {
-        u_char    *next = NULL;
-        ngx_int_t  frame_rc;
-
-        op.rbuf = buf;
-        op.rlen = delivered;
-        op.pool = pool;
-        op.rpool = pool;
-        *members = NULL;
-        *nmembers = 0;
-
-        if (delivered < total && want == NGX_OK) {
-            frame_rc = ngx_http_cache_turbo_redis_frame(buf, buf + delivered,
-                                                        0, &next);
-            if (frame_rc != NGX_AGAIN) {
-                __builtin_trap();
-            }
-        }
-        rc = ngx_http_cache_turbo_redis_parse_array(&op, members, nmembers);
-    }
-
-    return rc;
-}
-
-
-static int
-check_array_split_fixture(const char *name, const u_char *wire, size_t wire_len,
-    ngx_int_t want, ngx_uint_t want_nmembers, const char **want_members)
-{
-    ngx_pool_t  pool = { 0 };
-    ngx_http_cache_turbo_redis_op_t  op = { 0 };
-    ngx_str_t                       *one = NULL, *split = NULL;
-    ngx_uint_t                       none = 0, nsplit = 0, i;
-    ngx_int_t                        rc_one, rc_split;
-    int                              failures = 0;
-
-    op.rbuf = (u_char *) wire;
-    op.rlen = wire_len;
-    op.pool = &pool;
-    op.rpool = &pool;
-
-    rc_one = ngx_http_cache_turbo_redis_parse_array(&op, &one, &none);
-    rc_split = parse_array_dribbled((u_char *) wire, wire_len, &pool, want,
-                                    &split, &nsplit);
-    if (rc_one != want || rc_split != want) {
-        fprintf(stderr, "%s: got rc one=%ld split=%ld, want=%ld\n",
-                name, (long) rc_one, (long) rc_split, (long) want);
-        failures++;
-    }
-    if (none != want_nmembers || nsplit != want_nmembers) {
-        fprintf(stderr, "%s: got members one=%lu split=%lu, want=%lu\n",
-                name, (unsigned long) none, (unsigned long) nsplit,
-                (unsigned long) want_nmembers);
-        failures++;
-    }
-    if (rc_one == NGX_OK && rc_split == NGX_OK) {
-        for (i = 0; i < none && i < nsplit; i++) {
-            if (one[i].len != split[i].len
-                || (one[i].len != 0
-                    && memcmp(one[i].data, split[i].data, one[i].len) != 0))
-            {
-                fprintf(stderr, "%s: member %lu changed under split delivery\n",
-                        name, (unsigned long) i);
-                failures++;
-            }
-            if (want_members != NULL) {
-                failures += check_str(name, &one[i], want_members[i]);
-                failures += check_str(name, &split[i], want_members[i]);
-            }
-        }
-    }
-    ngx_fuzz_pool_reset(&pool);
-    return failures;
-}
-
-
-static ngx_int_t
 parse_scan_dribbled(u_char *buf, size_t total, ngx_pool_t *pool,
     ngx_int_t want, ngx_str_t *cursor, ngx_str_t **keys, ngx_uint_t *nkeys)
 {
@@ -656,17 +547,24 @@ main(void)
         (const u_char *) "$-1\r\n+", sizeof("$-1\r\n+") - 1,
         NGX_ERROR, NULL, 0);
 
-    failures += check_array_split_fixture("array two members",
-        (const u_char *) "*2\r\n$3\r\none\r\n$3\r\ntwo\r\n",
-        sizeof("*2\r\n$3\r\none\r\n$3\r\ntwo\r\n") - 1, NGX_OK, 2,
-        array_two);
-    failures += check_array_split_fixture("array nil member",
-        (const u_char *) "*2\r\n$-1\r\n$3\r\ntwo\r\n",
-        sizeof("*2\r\n$-1\r\n$3\r\ntwo\r\n") - 1, NGX_OK, 2,
-        array_nil);
-    failures += check_array_split_fixture("array malformed member",
-        (const u_char *) "*1\r\n$3\r\none\n",
-        sizeof("*1\r\n$3\r\none\n") - 1, NGX_AGAIN, 0, NULL);
+    /* TODO-REDIS-PAGINATION: these three were check_array_split_fixture cases
+     * against parse_array(), which went with the SMEMBERS reader it existed
+     * for. The member-array shapes they pin -- two members, a nil element, a
+     * short/malformed element -- are now only ever reached as the SECOND
+     * element of a SCAN/SSCAN 2-tuple, so each wire is carried over verbatim
+     * wrapped in a "[cursor, <array>]" tuple rather than dropped. */
+    failures += check_scan_split_fixture("sscan two members",
+        (const u_char *) "*2\r\n$1\r\n0\r\n*2\r\n$3\r\none\r\n$3\r\ntwo\r\n",
+        sizeof("*2\r\n$1\r\n0\r\n*2\r\n$3\r\none\r\n$3\r\ntwo\r\n") - 1,
+        NGX_OK, "0", 2, array_two);
+    failures += check_scan_split_fixture("sscan nil member",
+        (const u_char *) "*2\r\n$1\r\n0\r\n*2\r\n$-1\r\n$3\r\ntwo\r\n",
+        sizeof("*2\r\n$1\r\n0\r\n*2\r\n$-1\r\n$3\r\ntwo\r\n") - 1,
+        NGX_OK, "0", 2, array_nil);
+    failures += check_scan_split_fixture("sscan malformed member",
+        (const u_char *) "*2\r\n$1\r\n0\r\n*1\r\n$3\r\none\n",
+        sizeof("*2\r\n$1\r\n0\r\n*1\r\n$3\r\none\n") - 1,
+        NGX_AGAIN, "", 0, NULL);
 
     failures += check_scan_split_fixture("scan done two keys",
         (const u_char *) "*2\r\n$1\r\n0\r\n*2\r\n$2\r\nk1\r\n$2\r\nk2\r\n",

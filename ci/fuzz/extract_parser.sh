@@ -4,7 +4,6 @@
 # ../src/ngx_http_cache_turbo_redis.c into generated_parser.inc:
 #
 #   ngx_http_cache_turbo_redis_parse()        - bulk-string GET reply
-#   ngx_http_cache_turbo_redis_parse_array()  - SMEMBERS array reply
 #   ngx_http_cache_turbo_redis_parse_scan()   - SCAN [cursor, keys] 2-tuple
 #
 #   ngx_http_cache_turbo_redis_frame()        - STAB-3 pre-framer (recursive)
@@ -104,7 +103,6 @@ for fn in \
     'ngx_http_cache_turbo_redis_resp_len(' \
     'ngx_http_cache_turbo_redis_get_reply_max(' \
     'ngx_http_cache_turbo_redis_parse(' \
-    'ngx_http_cache_turbo_redis_parse_array(' \
     'ngx_http_cache_turbo_redis_parse_scan(' \
     'ngx_http_cache_turbo_redis_parse_bulk(' \
     'ngx_http_cache_turbo_redis_frame(' \
@@ -128,4 +126,4 @@ if [ "$(tail -n1 "$OUT")" != "}" ]; then
 fi
 
 LINES=$(wc -l < "$OUT")
-echo "✓ extracted redis_parse() + _parse_array() + _parse_scan() + _frame() + _frame_scan() — $LINES lines -> $OUT"
+echo "✓ extracted redis_parse() + _parse_scan() + _frame() + _frame_scan() — $LINES lines -> $OUT"

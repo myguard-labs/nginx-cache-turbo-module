@@ -3212,6 +3212,16 @@ size_t ngx_http_cache_turbo_redis_key(ngx_str_t *prefix, u_char *key_hash,
 void ngx_http_cache_turbo_redis_del_many(ngx_http_cache_turbo_loc_conf_t *clcf,
     ngx_str_t *keys, ngx_uint_t nkeys);
 
+/* TODO-REDIS-PAGINATION: SREM `members` from the set `setkey`, pipelined and
+ * chunked exactly like del_many. The paginated tag purge calls this per page so
+ * an ABANDONED walk leaves behind a tag set containing only the members it
+ * never reached -- without it the retained set key is useless, because every
+ * retry restarts at cursor 0, re-walks the same pages and never converges.
+ * No-op when L2 is disabled, nmembers == 0, or setkey is empty. */
+void ngx_http_cache_turbo_redis_srem_many(
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_str_t *setkey,
+    ngx_str_t *members, ngx_uint_t nmembers);
+
 /* AUD-SCAN1: outcome of a SCAN-del keyspace walk, handed to the completion
  * callback so it can tell a FINISHED walk from an ABANDONED one. Before this
  * existed every terminal path — cursor 0, read timeout, malformed reply —
@@ -3239,13 +3249,30 @@ typedef struct {
     unsigned    deadline:1;
 } ngx_http_cache_turbo_redis_walk_t;
 
-/* Completion callback for a bounded Redis enumeration: invoked once with the
- * set members on SMEMBERS, or with no members after a SCAN delete walk.
- * (pointing into transient buffers — copy what must outlive the call) BEFORE
- * the request is finalized. Must produce the HTTP response and return the rc to
- * finalize with. Called with nmembers==0 on an empty/missing set or any error,
- * so the response path is uniform. `walk` is non-NULL for SCAN-del and bounded
- * SMEMBERS; a callback that ignores it treats an abandoned walk as success. */
+/* Callback for a bounded Redis enumeration. TODO-REDIS-PAGINATION made this
+ * TWO-PHASE, because the SSCAN tag walk is paginated and buffering every page
+ * to deliver one array would reintroduce the unbounded buffer that pagination
+ * exists to remove:
+ *
+ *   walk == NULL  PAGE DELIVERY (SSCAN only). `members` are one page's members,
+ *                 pointing into a transient per-page buffer that is released
+ *                 immediately after the call -- act on them or copy them now.
+ *                 Must NOT produce a response and must NOT delete the set key.
+ *                 Return NGX_ERROR ONLY to abandon the WHOLE walk -- the purge
+ *                 then reports INCOMPLETE and the set key is kept, so reserve
+ *                 it for "this page could not be dropped", never for a member
+ *                 the callback merely chose to skip. Any other value means
+ *                 "page handled" and is otherwise ignored. May be called any
+ *                 number of times, including zero. Must be IDEMPOTENT: SSCAN
+ *                 may return the same member on more than one page.
+ *   walk != NULL  TERMINAL, exactly once, always, with nmembers == 0. Must
+ *                 produce the HTTP response and return the rc to finalize with.
+ *                 `walk->status != NGX_OK` means the enumeration was abandoned:
+ *                 a callback that ignores it reports an abandoned walk as a
+ *                 clean success, and must not delete the set key.
+ *
+ * The SCAN-del keyspace walk deletes its pages internally and therefore only
+ * ever makes the terminal call. */
 typedef ngx_int_t (*ngx_http_cache_turbo_redis_members_pt)(
     ngx_http_request_t *r, void *data, ngx_str_t *members,
     ngx_uint_t nmembers, const ngx_http_cache_turbo_redis_walk_t *walk);
@@ -3576,6 +3603,20 @@ typedef struct {
      * false "degraded" costs an operator a re-purge; a false "complete" is
      * the defect this exists to catch. */
     ngx_uint_t                         pending_at_launch;
+
+    /* TODO-REDIS-PAGINATION: running count of members VISITED by the SSCAN
+     * walk so far, accumulated across pages by tag_purge_complete's page
+     * deliveries and reported by its terminal call. It exists precisely
+     * because the walk is now paginated: the completion no longer sees the
+     * whole set at once, so the count cannot be derived at the end.
+     *
+     * ⚠ VISITED, not DISTINCT. SSCAN may return the same member on more than
+     * one page (a rehash during the walk), and de-duplicating would require
+     * remembering every member seen -- the unbounded buffer pagination exists
+     * to remove. A duplicate is otherwise harmless (the second drop of an
+     * already-dropped key is a no-op), so the count may over-report on a set
+     * that was rehashed mid-walk. Documented for operators in README.md. */
+    ngx_uint_t                         purged;
 } ngx_http_cache_turbo_tagpurge_t;
 
 ngx_int_t ngx_http_cache_turbo_tag_purge_complete(ngx_http_request_t *r,

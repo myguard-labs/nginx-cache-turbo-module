@@ -297,13 +297,23 @@ ngx_int_t ngx_http_cache_turbo_redis_tag_add_many(
     ngx_http_cache_turbo_loc_conf_t *clcf, u_char *key_hash, ngx_str_t *names,
     ngx_uint_t nnames, time_t ttl);
 
-/* Sync-park SMEMBERS "<prefix>tag:<name>": parks the request (count++) and,
- * when the array reply lands, invokes cb(r, data, members, n) then finalizes
- * with the rc cb returned. Returns:
+/* TODO-REDIS-PAGINATION: paginated SSCAN "<prefix>tag:<name>" cursor walk
+ * (was a single SMEMBERS, which failed the whole purge once the set's reply
+ * exceeded the 128 KiB bounded-iteration cap). Parks the request (count++) and
+ * invokes cb ONCE PER PAGE with that page's members and walk == NULL, then
+ * exactly once with no members and walk != NULL to produce the response;
+ * finalizes with the rc of that terminal call.
+ *
+ * ⚠ SSCAN's completeness is weaker than SMEMBERS': a member present for the
+ * whole walk is returned at least once, but a member SADDed mid-walk may be
+ * MISSED and any member may be returned MORE THAN ONCE. The per-page callback
+ * must therefore be idempotent. Rationale in redis.c's redis_sscan().
+ *
+ * Returns:
  *   NGX_DONE  - parked; caller must return NGX_DONE
  *   NGX_ERROR - could not start (L2 disabled or connect failed); caller
  *               produces its own response. */
-ngx_int_t ngx_http_cache_turbo_redis_smembers(ngx_http_request_t *r,
+ngx_int_t ngx_http_cache_turbo_redis_sscan(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, u_char *name, size_t name_len,
     ngx_http_cache_turbo_redis_members_pt cb, void *data);
 

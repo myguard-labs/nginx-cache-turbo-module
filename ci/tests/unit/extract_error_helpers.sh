@@ -51,8 +51,8 @@ extract_function() {
 	for fn in \
 		ngx_http_cache_turbo_redis_backoff_fail \
 		ngx_http_cache_turbo_redis_read_drain \
-		ngx_http_cache_turbo_redis_read_smembers \
-		ngx_http_cache_turbo_redis_smembers_finish \
+		ngx_http_cache_turbo_redis_read_sscan \
+		ngx_http_cache_turbo_redis_walk_finish \
 		ngx_http_cache_turbo_redis_get_finish \
 		ngx_http_cache_turbo_redis_lock_finish \
 		ngx_http_cache_turbo_redis_op_fail; do
@@ -72,8 +72,8 @@ for symbol in \
 	ngx_http_cache_turbo_mc_op_fail \
 	ngx_http_cache_turbo_redis_backoff_fail \
 	ngx_http_cache_turbo_redis_read_drain \
-	ngx_http_cache_turbo_redis_read_smembers \
-	ngx_http_cache_turbo_redis_smembers_finish \
+	ngx_http_cache_turbo_redis_read_sscan \
+	ngx_http_cache_turbo_redis_walk_finish \
 	ngx_http_cache_turbo_redis_get_finish \
 	ngx_http_cache_turbo_redis_lock_finish \
 	ngx_http_cache_turbo_redis_op_fail; do
@@ -187,9 +187,9 @@ if [ "${CTRL_ERROR_HELPERS_REDIS_CONSUME:-0}" = 1 ]; then
 fi
 
 if [ "${CTRL_ERROR_HELPERS_REDIS_SMEMBERS_FAIL:-0}" = 1 ]; then
-	mutate_function_exact ngx_http_cache_turbo_redis_smembers_finish \
+	mutate_function_exact ngx_http_cache_turbo_redis_walk_finish \
 		'ngx_http_cache_turbo_redis_backoff_fail(op);' '(void) op;' \
-		'Redis SMEMBERS zero-byte failure'
+		'Redis walk-finish zero-byte failure'
 fi
 
 if [ "${CTRL_ERROR_HELPERS_REDIS_DRAIN_CLEAR:-0}" = 1 ]; then
@@ -199,9 +199,9 @@ if [ "${CTRL_ERROR_HELPERS_REDIS_DRAIN_CLEAR:-0}" = 1 ]; then
 fi
 
 if [ "${CTRL_ERROR_HELPERS_REDIS_EXACT_FRAME:-0}" = 1 ]; then
-	mutate_function_exact ngx_http_cache_turbo_redis_read_smembers \
+	mutate_function_exact ngx_http_cache_turbo_redis_read_sscan \
 		'next != op->rbuf + op->rlen' '0' \
-		'Redis SMEMBERS exact-frame gate'
+		'Redis SSCAN exact-frame gate'
 fi
 
 echo "✓ extracted terminal error compositions → $(basename "$OUT")"

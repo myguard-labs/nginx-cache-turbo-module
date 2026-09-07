@@ -2332,9 +2332,37 @@ http {
 | `GET /_cache?format=prometheus` | Same stats in Prometheus text format — scrape this. |
 | `POST /_cache?all=1` | Purge the whole zone (and the L2 keyspace, if Redis is on). L1 walks a finite snapshot-sized budget so concurrent refill cannot starve the worker; if entries remain after that budget, the response is `500` with `{"purged":N,"l1":"incomplete"}` (retry the purge). A configured L2 purge still runs after this L1 outcome. The L2 side is a `SCAN MATCH <prefix>*` walk; if that walk does **not** finish — read timeout, malformed reply, or the internal page cap — the response is `500` with `{"purged":N,"l2":"incomplete","reason":"…"}` and part of L2 still holds entries. If the walk cannot even start — L2 unreachable, connect refused — the response is `500` with `{"purged":N,"l2":"unavailable"}` and L2 is untouched. When both tiers are incomplete, the same object contains both `"l1":"incomplete"` and the applicable `"l2"`/`"reason"` fields. A `200` means L1 was empty at its final lock-held observation and, when Redis is configured, the L2 walk reached the end of the keyspace. |
 | `POST /_cache?key=<string>` | Purge one entry. `<string>` is hashed **verbatim**, so it must equal the entry's full cache-key value — for the built-in default key that is `<host><uri><raw-query-string>` (e.g. `example.com/blog/post-42?id=1`), **not** just the path. The argument is not URL-decoded: percent escapes become literal key bytes, and a raw `&` terminates the argument. Use a `PURGE` request to the cached URL (above) when its reconstructed key cannot be represented verbatim as one query argument. Drops L1 + L2. |
-| `POST /_cache?tag=<name>` | Purge every page tagged `<name>` across L1 + L2. Redis tag enumeration is capped at 128 KiB per request; an index exceeding that bounded legacy reply returns `500` with `{"purged":0,"l2":"incomplete"}` and retains the index and objects without partial deletion. A later retry can succeed only after the set shrinks or pagination support is added. |
+| `POST /_cache?tag=<name>` | Purge every page tagged `<name>` across L1 + L2. The Redis tag index is enumerated by a paginated `SSCAN` cursor walk, so a tag of **any** size is purgeable — there is no longer a set size above which the purge fails outright. Members are dropped page by page as the walk proceeds. A `200` with `{"purged":N}` means the walk reached the end of the set. If the walk does **not** finish — read timeout, malformed reply, the internal page cap, or the `cache_turbo_redis_scan_deadline` wall clock — the response is `500` with `{"purged":N,"l2":"incomplete"}`, where **`N` is the number of members already dropped before the walk was abandoned** (the purge is genuinely partial, so the count is reported honestly rather than as `0`). The tag index itself is **retained** on an incomplete walk, so re-issuing the same purge picks up what is left. ⚠ **Completeness caveat, see below.** |
 | `POST /_cache?url=<path[,path,...]>` | Warm those paths (background prefetch). Each warm subrequest fetches **anonymously** — the admin request's `Cookie` header is stripped, so the entry is stored under the cookieless anonymous key a visitor looks up (and no per-visitor/segment body is pulled from the origin), even if you trigger the warm from a logged-in browser. Fires at most `cache_turbo_warm_max` subrequests (default `32`) regardless of list length. |
 | `POST /_cache?url_file=<path>` | Same as `?url=`, but the list of paths comes from a file on disk (one `path[?query]` per line, CRLF tolerated) instead of the query string — useful when the list is longer than comfortably fits in a URL. Requires nginx built with `--with-threads` and an available/default `thread_pool`; opening, validating, and reading the file are posted through nginx's thread pool, and a missing prerequisite is a clean `500` with a JSON error body plus an error-log entry. A 60-second watchdog logs that an operation is still running but does not unsafely cancel the thread or release its request; completion retains sole ownership of cleanup. Subject to the same `cache_turbo_warm_max` cap, plus its own bounded read: the file must be a regular file no larger than 64 KiB, and no single line may exceed 2048 bytes; either limit, or a missing/unreadable file, is a clean `500` with a JSON error body, never a crash or a silent partial warm. A failed thread-pool post or a dynamic `thread_pool` value that cannot be evaluated for the request produces a separate clean `500` scheduling error rather than being reported as a missing prerequisite. A named pool that does not exist remains a prerequisite error. |
+
+#### Purge-by-tag completeness
+
+`POST /_cache?tag=` walks the Redis tag index with `SSCAN`, which is a *cursor*
+over a live set rather than an atomic snapshot. Redis guarantees that a member
+present in the set for the **entire** duration of the walk is returned at least
+once — but it guarantees nothing about members that come and go while the walk
+is running. In practice that means:
+
+- **A page tagged and cached *while* a purge of that tag is running may survive
+  the purge.** The purge reports `200` and its `purged` count, because from its
+  point of view the walk completed normally; there is no way for it to know a
+  member appeared behind the cursor. If you are purging in response to a content
+  change and writes to that tag are still in flight, **re-issue the purge** once
+  the writes have settled. A second purge is cheap and idempotent.
+- **A member may be reported twice.** If the set is resized mid-walk, `SSCAN` can
+  return the same member on two different pages. Dropping an already-dropped
+  object is a no-op, so this costs nothing — but it means `purged` counts members
+  *visited*, not *distinct* members, and can slightly over-report on a large tag
+  that changed size during the purge. Treat it as a progress figure, not an
+  inventory.
+
+This is the deliberate trade for being able to purge tags of unbounded size. The
+previous single-`SMEMBERS` enumeration was an atomic snapshot with neither
+caveat, but it failed the purge outright — `500`, nothing deleted, permanently —
+once the set's reply exceeded 128 KiB (roughly 1,800 members at the default key
+length). An occasionally-missed straggler that a re-purge cleans up is a better
+failure mode than a tag that cannot be purged at all.
 
 **`lock_ttl` is the one effective-config field on the JSON object** — every other
 key is a zone counter or gauge. It reports the single-flight lock TTL in seconds

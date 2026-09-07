@@ -91,7 +91,7 @@ members_callback(ngx_http_request_t *r, void *data, ngx_str_t *members,
 {
     (void) r;
     CHECK(data == (void *) (uintptr_t) 0x51,
-          "SMEMBERS completion must preserve callback data");
+          "walk completion must preserve callback data");
     ngx_test_members_calls++;
     ngx_test_members = members;
     ngx_test_nmembers = nmembers;
@@ -445,7 +445,7 @@ test_redis_get_and_lock_compositions(void)
 }
 
 static void
-test_redis_smembers_zero_byte(void)
+test_redis_sscan_zero_byte(void)
 {
     ngx_http_cache_turbo_loc_conf_t clcf;
     ngx_http_cache_turbo_ctx_t      ctx;
@@ -461,17 +461,17 @@ test_redis_smembers_zero_byte(void)
     op.members_data = (void *) (uintptr_t) 0x51;
     connection.data = &op;
     reset_observations();
-    ngx_http_cache_turbo_redis_read_smembers(&read);
+    ngx_http_cache_turbo_redis_read_sscan(&read);
 
     CHECK(ngx_test_redis_arm_calls == 1 && op.unconnected == 0,
-          "Redis SMEMBERS zero-byte fill failure must arm exactly once");
+          "Redis SSCAN zero-byte fill failure must arm exactly once");
     CHECK(ngx_test_members_calls == 1 && ngx_test_members == NULL
               && ngx_test_nmembers == 0 && ngx_test_walk == NULL,
-          "Redis SMEMBERS zero-byte failure must run its callback as empty");
+          "Redis SSCAN zero-byte failure must run its callback as empty");
     CHECK(ngx_test_redis_done_calls == 1 && ngx_test_phase_calls == 0
               && ngx_test_posted_calls == 1 && ngx_test_finalize_calls == 1
               && ngx_test_finalize_rc == ngx_test_members_result,
-          "Redis SMEMBERS failure must tear down and finalize exactly once");
+          "Redis SSCAN failure must tear down and finalize exactly once");
 
     init_redis(&op, &clcf, &ctx, &request, &pool);
     op.members_cb = members_callback;
@@ -479,13 +479,13 @@ test_redis_smembers_zero_byte(void)
     reset_observations();
     ngx_http_cache_turbo_redis_op_fail(&op);
     CHECK(ngx_test_redis_arm_calls == 1,
-          "Redis op_fail -> real SMEMBERS finish must not double-arm");
+          "Redis op_fail -> real walk finish must not double-arm");
     CHECK(ngx_test_members_calls == 1 && ngx_test_redis_done_calls == 1,
-          "Redis op_fail must retain SMEMBERS callback and cleanup");
+          "Redis op_fail must retain walk callback and cleanup");
 }
 
 static void
-test_redis_smembers_requires_exact_frame(void)
+test_redis_sscan_requires_exact_frame(void)
 {
     static u_char reply[] = "*0\r\nJUNK";
     ngx_http_cache_turbo_loc_conf_t clcf;
@@ -509,13 +509,13 @@ test_redis_smembers_requires_exact_frame(void)
     ngx_test_redis_frame_scan_next = 4; /* complete *0 frame, then junk */
     ngx_test_redis_parse_array_result = NGX_OK;
 
-    ngx_http_cache_turbo_redis_read_smembers(&read);
+    ngx_http_cache_turbo_redis_read_sscan(&read);
 
     CHECK(ngx_test_redis_parse_array_calls == 0,
-          "SMEMBERS must reject trailing RESP bytes before parsing");
+          "SSCAN must reject trailing RESP bytes before parsing");
     CHECK(ngx_test_members_calls == 1 && ngx_test_members == NULL
               && ngx_test_nmembers == 0,
-          "SMEMBERS trailing bytes must complete as a failed enumeration");
+          "SSCAN trailing bytes must complete as a failed enumeration");
 
     init_redis(&op, &clcf, &ctx, &request, &pool);
     op.members_cb = members_callback;
@@ -529,10 +529,10 @@ test_redis_smembers_requires_exact_frame(void)
     ngx_test_redis_frame_scan_next = 4;
     ngx_test_redis_parse_array_result = NGX_OK;
 
-    ngx_http_cache_turbo_redis_read_smembers(&read);
+    ngx_http_cache_turbo_redis_read_sscan(&read);
 
     CHECK(ngx_test_redis_parse_array_calls == 1,
-          "SMEMBERS must still parse an exactly consumed RESP frame");
+          "SSCAN must still parse an exactly consumed RESP frame");
 }
 
 static void
@@ -584,8 +584,8 @@ main(void)
     test_memcached_compositions();
     test_memcached_drain_ownership();
     test_redis_get_and_lock_compositions();
-    test_redis_smembers_zero_byte();
-    test_redis_smembers_requires_exact_frame();
+    test_redis_sscan_zero_byte();
+    test_redis_sscan_requires_exact_frame();
     test_redis_drain_ownership();
 
     fprintf(stderr, "terminal error compositions: %d failures\n", failures);

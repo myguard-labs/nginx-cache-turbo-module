@@ -1928,42 +1928,464 @@ def test_l2_tag_purge_large(ng: Nginx, origin: Origin,
                     timeout=10.0), "purged members survived in L2"
 
 
-def test_l2_tag_purge_over_reply_cap_is_retryable(
-        ng: Nginx, redis: RedisServer) -> None:
-    """CT-AUD31-REDIS-RSS large-tag/concurrent negative control.
+# ---------------------------------------------------------------------------
+# TODO-REDIS-PAGINATION: purge-by-tag is a paginated SSCAN cursor walk.
+#
+# The defect these replace: the walk was a single SMEMBERS, so a tag set whose
+# reply exceeded the 128 KiB bounded-iteration cap failed the purge outright --
+# 500, NOTHING deleted, and permanently so until the set shrank on its own. The
+# tag was simply unpurgeable. test_l2_tag_purge_over_reply_cap_is_retryable
+# pinned that failure as the best available behaviour at the time (PR #485
+# closed the RSS reachability but not the unusability); it is replaced by
+# test_l2_tag_purge_over_legacy_reply_cap_now_succeeds below, which asserts the
+# same fixture now PURGES.
+#
+# All of these use the ctsscan: prefix in redis db 8 (see nginx_config.py), so
+# they never disturb the ct:tag:* counts the tests above assert exact values on.
+# ---------------------------------------------------------------------------
 
-    A legacy SMEMBERS reply above the distinct 128 KiB iteration cap fails as
-    incomplete without deleting the tag index or member objects. Eight modest
-    concurrent requests cover multiplication of the bounded request shape.
-    """
-    tag = "redis-rss-over-cap"
-    tkey = tag_key(tag)
-    n = 2200
-    members = [f"ct:{i:064x}" for i in range(n)]
-    redis.cli("DEL", tkey, members[0], members[-1])
-    added = redis.cli("SADD", tkey, *members)
-    assert added == str(n), f"large-tag fixture added {added}/{n} members"
-    redis.cli("SET", members[0], "sentinel-first")
-    redis.cli("SET", members[-1], "sentinel-last")
+SSCAN_PREFIX = "ctsscan:"
+
+
+def _sscan_tag_key(name: str) -> str:
+    return f"{SSCAN_PREFIX}tag:{name}"
+
+
+def _sscan_member(i: int) -> str:
+    """A well-formed member: <prefix><64 hex>, the shape tag_purge_complete
+    hex-decodes to reach L1 and the object's lock: key."""
+    return f"{SSCAN_PREFIX}{i:064x}"
+
+
+def _sscan_fill(redis: RedisServer, tag: str, n: int,
+                start: int = 0) -> list[str]:
+    """SADD n well-formed members into <prefix>tag:<tag> AND materialise each
+    as a real L2 object key, in one pipeline on one socket (one redis-cli per
+    member would be n process spawns, and these tests need thousands).
+
+    The objects matter: the purge's claim is that it removes MEMBERS, and a
+    test whose member keys never existed cannot tell a purge that deleted them
+    from one that did nothing."""
+    members = [_sscan_member(i) for i in range(start, start + n)]
+    with socket.create_connection(("127.0.0.1", redis.port), 5) as s:
+        s.settimeout(20)
+        s.sendall(b"*2\r\n$6\r\nSELECT\r\n$1\r\n8\r\n")
+        if not s.recv(4096).startswith(b"+OK"):
+            raise RuntimeError("redis SELECT 8 failed")
+        tkey = _sscan_tag_key(tag).encode()
+        for base in range(0, n, 400):
+            batch = members[base:base + 400]
+            cmd = bytearray()
+            nreplies = 0
+            for m in batch:
+                for args in ((b"SET", m.encode(), b"v", b"EX", b"300"),
+                             (b"SADD", tkey, m.encode())):
+                    cmd += b"*%d\r\n" % len(args)
+                    for a in args:
+                        cmd += b"$%d\r\n%s\r\n" % (len(a), a)
+                    nreplies += 1
+            s.sendall(cmd)
+            buf = b""
+            while buf.count(b"\r\n") < nreplies:
+                chunk = s.recv(65536)
+                if not chunk:
+                    raise RuntimeError("redis closed mid-pipeline")
+                buf += chunk
+    return members
+
+
+def _sscan_purge(ng: Nginx, loc: str, tag: str) -> tuple[int, dict]:
+    s, b, _ = fetch(ng.port, f"{loc}?tag={tag}", method="POST")
+    return s, json.loads(b)
+
+
+def _sscan_db(redis: RedisServer, *args: str) -> str:
+    return redis.cli("-n", "8", *args)
+
+
+def test_l2_tag_purge_sscan_multipage_purges_every_member(
+        ng: Nginx, redis: RedisServer) -> None:
+    """TODO-REDIS-PAGINATION (a): a tag set spanning MANY SSCAN pages purges
+    EVERY member, and the emptied tag key is deleted exactly once at the end.
+
+    Two claims, and the first keeps the second from being vacuous:
+
+      1. The walk really was multi-page. A single-page walk would satisfy every
+         other assertion here while proving nothing about pagination, so the
+         set is sized well past the COUNT 256 page hint and the reply size that
+         used to be fatal.
+      2. Every member object is gone from L2, every member's lock: key is gone,
+         and the tag key itself is gone -- and `purged` equals the member count.
+
+    The negative control for the multi-page property is
+    test_l2_tag_purge_sscan_page_cap_keeps_tag_key: capped at 2 pages the SAME
+    fixture does NOT complete, which is only possible if the walk is paginated."""
+    _sscan_db(redis, "FLUSHDB")
+    tag = "sscan-multipage"
+    n = 3000                                   # ~12 pages at COUNT 256
+    members = _sscan_fill(redis, tag, n)
+    assert _sscan_db(redis, "SCARD", _sscan_tag_key(tag)) == str(n), \
+        "fixture did not land every member"
+
+    s, body = _sscan_purge(ng, "/_cache_sscan", tag)
+    assert s == 200, f"multi-page tag purge must succeed: {s} {body}"
+    assert "l2" not in body, f"multi-page walk reported incomplete: {body}"
+    assert body["purged"] == n, \
+        f"expected {n} members purged across the paginated walk, got {body}"
+
+    assert wait_for(
+        lambda: _sscan_db(redis, "EXISTS", _sscan_tag_key(tag)) == "0",
+        timeout=10.0), "emptied tag set survived a complete SSCAN walk"
+    # Spot-check both ends and the middle rather than all 3000: the UNLINK is
+    # pipelined per page, so a page that was skipped shows up as a survivor
+    # wherever it happened to fall.
+    for probe in (members[0], members[n // 2], members[-1]):
+        assert wait_for(lambda p=probe: _sscan_db(redis, "EXISTS", p) == "0",
+                        timeout=10.0), \
+            f"member {probe} survived the paginated purge"
+    _sscan_db(redis, "FLUSHDB")
+
+
+def test_l2_tag_purge_over_legacy_reply_cap_now_succeeds(
+        ng: Nginx, redis: RedisServer) -> None:
+    """TODO-REDIS-PAGINATION (b) -- THE REGRESSION THIS ITEM EXISTS FOR.
+
+    This is the exact fixture shape that used to be unpurgeable: 2200 members of
+    72 bytes each is a ~160 KiB SMEMBERS reply, past the 128 KiB
+    MAX_ITER_REPLY iteration cap. The old behaviour (pinned until now by
+    test_l2_tag_purge_over_reply_cap_is_retryable) was 500,
+    {"purged":0,"l2":"incomplete"}, nothing deleted, FOREVER -- the operator had
+    no way to purge that tag at all short of waiting for it to shrink.
+
+    SSCAN bounds each REPLY rather than the set, so the same fixture now purges.
+    The assertion is deliberately the INVERSE of the test it replaces: 200, a
+    full purged count, and the index and objects GONE rather than retained.
+
+    Concurrency is kept from the replaced test (eight modest concurrent purges)
+    -- it covers multiplication of the parked request shape, and it is a real
+    regression surface for a walk that now holds a connection across many round
+    trips rather than one."""
+    _sscan_db(redis, "FLUSHDB")
+    tag = "sscan-over-legacy-cap"
+    n = 2200                                   # ~160 KiB as one SMEMBERS reply
+    members = _sscan_fill(redis, tag, n)
+    assert _sscan_db(redis, "SCARD", _sscan_tag_key(tag)) == str(n), \
+        "over-legacy-cap fixture did not land every member"
 
     def purge(_: int) -> tuple[int, str]:
-        status, body, _ = fetch(
-            ng.port, f"/_cache_l2?tag={tag}", method="POST")
+        status, body, _h = fetch(
+            ng.port, f"/_cache_sscan?tag={tag}", method="POST")
         return status, body
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
         replies = list(ex.map(purge, range(8)))
 
-    assert all(status == 500 for status, _ in replies), replies
-    assert all(json.loads(body).get("l2") == "incomplete"
-               for _, body in replies), replies
-    assert redis.cli("SCARD", tkey) == str(n), \
-        "over-cap tag enumeration deleted or truncated its retry index"
-    assert redis.cli("GET", members[0]) == "sentinel-first" \
-        and redis.cli("GET", members[-1]) == "sentinel-last", \
-        "over-cap tag enumeration deleted member objects before completeness"
+    assert all(status == 200 for status, _ in replies), \
+        f"a tag past the legacy 128 KiB reply cap must now PURGE, not 500: {replies}"
+    assert all("l2" not in json.loads(body) for _, body in replies), \
+        f"paginated walk still reported an L2 problem: {replies}"
+    # Exactly one of the eight sees the full set; the rest race behind it and
+    # legitimately see fewer members (or none). Asserting every reply purged n
+    # would be asserting serialisation nobody promised. What must hold is that
+    # the winner saw them all.
+    #
+    # >= n, not == n: `purged` counts members VISITED, not distinct members
+    # (see the module.h contract and the README caveat). SSCAN may return the
+    # same member on more than one page when the set is resized mid-walk, and
+    # eight concurrent walks over a set being emptied underneath them is
+    # precisely the shape that provokes it -- an observed run reported 2202 for
+    # a 2200-member set. Pinning == n would make this test fail on correct,
+    # documented behaviour. The upper bound is not asserted because the walk
+    # makes no promise about how many duplicates a rehash can produce; that the
+    # whole set was covered at least once is the claim.
+    assert max(json.loads(body)["purged"] for _, body in replies) >= n, \
+        f"no purge enumerated the whole over-cap set: {replies}"
 
-    redis.cli("DEL", tkey, members[0], members[-1])
+    assert wait_for(
+        lambda: _sscan_db(redis, "EXISTS", _sscan_tag_key(tag)) == "0",
+        timeout=10.0), \
+        "the tag index survived: an over-cap tag is still unpurgeable"
+    for probe in (members[0], members[-1]):
+        assert wait_for(lambda p=probe: _sscan_db(redis, "EXISTS", p) == "0",
+                        timeout=10.0), \
+            f"member {probe} survived: the over-cap purge did not delete objects"
+    _sscan_db(redis, "FLUSHDB")
+
+
+def test_l2_tag_purge_sscan_page_cap_keeps_tag_key(
+        ng: Nginx, redis: RedisServer) -> None:
+    """TODO-REDIS-PAGINATION (c): a walk abandoned at the page cap must keep the
+    tag key and report the purge INCOMPLETE -- never a clean success.
+
+    Retaining the key is the load-bearing half: it is what makes the purge
+    retryable and keeps every unvisited member discoverable. Deleting it over a
+    partial walk would silently strand the survivors, unpurgeable by tag
+    forever, which is a worse defect than the one this item fixed.
+
+    Two claims, first keeping the second honest:
+
+      1. NEGATIVE CONTROL -- a set that fits inside the 2-page cap completes
+         normally at the SAME endpoint (200, no "l2" key, tag key deleted). A
+         cap that fired on every purge would satisfy claim 2 while destroying
+         the feature.
+      2. Past the cap: 500, "l2":"incomplete", the tag key STILL EXISTS, and
+         members still exist behind the cursor.
+
+    The reported `purged` is also asserted to be NON-ZERO and to under-count the
+    set. That is the contract change TODO-REDIS-PAGINATION forced: the old
+    all-or-nothing SMEMBERS purge could honestly say "purged":0 on a failure,
+    but the paginated walk really has deleted the pages it got through, so
+    reporting 0 would be a lie about the state of the cache."""
+    _sscan_db(redis, "FLUSHDB")
+
+    # 1. under the cap -> ordinary completion
+    ok_tag = "sscan-cap-ok"
+    _sscan_fill(redis, ok_tag, 5)
+    s, ok = _sscan_purge(ng, "/_cache_sscancap", ok_tag)
+    assert s == 200, f"a walk inside the cap must complete: {s} {ok}"
+    assert "l2" not in ok, f"cap fired on a one-page walk: {ok}"
+    assert ok["purged"] == 5, f"in-cap walk miscounted: {ok}"
+    assert wait_for(
+        lambda: _sscan_db(redis, "EXISTS", _sscan_tag_key(ok_tag)) == "0"), \
+        "a COMPLETE walk must still delete the emptied tag key"
+
+    # 2. past the cap -> abandoned
+    tag = "sscan-cap-over"
+    n = 3000
+    _sscan_fill(redis, tag, n)
+    s, over = _sscan_purge(ng, "/_cache_sscancap", tag)
+    assert s == 500, f"an abandoned tag purge must not report success: {s} {over}"
+    assert over.get("l2") == "incomplete", \
+        f"abandoned tag purge did not disclose the incomplete walk: {over}"
+
+    # THE assertion this test exists for.
+    assert _sscan_db(redis, "EXISTS", _sscan_tag_key(tag)) == "1", \
+        ("an abandoned walk DELETED the tag index: every member behind the "
+         "cursor is now unpurgeable by tag")
+    assert int(_sscan_db(redis, "SCARD", _sscan_tag_key(tag))) > 0, \
+        "abandoned walk emptied the tag set it was supposed to retain"
+
+    # Honest partial count: > 0 because two pages really were dropped, < n
+    # because the walk stopped.
+    assert 0 < over["purged"] < n, \
+        (f"an abandoned paginated purge must report the members it ACTUALLY "
+         f"dropped, not 0 and not the whole set: {over}")
+
+    # Retaining the tag key is only worth anything if a RETRY makes progress.
+    # Proving the key survives is not enough: if the walk deleted members from
+    # L2 but left them in the tag SET, every retry would re-walk the same
+    # members, hit the same 2-page cap and never finish -- the tag would be
+    # just as unpurgeable as it was before this change, only with a different
+    # failure mode. So drive the retry loop to completion and pin both that
+    # each attempt SHRINKS the set and that the purge eventually succeeds.
+    remaining = int(_sscan_db(redis, "SCARD", _sscan_tag_key(tag)))
+    assert remaining < n, \
+        f"the abandoned walk removed nothing from the tag set: {remaining}/{n}"
+
+    attempts = 0
+    while True:
+        attempts += 1
+        assert attempts <= 40, \
+            (f"retrying a page-capped purge never converged: still "
+             f"{remaining} members after {attempts} attempts")
+        st, body = _sscan_purge(ng, "/_cache_sscancap", tag)
+        if st == 200:
+            assert "l2" not in body, f"completing retry reported incomplete: {body}"
+            break
+        assert st == 500 and body.get("l2") == "incomplete", \
+            f"unexpected retry outcome: {st} {body}"
+        now = int(_sscan_db(redis, "SCARD", _sscan_tag_key(tag)))
+        assert now < remaining, \
+            (f"a retry made NO progress ({now} members before and after): the "
+             f"capped walk re-visits the same members forever and the tag is "
+             f"permanently unpurgeable")
+        remaining = now
+
+    assert wait_for(
+        lambda: _sscan_db(redis, "EXISTS", _sscan_tag_key(tag)) == "0",
+        timeout=10.0), \
+        "the retry that finally COMPLETED did not delete the emptied tag key"
+    _sscan_db(redis, "FLUSHDB")
+
+
+def test_l2_tag_purge_sscan_deadline_keeps_tag_key(
+        ng: Nginx, redis: RedisServer) -> None:
+    """TODO-REDIS-PAGINATION (d): the wall-clock ceiling bounds the SSCAN walk
+    too, with the same retain-the-key contract as the page cap.
+
+    The page cap bounds MEMORY; it does not bound TIME -- each page's read
+    re-arms redis_timeout, so a backend that always hands back a non-zero cursor
+    just under that timeout could park a tag purge for up to SCAN_MAX_PAGES
+    pages. The SCAN walk already carried this ceiling; carrying it into the
+    SSCAN walk is not optional, because an unbounded SSCAN walk is the same
+    non-termination bug.
+
+      1. NEGATIVE CONTROL -- /_cache_sscandeadlineoff (deadline disabled, SAME
+         40ms per-page hold) completes normally. Sharing the hold is what makes
+         this a control for the DEADLINE rather than for the hold.
+      2. /_cache_sscandeadline (5ms deadline, 40ms hold) abandons the walk,
+         reports incomplete, and KEEPS the tag key.
+
+    ⚠ The hold, not a tiny deadline, is what makes this deterministic: the
+    cursor==0 completion return sits BEFORE the deadline check, so a walk that
+    reaches the end of the set never evaluates the deadline. See the SCAN
+    equivalent (test_scan_walk_deadline_reports_incomplete) for the full
+    reasoning -- do NOT "fix" a recurrence by widening the deadline, that
+    disables the oracle. The knob to move is the hold."""
+    _sscan_db(redis, "FLUSHDB")
+
+    # 1. negative control: deadline disabled, still crosses a held boundary.
+    # Small on purpose -- the hold blocks the worker inside the read handler
+    # while the 2s read timer runs.
+    ctrl_tag = "sscan-dl-ctrl"
+    _sscan_fill(redis, ctrl_tag, 400)
+    s_off, off = _sscan_purge(ng, "/_cache_sscandeadlineoff", ctrl_tag)
+    assert s_off == 200, \
+        f"deadline=0 must not abort a normal tag walk: {s_off} {off}"
+    assert "l2" not in off, \
+        f"disabled deadline still reported an L2 problem: {off}"
+    _sscan_db(redis, "FLUSHDB")
+
+    # 2. the claim
+    tag = "sscan-dl-over"
+    n = 3000
+    _sscan_fill(redis, tag, n)
+    s, over = _sscan_purge(ng, "/_cache_sscandeadline", tag)
+    assert s == 500, \
+        f"a deadline-abandoned tag purge must not report success: {s} {over}"
+    assert over.get("l2") == "incomplete", \
+        f"deadline abort did not disclose the incomplete walk: {over}"
+    assert _sscan_db(redis, "EXISTS", _sscan_tag_key(tag)) == "1", \
+        "a deadline-abandoned walk deleted the tag index it must retain"
+    assert 0 <= over["purged"] < n, \
+        f"deadline-abandoned purge over-reported: {over}"
+    _sscan_db(redis, "FLUSHDB")
+
+
+def test_l2_tag_purge_sscan_empty_set(ng: Nginx, redis: RedisServer) -> None:
+    """TODO-REDIS-PAGINATION (e): purging a tag that does not exist is a clean,
+    complete, zero-member success -- not an error and not an incomplete walk.
+
+    SSCAN over a missing key returns cursor "0" with an empty member array on
+    the first page, so this exercises the walk's completion path with zero
+    pages of members. Worth pinning: a reader that treated "no members" as a
+    parse failure, or that only set scan_status on a page that HAD members,
+    would turn every no-op purge into a 500."""
+    _sscan_db(redis, "FLUSHDB")
+    s, body = _sscan_purge(ng, "/_cache_sscan", "sscan-nonexistent")
+    assert s == 200, f"purging an absent tag must succeed: {s} {body}"
+    assert body["purged"] == 0, f"absent tag purged something: {body}"
+    assert "l2" not in body, \
+        f"an empty set is a COMPLETE walk, not an incomplete one: {body}"
+
+
+def test_l2_tag_purge_sscan_malformed_member_is_skipped(
+        ng: Nginx, redis: RedisServer) -> None:
+    """TODO-REDIS-PAGINATION (f): a member that is not <prefix><64 hex> must be
+    dropped from L2 but must NOT be hex-decoded -- and must not take the walk
+    down with it.
+
+    The tag set is just a Redis set: anything can be SADDed into it, by a
+    corrupted write, a different module version, or an operator. The completion
+    guards the L1/lock work with `len == plen + 64` and a hex-decode check; this
+    pins that a short member, an over-long one, a right-length-but-not-hex one
+    and an empty one all leave the purge standing and let the WELL-FORMED
+    members in the same set still be purged.
+
+    The well-formed members are the oracle. A purge that crashed, 500'd, or
+    bailed at the first malformed member would leave them behind -- so asserting
+    they are gone is what proves the malformed ones were SKIPPED rather than
+    fatal."""
+    _sscan_db(redis, "FLUSHDB")
+    tag = "sscan-malformed"
+    tkey = _sscan_tag_key(tag)
+
+    good = _sscan_fill(redis, tag, 4)
+    bad = [
+        f"{SSCAN_PREFIX}short",                       # far too short
+        f"{SSCAN_PREFIX}{'z' * 64}",                  # right length, not hex
+        f"{SSCAN_PREFIX}{'0' * 63}",                  # one hex nibble short
+        f"{SSCAN_PREFIX}{'0' * 65}",                  # one too long
+        "",                                           # empty member
+    ]
+    _sscan_db(redis, "SADD", tkey, *bad)
+    assert _sscan_db(redis, "SCARD", tkey) == str(len(good) + len(bad)), \
+        "malformed fixture did not land"
+
+    s, body = _sscan_purge(ng, "/_cache_sscan", tag)
+    assert s == 200, \
+        f"a malformed member must not fail the whole purge: {s} {body}"
+    assert "l2" not in body, f"malformed member aborted the walk: {body}"
+
+    # The oracle: the well-formed members were still purged.
+    for probe in good:
+        assert wait_for(lambda p=probe: _sscan_db(redis, "EXISTS", p) == "0",
+                        timeout=10.0), \
+            (f"well-formed member {probe} survived a purge that also saw "
+             f"malformed members -- the bad member aborted the page")
+    assert wait_for(lambda: _sscan_db(redis, "EXISTS", tkey) == "0",
+                    timeout=10.0), \
+        "a complete walk over a set containing malformed members must still "\
+        "delete the emptied tag key"
+
+
+def test_l2_tag_purge_sscan_duplicate_member_is_idempotent(
+        ng: Nginx, redis: RedisServer) -> None:
+    """TODO-REDIS-PAGINATION (g): the per-page purge must be IDEMPOTENT.
+
+    SSCAN's weaker guarantee (the accepted cost of option A) is that a member
+    may be returned MORE THAN ONCE when the set is rehashed mid-walk, so the
+    same object key can be dropped on two different pages. That must be
+    harmless: purge_key on an absent L1 slot and UNLINK on an absent L2 key are
+    both no-ops.
+
+    A Redis set cannot hold a literal duplicate, so the duplicate delivery is
+    reproduced the only honest way available from outside: purge the SAME tag
+    fixture TWICE. The second purge re-walks members the first already dropped,
+    which is exactly the per-member state a duplicated page delivery produces --
+    the object key gone, the lock key gone, the L1 slot empty. If dropping an
+    already-dropped member were not a no-op, the second purge is where it would
+    surface (a 500, a crash, or a wedged walk).
+
+    Also pins the documented counting contract: `purged` counts members
+    VISITED, not distinct members. The second purge sees an empty set and
+    reports 0 -- not a negative number, not an error."""
+    _sscan_db(redis, "FLUSHDB")
+    tag = "sscan-dup"
+    members = _sscan_fill(redis, tag, 300)
+
+    s1, first = _sscan_purge(ng, "/_cache_sscan", tag)
+    assert s1 == 200 and first["purged"] == 300, \
+        f"first purge did not clear the fixture: {s1} {first}"
+    assert wait_for(
+        lambda: _sscan_db(redis, "EXISTS", _sscan_tag_key(tag)) == "0",
+        timeout=10.0), "first purge left the tag key"
+
+    # Re-SADD the SAME member names WITHOUT recreating their object keys. This
+    # is the state a duplicated SSCAN page delivery produces: the walk hands the
+    # callback a member whose object key, lock key and L1 slot are already gone.
+    # Without this re-insert the second purge would scan a MISSING set and prove
+    # only the empty-set path -- it would never re-visit a member at all.
+    _sscan_db(redis, "SADD", _sscan_tag_key(tag), *members)
+    assert _sscan_db(redis, "SCARD", _sscan_tag_key(tag)) == str(len(members)), \
+        "duplicate-delivery fixture did not re-land its members"
+
+    s2, second = _sscan_purge(ng, "/_cache_sscan", tag)
+    assert s2 == 200, \
+        f"re-dropping already-dropped members must be a clean no-op: {s2} {second}"
+    assert "l2" not in second, f"re-purge reported an incomplete walk: {second}"
+    # It really re-VISITED them -- this is what makes the idempotency claim
+    # non-vacuous. A count of 0 here would mean the walk saw nothing.
+    assert second["purged"] == len(members), \
+        (f"the second purge did not re-visit the re-added members, so nothing "
+         f"was re-dropped and idempotency is untested: {second}")
+
+    for probe in (members[0], members[-1]):
+        assert _sscan_db(redis, "EXISTS", probe) == "0", \
+            f"member {probe} came back after a repeated purge"
+    assert wait_for(
+        lambda: _sscan_db(redis, "EXISTS", _sscan_tag_key(tag)) == "0",
+        timeout=10.0), "the repeated purge did not delete the emptied tag key"
 
 
 def test_l2_tag_cap_and_dedup(ng: Nginx, origin: Origin,

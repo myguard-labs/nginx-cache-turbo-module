@@ -457,7 +457,16 @@ def run_all(ng: Nginx, origin: Origin,
         test_l2_tag_overlong_warns(ng, origin, redis)  # CR297-TAGLEN
         test_l2_tag_purge(ng, origin, redis)
         test_l2_tag_purge_large(ng, origin, redis)  # STAB-3 + PERF-1/2 pipeline
-        test_l2_tag_purge_over_reply_cap_is_retryable(ng, redis)  # CT-AUD31
+        # TODO-REDIS-PAGINATION: the SSCAN cursor walk that replaced SMEMBERS.
+        # Ordered cheapest-first; the multi-page and over-legacy-cap fixtures
+        # are the expensive pair (3000 / 2200 members).
+        test_l2_tag_purge_sscan_empty_set(ng, redis)
+        test_l2_tag_purge_sscan_malformed_member_is_skipped(ng, redis)
+        test_l2_tag_purge_sscan_duplicate_member_is_idempotent(ng, redis)
+        test_l2_tag_purge_sscan_multipage_purges_every_member(ng, redis)
+        test_l2_tag_purge_over_legacy_reply_cap_now_succeeds(ng, redis)
+        test_l2_tag_purge_sscan_page_cap_keeps_tag_key(ng, redis)
+        test_l2_tag_purge_sscan_deadline_keeps_tag_key(ng, redis)
         test_l2_tag_purge_arg_validation(ng, origin, redis)  # AUD-TAG1
         test_l2_tag_cap_and_dedup(ng, origin, redis)  # PERF-2 tag cap/dedup
         test_l2_tag_cap_purge_reports_degraded(ng, origin, redis)  # TAG-CAP-SILENT-DROP

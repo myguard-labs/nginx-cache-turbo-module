@@ -64,11 +64,11 @@ run_mutant CTRL_ERROR_HELPERS_REDIS_CONSUME \
 	'Redis op_fail -> real get_finish must arm exactly once' \
 	'Redis consume-once'
 run_mutant CTRL_ERROR_HELPERS_REDIS_SMEMBERS_FAIL \
-	'Redis SMEMBERS zero-byte fill failure must arm exactly once' \
-	'Redis SMEMBERS zero-byte failure'
+	'Redis SSCAN zero-byte fill failure must arm exactly once' \
+	'Redis walk-finish zero-byte failure'
 run_mutant CTRL_ERROR_HELPERS_REDIS_DRAIN_CLEAR \
 	'Redis drain first reply byte must clear, never arm, backoff state' \
 	'Redis drain first-byte clear'
 run_mutant CTRL_ERROR_HELPERS_REDIS_EXACT_FRAME \
-	'SMEMBERS must reject trailing RESP bytes before parsing' \
-	'Redis SMEMBERS exact-frame gate'
+	'SSCAN must reject trailing RESP bytes before parsing' \
+	'Redis SSCAN exact-frame gate'
