@@ -2017,8 +2017,8 @@ def test_l2_tag_purge_sscan_multipage_purges_every_member(
          other assertion here while proving nothing about pagination, so the
          set is sized well past the COUNT 256 page hint and the reply size that
          used to be fatal.
-      2. Every member object is gone from L2, every member's lock: key is gone,
-         and the tag key itself is gone -- and `purged` equals the member count.
+      2. Every member object is gone from L2, the tag key itself is gone,
+         and `purged` counts at least the member count (visited, not distinct).
 
     The negative control for the multi-page property is
     test_l2_tag_purge_sscan_page_cap_keeps_tag_key: capped at 2 pages the SAME
@@ -2224,12 +2224,7 @@ def test_l2_tag_purge_sscan_page_cap_keeps_tag_key(
             (f"a retry made NO progress ({_sscan_db(redis, 'SCARD', tkey)} "
              f"members before and after): the capped walk re-visits the same "
              f"members forever and the tag is permanently unpurgeable")
-        now = int(_sscan_db(redis, "SCARD", tkey))
-        assert now < remaining, \
-            (f"a retry made NO progress ({now} members before and after): the "
-             f"capped walk re-visits the same members forever and the tag is "
-             f"permanently unpurgeable")
-        remaining = now
+        remaining = int(_sscan_db(redis, "SCARD", tkey))
 
     assert wait_for(
         lambda: _sscan_db(redis, "EXISTS", _sscan_tag_key(tag)) == "0",

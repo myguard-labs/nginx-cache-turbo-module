@@ -3269,8 +3269,8 @@ typedef struct {
  *                 it for "this page could not be dropped", never for a member
  *                 the callback merely chose to skip. Any other value means
  *                 "page handled" and is otherwise ignored. May be called any
- *                 number of times, including zero. Must be IDEMPOTENT: SSCAN
- *                 may return the same member on more than one page. An EMPTY
+ *                 number of times, including zero. Must be IDEMPOTENT; see
+ *                 redis_sscan() for SSCAN's completeness caveat. An EMPTY
  *                 page with a non-zero cursor does NOT reach cb at all, so
  *                 nmembers == 0 always means the terminal call.
  *   nmembers==0   TERMINAL, exactly once, always. Must produce the HTTP
@@ -3617,6 +3617,14 @@ typedef struct {
      * false "degraded" costs an operator a re-purge; a false "complete" is
      * the defect this exists to catch. */
     ngx_uint_t                         pending_at_launch;
+
+    /* TODO-REDIS-PAGINATION: pre-built tag set key ("<prefix>tag:<name>"),
+     * allocated from the transport pool (op->pool) and reused across every
+     * page delivery instead of rebuilding it anew. Derived solely from
+     * redis_prefix + tag, which are invariant across the walk, so every page
+     * produces the byte-identical result. Stored here to avoid redundant
+     * ngx_pnalloc on every page. */
+    ngx_str_t                          sscan_key;
 
     /* TODO-REDIS-PAGINATION: running count of members VISITED by the SSCAN
      * walk so far, accumulated across pages by tag_purge_complete's page

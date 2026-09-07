@@ -180,6 +180,19 @@ ngx_http_cache_turbo_purge_auto_vary(ngx_http_request_t *r,
         ngx_memcpy(tp->tag.data, keys->variant_index,
                    keys->variant_index_len);
         tp->tag.len = keys->variant_index_len;
+
+        /* TODO-REDIS-PAGINATION: build the tag set key once here, reuse it
+         * across every page instead of rebuilding on each one. Allocated from
+         * r->pool which survives the walk. */
+        tp->sscan_key.data = ngx_pnalloc(r->pool,
+                                clcf->redis_prefix.len + sizeof("tag:") - 1
+                                + tp->tag.len);
+        if (tp->sscan_key.data == NULL) {
+            return NGX_OK;
+        }
+        tp->sscan_key.len = clcf->backend->tagkey(&clcf->redis_prefix,
+                               tp->tag.data, tp->tag.len, tp->sscan_key.data);
+
         prc = clcf->backend->purge_tag(r, clcf, keys->variant_index,
                   keys->variant_index_len,
                   ngx_http_cache_turbo_tag_purge_complete, tp);
@@ -509,17 +522,22 @@ ngx_http_cache_turbo_tag_purge_complete(ngx_http_request_t *r, void *data,
 
                     lockbuf = ngx_pnalloc(tmp,
                                   plen + sizeof("lock:") - 1 + 64);
-                    if (lockbuf != NULL) {
-                        delkeys[ndel].data = lockbuf;
-                        delkeys[ndel].len =
-                            ngx_http_cache_turbo_redis_lockkey(
-                                &tp->clcf->redis_prefix, key_hash, lockbuf);
-                        ndel++;
+                    if (lockbuf == NULL) {
+                        ngx_destroy_pool(tmp);
+                        /* Out of memory mid-walk, same policy as delkeys and
+                         * tagkey failures: abandon the walk so the response says
+                         * INCOMPLETE rather than claiming a clean purge while a
+                         * stale lock survives to cause V-HANG on the next
+                         * cold-miss winner. */
+                        return NGX_ERROR;
                     }
+                    delkeys[ndel].data = lockbuf;
+                    delkeys[ndel].len =
+                        ngx_http_cache_turbo_redis_lockkey(
+                            &tp->clcf->redis_prefix, key_hash, lockbuf);
+                    ndel++;
                 }
             }
-
-            tp->purged++;
         }
 
         if (ngx_http_cache_turbo_redis_del_many(tp->clcf, delkeys, ndel)
@@ -536,6 +554,16 @@ ngx_http_cache_turbo_tag_purge_complete(ngx_http_request_t *r, void *data,
              * terminal-DEL design had for free. Abandon the walk so the
              * response says INCOMPLETE rather than claiming a clean purge. */
             return NGX_ERROR;
+        }
+
+        /* del_many succeeded: count every non-empty member in this page. This
+         * counts visited members, not distinct members (SSCAN may revisit a
+         * member on a rehash), which matches the purged contract and the README
+         * caveat. */
+        for (i = 0; i < nmembers; i++) {
+            if (members[i].len > 0) {
+                tp->purged++;
+            }
         }
 
         /* Drop this page's members from the tag set itself, so an ABANDONED
@@ -558,27 +586,14 @@ ngx_http_cache_turbo_tag_purge_complete(ngx_http_request_t *r, void *data,
          * keep reporting as present after a complete purge. Pinned by
          * test_l2_tag_purge_sscan_malformed_member_is_skipped, whose fixture
          * SADDs "" precisely to hold this honest. */
-        tagkey = ngx_pnalloc(tmp, plen + sizeof("tag:") - 1 + tp->tag.len);
-        if (tagkey == NULL) {
-            ngx_destroy_pool(tmp);
-            /* This page's object keys are already UNLINKed but its members
-             * would stay in the tag set. Continuing would let an abandoned
-             * walk re-visit those already-dropped members on every retry and
-             * never converge -- the same silently-unpurgeable failure the
-             * delkeys allocation above refuses to risk. Abandon the walk
-             * instead, exactly as that path does. */
-            return NGX_ERROR;
-        }
-
+        /* TODO-REDIS-PAGINATION: reuse tp->sscan_key (built once at launch,
+         * not rebuilt on every page). Saves allocation + computation per page
+         * and guarantees consistency. */
         {
-            ngx_str_t  tk;
             ngx_int_t  src;
 
-            tk.data = tagkey;
-            tk.len = tp->clcf->backend->tagkey(&tp->clcf->redis_prefix,
-                         tp->tag.data, tp->tag.len, tagkey);
-            src = ngx_http_cache_turbo_redis_srem_many(tp->clcf, &tk, members,
-                                                       nmembers);
+            src = ngx_http_cache_turbo_redis_srem_many(tp->clcf, &tp->sscan_key,
+                                                       members, nmembers);
             if (src != NGX_OK) {
                 ngx_destroy_pool(tmp);
                 /* The SREM never launched, so this page's members are gone

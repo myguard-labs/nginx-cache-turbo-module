@@ -153,7 +153,7 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         ngx_fuzz_pool_reset(&pool);
     }
 
-    /* 4) STAB-3 pre-framer. Unlike the three above it takes raw pointers rather
+    /* 3) STAB-3 pre-framer. Unlike the two above it takes raw pointers rather
      * than an op, reports progress through *next, and is the module's ONLY
      * recursive parser: a `*<count>` array recurses per element, bounded by
      * FRAME_MAX_DEPTH. It is the pre-framer for read_smembers/read_scan and,
@@ -192,7 +192,7 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         ngx_fuzz_pool_reset(&pool);
     }
 
-    /* 5) SPLIT DELIVERY. Everything above hands the parser one buffer holding
+    /* 4) SPLIT DELIVERY. Everything above hands the parser one buffer holding
      * the whole reply, which is the single case a real socket does NOT
      * guarantee: a Redis reply arrives in as many recv()s as the network feels
      * like, and read_get()/read_smembers()/read_scan() drive their parser in a
@@ -561,10 +561,14 @@ main(void)
         (const u_char *) "*2\r\n$1\r\n0\r\n*2\r\n$-1\r\n$3\r\ntwo\r\n",
         sizeof("*2\r\n$1\r\n0\r\n*2\r\n$-1\r\n$3\r\ntwo\r\n") - 1,
         NGX_OK, "0", 2, array_nil);
-    failures += check_scan_split_fixture("sscan malformed member",
+    failures += check_scan_split_fixture("sscan truncated member",
         (const u_char *) "*2\r\n$1\r\n0\r\n*1\r\n$3\r\none\n",
         sizeof("*2\r\n$1\r\n0\r\n*1\r\n$3\r\none\n") - 1,
         NGX_AGAIN, "", 0, NULL);
+    failures += check_scan_split_fixture("sscan member invalid delimiter",
+        (const u_char *) "*2\r\n$1\r\n0\r\n*1\r\n$3\r\none#\r\n",
+        sizeof("*2\r\n$1\r\n0\r\n*1\r\n$3\r\none#\r\n") - 1,
+        NGX_ERROR, "", 0, NULL);
 
     failures += check_scan_split_fixture("scan done two keys",
         (const u_char *) "*2\r\n$1\r\n0\r\n*2\r\n$2\r\nk1\r\n$2\r\nk2\r\n",
