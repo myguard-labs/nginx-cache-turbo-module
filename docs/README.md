@@ -34,7 +34,7 @@ One page per `cache_turbo_backend` preset:
 | `typo3` | [typo3.md](typo3.md) | ⚠️ yes (`fe_typo_user`, `be_typo_user`) — **but the cookie name is admin-overridable via `FE/cookieName`**; fails **UNSAFE** |
 | `invision` | [invision.md](invision.md) | ✅ yes (`ips4_loggedIn`, vendor-documented for this exact purpose) — closed-source, vendor-attested not code-verified |
 | `smf` | [smf.md](smf.md) | ✅ yes (`SMFCookie`, presence-only) — guest-issued too; the ideal value predicate needs JSON/array decoding this engine doesn't do, so it costs hit rate instead |
-| `vanilla` | [vanilla.md](vanilla.md) | ✅ yes (`Vanilla`, presence-only) — **verify empirically on your install**, source could not be directly cited |
+| `vanilla` | [vanilla.md](vanilla.md) | ⚠️ legacy self-hosted only (`Vanilla=`, presence-only) — current Vanilla SaaS uses a per-site `vf_*` login-cookie name that the stock preset cannot match; configure the exact deployed name |
 | `punbb` | [punbb.md](punbb.md) | ✅ yes (`forum_cookie`/`punbb_cookie`, presence-only) — `forum_cookie` covers stock 1.4.x (incl. the installer's randomised suffix), `punbb_cookie` the legacy 1.2-era name; same engine limitation as `smf`, guest-issued too |
 | `phorum` | [phorum.md](phorum.md) | ✅ yes (fixed session-cookie constants) — never guest-issued, the clean case |
 | `yabb` | [yabb.md](yabb.md) | ✅ yes (`Y2Sess-`/`Y2User-`/`Y2Pass-` prefix) — per-install random suffix, but never guest-issued |
@@ -51,7 +51,7 @@ One page per `cache_turbo_backend` preset:
 | `wikijs` | [wikijs.md](wikijs.md) | ✅ yes for Wiki.js 2.x (`jwt`; untouched guests get no Express session) — re-audit for 3.x |
 | `redmine` | [redmine.md](redmine.md) | ✅ yes (`_redmine_session`, a hardcoded literal, + `autologin`) — **and `?key=` is a bypass ARG**: it authenticates an Atom/API request with no cookie at all |
 | `flarum` | [flarum.md](flarum.md) | ⚠️ **only with "remember me"** (`flarum_remember`) — `flarum_session` is issued to every guest and is deliberately NOT matched; a login without remember-me is invisible to the cookie tier, `/api` contains most of the exposure |
-| `opencart` | [opencart.md](opencart.md) | ⚠️ **by ARG, not cookie** (`route=account/…`, `route=checkout/…`) — `OCSESSID` is guest-issued and login state is server-side only, so there is NO cookie rule; routes are enumerated because the arg tier is an exact match |
+| `opencart` | [opencart.md](opencart.md) | ⚠️ defense in depth only on 4.1.0.4 — base controller ARGs are matched, method-qualified routes are not; the global origin `no-store` keeps the default safe but also prevents page-cache hits |
 
 `classicpress` is a source-verified alias for `wordpress`; `backdrop` is a
 source-verified alias for `drupal`. See the addenda in [wordpress.md](wordpress.md)
@@ -198,9 +198,10 @@ Several rows above are load-bearing:
   what makes them shippable at all. But both stop being logged-in signals if the
   app starts writing sessions for guests — a Django anonymous cart, a Kirby
   template calling `csrf()`. When that happens the guest gets **bypassed**: the hit
-  rate drops, nothing leaks. **That direction is the whole ballgame** — compare
-  `flarum` below, whose equivalent condition fails the *other* way and is therefore
-  rejected outright. See [wagtail.md](wagtail.md), [kirby.md](kirby.md).
+  rate drops, nothing leaks. **That direction is the whole ballgame** —
+  Flarum's equivalent condition fails the *other* way, which is why its shipped
+  preset remains explicitly partial. See [wagtail.md](wagtail.md),
+  [kirby.md](kirby.md), and [flarum.md](flarum.md).
 - **`typo3` is a conditional cookie rule too — but it is the one that fails
   UNSAFE, not safe.** `FrontendUserAuthentication` sets `$dontSetCookie = true`
   by default, so an anonymous visitor gets no `fe_typo_user` cookie — good hit
@@ -324,49 +325,18 @@ sends no `Cache-Control` on cart or checkout at all**, so the origin backstop th
 saves Drupal and MediaWiki does not fire. All three legs are broken — a URI-only
 preset here would not degrade gracefully, it would **leak carts**.
 
-**OpenCart.** Everything is `index.php?route=checkout/cart`, so the dynamic surface
-lives in a query-arg **value**. This registry matches arg-**key** presence, and a
-`route` rule would match *every* page including the entire catalog — hit rate zero.
-Every cookie OpenCart sets (`OCSESSID`, `currency`) is set for anonymous visitors,
-so none can be a bypass. The preset simply cannot express the app.
+**Flarum's remember-me trap.** Flarum gives every guest the same opaque session
+cookie used by an ordinary login. Only a login with "remember me" adds the
+matchable identity cookie, so matching that cookie misses ordinary members while
+matching the session cookie bypasses every guest. The shipped partial preset and
+its remaining boundary are documented in [flarum.md](flarum.md).
 
-**Flarum.** The instructive rejection, because it *looks* shippable and is not.
-Flarum has a stable, non-`APP_NAME`-derived cookie prefix (`CookieFactory`, default
-`flarum`) and a cookie that means "logged in": `flarum_remember`. The trap is what
-happens when a user **doesn't tick "remember me"** — which is the checkbox's
-*default* state. `CreateTokenController` branches:
+OpenCart also ships a partial preset. Its exact base-controller rules do not
+cover method-qualified OpenCart 4 routes; [opencart.md](opencart.md) documents
+the origin-header backstop and the fail-closed opt-in configuration.
 
-```php
-if (Arr::get($body, 'remember')) { $token = RememberAccessToken::generate($user->id); }
-else                             { $token = SessionAccessToken::generate($user->id); }
-```
-
-and `Rememberer::remember()` — the **only** writer of `flarum_remember` — is called
-only for the `RememberAccessToken` branch. So an ordinary logged-in user carries
-**only `flarum_session`**, which Flarum starts for every anonymous visitor too.
-Both doors are locked:
-
-- bypass `flarum_session` → bypasses **100%** of traffic (hit rate 0)
-- bypass only `flarum_remember` → a logged-in user is served a **cached anonymous
-  page**
-
-The second is a **leak, not a lost hit**, and it is the *common* path rather than an
-edge case. That is the exact inverse of the [`kirby`](kirby.md) / [`wagtail`](wagtail.md)
-condition, which fails toward a needless bypass. **When a preset's failure mode
-serves one user's page to another, there is no preset.**
-
-> **"But we have cookie VALUE predicates now — doesn't that fix Flarum?" No.**
-> Asked and answered against the source; do not re-open it. `StartSession`
-> (`src/Http/Middleware/StartSession.php`) sets `flarum_session` on **every**
-> response with no actor check, and its value is an opaque Laravel session id —
-> byte-shape-identical for a guest and a member. Login state is the `access_token`
-> key **inside the server-side session payload** (`AuthenticateWithSession.php`),
-> and it never reaches a cookie. There is nothing in any cookie, *name or value*,
-> that differs between the two. The value predicate that rescues [phpBB](phpbb.md)
-> works because phpBB puts the user id in the cookie; Flarum does not put anything
-> there. **Flarum stays rejected.**
->
-> **Joomla is the same shape, and its md5 cookie name is a red herring.** Joomla's
+> **Joomla has the same server-side identity shape, and its md5 cookie name is a
+> red herring.** Joomla's
 > session name is `md5(md5($secret . $session_name))` — per-install, so a fixed-name
 > matcher genuinely cannot match it. But solving the *naming* problem would not
 > solve the *safety* problem: the session is started **eagerly for every anonymous

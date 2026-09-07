@@ -55,11 +55,10 @@
  * route every page through one `action`/`do` argument, so for them only the
  * VALUE separates a login from an ordinary read. Adding a
  * backend is one row here — no new code path. A row is active when
- * (clcf->backend_presets & row->bit). `generic` (bare `auto`) is the union of
- * WP/Woo/Joomla, whose cookie/URI namespaces are disjoint, so stacking them
- * cannot collide. A backend with generic-English URIs (xenforo, discourse,
- * drupal, ...) stays out of that union and must be named explicitly. Curated
- * heuristic, not a CMS fingerprint.
+ * (clcf->backend_presets & row->bit). Every row is opt-in; the removed
+ * `generic` / `auto` spellings are rejected by the config parser. In
+ * particular, a backend with generic-English URIs (xenforo, discourse, drupal,
+ * ...) must be named explicitly. Curated heuristic, not a CMS fingerprint.
  *
  * `cookies` is matched as a SUBSTRING of the request Cookie header — presence
  * only, no value predicate. Two consequences the rows below turn on: a cookie
@@ -1055,12 +1054,12 @@ static const char *const  ct_smf_args[] = {
  * receives it at all, unlike the phpBB/SMF/XenForo shape. No value predicate
  * is needed or available (the value is an HMAC-signed opaque payload).
  *
- * CAVEAT: this is corroborated via Vanilla's own KB article and community
- * threads describing SetIdentity/GetIdentity, not a direct line-cited GitHub
- * source read (the exact file could not be fetched at research time — it may
- * have moved in the TypeScript/PHP8 rewrite of newer Vanilla). Ship it, but
- * verify empirically against your own install (curl anonymously, confirm no
- * `Set-Cookie: Vanilla=...` appears) before relying on it in production.
+ * CAVEAT: `Vanilla=` targets the legacy self-hosted Garden-era product.
+ * Current Vanilla SaaS documents a per-site `vf_[site]_<hash>` login-cookie
+ * name, which this fixed literal cannot match; SaaS operators need an exact
+ * local bypass plus no-store rule. The legacy rule is corroborated via
+ * community forks rather than the unavailable former upstream repository, so
+ * verify it empirically against the deployed installation before relying on it.
  *
  * The rule matches "Vanilla=" — the identity cookie's name followed by its
  * delimiter — NOT the bare substring "Vanilla". Vanilla derives several
@@ -1569,8 +1568,8 @@ static const char *const  ct_redmine_args[] = { "key", NULL };
  * $prefix = $config['cookie.name'] ?? 'flarum', getName() returns
  * "{$prefix}_{$name}"), and `paths.admin`/`paths.api` are renameable the same
  * way; all three are matched at their stock values only. Verified against
- * flarum/framework main (2.0.0-rc.5; identical mechanics in the 1.8.x stable
- * line).
+ * flarum/framework v2.0.0-rc.8; the same cookie mechanics remain in the
+ * v1.8.19 stable line (rechecked 2026-09-01).
  */
 static const char *const  ct_flarum_cookies[] = {
     "flarum_remember=", NULL };
@@ -1584,11 +1583,14 @@ static const char *const  ct_flarum_args[] = { NULL };
  * application: OpenCart routes everything through index.php?route=<controller>,
  * so every private page shares the single path /index.php. A URI-prefix rule
  * catches NOTHING here — it would look correct, match nothing, and leave carts
- * and account pages cacheable. The `route=account/` and `route=checkout/`
- * prefixes cover the whole private surface (verified against
- * upload/catalog/controller/{account,checkout}/ on opencart/opencart master,
- * 4.1.0.3 current 2026-07-26). `user_token` is the admin-panel auth arg and
- * `customer_token` the login-validation token.
+ * and account pages cacheable. The shipped exact values cover each controller's
+ * base route in the 22 account and 10 checkout controllers in OpenCart 4.1.0.4.
+ * They do NOT cover method-qualified values such as `checkout/cart.list`;
+ * OpenCart's global `Cache-Control: no-store` remains the safety boundary for
+ * those requests. Do not override that header and treat this preset as
+ * complete.
+ * `user_token` is the admin-panel auth arg and `customer_token` the
+ * login-validation token.
  *
  * NO COOKIE ROW, deliberately. `OCSESSID` (upload/system/config/default.php,
  * $_['session_name']) is issued to guests — a shop has to track an anonymous
@@ -1602,9 +1604,11 @@ static const char *const  ct_flarum_args[] = { NULL };
  * NAME=VALUE by exact bytes (see the NAME=VALUE branch in auto_skip: "no case
  * folding, no prefix match"), so a `route=account/` row would match only the
  * literal ?route=account/ and never ?route=account/login — i.e. it would look
- * right and protect nothing. Every private route is therefore listed in full.
- * ADDING A ROUTE MEANS ADDING A ROW; a new private controller under
- * account/ or checkout/ is NOT covered automatically.
+ * right and protect nothing. Every base controller route is therefore listed in
+ * full. ADDING A CONTROLLER OR METHOD ROUTE MEANS ADDING A ROW; neither is
+ * covered automatically. Current OpenCart has many method-qualified routes,
+ * so docs/opencart.md requires an application-provided identity boundary
+ * before an operator considers overriding the global no-store policy.
  *
  * No key_cookies: OpenCart 4.x drives language and currency through the URL
  * (catalog/controller/common/language.php only reads request/config and

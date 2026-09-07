@@ -830,8 +830,9 @@ there is no way to opt a single location out.
 >   exist, so `auto` on a Drupal site silently enabled *no* Drupal rules;
 > - its **`woocommerce`** shipped without implying `wordpress`, leaving
 >   `/wp-admin/` cacheable (see [woocommerce.md](docs/woocommerce.md));
-> - the **`joomla` in it shipped no cookie rule at all**, so `auto` on a Joomla site
->   *looked* like it protected logged-in users and did not.
+> - the **`joomla` in it had no complete frontend-session rule**, so `auto` on a
+>   Joomla site *looked* like it protected every logged-in user and did not. The
+>   current standalone preset has a partial remember-me rule, not full coverage.
 >
 > A default that is only correct if you already know which parts of it are wrong
 > is a footgun with a friendly name. nginx now **refuses to start** and names the
@@ -963,7 +964,7 @@ storage; the trade is a lost cache hit, never a cacheable private request.
 | `typo3` † ※   | `/typo3` | — | `fe_typo_user`, `be_typo_user` |
 | `invision` †  | `/admin`, `/login`, `/register`, `/lostpassword`, `/messenger` | `do=compose`, `do=post`, `do=reply`, `do=report`, `module=messaging` | `_loggedIn` (suffix); *(key)* `ips4_hasJS`, `ips4_theme`, `ips4_language` |
 | `smf` †       | — | `action=admin`, `action=login`, `action=login2`, `action=logintfa`, `action=logout`, `action=profile`, `action=pm`, `action=post`, `action=post2`, `action=moderate`, `action=reporttm`, `action=xmlhttp` | `SMFCookie` (presence-only) |
-| `vanilla` †   | `/dashboard`, `/entry/`, `/messages/`, `/post/` ⁂ | — | `Vanilla=` (presence-only) |
+| `vanilla` †   | `/dashboard`, `/entry/`, `/messages/`, `/post/` ⁂ | — | `Vanilla=` (legacy self-hosted only); SaaS `vf_*` names need an exact local rule |
 | `punbb` †     | `/admin.php`, `/admin/`, `/login.php`, `/post.php`, `/message_send.php`, `/message_delete.php`, `/misc.php` | — | `forum_cookie`, `punbb_cookie` (presence-only) |
 | `phorum` †    | `admin.php`, `login.php`, `register.php`, `pm.php`, `posting.php`, `post.php`, `moderation.php`, `control.php`, `ajax.php`, `report.php`, `follow.php` | — | `phorum_session_v5`, `phorum_session_st`, `phorum_admin_session_v5`; *(key)* `list_style` |
 | `yabb` †      | — | `action=post`, `action=post2`, `action=login`, `action=login2`, `action=register`, `action=register2`, `action=admin`, `action=pm`, `action=imsend`, `action=imsend2` | `Y2User-`, `Y2Pass-`, `Y2Sess-` (prefix) |
@@ -980,7 +981,7 @@ storage; the trade is a lost cache hit, never a cacheable private request.
 | `wikijs` † | admin/editor/history/source/upload, login/identity and GraphQL routes | — | `jwt`, `connect.sid`, `loginRedirect` |
 | `redmine` † | `/admin`, `/my`, `/login`, `/logout`, `/account`, `/settings`, `/enumerations`, `/roles`, `/trackers`, `/custom_fields`, `/auth_sources`, `/mail_handler` | `key` | `_redmine_session`, `autologin` |
 | `flarum` † | `/admin`, `/api`, `/login`, `/logout`, `/global-logout`, `/register`, `/reset`, `/confirm`, `/settings`, `/notifications` | — | `flarum_remember` **only** — `flarum_session` is guest-issued and deliberately unmatched |
-| `opencart` † | — (all routing is `/index.php?route=`) | `route=account/…` and `route=checkout/…` (enumerated), `user_token`, `customer_token` | — (none: `OCSESSID` is guest-issued, login state is server-side only) |
+| `opencart` † | — (all routing is `/index.php?route=`) | base `route=account/…` and `route=checkout/…` values, `user_token`, `customer_token`; method-qualified OpenCart 4 routes rely on origin `no-store` | — (none: `OCSESSID` is guest-issued, login state is server-side only) |
 
 `classicpress` is an alias for `wordpress`, and `backdrop` is an alias for
 `drupal`; the upstream forks retain their base project's cookie and route

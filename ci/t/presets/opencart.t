@@ -16,16 +16,17 @@
 #   OpenCart routes everything through index.php?route=<controller>, so every
 #   private page shares the single path /index.php. A URI-prefix rule catches
 #   NOTHING here -- it would look correct, match nothing, and leave carts and
-#   account pages cacheable. The `route=account/` and `route=checkout/`
-#   prefixes cover the whole private surface. `user_token` is the admin-panel
-#   auth arg and `customer_token` the login-validation token.
+#   account pages cacheable. The exact `route=account/...` and
+#   `route=checkout/...` rows cover base controller routes, not OpenCart 4's
+#   method-qualified routes such as `checkout/cart.list`. OpenCart's global
+#   no-store header remains the safety boundary for those requests.
 #
 #   The route values are ENUMERATED, not prefix-matched: the arg tier compares
 #   NAME=VALUE by exact bytes (no case folding, no prefix match), so a
 #   `route=account/` row would match only the literal ?route=account/ and
-#   never ?route=account/login. Every private route is therefore listed in
-#   full. ADDING A ROUTE MEANS ADDING A ROW; a new private controller under
-#   account/ or checkout/ is NOT covered automatically.
+#   never ?route=account/login. Every base controller route is therefore listed
+#   in full. ADDING A CONTROLLER OR METHOD ROUTE MEANS ADDING A ROW; neither is
+#   covered automatically.
 #
 # NO COOKIE ROW, DELIBERATELY
 # ------------------------------------------------------------------------
@@ -79,8 +80,9 @@ run_tests();
 
 __DATA__
 
-=== TEST 1: every checkout/* route bypasses
-# The checkout/* half of ct_opencart_args[].
+=== TEST 1: every shipped base checkout/* route bypasses
+# The base-controller checkout/* half of ct_opencart_args[]. Method-qualified
+# OpenCart 4 routes are deliberately outside this exact-match test.
 --- http_config eval: $::HttpConfig
 --- config eval: $::Config
 --- request eval
@@ -111,8 +113,8 @@ __DATA__
 
 
 
-=== TEST 2: every account/* route bypasses
-# The account/* half of ct_opencart_args[].
+=== TEST 2: every shipped base account/* route bypasses
+# The base-controller account/* half of ct_opencart_args[].
 --- http_config eval: $::HttpConfig
 --- config eval: $::Config
 --- request eval
@@ -183,23 +185,29 @@ __DATA__
 
 
 
-=== TEST 4: catalogue routes on the SAME /index.php path stay cacheable
-# The negative control: an ordinary product page goes through the identical
-# path with a different route value and must still cache. A test asserting
-# only the bypass rows would also pass if the preset bypassed /index.php
-# outright, which would disable the cache for the whole shop.
+=== TEST 4: catalogue routes on the SAME /index.php path are not preset-bypassed
+# Matcher negative control against the synthetic cacheable fixture origin: an
+# ordinary product page goes through the same path with a different route value.
+# Stock OpenCart 4.1.0.4 itself sends global no-store, so this proves selector
+# precision, not that an unmodified OpenCart response will be stored.
 --- http_config eval: $::HttpConfig
 --- config eval: $::Config
 --- request eval
 ["GET /oc/index.php?route=common/home",       "GET /oc/index.php?route=common/home",
  "GET /oc/index.php?route=product/category",  "GET /oc/index.php?route=product/category",
- "GET /oc/index.php?route=product/product",   "GET /oc/index.php?route=product/product"]
+ "GET /oc/index.php?route=product/product",   "GET /oc/index.php?route=product/product",
+ "GET /oc/index.php?route=checkout/cart.list", "GET /oc/index.php?route=checkout/cart.list",
+ "GET /oc/index.php?route=checkout/cart|list", "GET /oc/index.php?route=checkout/cart|list",
+ "GET /oc/index.php?route=checkout/cart%7Clist", "GET /oc/index.php?route=checkout/cart%7Clist"]
 --- response_headers eval
 [qq{X-Cache: }, qq{X-Cache: HIT},
  qq{X-Cache: }, qq{X-Cache: HIT},
+ qq{X-Cache: }, qq{X-Cache: HIT},
+ qq{X-Cache: }, qq{X-Cache: HIT},
+ qq{X-Cache: }, qq{X-Cache: HIT},
  qq{X-Cache: }, qq{X-Cache: HIT}]
 --- error_code eval
-[200, 200, 200, 200, 200, 200]
+[200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200]
 
 
 
@@ -217,8 +225,10 @@ __DATA__
 
 === TEST 6: OCSESSID guest-issued session cookie does NOT bypass
 # OpenCart must ship NO cookie row -- OCSESSID is guest-issued and login
-# state lives server-side only, so a browsing shopper carrying it must stay
-# cacheable. Without this row a cookie rule here would bypass the entire shop.
+# state lives server-side only, so the cookie alone must not trigger this
+# preset.
+# The synthetic fixture remains cacheable to prove that selector property;
+# stock OpenCart's global no-store still prevents application-page storage.
 --- http_config eval: $::HttpConfig
 --- config eval: $::Config
 --- more_headers

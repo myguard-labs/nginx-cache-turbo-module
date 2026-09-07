@@ -1,6 +1,6 @@
 # Preset review and deployment checklist
 
-_Registry reviewed: 2026-08-17 at `ddb06b8`._
+_Implementation reviewed: 2026-09-01 at `3db1ca9`._
 
 This page records what was checked across every shipped
 `cache_turbo_backend` preset. The per-application guides remain the source for
@@ -55,7 +55,7 @@ deliberately has no rule of that kind; it is not an unchecked blank.
 | `typo3` | 2 | 1 | — | — | — | Unsafe after an unmirrored `FE/cookieName` rename; add local bypass and no-store rules. |
 | `invision` | — | 5 | 5 | yes | 3 | Vendor-attested closed-source rules; verify cookies on the deployed release. |
 | `smf` | 1 | — | 12 | — | — | Safe but presence-only session matching can bypass guests. |
-| `vanilla` | 1 | 4 | — | — | — | Verify the deployed product/version and cookie name empirically. |
+| `vanilla` | 1 | 4 | — | — | — | Legacy self-hosted only; current SaaS `vf_*` login-cookie names are per-site and need local rules. |
 | `punbb` | 2 | 9 | — | — | — | Covers stock and legacy prefixes; guest-issued cookies reduce hit rate. |
 | `phorum` | 3 | 12 | — | — | 1 | Fixed member cookies and language key are covered. |
 | `yabb` | 3 | — | 11 | — | — | Random cookie suffixes are covered by stable prefixes. |
@@ -71,8 +71,8 @@ deliberately has no rule of that kind; it is not an unchecked blank.
 | `dotclear` | 3 | 3 | — | — | — | Custom `DC_SESSION_NAME` and same-host admin paths need local rules. |
 | `wikijs` | 3 | 14 | — | — | — | Covers Wiki.js 2.x; treat 3.x as a fresh preset review. |
 | `redmine` | 2 | 12 | 1 | — | — | Cookie login and cookieless `?key=` authentication are covered. |
-| `flarum` | 1 | 10 | — | — | — | Partial: login without remember-me is indistinguishable from a guest session. |
-| `opencart` | — | — | 34 | — | — | Route-driven only; pretty URLs and new controllers require deployment checks. |
+| `flarum` | 1 | 10 | — | — | — | Partial: login without remember-me is indistinguishable from a guest session; rechecked at 2.0.0-rc.8/1.8.19. |
+| `opencart` | — | — | 34 | — | — | Partial: base controller routes only. `OCSESSID` is identical for guests and members, so retain the application `no-store` policy; overriding it needs an application-exposed login boundary, then a fail-closed local map. |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -84,7 +84,19 @@ sentinel, not a preset.
 
 The registry, runtime-test mirrors and documentation index agree on all 34
 preset rows and 37 accepted spellings. The preset unit checks cover every
-populated cookie and argument row. No internally inconsistent setting was found.
+populated cookie and argument row.
+
+The 2026-09-01 online refresh also confirmed that XenForo 2.3.12 and Flarum
+2.0.0-rc.8 do not require literal changes. Two material documentation
+corrections survived review:
+
+- OpenCart 4.1.0.4 has method-qualified request routes such as
+  `checkout/cart.list` that the exact base-controller rows do not match. Its
+  global `Cache-Control: no-store` keeps the default safe but prevents useful
+  page caching; overriding it requires a fail-closed deployment map.
+- `Vanilla=` remains a legacy self-hosted literal, while the current SaaS
+  product documents a per-site `vf_*` login-cookie name that cannot be
+  represented by one safe stock substring.
 
 That result does **not** turn conditional presets into universal ones. The
 remaining deployment checks are concentrated in six classes:

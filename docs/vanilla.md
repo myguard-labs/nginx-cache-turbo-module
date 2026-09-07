@@ -1,9 +1,10 @@
 # Vanilla Forums + cache-turbo
 
-_Last researched: 2026-07-18_
+_Last researched: 2026-09-01_
 
-Caching a Vanilla Forums board. Shippable, but **verify empirically on your
-install before relying on it** — see the caveat below.
+Caching a legacy self-hosted Vanilla Forums board. The stock preset does **not**
+match current Vanilla SaaS cookie names; identify which product you run and
+verify its cookie on the wire before relying on it.
 
 - [The short version](#the-short-version)
 - [The identity cookie, and the caveat](#the-identity-cookie-and-the-caveat)
@@ -30,27 +31,38 @@ the substring **`Vanilla=`** — the default name plus its delimiter — in the
 Cookie header. The trailing `=` is deliberate: it excludes the
 `Vanilla-tk` (guest-issued) and `Vanilla-Vv` siblings that share the base
 prefix (see below).
-A renamed cookie (`Garden.Cookie.Name` changed, or the SaaS `vf_[site]_<hash>`
-naming) won't match and needs a hand-written `cache_turbo_bypass` **plus a
-matching `cache_turbo_no_store`** — the bypass skips only the lookup and still
-stores the member's page.
+A renamed cookie (`Garden.Cookie.Name` changed) will not match and needs a
+hand-written `cache_turbo_bypass` **plus a matching `cache_turbo_no_store`** —
+the bypass skips only the lookup and still stores the member's page.
 
-**Verification status — read this before trusting the citations.** There is no
-longer a live upstream source to check this against. `github.com/vanilla/vanilla`
-now returns **404** (repository page, `raw.githubusercontent.com` and the REST
-API alike; the `vanilla` GitHub *org* still exists, but the forum repo is gone),
-and the vendor KB article
+**Product boundary — read this before using the preset.** The current vendor KB
 [Cookies Used in Vanilla](https://success.vanillaforums.com/kb/articles/86-cookies-used-in-vanilla)
-no longer renders its body. **A reader cannot follow either citation**, and this
-page does *not* rest on a confirmed reading of current Vanilla source.
+documents the SaaS login cookie as `vf_[your-site]_%`: the site component and
+random hash make its name installation-specific. It also documents related
+anonymous `%-tk` and `%-Vv` cookies and the `vf-%-sid` workflow session. The
+stock `Vanilla=` literal matches none of them, and a broad `vf_` substring would
+also catch non-identity cookies. For SaaS, inspect the exact login-cookie name
+and match that full name plus `=` in a `map`, then use the result for both
+bypass and no-store:
 
-What it actually rests on: surviving community forks of the **Garden**-era tree
+```nginx
+map $http_cookie $vanilla_saas_member {
+    default                              0;
+    "~*(^|;\s*)vf_your_site_exact_hash=" 1;
+}
+
+cache_turbo_bypass   $vanilla_saas_member;
+cache_turbo_no_store $vanilla_saas_member;
+```
+
+The shipped literal instead rests on surviving community forks of the
+**Garden**-era self-hosted tree
 (last pushed ~2013), where `Garden.Cookie.Name` defaults to `'Vanilla'` in
 `conf/config-defaults.php` and `SetIdentity()`/`GetIdentity()` live in
 `library/core/class.cookieidentity.php`. That is a decade-stale snapshot of a
-codebase that has since been rewritten. Treat the cookie shape below as
-plausible-but-unverified and **confirm it on your own install** before going
-live:
+codebase that has since been rewritten; the former upstream repository remains
+unavailable. Treat the legacy cookie shape below as plausible-but-unverified and
+**confirm it on your own self-hosted install** before going live:
 
 ```bash
 curl -s -o /dev/null -D- https://forum.example.com/ | grep -i set-cookie
@@ -58,12 +70,8 @@ curl -s -o /dev/null -D- https://forum.example.com/ | grep -i set-cookie
 ```
 
 **The prefix collision the `=` avoids:** the same base name prefixes two more
-cookies — `Vanilla-tk` (the CSRF transient key), which *is* issued to guests: an
-anonymous visitor loading any form-bearing page gets one; and `Vanilla-Vv`, a
-~20-minute sliding visit tracker. (`-Vv` is reported in the field only alongside
-the logged-in cookie set, which suggests it is member-only rather than
-guest-issued; with the upstream repo gone this could not be re-confirmed
-against source, so the rule below is written to be correct either way.) A
+anonymous cookies documented by the vendor: `Vanilla-tk`, the CSRF transient
+key, and `Vanilla-Vv`, the roughly 20-minute sliding visit tracker. A
 bare-prefix rule would match `Vanilla-tk` and serve
 **BYPASS** to every returning guest, leaving the cache to answer only
 cookie-less first hits and crawlers. Matching `Vanilla=` instead anchors on the
@@ -214,10 +222,11 @@ The copy stays fresh for `60s`; if the origin starts failing after that, the exp
 > `location` does **not** substitute: it routes requests, it does not rewrite
 > `r->uri`. See [frameworks.md](frameworks.md).
 
-- **No live upstream source backs this page.** `github.com/vanilla/vanilla`
-  404s and the vendor KB article no longer renders; the only surviving basis is
-  the Garden-era tree (last pushed ~2013). Confirm with a live anonymous
-  `curl` before trusting this in production (see caveat above).
+- **The preset is legacy self-hosted only.** The current vendor KB directly
+  confirms that SaaS uses per-site `vf_*` cookie names, which do not match
+  `Vanilla=`. The legacy literal itself still rests on Garden-era forks because
+  the former upstream repository is unavailable. Confirm with a live anonymous
+  and member `curl` before trusting it in production (see caveat above).
 - **The `-tk` (guest-issued) and `-Vv` cookies share the `Vanilla` prefix** — the preset
   matches `Vanilla=` rather than `Vanilla` so those two do not trip it and
   returning guests stay cacheable. Keep that `=` in mind if you write your own
