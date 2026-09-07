@@ -439,7 +439,7 @@ ngx_http_cache_turbo_tag_purge_complete(ngx_http_request_t *r, void *data,
     ngx_http_cache_turbo_tagpurge_t  *tp = data;
     ngx_uint_t                        i, ndel = 0;
     size_t                            plen;
-    u_char                           *tagkey, *p;
+    u_char                           *p;
     ngx_str_t                        *delkeys, body;
 
     plen = tp->clcf->redis_prefix.len;

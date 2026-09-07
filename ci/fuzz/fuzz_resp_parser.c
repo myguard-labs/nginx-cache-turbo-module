@@ -568,7 +568,7 @@ main(void)
     failures += check_scan_split_fixture("sscan member invalid delimiter",
         (const u_char *) "*2\r\n$1\r\n0\r\n*1\r\n$3\r\none#\r\n",
         sizeof("*2\r\n$1\r\n0\r\n*1\r\n$3\r\none#\r\n") - 1,
-        NGX_ERROR, "", 0, NULL);
+        NGX_DECLINED, "", 0, NULL);
 
     failures += check_scan_split_fixture("scan done two keys",
         (const u_char *) "*2\r\n$1\r\n0\r\n*2\r\n$2\r\nk1\r\n$2\r\nk2\r\n",

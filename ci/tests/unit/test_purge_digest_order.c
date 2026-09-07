@@ -77,6 +77,24 @@ test_purge_tag(ngx_http_request_t *r,
     return l2_purge_tag_result;
 }
 
+/* Mirrors the production ngx_http_cache_turbo_redis_tagkey encoding
+ * ("<prefix>tag:<name>") so the extracted launch-time sscan_key
+ * construction has an observable, checkable result. */
+static size_t
+test_tagkey(ngx_str_t *prefix, u_char *name, size_t name_len, u_char *buf)
+{
+    u_char *p = buf;
+
+    memcpy(p, prefix->data, prefix->len);
+    p += prefix->len;
+    memcpy(p, "tag:", sizeof("tag:") - 1);
+    p += sizeof("tag:") - 1;
+    memcpy(p, name, name_len);
+    p += name_len;
+
+    return (size_t) (p - buf);
+}
+
 static void
 reset_case(ngx_http_request_t *r, ngx_pool_t *pool,
     ngx_connection_t *connection, ngx_http_cache_turbo_loc_conf_t *clcf,
@@ -161,7 +179,8 @@ int
 main(void)
 {
     ngx_cache_turbo_l1_backend_t    l1 = { test_lookup, test_purge_key };
-    ngx_cache_turbo_backend_t       redis = { test_del, test_purge_tag };
+    ngx_cache_turbo_backend_t       redis = { test_del, test_purge_tag,
+                                               test_tagkey };
     ngx_http_cache_turbo_zone_t     zone;
     ngx_shm_zone_t                  shm_zone = { &zone };
     ngx_http_cache_turbo_loc_conf_t clcf;
