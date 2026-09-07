@@ -1883,7 +1883,7 @@ def test_l2_tag_purge(ng: Nginx, origin: Origin, redis: RedisServer) -> None:
 
 def test_l2_tag_purge_large(ng: Nginx, origin: Origin,
                             redis: RedisServer) -> None:
-    """STAB-3 + PERF-1/2: a tag set with enough members that the SMEMBERS reply
+    """STAB-3 + PERF-1/2: a tag set with enough members that the enumeration
     spans multiple recv()s (>16 KiB), and whose purge drops every member across
     both tiers. Pre-PERF this fired ~2N fire-and-forget DEL connections at once
     and exhausted worker_connections; now the purge collects all keys into ONE
@@ -1908,7 +1908,7 @@ def test_l2_tag_purge_large(ng: Nginx, origin: Origin,
          f"fire-and-forget SADD is still landing after 10s "
          f"(SCARD={redis.cli('SCARD', tag_key('news'))})")
 
-    n = 350                                        # ~25 KiB SMEMBERS reply
+    n = 350                                        # ~25 KiB of members
     for i in range(n):
         s, _, _ = fetch(ng.port, f"/l2t/big-{i}")  # miss -> store + tag
         assert s == 200, f"prime /l2t/big-{i} status {s}"
@@ -1918,9 +1918,12 @@ def test_l2_tag_purge_large(ng: Nginx, origin: Origin,
 
     s, b, _ = fetch(ng.port, "/_cache_l2?tag=news", method="POST")
     assert s == 200, f"large tag purge status {s}"
-    # STAB-3: the whole multi-recv SMEMBERS array was framed + parsed once.
-    assert json.loads(b)["purged"] == n, f"expected {n} purged, got {b}"
-    # PERF-1/2: the pipelined UNLINK dropped every member + the tag set itself.
+    # STAB-3: every multi-recv page was framed + parsed. >= n, not == n: the
+    # SSCAN walk SREMs each page as it goes and so resizes the set under its own
+    # cursor, and `purged` counts members VISITED, not distinct members.
+    assert json.loads(b)["purged"] >= n, f"expected at least {n} purged, got {b}"
+    # PERF-1/2: the pipelined UNLINK dropped every member, and the per-page SREM
+    # emptied the set so Redis dropped the set key itself.
     assert wait_for(lambda: redis.cli("EXISTS", tag_key("news")) == "0",
                     timeout=10.0), "emptied tag set survived the large purge"
     assert wait_for(lambda: redis.cli("EXISTS", l2_key("/l2t/big-0")) == "0"
