@@ -3220,7 +3220,10 @@ ngx_int_t ngx_http_cache_turbo_redis_del_many(ngx_http_cache_turbo_loc_conf_t *c
  * On a COMPLETE walk it is what empties the set, since there is no terminal DEL
  * of the tag key; pass EVERY visited member, zero-length ones included, or the
  * set never reaches empty and Redis never retires the key.
- * No-op when L2 is disabled, nmembers == 0, or setkey is empty. */
+ * No-op returning NGX_OK when L2 is disabled or nmembers == 0. An empty or
+ * NULL `setkey` is NOT a no-op: it returns NGX_ERROR, because a caller that
+ * built no set key has nothing to SREM from and the paginated tag walk treats
+ * a non-NGX_OK return as "abandon the walk". */
 ngx_int_t ngx_http_cache_turbo_redis_srem_many(
     ngx_http_cache_turbo_loc_conf_t *clcf, ngx_str_t *setkey,
     ngx_str_t *members, ngx_uint_t nmembers);
