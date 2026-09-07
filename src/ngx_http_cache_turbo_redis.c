@@ -1453,10 +1453,17 @@ ngx_http_cache_turbo_redis_del(ngx_http_cache_turbo_loc_conf_t *clcf,
  * chunking, sizing and launch dance. `lead` is the fixed prefix ("UNLINK", or
  * "SREM" + the set key); keys are appended after it. Key bytes are copied by
  * encode_into, so the caller's arrays need not outlive the call.
+ *
+ * `keep_empty` decides what a zero-length element means. For UNLINK it is
+ * garbage and is dropped, because "" is not a key anything could have stored.
+ * For SREM it is a legitimate member -- a Redis set holds "" as happily as any
+ * other string -- and dropping it would leave it in the set forever, so the set
+ * would never reach empty and Redis would never retire the set key.
  */
 static void
 ngx_http_cache_turbo_redis_cmd_many(ngx_http_cache_turbo_loc_conf_t *clcf,
-    ngx_str_t *lead, ngx_uint_t nlead, ngx_str_t *keys, ngx_uint_t nkeys)
+    ngx_str_t *lead, ngx_uint_t nlead, ngx_str_t *keys, ngx_uint_t nkeys,
+    ngx_uint_t keep_empty)
 {
     ngx_uint_t                        i, m, emitted, j;
     size_t                            total;
@@ -1490,7 +1497,7 @@ ngx_http_cache_turbo_redis_cmd_many(ngx_http_cache_turbo_loc_conf_t *clcf,
     while (i < nkeys) {
         m = 0;
         while (m < NGX_HTTP_CACHE_TURBO_REDIS_DEL_CHUNK && i < nkeys) {
-            if (keys[i].len) {            /* skip empty keys defensively */
+            if (keep_empty || keys[i].len) {
                 argv[nlead + m] = keys[i];/* shallow; encode copies the bytes */
                 m++;
             }
@@ -1518,7 +1525,7 @@ ngx_http_cache_turbo_redis_cmd_many(ngx_http_cache_turbo_loc_conf_t *clcf,
     while (i < nkeys) {
         m = 0;
         while (m < NGX_HTTP_CACHE_TURBO_REDIS_DEL_CHUNK && i < nkeys) {
-            if (keys[i].len) {
+            if (keep_empty || keys[i].len) {
                 argv[nlead + m] = keys[i];
                 m++;
             }
@@ -1549,7 +1556,7 @@ ngx_http_cache_turbo_redis_del_many(ngx_http_cache_turbo_loc_conf_t *clcf,
     lead[0].data = (u_char *) "UNLINK";
     lead[0].len = sizeof("UNLINK") - 1;
 
-    ngx_http_cache_turbo_redis_cmd_many(clcf, lead, 1, keys, nkeys);
+    ngx_http_cache_turbo_redis_cmd_many(clcf, lead, 1, keys, nkeys, 0);
 }
 
 
@@ -1565,9 +1572,12 @@ ngx_http_cache_turbo_redis_del_many(ngx_http_cache_turbo_loc_conf_t *clcf,
  * than the over-cap SMEMBERS bug this change fixed. SREMing each page as it is
  * dropped is what makes "retry the purge" actually converge.
  *
- * On a COMPLETE walk this is redundant (the whole set key is deleted at the
- * end) but harmless, and issuing it uniformly keeps the page path free of a
- * "was this the last page" special case it cannot answer anyway.
+ * On a COMPLETE walk it is also what EMPTIES the set: there is no terminal DEL
+ * of the tag key, because deleting it unconditionally would destroy a member
+ * SADDed mid-walk that SSCAN never returned. Emptying the set page by page and
+ * letting Redis retire the emptied key itself preserves that survivor instead.
+ * Every visited member is passed, zero-length ones included (keep_empty), or
+ * the set would never reach empty and the key would outlive a complete purge.
  */
 void
 ngx_http_cache_turbo_redis_srem_many(ngx_http_cache_turbo_loc_conf_t *clcf,
@@ -1583,7 +1593,7 @@ ngx_http_cache_turbo_redis_srem_many(ngx_http_cache_turbo_loc_conf_t *clcf,
     lead[0].len = sizeof("SREM") - 1;
     lead[1] = *setkey;
 
-    ngx_http_cache_turbo_redis_cmd_many(clcf, lead, 2, members, nmembers);
+    ngx_http_cache_turbo_redis_cmd_many(clcf, lead, 2, members, nmembers, 1);
 }
 
 

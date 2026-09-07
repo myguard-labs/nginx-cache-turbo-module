@@ -544,12 +544,18 @@ ngx_http_cache_turbo_tag_purge_complete(ngx_http_request_t *r, void *data,
             return NGX_ERROR;
         }
 
-        nsrem = 0;
+        /* EVERY member this page visited, including a zero-length one. The
+         * delkeys loop above skips an empty member because it is not a usable
+         * L2 key, but it IS a real member of the set and SREM removes it
+         * perfectly well. Filtering it out here would leave it behind forever:
+         * the set would never reach empty, so Redis would never drop the set
+         * key, and the tag would keep reporting as present after a complete
+         * purge. Pinned by test_l2_tag_purge_sscan_malformed_member_is_skipped,
+         * whose fixture SADDs "" precisely to hold this line honest. */
         for (i = 0; i < nmembers; i++) {
-            if (members[i].len != 0) {
-                srem[nsrem++] = members[i];
-            }
+            srem[i] = members[i];
         }
+        nsrem = nmembers;
 
         {
             ngx_str_t  tk;

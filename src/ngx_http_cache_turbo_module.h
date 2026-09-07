@@ -3217,6 +3217,9 @@ void ngx_http_cache_turbo_redis_del_many(ngx_http_cache_turbo_loc_conf_t *clcf,
  * an ABANDONED walk leaves behind a tag set containing only the members it
  * never reached -- without it the retained set key is useless, because every
  * retry restarts at cursor 0, re-walks the same pages and never converges.
+ * On a COMPLETE walk it is what empties the set, since there is no terminal DEL
+ * of the tag key; pass EVERY visited member, zero-length ones included, or the
+ * set never reaches empty and Redis never retires the key.
  * No-op when L2 is disabled, nmembers == 0, or setkey is empty. */
 void ngx_http_cache_turbo_redis_srem_many(
     ngx_http_cache_turbo_loc_conf_t *clcf, ngx_str_t *setkey,
