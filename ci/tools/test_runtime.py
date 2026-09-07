@@ -524,6 +524,7 @@ def run_all(ng: Nginx, origin: Origin,
         # below (the last of which deliberately empties L2).
         test_scan_walk_pool_is_o1_in_pages(ng, redis)
         test_scan_walk_page_cap_reports_incomplete(ng, redis)
+        test_scan_walk_del_many_failure_reports_incomplete(ng, redis)  # GRIND-C6-READSCAN
         test_scan_walk_deadline_reports_incomplete(ng, redis)  # S231-L2-SCANTIME
         # AUD-PURGE-HONESTY1: shares the ctscan: prefix for its control leg, so
         # it belongs in this group and ahead of the all-purge tests below.

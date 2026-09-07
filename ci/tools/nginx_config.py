@@ -923,6 +923,20 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             deny all;
         }}
 
+        # GRIND-C6-READSCAN: force the ?all=1 SCAN-del walk's per-page
+        # del_many() to report failure deterministically (real Redis stays UP
+        # and answers the SCAN side normally), so the "this page's UNLINK
+        # never launched" abandon-and-report-INCOMPLETE branch is reachable
+        # without a real OOM/backoff. Own prefix/db shared with the rest of
+        # this SCAN group, same convention as /_cache_scancap.
+        location = /_cache_scandelfail {{
+            cache_turbo_admin    main;
+            cache_turbo_redis    127.0.0.1:{redis_port} db=7 prefix=ctscan: timeout=2s;
+            cache_turbo_test_scan_del_fail on;
+            allow 127.0.0.1;
+            deny all;
+        }}
+
         # S231-L2-SCANTIME. The deadline is checked at a page boundary and only
         # AFTER the cursor==0 completion return, so a walk that finishes never
         # evaluates it. A bare "unmeetable" 1ms deadline therefore does NOT make
