@@ -304,6 +304,10 @@ ngx_int_t ngx_http_cache_turbo_redis_tag_add_many(
  * exactly once with no members to produce the response; finalizes with the rc
  * of that terminal call.
  *
+ * An EMPTY page with a non-zero cursor never reaches cb at all -- read_sscan
+ * invokes it only for nmembers > 0 -- so `nmembers == 0` unambiguously denotes
+ * the terminal call.
+ *
  * ⚠ On the TERMINAL call, walk is non-NULL only when the walk actually ran
  * (it carries status/pages/deadline/blocks). A transport failure before any
  * page landed also invokes cb exactly once, with no members AND walk == NULL --

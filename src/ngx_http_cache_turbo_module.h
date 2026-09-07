@@ -3267,7 +3267,9 @@ typedef struct {
  *                 the callback merely chose to skip. Any other value means
  *                 "page handled" and is otherwise ignored. May be called any
  *                 number of times, including zero. Must be IDEMPOTENT: SSCAN
- *                 may return the same member on more than one page.
+ *                 may return the same member on more than one page. An EMPTY
+ *                 page with a non-zero cursor does NOT reach cb at all, so
+ *                 nmembers == 0 always means the terminal call.
  *   nmembers==0   TERMINAL, exactly once, always. Must produce the HTTP
  *                 response and return the rc to finalize with.
  *                 `walk->status != NGX_OK` means the enumeration was abandoned:

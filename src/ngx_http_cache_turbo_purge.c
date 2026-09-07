@@ -431,13 +431,18 @@ ngx_http_cache_turbo_tag_purge_complete(ngx_http_request_t *r, void *data,
 
     plen = tp->clcf->redis_prefix.len;
 
-    if (walk == NULL) {
+    /* ONE discriminator, matching the members_pt contract: no members means the
+     * TERMINAL call. Keying the page branch off `walk == NULL` alone would send
+     * a terminal call that carries no walk (transport failure before any page
+     * landed) into the page branch, which returns NGX_DONE without emitting a
+     * body -- walk_finish then finalizes and the client waits forever. That is
+     * unreachable today only because walk_finish passes `op->is_scan ? &walk :
+     * NULL` and redis_sscan always sets is_scan, which is luck, not a contract.
+     * read_sscan never invokes the callback for an empty non-terminal page, so
+     * nmembers == 0 is unambiguous here. */
+    if (walk == NULL && nmembers > 0) {
         /* ---- page delivery ---- */
         ngx_pool_t  *tmp;
-
-        if (nmembers == 0) {
-            return NGX_DONE;
-        }
 
         /* ⚠ PAGE-SCOPED POOL, NOT r->pool. r->pool is not released until the
          * request finalizes, which happens only after the LAST page -- so

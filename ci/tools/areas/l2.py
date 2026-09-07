@@ -2175,7 +2175,12 @@ def test_l2_tag_purge_sscan_page_cap_keeps_tag_key(
 
     # Honest partial count: > 0 because two pages really were dropped, < n
     # because the walk stopped.
-    assert 0 < over["purged"] < n, \
+    # 0 <= , like the deadline test next door: COUNT is a hint over hash
+    # BUCKETS, not members, so nothing promises a two-page scan of ~512 buckets
+    # contains any member at all. The docstring's real claim -- the report must
+    # not lie about deleted pages -- is carried by `< n` plus the retry loop
+    # below, which proves each attempt shrinks the set.
+    assert 0 <= over["purged"] < n, \
         (f"an abandoned paginated purge must report the members it ACTUALLY "
          f"dropped, not 0 and not the whole set: {over}")
 
