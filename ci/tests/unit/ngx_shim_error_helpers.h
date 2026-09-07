@@ -296,7 +296,9 @@ ngx_http_cache_turbo_redis_op_done(ngx_http_cache_turbo_redis_op_t *op)
 #ifndef ngx_pagesize
 #define ngx_pagesize  4096
 #endif
+#ifndef ngx_min
 #define ngx_min(a, b)  ((a) < (b) ? (a) : (b))
+#endif
 
 typedef ngx_int_t  ngx_msec_int_t;
 

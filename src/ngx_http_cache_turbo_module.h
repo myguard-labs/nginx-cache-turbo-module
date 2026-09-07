@@ -3265,11 +3265,17 @@ typedef struct {
  *                 "page handled" and is otherwise ignored. May be called any
  *                 number of times, including zero. Must be IDEMPOTENT: SSCAN
  *                 may return the same member on more than one page.
- *   walk != NULL  TERMINAL, exactly once, always, with nmembers == 0. Must
- *                 produce the HTTP response and return the rc to finalize with.
+ *   nmembers==0   TERMINAL, exactly once, always. Must produce the HTTP
+ *                 response and return the rc to finalize with.
  *                 `walk->status != NGX_OK` means the enumeration was abandoned:
  *                 a callback that ignores it reports an abandoned walk as a
- *                 clean success, and must not delete the set key.
+ *                 clean success.
+ *                 ⚠ walk is non-NULL on the terminal call only when the walk
+ *                 actually ran. A transport failure before any page landed
+ *                 makes the terminal call with walk == NULL (pinned by the
+ *                 zero-byte fill test in ci/tests/unit/test_error_helpers.c),
+ *                 so the callback MUST NULL-check walk before dereferencing it
+ *                 and treat NULL as "the enumeration failed outright".
  *
  * The SCAN-del keyspace walk deletes its pages internally and therefore only
  * ever makes the terminal call. */

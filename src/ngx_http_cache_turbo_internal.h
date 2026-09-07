@@ -301,8 +301,15 @@ ngx_int_t ngx_http_cache_turbo_redis_tag_add_many(
  * (was a single SMEMBERS, which failed the whole purge once the set's reply
  * exceeded the 128 KiB bounded-iteration cap). Parks the request (count++) and
  * invokes cb ONCE PER PAGE with that page's members and walk == NULL, then
- * exactly once with no members and walk != NULL to produce the response;
- * finalizes with the rc of that terminal call.
+ * exactly once with no members to produce the response; finalizes with the rc
+ * of that terminal call.
+ *
+ * ⚠ On the TERMINAL call, walk is non-NULL only when the walk actually ran
+ * (it carries status/pages/deadline/blocks). A transport failure before any
+ * page landed also invokes cb exactly once, with no members AND walk == NULL --
+ * pinned by the zero-byte fill test in ci/tests/unit/test_error_helpers.c. A
+ * consumer MUST therefore NULL-check walk before dereferencing it, and treat a
+ * NULL walk on the terminal call as "the enumeration failed outright".
  *
  * ⚠ SSCAN's completeness is weaker than SMEMBERS': a member present for the
  * whole walk is returned at least once, but a member SADDed mid-walk may be

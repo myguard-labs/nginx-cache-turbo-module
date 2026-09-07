@@ -401,8 +401,11 @@ ngx_http_cache_turbo_hexdecode(u_char *src, size_t len, u_char *dst)
  *   walk == NULL  one page's members: evict each from L1, and pipeline its
  *                 object key + its `lock:` key into one UNLINK. The running
  *                 count goes into tp->purged. NO response, NO tag-key delete.
- *   walk != NULL  terminal: delete the tag set key (complete walks only) and
- *                 emit the JSON reply.
+ *   terminal      emit the JSON reply. No tag-key delete: every page SREMs
+ *                 its own members, so a complete walk empties the set and
+ *                 Redis drops the emptied key itself. walk may be NULL here
+ *                 when the transport failed before any page landed, which is
+ *                 an abandoned walk.
  *
  * Dropping each page as it arrives is the whole point: accumulating members to
  * delete them in one final pass would reintroduce exactly the unbounded buffer
@@ -422,7 +425,7 @@ ngx_http_cache_turbo_tag_purge_complete(ngx_http_request_t *r, void *data,
 {
     ngx_http_cache_turbo_tagpurge_t  *tp = data;
     ngx_uint_t                        i, ndel = 0, nsrem;
-    size_t                            plen, n;
+    size_t                            plen;
     u_char                           *tagkey, *p;
     ngx_str_t                        *delkeys, *srem, body;
 
@@ -577,7 +580,11 @@ ngx_http_cache_turbo_tag_purge_complete(ngx_http_request_t *r, void *data,
      * is what already tells the consumer the purge did not finish. The status
      * (500) and the "l2":"incomplete" field are unchanged, so a consumer that
      * only checks those is unaffected. */
-    if (walk->status != NGX_OK) {
+    /* walk == NULL means the transport failed before any page landed, which is
+     * an abandoned enumeration and takes the same INCOMPLETE reply as an
+     * explicitly-abandoned walk. Dereferencing it here would be a NULL-deref on
+     * a dead Redis connection. */
+    if (walk == NULL || walk->status != NGX_OK) {
         p = ngx_pnalloc(r->pool,
                 sizeof("{\"purged\":4294967295,\"l2\":\"incomplete\"}\n"));
         if (p == NULL) {
@@ -590,18 +597,20 @@ ngx_http_cache_turbo_tag_purge_complete(ngx_http_request_t *r, void *data,
                     r, NGX_HTTP_INTERNAL_SERVER_ERROR, &body);
     }
 
-    /* Complete walk: every member has been dropped page by page, so the set is
-     * empty and the set key itself goes now — exactly once, and only here. */
-    tagkey = ngx_pnalloc(r->pool, plen + sizeof("tag:") - 1 + tp->tag.len);
-    if (tagkey != NULL) {
-        ngx_str_t  tk;
-
-        n = tp->clcf->backend->tagkey(&tp->clcf->redis_prefix,
-                 tp->tag.data, tp->tag.len, tagkey);
-        tk.data = tagkey;
-        tk.len = n;
-        ngx_http_cache_turbo_redis_del_many(tp->clcf, &tk, 1);
-    }
+    /* Complete walk: NOTHING to delete here. Every page SREMs its own members,
+     * so a fully-enumerated set has already emptied itself and Redis drops an
+     * emptied set key automatically -- the terminal DEL this replaces was
+     * redundant on that path.
+     *
+     * It was also actively harmful on the one path SSCAN newly admits. A member
+     * SADDed mid-walk may be missed (the weaker completeness this change
+     * accepts), and such a member is still in the set when the walk reaches
+     * cursor 0. An unconditional DEL would destroy that membership, orphaning a
+     * live L2 object with no tag pointing at it -- undiscoverable by any later
+     * purge, i.e. permanently unpurgeable. Letting the set key expire naturally
+     * once it is genuinely empty preserves the survivor instead, so reissuing
+     * the purge finds it. This is why the delete is gone rather than made
+     * conditional: there is no state in which it is the right operation. */
 
     /* c-1 / SILENT-INDEX-DROP(c): report a DEGRADED enumeration explicitly
      * rather than silently under-counting. tp->pending_at_launch != 0 means

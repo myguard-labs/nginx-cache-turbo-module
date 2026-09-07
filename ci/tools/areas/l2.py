@@ -2030,8 +2030,13 @@ def test_l2_tag_purge_sscan_multipage_purges_every_member(
     s, body = _sscan_purge(ng, "/_cache_sscan", tag)
     assert s == 200, f"multi-page tag purge must succeed: {s} {body}"
     assert "l2" not in body, f"multi-page walk reported incomplete: {body}"
-    assert body["purged"] == n, \
-        f"expected {n} members purged across the paginated walk, got {body}"
+    # >= n, not == n: `purged` counts members VISITED, not distinct members
+    # (module.h's contract and the README caveat). This walk SREMs each page as
+    # it goes, so it resizes the set under its own cursor for ~12 consecutive
+    # pages -- exactly the condition under which SSCAN may return a member on
+    # two pages. Coverage of the whole set is the claim; the visit count is not.
+    assert body["purged"] >= n, \
+        f"expected at least {n} members purged across the paginated walk, got {body}"
 
     assert wait_for(
         lambda: _sscan_db(redis, "EXISTS", _sscan_tag_key(tag)) == "0",
@@ -2373,7 +2378,8 @@ def test_l2_tag_purge_sscan_duplicate_member_is_idempotent(
     members = _sscan_fill(redis, tag, 300)
 
     s1, first = _sscan_purge(ng, "/_cache_sscan", tag)
-    assert s1 == 200 and first["purged"] == 300, \
+    # >= for the same visited-not-distinct reason as the multi-page test above.
+    assert s1 == 200 and first["purged"] >= 300, \
         f"first purge did not clear the fixture: {s1} {first}"
     assert wait_for(
         lambda: _sscan_db(redis, "EXISTS", _sscan_tag_key(tag)) == "0",
@@ -2394,7 +2400,9 @@ def test_l2_tag_purge_sscan_duplicate_member_is_idempotent(
     assert "l2" not in second, f"re-purge reported an incomplete walk: {second}"
     # It really re-VISITED them -- this is what makes the idempotency claim
     # non-vacuous. A count of 0 here would mean the walk saw nothing.
-    assert second["purged"] == len(members), \
+    # >= still fails on 0, which is the outcome that would make the idempotency
+    # claim vacuous, so the assertion keeps its teeth.
+    assert second["purged"] >= len(members), \
         (f"the second purge did not re-visit the re-added members, so nothing "
          f"was re-dropped and idempotency is untested: {second}")
 
