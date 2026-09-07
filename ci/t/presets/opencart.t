@@ -220,6 +220,9 @@ __DATA__
 [qq{X-Cache: }, qq{X-Cache: HIT}]
 --- error_code eval
 [200, 200]
+
+
+
 === TEST 6: OCSESSID guest-issued session cookie does NOT bypass
 # OpenCart must ship NO cookie row -- OCSESSID is guest-issued and login
 # state lives server-side only, so the cookie alone must not trigger this
