@@ -467,6 +467,7 @@ def run_all(ng: Nginx, origin: Origin,
         test_l2_tag_purge_sscan_malformed_member_is_skipped(ng, redis)
         test_l2_tag_purge_sscan_duplicate_member_is_idempotent(ng, redis)
         test_l2_tag_purge_sscan_multipage_purges_every_member(ng, redis)
+        test_l2_tag_purge_sscan_reports_incomplete_when_backend_is_down(ng, redis)
         test_l2_tag_purge_over_legacy_reply_cap_now_succeeds(ng, redis)
         test_l2_tag_purge_sscan_page_cap_keeps_tag_key(ng, redis)
         test_l2_tag_purge_sscan_deadline_keeps_tag_key(ng, redis)

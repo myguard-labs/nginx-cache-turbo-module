@@ -2054,6 +2054,65 @@ def test_l2_tag_purge_sscan_multipage_purges_every_member(
     _sscan_db(redis, "FLUSHDB")
 
 
+def test_l2_tag_purge_sscan_reports_incomplete_when_backend_is_down(
+        ng: Nginx, redis: RedisServer) -> None:
+    """mem_058c6ab1eff44d89b7425ac24c68e77c: the by-tag (SSCAN) mirror of
+    test_all_purge_reports_l2_unavailable_when_backend_is_down above -- same
+    /_cache_scandown fault (the registry's redis_dead offset is reserved and
+    never bound, so the connect is refused before any page is read), applied
+    to /_cache_sscandown instead.
+
+    The two transports do NOT converge on the same reply. read_scan's terminal
+    callback (ngx_http_cache_turbo_all_purge_complete, admin.c) branches on
+    walk->pages to tell "never started" (l2":"unavailable") apart from "started
+    and stopped early" (l2":"incomplete") -- that is what the ?all=1 sibling
+    test asserts. tag_purge_complete (purge.c) has no such branch: its terminal
+    check is bare `walk == NULL || walk->status != NGX_OK`, so a connect-refused
+    walk that consumed zero pages reports the SAME "l2":"incomplete" as a walk
+    that died on page 4. Asserting "unavailable" here would be wrong for this
+    transport and would never go red -- the field this code actually emits is
+    "incomplete", and that is the specific value pinned below.
+
+    Two claims, and the first keeps the second from being vacuous:
+
+      1. NEGATIVE CONTROL -- the SAME request shape (?tag=) against a LIVE L2
+         (/_cache_sscan) answers 200 with no "l2" key. An endpoint that
+         reported incomplete unconditionally would satisfy claim 2 while
+         breaking every healthy tag purge.
+      2. Against the dead backend the reply is 500 AND carries
+         "l2":"incomplete". Asserting only "not 200" would pass on any
+         unrelated error path (a 404 from a misspelled location, the 400/502
+         validation replies admin_purge_tag sends for other failures), so both
+         status and field are pinned.
+
+    "purged" must still be present in the failure body AND be exactly 0: it is
+    the walk's own visited-count accounting, and the connect is refused before
+    the first SSCAN page, so any other count means the counter advanced for a
+    page that was never read. `type(...) is int` rather than isinstance, since
+    isinstance(True, int) is also true."""
+    # 1. control: identical request shape, live backend
+    _sscan_db(redis, "FLUSHDB")
+    ctrl_tag = "sscandown-ctrl"
+    _sscan_fill(redis, ctrl_tag, 5)
+    s_ok, ok = _sscan_purge(ng, "/_cache_sscan", ctrl_tag)
+    assert s_ok == 200, f"control tag purge against a LIVE L2 failed: {s_ok} {ok}"
+    assert "l2" not in ok, f"control tag purge reported an L2 problem: {ok}"
+    _sscan_db(redis, "FLUSHDB")
+
+    # 2. the claim: L2 down, nothing walked
+    s, down = _sscan_purge(ng, "/_cache_sscandown", "sscandown-claim")
+    assert s == 500, \
+        f"tag purge with L2 down must not report success: {s} {down}"
+    assert down.get("l2") == "incomplete", \
+        (f"tag purge with L2 down did not disclose the walk outcome as "
+         f"INCOMPLETE (this transport has no separate 'unavailable' state -- "
+         f"see mem_058c6ab1eff44d89b7425ac24c68e77c): {down}")
+    assert type(down.get("purged")) is int and down["purged"] == 0, \
+        (f"the connect is refused before the first SSCAN page, so the failed "
+         f"walk must report EXACTLY 0 purged -- any other count means the "
+         f"counter advanced for a page that was never read: {down}")
+
+
 def test_l2_tag_purge_over_legacy_reply_cap_now_succeeds(
         ng: Nginx, redis: RedisServer) -> None:
     """TODO-REDIS-PAGINATION (b) -- THE REGRESSION THIS ITEM EXISTS FOR.
