@@ -3908,6 +3908,14 @@ ngx_http_cache_turbo_redis_walk_unsuspend(void *opaque)
  * refused -- the caller decides what an undisarmable connection means, because
  * the two call sites differ: the suspension must stay parked for its in-flight
  * UNLINK, while the detach has no request left to protect.
+ *
+ * ⚠ This clears rev->active but deliberately NOT rev->ready, which stays set
+ * from the reply already consumed. That matters to whoever re-arms: with
+ * active == 0 and ready == 1, ngx_handle_read_event's `!active && !ready` gate
+ * is false and it registers NOTHING. sscan_advance -- the only resuming caller
+ * -- clears `ready` itself immediately before re-arming. walk_detach's
+ * suspended arm is the other caller and needs none of this: it tears the walk
+ * down and never resumes, so its connection is closed rather than re-armed.
  */
 static ngx_int_t
 ngx_http_cache_turbo_redis_walk_disarm_conn(ngx_connection_t *c)
@@ -4155,11 +4163,35 @@ ngx_http_cache_turbo_redis_sscan_advance(
      * re-arms ngx_add_timer(c->read, op->timeout) as soon as it finishes
      * sending, which is what bounds each page individually.
      *
+     * ⚠ CLEAR rev->ready FIRST, or ngx_handle_read_event REGISTERS NOTHING.
+     * Under NGX_USE_CLEAR_EVENT (epoll/kqueue -- the production case) and
+     * under NGX_USE_LEVEL_EVENT alike, ngx_handle_read_event only calls
+     * ngx_add_event when `!rev->active && !rev->ready`. walk_disarm_conn
+     * cleared `active` but deliberately leaves `ready` alone, and `ready` is
+     * still set from the page reply that triggered this suspension: read_sscan
+     * consumed that reply to completion without the recv loop ever hitting
+     * EAGAIN, and nothing in this module clears `ready` itself. So a stale
+     * ready == 1 makes the gate false, ngx_handle_read_event returns NGX_OK
+     * having added nothing, and the resumed walk writes its next SSCAN with
+     * the read event OFF the poller: the reply is never noticed and the purge
+     * stalls until the read timer expires -- a silent multi-page tag-purge
+     * failure on every walk that had to UNLINK a page.
+     *
+     * Clearing it drops no buffered bytes. The suspension is only reachable
+     * after read_sscan's exact-frame gate accepted the page --
+     * frame_scan returned NGX_OK *and* next == op->rbuf + op->rlen -- so the
+     * receive buffer held exactly one complete frame with nothing trailing;
+     * any trailing byte takes the desynchronised-reply path to walk_finish
+     * instead and never reaches here. Whatever the kernel may still hold is
+     * the NEXT page's reply, which the freshly registered event reports.
+     *
      * Harmless on the synchronous path, where the event was never dropped:
-     * ngx_handle_read_event on an already-active level-triggered event is a
-     * no-op, and re-adding an edge-triggered one is idempotent. Doing it
+     * there `active` is still 1, so the gate is false either way and
+     * ngx_handle_read_event leaves the existing registration alone. Doing it
      * unconditionally keeps the two entry paths from needing different
      * teardown state. */
+    c->read->ready = 0;
+
     if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
         ngx_http_cache_turbo_redis_walk_finish(op, NULL, 0);
         return;

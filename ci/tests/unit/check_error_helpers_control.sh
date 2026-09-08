@@ -118,3 +118,15 @@ run_mutant CTRL_ERROR_HELPERS_AWAIT_CONSUME \
 run_mutant CTRL_ERROR_HELPERS_AWAIT_LIVE \
 	'the live arm must consume the token'"'"'s mirror too' \
 	'live await consumes its continuation mirror'
+
+# GRIND-C7 (re-arm): the assertion named here is ngx_test_add_event_calls -- a
+# count of GENUINE ngx_add_event registrations. The shim's
+# ngx_handle_read_event is ported verbatim from nginx's `!active && !ready`
+# gate, so neither mutant can satisfy it vacuously: with `ready` left stale the
+# gate is false and the count stays 0.
+run_mutant CTRL_ERROR_HELPERS_REDIS_RESUME_READY_CLEAR \
+	'a resumed walk must genuinely RE-REGISTER its read event' \
+	'Redis sscan-advance clears stale read readiness'
+run_mutant CTRL_ERROR_HELPERS_REDIS_RESUME_REARM \
+	'a resumed walk must genuinely RE-REGISTER its read event' \
+	'Redis sscan-advance re-arms the read event'

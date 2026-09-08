@@ -389,6 +389,35 @@ if [ "${CTRL_ERROR_HELPERS_AWAIT_LIVE:-0}" = 1 ]; then
 		'live await consumes its continuation mirror'
 fi
 
+# GRIND-C7 (re-arm) controls. A resumed walk has to put its read event back on
+# the poller, and ngx_handle_read_event will NOT do it by itself: it calls
+# ngx_add_event only when `!active && !ready`, and the suspension leaves
+# active == 0 with a STALE ready == 1 from the reply it already consumed. Two
+# distinct obligations, one mutation each:
+#
+#   RESUME_READY_CLEAR - sscan_advance must CLEAR c->read->ready before
+#                        re-arming. Without it ngx_handle_read_event registers
+#                        nothing, the next page's reply is never noticed and
+#                        the purge stalls until its read timer expires.
+#   RESUME_REARM       - the re-arm call must happen at all. Neutralizing the
+#                        clear alone cannot catch a deleted ngx_handle_read_event.
+#
+# Mutations neutralize the statement or compile the call out rather than
+# substituting a constant, so no variable becomes unused and -Werror stays
+# satisfied.
+if [ "${CTRL_ERROR_HELPERS_REDIS_RESUME_READY_CLEAR:-0}" = 1 ]; then
+	mutate_function_exact ngx_http_cache_turbo_redis_sscan_advance \
+		'c->read->ready = 0;' '(void) c;' \
+		'Redis sscan-advance clears stale read readiness'
+fi
+
+if [ "${CTRL_ERROR_HELPERS_REDIS_RESUME_REARM:-0}" = 1 ]; then
+	mutate_function_exact ngx_http_cache_turbo_redis_sscan_advance \
+		'if (ngx_handle_read_event(c->read, 0) != NGX_OK) {' \
+		'if (0 && ngx_handle_read_event(c->read, 0) != NGX_OK) {' \
+		'Redis sscan-advance re-arms the read event'
+fi
+
 if [ "${CTRL_ERROR_HELPERS_REDIS_EXACT_FRAME:-0}" = 1 ]; then
 	mutate_function_exact ngx_http_cache_turbo_redis_read_sscan \
 		'next != op->rbuf + op->rlen' '0' \

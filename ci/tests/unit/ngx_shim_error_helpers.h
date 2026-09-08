@@ -54,6 +54,10 @@ struct ngx_event_s {
      * every exit from that block. Deleting it does not merely shrink the mock;
      * it voids the only deterministic control for the disarm. */
     unsigned    active:1;
+    /* GRIND-C7 (re-arm): nginx's readiness bit. LOAD-BEARING -- it is the
+     * second half of ngx_handle_read_event's `!active && !ready` gate, and a
+     * shim without it cannot tell a genuine re-registration from a no-op. */
+    unsigned    ready:1;
 };
 
 struct ngx_connection_s {
@@ -252,6 +256,10 @@ static void ngx_http_cache_turbo_redis_sscan_advance(
 
 /* NIT-E: forced ngx_del_event failure; NGX_OK (the reset default) disables. */
 extern ngx_int_t   ngx_test_del_event_result;
+/* GRIND-C7: the re-arm oracle. ngx_test_add_event_calls counts genuine
+ * ngx_add_event registrations; ngx_test_add_event_result forces a refusal. */
+extern ngx_uint_t  ngx_test_add_event_calls;
+extern ngx_int_t   ngx_test_add_event_result;
 extern const char *ngx_test_redis_parse_cursor;
 extern ngx_str_t  *ngx_test_redis_parse_members;
 extern ngx_uint_t  ngx_test_redis_parse_nmembers;
@@ -388,20 +396,36 @@ static struct { void *log; }  ngx_cycle_stub;
 
 #define ngx_post_event(ev, q)  do { (void) (ev); (void) (q); } while (0)
 
+/* GRIND-C7: sscan_advance's page rotation, made REACHABLE.
+ *
+ * Both of these used to return NULL unconditionally, which made every
+ * sscan_advance call bail into walk_finish before it could get as far as
+ * re-arming the read event -- so the re-arm was untestable and, as it turned
+ * out, wrong. ngx_test_rotation_ok = 1 lets the rotation succeed so the tail
+ * of sscan_advance actually runs. It defaults to 0, preserving the previous
+ * always-fails behaviour every earlier test was written against. */
+static int  ngx_test_rotation_ok;
+
 static ngx_buf_t *
 ngx_http_cache_turbo_redis_sscan_cmd(ngx_pool_t *pool, ngx_str_t *tagkey,
     ngx_str_t *cursor)
 {
+    static ngx_buf_t  cmd;
+
     (void) pool; (void) tagkey; (void) cursor;
-    return NULL;
+
+    return ngx_test_rotation_ok ? &cmd : NULL;
 }
 
 static void *
 ngx_create_pool(size_t size, void *log)
 {
+    static ngx_pool_t  rotated;
+
     (void) size;
     (void) log;
-    return NULL;                       /* rotation branch is unreachable here */
+
+    return ngx_test_rotation_ok ? &rotated : NULL;
 }
 
 /* CT-SSCAN-TERMINATE-LEAK: the page settle, STUBBED.
@@ -477,6 +501,30 @@ ngx_http_finalize_request(ngx_http_request_t *r, ngx_int_t rc)
     ngx_test_finalize_rc = rc;
 }
 
+#define NGX_READ_EVENT   0
+#define NGX_WRITE_EVENT  1
+
+/* GRIND-C7: poller REGISTRATION. Counted, because a registration counter is
+ * the only observable that a genuine ngx_add_event happened -- `active` alone
+ * cannot separate "re-added" from "was never removed". */
+static ngx_int_t ngx_add_event(ngx_event_t *ev, ngx_int_t event,
+    ngx_uint_t flags) __attribute__((unused));
+
+static ngx_int_t
+ngx_add_event(ngx_event_t *ev, ngx_int_t event, ngx_uint_t flags)
+{
+    (void) event;
+    (void) flags;
+
+    if (ngx_test_add_event_result != NGX_OK) {
+        return ngx_test_add_event_result;
+    }
+
+    ev->active = 1;
+    ngx_test_add_event_calls++;
+    return NGX_OK;
+}
+
 static ngx_int_t
 ngx_handle_write_event(ngx_event_t *ev, ngx_uint_t flags)
 {
@@ -485,12 +533,38 @@ ngx_handle_write_event(ngx_event_t *ev, ngx_uint_t flags)
     return ngx_test_handle_write_result;
 }
 
+/*
+ * GRIND-C7: ngx_handle_read_event, ported FAITHFULLY from nginx's
+ * src/event/ngx_event.c rather than stubbed.
+ *
+ * The stub it replaces returned a canned status and touched nothing, so any
+ * assertion about re-arming was vacuous: registered and unregistered were
+ * indistinguishable. The whole point of the defect under test is that the real
+ * function is NOT unconditional -- under NGX_USE_CLEAR_EVENT (epoll/kqueue)
+ * and NGX_USE_LEVEL_EVENT alike it calls ngx_add_event only when
+ * `!ev->active && !ev->ready`, so a stale `ready` left over from a consumed
+ * reply silently suppresses the registration. Modelling that gate is what
+ * makes ngx_test_add_event_calls a real oracle.
+ *
+ * ngx_test_handle_read_result still forces a failure return for the callers
+ * that need one; it is checked first so those tests keep working.
+ */
 static ngx_int_t
 ngx_handle_read_event(ngx_event_t *ev, ngx_uint_t flags)
 {
-    (void) ev;
     (void) flags;
-    return ngx_test_handle_read_result;
+
+    if (ngx_test_handle_read_result != NGX_OK) {
+        return ngx_test_handle_read_result;
+    }
+
+    if (!ev->active && !ev->ready) {
+        if (ngx_add_event(ev, NGX_READ_EVENT, 0) != NGX_OK) {
+            return NGX_ERROR;
+        }
+    }
+
+    return NGX_OK;
 }
 
 static void
@@ -508,9 +582,6 @@ ngx_del_timer(ngx_event_t *ev)
     ngx_test_del_timer_calls++;
 }
 
-
-#define NGX_READ_EVENT   0
-#define NGX_WRITE_EVENT  1
 
 /* Mirrors nginx's poller de-registration: the suspension calls this to stop the
  * SSCAN connection waking while the walk is parked. */

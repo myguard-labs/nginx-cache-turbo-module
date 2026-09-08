@@ -39,6 +39,8 @@ ngx_uint_t  ngx_test_del_timer_calls;
 ngx_int_t   ngx_test_redis_frame_result;
 ngx_int_t   ngx_test_redis_fill_result;
 ngx_int_t   ngx_test_del_event_result;
+ngx_uint_t  ngx_test_add_event_calls;
+ngx_int_t   ngx_test_add_event_result;
 const char *ngx_test_redis_parse_cursor;
 ngx_str_t  *ngx_test_redis_parse_members;
 ngx_uint_t  ngx_test_redis_parse_nmembers;
@@ -125,6 +127,9 @@ reset_observations(void)
     ngx_test_mc_done_calls = 0;
     ngx_test_mc_done_op = NULL;
     ngx_test_del_event_result = NGX_OK;
+    ngx_test_add_event_calls = 0;
+    ngx_test_add_event_result = NGX_OK;
+    ngx_test_rotation_ok = 0;
     ngx_test_redis_parse_cursor = NULL;
     ngx_test_redis_parse_members = NULL;
     ngx_test_redis_parse_nmembers = 0;
@@ -644,6 +649,244 @@ suspending_members_callback(ngx_http_request_t *r, void *data,
  * test left on the stub's default would assert this of a walk that completed
  * and pass against the un-disarmed code too.
  */
+/*
+ * GRIND-C7: the suspended walk's read event must really be BACK ON THE POLLER
+ * when the walk resumes.
+ *
+ * The defect this covers: read_sscan's suspension calls walk_disarm_conn,
+ * which clears rev->active but leaves rev->ready alone -- and `ready` is still
+ * set from the page reply that caused the suspension, because read_sscan
+ * consumed that reply to completion without the recv loop ever hitting EAGAIN
+ * and nothing in the module clears `ready` itself. sscan_advance then re-armed
+ * with a bare ngx_handle_read_event(c->read, 0), whose comment claimed
+ * re-adding was idempotent. It is not: nginx's ngx_handle_read_event calls
+ * ngx_add_event only when `!active && !ready`, so active == 0 with a stale
+ * ready == 1 made it return NGX_OK having registered NOTHING. The resumed walk
+ * wrote its next SSCAN page with its read event off the poller, the reply was
+ * never noticed, and the purge stalled until the read timer expired -- a
+ * silent failure on every multi-page tag purge that had to UNLINK a page.
+ *
+ * ⚠ WHY THE ORACLE IS A COUNTER, NOT `active`. The shim's ngx_handle_read_event
+ * is ported verbatim from nginx's own gate, and ngx_test_add_event_calls is
+ * incremented only by a genuine ngx_add_event. `active` alone cannot
+ * discriminate on the synchronous path, where the event was never removed and
+ * is trivially still 1. The count separates "genuinely (re-)registered" from
+ * "was already there" and from "silently registered nothing", which is exactly
+ * the distinction the bug lived in.
+ *
+ * Four exits, because the re-arm has to be right on all of them:
+ *   (a) resume with a STALE ready == 1  -- must still register (the defect)
+ *   (b) resume with ready == 0          -- must register
+ *   (c) the synchronous, never-disarmed path -- must NOT double-register
+ *   (d) the detached / no-resume path   -- must not register at all
+ */
+static void
+test_redis_sscan_resume_rearms_read_event(void)
+{
+    static u_char                    reply[] = "*2\r\n";
+
+    ngx_http_cache_turbo_loc_conf_t  clcf;
+    ngx_http_cache_turbo_ctx_t       ctx;
+    ngx_http_cache_turbo_redis_op_t  op;
+    ngx_http_request_t               request;
+    ngx_connection_t                 connection;
+    ngx_pool_t                       pool;
+    ngx_event_t                      read, write;
+    ngx_str_t                        one_member;
+
+    one_member.data = (u_char *) "m";
+    one_member.len = 1;
+
+    /* ---- EXIT (a): a real suspension, then a resume with STALE ready ----
+     *
+     * Driven end to end rather than by hand-setting op fields: read_sscan is
+     * what performs the disarm, so only the real path produces the exact
+     * (active == 0, ready == 1) state the defect needs. */
+    init_request(&request, &connection, &pool, &read, &write);
+    init_redis(&op, &clcf, &ctx, &request, &pool);
+    op.members_cb = suspending_members_callback;
+    op.members_data = (void *) (uintptr_t) 0x51;
+    op.is_scan = 1;
+    op.peer.connection = &connection;
+    op.rbuf = reply;
+    op.rlen = sizeof(reply) - 1;
+    connection.data = &op;
+    reset_observations();
+
+    ngx_test_redis_fill_result = NGX_OK;
+    ngx_test_redis_frame_scan_result = NGX_OK;
+    ngx_test_redis_frame_scan_next = (ngx_int_t) (sizeof(reply) - 1);
+    ngx_test_redis_parse_array_result = NGX_OK;
+    ngx_test_redis_parse_cursor = "17";
+    ngx_test_redis_parse_members = &one_member;
+    ngx_test_redis_parse_nmembers = 1;
+
+    sus_done = NULL;
+    sus_done_data = NULL;
+    sus_suspend_rc = NGX_ERROR;
+    /* Let the page rotation succeed, so sscan_advance reaches its re-arm
+     * instead of bailing into walk_finish. */
+    ngx_test_rotation_ok = 1;
+
+    /* The state redis_write leaves behind after sending a page, PLUS the
+     * readiness the just-consumed reply left set. That combination is the
+     * entire bug. */
+    read.timer_set = 1;
+    read.active = 1;
+    read.ready = 1;
+
+    ngx_http_cache_turbo_redis_read_sscan(&read);
+
+    CHECK(op.suspended == 1,
+          "the page callback must have suspended the walk");
+    CHECK(read.active == 0,
+          "the suspension must have taken the read event off the poller");
+    CHECK(read.ready == 1,
+          "walk_disarm_conn must leave `ready` alone: it is precisely the "
+          "stale bit the resumer has to clear, and a disarm that cleared it "
+          "would make this whole control vacuous");
+    CHECK(ngx_test_add_event_calls == 0,
+          "nothing may have re-registered the event while the walk is parked");
+
+    /* Resume the parked walk with a successful page verdict: sscan_advance
+     * rotates in the next page and must put the read event back. */
+    ngx_http_cache_turbo_redis_sscan_resume(&op, NGX_OK);
+
+    /* THE assertion this test exists for. */
+    CHECK(ngx_test_add_event_calls == 1,
+          "a resumed walk must genuinely RE-REGISTER its read event: the "
+          "suspension cleared `active` but left `ready` set from the consumed "
+          "reply, and ngx_handle_read_event only adds when !active && !ready, "
+          "so without clearing `ready` first it registers NOTHING and the next "
+          "page's reply is never noticed -- the purge stalls until timeout");
+    CHECK(read.active == 1,
+          "the resumed walk's read event must be back on the poller");
+    CHECK(op.scan_pages == 1,
+          "the resume must actually have advanced to the next page: a re-arm "
+          "assertion on a walk that never advanced would prove nothing");
+
+    /* ---- EXIT (b): resume with ready already 0 -- must register too ---- */
+    init_request(&request, &connection, &pool, &read, &write);
+    init_redis(&op, &clcf, &ctx, &request, &pool);
+    op.members_cb = suspending_members_callback;
+    op.members_data = (void *) (uintptr_t) 0x51;
+    op.is_scan = 1;
+    op.peer.connection = &connection;
+    op.rbuf = reply;
+    op.rlen = sizeof(reply) - 1;
+    connection.data = &op;
+    reset_observations();
+    ngx_test_redis_fill_result = NGX_OK;
+    ngx_test_redis_frame_scan_result = NGX_OK;
+    ngx_test_redis_frame_scan_next = (ngx_int_t) (sizeof(reply) - 1);
+    ngx_test_redis_parse_array_result = NGX_OK;
+    ngx_test_redis_parse_cursor = "17";
+    ngx_test_redis_parse_members = &one_member;
+    ngx_test_redis_parse_nmembers = 1;
+    sus_done = NULL;
+    sus_done_data = NULL;
+    sus_suspend_rc = NGX_ERROR;
+    ngx_test_rotation_ok = 1;
+    read.timer_set = 1;
+    read.active = 1;
+    read.ready = 0;              /* the recv loop DID hit EAGAIN this time */
+
+    ngx_http_cache_turbo_redis_read_sscan(&read);
+    CHECK(op.suspended == 1 && read.active == 0,
+          "the ready == 0 case must suspend and disarm exactly as the other");
+
+    ngx_http_cache_turbo_redis_sscan_resume(&op, NGX_OK);
+
+    CHECK(ngx_test_add_event_calls == 1,
+          "a resume must re-register the read event when `ready` was already "
+          "clear as well: the fix must not have traded one stale-state bug "
+          "for its mirror image");
+    CHECK(read.active == 1,
+          "the ready == 0 resume must also leave the event on the poller");
+
+    /* ---- EXIT (c): the SYNCHRONOUS path must not DOUBLE-register --------
+     *
+     * sscan_advance is also reached straight from read_sscan for a page whose
+     * callback did NOT suspend. There the event was never removed -- active is
+     * still 1 -- so ngx_handle_read_event's gate is false and nothing may be
+     * added. A fix that re-registered unconditionally (a bare ngx_add_event
+     * with no `!active` test) would leak a duplicate registration here, which
+     * epoll rejects with EEXIST. */
+    init_request(&request, &connection, &pool, &read, &write);
+    init_redis(&op, &clcf, &ctx, &request, &pool);
+    op.members_cb = members_callback;
+    op.members_data = (void *) (uintptr_t) 0x51;
+    op.is_scan = 1;
+    op.peer.connection = &connection;
+    op.rbuf = reply;
+    op.rlen = sizeof(reply) - 1;
+    connection.data = &op;
+    reset_observations();
+    ngx_test_redis_fill_result = NGX_OK;
+    ngx_test_redis_frame_scan_result = NGX_OK;
+    ngx_test_redis_frame_scan_next = (ngx_int_t) (sizeof(reply) - 1);
+    ngx_test_redis_parse_array_result = NGX_OK;
+    ngx_test_redis_parse_cursor = "17";
+    ngx_test_redis_parse_members = &one_member;
+    ngx_test_redis_parse_nmembers = 1;
+    ngx_test_members_result = NGX_OK;   /* handled inline: no suspension */
+    ngx_test_rotation_ok = 1;
+    read.timer_set = 1;
+    read.active = 1;
+    read.ready = 1;
+
+    ngx_http_cache_turbo_redis_read_sscan(&read);
+
+    CHECK(op.suspended == 0,
+          "the synchronous page must not have suspended the walk");
+    CHECK(op.scan_pages == 1,
+          "the synchronous page must still have advanced: an assertion about "
+          "not double-registering is vacuous on a path that never ran");
+    CHECK(ngx_test_add_event_calls == 0,
+          "the synchronous path must NOT re-register: its read event was never "
+          "removed, so a second ngx_add_event on the same descriptor is the "
+          "EEXIST epoll refuses");
+    CHECK(read.active == 1,
+          "the synchronous path must leave its read event registered");
+
+    /* ---- EXIT (d): the DETACHED walk's resume must register NOTHING -----
+     *
+     * walk_detach's suspended arm disarms and defers; its resume tears the
+     * walk down through op_done and never reaches sscan_advance. Re-arming a
+     * connection that is being closed would put a freed event back on the
+     * poller. */
+    init_request(&request, &connection, &pool, &read, &write);
+    init_redis(&op, &clcf, &ctx, &request, &pool);
+    op.is_scan = 1;
+    op.peer.connection = &connection;
+    connection.data = &op;
+    reset_observations();
+
+    op.detached = 1;
+    op.request = NULL;
+    op.members_cb = NULL;
+    op.members_data = NULL;
+    op.suspended = 1;
+    op.resume_doomed = 0;
+    op.resume_cursor.data = op.resume_cursor_buf;
+    op.resume_cursor.len = 2;
+    op.resume_cursor_buf[0] = '1';
+    op.resume_cursor_buf[1] = '7';
+    read.active = 0;
+    read.ready = 1;
+
+    ngx_http_cache_turbo_redis_sscan_resume(&op, NGX_OK);
+
+    CHECK(ngx_test_redis_done_calls == 1,
+          "a detached walk's resume must tear the walk down");
+    CHECK(ngx_test_add_event_calls == 0,
+          "a DETACHED walk's resume must not re-register a read event: the "
+          "connection is being closed, so putting its event back on the poller "
+          "arms a wakeup on a freed connection");
+    CHECK(op.scan_pages == 0,
+          "a detached walk's resume must not enter sscan_advance at all");
+}
+
 static void
 test_redis_sscan_suspension_disarms_connection(void)
 {
@@ -1777,6 +2020,7 @@ main(void)
     test_redis_sscan_requires_exact_frame();
     test_redis_drain_ownership();
     test_redis_sscan_suspension_disarms_connection();
+    test_redis_sscan_resume_rearms_read_event();
     test_redis_sscan_suspended_walk_ignores_stray_events();
     test_await_token_protocol_only();
     test_redis_walk_detach_on_request_teardown();
