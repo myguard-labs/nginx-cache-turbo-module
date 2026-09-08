@@ -1013,6 +1013,49 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             deny all;
         }}
 
+        # TODO-UNLINK-REPLY-WINDOW: the per-page UNLINK is sent as an unknown
+        # command, so Redis answers a real `-ERR` -- a delete that LAUNCHED and
+        # was ANSWERED but FAILED. Same production bounds as /_cache_sscan
+        # otherwise, so the only variable is the delete's fate at the server.
+        location = /_cache_sscanunlinkfail {{
+            cache_turbo_admin    main;
+            cache_turbo_redis    127.0.0.1:{redis_port} db=8 prefix=ctsscan: timeout=2s;
+            cache_turbo_test_unlink_reply_fail 1;
+            allow 127.0.0.1;
+            deny all;
+        }}
+
+        # TODO-UNLINK-REPLY-WINDOW, timer fixture: redis_timeout is 300ms and the
+        # awaited UNLINK is held 900ms before launch, so the SSCAN connection's
+        # read timer would expire three times over WHILE the walk is suspended.
+        # A walk that disarms that timer across the park still completes; one
+        # that leaves it armed is torn down under the in-flight UNLINK -- a
+        # use-after-free of the op and a double free of the page pool. The
+        # UNLINK itself succeeds here, so the ONLY variable is the timer.
+        location = /_cache_sscanunlinkhold {{
+            cache_turbo_admin    main;
+            cache_turbo_redis    127.0.0.1:{redis_port} db=8 prefix=ctsscan: timeout=300ms;
+            cache_turbo_test_unlink_launch_hold_ms 900;
+            allow 127.0.0.1;
+            deny all;
+        }}
+
+        # TODO-UNLINK-REPLY-WINDOW, multi-page fixture: the first five awaited
+        # UNLINKs SUCCEED and the sixth is refused. The successful pages are
+        # what drive the walk through resume -> sscan_advance -- the cursor is
+        # restored from the saved copy and the next SSCAN is issued -- which a
+        # single-page fixture can never reach, because its cursor returns "0"
+        # and the walk finishes instead of advancing. Six rather than two so the
+        # visited-member count separates a correctly-advancing walk from one
+        # that stops at its first resume by whole pages, not by a member or two.
+        location = /_cache_sscanunlinkfail6 {{
+            cache_turbo_admin    main;
+            cache_turbo_redis    127.0.0.1:{redis_port} db=8 prefix=ctsscan: timeout=2s;
+            cache_turbo_test_unlink_reply_fail 6;
+            allow 127.0.0.1;
+            deny all;
+        }}
+
         location = /_cache_sscandeadline {{
             cache_turbo_admin    main;
             cache_turbo_redis    127.0.0.1:{redis_port} db=8 prefix=ctsscan: timeout=2s scan_deadline=5ms;

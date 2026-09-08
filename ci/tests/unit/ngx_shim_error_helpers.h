@@ -46,6 +46,18 @@ struct ngx_event_s {
     void      (*handler)(ngx_event_t *ev);
     unsigned    timedout:1;
     unsigned    timer_set:1;
+    /* TODO-UNLINK-REPLY-WINDOW: read_sscan's suspension takes the read event
+     * off the poller, which needs `active` and ngx_del_event below.
+     * ⚠ LOAD-BEARING, not padding. test_redis_sscan_suspension_disarms_
+     * connection overrides the parse_scan stub's cursor (ngx_test_redis_parse_
+     * cursor) so a page really does suspend, and ASSERTS this bit is cleared on
+     * every exit from that block. Deleting it does not merely shrink the mock;
+     * it voids the only deterministic control for the disarm. */
+    unsigned    active:1;
+    /* GRIND-C7 (re-arm): nginx's readiness bit. LOAD-BEARING -- it is the
+     * second half of ngx_handle_read_event's `!active && !ready` gate, and a
+     * shim without it cannot tell a genuine re-registration from a no-op. */
+    unsigned    ready:1;
 };
 
 struct ngx_connection_s {
@@ -71,6 +83,23 @@ typedef struct {
     int  token;
 } ngx_addr_t;
 
+/* CT-SSCAN-TERMINATE-LEAK: the r->pool cleanup record. redis_sscan registers
+ * one holding walk_detach, and op_done cancels it by neutralizing the handler
+ * -- so the shim needs the real field shape for both the extracted detach and
+ * the extracted op_done to compile and behave identically. */
+typedef struct ngx_pool_cleanup_s  ngx_pool_cleanup_t;
+struct ngx_pool_cleanup_s {
+    void  (*handler)(void *data);
+    void   *data;
+};
+
+/* Minimal stand-in for nginx's ngx_peer_connection_t. sscan_advance reads the
+ * op's connection through op->peer.connection rather than through an event, so
+ * the mock op needs the same shape for the extracted function to compile. */
+typedef struct {
+    ngx_connection_t  *connection;
+} ngx_peer_connection_t;
+
 typedef struct {
     ngx_addr_t  redis_addr;
     ngx_msec_t  redis_connect_backoff;
@@ -80,6 +109,11 @@ typedef struct {
      * runtime test, test_scan_walk_deadline_reports_incomplete). */
     ngx_msec_t  redis_scan_deadline;
 } ngx_http_cache_turbo_loc_conf_t;
+
+/* CT-SSCAN-TERMINATE-LEAK: the tagpurge names its zone only as a pointer, and
+ * nothing on the completion paths under test dereferences it. An opaque type
+ * keeps the real struct out of this shim without a hand-copy that could drift. */
+typedef struct ngx_http_cache_turbo_zone_s  ngx_http_cache_turbo_zone_t;
 
 typedef struct {
     ngx_int_t   l2_result;
@@ -115,6 +149,7 @@ typedef ngx_int_t (*ngx_http_cache_turbo_redis_members_pt)(
     ngx_uint_t nmembers, const ngx_http_cache_turbo_redis_walk_t *walk);
 
 typedef struct {
+    ngx_peer_connection_t                  peer;
     ngx_http_cache_turbo_loc_conf_t       *clcf;
     ngx_http_request_t                    *request;
     ngx_http_cache_turbo_ctx_t            *ctx;
@@ -146,7 +181,32 @@ typedef struct {
     size_t                                 reply_max;
     size_t                                 frame_off;
     ngx_uint_t                             frame_depth;
+    /* TODO-UNLINK-REPLY-WINDOW: the awaited-reply completion on a drained op,
+     * and the SSCAN walk's suspend/resume state. They exist so the extracted
+     * readers compile against the mock op exactly as they do against the real
+     * one, which is what keeps this shim from silently drifting into testing a
+     * different function than the one that ships.
+     * ⚠ Unlike the rotation fields above, `suspended`, `resume_doomed` and
+     * `resume_cursor_buf` are EXERCISED: the suspension test overrides the
+     * parse_scan stub's cursor so a page genuinely suspends, and asserts on
+     * them for both the normal and the oversized-cursor exit. */
+    void                                 (*drain_cb)(void *, ngx_int_t);
+    void                                  *drain_data;
+    unsigned                               drain_done:1;
+    unsigned                               drain_failed:1;
+    unsigned                               suspended:1;
+    unsigned                               resume_doomed:1;
+    /* CT-SSCAN-TERMINATE-LEAK: the request-teardown detach state. EXERCISED --
+     * the detach test drives walk_detach through both its suspended and its
+     * unsuspended exit and asserts on both fields. */
+    unsigned                               detached:1;
+    ngx_pool_cleanup_t                    *req_cln;
+    ngx_str_t                              resume_cursor;
+    u_char                                 resume_cursor_buf[64];
 } ngx_http_cache_turbo_redis_op_t;
+
+/* Matching the real file's file-scope "page delivery on the stack" pointer. */
+static ngx_http_cache_turbo_redis_op_t  *ngx_http_cache_turbo_redis_delivering;
 
 extern ngx_uint_t  ngx_test_log_calls;
 extern ngx_int_t   ngx_test_log_level;
@@ -181,6 +241,28 @@ extern ngx_uint_t  ngx_test_add_timer_calls;
 extern ngx_uint_t  ngx_test_del_timer_calls;
 extern ngx_int_t   ngx_test_redis_frame_result;
 extern ngx_int_t   ngx_test_redis_fill_result;
+/* TODO-UNLINK-REPLY-WINDOW: parse_scan overrides. NULL cursor keeps the legacy
+ * "0" (last page); a non-NULL one makes the stubbed page non-terminal so the
+ * suspension path is reachable. Members must be non-empty for read_sscan to
+ * call the page callback at all. */
+/* Forward declarations for the extracted redis walk functions: the extractor
+ * emits them in source order, so walk_suspend (which names sscan_resume) and
+ * read_sscan (which names sscan_advance) are compiled before their definitions.
+ * The real translation unit has these at the top of the file for the same
+ * reason. */
+static void ngx_http_cache_turbo_redis_sscan_resume(void *opaque, ngx_int_t rc);
+static void ngx_http_cache_turbo_redis_sscan_advance(
+    ngx_http_cache_turbo_redis_op_t *op, ngx_str_t cursor);
+
+/* NIT-E: forced ngx_del_event failure; NGX_OK (the reset default) disables. */
+extern ngx_int_t   ngx_test_del_event_result;
+/* GRIND-C7: the re-arm oracle. ngx_test_add_event_calls counts genuine
+ * ngx_add_event registrations; ngx_test_add_event_result forces a refusal. */
+extern ngx_uint_t  ngx_test_add_event_calls;
+extern ngx_int_t   ngx_test_add_event_result;
+extern const char *ngx_test_redis_parse_cursor;
+extern ngx_str_t  *ngx_test_redis_parse_members;
+extern ngx_uint_t  ngx_test_redis_parse_nmembers;
 extern ngx_int_t   ngx_test_redis_frame_scan_result;
 extern size_t      ngx_test_redis_frame_scan_next;
 extern ngx_int_t   ngx_test_redis_parse_array_result;
@@ -314,26 +396,71 @@ static struct { void *log; }  ngx_cycle_stub;
 
 #define ngx_post_event(ev, q)  do { (void) (ev); (void) (q); } while (0)
 
+/* GRIND-C7: sscan_advance's page rotation, made REACHABLE.
+ *
+ * Both of these used to return NULL unconditionally, which made every
+ * sscan_advance call bail into walk_finish before it could get as far as
+ * re-arming the read event -- so the re-arm was untestable and, as it turned
+ * out, wrong. ngx_test_rotation_ok = 1 lets the rotation succeed so the tail
+ * of sscan_advance actually runs. It defaults to 0, preserving the previous
+ * always-fails behaviour every earlier test was written against. */
+static int  ngx_test_rotation_ok;
+
 static ngx_buf_t *
 ngx_http_cache_turbo_redis_sscan_cmd(ngx_pool_t *pool, ngx_str_t *tagkey,
     ngx_str_t *cursor)
 {
+    static ngx_buf_t  cmd;
+
     (void) pool; (void) tagkey; (void) cursor;
-    return NULL;
+
+    return ngx_test_rotation_ok ? &cmd : NULL;
 }
 
 static void *
 ngx_create_pool(size_t size, void *log)
 {
+    static ngx_pool_t  rotated;
+
     (void) size;
     (void) log;
-    return NULL;                       /* rotation branch is unreachable here */
+
+    return ngx_test_rotation_ok ? &rotated : NULL;
 }
+
+/* CT-SSCAN-TERMINATE-LEAK: the page settle, STUBBED.
+ *
+ * The real one walks the page's member array and issues the SREM that strips
+ * tag membership, needing the whole L2 surface. The arm under test -- the
+ * awaited UNLINK's completion arriving on a TERMINATED request -- returns long
+ * before reaching it, and the still-live arm is exercised here only as a
+ * negative control against an over-broad change. Counting the call is
+ * therefore both sufficient and the honest boundary: it says whether the
+ * completion took the live path, without pretending to model the SREM. */
+struct ngx_http_cache_turbo_tagpurge_s;
+static ngx_uint_t  ngx_test_page_settle_calls;
+static ngx_int_t   ngx_test_page_settle_result;
+
+static ngx_int_t
+ngx_http_cache_turbo_tag_purge_page_settle(void *tp, ngx_int_t rc)
+{
+    (void) tp; (void) rc;
+    ngx_test_page_settle_calls++;
+    return ngx_test_page_settle_result;
+}
+
+/* CT-SSCAN-TERMINATE-LEAK: pool destruction is COUNTED, not merely accepted.
+ * The awaited UNLINK's completion must release the page scratch exactly once
+ * whichever arm it takes, and "exactly once" is only assertable if the shim
+ * observes each release. `last_destroyed` lets a test tell WHICH pool went. */
+static ngx_uint_t   ngx_test_destroy_pool_calls;
+static ngx_pool_t  *ngx_test_last_destroyed_pool;
 
 static void
 ngx_destroy_pool(ngx_pool_t *pool)
 {
-    (void) pool;
+    ngx_test_destroy_pool_calls++;
+    ngx_test_last_destroyed_pool = pool;
 }
 
 static void *
@@ -374,6 +501,30 @@ ngx_http_finalize_request(ngx_http_request_t *r, ngx_int_t rc)
     ngx_test_finalize_rc = rc;
 }
 
+#define NGX_READ_EVENT   0
+#define NGX_WRITE_EVENT  1
+
+/* GRIND-C7: poller REGISTRATION. Counted, because a registration counter is
+ * the only observable that a genuine ngx_add_event happened -- `active` alone
+ * cannot separate "re-added" from "was never removed". */
+static ngx_int_t ngx_add_event(ngx_event_t *ev, ngx_int_t event,
+    ngx_uint_t flags) __attribute__((unused));
+
+static ngx_int_t
+ngx_add_event(ngx_event_t *ev, ngx_int_t event, ngx_uint_t flags)
+{
+    (void) event;
+    (void) flags;
+
+    if (ngx_test_add_event_result != NGX_OK) {
+        return ngx_test_add_event_result;
+    }
+
+    ev->active = 1;
+    ngx_test_add_event_calls++;
+    return NGX_OK;
+}
+
 static ngx_int_t
 ngx_handle_write_event(ngx_event_t *ev, ngx_uint_t flags)
 {
@@ -382,12 +533,38 @@ ngx_handle_write_event(ngx_event_t *ev, ngx_uint_t flags)
     return ngx_test_handle_write_result;
 }
 
+/*
+ * GRIND-C7: ngx_handle_read_event, ported FAITHFULLY from nginx's
+ * src/event/ngx_event.c rather than stubbed.
+ *
+ * The stub it replaces returned a canned status and touched nothing, so any
+ * assertion about re-arming was vacuous: registered and unregistered were
+ * indistinguishable. The whole point of the defect under test is that the real
+ * function is NOT unconditional -- under NGX_USE_CLEAR_EVENT (epoll/kqueue)
+ * and NGX_USE_LEVEL_EVENT alike it calls ngx_add_event only when
+ * `!ev->active && !ev->ready`, so a stale `ready` left over from a consumed
+ * reply silently suppresses the registration. Modelling that gate is what
+ * makes ngx_test_add_event_calls a real oracle.
+ *
+ * ngx_test_handle_read_result still forces a failure return for the callers
+ * that need one; it is checked first so those tests keep working.
+ */
 static ngx_int_t
 ngx_handle_read_event(ngx_event_t *ev, ngx_uint_t flags)
 {
-    (void) ev;
     (void) flags;
-    return ngx_test_handle_read_result;
+
+    if (ngx_test_handle_read_result != NGX_OK) {
+        return ngx_test_handle_read_result;
+    }
+
+    if (!ev->active && !ev->ready) {
+        if (ngx_add_event(ev, NGX_READ_EVENT, 0) != NGX_OK) {
+            return NGX_ERROR;
+        }
+    }
+
+    return NGX_OK;
 }
 
 static void
@@ -403,6 +580,27 @@ ngx_del_timer(ngx_event_t *ev)
 {
     ev->timer_set = 0;
     ngx_test_del_timer_calls++;
+}
+
+
+/* Mirrors nginx's poller de-registration: the suspension calls this to stop the
+ * SSCAN connection waking while the walk is parked. */
+static ngx_int_t ngx_del_event(ngx_event_t *ev, ngx_int_t event,
+    ngx_uint_t flags) __attribute__((unused));
+
+static ngx_int_t
+ngx_del_event(ngx_event_t *ev, ngx_int_t event, ngx_uint_t flags)
+{
+    (void) event;
+    (void) flags;
+    /* NIT-E: injectable failure, so the suspension's resume_doomed arm -- the
+     * branch taken when the connection CANNOT be disarmed -- has coverage
+     * instead of being unreachable in both harnesses. */
+    if (ngx_test_del_event_result != NGX_OK) {
+        return ngx_test_del_event_result;
+    }
+    ev->active = 0;
+    return NGX_OK;
 }
 
 static ngx_int_t
@@ -435,9 +633,11 @@ ngx_http_cache_turbo_redis_frame_scan(ngx_http_cache_turbo_redis_op_t *op,
 /* TODO-REDIS-PAGINATION: the tag walk is SSCAN now, whose reply is parse_scan's
  * [cursor, members] shape -- parse_array went with the SMEMBERS reader. The
  * stub keeps the same observation counters (the assertions are about WHEN the
- * reader parses, not which parser), and yields cursor "0" so the stubbed page
- * is the walk's last: read_sscan then takes its completion path rather than
- * rotating a page pool this shim does not provide. */
+ * reader parses, not which parser), and yields cursor "0" -- UNLESS a test
+ * overrides ngx_test_redis_parse_cursor -- so the stubbed page is the walk's
+ * last: read_sscan then takes its completion path rather than rotating a page
+ * pool this shim does not provide. The suspension test sets that override
+ * precisely because a last page never suspends. */
 static ngx_int_t
 ngx_http_cache_turbo_redis_parse_scan(
     ngx_http_cache_turbo_redis_op_t *op, ngx_str_t *cursor,
@@ -447,10 +647,20 @@ ngx_http_cache_turbo_redis_parse_scan(
 
     (void) op;
     ngx_test_redis_parse_array_calls++;
-    cursor->data = zero;
-    cursor->len = 1;
-    *members = NULL;
-    *nmembers = 0;
+    /* TODO-UNLINK-REPLY-WINDOW: cursor "0" (a LAST page, so read_sscan
+     * completes rather than rotating a pool this shim does not provide) unless
+     * a test asks for a non-terminal one. The suspension assertions need a
+     * NON-"0" cursor, because a last page never suspends: its callback's
+     * verdict is consumed by the completion path instead. */
+    if (ngx_test_redis_parse_cursor != NULL) {
+        cursor->data = (u_char *) ngx_test_redis_parse_cursor;
+        cursor->len = strlen(ngx_test_redis_parse_cursor);
+    } else {
+        cursor->data = zero;
+        cursor->len = 1;
+    }
+    *members = ngx_test_redis_parse_members;
+    *nmembers = ngx_test_redis_parse_nmembers;
     return ngx_test_redis_parse_array_result;
 }
 

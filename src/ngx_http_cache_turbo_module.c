@@ -626,6 +626,34 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       offsetof(ngx_http_cache_turbo_loc_conf_t, test_scan_page_hold_ms),
       NULL },
 
+    /* TODO-UNLINK-REPLY-WINDOW: hold the awaited per-page UNLINK before launch
+     * so the SSCAN connection's read timeout elapses while the walk is
+     * suspended. Set above the location's redis_timeout to prove the
+     * suspension disarms that timer; without the disarm the timer fires into
+     * read_sscan and tears the walk down under the in-flight UNLINK. */
+    { ngx_string("cache_turbo_test_unlink_launch_hold_ms"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_num_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_turbo_loc_conf_t, test_unlink_launch_hold_ms),
+      NULL },
+
+    /* TODO-UNLINK-REPLY-WINDOW: send the tag purge's per-page UNLINK as an
+     * unknown command so Redis answers `-ERR`. A launched-and-answered-but-
+     * FAILED delete has no black-box trigger otherwise, and it is the exact
+     * state the pre-fix code treated as success before SREMing away the only
+     * pointer to the still-live objects. Awaited deletes only.
+     *
+     * The value is the 1-based ordinal of the first awaited delete to fail, so
+     * N > 1 lets earlier pages complete and drives the walk through its
+     * resume -> next-page transition before the failure. 0/unset = off. */
+    { ngx_string("cache_turbo_test_unlink_reply_fail"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_num_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_turbo_loc_conf_t, test_unlink_reply_fail),
+      NULL },
+
     /* AUD-L2-PROMOTE-RACE: the gap between the resumed L2-hit handler's own
      * (already-unlocked) L1 re-check and its store_if() call is pure CPU with
      * no I/O or yield point in between -- unreachable from a black-box HTTP
@@ -5756,6 +5784,8 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->test_varidx_fail = NGX_CONF_UNSET;
     conf->test_scan_max_pages = NGX_CONF_UNSET;
     conf->test_scan_page_hold_ms = NGX_CONF_UNSET;
+    conf->test_unlink_reply_fail = NGX_CONF_UNSET;
+    conf->test_unlink_launch_hold_ms = NGX_CONF_UNSET;
     conf->test_l2_promote_hold_ms = NGX_CONF_UNSET;
     conf->test_midbody_abort = NGX_CONF_UNSET;
     conf->test_warm_ctx_fail = NGX_CONF_UNSET;
