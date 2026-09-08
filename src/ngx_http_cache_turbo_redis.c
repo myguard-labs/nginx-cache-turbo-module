@@ -4157,81 +4157,99 @@ ngx_http_cache_turbo_redis_read_sscan(ngx_event_t *rev)
                  * op->pool and is destroyed only by walk_finish, i.e. strictly
                  * after any resume.
                  *
-                 * A cursor longer than the buffer cannot come from Redis
-                 * (cursors are decimal u64 text, at most 20 bytes), but a
-                 * desynchronised or hostile reply could claim one. Reject it as
-                 * a malformed page rather than truncating it into a DIFFERENT
-                 * valid-looking cursor, which would silently restart the walk
-                 * or skip an arbitrary span of the set.
+                 * ⚠ DISARM THIS CONNECTION FIRST, before anything that can
+                 * return. The write handler armed
+                 * ngx_add_timer(c->read, op->timeout) when it finished sending
+                 * this SSCAN, and nothing has deleted it. Left armed across the
+                 * suspension it fires on its own schedule -- entirely unrelated
+                 * to how long the UNLINK takes -- and re-enters read_sscan with
+                 * rev->timedout, whose walk_finish destroys op->pool and
+                 * finalizes the parked request while the UNLINK op still holds
+                 * both. That is a use-after-free plus a double free of the page
+                 * pool and a second finalize, fired from the event loop. A peer
+                 * close does the same through a still-registered read event.
                  *
-                 * Rejecting it must NOT clear `suspended`: the pending UNLINK
-                 * still owns a resume, and sscan_resume ignores a resume for a
-                 * walk that is not suspended -- so clearing it here would drop
-                 * the only call that can ever tear this walk down, leaking the
-                 * op pool, the connection and the parked request for the life
-                 * of the worker. Stay suspended and record the verdict instead;
-                 * see the resume_doomed comment below. */
-                if (cursor.len > sizeof(op->resume_cursor_buf)) {
-                    ngx_log_error(NGX_LOG_ERR, c->log, 0,
-                                  "cache_turbo: L2 tag purge abandoned: SSCAN "
-                                  "cursor of %uz bytes is not a cursor",
-                                  cursor.len);
-                    /* ⚠ Do NOT finish the walk here. The page's UNLINK is
-                     * ALREADY in flight and holds `op` as its completion data;
-                     * walk_finish destroys op->pool, which `op` itself is
-                     * allocated from, so finishing now would leave that pending
-                     * completion pointing at freed memory -- a use-after-free
-                     * fired from the event loop some milliseconds later, which
-                     * is strictly worse than the stranding this whole change
-                     * exists to prevent. Instead mark the walk doomed and stay
-                     * suspended: the resume is guaranteed to come (del_many_cb
-                     * fires `done` exactly once from every terminal path), and
-                     * sscan_resume sees resume_doomed and finishes the walk
-                     * then -- at which point nothing is in flight any more. */
-                    op->resume_doomed = 1;
-                    return;
-                }
-                /* ⚠ DISARM THIS CONNECTION for the duration of the parking.
-                 * The write handler armed ngx_add_timer(c->read, op->timeout)
-                 * when it finished sending this SSCAN, and nothing has deleted
-                 * it. Left armed across the suspension it fires on its own
-                 * schedule -- entirely unrelated to how long the UNLINK takes
-                 * -- and re-enters read_sscan with rev->timedout, whose
-                 * walk_finish destroys op->pool and finalizes the parked
-                 * request while the UNLINK op still holds both. That is a
-                 * use-after-free plus a double-free of the page pool and a
-                 * second finalize, fired from the event loop.
+                 * ORDER IS THE WHOLE POINT. The UNLINK is already in flight by
+                 * the time we get here -- the page callback suspends the walk
+                 * and launches the delete before returning NGX_AGAIN -- so
+                 * EVERY exit from this block leaves a pending completion
+                 * holding this op, and every one of them must therefore leave
+                 * the connection disarmed. An earlier revision rejected the
+                 * oversized cursor BELOW this point and returned, which left
+                 * the timer armed on exactly the path whose own comment
+                 * explains why the walk must not be torn down. Anything added
+                 * here that can return goes AFTER the disarm.
                  *
                  * Disarming is also the honest accounting: redis_timeout bounds
                  * how long this connection may take to ANSWER, and time spent
                  * waiting on a different operation on a different connection is
                  * not that. sscan_advance re-arms it before the next page's
                  * write, so the bound applies to every page exactly as before.
-                 * The read event is dropped too, so a peer close arriving
-                 * during the park cannot drive the reader either; the resume
-                 * re-establishes both. */
+                 */
                 if (rev->timer_set) {
                     ngx_del_timer(rev);
                 }
+
                 /* ngx_del_event, NOT ngx_handle_read_event(NGX_CLOSE_EVENT):
                  * the latter keeps the descriptor registered so a peer close is
                  * still reported, which is precisely the wakeup that must not
-                 * happen here -- it re-enters read_sscan while the walk is
-                 * parked. Take the event off the poller outright; sscan_advance
-                 * puts it back before the next page. */
+                 * happen here. Take the event off the poller outright;
+                 * sscan_advance puts it back before the next page. */
                 if (rev->active
                     && ngx_del_event(rev, NGX_READ_EVENT, 0) != NGX_OK)
                 {
-                    /* Cannot disarm, so the hazard above stands. Abandon --
-                     * still deferred, because the UNLINK is already in flight
-                     * and holds this op. */
-                    op->resume_doomed = 1;
-                    return;
+                    ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                                  "cache_turbo: L2 tag purge abandoned: the "
+                                  "SSCAN connection could not be disarmed for "
+                                  "the suspension; purge is INCOMPLETE");
+                    goto doomed;
+                }
+
+                /* Save the cursor for the NEXT page. A cursor longer than the
+                 * buffer cannot come from Redis (cursors are decimal u64 text,
+                 * at most 20 bytes), but a desynchronised or hostile reply
+                 * could claim one. Reject it as a malformed page rather than
+                 * truncating it into a DIFFERENT valid-looking cursor, which
+                 * would silently restart the walk or skip an arbitrary span of
+                 * the set. */
+                if (cursor.len > sizeof(op->resume_cursor_buf)) {
+                    ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                                  "cache_turbo: L2 tag purge abandoned: SSCAN "
+                                  "cursor of %uz bytes is not a cursor",
+                                  cursor.len);
+                    goto doomed;
                 }
 
                 ngx_memcpy(op->resume_cursor_buf, cursor.data, cursor.len);
                 op->resume_cursor.data = op->resume_cursor_buf;
                 op->resume_cursor.len = cursor.len;
+                return;
+
+            doomed:
+
+                /* ⚠ Do NOT finish the walk here, and do NOT clear `suspended`.
+                 * The page's UNLINK is ALREADY in flight and holds `op` as its
+                 * completion data; walk_finish destroys op->pool, which `op`
+                 * itself is allocated from, so finishing now would leave that
+                 * pending completion pointing at freed memory -- a
+                 * use-after-free fired from the event loop milliseconds later,
+                 * strictly worse than the stranding this change exists to
+                 * prevent. Clearing `suspended` is just as bad the other way:
+                 * sscan_resume ignores a resume for an unsuspended walk, so it
+                 * would drop the only call that can ever tear this walk down,
+                 * leaking the op pool, the connection and the parked request
+                 * for the life of the worker.
+                 *
+                 * Stay suspended and record the verdict. The resume is
+                 * guaranteed to come -- del_many_cb fires its completion
+                 * exactly once from every terminal path -- and sscan_resume
+                 * sees resume_doomed and finishes the walk then, at which point
+                 * nothing is in flight any more.
+                 *
+                 * Both callers reach here with the connection ALREADY
+                 * disarmed, which is why they share this label rather than
+                 * duplicating it. */
+                op->resume_doomed = 1;
                 return;
             }
         }

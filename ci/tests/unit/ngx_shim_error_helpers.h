@@ -47,10 +47,12 @@ struct ngx_event_s {
     unsigned    timedout:1;
     unsigned    timer_set:1;
     /* TODO-UNLINK-REPLY-WINDOW: read_sscan's suspension takes the read event
-     * off the poller, which needs `active` and ngx_del_event below. Not
-     * exercised here (the stubbed parse_scan always yields cursor "0", so no
-     * page ever suspends) -- present so the extracted reader compiles against
-     * the mock exactly as it does against the real event. */
+     * off the poller, which needs `active` and ngx_del_event below.
+     * ⚠ LOAD-BEARING, not padding. test_redis_sscan_suspension_disarms_
+     * connection overrides the parse_scan stub's cursor (ngx_test_redis_parse_
+     * cursor) so a page really does suspend, and ASSERTS this bit is cleared on
+     * every exit from that block. Deleting it does not merely shrink the mock;
+     * it voids the only deterministic control for the disarm. */
     unsigned    active:1;
 };
 
@@ -161,12 +163,14 @@ typedef struct {
     size_t                                 frame_off;
     ngx_uint_t                             frame_depth;
     /* TODO-UNLINK-REPLY-WINDOW: the awaited-reply completion on a drained op,
-     * and the SSCAN walk's suspend/resume state. Like the rotation fields
-     * above these are not EXERCISED here (the stubbed parse_scan always yields
-     * cursor "0", so no page ever suspends) -- they exist so the extracted
+     * and the SSCAN walk's suspend/resume state. They exist so the extracted
      * readers compile against the mock op exactly as they do against the real
      * one, which is what keeps this shim from silently drifting into testing a
-     * different function than the one that ships. */
+     * different function than the one that ships.
+     * ⚠ Unlike the rotation fields above, `suspended`, `resume_doomed` and
+     * `resume_cursor_buf` are EXERCISED: the suspension test overrides the
+     * parse_scan stub's cursor so a page genuinely suspends, and asserts on
+     * them for both the normal and the oversized-cursor exit. */
     void                                 (*drain_cb)(void *, ngx_int_t);
     void                                  *drain_data;
     unsigned                               drain_done:1;
@@ -509,9 +513,11 @@ ngx_http_cache_turbo_redis_frame_scan(ngx_http_cache_turbo_redis_op_t *op,
 /* TODO-REDIS-PAGINATION: the tag walk is SSCAN now, whose reply is parse_scan's
  * [cursor, members] shape -- parse_array went with the SMEMBERS reader. The
  * stub keeps the same observation counters (the assertions are about WHEN the
- * reader parses, not which parser), and yields cursor "0" so the stubbed page
- * is the walk's last: read_sscan then takes its completion path rather than
- * rotating a page pool this shim does not provide. */
+ * reader parses, not which parser), and yields cursor "0" -- UNLESS a test
+ * overrides ngx_test_redis_parse_cursor -- so the stubbed page is the walk's
+ * last: read_sscan then takes its completion path rather than rotating a page
+ * pool this shim does not provide. The suspension test sets that override
+ * precisely because a last page never suspends. */
 static ngx_int_t
 ngx_http_cache_turbo_redis_parse_scan(
     ngx_http_cache_turbo_redis_op_t *op, ngx_str_t *cursor,

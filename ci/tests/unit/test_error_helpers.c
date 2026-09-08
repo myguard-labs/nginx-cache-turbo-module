@@ -657,9 +657,15 @@ test_redis_sscan_suspension_disarms_connection(void)
     ngx_pool_t                       pool;
     ngx_event_t                      read, write;
     ngx_str_t                        one_member;
+    char                             oversized_cursor[
+                                         sizeof(op.resume_cursor_buf) + 2];
 
     one_member.data = (u_char *) "m";
     one_member.len = 1;
+
+    /* One byte longer than the inline resume buffer can hold. */
+    memset(oversized_cursor, '7', sizeof(oversized_cursor) - 1);
+    oversized_cursor[sizeof(oversized_cursor) - 1] = '\0';
 
     init_request(&request, &connection, &pool, &read, &write);
     init_redis(&op, &clcf, &ctx, &request, &pool);
@@ -717,6 +723,59 @@ test_redis_sscan_suspension_disarms_connection(void)
               && op.resume_cursor.data == op.resume_cursor_buf,
           "the next page's cursor must be COPIED into the op's own inline "
           "buffer, which outlives the suspension");
+
+    /* CRITICAL (round 3): the OVERSIZED-CURSOR exit must be disarmed too.
+     *
+     * This is the case two human review rounds and the original control all
+     * missed. That path rejects the page and returns without advancing, and it
+     * used to do so BEFORE the disarm ran -- leaving the read timer armed and
+     * the read event registered with the page's UNLINK already in flight, which
+     * is exactly the use-after-free its own comment explains it is avoiding by
+     * not calling walk_finish. A control that only covers the HAPPY suspension
+     * cannot see that: the assertions must be made on every exit from the
+     * block, not on the one the fix happened to be written for.
+     *
+     * A cursor of sizeof(resume_cursor_buf) + 1 bytes cannot come from Redis
+     * (cursors are decimal u64 text), so this models the desynchronised or
+     * hostile reply the rejection exists for. */
+    init_redis(&op, &clcf, &ctx, &request, &pool);
+    op.members_cb = suspending_members_callback;
+    op.members_data = (void *) (uintptr_t) 0x51;
+    op.rbuf = reply;
+    op.rlen = sizeof(reply) - 1;
+    connection.data = &op;
+    reset_observations();
+    ngx_test_redis_fill_result = NGX_OK;
+    ngx_test_redis_frame_scan_result = NGX_OK;
+    ngx_test_redis_frame_scan_next = (ngx_int_t) (sizeof(reply) - 1);
+    ngx_test_redis_parse_array_result = NGX_OK;
+    ngx_test_redis_parse_cursor = oversized_cursor;
+    ngx_test_redis_parse_members = &one_member;
+    ngx_test_redis_parse_nmembers = 1;
+    read.timer_set = 1;
+    read.active = 1;
+
+    ngx_http_cache_turbo_redis_read_sscan(&read);
+
+    CHECK(op.resume_doomed == 1,
+          "an SSCAN cursor too long for the resume buffer must be REJECTED, "
+          "not truncated into a different valid-looking cursor");
+    CHECK(op.suspended == 1,
+          "the rejected page must stay SUSPENDED: its UNLINK is in flight and "
+          "holds the op, so only the resume may tear the walk down");
+
+    /* THE assertions this case exists for -- identical to the happy path's,
+     * because the hazard is identical. */
+    CHECK(read.timer_set == 0,
+          "the OVERSIZED-CURSOR exit must delete the read timer too: it "
+          "returns with the UNLINK in flight, so a timer left armed fires into "
+          "read_sscan and tears the walk down under the pending completion");
+    CHECK(read.active == 0,
+          "the OVERSIZED-CURSOR exit must take the read event off the poller "
+          "too: left registered, a peer close re-enters read_sscan and tears "
+          "the walk down under the pending completion");
+    CHECK(ngx_test_redis_done_calls == 0,
+          "a doomed suspension must not tear the walk down inline");
 
     /* NIT-E: the arm taken when the connection CANNOT be disarmed. The UNLINK
      * is already in flight and cannot be recalled, so the walk must stay
