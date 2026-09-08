@@ -1,14 +1,17 @@
 Changes with the nginx-cache-turbo-module (unreleased)
 
-    *) Security: on nginx before 1.23 a response carrying duplicate
-       Content-Length, duplicate Transfer-Encoding, or both Content-Length
-       and Transfer-Encoding is no longer stored. Those versions accept such
-       ambiguous framing instead of rejecting it, so an origin or an
-       intermediary that disagreed with nginx about the message length could
-       have its interpretation cached and replayed to later clients. nginx
-       1.23 and newer reject these responses themselves and are unaffected.
-       The admin warm thread-completion path also again compiles and behaves
-       correctly against nginx before 1.25.4, which has no
+    *) Security: a response carrying duplicate Content-Length, duplicate
+       Transfer-Encoding, or both Content-Length and Transfer-Encoding is no
+       longer stored, on every supported nginx version. The exposure is
+       specific to nginx before 1.23: those versions accept such ambiguous
+       framing instead of rejecting it, so an origin or an intermediary that
+       disagreed with nginx about the message length could have its
+       interpretation cached and replayed to later clients. nginx 1.23 and
+       newer reject these responses themselves before this module sees them,
+       so the added check is a no-op there but is not version-gated.
+
+    *) Bugfix: the admin warm thread-completion path again compiles and
+       behaves correctly against nginx before 1.25.4, which has no
        r->main->terminated field.
 
     *) Bugfix: a by-tag purge of a large tag index no longer fails outright.
@@ -43,6 +46,15 @@ Changes with the nginx-cache-turbo-module (unreleased)
        connect backoff still advanced the cursor to completion and reported a
        clean purge while those objects remained in L2. Such a page now
        abandons the walk and reports 500 with "l2":"incomplete".
+
+    *) Bugfix: a by-tag purge whose page-local lock-key allocation fails
+       mid-walk now fails closed. The walk previously skipped that member's
+       lock key and continued, so an out-of-memory allocation could complete
+       the walk and report 200 while leaving a stale lock key behind; that
+       stale lock survives its purged object and stalls the next cold-miss
+       winner. Such a page now abandons the walk and reports 500 with
+       "l2":"incomplete", the same policy already used for a failed delkeys
+       or tag-key allocation.
 
     *) Bugfix: a by-tag or whole-keyspace purge whose request is terminated
        mid-walk no longer touches the freed request. The walk parks the
