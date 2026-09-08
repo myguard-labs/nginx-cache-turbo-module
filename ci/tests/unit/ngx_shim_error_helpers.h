@@ -213,6 +213,24 @@ extern ngx_uint_t  ngx_test_add_timer_calls;
 extern ngx_uint_t  ngx_test_del_timer_calls;
 extern ngx_int_t   ngx_test_redis_frame_result;
 extern ngx_int_t   ngx_test_redis_fill_result;
+/* TODO-UNLINK-REPLY-WINDOW: parse_scan overrides. NULL cursor keeps the legacy
+ * "0" (last page); a non-NULL one makes the stubbed page non-terminal so the
+ * suspension path is reachable. Members must be non-empty for read_sscan to
+ * call the page callback at all. */
+/* Forward declarations for the extracted redis walk functions: the extractor
+ * emits them in source order, so walk_suspend (which names sscan_resume) and
+ * read_sscan (which names sscan_advance) are compiled before their definitions.
+ * The real translation unit has these at the top of the file for the same
+ * reason. */
+static void ngx_http_cache_turbo_redis_sscan_resume(void *opaque, ngx_int_t rc);
+static void ngx_http_cache_turbo_redis_sscan_advance(
+    ngx_http_cache_turbo_redis_op_t *op, ngx_str_t cursor);
+
+/* NIT-E: forced ngx_del_event failure; NGX_OK (the reset default) disables. */
+extern ngx_int_t   ngx_test_del_event_result;
+extern const char *ngx_test_redis_parse_cursor;
+extern ngx_str_t  *ngx_test_redis_parse_members;
+extern ngx_uint_t  ngx_test_redis_parse_nmembers;
 extern ngx_int_t   ngx_test_redis_frame_scan_result;
 extern size_t      ngx_test_redis_frame_scan_next;
 extern ngx_int_t   ngx_test_redis_parse_array_result;
@@ -443,11 +461,20 @@ ngx_del_timer(ngx_event_t *ev)
 
 /* Mirrors nginx's poller de-registration: the suspension calls this to stop the
  * SSCAN connection waking while the walk is parked. */
+static ngx_int_t ngx_del_event(ngx_event_t *ev, ngx_int_t event,
+    ngx_uint_t flags) __attribute__((unused));
+
 static ngx_int_t
 ngx_del_event(ngx_event_t *ev, ngx_int_t event, ngx_uint_t flags)
 {
     (void) event;
     (void) flags;
+    /* NIT-E: injectable failure, so the suspension's resume_doomed arm -- the
+     * branch taken when the connection CANNOT be disarmed -- has coverage
+     * instead of being unreachable in both harnesses. */
+    if (ngx_test_del_event_result != NGX_OK) {
+        return ngx_test_del_event_result;
+    }
     ev->active = 0;
     return NGX_OK;
 }
@@ -494,10 +521,20 @@ ngx_http_cache_turbo_redis_parse_scan(
 
     (void) op;
     ngx_test_redis_parse_array_calls++;
-    cursor->data = zero;
-    cursor->len = 1;
-    *members = NULL;
-    *nmembers = 0;
+    /* TODO-UNLINK-REPLY-WINDOW: cursor "0" (a LAST page, so read_sscan
+     * completes rather than rotating a pool this shim does not provide) unless
+     * a test asks for a non-terminal one. The suspension assertions need a
+     * NON-"0" cursor, because a last page never suspends: its callback's
+     * verdict is consumed by the completion path instead. */
+    if (ngx_test_redis_parse_cursor != NULL) {
+        cursor->data = (u_char *) ngx_test_redis_parse_cursor;
+        cursor->len = strlen(ngx_test_redis_parse_cursor);
+    } else {
+        cursor->data = zero;
+        cursor->len = 1;
+    }
+    *members = ngx_test_redis_parse_members;
+    *nmembers = ngx_test_redis_parse_nmembers;
     return ngx_test_redis_parse_array_result;
 }
 

@@ -3294,7 +3294,19 @@ ngx_int_t ngx_http_cache_turbo_redis_del_many(ngx_http_cache_turbo_loc_conf_t *c
  */
 ngx_int_t ngx_http_cache_turbo_redis_del_many_cb(
     ngx_http_cache_turbo_loc_conf_t *clcf, ngx_str_t *keys, ngx_uint_t nkeys,
-    void (*done)(void *, ngx_int_t), void *done_data);
+    void (*done)(void *, ngx_int_t), size_t done_data_size, void **done_data);
+
+/*
+ * `done_data` is an OUT parameter, not an in. The completion's state cannot
+ * live in the caller's arena: state in r->pool dies with a terminated request
+ * while the completion is still pending, and state in the page scratch is
+ * released by the very completion that would read it. So del_many_cb allocates
+ * `done_data_size` zeroed bytes from the op's OWN pool -- the one arena whose
+ * lifetime brackets the completion exactly, since op_done destroys it strictly
+ * after the completion has run -- and hands the caller that pointer to
+ * populate. It is written only on the NGX_DONE (launched) return; every other
+ * return leaves it NULL, because no completion is coming.
+ */
 
 /*
  * TODO-UNLINK-REPLY-WINDOW: SUSPEND the SSCAN tag walk currently delivering a
@@ -3764,7 +3776,50 @@ typedef struct {
     ngx_uint_t                         page_nmembers;
     void                             (*page_resume)(void *, ngx_int_t);
     void                              *page_resume_data;
+
+    /* TODO-UNLINK-REPLY-WINDOW: the awaited UNLINK's completion is handed THIS
+     * pointer, and it must be able to discover that the request died under it.
+     * See ngx_http_cache_turbo_tagpurge_await_t below for why the liveness flag
+     * cannot live in this struct. */
+    struct ngx_http_cache_turbo_tagpurge_await_s  *page_await;
 } ngx_http_cache_turbo_tagpurge_t;
+
+/*
+ * TODO-UNLINK-REPLY-WINDOW: the awaited page's liveness token.
+ *
+ * The tagpurge struct lives in r->pool, but the awaited UNLINK's completion
+ * outlives the page delivery that armed it. Normal completion is safe: the walk
+ * parks the request with r->main->count++ and only walk_finish finalizes it,
+ * which cannot run while a page is suspended. A WORKER TERMINATE does not
+ * respect that refcount -- ngx_http_terminate_request on graceful shutdown, and
+ * a client abort -- so r->pool can be destroyed, tagpurge and all, while the
+ * UNLINK is still in flight on its own connection holding it as completion
+ * data.
+ *
+ * A `gone` flag INSIDE the tagpurge would be unusable: reading it would already
+ * be a read of the freed memory it is meant to guard. So the flag lives here,
+ * in a token allocated from the UNLINK OP'S OWN pool -- which the op owns, and
+ * which op_done destroys strictly after the completion has run. The completion
+ * is handed the token, not the tagpurge, and reaches the tagpurge only through
+ * it and only when `alive`.
+ *
+ * A cleanup handler registered on r->pool at suspension time clears `alive`
+ * during the request's teardown, before the memory is released. Both orderings
+ * are then safe: request first (completion sees !alive and touches nothing but
+ * the token), or completion first (it deregisters the cleanup on its way out,
+ * so the later teardown finds nothing to run).
+ */
+typedef struct ngx_http_cache_turbo_tagpurge_await_s {
+    ngx_http_cache_turbo_tagpurge_t  *tp;
+    ngx_pool_cleanup_t               *cln;   /* on r->pool; handler cleared
+                                              * by the completion */
+    /* The page's scratch, mirrored here so the completion can release it
+     * without going through the tagpurge. It is a standalone ngx_create_pool,
+     * NOT a child of r->pool, so the request teardown does not free it and
+     * this is the only owner either way. */
+    ngx_pool_t                       *page_pool;
+    unsigned                          alive:1;
+} ngx_http_cache_turbo_tagpurge_await_t;
 
 ngx_int_t ngx_http_cache_turbo_tag_purge_complete(ngx_http_request_t *r,
     void *data, ngx_str_t *members, ngx_uint_t nmembers,

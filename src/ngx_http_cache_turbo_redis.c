@@ -1500,7 +1500,8 @@ ngx_http_cache_turbo_redis_del(ngx_http_cache_turbo_loc_conf_t *clcf,
 static ngx_int_t
 ngx_http_cache_turbo_redis_cmd_many(ngx_http_cache_turbo_loc_conf_t *clcf,
     ngx_str_t *lead, ngx_uint_t nlead, ngx_str_t *keys, ngx_uint_t nkeys,
-    ngx_uint_t keep_empty, void (*done)(void *, ngx_int_t), void *done_data)
+    ngx_uint_t keep_empty, void (*done)(void *, ngx_int_t),
+    size_t done_data_size, void **done_data)
 {
     ngx_uint_t                        i, m, emitted, j;
     size_t                            total;
@@ -1596,7 +1597,22 @@ ngx_http_cache_turbo_redis_cmd_many(ngx_http_cache_turbo_loc_conf_t *clcf,
 
     op->expected_replies = emitted;       /* one integer reply per command */
     op->drain_cb = done;                  /* NULL keeps fire-and-forget */
-    op->drain_data = done_data;
+
+    if (done != NULL && done_data_size > 0) {
+        /* The completion's state is allocated HERE, from the op's own pool,
+         * and handed back for the caller to populate. That pool is destroyed by
+         * op_done strictly after the completion has run, so it is the one arena
+         * whose lifetime brackets the completion exactly -- unlike the caller's
+         * request pool, which a terminated request frees out from under a
+         * pending completion, and unlike the caller's page scratch, which the
+         * completion itself releases. */
+        op->drain_data = ngx_pcalloc(op->pool, done_data_size);
+        if (op->drain_data == NULL) {
+            ngx_destroy_pool(op->pool);
+            return NGX_ERROR;
+        }
+        *done_data = op->drain_data;
+    }
 
     if (ngx_http_cache_turbo_redis_launch(op, clcf,
             ngx_http_cache_turbo_redis_read_drain) != NGX_OK)
@@ -1626,7 +1642,7 @@ ngx_http_cache_turbo_redis_del_many(ngx_http_cache_turbo_loc_conf_t *clcf,
 
     /* Fire-and-forget: a launch and a nothing-to-send are both success. */
     return ngx_http_cache_turbo_redis_cmd_many(clcf, lead, 1, keys, nkeys, 0,
-                                               NULL, NULL) == NGX_ERROR
+                                               NULL, 0, NULL) == NGX_ERROR
                ? NGX_ERROR : NGX_OK;
 }
 
@@ -1653,9 +1669,12 @@ ngx_http_cache_turbo_redis_del_many(ngx_http_cache_turbo_loc_conf_t *clcf,
 ngx_int_t
 ngx_http_cache_turbo_redis_del_many_cb(ngx_http_cache_turbo_loc_conf_t *clcf,
     ngx_str_t *keys, ngx_uint_t nkeys, void (*done)(void *, ngx_int_t),
-    void *done_data)
+    size_t done_data_size, void **done_data)
 {
     ngx_str_t  lead[1];
+    ngx_int_t  rc;
+
+    *done_data = NULL;                    /* only a launch produces one */
 
     lead[0].data = (u_char *) "UNLINK";
     lead[0].len = sizeof("UNLINK") - 1;
@@ -1694,8 +1713,13 @@ ngx_http_cache_turbo_redis_del_many_cb(ngx_http_cache_turbo_loc_conf_t *clcf,
      * launched (done never fires). Re-deriving "was anything sent?" here by
      * re-scanning the keys would duplicate cmd_many's own emptiness filter and
      * silently diverge from it the first time either side changed. */
-    return ngx_http_cache_turbo_redis_cmd_many(clcf, lead, 1, keys, nkeys, 0,
-                                               done, done_data);
+    rc = ngx_http_cache_turbo_redis_cmd_many(clcf, lead, 1, keys, nkeys, 0,
+                                             done, done_data_size, done_data);
+    if (rc != NGX_DONE) {
+        *done_data = NULL;                /* nothing launched, nothing to fill */
+    }
+
+    return rc;
 }
 
 
@@ -1734,7 +1758,7 @@ ngx_http_cache_turbo_redis_srem_many(ngx_http_cache_turbo_loc_conf_t *clcf,
 
     /* Fire-and-forget: a launch and a nothing-to-send are both success. */
     return ngx_http_cache_turbo_redis_cmd_many(clcf, lead, 2, members,
-                                               nmembers, 1, NULL, NULL)
+                                               nmembers, 1, NULL, 0, NULL)
                == NGX_ERROR ? NGX_ERROR : NGX_OK;
 }
 

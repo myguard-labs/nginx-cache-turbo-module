@@ -48,10 +48,17 @@ extract_function() {
 		extract_function "$MC_SRC" 'static void' "$fn"
 		printf '\n'
 	done
+	# TODO-UNLINK-REPLY-WINDOW: walk_suspend is the API a page callback uses to
+	# park its walk, and the suspension assertions drive read_sscan through it.
+	# Non-static and ngx_int_t, so it needs its own extraction.
+	extract_function "$REDIS_SRC" 'ngx_int_t' \
+		ngx_http_cache_turbo_redis_walk_suspend
+	printf '\n'
 	for fn in \
 		ngx_http_cache_turbo_redis_backoff_fail \
 		ngx_http_cache_turbo_redis_read_drain \
 		ngx_http_cache_turbo_redis_sscan_advance \
+		ngx_http_cache_turbo_redis_sscan_resume \
 		ngx_http_cache_turbo_redis_read_sscan \
 		ngx_http_cache_turbo_redis_walk_finish \
 		ngx_http_cache_turbo_redis_get_finish \
@@ -74,6 +81,8 @@ for symbol in \
 	ngx_http_cache_turbo_redis_backoff_fail \
 	ngx_http_cache_turbo_redis_read_drain \
 	ngx_http_cache_turbo_redis_sscan_advance \
+	ngx_http_cache_turbo_redis_sscan_resume \
+	ngx_http_cache_turbo_redis_walk_suspend \
 	ngx_http_cache_turbo_redis_read_sscan \
 	ngx_http_cache_turbo_redis_walk_finish \
 	ngx_http_cache_turbo_redis_get_finish \

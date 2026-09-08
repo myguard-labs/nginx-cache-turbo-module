@@ -2408,7 +2408,7 @@ def test_l2_tag_purge_sscan_unlink_failure_on_a_later_page(
          further SSCAN. A build that failed to advance would abandon at page 1
          and remove nothing.
       2. The walk stops there rather than running to completion: the set is NOT
-         empty and the tag key survives, so page 3's members -- still resident
+         empty and the tag key survives, so page 6's members -- still resident
          in L2, since their UNLINK was refused -- are still reachable by tag.
       3. The reply is 500 / "l2":"incomplete", not a 200 over a partial purge.
       4. Re-purging through the healthy endpoint converges, which is what makes
@@ -2431,8 +2431,8 @@ def test_l2_tag_purge_sscan_unlink_failure_on_a_later_page(
 
     # 1. THE assertion this variant exists for. `purged` counts members VISITED
     #    across the walk, so it is the direct readout of how many pages the walk
-    #    actually got through. The fault is armed at the THIRD awaited delete,
-    #    so a walk that resumes and advances correctly visits three pages before
+    #    actually got through. The fault is armed at the SIXTH awaited delete,
+    #    so a walk that resumes and advances correctly visits six pages before
     #    stopping; one that finishes at its first resume instead of advancing
     #    reports a single page. At COUNT 256 the two are far apart, and the
     #    comparison is what makes this test discriminate the resume ->

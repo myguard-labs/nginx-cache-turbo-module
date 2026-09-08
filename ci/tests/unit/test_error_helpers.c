@@ -38,6 +38,10 @@ ngx_uint_t  ngx_test_add_timer_calls;
 ngx_uint_t  ngx_test_del_timer_calls;
 ngx_int_t   ngx_test_redis_frame_result;
 ngx_int_t   ngx_test_redis_fill_result;
+ngx_int_t   ngx_test_del_event_result;
+const char *ngx_test_redis_parse_cursor;
+ngx_str_t  *ngx_test_redis_parse_members;
+ngx_uint_t  ngx_test_redis_parse_nmembers;
 ngx_int_t   ngx_test_redis_frame_scan_result;
 size_t      ngx_test_redis_frame_scan_next;
 ngx_int_t   ngx_test_redis_parse_array_result;
@@ -56,7 +60,8 @@ static int           failures;
 #define CHECK(cond, msg)                                                     \
     do {                                                                     \
         if (!(cond)) {                                                       \
-            fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, msg);   \
+            (void) fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__,  \
+                           msg);                                             \
             failures++;                                                      \
         }                                                                    \
     } while (0)
@@ -119,6 +124,10 @@ reset_observations(void)
     ngx_test_mc_clear_calls = 0;
     ngx_test_mc_done_calls = 0;
     ngx_test_mc_done_op = NULL;
+    ngx_test_del_event_result = NGX_OK;
+    ngx_test_redis_parse_cursor = NULL;
+    ngx_test_redis_parse_members = NULL;
+    ngx_test_redis_parse_nmembers = 0;
     ngx_test_redis_arm_calls = 0;
     ngx_test_redis_arm_addr = NULL;
     ngx_test_redis_arm_delay = 0;
@@ -581,6 +590,287 @@ test_redis_drain_ownership(void)
           "Redis complete first reply must remain poolable and tear down once");
 }
 
+/*
+ * TODO-UNLINK-REPLY-WINDOW: a page callback that SUSPENDS the walk, exactly as
+ * the real tag-purge page delivery does before launching its awaited UNLINK.
+ * It parks the walk and returns NGX_AGAIN without launching anything, which is
+ * the state read_sscan must handle: disarmed connection, walk left parked for a
+ * completion that arrives later.
+ */
+static void (*sus_done)(void *, ngx_int_t);
+static void  *sus_done_data;
+static ngx_int_t  sus_suspend_rc;
+
+static ngx_int_t
+suspending_members_callback(ngx_http_request_t *r, void *data,
+    ngx_str_t *members, ngx_uint_t nmembers,
+    const ngx_http_cache_turbo_redis_walk_t *walk)
+{
+    (void) r;
+    (void) data;
+    (void) members;
+    (void) nmembers;
+    (void) walk;
+
+    ngx_test_members_calls++;
+
+    sus_suspend_rc = ngx_http_cache_turbo_redis_walk_suspend(&sus_done,
+                                                             &sus_done_data);
+    if (sus_suspend_rc != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    return NGX_AGAIN;
+}
+
+
+/*
+ * TODO-UNLINK-REPLY-WINDOW: the SSCAN connection must be DISARMED while its
+ * walk is parked awaiting a page's UNLINK reply.
+ *
+ * This is the deterministic negative control for that fix, and it needs no
+ * Redis. redis_write arms ngx_add_timer(c->read, redis_timeout) when it
+ * finishes sending a page; if that timer and the read event survive the park,
+ * they fire on their own schedule and re-enter read_sscan, whose walk_finish
+ * destroys op->pool (the op lives in it) and finalizes the parked request --
+ * while the UNLINK is still in flight on a separate connection holding both.
+ *
+ * The black-box hold test cannot go red against that, because its fault hook
+ * (ngx_msleep) blocks the worker and the loop never runs during the park. Here
+ * the assertion is direct: after read_sscan takes the NGX_AGAIN path, the read
+ * event must be off the poller and its timer gone.
+ *
+ * A NON-terminal cursor is essential: a last page ("0") never suspends, so a
+ * test left on the stub's default would assert this of a walk that completed
+ * and pass against the un-disarmed code too.
+ */
+static void
+test_redis_sscan_suspension_disarms_connection(void)
+{
+    static u_char                    reply[] = "*2\r\n";
+
+    ngx_http_cache_turbo_loc_conf_t  clcf;
+    ngx_http_cache_turbo_ctx_t       ctx;
+    ngx_http_cache_turbo_redis_op_t  op;
+    ngx_http_request_t               request;
+    ngx_connection_t                 connection;
+    ngx_pool_t                       pool;
+    ngx_event_t                      read, write;
+    ngx_str_t                        one_member;
+
+    one_member.data = (u_char *) "m";
+    one_member.len = 1;
+
+    init_request(&request, &connection, &pool, &read, &write);
+    init_redis(&op, &clcf, &ctx, &request, &pool);
+    op.members_cb = suspending_members_callback;
+    op.members_data = (void *) (uintptr_t) 0x51;
+    op.rbuf = reply;
+    op.rlen = sizeof(reply) - 1;
+    connection.data = &op;
+    reset_observations();
+
+    ngx_test_redis_fill_result = NGX_OK;
+    ngx_test_redis_frame_scan_result = NGX_OK;
+    ngx_test_redis_frame_scan_next = (ngx_int_t) (sizeof(reply) - 1);
+    ngx_test_redis_parse_array_result = NGX_OK;
+    /* Non-terminal page with one member: the ONLY shape that reaches the
+     * suspension branch. */
+    ngx_test_redis_parse_cursor = "17";
+    ngx_test_redis_parse_members = &one_member;
+    ngx_test_redis_parse_nmembers = 1;
+
+    sus_done = NULL;
+    sus_done_data = NULL;
+    sus_suspend_rc = NGX_ERROR;
+
+    /* The state redis_write leaves behind after sending a page. */
+    read.timer_set = 1;
+    read.active = 1;
+
+    ngx_http_cache_turbo_redis_read_sscan(&read);
+
+    CHECK(ngx_test_members_calls == 1,
+          "a non-terminal SSCAN page with members must reach the callback");
+    CHECK(sus_suspend_rc == NGX_OK,
+          "a page delivery must be able to suspend its own walk");
+    CHECK(op.suspended == 1,
+          "a callback that returned NGX_AGAIN must leave the walk suspended");
+
+    /* THE assertions. Both go red against a suspension that does not disarm. */
+    CHECK(read.timer_set == 0,
+          "the SSCAN read TIMER must be deleted across the suspension: left "
+          "armed it fires during the park and tears the walk down under the "
+          "in-flight UNLINK");
+    CHECK(read.active == 0,
+          "the SSCAN read EVENT must be off the poller across the suspension: "
+          "left registered, a peer close during the park re-enters read_sscan "
+          "and tears the walk down under the in-flight UNLINK");
+
+    /* The walk must be PARKED, not finished: no terminal callback, no teardown. */
+    CHECK(ngx_test_redis_done_calls == 0,
+          "a suspended walk must not be torn down while its UNLINK is pending");
+
+    /* And the cursor really was saved for the resume, rather than left
+     * pointing into the reply buffer the rotation frees. */
+    CHECK(op.resume_cursor.len == 2
+              && op.resume_cursor.data == op.resume_cursor_buf,
+          "the next page's cursor must be COPIED into the op's own inline "
+          "buffer, which outlives the suspension");
+
+    /* NIT-E: the arm taken when the connection CANNOT be disarmed. The UNLINK
+     * is already in flight and cannot be recalled, so the walk must stay
+     * SUSPENDED and merely record the doom -- tearing it down here would free
+     * the op the pending completion still holds, which is the very hazard the
+     * disarm exists to avoid. */
+    init_redis(&op, &clcf, &ctx, &request, &pool);
+    op.members_cb = suspending_members_callback;
+    op.members_data = (void *) (uintptr_t) 0x51;
+    op.rbuf = reply;
+    op.rlen = sizeof(reply) - 1;
+    connection.data = &op;
+    reset_observations();
+    ngx_test_redis_fill_result = NGX_OK;
+    ngx_test_redis_frame_scan_result = NGX_OK;
+    ngx_test_redis_frame_scan_next = (ngx_int_t) (sizeof(reply) - 1);
+    ngx_test_redis_parse_array_result = NGX_OK;
+    ngx_test_redis_parse_cursor = "17";
+    ngx_test_redis_parse_members = &one_member;
+    ngx_test_redis_parse_nmembers = 1;
+    ngx_test_del_event_result = NGX_ERROR;
+    read.timer_set = 1;
+    read.active = 1;
+
+    ngx_http_cache_turbo_redis_read_sscan(&read);
+
+    CHECK(op.resume_doomed == 1,
+          "a suspension that cannot disarm the connection must record the doom "
+          "for the resume to act on");
+    CHECK(op.suspended == 1,
+          "a doomed suspension must stay SUSPENDED: the UNLINK is in flight "
+          "and holds the op, so only the resume may tear the walk down");
+    CHECK(ngx_test_redis_done_calls == 0,
+          "a doomed suspension must not tear the walk down inline");
+
+    /* Restore the stubs for every later test. */
+    ngx_test_del_event_result = NGX_OK;
+    ngx_test_redis_parse_cursor = NULL;
+    ngx_test_redis_parse_members = NULL;
+    ngx_test_redis_parse_nmembers = 0;
+}
+
+
+/*
+ * TODO-UNLINK-REPLY-WINDOW / BLOCKER-A: the awaited page's completion must be
+ * NEUTRALIZED when the request dies under it.
+ *
+ * The tagpurge lives in r->pool. The walk parks the request with
+ * r->main->count++, which keeps a NORMALLY completing request alive -- but a
+ * TERMINATE (worker graceful shutdown, client abort) does not honour that
+ * refcount, so r->pool can be destroyed while the page's UNLINK is still in
+ * flight on its own connection holding the tagpurge as completion data.
+ *
+ * The protocol that closes it: the completion is handed a TOKEN allocated from
+ * the UNLINK op's own pool -- destroyed by op_done strictly after the completion
+ * runs, so reading it is always safe -- and a cleanup on r->pool clears the
+ * token's `alive` bit during teardown, before the memory goes. The completion
+ * reads `alive` FIRST and, when clear, touches nothing that lived in r->pool.
+ *
+ * ⚠ SCOPE. This asserts the token PROTOCOL, not the production completion.
+ * ngx_http_cache_turbo_tag_purge_page_unlinked lives in purge.c, which this
+ * shim does not extract; reaching it would need the real tagpurge_t, whose
+ * fields this shim would have to redeclare by hand -- and a hand-copied struct
+ * that drifts from the real one is precisely the divergence these shims exist
+ * to rule out. What is pinned here is that clearing `alive` before the
+ * completion runs is observable to it, and that the ordering works both ways.
+ * The production wiring is covered by the black-box tests.
+ */
+typedef struct {
+    void      *tp;
+    void      *cln;
+    void      *page_pool;
+    unsigned   alive:1;
+} test_await_t;
+
+static ngx_uint_t  test_await_touched_tp;
+static ngx_uint_t  test_await_freed_pool;
+
+static void
+test_await_gone(void *data)
+{
+    test_await_t  *aw = data;
+
+    aw->alive = 0;
+    aw->tp = NULL;
+}
+
+static void
+test_await_completion(void *data)
+{
+    test_await_t  *aw = data;
+
+    if (!aw->alive) {
+        if (aw->page_pool) {
+            test_await_freed_pool++;
+            aw->page_pool = NULL;
+        }
+        return;
+    }
+
+    test_await_touched_tp++;
+    aw->alive = 0;
+    if (aw->page_pool) {
+        test_await_freed_pool++;
+        aw->page_pool = NULL;
+    }
+}
+
+static void
+test_redis_await_token_survives_request_teardown(void)
+{
+    test_await_t  aw;
+    int           tp_object = 0;
+    int           pool_object = 0;
+
+    /* --- request dies FIRST, completion arrives after --- */
+    aw.tp = &tp_object;
+    aw.cln = NULL;
+    aw.page_pool = &pool_object;
+    aw.alive = 1;
+    test_await_touched_tp = 0;
+    test_await_freed_pool = 0;
+
+    test_await_gone(&aw);                 /* r->pool cleanup runs */
+    test_await_completion(&aw);           /* UNLINK reply lands after */
+
+    CHECK(test_await_touched_tp == 0,
+          "a completion arriving after the request died must NOT dereference "
+          "the tagpurge: it lives in the freed r->pool");
+    CHECK(aw.tp == NULL,
+          "the cleanup must drop the tagpurge pointer, not merely flag it");
+    CHECK(test_await_freed_pool == 1,
+          "the page scratch is a standalone pool the request teardown does not "
+          "own, so the neutralized completion must still release it -- exactly "
+          "once");
+
+    /* --- completion arrives FIRST, request teardown after --- */
+    aw.tp = &tp_object;
+    aw.cln = NULL;
+    aw.page_pool = &pool_object;
+    aw.alive = 1;
+    test_await_touched_tp = 0;
+    test_await_freed_pool = 0;
+
+    test_await_completion(&aw);           /* normal ordering */
+    test_await_gone(&aw);                 /* request finalizes afterwards */
+
+    CHECK(test_await_touched_tp == 1,
+          "a completion on a LIVE request must settle the page normally");
+    CHECK(test_await_freed_pool == 1,
+          "the page scratch must be released exactly once on this ordering too");
+}
+
+
 int
 main(void)
 {
@@ -592,7 +882,10 @@ main(void)
     test_redis_sscan_zero_byte();
     test_redis_sscan_requires_exact_frame();
     test_redis_drain_ownership();
+    test_redis_sscan_suspension_disarms_connection();
+    test_redis_await_token_survives_request_teardown();
 
-    fprintf(stderr, "terminal error compositions: %d failures\n", failures);
+    (void) fprintf(stderr, "terminal error compositions: %d failures\n",
+                   failures);
     return failures ? 1 : 0;
 }

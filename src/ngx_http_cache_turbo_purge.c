@@ -533,10 +533,52 @@ ngx_http_cache_turbo_tag_purge_page_settle(
 static void
 ngx_http_cache_turbo_tag_purge_page_unlinked(void *data, ngx_int_t rc)
 {
-    ngx_http_cache_turbo_tagpurge_t  *tp = data;
-    ngx_int_t                         verdict;
-    void                            (*resume)(void *, ngx_int_t);
-    void                             *rdata;
+    ngx_http_cache_turbo_tagpurge_await_t  *aw = data;
+    ngx_http_cache_turbo_tagpurge_t        *tp;
+    ngx_int_t                               verdict;
+    void                                  (*resume)(void *, ngx_int_t);
+    void                                   *rdata;
+
+    /* ⚠ LIVENESS FIRST, before anything else is touched. `aw` lives in the
+     * UNLINK op's own pool, which op_done destroys strictly after this
+     * function returns, so reading it is always safe. `aw->tp` does NOT: the
+     * tagpurge lives in r->pool, and a TERMINATED request -- worker graceful
+     * shutdown, client abort -- frees it without honouring the walk's
+     * r->main->count++ park. When that happened, the cleanup handler
+     * registered on r->pool has already cleared `alive`.
+     *
+     * There is then nothing left to do and nothing safe to do: the tagpurge,
+     * the tag key, the member array and the walk op are all gone or going, and
+     * the walk that would have been resumed no longer exists. Release the page
+     * scratch through the token (it is a standalone pool, not a child of
+     * r->pool, so nobody else owns it) and return. */
+    if (!aw->alive) {
+        if (aw->page_pool) {
+            ngx_destroy_pool(aw->page_pool);
+            aw->page_pool = NULL;
+        }
+        return;
+    }
+
+    /* Live: the request is still parked, so the tagpurge is valid. Deregister
+     * the cleanup on the way out -- from here on the completion owns the
+     * teardown, and leaving the handler armed would clear `alive` on a token
+     * whose op pool is about to be destroyed anyway. */
+    if (aw->cln) {
+        aw->cln->handler = NULL;
+        aw->cln = NULL;
+    }
+    aw->alive = 0;
+
+    tp = aw->tp;
+    tp->page_await = NULL;
+
+    /* settle() destroys the page scratch through tp->page_pool. Drop the
+     * token's mirror of it first so there is exactly ONE owner on this path --
+     * the mirror exists only for the !alive arm above, where the tagpurge is
+     * unreachable. The two arms are mutually exclusive (alive is cleared by
+     * whichever runs first), so the pool is released exactly once either way. */
+    aw->page_pool = NULL;
 
     verdict = ngx_http_cache_turbo_tag_purge_page_settle(tp, rc);
 
@@ -548,6 +590,27 @@ ngx_http_cache_turbo_tag_purge_page_unlinked(void *data, ngx_int_t rc)
     if (resume) {
         resume(rdata, verdict);
     }
+}
+
+
+/*
+ * TODO-UNLINK-REPLY-WINDOW: the request died while a page's UNLINK was still in
+ * flight. Registered on r->pool at suspension time and run by the request's own
+ * teardown, BEFORE the memory holding the tagpurge is released.
+ *
+ * It only clears the token's liveness bit. It must not touch the walk op (which
+ * walk_finish owns and which the terminate path tears down on its own schedule)
+ * and must not free the page scratch, because the pending completion is the one
+ * that will do that -- and it is guaranteed to run, since del_many_cb fires its
+ * completion exactly once from every terminal path.
+ */
+static void
+ngx_http_cache_turbo_tag_purge_await_gone(void *data)
+{
+    ngx_http_cache_turbo_tagpurge_await_t  *aw = data;
+
+    aw->alive = 0;
+    aw->tp = NULL;
 }
 
 
@@ -727,11 +790,54 @@ ngx_http_cache_turbo_tag_purge_complete(ngx_http_request_t *r, void *data,
         tp->page_members = members;
         tp->page_nmembers = nmembers;
 
-        rc = ngx_http_cache_turbo_redis_del_many_cb(tp->clcf, delkeys, ndel,
-                 ngx_http_cache_turbo_tag_purge_page_unlinked, tp);
+        {
+            ngx_http_cache_turbo_tagpurge_await_t  *aw = NULL;
 
-        if (rc == NGX_DONE) {
-            return NGX_AGAIN;             /* awaiting the UNLINK's reply */
+            rc = ngx_http_cache_turbo_redis_del_many_cb(tp->clcf, delkeys, ndel,
+                     ngx_http_cache_turbo_tag_purge_page_unlinked,
+                     sizeof(*aw), (void **) &aw);
+
+            if (rc == NGX_DONE) {
+                ngx_pool_cleanup_t  *cln;
+
+                /* The completion outlives this delivery and dereferences the
+                 * tagpurge, which lives in r->pool. The walk's
+                 * r->main->count++ park keeps a NORMALLY completing request
+                 * alive, but a TERMINATE -- worker graceful shutdown, client
+                 * abort -- does not honour it. Register a cleanup so the
+                 * request's own teardown tells the pending completion that its
+                 * state is gone, before the memory is released. */
+                cln = ngx_pool_cleanup_add(r->pool, 0);
+                if (cln == NULL) {
+                    /* The UNLINK is already in flight and cannot be recalled,
+                     * so the completion WILL run. Without the cleanup it could
+                     * run against a freed tagpurge, so leave the token dead:
+                     * the completion then releases the page scratch and does
+                     * nothing else, and this page is abandoned. Its members
+                     * keep their tag membership, which is the safe direction --
+                     * the objects may or may not be gone, and the tag stays
+                     * pointing at them either way. */
+                    aw->alive = 0;
+                    aw->page_pool = tmp;
+                    tp->page_pool = NULL;
+                    ngx_http_cache_turbo_redis_walk_unsuspend(
+                        tp->page_resume_data);
+                    tp->page_resume = NULL;
+                    tp->page_resume_data = NULL;
+                    return NGX_ERROR;
+                }
+
+                cln->handler = ngx_http_cache_turbo_tag_purge_await_gone;
+                cln->data = aw;
+
+                aw->tp = tp;
+                aw->cln = cln;
+                aw->page_pool = tmp;
+                aw->alive = 1;
+                tp->page_await = aw;
+
+                return NGX_AGAIN;         /* awaiting the UNLINK's reply */
+            }
         }
 
         /* No reply is coming: either nothing was sent (NGX_OK -- vacuously a
