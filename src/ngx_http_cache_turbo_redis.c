@@ -2254,6 +2254,7 @@ ngx_http_cache_turbo_redis_scan_del(ngx_http_request_t *r,
     ngx_http_cache_turbo_redis_members_pt cb, void *data)
 {
     ngx_str_t                         cursor0 = ngx_string("0");
+    ngx_pool_cleanup_t               *cln;
     ngx_http_cache_turbo_redis_op_t  *op;
 
     if (!clcf->redis_enable) {
@@ -2310,16 +2311,54 @@ ngx_http_cache_turbo_redis_scan_del(ngx_http_request_t *r,
         return NGX_ERROR;
     }
 
+    /* CT-SCANDEL-TERMINATE-LEAK: register the request-teardown detach BEFORE
+     * the launch, exactly as redis_sscan does. This walk is built from its OWN
+     * pool, not a child of r->pool, and the r->main->count++ park below does
+     * not survive a TERMINATE -- ngx_http_terminate_handler forces r->count = 1
+     * and frees the request regardless. Without this cleanup op->request
+     * dangles at freed memory and the walk's remaining wakeups drive
+     * walk_finish into cb(r, ...) + ngx_http_finalize_request(r, rc) on it: a
+     * use-after-free.
+     *
+     * Unlike the SSCAN walk this one has no *leak* arm to close: the SCAN-del
+     * walk has no per-page awaited sub-operation, so it never suspends, and
+     * walk_detach's unsuspended arm tears it down inline. That is the only
+     * state this walk can be detached in.
+     *
+     * Registering it before the launch is deliberate: a failed launch reaches
+     * op_fail -> walk_finish, which would otherwise leave a cleanup pointing at
+     * a destroyed op. op_done cancels the cleanup on every path that destroys
+     * the op, so the ordering is safe in both directions -- but only because
+     * the cleanup exists by the time any teardown can run.
+     *
+     * A cleanup slot that cannot be allocated is fatal to the walk: proceeding
+     * would reinstate exactly the use-after-free this closes. */
+    cln = ngx_pool_cleanup_add(r->pool, 0);
+    if (cln == NULL) {
+        ngx_destroy_pool(op->rpool);
+        ngx_destroy_pool(op->pool);
+        return NGX_ERROR;
+    }
+    cln->handler = ngx_http_cache_turbo_redis_walk_detach;
+    cln->data = op;
+    op->req_cln = cln;
+
     if (ngx_http_cache_turbo_redis_launch(op, clcf,
             ngx_http_cache_turbo_redis_read_scan) != NGX_OK)
     {
+        /* The op is being destroyed here, not through op_done, so cancel the
+         * cleanup by hand. */
+        cln->handler = NULL;
+        op->req_cln = NULL;
         ngx_destroy_pool(op->rpool);
         ngx_destroy_pool(op->pool);
         return NGX_ERROR;
     }
 
     /* Parked: released by ngx_http_finalize_request in walk_finish (reused
-     * as the scan completion: cb(r, data, NULL, 0)). */
+     * as the scan completion: cb(r, data, NULL, 0)) -- unless the request is
+     * TERMINATED first, in which case walk_detach above takes over and the
+     * walk tears itself down without ever touching the request. */
     r->main->count++;
 
     return NGX_DONE;

@@ -139,6 +139,15 @@ reset_observations(void)
     ngx_test_redis_clear_calls = 0;
     ngx_test_redis_done_calls = 0;
     ngx_test_redis_done_op = NULL;
+    ngx_test_pnalloc_fails = 0;
+    ngx_test_pnalloc_used = 0;
+    ngx_test_cleanup_add_fails = 0;
+    ngx_test_cleanup_count = 0;
+    ngx_test_op_create_fails = 0;
+    ngx_test_launch_calls = 0;
+    ngx_test_launch_result = NGX_OK;
+    ngx_test_destroy_pool_calls = 0;
+    ngx_test_last_destroyed_pool = NULL;
     ngx_test_phase_calls = 0;
     ngx_test_posted_calls = 0;
     ngx_test_finalize_calls = 0;
@@ -179,6 +188,10 @@ init_request(ngx_http_request_t *r, ngx_connection_t *c, ngx_pool_t *pool,
     write->data = c;
     r->connection = c;
     r->pool = pool;
+    /* A non-subrequest is its own main, and nginx starts it at one reference
+     * (the connection's). A walk that parks takes it to two. */
+    r->main = r;
+    r->count = 1;
 }
 
 static void
@@ -605,6 +618,23 @@ test_redis_drain_ownership(void)
 static void (*sus_done)(void *, ngx_int_t);
 static void  *sus_done_data;
 static ngx_int_t  sus_suspend_rc;
+
+/* CT-SCANDEL-TERMINATE-LEAK: a page callback that only counts. The SCAN-del
+ * registration assertions never let the walk reach a page, and the SSCAN
+ * suspending callback would drag walk_suspend's state into a test about
+ * scan_del's entry path. */
+static ngx_int_t
+counting_members_callback(ngx_http_request_t *r, void *data,
+    ngx_str_t *members, ngx_uint_t nmembers,
+    const ngx_http_cache_turbo_redis_walk_t *walk)
+{
+    (void) r; (void) data; (void) members; (void) nmembers; (void) walk;
+
+    ngx_test_members_calls++;
+
+    return NGX_OK;
+}
+
 
 static ngx_int_t
 suspending_members_callback(ngx_http_request_t *r, void *data,
@@ -2026,6 +2056,184 @@ test_redis_terminated_await_runs_deferred_teardown(void)
 }
 
 
+/*
+ * CT-SCANDEL-TERMINATE-LEAK: the SCAN-del keyspace walk must register the same
+ * request-teardown detach the SSCAN walk does.
+ *
+ * scan_del builds its walk op from its OWN ngx_create_pool (not a child of
+ * r->pool), sets op->request = r and parks the request with r->main->count++.
+ * ngx_http_terminate_handler does NOT honour that park -- it forces r->count = 1
+ * and frees the request regardless. Before this fix scan_del registered no
+ * r->pool cleanup at all, so op->request dangled at freed memory and the walk's
+ * remaining wakeups drove walk_finish into cb(r, ...) plus
+ * ngx_http_finalize_request(r, rc) on the freed request: a use-after-free, the
+ * same defect arm PR #493 closed for SSCAN.
+ *
+ * This walk has NO leak arm. It has no per-page awaited sub-operation, so it
+ * never suspends, and walk_detach's unsuspended arm tears it down inline --
+ * the only state a SCAN-del walk can be detached in. That is asserted below
+ * too, because a future change that made this walk suspend would silently
+ * inherit the SSCAN walk's deferral obligation.
+ *
+ * scan_del is EXTRACTED from production, not modelled: a hand-written
+ * "does it register a cleanup?" assertion would pass forever regardless of
+ * what src/ngx_http_cache_turbo_redis.c actually does.
+ *
+ * The registration is a guard with three exits and each is asserted on a value
+ * ONLY that exit writes:
+ *
+ *   A: the success path         -> a record exists, carrying walk_detach and
+ *                                  the op, mirrored into op->req_cln, and the
+ *                                  request is parked.
+ *   B: cleanup_add returns NULL -> NGX_ERROR, the request is NOT parked, and
+ *                                  the launch is never attempted.
+ *   C: the launch fails         -> NGX_ERROR, the record is NEUTRALIZED and
+ *                                  op->req_cln cleared, and no park.
+ */
+static void
+test_redis_scan_del_registers_walk_detach(void)
+{
+    ngx_int_t                         rc;
+    ngx_http_cache_turbo_loc_conf_t   clcf;
+    ngx_http_cache_turbo_ctx_t        ctx;
+    ngx_http_cache_turbo_redis_op_t   op;
+    ngx_http_request_t                request;
+    ngx_connection_t                  connection;
+    ngx_pool_t                        pool;
+    ngx_event_t                       read, write;
+
+    /* ---- EXIT A: the SUCCESS path registers the detach ----------------- */
+
+    init_request(&request, &connection, &pool, &read, &write);
+    init_redis(&op, &clcf, &ctx, &request, &pool);
+    reset_observations();
+
+    /* scan_del's own preconditions: L2 on, and a NON-EMPTY key prefix (an
+     * empty one is refused before any of this, as SCAN MATCH * over a shared
+     * keyspace). */
+    clcf.redis_enable = 1;
+    ngx_str_set(&clcf.redis_prefix, "ct:");
+
+    /* Let the per-page pool, its reply buffer and the SCAN command all
+     * succeed, so the walk reaches the registration rather than bailing in one
+     * of the allocation arms above it. */
+    ngx_test_rotation_ok = 1;
+    ngx_test_launch_result = NGX_OK;
+
+    rc = ngx_http_cache_turbo_redis_scan_del(&request, &clcf,
+             counting_members_callback, (void *) (uintptr_t) 0x5c);
+
+    CHECK(rc == NGX_DONE,
+          "a launched SCAN-del walk must return NGX_DONE: it has parked the "
+          "request and owns its completion");
+
+    /* THE assertion this item exists for. ngx_test_cleanup_count is written by
+     * nothing but a real ngx_pool_cleanup_add call, so it cannot be satisfied
+     * by the unpatched scan_del, which called it zero times. */
+    CHECK(ngx_test_cleanup_count == 1,
+          "scan_del must register EXACTLY ONE r->pool cleanup: the walk op is "
+          "built from its own pool and the r->main->count++ park does not "
+          "survive a TERMINATE, so without it op->request dangles at freed "
+          "memory");
+    CHECK(ngx_test_cleanups[0].handler
+              == ngx_http_cache_turbo_redis_walk_detach,
+          "the registered record must carry walk_detach: a record with any "
+          "other handler does not clear op->request, and one with a NULL "
+          "handler is skipped by nginx entirely");
+    CHECK(ngx_test_cleanups[0].data == &ngx_test_scan_op,
+          "the record must carry THIS walk's op: the handler's whole job is "
+          "to detach that op from the request being freed");
+    CHECK(ngx_test_scan_op.req_cln == &ngx_test_cleanups[0],
+          "the op must mirror its own record, so op_done can neutralize the "
+          "cleanup on every path that destroys the op");
+    CHECK(ngx_test_scan_op.request == &request,
+          "the walk must still hold its request on the success path: the "
+          "detach is armed, not fired");
+    CHECK(request.main->count == 2,
+          "a launched walk must PARK the request exactly once (1 -> 2): the "
+          "walk owns the finalize its completion issues");
+
+    /* The SCAN-del walk has no awaited sub-operation, so it can only ever be
+     * detached UNSUSPENDED -- the arm walk_detach tears down inline. A change
+     * that made this walk suspend would inherit the SSCAN walk's deferred
+     * teardown obligation, and this pins that it has not happened yet. */
+    CHECK(ngx_test_scan_op.suspended == 0,
+          "a freshly launched SCAN-del walk must NOT be suspended: this walk "
+          "has no per-page awaited sub-operation, so walk_detach's inline "
+          "teardown arm is the only one it can reach");
+
+    /* ---- EXIT B: ngx_pool_cleanup_add FAILS ---------------------------- */
+
+    /* Re-init ALL the fixtures, not just the request: scan_del reads clcf, and
+     * carrying EXIT A's copy forward would surface a future clcf dependency as
+     * "EXIT A leaked into EXIT B" rather than as the real change. */
+    init_request(&request, &connection, &pool, &read, &write);
+    init_redis(&op, &clcf, &ctx, &request, &pool);
+    reset_observations();
+    clcf.redis_enable = 1;
+    ngx_str_set(&clcf.redis_prefix, "ct:");
+    ngx_test_rotation_ok = 1;
+    ngx_test_launch_result = NGX_OK;
+    ngx_test_cleanup_add_fails = 1;
+
+    rc = ngx_http_cache_turbo_redis_scan_del(&request, &clcf,
+             counting_members_callback, (void *) (uintptr_t) 0x5c);
+
+    CHECK(rc == NGX_ERROR,
+          "a cleanup slot that cannot be allocated must be FATAL to the walk: "
+          "proceeding would reinstate exactly the use-after-free this closes");
+    /* ngx_test_launch_calls is written only by the launch stub, so it
+     * discriminates 'refused before launching' from 'launched then unwound' --
+     * both of which return NGX_ERROR. */
+    CHECK(ngx_test_launch_calls == 0,
+          "the walk must be refused BEFORE the launch: a launched op with no "
+          "detach registered is the very state this fix forbids");
+    CHECK(request.main->count == 1,
+          "a refused walk must NOT park the request: nothing will ever issue "
+          "the matching finalize");
+    CHECK(ngx_test_destroy_pool_calls == 2,
+          "the refused walk must release BOTH its pools -- the per-page pool "
+          "and the op pool -- not just the one it allocated last");
+
+    /* ---- EXIT C: the LAUNCH fails after the record is registered -------- */
+
+    init_request(&request, &connection, &pool, &read, &write);
+    init_redis(&op, &clcf, &ctx, &request, &pool);
+    reset_observations();
+    clcf.redis_enable = 1;
+    ngx_str_set(&clcf.redis_prefix, "ct:");
+    ngx_test_rotation_ok = 1;
+    ngx_test_launch_result = NGX_ERROR;
+
+    rc = ngx_http_cache_turbo_redis_scan_del(&request, &clcf,
+             counting_members_callback, (void *) (uintptr_t) 0x5c);
+
+    CHECK(rc == NGX_ERROR,
+          "a walk whose launch failed must report failure to its caller");
+    CHECK(ngx_test_cleanup_count == 1,
+          "the record WAS registered before the launch: registering after it "
+          "would leave a failed launch's op_fail -> walk_finish path running "
+          "with no detach armed");
+    /* cln->handler is the discriminating value: nginx runs a record whose
+     * handler is non-NULL and skips one whose handler is NULL. This op's pool
+     * is destroyed below, so a surviving handler is a use-after-free at the
+     * request's own teardown -- a NULL here is the ONLY safe state, and only
+     * the cancel arm writes it. */
+    CHECK(ngx_test_cleanups[0].handler == NULL,
+          "a failed launch must NEUTRALIZE the record it registered: the op "
+          "pool is destroyed on this path, so a record left armed would run "
+          "walk_detach against freed memory at the request's teardown");
+    CHECK(ngx_test_scan_op.req_cln == NULL,
+          "the op must drop its mirror too, so nothing can reuse a record "
+          "this path has already disarmed");
+    CHECK(request.main->count == 1,
+          "a failed launch must NOT leave the request parked: no completion "
+          "will ever run to release it");
+    CHECK(ngx_test_destroy_pool_calls == 2,
+          "the unwound walk must release BOTH its pools");
+}
+
+
 int
 main(void)
 {
@@ -2042,6 +2250,7 @@ main(void)
     test_redis_sscan_suspended_walk_ignores_stray_events();
     test_await_token_protocol_only();
     test_redis_walk_detach_on_request_teardown();
+    test_redis_scan_del_registers_walk_detach();
     test_redis_terminated_await_runs_deferred_teardown();
 
     (void) fprintf(stderr, "terminal error compositions: %d failures\n",

@@ -74,10 +74,19 @@ typedef struct {
     u_char  *last;
 } ngx_buf_t;
 
-typedef struct {
-    ngx_connection_t  *connection;
-    ngx_pool_t        *pool;
-} ngx_http_request_t;
+/* CT-SCANDEL-TERMINATE-LEAK: `main` and `count` model the reference park.
+ * scan_del does r->main->count++ to keep the request alive for the walk's own
+ * finalize, and whether that park happens is one of the values separating the
+ * registration's three exits -- a refused or unwound walk must NOT park. In
+ * nginx `main` points at the main request (r itself for a non-subrequest),
+ * which is what init_request sets up. */
+typedef struct ngx_http_request_s ngx_http_request_t;
+struct ngx_http_request_s {
+    ngx_connection_t    *connection;
+    ngx_pool_t          *pool;
+    ngx_http_request_t  *main;
+    unsigned             count:16;
+};
 
 typedef struct {
     int  token;
@@ -108,6 +117,14 @@ typedef struct {
      * exercise the reader's terminal paths, not the deadline (that has its own
      * runtime test, test_scan_walk_deadline_reports_incomplete). */
     ngx_msec_t  redis_scan_deadline;
+    /* CT-SCANDEL-TERMINATE-LEAK: the three settings the extracted scan_del
+     * reads on its way to the registration. redis_prefix is LOAD-BEARING: an
+     * empty one is refused up front (it would be SCAN MATCH * over a possibly
+     * shared keyspace), so a test that leaves it zeroed never reaches the
+     * cleanup registration at all and asserts nothing. */
+    ngx_uint_t  redis_enable;
+    ngx_str_t   redis_prefix;
+    ngx_msec_t  redis_timeout;
 } ngx_http_cache_turbo_loc_conf_t;
 
 /* CT-SSCAN-TERMINATE-LEAK: the tagpurge names its zone only as a pointer, and
@@ -177,6 +194,10 @@ typedef struct {
     ngx_buf_t                             *command;
     ngx_str_t                              sscan_key;
     ngx_msec_t                             scan_start;
+    /* CT-SCANDEL-TERMINATE-LEAK: the connect timeout op_create copies from the
+     * location config. Present so the extracted entry path compiles unchanged;
+     * nothing under test reads it back. */
+    ngx_msec_t                             timeout;
     size_t                                 rcap;
     size_t                                 reply_max;
     size_t                                 frame_off;
@@ -385,6 +406,16 @@ ngx_http_cache_turbo_redis_op_done(ngx_http_cache_turbo_redis_op_t *op)
 typedef ngx_int_t  ngx_msec_int_t;
 
 #define NGX_HTTP_CACHE_TURBO_REDIS_SCAN_MAX_PAGES  (1024 * 1024)
+/* CT-SCANDEL-TERMINATE-LEAK: the per-op reply ceiling scan_del installs. Only
+ * the allocation arms above the registration read it, and this shim's
+ * ngx_pnalloc ignores its size argument, so the exact value is not load-bearing
+ * here -- it matches production's so the extracted code compiles unchanged. */
+#ifndef NGX_HTTP_CACHE_TURBO_REDIS_MAX_ITER_REPLY
+#define NGX_HTTP_CACHE_TURBO_REDIS_MAX_ITER_REPLY  (64 * 1024 * 1024)
+#endif
+#ifndef ngx_string
+#define ngx_string(str)  { sizeof(str) - 1, (u_char *) str }
+#endif
 #ifndef NGX_ABORT
 #define NGX_ABORT  (-6)
 #endif
@@ -463,13 +494,154 @@ ngx_destroy_pool(ngx_pool_t *pool)
     ngx_test_last_destroyed_pool = pool;
 }
 
+/* CT-SCANDEL-TERMINATE-LEAK: the walks' page reply buffer is ngx_min(4 pages,
+ * MAX_ITER_REPLY) = 16 KiB, so a 256-byte arena made scan_del bail in its rbuf
+ * arm before it could ever reach the cleanup registration -- the registration
+ * would have been untestable, and silently so. The arena is sized to hold that
+ * buffer; ngx_test_pnalloc_fails is the explicit switch for tests that want the
+ * failure arm, replacing the accidental size-based one.
+ *
+ * It BUMPS rather than handing the same block to every caller: scan_del has two
+ * live allocations at once, and a shared block would alias them. Nothing under
+ * test reads those buffers back today, so aliasing would not fail now -- it
+ * would fail a later test that checks reply or cursor CONTENT, and pass for the
+ * wrong reason until then. `used` is reset by reset_observations. */
+static int     ngx_test_pnalloc_fails;
+static size_t  ngx_test_pnalloc_used;
+
 static void *
 ngx_pnalloc(ngx_pool_t *pool, size_t size)
 {
-    static u_char storage[256];
+    static u_char storage[16 * 1024];
 
     (void) pool;
-    return size <= sizeof(storage) ? storage : NULL;
+
+    if (ngx_test_pnalloc_fails
+        || size > sizeof(storage) - ngx_test_pnalloc_used)
+    {
+        return NULL;
+    }
+
+    ngx_test_pnalloc_used += size;
+
+    return storage + ngx_test_pnalloc_used - size;
+}
+
+/* CT-SCANDEL-TERMINATE-LEAK scaffolding: the three collaborators the extracted
+ * scan_del calls, plus a cleanup-list model.
+ *
+ * ngx_pool_cleanup_add mirrors the real one's gate, checked against nginx's
+ * src/core/ngx_palloc.c: it returns NULL ONLY on allocation failure, and for
+ * the size == 0 form this caller uses it hands back a record with handler and
+ * data both NULL. The test drives that failure through ngx_test_cleanup_add_fails
+ * rather than by hand-setting op fields, so the extracted registration's NULL
+ * arm is reached the same way production reaches it.
+ *
+ * What is NOT modelled: the real one pushes the record onto p->cleanup and the
+ * pool's destruction later runs the list. This shim's ngx_pool_t is a token
+ * stub with no cleanup list and its ngx_destroy_pool is a counter, so records
+ * come from a fixed array instead and nothing here runs them. That is the
+ * honest boundary: this test pins that scan_del REGISTERS the detach with the
+ * right handler and data, which is precisely what was missing; that a
+ * registered r->pool cleanup is actually invoked on request teardown is
+ * nginx's own contract, and what the handler then does is already pinned by
+ * test_redis_walk_detach_on_request_teardown. ngx_test_cleanup_count is the
+ * observable separating a registering scan_del from the unpatched one. */
+static int                 ngx_test_cleanup_add_fails;
+static ngx_uint_t          ngx_test_cleanup_count;
+static ngx_pool_cleanup_t  ngx_test_cleanups[4];
+
+/* __attribute__((unused)) is for the NEGATIVE CONTROL, not for production: the
+ * SCANDEL_REGISTER mutation is precisely "scan_del does not call this", which
+ * leaves the shim's only caller gone and -Werror=unused-function rejecting the
+ * mutant before the assertion can run. Suppressing that here is what lets the
+ * control observe the missing registration instead of a compile error. */
+static ngx_pool_cleanup_t *
+ngx_pool_cleanup_add(ngx_pool_t *pool, size_t size) __attribute__((unused));
+
+static ngx_pool_cleanup_t *
+ngx_pool_cleanup_add(ngx_pool_t *pool, size_t size)
+{
+    ngx_pool_cleanup_t  *c;
+
+    (void) pool;
+    (void) size;
+
+    if (ngx_test_cleanup_add_fails
+        || ngx_test_cleanup_count >= sizeof(ngx_test_cleanups)
+                                     / sizeof(ngx_test_cleanups[0]))
+    {
+        return NULL;
+    }
+
+    c = &ngx_test_cleanups[ngx_test_cleanup_count++];
+    c->handler = NULL;
+    c->data = NULL;
+
+    return c;
+}
+
+/* The op the extracted scan_del builds. op_create is stubbed rather than
+ * extracted: it only wraps ngx_create_pool + ngx_pcalloc, and the test needs a
+ * STABLE op address to assert cln->data against. */
+static ngx_http_cache_turbo_redis_op_t  ngx_test_scan_op;
+static int                              ngx_test_op_create_fails;
+
+static ngx_http_cache_turbo_redis_op_t *
+ngx_http_cache_turbo_redis_op_create(ngx_http_cache_turbo_loc_conf_t *clcf)
+{
+    static ngx_pool_t  op_pool;
+
+    if (ngx_test_op_create_fails) {
+        return NULL;
+    }
+
+    memset(&ngx_test_scan_op, 0, sizeof(ngx_test_scan_op));
+    ngx_test_scan_op.pool = &op_pool;
+    ngx_test_scan_op.rpool = &op_pool;
+    ngx_test_scan_op.timeout = clcf->redis_timeout;
+
+    return &ngx_test_scan_op;
+}
+
+/* SCAN's per-page command encoder. Succeeds under the same ngx_test_rotation_ok
+ * switch the SSCAN encoder uses, so a test that lets the walk get as far as the
+ * launch does not have to enable two unrelated flags. */
+static ngx_buf_t *
+ngx_http_cache_turbo_redis_scan_cmd(ngx_pool_t *pool,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_str_t *cursor)
+{
+    static ngx_buf_t  cmd;
+
+    (void) pool; (void) clcf; (void) cursor;
+
+    return ngx_test_rotation_ok ? &cmd : NULL;
+}
+
+/* The connect/arm step, stubbed. Whether it SUCCEEDS decides which of
+ * scan_del's two post-registration arms runs, which is exactly what the
+ * failure-path assertion needs to steer. */
+static ngx_uint_t  ngx_test_launch_calls;
+static ngx_int_t   ngx_test_launch_result;
+
+/* The SCAN reply reader, referenced by scan_del only as the handler it hands
+ * to the launch. The launch is stubbed, so this is never called -- but taking
+ * its address needs a definition. */
+static void
+ngx_http_cache_turbo_redis_read_scan(ngx_event_t *rev)
+{
+    (void) rev;
+}
+
+static ngx_int_t
+ngx_http_cache_turbo_redis_launch(ngx_http_cache_turbo_redis_op_t *op,
+    ngx_http_cache_turbo_loc_conf_t *clcf, void (*read_handler)(ngx_event_t *))
+{
+    (void) op; (void) clcf; (void) read_handler;
+
+    ngx_test_launch_calls++;
+
+    return ngx_test_launch_result;
 }
 
 static void

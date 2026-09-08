@@ -104,6 +104,15 @@ extract_struct() {
 		extract_function "$REDIS_SRC" 'static void' "$fn"
 		printf '\n'
 	done
+	# CT-SCANDEL-TERMINATE-LEAK: the SCAN-del walk's entry point. Non-static
+	# and ngx_int_t, so it needs its own extraction, and it must follow
+	# walk_detach, whose address it registers. Extracting it rather than
+	# hand-modelling the registration is the whole point: a hand-written
+	# "does scan_del register a cleanup?" assertion would pass forever
+	# regardless of what production does.
+	extract_function "$REDIS_SRC" 'ngx_int_t' \
+		ngx_http_cache_turbo_redis_scan_del
+	printf '\n'
 	# CT-SSCAN-TERMINATE-LEAK: the awaited UNLINK's completion and the r->pool
 	# cleanup that neutralizes it. Extracted AFTER sscan_resume, which the
 	# completion's request-is-gone arm now calls through the token's mirrored
@@ -141,6 +150,7 @@ for symbol in \
 	ngx_http_cache_turbo_redis_get_finish \
 	ngx_http_cache_turbo_redis_lock_finish \
 	ngx_http_cache_turbo_redis_op_fail \
+	ngx_http_cache_turbo_redis_scan_del \
 	ngx_http_cache_turbo_tag_purge_page_unlinked \
 	ngx_http_cache_turbo_tag_purge_await_gone; do
 	if ! grep -qF "$symbol(" "$OUT"; then
@@ -429,6 +439,43 @@ if [ "${CTRL_ERROR_HELPERS_REDIS_RESUME_REARM:-0}" = 1 ]; then
 		'if (ngx_handle_read_event(c->read, 0) != NGX_OK) {' \
 		'if (0 && ngx_handle_read_event(c->read, 0) != NGX_OK) {' \
 		'Redis sscan-advance re-arms the read event'
+fi
+
+# CT-SCANDEL-TERMINATE-LEAK controls. The SCAN-del walk parks its request with
+# r->main->count++ out of a pool that is NOT a child of r->pool, so a TERMINATE
+# frees the request under a live walk. The registration that closes it is a
+# THREE-part contract, one mutation each:
+#
+#   SCANDEL_REGISTER - scan_del must CALL ngx_pool_cleanup_add at all. Without
+#                      it op->request dangles and walk_finish drives cb() plus
+#                      ngx_http_finalize_request on the freed request.
+#   SCANDEL_HANDLER  - the record must carry walk_detach. A record registered
+#                      with a NULL handler is not a detach; nginx skips it.
+#   SCANDEL_CANCEL   - the launch-failure arm must NEUTRALIZE the record it
+#                      just registered. Left armed, the request's later
+#                      teardown runs walk_detach against an op whose pool this
+#                      arm has already destroyed.
+#
+# Mutations compile the call out or neutralize the statement rather than
+# substituting a constant, so no variable becomes unused and -Werror stays
+# satisfied.
+if [ "${CTRL_ERROR_HELPERS_REDIS_SCANDEL_REGISTER:-0}" = 1 ]; then
+	mutate_function_exact ngx_http_cache_turbo_redis_scan_del \
+		'cln = ngx_pool_cleanup_add(r->pool, 0);' \
+		'cln = ngx_test_cleanup_add_fails ? NULL : &ngx_test_cleanups[3];' \
+		'Redis scan_del registers the request-teardown detach'
+fi
+
+if [ "${CTRL_ERROR_HELPERS_REDIS_SCANDEL_HANDLER:-0}" = 1 ]; then
+	mutate_function_exact ngx_http_cache_turbo_redis_scan_del \
+		'cln->handler = ngx_http_cache_turbo_redis_walk_detach;' '(void) 0;' \
+		'Redis scan_del arms the record with walk_detach'
+fi
+
+if [ "${CTRL_ERROR_HELPERS_REDIS_SCANDEL_CANCEL:-0}" = 1 ]; then
+	mutate_function_exact ngx_http_cache_turbo_redis_scan_del \
+		'cln->handler = NULL;' '(void) 0;' \
+		'Redis scan_del cancels its record on a failed launch'
 fi
 
 if [ "${CTRL_ERROR_HELPERS_REDIS_EXACT_FRAME:-0}" = 1 ]; then
