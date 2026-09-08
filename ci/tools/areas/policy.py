@@ -2620,6 +2620,20 @@ def test_cor5_purge_reports_degraded_enumeration(
     assert counts["reissues"] >= counts["drops"], \
         f"self-heal did not catch up before the baseline check: {counts}"
 
+    # drops/reissues alone is necessary but NOT sufficient: purge.c's
+    # completeness snapshot (ngx_http_cache_turbo_purge.c:171-174) is
+    # varidx_inflight + varidx_drops - varidx_reissues. A SADD that redis_launch()
+    # already accepted for /cor5sh/full is not a drop and never touches
+    # drops/reissues, yet until L2 acks it (op_done) the index set the baseline
+    # PURGE below is about to SMEMBERS may still be short that variant --
+    # exactly the false "degraded" this baseline is meant to rule out. Poll
+    # varidx_inflight to 0 (bounded; fail loudly, not silently) so the zone is
+    # genuinely quiescent on all three terms before asserting completeness.
+    assert wait_for(
+        lambda: _varidx(fetch(ng.port, "/cor5sh/degraded-confirm?v=al",
+                               headers=en)[2])["inflight"] == 0
+    ), "varidx_inflight never drained to 0 -- zone not quiescent for baseline"
+
     # Baseline (no outstanding drop anywhere in the zone): a fully-enumerated
     # purge must NOT claim degraded.
     en_full = {"Accept-Language": "en"}
@@ -2705,17 +2719,18 @@ def test_cor5_purge_reports_inflight_index_write(
 
 
 def _varidx(headers: dict) -> dict:
-    """Parse X-Cache-Turbo-Test-Varidx ("drops=<n>,reissues=<n>", TEST_FAULTS
-    only) into ints. A MISSING header is a hard failure, never a silent zero --
-    a test-only counter that vanished would otherwise read as "nothing
-    happened" and turn every assertion above into a tautology."""
+    """Parse X-Cache-Turbo-Test-Varidx ("drops=<n>,reissues=<n>,inflight=<n>",
+    TEST_FAULTS only) into ints. A MISSING header is a hard failure, never a
+    silent zero -- a test-only counter that vanished would otherwise read as
+    "nothing happened" and turn every assertion above into a tautology."""
     raw = headers.get("x-cache-turbo-test-varidx")
     assert raw, "X-Cache-Turbo-Test-Varidx header absent (non-TEST_FAULTS build?)"
     out = {}
     for field in raw.split(","):
         k, _, v = field.partition("=")
         out[k.strip()] = int(v)
-    assert "drops" in out and "reissues" in out, f"malformed varidx header: {raw!r}"
+    assert "drops" in out and "reissues" in out and "inflight" in out, \
+        f"malformed varidx header: {raw!r}"
     return out
 
 
