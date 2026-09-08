@@ -820,6 +820,272 @@ test_redis_sscan_suspension_disarms_connection(void)
 
 
 /*
+ * TODO-UNLINK-REPLY-WINDOW / GRIND-C7: a SUSPENDED walk re-entered by a stray
+ * event must be INERT.
+ *
+ * The suspension disarms the connection so no event can arrive at all -- but
+ * ngx_del_event can REFUSE, and two callers tolerate that: read_sscan's own
+ * disarm-failure arm (which falls through to `doomed:`) and walk_detach's
+ * suspended arm (which discards the disarm result entirely). Both therefore
+ * return with the read event still registered on the poller while the page's
+ * UNLINK is in flight holding this op as its completion data.
+ *
+ * A peer close or a stray readable event then re-enters read_sscan. Without an
+ * entry guard every error exit below reaches walk_finish, which destroys
+ * op->pool -- the pool `op` itself is allocated from -- while that pending
+ * completion still holds it. The completion then fires against freed memory:
+ * a use-after-free from the event loop, exactly what the `doomed:` label's own
+ * comment exists to prevent. The `doomed:` block used to assert "Both callers
+ * reach here with the connection ALREADY disarmed", which is FALSE on the
+ * disarm-failure arm -- the one path where the disarm provably did not happen.
+ *
+ * The guard's exits, each asserted below:
+ *
+ *   (a) a read event on a suspended walk returns without touching the op --
+ *       no walk_finish (no terminal callback), no op_done, no re-arm, and the
+ *       reply buffer the resume still needs left un-rotated;
+ *   (b) rev->timedout on a suspended walk likewise never finishes the walk;
+ *       the flag is CONSUMED (so the event is not redelivered as a timeout
+ *       forever) and the doom recorded for the resume to act on;
+ *   (c) an UNSUSPENDED walk still takes the normal path -- the negative
+ *       control against an over-broad guard that would park every walk;
+ *   (d) the disarm-failure arm reaches `doomed:` with the op INTACT, and the
+ *       later resume still tears it down exactly once.
+ *
+ * ⚠ The discriminating observable for (a) and (b) is ngx_test_members_calls,
+ * not ngx_test_redis_done_calls alone: walk_finish calls the terminal callback
+ * before op_done, and the terminal callback is what a stray event must never
+ * reach. Asserting only on op_done would still be satisfied by paths that
+ * reach it another way.
+ */
+static void
+test_redis_sscan_suspended_walk_ignores_stray_events(void)
+{
+    static u_char                    reply[] = "*2\r\n";
+
+    ngx_http_cache_turbo_loc_conf_t  clcf;
+    ngx_http_cache_turbo_ctx_t       ctx;
+    ngx_http_cache_turbo_redis_op_t  op;
+    ngx_http_request_t               request;
+    ngx_connection_t                 connection;
+    ngx_pool_t                       pool;
+    ngx_event_t                      read, write;
+    ngx_str_t                        one_member;
+
+    one_member.data = (u_char *) "m";
+    one_member.len = 1;
+
+    init_request(&request, &connection, &pool, &read, &write);
+
+    /* ---- (a) a READ event on a suspended walk must touch nothing. ----
+     *
+     * The op is set up exactly as the suspension left it: parked, with a saved
+     * resume cursor and its reply buffer still holding the page. Every stub
+     * that read_sscan would consult on the normal path is left at its
+     * reset_observations default (fill/frame_scan/parse all NGX_ERROR), so if
+     * the guard is absent the very first thing the function does after the
+     * timeout check is fall into the fill-failure walk_finish. That makes the
+     * mutant unambiguous rather than dependent on parse shape. */
+    init_redis(&op, &clcf, &ctx, &request, &pool);
+    op.members_cb = members_callback;
+    op.members_data = (void *) (uintptr_t) 0x51;
+    op.rbuf = reply;
+    op.rlen = sizeof(reply) - 1;
+    op.is_scan = 1;
+    connection.data = &op;
+    reset_observations();
+
+    op.suspended = 1;
+    op.resume_cursor.data = op.resume_cursor_buf;
+    op.resume_cursor.len = 2;
+    ngx_memcpy(op.resume_cursor_buf, "17", 2);
+
+    read.timedout = 0;
+    read.timer_set = 0;
+    read.active = 1;                   /* the disarm refused: still registered */
+
+    ngx_http_cache_turbo_redis_read_sscan(&read);
+
+    CHECK(ngx_test_members_calls == 0,
+          "a READ event on a SUSPENDED walk must not reach walk_finish: its "
+          "terminal callback would report the walk over while the page's "
+          "UNLINK is still in flight holding the op");
+    CHECK(ngx_test_redis_done_calls == 0,
+          "a READ event on a SUSPENDED walk must not reach op_done: it "
+          "destroys op->pool, which the op itself lives in, under the pending "
+          "UNLINK completion -- a use-after-free from the event loop");
+    CHECK(op.suspended == 1,
+          "a stray READ event must leave the walk SUSPENDED: sscan_resume is "
+          "the sole driver of a parked walk");
+    CHECK(op.resume_doomed == 0,
+          "a stray READ event is not itself a failure and must not doom an "
+          "otherwise healthy suspended walk");
+    CHECK(ngx_test_add_timer_calls == 0 && ngx_test_del_timer_calls == 0,
+          "a stray READ event must not re-arm or otherwise touch the "
+          "suspended connection's read timer");
+    CHECK(op.rbuf == reply && op.rlen == sizeof(reply) - 1,
+          "a stray READ event must not consume or rotate the suspended walk's "
+          "reply buffer: the resume's framing depends on it");
+    CHECK(op.resume_cursor.len == 2
+              && op.resume_cursor.data == op.resume_cursor_buf,
+          "a stray READ event must leave the saved resume cursor intact");
+
+    /* ---- (b) rev->timedout on a suspended walk. ----
+     *
+     * The timer should have been deleted at suspension, so a timeout here
+     * means the disarm refused and the stale deadline fired. It must NOT tear
+     * the walk down -- but it must not be silently dropped either: the flag is
+     * consumed so the event is not redelivered as a timeout forever, and the
+     * doom is recorded so the resume abandons the walk rather than advancing
+     * it onto a connection whose read deadline has already expired. */
+    init_redis(&op, &clcf, &ctx, &request, &pool);
+    op.members_cb = members_callback;
+    op.members_data = (void *) (uintptr_t) 0x51;
+    op.rbuf = reply;
+    op.rlen = sizeof(reply) - 1;
+    op.is_scan = 1;
+    connection.data = &op;
+    reset_observations();
+
+    op.suspended = 1;
+    read.timedout = 1;
+    read.timer_set = 0;
+    read.active = 1;
+
+    ngx_http_cache_turbo_redis_read_sscan(&read);
+
+    CHECK(ngx_test_members_calls == 0,
+          "a TIMEOUT on a SUSPENDED walk must not reach walk_finish: the "
+          "timeout arm's own walk_finish is the exact use-after-free the "
+          "suspension disarm was written to prevent");
+    CHECK(ngx_test_redis_done_calls == 0,
+          "a TIMEOUT on a SUSPENDED walk must not reach op_done while the "
+          "page's UNLINK still holds the op");
+    CHECK(op.suspended == 1,
+          "a TIMEOUT must leave the walk SUSPENDED: only the resume may tear "
+          "a parked walk down");
+    CHECK(read.timedout == 0,
+          "a TIMEOUT on a SUSPENDED walk must CONSUME the flag, or the event "
+          "is redelivered as a timeout for the whole suspension");
+    CHECK(op.resume_doomed == 1,
+          "a TIMEOUT on a SUSPENDED walk must record the doom: the read "
+          "deadline expired, so the resume must abandon the walk rather than "
+          "advance it");
+    CHECK(op.scan_status == NGX_ERROR,
+          "a timed-out suspended walk must never report a COMPLETE purge");
+
+    /* ---- (c) NEGATIVE CONTROL: an UNSUSPENDED walk still takes the normal
+     * path. A guard that parked every walk, not just suspended ones, would
+     * strand every SSCAN in the worker while passing (a) and (b). ---- */
+    init_redis(&op, &clcf, &ctx, &request, &pool);
+    op.members_cb = members_callback;
+    op.members_data = (void *) (uintptr_t) 0x51;
+    op.rbuf = reply;
+    op.rlen = sizeof(reply) - 1;
+    op.is_scan = 1;
+    connection.data = &op;
+    reset_observations();
+
+    op.suspended = 0;
+    read.timedout = 0;
+    read.timer_set = 0;
+    read.active = 1;
+
+    /* fill fails -> the normal path's first walk_finish. */
+    ngx_test_redis_fill_result = NGX_ERROR;
+
+    ngx_http_cache_turbo_redis_read_sscan(&read);
+
+    CHECK(ngx_test_members_calls == 1 && ngx_test_walk != NULL,
+          "an UNSUSPENDED walk must still reach walk_finish's TERMINAL "
+          "callback: the guard covers parked walks only");
+    CHECK(ngx_test_redis_done_calls == 1,
+          "an UNSUSPENDED walk must still reach op_done exactly once");
+
+    /* ---- (d) the disarm-FAILURE arm: `doomed:` with the op intact, and the
+     * resume still tearing it down exactly once. ----
+     *
+     * This is the arm whose `doomed:` comment used to claim the connection was
+     * "ALREADY disarmed". It is not: ngx_del_event refused, so the read event
+     * is still registered -- which is why (a) and (b) above have to hold. */
+    init_redis(&op, &clcf, &ctx, &request, &pool);
+    op.members_cb = suspending_members_callback;
+    op.members_data = (void *) (uintptr_t) 0x51;
+    op.rbuf = reply;
+    op.rlen = sizeof(reply) - 1;
+    op.is_scan = 1;
+    connection.data = &op;
+    reset_observations();
+
+    ngx_test_redis_fill_result = NGX_OK;
+    ngx_test_redis_frame_scan_result = NGX_OK;
+    ngx_test_redis_frame_scan_next = (ngx_int_t) (sizeof(reply) - 1);
+    ngx_test_redis_parse_array_result = NGX_OK;
+    ngx_test_redis_parse_cursor = "17";
+    ngx_test_redis_parse_members = &one_member;
+    ngx_test_redis_parse_nmembers = 1;
+
+    sus_done = NULL;
+    sus_done_data = NULL;
+    sus_suspend_rc = NGX_ERROR;
+
+    ngx_test_del_event_result = NGX_ERROR;    /* the disarm REFUSES */
+    read.timedout = 0;
+    read.timer_set = 1;
+    read.active = 1;
+
+    ngx_http_cache_turbo_redis_read_sscan(&read);
+
+    CHECK(op.resume_doomed == 1 && op.suspended == 1,
+          "the disarm-FAILURE arm must reach `doomed:`: parked, doomed, and "
+          "waiting for the resume");
+    CHECK(ngx_test_redis_done_calls == 0,
+          "the disarm-FAILURE arm must leave the op INTACT: its UNLINK is "
+          "already in flight and cannot be recalled");
+    CHECK(read.active == 1,
+          "the disarm-FAILURE arm leaves the read event REGISTERED -- this is "
+          "the false invariant the `doomed:` comment used to assert, and the "
+          "reason read_sscan needs a `suspended` entry guard at all");
+
+    /* A stray event arriving on that still-registered read event must be inert
+     * on THIS op, in exactly the state the failed disarm left it. */
+    ngx_test_members_calls = 0;
+    ngx_test_redis_done_calls = 0;
+    read.timedout = 0;
+
+    ngx_http_cache_turbo_redis_read_sscan(&read);
+
+    CHECK(ngx_test_members_calls == 0 && ngx_test_redis_done_calls == 0,
+          "a stray event on the UNDISARMABLE suspended connection must not "
+          "tear the walk down: this is the concrete use-after-free the guard "
+          "closes");
+
+    /* And the resume -- the sole driver -- still finishes it exactly once. */
+    ngx_test_del_event_result = NGX_OK;
+    ngx_test_members_calls = 0;
+    ngx_test_redis_done_calls = 0;
+
+    ngx_http_cache_turbo_redis_sscan_resume(&op, NGX_ERROR);
+
+    CHECK(op.suspended == 0,
+          "the resume must clear `suspended`: the UNLINK has landed and "
+          "nothing holds the op any more");
+    CHECK(ngx_test_redis_done_calls == 1,
+          "the doomed walk must be torn down EXACTLY once, by the resume");
+    CHECK(ngx_test_members_calls == 1 && ngx_test_walk != NULL,
+          "the resume's teardown must run the TERMINAL callback so the purge "
+          "is reported INCOMPLETE rather than silently dropped");
+
+    /* Restore the stubs for every later test. */
+    ngx_test_del_event_result = NGX_OK;
+    ngx_test_redis_parse_cursor = NULL;
+    ngx_test_redis_parse_members = NULL;
+    ngx_test_redis_parse_nmembers = 0;
+    read.timedout = 0;
+}
+
+
+/*
  * TODO-UNLINK-REPLY-WINDOW / BLOCKER-A: the awaited page's completion must be
  * NEUTRALIZED when the request dies under it.
  *
@@ -1238,6 +1504,7 @@ main(void)
     test_redis_sscan_requires_exact_frame();
     test_redis_drain_ownership();
     test_redis_sscan_suspension_disarms_connection();
+    test_redis_sscan_suspended_walk_ignores_stray_events();
     test_await_token_protocol_only();
     test_redis_walk_detach_on_request_teardown();
 

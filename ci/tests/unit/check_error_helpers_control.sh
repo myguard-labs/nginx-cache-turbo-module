@@ -90,3 +90,17 @@ run_mutant CTRL_ERROR_HELPERS_REDIS_RESUME_DETACHED \
 run_mutant CTRL_ERROR_HELPERS_REDIS_EXACT_FRAME \
 	'SSCAN must reject trailing RESP bytes before parsing' \
 	'Redis SSCAN exact-frame gate'
+
+# GRIND-C7: the `suspended` entry guard. The discriminating assertion for the
+# guard itself is ngx_test_members_calls -- walk_finish runs the TERMINAL
+# callback before op_done, and reaching that callback is what a stray event on
+# a parked walk must never do.
+run_mutant CTRL_ERROR_HELPERS_REDIS_SUSPENDED_GUARD \
+	'a READ event on a SUSPENDED walk must not reach walk_finish' \
+	'Redis SSCAN suspended-walk entry guard'
+run_mutant CTRL_ERROR_HELPERS_REDIS_SUSPENDED_TIMEOUT \
+	'a TIMEOUT on a SUSPENDED walk must CONSUME the flag' \
+	'Redis SSCAN suspended-walk timeout consume'
+run_mutant CTRL_ERROR_HELPERS_REDIS_SUSPENDED_DOOM \
+	'a TIMEOUT on a SUSPENDED walk must record the doom' \
+	'Redis SSCAN suspended-walk timeout doom'

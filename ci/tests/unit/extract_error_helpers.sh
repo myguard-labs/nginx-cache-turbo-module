@@ -260,6 +260,39 @@ if [ "${CTRL_ERROR_HELPERS_REDIS_RESUME_DETACHED:-0}" = 1 ]; then
 		'Redis sscan-resume detached arm'
 fi
 
+# GRIND-C7 controls. read_sscan's `suspended` entry guard is what makes a
+# stray event on an UNDISARMABLE suspended connection inert. It has three
+# distinct behaviours and each gets its own mutation:
+#
+#   SUSPENDED_GUARD   - the guard must exist at all: without it a stray read
+#                       event falls into walk_finish, which destroys op->pool
+#                       under the in-flight UNLINK completion
+#   SUSPENDED_TIMEOUT - the guard's timeout arm must CONSUME rev->timedout and
+#                       record resume_doomed, not drop the timeout silently
+#   SUSPENDED_DOOM    - the guard's timeout arm must DOOM the walk: an expired
+#                       read deadline must not let the resume advance
+#
+# Mutations compile the guard (or its arm) OFF rather than substituting a
+# constant, so no variable becomes unused and -Werror stays satisfied.
+if [ "${CTRL_ERROR_HELPERS_REDIS_SUSPENDED_GUARD:-0}" = 1 ]; then
+	mutate_function_exact ngx_http_cache_turbo_redis_read_sscan \
+		'if (op->suspended) {' 'if (0 && op->suspended) {' \
+		'Redis SSCAN suspended-walk entry guard'
+fi
+
+if [ "${CTRL_ERROR_HELPERS_REDIS_SUSPENDED_TIMEOUT:-0}" = 1 ]; then
+	mutate_function_exact ngx_http_cache_turbo_redis_read_sscan \
+		'rev->timedout = 0;' '(void) rev;' \
+		'Redis SSCAN suspended-walk timeout consume'
+fi
+
+if [ "${CTRL_ERROR_HELPERS_REDIS_SUSPENDED_DOOM:-0}" = 1 ]; then
+	mutate_function_block_exact ngx_http_cache_turbo_redis_read_sscan \
+		'if (op->suspended) {' \
+		'op->resume_doomed = 1;' '(void) op;' \
+		'Redis SSCAN suspended-walk timeout doom'
+fi
+
 if [ "${CTRL_ERROR_HELPERS_REDIS_EXACT_FRAME:-0}" = 1 ]; then
 	mutate_function_exact ngx_http_cache_turbo_redis_read_sscan \
 		'next != op->rbuf + op->rlen' '0' \

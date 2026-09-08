@@ -3989,8 +3989,14 @@ ngx_http_cache_turbo_redis_walk_detach(void *data)
     if (op->suspended) {
         /* A page's UNLINK still holds this op. Only the resume may tear it
          * down; sscan_resume sees resume_doomed (and detached) and calls
-         * op_done there. Leave the connection disarmed either way -- it was
-         * already disarmed at suspension time, and a re-disarm is harmless. */
+         * op_done there. Try to disarm the connection again -- it should
+         * already be quiet from the suspension, and a re-disarm is harmless.
+         *
+         * The result is deliberately discarded: there is nothing useful to do
+         * with a refusal here, and the walk must stay parked for its in-flight
+         * UNLINK regardless. That means this arm CAN return with the read
+         * event still registered, so read_sscan's `suspended` entry guard --
+         * not this disarm -- is what makes a stray wakeup harmless. */
         op->resume_doomed = 1;
         (void) ngx_http_cache_turbo_redis_walk_disarm_conn(op->peer.connection);
         return;
@@ -4226,6 +4232,53 @@ ngx_http_cache_turbo_redis_read_sscan(ngx_event_t *rev)
     c = rev->data;
     op = c->data;
 
+    /* TODO-UNLINK-REPLY-WINDOW: a SUSPENDED walk is not ours to touch.
+     *
+     * While `suspended` is set, a page's UNLINK is in flight on a DIFFERENT
+     * connection and holds this op as its completion data through
+     * tp->page_resume_data. sscan_resume is the SOLE driver of a suspended
+     * walk: it is guaranteed to run (del_many_cb fires its completion exactly
+     * once from every terminal path) and it is the only place that may advance
+     * or tear the walk down, because it is the first moment nothing else
+     * references the op.
+     *
+     * The suspension normally disarms this connection so no event can reach
+     * here at all -- but ngx_del_event can REFUSE, and both callers that
+     * tolerate that (the suspension's disarm-failure arm below, and
+     * walk_detach's suspended arm, which discards the disarm result) leave the
+     * read event registered on the poller. A peer close or a stray readable
+     * event then re-enters this function with the walk still parked, and every
+     * error exit below calls walk_finish, which destroys op->pool -- the pool
+     * `op` itself is allocated from -- while the pending UNLINK completion
+     * still holds it. That completion then fires against freed memory: a
+     * use-after-free from the event loop, precisely what the suspension's
+     * `doomed:` label exists to prevent.
+     *
+     * So return, touching NOTHING. Do not parse, do not consume the
+     * connection's buffered bytes (op->rbuf holds the page the resume still
+     * needs, and rotating it would desynchronise the resumed walk's framing),
+     * do not re-arm, and above all do not finish the walk.
+     *
+     * A timeout that lands here is likewise not ours: the timer was supposed
+     * to be deleted at suspension and the deadline it measured -- how long this
+     * connection may take to ANSWER -- stopped applying the moment the walk
+     * started waiting on a different operation. Consume the flag so the event
+     * is not re-delivered as a timeout forever, and record the doom so the
+     * resume finishes the walk instead of advancing it onto a connection whose
+     * read deadline has already expired. rev->timedout is never LOST: the
+     * resume always runs and always acts on resume_doomed. */
+    if (op->suspended) {
+        if (rev->timedout) {
+            rev->timedout = 0;
+            ngx_log_error(NGX_LOG_INFO, c->log, NGX_ETIMEDOUT,
+                          "cache_turbo: redis SSCAN read timer fired on a "
+                          "SUSPENDED walk; the resume will abandon it");
+            op->scan_status = NGX_ERROR;
+            op->resume_doomed = 1;
+        }
+        return;
+    }
+
     /* The page cap, the wall-clock deadline and the next-page rotation moved
      * into sscan_advance, which both this reader and the suspended-walk resume
      * path share. */
@@ -4366,6 +4419,14 @@ ngx_http_cache_turbo_redis_read_sscan(ngx_event_t *rev)
                  * explains why the walk must not be torn down. Anything added
                  * here that can return goes AFTER the disarm.
                  *
+                 * The disarm is still the PRIMARY defence -- it is what stops
+                 * the wakeup from ever being delivered -- but it is no longer
+                 * the only one. ngx_del_event can refuse, so read_sscan opens
+                 * with a `suspended` guard that makes a delivered wakeup inert.
+                 * Neither replaces the other: the guard cannot stop the timer
+                 * from firing spuriously for the whole UNLINK, and the disarm
+                 * cannot be relied on to have succeeded.
+                 *
                  * Disarming is also the honest accounting: redis_timeout bounds
                  * how long this connection may take to ANSWER, and time spent
                  * waiting on a different operation on a different connection is
@@ -4425,9 +4486,14 @@ ngx_http_cache_turbo_redis_read_sscan(ngx_event_t *rev)
                  * sees resume_doomed and finishes the walk then, at which point
                  * nothing is in flight any more.
                  *
-                 * Both callers reach here with the connection ALREADY
-                 * disarmed, which is why they share this label rather than
-                 * duplicating it. */
+                 * The two callers share this label because they need the
+                 * IDENTICAL handling, not because they share a precondition:
+                 * the oversized-cursor caller reaches here with the connection
+                 * already disarmed, while the disarm-FAILURE caller by
+                 * definition does not. That asymmetry is why read_sscan opens
+                 * with a `suspended` guard -- an event on a connection that
+                 * could not be taken off the poller must not be allowed to
+                 * finish this walk. */
                 op->resume_doomed = 1;
                 return;
             }
